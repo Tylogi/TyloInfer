@@ -7,10 +7,14 @@
 `d906b257e10353948152ba51c824787045271cd9`；按最终实现迁移，已撤销的目录调整、
 被后续接口取代的中间实现不重复搬运。
 
-范围覆盖 CUDA、共享 Engine/model/state/format/model-source、CPU 存储与执行，以及
-公共接口变化涉及的 Transport、Scheduler、Metal、HIP、Python JIT、发布脚本和测试。
-TyloInfer 的 TQ 主路径必须接入同一所有权和执行规则；MFQ 兼容格式保持显式启用。
-不恢复 TyloInfer 已移除的离线量化、校准产品入口。
+**当前执行范围仅 CUDA。Metal 和 HIP 的源码、构建及 Python 实现保持不动。**
+先迁移 CUDA 私有的加载、数学、执行资源、物理状态、Engine 装配与 Graph，及其
+CUDA JIT、测试和文档。现有公共 Interface 继续使用；需要改变其他后端调用约定的
+共享 Engine/core/CPU/format/model-source 重构先保留在后续工作中，不在本阶段实施。
+
+完整参考涉及的共享层和其他后端适配仍列在设计中，用于保留总目标的差距，不能将
+本阶段 CUDA 完成写成整个迁移完成。TyloInfer 的 TQ 主路径必须接入同一所有权和
+执行规则；MFQ 兼容格式保持显式启用。不恢复已移除的离线量化、校准产品入口。
 
 参考分支仍有未闭合的模型迁移，其完整 runtime 不能构建。迁移不能以复制这个编译
 断点作为完成：所有现有调用方都必须接通新接口，删除已失去消费者的旧实现，实际受
@@ -73,6 +77,11 @@ host mock 或源码字符串不能证明设备行为。
 每组都覆盖实现、全部调用方、CMake、Python/JIT、测试和文档。以下是完整目标的
 工作分解，不是任选其中一组即可完成的列表。
 
+当前先执行下表中 CUDA 私有部分：完成加载分离，收口 CUDA 目录与依赖，再迁移
+执行 Owner、显式 state 和真实模型/Engine/MTP/Graph 消费者。共享层、CPU I/O 及
+Metal/HIP 的改动暂缓；若某一步需要改变它们的 Interface，登记依赖后继续其他
+CUDA 工作，不用复制共享实现或增加转发包装绕过。
+
 | 顺序 | 剩余改动 | 必须提供的证据 |
 | --- | --- | --- |
 | 1 | 拆出 `components/io`、`formats`、`model_source`；host worker/copy 归 CPU；共享请求、模型定义与状态策略归 Engine；删除 `mfq-core` 聚合 | host/CUDA × communication on/off 的实际构建；reader、host copy、dtype、范围与依赖检查 |
@@ -89,8 +98,8 @@ host mock 或源码字符串不能证明设备行为。
 分离。它们只覆盖上述目标的一部分。TQ 的专用加载/缓存、旧管理执行上下文、模型内
 请求状态、通用 Block、Graph/session/MTP 消费者及 core 聚合仍须处理。
 
-目录调整应直接朝最终所有者推进；不为重放历史提交恢复已撤销的布局。公共改动影响
-HIP/Metal 时同步迁移调用方，但不因此重写未受影响的后端数学。
+目录调整应直接朝最终所有者推进；不为重放历史提交恢复已撤销的布局。当前阶段
+不提交 Metal/HIP 文件改动，也不进行会迫使这些后端同步修改的公共 Interface 更换。
 
 ## 验证与完成审计
 
