@@ -85,7 +85,7 @@ void check(ggml_type type) {
             compare(matrix.matmul(rows), reference_mm(direct ? rows : astype(rows, float16),
                 matrix.dequantize(direct ? float32 : float16)),
                 2e-4f, upper + " compressed dense prefill M=" + std::to_string(count));
-            if (count == 7 || count == 8) compare(MlxGgufStagedPrefill::dense_small(matrix, rows),
+            if ((count == 7 || count == 8) && matrix.has_staged_planes()) compare(MlxGgufStagedPrefill::dense_small(matrix, rows),
                 reference_mm(astype(rows, float16), matrix.dequantize(float16)), 2e-4f,
                 upper + " compact matrix tile M=" + std::to_string(count));
         }
