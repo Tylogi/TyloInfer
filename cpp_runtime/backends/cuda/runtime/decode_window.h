@@ -9,6 +9,7 @@
 #include <vector>
 
 namespace mfq::cuda {
+class StreamHandle;
 void wait_route_publication(const uint32_t* flag,cudaStream_t stream,int timeout_ms=60000);
 void publish_mapped_flag(uint32_t* flag) noexcept;
 void check_stream_progress(cudaStream_t stream);
@@ -40,6 +41,9 @@ public:
                  const std::function<void()>& restore,
                  const std::function<void()>& release_output = {});
     void enroll(Task task);
+    // The executor retains this stream's pool across windows; each captured
+    // window also owns it until its final GPU submission has completed.
+    void prepare_branch_stream(const StreamHandle& stream,std::shared_ptr<void>& owner);
     // Finish the current GPU segment before running host I/O. During graph
     // preparation only the supplied placeholder buffers are consumed.
     void host_barrier(std::function<void()> serve);
@@ -50,6 +54,12 @@ public:
         auto& owner=workspaces_[identity];if(!owner)owner=create();return std::static_pointer_cast<T>(owner);
     }
     void run();
+    // Enqueue pure-device graphs without a host wait. Host tasks, I/O
+    // boundaries or window timing require run() and return false here.
+    bool enqueue_if_device_only();
+    bool can_enqueue_device_only() const {
+        return valid() && !failed_ && tasks_.empty() && barriers_.empty() && !layer_profile_;
+    }
     void mark(int layer,const char* phase);
     void mark_current(const char* phase) {mark(profile_layer_,phase);}
     int set_profile_tile(int tile) noexcept {const int previous=profile_tile_;profile_tile_=tile;return previous;}
@@ -64,6 +74,8 @@ public:
     void set_prediction_enabled(bool enabled) noexcept {prediction_enabled_=enabled;}
 private:
     cudaStream_t stream_;
+    struct BranchPool;
+    std::vector<std::shared_ptr<BranchPool>> branch_pools_;
     GraphRegistry graphs_;
     struct LayerPoint;
     struct ProfileClock;
@@ -86,7 +98,7 @@ private:
     bool recording_segments_=false;
     bool failed_=false;
     int64_t capture_ns_=0,replay_ns_=0,reset_ns_=0,launch_ns_=0,serve_ns_=0,wait_ns_=0,finish_ns_=0,profile_ns_=0;
-    uint64_t replays_=0;
+    uint64_t replays_=0,async_replays_=0;
     uint64_t dropped_profiles_=0;
 };
 }

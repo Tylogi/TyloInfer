@@ -1,10 +1,12 @@
 #include "tyloinfer/gguf_model_source.h"
+#include "tyloinfer/mapped_tensor_reader.h"
 
 #include "gguf.h"
 #include "nlohmann/json.hpp"
 
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -223,6 +225,20 @@ json model_config(const json& meta, const json& shapes, const std::string& arch)
             config["hidden_act"] = "silu";
             config["output_gate_type"] = "sigmoid";
             config["norm_topk_prob"] = true;
+            int64_t predictor_layers=0;
+            constexpr std::string_view predictor_prefix="predictor.block.";
+            for(const auto& item:shapes.items()) {
+                const std::string_view name=item.key();
+                if(name.substr(0,predictor_prefix.size())!=predictor_prefix)continue;
+                const auto end=name.find('.',predictor_prefix.size());
+                int64_t layer=-1;
+                if(end==std::string_view::npos)throw std::runtime_error("invalid GGUF predictor block name");
+                const auto parsed=std::from_chars(name.data()+predictor_prefix.size(),name.data()+end,layer);
+                if(parsed.ec!=std::errc{} || parsed.ptr!=name.data()+end || layer<0 || layer==INT64_MAX)
+                    throw std::runtime_error("invalid GGUF predictor block index");
+                predictor_layers=std::max(predictor_layers,layer+1);
+            }
+            config["mtp_num_hidden_layers"]=predictor_layers;
         }
     }
     return config;
@@ -479,6 +495,13 @@ ModelSource::TensorReader GgufModelSource::tensor_reader(std::string_view name) 
         if (size) record.file->read(record.offset + offset - record.prefix.size(), destination, size);
     };
 }
+ModelSource::TensorReader GgufModelSource::mapped_tensor_reader(std::string_view name) const {
+    if(!find_tensor(name))throw std::out_of_range("GGUF tensor not found: "+std::string(name));
+    const auto range=tensor_file_range(name);
+    // Synthesized dense headers and joined tensors are not contiguous byte
+    // ranges in the file. Their ordinary retained reader remains available.
+    return range?mapped_file_tensor_reader(*range):TensorReader{};
+}
 std::optional<TensorFileRange> GgufModelSource::tensor_file_range(std::string_view name) const {
     const auto it = impl_->records.find(std::string(name));
     if (it == impl_->records.end() || !it->second.prefix.empty() || !it->second.inline_bytes.empty()) return std::nullopt;
@@ -499,17 +522,9 @@ ModelSource::TensorBatchReader GgufModelSource::tensor_batch_reader(std::string_
             return;
         }
         std::vector<ReadSpan> destinations;
-        for (std::size_t begin = 0; begin < spans.size();) {
-            destinations.clear();
-            auto end = begin;
-            auto next = spans[begin].offset;
-            while (end < spans.size() && spans[end].offset == next) {
-                destinations.push_back({record.offset + spans[end].offset, spans[end].destination, spans[end].size});
-                next += spans[end++].size;
-            }
-            record.file->read_contiguous(destinations);
-            begin = end;
-        }
+        destinations.reserve(spans.size());
+        for(const auto& span:spans)destinations.push_back({record.offset+span.offset,span.destination,span.size});
+        record.file->read_coalesced(destinations);
     };
 }
 void GgufModelSource::read_range_into(std::string_view name, uint64_t offset, std::byte* destination, std::size_t size) const {

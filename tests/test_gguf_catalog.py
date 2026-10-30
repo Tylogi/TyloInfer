@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
+import os
 import struct
 from pathlib import Path
 
@@ -14,6 +16,7 @@ from tyloinfer.server.services.checkpoint_analysis import analyze_checkpoint
 from tyloinfer.server.runtime.prefix_cache_text import decode_prefix_cache_tokens
 from tyloinfer.server.runtime.qsa_kv_policy import qsa_index_requirement
 from tyloinfer.server.state.catalog import ModelCatalog
+from tyloinfer.server.runtime.native_metadata import NativeModelInspector
 
 
 def header(path: Path, tensors: int, name: bytes = b'per_layer_token_embd.weight') -> None:
@@ -29,6 +32,27 @@ def test_gguf_component_and_shard_headers(tmp_path):
     assert parse_gguf_shard_path(tmp_path / 'model-00002-of-00003.gguf') == (tmp_path / 'model.gguf', 2, 3)
     with pytest.raises(ValueError):
         parse_gguf_shard_path(tmp_path / 'model-00000-of-00003.gguf')
+
+
+@pytest.mark.parametrize('backend', ['metal', 'cuda'])
+def test_native_gguf_inspection_accepts_supported_backends(monkeypatch, tmp_path, backend):
+    import subprocess
+    import tyloinfer.server.runtime.native_metadata as native_metadata
+
+    metadata = {'architecture': 'qwen4_exp', 'config': {'model_type': 'qwen4_exp'},
+        'tensors': {'model.embed_tokens.weight': {'dtype': 'GGUF_IQ3_S', 'shape': [128, 256], 'nbytes': 12000}}}
+    calls = []
+
+    def run(arguments, **kwargs):
+        calls.append(arguments)
+        return subprocess.CompletedProcess(arguments, 0, json.dumps(metadata).encode(), b'')
+
+    monkeypatch.setattr(native_metadata, 'native_runtime_environment', lambda *args: {})
+    monkeypatch.setattr(native_metadata.subprocess, 'run', run)
+    executable = tmp_path / 'mfq-runtime'
+    model = tmp_path / 'model.gguf'
+    assert NativeModelInspector(executable, backend)(model) == metadata
+    assert calls == [[str(executable), '--model', str(model), '--inspect-model-json']]
 
 
 def test_gguf_prefix_text_decodes_embedded_byte_vocabulary(tmp_path):
@@ -55,7 +79,15 @@ def test_gguf_catalog_groups_shards_and_shared_table(tmp_path):
         models.mkdir(); shared.mkdir()
         table = shared / 'table-00002-of-00002.gguf'
         first, second = (models / f'checkpoint-0000{index}-of-00002.gguf' for index in (1, 2))
-        header(first, 4); header(table, 1); second.symlink_to(table)
+        header(first, 4); header(table, 1)
+        try:
+            second.symlink_to(table)
+        except OSError as error:
+            if error.errno not in {errno.EPERM, errno.EACCES, errno.ENOTSUP} and getattr(error, 'winerror', None) != 1314:
+                raise
+            # Shared-file catalog behavior does not require symbolic links;
+            # hard links work without the optional symlink privilege too.
+            os.link(table, second)
         calls = []
 
         def inspect(path):

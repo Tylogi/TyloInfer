@@ -13,7 +13,7 @@ class NativeModelInspector:
         self.backend = backend
 
     def __call__(self, model: Path) -> dict:
-        if self.backend != 'metal':
+        if self.backend not in {'metal', 'cuda'}:
             raise ValueError('This model format is not available on the selected backend')
         result = subprocess.run([str(self.executable), '--model', str(model), '--inspect-model-json'],
             env=native_runtime_environment(self.executable, self.backend), capture_output=True, timeout=30, check=False)

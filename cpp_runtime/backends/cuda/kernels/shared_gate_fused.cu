@@ -1,6 +1,7 @@
 #include "mfq_cuda_shared_gate.h"
 #include "mfq_cuda_context.h"
 #include "shared_gate_fused.cuh"
+#include "kernel_dispatch_trace.h"
 #include "../ops/mfq/include/nint.h"
 #include <cstdlib>
 
@@ -192,16 +193,22 @@ std::optional<mfq_tensor_backend::Tensor> try_shared_gate_sigmoid_cuda(
         input.get_device()!=weight.get_device() || !input.is_contiguous() || !weight.is_contiguous() ||
         input.scalar_type()!=tb::kFloat16 || weight.scalar_type()!=tb::kBFloat16 ||
         input.dim()!=2 || weight.dim()!=2 || weight.size(0)!=1 ||
-        input.size(0)<1 || input.size(0)>8 || input.size(1)<1 || input.size(1)>4096 ||
+        input.size(0)<1 || input.size(1)<1 ||
         input.size(1)!=weight.size(1))return std::nullopt;
-    auto output=tb::empty({input.size(0),1},weight.options());
     mfq::cuda::DeviceGuard guard(input.get_device());
+    int maximum_grid=0;
+    TYLOINFER_NATIVE_CUDA_CHECK(cudaDeviceGetAttribute(&maximum_grid,cudaDevAttrMaxGridDimX,input.get_device()));
+    if(input.size(0)>maximum_grid)return std::nullopt;
+    auto output=tb::empty({input.size(0),1},input.options());
     const auto stream=mfq::cuda::current_stream(input.get_device()).stream();
-    mfq::cuda::shared_gate_detail::project_sigmoid<128,true,false>
+    mfq::cuda::shared_gate_detail::project_sigmoid<128,true,false,true>
         <<<int(input.size(0)),128,0,stream>>>(
             static_cast<const __half*>(input.data_ptr()),
             static_cast<const __nv_bfloat16*>(weight.data_ptr()),nullptr,
-            static_cast<__nv_bfloat16*>(output.data_ptr()),int(input.size(1)));
+            static_cast<__half*>(output.data_ptr()),input.size(1));
     TYLOINFER_NATIVE_CUDA_CHECK(cudaGetLastError());
+    if(mfq::cuda::dispatch_trace::enabled())mfq::cuda::dispatch_trace::record(stream,"shared_gate_sigmoid",
+        reinterpret_cast<const void*>(mfq::cuda::shared_gate_detail::project_sigmoid<128,true,false,true>),
+        "rows="+std::to_string(input.size(0))+" K="+std::to_string(input.size(1))+" output_half=1");
     return output;
 }

@@ -21,6 +21,10 @@ std::vector<Tensor> gated_residual_pre(
     int64_t hc_count, double eps);
 Tensor gated_residual_post(
     const Tensor&, const Tensor&, const Tensor&, int64_t hc_count);
+// Writes a compatible FP16/FP32 output directly; exact residual aliasing is
+// supported. Unsupported views/types/overlap return false without writing.
+bool try_gated_residual_post_out(const Tensor& branch,const Tensor& residual,
+    const Tensor& injection,const Tensor& output,int64_t hc_count);
 std::vector<Tensor> gated_residual_post_norm(
     const Tensor& branch, const Tensor& residual, const Tensor& injection,
     const Tensor& norm, int64_t hc_count, double eps);

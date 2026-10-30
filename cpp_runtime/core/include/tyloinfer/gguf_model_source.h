@@ -19,6 +19,7 @@ public:
     void read_range_into(std::string_view name, std::uint64_t offset,
                          std::byte* destination, std::size_t size) const override;
     TensorReader tensor_reader(std::string_view name) const override;
+    TensorReader mapped_tensor_reader(std::string_view name) const override;
     TensorBatchReader tensor_batch_reader(std::string_view name) const override;
     std::optional<TensorFileRange> tensor_file_range(std::string_view name) const override;
     bool supports_parallel_tensor_reads() const noexcept override { return true; }

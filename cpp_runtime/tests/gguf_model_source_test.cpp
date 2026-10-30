@@ -102,6 +102,25 @@ void qwen4_source(const std::filesystem::path& directory) {
     const auto bytes = source.read("model.block.0.position_embedding.ngram.head_vocab_sizes");
     int64_t vocab = 0; std::memcpy(&vocab, bytes.data() + 12, 8);
     require(vocab == 2, "GGUF PLE hash metadata missing");
+    auto* predictor=gguf_init_empty();
+    auto* predictor_tensors=ggml_init({1<<16,nullptr,false});
+    for(const auto* name:{"predictor.embedding_norm.weight","predictor.block.0.attention.query_norm.weight",
+            "predictor.block.1.attention.query_norm.weight"}) {
+        auto* t=ggml_new_tensor_1d(predictor_tensors,GGML_TYPE_F32,256);
+        ggml_set_name(t,name);
+        for(int i=0;i<256;++i)static_cast<float*>(t->data)[i]=1.25f;
+        gguf_add_tensor(predictor,t);
+    }
+    const auto predictor_path=directory/"predictor.gguf";
+    require(gguf_write_to_file(predictor,predictor_path.string().c_str(),false),"GGUF predictor companion write failed");
+    gguf_free(predictor);ggml_free(predictor_tensors);
+    const mfq::GgufModelSource with_predictor(main_path,{table_path,predictor_path});
+    const auto predictor_config=nlohmann::json::parse(with_predictor.model_config_json());
+    require(cfg["mtp_num_hidden_layers"]==0 && predictor_config["mtp_num_hidden_layers"]==2,
+        "GGUF predictor layers were not derived from the selected companion");
+    const auto predictor_norm=with_predictor.read("predictor.embedding_norm.weight");
+    float norm=0;std::memcpy(&norm,predictor_norm.data()+12,sizeof(norm));
+    require(norm==.25f,"GGUF predictor norm offset differs from the backbone");
 }
 }
 
@@ -149,9 +168,11 @@ int main() {
         gguf_add_tensor(second, extra);
         const auto second_path = directory / "model-00002-of-00002.gguf";
         require(gguf_write_to_file(second, second_path.string().c_str(), false), "GGUF second shard write failed");
-        const mfq::GgufModelSource split(second_path);
-        require(split.source_paths().size() == 2 && split.tensors().size() == 3 &&
-            split.find_tensor("model.block.0.attention.norm.weight"), "GGUF shard discovery failed");
+        {
+            const mfq::GgufModelSource split(second_path);
+            require(split.source_paths().size() == 2 && split.tensors().size() == 3 &&
+                split.find_tensor("model.block.0.attention.norm.weight"), "GGUF shard discovery failed");
+        }
         gguf_set_val_u16(second, "split.no", 0);
         require(gguf_write_to_file(second, second_path.string().c_str(), false), "GGUF invalid shard write failed");
         bool mismatched = false;
@@ -179,11 +200,29 @@ int main() {
         bool bounded = false;
         try { source->read(table->name, table->nbytes, 1); } catch (const std::out_of_range&) { bounded = true; }
         require(bounded, "out-of-range GGUF read accepted");
+        {
         const auto reader = source->tensor_reader(table->name);
+        const auto mapped = source->mapped_tensor_reader(table->name);
+        require(bool(mapped),"GGUF native rows did not expose a retained mapping");
+        require(!source->mapped_tensor_reader("model.output_norm.weight"),"GGUF dense synthetic header was treated as a raw mapping");
+        bool mapped_bounded=false;
+        std::byte mapped_value{};
+        try {mapped(table->nbytes,&mapped_value,1);}catch(const std::out_of_range&){mapped_bounded=true;}
+        require(mapped_bounded,"out-of-range GGUF mapping read accepted");
+        const auto batch = source->tensor_batch_reader(table->name);
+        std::byte a{},b{},c{};
+        batch({{17,&a,1},{0,&b,1},{17,&c,1}});
+        require(a==std::byte{17} && b==a && c==a,"GGUF scattered/duplicate tensor ranges changed bytes");
+        bool batch_bounded=false;
+        try {batch({{table->nbytes,&a,1}});}catch(const std::out_of_range&){batch_bounded=true;}
+        require(batch_bounded,"out-of-range GGUF batch read accepted");
         source.reset();
         std::byte value{};
         reader(0, &value, 1);
         require(value == std::byte{17}, "retained GGUF reader expired");
+        mapped(17,&value,1);require(value==std::byte{17},"retained GGUF mapping expired with its source");
+        batch({{0,&a,1}});require(a==std::byte{17},"retained GGUF batch reader expired");
+        }
         std::filesystem::resize_file(path, 80);
         bool truncated = false;
         try { mfq::GgufModelSource invalid(path); } catch (const std::runtime_error&) { truncated = true; }

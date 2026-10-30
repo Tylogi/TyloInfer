@@ -1,5 +1,6 @@
 #include "qwen4_exp.h"
 #include "mfq_cuda_norm_ops.h"
+#include "cpp_runtime/backends/cuda/kernels/kernel_dispatch_trace.h"
 
 #include "selected_attention.h"
 
@@ -7,6 +8,8 @@
 #include <cstdlib>
 #include <limits>
 #include <type_traits>
+#include <atomic>
+#include <cstdio>
 #include <cub/block/block_radix_sort.cuh>
 
 namespace mfq_qwen4_exp {
@@ -147,24 +150,26 @@ __global__ void gated_residual_mix_kernel(const Gate* projection,const Value* no
         output[i]=static_cast<Output>(sum/streams);
     }
 }
-template<class Value>
-__global__ void gated_residual_post_kernel(const Value* branch,const Value* residual,
-    const Value* injection,Value* output,int64_t count,int hidden,int streams) {
-    for(int64_t i=int64_t(blockIdx.x)*blockDim.x+threadIdx.x;i<count;i+=int64_t(gridDim.x)*blockDim.x) {
-        const int64_t sample=i/(int64_t(hidden)*streams);
-        const int stream=int((i/hidden)%streams);
-        const Value update=static_cast<Value>(__fmul_rn(static_cast<float>(branch[sample*hidden+i%hidden]),
-            static_cast<float>(injection[sample*streams+stream])));
-        output[i]=static_cast<Value>(__fadd_rn(static_cast<float>(residual[i]),static_cast<float>(update)));
-    }
-}
-
 template<class Branch,class Residual,class Injection>
 using ResidualUpdate=std::conditional_t<std::is_same_v<Branch,float> ||
     std::is_same_v<Injection,float>,float,mfq_half>;
 template<class Branch,class Residual,class Injection>
 using ResidualOutput=std::conditional_t<std::is_same_v<Residual,float> ||
     std::is_same_v<ResidualUpdate<Branch,Residual,Injection>,float>,float,mfq_half>;
+
+template<class Branch,class Residual,class Injection>
+__global__ void gated_residual_post_kernel(const Branch* branch,const Residual* residual,
+    const Injection* injection,ResidualOutput<Branch,Residual,Injection>* output,int64_t count,int hidden,int streams) {
+    using Update=ResidualUpdate<Branch,Residual,Injection>;
+    using Output=ResidualOutput<Branch,Residual,Injection>;
+    for(int64_t i=int64_t(blockIdx.x)*blockDim.x+threadIdx.x;i<count;i+=int64_t(gridDim.x)*blockDim.x) {
+        const int64_t sample=i/(int64_t(hidden)*streams);
+        const int stream=int((i/hidden)%streams);
+        const Update update=static_cast<Update>(__fmul_rn(static_cast<float>(branch[sample*hidden+i%hidden]),
+            static_cast<float>(injection[sample*streams+stream])));
+        output[i]=static_cast<Output>(__fadd_rn(static_cast<float>(residual[i]),static_cast<float>(update)));
+    }
+}
 
 template<class Branch,class Residual,class Injection>
 __global__ void gated_residual_post_norm_kernel(const Branch* branch,const Residual* residual,
@@ -290,6 +295,59 @@ std::vector<Tensor> gated_residual_pre(
     return {mixed, input, injection};
 }
 
+bool try_gated_residual_post_out(const Tensor& branch,const Tensor& residual,
+        const Tensor& injection,const Tensor& output,int64_t streams) {
+    const auto supported=[](const Tensor& t){return t.defined() && t.is_cuda() && t.is_contiguous() &&
+        (t.scalar_type()==tb::kFloat16 || t.scalar_type()==tb::kFloat32);};
+    if(streams<1 || streams>INT_MAX || !supported(branch) || !supported(residual) || !supported(injection) ||
+            !supported(output) || branch.device()!=residual.device() || injection.device()!=residual.device() ||
+            output.device()!=residual.device() || branch.dim()<1 || branch.size(-1)<1 || branch.size(-1)>INT_MAX ||
+            branch.dim()!=residual.dim() || branch.dim()!=injection.dim() || output.sizes()!=residual.sizes())return false;
+    auto shape=branch.sizes().vec();shape.back()*=streams;
+    if(shape!=residual.sizes().vec())return false;
+    shape.back()=streams;if(shape!=injection.sizes().vec())return false;
+    const int mode=(branch.scalar_type()==tb::kFloat32?4:0) |
+        (residual.scalar_type()==tb::kFloat32?2:0) | (injection.scalar_type()==tb::kFloat32?1:0);
+    if(output.scalar_type()!=(mode?tb::kFloat32:tb::kFloat16))return false;
+    if(!output.numel())return true;
+    const auto overlap=[](const Tensor& a,const Tensor& b) {
+        const auto x=reinterpret_cast<std::uintptr_t>(a.data_ptr()),y=reinterpret_cast<std::uintptr_t>(b.data_ptr());
+        return x<=y?y-x<a.nbytes():x-y<b.nbytes();
+    };
+    if(overlap(output,branch) || overlap(output,injection) ||
+            (overlap(output,residual) && output.data_ptr()!=residual.data_ptr()))return false;
+    const MfqCudaGuard guard(residual.device());
+    const auto count=output.numel();const int blocks=int((count+255)/256),hidden=int(branch.size(-1));
+    const auto stream=mfq_current_cuda_stream();
+    const auto launch=[&](auto b,auto r,auto i) {
+        using Branch=decltype(b);using Residual=decltype(r);using Injection=decltype(i);
+        using Output=ResidualOutput<Branch,Residual,Injection>;
+        gated_residual_post_kernel<Branch,Residual,Injection><<<blocks,256,0,stream>>>(branch.data_ptr<Branch>(),
+            residual.data_ptr<Residual>(),injection.data_ptr<Injection>(),output.data_ptr<Output>(),count,hidden,int(streams));
+        if(mfq::cuda::dispatch_trace::enabled())mfq::cuda::dispatch_trace::record(stream,"gr_residual_post",
+            reinterpret_cast<const void*>(gated_residual_post_kernel<Branch,Residual,Injection>),
+            "M="+std::to_string(branch.numel()/hidden)+" hidden="+std::to_string(hidden)+" streams="+std::to_string(streams)+
+            " type_flags="+std::to_string(mode)+" inplace="+std::to_string(output.data_ptr()==residual.data_ptr()));
+    };
+    const auto residual_type=[&](auto b,auto i) {
+        if(residual.scalar_type()==tb::kFloat16)launch(b,mfq_half{},i);else launch(b,float{},i);
+    };
+    const auto injection_type=[&](auto b) {
+        if(injection.scalar_type()==tb::kFloat16)residual_type(b,mfq_half{});else residual_type(b,float{});
+    };
+    if(branch.scalar_type()==tb::kFloat16)injection_type(mfq_half{});else injection_type(float{});
+    TYLOINFER_CUDA_KERNEL_LAUNCH_CHECK();
+    for(const auto& t:{branch,residual,injection,output})t.record_stream(reinterpret_cast<std::uintptr_t>(stream));
+    if(const auto* trace=std::getenv("TYLOINFER_TRACE_KERNEL_DISPATCH");trace && trace[0]=='1' && branch.numel()/hidden>32) {
+        static std::atomic<unsigned> reported{0};
+        const bool inplace=output.data_ptr()==residual.data_ptr();const unsigned bit=inplace?1:2;
+        if(!(reported.fetch_or(bit,std::memory_order_relaxed)&bit))std::fprintf(stderr,
+            "native_gr_prefill_post actual_match=1 M=%lld hidden=%d streams=%lld type_flags=%d inplace=%d\n",
+            static_cast<long long>(branch.numel()/hidden),hidden,static_cast<long long>(streams),mode,int(inplace));
+    }
+    return true;
+}
+
 Tensor gated_residual_post(const Tensor& branch, const Tensor& residual,
                            const Tensor& injection, int64_t streams) {
     mfq_selected_attention::values({&branch, &residual, &injection});
@@ -301,17 +359,13 @@ Tensor gated_residual_post(const Tensor& branch, const Tensor& residual,
     shape.back() = streams;
     TYLOINFER_RUNTIME_CHECK(injection.sizes().vec() == shape, "Qwen4 injection shape disagrees");
     MfqCudaGuard guard(branch.device());
+    const auto value=[](const Tensor& t){return t.scalar_type()==tb::kFloat16 || t.scalar_type()==tb::kFloat32;};
     if(branch.is_contiguous() && residual.is_contiguous() && injection.is_contiguous() &&
-        branch.scalar_type()==residual.scalar_type() && branch.scalar_type()==injection.scalar_type() &&
-        (branch.scalar_type()==tb::kFloat16 || branch.scalar_type()==tb::kFloat32)) {
-        auto output=tb::empty_like(residual);const auto count=output.numel();
-        if(count==0)return output;
-        const int blocks=int((count+255)/256),hidden=int(branch.size(-1));
-        if(branch.scalar_type()==tb::kFloat16)
-            gated_residual_post_kernel<<<blocks,256,0,mfq_current_cuda_stream()>>>(branch.data_ptr<mfq_half>(),residual.data_ptr<mfq_half>(),injection.data_ptr<mfq_half>(),output.data_ptr<mfq_half>(),count,hidden,int(streams));
-        else
-            gated_residual_post_kernel<<<blocks,256,0,mfq_current_cuda_stream()>>>(branch.data_ptr<float>(),residual.data_ptr<float>(),injection.data_ptr<float>(),output.data_ptr<float>(),count,hidden,int(streams));
-        return output;
+            value(branch) && value(residual) && value(injection)) {
+        const auto dtype=branch.scalar_type()==tb::kFloat32 || residual.scalar_type()==tb::kFloat32 ||
+            injection.scalar_type()==tb::kFloat32?tb::kFloat32:tb::kFloat16;
+        auto output=tb::empty(residual.sizes(),residual.options().dtype(dtype));
+        if(try_gated_residual_post_out(branch,residual,injection,output,streams))return output;
     }
     return residual + (branch.unsqueeze(-2) * injection.unsqueeze(-1)).reshape(residual.sizes());
 }

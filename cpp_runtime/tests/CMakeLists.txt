@@ -217,3 +217,10 @@ endif()
 add_executable(mfq-deepseek-v41-vision-layout-test deepseek_v41_vision_layout_test.cpp)
 target_link_libraries(mfq-deepseek-v41-vision-layout-test PRIVATE mfq-models)
 add_test(NAME mfq-deepseek-v41-vision-layout-test COMMAND mfq-deepseek-v41-vision-layout-test)
+
+# The split policy is pure host arithmetic and is testable without CUDA or a GPU.
+add_executable(mfq-gguf-cpu-balance-test gguf_cpu_balance_test.cpp)
+find_package(Threads REQUIRED)
+target_link_libraries(mfq-gguf-cpu-balance-test PRIVATE Threads::Threads)
+target_compile_features(mfq-gguf-cpu-balance-test PRIVATE cxx_std_20)
+add_test(NAME mfq-gguf-cpu-balance-test COMMAND mfq-gguf-cpu-balance-test)
