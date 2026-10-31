@@ -14,6 +14,7 @@ public:
     const std::vector<std::filesystem::path>& source_paths() const noexcept override;
     std::string_view architecture() const noexcept override;
     const std::unordered_map<std::string, std::string>& metadata() const noexcept override;
+    const HadamardTransforms* hadamard_transforms() const noexcept override;
     const std::vector<TensorMetadata>& tensors() const noexcept override;
     const TensorMetadata* find_tensor(std::string_view name) const noexcept override;
     void read_range_into(std::string_view name, std::uint64_t offset,

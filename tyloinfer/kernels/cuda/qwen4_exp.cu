@@ -488,7 +488,7 @@ Tensor live_block_scores(const Tensor& query,const Tensor& pooled,const Tensor& 
 namespace {
 template<int Items>
 __device__ void live_topk_sort(const float* source,const int64_t* ids,float* output,int64_t* out_ids,
-        int row,int columns,int begin,int live,int pools,int count,int64_t out,unsigned char* temporary) {
+        int row,int columns,int begin,int live,int pools,int count,int64_t out,unsigned char* temporary,bool emit_tokens) {
     using Sort=cub::BlockRadixSort<float,256,Items,int64_t>;
     float keys[Items];int64_t indices[Items];
 #pragma unroll
@@ -499,71 +499,129 @@ __device__ void live_topk_sort(const float* source,const int64_t* ids,float* out
         indices[i]=column<live?(ids?ids[at]:column):pools;
     }
     Sort(*reinterpret_cast<typename Sort::TempStorage*>(temporary)).SortDescending(keys,indices);
+    // CUB no longer needs its storage once every thread has its sorted
+    // register values. Reuse it for the final token expansion instead of
+    // writing and rereading an otherwise unused global candidate list.
+    if(emit_tokens)__syncthreads();
+    auto* selected_ids=emit_tokens?reinterpret_cast<int64_t*>(temporary):out_ids+out;
 #pragma unroll
     for(int i=0;i<Items;++i) {
         const int rank=threadIdx.x*Items+i;
-        if(rank<count){output[out+rank]=keys[i];out_ids[out+rank]=indices[i];}
+        if(rank<count){if(!emit_tokens)output[out+rank]=keys[i];selected_ids[rank]=indices[i];}
     }
 }
 __global__ void live_topk_blocks_kernel(const float* source,const int64_t* ids,
         float* output,int64_t* out_ids,const int64_t* positions,int columns,
-        int pools,int pool,int count,int stage,bool compact) {
+        int pools,int pool,int count,int stage,bool compact,int32_t* selected,int budget) {
     constexpr int tile=4096;
     extern __shared__ __align__(16) unsigned char temporary[];
-    const int row=blockIdx.y,begin=int(blockIdx.x)*tile,tiles=(columns+tile-1)/tile;
+    const int row=blockIdx.y,begin=int(blockIdx.x)*tile,tiles=int((int64_t(columns)+tile-1)/tile);
     int live=int(min(int64_t(pools),max(int64_t(0),(positions[row]+1)/pool)));
     for(int s=0;s<stage;++s)live=live/tile*count+min(count,live%tile);
     const int available=min(tile,max(0,live-begin));
     const int64_t out=(int64_t(row)*tiles+blockIdx.x)*count;
+    auto* selected_ids=selected?reinterpret_cast<int64_t*>(temporary):out_ids+out;
     // Entirely unused tiles and already reduced candidate lists need no sort.
     if(available<=count) {
         for(int i=threadIdx.x;i<count;i+=256) {
             const auto at=int64_t(row)*columns+begin+i;
-            output[out+i]=i<available?source[at]:-1e30f;
-            out_ids[out+i]=i<available?(ids?ids[at]:begin+i):pools;
+            if(!selected)output[out+i]=i<available?source[at]:-1e30f;
+            selected_ids[i]=i<available?(ids?ids[at]:begin+i):pools;
         }
-        return;
-    }
+    } else {
     // The graph reserves the maximum context, while each replay has a much
     // shorter live prefix. Keep the reduction tiles and output layout fixed,
     // but sort only the power-of-two range containing this tile's live rows.
     // CUB's stable ordering is unchanged because input column order is kept.
-    if(compact && available<=1024)
-        live_topk_sort<4>(source,ids,output,out_ids,row,columns,begin,live,pools,count,out,temporary);
+    if(compact && available<=256)
+        live_topk_sort<1>(source,ids,output,out_ids,row,columns,begin,live,pools,count,out,temporary,selected!=nullptr);
+    else if(compact && available<=512)
+        live_topk_sort<2>(source,ids,output,out_ids,row,columns,begin,live,pools,count,out,temporary,selected!=nullptr);
+    else if(compact && available<=1024)
+        live_topk_sort<4>(source,ids,output,out_ids,row,columns,begin,live,pools,count,out,temporary,selected!=nullptr);
     else if(compact && available<=2048)
-        live_topk_sort<8>(source,ids,output,out_ids,row,columns,begin,live,pools,count,out,temporary);
-    else live_topk_sort<16>(source,ids,output,out_ids,row,columns,begin,live,pools,count,out,temporary);
+        live_topk_sort<8>(source,ids,output,out_ids,row,columns,begin,live,pools,count,out,temporary,selected!=nullptr);
+    else live_topk_sort<16>(source,ids,output,out_ids,row,columns,begin,live,pools,count,out,temporary,selected!=nullptr);
+    }
+    if(selected) {
+        // Only the final reduction has one CTA per query. Its IDs are now
+        // complete; publish them to this CTA before expanding whole pools
+        // and the incomplete causal tail into the existing token order.
+        __syncthreads();
+        const int64_t position=positions[row];
+        const int width=budget+pool-1;
+        for(int slot=threadIdx.x;slot<width;slot+=blockDim.x) {
+            int64_t token=-1;
+            if(position+1<=budget) {
+                if(slot<=position)token=slot;
+            } else if(int64_t(slot)<int64_t(count)*pool) {
+                const int64_t block=selected_ids[slot/pool];
+                if(block*pool+pool-1<=position)token=block*pool+slot%pool;
+            } else if(slot>=budget) {
+                const int offset=slot-budget;
+                const int64_t tail=(position+1)%pool;
+                if(offset<tail)token=position+1-tail+offset;
+            }
+            selected[int64_t(row)*width+slot]=int32_t(token);
+        }
+    }
 }
 }
 
-Tensor live_topk_blocks(const Tensor& scores,const Tensor& positions,int64_t pool,int64_t count) {
+static Tensor live_topk_impl(const Tensor& scores,const Tensor& positions,int64_t pool,int64_t count,int64_t budget) {
+    TYLOINFER_RUNTIME_CHECK(!budget || (pool>0 && pool<=INT_MAX && budget>0 &&
+        budget<=INT_MAX-pool && count<=budget/pool),"invalid live QSA token selection geometry");
     const auto* option=std::getenv("TYLOINFER_QSA_LIVE_TOPK");
-    if((option && option[0]=='0') || count>1024)
-        return std::get<1>(tb::topk(scores,count,-1,true,false));
+    if((option && option[0]=='0') || count>1024) {
+        auto ids=std::get<1>(tb::topk(scores,count,-1,true,false));
+        return budget?mfq_selected_attention::block_indices_to_tokens(ids,positions,pool,budget):ids;
+    }
     TYLOINFER_RUNTIME_CHECK(scores.is_cuda() && scores.is_contiguous() && scores.dim()==3 && scores.size(0)==1 &&
         scores.scalar_type()==tb::kFloat32 && positions.is_cuda() && positions.is_contiguous() &&
         positions.scalar_type()==tb::kInt64 && positions.numel()==scores.size(1) && pool>0 &&
-        count>0 && count<=scores.size(2),"invalid live QSA top-k geometry");
+        count>0 && count<=scores.size(2) && scores.size(1)<=INT_MAX && scores.size(2)<=INT_MAX,
+        "invalid live QSA top-k geometry");
     MfqCudaGuard guard(scores.device());
     const int rows=int(scores.size(1)),pools=int(scores.size(2));
     const auto* compact_option=std::getenv("TYLOINFER_QSA_TOPK_LIVE_TILE");
     const bool compact=!compact_option || compact_option[0]!='0';
     int columns=pools,stage=0;
     auto keys=scores;Tensor ids;
-    constexpr auto bytes=sizeof(cub::BlockRadixSort<float,256,16,int64_t>::TempStorage);
-    if constexpr(bytes>49152)TYLOINFER_CUDA_CHECK(cudaFuncSetAttribute(live_topk_blocks_kernel,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,int(bytes)));
+    Tensor selected;
+    if(budget)selected=tb::empty({1,rows,budget+pool-1},scores.options().dtype(tb::kInt32));
+    constexpr auto max_bytes=sizeof(cub::BlockRadixSort<float,256,16,int64_t>::TempStorage);
+    if constexpr(max_bytes>49152)TYLOINFER_CUDA_CHECK(cudaFuncSetAttribute(live_topk_blocks_kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,int(max_bytes)));
     do {
-        const int tiles=(columns+4095)/4096;
+        const int tiles=int((int64_t(columns)+4095)/4096);
+        // The maximum candidate count is known without reading live graph
+        // positions. Smaller contexts do not need the largest CUB workspace.
+        const auto bytes=compact && columns<=1024?sizeof(cub::BlockRadixSort<float,256,4,int64_t>::TempStorage):
+            compact && columns<=2048?sizeof(cub::BlockRadixSort<float,256,8,int64_t>::TempStorage):
+            sizeof(cub::BlockRadixSort<float,256,16,int64_t>::TempStorage);
         auto next=tb::empty({1,rows,tiles*count},scores.options());
         auto next_ids=tb::empty(next.sizes(),scores.options().dtype(tb::kInt64));
         live_topk_blocks_kernel<<<dim3(tiles,rows),256,bytes,mfq_current_cuda_stream()>>>(
             keys.data_ptr<float>(),ids.defined()?ids.data_ptr<int64_t>():nullptr,
             next.data_ptr<float>(),next_ids.data_ptr<int64_t>(),positions.data_ptr<int64_t>(),
-            columns,pools,int(pool),int(count),stage++,compact);
+            columns,pools,int(pool),int(count),stage++,compact,
+            tiles==1 && selected.defined()?selected.data_ptr<int32_t>():nullptr,int(budget));
+        if(mfq::cuda::dispatch_trace::enabled())mfq::cuda::dispatch_trace::record(
+            mfq_current_cuda_stream(),"qsa_live_topk",reinterpret_cast<const void*>(live_topk_blocks_kernel),
+            "M="+std::to_string(rows)+" candidate_columns="+std::to_string(columns)+
+            " count="+std::to_string(count)+" selection_fused="+std::to_string(tiles==1 && selected.defined())+
+            " minimum_sort_items="+std::to_string(compact?1:16)+" shared_bytes="+std::to_string(bytes));
         TYLOINFER_CUDA_KERNEL_LAUNCH_CHECK();keys=std::move(next);ids=std::move(next_ids);columns=tiles*int(count);
     } while(columns>count);
-    return ids;
+    return budget?selected:ids;
+}
+
+Tensor live_topk_blocks(const Tensor& scores,const Tensor& positions,int64_t pool,int64_t count) {
+    return live_topk_impl(scores,positions,pool,count,0);
+}
+
+Tensor live_topk_selected_tokens(const Tensor& scores,const Tensor& positions,int64_t pool,int64_t count,int64_t budget) {
+    return live_topk_impl(scores,positions,pool,count,budget);
 }
 
 std::vector<Tensor> ple_dilated_conv_silu(const Tensor& input,

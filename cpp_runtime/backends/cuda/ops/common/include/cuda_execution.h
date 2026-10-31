@@ -385,6 +385,9 @@ struct CudaExecutionContext {
     // Share side streams across projection groups rather than creating
     // a separate set of graph memory pools for every model layer.
     std::unordered_map<int,std::shared_ptr<CudaIndependentBranchExecutor>> projection_executors;
+    // Layers join this branch before advancing, so one shared-expert stream
+    // per device suffices. Keep it separate from nested projection branches.
+    std::unordered_map<int,std::shared_ptr<CudaIndependentBranchExecutor>> shared_expert_executors;
     std::shared_ptr<mfq::cuda::KvOffloadStore> qsa_kv_store;
     std::shared_ptr<mfq::cuda::KvMemoryManager> kv_memory;
     std::unordered_map<int, MoeRouteLayerStats> moe_route_stats;

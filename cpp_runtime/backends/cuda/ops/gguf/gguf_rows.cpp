@@ -1,4 +1,5 @@
 #include "gguf_weight.h"
+#include "gguf_rotation.h"
 #include "../../kernels/gguf.h"
 #include "mfq_weight_memory.h"
 #include <algorithm>
@@ -26,6 +27,8 @@ GgufRowTable::GgufRowTable(const mfq::ModelSource& source, const std::string& na
         throw std::invalid_argument("GGUF row table requires a matrix: " + name);
     type_ = mfq::gguf::quant_type(record->dtype);
     rows_ = record->shape->at(0); columns_ = record->shape->at(1);
+    if(load_gguf_input_rotation(source,name,columns_,0,columns_,0,false))
+        throw std::invalid_argument("GGUF streaming row tables do not yet support an inverse Hadamard transform");
     row_bytes_ = mfq::gguf::row_bytes(type_, columns_);
     if (rows_ <= 0 || std::uint64_t(rows_) > UINT64_MAX / row_bytes_ ||
             record->nbytes != std::uint64_t(rows_) * row_bytes_)

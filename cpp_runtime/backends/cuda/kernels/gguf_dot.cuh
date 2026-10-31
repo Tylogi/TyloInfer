@@ -65,6 +65,59 @@ template<> struct Dot<GGML_TYPE_Q8_K> {
         return weight->d * __low2float(x[part].ds) * sum;
     }
 };
+// Compact 128-value formats reuse one decoded four-value fragment across
+// activation rows, including the existing grouped expert and Gate/Up kernels.
+struct CompactIntegerWeight { std::uint32_t codes; float scale; int part; };
+struct CompactFloatWeight { struct { float x, y, z, w; } values; int part; };
+static_assert(sizeof(CompactFloatWeight) == 5 * sizeof(std::uint32_t));
+template<int Format> struct CompactDot {
+    using L = compact_detail::Layout<Format>;
+    static constexpr int qk = 128, parts = 32, step = 1;
+    using Weight = std::conditional_t<L::bits == 0, CompactIntegerWeight, CompactFloatWeight>;
+    __device__ static Weight load(const void* data, int block, int part) {
+        const auto* q = static_cast<const std::uint8_t*>(data) + std::uint64_t(block) * L::bytes;
+        Weight w{}; w.part = part;
+        const float d = compact_detail::scale_at(q + (L::bits ? 0 : 26));
+        if constexpr (!L::bits) { w.scale = d; w.codes = compact_detail::ternary_four(q, part); }
+        else {
+            const auto values = compact_detail::decode_four<L::bits, L::steps>(q + 2, part);
+            w.values = {values.x, values.y, values.z, values.w};
+            w.values.x = __fmul_rn(w.values.x, d); w.values.y = __fmul_rn(w.values.y, d);
+            w.values.z = __fmul_rn(w.values.z, d); w.values.w = __fmul_rn(w.values.w, d);
+        }
+        return w;
+    }
+    __device__ static int input_block(const Weight& w) { return w.part / 8; }
+    __device__ static float apply_u(const Weight& w, const int (&codes)[8], float scale) {
+        const auto x = std::uint32_t(codes[w.part % 8]);
+        if constexpr (!L::bits) return w.scale * scale * ggml_cuda_dp4a(int(w.codes), int(x), 0);
+        else {
+            float sum = __fmul_rn(w.values.x, float(std::int8_t(x)) * scale);
+            sum = __fmaf_rn(w.values.y, float(std::int8_t(x >> 8)) * scale, sum);
+            sum = __fmaf_rn(w.values.z, float(std::int8_t(x >> 16)) * scale, sum);
+            return __fmaf_rn(w.values.w, float(std::int8_t(x >> 24)) * scale, sum);
+        }
+    }
+    __device__ static float apply(const Weight& w, const block_q8_1* x) {
+        const auto& packet = x[w.part / 8];
+        if constexpr (!L::bits) return w.scale * __low2float(packet.ds) *
+            ggml_cuda_dp4a(int(w.codes), get_int_b4(packet.qs, w.part % 8), 0);
+        else {
+            const auto codes = std::uint32_t(get_int_b4(packet.qs, w.part % 8));
+            const float d = __low2float(packet.ds);
+            float sum = __fmul_rn(w.values.x, float(std::int8_t(codes)) * d);
+            sum = __fmaf_rn(w.values.y, float(std::int8_t(codes >> 8)) * d, sum);
+            sum = __fmaf_rn(w.values.z, float(std::int8_t(codes >> 16)) * d, sum);
+            return __fmaf_rn(w.values.w, float(std::int8_t(codes >> 24)) * d, sum);
+        }
+    }
+    __device__ static float apply(const void* data, const block_q8_1* x, int block, int part) {
+        return apply(load(data, block, part), x);
+    }
+};
+#define TYLOINFER_COMPACT_DOT(Name) template<> struct Dot<GGML_TYPE_##Name> : CompactDot<GGML_TYPE_##Name> {};
+TYLOINFER_GGUF_COMPACT_FORMATS(TYLOINFER_COMPACT_DOT)
+#undef TYLOINFER_COMPACT_DOT
 #include "gguf_dot_prepared.cuh"
 
 template<int Format>

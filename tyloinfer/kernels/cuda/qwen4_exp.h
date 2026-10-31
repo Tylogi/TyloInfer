@@ -35,6 +35,8 @@ std::vector<Tensor> live_index_pool(const Tensor& index, const Tensor& positions
     const Tensor& cache_positions, int64_t pool, int64_t maximum);
 Tensor live_topk_blocks(const Tensor& scores, const Tensor& cache_positions,
     int64_t pool, int64_t count);
+Tensor live_topk_selected_tokens(const Tensor& scores, const Tensor& cache_positions,
+    int64_t pool, int64_t count, int64_t budget);
 std::vector<Tensor> ple_dilated_conv_silu(
     const Tensor&, const Tensor&, const std::optional<Tensor>& state,
     int64_t dilation);

@@ -89,6 +89,9 @@ set_target_properties(mfq-cuda-core PROPERTIES
 
 set(TYLOINFER_CUDA_KERNEL_SOURCES
     ${TYLOINFER_CUDA_ROOT}/kernels/gguf.cu
+    ${TYLOINFER_CUDA_ROOT}/kernels/gguf_input.cu
+    ${TYLOINFER_CUDA_ROOT}/kernels/gguf_compact.cu
+    ${TYLOINFER_CUDA_ROOT}/kernels/gguf_residual.cu
     ${TYLOINFER_CUDA_ROOT}/kernels/gguf_gemm.cu
     ${TYLOINFER_CUDA_ROOT}/kernels/gguf_tensorcore.cu
     ${TYLOINFER_CUDA_ROOT}/kernels/gguf_mmq.cu
@@ -303,6 +306,12 @@ if(BUILD_TESTING)
 
     mfq_add_cuda_test(mfq-cuda-context-test
         ${TYLOINFER_CUDA_ROOT}/tests/mfq_cuda_context_test.cu)
+    mfq_add_cuda_test(tyloinfer-cuda-hadamard-test
+        ${TYLOINFER_CUDA_ROOT}/tests/hadamard_test.cu
+        mfq-cuda-native-kernels)
+    mfq_add_cuda_test(tyloinfer-cuda-gguf-compact-test
+        ${TYLOINFER_CUDA_ROOT}/tests/gguf_compact_test.cpp
+        mfq-cuda-native-kernels mfq-ggml)
     mfq_add_cuda_test(tyloinfer-cuda-gguf-quant-test
         ${TYLOINFER_CUDA_ROOT}/tests/gguf_quant_test.cpp
         mfq-cuda-native-kernels mfq-ggml mfq-ggml-internal-headers mfq-core)
@@ -471,6 +480,8 @@ set(TYLOINFER_CUDA_TRANSFORMER_SOURCES
 
 set(TYLOINFER_CUDA_RUNTIME_OP_SOURCES
     ${TYLOINFER_CUDA_ROOT}/ops/gguf/gguf_weight.cpp
+    ${TYLOINFER_CUDA_ROOT}/ops/gguf/gguf_residual.cpp
+    ${TYLOINFER_CUDA_ROOT}/ops/gguf/gguf_rotation.cpp
     ${TYLOINFER_CUDA_ROOT}/ops/gguf/gguf_rows.cpp
     ${TYLOINFER_CUDA_ROOT}/ops/gguf/gguf_experts.cpp
     ${TYLOINFER_CUDA_ROOT}/ops/gguf/gguf_cpu_executor.cpp
@@ -782,12 +793,20 @@ if(BUILD_TESTING)
     add_test(NAME tyloinfer-cuda-gdn-prepared-replay-test
         COMMAND tyloinfer-cuda-gdn-prefill-test --gdn-prepared-replay-check)
     set_tests_properties(tyloinfer-cuda-gdn-prepared-replay-test PROPERTIES SKIP_RETURN_CODE 77)
-    add_executable(tyloinfer-cuda-qsa-test ${TYLOINFER_CUDA_ROOT}/tests/qsa_test.cpp)
+    add_executable(tyloinfer-cuda-qsa-test ${TYLOINFER_CUDA_ROOT}/tests/qsa_test.cpp
+        ${TYLOINFER_CUDA_ROOT}/tests/qsa_tile_bench.cu)
     mfq_configure_cuda_runtime_target(tyloinfer-cuda-qsa-test)
     target_compile_definitions(tyloinfer-cuda-qsa-test PRIVATE TYLOINFER_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
     target_link_libraries(tyloinfer-cuda-qsa-test PRIVATE mfq-cuda-runtime)
+    target_compile_options(tyloinfer-cuda-qsa-test PRIVATE
+        "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;--extended-lambda>")
+    set_target_properties(tyloinfer-cuda-qsa-test PROPERTIES
+        CUDA_ARCHITECTURES "${TYLOINFER_CUDA_ARCHITECTURES}" CUDA_RUNTIME_LIBRARY Shared
+        CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
     add_test(NAME tyloinfer-cuda-qsa-test COMMAND tyloinfer-cuda-qsa-test)
     set_tests_properties(tyloinfer-cuda-qsa-test PROPERTIES SKIP_RETURN_CODE 77)
+    add_test(NAME tyloinfer-cuda-qsa-topk-select-test COMMAND tyloinfer-cuda-qsa-test --topk-select-check)
+    set_tests_properties(tyloinfer-cuda-qsa-topk-select-test PROPERTIES SKIP_RETURN_CODE 77)
     add_executable(mfq-gdn-decode-window-test ${TYLOINFER_CUDA_ROOT}/tests/gdn_decode_window_test.cpp)
     mfq_configure_cuda_runtime_target(mfq-gdn-decode-window-test)
     target_compile_definitions(mfq-gdn-decode-window-test PRIVATE TYLOINFER_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
@@ -864,6 +883,10 @@ if(BUILD_TESTING)
     set_tests_properties(tyloinfer-cuda-gr-prefill-read PROPERTIES SKIP_RETURN_CODE 77)
     add_test(NAME tyloinfer-cuda-gr-post-mixed COMMAND tyloinfer-cuda-gr-bf16-test --post-mixed-check)
     set_tests_properties(tyloinfer-cuda-gr-post-mixed PROPERTIES SKIP_RETURN_CODE 77)
+    add_test(NAME tyloinfer-cuda-shared-gate-fp32 COMMAND tyloinfer-cuda-gr-bf16-test --shared-gate-multiply-check)
+    set_tests_properties(tyloinfer-cuda-shared-gate-fp32 PROPERTIES SKIP_RETURN_CODE 77)
+    add_test(NAME tyloinfer-cuda-gguf-shared-stream COMMAND tyloinfer-cuda-gguf-runtime-test --shared-stream-check)
+    set_tests_properties(tyloinfer-cuda-gguf-shared-stream PROPERTIES SKIP_RETURN_CODE 77)
     mfq_configure_cuda_runtime_target(tyloinfer-cuda-dflash2-test)
     target_link_libraries(tyloinfer-cuda-dflash2-test PRIVATE mfq-cuda-runtime)
     target_compile_definitions(tyloinfer-cuda-dflash2-test PRIVATE TYLOINFER_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
@@ -883,10 +906,13 @@ if(BUILD_TESTING)
         target_compile_options(tyloinfer-cuda-gguf-runtime-test PRIVATE /EHsc)
     endif()
     add_test(NAME tyloinfer-cuda-gguf-runtime-test COMMAND tyloinfer-cuda-gguf-runtime-test)
+    add_test(NAME tyloinfer-cuda-gguf-gr-prepare-test COMMAND tyloinfer-cuda-gguf-runtime-test --residual-pre-check)
+    set_tests_properties(tyloinfer-cuda-gguf-gr-prepare-test PROPERTIES SKIP_RETURN_CODE 77)
     add_test(NAME tyloinfer-cuda-gguf-mmq-swiglu-test COMMAND tyloinfer-cuda-gguf-runtime-test --mmq-swiglu-check)
     set_tests_properties(tyloinfer-cuda-gguf-mmq-swiglu-test PROPERTIES SKIP_RETURN_CODE 77)
     # Runs before device discovery and verifies the portable CPU expression.
     add_test(NAME tyloinfer-gguf-cpu-activation-test COMMAND tyloinfer-cuda-gguf-runtime-test --cpu-activation-check)
+    add_test(NAME tyloinfer-gguf-speculative-journal-test COMMAND tyloinfer-cuda-gguf-runtime-test --speculative-journal-check)
     add_test(NAME tyloinfer-gguf-cpu-queue-test COMMAND tyloinfer-cuda-gguf-runtime-test --cpu-queue-check)
     add_test(NAME tyloinfer-gguf-expert-image-test COMMAND tyloinfer-cuda-gguf-runtime-test --expert-image-check)
     set_tests_properties(tyloinfer-gguf-expert-image-test PROPERTIES SKIP_RETURN_CODE 77)

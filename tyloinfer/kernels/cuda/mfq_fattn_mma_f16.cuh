@@ -286,6 +286,14 @@ static constexpr __host__ __device__ fattn_mma_config mfq_fattn_mma_select_confi
     if(indirect && DKQ==256 && DV==256 && ncols==16 && config.nthreads==64 && config.nbatch_fa==32) {
         config.nthreads=128;config.occupancy=2;config.nbatch_fa=64;
     }
+    // An eight-head gather retains the K/V tile size. Four warps split those
+    // irregular loads and output accumulators instead of doubling each
+    // thread's temporary storage in the two-warp configuration.
+    // Four warp partitions need at least four 16-row MMA fragments; a
+    // 32-key tile must retain its two-warp mapping.
+    if(indirect && ncols==8 && config.nthreads==64 && config.nbatch_fa>=64) {
+        config.nthreads=128;config.occupancy=2;
+    }
     return config;
 }
 static constexpr __device__ fattn_mma_config mfq_fattn_mma_get_config(

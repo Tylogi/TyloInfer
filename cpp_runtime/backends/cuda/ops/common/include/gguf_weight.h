@@ -7,25 +7,32 @@
 #include <optional>
 #include <functional>
 
+struct GgufInputRotation;
 struct GgufWeight {
     mfq_tensor_backend::Tensor packed;
     ggml_type type = GGML_TYPE_COUNT;
     std::int64_t out = 0, neuron_len = 0;
     std::uint64_t row_bytes = 0;
+    std::shared_ptr<const GgufInputRotation> rotation;
+    bool prefers_original_input() const noexcept {
+        return bool(rotation) || (type >= GGML_TYPE_TQ2_T && type <= GGML_TYPE_TQK4);
+    }
     mfq_tensor_backend::Tensor forward(mfq_tensor_backend::Tensor input,bool allow_mmq = true) const;
     // Consume the native Q8_1 packet produced by a fused upstream operator.
     mfq_tensor_backend::Tensor forward_q8(const mfq_tensor_backend::Tensor&,std::int64_t tokens,
         mfq_tensor_backend::ScalarType output_type,bool position_major=false) const;
     mfq_tensor_backend::Tensor embedding(mfq_tensor_backend::Tensor ids) const;
     mfq_tensor_backend::Tensor dequantize() const;
+    mfq_tensor_backend::Tensor dequantize_stored() const;
 };
+bool same_gguf_input_basis(const GgufWeight&, const GgufWeight&);
 // Combine compatible immutable row images and replace each component with a
 // view of the shared allocation. The total resident weight payload is unchanged.
 GgufWeight combine_gguf_rows(const std::vector<GgufWeight*>& weights);
-// Small-window projections with a common input quantize that input once,
-// including matrices whose GGUF encodings differ.
+// Small-window projections share activation packets. Floating codebooks and
+// transformed weights retain the original activation when it is required.
 struct GgufProjectionInput {
-    mfq_tensor_backend::Tensor native, interleaved;
+    mfq_tensor_backend::Tensor native, interleaved, original;
     std::vector<std::int64_t> shape;
     std::int64_t tokens = 0;
     mfq_tensor_backend::ScalarType dtype = mfq_tensor_backend::kFloat32;
@@ -73,6 +80,7 @@ private:
 };
 struct GgufRoutedWeight {
     std::shared_ptr<GgufExpertCache> cache;
+    std::shared_ptr<const GgufInputRotation> rotation;
     // Predictor experts are immutable model weights, outside the target's
     // evictable cache and its prefill workspace loans.
     mfq_tensor_backend::Tensor resident_packed;
@@ -87,14 +95,19 @@ struct GgufRoutedWeight {
     mfq_tensor_backend::Tensor forward(mfq_tensor_backend::Tensor source,
         mfq_tensor_backend::Tensor ids) const;
 };
+struct CudaIndependentBranchExecutor;
 struct GgufMoeBanks {
     std::shared_ptr<GgufRoutedWeight> gate, up, down;
-    // Independent shared-expert work runs after streamed routes are published
-    // and the transfer stream has started, before routed expert computation.
+    // Independent shared-expert work runs after streamed routes are published.
+    // The serial path starts it after starting the transfer stream.
+    // A prepared branch executor can overlap it with routed computation;
+    // the parent joins before consuming either result. Profiling is serial
+    // so layer timestamps measure complete shared work, as in Strata.
     // Resident/prefill calls execute it once before their own computation.
     mfq_tensor_backend::Tensor forward(mfq_tensor_backend::Tensor source,
         mfq_tensor_backend::Tensor ids, mfq_tensor_backend::Tensor weights, float limit = 0,
-        const std::function<void()>& independent_work = {}) const;
+        const std::function<void()>& independent_work = {},
+        CudaIndependentBranchExecutor* shared_executor = nullptr) const;
 };
 
 GgufWeight load_gguf_weight(const mfq::ModelSource& source, const std::string& name,

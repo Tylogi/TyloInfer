@@ -12,6 +12,7 @@
 #include <chrono>
 #include <bit>
 #include <cmath>
+#include <climits>
 #include <cstring>
 #include <cstdlib>
 #include <fstream>
@@ -749,6 +750,50 @@ void projection_benchmark(int only_tokens=0) {
         }
     }
 }
+void prompt_projection_benchmark(int tokens,int rows,int columns) {
+    using namespace mfq::cuda;using namespace mfq::cuda::dflash2;
+    if(tokens<1 || tokens>INT_MAX-7 || rows<1 || rows>INT_MAX-31 ||
+            columns<1 || columns>INT_MAX-511 || columns%32)
+        throw std::invalid_argument("DFlash2 prompt projection geometry differs");
+    const auto stream=mfq_current_cuda_stream();
+    const int pk=(columns+511)/512*512,pn=(rows+31)/32*32,pm=(tokens+7)/8*8;
+    const auto fp=pattern({rows,columns},.3f);
+    auto packed=tb::empty({int64_t(rows)*(columns/32)*34},fp.options().dtype(tb::kUInt8));
+    quantize_row_q8_0_ref(fp.data_ptr<float>(),static_cast<block_q8_0*>(packed.data_ptr()),int64_t(rows)*columns);
+    const auto weights=packed.to(tb::kCUDA);
+    auto tiles=tb::empty({int64_t(pn)*(pk/32)*34},weights.options());
+    q8_tile(weights.data_ptr(),tiles.data_ptr(),rows,columns,stream);
+    const auto input=pattern({tokens,columns},.7f).to(tb::kCUDA);
+    auto codes=tb::empty({int64_t(pm)*pk},weights.options()),scales=tb::empty({int64_t(pm)*(pk/32)},input.options());
+    std::array<tb::Tensor,2> outputs{tb::full({tokens,rows},NAN,input.options()),tb::full({tokens,rows},INFINITY,input.options())};
+    const auto launch=[&](int mode) {
+        const int step=mode?tokens:kQ8TileRows;
+        for(int first=0;first<tokens;first+=step) {
+            const int count=std::min(step,tokens-first);
+            Q8TiledMatrix matrix{tiles.data_ptr(),outputs[mode].data_ptr<float>()+int64_t(first)*rows,rows,pn};
+            q8_quantize(input.data_ptr<float>()+int64_t(first)*columns,codes.data_ptr(),scales.data_ptr<float>(),count,columns,stream);
+            q8_gemm(&matrix,1,codes.data_ptr(),scales.data_ptr<float>(),count,columns,stream);
+        }
+    };
+    for(int i=0;i<3;++i){launch(0);launch(1);}
+    const auto a=outputs[0].cpu().contiguous(),b=outputs[1].cpu().contiguous();
+    for(int64_t i=0;i<a.numel();++i)require(std::isfinite(a.data_ptr<float>()[i]) &&
+        a.data_ptr<float>()[i]==b.data_ptr<float>()[i],"DFlash2 batched prompt projection changed an output or missed a tail");
+    std::vector<double> gpu[2],wall[2];
+    for(int trial=0;trial<7;++trial)for(int order=0;order<2;++order) {
+        const int mode=(trial+order)%2;
+        Event begin(0),end(0);begin.record(stream);const auto start=std::chrono::steady_clock::now();
+        launch(mode);end.record(stream);end.synchronize();
+        wall[mode].push_back(std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-start).count());
+        float ms=0;TYLOINFER_NATIVE_CUDA_CHECK(cudaEventElapsedTime(&ms,begin.get(),end.get()));gpu[mode].push_back(ms*1000);
+    }
+    for(int mode=0;mode<2;++mode) {
+        std::sort(gpu[mode].begin(),gpu[mode].end());std::sort(wall[mode].begin(),wall[mode].end());
+        std::cout<<"DFlash2 prompt projection M="<<tokens<<" N="<<rows<<" K="<<columns
+            <<" batched="<<mode<<" gpu_us="<<gpu[mode][3]<<" wall_us="<<wall[mode][3]
+            <<" median7=1 output_bit_exact=1 kernel_launches="<<2*(mode?1:(tokens+7)/8)<<'\n';
+    }
+}
 void check_tiled_gemm() {
     using namespace mfq::cuda::dflash2;
     const auto host=tb::TensorOptions().device(tb::kCPU);
@@ -764,12 +809,13 @@ void check_tiled_gemm() {
         auto bytes=restored.cpu();
         require(std::memcmp(bytes.data_ptr(),packed.data_ptr(),packed.nbytes())==0,
             "DFlash2 Q8_0 tiling changed a weight code, scale, or unaligned tail");
-        for(int tokens:{1,2,3,4,5,6,7,8}) {
+        for(int tokens:{1,2,3,4,5,6,7,8,9,17,35}) {
             auto input=pattern({tokens,columns},.4f),x=input.to(tb::kCUDA);
-            auto codes=tb::empty({8*pk},weights.options()),scales=tb::empty({8*(pk/32)},x.options());
+            const int padded_tokens=(tokens+7)/8*8;
+            auto codes=tb::empty({int64_t(padded_tokens)*pk},weights.options()),scales=tb::empty({int64_t(padded_tokens)*(pk/32)},x.options());
             q8_quantize(x.data_ptr<float>(),codes.data_ptr(),scales.data_ptr<float>(),tokens,columns,mfq_current_cuda_stream());
             auto cq=codes.cpu(),cs=scales.cpu();
-            for(int t=0;t<8;++t)for(int block=0;block<pk/32;++block) {
+            for(int t=0;t<padded_tokens;++t)for(int block=0;block<pk/32;++block) {
                 float maximum=0;
                 for(int i=0;i<32;++i)if(t<tokens && block*32+i<columns)
                     maximum=std::max(maximum,std::abs(input.data_ptr<float>()[t*columns+block*32+i]));
@@ -961,7 +1007,8 @@ void fixture(const std::filesystem::path& directory,int layers=1,bool attention_
         int64_t count = 1; for (auto size : shape) count *= size;
         const auto begin = bytes.size() * 2;
         bytes.insert(bytes.end(), count, std::uint16_t(std::bit_cast<std::uint32_t>(value) >> 16));
-        if(attention_sensitive && name.find("layers.")==0 && name.find("norm.weight")==std::string::npos)
+        if(attention_sensitive && (name=="fc.weight" ||
+                (name.find("layers.")==0 && name.find("norm.weight")==std::string::npos)))
             for(int64_t i=0;i<count;++i) {
                 const float v=value+.025f*std::sin(float(i)*.17f+float(name.size()));
                 bytes[begin/2+i]=std::uint16_t(std::bit_cast<std::uint32_t>(v)>>16);
@@ -1041,6 +1088,21 @@ void context_overlap_reference(const std::filesystem::path& directory) {
         require(x.scalar_type()==y.scalar_type() && x.sizes()==y.sizes() &&
             !std::memcmp(x.data_ptr(),y.data_ptr(),x.nbytes()),message);
     };
+    // Prompt splitting must not switch the draft's arithmetic. The same raw
+    // features and absolute positions must produce the same committed rings.
+    auto partitioned=mfq::cuda::dflash2::load(execution,target,directory);
+    for(int offset=0;offset<history.size(1);offset+=8)
+        partitioned->append_target_context(history.narrow(1,offset,std::min<int64_t>(8,history.size(1)-offset)),offset);
+    const auto seed_last=history.narrow(1,history.size(1)-1,1);
+    const auto bulk_state=serial->capture_session_state(history.size(1),seed_last);
+    const auto split_state=partitioned->capture_session_state(history.size(1),seed_last);
+    for(std::size_t layer=0;layer<bulk_state.qwen4_blocks.size();++layer) {
+        exact(bulk_state.qwen4_blocks[layer].keys,split_state.qwen4_blocks[layer].keys,
+            "DFlash2 prompt splitting changed the committed K ring");
+        exact(bulk_state.qwen4_blocks[layer].values,split_state.qwen4_blocks[layer].values,
+            "DFlash2 prompt splitting changed the committed V ring");
+    }
+    partitioned.reset();
     int64_t position=35;int step=0;
     for(int rows:{1,4,2,3,8,1,7,4,2,3,1,8,5,6,2,4}) {
         const auto features=pattern({1,rows,64},.31f*(++step)).to(tb::kCUDA);
@@ -1377,6 +1439,7 @@ int main(int argc, char** argv) {
         if(argc==5 && std::string(argv[1])=="--context-overlap-bench"){model_parity(argv[2],argv[3],argv[4],true);return 0;}
         if(argc==2 && std::string(argv[1])=="--rotary-bench"){rotary_benchmark();return 0;}
         if(argc>=2 && std::string(argv[1])=="--projection-bench"){projection_benchmark(argc>2?std::stoi(argv[2]):0);return 0;}
+        if(argc==5 && std::string(argv[1])=="--prompt-projection-bench"){prompt_projection_benchmark(std::stoi(argv[2]),std::stoi(argv[3]),std::stoi(argv[4]));return 0;}
         if(argc==10 && std::string(argv[1])=="--context-attention-bench"){
             context_attention_benchmark(std::stoi(argv[2]),std::stoi(argv[3]),std::stoi(argv[4]),std::stoi(argv[5]),
                 std::stoi(argv[6]),std::stoi(argv[7]),std::stoi(argv[8]),std::stoi(argv[9]));return 0;}

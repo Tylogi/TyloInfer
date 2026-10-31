@@ -6,6 +6,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <climits>
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
@@ -75,11 +76,13 @@ __global__ void tile(const unsigned char* source,unsigned char* destination,
 }
 __global__ void quantize(const float* input,signed char* codes,float* scales,
         int tokens,int columns,int pk) {
-    const int block=blockIdx.x*8+(threadIdx.x>>5),row=blockIdx.y,lane=threadIdx.x&31;
+    const int block=blockIdx.x*8+(threadIdx.x>>5),lane=threadIdx.x&31;
     if(block>=pk/32)return;
-    const int column=block*32+lane;
-    const float value=row<tokens && column<columns?input[std::int64_t(row)*columns+column]:0.f;
-    store_planar_q8(value,codes,scales,row,column,pk);
+    const int column=block*32+lane,padded_tokens=(tokens+7)/8*8;
+    for(std::int64_t row=blockIdx.y;row<padded_tokens;row+=gridDim.y) {
+        const float value=row<tokens && column<columns?input[std::int64_t(row)*columns+column]:0.f;
+        store_planar_q8(value,codes,scales,int(row),column,pk);
+    }
 }
 __global__ void activate_float(const float* gate,const float* up,float* output,std::int64_t count) {
     const auto i=std::int64_t(blockIdx.x)*blockDim.x+threadIdx.x;
@@ -98,11 +101,12 @@ struct Df2Seg { const int8_t* q; const __half* d; float* y; int n_out; int row0;
 struct Df2Segs { Df2Seg s[3]; int n; };
 
 template <int WARPS, bool COMPUTE, int Tokens=8, int UNR=2,int Rows=8>
-__global__ void __launch_bounds__(WARPS * 32) gemm8_kernel(Df2Segs segs, const int8_t* __restrict__ xq, const float* __restrict__ xd, int n_in, int ncols) {
+__device__ __forceinline__ void gemm_tile(Df2Segs segs, const int8_t* __restrict__ xq,
+        const float* __restrict__ xd, int n_in, int ncols,int group,int first) {
     constexpr int R=Rows;
     static_assert(R>0 && 8%R==0);
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int row_g = (blockIdx.x * WARPS + warp) * R;   // first row of this warp's group, over all the launch's matrices
+    const int row_g = (group * WARPS + warp) * R;   // first row of this warp's group, over all the launch's matrices
     // Dynamic indexing materialized the whole 104-byte descriptor in local
     // memory per thread. Constant fields remain in kernel parameter storage.
     Df2Seg sg=segs.s[0];
@@ -114,7 +118,8 @@ __global__ void __launch_bounds__(WARPS * 32) gemm8_kernel(Df2Segs segs, const i
     // Eight live input columns then need 32 accumulators rather than 64.
     const int4* wq = reinterpret_cast<const int4*>(sg.q + (size_t)(row0/8)*8*n_in+(row0%8)*512) + lane;
     const __half* wd = sg.d + (size_t)(row0/8)*8*nb+(row0%8)*16 + (lane >> 1);
-    const int4* xv = reinterpret_cast<const int4*>(xq) + lane;
+    const int4* xv = reinterpret_cast<const int4*>(xq+size_t(first)*n_in) + lane;
+    xd+=size_t(first)*nb;
     float acc[R][Tokens];
 #pragma unroll
     for (int r = 0; r < R; ++r)
@@ -163,10 +168,25 @@ __global__ void __launch_bounds__(WARPS * 32) gemm8_kernel(Df2Segs segs, const i
             v += __shfl_xor_sync(0xffffffffu, v, 4);
             v += __shfl_xor_sync(0xffffffffu, v, 2);
             v += __shfl_xor_sync(0xffffffffu, v, 1);
-            if (lane == 0 && c < ncols && row0 + r < sg.n_out) sg.y[(size_t) c * sg.n_out + row0 + r] = __bfloat162float(__float2bfloat16_rn(v));
+            if (lane == 0 && c < ncols && row0 + r < sg.n_out) sg.y[(size_t(first)+c)*sg.n_out+row0+r] = __bfloat162float(__float2bfloat16_rn(v));
         }
 }
 
+template<int WARPS,bool COMPUTE,int Tokens=8,int UNR=2,int Rows=8>
+__global__ void __launch_bounds__(WARPS*32) gemm8_kernel(Df2Segs segs,const int8_t* xq,
+        const float* xd,int n_in,int ncols) {
+    gemm_tile<WARPS,COMPUTE,Tokens,UNR,Rows>(segs,xq,xd,n_in,ncols,blockIdx.x,0);
+}
+__global__ void __launch_bounds__(128) gemm_many_kernel(Df2Segs segs,const int8_t* xq,
+        const float* xd,int n_in,int tokens,int groups) {
+    const int tiles=(tokens+7)/8;
+    // Nearby CTAs reuse a weight row group across input tiles in L2. A
+    // bounded grid-stride launch also supports large token/output axes.
+    for(std::int64_t work=blockIdx.x;work<std::int64_t(groups)*tiles;work+=gridDim.x) {
+        const int first=int(work%tiles)*8,live=min(8,tokens-first);
+        gemm_tile<4,true,8,2,4>(segs,xq,xd,n_in,live,int(work/tiles),first);
+    }
+}
 
 }
 void q8_tile(const void* blocks,void* tiles,int rows,int columns,cudaStream_t stream) {
@@ -183,13 +203,13 @@ void q8_untile(const void* tiles,void* blocks,int rows,int columns,cudaStream_t 
 }
 void q8_quantize(const float* input,void* codes,float* scales,int tokens,int columns,cudaStream_t stream) {
     const int pk=padded_columns(columns);
-    if(tokens<1 || tokens>8)throw std::invalid_argument("DFlash2 tiled GEMM uses 1..8 tokens");
-    quantize<<<dim3((pk/32+7)/8,8),256,0,stream>>>(input,static_cast<signed char*>(codes),scales,tokens,columns,pk);check();
+    if(tokens<1 || tokens>INT_MAX-7)throw std::invalid_argument("DFlash2 padded token rows overflow");
+    quantize<<<dim3((pk/32+7)/8,std::min((tokens+7)/8*8,65535)),256,0,stream>>>(input,static_cast<signed char*>(codes),scales,tokens,columns,pk);check();
 }
 void q8_gemm(const Q8TiledMatrix* matrices,int count,const void* codes,const float* scales,
         int tokens,int columns,cudaStream_t stream) {
     const int pk=padded_columns(columns);
-    if(count<1 || count>3 || tokens<1 || tokens>8)throw std::invalid_argument("DFlash2 tiled GEMM batch differs");
+    if(count<1 || count>3 || tokens<1 || tokens>INT_MAX-7)throw std::invalid_argument("DFlash2 tiled GEMM batch differs");
     Df2Segs segs{};segs.n=count;int rows=0;
     for(int i=0;i<count;++i) {
         const auto& m=matrices[i];
@@ -205,6 +225,15 @@ void q8_gemm(const Q8TiledMatrix* matrices,int count,const void* codes,const flo
         std::fprintf(stderr,"runtime_dflash2_q8_tiled actual_match=1 tokens=%d matrices=%d columns=%d padded_columns=%d rows=%d\n",
             tokens,count,columns,pk,rows);
     });
+    if(tokens>8) {
+        const int groups=rows/16;
+        const auto blocks=std::min<std::int64_t>(std::int64_t(groups)*((tokens+7)/8),65535);
+        gemm_many_kernel<<<unsigned(blocks),128,0,stream>>>(segs,static_cast<const int8_t*>(codes),scales,pk,tokens,groups);check();
+        if(mfq::cuda::dispatch_trace::enabled())mfq::cuda::dispatch_trace::record(stream,
+            "dflash2_q8_projection_many",reinterpret_cast<const void*>(gemm_many_kernel),
+            "M="+std::to_string(tokens)+" matrices="+std::to_string(count)+" K="+std::to_string(columns)+" token_tile=8");
+        return;
+    }
     // Reuse decoded weights across live activation columns. The tile's
     // capacity follows M; short committed-context updates do not execute
     // seven unused columns just because the proposal block holds eight.

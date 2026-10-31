@@ -81,6 +81,15 @@ template <class Model> struct CudaMtpOps {
   std::uint64_t target_graph_captures = 0;
   std::uint64_t target_transfer_bytes=0;
   std::array<double,6> target_profile{};
+  std::array<double,3> resolve_profile{};
+  std::uint64_t resolve_rounds=0,rollback_rounds=0;
+  static bool profile_resolve() {
+    static const bool enabled=[] {
+      const auto* option=std::getenv("TYLOINFER_PROFILE_TARGET_RESOLVE");
+      return option && option[0]=='1';
+    }();
+    return enabled;
+  }
   std::shared_ptr<MoeExpertCache> target_route_cache;
   std::shared_ptr<GgufExpertCache> target_gguf_route_cache;
   static bool profile_target() {
@@ -111,6 +120,9 @@ template <class Model> struct CudaMtpOps {
   }
   CudaMtpOps(CudaMtpOps&&)=default;
   ~CudaMtpOps() {
+    if(profile_resolve() && resolve_rounds)std::cerr<<"runtime_target_resolve rounds="<<resolve_rounds
+        <<" rollback_rounds="<<rollback_rounds<<" rollback_model_ms="<<resolve_profile[0]
+        <<" rollback_submit_ms="<<resolve_profile[1]<<" routes_ms="<<resolve_profile[2]<<'\n';
     if(target_route_cache)discard_moe_speculative_routes(target_route_cache);
     discard_gguf_speculative_routes(target_gguf_route_cache);
   }
@@ -121,6 +133,7 @@ template <class Model> struct CudaMtpOps {
     target_gguf_route_cache=model.execution->gguf_expert_cache;
   }
   void resolve_target_routes(int rows,bool cancelled) {
+    const auto started=profile_resolve()?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
     if(target_route_cache) {
       if(cancelled)discard_moe_speculative_routes(target_route_cache);
       else commit_moe_speculative_routes(target_route_cache,rows);
@@ -128,12 +141,23 @@ template <class Model> struct CudaMtpOps {
     if(cancelled)discard_gguf_speculative_routes(target_gguf_route_cache);
     else commit_gguf_speculative_routes(target_gguf_route_cache,rows);
     target_route_cache.reset();
+    if(profile_resolve()) {
+      resolve_profile[2]+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count();
+      ++resolve_rounds;
+    }
   }
   void rollback_target(int64_t keep) {
 #ifdef TYLOINFER_NATIVE_CUDA_RUNTIME
     mfq::cuda::RecurrentCopyBatch copies;
+    const auto started=profile_resolve()?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
     model.rollback_speculative(keep);
+    const auto restored=profile_resolve()?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
     copies.flush();
+    if(profile_resolve()) {
+      resolve_profile[0]+=std::chrono::duration<double,std::milli>(restored-started).count();
+      resolve_profile[1]+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-restored).count();
+      ++rollback_rounds;
+    }
     if(copies.batched_copies()) {
       static bool reported=false;
       if(!std::exchange(reported,true))std::cerr<<"runtime_recurrent_copy_batch copies="

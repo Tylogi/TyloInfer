@@ -95,21 +95,11 @@ struct TiledLinear {
         const auto stream_id=reinterpret_cast<std::uintptr_t>(stream);
         input.record_stream(stream_id);
         std::vector<Tensor> outputs;
-        if(tokens>8) {
-            for(const auto* weight:weights) {
-                if(weight->columns!=first.columns || weight->tiles.device()!=first.tiles.device())
-                    throw std::invalid_argument("DFlash2 projection group input differs");
-                auto packed=tb::empty({weight->out*(weight->columns/32)*34},weight->tiles.options());
-                weight->tiles.record_stream(stream_id);packed.record_stream(stream_id);
-                q8_untile(weight->tiles.data_ptr(),packed.data_ptr(),int(weight->out),int(weight->columns),stream);
-                GgufWeight linear{std::move(packed),GGML_TYPE_Q8_0,weight->out,weight->columns,
-                    std::uint64_t(weight->columns/32)*34};
-                outputs.push_back(linear.forward(input.to(tb::kFloat16)).to(tb::kBFloat16).to(tb::kFloat32));
-            }
-            return outputs;
-        }
-        auto codes=prepared && prepared->codes.defined()?prepared->codes:tb::empty({8*first.padded_in},first.tiles.options());
-        auto scales=prepared && prepared->scales.defined()?prepared->scales:tb::empty({8*(first.padded_in/32)},input.options());
+        if(tokens>std::numeric_limits<int>::max()-7)
+            throw std::invalid_argument("DFlash2 padded projection rows overflow");
+        const auto padded_tokens=(tokens+7)/8*8;
+        auto codes=prepared && prepared->codes.defined()?prepared->codes:tb::empty({padded_tokens*first.padded_in},first.tiles.options());
+        auto scales=prepared && prepared->scales.defined()?prepared->scales:tb::empty({padded_tokens*(first.padded_in/32)},input.options());
         if(!prepared || !prepared->codes.defined())
             q8_quantize(input.data_ptr<float>(),codes.data_ptr(),scales.data_ptr<float>(),int(tokens),int(first.columns),stream);
         Q8TiledMatrix matrices[3];int index=0;
@@ -225,7 +215,7 @@ struct Layer {
 struct Draft final : MtpModule {
     CudaExecutionContext& execution;
     Config c;
-    GgufWeight context_projection, selector_projection;
+    TiledLinear context_projection, selector_projection;
     Tensor hidden_norm, final_norm, predecessor, successor, mask_embedding;
     const std::uint16_t* predecessor_address=nullptr;
     const std::uint16_t* successor_address=nullptr;
@@ -545,6 +535,16 @@ struct Draft final : MtpModule {
         position = count - hidden.size(1); append_target_context(std::move(hidden), position);
     }
     void append_context_rows(const Tensor& features,const Tensor& pos) {
+        // Prompt seeding and later updates share the same Q8 arithmetic.
+        // The batched kernel keeps eight-row tiles and handles the tail on
+        // device, without changing quantization when prompt chunking changes.
+        if(pos.numel()>kQ8TileRows) {
+            if(const auto* trace=std::getenv("TYLOINFER_TRACE_KERNEL_DISPATCH");trace && trace[0]=='1') {
+                static std::atomic<bool> reported{false};
+                if(!reported.exchange(true))std::cerr<<"runtime_dflash2_context_seed actual_match=1 rows="<<pos.numel()
+                    <<" tile_rows="<<kQ8TileRows<<" q8_fp32_scales=1 bf16_projection=1 batched=1\n";
+            }
+        }
         // Preserve raw F32 target taps through their first Q8 projection.
         auto prepared=normalized_q8(context_projection.forward(features),hidden_norm,c.epsilon);
         const auto table=rotation_table(pos,c);
@@ -582,7 +582,7 @@ struct Draft final : MtpModule {
         if(!context_update_stream) {
             context_update_stream=mfq_get_stream_from_pool(false,parent.device_index());
             context_fork=std::make_shared<Event>();context_join=std::make_shared<Event>();
-            for(const auto& tensor:{context_projection.packed,hidden_norm})mfq_cuda_record_stream(tensor,context_update_stream);
+            for(const auto& tensor:{context_projection.tiles,hidden_norm})mfq_cuda_record_stream(tensor,context_update_stream);
             for(int layer=0;layer<c.layers;++layer)
                 for(const auto& tensor:{layers[layer].k.tiles,layers[layer].v.tiles,layers[layer].k_norm,keys[layer],values[layer]})
                     mfq_cuda_record_stream(tensor,context_update_stream);

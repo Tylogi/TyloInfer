@@ -915,6 +915,7 @@ void CudaExecutionContext::reset() noexcept {
     tq_expert_cache.reset();
     gguf_expert_cache.reset();
     projection_executors.clear();
+    shared_expert_executors.clear();
     dflash2_draft_path.clear();
     model_parallel_collectives.reset();
     tensor_parallel = {};

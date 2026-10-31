@@ -1,5 +1,6 @@
 #include "tyloinfer/gguf_model_source.h"
 #include "tyloinfer/mapped_tensor_reader.h"
+#include "tyloinfer/mirrored_file_reader.h"
 
 #include "gguf.h"
 #include "nlohmann/json.hpp"
@@ -248,7 +249,7 @@ json model_config(const json& meta, const json& shapes, const std::string& arch)
 struct GgufModelSource::Impl {
     struct Record {
         TensorMetadata tensor;
-        std::shared_ptr<FileRangeReader> file;
+        std::shared_ptr<MirroredFileReader> file;
         std::filesystem::path path;
         uint64_t offset = 0;
         std::vector<std::byte> prefix;
@@ -257,6 +258,7 @@ struct GgufModelSource::Impl {
     std::vector<std::filesystem::path> paths;
     std::string arch;
     std::unordered_map<std::string, std::string> metadata;
+    HadamardTransforms hadamard;
     std::vector<TensorMetadata> tensors;
     std::unordered_map<std::string, Record> records;
     std::unordered_map<std::string, std::vector<std::byte>> asset_data;
@@ -316,7 +318,8 @@ GgufModelSource::GgufModelSource(const std::filesystem::path& path,
                 throw std::runtime_error("inconsistent GGUF shard metadata");
         }
         const auto file_size = std::filesystem::file_size(impl_->paths[shard]);
-        auto file = std::make_shared<FileRangeReader>(impl_->paths[shard], model_file_read_mode());
+        auto file = std::make_shared<MirroredFileReader>(model_read_replica_paths(impl_->paths[shard]),
+            model_file_read_mode(),gguf_get_data_offset(ctx.get()));
         if (shard == 0) {
             for (int64_t i = 0; i < gguf_get_n_kv(ctx.get()); ++i) {
                 const std::string name = gguf_get_key(ctx.get(), i);
@@ -337,6 +340,9 @@ GgufModelSource::GgufModelSource(const std::filesystem::path& path,
             const auto* tensor = ggml_get_tensor(tensors.get(), original);
             if (!tensor) throw std::runtime_error("GGUF tensor shape is missing");
             const auto type = gguf_get_tensor_type(ctx.get(), i);
+            if (type >= GGML_TYPE_TQ2_T && type <= GGML_TYPE_TQK4 &&
+                    meta.value("agention.trellis.state_bits", int64_t{-1}) != 15)
+                throw std::runtime_error("Gyro GGUF requires agention.trellis.state_bits=15");
             std::vector<int64_t> shape;
             for (int d = ggml_n_dims(tensor) - 1; d >= 0; --d) shape.push_back(tensor->ne[d]);
             auto name = canonical_name(original);
@@ -466,12 +472,61 @@ GgufModelSource::GgufModelSource(const std::filesystem::path& path,
     impl_->metadata["source_format"] = "\"gguf\"";
     impl_->metadata["tensor_shapes"] = shapes.dump();
     impl_->metadata["gguf_metadata"] = meta.dump();
+    if (meta.contains("prism.hadamard.version")) {
+        const auto version = meta.at("prism.hadamard.version").get<int>();
+        const auto block = meta.value("prism.hadamard.block_size", int64_t{0});
+        const auto mode = meta.value("prism.hadamard.sign_mode", std::string{});
+        if ((version != 1 && version != 2) || block < 1 || (block & (block - 1)) || block > INT32_MAX ||
+            meta.value("prism.hadamard.transform", std::string{}) != "normalized-sylvester-walsh-hadamard" ||
+            meta.value("prism.hadamard.axis", std::string{}) != "input-last-dimension" ||
+            (mode != "explicit" && mode != "identity"))
+            throw std::runtime_error("unsupported GGUF Hadamard transform metadata");
+        if (!meta.value("prism.hadamard.inverse_weight_names", json::array()).empty() ||
+            meta.value("prism.hadamard.tied_output", false) || meta.value("prism.hadamard.gdn_v_grouped", false))
+            throw std::runtime_error("GGUF inverse embedding or grouped GDN Hadamard layout is unsupported");
+        std::map<int64_t, std::vector<int8_t>> signs;
+        if (mode == "explicit") {
+            const auto widths = meta.at("prism.hadamard.sign_widths").get<std::vector<int64_t>>();
+            const auto values = meta.at("prism.hadamard.sign_values").get<std::vector<int>>();
+            std::size_t offset = 0;
+            for (const auto width : widths) {
+                if (width < 1 || width % block || uint64_t(width) > values.size() - offset || signs.count(width))
+                    throw std::runtime_error("invalid GGUF Hadamard sign widths");
+                std::vector<int8_t> pattern;
+                for (int64_t i = 0; i < width; ++i) {
+                    const int value = values[offset++];
+                    if (value != 1 && value != -1) throw std::runtime_error("invalid GGUF Hadamard sign value");
+                    pattern.push_back(int8_t(value));
+                }
+                signs.emplace(width, std::move(pattern));
+            }
+            if (widths.empty() || offset != values.size()) throw std::runtime_error("GGUF Hadamard sign vector lengths differ");
+        }
+        json transforms = json::object();
+        const auto weights = meta.at("prism.hadamard.weight_names").get<std::vector<std::string>>();
+        if (weights.empty()) throw std::runtime_error("GGUF Hadamard weight list is empty");
+        for (const auto& original : weights) {
+            const auto name = canonical_name(original);
+            const auto record = impl_->records.find(name);
+            if (record == impl_->records.end() || !record->second.tensor.shape || record->second.tensor.shape->size() < 2 ||
+                record->second.tensor.dtype.rfind("GGUF_", 0) != 0 || transforms.contains(name))
+                throw std::runtime_error("invalid or unsupported GGUF Hadamard weight");
+            const auto width = record->second.tensor.shape->back();
+            if (width % block || (mode == "explicit" && !signs.count(width)))
+                throw std::runtime_error("GGUF Hadamard weight has no compatible sign vector");
+            transforms[name] = {{"block_size", block}, {"signs", mode == "explicit" ? json(signs.at(width)) : json::array()}};
+            impl_->hadamard.emplace(name,HadamardTransform{block,mode=="explicit"?signs.at(width):std::vector<int8_t>{}});
+        }
+        impl_->metadata["gguf_hadamard"] = transforms.dump();
+        impl_->metadata["gguf_requires_hadamard"] = "true";
+    }
 }
 
 GgufModelSource::~GgufModelSource() = default;
 const std::vector<std::filesystem::path>& GgufModelSource::source_paths() const noexcept { return impl_->paths; }
 std::string_view GgufModelSource::architecture() const noexcept { return impl_->arch; }
 const std::unordered_map<std::string, std::string>& GgufModelSource::metadata() const noexcept { return impl_->metadata; }
+const HadamardTransforms* GgufModelSource::hadamard_transforms() const noexcept { return &impl_->hadamard; }
 const std::vector<TensorMetadata>& GgufModelSource::tensors() const noexcept { return impl_->tensors; }
 const TensorMetadata* GgufModelSource::find_tensor(std::string_view name) const noexcept {
     const auto it = impl_->records.find(std::string(name));

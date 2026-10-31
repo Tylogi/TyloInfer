@@ -9,6 +9,7 @@
 #include <mutex>
 #include <thread>
 #include <vector>
+struct GgufInputRotation;
 
 // Only original compressed routed experts are accepted here. Storage owners
 // keep their RAM images alive until the asynchronous CPU work has completed.
@@ -22,6 +23,8 @@ struct GgufCpuWork {
     bool half=false;
     float limit=0;
     const float* input=nullptr;
+    const float* up_input=nullptr;
+    std::shared_ptr<const GgufInputRotation> down_rotation;
     float* output=nullptr;
     std::uint32_t* ready=nullptr;
     std::vector<GgufCpuExpert> experts;
@@ -45,12 +48,12 @@ class GgufCpuExecutor {
     struct PreparedExpert {
         int count=0;
         std::array<int,4> token{},first_slot{};
-        std::array<const void*,4> x{},h{};
+        std::array<const void*,4> x{},u{},h{};
         std::array<float*,4> gate{},up{},out{};
     };
     // execute() is serialized by worker_; completed jobs retain only outputs.
     std::vector<PreparedExpert> prepared_;
-    std::vector<std::uint8_t> qinput_,qhidden_;
+    std::vector<std::uint8_t> qinput_,qup_,qhidden_;
     std::vector<float> gate_,up_,hidden_;
     std::size_t workspace_bytes_=0;
     void execute(GgufCpuWork&);

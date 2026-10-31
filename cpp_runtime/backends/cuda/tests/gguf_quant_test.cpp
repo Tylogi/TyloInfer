@@ -1,4 +1,5 @@
 #include "../kernels/gguf.h"
+#include "../kernels/gguf_compact.h"
 #include "tyloinfer/gguf_quant.h"
 #include "ggml-quants.h"
 #include <cuda_fp16.h>
@@ -224,15 +225,65 @@ void check_type(ggml_type type, int columns, int rows=5) {
             if(std::any_of(seen.begin(),seen.end(),[](int count){return count!=1;}))
                 throw std::runtime_error("routed grouping omitted an input row");
         }
+        check(cudaMemset(dy.data,0xff,y.size()*sizeof(float)));
         mfq::cuda::gguf::grouped_routed_matvec_q8(type,device_addresses.data,stride,addresses.size(),rows,columns,
             selected_device.data,groups.data,tokens,routes,quantized.data,routed,dy.data,nullptr);
         std::vector<float> grouped_output(y.size());
         check(cudaMemcpy(grouped_output.data(),dy.data,grouped_output.size()*sizeof(float),cudaMemcpyDeviceToHost));
+        if(type>=GGML_TYPE_TQ2_T && type<=GGML_TYPE_TQK4) {
+            // The raw single-entry kernel factors block scales. Check it
+            // against independently decoded weights and the actual Q8 input,
+            // keeping activation quantization error out of this bound.
+            std::vector<block_q8_1> packets(x.size()/32);
+            check(cudaMemcpy(packets.data(),quantized.data,packets.size()*sizeof(packets[0]),cudaMemcpyDeviceToHost));
+            for(int slot=0;slot<tokens*routes;++slot)for(int row=0;row<rows;++row) {
+                const auto expert=selected[slot];double expected=0,magnitude=0;
+                if(expert>=0 && expert<3)for(int k=0;k<columns;++k) {
+                    const auto& packet=packets[(routed?slot:slot/routes)*(columns/32)+k/32];
+                    const double product=double(reference[((row+expert)%rows)*columns+k])*
+                        ggml_fp16_to_fp32(packet.d)*packet.qs[k%32];
+                    expected+=product;magnitude+=std::abs(product);
+                }
+                if(!std::isfinite(y[slot*rows+row]) || std::abs(double(y[slot*rows+row])-expected)>2e-6*magnitude+1e-6)
+                    throw std::runtime_error("trellis factored block scales exceeded independent Q8 dot bound");
+            }
+            // Native Q8 staging and decoded FP32 slices must agree, including
+            // mixed group sizes, absent experts and odd K/N tails.
+            if(!mfq::cuda::gguf::try_compact_routed_project(mfq::cuda::gguf::CompactFormat(type),
+                    device_addresses.data,stride,addresses.size(),rows,columns,selected_device.data,
+                    groups.data,tokens,routes,quantized.data,routed,dy.data,nullptr,false,nullptr,0,nullptr,true,false))
+                throw std::runtime_error("compact Q8-staging reference unavailable");
+            std::vector<float> native(y.size());
+            check(cudaMemcpy(native.data(),dy.data,native.size()*sizeof(float),cudaMemcpyDeviceToHost));
+            if(std::memcmp(native.data(),grouped_output.data(),native.size()*sizeof(float)))
+                throw std::runtime_error("decoded activation slices changed exact FP32 projection bits");
+            // Changing lanes per row changes the FP32 reduction tree. Compare
+            // with the original layout against a sum-of-products error bound,
+            // including odd row tails and each circular trellis encoding.
+            if(!mfq::cuda::gguf::try_compact_routed_project(mfq::cuda::gguf::CompactFormat(type),
+                    device_addresses.data,stride,addresses.size(),rows,columns,selected_device.data,
+                    groups.data,tokens,routes,quantized.data,routed,dy.data,nullptr,false,nullptr,0,nullptr,true,true,false))
+                throw std::runtime_error("original trellis row layout unavailable");
+            std::vector<float> original(y.size());
+            check(cudaMemcpy(original.data(),dy.data,original.size()*sizeof(float),cudaMemcpyDeviceToHost));
+            for(int slot=0;slot<tokens*routes;++slot)for(int row=0;row<rows;++row) {
+                const auto expert=selected[slot];double magnitude=0;
+                if(expert>=0 && expert<3)for(int k=0;k<columns;++k)
+                    magnitude+=std::abs(double(reference[((row+expert)%rows)*columns+k])*
+                        x[(routed?slot:slot/routes)*columns+k]);
+                const auto at=slot*rows+row;
+                if(!std::isfinite(grouped_output[at]) || !std::isfinite(original[at]) ||
+                        std::abs(double(grouped_output[at])-original[at])>2e-6*magnitude+1e-6)
+                    throw std::runtime_error("narrow trellis row layout exceeded FP32 accumulation bound");
+            }
+        }
         if(!routed && tokens<=8) {
             auto up_addresses=addresses;std::rotate(up_addresses.begin(),up_addresses.begin()+1,up_addresses.end());
             DeviceArray<uint64_t> device_up(up_addresses.size());
             check(cudaMemcpy(device_up.data,up_addresses.data(),up_addresses.size()*sizeof(uint64_t),cudaMemcpyHostToDevice));
             DeviceArray<float> gu(y.size()),uu(y.size()),up_reference(y.size());
+            check(cudaMemset(gu.data,0xff,y.size()*sizeof(float)));
+            check(cudaMemset(uu.data,0xff,y.size()*sizeof(float)));
             mfq::cuda::gguf::routed_matvec_q8(type,device_up.data,stride,addresses.size(),rows,columns,
                 selected_device.data,tokens,routes,quantized.data,false,up_reference.data,nullptr);
             const bool used=mfq::cuda::gguf::try_gate_up_matvec_q8(type,device_addresses.data,device_up.data,stride,stride,
@@ -241,18 +292,43 @@ void check_type(ggml_type type, int columns, int rows=5) {
             if(used) {
                 std::vector<float> actual(y.size()),expected(y.size());
                 check(cudaMemcpy(actual.data(),gu.data,y.size()*sizeof(float),cudaMemcpyDeviceToHost));
-                if(std::memcmp(actual.data(),y.data(),y.size()*sizeof(float)))
-                    throw std::runtime_error(std::string(ggml_type_name(type))+" fused Gate changed reference output bits");
+                const auto equal_projection=[&](const std::vector<float>& actual,const std::vector<float>& expected,
+                        const std::vector<uint64_t>& table) {
+                    if(type<GGML_TYPE_TQ2_T || type>GGML_TYPE_TQK4)
+                        return std::memcmp(actual.data(),expected.data(),actual.size()*sizeof(float))==0;
+                    // Trellis uses a different reduction layout for grouped
+                    // activations, preserving the same original FP16 values.
+                    // Apply the flat/grouped accumulation bound below.
+                    for(int slot=0;slot<tokens*routes;++slot)for(int row=0;row<rows;++row) {
+                        const auto expert=selected[slot];
+                        const auto pointer=expert>=0 && expert<int64_t(table.size())?table[expert]:0;
+                        const auto found=std::find(addresses.begin(),addresses.end(),pointer);
+                        const auto bank=found-addresses.begin();double magnitude=0;
+                        if(pointer && bank<3)for(int k=0;k<columns;++k)
+                            magnitude+=std::abs(double(reference[((row+bank)%rows)*columns+k])*x[(slot/routes)*columns+k]);
+                        const auto at=slot*rows+row;
+                        if(!std::isfinite(actual[at]) || !std::isfinite(expected[at]) ||
+                                std::abs(double(actual[at])-expected[at])>2e-6*magnitude+1e-6) {
+                            std::fprintf(stderr,"trellis projection mismatch type=%d M=%d row=%d slot=%d actual=%.9g expected=%.9g magnitude=%.9g\n",
+                                int(type),tokens,row,slot,actual[at],expected[at],magnitude);
+                            return false;
+                        }
+                    }
+                    return true;
+                };
+                if(!equal_projection(actual,y,addresses))
+                    throw std::runtime_error(std::string(ggml_type_name(type))+" fused Gate exceeded reference accumulation bound");
+                const auto saved_gate=actual;
                 check(cudaMemcpy(actual.data(),uu.data,y.size()*sizeof(float),cudaMemcpyDeviceToHost));
                 check(cudaMemcpy(expected.data(),up_reference.data,y.size()*sizeof(float),cudaMemcpyDeviceToHost));
-                if(std::memcmp(actual.data(),expected.data(),y.size()*sizeof(float)))
-                    throw std::runtime_error(std::string(ggml_type_name(type))+" fused Up changed independent pointer table bits");
+                if(!equal_projection(actual,expected,up_addresses))
+                    throw std::runtime_error(std::string(ggml_type_name(type))+" fused Up changed independent pointer table or accumulation");
                 if(rows%32==0)for(bool half:{false,true})for(float limit:{0.f,.01f}) {
                     DeviceArray<uint8_t> wanted(selected.size()*mfq::cuda::gguf::q8_row_bytes(rows)),packed_hidden(selected.size()*mfq::cuda::gguf::q8_row_bytes(rows));
                     mfq::cuda::gguf::quantize_moe_hidden(gu.data,uu.data,selected.size(),rows,half,limit,wanted.data,nullptr);
                     if(!mfq::cuda::gguf::try_gate_up_hidden_q8(type,device_addresses.data,device_up.data,stride,stride,
                             addresses.size(),rows,columns,selected_device.data,groups.data,tokens,routes,quantized.data,
-                            packed_hidden.data,half,limit,nullptr))throw std::runtime_error("fused hidden quantizer did not launch");
+                            packed_hidden.data,half,limit,nullptr))continue; // Independently optional epilogue. Generator is tested separately.
                     std::vector<uint8_t> a(selected.size()*mfq::cuda::gguf::q8_row_bytes(rows)),b(a.size());
                     check(cudaMemcpy(a.data(),packed_hidden.data,a.size(),cudaMemcpyDeviceToHost));
                     check(cudaMemcpy(b.data(),wanted.data,b.size(),cudaMemcpyDeviceToHost));
@@ -265,7 +341,7 @@ void check_type(ggml_type type, int columns, int rows=5) {
                     addresses.size(),rows,columns,selected_device.data,groups.data,tokens,routes,quantized.data,
                     gu.data,uu.data,nullptr,true);
                 check(cudaMemcpy(actual.data(),gu.data,y.size()*sizeof(float),cudaMemcpyDeviceToHost));
-                if(std::memcmp(actual.data(),y.data(),y.size()*sizeof(float)))
+                if(std::memcmp(actual.data(),saved_gate.data(),y.size()*sizeof(float)))
                     throw std::runtime_error("fused Gate did not preserve its missing expert rows");
             }
         }
@@ -714,6 +790,17 @@ int main(int argc,char** argv) {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices) return 77;
     try {
+        if(argc==2 && std::strcmp(argv[1],"--compact-shared-check")==0) {
+            // Odd K-block counts and row tails exercise the cooperative
+            // original-codebook load, absent experts and grouped M=1..8.
+            for(int type=GGML_TYPE_TQ2_T;type<=GGML_TYPE_TQK4;++type)
+                check_type(ggml_type(type),2176,17);
+            // More output tiles bound grid.y, so CTAs reuse the table while
+            // advancing between route groups and writing activation scratch.
+            check_type(GGML_TYPE_TQK6,2176,257);
+            std::puts("Compact8 shared codebook / tails / missing experts / persistent groups PASS");
+            std::fflush(stdout);return 0;
+        }
         if(argc==2 && std::strcmp(argv[1],"--iq3-s-tile-check")==0) {
             for(int rows:{5,32})for(int columns:{256,768,2816})
                 check_type(GGML_TYPE_IQ3_S,columns,rows);

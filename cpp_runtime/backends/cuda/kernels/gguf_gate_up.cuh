@@ -7,8 +7,8 @@ namespace mfq::cuda::gguf {
 namespace {
 template<int Format,int Lanes>
 __device__ __forceinline__ void gate_up_direct_dot(const uint8_t* gate_weight,const uint8_t* up_weight,
-        const block_q8_1* input,int columns,int lane,float& g,float& u) {
-    using F=PreparedDot<Format>;
+        const block_q8_1* input,int columns,int lane,float& g,float& u,const uint32_t* grid) {
+    using F=StagedPreparedDot<Format>;
     constexpr int Parts=32/Lanes;
     float sg[Parts]{},su[Parts]{};
     const int items=columns/F::qk*F::parts;
@@ -16,8 +16,8 @@ __device__ __forceinline__ void gate_up_direct_dot(const uint8_t* gate_weight,co
     for(int p=0;p<Parts;++p)for(int i=lane+p*Lanes;(gate_weight || up_weight) && i<items;i+=32) {
         const int block=i/F::parts,part=F::step*(i%F::parts);
         typename F::Weight wg{},wu{};
-        if(gate_weight)wg=F::load(gate_weight,block,part);
-        if(up_weight)wu=F::load(up_weight,block,part);
+        if(gate_weight)wg=F::load(gate_weight,block,part,grid);
+        if(up_weight)wu=F::load(up_weight,block,part,grid);
         const auto& x=input[block*(F::qk/32)+(gate_weight?F::input_block(wg):F::input_block(wu))];
         int codes[8];
         #pragma unroll
@@ -50,12 +50,45 @@ __global__ void __launch_bounds__(128) project_gate_up_direct_q8(const uint64_t*
     float g,u;
     gate_up_direct_dot<Format,Lanes>(ga?reinterpret_cast<const uint8_t*>(ga)+uint64_t(row)*gate_stride:nullptr,
         ua?reinterpret_cast<const uint8_t*>(ua)+uint64_t(row)*up_stride:nullptr,
-        input+(slot/routes)*(columns/32),columns,lane,g,u);
+        input+(slot/routes)*(columns/32),columns,lane,g,u,nullptr);
     if(!lane) {
         if(ga || !preserve_missing)gate[index]=g;
         if(ua || !preserve_missing)up[index]=u;
     }
 }
+// One CTA belongs to a single expert. Complete misses return uniformly before
+// staging its exact lookup tables; live rows amortize those tables over a larger
+// tile. The zero-table formats retain four warps without shared staging.
+template<int Format,int Lanes>
+__global__ void __launch_bounds__(StagedPreparedDot<Format>::words?256:128)
+project_gate_up_table_q8(const uint64_t* gate_addresses,const uint64_t* up_addresses,
+        uint64_t gate_stride,uint64_t up_stride,int experts,int rows,int columns,int slots,
+        const int64_t* ids,int routes,const block_q8_1* input,float* gate,float* up,bool preserve_missing) {
+    using F=StagedPreparedDot<Format>;
+    constexpr int Threads=F::words?256:128;
+    const int slot=blockIdx.y,row=int(blockIdx.x)*(Threads/Lanes)+threadIdx.x/Lanes;
+    const int lane=threadIdx.x%Lanes;
+    const auto expert=ids[slot];
+    const auto ga=expert>=0 && expert<experts?gate_addresses[expert]:0;
+    const auto ua=expert>=0 && expert<experts?up_addresses[expert]:0;
+    const auto index=int64_t(slot)*rows+row;
+    if(!ga && !ua) {
+        if(row<rows && !lane && !preserve_missing){gate[index]=0.f;up[index]=0.f;}
+        return;
+    }
+    __shared__ __align__(16) uint32_t grid[F::words?F::words:1];
+    F::stage(grid,threadIdx.x,Threads);
+    if(row>=rows)return;
+    float g,u;
+    gate_up_direct_dot<Format,Lanes>(ga?reinterpret_cast<const uint8_t*>(ga)+uint64_t(row)*gate_stride:nullptr,
+        ua?reinterpret_cast<const uint8_t*>(ua)+uint64_t(row)*up_stride:nullptr,
+        input+(slot/routes)*(columns/32),columns,lane,g,u,grid);
+    if(!lane) {
+        if(ga || !preserve_missing)gate[index]=g;
+        if(ua || !preserve_missing)up[index]=u;
+    }
+}
+
 template<int Format,int Capacity,int Lanes,bool Paired,bool Quantized>
 __global__ void __launch_bounds__(Quantized?32*Lanes:256,Quantized?1024/(32*Lanes):4) project_gate_up_planar_q8(const uint64_t* gate_addresses,const uint64_t* up_addresses,
         uint64_t gate_stride,uint64_t up_stride,int experts,int rows,int columns,int slots,

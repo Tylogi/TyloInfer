@@ -1,4 +1,5 @@
 #include "gguf_cpu_executor.h"
+#include "gguf_rotation.h"
 #include "gguf_cpu_activation.h"
 #include "tyloinfer/cpu_expert_pool.h"
 #include "tyloinfer/cpu_wait.h"
@@ -95,6 +96,10 @@ void GgufCpuExecutor::execute(GgufCpuWork& w) {
     resize(qinput_,w.tokens*input_bytes);resize(qhidden_,w.experts.size()*w.tokens*hidden_bytes);
     resize(gate_,w.experts.size()*values);resize(up_,gate_.size());resize(hidden_,gate_.size());
     for(int t=0;t<w.tokens;++t)cpu::quantize_input(w.input+t*w.input_width,qinput_.data()+t*input_bytes,w.input_width);
+    if(w.up_input && w.up_input!=w.input) {
+        resize(qup_,w.tokens*input_bytes);
+        for(int t=0;t<w.tokens;++t)cpu::quantize_input(w.up_input+t*w.input_width,qup_.data()+t*input_bytes,w.input_width);
+    }
     const int threads=std::max(1,int(cores_.size()));
     for(std::size_t e=0;e<w.experts.size();++e) {
         const auto& expert=w.experts[e];auto& p=prepared[e];
@@ -111,6 +116,7 @@ void GgufCpuExecutor::execute(GgufCpuWork& w) {
         }
         for(int t=0;t<p.count;++t) {
             p.x[t]=qinput_.data()+p.token[t]*input_bytes;
+            p.u[t]=w.up_input && w.up_input!=w.input?qup_.data()+p.token[t]*input_bytes:p.x[t];
             p.h[t]=qhidden_.data()+(e*w.tokens+t)*hidden_bytes;
             p.gate[t]=gate_.data()+e*values+t*w.hidden_width;
             p.up[t]=up_.data()+e*values+t*w.hidden_width;
@@ -128,16 +134,18 @@ void GgufCpuExecutor::execute(GgufCpuWork& w) {
                 const int last=first+int(std::min(end-begin,std::int64_t(w.hidden_width-first)));
                 if(p.count) {
                     cpu::project(w.experts[e].projections[0],p.x.data(),p.count,p.gate.data(),first,last,dispatch);
-                    cpu::project(w.experts[e].projections[1],p.x.data(),p.count,p.up.data(),first,last,dispatch);
+                    cpu::project(w.experts[e].projections[1],p.u.data(),p.count,p.up.data(),first,last,dispatch);
                     for(int t=0;t<p.count;++t)cpu::swiglu(p.gate[t]+first,p.up[t]+first,
                         hidden_.data()+e*values+t*w.hidden_width+first,last-first,w.half,w.limit);
                 }
                 begin+=last-first;
             }
         });
-    for(std::size_t e=0;e<prepared.size();++e)for(int t=0;t<prepared[e].count;++t)
+    for(std::size_t e=0;e<prepared.size();++e)for(int t=0;t<prepared[e].count;++t) {
+        if(w.down_rotation)w.down_rotation->apply_cpu(hidden_.data()+e*values+t*w.hidden_width,1,w.hidden_width,w.half);
         cpu::quantize_hidden(hidden_.data()+e*values+t*w.hidden_width,
             qhidden_.data()+(e*w.tokens+t)*hidden_bytes,w.hidden_width,down_type);
+    }
     pool_.run(0,std::int64_t(w.experts.size())*w.output_width,32,threads,
         [&](std::int64_t begin,std::int64_t end) {
             while(begin<end) {

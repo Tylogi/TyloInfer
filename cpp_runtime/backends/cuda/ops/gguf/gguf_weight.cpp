@@ -1,8 +1,10 @@
 #include "gguf_weight.h"
+#include "gguf_rotation.h"
 #include "quant_linear.h"
 #include "mfq_weight_memory.h"
 #include "mfq_cuda_context.h"
 #include "../../kernels/gguf.h"
+#include "../../kernels/gguf_compact.h"
 #include "../../kernels/gguf_mmq.h"
 #ifdef TYLOINFER_NATIVE_CUDA_RUNTIME
 #include "gguf_dense_schedule.h"
@@ -19,6 +21,10 @@
 
 namespace tb = mfq_tensor_backend;
 
+bool same_gguf_input_basis(const GgufWeight& a, const GgufWeight& b) {
+    return (!a.rotation && !b.rotation) || (a.rotation && b.rotation && a.rotation->equivalent(*b.rotation));
+}
+
 GgufWeight combine_gguf_rows(const std::vector<GgufWeight*>& weights) {
     if(weights.empty() || !weights.front())throw std::invalid_argument("GGUF row combination requires weights");
     const auto& first=*weights.front();
@@ -28,6 +34,7 @@ GgufWeight combine_gguf_rows(const std::vector<GgufWeight*>& weights) {
     std::vector<tb::Tensor> images;images.reserve(weights.size());
     for(const auto* weight:weights) {
         if(!weight || weight->type!=first.type || weight->neuron_len!=first.neuron_len || weight->row_bytes!=first.row_bytes ||
+                !same_gguf_input_basis(first,*weight) ||
                 weight->out<1 || !weight->packed.defined() || weight->packed.device()!=first.packed.device() ||
                 weight->packed.scalar_type()!=tb::kUInt8 || !weight->packed.is_contiguous() ||
                 weight->out>INT64_MAX-rows || weight->row_bytes>std::uint64_t(INT64_MAX)/weight->out ||
@@ -39,6 +46,7 @@ GgufWeight combine_gguf_rows(const std::vector<GgufWeight*>& weights) {
     const mfq::cuda::WeightAllocationScope weight_memory;
     const auto image=tb::cat(images,0);
     GgufWeight joined{image,first.type,rows,first.neuron_len,first.row_bytes};
+    joined.rotation=first.rotation;
     std::int64_t offset=0;
     for(auto* weight:weights) {
         const auto bytes=std::int64_t(weight->out*weight->row_bytes);
@@ -80,6 +88,7 @@ GgufWeight load_gguf_weight(const mfq::ModelSource& source, const std::string& n
     result.out = row_end - row_begin;
     result.neuron_len = column_end - column_begin;
     result.row_bytes = mfq::gguf::row_bytes(result.type, result.neuron_len);
+    result.rotation = load_gguf_input_rotation(source, name, columns, column_begin, column_end, device, cuda);
     auto host = tb::empty({static_cast<std::int64_t>(result.row_bytes * result.out)},
         tb::TensorOptions().dtype(tb::kUInt8).device(tb::kCPU));
     const auto read = source.tensor_reader(name);
@@ -96,12 +105,12 @@ GgufWeight load_gguf_weight(const mfq::ModelSource& source, const std::string& n
     return result;
 }
 
-tb::Tensor GgufWeight::dequantize() const {
+tb::Tensor GgufWeight::dequantize_stored() const {
     auto output = tb::empty({out, neuron_len}, packed.options().dtype(tb::kFloat32));
     if (packed.is_cuda()) {
         MfqCudaGuard guard(packed.get_device());
-        packed.record_stream(reinterpret_cast<std::uintptr_t>(mfq_current_cuda_stream()));
-        output.record_stream(reinterpret_cast<std::uintptr_t>(mfq_current_cuda_stream()));
+        const auto stream=mfq_get_current_cuda_stream(packed.get_device());
+        mfq_cuda_record_stream(packed,stream);mfq_cuda_record_stream(output,stream);
         mfq::cuda::gguf::dequantize_rows(type, packed.data_ptr(), row_bytes, out, neuron_len,
             output.data_ptr(), false, mfq_current_cuda_stream());
     } else {
@@ -109,6 +118,12 @@ tb::Tensor GgufWeight::dequantize() const {
             decode_gguf_cpu(type, packed.data_ptr<std::uint8_t>() + row * row_bytes,
                 output.data_ptr<float>() + row * neuron_len, neuron_len);
     }
+    return output;
+}
+
+tb::Tensor GgufWeight::dequantize() const {
+    auto output = dequantize_stored();
+    if (rotation) rotation->apply_inplace(output, true);
     return output;
 }
 
@@ -128,10 +143,11 @@ tb::Tensor GgufWeight::embedding(tb::Tensor ids) const {
     }
     MfqCudaGuard guard(packed.get_device());
     auto output = tb::empty({ids.numel(), neuron_len}, packed.options().dtype(tb::kFloat32));
-    const auto stream = reinterpret_cast<std::uintptr_t>(mfq_current_cuda_stream());
-    packed.record_stream(stream); ids.record_stream(stream); output.record_stream(stream);
+    const auto stream=mfq_get_current_cuda_stream(packed.get_device());
+    mfq_cuda_record_stream(packed,stream); mfq_cuda_record_stream(ids,stream); mfq_cuda_record_stream(output,stream);
     mfq::cuda::gguf::embedding_rows(type, packed.data_ptr(), row_bytes, out, neuron_len,
         ids.data_ptr<std::int64_t>(), ids.numel(), output.data_ptr<float>(), mfq_current_cuda_stream());
+    if(rotation)rotation->apply_inplace(output,true);
     return output.reshape(shape);
 }
 
@@ -150,11 +166,14 @@ GgufProjectionInput prepare_gguf_group_input(const std::vector<GgufWeight>& weig
     const auto stream_handle=mfq_get_current_cuda_stream(input.get_device());
     const auto stream=stream_handle.stream();
     auto source=input.reshape({tokens,columns});
+    auto original=source;
     if(source.scalar_type()!=tb::kFloat16)source=source.to(tb::kFloat32);
     source=source.contiguous();
-    const auto supported=[&](const auto& weight){return mfq::cuda::gguf::supports_interleaved_activation(weight.type,tokens);};
+    const auto supported=[&](const auto& weight){return !weight.prefers_original_input() && mfq::cuda::gguf::supports_interleaved_activation(weight.type,tokens);};
+    const auto floating_codebook=[](const auto& weight){return weight.prefers_original_input();};
+    const bool keep_original=std::any_of(weights.begin(),weights.end(),floating_codebook);
     const bool interleaved=std::any_of(weights.begin(),weights.end(),supported);
-    const bool native=std::any_of(weights.begin(),weights.end(),[&](const auto& weight){return !supported(weight);});
+    const bool native=std::any_of(weights.begin(),weights.end(),[&](const auto& weight){return !supported(weight) && !floating_codebook(weight);});
     auto activation=native?tb::empty({std::int64_t(tokens*mfq::cuda::gguf::q8_row_bytes(columns))},
         input.options().dtype(tb::kUInt8)):tb::Tensor{};
     auto position_major=interleaved?tb::empty({std::int64_t(mfq::cuda::gguf::interleaved_activation_bytes(tokens,columns))},
@@ -163,10 +182,10 @@ GgufProjectionInput prepare_gguf_group_input(const std::vector<GgufWeight>& weig
     if(interleaved)
         mfq::cuda::gguf::quantize_input_interleaved(source.data_ptr(),source.scalar_type()==tb::kFloat16,tokens,columns,
             position_major.data_ptr(),activation.defined()?activation.data_ptr():nullptr,stream);
-    else if(source.scalar_type()==tb::kFloat16)
+    else if(native && source.scalar_type()==tb::kFloat16)
         mfq::cuda::gguf::quantize_input_f16(source.data_ptr(),tokens,columns,activation.data_ptr(),stream);
-    else mfq::cuda::gguf::quantize_input(source.data_ptr<float>(),tokens,columns,activation.data_ptr(),stream);
-    return {std::move(activation),std::move(position_major),input.sizes().vec(),tokens,dtype};
+    else if(native)mfq::cuda::gguf::quantize_input(source.data_ptr<float>(),tokens,columns,activation.data_ptr(),stream);
+    return {std::move(activation),std::move(position_major),keep_original?std::move(original):tb::Tensor{},input.sizes().vec(),tokens,dtype};
 }
 
 tb::Tensor GgufProjectionInput::project(const GgufWeight& weight) const {
@@ -174,6 +193,10 @@ tb::Tensor GgufProjectionInput::project(const GgufWeight& weight) const {
     const bool use_interleaved=mfq::cuda::gguf::supports_interleaved_activation(weight.type,tokens);
     auto output_shape=shape;output_shape.back()=weight.out;
     if(!tokens)return tb::empty(output_shape,weight.packed.options().dtype(dtype));
+    if(weight.prefers_original_input()) {
+        TYLOINFER_RUNTIME_CHECK(original.defined(),"GGUF floating codebook projection requires the original activation");
+        return weight.forward(original).to(dtype).reshape(output_shape);
+    }
     return weight.forward_q8(use_interleaved?interleaved:native,tokens,
         dtype==tb::kFloat16?tb::kFloat16:tb::kFloat32,use_interleaved).to(dtype).reshape(output_shape);
 }
@@ -192,15 +215,22 @@ std::vector<tb::Tensor> GgufProjectionInput::project_all(const std::vector<GgufW
     }
     const MfqCudaGuard guard(weights.front().packed.get_device());
     const auto stream=mfq_get_current_cuda_stream(weights.front().packed.get_device());
-    for(const auto& packet:{native,interleaved})if(packet.defined())mfq_cuda_record_stream(packet,stream);
+    for(const auto& packet:{native,interleaved,original})if(packet.defined())mfq_cuda_record_stream(packet,stream);
     std::vector<mfq::cuda::gguf::DenseProjection> projections;projections.reserve(weights.size());
+    std::vector<std::size_t> projection_indices;projection_indices.reserve(weights.size());
     const auto result_type=dtype==tb::kFloat16?tb::kFloat16:tb::kFloat32;
     for(const auto& weight:weights) {
+        if(weight.rotation || (weight.type>=GGML_TYPE_PTQ1_0 && weight.type<=GGML_TYPE_TQK4)) {
+            output.push_back(project(weight));
+            continue;
+        }
         auto result=tb::empty({tokens,weight.out},weight.packed.options().dtype(result_type));
         mfq_cuda_record_stream(weight.packed,stream);mfq_cuda_record_stream(result,stream);
         projections.push_back({weight.packed.data_ptr(),weight.row_bytes,weight.out,result.data_ptr(),weight.type});
+        projection_indices.push_back(output.size());
         output.push_back(std::move(result));
     }
+    if(projections.empty())return output;
     const auto separate=[&] {
         for(const auto& p:projections) {
             if(mfq::cuda::gguf::supports_interleaved_activation(p.type,tokens))
@@ -231,7 +261,7 @@ std::vector<tb::Tensor> GgufProjectionInput::project_all(const std::vector<GgufW
             std::fprintf(stderr,"native_gguf_dense_schedule_use actual_match=1 M=%lld matrices=%zu selected=%s captured=1\n",
                 static_cast<long long>(tokens),weights.size(),selected?"batch":"separate");
     }
-    for(std::size_t i=0;i<output.size();++i) {
+    for(const auto i:projection_indices) {
         auto output_shape=shape;output_shape.back()=weights[i].out;
         output[i]=output[i].to(dtype).reshape(output_shape);
     }
@@ -239,6 +269,7 @@ std::vector<tb::Tensor> GgufProjectionInput::project_all(const std::vector<GgufW
 }
 
 tb::Tensor GgufWeight::forward_q8(const tb::Tensor& activation,std::int64_t tokens,tb::ScalarType dtype,bool position_major) const {
+    TYLOINFER_RUNTIME_CHECK(!rotation,"GGUF rotated projection requires its original activation before Q8 quantization");
     const auto bytes_per_row=mfq::cuda::gguf::q8_row_bytes(neuron_len);
     const auto bytes=position_major?mfq::cuda::gguf::interleaved_activation_bytes(tokens,neuron_len)
         :std::uint64_t(tokens)*bytes_per_row;
@@ -248,10 +279,10 @@ tb::Tensor GgufWeight::forward_q8(const tb::Tensor& activation,std::int64_t toke
         (dtype==tb::kFloat16 || dtype==tb::kFloat32) &&
         (!position_major || mfq::cuda::gguf::supports_interleaved_activation(type,tokens)) &&
         activation.nbytes()==bytes,"GGUF prepared activation geometry/device/type differs");
-    const MfqCudaGuard guard(packed.get_device());const auto stream=mfq_current_cuda_stream();
-    const auto stream_id=reinterpret_cast<std::uintptr_t>(stream);
+    const MfqCudaGuard guard(packed.get_device());const auto stream_handle=mfq_get_current_cuda_stream(packed.get_device());
+    const auto stream=stream_handle.stream();
     auto result=tb::empty({tokens,out},packed.options().dtype(dtype));
-    for(const auto& tensor:{activation,packed,result})tensor.record_stream(stream_id);
+    for(const auto& tensor:{activation,packed,result})mfq_cuda_record_stream(tensor,stream_handle);
     if(position_major)mfq::cuda::gguf::matvec_interleaved(type,packed.data_ptr(),row_bytes,out,neuron_len,
         activation.data_ptr(),tokens,result.data_ptr(),dtype==tb::kFloat16,stream);
     else if(dtype==tb::kFloat16)mfq::cuda::gguf::matvec_q8_f16(type,packed.data_ptr(),row_bytes,out,neuron_len,
@@ -269,25 +300,38 @@ tb::Tensor GgufWeight::forward(tb::Tensor input,bool allow_mmq) const {
     // from a GGUF source must not propagate BF16 logits into the sampler.
     const auto dtype = input.scalar_type() == tb::kBFloat16 ? tb::kFloat16 : input.scalar_type();
     auto x = input.reshape({-1, neuron_len}).contiguous();
+    if(rotation)x=rotation->apply(x);
     if (!packed.is_cuda())
-        return tb::matmul(x.to(tb::kFloat32), dequantize().transpose(0, 1)).to(dtype).reshape(shape);
+        return tb::matmul(x.to(tb::kFloat32), dequantize_stored().transpose(0, 1)).to(dtype).reshape(shape);
     MfqCudaGuard guard(packed.get_device());
     TYLOINFER_RUNTIME_CHECK(x.is_cuda() && x.get_device() == packed.get_device(),
         "GGUF weight and input must share a device");
     const auto tokens = x.size(0);
     const auto output_dtype=dtype==tb::kFloat16?tb::kFloat16:tb::kFloat32;
     auto output = tb::empty({tokens, out}, packed.options().dtype(output_dtype));
-    const auto stream = reinterpret_cast<std::uintptr_t>(mfq_current_cuda_stream());
-    packed.record_stream(stream); output.record_stream(stream);
+    const auto stream=mfq_get_current_cuda_stream(packed.get_device());
+    mfq_cuda_record_stream(packed,stream); mfq_cuda_record_stream(output,stream);
+    // Trellis weights decode to floating-point codebook entries. Preserve the
+    // original activation instead of requantizing it to Q8 for a float dot.
+    // Large prefill batches retain the tensor-core path below.
+    if (type >= GGML_TYPE_TQ2_T && type <= GGML_TYPE_TQK4 && tokens <= 32) {
+        auto source = x.scalar_type() == tb::kFloat16 ? x : x.to(tb::kFloat32).contiguous();
+        mfq_cuda_record_stream(source,stream);
+        mfq::cuda::gguf::compact_project(mfq::cuda::gguf::CompactFormat(type), packed.data_ptr(), row_bytes,
+            out, neuron_len, source.data_ptr(), source.scalar_type() == tb::kFloat16
+                ? mfq::cuda::gguf::CompactInput::Float16 : mfq::cuda::gguf::CompactInput::Float32,
+            tokens, output.data_ptr(), output_dtype == tb::kFloat16, mfq_current_cuda_stream());
+        return output.to(dtype).reshape(shape);
+    }
     if (tokens <= 32) {
         auto source=x.scalar_type()==tb::kFloat16?x:x.to(tb::kFloat32).contiguous();
-        source.record_stream(stream);
+        mfq_cuda_record_stream(source,stream);
         const bool interleaved=mfq::cuda::gguf::supports_interleaved_activation(type,tokens);
         auto activation = tb::empty({static_cast<std::int64_t>(interleaved
                 ?mfq::cuda::gguf::interleaved_activation_bytes(tokens,neuron_len)
                 :tokens * mfq::cuda::gguf::q8_row_bytes(neuron_len))},
             packed.options());
-        activation.record_stream(stream);
+        mfq_cuda_record_stream(activation,stream);
         if(interleaved)
             mfq::cuda::gguf::quantize_input_interleaved(source.data_ptr(),source.scalar_type()==tb::kFloat16,
                 tokens,neuron_len,activation.data_ptr(),nullptr,mfq_current_cuda_stream());
@@ -325,7 +369,7 @@ tb::Tensor GgufWeight::forward(tb::Tensor input,bool allow_mmq) const {
             auto result=output_dtype==tb::kFloat32?output:tb::empty({tokens,out},packed.options().dtype(tb::kFloat32));
             const auto guard_bytes=std::size_t(128)*ggml_type_size(type);
             auto weight=tb::empty({std::int64_t(mmq_rows*row_bytes+guard_bytes)},packed.options());
-            for(const auto& tensor:{input_float,exponents,activation,result,weight})if(tensor.defined())tensor.record_stream(stream);
+            for(const auto& tensor:{input_float,exponents,activation,result,weight})if(tensor.defined())mfq_cuda_record_stream(tensor,stream);
             mmq::Context context;
             for(std::int64_t begin=0;begin<out;begin+=mmq_rows) {
                 const auto count=std::min(mmq_rows,out-begin);
@@ -358,7 +402,7 @@ tb::Tensor GgufWeight::forward(tb::Tensor input,bool allow_mmq) const {
         // decoded workspace. The final output slice still handles arbitrary N.
         const auto tile_rows=std::min(out,raw_rows>=32?raw_rows/32*32:raw_rows);
         auto tile = tb::empty({tile_rows, neuron_len}, x.options());
-        tile.record_stream(stream);
+        mfq_cuda_record_stream(tile,stream);
         tb::Tensor scaled_x,scaled_weight,x_exponents,weight_exponents;
         mfq::cuda::BlasHandle* blas=nullptr;
         if(scaled_half) {
@@ -366,7 +410,7 @@ tb::Tensor GgufWeight::forward(tb::Tensor input,bool allow_mmq) const {
             scaled_weight=tb::empty({tile_rows,neuron_len},scaled_x.options());
             x_exponents=tb::empty({tokens},x.options().dtype(tb::kInt32));
             weight_exponents=tb::empty({tile_rows},x_exponents.options());
-            for(const auto& tensor:{scaled_x,scaled_weight,x_exponents,weight_exponents})tensor.record_stream(stream);
+            for(const auto& tensor:{scaled_x,scaled_weight,x_exponents,weight_exponents})mfq_cuda_record_stream(tensor,stream);
             mfq::cuda::gguf::pack_scaled_f16(x.data_ptr<float>(),scaled_x.data_ptr(),x_exponents.data_ptr<std::int32_t>(),
                 tokens,neuron_len,mfq_current_cuda_stream());
             blas=&mfq::cuda::default_context(packed.get_device())->blas();blas->set_stream(mfq_current_cuda_stream());
@@ -380,7 +424,7 @@ tb::Tensor GgufWeight::forward(tb::Tensor input,bool allow_mmq) const {
             if(scaled_half) {
                 mfq::cuda::gguf::pack_scaled_f16(weight.data_ptr<float>(),scaled_weight.data_ptr(),weight_exponents.data_ptr<std::int32_t>(),
                     count,neuron_len,mfq_current_cuda_stream());
-                auto result=tb::empty({tokens,count},x.options());result.record_stream(stream);
+                auto result=tb::empty({tokens,count},x.options());mfq_cuda_record_stream(result,stream);
                 mfq::cuda::gguf::gemm_scaled_f16(scaled_x.data_ptr(),scaled_weight.data_ptr(),x_exponents.data_ptr<std::int32_t>(),
                     weight_exponents.data_ptr<std::int32_t>(),result.data_ptr<float>(),tokens,count,neuron_len,blas->get(),mfq_current_cuda_stream());
                 output.slice(1,begin,begin+count).copy_(result);

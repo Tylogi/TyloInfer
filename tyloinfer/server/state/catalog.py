@@ -776,7 +776,8 @@ class ModelCatalog:
             tensors = metadata['tensors']
             architecture = _native_architecture(metadata)
             supported = {'Q4_0', 'Q4_1', 'Q5_0', 'Q5_1', 'Q8_0', 'Q2_K', 'Q3_K', 'Q4_K', 'Q5_K', 'Q6_K',
-                'Q8_K', 'IQ2_XXS', 'IQ2_XS', 'IQ2_S', 'IQ3_XXS', 'IQ3_S', 'IQ4_NL', 'IQ4_XS', 'Q2_0'}
+                'Q8_K', 'IQ2_XXS', 'IQ2_XS', 'IQ2_S', 'IQ3_XXS', 'IQ3_S', 'IQ4_NL', 'IQ4_XS', 'Q2_0',
+                'PTQ1_0', 'TQ2_T', 'TQK6', 'TQK7', 'TQP5', 'TQP6', 'TQP7', 'TQK5', 'TQK4'}
             unsupported = set()
             for tensor, record in tensors.items():
                 dtype, size = record['dtype'], int(record['nbytes'])

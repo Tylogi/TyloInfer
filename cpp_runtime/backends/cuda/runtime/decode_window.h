@@ -34,6 +34,7 @@ public:
     };
     explicit DecodeWindow(cudaStream_t stream,bool layer_profile=false,bool independent_sequences=false);
     bool independent_sequences() const noexcept {return independent_sequences_;}
+    bool layer_profiling() const noexcept {return layer_profile_;}
     ~DecodeWindow();
     DecodeWindow(const DecodeWindow&)=delete;
     DecodeWindow& operator=(const DecodeWindow&)=delete;

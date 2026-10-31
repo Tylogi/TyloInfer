@@ -291,7 +291,8 @@ __global__ void sparse_attention_kernel(
 #endif
 }
 
-template<int DKQ, int DV, int ncols1, int ncols2, bool V_is_K_view, bool use_hot = false, bool resolved_hot = false>
+template<int DKQ, int DV, int ncols1, int ncols2, bool V_is_K_view, bool use_hot = false, bool resolved_hot = false,
+         bool select_head_tile=true>
 Tensor launch(
     const Tensor& q,
     const Tensor& k,
@@ -445,6 +446,19 @@ Tensor launch(
     const int resident_blocks =
         max_blocks_per_sm * properties.multiProcessorCount;
     const int64_t total_tiles = ntiles_dst64 * ntiles_kv;
+    if constexpr(ncols2==16 && select_head_tile) {
+        // Smaller head tiles avoid padding unused GQA heads, or expose more
+        // independent blocks when this grid cannot fill the available SMs.
+        // This follows the actual workload and kernel occupancy on the device.
+        const auto small_base=ampere_mma_available(cc)
+            ?ggml_cuda_fattn_mma_get_config_ampere(DKQ,DV,8)
+            :ggml_cuda_fattn_mma_get_config_turing(DKQ,DV,8);
+        const auto small_config=mfq_fattn_mma_select_config(small_base,DKQ,DV,8,true);
+        if(small_config.nthreads>=128 && small_config.nbatch_fa>0 &&
+            selected%small_config.nbatch_fa==0 && (gqa_ratio<=8 || total_tiles<resident_blocks))
+            return launch<DKQ,DV,ncols1,8,V_is_K_view,use_hot,resolved_hot>(
+                q,k,v,indices,mask,sinks,meta,scale,name,gate,half_output,positions,causal_columns,hot);
+    }
     const int raw_blocks = static_cast<int>(std::min<int64_t>(
         resident_blocks, total_tiles));
     const int rounded_blocks = std::max(
@@ -496,6 +510,7 @@ Tensor launch(
         stream, "selected_attention_mma", reinterpret_cast<const void*>(kernel),
         "M="+std::to_string(M)+" heads="+std::to_string(heads)+
         " kv_heads="+std::to_string(kv_heads)+" width="+std::to_string(DKQ)+
+        " query_heads_per_tile="+std::to_string(ncols2)+
         " tile_keys="+std::to_string(nbatch_fa)+
         " selected="+std::to_string(selected)+" parts="+std::to_string(blocks_per_tile)+
         " blocks="+std::to_string(rounded_blocks)+" shared_bytes="+std::to_string(shmem)+

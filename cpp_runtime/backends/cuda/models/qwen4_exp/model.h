@@ -1433,13 +1433,14 @@ class Qsa {
         mark("qsa_scores_end");
         auto absolute=query_positions.reshape({1,query_tokens,1});
         const auto count=std::min(c_.budget/c_.pool,pools),columns=c_.budget+c_.pool-1;
-        auto indices=mfq_qwen4_exp::live_topk_blocks(ranked,query_positions,c_.pool,count);
-        mark("qsa_topk_end");
         Tensor selected;
         const auto fused_selection=mfq::cuda::runtime_options::qsa_select_fused();
         if(!fused_selection || *fused_selection) {
-            selected=mfq_qwen4_exp::qsa_selected_tokens(indices,query_positions,c_.pool,c_.budget);
+            selected=mfq_qwen4_exp::live_topk_selected_tokens(ranked,query_positions,c_.pool,count,c_.budget);
+            mark("qsa_topk_end");
         } else {
+        auto indices=mfq_qwen4_exp::live_topk_blocks(ranked,query_positions,c_.pool,count);
+        mark("qsa_topk_end");
         // Live top-k pads inactive slots with an out-of-range block ID.
         // Check positions directly rather than gathering a visibility table
         // with those sentinels when the unfused selector is requested.

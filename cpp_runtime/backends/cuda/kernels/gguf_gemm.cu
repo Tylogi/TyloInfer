@@ -167,11 +167,11 @@ void grouped_decode_f16(ggml_type type,const GemmJob* jobs,int experts,std::uint
     }
     checked();
     if(const auto* trace=std::getenv("TYLOINFER_TRACE_KERNEL_DISPATCH");trace && trace[0]=='1') {
-        static std::atomic<std::uint64_t> reported{0};
-        const auto mask=std::uint64_t(1)<<unsigned(type);
-        if(!(reported.fetch_or(mask,std::memory_order_relaxed)&mask))
-            std::fprintf(stderr,"native_gguf_prefill_decode format=%d values_per_thread=8 rows=%lld columns=%lld\n",
-                int(type),static_cast<long long>(rows),static_cast<long long>(columns));
+        static std::atomic<bool> reported[GGML_TYPE_COUNT]{};
+        if(!reported[type].exchange(true,std::memory_order_relaxed))
+            std::fprintf(stderr,"native_gguf_prefill_decode format=%d values_per_thread=8 four_value_groups=%d rows=%lld columns=%lld\n",
+                int(type),int(type>=GGML_TYPE_PTQ1_0 && type<=GGML_TYPE_TQK4?2:0),
+                static_cast<long long>(rows),static_cast<long long>(columns));
     }
 }
 void gate_up_swiglu_f16(const void* gate_up,std::int64_t tokens,std::int64_t width,void* hidden,float limit,cudaStream_t stream) {

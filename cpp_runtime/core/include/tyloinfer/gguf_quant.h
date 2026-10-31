@@ -9,13 +9,18 @@
 #include <string>
 #include <string_view>
 
-// The formats accepted by both native backends. Keep dispatch independent of
-// model names, development GPU capabilities and particular matrix dimensions.
-#define TYLOINFER_GGUF_FORMATS(X) \
+// Known GGUF row encodings. Backend capabilities are checked independently.
+// Keep format dispatch independent of device names and model dimensions.
+#define TYLOINFER_GGUF_LEGACY_FORMATS(X) \
     X(Q4_0) X(Q4_1) X(Q5_0) X(Q5_1) X(Q8_0) \
     X(Q2_K) X(Q3_K) X(Q4_K) X(Q5_K) X(Q6_K) X(Q8_K) \
     X(IQ2_XXS) X(IQ2_XS) X(IQ3_XXS) X(IQ4_NL) X(IQ3_S) \
     X(IQ2_S) X(IQ4_XS) X(Q2_0)
+
+#define TYLOINFER_GGUF_COMPACT_FORMATS(X) \
+    X(PTQ1_0) X(TQ2_T) X(TQK6) X(TQK7) X(TQP5) X(TQP6) X(TQP7) X(TQK5) X(TQK4)
+#define TYLOINFER_GGUF_FORMATS(X) \
+    TYLOINFER_GGUF_LEGACY_FORMATS(X) TYLOINFER_GGUF_COMPACT_FORMATS(X)
 
 namespace mfq::gguf {
 inline bool is_quantized(std::string_view dtype) noexcept {

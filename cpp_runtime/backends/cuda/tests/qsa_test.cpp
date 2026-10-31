@@ -10,6 +10,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <vector>
+void qsa_tile_pair_benchmark(int rows,int heads,int kv_heads,int capacity,int selected);
 namespace tb=mfq_tensor_backend;
 using tb::Tensor;
 using namespace mfq::cuda;
@@ -490,6 +491,52 @@ void qsa_sparse_gate_case() {
         <<" bytes exact; partial/whole tiles, invalid/repeated indices, Half/Float strided query/gates, BF16/empty-cache fallbacks PASS\n";
 }
 
+void topk_selection(bool sanitizer=false) {
+    const auto stream=mfq_current_cuda_stream();
+    int cases=0;
+    const auto run=[&](int pools,int rows,int pool,int count,int budget) {
+        auto scores=data({1,rows,pools},733,.7f);
+        auto positions=tb::zeros({rows},scores.options().dtype(tb::kInt64));
+        Tensor output[2];Graph graphs[2];
+        const auto compute=[&](int mode) {
+            if(mode)output[1]=mfq_qwen4_exp::live_topk_selected_tokens(scores,positions,pool,count,budget);
+            else output[0]=mfq_qwen4_exp::qsa_selected_tokens(
+                mfq_qwen4_exp::live_topk_blocks(scores,positions,pool,count),positions,pool,budget);
+        };
+        for(int mode=0;mode<2;++mode) {
+            {GraphWarmupScope warm(default_context(mfq_current_cuda_device()),stream);compute(mode);}
+            TYLOINFER_NATIVE_CUDA_CHECK(cudaStreamSynchronize(stream));output[mode]={};
+            graphs[mode].capture_begin_shared();compute(mode);graphs[mode].capture_end();
+        }
+        for(int ties:{0,1})for(int64_t start:{int64_t(-1),int64_t(0),int64_t(count)*pool-1,int64_t(count)*pool,
+                int64_t(129)*pool-1,int64_t(257)*pool,int64_t(pools)*pool-2}) {
+            if(ties)scores.zero_();
+            std::vector<int64_t> live(rows);
+            for(int row=0;row<rows;++row)live[row]=std::min(int64_t(pools)*pool-1,std::max(int64_t(-1),start+row));
+            positions.copy_(tb::tensor(live).to(tb::kCUDA));
+            for(int mode=0;mode<2;++mode){output[mode].fill_(-123456);graphs[mode].replay();}
+            auto a=output[0].cpu().contiguous(),b=output[1].cpu().contiguous();
+            if(a.sizes()!=b.sizes() || std::memcmp(a.data_ptr(),b.data_ptr(),a.nbytes()))
+                throw std::runtime_error("Fused QSA top-k selection changed token IDs");
+            ++cases;
+        }
+
+    };
+    if(sanitizer) {
+        run(1024,4,32,64,2048);
+        run(8193,3,4,1024,4096);
+    } else {
+        for(int pools:{17,257,1024,8193})for(int rows:{1,4})for(int pool:{1,3,4,7,32}) {
+            const int count=std::min(64,pools);
+            run(pools,rows,pool,count,count*pool+(pool>1?3:0));
+        }
+        for(int rows:{1,4})run(8192,rows,4,512,2048);
+        for(int count:{512,1024,1025})run(8193,3,4,count,count*4);
+    }
+    std::cout<<"QSA fused top-k/token selection cases="<<cases
+        <<" changing graphs/ties/empty visibility/causal tails/multiple stages/large-count fallback exact PASS\n";
+}
+
 }
 #include "rotary_shared_angles_test.h"
 int main(int argc,char** argv) {
@@ -501,8 +548,12 @@ int main(int argc,char** argv) {
         std::cout<<std::unitbuf;
         auto context=default_context(mfq_current_cuda_device());const auto stream=mfq_current_cuda_stream();context->begin_graph_pool(stream);
         struct Release {std::shared_ptr<Context> c;cudaStream_t s;~Release(){c->end_graph_pool(s);}} release{context,stream};
-        if(argc==2 && std::string(argv[1])=="--rotary-angle-check")rotary_angles_test::check();
+        if(argc==2 && std::string(argv[1])=="--topk-select-check")topk_selection(false);
+        else if(argc==2 && std::string(argv[1])=="--topk-select-sanitizer-check")topk_selection(true);
+        else if(argc==2 && std::string(argv[1])=="--rotary-angle-check")rotary_angles_test::check();
         else if(argc==7 && std::string(argv[1])=="--rotary-angle-bench")rotary_angles_test::benchmark(
+            std::stoi(argv[2]),std::stoi(argv[3]),std::stoi(argv[4]),std::stoi(argv[5]),std::stoi(argv[6]));
+        else if(argc==7 && std::string(argv[1])=="--tile-pair-bench")qsa_tile_pair_benchmark(
             std::stoi(argv[2]),std::stoi(argv[3]),std::stoi(argv[4]),std::stoi(argv[5]),std::stoi(argv[6]));
         else if(argc==2 && (std::string(argv[1])=="--bench" || std::string(argv[1])=="--bench-f16"))benchmark(std::string(argv[1])=="--bench-f16");
         else if(argc==2 && std::string(argv[1])=="--prefill-bench")prefill_benchmark();

@@ -231,6 +231,63 @@ void benchmark_prefill_mix(int hidden,int rank,int streams,int rows,int sets,int
     std::printf("gr_prefill_%s M=%d hidden=%d K=%d streams=%d sets=%d iterations=%d old_ms=%.6f fused_ms=%.6f median5=1\n",
         after?"read_after":full?"read":"mix",rows,hidden,rank,streams,sets,iterations,times[0][2],times[1][2]);
 }
+void check_shared_gate_multiply(int width,int rows,tb::ScalarType input_type,tb::ScalarType expert_type,bool graph) {
+    auto x=pattern(int64_t(rows)*width+1,.29f).to(input_type).narrow(0,1,int64_t(rows)*width).reshape({rows,width});
+    auto weight=pattern(width+1,.57f).narrow(0,1,width).reshape({1,width});
+    auto expert=pattern(int64_t(rows)*259+1,.41f).to(expert_type).narrow(0,1,int64_t(rows)*259).reshape({rows,259});
+    const auto compute=[&] {
+        auto result=try_shared_gate_multiply_cuda(x,weight,expert);
+        if(!result || result->scalar_type()!=tb::kFloat32 || result->sizes()!=expert.sizes())
+            throw std::runtime_error("FP32 shared gate scaling changed its dtype/shape or rejected a valid case");
+        return *result;
+    };
+    const auto compare=[&](const tb::Tensor& actual) {
+        const auto reference=tb::sigmoid(dense_projection(x,weight))*expert;
+        if(reference.scalar_type()!=tb::kFloat32)throw std::runtime_error("Shared gate FP32 reference precision changed");
+        const auto error=(actual-reference).abs().max().item<float>();
+        if(!std::isfinite(error) || error>2e-6f)
+            throw std::runtime_error("FP32 shared gate scaling exceeded float-addition allowance");
+    };
+    compare(compute());
+    if(graph) {
+        const auto context=mfq::cuda::default_context(x.get_device());context->begin_graph_pool(mfq_current_cuda_stream());
+        struct PoolEnd {std::shared_ptr<mfq::cuda::Context> context;
+            ~PoolEnd(){context->end_graph_pool(mfq_current_cuda_stream());}} pool_end{context};
+        tb::Tensor actual;mfq::cuda::DecodeWindow window(mfq_current_cuda_stream());
+        window.capture([&]{actual=compute();},[]{},[&]{actual={};});
+        for(float value:{.01f,-.07f,100.f}) {x.fill_(value);expert.fill_(value*.001f);window.run();compare(actual);}
+    }
+    for(float sign:{-1.f,1.f}) {x.fill_(100.f);weight.fill_(sign*100.f);compare(compute());}
+    if(try_shared_gate_multiply_cuda(x,weight.to(tb::kBFloat16),expert) ||
+            try_shared_gate_multiply_cuda(x,weight,expert.narrow(0,0,rows-1)) ||
+            (rows>1 && try_shared_gate_multiply_cuda(x,weight,expert.narrow(1,0,257))))
+        throw std::runtime_error("FP32 shared gate accepted incompatible weight, row count or strided expert output");
+}
+void benchmark_shared_gate_multiply(int rows,int width,int outputs,int iterations) {
+    auto x=pattern(int64_t(rows)*width,.29f).to(tb::kFloat16).reshape({rows,width});
+    auto weight=pattern(width,.57f).reshape({1,width});
+    auto expert=pattern(int64_t(rows)*outputs,.41f).to(tb::kFloat16).reshape({rows,outputs});
+    const auto context=mfq::cuda::default_context(x.get_device());context->begin_graph_pool(mfq_current_cuda_stream());
+    struct PoolEnd {std::shared_ptr<mfq::cuda::Context> context;
+        ~PoolEnd(){context->end_graph_pool(mfq_current_cuda_stream());}} pool_end{context};
+    tb::Tensor result[2];mfq::cuda::DecodeWindow before(mfq_current_cuda_stream()),after(mfq_current_cuda_stream());
+    before.capture([&]{result[0]=tb::sigmoid(dense_projection(x,weight))*expert;},[]{});
+    after.capture([&]{auto output=try_shared_gate_multiply_cuda(x,weight,expert);
+        if(!output)throw std::runtime_error("FP32 gate benchmark did not use the fused entry");result[1]=*output;},[]{});
+    before.run();after.run();
+    if((result[0]-result[1]).abs().max().item<float>()>2e-6f)throw std::runtime_error("FP32 gate benchmark parity failed");
+    std::array<std::vector<float>,2> times;
+    for(int trial=0;trial<7;++trial)for(int order=0;order<2;++order) {
+        const int mode=(trial+order)%2;auto& window=mode?after:before;
+        for(int i=0;i<iterations/4;++i)if(!window.enqueue_if_device_only())throw std::runtime_error("Gate benchmark has a host task");
+        mfq::cuda::Event begin(cudaEventDefault),end(cudaEventDefault);begin.record(mfq_current_cuda_stream());
+        for(int i=0;i<iterations;++i)window.enqueue_if_device_only();end.record(mfq_current_cuda_stream());end.synchronize();
+        float ms=0;TYLOINFER_CUDA_CHECK(cudaEventElapsedTime(&ms,begin.get(),end.get()));times[mode].push_back(ms*1000/iterations);
+    }
+    for(auto& t:times)std::sort(t.begin(),t.end());
+    std::printf("shared_gate_multiply M=%d K=%d output=%d old_us=%.6f new_us=%.6f ratio=%.6f actual_match=1\n",
+        rows,width,outputs,times[0][3],times[1][3],times[1][3]/times[0][3]);
+}
 void check_shared_gate(int width,int rows,bool graph) {
     auto x=pattern(int64_t(rows)*width+1,.29f).to(tb::kFloat16).narrow(0,1,int64_t(rows)*width).reshape({rows,width});
     auto weight=pattern(width+1,.57f).to(tb::kBFloat16).narrow(0,1,width).reshape({1,width});
@@ -533,6 +590,15 @@ int main(int argc,char** argv) {
             check_prefill_mix(127,96,3,137,false);check_prefill_mix(129,128,7,257,false);
             check_prefill_mix(2560,320,4,133,false);
             std::cout<<"BF16 GR prefill up/mix arbitrary streams/tails/offsets/views/changed graphs PASS\n";return 0;
+        }
+        if(argc==6 && std::string(argv[1])=="--shared-gate-multiply-bench") {
+            benchmark_shared_gate_multiply(std::stoi(argv[2]),std::stoi(argv[3]),std::stoi(argv[4]),std::stoi(argv[5]));return 0;
+        }
+        if(argc==2 && std::string(argv[1])=="--shared-gate-multiply-check") {
+            for(int width:{1,127,257,2560,4097,8193})for(int rows:{1,2,3,4,6})
+                for(auto input:{tb::kFloat16,tb::kFloat32})for(auto expert:{tb::kFloat16,tb::kFloat32})
+                    check_shared_gate_multiply(width,rows,input,expert,width==257 && rows==4);
+            std::cout<<"FP32 shared gate120cases+changinggraphs+overflow/views/precision checks PASS\n";return 0;
         }
         if(argc==2 && std::string(argv[1])=="--shared-gate-check") {
             for(int width:{1,127,257,2560,4097,8193})for(int rows:{1,2,3,4,6,8,32,97})

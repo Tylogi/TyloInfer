@@ -17,7 +17,7 @@ __device__ __forceinline__ void project_dense_group_entry(const DenseGroupEntry&
         bool half_output,float* scratch) {
     const auto& p=entry.projection;
     const auto* packed=static_cast<const uint8_t*>(p.packed);
-    if constexpr(M==1) {
+    if constexpr(M==1)if(!entry.cooperative) {
         const auto row=int64_t(tile)*4+threadIdx.y;
         if(row>=p.rows)return;
         const auto value=q8_dot<Format>(packed+row*p.stride,native,columns,threadIdx.x);
@@ -38,7 +38,7 @@ __device__ __forceinline__ void project_dense_group_entry(const DenseGroupEntry&
     }
     if constexpr(Format==GGML_TYPE_Q8_0 || Format==GGML_TYPE_Q5_K || Format==GGML_TYPE_Q6_K || Format==GGML_TYPE_IQ4_XS) {
         if(entry.cooperative) {
-            constexpr int Outputs=Format==GGML_TYPE_Q6_K && M==2?1:2;
+            constexpr int Outputs=M==1 || (Format==GGML_TYPE_Q6_K && M==2)?1:2;
             if(entry.warps==2)project_dense_cooperative_q8_body<Format,M,Outputs,2>(packed,int(p.stride),int(p.rows),columns,M,native,output,half_output,tile,scratch);
             else if(entry.warps==3)project_dense_cooperative_q8_body<Format,M,Outputs,3>(packed,int(p.stride),int(p.rows),columns,M,native,output,half_output,tile,scratch);
             else project_dense_cooperative_q8_body<Format,M,Outputs,4>(packed,int(p.stride),int(p.rows),columns,M,native,output,half_output,tile,scratch);

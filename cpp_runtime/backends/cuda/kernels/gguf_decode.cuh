@@ -1,4 +1,5 @@
 #pragma once
+#include "gguf_compact_decode.cuh"
 // GGUF scalar decoder shared in design with the native Metal backend.
 // Layouts and lookup tables are supplied by the bundled ggml-common.h.
 
@@ -8,7 +9,14 @@ __device__ __forceinline__ std::uint32_t gguf_sign_mask(std::uint32_t index) {
 
 template<int F> __device__ __forceinline__ float gguf_value(const std::uint8_t* row, std::uint64_t k) {
     std::uint32_t j = k % 32u, p = k % 256u;
-    if constexpr (F == 42) {
+    if constexpr (F >= 143 && F <= 151) {
+        using L = mfq::cuda::gguf::compact_detail::Layout<F>;
+        const auto* q = row + (k / 128) * L::bytes;
+        const auto w = mfq::cuda::gguf::compact_detail::decode_four<L::bits, L::steps>(q + (L::bits ? 2 : 0), int(k % 128) / 4);
+        const float d = mfq::cuda::gguf::compact_detail::scale_at(q + (L::bits ? 0 : 26));
+        const auto part = k % 4;
+        return __fmul_rn(part == 0 ? w.x : part == 1 ? w.y : part == 2 ? w.z : w.w, d);
+    } else if constexpr (F == 42) {
         auto block = row + std::uint64_t(k / 64u) * 18u;
         const float scale = float(*reinterpret_cast<const half*>(block));
         const std::uint32_t code = (block[2u + (k % 64u) / 4u] >> (2u * (k % 4u))) & 3u;
@@ -135,7 +143,21 @@ template<int F> __device__ __forceinline__ float gguf_value(const std::uint8_t* 
 // begins on an eight-value boundary and cannot cross a GGUF block.
 template<int F> __device__ __forceinline__ void gguf_values8(
         const std::uint8_t* row, std::uint64_t k, float (&values)[8]) {
-    if constexpr(F==16 || F==17 || F==22 || F==18 || F==21) {
+    if constexpr(F>=143 && F<=151) {
+        using L=mfq::cuda::gguf::compact_detail::Layout<F>;
+        const auto* block=row+(k/128)*L::bytes;
+        const auto* states=block+(L::bits?2:0);
+        const auto lane=int(k%128)/4;
+        const float scale=mfq::cuda::gguf::compact_detail::scale_at(block+(L::bits?0:26));
+        // Eight-value groups never cross a 128-value block. Decode each
+        // four-value state once, sharing its window, hash, codebook and scale.
+        const auto a=mfq::cuda::gguf::compact_detail::decode_four<L::bits,L::steps>(states,lane);
+        const auto b=mfq::cuda::gguf::compact_detail::decode_four<L::bits,L::steps>(states,lane+1);
+        values[0]=__fmul_rn(a.x,scale);values[1]=__fmul_rn(a.y,scale);
+        values[2]=__fmul_rn(a.z,scale);values[3]=__fmul_rn(a.w,scale);
+        values[4]=__fmul_rn(b.x,scale);values[5]=__fmul_rn(b.y,scale);
+        values[6]=__fmul_rn(b.z,scale);values[7]=__fmul_rn(b.w,scale);
+    } else if constexpr(F==16 || F==17 || F==22 || F==18 || F==21) {
         const auto p=std::uint32_t(k%256), group=p/32, sub=p%32/8;
         float scale;
         std::uint32_t signs;

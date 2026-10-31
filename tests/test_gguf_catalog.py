@@ -73,7 +73,10 @@ def test_gguf_prefix_text_decodes_embedded_byte_vocabulary(tmp_path):
     assert decode_prefix_cache_tokens(path, [0, 1]) == 'hello world'
 
 
-def test_gguf_catalog_groups_shards_and_shared_table(tmp_path):
+@pytest.mark.parametrize('expert_format', [
+    'IQ3_XXS', 'PTQ1_0', 'TQ2_T', 'TQK6', 'TQK7', 'TQP5', 'TQP6', 'TQP7', 'TQK5', 'TQK4',
+])
+def test_gguf_catalog_groups_shards_and_shared_table(tmp_path, expert_format):
     async def check():
         models, shared = tmp_path / 'models', tmp_path / 'shared'
         models.mkdir(); shared.mkdir()
@@ -98,7 +101,7 @@ def test_gguf_catalog_groups_shards_and_shared_table(tmp_path):
                 'indexer_head_dim': 128, 'indexer_compress_ratio': 4, 'indexer_budget': 2048,
             }, 'tensors': {
                 'model.token_embedding.weight': {'dtype': 'GGUF_Q8_0', 'nbytes': 500, 'shape': [32, 32]},
-                'model.block.0.mlp.experts.gate.weight': {'dtype': 'GGUF_IQ3_XXS', 'nbytes': 2000, 'shape': [4, 256, 256]},
+                'model.block.0.mlp.experts.gate.weight': {'dtype': f'GGUF_{expert_format}', 'nbytes': 2000, 'shape': [4, 256, 256]},
                 'model.block.0.position_embedding.ngram.shard.0.weight': {'dtype': 'GGUF_IQ4_NL', 'nbytes': 9000, 'shape': [128, 160]},
             }}
 
@@ -117,7 +120,7 @@ def test_gguf_catalog_groups_shards_and_shared_table(tmp_path):
         analysis = analyze_checkpoint(artifact)
         assert analysis.format == 'gguf' and analysis.expert_count == 4
         assert len(analysis.experts) == 4
-        assert {expert.format for expert in analysis.experts} == {'IQ3_XXS'}
+        assert {expert.format for expert in analysis.experts} == {expert_format}
         assert analysis.experts[0].parameters == 256 * 256
         assert analysis.experts[0].stored_bytes == 500
         assert catalog._immediate_model_count(shared) == 0

@@ -8,6 +8,11 @@ template<int Format> struct PreparedDot : Dot<Format> {
     __device__ static float apply(const Weight& w,const block_q8_1* x){return Dot<Format>::apply(w.data,x,w.block,w.part);}
 };
 
+#define TYLOINFER_COMPACT_PREPARED(Name) \
+template<> struct PreparedDot<GGML_TYPE_##Name> : Dot<GGML_TYPE_##Name> { using DecodedWeight = void; };
+TYLOINFER_GGUF_COMPACT_FORMATS(TYLOINFER_COMPACT_PREPARED)
+#undef TYLOINFER_COMPACT_PREPARED
+
 // Affine K blocks follow Strata's Q4K/Q5K traits. Materialize the integer
 // codes and scales before the token loop; a pointer-only preparation would
 // leave their unpacking inside every activation dot.

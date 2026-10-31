@@ -25,6 +25,7 @@
 #include "storage/session_codec.h"
 #include "gated_residual.h"
 #include "gated_residual_fused.h"
+#include "../../ops/gguf/gguf_residual.h"
 #include "float_projection.h"
 #include "../../kernels/gguf.h"
 #include "nint_prefill_cache.h"
@@ -197,6 +198,7 @@ struct Gr {
                 return pre(execution,x.narrow(1,begin,count),marker);
             });
         if(can_fuse(execution,x))return fused({},x,{},false,marker);
+        if(auto gguf=gguf_fused(execution,x,{},{},marker);!gguf.empty())return gguf;
         if(auto dense=dense_fused(execution,x,{},{},marker);!dense.empty())return dense;
         return gated_residual_pre_projected(execution, x, norm, down.forward, up.forward, injection.forward,
             hidden, streams, eps,up.mixed,marker,down.activated,injection.activated);
@@ -218,6 +220,15 @@ struct Gr {
         return try_gated_residual_bf16_cuda(input,norm,down.weight->dense,up.weight->dense,
             injection.weight->dense,streams,eps,branch,prior,marker);
     }
+    std::vector<Tensor> gguf_fused(CudaExecutionContext& execution,const Tensor& input,
+            const Tensor& branch,const Tensor& prior,const GatedResidualMarker& marker)const {
+        if(!execution.config.gr_fused_projections ||
+                (branch.defined() && !execution.config.gr_fused_post_norm) ||
+                !down.weight || !up.weight || !injection.weight || !down.weight->is_gguf() ||
+                !up.weight->is_gguf() || !injection.weight->is_gguf())return {};
+        return try_gguf_gated_residual_pre(input,norm,down.weight->gguf,up.weight->gguf,
+            injection.weight->gguf,streams,eps,branch,prior,marker);
+    }
     std::vector<Tensor> pre_after(CudaExecutionContext& execution,const Tensor& branch,
         const std::vector<Tensor>& inputs,const GatedResidualMarker& marker={}) const {
         if(const auto chunk=prefill_work_chunk(inputs[1]))
@@ -229,6 +240,7 @@ struct Gr {
             (branch.scalar_type()==tb::kFloat16 || branch.scalar_type()==tb::kFloat32) &&
             (inputs[2].scalar_type()==tb::kFloat16 || inputs[2].scalar_type()==tb::kFloat32))
             return fused(branch,inputs[1],inputs[2],true,marker);
+        if(auto gguf=gguf_fused(execution,inputs[1],branch,inputs[2],marker);!gguf.empty())return gguf;
         if(auto dense=dense_fused(execution,inputs[1],branch,inputs[2],marker);!dense.empty())return dense;
         return gated_residual_pre_after_projected(execution,branch,inputs[1],inputs[2],norm,
             down.forward,up.forward,injection.forward,hidden,streams,eps,
@@ -370,14 +382,22 @@ static Linear qwen_moe(CudaExecutionContext& loading,weight_loader::Routed gate_
             if(auto output=try_shared_gate_sigmoid_cuda(input,shared_gate_weight->dense))return *output;
         return tb::sigmoid(shared_gate(execution,input));
     };
-    auto shared_raw=[sg,su,sd,shared_scale,shared_tq,shared_gguf,shared_width,shared_d](CudaExecutionContext& execution,const Tensor& source) {
+    const auto scale_output=[shared_scale,shared_gate_weight](CudaExecutionContext& execution,const Tensor& source,const Tensor& output) {
+        const auto option=mfq::cuda::runtime_options::shared_gate_fused();
+        if((!option || *option) && shared_gate_weight && shared_gate_weight->is_dense() &&
+                !shared_gate_weight->tensor_parallel())
+            if(auto result=try_shared_gate_multiply_cuda(source,shared_gate_weight->dense,output))return *result;
+        return shared_scale(execution,source)*output;
+    };
+    auto shared_raw=[sg,su,sd,scale_output,shared_tq,shared_gguf,shared_width,shared_d](CudaExecutionContext& execution,const Tensor& source) {
         if(shared_tq) {
             auto output=sd(execution,shared_tq->swiglu(source));
-            return shared_scale(execution,source)*output;
+            return scale_output(execution,source,output);
         }
         if(shared_gguf && source.size(0)<=32 && source.scalar_type()==tb::kFloat16) {
             auto gu=shared_gguf(execution,source).at(0).contiguous();
             if(shared_d && shared_d->is_gguf() && !shared_d->tensor_parallel() &&
+                    !shared_d->gguf.prefers_original_input() &&
                     shared_d->gguf.packed.is_cuda() && shared_d->gguf.packed.device()==source.device()) {
                 const auto& down=shared_d->gguf;
                 const auto tokens=source.size(0);
@@ -387,20 +407,20 @@ static Linear qwen_moe(CudaExecutionContext& loading,weight_loader::Routed gate_
                 auto quantized=tb::empty({int64_t(bytes)},source.options().dtype(tb::kUInt8));
                 mfq::cuda::gguf::gate_up_swiglu_q8_f16(gu.data_ptr(),tokens,shared_width,quantized.data_ptr(),
                     position_major,mfq_current_cuda_stream());
-                return shared_scale(execution,source)*down.forward_q8(quantized,tokens,source.scalar_type(),position_major);
+                return scale_output(execution,source,down.forward_q8(quantized,tokens,source.scalar_type(),position_major));
             }
             auto shape=source.sizes().vec();shape.back()=shared_width;
             auto hidden=tb::empty(shape,source.options());
             mfq::cuda::gguf::gate_up_swiglu_f16(gu.data_ptr(),source.size(0),shared_width,hidden.data_ptr(),0.f,mfq_current_cuda_stream());
             auto output=sd(execution,hidden);
-            return shared_scale(execution,source)*output;
+            return scale_output(execution,source,output);
         }
         auto unfused=[](const auto&...){return std::optional<Tensor>{};};
         auto output=mfq::models::gated_mlp(source,false,0.0,unfused,unfused,
             [&](Tensor input){return std::array<Tensor,2>{sg(execution,input),su(execution,input)};},
             [](Tensor g,Tensor u,mfq::models::GatedActivation,double){return (g*tb::sigmoid(g))*u;},
             [&](Tensor hidden){return sd(execution,hidden);},unfused);
-        return shared_scale(execution,source)*output;
+        return scale_output(execution,source,output);
     };
     const std::array<Linear,3> shared_projections{sg,su,sd};
     const bool shared_row_parallel=std::all_of(shared_projections.begin(),shared_projections.end(),
@@ -461,18 +481,27 @@ static Linear qwen_moe(CudaExecutionContext& loading,weight_loader::Routed gate_
         tq->gate=gate_up.tq_projections[0];tq->up=gate_up.tq_projections[1];tq->down=down.tq_projections[0];
     }
     std::shared_ptr<GgufMoeBanks> gguf;
+    std::shared_ptr<CudaIndependentBranchExecutor> shared_executor;
     if(!gate_up.gguf_projections.empty() || !down.gguf_projections.empty()) {
         TYLOINFER_RUNTIME_CHECK(gate_up.gguf_projections.size()==2 && down.gguf_projections.size()==1 &&
             gate_up.projections.empty() && down.projections.empty(),
             "GGUF MoE requires separate Gate, Up and Down banks");
         gguf=std::make_shared<GgufMoeBanks>();
         gguf->gate=gate_up.gguf_projections[0];gguf->up=gate_up.gguf_projections[1];gguf->down=down.gguf_projections[0];
+        if(loading.config.decode_branch_parallel && !loading.loading_cpu_layer) {
+            const int device=active_weight_load_device(loading);
+            const MfqCudaGuard guard(device);
+            auto& per_device=loading.shared_expert_executors[device];
+            if(!per_device)per_device=std::make_shared<CudaIndependentBranchExecutor>();
+            shared_executor=per_device;
+            shared_executor->ensure(1,mfq_get_current_cuda_stream(device));
+        }
     }
     MoeFfnForward pipeline;
 #if TYLOINFER_ENABLE_MFQ_COMPAT
     if(!tq && !gguf)pipeline=make_moe_ffn_pipeline(gate_up.projections,down.projections,shared,{},std::move(shared_weights),prefetch);
 #endif
-    return [gate_up, down, router, shared, pipeline, tq, gguf, c](CudaExecutionContext &execution,
+    return [gate_up, down, router, shared, pipeline, tq, gguf, shared_executor, c](CudaExecutionContext &execution,
                                                                const Tensor &x) {
         auto source = x.reshape({-1, c.hidden}).to(tb::kFloat16);
         const auto layer_prefill = mfq::cuda::runtime_options::moe_prefill_layer();
@@ -511,7 +540,10 @@ static Linear qwen_moe(CudaExecutionContext& loading,weight_loader::Routed gate_
                     const std::function<void()> work=overlap_shared?std::function<void()>([&] {
                         deferred_shared=shared(execution,source);
                     }):std::function<void()>{};
-                    return gguf->forward(source,selected[0],selected[1],0.f,work);
+                    auto output=gguf->forward(source,selected[0],selected[1],0.f,work,
+                        execution.config.decode_branch_parallel?shared_executor.get():nullptr);
+                    if(deferred_shared.defined())mfq_cuda_record_stream(deferred_shared,mfq_get_current_cuda_stream(source.get_device()));
+                    return output;
                 });
                 return mfq::models::routed_experts(
                     [&] { return gate_up(execution, source, selected[0]); },
@@ -607,7 +639,7 @@ struct BlockLoader : weight_loader::Loader {
         weights.gate=std::move(projections[start]);weights.alpha=std::move(projections[start+1]);
         weights.beta=std::move(projections[start+2]);
         if(const auto weight=weight_loader::linear_weight(weights.output);weight && weight->is_gguf() &&
-                !weight->tensor_parallel() && weight->gguf.packed.is_cuda()) {
+                !weight->tensor_parallel() && weight->gguf.packed.is_cuda() && !weight->gguf.prefers_original_input()) {
             weights.output_q8_position_major=mfq::cuda::gguf::supports_interleaved_activation(weight->gguf.type,2);
             weights.output_q8=[weight](CudaExecutionContext&,const Tensor& input,int64_t tokens,tb::ScalarType dtype,bool position_major) {
                 return weight->gguf.forward_q8(input,tokens,dtype,position_major).reshape({1,tokens,weight->gguf.out});

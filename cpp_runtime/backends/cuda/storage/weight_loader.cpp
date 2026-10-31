@@ -3,6 +3,7 @@
 #include "mfq_weight_memory.h"
 #include "float_projection.h"
 #include "gated_residual_fused.h"
+#include "../ops/gguf/gguf_residual.h"
 #include "selected_attention.h"
 #include "qwen4_exp.h"
 #include <limits>
@@ -276,7 +277,7 @@ LinearGroup grouped_linear(CudaExecutionContext& execution, std::vector<Linear>&
             auto found=std::find_if(buckets.begin(),buckets.end(),[&](const Bucket& bucket) {
                 const auto& first=*bucket.weights.front();
                 return first.type==weight->type && first.neuron_len==weight->neuron_len &&
-                    first.packed.device()==weight->packed.device();
+                    first.packed.device()==weight->packed.device() && same_gguf_input_basis(first,*weight);
             });
             if(found==buckets.end()){buckets.emplace_back();found=buckets.end()-1;}
             found->weights.push_back(weight);found->indices.push_back(i);
@@ -506,7 +507,13 @@ ResidualLinear residual_linear(CudaExecutionContext& execution, const mfq::Model
                 return weight->forward(context,input.scalar_type()==tb::kFloat16?input:input.to(tb::kFloat32));
             });
         };
-        return {std::move(forward),{},{},std::move(weight),{}};
+        GatedResidualMixProjection mixed;
+        if(weight->is_gguf())mixed=[weight,forward](CudaExecutionContext& context,const Tensor& input,
+                const Tensor& normalized,int64_t streams) {
+            if(auto output=try_gguf_residual_mix(weight->gguf,input,normalized,streams);output.defined())return output;
+            return mfq_qwen4_exp::gated_residual_mix(forward(context,input),normalized,streams);
+        };
+        return {std::move(forward),std::move(mixed),{},std::move(weight),{}};
     }
     if(weight->is_dense()) {
         auto right=weight->dense.transpose(-1,-2);

@@ -9,6 +9,8 @@ inline constexpr int kQ8TileRows=8;
 struct Q8TiledMatrix { const void* weight; float* output; int rows, padded_rows; };
 void q8_tile(const void* blocks, void* tiles, int rows, int columns, cudaStream_t stream);
 void q8_untile(const void* tiles, void* blocks, int rows, int columns, cudaStream_t stream);
+// Activations are row-major; reserve ceil(tokens/8)*8 padded rows of codes
+// (ceil(columns/512)*512 bytes each) and FP32 scales (one per 32 codes).
 void q8_quantize(const float* input, void* codes, float* scales, int tokens, int columns, cudaStream_t stream);
 void q8_gemm(const Q8TiledMatrix* matrices, int count, const void* codes, const float* scales,
     int tokens, int columns, cudaStream_t stream);
