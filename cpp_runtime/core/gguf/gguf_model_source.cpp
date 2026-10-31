@@ -422,8 +422,11 @@ json model_config(const json& meta, const json& shapes, const std::string& arch)
                     const auto root = "predictor.block." + std::to_string(layers) + ".mlp.";
                     const auto experts = config.at("num_experts").get<int64_t>();
                     const auto width = config.at("moe_intermediate_size").get<int64_t>();
+                    const bool joined = matches(root + "experts.gate_up.weight", {experts, 2 * width, hidden});
+                    const bool separate = matches(root + "experts.gate.weight", {experts, width, hidden}) &&
+                        matches(root + "experts.up.weight", {experts, width, hidden});
                     if (!matches(root + "router.weight", {experts, hidden}) ||
-                        !matches(root + "experts.gate_up.weight", {experts, 2 * width, hidden}) ||
+                        (!joined && !separate) ||
                         !matches(root + "experts.down.weight", {experts, hidden, width}))
                         throw std::runtime_error("GGUF predictor expert geometry differs from the backbone");
                     ++layers;
@@ -621,6 +624,8 @@ GgufModelSource::GgufModelSource(const std::filesystem::path& path,
                 json{{"model_type", "qwen4_exp_text"}, {"num_hidden_layers", meta.at("qwen4exp.block_count")}}.dump(), names);
             for (const auto& [canonical, stored] : aliases.canonical_to_stored)
                 if (canonical.rfind("predictor.", 0) == 0) predictor_names.emplace(stored, canonical);
+            for (const auto& name : names)
+                if (name.rfind("predictor.", 0) == 0) predictor_names.emplace(name, name);
             if (predictor_names.size() != names.size())
                 throw std::runtime_error("GGUF MTP companion contains unsupported predictor tensors");
         }
@@ -674,7 +679,10 @@ GgufModelSource::GgufModelSource(const std::filesystem::path& path,
             std::transform(dtype.begin(), dtype.end(), dtype.begin(), [](unsigned char c) { return std::toupper(c); });
             if (!ggml_is_quantized(type) && !engram) record.prefix = dense_prefix(shape);
             record.tensor = {name, dtype, dtype, shape, size + record.prefix.size()};
-            const bool norm_delta = impl_->arch == "qwen4exp" && !raw_predictor && name.find("norm.weight") != std::string::npos &&
+            // Canonical GGUF predictors use the backbone's RMS weight
+            // convention. Legacy mtp.* companions already store norm deltas.
+            const bool canonical_predictor = std::string_view(original).rfind("predictor.", 0) == 0;
+            const bool norm_delta = impl_->arch == "qwen4exp" && (!raw_predictor || canonical_predictor) && name.find("norm.weight") != std::string::npos &&
                 name.find(".linear_attention.norm.weight") == std::string::npos;
             const bool decay_log = impl_->arch == "qwen4exp" && name.find(".linear_attention.a") != std::string::npos &&
                 name.size() >= 2 && name.substr(name.size() - 2) == ".a";

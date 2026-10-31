@@ -511,6 +511,43 @@ void qwen4_source(const std::filesystem::path& directory) {
     std::memcpy(&original_norm, predictor_norm.data() + 12, 4);
     require(original_norm == .25f, "raw MTP companion norm was converted as a folded main-model norm");
     require(with_predictor.read(packed_down->name) == packed_bytes, "MTP companion changed backbone weights");
+    {
+        auto* canonical_tensors = ggml_init({3 << 20, nullptr, false});
+        auto* canonical = gguf_init_empty();
+        gguf_set_val_str(canonical, "general.architecture", "qwen4exp-mtp");
+        const auto add = [&](const char* name, ggml_type type, std::vector<int64_t> shape) {
+            std::reverse(shape.begin(), shape.end());
+            auto* tensor = ggml_new_tensor(canonical_tensors, type, int(shape.size()), shape.data());
+            ggml_set_name(tensor, name);
+            std::memset(tensor->data, 0, ggml_nbytes(tensor));
+            if (type == GGML_TYPE_F32)
+                for (int64_t i = 0; i < ggml_nelements(tensor); ++i) static_cast<float*>(tensor->data)[i] = 1.25f;
+            gguf_add_tensor(canonical, tensor);
+        };
+        add("predictor.embedding_norm.weight", GGML_TYPE_F32, {256});
+        add("predictor.hidden_norm.weight", GGML_TYPE_F32, {512});
+        add("predictor.fusion.embedding.weight", GGML_TYPE_BF16, {256, 256});
+        add("predictor.fusion.hidden.weight", GGML_TYPE_BF16, {256, 256});
+        add("predictor.block.0.attention.query.weight", GGML_TYPE_BF16, {512, 256});
+        add("predictor.block.0.mlp.router.weight", GGML_TYPE_F32, {4, 256});
+        add("predictor.block.0.mlp.experts.gate.weight", GGML_TYPE_Q2_0, {4, 128, 256});
+        add("predictor.block.0.mlp.experts.up.weight", GGML_TYPE_Q2_0, {4, 128, 256});
+        add("predictor.block.0.mlp.experts.down.weight", GGML_TYPE_Q2_0, {4, 256, 128});
+        add("predictor.output.weight", GGML_TYPE_Q6_K, {32, 256});
+        add("predictor.output.token_ids", GGML_TYPE_I64, {32});
+        const auto canonical_path = directory / "canonical-predictor.gguf";
+        require(gguf_write_to_file(canonical, canonical_path.string().c_str(), false), "canonical MTP write failed");
+        const mfq::GgufModelSource canonical_source(main_path, {table_path, canonical_path});
+        const auto canonical_config = nlohmann::json::parse(canonical_source.model_config_json());
+        require(canonical_config["mtp_num_hidden_layers"] == 1, "canonical MTP layer count differs");
+        require(canonical_source.find_tensor("predictor.block.0.mlp.experts.gate.weight") &&
+            canonical_source.find_tensor("predictor.block.0.mlp.experts.up.weight") &&
+            canonical_source.find_tensor("predictor.output.token_ids"), "canonical MTP tensors were discarded");
+        const auto norm = canonical_source.read("predictor.embedding_norm.weight");
+        float delta = 0; std::memcpy(&delta, norm.data() + 12, 4);
+        require(delta == .25f, "canonical MTP norm no longer uses the backbone convention");
+        gguf_free(canonical); ggml_free(canonical_tensors);
+    }
     add_predictor("mtp.unsupported.weight", GGML_TYPE_F32, {1});
     require(gguf_write_to_file(predictor, predictor_path.string().c_str(), false), "GGUF invalid predictor write failed");
     bool unsupported_predictor = false;
