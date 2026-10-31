@@ -88,6 +88,8 @@ void raw_part_source(const std::filesystem::path& path, const std::vector<std::f
     require(actual == expected, "retained raw part reader expired");
     const auto hidden = parts[1].string() + ".missing";
     std::filesystem::rename(parts[1], hidden);
+    retained(0, actual.data(), actual.size());
+    require(actual == expected, "retained raw part reader changed after rename");
     bool missing = false;
     try { mfq::GgufModelSource invalid(parts.front(), companions); } catch (const std::runtime_error&) { missing = true; }
     require(missing, "incomplete raw GGUF parts accepted");
