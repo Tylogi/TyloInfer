@@ -2,20 +2,29 @@
 #include "mlx_gguf_rows.h"
 #include "mlx_gguf_prefill.h"
 #include "mlx_gguf_staged.h"
+#include "mlx_platform.h"
+#include "native/mlx_native_gguf.h"
 #include "mlx_kernel_prepare.h"
 #include "metal_device_info.h"
 #include "mlx_tensor.h"
+#include "mlx_affine.h"
 #include "mlx_moe_ops.h"
+#include "mfq_container.h"
 #include "qwen4_ops.h"
 #include "ggml.h"
 #include "ggml-quants.h"
+#include "gguf.h"
+#include <mlx/primitives.h>
 
 #include <cmath>
 #include <cstring>
+#include <filesystem>
 #include <iostream>
+#include <limits>
 #include <random>
 #include <stdexcept>
 #include <sys/mman.h>
+#include <unordered_set>
 
 namespace {
 using namespace mlx::core;
@@ -26,6 +35,26 @@ void compare(const array& actual, const array& expected, float tolerance, const 
     const auto scale = max(abs(astype(expected, float32))).item<float>();
     if (!std::isfinite(error) || error > tolerance * std::max(1.f, scale))
         throw std::runtime_error(label + " error=" + std::to_string(error) + " scale=" + std::to_string(scale));
+}
+
+void check_native_views(const std::vector<array>& outputs) {
+    std::vector<std::pair<array, array>> views;
+    std::unordered_set<const Primitive*> visited;
+    const auto visit = [&](const auto& self, const array& value) -> void {
+        if (!value.has_primitive() || !visited.insert(value.primitive_ptr().get()).second) return;
+        if (std::string_view(value.primitive().name()) == "MlxRowMajorView")
+            views.emplace_back(value.inputs().front(), value);
+        for (const auto& input : value.inputs()) self(self, input);
+    };
+    for (const auto& output : outputs) visit(visit, output);
+    if (views.empty()) throw std::runtime_error("native input normalization was not exercised");
+    eval(outputs);
+    for (const auto& [source, view] : views) {
+        if (!view.flags().row_contiguous) throw std::runtime_error("native input normalization kept strided rows");
+        if (source.flags().row_contiguous &&
+            (source.buffer().ptr() != view.buffer().ptr() || source.offset() != view.offset()))
+            throw std::runtime_error("native input normalization copied a contiguous view");
+    }
 }
 
 array reference_mm(const array& input, const array& weight) {
@@ -48,9 +77,10 @@ std::vector<std::uint8_t> packed(ggml_type type, int k, int rows) {
     for (auto& byte : bytes) byte = std::uint8_t(rng());
     const auto block = ggml_type_size(type);
     for (std::size_t offset = 0; offset < bytes.size(); offset += block) {
-        const auto scale = ggml_fp32_to_fp16(.00025f);
-        std::size_t d = type == GGML_TYPE_Q2_K ? 80 : type == GGML_TYPE_Q3_K ? 108 : type == GGML_TYPE_Q6_K ? 208 : 0;
-        if (type == GGML_TYPE_Q8_K) {
+        const auto scale = ggml_fp32_to_fp16(type == GGML_TYPE_PTQ1_0 ? .03125f : .00025f);
+        std::size_t d = type == GGML_TYPE_PTQ1_0 ? 26 : type == GGML_TYPE_Q2_K ? 80 : type == GGML_TYPE_Q3_K ? 108 : type == GGML_TYPE_Q6_K ? 208 : 0;
+        if (type == GGML_TYPE_MXFP4) bytes[offset] = uint8_t(114 + offset / block % 5);
+        else if (type == GGML_TYPE_Q8_K) {
             float value = .002f;
             std::memcpy(bytes.data() + offset, &value, 4);
         } else std::memcpy(bytes.data() + offset + d, &scale, 2);
@@ -59,6 +89,206 @@ std::vector<std::uint8_t> packed(ggml_type type, int k, int rows) {
         if (type == GGML_TYPE_Q2_K) std::memcpy(bytes.data() + offset + 82, &scale, 2);
     }
     return bytes;
+}
+
+array reference_routed_mm(const array& input, const array& ids, const array& weight, bool shared) {
+    const auto x = contiguous(astype(input, float32));
+    const auto w = contiguous(astype(weight, float32));
+    const auto routes = contiguous(astype(ids, int32));
+    eval(x, w, routes);
+    const int m = ids.shape(0), r = ids.shape(1), n = w.shape(1), k = w.shape(2);
+    std::vector<float> output(m * r * n);
+    for (int i = 0; i < m * r; ++i) {
+        const auto e = routes.data<int32_t>()[i];
+        if (e < 0 || e >= w.shape(0)) continue;
+        for (int j = 0; j < n; ++j) {
+            double sum = 0;
+            for (int c = 0; c < k; ++c)
+                sum += double(x.data<float>()[(shared ? i / r : i) * k + c]) * w.data<float>()[(e * n + j) * k + c];
+            output[i * n + j] = float(sum);
+        }
+    }
+    return array(output.begin(), Shape{m, r, n});
+}
+
+void check_group_decoders() {
+    const auto kernel = fast::metal_kernel("tinfer_gguf_group_decoder_test", {"packed", "params"}, {"y"}, R"METAL(
+uint row = thread_position_in_grid.x, groups = params[0];
+if (row >= params[1]) return;
+GroupPayload payload;
+for (uint g = 0u; g < groups; ++g) {
+    fetch_raw_group<F>(payload, packed, row, groups, g,
+        g == 0u || g / PlaneLayout<F>::meta_groups != (g - 1u) / PlaneLayout<F>::meta_groups);
+    decode_group_chunks<F, half>(payload, GgufConstantLookup<F>{}, g,
+        [&](uint c, half4 low, half4 high) {
+            for (uint i = 0u; i < 4u; ++i) {
+                y[ulong(row) * groups * 32u + g * 32u + c * 4u + i] = float(low[i]);
+                y[ulong(row) * groups * 32u + g * 32u + 16u + c * 4u + i] = float(high[i]);
+            }
+        });
+}
+)METAL", MlxGgufStagedPrefill::scalar_decoder_header());
+    for (const auto type : {GGML_TYPE_PTQ1_0, GGML_TYPE_Q2_0, GGML_TYPE_MXFP4, GGML_TYPE_Q3_K,
+        GGML_TYPE_TQ2_T, GGML_TYPE_TQK4, GGML_TYPE_TQK5, GGML_TYPE_TQK6, GGML_TYPE_TQK7,
+        GGML_TYPE_TQP5, GGML_TYPE_TQP6, GGML_TYPE_TQP7}) {
+        constexpr int K = 512, N = 35;
+        auto bytes = packed(type, K, N);
+        const bool gyro = int(type) >= 144 && int(type) <= 151;
+        if (gyro) {
+            constexpr float scales[]{0.f, 0x1p-24f, -0x1p-24f, 0x1p-14f, -0x1p-14f,
+                .00025f, -.00025f, .03125f, -.03125f, .5f, 1.f, 32.f, 512.f};
+            const auto stride = ggml_type_size(type);
+            for (std::size_t at = 0; at < bytes.size(); at += stride) {
+                const auto scale = ggml_fp32_to_fp16(scales[(at / stride) % std::size(scales)]);
+                std::memcpy(bytes.data() + at, &scale, sizeof(scale));
+            }
+        }
+        std::vector<float> values(K * N);
+        ggml_get_type_traits(type)->to_float(bytes.data(), values.data(), values.size());
+        const auto actual = kernel({array(bytes.begin(), Shape{int(bytes.size())}, uint8),
+            array({uint32_t(K / 32), uint32_t(N)})}, {{N, K}}, {float32}, {64, 1, 1}, {64, 1, 1},
+            {{"F", int(type)}}, std::nullopt, false, {}).front();
+        compare(actual, astype(array(values.begin(), Shape{N, K}), float16), gyro ? 0.f : 1e-6f,
+            std::string(ggml_type_name(type)) + " grouped decoder");
+    }
+}
+
+void check_prefill_restore() {
+    constexpr int E = 3, M = 9, R = 4, K = 128;
+    if (!gguf_expert_prefill_available(zeros({M, K}, float16))) return;
+    const auto ids = reshape(remainder(arange(M * R, int32), array(E + 2, int32)) - 1, {M, R});
+    const auto routes = gguf_group_routes(ids, E, 32);
+    const auto experts = reshape(broadcast_to(slice(routes.descriptors,
+        {0, 0}, {routes.tiles, 1}), {routes.tiles, 32}), {-1, 1});
+    for (const auto dtype : {float16, bfloat16, float32}) {
+        const MlxGgufPrefillPlan plan(zeros({M, K}, dtype), ids, E, 32);
+        for (const int width : {7, 128, 129}) for (const auto source_type : {float16, float32}) {
+            const int rows = routes.tiles * 32, extent = rows * width;
+            const auto values_by_expert = sin(astype(experts, float32) * .3f + arange(width, float32) * .013f);
+            const auto backing = concatenate({zeros({1}, source_type), reshape(astype(values_by_expert, source_type), {-1})});
+            eval(backing);
+            const auto values = reshape(slice(backing, {1}, {extent + 1}), {rows, width});
+            const auto expected_values = astype(sin(expand_dims(astype(ids, float32), -1) * .3f +
+                arange(width, float32) * .013f), source_type);
+            const auto expected = astype(where(expand_dims((ids >= array(0, int32)) & (ids < array(E, int32)), -1),
+                expected_values, zeros({M, R, width}, source_type)), dtype);
+            compare(plan.restore(values), expected, 0.f, "GGUF prefill restore width/dtype/offset/invalid routes width=" +
+                std::to_string(width) + " source=" + std::to_string(int(source_type.val())) +
+                " destination=" + std::to_string(int(dtype.val())));
+        }
+    }
+}
+
+void check_sparse_short_routes() {
+    constexpr int E = 64, N = 16, K = 256, R = 4;
+    if (!gguf_short_sparse_routes(zeros({8, R}, int32), E) ||
+        gguf_short_sparse_routes(zeros({9, R}, int32), E) ||
+        gguf_short_sparse_routes(zeros({8, R}, int32), R) ||
+        gguf_short_sparse_routes(zeros({0, R}, int32), E))
+        throw std::runtime_error("short sparse GGUF route boundary changed");
+    for (const auto type : {GGML_TYPE_Q8_0, GGML_TYPE_IQ3_XXS, GGML_TYPE_TQ2_T, GGML_TYPE_TQK4,
+        GGML_TYPE_TQK5, GGML_TYPE_TQK6, GGML_TYPE_TQK7, GGML_TYPE_TQP5, GGML_TYPE_TQP6, GGML_TYPE_TQP7}) {
+        const auto bytes = packed(type, K, E * N);
+        auto format = "GGUF_" + std::string(ggml_type_name(type));
+        for (auto& c : format) c = std::toupper(static_cast<unsigned char>(c));
+        const auto weight = MlxGgufWeight::from_bytes(format, bytes, {E, N, K});
+        std::vector<float> decoded(E * N * K);
+        ggml_get_type_traits(type)->to_float(bytes.data(), decoded.data(), decoded.size());
+        const array gold(decoded.begin(), Shape{E, N, K});
+        for (int M : {7, 8}) for (auto dt : {float16, bfloat16, float32}) for (bool repeated : {false, true}) {
+            std::vector<int> selected(M * R);
+            for (int i = 0; i < M * R; ++i) selected[i] = repeated ? i % R : (i * 17) % E;
+            selected[0] = -1; selected.back() = E;
+            const array ids(selected.begin(), Shape{M, R}, int32);
+            const auto input = astype(reshape(sin(arange(M * K, float32) * .017f), {M, K}), dt);
+            const auto expected = astype(reference_routed_mm(input, ids, gold, true), dt);
+            const auto projected = weight.routed_matmul(input, ids, true);
+            compare(projected, expected, dt == bfloat16 ? .015f : .003f, "sparse short routed projection");
+            compare(weight.routed_swiglu(weight, input, ids, nullptr, .7f),
+                moe_limited_swiglu_pair(expected, expected, .7f), dt == bfloat16 ? .025f : .004f,
+                "sparse short fused Gate/Up");
+            const auto separate = broadcast_to(expand_dims(input, 1), {M, R, K});
+            const auto probabilities = full({M, R}, .25f);
+            compare(weight.routed_weighted_matmul(separate, ids, probabilities),
+                moe_weighted_reduce(expected, probabilities), dt == bfloat16 ? .015f : .003f,
+                "sparse short weighted Down");
+        }
+    }
+}
+
+void check_sparse_mixed_prefill() {
+    constexpr int E = 64, N = 35, K = 256, R = 4;
+    const std::array types{GGML_TYPE_PTQ1_0, GGML_TYPE_Q2_0, GGML_TYPE_MXFP4, GGML_TYPE_Q3_K};
+    std::vector<int> experts;
+    std::vector<std::string> formats;
+    std::vector<array> storage;
+    std::vector<float> decoded(E * N * K);
+    for (int e = 0; e < E; ++e) {
+        const auto type = types[e % types.size()];
+        const auto bytes = packed(type, K, N);
+        auto format = "GGUF_" + std::string(ggml_type_name(type));
+        for (auto& c : format) c = std::toupper(static_cast<unsigned char>(c));
+        experts.push_back(e); formats.push_back(format);
+        storage.emplace_back(bytes.begin(), Shape{int(bytes.size())}, uint8);
+        ggml_get_type_traits(type)->to_float(bytes.data(), decoded.data() + e * N * K, N * K);
+    }
+    const auto weight = MlxGgufWeight::from_mixed_experts({E, N, K}, experts, formats, storage);
+    const array gold(decoded.begin(), Shape{E, N, K});
+    for (int M : {9, 17}) for (auto dt : {float16, bfloat16, float32}) for (bool shared : {true, false}) {
+        std::vector<int> selected(M * R);
+        for (int i = 0; i < M * R; ++i) selected[i] = i % E;
+        selected[0] = -1; selected.back() = E;
+        const array ids(selected.begin(), Shape{M, R}, int32);
+        const auto input = astype(reshape(sin(arange(M * (shared ? 1 : R) * K, float32) * .017f),
+            shared ? Shape{M, K} : Shape{M, R, K}), dt);
+        const auto expected = astype(reference_routed_mm(reshape(astype(input, float16), {-1, K}), ids,
+            astype(gold, float16), shared), dt);
+        compare(weight.routed_matmul(input, ids, shared), expected, dt == bfloat16 ? .015f : .003f,
+            "sparse mixed prefill projection");
+        if (shared) compare(weight.routed_swiglu(weight, input, ids, nullptr, .7f),
+            moe_limited_swiglu_pair(expected, expected, .7f), dt == bfloat16 ? .025f : .004f,
+            "sparse mixed prefill Gate/Up");
+        else compare(weight.routed_weighted_matmul(input, ids, full({M, R}, .25f)),
+            moe_weighted_reduce(expected, full({M, R}, .25f)), dt == bfloat16 ? .015f : .003f,
+            "sparse mixed prefill weighted Down");
+    }
+}
+
+void check_wide_mixed_prefill() {
+    constexpr int E = 4, N = 512, K = 256, M = 65, R = 4;
+    const std::array types{GGML_TYPE_PTQ1_0, GGML_TYPE_Q2_0, GGML_TYPE_MXFP4, GGML_TYPE_Q3_K};
+    std::vector<int> experts;
+    std::vector<std::string> formats;
+    std::vector<array> storage;
+    std::vector<float> decoded(E * N * K);
+    for (int e = 0; e < E; ++e) {
+        const auto bytes = packed(types[e], K, N);
+        auto format = "GGUF_" + std::string(ggml_type_name(types[e]));
+        for (auto& c : format) c = std::toupper(static_cast<unsigned char>(c));
+        experts.push_back(e); formats.push_back(format);
+        storage.emplace_back(bytes.begin(), Shape{int(bytes.size())}, uint8);
+        ggml_get_type_traits(types[e])->to_float(bytes.data(), decoded.data() + e * N * K, N * K);
+    }
+    const auto weight = MlxGgufWeight::from_mixed_experts({E, N, K}, experts, formats, storage);
+    const array gold(decoded.begin(), Shape{E, N, K});
+    auto ids = reshape(remainder(arange(M * R, int32), array(E, int32)), {M, R});
+    const auto plan = gguf_route_plan(ids, E, true);
+    if (!mlx_metal_nax_disabled() && mlx_apple_chip_starts_with("Apple M5") && plan.tile_rows != 64)
+        throw std::runtime_error("wide mixed prefill dispatch was not selected");
+    for (auto dt : {float16, bfloat16, float32}) for (bool shared : {true, false}) {
+        const auto input = astype(reshape(sin(arange(M * (shared ? 1 : R) * K, float32) * .017f),
+            shared ? Shape{M, K} : Shape{M, R, K}), dt);
+        const auto expected = astype(reference_routed_mm(reshape(astype(input, float16), {-1, K}), ids,
+            astype(gold, float16), shared), dt);
+        compare(weight.routed_matmul(input, ids, shared, &plan), expected, dt == bfloat16 ? .015f : .003f,
+            "wide mixed prefill projection");
+        if (shared) compare(weight.routed_swiglu(weight, input, ids, &plan, .7f),
+            moe_limited_swiglu_pair(expected, expected, .7f), dt == bfloat16 ? .025f : .004f,
+            "wide mixed prefill Gate/Up");
+        else compare(weight.routed_weighted_matmul(input, ids, full({M, R}, .25f), &plan),
+            moe_weighted_reduce(expected, full({M, R}, .25f)), dt == bfloat16 ? .015f : .003f,
+            "wide mixed prefill weighted Down");
+    }
 }
 
 void check(ggml_type type) {
@@ -79,6 +309,19 @@ void check(ggml_type type) {
             dequantize_row_q8_K(reinterpret_cast<const block_q8_K*>(matrix_bytes.data()), matrix_values.data(), matrix_values.size());
         else ggml_get_type_traits(type)->to_float(matrix_bytes.data(), matrix_values.data(), matrix_values.size());
         compare(matrix.dequantize(float32), array(matrix_values.begin(), Shape{64, K}), 2e-6f, upper + " compressed planes");
+        if (mlx_native_gguf_supported(type, 64, K)) {
+            const auto native = mlx_native_gguf_pack(array(matrix_bytes.begin(), Shape{int(matrix_bytes.size())}, uint8),
+                type, 64, K, int(ggml_row_size(type, K)));
+            for (const int count : {1, 2, 3, 4, 8, 65}) {
+                const auto input = astype(reshape(sin(arange(count * K, float32) * .013f), {count, K}), bfloat16);
+                const auto expected = reference_mm(input, matrix.dequantize(float32));
+                const auto actual = mlx_native_gguf_project(std::span(&native, 1), input)[0];
+                const auto rms = sqrt(mean(square(astype(actual, float32) - expected))).item<float>();
+                const auto scale = sqrt(mean(square(expected))).item<float>();
+                if (!std::isfinite(rms) || rms > .02f * scale + 1e-6f)
+                    throw std::runtime_error(upper + " native projection relative RMS=" + std::to_string(rms / scale));
+            }
+        }
         for (const int count : {1, 2, 6, 7, 8, 19, 64, 65, 128}) {
             const auto rows = reshape(sin(arange(count * K, float32) * .013f), {count, K});
             const bool direct = count <= 6 || (count <= 8 && matrix.has_staged_planes());
@@ -90,8 +333,75 @@ void check(ggml_type type) {
                 upper + " compact matrix tile M=" + std::to_string(count));
         }
         constexpr int intermediate = 256;
-        const auto gate = MlxGgufWeight::from_bytes(upper, packed(type, K, intermediate * E), {E, intermediate, K});
+        auto gate_bytes = packed(type, K, intermediate * E);
+        if (type >= GGML_TYPE_TQ2_T && type <= GGML_TYPE_TQK4)
+            for (std::size_t b = 0; b < gate_bytes.size(); b += ggml_type_size(type)) {
+                const auto scale = ggml_fp32_to_fp16(.015625f * (1 + b / ggml_type_size(type) % 7));
+                std::memcpy(gate_bytes.data() + b, &scale, sizeof(scale));
+            }
+        const auto gate = MlxGgufWeight::from_bytes(upper, gate_bytes, {E, intermediate, K});
         const auto down = MlxGgufWeight::from_bytes(upper, packed(type, intermediate, K * E), {E, K, intermediate});
+        if (type >= GGML_TYPE_TQ2_T && type <= GGML_TYPE_TQK4) {
+            const auto& encoded = gate_bytes;
+            std::vector<float> values(E * intermediate * K);
+            ggml_get_type_traits(type)->to_float(encoded.data(), values.data(), values.size());
+            if (!gate.has_staged_planes() || gate.packed_nbytes() != encoded.size() + 1)
+                throw std::runtime_error(upper + " compressed planes changed the packed payload size");
+            compare(gate.dequantize(float32), array(values.begin(), Shape{E, intermediate, K}), 2e-6f,
+                upper + " grouped compressed plane CPU decode");
+            const auto rounded_weight = astype(array(values.begin(), Shape{E, intermediate, K}), float16);
+            for (int count : {1, 2, 6, 8, 65}) {
+                const auto x = astype(reshape(sin(arange(count * K, float32) * .017f), {count, K}), float16);
+                const auto selected = reshape(remainder(arange(count * E, int32), array(E, int32)), {count, E});
+                if (count == 65 && gguf_prefill_tile_rows(gate, gate, down, selected) != 48)
+                    throw std::runtime_error(upper + " populated Gyro routes did not select the wider tile");
+                compare(gate.routed_matmul(x, selected, true),
+                    reference_routed_mm(x, selected, array(values.begin(), Shape{E, intermediate, K}), true),
+                    .003f, upper + " compressed expert projection M=" + std::to_string(count));
+                const auto probability = full({count, E}, 1.f / E);
+                compare(gate.routed_weighted_matmul(broadcast_to(expand_dims(x, 1), {count, E, K}), selected, probability),
+                    moe_weighted_reduce(reference_routed_mm(x, selected,
+                        array(values.begin(), Shape{E, intermediate, K}), true), probability),
+                    .003f, upper + " compressed expert weighted projection M=" + std::to_string(count));
+                if (count == 1) {
+                    const MlxGgufPrefillPlan plan(x, selected, E, 8);
+                    const auto grouped = plan.gate_up(gate, gate), restored = plan.restore(grouped);
+                    eval(grouped, restored);
+                    if (grouped.buffer().ptr() != restored.buffer().ptr() || grouped.offset() != restored.offset())
+                        throw std::runtime_error(upper + " single-token restore copied identity routes");
+                    const auto reduced = plan.down(down, grouped, probability);
+                    if (MlxGgufStagedPrefill::prefers_weighted_down(down) && (!reduced.has_primitive() ||
+                        mlx_kernel_preparation_key(reduced.primitive()).find("tinfer_gguf_planes_down_reduce") == std::string::npos))
+                        throw std::runtime_error(upper + " single-token FFN skipped the fused Down kernel");
+                }
+                if (count == 2 || count == 6 || count == 65) for (const auto dt : {float16, bfloat16, float32}) {
+                    const auto typed_input = astype(x, dt);
+                    const auto linear = astype(reference_routed_mm(astype(typed_input, float16), selected, rounded_weight, true), dt);
+                    const auto expected = moe_swiglu_pair(linear, linear);
+                    const auto actual = gate.routed_swiglu(gate, typed_input, selected);
+                    const auto error = max(abs(astype(actual, float32) - astype(expected, float32))).item<float>();
+                    const auto peak = max(abs(astype(expected, float32))).item<float>();
+                    if (!std::isfinite(error) || error > (dt == bfloat16 ? .02f : .002f) * peak + 1e-6f)
+                        throw std::runtime_error(upper + " compressed Gate/Up CPU oracle M=" + std::to_string(count) +
+                            " error=" + std::to_string(error) + " peak=" + std::to_string(peak));
+                }
+            }
+            for (const auto dt : {float16, bfloat16, float32}) for (int routes : {1, 2, 3, 10, 17}) {
+                const auto x = astype(reshape(sin(arange(routes * K, float32) * .017f), {1, routes, K}), dt);
+                const auto ids = reshape(remainder(arange(routes, int32) + 1, array(E + 2, int32)) - 1, {1, routes});
+                const auto probability = reshape((arange(routes, float32) + 1.f) / float(routes * routes), {1, routes});
+                const auto projected = astype(reference_routed_mm(astype(x, float16), ids, rounded_weight, false), dt);
+                const auto expected = moe_weighted_reduce(projected, probability);
+                const MlxGgufPrefillPlan plan(x, ids, E, 8, false);
+                for (const auto actual : {gate.routed_weighted_matmul(x, ids, probability),
+                        plan.down(gate, reshape(x, {routes, K}), probability)}) {
+                    const auto error = max(abs(astype(actual, float32) - astype(expected, float32))).item<float>();
+                    const auto peak = max(abs(astype(expected, float32))).item<float>();
+                    if (actual.dtype() != dt || !std::isfinite(error) || error > (dt == bfloat16 ? .02f : .002f) * peak + 1e-6f)
+                        throw std::runtime_error(upper + " fused weighted CPU oracle failed");
+                }
+            }
+        }
         auto ids = reshape(remainder(arange(65 * 3, int32), array(5, int32)) - 1, {65, 3});
         const auto probabilities = full({65, 3}, .25f, float32);
         for (const auto dt : {float16, bfloat16, float32}) {
@@ -149,6 +459,18 @@ void check(ggml_type type) {
     MlxLinear linear(weight);
     MlxEmbedding embedding(weight);
     MlxProjectionBatch gate_up(std::vector<const MlxLinear*>{&linear, &linear});
+    for (const int m : {1, 2, 3, 4, 5, 6, 7, 8, 65}) for (const auto dt : {float16, bfloat16, float32}) {
+        const auto x = astype(reshape(sin(arange(m * 5 * K, float32) * .031f), {m, 5, K}), dt);
+        std::vector<array> expected;
+        for (int g = 0; g < 5; ++g) {
+            auto source = reshape(slice(x, {0, g, 0}, {m, g + 1, K}), {m, K});
+            auto selected = slice(dense, {g * 7, 0}, {(g + 1) * 7, K});
+            if (m > 6) { source = astype(source, float16); selected = astype(selected, float16); }
+            expected.push_back(astype(reference_mm(source, selected), dt));
+        }
+        compare(linear.grouped_row_matmul(x, 5), stack(expected, 1), dt == bfloat16 ? .01f : .002f,
+            upper + " diagonal grouped O projection M=" + std::to_string(m));
+    }
     if (linear(zeros({0, K})).size() || embedding(zeros({0}, int32)).size())
         throw std::runtime_error("empty GGUF projection changed shape");
     const array ids({N - 1, 0, -1, N, 3}, int32);
@@ -192,12 +514,22 @@ void check(ggml_type type) {
     compare(streamed.routed_swiglu(experts, x, routes),
         moe_swiglu_pair(streamed.routed_matmul(x, routes, true), experts.routed_matmul(x, routes, true)),
         .002f, upper + " mixed direct/indirect Gate/Up");
+    compare(streamed.routed_swiglu(experts, x, routes, nullptr, .7f),
+        moe_limited_swiglu_pair(streamed.routed_matmul(x, routes, true), experts.routed_matmul(x, routes, true), .7f),
+        .002f, upper + " clipped direct/indirect Gate/Up");
     auto separate = reshape(cos(arange(6 * K, float32) * .019f), {2, 3, K});
     expected.clear();
     const auto flat = reshape(separate, {6, K});
     for (int r = 0; r < 6; ++r)
         expected.push_back(chosen[r] < 0 ? zeros({1, N}) : reference_mm(take(flat, array({r}, int32), 0), take(gold, chosen[r], 0)));
     compare(experts.routed_matmul(separate, routes, false), reshape(concatenate(expected, 0), {2, 3, N}), 2e-4f, upper + " down");
+    for (const int m : {1, 2, 3, 4, 5, 6, 7, 8}) for (const auto dt : {float16, bfloat16, float32}) {
+        const auto hidden = astype(reshape(cos(arange(m * 3 * K, float32) * .019f), {m, 3, K}), dt);
+        const auto ids = reshape(remainder(arange(m * 3, int32), array(5, int32)) - 1, {m, 3});
+        const auto p = reshape(sin(arange(m * 3, float32) * .1f), {m, 3});
+        compare(experts.routed_weighted_matmul(hidden, ids, p), moe_weighted_reduce(experts.routed_matmul(hidden, ids, false), p),
+            dt == bfloat16 ? .01f : .002f, upper + " fused Down/reduce M=" + std::to_string(m));
+    }
     for (const int M : {7, 19, 65}) {
         std::vector<int> chosen(M * 3);
         for (int i = 0; i < M * 3; ++i) chosen[i] = i % 5 - 1;
@@ -229,6 +561,313 @@ void check(ggml_type type) {
     compare(linear(strided), reference_mm(strided, dense), 2e-4f, upper + " strided input");
     std::cout << upper << " decode/embedding/M=1,2,6/prefill/routed passed\n";
 }
+void check_heterogeneous_file() {
+    char pattern[] = "/tmp/tinfer-gguf-mixed.XXXXXX";
+    const auto* directory = mkdtemp(pattern);
+    if (!directory) throw std::runtime_error("cannot create GGUF mixed fixture directory");
+    struct Cleanup {
+        std::filesystem::path file, directory;
+        ~Cleanup() { std::error_code error; std::filesystem::remove(file, error); std::filesystem::remove(directory, error); }
+    } cleanup{std::filesystem::path(directory) / "mixed.gguf", directory};
+    auto* context = ggml_init({4 << 20, nullptr, false});
+    auto* file = gguf_init_empty();
+    gguf_set_val_str(file, "general.architecture", "test");
+    constexpr int E = 4, N = 64, K = 512;
+    const std::array<ggml_type, E> types{GGML_TYPE_PTQ1_0, GGML_TYPE_Q2_0, GGML_TYPE_MXFP4, GGML_TYPE_Q3_K};
+    std::array<std::vector<array>, 3> gold;
+    for (int p = 0; p < 3; ++p) {
+        const auto role = std::array{"gate", "up", "down"}[p];
+        for (const auto type : {GGML_TYPE_PTQ1_0, GGML_TYPE_Q2_0, GGML_TYPE_MXFP4, GGML_TYPE_Q3_K}) {
+            const auto count = std::count(types.begin(), types.end(), type);
+            auto* tensor = ggml_new_tensor_3d(context, type, K, N, count);
+            auto suffix = std::string(ggml_type_name(type));
+            for (auto& c : suffix) c = std::tolower(static_cast<unsigned char>(c));
+            const auto name = std::string("blk.0.ffn_") + role + "_exps." + suffix + ".weight";
+            ggml_set_name(tensor, name.c_str());
+            const auto bytes = packed(type, K, N * count);
+            std::memcpy(tensor->data, bytes.data(), bytes.size());
+            gguf_add_tensor(file, tensor);
+            std::vector<float> decoded(N * K * count);
+            ggml_get_type_traits(type)->to_float(bytes.data(), decoded.data(), decoded.size());
+            int slot = 0;
+            if (gold[p].empty()) gold[p].assign(E, zeros({N, K}));
+            for (int e = 0; e < E; ++e) if (types[e] == type) {
+                gold[p][e] = array(decoded.begin() + slot * N * K, Shape{N, K}); ++slot;
+            }
+        }
+    }
+    for (const auto* role : {"gu", "down"}) {
+        auto* map = ggml_new_tensor_1d(context, GGML_TYPE_I32, E);
+        const auto name = std::string("blk.0.ffn_exps_") + role + "_type";
+        ggml_set_name(map, name.c_str());
+        for (int e = 0; e < E; ++e) static_cast<int32_t*>(map->data)[e] = types[e];
+        gguf_add_tensor(file, map);
+    }
+    const auto written = gguf_write_to_file(file, cleanup.file.string().c_str(), false);
+    gguf_free(file); ggml_free(context);
+    if (!written) throw std::runtime_error("cannot write GGUF mixed fixture");
+    const MfqContainer model(cleanup.file);
+    const auto gate = MlxGgufWeight::load(model, "model.block.0.mlp.experts.gate.weight");
+    const auto up = MlxGgufWeight::load(model, "model.block.0.mlp.experts.up.weight");
+    const auto down = MlxGgufWeight::load(model, "model.block.0.mlp.experts.down.weight");
+    for (const int m : {1, 8, 65}) {
+        const auto input = astype(reshape(sin(arange(m * K, float32) * .011f), {m, K}), float16);
+        const auto ids = broadcast_to(arange(E, int32), {m, E});
+        std::array<std::vector<array>, 3> expected;
+        for (int p = 0; p < 3; ++p) for (int e = 0; e < E; ++e)
+            expected[p].push_back(astype(reference_mm(input, gold[p][e]), float16));
+        compare(gate.routed_matmul(input, ids, true), stack(expected[0], 1), .002f, "mixed GGUF file projection");
+        compare(gate.routed_swiglu(up, input, ids), moe_swiglu_pair(stack(expected[0], 1), stack(expected[1], 1)),
+            .003f, "mixed GGUF file fused Gate/Up");
+        const auto probabilities = full({m, E}, .25f);
+        compare(down.routed_weighted_matmul(broadcast_to(expand_dims(input, 1), {m, E, K}), ids, probabilities),
+            moe_weighted_reduce(stack(expected[2], 1), probabilities), .003f, "mixed GGUF file fused Down");
+    }
+}
+
+void check_ptq_tail_projection() {
+    constexpr int K = 128, N = 256;
+    auto bytes = packed(GGML_TYPE_PTQ1_0, K, N);
+    for (int n = 0; n < N; ++n) {
+        bytes[n * 28 + 24] = std::uint8_t(n);
+        bytes[n * 28 + 25] = std::uint8_t(255 - n);
+        bytes[n * 28 + 26] = 0; bytes[n * 28 + 27] = 0x3c;
+    }
+    std::vector<float> decoded(N * K);
+    ggml_get_type_traits(GGML_TYPE_PTQ1_0)->to_float(bytes.data(), decoded.data(), decoded.size());
+    const auto weight = MlxGgufWeight::from_bytes("GGUF_PTQ1_0", bytes, {N, K});
+    for (auto dtype : {float16, bfloat16, float32}) for (int rows : {1, 6}) {
+        for (int first = 0; first + rows <= 8; first += rows == 1 ? 1 : 2) {
+            std::vector<float> values(rows * K), expected(rows * N);
+            for (int row = 0; row < rows; ++row) {
+                const int k = 120 + first + row;
+                values[row * K + k] = 1.f;
+                for (int n = 0; n < N; ++n) expected[row * N + n] = decoded[n * K + k];
+            }
+            compare(weight.matmul(astype(array(values.begin(), {rows, K}), dtype)),
+                astype(array(expected.begin(), {rows, N}), dtype), 0.f, "PTQ tail basis differs");
+        }
+    }
+}
+
+void check_ptq_packed_pairs() {
+    constexpr int N = 65536, K = 128, M = 5;
+    std::vector<std::uint8_t> bytes(N * 28, 0);
+    std::vector<float> input(M * K, 0.f), expected(M * N);
+    constexpr unsigned powers[]{1, 3, 9, 27, 81};
+    const std::uint16_t scale = ggml_fp32_to_fp16(1.f);
+    for (int row = 0; row < N; ++row) {
+        const unsigned a = row & 255, b = row >> 8;
+        bytes[row * 28] = a; bytes[row * 28 + 8] = b;
+        std::memcpy(bytes.data() + row * 28 + 26, &scale, 2);
+        for (int digit = 0; digit < M; ++digit)
+            expected[digit * N + row] = int((((a * powers[digit]) & 255) * 3) >> 8) - 1 +
+                int((((b * powers[digit]) & 255) * 3) >> 8) - 1;
+    }
+    for (int digit = 0; digit < M; ++digit)
+        input[digit * K + digit * 16] = input[digit * K + digit * 16 + 8] = 1.f;
+    const auto dense = MlxGgufWeight::from_bytes("GGUF_PTQ1_0", bytes, {N, K});
+    const auto mixed = MlxGgufWeight::from_mixed_experts({1, N, K}, {0}, {"GGUF_PTQ1_0"},
+        {array(bytes.begin(), {N, 28}, uint8)});
+    for (const auto dtype : {float16, bfloat16, float32}) {
+        const auto x = astype(array(input.begin(), {M, K}), dtype);
+        const auto gold = astype(array(expected.begin(), {M, N}), dtype);
+        compare(dense.matmul(x), gold, 0.f, "PTQ packed dense byte pairs differ");
+        compare(mixed.routed_matmul(x, zeros({M, 1}, int32), true), expand_dims(gold, 1),
+            0.f, "PTQ packed mixed byte pairs differ");
+    }
+}
+
+void check_heterogeneous_experts() {
+    check_ptq_tail_projection();
+    check_ptq_packed_pairs();
+    check_heterogeneous_file();
+    for (const int width : {64, 192}) {
+        constexpr int experts = 2, outputs = 16;
+        const auto bytes = packed(GGML_TYPE_Q2_0, width, experts * outputs);
+        const auto stride = ggml_row_size(GGML_TYPE_Q2_0, width);
+        std::vector<array> storage;
+        for (int expert = 0; expert < experts; ++expert)
+            storage.emplace_back(bytes.begin() + expert * outputs * stride,
+                Shape{outputs, int(stride)}, uint8);
+        const auto weight = MlxGgufWeight::from_mixed_experts({experts, outputs, width}, {0, 1},
+            {"GGUF_Q2_0", "GGUF_Q2_0"}, storage);
+        std::vector<float> decoded(experts * outputs * width);
+        ggml_get_type_traits(GGML_TYPE_Q2_0)->to_float(bytes.data(), decoded.data(), decoded.size());
+        const array gold(decoded.begin(), {experts, outputs, width});
+        for (auto dtype : {float16, bfloat16, float32}) for (int rows : {1, 6}) {
+            const auto input = astype(reshape(sin(arange(rows * width, float32) * .013f), {rows, width}), dtype);
+            const auto ids = broadcast_to(array({0, 1}, int32), {rows, experts});
+            const auto expected = astype(reference_routed_mm(input, ids, gold, true), dtype);
+            const float tolerance = dtype == bfloat16 ? .01f : .002f;
+            compare(weight.routed_matmul(input, ids, true), expected, tolerance, "Q2 short-block projection differs");
+            compare(weight.routed_swiglu(weight, input, ids), moe_swiglu_pair(expected, expected),
+                dtype == bfloat16 ? .02f : .003f, "Q2 short-block Gate/Up differs");
+            const auto separate = broadcast_to(expand_dims(input, 1), {rows, experts, width});
+            const auto probabilities = full({rows, experts}, .5f);
+            compare(weight.routed_weighted_matmul(separate, ids, probabilities),
+                moe_weighted_reduce(expected, probabilities), tolerance, "Q2 short-block weighted Down differs");
+        }
+    }
+    constexpr int E = 5, N = 64, K = 512;
+    const std::array types{GGML_TYPE_PTQ1_0, GGML_TYPE_Q2_0, GGML_TYPE_Q3_K, GGML_TYPE_MXFP4};
+    std::array<std::vector<array>, 2> gold;
+    const auto make = [&](int offset) {
+        std::vector<std::string> dtypes;
+        std::vector<array> storage;
+        for (int e = 0; e < E - 1; ++e) {
+            const auto type = types[(e + offset) % types.size()];
+            auto dtype = "GGUF_" + std::string(ggml_type_name(type));
+            for (auto& c : dtype) c = std::toupper(static_cast<unsigned char>(c));
+            auto bytes = packed(type, K, N);
+            std::vector<float> values(N * K);
+            ggml_get_type_traits(type)->to_float(bytes.data(), values.data(), values.size());
+            gold[offset].emplace_back(values.begin(), Shape{N, K});
+            dtypes.push_back(std::move(dtype));
+            storage.emplace_back(bytes.begin(), Shape{int(bytes.size())}, uint8);
+        }
+        gold[offset].push_back(zeros({N, K}));
+        return MlxGgufWeight::from_mixed_experts({E, N, K}, {0, 1, 2, 3}, dtypes, storage);
+    };
+    const auto gate = make(0), up = make(1);
+    std::vector<MlxGgufWeight> uniform;
+    for (const auto type : {GGML_TYPE_IQ4_XS, GGML_TYPE_MXFP4}) {
+        auto dtype = "GGUF_" + std::string(ggml_type_name(type));
+        for (auto& c : dtype) c = std::toupper(static_cast<unsigned char>(c));
+        const auto bytes = packed(type, K, N * E);
+        uniform.push_back(MlxGgufWeight::from_bytes(dtype, bytes, {E, N, K}));
+        std::vector<array> allocations;
+        const auto stride = ggml_row_size(type, K);
+        for (int expert : {0, 2, 4}) allocations.emplace_back(bytes.begin() + expert * N * stride,
+            Shape{N, int(stride)}, uint8);
+        uniform.push_back(MlxGgufWeight::from_experts(dtype, {E, N, K}, {0, 2, 4}, allocations));
+    }
+    if (!gate.has_mixed_formats() || gate.has_staged_planes())
+        throw std::runtime_error("heterogeneous GGUF bank lost its compressed expert layout");
+    for (const int m : {1, 2, 3, 4, 5, 6, 7, 8, 9, 17, 33, 65}) {
+        std::vector<int> selected(m * 5);
+        for (std::size_t i = 0; i < selected.size(); ++i) selected[i] = int(i % 7) - 1;
+        const array ids(selected.begin(), {m, 5}, int32);
+        for (const auto dt : {float16, bfloat16, float32}) {
+            const auto input = astype(reshape(sin(arange(m * K, float32) * .017f), {m, K}), dt);
+            const auto values = astype(input, float32);
+            eval(values);
+            std::array<std::vector<float>, 2> outputs{std::vector<float>(m * 5 * N), std::vector<float>(m * 5 * N)};
+            for (int part = 0; part < 2; ++part) for (int e = 0; e < E - 1; ++e) {
+                const auto w = astype(gold[part][e], float32); eval(w);
+                for (int r = 0; r < m * 5; ++r) if (selected[r] == e)
+                    for (int n = 0; n < N; ++n) {
+                        double sum = 0;
+                        for (int k = 0; k < K; ++k)
+                            sum += double(values.data<float>()[(r / 5) * K + k]) * w.data<float>()[n * K + k];
+                        outputs[part][r * N + n] = float(sum);
+                    }
+            }
+            const array expected_gate(outputs[0].begin(), Shape{m, 5, N});
+            const array expected_up(outputs[1].begin(), Shape{m, 5, N});
+            compare(gate.routed_matmul(input, ids, true), astype(expected_gate, dt), dt == bfloat16 ? .01f : .002f,
+                "heterogeneous GGUF routed projection M=" + std::to_string(m));
+            compare(gate.routed_swiglu(up, input, ids), moe_swiglu_pair(astype(expected_gate, dt), astype(expected_up, dt)),
+                dt == bfloat16 ? .02f : .003f, "heterogeneous GGUF fused Gate/Up M=" + std::to_string(m));
+            compare(gate.routed_swiglu(up, input, ids, nullptr, .7f),
+                moe_limited_swiglu_pair(astype(expected_gate, dt), astype(expected_up, dt), .7f),
+                dt == bfloat16 ? .02f : .003f, "heterogeneous GGUF clipped Gate/Up M=" + std::to_string(m));
+            for (const auto& fixed : uniform) {
+                const auto projected = fixed.routed_matmul(input, ids, true);
+                compare(gate.routed_swiglu(fixed, input, ids),
+                    moe_swiglu_pair(gate.routed_matmul(input, ids, true), projected),
+                    dt == bfloat16 ? .02f : .003f, "heterogeneous Gate / uniform Up M=" + std::to_string(m));
+                compare(fixed.routed_swiglu(up, input, ids, nullptr, .7f),
+                    moe_limited_swiglu_pair(projected, up.routed_matmul(input, ids, true), .7f),
+                    dt == bfloat16 ? .02f : .003f, "uniform Gate / heterogeneous Up M=" + std::to_string(m));
+            }
+            const auto separate = broadcast_to(expand_dims(input, 1), {m, 5, K});
+            compare(gate.routed_matmul(separate, ids, false), astype(expected_gate, dt), dt == bfloat16 ? .01f : .002f,
+                "heterogeneous GGUF separate routed inputs M=" + std::to_string(m));
+            const auto probabilities = reshape(cos(arange(m * 5, float32) * .1f), {m, 5});
+            compare(gate.routed_weighted_matmul(separate, ids, probabilities),
+                moe_weighted_reduce(astype(expected_gate, dt), probabilities), dt == bfloat16 ? .015f : .003f,
+                "heterogeneous GGUF fused Down/reduce M=" + std::to_string(m));
+            if (m == 65 && mlx_metal_nax_disabled()) {
+                const auto backing = concatenate({input, input}, -1);
+                const auto strided = slice(backing, {0, 0}, {m, K});
+                const auto unsigned_ids = astype(ids, uint32);
+                for (const int tile : {7, 16, 31, 32}) {
+                    const auto plan = mlx_expert_route_tiles(unsigned_ids, E, tile);
+                    compare(gate.routed_matmul(strided, unsigned_ids, true, &plan), astype(expected_gate, dt),
+                        dt == bfloat16 ? .01f : .002f, "heterogeneous SIMD prefill external tile=" + std::to_string(tile));
+                    compare(gate.routed_swiglu(up, strided, unsigned_ids, &plan, .7f),
+                        moe_limited_swiglu_pair(astype(expected_gate, dt), astype(expected_up, dt), .7f),
+                        dt == bfloat16 ? .02f : .003f, "heterogeneous SIMD clipped Gate/Up external plan");
+                    compare(gate.routed_weighted_matmul(separate, unsigned_ids, probabilities, &plan),
+                        moe_weighted_reduce(astype(expected_gate, dt), probabilities), dt == bfloat16 ? .015f : .003f,
+                        "heterogeneous SIMD Down/reduce external plan");
+                }
+            }
+        }
+    }
+    bool rejected = false;
+    try {
+        MlxGgufWeight::from_mixed_experts({E, N, K}, {0, 0}, {"GGUF_PTQ1_0", "GGUF_PTQ1_0"},
+            {zeros({N * K / 128 * 28}, uint8), zeros({N * K / 128 * 28}, uint8)});
+    } catch (const std::invalid_argument&) { rejected = true; }
+    if (!rejected) throw std::runtime_error("duplicate mixed GGUF expert accepted");
+    const std::vector<ggml_type> all_types{GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,
+        GGML_TYPE_Q8_0, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K,
+        GGML_TYPE_Q6_K, GGML_TYPE_Q8_K, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S,
+        GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_Q2_0, GGML_TYPE_PTQ1_0, GGML_TYPE_MXFP4,
+        GGML_TYPE_TQ2_T, GGML_TYPE_TQK6, GGML_TYPE_TQK7, GGML_TYPE_TQP5, GGML_TYPE_TQP6, GGML_TYPE_TQP7,
+        GGML_TYPE_TQK5, GGML_TYPE_TQK4};
+    std::vector<std::string> names;
+    std::vector<array> storage, matrices;
+    std::vector<int32_t> experts;
+    for (const auto type : all_types) {
+        auto name = "GGUF_" + std::string(ggml_type_name(type));
+        for (auto& c : name) c = std::toupper(static_cast<unsigned char>(c));
+        const auto bytes = packed(type, K, 7);
+        std::vector<float> decoded(7 * K);
+        if (type == GGML_TYPE_Q8_K)
+            dequantize_row_q8_K(reinterpret_cast<const block_q8_K*>(bytes.data()), decoded.data(), decoded.size());
+        else ggml_get_type_traits(type)->to_float(bytes.data(), decoded.data(), decoded.size());
+        experts.push_back(int(experts.size())); names.push_back(std::move(name));
+        storage.emplace_back(bytes.begin(), Shape{int(bytes.size())}, uint8);
+        matrices.emplace_back(decoded.begin(), Shape{7, K});
+    }
+    const auto all = MlxGgufWeight::from_mixed_experts({int(all_types.size()), 7, K}, experts, names, storage);
+    for (const int m : {1, 8, 65}) {
+        const auto input = astype(reshape(sin(arange(m * K, float32) * .02f), {m, K}), float16);
+        const auto ids = broadcast_to(array(experts.begin(), Shape{int(experts.size())}, int32), {m, int(experts.size())});
+        std::vector<array> expected;
+        for (const auto& matrix : matrices) expected.push_back(astype(reference_mm(input, matrix), float16));
+        compare(all.routed_matmul(input, ids, true), stack(expected, 1), .003f,
+            "all supported heterogeneous GGUF formats with partial output tiles");
+    }
+    {
+        constexpr int width = 256, output = 513;
+        std::vector<std::string> formats;
+        std::vector<array> data, decoded;
+        for (const auto type : types) {
+            auto name = "GGUF_" + std::string(ggml_type_name(type));
+            for (auto& c : name) c = std::toupper(static_cast<unsigned char>(c));
+            const auto bytes = packed(type, width, output);
+            std::vector<float> values(output * width);
+            ggml_get_type_traits(type)->to_float(bytes.data(), values.data(), values.size());
+            formats.push_back(std::move(name));
+            data.emplace_back(bytes.begin(), Shape{int(bytes.size())}, uint8);
+            decoded.emplace_back(values.begin(), Shape{output, width});
+        }
+        const auto expanded = MlxGgufWeight::from_mixed_experts({4, output, width}, {0, 1, 2, 3}, formats, data);
+        for (const int m : {9, 65}) {
+            const auto input = astype(reshape(sin(arange(m * width, float32) * .017f), {m, width}), float16);
+            const auto ids = broadcast_to(array({0, 1, 2, 3}, int32), {m, 4});
+            compare(expanded.routed_matmul(input, ids, true),
+                astype(reference_routed_mm(input, ids, stack(decoded), true), float16), .003f,
+                "heterogeneous expanding prefill and partial output tile M=" + std::to_string(m));
+        }
+    }
+    std::cout << "heterogeneous compressed experts M=1..8/prefill/GateUp/lifetime passed\n";
+}
+
 void check_gated_residual() {
     const auto down_bytes = packed(GGML_TYPE_Q8_0, 512, 128);
     const auto up_bytes = packed(GGML_TYPE_Q8_0, 128, 512);
@@ -266,16 +905,17 @@ void check_gated_residual() {
     }
     if (down.gated_residual(zeros({1, 9, 512}), up, nullptr, 4))
         throw std::runtime_error("GGUF mHC selected an unsupported prefill shape");
-    for (const auto dimensions : {std::array{32, 32, 8}, std::array{10240, 320, 4}}) {
+    for (const auto dimensions : {std::array{32, 32, 8}, std::array{10240, 320, 4}, std::array{4096, 32, 8}})
+      for (const int rows : {1, 2, 6, 7, 8}) {
         const auto width = dimensions[0], rank = dimensions[1], streams = dimensions[2];
         const auto low_weight = MlxGgufWeight::from_bytes("GGUF_Q8_0", packed(GGML_TYPE_Q8_0, width, rank), {rank, width});
         const auto high_weight = MlxGgufWeight::from_bytes("GGUF_Q8_0", packed(GGML_TYPE_Q8_0, rank, width), {width, rank});
-        const auto input = slice(reshape(cos(arange(2 * width, float32) * .013f), {1, 1, 2 * width}),
-            {0, 0, 0}, {1, 1, 2 * width}, {1, 1, 2});
+        const auto input = slice(reshape(cos(arange(2 * rows * width, float32) * .013f), {1, rows, 2 * width}),
+            {0, 0, 0}, {1, rows, 2 * width}, {1, 1, 2});
         auto low = low_weight.matmul(input) / array(float(streams));
         low = low * sigmoid(low);
         const auto expected = mean(reshape(sigmoid(high_weight.matmul(low)) * input,
-            {1, 1, streams, width / streams}), -2);
+            {1, rows, streams, width / streams}), -2);
         const auto plain = low_weight.gated_residual(input, high_weight, nullptr, streams);
         if (!plain || plain->size() != 1) throw std::runtime_error("GGUF single-token mHC without injection failed");
         compare((*plain)[0], expected, 5e-5f, "GGUF strided single-token mHC mix");
@@ -283,11 +923,16 @@ void check_gated_residual() {
             const auto injection = astype(reshape(sin(arange(streams * width, float32) * .017f) * .01f,
                 {streams, width}), dtype);
             const auto projected = MlxLinear(injection)(input);
-            const auto expected_gate = array(2.f) * sigmoid(projected / array(float(streams)));
+            const auto reference = rows == 1 ? projected : astype(reshape(reference_mm(
+                astype(reshape(input, {rows, width}), dtype), astype(injection, float32)),
+                {1, rows, streams}), projected.dtype());
+            const auto expected_gate = array(2.f) * sigmoid(reference / array(float(streams)));
             const auto output = low_weight.gated_residual(input, high_weight, &injection, streams);
             if (!output || output->size() != 2) throw std::runtime_error("GGUF single-token mHC injection failed");
             compare((*output)[0], expected, 5e-5f, "GGUF real-shape single-token mHC mix");
-            compare((*output)[1], expected_gate, 0.f, "GGUF independent injection precision");
+            compare((*output)[1], expected_gate, rows == 1 ? 0.f : dtype == bfloat16 ? .008f :
+                dtype == float16 ? .001f : 5e-5f, "GGUF independent injection precision rows=" +
+                std::to_string(rows) + " width=" + std::to_string(width) + " dtype=" + std::to_string(int(dtype.val())));
         }
     }
 }
@@ -333,8 +978,15 @@ void check_mixed_prefill_formats() {
             const auto expected = moe_weighted_reduce(down.routed_matmul(gate.routed_swiglu(up, input, ids), ids, false), probabilities);
             const int tile = gguf_prefill_tile_rows(gate, up, down, ids);
             const MlxGgufPrefillPlan plan(input, ids, E, tile);
-            compare(plan.down(down, plan.gate_up(gate, up), probabilities), expected,
+            const auto hidden = plan.gate_up(gate, up);
+            compare(plan.down(down, hidden, probabilities), expected,
                 dtype == bfloat16 ? .02f : .003f, "heterogeneous GGUF complete prefill FFN");
+            const auto pairs = down.routed_matmul(plan.restore(hidden), ids, false);
+            const auto float_expected = sum(astype(pairs, float32) * expand_dims(probabilities, -1), -2);
+            const auto accumulated = plan.down(down, hidden, probabilities, true);
+            if (accumulated.dtype() != float32) throw std::runtime_error("GGUF prefill lost float accumulation");
+            compare(accumulated, float_expected, dtype == bfloat16 ? .02f : .003f,
+                "GGUF prefill float accumulation");
         }
     }
 }
@@ -642,6 +1294,417 @@ void check_grouped_shared() {
     }
     std::cout << "compressed routed/shared planes, column/live-row tiles passed\n";
 }
+void check_native_affine_pairs() {
+    constexpr int experts = 8, top_k = 2;
+    for (const auto [width, middle] : std::array{std::pair{256, 512}, std::pair{512, 256}})
+        for (const int group : {32, 64, 128}) for (const int bits : {2, 3, 4, 5, 6, 8}) {
+        const auto fields = [&](int outputs, int columns, float phase) {
+            return quantize(astype(reshape(sin(arange(experts * outputs * columns, float32) * .017f + phase)
+                * .02f, {experts, outputs, columns}), bfloat16), group, bits, "affine");
+        };
+        const auto gate = fields(middle, width, 0.f), down = fields(width, middle, 1.f);
+        const auto weight = [&](const std::vector<array>& q, bool shared) {
+            std::vector<array> values;
+            for (const auto& value : q) values.push_back(shared ? take(value, array(0, int32), 0) : value);
+            return MlxAffineWeight::from_arrays(values[0], values[1], values[2], bits, group);
+        };
+        const auto native = [&](const MlxAffineWeight& value) {
+            auto prepared = value; prepared.prepare_native();
+            if (!prepared.native_weight_ref()) throw std::runtime_error("paired affine fixture did not prepare");
+            return *prepared.native_weight_ref();
+        };
+        const auto g = weight(gate, false), d = weight(down, false);
+        const auto sg = weight(gate, true), sd = weight(down, true);
+        const auto gn = native(g), dn = native(d), sgn = native(sg), sdn = native(sd);
+        const auto router = reshape(cos(arange(experts * width, float32) * .019f), {experts, width}) * .03f;
+        const auto scalar = reshape(sin(arange(width, float32) * .011f), {1, width}) * .02f;
+        const auto input = astype(reshape(cos(arange(width, float32) * .013f), {1, width}), bfloat16);
+        const MlxNativeGgufMoe moe{{gn, gn, dn}, {sgn, sgn, sdn}, router, scalar, arange(experts, uint32), top_k};
+        const auto scores = matmul(astype(input, float32), transpose(router));
+        const auto ids = astype(slice(argsort(-scores, -1), {0, 0}, {1, top_k}), int32);
+        const auto probabilities = softmax(take_along_axis(scores, ids, -1), -1);
+        const auto routed_gate = g.routed_matmul(input, ids, true);
+        const auto routed = d.routed_matmul(astype(moe_swiglu_pair(routed_gate, routed_gate), bfloat16), ids, false);
+        const auto shared_gate = sg.matmul(input);
+        const auto shared = sd.matmul(astype(moe_swiglu_pair(shared_gate, shared_gate), bfloat16));
+        const auto expected = astype(sum(astype(routed, float32) * expand_dims(probabilities, -1), 1) +
+            astype(shared, float32) * sigmoid(matmul(astype(input, float32), transpose(scalar))), bfloat16);
+        const auto actual = mlx_native_gguf_moe(moe, input);
+        const auto error = max(abs(astype(actual, float32) - astype(expected, float32))).item<float>();
+        const auto peak = max(abs(astype(expected, float32))).item<float>();
+        if (!std::isfinite(error) || error > .02f * peak + 1e-6f)
+            throw std::runtime_error("paired affine MoE failed Q=" + std::to_string(bits) +
+                " GS=" + std::to_string(group) + " K=" + std::to_string(width));
+    }
+}
+void check_native_grid_gate_up(int width = 1024, int inner = 256) {
+    constexpr int experts = 16;
+    MlxKernelPreparation preparation(1, 1);
+    const std::array formats{GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S};
+    for (std::size_t format = 0; format < formats.size(); ++format) {
+        std::vector<MlxNativeGgufWeight> native;
+        std::vector<MlxGgufWeight> reference;
+        for (const bool routed : {true, false}) for (int part = 0; part < 3; ++part) {
+            const auto type = part == 2 ? (inner % 256 ? GGML_TYPE_Q2_0 : GGML_TYPE_Q4_K) : routed ? formats[(format + part) % formats.size()]
+                : part == 0 ? GGML_TYPE_Q5_K : GGML_TYPE_Q6_K;
+            const int k = part == 2 ? inner : width, n = part == 2 ? width : inner;
+            const int rows = n * (routed ? experts : 1);
+            const auto bytes = packed(type, k, rows);
+            auto weight = mlx_native_gguf_pack(array(bytes.begin(), Shape{int(bytes.size())}, uint8),
+                type, rows, k, int(ggml_row_size(type, k)));
+            weight.outputs = n; weight.experts = routed ? experts : 1;
+            native.push_back(std::move(weight));
+            auto name = "GGUF_" + std::string(ggml_type_name(type));
+            for (auto& c : name) c = std::toupper(static_cast<unsigned char>(c));
+            reference.push_back(MlxGgufWeight::from_bytes(name, bytes, routed ? Shape{experts, n, k} : Shape{n, k}));
+        }
+        const auto router = reshape(sin(arange(experts * width, float32) * .019f), {experts, width}) * .03f;
+        const auto scalar = reshape(cos(arange(width, float32) * .017f), {1, width}) * .02f;
+        const auto slots = remainder(arange(experts, uint32) + array(1u), array(uint32_t(experts)));
+        const auto row = astype(reshape(cos(arange(width, float32) * .023f), {1, width}), bfloat16);
+        for (const auto& input : {row, concatenate({row, row}, 0), concatenate({row, -row}, 0),
+                concatenate({row, -row, row}, 0), concatenate({row, row, -row, -row}, 0)}) {
+            const int count = input.shape(0);
+            for (const auto dtype : {float32, bfloat16}) for (const int selected : {1, 2, experts - 1, experts}) {
+                const auto current_router = astype(router, dtype);
+                const auto scores = matmul(astype(input, float32), transpose(astype(current_router, float32)));
+                const auto ids = astype(slice(argsort(-scores, -1), {0, 0}, {count, selected}), int32);
+                const auto physical = astype(take(slots, ids, 0), int32);
+                const auto probability = softmax(take_along_axis(scores, ids, -1), -1);
+                const auto gate = reference[0].routed_matmul(input, physical, true);
+                const auto up = reference[1].routed_matmul(input, physical, true);
+                const auto routed = reference[2].routed_matmul(astype(moe_swiglu_pair(gate, up), bfloat16), physical, false);
+                const auto shared = reference[5].matmul(astype(moe_swiglu_pair(reference[3].matmul(input), reference[4].matmul(input)), bfloat16));
+                const auto expected = astype(sum(astype(routed, float32) * expand_dims(probability, -1), 1) +
+                    astype(shared, float32) * sigmoid(matmul(astype(input, float32), transpose(scalar))), bfloat16);
+                const MlxNativeGgufMoe weights{{native[0], native[1], native[2]}, {native[3], native[4], native[5]},
+                    current_router, scalar, slots, selected};
+                const auto actual = mlx_native_gguf_moe(weights, input);
+                if (count == 1 && dtype == float32 && selected == 1) {
+                    const auto previous = preparation.size();
+                    preparation.collect([&] { preparation.add(actual); });
+                    if (format && preparation.size() == previous)
+                        throw std::runtime_error("native Gate/Up preparation merges different format specializations");
+                }
+                compare(actual, expected, .025f,
+                    "native grid split-K Gate/Up with mixed formats and compact slots");
+            }
+        }
+    }
+    preparation.finish();
+}
+
+void check_native_stack() {
+    check_native_affine_pairs();
+    check_native_grid_gate_up();
+    check_native_grid_gate_up(2560, 640);
+    constexpr int K = 256, N = 256, E = 8, top_k = 2;
+    for (const auto [width, outputs] : std::array{std::pair{512, 768}, std::pair{4096, 64}, std::pair{6144, 2560}}) {
+        const auto bytes = packed(GGML_TYPE_IQ4_XS, width, outputs);
+        const auto native = mlx_native_gguf_pack(array(bytes.begin(), Shape{int(bytes.size())}, uint8),
+            GGML_TYPE_IQ4_XS, outputs, width, int(ggml_row_size(GGML_TYPE_IQ4_XS, width)));
+        const auto reference = MlxGgufWeight::from_bytes("GGUF_IQ4_XS", bytes, {outputs, width}).dequantize(float32);
+        for (const int count : {1, 2, 3, 4}) for (const auto dtype : {float16, bfloat16, float32}) {
+            const auto backing = astype(reshape(sin(arange(5 * width, float32) * .013f), {5, width}), dtype);
+            const auto input = slice(backing, {1, 0}, {1 + count, width});
+            compare(mlx_native_gguf_project(std::span(&native, 1), input)[0],
+                reference_mm(astype(input, bfloat16), reference), .01f, "native IQ4_XS factored projection");
+        }
+    }
+    {
+        const auto source = astype(reshape(cos(arange(160 * 2560, float32) * .017f), {160, 2560}) * .05f, bfloat16);
+        const auto q = quantize(source, 64, 4, "affine");
+        const auto native = mlx_native_affine_pack(q[0], q[1], q[2], 4, 64);
+        const auto reference = MlxAffineWeight::from_arrays(q[0], q[1], q[2], 4, 64);
+        const auto dense_reference = reference.dequantize(float16);
+        for (const int count : {1, 8, 32, 65}) {
+            const auto input = astype(reshape(sin(arange(count * 2560, float32) * .013f), {count, 2560}), bfloat16);
+            const auto expected = astype(reference_mm(input, dense_reference), bfloat16);
+            compare(mlx_native_gguf_project(std::span(&native, 1), input)[0], expected, .01f,
+                "native affine projection M=" + std::to_string(count));
+            compare(mlx_native_gguf_swiglu(native, native, input),
+                astype(moe_swiglu_pair(expected, expected), bfloat16), .025f,
+                "native affine Gate/Up M=" + std::to_string(count));
+        }
+        for (const auto dtype : {float16, float32}) {
+            auto backing = astype(reshape(cos(arange(3 * 2560, float32) * .013f), {3, 2560}), dtype);
+            const auto input = slice(backing, {1, 0}, {2, 2560});
+            const auto actual = mlx_native_gguf_project(std::span(&native, 1), input)[0];
+            if (actual.dtype() != dtype) throw std::runtime_error("native single-row projection changed output dtype");
+            compare(actual, reference_mm(astype(input, bfloat16), dense_reference), .01f,
+                "native single-row split projection with offset input");
+        }
+    }
+    const std::array types{GGML_TYPE_IQ3_XXS, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K};
+    std::vector<MlxNativeGgufWeight> routed, shared;
+    std::vector<MlxGgufWeight> routed_reference, shared_reference;
+    for (const bool experts : {true, false}) for (const auto type : types) {
+        const int rows = N * (experts ? E : 1);
+        const auto bytes = packed(type, K, rows);
+        auto name = "GGUF_" + std::string(ggml_type_name(type));
+        for (auto& c : name) c = std::toupper(static_cast<unsigned char>(c));
+        auto weight = mlx_native_gguf_pack(array(bytes.begin(), Shape{int(bytes.size())}, uint8),
+            type, rows, K, int(ggml_row_size(type, K)));
+        weight.outputs = N; weight.experts = experts ? E : 1;
+        (experts ? routed : shared).push_back(std::move(weight));
+        (experts ? routed_reference : shared_reference).push_back(
+            MlxGgufWeight::from_bytes(name, bytes, experts ? Shape{E, N, K} : Shape{N, K}));
+    }
+    const auto router = reshape(sin(arange(E * K, float32) * .019f), {E, K}) * .03f;
+    const auto scalar = reshape(cos(arange(K, float32) * .017f), {1, K}) * .02f;
+    MlxNativeGgufMoe moe{{routed[0], routed[1], routed[2]}, {shared[0], shared[1], shared[2]},
+        router, scalar, arange(E, uint32), top_k};
+    const auto reference_moe = [&](const MlxNativeGgufMoe& weights, const array& input) {
+        const int count = int(input.size() / K);
+        const auto scores = matmul(astype(input, float32), transpose(weights.router));
+        const auto ids = astype(slice(argsort(-scores, -1), {0, 0}, {count, weights.top_k}), int32);
+        const auto probabilities = softmax(take_along_axis(scores, ids, -1), -1);
+        const auto slots = astype(take(weights.slots, ids, 0), int32);
+        const auto gate = routed_reference[0].routed_matmul(input, slots, true);
+        const auto up = routed_reference[1].routed_matmul(input, slots, true);
+        const auto intermediate = astype(moe_swiglu_pair(gate, up), bfloat16);
+        const auto routed_out = routed_reference[2].routed_matmul(intermediate, slots, false);
+        const auto sg = shared_reference[0].matmul(input), su = shared_reference[1].matmul(input);
+        const auto shared_out = shared_reference[2].matmul(astype(moe_swiglu_pair(sg, su), bfloat16));
+        return astype(sum(astype(routed_out, float32) * expand_dims(probabilities, -1), 1) +
+            astype(shared_out, float32) * sigmoid(matmul(astype(input, float32), transpose(weights.scalar_gate))), bfloat16);
+    };
+    for (const auto dtype : {float32, bfloat16}) {
+        auto current = moe;
+        current.router = astype(router, dtype);
+        for (const int count : {1, 2, 3, 4, 6}) {
+            const auto input = astype(reshape(cos(arange(count * K, float32) * .023f), {count, K}), bfloat16);
+            for (const int selected : {1, top_k, E}) {
+                current.top_k = selected;
+                compare(mlx_native_gguf_moe(current, input), reference_moe(current, input), .025f,
+                    "native single-row Down/combine and floating router precision");
+            }
+        }
+    }
+    {
+        auto wide = moe;
+        wide.router = tile(router, {4, 1});
+        wide.slots = remainder(arange(E * 4, uint32), array(uint32_t(E)));
+        for (auto& weight : wide.routed) {
+            weight.experts *= 4;
+            for (auto& plane : weight.planes)
+                if (plane.size()) plane = concatenate({plane, plane, plane, plane}, 0);
+        }
+        const auto input = astype(reshape(cos(arange(K, float32) * .029f), {1, K}), bfloat16);
+        for (const int selected : {15, 31, 32}) {
+            wide.top_k = selected;
+            compare(mlx_native_gguf_moe(wide, input), reference_moe(wide, input), .025f,
+                "native Down/combine route-count boundary and compact slot aliases");
+        }
+    }
+    for (const int count : {1, 2, 3, 4, 5, 6, 7, 8, 17, 32, 65}) {
+        const auto input = astype(reshape(sin(arange(count * K, float32) * .013f), {count, K}), bfloat16);
+        const auto expected = reference_moe(moe, input);
+        compare(mlx_native_gguf_moe(moe, input), expected, .025f,
+            "native grouped MoE mixed formats M=" + std::to_string(count));
+        const auto actual = mlx_native_gguf_project(shared, input);
+        for (int i = 0; i < 3; ++i)
+            compare(actual[i], shared_reference[i].matmul(input), .015f,
+                "native mixed projections M=" + std::to_string(count));
+        compare(mlx_native_gguf_swiglu(shared[0], shared[1], input),
+            astype(moe_swiglu_pair(shared_reference[0].matmul(input), shared_reference[1].matmul(input)), bfloat16), .025f,
+            "native mixed Gate/Up M=" + std::to_string(count));
+    }
+    for (const int count : {4096, 4161}) {
+        const auto input = astype(reshape(sin(arange(count * K, float32) * .013f), {count, K}), bfloat16);
+        compare(mlx_native_gguf_moe(moe, input), reference_moe(moe, input), .025f,
+            "native grouped MoE prefill boundary M=" + std::to_string(count));
+    }
+    for (const int count : {2051, 4096, 4161}) for (const auto dtype : {bfloat16, float16, float32}) {
+        const auto input = astype(reshape(sin(arange(count * K, float32) * .013f), {count, K}), dtype);
+        const auto actual = mlx_native_gguf_project(shared, input);
+        eval(actual);
+        for (std::size_t i = 0; i < shared.size(); ++i) {
+            compare(actual[i], shared_reference[i].matmul(input), .02f, "native chunked mixed projections");
+            if (dtype == bfloat16 && actual[i].buffer().ptr() != actual.front().buffer().ptr())
+                throw std::runtime_error("native prefill projections copied chunk outputs");
+        }
+        const std::array matching{shared[0], shared[0], shared[0]};
+        const auto grouped = mlx_native_gguf_project(matching, input);
+        for (const auto& value : grouped)
+            compare(value, shared_reference[0].matmul(input), .02f, "native chunked matching projections");
+    }
+    const auto initial_stream = default_stream(Device::gpu);
+    std::vector<array> pending, expected;
+    for (const auto stream : {initial_stream, new_stream(Device::gpu), initial_stream}) {
+        set_default_stream(stream);
+        for (int iteration = 0; iteration < 8; ++iteration) {
+            const int count = std::array{1, 2, 3, 4, 8, 17}[iteration % 6];
+            const auto input = astype(reshape(sin(arange(count * K, float32) * .013f + iteration * .4f),
+                {count, K}), bfloat16);
+            auto current = moe;
+            if (iteration % 2) { current.router = -router; current.scalar_gate = -scalar; }
+            if (iteration % 3) current.slots = astype(E - 1 - arange(E, int32), uint32);
+            pending.push_back(mlx_native_gguf_moe(current, input));
+            expected.push_back(reference_moe(current, input));
+            pending.push_back(mlx_native_gguf_swiglu(shared[0], shared[1], input));
+            expected.push_back(astype(moe_swiglu_pair(shared_reference[0].matmul(input),
+                shared_reference[1].matmul(input)), bfloat16));
+            const auto projections = mlx_native_gguf_project(shared, input);
+            pending.insert(pending.end(), projections.begin(), projections.end());
+            for (const auto& weight : shared_reference) expected.push_back(weight.matmul(input));
+        }
+    }
+    for (int iteration = 0; iteration < 5; ++iteration) {
+        set_default_stream(new_stream(Device::gpu));
+        const auto input = astype(reshape(cos(arange(K, float32) * .013f + iteration * .4f), {1, K}), bfloat16);
+        pending.push_back(mlx_native_gguf_moe(moe, input));
+        expected.push_back(reference_moe(moe, input));
+    }
+    set_default_stream(initial_stream);
+    eval(pending);
+    for (std::size_t i = 0; i < pending.size(); ++i)
+        compare(pending[i], expected[i], .025f, "native deferred mixed-plan/stream reuse " + std::to_string(i));
+    for (const bool strided : {false, true}) {
+        auto backing = astype(reshape(sin(arange(130 * K, float32) * .017f), {130, K}), bfloat16);
+        auto input = strided ? transpose(reshape(backing, {K, 130})) : slice(backing, {65, 0}, {130, K});
+        auto outputs = mlx_native_gguf_project(shared, input);
+        outputs.push_back(mlx_native_gguf_moe(moe, input));
+        check_native_views(outputs);
+        for (std::size_t i = 0; i < shared.size(); ++i)
+            compare(outputs[i], shared_reference[i].matmul(input), .015f, "native offset/strided projection");
+        compare(outputs.back(), reference_moe(moe, input), .025f, "native offset/strided MoE");
+    }
+    for (const auto [width, intermediate] : std::array{std::pair{256, 512}, std::pair{K, N}, std::pair{512, 256}})
+        for (const int group : {32, 64, 128}) for (const int shift : {0, 3}) {
+        std::vector<MlxNativeGgufWeight> affine_routed, affine_shared;
+        std::vector<MlxAffineWeight> affine_routed_reference, affine_shared_reference;
+        for (const bool experts : {true, false}) for (int i = 0; i < 3; ++i) {
+            const int columns = i == 2 ? intermediate : width, outputs = i == 2 ? width : intermediate;
+            const auto shape = experts ? Shape{E, outputs, columns} : Shape{outputs, columns};
+            const auto fields = quantize(astype(reshape(sin(arange((experts ? E : 1) * outputs * columns, float32) * .017f + i)
+                * .03f, shape), bfloat16), group, std::array{2, 3, 4, 5, 6, 8}[i + shift], "affine");
+            const int bits = std::array{2, 3, 4, 5, 6, 8}[i + shift];
+            auto packed = mlx_native_affine_pack(fields[0], fields[1], fields[2], bits, group);
+            if (packed.outputs != outputs || packed.experts != (experts ? E : 1))
+                throw std::runtime_error("native affine expert dimension lost during packing");
+            (experts ? affine_routed : affine_shared).push_back(std::move(packed));
+            (experts ? affine_routed_reference : affine_shared_reference).push_back(
+                MlxAffineWeight::from_arrays(fields[0], fields[1], fields[2], bits, group));
+        }
+        const auto affine_router = reshape(sin(arange(E * width, float32) * .019f), {E, width}) * .03f;
+        const auto affine_scalar = reshape(cos(arange(width, float32) * .017f), {1, width}) * .02f;
+        const MlxNativeGgufMoe affine_moe{{affine_routed[0], affine_routed[1], affine_routed[2]},
+            {affine_shared[0], affine_shared[1], affine_shared[2]}, affine_router, affine_scalar, arange(E, uint32), top_k};
+        for (int projection = 0; projection < 3; ++projection) {
+            auto weight = affine_routed[projection];
+            weight.outputs *= weight.experts; weight.experts = 1;
+            const auto x = astype(reshape(cos(arange(2 * weight.width, float32) * .013f),
+                {2, weight.width}), bfloat16);
+            const auto dense = reshape(affine_routed_reference[projection].dequantize(float32),
+                {weight.outputs, weight.width});
+            const auto expected = astype(reference_mm(x, dense), bfloat16);
+            compare(mlx_native_gguf_project(std::span(&weight, 1), x)[0], expected, .01f,
+                "native affine two-row CPU projection " + std::to_string(projection) +
+                " K=" + std::to_string(weight.width) + " GS=" + std::to_string(group) +
+                " shift=" + std::to_string(shift));
+        }
+        for (const int rows : {1, 6, 65}) {
+            const auto input = astype(reshape(cos(arange(rows * width, float32) * .013f), {rows, width}), bfloat16);
+            const auto scores = matmul(astype(input, float32), transpose(affine_router));
+            const auto ids = astype(slice(argsort(-scores, -1), {0, 0}, {rows, top_k}), int32);
+            const auto probability = softmax(take_along_axis(scores, ids, -1), -1);
+            const auto routed_reference = [&](int p, const array& x, bool shared) {
+                return rows <= 6 ? affine_routed_reference[p].routed_matmul(x, ids, shared)
+                    : astype(reference_routed_mm(x, ids, affine_routed_reference[p].dequantize(float16), shared), bfloat16);
+            };
+            const auto shared_reference = [&](int p, const array& x) {
+                return rows <= 6 ? affine_shared_reference[p].matmul(x)
+                    : astype(reference_mm(x, affine_shared_reference[p].dequantize(float16)), bfloat16);
+            };
+            const auto gate = routed_reference(0, input, true);
+            const auto up = routed_reference(1, input, true);
+            const auto routed_out = routed_reference(2, astype(moe_swiglu_pair(gate, up), bfloat16), false);
+            const auto shared_hidden = astype(moe_swiglu_pair(
+                shared_reference(0, input), shared_reference(1, input)), bfloat16);
+            const auto shared_out = shared_reference(2, shared_hidden);
+            const auto expected = astype(sum(astype(routed_out, float32) * expand_dims(probability, -1), 1) +
+                astype(shared_out, float32) * sigmoid(matmul(astype(input, float32), transpose(affine_scalar))), bfloat16);
+            compare(mlx_native_gguf_moe(affine_moe, input), expected, .025f,
+                "native affine complete mixed-format MoE K=" + std::to_string(width) + " N=" +
+                std::to_string(intermediate) + " GS=" + std::to_string(group) + " shift=" +
+                std::to_string(shift) + " M=" + std::to_string(rows));
+        }
+    }
+    std::cout << "native GGUF repack, grouped projections, mixed Gate/Up and complete MoE passed\n";
+}
+
+void check_native_hyper() {
+    constexpr int hidden = 2560, width = hidden * 4, rank = 320;
+    const auto down = astype(reshape(sin(arange(rank * width, float32) * .017f) * .001f, {rank, width}), bfloat16);
+    const auto up = astype(reshape(cos(arange(width * rank, float32) * .013f) * .01f, {width, rank}), bfloat16);
+    const auto inject = reshape(sin(arange(4 * width, float32) * .019f) * .01f, {4, width});
+    const auto norm = reshape(cos(arange(width, float32) * .013f) * .02f, {width});
+    for (const int rows : {1, 2, 3, 6, 8, 33, 64, 65, 2051, 4096, 4161}) {
+        const auto input = reshape(sin(arange(rows * width, float32) * .013f), {1, rows, width});
+        for (const bool injection : {false, true}) {
+            const auto actual = mlx_native_gguf_hyper(input, norm + array(1.f), mlx_native_gguf_float(down),
+                mlx_native_gguf_float(up), injection ? &inject : nullptr);
+            check_native_views({actual[0], actual[1]});
+            const auto expected = qwen4_gated_residual_pre(input, norm, down, up,
+                injection ? std::optional<array>(inject) : std::nullopt, hidden, 4, 1e-6f);
+            compare(actual[0], expected.branch, .02f, "native hyper branch");
+            if (injection) compare(reshape(actual[1], {1, rows, 4}), *expected.injection, .001f, "native hyper injection");
+            {
+                const auto packed_input = astype(input, bfloat16);
+                const auto direct = mlx_native_gguf_hyper(packed_input, norm + array(1.f), mlx_native_gguf_float(down),
+                    mlx_native_gguf_float(up), injection ? &inject : nullptr);
+                const auto promoted = mlx_native_gguf_hyper(astype(packed_input, float32), norm + array(1.f),
+                    mlx_native_gguf_float(down), mlx_native_gguf_float(up), injection ? &inject : nullptr);
+                compare(direct[0], promoted[0], 0.f, "native BF16 hyper input preserves branch bits");
+                if (injection) compare(direct[1], promoted[1], 0.f, "native BF16 hyper input preserves injection bits");
+            }
+        }
+    }
+    const auto down_q = quantize(down, 64, 4, "affine"), up_q = quantize(up, 64, 4, "affine");
+    const auto native_down = mlx_native_affine_pack(down_q[0], down_q[1], down_q[2], 4, 64);
+    const auto native_up = mlx_native_affine_pack(up_q[0], up_q[1], up_q[2], 4, 64);
+    const auto down_reference = astype(dequantize(down_q[0], down_q[1], down_q[2], 64, 4, "affine"), bfloat16);
+    const auto up_reference = astype(dequantize(up_q[0], up_q[1], up_q[2], 64, 4, "affine"), bfloat16);
+    std::vector<array> branches, expected_branches;
+    for (const int rows : {1, 7, 8, 17}) {
+        const auto input = reshape(sin(arange(rows * width, float32) * .013f), {1, rows, width});
+        branches.push_back(mlx_native_gguf_hyper(input, norm + array(1.f), native_down, native_up, &inject)[0]);
+        expected_branches.push_back(qwen4_gated_residual_pre(input, norm, down_reference, up_reference,
+            inject, hidden, 4, 1e-6f).branch);
+    }
+    eval(branches);
+    for (std::size_t i = 0; i < branches.size(); ++i)
+        compare(branches[i], expected_branches[i], .03f, "native hyper prepared affine input");
+    const auto down_bytes = packed(GGML_TYPE_Q8_0, width, rank);
+    const auto up_bytes = packed(GGML_TYPE_Q8_0, rank, width);
+    const auto inject_bytes = packed(GGML_TYPE_Q8_0, width, 4);
+    const auto quantized_inject = MlxGgufWeight::from_bytes("GGUF_Q8_0", inject_bytes, {4, width});
+    const auto inject_f32 = quantized_inject.dequantize(float32);
+    std::vector<float> decoded_inject(width * 4), decoded_down(width * rank), decoded_up(width * rank);
+    const auto decode = ggml_get_type_traits(GGML_TYPE_Q8_0)->to_float;
+    decode(inject_bytes.data(), decoded_inject.data(), decoded_inject.size());
+    decode(down_bytes.data(), decoded_down.data(), decoded_down.size());
+    decode(up_bytes.data(), decoded_up.data(), decoded_up.size());
+    compare(inject_f32, array(decoded_inject.begin(), {4, width}), 0.f, "native hyper quantized injection decode");
+    const auto reference_down = astype(array(decoded_down.begin(), {rank, width}), bfloat16);
+    const auto reference_up = astype(array(decoded_up.begin(), {width, rank}), bfloat16);
+    const auto packed_down = mlx_native_gguf_pack(array(down_bytes.begin(), {int(down_bytes.size())}, uint8),
+        GGML_TYPE_Q8_0, rank, width, ggml_row_size(GGML_TYPE_Q8_0, width));
+    const auto packed_up = mlx_native_gguf_pack(array(up_bytes.begin(), {int(up_bytes.size())}, uint8),
+        GGML_TYPE_Q8_0, width, rank, ggml_row_size(GGML_TYPE_Q8_0, rank));
+    for (const auto dtype : {float16, bfloat16, float32}) for (const int rows : {1, 6, 65, 4096}) {
+        const auto input = astype(reshape(sin(arange(rows * width, float32) * .013f), {1, rows, width}), dtype);
+        const auto actual = mlx_native_gguf_hyper(input, norm + array(1.f), packed_down, packed_up, &inject_f32);
+        const auto expected = qwen4_gated_residual_pre(input, norm, reference_down, reference_up,
+            inject_f32, hidden, 4, 1e-6f);
+        compare(actual[0], expected.branch, .025f, "native hyper quantized projections and injection");
+        compare(reshape(actual[1], {1, rows, 4}), *expected.injection, .02f,
+            "native hyper quantized injection normalization");
+    }
+    std::cout << "native hyper-connection norm, projections, activation and mix passed\n";
+}
+
 void check_row_preparation() {
     for (const auto& [format, width] : std::vector<std::pair<std::string, int>>{
             {"GGUF_IQ4_NL", 160}, {"GGUF_Q8_0", 160}, {"GGUF_IQ3_XXS", 256}, {"GGUF_Q4_K", 256}}) {
@@ -670,6 +1733,57 @@ void check_row_preparation() {
     }
     std::cout << "GGUF row preparation avoids source reads, deduplicates and preserves decode\n";
 }
+void check_gyro_dense_projections() {
+    constexpr int K = 256, N = 128;
+    std::vector<MlxLinear> linears;
+    std::vector<array> references;
+    const bool staged = gguf_expert_prefill_available(zeros({65, K}, float16));
+    for (const auto type : {GGML_TYPE_TQ2_T, GGML_TYPE_TQK4, GGML_TYPE_TQK5, GGML_TYPE_TQK6,
+            GGML_TYPE_TQK7, GGML_TYPE_TQP5, GGML_TYPE_TQP6, GGML_TYPE_TQP7, GGML_TYPE_IQ3_XXS}) {
+        auto bytes = packed(type, K, N);
+        auto name = "GGUF_" + std::string(ggml_type_name(type));
+        for (auto& c : name) c = std::toupper(static_cast<unsigned char>(c));
+        const auto weight = MlxGgufWeight::from_bytes(name, bytes, {N, K});
+        if (staged && (!weight.has_staged_planes() || weight.packed_nbytes() != bytes.size() + (type >= GGML_TYPE_TQ2_T ? 1 : 0)))
+            throw std::runtime_error("dense compressed layout changed the weight byte count");
+        std::vector<float> decoded(N * K);
+        ggml_get_type_traits(type)->to_float(bytes.data(), decoded.data(), decoded.size());
+        const array reference(decoded.begin(), {N, K});
+        compare(weight.dequantize(float32), reference, 2e-6f, name + " dense decoded weights");
+        for (auto dtype : {float16, bfloat16, float32}) for (int groups : {2, 4, 8}) {
+            const auto empty = weight.grouped_row_matmul(zeros({0, groups, K}, dtype), groups);
+            if (empty.shape() != Shape{0, groups, N / groups})
+                throw std::runtime_error("empty grouped projection lost its shape");
+            for (int rows : {1, 2, 6, 7, 8, 9, 33, 65}) {
+                const auto input = astype(reshape(sin(arange(rows * groups * K, float32) * .013f) * .1f,
+                    {rows, groups, K}), dtype);
+                std::vector<array> expected;
+                for (int group = 0; group < groups; ++group) {
+                    auto x = reshape(slice(input, {0, group, 0}, {rows, group + 1, K}), {rows, K});
+                    auto w = slice(reference, {group * (N / groups), 0}, {(group + 1) * (N / groups), K});
+                    expected.push_back(astype(reference_mm(x, w), dtype));
+                }
+                compare(weight.grouped_row_matmul(input, groups), stack(expected, 1),
+                    dtype == bfloat16 ? .01f : .002f, name + " grouped dense precision/tail");
+            }
+        }
+        bool rejected = false;
+        try { (void)weight.grouped_row_matmul(zeros({1, 3, K}), 3); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        if (!rejected) throw std::runtime_error("invalid dense projection grouping accepted");
+        if (type == GGML_TYPE_TQK4 || type == GGML_TYPE_TQP6 || type == GGML_TYPE_TQP7 || type == GGML_TYPE_IQ3_XXS) {
+            linears.emplace_back(weight); references.push_back(reference);
+        }
+    }
+    const MlxProjectionBatch batch(std::vector<const MlxLinear*>{&linears[0], &linears[1], &linears[2], &linears[3]});
+    for (auto dtype : {float16, bfloat16, float32}) for (int rows : {1, 2, 3, 4, 5, 6, 7, 8, 65}) {
+        const auto input = astype(reshape(sin(arange(rows * K, float32) * .013f) * .1f, {rows, K}), dtype);
+        const auto actual = batch(input);
+        for (std::size_t i = 0; i < actual.size(); ++i)
+            compare(actual[i], astype(reference_mm(input, references[i]), dtype),
+                dtype == bfloat16 ? .01f : .002f, "heterogeneous dense projection batch");
+    }
+}
 } // namespace
 
 int main(int argc, char** argv) {
@@ -678,6 +1792,14 @@ int main(int argc, char** argv) {
         auto* ctx = ggml_init({1024 * 1024, nullptr, true});
         ggml_free(ctx);
         if (argc > 1) {
+            if (std::string_view(argv[1]) == "gyro-dense") { check_gyro_dense_projections(); return 0; }
+            if (std::string_view(argv[1]) == "prefill-transfers") {
+                check_prefill_restore();
+                if (gguf_expert_prefill_available(zeros({65, 512}, float16))) check_mixed_prefill_formats();
+                return 0;
+            }
+            if (std::string_view(argv[1]) == "native-stack") { check_native_stack(); return 0; }
+            if (std::string_view(argv[1]) == "native-hyper") { check_native_hyper(); return 0; }
             if (std::string_view(argv[1]) == "rows") { check_row_preparation(); return 0; }
             if (std::string_view(argv[1]) == "mhc") { check_gated_residual(); return 0; }
             if (std::string_view(argv[1]) == "grouped") { check_grouped_shared(); return 0; }
@@ -685,6 +1807,17 @@ int main(int argc, char** argv) {
                 check_projection_batch(); check_compact_expansion(); check_compact_contraction(); return 0;
             }
             if (std::string_view(argv[1]) == "splits") { check_split_projection(); return 0; }
+            if (std::string_view(argv[1]) == "heterogeneous") { check_heterogeneous_experts(); return 0; }
+            if (std::string_view(argv[1]) == "gyro") {
+                check_group_decoders();
+                check_prefill_restore();
+                check_sparse_short_routes();
+                check_sparse_mixed_prefill();
+                check_wide_mixed_prefill();
+                for (const auto type : {GGML_TYPE_TQ2_T, GGML_TYPE_TQK4, GGML_TYPE_TQK5, GGML_TYPE_TQK6,
+                    GGML_TYPE_TQK7, GGML_TYPE_TQP5, GGML_TYPE_TQP6, GGML_TYPE_TQP7}) check(type);
+                return 0;
+            }
             for (int index = 0; index < GGML_TYPE_COUNT; ++index) {
                 const auto type = static_cast<ggml_type>(index);
                 const auto* name = ggml_type_name(type);
@@ -692,7 +1825,13 @@ int main(int argc, char** argv) {
             }
             throw std::invalid_argument("unknown GGUF test format");
         }
+        check_sparse_short_routes();
+        check_group_decoders();
+        check_prefill_restore();
+        check_sparse_mixed_prefill();
+        check_wide_mixed_prefill();
         check_row_preparation();
+        check_heterogeneous_experts();
         check_gated_residual();
         check_mixed_formats();
         check_projection_batch();
@@ -703,7 +1842,8 @@ int main(int argc, char** argv) {
             GGML_TYPE_Q8_0, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K,
             GGML_TYPE_Q6_K, GGML_TYPE_Q8_K, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS,
             GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS,
-            GGML_TYPE_Q2_0}) check(type);
+            GGML_TYPE_Q2_0, GGML_TYPE_PTQ1_0, GGML_TYPE_MXFP4, GGML_TYPE_TQ2_T, GGML_TYPE_TQK4, GGML_TYPE_TQK5,
+            GGML_TYPE_TQK6, GGML_TYPE_TQK7, GGML_TYPE_TQP5, GGML_TYPE_TQP6, GGML_TYPE_TQP7}) check(type);
         bool rejected = false;
         try { MlxGgufWeight::from_bytes("GGUF_UNKNOWN", {}, {1, 256}); }
         catch (const std::invalid_argument&) { rejected = true; }

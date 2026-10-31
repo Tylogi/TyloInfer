@@ -7,6 +7,7 @@
 #include "mlx_platform.h"
 #include "mlx_eval_timing.h"
 #include "mlx_tq_rows.h"
+#include "tyloinfer/tq_rows.h"
 
 #include <mlx/allocator.h>
 #include <nlohmann/json.hpp>
@@ -199,7 +200,14 @@ if (expert >= 0 && expert < EXPERTS) {
     auto packed_u = tq_words<POOLED_U>(words_u, desc_u, EXPERTS * OUT, uint(expert));
     ulong descriptor = descriptors[wr];
     auto input = (upper ? prepared_u : prepared_g) + route * K;
-    value = tq_dot<float, 16, 0, K, K, 512>(upper ? packed_u : packed_g, descriptor, TqUnitScale{}, relative, wr, input, lane & 15u);
+    if constexpr (WIDTH_G == WIDTH_U)
+        value = tq_dot<float, 16, 0, WIDTH_G, K, 512>(upper ? packed_u : packed_g, descriptor,
+            TqUnitScale{}, relative, wr, input, lane & 15u);
+    else if (upper)
+        value = tq_dot<float, 16, 0, WIDTH_U, K, 512>(packed_u, descriptor,
+            TqUnitScale{}, relative, wr, input, lane & 15u);
+    else value = tq_dot<float, 16, 0, WIDTH_G, K, 512>(packed_g, descriptor,
+        TqUnitScale{}, relative, wr, input, lane & 15u);
     anchor = float(as_type<half>(ushort(descriptor >> 40u)));
 }
 for (uint step = 8u; step; step >>= 1u) value += simd_shuffle_down(value, step);
@@ -242,6 +250,7 @@ auto packed = words0;
 auto input = x;
 ulong descriptor = 0ul;
 uint local = 0u;
+float value = 0.f;
 )METAL";
     for (std::size_t p = 0; p < count; ++p) {
         const auto suffix = std::to_string(p);
@@ -254,14 +263,14 @@ uint local = 0u;
                 "local = row - BEGIN" + suffix + ";\n"
                 "packed = tq_words<POOLED" + suffix + ">(words" + suffix + ", descriptors" + suffix
                 + ", END" + suffix + " - BEGIN" + suffix + ", 0u);\n"
-                "descriptor = descriptors" + suffix + "[local];\ninput = x + " + suffix + "u * K;\n}\n";
+                "descriptor = descriptors" + suffix + "[local];\ninput = x + " + suffix + "u * K;\n"
+                "value = tq_dot<float, 16, 0, WIDTH" + suffix + ", K, 512>(packed, descriptor, TqUnitScale{}, relative, local, input, lane);\n}\n";
         }
     }
     source += prepare ? R"METAL(
 value *= factor;
 for (uint j = 0u; j < 4u; ++j) if (col + j < K) y[projection * K + col + j] = value[j];
 )METAL" : R"METAL(
-float value = tq_dot<float, 16, 0, K, K, 512>(packed, descriptor, TqUnitScale{}, relative, local, input, lane);
 for (uint step = 8u; step; step >>= 1u) value += simd_shuffle_down(value, step);
 if (lane == 0u) y[row] = half(value * float(as_type<half>(ushort(descriptor >> 40u))));
 )METAL";
@@ -464,7 +473,7 @@ if constexpr (COLUMN_SINGLE) {
             auto packed_u = tq_words<POOLED_U>(words_u, descriptors_u, EXPERTS * OUT, uint(expert));
             ulong descriptor = upper ? descriptors_u[wr] : descriptors_g[wr];
             auto prepared = (upper ? prepared_u : prepared_g) + destination * K;
-            result = tq_dot<float, 16, 0, K, K, 512>(upper ? packed_u : packed_g,
+            result = tq_dot<float, 16, 0, WIDTH_G, K, 512>(upper ? packed_u : packed_g,
                 descriptor, TqUnitScale{}, relative, wr, prepared, lane & 15u);
             anchor = float(as_type<half>(ushort(descriptor >> 40u)));
         }
@@ -716,6 +725,27 @@ if (expert < 0 || expert >= EXPERTS) {
         threadgroup_position_in_grid.x * 128u, thread_position_in_threadgroup.x, 128u);
     return;
 }
+if constexpr (NAX && SHARED_TILE && BM == 64 && OUT >= K * 2u && K >= 1024u) {
+    if (rows - begin > 16u && rows - begin <= 32u) {
+        if (threadgroup_position_in_grid.x & 1u) return;
+        uint tile = threadgroup_position_in_grid.x * 64u +
+            (thread_position_in_threadgroup.x / 32u) * 32u;
+        auto packed = tq_words<POOLED>(words, descriptors, EXPERTS * OUT, uint(expert));
+        uint cached = tile + uint(mlx::steel::BaseNAXFrag::get_coord().y) +
+            ((__metal_get_thread_index_in_simdgroup(ushort()) & 1u) ? 8u : 0u);
+        ulong first = cached < OUT ? descriptors[uint(expert) * OUT + cached] : 0ul;
+        ulong second = cached + 16u < OUT ? descriptors[uint(expert) * OUT + cached + 16u] : 0ul;
+        auto decode = [&](uint row, uint col) {
+            uint wr = uint(expert) * OUT + row;
+            return tq_decode8<COLUMNS, WIDTH, GS>(packed, row == cached ? first : second,
+                scales, relative, wr, col);
+        };
+        auto input_row = [&](uint row) { return uint(order[row]) / (SHARED_INPUT ? ROUTES : 1u); };
+        auto output_row = [&](uint row) { return uint(order[row]); };
+        tq_nax_matmul<T, K, OUT, 32>(x, y, rows, tile, begin, decode, input_row, output_row);
+        return;
+    }
+}
 auto packed = tq_words<POOLED>(words, descriptors, EXPERTS * OUT, uint(expert));
 ulong row_descriptor = 0ul;
 if constexpr (NAX && SHARED_TILE) {
@@ -753,8 +783,11 @@ if constexpr (!NAX) {
     return kernel;
 }
 
-const fast::CustomKernelFunction& routed_pair_matmul_kernel() {
-    static const auto kernel = indirect_weight_metal_kernel("tyloinfer_tq_routed_pair_matmul",
+const fast::CustomKernelFunction& routed_pair_matmul_kernel(bool nax) {
+    static const auto make_kernel = [](bool nax) {
+        CompileOptions options;
+        options.math_mode = nax ? MathMode::Fast : MathMode::Safe;
+        return indirect_weight_metal_kernel(nax ? "tyloinfer_tq_routed_pair_matmul_nax" : "tyloinfer_tq_routed_pair_matmul",
         {"words_g", "descriptors_g", "scales_g", "words_u", "descriptors_u", "scales_u",
          "relative", "x", "order", "blocks", "block_count", "params"}, {"y"}, R"METAL(
 uint n0 = threadgroup_position_in_grid.x * (NAX ? 64u : 32u), block = thread_position_in_grid.y;
@@ -795,8 +828,10 @@ else if (rows - begin <= 64u)
 else tq_nax_shared_pair<T, K, OUT, BM, 32>(x, y, rows, begin, n0, thread_position_in_threadgroup.x,
     decode_g, decode_u, input_row, output_row, params[0], GELU,
     scratch, scratch + BM * 32u, scratch + BM * 32u + 64u * 32u);
-)METAL", std::string(kTqDecode) + kTqNax, true, false);
-    return kernel;
+)METAL", std::string(kTqDecode) + kTqNax, true, false, options);
+    };
+    static const auto kernel = make_kernel(false), nax_kernel = make_kernel(true);
+    return nax ? nax_kernel : kernel;
 }
 
 MlxTqRoutePlan make_tq_route_plan(const array& ids, const array& order, int experts, int block_rows) {
@@ -953,7 +988,7 @@ y[index] = T(value);
 enum class TqBatchMode { Vector, Reuse, Nax, NaxSplit, SharedNax, SplitK, SplitReuse, FusedSplitReuse, StageWeights };
 
 const fast::CustomKernelFunction& batch_kernel(std::size_t count, TqBatchMode mode,
-    bool select_decode = false, bool fixed_sources = false) {
+    bool select_decode = false, bool fixed_sources = false, bool gated = false) {
     const bool shared = mode == TqBatchMode::SharedNax;
     const bool fused_split = mode == TqBatchMode::FusedSplitReuse;
     const bool nax = shared || mode == TqBatchMode::Nax || mode == TqBatchMode::NaxSplit;
@@ -962,9 +997,9 @@ const fast::CustomKernelFunction& batch_kernel(std::size_t count, TqBatchMode mo
     const bool staging = mode == TqBatchMode::StageWeights;
     const bool cache_rows = nax && !shared;
     static std::mutex mutex;
-    static std::map<std::tuple<std::size_t, TqBatchMode, bool, bool>, fast::CustomKernelFunction> kernels;
+    static std::map<std::tuple<std::size_t, TqBatchMode, bool, bool, bool>, fast::CustomKernelFunction> kernels;
     std::lock_guard lock(mutex);
-    const auto key = std::tuple{count, mode, select_decode, fixed_sources};
+    const auto key = std::tuple{count, mode, select_decode, fixed_sources, gated};
     const auto found = kernels.find(key);
     if (found != kernels.end()) return found->second;
     std::vector<std::string> names{"x", "relative"};
@@ -1088,7 +1123,7 @@ auto destination = [&](uint row) { return thread_position_in_grid.z * rows + row
 tq_nax_matmul<T, K, TOTAL, BM>(x, y, rows, n0, m0, decode, identity, destination,
     begin, min(uint(K), begin + CHUNK));
 )METAL" : "tq_nax_matmul<T, K, TOTAL, BM>(x, y, rows, n0, m0, decode, identity, identity);\n")
-    : fused_split ? R"METAL(
+    : fused_split ? std::string(R"METAL(
 threadgroup float partial[SPLITS * BM];
 #pragma unroll
 for (uint i = 0u; i < BM; ++i) {
@@ -1100,7 +1135,15 @@ threadgroup_barrier(mem_flags::mem_threadgroup);
 if (local_thread < BM) {
     float value = 0.f;
     for (uint p = 0u; p < SPLITS; ++p) value += partial[p * BM + local_thread];
+)METAL") + (gated ? R"METAL(
+    T projected = T(value), scaled = projected / T(GROUPS);
+    auto tail = 1 / (1 + metal::precise::exp(metal::abs(scaled)));
+    T gate = scaled < 0 ? tail : 1 - tail;
+    if (row < END0) low[local_thread * END0 + row] = scaled * gate;
+    else injection[local_thread * (TOTAL - END0) + row - END0] = T(2.f) * gate;
+)METAL" : R"METAL(
     y[local_thread * TOTAL + row] = T(value);
+)METAL") + R"METAL(
 }
 )METAL" : small ? std::string(R"METAL(
 float value[BM];
@@ -1122,8 +1165,8 @@ if (lane == 0) y[token * TOTAL + row] = T(value);
     if (nax) header += kTqNax;
     return kernels.emplace(key, indirect_weight_metal_kernel("mfq_cpp_tq_batch_" + std::to_string(count)
         + (select_decode ? "_select" : staging ? "_stage" : shared ? "_nax_shared" : nax ? split ? "_nax_split" : "_nax" : fused_split ? "_split_fused" : small && split ? "_split_reuse"
-            : small ? "_small" : split ? "_split" : "") + (fixed_sources ? "_fixed" : ""),
-        names, {"y"}, source, header, true, false)).first->second;
+            : small ? "_small" : split ? "_split" : "") + (fixed_sources ? "_fixed" : "") + (gated ? "_gated" : ""),
+        names, gated ? std::vector<std::string>{"low", "injection"} : std::vector<std::string>{"y"}, source, header, true, false)).first->second;
 }
 
 const fast::CustomKernelFunction& grouped_kernel(bool nax) {
@@ -1399,12 +1442,11 @@ MlxTqWeight MlxTqWeight::from_blob_impl(std::span<const std::uint8_t> blob,
         int input_columns, int experts, const array* word_pool, std::span<const std::uint64_t> expert_offsets) {
     if (blob.size() >= 8 && !std::memcmp(blob.data(), "RTQEXP01", 8))
         return from_expert_blob(blob, input_columns, experts, word_pool, expert_offsets);
-    if (blob.size() < 64 || std::memcmp(blob.data(), "RTRELL05", 8) || load_le<std::uint32_t>(blob, 8) != 5)
-        throw std::runtime_error("invalid TQ RTRELL05 header");
+    const mfq::TqLayout layout(blob.data(), blob.size());
     auto rows = load_le<std::uint32_t>(blob, 12), width = load_le<std::uint32_t>(blob, 16);
     auto columns = load_le<std::uint32_t>(blob, 20), gs = load_le<std::uint32_t>(blob, 24);
     auto packed = load_le<std::uint32_t>(blob, 28);
-    if (!rows || rows > INT_MAX || !width || width > INT_MAX || width % 256 || columns > 1
+    if (!rows || rows > INT_MAX || !width || width > INT_MAX || width % 32 || columns > 1
         || (!columns && (gs < 16 || gs > (1u << 20) || (gs & (gs - 1))))
         || experts <= 0 || rows % experts || input_columns < 0 || input_columns > int(width))
         throw std::runtime_error("invalid TQ geometry");
@@ -1419,7 +1461,7 @@ MlxTqWeight MlxTqWeight::from_blob_impl(std::span<const std::uint8_t> blob,
     for (std::size_t row = 0; row < rows; ++row) {
         auto d = load_le<std::uint64_t>(blob, 64 + row * 8);
         auto anchor = std::uint16_t(d >> 40);
-        if ((d & ~std::uint64_t(0x00FFFF07FFFFFFFF)) || std::uint32_t(d) != offset
+        if (!layout.valid_descriptor(d) || layout.offset(d) != offset
             || (anchor & 0x8000) || (anchor & 0x7c00) == 0x7c00)
             throw std::runtime_error("invalid TQ row descriptor");
         offset += std::uint64_t(width) * (((d >> 32) & 7) + 1) / 32;
@@ -1439,16 +1481,15 @@ MlxTqWeight MlxTqWeight::from_blob_impl(std::span<const std::uint8_t> blob,
         std::vector<std::uint64_t> descriptors(rows + experts);
         for (int expert = 0; expert < experts; ++expert) {
             const auto first_row = std::size_t(expert) * expert_rows;
-            const auto source_base = std::uint32_t(load_le<std::uint64_t>(blob, 64 + first_row * 8));
+            const auto source_base = layout.offset(load_le<std::uint64_t>(blob, 64 + first_row * 8));
             const auto source_end = expert + 1 == experts ? packed / 4
-                : std::uint32_t(load_le<std::uint64_t>(blob, 64 + (first_row + expert_rows) * 8));
+                : layout.offset(load_le<std::uint64_t>(blob, 64 + (first_row + expert_rows) * 8));
             const auto target = expert_offsets[expert];
             if (target > word_pool->size() || source_end - source_base > word_pool->size() - target)
                 throw std::out_of_range("TQ expert exceeds the word pool");
             for (std::size_t row = first_row; row < first_row + expert_rows; ++row) {
                 const auto descriptor = load_le<std::uint64_t>(blob, 64 + row * 8);
-                descriptors[row] = (descriptor & 0xffffffff00000000ull)
-                    | (std::uint32_t(descriptor) - source_base);
+                descriptors[row] = layout.rebase(descriptor, layout.offset(descriptor) - source_base);
             }
             descriptors[rows + expert] = target;
         }
@@ -1511,6 +1552,7 @@ MlxTqWeight MlxTqWeight::concatenate(const std::vector<MlxTqWeight>& weights, bo
     auto descriptors = array(allocator::malloc(rows * 8), Shape{int(rows)}, uint64);
     auto scales = first.columns_ ? first.scales_
         : array(allocator::malloc(scale_bytes), Shape{int(scale_count)}, first.scales_.dtype());
+    mfq::TqLayout layout; layout.compact = first.width_ % 256 != 0;
     auto* target_desc = descriptors.data<std::uint64_t>();
     std::size_t word_base = 0, row_base = 0, projection_base = 0;
     for (std::size_t p = 0; p < weights.size(); ++p) {
@@ -1525,8 +1567,7 @@ MlxTqWeight MlxTqWeight::concatenate(const std::vector<MlxTqWeight>& weights, bo
             const std::size_t to = projections
                 ? std::size_t(e) * outputs + projection_base : row_base;
             for (int r = 0; r < block_rows; ++r)
-                target_desc[to + r] = (source[from + r] & 0xffffffff00000000ull)
-                    | (std::uint32_t(source[from + r]) + std::uint32_t(word_base));
+                target_desc[to + r] = layout.rebase(source[from + r], std::uint64_t(layout.offset(source[from + r])) + word_base);
             if (!first.columns_) std::memcpy(scales.data<std::uint8_t>() + to * scale_stride,
                 weight.scales_.data<std::uint8_t>() + from * scale_stride, block_rows * scale_stride);
         }
@@ -1561,7 +1602,8 @@ array MlxTqWeight::project_column_inputs(const array& input, const array& ids,
         return column_pair_kernel()({words_, descriptors_, up->words_, up->descriptors_, relative_table(),
                 prepared[0], prepared[1], canonical, array({limit}), scales_}, {Shape{tokens, routes, output_size()}}, {float16},
             {((output_size() + 3) / 4) * 128, total, 1}, {128, 1, 1},
-            {{"K", input_columns_}, {"OUT", output_size()}, {"EXPERTS", experts_}, {"GELU", gelu},
+            {{"K", input_columns_}, {"WIDTH_G", width_}, {"WIDTH_U", up->width_},
+             {"OUT", output_size()}, {"EXPERTS", experts_}, {"GELU", gelu},
              {"POOLED_G", pool_kind(pooled_,words_)}, {"POOLED_U", pool_kind(up->pooled_,up->words_)}, {"PREPARE_DOWN", false},
              {"DOWN_COLUMN", 0}, {"DOWN_WIDTH", 0}}, std::nullopt, false, {}).front();
     }
@@ -1592,7 +1634,17 @@ std::vector<array> MlxTqWeight::prepare_column_pair_inputs(const MlxTqWeight& up
          {"ROUTES", routes}, {"SHARED_INPUT", source.shape(0) == tokens}}, std::nullopt, false, {});
 }
 
-std::vector<array> MlxTqWeight::matmul_many_impl(std::span<const MlxTqWeight> weights, const array& input) {
+std::optional<std::vector<array>> MlxTqWeight::gated_projections(const MlxTqWeight& injection,
+    const array& input, int groups) const {
+    if (groups < 2 || injection.output_size() != groups || input_size() != injection.input_size())
+        throw std::invalid_argument("TQ gated projection geometry differs");
+    const std::array weights{*this, injection};
+    auto values = matmul_many_impl(weights, input, groups);
+    if (values.empty()) return std::nullopt;
+    return values;
+}
+
+std::vector<array> MlxTqWeight::matmul_many_impl(std::span<const MlxTqWeight> weights, const array& input, int gated_groups) {
     if (weights.empty() || weights.size() > 8 || input.ndim() == 0 || input.size() == 0
         || input.shape(-1) != weights.front().input_size())
         throw std::invalid_argument("invalid TQ projection batch");
@@ -1606,6 +1658,9 @@ std::vector<array> MlxTqWeight::matmul_many_impl(std::span<const MlxTqWeight> we
     std::int64_t output_sum = 0;
     for (const auto& weight : weights) output_sum += weight.output_size();
     if (output_sum > INT_MAX) throw std::invalid_argument("TQ projection batch is too large");
+    const bool fused_split = input.dtype() == float16 && tokens <= 6 && width >= 2048
+        && output_sum >= 256 && output_sum * 4 < width && (tokens > 1 || output_sum <= 1024);
+    if (gated_groups && !fused_split) return {};
     const bool column_batch = weights.size() > 1 && tokens == 1 && input.dtype() == float16
         && output_sum >= 1024 && output_sum * 4 >= width
         && output_sum <= INT_MAX / 16 - 7
@@ -1631,6 +1686,7 @@ std::vector<array> MlxTqWeight::matmul_many_impl(std::span<const MlxTqWeight> we
             total += weight.output_size();
             templates.emplace_back("END" + suffix, total);
             templates.emplace_back("POOLED" + suffix, pool_kind(weight.pooled_,weight.words_));
+            templates.emplace_back("WIDTH" + suffix, weight.width_);
         }
         record_dispatch(input, total, 1, "dense_column_inputs");
         auto values = column_batch_kernel(weights.size(), false)(inputs, {Shape{1, total}}, {float16},
@@ -1647,8 +1703,6 @@ std::vector<array> MlxTqWeight::matmul_many_impl(std::span<const MlxTqWeight> we
     }
     const bool staging = stage_weights(input, output_sum);
     const auto dtype = input.dtype();
-    const bool fused_split = dtype == float16 && tokens <= 6 && width >= 2048
-        && output_sum >= 256 && output_sum * 4 < width && (tokens > 1 || output_sum <= 1024);
     const int split_rows = staging ? 1 : fused_split ? tokens : split_batch_rows(tokens, output_sum, width);
     int splits = staging ? 1 : split_count(tokens, output_sum, width, split_rows, fused_split);
     const bool nax = use_nax(input) && splits == 1;
@@ -1709,6 +1763,14 @@ std::vector<array> MlxTqWeight::matmul_many_impl(std::span<const MlxTqWeight> we
                 && weight.group_size_ == first.group_size_ && weight.scales_.dtype() == first.scales_.dtype()
                 && weight.words_.size() >= 8 && weight.descriptors_.size() >= 8 && weight.scales_.size() >= 8;
         });
+    if (gated_groups) {
+        templates.emplace_back("GROUPS", gated_groups);
+        auto low_shape = input.shape(), injection_shape = input.shape();
+        low_shape.back() = weights[0].output_size(); injection_shape.back() = weights[1].output_size();
+        return batch_kernel(weights.size(), mode, false, fixed_sources, true)(inputs,
+            {low_shape, injection_shape}, {dtype, dtype}, {total * threads, 1, 1}, {threads, 1, 1},
+            std::move(templates), std::nullopt, false, {});
+    }
     auto values = batch_kernel(weights.size(), mode, select_decode, fixed_sources)(inputs,
         {staging ? Shape{total, width} : splits > 1 && !fused_split ? Shape{splits, tokens, total} : Shape{tokens, total}},
         {staging ? (dtype == float16 ? float16 : float32) : splits > 1 && !fused_split ? float32 : dtype},
@@ -1872,7 +1934,7 @@ array MlxTqWeight::project(const array& input, const array& ids,
         if (up && !split && ((nax && block_rows == 128) || (!nax && input_columns_ >= 1024))) {
             record_dispatch(input, out, experts_, nax ? "routed_pair_shared_nax" : "routed_pair_simd");
             const int tile_columns = nax ? 64 : 32;
-            return routed_pair_matmul_kernel()({words_, descriptors_, scales_, u.words_, u.descriptors_, u.scales_,
+            return routed_pair_matmul_kernel(nax)({words_, descriptors_, scales_, u.words_, u.descriptors_, u.scales_,
                 relative_table(), contiguous(reshape(input, {-1, input_columns_})), contiguous(order),
                 plan.block_meta, plan.block_count, array({limit})},
                 {Shape{tokens, routes, out}}, {dtype},
@@ -2043,7 +2105,7 @@ std::optional<array> make_tq_reuse_plan(const array& ids, int experts) {
     if (ids.ndim() != 2 || ids.shape(0) < 1 || ids.shape(1) < 1 || experts < 1
         || (ids.dtype() != int32 && ids.dtype() != uint32))
         throw std::invalid_argument("invalid TQ route reuse geometry");
-    if (ids.shape(0) < 3 || ids.shape(0) > 16 || ids.size() > 512) return std::nullopt;
+    if (ids.shape(0) < 2 || ids.shape(0) > 16 || ids.size() > 512) return std::nullopt;
     static const auto kernel = indirect_weight_metal_kernel("tyloinfer_tq_device_reuse_plan", {"ids"}, {"plan"}, R"METAL(
 uint index = thread_position_in_grid.x, total = uint(ids_shape[0]);
 if (index >= total) return;
@@ -2222,7 +2284,8 @@ MlxTqFfnIntermediate MlxTqWeight::swiglu_for_down(const MlxTqWeight& up, const M
                 prepared[0], prepared[1], canonical, array({limit}), down.scales_},
             {Shape{1, ids.shape(1), output_size()}}, {float32},
             {((output_size() + 3) / 4) * 128, ids.shape(1), 1}, {128, 1, 1},
-            {{"K", input_columns_}, {"OUT", output_size()}, {"EXPERTS", experts_}, {"GELU", gelu},
+            {{"K", input_columns_}, {"WIDTH_G", width_}, {"WIDTH_U", up.width_},
+             {"OUT", output_size()}, {"EXPERTS", experts_}, {"GELU", gelu},
              {"POOLED_G", pool_kind(pooled_,words_)}, {"POOLED_U", pool_kind(up.pooled_,up.words_)}, {"PREPARE_DOWN", true},
              {"DOWN_COLUMN", down.columns_}, {"DOWN_WIDTH", down.width_}}, std::nullopt, false, {}).front();
         return {std::move(values), true};
