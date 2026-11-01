@@ -64,19 +64,19 @@ export const modelsApi = {
     return request('/api/v1/hub/download-sources/probe', { method: 'POST', body: JSON.stringify({ sources }), signal });
   },
   /** 列出模型资产；refresh 为真时要求服务重新扫描。 */
-  async modelArtifacts(refresh = false): Promise<ModelArtifact[]> {
+  async modelArtifacts(refresh = false, includeComponents = false): Promise<ModelArtifact[]> {
     return (
-      await request<{ data: ModelArtifact[] }>(`/api/v1/models${refresh ? '?refresh=true' : ''}`)
+      await request<{ data: ModelArtifact[] }>(`/api/v1/models${refresh || includeComponents ? `?${new URLSearchParams({ ...(refresh ? { refresh: 'true' } : {}), ...(includeComponents ? { include_components: 'true' } : {}) })}` : ''}`)
     ).data;
   },
 
   /** 浏览服务端模型目录，优先使用目录标识，其次使用完整路径。 */
-  modelDirectories(directoryId?: string | null, path?: string | null): Promise<ModelDirectoryList> {
+  modelDirectories(directoryId?: string | null, path?: string | null, signal?: AbortSignal): Promise<ModelDirectoryList> {
     const query = new URLSearchParams();
     if (directoryId) query.set('directory_id', directoryId);
     else if (path?.trim()) query.set('path', path.trim());
     const suffix = query.size ? `?${query.toString()}` : '';
-    return request(`/api/v1/models/directories${suffix}`);
+    return request(`/api/v1/models/directories${suffix}`, { signal });
   },
 
   modelArtifactDirectory(modelId: string): Promise<ModelDirectoryList> {

@@ -215,6 +215,10 @@ export const runtimeApi = {
     return (await request<{ data: RuntimeInstance[] }>('/api/v1/runtime/instances')).data;
   },
 
+  configureInstance(instanceId: string, policy: { pinned: boolean; idle_ttl_seconds: number | null }): Promise<RuntimeInstance> {
+    return request(`/api/v1/runtime/instances/${encodeURIComponent(instanceId)}`, { method: 'PATCH', body: JSON.stringify(policy) });
+  },
+
 
   /** 获取运行指标快照历史，供概览趋势展示。 */
   async runtimeMetrics(limit = 200, signal?: AbortSignal, since?: string): Promise<RuntimeMetricSnapshot[]> {
