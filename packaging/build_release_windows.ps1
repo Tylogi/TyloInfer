@@ -269,6 +269,7 @@ function New-BuildContext {
         StudioDirectory = Join-Path $projectDirectory 'TyloInferStudio'
         NativeBuildDirectory = Join-Path $ScriptDirectory "build/native-server/$buildId"
         ServerStageDirectory = Join-Path $ScriptDirectory "build/stage/$buildId/tyloinfer-server"
+        TemporaryDirectory = Join-Path $ScriptDirectory "build/tmp/$buildId"
         ServerDirectory = Join-Path $resourceDirectory 'tyloinfer-server'
         ResourceDirectory = $resourceDirectory
         TargetTriple = 'x86_64-pc-windows-msvc'
@@ -420,8 +421,10 @@ function Initialize-ReleaseDirectories {
 
     New-Item -ItemType Directory -Force -Path @(
         $Context.NativeBuildDirectory, $Context.ServerStageDirectory,
-        $Context.ResourceDirectory, $Context.OutputDirectory
+        $Context.ResourceDirectory, $Context.OutputDirectory, $Context.TemporaryDirectory
     ) | Out-Null
+    $env:TEMP = $Context.TemporaryDirectory
+    $env:TMP = $Context.TemporaryDirectory
 
     if ([string]::IsNullOrWhiteSpace($env:npm_config_cache)) {
         $env:npm_config_cache = Join-Path $Context.ScriptDirectory 'build/npm-cache'
