@@ -72,7 +72,7 @@ pub fn command(
     }
     #[cfg(windows)]
     {
-
+        // Keep the native server and its DLLs together while preserving the development toolchain search paths.
         let directory = executable.parent().ok_or("Native server executable has no parent directory")?;
         let mut paths = vec![directory.to_path_buf()];
         if let Some(existing) = std::env::var_os("PATH") {

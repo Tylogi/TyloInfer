@@ -8,7 +8,7 @@ import { useJobStore } from '../../stores/jobStore';
 import { serverCapabilities } from '../../app/serverCapabilities';
 
 it('resolves a native repository and submits a download without catalog, search or reuse requests', async () => {
-
+  // Use the minimal native repository fields without assuming recommendation or memory analysis support.
   const info = {
     provider: 'huggingface', repo_id: 'owner/native', revision: 'main', source_url: 'https://huggingface.co/owner/native',
     downloads: null, likes: null, total_bytes: 42, files: [{ name: 'Engram/native.tq', byte_size: 42 }],

@@ -6,7 +6,7 @@ foreach(required SERVER DESTINATION DUMPBIN)
     endif()
 endforeach()
 
-
+# Resolve PE imports recursively after building to avoid bundling the development environment or Python DLLs.
 set(CMAKE_GET_RUNTIME_DEPENDENCIES_PLATFORM windows+pe)
 set(CMAKE_GET_RUNTIME_DEPENDENCIES_TOOL dumpbin)
 set(CMAKE_GET_RUNTIME_DEPENDENCIES_COMMAND "${DUMPBIN}")
@@ -44,7 +44,7 @@ if(unresolved)
 endif()
 foreach(name IN LISTS conflicts_FILENAMES)
     string(TOLOWER "${name}" lower_name)
-
+    # Development library directories may contain older CRTs; use the staged VS redistributable consistently.
     if(NOT lower_name MATCHES "^(vcruntime|msvcp|concrt|vcomp)[0-9][a-z0-9_]*\\.dll$"
             OR NOT EXISTS "${DESTINATION}/${name}")
         message(FATAL_ERROR "Conflicting native runtime dependency ${name}: ${conflicts_${name}}")
@@ -58,7 +58,7 @@ foreach(library IN LISTS resolved)
     endif()
     file(COPY_FILE "${library}" "${DESTINATION}/${name}" ONLY_IF_DIFFERENT)
 endforeach()
-
+# Resolve final imports only from the server directory and system libraries so development paths cannot hide missing transitive dependencies.
 file(GLOB staged_libraries "${DESTINATION}/*.dll")
 file(GET_RUNTIME_DEPENDENCIES
     EXECUTABLES "${SERVER}"

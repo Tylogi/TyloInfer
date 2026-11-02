@@ -756,7 +756,7 @@ void directory_browsing() {
     CHECK(!busy_id.empty() && !visible_id.empty());
     {
 #ifdef _WIN32
-
+        // Simulate access denial by changing only the temporary subdirectory's ACL, then restore it on scope exit.
         struct Unavailable {
             fs::path path;
             std::vector<BYTE> saved;

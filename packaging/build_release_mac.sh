@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-
+# Prepare native macOS resources only; block inference releases until the server integrates the Metal engine.
 set -euo pipefail
 
 mfq_script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -28,7 +28,7 @@ done
 [[ -x "${mfq_venv_dir}/bin/python" ]] || fail "set TYLOINFER_RELEASE_VENV to an existing build-only Python environment with MLX"
 xcrun --find metal >/dev/null 2>&1 || fail "Xcode Metal Toolchain is required"
 xcrun --find metallib >/dev/null 2>&1 || fail "Xcode Metal Toolchain is required"
-
+# Refuse to overwrite existing mapped resources to avoid mixing in older Python or different-architecture artifacts.
 for mfq_destination in "${mfq_server_dir}" "${mfq_framework_dir}" "${mfq_resource_dir}/mfq-metal"; do
   [[ ! -e "${mfq_destination}" ]] || fail "preserve or manually remove existing resources before preparation: ${mfq_destination}"
 done

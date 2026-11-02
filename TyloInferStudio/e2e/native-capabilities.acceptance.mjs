@@ -5,7 +5,7 @@ import { resolve } from 'node:path';
 import { once } from 'node:events';
 import { chromium } from '@playwright/test';
 
-
+// Require a dedicated build and create fresh data and evidence directories for each run, without connecting to user services.
 const [serverPath, webPath, evidenceRoot] = process.argv.slice(2);
 assert(serverPath && webPath && evidenceRoot, 'Usage: node e2e/native-capabilities.acceptance.mjs SERVER WEB_ROOT EVIDENCE_ROOT');
 await mkdir(resolve(evidenceRoot), { recursive: true });
@@ -100,13 +100,13 @@ try {
   });
   assert.deepEqual(await page.evaluate(() => window.cspViolations), []);
   report.checks.push('GitHub version check is not blocked by the local CSP');
-
+  // CSP should block the disallowed origin before any network request is sent.
   await page.evaluate(async () => { await fetch('https://example.invalid/csp-probe').catch(() => {}); });
   await page.waitForFunction(() => window.cspViolations.some(event => event.blockedURI === 'https://example.invalid/csp-probe'));
   report.checks.push('An unrelated external HTTP origin remains blocked by CSP');
   await page.screenshot({ path: resolve(output, 'versions.png') });
 
-
+  // Verify cross-origin navigation through another hostname for the same isolated service, without starting or probing user services.
   await page.goto(`${baseURL}/runtime`);
   await page.getByRole('combobox', { name: 'Service connection', exact: true }).selectOption('remote');
   const remote = page.getByRole('textbox', { name: 'Remote endpoint', exact: true });

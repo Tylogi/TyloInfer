@@ -577,8 +577,8 @@ void early_target_prefetch() {
         Tensor target_forward(Tensor ids,Tensor* raw=nullptr,int64_t confirmed=0) {
             events->push_back('t');
             auto result=Ops::target_forward(ids,raw,confirmed);
-
-
+            // Windows sleep granularity may give 1 ms and 12 ms delays the same cost.
+            // Separate verification costs enough to reliably exercise the regular decoding branch.
             if(size(ids,1)>1)std::this_thread::sleep_for(std::chrono::milliseconds(100));
             return result;
         }

@@ -46,7 +46,7 @@ public:
         environment["PATH"] = "";
 #endif
 #ifdef _WIN32
-
+        // Windows resolves shared libraries through PATH, so development builds must inherit dependency DLL paths.
         const auto quote = [](const std::wstring& argument) {
             std::wstring result = L"\"";
             std::size_t slashes = 0;

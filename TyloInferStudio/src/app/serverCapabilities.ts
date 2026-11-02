@@ -1,6 +1,6 @@
 import type { RuntimeStatus } from '../shared/api/types';
 
-
+// Derive native capabilities from registered routes; model architecture declarations do not imply server support.
 const nativeCapabilities = {
   agent: false,
   resources: false,
