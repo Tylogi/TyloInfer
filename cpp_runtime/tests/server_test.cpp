@@ -2,8 +2,11 @@
 #include "nlohmann/json.hpp"
 #include "schema.h"
 #include "server_test_process.h"
+#include "mfq_paged_prefix_cache.h"
 
 #include <sqlite3.h>
+#include <cstring>
+#include <fstream>
 #include <functional>
 #include <future>
 #include <iostream>
@@ -254,6 +257,91 @@ public:
 private:
     socket_t socket_ = INVALID_SOCKET;
 };
+
+void prefix_cache() {
+    Fixture f;
+    auto server = f.start({}, root_environment);
+    const auto wait_job = [&](const json& accepted) {
+        for (int attempt = 0; attempt < 500; ++attempt) {
+            const auto job = server.get("/api/jobs/" + accepted.at("operation_id").get<std::string>(), admin).document();
+            if (job.at("status") != "queued" && job.at("status") != "running") return job;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        throw std::runtime_error("memory policy job did not finish");
+    };
+    // Synthesize the engine's on-disk layout: one namespace, a two-block complete chain, one token sidecar.
+    const fs::path root = fs::temp_directory_path() / ("tyloinfer-prefix-test-" + std::to_string(std::random_device{}()));
+    const std::string space(64, '1'), parent(64, '2'), child(64, '3');
+    const auto bytes_of = [](const std::string& hex) {
+        std::string raw(hex.size() / 2, '\0');
+        for (std::size_t index = 0; index < raw.size(); ++index)
+            raw[index] = static_cast<char>(std::stoul(hex.substr(index * 2, 2), nullptr, 16));
+        return raw;
+    };
+    const auto block_file = [&](const std::string& digest, const std::string& parent_digest, std::uint32_t tokens, std::uint32_t size) {
+        const fs::path path = root / space / digest.substr(0, 2) / (digest + ".tqkv");
+        fs::create_directories(path.parent_path());
+        std::string raw(156, '\0');
+        std::memcpy(raw.data(), "MFQKVB1\0", 8);
+        std::uint32_t version = 1;
+        std::memcpy(raw.data() + 8, &version, 4);
+        std::memcpy(raw.data() + 12, bytes_of(space).data(), 32);
+        std::memcpy(raw.data() + 44, bytes_of(digest).data(), 32);
+        std::memcpy(raw.data() + 76, bytes_of(parent_digest).data(), 32);
+        std::memcpy(raw.data() + 108, &size, 4);
+        std::memcpy(raw.data() + 112, &tokens, 4);
+        const std::uint64_t payload = 8;
+        std::memcpy(raw.data() + 116, &payload, 8);
+        std::ofstream(path, std::ios::binary) << raw << std::string(8, '\x7f');
+        return path;
+    };
+    const fs::path parent_block = block_file(parent, std::string(64, '0'), 2, 4);
+    const fs::path child_block = block_file(child, parent, 2, 4);
+    {
+        const std::int64_t tokens[2] = {72, 101};
+        const std::string payload(reinterpret_cast<const char*>(tokens), sizeof tokens);
+        std::string raw(108, '\0');
+        std::memcpy(raw.data(), "MFQTXT1\0", 8);
+        std::memcpy(raw.data() + 8, bytes_of(space).data(), 32);
+        std::memcpy(raw.data() + 40, bytes_of(child).data(), 32);
+        const std::uint32_t count = 2;
+        std::memcpy(raw.data() + 72, &count, 4);
+        const auto checksum = mfq::cache::sha256(payload);
+        std::memcpy(raw.data() + 76, checksum.data(), 32);
+        std::ofstream(fs::path(child_block) += ".tokens", std::ios::binary) << raw << payload;
+        std::ofstream(root / space / "identity.txt") << "mfq-cache-identity-v1\nnamespace=" << space
+            << "\narchitecture=test\ncodec=test\ncontext=4096\nmodel_path=/nonexistent/model\nsource=0:test-model:0:0\n";
+    }
+    const auto accepted = server.send("PUT", "/api/runtime/memory-policy", {{"prefix_directory", root.string()}}, admin);
+    CHECK(accepted.status == 202 && wait_job(accepted.document()).at("status") == "succeeded");
+
+    const auto summary = server.get("/api/runtime/cache/entries", admin).document();
+    CHECK(summary.at("total_blocks") == 2 && summary.at("data").size() == 1 && summary.at("can_clear").get<bool>());
+    const auto& group = summary.at("data").at(0);
+    CHECK(group.at("id") == space && group.at("blocks") == 2 && group.at("prefixes") == 1 &&
+        group.at("text_blocks") == 1 && group.at("max_prefix_tokens") == 4 && group.at("incomplete_prefixes") == 0 &&
+        group.at("architecture") == "test" && group.at("context_size") == 4096);
+    const auto detail = server.get("/api/runtime/cache/entries?namespace=" + space + "&chain_filter=complete&sort=length", admin).document();
+    CHECK(detail.at("matched_blocks") == 2 && detail.at("blocks").size() == 2);
+    CHECK(detail.at("blocks").at(0).at("id") == child && detail.at("blocks").at(0).at("prefix_tokens") == 4 &&
+        detail.at("blocks").at(1).at("id") == parent);
+    const auto missing_text = server.get("/api/runtime/cache/entries?namespace=" + space + "&text_filter=missing", admin).document();
+    CHECK(missing_text.at("matched_blocks") == 1 && missing_text.at("blocks").at(0).at("id") == parent);
+    // The text decoder needs the model that wrote the cache; the synthetic identity has none.
+    const auto text = server.get("/api/runtime/cache/entries/" + space + "/" + child + "/text", admin).document();
+    CHECK(text.at("available") == false && text.at("reason") == "tokenizer_unavailable");
+    CHECK(server.get("/api/runtime/cache/entries?namespace=zz", admin).status == 400);
+
+    CHECK(server.send("POST", "/api/runtime/cache/clear", json::object(), admin).status == 503);
+    CHECK(server.send("POST", "/api/runtime/cache/trim", {{"target_bytes", 0}}, admin).status == 503);
+    CHECK(server.send("POST", "/api/runtime/cache/trim", {{"target_bytes", -1}}, admin).status == 400);
+    const auto purged = server.send("POST", "/api/runtime/cache/purge", {{"namespace", space}}, admin);
+    CHECK(purged.status == 200 && purged.document().at("removed_blocks") == 2);
+    CHECK(server.get("/api/runtime/cache/entries", admin).document().at("total_blocks") == 0);
+    CHECK(server.send("POST", "/api/runtime/cache/purge", {{"namespace", space}}, admin).status == 404);
+    fs::remove_all(root);
+    server.stop();
+}
 
 void media_uploads() {
     Fixture f;
@@ -1514,6 +1602,7 @@ int run_tests(const fs::path& server, const std::string& selection) {
         {"CLI and lifetime", cli_and_lifetime}, {"locks and ports", locks_and_ports}, {"static files", static_files},
         {"policy and protocols", policy_and_protocols}, {"keys and network", keys_and_network},
         {"media uploads", media_uploads},
+        {"prefix cache", prefix_cache},
         {"runtime observation", runtime_observation},
         {"runtime policies", runtime_policies},
         {"runtime profiles", runtime_profiles},

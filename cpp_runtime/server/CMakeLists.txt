@@ -31,8 +31,8 @@ configure_file(storage/schema.h.in generated/schema.h @ONLY)
 add_library(tyloinfer-server-core STATIC server.cpp instance.cpp api/inference.cpp api/anthropic.cpp api/models.cpp
     api/artifacts.cpp
     auth/auth.cpp auth/keys.cpp api/auth.cpp storage/storage.cpp storage/files.cpp models/catalog.cpp models/instances.cpp models/aliases.cpp
-    models/analysis.cpp models/deletion.cpp models/policies.cpp models/profiles.cpp
-    jobs/jobs.cpp api/jobs.cpp sessions/sessions.cpp api/sessions.cpp media/media.cpp api/media.cpp hub/hub.cpp hub/fetch.cpp api/hub.cpp api/runtime.cpp api/runtime_config.cpp)
+    models/analysis.cpp models/deletion.cpp models/policies.cpp models/profiles.cpp cache/prefix.cpp
+    jobs/jobs.cpp api/jobs.cpp sessions/sessions.cpp api/sessions.cpp media/media.cpp api/media.cpp hub/hub.cpp hub/fetch.cpp api/hub.cpp api/runtime.cpp api/runtime_config.cpp api/runtime_cache.cpp)
 target_include_directories(tyloinfer-server-core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
 target_link_libraries(tyloinfer-server-core PUBLIC mfq-http mfq-protocol mfq-paged-prefix-cache mfq-model-source SQLite::SQLite3)
 target_link_libraries(tyloinfer-server-core PRIVATE CURL::libcurl OpenSSL::Crypto)
@@ -101,7 +101,7 @@ if(BUILD_TESTING)
     add_executable(tyloinfer-server-test ../tests/server_test.cpp)
     target_include_directories(tyloinfer-server-test PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
     target_compile_definitions(tyloinfer-server-test PRIVATE TYLOINFER_SERVER_SCHEMA_FILE="${_schema_file}")
-    target_link_libraries(tyloinfer-server-test PRIVATE mfq-http mfq-json SQLite::SQLite3)
+    target_link_libraries(tyloinfer-server-test PRIVATE mfq-http mfq-json mfq-paged-prefix-cache SQLite::SQLite3)
     if(WIN32)
         target_link_libraries(tyloinfer-server-test PRIVATE advapi32)
     endif()

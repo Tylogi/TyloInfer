@@ -205,6 +205,11 @@ HTTP 层共 4 个工作线程。流式请求（`/v1/chat/completions`、`/v1/mes
 | `PUT` | `/api/runtime/inference-policy` | `InferencePolicy` | `200 InferencePolicy` | `admin` |
 | `GET` | `/api/runtime/memory-policy` | — | `200 MemoryPolicy` | `inference` |
 | `PUT` | `/api/runtime/memory-policy` | `MemoryPolicy` | `202 OperationAccepted` | `admin` |
+| `GET` | `/api/runtime/cache/entries` | `?namespace&offset&limit&query&search_in&text_filter&chain_filter&sort` | `200 CacheEntries` | `admin` |
+| `GET` | `/api/runtime/cache/entries/{namespace}/{block}/text` | `?offset&limit` | `200 CacheBlockText` | `admin` |
+| `POST` | `/api/runtime/cache/purge` | `{"namespace":String\|null}` | `200 Purged` | `admin` |
+| `POST` | `/api/runtime/cache/clear` | `{"instance_id":UUID\|null}` | `200 Cleared` | `models` |
+| `POST` | `/api/runtime/cache/trim` | `{"target_bytes":Int,"instance_id":UUID\|null}` | `200 Trimmed` | `models` |
 
 ### 2.3 任务
 
@@ -625,6 +630,24 @@ Anthropic 协议，端口启动时确定，没有可在线改动的托管 listen
 `protocol`（`openai`\|`anthropic`），校验通过后返回
 `409 listener_not_managed`，`message` 为
 `server listener is managed externally`。
+
+### 3.9 前缀缓存
+
+`GET /api/runtime/cache/entries` 直接扫描引擎写在磁盘上的前缀缓存
+（MFQKVB1 块文件、`.tokens` 令牌边车、`identity.txt`），目录取
+`MemoryPolicy.prefix_directory`，未设置时取 `TYLOINFER_RUNTIME_PREFIX_CACHE_DIR`
+或引擎默认目录，与引擎写入的是同一份。响应含目录级汇总（`data`：
+每个命名空间的块数/前缀数/字节数/最长完整链/最近使用时间）和
+`namespace` 过滤时的块级明细（`blocks`，支持 `query`+`search_in`、
+`text_filter`、`chain_filter`、`sort` 分页）。文本搜索与
+`GET /api/runtime/cache/entries/{namespace}/{block}/text` 需要写出该缓存的
+模型 tokenizer；模型已不在目录中时诚实返回 `tokenizer_unavailable`。
+`POST /api/runtime/cache/purge` 删除块文件（可指定命名空间，不存在时
+`404 cache_not_found`），随后刷新已加载实例的引擎索引；实例有排队或运行中
+请求时 `409 runtime_busy`。`POST /api/runtime/cache/clear` 与 `trim` 直接作用
+于进程内引擎的会话缓存（无已加载实例时 `503 model_not_loaded`），返回释放的
+快照数/字节数与实例会话指标。Python 侧的 `image_decode_cache_released_bytes`
+字段没有原生对应（shortcut: 原生图像解码缓存在引擎内部，无独立释放接缝）。
 
 ## 4. 任务与事件
 
