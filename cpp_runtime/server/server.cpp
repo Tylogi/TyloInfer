@@ -9,6 +9,7 @@
 #include "api/runtime.h"
 #include "api/runtime_config.h"
 #include "api/runtime_cache.h"
+#include "api/runtime_control.h"
 #include "api/jobs.h"
 #include "api/hub.h"
 #include "hub/hub.h"
@@ -21,6 +22,7 @@
 #include "models/policies.h"
 #include "models/profiles.h"
 #include "cache/prefix.h"
+#include "models/components.h"
 #include "models/errors.h"
 
 #include "httplib.h"
@@ -228,6 +230,7 @@ int run(const Config& config, const std::atomic<bool>& stop_requested, EngineFac
     RuntimePolicies policies(storage);
     RuntimeProfiles profiles(storage, models);
     PrefixCache prefix_cache(storage, models, instances);
+    VoiceOutput voice(config.data_dir);
     Media media(storage, data_dir / "media");
     Sessions sessions(storage, instances, media);
     Jobs jobs(storage, [](std::exception_ptr exception) { return describe_failure(exception).detail; });
@@ -341,6 +344,7 @@ int run(const Config& config, const std::atomic<bool>& stop_requested, EngineFac
     register_runtime(http, instances);
     register_runtime_config(http, policies, profiles, instances, jobs, config.host, listener_port);
     register_runtime_cache(http, instances, prefix_cache);
+    register_runtime_control(http, instances, models, policies, jobs, voice);
     register_jobs(http, jobs, streams);
     register_hub(http, hub, models, jobs, backend);
     register_inference(http, instances, streams);

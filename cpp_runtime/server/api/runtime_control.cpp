@@ -6,6 +6,7 @@
 #include "models/errors.h"
 #include "models/instances.h"
 #include "models/policies.h"
+#include "models/components.h"
 #include "jobs/jobs.h"
 #include "tyloinfer/model_source.h"
 
@@ -70,7 +71,7 @@ std::int64_t default_context(const ModelCatalog::Artifact& artifact, const json&
 } // namespace
 
 void register_runtime_control(httplib::Server& http, ModelInstances& instances,
-        ModelCatalog& catalog, RuntimePolicies& policies, Jobs& jobs) {
+        ModelCatalog& catalog, RuntimePolicies& policies, Jobs& jobs, VoiceOutput& voice) {
     // shortcut: the native engine reloads a context size only; yarn and KV reconfiguration are rejected
     // honestly until the engine grows those seams, and the reload never persists into model_overrides.
     const auto reload_target = [&](const json& body) {
@@ -117,6 +118,22 @@ void register_runtime_control(httplib::Server& http, ModelInstances& instances,
     });
     http.Post("/api/runtime/reload", [&](const httplib::Request& request, httplib::Response& response) {
         set_json(response, reload_target(parse_json(request)));
+    });
+    http.Get("/api/components/voice-output", [&](const httplib::Request&, httplib::Response& response) {
+        set_json(response, voice.status());
+    });
+    http.Post("/api/components/voice-output/install", [&](const httplib::Request&, httplib::Response& response) {
+        const auto operation = jobs.submit("component.voice_output.install", json::object(),
+            [&voice](const Jobs::Control& control) {
+                return voice.install([&](double value, const std::string& message) { control.progress(message, value); },
+                    [&] { return control.cancelled.load(); });
+            });
+        set_json(response, {{"operation_id", operation}, {"status", "accepted"}}, 202);
+    });
+    http.Post("/api/components/voice-output/activate", [&](const httplib::Request&, httplib::Response&) {
+        // shortcut: activation flips the realtime duplex path on the Python runtime pool; the native
+        // engine has no such seam yet, so this answers Python's not-managed error.
+        throw ApiError(501, "model_management_unavailable", "managed model runtime is not available");
     });
     http.Get("/api/runtime/yarn/([0-9a-fA-F-]{36})", [&](const httplib::Request& request, httplib::Response& response) {
         const auto items = instances.list();
