@@ -201,11 +201,4 @@ export const modelsApi = {
     );
   },
 
-
-  removeWorkspaceArtifact(uri: string): Promise<Record<string, unknown>> {
-    return request('/api/artifacts/remove', {
-      method: 'POST',
-      body: JSON.stringify({ artifact_uri: uri }),
-    });
-  },
 };

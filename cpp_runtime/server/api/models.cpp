@@ -2,6 +2,8 @@
 #include "http.h"
 #include "instance_json.h"
 #include "models/instances.h"
+#include "models/analysis.h"
+#include "models/deletion.h"
 #include "models/errors.h"
 #include "models/policies.h"
 #include "jobs/jobs.h"
@@ -58,6 +60,19 @@ std::int64_t integer(const json& request, const char* field, std::int64_t fallba
     if (!value.is_number_integer() || value < minimum || value > maximum)
         throw ApiError(400, "invalid_request", std::string(field) + " is outside its supported range");
     return value.get<std::int64_t>();
+}
+
+bool boolean_query(const httplib::Request& request, const char* name) {
+    const auto value = request.get_param_value(name);
+    if (request.has_param(name) && value != "true" && value != "false" && value != "1" && value != "0")
+        throw ApiError(400, "invalid_request", std::string(name) + " must be a boolean");
+    return value == "true" || value == "1";
+}
+
+void valid_token(const std::string& token) {
+    if (token.size() != 64 || !std::all_of(token.begin(), token.end(),
+            [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); }))
+        throw ApiError(400, "invalid_request", "token must be a SHA-256 hexadecimal digest");
 }
 } // namespace
 
@@ -208,6 +223,35 @@ void models_unload(const Services& services, const httplib::Request& request, ht
     });
     response.set_header("Location", "/api/jobs/" + operation);
     set_json(response, {{"operation_id", operation}, {"status", "accepted"}}, 202);
+}
+
+void model_analysis(const Services& services, const httplib::Request& request, httplib::Response& response) {
+    set_json(response, checkpoint_analysis_json(services.catalog.resolve(request.matches[1]), services.backend == "cuda"));
+}
+
+void model_cache_profile(const Services& services, const httplib::Request& request, httplib::Response& response) {
+    set_json(response, model_cache_profile_json(services.catalog.resolve(request.matches[1]),
+        boolean_query(request, "include_recurrent"), services.backend == "cuda"));
+}
+
+void model_deletion(const Services& services, const httplib::Request& request, httplib::Response& response) {
+    set_json(response, deletion_plan_json(model_deletion_plan(services.catalog.resolve(request.matches[1]))));
+}
+
+void model_delete(const Services& services, const httplib::Request& request, httplib::Response& response) {
+    auto& catalog = services.catalog;
+    auto& instances = services.instances;
+    const auto body = parse_json(request);
+    fields(body, {"token"});
+    const auto token = selector(body, "token");
+    valid_token(token);
+    const auto artifact = catalog.resolve(request.matches[1]);
+    if (instances.busy_for(artifact.id, artifact.name))
+        throw ModelError(ModelError::Kind::conflict, "model_delete_busy",
+            "Unload the model and wait for loading to finish before deleting it");
+    const auto result = delete_model_files(artifact, token);
+    catalog.list(true);
+    set_json(response, result);
 }
 
 }

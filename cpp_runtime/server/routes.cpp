@@ -36,7 +36,7 @@ const std::vector<Route>& route_table() {
         {"POST", "/api/auth/keys/([^/]+)/revoke", Scope::admin, auth_key_revoke},
         {"POST", "/api/auth/keys/([^/]+)/rotate", Scope::admin, auth_key_rotate},
 
-        // api/models.cpp
+        // api/models.cpp (catalog, directories, load/unload, analysis, deletion)
         {"GET", "/api/models", Scope::inference, models_list},
         {"GET", "/api/models/directories", Scope::models, models_browse},
         {"POST", "/api/models/directories/open", Scope::models, models_open},
@@ -46,7 +46,6 @@ const std::vector<Route>& route_table() {
         {"POST", "/api/models/load", Scope::models, models_load},
         {"POST", "/api/models/unload", Scope::models, models_unload},
 
-        // api/artifacts.cpp
         {"GET", "/api/models/([^/]+)/analysis", Scope::inference, model_analysis},
         {"GET", "/api/models/([^/]+)/cache-profile", Scope::inference, model_cache_profile},
         {"GET", "/api/models/([^/]+)/deletion", Scope::inference, model_deletion},

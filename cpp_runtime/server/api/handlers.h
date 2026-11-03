@@ -15,7 +15,7 @@ void auth_key_create(const Services&, const httplib::Request&, httplib::Response
 void auth_key_revoke(const Services&, const httplib::Request&, httplib::Response&);
 void auth_key_rotate(const Services&, const httplib::Request&, httplib::Response&);
 
-// api/models.cpp
+// api/models.cpp (catalog, directories, load/unload, analysis, deletion)
 void models_list(const Services&, const httplib::Request&, httplib::Response&);
 void models_browse(const Services&, const httplib::Request&, httplib::Response&);
 void models_open(const Services&, const httplib::Request&, httplib::Response&);
