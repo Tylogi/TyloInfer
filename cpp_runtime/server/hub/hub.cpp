@@ -6,7 +6,10 @@
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
+#include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <limits>
 #include <regex>
@@ -62,13 +65,19 @@ fs::path absolute(const std::string& value) {
         throw Error(Error::invalid, "invalid_download_directory", "download directory must be an absolute path");
     return fs::weakly_canonical(fs::u8path(value));
 }
+const std::regex repository(R"([A-Za-z0-9_-][A-Za-z0-9_.-]*/[A-Za-z0-9_-][A-Za-z0-9_.-]*)");
 void source(Hub::Source& value) {
-    static const std::regex repo("[A-Za-z0-9_-][A-Za-z0-9_.-]*/[A-Za-z0-9_-][A-Za-z0-9_.-]*");
-    if (value.repo.size() > 256 || !std::regex_match(value.repo, repo))
+    if (value.repo.size() > 256 || !std::regex_match(value.repo, repository))
         throw Error(Error::invalid, "invalid_repository", "repository must be owner/name");
     if (value.revision.empty()) value.revision = value.provider == Hub::Provider::hf ? "main" : "master";
     if (value.revision.size() > 255 || std::any_of(value.revision.begin(), value.revision.end(), [](unsigned char ch) { return ch < 32 || ch == 127; }))
         throw Error(Error::invalid, "invalid_revision", "invalid repository revision");
+}
+// The resolve endpoint for one repository file; downloads and speed probes share it with the Python hub helper.
+std::string content_path(Hub::Provider provider, const std::string& repo, const std::string& revision, const std::string& file) {
+    const auto name = hub::escape(repo, true), tag = hub::escape(revision), path = hub::escape(file, true);
+    return provider == Hub::Provider::hf ? "/" + name + "/resolve/" + tag + "/" + path :
+        "/api/v1/models/" + name + "/repo?Revision=" + tag + "&FilePath=" + path;
 }
 bool matches(const std::string& pattern, const std::string& name) {
     std::size_t p = 0, n = 0, star = std::string::npos, retry = 0;
@@ -286,9 +295,7 @@ Hub::Result Hub::download(const Request& request, const Control& control) try {
             for (;;) {
                 active.checkpoint(); const auto index = next.fetch_add(1); if (index >= repo.files.size()) break;
                 const auto& file = repo.files[index];
-                const auto repo_name = hub::escape(repo.source.repo, true), revision = hub::escape(repo.source.revision);
-                const auto url = repo.source.provider == Provider::hf ? "/" + repo_name + "/resolve/" + revision + "/" + hub::escape(file.name, true) :
-                    "/api/v1/models/" + repo_name + "/repo?Revision=" + revision + "&FilePath=" + hub::escape(file.name);
+                const auto url = content_path(repo.source.provider, repo.source.repo, repo.source.revision, file.name);
                 const auto ready = content / fs::u8path(file.name);
                 hub::save({remote(repo.source.provider), network_.ca, request.direct}, url, file, fs::exists(ready) ? ready : parts / std::to_string(index), active,
                     [&](std::uint64_t bytes) { report(index, bytes, false); });
@@ -320,5 +327,476 @@ Hub::Result Hub::download(const Request& request, const Control& control) try {
     throw Error(Error::io, "download_io_failed", "download directory could not be read or written");
 } catch (const Json::exception&) {
     throw Error(Error::integrity, "download_state_invalid", "saved download state is invalid; existing files were preserved");
+}
+namespace {
+Hub::Control stopping_control(const std::atomic<bool>& stopping) {
+    return Hub::Control{[&] { return stopping.load(); }, {}};
+}
+std::string lowercase(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    return value;
+}
+std::string text(const Json& value, const char* key) {
+    return value.contains(key) && value.at(key).is_string() ? value.at(key).get<std::string>() : std::string();
+}
+std::int64_t number(const Json& value, const char* key) {
+    if (!value.contains(key) || !value.at(key).is_number_integer()) return 0;
+    return std::max<std::int64_t>(0, value.at(key).get<std::int64_t>());
+}
+double real(const Json& value, const char* key) {
+    return value.contains(key) && value.at(key).is_number() ? value.at(key).get<double>() : 0;
+}
+std::vector<std::string> strings(const Json& value, const char* key) {
+    std::vector<std::string> result;
+    if (!value.contains(key) || !value.at(key).is_array()) return result;
+    for (const auto& entry : value.at(key)) if (entry.is_string()) result.push_back(entry.get<std::string>());
+    return result;
+}
+bool rejected(const Json& document) {
+    return document.contains("success") && document.at("success").is_boolean() && !document.at("success").get<bool>();
+}
+bool has(const std::vector<std::string>& values, const std::string& value) {
+    return std::find(values.begin(), values.end(), value) != values.end();
+}
+// Byte limits must not split a UTF-8 sequence; invalid text would break JSON serialization.
+std::string clipped(std::string value, std::size_t limit) {
+    if (value.size() <= limit) return value;
+    value.resize(limit);
+    while (!value.empty() && (static_cast<unsigned char>(value.back()) & 0xC0) == 0x80) value.pop_back();
+    if (!value.empty() && (static_cast<unsigned char>(value.back()) & 0xC0) >= 0xC0) value.pop_back();
+    return value;
+}
+bool tq_token(const std::string& name) {
+    for (std::size_t at = name.find("tq"); at != std::string::npos; at = name.find("tq", at + 1)) {
+        const bool before = at == 0 || name[at - 1] == '-' || name[at - 1] == '_' || name[at - 1] == '/';
+        const auto after = at + 2;
+        const bool tail = after == name.size() || name[after] == '-' || name[after] == '_' || (name[after] >= '0' && name[after] <= '9');
+        if (before && tail) return true;
+    }
+    return false;
+}
+// Weight formats a hub entry advertises, mirroring the Python search classifier.
+std::vector<std::string> formats(const std::string& repo, const std::vector<std::string>& tags) {
+    std::set<std::string> labels;
+    for (const auto& tag : tags) labels.insert(lowercase(tag.substr(tag.rfind(':') + 1)));
+    const auto name = lowercase(repo);
+    std::vector<std::string> result;
+    if (labels.count("gguf") || name.find("gguf") != std::string::npos) result.push_back("gguf");
+    if (labels.count("mlx") || name.find("mlx") != std::string::npos) result.push_back("mlx");
+    if (!has(result, "gguf") && (labels.count("tq") || tq_token(name))) result.push_back("tq");
+    if (result.empty() && labels.count("safetensors")) result.push_back("hf");
+    return result;
+}
+std::vector<std::string> modalities(const std::vector<std::string>& tags) {
+    std::string joined;
+    for (const auto& tag : tags) joined += lowercase(tag) + ' ';
+    std::vector<std::string> result;
+    for (const auto* name : {"text", "image", "video", "audio"}) if (joined.find(name) != std::string::npos) result.push_back(name);
+    return result;
+}
+const std::vector<std::string> media_pipelines{"text-to-image", "image-to-image", "text-to-video", "image-to-video", "unconditional-image-generation"};
+bool media_model(const std::string& pipeline, const std::vector<std::string>& tags) {
+    if (!pipeline.empty()) return has(media_pipelines, pipeline);
+    for (const auto& tag : tags) if (has(media_pipelines, lowercase(tag.substr(tag.rfind(':') + 1)))) return true;
+    return false;
+}
+// shortcut: word runs are ASCII-only, so non-ASCII names fall back to the weaker relevance tiers.
+std::vector<std::string> words(const std::string& value) {
+    std::vector<std::string> result; std::string current; int kind = 0;
+    for (const auto raw : lowercase(value)) {
+        const auto ch = static_cast<unsigned char>(raw);
+        const int next = std::isalpha(ch) ? 1 : std::isdigit(ch) ? 2 : 0;
+        if (next && next == kind) current += raw;
+        else { if (!current.empty()) result.push_back(current); current = next ? std::string(1, raw) : std::string(); kind = next; }
+    }
+    if (!current.empty()) result.push_back(current);
+    return result;
+}
+std::string joined(const std::vector<std::string>& values) {
+    std::string result;
+    for (const auto& value : values) result += value;
+    return result;
+}
+std::string strip_formats(const std::string& name) {
+    const auto lower = lowercase(name);
+    for (std::size_t at = 1; at < lower.size(); ++at) {
+        const auto before = lower[at - 1];
+        if (before != '-' && before != '_' && before != '.') continue;
+        for (const auto* suffix : {"gguf", "mlx", "tq"}) {
+            const auto length = std::strlen(suffix);
+            if (lower.compare(at, length, suffix) != 0) continue;
+            const auto after = at + length;
+            if (after == lower.size() || lower[after] == '-' || lower[after] == '_') return name.substr(0, at - 1);
+        }
+    }
+    return name;
+}
+bool contains_all(const std::vector<std::string>& words, const std::vector<std::string>& requested) {
+    return std::all_of(requested.begin(), requested.end(), [&](const auto& word) { return has(words, word); });
+}
+std::pair<int, int> relevance(const Hub::Summary& item, const std::string& query) {
+    const auto name = item.repo.substr(item.repo.find('/') + 1);
+    const auto found = words(name), requested = words(query);
+    const auto joined_name = joined(found), requested_name = joined(requested);
+    const auto base = joined(words(strip_formats(name)));
+    const int tier = joined_name == requested_name ? 6 : base == requested_name ? 5 : joined_name.rfind(requested_name, 0) == 0 ? 4 :
+        contains_all(found, requested) ? 3 : joined_name.find(requested_name) != std::string::npos ? 2 :
+        contains_all(words(item.repo), requested) ? 1 : 0;
+    int matched = 0;
+    for (const auto& word : requested) if (has(found, word)) ++matched;
+    return {tier, matched};
+}
+int order(std::int64_t left, std::int64_t right) { return left < right ? -1 : left > right ? 1 : 0; }
+int order(double left, double right) { return left < right ? -1 : left > right ? 1 : 0; }
+// Lexicographic comparison of the Python search key; descending searches pick the greatest entry.
+int rank(const Hub::Summary& left, const Hub::Summary& right, const std::string& sort, const std::string& query) {
+    const auto by_repo = lowercase(left.repo).compare(lowercase(right.repo));
+    if (sort == "downloads") { if (const auto value = order(left.downloads, right.downloads)) return value; return by_repo; }
+    if (sort == "likes") { if (const auto value = order(left.likes, right.likes)) return value; return by_repo; }
+    if (sort == "updated") {
+        // shortcut: each hub emits fixed-width timestamps, so lexical order matches chronological order.
+        if (const auto value = left.updated.compare(right.updated)) return value;
+        return by_repo;
+    }
+    if (query.empty()) {
+        if (const auto trending = order(left.trending, right.trending)) return trending;
+        if (const auto value = order(left.downloads, right.downloads)) return value;
+        return by_repo;
+    }
+    const auto left_rank = relevance(left, query), right_rank = relevance(right, query);
+    if (left_rank.first != right_rank.first) return left_rank.first < right_rank.first ? -1 : 1;
+    if (left_rank.second != right_rank.second) return left_rank.second < right_rank.second ? -1 : 1;
+    if (const auto downloads = order(left.downloads, right.downloads)) return downloads;
+    const auto left_name = left.repo.substr(left.repo.find('/') + 1), right_name = right.repo.substr(right.repo.find('/') + 1);
+    if (left_name.size() != right_name.size()) return left_name.size() > right_name.size() ? -1 : 1;
+    return by_repo;
+}
+bool official_repo(const std::string& repo) {
+    const auto slash = repo.find('/');
+    if (slash == std::string::npos || !std::regex_match(repo, repository)) return false;
+    if (lowercase(repo.substr(0, slash)) != "tylogi") return false;
+    std::vector<std::string> parts; std::string current;
+    for (const auto ch : lowercase(repo.substr(slash + 1))) {
+        if (ch == '-' || ch == '_') { parts.push_back(current); current.clear(); } else current += ch;
+    }
+    parts.push_back(current);
+    return has(parts, "tq");
+}
+bool parse_summary(const Json& item, Hub::Provider provider, Hub::Summary& summary) {
+    if (!item.is_object()) return false;
+    summary = Hub::Summary{};
+    summary.provider = provider;
+    summary.repo = text(item, "id");
+    if (summary.repo.size() > 255 || !std::regex_match(summary.repo, repository)) return false;
+    const auto tags = strings(item, "tags");
+    const auto pipeline = text(item, "pipeline_tag").empty() ? text(item, "pipeline") : text(item, "pipeline_tag");
+    summary.formats = formats(summary.repo, tags);
+    summary.modalities = modalities(tags);
+    summary.media = media_model(pipeline, tags);
+    summary.author = summary.repo.substr(0, summary.repo.find('/'));
+    summary.description = clipped(text(item, "description"), 2048);
+    summary.downloads = number(item, "downloads");
+    summary.likes = number(item, "likes");
+    summary.bytes = provider == Hub::Provider::ms ? number(item, "storage_size") : 0;
+    summary.updated = text(item, provider == Hub::Provider::hf ? "lastModified" : "last_modified");
+    summary.trending = real(item, provider == Hub::Provider::hf ? "trendingScore" : "trending_score");
+    return true;
+}
+// The next-page URL from a Link header, reduced to a path so the configured endpoint stays authoritative.
+std::string link_path(const std::string& link) {
+    std::size_t at = 0;
+    while ((at = link.find('<', at)) != std::string::npos) {
+        const auto end = link.find('>', at);
+        if (end == std::string::npos) break;
+        const auto boundary = link.find('<', end);
+        const auto tail = link.substr(end + 1, (boundary == std::string::npos ? link.size() : boundary) - end - 1);
+        if (tail.find("rel=\"next\"") != std::string::npos) {
+            const auto url = link.substr(at + 1, end - at - 1);
+            const auto scheme = url.find("://");
+            const auto slash = url.find('/', scheme == std::string::npos ? 0 : scheme + 3);
+            return slash == std::string::npos ? std::string() : url.substr(slash);
+        }
+        at = end;
+    }
+    return {};
+}
+std::string key(Hub::Provider provider, const std::string& repo) {
+    return std::string(provider == Hub::Provider::hf ? "huggingface:" : "modelscope:") + repo;
+}
+}
+
+Hub::~Hub() {
+    stopping_ = true;
+    if (refresher_.joinable()) refresher_.join();
+}
+
+Hub::Page Hub::search(Provider provider, const std::string& query, const std::string& format,
+    const std::string& sort, const std::string& direction, std::size_t limit, const std::string& position) const {
+    if (limit < 1 || limit > 100) throw Error(Error::invalid, "invalid_hub_search", "search limit is outside its range");
+    const auto endpoint = remote(provider);
+    const auto control = stopping_control(stopping_);
+    const auto order_name = sort == "updated" ? (provider == Provider::hf ? "lastModified" : "last_modified") :
+        sort == "relevance" ? (provider == Provider::hf ? (query.empty() ? "trendingScore" : "downloads") : "downloads") : sort;
+    const auto search = format == "tq" ? (query.empty() ? "TQ" : query + " TQ") : query;
+    Json values = Json::array();
+    std::string next;
+    if (provider == Provider::hf) {
+        auto path = position;
+        if (path.empty()) {
+            path = "/api/models?search=" + hub::escape(search) + "&limit=" + std::to_string(limit) +
+                "&direction=" + (direction == "asc" ? "1" : "-1") + "&sort=" + order_name;
+            for (const auto* field : {"downloads", "likes", "lastModified", "tags", "trendingScore", "pipeline_tag"}) path += "&expand=" + std::string(field);
+            if (format == "gguf" || format == "mlx") path += "&filter=" + format;
+        }
+        std::string link;
+        const auto document = Json::parse(hub::get({endpoint, network_.ca, false}, path, control, &link));
+        if (!document.is_array()) throw Error(Error::integrity, "invalid_hub_metadata", "model source returned an invalid search response");
+        values = document;
+        next = link_path(link);
+    } else {
+        const auto size = std::min<std::size_t>(limit, 50);
+        std::size_t page = position.empty() ? 1 : static_cast<std::size_t>(std::stoul(position));
+        for (;;) {
+            auto path = "/openapi/v1/models?search=" + hub::escape(search) + "&page_size=" + std::to_string(size) +
+                "&page_number=" + std::to_string(page) + "&sort=" + order_name;
+            if (format == "gguf" || format == "mlx") path += "&filter.library=" + format;
+            const auto document = Json::parse(hub::get({endpoint, network_.ca, false}, path, control));
+            if (!document.is_object() || rejected(document))
+                throw Error(Error::network, "hub_search_failed", "model source rejected the search");
+            if (!document.contains("data") || !document.at("data").is_object() ||
+                !document.at("data").contains("models") || !document.at("data").at("models").is_array())
+                throw Error(Error::integrity, "invalid_hub_metadata", "model source returned an invalid search response");
+            const auto& models = document.at("data").at("models");
+            values.insert(values.end(), models.begin(), models.end());
+            if (models.size() == size) next = std::to_string(page + 1);
+            ++page;
+            if (models.size() < size || values.size() >= limit) break;
+        }
+    }
+    Page result;
+    for (const auto& item : values) {
+        Summary summary;
+        if (parse_summary(item, provider, summary)) result.items.push_back(std::move(summary));
+    }
+    result.cursor = next;
+    return result;
+}
+
+bool Hub::Search::matches(const Search& other) const {
+    return provider == other.provider && query == other.query && sort == other.sort && direction == other.direction &&
+        limit == other.limit && formats == other.formats;
+}
+
+Hub::Page Hub::browse(Provider provider, const std::string& query, const std::vector<std::string>& formats,
+    const std::string& sort, const std::string& direction, std::size_t limit, const std::string& cursor) {
+    Search wanted{provider, query, sort, direction, formats, limit};
+    for (const auto& format : formats) wanted.streams.push_back(Stream{format, {}, false, {}});
+    Search state = wanted;
+    {
+        // Only the cursor table is shared; provider paging below must not hold the lock.
+        std::lock_guard lock(search_);
+        const auto now = std::chrono::steady_clock::now();
+        for (auto entry = cursors_.begin(); entry != cursors_.end();)
+            entry = entry->second.expires < now ? cursors_.erase(entry) : std::next(entry);
+        while (cursors_.size() > 128) cursors_.erase(cursors_.begin());
+        if (!cursor.empty()) {
+            auto found = cursors_.find(cursor);
+            if (found == cursors_.end() || !found->second.matches(wanted))
+                throw Error(Error::invalid, "search_cursor_expired", "The search has expired or its filters changed. Start a new search.");
+            if (found->second.consumed) return {found->second.page, found->second.next};
+            state = found->second;
+        }
+    }
+    std::vector<Summary> items;
+    while (items.size() < state.limit) {
+        for (auto& stream : state.streams) {
+            while (stream.buffer.empty() && !stream.exhausted) {
+                auto page = search(state.provider, state.query, stream.format, state.sort, state.direction, 50, stream.position);
+                if (!stream.position.empty() && page.cursor == stream.position)
+                    throw Error(Error::network, "hub_search_failed", "model source returned a repeated page cursor");
+                stream.position = page.cursor;
+                stream.exhausted = page.cursor.empty();
+                for (auto& item : page.items) {
+                    if (!has(item.formats, stream.format) || item.media || state.seen.count(item.repo)) continue;
+                    stream.buffer.push_back(std::move(item));
+                }
+                if (state.sort == "relevance")
+                    std::sort(stream.buffer.begin(), stream.buffer.end(), [&](const auto& left, const auto& right) {
+                        return rank(left, right, state.sort, state.query) > 0;
+                    });
+            }
+        }
+        Stream* best = nullptr;
+        for (auto& stream : state.streams) {
+            if (stream.buffer.empty()) continue;
+            if (!best) { best = &stream; continue; }
+            const auto value = rank(stream.buffer.front(), best->buffer.front(), state.sort, state.query);
+            if ((state.direction == "desc" && value > 0) || (state.direction == "asc" && value < 0)) best = &stream;
+        }
+        if (!best) break;
+        auto item = best->buffer.front();
+        best->buffer.erase(best->buffer.begin());
+        if (state.seen.insert(item.repo).second) items.push_back(std::move(item));
+    }
+    state.page = items;
+    state.next = std::any_of(state.streams.begin(), state.streams.end(), [](const auto& stream) {
+        return !stream.buffer.empty() || !stream.exhausted;
+    }) ? normalize_uuid({}) : std::string();
+    state.consumed = true;
+    state.expires = std::chrono::steady_clock::now() + std::chrono::minutes(15);
+    auto resumed = state;
+    resumed.consumed = false; resumed.page.clear(); resumed.next.clear();
+    std::lock_guard lock(search_);
+    if (!cursor.empty()) cursors_[cursor] = state;
+    if (!state.next.empty()) cursors_[state.next] = resumed;
+    return {items, state.next};
+}
+
+std::string Hub::readme(Provider provider, const std::string& repo, const std::string& revision) const {
+    Source candidate{provider, repo, revision};
+    source(candidate);
+    const auto path = provider == Provider::hf ?
+        "/" + hub::escape(candidate.repo, true) + "/resolve/" + hub::escape(candidate.revision) + "/README.md" :
+        "/api/v1/models/" + hub::escape(candidate.repo, true) + "/repo?Revision=" + hub::escape(candidate.revision) + "&FilePath=README.md";
+    try { return hub::get({remote(provider), network_.ca, false}, path, stopping_control(stopping_)); }
+    catch (const Error& error) { if (error.kind == Error::missing) return {}; throw; }
+}
+
+std::vector<Hub::Summary> Hub::discover(Provider provider) const {
+    const auto endpoint = remote(provider);
+    const auto control = stopping_control(stopping_);
+    std::vector<Summary> result;
+    if (provider == Provider::hf) {
+        std::string path = "/api/models?author=Tylogi&limit=100";
+        for (std::size_t page = 0; !path.empty(); ++page) {
+            if (page >= 150) throw Error(Error::network, "hub_search_failed", "official model discovery did not complete");
+            std::string link;
+            const auto document = Json::parse(hub::get({endpoint, network_.ca, false}, path, control, &link));
+            if (!document.is_array()) throw Error(Error::integrity, "invalid_hub_metadata", "official model discovery returned an invalid response");
+            for (const auto& item : document) {
+                if (item.contains("private") && item.at("private").is_boolean() && item.at("private").get<bool>()) continue;
+                Summary summary;
+                if (parse_summary(item, provider, summary) && official_repo(summary.repo)) result.push_back(std::move(summary));
+            }
+            path = link_path(link);
+        }
+        return result;
+    }
+    for (std::size_t page = 1; page <= 150; ++page) {
+        const auto document = Json::parse(hub::get({endpoint, network_.ca, false},
+            "/openapi/v1/models?owner=Tylogi&page_size=20&page_number=" + std::to_string(page), control));
+        if (!document.is_object() || rejected(document))
+            throw Error(Error::network, "hub_search_failed", "official model discovery failed");
+        if (!document.contains("data") || !document.at("data").is_object() ||
+            !document.at("data").contains("models") || !document.at("data").at("models").is_array())
+            throw Error(Error::integrity, "invalid_hub_metadata", "official model discovery returned an invalid response");
+        const auto& models = document.at("data").at("models");
+        for (const auto& item : models) {
+            Summary summary;
+            if (parse_summary(item, provider, summary) && official_repo(summary.repo)) result.push_back(std::move(summary));
+        }
+        if (models.size() < 20) break;
+    }
+    return result;
+}
+
+void Hub::refresh_official() {
+    Snapshot next;
+    {
+        std::lock_guard lock(official_);
+        next = snapshot_;
+    }
+    for (const auto provider : {Provider::hf, Provider::ms}) {
+        std::vector<Summary> found;
+        try { found = discover(provider); } catch (const Error&) { continue; }
+        // A successful discovery replaces this provider's entries; a failed one keeps the last usable snapshot.
+        const auto prefix = provider == Provider::hf ? "huggingface:" : "modelscope:";
+        for (auto entry = next.models.begin(); entry != next.models.end();)
+            entry = entry->first.rfind(prefix, 0) == 0 ? next.models.erase(entry) : std::next(entry);
+        for (const auto& summary : found) {
+            OfficialModel model;
+            model.summary = summary;
+            model.source = {provider, summary.repo, {}};
+            try {
+                auto repo = info(model.source, stopping_control(stopping_));
+                model.source.revision = repo.source.revision;
+                model.files = std::move(repo.files);
+            } catch (const Error&) {}
+            next.models[key(provider, summary.repo)] = std::move(model);
+        }
+    }
+    if (stopping_.load()) return;
+    next.refreshed = std::chrono::steady_clock::now();
+    std::lock_guard lock(official_);
+    snapshot_ = std::move(next);
+}
+
+std::vector<Hub::OfficialModel> Hub::official(bool refresh) {
+    bool stale;
+    {
+        std::lock_guard lock(official_);
+        stale = snapshot_.refreshed == std::chrono::steady_clock::time_point{} ||
+            std::chrono::steady_clock::now() - snapshot_.refreshed >= std::chrono::minutes(15);
+    }
+    if ((refresh || stale) && !refreshing_.exchange(true)) {
+        if (refresher_.joinable()) refresher_.join();
+        refresher_ = std::thread([this] {
+            try { refresh_official(); } catch (const Error&) {}
+            refreshing_ = false;
+        });
+    }
+    std::lock_guard lock(official_);
+    std::vector<OfficialModel> result;
+    for (const auto& [name, model] : snapshot_.models) result.push_back(model);
+    return result;
+}
+
+bool Hub::refreshing() const {
+    std::lock_guard lock(official_);
+    return refreshing_;
+}
+
+std::vector<std::pair<std::string, std::uint64_t>> Hub::reusable(const Source& reference, const std::string& destination,
+    const std::optional<fs::path>& directory) const {
+    auto name = destination;
+    if (name.rfind("models/", 0) == 0) name.erase(0, 7);
+    const auto target = relative(name);
+    fs::path root;
+    {
+        std::lock_guard lock(mutex_);
+        root = directory ? absolute(path_utf8(*directory)) : selected_.empty() ? fallback_ : selected_;
+        if (std::find(roots_.begin(), roots_.end(), root) == roots_.end())
+            throw Error(Error::invalid, "invalid_download_directory", "download directory has not been selected on this server");
+    }
+    safe(root, target);
+    const auto base = root / target;
+    std::vector<std::pair<std::string, std::uint64_t>> result;
+    for (const auto& file : info(reference).files) {
+        const auto extension = fs::u8path(file.name).extension();
+        if (file.size == 0 || (extension != ".tq" && extension != ".mfq")) continue;
+        std::error_code error;
+        const auto size = fs::is_regular_file(base / fs::u8path(file.name), error) ? fs::file_size(base / fs::u8path(file.name), error) : 0;
+        if (!error && size == file.size) result.emplace_back(file.name, file.size);
+    }
+    return result;
+}
+
+Hub::Route Hub::probe(Provider provider, const Source& reference, const std::string& file) const {
+    auto candidate = reference;
+    source(candidate);
+    const auto path = content_path(provider, candidate.repo, candidate.revision, file);
+    const auto endpoint = remote(provider);
+    auto measure = [&](bool direct) {
+        const auto started = std::chrono::steady_clock::now();
+        const auto bytes = hub::range({endpoint, network_.ca, direct}, path, 1048576, stopping_control(stopping_));
+        const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+        return bytes ? static_cast<double>(bytes) / std::max(0.001, elapsed) : 0.0;
+    };
+    const auto direct = measure(true);
+    // shortcut: the proxy route is only measured when the environment configures a proxy at all.
+    if (!std::getenv("http_proxy") && !std::getenv("HTTP_PROXY") && !std::getenv("https_proxy") &&
+        !std::getenv("HTTPS_PROXY") && !std::getenv("all_proxy") && !std::getenv("ALL_PROXY")) return {direct, false};
+    const auto proxied = measure(false);
+    return proxied > direct ? Route{proxied, true} : Route{direct, false};
 }
 }
