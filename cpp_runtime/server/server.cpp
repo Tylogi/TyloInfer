@@ -18,6 +18,7 @@
 #include "models/catalog.h"
 #include "models/instances.h"
 #include "models/policies.h"
+#include "models/profiles.h"
 #include "models/errors.h"
 
 #include "httplib.h"
@@ -223,6 +224,7 @@ int run(const Config& config, const std::atomic<bool>& stop_requested, EngineFac
     const std::string backend = factory.backend;
     ModelInstances instances(models, storage, std::move(factory));
     RuntimePolicies policies(storage);
+    RuntimeProfiles profiles(storage, models);
     Media media(storage, data_dir / "media");
     Sessions sessions(storage, instances, media);
     Jobs jobs(storage, [](std::exception_ptr exception) { return describe_failure(exception).detail; });
@@ -245,6 +247,8 @@ int run(const Config& config, const std::atomic<bool>& stop_requested, EngineFac
     http.set_write_timeout(5);
     http.set_keep_alive_timeout(1);
     std::atomic<bool> draining{false};
+    // The listener routes report the port this process binds below, which is known before listening starts.
+    int listener_port = config.port;
     http.set_pre_routing_handler([&](const httplib::Request& request, httplib::Response& response) {
         const bool websocket = lowercase(request.get_header_value("Upgrade")) == "websocket";
         auto expected = request.get_header_value("X-TyloInfer-Instance-ID");
@@ -332,7 +336,7 @@ int run(const Config& config, const std::atomic<bool>& stop_requested, EngineFac
     register_models(http, models, instances, jobs, policies);
     register_artifacts(http, models, instances, backend);
     register_runtime(http, instances);
-    register_runtime_config(http, policies, jobs);
+    register_runtime_config(http, policies, profiles, instances, jobs, config.host, listener_port);
     register_jobs(http, jobs, streams);
     register_hub(http, hub, models, jobs, backend);
     register_inference(http, instances, streams);
@@ -341,11 +345,12 @@ int run(const Config& config, const std::atomic<bool>& stop_requested, EngineFac
     if (!web_root.empty()) http.Get("/.*", [&](const httplib::Request& request, httplib::Response& response) {
         static_response(web_root, request, response);
     });
-    const int port = config.port == 0 ? http.bind_to_any_port(config.host) :
+    const int bound = config.port == 0 ? http.bind_to_any_port(config.host) :
         (http.bind_to_port(config.host, config.port) ? config.port : -1);
-    if (port < 0) throw std::runtime_error("cannot bind listener on " + config.host + ":" + std::to_string(config.port));
+    if (bound < 0) throw std::runtime_error("cannot bind listener on " + config.host + ":" + std::to_string(config.port));
+    listener_port = bound;
     http.set_start_handler([&] {
-        std::cout << json{{"event", "listening"}, {"host", config.host}, {"port", port},
+        std::cout << json{{"event", "listening"}, {"host", config.host}, {"port", listener_port},
             {"instance_id", instance.identity()["instance_id"]}}.dump() << std::endl;
     });
     std::atomic<bool> finished{false};

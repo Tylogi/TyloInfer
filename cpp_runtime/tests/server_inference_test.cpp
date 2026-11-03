@@ -1704,6 +1704,33 @@ void runtime_observation_checks(const fs::path& executable) {
     const auto missing = get("/api/runtime/instances/00000000-0000-4000-8000-000000000001");
     CHECK(missing.first == 404 && missing.second.at("error").at("code") == "runtime_instance_not_found");
     CHECK(get("/api/runtime/instances/not-a-uuid").first == 400);
+    const auto patch = [&](const std::string& path, const Json& body) {
+        const auto response = client.Patch(path, body.dump(), "application/json");
+        CHECK(response);
+        return std::make_pair(response->status, Json::parse(response->body));
+    };
+    const auto capabilities = get("/api/runtime/capabilities").second;
+    CHECK(capabilities.at("model") == "served" && capabilities.at("model_type") == "qwen3_5" &&
+        capabilities.at("model_capabilities") == listed.at(0).at("capabilities") &&
+        capabilities.at("vision_available") == false && capabilities.at("mtp_available") == false &&
+        capabilities.at("duplex_available") == false);
+    CHECK(get("/api/runtime/capabilities?instance_id=" + id).second == capabilities);
+    CHECK(get("/api/runtime/capabilities?instance_id=00000000-0000-4000-8000-000000000001").first == 404);
+    const auto pinned = patch("/api/runtime/instances/" + id, {{"pinned", true}});
+    CHECK(pinned.first == 200 && pinned.second.at("instance_id") == id &&
+        pinned.second.at("policy") == Json({{"pin", true}, {"idle_ttl_seconds", nullptr}}));
+    CHECK(get("/api/runtime/instances/" + id).second.at("policy").at("pin") == true);
+    // A pin and an idle timeout cannot both be set, as in POST /api/models/load.
+    CHECK(patch("/api/runtime/instances/" + id, {{"idle_ttl_seconds", 60}}).first == 400);
+    const auto timed = patch("/api/runtime/instances/" + id, {{"pinned", false}, {"idle_ttl_seconds", 3600}});
+    CHECK(timed.first == 200 && timed.second.at("policy") == Json({{"pin", false}, {"idle_ttl_seconds", 3600}}));
+    CHECK(patch("/api/runtime/instances/" + id, {{"idle_ttl_seconds", nullptr}}).second.at("policy")
+        .at("idle_ttl_seconds").is_null());
+    for (const auto& body : std::vector<Json>{Json::object(), {{"pinned", "yes"}}, {{"pinned", nullptr}},
+            {{"idle_ttl_seconds", -1}}, {{"unexpected", true}}})
+        CHECK(patch("/api/runtime/instances/" + id, body).first == 400);
+    CHECK(patch("/api/runtime/instances/00000000-0000-4000-8000-000000000001", {{"pinned", true}}).first == 404);
+    CHECK(patch("/api/runtime/instances/not-a-uuid", {{"pinned", true}}).first == 400);
     const auto status = get("/api/runtime/status?instance_id=" + id).second;
     CHECK(status.at("source") == "native-instances" && status.at("instance_id") == id && status.at("model") == "served");
     CHECK(status.at("runtime_state") == "ready" && status.at("max_context") == 128 && status.at("active_requests") == 0);

@@ -636,7 +636,7 @@ void keys_and_network() {
         CHECK(server.get("/api/models/00000000000000000000000000000000/directory", credentials).status == (std::string(role) == "viewer" ? 403 : 404));
         CHECK(server.get("/api/models", credentials).status == 200);
         CHECK(server.raw("HEAD", "/api/models", credentials).status == 200);
-        CHECK(server.raw("HEAD", "/api/runtime/listener", credentials).status == 404);
+        CHECK(server.raw("HEAD", "/api/runtime/listener", credentials).status == 200);
         CHECK(server.get("/api/auth/keys", credentials).status == (std::string(role) == "administrator" ? 200 : 403));
     }
     for (const auto& input : std::vector<json>{json::object(), {{"name", "x"}}, {{"name", "x"}, {"scopes", {"root"}}},
@@ -835,6 +835,139 @@ void runtime_policies() {
     CHECK(restarted.get("/api/runtime/context-policy", admin).document() == context_partial);
     CHECK(restarted.get("/api/runtime/inference-policy", admin).document() == inference_defaults);
     CHECK(restarted.get("/api/runtime/memory-policy", admin).document() == memory_partial);
+    restarted.stop();
+}
+
+// Profiles, capabilities, instance policy patches and the listener against the real server binary;
+// no model can load in this fixture, so the instance-backed paths live in server_inference_test.cpp.
+void runtime_profiles() {
+    Fixture f;
+    auto server = f.start({}, root_environment);
+    const auto root = f.data / "models";
+    write_mfq(root / "beta.MFQ");
+    const auto artifacts = server.get("/api/models?refresh=true", admin).document().at("data");
+    CHECK(artifacts.size() == 1);
+    const auto artifact_id = artifacts.at(0).at("id").get<std::string>();
+    const auto modified_at = artifacts.at(0).at("modified_at").get<std::string>();
+    const json load{{"model", artifact_id}, {"context_size", 4096}};
+    const std::string absent = "00000000-0000-4000-8000-000000000001";
+    const std::string instance_path = "/api/runtime/instances/" + absent;
+
+    for (const auto* path : {"/api/runtime/profiles", "/api/runtime/capabilities", "/api/runtime/listener"})
+        CHECK(server.get(path).status == 401);
+    CHECK(server.send("POST", "/api/runtime/profiles", {{"name", "chat"}, {"load", load}}).status == 401);
+    CHECK(server.send("PUT", "/api/runtime/listener", {{"port", 8080}}).status == 401);
+    CHECK(server.send("PATCH", instance_path, {{"pinned", true}}).status == 401);
+
+    // One native listener serves both protocols on the port chosen at startup.
+    const auto listener = server.get("/api/runtime/listener", admin).document();
+    CHECK(listener.at("host") == "127.0.0.1" && listener.at("port").get<int>() > 0);
+    CHECK(listener.at("anthropic_port").is_null() && listener.at("configurable") == false);
+    const auto managed = server.send("PUT", "/api/runtime/listener", {{"port", 8080}, {"protocol", "anthropic"}}, admin);
+    CHECK(managed.status == 409 && managed.document()["error"]["code"] == "listener_not_managed" &&
+        managed.document()["error"]["message"] == "server listener is managed externally");
+    for (const auto& body : std::vector<json>{json::object(), {{"port", 0}}, {{"port", 70000}}, {{"port", "8080"}},
+            {{"port", 8080}, {"protocol", "grpc"}}, {{"port", 8080}, {"unexpected", true}}})
+        CHECK(server.send("PUT", "/api/runtime/listener", body, admin).status == 400);
+
+    // With no loaded instance the native server has no runtime to describe, as the Python pool reports.
+    const auto no_runtime = server.get("/api/runtime/capabilities", admin);
+    CHECK(no_runtime.status == 503 && no_runtime.document()["error"]["code"] == "model_not_loaded");
+    CHECK(server.get("/api/runtime/capabilities?instance_id=" + absent, admin).status == 404);
+    CHECK(server.get("/api/runtime/capabilities?instance_id=nope", admin).status == 400);
+
+    for (const auto& body : std::vector<json>{json::object(), {{"pinned", "yes"}}, {{"pinned", nullptr}},
+            {{"idle_ttl_seconds", -1}}, {{"idle_ttl_seconds", "60"}}, {{"unexpected", true}}})
+        CHECK(server.send("PATCH", instance_path, body, admin).status == 400);
+    CHECK(server.send("PATCH", "/api/runtime/instances/not-a-uuid", {{"pinned", true}}, admin).status == 400);
+    const auto absent_instance = server.send("PATCH", instance_path, {{"pinned", true}}, admin);
+    CHECK(absent_instance.status == 404 && absent_instance.document()["error"]["code"] == "runtime_instance_not_found");
+
+    CHECK(server.get("/api/runtime/profiles", admin).document() == json({{"data", json::array()}}));
+    CHECK(server.get("/api/runtime/profiles/" + absent, admin).status == 404);
+    CHECK(server.get("/api/runtime/profiles/not-a-uuid", admin).status == 400);
+    const auto created = server.send("POST", "/api/runtime/profiles", {{"name", "chat"}, {"load", load}}, admin);
+    CHECK(created.status == 201);
+    const auto profile = created.document();
+    const auto id = profile.at("id").get<std::string>();
+    CHECK(id.size() == 36 && profile.at("name") == "chat" && profile.at("artifact_id") == artifact_id &&
+        profile.at("artifact_modified_at") == modified_at && profile.at("drifted") == false &&
+        profile.at("drift_reason").is_null() && profile.at("created_at") == profile.at("updated_at"));
+    // sampling_defaults always shows inside load, as the Python resource does.
+    CHECK(profile.at("load") == json({{"model", artifact_id}, {"context_size", 4096}, {"sampling_defaults", nullptr}}));
+    CHECK(server.get("/api/runtime/profiles/" + id, admin).document() == profile);
+    CHECK(server.get("/api/runtime/profiles", admin).document().at("data") == json::array({profile}));
+
+    const json edited{{"name", "chat-lab"}, {"load", {{"model", artifact_id}, {"context_size", 2048}, {"pin", true}}}};
+    const auto renamed = server.send("PUT", "/api/runtime/profiles/" + id, edited, admin).document();
+    CHECK(renamed.at("id") == id && renamed.at("name") == "chat-lab" &&
+        renamed.at("load").at("context_size") == 2048 && renamed.at("load").at("pin") == true &&
+        renamed.at("updated_at").get<std::string>() >= renamed.at("created_at").get<std::string>());
+    const auto conflict = server.send("POST", "/api/runtime/profiles", {{"name", "chat-lab"}, {"load", load}}, admin);
+    CHECK(conflict.status == 409 && conflict.document()["error"]["code"] == "runtime_profile_conflict");
+    for (const auto& body : std::vector<json>{json::object(), {{"name", ""}, {"load", load}},
+            {{"name", std::string(65, 'n')}, {"load", load}}, {{"name", "unnamed"}},
+            {{"name", "bad-load"}, {"load", json::array()}}, {{"name", "bad-load"}, {"load", {{"context_size", 4096}}}},
+            {{"name", "bad-load"}, {"load", {{"model", artifact_id}, {"context_size", 511}}}},
+            {{"name", "bad-load"}, {"load", {{"model", artifact_id}, {"idle_ttl_seconds", 0}}}},
+            {{"name", "bad-load"}, {"load", {{"model", artifact_id}, {"pin", "yes"}}}},
+            {{"name", "bad-load"}, {"load", {{"model", artifact_id}, {"sampling_defaults", 4}}}}})
+        CHECK(server.send("POST", "/api/runtime/profiles", body, admin).status == 400);
+    const auto unlisted = server.send("POST", "/api/runtime/profiles",
+        {{"name", "unlisted"}, {"load", {{"model", "00000000000000000000000000000000"}}}}, admin);
+    CHECK(unlisted.status == 404 && unlisted.document()["error"]["code"] == "model_artifact_not_found");
+
+    // Rewriting the artifact changes what the profile pinned, so reads report drift and load refuses.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    write_mfq(root / "beta.MFQ");
+    CHECK(server.get("/api/models?refresh=true", admin).document().at("data").at(0).at("modified_at") != modified_at);
+    const auto drifted = server.get("/api/runtime/profiles/" + id, admin).document();
+    CHECK(drifted.at("drifted") == true &&
+        drifted.at("drift_reason") == "the selected model artifact changed after this profile was saved");
+    CHECK(server.get("/api/runtime/profiles", admin).document().at("data").at(0).at("drifted") == true);
+    const auto blocked = server.send("POST", "/api/runtime/profiles/" + id + "/load", json::object(), admin);
+    CHECK(blocked.status == 409 && blocked.document()["error"]["code"] == "runtime_profile_drift" &&
+        blocked.document()["error"]["message"].get<std::string>().find("changed after this profile was saved") != std::string::npos);
+    for (const auto& body : std::vector<json>{{{"allow_drift", "yes"}}, {{"unexpected", true}}})
+        CHECK(server.send("POST", "/api/runtime/profiles/" + id + "/load", body, admin).status == 400);
+    CHECK(server.send("POST", "/api/runtime/profiles/" + absent + "/load", json::object(), admin).status == 404);
+    const auto accepted = server.send("POST", "/api/runtime/profiles/" + id + "/load", {{"allow_drift", true}}, admin);
+    CHECK(accepted.status == 202 && accepted.document().at("status") == "accepted");
+    const auto job_id = accepted.document().at("operation_id").get<std::string>();
+    CHECK(accepted.header("Location") == "/api/jobs/" + job_id);
+    json job;
+    for (int attempt = 0; attempt < 500; ++attempt) {
+        job = server.get("/api/jobs/" + job_id, admin).document();
+        if (job.at("status") != "queued" && job.at("status") != "running") break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    // The job carries the stored load document; this server build has no engine, so it fails honestly.
+    CHECK(job.at("kind") == "model.load" && job.at("status") == "failed" &&
+        job.at("error").at("code") == "backend_unavailable" &&
+        job.at("payload") == json({{"model", artifact_id}, {"context_size", 2048}, {"pin", true},
+            {"sampling_defaults", nullptr}}));
+
+    // The Python scope table puts these writes under `models` and their reads under `inference`.
+    const auto issued = server.send("POST", "/api/auth/keys", {{"name", "models-only"}, {"scopes", {"models"}}}, admin);
+    CHECK(issued.status == 201);
+    const auto model_key = bearer(issued.document().at("token").get<std::string>());
+    CHECK(server.get("/api/runtime/profiles", model_key).status == 403);
+    CHECK(server.get("/api/runtime/listener", model_key).status == 403);
+    CHECK(server.send("PATCH", instance_path, {{"pinned", true}}, model_key).status == 404);
+    CHECK(server.send("POST", "/api/runtime/profiles", {{"name", "scoped"}, {"load", load}}, model_key).status == 201);
+    CHECK(server.send("PUT", "/api/runtime/listener", {{"port", 8080}}, model_key).status == 403);
+
+    CHECK(server.raw("DELETE", "/api/runtime/profiles/" + id, admin).status == 204);
+    CHECK(server.get("/api/runtime/profiles/" + id, admin).status == 404);
+    CHECK(server.raw("DELETE", "/api/runtime/profiles/" + id, admin).status == 404);
+    CHECK(server.send("PUT", "/api/runtime/profiles/" + id, edited, admin).status == 404);
+    const auto kept = server.send("POST", "/api/runtime/profiles", {{"name", "kept"}, {"load", load}}, admin);
+    CHECK(kept.status == 201);
+    const auto kept_id = kept.document().at("id").get<std::string>();
+    server.stop();
+    auto restarted = f.start({}, root_environment);
+    CHECK(restarted.get("/api/runtime/profiles", admin).document().at("data").size() == 2);
+    CHECK(restarted.get("/api/runtime/profiles/" + kept_id, admin).document().at("name") == "kept");
     restarted.stop();
 }
 
@@ -1376,12 +1509,14 @@ int run_tests(const fs::path& server, const std::string& selection) {
     using Tests = std::vector<std::pair<const char*, std::function<void()>>>;
     const Tests tests = selection == "--models" ? Tests{{"model catalog", model_catalog}, {"directory browsing", directory_browsing},
         {"model roots", model_roots}, {"model inspection", model_inspection}, {"model deletion", model_deletion}} :
-        selection == "--policies" ? Tests{{"runtime policies", runtime_policies}} : Tests{
+        selection == "--policies" ? Tests{{"runtime policies", runtime_policies}, {"runtime profiles", runtime_profiles}} :
+        Tests{
         {"CLI and lifetime", cli_and_lifetime}, {"locks and ports", locks_and_ports}, {"static files", static_files},
         {"policy and protocols", policy_and_protocols}, {"keys and network", keys_and_network},
         {"media uploads", media_uploads},
         {"runtime observation", runtime_observation},
         {"runtime policies", runtime_policies},
+        {"runtime profiles", runtime_profiles},
         {"shutdown with pending work", shutdown_with_pending_work}, {"database migrations", databases_and_migration}};
     int failures = 0;
     for (const auto& test : tests) {

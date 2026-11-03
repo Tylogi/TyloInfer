@@ -31,7 +31,7 @@ configure_file(storage/schema.h.in generated/schema.h @ONLY)
 add_library(tyloinfer-server-core STATIC server.cpp instance.cpp api/inference.cpp api/anthropic.cpp api/models.cpp
     api/artifacts.cpp
     auth/auth.cpp auth/keys.cpp api/auth.cpp storage/storage.cpp storage/files.cpp models/catalog.cpp models/instances.cpp models/aliases.cpp
-    models/analysis.cpp models/deletion.cpp models/policies.cpp
+    models/analysis.cpp models/deletion.cpp models/policies.cpp models/profiles.cpp
     jobs/jobs.cpp api/jobs.cpp sessions/sessions.cpp api/sessions.cpp media/media.cpp api/media.cpp hub/hub.cpp hub/fetch.cpp api/hub.cpp api/runtime.cpp api/runtime_config.cpp)
 target_include_directories(tyloinfer-server-core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
 target_link_libraries(tyloinfer-server-core PUBLIC mfq-http mfq-protocol mfq-paged-prefix-cache mfq-model-source SQLite::SQLite3)

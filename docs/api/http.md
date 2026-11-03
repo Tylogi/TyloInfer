@@ -42,7 +42,7 @@ Anthropic 风格请求（`/v1/messages*`、`/v1/models/*`，或带 `Anthropic-Ve
 | 路由区域 | 所需 scope |
 |---|---|
 | `/api/auth/*` | `admin` |
-| `PUT /api/runtime/model-aliases`、`/api/runtime/context-policy`、`/api/runtime/inference-policy`、`/api/runtime/memory-policy` | `admin` |
+| `PUT /api/runtime/model-aliases`、`/api/runtime/context-policy`、`/api/runtime/inference-policy`、`/api/runtime/memory-policy`、`/api/runtime/listener` | `admin` |
 | `/api/models/directories*`、`/api/models/{artifact_id}/directory`、`/api/hub/download-directory` | `models` |
 | 其余 `/api/models`、`/api/runtime`、`/api/hub`：读 | `inference` |
 | 其余 `/api/models`、`/api/runtime`、`/api/hub`：写（含 `POST /models/load`、`/models/unload`） | `models` |
@@ -102,8 +102,8 @@ Messages 请求拒绝未知字段。
 | `400` | `job_kind_not_supported`、`repo_type_not_supported`、`unsupported_requirement` | 请求了未支持的类型 |
 | `400` | `search_cursor_expired` | Hub 搜索游标过期或筛选条件变化 |
 | `401` / `403` | `authentication_error`、`authentication_required` | 凭据缺失、无效、撤销或过期 |
-| `404` | `not_found`、`operation_not_found`、`model_artifact_not_found`、`model_directory_not_found`、`session_not_found`、`response_not_found`、`media_not_found` | 对象不存在或已归档 |
-| `409` | `job_state_conflict`、`model_already_loaded`、`model_operation_busy`、`model_busy`、`model_alias_conflict`、`revision_conflict`、`response_in_progress`、`request_cancelled`、`model_delete_busy`、`model_delete_unsafe`、`model_delete_changed`、`model_delete_failed` | 状态或标识冲突 |
+| `404` | `not_found`、`operation_not_found`、`model_artifact_not_found`、`model_directory_not_found`、`session_not_found`、`response_not_found`、`media_not_found`、`runtime_profile_not_found`、`runtime_instance_not_found` | 对象不存在或已归档 |
+| `409` | `job_state_conflict`、`model_already_loaded`、`model_operation_busy`、`model_busy`、`model_alias_conflict`、`revision_conflict`、`response_in_progress`、`request_cancelled`、`model_delete_busy`、`model_delete_unsafe`、`model_delete_changed`、`model_delete_failed`、`runtime_profile_conflict`、`runtime_profile_drift`、`listener_not_managed` | 状态或标识冲突 |
 | `410` | `event_cursor_expired` | 事件游标已被淘汰 |
 | `413` | `request_too_large`、`media_too_large` | 会话消息或导出超过上限；上传超过媒体上限 |
 | `415` | `unsupported_media_type` | `Content-Type` 不是 `application/json`，或上传 MIME 不在媒体白名单 |
@@ -113,7 +113,7 @@ Messages 请求拒绝未知字段。
 | `500` | `response_save_failed`、`model_registration_save_failed`、`model_alias_save_failed`、`operation_failed` | 落盘或执行失败 |
 | `501` | `cache_reclaim_not_supported`、`media_unavailable`、`session_mode_unavailable` | 当前服务不提供该能力；含媒体片段回复与文档抽取在原生侧未实现 |
 | `502` | `invalid_tool_output`、`model_card_unavailable`、下载源或校验失败 | 上游/原生输出不可信 |
-| `503` | `server_stopping`、`model_stopping`、`backend_unavailable`、`resource_exhausted` | 停机中或资源不可用 |
+| `503` | `server_stopping`、`model_stopping`、`backend_unavailable`、`resource_exhausted`、`model_not_loaded` | 停机中或资源不可用 |
 
 ### 1.4 列表、删除与异步受理
 
@@ -181,6 +181,16 @@ HTTP 层共 4 个工作线程。流式请求（`/v1/chat/completions`、`/v1/mes
 | `POST` | `/api/models/unload` | `UnloadRequest` | `202 Accepted` | `models` |
 | `GET` | `/api/runtime/instances` | — | `200 {"data":[Instance]}` | `inference` |
 | `GET` | `/api/runtime/instances/{instance_id}` | — | `200 Instance` | `inference` |
+| `PATCH` | `/api/runtime/instances/{instance_id}` | `{"pinned":bool}` 或 `{"idle_ttl_seconds":int\|null}` | `200 Instance` | `models` |
+| `GET` | `/api/runtime/capabilities` | `?instance_id=UUID` | `200 Capabilities` | `inference` |
+| `GET` | `/api/runtime/profiles` | — | `200 {"data":[Profile]}` | `inference` |
+| `POST` | `/api/runtime/profiles` | `{"name":String,"load":ProfileLoad}` | `201 Profile` | `models` |
+| `GET` | `/api/runtime/profiles/{profile_id}` | — | `200 Profile` | `inference` |
+| `PUT` | `/api/runtime/profiles/{profile_id}` | `{"name":String,"load":ProfileLoad}` | `200 Profile` | `models` |
+| `DELETE` | `/api/runtime/profiles/{profile_id}` | — | `204` | `models` |
+| `POST` | `/api/runtime/profiles/{profile_id}/load` | `{"allow_drift":bool}` | `202 Accepted` | `models` |
+| `GET` | `/api/runtime/listener` | — | `200 Listener` | `inference` |
+| `PUT` | `/api/runtime/listener` | `{"port":int,"protocol":"openai"\|"anthropic"}` | `409 listener_not_managed` | `admin` |
 | `GET` | `/api/runtime/status` | `?instance_id=UUID` | `200 Status` | `inference` |
 | `GET` | `/api/runtime/models` | — | `200 {"data":[{"id":String}]}` | `inference` |
 | `GET` | `/api/runtime/resources` | — | `200 Resources` | `inference` |
@@ -561,6 +571,60 @@ memory-policy` 返回 `202 {"operation_id", "status":"accepted"}`，字段错误
 持久化并回显，不改变原生引擎预算、YaRN、KV 量化或设备放置。Python 的
 `GET /api/v1/runtime/memory-policy` 还会附带内存拓扑与生效预算，原生服务没有
 内存规划，只返回策略字段本身。
+
+### 3.8 运行时 profile、实例策略与监听
+
+`/api/runtime/profiles` 增删改查命名加载配置，存在 `runtime_profiles` 表
+（与 Python 服务共用同一张表），重启后保持。读取需要 `inference`，写入与
+加载需要 `models`。
+
+`Profile`：
+
+| 字段 | 含义 |
+|---|---|
+| `id` | profile UUID |
+| `name` | 1-64 个字符，全表唯一 |
+| `load` | 存储的加载请求；`sampling_defaults` 单独存列，响应里回填到 `load` 内 |
+| `artifact_id`、`artifact_modified_at` | 保存时解析到的产物 ID 与修改时间 |
+| `drifted`、`drift_reason` | 每次读取重新解析产物后计算：产物 ID 或修改时间变化即 `true`，产物解析失败也为 `true` 并给出失败原因 |
+| `created_at`、`updated_at` | 保存时间 |
+
+`POST` 与 `PUT` 的正文相同（Python 的 `UpdateRuntimeProfileRequest` 与创建
+模型使用同一模型），两者都要求完整文档。`load` 必须含 `model`（1-255 个
+字符，按产物 ID 或名称解析），解析不到返回 `404 model_artifact_not_found`。
+原生侧只校验并消费 `model`、`context_size`（`512..2147483647`）、`pin`、
+`idle_ttl_seconds`（`1..2147483647`）；其余 Python 加载字段原样存储与回显，
+不改变原生引擎行为。名称冲突返回 `409 runtime_profile_conflict`，未知
+profile 返回 `404 runtime_profile_not_found`，字段非法返回
+`400 invalid_request`。
+
+`POST /api/runtime/profiles/{profile_id}/load` 与 `POST /api/models/load`
+结束于同一个 `model.load` 任务：先检查漂移，漂移且未 `allow_drift` 返回
+`409 runtime_profile_drift`（`message` 即 `drift_reason`）；通过后按存储的
+`load` 提交任务，`202` 响应与 `Location` 头与模型加载相同，任务的 `payload`
+就是 profile 的 `load` 文档。`context_size` 缺省时按 3.1 的运行策略取默认
+上下文；`pin` 与 `idle_ttl_seconds` 同时设置返回 `400 invalid_request`。
+
+`GET /api/runtime/capabilities` 返回 `model`、`model_type`、
+`model_capabilities`（与 `Instance.capabilities` 同形）、`vision_available`
+（`image_input` 或 `video_input`）、`mtp_available`、`duplex_available`。
+带 `instance_id` 时选择该实例，未知返回 `404 runtime_instance_not_found`；
+不带时选择第一个已加载实例。原生服务没有共享 runtime worker 可以上报自己的
+能力，没有已加载实例时返回 `503 model_not_loaded`。
+
+`PATCH /api/runtime/instances/{instance_id}` 只接受 `pinned`（Boolean）与
+`idle_ttl_seconds`（不小于 `0` 的整数，`null` 清除超时），至少出现一个字段，
+其它字段返回 `400 invalid_request`。补丁只改动出现的字段；结果不得同时为
+固定与带超时，否则返回 `400 invalid_request`。响应为更新后的 `Instance`
+（见 3.3），未知实例返回 `404 runtime_instance_not_found`。
+
+`GET /api/runtime/listener` 返回 `{"host","port","anthropic_port":null,
+"configurable":false}`：原生服务在启动时绑定的单个端口同时提供 OpenAI 与
+Anthropic 协议，端口启动时确定，没有可在线改动的托管 listener。
+`PUT /api/runtime/listener` 仍按 Python 校验 `port`（`1..65535`）与
+`protocol`（`openai`\|`anthropic`），校验通过后返回
+`409 listener_not_managed`，`message` 为
+`server listener is managed externally`。
 
 ## 4. 任务与事件
 

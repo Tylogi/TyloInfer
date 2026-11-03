@@ -5,11 +5,13 @@
 
 #include "errors.h"
 #include "httplib.h"
+#include "instance.h"
 #include <algorithm>
 #include <cctype>
 #include <atomic>
 #include <memory>
 #include <nlohmann/json.hpp>
+#include <optional>
 
 namespace mfq::server {
 inline constexpr std::size_t http_workers = 4;
@@ -34,5 +36,13 @@ inline nlohmann::json parse_json(const httplib::Request& request) {
 inline void set_json(httplib::Response& response, const nlohmann::json& body, int status = 200) {
     response.status = status;
     response.set_content(body.dump(), "application/json; charset=utf-8");
+}
+// A query parameter that must be a UUID; an absent parameter yields no value.
+inline std::optional<std::string> query_uuid(const httplib::Request& request, const char* name) {
+    if (!request.has_param(name)) return std::nullopt;
+    const auto value = request.get_param_value(name);
+    if (value.empty()) throw ApiError(400, "invalid_request", std::string(name) + " must be a UUID");
+    // normalize_uuid rejects malformed values, which describe_failure reports as 400 invalid_request.
+    return normalize_uuid(value);
 }
 }

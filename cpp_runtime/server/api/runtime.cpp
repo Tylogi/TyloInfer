@@ -39,14 +39,6 @@ namespace mfq::server {
 namespace {
 using json = nlohmann::json;
 
-std::optional<std::string> query_uuid(const httplib::Request& request, const char* name) {
-    if (!request.has_param(name)) return std::nullopt;
-    const auto value = request.get_param_value(name);
-    if (value.empty()) throw ApiError(400, "invalid_request", std::string(name) + " must be a UUID");
-    // normalize_uuid rejects malformed values, which describe_failure reports as 400 invalid_request.
-    return normalize_uuid(value);
-}
-
 std::int64_t query_integer(const httplib::Request& request, const char* name, std::int64_t fallback,
         std::int64_t minimum, std::int64_t maximum) {
     if (!request.has_param(name)) return fallback;
