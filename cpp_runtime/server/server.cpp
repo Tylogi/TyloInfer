@@ -289,7 +289,10 @@ int run(const Config& config, const std::atomic<bool>& stop_requested, EngineFac
         response.set_header("X-Content-Type-Options", "nosniff");
         response.set_header("X-Frame-Options", "DENY");
         response.set_header("Referrer-Policy", "no-referrer");
-        response.set_header("Content-Security-Policy", "default-src 'self'; connect-src 'self' https://api.github.com ws: wss:; "
+        // Only documents served from --web-root check product releases on GitHub; API responses stay strict.
+        const bool document = response.get_header_value("Content-Type").rfind("text/html", 0) == 0;
+        const auto connect = "'self'" + std::string(document ? " https://api.github.com" : "") + " ws: wss:";
+        response.set_header("Content-Security-Policy", "default-src 'self'; connect-src " + connect + "; "
             "img-src 'self' data: blob:; media-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; "
             "script-src 'self'; font-src 'self' data:");
     });
