@@ -1,5 +1,6 @@
 #include "httplib.h"
 #include "nlohmann/json.hpp"
+#include "openapi.h"
 #include "schema.h"
 #include "server_test_process.h"
 
@@ -14,6 +15,7 @@
 #include <fcntl.h>
 #include <io.h>
 #include <share.h>
+#include <sddl.h>
 #include <sys/locking.h>
 #include <sys/stat.h>
 #else
@@ -422,11 +424,24 @@ void static_files() {
     write_file(web / "api" / "secret", "not an API");
     write_file(web / "health", "not health");
     auto server = f.start({"--web-root", web.u8string() + "/"});
+    const auto openapi = read_file(fs::u8path(TYLOINFER_SERVER_OPENAPI_FILE));
+    CHECK(!openapi.empty());
+    CHECK(std::string(mfq::server::openapi_document) == openapi);
+    CHECK(std::string(mfq::server::schema_sql) == read_file(fs::u8path(TYLOINFER_SERVER_SCHEMA_FILE)));
+    const auto document = server.get("/openapi.json");
+    CHECK(document.status == 200);
+    CHECK(document.body == openapi);
+    CHECK(document.header("Content-Type").find("application/json") != std::string::npos);
+    CHECK(document.document().at("paths").is_object());
     for (const auto* path : {"/", "/chat", "/settings/profile", "/future/page?session=1"}) {
         const auto response = server.get(path, {{"Accept", "text/html"}});
         CHECK(response.status == 200);
         CHECK(response.body == index);
         CHECK(response.header("Content-Type").find("text/html") != std::string::npos);
+        const auto csp = response.header("Content-Security-Policy");
+        CHECK(csp.find("connect-src 'self' https://api.github.com ws: wss:;") != std::string::npos);
+        CHECK(csp.find("connect-src *") == std::string::npos);
+        CHECK(csp.find("script-src 'self';") != std::string::npos);
         const auto head = server.raw("HEAD", path, {{"Accept", "text/html"}});
         CHECK(head.status == 200);
         CHECK(head.body.empty());
@@ -678,7 +693,7 @@ void model_catalog() {
     CHECK(read_file(index) == saved);
     CHECK(server.get("/api/v1/models", admin).document().at("data").size() == 5);
     auto deep = f.root / "deep";
-    for (int i = 0; i < 34; ++i) deep /= "child";
+    for (int i = 0; i < 34; ++i) deep /= "d";
     fs::create_directories(deep);
     write_mfq(deep / "deep.mfq");
     CHECK(server.send("POST", "/api/v1/models/directories/register", {{"path", (f.root / "deep").u8string()}}, admin).status == 413);
@@ -716,6 +731,97 @@ void model_catalog() {
     CHECK(restarted.get("/api/v1/models/directories?directory_id=" + root_id, admin).status == 404);
     fs::remove(external / "gamma" / "model.safetensors");
     CHECK(restarted.get("/api/v1/models?refresh=true", admin).document().at("data").size() == 4);
+}
+
+/** Verifies child access failures are isolated while unavailable selections remain explicit errors. */
+void directory_browsing() {
+    Fixture f;
+    const auto root = f.root / "browse", busy = root / "busy", visible = root / "visible";
+    fs::create_directories(busy);
+    fs::create_directory(visible);
+    write_hf(root / "hf");
+    write_mfq(root / "visible.mfq");
+    auto server = f.start();
+    const auto browse = [&](const fs::path& path) {
+        return server.get("/api/v1/models/directories?path=" + httplib::encode_uri_component(path.u8string()));
+    };
+    const auto initial = browse(root);
+    CHECK(initial.status == 200);
+    const auto initial_document = initial.document();
+    std::string busy_id, visible_id;
+    for (const auto& entry : initial_document.at("data")) {
+        if (entry.at("name") == "busy") busy_id = entry.at("id");
+        if (entry.at("name") == "visible") visible_id = entry.at("id");
+    }
+    CHECK(!busy_id.empty() && !visible_id.empty());
+    {
+#ifdef _WIN32
+        // Simulate access denial by changing only the temporary subdirectory's ACL, then restore it on scope exit.
+        struct Unavailable {
+            fs::path path;
+            std::vector<BYTE> saved;
+            SECURITY_INFORMATION restore = DACL_SECURITY_INFORMATION;
+            explicit Unavailable(const fs::path& path) : path(path) {
+                DWORD bytes = 0;
+                GetFileSecurityW(path.c_str(), DACL_SECURITY_INFORMATION, nullptr, 0, &bytes);
+                CHECK(GetLastError() == ERROR_INSUFFICIENT_BUFFER);
+                saved.resize(bytes);
+                CHECK(GetFileSecurityW(path.c_str(), DACL_SECURITY_INFORMATION, saved.data(), bytes, &bytes));
+                SECURITY_DESCRIPTOR_CONTROL control = 0;
+                DWORD revision = 0;
+                CHECK(GetSecurityDescriptorControl(saved.data(), &control, &revision));
+                restore |= (control & SE_DACL_PROTECTED) ? PROTECTED_DACL_SECURITY_INFORMATION : UNPROTECTED_DACL_SECURITY_INFORMATION;
+                PSECURITY_DESCRIPTOR denied = nullptr;
+                CHECK(ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:P(D;;FA;;;WD)", SDDL_REVISION_1, &denied, nullptr));
+                const auto applied = SetFileSecurityW(path.c_str(), DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION, denied);
+                LocalFree(denied);
+                CHECK(applied);
+            }
+            ~Unavailable() { SetFileSecurityW(path.c_str(), restore, saved.data()); }
+        } unavailable{busy};
+        std::error_code error;
+        (void)fs::canonical(busy, error);
+        CHECK(error);
+#else
+        struct Unavailable {
+            fs::path path;
+            ~Unavailable() { std::error_code ignored; fs::permissions(path, fs::perms::owner_all, ignored); }
+        } unavailable{busy};
+        fs::permissions(busy, fs::perms::none);
+        std::error_code error;
+        fs::directory_iterator probe(busy, error);
+        if (!error) {
+            std::cout << "SKIP unavailable directory: process can bypass permissions\n";
+        } else
+#endif
+        {
+            const auto listed = browse(root);
+            CHECK(listed.status == 200);
+            const auto document = listed.document();
+            CHECK(document.at("model_file_count") == 2);
+            CHECK(document.at("files").size() == 1);
+            CHECK(document.at("data").size() == 2);
+            CHECK(document.at("data")[0].at("name") == "hf");
+            CHECK(document.at("data")[1].at("name") == "visible");
+            const auto selected = browse(busy);
+            CHECK(selected.status == 404);
+            CHECK(selected.document().at("error").at("code") == "model_directory_not_found");
+            CHECK(server.get("/api/v1/models/directories?directory_id=" + busy_id).status == 404);
+        }
+    }
+    CHECK(browse(busy).status == 200);
+#ifndef _WIN32
+    fs::create_directory_symlink(root / "missing", root / "dangling");
+    CHECK(browse(root).status == 200);
+#endif
+    CHECK(fs::remove(visible));
+    for (const auto& path : {visible, root / "missing", root / "visible.mfq"}) {
+        const auto missing = browse(path);
+        CHECK(missing.status == 404);
+        CHECK(missing.document().at("error").at("code") == "model_directory_not_found");
+    }
+    CHECK(server.get("/api/v1/models/directories?directory_id=" + visible_id).status == 404);
+    server.stop();
 }
 
 void model_roots() {
@@ -854,7 +960,7 @@ void databases_and_migration() {
 int run_tests(const fs::path& server, bool models_only) {
     executable = fs::absolute(server);
     using Tests = std::vector<std::pair<const char*, std::function<void()>>>;
-    const Tests tests = models_only ? Tests{{"model catalog", model_catalog}, {"model roots", model_roots}} : Tests{
+    const Tests tests = models_only ? Tests{{"model catalog", model_catalog}, {"directory browsing", directory_browsing}, {"model roots", model_roots}} : Tests{
         {"CLI and lifetime", cli_and_lifetime}, {"locks and ports", locks_and_ports}, {"static files", static_files},
         {"policy and protocols", policy_and_protocols}, {"keys and network", keys_and_network},
         {"shutdown with pending work", shutdown_with_pending_work}, {"database migrations", databases_and_migration}};

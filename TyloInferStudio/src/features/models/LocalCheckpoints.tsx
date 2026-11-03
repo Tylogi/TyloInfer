@@ -10,12 +10,15 @@ import { ModelPressureBars } from './ModelMemoryPressure';
 import { availableResidentMemory, hasSeparateVram } from '../runtime/memoryArchitecture';
 import { ModelDeleteDialog } from './ModelDeleteDialog';
 import { availableLoadMemory } from './loadMemoryEstimate';
+import { serverCapabilities } from '../../app/serverCapabilities';
 import { groupCheckpoints } from './checkpointGroups';
 
+/** Render catalog artifacts and connect lifecycle actions to their human-readable names. */
 export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useModelCatalog> }) {
   const { tr } = useSettings();
   const { runtime, artifacts, busy, instances, modelFilter,
     setModelFilter, filteredArtifacts, unloadInstance, loadArtifact, chooseModelDirectory, openModelFiles, prepareModelDeletion } = catalog;
+  const capabilities = serverCapabilities(runtime);
   const [status, setStatus] = useState('all');
   const [architecture, setArchitecture] = useState('all');
   const [format, setFormat] = useState('all');
@@ -93,7 +96,7 @@ export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useMo
               const loaded = Boolean(instance) || item.name === runtime?.model;
               const streamsExperts = !loaded && item.loadable && (item.estimated_weight_bytes_by_role?.experts ?? 0) > 0
                 && loadMemory != null && item.estimated_resident_weight_bytes != null && item.estimated_resident_weight_bytes > loadMemory;
-              const unavailableLabel = item.complete && item.format === 'hf'
+              const unavailableLabel = item.support_error ? tr('后端暂不支持', 'Backend unsupported') : item.complete && item.format === 'hf'
                 ? tr('需先转换', 'Convert first') : item.missing_shards
                   ? tr('分片不全', 'Incomplete shards') : tr('不可用', 'Invalid');
               const streamingNotice = tr('剩余内存不足，超出部分专家会被放入 SSD 进行流式加载推理。',
@@ -115,7 +118,7 @@ export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useMo
                       {instance.context_size != null && ` · ${formatNumber(instance.context_size)} ctx`}
                       {instance.pinned ? ` · ${tr('固定', 'Pinned')}` : instance.idle_ttl_seconds != null ? ` · TTL ${instance.idle_ttl_seconds}s` : ''}
                     </small>}
-                    {!component && <ModelLoadProgress model={item.name} />}
+                    {!component && <ModelLoadProgress model={item.name} artifactId={item.id} />}
                     {!loaded && item.gguf_companion_required && <details className="model-companion-picker">
                       <summary>{tr('Engram 配套文件', 'Engram companion')}</summary>
                       <input aria-label={tr(`Engram 路径：${item.name}`, `Engram path: ${item.name}`)}
@@ -126,7 +129,7 @@ export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useMo
                   </div>
                   {!component && <div className="local-checkpoint-resources">
                     <div className="local-checkpoint-notice">
-                      {!loaded && !item.loadable && <em className="failed" id={`checkpoint-unavailable-${item.id}`} title={item.error || unavailableLabel}>{unavailableLabel}</em>}
+                      {!loaded && !item.loadable && <em className="failed" id={`checkpoint-unavailable-${item.id}`} title={item.support_error || item.error || unavailableLabel}>{unavailableLabel}</em>}
                       {streamsExperts && <small className="model-streaming-notice" id={`expert-streaming-${item.id}`} title={streamingNotice}>{streamingNotice}</small>}
                     </div>
                     <div className="local-checkpoint-memory">
@@ -148,14 +151,14 @@ export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useMo
                   ) : loaded ? (
                     <em className="model-load-action">{tr('已加载', 'Loaded')}</em>
                   ) : (
-                    <button className="model-load-action" disabled={busy || !item.loadable || (item.gguf_companion_required && !companions[item.id]?.trim())} title={!item.loadable ? item.error || unavailableLabel : undefined}
+                    <button className="model-load-action" disabled={busy || !item.loadable || (item.gguf_companion_required && !companions[item.id]?.trim())} title={!item.loadable ? item.support_error || item.error || unavailableLabel : undefined}
                       aria-describedby={!item.loadable ? `checkpoint-unavailable-${item.id}` : streamsExperts ? `expert-streaming-${item.id}` : undefined}
                       onClick={() => void (companions[item.id]?.trim()
                         ? loadArtifact(item.name, [companions[item.id].trim()]) : loadArtifact(item.name))} type="button">
                       {tr('加载', 'Load')}
                     </button>
                   )}<button className="model-delete-action" aria-label={tr(`删除模型：${item.name}`, `Delete model: ${item.name}`)}
-                    disabled={busy || loaded} title={loaded ? tr('请先卸载模型再删除', 'Unload the model before deleting it') : tr('删除模型', 'Delete model')}
+                    disabled={!capabilities.modelDeletion || busy || loaded} title={!capabilities.modelDeletion ? tr('当前原生服务暂不支持删除模型文件。', 'Deleting model files is unavailable on the native server.') : loaded ? tr('请先卸载模型再删除', 'Unload the model before deleting it') : tr('删除模型', 'Delete model')}
                     onClick={() => void prepareModelDeletion(item.id)} type="button"><Icon name="trash" size={14} /></button></>}
                     </div>
                   </div>

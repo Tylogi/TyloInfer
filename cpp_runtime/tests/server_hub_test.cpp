@@ -10,6 +10,7 @@
 #include <future>
 #include <iostream>
 #include <sstream>
+#include <regex>
 
 using namespace mfq::server;
 using namespace std::chrono_literals;
@@ -102,7 +103,7 @@ struct Origin {
         response.set_content_provider(bytes.size(), "application/octet-stream",
             [bytes, behavior](std::size_t offset, std::size_t length, httplib::DataSink& sink) {
                 if (behavior == 1 && offset >= 65536) return false;
-                if (behavior == 7) std::this_thread::sleep_for(10ms);
+                if (behavior == 7) std::this_thread::sleep_for(100ms);
                 const auto count = std::min<std::size_t>(length, 16384);
                 return sink.write(bytes.data() + offset, count);
             }, [&](bool) { --active; });
@@ -194,9 +195,11 @@ void network(const fs::path& openssl) {
         fetch.direct = true; CHECK(hub::get(fetch, "/echo", {}) == "Bearer fixture-token");
     }
     const auto cert = temporary.root / "cert.pem", key = temporary.root / "key.pem";
-    server_test::Process generate(openssl, {"req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-subj", "/CN=localhost",
+    const auto config = temporary.root / "openssl.cnf";
+    write(config, "[req]\ndistinguished_name=dn\n[dn]\n");
+    server_test::Process generate(openssl, {"req", "-config", path_utf8(config), "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-subj", "/CN=localhost",
         "-addext", "subjectAltName=DNS:localhost", "-keyout", path_utf8(key), "-out", path_utf8(cert)}, temporary.root / "cert.log");
-    CHECK(generate.wait() == 0);
+    if (generate.wait() != 0) throw std::runtime_error("test certificate generation failed: " + generate.output());
     int port;
     { httplib::Server reserve; port = reserve.bind_to_any_port("127.0.0.1"); CHECK(port > 0);
       std::thread listener([&] { reserve.listen_after_bind(); }); wait([&] { return reserve.is_running(); }); reserve.stop(); listener.join(); }
@@ -278,15 +281,19 @@ void routes(const fs::path& executable) {
         CHECK(progress); server.post("/api/v1/jobs/" + id + "/retry", {}, 409);
         origin.mode = 7; auto cancel = payload; cancel["destination"] = "models/cancel-api";
         const auto cancel_id = server.post("/api/v1/jobs", {{"kind", "download.huggingface"}, {"payload", cancel}}).at("id").get<std::string>();
-        wait([&] { return origin.active > 0; }); server.post("/api/v1/jobs/" + cancel_id + "/cancel", {}, 200);
+        // Confirm that some weights arrived so a retry after cancellation must send Range.
+        wait([&] { const auto job = server.get("/api/v1/jobs/" + cancel_id); return job["progress_data"].is_object() && job["progress_data"].value("downloaded_bytes", 0) > 32768; });
+        server.post("/api/v1/jobs/" + cancel_id + "/cancel", {}, 200);
         CHECK(server.complete(cancel_id)["status"] == "cancelled"); CHECK(!fs::exists(temporary.root / "models/cancel-api"));
         origin.mode = 0;
+        const auto hf_ranges = origin.ranges.load();
         const auto retry = server.post("/api/v1/jobs/" + cancel_id + "/retry", {}); CHECK(retry["id"] != cancel_id);
         CHECK(server.complete(retry["id"])["status"] == "succeeded");
+        CHECK(origin.ranges > hf_ranges);
         origin.mode = 7; cancel["destination"] = "models/restart";
         interrupted = server.post("/api/v1/jobs", {{"kind", "download.modelscope"}, {"payload", cancel}}).at("id");
-#ifndef _WIN32
         wait([&] { const auto job = server.get("/api/v1/jobs/" + interrupted); return job["progress_data"].is_object() && job["progress_data"].value("downloaded_bytes", 0) > 32768; });
+#ifndef _WIN32
         server.process->signal(SIGKILL); CHECK(server.process->wait() == -SIGKILL);
 #else
         server.post("/api/v1/jobs/" + interrupted + "/cancel", {}, 200);
@@ -299,9 +306,21 @@ void routes(const fs::path& executable) {
 #ifndef _WIN32
         CHECK(server.get("/api/v1/jobs/" + interrupted)["status"] == "interrupted");
 #endif
+        const auto ms_ranges = origin.ranges.load();
         const auto retry = server.post("/api/v1/jobs/" + interrupted + "/retry", {});
         CHECK(server.complete(retry["id"])["status"] == "succeeded");
-        CHECK(origin.ranges > 0 && server.get("/api/v1/models?refresh=true")["data"].size() == 3);
+        CHECK(origin.ranges > ms_ranges);
+        CHECK(server.get("/api/v1/models?refresh=true")["data"].size() == 3);
+        for (const auto* provider : {"huggingface", "modelscope"}) {
+            const auto info = server.get(std::string("/api/v1/hub/models/") + provider + "/owner/model");
+            const auto label = info["variants"][0]["label"].get<std::string>();
+            auto download = payload;
+            download["destination"] = std::string("models/") + provider + "/owner/model/" +
+                std::regex_replace(label, std::regex("[^A-Za-z0-9_.-]+"), "-");
+            const auto job = server.post("/api/v1/jobs", {{"kind", std::string("download.") + provider}, {"payload", download}});
+            CHECK(server.complete(job["id"])["status"] == "succeeded");
+        }
+        CHECK(server.get("/api/v1/models?refresh=true")["data"].size() == 5);
         server.client->set_default_headers({}); const auto denied = server.client->Post("/api/v1/jobs", payload.dump(), "application/json"); CHECK(denied && denied->status == 401);
     }
 }
