@@ -41,7 +41,7 @@ build/native-server/server/tyloinfer-server --data-dir .tyloinfer --port 8090
 
 原生依赖包括 SQLite3、libcurl 7.85 及以上版本、OpenSSL Crypto。
 实际推理需要启用对应 GPU runtime；Metal 的公开加载工厂仍待接入。
-原生接口以 [OpenAPI](../cpp_runtime/server/api/openapi.json) 为准，
+原生接口以 [HTTP API](api/http.md) 为准，
 不能将 Python 服务的完整接口清单视为原生服务已实现的能力。
 
 ## 留给后续的适配
