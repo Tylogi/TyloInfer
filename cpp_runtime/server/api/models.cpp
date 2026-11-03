@@ -59,6 +59,7 @@ std::int64_t integer(const json& request, const char* field, std::int64_t fallba
         throw ApiError(400, "invalid_request", std::string(field) + " is outside its supported range");
     return value.get<std::int64_t>();
 }
+} // namespace
 
 // The context policy only supplies a default when the request omits context_size. A declared artifact
 // capacity still wins over fallback_context_size, max_context_size pins the size only where its cap
@@ -78,7 +79,25 @@ std::int64_t policy_context_size(const ModelCatalog::Artifact& artifact, const j
     }
     return policy.at("fallback_context_size").get<std::int64_t>();
 }
-} // namespace
+
+// POST /api/models/load and POST /api/runtime/profiles/{id}/load end in this same job; each route
+// resolves its own body into the load arguments.
+std::string submit_model_load(Jobs& jobs, ModelInstances& instances, const std::string& artifact_id,
+        const LoadOptions& options, const LoadPolicy& policy, const json& payload) {
+    return jobs.submit("model.load", payload, [&, artifact_id, options, policy](const Jobs::Control& control) {
+        const auto progress = [&](LoadControl::Phase phase) {
+            control.progress(phase == LoadControl::Phase::resolving ? "resolving" :
+                phase == LoadControl::Phase::loading ? "loading" : "initializing");
+        };
+        try {
+            const auto loaded = instances.load(artifact_id, options, {&control.cancelled, progress}, policy);
+            return instance_json(loaded);
+        } catch (const ModelError& error) {
+            if (error.kind == ModelError::Kind::cancelled) throw Jobs::Cancelled{};
+            throw;
+        }
+    });
+}
 
 void register_models(httplib::Server& http, ModelCatalog& catalog, ModelInstances& instances, Jobs& jobs,
         RuntimePolicies& policies) {
@@ -139,19 +158,7 @@ void register_models(httplib::Server& http, ModelCatalog& catalog, ModelInstance
             policy.idle_ttl = std::chrono::seconds(integer(policy_body, "idle_ttl_seconds", 0, 1, 2147483647));
         if (policy.pin && policy.idle_ttl) throw ApiError(400, "invalid_request", "pinned instances cannot have an idle timeout");
         policy.mtp_enabled = policies.inference_policy().at("mtp_enabled").get<bool>();
-        const auto operation = jobs.submit("model.load", body, [&, artifact_id, options, policy](const Jobs::Control& control) {
-            const auto progress = [&](LoadControl::Phase phase) {
-                control.progress(phase == LoadControl::Phase::resolving ? "resolving" :
-                    phase == LoadControl::Phase::loading ? "loading" : "initializing");
-            };
-            try {
-                const auto loaded = instances.load(artifact_id, options, {&control.cancelled, progress}, policy);
-                return instance_json(loaded);
-            } catch (const ModelError& error) {
-                if (error.kind == ModelError::Kind::cancelled) throw Jobs::Cancelled{};
-                throw;
-            }
-        });
+        const auto operation = submit_model_load(jobs, instances, artifact_id, options, policy, body);
         response.set_header("Location", "/api/jobs/" + operation);
         set_json(response, {{"operation_id", operation}, {"status", "accepted"}}, 202);
     });

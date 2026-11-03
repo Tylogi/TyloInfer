@@ -242,6 +242,31 @@ void ModelInstances::unload(const std::string& instance_id, bool force) {
     { std::lock_guard guard(mutex_); instances_.erase(instance_id); }
 }
 
+InstanceInfo ModelInstance::apply_policy(std::optional<bool> pin,
+        std::optional<std::optional<std::chrono::seconds>> idle_ttl) {
+    std::lock_guard guard(admission_);
+    const bool pinned = pin.value_or(policy_.pin);
+    const auto ttl = idle_ttl ? *idle_ttl : policy_.idle_ttl;
+    if (pinned && ttl)
+        throw ModelError(ModelError::Kind::invalid, "invalid_request", "pinned instances cannot have an idle timeout");
+    policy_.pin = pinned;
+    policy_.idle_ttl = ttl;
+    return snapshot();
+}
+
+InstanceInfo ModelInstances::update_policy(const std::string& instance_id, std::optional<bool> pin,
+        std::optional<std::optional<std::chrono::seconds>> idle_ttl) {
+    std::shared_ptr<ModelInstance> instance;
+    {
+        std::lock_guard guard(mutex_);
+        const auto found = instances_.find(instance_id);
+        if (found != instances_.end()) instance = found->second;
+    }
+    if (!instance) throw ModelError(ModelError::Kind::not_found, "runtime_instance_not_found",
+        "runtime instance was not found: " + instance_id);
+    return instance->apply_policy(pin, idle_ttl);
+}
+
 bool ModelInstances::busy_for(const std::string& artifact_id, const std::string& name) const {
     std::lock_guard guard(mutex_);
     if (loading_ && loading_->id == artifact_id) return true;

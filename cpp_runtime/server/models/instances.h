@@ -38,6 +38,9 @@ public:
 private:
     friend class ModelInstances;
     void close(bool force);
+    // A partial policy patch: an absent optional keeps the current value and a set-but-empty idle
+    // timeout clears it. The result never combines a pin with an idle timeout.
+    InstanceInfo apply_policy(std::optional<bool> pin, std::optional<std::optional<std::chrono::seconds>> idle_ttl);
     std::unique_ptr<engine::Engine> engine_;
     MfqScheduler scheduler_;
     MfqSamplingParams sampling_;
@@ -66,6 +69,9 @@ public:
     Support support(const ModelCatalog::Artifact& artifact) const;
     InstanceInfo load(const std::string& model, LoadOptions options = {}, const LoadControl& control = {}, LoadPolicy policy = {});
     void unload(const std::string& instance_id, bool force = false);
+    // Applies a PATCH-style policy update to one instance and returns its new representation.
+    InstanceInfo update_policy(const std::string& instance_id, std::optional<bool> pin,
+        std::optional<std::optional<std::chrono::seconds>> idle_ttl);
     std::vector<InstanceInfo> list() const;
     /** True when a loaded, unloading, or in-flight load selects this artifact or model name. */
     bool busy_for(const std::string& artifact_id, const std::string& name) const;
