@@ -7,9 +7,12 @@
 
 #include <algorithm>
 #include <ctime>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <iterator>
 #include <limits>
+#include <map>
 #include <regex>
 #include <sstream>
 
@@ -45,6 +48,27 @@ bool boolean(const Json& body, const char* key, bool fallback) {
     if (!body.contains(key)) return fallback;
     if (!body[key].is_boolean()) throw Error(Error::invalid, "invalid_request", std::string(key) + " must be boolean");
     return body[key].get<bool>();
+}
+void bounded(const Json& part, const char* key, std::int64_t minimum, std::int64_t maximum = INT64_MAX, bool required = false) {
+    if (!part.contains(key) || part[key].is_null()) {
+        if (required) throw Error(Error::invalid, "invalid_request", std::string(key) + " is required");
+        return;
+    }
+    const auto value = integer(part[key]);
+    if (value < minimum || value > maximum) throw Error(Error::invalid, "invalid_request", std::string(key) + " is out of range");
+}
+/** Media references are client-supplied identities; the stored row is compared separately. */
+void normalize_media(Json& part) {
+    if (!part.contains("media")) throw Error(Error::invalid, "invalid_request", "media reference is required");
+    auto& reference = part["media"];
+    fields(reference, {"id", "sha256", "mime_type", "byte_size"});
+    reference["id"] = normalize_uuid(text(reference.value("id", Json()), 36, false));
+    const auto digest = text(reference.value("sha256", Json()), 64, false);
+    if (!std::all_of(digest.begin(), digest.end(), [](unsigned char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); }))
+        throw Error(Error::invalid, "invalid_request", "media sha256 must be 64 lowercase hexadecimal characters");
+    reference["sha256"] = digest;
+    text(reference["mime_type"], 255, false);
+    integer(reference["byte_size"]);
 }
 std::string timestamp() {
     const auto value = std::time(nullptr);
@@ -133,12 +157,42 @@ Json normalize_parts(Json parts) {
             if (!part.contains("is_error")) part["is_error"] = false;
             if (!part.contains("result") || !part["is_error"].is_boolean())
                 throw Error(Error::invalid, "invalid_request", "tool result and is_error are required");
-        } else if (type == "image" || type == "video" || type == "audio" || type == "generated_audio" || type == "document") {
-            throw Error(Error::unavailable, "media_unavailable", "native session media validation and archives are not implemented");
+        } else if (type == "image" || type == "video" || type == "audio") {
+            if (type == "image") fields(part, {"type", "media", "width", "height"});
+            else if (type == "video") fields(part, {"type", "media", "width", "height", "duration_ms"});
+            else fields(part, {"type", "media", "sample_rate_hz", "channels", "duration_ms"});
+            normalize_media(part);
+            bounded(part, "width", 1); bounded(part, "height", 1); bounded(part, "duration_ms", 0);
+            if (type == "audio") { bounded(part, "sample_rate_hz", 1, INT64_MAX, true); bounded(part, "channels", 1, 8, true); }
+        } else if (type == "document" || type == "generated_audio") {
+            throw Error(Error::unavailable, "media_unavailable", "native sessions do not store documents or generated audio");
         } else throw Error(Error::invalid, "invalid_request", "unknown content part type");
     }
     if (parts.dump().size() > history_limit) throw Error(Error::too_large, "history_limit", "message exceeds 16 MiB");
     return parts;
+}
+bool holds_media(const Json& parts) {
+    for (const auto& part : parts)
+        if (part.contains("media")) return true;
+    return false;
+}
+/** A stored object is the only authority for a media reference; the client copy must match it exactly. */
+void validate_media(Media& store, sqlite3* database, const Json& parts) {
+    static const std::map<std::string, std::string> prefixes{{"image", "image/"}, {"video", "video/"}, {"audio", "audio/"}};
+    for (const auto& part : parts) {
+        const auto type = part.at("type").get<std::string>();
+        const auto prefix = prefixes.find(type);
+        if (prefix == prefixes.end()) continue;
+        const auto& reference = part.at("media");
+        const auto id = reference.at("id").get<std::string>();
+        Json stored;
+        try { stored = store.get(database, id); }
+        catch (const Media::Error&) { throw Error(Error::unprocessable, "media_not_found", "media is not stored: " + id); }
+        if (stored.at("media") != reference)
+            throw Error(Error::unprocessable, "media_reference_mismatch", "media reference does not match stored object " + id);
+        if (reference.at("mime_type").get<std::string>().rfind(prefix->second, 0) != 0)
+            throw Error(Error::unprocessable, "media_type_mismatch", type + " requires a " + prefix->second.substr(0, prefix->second.size() - 1) + " MIME type");
+    }
 }
 void validate_role(const Json& role) {
     if (role != "system" && role != "user" && role != "assistant" && role != "tool")
@@ -312,7 +366,7 @@ struct Sessions::Reply::State {
     std::size_t bytes = 0;
 };
 
-Sessions::Sessions(Storage& storage, ModelInstances& models) : storage_(storage), models_(models) {
+Sessions::Sessions(Storage& storage, ModelInstances& models, Media& media) : storage_(storage), models_(models), media_(media) {
     auto access = storage_.access();
     sqlite::Transaction transaction(access.database);
     Statement recover(access.database, "UPDATE sessions SET state='interrupted',runtime_instance_id=NULL,updated_at=? "
@@ -364,6 +418,7 @@ Sessions::Json Sessions::append(const std::string& id, const Json& body) {
     const auto parts = normalize_parts(body.value("parts", Json()));
     auto access = storage_.access(); sqlite::Transaction transaction(access.database);
     editable(session(access.database, id), expected);
+    validate_media(media_, access.database, parts);
     const auto message = add_message(access.database, id, role, parts, timestamp());
     history(access.database, id);
     auto result = Json{{"session", session(access.database, id)}, {"message", message}};
@@ -422,15 +477,30 @@ Sessions::Json Sessions::export_archive(const std::string& id) const {
     const auto current = session(access.database, id);
     auto data = history(access.database, id);
     for (auto& message : data) { message["parts"] = normalize_parts(message.at("parts")); message.erase("id"); message.erase("parent_id"); }
-    return {{"format", "mfq-session-v1"}, {"session", current}, {"messages", std::move(data)}, {"media", Json::array()}};
+    auto embedded = Json::array();
+    std::vector<std::string> digests;
+    for (const auto& message : data) for (const auto& part : message.at("parts")) {
+        if (!part.contains("media")) continue;
+        const auto digest = part.at("media").at("sha256").get<std::string>();
+        if (std::find(digests.begin(), digests.end(), digest) != digests.end()) continue;
+        digests.push_back(digest);
+        const auto id = part.at("media").at("id").get<std::string>();
+        const auto stored = media_.get(access.database, id);
+        std::ifstream blob(path_utf8(media_.path(access.database, id)), std::ios::binary);
+        if (!blob) throw Error(Error::unprocessable, "media_not_found", "media blob is missing: " + digest);
+        const std::string bytes{std::istreambuf_iterator<char>(blob), std::istreambuf_iterator<char>()};
+        embedded.push_back({{"sha256", digest}, {"mime_type", stored.at("media").at("mime_type")},
+            {"data_base64", base64_encode(bytes)}, {"document", nullptr}});
+    }
+    return {{"format", "mfq-session-v1"}, {"session", current}, {"messages", std::move(data)}, {"media", std::move(embedded)}};
 }
 Sessions::Json Sessions::import_archive(const Json& archive) {
     fields(archive, {"format", "session", "messages", "media"});
     if (archive.value("format", Json()) != "mfq-session-v1" || !archive.contains("session") || !archive["session"].is_object() ||
         !archive.contains("messages") || !archive["messages"].is_array() || archive["messages"].size() > 10000)
         throw Error(Error::invalid, "invalid_request", "invalid session archive");
-    if (archive.contains("media") && (!archive["media"].is_array() || !archive["media"].empty()))
-        throw Error(Error::unavailable, "media_unavailable", "media archive import is not implemented");
+    if (archive.contains("media") && !archive["media"].is_array())
+        throw Error(Error::invalid, "invalid_request", "media must be an array");
     const auto& source = archive["session"];
     auto metadata = source.value("metadata", Json::object());
     if (!metadata.is_object()) throw Error(Error::invalid, "invalid_request", "metadata must be an object");
@@ -440,10 +510,30 @@ Sessions::Json Sessions::import_archive(const Json& archive) {
     auto created = create_session(access.database, {{"model", source.value("model", Json(""))}, {"mode", source.value("mode", Json("text"))},
         {"title", source.value("title", Json())}, {"metadata", std::move(metadata)}});
     const auto id = created.at("id").get<std::string>();
+    // Imported objects are re-stored here, so every message reference is rewritten to the local row.
+    Json replacements = Json::object();
+    for (const auto& portable : archive.value("media", Json::array())) {
+        fields(portable, {"sha256", "mime_type", "data_base64", "document"});
+        if (!portable.value("document", Json()).is_null())
+            throw Error(Error::unavailable, "media_unavailable", "document extraction is not implemented");
+        const auto data = base64_decode(text(portable.value("data_base64", Json()), Media::max_bytes / 3 * 4 + 4));
+        const auto stored = media_.put(access.database, data, text(portable.value("mime_type", Json()), 255, false),
+            text(portable.value("sha256", Json()), 64, false));
+        replacements[stored.at("media").at("sha256").get<std::string>()] = stored.at("media");
+    }
     for (const auto& message : archive["messages"]) {
         fields(message, {"role", "parts", "created_at"});
         const auto role = message.value("role", Json()); validate_role(role);
-        const auto parts = normalize_parts(message.value("parts", Json()));
+        auto parts = normalize_parts(message.value("parts", Json()));
+        for (auto& part : parts) {
+            if (!part.contains("media")) continue;
+            const auto digest = part.at("media").at("sha256").get<std::string>();
+            const auto replacement = replacements.find(digest);
+            if (replacement == replacements.end())
+                throw Error(Error::unprocessable, "archive_media_missing", "archive does not contain media " + digest);
+            part["media"] = *replacement;
+        }
+        validate_media(media_, access.database, parts);
         const auto when = text(message.value("created_at", Json()), 32, false);
         std::smatch parsed;
         if (!std::regex_match(when, parsed, date)) throw Error(Error::invalid, "invalid_request", "created_at must be a timestamp with timezone");
@@ -457,7 +547,7 @@ Sessions::Json Sessions::import_archive(const Json& archive) {
         add_message(access.database, id, role, parts, when);
     }
     history(access.database, id);
-    auto result = Json{{"session", session(access.database, id)}, {"messages_imported", archive["messages"].size()}, {"media_imported", 0}};
+    auto result = Json{{"session", session(access.database, id)}, {"messages_imported", archive["messages"].size()}, {"media_imported", replacements.size()}};
     transaction.commit(); return result;
 }
 Sessions::Json Sessions::presets() const {
@@ -546,6 +636,12 @@ std::shared_ptr<Sessions::Reply> Sessions::start(const std::string& id, Json req
     const auto model = options["model"].is_null() ? current.at("model").get<std::string>() : options["model"].get<std::string>();
     if (model.empty()) throw Error(Error::invalid, "model_required", "select a model before sending a message");
     auto data = history(access.database, id);
+    for (const auto& message : data) validate_media(media_, access.database, message.at("parts"));
+    validate_media(media_, access.database, request["input"]);
+    // Uploads and archives are stored, but the native engine has no image or audio preprocessing stage.
+    if (holds_media(request["input"]) || std::any_of(data.begin(), data.end(),
+            [](const Json& message) { return holds_media(message.at("parts")); }))
+        throw Error(Error::unavailable, "media_unavailable", "native inference has no media tensor preprocessing yet");
     auto messages = Json::array();
     if (!options["system_prompt"].is_null() && !options["system_prompt"].get<std::string>().empty())
         messages.push_back({{"role", "system"}, {"content", options["system_prompt"]}});

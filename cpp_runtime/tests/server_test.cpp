@@ -255,6 +255,55 @@ private:
     socket_t socket_ = INVALID_SOCKET;
 };
 
+void media_uploads() {
+    Fixture f;
+    auto server = f.start({}, root_environment);
+    const std::string picture{"tyloinfer-media-check"};
+    const std::string digest{"2b03e8c6dff53e6694f0f92589500c61062a1789d8e5d5b65714f64cf2c000a7"};
+    auto upload = [&](const char* mime, const std::string& body, const std::string& sha, bool authorized = true) {
+        httplib::Headers headers{{"Content-Type", mime}};
+        if (!sha.empty()) headers.emplace("X-Content-SHA256", sha);
+        if (authorized) headers.insert(admin.begin(), admin.end());
+        return server.raw("POST", "/api/v1/media", headers, body);
+    };
+    CHECK(upload("image/png", picture, digest, false).status == 401);
+    const auto created = upload("image/png", picture, digest);
+    CHECK(created.status == 201);
+    const auto resource = created.document();
+    CHECK(resource.at("media").at("sha256") == digest && resource.at("media").at("mime_type") == "image/png" &&
+        resource.at("media").at("byte_size") == picture.size() &&
+        resource.at("media").at("id").get<std::string>().size() == 36 && !resource.at("created_at").is_null());
+    const auto id = resource.at("media").at("id").get<std::string>();
+    CHECK(upload("application/octet-stream", picture, digest).document().at("media").at("id") == id);
+    const auto fetched = server.get("/api/v1/media/" + id, admin);
+    CHECK(fetched.status == 200 && fetched.body == picture);
+    CHECK(fetched.header("Content-Type") == "image/png" && fetched.header("ETag") == "\"" + digest + "\"" &&
+        fetched.header("Cache-Control") == "private, immutable, max-age=31536000" &&
+        fetched.header("X-Content-Type-Options") == "nosniff");
+    CHECK(server.get("/api/v1/media/" + id).status == 401);
+    CHECK(server.get("/api/v1/media/00000000-0000-4000-8000-000000000000", admin).status == 404);
+    CHECK(server.get("/api/v1/media/not-a-media-id", admin).status == 404);
+    CHECK(upload("application/x-shockwave-flash", picture, digest).status == 415);
+    CHECK(upload("image/png", "", digest).status == 400 && upload("image/png", "", digest).document()["error"]["code"] == "empty_media");
+    CHECK(upload("image/png", picture, std::string(64, '0')).status == 422);
+    CHECK(upload("image/png", picture, "not-a-digest").status == 400);
+    CHECK(upload("image/png", picture, "").status == 400);
+    CHECK(upload("image/png", picture, digest, false).status == 401);
+    const auto oversized = server.send("POST", "/api/v1/sessions", json{{"title", std::string(2 * 1024 * 1024, 'x')}});
+    CHECK(oversized.status == 413 && oversized.document()["error"]["code"] == "request_too_large");
+    const std::string large(2 * 1024 * 1024, 'm');
+    // The payload cap only rises for uploads, so this exceeds the JSON cap while staying under the media limit.
+    const auto uploaded = upload("image/png", large, "67c082ebaf8f24d2ad6f6e1ca6e37cbe7ff17f3dcde39ecd6a4ed311c6210fb7");
+    CHECK(uploaded.status == 201 && uploaded.document().at("media").at("byte_size") == large.size());
+    const auto issued = server.send("POST", "/api/v1/auth/keys", {{"name", "jobs-only"}, {"scopes", {"jobs"}}}, admin);
+    CHECK(issued.status == 201);
+    CHECK(server.raw("POST", "/api/v1/media", {{"Content-Type", "image/png"}, {"X-Content-SHA256", digest},
+        {"Authorization", "Bearer " + issued.document().at("token").get<std::string>()}}, picture).status == 403);
+    server.stop();
+    auto restarted = f.start({}, root_environment);
+    CHECK(restarted.get("/api/v1/media/" + id, admin).body == picture);
+}
+
 void cli_and_lifetime() {
     Fixture f;
     write_file(f.root / "file", "not a directory");
@@ -1224,6 +1273,7 @@ int run_tests(const fs::path& server, bool models_only) {
         {"model roots", model_roots}, {"model inspection", model_inspection}, {"model deletion", model_deletion}} : Tests{
         {"CLI and lifetime", cli_and_lifetime}, {"locks and ports", locks_and_ports}, {"static files", static_files},
         {"policy and protocols", policy_and_protocols}, {"keys and network", keys_and_network},
+        {"media uploads", media_uploads},
         {"runtime observation", runtime_observation},
         {"shutdown with pending work", shutdown_with_pending_work}, {"database migrations", databases_and_migration}};
     int failures = 0;

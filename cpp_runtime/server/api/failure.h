@@ -4,6 +4,7 @@
 #include "models/errors.h"
 #include "jobs/jobs.h"
 #include "hub/hub.h"
+#include "media/media.h"
 #include "sessions/sessions.h"
 #include "protocol.h"
 #include "httplib.h"
@@ -64,11 +65,24 @@ inline HttpFailure describe_failure(std::exception_ptr exception) {
             case Hub::Error::unavailable: status = 501; break;
             case Hub::Error::io: break;
         }
+    } catch (const Media::Error& error) {
+        code = error.code; message = error.what();
+        switch (error.kind) {
+            case Media::Error::invalid: status = 400; break;
+            case Media::Error::not_found: status = 404; break;
+            case Media::Error::unprocessable: status = 422; break;
+            case Media::Error::too_large: status = 413; break;
+            case Media::Error::unsupported: status = 415; break;
+            case Media::Error::save_failed: status = 500; break;
+        }
+        return {status, {{"code", error.code}, {"message", error.what()},
+            {"retryable", false}, {"details", nlohmann::json::object()}}};
     } catch (const Sessions::Error& error) {
         switch (error.kind) {
             case Sessions::Error::invalid: status = 400; break;
             case Sessions::Error::not_found: status = 404; break;
             case Sessions::Error::conflict: status = 409; break;
+            case Sessions::Error::unprocessable: status = 422; break;
             case Sessions::Error::unavailable: status = 501; break;
             case Sessions::Error::too_large: status = 413; break;
             case Sessions::Error::stopping: status = 503; break;

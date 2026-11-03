@@ -101,15 +101,15 @@ Messages 请求拒绝未知字段。
 | `400` | `job_kind_not_supported`、`repo_type_not_supported`、`unsupported_requirement` | 请求了未支持的类型 |
 | `400` | `search_cursor_expired` | Hub 搜索游标过期或筛选条件变化 |
 | `401` / `403` | `authentication_error`、`authentication_required` | 凭据缺失、无效、撤销或过期 |
-| `404` | `not_found`、`operation_not_found`、`model_artifact_not_found`、`model_directory_not_found`、`session_not_found`、`response_not_found` | 对象不存在或已归档 |
+| `404` | `not_found`、`operation_not_found`、`model_artifact_not_found`、`model_directory_not_found`、`session_not_found`、`response_not_found`、`media_not_found` | 对象不存在或已归档 |
 | `409` | `job_state_conflict`、`model_already_loaded`、`model_operation_busy`、`model_busy`、`model_alias_conflict`、`revision_conflict`、`response_in_progress`、`request_cancelled`、`model_delete_busy`、`model_delete_unsafe`、`model_delete_changed`、`model_delete_failed` | 状态或标识冲突 |
 | `410` | `event_cursor_expired` | 事件游标已被淘汰 |
-| `413` | `request_too_large` | 会话消息或导出超过上限 |
-| `415` | `unsupported_media_type` | `Content-Type` 不是 `application/json` |
-| `422` | `checkpoint_analysis_unavailable`、`model_cache_profile_unavailable` | 检查点不完整或元数据读不出 |
+| `413` | `request_too_large`、`media_too_large` | 会话消息或导出超过上限；上传超过媒体上限 |
+| `415` | `unsupported_media_type` | `Content-Type` 不是 `application/json`，或上传 MIME 不在媒体白名单 |
+| `422` | `checkpoint_analysis_unavailable`、`model_cache_profile_unavailable`、`media_digest_mismatch`、`media_reference_mismatch`、`media_type_mismatch`、`archive_media_missing` | 检查点不完整或元数据读不出；媒体内容与引用不一致 |
 | `429` | `operation_queue_full`、`stream_connections_full` | 后台队列或流式连接已满 |
 | `500` | `response_save_failed`、`model_registration_save_failed`、`model_alias_save_failed`、`operation_failed` | 落盘或执行失败 |
-| `501` | `cache_reclaim_not_supported`、`media_unavailable`、`session_mode_unavailable` | 当前服务不提供该能力 |
+| `501` | `cache_reclaim_not_supported`、`media_unavailable`、`session_mode_unavailable` | 当前服务不提供该能力；含媒体片段回复与文档抽取在原生侧未实现 |
 | `502` | `invalid_tool_output`、`model_card_unavailable`、下载源或校验失败 | 上游/原生输出不可信 |
 | `503` | `server_stopping`、`model_stopping`、`backend_unavailable`、`resource_exhausted` | 停机中或资源不可用 |
 
@@ -222,7 +222,16 @@ HTTP 层共 4 个工作线程。流式请求（`/v1/chat/completions`、`/v1/mes
 | `POST` | `/api/v1/sessions/{session_id}/responses` | `CreateResponse` | `200 SessionResponse` 或 SSE |
 | `POST` | `/api/v1/sessions/{session_id}/responses/cancel` | — | `200 SessionResponse` |
 
-### 2.5 生成预设（`inference`）
+### 2.5 媒体上传（`inference`）
+
+| 方法 | 路径 | 请求 | 成功 |
+|---|---|---|---|
+| `POST` | `/api/v1/media` | 原始字节，带 `Content-Type` 与 `X-Content-SHA256` | `201 MediaResource` |
+| `GET` | `/api/v1/media/{media_id}` | — | `200` 原始字节 |
+
+没有媒体列表端点。字段表与三层能力状态见 §5.5。
+
+### 2.6 生成预设（`inference`）
 
 | 方法 | 路径 | 请求 | 成功 |
 |---|---|---|---|
@@ -233,7 +242,7 @@ HTTP 层共 4 个工作线程。流式请求（`/v1/chat/completions`、`/v1/mes
 
 `PUT` 整体替换预设，不是部分更新。预设创建不要求模型已加载。
 
-### 2.6 Hub 与下载目录
+### 2.7 Hub 与下载目录
 
 | 方法 | 路径 | 请求 | 成功 | scope |
 |---|---|---|---|---|
@@ -290,7 +299,7 @@ cache profile、attention profile、license 和 `published_at` 一律为 `null`�
 `directory`、`actual_directory`、`default_directory`、`disk_total_bytes`、
 `disk_free_bytes`、`disk_available_bytes`、`evict_prefix_cache`（恒 `false`）。
 
-### 2.7 推理取消（`inference`）
+### 2.8 推理取消（`inference`）
 
 | 方法 | 路径 | 请求 | 成功 |
 |---|---|---|---|
@@ -300,7 +309,7 @@ cache profile、attention profile、license 和 `published_at` 一律为 `null`�
 只表示已受理取消意图，不表示生成已终止或资源已清理；终态从原推理流读取。
 同步原生加载只能在工厂返回后收尾。
 
-### 2.8 健康与身份
+### 2.9 健康与身份
 
 `GET /health` 返回 `{"status":"ok","service":"tyloinfer-server","protocol_version":"1.0"}`。
 `GET /health/identity` 返回进程身份：`service`、`protocol_version`、
@@ -584,6 +593,12 @@ SSE 开始前的失败用 HTTP 错误；开始后的失败发送 `event: error` 
 | `transcript` | `text`、`language`、`start_ms`、`end_ms` |
 | `tool_call` | `call_id`（≤255）、`name`（≤255）、`arguments`（Object，默认 `{}`） |
 | `tool_result` | `call_id`、`result`（任意）、`is_error`（默认 `false`） |
+| `image` | `media`、`width`、`height`（后两个可选，`≥1`） |
+| `video` | `media`、`width`、`height`、`duration_ms`（可选，`≥0`） |
+| `audio` | `media`、`sample_rate_hz`（`≥1`）、`channels`（`1..8`）、`duration_ms`（可选） |
+
+`media` 是 `MediaRef`：`id`、`sha256`（64 位小写十六进制）、`mime_type`（≤255）、
+`byte_size`（`≥0`）。`document` 与 `generated_audio` 片段返回 `501 media_unavailable`。
 
 部件数组为 `1..1024` 项。`POST /messages` 需要 `expected_revision`、`role`
 （`system`\|`user`\|`assistant`\|`tool`）和 `parts`，原子追加并返回
@@ -593,9 +608,11 @@ SSE 开始前的失败用 HTTP 错误；开始后的失败发送 `event: error` 
 `fork` 可指定 `at_message_id`、`include_message`（默认 `true`）、`title`、
 `model`。`rewind` 需要 `expected_revision` 与 `at_message_id`。`export` 返回
 `SessionArchive`（`format: "mfq-session-v1"`、`session`、`messages` ≤10000、
-`media` 恒为空数组）；含媒体的会话导出返回 `501 media_unavailable`。
-`POST /sessions/import` 原子导入，返回 `messages_imported` 与恒为 0 的
-`media_imported`。有活动回复的会话拒绝删除。
+`media` 为按 `sha256` 去重的内联媒体，每项 `sha256`、`mime_type`、`data_base64`、
+`document`）。`POST /sessions/import` 原子导入，先把归档媒体重新落盘，再把消息里的
+媒体引用按 `sha256` 改写到本地对象，返回 `messages_imported` 与 `media_imported`；
+归档没有引用到的媒体返回 `422 archive_media_missing`，`document` 非 `null` 返回
+`501 media_unavailable`。有活动回复的会话拒绝删除。
 
 ### 5.2 创建回复与幂等
 
@@ -668,6 +685,40 @@ data: {"protocol_version":"1.0","session_id":"...","sequence":0,"timestamp":"...
 `running` 快照重放成成功。数据库事务失败则回滚：历史查询可能仍读到此前提交的
 `running` 记录，该记录不表示执行仍在继续。重启恢复会把遗留回复标记为
 `failed`、会话标记为 `interrupted`，并保留已提交的用户输入。
+
+### 5.5 媒体上传与媒体片段
+
+`MediaResource`：`media`（`MediaRef`）与 `created_at`。
+
+`POST /api/v1/media` 读取原始请求体（不是 JSON），要求两个头：
+
+| 头 | 约束 | 不满足 |
+|---|---|---|
+| `Content-Type` | `image/`、`audio/`、`video/`、`text/` 前缀，或 `application/json`\|`pdf`\|`xml`\|`yaml`\|`octet-stream`\|`vnd.openxmlformats-officedocument.wordprocessingml.document`；`;` 后缀被剖掉并转小写 | `415 unsupported_media_type` |
+| `X-Content-SHA256` | 64 位小写十六进制，必须等于请求体的摘要 | `400 invalid_request` / `422 media_digest_mismatch` |
+
+空请求体返回 `400 empty_media`；超过 536870912 字节（512 MiB）返回
+`413 media_too_large`。只有该端点的请求体上限提到 512 MiB，其余 API 路由仍在
+1 MiB 内，超出返回 `413 request_too_large`。对象按摘要寻址：落盘到
+`<data-dir>/media/<摘要前 2>/<2..4>/<摘要>`（权限 `0600`，临时文件 + 重命名），
+同摘要的重复上传返回已有对象而不重写。`GET /api/v1/media/{media_id}` 返回原始
+字节与媒体 `mime_type`，带 `Cache-Control: private, immutable, max-age=31536000`、
+`ETag: "<摘要>"` 与全局 `X-Content-Type-Options: nosniff`；ID 不存在或 blob 己丢
+返回 `404 media_not_found`。
+
+媒体在原生侧分三层，能力不同：
+
+| 层 | 状态 |
+|---|---|
+| 上传、落盘、取回、会话消息引用校验、导出/导入往返 | 已打通 |
+| 含 `image`\|`video`\|`audio` 片段的回复 | `501 media_unavailable`，原生没有把字节变成张量的预处理阶段，是独立一期 |
+| `document` 片段与 `/api/v1/documents` | 未实现，保持 `501 media_unavailable` |
+
+片段校验分两步。结构：未知字段、`audio` 缺 `sample_rate_hz`/`channels`、越界整数
+返回 `400 invalid_request`。内容：每个媒体引用必须指向已存储对象且与存储行完全
+一致，否则 `422 media_not_found` 或 `422 media_reference_mismatch`；`mime_type`
+前缀需与片段类型一致，否则 `422 media_type_mismatch`。追加消息与创建回复都会
+校验（回复同时校验历史与输入）；`501` 在受理阶段抛出，输入不会被写入历史。
 
 ## 6. `/v1` 兼容层
 
@@ -796,8 +847,11 @@ Anthropic `2023-06-01` 子集，严格校验：未知字段返回
 | `stop_sequences` | String[] | ≤16；空数组可接受，非空返回 `501`（原生终态事件尚未暴露命中的停止串） |
 
 `tool_use`/`thinking` 只允许出现在 `assistant` 消息，`tool_result` 只允许在
-`user` 消息。采样缺省取自原生模型 profile。图片只透传给原生输入校验，本路由
-不抓取或解码。请求体上限 1 MiB；累计输出或保留的工具参数上限 16 MiB 与 128 次
+`user` 消息。采样缺省取自原生模型 profile。`source.type:"base64"` 的内联图片
+在入口返回 `501 media_unavailable`（原生无图片解码器）；`source.type:"url"` 的
+HTTP(S) 图片会转成 OpenAI `image_url` 输入，而原生 chat 模板只接受 `text` 与
+`media_marker` 片段，因此返回 `400 invalid_request_error`。本路由不抓取图片。
+请求体上限 1 MiB；累计输出或保留的工具参数上限 16 MiB 与 128 次
 调用。
 
 非流式返回 `Message`：`id`、`type:"message"`、`role:"assistant"`、`model`、
@@ -817,8 +871,9 @@ thinking 的 `signature` 为空串。
 
 ## 7. Python 后端
 
-Python 服务（`tyloinfer/server`）仍是独立入口，其独有接口——媒体与文档、
-实时/语音、量化、数据集与评估、集群节点、运行时 profile 与缓存管理等——以
-`tyloinfer/server` 代码及其 `tyloinfer/server/protocol/openapi.json` 为准。
-本文只描述原生 C++ server 已实现的能力，不能把 Python 服务的接口清单当作
-原生服务已实现的能力。
+Python 服务（`tyloinfer/server`）仍是独立入口，其独有接口——文档抽取与
+`/api/v1/documents`、实时/语音、量化、数据集与评估、集群节点、运行时 profile 与
+缓存管理等——以 `tyloinfer/server` 代码及其 `tyloinfer/server/protocol/openapi.json`
+为准。媒体上传与取回两边都有，但路径、错误码与能力边界各自定义：原生侧见 §5.5，
+原生侧不提取文档文本，也不把媒体片段送进生成推理。本文只描述原生 C++ server
+已实现的能力，不能把 Python 服务的接口清单当作原生服务已实现的能力。

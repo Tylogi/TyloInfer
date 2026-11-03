@@ -9,6 +9,7 @@
 #include "api/jobs.h"
 #include "api/hub.h"
 #include "hub/hub.h"
+#include "api/media.h"
 #include "api/sessions.h"
 #include "api/failure.h"
 #include "protocol.h"
@@ -42,6 +43,9 @@ namespace {
 
 using json = nlohmann::json;
 namespace fs = std::filesystem;
+
+// Every API route except a media upload stays under this request body cap.
+constexpr std::size_t json_payload_bytes = 1024 * 1024;
 
 std::string lowercase(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
@@ -215,7 +219,8 @@ int run(const Config& config, const std::atomic<bool>& stop_requested, EngineFac
     Hub hub(data_dir, std::move(hub_network));
     const std::string backend = factory.backend;
     ModelInstances instances(models, storage, std::move(factory));
-    Sessions sessions(storage, instances);
+    Media media(storage, data_dir / "media");
+    Sessions sessions(storage, instances, media);
     Jobs jobs(storage, [](std::exception_ptr exception) { return describe_failure(exception).detail; });
     auto streams = std::make_shared<std::atomic<std::size_t>>(0);
     httplib::Server http;
@@ -230,7 +235,8 @@ int run(const Config& config, const std::atomic<bool>& stop_requested, EngineFac
             throw std::runtime_error("cannot configure exclusive HTTP listener");
     });
     http.new_task_queue = [] { return new httplib::ThreadPool(http_workers, 0, 32); };
-    http.set_payload_max_length(1024 * 1024);
+    // Uploads are the only large payloads; the pre-routing check keeps every other route at the small cap.
+    http.set_payload_max_length(Media::max_bytes);
     http.set_read_timeout(5);
     http.set_write_timeout(5);
     http.set_keep_alive_timeout(1);
@@ -267,6 +273,15 @@ int run(const Config& config, const std::atomic<bool>& stop_requested, EngineFac
             return httplib::Server::HandlerResponse::Handled;
         }
         if (request.path.rfind("/api/", 0) == 0 || request.path.rfind("/v1", 0) == 0) {
+            if (request.method != "POST" || request.path != "/api/v1/media") {
+                // shortcut: this guard reads Content-Length, so a chunked body only sees the global cap;
+                // upgrade to a streaming limit if a non-upload route ever needs a hard cap mid-transfer.
+                if (request.get_header_value_u64("Content-Length") > json_payload_bytes) {
+                    request_error(request, response, std::make_exception_ptr(ApiError(413, "request_too_large",
+                        "request body exceeds " + std::to_string(json_payload_bytes) + " bytes")));
+                    return httplib::Server::HandlerResponse::Handled;
+                }
+            }
             const auto authorization = request.get_header_value("Authorization");
             auto token = authorization.rfind("Bearer ", 0) == 0 ? authorization.substr(7) : "";
             if (token.empty() && websocket) token = request.get_param_value("access_token");
@@ -316,6 +331,7 @@ int run(const Config& config, const std::atomic<bool>& stop_requested, EngineFac
     register_hub(http, hub, models, jobs, backend);
     register_inference(http, instances, streams);
     register_sessions(http, sessions, streams);
+    register_media(http, media);
     if (!web_root.empty()) http.Get("/.*", [&](const httplib::Request& request, httplib::Response& response) {
         static_response(web_root, request, response);
     });
