@@ -188,22 +188,10 @@ export const runtimeApi = {
   runtimeListener(): Promise<RuntimeListener> {
     return request('/api/runtime/listener');
   },
-
   configureRuntimeListener(port: number, protocol: 'openai' | 'anthropic' = 'openai'): Promise<RuntimeListener> {
     return request('/api/runtime/listener', {
       method: 'PUT', body: JSON.stringify(protocol === 'openai' ? { port } : { port, protocol }),
     });
-  },
-
-  runtimeCapabilities(instanceId?: string | null): Promise<RuntimeCapabilities> {
-    const suffix = instanceId ? `?instance_id=${encodeURIComponent(instanceId)}` : '';
-    return request(`/api/runtime/capabilities${suffix}`);
-  },
-
-
-  runtimeStatus(instanceId?: string | null): Promise<RuntimeStatus> {
-    const suffix = instanceId ? `?instance_id=${encodeURIComponent(instanceId)}` : '';
-    return request(`/api/runtime/status${suffix}`);
   },
 
   /** Read and adapt native instances while preserving unreported telemetry as unknown. */
@@ -246,14 +234,6 @@ export const runtimeApi = {
 
   activateVoiceOutputComponent(): Promise<{ active: boolean; reason?: string; error?: string }> {
     return request('/api/components/voice-output/activate', { method: 'POST' });
-  },
-
-
-  reloadRuntime(contextSize: number, instanceId?: string): Promise<RuntimeStatus> {
-    return request('/api/runtime/reload', {
-      method: 'POST',
-      body: JSON.stringify({ context_size: contextSize, instance_id: instanceId }),
-    });
   },
 
   contextPolicy(): Promise<RuntimeContextPolicy> {

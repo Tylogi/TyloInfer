@@ -59,7 +59,6 @@ describe('RuntimeProvider 故障状态', () => {
     vi.spyOn(runtimeApi, 'runtimeInstances').mockResolvedValue([]);
     vi.spyOn(jobsApi, 'jobs').mockResolvedValue([]);
     vi.spyOn(modelsApi, 'modelArtifacts').mockResolvedValue([]);
-    vi.spyOn(runtimeApi, 'runtimeStatus').mockResolvedValue({ runtime_state: 'idle' } as RuntimeStatus);
     vi.spyOn(runtimeApi, 'voiceOutputComponent').mockResolvedValue({} as Awaited<ReturnType<typeof runtimeApi.voiceOutputComponent>>);
   });
 
@@ -69,7 +68,6 @@ describe('RuntimeProvider 故障状态', () => {
     expect(capturedRuntime.runtime).toEqual({ source: 'native-instances', runtime_state: 'idle' });
     expect(capturedRuntime.models).toEqual([]);
     expect(capturedRuntime.realtime).toBeNull();
-    expect(runtimeApi.runtimeStatus).not.toHaveBeenCalled();
     expect(runtimeApi.voiceOutputComponent).not.toHaveBeenCalled();
   });
 
@@ -206,7 +204,6 @@ describe('RuntimeProvider 故障状态', () => {
       active_sessions: 0, queued_requests: 0 } as RuntimeInstance;
     vi.mocked(jobsApi.jobs).mockResolvedValue([activeJob]);
     vi.mocked(runtimeApi.runtimeInstances).mockResolvedValue([loading]);
-    vi.mocked(runtimeApi.runtimeStatus).mockResolvedValue({ runtime_state: 'loading', model: 'test-model' } as RuntimeStatus);
     vi.spyOn(jobsApi, 'streamJobEvents').mockImplementation(() => new Promise<void>(() => {}));
     const view = render(<RuntimeProvider><RuntimeFixture /></RuntimeProvider>);
     try {
@@ -218,7 +215,6 @@ describe('RuntimeProvider 故障状态', () => {
       expect(capturedRuntime.runtime?.runtime_state).toBe('loading');
       const calls = vi.mocked(runtimeApi.runtimeInstances).mock.calls.length;
       vi.mocked(runtimeApi.runtimeInstances).mockResolvedValue([]);
-      vi.mocked(runtimeApi.runtimeStatus).mockResolvedValue({ runtime_state: 'idle' } as RuntimeStatus);
       await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
       expect(runtimeApi.runtimeInstances).toHaveBeenCalledTimes(calls + 1);
       expect(capturedRuntime.runtime?.runtime_state).toBe('idle');

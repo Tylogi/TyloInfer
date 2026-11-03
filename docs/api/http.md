@@ -172,7 +172,6 @@ HTTP 层共 4 个工作线程。流式请求（`/v1/chat/completions`、`/v1/mes
 | `GET` | `/api/models/directories` | `?directory_id=` 或 `?path=` | `200 Directory` | `models` |
 | `POST` | `/api/models/directories/register` | `{"path":string}` 或 `{"directory_id":string}` | `200 {"data":[Artifact]}` | `models` |
 | `GET` | `/api/models/{artifact_id}/directory` | — | `200 Directory` | `models` |
-| `GET` | `/api/models/{artifact_id}/capabilities` | — | `200 Capabilities` | `inference` |
 | `GET` | `/api/models/{model_id}/analysis` | — | `200 CheckpointAnalysis` | `inference` |
 | `GET` | `/api/models/{model_id}/cache-profile` | `?include_recurrent=true\|false` | `200 ModelCacheProfile\|null` | `inference` |
 | `GET` | `/api/models/{model_id}/deletion` | — | `200 DeletionPlan` | `inference` |
@@ -183,7 +182,6 @@ HTTP 层共 4 个工作线程。流式请求（`/v1/chat/completions`、`/v1/mes
 | `GET` | `/api/runtime/instances` | — | `200 {"data":[Instance]}` | `inference` |
 | `GET` | `/api/runtime/instances/{instance_id}` | — | `200 Instance` | `inference` |
 | `PATCH` | `/api/runtime/instances/{instance_id}` | `{"pinned":bool}` 或 `{"idle_ttl_seconds":int\|null}` | `200 Instance` | `models` |
-| `GET` | `/api/runtime/capabilities` | `?instance_id=UUID` | `200 Capabilities` | `inference` |
 | `GET` | `/api/runtime/profiles` | — | `200 {"data":[Profile]}` | `inference` |
 | `POST` | `/api/runtime/profiles` | `{"name":String,"load":ProfileLoad}` | `201 Profile` | `models` |
 | `GET` | `/api/runtime/profiles/{profile_id}` | — | `200 Profile` | `inference` |
@@ -191,8 +189,6 @@ HTTP 层共 4 个工作线程。流式请求（`/v1/chat/completions`、`/v1/mes
 | `DELETE` | `/api/runtime/profiles/{profile_id}` | — | `204` | `models` |
 | `POST` | `/api/runtime/profiles/{profile_id}/load` | `{"allow_drift":bool}` | `202 Accepted` | `models` |
 | `GET` | `/api/runtime/listener` | — | `200 Listener` | `inference` |
-| `PUT` | `/api/runtime/listener` | `{"port":int,"protocol":"openai"\|"anthropic"}` | `409 listener_not_managed` | `admin` |
-| `GET` | `/api/runtime/status` | `?instance_id=UUID` | `200 Status` | `inference` |
 | `GET` | `/api/runtime/resources` | — | `200 Resources` | `inference` |
 | `GET` | `/api/runtime/model-aliases` | — | `200 Aliases` | `inference` |
 | `PUT` | `/api/runtime/model-aliases` | `Aliases` | `200 Aliases` | `admin` |
@@ -208,7 +204,6 @@ HTTP 层共 4 个工作线程。流式请求（`/v1/chat/completions`、`/v1/mes
 | `POST` | `/api/runtime/cache/clear` | `{"instance_id":UUID\|null}` | `200 Cleared` | `models` |
 | `POST` | `/api/runtime/cache/trim` | `{"target_bytes":Int,"instance_id":UUID\|null}` | `200 Trimmed` | `models` |
 | `POST` | `/api/runtime/context` | `ReloadRequest` | `202 OperationAccepted` | `models` |
-| `POST` | `/api/runtime/reload` | `ReloadRequest` | `200 Reloaded` | `models` |
 | `GET` | `/api/runtime/yarn/{instance_id}` | — | `200 YarnInfo` | `inference` |
 | `GET` | `/api/runtime/qsa-kv/{instance_id}` | `?target_context` | `200 QsaKvInfo` | `inference` |
 | `PUT` | `/api/runtime/qsa-kv` | `QsaKvRequest` | `202 OperationAccepted` | `models` |
@@ -384,17 +379,6 @@ cache profile、attention profile、license 和 `published_at` 一律为 `null`�
 
 ### 3.3 能力与实例
 
-`GET /api/models/{artifact_id}/capabilities`：
-
-| 字段 | 含义 |
-|---|---|
-| `artifact_id` | 产物 ID |
-| `supported` | 产物能否被所接工厂识别执行，不保证当前资源足够 |
-| `reason` | 不支持的原因，支持时为 `null` |
-| `declared_context_capacity` | 目录声明的上下文容量 |
-| `load.cancellation` | 恒 `after_return` |
-| `load.progress` | 恒 `phase` |
-
 `GET /api/runtime/instances` 返回 `{"data":[Instance]}`。`Instance` 含
 `instance_id`、`artifact_id`、`model`、`backend`、`state`
 （`loaded`\|`unloading`\|`failed`）、`context_size`、`max_requests`、
@@ -481,17 +465,6 @@ HF 目录含 `config.json`、`*.safetensors` 与索引 `weight_map` 引用的分
 
 `GET /api/runtime/instances/{instance_id}` 返回与列表元素相同的 `Instance`；
 未知实例返回 `404 runtime_instance_not_found`，UUID 格式错误返回 `400`。
-
-`GET /api/runtime/status` 不带 `instance_id` 时返回第一个已加载实例的投影，
-没有已加载实例时为 `{"source":"native-instances","status":"ok","runtime_state":"idle"}`；
-带 `instance_id` 时选择该实例，错误码与实例详情相同。投影字段为 `source`
-（恒 `native-instances`）、`status`、`instance_id`、`model`、`backend`、
-`model_type`、`runtime_state`（`ready`\|`busy`\|`unloading`\|`failed`）、
-`max_context`、`context_capacity`、`vocab_size`、`max_requests`、`active_requests`、
-`reloading`、`model_capabilities`、`metrics_age_ms`。Python 侧由 runtime worker
-上报的 `started_at`、`uptime_seconds`、`total_requests`、`failed_requests`、
-`total_prompt_tokens`、`total_completion_tokens`、`last_request`、`live_requests`
-以及内存与前缀缓存计数在原生服务不存在，响应里不出现这些键。
 
 `GET /api/runtime/resources` 采样服务所在主机：
 
@@ -602,13 +575,6 @@ profile 返回 `404 runtime_profile_not_found`，字段非法返回
 就是 profile 的 `load` 文档。`context_size` 缺省时按 3.1 的运行策略取默认
 上下文；`pin` 与 `idle_ttl_seconds` 同时设置返回 `400 invalid_request`。
 
-`GET /api/runtime/capabilities` 返回 `model`、`model_type`、
-`model_capabilities`（与 `Instance.capabilities` 同形）、`vision_available`
-（`image_input` 或 `video_input`）、`mtp_available`、`duplex_available`。
-带 `instance_id` 时选择该实例，未知返回 `404 runtime_instance_not_found`；
-不带时选择第一个已加载实例。原生服务没有共享 runtime worker 可以上报自己的
-能力，没有已加载实例时返回 `503 model_not_loaded`。
-
 `PATCH /api/runtime/instances/{instance_id}` 只接受 `pinned`（Boolean）与
 `idle_ttl_seconds`（不小于 `0` 的整数，`null` 清除超时），至少出现一个字段，
 其它字段返回 `400 invalid_request`。补丁只改动出现的字段；结果不得同时为
@@ -618,10 +584,6 @@ profile 返回 `404 runtime_profile_not_found`，字段非法返回
 `GET /api/runtime/listener` 返回 `{"host","port","anthropic_port":null,
 "configurable":false}`：原生服务在启动时绑定的单个端口同时提供 OpenAI 与
 Anthropic 协议，端口启动时确定，没有可在线改动的托管 listener。
-`PUT /api/runtime/listener` 仍按 Python 校验 `port`（`1..65535`）与
-`protocol`（`openai`\|`anthropic`），校验通过后返回
-`409 listener_not_managed`，`message` 为
-`server listener is managed externally`。
 
 ### 3.9 前缀缓存
 

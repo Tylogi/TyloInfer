@@ -41,25 +41,6 @@ void fields(const json& body, std::initializer_list<const char*> allowed) {
             throw ApiError(400, "invalid_request", "unknown model operation parameter: " + item.key());
 }
 
-std::int64_t metrics_age_ms(const InstanceInfo& item) {
-    return std::max<std::int64_t>(0, std::chrono::duration_cast<std::chrono::milliseconds>(
-        engine::Clock::now() - item.execution.captured).count());
-}
-
-// The native server has no shared runtime worker, so a status resource is a projection of one instance snapshot.
-json status_json(const InstanceInfo& item) {
-    const auto state = item.state == InstanceInfo::State::loaded
-        ? (item.execution.requests ? "busy" : "ready")
-        : item.state == InstanceInfo::State::unloading ? "unloading" : "failed";
-    return {{"source", "native-instances"}, {"status", "ok"}, {"instance_id", item.id}, {"model", item.model},
-        {"backend", item.backend}, {"model_type", item.capabilities.model_type}, {"runtime_state", state},
-        {"max_context", item.capabilities.max_context}, {"context_capacity", item.capabilities.max_context},
-        {"vocab_size", item.capabilities.vocab_size}, {"max_requests", item.capabilities.max_requests},
-        {"active_requests", item.execution.requests}, {"reloading", item.state == InstanceInfo::State::unloading},
-        {"model_capabilities", mfq::protocol::model_capability_profile_json(item.capabilities.capabilities)},
-        {"metrics_age_ms", metrics_age_ms(item)}};
-}
-
 std::vector<InstanceInfo>::const_iterator find_instance(const std::vector<InstanceInfo>& items, const std::string& id) {
     return std::find_if(items.begin(), items.end(), [&](const auto& item) { return item.id == id; });
 }
@@ -210,22 +191,6 @@ ResourceMonitor& monitor() {
 
 } // namespace
 
-void runtime_status(const Services& services, const httplib::Request& request, httplib::Response& response) {
-    const auto items = services.instances.list();
-    if (const auto id = query_uuid(request, "instance_id")) {
-        const auto found = find_instance(items, *id);
-        if (found == items.end())
-            throw ApiError(404, "runtime_instance_not_found", "runtime instance was not found: " + *id);
-        set_json(response, status_json(*found));
-        return;
-    }
-    const auto loaded = std::find_if(items.begin(), items.end(),
-        [](const auto& item) { return item.state == InstanceInfo::State::loaded; });
-    set_json(response, loaded == items.end()
-        ? json{{"source", "native-instances"}, {"status", "ok"}, {"runtime_state", "idle"}}
-        : status_json(*loaded));
-}
-
 void runtime_instances(const Services& services, const httplib::Request&, httplib::Response& response) {
     auto data = json::array();
     for (const auto& item : services.instances.list()) data.push_back(instance_json(item));
@@ -242,11 +207,9 @@ void runtime_instance(const Services& services, const httplib::Request& request,
 }
 
 
-
 void runtime_resources(const Services& services, const httplib::Request&, httplib::Response& response) {
     set_json(response, monitor().sample(services.instances.list()));
 }
-
 
 
 void runtime_aliases_get(const Services& services, const httplib::Request&, httplib::Response& response) {

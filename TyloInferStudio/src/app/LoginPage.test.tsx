@@ -52,7 +52,6 @@ beforeEach(() => {
     if (enabled && new Headers(init?.headers).get('Authorization') !== `Bearer ${validKey}`) {
       return response({ error: { code: 'unauthorized', message: 'invalid API credential', retryable: false, details: {} } }, 401);
     }
-    if (url === '/api/runtime/status') return response({ runtime_state: 'idle' });
     return response({ data: [] });
   });
   vi.stubGlobal('fetch', fetchMock);

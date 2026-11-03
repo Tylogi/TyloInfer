@@ -356,7 +356,7 @@ void runtime_control() {
         throw std::runtime_error("runtime control job did not finish");
     };
     const std::string missing = "00000000-0000-4000-8000-000000000000";
-    CHECK(server.post("/api/runtime/reload", json::object(), admin).status == 503);
+    CHECK(server.post("/api/runtime/context", json::object(), admin).status == 202);
     const auto yarn = server.get("/api/runtime/yarn/" + missing, admin);
     CHECK(yarn.status == 404 && yarn.document()["error"]["code"] == "model_not_loaded");
     const auto qsa = server.get("/api/runtime/qsa-kv/" + missing, admin);
@@ -755,7 +755,7 @@ void keys_and_network() {
     for (const auto* role : {"viewer", "operator", "administrator"}) {
         const auto issued = issue({{"name", role}, {"role", role}});
         const auto credentials = bearer(issued.at("token"));
-        CHECK(server.get("/api/runtime/status", credentials).status == 200);
+        CHECK(server.get("/api/runtime/instances", credentials).status == 200);
         CHECK(server.get("/api/runtime/resources", credentials).status == 200);
         CHECK(server.get("/api/models/directories", credentials).status == (std::string(role) == "viewer" ? 403 : 200));
         CHECK(server.get("/api/models/00000000000000000000000000000000/directory", credentials).status == (std::string(role) == "viewer" ? 403 : 404));
@@ -804,14 +804,10 @@ void keys_and_network() {
 void runtime_observation() {
     Fixture f;
     auto server = f.start({}, root_environment);
-    for (const auto* path : {"/api/runtime/status", "/api/runtime/resources",
+    for (const auto* path : {"/api/runtime/resources",
             "/api/runtime/instances/00000000-0000-4000-8000-000000000001"})
         CHECK(server.get(path).status == 401);
-    const auto idle = server.get("/api/runtime/status", admin).document();
-    CHECK(idle == json({{"source", "native-instances"}, {"status", "ok"}, {"runtime_state", "idle"}}));
-    CHECK(server.get("/api/runtime/status?instance_id=", admin).status == 400);
-    CHECK(server.get("/api/runtime/status?instance_id=not-a-uuid", admin).status == 400);
-    CHECK(server.get("/api/runtime/status?instance_id=00000000-0000-4000-8000-000000000001", admin).status == 404);
+    CHECK(server.get("/api/runtime/instances", admin).document() == json({{"data", json::array()}}));
     CHECK(server.get("/api/runtime/instances/00000000-0000-4000-8000-000000000001", admin).status == 404);
     CHECK(server.get("/api/runtime/instances/not-a-uuid", admin).status == 400);
     const auto resources = server.get("/api/runtime/resources", admin).document();
@@ -954,28 +950,15 @@ void runtime_profiles() {
     const std::string absent = "00000000-0000-4000-8000-000000000001";
     const std::string instance_path = "/api/runtime/instances/" + absent;
 
-    for (const auto* path : {"/api/runtime/profiles", "/api/runtime/capabilities", "/api/runtime/listener"})
+    for (const auto* path : {"/api/runtime/profiles", "/api/runtime/listener"})
         CHECK(server.get(path).status == 401);
     CHECK(server.send("POST", "/api/runtime/profiles", {{"name", "chat"}, {"load", load}}).status == 401);
-    CHECK(server.send("PUT", "/api/runtime/listener", {{"port", 8080}}).status == 401);
     CHECK(server.send("PATCH", instance_path, {{"pinned", true}}).status == 401);
 
     // One native listener serves both protocols on the port chosen at startup.
     const auto listener = server.get("/api/runtime/listener", admin).document();
     CHECK(listener.at("host") == "127.0.0.1" && listener.at("port").get<int>() > 0);
     CHECK(listener.at("anthropic_port").is_null() && listener.at("configurable") == false);
-    const auto managed = server.send("PUT", "/api/runtime/listener", {{"port", 8080}, {"protocol", "anthropic"}}, admin);
-    CHECK(managed.status == 409 && managed.document()["error"]["code"] == "listener_not_managed" &&
-        managed.document()["error"]["message"] == "server listener is managed externally");
-    for (const auto& body : std::vector<json>{json::object(), {{"port", 0}}, {{"port", 70000}}, {{"port", "8080"}},
-            {{"port", 8080}, {"protocol", "grpc"}}, {{"port", 8080}, {"unexpected", true}}})
-        CHECK(server.send("PUT", "/api/runtime/listener", body, admin).status == 400);
-
-    // With no loaded instance the native server has no runtime to describe, as the Python pool reports.
-    const auto no_runtime = server.get("/api/runtime/capabilities", admin);
-    CHECK(no_runtime.status == 503 && no_runtime.document()["error"]["code"] == "model_not_loaded");
-    CHECK(server.get("/api/runtime/capabilities?instance_id=" + absent, admin).status == 404);
-    CHECK(server.get("/api/runtime/capabilities?instance_id=nope", admin).status == 400);
 
     for (const auto& body : std::vector<json>{json::object(), {{"pinned", "yes"}}, {{"pinned", nullptr}},
             {{"idle_ttl_seconds", -1}}, {{"idle_ttl_seconds", "60"}}, {{"unexpected", true}}})

@@ -1709,13 +1709,6 @@ void runtime_observation_checks(const fs::path& executable) {
         CHECK(response);
         return std::make_pair(response->status, Json::parse(response->body));
     };
-    const auto capabilities = get("/api/runtime/capabilities").second;
-    CHECK(capabilities.at("model") == "served" && capabilities.at("model_type") == "qwen3_5" &&
-        capabilities.at("model_capabilities") == listed.at(0).at("capabilities") &&
-        capabilities.at("vision_available") == false && capabilities.at("mtp_available") == false &&
-        capabilities.at("duplex_available") == false);
-    CHECK(get("/api/runtime/capabilities?instance_id=" + id).second == capabilities);
-    CHECK(get("/api/runtime/capabilities?instance_id=00000000-0000-4000-8000-000000000001").first == 404);
     const auto pinned = patch("/api/runtime/instances/" + id, {{"pinned", true}});
     CHECK(pinned.first == 200 && pinned.second.at("instance_id") == id &&
         pinned.second.at("policy") == Json({{"pin", true}, {"idle_ttl_seconds", nullptr}}));
@@ -1731,12 +1724,6 @@ void runtime_observation_checks(const fs::path& executable) {
         CHECK(patch("/api/runtime/instances/" + id, body).first == 400);
     CHECK(patch("/api/runtime/instances/00000000-0000-4000-8000-000000000001", {{"pinned", true}}).first == 404);
     CHECK(patch("/api/runtime/instances/not-a-uuid", {{"pinned", true}}).first == 400);
-    const auto status = get("/api/runtime/status?instance_id=" + id).second;
-    CHECK(status.at("source") == "native-instances" && status.at("instance_id") == id && status.at("model") == "served");
-    CHECK(status.at("runtime_state") == "ready" && status.at("max_context") == 128 && status.at("active_requests") == 0);
-    CHECK(status.at("model_capabilities").at("architecture_family") == "fixture");
-    CHECK(get("/api/runtime/status").second.at("instance_id") == id);
-    CHECK(get("/api/runtime/status?instance_id=00000000-0000-4000-8000-000000000001").first == 404);
     const auto resources = get("/api/runtime/resources").second;
     CHECK(resources.at("weights").size() == 1 && resources.at("weights")[0].at("instance_id") == id &&
         resources.at("weights")[0].at("model") == "served");
@@ -1744,7 +1731,7 @@ void runtime_observation_checks(const fs::path& executable) {
     CHECK(resources.at("gpus").empty() && resources.at("disks").empty());
     CHECK(server.complete(server.post("/api/models/unload", {{"instance_id", id}}))["status"] == "succeeded");
     CHECK(get("/api/runtime/instances/" + id).first == 404);
-    CHECK(get("/api/runtime/status").second.at("runtime_state") == "idle");
+    CHECK(get("/api/runtime/instances").second.at("data").empty());
     CHECK(get("/api/runtime/resources").second.at("weights").empty());
     server.process->close_input(); CHECK(server.process->wait() == 0);
 }
@@ -2099,8 +2086,6 @@ void run_checks(const fs::path& executable, const fs::path& real_model) {
     const auto event_stream = event_client.Get("/api/jobs/" + job_id + "/events/stream");
     CHECK(event_stream && event_stream->status == 200 && event_stream->body.find("id: 1\n") != std::string::npos);
     CHECK(event_stream->body.find("succeeded") != std::string::npos);
-    const auto caps = server.get(("/api/models/" + artifact_id + "/capabilities").c_str());
-    CHECK(caps["supported"] == true && caps["load"]["cancellation"] == "after_return");
     CHECK(server.get("/v1/models")["data"].at(0).at("id") == model);
     CHECK(fresh_instance(server, instance).at("metrics_age_ms").get<std::int64_t>() >= 0);
     response = server.post("/api/models/load", {{"artifact_id", artifact_id}});

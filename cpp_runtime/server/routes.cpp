@@ -42,7 +42,6 @@ const std::vector<Route>& route_table() {
         {"POST", "/api/models/directories/open", Scope::models, models_open},
         {"POST", "/api/models/directories/register", Scope::models, models_register},
         {"GET", "/api/models/([^/]+)/directory", Scope::models, model_directory},
-        {"GET", "/api/models/([^/]+)/capabilities", Scope::inference, model_capabilities},
         {"POST", "/api/models/load", Scope::models, models_load},
         {"POST", "/api/models/unload", Scope::models, models_unload},
 
@@ -52,7 +51,6 @@ const std::vector<Route>& route_table() {
         {"POST", "/api/models/([^/]+)/delete", Scope::models, model_delete},
 
         // api/runtime.cpp
-        {"GET", "/api/runtime/status", Scope::inference, runtime_status},
         {"GET", "/api/runtime/instances", Scope::inference, runtime_instances},
         {"GET", "/api/runtime/instances/([^/]+)", Scope::inference, runtime_instance},
         {"GET", "/api/runtime/resources", Scope::inference, runtime_resources},
@@ -72,10 +70,8 @@ const std::vector<Route>& route_table() {
         {"PUT", "/api/runtime/profiles/([^/]+)", Scope::models, profile_update},
         {"DELETE", "/api/runtime/profiles/([^/]+)", Scope::models, profile_delete},
         {"POST", "/api/runtime/profiles/([^/]+)/load", Scope::models, profile_load},
-        {"GET", "/api/runtime/capabilities", Scope::inference, runtime_capabilities},
         {"PATCH", "/api/runtime/instances/([^/]+)", Scope::models, runtime_instance_patch},
         {"GET", "/api/runtime/listener", Scope::inference, listener_get},
-        {"PUT", "/api/runtime/listener", Scope::admin, listener_put},
 
         // api/runtime_cache.cpp
         {"GET", "/api/runtime/cache/entries", Scope::admin, cache_entries},
@@ -86,7 +82,6 @@ const std::vector<Route>& route_table() {
 
         // api/runtime_control.cpp
         {"POST", "/api/runtime/context", Scope::models, runtime_context},
-        {"POST", "/api/runtime/reload", Scope::models, runtime_reload},
         {"GET", "/api/components/voice-output", Scope::inference, voice_status},
         {"POST", "/api/components/voice-output/install", Scope::inference, voice_install},
         {"POST", "/api/components/voice-output/activate", Scope::inference, voice_activate},
