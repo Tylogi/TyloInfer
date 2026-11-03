@@ -1,7 +1,9 @@
 #pragma once
 
 #include <filesystem>
+#include <cstdint>
 #include <string>
+#include <utility>
 #include <nlohmann/json.hpp>
 
 namespace mfq::server {
@@ -12,6 +14,9 @@ inline std::string path_utf8(const std::filesystem::path& path) {
 
 std::filesystem::path resolved_path(const std::filesystem::path& path);
 std::string normalize_uuid(std::string value);
+
+/** Host physical and available memory in bytes; a zero half means the platform does not report it. */
+std::pair<std::int64_t, std::int64_t> host_memory_bytes();
 
 class InstanceLock {
 public:

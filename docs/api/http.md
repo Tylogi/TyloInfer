@@ -178,6 +178,13 @@ HTTP 层共 4 个工作线程。流式请求（`/v1/chat/completions`、`/v1/mes
 | `POST` | `/api/v1/models/load` | `LoadRequest` | `202 Accepted` | `models` |
 | `POST` | `/api/v1/models/unload` | `UnloadRequest` | `202 Accepted` | `models` |
 | `GET` | `/api/v1/runtime/instances` | — | `200 {"data":[Instance]}` | `inference` |
+| `GET` | `/api/v1/runtime/instances/{instance_id}` | — | `200 Instance` | `inference` |
+| `GET` | `/api/v1/runtime/status` | `?instance_id=UUID` | `200 Status` | `inference` |
+| `GET` | `/api/v1/runtime/models` | — | `200 {"data":[{"id":String}]}` | `inference` |
+| `GET` | `/api/v1/runtime/resources` | — | `200 Resources` | `inference` |
+| `GET` | `/api/v1/runtime/serving` | `?scope=session\|alltime&model=` | `200 ServingStatistics` | `inference` |
+| `GET` | `/api/v1/runtime/metrics` | `?instance_id&since&limit` | `200 {"data":[MetricSnapshot]}` | `inference` |
+| `GET` | `/api/v1/runtime/logs` | `?instance_id&level&after&limit` | `200 {"data":[LogEntry]}` | `inference` |
 | `GET` | `/api/v1/runtime/model-aliases` | — | `200 Aliases` | `inference` |
 | `PUT` | `/api/v1/runtime/model-aliases` | `Aliases` | `200 Aliases` | `admin` |
 
@@ -429,6 +436,61 @@ HF 目录含 `config.json`、`*.safetensors` 与索引 `weight_map` 引用的分
 
 删除只作用于计划里的文件，不删除模型目录或伴随文件；成功后服务重新扫描目录，
 产物从列表消失。成功响应为 `{"files":N,"total_bytes":M}`。
+
+### 3.6 运行时观测
+
+原生服务没有共享的 runtime worker，也没有 Python 侧的指标与日志存储。观测资源
+只报告原生能够取到的事实，取不到的字段保持 `null` 或空集合，不会用估算值填充。
+
+`GET /api/v1/runtime/instances/{instance_id}` 返回与列表元素相同的 `Instance`；
+未知实例返回 `404 runtime_instance_not_found`，UUID 格式错误返回 `400`。
+
+`GET /api/v1/runtime/status` 不带 `instance_id` 时返回第一个已加载实例的投影，
+没有已加载实例时为 `{"source":"native-instances","status":"ok","runtime_state":"idle"}`；
+带 `instance_id` 时选择该实例，错误码与实例详情相同。投影字段为 `source`
+（恒 `native-instances`）、`status`、`instance_id`、`model`、`backend`、
+`model_type`、`runtime_state`（`ready`\|`busy`\|`unloading`\|`failed`）、
+`max_context`、`context_capacity`、`vocab_size`、`max_requests`、`active_requests`、
+`reloading`、`model_capabilities`、`metrics_age_ms`。Python 侧由 runtime worker
+上报的 `started_at`、`uptime_seconds`、`total_requests`、`failed_requests`、
+`total_prompt_tokens`、`total_completion_tokens`、`last_request`、`live_requests`
+以及内存与前缀缓存计数在原生服务不存在，响应里不出现这些键。
+
+`GET /api/v1/runtime/models` 只列出已加载实例的模型名，同名实例合并为一条；
+不登记产物，也不触发加载。
+
+`GET /api/v1/runtime/resources` 采样服务所在主机：
+
+| 字段 | 原生来源 |
+|---|---|
+| `sampled_at` | 采样时刻（Unix 秒） |
+| `interval_seconds` | 与上一次采样的间隔；首次采样或间隔超过 10 秒为 `null` |
+| `cpu_cores` | `std::thread::hardware_concurrency()` |
+| `cpu_utilization_percent` | 相邻两次采样的 CPU 时间差；首次采样为 `null` |
+| `cpu_name` | 恒 `null`，原生服务不上报 CPU 型号 |
+| `memory_total_bytes`、`memory_available_bytes`、`memory_used_bytes` | 系统物理与可用内存，`used = total - available` |
+| `gpus`、`disks` | 恒为空数组，原生服务不采样 GPU 利用率与磁盘 IO |
+| `memory_bandwidth_bytes_per_second`、`memory_bandwidth_limit_bytes_per_second`、`memory_bandwidth_utilization_percent` | 恒 `null` |
+| `weights` | 每个已加载实例一条：`instance_id`、`model` 加五个字节速率字段 |
+
+`weights` 的速率由实例原生指标快照差分得到：`expert_read_bytes_per_second`
+取 `ssd_expert_bytes_read`，`ple_read_bytes_per_second` 取 `ple_source_bytes_read`，
+`engram_read_bytes_per_second` 取 `engram_bytes_read`，`kv_read_bytes_per_second`
+取 `qsa_kv_ssd_read_bytes`，`kv_write_bytes_per_second` 取
+`qsa_kv_ssd_written_bytes`。计数器不存在、上一次快照缺少该计数器或采样间隔
+超过 10 秒时该速率为 `null`。
+
+`GET /api/v1/runtime/serving` 接受 `scope`（默认 `session`，或 `alltime`）与
+`model` 过滤，其它取值返回 `400 invalid_request`。原生服务不持久化完成请求
+记录，`totals` 恒为零计数与 `null` 速率，`activity` 恒为空数组，`started_at`
+是服务进程启动时刻。
+
+`GET /api/v1/runtime/metrics` 与 `GET /api/v1/runtime/logs` 保留 Python 的查询
+参数：`instance_id` 必须是 UUID，`since` 必须是 ISO 8601 时间，`level` 取
+`debug`\|`info`\|`warning`\|`error`，`after` 不小于 `0`，`limit` 为 `1..2000`
+（默认 `200`），违反者返回 `400 invalid_request`。原生服务没有指标历史与日志
+存储，两者恒返回 `{"data":[]}`；实时指标见 `GET /api/v1/runtime/instances` 与
+`GET /api/v1/runtime/status`。
 
 ## 4. 任务与事件
 

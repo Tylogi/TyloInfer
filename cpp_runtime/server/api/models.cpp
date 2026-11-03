@@ -216,5 +216,14 @@ void register_models(httplib::Server& http, ModelCatalog& catalog, ModelInstance
         for (const auto& item : instances.list()) data.push_back(instance_json(item));
         set_json(response, {{"data", std::move(data)}});
     });
+    http.Get("/api/v1/runtime/instances/([^/]+)", [&](const httplib::Request& request, httplib::Response& response) {
+        const auto id = normalize_uuid(request.matches[1]);
+        const auto items = instances.list();
+        const auto found = std::find_if(items.begin(), items.end(),
+            [&](const auto& item) { return item.id == id; });
+        if (found == items.end())
+            throw ApiError(404, "runtime_instance_not_found", "runtime instance was not found: " + id);
+        set_json(response, instance_json(*found));
+    });
 }
 }
