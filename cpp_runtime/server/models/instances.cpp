@@ -288,6 +288,15 @@ std::size_t ModelInstances::cache_control(const std::optional<std::string>& inst
     return released;
 }
 
+std::vector<InstanceInfo> ModelInstances::reload(const std::optional<std::string>& instance_id, std::int64_t context) {
+    std::vector<InstanceInfo> reloaded;
+    for (const auto& instance : targets(instance_id)) {
+        instance->engine_->reload(context);
+        reloaded.push_back(instance->snapshot());
+    }
+    return reloaded;
+}
+
 bool ModelInstances::busy(const std::optional<std::string>& instance_id) const {
     std::vector<std::shared_ptr<ModelInstance>> selected;
     {

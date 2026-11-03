@@ -74,8 +74,11 @@ public:
         std::optional<std::optional<std::chrono::seconds>> idle_ttl);
     // Runs a cache/session command on one instance or every loaded instance; returns released units.
     std::size_t cache_control(const std::optional<std::string>& instance_id, const engine::SessionCommand& command);
+    // Re-aims one instance (or every loaded instance) at a context size; the returned snapshots carry the actual size.
+    std::vector<InstanceInfo> reload(const std::optional<std::string>& instance_id, std::int64_t context);
     // True while any target instance has queued or running requests, as the cache purge gate needs.
     bool busy(const std::optional<std::string>& instance_id) const;
+    const std::string& backend() const { return factory_.backend; }
     std::vector<InstanceInfo> list() const;
     /** True when a loaded, unloading, or in-flight load selects this artifact or model name. */
     bool busy_for(const std::string& artifact_id, const std::string& name) const;

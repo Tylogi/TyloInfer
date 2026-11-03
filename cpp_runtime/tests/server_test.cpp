@@ -343,6 +343,42 @@ void prefix_cache() {
     server.stop();
 }
 
+void runtime_control() {
+    Fixture f;
+    auto server = f.start({}, root_environment);
+    const auto wait_job = [&](const json& accepted) {
+        for (int attempt = 0; attempt < 500; ++attempt) {
+            const auto job = server.get("/api/jobs/" + accepted.at("operation_id").get<std::string>(), admin).document();
+            if (job.at("status") != "queued" && job.at("status") != "running") return job;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        throw std::runtime_error("runtime control job did not finish");
+    };
+    const std::string missing = "00000000-0000-4000-8000-000000000000";
+    CHECK(server.post("/api/runtime/reload", json::object(), admin).status == 503);
+    const auto yarn = server.get("/api/runtime/yarn/" + missing, admin);
+    CHECK(yarn.status == 404 && yarn.document()["error"]["code"] == "model_not_loaded");
+    const auto qsa = server.get("/api/runtime/qsa-kv/" + missing, admin);
+    CHECK(qsa.status == 404 && qsa.document()["error"]["code"] == "runtime_instance_not_found");
+    CHECK(server.send("PUT", "/api/runtime/qsa-kv", {{"instance_id", missing}, {"enabled", false},
+        {"budget_bytes", 1073741824}}, admin).status == 404);
+    CHECK(server.send("PUT", "/api/runtime/qsa-kv", {{"instance_id", missing}, {"enabled", false},
+        {"budget_bytes", 0}}, admin).status == 400);
+    CHECK(server.send("PUT", "/api/runtime/qsa-kv", {{"enabled", false}, {"budget_bytes", 1}}, admin).status == 400);
+    const auto context = server.post("/api/runtime/context", {"instance_id", missing}, admin);
+    CHECK(context.status == 202);
+    const auto none = wait_job(context.document());
+    CHECK(none.at("status") == "failed" && none.at("error").at("code") == "model_not_loaded");
+    const auto yarn_job = server.post("/api/runtime/context", {{"instance_id", missing}, {"yarn_enabled", true}}, admin);
+    const auto refused = wait_job(yarn_job.document());
+    CHECK(refused.at("status") == "failed" && refused.at("error").at("code") == "yarn_unsupported");
+    const auto quant_job = server.post("/api/runtime/context",
+        {{"kv_quantization", {{"enabled", true}}}}, admin);
+    CHECK(quant_job.status == 202 && wait_job(quant_job.document()).at("error").at("code") == "kv_quantization_unsupported");
+    CHECK(server.post("/api/runtime/context", {{"unexpected", 1}}, admin).status == 400);
+    server.stop();
+}
+
 void media_uploads() {
     Fixture f;
     auto server = f.start({}, root_environment);
@@ -1603,6 +1639,7 @@ int run_tests(const fs::path& server, const std::string& selection) {
         {"policy and protocols", policy_and_protocols}, {"keys and network", keys_and_network},
         {"media uploads", media_uploads},
         {"prefix cache", prefix_cache},
+        {"runtime control", runtime_control},
         {"runtime observation", runtime_observation},
         {"runtime policies", runtime_policies},
         {"runtime profiles", runtime_profiles},
