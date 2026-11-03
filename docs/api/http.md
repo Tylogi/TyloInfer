@@ -42,7 +42,7 @@ Anthropic 风格请求（`/v1/messages*`、`/v1/models/*`，或带 `Anthropic-Ve
 | 路由区域 | 所需 scope |
 |---|---|
 | `/api/auth/*` | `admin` |
-| `PUT /api/runtime/model-aliases`、`/api/runtime/context-policy`、`/api/runtime/inference-policy`、`/api/runtime/memory-policy`、`/api/runtime/listener` | `admin` |
+| `PUT /api/runtime/model-aliases`、`/api/runtime/context-policy`、`/api/runtime/inference-policy`、`/api/runtime/memory-policy` | `admin` |
 | `/api/models/directories*`、`/api/models/{artifact_id}/directory`、`/api/hub/download-directory` | `models` |
 | 其余 `/api/models`、`/api/runtime`、`/api/hub`：读 | `inference` |
 | 其余 `/api/models`、`/api/runtime`、`/api/hub`：写（含 `POST /models/load`、`/models/unload`） | `models` |
@@ -103,7 +103,7 @@ Messages 请求拒绝未知字段。
 | `400` | `search_cursor_expired` | Hub 搜索游标过期或筛选条件变化 |
 | `401` / `403` | `authentication_error`、`authentication_required` | 凭据缺失、无效、撤销或过期 |
 | `404` | `not_found`、`operation_not_found`、`model_artifact_not_found`、`model_directory_not_found`、`session_not_found`、`response_not_found`、`media_not_found`、`runtime_profile_not_found`、`runtime_instance_not_found` | 对象不存在或已归档 |
-| `409` | `job_state_conflict`、`model_already_loaded`、`model_operation_busy`、`model_busy`、`model_alias_conflict`、`revision_conflict`、`response_in_progress`、`request_cancelled`、`model_delete_busy`、`model_delete_unsafe`、`model_delete_changed`、`model_delete_failed`、`runtime_profile_conflict`、`runtime_profile_drift`、`listener_not_managed` | 状态或标识冲突 |
+| `409` | `job_state_conflict`、`model_already_loaded`、`model_operation_busy`、`model_busy`、`model_alias_conflict`、`revision_conflict`、`response_in_progress`、`request_cancelled`、`model_delete_busy`、`model_delete_unsafe`、`model_delete_changed`、`model_delete_failed`、`runtime_profile_conflict`、`runtime_profile_drift` | 状态或标识冲突 |
 | `410` | `event_cursor_expired` | 事件游标已被淘汰 |
 | `413` | `request_too_large`、`media_too_large` | 会话消息或导出超过上限；上传超过媒体上限 |
 | `415` | `unsupported_media_type` | `Content-Type` 不是 `application/json`，或上传 MIME 不在媒体白名单 |
@@ -188,7 +188,6 @@ HTTP 层共 4 个工作线程。流式请求（`/v1/chat/completions`、`/v1/mes
 | `PUT` | `/api/runtime/profiles/{profile_id}` | `{"name":String,"load":ProfileLoad}` | `200 Profile` | `models` |
 | `DELETE` | `/api/runtime/profiles/{profile_id}` | — | `204` | `models` |
 | `POST` | `/api/runtime/profiles/{profile_id}/load` | `{"allow_drift":bool}` | `202 Accepted` | `models` |
-| `GET` | `/api/runtime/listener` | — | `200 Listener` | `inference` |
 | `GET` | `/api/runtime/resources` | — | `200 Resources` | `inference` |
 | `GET` | `/api/runtime/model-aliases` | — | `200 Aliases` | `inference` |
 | `PUT` | `/api/runtime/model-aliases` | `Aliases` | `200 Aliases` | `admin` |
@@ -214,7 +213,6 @@ HTTP 层共 4 个工作线程。流式请求（`/v1/chat/completions`、`/v1/mes
 |---|---|---|---|
 | `GET` | `/api/jobs` | `?limit&offset&status&kind` | `200 {"data":[Job]}` |
 | `POST` | `/api/jobs` | `{"kind":string,"payload":Download}` | `202 Job` |
-| `GET` | `/api/jobs/kinds` | — | `200 {"data":[{"kind":String}]}` |
 | `GET` | `/api/jobs/{id}` | — | `200 Job` |
 | `DELETE` | `/api/jobs/{id}` | — | `204` |
 | `POST` | `/api/jobs/{id}/cancel` | — | `200 Job` |
@@ -581,10 +579,6 @@ profile 返回 `404 runtime_profile_not_found`，字段非法返回
 固定与带超时，否则返回 `400 invalid_request`。响应为更新后的 `Instance`
 （见 3.3），未知实例返回 `404 runtime_instance_not_found`。
 
-`GET /api/runtime/listener` 返回 `{"host","port","anthropic_port":null,
-"configurable":false}`：原生服务在启动时绑定的单个端口同时提供 OpenAI 与
-Anthropic 协议，端口启动时确定，没有可在线改动的托管 listener。
-
 ### 3.9 前缀缓存
 
 `GET /api/runtime/cache/entries` 直接扫描引擎写在磁盘上的前缀缓存
@@ -648,13 +642,9 @@ SSE 开始前的失败用 HTTP 错误；开始后的失败发送 `event: error` 
 
 ### 4.4 下载任务
 
-`GET /api/jobs/kinds` 返回当前服务接受的任务类型，不再有内嵌 schema：
-
-```json
-{"data":[{"kind":"download.huggingface"},{"kind":"download.modelscope"}]}
-```
-
-`POST /api/jobs` 只接受这两种 `kind`，其他返回 `501 job_kind_not_supported`。
+`POST /api/jobs` 只接受 `download.huggingface` 与 `download.modelscope` 两种
+`kind`，其他返回 `501 job_kind_not_supported`；可提交类型是客户端常量，
+没有发现端点。
 `payload` 字段：
 
 | 字段 | 类型 | 约束 |

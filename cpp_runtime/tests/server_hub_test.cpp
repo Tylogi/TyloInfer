@@ -308,13 +308,12 @@ void routes(const fs::path& executable) {
         for (const auto* scope : {"inference", "jobs", "models"}) {
             const auto key = server.post("/api/auth/keys", {{"name", scope}, {"scopes", {scope}}}, 201);
             server.client->set_default_headers({{"Authorization", "Bearer " + key.at("token").get<std::string>()}});
-            auto result = server.client->Get("/api/jobs/kinds"); CHECK(result && result->status == (std::string(scope) == "jobs" ? 200 : 403));
+            auto result = server.client->Get("/api/jobs"); CHECK(result && result->status == (std::string(scope) == "jobs" ? 200 : 403));
             result = server.client->Get("/api/hub/download-directory"); CHECK(result && result->status == (std::string(scope) == "models" ? 200 : 403));
             result = server.client->Get("/api/hub/models?provider=huggingface&limit=1");
             CHECK(result && result->status == (std::string(scope) == "inference" ? 200 : 403));
             server.client->set_default_headers({{"Authorization", "Bearer hub-test-root"}});
         }
-        CHECK(server.get("/api/jobs/kinds")["data"].size() == 2);
         auto info = server.get("/api/hub/models/huggingface/owner/model"); CHECK(info["revision"] == origin.revision && info["variants"].size() == 1 && info["downloads"].is_null());
         CHECK(server.post("/api/hub/resolve", {{"reference", "https://modelscope.cn/models/owner/model"}}, 200)["provider"] == "modelscope");
         server.post("/api/hub/resolve", {{"reference", "https://evil.invalid/owner/model"}}, 400);

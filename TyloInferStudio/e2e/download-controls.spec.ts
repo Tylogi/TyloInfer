@@ -32,9 +32,6 @@ test('checked prefix control retains its paint and state across focus and a fail
 
 test('chooses the faster source automatically and displays an existing-file reminder without adding a task', async ({ page }) => {
   await mockStudioServer(page);
-  await page.route('**/api/jobs/kinds', route => route.fulfill({ json: { data: [
-    { kind: 'download.modelscope' }, { kind: 'download.huggingface' },
-  ] } }));
   const catalog = structuredClone(officialCatalog);
   const first = catalog.data[0];
   const ms = first.sources[0];

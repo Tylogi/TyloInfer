@@ -6,7 +6,6 @@ import type {
   HubModelSummary,
   HubModelVariant,
   HubSystemProfile,
-  JobKindResource,
   JobResource,
   ModelConfigurationStatus,
   ModelParameterBreakdown,
@@ -31,6 +30,9 @@ import { useDownloadReuse, type DownloadReuse } from './useDownloadReuse';
 import { downloadPatterns, isSharedEngram } from './downloadPatterns';
 import type { ServerCapabilities } from '../../app/serverCapabilities';
 
+/** The download sources this build can submit jobs for; mirrors the server's submittable kinds. */
+const DOWNLOAD_PROVIDERS = ['huggingface', 'modelscope'] as const;
+
 type Translate = (chinese: string, english: string) => string;
 function attentionLabel(profile: ModelAttentionProfile | null | undefined, tr: Translate): string {
   if (!profile) return '--';
@@ -44,7 +46,6 @@ export type DownloadOrigin = { x: number; y: number };
 interface ModelBrowserProps {
   /** Limits optional browsing resources to those implemented by the connected service. */
   capabilities?: ServerCapabilities;
-  jobKinds: JobKindResource[];
   onError(message: string): void;
   onJobCreated(job: JobResource, origin: DownloadOrigin): void;
   tab: ModelBrowserTab;
@@ -271,7 +272,7 @@ function VariantList({
 }
 
 /** Browse supported repositories and submit downloads using the service's available capabilities. */
-export function ModelBrowser({ capabilities, jobKinds, onError, onJobCreated, tab, onTabChange, downloadQueue, downloadDirectory, downloadDirectoryControl, tr }: ModelBrowserProps) {
+export function ModelBrowser({ capabilities, onError, onJobCreated, tab, onTabChange, downloadQueue, downloadDirectory, downloadDirectoryControl, tr }: ModelBrowserProps) {
   const [official, setOfficial] = useState<OfficialModelList | null>(null);
   const [officialSelection, setOfficialSelection] = useState<string | null>(null);
   const [officialSource, setOfficialSource] = useState<OfficialModelSource | null>(null);
@@ -342,7 +343,7 @@ export function ModelBrowser({ capabilities, jobKinds, onError, onJobCreated, ta
     ? estimateCacheBytes(communityModel.cache_profile, communityContext) : 0;
   const applyPlan = (key: string, context: number | undefined) => setPlannedContexts((current) => ({ ...current, [key]: context }));
   const canDownload = (targetProvider: HubModelSummary["provider"]) =>
-    (!downloadDirectoryControl || downloadDirectory !== undefined) && jobKinds.some((item) => item.kind === `download.${targetProvider}`);
+    (!downloadDirectoryControl || downloadDirectory !== undefined) && DOWNLOAD_PROVIDERS.includes(targetProvider);
   const downloadRevision = useJobStore(state => state.jobs.filter(job => job.kind.startsWith('download.'))
     .map(job => `${job.id}:${job.status}`).join('|'));
   const directoryReady = !downloadDirectoryControl || downloadDirectory !== undefined;

@@ -12,7 +12,6 @@ import {
 import { errorMessage, formatNumber } from '../../app/formatters';
 import { runtimeModelNames } from './modelSelection';
 import { ServingStatisticsPanel, ServingTotalsPanel } from './ServingStatisticsPanel';
-import { useServingStatistics } from './useServingStatistics';
 import { RuntimeHero } from './RuntimeHero';
 import { MemoryHierarchy } from './MemoryHierarchy';
 import { residentMemoryCapacity } from './memoryArchitecture';
@@ -39,9 +38,7 @@ export function OverviewPage() {
   const { tr } = useSettings();
   const [scope, setScope] = useState<'session' | 'alltime'>('session');
   const native = runtime?.source === 'native-instances';
-  const { data: servingStatistics, error: statisticsError } = useServingStatistics(scope, connectionRevision, !native);
   const [endpointCopied, setEndpointCopied] = useState<string | null>(null);
-  const [listener, setListener] = useState<{ url: string; revision: number; port: number | null } | null>(null);
   const serviceUrl = studio?.service_url || getApiBaseUrl();
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(
@@ -50,36 +47,11 @@ export function OverviewPage() {
     },
     [],
   );
-  useEffect(() => {
-    if (native) { setListener(null); return; }
-    let disposed = false;
-    let pending = false;
-    const endpoint = getApiBaseUrl();
-    const credential = getApiToken();
-    const current = () => !disposed && endpoint === getApiBaseUrl() && credential === getApiToken();
-    const refresh = async () => {
-      if (pending) return;
-      pending = true;
-      try {
-        const value = await runtimeApi.runtimeListener();
-        if (current()) setListener({ url: serviceUrl, revision: connectionRevision, port: value.anthropic_port ?? null });
-      } catch {
-        if (current()) setListener(null);
-      } finally {
-        pending = false;
-      }
-    };
-    void refresh();
-    const poll = setInterval(() => void refresh(), 5000);
-    window.addEventListener('focus', refresh);
-    return () => { disposed = true; clearInterval(poll); window.removeEventListener('focus', refresh); };
-  }, [serviceUrl, connectionRevision, native]);
   const availableModelNames = runtimeModelNames(models, instances);
-  const anthropicPort = listener?.url === serviceUrl && listener.revision === connectionRevision ? listener.port : null;
   const openAIUrl = openAIEndpoint(serviceUrl);
   const endpoints = [
     { id: 'openai', label: tr('OpenAI 兼容端点', 'OpenAI-compatible endpoint'), url: openAIUrl },
-    { id: 'anthropic', label: tr('Anthropic 兼容端点', 'Anthropic-compatible endpoint'), url: native ? openAIUrl ? `${openAIUrl}/messages` : null : anthropicEndpoint(serviceUrl, anthropicPort) },
+    { id: 'anthropic', label: tr('Anthropic 兼容端点', 'Anthropic-compatible endpoint'), url: openAIUrl ? `${openAIUrl}/messages` : null },
   ];
   async function copyEndpoint(id: string, endpoint: string) {
     try {
@@ -167,7 +139,7 @@ export function OverviewPage() {
           </TMPanel>
         </>
       )}
-      <ServingStatisticsPanel data={servingStatistics} error={statisticsError} unavailable={native ? tr('原生服务暂未提供汇总统计。', 'The native server does not provide aggregate statistics yet.') : undefined} scope={scope} onScopeChange={setScope} />
+      <ServingStatisticsPanel unavailable={tr('原生服务暂未提供汇总统计。', 'The native server does not provide aggregate statistics yet.')} scope={scope} onScopeChange={setScope} />
       <SectionLabel title={tr('资源概览', 'Resource overview')} />
       {runtime ? (
         <MemoryHierarchy instances={instances} runtime={runtime} connectionRevision={connectionRevision}
@@ -202,7 +174,7 @@ export function OverviewPage() {
             ))}
           </div>
         </TMPanel>
-        <ServingTotalsPanel data={servingStatistics} scope={scope} runtime={runtime} />
+        <ServingTotalsPanel scope={scope} runtime={runtime} />
       </div>
     </section>
   );

@@ -1,5 +1,5 @@
 
-import type { RuntimeLogEntry, JobResource, JobEventResource, JobKindResource } from '../types';
+import type { RuntimeLogEntry, JobResource, JobEventResource } from '../types';
 import { ApiError, request, apiUrl, errorFromResponse, authorizedHeaders } from '../client';
 import type { ApiErrorBody } from '../types';
 import { readEventStream } from '../eventStream';
@@ -11,11 +11,6 @@ export const jobsApi = {
 
   async jobs(limit = 100): Promise<JobResource[]> {
     return (await request<{ data: JobResource[] }>(`/api/jobs?limit=${limit}`)).data;
-  },
-
-
-  async jobKinds(): Promise<JobKindResource[]> {
-    return (await request<{ data: JobKindResource[] }>('/api/jobs/kinds')).data;
   },
 
 

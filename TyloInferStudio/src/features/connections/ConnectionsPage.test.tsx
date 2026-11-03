@@ -32,7 +32,6 @@ beforeEach(() => {
   setBrowserServiceUrl('');
   setApiBaseUrl('');
   reloadService.mockResolvedValue(true);
-  vi.spyOn(runtimeApi, 'runtimeListener').mockResolvedValue({ host: '127.0.0.1', port: 8090, anthropic_port: 8091, configurable: true });
 });
 
 it('changes a managed native Studio port through its launcher without requesting HTTP listener APIs', async () => {
@@ -42,7 +41,6 @@ it('changes a managed native Studio port through its launcher without requesting
     service_url: 'http://127.0.0.1:8090', reachable: true, connection: 'managed', managed_pid: 123 };
   setApiBaseUrl(connection.studio.service_url);
   vi.mocked(configureStudio).mockResolvedValue(connection.studio);
-  const listener = vi.spyOn(runtimeApi, 'configureRuntimeListener');
   render(<MemoryRouter><ConnectionsPage /></MemoryRouter>);
   const port = screen.getByRole('spinbutton', { name: 'OpenAI port' });
   expect(port).toBeEnabled();
@@ -50,8 +48,6 @@ it('changes a managed native Studio port through its launcher without requesting
   fireEvent.blur(port);
   await waitFor(() => expect(configureStudio).toHaveBeenCalledWith({ ...connection.studio!.config, local_service_port: 8092 }));
   await waitFor(() => expect(reloadService).toHaveBeenCalledOnce());
-  expect(runtimeApi.runtimeListener).not.toHaveBeenCalled();
-  expect(listener).not.toHaveBeenCalled();
   expect(await screen.findByText(/The service restarted on the new port/)).toBeInTheDocument();
 });
 afterEach(() => { vi.restoreAllMocks(); localStorage.clear(); setApiBaseUrl(''); });

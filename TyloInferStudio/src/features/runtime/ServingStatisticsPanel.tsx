@@ -4,11 +4,10 @@ import type { RuntimeStatus, ServingStatistics } from '../../shared/api/contract
 import { useSettings } from '../settings/SettingsProvider';
 import './serving.css';
 
-type StatisticsProps = { data: ServingStatistics | null; scope: ServingStatistics['scope'] };
+type StatisticsProps = { data?: ServingStatistics | null; scope: ServingStatistics['scope'] };
 
 /** Render available aggregate measurements and distinguish missing resources from refresh failures. */
-export function ServingStatisticsPanel({ data, error, unavailable, scope, onScopeChange }: StatisticsProps & {
-  error: string | null;
+export function ServingStatisticsPanel({ data, unavailable, scope, onScopeChange }: StatisticsProps & {
   unavailable?: string;
   onScopeChange: (scope: ServingStatistics['scope']) => void;
 }) {
@@ -25,7 +24,6 @@ export function ServingStatisticsPanel({ data, error, unavailable, scope, onScop
         <button type="button" aria-pressed={scope === 'alltime'} onClick={() => onScopeChange('alltime')}>{tr('全部历史', 'All time')}</button>
       </div>
     </div>
-    {error && <p className="serving-error" role="status">{tr('统计暂未更新', 'Statistics could not be refreshed')} · {error}</p>}
     {unavailable && <p className="configuration-effect" role="status">{unavailable}</p>}
     <div className="metric-grid">
       <MetricTile label={tr('预填充', 'Prefill')} value={formatNumber(totals?.prefill_tps ?? undefined, 1)} unit="tok/s"

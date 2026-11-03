@@ -5,8 +5,6 @@ import { errorMessage, formatNumber } from '../../app/formatters';
 import { Icon } from '../../app/display';
 import { useSettings } from '../settings/SettingsProvider';
 import { toast } from '../../stores/toastStore';
-import { displayPrefillMetric, preferPositiveMetric } from './metrics';
-import type { RequestLogRecord } from './useLogHistory';
 
 export function LogDetails({ value, children }: { value: unknown; children?: ReactNode }) {
   const { tr } = useSettings();
@@ -21,23 +19,6 @@ export function LogDetails({ value, children }: { value: unknown; children?: Rea
       <button type="button" onClick={() => void copy()}><Icon name="copy" size={13} />{tr('复制', 'Copy')}</button></div>
     <pre>{serialized}</pre>
   </div>;
-}
-
-export function RequestDetails({ record }: { record: RequestLogRecord }) {
-  const { tr } = useSettings();
-  const { request } = record;
-  const prefill = displayPrefillMetric(request);
-  const metric = (value: number | undefined, suffix = '') => value == null ? '--' : `${formatNumber(value, 1)}${suffix}`;
-  const values = [
-    [tr('输入 / 输出 tokens', 'Input / output tokens'), `${metric(request.prompt_tokens)} / ${metric(request.completion_tokens)}`],
-    [tr('预填充', 'Prefill'), `${metric(prefill.tokensPerSecond, ' tok/s')} · ${metric(prefill.milliseconds, ' ms')}`],
-    [tr('解码', 'Decode'), `${metric(request.decode_tps, ' tok/s')} · ${metric(request.decode_ms, ' ms')}`],
-    [tr('首字延迟', 'TTFT'), metric(request.ttft_ms, ' ms')],
-    [tr('请求总耗时', 'Total request time'), metric(preferPositiveMetric(request.complete_generation_ms, request.generation_ms), ' ms')],
-    [tr('停止原因', 'Finish reason'), request.finish_reason || '--'],
-  ];
-  return <LogDetails value={record}><div className="log-detail-metrics">{values.map(([label, value]) =>
-    <div key={label}><span>{label}</span><strong>{value}</strong></div>)}</div></LogDetails>;
 }
 
 export function JobDetails({ job, onRemove, busy, refreshAt }: { job: JobResource; onRemove: () => void; busy: boolean; refreshAt?: number | null }) {

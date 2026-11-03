@@ -210,9 +210,18 @@ bool weight_file(const std::string& name) {
     static const std::vector<std::string> suffixes{".tq", ".mfq", ".safetensors", ".gguf", ".bin"};
     return std::find(suffixes.begin(), suffixes.end(), lowercase(std::filesystem::path(name).extension().string())) != suffixes.end();
 }
-Hub::Request download(const std::string& kind, Json& body, const Hub& hub) {
-    if (kind != "download.huggingface" && kind != "download.modelscope")
+// The only job kinds a client may submit through POST /api/jobs or retry; every other
+// kind is an internal operation that its own resource route creates.
+const std::vector<const char*>& submittable_kinds() {
+    static const std::vector<const char*> kinds{"download.huggingface", "download.modelscope"};
+    return kinds;
+}
+void require_submittable(const std::string& kind) {
+    const auto& kinds = submittable_kinds();
+    if (std::find(kinds.begin(), kinds.end(), kind) == kinds.end())
         throw ApiError(501, "job_kind_not_supported", "this job kind is not available in the native server");
+}
+Hub::Request download(const std::string& kind, Json& body, const Hub& hub) {
     fields(body, {"repo_id", "revision", "destination", "download_directory", "include", "exclude", "max_workers", "direct", "expected_bytes", "repo_type"});
     Hub::Request result;
     result.source = {provider(kind.substr(9)), text(body, "repo_id", true), text(body, "revision")};
@@ -246,7 +255,8 @@ Hub::Request download(const std::string& kind, Json& body, const Hub& hub) {
     }
     return result;
 }
-std::string submit(Hub& hub, ModelCatalog& catalog, Jobs& jobs, const std::string& kind, Json body) {
+std::string submit_download_job(Hub& hub, ModelCatalog& catalog, Jobs& jobs, const std::string& kind, Json body) {
+    require_submittable(kind);
     const auto request = download(kind, body, hub);
     return jobs.submit(kind, body, [&hub, &catalog, &jobs, request](const Jobs::Control& control) {
         control.progress("resolving");
@@ -405,20 +415,18 @@ void hub_probe(const Services& services, const httplib::Request& request, httpli
     set_json(response, {{"data", std::move(data)}});
 }
 
-void jobs_kinds(const Services&, const httplib::Request&, httplib::Response& response) {
-    set_json(response, {{"data", Json::array({{{"kind", "download.huggingface"}}, {{"kind", "download.modelscope"}}})}});
-}
-
 void jobs_submit(const Services& services, const httplib::Request& request, httplib::Response& response) {
     const auto body = parse_json(request); fields(body, {"kind", "payload"});
     if (!body.contains("payload")) throw ApiError(400, "invalid_request", "payload is required");
-    set_json(response, services.jobs.get(submit(services.hub, services.catalog, services.jobs, text(body, "kind", true), body.at("payload"))), 202);
+    set_json(response, services.jobs.get(submit_download_job(services.hub, services.catalog, services.jobs, text(body, "kind", true), body.at("payload"))), 202);
 }
 
 void job_retry(const Services& services, const httplib::Request& request, httplib::Response& response) {
     const auto previous = services.jobs.get(normalize_uuid(request.matches[1]));
-    if (!Jobs::terminal(previous) || previous.at("status") == "succeeded") throw ApiError(409, "job_state_conflict", "only failed, cancelled or interrupted downloads can be retried");
-    set_json(response, services.jobs.get(submit(services.hub, services.catalog, services.jobs, previous.at("kind"), previous.at("payload"))), 202);
+    require_submittable(previous.at("kind"));
+    if (!Jobs::terminal(previous) || previous.at("status") == "succeeded")
+        throw ApiError(409, "job_state_conflict", "only failed, cancelled or interrupted downloads can be retried");
+    set_json(response, services.jobs.get(submit_download_job(services.hub, services.catalog, services.jobs, previous.at("kind"), previous.at("payload"))), 202);
 }
 
 }

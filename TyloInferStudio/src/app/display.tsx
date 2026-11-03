@@ -199,12 +199,12 @@ export function SettingRow({
   title: string;
   titleHint?: string;
   detail: string;
-  trailing: ReactNode;
+  trailing?: ReactNode;
 }) {
   return (
     <div className="setting-row">
       <div><strong title={titleHint}>{title}</strong><small>{detail}</small></div>
-      <div className="setting-row-trailing">{trailing}</div>
+      {trailing != null && <div className="setting-row-trailing">{trailing}</div>}
     </div>
   );
 }

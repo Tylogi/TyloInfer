@@ -761,7 +761,6 @@ void keys_and_network() {
         CHECK(server.get("/api/models/00000000000000000000000000000000/directory", credentials).status == (std::string(role) == "viewer" ? 403 : 404));
         CHECK(server.get("/api/models", credentials).status == 200);
         CHECK(server.raw("HEAD", "/api/models", credentials).status == 200);
-        CHECK(server.raw("HEAD", "/api/runtime/listener", credentials).status == 200);
         CHECK(server.get("/api/auth/keys", credentials).status == (std::string(role) == "administrator" ? 200 : 403));
     }
     for (const auto& input : std::vector<json>{json::object(), {{"name", "x"}}, {{"name", "x"}, {"scopes", {"root"}}},
@@ -935,7 +934,7 @@ void runtime_policies() {
     restarted.stop();
 }
 
-// Profiles, capabilities, instance policy patches and the listener against the real server binary;
+// Profiles and instance policy patches against the real server binary;
 // no model can load in this fixture, so the instance-backed paths live in server_inference_test.cpp.
 void runtime_profiles() {
     Fixture f;
@@ -950,15 +949,10 @@ void runtime_profiles() {
     const std::string absent = "00000000-0000-4000-8000-000000000001";
     const std::string instance_path = "/api/runtime/instances/" + absent;
 
-    for (const auto* path : {"/api/runtime/profiles", "/api/runtime/listener"})
+    for (const auto* path : {"/api/runtime/profiles"})
         CHECK(server.get(path).status == 401);
     CHECK(server.send("POST", "/api/runtime/profiles", {{"name", "chat"}, {"load", load}}).status == 401);
     CHECK(server.send("PATCH", instance_path, {{"pinned", true}}).status == 401);
-
-    // One native listener serves both protocols on the port chosen at startup.
-    const auto listener = server.get("/api/runtime/listener", admin).document();
-    CHECK(listener.at("host") == "127.0.0.1" && listener.at("port").get<int>() > 0);
-    CHECK(listener.at("anthropic_port").is_null() && listener.at("configurable") == false);
 
     for (const auto& body : std::vector<json>{json::object(), {{"pinned", "yes"}}, {{"pinned", nullptr}},
             {{"idle_ttl_seconds", -1}}, {{"idle_ttl_seconds", "60"}}, {{"unexpected", true}}})
@@ -1036,10 +1030,8 @@ void runtime_profiles() {
     CHECK(issued.status == 201);
     const auto model_key = bearer(issued.document().at("token").get<std::string>());
     CHECK(server.get("/api/runtime/profiles", model_key).status == 403);
-    CHECK(server.get("/api/runtime/listener", model_key).status == 403);
     CHECK(server.send("PATCH", instance_path, {{"pinned", true}}, model_key).status == 404);
     CHECK(server.send("POST", "/api/runtime/profiles", {{"name", "scoped"}, {"load", load}}, model_key).status == 201);
-    CHECK(server.send("PUT", "/api/runtime/listener", {{"port", 8080}}, model_key).status == 403);
 
     CHECK(server.raw("DELETE", "/api/runtime/profiles/" + id, admin).status == 204);
     CHECK(server.get("/api/runtime/profiles/" + id, admin).status == 404);
