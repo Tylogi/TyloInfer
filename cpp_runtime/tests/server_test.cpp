@@ -449,6 +449,10 @@ void static_files() {
     }
     CHECK(server.get("/assets/app.js").body == "console.log('ok');");
     CHECK(server.get("/guide/").body == "guide");
+    // API responses carry the strict policy without the web UI's release-check origin.
+    const auto api_csp = server.get("/health").header("Content-Security-Policy");
+    CHECK(api_csp.find("connect-src 'self' ws: wss:;") != std::string::npos);
+    CHECK(api_csp.find("api.github.com") == std::string::npos);
     CHECK(server.get("/health").document().at("service") == "tyloinfer-server");
     for (const auto* path : {"/api/secret", "/v1/missing", "/health/missing", "/docs/missing",
             "/assets/missing", "/missing.js/", "/%2e%2e/secret.txt", "/%5csecret", "/%00secret"})
