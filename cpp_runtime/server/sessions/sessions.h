@@ -1,6 +1,7 @@
 #pragma once
 
 #include "storage/storage.h"
+#include "media/media.h"
 #include "models/instances.h"
 #include <nlohmann/json.hpp>
 
@@ -10,7 +11,7 @@ class Sessions {
 public:
     using Json = nlohmann::json;
     struct Error : std::runtime_error {
-        enum Kind { invalid, not_found, conflict, unavailable, too_large, stopping, save_failed } kind;
+        enum Kind { invalid, not_found, conflict, unprocessable, unavailable, too_large, stopping, save_failed } kind;
         std::string code;
         Json details;
         Error(Kind kind, std::string code, std::string message, Json details = Json::object())
@@ -31,7 +32,7 @@ public:
         std::unique_ptr<State> state_;
     };
 
-    Sessions(Storage& storage, ModelInstances& models);
+    Sessions(Storage& storage, ModelInstances& models, Media& media);
     ~Sessions();
     Json create(const Json& request);
     Json get(const std::string& id) const;
@@ -55,6 +56,7 @@ public:
 private:
     Storage& storage_;
     ModelInstances& models_;
+    Media& media_;
     std::mutex mutex_;
     std::map<std::string, std::weak_ptr<Reply>> active_;
     bool stopping_ = false;

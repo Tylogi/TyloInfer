@@ -55,7 +55,8 @@ Json content(const Json& block) {
         const auto mime = text(source.value("media_type", Json()), "image.source.media_type");
         if (mime != "image/jpeg" && mime != "image/png" && mime != "image/gif" && mime != "image/webp")
             throw ProtocolError(400, "invalid_request_error", "unsupported image media type");
-        url = "data:" + mime + ";base64," + text(source.value("data", Json()), "image.source.data");
+        // The native engine has no image decoder, so inline bytes cannot become vision tensors here.
+        throw ProtocolError(501, "media_unavailable", "the native server does not decode inline image bytes");
     } else throw ProtocolError(400, "invalid_request_error", "image source must be URL or base64");
     return {{"type", "image_url"}, {"image_url", {{"url", std::move(url)}}}};
 }

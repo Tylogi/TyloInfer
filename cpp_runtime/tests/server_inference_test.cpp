@@ -749,8 +749,19 @@ void jobs_checks() {
 
 template<class Action> void session_error(const char* code, Action action) {
     try { action(); }
-    catch (const Sessions::Error& error) { CHECK(error.code == code); return; }
+    catch (const Sessions::Error& error) {
+        if (error.code != code) throw std::runtime_error(std::string("expected ") + code + ", got " + error.code + ": " + error.what());
+        return;
+    }
     throw std::runtime_error(std::string("expected session error: ") + code);
+}
+template<class Action> void upload_error(const char* code, Action action) {
+    try { action(); }
+    catch (const Media::Error& error) {
+        if (error.code != code) throw std::runtime_error(std::string("expected ") + code + ", got " + error.code + ": " + error.what());
+        return;
+    }
+    throw std::runtime_error(std::string("expected media error: ") + code);
 }
 Json reply_input(const char* prompt = "hello", std::int64_t revision = 0) {
     return {{"request_id", normalize_uuid({})}, {"expected_revision", revision},
@@ -766,10 +777,11 @@ void session_checks() {
     factory.unavailable_reason = [](const mfq::ModelSource&) { return std::string(); };
     factory.load = [](const fs::path&, const LoadOptions&) { return std::make_unique<FixtureEngine>(); };
     ModelInstances models(catalog, storage, factory);
+    Media media(storage, directory.root / "media");
     const auto loaded = models.load(catalog.list(true)[0].id);
     std::string preserved, interrupted;
     {
-        Sessions sessions(storage, models);
+        Sessions sessions(storage, models, media);
         const auto created = sessions.create({{"model", loaded.id}, {"title", "original"}});
         const auto id = preserved = created.at("id").get<std::string>();
         const auto body = reply_input();
@@ -825,8 +837,57 @@ void session_checks() {
         invalid_date["messages"][0]["created_at"] = "2026-02-30T00:00:00Z";
         session_error("invalid_request", [&] { sessions.import_archive(invalid_date); });
         CHECK(sessions.list()["data"].size() == before);
-        auto media = sessions.export_archive(id); media["media"] = Json::array({Json::object()});
-        session_error("media_unavailable", [&] { sessions.import_archive(media); });
+        auto malformed_media = sessions.export_archive(id); malformed_media["media"] = Json::array({Json::object()});
+        session_error("invalid_request", [&] { sessions.import_archive(malformed_media); });
+        CHECK(sessions.list()["data"].size() == before);
+        // Media uploads are stored and archived, but no native path turns them into tensors.
+        const std::string picture{"tyloinfer-media-check"}, sound{"audio"};
+        const std::string digest{"2b03e8c6dff53e6694f0f92589500c61062a1789d8e5d5b65714f64cf2c000a7"};
+        const auto stored = media.put(picture, "image/png; charset=binary", digest);
+        CHECK(stored["media"]["sha256"] == digest && stored["media"]["mime_type"] == "image/png" &&
+            stored["media"]["byte_size"] == picture.size() && !stored["created_at"].is_null());
+        CHECK(fs::file_size(directory.root / "media" / "2b" / "03" / digest) == picture.size());
+        CHECK(media.put(picture, "application/octet-stream", digest)["media"]["id"] == stored["media"]["id"]);
+        upload_error("media_digest_mismatch", [&] { media.put(picture, "image/png", std::string(64, '0')); });
+        upload_error("unsupported_media_type", [&] { media.put(picture, "application/x-shockwave-flash", digest); });
+        upload_error("empty_media", [&] { media.put("", "image/png", digest); });
+        const auto& reference = stored["media"];
+        const auto attached = sessions.create({{"model", loaded.id}})["id"].get<std::string>();
+        const auto image = Json::array({{{"type", "image"}, {"media", reference}, {"width", 8}}});
+        CHECK(sessions.append(attached, {{"expected_revision", 0}, {"role", "user"}, {"parts", image}})
+            ["message"]["parts"][0]["media"]["id"] == reference["id"]);
+        auto wrong_digest = reference; wrong_digest["sha256"] = std::string(64, '0');
+        session_error("media_reference_mismatch", [&] { sessions.append(attached,
+            {{"expected_revision", 1}, {"role", "user"}, {"parts", Json::array({{{"type", "image"}, {"media", wrong_digest}}})}}); });
+        auto unknown = reference; unknown["id"] = normalize_uuid({});
+        session_error("media_not_found", [&] { sessions.append(attached,
+            {{"expected_revision", 1}, {"role", "user"}, {"parts", Json::array({{{"type", "image"}, {"media", unknown}}})}}); });
+        const auto clip = media.put(sound, "audio/mpeg", "6ed8919ce20490a5e3ad8630a4fab69475297abd07db73918dd5f36fcfaeb11b");
+        session_error("media_type_mismatch", [&] { sessions.append(attached,
+            {{"expected_revision", 1}, {"role", "user"}, {"parts", Json::array({{{"type", "image"}, {"media", clip["media"]}}})}}); });
+        session_error("invalid_request", [&] { sessions.append(attached,
+            {{"expected_revision", 1}, {"role", "user"}, {"parts", Json::array({{{"type", "audio"}, {"media", reference}}})}}); });
+        session_error("media_unavailable", [&] { sessions.append(attached,
+            {{"expected_revision", 1}, {"role", "user"}, {"parts", Json::array({{{"type", "document"}, {"media", reference}, {"name", "note.txt"}}})}}); });
+        CHECK(sessions.get(attached)["revision"] == 1);
+        auto attached_input = reply_input("look", 1); attached_input["input"] = image;
+        session_error("media_unavailable", [&] { sessions.start(attached, attached_input); });
+        CHECK(sessions.get(attached)["revision"] == 1 && sessions.responses(attached)["data"].empty());
+        auto with_media = sessions.export_archive(attached);
+        CHECK(with_media["media"].size() == 1 && with_media["media"][0]["data_base64"] == base64_encode(picture) &&
+            with_media["media"][0]["sha256"] == digest && with_media["media"][0]["document"].is_null());
+        const auto reattached = sessions.import_archive(with_media);
+        CHECK(reattached["media_imported"] == 1 && reattached["messages_imported"] == 1);
+        const auto rebound = sessions.messages(reattached["session"]["id"])["data"][0]["parts"][0]["media"];
+        // The archive digest already has a local row, so the import reuses it instead of duplicating the blob.
+        CHECK(rebound == reference);
+        CHECK(sessions.export_archive(reattached["session"]["id"])["media"][0]["data_base64"] == base64_encode(picture));
+        auto without_media = with_media; without_media["media"] = Json::array();
+        session_error("archive_media_missing", [&] { sessions.import_archive(without_media); });
+        auto tampered = with_media; tampered["media"][0]["data_base64"] = base64_encode("tampered");
+        upload_error("media_digest_mismatch", [&] { sessions.import_archive(tampered); });
+        auto documented = with_media; documented["media"][0]["document"] = {{"name", "note"}};
+        session_error("media_unavailable", [&] { sessions.import_archive(documented); });
         const auto tool_session = sessions.create({{"model", loaded.id}})["id"].get<std::string>();
         auto tool_input = reply_input("tool");
         tool_input["tools"] = Json::array({{{"type", "function"}, {"function", {{"name", "lookup"}}}}});
@@ -924,7 +985,7 @@ void session_checks() {
         CHECK(active->snapshot()["status"] == "cancelled");
     }
     {
-        Sessions recovered(storage, models);
+        Sessions recovered(storage, models, media);
         CHECK(recovered.get(preserved)["revision"] == 1);
         CHECK(recovered.get(interrupted)["state"] == "interrupted");
         CHECK(recovered.responses(interrupted)["data"][0]["error"]["code"] == "response_interrupted");
@@ -956,7 +1017,8 @@ void reply_load_checks() {
             return engine;
         };
         ModelInstances models(catalog, storage, factory); models.set_aliases({{"model", "fast"}});
-        Sessions sessions(storage, models);
+        Media media(storage, directory.root / "media");
+        Sessions sessions(storage, models, media);
         const auto a = sessions.create({{"model", "fast"}})["id"].get<std::string>();
         auto invalid = reply_input(); invalid["sampling"] = {{"top_k", 1025}};
         session_error("invalid_request_error", [&] { sessions.start(a, invalid); });
@@ -1264,6 +1326,16 @@ void compat_checks(const fs::path& executable) {
     CHECK(response && response->status == 501 && Json::parse(response->body)["error"]["type"] == "api_error");
     body = request_body("hello"); body["max_tokens"] = 4096; body["thinking"] = {{"type", "enabled"}, {"budget_tokens", 1024}};
     response = server.post("/v1/messages", body); CHECK(response && response->status == 501);
+    // Inline image bytes have no native decoder, so they must not reach the chat template as image_url.
+    const auto image = [](const char* mime) {
+        return Json::array({{{"role", "user"}, {"content", Json::array({
+            {{"type", "image"}, {"source", {{"type", "base64"}, {"media_type", mime}, {"data", "cG5n"}}}}})}}});
+    };
+    body = request_body("hello"); body["messages"] = image("image/png");
+    response = server.post("/v1/messages", body);
+    CHECK(response && response->status == 501 && Json::parse(response->body)["error"]["type"] == "api_error");
+    body = request_body("hello"); body["messages"] = image("image/tiff");
+    response = server.post("/v1/messages", body); CHECK(response && response->status == 400);
     response = server.post("/v1/messages/count_tokens", request_body("hello")); CHECK(response && response->status == 501);
     response = server.post("/v1/messages", request_body("hello"), {{"Anthropic-Version", "future"}}); CHECK(response && response->status == 400);
     body = request_body("hello"); body["model"] = "missing";
@@ -1708,7 +1780,8 @@ void session_http_checks(const fs::path& executable) {
     server.process.reset();
     Storage reopened(server.root / "data" / "server.sqlite3");
     ModelCatalog catalog({server.root / "data" / "models"}); ModelInstances models(catalog, reopened, {});
-    Sessions restored(reopened, models);
+    Media restored_media(reopened, server.root / "data" / "media");
+    Sessions restored(reopened, models, restored_media);
     CHECK(restored.messages(id)["data"].size() == 5 && restored.presets()["data"].size() == 1);
     CHECK(restored.start(id, input)->finish()["status"] == "completed");
 }
