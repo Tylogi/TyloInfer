@@ -9,7 +9,8 @@ Scope required_scope(const std::string& method, const std::string& path) {
     if (path == "/api/hub/download-directory") return Scope::models;
     if (starts("/api/runtime/cache/entries") || path == "/api/runtime/cache/purge") return Scope::admin;
     if (!read && (path == "/api/runtime/listener" || path == "/api/runtime/memory-policy" ||
-        path == "/api/runtime/model-aliases" || path == "/api/runtime/context-policy")) return Scope::admin;
+        path == "/api/runtime/model-aliases" || path == "/api/runtime/context-policy" ||
+        path == "/api/runtime/inference-policy")) return Scope::admin;
     if (starts("/api/auth/") || starts("/api/cluster/")) return Scope::admin;
     if (starts("/api/models/directories")) return Scope::models;
     if (starts("/api/models/") && path.size() >= 10 && path.compare(path.size() - 10, 10, "/directory") == 0) return Scope::models;

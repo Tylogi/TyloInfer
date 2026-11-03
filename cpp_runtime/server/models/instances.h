@@ -15,6 +15,8 @@ class Storage;
 struct LoadPolicy {
     bool pin = false;
     std::optional<std::chrono::seconds> idle_ttl;
+    // The runtime inference policy is applied once, when the instance is created.
+    bool mtp_enabled = true;
 };
 struct InstanceInfo {
     enum class State { loaded, unloading, failed } state;

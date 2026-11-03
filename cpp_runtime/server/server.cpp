@@ -7,6 +7,7 @@
 #include "api/models.h"
 #include "api/artifacts.h"
 #include "api/runtime.h"
+#include "api/runtime_config.h"
 #include "api/jobs.h"
 #include "api/hub.h"
 #include "hub/hub.h"
@@ -16,6 +17,7 @@
 #include "protocol.h"
 #include "models/catalog.h"
 #include "models/instances.h"
+#include "models/policies.h"
 #include "models/errors.h"
 
 #include "httplib.h"
@@ -220,6 +222,7 @@ int run(const Config& config, const std::atomic<bool>& stop_requested, EngineFac
     Hub hub(data_dir, std::move(hub_network));
     const std::string backend = factory.backend;
     ModelInstances instances(models, storage, std::move(factory));
+    RuntimePolicies policies(storage);
     Media media(storage, data_dir / "media");
     Sessions sessions(storage, instances, media);
     Jobs jobs(storage, [](std::exception_ptr exception) { return describe_failure(exception).detail; });
@@ -326,9 +329,10 @@ int run(const Config& config, const std::atomic<bool>& stop_requested, EngineFac
         set_json(response, instance.identity());
     });
     register_auth(http, auth);
-    register_models(http, models, instances, jobs);
+    register_models(http, models, instances, jobs, policies);
     register_artifacts(http, models, instances, backend);
     register_runtime(http, instances);
+    register_runtime_config(http, policies);
     register_jobs(http, jobs, streams);
     register_hub(http, hub, models, jobs, backend);
     register_inference(http, instances, streams);
