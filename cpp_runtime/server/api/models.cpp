@@ -3,6 +3,7 @@
 #include "instance_json.h"
 #include "models/instances.h"
 #include "models/errors.h"
+#include "models/policies.h"
 #include "jobs/jobs.h"
 #include "instance.h"
 
@@ -58,9 +59,20 @@ std::int64_t integer(const json& request, const char* field, std::int64_t fallba
         throw ApiError(400, "invalid_request", std::string(field) + " is outside its supported range");
     return value.get<std::int64_t>();
 }
+
+// The context policy only supplies a default when the request omits context_size. A declared artifact
+// capacity still wins over fallback_context_size, and 0 leaves the choice to the native factory.
+std::int64_t policy_context_size(const ModelCatalog::Artifact& artifact, const json& policy) {
+    const auto& overrides = policy.at("model_overrides");
+    const auto override = overrides.find(artifact.name);
+    const auto capacity = artifact.context_capacity.value_or(2147483647);
+    if (override != overrides.end()) return std::min(override.value().get<std::int64_t>(), capacity);
+    return artifact.context_capacity ? 0 : policy.at("fallback_context_size").get<std::int64_t>();
+}
 } // namespace
 
-void register_models(httplib::Server& http, ModelCatalog& catalog, ModelInstances& instances, Jobs& jobs) {
+void register_models(httplib::Server& http, ModelCatalog& catalog, ModelInstances& instances, Jobs& jobs,
+        RuntimePolicies& policies) {
     http.Get("/api/models", [&](const httplib::Request& request, httplib::Response& response) {
         const auto refresh = request.get_param_value("refresh");
         if (request.has_param("refresh") && refresh != "true" && refresh != "false" && refresh != "1" && refresh != "0")
@@ -105,6 +117,8 @@ void register_models(httplib::Server& http, ModelCatalog& catalog, ModelInstance
         fields(requirements, {"context_size"});
         LoadOptions options;
         options.context_size = integer(requirements, "context_size", 0, 1, 2147483647);
+        if (!requirements.contains("context_size"))
+            options.context_size = policy_context_size(artifact, policies.context_policy());
         const auto policy_body = body.value("policy", json::object());
         fields(policy_body, {"pin", "idle_ttl_seconds"});
         LoadPolicy policy;
@@ -115,6 +129,7 @@ void register_models(httplib::Server& http, ModelCatalog& catalog, ModelInstance
         if (policy_body.contains("idle_ttl_seconds"))
             policy.idle_ttl = std::chrono::seconds(integer(policy_body, "idle_ttl_seconds", 0, 1, 2147483647));
         if (policy.pin && policy.idle_ttl) throw ApiError(400, "invalid_request", "pinned instances cannot have an idle timeout");
+        policy.mtp_enabled = policies.inference_policy().at("mtp_enabled").get<bool>();
         const auto operation = jobs.submit("model.load", body, [&, artifact_id, options, policy](const Jobs::Control& control) {
             const auto progress = [&](LoadControl::Phase phase) {
                 control.progress(phase == LoadControl::Phase::resolving ? "resolving" :

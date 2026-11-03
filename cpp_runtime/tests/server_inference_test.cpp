@@ -1970,6 +1970,56 @@ void multi_model_checks(const fs::path& executable, const fs::path& real_model) 
     first.get(); second.get();
 }
 
+// The runtime policies reach the native load path through the model routes; the fixture factory
+// reports the context size it was asked for, so the instance result shows what the server chose.
+void policy_load_checks(const fs::path& executable) {
+    Server server(executable, true);
+    for (const auto* name : {"sized", "plain"}) fixture_model(server.root / name);
+    // "plain" declares no context capacity, so only the policy fallback can supply one.
+    write_file(server.root / "plain" / "config.json", R"({"model_type":"qwen3_5","vocab_size":8})");
+    const auto registered = server.post("/api/models/directories/register", {{"path", path_utf8(server.root)}});
+    CHECK(registered && registered->status == 200);
+    const auto listing = Json::parse(registered->body);
+    std::map<std::string, std::string> artifacts;
+    for (const auto& artifact : listing["data"]) artifacts.emplace(artifact["name"], artifact["id"]);
+    httplib::Client client("127.0.0.1", server.port);
+    const auto put = [&](const char* path, const Json& body) {
+        const auto response = client.Put(path, body.dump(), "application/json");
+        CHECK(response && response->status == 200);
+        return Json::parse(response->body);
+    };
+    const auto load = [&](const char* model) {
+        const auto job = server.complete(server.post("/api/models/load", {{"artifact_id", artifacts.at(model)}}));
+        if (job["status"] != "succeeded") throw std::runtime_error(job.dump() + server.process->output());
+        return job.at("result");
+    };
+    const auto unload = [&] {
+        const auto instances = server.get("/api/runtime/instances")["data"];
+        for (const auto& instance : instances)
+            CHECK(server.complete(server.post("/api/models/unload", {{"instance_id", instance["instance_id"]}}))["status"] == "succeeded");
+    };
+    const auto mtp_enabled = [&] {
+        const auto response = server.post("/v1/chat/completions",
+            {{"model", "sized"}, {"messages", {{{"role", "user"}, {"content", "inspect"}}}}, {"max_tokens", 8}});
+        CHECK(response && response->status == 200);
+        const auto observed = Json::parse(Json::parse(response->body)["choices"][0]["message"]["content"].get<std::string>());
+        return observed["enable_mtp"].get<bool>();
+    };
+    // A declared artifact capacity leaves the context choice to the native factory; the fallback fills a gap.
+    CHECK(load("sized")["context_size"] == 128);
+    CHECK(load("plain")["context_size"] == 32768);
+    CHECK(mtp_enabled());
+    unload();
+    put("/api/runtime/context-policy", {{"fallback_context_size", 640}, {"model_overrides", {{"sized", 512}}}});
+    CHECK(load("sized")["context_size"] == 512 && load("plain")["context_size"] == 640);
+    unload();
+    put("/api/runtime/inference-policy", {{"mtp_enabled", false}});
+    CHECK(load("sized")["context_size"] == 512);
+    CHECK(!mtp_enabled());
+    unload();
+    server.process->close_input(); CHECK(server.process->wait() == 0);
+}
+
 void run_checks(const fs::path& executable, const fs::path& real_model) {
     const bool fixture = real_model.empty();
     Server server(executable, fixture);
@@ -2207,6 +2257,10 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string(argv[1]) == "--runtime-observation") {
             runtime_observation_checks(fs::absolute(fs::u8path(argv[0])));
             std::cout << "native runtime observation checks passed\n"; return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "--policies") {
+            policy_load_checks(fs::absolute(fs::u8path(argv[0])));
+            std::cout << "native runtime policy checks passed\n"; return 0;
         }
         if (argc == 4 && std::string(argv[1]) == "--cuda-resources") {
             cuda_resource_checks(fs::absolute(fs::u8path(argv[2])), fs::u8path(argv[3]));

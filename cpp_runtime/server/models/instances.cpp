@@ -179,6 +179,9 @@ std::shared_ptr<ModelInstance> ModelInstances::create(const ModelCatalog::Artifa
     if (!engine) throw std::runtime_error("engine factory returned no engine");
     auto instance = std::make_shared<ModelInstance>(artifact, factory_.backend, std::move(engine));
     instance->policy_ = policy;
+    // shortcut: the inference policy only lowers the instance default; a request that names
+    // enable_mtp explicitly still wins, until per-request policy application lands with the runtime work package.
+    if (!policy.mtp_enabled) instance->sampling_.enable_mtp = false;
     try {
         control.checkpoint(LoadControl::Phase::initializing);
         if (stopping_) throw ModelError(ModelError::Kind::stopping, "server_stopping", "server is stopping");

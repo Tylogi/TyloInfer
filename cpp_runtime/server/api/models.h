@@ -4,5 +4,7 @@ namespace mfq::server {
 class ModelCatalog;
 class ModelInstances;
 class Jobs;
-void register_models(httplib::Server& http, ModelCatalog& catalog, ModelInstances& instances, Jobs& jobs);
+class RuntimePolicies;
+void register_models(httplib::Server& http, ModelCatalog& catalog, ModelInstances& instances, Jobs& jobs,
+    RuntimePolicies& policies);
 }

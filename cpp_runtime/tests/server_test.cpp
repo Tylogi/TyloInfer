@@ -733,6 +733,91 @@ void runtime_observation() {
     server.stop();
 }
 
+void runtime_policies() {
+    Fixture f;
+    auto server = f.start({}, root_environment);
+    const std::vector<const char*> policies{"/api/runtime/context-policy", "/api/runtime/inference-policy",
+        "/api/runtime/memory-policy"};
+    for (const auto* path : policies) CHECK(server.get(path).status == 401);
+    const json context_defaults{{"fallback_context_size", 32768}, {"max_context_size", nullptr},
+        {"model_overrides", json::object()}, {"model_yarn_enabled", json::object()},
+        {"model_qsa_kv_offload", json::object()}, {"model_kv_quantization", json::object()},
+        {"model_kv_memory", json::object()}};
+    const json inference_defaults{{"mtp_enabled", true}};
+    const json memory_defaults{{"total_limit_bytes", nullptr}, {"model_limit_bytes", nullptr},
+        {"prefix_limit_bytes", nullptr}, {"prefix_disk_limit_bytes", nullptr}, {"prefix_ram_limit_bytes", nullptr},
+        {"prefix_directory", nullptr}};
+    CHECK(server.get("/api/runtime/context-policy", admin).document() == context_defaults);
+    CHECK(server.get("/api/runtime/inference-policy", admin).document() == inference_defaults);
+    CHECK(server.get("/api/runtime/memory-policy", admin).document() == memory_defaults);
+
+    const json context{{"fallback_context_size", 8192}, {"max_context_size", 65536},
+        {"model_overrides", {{"chat", 4096}}}, {"model_yarn_enabled", {{"chat", true}}},
+        {"model_qsa_kv_offload", {{"chat", {{"enabled", true}, {"budget_bytes", 1073741824LL}, {"ram_budget_bytes", 0}}}}},
+        {"model_kv_quantization", {{"chat", {{"enabled", true}, {"bits", 2.5}, {"algorithm", "turboquant"}}}}},
+        {"model_kv_memory", {{"chat", {{"placement", "auto_ssd"}, {"allocation", "dynamic"}, {"gpu_budget_bytes", 2048},
+            {"ram_preallocated", false}, {"ram_budget_bytes", 4096}}}}}};
+    CHECK(server.send("PUT", "/api/runtime/context-policy", context, admin).document() == context);
+    CHECK(server.get("/api/runtime/context-policy", admin).document() == context);
+    const json context_partial{{"fallback_context_size", 512}, {"max_context_size", 65536},
+        {"model_overrides", {{"chat", 4096}}}, {"model_yarn_enabled", {{"chat", true}}},
+        {"model_qsa_kv_offload", {{"chat", {{"enabled", true}, {"budget_bytes", 1073741824LL}, {"ram_budget_bytes", 0}}}}},
+        {"model_kv_quantization", {{"chat", {{"enabled", true}, {"bits", 2.5}, {"algorithm", "turboquant"}}}}},
+        {"model_kv_memory", {{"chat", {{"placement", "auto_ssd"}, {"allocation", "dynamic"}, {"gpu_budget_bytes", 2048},
+            {"ram_preallocated", false}, {"ram_budget_bytes", 4096}}}}}};
+    CHECK(server.send("PUT", "/api/runtime/context-policy", {{"fallback_context_size", 512}}, admin).document() ==
+        context_partial);
+    for (const auto& body : std::vector<json>{{{"fallback_context_size", 511}}, {{"fallback_context_size", 2147483648LL}},
+            {{"max_context_size", 0}}, {{"model_overrides", {{"chat", "4096"}}}}, {{"model_yarn_enabled", {{"chat", 1}}}},
+            {{"model_qsa_kv_offload", {{"chat", {{"budget_bytes", 0}}}}}},
+            {{"model_kv_quantization", {{"chat", {{"bits", 5}}}}}},
+            {{"model_kv_memory", {{"chat", {{"placement", "disk"}}}}}}, {{"unexpected", true}}}) {
+        const auto rejected = server.send("PUT", "/api/runtime/context-policy", body, admin);
+        CHECK(rejected.status == 422 && rejected.document()["error"]["code"] == "invalid_policy");
+    }
+    // KvMemorySettings.ram_preallocated=false is only legal with SSD KV placement, as in the Python model validator.
+    const auto kv_rule = server.send("PUT", "/api/runtime/context-policy",
+        {{"model_kv_memory", {{"chat", {{"ram_preallocated", false}}}}}}, admin).document();
+    CHECK(kv_rule["error"]["code"] == "invalid_policy" &&
+        kv_rule["error"]["message"].get<std::string>().find("model_kv_memory.chat") != std::string::npos &&
+        kv_rule["error"]["message"].get<std::string>().find("kv_ssd_required") != std::string::npos);
+    CHECK(server.get("/api/runtime/context-policy", admin).document() == context_partial);
+
+    CHECK(server.send("PUT", "/api/runtime/inference-policy", {{"mtp_enabled", false}}, admin).document() ==
+        json({{"mtp_enabled", false}}));
+    // The inference policy has no other fields, so a PUT replaces it instead of merging.
+    CHECK(server.send("PUT", "/api/runtime/inference-policy", json::object(), admin).document() == inference_defaults);
+    for (const auto& body : std::vector<json>{{{"mtp_enabled", "yes"}}, {{"mtp_enabled", 1}}, {{"mtp", true}}})
+        CHECK(server.send("PUT", "/api/runtime/inference-policy", body, admin).status == 422);
+
+    const json memory{{"total_limit_bytes", 17179869184LL}, {"model_limit_bytes", 8589934592LL},
+        {"prefix_limit_bytes", 0}, {"prefix_disk_limit_bytes", 1024}, {"prefix_ram_limit_bytes", nullptr},
+        {"prefix_directory", "/tmp/tyloinfer-prefix"}};
+    CHECK(server.send("PUT", "/api/runtime/memory-policy", memory, admin).document() == memory);
+    const json memory_partial{{"total_limit_bytes", 17179869184LL}, {"model_limit_bytes", 8589934592LL},
+        {"prefix_limit_bytes", 0}, {"prefix_disk_limit_bytes", 1024}, {"prefix_ram_limit_bytes", nullptr},
+        {"prefix_directory", "/tmp/tyloinfer-other"}};
+    CHECK(server.send("PUT", "/api/runtime/memory-policy", {{"prefix_directory", "/tmp/tyloinfer-other"}}, admin).document() ==
+        memory_partial);
+    for (const auto& body : std::vector<json>{{{"total_limit_bytes", 0}}, {{"prefix_limit_bytes", -1}},
+            {{"prefix_directory", ""}}, {{"prefix_directory", 5}}})
+        CHECK(server.send("PUT", "/api/runtime/memory-policy", body, admin).status == 422);
+
+    const auto issued = server.send("POST", "/api/auth/keys", {{"name", "models-only"}, {"scopes", {"models"}}}, admin);
+    CHECK(issued.status == 201);
+    const auto scoped = bearer(issued.document().at("token").get<std::string>());
+    for (const auto* path : policies) {
+        CHECK(server.get(path, scoped).status == 403);
+        CHECK(server.send("PUT", path, json::object(), scoped).status == 403);
+    }
+    server.stop();
+    auto restarted = f.start({}, root_environment);
+    CHECK(restarted.get("/api/runtime/context-policy", admin).document() == context_partial);
+    CHECK(restarted.get("/api/runtime/inference-policy", admin).document() == inference_defaults);
+    CHECK(restarted.get("/api/runtime/memory-policy", admin).document() == memory_partial);
+    restarted.stop();
+}
+
 void model_catalog() {
     Fixture f;
     auto server = f.start({}, root_environment);
@@ -1266,15 +1351,17 @@ void databases_and_migration() {
 
 } // namespace
 
-int run_tests(const fs::path& server, bool models_only) {
+int run_tests(const fs::path& server, const std::string& selection) {
     executable = fs::absolute(server);
     using Tests = std::vector<std::pair<const char*, std::function<void()>>>;
-    const Tests tests = models_only ? Tests{{"model catalog", model_catalog}, {"directory browsing", directory_browsing},
-        {"model roots", model_roots}, {"model inspection", model_inspection}, {"model deletion", model_deletion}} : Tests{
+    const Tests tests = selection == "--models" ? Tests{{"model catalog", model_catalog}, {"directory browsing", directory_browsing},
+        {"model roots", model_roots}, {"model inspection", model_inspection}, {"model deletion", model_deletion}} :
+        selection == "--policies" ? Tests{{"runtime policies", runtime_policies}} : Tests{
         {"CLI and lifetime", cli_and_lifetime}, {"locks and ports", locks_and_ports}, {"static files", static_files},
         {"policy and protocols", policy_and_protocols}, {"keys and network", keys_and_network},
         {"media uploads", media_uploads},
         {"runtime observation", runtime_observation},
+        {"runtime policies", runtime_policies},
         {"shutdown with pending work", shutdown_with_pending_work}, {"database migrations", databases_and_migration}};
     int failures = 0;
     for (const auto& test : tests) {
@@ -1287,12 +1374,14 @@ int run_tests(const fs::path& server, bool models_only) {
 
 #ifdef _WIN32
 int wmain(int argc, wchar_t** argv) {
-    if (argc != 2 && !(argc == 3 && std::wstring(argv[2]) == L"--models")) return 2;
-    return run_tests(argv[1], argc == 3);
+    const std::wstring selection = argc == 3 ? std::wstring(argv[2]) : std::wstring();
+    if (argc != 2 && !(selection == L"--models" || selection == L"--policies")) return 2;
+    return run_tests(argv[1], argc == 3 ? (selection == L"--policies" ? "--policies" : "--models") : "");
 }
 #else
 int main(int argc, char** argv) {
-    if (argc != 2 && !(argc == 3 && std::string(argv[2]) == "--models")) return 2;
-    return run_tests(fs::u8path(argv[1]), argc == 3);
+    const std::string selection = argc == 3 ? argv[2] : std::string();
+    if (argc != 2 && !(selection == "--models" || selection == "--policies")) return 2;
+    return run_tests(fs::u8path(argv[1]), selection);
 }
 #endif

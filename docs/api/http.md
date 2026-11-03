@@ -42,7 +42,7 @@ Anthropic 风格请求（`/v1/messages*`、`/v1/models/*`，或带 `Anthropic-Ve
 | 路由区域 | 所需 scope |
 |---|---|
 | `/api/auth/*` | `admin` |
-| `PUT /api/runtime/model-aliases` | `admin` |
+| `PUT /api/runtime/model-aliases`、`/api/runtime/context-policy`、`/api/runtime/inference-policy`、`/api/runtime/memory-policy` | `admin` |
 | `/api/models/directories*`、`/api/models/{artifact_id}/directory`、`/api/hub/download-directory` | `models` |
 | 其余 `/api/models`、`/api/runtime`、`/api/hub`：读 | `inference` |
 | 其余 `/api/models`、`/api/runtime`、`/api/hub`：写（含 `POST /models/load`、`/models/unload`） | `models` |
@@ -108,6 +108,7 @@ Messages 请求拒绝未知字段。
 | `413` | `request_too_large`、`media_too_large` | 会话消息或导出超过上限；上传超过媒体上限 |
 | `415` | `unsupported_media_type` | `Content-Type` 不是 `application/json`，或上传 MIME 不在媒体白名单 |
 | `422` | `checkpoint_analysis_unavailable`、`model_cache_profile_unavailable`、`media_digest_mismatch`、`media_reference_mismatch`、`media_type_mismatch`、`archive_media_missing` | 检查点不完整或元数据读不出；媒体内容与引用不一致 |
+| `422` | `invalid_policy` | 运行策略字段类型、取值或字段组合非法，`message` 指出出错字段（见 3.7） |
 | `429` | `operation_queue_full`、`stream_connections_full` | 后台队列或流式连接已满 |
 | `500` | `response_save_failed`、`model_registration_save_failed`、`model_alias_save_failed`、`operation_failed` | 落盘或执行失败 |
 | `501` | `cache_reclaim_not_supported`、`media_unavailable`、`session_mode_unavailable` | 当前服务不提供该能力；含媒体片段回复与文档抽取在原生侧未实现 |
@@ -188,6 +189,12 @@ HTTP 层共 4 个工作线程。流式请求（`/v1/chat/completions`、`/v1/mes
 | `GET` | `/api/runtime/logs` | `?instance_id&level&after&limit` | `200 {"data":[LogEntry]}` | `inference` |
 | `GET` | `/api/runtime/model-aliases` | — | `200 Aliases` | `inference` |
 | `PUT` | `/api/runtime/model-aliases` | `Aliases` | `200 Aliases` | `admin` |
+| `GET` | `/api/runtime/context-policy` | — | `200 ContextPolicy` | `inference` |
+| `PUT` | `/api/runtime/context-policy` | `ContextPolicy` | `200 ContextPolicy` | `admin` |
+| `GET` | `/api/runtime/inference-policy` | — | `200 InferencePolicy` | `inference` |
+| `PUT` | `/api/runtime/inference-policy` | `InferencePolicy` | `200 InferencePolicy` | `admin` |
+| `GET` | `/api/runtime/memory-policy` | — | `200 MemoryPolicy` | `inference` |
+| `PUT` | `/api/runtime/memory-policy` | `MemoryPolicy` | `200 MemoryPolicy` | `admin` |
 
 ### 2.3 任务
 
@@ -336,10 +343,12 @@ cache profile、attention profile、license 和 `published_at` 一律为 `null`�
 | `policy.pin` | Boolean | 默认 `false`；表示服务保留实例，不表示锁定物理内存 |
 | `policy.idle_ttl_seconds` | Integer | `1..2147483647`；固定实例（`pin: true`）不能同时指定空闲超时 |
 
-`requirements` 未填写时把原生默认上下文交给现有工厂决定，服务端不补 8192
-或 32768。显式要求无法满足时加载失败，加载结果报告实际配置。空闲卸载不取消
-正在运行的请求，每次使用后重新计时；显式卸载不受 `pin` 限制。服务策略不会
-传给原生工厂。加载请求不接受设备放置、预填充分块、批处理、KV 或后端缓存预算，
+`requirements` 未填写时按运行策略补默认上下文：`model_overrides` 命中模型名时
+用该值（不超过产物声明的容量），产物没有声明容量时用
+`context_policy.fallback_context_size`，其余情况把选择交给现有工厂。显式
+`requirements.context_size` 始终优先，显式要求无法满足时加载失败，加载结果
+报告实际配置。空闲卸载不取消正在运行的请求，每次使用后重新计时；显式卸载不受
+`pin` 限制。加载请求不接受设备放置、预填充分块、批处理、KV 或后端缓存预算，
 也不提供任意后端参数字典。
 
 加载任务只报告 `resolving`、`loading`、`initializing` 三个真实检查点；
@@ -501,6 +510,51 @@ HF 目录含 `config.json`、`*.safetensors` 与索引 `weight_map` 引用的分
 （默认 `200`），违反者返回 `400 invalid_request`。原生服务没有指标历史与日志
 存储，两者恒返回 `{"data":[]}`；实时指标见 `GET /api/runtime/instances` 与
 `GET /api/runtime/status`。
+
+### 3.7 运行策略
+
+`GET/PUT /api/runtime/context-policy`、`/api/runtime/inference-policy` 与
+`/api/runtime/memory-policy` 读写三份持久化策略；读取需要 `inference`，写入
+需要 `admin`。三份文档存在 `schema_meta` 表，键为 `runtime_context_policy`、
+`runtime_inference_policy`、`runtime_memory_policy`，重启后保持。字段与 Python
+协议模型逐一对齐；未知字段、错误类型、超界整数和未声明允许的 `null` 返回
+`422 invalid_policy`，`message` 指出出错字段，被拒绝的请求不改动已保存的策略。
+
+`ContextPolicy`：
+
+| 字段 | 类型 | 约束与默认 |
+|---|---|---|
+| `fallback_context_size` | Integer | `512..2147483647`，默认 `32768` |
+| `max_context_size` | Integer\|null | `512..2147483647`，默认 `null` |
+| `model_overrides` | Object | 模型名到 `512..2147483647` 整数，默认 `{}` |
+| `model_yarn_enabled` | Object | 模型名到 Boolean，默认 `{}` |
+| `model_qsa_kv_offload` | Object | 模型名到 `{enabled:Boolean=false, budget_bytes:Integer=2147483648（`1..2^50`）, ram_budget_bytes:Integer\|null（`0..2^50`）}`，默认 `{}` |
+| `model_kv_quantization` | Object | 模型名到 `{enabled:Boolean=false, bits:`2\|2.5\|3\|3.5\|4\|6\|8`=4, algorithm:"turboquant"}`，默认 `{}` |
+| `model_kv_memory` | Object | 模型名到 `{placement:"auto"\|"auto_ssd"\|"vram"\|"ram"="auto", allocation:"preallocated"\|"dynamic"="preallocated", gpu_budget_bytes:Integer\|null（`1..2^50`）, ram_preallocated:Boolean=true, ram_budget_bytes:Integer\|null（`0..2^50`）}`，默认 `{}` |
+
+`model_kv_memory` 条目里 `ram_preallocated` 为 `false` 时 `placement` 必须是
+`auto_ssd`，否则返回 `422 invalid_policy`，`message` 含出错条目名与
+`kv_ssd_required`。
+
+`InferencePolicy` 只有 `mtp_enabled`（Boolean，默认 `true`）。`MemoryPolicy`
+字段：`total_limit_bytes`、`model_limit_bytes`（不小于 `1`）、
+`prefix_limit_bytes`、`prefix_disk_limit_bytes`、`prefix_ram_limit_bytes`
+（不小于 `0`）都是 `Integer|null`；`prefix_directory` 是 `String|null`，
+1-4096 个字符。
+
+`PUT` 返回保存后的完整文档。`context-policy` 与 `memory-policy` 按顶层字段
+合并：请求里出现的顶层字段整体替换，未出现的字段保留原值；嵌套映射按条目
+替换，不逐模型合并。`inference-policy` 没有其它字段，`PUT` 直接替换整份文档。
+
+原生侧的消费范围：`fallback_context_size` 与 `model_overrides` 参与
+`POST /api/models/load` 的默认上下文（见 3.1）；`mtp_enabled` 在实例创建时
+一次性关掉实例默认采样里的 MTP，请求显式指定 `enable_mtp` 时仍以请求为准；
+`max_context_size`、`model_yarn_enabled`、`model_qsa_kv_offload`、
+`model_kv_quantization`、`model_kv_memory` 与整份 `MemoryPolicy` 目前只持久化
+并回显，不改变原生引擎预算、YaRN、KV 量化或设备放置。Python 的
+`GET /api/v1/runtime/memory-policy` 还会附带内存拓扑与生效预算，原生服务没有
+内存规划，只返回策略字段本身；Python 的 `PUT` 返回 `202` 任务受理，原生服务
+同步保存并返回 `200` 与保存后的文档。
 
 ## 4. 任务与事件
 
