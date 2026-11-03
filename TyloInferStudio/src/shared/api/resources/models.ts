@@ -201,11 +201,4 @@ export const modelsApi = {
     );
   },
 
-  /** 删除服务工作区内的指定产物，调用方应先确认。 */
-  removeWorkspaceArtifact(uri: string): Promise<Record<string, unknown>> {
-    return request('/api/artifacts/remove', {
-      method: 'POST',
-      body: JSON.stringify({ artifact_uri: uri }),
-    });
-  },
 };

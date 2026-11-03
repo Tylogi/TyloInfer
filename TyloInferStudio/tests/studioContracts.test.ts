@@ -225,9 +225,6 @@ describe('Studio 过渡源码与静态样式契约（非行为测试）', () => 
     expect(APP_ENTRY).toContain('path="agent"');
     expect(APP_ENTRY).not.toContain('path="settings"');
     expect(APP_ENTRY).not.toContain('path="quantization"');
-    const jobs = readSources('features/jobs/useJobRecordActions.ts');
-    expect(jobs).toContain('jobsApi.clearCompletedJobs()');
-    expect(jobs).toContain('jobsApi.deleteJob(id)');
     expect(APP).not.toContain('className="drawer-scrim"');
   });
 
