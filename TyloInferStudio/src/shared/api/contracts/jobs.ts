@@ -28,24 +28,6 @@ export interface JobEventResource {
   created_at: string;
 }
 
-export interface JsonSchemaProperty {
-  type?: string | string[];
-  title?: string;
-  description?: string;
-  default?: unknown;
-  enum?: unknown[];
-  minimum?: number;
-  maximum?: number;
-  anyOf?: JsonSchemaProperty[];
-  items?: JsonSchemaProperty;
-}
-
 export interface JobKindResource {
   kind: string;
-  payload_schema: {
-    type?: string;
-    properties?: Record<string, JsonSchemaProperty>;
-    required?: string[];
-    [key: string]: unknown;
-  };
 }

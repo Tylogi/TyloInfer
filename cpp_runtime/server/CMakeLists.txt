@@ -27,9 +27,6 @@ endfunction()
 
 tyloinfer_server_read_bytes("${_schema_file}" TYLOINFER_SERVER_SCHEMA)
 configure_file(storage/schema.h.in generated/schema.h @ONLY)
-set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/api/openapi.json")
-tyloinfer_server_read_bytes("${CMAKE_CURRENT_SOURCE_DIR}/api/openapi.json" TYLOINFER_SERVER_OPENAPI)
-configure_file(api/openapi.h.in generated/openapi.h @ONLY)
 
 add_library(tyloinfer-server-core STATIC server.cpp instance.cpp api/inference.cpp api/anthropic.cpp api/models.cpp
     auth/auth.cpp auth/keys.cpp api/auth.cpp storage/storage.cpp storage/files.cpp models/catalog.cpp models/instances.cpp models/aliases.cpp
@@ -97,9 +94,7 @@ if(BUILD_TESTING)
     set_tests_properties(tyloinfer-server-catalog-formats-test PROPERTIES TIMEOUT 60 LABELS "native-server;stage2")
     add_executable(tyloinfer-server-test ../tests/server_test.cpp)
     target_include_directories(tyloinfer-server-test PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
-    target_compile_definitions(tyloinfer-server-test PRIVATE
-        TYLOINFER_SERVER_OPENAPI_FILE="${CMAKE_CURRENT_SOURCE_DIR}/api/openapi.json"
-        TYLOINFER_SERVER_SCHEMA_FILE="${_schema_file}")
+    target_compile_definitions(tyloinfer-server-test PRIVATE TYLOINFER_SERVER_SCHEMA_FILE="${_schema_file}")
     target_link_libraries(tyloinfer-server-test PRIVATE mfq-http mfq-json SQLite::SQLite3)
     if(WIN32)
         target_link_libraries(tyloinfer-server-test PRIVATE advapi32)

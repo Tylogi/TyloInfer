@@ -1,7 +1,0 @@
-#pragma once
-
-namespace mfq::server {
-inline constexpr char openapi_document[] = {
-@TYLOINFER_SERVER_OPENAPI@'\0'
-};
-}

@@ -91,7 +91,7 @@ describe('test_model_hub_accepts_repository_links_and_downloads_into_the_model_c
       system: { platform: 'test', machine: 'test', backend: 'unknown' },
       data: [],
     });
-    vi.spyOn(jobsApi, 'jobKinds').mockResolvedValue([{ kind: `download.${provider}`, payload_schema: {} }]);
+    vi.spyOn(jobsApi, 'jobKinds').mockResolvedValue([{ kind: `download.${provider}` }]);
     const inspect = vi.spyOn(modelsApi, 'resolveHubModel').mockResolvedValue(info);
     const createJob = vi.spyOn(jobsApi, 'createJob').mockResolvedValue(job);
     render(<MemoryRouter><ModelHubPage /></MemoryRouter>);

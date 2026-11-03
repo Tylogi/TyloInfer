@@ -509,7 +509,7 @@ test('模型下载留在本页，飞入圆圈后打开第三个队列标签', as
   const state = await mockStudioServer(page);
   const jobs: unknown[] = [{ id: 'load', kind: 'model.load', status: 'succeeded', progress: 1,
     payload: { repo_id: 'Not a download' }, cancel_requested: false, created_at: '2026-01-01', updated_at: '2026-01-01' }];
-  await page.route('**/api/v1/jobs/kinds', (route) => route.fulfill({ json: { data: [{ kind: 'download.modelscope', payload_schema: {} }] } }));
+  await page.route('**/api/v1/jobs/kinds', (route) => route.fulfill({ json: { data: [{ kind: 'download.modelscope' }] } }));
   await page.route(/\/api\/v1\/jobs(?:\?.*)?$/, async (route) => {
     if (route.request().method() === 'GET') return route.fulfill({ json: { data: jobs } });
     const { kind, payload } = route.request().postDataJSON();

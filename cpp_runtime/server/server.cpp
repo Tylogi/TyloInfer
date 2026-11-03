@@ -10,7 +10,6 @@
 #include "hub/hub.h"
 #include "api/sessions.h"
 #include "api/failure.h"
-#include "openapi.h"
 #include "protocol.h"
 #include "models/catalog.h"
 #include "models/instances.h"
@@ -301,9 +300,6 @@ int run(const Config& config, const std::atomic<bool>& stop_requested, EngineFac
             std::make_exception_ptr(ApiError(response.status, "http_error", "request failed")));
     });
     http.set_exception_handler(request_error);
-    http.Get("/openapi.json", [](const httplib::Request&, httplib::Response& response) {
-        response.set_content(openapi_document, "application/json; charset=utf-8");
-    });
     http.Get("/health", [](const httplib::Request&, httplib::Response& response) {
         set_json(response, {{"status", "ok"}, {"service", "tyloinfer-server"}, {"protocol_version", "1.0"}});
     });

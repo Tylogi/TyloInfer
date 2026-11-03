@@ -31,7 +31,7 @@ beforeEach(() => {
   useJobStore.getState().setJobs([]);
   vi.mocked(modelsApi.officialHubModels).mockResolvedValue(catalog);
   vi.mocked(modelsApi.downloadDirectory).mockResolvedValue({ directory: null, actual_directory: '/workspace/models', default_directory: '/workspace/models', disk_total_bytes: 2048 * 2 ** 30, disk_free_bytes: 200 * 2 ** 30 });
-  vi.mocked(jobsApi.jobKinds).mockResolvedValue([{ kind: 'download.modelscope', payload_schema: {} }]);
+  vi.mocked(jobsApi.jobKinds).mockResolvedValue([{ kind: 'download.modelscope' }]);
   Element.prototype.scrollIntoView = vi.fn();
 });
 afterEach(() => { vi.useRealTimers(); vi.clearAllMocks(); useJobStore.getState().setJobs([]); });

@@ -23,7 +23,7 @@ it('resolves a native repository and submits a download without catalog, search 
   const onJobCreated = vi.fn();
   const onError = vi.fn();
   render(<ModelBrowser capabilities={serverCapabilities({ source: 'native-instances' })}
-    tab="community" onTabChange={vi.fn()} jobKinds={[{ kind: 'download.huggingface', payload_schema: {} }]}
+    tab="community" onTabChange={vi.fn()} jobKinds={[{ kind: 'download.huggingface' }]}
     onError={onError} onJobCreated={onJobCreated} tr={(_, en) => en} />);
   fireEvent.change(screen.getByRole('textbox', { name: 'Search models' }), { target: { value: 'https://huggingface.co/owner/native/tree/main' } });
   fireEvent.click(screen.getByRole('button', { name: 'Search' }));
@@ -57,7 +57,7 @@ it.each([3, 60])('downloads all shared Engram dependencies into one repository d
   vi.mocked(jobsApi.createJob).mockResolvedValue({ id: 'engram-download', kind: 'download.modelscope',
     status: 'queued', progress: 0, cancel_requested: false, payload: {}, created_at: '', updated_at: '' });
   render(<ModelBrowser tab="official" onTabChange={vi.fn()}
-    jobKinds={[{ kind: 'download.modelscope', payload_schema: {} }]}
+    jobKinds={[{ kind: 'download.modelscope' }]}
     onError={vi.fn()} onJobCreated={vi.fn()} tr={(_, en) => en} />);
   const button = await screen.findByRole('button', { name: 'Download' });
   await waitFor(() => expect(button).toBeEnabled());

@@ -5,7 +5,6 @@
 #include "jobs/jobs.h"
 #include "models/catalog.h"
 #include "models/errors.h"
-#include "openapi.h"
 #include <map>
 #include <regex>
 #include <tuple>
@@ -152,9 +151,7 @@ void register_hub(httplib::Server& http, Hub& hub, ModelCatalog& catalog, Jobs& 
         set_json(response, repository(hub.info({selected, name, {}}, {request.is_connection_closed, {}})));
     });
     http.Get("/api/v1/jobs/kinds", [](const httplib::Request&, httplib::Response& response) {
-        static const auto schema = Json::parse(openapi_document).at("components").at("schemas").at("Download");
-        set_json(response, {{"data", {{{"kind", "download.huggingface"}, {"payload_schema", schema}},
-            {{"kind", "download.modelscope"}, {"payload_schema", schema}}}}});
+        set_json(response, {{"data", Json::array({{{"kind", "download.huggingface"}}, {{"kind", "download.modelscope"}}})}});
     });
     http.Post("/api/v1/jobs", [&](const httplib::Request& request, httplib::Response& response) {
         const auto body = parse_json(request); fields(body, {"kind", "payload"});

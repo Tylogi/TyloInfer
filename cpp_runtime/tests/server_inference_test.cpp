@@ -1149,8 +1149,6 @@ Json message_events(const std::string& stream) {
 
 void compat_checks(const fs::path& executable) {
     Server server(executable, true);
-    const auto contract = server.get("/openapi.json");
-    CHECK(contract["paths"].contains("/v1/messages") && contract["paths"].contains("/v1/models/{model_id}"));
     fixture_model(server.root / "alpha"); fixture_model(server.root / "beta");
     write_file(server.root / "alpha.runtime.json", R"({"chat":{"top_k":7,"temperature":0.4,"enable_thinking":false}})");
     const auto registered = server.post("/api/v1/models/directories/register", {{"path", path_utf8(server.root)}});
@@ -1557,7 +1555,7 @@ void reply_load_http(const fs::path& executable) {
 
 void names_http_checks(const fs::path& executable) {
     Server server(executable, true);
-    CHECK(server.get("/openapi.json")["paths"].contains("/api/v1/runtime/model-aliases"));
+    CHECK(server.get("/api/v1/runtime/model-aliases")["aliases"].is_object());
     fixture_model(server.root / "alpha");
     const auto artifact = register_checkpoint(server, server.root / "alpha", "beta");
     const auto loaded = server.complete(server.post("/api/v1/models/load", {{"artifact_id", artifact}}));
@@ -1612,9 +1610,6 @@ void names_http_checks(const fs::path& executable) {
 
 void session_http_checks(const fs::path& executable) {
     Server server(executable, true);
-    const auto contract = server.get("/openapi.json");
-    CHECK(contract["paths"].contains("/api/v1/sessions/{session_id}/responses"));
-    CHECK(contract["components"]["schemas"].contains("SessionResponse"));
     fixture_model(server.root / "model");
     const auto artifact = register_checkpoint(server, server.root / "model", "chat");
     CHECK(server.complete(server.post("/api/v1/models/load", {{"artifact_id", artifact}}))["status"] == "succeeded");
