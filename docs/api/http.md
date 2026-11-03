@@ -177,6 +177,9 @@ HTTP 层共 4 个工作线程。流式请求（`/v1/chat/completions`、`/v1/mes
 | `GET` | `/api/models/{model_id}/cache-profile` | `?include_recurrent=true\|false` | `200 ModelCacheProfile\|null` | `inference` |
 | `GET` | `/api/models/{model_id}/deletion` | — | `200 DeletionPlan` | `inference` |
 | `POST` | `/api/models/{model_id}/delete` | `{"token":string}` | `200 {"files":int,"total_bytes":int}` | `models` |
+| `GET` | `/api/artifacts/lineage` | `?artifact_uri&limit` | `200 {"data":[Lineage]}` | `jobs` |
+| `POST` | `/api/artifacts/remove` | `RemoveRequest` | `501 workspace_management_unavailable` | `jobs` |
+| `POST` | `/api/models/directories/open` | `{"directory_id":string}` | `200 {"opened":true}` | `models` |
 | `POST` | `/api/models/load` | `LoadRequest` | `202 Accepted` | `models` |
 | `POST` | `/api/models/unload` | `UnloadRequest` | `202 Accepted` | `models` |
 | `GET` | `/api/runtime/instances` | — | `200 {"data":[Instance]}` | `inference` |
