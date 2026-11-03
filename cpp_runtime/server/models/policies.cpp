@@ -7,6 +7,9 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <initializer_list>
 #include <limits>
 #include <string>
@@ -14,6 +17,7 @@
 namespace mfq::server {
 namespace {
 using json = nlohmann::json;
+namespace fs = std::filesystem;
 
 constexpr const char* context_key = "runtime_context_policy";
 constexpr const char* inference_key = "runtime_inference_policy";
@@ -162,6 +166,29 @@ json validate_inference(const json& body) {
     return policy;
 }
 
+// The prefix cache directory must resolve to an absolute writable location before the policy
+// is saved; the Python memory-configure job guarantees the same before it takes effect.
+void prepare_prefix_directory(json& policy) {
+    auto& field = policy["prefix_directory"];
+    if (field.is_null()) return;
+    auto text = field.get<std::string>();
+    if (text == "~" || text.rfind("~/", 0) == 0)
+        if (const char* home = std::getenv("HOME")) text = std::string(home) + text.substr(1);
+    const fs::path directory{text};
+    if (!directory.is_absolute())
+        throw ApiError(400, "invalid_cache_directory", "prefix cache directory must be an absolute path");
+    try {
+        fs::create_directories(directory);
+        const auto probe = directory / ".tyloinfer-write-probe";
+        { std::ofstream file(probe, std::ios::binary);
+          if (!file) throw std::ios_base::failure("cannot write into the directory"); }
+        fs::remove(probe);
+        field = fs::canonical(directory).string();
+    } catch (const std::exception& failure) {
+        throw ApiError(400, "cache_directory_unwritable", failure.what());
+    }
+}
+
 json validate_memory(const json& body) {
     reject_unknown(body, "runtime_memory_policy", {"total_limit_bytes", "model_limit_bytes", "prefix_limit_bytes",
         "prefix_disk_limit_bytes", "prefix_ram_limit_bytes", "prefix_directory"});
@@ -240,10 +267,17 @@ json RuntimePolicies::memory_policy() const {
     return saved.is_null() ? validate_memory(json::object()) : saved;
 }
 
+json RuntimePolicies::check_memory(const json& body) const {
+    if (!body.is_object()) throw ApiError(400, "invalid_request", "request must be a JSON object");
+    auto access = storage_.access();
+    return validate_memory(merge(read_policy(access.database, memory_key), body));
+}
+
 json RuntimePolicies::put_memory_policy(const json& body) {
     if (!body.is_object()) throw ApiError(400, "invalid_request", "request must be a JSON object");
     auto access = storage_.access();
-    const auto policy = validate_memory(merge(read_policy(access.database, memory_key), body));
+    auto policy = validate_memory(merge(read_policy(access.database, memory_key), body));
+    prepare_prefix_directory(policy);
     write_policy(access.database, memory_key, policy);
     return policy;
 }

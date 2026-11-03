@@ -332,7 +332,7 @@ int run(const Config& config, const std::atomic<bool>& stop_requested, EngineFac
     register_models(http, models, instances, jobs, policies);
     register_artifacts(http, models, instances, backend);
     register_runtime(http, instances);
-    register_runtime_config(http, policies);
+    register_runtime_config(http, policies, jobs);
     register_jobs(http, jobs, streams);
     register_hub(http, hub, models, jobs, backend);
     register_inference(http, instances, streams);

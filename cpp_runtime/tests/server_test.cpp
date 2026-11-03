@@ -790,18 +790,38 @@ void runtime_policies() {
     for (const auto& body : std::vector<json>{{{"mtp_enabled", "yes"}}, {{"mtp_enabled", 1}}, {{"mtp", true}}})
         CHECK(server.send("PUT", "/api/runtime/inference-policy", body, admin).status == 422);
 
+    // The memory policy applies as a job, as in Python: field errors reject the PUT synchronously,
+    // directory problems fail the accepted job.
+    const auto wait_job = [&](const json& accepted) {
+        for (int attempt = 0; attempt < 500; ++attempt) {
+            const auto job = server.get("/api/jobs/" + accepted.at("operation_id").get<std::string>(), admin).document();
+            if (job.at("status") != "queued" && job.at("status") != "running") return job;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        throw std::runtime_error("memory policy job did not finish");
+    };
     const json memory{{"total_limit_bytes", 17179869184LL}, {"model_limit_bytes", 8589934592LL},
         {"prefix_limit_bytes", 0}, {"prefix_disk_limit_bytes", 1024}, {"prefix_ram_limit_bytes", nullptr},
         {"prefix_directory", "/tmp/tyloinfer-prefix"}};
-    CHECK(server.send("PUT", "/api/runtime/memory-policy", memory, admin).document() == memory);
-    const json memory_partial{{"total_limit_bytes", 17179869184LL}, {"model_limit_bytes", 8589934592LL},
-        {"prefix_limit_bytes", 0}, {"prefix_disk_limit_bytes", 1024}, {"prefix_ram_limit_bytes", nullptr},
-        {"prefix_directory", "/tmp/tyloinfer-other"}};
-    CHECK(server.send("PUT", "/api/runtime/memory-policy", {{"prefix_directory", "/tmp/tyloinfer-other"}}, admin).document() ==
-        memory_partial);
+    const auto accepted = server.send("PUT", "/api/runtime/memory-policy", memory, admin);
+    CHECK(accepted.status == 202 && accepted.document().at("status") == "accepted");
+    CHECK(wait_job(accepted.document()).at("status") == "succeeded");
+    json memory_saved = memory;
+    memory_saved["prefix_directory"] = fs::canonical("/tmp/tyloinfer-prefix").string();
+    CHECK(server.get("/api/runtime/memory-policy", admin).document() == memory_saved);
+    CHECK(wait_job(server.send("PUT", "/api/runtime/memory-policy",
+        {{"prefix_directory", "/tmp/tyloinfer-other"}}, admin).document()).at("status") == "succeeded");
+    json memory_partial = memory_saved;
+    memory_partial["prefix_directory"] = fs::canonical("/tmp/tyloinfer-other").string();
+    CHECK(server.get("/api/runtime/memory-policy", admin).document() == memory_partial);
     for (const auto& body : std::vector<json>{{{"total_limit_bytes", 0}}, {{"prefix_limit_bytes", -1}},
             {{"prefix_directory", ""}}, {{"prefix_directory", 5}}})
         CHECK(server.send("PUT", "/api/runtime/memory-policy", body, admin).status == 422);
+    // A relative prefix directory passes the field rules and fails inside the job.
+    const auto invalid = server.send("PUT", "/api/runtime/memory-policy", {{"prefix_directory", "relative/cache"}}, admin);
+    CHECK(invalid.status == 202);
+    const auto failed = wait_job(invalid.document());
+    CHECK(failed.at("status") == "failed" && failed.at("error").at("code") == "invalid_cache_directory");
 
     const auto issued = server.send("POST", "/api/auth/keys", {{"name", "models-only"}, {"scopes", {"models"}}}, admin);
     CHECK(issued.status == 201);
