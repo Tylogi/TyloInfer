@@ -61,13 +61,22 @@ std::int64_t integer(const json& request, const char* field, std::int64_t fallba
 }
 
 // The context policy only supplies a default when the request omits context_size. A declared artifact
-// capacity still wins over fallback_context_size, and 0 leaves the choice to the native factory.
+// capacity still wins over fallback_context_size, max_context_size pins the size only where its cap
+// bites, and 0 leaves the choice to the native factory.
 std::int64_t policy_context_size(const ModelCatalog::Artifact& artifact, const json& policy) {
     const auto& overrides = policy.at("model_overrides");
     const auto override = overrides.find(artifact.name);
     const auto capacity = artifact.context_capacity.value_or(2147483647);
     if (override != overrides.end()) return std::min(override.value().get<std::int64_t>(), capacity);
-    return artifact.context_capacity ? 0 : policy.at("fallback_context_size").get<std::int64_t>();
+    if (artifact.context_capacity) {
+        const auto& cap = policy.at("max_context_size");
+        if (!cap.is_null()) {
+            const std::int64_t limited = std::min(cap.get<std::int64_t>(), *artifact.context_capacity);
+            if (limited < *artifact.context_capacity) return limited;
+        }
+        return 0;
+    }
+    return policy.at("fallback_context_size").get<std::int64_t>();
 }
 } // namespace
 

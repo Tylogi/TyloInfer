@@ -15,6 +15,8 @@ public:
     nlohmann::json inference_policy() const;
     nlohmann::json put_inference_policy(const nlohmann::json& body);
     nlohmann::json memory_policy() const;
+    // Field-rule check without saving; the PUT rejects bad bodies before it accepts the job.
+    nlohmann::json check_memory(const nlohmann::json& body) const;
     nlohmann::json put_memory_policy(const nlohmann::json& body);
 
 private:

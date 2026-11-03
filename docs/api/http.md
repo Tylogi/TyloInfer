@@ -194,7 +194,7 @@ HTTP 层共 4 个工作线程。流式请求（`/v1/chat/completions`、`/v1/mes
 | `GET` | `/api/runtime/inference-policy` | — | `200 InferencePolicy` | `inference` |
 | `PUT` | `/api/runtime/inference-policy` | `InferencePolicy` | `200 InferencePolicy` | `admin` |
 | `GET` | `/api/runtime/memory-policy` | — | `200 MemoryPolicy` | `inference` |
-| `PUT` | `/api/runtime/memory-policy` | `MemoryPolicy` | `200 MemoryPolicy` | `admin` |
+| `PUT` | `/api/runtime/memory-policy` | `MemoryPolicy` | `202 OperationAccepted` | `admin` |
 
 ### 2.3 任务
 
@@ -344,7 +344,8 @@ cache profile、attention profile、license 和 `published_at` 一律为 `null`�
 | `policy.idle_ttl_seconds` | Integer | `1..2147483647`；固定实例（`pin: true`）不能同时指定空闲超时 |
 
 `requirements` 未填写时按运行策略补默认上下文：`model_overrides` 命中模型名时
-用该值（不超过产物声明的容量），产物没有声明容量时用
+用该值（不超过产物声明的容量），产物声明了容量且 `max_context_size` 比它小时
+用被截断的值，产物没有声明容量时用
 `context_policy.fallback_context_size`，其余情况把选择交给现有工厂。显式
 `requirements.context_size` 始终优先，显式要求无法满足时加载失败，加载结果
 报告实际配置。空闲卸载不取消正在运行的请求，每次使用后重新计时；显式卸载不受
@@ -542,19 +543,24 @@ HF 目录含 `config.json`、`*.safetensors` 与索引 `weight_map` 引用的分
 （不小于 `0`）都是 `Integer|null`；`prefix_directory` 是 `String|null`，
 1-4096 个字符。
 
-`PUT` 返回保存后的完整文档。`context-policy` 与 `memory-policy` 按顶层字段
+`PUT context-policy` 与 `PUT inference-policy` 返回保存后的完整文档，`PUT
+memory-policy` 返回 `202 {"operation_id", "status":"accepted"}`，字段错误
+在受理前以 `422 invalid_policy` 拒绝，`prefix_directory` 的问题（展开 `~` 后
+非绝对路径、不可创建或不可写）使任务失败，失败码为
+`invalid_cache_directory` 或 `cache_directory_unwritable`；保存的是解析后的
+绝对路径。`context-policy` 与 `memory-policy` 按顶层字段
 合并：请求里出现的顶层字段整体替换，未出现的字段保留原值；嵌套映射按条目
 替换，不逐模型合并。`inference-policy` 没有其它字段，`PUT` 直接替换整份文档。
 
-原生侧的消费范围：`fallback_context_size` 与 `model_overrides` 参与
+原生侧的消费范围：`fallback_context_size`、`model_overrides` 与
+`max_context_size` 参与
 `POST /api/models/load` 的默认上下文（见 3.1）；`mtp_enabled` 在实例创建时
 一次性关掉实例默认采样里的 MTP，请求显式指定 `enable_mtp` 时仍以请求为准；
 `max_context_size`、`model_yarn_enabled`、`model_qsa_kv_offload`、
-`model_kv_quantization`、`model_kv_memory` 与整份 `MemoryPolicy` 目前只持久化
-并回显，不改变原生引擎预算、YaRN、KV 量化或设备放置。Python 的
+`model_kv_quantization`、`model_kv_memory` 与 `MemoryPolicy` 的预算字段目前只
+持久化并回显，不改变原生引擎预算、YaRN、KV 量化或设备放置。Python 的
 `GET /api/v1/runtime/memory-policy` 还会附带内存拓扑与生效预算，原生服务没有
-内存规划，只返回策略字段本身；Python 的 `PUT` 返回 `202` 任务受理，原生服务
-同步保存并返回 `200` 与保存后的文档。
+内存规划，只返回策略字段本身。
 
 ## 4. 任务与事件
 
