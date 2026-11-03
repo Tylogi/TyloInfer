@@ -206,11 +206,6 @@ export const runtimeApi = {
     return request(`/api/runtime/status${suffix}`);
   },
 
-  /** 列出当前服务提供的模型名称。 */
-  async runtimeModels(): Promise<RuntimeModel[]> {
-    return (await request<{ data: RuntimeModel[] }>('/api/runtime/models')).data;
-  },
-
   /** Read and adapt native instances while preserving unreported telemetry as unknown. */
   async runtimeInstances(): Promise<RuntimeInstance[]> {
     return (await request<{ data: NativeRuntimeInstance[] }>('/api/runtime/instances')).data.map(adaptNativeInstance);

@@ -153,7 +153,6 @@ export async function mockStudioServer(page: Page, options: MockOptions = {}) {
         mtp_available: false,
         duplex_available: false,
       });
-    if (path === '/api/runtime/models') return json({ data: [{ id: model }] });
     if (path === '/api/runtime/listener') return json({ host: '127.0.0.1', port: 8090, anthropic_port: 8091, configurable: true });
     if (path === '/api/runtime/instances')
       return json({
@@ -310,7 +309,6 @@ export async function mockStudioServer(page: Page, options: MockOptions = {}) {
         '/api/jobs/kinds',
         '/api/presets',
         '/api/runtime/profiles',
-        '/api/artifacts/lineage',
         '/api/datasets',
         '/api/datasets/catalog',
         '/api/evaluations',

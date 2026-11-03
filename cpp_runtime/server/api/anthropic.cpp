@@ -1,4 +1,4 @@
-#include "anthropic.h"
+#include "handlers.h"
 #include "failure.h"
 #include "http.h"
 #include "instance.h"
@@ -280,11 +280,13 @@ bool send(httplib::DataSink& sink, const Json& event) {
 }
 }
 
-void register_anthropic(httplib::Server& http, ModelInstances& models, std::shared_ptr<std::atomic<std::size_t>> active) {
-    http.Post("/v1/messages/count_tokens", [](const httplib::Request&, httplib::Response&) {
-        throw ProtocolError(501, "unsupported_parameter", "native runtime does not expose exact prompt token counting");
-    });
-    http.Post("/v1/messages", [&, active](const httplib::Request& request, httplib::Response& response) {
+void anthropic_count_tokens(const Services&, const httplib::Request&, httplib::Response&) {
+    throw ProtocolError(501, "unsupported_parameter", "native runtime does not expose exact prompt token counting");
+}
+
+void anthropic_messages(const Services& services, const httplib::Request& request, httplib::Response& response) {
+    auto& models = services.instances;
+    const auto active = services.streams;
         const auto version = request.get_header_value("Anthropic-Version");
         if (!version.empty() && version != "2023-06-01") throw ProtocolError(400, "unsupported_parameter", "supported Anthropic-Version is 2023-06-01");
         const auto body = parse_json(request);
@@ -330,6 +332,5 @@ void register_anthropic(httplib::Server& http, ModelInstances& models, std::shar
                 }
                 sink.done(); return false;
             }, [generation](bool) {});
-    });
 }
 }

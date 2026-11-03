@@ -1,29 +1,19 @@
 #include "server.h"
 #include "instance.h"
-#include "api/auth.h"
+#include "routes.h"
 #include "api/errors.h"
 #include "api/http.h"
-#include "api/inference.h"
-#include "api/models.h"
-#include "api/artifacts.h"
-#include "api/runtime.h"
-#include "api/runtime_config.h"
-#include "api/runtime_cache.h"
-#include "api/runtime_control.h"
-#include "api/jobs.h"
-#include "api/hub.h"
-#include "hub/hub.h"
-#include "api/media.h"
-#include "api/sessions.h"
 #include "api/failure.h"
-#include "protocol.h"
+#include "hub/hub.h"
+#include "media/media.h"
+#include "sessions/sessions.h"
+#include "jobs/jobs.h"
 #include "models/catalog.h"
 #include "models/instances.h"
 #include "models/policies.h"
 #include "models/profiles.h"
 #include "cache/prefix.h"
 #include "models/components.h"
-#include "models/errors.h"
 
 #include "httplib.h"
 
@@ -51,9 +41,6 @@ namespace {
 
 using json = nlohmann::json;
 namespace fs = std::filesystem;
-
-// Every API route except a media upload stays under this request body cap.
-constexpr std::size_t json_payload_bytes = 1024 * 1024;
 
 std::string lowercase(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
@@ -235,6 +222,8 @@ int run(const Config& config, const std::atomic<bool>& stop_requested, EngineFac
     Sessions sessions(storage, instances, media);
     Jobs jobs(storage, [](std::exception_ptr exception) { return describe_failure(exception).detail; });
     auto streams = std::make_shared<std::atomic<std::size_t>>(0);
+    Services services{instance, auth, storage, models, instances, jobs, sessions, media, hub,
+        policies, profiles, prefix_cache, voice, config.host, config.port, backend, streams};
     httplib::Server http;
     http.set_socket_options([](socket_t socket) {
         // A public listener must fail on conflicts, not share traffic via SO_REUSEPORT.
@@ -287,20 +276,19 @@ int run(const Config& config, const std::atomic<bool>& stop_requested, EngineFac
             return httplib::Server::HandlerResponse::Handled;
         }
         if (request.path.rfind("/api/", 0) == 0 || request.path.rfind("/v1", 0) == 0) {
-            if (request.method != "POST" || request.path != "/api/media") {
-                // shortcut: this guard reads Content-Length, so a chunked body only sees the global cap;
-                // upgrade to a streaming limit if a non-upload route ever needs a hard cap mid-transfer.
-                if (request.get_header_value_u64("Content-Length") > json_payload_bytes) {
-                    request_error(request, response, std::make_exception_ptr(ApiError(413, "request_too_large",
-                        "request body exceeds " + std::to_string(json_payload_bytes) + " bytes")));
-                    return httplib::Server::HandlerResponse::Handled;
-                }
+            const Route* route = find_route(request.method, request.path);
+            // shortcut: this guard reads Content-Length, so a chunked body only sees the global cap;
+            // upgrade to a streaming limit if a non-upload route ever needs a hard cap mid-transfer.
+            if (request.get_header_value_u64("Content-Length") > (route ? route->body_limit : json_payload_bytes)) {
+                request_error(request, response, std::make_exception_ptr(ApiError(413, "request_too_large",
+                    "request body exceeds " + std::to_string(route ? route->body_limit : json_payload_bytes) + " bytes")));
+                return httplib::Server::HandlerResponse::Handled;
             }
             const auto authorization = request.get_header_value("Authorization");
             auto token = authorization.rfind("Bearer ", 0) == 0 ? authorization.substr(7) : "";
             if (token.empty() && websocket) token = request.get_param_value("access_token");
             if (token.empty() && anthropic_request(request)) token = request.get_header_value("X-Api-Key");
-            try { auth.require(token, required_scope(request.method, request.path)); }
+            try { auth.require(token, route ? route->scope : Scope::inference); }
             catch (...) {
                 request_error(request, response, std::current_exception());
                 return httplib::Server::HandlerResponse::Handled;
@@ -332,24 +320,7 @@ int run(const Config& config, const std::atomic<bool>& stop_requested, EngineFac
             std::make_exception_ptr(ApiError(response.status, "http_error", "request failed")));
     });
     http.set_exception_handler(request_error);
-    http.Get("/health", [](const httplib::Request&, httplib::Response& response) {
-        set_json(response, {{"status", "ok"}, {"service", "tyloinfer-server"}, {"protocol_version", "1.0"}});
-    });
-    http.Get("/health/identity", [&](const httplib::Request&, httplib::Response& response) {
-        set_json(response, instance.identity());
-    });
-    register_auth(http, auth);
-    register_models(http, models, instances, jobs, policies);
-    register_artifacts(http, models, instances, storage, backend);
-    register_runtime(http, instances);
-    register_runtime_config(http, policies, profiles, instances, jobs, config.host, listener_port);
-    register_runtime_cache(http, instances, prefix_cache);
-    register_runtime_control(http, instances, models, policies, jobs, voice);
-    register_jobs(http, jobs, streams);
-    register_hub(http, hub, models, jobs, backend);
-    register_inference(http, instances, streams);
-    register_sessions(http, sessions, streams);
-    register_media(http, media);
+    register_routes(http, services);
     if (!web_root.empty()) http.Get("/.*", [&](const httplib::Request& request, httplib::Response& response) {
         static_response(web_root, request, response);
     });
@@ -357,6 +328,7 @@ int run(const Config& config, const std::atomic<bool>& stop_requested, EngineFac
         (http.bind_to_port(config.host, config.port) ? config.port : -1);
     if (bound < 0) throw std::runtime_error("cannot bind listener on " + config.host + ":" + std::to_string(config.port));
     listener_port = bound;
+    services.port = bound;
     http.set_start_handler([&] {
         std::cout << json{{"event", "listening"}, {"host", config.host}, {"port", listener_port},
             {"instance_id", instance.identity()["instance_id"]}}.dump() << std::endl;

@@ -28,7 +28,7 @@ endfunction()
 tyloinfer_server_read_bytes("${_schema_file}" TYLOINFER_SERVER_SCHEMA)
 configure_file(storage/schema.h.in generated/schema.h @ONLY)
 
-add_library(tyloinfer-server-core STATIC server.cpp instance.cpp api/inference.cpp api/anthropic.cpp api/models.cpp
+add_library(tyloinfer-server-core STATIC server.cpp instance.cpp routes.cpp api/inference.cpp api/anthropic.cpp api/models.cpp
     api/artifacts.cpp
     auth/auth.cpp auth/keys.cpp api/auth.cpp storage/storage.cpp storage/files.cpp models/catalog.cpp models/instances.cpp models/aliases.cpp
     models/analysis.cpp models/deletion.cpp models/policies.cpp models/profiles.cpp models/context.cpp models/components.cpp cache/prefix.cpp

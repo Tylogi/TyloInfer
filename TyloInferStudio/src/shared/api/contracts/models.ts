@@ -349,16 +349,3 @@ export interface OfficialModelList {
   data: OfficialModelInfo[];
   refreshing?: boolean;
 }
-
-export interface ArtifactLineage {
-  id: string;
-  artifact_uri: string;
-  artifact_name: string;
-  producer_job_id: string;
-  producer_kind: string;
-  source_uris: string[];
-  parameters: Record<string, unknown>;
-  metadata: Record<string, unknown>;
-  validation_job_ids: string[];
-  created_at: string;
-}
