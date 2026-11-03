@@ -165,15 +165,6 @@ void model_directory(const Services& services, const httplib::Request& request, 
     set_json(response, directory_json(services.catalog.model_directory(request.matches[1])));
 }
 
-void model_capabilities(const Services& services, const httplib::Request& request, httplib::Response& response) {
-    const auto artifact = services.catalog.resolve(request.matches[1]);
-    if (artifact.id != request.matches[1]) throw ApiError(400, "invalid_request", "capability lookup requires an artifact ID");
-    const auto support = services.instances.support(artifact);
-    set_json(response, {{"artifact_id", artifact.id}, {"supported", support.supported},
-        {"reason", support.reason.empty() ? json(nullptr) : json(support.reason)},
-        {"declared_context_capacity", artifact.context_capacity ? json(*artifact.context_capacity) : json(nullptr)},
-        {"load", {{"cancellation", "after_return"}, {"progress", "phase"}}}});
-}
 
 void models_load(const Services& services, const httplib::Request& request, httplib::Response& response) {
     auto& catalog = services.catalog;

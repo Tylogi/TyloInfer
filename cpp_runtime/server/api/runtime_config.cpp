@@ -6,7 +6,6 @@
 #include "models/instances.h"
 #include "models/policies.h"
 #include "models/profiles.h"
-#include "protocol.h"
 
 #include <algorithm>
 #include <chrono>
@@ -105,27 +104,6 @@ void profile_load(const Services& services, const httplib::Request& request, htt
     set_json(response, {{"operation_id", operation}, {"status", "accepted"}}, 202);
 }
 
-void runtime_capabilities(const Services& services, const httplib::Request& request, httplib::Response& response) {
-    const auto items = services.instances.list();
-    auto chosen = items.end();
-    if (const auto id = query_uuid(request, "instance_id")) {
-        chosen = std::find_if(items.begin(), items.end(), [&](const auto& item) { return item.id == *id; });
-        if (chosen == items.end())
-            throw ApiError(404, "runtime_instance_not_found", "runtime instance was not found: " + *id);
-    } else {
-        // The native server has no shared runtime worker to ask for capabilities of its own, so an
-        // idle server reports the same model_not_loaded the Python runtime pool raises.
-        chosen = std::find_if(items.begin(), items.end(),
-            [](const auto& item) { return item.state == InstanceInfo::State::loaded; });
-        if (chosen == items.end()) throw ApiError(503, "model_not_loaded", "no runtime is available");
-    }
-    const auto& engine = chosen->capabilities;
-    set_json(response, {{"model", chosen->model}, {"model_type", engine.model_type},
-        {"model_capabilities", mfq::protocol::model_capability_profile_json(engine.capabilities)},
-        {"vision_available", engine.capabilities.image_input || engine.capabilities.video_input},
-        {"mtp_available", engine.capabilities.mtp}, {"duplex_available", engine.capabilities.full_duplex}});
-}
-
 void runtime_instance_patch(const Services& services, const httplib::Request& request, httplib::Response& response) {
     const auto body = parse_json(request);
     fields(body, {"pinned", "idle_ttl_seconds"});
@@ -151,17 +129,6 @@ void runtime_instance_patch(const Services& services, const httplib::Request& re
 // to reconfigure at runtime; the Python managed listener does not exist here.
 void listener_get(const Services& services, const httplib::Request&, httplib::Response& response) {
     set_json(response, {{"host", services.host}, {"port", services.port}, {"anthropic_port", nullptr}, {"configurable", false}});
-}
-
-void listener_put(const Services&, const httplib::Request& request, httplib::Response&) {
-    const auto body = parse_json(request);
-    fields(body, {"port", "protocol"});
-    if (!body.contains("port") || !body["port"].is_number_integer() || body["port"] < 1 || body["port"] > 65535)
-        throw ApiError(400, "invalid_request", "port must be an integer between 1 and 65535");
-    const auto protocol = body.value("protocol", std::string("openai"));
-    if (protocol != "openai" && protocol != "anthropic")
-        throw ApiError(400, "invalid_request", "protocol must be openai or anthropic");
-    throw ApiError(409, "listener_not_managed", "server listener is managed externally");
 }
 
 } // namespace mfq::server

@@ -29,7 +29,6 @@ beforeEach(() => {
 
 it('saves the service switch remotely without reloading a model', async () => {
   const save = vi.spyOn(runtimeApi, 'configureInferencePolicy').mockResolvedValue({ mtp_enabled: false });
-  const reload = vi.spyOn(runtimeApi, 'reloadRuntime');
   context.refreshRuntime.mockImplementation(async () => {
     context.runtime = { mtp_service_enabled: false };
     return true;
@@ -41,7 +40,6 @@ it('saves the service switch remotely without reloading a model', async () => {
   await waitFor(() => expect(save).toHaveBeenCalledExactlyOnceWith(false));
   await waitFor(() => expect(control).toHaveAttribute('aria-checked', 'false'));
   expect(context.refreshRuntime).toHaveBeenCalledOnce();
-  expect(reload).not.toHaveBeenCalled();
   expect(notify.success).toHaveBeenCalledOnce();
 });
 

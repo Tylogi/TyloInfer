@@ -188,22 +188,10 @@ export const runtimeApi = {
   runtimeListener(): Promise<RuntimeListener> {
     return request('/api/runtime/listener');
   },
-
   configureRuntimeListener(port: number, protocol: 'openai' | 'anthropic' = 'openai'): Promise<RuntimeListener> {
     return request('/api/runtime/listener', {
       method: 'PUT', body: JSON.stringify(protocol === 'openai' ? { port } : { port, protocol }),
     });
-  },
-  /** 读取指定实例或默认实例支持的推理能力。 */
-  runtimeCapabilities(instanceId?: string | null): Promise<RuntimeCapabilities> {
-    const suffix = instanceId ? `?instance_id=${encodeURIComponent(instanceId)}` : '';
-    return request(`/api/runtime/capabilities${suffix}`);
-  },
-
-  /** 读取运行状态、缓存和性能指标。 */
-  runtimeStatus(instanceId?: string | null): Promise<RuntimeStatus> {
-    const suffix = instanceId ? `?instance_id=${encodeURIComponent(instanceId)}` : '';
-    return request(`/api/runtime/status${suffix}`);
   },
 
   /** Read and adapt native instances while preserving unreported telemetry as unknown. */
@@ -246,14 +234,6 @@ export const runtimeApi = {
   /** 激活已经安装的语音输出组件。 */
   activateVoiceOutputComponent(): Promise<{ active: boolean; reason?: string; error?: string }> {
     return request('/api/components/voice-output/activate', { method: 'POST' });
-  },
-
-  /** 使用新的上下文容量重载运行实例。 */
-  reloadRuntime(contextSize: number, instanceId?: string): Promise<RuntimeStatus> {
-    return request('/api/runtime/reload', {
-      method: 'POST',
-      body: JSON.stringify({ context_size: contextSize, instance_id: instanceId }),
-    });
   },
 
   contextPolicy(): Promise<RuntimeContextPolicy> {

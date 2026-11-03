@@ -132,18 +132,7 @@ export async function mockStudioServer(page: Page, options: MockOptions = {}) {
     if (path === '/api/evaluations/tools')
       return json({ workspace_root: null, api_base: 'http://127.0.0.1:8090/v1',
         quality_available: false, benchmark_available: false, accuracy_available: false, task_benchmarks: {} });
-    if (path === '/api/runtime/status')
-      return json({
-        runtime_state: 'ready',
-        model,
-        model_type: 'Test',
-        model_capabilities: modelCapabilities,
-        max_context: 8192,
-        total_requests: state.submissions,
-        uptime_seconds: 60,
-        active_requests: 0,
-        sampling_defaults: {},
-      });
+
     if (path === '/api/runtime/capabilities')
       return json({
         model,

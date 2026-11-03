@@ -117,9 +117,6 @@ void runtime_context(const Services& services, const httplib::Request& request, 
     set_json(response, {{"operation_id", operation}, {"status", "accepted"}}, 202);
 }
 
-void runtime_reload(const Services& services, const httplib::Request& request, httplib::Response& response) {
-    set_json(response, reload_target(services.instances, services.catalog, services.policies, parse_json(request)));
-}
 
 void voice_status(const Services& services, const httplib::Request&, httplib::Response& response) {
     set_json(response, services.voice.status());

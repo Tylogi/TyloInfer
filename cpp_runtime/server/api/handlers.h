@@ -21,7 +21,6 @@ void models_browse(const Services&, const httplib::Request&, httplib::Response&)
 void models_open(const Services&, const httplib::Request&, httplib::Response&);
 void models_register(const Services&, const httplib::Request&, httplib::Response&);
 void model_directory(const Services&, const httplib::Request&, httplib::Response&);
-void model_capabilities(const Services&, const httplib::Request&, httplib::Response&);
 void models_load(const Services&, const httplib::Request&, httplib::Response&);
 void models_unload(const Services&, const httplib::Request&, httplib::Response&);
 
@@ -32,7 +31,6 @@ void model_deletion(const Services&, const httplib::Request&, httplib::Response&
 void model_delete(const Services&, const httplib::Request&, httplib::Response&);
 
 // api/runtime.cpp
-void runtime_status(const Services&, const httplib::Request&, httplib::Response&);
 void runtime_instances(const Services&, const httplib::Request&, httplib::Response&);
 void runtime_instance(const Services&, const httplib::Request&, httplib::Response&);
 void runtime_resources(const Services&, const httplib::Request&, httplib::Response&);
@@ -52,10 +50,8 @@ void profile_get(const Services&, const httplib::Request&, httplib::Response&);
 void profile_update(const Services&, const httplib::Request&, httplib::Response&);
 void profile_delete(const Services&, const httplib::Request&, httplib::Response&);
 void profile_load(const Services&, const httplib::Request&, httplib::Response&);
-void runtime_capabilities(const Services&, const httplib::Request&, httplib::Response&);
 void runtime_instance_patch(const Services&, const httplib::Request&, httplib::Response&);
 void listener_get(const Services&, const httplib::Request&, httplib::Response&);
-void listener_put(const Services&, const httplib::Request&, httplib::Response&);
 
 // api/runtime_cache.cpp
 void cache_entries(const Services&, const httplib::Request&, httplib::Response&);
@@ -66,7 +62,6 @@ void cache_trim(const Services&, const httplib::Request&, httplib::Response&);
 
 // api/runtime_control.cpp
 void runtime_context(const Services&, const httplib::Request&, httplib::Response&);
-void runtime_reload(const Services&, const httplib::Request&, httplib::Response&);
 void voice_status(const Services&, const httplib::Request&, httplib::Response&);
 void voice_install(const Services&, const httplib::Request&, httplib::Response&);
 void voice_activate(const Services&, const httplib::Request&, httplib::Response&);
