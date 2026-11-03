@@ -6,7 +6,7 @@ for (const language of ['zh-CN', 'en'] as const) {
     const state = await mockStudioServer(page, { language });
     const errors: string[] = [];
     page.on('pageerror', error => errors.push(error.message));
-    await page.route('**/api/v1/runtime/memory-policy', route => route.fulfill({ json: {
+    await page.route('**/api/runtime/memory-policy', route => route.fulfill({ json: {
       total_limit_bytes: null, effective_total_limit_bytes: 107.5 * 2 ** 30,
       model_limit_bytes: null, prefix_limit_bytes: null,
     } }));

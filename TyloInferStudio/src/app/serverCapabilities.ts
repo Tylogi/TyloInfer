@@ -1,24 +1,21 @@
-import type { RuntimeStatus } from '../shared/api/types';
-
-// Derive native capabilities from registered routes; model architecture declarations do not imply server support.
+// Native route capabilities; the native server's registered routes are the only source.
 const nativeCapabilities = {
-  agent: false,
-  resources: false,
-  analysis: false,
+  agent: false, // the separate agent-runtime service is not verified against the native server
+  resources: true,
+  analysis: true,
   evaluations: false,
-  runtimeConfiguration: false,
-  officialCatalog: false,
-  hubSearch: false,
-  hubReadme: false,
-  downloadReuse: false,
-  cacheReclaim: false,
-  modelDeletion: false,
+  runtimeConfiguration: false, // listener, cache and cluster policy surfaces are not implemented natively
+  officialCatalog: true,
+  hubSearch: true,
+  hubReadme: true,
+  downloadReuse: true,
+  cacheReclaim: false, // prefix cache reclamation is not implemented natively
+  modelDeletion: true,
 };
 
 export type ServerCapabilities = typeof nativeCapabilities;
 
-/** Restrict unsupported native resources, including while the connection is initializing. */
-export function serverCapabilities(runtime: RuntimeStatus | null | undefined): ServerCapabilities {
-  if (!runtime || runtime.source === 'native-instances') return nativeCapabilities;
-  return Object.fromEntries(Object.keys(nativeCapabilities).map(key => [key, true])) as ServerCapabilities;
+/** Restrict unsupported native resources; the connection state no longer widens them. */
+export function serverCapabilities(): ServerCapabilities {
+  return nativeCapabilities;
 }

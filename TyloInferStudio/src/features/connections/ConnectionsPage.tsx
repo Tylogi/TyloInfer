@@ -45,7 +45,7 @@ export function ConnectionsPage() {
     studio,
     reloadService,
   } = useRuntime();
-  const capabilities = serverCapabilities(runtime);
+  const capabilities = serverCapabilities();
   const managedLocal = isStudio() && studio?.connection === 'managed' && studio.config.mode === 'local';
   const [draft, setDraft] = useState<StudioConfig>(() => studio?.config ?? browserConfig());
   const [listeningPort, setListeningPort] = useState<number | null>(null);

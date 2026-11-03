@@ -5,14 +5,14 @@ import { request, apiUrl, errorFromResponse, authorizedHeaders } from '../client
 export const presetsApi = {
   /** 获取服务端保存的生成预设列表。 */
   async generationPresets(): Promise<GenerationPresetResource[]> {
-    return (await request<{ data: GenerationPresetResource[] }>('/api/v1/presets')).data;
+    return (await request<{ data: GenerationPresetResource[] }>('/api/presets')).data;
   },
 
   /** 保存新的生成预设，返回服务端资源。 */
   createGenerationPreset(
     body: Omit<GenerationPresetResource, 'id' | 'created_at' | 'updated_at'>,
   ): Promise<GenerationPresetResource> {
-    return request('/api/v1/presets', { method: 'POST', body: JSON.stringify(body) });
+    return request('/api/presets', { method: 'POST', body: JSON.stringify(body) });
   },
 
   /** 覆盖指定预设的推理配置。 */
@@ -20,7 +20,7 @@ export const presetsApi = {
     id: string,
     body: Omit<GenerationPresetResource, 'id' | 'created_at' | 'updated_at'>,
   ): Promise<GenerationPresetResource> {
-    return request(`/api/v1/presets/${id}`, {
+    return request(`/api/presets/${id}`, {
       method: 'PUT',
       body: JSON.stringify(body),
     });
@@ -28,7 +28,7 @@ export const presetsApi = {
 
   /** 删除指定预设，不修改已经创建的会话。 */
   async deleteGenerationPreset(id: string): Promise<void> {
-    const response = await fetch(apiUrl(`/api/v1/presets/${id}`), {
+    const response = await fetch(apiUrl(`/api/presets/${id}`), {
       method: 'DELETE',
       headers: authorizedHeaders(),
     });

@@ -29,7 +29,7 @@ for (const language of ['zh', 'en'] as const) {
 test('resource telemetry and service profiles have separate responsive homes', async ({ page }, testInfo) => {
   await mockStudioServer(page);
   let samples = 0;
-  await page.route('**/api/v1/runtime/resources', (route) => {
+  await page.route('**/api/runtime/resources', (route) => {
     samples++;
     return route.fulfill({ json: { sampled_at: 100 + samples * 2, interval_seconds: 2,
       cpu_name: 'Apple M5 Max', cpu_cores: 18, cpu_utilization_percent: samples > 1 ? 43 : 36,
@@ -72,7 +72,7 @@ async function navigateClient(page: Page, path: string) {
 
 test('服务页不再包含旧聊天设置和可执行文件入口', async ({ page }, testInfo) => {
   await mockStudioServer(page);
-  await page.route('**/api/v1/runtime/models', (route) => route.fulfill({ json: { data: [{ id: 'Test Model' }, { id: 'Another Model' }] } }));
+  await page.route('**/api/runtime/models', (route) => route.fulfill({ json: { data: [{ id: 'Test Model' }, { id: 'Another Model' }] } }));
   await page.goto('/runtime');
   await expect(page.getByText('Runtime executable', { exact: true })).toHaveCount(0);
   await expect(page.getByRole('textbox', { name: 'System prompt' })).toHaveCount(0);
@@ -92,9 +92,9 @@ test('每个模型独立配置 ctx，保存整套设置且不改变另一个模�
       queued_requests: 0, context_size: 16384, context_capacity: 262144,
       memory: { resident_weight_bytes: 17.7 * 2 ** 30 } },
   ];
-  await page.route('**/api/v1/runtime/instances', (route) => route.fulfill({ json: { data: instances } }));
-  await page.route('**/api/v1/runtime/models', (route) => route.fulfill({ json: { data: instances.map((item) => ({ id: item.model })) } }));
-  await page.route(/\/api\/v1\/runtime\/status(?:\?.*)?$/, (route) => {
+  await page.route('**/api/runtime/instances', (route) => route.fulfill({ json: { data: instances } }));
+  await page.route('**/api/runtime/models', (route) => route.fulfill({ json: { data: instances.map((item) => ({ id: item.model })) } }));
+  await page.route(/\/api\/runtime\/status(?:\?.*)?$/, (route) => {
     const id = new URL(route.request().url()).searchParams.get('instance_id');
     const item = instances.find((entry) => entry.id === id) ?? instances[0];
     return route.fulfill({ json: { instance_id: item.id, model: item.model,
@@ -104,8 +104,8 @@ test('每个模型独立配置 ctx，保存整套设置且不改变另一个模�
   const pending = new Promise<void>((resolve) => { complete = resolve; });
   const reloads: { instance_id: string; context_size: number }[] = [];
   const policy = { max_context_size: null, model_overrides: {} as Record<string, number>, fallback_context_size: 32768 };
-  await page.route('**/api/v1/runtime/context-policy', route => route.fulfill({ json: policy }));
-  await page.route('**/api/v1/runtime/context', async (route) => {
+  await page.route('**/api/runtime/context-policy', route => route.fulfill({ json: policy }));
+  await page.route('**/api/runtime/context', async (route) => {
     const body = route.request().postDataJSON();
     reloads.push(body);
     await pending;
@@ -151,7 +151,7 @@ test('每个模型独立配置 ctx，保存整套设置且不改变另一个模�
 test('网页运行服务允许编辑端口，无效端口不发送更改', async ({ page }) => {
   await mockStudioServer(page);
   const updates: number[] = [];
-  await page.route('**/api/v1/runtime/listener', (route) => {
+  await page.route('**/api/runtime/listener', (route) => {
     if (route.request().method() === 'PUT') updates.push(route.request().postDataJSON().port);
     return route.fulfill({ json: { host: '127.0.0.1', port: 8090, configurable: true } });
   });
@@ -177,13 +177,13 @@ test('三家架构标识贯穿模型页面，保持描线、无边框和靠右�
     complete: true, loadable: true, modified_at: '2026-01-01' }));
   const instances = models.map((item, index) => ({ id: `instance-${index}`, model: item.name,
     state: 'ready', devices: ['metal'], active_sessions: 0, queued_requests: 0, context_size: 32768 }));
-  await page.route('**/api/v1/runtime/models', (route) => route.fulfill({ json: { data: models.map((item) => ({ id: item.name })) } }));
-  await page.route('**/api/v1/runtime/instances', (route) => route.fulfill({ json: { data: instances } }));
-  await page.route(/\/api\/v1\/runtime\/status(?:\?.*)?$/, (route) => route.fulfill({ json: {
+  await page.route('**/api/runtime/models', (route) => route.fulfill({ json: { data: models.map((item) => ({ id: item.name })) } }));
+  await page.route('**/api/runtime/instances', (route) => route.fulfill({ json: { data: instances } }));
+  await page.route(/\/api\/runtime\/status(?:\?.*)?$/, (route) => route.fulfill({ json: {
     model: models[0].name, model_type: models[0].architecture, runtime_state: 'ready', instance_id: 'instance-0', max_context: 32768,
   } }));
-  await page.route(/\/api\/v1\/models(?:\?.*)?$/, (route) => route.fulfill({ json: { data: artifacts } }));
-  await page.route(/\/api\/v1\/hub\/official(?:\?.*)?$/, (route) => route.fulfill({ json: {
+  await page.route(/\/api\/models(?:\?.*)?$/, (route) => route.fulfill({ json: { data: artifacts } }));
+  await page.route(/\/api\/hub\/official(?:\?.*)?$/, (route) => route.fulfill({ json: {
     ...officialCatalog, data: models.map((item, index) => ({ ...officialCatalog.data[0], ...item, id: `catalog-${index}` })),
   } }));
   const errors: string[] = [];
@@ -272,7 +272,7 @@ test('推理预算按内存架构分列容量，带宽用小号灰字放在下�
   };
   await checkLayout();
   await page.locator('.detected-configuration').screenshot({ path: testInfo.outputPath('unified-memory.png') });
-  await page.route(/\/api\/v1\/hub\/official(?:\?.*)?$/, (route) => route.fulfill({ json: {
+  await page.route(/\/api\/hub\/official(?:\?.*)?$/, (route) => route.fulfill({ json: {
     ...officialCatalog, system: { platform: 'Windows', machine: 'AMD64', backend: 'cuda',
       cpu_name: 'AMD Ryzen 5 9600X', gpu_names: ['NVIDIA GeForce RTX 5090'], physical_memory_bytes: 64 * 2 ** 30,
       memory_pools: [{ kind: 'vram', capacity_bytes: 32 * 2 ** 30, bandwidth_bytes_per_second: 1792e9 },
@@ -292,9 +292,9 @@ test('注册资产显示文件总大小', async ({ page }) => {
   const assets = [32, 8].map((size, index) => ({ id: `asset-${index}`, name: `Registered checkpoint ${index}`,
     architecture: 'test', format: 'mfq', total_bytes: size * 2 ** 30, shard_count: 1,
     tensor_count: 1, record_count: 1, dtypes: [], complete: true, loadable: true, modified_at: '2026-01-01' }));
-  await page.route(/\/api\/v1\/models(?:\?.*)?$/, (route) => route.fulfill({ json: { data: assets } }));
-  await page.route('**/api/v1/runtime/models', (route) => route.fulfill({ json: { data: [] } }));
-  await page.route('**/api/v1/runtime/instances', (route) => route.fulfill({ json: { data: [
+  await page.route(/\/api\/models(?:\?.*)?$/, (route) => route.fulfill({ json: { data: assets } }));
+  await page.route('**/api/runtime/models', (route) => route.fulfill({ json: { data: [] } }));
+  await page.route('**/api/runtime/instances', (route) => route.fulfill({ json: { data: [
     { id: 'instance-1', model: 'Studio Test Model', state: 'ready', devices: ['cpu'] },
     { id: 'instance-2', model: nextModel, state: 'ready', devices: ['cpu'] },
   ] } }));
@@ -346,8 +346,8 @@ test('运行资源按模型分段，各槽使用统一中性色，端点包含 v
       context_count: index, prefix_cache_blocks: index * 2, ssd_experts: true,
       ssd_expert_bytes: index * 2 ** 30, ssd_ple: true, ssd_ple_bytes: index * 2 ** 30 },
   }));
-  await page.route('**/api/v1/runtime/instances', (route) => route.fulfill({ json: { data: instances } }));
-  await page.route(/\/api\/v1\/runtime\/status(?:\?.*)?$/, (route) => route.fulfill({ json: {
+  await page.route('**/api/runtime/instances', (route) => route.fulfill({ json: { data: instances } }));
+  await page.route(/\/api\/runtime\/status(?:\?.*)?$/, (route) => route.fulfill({ json: {
     runtime_state: 'ready', model: 'Resource Model 1', instance_id: 'resource-1',
     runtime_memory_budget_bytes: 32 * 2 ** 30, runtime_memory_effective_budget_bytes: 20 * 2 ** 30,
   } }));
@@ -395,8 +395,8 @@ test('加载条显示实际任务进度，部分缺失的资源明细保留已�
     active_sessions: 0, queued_requests: 0, context_size: 32768 }];
   let advance!: () => void;
   const progressEvent = new Promise<void>((resolve) => { advance = resolve; });
-  await page.route(/\/api\/v1\/jobs(?:\?.*)?$/, (route) => route.fulfill({ json: { data: [job] } }));
-  await page.route('**/api/v1/jobs/loading-job/events/stream', async (route) => {
+  await page.route(/\/api\/jobs(?:\?.*)?$/, (route) => route.fulfill({ json: { data: [job] } }));
+  await page.route('**/api/jobs/loading-job/events/stream', async (route) => {
     await progressEvent;
     job.progress = 0.75;
     await route.fulfill({ contentType: 'text/event-stream', body: `data: ${JSON.stringify({
@@ -404,11 +404,11 @@ test('加载条显示实际任务进度，部分缺失的资源明细保留已�
       data: {}, created_at: job.updated_at,
     })}\n\n` }).catch(() => undefined);
   });
-  await page.route('**/api/v1/runtime/instances', (route) => route.fulfill({ json: { data: instances } }));
-  await page.route(/\/api\/v1\/runtime\/status(?:\?.*)?$/, (route) => route.fulfill({ json: {
+  await page.route('**/api/runtime/instances', (route) => route.fulfill({ json: { data: instances } }));
+  await page.route(/\/api\/runtime\/status(?:\?.*)?$/, (route) => route.fulfill({ json: {
     runtime_state: 'loading', model: 'Loading Model', instance_id: 'loading',
   } }));
-  await page.route(/\/api\/v1\/models(?:\?.*)?$/, (route) => route.fulfill({ json: { data: [{
+  await page.route(/\/api\/models(?:\?.*)?$/, (route) => route.fulfill({ json: { data: [{
     id: 'artifact', name: 'Loading Model', architecture: 'qwen35', loadable: true,
     total_bytes: 1024, shard_count: 1,
   }] } }));
@@ -423,13 +423,13 @@ test('加载条显示实际任务进度，部分缺失的资源明细保留已�
   await page.screenshot({ path: testInfo.outputPath('model-loading-progress.png') });
   job.status = 'succeeded';
   job.progress = 1;
-  await page.route('**/api/v1/runtime/instances', (route) => route.fulfill({ json: { data: [
+  await page.route('**/api/runtime/instances', (route) => route.fulfill({ json: { data: [
     { id: 'known', model: 'Known Model', state: 'ready', devices: ['metal'], active_sessions: 0, queued_requests: 0, memory: {
       resident_weight_bytes: 2 ** 30, kv_bytes: 0, context_count: 0, prefix_cache_blocks: 0,
       ssd_experts: false, ssd_expert_bytes: 0, ssd_ple: false, ssd_ple_bytes: 0,
     } }, { id: 'unknown', model: 'Unknown Model', state: 'ready', devices: ['metal'], active_sessions: 0, queued_requests: 0, memory: null },
   ] } }));
-  await page.route(/\/api\/v1\/runtime\/status(?:\?.*)?$/, (route) => route.fulfill({ json: {
+  await page.route(/\/api\/runtime\/status(?:\?.*)?$/, (route) => route.fulfill({ json: {
     runtime_state: 'ready', model: 'Known Model', runtime_memory_effective_budget_bytes: 4 * 2 ** 30,
   } }));
   await page.goto('/');
@@ -446,13 +446,13 @@ for (const kind of ['model.load', 'download.modelscope']) {
     const job = { id: 'resume-job', kind, payload: loading ? { model: 'Loading Model' } : { repo_id: 'Tylogi/test-MFQ' },
       progress: 0.25, status: 'running', cancel_requested: false,
       created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z' };
-    await page.route(/\/api\/v1\/jobs(?:\?.*)?$/, (route) => route.fulfill({ json: { data: [job] } }));
-    await page.route(/\/api\/v1\/jobs\/resume-job\/events\/stream(?:\?.*)?$/, (route) => route.fulfill({ status: 503, json: { error: 'stream offline' } }));
+    await page.route(/\/api\/jobs(?:\?.*)?$/, (route) => route.fulfill({ json: { data: [job] } }));
+    await page.route(/\/api\/jobs\/resume-job\/events\/stream(?:\?.*)?$/, (route) => route.fulfill({ status: 503, json: { error: 'stream offline' } }));
     if (loading) {
-      await page.route('**/api/v1/runtime/instances', (route) => route.fulfill({ json: { data: [{
+      await page.route('**/api/runtime/instances', (route) => route.fulfill({ json: { data: [{
         id: 'loading', model: 'Loading Model', state: 'loading', devices: ['metal'], active_sessions: 0, queued_requests: 0,
       }] } }));
-      await page.route(/\/api\/v1\/runtime\/status(?:\?.*)?$/, (route) => route.fulfill({ json: {
+      await page.route(/\/api\/runtime\/status(?:\?.*)?$/, (route) => route.fulfill({ json: {
         runtime_state: 'loading', model: 'Loading Model', instance_id: 'loading',
       } }));
     }
@@ -480,26 +480,26 @@ test('页面按需请求自己的资源，概览不预载其他业务列表', as
   await page.goto('/');
   await expect(page.getByRole('heading', { name: 'Overview', exact: true })).toBeVisible();
   for (const path of ['sessions', 'datasets', 'datasets/catalog', 'evaluations', 'evaluations/tools', 'models', 'runtime/logs', 'runtime/profiles', 'cluster/nodes']) {
-    expect(state.requests).not.toContain(`GET /api/v1/${path}`);
+    expect(state.requests).not.toContain(`GET /api/${path}`);
   }
   const routes = [
-    ['/evaluations', '/api/v1/evaluations'],
+    ['/evaluations', '/api/evaluations'],
     ['/model-hub', null],
     ['/versions', null],
     ['/runtime', null],
-    ['/resources', '/api/v1/runtime/resources'],
-    ['/logs', '/api/v1/runtime/logs'],
+    ['/resources', '/api/runtime/resources'],
+    ['/logs', '/api/runtime/logs'],
   ] as const;
   for (const [path, endpoint] of routes) {
     await navigateClient(page, path);
     await expect(page.locator('main h1')).toBeVisible();
     if (endpoint) await expect.poll(() => state.requests.includes(`GET ${endpoint}`)).toBe(true);
     if (path === '/runtime') {
-      expect(state.requests).not.toContain('GET /api/v1/cluster/nodes');
+      expect(state.requests).not.toContain('GET /api/cluster/nodes');
       await page.getByRole('tab', { name: 'Advanced', exact: true }).click();
-      await expect.poll(() => state.requests.includes('GET /api/v1/cluster/nodes')).toBe(true);
+      await expect.poll(() => state.requests.includes('GET /api/cluster/nodes')).toBe(true);
     }
-    if (path === '/versions') expect(state.requests).not.toContain('GET /api/v1/presets');
+    if (path === '/versions') expect(state.requests).not.toContain('GET /api/presets');
   }
   expect(errors).toEqual([]);
   expect(state.unexpected).toEqual([]);
@@ -509,8 +509,8 @@ test('模型下载留在本页，飞入圆圈后打开第三个队列标签', as
   const state = await mockStudioServer(page);
   const jobs: unknown[] = [{ id: 'load', kind: 'model.load', status: 'succeeded', progress: 1,
     payload: { repo_id: 'Not a download' }, cancel_requested: false, created_at: '2026-01-01', updated_at: '2026-01-01' }];
-  await page.route('**/api/v1/jobs/kinds', (route) => route.fulfill({ json: { data: [{ kind: 'download.modelscope' }] } }));
-  await page.route(/\/api\/v1\/jobs(?:\?.*)?$/, async (route) => {
+  await page.route('**/api/jobs/kinds', (route) => route.fulfill({ json: { data: [{ kind: 'download.modelscope' }] } }));
+  await page.route(/\/api\/jobs(?:\?.*)?$/, async (route) => {
     if (route.request().method() === 'GET') return route.fulfill({ json: { data: jobs } });
     const { kind, payload } = route.request().postDataJSON();
     expect(kind).toBe('download.modelscope');
@@ -540,7 +540,7 @@ test('模型下载留在本页，飞入圆圈后打开第三个队列标签', as
   await expect(page.getByText('Not a download')).toHaveCount(0);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
   await page.screenshot({ path: testInfo.outputPath('download-queue.png'), animations: 'disabled' });
-  expect(state.requests).not.toContain('GET /api/v1/artifacts/lineage');
+  expect(state.requests).not.toContain('GET /api/artifacts/lineage');
   expect(state.unexpected).toEqual([]);
 });
 

@@ -42,7 +42,7 @@ export function setApiServerInstance(value: string): void {
 export async function verifyApiToken(token: string, signal?: AbortSignal): Promise<void> {
   const headers = new Headers({ Authorization: `Bearer ${token.trim()}` });
   if (apiServerInstance) headers.set('X-TyloInfer-Instance-ID', apiServerInstance);
-  const response = await fetch(apiUrl('/api/v1/runtime/instances'), {
+  const response = await fetch(apiUrl('/api/runtime/instances'), {
     headers,
     cache: 'no-store',
     signal,
@@ -96,7 +96,7 @@ export function apiUrl(path: string): string {
 /** 构造浏览器 WebSocket 音频入口，并附带服务要求的连接凭据。 */
 export function runtimeRealtimeUrl(): string {
   const base = apiBaseUrl || window.location.origin;
-  const url = new URL('/api/v1/runtime/realtime?mode=audio', base);
+  const url = new URL('/api/runtime/realtime?mode=audio', base);
   if (apiToken) url.searchParams.set('access_token', apiToken);
   if (apiServerInstance) url.searchParams.set('server_instance', apiServerInstance);
   url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';

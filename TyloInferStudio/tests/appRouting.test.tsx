@@ -81,21 +81,23 @@ beforeEach(() => {
     const method = init?.method ?? 'GET';
     requests.push({ path, method });
     const json = (value: unknown) => new Response(JSON.stringify(value));
-    if (path === '/api/v1/auth/policy') return json({ enabled: false, has_key: false });
-    if (path === '/api/v1/runtime/model-aliases') return json({ aliases: {} });
-    if (path === '/api/v1/jobs/kinds') return json({ data: [] });
-    if (path === '/api/v1/hub/download-directory') return json({ actual_directory: 'D:/isolated/models', default_directory: 'D:/isolated/models', evict_prefix_cache: false });
-    if (runtime.runtime.source !== 'native-instances' && ['/api/v1/agent/state', '/api/v1/agent/start'].includes(path)) {
+    if (path === '/api/auth/policy') return json({ enabled: false, has_key: false });
+    if (path === '/api/runtime/model-aliases') return json({ aliases: {} });
+    if (path === '/api/jobs/kinds') return json({ data: [] });
+    if (path === '/api/hub/official') return json({ data: [], refreshing: false });
+    if (path === '/api/hub/models') return json({ data: [], next_cursor: null });
+    if (path === '/api/hub/download-directory') return json({ actual_directory: 'D:/isolated/models', default_directory: 'D:/isolated/models', evict_prefix_cache: false });
+    if (runtime.runtime.source !== 'native-instances' && ['/api/agent/state', '/api/agent/start'].includes(path)) {
       return json({ running: path.endsWith('/start'), workspaces: [], sessions: [], models: [], approvals: [] });
     }
-    if (path === '/api/v1/sessions' && method === 'GET') return json({ data: sessions });
-    if (path === '/api/v1/sessions' && method === 'POST') {
+    if (path === '/api/sessions' && method === 'GET') return json({ data: sessions });
+    if (path === '/api/sessions' && method === 'POST') {
       sessions = [savedSession()]; return json(sessions[0]);
     }
-    if (path === `/api/v1/sessions/${sessionId}/messages`) return json({ data: messages });
-    if (path === `/api/v1/sessions/${sessionId}/responses` && method === 'GET') return json({ data: responses });
-    if (path === `/api/v1/sessions/${sessionId}`) return json(sessions[0]);
-    if (path === `/api/v1/sessions/${sessionId}/responses` && method === 'POST') {
+    if (path === `/api/sessions/${sessionId}/messages`) return json({ data: messages });
+    if (path === `/api/sessions/${sessionId}/responses` && method === 'GET') return json({ data: responses });
+    if (path === `/api/sessions/${sessionId}`) return json(sessions[0]);
+    if (path === `/api/sessions/${sessionId}/responses` && method === 'POST') {
       generationRequest = JSON.parse(init!.body as string);
       generationSignal = init?.signal ?? null;
       const body = new ReadableStream<Uint8Array>({ start(controller) { stream = controller; } });
@@ -108,15 +110,13 @@ beforeEach(() => {
 afterEach(() => { cleanup(); vi.useRealTimers(); setApiBaseUrl(''); vi.unstubAllGlobals(); });
 
 it.each([
-  ['/resources', 'resource monitoring or cache management'],
-  ['/analysis', 'architecture or tensor analysis'],
   ['/evaluations', 'datasets, quality evaluations or benchmark jobs'],
 ])('keeps %s as an unavailable entry without mounting requests or polling', async (path, detail) => {
   renderApp(path);
   expect(await screen.findByText(new RegExp(detail))).toBeInTheDocument();
   vi.useFakeTimers();
   await act(async () => { await vi.advanceTimersByTimeAsync(12000); });
-  expect(requests.filter(request => !request.path.startsWith('/api/v1/sessions'))).toEqual([]);
+  expect(requests.filter(request => !request.path.startsWith('/api/sessions'))).toEqual([]);
 });
 
 it('retains native authentication and aliases while all runtime settings tabs avoid unsupported APIs', async () => {
@@ -131,23 +131,22 @@ it('retains native authentication and aliases while all runtime settings tabs av
   expect(screen.getByRole('tabpanel')).toHaveTextContent('Cluster nodes and remote routing are unavailable');
   vi.useFakeTimers();
   await act(async () => { await vi.advanceTimersByTimeAsync(12000); });
-  expect(requests.filter(request => !['/api/v1/sessions', '/api/v1/runtime/model-aliases', '/api/v1/auth/policy'].includes(request.path))).toEqual([]);
+  expect(requests.filter(request => !['/api/sessions', '/api/runtime/model-aliases', '/api/auth/policy'].includes(request.path))).toEqual([]);
 });
 
-it('keeps native downloads and future recommendations visible without automatic keyword or catalog requests', async () => {
+it('searches and browses the native hub while keeping cache reclamation unavailable', async () => {
   renderApp('/model-hub');
+  await waitFor(() => expect(requests.some(request => request.path === '/api/hub/official')).toBe(true));
+  expect(screen.getByRole('checkbox', { name: 'Reclaim SSD prefix budget' })).toBeDisabled();
+  fireEvent.click(screen.getByRole('tab', { name: 'Model browser' }));
   const search = await screen.findByRole('textbox', { name: 'Search models' });
-  expect(search).toHaveAttribute('placeholder', 'owner/repo or repository URL');
-  expect(screen.getByRole('button', { name: 'Search' })).toBeDisabled();
-  const reclaim = screen.getByRole('checkbox', { name: 'Reclaim SSD prefix budget' });
-  expect(reclaim).toBeDisabled();
+  expect(search).toHaveAttribute('placeholder', 'Model name, owner/repo, or repository URL');
   fireEvent.change(search, { target: { value: 'keyword' } });
-  expect(screen.getByRole('button', { name: 'Search' })).toBeDisabled();
-  fireEvent.click(screen.getByRole('tab', { name: 'Recommended models' }));
-  expect(screen.getByText(/does not provide recommendations/)).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: 'Search' })).toBeEnabled();
+  await waitFor(() => expect(requests.some(request => request.path === '/api/hub/models')).toBe(true));
   vi.useFakeTimers();
   await act(async () => { await vi.advanceTimersByTimeAsync(12000); });
-  expect(requests.filter(request => !['/api/v1/sessions', '/api/v1/jobs/kinds', '/api/v1/hub/download-directory'].includes(request.path))).toEqual([]);
+  expect(requests.filter(request => !['/api/sessions', '/api/jobs/kinds', '/api/hub/download-directory', '/api/hub/official', '/api/hub/models'].includes(request.path))).toEqual([]);
 });
 
 it.each(['/chat', '/chat/'])('renders the real native chat page at %s without redirecting or calling Agent APIs', async path => {
@@ -155,7 +154,7 @@ it.each(['/chat', '/chat/'])('renders the real native chat page at %s without re
   await waitFor(() => expect(screen.getByRole('textbox', { name: 'Message' })).toBeEnabled());
   expect(screen.getByLabelText('Current path')).toHaveTextContent(path);
   expect(screen.getByRole('heading', { name: 'Native conversation' })).toBeInTheDocument();
-  expect(requests.some(request => request.path.startsWith('/api/v1/agent'))).toBe(false);
+  expect(requests.some(request => request.path.startsWith('/api/agent'))).toBe(false);
   expect(screen.getByRole('button', { name: 'Text chat' })).toHaveAttribute('aria-current', 'page');
 });
 
@@ -167,19 +166,7 @@ it('explains native Agent unavailability and opens the actual text chat route', 
   fireEvent.click(screen.getByRole('button', { name: 'Open text chat' }));
   await waitFor(() => expect(screen.getByRole('textbox', { name: 'Message' })).toBeEnabled());
   expect(screen.getByLabelText('Current path').textContent).toBe('/chat');
-  expect(requests.some(request => request.path.startsWith('/api/v1/agent'))).toBe(false);
-});
-
-it('retains the real Agent page, startup and workspace entry on services supporting Agent', async () => {
-  runtime.runtime = { model: 'Native Model', runtime_state: 'ready' };
-  renderApp('/agent', true);
-  expect(await screen.findByRole('heading', { name: 'Start something new' })).toBeInTheDocument();
-  await waitFor(() => expect(screen.getByRole('button', { name: 'Add workspace' })).toBeEnabled());
-  expect(screen.getByRole('button', { name: 'New conversation' })).toBeInTheDocument();
-  expect(screen.queryByRole('heading', { name: 'Agent is unavailable on this server' })).not.toBeInTheDocument();
-  expect(requests).toEqual(expect.arrayContaining([
-    { path: '/api/v1/agent/state', method: 'GET' }, { path: '/api/v1/agent/start', method: 'POST' },
-  ]));
+  expect(requests.some(request => request.path.startsWith('/api/agent'))).toBe(false);
 });
 
 it('allows a native idle server to open and create text chats, then guides model selection', async () => {
@@ -192,7 +179,7 @@ it('allows a native idle server to open and create text chats, then guides model
   expect(screen.getByRole('button', { name: 'Choose model' })).toBeEnabled();
   expect(screen.getByRole('textbox', { name: 'Message' })).toBeEnabled();
   expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled();
-  expect(requests.filter(request => request.path === '/api/v1/sessions' && request.method === 'POST')).toHaveLength(1);
+  expect(requests.filter(request => request.path === '/api/sessions' && request.method === 'POST')).toHaveLength(1);
 });
 
 it('keeps a real text stream alive across App routes and synchronizes persisted output on return', async () => {

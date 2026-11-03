@@ -61,19 +61,19 @@ std::int64_t integer(const json& request, const char* field, std::int64_t fallba
 } // namespace
 
 void register_models(httplib::Server& http, ModelCatalog& catalog, ModelInstances& instances, Jobs& jobs) {
-    http.Get("/api/v1/models", [&](const httplib::Request& request, httplib::Response& response) {
+    http.Get("/api/models", [&](const httplib::Request& request, httplib::Response& response) {
         const auto refresh = request.get_param_value("refresh");
         if (request.has_param("refresh") && refresh != "true" && refresh != "false" && refresh != "1" && refresh != "0")
             throw ApiError(400, "invalid_request", "refresh must be a boolean");
         set_json(response, artifacts(catalog.list(refresh == "true" || refresh == "1"), instances));
     });
-    http.Get("/api/v1/models/directories", [&](const httplib::Request& request, httplib::Response& response) {
+    http.Get("/api/models/directories", [&](const httplib::Request& request, httplib::Response& response) {
         const auto id = request.get_param_value("directory_id"), path = request.get_param_value("path");
         if ((request.has_param("directory_id") && id.empty()) || (request.has_param("path") && path.empty()))
             throw ApiError(400, "invalid_model_directory_source", "directory source cannot be empty");
         set_json(response, directory_json(catalog.browse({id, std::filesystem::u8path(path)})));
     });
-    http.Post("/api/v1/models/directories/register", [&](const httplib::Request& request, httplib::Response& response) {
+    http.Post("/api/models/directories/register", [&](const httplib::Request& request, httplib::Response& response) {
         const auto body = parse_json(request);
         fields(body, {"path", "directory_id"});
         for (const auto& item : body.items())
@@ -83,10 +83,10 @@ void register_models(httplib::Server& http, ModelCatalog& catalog, ModelInstance
         const auto path = body.contains("path") && !body["path"].is_null() ? body["path"].get<std::string>() : "";
         set_json(response, artifacts(catalog.register_directory({id, std::filesystem::u8path(path)}), instances));
     });
-    http.Get("/api/v1/models/([^/]+)/directory", [&](const httplib::Request& request, httplib::Response& response) {
+    http.Get("/api/models/([^/]+)/directory", [&](const httplib::Request& request, httplib::Response& response) {
         set_json(response, directory_json(catalog.model_directory(request.matches[1])));
     });
-    http.Get("/api/v1/models/([^/]+)/capabilities", [&](const httplib::Request& request, httplib::Response& response) {
+    http.Get("/api/models/([^/]+)/capabilities", [&](const httplib::Request& request, httplib::Response& response) {
         const auto artifact = catalog.resolve(request.matches[1]);
         if (artifact.id != request.matches[1]) throw ApiError(400, "invalid_request", "capability lookup requires an artifact ID");
         const auto support = instances.support(artifact);
@@ -95,7 +95,7 @@ void register_models(httplib::Server& http, ModelCatalog& catalog, ModelInstance
             {"declared_context_capacity", artifact.context_capacity ? json(*artifact.context_capacity) : json(nullptr)},
             {"load", {{"cancellation", "after_return"}, {"progress", "phase"}}}});
     });
-    http.Post("/api/v1/models/load", [&](const httplib::Request& request, httplib::Response& response) {
+    http.Post("/api/models/load", [&](const httplib::Request& request, httplib::Response& response) {
         const auto body = parse_json(request);
         fields(body, {"artifact_id", "requirements", "policy"});
         const auto artifact_id = selector(body, "artifact_id");
@@ -128,10 +128,10 @@ void register_models(httplib::Server& http, ModelCatalog& catalog, ModelInstance
                 throw;
             }
         });
-        response.set_header("Location", "/api/v1/jobs/" + operation);
+        response.set_header("Location", "/api/jobs/" + operation);
         set_json(response, {{"operation_id", operation}, {"status", "accepted"}}, 202);
     });
-    http.Post("/api/v1/models/unload", [&](const httplib::Request& request, httplib::Response& response) {
+    http.Post("/api/models/unload", [&](const httplib::Request& request, httplib::Response& response) {
         const auto body = parse_json(request);
         fields(body, {"instance_id", "force"});
         const auto id = normalize_uuid(selector(body, "instance_id"));
@@ -143,7 +143,7 @@ void register_models(httplib::Server& http, ModelCatalog& catalog, ModelInstance
             instances.unload(id, force);
             return json{{"instance_id", id}, {"state", "unloaded"}};
         });
-        response.set_header("Location", "/api/v1/jobs/" + operation);
+        response.set_header("Location", "/api/jobs/" + operation);
         set_json(response, {{"operation_id", operation}, {"status", "accepted"}}, 202);
     });
 }

@@ -18,7 +18,7 @@ export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useMo
   const { tr } = useSettings();
   const { runtime, artifacts, busy, instances, modelFilter,
     setModelFilter, filteredArtifacts, unloadInstance, loadArtifact, chooseModelDirectory, openModelFiles, prepareModelDeletion } = catalog;
-  const capabilities = serverCapabilities(runtime);
+  const capabilities = serverCapabilities();
   const [status, setStatus] = useState('all');
   const [architecture, setArchitecture] = useState('all');
   const [format, setFormat] = useState('all');

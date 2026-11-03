@@ -82,7 +82,7 @@ it('stops through the native cancel route, then confirms the persisted cancelled
   expect(controller.getSnapshot()).toMatchObject({ phase: 'cancelled', recoveryNeeded: false });
   expect(synchronized.mock.calls[0][0].messages).toEqual([user]);
   expect(fetchMock.mock.calls.filter(([, init]) => init?.method === 'POST').map(([url]) => url))
-    .toEqual([`/api/v1/sessions/${sessionId}/responses`, `/api/v1/sessions/${sessionId}/responses/cancel`]);
+    .toEqual([`/api/sessions/${sessionId}/responses`, `/api/sessions/${sessionId}/responses/cancel`]);
   controller.reset();
 });
 

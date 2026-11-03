@@ -9,7 +9,7 @@ export const mediaApi = {
     const sha256 = Array.from(new Uint8Array(digest), (value) =>
       value.toString(16).padStart(2, '0'),
     ).join('');
-    const response = await fetch(apiUrl('/api/v1/media'), {
+    const response = await fetch(apiUrl('/api/media'), {
       method: 'POST',
       headers: authorizedHeaders({
         'Content-Type': mimeType || file.type || 'application/octet-stream',
@@ -23,12 +23,12 @@ export const mediaApi = {
 
   /** 返回媒体资源地址；需要鉴权读取时应调用 fetchMedia。 */
   mediaUrl(id: string): string {
-    return apiUrl(`/api/v1/media/${id}`);
+    return apiUrl(`/api/media/${id}`);
   },
 
   /** 带鉴权读取媒体二进制，支持组件卸载时取消。 */
   async fetchMedia(id: string, signal?: AbortSignal): Promise<Blob> {
-    const response = await fetch(apiUrl(`/api/v1/media/${id}`), {
+    const response = await fetch(apiUrl(`/api/media/${id}`), {
       headers: authorizedHeaders(),
       signal,
     });
@@ -38,7 +38,7 @@ export const mediaApi = {
 
   /** 请求服务端提取已上传文档，返回文档文本与媒体引用。 */
   createDocument(mediaId: string, name: string): Promise<DocumentResource> {
-    return request('/api/v1/documents', {
+    return request('/api/documents', {
       method: 'POST',
       body: JSON.stringify({ media_id: mediaId, name }),
     });

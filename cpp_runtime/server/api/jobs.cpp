@@ -18,25 +18,25 @@ std::int64_t number(const std::string& value, std::int64_t fallback, std::int64_
 }
 }
 void register_jobs(httplib::Server& http, Jobs& jobs, std::shared_ptr<std::atomic<std::size_t>> streams) {
-    http.Get("/api/v1/jobs", [&](const httplib::Request& request, httplib::Response& response) {
+    http.Get("/api/jobs", [&](const httplib::Request& request, httplib::Response& response) {
         for (const auto* key : {"limit", "offset", "status", "kind"})
             if (request.has_param(key) && request.get_param_value(key).empty()) throw ApiError(400, "invalid_request", "job filters cannot be empty");
         set_json(response, jobs.list(number(request.get_param_value("limit"), 100, 1000),
             number(request.get_param_value("offset"), 0, INT64_MAX), request.get_param_value("status"), request.get_param_value("kind")));
     });
-    http.Delete("/api/v1/jobs/completed", [&](const httplib::Request&, httplib::Response& response) {
+    http.Delete("/api/jobs/completed", [&](const httplib::Request&, httplib::Response& response) {
         jobs.clear(); response.status = 204;
     });
-    http.Delete("/api/v1/jobs/([0-9a-f-]{36})", [&](const httplib::Request& request, httplib::Response& response) {
+    http.Delete("/api/jobs/([0-9a-f-]{36})", [&](const httplib::Request& request, httplib::Response& response) {
         jobs.erase(normalize_uuid(request.matches[1])); response.status = 204;
     });
-    http.Get("/api/v1/jobs/([0-9a-f-]{36})", [&](const httplib::Request& request, httplib::Response& response) {
+    http.Get("/api/jobs/([0-9a-f-]{36})", [&](const httplib::Request& request, httplib::Response& response) {
         set_json(response, jobs.get(normalize_uuid(request.matches[1])));
     });
-    http.Post("/api/v1/jobs/([0-9a-f-]{36})/cancel", [&](const httplib::Request& request, httplib::Response& response) {
+    http.Post("/api/jobs/([0-9a-f-]{36})/cancel", [&](const httplib::Request& request, httplib::Response& response) {
         set_json(response, jobs.cancel(normalize_uuid(request.matches[1])));
     });
-    http.Get("/api/v1/jobs/([0-9a-f-]{36})/events", [&](const httplib::Request& request, httplib::Response& response) {
+    http.Get("/api/jobs/([0-9a-f-]{36})/events", [&](const httplib::Request& request, httplib::Response& response) {
         const auto id = normalize_uuid(request.matches[1]);
         const auto limit = number(request.get_param_value("limit"), 256, 1000);
         auto after = number(request.get_param_value("after"), 0, INT64_MAX);
@@ -44,7 +44,7 @@ void register_jobs(httplib::Server& http, Jobs& jobs, std::shared_ptr<std::atomi
             after = std::max<std::int64_t>(after, std::max<std::int64_t>(0, jobs.get(id)["last_sequence"].get<std::int64_t>() - std::min<std::int64_t>(limit, 256)));
         set_json(response, jobs.events(id, after, limit));
     });
-    http.Get("/api/v1/jobs/([0-9a-f-]{36})/events/stream", [&, streams](const httplib::Request& request, httplib::Response& response) {
+    http.Get("/api/jobs/([0-9a-f-]{36})/events/stream", [&, streams](const httplib::Request& request, httplib::Response& response) {
         const auto id = normalize_uuid(request.matches[1]);
         auto cursor = std::max(number(request.get_param_value("after"), 0, INT64_MAX),
             number(request.get_header_value("Last-Event-ID"), 0, INT64_MAX));

@@ -6,21 +6,21 @@ import { readEventStream } from '../eventStream';
 
 export const jobsApi = {
   getJob(id: string): Promise<JobResource> {
-    return request(`/api/v1/jobs/${id}`);
+    return request(`/api/jobs/${id}`);
   },
   /** 获取最近的后台任务。 */
   async jobs(limit = 100): Promise<JobResource[]> {
-    return (await request<{ data: JobResource[] }>(`/api/v1/jobs?limit=${limit}`)).data;
+    return (await request<{ data: JobResource[] }>(`/api/jobs?limit=${limit}`)).data;
   },
 
   /** 获取任务类型和动态表单字段定义。 */
   async jobKinds(): Promise<JobKindResource[]> {
-    return (await request<{ data: JobKindResource[] }>('/api/v1/jobs/kinds')).data;
+    return (await request<{ data: JobKindResource[] }>('/api/jobs/kinds')).data;
   },
 
   /** 提交后台任务并返回初始任务记录。 */
   createJob(kind: string, payload: Record<string, unknown>): Promise<JobResource> {
-    return request('/api/v1/jobs', {
+    return request('/api/jobs', {
       method: 'POST',
       body: JSON.stringify({ kind, payload }),
     });
@@ -28,17 +28,17 @@ export const jobsApi = {
 
   /** 请求取消指定后台任务。 */
   cancelJob(id: string): Promise<JobResource> {
-    return request(`/api/v1/jobs/${id}/cancel`, { method: 'POST' });
+    return request(`/api/jobs/${id}/cancel`, { method: 'POST' });
   },
 
   /** 根据已有任务重新创建执行尝试。 */
   retryJob(id: string): Promise<JobResource> {
-    return request(`/api/v1/jobs/${id}/retry`, { method: 'POST' });
+    return request(`/api/jobs/${id}/retry`, { method: 'POST' });
   },
 
   /** 移除指定任务历史记录。 */
   async deleteJob(id: string): Promise<void> {
-    const response = await fetch(apiUrl(`/api/v1/jobs/${id}`), {
+    const response = await fetch(apiUrl(`/api/jobs/${id}`), {
       method: 'DELETE',
       headers: authorizedHeaders(),
     });
@@ -47,7 +47,7 @@ export const jobsApi = {
 
   /** 清理已经完成的任务记录，不删除对应模型产物。 */
   async clearCompletedJobs(): Promise<void> {
-    const response = await fetch(apiUrl('/api/v1/jobs/completed'), {
+    const response = await fetch(apiUrl('/api/jobs/completed'), {
       method: 'DELETE',
       headers: authorizedHeaders(),
     });
@@ -64,7 +64,7 @@ export const jobsApi = {
         data: Record<string, unknown>;
         created_at: string;
       }>;
-    }>(`/api/v1/jobs/${id}/events?limit=1000&tail=true`, { signal });
+    }>(`/api/jobs/${id}/events?limit=1000&tail=true`, { signal });
     return response.data
       .filter((event) => event.message)
       .map((event) => ({
@@ -83,7 +83,7 @@ export const jobsApi = {
     signal: AbortSignal,
     after = 0,
   ): Promise<void> {
-    const response = await fetch(apiUrl(`/api/v1/jobs/${id}/events/stream${after > 0 ? `?after=${after}` : ''}`), {
+    const response = await fetch(apiUrl(`/api/jobs/${id}/events/stream${after > 0 ? `?after=${after}` : ''}`), {
       headers: authorizedHeaders({ Accept: 'text/event-stream' }),
       signal,
     });

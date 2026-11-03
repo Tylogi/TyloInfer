@@ -237,7 +237,7 @@ describe('Studio 过渡源码与静态样式契约（非行为测试）', () => 
     expect(runtime).toContain('.watchActiveJobs(');
     expect(jobs).toContain('get().streamJobEvents(id,');
     expect(jobs).toContain('.streamJobEvents(');
-    expect(API).toContain('/api/v1/jobs/${id}/events/stream');
+    expect(API).toContain('/api/jobs/${id}/events/stream');
     expect(API).toContain('readEventStream<JobEventResource | ApiErrorBody>');
     expect(API).toContain("if ('error' in event) throw new ApiError(502, event)");
     expect(APP).not.toContain('window.setInterval(() => void refreshRuntime(true), 2500)');

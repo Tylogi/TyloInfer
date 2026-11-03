@@ -16,7 +16,7 @@ it('重载使用指定实例与上下文，并保留服务响应', async () => {
   setApiToken('test-token');
   await expect(runtimeApi.reloadRuntime(8192, 'instance-a')).resolves.toEqual(response);
   const [url, init] = fetchMock.mock.calls[0];
-  expect(url).toBe('https://test.invalid/api/v1/runtime/reload');
+  expect(url).toBe('https://test.invalid/api/runtime/reload');
   expect(init.method).toBe('POST');
   expect(JSON.parse(init.body)).toEqual({ context_size: 8192, instance_id: 'instance-a' });
   expect(init.headers.get('Authorization')).toBe('Bearer test-token');

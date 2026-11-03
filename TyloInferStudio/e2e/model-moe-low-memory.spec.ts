@@ -14,18 +14,18 @@ function artifact(id: string, name: string, experts: number) {
 for (const memory_architecture of ['unified', 'discrete'] as const) {
   test(`low-memory MoE on ${memory_architecture} memory explains SSD streaming and still loads`, async ({ page }) => {
     await mockStudioServer(page);
-    await page.route('**/api/v1/runtime/status*', route => route.fulfill({ json: {
+    await page.route('**/api/runtime/status*', route => route.fulfill({ json: {
       runtime_state: 'idle', memory_architecture, active_requests: 0, sampling_defaults: {},
       host_memory_available_bytes: 16 * GiB, runtime_memory_headroom_bytes: 16 * GiB,
       ...(memory_architecture === 'discrete' ? { gpu_devices: [{ id: '0', name: 'GPU', memory_available_bytes: 8 * GiB }] } : {}),
     } }));
-    await page.route(/\/api\/v1\/models(?:\?.*)?$/, route => route.fulfill({ json: { data: [
+    await page.route(/\/api\/models(?:\?.*)?$/, route => route.fulfill({ json: { data: [
       artifact('moe', 'Low Memory MoE', 76), artifact('dense', 'Low Memory Dense', 0),
     ] } }));
     const writes: Record<string, unknown>[] = [];
     let release = () => {};
     const held = new Promise<void>(resolve => { release = resolve; });
-    await page.route('**/api/v1/models/load', async route => {
+    await page.route('**/api/models/load', async route => {
       writes.push(route.request().postDataJSON());
       await held;
       await route.fulfill({ json: { operation_id: 'load', status: 'accepted' } });
@@ -56,11 +56,11 @@ for (const memory_architecture of ['unified', 'discrete'] as const) {
 
 test('checkpoint warnings stay left of pressure bars with equal row heights and stable action columns', async ({ page }, testInfo) => {
   await mockStudioServer(page);
-  await page.route('**/api/v1/runtime/status*', route => route.fulfill({ json: {
+  await page.route('**/api/runtime/status*', route => route.fulfill({ json: {
     runtime_state: 'idle', memory_architecture: 'unified', runtime_memory_headroom_bytes: 16 * GiB,
     active_requests: 0, sampling_defaults: {},
   } }));
-  await page.route(/\/api\/v1\/models(?:\?.*)?$/, route => route.fulfill({ json: { data: [
+  await page.route(/\/api\/models(?:\?.*)?$/, route => route.fulfill({ json: { data: [
     { ...artifact('fit', 'Fitting model', 0), estimated_resident_weight_bytes: 4 * GiB },
     artifact('streamed', 'Streamed model', 76),
     { ...artifact('incomplete', 'Incomplete model', 76), shard_count: 8, missing_shards: 2, complete: false, loadable: false, estimated_resident_weight_bytes: null },

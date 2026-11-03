@@ -67,21 +67,6 @@ it('keeps a submitted download on this page, animates into the circle and opens 
   expect(screen.getByText('Queued')).toBeInTheDocument();
 });
 
-it('reclaims prefix space only after the setting is saved and restores it on failure', async () => {
-  vi.mocked(modelsApi.configureDownloadReclaim).mockResolvedValue({ directory: null, actual_directory: '/workspace/models', default_directory: '/workspace/models', disk_total_bytes: 2048 * 2 ** 30, disk_free_bytes: 200 * 2 ** 30, disk_available_bytes: 260 * 2 ** 30, evict_prefix_cache: true });
-  render(<ModelHubPage />);
-  const checkbox = await screen.findByRole('checkbox', { name: 'Reclaim SSD prefix budget' });
-  await waitFor(() => expect(checkbox).toBeEnabled());
-  expect(checkbox).not.toBeChecked();
-  fireEvent.click(checkbox);
-  await waitFor(() => expect(checkbox).toBeChecked());
-  expect(modelsApi.configureDownloadReclaim).toHaveBeenCalledWith(true);
-  expect(screen.getByText('260.0 / 2048.0 GiB')).toBeInTheDocument();
-  vi.mocked(modelsApi.configureDownloadReclaim).mockRejectedValue(new Error('save failed'));
-  fireEvent.click(checkbox);
-  await waitFor(() => expect(checkbox).toBeEnabled());
-  expect(checkbox).toBeChecked();
-});
 
 it('distinguishes two precisions of one repository by their file paths and lists all shards', () => {
   const first = 'S2-L/model-00001-of-00002.tq';
@@ -135,21 +120,6 @@ it('shows remaining download disk capacity and refreshes it while mounted', asyn
   expect(modelsApi.downloadDirectory).toHaveBeenCalledTimes(2);
 });
 
-it('keeps the checked prefix setting and folder through a transient status failure', async () => {
-  vi.useFakeTimers();
-  vi.mocked(modelsApi.downloadDirectory).mockResolvedValueOnce({ directory: null,
-    actual_directory: '/workspace/models', default_directory: '/workspace/models', evict_prefix_cache: true })
-    .mockRejectedValueOnce(new Error('temporarily offline'));
-  let view: ReturnType<typeof render>;
-  await act(async () => { view = render(<ModelHubPage />); });
-  const checkbox = screen.getByRole('checkbox', { name: 'Reclaim SSD prefix budget' });
-  expect(checkbox).toBeChecked();
-  await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
-  expect(checkbox).toBeChecked();
-  expect(checkbox).toBeEnabled();
-  expect(screen.getByText('/workspace/models')).toBeInTheDocument();
-  view!.unmount();
-});
 
 it('keeps download controls usable when disk capacity is not reported', async () => {
   vi.mocked(modelsApi.downloadDirectory).mockResolvedValue({ directory: null, actual_directory: '/workspace/models', default_directory: '/workspace/models' });

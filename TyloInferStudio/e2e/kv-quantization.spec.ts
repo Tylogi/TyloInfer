@@ -7,13 +7,13 @@ for (const language of ['zh-CN', 'en'] as const) {
     await mockStudioServer(page, { language });
     const model = { id: 'qsa', model: 'Qwen3.8-Flash-Next', state: 'ready', context_size: 678920,
       context_capacity: 262144, qsa_kv_offload_supported: true, kv_quantization_supported: true };
-    await page.route('**/api/v1/runtime/instances', route => route.fulfill({ json: { data: [model] } }));
-    await page.route('**/api/v1/runtime/context-policy', route => route.fulfill({ json: { max_context_size: null,
+    await page.route('**/api/runtime/instances', route => route.fulfill({ json: { data: [model] } }));
+    await page.route('**/api/runtime/context-policy', route => route.fulfill({ json: { max_context_size: null,
       model_overrides: { [model.model]: 678920 }, model_yarn_enabled: { [model.model]: true }, model_kv_quantization: {} } }));
-    await page.route('**/api/v1/runtime/yarn/*', route => route.fulfill({ json: { supported: true,
+    await page.route('**/api/runtime/yarn/*', route => route.fulfill({ json: { supported: true,
       native_context: 262144, maximum_context: 1048576, maximum_factor: 4, enabled: true } }));
-    await page.route(/\/api\/v1\/models(?:\?.*)?$/, route => route.fulfill({ json: { data: [{ id: 'artifact', name: model.model }] } }));
-    await page.route('**/api/v1/models/*/cache-profile', route => route.fulfill({ json: { max_context: 262144,
+    await page.route(/\/api\/models(?:\?.*)?$/, route => route.fulfill({ json: { data: [{ id: 'artifact', name: model.model }] } }));
+    await page.route('**/api/models/*/cache-profile', route => route.fulfill({ json: { max_context: 262144,
       fixed_bytes: 29978, fixed_components: [{ group: 'QSA', name: 'indexer_tail', bytes: 29978 }], components: [
         { group: 'QSA', name: 'raw_kv', layers: 13, head_dimension: 256, kv_heads: 2, bytes_per_row: 26624,
           tokens_per_row: 1, allocation: 'power_of_two', minimum_rows: 16, max_read_rows_per_token: 2048 },
@@ -21,7 +21,7 @@ for (const language of ['zh-CN', 'en'] as const) {
           tokens_per_row: 4, allocation: 'power_of_two', minimum_rows: 16, row_rounding: 'floor' },
       ] } }));
     const writes: unknown[] = [];
-    await page.route('**/api/v1/runtime/context', route => {
+    await page.route('**/api/runtime/context', route => {
       const payload = route.request().postDataJSON(); writes.push(payload);
       return route.fulfill({ json: { id: 'save', kind: 'runtime.context.configure', status: 'running', payload,
         progress: .1, cancel_requested: false, created_at: '2026-10-10T00:00:00Z', updated_at: '2026-10-10T00:00:00Z' } });

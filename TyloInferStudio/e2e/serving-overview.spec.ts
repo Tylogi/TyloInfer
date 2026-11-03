@@ -4,7 +4,7 @@ import { mockStudioServer } from './mockServer';
 test('overview shares statistics scope with the compact footer and keeps concurrency live', async ({ page }) => {
   const state = await mockStudioServer(page);
   let polls = 0;
-  await page.route('**/api/v1/runtime/serving?*', async route => {
+  await page.route('**/api/runtime/serving?*', async route => {
     polls += 1;
     const scope = new URL(route.request().url()).searchParams.get('scope');
     const historical = scope === 'alltime';

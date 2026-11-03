@@ -4,7 +4,7 @@ import { mockStudioServer, officialCatalog } from './mockServer';
 test('checked prefix control retains its paint and state across focus and a failed poll', async ({ page, context }) => {
   await mockStudioServer(page);
   let calls = 0;
-  await page.route('**/api/v1/hub/download-directory', route => {
+  await page.route('**/api/hub/download-directory', route => {
     calls += 1;
     return calls === 1 ? route.fulfill({ json: {
       directory: null, actual_directory: '/downloads', default_directory: '/downloads', evict_prefix_cache: true,
@@ -32,7 +32,7 @@ test('checked prefix control retains its paint and state across focus and a fail
 
 test('chooses the faster source automatically and displays an existing-file reminder without adding a task', async ({ page }) => {
   await mockStudioServer(page);
-  await page.route('**/api/v1/jobs/kinds', route => route.fulfill({ json: { data: [
+  await page.route('**/api/jobs/kinds', route => route.fulfill({ json: { data: [
     { kind: 'download.modelscope' }, { kind: 'download.huggingface' },
   ] } }));
   const catalog = structuredClone(officialCatalog);
@@ -40,16 +40,16 @@ test('chooses the faster source automatically and displays an existing-file remi
   const ms = first.sources[0];
   const hf = { ...ms, provider: 'huggingface' as const, url: `https://huggingface.co/${ms.repo_id}` };
   first.sources = [hf, ms]; first.selected_source = hf;
-  await page.route('**/api/v1/hub/official*', route => route.fulfill({ json: catalog }));
-  await page.route('**/api/v1/hub/download-sources/probe', route => route.fulfill({ json: { data: [
+  await page.route('**/api/hub/official*', route => route.fulfill({ json: catalog }));
+  await page.route('**/api/hub/download-sources/probe', route => route.fulfill({ json: { data: [
     { provider: 'huggingface', repo_id: ms.repo_id, bytes_per_second: 100 },
     { provider: 'modelscope', repo_id: ms.repo_id, bytes_per_second: 500 },
   ] } }));
-  await page.route('**/api/v1/hub/models/modelscope/**', route => route.fulfill({ json: {
+  await page.route('**/api/hub/models/modelscope/**', route => route.fulfill({ json: {
     provider: 'modelscope', repo_id: ms.repo_id, revision: 'test', files: [], variants: first.variants,
     downloads: 0, likes: 0, tags: [], architectures: [], modalities: ['text'], gated: false, total_bytes: 1,
   } }));
-  await page.route(/\/api\/v1\/jobs$/, route => route.request().method() === 'POST'
+  await page.route(/\/api\/jobs$/, route => route.request().method() === 'POST'
     ? route.fulfill({ status: 409, json: { error: { code: 'download_already_exists', message: 'already exists', retryable: false, details: {} } } })
     : route.fallback());
   await page.goto('/model-hub');

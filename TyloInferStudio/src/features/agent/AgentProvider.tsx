@@ -13,7 +13,7 @@ const empty: AgentState = { running: false, workspaces: [], sessions: [], models
 
 /** Invoke a workspace RPC from Agent views on services that implement the Agent API. */
 export const agentRpc = <T,>(method: string, args: Record<string, unknown> = {}) =>
-  request<T>('/api/v1/agent/rpc', { method: 'POST', body: JSON.stringify({ method, args }) });
+  request<T>('/api/agent/rpc', { method: 'POST', body: JSON.stringify({ method, args }) });
 
 const unavailableMessage = 'The native server does not provide Agent workspaces. Use text chat instead.';
 interface AgentContextValue {
@@ -35,8 +35,8 @@ const AgentContext = createContext<AgentContextValue | null>(null);
 
 /** Preserve Agent state across routes and poll only services that support Agent workspaces. */
 export function AgentProvider({ children }: { children: ReactNode }) {
-  const { ready, connectionRevision, instances, runtime } = useRuntime();
-  const available = serverCapabilities(runtime).agent;
+  const { ready, connectionRevision, instances } = useRuntime();
+  const available = serverCapabilities().agent;
   const [state, setState] = useState(empty);
   const [error, setError] = useState('');
   const [startError, setStartError] = useState('');
@@ -53,7 +53,7 @@ export function AgentProvider({ children }: { children: ReactNode }) {
     const key = `${generation.current}:${id}`;
     const existing = workspaceConnections.current.get(key);
     if (existing) return existing;
-    const pending = request<{ sessionId: string }>(`/api/v1/agent/workspaces/${encodeURIComponent(id)}/session`, { method: 'POST' })
+    const pending = request<{ sessionId: string }>(`/api/agent/workspaces/${encodeURIComponent(id)}/session`, { method: 'POST' })
       .finally(() => { if (workspaceConnections.current.get(key) === pending) workspaceConnections.current.delete(key); });
     workspaceConnections.current.set(key, pending);
     return pending;
@@ -62,7 +62,7 @@ export function AgentProvider({ children }: { children: ReactNode }) {
     if (!available) { setError(unavailableMessage); return; }
     const revision = generation.current;
     try {
-      const result = await request<AgentState>('/api/v1/agent/state');
+      const result = await request<AgentState>('/api/agent/state');
       if (generation.current === revision) { setState(result); setError(''); }
     } catch (cause) {
       if (generation.current === revision) setError(cause instanceof Error ? cause.message : String(cause));
@@ -74,7 +74,7 @@ export function AgentProvider({ children }: { children: ReactNode }) {
     const revision = generation.current;
     setStarting(true); setStartError('');
     const operation = (async () => { try {
-      const result = await request<AgentState>('/api/v1/agent/start', { method: 'POST', body: '{}' });
+      const result = await request<AgentState>('/api/agent/start', { method: 'POST', body: '{}' });
       if (generation.current === revision) setState(result);
     } catch (cause) {
       if (generation.current === revision) setStartError(cause instanceof Error ? cause.message : String(cause));

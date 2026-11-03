@@ -10,7 +10,7 @@ for (const language of ['zh-CN', 'en'] as const) {
         writeText: async (value: string) => { document.documentElement.dataset.copiedEndpoint = value; },
       } });
     });
-    await page.route('**/api/v1/runtime/listener', route => route.fulfill({ json: {
+    await page.route('**/api/runtime/listener', route => route.fulfill({ json: {
       host: '127.0.0.1', port: 8090, anthropic_port: port, configurable: true,
     } }));
     await page.goto('/');
@@ -45,7 +45,7 @@ for (const language of ['zh-CN', 'en'] as const) {
     await mockStudioServer(page, { language });
     const writes: unknown[] = [];
     let anthropicPort = 8091;
-    await page.route('**/api/v1/runtime/listener', async route => {
+    await page.route('**/api/runtime/listener', async route => {
       if (route.request().method() === 'PUT') {
         const body = route.request().postDataJSON();
         writes.push(body);

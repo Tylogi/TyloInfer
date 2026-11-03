@@ -9,9 +9,9 @@ for (const language of ['en', 'zh-CN'] as const) {
       created_at: '2026-10-15T00:00:00Z', updated_at: '2026-10-15T00:00:00Z',
       progress_data: { downloaded_bytes: 1024, total_bytes: 8192, bytes_per_second: 1024 } };
     const writes: string[] = [];
-    page.on('request', request => { if (request.method() !== 'GET' && request.url().includes('/api/v1/jobs')) writes.push(request.url()); });
-    await page.route(/\/api\/v1\/jobs(?:\?.*)?$/, route => route.fulfill({ json: { data: [job] } }));
-    await page.route(/\/api\/v1\/jobs\/eta-download\/events\/stream(?:\?.*)?$/, route => route.fulfill({ status: 503, json: {} }));
+    page.on('request', request => { if (request.method() !== 'GET' && request.url().includes('/api/jobs')) writes.push(request.url()); });
+    await page.route(/\/api\/jobs(?:\?.*)?$/, route => route.fulfill({ json: { data: [job] } }));
+    await page.route(/\/api\/jobs\/eta-download\/events\/stream(?:\?.*)?$/, route => route.fulfill({ status: 503, json: {} }));
     await page.goto('/model-hub');
     await page.locator('.download-circle').click();
     const eta = page.getByLabel(language === 'en' ? 'Estimated time remaining' : '预计剩余时间');

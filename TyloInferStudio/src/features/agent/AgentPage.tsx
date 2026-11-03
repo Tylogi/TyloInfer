@@ -23,10 +23,9 @@ function Message({ message }: { message: AgentMessage }) {
 
 /** Explain missing native Agent support without mounting workspace effects or hiding text chat. */
 export function AgentPage() {
-  const { runtime } = useRuntime();
   const { tr } = useSettings();
   const navigate = useNavigate();
-  if (!serverCapabilities(runtime).agent) return <section className="agent-page">
+  if (!serverCapabilities().agent) return <section className="agent-page">
     <header className="agent-page-header"><h1>Agent</h1></header>
     <div className="agent-conversation"><div className="agent-welcome">
       <RobotIcon size={36} />
@@ -76,7 +75,7 @@ function ConnectedAgentPage() {
     const controller = new AbortController();
     void (async () => {
       try {
-        const response = await fetch(apiUrl(`/api/v1/agent/sessions/${encodeURIComponent(sessionId)}/events`), { headers: authorizedHeaders(), signal: controller.signal });
+        const response = await fetch(apiUrl(`/api/agent/sessions/${encodeURIComponent(sessionId)}/events`), { headers: authorizedHeaders(), signal: controller.signal });
         if (!response.ok) throw await errorFromResponse(response);
         const reader = response.body!.pipeThrough(new TextDecoderStream()).getReader();
         let pending = '';
@@ -130,7 +129,7 @@ function ConnectedAgentPage() {
       {journal.messages.map(message => <Message key={message.id} message={message} />)}
       {journal.live && <Message message={journal.live} />}
       {agent.state.approvals.map(item => <div className="agent-approval" key={item.eventId}><strong>{item.request?.toolName}</strong><p>{item.request?.reason}</p><div>
-        {[true, false].map(allow => <button key={String(allow)} type="button" onClick={() => void request('/api/v1/agent/approvals', { method: 'POST', body: JSON.stringify({ event_id: item.eventId, allow }) }).then(agent.refresh).catch(cause => setError(String(cause)))}>{allow ? tr('允许这一次', 'Allow once') : tr('拒绝', 'Deny')}</button>)}
+        {[true, false].map(allow => <button key={String(allow)} type="button" onClick={() => void request('/api/agent/approvals', { method: 'POST', body: JSON.stringify({ event_id: item.eventId, allow }) }).then(agent.refresh).catch(cause => setError(String(cause)))}>{allow ? tr('允许这一次', 'Allow once') : tr('拒绝', 'Deny')}</button>)}
       </div></div>)}
       {agent.state.questions?.map(item => <AgentQuestionCard key={item.eventId} pending={item} onAnswered={agent.refresh} />)}
       {(error || journal.error || agent.error || agent.state.error) && <div className="agent-error" role="alert">{error || journal.error || agent.error || agent.state.error}<button type="button" onClick={() => { void agent.start(); setReconnect(value => value + 1); }}>{tr('重连', 'Reconnect')}</button></div>}

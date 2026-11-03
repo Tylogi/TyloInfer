@@ -271,8 +271,8 @@ std::string submit(Hub& hub, ModelCatalog& catalog, Jobs& jobs, const std::strin
 }
 }
 void register_hub(httplib::Server& http, Hub& hub, ModelCatalog& catalog, Jobs& jobs, const std::string& backend) {
-    http.Get("/api/v1/hub/download-directory", [&](const httplib::Request&, httplib::Response& response) { set_json(response, directory(hub.directory())); });
-    http.Put("/api/v1/hub/download-directory", [&](const httplib::Request& request, httplib::Response& response) {
+    http.Get("/api/hub/download-directory", [&](const httplib::Request&, httplib::Response& response) { set_json(response, directory(hub.directory())); });
+    http.Put("/api/hub/download-directory", [&](const httplib::Request& request, httplib::Response& response) {
         const auto body = parse_json(request); fields(body, {"directory_id", "evict_prefix_cache"});
         if (body.contains("evict_prefix_cache")) {
             if (!body["evict_prefix_cache"].is_boolean()) throw ApiError(400, "invalid_request", "evict_prefix_cache must be boolean");
@@ -282,7 +282,7 @@ void register_hub(httplib::Server& http, Hub& hub, ModelCatalog& catalog, Jobs& 
         const auto id = text(body, "directory_id");
         set_json(response, directory(hub.configure(id.empty() ? std::optional<std::filesystem::path>{} : catalog.browse(ModelCatalog::DirectorySource{id, {}}).path)));
     });
-    http.Get("/api/v1/hub/models", [&](const httplib::Request& request, httplib::Response& response) {
+    http.Get("/api/hub/models", [&](const httplib::Request& request, httplib::Response& response) {
         const auto selected = provider(parameter(request, "provider", "", 32));
         const auto query = parameter(request, "query", {}, 255);
         const auto format = choice(request, "format", "all", {"all", "tq", "gguf", "mlx"});
@@ -315,7 +315,7 @@ void register_hub(httplib::Server& http, Hub& hub, ModelCatalog& catalog, Jobs& 
         if (formats.empty()) formats = format == "all" ? std::vector<std::string>{"tq", "gguf", "mlx"} : std::vector<std::string>{format};
         set_json(response, searched(hub.browse(selected, query, formats, sort, direction, limit, cursor)));
     });
-    http.Get("/api/v1/hub/official", [&](const httplib::Request& request, httplib::Response& response) {
+    http.Get("/api/hub/official", [&](const httplib::Request& request, httplib::Response& response) {
         const auto system = system_profile(backend);
         const auto models = hub.official(flag(request, "refresh", false));
         std::map<std::string, std::vector<const Hub::OfficialModel*>> groups;
@@ -329,7 +329,7 @@ void register_hub(httplib::Server& http, Hub& hub, ModelCatalog& catalog, Jobs& 
         });
         set_json(response, {{"system", system}, {"data", std::move(data)}, {"refreshing", hub.refreshing()}});
     });
-    http.Get(R"(/api/v1/hub/models/([^/]+)/([^/]+)/([^/]+)/readme)", [&](const httplib::Request& request, httplib::Response& response) {
+    http.Get(R"(/api/hub/models/([^/]+)/([^/]+)/([^/]+)/readme)", [&](const httplib::Request& request, httplib::Response& response) {
         const auto revision = parameter(request, "revision", {}, 255);
         std::string content;
         try {
@@ -340,11 +340,11 @@ void register_hub(httplib::Server& http, Hub& hub, ModelCatalog& catalog, Jobs& 
         }
         set_json(response, {{"content", content.empty() ? Json(nullptr) : Json(content)}});
     });
-    http.Get("/api/v1/hub/models/([^/]+)/([^/]+)/([^/]+)", [&](const httplib::Request& request, httplib::Response& response) {
+    http.Get("/api/hub/models/([^/]+)/([^/]+)/([^/]+)", [&](const httplib::Request& request, httplib::Response& response) {
         set_json(response, repository(hub.info({provider(request.matches[1]), request.matches[2].str() + "/" + request.matches[3].str(), request.get_param_value("revision")},
             {request.is_connection_closed, {}})));
     });
-    http.Post("/api/v1/hub/resolve", [&](const httplib::Request& request, httplib::Response& response) {
+    http.Post("/api/hub/resolve", [&](const httplib::Request& request, httplib::Response& response) {
         const auto body = parse_json(request); fields(body, {"reference", "fallback_provider"});
         auto name = text(body, "reference", true), fallback = text(body, "fallback_provider");
         auto selected = provider(fallback.empty() ? "huggingface" : fallback);
@@ -353,7 +353,7 @@ void register_hub(httplib::Server& http, Hub& hub, ModelCatalog& catalog, Jobs& 
         if (std::regex_match(name, match, url)) { selected = match[1] == "huggingface.co" ? Hub::Provider::hf : Hub::Provider::ms; name = match[2]; }
         set_json(response, repository(hub.info({selected, name, {}}, {request.is_connection_closed, {}})));
     });
-    http.Post("/api/v1/hub/download-reuse", [&](const httplib::Request& request, httplib::Response& response) {
+    http.Post("/api/hub/download-reuse", [&](const httplib::Request& request, httplib::Response& response) {
         const auto body = parse_json(request);
         fields(body, {"provider", "repo_id", "revision", "destination", "download_directory"});
         const Hub::Source source{provider(text(body, "provider", true)), text(body, "repo_id", true), text(body, "revision")};
@@ -365,7 +365,7 @@ void register_hub(httplib::Server& http, Hub& hub, ModelCatalog& catalog, Jobs& 
             reusable[name] = bytes;
         set_json(response, {{"reusable_files", std::move(reusable)}});
     });
-    http.Post("/api/v1/hub/download-sources/probe", [&](const httplib::Request& request, httplib::Response& response) {
+    http.Post("/api/hub/download-sources/probe", [&](const httplib::Request& request, httplib::Response& response) {
         const auto body = parse_json(request);
         fields(body, {"sources"});
         if (!body.contains("sources") || !body["sources"].is_array() || body["sources"].empty() || body["sources"].size() > 2)
@@ -390,15 +390,15 @@ void register_hub(httplib::Server& http, Hub& hub, ModelCatalog& catalog, Jobs& 
         }
         set_json(response, {{"data", std::move(data)}});
     });
-    http.Get("/api/v1/jobs/kinds", [](const httplib::Request&, httplib::Response& response) {
+    http.Get("/api/jobs/kinds", [](const httplib::Request&, httplib::Response& response) {
         set_json(response, {{"data", Json::array({{{"kind", "download.huggingface"}}, {{"kind", "download.modelscope"}}})}});
     });
-    http.Post("/api/v1/jobs", [&](const httplib::Request& request, httplib::Response& response) {
+    http.Post("/api/jobs", [&](const httplib::Request& request, httplib::Response& response) {
         const auto body = parse_json(request); fields(body, {"kind", "payload"});
         if (!body.contains("payload")) throw ApiError(400, "invalid_request", "payload is required");
         set_json(response, jobs.get(submit(hub, catalog, jobs, text(body, "kind", true), body.at("payload"))), 202);
     });
-    http.Post("/api/v1/jobs/([0-9a-f-]{36})/retry", [&](const httplib::Request& request, httplib::Response& response) {
+    http.Post("/api/jobs/([0-9a-f-]{36})/retry", [&](const httplib::Request& request, httplib::Response& response) {
         const auto previous = jobs.get(normalize_uuid(request.matches[1]));
         if (!Jobs::terminal(previous) || previous.at("status") == "succeeded") throw ApiError(409, "job_state_conflict", "only failed, cancelled or interrupted downloads can be retried");
         set_json(response, jobs.get(submit(hub, catalog, jobs, previous.at("kind"), previous.at("payload"))), 202);

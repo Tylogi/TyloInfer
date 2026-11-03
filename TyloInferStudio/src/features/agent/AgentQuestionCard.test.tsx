@@ -16,7 +16,7 @@ it('requires an answer and returns the selected labels to the owning DSH request
   fireEvent.click(screen.getByRole('radio', { name: 'Yes' }));
   fireEvent.click(submit);
   await waitFor(() => expect(refresh).toHaveBeenCalledOnce());
-  expect(request).toHaveBeenCalledWith('/api/v1/agent/answers', { method: 'POST', body: JSON.stringify({
+  expect(request).toHaveBeenCalledWith('/api/agent/answers', { method: 'POST', body: JSON.stringify({
     event_id: 'question-1', answers: [{ id: 'choice', selected: ['Yes'], custom: '' }],
   }) });
 });

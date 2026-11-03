@@ -3,7 +3,7 @@ import { mockStudioServer } from './mockServer';
 
 test('browses repositories, selects one quantization and reads model cards without leaving the downloader', async ({ page }, testInfo) => {
   await mockStudioServer(page);
-  await page.route('**/api/v1/jobs/kinds', route => route.fulfill({ json: { data: [{ kind: 'download.huggingface' }] } }));
+  await page.route('**/api/jobs/kinds', route => route.fulfill({ json: { data: [{ kind: 'download.huggingface' }] } }));
   const model = {
     provider: 'huggingface', repo_id: 'community/Qwen3-GGUF', author: 'community', revision: 'main',
     downloads: 12345, likes: 123, total_bytes: 7 * 2 ** 30, tags: ['gguf'], formats: ['gguf'],
@@ -17,14 +17,14 @@ test('browses repositories, selects one quantization and reads model cards witho
       configuration: { status: 'recommended', recommendation: 'three_stars', required_memory_bytes: bits * 2 ** 30, available_memory_bytes: 16 * 2 ** 30, reasons: [] } })),
   };
   const searches: URL[] = [];
-  await page.route('**/api/v1/hub/models?*', route => {
+  await page.route('**/api/hub/models?*', route => {
     searches.push(new URL(route.request().url()));
     return route.fulfill({ json: { data: [model], next_cursor: null } });
   });
-  await page.route('**/api/v1/hub/models/huggingface/community/Qwen3-GGUF', route => route.fulfill({ json: model }));
+  await page.route('**/api/hub/models/huggingface/community/Qwen3-GGUF', route => route.fulfill({ json: model }));
   let cardReads = 0;
   let imageReads = 0;
-  await page.route('**/api/v1/hub/models/huggingface/community/Qwen3-GGUF/readme?*', route => {
+  await page.route('**/api/hub/models/huggingface/community/Qwen3-GGUF/readme?*', route => {
     cardReads += 1;
     return route.fulfill({ json: { content: `# Community model card\n\nDocumentation fetched from the model repository.\n\n![Precision chart](chart.svg)\n\n[Model guide](guide.md)\n\n\`\`\`\n${'wide-model-command '.repeat(80)}\n\`\`\`` } });
   });
@@ -33,7 +33,7 @@ test('browses repositories, selects one quantization and reads model cards witho
     return route.fulfill({ contentType: 'image/svg+xml', headers: { 'Cache-Control': 'no-store' }, body: '<svg xmlns="http://www.w3.org/2000/svg" width="4096" height="2048"><rect width="4096" height="2048" fill="gray"/></svg>' });
   });
   const downloads: Record<string, unknown>[] = [];
-  await page.route(/\/api\/v1\/jobs$/, route => {
+  await page.route(/\/api\/jobs$/, route => {
     if (route.request().method() !== 'POST') return route.fallback();
     downloads.push(route.request().postDataJSON());
     return route.fulfill({ json: { id: 'new-download', kind: 'download.huggingface', status: 'queued', progress: 0, cancel_requested: false, payload: {}, created_at: '', updated_at: '' } });
@@ -86,7 +86,7 @@ test('browses repositories, selects one quantization and reads model cards witho
 
 test('downloads a complete model folder as one task without sibling weights', async ({ page }) => {
   await mockStudioServer(page);
-  await page.route('**/api/v1/jobs/kinds', route => route.fulfill({ json: { data: [{ kind: 'download.huggingface' }] } }));
+  await page.route('**/api/jobs/kinds', route => route.fulfill({ json: { data: [{ kind: 'download.huggingface' }] } }));
   const names = ['4bit/model-00001-of-00002.safetensors', '4bit/model-00002-of-00002.safetensors', '4bit/config.json', '4bit/tokenizer.json'];
   const model = {
     provider: 'huggingface', repo_id: 'community/Qwen-MLX', author: 'community', revision: 'main',
@@ -96,10 +96,10 @@ test('downloads a complete model folder as one task without sibling weights', as
     variants: [{ id: 'hf:4bit', label: '4bit', format: 'hf', files: names.slice(0, 2), byte_size: 2048,
       configuration: { status: 'unknown', recommendation: 'unknown', reasons: [] } }],
   };
-  await page.route('**/api/v1/hub/models?*', route => route.fulfill({ json: { data: [model], next_cursor: null } }));
-  await page.route('**/api/v1/hub/models/huggingface/community/Qwen-MLX', route => route.fulfill({ json: model }));
+  await page.route('**/api/hub/models?*', route => route.fulfill({ json: { data: [model], next_cursor: null } }));
+  await page.route('**/api/hub/models/huggingface/community/Qwen-MLX', route => route.fulfill({ json: model }));
   const downloads: Record<string, unknown>[] = [];
-  await page.route(/\/api\/v1\/jobs$/, route => {
+  await page.route(/\/api\/jobs$/, route => {
     if (route.request().method() !== 'POST') return route.fallback();
     downloads.push(route.request().postDataJSON());
     return route.fulfill({ json: { id: 'folder-download', kind: 'download.huggingface', status: 'queued', progress: 0, cancel_requested: false, payload: {}, created_at: '', updated_at: '' } });

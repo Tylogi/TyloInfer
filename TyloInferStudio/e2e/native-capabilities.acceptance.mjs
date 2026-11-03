@@ -63,8 +63,7 @@ try {
   await page.screenshot({ path: resolve(output, 'model-directory.png') });
   report.checks.push('Model management opens the real native directory browser');
 
-  for (const [path, detail] of [['resources', 'resource monitoring or cache management'],
-    ['analysis', 'architecture or tensor analysis'], ['evaluations', 'datasets, quality evaluations or benchmark jobs']]) {
+  for (const [path, detail] of [['evaluations', 'datasets, quality evaluations or benchmark jobs']]) {
     await page.goto(`${baseURL}/${path}`);
     await page.getByText(new RegExp(detail)).waitFor();
     await page.screenshot({ path: resolve(output, `${path}.png`) });
@@ -79,12 +78,12 @@ try {
   await page.screenshot({ path: resolve(output, 'runtime.png') });
 
   await page.goto(`${baseURL}/model-hub`);
+  await page.getByRole('tab', { name: 'Recommended models', exact: true }).waitFor();
+  await page.getByRole('tab', { name: 'Model browser', exact: true }).click();
   await page.getByRole('textbox', { name: 'Search models' }).waitFor();
-  assert(await page.getByRole('button', { name: 'Search', exact: true }).isDisabled());
-  await page.getByRole('tab', { name: 'Recommended models', exact: true }).click();
-  await page.getByText(/does not provide recommendations/).waitFor();
+  assert(await page.getByRole('button', { name: 'Search', exact: true }).isEnabled());
   await page.waitForTimeout(6500);
-  const unsupported = /\/api\/v1\/(?:runtime\/(?:listener|memory-policy|resources|cache|serving|context-policy|inference-policy)|cluster|datasets|evaluations|hub\/(?:official|models\?|download-reuse)|models\/[^/]+\/(?:analysis|cache-profile|deletion|delete))/;
+  const unsupported = /\/api\/(?:runtime\/(?:listener|memory-policy|cache|serving|context-policy|inference-policy)|cluster|datasets|evaluations)/;
   assert.deepEqual(requests.filter(request => unsupported.test(request.url)), []);
   assert.deepEqual(httpErrors.filter(response => response.url.startsWith(baseURL)), []);
   assert.deepEqual(consoleErrors, []);

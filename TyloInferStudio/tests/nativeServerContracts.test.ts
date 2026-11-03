@@ -48,7 +48,7 @@ it('adapts real native instance fields and leaves missing telemetry unknown', as
   expect(view.capabilities?.model_capabilities).toEqual(profile);
   expect(view.capabilities?.vision_available).toBe(false);
   expect(view.capabilities?.duplex_available).toBe(false);
-  expect(fetchMock.mock.calls.map(([url]) => url)).toEqual(['/api/v1/runtime/instances']);
+  expect(fetchMock.mock.calls.map(([url]) => url)).toEqual(['/api/runtime/instances']);
   expect(projectNativeRuntime([], '').runtime).toEqual({ source: 'native-instances', runtime_state: 'idle' });
 });
 
@@ -124,7 +124,7 @@ it('uses the real job cancellation endpoint and preserves deferred cancellation 
   const fetchMock = vi.fn().mockResolvedValue(json(pending));
   vi.stubGlobal('fetch', fetchMock);
   await expect(jobsApi.cancelJob('job-a')).resolves.toEqual(pending);
-  expect(fetchMock.mock.calls[0][0]).toBe('/api/v1/jobs/job-a/cancel');
+  expect(fetchMock.mock.calls[0][0]).toBe('/api/jobs/job-a/cancel');
   expect(fetchMock.mock.calls[0][1].method).toBe('POST');
 });
 

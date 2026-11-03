@@ -25,7 +25,9 @@ TyloInfer provides TQ inference, CUDA/Metal runtimes, and local serving.
 ## APIs
 
 MFQ provides OpenAI-compatible `/v1/models` and `/v1/chat/completions`,
-Anthropic-compatible `/v1/messages`, and an HTTP control API under `/api/v1`.
+Anthropic-compatible `/v1/messages`, and an HTTP control API under `/api`.
+That root is the native server contract documented in [HTTP API](api/http.md);
+the Python legacy backend keeps the `/api/v1` prefix.
 Token and job updates stream over SSE; audio and realtime sessions use
 WebSocket. Function tools are executed by the client and their results returned
 through the inference API.
