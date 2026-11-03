@@ -1,4 +1,4 @@
-#include "models.h"
+#include "handlers.h"
 #include "http.h"
 #include "instance_json.h"
 #include "models/instances.h"
@@ -83,8 +83,8 @@ std::int64_t policy_context_size(const ModelCatalog::Artifact& artifact, const j
 // POST /api/models/load and POST /api/runtime/profiles/{id}/load end in this same job; each route
 // resolves its own body into the load arguments.
 std::string submit_model_load(Jobs& jobs, ModelInstances& instances, const std::string& artifact_id,
-        const LoadOptions& options, const LoadPolicy& policy, const json& payload) {
-    return jobs.submit("model.load", payload, [&, artifact_id, options, policy](const Jobs::Control& control) {
+    const LoadOptions& options, const LoadPolicy& policy, const json& payload) {
+    return jobs.submit("model.load", payload, [&jobs, &instances, artifact_id, options, policy](const Jobs::Control& control) {
         const auto progress = [&](LoadControl::Phase phase) {
             control.progress(phase == LoadControl::Phase::resolving ? "resolving" :
                 phase == LoadControl::Phase::loading ? "loading" : "initializing");
@@ -99,100 +99,115 @@ std::string submit_model_load(Jobs& jobs, ModelInstances& instances, const std::
     });
 }
 
-void register_models(httplib::Server& http, ModelCatalog& catalog, ModelInstances& instances, Jobs& jobs,
-        RuntimePolicies& policies) {
-    http.Get("/api/models", [&](const httplib::Request& request, httplib::Response& response) {
-        const auto refresh = request.get_param_value("refresh");
-        if (request.has_param("refresh") && refresh != "true" && refresh != "false" && refresh != "1" && refresh != "0")
-            throw ApiError(400, "invalid_request", "refresh must be a boolean");
-        set_json(response, artifacts(catalog.list(refresh == "true" || refresh == "1"), instances));
-    });
-    http.Get("/api/models/directories", [&](const httplib::Request& request, httplib::Response& response) {
-        const auto id = request.get_param_value("directory_id"), path = request.get_param_value("path");
-        if ((request.has_param("directory_id") && id.empty()) || (request.has_param("path") && path.empty()))
-            throw ApiError(400, "invalid_model_directory_source", "directory source cannot be empty");
-        set_json(response, directory_json(catalog.browse({id, std::filesystem::u8path(path)})));
-    });
-    http.Post("/api/models/directories/open", [&](const httplib::Request& request, httplib::Response& response) {
-        const auto body = parse_json(request);
-        fields(body, {"directory_id"});
-        if (!body.contains("directory_id") || !body["directory_id"].is_string())
-            throw ApiError(400, "invalid_request", "directory_id is required");
-        const auto listing = catalog.browse(ModelCatalog::DirectorySource{body["directory_id"].get<std::string>(), {}});
-#if defined(_WIN32)
-        const std::string command = "explorer \"" + listing.path.string() + "\"";
-#elif defined(__APPLE__)
-        const std::string command = "open \"" + listing.path.string() + "\" >/dev/null 2>&1 &";
-#else
-        const std::string command = "xdg-open \"" + listing.path.string() + "\" >/dev/null 2>&1 &";
-#endif
-        if (std::system(command.c_str()) != 0)
-            throw ApiError(500, "file_manager_unavailable", "could not open the model directory");
-        set_json(response, {{"opened", true}});
-    });
-    http.Post("/api/models/directories/register", [&](const httplib::Request& request, httplib::Response& response) {
-        const auto body = parse_json(request);
-        fields(body, {"path", "directory_id"});
-        for (const auto& item : body.items())
-            if (!item.value().is_null() && (!item.value().is_string() || item.value().get_ref<const std::string&>().empty()))
-                throw ApiError(400, "invalid_request", "invalid model directory source");
-        const auto id = body.contains("directory_id") && !body["directory_id"].is_null() ? body["directory_id"].get<std::string>() : "";
-        const auto path = body.contains("path") && !body["path"].is_null() ? body["path"].get<std::string>() : "";
-        set_json(response, artifacts(catalog.register_directory({id, std::filesystem::u8path(path)}), instances));
-    });
-    http.Get("/api/models/([^/]+)/directory", [&](const httplib::Request& request, httplib::Response& response) {
-        set_json(response, directory_json(catalog.model_directory(request.matches[1])));
-    });
-    http.Get("/api/models/([^/]+)/capabilities", [&](const httplib::Request& request, httplib::Response& response) {
-        const auto artifact = catalog.resolve(request.matches[1]);
-        if (artifact.id != request.matches[1]) throw ApiError(400, "invalid_request", "capability lookup requires an artifact ID");
-        const auto support = instances.support(artifact);
-        set_json(response, {{"artifact_id", artifact.id}, {"supported", support.supported},
-            {"reason", support.reason.empty() ? json(nullptr) : json(support.reason)},
-            {"declared_context_capacity", artifact.context_capacity ? json(*artifact.context_capacity) : json(nullptr)},
-            {"load", {{"cancellation", "after_return"}, {"progress", "phase"}}}});
-    });
-    http.Post("/api/models/load", [&](const httplib::Request& request, httplib::Response& response) {
-        const auto body = parse_json(request);
-        fields(body, {"artifact_id", "requirements", "policy"});
-        const auto artifact_id = selector(body, "artifact_id");
-        const auto artifact = catalog.resolve(artifact_id);
-        if (artifact.id != artifact_id) throw ApiError(400, "invalid_request", "loading requires an artifact ID");
-        const auto requirements = body.value("requirements", json::object());
-        fields(requirements, {"context_size"});
-        LoadOptions options;
-        options.context_size = integer(requirements, "context_size", 0, 1, 2147483647);
-        if (!requirements.contains("context_size"))
-            options.context_size = policy_context_size(artifact, policies.context_policy());
-        const auto policy_body = body.value("policy", json::object());
-        fields(policy_body, {"pin", "idle_ttl_seconds"});
-        LoadPolicy policy;
-        if (policy_body.contains("pin")) {
-            if (!policy_body["pin"].is_boolean()) throw ApiError(400, "invalid_request", "pin must be a boolean");
-            policy.pin = policy_body["pin"].get<bool>();
-        }
-        if (policy_body.contains("idle_ttl_seconds"))
-            policy.idle_ttl = std::chrono::seconds(integer(policy_body, "idle_ttl_seconds", 0, 1, 2147483647));
-        if (policy.pin && policy.idle_ttl) throw ApiError(400, "invalid_request", "pinned instances cannot have an idle timeout");
-        policy.mtp_enabled = policies.inference_policy().at("mtp_enabled").get<bool>();
-        const auto operation = submit_model_load(jobs, instances, artifact_id, options, policy, body);
-        response.set_header("Location", "/api/jobs/" + operation);
-        set_json(response, {{"operation_id", operation}, {"status", "accepted"}}, 202);
-    });
-    http.Post("/api/models/unload", [&](const httplib::Request& request, httplib::Response& response) {
-        const auto body = parse_json(request);
-        fields(body, {"instance_id", "force"});
-        const auto id = normalize_uuid(selector(body, "instance_id"));
-        if (body.contains("force") && !body["force"].is_boolean())
-            throw ApiError(400, "invalid_request", "force must be a boolean");
-        const bool force = body.value("force", false);
-        const auto operation = jobs.submit("model.unload", body, [&, id, force](const Jobs::Control& control) {
-            control.checkpoint();
-            instances.unload(id, force);
-            return json{{"instance_id", id}, {"state", "unloaded"}};
-        });
-        response.set_header("Location", "/api/jobs/" + operation);
-        set_json(response, {{"operation_id", operation}, {"status", "accepted"}}, 202);
-    });
+void models_list(const Services& services, const httplib::Request& request, httplib::Response& response) {
+    auto& catalog = services.catalog;
+    auto& instances = services.instances;
+    const auto refresh = request.get_param_value("refresh");
+    if (request.has_param("refresh") && refresh != "true" && refresh != "false" && refresh != "1" && refresh != "0")
+        throw ApiError(400, "invalid_request", "refresh must be a boolean");
+    set_json(response, artifacts(catalog.list(refresh == "true" || refresh == "1"), instances));
 }
+
+void models_browse(const Services& services, const httplib::Request& request, httplib::Response& response) {
+    const auto id = request.get_param_value("directory_id"), path = request.get_param_value("path");
+    if ((request.has_param("directory_id") && id.empty()) || (request.has_param("path") && path.empty()))
+        throw ApiError(400, "invalid_model_directory_source", "directory source cannot be empty");
+    set_json(response, directory_json(services.catalog.browse({id, std::filesystem::u8path(path)})));
+}
+
+void models_open(const Services& services, const httplib::Request& request, httplib::Response& response) {
+    const auto body = parse_json(request);
+    fields(body, {"directory_id"});
+    if (!body.contains("directory_id") || !body["directory_id"].is_string())
+        throw ApiError(400, "invalid_request", "directory_id is required");
+    const auto listing = services.catalog.browse(ModelCatalog::DirectorySource{body["directory_id"].get<std::string>(), {}});
+#if defined(_WIN32)
+    const std::string command = "explorer \"" + listing.path.string() + "\"";
+#elif defined(__APPLE__)
+    const std::string command = "open \"" + listing.path.string() + "\" >/dev/null 2>&1 &";
+#else
+    const std::string command = "xdg-open \"" + listing.path.string() + "\" >/dev/null 2>&1 &";
+#endif
+    if (std::system(command.c_str()) != 0)
+        throw ApiError(500, "file_manager_unavailable", "could not open the model directory");
+    set_json(response, {{"opened", true}});
+}
+
+void models_register(const Services& services, const httplib::Request& request, httplib::Response& response) {
+    auto& catalog = services.catalog;
+    auto& instances = services.instances;
+    const auto body = parse_json(request);
+    fields(body, {"path", "directory_id"});
+    for (const auto& item : body.items())
+        if (!item.value().is_null() && (!item.value().is_string() || item.value().get_ref<const std::string&>().empty()))
+            throw ApiError(400, "invalid_request", "invalid model directory source");
+    const auto id = body.contains("directory_id") && !body["directory_id"].is_null() ? body["directory_id"].get<std::string>() : "";
+    const auto path = body.contains("path") && !body["path"].is_null() ? body["path"].get<std::string>() : "";
+    set_json(response, artifacts(catalog.register_directory({id, std::filesystem::u8path(path)}), instances));
+}
+
+void model_directory(const Services& services, const httplib::Request& request, httplib::Response& response) {
+    set_json(response, directory_json(services.catalog.model_directory(request.matches[1])));
+}
+
+void model_capabilities(const Services& services, const httplib::Request& request, httplib::Response& response) {
+    const auto artifact = services.catalog.resolve(request.matches[1]);
+    if (artifact.id != request.matches[1]) throw ApiError(400, "invalid_request", "capability lookup requires an artifact ID");
+    const auto support = services.instances.support(artifact);
+    set_json(response, {{"artifact_id", artifact.id}, {"supported", support.supported},
+        {"reason", support.reason.empty() ? json(nullptr) : json(support.reason)},
+        {"declared_context_capacity", artifact.context_capacity ? json(*artifact.context_capacity) : json(nullptr)},
+        {"load", {{"cancellation", "after_return"}, {"progress", "phase"}}}});
+}
+
+void models_load(const Services& services, const httplib::Request& request, httplib::Response& response) {
+    auto& catalog = services.catalog;
+    auto& instances = services.instances;
+    auto& jobs = services.jobs;
+    auto& policies = services.policies;
+    const auto body = parse_json(request);
+    fields(body, {"artifact_id", "requirements", "policy"});
+    const auto artifact_id = selector(body, "artifact_id");
+    const auto artifact = catalog.resolve(artifact_id);
+    if (artifact.id != artifact_id) throw ApiError(400, "invalid_request", "loading requires an artifact ID");
+    const auto requirements = body.value("requirements", json::object());
+    fields(requirements, {"context_size"});
+    LoadOptions options;
+    options.context_size = integer(requirements, "context_size", 0, 1, 2147483647);
+    if (!requirements.contains("context_size"))
+        options.context_size = policy_context_size(artifact, policies.context_policy());
+    const auto policy_body = body.value("policy", json::object());
+    fields(policy_body, {"pin", "idle_ttl_seconds"});
+    LoadPolicy policy;
+    if (policy_body.contains("pin")) {
+        if (!policy_body["pin"].is_boolean()) throw ApiError(400, "invalid_request", "pin must be a boolean");
+        policy.pin = policy_body["pin"].get<bool>();
+    }
+    if (policy_body.contains("idle_ttl_seconds"))
+        policy.idle_ttl = std::chrono::seconds(integer(policy_body, "idle_ttl_seconds", 0, 1, 2147483647));
+    if (policy.pin && policy.idle_ttl) throw ApiError(400, "invalid_request", "pinned instances cannot have an idle timeout");
+    policy.mtp_enabled = policies.inference_policy().at("mtp_enabled").get<bool>();
+    const auto operation = submit_model_load(jobs, instances, artifact_id, options, policy, body);
+    response.set_header("Location", "/api/jobs/" + operation);
+    set_json(response, {{"operation_id", operation}, {"status", "accepted"}}, 202);
+}
+
+void models_unload(const Services& services, const httplib::Request& request, httplib::Response& response) {
+    auto& instances = services.instances;
+    auto& jobs = services.jobs;
+    const auto body = parse_json(request);
+    fields(body, {"instance_id", "force"});
+    const auto id = normalize_uuid(selector(body, "instance_id"));
+    if (body.contains("force") && !body["force"].is_boolean())
+        throw ApiError(400, "invalid_request", "force must be a boolean");
+    const bool force = body.value("force", false);
+    const auto operation = jobs.submit("model.unload", body, [&instances, id, force](const Jobs::Control& control) {
+        control.checkpoint();
+        instances.unload(id, force);
+        return json{{"instance_id", id}, {"state", "unloaded"}};
+    });
+    response.set_header("Location", "/api/jobs/" + operation);
+    set_json(response, {{"operation_id", operation}, {"status", "accepted"}}, 202);
+}
+
 }

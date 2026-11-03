@@ -177,8 +177,6 @@ HTTP 层共 4 个工作线程。流式请求（`/v1/chat/completions`、`/v1/mes
 | `GET` | `/api/models/{model_id}/cache-profile` | `?include_recurrent=true\|false` | `200 ModelCacheProfile\|null` | `inference` |
 | `GET` | `/api/models/{model_id}/deletion` | — | `200 DeletionPlan` | `inference` |
 | `POST` | `/api/models/{model_id}/delete` | `{"token":string}` | `200 {"files":int,"total_bytes":int}` | `models` |
-| `GET` | `/api/artifacts/lineage` | `?artifact_uri&limit` | `200 {"data":[Lineage]}` | `jobs` |
-| `POST` | `/api/artifacts/remove` | `RemoveRequest` | `501 workspace_management_unavailable` | `jobs` |
 | `POST` | `/api/models/directories/open` | `{"directory_id":string}` | `200 {"opened":true}` | `models` |
 | `POST` | `/api/models/load` | `LoadRequest` | `202 Accepted` | `models` |
 | `POST` | `/api/models/unload` | `UnloadRequest` | `202 Accepted` | `models` |
@@ -195,11 +193,7 @@ HTTP 层共 4 个工作线程。流式请求（`/v1/chat/completions`、`/v1/mes
 | `GET` | `/api/runtime/listener` | — | `200 Listener` | `inference` |
 | `PUT` | `/api/runtime/listener` | `{"port":int,"protocol":"openai"\|"anthropic"}` | `409 listener_not_managed` | `admin` |
 | `GET` | `/api/runtime/status` | `?instance_id=UUID` | `200 Status` | `inference` |
-| `GET` | `/api/runtime/models` | — | `200 {"data":[{"id":String}]}` | `inference` |
 | `GET` | `/api/runtime/resources` | — | `200 Resources` | `inference` |
-| `GET` | `/api/runtime/serving` | `?scope=session\|alltime&model=` | `200 ServingStatistics` | `inference` |
-| `GET` | `/api/runtime/metrics` | `?instance_id&since&limit` | `200 {"data":[MetricSnapshot]}` | `inference` |
-| `GET` | `/api/runtime/logs` | `?instance_id&level&after&limit` | `200 {"data":[LogEntry]}` | `inference` |
 | `GET` | `/api/runtime/model-aliases` | — | `200 Aliases` | `inference` |
 | `PUT` | `/api/runtime/model-aliases` | `Aliases` | `200 Aliases` | `admin` |
 | `GET` | `/api/runtime/context-policy` | — | `200 ContextPolicy` | `inference` |
@@ -213,7 +207,7 @@ HTTP 层共 4 个工作线程。流式请求（`/v1/chat/completions`、`/v1/mes
 | `POST` | `/api/runtime/cache/purge` | `{"namespace":String\|null}` | `200 Purged` | `admin` |
 | `POST` | `/api/runtime/cache/clear` | `{"instance_id":UUID\|null}` | `200 Cleared` | `models` |
 | `POST` | `/api/runtime/cache/trim` | `{"target_bytes":Int,"instance_id":UUID\|null}` | `200 Trimmed` | `models` |
-| `POST` | `/api/runtime/context` | `ReloadRequest` | `202 Job` | `models` |
+| `POST` | `/api/runtime/context` | `ReloadRequest` | `202 OperationAccepted` | `models` |
 | `POST` | `/api/runtime/reload` | `ReloadRequest` | `200 Reloaded` | `models` |
 | `GET` | `/api/runtime/yarn/{instance_id}` | — | `200 YarnInfo` | `inference` |
 | `GET` | `/api/runtime/qsa-kv/{instance_id}` | `?target_context` | `200 QsaKvInfo` | `inference` |
@@ -499,9 +493,6 @@ HF 目录含 `config.json`、`*.safetensors` 与索引 `weight_map` 引用的分
 `total_prompt_tokens`、`total_completion_tokens`、`last_request`、`live_requests`
 以及内存与前缀缓存计数在原生服务不存在，响应里不出现这些键。
 
-`GET /api/runtime/models` 只列出已加载实例的模型名，同名实例合并为一条；
-不登记产物，也不触发加载。
-
 `GET /api/runtime/resources` 采样服务所在主机：
 
 | 字段 | 原生来源 |
@@ -523,17 +514,10 @@ HF 目录含 `config.json`、`*.safetensors` 与索引 `weight_map` 引用的分
 `qsa_kv_ssd_written_bytes`。计数器不存在、上一次快照缺少该计数器或采样间隔
 超过 10 秒时该速率为 `null`。
 
-`GET /api/runtime/serving` 接受 `scope`（默认 `session`，或 `alltime`）与
-`model` 过滤，其它取值返回 `400 invalid_request`。原生服务不持久化完成请求
-记录，`totals` 恒为零计数与 `null` 速率，`activity` 恒为空数组，`started_at`
-是服务进程启动时刻。
-
-`GET /api/runtime/metrics` 与 `GET /api/runtime/logs` 保留 Python 的查询
-参数：`instance_id` 必须是 UUID，`since` 必须是 ISO 8601 时间，`level` 取
-`debug`\|`info`\|`warning`\|`error`，`after` 不小于 `0`，`limit` 为 `1..2000`
-（默认 `200`），违反者返回 `400 invalid_request`。原生服务没有指标历史与日志
-存储，两者恒返回 `{"data":[]}`；实时指标见 `GET /api/runtime/instances` 与
-`GET /api/runtime/status`。
+`/api/runtime/models`、`/api/runtime/serving`、`/api/runtime/metrics`、
+`/api/runtime/logs`、`/api/artifacts/lineage` 与 `/api/artifacts/remove`
+不在原生服务上提供：模型清单是 `GET /api/runtime/instances` 的投影，
+汇总统计、指标历史与日志存储原生服务没有，产物世系随评估任务再引入。
 
 ### 3.7 运行策略
 

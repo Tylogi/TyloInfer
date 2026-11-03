@@ -1,4 +1,4 @@
-#include "hub.h"
+#include "handlers.h"
 #include "hub/hub.h"
 #include "http.h"
 #include "instance.h"
@@ -248,7 +248,7 @@ Hub::Request download(const std::string& kind, Json& body, const Hub& hub) {
 }
 std::string submit(Hub& hub, ModelCatalog& catalog, Jobs& jobs, const std::string& kind, Json body) {
     const auto request = download(kind, body, hub);
-    return jobs.submit(kind, body, [&, request](const Jobs::Control& control) {
+    return jobs.submit(kind, body, [&hub, &catalog, &jobs, request](const Jobs::Control& control) {
         control.progress("resolving");
         Hub::Result result;
         try {
@@ -269,147 +269,156 @@ std::string submit(Hub& hub, ModelCatalog& catalog, Jobs& jobs, const std::strin
             {"registration", models.empty() ? "unsupported" : "registered"}};
     });
 }
+} // namespace
+
+void hub_directory_get(const Services& services, const httplib::Request&, httplib::Response& response) {
+    set_json(response, directory(services.hub.directory()));
 }
-void register_hub(httplib::Server& http, Hub& hub, ModelCatalog& catalog, Jobs& jobs, const std::string& backend) {
-    http.Get("/api/hub/download-directory", [&](const httplib::Request&, httplib::Response& response) { set_json(response, directory(hub.directory())); });
-    http.Put("/api/hub/download-directory", [&](const httplib::Request& request, httplib::Response& response) {
-        const auto body = parse_json(request); fields(body, {"directory_id", "evict_prefix_cache"});
-        if (body.contains("evict_prefix_cache")) {
-            if (!body["evict_prefix_cache"].is_boolean()) throw ApiError(400, "invalid_request", "evict_prefix_cache must be boolean");
-            if (body["evict_prefix_cache"].get<bool>()) throw ApiError(501, "cache_reclaim_not_supported", "download cache reclamation is not available");
+
+void hub_directory_put(const Services& services, const httplib::Request& request, httplib::Response& response) {
+    auto& hub = services.hub;
+    const auto body = parse_json(request); fields(body, {"directory_id", "evict_prefix_cache"});
+    if (body.contains("evict_prefix_cache")) {
+        if (!body["evict_prefix_cache"].is_boolean()) throw ApiError(400, "invalid_request", "evict_prefix_cache must be boolean");
+        if (body["evict_prefix_cache"].get<bool>()) throw ApiError(501, "cache_reclaim_not_supported", "download cache reclamation is not available");
+    }
+    if (!body.contains("directory_id")) { set_json(response, directory(hub.directory())); return; }
+    const auto id = text(body, "directory_id");
+    set_json(response, directory(hub.configure(id.empty() ? std::optional<std::filesystem::path>{} : services.catalog.browse(ModelCatalog::DirectorySource{id, {}}).path)));
+}
+
+void hub_search(const Services& services, const httplib::Request& request, httplib::Response& response) {
+    auto& hub = services.hub;
+    const auto selected = provider(parameter(request, "provider", "", 32));
+    const auto query = parameter(request, "query", {}, 255);
+    const auto format = choice(request, "format", "all", {"all", "tq", "gguf", "mlx"});
+    const auto sort = choice(request, "sort", "downloads", {"relevance", "downloads", "likes", "updated"});
+    const auto direction = choice(request, "direction", "desc", {"asc", "desc"});
+    const auto limit = quantity(request, "limit", 20, 1, 100);
+    const auto cursor = parameter(request, "cursor", {}, 64);
+    if (!cursor.empty() && (cursor.size() < 16 || !std::regex_match(cursor, std::regex("[A-Za-z0-9_-]+"))))
+        throw ApiError(400, "invalid_request", "cursor is not a search cursor");
+    std::vector<std::string> formats;
+    if (request.has_param("formats")) {
+        std::istringstream list(parameter(request, "formats", "", 64));
+        std::string item;
+        while (std::getline(list, item, ',')) {
+            if (item != "tq" && item != "gguf" && item != "mlx") throw ApiError(400, "invalid_request", "formats must list tq, gguf or mlx");
+            if (std::find(formats.begin(), formats.end(), item) == formats.end()) formats.push_back(item);
         }
-        if (!body.contains("directory_id")) { set_json(response, directory(hub.directory())); return; }
-        const auto id = text(body, "directory_id");
-        set_json(response, directory(hub.configure(id.empty() ? std::optional<std::filesystem::path>{} : catalog.browse(ModelCatalog::DirectorySource{id, {}}).path)));
+        if (formats.empty()) throw ApiError(400, "invalid_request", "formats must list at least one format");
+    }
+    // The browser path is the one Studio uses; the plain search keeps the legacy single-page shape.
+    const bool browse = flag(request, "browse", false) || !formats.empty() || !cursor.empty() || sort == "relevance" || direction == "asc";
+    if (!browse) {
+        auto legacy = hub.search(selected, query, format, sort, direction, limit);
+        legacy.cursor.clear(); // the single-page search has no continuation, unlike the browser
+        set_json(response, searched(legacy));
+        return;
+    }
+    if (selected == Hub::Provider::ms && direction == "asc")
+        throw ApiError(400, "invalid_hub_search", "ModelScope does not support ascending search order.");
+    if (formats.empty()) formats = format == "all" ? std::vector<std::string>{"tq", "gguf", "mlx"} : std::vector<std::string>{format};
+    set_json(response, searched(hub.browse(selected, query, formats, sort, direction, limit, cursor)));
+}
+
+void hub_official(const Services& services, const httplib::Request& request, httplib::Response& response) {
+    auto& hub = services.hub;
+    const auto system = system_profile(services.backend);
+    const auto models = hub.official(flag(request, "refresh", false));
+    std::map<std::string, std::vector<const Hub::OfficialModel*>> groups;
+    for (const auto& model : models)
+        groups[lowercase(model.summary.repo.substr(model.summary.repo.find('/') + 1))].push_back(&model);
+    auto data = Json::array();
+    for (const auto& [name, group] : groups) data.push_back(official_model(group, system));
+    std::sort(data.begin(), data.end(), [](const auto& left, const auto& right) {
+        const auto older = [](const Json& model) { return model["updated_at"].is_string() ? model["updated_at"].get<std::string>() : std::string(); };
+        return older(left) > older(right);
     });
-    http.Get("/api/hub/models", [&](const httplib::Request& request, httplib::Response& response) {
-        const auto selected = provider(parameter(request, "provider", "", 32));
-        const auto query = parameter(request, "query", {}, 255);
-        const auto format = choice(request, "format", "all", {"all", "tq", "gguf", "mlx"});
-        const auto sort = choice(request, "sort", "downloads", {"relevance", "downloads", "likes", "updated"});
-        const auto direction = choice(request, "direction", "desc", {"asc", "desc"});
-        const auto limit = quantity(request, "limit", 20, 1, 100);
-        const auto cursor = parameter(request, "cursor", {}, 64);
-        if (!cursor.empty() && (cursor.size() < 16 || !std::regex_match(cursor, std::regex("[A-Za-z0-9_-]+"))))
-            throw ApiError(400, "invalid_request", "cursor is not a search cursor");
-        std::vector<std::string> formats;
-        if (request.has_param("formats")) {
-            std::istringstream list(parameter(request, "formats", "", 64));
-            std::string item;
-            while (std::getline(list, item, ',')) {
-                if (item != "tq" && item != "gguf" && item != "mlx") throw ApiError(400, "invalid_request", "formats must list tq, gguf or mlx");
-                if (std::find(formats.begin(), formats.end(), item) == formats.end()) formats.push_back(item);
+    set_json(response, {{"system", system}, {"data", std::move(data)}, {"refreshing", hub.refreshing()}});
+}
+
+void hub_readme(const Services& services, const httplib::Request& request, httplib::Response& response) {
+    const auto revision = parameter(request, "revision", {}, 255);
+    std::string content;
+    try {
+        content = services.hub.readme(provider(request.matches[1]), request.matches[2].str() + "/" + request.matches[3].str(), revision);
+    } catch (const Hub::Error& error) {
+        if (error.kind != Hub::Error::invalid) throw ApiError(502, "model_card_unavailable", "Could not retrieve the model card.");
+        throw;
+    }
+    set_json(response, {{"content", content.empty() ? Json(nullptr) : Json(content)}});
+}
+
+void hub_repository(const Services& services, const httplib::Request& request, httplib::Response& response) {
+    set_json(response, repository(services.hub.info({provider(request.matches[1]), request.matches[2].str() + "/" + request.matches[3].str(), request.get_param_value("revision")},
+        {request.is_connection_closed, {}})));
+}
+
+void hub_resolve(const Services& services, const httplib::Request& request, httplib::Response& response) {
+    const auto body = parse_json(request); fields(body, {"reference", "fallback_provider"});
+    auto name = text(body, "reference", true), fallback = text(body, "fallback_provider");
+    auto selected = provider(fallback.empty() ? "huggingface" : fallback);
+    static const std::regex url(R"(https://(huggingface\.co|modelscope\.cn)/(?:models/)?([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/?)");
+    std::smatch match;
+    if (std::regex_match(name, match, url)) { selected = match[1] == "huggingface.co" ? Hub::Provider::hf : Hub::Provider::ms; name = match[2]; }
+    set_json(response, repository(services.hub.info({selected, name, {}}, {request.is_connection_closed, {}})));
+}
+
+void hub_reuse(const Services& services, const httplib::Request& request, httplib::Response& response) {
+    const auto body = parse_json(request);
+    fields(body, {"provider", "repo_id", "revision", "destination", "download_directory"});
+    const Hub::Source source{provider(text(body, "provider", true)), text(body, "repo_id", true), text(body, "revision")};
+    const auto destination = text(body, "destination", true);
+    const auto selected = text(body, "download_directory");
+    Json reusable = Json::object();
+    for (const auto& [name, bytes] : services.hub.reusable(source, destination,
+            selected.empty() ? std::optional<std::filesystem::path>{} : std::filesystem::u8path(selected)))
+        reusable[name] = bytes;
+    set_json(response, {{"reusable_files", std::move(reusable)}});
+}
+
+void hub_probe(const Services& services, const httplib::Request& request, httplib::Response& response) {
+    auto& hub = services.hub;
+    const auto body = parse_json(request);
+    fields(body, {"sources"});
+    if (!body.contains("sources") || !body["sources"].is_array() || body["sources"].empty() || body["sources"].size() > 2)
+        throw ApiError(400, "invalid_request", "sources must contain one or two entries");
+    auto data = Json::array();
+    for (const auto& item : body["sources"]) {
+        if (!item.is_object()) throw ApiError(400, "invalid_request", "sources must be objects");
+        fields(item, {"provider", "repo_id", "revision"});
+        const Hub::Source source{provider(text(item, "provider", true)), text(item, "repo_id", true), text(item, "revision")};
+        Json entry{{"provider", provider(source.provider)}, {"repo_id", source.repo}, {"bytes_per_second", 0.0}};
+        try {
+            const auto repo = hub.info(source);
+            for (const auto& file : repo.files) {
+                if (file.size < 262144 || !weight_file(file.name)) continue;
+                const auto route = hub.probe(source.provider, repo.source, file.name);
+                entry["bytes_per_second"] = route.bytes_per_second;
+                entry["route"] = route.proxy ? "proxy" : "direct";
+                break;
             }
-            if (formats.empty()) throw ApiError(400, "invalid_request", "formats must list at least one format");
-        }
-        // The browser path is the one Studio uses; the plain search keeps the legacy single-page shape.
-        const bool browse = flag(request, "browse", false) || !formats.empty() || !cursor.empty() || sort == "relevance" || direction == "asc";
-        if (!browse) {
-            auto legacy = hub.search(selected, query, format, sort, direction, limit);
-            legacy.cursor.clear(); // the single-page search has no continuation, unlike the browser
-            set_json(response, searched(legacy));
-            return;
-        }
-        if (selected == Hub::Provider::ms && direction == "asc")
-            throw ApiError(400, "invalid_hub_search", "ModelScope does not support ascending search order.");
-        if (formats.empty()) formats = format == "all" ? std::vector<std::string>{"tq", "gguf", "mlx"} : std::vector<std::string>{format};
-        set_json(response, searched(hub.browse(selected, query, formats, sort, direction, limit, cursor)));
-    });
-    http.Get("/api/hub/official", [&](const httplib::Request& request, httplib::Response& response) {
-        const auto system = system_profile(backend);
-        const auto models = hub.official(flag(request, "refresh", false));
-        std::map<std::string, std::vector<const Hub::OfficialModel*>> groups;
-        for (const auto& model : models)
-            groups[lowercase(model.summary.repo.substr(model.summary.repo.find('/') + 1))].push_back(&model);
-        auto data = Json::array();
-        for (const auto& [name, group] : groups) data.push_back(official_model(group, system));
-        std::sort(data.begin(), data.end(), [](const auto& left, const auto& right) {
-            const auto older = [](const Json& model) { return model["updated_at"].is_string() ? model["updated_at"].get<std::string>() : std::string(); };
-            return older(left) > older(right);
-        });
-        set_json(response, {{"system", system}, {"data", std::move(data)}, {"refreshing", hub.refreshing()}});
-    });
-    http.Get(R"(/api/hub/models/([^/]+)/([^/]+)/([^/]+)/readme)", [&](const httplib::Request& request, httplib::Response& response) {
-        const auto revision = parameter(request, "revision", {}, 255);
-        std::string content;
-        try {
-            content = hub.readme(provider(request.matches[1]), request.matches[2].str() + "/" + request.matches[3].str(), revision);
-        } catch (const Hub::Error& error) {
-            if (error.kind != Hub::Error::invalid) throw ApiError(502, "model_card_unavailable", "Could not retrieve the model card.");
-            throw;
-        }
-        set_json(response, {{"content", content.empty() ? Json(nullptr) : Json(content)}});
-    });
-    http.Get("/api/hub/models/([^/]+)/([^/]+)/([^/]+)/readme", [&](const httplib::Request& request, httplib::Response& response) {
-        try {
-            set_json(response, {{"content", hub.readme(provider(request.matches[1]),
-                request.matches[2].str() + "/" + request.matches[3].str(), request.get_param_value("revision"))}});
-        } catch (const std::exception&) {
-            throw ApiError(502, "model_card_unavailable", "Could not retrieve the model card.");
-        }
-    });
-    http.Get("/api/hub/models/([^/]+)/([^/]+)/([^/]+)", [&](const httplib::Request& request, httplib::Response& response) {
-        set_json(response, repository(hub.info({provider(request.matches[1]), request.matches[2].str() + "/" + request.matches[3].str(), request.get_param_value("revision")},
-            {request.is_connection_closed, {}})));
-    });
-    http.Post("/api/hub/resolve", [&](const httplib::Request& request, httplib::Response& response) {
-        const auto body = parse_json(request); fields(body, {"reference", "fallback_provider"});
-        auto name = text(body, "reference", true), fallback = text(body, "fallback_provider");
-        auto selected = provider(fallback.empty() ? "huggingface" : fallback);
-        static const std::regex url(R"(https://(huggingface\.co|modelscope\.cn)/(?:models/)?([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/?)");
-        std::smatch match;
-        if (std::regex_match(name, match, url)) { selected = match[1] == "huggingface.co" ? Hub::Provider::hf : Hub::Provider::ms; name = match[2]; }
-        set_json(response, repository(hub.info({selected, name, {}}, {request.is_connection_closed, {}})));
-    });
-    http.Post("/api/hub/download-reuse", [&](const httplib::Request& request, httplib::Response& response) {
-        const auto body = parse_json(request);
-        fields(body, {"provider", "repo_id", "revision", "destination", "download_directory"});
-        const Hub::Source source{provider(text(body, "provider", true)), text(body, "repo_id", true), text(body, "revision")};
-        const auto destination = text(body, "destination", true);
-        const auto selected = text(body, "download_directory");
-        Json reusable = Json::object();
-        for (const auto& [name, bytes] : hub.reusable(source, destination,
-                selected.empty() ? std::optional<std::filesystem::path>{} : std::filesystem::u8path(selected)))
-            reusable[name] = bytes;
-        set_json(response, {{"reusable_files", std::move(reusable)}});
-    });
-    http.Post("/api/hub/download-sources/probe", [&](const httplib::Request& request, httplib::Response& response) {
-        const auto body = parse_json(request);
-        fields(body, {"sources"});
-        if (!body.contains("sources") || !body["sources"].is_array() || body["sources"].empty() || body["sources"].size() > 2)
-            throw ApiError(400, "invalid_request", "sources must contain one or two entries");
-        auto data = Json::array();
-        for (const auto& item : body["sources"]) {
-            if (!item.is_object()) throw ApiError(400, "invalid_request", "sources must be objects");
-            fields(item, {"provider", "repo_id", "revision"});
-            const Hub::Source source{provider(text(item, "provider", true)), text(item, "repo_id", true), text(item, "revision")};
-            Json entry{{"provider", provider(source.provider)}, {"repo_id", source.repo}, {"bytes_per_second", 0.0}};
-            try {
-                const auto repo = hub.info(source);
-                for (const auto& file : repo.files) {
-                    if (file.size < 262144 || !weight_file(file.name)) continue;
-                    const auto route = hub.probe(source.provider, repo.source, file.name);
-                    entry["bytes_per_second"] = route.bytes_per_second;
-                    entry["route"] = route.proxy ? "proxy" : "direct";
-                    break;
-                }
-            } catch (const Hub::Error&) {}
-            data.push_back(std::move(entry));
-        }
-        set_json(response, {{"data", std::move(data)}});
-    });
-    http.Get("/api/jobs/kinds", [](const httplib::Request&, httplib::Response& response) {
-        set_json(response, {{"data", Json::array({{{"kind", "download.huggingface"}}, {{"kind", "download.modelscope"}}})}});
-    });
-    http.Post("/api/jobs", [&](const httplib::Request& request, httplib::Response& response) {
-        const auto body = parse_json(request); fields(body, {"kind", "payload"});
-        if (!body.contains("payload")) throw ApiError(400, "invalid_request", "payload is required");
-        set_json(response, jobs.get(submit(hub, catalog, jobs, text(body, "kind", true), body.at("payload"))), 202);
-    });
-    http.Post("/api/jobs/([0-9a-f-]{36})/retry", [&](const httplib::Request& request, httplib::Response& response) {
-        const auto previous = jobs.get(normalize_uuid(request.matches[1]));
-        if (!Jobs::terminal(previous) || previous.at("status") == "succeeded") throw ApiError(409, "job_state_conflict", "only failed, cancelled or interrupted downloads can be retried");
-        set_json(response, jobs.get(submit(hub, catalog, jobs, previous.at("kind"), previous.at("payload"))), 202);
-    });
+        } catch (const Hub::Error&) {}
+        data.push_back(std::move(entry));
+    }
+    set_json(response, {{"data", std::move(data)}});
 }
+
+void jobs_kinds(const Services&, const httplib::Request&, httplib::Response& response) {
+    set_json(response, {{"data", Json::array({{{"kind", "download.huggingface"}}, {{"kind", "download.modelscope"}}})}});
+}
+
+void jobs_submit(const Services& services, const httplib::Request& request, httplib::Response& response) {
+    const auto body = parse_json(request); fields(body, {"kind", "payload"});
+    if (!body.contains("payload")) throw ApiError(400, "invalid_request", "payload is required");
+    set_json(response, services.jobs.get(submit(services.hub, services.catalog, services.jobs, text(body, "kind", true), body.at("payload"))), 202);
+}
+
+void job_retry(const Services& services, const httplib::Request& request, httplib::Response& response) {
+    const auto previous = services.jobs.get(normalize_uuid(request.matches[1]));
+    if (!Jobs::terminal(previous) || previous.at("status") == "succeeded") throw ApiError(409, "job_state_conflict", "only failed, cancelled or interrupted downloads can be retried");
+    set_json(response, services.jobs.get(submit(services.hub, services.catalog, services.jobs, previous.at("kind"), previous.at("payload"))), 202);
+}
+
 }

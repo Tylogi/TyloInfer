@@ -1737,19 +1737,13 @@ void runtime_observation_checks(const fs::path& executable) {
     CHECK(status.at("model_capabilities").at("architecture_family") == "fixture");
     CHECK(get("/api/runtime/status").second.at("instance_id") == id);
     CHECK(get("/api/runtime/status?instance_id=00000000-0000-4000-8000-000000000001").first == 404);
-    const auto models = get("/api/runtime/models").second.at("data");
-    CHECK(models.size() == 1 && models.at(0).at("id") == "served");
     const auto resources = get("/api/runtime/resources").second;
     CHECK(resources.at("weights").size() == 1 && resources.at("weights")[0].at("instance_id") == id &&
         resources.at("weights")[0].at("model") == "served");
     CHECK(resources.at("weights")[0].at("expert_read_bytes_per_second").is_null());
     CHECK(resources.at("gpus").empty() && resources.at("disks").empty());
-    CHECK(get("/api/runtime/serving?scope=alltime").second.at("scope") == "alltime");
-    CHECK(get("/api/runtime/metrics?limit=1").second.at("data").empty());
-    CHECK(get("/api/runtime/logs?level=error").second.at("data").empty());
     CHECK(server.complete(server.post("/api/models/unload", {{"instance_id", id}}))["status"] == "succeeded");
     CHECK(get("/api/runtime/instances/" + id).first == 404);
-    CHECK(get("/api/runtime/models").second.at("data").empty());
     CHECK(get("/api/runtime/status").second.at("runtime_state") == "idle");
     CHECK(get("/api/runtime/resources").second.at("weights").empty());
     server.process->close_input(); CHECK(server.process->wait() == 0);

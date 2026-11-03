@@ -11,7 +11,6 @@ import type {
   HubDownloadReuseRequest,
   HubDownloadReuseResponse,
   OfficialModelList,
-  ArtifactLineage,
 } from '../types';
 import { request } from '../client';
 import type { KvQuantizationSettings } from './runtime';
@@ -208,11 +207,5 @@ export const modelsApi = {
       method: 'POST',
       body: JSON.stringify({ artifact_uri: uri }),
     });
-  },
-
-
-  async artifactLineage(limit = 200): Promise<ArtifactLineage[]> {
-    return (await request<{ data: ArtifactLineage[] }>(`/api/artifacts/lineage?limit=${limit}`))
-      .data;
   },
 };

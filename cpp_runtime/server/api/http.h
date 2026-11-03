@@ -15,6 +15,8 @@
 
 namespace mfq::server {
 inline constexpr std::size_t http_workers = 4;
+// Every API route except a media upload stays under this request body cap.
+inline constexpr std::size_t json_payload_bytes = 1024 * 1024;
 struct StreamSlot {
     std::shared_ptr<std::atomic<std::size_t>> active;
     explicit StreamSlot(std::shared_ptr<std::atomic<std::size_t>> count) : active(std::move(count)) {

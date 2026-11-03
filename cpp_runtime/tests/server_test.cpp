@@ -161,6 +161,7 @@ struct Server {
         return {response->status, response->headers, response->body};
     }
     Response get(const std::string& path, httplib::Headers headers = {}) { return raw("GET", path, std::move(headers)); }
+    Response post(const std::string& path, const json& body, httplib::Headers headers = {}) { return send("POST", path, body, std::move(headers)); }
     Response send(const std::string& method, const std::string& path, const json& body, httplib::Headers headers = {}) {
         headers.emplace("Content-Type", "application/json");
         return raw(method, path, std::move(headers), body.dump());
@@ -365,10 +366,10 @@ void runtime_control() {
     CHECK(server.send("PUT", "/api/runtime/qsa-kv", {{"instance_id", missing}, {"enabled", false},
         {"budget_bytes", 0}}, admin).status == 400);
     CHECK(server.send("PUT", "/api/runtime/qsa-kv", {{"enabled", false}, {"budget_bytes", 1}}, admin).status == 400);
-    const auto context = server.post("/api/runtime/context", {"instance_id", missing}, admin);
+    const auto context = server.post("/api/runtime/context", {{"instance_id", missing}}, admin);
     CHECK(context.status == 202);
     const auto none = wait_job(context.document());
-    CHECK(none.at("status") == "failed" && none.at("error").at("code") == "model_not_loaded");
+    CHECK(none.at("status") == "failed" && none.at("error").at("code") == "runtime_instance_not_found");
     const auto yarn_job = server.post("/api/runtime/context", {{"instance_id", missing}, {"yarn_enabled", true}}, admin);
     const auto refused = wait_job(yarn_job.document());
     CHECK(refused.at("status") == "failed" && refused.at("error").at("code") == "yarn_unsupported");
@@ -803,8 +804,7 @@ void keys_and_network() {
 void runtime_observation() {
     Fixture f;
     auto server = f.start({}, root_environment);
-    for (const auto* path : {"/api/runtime/status", "/api/runtime/metrics", "/api/runtime/logs",
-            "/api/runtime/resources", "/api/runtime/serving", "/api/runtime/models",
+    for (const auto* path : {"/api/runtime/status", "/api/runtime/resources",
             "/api/runtime/instances/00000000-0000-4000-8000-000000000001"})
         CHECK(server.get(path).status == 401);
     const auto idle = server.get("/api/runtime/status", admin).document();
@@ -814,29 +814,6 @@ void runtime_observation() {
     CHECK(server.get("/api/runtime/status?instance_id=00000000-0000-4000-8000-000000000001", admin).status == 404);
     CHECK(server.get("/api/runtime/instances/00000000-0000-4000-8000-000000000001", admin).status == 404);
     CHECK(server.get("/api/runtime/instances/not-a-uuid", admin).status == 400);
-    CHECK(server.get("/api/runtime/models", admin).document() == json({{"data", json::array()}}));
-    CHECK(server.get("/api/runtime/metrics", admin).document() == json({{"data", json::array()}}));
-    CHECK(server.get("/api/runtime/logs", admin).document() == json({{"data", json::array()}}));
-    for (const auto* query : {"?limit=0", "?limit=2001", "?limit=two", "?instance_id=nope"}) {
-        CHECK(server.get(std::string("/api/runtime/metrics") + query, admin).status == 400);
-        CHECK(server.get(std::string("/api/runtime/logs") + query, admin).status == 400);
-    }
-    CHECK(server.get("/api/runtime/metrics?since=yesterday", admin).status == 400);
-    for (const auto* query : {"?after=-1", "?level=trace", "?level="})
-        CHECK(server.get(std::string("/api/runtime/logs") + query, admin).status == 400);
-    CHECK(server.get("/api/runtime/metrics?limit=1&since=2024-01-02T03:04:05.500+00:00", admin).status == 200);
-    CHECK(server.get("/api/runtime/logs?limit=2000&after=0&level=warning", admin).document() ==
-        json({{"data", json::array()}}));
-    const auto serving = server.get("/api/runtime/serving", admin).document();
-    CHECK(serving.at("scope") == "session");
-    CHECK(serving.at("started_at").get<double>() > 0);
-    CHECK(serving.at("activity").empty());
-    CHECK(serving.at("totals") == json({{"completed_requests", 0}, {"prompt_tokens", 0}, {"prefill_tokens", 0},
-        {"completion_tokens", 0}, {"cached_tokens", 0}, {"prefill_tps", nullptr}, {"decode_tps", nullptr},
-        {"ttft_ms", nullptr}, {"cache_hit_rate", nullptr}}));
-    CHECK(server.get("/api/runtime/serving?scope=alltime&model=any", admin).document().at("scope") == "alltime");
-    CHECK(server.get("/api/runtime/serving?scope=week", admin).status == 400);
-    CHECK(server.get("/api/runtime/serving?model=", admin).status == 400);
     const auto resources = server.get("/api/runtime/resources", admin).document();
     CHECK(resources.at("cpu_name").is_null());
     CHECK(resources.at("cpu_cores").get<int>() >= 1);
