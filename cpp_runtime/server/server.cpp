@@ -337,7 +337,7 @@ int run(const Config& config, const std::atomic<bool>& stop_requested, EngineFac
     });
     register_auth(http, auth);
     register_models(http, models, instances, jobs, policies);
-    register_artifacts(http, models, instances, backend);
+    register_artifacts(http, models, instances, storage, backend);
     register_runtime(http, instances);
     register_runtime_config(http, policies, profiles, instances, jobs, config.host, listener_port);
     register_runtime_cache(http, instances, prefix_cache);

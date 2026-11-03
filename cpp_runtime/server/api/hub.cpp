@@ -340,6 +340,14 @@ void register_hub(httplib::Server& http, Hub& hub, ModelCatalog& catalog, Jobs& 
         }
         set_json(response, {{"content", content.empty() ? Json(nullptr) : Json(content)}});
     });
+    http.Get("/api/hub/models/([^/]+)/([^/]+)/([^/]+)/readme", [&](const httplib::Request& request, httplib::Response& response) {
+        try {
+            set_json(response, {{"content", hub.readme(provider(request.matches[1]),
+                request.matches[2].str() + "/" + request.matches[3].str(), request.get_param_value("revision"))}});
+        } catch (const std::exception&) {
+            throw ApiError(502, "model_card_unavailable", "Could not retrieve the model card.");
+        }
+    });
     http.Get("/api/hub/models/([^/]+)/([^/]+)/([^/]+)", [&](const httplib::Request& request, httplib::Response& response) {
         set_json(response, repository(hub.info({provider(request.matches[1]), request.matches[2].str() + "/" + request.matches[3].str(), request.get_param_value("revision")},
             {request.is_connection_closed, {}})));

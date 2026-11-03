@@ -113,6 +113,23 @@ void register_models(httplib::Server& http, ModelCatalog& catalog, ModelInstance
             throw ApiError(400, "invalid_model_directory_source", "directory source cannot be empty");
         set_json(response, directory_json(catalog.browse({id, std::filesystem::u8path(path)})));
     });
+    http.Post("/api/models/directories/open", [&](const httplib::Request& request, httplib::Response& response) {
+        const auto body = parse_json(request);
+        fields(body, {"directory_id"});
+        if (!body.contains("directory_id") || !body["directory_id"].is_string())
+            throw ApiError(400, "invalid_request", "directory_id is required");
+        const auto listing = catalog.browse(ModelCatalog::DirectorySource{body["directory_id"].get<std::string>(), {}});
+#if defined(_WIN32)
+        const std::string command = "explorer \"" + listing.path.string() + "\"";
+#elif defined(__APPLE__)
+        const std::string command = "open \"" + listing.path.string() + "\" >/dev/null 2>&1 &";
+#else
+        const std::string command = "xdg-open \"" + listing.path.string() + "\" >/dev/null 2>&1 &";
+#endif
+        if (std::system(command.c_str()) != 0)
+            throw ApiError(500, "file_manager_unavailable", "could not open the model directory");
+        set_json(response, {{"opened", true}});
+    });
     http.Post("/api/models/directories/register", [&](const httplib::Request& request, httplib::Response& response) {
         const auto body = parse_json(request);
         fields(body, {"path", "directory_id"});
