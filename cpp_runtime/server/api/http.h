@@ -1,5 +1,8 @@
 #pragma once
 
+// Route adapters own the wire shape of their responses; only shaping shared
+// across transports (stdio/http) belongs in components/protocol.
+
 #include "errors.h"
 #include "httplib.h"
 #include <algorithm>

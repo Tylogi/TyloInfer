@@ -1,5 +1,5 @@
 # Protocol parsing and encoding shared by the public server and legacy transports.
-add_library(mfq-protocol STATIC protocol.cpp)
+add_library(mfq-protocol STATIC protocol.cpp protocol_profile.cpp protocol_multimodal.cpp protocol_metrics.cpp)
 target_include_directories(mfq-protocol PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(mfq-protocol PUBLIC mfq-runtime-scheduler mfq-json)
 target_compile_definitions(mfq-protocol PRIVATE NOMINMAX)
