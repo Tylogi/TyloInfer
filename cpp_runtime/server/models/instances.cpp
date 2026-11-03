@@ -239,6 +239,16 @@ void ModelInstances::unload(const std::string& instance_id, bool force) {
     { std::lock_guard guard(mutex_); instances_.erase(instance_id); }
 }
 
+bool ModelInstances::busy_for(const std::string& artifact_id, const std::string& name) const {
+    std::lock_guard guard(mutex_);
+    if (loading_ && loading_->id == artifact_id) return true;
+    for (const auto& [id, instance] : instances_) {
+        if (instance->close_failed_) continue;
+        if (instance->artifact_id == artifact_id || instance->model == name) return true;
+    }
+    return false;
+}
+
 std::vector<InstanceInfo> ModelInstances::list() const {
     std::vector<std::shared_ptr<ModelInstance>> instances;
     { std::lock_guard guard(mutex_); for (const auto& [id, instance] : instances_) instances.push_back(instance); }

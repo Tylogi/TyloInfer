@@ -65,6 +65,8 @@ public:
     InstanceInfo load(const std::string& model, LoadOptions options = {}, const LoadControl& control = {}, LoadPolicy policy = {});
     void unload(const std::string& instance_id, bool force = false);
     std::vector<InstanceInfo> list() const;
+    /** True when a loaded, unloading, or in-flight load selects this artifact or model name. */
+    bool busy_for(const std::string& artifact_id, const std::string& name) const;
     std::shared_ptr<ModelInstance> get(const std::string& model) const;
     std::shared_ptr<ModelInstance> acquire(const std::string& model, const std::function<bool()>& cancelled = {});
     Aliases aliases() const;

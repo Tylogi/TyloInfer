@@ -80,6 +80,25 @@ void write_hf(const fs::path& path) {
     CHECK(stream.good());
 }
 
+/** Writes a Safetensors shard from {name,dtype,shape,bytes} entries with sequential offsets. */
+void write_safetensors(const fs::path& path, const json& entries) {
+    json header = json::object();
+    std::size_t offset = 0;
+    for (const auto& entry : entries) {
+        const auto bytes = entry.at("bytes").get<std::size_t>();
+        header[entry.at("name").get<std::string>()] = {{"dtype", entry.at("dtype")}, {"shape", entry.at("shape")},
+            {"data_offsets", {offset, offset + bytes}}};
+        offset += bytes;
+    }
+    const auto text = header.dump();
+    std::ofstream stream(path, std::ios::binary);
+    write_scalar<std::uint64_t>(stream, text.size());
+    stream << text;
+    const auto payload = std::string(offset, '\0');
+    stream.write(payload.data(), static_cast<std::streamsize>(offset));
+    CHECK(stream.good());
+}
+
 class Database {
 public:
     explicit Database(const fs::path& path) {
@@ -729,6 +748,193 @@ void model_catalog() {
     CHECK(restarted.get("/api/v1/models?refresh=true", admin).document().at("data").size() == 4);
 }
 
+/** Verifies checkpoint analysis and cache profiles match the Python response shape. */
+void model_inspection() {
+    Fixture f;
+    const auto root = f.data / "models";
+    fs::create_directories(root / "alpha");
+    write_file(root / "alpha" / "config.json", R"({"model_type":"qwen3","hidden_size":8,"num_attention_heads":2,
+        "num_key_value_heads":1,"head_dim":4,"num_hidden_layers":2,"max_position_embeddings":128,"intermediate_size":16})");
+    write_safetensors(root / "alpha" / "model.safetensors", json::array({
+        json{{"name", "model.embed_tokens.weight"}, {"dtype", "BF16"}, {"shape", {4, 8}}, {"bytes", 64}},
+        json{{"name", "model.block.0.attention.q_proj.weight"}, {"dtype", "BF16"}, {"shape", {8, 8}}, {"bytes", 128}},
+        json{{"name", "model.block.0.mlp.down_proj.weight"}, {"dtype", "BF16"}, {"shape", {8, 16}}, {"bytes", 256}},
+        json{{"name", "model.block.1.attention.q_proj.weight"}, {"dtype", "BF16"}, {"shape", {8, 8}}, {"bytes", 128}},
+        json{{"name", "model.block.1.mlp.down_proj.weight"}, {"dtype", "BF16"}, {"shape", {8, 16}}, {"bytes", 256}}}));
+    auto server = f.start({}, root_environment);
+    write_mfq(root / "beta.mfq");
+    const auto artifacts = server.get("/api/v1/models?refresh=true", admin).document().at("data");
+    CHECK(artifacts.size() == 2);
+    std::string id, tq_id;
+    for (const auto& item : artifacts) (item.at("name") == "alpha" ? id : tq_id) = item.at("id").get<std::string>();
+    CHECK(!id.empty() && !tq_id.empty());
+    const auto analysis = server.get("/api/v1/models/" + id + "/analysis", admin);
+    CHECK(analysis.status == 200);
+    const auto body = analysis.document();
+    CHECK(body.at("model_id") == id);
+    CHECK(body.at("name") == "alpha");
+    CHECK(body.at("format") == "hf");
+    CHECK(body.at("architecture") == "qwen3");
+    CHECK(body.at("complete") == true);
+    CHECK(body.at("layer_count") == 2);
+    CHECK(body.at("hidden_size") == 8);
+    CHECK(body.at("attention_heads") == 2);
+    CHECK(body.at("kv_heads") == 1);
+    CHECK(body.at("head_dim") == 4);
+    CHECK(body.at("linear_key_heads").is_null());
+    CHECK(body.at("expert_count") == 0);
+    CHECK(body.at("experts_per_token").is_null());
+    CHECK(body.at("parameters") == 416);
+    std::int64_t tensor_bytes = 0;
+    for (const auto& tensor : body.at("tensors")) tensor_bytes += tensor.at("stored_bytes").get<std::int64_t>();
+    CHECK(body.at("stored_bytes") == tensor_bytes);
+    CHECK(body.at("average_bpw") == 8.0 * static_cast<double>(tensor_bytes) / 416.0);
+    CHECK(body.at("tensors").size() == 5);
+    CHECK(body.at("experts").empty());
+    CHECK(body.at("layers").size() == 2);
+    CHECK(body.at("layers")[0].at("attention_type") == "GQA");
+    CHECK(body.at("layers")[0].at("parameters") == 64 + 128);
+    CHECK(body.at("attention_distribution").at("GQA") == json({0, 1}));
+    CHECK(body.at("projections").size() == 3);
+    CHECK(body.at("projections")[0].at("category") == "attention");
+    CHECK(body.at("projections")[0].at("name") == "q_proj");
+    CHECK(body.at("projections")[0].at("tensor_count") == 2);
+    CHECK(body.at("projections")[0].at("formats") == json({"BF16"}));
+    CHECK(body.at("advanced").at("ffn_hidden_size") == 16);
+    CHECK(body.at("advanced").at("max_context") == 128);
+    CHECK(body.at("advanced").at("predictor_layers") == 0);
+    CHECK(body.at("advanced").at("normalizations").empty());
+    CHECK(body.at("graph").at("has_ple") == false);
+    CHECK(body.at("graph").at("has_shared_expert") == false);
+    CHECK(body.at("warnings").empty());
+    const auto profile = body.at("cache_profile");
+    CHECK(profile.at("max_context") == 128);
+    CHECK(profile.at("fixed_bytes") == 0);
+    CHECK(profile.at("fixed_components").empty());
+    CHECK(profile.at("components").size() == 1);
+    CHECK(profile.at("components")[0] == json({{"group", "GQA"}, {"name", "raw_kv"}, {"subgroup", nullptr},
+        {"layers", 2}, {"bytes_per_row", 32}, {"tokens_per_row", 1}, {"allocation", "power_of_two"}, {"minimum_rows", 16},
+        {"row_rounding", "ceil"}, {"active_after", 0}, {"max_read_rows_per_token", nullptr}, {"head_dimension", 4},
+        {"kv_heads", 1}}));
+    CHECK(server.get("/api/v1/models/" + id + "/cache-profile", admin).document() == profile);
+    CHECK(server.get("/api/v1/models/" + id + "/cache-profile?include_recurrent=true", admin).document() == profile);
+    CHECK(server.get("/api/v1/models/" + id + "/cache-profile?include_recurrent=maybe", admin).status == 400);
+    CHECK(server.get("/api/v1/models/invalid/analysis", admin).status == 404);
+    CHECK(server.get("/api/v1/models/00000000000000000000000000000000/analysis", admin).status == 404);
+    CHECK(server.get("/api/v1/models/00000000000000000000000000000000/cache-profile", admin).status == 404);
+    // An unreadable checkpoint stays listed but answers both inspection routes with 422.
+    write_file(root / "broken.mfq", "broken");
+    const auto listed = server.get("/api/v1/models?refresh=true", admin).document().at("data");
+    CHECK(listed.size() == 3);
+    const auto broken_id = listed[2].at("id").get<std::string>();
+    CHECK(listed[2].at("complete") == false);
+    CHECK(server.get("/api/v1/models/" + broken_id + "/analysis", admin).status == 422);
+    CHECK(server.get("/api/v1/models/" + broken_id + "/cache-profile", admin).status == 422);
+    // A container without stored shapes still analyses its tensors from the payload headers.
+    const auto container = server.get("/api/v1/models/" + tq_id + "/analysis", admin).document();
+    CHECK(container.at("format") == "tq");
+    CHECK(container.at("architecture") == "qwen3_5");
+    CHECK(container.at("tensors").size() == 1);
+    CHECK(container.at("tensors")[0].at("shape") == json({1}));
+    CHECK(container.at("tensors")[0].at("category") == "embedding");
+    CHECK(container.at("warnings").empty());
+    CHECK(container.at("layer_count") == 0);
+    CHECK(container.at("cache_profile").is_null());
+    // An architecture without a cache model answers with a null profile instead of an error.
+    write_file(root / "alpha" / "config.json", R"({"model_type":"unsupported_kind"})");
+    const auto unsupported = server.get("/api/v1/models/" + id + "/cache-profile", admin);
+    CHECK(unsupported.status == 200);
+    CHECK(unsupported.document().is_null());
+}
+
+/** Covers deletion planning, token binding, safe path rejection, and what survives a delete. */
+void model_deletion() {
+    Fixture f;
+    const auto root = f.data / "models";
+    const auto alpha = root / "alpha";
+    fs::create_directories(alpha);
+    write_file(alpha / "config.json", R"({"model_type":"qwen3"})");
+    write_safetensors(alpha / "part-0.safetensors", json::array({
+        json{{"name", "model.embed_tokens.weight"}, {"dtype", "BF16"}, {"shape", {4, 8}}, {"bytes", 64}}}));
+    write_safetensors(alpha / "part-1.safetensors", json::array({
+        json{{"name", "model.lm_head.weight"}, {"dtype", "BF16"}, {"shape", {8, 8}}, {"bytes", 128}}}));
+    write_file(alpha / "model.safetensors.index.json",
+        R"({"metadata":{},"weight_map":{"model.embed_tokens.weight":"part-0.safetensors","model.lm_head.weight":"part-1.safetensors"}})");
+    write_file(alpha / "tokenizer.json", "{}");
+    // A weight map that leaves the checkpoint directory must be refused before anything is removed.
+    const auto gamma = root / "gamma";
+    fs::create_directories(gamma);
+    write_file(gamma / "config.json", R"({"model_type":"qwen3"})");
+    write_safetensors(gamma / "part-0.safetensors", json::array({
+        json{{"name", "model.embed_tokens.weight"}, {"dtype", "BF16"}, {"shape", {4, 8}}, {"bytes", 64}}}));
+    write_file(gamma / "model.safetensors.index.json", R"({"weight_map":{"model.embed_tokens.weight":"../escape.safetensors"}})");
+    write_file(root / "beta-00001-of-00002.tq", "first shard");
+    write_file(root / "beta-00002-of-00002.tq", "second shard");
+    write_file(root / "beta.mfq.notes.json", "{}");
+    auto server = f.start({}, root_environment);
+    const auto listed = [&] { return server.get("/api/v1/models?refresh=true", admin).document().at("data"); };
+    CHECK(listed().size() == 3);
+    std::string hf_id, tq_id;
+    for (const auto& item : listed()) {
+        if (item.at("format") == "hf") { if (item.at("name") == "alpha") hf_id = item.at("id").get<std::string>(); }
+        else tq_id = item.at("id").get<std::string>();
+    }
+    CHECK(!hf_id.empty() && !tq_id.empty());
+    const auto plan = server.get("/api/v1/models/" + hf_id + "/deletion", admin);
+    CHECK(plan.status == 200);
+    const auto planned = plan.document();
+    const auto token = planned.at("token").get<std::string>();
+    CHECK(planned.at("model_id") == hf_id);
+    CHECK(planned.at("name") == "alpha");
+    CHECK(token.size() == 64);
+    CHECK(planned.at("files") == json({fs::canonical(alpha / "config.json").u8string(),
+        fs::canonical(alpha / "model.safetensors.index.json").u8string(),
+        fs::canonical(alpha / "part-0.safetensors").u8string(), fs::canonical(alpha / "part-1.safetensors").u8string()}));
+    std::uint64_t total = 0;
+    for (const auto* name : {"config.json", "model.safetensors.index.json", "part-0.safetensors", "part-1.safetensors"})
+        total += fs::file_size(alpha / name);
+    CHECK(planned.at("total_bytes") == total);
+    CHECK(server.get("/api/v1/models/invalid/deletion", admin).status == 404);
+    CHECK(server.get("/api/v1/models/00000000000000000000000000000000/deletion", admin).status == 404);
+    CHECK(server.send("POST", "/api/v1/models/00000000000000000000000000000000/delete", {{"token", token}}, admin).status == 404);
+    for (const auto& body : {json{{"token", "short"}}, json{{"token", std::string(64, 'A')}}, json{{"unexpected", 1}}, json::object()})
+        CHECK(server.send("POST", "/api/v1/models/" + hf_id + "/delete", body, admin).status == 400);
+    CHECK(server.send("POST", "/api/v1/models/" + hf_id + "/delete", {{"token", std::string(64, '0')}}, admin).status == 409);
+    CHECK(fs::exists(alpha / "config.json"));
+    for (const auto* escaped : {"../escape.safetensors", "/tmp/escape.safetensors", "nested/part-0.bin"}) {
+        write_file(gamma / "model.safetensors.index.json",
+            std::string(R"({"weight_map":{"model.embed_tokens.weight":")") + escaped + R"(}})");
+        std::string current;
+        for (const auto& item : listed()) if (item.at("name") == "gamma") current = item.at("id").get<std::string>();
+        CHECK(!current.empty());
+        const auto refused = server.get("/api/v1/models/" + current + "/deletion", admin);
+        CHECK(refused.status == 409);
+        CHECK(refused.document().at("error").at("code") == "model_delete_unsafe");
+        CHECK(server.send("POST", "/api/v1/models/" + current + "/delete", {{"token", token}}, admin).status == 409);
+    }
+    CHECK(fs::exists(gamma / "part-0.safetensors") && fs::exists(alpha / "part-0.safetensors"));
+    const auto deleted = server.send("POST", "/api/v1/models/" + hf_id + "/delete", {{"token", token}}, admin);
+    CHECK(deleted.status == 200);
+    CHECK(deleted.document().at("files") == 4);
+    CHECK(deleted.document().at("total_bytes") == total);
+    CHECK(!fs::exists(alpha / "config.json") && !fs::exists(alpha / "model.safetensors.index.json"));
+    CHECK(!fs::exists(alpha / "part-0.safetensors") && !fs::exists(alpha / "part-1.safetensors"));
+    CHECK(fs::exists(alpha / "tokenizer.json"));
+    CHECK(server.get("/api/v1/models/" + hf_id + "/deletion", admin).status == 404);
+    const auto shards = server.get("/api/v1/models/" + tq_id + "/deletion", admin).document();
+    CHECK(shards.at("files") == json({fs::canonical(root / "beta-00001-of-00002.tq").u8string(),
+        fs::canonical(root / "beta-00002-of-00002.tq").u8string()}));
+    CHECK(shards.at("total_bytes") == 23);
+    const auto removed = server.send("POST", "/api/v1/models/" + tq_id + "/delete",
+        {{"token", shards.at("token").get<std::string>()}}, admin);
+    CHECK(removed.status == 200);
+    CHECK(removed.document().at("files") == 2);
+    CHECK(!fs::exists(root / "beta-00001-of-00002.tq") && !fs::exists(root / "beta-00002-of-00002.tq"));
+    CHECK(fs::exists(root / "beta.mfq.notes.json") && fs::exists(gamma / "part-0.safetensors"));
+    CHECK(listed().size() == 1);
+    CHECK(listed()[0].at("name") == "gamma");
+}
+
 /** Verifies child access failures are isolated while unavailable selections remain explicit errors. */
 void directory_browsing() {
     Fixture f;
@@ -956,7 +1162,8 @@ void databases_and_migration() {
 int run_tests(const fs::path& server, bool models_only) {
     executable = fs::absolute(server);
     using Tests = std::vector<std::pair<const char*, std::function<void()>>>;
-    const Tests tests = models_only ? Tests{{"model catalog", model_catalog}, {"directory browsing", directory_browsing}, {"model roots", model_roots}} : Tests{
+    const Tests tests = models_only ? Tests{{"model catalog", model_catalog}, {"directory browsing", directory_browsing},
+        {"model roots", model_roots}, {"model inspection", model_inspection}, {"model deletion", model_deletion}} : Tests{
         {"CLI and lifetime", cli_and_lifetime}, {"locks and ports", locks_and_ports}, {"static files", static_files},
         {"policy and protocols", policy_and_protocols}, {"keys and network", keys_and_network},
         {"shutdown with pending work", shutdown_with_pending_work}, {"database migrations", databases_and_migration}};

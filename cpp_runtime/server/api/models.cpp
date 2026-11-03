@@ -1,6 +1,8 @@
 #include "models.h"
 #include "http.h"
 #include "protocol.h"
+#include "models/analysis.h"
+#include "models/deletion.h"
 #include "models/instances.h"
 #include "models/errors.h"
 #include "jobs/jobs.h"
@@ -71,9 +73,24 @@ std::int64_t integer(const json& request, const char* field, std::int64_t fallba
         throw ApiError(400, "invalid_request", std::string(field) + " is outside its supported range");
     return value.get<std::int64_t>();
 }
+
+bool boolean_query(const httplib::Request& request, const char* name) {
+    const auto value = request.get_param_value(name);
+    if (request.has_param(name) && value != "true" && value != "false" && value != "1" && value != "0")
+        throw ApiError(400, "invalid_request", std::string(name) + " must be a boolean");
+    return value == "true" || value == "1";
 }
 
-void register_models(httplib::Server& http, ModelCatalog& catalog, ModelInstances& instances, Jobs& jobs) {
+void valid_token(const std::string& token) {
+    if (token.size() != 64 || !std::all_of(token.begin(), token.end(),
+            [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); }))
+        throw ApiError(400, "invalid_request", "token must be a SHA-256 hexadecimal digest");
+}
+} // namespace
+
+void register_models(httplib::Server& http, ModelCatalog& catalog, ModelInstances& instances, Jobs& jobs,
+        const std::string& backend) {
+    const bool cuda = backend == "cuda";
     http.Get("/api/v1/runtime/model-aliases", [&](const httplib::Request&, httplib::Response& response) {
         set_json(response, {{"aliases", instances.aliases()}});
     });
@@ -119,6 +136,29 @@ void register_models(httplib::Server& http, ModelCatalog& catalog, ModelInstance
             {"reason", support.reason.empty() ? json(nullptr) : json(support.reason)},
             {"declared_context_capacity", artifact.context_capacity ? json(*artifact.context_capacity) : json(nullptr)},
             {"load", {{"cancellation", "after_return"}, {"progress", "phase"}}}});
+    });
+    http.Get("/api/v1/models/([^/]+)/analysis", [&](const httplib::Request& request, httplib::Response& response) {
+        set_json(response, checkpoint_analysis_json(catalog.resolve(request.matches[1]), cuda));
+    });
+    http.Get("/api/v1/models/([^/]+)/cache-profile", [&](const httplib::Request& request, httplib::Response& response) {
+        set_json(response, model_cache_profile_json(catalog.resolve(request.matches[1]),
+            boolean_query(request, "include_recurrent"), cuda));
+    });
+    http.Get("/api/v1/models/([^/]+)/deletion", [&](const httplib::Request& request, httplib::Response& response) {
+        set_json(response, deletion_plan_json(model_deletion_plan(catalog.resolve(request.matches[1]))));
+    });
+    http.Post("/api/v1/models/([^/]+)/delete", [&](const httplib::Request& request, httplib::Response& response) {
+        const auto body = parse_json(request);
+        fields(body, {"token"});
+        const auto token = selector(body, "token");
+        valid_token(token);
+        const auto artifact = catalog.resolve(request.matches[1]);
+        if (instances.busy_for(artifact.id, artifact.name))
+            throw ModelError(ModelError::Kind::conflict, "model_delete_busy",
+                "Unload the model and wait for loading to finish before deleting it");
+        const auto result = delete_model_files(artifact, token);
+        catalog.list(true);
+        set_json(response, result);
     });
     http.Post("/api/v1/models/load", [&](const httplib::Request& request, httplib::Response& response) {
         const auto body = parse_json(request);
