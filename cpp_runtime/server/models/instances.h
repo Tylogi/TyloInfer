@@ -72,6 +72,10 @@ public:
     // Applies a PATCH-style policy update to one instance and returns its new representation.
     InstanceInfo update_policy(const std::string& instance_id, std::optional<bool> pin,
         std::optional<std::optional<std::chrono::seconds>> idle_ttl);
+    // Runs a cache/session command on one instance or every loaded instance; returns released units.
+    std::size_t cache_control(const std::optional<std::string>& instance_id, const engine::SessionCommand& command);
+    // True while any target instance has queued or running requests, as the cache purge gate needs.
+    bool busy(const std::optional<std::string>& instance_id) const;
     std::vector<InstanceInfo> list() const;
     /** True when a loaded, unloading, or in-flight load selects this artifact or model name. */
     bool busy_for(const std::string& artifact_id, const std::string& name) const;
@@ -88,6 +92,7 @@ private:
         std::string id;
         std::shared_future<std::shared_ptr<ModelInstance>> result;
     };
+    std::vector<std::shared_ptr<ModelInstance>> targets(const std::optional<std::string>& instance_id);
     std::shared_ptr<ModelInstance> open(const ModelCatalog::Artifact& artifact, LoadOptions options,
         const LoadControl& control, LoadPolicy policy, bool reuse, const std::function<bool()>& cancelled);
     std::shared_ptr<ModelInstance> create(const ModelCatalog::Artifact& artifact, LoadOptions options,

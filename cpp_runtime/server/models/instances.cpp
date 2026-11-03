@@ -267,6 +267,46 @@ InstanceInfo ModelInstances::update_policy(const std::string& instance_id, std::
     return instance->apply_policy(pin, idle_ttl);
 }
 
+std::vector<std::shared_ptr<ModelInstance>> ModelInstances::targets(const std::optional<std::string>& instance_id) {
+    std::vector<std::shared_ptr<ModelInstance>> selected;
+    std::lock_guard guard(mutex_);
+    if (stopping_) throw ModelError(ModelError::Kind::stopping, "server_stopping", "server is stopping");
+    if (instance_id) {
+        const auto found = instances_.find(*instance_id);
+        if (found == instances_.end()) throw ModelError(ModelError::Kind::not_found, "runtime_instance_not_found",
+            "runtime instance was not found: " + *instance_id);
+        selected.push_back(found->second);
+    } else {
+        for (const auto& [id, instance] : instances_) selected.push_back(instance);
+    }
+    return selected;
+}
+
+std::size_t ModelInstances::cache_control(const std::optional<std::string>& instance_id, const engine::SessionCommand& command) {
+    std::size_t released = 0;
+    for (const auto& instance : targets(instance_id)) released += instance->scheduler_.session(command).count;
+    return released;
+}
+
+bool ModelInstances::busy(const std::optional<std::string>& instance_id) const {
+    std::vector<std::shared_ptr<ModelInstance>> selected;
+    {
+        std::lock_guard guard(mutex_);
+        if (instance_id) {
+            const auto found = instances_.find(*instance_id);
+            if (found == instances_.end()) throw ModelError(ModelError::Kind::not_found, "runtime_instance_not_found",
+                "runtime instance was not found: " + *instance_id);
+            selected.push_back(found->second);
+        } else {
+            if (loading_) return true;
+            for (const auto& [id, instance] : instances_) selected.push_back(instance);
+        }
+    }
+    for (const auto& instance : selected)
+        if (instance->scheduler_.snapshot().requests) return true;
+    return false;
+}
+
 bool ModelInstances::busy_for(const std::string& artifact_id, const std::string& name) const {
     std::lock_guard guard(mutex_);
     if (loading_ && loading_->id == artifact_id) return true;
