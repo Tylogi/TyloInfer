@@ -1376,6 +1376,22 @@ json chat_diff_json(const common_chat_msg_diff & diff) {
     return delta;
 }
 
+void apply_tool_call_delta(std::vector<common_chat_tool_call> & calls, const common_chat_msg_diff & diff) {
+    if (calls.size() <= diff.tool_call_index) calls.resize(diff.tool_call_index + 1);
+    auto & call = calls[diff.tool_call_index];
+    if (!diff.tool_call_delta.id.empty()) call.id = diff.tool_call_delta.id;
+    if (!diff.tool_call_delta.name.empty()) call.name = diff.tool_call_delta.name;
+    call.arguments += diff.tool_call_delta.arguments;
+}
+
+std::optional<std::string> identity_fragment(std::string & previous, const std::string & value) {
+    if (value.empty()) return std::string{};
+    if (value.compare(0, previous.size(), previous) != 0) return {};
+    auto fragment = value.substr(previous.size());
+    previous = value;
+    return fragment;
+}
+
 static json chat_tool_calls_json(
         const std::vector<common_chat_tool_call> & tool_calls) {
     json out = json::array();
@@ -2330,13 +2346,8 @@ std::optional<std::vector<common_chat_msg_diff>> CompletionStream::next() {
                     }
                     result.text += diff.content_delta;
                     result.reasoning_text += diff.reasoning_content_delta;
-                    if (diff.tool_call_index == std::string::npos) continue;
-                    if (result.tool_calls.size() <= diff.tool_call_index)
-                        result.tool_calls.resize(diff.tool_call_index + 1);
-                    auto& call = result.tool_calls[diff.tool_call_index];
-                    if (!diff.tool_call_delta.id.empty()) call.id = diff.tool_call_delta.id;
-                    if (!diff.tool_call_delta.name.empty()) call.name = diff.tool_call_delta.name;
-                    call.arguments += diff.tool_call_delta.arguments;
+                    if (diff.tool_call_index != std::string::npos)
+                        apply_tool_call_delta(result.tool_calls, diff);
                 }
                 diffs.insert(diffs.end(), std::make_move_iterator(data.diffs.begin()),
                              std::make_move_iterator(data.diffs.end()));
