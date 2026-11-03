@@ -119,14 +119,12 @@ void register_inference(httplib::Server& http, ModelInstances& models, std::shar
                 const auto& completion = generation->completion;
                 try {
                     std::map<std::size_t, common_chat_tool_call> identities;
-                    /** Convert complete native identities to append-only OpenAI field fragments. */
-                    const auto identity_delta = [](std::string& previous, std::string& value) {
-                        if (value.empty()) return;
-                        if (value.compare(0, previous.size(), previous) != 0)
+                    // Convert complete native identities to append-only OpenAI field fragments.
+                    const auto identity_delta = [](std::string & previous, std::string & value) {
+                        auto fragment = mfq::protocol::identity_fragment(previous, value);
+                        if (!fragment)
                             throw ApiError(502, "invalid_tool_output", "native tool identity changed after it was streamed");
-                        auto complete = value;
-                        value.erase(0, previous.size());
-                        previous = std::move(complete);
+                        value = std::move(*fragment);
                     };
                     if (!sse(sink, chunk(id, created, model, {{"role", "assistant"}}))) return false;
                     while (auto diffs = completion->next()) {

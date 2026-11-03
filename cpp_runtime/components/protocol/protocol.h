@@ -169,6 +169,10 @@ json runtime_generation_result(
     json usage,
     json metrics);
 json chat_diff_json(const common_chat_msg_diff & diff);
+/** Engines emit complete tool-call id/name per delta; only arguments stream incrementally. */
+void apply_tool_call_delta(std::vector<common_chat_tool_call> & calls, const common_chat_msg_diff & diff);
+/** Append-only fragment of a complete identity value; nullopt when the identity changed beyond its prefix. */
+std::optional<std::string> identity_fragment(std::string & previous, const std::string & value);
 MfqMultimodalInput parse_mfq_vision(const json & value);
 std::vector<float> decode_audio_features(
     const std::string & encoded,

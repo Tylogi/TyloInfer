@@ -641,14 +641,8 @@ std::optional<std::vector<common_chat_msg_diff>> Sessions::Reply::next(const std
                     }
                     if (!state_->error.is_null()) continue;
                     state_->output.content += diff.content_delta; state_->output.reasoning_content += diff.reasoning_content_delta;
-                    if (diff.tool_call_index != std::string::npos) {
-                        if (state_->output.tool_calls.size() <= diff.tool_call_index) state_->output.tool_calls.resize(diff.tool_call_index + 1);
-                        auto& call = state_->output.tool_calls[diff.tool_call_index];
-                        // The engine emits complete names and IDs; only arguments are incremental.
-                        if (!diff.tool_call_delta.id.empty()) call.id = diff.tool_call_delta.id;
-                        if (!diff.tool_call_delta.name.empty()) call.name = diff.tool_call_delta.name;
-                        call.arguments += diff.tool_call_delta.arguments;
-                    }
+                    if (diff.tool_call_index != std::string::npos)
+                        mfq::protocol::apply_tool_call_delta(state_->output.tool_calls, diff);
                     diffs.push_back(std::move(diff));
                 }
             } else if constexpr (std::is_same_v<T, engine::Completed> || std::is_same_v<T, engine::Cancelled>) {
