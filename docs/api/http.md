@@ -210,6 +210,11 @@ HTTP 层共 4 个工作线程。流式请求（`/v1/chat/completions`、`/v1/mes
 | `POST` | `/api/runtime/cache/purge` | `{"namespace":String\|null}` | `200 Purged` | `admin` |
 | `POST` | `/api/runtime/cache/clear` | `{"instance_id":UUID\|null}` | `200 Cleared` | `models` |
 | `POST` | `/api/runtime/cache/trim` | `{"target_bytes":Int,"instance_id":UUID\|null}` | `200 Trimmed` | `models` |
+| `POST` | `/api/runtime/context` | `ReloadRequest` | `202 Job` | `models` |
+| `POST` | `/api/runtime/reload` | `ReloadRequest` | `200 Reloaded` | `models` |
+| `GET` | `/api/runtime/yarn/{instance_id}` | — | `200 YarnInfo` | `inference` |
+| `GET` | `/api/runtime/qsa-kv/{instance_id}` | `?target_context` | `200 QsaKvInfo` | `inference` |
+| `PUT` | `/api/runtime/qsa-kv` | `QsaKvRequest` | `202 OperationAccepted` | `models` |
 
 ### 2.3 任务
 
