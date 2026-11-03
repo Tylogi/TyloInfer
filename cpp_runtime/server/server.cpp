@@ -207,10 +207,12 @@ int run(const Config& config, const std::atomic<bool>& stop_requested, EngineFac
     ModelCatalog models(std::move(roots));
     Hub::Network hub_network;
     for (auto [key, value] : {std::pair{"HF_ENDPOINT", &hub_network.hf.url}, {"HF_TOKEN", &hub_network.hf.token},
-            {"MODELSCOPE_ENDPOINT", &hub_network.ms.url}, {"MODELSCOPE_API_TOKEN", &hub_network.ms.token}})
+            {"MODELSCOPE_ENDPOINT", &hub_network.ms.url}, {"MODELSCOPE_TOKEN", &hub_network.ms.token},
+            {"MODELSCOPE_API_TOKEN", &hub_network.ms.token}})
         if (const auto* setting = std::getenv(key); setting && *setting) *value = setting;
     if (const auto* ca = std::getenv("SSL_CERT_FILE"); ca && *ca) hub_network.ca = fs::u8path(ca);
     Hub hub(data_dir, std::move(hub_network));
+    const std::string backend = factory.backend;
     ModelInstances instances(models, storage, std::move(factory));
     Sessions sessions(storage, instances);
     Jobs jobs(storage, [](std::exception_ptr exception) { return describe_failure(exception).detail; });
@@ -309,7 +311,7 @@ int run(const Config& config, const std::atomic<bool>& stop_requested, EngineFac
     register_auth(http, auth);
     register_models(http, models, instances, jobs);
     register_jobs(http, jobs, streams);
-    register_hub(http, hub, models, jobs);
+    register_hub(http, hub, models, jobs, backend);
     register_inference(http, instances, streams);
     register_sessions(http, sessions, streams);
     if (!web_root.empty()) http.Get("/.*", [&](const httplib::Request& request, httplib::Response& response) {

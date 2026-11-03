@@ -99,6 +99,7 @@ Messages 请求拒绝未知字段。
 | `400` | `invalid_request` | 未知字段、类型错误、超界整数、非法筛选值 |
 | `400` | `invalid_model_directory_source`、`invalid_provider`、`invalid_model_alias`、`invalid_download_*`、`invalid_hub_*` | 领域参数非法 |
 | `400` | `job_kind_not_supported`、`repo_type_not_supported`、`unsupported_requirement` | 请求了未支持的类型 |
+| `400` | `search_cursor_expired` | Hub 搜索游标过期或筛选条件变化 |
 | `401` / `403` | `authentication_error`、`authentication_required` | 凭据缺失、无效、撤销或过期 |
 | `404` | `not_found`、`operation_not_found`、`model_artifact_not_found`、`model_directory_not_found`、`session_not_found`、`response_not_found` | 对象不存在或已归档 |
 | `409` | `job_state_conflict`、`model_already_loaded`、`model_operation_busy`、`model_busy`、`model_alias_conflict`、`revision_conflict`、`response_in_progress`、`request_cancelled` | 状态或标识冲突 |
@@ -108,7 +109,7 @@ Messages 请求拒绝未知字段。
 | `429` | `operation_queue_full`、`stream_connections_full` | 后台队列或流式连接已满 |
 | `500` | `response_save_failed`、`model_registration_save_failed`、`model_alias_save_failed`、`operation_failed` | 落盘或执行失败 |
 | `501` | `cache_reclaim_not_supported`、`media_unavailable`、`session_mode_unavailable` | 当前服务不提供该能力 |
-| `502` | `invalid_tool_output`、下载源或校验失败 | 上游/原生输出不可信 |
+| `502` | `invalid_tool_output`、`model_card_unavailable`、下载源或校验失败 | 上游/原生输出不可信 |
 | `503` | `server_stopping`、`model_stopping`、`backend_unavailable`、`resource_exhausted` | 停机中或资源不可用 |
 
 ### 1.4 列表、删除与异步受理
@@ -225,7 +226,12 @@ HTTP 层共 4 个工作线程。流式请求（`/v1/chat/completions`、`/v1/mes
 | 方法 | 路径 | 请求 | 成功 | scope |
 |---|---|---|---|---|
 | `POST` | `/api/v1/hub/resolve` | `{"reference":string,"fallback_provider":"huggingface"\|"modelscope"}` | `200 HubRepo` | `models` |
+| `GET` | `/api/v1/hub/models` | `?provider&query&limit&format&sort&formats&direction&cursor&browse` | `200 HubSearchPage` | `inference` |
+| `GET` | `/api/v1/hub/official` | `?refresh=bool` | `200 OfficialCatalog` | `inference` |
 | `GET` | `/api/v1/hub/models/{provider}/{owner}/{name}` | `?revision=` | `200 HubRepo` | `inference` |
+| `GET` | `/api/v1/hub/models/{provider}/{owner}/{name}/readme` | `?revision=` | `200 {"content":string\|null}` | `inference` |
+| `POST` | `/api/v1/hub/download-reuse` | `{"provider":string,"repo_id":string,"revision"?:string,"destination":string,"download_directory"?:string}` | `200 {"reusable_files":{文件名:字节}}` | `models` |
+| `POST` | `/api/v1/hub/download-sources/probe` | `{"sources":[{"provider":string,"repo_id":string,"revision"?:string}]}` | `200 {"data":[ProbeRoute]}` | `models` |
 | `GET` | `/api/v1/hub/download-directory` | — | `200 DownloadDirectory` | `models` |
 | `PUT` | `/api/v1/hub/download-directory` | `{"directory_id":string\|null,"evict_prefix_cache":bool}` | `200 DownloadDirectory` | `models` |
 
@@ -233,6 +239,39 @@ HTTP 层共 4 个工作线程。流式请求（`/v1/chat/completions`、`/v1/mes
 URL；任意 URL、凭据、查询串和 URL 后缀 revision 一律拒绝。仓库详情列出文件并
 分组可下载权重；估算与热度元数据为 `null`。Hugging Face 固定 commit，
 ModelScope 需要每个文件的 SHA-256。
+
+Hub 搜索：`provider` 必填，`query`（≤255）、`limit`（`1..100`，默认 `20`）、
+`format`（`all\|tq\|gguf\|mlx`）、`sort`（`relevance\|downloads\|likes\|updated`，
+默认 `downloads`）、`direction`（`asc\|desc`）、`formats`（逗号分隔的 `tq`/`gguf`/`mlx`）、
+`cursor` 和 `browse`。带 `browse`、`formats`、`cursor`、`sort=relevance` 或
+`direction=asc` 任一项即进入浏览器路径：按格式分别翻页、合并去重，
+`HubSearchPage` 为 `{"data":[HubSummary],"next_cursor":string\|null}`，
+`next_cursor` 在服务端保存 15 分钟；游标过期或筛选条件变化返回
+`400 search_cursor_expired`。ModelScope 不支持 `direction=asc`，返回
+`400 invalid_hub_search`。单页搜索不返回游标（`next_cursor` 恒 `null`）。
+`HubSummary` 字段：`provider`、`repo_id`、`source_url`、`author`、`description`、
+`downloads`、`likes`、`total_bytes`、`updated_at`、`formats`、`trending_score`；
+Hugging Face 不提供 `total_bytes`，恒为 `0`。
+
+官方目录：`refresh=true` 强制刷新。响应为 `{"system":SystemProfile,"data":[OfficialModel],
+"refreshing":bool}`，刷新在后台线程进行，`refreshing` 为 `true` 时客户端应稍后重试。
+`system` 报告 `platform`、`machine`、`backend`、`cpu_cores`、物理/可用内存和单个
+`ram` 内存池；`cpu_name`、GPU 字段和 `runtime_memory_budget_bytes` 为 `null`。
+官方条目按 `updated_at` 倒序排列，字段集与 Python 侧一致，但驻留权重、参数分解、
+cache profile、attention profile、license 和 `published_at` 一律为 `null`，
+`configuration` 恒为 `unknown`（`available_memory_bytes` 取物理内存）。
+
+模型卡：`readme` 返回 `{"content":string|null}`，仓库没有模型卡时为 `null`；
+上游不可达返回 `502 model_card_unavailable`。
+
+下载复用：`destination` 相对下载目录（`models/` 前缀会被剥离），未指定
+`download_directory` 时使用当前下载目录。响应 `reusable_files` 只列出磁盘上已存在且
+字节数一致的 `.tq`/`.mfq` 文件，键为仓库内文件名，值为字节数。
+
+下载源探测：`sources` 接受 1 到 2 个条目。`ProbeRoute` 为
+`{provider,repo_id,bytes_per_second,route}`，`route` 取 `direct` 或 `proxy`；
+仓库没有 ≥256 KiB 的权重文件时省略 `route` 且 `bytes_per_second` 为 `0`，
+仓库元数据不可用时同样返回 `0` 而不是报错。
 
 下载目录：`directory_id` 来自模型目录浏览器，`null` 重置为工作区模型目录；
 `evict_prefix_cache: true` 返回 `501 cache_reclaim_not_supported`。响应字段：

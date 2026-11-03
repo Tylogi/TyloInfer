@@ -51,13 +51,16 @@ Handle open(const Fetch& fetch, const std::string& path) {
     }
     return handle;
 }
+struct Complete {  // raised by a bounded read once its byte limit has arrived
+};
 struct Transfer {
     const Hub::Control& control;
     const Hub::File* file = nullptr;
     fs::path meta;
-    std::string identity, text, etag, saved_etag, range;
+    std::string identity, text, etag, saved_etag, range, link;
     std::ofstream output;
     std::function<void(std::uint64_t)> report;
+    std::size_t limit = 0;
     std::uint64_t offset = 0, written = 0;
     long status = 0;
     bool restart = false, prepared = false;
@@ -78,7 +81,7 @@ std::size_t header(char* bytes, std::size_t size, std::size_t count, void* data)
         std::string line(bytes, size * count);
         if (line.rfind("HTTP/", 0) == 0) {
             std::istringstream status(line); std::string protocol; status >> protocol >> transfer.status;
-            transfer.etag.clear(); transfer.range.clear(); transfer.prepared = false;
+            transfer.etag.clear(); transfer.range.clear(); transfer.link.clear(); transfer.prepared = false;
         } else if (const auto colon = line.find(':'); colon != std::string::npos) {
             auto name = line.substr(0, colon);
             std::transform(name.begin(), name.end(), name.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
@@ -87,6 +90,7 @@ std::size_t header(char* bytes, std::size_t size, std::size_t count, void* data)
                 if (transfer.etag.size() > 1024) throw Error(Error::integrity, "invalid_download_response", "ETag exceeds its limit");
                 if (transfer.etag.rfind("W/", 0) == 0) transfer.etag.clear();
             } else if (name == "content-range") transfer.range = trim(line.substr(colon + 1));
+            else if (name == "link" && line.size() <= 4096) transfer.link = trim(line.substr(colon + 1));
         }
         if (!transfer.file || line != "\r\n" || (transfer.status != 200 && transfer.status != 206)) return;
         if (transfer.offset && transfer.status == 200) { transfer.restart = true; throw Error(Error::integrity, "range_ignored", "server ignored the resume range"); }
@@ -112,7 +116,9 @@ std::size_t body(char* bytes, std::size_t size, std::size_t count, void* data) n
         if (!transfer.file) {
             if (length > 16 * 1024 * 1024 - transfer.text.size())
                 throw Error(Error::integrity, "hub_response_too_large", "repository metadata exceeds 16 MiB");
-            transfer.text.append(bytes, length); return;
+            transfer.text.append(bytes, length);
+            if (transfer.limit && transfer.text.size() >= transfer.limit) throw Complete{};
+            return;
         }
         if (!transfer.prepared || length > transfer.file->size - transfer.offset - transfer.written)
             throw Error(Error::integrity, "download_size_mismatch", "download exceeds the declared file size");
@@ -149,9 +155,20 @@ std::string escape(const std::string& value, bool slashes) {
     }
     return result;
 }
-std::string get(const Fetch& fetch, const std::string& path, const Hub::Control& control) {
+std::string get(const Fetch& fetch, const std::string& path, const Hub::Control& control, std::string* link) {
     auto handle = open(fetch, path); set(handle.get(), CURLOPT_TIMEOUT_MS, 30000L);
-    Transfer transfer(control); perform(handle.get(), transfer); return std::move(transfer.text);
+    Transfer transfer(control); perform(handle.get(), transfer);
+    if (link) *link = std::move(transfer.link);
+    return std::move(transfer.text);
+}
+std::size_t range(const Fetch& fetch, const std::string& path, std::size_t limit, const Hub::Control& control) {
+    auto handle = open(fetch, path);
+    set(handle.get(), CURLOPT_TIMEOUT_MS, 6000L);
+    set(handle.get(), CURLOPT_RANGE, ("0-" + std::to_string(limit - 1)).c_str());
+    Transfer transfer(control); transfer.limit = limit;
+    // A probe reports the bytes it managed to read; an aborted or failed transfer is not an error.
+    try { perform(handle.get(), transfer); } catch (const Error&) {} catch (const Complete&) {}
+    return transfer.text.size();
 }
 std::string hash(const fs::path& path, const Hub::Control& control) {
     std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> digest(EVP_MD_CTX_new(), EVP_MD_CTX_free);
