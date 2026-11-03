@@ -112,37 +112,7 @@ export async function mockStudioServer(page: Page, options: MockOptions = {}) {
         candidate_groups: { NVQ: ['NVQ3J-L'], NINT: ['NINT4', 'NINT8'] }, official_imatrix_url: null });
     if (path === '/api/runtime/memory-policy') return json({ model_limit_bytes: null, prefix_limit_bytes: null, prefix_directory: null, actual_prefix_directory: '/data/tyloinfer/prefix-cache' });
     if (path === '/api/runtime/model-aliases') return json({ aliases: {} });
-    if (path === '/api/runtime/serving') return json({
-      scope: new URL(route.request().url()).searchParams.get('scope') || 'session',
-      started_at: Date.now() / 1000, activity: [],
-      totals: { completed_requests: 0, prompt_tokens: 0, prefill_tokens: 0,
-        completion_tokens: 0, cached_tokens: 0, prefill_tps: null, decode_tps: null,
-        ttft_ms: null, cache_hit_rate: null },
-    });
-    if (path === '/api/runtime/resources') return json({ sampled_at: 1, interval_seconds: 2,
-      cpu_utilization_percent: null, gpus: [], disks: [], weights: [], memory_bandwidth_bytes_per_second: null,
-      memory_bandwidth_limit_bytes_per_second: null, memory_bandwidth_utilization_percent: null });
-    if (path === '/api/runtime/cache/entries') return json({ directory: '/data/tyloinfer/prefix-cache',
-      total_bytes: 0, total_blocks: 0, can_clear: true, offset: 0, limit: 100, data: [], blocks: [] });
-    if (path === '/api/runtime/context-policy') return json({ max_context_size: null,
-      model_overrides: {}, model_yarn_enabled: {}, model_qsa_kv_offload: {}, model_kv_quantization: {}, fallback_context_size: 32768 });
-    if (path.startsWith('/api/runtime/yarn/')) return json({ supported: false,
-      native_context: 262144, maximum_context: 262144, maximum_factor: 1, enabled: false, effective_factor: 1 });
-    if (/^\/api\/models\/[^/]+\/cache-profile$/.test(path)) return json(null);
-    if (path === '/api/evaluations/tools')
-      return json({ workspace_root: null, api_base: 'http://127.0.0.1:8090/v1',
-        quality_available: false, benchmark_available: false, accuracy_available: false, task_benchmarks: {} });
 
-    if (path === '/api/runtime/capabilities')
-      return json({
-        model,
-        model_type: 'Test',
-        model_capabilities: modelCapabilities,
-        vision_available: false,
-        mtp_available: false,
-        duplex_available: false,
-      });
-    if (path === '/api/runtime/listener') return json({ host: '127.0.0.1', port: 8090, anthropic_port: 8091, configurable: true });
     if (path === '/api/runtime/instances')
       return json({
         data: [
@@ -293,9 +263,6 @@ export async function mockStudioServer(page: Page, options: MockOptions = {}) {
       [
         '/api/models',
         '/api/jobs',
-        '/api/runtime/metrics',
-        '/api/runtime/logs',
-        '/api/jobs/kinds',
         '/api/presets',
         '/api/runtime/profiles',
         '/api/datasets',

@@ -12,11 +12,9 @@ import { studioConfirm } from '../../studio';
 import { toast } from '../../stores/toastStore';
 import { useJobStore } from '../../stores/jobStore';
 import { useLogHistory } from './useLogHistory';
-import { JobDetails, LogDetails, RequestDetails } from './LogDetails';
+import { JobDetails } from './LogDetails';
 import { modelLoadJobName } from './modelSelection';
 import { isNativePhaseLoad, nativeLoadPhase } from '../jobs/jobProgress';
-
-type LogTab = 'events' | 'requests' | 'jobs';
 
 function jobModelName(job: JobResource, artifactNames: Record<string, string> = {}): string | undefined {
   const resolved = job.result?.model;
@@ -24,7 +22,7 @@ function jobModelName(job: JobResource, artifactNames: Record<string, string> = 
     : modelLoadJobName(job, artifactNames) || undefined;
 }
 
-/** Display instance and job history within the current connection scope. */
+/** Display job history within the current connection scope; the event stream keeps it live. */
 export function LogsPage() {
   const { instances, connectionRevision } = useRuntime();
   return <LogConsole key={connectionRevision} instances={instances || []} />;
@@ -34,7 +32,6 @@ function LogConsole({ instances }: { instances: ReturnType<typeof useRuntime>['i
   const { refreshRuntime, refreshError, artifactNames, runtime } = useRuntime();
   const connectionScope = useConnectionScope();
   const { tr } = useSettings();
-  const [tab, setTab] = useState<LogTab>('events');
   const [paused, setPaused] = useState(false);
   const [query, setQuery] = useState('');
   const [source, setSource] = useState('');
@@ -48,13 +45,8 @@ function LogConsole({ instances }: { instances: ReturnType<typeof useRuntime>['i
   const [manualRefreshFailed, setManualRefreshFailed] = useState(false);
   const refreshPending = useRef(false);
   const history = useLogHistory(paused);
-  const error = [history.error, manualError || (manualRefreshFailed ? refreshError : '')].filter(Boolean).join(' · ');
+  const error = [manualError || (manualRefreshFailed ? refreshError : '')].filter(Boolean).join(' · ');
   const sourceNames = new Map(instances.map((item) => [item.id, item.model]));
-  history.requests.forEach((item) => { if (item.instance_id && item.model) sourceNames.set(item.instance_id, item.model); });
-  history.logs.forEach((item) => {
-    if (item.instance_id && typeof item.fields.model === 'string' && item.fields.model && !sourceNames.has(item.instance_id))
-      sourceNames.set(item.instance_id, item.fields.model);
-  });
   history.jobs.forEach((job) => {
     const model = jobModelName(job, artifactNames);
     if (!model) return;
@@ -62,41 +54,29 @@ function LogConsole({ instances }: { instances: ReturnType<typeof useRuntime>['i
       if (typeof id === 'string' && id && !sourceNames.has(id)) sourceNames.set(id, model);
     }
   });
-  [...history.logs.map((item) => item.instance_id),
-    ...history.jobs.flatMap((job) => [job.payload.instance_id, job.result?.instance_id])].forEach((id) => {
+  history.jobs.flatMap((job) => [job.payload.instance_id, job.result?.instance_id]).forEach((id) => {
     if (typeof id === 'string' && id && !sourceNames.has(id)) sourceNames.set(id,
       `${tr('历史实例', 'Past instance')} · ${id.slice(0, 8)}`);
   });
   const search = query.trim().toLocaleLowerCase();
   const cutoff = range ? (paused ? history.updatedAt ?? Date.now() : Date.now()) - Number(range) * 3600000 : 0;
-  const inRange = (time: string | number) => (typeof time === 'number' ? time * 1000 : Date.parse(time)) >= cutoff;
+  const inRange = (time: string) => Date.parse(time) >= cutoff;
   const matches = (value: unknown) => !search || JSON.stringify(value).toLocaleLowerCase().includes(search);
-  const events = history.logs.filter((item) => (!source || item.instance_id === source) && (!filter || item.level === filter)
-    && inRange(item.created_at) && matches([item.message, item.fields, sourceNames.get(item.instance_id || ''), item.instance_id]));
-  const requests = history.requests.filter((item) => (!source || item.instance_id === source) && (!filter || item.request.finish_reason === filter)
-    && inRange(item.request.completed_at ?? item.captured_at) && matches(item));
   const jobs = history.jobs.filter((item) => {
     const targets = [item.payload.instance_id, item.result?.instance_id].filter((id): id is string => typeof id === 'string' && !!id);
     return (!source || (targets.length ? targets.includes(source) : jobModelName(item) === sourceNames.get(source)))
       && (!filter || (filter === 'active' ? !isTerminalJob(item) : item.status === filter)) && inRange(item.updated_at) && matches(item);
   })
     .sort((a, b) => Date.parse(b.updated_at) - Date.parse(a.updated_at));
-  const visible = tab === 'events' ? events : tab === 'requests' ? requests : jobs;
-  const total = tab === 'events' ? history.logs.length : tab === 'requests' ? history.requests.length : history.jobs.length;
   const statusLabel = (status: string) => ({ queued: tr('排队中', 'Queued'), running: tr('运行中', 'Running'), cancelling: tr('取消中', 'Cancelling'),
     succeeded: tr('已完成', 'Completed'), failed: tr('失败', 'Failed'), interrupted: tr('已中断', 'Interrupted'), cancelled: tr('已取消', 'Cancelled') })[status] || status;
   const jobLabel = (kind: string) => ({ 'model.load': tr('加载模型', 'Load model'), 'model.unload': tr('卸载模型', 'Unload model'),
     'hub.download': tr('下载模型', 'Download model'), 'model.download': tr('下载模型', 'Download model'),
     'download.huggingface': tr('下载模型', 'Download model'), 'download.modelscope': tr('下载模型', 'Download model'),
-    'dataset.download': tr('下载官方测评集合', 'Download official test collection'),
-    'evaluate.wikitext2': 'WT2 KLD / Top1', 'evaluate.accuracy': tr('任务测评', 'Task evaluation'),
-    'benchmark.inference': tr('推理测速', 'Inference benchmark'), 'benchmark.kernel': tr('算子测速', 'Kernel benchmark'),
     'runtime.memory.configure': tr('调整内存预算', 'Adjust memory budget'),
     'runtime.context.configure': tr('调整模型上下文', 'Change model context') })[kind] || kind;
-  const time = (value: string | number) => new Date(typeof value === 'number' ? value * 1000 : value)
+  const time = (value: string) => new Date(value)
     .toLocaleString(undefined, { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
-  const metric = (value: number | undefined, suffix = '') => value == null ? '--' : `${formatNumber(value, 1)}${suffix}`;
-  function selectTab(next: LogTab) { setTab(next); setFilter(''); setSelected(''); }
   function toggle(id: string) { setSelected((current) => current === id ? '' : id); }
   async function refresh() {
     if (refreshPending.current) return;
@@ -138,36 +118,26 @@ function LogConsole({ instances }: { instances: ReturnType<typeof useRuntime>['i
   }
   function exportRecords() {
     try {
-      const url = URL.createObjectURL(new Blob([JSON.stringify(visible, null, 2)], { type: 'application/json' }));
+      const url = URL.createObjectURL(new Blob([JSON.stringify(jobs, null, 2)], { type: 'application/json' }));
       const anchor = document.createElement('a');
-      anchor.href = url; anchor.download = `tyloinfer-${tab}-${new Date().toISOString().slice(0, 10)}.json`;
+      anchor.href = url; anchor.download = `tyloinfer-jobs-${new Date().toISOString().slice(0, 10)}.json`;
       anchor.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
     } catch (cause) { toast.error(errorMessage(cause)); }
   }
-  const filterOptions = tab === 'events'
-    ? [['error', tr('错误', 'Error')], ['warning', tr('警告', 'Warning')], ['info', tr('信息', 'Info')], ['debug', tr('调试', 'Debug')]]
-    : tab === 'jobs' ? ['active', 'succeeded', 'failed', 'interrupted', 'cancelled'].map((value) => [value, value === 'active' ? tr('进行中', 'Active') : statusLabel(value)])
-      : [...new Set(history.requests.map((item) => item.request.finish_reason).filter(Boolean))].map((value) => [value!, value!]);
+  const filterOptions = ['active', 'succeeded', 'failed', 'interrupted', 'cancelled']
+    .map((value) => [value, value === 'active' ? tr('进行中', 'Active') : statusLabel(value)]);
   return <section className="dashboard-view logs-view">
-    <ScreenHeader title={tr('日志', 'Logs')} subtitle={tr('查看服务事件、请求性能与任务记录。', 'Inspect service events, request performance, and job records.')}
+    <ScreenHeader title={tr('日志', 'Logs')} subtitle={tr('查看任务事件与记录。', 'Inspect job events and records.')}
       trailing={<>
         <button type="button" aria-pressed={paused} onClick={() => setPaused((current) => !current)} disabled={!history.ready}>
           {paused ? <PlayIcon size={13} /> : <PauseIcon size={13} />}{paused ? tr('继续更新', 'Resume updates') : tr('暂停更新', 'Pause updates')}</button>
-        <button type="button" onClick={() => void refresh()} disabled={refreshBusy || history.loading || !history.ready}><Icon name="refresh" size={13} />{tr('刷新', 'Refresh')}</button>
+        <button type="button" onClick={() => void refresh()} disabled={refreshBusy || !history.ready}><Icon name="refresh" size={13} />{tr('刷新', 'Refresh')}</button>
       </>} />
     <TMPanel className="logs-console">
       <div className="logs-console-heading">
-        <div className="logs-tabs" role="tablist" aria-label={tr('日志类别', 'Log categories')}>
-          {([['events', tr('服务事件', 'Service events'), history.logs.length], ['requests', tr('请求记录', 'Requests'), history.requests.length],
-            ['jobs', tr('任务记录', 'Jobs'), history.jobs.length]] as const).map(([id, label, count]) =>
-            <button key={id} id={`logs-tab-${id}`} role="tab" type="button" aria-selected={tab === id} tabIndex={tab === id ? 0 : -1}
-              aria-controls="logs-records" onClick={() => selectTab(id)} onKeyDown={(event) => {
-                const tabs: LogTab[] = ['events', 'requests', 'jobs'];
-                const next = event.key === 'ArrowRight' ? tabs[(tabs.indexOf(id) + 1) % 3]
-                  : event.key === 'ArrowLeft' ? tabs[(tabs.indexOf(id) + 2) % 3]
-                    : event.key === 'Home' ? tabs[0] : event.key === 'End' ? tabs[2] : null;
-                if (next) { event.preventDefault(); selectTab(next); document.getElementById(`logs-tab-${next}`)?.focus(); }
-              }}>{label}<span>{count}</span></button>)}
+        <div className="logs-tabs" role="tablist" aria-label={tr('任务记录', 'Job records')}>
+          <button id="logs-tab-jobs" role="tab" type="button" aria-selected={true} tabIndex={0} aria-controls="logs-records">
+            {tr('任务记录', 'Job records')}<span>{history.jobs.length}</span></button>
         </div>
         <span className={`logs-live-state${paused || !history.ready || error ? ' paused' : ''}`}><i />
           {!history.ready ? tr('未连接', 'Disconnected') : error ? tr('刷新失败', 'Refresh failed') : paused ? tr('已暂停', 'Paused') : tr('实时更新', 'Live updates')}</span>
@@ -178,42 +148,26 @@ function LogConsole({ instances }: { instances: ReturnType<typeof useRuntime>['i
         <label><span>{tr('来源', 'Source')}</span><select value={source} onChange={(event) => setSource(event.target.value)}>
           <option value="">{tr('全部模型与服务', 'All models and service')}</option>
           {[...sourceNames].map(([id, name]) => <option value={id} key={id}>{name} · {id.slice(0, 8)}</option>)}</select></label>
-        <label><span>{tab === 'events' ? tr('级别', 'Level') : tab === 'jobs' ? tr('状态', 'Status') : tr('停止原因', 'Finish reason')}</span>
+        <label><span>{tr('状态', 'Status')}</span>
           <select value={filter} onChange={(event) => setFilter(event.target.value)}><option value="">{tr('全部', 'All')}</option>
             {filterOptions.map(([id, label]) => <option value={id} key={id}>{label}</option>)}</select></label>
         <label><span>{tr('时间', 'Time')}</span><select value={range} onChange={(event) => setRange(event.target.value)}>
           <option value="1">{tr('最近 1 小时', 'Last hour')}</option><option value="24">{tr('最近 24 小时', 'Last 24 hours')}</option>
           <option value="168">{tr('最近 7 天', 'Last 7 days')}</option><option value="">{tr('全部时间', 'All time')}</option></select></label>
       </div>
-      <div className="logs-list-heading"><span>{tr(`${visible.length} / ${total} 条 · 最新在前`, `${visible.length} / ${total} records · newest first`)}</span>
+      <div className="logs-list-heading"><span>{tr(`${jobs.length} / ${history.jobs.length} 条 · 最新在前`, `${jobs.length} / ${history.jobs.length} records · newest first`)}</span>
         <div>{(query || source || filter || range !== '24') && <button type="button" onClick={() => { setQuery(''); setSource(''); setFilter(''); setRange('24'); }}>
           {tr('重置筛选', 'Reset filters')}</button>}
-          {tab === 'jobs' && <button type="button" className="danger" disabled={cleanupBusy || !history.jobs.some(isTerminalJob)} onClick={() => void cleanup()}>
-            {tr('清理已结束记录', 'Clear finished records')}</button>}
-          <button type="button" disabled={!visible.length} onClick={exportRecords}><Icon name="download" size={13} />{tr('导出', 'Export')}</button></div>
+          <button type="button" className="danger" disabled={cleanupBusy || !history.jobs.some(isTerminalJob)} onClick={() => void cleanup()}>
+            {tr('清理已结束记录', 'Clear finished records')}</button>
+          <button type="button" disabled={!jobs.length} onClick={exportRecords}><Icon name="download" size={13} />{tr('导出', 'Export')}</button></div>
       </div>
-      {error && <p className="logs-error" role="status">{error}{tr(' · 保留上次成功读取的记录', ' · Showing previously retrieved records')}</p>}
-      {runtime?.source === 'native-instances' && <p className="configuration-effect" role="status">{tr('原生服务当前仅提供任务事件，尚无运行日志与请求历史接口。', 'The native server provides job events only. Runtime log and request history endpoints are unavailable.')}</p>}
-      <div id="logs-records" className="logs-records" role="tabpanel" aria-labelledby={`logs-tab-${tab}`}>
-        {visible.length === 0 && <div className="logs-empty"><Icon name="scroll" size={28} /><strong>
-          {history.loading ? tr('正在读取记录…', 'Loading records…') : !history.ready ? tr('服务未连接', 'Service disconnected') : tr('没有匹配的记录', 'No matching records')}</strong>
+      {error && <p className="logs-error" role="status">{error}</p>}
+      <div id="logs-records" className="logs-records" role="tabpanel" aria-labelledby="logs-tab-jobs">
+        {jobs.length === 0 && <div className="logs-empty"><Icon name="scroll" size={28} /><strong>
+          {!history.ready ? tr('服务未连接', 'Service disconnected') : tr('没有匹配的记录', 'No matching records')}</strong>
           <span>{tr('可以调整筛选条件，或等待新的服务活动。', 'Adjust the filters or wait for new service activity.')}</span></div>}
-        {tab === 'events' && events.map((entry) => <div className={`log-record log-event-record ${entry.level}`} key={entry.sequence}>
-          <button type="button" className="log-record-toggle" aria-expanded={selected === String(entry.sequence)} onClick={() => toggle(String(entry.sequence))}>
-            <time>{time(entry.created_at)}</time><span className={`log-level ${entry.level}`}>{entry.level.toUpperCase()}</span>
-            <span className="log-record-copy"><strong>{entry.message}</strong><small>{sourceNames.get(entry.instance_id || '') || tr('服务', 'Service')}
-              {typeof entry.fields.source === 'string' && ` · ${entry.fields.source}`}</small></span><span className="log-record-chevron">›</span></button>
-          {selected === String(entry.sequence) && <LogDetails value={entry} />}
-        </div>)}
-        {tab === 'requests' && requests.map((record) => <div className="log-record log-request-record" key={record.key}>
-          <button type="button" className="log-record-toggle" aria-expanded={selected === record.key} onClick={() => toggle(record.key)}>
-            <time>{time(record.request.completed_at ?? record.captured_at)}</time><span className="log-record-copy"><strong>{record.model || record.request.endpoint || tr('推理请求', 'Inference request')}</strong>
-              <small>{record.request.id}</small></span>
-            <span className="log-request-metric"><b>{metric(record.request.decode_tps, ' tok/s')}</b><small>{metric(record.request.prompt_tokens)} → {metric(record.request.completion_tokens)}</small></span>
-            <span className="log-record-chevron">›</span></button>
-          {selected === record.key && <RequestDetails record={record} />}
-        </div>)}
-        {tab === 'jobs' && jobs.map((job) => <div className="log-record log-job-record" key={job.id}>
+        {jobs.map((job) => <div className="log-record log-job-record" key={job.id}>
           <button type="button" className="log-record-toggle" aria-expanded={selected === job.id} onClick={() => toggle(job.id)}>
             <time>{time(job.updated_at)}</time><span className={`log-job-state ${job.status}`}>{statusLabel(job.status)}</span>
             <span className="log-record-copy"><strong>{jobLabel(job.kind)}</strong><small>{String(jobModelName(job, artifactNames)
@@ -224,7 +178,7 @@ function LogConsole({ instances }: { instances: ReturnType<typeof useRuntime>['i
           {selected === job.id && <JobDetails job={job} onRemove={() => void cleanup(job.id)} busy={cleanupBusy} refreshAt={history.updatedAt} />}
         </div>)}
       </div>
-      <footer className="logs-footer"><span>{tr('每 4 秒刷新 · 服务事件 / 请求快照各保留最近 500 条', 'Refreshes every 4 seconds · latest 500 service events / request snapshots')}</span>
+      <footer className="logs-footer"><span>{tr('任务事件实时流入', 'Job events stream in live')}</span>
         <span>{history.updatedAt ? `${tr('最近读取', 'Last retrieved')} ${new Date(history.updatedAt).toLocaleTimeString()}` : '--'}</span></footer>
     </TMPanel>
   </section>;

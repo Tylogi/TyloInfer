@@ -39,6 +39,12 @@ inline void set_json(httplib::Response& response, const nlohmann::json& body, in
     response.status = status;
     response.set_content(body.dump(), "application/json; charset=utf-8");
 }
+
+// The acceptance envelope every job-submitting route answers with.
+inline void accept(httplib::Response& response, const std::string& operation) {
+    response.set_header("Location", "/api/jobs/" + operation);
+    set_json(response, {{"operation_id", operation}, {"status", "accepted"}}, 202);
+}
 // A query parameter that must be a UUID; an absent parameter yields no value.
 inline std::optional<std::string> query_uuid(const httplib::Request& request, const char* name) {
     if (!request.has_param(name)) return std::nullopt;

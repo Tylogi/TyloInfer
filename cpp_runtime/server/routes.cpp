@@ -71,7 +71,6 @@ const std::vector<Route>& route_table() {
         {"DELETE", "/api/runtime/profiles/([^/]+)", Scope::models, profile_delete},
         {"POST", "/api/runtime/profiles/([^/]+)/load", Scope::models, profile_load},
         {"PATCH", "/api/runtime/instances/([^/]+)", Scope::models, runtime_instance_patch},
-        {"GET", "/api/runtime/listener", Scope::inference, listener_get},
 
         // api/runtime_cache.cpp
         {"GET", "/api/runtime/cache/entries", Scope::admin, cache_entries},
@@ -108,7 +107,6 @@ const std::vector<Route>& route_table() {
         {"POST", "/api/hub/resolve", Scope::models, hub_resolve},
         {"POST", "/api/hub/download-reuse", Scope::models, hub_reuse},
         {"POST", "/api/hub/download-sources/probe", Scope::models, hub_probe},
-        {"GET", "/api/jobs/kinds", Scope::jobs, jobs_kinds},
         {"POST", "/api/jobs", Scope::jobs, jobs_submit},
         {"POST", "/api/jobs/([0-9a-f-]{36})/retry", Scope::jobs, job_retry},
 

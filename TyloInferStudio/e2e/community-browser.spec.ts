@@ -3,7 +3,6 @@ import { mockStudioServer } from './mockServer';
 
 test('browses repositories, selects one quantization and reads model cards without leaving the downloader', async ({ page }, testInfo) => {
   await mockStudioServer(page);
-  await page.route('**/api/jobs/kinds', route => route.fulfill({ json: { data: [{ kind: 'download.huggingface' }] } }));
   const model = {
     provider: 'huggingface', repo_id: 'community/Qwen3-GGUF', author: 'community', revision: 'main',
     downloads: 12345, likes: 123, total_bytes: 7 * 2 ** 30, tags: ['gguf'], formats: ['gguf'],
@@ -86,7 +85,6 @@ test('browses repositories, selects one quantization and reads model cards witho
 
 test('downloads a complete model folder as one task without sibling weights', async ({ page }) => {
   await mockStudioServer(page);
-  await page.route('**/api/jobs/kinds', route => route.fulfill({ json: { data: [{ kind: 'download.huggingface' }] } }));
   const names = ['4bit/model-00001-of-00002.safetensors', '4bit/model-00002-of-00002.safetensors', '4bit/config.json', '4bit/tokenizer.json'];
   const model = {
     provider: 'huggingface', repo_id: 'community/Qwen-MLX', author: 'community', revision: 'main',

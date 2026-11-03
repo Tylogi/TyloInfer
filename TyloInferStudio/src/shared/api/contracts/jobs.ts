@@ -28,6 +28,3 @@ export interface JobEventResource {
   created_at: string;
 }
 
-export interface JobKindResource {
-  kind: string;
-}

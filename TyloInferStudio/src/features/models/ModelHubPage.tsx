@@ -1,6 +1,6 @@
 import { type CSSProperties, useEffect, useRef, useState } from 'react';
 import { jobsApi } from '../../shared/api/resources/jobs';
-import type { JobKindResource, JobResource } from '../../shared/api/types';
+import type { JobResource } from '../../shared/api/types';
 import { useRuntime } from '../../app/RuntimeProvider';
 import { useConnectionScope } from '../../app/useConnectionScope';
 import { errorMessage } from '../../app/formatters';
@@ -28,22 +28,7 @@ export function ModelHubPage() {
   const circle = useRef<HTMLButtonElement>(null);
   const page = useRef<HTMLDivElement>(null);
   const [flight, setFlight] = useState<{ id: string; origin: DownloadOrigin; dx: number; dy: number } | null>(null);
-  const [jobKinds, setJobKinds] = useState<JobKindResource[]>([]);
 
-  useEffect(() => {
-    let active = true;
-    void jobsApi
-      .jobKinds()
-      .then((items) => {
-        if (active) setJobKinds(items);
-      })
-      .catch((cause) => {
-        if (active) toast.error(errorMessage(cause, tr));
-      });
-    return () => {
-      active = false;
-    };
-  }, []);
 
   useEffect(() => {
     if (!flight) return;
@@ -66,7 +51,6 @@ export function ModelHubPage() {
     <div className="model-download-page" ref={page}>
       <ModelBrowser
         capabilities={capabilities}
-        jobKinds={jobKinds}
         onError={(message) => toast.error(message)}
         onJobCreated={trackDownload}
         tab={tab}

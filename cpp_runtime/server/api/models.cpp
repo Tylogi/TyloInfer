@@ -194,8 +194,7 @@ void models_load(const Services& services, const httplib::Request& request, http
     if (policy.pin && policy.idle_ttl) throw ApiError(400, "invalid_request", "pinned instances cannot have an idle timeout");
     policy.mtp_enabled = policies.inference_policy().at("mtp_enabled").get<bool>();
     const auto operation = submit_model_load(jobs, instances, artifact_id, options, policy, body);
-    response.set_header("Location", "/api/jobs/" + operation);
-    set_json(response, {{"operation_id", operation}, {"status", "accepted"}}, 202);
+    accept(response, operation);
 }
 
 void models_unload(const Services& services, const httplib::Request& request, httplib::Response& response) {
@@ -212,8 +211,7 @@ void models_unload(const Services& services, const httplib::Request& request, ht
         instances.unload(id, force);
         return json{{"instance_id", id}, {"state", "unloaded"}};
     });
-    response.set_header("Location", "/api/jobs/" + operation);
-    set_json(response, {{"operation_id", operation}, {"status", "accepted"}}, 202);
+    accept(response, operation);
 }
 
 void model_analysis(const Services& services, const httplib::Request& request, httplib::Response& response) {

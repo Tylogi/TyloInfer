@@ -51,7 +51,6 @@ void profile_update(const Services&, const httplib::Request&, httplib::Response&
 void profile_delete(const Services&, const httplib::Request&, httplib::Response&);
 void profile_load(const Services&, const httplib::Request&, httplib::Response&);
 void runtime_instance_patch(const Services&, const httplib::Request&, httplib::Response&);
-void listener_get(const Services&, const httplib::Request&, httplib::Response&);
 
 // api/runtime_cache.cpp
 void cache_entries(const Services&, const httplib::Request&, httplib::Response&);
@@ -88,7 +87,6 @@ void hub_repository(const Services&, const httplib::Request&, httplib::Response&
 void hub_resolve(const Services&, const httplib::Request&, httplib::Response&);
 void hub_reuse(const Services&, const httplib::Request&, httplib::Response&);
 void hub_probe(const Services&, const httplib::Request&, httplib::Response&);
-void jobs_kinds(const Services&, const httplib::Request&, httplib::Response&);
 void jobs_submit(const Services&, const httplib::Request&, httplib::Response&);
 void job_retry(const Services&, const httplib::Request&, httplib::Response&);
 

@@ -135,9 +135,6 @@ export interface PrefixCacheText {
 }
 
 export const runtimeApi = {
-  servingStatistics(scope: 'session' | 'alltime', signal?: AbortSignal): Promise<ServingStatistics> {
-    return request(`/api/runtime/serving?scope=${scope}`, { signal });
-  },
   authenticationPolicy(): Promise<RuntimeAuthenticationPolicy> {
     return request('/api/auth/policy');
   },
@@ -185,14 +182,6 @@ export const runtimeApi = {
   configureMemoryPolicy(policy: Partial<Pick<RuntimeMemoryPolicy, 'total_limit_bytes' | 'model_limit_bytes' | 'prefix_limit_bytes' | 'prefix_disk_limit_bytes' | 'prefix_ram_limit_bytes' | 'prefix_directory'>>): Promise<{ operation_id: string }> {
     return request('/api/runtime/memory-policy', { method: 'PUT', body: JSON.stringify(policy) });
   },
-  runtimeListener(): Promise<RuntimeListener> {
-    return request('/api/runtime/listener');
-  },
-  configureRuntimeListener(port: number, protocol: 'openai' | 'anthropic' = 'openai'): Promise<RuntimeListener> {
-    return request('/api/runtime/listener', {
-      method: 'PUT', body: JSON.stringify(protocol === 'openai' ? { port } : { port, protocol }),
-    });
-  },
 
   /** Read and adapt native instances while preserving unreported telemetry as unknown. */
   async runtimeInstances(): Promise<RuntimeInstance[]> {
@@ -204,17 +193,7 @@ export const runtimeApi = {
   },
 
 
-  /** 获取运行指标快照历史，供概览趋势展示。 */
-  async runtimeMetrics(limit = 200, signal?: AbortSignal, since?: string): Promise<RuntimeMetricSnapshot[]> {
-    return (
-      await request<{ data: RuntimeMetricSnapshot[] }>(`/api/runtime/metrics?limit=${limit}${since ? `&since=${encodeURIComponent(since)}` : ''}`, { signal })
-    ).data;
-  },
 
-  /** 获取最近的服务日志。 */
-  async runtimeLogs(limit = 100, signal?: AbortSignal, after?: number): Promise<RuntimeLogEntry[]> {
-    return (await request<{ data: RuntimeLogEntry[] }>(`/api/runtime/logs?limit=${limit}${after != null ? `&after=${after}` : ''}`, { signal })).data;
-  },
 
   /** 读取语音通道可用性与默认音频参数。 */
   realtimeCapabilities(): Promise<RealtimeCapabilities> {

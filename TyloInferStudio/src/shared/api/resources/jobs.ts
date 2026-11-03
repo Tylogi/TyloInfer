@@ -1,5 +1,5 @@
 /** 封装 jobs 领域资源请求，不保存组件状态。 */
-import type { RuntimeLogEntry, JobResource, JobEventResource, JobKindResource } from '../types';
+import type { RuntimeLogEntry, JobResource, JobEventResource } from '../types';
 import { ApiError, request, apiUrl, errorFromResponse, authorizedHeaders } from '../client';
 import type { ApiErrorBody } from '../types';
 import { readEventStream } from '../eventStream';
@@ -11,11 +11,6 @@ export const jobsApi = {
   /** 获取最近的后台任务。 */
   async jobs(limit = 100): Promise<JobResource[]> {
     return (await request<{ data: JobResource[] }>(`/api/jobs?limit=${limit}`)).data;
-  },
-
-  /** 获取任务类型和动态表单字段定义。 */
-  async jobKinds(): Promise<JobKindResource[]> {
-    return (await request<{ data: JobKindResource[] }>('/api/jobs/kinds')).data;
   },
 
   /** 提交后台任务并返回初始任务记录。 */

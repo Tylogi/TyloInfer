@@ -113,8 +113,7 @@ void runtime_context(const Services& services, const httplib::Request& request, 
         [&services, body](const Jobs::Control&) {
             return reload_target(services.instances, services.catalog, services.policies, body);
         });
-    response.set_header("Location", "/api/jobs/" + operation);
-    set_json(response, {{"operation_id", operation}, {"status", "accepted"}}, 202);
+    accept(response, operation);
 }
 
 
@@ -129,7 +128,7 @@ void voice_install(const Services& services, const httplib::Request&, httplib::R
             return voice.install([&](double value, const std::string& message) { control.progress(message, value); },
                 [&] { return control.cancelled.load(); });
         });
-    set_json(response, {{"operation_id", operation}, {"status", "accepted"}}, 202);
+    accept(response, operation);
 }
 
 void voice_activate(const Services&, const httplib::Request&, httplib::Response&) {
@@ -241,7 +240,7 @@ void qsa_kv_put(const Services& services, const httplib::Request& request, httpl
             {"ram_budget_bytes", body.contains("ram_budget_bytes") ? body["ram_budget_bytes"] : json(nullptr)}};
         return policies.put_context_policy(json{{"model_qsa_kv_offload", std::move(model_policy)}});
     });
-    set_json(response, {{"operation_id", operation}, {"status", "accepted"}}, 202);
+    accept(response, operation);
 }
 
 } // namespace mfq::server

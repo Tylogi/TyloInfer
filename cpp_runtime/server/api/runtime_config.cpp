@@ -53,7 +53,7 @@ void memory_policy_put(const Services& services, const httplib::Request& request
     policies.check_memory(body); // field errors reject the request before the job is accepted
     const auto operation = jobs.submit("runtime.memory.configure", body,
         [&policies, body](const Jobs::Control&) { return policies.put_memory_policy(body); });
-    set_json(response, {{"operation_id", operation}, {"status", "accepted"}}, 202);
+    accept(response, operation);
 }
 
 void profiles_create(const Services& services, const httplib::Request& request, httplib::Response& response) {
@@ -100,8 +100,7 @@ void profile_load(const Services& services, const httplib::Request& request, htt
         throw ApiError(400, "invalid_request", "pinned instances cannot have an idle timeout");
     policy.mtp_enabled = policies.inference_policy().at("mtp_enabled").get<bool>();
     const auto operation = submit_model_load(services.jobs, services.instances, profile.artifact.id, options, policy, load);
-    response.set_header("Location", "/api/jobs/" + operation);
-    set_json(response, {{"operation_id", operation}, {"status", "accepted"}}, 202);
+    accept(response, operation);
 }
 
 void runtime_instance_patch(const Services& services, const httplib::Request& request, httplib::Response& response) {
@@ -123,12 +122,6 @@ void runtime_instance_patch(const Services& services, const httplib::Request& re
         }
     }
     set_json(response, instance_json(services.instances.update_policy(normalize_uuid(request.matches[1]), pinned, idle_ttl)));
-}
-
-// The native listener serves both protocols on the port it bound at startup, so there is nothing
-// to reconfigure at runtime; the Python managed listener does not exist here.
-void listener_get(const Services& services, const httplib::Request&, httplib::Response& response) {
-    set_json(response, {{"host", services.host}, {"port", services.port}, {"anthropic_port", nullptr}, {"configurable", false}});
 }
 
 } // namespace mfq::server

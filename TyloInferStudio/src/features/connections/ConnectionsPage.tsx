@@ -49,8 +49,6 @@ export function ConnectionsPage() {
   const managedLocal = isStudio() && studio?.connection === 'managed' && studio.config.mode === 'local';
   const [draft, setDraft] = useState<StudioConfig>(() => studio?.config ?? browserConfig());
   const [listeningPort, setListeningPort] = useState<number | null>(null);
-  const [anthropicPort, setAnthropicPort] = useState<number | null>(null);
-  const [anthropicDraft, setAnthropicDraft] = useState('');
   const [configurable, setConfigurable] = useState(false);
   const [token, setToken] = useState('');
   const [credentialWritable, setCredentialWritable] = useState(false);
@@ -67,26 +65,9 @@ export function ConnectionsPage() {
   }, []);
   useEffect(() => {
     if (studio) { setDraft(studio.config); applied.current = studio.config; }
-    if (!capabilities.runtimeConfiguration) {
-      setListeningPort(browserConfig().local_service_port);
-      setConfigurable(managedLocal);
-      return;
-    }
-    let disposed = false;
-    void runtimeApi.runtimeListener().then((listener) => {
-      if (!disposed) {
-        if (!studio) {
-          setDraft((current) => ({ ...current, local_service_port: listener.port }));
-          applied.current = { ...applied.current, local_service_port: listener.port };
-        }
-        setListeningPort(listener.port);
-        setConfigurable(listener.configurable);
-        setAnthropicPort(listener.anthropic_port ?? null);
-        setAnthropicDraft(listener.anthropic_port == null ? '' : String(listener.anthropic_port));
-      }
-    }).catch(() => {});
-    return () => { disposed = true; };
-  }, [studio, capabilities.runtimeConfiguration, managedLocal]);
+    setListeningPort(browserConfig().local_service_port);
+    setConfigurable(managedLocal);
+  }, [managedLocal]);
   useEffect(() => {
     let disposed = false;
     void studioCredential()
@@ -111,10 +92,9 @@ export function ConnectionsPage() {
     if (applying.current) return;
     if (JSON.stringify(draft) === JSON.stringify(applied.current) && !credentialWritable && !applyState?.error) return;
     const endpoint = getApiBaseUrl();
-    const restartsManagedService = !capabilities.runtimeConfiguration && managedLocal && draft.mode === 'local'
+    const restartsManagedService = managedLocal && draft.mode === 'local'
       && studio.config.local_service_port !== draft.local_service_port;
     let credential = getApiToken();
-    let boundPort = listeningPort;
     const current = () => getApiBaseUrl() === endpoint && getApiToken() === credential;
     applying.current = true;
     setBusy(true);
@@ -123,15 +103,7 @@ export function ConnectionsPage() {
       if (draft.mode === 'local' && (!Number.isInteger(draft.local_service_port) || draft.local_service_port < 1 || draft.local_service_port > 65535)) {
         throw new Error(tr('端口必须为 1–65535 的整数', 'Port must be an integer between 1 and 65535'));
       }
-      if (draft.mode === 'local' && draft.local_service_port === anthropicPort && draft.local_service_port !== listeningPort) {
-        throw new Error(tr('OpenAI 和 Anthropic 不能使用同一个端口，请为它们设置不同的端口。', 'OpenAI and Anthropic cannot share a port. Choose a different port for each API.'));
-      }
       if (isStudio()) {
-        if (capabilities.runtimeConfiguration && studio?.connection === 'managed' && studio.config.mode === 'local' && draft.mode === 'local'
-            && studio.config.local_service_port !== draft.local_service_port) {
-          boundPort = (await runtimeApi.configureRuntimeListener(draft.local_service_port)).port;
-          if (!current()) return;
-        }
         await configureStudio(draft);
         if (!current()) return;
         if (credentialWritable) {
@@ -141,7 +113,6 @@ export function ConnectionsPage() {
       } else {
         let address = draft.remote_url.trim().replace(/\/+$/, '').replace(/\/v1$/, '');
         if (draft.mode === 'local') {
-          if (capabilities.runtimeConfiguration && browserConfig().mode === 'local') boundPort = (await runtimeApi.configureRuntimeListener(draft.local_service_port)).port;
           if (!current()) return;
           address = `http://127.0.0.1:${draft.local_service_port}`;
         } else {
@@ -189,44 +160,8 @@ export function ConnectionsPage() {
       }
     } catch (cause) {
       if (mounted.current && current()) {
-        setDraft({ ...applied.current, local_service_port: boundPort ?? applied.current.local_service_port });
-        setListeningPort(boundPort);
-        setApplyState({ error: true, text: errorMessage(cause, tr) });
-      }
-    } finally {
-      applying.current = false;
-      if (mounted.current) setBusy(false);
-    }
-  }
-
-  async function applyAnthropic() {
-    const port = Number(anthropicDraft);
-    if (applying.current || port === anthropicPort) return;
-    if (!Number.isInteger(port) || port < 1 || port > 65535) {
-      setAnthropicDraft(anthropicPort == null ? '' : String(anthropicPort));
-      setApplyState({ error: true, text: tr('端口必须为 1–65535 的整数', 'Port must be an integer between 1 and 65535') });
-      return;
-    }
-    if (port === listeningPort) {
-      setAnthropicDraft(anthropicPort == null ? '' : String(anthropicPort));
-      setApplyState({ error: true, text: tr('OpenAI 和 Anthropic 不能使用同一个端口，请为它们设置不同的端口。', 'OpenAI and Anthropic cannot share a port. Choose a different port for each API.') });
-      return;
-    }
-    const endpoint = getApiBaseUrl();
-    const credential = getApiToken();
-    applying.current = true;
-    setBusy(true);
-    setApplyState({ error: false, text: tr('正在应用…', 'Applying…') });
-    try {
-      const listener = await runtimeApi.configureRuntimeListener(port, 'anthropic');
-      if (mounted.current && endpoint === getApiBaseUrl() && credential === getApiToken()) {
-        setAnthropicPort(listener.anthropic_port ?? port);
-        setAnthropicDraft(String(listener.anthropic_port ?? port));
-        setApplyState({ error: false, text: tr('已应用，无需重载模型', 'Applied without reloading models') });
-      }
-    } catch (cause) {
-      if (mounted.current && endpoint === getApiBaseUrl() && credential === getApiToken()) {
-        setAnthropicDraft(anthropicPort == null ? '' : String(anthropicPort));
+        setDraft({ ...applied.current, local_service_port: listeningPort ?? applied.current.local_service_port });
+        setListeningPort(listeningPort);
         setApplyState({ error: true, text: errorMessage(cause, tr) });
       }
     } finally {
@@ -399,18 +334,7 @@ export function ConnectionsPage() {
               />
               <SettingRow
                 title={tr('Anthropic 端口', 'Anthropic port')}
-                detail={anthropicPort == null
-                  ? capabilities.runtimeConfiguration ? tr('当前服务尚未启用 Anthropic API。', 'The current service has not enabled the Anthropic API.') : tr('与 OpenAI 共用服务端口 /v1/messages；不能单独配置。', 'Uses the same server port at /v1/messages; a separate port cannot be configured.')
-                  : `http://127.0.0.1:${anthropicPort}/v1/messages`}
-                trailing={<input
-                  aria-label={tr('Anthropic 端口', 'Anthropic port')}
-                  className="server-number-input"
-                  disabled={busy || !configurable || anthropicPort == null}
-                  max={65535} min={1} type="number" value={anthropicDraft}
-                  onChange={(event) => setAnthropicDraft(event.target.value)}
-                  onBlur={() => void applyAnthropic()}
-                  onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); void applyAnthropic(); } }}
-                />}
+                detail={tr('与 OpenAI 共用服务端口 /v1/messages；不能单独配置。', 'Uses the same server port at /v1/messages; a separate port cannot be configured.')}
               />
               </>
             )}
