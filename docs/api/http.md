@@ -102,10 +102,11 @@ Messages 请求拒绝未知字段。
 | `400` | `search_cursor_expired` | Hub 搜索游标过期或筛选条件变化 |
 | `401` / `403` | `authentication_error`、`authentication_required` | 凭据缺失、无效、撤销或过期 |
 | `404` | `not_found`、`operation_not_found`、`model_artifact_not_found`、`model_directory_not_found`、`session_not_found`、`response_not_found` | 对象不存在或已归档 |
-| `409` | `job_state_conflict`、`model_already_loaded`、`model_operation_busy`、`model_busy`、`model_alias_conflict`、`revision_conflict`、`response_in_progress`、`request_cancelled` | 状态或标识冲突 |
+| `409` | `job_state_conflict`、`model_already_loaded`、`model_operation_busy`、`model_busy`、`model_alias_conflict`、`revision_conflict`、`response_in_progress`、`request_cancelled`、`model_delete_busy`、`model_delete_unsafe`、`model_delete_changed`、`model_delete_failed` | 状态或标识冲突 |
 | `410` | `event_cursor_expired` | 事件游标已被淘汰 |
 | `413` | `request_too_large` | 会话消息或导出超过上限 |
 | `415` | `unsupported_media_type` | `Content-Type` 不是 `application/json` |
+| `422` | `checkpoint_analysis_unavailable`、`model_cache_profile_unavailable` | 检查点不完整或元数据读不出 |
 | `429` | `operation_queue_full`、`stream_connections_full` | 后台队列或流式连接已满 |
 | `500` | `response_save_failed`、`model_registration_save_failed`、`model_alias_save_failed`、`operation_failed` | 落盘或执行失败 |
 | `501` | `cache_reclaim_not_supported`、`media_unavailable`、`session_mode_unavailable` | 当前服务不提供该能力 |
@@ -170,6 +171,10 @@ HTTP 层共 4 个工作线程。流式请求（`/v1/chat/completions`、`/v1/mes
 | `POST` | `/api/v1/models/directories/register` | `{"path":string}` 或 `{"directory_id":string}` | `200 {"data":[Artifact]}` | `models` |
 | `GET` | `/api/v1/models/{artifact_id}/directory` | — | `200 Directory` | `models` |
 | `GET` | `/api/v1/models/{artifact_id}/capabilities` | — | `200 Capabilities` | `inference` |
+| `GET` | `/api/v1/models/{model_id}/analysis` | — | `200 CheckpointAnalysis` | `inference` |
+| `GET` | `/api/v1/models/{model_id}/cache-profile` | `?include_recurrent=true\|false` | `200 ModelCacheProfile\|null` | `inference` |
+| `GET` | `/api/v1/models/{model_id}/deletion` | — | `200 DeletionPlan` | `inference` |
+| `POST` | `/api/v1/models/{model_id}/delete` | `{"token":string}` | `200 {"files":int,"total_bytes":int}` | `models` |
 | `POST` | `/api/v1/models/load` | `LoadRequest` | `202 Accepted` | `models` |
 | `POST` | `/api/v1/models/unload` | `UnloadRequest` | `202 Accepted` | `models` |
 | `GET` | `/api/v1/runtime/instances` | — | `200 {"data":[Instance]}` | `inference` |
@@ -365,6 +370,65 @@ cache profile、attention profile、license 和 `published_at` 一律为 `null`�
 
 公开列表同时公布原生支持的登记产物与健康实例；同名产物/实例用 ID 区分。
 列表、详情和设置别名都不触发加载。普通响应与 SSE 回显请求中的名称。
+
+### 3.5 模型分析、缓存画像与磁盘删除
+
+`GET /api/v1/models/{model_id}/analysis` 读取产物元数据，返回 `CheckpointAnalysis`：
+
+| 字段 | 含义 |
+|---|---|
+| `model_id`、`name`、`format`、`architecture`、`complete` | 产物身份与格式 |
+| `layer_count` | `num_hidden_layers`，或与张量名推出的最大层号 + 1 的较大值 |
+| `hidden_size`、`attention_heads`、`kv_heads`、`head_dim`、`linear_key_heads`、`linear_value_heads`、`experts_per_token` | 配置里的结构数字，缺失为 `null` |
+| `expert_count` | 配置声明与专家条目推出的最大值 |
+| `parameters`、`stored_bytes`、`average_bpw` | 全部张量的参数与字节合计，平均位宽排除 `predictor`、`vision` |
+| `attention_distribution` | 注意力类型到层号列表的映射 |
+| `layers[]` | `layer`、`attention_type`、`parameters`、`stored_bytes`、`average_bpw` |
+| `projections[]` | 按 `(category, name)` 排序的投影聚合，含 `tensor_count`、`formats` |
+| `tensors[]` | `name`、`shape`、`category`、`projection`、`layer`、`parameters`、`stored_bytes`、`bpw`、`format` |
+| `experts[]` | 路由专家行：`layer`、`expert`、`projection`、`parameters`、`stored_bytes`、`bpw`、`format`、`granularity` |
+| `graph` | `hc_count`、`has_ple`、`has_shared_expert` |
+| `advanced` | 结构细节：FFN 与专家宽度、HC、激活函数、GDN/QSA/PLE 卷积与压缩参数、`normalizations[]` 等 |
+| `cache_profile` | 按 `include_recurrent=false` 计算的缓存画像，见下文 |
+| `warnings[]` | 无法解析的张量说明 |
+
+`{model_id}` 接受产物 ID 或模型名；不存在返回 `404 model_artifact_not_found`，
+产物不完整或元数据读不出返回 `422 checkpoint_analysis_unavailable`。容器没有
+保存逻辑形状时从张量头恢复几何，恢复不了的张量记入 `warnings` 并从
+`parameters`、`stored_bytes` 中排除。
+
+`GET /api/v1/models/{model_id}/cache-profile` 返回 `ModelCacheProfile`，架构没有
+缓存模型时返回 `null`。字段为 `max_context`、`fixed_bytes`、
+`fixed_components[]{group,name,layers,bytes}` 与
+`components[]{group,name,subgroup,layers,bytes_per_row,tokens_per_row,allocation,minimum_rows,row_rounding,active_after,max_read_rows_per_token,head_dimension,kv_heads}`。
+`include_recurrent` 只决定是否计入循环状态（GDN、PLE）的固定分量，默认 `false`。
+读不出元数据返回 `422 model_cache_profile_unavailable`。
+
+`GET /api/v1/models/{model_id}/deletion` 返回删除计划：
+
+```json
+{"model_id": "catalog-artifact-id", "name": "model-name",
+ "files": ["/abs/path/config.json"], "total_bytes": 123, "token": "<64 hex>"}
+```
+
+`files` 就是会被删除的确切文件：分片模型按同基名同分片数匹配同目录兄弟分片，
+HF 目录含 `config.json`、`*.safetensors` 与索引 `weight_map` 引用的分片。目录和
+伴随文件不在计划内。`token` 绑定这些文件的设备号、inode、大小与时间戳。
+
+`POST /api/v1/models/{model_id}/delete` 正文只有 `{"token":string}`，必须是计划
+返回的 64 位十六进制摘要。
+
+| 状态 | `code` | 条件 |
+|---|---|---|
+| `400` | `invalid_request` | `token` 缺失、类型错误或不是 64 位十六进制 |
+| `404` | `model_artifact_not_found` | 产物不存在 |
+| `409` | `model_delete_busy` | 该产物或同名模型已加载、正在卸载或正在加载 |
+| `409` | `model_delete_unsafe` | 文件集合越出模型目录，例如 `weight_map` 指向 `..`、绝对路径或非 `.safetensors` 目标 |
+| `409` | `model_delete_changed` | 计划与当前文件状态不一致，需要重新取计划 |
+| `409` | `model_delete_failed` | 删除中途失败，已删除的文件不会恢复 |
+
+删除只作用于计划里的文件，不删除模型目录或伴随文件；成功后服务重新扫描目录，
+产物从列表消失。成功响应为 `{"files":N,"total_bytes":M}`。
 
 ## 4. 任务与事件
 
