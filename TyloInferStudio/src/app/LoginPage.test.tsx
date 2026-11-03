@@ -52,7 +52,7 @@ beforeEach(() => {
     if (enabled && new Headers(init?.headers).get('Authorization') !== `Bearer ${validKey}`) {
       return response({ error: { code: 'unauthorized', message: 'invalid API credential', retryable: false, details: {} } }, 401);
     }
-    if (url === '/api/v1/runtime/status') return response({ runtime_state: 'idle' });
+    if (url === '/api/runtime/status') return response({ runtime_state: 'idle' });
     return response({ data: [] });
   });
   vi.stubGlobal('fetch', fetchMock);
@@ -125,7 +125,7 @@ it('returns to sign-in when a currently open page receives a 401', async () => {
   mount();
   await screen.findByText('Overview content');
   enabled = true;
-  await act(async () => { await expect(request('/api/v1/models')).rejects.toBeInstanceOf(ApiError); });
+  await act(async () => { await expect(request('/api/models')).rejects.toBeInstanceOf(ApiError); });
   await screen.findByRole('heading', { name: 'Sign in' });
   submit();
   await screen.findByText('Overview content');

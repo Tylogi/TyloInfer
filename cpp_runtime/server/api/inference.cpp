@@ -71,7 +71,7 @@ void register_inference(httplib::Server& http, ModelInstances& models, std::shar
         if (std::find(names.begin(), names.end(), model) == names.end()) models.get(model);
         set_json(response, {{"id", model}, {"type", "model"}, {"display_name", model}, {"created_at", "1970-01-01T00:00:00Z"}});
     });
-    http.Post("/api/v1/inference/requests/([0-9a-f-]{36})/cancel", [&](const httplib::Request& request, httplib::Response& response) {
+    http.Post("/api/inference/requests/([0-9a-f-]{36})/cancel", [&](const httplib::Request& request, httplib::Response& response) {
         const auto body = parse_json(request);
         if (!body.is_object() || body.size() != 1 || !body.contains("instance_id") || !body["instance_id"].is_string())
             throw ApiError(400, "invalid_request", "cancel requires an instance_id");

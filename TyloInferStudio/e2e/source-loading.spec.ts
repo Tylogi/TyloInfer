@@ -3,11 +3,11 @@ import { mockStudioServer } from './mockServer';
 
 test('WT2 keeps default layerwise loading and visible memory fallback', async ({ page }, testInfo) => {
   await mockStudioServer(page);
-  await page.route('**/api/v1/evaluations/tools', route => route.fulfill({ json: { workspace_root: '/workspace', api_base: 'http://localhost/v1', quality_available: true, reference_available: true, benchmark_available: true, accuracy_available: false } }));
-  await page.route('**/api/v1/datasets', route => route.fulfill({ json: { data: [{ id: 'wt2', name: 'WikiText-2 raw · test', kind: 'wikitext2', sha256: 'a'.repeat(64), metadata: {} }] } }));
-  await page.route('**/api/v1/evaluations/reference/workspace', route => route.fulfill({ json: { import_directory: '/models', export_directory: '/outputs' } }));
-  await page.route('**/api/v1/evaluations/reference/source', route => route.fulfill({ json: { path: '/models/original', architecture: 'qwen3_5', tensors: 320, parameters: 800000000, format: 'hf', full_precision: true, reference_supported: true, source_precisions: ['BF16'] } }));
-  await page.route('**/api/v1/evaluations/reference/loading-plan', route => route.fulfill({ json: { backend: 'metal', resident_allowed: false, available_bytes: 2 ** 30, resident_required_bytes: 4 * 2 ** 30, weights_bytes: 0, workspace_bytes: 0 } }));
+  await page.route('**/api/evaluations/tools', route => route.fulfill({ json: { workspace_root: '/workspace', api_base: 'http://localhost/v1', quality_available: true, reference_available: true, benchmark_available: true, accuracy_available: false } }));
+  await page.route('**/api/datasets', route => route.fulfill({ json: { data: [{ id: 'wt2', name: 'WikiText-2 raw · test', kind: 'wikitext2', sha256: 'a'.repeat(64), metadata: {} }] } }));
+  await page.route('**/api/evaluations/reference/workspace', route => route.fulfill({ json: { import_directory: '/models', export_directory: '/outputs' } }));
+  await page.route('**/api/evaluations/reference/source', route => route.fulfill({ json: { path: '/models/original', architecture: 'qwen3_5', tensors: 320, parameters: 800000000, format: 'hf', full_precision: true, reference_supported: true, source_precisions: ['BF16'] } }));
+  await page.route('**/api/evaluations/reference/loading-plan', route => route.fulfill({ json: { backend: 'metal', resident_allowed: false, available_bytes: 2 ** 30, resident_required_bytes: 4 * 2 ** 30, weights_bytes: 0, workspace_bytes: 0 } }));
   for (const [path, summary, input] of [
     ['/evaluations', 'Generate WT2 logits from original model', 'Original model directory'],
   ]) {

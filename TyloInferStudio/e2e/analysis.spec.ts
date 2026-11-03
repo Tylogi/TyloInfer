@@ -9,8 +9,8 @@ for (const mode of ['light', 'dark', 'system-light', 'system-dark'] as const) {
     await mockStudioServer(page);
     await page.emulateMedia({ colorScheme: dark ? 'dark' : 'light' });
     await page.addInitScript(value => localStorage.setItem('tyloinfer.studio.generation.v1', JSON.stringify({ language: 'en', theme: value })), theme);
-    await page.route(/\/api\/v1\/models(?:\?.*)?$/, route => route.fulfill({ json: { data: [analysisArtifacts[1]] } }));
-    await page.route('**/api/v1/models/*/analysis', route => route.fulfill({ json: analysisFixture(true) }));
+    await page.route(/\/api\/models(?:\?.*)?$/, route => route.fulfill({ json: { data: [analysisArtifacts[1]] } }));
+    await page.route('**/api/models/*/analysis', route => route.fulfill({ json: analysisFixture(true) }));
     await page.goto('/analysis');
     const chart = page.locator('.layer-budget');
     await expect(chart.locator('.budget-legend')).toHaveText('FFNAttentionTotal');
@@ -33,8 +33,8 @@ for (const mode of ['light', 'dark', 'system-light', 'system-dark'] as const) {
 
 test('checkpoint analysis charts and controls fit desktop and mobile', async ({ page }, testInfo) => {
   await mockStudioServer(page);
-  await page.route(/\/api\/v1\/models(?:\?.*)?$/, route => route.fulfill({ json: { data: analysisArtifacts } }));
-  await page.route('**/api/v1/models/*/analysis', route => {
+  await page.route(/\/api\/models(?:\?.*)?$/, route => route.fulfill({ json: { data: analysisArtifacts } }));
+  await page.route('**/api/models/*/analysis', route => {
     const analysis = analysisFixture(route.request().url().includes(analysisArtifacts[1].id));
     if (analysis.expert_count) analysis.tensors.push(...['gate', 'up', 'down'].map(projection => ({
       name: `model.block.0.mlp.shared_expert.${projection}.weight`, shape: [4, 8], category: 'shared_expert', projection,

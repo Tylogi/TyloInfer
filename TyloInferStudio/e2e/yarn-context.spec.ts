@@ -6,25 +6,25 @@ for (const language of ['zh-CN', 'en'] as const) {
   test(`per-model YaRN limits and save-time clamping (${language})`, async ({ page }, testInfo) => {
     await mockStudioServer(page, { language });
     const model = 'Qwen3.8-Flash-Next-EWQ-MFQ-S4-L-MHC-NINT-LMHead8-MTP8';
-    await page.route(/\/api\/v1\/models(?:\?.*)?$/, route => route.fulfill({ json: { data: [{ id: 'artifact-qwen', name: model }] } }));
-    await page.route('**/api/v1/models/*/cache-profile', route => route.fulfill({ json: {
+    await page.route(/\/api\/models(?:\?.*)?$/, route => route.fulfill({ json: { data: [{ id: 'artifact-qwen', name: model }] } }));
+    await page.route('**/api/models/*/cache-profile', route => route.fulfill({ json: {
       max_context: 262144, fixed_bytes: 29978, fixed_components: [{ group: 'QSA', name: 'indexer_tail', bytes: 29978 }], components: [
         { group: 'QSA', name: 'raw_kv', layers: 13, bytes_per_row: 26624, tokens_per_row: 1, allocation: 'power_of_two', minimum_rows: 16 },
         { group: 'QSA', name: 'indexer_pooled', subgroup: 'indexer', layers: 13, bytes_per_row: 6656, tokens_per_row: 4,
           allocation: 'power_of_two', minimum_rows: 16, row_rounding: 'floor', active_after: 0 },
       ],
     } }));
-    await page.route('**/api/v1/runtime/instances', route => route.fulfill({ json: { data: [{
+    await page.route('**/api/runtime/instances', route => route.fulfill({ json: { data: [{
       id: 'qwen', model, state: 'ready', context_size: 262144, context_capacity: 262144,
     }] } }));
-    await page.route('**/api/v1/runtime/context-policy', route => route.fulfill({ json: {
+    await page.route('**/api/runtime/context-policy', route => route.fulfill({ json: {
       max_context_size: null, model_overrides: {}, model_yarn_enabled: {}, fallback_context_size: 32768,
     } }));
-    await page.route('**/api/v1/runtime/yarn/*', route => route.fulfill({ json: {
+    await page.route('**/api/runtime/yarn/*', route => route.fulfill({ json: {
       supported: true, native_context: 262144, maximum_context: 1048576, maximum_factor: 4, enabled: false, effective_factor: 1,
     } }));
     const writes: unknown[] = [];
-    await page.route('**/api/v1/runtime/context', route => {
+    await page.route('**/api/runtime/context', route => {
       const payload = route.request().postDataJSON();
       writes.push(payload);
       return route.fulfill({ json: { id: `ctx-${writes.length}`, kind: 'runtime.context.configure', payload,

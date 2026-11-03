@@ -27,12 +27,12 @@ export interface SourceLoadingPlan {
 }
 
 export const referenceApi = {
-  workspace: () => request<{ import_directory: string }>('/api/v1/evaluations/reference/workspace'),
-  files: (path: string, signal?: AbortSignal) => request<ReferenceFiles>(`/api/v1/evaluations/reference/files?path=${encodeURIComponent(path)}`, { signal }),
-  source: (path: string) => request<ReferenceSource>('/api/v1/evaluations/reference/source', {
+  workspace: () => request<{ import_directory: string }>('/api/evaluations/reference/workspace'),
+  files: (path: string, signal?: AbortSignal) => request<ReferenceFiles>(`/api/evaluations/reference/files?path=${encodeURIComponent(path)}`, { signal }),
+  source: (path: string) => request<ReferenceSource>('/api/evaluations/reference/source', {
     method: 'POST', body: JSON.stringify({ path }),
   }),
-  loadingPlan: (path: string, purpose: 'wt2', context_size: number) => request<SourceLoadingPlan>('/api/v1/evaluations/reference/loading-plan', {
+  loadingPlan: (path: string, purpose: 'wt2', context_size: number) => request<SourceLoadingPlan>('/api/evaluations/reference/loading-plan', {
     method: 'POST', body: JSON.stringify({ path, purpose, context_size }),
   }),
 };

@@ -264,7 +264,7 @@ void media_uploads() {
         httplib::Headers headers{{"Content-Type", mime}};
         if (!sha.empty()) headers.emplace("X-Content-SHA256", sha);
         if (authorized) headers.insert(admin.begin(), admin.end());
-        return server.raw("POST", "/api/v1/media", headers, body);
+        return server.raw("POST", "/api/media", headers, body);
     };
     CHECK(upload("image/png", picture, digest, false).status == 401);
     const auto created = upload("image/png", picture, digest);
@@ -275,33 +275,33 @@ void media_uploads() {
         resource.at("media").at("id").get<std::string>().size() == 36 && !resource.at("created_at").is_null());
     const auto id = resource.at("media").at("id").get<std::string>();
     CHECK(upload("application/octet-stream", picture, digest).document().at("media").at("id") == id);
-    const auto fetched = server.get("/api/v1/media/" + id, admin);
+    const auto fetched = server.get("/api/media/" + id, admin);
     CHECK(fetched.status == 200 && fetched.body == picture);
     CHECK(fetched.header("Content-Type") == "image/png" && fetched.header("ETag") == "\"" + digest + "\"" &&
         fetched.header("Cache-Control") == "private, immutable, max-age=31536000" &&
         fetched.header("X-Content-Type-Options") == "nosniff");
-    CHECK(server.get("/api/v1/media/" + id).status == 401);
-    CHECK(server.get("/api/v1/media/00000000-0000-4000-8000-000000000000", admin).status == 404);
-    CHECK(server.get("/api/v1/media/not-a-media-id", admin).status == 404);
+    CHECK(server.get("/api/media/" + id).status == 401);
+    CHECK(server.get("/api/media/00000000-0000-4000-8000-000000000000", admin).status == 404);
+    CHECK(server.get("/api/media/not-a-media-id", admin).status == 404);
     CHECK(upload("application/x-shockwave-flash", picture, digest).status == 415);
     CHECK(upload("image/png", "", digest).status == 400 && upload("image/png", "", digest).document()["error"]["code"] == "empty_media");
     CHECK(upload("image/png", picture, std::string(64, '0')).status == 422);
     CHECK(upload("image/png", picture, "not-a-digest").status == 400);
     CHECK(upload("image/png", picture, "").status == 400);
     CHECK(upload("image/png", picture, digest, false).status == 401);
-    const auto oversized = server.send("POST", "/api/v1/sessions", json{{"title", std::string(2 * 1024 * 1024, 'x')}});
+    const auto oversized = server.send("POST", "/api/sessions", json{{"title", std::string(2 * 1024 * 1024, 'x')}});
     CHECK(oversized.status == 413 && oversized.document()["error"]["code"] == "request_too_large");
     const std::string large(2 * 1024 * 1024, 'm');
     // The payload cap only rises for uploads, so this exceeds the JSON cap while staying under the media limit.
     const auto uploaded = upload("image/png", large, "67c082ebaf8f24d2ad6f6e1ca6e37cbe7ff17f3dcde39ecd6a4ed311c6210fb7");
     CHECK(uploaded.status == 201 && uploaded.document().at("media").at("byte_size") == large.size());
-    const auto issued = server.send("POST", "/api/v1/auth/keys", {{"name", "jobs-only"}, {"scopes", {"jobs"}}}, admin);
+    const auto issued = server.send("POST", "/api/auth/keys", {{"name", "jobs-only"}, {"scopes", {"jobs"}}}, admin);
     CHECK(issued.status == 201);
-    CHECK(server.raw("POST", "/api/v1/media", {{"Content-Type", "image/png"}, {"X-Content-SHA256", digest},
+    CHECK(server.raw("POST", "/api/media", {{"Content-Type", "image/png"}, {"X-Content-SHA256", digest},
         {"Authorization", "Bearer " + issued.document().at("token").get<std::string>()}}, picture).status == 403);
     server.stop();
     auto restarted = f.start({}, root_environment);
-    CHECK(restarted.get("/api/v1/media/" + id, admin).body == picture);
+    CHECK(restarted.get("/api/media/" + id, admin).body == picture);
 }
 
 void cli_and_lifetime() {
@@ -450,7 +450,7 @@ void shutdown_with_pending_work() {
         Database database(f.data / "server.sqlite3");
         database.execute("BEGIN IMMEDIATE");
         auto pending = std::async(std::launch::async, [&] {
-            return server.send("POST", "/api/v1/auth/keys", {{"name", "during-shutdown"}, {"scopes", {"jobs"}}}, admin);
+            return server.send("POST", "/api/auth/keys", {{"name", "during-shutdown"}, {"scopes", {"jobs"}}}, admin);
         });
         CHECK(pending.wait_for(std::chrono::milliseconds(100)) == std::future_status::timeout);
         CHECK(server.get("/health").status == 200);
@@ -463,7 +463,7 @@ void shutdown_with_pending_work() {
         CHECK(server.process.wait() == 0);
         CHECK(database.scalar("PRAGMA integrity_check") == "ok");
         auto restarted = f.start({}, root_environment);
-        CHECK(restarted.get("/api/v1/jobs", bearer(created.document().at("token"))).status == 200);
+        CHECK(restarted.get("/api/jobs", bearer(created.document().at("token"))).status == 200);
     }
     {
         Fixture f;
@@ -539,30 +539,30 @@ void static_files() {
 void policy_and_protocols() {
     Fixture f;
     auto server = f.start();
-    CHECK(server.get("/api/v1/auth/policy").document() == json({{"enabled", false}, {"has_key", false}}));
-    CHECK(server.send("PUT", "/api/v1/auth/policy", {{"enabled", true}}).status == 400);
-    CHECK(server.send("PUT", "/api/v1/auth/policy", {{"enabled", true}, {"api_key", "example-root"}}).status == 200);
-    CHECK(server.get("/api/v1/auth/policy").status == 401);
+    CHECK(server.get("/api/auth/policy").document() == json({{"enabled", false}, {"has_key", false}}));
+    CHECK(server.send("PUT", "/api/auth/policy", {{"enabled", true}}).status == 400);
+    CHECK(server.send("PUT", "/api/auth/policy", {{"enabled", true}, {"api_key", "example-root"}}).status == 200);
+    CHECK(server.get("/api/auth/policy").status == 401);
     for (const auto& key : std::vector<json>{"", "has space", "中文", std::string(513, 'x'), 123})
-        CHECK(server.send("PUT", "/api/v1/auth/policy", {{"enabled", true}, {"api_key", key}}, admin).status == 400);
-    CHECK(server.send("PUT", "/api/v1/auth/policy", {{"enabled", 1}}, admin).status == 400);
-    CHECK(server.send("PUT", "/api/v1/auth/policy", {{"enabled", true}, {"unknown", 1}}, admin).status == 400);
-    CHECK(server.raw("PUT", "/api/v1/auth/policy", admin, "{}").status == 415);
+        CHECK(server.send("PUT", "/api/auth/policy", {{"enabled", true}, {"api_key", key}}, admin).status == 400);
+    CHECK(server.send("PUT", "/api/auth/policy", {{"enabled", 1}}, admin).status == 400);
+    CHECK(server.send("PUT", "/api/auth/policy", {{"enabled", true}, {"unknown", 1}}, admin).status == 400);
+    CHECK(server.raw("PUT", "/api/auth/policy", admin, "{}").status == 415);
     auto content_headers = admin;
     content_headers.emplace("Content-Type", "application/json");
-    CHECK(server.raw("PUT", "/api/v1/auth/policy", content_headers, "{").status == 400);
+    CHECK(server.raw("PUT", "/api/auth/policy", content_headers, "{").status == 400);
     for (const auto* origin : {"tauri://localhost", "http://tauri.localhost", "https://tauri.localhost", "http://127.0.0.1:5174"}) {
-        const auto denied = server.get("/api/v1/auth/policy", {{"Origin", origin}});
+        const auto denied = server.get("/api/auth/policy", {{"Origin", origin}});
         CHECK(denied.status == 401);
         CHECK(denied.header("Access-Control-Allow-Origin") == origin);
         CHECK(denied.header("WWW-Authenticate") == "Bearer");
-        const auto preflight = server.raw("OPTIONS", "/api/v1/auth/policy", {{"Origin", origin},
+        const auto preflight = server.raw("OPTIONS", "/api/auth/policy", {{"Origin", origin},
             {"Access-Control-Request-Method", "PUT"}, {"Access-Control-Request-Headers", "Authorization, Content-Type, X-TyloInfer-Instance-ID"}});
         CHECK(preflight.status == 204);
         CHECK(preflight.header("Access-Control-Allow-Origin") == origin);
     }
-    CHECK(server.get("/api/v1/auth/policy", {{"Origin", "https://untrusted.example"}}).header("Access-Control-Allow-Origin").empty());
-    CHECK(server.raw("OPTIONS", "/api/v1/auth/policy", {{"Origin", "tauri://localhost"},
+    CHECK(server.get("/api/auth/policy", {{"Origin", "https://untrusted.example"}}).header("Access-Control-Allow-Origin").empty());
+    CHECK(server.raw("OPTIONS", "/api/auth/policy", {{"Origin", "tauri://localhost"},
         {"Access-Control-Request-Method", "PUT"}, {"Access-Control-Request-Headers", "X-Untrusted"}}).status == 403);
     CHECK(server.raw("POST", "/v1/messages", {{"X-Api-Key", "wrong"}}).document().at("error").at("type") == "authentication_error");
     const auto invalid_message = server.raw("POST", "/v1/messages", {{"X-Api-Key", "example-root"}});
@@ -570,40 +570,40 @@ void policy_and_protocols() {
     CHECK(invalid_message.document().at("error").at("type") == "invalid_request_error");
     const httplib::Headers upgrade{{"Upgrade", "websocket"}, {"Connection", "Upgrade"},
         {"Sec-WebSocket-Version", "13"}, {"Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ=="}};
-    CHECK(server.get("/api/v1/realtime", upgrade).status == 401);
-    CHECK(server.get("/api/v1/realtime?access_token=example-root", upgrade).status == 404);
-    CHECK(server.get("/api/v1/realtime?access_token=example-root&server_instance=old", upgrade).status == 409);
+    CHECK(server.get("/api/realtime", upgrade).status == 401);
+    CHECK(server.get("/api/realtime?access_token=example-root", upgrade).status == 404);
+    CHECK(server.get("/api/realtime?access_token=example-root&server_instance=old", upgrade).status == 409);
 #ifndef _WIN32
     const auto previous = read_file(f.data / "auth.json");
     fs::rename(f.data / "auth.json", f.data / "auth.saved");
     fs::create_directory(f.data / "auth.json");
-    const auto failed = server.send("PUT", "/api/v1/auth/policy", {{"enabled", true}, {"api_key", "failed-key"}}, admin);
+    const auto failed = server.send("PUT", "/api/auth/policy", {{"enabled", true}, {"api_key", "failed-key"}}, admin);
     fs::remove(f.data / "auth.json");
     fs::rename(f.data / "auth.saved", f.data / "auth.json");
     CHECK(failed.status == 500);
     CHECK(read_file(f.data / "auth.json") == previous);
-    CHECK(server.get("/api/v1/auth/policy", admin).status == 200);
-    CHECK(server.get("/api/v1/auth/policy", bearer("failed-key")).status == 401);
+    CHECK(server.get("/api/auth/policy", admin).status == 200);
+    CHECK(server.get("/api/auth/policy", bearer("failed-key")).status == 401);
     CHECK((fs::status(f.data / "auth.json").permissions() & fs::perms::mask) == (fs::perms::owner_read | fs::perms::owner_write));
 #endif
-    CHECK(server.send("PUT", "/api/v1/auth/policy", {{"enabled", true}, {"api_key", "replacement"}}, admin).status == 200);
-    CHECK(server.get("/api/v1/auth/policy", admin).status == 401);
+    CHECK(server.send("PUT", "/api/auth/policy", {{"enabled", true}, {"api_key", "replacement"}}, admin).status == 200);
+    CHECK(server.get("/api/auth/policy", admin).status == 401);
     server.stop();
     const auto saved = read_file(f.data / "auth.json");
     CHECK(saved.find("example-root") == std::string::npos);
     CHECK(saved.find("replacement") == std::string::npos);
     CHECK(json::parse(saved).at("key_hash").get<std::string>().size() == 64);
     auto network_saved = f.start({"--host", "0.0.0.0"});
-    CHECK(network_saved.get("/api/v1/auth/policy").status == 401);
-    CHECK(network_saved.get("/api/v1/auth/policy", bearer("replacement")).status == 200);
-    CHECK(network_saved.send("PUT", "/api/v1/auth/policy", {{"enabled", false}}, bearer("replacement")).status == 400);
+    CHECK(network_saved.get("/api/auth/policy").status == 401);
+    CHECK(network_saved.get("/api/auth/policy", bearer("replacement")).status == 200);
+    CHECK(network_saved.send("PUT", "/api/auth/policy", {{"enabled", false}}, bearer("replacement")).status == 400);
     network_saved.stop();
     auto restarted = f.start({}, root_environment);
-    CHECK(restarted.get("/api/v1/auth/policy", admin).status == 401);
-    CHECK(restarted.send("PUT", "/api/v1/auth/policy", {{"enabled", false}}, bearer("replacement")).status == 200);
+    CHECK(restarted.get("/api/auth/policy", admin).status == 401);
+    CHECK(restarted.send("PUT", "/api/auth/policy", {{"enabled", false}}, bearer("replacement")).status == 200);
     restarted.stop();
     auto disabled = f.start();
-    CHECK(disabled.get("/api/v1/auth/policy").document() == json({{"enabled", false}, {"has_key", true}}));
+    CHECK(disabled.get("/api/auth/policy").document() == json({{"enabled", false}, {"has_key", true}}));
     disabled.stop();
     auto& network = f.launch(f.data, {"--host", "0.0.0.0"}, root_environment);
     CHECK(network.wait() != 0);
@@ -613,31 +613,31 @@ void policy_and_protocols() {
 void keys_and_network() {
     Fixture f;
     auto server = f.start({"--host", "0.0.0.0", "--api-key-env", "TYLOINFER_TEST_ROOT"}, {{"TYLOINFER_TEST_ROOT", "example-root"}});
-    CHECK(server.get("/api/v1/auth/policy").status == 401);
-    CHECK(server.send("PUT", "/api/v1/auth/policy", {{"enabled", false}}, admin).status == 400);
+    CHECK(server.get("/api/auth/policy").status == 401);
+    CHECK(server.send("PUT", "/api/auth/policy", {{"enabled", false}}, admin).status == 400);
     auto issue = [&](const json& input) {
-        const auto response = server.send("POST", "/api/v1/auth/keys", input, admin);
+        const auto response = server.send("POST", "/api/auth/keys", input, admin);
         CHECK(response.status == 201);
         return response.document();
     };
     auto key = issue({{"name", "jobs"}, {"scopes", {"jobs"}}});
     const auto token = key.at("token").get<std::string>(), id = key.at("key").at("id").get<std::string>();
     CHECK(token.rfind("mfq_", 0) == 0);
-    CHECK(server.get("/api/v1/jobs", bearer(token)).status == 200);
-    CHECK(server.get("/api/v1/sessions", bearer(token)).status == 403);
-    CHECK(server.get("/api/v1/auth/keys", bearer(token)).status == 403);
-    CHECK(server.send("POST", "/api/v1/auth/keys", {{"name", "jobs"}, {"scopes", {"jobs"}}}, admin).status == 409);
+    CHECK(server.get("/api/jobs", bearer(token)).status == 200);
+    CHECK(server.get("/api/sessions", bearer(token)).status == 403);
+    CHECK(server.get("/api/auth/keys", bearer(token)).status == 403);
+    CHECK(server.send("POST", "/api/auth/keys", {{"name", "jobs"}, {"scopes", {"jobs"}}}, admin).status == 409);
     for (const auto* role : {"viewer", "operator", "administrator"}) {
         const auto issued = issue({{"name", role}, {"role", role}});
         const auto credentials = bearer(issued.at("token"));
-        CHECK(server.get("/api/v1/runtime/status", credentials).status == 200);
-        CHECK(server.get("/api/v1/runtime/resources", credentials).status == 200);
-        CHECK(server.get("/api/v1/models/directories", credentials).status == (std::string(role) == "viewer" ? 403 : 200));
-        CHECK(server.get("/api/v1/models/00000000000000000000000000000000/directory", credentials).status == (std::string(role) == "viewer" ? 403 : 404));
-        CHECK(server.get("/api/v1/models", credentials).status == 200);
-        CHECK(server.raw("HEAD", "/api/v1/models", credentials).status == 200);
-        CHECK(server.raw("HEAD", "/api/v1/runtime/listener", credentials).status == 404);
-        CHECK(server.get("/api/v1/auth/keys", credentials).status == (std::string(role) == "administrator" ? 200 : 403));
+        CHECK(server.get("/api/runtime/status", credentials).status == 200);
+        CHECK(server.get("/api/runtime/resources", credentials).status == 200);
+        CHECK(server.get("/api/models/directories", credentials).status == (std::string(role) == "viewer" ? 403 : 200));
+        CHECK(server.get("/api/models/00000000000000000000000000000000/directory", credentials).status == (std::string(role) == "viewer" ? 403 : 404));
+        CHECK(server.get("/api/models", credentials).status == 200);
+        CHECK(server.raw("HEAD", "/api/models", credentials).status == 200);
+        CHECK(server.raw("HEAD", "/api/runtime/listener", credentials).status == 404);
+        CHECK(server.get("/api/auth/keys", credentials).status == (std::string(role) == "administrator" ? 200 : 403));
     }
     for (const auto& input : std::vector<json>{json::object(), {{"name", "x"}}, {{"name", "x"}, {"scopes", {"root"}}},
         {{"name", "x"}, {"scopes", {"jobs", "jobs"}}}, {{"name", "x"}, {"role", "root"}},
@@ -645,20 +645,20 @@ void keys_and_network() {
         {{"name", "x"}, {"role", "viewer"}, {"expires_at", "2025-02-29T00:00:00Z"}},
         {{"name", "x"}, {"role", "viewer"}, {"expires_at", "2099-01-01"}},
         {{"name", "x"}, {"role", "viewer"}, {"expires_at", "2099-01-01T00:00:00+25:00"}}})
-        CHECK(server.send("POST", "/api/v1/auth/keys", input, admin).status == 400);
+        CHECK(server.send("POST", "/api/auth/keys", input, admin).status == 400);
     for (const auto expired : {true, false}) {
         const auto issued = issue({{"name", expired ? "expired" : "future"}, {"role", "viewer"},
             {"expires_at", expired ? "2024-02-29T00:00:00+00:00" : "2099-02-28T23:59:59.999999-08:00"}});
         CHECK(server.get("/v1/models", bearer(issued.at("token"))).status == (expired ? 401 : 200));
     }
     issue({{"name", "'; DROP TABLE sessions; --"}, {"scopes", {"inference"}}});
-    const auto rotated = server.raw("POST", "/api/v1/auth/keys/" + id + "/rotate", admin);
+    const auto rotated = server.raw("POST", "/api/auth/keys/" + id + "/rotate", admin);
     CHECK(rotated.status == 200);
     const auto replacement = rotated.document().at("token").get<std::string>();
     CHECK(replacement != token);
-    CHECK(server.get("/api/v1/jobs", bearer(token)).status == 401);
-    CHECK(server.get("/api/v1/jobs", bearer(replacement)).status == 200);
-    const auto listed = server.get("/api/v1/auth/keys", admin).body;
+    CHECK(server.get("/api/jobs", bearer(token)).status == 401);
+    CHECK(server.get("/api/jobs", bearer(replacement)).status == 200);
+    const auto listed = server.get("/api/auth/keys", admin).body;
     CHECK(listed.find("key_hash") == std::string::npos);
     CHECK(listed.find(replacement) == std::string::npos);
     for (const auto& file : fs::directory_iterator(f.data)) if (file.path().filename().u8string().rfind("server.sqlite3", 0) == 0) {
@@ -667,11 +667,11 @@ void keys_and_network() {
     }
     server.stop();
     auto restarted = f.start({}, root_environment);
-    CHECK(restarted.get("/api/v1/jobs", bearer(replacement)).status == 200);
-    CHECK(restarted.raw("POST", "/api/v1/auth/keys/" + id + "/revoke", admin).status == 200);
-    CHECK(restarted.get("/api/v1/jobs", bearer(replacement)).status == 401);
-    CHECK(restarted.raw("POST", "/api/v1/auth/keys/00000000-0000-4000-8000-000000000000/revoke", admin).status == 404);
-    CHECK(restarted.raw("POST", "/api/v1/auth/keys/invalid/rotate", admin).status == 400);
+    CHECK(restarted.get("/api/jobs", bearer(replacement)).status == 200);
+    CHECK(restarted.raw("POST", "/api/auth/keys/" + id + "/revoke", admin).status == 200);
+    CHECK(restarted.get("/api/jobs", bearer(replacement)).status == 401);
+    CHECK(restarted.raw("POST", "/api/auth/keys/00000000-0000-4000-8000-000000000000/revoke", admin).status == 404);
+    CHECK(restarted.raw("POST", "/api/auth/keys/invalid/rotate", admin).status == 400);
     Database database(f.data / "server.sqlite3");
     CHECK(database.scalar("SELECT count(*) FROM sessions") == "0");
 }
@@ -679,41 +679,41 @@ void keys_and_network() {
 void runtime_observation() {
     Fixture f;
     auto server = f.start({}, root_environment);
-    for (const auto* path : {"/api/v1/runtime/status", "/api/v1/runtime/metrics", "/api/v1/runtime/logs",
-            "/api/v1/runtime/resources", "/api/v1/runtime/serving", "/api/v1/runtime/models",
-            "/api/v1/runtime/instances/00000000-0000-4000-8000-000000000001"})
+    for (const auto* path : {"/api/runtime/status", "/api/runtime/metrics", "/api/runtime/logs",
+            "/api/runtime/resources", "/api/runtime/serving", "/api/runtime/models",
+            "/api/runtime/instances/00000000-0000-4000-8000-000000000001"})
         CHECK(server.get(path).status == 401);
-    const auto idle = server.get("/api/v1/runtime/status", admin).document();
+    const auto idle = server.get("/api/runtime/status", admin).document();
     CHECK(idle == json({{"source", "native-instances"}, {"status", "ok"}, {"runtime_state", "idle"}}));
-    CHECK(server.get("/api/v1/runtime/status?instance_id=", admin).status == 400);
-    CHECK(server.get("/api/v1/runtime/status?instance_id=not-a-uuid", admin).status == 400);
-    CHECK(server.get("/api/v1/runtime/status?instance_id=00000000-0000-4000-8000-000000000001", admin).status == 404);
-    CHECK(server.get("/api/v1/runtime/instances/00000000-0000-4000-8000-000000000001", admin).status == 404);
-    CHECK(server.get("/api/v1/runtime/instances/not-a-uuid", admin).status == 400);
-    CHECK(server.get("/api/v1/runtime/models", admin).document() == json({{"data", json::array()}}));
-    CHECK(server.get("/api/v1/runtime/metrics", admin).document() == json({{"data", json::array()}}));
-    CHECK(server.get("/api/v1/runtime/logs", admin).document() == json({{"data", json::array()}}));
+    CHECK(server.get("/api/runtime/status?instance_id=", admin).status == 400);
+    CHECK(server.get("/api/runtime/status?instance_id=not-a-uuid", admin).status == 400);
+    CHECK(server.get("/api/runtime/status?instance_id=00000000-0000-4000-8000-000000000001", admin).status == 404);
+    CHECK(server.get("/api/runtime/instances/00000000-0000-4000-8000-000000000001", admin).status == 404);
+    CHECK(server.get("/api/runtime/instances/not-a-uuid", admin).status == 400);
+    CHECK(server.get("/api/runtime/models", admin).document() == json({{"data", json::array()}}));
+    CHECK(server.get("/api/runtime/metrics", admin).document() == json({{"data", json::array()}}));
+    CHECK(server.get("/api/runtime/logs", admin).document() == json({{"data", json::array()}}));
     for (const auto* query : {"?limit=0", "?limit=2001", "?limit=two", "?instance_id=nope"}) {
-        CHECK(server.get(std::string("/api/v1/runtime/metrics") + query, admin).status == 400);
-        CHECK(server.get(std::string("/api/v1/runtime/logs") + query, admin).status == 400);
+        CHECK(server.get(std::string("/api/runtime/metrics") + query, admin).status == 400);
+        CHECK(server.get(std::string("/api/runtime/logs") + query, admin).status == 400);
     }
-    CHECK(server.get("/api/v1/runtime/metrics?since=yesterday", admin).status == 400);
+    CHECK(server.get("/api/runtime/metrics?since=yesterday", admin).status == 400);
     for (const auto* query : {"?after=-1", "?level=trace", "?level="})
-        CHECK(server.get(std::string("/api/v1/runtime/logs") + query, admin).status == 400);
-    CHECK(server.get("/api/v1/runtime/metrics?limit=1&since=2024-01-02T03:04:05.500+00:00", admin).status == 200);
-    CHECK(server.get("/api/v1/runtime/logs?limit=2000&after=0&level=warning", admin).document() ==
+        CHECK(server.get(std::string("/api/runtime/logs") + query, admin).status == 400);
+    CHECK(server.get("/api/runtime/metrics?limit=1&since=2024-01-02T03:04:05.500+00:00", admin).status == 200);
+    CHECK(server.get("/api/runtime/logs?limit=2000&after=0&level=warning", admin).document() ==
         json({{"data", json::array()}}));
-    const auto serving = server.get("/api/v1/runtime/serving", admin).document();
+    const auto serving = server.get("/api/runtime/serving", admin).document();
     CHECK(serving.at("scope") == "session");
     CHECK(serving.at("started_at").get<double>() > 0);
     CHECK(serving.at("activity").empty());
     CHECK(serving.at("totals") == json({{"completed_requests", 0}, {"prompt_tokens", 0}, {"prefill_tokens", 0},
         {"completion_tokens", 0}, {"cached_tokens", 0}, {"prefill_tps", nullptr}, {"decode_tps", nullptr},
         {"ttft_ms", nullptr}, {"cache_hit_rate", nullptr}}));
-    CHECK(server.get("/api/v1/runtime/serving?scope=alltime&model=any", admin).document().at("scope") == "alltime");
-    CHECK(server.get("/api/v1/runtime/serving?scope=week", admin).status == 400);
-    CHECK(server.get("/api/v1/runtime/serving?model=", admin).status == 400);
-    const auto resources = server.get("/api/v1/runtime/resources", admin).document();
+    CHECK(server.get("/api/runtime/serving?scope=alltime&model=any", admin).document().at("scope") == "alltime");
+    CHECK(server.get("/api/runtime/serving?scope=week", admin).status == 400);
+    CHECK(server.get("/api/runtime/serving?model=", admin).status == 400);
+    const auto resources = server.get("/api/runtime/resources", admin).document();
     CHECK(resources.at("cpu_name").is_null());
     CHECK(resources.at("cpu_cores").get<int>() >= 1);
     CHECK(resources.at("gpus").empty() && resources.at("disks").empty() && resources.at("weights").empty());
@@ -725,7 +725,7 @@ void runtime_observation() {
         resources.at("memory_bandwidth_limit_bytes_per_second").is_null() &&
         resources.at("memory_bandwidth_utilization_percent").is_null());
     std::this_thread::sleep_for(std::chrono::milliseconds(1200));
-    const auto second = server.get("/api/v1/runtime/resources", admin).document();
+    const auto second = server.get("/api/runtime/resources", admin).document();
     const auto interval = second.at("interval_seconds").get<double>();
     const auto utilization = second.at("cpu_utilization_percent").get<double>();
     CHECK(interval >= 1.0 && interval <= 10.0);
@@ -736,28 +736,28 @@ void runtime_observation() {
 void model_catalog() {
     Fixture f;
     auto server = f.start({}, root_environment);
-    CHECK(server.get("/api/v1/models").status == 401);
-    CHECK(server.get("/api/v1/models", admin).document().at("data").empty());
-    const auto roots = server.get("/api/v1/models/directories", admin).document();
+    CHECK(server.get("/api/models").status == 401);
+    CHECK(server.get("/api/models", admin).document().at("data").empty());
+    const auto roots = server.get("/api/models/directories", admin).document();
     CHECK(roots.at("current_path").is_null());
     CHECK(roots.at("data").size() == 1);
     const auto root_id = roots.at("data")[0].at("id").get<std::string>();
     CHECK(root_id.size() == 32);
     const auto root = f.data / "models";
-    const auto browse = server.get("/api/v1/models/directories?directory_id=" + root_id, admin).document();
+    const auto browse = server.get("/api/models/directories?directory_id=" + root_id, admin).document();
     CHECK(browse.at("current_path") == fs::canonical(root).u8string());
     CHECK(!browse.at("can_open_directory").get<bool>());
     CHECK(!browse.at("parent_id").is_null());
-    CHECK(server.get("/api/v1/models?refresh=invalid", admin).status == 400);
+    CHECK(server.get("/api/models?refresh=invalid", admin).status == 400);
     for (const auto* query : {"directory_id=invalid", "directory_id=", "path=", "path=%00bad", "directory_id=00000000000000000000000000000000&path=/"})
-        CHECK(server.get(std::string("/api/v1/models/directories?") + query, admin).status == 400);
-    CHECK(server.get("/api/v1/models/directories?directory_id=00000000000000000000000000000000", admin).status == 404);
+        CHECK(server.get(std::string("/api/models/directories?") + query, admin).status == 400);
+    CHECK(server.get("/api/models/directories?directory_id=00000000000000000000000000000000", admin).status == 404);
     write_hf(root / "alpha");
     write_mfq(root / "beta.MFQ");
     write_file(root / "broken.mfq", "broken");
     write_file(root / "split-00002-of-00003.mfq", "missing shards");
-    CHECK(server.get("/api/v1/models", admin).document().at("data").empty());
-    const auto artifacts = server.get("/api/v1/models?refresh=true", admin).document().at("data");
+    CHECK(server.get("/api/models", admin).document().at("data").empty());
+    const auto artifacts = server.get("/api/models?refresh=true", admin).document().at("data");
     CHECK(artifacts.size() == 4);
     CHECK(artifacts[0].at("name") == "alpha");
     CHECK(artifacts[0].at("format") == "hf");
@@ -781,19 +781,19 @@ void model_catalog() {
     CHECK(artifacts.dump().find(f.root.u8string()) == std::string::npos);
     const auto hf_id = artifacts[0].at("id").get<std::string>();
     const auto mfq_id = artifacts[1].at("id").get<std::string>();
-    CHECK(server.get("/api/v1/models/" + hf_id + "/directory", admin).document().at("current_path") == (root / "alpha").u8string());
-    CHECK(server.get("/api/v1/models/" + mfq_id + "/directory", admin).document().at("current_path") == root.u8string());
-    CHECK(server.get("/api/v1/models/invalid/directory", admin).status == 400);
-    const auto files = server.get("/api/v1/models/directories?directory_id=" + root_id, admin).document();
+    CHECK(server.get("/api/models/" + hf_id + "/directory", admin).document().at("current_path") == (root / "alpha").u8string());
+    CHECK(server.get("/api/models/" + mfq_id + "/directory", admin).document().at("current_path") == root.u8string());
+    CHECK(server.get("/api/models/invalid/directory", admin).status == 400);
+    const auto files = server.get("/api/models/directories?directory_id=" + root_id, admin).document();
     CHECK(files.at("model_file_count") == 4);
     CHECK(files.at("files").size() == 3);
     CHECK(files.at("data").size() == 1);
 
     const auto external = f.root / fs::u8path("外部 models");
     write_hf(external / "gamma");
-    const auto selected = server.get("/api/v1/models/directories?path=" + httplib::encode_uri_component(external.u8string()), admin).document();
+    const auto selected = server.get("/api/models/directories?path=" + httplib::encode_uri_component(external.u8string()), admin).document();
     const auto source = json{{"directory_id", selected.at("current_id")}};
-    const auto registered = server.send("POST", "/api/v1/models/directories/register", source, admin);
+    const auto registered = server.send("POST", "/api/models/directories/register", source, admin);
     CHECK(registered.status == 200);
     CHECK(registered.document().at("data").size() == 1);
     const auto gamma_id = registered.document().at("data")[0].at("id");
@@ -801,24 +801,24 @@ void model_catalog() {
     const auto saved = read_file(index);
     CHECK(json::parse(saved).at("version") == 1);
     CHECK(json::parse(saved).at("files") == json({(external / "gamma").u8string()}));
-    CHECK(server.send("POST", "/api/v1/models/directories/register", source, admin).document().at("data").size() == 1);
-    CHECK(server.get("/api/v1/models?refresh=1", admin).document().at("data").size() == 5);
+    CHECK(server.send("POST", "/api/models/directories/register", source, admin).document().at("data").size() == 1);
+    CHECK(server.get("/api/models?refresh=1", admin).document().at("data").size() == 5);
     for (const auto& input : std::vector<json>{json::object(), json::array(), {{"path", ""}}, {{"path", 42}},
             {{"path", external.u8string()}, {"directory_id", root_id}}, {{"path", external.u8string()}, {"unexpected", true}},
             {{"path", external.u8string()}, {"directory_id", ""}}})
-        CHECK(server.send("POST", "/api/v1/models/directories/register", input, admin).status == 400);
-    CHECK(server.send("POST", "/api/v1/models/directories/register", {{"directory_id", "00000000000000000000000000000000"}}, admin).status == 404);
+        CHECK(server.send("POST", "/api/models/directories/register", input, admin).status == 400);
+    CHECK(server.send("POST", "/api/models/directories/register", {{"directory_id", "00000000000000000000000000000000"}}, admin).status == 404);
     fs::create_directory(f.root / "empty");
-    CHECK(server.send("POST", "/api/v1/models/directories/register", {{"path", (f.root / "empty").u8string()}}, admin).status == 400);
+    CHECK(server.send("POST", "/api/models/directories/register", {{"path", (f.root / "empty").u8string()}}, admin).status == 400);
     write_hf(f.root / "duplicate" / "alpha");
-    CHECK(server.send("POST", "/api/v1/models/directories/register", {{"path", (f.root / "duplicate").u8string()}}, admin).status == 409);
+    CHECK(server.send("POST", "/api/models/directories/register", {{"path", (f.root / "duplicate").u8string()}}, admin).status == 409);
     CHECK(read_file(index) == saved);
-    CHECK(server.get("/api/v1/models", admin).document().at("data").size() == 5);
+    CHECK(server.get("/api/models", admin).document().at("data").size() == 5);
     auto deep = f.root / "deep";
     for (int i = 0; i < 34; ++i) deep /= "d";
     fs::create_directories(deep);
     write_mfq(deep / "deep.mfq");
-    CHECK(server.send("POST", "/api/v1/models/directories/register", {{"path", (f.root / "deep").u8string()}}, admin).status == 413);
+    CHECK(server.send("POST", "/api/models/directories/register", {{"path", (f.root / "deep").u8string()}}, admin).status == 413);
     CHECK(read_file(index) == saved);
     json large{{"version", 1}, {"files", json::array()}};
     constexpr std::size_t limit = 4 * 1024 * 1024;
@@ -836,23 +836,23 @@ void model_catalog() {
     CHECK(large_saved.size() == limit - 1);
     CHECK(large["files"].size() < 10000);
     write_file(index, large_saved);
-    CHECK(server.send("POST", "/api/v1/models/directories/register", source, admin).status == 413);
+    CHECK(server.send("POST", "/api/models/directories/register", source, admin).status == 413);
     CHECK(read_file(index) == large_saved);
     write_file(index, saved);
     write_file(index, "{invalid");
-    CHECK(server.get("/api/v1/models?refresh=true", admin).status == 500);
+    CHECK(server.get("/api/models?refresh=true", admin).status == 500);
     CHECK(read_file(index) == "{invalid");
     write_file(index, saved);
     server.stop();
     auto restarted = f.start({}, root_environment);
-    const auto recovered = restarted.get("/api/v1/models", admin).document().at("data");
+    const auto recovered = restarted.get("/api/models", admin).document().at("data");
     CHECK(recovered.size() == 5);
     CHECK(recovered[0].at("id") == hf_id);
     CHECK(recovered[1].at("id") == mfq_id);
     CHECK(recovered[3].at("id") == gamma_id);
-    CHECK(restarted.get("/api/v1/models/directories?directory_id=" + root_id, admin).status == 404);
+    CHECK(restarted.get("/api/models/directories?directory_id=" + root_id, admin).status == 404);
     fs::remove(external / "gamma" / "model.safetensors");
-    CHECK(restarted.get("/api/v1/models?refresh=true", admin).document().at("data").size() == 4);
+    CHECK(restarted.get("/api/models?refresh=true", admin).document().at("data").size() == 4);
 }
 
 /** Verifies checkpoint analysis and cache profiles match the Python response shape. */
@@ -870,12 +870,12 @@ void model_inspection() {
         json{{"name", "model.block.1.mlp.down_proj.weight"}, {"dtype", "BF16"}, {"shape", {8, 16}}, {"bytes", 256}}}));
     auto server = f.start({}, root_environment);
     write_mfq(root / "beta.mfq");
-    const auto artifacts = server.get("/api/v1/models?refresh=true", admin).document().at("data");
+    const auto artifacts = server.get("/api/models?refresh=true", admin).document().at("data");
     CHECK(artifacts.size() == 2);
     std::string id, tq_id;
     for (const auto& item : artifacts) (item.at("name") == "alpha" ? id : tq_id) = item.at("id").get<std::string>();
     CHECK(!id.empty() && !tq_id.empty());
-    const auto analysis = server.get("/api/v1/models/" + id + "/analysis", admin);
+    const auto analysis = server.get("/api/models/" + id + "/analysis", admin);
     CHECK(analysis.status == 200);
     const auto body = analysis.document();
     CHECK(body.at("model_id") == id);
@@ -923,22 +923,22 @@ void model_inspection() {
         {"layers", 2}, {"bytes_per_row", 32}, {"tokens_per_row", 1}, {"allocation", "power_of_two"}, {"minimum_rows", 16},
         {"row_rounding", "ceil"}, {"active_after", 0}, {"max_read_rows_per_token", nullptr}, {"head_dimension", 4},
         {"kv_heads", 1}}));
-    CHECK(server.get("/api/v1/models/" + id + "/cache-profile", admin).document() == profile);
-    CHECK(server.get("/api/v1/models/" + id + "/cache-profile?include_recurrent=true", admin).document() == profile);
-    CHECK(server.get("/api/v1/models/" + id + "/cache-profile?include_recurrent=maybe", admin).status == 400);
-    CHECK(server.get("/api/v1/models/invalid/analysis", admin).status == 404);
-    CHECK(server.get("/api/v1/models/00000000000000000000000000000000/analysis", admin).status == 404);
-    CHECK(server.get("/api/v1/models/00000000000000000000000000000000/cache-profile", admin).status == 404);
+    CHECK(server.get("/api/models/" + id + "/cache-profile", admin).document() == profile);
+    CHECK(server.get("/api/models/" + id + "/cache-profile?include_recurrent=true", admin).document() == profile);
+    CHECK(server.get("/api/models/" + id + "/cache-profile?include_recurrent=maybe", admin).status == 400);
+    CHECK(server.get("/api/models/invalid/analysis", admin).status == 404);
+    CHECK(server.get("/api/models/00000000000000000000000000000000/analysis", admin).status == 404);
+    CHECK(server.get("/api/models/00000000000000000000000000000000/cache-profile", admin).status == 404);
     // An unreadable checkpoint stays listed but answers both inspection routes with 422.
     write_file(root / "broken.mfq", "broken");
-    const auto listed = server.get("/api/v1/models?refresh=true", admin).document().at("data");
+    const auto listed = server.get("/api/models?refresh=true", admin).document().at("data");
     CHECK(listed.size() == 3);
     const auto broken_id = listed[2].at("id").get<std::string>();
     CHECK(listed[2].at("complete") == false);
-    CHECK(server.get("/api/v1/models/" + broken_id + "/analysis", admin).status == 422);
-    CHECK(server.get("/api/v1/models/" + broken_id + "/cache-profile", admin).status == 422);
+    CHECK(server.get("/api/models/" + broken_id + "/analysis", admin).status == 422);
+    CHECK(server.get("/api/models/" + broken_id + "/cache-profile", admin).status == 422);
     // A container without stored shapes still analyses its tensors from the payload headers.
-    const auto container = server.get("/api/v1/models/" + tq_id + "/analysis", admin).document();
+    const auto container = server.get("/api/models/" + tq_id + "/analysis", admin).document();
     CHECK(container.at("format") == "tq");
     CHECK(container.at("architecture") == "qwen3_5");
     CHECK(container.at("tensors").size() == 1);
@@ -949,7 +949,7 @@ void model_inspection() {
     CHECK(container.at("cache_profile").is_null());
     // An architecture without a cache model answers with a null profile instead of an error.
     write_file(root / "alpha" / "config.json", R"({"model_type":"unsupported_kind"})");
-    const auto unsupported = server.get("/api/v1/models/" + id + "/cache-profile", admin);
+    const auto unsupported = server.get("/api/models/" + id + "/cache-profile", admin);
     CHECK(unsupported.status == 200);
     CHECK(unsupported.document().is_null());
 }
@@ -979,7 +979,7 @@ void model_deletion() {
     write_file(root / "beta-00002-of-00002.tq", "second shard");
     write_file(root / "beta.mfq.notes.json", "{}");
     auto server = f.start({}, root_environment);
-    const auto listed = [&] { return server.get("/api/v1/models?refresh=true", admin).document().at("data"); };
+    const auto listed = [&] { return server.get("/api/models?refresh=true", admin).document().at("data"); };
     CHECK(listed().size() == 3);
     std::string hf_id, tq_id;
     for (const auto& item : listed()) {
@@ -987,7 +987,7 @@ void model_deletion() {
         else tq_id = item.at("id").get<std::string>();
     }
     CHECK(!hf_id.empty() && !tq_id.empty());
-    const auto plan = server.get("/api/v1/models/" + hf_id + "/deletion", admin);
+    const auto plan = server.get("/api/models/" + hf_id + "/deletion", admin);
     CHECK(plan.status == 200);
     const auto planned = plan.document();
     const auto token = planned.at("token").get<std::string>();
@@ -1001,12 +1001,12 @@ void model_deletion() {
     for (const auto* name : {"config.json", "model.safetensors.index.json", "part-0.safetensors", "part-1.safetensors"})
         total += fs::file_size(alpha / name);
     CHECK(planned.at("total_bytes") == total);
-    CHECK(server.get("/api/v1/models/invalid/deletion", admin).status == 404);
-    CHECK(server.get("/api/v1/models/00000000000000000000000000000000/deletion", admin).status == 404);
-    CHECK(server.send("POST", "/api/v1/models/00000000000000000000000000000000/delete", {{"token", token}}, admin).status == 404);
+    CHECK(server.get("/api/models/invalid/deletion", admin).status == 404);
+    CHECK(server.get("/api/models/00000000000000000000000000000000/deletion", admin).status == 404);
+    CHECK(server.send("POST", "/api/models/00000000000000000000000000000000/delete", {{"token", token}}, admin).status == 404);
     for (const auto& body : {json{{"token", "short"}}, json{{"token", std::string(64, 'A')}}, json{{"unexpected", 1}}, json::object()})
-        CHECK(server.send("POST", "/api/v1/models/" + hf_id + "/delete", body, admin).status == 400);
-    CHECK(server.send("POST", "/api/v1/models/" + hf_id + "/delete", {{"token", std::string(64, '0')}}, admin).status == 409);
+        CHECK(server.send("POST", "/api/models/" + hf_id + "/delete", body, admin).status == 400);
+    CHECK(server.send("POST", "/api/models/" + hf_id + "/delete", {{"token", std::string(64, '0')}}, admin).status == 409);
     CHECK(fs::exists(alpha / "config.json"));
     for (const auto* escaped : {"../escape.safetensors", "/tmp/escape.safetensors", "nested/part-0.bin"}) {
         write_file(gamma / "model.safetensors.index.json",
@@ -1014,25 +1014,25 @@ void model_deletion() {
         std::string current;
         for (const auto& item : listed()) if (item.at("name") == "gamma") current = item.at("id").get<std::string>();
         CHECK(!current.empty());
-        const auto refused = server.get("/api/v1/models/" + current + "/deletion", admin);
+        const auto refused = server.get("/api/models/" + current + "/deletion", admin);
         CHECK(refused.status == 409);
         CHECK(refused.document().at("error").at("code") == "model_delete_unsafe");
-        CHECK(server.send("POST", "/api/v1/models/" + current + "/delete", {{"token", token}}, admin).status == 409);
+        CHECK(server.send("POST", "/api/models/" + current + "/delete", {{"token", token}}, admin).status == 409);
     }
     CHECK(fs::exists(gamma / "part-0.safetensors") && fs::exists(alpha / "part-0.safetensors"));
-    const auto deleted = server.send("POST", "/api/v1/models/" + hf_id + "/delete", {{"token", token}}, admin);
+    const auto deleted = server.send("POST", "/api/models/" + hf_id + "/delete", {{"token", token}}, admin);
     CHECK(deleted.status == 200);
     CHECK(deleted.document().at("files") == 4);
     CHECK(deleted.document().at("total_bytes") == total);
     CHECK(!fs::exists(alpha / "config.json") && !fs::exists(alpha / "model.safetensors.index.json"));
     CHECK(!fs::exists(alpha / "part-0.safetensors") && !fs::exists(alpha / "part-1.safetensors"));
     CHECK(fs::exists(alpha / "tokenizer.json"));
-    CHECK(server.get("/api/v1/models/" + hf_id + "/deletion", admin).status == 404);
-    const auto shards = server.get("/api/v1/models/" + tq_id + "/deletion", admin).document();
+    CHECK(server.get("/api/models/" + hf_id + "/deletion", admin).status == 404);
+    const auto shards = server.get("/api/models/" + tq_id + "/deletion", admin).document();
     CHECK(shards.at("files") == json({fs::canonical(root / "beta-00001-of-00002.tq").u8string(),
         fs::canonical(root / "beta-00002-of-00002.tq").u8string()}));
     CHECK(shards.at("total_bytes") == 23);
-    const auto removed = server.send("POST", "/api/v1/models/" + tq_id + "/delete",
+    const auto removed = server.send("POST", "/api/models/" + tq_id + "/delete",
         {{"token", shards.at("token").get<std::string>()}}, admin);
     CHECK(removed.status == 200);
     CHECK(removed.document().at("files") == 2);
@@ -1052,7 +1052,7 @@ void directory_browsing() {
     write_mfq(root / "visible.mfq");
     auto server = f.start();
     const auto browse = [&](const fs::path& path) {
-        return server.get("/api/v1/models/directories?path=" + httplib::encode_uri_component(path.u8string()));
+        return server.get("/api/models/directories?path=" + httplib::encode_uri_component(path.u8string()));
     };
     const auto initial = browse(root);
     CHECK(initial.status == 200);
@@ -1115,7 +1115,7 @@ void directory_browsing() {
             const auto selected = browse(busy);
             CHECK(selected.status == 404);
             CHECK(selected.document().at("error").at("code") == "model_directory_not_found");
-            CHECK(server.get("/api/v1/models/directories?directory_id=" + busy_id).status == 404);
+            CHECK(server.get("/api/models/directories?directory_id=" + busy_id).status == 404);
         }
     }
     CHECK(browse(busy).status == 200);
@@ -1129,7 +1129,7 @@ void directory_browsing() {
         CHECK(missing.status == 404);
         CHECK(missing.document().at("error").at("code") == "model_directory_not_found");
     }
-    CHECK(server.get("/api/v1/models/directories?directory_id=" + visible_id).status == 404);
+    CHECK(server.get("/api/models/directories?directory_id=" + visible_id).status == 404);
     server.stop();
 }
 
@@ -1140,21 +1140,21 @@ void model_roots() {
     write_hf(second / "two");
     write_hf(environment / "ignored");
     auto explicit_roots = f.start({"--model-dir", first.u8string(), "--model-dir", second.u8string()}, {{"TYLOINFER_SERVER_MODEL_DIRS", environment.u8string()}});
-    CHECK(explicit_roots.get("/api/v1/models").document().at("data").size() == 2);
-    CHECK(explicit_roots.get("/api/v1/models/directories").document().at("data").size() == 2);
+    CHECK(explicit_roots.get("/api/models").document().at("data").size() == 2);
+    CHECK(explicit_roots.get("/api/models/directories").document().at("data").size() == 2);
     explicit_roots.stop();
     auto from_environment = f.start({}, {{"TYLOINFER_SERVER_MODEL_DIRS", environment.u8string()}});
-    CHECK(from_environment.get("/api/v1/models").document().at("data")[0].at("name") == "ignored");
+    CHECK(from_environment.get("/api/models").document().at("data")[0].at("name") == "ignored");
     from_environment.stop();
 #ifndef _WIN32
     fs::create_directory_symlink(first, f.root / "alias");
     auto alias = f.start({"--model-dir", first.u8string(), "--model-dir", (f.root / "alias").u8string()});
-    CHECK(alias.get("/api/v1/models/directories").document().at("data").size() == 1);
+    CHECK(alias.get("/api/models/directories").document().at("data").size() == 1);
     alias.stop();
 #endif
     write_mfq(environment / "ignored.mfq");
     auto dual_format = f.start({"--model-dir", environment.u8string()});
-    const auto artifacts = dual_format.get("/api/v1/models").document().at("data");
+    const auto artifacts = dual_format.get("/api/models").document().at("data");
     CHECK(artifacts.size() == 1);
     CHECK(artifacts[0].at("format") == "tq");
 }
@@ -1203,7 +1203,7 @@ void databases_and_migration() {
         db.execute("CREATE TRIGGER reject_version_rewrite BEFORE INSERT ON schema_meta "
             "WHEN NEW.key='schema_version' BEGIN SELECT RAISE(ABORT,'current version must not be rewritten'); END;");
         auto current = f.start({"--db", explicit_database.u8string()});
-        CHECK(current.get("/api/v1/auth/keys").status == 200);
+        CHECK(current.get("/api/auth/keys").status == 200);
         current.stop();
         db.execute("DROP TRIGGER reject_version_rewrite;");
         db.execute("ALTER TABLE api_keys DROP COLUMN role;");
@@ -1240,7 +1240,7 @@ void databases_and_migration() {
         }
         auto server = f.start_at(data, {}, root_environment);
         CHECK(!fs::exists(data / "server.sqlite3"));
-        CHECK(server.get("/api/v1/auth/keys", bearer("old-key")).status == 200);
+        CHECK(server.get("/api/auth/keys", bearer("old-key")).status == 200);
         server.stop();
         Database db(legacy);
         CHECK(db.scalar("SELECT value FROM schema_meta WHERE key='schema_version'") == "19");

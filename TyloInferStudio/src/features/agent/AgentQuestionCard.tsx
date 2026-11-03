@@ -12,7 +12,7 @@ export function AgentQuestionCard({ pending, onAnswered }: { pending: AgentQuest
   async function submit() {
     setSending(true); setError('');
     try {
-      await request('/api/v1/agent/answers', { method: 'POST', body: JSON.stringify({ event_id: pending.eventId,
+      await request('/api/agent/answers', { method: 'POST', body: JSON.stringify({ event_id: pending.eventId,
         answers: pending.request.questions.map(question => ({ id: question.id, selected: answers[question.id]?.selected || [], custom: answers[question.id]?.custom || '' })) }) });
       await onAnswered();
     } catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); }

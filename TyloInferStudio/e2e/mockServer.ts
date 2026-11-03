@@ -90,49 +90,49 @@ export async function mockStudioServer(page: Page, options: MockOptions = {}) {
       JSON.stringify({ language, theme }),
     );
   }, { language: options.language ?? 'en', theme: options.theme ?? 'light', preserveSettings: options.preserveSettings ?? false });
-  await page.route('**/api/v1/**', async (route) => {
+  await page.route('**/api/**', async (route) => {
     const path = new URL(route.request().url()).pathname;
     const method = route.request().method();
     state.requests.push(`${method} ${path}`);
     const json = async (value: unknown) => route.fulfill({ json: value });
-    if (path === '/api/v1/auth/policy' && method === 'GET') return json({ enabled: false, has_key: false });
-    if (path === '/api/v1/agent/state' || path === '/api/v1/agent/start') return json({
+    if (path === '/api/auth/policy' && method === 'GET') return json({ enabled: false, has_key: false });
+    if (path === '/api/agent/state' || path === '/api/agent/start') return json({
       running: false, workspaces: [], sessions: [], models: [], approvals: [],
     });
-    if (/^\/api\/v1\/agent\/sessions\/[^/]+\/controls$/.test(path)) return json({
+    if (/^\/api\/agent\/sessions\/[^/]+\/controls$/.test(path)) return json({
       values: { modelSelection: { next: null }, plan: { active: false, pending: null }, permissions: { currentValue: 'workspace-write' } },
       commands: [{ name: 'plan', description: 'Enter or leave plan mode', input: { hint: '[off|message]' } }],
       permissions: [{ value: 'read-only', name: 'read-only' }, { value: 'workspace-write', name: 'workspace-write' }, { value: 'danger-full-access', name: 'danger-full-access' }],
     });
-    if (path === '/api/v1/hub/official') return json(officialCatalog);
-    if (path === '/api/v1/hub/download-directory') return json({ directory: null, actual_directory: '/tmp/studio/models', default_directory: '/tmp/studio/models' });
-    if (path === '/api/v1/quantization/workspace' && method === 'GET')
+    if (path === '/api/hub/official') return json(officialCatalog);
+    if (path === '/api/hub/download-directory') return json({ directory: null, actual_directory: '/tmp/studio/models', default_directory: '/tmp/studio/models' });
+    if (path === '/api/quantization/workspace' && method === 'GET')
       return json({ import_directory: '/models', export_directory: '/outputs',
         candidates: ['NVQ3J-L', 'NINT4', 'NINT8'],
         candidate_groups: { NVQ: ['NVQ3J-L'], NINT: ['NINT4', 'NINT8'] }, official_imatrix_url: null });
-    if (path === '/api/v1/runtime/memory-policy') return json({ model_limit_bytes: null, prefix_limit_bytes: null, prefix_directory: null, actual_prefix_directory: '/data/tyloinfer/prefix-cache' });
-    if (path === '/api/v1/runtime/model-aliases') return json({ aliases: {} });
-    if (path === '/api/v1/runtime/serving') return json({
+    if (path === '/api/runtime/memory-policy') return json({ model_limit_bytes: null, prefix_limit_bytes: null, prefix_directory: null, actual_prefix_directory: '/data/tyloinfer/prefix-cache' });
+    if (path === '/api/runtime/model-aliases') return json({ aliases: {} });
+    if (path === '/api/runtime/serving') return json({
       scope: new URL(route.request().url()).searchParams.get('scope') || 'session',
       started_at: Date.now() / 1000, activity: [],
       totals: { completed_requests: 0, prompt_tokens: 0, prefill_tokens: 0,
         completion_tokens: 0, cached_tokens: 0, prefill_tps: null, decode_tps: null,
         ttft_ms: null, cache_hit_rate: null },
     });
-    if (path === '/api/v1/runtime/resources') return json({ sampled_at: 1, interval_seconds: 2,
+    if (path === '/api/runtime/resources') return json({ sampled_at: 1, interval_seconds: 2,
       cpu_utilization_percent: null, gpus: [], disks: [], weights: [], memory_bandwidth_bytes_per_second: null,
       memory_bandwidth_limit_bytes_per_second: null, memory_bandwidth_utilization_percent: null });
-    if (path === '/api/v1/runtime/cache/entries') return json({ directory: '/data/tyloinfer/prefix-cache',
+    if (path === '/api/runtime/cache/entries') return json({ directory: '/data/tyloinfer/prefix-cache',
       total_bytes: 0, total_blocks: 0, can_clear: true, offset: 0, limit: 100, data: [], blocks: [] });
-    if (path === '/api/v1/runtime/context-policy') return json({ max_context_size: null,
+    if (path === '/api/runtime/context-policy') return json({ max_context_size: null,
       model_overrides: {}, model_yarn_enabled: {}, model_qsa_kv_offload: {}, model_kv_quantization: {}, fallback_context_size: 32768 });
-    if (path.startsWith('/api/v1/runtime/yarn/')) return json({ supported: false,
+    if (path.startsWith('/api/runtime/yarn/')) return json({ supported: false,
       native_context: 262144, maximum_context: 262144, maximum_factor: 1, enabled: false, effective_factor: 1 });
-    if (/^\/api\/v1\/models\/[^/]+\/cache-profile$/.test(path)) return json(null);
-    if (path === '/api/v1/evaluations/tools')
+    if (/^\/api\/models\/[^/]+\/cache-profile$/.test(path)) return json(null);
+    if (path === '/api/evaluations/tools')
       return json({ workspace_root: null, api_base: 'http://127.0.0.1:8090/v1',
         quality_available: false, benchmark_available: false, accuracy_available: false, task_benchmarks: {} });
-    if (path === '/api/v1/runtime/status')
+    if (path === '/api/runtime/status')
       return json({
         runtime_state: 'ready',
         model,
@@ -144,7 +144,7 @@ export async function mockStudioServer(page: Page, options: MockOptions = {}) {
         active_requests: 0,
         sampling_defaults: {},
       });
-    if (path === '/api/v1/runtime/capabilities')
+    if (path === '/api/runtime/capabilities')
       return json({
         model,
         model_type: 'Test',
@@ -153,9 +153,9 @@ export async function mockStudioServer(page: Page, options: MockOptions = {}) {
         mtp_available: false,
         duplex_available: false,
       });
-    if (path === '/api/v1/runtime/models') return json({ data: [{ id: model }] });
-    if (path === '/api/v1/runtime/listener') return json({ host: '127.0.0.1', port: 8090, anthropic_port: 8091, configurable: true });
-    if (path === '/api/v1/runtime/instances')
+    if (path === '/api/runtime/models') return json({ data: [{ id: model }] });
+    if (path === '/api/runtime/listener') return json({ host: '127.0.0.1', port: 8090, anthropic_port: 8091, configurable: true });
+    if (path === '/api/runtime/instances')
       return json({
         data: [
           {
@@ -168,13 +168,13 @@ export async function mockStudioServer(page: Page, options: MockOptions = {}) {
           },
         ],
       });
-    if (path === '/api/v1/runtime/realtime/capabilities')
+    if (path === '/api/runtime/realtime/capabilities')
       return json({ available: false, defaults: {} });
-    if (path === '/api/v1/components/voice-output') return json({ available: false, ready: false });
-    if (path === '/api/v1/sessions') return json({ data: [session] });
-    if (path === '/api/v1/sessions/session-1')
+    if (path === '/api/components/voice-output') return json({ available: false, ready: false });
+    if (path === '/api/sessions') return json({ data: [session] });
+    if (path === '/api/sessions/session-1')
       return json({ ...session, revision: state.submissions });
-    if (path === '/api/v1/sessions/session-1/messages') {
+    if (path === '/api/sessions/session-1/messages') {
       if (options.failFirstSync && state.submissions > 0 && !failedSync) {
         failedSync = true;
         return route.fulfill({
@@ -191,14 +191,14 @@ export async function mockStudioServer(page: Page, options: MockOptions = {}) {
       }
       return json({ data: messages });
     }
-    if (path === '/api/v1/sessions/session-1/responses/cancel') {
+    if (path === '/api/sessions/session-1/responses/cancel') {
       state.cancellations += 1;
       releasePending?.();
       return json({ accepted: true });
     }
-    if (path === '/api/v1/sessions/session-1/responses' && method === 'GET')
+    if (path === '/api/sessions/session-1/responses' && method === 'GET')
       return json({ data: responses });
-    if (path === '/api/v1/sessions/session-1/responses' && method === 'POST') {
+    if (path === '/api/sessions/session-1/responses' && method === 'POST') {
       state.submissions += 1;
       if (options.rejectFirstSubmission && state.submissions === 1)
         return route.fulfill({
@@ -278,17 +278,17 @@ export async function mockStudioServer(page: Page, options: MockOptions = {}) {
         .catch(() => undefined);
       return;
     }
-    if (path === '/api/v1/media' && method === 'POST')
+    if (path === '/api/media' && method === 'POST')
       return json({
         media: { id: 'media-1', sha256: 'test', mime_type: 'text/plain', byte_size: 4 },
         created_at: createdAt,
       });
-    if (path === '/api/v1/documents' && method === 'POST')
+    if (path === '/api/documents' && method === 'POST')
       return json({
         media: { id: 'media-1', sha256: 'test', mime_type: 'text/plain', byte_size: 4 },
         name: 'notes.txt', text: 'note', extractor: 'text', created_at: createdAt,
       });
-    if (path === '/api/v1/models/directories') {
+    if (path === '/api/models/directories') {
       const query = new URL(route.request().url()).searchParams;
       const directory = query.get('path') || ({ 'root-dir': '/', 'models-dir': '/models', 'empty-dir': '/models/empty' }[query.get('directory_id') || ''] ?? '/');
       const root = directory === '/';
@@ -303,18 +303,18 @@ export async function mockStudioServer(page: Page, options: MockOptions = {}) {
     }
     if (
       [
-        '/api/v1/models',
-        '/api/v1/jobs',
-        '/api/v1/runtime/metrics',
-        '/api/v1/runtime/logs',
-        '/api/v1/jobs/kinds',
-        '/api/v1/presets',
-        '/api/v1/runtime/profiles',
-        '/api/v1/artifacts/lineage',
-        '/api/v1/datasets',
-        '/api/v1/datasets/catalog',
-        '/api/v1/evaluations',
-        '/api/v1/cluster/nodes',
+        '/api/models',
+        '/api/jobs',
+        '/api/runtime/metrics',
+        '/api/runtime/logs',
+        '/api/jobs/kinds',
+        '/api/presets',
+        '/api/runtime/profiles',
+        '/api/artifacts/lineage',
+        '/api/datasets',
+        '/api/datasets/catalog',
+        '/api/evaluations',
+        '/api/cluster/nodes',
       ].includes(path)
     )
       return json({ data: [] });

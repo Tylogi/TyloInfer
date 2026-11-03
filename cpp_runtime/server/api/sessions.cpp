@@ -36,46 +36,46 @@ struct ResponseStream {
 };
 }
 void register_sessions(httplib::Server& http, Sessions& sessions, std::shared_ptr<std::atomic<std::size_t>> active) {
-    http.Post("/api/v1/sessions", [&](const httplib::Request& request, httplib::Response& response) {
+    http.Post("/api/sessions", [&](const httplib::Request& request, httplib::Response& response) {
         set_json(response, sessions.create(parse_json(request)), 201);
     });
-    http.Get("/api/v1/sessions", [&](const httplib::Request& request, httplib::Response& response) {
+    http.Get("/api/sessions", [&](const httplib::Request& request, httplib::Response& response) {
         set_json(response, sessions.list(page(request, "limit", 50, 1, 200), page(request, "offset", 0, 0, INT64_MAX)));
     });
-    http.Post("/api/v1/sessions/import", [&](const httplib::Request& request, httplib::Response& response) {
+    http.Post("/api/sessions/import", [&](const httplib::Request& request, httplib::Response& response) {
         set_json(response, sessions.import_archive(parse_json(request)), 201);
     });
-    http.Get("/api/v1/sessions/([0-9a-fA-F-]{36})", [&](const httplib::Request& request, httplib::Response& response) {
+    http.Get("/api/sessions/([0-9a-fA-F-]{36})", [&](const httplib::Request& request, httplib::Response& response) {
         set_json(response, sessions.get(normalize_uuid(request.matches[1])));
     });
-    http.Patch("/api/v1/sessions/([0-9a-fA-F-]{36})", [&](const httplib::Request& request, httplib::Response& response) {
+    http.Patch("/api/sessions/([0-9a-fA-F-]{36})", [&](const httplib::Request& request, httplib::Response& response) {
         set_json(response, sessions.update(normalize_uuid(request.matches[1]), parse_json(request)));
     });
-    http.Delete("/api/v1/sessions/([0-9a-fA-F-]{36})", [&](const httplib::Request& request, httplib::Response& response) {
+    http.Delete("/api/sessions/([0-9a-fA-F-]{36})", [&](const httplib::Request& request, httplib::Response& response) {
         sessions.erase(normalize_uuid(request.matches[1])); response.status = 204;
     });
-    http.Get("/api/v1/sessions/([0-9a-fA-F-]{36})/messages", [&](const httplib::Request& request, httplib::Response& response) {
+    http.Get("/api/sessions/([0-9a-fA-F-]{36})/messages", [&](const httplib::Request& request, httplib::Response& response) {
         set_json(response, sessions.messages(normalize_uuid(request.matches[1])));
     });
-    http.Post("/api/v1/sessions/([0-9a-fA-F-]{36})/messages", [&](const httplib::Request& request, httplib::Response& response) {
+    http.Post("/api/sessions/([0-9a-fA-F-]{36})/messages", [&](const httplib::Request& request, httplib::Response& response) {
         set_json(response, sessions.append(normalize_uuid(request.matches[1]), parse_json(request)), 201);
     });
-    http.Post("/api/v1/sessions/([0-9a-fA-F-]{36})/fork", [&](const httplib::Request& request, httplib::Response& response) {
+    http.Post("/api/sessions/([0-9a-fA-F-]{36})/fork", [&](const httplib::Request& request, httplib::Response& response) {
         set_json(response, sessions.fork(normalize_uuid(request.matches[1]), parse_json(request)), 201);
     });
-    http.Post("/api/v1/sessions/([0-9a-fA-F-]{36})/rewind", [&](const httplib::Request& request, httplib::Response& response) {
+    http.Post("/api/sessions/([0-9a-fA-F-]{36})/rewind", [&](const httplib::Request& request, httplib::Response& response) {
         set_json(response, sessions.rewind(normalize_uuid(request.matches[1]), parse_json(request)));
     });
-    http.Get("/api/v1/sessions/([0-9a-fA-F-]{36})/export", [&](const httplib::Request& request, httplib::Response& response) {
+    http.Get("/api/sessions/([0-9a-fA-F-]{36})/export", [&](const httplib::Request& request, httplib::Response& response) {
         set_json(response, sessions.export_archive(normalize_uuid(request.matches[1])));
     });
-    http.Get("/api/v1/sessions/([0-9a-fA-F-]{36})/responses", [&](const httplib::Request& request, httplib::Response& response) {
+    http.Get("/api/sessions/([0-9a-fA-F-]{36})/responses", [&](const httplib::Request& request, httplib::Response& response) {
         set_json(response, sessions.responses(normalize_uuid(request.matches[1]), page(request, "limit", 200, 1, 1000)));
     });
-    http.Post("/api/v1/sessions/([0-9a-fA-F-]{36})/responses/cancel", [&](const httplib::Request& request, httplib::Response& response) {
+    http.Post("/api/sessions/([0-9a-fA-F-]{36})/responses/cancel", [&](const httplib::Request& request, httplib::Response& response) {
         set_json(response, sessions.cancel(normalize_uuid(request.matches[1])));
     });
-    http.Post("/api/v1/sessions/([0-9a-fA-F-]{36})/responses", [&, active](const httplib::Request& request, httplib::Response& response) {
+    http.Post("/api/sessions/([0-9a-fA-F-]{36})/responses", [&, active](const httplib::Request& request, httplib::Response& response) {
         const auto body = parse_json(request);
         auto stream = std::make_shared<ResponseStream>(active);
         const auto id = normalize_uuid(request.matches[1]);
@@ -137,12 +137,12 @@ void register_sessions(httplib::Server& http, Sessions& sessions, std::shared_pt
                 return false;
             }, [stream](bool) {});
     });
-    http.Get("/api/v1/presets", [&](const httplib::Request&, httplib::Response& response) { set_json(response, sessions.presets()); });
-    http.Post("/api/v1/presets", [&](const httplib::Request& request, httplib::Response& response) { set_json(response, sessions.put_preset(parse_json(request)), 201); });
-    http.Put("/api/v1/presets/([0-9a-fA-F-]{36})", [&](const httplib::Request& request, httplib::Response& response) {
+    http.Get("/api/presets", [&](const httplib::Request&, httplib::Response& response) { set_json(response, sessions.presets()); });
+    http.Post("/api/presets", [&](const httplib::Request& request, httplib::Response& response) { set_json(response, sessions.put_preset(parse_json(request)), 201); });
+    http.Put("/api/presets/([0-9a-fA-F-]{36})", [&](const httplib::Request& request, httplib::Response& response) {
         set_json(response, sessions.put_preset(parse_json(request), normalize_uuid(request.matches[1])));
     });
-    http.Delete("/api/v1/presets/([0-9a-fA-F-]{36})", [&](const httplib::Request& request, httplib::Response& response) {
+    http.Delete("/api/presets/([0-9a-fA-F-]{36})", [&](const httplib::Request& request, httplib::Response& response) {
         sessions.erase_preset(normalize_uuid(request.matches[1])); response.status = 204;
     });
 }

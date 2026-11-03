@@ -69,7 +69,7 @@ export function AgentComposer({ sessionId, locked, running, revision, onSend, on
   useEffect(() => { alive.current = true; return () => { alive.current = false; }; }, []);
   async function refresh(signal?: AbortSignal) {
     if (!sessionId) return;
-    const value = await request<Controls>(`/api/v1/agent/sessions/${encodeURIComponent(sessionId)}/controls`, { signal });
+    const value = await request<Controls>(`/api/agent/sessions/${encodeURIComponent(sessionId)}/controls`, { signal });
     if (alive.current && !signal?.aborted) setControls(value);
   }
   useEffect(() => {
@@ -100,10 +100,10 @@ export function AgentComposer({ sessionId, locked, running, revision, onSend, on
     await operation(async () => { await agentRpc('session/selectModel', { request: { sessionId, ...selection } }); await refresh(); });
   }
   async function command(line: string, parts: AgentPromptPart[] = []) {
-    const result = await request<{ result: { text?: string } }>(`/api/v1/agent/sessions/${encodeURIComponent(sessionId!)}/commands`, {
+    const result = await request<{ result: { text?: string } }>(`/api/agent/sessions/${encodeURIComponent(sessionId!)}/commands`, {
       method: 'POST', body: JSON.stringify({ line, attachments: parts }) });
     if (line === '/export') {
-      const response = await fetch(apiUrl(`/api/v1/agent/sessions/${encodeURIComponent(sessionId!)}/export`), { headers: authorizedHeaders() });
+      const response = await fetch(apiUrl(`/api/agent/sessions/${encodeURIComponent(sessionId!)}/export`), { headers: authorizedHeaders() });
       if (!response.ok) throw await errorFromResponse(response);
       const url = URL.createObjectURL(await response.blob());
       const link = document.createElement('a'); link.href = url; link.download = 'conversation.zip'; link.click();
@@ -135,7 +135,7 @@ export function AgentComposer({ sessionId, locked, running, revision, onSend, on
           const data = await new Promise<string>((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(String(reader.result).split(',')[1]); reader.onerror = () => reject(new Error(tr('无法读取文件。', 'Could not read the file.'))); reader.readAsDataURL(file); });
           part = { type: 'image', name: file.name, mediaType: file.type, data };
         } else {
-          const receipt = await request<{ receiptId: string }>(`/api/v1/agent/sessions/${encodeURIComponent(sessionId)}/files?name=${encodeURIComponent(file.name)}`, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: file });
+          const receipt = await request<{ receiptId: string }>(`/api/agent/sessions/${encodeURIComponent(sessionId)}/files?name=${encodeURIComponent(file.name)}`, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: file });
           part = { type: 'file', receiptId: receipt.receiptId };
         }
         if (alive.current) setAttachments(current => [...current, { id: crypto.randomUUID(), name: file.name, part }]);

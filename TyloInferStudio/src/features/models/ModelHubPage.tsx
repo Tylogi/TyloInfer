@@ -16,8 +16,8 @@ import { serverCapabilities } from '../../app/serverCapabilities';
 /** Keep repository downloads available while disabling native catalog and search resources. */
 export function ModelHubPage() {
   const { tr } = useSettings();
-  const { addJob, runtime } = useRuntime();
-  const capabilities = serverCapabilities(runtime);
+  const { addJob } = useRuntime();
+  const capabilities = serverCapabilities();
   const connectionScope = useConnectionScope();
   const jobs = useJobStore((state) => state.jobs);
   const downloads = jobs.filter(isModelDownload);

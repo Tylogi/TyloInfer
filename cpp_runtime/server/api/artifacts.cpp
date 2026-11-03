@@ -39,17 +39,17 @@ void valid_token(const std::string& token) {
 
 void register_artifacts(httplib::Server& http, ModelCatalog& catalog, ModelInstances& instances, const std::string& backend) {
     const bool cuda = backend == "cuda";
-    http.Get("/api/v1/models/([^/]+)/analysis", [&](const httplib::Request& request, httplib::Response& response) {
+    http.Get("/api/models/([^/]+)/analysis", [&](const httplib::Request& request, httplib::Response& response) {
         set_json(response, checkpoint_analysis_json(catalog.resolve(request.matches[1]), cuda));
     });
-    http.Get("/api/v1/models/([^/]+)/cache-profile", [&](const httplib::Request& request, httplib::Response& response) {
+    http.Get("/api/models/([^/]+)/cache-profile", [&](const httplib::Request& request, httplib::Response& response) {
         set_json(response, model_cache_profile_json(catalog.resolve(request.matches[1]),
             boolean_query(request, "include_recurrent"), cuda));
     });
-    http.Get("/api/v1/models/([^/]+)/deletion", [&](const httplib::Request& request, httplib::Response& response) {
+    http.Get("/api/models/([^/]+)/deletion", [&](const httplib::Request& request, httplib::Response& response) {
         set_json(response, deletion_plan_json(model_deletion_plan(catalog.resolve(request.matches[1]))));
     });
-    http.Post("/api/v1/models/([^/]+)/delete", [&](const httplib::Request& request, httplib::Response& response) {
+    http.Post("/api/models/([^/]+)/delete", [&](const httplib::Request& request, httplib::Response& response) {
         const auto body = parse_json(request);
         fields(body, {"token"});
         const auto token = selector(body, "token");

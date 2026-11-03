@@ -1105,7 +1105,7 @@ struct Server {
         const auto accepted = Json::parse(response->body);
         CHECK(accepted.at("status") == "accepted");
         const auto path = response->get_header_value("Location");
-        CHECK(path == "/api/v1/jobs/" + accepted.at("operation_id").get<std::string>());
+        CHECK(path == "/api/jobs/" + accepted.at("operation_id").get<std::string>());
         const auto deadline = Clock::now() + 60s;
         while (Clock::now() < deadline) {
             auto job = get(path.c_str());
@@ -1129,7 +1129,7 @@ std::string register_checkpoint(Server& server, const fs::path& source, const ch
         fs::create_hard_link(file.path(), path / file.path().filename(), error);
         if (error) fs::copy_file(file.path(), path / file.path().filename());
     }
-    const auto response = server.post("/api/v1/models/directories/register", {{"path", path_utf8(path)}});
+    const auto response = server.post("/api/models/directories/register", {{"path", path_utf8(path)}});
     CHECK(response && response->status == 200);
     return Json::parse(response->body).at("data").at(0).at("id");
 }
@@ -1138,16 +1138,16 @@ void shutdown_checks(const fs::path& executable) {
     Server server(executable, true);
     const auto alpha = server.root / "alpha", beta = server.root / "beta";
     fixture_model(alpha); fixture_model(beta);
-    auto registered = server.post("/api/v1/models/directories/register", {{"path", path_utf8(server.root)}});
+    auto registered = server.post("/api/models/directories/register", {{"path", path_utf8(server.root)}});
     CHECK(registered && registered->status == 200);
     std::map<std::string, std::string> artifacts;
     const auto listing = Json::parse(registered->body);
     for (const auto& artifact : listing["data"]) artifacts.emplace(artifact["name"], artifact["id"]);
-    const auto loaded = server.complete(server.post("/api/v1/models/load", {{"artifact_id", artifacts.at("alpha")}}));
+    const auto loaded = server.complete(server.post("/api/models/load", {{"artifact_id", artifacts.at("alpha")}}));
     CHECK(loaded["status"] == "succeeded");
-    const auto created = server.post("/api/v1/sessions", {{"model", "alpha"}});
+    const auto created = server.post("/api/sessions", {{"model", "alpha"}});
     CHECK(created && created->status == 201);
-    const auto session_path = "/api/v1/sessions/" + Json::parse(created->body)["id"].get<std::string>();
+    const auto session_path = "/api/sessions/" + Json::parse(created->body)["id"].get<std::string>();
     auto reply = std::async(std::launch::async, [&] { return server.post(session_path + "/responses", reply_input("slow")); });
     const auto deadline = Clock::now() + 5s;
     while (server.get(session_path.c_str())["state"] != "processing" && Clock::now() < deadline) std::this_thread::sleep_for(1ms);
@@ -1158,17 +1158,17 @@ void shutdown_checks(const fs::path& executable) {
     };
     auto ordinary = std::async(std::launch::async, [&] { return message(false); });
     auto stream = std::async(std::launch::async, [&] { return message(true); });
-    while (server.get("/api/v1/runtime/instances")["data"][0]["active_requests"] != 3 && Clock::now() < deadline)
+    while (server.get("/api/runtime/instances")["data"][0]["active_requests"] != 3 && Clock::now() < deadline)
         std::this_thread::sleep_for(1ms);
-    CHECK(server.get("/api/v1/runtime/instances")["data"][0]["active_requests"] == 3);
-    const auto loading = server.post("/api/v1/models/load", {{"artifact_id", artifacts.at("beta")}, {"requirements", {{"context_size", 15}}}});
+    CHECK(server.get("/api/runtime/instances")["data"][0]["active_requests"] == 3);
+    const auto loading = server.post("/api/models/load", {{"artifact_id", artifacts.at("beta")}, {"requirements", {{"context_size", 15}}}});
     CHECK(loading && loading->status == 202);
     while (!fs::exists(beta / "entered") && Clock::now() < deadline) std::this_thread::sleep_for(1ms);
     CHECK(fs::exists(beta / "entered"));
     server.process->close_input();
     httplib::Result rejected;
     do {
-        rejected = server.post("/api/v1/sessions", {{"model", "alpha"}});
+        rejected = server.post("/api/sessions", {{"model", "alpha"}});
         if (rejected && rejected->status == 503) break;
         std::this_thread::sleep_for(1ms);
     } while (Clock::now() < deadline);
@@ -1213,10 +1213,10 @@ void compat_checks(const fs::path& executable) {
     Server server(executable, true);
     fixture_model(server.root / "alpha"); fixture_model(server.root / "beta");
     write_file(server.root / "alpha.runtime.json", R"({"chat":{"top_k":7,"temperature":0.4,"enable_thinking":false}})");
-    const auto registered = server.post("/api/v1/models/directories/register", {{"path", path_utf8(server.root)}});
+    const auto registered = server.post("/api/models/directories/register", {{"path", path_utf8(server.root)}});
     CHECK(registered && registered->status == 200);
     const auto artifacts = Json::parse(registered->body)["data"];
-    for (const auto& artifact : artifacts) CHECK(server.complete(server.post("/api/v1/models/load", {{"artifact_id", artifact["id"]}}))["status"] == "succeeded");
+    for (const auto& artifact : artifacts) CHECK(server.complete(server.post("/api/models/load", {{"artifact_id", artifact["id"]}}))["status"] == "succeeded");
     httplib::Client client("127.0.0.1", server.port);
     const httplib::Headers anthropic{{"Anthropic-Version", "2023-06-01"}};
     CHECK(server.get("/v1")["endpoints"][1] == "/v1/chat/completions");
@@ -1352,7 +1352,7 @@ void compat_checks(const fs::path& executable) {
             CHECK(events.back()["type"] == "error" && response->body.find("message_stop") == std::string::npos);
         } else CHECK(response->status == 502 && Json::parse(response->body)["error"]["type"] == "api_error");
     }
-    const auto instance = server.get("/api/v1/runtime/instances")["data"];
+    const auto instance = server.get("/api/runtime/instances")["data"];
     std::string alpha;
     for (const auto& item : instance) if (item["model"] == "alpha") alpha = item.at("instance_id").get<std::string>();
     CHECK(!alpha.empty());
@@ -1376,7 +1376,7 @@ void compat_checks(const fs::path& executable) {
     CHECK(response && response->status == 429 && Json::parse(response->body)["error"]["type"] == "rate_limit_error");
     CHECK(response->get_header_value("Retry-After") == "1");
     for (const auto& id : ids) {
-        response = server.post("/api/v1/inference/requests/" + id + "/cancel", {{"instance_id", alpha}});
+        response = server.post("/api/inference/requests/" + id + "/cancel", {{"instance_id", alpha}});
         CHECK(response && response->status == 200);
     }
     for (auto& stream : streams) {
@@ -1389,17 +1389,17 @@ void compat_checks(const fs::path& executable) {
     bool idle = false;
     do {
         idle = true;
-        const auto current = server.get("/api/v1/runtime/instances");
+        const auto current = server.get("/api/runtime/instances");
         for (const auto& item : current["data"]) if (item["active_requests"] != 0) idle = false;
         if (!idle) std::this_thread::sleep_for(1ms);
     } while (!idle && Clock::now() < deadline);
     CHECK(idle);
-    response = client.Put("/api/v1/auth/policy", R"({"enabled":true,"api_key":"root"})", "application/json"); CHECK(response && response->status == 200);
+    response = client.Put("/api/auth/policy", R"({"enabled":true,"api_key":"root"})", "application/json"); CHECK(response && response->status == 200);
     response = server.post("/v1/messages", request_body("hello"));
     CHECK(response && response->status == 401 && Json::parse(response->body)["error"]["type"] == "authentication_error");
     const httplib::Headers root{{"X-Api-Key", "root"}, {"Anthropic-Version", "2023-06-01"}};
     response = server.post("/v1/messages", request_body("hello"), root); CHECK(response && response->status == 200);
-    response = server.post("/api/v1/auth/keys", {{"name", "models-only"}, {"scopes", {"models"}}}, {{"Authorization", "Bearer root"}});
+    response = server.post("/api/auth/keys", {{"name", "models-only"}, {"scopes", {"models"}}}, {{"Authorization", "Bearer root"}});
     CHECK(response && response->status == 201);
     response = server.post("/v1/messages", request_body("hello"), {{"X-Api-Key", Json::parse(response->body)["token"].get<std::string>()}});
     CHECK(response && response->status == 403 && Json::parse(response->body)["error"]["type"] == "permission_error");
@@ -1422,58 +1422,58 @@ void jobs_http_checks(const fs::path& executable) {
     fixture_model(server.root / "source");
     const auto artifact = register_checkpoint(server, server.root / "source", "chat");
     httplib::Client client("127.0.0.1", server.port);
-    auto accepted = server.post("/api/v1/models/load", {{"artifact_id", artifact}});
+    auto accepted = server.post("/api/models/load", {{"artifact_id", artifact}});
     const auto loaded = server.complete(accepted);
     CHECK(loaded["status"] == "succeeded");
-    const auto path = "/api/v1/jobs/" + loaded["id"].get<std::string>();
+    const auto path = "/api/jobs/" + loaded["id"].get<std::string>();
     auto response = client.Delete(path); CHECK(response && response->status == 204);
-    CHECK(server.get("/api/v1/runtime/instances")["data"].size() == 1 && fs::exists(server.root / "chat" / "model.safetensors"));
+    CHECK(server.get("/api/runtime/instances")["data"].size() == 1 && fs::exists(server.root / "chat" / "model.safetensors"));
     for (const auto& suffix : {"", "/events", "/events/stream"}) {
         response = client.Get(path + suffix); CHECK(response && response->status == 404);
     }
     response = client.Post(path + "/cancel"); CHECK(response && response->status == 404);
     response = client.Delete(path); CHECK(response && response->status == 404);
-    CHECK(server.complete(server.post("/api/v1/models/unload", {{"instance_id", loaded["result"]["instance_id"]}}))["status"] == "succeeded");
-    auto running = server.post("/api/v1/models/load", {{"artifact_id", artifact}, {"requirements", {{"context_size", 15}}}});
+    CHECK(server.complete(server.post("/api/models/unload", {{"instance_id", loaded["result"]["instance_id"]}}))["status"] == "succeeded");
+    auto running = server.post("/api/models/load", {{"artifact_id", artifact}, {"requirements", {{"context_size", 15}}}});
     CHECK(running && running->status == 202);
     const auto active = running->get_header_value("Location");
     const auto deadline = Clock::now() + 5s;
     while (!fs::exists(server.root / "chat" / "entered") && Clock::now() < deadline) std::this_thread::sleep_for(1ms);
     CHECK(fs::exists(server.root / "chat" / "entered"));
-    auto queued = server.post("/api/v1/models/load", {{"artifact_id", artifact}, {"requirements", {{"context_size", 13}}}});
+    auto queued = server.post("/api/models/load", {{"artifact_id", artifact}, {"requirements", {{"context_size", 13}}}});
     CHECK(queued && queued->status == 202);
     for (const auto& id : {active, queued->get_header_value("Location")}) {
         response = client.Delete(id); CHECK(response && response->status == 409 && Json::parse(response->body)["error"]["code"] == "job_state_conflict");
     }
-    CHECK(server.get("/api/v1/jobs?status=running&kind=model.load")["data"].size() == 1);
-    CHECK(server.get("/api/v1/jobs?status=queued&kind=model.load")["data"].size() == 1);
-    const auto all = server.get("/api/v1/jobs")["data"];
-    CHECK(all.size() == 3 && server.get("/api/v1/jobs?limit=1&offset=1")["data"][0] == all[1]);
+    CHECK(server.get("/api/jobs?status=running&kind=model.load")["data"].size() == 1);
+    CHECK(server.get("/api/jobs?status=queued&kind=model.load")["data"].size() == 1);
+    const auto all = server.get("/api/jobs")["data"];
+    CHECK(all.size() == 3 && server.get("/api/jobs?limit=1&offset=1")["data"][0] == all[1]);
     for (const auto* query : {"limit=0", "limit=1001", "offset=-1", "offset=9223372036854775808", "status=other", "kind=Bad", "limit=", "offset=", "status=", "kind="}) {
-        response = client.Get(std::string("/api/v1/jobs?") + query); CHECK(response && response->status == 400);
+        response = client.Get(std::string("/api/jobs?") + query); CHECK(response && response->status == 400);
     }
-    response = client.Delete("/api/v1/jobs/completed"); CHECK(response && response->status == 204);
-    CHECK(server.get("/api/v1/jobs")["data"].size() == 2);
+    response = client.Delete("/api/jobs/completed"); CHECK(response && response->status == 204);
+    CHECK(server.get("/api/jobs")["data"].size() == 2);
     response = client.Post(active + "/cancel"); CHECK(response && response->status == 200 && Json::parse(response->body)["status"] == "cancelling");
     response = client.Delete(active); CHECK(response && response->status == 409);
-    response = client.Delete("/api/v1/jobs/completed"); CHECK(response && response->status == 204);
-    CHECK(server.get("/api/v1/jobs")["data"].size() == 2);
+    response = client.Delete("/api/jobs/completed"); CHECK(response && response->status == 204);
+    CHECK(server.get("/api/jobs")["data"].size() == 2);
     write_file(server.root / "chat" / "release", "");
     CHECK(server.complete(running)["status"] == "cancelled");
     CHECK(server.complete(queued)["status"] == "failed");
-    response = client.Put("/api/v1/auth/policy", R"({"enabled":true,"api_key":"root"})", "application/json");
+    response = client.Put("/api/auth/policy", R"({"enabled":true,"api_key":"root"})", "application/json");
     CHECK(response && response->status == 200);
-    response = client.Delete("/api/v1/jobs/completed"); CHECK(response && response->status == 401);
+    response = client.Delete("/api/jobs/completed"); CHECK(response && response->status == 401);
     for (const auto* scope : {"inference", "jobs"}) {
-        const auto key = server.post("/api/v1/auth/keys", {{"name", scope}, {"scopes", {scope}}}, {{"Authorization", "Bearer root"}});
+        const auto key = server.post("/api/auth/keys", {{"name", scope}, {"scopes", {scope}}}, {{"Authorization", "Bearer root"}});
         CHECK(key && key->status == 201);
         const httplib::Headers token{{"Authorization", "Bearer " + Json::parse(key->body)["token"].get<std::string>()}};
         response = client.Delete(queued->get_header_value("Location"), token);
         CHECK(response && response->status == (std::string_view(scope) == "jobs" ? 204 : 403));
-        response = client.Delete("/api/v1/jobs/completed", token);
+        response = client.Delete("/api/jobs/completed", token);
         CHECK(response && response->status == (std::string_view(scope) == "jobs" ? 204 : 403));
         if (std::string_view(scope) == "jobs") {
-            response = client.Get("/api/v1/jobs", token); CHECK(response && response->status == 200 && Json::parse(response->body)["data"].empty());
+            response = client.Get("/api/jobs", token); CHECK(response && response->status == 200 && Json::parse(response->body)["data"].empty());
         }
     }
     CHECK(fs::exists(server.root / "chat" / "model.safetensors"));
@@ -1486,7 +1486,7 @@ void load_http_checks(const fs::path& executable) {
         register_checkpoint(server, server.root / "source", "chat");
         write_file(server.root / "chat.runtime.json", R"({"chat":{"top_k":7,"temperature":0.4,"enable_thinking":false}})");
         httplib::Client client("127.0.0.1", server.port);
-        auto response = client.Put("/api/v1/runtime/model-aliases", R"({"aliases":{"chat":"fast"}})", "application/json");
+        auto response = client.Put("/api/runtime/model-aliases", R"({"aliases":{"chat":"fast"}})", "application/json");
         CHECK(response && response->status == 200);
         CHECK(server.get("/v1/models")["data"][0]["id"] == "fast");
         CHECK(server.get("/v1/models/fast")["id"] == "fast");
@@ -1502,7 +1502,7 @@ void load_http_checks(const fs::path& executable) {
         response = server.post("/v1/chat/completions", invalid); CHECK(response && response->status == 400);
         invalid = body; invalid["stop_sequences"] = {"stop"};
         response = server.post("/v1/messages", invalid); CHECK(response && response->status == 501);
-        CHECK(!fs::exists(path / "loads") && server.get("/api/v1/runtime/instances")["data"].empty());
+        CHECK(!fs::exists(path / "loads") && server.get("/api/runtime/instances")["data"].empty());
         int loads = 0;
         for (const auto* route : {"/v1/chat/completions", "/v1/messages"}) for (bool stream : {false, true}) {
             body["stream"] = stream;
@@ -1515,9 +1515,9 @@ void load_http_checks(const fs::path& executable) {
                 CHECK(std::abs(observed["temperature"].get<double>() - 0.4) < 0.0001);
             } else CHECK(response->get_header_value("Content-Type").find("text/event-stream") == 0 && response->body.find("fast") != std::string::npos);
             CHECK(fs::file_size(path / "loads") == static_cast<std::uintmax_t>(++loads));
-            const auto instances = server.get("/api/v1/runtime/instances")["data"];
+            const auto instances = server.get("/api/runtime/instances")["data"];
             CHECK(instances.size() == 1);
-            CHECK(server.complete(server.post("/api/v1/models/unload", {{"instance_id", instances[0]["instance_id"]}}))["status"] == "succeeded");
+            CHECK(server.complete(server.post("/api/models/unload", {{"instance_id", instances[0]["instance_id"]}}))["status"] == "succeeded");
         }
     }
     for (int mode = 0; mode < 3; ++mode) {
@@ -1545,7 +1545,7 @@ void load_http_checks(const fs::path& executable) {
             fourth = std::async(std::launch::async, [&] { return server.post("/v1/chat/completions", body); });
             limited = third.wait_for(1s) == std::future_status::ready || fourth.wait_for(1s) == std::future_status::ready;
         }
-        const bool empty = server.get("/api/v1/runtime/instances")["data"].empty();
+        const bool empty = server.get("/api/runtime/instances")["data"].empty();
         const bool listed = server.get("/v1/models")["data"].size() == 1;
         const bool disconnected = mode != 2 || first.wait_for(2s) == std::future_status::ready;
         write_file(path / "release", "");
@@ -1559,13 +1559,13 @@ void load_http_checks(const fs::path& executable) {
             CHECK(a && b && a->status == 500 && b->status == 500);
             CHECK(a->get_header_value("Content-Type").find("application/json") == 0);
             CHECK(b->get_header_value("Content-Type").find("application/json") == 0 && Json::parse(b->body)["type"] == "error");
-            CHECK(server.get("/api/v1/runtime/instances")["data"].empty());
+            CHECK(server.get("/api/runtime/instances")["data"].empty());
             fs::remove(path / "fail-load");
             auto retry = server.post("/v1/messages", body); CHECK(retry && retry->status == 200);
             CHECK(fs::file_size(path / "loads") == 2);
         } else {
             CHECK(mode == 2 ? !a : a && a->status == 200);
-            CHECK(b && b->status == 200 && server.get("/api/v1/runtime/instances")["data"].size() == 1);
+            CHECK(b && b->status == 200 && server.get("/api/runtime/instances")["data"].size() == 1);
         }
     }
 }
@@ -1577,9 +1577,9 @@ void reply_load_http(const fs::path& executable) {
         const auto model = server.root / "chat";
         write_file(model / "wait", "");
         if (mode == 4) write_file(model / "fail-load", "");
-        const auto created = server.post("/api/v1/sessions", {{"model", "chat"}});
+        const auto created = server.post("/api/sessions", {{"model", "chat"}});
         CHECK(created && created->status == 201);
-        const auto path = "/api/v1/sessions/" + Json::parse(created->body)["id"].get<std::string>();
+        const auto path = "/api/sessions/" + Json::parse(created->body)["id"].get<std::string>();
         auto body = reply_input(); body["stream"] = mode == 1 || mode == 3 || mode == 4;
         const bool disconnect = mode == 2 || mode == 3;
         auto running = std::async(std::launch::async, [&] {
@@ -1612,32 +1612,32 @@ void reply_load_http(const fs::path& executable) {
             std::this_thread::sleep_for(1ms);
         } while (Clock::now() < finished);
         CHECK(saved["status"] == (mode == 4 ? "failed" : "cancelled") && saved["performance"].is_null());
-        const auto instances = server.get("/api/v1/runtime/instances")["data"];
+        const auto instances = server.get("/api/runtime/instances")["data"];
         if (mode == 4) CHECK(instances.empty());
         else {
             CHECK(instances.size() == 1);
-            CHECK(server.complete(server.post("/api/v1/models/unload", {{"instance_id", instances[0]["instance_id"]}}))["status"] == "succeeded");
+            CHECK(server.complete(server.post("/api/models/unload", {{"instance_id", instances[0]["instance_id"]}}))["status"] == "succeeded");
         }
         body["stream"] = false;
         auto replay = server.post(path + "/responses", body);
         CHECK(replay && replay->status == 200 && Json::parse(replay->body) == saved);
-        CHECK(fs::file_size(model / "loads") == 1 && server.get("/api/v1/runtime/instances")["data"].empty());
+        CHECK(fs::file_size(model / "loads") == 1 && server.get("/api/runtime/instances")["data"].empty());
     }
 }
 
 void names_http_checks(const fs::path& executable) {
     Server server(executable, true);
-    CHECK(server.get("/api/v1/runtime/model-aliases")["aliases"].is_object());
+    CHECK(server.get("/api/runtime/model-aliases")["aliases"].is_object());
     fixture_model(server.root / "alpha");
     const auto artifact = register_checkpoint(server, server.root / "alpha", "beta");
-    const auto loaded = server.complete(server.post("/api/v1/models/load", {{"artifact_id", artifact}}));
+    const auto loaded = server.complete(server.post("/api/models/load", {{"artifact_id", artifact}}));
     CHECK(loaded["status"] == "succeeded");
     httplib::Client client("127.0.0.1", server.port);
     const auto configure = [&](const Json& body, const httplib::Headers& headers = {}) {
-        return client.Put("/api/v1/runtime/model-aliases", headers, body.dump(), "application/json");
+        return client.Put("/api/runtime/model-aliases", headers, body.dump(), "application/json");
     };
     auto response = configure({{"aliases", {{"beta", "fast"}}}}); CHECK(response && response->status == 200);
-    CHECK(server.get("/api/v1/runtime/model-aliases")["aliases"]["beta"] == "fast");
+    CHECK(server.get("/api/runtime/model-aliases")["aliases"]["beta"] == "fast");
     CHECK(server.get("/v1/models")["data"][0]["id"] == "fast");
     response = client.Get("/v1/models", {{"Anthropic-Version", "2023-06-01"}});
     CHECK(response && Json::parse(response->body)["first_id"] == "fast");
@@ -1660,17 +1660,17 @@ void names_http_checks(const fs::path& executable) {
     for (const auto& body : std::vector<Json>{Json::object(), Json::array(), {{"aliases", nullptr}}, {{"aliases", {1}}},
             {{"aliases", {{"beta", 1}}}}, {{"aliases", {{"beta", "next"}}}, {"unknown", true}}}) {
         response = configure(body); CHECK(response && response->status == 400);
-        CHECK(server.get("/api/v1/runtime/model-aliases")["aliases"]["beta"] == "fast");
+        CHECK(server.get("/api/runtime/model-aliases")["aliases"]["beta"] == "fast");
     }
     response = configure({{"aliases", {{"beta", "team/fast"}}}}); CHECK(response && response->status == 200);
     CHECK(server.get("/v1/models/team%2Ffast")["id"] == "team/fast");
-    response = client.Put("/api/v1/auth/policy", R"({"enabled":true,"api_key":"root"})", "application/json");
+    response = client.Put("/api/auth/policy", R"({"enabled":true,"api_key":"root"})", "application/json");
     CHECK(response && response->status == 200);
     response = configure({{"aliases", Json::object()}}); CHECK(response && response->status == 401);
-    response = server.post("/api/v1/auth/keys", {{"name", "infer"}, {"scopes", {"inference"}}}, {{"Authorization", "Bearer root"}});
+    response = server.post("/api/auth/keys", {{"name", "infer"}, {"scopes", {"inference"}}}, {{"Authorization", "Bearer root"}});
     CHECK(response && response->status == 201);
     const httplib::Headers token{{"Authorization", "Bearer " + Json::parse(response->body)["token"].get<std::string>()}};
-    response = client.Get("/api/v1/runtime/model-aliases", token); CHECK(response && response->status == 200);
+    response = client.Get("/api/runtime/model-aliases", token); CHECK(response && response->status == 200);
     response = configure({{"aliases", Json::object()}}, token); CHECK(response && response->status == 403);
     response = configure({{"aliases", {{"beta", "next"}}}}, {{"Authorization", "Bearer root"}});
     CHECK(response && response->status == 200 && Json::parse(response->body)["aliases"]["beta"] == "next");
@@ -1684,47 +1684,47 @@ void runtime_observation_checks(const fs::path& executable) {
     Server server(executable, true);
     fixture_model(server.root / "alpha");
     const auto artifact = register_checkpoint(server, server.root / "alpha", "served");
-    CHECK(server.complete(server.post("/api/v1/models/load", {{"artifact_id", artifact}}))["status"] == "succeeded");
+    CHECK(server.complete(server.post("/api/models/load", {{"artifact_id", artifact}}))["status"] == "succeeded");
     httplib::Client client("127.0.0.1", server.port);
     const auto get = [&](const std::string& path) {
         const auto response = client.Get(path);
         CHECK(response);
         return std::make_pair(response->status, Json::parse(response->body));
     };
-    const auto listed = get("/api/v1/runtime/instances").second.at("data");
+    const auto listed = get("/api/runtime/instances").second.at("data");
     CHECK(listed.size() == 1);
     const auto id = listed.at(0).at("instance_id").get<std::string>();
-    const auto detail = get("/api/v1/runtime/instances/" + id);
+    const auto detail = get("/api/runtime/instances/" + id);
     CHECK(detail.first == 200 && detail.second.at("instance_id") == id &&
         detail.second.at("artifact_id") == listed.at(0).at("artifact_id") &&
         detail.second.at("context_size") == listed.at(0).at("context_size") &&
         detail.second.at("capabilities") == listed.at(0).at("capabilities"));
     CHECK(detail.second.at("state") == "loaded" && detail.second.at("model") == "served" &&
         detail.second.at("backend") == "fixture");
-    const auto missing = get("/api/v1/runtime/instances/00000000-0000-4000-8000-000000000001");
+    const auto missing = get("/api/runtime/instances/00000000-0000-4000-8000-000000000001");
     CHECK(missing.first == 404 && missing.second.at("error").at("code") == "runtime_instance_not_found");
-    CHECK(get("/api/v1/runtime/instances/not-a-uuid").first == 400);
-    const auto status = get("/api/v1/runtime/status?instance_id=" + id).second;
+    CHECK(get("/api/runtime/instances/not-a-uuid").first == 400);
+    const auto status = get("/api/runtime/status?instance_id=" + id).second;
     CHECK(status.at("source") == "native-instances" && status.at("instance_id") == id && status.at("model") == "served");
     CHECK(status.at("runtime_state") == "ready" && status.at("max_context") == 128 && status.at("active_requests") == 0);
     CHECK(status.at("model_capabilities").at("architecture_family") == "fixture");
-    CHECK(get("/api/v1/runtime/status").second.at("instance_id") == id);
-    CHECK(get("/api/v1/runtime/status?instance_id=00000000-0000-4000-8000-000000000001").first == 404);
-    const auto models = get("/api/v1/runtime/models").second.at("data");
+    CHECK(get("/api/runtime/status").second.at("instance_id") == id);
+    CHECK(get("/api/runtime/status?instance_id=00000000-0000-4000-8000-000000000001").first == 404);
+    const auto models = get("/api/runtime/models").second.at("data");
     CHECK(models.size() == 1 && models.at(0).at("id") == "served");
-    const auto resources = get("/api/v1/runtime/resources").second;
+    const auto resources = get("/api/runtime/resources").second;
     CHECK(resources.at("weights").size() == 1 && resources.at("weights")[0].at("instance_id") == id &&
         resources.at("weights")[0].at("model") == "served");
     CHECK(resources.at("weights")[0].at("expert_read_bytes_per_second").is_null());
     CHECK(resources.at("gpus").empty() && resources.at("disks").empty());
-    CHECK(get("/api/v1/runtime/serving?scope=alltime").second.at("scope") == "alltime");
-    CHECK(get("/api/v1/runtime/metrics?limit=1").second.at("data").empty());
-    CHECK(get("/api/v1/runtime/logs?level=error").second.at("data").empty());
-    CHECK(server.complete(server.post("/api/v1/models/unload", {{"instance_id", id}}))["status"] == "succeeded");
-    CHECK(get("/api/v1/runtime/instances/" + id).first == 404);
-    CHECK(get("/api/v1/runtime/models").second.at("data").empty());
-    CHECK(get("/api/v1/runtime/status").second.at("runtime_state") == "idle");
-    CHECK(get("/api/v1/runtime/resources").second.at("weights").empty());
+    CHECK(get("/api/runtime/serving?scope=alltime").second.at("scope") == "alltime");
+    CHECK(get("/api/runtime/metrics?limit=1").second.at("data").empty());
+    CHECK(get("/api/runtime/logs?level=error").second.at("data").empty());
+    CHECK(server.complete(server.post("/api/models/unload", {{"instance_id", id}}))["status"] == "succeeded");
+    CHECK(get("/api/runtime/instances/" + id).first == 404);
+    CHECK(get("/api/runtime/models").second.at("data").empty());
+    CHECK(get("/api/runtime/status").second.at("runtime_state") == "idle");
+    CHECK(get("/api/runtime/resources").second.at("weights").empty());
     server.process->close_input(); CHECK(server.process->wait() == 0);
 }
 
@@ -1732,11 +1732,11 @@ void session_http_checks(const fs::path& executable) {
     Server server(executable, true);
     fixture_model(server.root / "model");
     const auto artifact = register_checkpoint(server, server.root / "model", "chat");
-    CHECK(server.complete(server.post("/api/v1/models/load", {{"artifact_id", artifact}}))["status"] == "succeeded");
-    auto create = server.post("/api/v1/sessions", {{"model", "chat"}});
+    CHECK(server.complete(server.post("/api/models/load", {{"artifact_id", artifact}}))["status"] == "succeeded");
+    auto create = server.post("/api/sessions", {{"model", "chat"}});
     CHECK(create && create->status == 201);
     const auto id = Json::parse(create->body)["id"].get<std::string>();
-    const auto path = "/api/v1/sessions/" + id;
+    const auto path = "/api/sessions/" + id;
     const auto input = reply_input();
     auto result = server.post(path + "/responses", input);
     CHECK(result && result->status == 200 && Json::parse(result->body)["status"] == "completed");
@@ -1768,10 +1768,10 @@ void session_http_checks(const fs::path& executable) {
     CHECK(server.get(path.c_str())["state"] == "interrupted");
     const auto responses = server.get((path + "/responses").c_str())["data"];
     CHECK(std::any_of(responses.begin(), responses.end(), [](const Json& value) { return value.at("status") == "cancelled"; }));
-    result = server.post("/api/v1/presets", {{"name", "chat"}, {"settings", Json::object()}});
+    result = server.post("/api/presets", {{"name", "chat"}, {"settings", Json::object()}});
     CHECK(result && result->status == 201);
-    CHECK(server.get("/api/v1/presets")["data"].size() == 1);
-    result = client.Get("/api/v1/sessions?limit=-1"); CHECK(result && result->status == 400);
+    CHECK(server.get("/api/presets")["data"].size() == 1);
+    result = client.Get("/api/sessions?limit=-1"); CHECK(result && result->status == 400);
     result = server.post(path + "/messages", {{"expected_revision", false}, {"role", "user"}, {"parts", input["input"]}});
     CHECK(result && result->status == 400);
     result = server.post(path + "/messages", {{"expected_revision", 0}, {"role", "user"}, {"parts", input["input"]}});
@@ -1792,7 +1792,7 @@ Json fresh_instance(Server& server, const std::string& id) {
     Json snapshot;
     while (Clock::now() < deadline) {
         const auto before_read = Clock::now();
-        const auto instances = server.get("/api/v1/runtime/instances").at("data");
+        const auto instances = server.get("/api/runtime/instances").at("data");
         for (const auto& instance : instances) if (instance.at("instance_id") == id) {
             snapshot = instance;
             const auto age = instance.at("metrics_age_ms").get<std::int64_t>();
@@ -1815,7 +1815,7 @@ double byte_metric(const Json& instance, const char* name) {
 
 void cuda_resource_checks(const fs::path& executable, const fs::path& model) {
     const auto load = [](Server& server, const std::string& artifact) {
-        return server.complete(server.post("/api/v1/models/load", {{"artifact_id", artifact}, {"requirements", {{"context_size", 512}}}}));
+        return server.complete(server.post("/api/models/load", {{"artifact_id", artifact}, {"requirements", {{"context_size", 512}}}}));
     };
     const auto rejected = [](const Json& job) {
         CHECK(job.at("status") == "failed" && job.at("result").is_null());
@@ -1827,7 +1827,7 @@ void cuda_resource_checks(const fs::path& executable, const fs::path& model) {
         const auto artifact = register_checkpoint(server, model, "limited");
         for (int attempt = 0; attempt < 2; ++attempt) {
             rejected(load(server, artifact));
-            CHECK(server.get("/api/v1/runtime/instances").at("data").empty());
+            CHECK(server.get("/api/runtime/instances").at("data").empty());
             CHECK(server.get("/health").at("status") == "ok");
         }
         server.process->close_input(); CHECK(server.process->wait() == 0);
@@ -1855,7 +1855,7 @@ void cuda_resource_checks(const fs::path& executable, const fs::path& model) {
     const auto before = byte_metric(baseline, "cuda_allocated_bytes");
     for (const auto& artifact : rejected_artifacts) {
         rejected(load(server, artifact));
-        const auto instances = server.get("/api/v1/runtime/instances").at("data");
+        const auto instances = server.get("/api/runtime/instances").at("data");
         CHECK(instances.size() == 1 && instances.at(0).at("instance_id") == id);
         const auto reclaimed = fresh_instance(server, id);
         bounded(reclaimed);
@@ -1870,13 +1870,13 @@ void cuda_resource_checks(const fs::path& executable, const fs::path& model) {
         CHECK(Json::parse(response->body).at("usage").at("completion_tokens") > 0);
     };
     generate(); bounded(fresh_instance(server, id));
-    CHECK(server.complete(server.post("/api/v1/models/unload", {{"instance_id", id}})).at("status") == "succeeded");
-    CHECK(server.get("/api/v1/runtime/instances").at("data").empty());
+    CHECK(server.complete(server.post("/api/models/unload", {{"instance_id", id}})).at("status") == "succeeded");
+    CHECK(server.get("/api/runtime/instances").at("data").empty());
     loaded = load(server, rejected_artifacts.front());
     if (loaded.at("status") != "succeeded") throw std::runtime_error(loaded.dump());
     id = loaded.at("result").at("instance_id");
     bounded(fresh_instance(server, id)); generate();
-    CHECK(server.complete(server.post("/api/v1/models/unload", {{"instance_id", id}})).at("status") == "succeeded");
+    CHECK(server.complete(server.post("/api/models/unload", {{"instance_id", id}})).at("status") == "succeeded");
     server.process->close_input(); CHECK(server.process->wait() == 0);
     std::cout << "CUDA resource checks passed: 64 MiB refusal; 2 GiB limit; three failed loads reclaimed "
         << "to " << before << " tracked bytes; survivor generation and replacement reload succeeded\n";
@@ -1889,21 +1889,21 @@ void multi_model_checks(const fs::path& executable, const fs::path& real_model) 
         if (!fixture) { register_checkpoint(server, real_model, name); continue; }
         const auto path = server.root / name;
         fixture_model(path);
-        const auto response = server.post("/api/v1/models/directories/register", {{"path", path_utf8(path)}});
+        const auto response = server.post("/api/models/directories/register", {{"path", path_utf8(path)}});
         CHECK(response && response->status == 200);
     }
     const auto load = [&](const char* model, int context) {
         std::string artifact;
-        const auto entries = server.get("/api/v1/models");
+        const auto entries = server.get("/api/models");
         for (const auto& entry : entries["data"]) if (entry["name"] == model) artifact = entry["id"];
         CHECK(!artifact.empty());
-        const auto job = server.complete(server.post("/api/v1/models/load", {{"artifact_id", artifact}, {"requirements", {{"context_size", context}}}}));
+        const auto job = server.complete(server.post("/api/models/load", {{"artifact_id", artifact}, {"requirements", {{"context_size", context}}}}));
         if (job["status"] != "succeeded") throw std::runtime_error(job.dump() + server.process->output());
         return job.at("result");
     };
     auto alpha = load("alpha", 512);
     const auto beta = load("beta", 2048);
-    CHECK(server.get("/api/v1/runtime/instances")["data"].size() == 2);
+    CHECK(server.get("/api/runtime/instances")["data"].size() == 2);
     CHECK(server.get("/v1/models")["data"].size() == 2);
     if (!fixture) CHECK(alpha["context_size"] == 512 && beta["context_size"] == 2048);
     const auto input = [](const std::string& model, const std::string& prompt, bool stream = false) {
@@ -1931,7 +1931,7 @@ void multi_model_checks(const fs::path& executable, const fs::path& real_model) 
     CHECK(first_id.wait_for(10s) == std::future_status::ready && second_id.wait_for(10s) == std::future_status::ready);
     const auto id_a = first_id.get(), id_b = second_id.get();
     CHECK(!id_a.empty() && !id_b.empty());
-    auto response = server.post("/api/v1/inference/requests/" + id_a + "/cancel", {{"instance_id", alpha.at("instance_id")}});
+    auto response = server.post("/api/inference/requests/" + id_a + "/cancel", {{"instance_id", alpha.at("instance_id")}});
     CHECK(response && response->status == 200 && Json::parse(response->body)["cancel_requested"] == true);
     CHECK(first.wait_for(10s) == std::future_status::ready);
     const auto first_output = first.get();
@@ -1943,11 +1943,11 @@ void multi_model_checks(const fs::path& executable, const fs::path& real_model) 
     response = server.post("/v1/chat/completions", input("alpha", fixture ? "fail" : oversized));
     CHECK(response && response->status == (fixture ? 500 : 400));
     CHECK(second.wait_for(0ms) == std::future_status::timeout);
-    response = server.post("/api/v1/models/unload", {{"instance_id", alpha.at("instance_id")}, {"force", true}});
+    response = server.post("/api/models/unload", {{"instance_id", alpha.at("instance_id")}, {"force", true}});
     CHECK(server.complete(response)["status"] == "succeeded");
-    const auto remaining = server.get("/api/v1/runtime/instances")["data"];
+    const auto remaining = server.get("/api/runtime/instances")["data"];
     CHECK(remaining.size() == 1 && remaining[0]["instance_id"] == beta["instance_id"] && remaining[0]["active_requests"] == 1);
-    response = server.post("/api/v1/inference/requests/" + id_b + "/cancel", {{"instance_id", beta.at("instance_id")}});
+    response = server.post("/api/inference/requests/" + id_b + "/cancel", {{"instance_id", beta.at("instance_id")}});
     CHECK(response && response->status == 200 && Json::parse(response->body)["cancel_requested"] == true);
     CHECK(second.wait_for(10s) == std::future_status::ready);
     const auto second_output = second.get();
@@ -1975,7 +1975,7 @@ void run_checks(const fs::path& executable, const fs::path& real_model) {
     Server server(executable, fixture);
     const auto model_path = fixture ? server.root / "model" : real_model;
     if (fixture) { fixture_model(model_path); tokenizer_checks(model_path); }
-    auto registration = server.post("/api/v1/models/directories/register", {{"path", path_utf8(model_path)}});
+    auto registration = server.post("/api/models/directories/register", {{"path", path_utf8(model_path)}});
     CHECK(registration && registration->status == 200);
     const auto artifact = Json::parse(registration->body).at("data").at(0);
     CHECK(artifact.at("loadable"));
@@ -1983,7 +1983,7 @@ void run_checks(const fs::path& executable, const fs::path& real_model) {
     const auto model = artifact.at("name").get<std::string>();
     CHECK(server.get("/v1/models")["data"].size() == 1);
     const auto artifact_id = artifact.at("id").get<std::string>();
-    auto response = server.post("/api/v1/models/load", {{"artifact_id", artifact_id}, {"requirements", {{"context_size", false}}}});
+    auto response = server.post("/api/models/load", {{"artifact_id", artifact_id}, {"requirements", {{"context_size", false}}}});
     CHECK(response && response->status == 400);
     for (const auto& option : std::vector<Json>{
             {{"requirements", {{"context_size", 0}}}}, {{"requirements", {{"context_size", nullptr}}}},
@@ -1992,47 +1992,47 @@ void run_checks(const fs::path& executable, const fs::path& real_model) {
             {{"moe_gpu_cache_gb", 1}}, {{"gpu_layers", 1}}, {{"unknown", 1}},
             {{"requirements", {{"gpu_layers", 1}}}}, {{"policy", {{"pin", true}, {"idle_ttl_seconds", 1}}}}}) {
         auto invalid = option; invalid["artifact_id"] = artifact_id;
-        response = server.post("/api/v1/models/load", invalid);
+        response = server.post("/api/models/load", invalid);
         CHECK(response && response->status == 400);
         const auto error = Json::parse(response->body).at("error");
         CHECK(error.contains("retryable") && error["details"].is_object());
     }
-    CHECK(server.get("/api/v1/runtime/instances")["data"].empty());
+    CHECK(server.get("/api/runtime/instances")["data"].empty());
     if (fixture) {
-        response = server.post("/api/v1/models/load", {{"artifact_id", artifact_id}, {"requirements", {{"context_size", 13}}}});
+        response = server.post("/api/models/load", {{"artifact_id", artifact_id}, {"requirements", {{"context_size", 13}}}});
         CHECK(server.complete(response)["status"] == "failed");
         CHECK(server.process->output().find("fixture load failure after allocation") != std::string::npos);
-        CHECK(server.get("/api/v1/runtime/instances")["data"].empty());
-        response = server.post("/api/v1/models/load", {{"artifact_id", artifact_id}, {"requirements", {{"context_size", 14}}}});
+        CHECK(server.get("/api/runtime/instances")["data"].empty());
+        response = server.post("/api/models/load", {{"artifact_id", artifact_id}, {"requirements", {{"context_size", 14}}}});
         CHECK(response && response->status == 202);
         const auto operation = Json::parse(response->body)["operation_id"].get<std::string>();
-        const auto operation_path = "/api/v1/jobs/" + operation;
+        const auto operation_path = "/api/jobs/" + operation;
         const auto deadline = Clock::now() + 5s;
         while (server.get(operation_path.c_str())["progress_data"].value("phase", "") != "loading" && Clock::now() < deadline)
             std::this_thread::sleep_for(1ms);
         const auto cancellation = server.post(operation_path + "/cancel", Json::object());
         CHECK(cancellation && cancellation->status == 200 && Json::parse(cancellation->body)["cancel_requested"] == true);
         CHECK(server.complete(response)["status"] == "cancelled");
-        CHECK(server.get("/api/v1/runtime/instances")["data"].empty());
+        CHECK(server.get("/api/runtime/instances")["data"].empty());
     }
     auto load = [&] {
-        auto job = server.complete(server.post("/api/v1/models/load", {{"artifact_id", artifact_id}, {"requirements", {{"context_size", 512}}}}));
+        auto job = server.complete(server.post("/api/models/load", {{"artifact_id", artifact_id}, {"requirements", {{"context_size", 512}}}}));
         if (job["status"] != "succeeded") throw std::runtime_error(job.dump() + server.process->output());
         return job.at("result").at("instance_id").get<std::string>();
     };
     auto instance = load();
-    const auto jobs = server.get("/api/v1/jobs").at("data");
+    const auto jobs = server.get("/api/jobs").at("data");
     CHECK(!jobs.empty());
     const auto job_id = jobs[0]["id"].get<std::string>();
     httplib::Client event_client("127.0.0.1", server.port);
-    const auto event_stream = event_client.Get("/api/v1/jobs/" + job_id + "/events/stream");
+    const auto event_stream = event_client.Get("/api/jobs/" + job_id + "/events/stream");
     CHECK(event_stream && event_stream->status == 200 && event_stream->body.find("id: 1\n") != std::string::npos);
     CHECK(event_stream->body.find("succeeded") != std::string::npos);
-    const auto caps = server.get(("/api/v1/models/" + artifact_id + "/capabilities").c_str());
+    const auto caps = server.get(("/api/models/" + artifact_id + "/capabilities").c_str());
     CHECK(caps["supported"] == true && caps["load"]["cancellation"] == "after_return");
     CHECK(server.get("/v1/models")["data"].at(0).at("id") == model);
     CHECK(fresh_instance(server, instance).at("metrics_age_ms").get<std::int64_t>() >= 0);
-    response = server.post("/api/v1/models/load", {{"artifact_id", artifact_id}});
+    response = server.post("/api/models/load", {{"artifact_id", artifact_id}});
     CHECK(server.complete(response)["error"]["code"] == "model_already_loaded");
     Json body{{"model", model}, {"messages", Json::array({{{"role", "user"}, {"content", "Say hello."}}})},
         {"max_tokens", 16}, {"temperature", 0}, {"enable_thinking", false}};
@@ -2101,9 +2101,9 @@ void run_checks(const fs::path& executable, const fs::path& real_model) {
     auto streaming = start_stream(ready); auto ready_id = ready.get_future();
     CHECK(ready_id.wait_for(10s) == std::future_status::ready);
     const auto id = ready_id.get(); CHECK(!id.empty());
-    response = server.post("/api/v1/models/unload", {{"instance_id", instance}});
+    response = server.post("/api/models/unload", {{"instance_id", instance}});
     CHECK(server.complete(response)["error"]["code"] == "model_busy");
-    response = server.post("/api/v1/inference/requests/" + id + "/cancel", {{"instance_id", instance}});
+    response = server.post("/api/inference/requests/" + id + "/cancel", {{"instance_id", instance}});
     CHECK(response && response->status == 200 && Json::parse(response->body).at("cancel_requested"));
     CHECK(streaming.wait_for(10s) == std::future_status::ready);
     const auto cancelled_stream = streaming.get();
@@ -2112,9 +2112,9 @@ void run_checks(const fs::path& executable, const fs::path& real_model) {
     std::promise<std::string> disconnected;
     auto dropped = start_stream(disconnected, true); CHECK(dropped.wait_for(10s) == std::future_status::ready); dropped.get();
     const auto deadline = Clock::now() + 5s;
-    while (server.get("/api/v1/runtime/instances")["data"][0]["active_requests"] != 0 && Clock::now() < deadline)
+    while (server.get("/api/runtime/instances")["data"][0]["active_requests"] != 0 && Clock::now() < deadline)
         std::this_thread::sleep_for(20ms);
-    CHECK(server.get("/api/v1/runtime/instances")["data"][0]["active_requests"] == 0);
+    CHECK(server.get("/api/runtime/instances")["data"][0]["active_requests"] == 0);
     if (fixture) {
         std::array<std::promise<std::string>, 3> saturated;
         std::vector<std::future<std::string>> streams;
@@ -2128,25 +2128,25 @@ void run_checks(const fs::path& executable, const fs::path& real_model) {
         response = server.post("/v1/chat/completions", body);
         CHECK(response && response->status == 429);
         for (const auto& request_id : ids) {
-            response = server.post("/api/v1/inference/requests/" + request_id + "/cancel", {{"instance_id", instance}});
+            response = server.post("/api/inference/requests/" + request_id + "/cancel", {{"instance_id", instance}});
             CHECK(response && response->status == 200);
         }
         for (auto& stream : streams) { CHECK(stream.wait_for(10s) == std::future_status::ready); stream.get(); }
     }
     std::promise<std::string> forced;
     streaming = start_stream(forced); CHECK(forced.get_future().wait_for(10s) == std::future_status::ready);
-    response = server.post("/api/v1/models/unload", {{"instance_id", instance}, {"force", true}});
+    response = server.post("/api/models/unload", {{"instance_id", instance}, {"force", true}});
     CHECK(server.complete(response)["status"] == "succeeded");
     CHECK(streaming.wait_for(10s) == std::future_status::ready); streaming.get();
-    CHECK(server.get("/api/v1/runtime/instances")["data"].empty());
+    CHECK(server.get("/api/runtime/instances")["data"].empty());
     instance = load();
     if (fixture) {
         body["messages"][0]["content"] = "fail";
         response = server.post("/v1/chat/completions", body);
         CHECK(response && response->body.find("fixture execution failure") != std::string::npos);
-        const auto failed = server.get("/api/v1/runtime/instances")["data"][0];
+        const auto failed = server.get("/api/runtime/instances")["data"][0];
         CHECK(failed["state"] == "failed");
-        response = server.post("/api/v1/models/unload", {{"instance_id", instance}, {"force", true}});
+        response = server.post("/api/models/unload", {{"instance_id", instance}, {"force", true}});
         CHECK(server.complete(response)["status"] == "succeeded");
         instance = load(); body["messages"][0]["content"] = "slow";
     }

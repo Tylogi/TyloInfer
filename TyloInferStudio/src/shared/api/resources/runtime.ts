@@ -136,25 +136,25 @@ export interface PrefixCacheText {
 
 export const runtimeApi = {
   servingStatistics(scope: 'session' | 'alltime', signal?: AbortSignal): Promise<ServingStatistics> {
-    return request(`/api/v1/runtime/serving?scope=${scope}`, { signal });
+    return request(`/api/runtime/serving?scope=${scope}`, { signal });
   },
   authenticationPolicy(): Promise<RuntimeAuthenticationPolicy> {
-    return request('/api/v1/auth/policy');
+    return request('/api/auth/policy');
   },
   configureAuthenticationPolicy(enabled: boolean, apiKey?: string): Promise<RuntimeAuthenticationPolicy> {
-    return request('/api/v1/auth/policy', { method: 'PUT', body: JSON.stringify({ enabled, ...(apiKey === undefined ? {} : { api_key: apiKey }) }) });
+    return request('/api/auth/policy', { method: 'PUT', body: JSON.stringify({ enabled, ...(apiKey === undefined ? {} : { api_key: apiKey }) }) });
   },
   qsaKvOffloadInfo(instanceId: string, targetContext: number, signal?: AbortSignal): Promise<QsaKvOffloadInfo> {
-    return request(`/api/v1/runtime/qsa-kv/${encodeURIComponent(instanceId)}?target_context=${targetContext}`, { signal });
+    return request(`/api/runtime/qsa-kv/${encodeURIComponent(instanceId)}?target_context=${targetContext}`, { signal });
   },
   configureQsaKvOffload(instanceId: string, policy: Pick<QsaKvOffloadInfo['policy'], 'enabled' | 'budget_bytes'>): Promise<{ operation_id: string }> {
-    return request('/api/v1/runtime/qsa-kv', { method: 'PUT', body: JSON.stringify({ instance_id: instanceId, ...policy }) });
+    return request('/api/runtime/qsa-kv', { method: 'PUT', body: JSON.stringify({ instance_id: instanceId, ...policy }) });
   },
   inferencePolicy(): Promise<{ mtp_enabled: boolean }> {
-    return request('/api/v1/runtime/inference-policy');
+    return request('/api/runtime/inference-policy');
   },
   configureInferencePolicy(mtpEnabled: boolean): Promise<{ mtp_enabled: boolean }> {
-    return request('/api/v1/runtime/inference-policy', {
+    return request('/api/runtime/inference-policy', {
       method: 'PUT', body: JSON.stringify({ mtp_enabled: mtpEnabled }),
     });
   },
@@ -162,130 +162,130 @@ export const runtimeApi = {
     const query = new URLSearchParams({ offset: String(offset), limit: '100' });
     if (namespace) query.set('namespace', namespace);
     if (filters) Object.entries(filters).forEach(([key, value]) => query.set(key, value));
-    return request(`/api/v1/runtime/cache/entries?${query}`, { signal });
+    return request(`/api/runtime/cache/entries?${query}`, { signal });
   },
   prefixCacheText(namespace: string, block: string, offset = 0): Promise<PrefixCacheText> {
-    return request(`/api/v1/runtime/cache/entries/${encodeURIComponent(namespace)}/${encodeURIComponent(block)}/text?offset=${offset}`);
+    return request(`/api/runtime/cache/entries/${encodeURIComponent(namespace)}/${encodeURIComponent(block)}/text?offset=${offset}`);
   },
   purgePrefixCache(namespace?: string): Promise<{ released_bytes: number; removed_blocks: number; failed_blocks: number }> {
-    return request('/api/v1/runtime/cache/purge', { method: 'POST', body: JSON.stringify({ namespace: namespace ?? null }) });
+    return request('/api/runtime/cache/purge', { method: 'POST', body: JSON.stringify({ namespace: namespace ?? null }) });
   },
   runtimeResources(signal?: AbortSignal): Promise<RuntimeResources> {
-    return request('/api/v1/runtime/resources', { signal });
+    return request('/api/runtime/resources', { signal });
   },
   modelAliases(): Promise<{ aliases: Record<string, string> }> {
-    return request('/api/v1/runtime/model-aliases');
+    return request('/api/runtime/model-aliases');
   },
   configureModelAliases(aliases: Record<string, string>): Promise<{ aliases: Record<string, string> }> {
-    return request('/api/v1/runtime/model-aliases', { method: 'PUT', body: JSON.stringify({ aliases }) });
+    return request('/api/runtime/model-aliases', { method: 'PUT', body: JSON.stringify({ aliases }) });
   },
   memoryPolicy(): Promise<RuntimeMemoryPolicy> {
-    return request('/api/v1/runtime/memory-policy');
+    return request('/api/runtime/memory-policy');
   },
   configureMemoryPolicy(policy: Partial<Pick<RuntimeMemoryPolicy, 'total_limit_bytes' | 'model_limit_bytes' | 'prefix_limit_bytes' | 'prefix_disk_limit_bytes' | 'prefix_ram_limit_bytes' | 'prefix_directory'>>): Promise<{ operation_id: string }> {
-    return request('/api/v1/runtime/memory-policy', { method: 'PUT', body: JSON.stringify(policy) });
+    return request('/api/runtime/memory-policy', { method: 'PUT', body: JSON.stringify(policy) });
   },
   runtimeListener(): Promise<RuntimeListener> {
-    return request('/api/v1/runtime/listener');
+    return request('/api/runtime/listener');
   },
 
   configureRuntimeListener(port: number, protocol: 'openai' | 'anthropic' = 'openai'): Promise<RuntimeListener> {
-    return request('/api/v1/runtime/listener', {
+    return request('/api/runtime/listener', {
       method: 'PUT', body: JSON.stringify(protocol === 'openai' ? { port } : { port, protocol }),
     });
   },
 
   runtimeCapabilities(instanceId?: string | null): Promise<RuntimeCapabilities> {
     const suffix = instanceId ? `?instance_id=${encodeURIComponent(instanceId)}` : '';
-    return request(`/api/v1/runtime/capabilities${suffix}`);
+    return request(`/api/runtime/capabilities${suffix}`);
   },
 
 
   runtimeStatus(instanceId?: string | null): Promise<RuntimeStatus> {
     const suffix = instanceId ? `?instance_id=${encodeURIComponent(instanceId)}` : '';
-    return request(`/api/v1/runtime/status${suffix}`);
+    return request(`/api/runtime/status${suffix}`);
   },
 
 
   async runtimeModels(): Promise<RuntimeModel[]> {
-    return (await request<{ data: RuntimeModel[] }>('/api/v1/runtime/models')).data;
+    return (await request<{ data: RuntimeModel[] }>('/api/runtime/models')).data;
   },
 
   /** Read and adapt native instances while preserving unreported telemetry as unknown. */
   async runtimeInstances(): Promise<RuntimeInstance[]> {
-    return (await request<{ data: NativeRuntimeInstance[] }>('/api/v1/runtime/instances')).data.map(adaptNativeInstance);
+    return (await request<{ data: NativeRuntimeInstance[] }>('/api/runtime/instances')).data.map(adaptNativeInstance);
   },
 
   configureInstance(instanceId: string, policy: { pinned: boolean; idle_ttl_seconds: number | null }): Promise<RuntimeInstance> {
-    return request(`/api/v1/runtime/instances/${encodeURIComponent(instanceId)}`, { method: 'PATCH', body: JSON.stringify(policy) });
+    return request(`/api/runtime/instances/${encodeURIComponent(instanceId)}`, { method: 'PATCH', body: JSON.stringify(policy) });
   },
 
 
 
   async runtimeMetrics(limit = 200, signal?: AbortSignal, since?: string): Promise<RuntimeMetricSnapshot[]> {
     return (
-      await request<{ data: RuntimeMetricSnapshot[] }>(`/api/v1/runtime/metrics?limit=${limit}${since ? `&since=${encodeURIComponent(since)}` : ''}`, { signal })
+      await request<{ data: RuntimeMetricSnapshot[] }>(`/api/runtime/metrics?limit=${limit}${since ? `&since=${encodeURIComponent(since)}` : ''}`, { signal })
     ).data;
   },
 
 
   async runtimeLogs(limit = 100, signal?: AbortSignal, after?: number): Promise<RuntimeLogEntry[]> {
-    return (await request<{ data: RuntimeLogEntry[] }>(`/api/v1/runtime/logs?limit=${limit}${after != null ? `&after=${after}` : ''}`, { signal })).data;
+    return (await request<{ data: RuntimeLogEntry[] }>(`/api/runtime/logs?limit=${limit}${after != null ? `&after=${after}` : ''}`, { signal })).data;
   },
 
 
   realtimeCapabilities(): Promise<RealtimeCapabilities> {
-    return request('/api/v1/runtime/realtime/capabilities');
+    return request('/api/runtime/realtime/capabilities');
   },
 
 
   voiceOutputComponent(): Promise<VoiceOutputComponentStatus> {
-    return request('/api/v1/components/voice-output');
+    return request('/api/components/voice-output');
   },
 
 
   installVoiceOutputComponent(): Promise<{ operation_id: string; status: 'accepted' }> {
-    return request('/api/v1/components/voice-output/install', { method: 'POST' });
+    return request('/api/components/voice-output/install', { method: 'POST' });
   },
 
 
   activateVoiceOutputComponent(): Promise<{ active: boolean; reason?: string; error?: string }> {
-    return request('/api/v1/components/voice-output/activate', { method: 'POST' });
+    return request('/api/components/voice-output/activate', { method: 'POST' });
   },
 
 
   reloadRuntime(contextSize: number, instanceId?: string): Promise<RuntimeStatus> {
-    return request('/api/v1/runtime/reload', {
+    return request('/api/runtime/reload', {
       method: 'POST',
       body: JSON.stringify({ context_size: contextSize, instance_id: instanceId }),
     });
   },
 
   contextPolicy(): Promise<RuntimeContextPolicy> {
-    return request('/api/v1/runtime/context-policy');
+    return request('/api/runtime/context-policy');
   },
 
   configureContextPolicy(policy: Pick<RuntimeContextPolicy, 'max_context_size'>): Promise<RuntimeContextPolicy> {
-    return request('/api/v1/runtime/context-policy', { method: 'PUT', body: JSON.stringify(policy) });
+    return request('/api/runtime/context-policy', { method: 'PUT', body: JSON.stringify(policy) });
   },
 
   reloadGlobalContextCap(): Promise<JobResource> {
-    return request('/api/v1/runtime/context', { method: 'POST', body: JSON.stringify({ apply_global_cap: true }) });
+    return request('/api/runtime/context', { method: 'POST', body: JSON.stringify({ apply_global_cap: true }) });
   },
 
   yarnContextInfo(instanceId: string): Promise<YarnContextInfo> {
-    return request(`/api/v1/runtime/yarn/${encodeURIComponent(instanceId)}`);
+    return request(`/api/runtime/yarn/${encodeURIComponent(instanceId)}`);
   },
 
   configureContext(contextSize: number | null, instanceId: string, yarnEnabled?: boolean, qsaKvOffload?: QsaKvStorageSettings, kvQuantization?: KvQuantizationSettings, kvMemory?: KvMemorySettings): Promise<JobResource> {
-    return request('/api/v1/runtime/context', {
+    return request('/api/runtime/context', {
       method: 'POST', body: JSON.stringify({ context_size: contextSize, instance_id: instanceId, yarn_enabled: yarnEnabled, qsa_kv_offload: qsaKvOffload, kv_quantization: kvQuantization, kv_memory: kvMemory }),
     });
   },
 
 
   clearRuntimeCache(instanceId?: string): Promise<RuntimeStatus & { released_snapshots: number }> {
-    return request('/api/v1/runtime/cache/clear', {
+    return request('/api/runtime/cache/clear', {
       method: 'POST',
       body: JSON.stringify({ instance_id: instanceId }),
     });
@@ -296,7 +296,7 @@ export const runtimeApi = {
     targetBytes = 0,
     instanceId?: string,
   ): Promise<RuntimeStatus & { released_bytes: number; target_bytes: number }> {
-    return request('/api/v1/runtime/cache/trim', {
+    return request('/api/runtime/cache/trim', {
       method: 'POST',
       body: JSON.stringify({ target_bytes: targetBytes, instance_id: instanceId }),
     });

@@ -244,7 +244,7 @@ json empty_page() { return {{"data", json::array()}}; }
 void register_runtime(httplib::Server& http, ModelInstances& instances) {
     const auto started_at = std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
     auto monitor = std::make_shared<ResourceMonitor>();
-    http.Get("/api/v1/runtime/status", [&](const httplib::Request& request, httplib::Response& response) {
+    http.Get("/api/runtime/status", [&](const httplib::Request& request, httplib::Response& response) {
         const auto items = instances.list();
         if (const auto id = query_uuid(request, "instance_id")) {
             const auto found = find_instance(items, *id);
@@ -259,12 +259,12 @@ void register_runtime(httplib::Server& http, ModelInstances& instances) {
             ? json{{"source", "native-instances"}, {"status", "ok"}, {"runtime_state", "idle"}}
             : status_json(*loaded));
     });
-    http.Get("/api/v1/runtime/instances", [&](const httplib::Request&, httplib::Response& response) {
+    http.Get("/api/runtime/instances", [&](const httplib::Request&, httplib::Response& response) {
         auto data = json::array();
         for (const auto& item : instances.list()) data.push_back(instance_json(item));
         set_json(response, {{"data", std::move(data)}});
     });
-    http.Get("/api/v1/runtime/instances/([^/]+)", [&](const httplib::Request& request, httplib::Response& response) {
+    http.Get("/api/runtime/instances/([^/]+)", [&](const httplib::Request& request, httplib::Response& response) {
         const auto id = normalize_uuid(request.matches[1]);
         const auto items = instances.list();
         const auto found = find_instance(items, id);
@@ -272,13 +272,13 @@ void register_runtime(httplib::Server& http, ModelInstances& instances) {
             throw ApiError(404, "runtime_instance_not_found", "runtime instance was not found: " + id);
         set_json(response, instance_json(*found));
     });
-    http.Get("/api/v1/runtime/metrics", [&](const httplib::Request& request, httplib::Response& response) {
+    http.Get("/api/runtime/metrics", [&](const httplib::Request& request, httplib::Response& response) {
         query_uuid(request, "instance_id");
         if (request.has_param("since")) valid_timestamp(request, "since");
         query_integer(request, "limit", 200, 1, 2000);
         set_json(response, empty_page());
     });
-    http.Get("/api/v1/runtime/logs", [&](const httplib::Request& request, httplib::Response& response) {
+    http.Get("/api/runtime/logs", [&](const httplib::Request& request, httplib::Response& response) {
         query_uuid(request, "instance_id");
         if (request.has_param("level")) {
             const auto level = request.get_param_value("level");
@@ -289,10 +289,10 @@ void register_runtime(httplib::Server& http, ModelInstances& instances) {
         query_integer(request, "limit", 200, 1, 2000);
         set_json(response, empty_page());
     });
-    http.Get("/api/v1/runtime/resources", [&, monitor](const httplib::Request&, httplib::Response& response) {
+    http.Get("/api/runtime/resources", [&, monitor](const httplib::Request&, httplib::Response& response) {
         set_json(response, monitor->sample(instances.list()));
     });
-    http.Get("/api/v1/runtime/serving", [&, started_at](const httplib::Request& request, httplib::Response& response) {
+    http.Get("/api/runtime/serving", [&, started_at](const httplib::Request& request, httplib::Response& response) {
         const auto scope = request.has_param("scope") ? request.get_param_value("scope") : std::string("session");
         if (scope != "session" && scope != "alltime")
             throw ApiError(400, "invalid_request", "scope must be session or alltime");
@@ -305,7 +305,7 @@ void register_runtime(httplib::Server& http, ModelInstances& instances) {
                 {"ttft_ms", nullptr}, {"cache_hit_rate", nullptr}}},
             {"activity", json::array()}});
     });
-    http.Get("/api/v1/runtime/models", [&](const httplib::Request&, httplib::Response& response) {
+    http.Get("/api/runtime/models", [&](const httplib::Request&, httplib::Response& response) {
         auto data = json::array();
         for (const auto& item : instances.list()) {
             if (item.state != InstanceInfo::State::loaded) continue;
@@ -315,10 +315,10 @@ void register_runtime(httplib::Server& http, ModelInstances& instances) {
         }
         set_json(response, {{"data", std::move(data)}});
     });
-    http.Get("/api/v1/runtime/model-aliases", [&](const httplib::Request&, httplib::Response& response) {
+    http.Get("/api/runtime/model-aliases", [&](const httplib::Request&, httplib::Response& response) {
         set_json(response, {{"aliases", instances.aliases()}});
     });
-    http.Put("/api/v1/runtime/model-aliases", [&](const httplib::Request& request, httplib::Response& response) {
+    http.Put("/api/runtime/model-aliases", [&](const httplib::Request& request, httplib::Response& response) {
         const auto body = parse_json(request);
         fields(body, {"aliases"});
         if (!body.contains("aliases") || !body["aliases"].is_object())

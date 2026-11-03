@@ -8,11 +8,11 @@ for (const language of ['zh-CN', 'en'] as const) {
     const GiB = 2 ** 30;
     let size = GiB;
     const models = ['Qwen3.8-Flash-Next-EWQ-MFQ-S4-L-MHC-NINT-LMHead8-MTP8', 'Qwen3.8-Flash-Next-Second-Model'];
-    await page.route('**/api/v1/runtime/status*', route => route.fulfill({ json: {
+    await page.route('**/api/runtime/status*', route => route.fulfill({ json: {
       runtime_state: 'ready', instance_id: 'a', model: models[0], active_requests: 0,
       runtime_memory_effective_budget_bytes: 96 * GiB, sampling_defaults: {},
     } }));
-    await page.route('**/api/v1/runtime/instances', route => route.fulfill({ json: { data: models.map((model, index) => ({
+    await page.route('**/api/runtime/instances', route => route.fulfill({ json: { data: models.map((model, index) => ({
       id: index ? 'b' : 'a', model, state: 'ready', devices: ['metal'], active_sessions: 1, queued_requests: 0,
       started_at: `2026-10-09T00:00:0${index}Z`, memory: {
         resident_weight_bytes: 20 * GiB, kv_bytes: GiB, context_count: 1, prefix_cache_blocks: 0,
@@ -24,7 +24,7 @@ for (const language of ['zh-CN', 'en'] as const) {
       },
     })) } }));
     let samples = 0;
-    await page.route('**/api/v1/runtime/resources', route => {
+    await page.route('**/api/runtime/resources', route => {
       samples++;
       return route.fulfill({ json: { sampled_at: 1, interval_seconds: 2, cpu_utilization_percent: 10,
         cpu_name: 'Apple M5 Max', cpu_cores: 18, gpus: [{ name: 'Apple M5 Max', core_count: 40, utilization_percent: 12 }],

@@ -4,7 +4,7 @@ import { mockStudioServer } from './mockServer';
 for (const language of ['en', 'zh-CN'] as const) {
   test(`independent tables are visible without model-loading UI (${language})`, async ({ page }) => {
     await mockStudioServer(page, { language });
-    await page.route('**/api/v1/runtime/instances', route => route.fulfill({ json: { data: [] } }));
+    await page.route('**/api/runtime/instances', route => route.fulfill({ json: { data: [] } }));
     const base = { architecture: 'qwen4_exp_text', format: 'tq', shard_count: 2, total_bytes: 2 ** 30,
       tensor_count: 2, record_count: 2, dtypes: [], complete: true, loadable: false, modified_at: '' };
     const items = [
@@ -14,7 +14,7 @@ for (const language of ['en', 'zh-CN'] as const) {
       { ...base, id: 'engram', name: 'Qwen3.8-Flash-Next-Engram', asset_kind: 'engram' },
     ];
     let optedIn = false;
-    await page.route(/\/api\/v1\/models(?:\?.*)?$/, route => {
+    await page.route(/\/api\/models(?:\?.*)?$/, route => {
       optedIn = new URL(route.request().url()).searchParams.get('include_components') === 'true';
       return route.fulfill({ json: { data: items } });
     });
@@ -35,7 +35,7 @@ for (const language of ['en', 'zh-CN'] as const) {
     }
     await expect(page.locator('.model-load-action')).toHaveCount(1);
     const directoryRequests: string[] = [];
-    await page.route('**/api/v1/models/engram/directory', route => {
+    await page.route('**/api/models/engram/directory', route => {
       directoryRequests.push(route.request().url());
       return route.fulfill({ json: { current_id: 'folder', current_name: 'Engram', current_path: '/models/Engram',
         data: [], files: [{ name: 'table.tq', byte_size: 2 ** 30 }], model_file_count: 0 } });

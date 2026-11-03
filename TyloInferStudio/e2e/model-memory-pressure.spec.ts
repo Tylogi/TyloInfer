@@ -8,12 +8,12 @@ for (const moe of [true, false]) {
     const roles = moe ? { dense: 2 * GiB, experts: 80 * GiB, embedding: GiB }
       : { dense: 27 * GiB, experts: 0, embedding: GiB };
     const weights = moe ? 83 * GiB : 28 * GiB;
-    await page.route('**/api/v1/runtime/status*', route => route.fulfill({ json: {
+    await page.route('**/api/runtime/status*', route => route.fulfill({ json: {
       runtime_state: 'idle', backend: 'cuda', memory_architecture: 'discrete', unified_memory: false,
       device_memory_total_bytes: 24 * GiB, host_memory_total_bytes: 64 * GiB,
       active_requests: 0, sampling_defaults: {},
     } }));
-    await page.route(/\/api\/v1\/models(?:\?.*)?$/, route => route.fulfill({ json: { data: [{
+    await page.route(/\/api\/models(?:\?.*)?$/, route => route.fulfill({ json: { data: [{
       id: 'a'.repeat(32), name: '压力测试模型', architecture: moe ? 'qwen4_exp' : 'qwen35', format: 'mfq',
       shard_count: 1, total_bytes: weights + 50 * GiB, estimated_resident_weight_bytes: weights,
       estimated_weight_bytes_by_role: roles, ssd_ple_bytes: 50 * GiB,
@@ -26,7 +26,7 @@ for (const moe of [true, false]) {
     catalog.data = [{ ...catalog.data[0], name: '压力测试模型', capabilities: moe ? ['MoE'] : [],
       variants: [{ ...catalog.data[0].variants[0], byte_size: weights + 50 * GiB, estimated_resident_weight_bytes: weights,
         estimated_weight_bytes_by_role: roles, ssd_ple_bytes: 50 * GiB }] }];
-    await page.route('**/api/v1/hub/official*', route => route.fulfill({ json: catalog }));
+    await page.route('**/api/hub/official*', route => route.fulfill({ json: catalog }));
     for (const path of ['/models', '/model-hub']) {
       await page.goto(path);
       const combined = moe;

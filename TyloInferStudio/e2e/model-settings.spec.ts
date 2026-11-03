@@ -12,11 +12,11 @@ for (const language of ['en', 'zh-CN'] as const) {
   test(`remaining memory appears once beside Filter and follows live updates (${language})`, async ({ page }, testInfo) => {
     await mockStudioServer(page, { language });
     let headroom: number | null = 85.3 * GiB;
-    await page.route('**/api/v1/runtime/status*', route => route.fulfill({ json: {
+    await page.route('**/api/runtime/status*', route => route.fulfill({ json: {
       runtime_state: 'idle', memory_architecture: 'unified', runtime_memory_headroom_bytes: headroom,
       active_requests: 0, sampling_defaults: {},
     } }));
-    await page.route(/\/api\/v1\/models(?:\?.*)?$/, route => route.fulfill({ json: { data: models } }));
+    await page.route(/\/api\/models(?:\?.*)?$/, route => route.fulfill({ json: { data: models } }));
     await page.goto('/models');
     const memory = page.locator('.checkpoint-available-memory');
     await expect(memory).toHaveCount(1);
@@ -67,7 +67,7 @@ for (const language of ['en', 'zh-CN'] as const) {
       { ...models[0], id: 'dense', name: 'Qwen3.8-27B-V1_M', architecture: 'qwen3_5_text' },
       { ...models[0], id: 'deepseek', name: 'DeepSeek-V4.1-Flash-1017-Q3', architecture: 'deepseek_v41_text' },
     ];
-    await page.route(/\/api\/v1\/models(?:\?.*)?$/, route => route.fulfill({ json: { data: items } }));
+    await page.route(/\/api\/models(?:\?.*)?$/, route => route.fulfill({ json: { data: items } }));
     await page.goto('/models');
     await expect(page.locator('.checkpoint-family-heading h3')).toHaveText(['Qwen', 'DeepSeek']);
     await expect(page.locator('.checkpoint-model-heading')).toHaveText(['Qwen3.8-Flash-Next', 'Qwen3.8-27B', 'DeepSeek-V4.1-Flash-1017']);
@@ -92,16 +92,16 @@ for (const language of ['en', 'zh-CN'] as const) {
 
 test('model library comes first and load settings remain scoped to the chosen model', async ({ page }) => {
   await mockStudioServer(page);
-  await page.route(/\/api\/v1\/models(?:\?.*)?$/, route => route.fulfill({ json: { data: models } }));
-  await page.route('**/api/v1/runtime/instances', route => route.fulfill({ json: { data: [] } }));
-  await page.route('**/api/v1/runtime/status*', route => route.fulfill({ json: { runtime_state: 'idle' } }));
-  await page.route('**/api/v1/models/*/cache-profile*', route => route.fulfill({ json: {
+  await page.route(/\/api\/models(?:\?.*)?$/, route => route.fulfill({ json: { data: models } }));
+  await page.route('**/api/runtime/instances', route => route.fulfill({ json: { data: [] } }));
+  await page.route('**/api/runtime/status*', route => route.fulfill({ json: { runtime_state: 'idle' } }));
+  await page.route('**/api/models/*/cache-profile*', route => route.fulfill({ json: {
     max_context: 131072, fixed_bytes: 0, fixed_components: [], components: [
       { group: 'GQA', name: 'raw_kv', bytes_per_row: 1024, tokens_per_row: 1, allocation: 'exact', minimum_rows: 0 },
     ],
   } }));
   const writes: Record<string, unknown>[] = [];
-  await page.route('**/api/v1/models/load', route => {
+  await page.route('**/api/models/load', route => {
     writes.push(route.request().postDataJSON());
     return route.fulfill({ json: { operation_id: 'load', status: 'accepted' } });
   });
@@ -139,13 +139,13 @@ test('model library comes first and load settings remain scoped to the chosen mo
 
 test('running model residency applies only to that instance and never submits a context reload', async ({ page }) => {
   await mockStudioServer(page);
-  await page.route(/\/api\/v1\/models(?:\?.*)?$/, route => route.fulfill({ json: { data: models } }));
+  await page.route(/\/api\/models(?:\?.*)?$/, route => route.fulfill({ json: { data: models } }));
   const instances = models.map((model, index) => ({ id: `running-${index}`, model: model.name, state: 'ready', devices: ['metal'],
     active_sessions: 0, queued_requests: 0, pinned: false, idle_ttl_seconds: null as number | null,
     context_size: 32768, context_capacity: 131072 }));
-  await page.route('**/api/v1/runtime/instances', route => route.fulfill({ json: { data: instances } }));
+  await page.route('**/api/runtime/instances', route => route.fulfill({ json: { data: instances } }));
   const writes: Record<string, unknown>[] = [];
-  await page.route('**/api/v1/runtime/instances/running-1', route => {
+  await page.route('**/api/runtime/instances/running-1', route => {
     const payload = route.request().postDataJSON();
     writes.push(payload); Object.assign(instances[1], payload);
     return route.fulfill({ json: instances[1] });

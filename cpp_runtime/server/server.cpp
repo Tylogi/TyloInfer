@@ -274,7 +274,7 @@ int run(const Config& config, const std::atomic<bool>& stop_requested, EngineFac
             return httplib::Server::HandlerResponse::Handled;
         }
         if (request.path.rfind("/api/", 0) == 0 || request.path.rfind("/v1", 0) == 0) {
-            if (request.method != "POST" || request.path != "/api/v1/media") {
+            if (request.method != "POST" || request.path != "/api/media") {
                 // shortcut: this guard reads Content-Length, so a chunked body only sees the global cap;
                 // upgrade to a streaming limit if a non-upload route ever needs a hard cap mid-transfer.
                 if (request.get_header_value_u64("Content-Length") > json_payload_bytes) {

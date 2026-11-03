@@ -10,8 +10,9 @@
 http://127.0.0.1:8090
 ```
 
-版本化管理根是 `http://127.0.0.1:8090/api/v1`。`/health`、`/health/identity`
-和 `/v1` 兼容入口不在版本化根下。启动参数见 `tyloinfer-server --help`：
+控制接口根是 `http://127.0.0.1:8090/api`，路径里没有版本段，也不再保留带版本的
+别名根。`/health`、`/health/identity` 和 `/v1` 兼容入口不在该根下。Python legacy
+后端保留 `/api/v1` 前缀，与本文档不一致属预期。启动参数见 `tyloinfer-server --help`：
 `--host`、`--port`（默认 8090，`0` 表示随机端口）、`--data-dir`、`--db`、
 `--web-root`、`--api-key-env`、`--model-dir`、`--exit-on-stdin-close`、
 `--studio-instance-id`。监听地址不是回环时必须启用鉴权，否则启动失败。
@@ -29,7 +30,7 @@ Authorization: Bearer <token>
 
 Anthropic 风格请求（`/v1/messages*`、`/v1/models/*`，或带 `Anthropic-Version`、
 `Anthropic-Beta`、`X-Api-Key` 头的 `/v1`、`/v1/models`）也可以把凭据放在
-`X-Api-Key`。根凭据拥有 `admin`。子密钥由 `POST /api/v1/auth/keys` 创建，
+`X-Api-Key`。根凭据拥有 `admin`。子密钥由 `POST /api/auth/keys` 创建，
 可指定 scope 列表和/或角色；`admin` 覆盖一切。
 
 | 角色 | 授予的 scope |
@@ -40,13 +41,13 @@ Anthropic 风格请求（`/v1/messages*`、`/v1/models/*`，或带 `Anthropic-Ve
 
 | 路由区域 | 所需 scope |
 |---|---|
-| `/api/v1/auth/*` | `admin` |
-| `PUT /api/v1/runtime/model-aliases` | `admin` |
-| `/api/v1/models/directories*`、`/api/v1/models/{artifact_id}/directory`、`/api/v1/hub/download-directory` | `models` |
-| 其余 `/api/v1/models`、`/api/v1/runtime`、`/api/v1/hub`：读 | `inference` |
-| 其余 `/api/v1/models`、`/api/v1/runtime`、`/api/v1/hub`：写（含 `POST /models/load`、`/models/unload`） | `models` |
-| `/api/v1/jobs*` | `jobs` |
-| `/api/v1/sessions*`、`/api/v1/presets*`、`/api/v1/inference/*` | `inference` |
+| `/api/auth/*` | `admin` |
+| `PUT /api/runtime/model-aliases` | `admin` |
+| `/api/models/directories*`、`/api/models/{artifact_id}/directory`、`/api/hub/download-directory` | `models` |
+| 其余 `/api/models`、`/api/runtime`、`/api/hub`：读 | `inference` |
+| 其余 `/api/models`、`/api/runtime`、`/api/hub`：写（含 `POST /models/load`、`/models/unload`） | `models` |
+| `/api/jobs*` | `jobs` |
+| `/api/sessions*`、`/api/presets*`、`/api/inference/*` | `inference` |
 | `/v1*` 兼容入口 | `inference` |
 
 `/health`、`/health/identity` 不在 `/api/` 下，永不要求凭据。
@@ -64,7 +65,7 @@ Anthropic 风格请求（`/v1/messages*`、`/v1/models/*`，或带 `Anthropic-Ve
 | `Object` | 自由 JSON 对象，字段可由服务端扩展 |
 | `String[]` | 字符串数组 |
 
-管理接口（`/api/v1/*`）的 JSON 是严格的：拒绝未知字段、错误的字段类型、
+管理接口（`/api/*`）的 JSON 是严格的：拒绝未知字段、错误的字段类型、
 超界整数和未声明允许的 `null`，一律返回 `400 invalid_request`。
 `Content-Type` 必须是 `application/json`，否则返回 `415 unsupported_media_type`。
 请求体上限为 1 MiB，超出由 HTTP 层直接拒绝。
@@ -74,7 +75,7 @@ Messages 请求拒绝未知字段。
 
 ### 1.3 管理错误信封
 
-`/api/v1/*` 的错误统一为：
+`/api/*` 的错误统一为：
 
 ```json
 {
@@ -117,7 +118,7 @@ Messages 请求拒绝未知字段。
 
 列表响应统一为 `{"data": [...]}`。成功删除返回 `204 No Content`。
 
-模型加载/卸载返回 `202 Accepted`，并带 `Location: /api/v1/jobs/{id}`：
+模型加载/卸载返回 `202 Accepted`，并带 `Location: /api/jobs/{id}`：
 
 ```json
 {"operation_id": "uuid", "status": "accepted"}
@@ -149,12 +150,12 @@ HTTP 层共 4 个工作线程。流式请求（`/v1/chat/completions`、`/v1/mes
 
 | 方法 | 路径 | 请求 | 成功 |
 |---|---|---|---|
-| `GET` | `/api/v1/auth/policy` | — | `200 Object` |
-| `PUT` | `/api/v1/auth/policy` | `{"enabled":bool,"api_key":string}` | `200 Object` |
-| `GET` | `/api/v1/auth/keys` | — | `200 {"data":[ApiKey]}` |
-| `POST` | `/api/v1/auth/keys` | `{"name":string,"scopes":String[],"role":string\|null,"expires_at":DateTime\|null}` | `201 {"key":ApiKey,"token":string}` |
-| `POST` | `/api/v1/auth/keys/{key_id}/revoke` | — | `200 ApiKey` |
-| `POST` | `/api/v1/auth/keys/{key_id}/rotate` | — | `200 {"key":ApiKey,"token":string}` |
+| `GET` | `/api/auth/policy` | — | `200 Object` |
+| `PUT` | `/api/auth/policy` | `{"enabled":bool,"api_key":string}` | `200 Object` |
+| `GET` | `/api/auth/keys` | — | `200 {"data":[ApiKey]}` |
+| `POST` | `/api/auth/keys` | `{"name":string,"scopes":String[],"role":string\|null,"expires_at":DateTime\|null}` | `201 {"key":ApiKey,"token":string}` |
+| `POST` | `/api/auth/keys/{key_id}/revoke` | — | `200 ApiKey` |
+| `POST` | `/api/auth/keys/{key_id}/rotate` | — | `200 {"key":ApiKey,"token":string}` |
 
 `name` 为 1-64 个字符；`scopes` 最多 4 项且只能取 `inference`、`models`、
 `jobs`、`admin`；没有 scope 时必须给角色。`api_key` 为 1-512 个不含空格的
@@ -166,68 +167,68 @@ HTTP 层共 4 个工作线程。流式请求（`/v1/chat/completions`、`/v1/mes
 
 | 方法 | 路径 | 请求 | 成功 | scope |
 |---|---|---|---|---|
-| `GET` | `/api/v1/models` | `?refresh=true\|false` | `200 {"data":[Artifact]}` | `inference` |
-| `GET` | `/api/v1/models/directories` | `?directory_id=` 或 `?path=` | `200 Directory` | `models` |
-| `POST` | `/api/v1/models/directories/register` | `{"path":string}` 或 `{"directory_id":string}` | `200 {"data":[Artifact]}` | `models` |
-| `GET` | `/api/v1/models/{artifact_id}/directory` | — | `200 Directory` | `models` |
-| `GET` | `/api/v1/models/{artifact_id}/capabilities` | — | `200 Capabilities` | `inference` |
-| `GET` | `/api/v1/models/{model_id}/analysis` | — | `200 CheckpointAnalysis` | `inference` |
-| `GET` | `/api/v1/models/{model_id}/cache-profile` | `?include_recurrent=true\|false` | `200 ModelCacheProfile\|null` | `inference` |
-| `GET` | `/api/v1/models/{model_id}/deletion` | — | `200 DeletionPlan` | `inference` |
-| `POST` | `/api/v1/models/{model_id}/delete` | `{"token":string}` | `200 {"files":int,"total_bytes":int}` | `models` |
-| `POST` | `/api/v1/models/load` | `LoadRequest` | `202 Accepted` | `models` |
-| `POST` | `/api/v1/models/unload` | `UnloadRequest` | `202 Accepted` | `models` |
-| `GET` | `/api/v1/runtime/instances` | — | `200 {"data":[Instance]}` | `inference` |
-| `GET` | `/api/v1/runtime/instances/{instance_id}` | — | `200 Instance` | `inference` |
-| `GET` | `/api/v1/runtime/status` | `?instance_id=UUID` | `200 Status` | `inference` |
-| `GET` | `/api/v1/runtime/models` | — | `200 {"data":[{"id":String}]}` | `inference` |
-| `GET` | `/api/v1/runtime/resources` | — | `200 Resources` | `inference` |
-| `GET` | `/api/v1/runtime/serving` | `?scope=session\|alltime&model=` | `200 ServingStatistics` | `inference` |
-| `GET` | `/api/v1/runtime/metrics` | `?instance_id&since&limit` | `200 {"data":[MetricSnapshot]}` | `inference` |
-| `GET` | `/api/v1/runtime/logs` | `?instance_id&level&after&limit` | `200 {"data":[LogEntry]}` | `inference` |
-| `GET` | `/api/v1/runtime/model-aliases` | — | `200 Aliases` | `inference` |
-| `PUT` | `/api/v1/runtime/model-aliases` | `Aliases` | `200 Aliases` | `admin` |
+| `GET` | `/api/models` | `?refresh=true\|false` | `200 {"data":[Artifact]}` | `inference` |
+| `GET` | `/api/models/directories` | `?directory_id=` 或 `?path=` | `200 Directory` | `models` |
+| `POST` | `/api/models/directories/register` | `{"path":string}` 或 `{"directory_id":string}` | `200 {"data":[Artifact]}` | `models` |
+| `GET` | `/api/models/{artifact_id}/directory` | — | `200 Directory` | `models` |
+| `GET` | `/api/models/{artifact_id}/capabilities` | — | `200 Capabilities` | `inference` |
+| `GET` | `/api/models/{model_id}/analysis` | — | `200 CheckpointAnalysis` | `inference` |
+| `GET` | `/api/models/{model_id}/cache-profile` | `?include_recurrent=true\|false` | `200 ModelCacheProfile\|null` | `inference` |
+| `GET` | `/api/models/{model_id}/deletion` | — | `200 DeletionPlan` | `inference` |
+| `POST` | `/api/models/{model_id}/delete` | `{"token":string}` | `200 {"files":int,"total_bytes":int}` | `models` |
+| `POST` | `/api/models/load` | `LoadRequest` | `202 Accepted` | `models` |
+| `POST` | `/api/models/unload` | `UnloadRequest` | `202 Accepted` | `models` |
+| `GET` | `/api/runtime/instances` | — | `200 {"data":[Instance]}` | `inference` |
+| `GET` | `/api/runtime/instances/{instance_id}` | — | `200 Instance` | `inference` |
+| `GET` | `/api/runtime/status` | `?instance_id=UUID` | `200 Status` | `inference` |
+| `GET` | `/api/runtime/models` | — | `200 {"data":[{"id":String}]}` | `inference` |
+| `GET` | `/api/runtime/resources` | — | `200 Resources` | `inference` |
+| `GET` | `/api/runtime/serving` | `?scope=session\|alltime&model=` | `200 ServingStatistics` | `inference` |
+| `GET` | `/api/runtime/metrics` | `?instance_id&since&limit` | `200 {"data":[MetricSnapshot]}` | `inference` |
+| `GET` | `/api/runtime/logs` | `?instance_id&level&after&limit` | `200 {"data":[LogEntry]}` | `inference` |
+| `GET` | `/api/runtime/model-aliases` | — | `200 Aliases` | `inference` |
+| `PUT` | `/api/runtime/model-aliases` | `Aliases` | `200 Aliases` | `admin` |
 
 ### 2.3 任务
 
 | 方法 | 路径 | 请求 | 成功 |
 |---|---|---|---|
-| `GET` | `/api/v1/jobs` | `?limit&offset&status&kind` | `200 {"data":[Job]}` |
-| `POST` | `/api/v1/jobs` | `{"kind":string,"payload":Download}` | `202 Job` |
-| `GET` | `/api/v1/jobs/kinds` | — | `200 {"data":[{"kind":String}]}` |
-| `GET` | `/api/v1/jobs/{id}` | — | `200 Job` |
-| `DELETE` | `/api/v1/jobs/{id}` | — | `204` |
-| `POST` | `/api/v1/jobs/{id}/cancel` | — | `200 Job` |
-| `POST` | `/api/v1/jobs/{id}/retry` | — | `202 Job` |
-| `GET` | `/api/v1/jobs/{id}/events` | `?after&limit&tail` | `200 {"data":[JobEvent]}` |
-| `GET` | `/api/v1/jobs/{id}/events/stream` | `?after` + `Last-Event-ID` | `200` SSE |
-| `DELETE` | `/api/v1/jobs/completed` | — | `204` |
+| `GET` | `/api/jobs` | `?limit&offset&status&kind` | `200 {"data":[Job]}` |
+| `POST` | `/api/jobs` | `{"kind":string,"payload":Download}` | `202 Job` |
+| `GET` | `/api/jobs/kinds` | — | `200 {"data":[{"kind":String}]}` |
+| `GET` | `/api/jobs/{id}` | — | `200 Job` |
+| `DELETE` | `/api/jobs/{id}` | — | `204` |
+| `POST` | `/api/jobs/{id}/cancel` | — | `200 Job` |
+| `POST` | `/api/jobs/{id}/retry` | — | `202 Job` |
+| `GET` | `/api/jobs/{id}/events` | `?after&limit&tail` | `200 {"data":[JobEvent]}` |
+| `GET` | `/api/jobs/{id}/events/stream` | `?after` + `Last-Event-ID` | `200` SSE |
+| `DELETE` | `/api/jobs/completed` | — | `204` |
 
 ### 2.4 会话与回复（`inference`）
 
 | 方法 | 路径 | 请求 | 成功 |
 |---|---|---|---|
-| `GET` | `/api/v1/sessions` | `?limit=1..200（默认 50）&offset` | `200 {"data":[Session]}` |
-| `POST` | `/api/v1/sessions` | `CreateSession` | `201 Session` |
-| `POST` | `/api/v1/sessions/import` | `SessionArchive` | `201 {"session","messages_imported","media_imported"}` |
-| `GET` | `/api/v1/sessions/{session_id}` | — | `200 Session` |
-| `PATCH` | `/api/v1/sessions/{session_id}` | `{"title","mode","metadata"}`（至少一项） | `200 Session` |
-| `DELETE` | `/api/v1/sessions/{session_id}` | — | `204` |
-| `GET` | `/api/v1/sessions/{session_id}/messages` | — | `200 {"data":[SessionMessage]}` |
-| `POST` | `/api/v1/sessions/{session_id}/messages` | `{"expected_revision","role","parts"}` | `201 {"session","message"}` |
-| `POST` | `/api/v1/sessions/{session_id}/fork` | `{"at_message_id","include_message","title","model"}` | `201 Session` |
-| `POST` | `/api/v1/sessions/{session_id}/rewind` | `{"expected_revision","at_message_id","include_message"}` | `200 Session` |
-| `GET` | `/api/v1/sessions/{session_id}/export` | — | `200 SessionArchive` |
-| `GET` | `/api/v1/sessions/{session_id}/responses` | `?limit=1..1000（默认 200）` | `200 {"data":[SessionResponse]}` |
-| `POST` | `/api/v1/sessions/{session_id}/responses` | `CreateResponse` | `200 SessionResponse` 或 SSE |
-| `POST` | `/api/v1/sessions/{session_id}/responses/cancel` | — | `200 SessionResponse` |
+| `GET` | `/api/sessions` | `?limit=1..200（默认 50）&offset` | `200 {"data":[Session]}` |
+| `POST` | `/api/sessions` | `CreateSession` | `201 Session` |
+| `POST` | `/api/sessions/import` | `SessionArchive` | `201 {"session","messages_imported","media_imported"}` |
+| `GET` | `/api/sessions/{session_id}` | — | `200 Session` |
+| `PATCH` | `/api/sessions/{session_id}` | `{"title","mode","metadata"}`（至少一项） | `200 Session` |
+| `DELETE` | `/api/sessions/{session_id}` | — | `204` |
+| `GET` | `/api/sessions/{session_id}/messages` | — | `200 {"data":[SessionMessage]}` |
+| `POST` | `/api/sessions/{session_id}/messages` | `{"expected_revision","role","parts"}` | `201 {"session","message"}` |
+| `POST` | `/api/sessions/{session_id}/fork` | `{"at_message_id","include_message","title","model"}` | `201 Session` |
+| `POST` | `/api/sessions/{session_id}/rewind` | `{"expected_revision","at_message_id","include_message"}` | `200 Session` |
+| `GET` | `/api/sessions/{session_id}/export` | — | `200 SessionArchive` |
+| `GET` | `/api/sessions/{session_id}/responses` | `?limit=1..1000（默认 200）` | `200 {"data":[SessionResponse]}` |
+| `POST` | `/api/sessions/{session_id}/responses` | `CreateResponse` | `200 SessionResponse` 或 SSE |
+| `POST` | `/api/sessions/{session_id}/responses/cancel` | — | `200 SessionResponse` |
 
 ### 2.5 媒体上传（`inference`）
 
 | 方法 | 路径 | 请求 | 成功 |
 |---|---|---|---|
-| `POST` | `/api/v1/media` | 原始字节，带 `Content-Type` 与 `X-Content-SHA256` | `201 MediaResource` |
-| `GET` | `/api/v1/media/{media_id}` | — | `200` 原始字节 |
+| `POST` | `/api/media` | 原始字节，带 `Content-Type` 与 `X-Content-SHA256` | `201 MediaResource` |
+| `GET` | `/api/media/{media_id}` | — | `200` 原始字节 |
 
 没有媒体列表端点。字段表与三层能力状态见 §5.5。
 
@@ -235,10 +236,10 @@ HTTP 层共 4 个工作线程。流式请求（`/v1/chat/completions`、`/v1/mes
 
 | 方法 | 路径 | 请求 | 成功 |
 |---|---|---|---|
-| `GET` | `/api/v1/presets` | — | `200 {"data":[GenerationPreset]}` |
-| `POST` | `/api/v1/presets` | `PutGenerationPreset` | `201 GenerationPreset` |
-| `PUT` | `/api/v1/presets/{preset_id}` | `PutGenerationPreset` | `200 GenerationPreset` |
-| `DELETE` | `/api/v1/presets/{preset_id}` | — | `204` |
+| `GET` | `/api/presets` | — | `200 {"data":[GenerationPreset]}` |
+| `POST` | `/api/presets` | `PutGenerationPreset` | `201 GenerationPreset` |
+| `PUT` | `/api/presets/{preset_id}` | `PutGenerationPreset` | `200 GenerationPreset` |
+| `DELETE` | `/api/presets/{preset_id}` | — | `204` |
 
 `PUT` 整体替换预设，不是部分更新。预设创建不要求模型已加载。
 
@@ -246,15 +247,15 @@ HTTP 层共 4 个工作线程。流式请求（`/v1/chat/completions`、`/v1/mes
 
 | 方法 | 路径 | 请求 | 成功 | scope |
 |---|---|---|---|---|
-| `POST` | `/api/v1/hub/resolve` | `{"reference":string,"fallback_provider":"huggingface"\|"modelscope"}` | `200 HubRepo` | `models` |
-| `GET` | `/api/v1/hub/models` | `?provider&query&limit&format&sort&formats&direction&cursor&browse` | `200 HubSearchPage` | `inference` |
-| `GET` | `/api/v1/hub/official` | `?refresh=bool` | `200 OfficialCatalog` | `inference` |
-| `GET` | `/api/v1/hub/models/{provider}/{owner}/{name}` | `?revision=` | `200 HubRepo` | `inference` |
-| `GET` | `/api/v1/hub/models/{provider}/{owner}/{name}/readme` | `?revision=` | `200 {"content":string\|null}` | `inference` |
-| `POST` | `/api/v1/hub/download-reuse` | `{"provider":string,"repo_id":string,"revision"?:string,"destination":string,"download_directory"?:string}` | `200 {"reusable_files":{文件名:字节}}` | `models` |
-| `POST` | `/api/v1/hub/download-sources/probe` | `{"sources":[{"provider":string,"repo_id":string,"revision"?:string}]}` | `200 {"data":[ProbeRoute]}` | `models` |
-| `GET` | `/api/v1/hub/download-directory` | — | `200 DownloadDirectory` | `models` |
-| `PUT` | `/api/v1/hub/download-directory` | `{"directory_id":string\|null,"evict_prefix_cache":bool}` | `200 DownloadDirectory` | `models` |
+| `POST` | `/api/hub/resolve` | `{"reference":string,"fallback_provider":"huggingface"\|"modelscope"}` | `200 HubRepo` | `models` |
+| `GET` | `/api/hub/models` | `?provider&query&limit&format&sort&formats&direction&cursor&browse` | `200 HubSearchPage` | `inference` |
+| `GET` | `/api/hub/official` | `?refresh=bool` | `200 OfficialCatalog` | `inference` |
+| `GET` | `/api/hub/models/{provider}/{owner}/{name}` | `?revision=` | `200 HubRepo` | `inference` |
+| `GET` | `/api/hub/models/{provider}/{owner}/{name}/readme` | `?revision=` | `200 {"content":string\|null}` | `inference` |
+| `POST` | `/api/hub/download-reuse` | `{"provider":string,"repo_id":string,"revision"?:string,"destination":string,"download_directory"?:string}` | `200 {"reusable_files":{文件名:字节}}` | `models` |
+| `POST` | `/api/hub/download-sources/probe` | `{"sources":[{"provider":string,"repo_id":string,"revision"?:string}]}` | `200 {"data":[ProbeRoute]}` | `models` |
+| `GET` | `/api/hub/download-directory` | — | `200 DownloadDirectory` | `models` |
+| `PUT` | `/api/hub/download-directory` | `{"directory_id":string\|null,"evict_prefix_cache":bool}` | `200 DownloadDirectory` | `models` |
 
 `resolve` 接受 `owner/name` 或 `huggingface.co`/`modelscope.cn` 的 HTTPS 仓库
 URL；任意 URL、凭据、查询串和 URL 后缀 revision 一律拒绝。仓库详情列出文件并
@@ -303,7 +304,7 @@ cache profile、attention profile、license 和 `published_at` 一律为 `null`�
 
 | 方法 | 路径 | 请求 | 成功 |
 |---|---|---|---|
-| `POST` | `/api/v1/inference/requests/{request_id}/cancel` | `{"instance_id":UUID}` | `200 {"cancel_requested":bool}` |
+| `POST` | `/api/inference/requests/{request_id}/cancel` | `{"instance_id":UUID}` | `200 {"cancel_requested":bool}` |
 
 `request_id` 属于具体实例，取消使用实例与请求标识的组合。`cancel_requested`
 只表示已受理取消意图，不表示生成已终止或资源已清理；终态从原推理流读取。
@@ -318,7 +319,7 @@ cache profile、attention profile、license 和 `published_at` 一律为 `null`�
 
 ## 3. 模型生命周期
 
-### 3.1 `POST /api/v1/models/load`
+### 3.1 `POST /api/models/load`
 
 ```json
 {
@@ -344,7 +345,7 @@ cache profile、attention profile、license 和 `published_at` 一律为 `null`�
 加载任务只报告 `resolving`、`loading`、`initializing` 三个真实检查点；
 进行中的 `progress` 为 0 表示没有可量化进度，成功后为 1。
 
-### 3.2 `POST /api/v1/models/unload`
+### 3.2 `POST /api/models/unload`
 
 | 字段 | 类型 | 约束 |
 |---|---|---|
@@ -356,7 +357,7 @@ cache profile、attention profile、license 和 `published_at` 一律为 `null`�
 
 ### 3.3 能力与实例
 
-`GET /api/v1/models/{artifact_id}/capabilities`：
+`GET /api/models/{artifact_id}/capabilities`：
 
 | 字段 | 含义 |
 |---|---|
@@ -367,7 +368,7 @@ cache profile、attention profile、license 和 `published_at` 一律为 `null`�
 | `load.cancellation` | 恒 `after_return` |
 | `load.progress` | 恒 `phase` |
 
-`GET /api/v1/runtime/instances` 返回 `{"data":[Instance]}`。`Instance` 含
+`GET /api/runtime/instances` 返回 `{"data":[Instance]}`。`Instance` 含
 `instance_id`、`artifact_id`、`model`、`backend`、`state`
 （`loaded`\|`unloading`\|`failed`）、`context_size`、`max_requests`、
 `active_requests`、`input_bytes`、`capabilities`、`metrics`、`session_metrics`、
@@ -377,7 +378,7 @@ cache profile、attention profile、license 和 `published_at` 一律为 `null`�
 
 ### 3.4 模型别名
 
-`GET/PUT /api/v1/runtime/model-aliases` 读写原模型名到公开别名的映射，正文为
+`GET/PUT /api/runtime/model-aliases` 读写原模型名到公开别名的映射，正文为
 `{"aliases":{"model-name":"public-name"}}`。读取需要 `inference`，写入需要
 `admin`。别名去除 ASCII 首尾空白后最长 255 个 Unicode 字符，不得含 ASCII 控制
 字符。空值或等于原名的值清除映射；别名必须唯一，不得遮蔽原名、产物 ID 或
@@ -389,7 +390,7 @@ cache profile、attention profile、license 和 `published_at` 一律为 `null`�
 
 ### 3.5 模型分析、缓存画像与磁盘删除
 
-`GET /api/v1/models/{model_id}/analysis` 读取产物元数据，返回 `CheckpointAnalysis`：
+`GET /api/models/{model_id}/analysis` 读取产物元数据，返回 `CheckpointAnalysis`：
 
 | 字段 | 含义 |
 |---|---|
@@ -413,14 +414,14 @@ cache profile、attention profile、license 和 `published_at` 一律为 `null`�
 保存逻辑形状时从张量头恢复几何，恢复不了的张量记入 `warnings` 并从
 `parameters`、`stored_bytes` 中排除。
 
-`GET /api/v1/models/{model_id}/cache-profile` 返回 `ModelCacheProfile`，架构没有
+`GET /api/models/{model_id}/cache-profile` 返回 `ModelCacheProfile`，架构没有
 缓存模型时返回 `null`。字段为 `max_context`、`fixed_bytes`、
 `fixed_components[]{group,name,layers,bytes}` 与
 `components[]{group,name,subgroup,layers,bytes_per_row,tokens_per_row,allocation,minimum_rows,row_rounding,active_after,max_read_rows_per_token,head_dimension,kv_heads}`。
 `include_recurrent` 只决定是否计入循环状态（GDN、PLE）的固定分量，默认 `false`。
 读不出元数据返回 `422 model_cache_profile_unavailable`。
 
-`GET /api/v1/models/{model_id}/deletion` 返回删除计划：
+`GET /api/models/{model_id}/deletion` 返回删除计划：
 
 ```json
 {"model_id": "catalog-artifact-id", "name": "model-name",
@@ -431,7 +432,7 @@ cache profile、attention profile、license 和 `published_at` 一律为 `null`�
 HF 目录含 `config.json`、`*.safetensors` 与索引 `weight_map` 引用的分片。目录和
 伴随文件不在计划内。`token` 绑定这些文件的设备号、inode、大小与时间戳。
 
-`POST /api/v1/models/{model_id}/delete` 正文只有 `{"token":string}`，必须是计划
+`POST /api/models/{model_id}/delete` 正文只有 `{"token":string}`，必须是计划
 返回的 64 位十六进制摘要。
 
 | 状态 | `code` | 条件 |
@@ -451,10 +452,10 @@ HF 目录含 `config.json`、`*.safetensors` 与索引 `weight_map` 引用的分
 原生服务没有共享的 runtime worker，也没有 Python 侧的指标与日志存储。观测资源
 只报告原生能够取到的事实，取不到的字段保持 `null` 或空集合，不会用估算值填充。
 
-`GET /api/v1/runtime/instances/{instance_id}` 返回与列表元素相同的 `Instance`；
+`GET /api/runtime/instances/{instance_id}` 返回与列表元素相同的 `Instance`；
 未知实例返回 `404 runtime_instance_not_found`，UUID 格式错误返回 `400`。
 
-`GET /api/v1/runtime/status` 不带 `instance_id` 时返回第一个已加载实例的投影，
+`GET /api/runtime/status` 不带 `instance_id` 时返回第一个已加载实例的投影，
 没有已加载实例时为 `{"source":"native-instances","status":"ok","runtime_state":"idle"}`；
 带 `instance_id` 时选择该实例，错误码与实例详情相同。投影字段为 `source`
 （恒 `native-instances`）、`status`、`instance_id`、`model`、`backend`、
@@ -465,10 +466,10 @@ HF 目录含 `config.json`、`*.safetensors` 与索引 `weight_map` 引用的分
 `total_prompt_tokens`、`total_completion_tokens`、`last_request`、`live_requests`
 以及内存与前缀缓存计数在原生服务不存在，响应里不出现这些键。
 
-`GET /api/v1/runtime/models` 只列出已加载实例的模型名，同名实例合并为一条；
+`GET /api/runtime/models` 只列出已加载实例的模型名，同名实例合并为一条；
 不登记产物，也不触发加载。
 
-`GET /api/v1/runtime/resources` 采样服务所在主机：
+`GET /api/runtime/resources` 采样服务所在主机：
 
 | 字段 | 原生来源 |
 |---|---|
@@ -489,17 +490,17 @@ HF 目录含 `config.json`、`*.safetensors` 与索引 `weight_map` 引用的分
 `qsa_kv_ssd_written_bytes`。计数器不存在、上一次快照缺少该计数器或采样间隔
 超过 10 秒时该速率为 `null`。
 
-`GET /api/v1/runtime/serving` 接受 `scope`（默认 `session`，或 `alltime`）与
+`GET /api/runtime/serving` 接受 `scope`（默认 `session`，或 `alltime`）与
 `model` 过滤，其它取值返回 `400 invalid_request`。原生服务不持久化完成请求
 记录，`totals` 恒为零计数与 `null` 速率，`activity` 恒为空数组，`started_at`
 是服务进程启动时刻。
 
-`GET /api/v1/runtime/metrics` 与 `GET /api/v1/runtime/logs` 保留 Python 的查询
+`GET /api/runtime/metrics` 与 `GET /api/runtime/logs` 保留 Python 的查询
 参数：`instance_id` 必须是 UUID，`since` 必须是 ISO 8601 时间，`level` 取
 `debug`\|`info`\|`warning`\|`error`，`after` 不小于 `0`，`limit` 为 `1..2000`
 （默认 `200`），违反者返回 `400 invalid_request`。原生服务没有指标历史与日志
-存储，两者恒返回 `{"data":[]}`；实时指标见 `GET /api/v1/runtime/instances` 与
-`GET /api/v1/runtime/status`。
+存储，两者恒返回 `{"data":[]}`；实时指标见 `GET /api/runtime/instances` 与
+`GET /api/runtime/status`。
 
 ## 4. 任务与事件
 
@@ -546,13 +547,13 @@ SSE 开始前的失败用 HTTP 错误；开始后的失败发送 `event: error` 
 
 ### 4.4 下载任务
 
-`GET /api/v1/jobs/kinds` 返回当前服务接受的任务类型，不再有内嵌 schema：
+`GET /api/jobs/kinds` 返回当前服务接受的任务类型，不再有内嵌 schema：
 
 ```json
 {"data":[{"kind":"download.huggingface"},{"kind":"download.modelscope"}]}
 ```
 
-`POST /api/v1/jobs` 只接受这两种 `kind`，其他返回 `501 job_kind_not_supported`。
+`POST /api/jobs` 只接受这两种 `kind`，其他返回 `501 job_kind_not_supported`。
 `payload` 字段：
 
 | 字段 | 类型 | 约束 |
@@ -690,7 +691,7 @@ data: {"protocol_version":"1.0","session_id":"...","sequence":0,"timestamp":"...
 
 `MediaResource`：`media`（`MediaRef`）与 `created_at`。
 
-`POST /api/v1/media` 读取原始请求体（不是 JSON），要求两个头：
+`POST /api/media` 读取原始请求体（不是 JSON），要求两个头：
 
 | 头 | 约束 | 不满足 |
 |---|---|---|
@@ -701,7 +702,7 @@ data: {"protocol_version":"1.0","session_id":"...","sequence":0,"timestamp":"...
 `413 media_too_large`。只有该端点的请求体上限提到 512 MiB，其余 API 路由仍在
 1 MiB 内，超出返回 `413 request_too_large`。对象按摘要寻址：落盘到
 `<data-dir>/media/<摘要前 2>/<2..4>/<摘要>`（权限 `0600`，临时文件 + 重命名），
-同摘要的重复上传返回已有对象而不重写。`GET /api/v1/media/{media_id}` 返回原始
+同摘要的重复上传返回已有对象而不重写。`GET /api/media/{media_id}` 返回原始
 字节与媒体 `mime_type`，带 `Cache-Control: private, immutable, max-age=31536000`、
 `ETag: "<摘要>"` 与全局 `X-Content-Type-Options: nosniff`；ID 不存在或 blob 己丢
 返回 `404 media_not_found`。
@@ -712,7 +713,7 @@ data: {"protocol_version":"1.0","session_id":"...","sequence":0,"timestamp":"...
 |---|---|
 | 上传、落盘、取回、会话消息引用校验、导出/导入往返 | 已打通 |
 | 含 `image`\|`video`\|`audio` 片段的回复 | `501 media_unavailable`，原生没有把字节变成张量的预处理阶段，是独立一期 |
-| `document` 片段与 `/api/v1/documents` | 未实现，保持 `501 media_unavailable` |
+| `document` 片段与 `/api/documents` | 未实现，保持 `501 media_unavailable` |
 
 片段校验分两步。结构：未知字段、`audio` 缺 `sample_rate_hz`/`channels`、越界整数
 返回 `400 invalid_request`。内容：每个媒体引用必须指向已存储对象且与存储行完全
@@ -872,7 +873,7 @@ thinking 的 `signature` 为空串。
 ## 7. Python 后端
 
 Python 服务（`tyloinfer/server`）仍是独立入口，其独有接口——文档抽取与
-`/api/v1/documents`、实时/语音、量化、数据集与评估、集群节点、运行时 profile 与
+`/api/documents`、实时/语音、量化、数据集与评估、集群节点、运行时 profile 与
 缓存管理等——以 `tyloinfer/server` 代码及其 `tyloinfer/server/protocol/openapi.json`
 为准。媒体上传与取回两边都有，但路径、错误码与能力边界各自定义：原生侧见 §5.5，
 原生侧不提取文档文本，也不把媒体片段送进生成推理。本文只描述原生 C++ server

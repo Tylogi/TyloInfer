@@ -703,7 +703,7 @@ async fn studio_select_model_directory(
     let token = studio_credential_get()?;
     let request = client
         .post(format!(
-            "{}/api/v1/models/directories/register",
+            "{}/api/models/directories/register",
             local_service_url(&config)
         ))
         .header("X-TyloInfer-Instance-ID", server.instance_id)
@@ -1008,9 +1008,9 @@ mod tests {
             let first = launch_native_smoke(&state, &executable, &directory, first_port).await?;
             let endpoint = format!("http://127.0.0.1:{first_port}");
             let client = server_client(&endpoint, Duration::from_secs(2))?;
-            let unauthorized = client.get(format!("{endpoint}/api/v1/models")).send().await.map_err(|error| error.to_string())?;
+            let unauthorized = client.get(format!("{endpoint}/api/models")).send().await.map_err(|error| error.to_string())?;
             if unauthorized.status() != reqwest::StatusCode::UNAUTHORIZED { return Err("native server did not enforce the inherited root credential".into()); }
-            let authenticated = with_server_credential(client.get(format!("{endpoint}/api/v1/models")), "studio-smoke-test-key")
+            let authenticated = with_server_credential(client.get(format!("{endpoint}/api/models")), "studio-smoke-test-key")
                 .header("X-TyloInfer-Instance-ID", &first.instance_id).send().await.map_err(|error| error.to_string())?;
             if !authenticated.status().is_success() { return Err("native server rejected the authenticated Studio request".into()); }
             state.stop_owned_server()?;
@@ -1200,7 +1200,7 @@ mod tests {
     #[test]
     fn server_requests_use_the_trimmed_credential_without_empty_auth_headers() {
         let client = reqwest::Client::new();
-        for path in ["/api/v1/models/directories/register"] {
+        for path in ["/api/models/directories/register"] {
             let url = format!("http://127.0.0.1:8090{path}");
             let authenticated = with_server_credential(client.post(&url), " test-credential ").build().unwrap();
             assert_eq!(authenticated.headers()[reqwest::header::AUTHORIZATION], "Bearer test-credential");

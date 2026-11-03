@@ -76,6 +76,7 @@ void source(Hub::Source& value) {
 // The resolve endpoint for one repository file; downloads and speed probes share it with the Python hub helper.
 std::string content_path(Hub::Provider provider, const std::string& repo, const std::string& revision, const std::string& file) {
     const auto name = hub::escape(repo, true), tag = hub::escape(revision), path = hub::escape(file, true);
+    // ModelScope external endpoint, not our route prefix.
     return provider == Hub::Provider::hf ? "/" + name + "/resolve/" + tag + "/" + path :
         "/api/v1/models/" + name + "/repo?Revision=" + tag + "&FilePath=" + path;
 }
@@ -140,6 +141,7 @@ Hub::Repo Hub::info(Source request, const Control& control, bool direct) const {
     source(request); control.checkpoint();
     const auto endpoint = remote(request.provider);
     const auto repo = hub::escape(request.repo, true), revision = hub::escape(request.revision);
+    // ModelScope external endpoint, not our route prefix.
     const auto path = request.provider == Provider::hf ? "/api/models/" + repo + "/revision/" + revision + "?blobs=true" :
         "/api/v1/models/" + repo + "/repo/files?Revision=" + revision + "&Recursive=True";
     try {
@@ -655,6 +657,7 @@ Hub::Page Hub::browse(Provider provider, const std::string& query, const std::ve
 std::string Hub::readme(Provider provider, const std::string& repo, const std::string& revision) const {
     Source candidate{provider, repo, revision};
     source(candidate);
+    // ModelScope external endpoint, not our route prefix.
     const auto path = provider == Provider::hf ?
         "/" + hub::escape(candidate.repo, true) + "/resolve/" + hub::escape(candidate.revision) + "/README.md" :
         "/api/v1/models/" + hub::escape(candidate.repo, true) + "/repo?Revision=" + hub::escape(candidate.revision) + "&FilePath=README.md";

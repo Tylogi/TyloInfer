@@ -4,7 +4,7 @@ import { mockStudioServer } from './mockServer';
 for (const language of ['zh-CN', 'en'] as const) {
   test(`service keeps context management separate from memory and persistent cache (${language})`, async ({ page }, testInfo) => {
     const state = await mockStudioServer(page, { language });
-    await page.route('**/api/v1/runtime/instances', route => route.fulfill({ json: { data: [{
+    await page.route('**/api/runtime/instances', route => route.fulfill({ json: { data: [{
       id: 'instance-1', model: 'Qwen3.8-Flash-Next-EWQ-MFQ-S4-L-MHC-NINT-LMHead8-MTP8', state: 'ready',
       devices: ['metal'], active_sessions: 0, queued_requests: 0, context_size: 8192, context_capacity: 262144,
     }] } }));

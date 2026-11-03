@@ -14,8 +14,8 @@ import { serverCapabilities } from '../../app/serverCapabilities';
 /** Browse the server's download folder and expose cache reclamation only when supported. */
 export function DownloadDirectoryControl({ onDirectoryChange }: { onDirectoryChange(path: string | undefined): void }) {
   const { tr } = useSettings();
-  const { connectionRevision, runtime } = useRuntime();
-  const capabilities = serverCapabilities(runtime);
+  const { connectionRevision } = useRuntime();
+  const capabilities = serverCapabilities();
   const connectionScope = useConnectionScope();
   const [directory, setDirectory] = useState<string | null>(null);
   const [storage, setStorage] = useState<DownloadDirectoryStatus | null>(null);

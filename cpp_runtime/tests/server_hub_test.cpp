@@ -72,6 +72,7 @@ struct Origin {
                 list.push_back({{"rfilename", name}, {"size", bytes.size()}, {"lfs", {{"sha256", digest(bytes)}, {"size", bytes.size()}}}});
             response.set_content(Json{{"sha", revision}, {"siblings", list}}.dump(), "application/json");
         });
+        // The two vendor routes below keep ModelScope's own versioned prefix; our routes use /api.
         http.Get("/api/v1/models/owner/model/repo/files", [&](const auto&, auto& response) {
             auto list = Json::array(); for (const auto& [name, bytes] : files)
                 list.push_back({{"Path", name}, {"Size", bytes.size()}, {"Sha256", digest(bytes)}, {"Type", "blob"}});
@@ -109,6 +110,7 @@ struct Origin {
                 list.push_back({{"rfilename", name}, {"size", bytes.size()}, {"lfs", {{"sha256", digest(bytes)}, {"size", bytes.size()}}}});
             response.set_content(Json{{"sha", std::string(40, 'c')}, {"siblings", list}}.dump(), "application/json");
         });
+        // Same ModelScope mock paths as above; they are not our route prefix.
         http.Get(R"(/api/v1/models/Tylogi/([^/]+)/repo/files)", [&](const auto&, auto& response) {
             auto list = Json::array();
             for (const auto& [name, bytes] : tylogi) list.push_back({{"Path", name}, {"Size", bytes.size()}, {"Sha256", digest(bytes)}, {"Type", "blob"}});
@@ -286,7 +288,7 @@ struct Server {
         return Json::parse(result->body);
     }
     Json complete(const std::string& id) {
-        Json job; wait([&] { job = get("/api/v1/jobs/" + id); const auto state = job["status"]; return state == "succeeded" || state == "failed" || state == "cancelled" || state == "interrupted"; }); return job;
+        Json job; wait([&] { job = get("/api/jobs/" + id); const auto state = job["status"]; return state == "succeeded" || state == "failed" || state == "cancelled" || state == "interrupted"; }); return job;
     }
 };
 void routes(const fs::path& executable) {
@@ -294,49 +296,49 @@ void routes(const fs::path& executable) {
     const Json payload{{"repo_id", "owner/model"}, {"destination", "models/api"}, {"include", {"*.json", "*.safetensors"}}, {"max_workers", 2}};
     {
         Server server(executable, temporary.root, origin);
-        CHECK(server.get("/api/v1/hub/download-directory")["directory"].is_null());
+        CHECK(server.get("/api/hub/download-directory")["directory"].is_null());
         const auto selected = temporary.root / "selected"; fs::create_directory(selected);
-        const auto folder = server.get("/api/v1/models/directories?path=" + path_utf8(selected));
-        auto configured = server.client->Put("/api/v1/hub/download-directory", Json{{"directory_id", folder.at("current_id")}}.dump(), "application/json");
+        const auto folder = server.get("/api/models/directories?path=" + path_utf8(selected));
+        auto configured = server.client->Put("/api/hub/download-directory", Json{{"directory_id", folder.at("current_id")}}.dump(), "application/json");
         CHECK(configured && configured->status == 200 && Json::parse(configured->body)["actual_directory"] == path_utf8(selected));
-        configured = server.client->Put("/api/v1/hub/download-directory", R"({"directory_id":null})", "application/json");
+        configured = server.client->Put("/api/hub/download-directory", R"({"directory_id":null})", "application/json");
         CHECK(configured && configured->status == 200 && Json::parse(configured->body)["directory"].is_null());
-        const auto unsupported = server.client->Put("/api/v1/hub/download-directory", R"({"evict_prefix_cache":true})", "application/json");
+        const auto unsupported = server.client->Put("/api/hub/download-directory", R"({"evict_prefix_cache":true})", "application/json");
         CHECK(unsupported && unsupported->status == 501);
         for (const auto* scope : {"inference", "jobs", "models"}) {
-            const auto key = server.post("/api/v1/auth/keys", {{"name", scope}, {"scopes", {scope}}}, 201);
+            const auto key = server.post("/api/auth/keys", {{"name", scope}, {"scopes", {scope}}}, 201);
             server.client->set_default_headers({{"Authorization", "Bearer " + key.at("token").get<std::string>()}});
-            auto result = server.client->Get("/api/v1/jobs/kinds"); CHECK(result && result->status == (std::string(scope) == "jobs" ? 200 : 403));
-            result = server.client->Get("/api/v1/hub/download-directory"); CHECK(result && result->status == (std::string(scope) == "models" ? 200 : 403));
-            result = server.client->Get("/api/v1/hub/models?provider=huggingface&limit=1");
+            auto result = server.client->Get("/api/jobs/kinds"); CHECK(result && result->status == (std::string(scope) == "jobs" ? 200 : 403));
+            result = server.client->Get("/api/hub/download-directory"); CHECK(result && result->status == (std::string(scope) == "models" ? 200 : 403));
+            result = server.client->Get("/api/hub/models?provider=huggingface&limit=1");
             CHECK(result && result->status == (std::string(scope) == "inference" ? 200 : 403));
             server.client->set_default_headers({{"Authorization", "Bearer hub-test-root"}});
         }
-        CHECK(server.get("/api/v1/jobs/kinds")["data"].size() == 2);
-        auto info = server.get("/api/v1/hub/models/huggingface/owner/model"); CHECK(info["revision"] == origin.revision && info["variants"].size() == 1 && info["downloads"].is_null());
-        CHECK(server.post("/api/v1/hub/resolve", {{"reference", "https://modelscope.cn/models/owner/model"}}, 200)["provider"] == "modelscope");
-        server.post("/api/v1/hub/resolve", {{"reference", "https://evil.invalid/owner/model"}}, 400);
+        CHECK(server.get("/api/jobs/kinds")["data"].size() == 2);
+        auto info = server.get("/api/hub/models/huggingface/owner/model"); CHECK(info["revision"] == origin.revision && info["variants"].size() == 1 && info["downloads"].is_null());
+        CHECK(server.post("/api/hub/resolve", {{"reference", "https://modelscope.cn/models/owner/model"}}, 200)["provider"] == "modelscope");
+        server.post("/api/hub/resolve", {{"reference", "https://evil.invalid/owner/model"}}, 400);
         // Hub search, the merged browser, the official catalog, model cards and source probes.
-        const auto found = server.get("/api/v1/hub/models?provider=huggingface&query=model&limit=5");
+        const auto found = server.get("/api/hub/models?provider=huggingface&query=model&limit=5");
         CHECK(found["data"].size() == 2 && found["next_cursor"].is_null() && found["data"][0]["repo_id"] == "owner/alpha-tq-7b");
         CHECK(found["data"][0]["formats"] == Json::array({"tq"}) && found["data"][0]["downloads"] == 30 && found["data"][0]["total_bytes"] == 0);
         CHECK(found["data"][0]["author"] == "owner" && found["data"][0]["source_url"] == "https://huggingface.co/owner/alpha-tq-7b");
         CHECK(found["data"][0]["updated_at"] == "2024-01-01T00:00:00.000Z" && found["data"][0]["trending_score"] == 2);
-        const auto scoped = server.get("/api/v1/hub/models?provider=modelscope&query=model&limit=5");
+        const auto scoped = server.get("/api/hub/models?provider=modelscope&query=model&limit=5");
         CHECK(scoped["data"][0]["repo_id"] == "owner/ms-tq-7b" && scoped["data"][0]["total_bytes"] == 1024);
-        const auto browsed = server.get("/api/v1/hub/models?provider=huggingface&browse=true&formats=tq,gguf&sort=downloads&limit=1");
+        const auto browsed = server.get("/api/hub/models?provider=huggingface&browse=true&formats=tq,gguf&sort=downloads&limit=1");
         CHECK(browsed["data"].size() == 1 && browsed["data"][0]["repo_id"] == "owner/beta-gguf" && !browsed["next_cursor"].is_null());
-        const auto onward = server.get("/api/v1/hub/models?provider=huggingface&browse=true&formats=tq,gguf&sort=downloads&limit=1&cursor=" +
+        const auto onward = server.get("/api/hub/models?provider=huggingface&browse=true&formats=tq,gguf&sort=downloads&limit=1&cursor=" +
             browsed["next_cursor"].get<std::string>());
         CHECK(onward["data"].size() == 1 && onward["data"][0]["repo_id"] == "owner/alpha-tq-7b");
-        const auto expired = server.client->Get("/api/v1/hub/models?provider=huggingface&browse=true&cursor=aaaaaaaaaaaaaaaa");
+        const auto expired = server.client->Get("/api/hub/models?provider=huggingface&browse=true&cursor=aaaaaaaaaaaaaaaa");
         CHECK(expired && expired->status == 400 && Json::parse(expired->body)["error"]["code"] == "search_cursor_expired");
         for (const auto* bad : {"provider=nope", "limit=0", "sort=trending", "formats=tq,bogus", "provider=modelscope&direction=asc&browse=true"}) {
-            const auto rejected = server.client->Get("/api/v1/hub/models?" + std::string(bad));
+            const auto rejected = server.client->Get("/api/hub/models?" + std::string(bad));
             CHECK(rejected && rejected->status == 400);
         }
         Json catalog;
-        wait([&] { catalog = server.get("/api/v1/hub/official"); return !catalog["refreshing"].get<bool>(); });
+        wait([&] { catalog = server.get("/api/hub/official"); return !catalog["refreshing"].get<bool>(); });
         CHECK(catalog["data"].size() == 1 && catalog["system"]["memory_pools"].size() == 1 && catalog["system"]["cpu_cores"] >= 1);
         CHECK(catalog["system"]["backend"] == "cpu" && catalog["system"]["physical_memory_bytes"].is_number());
         const auto& official = catalog["data"][0];
@@ -346,50 +348,50 @@ void routes(const fs::path& executable) {
         CHECK(official["downloads"] == 7 && official["updated_at"] == "2024-05-01T00:00:00.000Z");
         CHECK(official["description_zh"].get<std::string>().find("PLE") != std::string::npos);
         CHECK(official["sources"][1]["provider"] == "modelscope" && official["sources"][1]["available"] == true);
-        CHECK(server.get("/api/v1/hub/official?refresh=true")["refreshing"] == true);
-        const auto bad_refresh = server.client->Get("/api/v1/hub/official?refresh=maybe"); CHECK(bad_refresh && bad_refresh->status == 400);
+        CHECK(server.get("/api/hub/official?refresh=true")["refreshing"] == true);
+        const auto bad_refresh = server.client->Get("/api/hub/official?refresh=maybe"); CHECK(bad_refresh && bad_refresh->status == 400);
         origin.cards["README.md"] = "# fixture card";
-        CHECK(server.get("/api/v1/hub/models/huggingface/owner/model/readme")["content"] == "# fixture card");
-        CHECK(server.get("/api/v1/hub/models/modelscope/owner/model/readme?revision=master")["content"] == "# fixture card");
-        const auto absent = server.client->Get("/api/v1/hub/models/huggingface/owner/missing/readme");
+        CHECK(server.get("/api/hub/models/huggingface/owner/model/readme")["content"] == "# fixture card");
+        CHECK(server.get("/api/hub/models/modelscope/owner/model/readme?revision=master")["content"] == "# fixture card");
+        const auto absent = server.client->Get("/api/hub/models/huggingface/owner/missing/readme");
         CHECK(absent && absent->status == 200 && Json::parse(absent->body)["content"].is_null());
-        const auto bad_card = server.client->Get("/api/v1/hub/models/gitlab/owner/model/readme"); CHECK(bad_card && bad_card->status == 400);
-        const auto probed = server.post("/api/v1/hub/download-sources/probe",
+        const auto bad_card = server.client->Get("/api/hub/models/gitlab/owner/model/readme"); CHECK(bad_card && bad_card->status == 400);
+        const auto probed = server.post("/api/hub/download-sources/probe",
             Json{{"sources", Json::array({Json{{"provider", "huggingface"}, {"repo_id", "owner/model"}}})}}, 200);
         CHECK(probed["data"].size() == 1 && probed["data"][0]["repo_id"] == "owner/model");
         CHECK(probed["data"][0]["route"] == "direct" && probed["data"][0]["bytes_per_second"] > 0);
-        server.post("/api/v1/hub/download-sources/probe", Json{{"sources", Json::array()}}, 400);
-        server.post("/api/v1/hub/download-sources/probe", Json{{"sources", Json::array({Json{{"provider", "gitlab"}, {"repo_id", "owner/model"}}})}}, 400);
-        server.post("/api/v1/jobs", {{"kind", "unknown"}, {"payload", payload}}, 501);
+        server.post("/api/hub/download-sources/probe", Json{{"sources", Json::array()}}, 400);
+        server.post("/api/hub/download-sources/probe", Json{{"sources", Json::array({Json{{"provider", "gitlab"}, {"repo_id", "owner/model"}}})}}, 400);
+        server.post("/api/jobs", {{"kind", "unknown"}, {"payload", payload}}, 501);
         auto invalid = payload; invalid["max_workers"] = 17;
-        server.post("/api/v1/jobs", {{"kind", "download.huggingface"}, {"payload", invalid}}, 400);
-        const auto started = server.post("/api/v1/jobs", {{"kind", "download.huggingface"}, {"payload", payload}});
+        server.post("/api/jobs", {{"kind", "download.huggingface"}, {"payload", invalid}}, 400);
+        const auto started = server.post("/api/jobs", {{"kind", "download.huggingface"}, {"payload", payload}});
         const auto id = started.at("id").get<std::string>(); const auto job = server.complete(id);
         CHECK(job["status"] == "succeeded" && job["progress"] == 1 && job["result"]["registration"] == "registered");
         CHECK(job["progress_data"]["downloaded_bytes"] == job["progress_data"]["total_bytes"] && job["progress_data"]["files_completed"] == 2);
-        CHECK(server.get("/api/v1/models?refresh=true")["data"].size() == 1);
-        const auto events = server.get("/api/v1/jobs/" + id + "/events");
+        CHECK(server.get("/api/models?refresh=true")["data"].size() == 1);
+        const auto events = server.get("/api/jobs/" + id + "/events");
         bool progress = false; for (const auto& event : events["data"])
             if (event["type"] == "progress" && event["data"].contains("downloaded_bytes")) { progress = true; CHECK(!event["progress"].is_null()); }
-        CHECK(progress); server.post("/api/v1/jobs/" + id + "/retry", {}, 409);
+        CHECK(progress); server.post("/api/jobs/" + id + "/retry", {}, 409);
         origin.mode = 7; auto cancel = payload; cancel["destination"] = "models/cancel-api";
-        const auto cancel_id = server.post("/api/v1/jobs", {{"kind", "download.huggingface"}, {"payload", cancel}}).at("id").get<std::string>();
+        const auto cancel_id = server.post("/api/jobs", {{"kind", "download.huggingface"}, {"payload", cancel}}).at("id").get<std::string>();
         // Confirm that some weights arrived so a retry after cancellation must send Range.
-        wait([&] { const auto job = server.get("/api/v1/jobs/" + cancel_id); return job["progress_data"].is_object() && job["progress_data"].value("downloaded_bytes", 0) > 32768; });
-        server.post("/api/v1/jobs/" + cancel_id + "/cancel", {}, 200);
+        wait([&] { const auto job = server.get("/api/jobs/" + cancel_id); return job["progress_data"].is_object() && job["progress_data"].value("downloaded_bytes", 0) > 32768; });
+        server.post("/api/jobs/" + cancel_id + "/cancel", {}, 200);
         CHECK(server.complete(cancel_id)["status"] == "cancelled"); CHECK(!fs::exists(temporary.root / "models/cancel-api"));
         origin.mode = 0;
         const auto hf_ranges = origin.ranges.load();
-        const auto retry = server.post("/api/v1/jobs/" + cancel_id + "/retry", {}); CHECK(retry["id"] != cancel_id);
+        const auto retry = server.post("/api/jobs/" + cancel_id + "/retry", {}); CHECK(retry["id"] != cancel_id);
         CHECK(server.complete(retry["id"])["status"] == "succeeded");
         CHECK(origin.ranges > hf_ranges);
         origin.mode = 7; cancel["destination"] = "models/restart";
-        interrupted = server.post("/api/v1/jobs", {{"kind", "download.modelscope"}, {"payload", cancel}}).at("id");
-        wait([&] { const auto job = server.get("/api/v1/jobs/" + interrupted); return job["progress_data"].is_object() && job["progress_data"].value("downloaded_bytes", 0) > 32768; });
+        interrupted = server.post("/api/jobs", {{"kind", "download.modelscope"}, {"payload", cancel}}).at("id");
+        wait([&] { const auto job = server.get("/api/jobs/" + interrupted); return job["progress_data"].is_object() && job["progress_data"].value("downloaded_bytes", 0) > 32768; });
 #ifndef _WIN32
         server.process->signal(SIGKILL); CHECK(server.process->wait() == -SIGKILL);
 #else
-        server.post("/api/v1/jobs/" + interrupted + "/cancel", {}, 200);
+        server.post("/api/jobs/" + interrupted + "/cancel", {}, 200);
         CHECK(server.complete(interrupted)["status"] == "cancelled");
 #endif
     }
@@ -397,33 +399,33 @@ void routes(const fs::path& executable) {
     {
         Server server(executable, temporary.root, origin);
 #ifndef _WIN32
-        CHECK(server.get("/api/v1/jobs/" + interrupted)["status"] == "interrupted");
+        CHECK(server.get("/api/jobs/" + interrupted)["status"] == "interrupted");
 #endif
         const auto ms_ranges = origin.ranges.load();
-        const auto retry = server.post("/api/v1/jobs/" + interrupted + "/retry", {});
+        const auto retry = server.post("/api/jobs/" + interrupted + "/retry", {});
         CHECK(server.complete(retry["id"])["status"] == "succeeded");
         CHECK(origin.ranges > ms_ranges);
-        CHECK(server.get("/api/v1/models?refresh=true")["data"].size() == 3);
+        CHECK(server.get("/api/models?refresh=true")["data"].size() == 3);
         for (const auto* provider : {"huggingface", "modelscope"}) {
-            const auto info = server.get(std::string("/api/v1/hub/models/") + provider + "/owner/model");
+            const auto info = server.get(std::string("/api/hub/models/") + provider + "/owner/model");
             const auto label = info["variants"][0]["label"].get<std::string>();
             auto download = payload;
             download["destination"] = std::string("models/") + provider + "/owner/model/" +
                 std::regex_replace(label, std::regex("[^A-Za-z0-9_.-]+"), "-");
-            const auto job = server.post("/api/v1/jobs", {{"kind", std::string("download.") + provider}, {"payload", download}});
+            const auto job = server.post("/api/jobs", {{"kind", std::string("download.") + provider}, {"payload", download}});
             CHECK(server.complete(job["id"])["status"] == "succeeded");
         }
-        CHECK(server.get("/api/v1/models?refresh=true")["data"].size() == 5);
+        CHECK(server.get("/api/models?refresh=true")["data"].size() == 5);
         write(temporary.root / "models" / "reuse" / "model.tq", origin.tylogi["model.tq"]);
-        const auto reuse = server.post("/api/v1/hub/download-reuse",
+        const auto reuse = server.post("/api/hub/download-reuse",
             Json{{"provider", "huggingface"}, {"repo_id", "Tylogi/tylogi-flash-next-tq-7b"}, {"destination", "models/reuse"}}, 200);
         CHECK(reuse["reusable_files"].size() == 1 && reuse["reusable_files"]["model.tq"] == origin.tylogi["model.tq"].size());
-        const auto missing = server.post("/api/v1/hub/download-reuse",
+        const auto missing = server.post("/api/hub/download-reuse",
             Json{{"provider", "huggingface"}, {"repo_id", "Tylogi/tylogi-flash-next-tq-7b"}, {"destination", "models/absent"}}, 200);
         CHECK(missing["reusable_files"].empty());
-        server.post("/api/v1/hub/download-reuse", Json{{"provider", "huggingface"}, {"repo_id", "Tylogi/tylogi-flash-next-tq-7b"}, {"destination", ""}}, 400);
-        server.post("/api/v1/hub/download-reuse", Json{{"provider", "huggingface"}, {"repo_id", "owner/model"}, {"destination", "models/reuse"}, {"bogus", 1}}, 400);
-        server.client->set_default_headers({}); const auto denied = server.client->Post("/api/v1/jobs", payload.dump(), "application/json"); CHECK(denied && denied->status == 401);
+        server.post("/api/hub/download-reuse", Json{{"provider", "huggingface"}, {"repo_id", "Tylogi/tylogi-flash-next-tq-7b"}, {"destination", ""}}, 400);
+        server.post("/api/hub/download-reuse", Json{{"provider", "huggingface"}, {"repo_id", "owner/model"}, {"destination", "models/reuse"}, {"bogus", 1}}, 400);
+        server.client->set_default_headers({}); const auto denied = server.client->Post("/api/jobs", payload.dump(), "application/json"); CHECK(denied && denied->status == 401);
     }
 }
 }

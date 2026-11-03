@@ -9,20 +9,20 @@ for (const language of ['zh-CN', 'en'] as const) {
     const instances = names.map((model, index) => ({ id: `instance-${index + 1}`, model, state: 'ready',
       devices: ['metal'], active_sessions: 0, queued_requests: 0, context_size: index ? 65536 : 262144,
       context_capacity: 262144, resident_bytes: 2 ** 30 }));
-    await page.route('**/api/v1/runtime/instances', route => route.fulfill({ json: { data: instances } }));
-    await page.route('**/api/v1/runtime/models', route => route.fulfill({ json: { data: names.map(id => ({ id })) } }));
-    await page.route('**/api/v1/runtime/status*', route => route.fulfill({ json: { runtime_state: 'ready',
+    await page.route('**/api/runtime/instances', route => route.fulfill({ json: { data: instances } }));
+    await page.route('**/api/runtime/models', route => route.fulfill({ json: { data: names.map(id => ({ id })) } }));
+    await page.route('**/api/runtime/status*', route => route.fulfill({ json: { runtime_state: 'ready',
       instance_id: 'instance-1', model: names[0], context_capacity: 262144, mtp_service_enabled: false } }));
     const saves: unknown[] = [];
     const updates: unknown[] = [];
-    await page.route('**/api/v1/runtime/context', route => {
+    await page.route('**/api/runtime/context', route => {
       const payload = route.request().postDataJSON();
       updates.push(payload);
       return route.fulfill({ json: { id: 'context-layout-job', kind: 'runtime.context.configure', status: 'running',
         payload, progress: .3, progress_data: { phase: 'reloading' }, created_at: '2026-10-09T00:00:00Z',
         updated_at: '2026-10-09T00:00:00Z', cancel_requested: false } });
     });
-    await page.route('**/api/v1/runtime/context-policy', route => {
+    await page.route('**/api/runtime/context-policy', route => {
       if (route.request().method() === 'PUT') saves.push(route.request().postDataJSON());
       return route.fulfill({ json: { max_context_size: route.request().method() === 'PUT' ? 65536 : null,
         model_overrides: {}, fallback_context_size: 32768 } });

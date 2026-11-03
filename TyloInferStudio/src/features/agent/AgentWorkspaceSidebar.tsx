@@ -36,7 +36,7 @@ export function AgentWorkspaceSidebar({ onOpen }: { onOpen(path: string): void }
     const controller = new AbortController();
     setRemote({ query: normalizedQuery, items: [], pending: true, hasMore: false, failed: false });
     const timer = setTimeout(() => {
-      void request<{ items: { sessionId: string; snippet: string }[]; hasMore: boolean }>(`/api/v1/agent/search?query=${encodeURIComponent(normalizedQuery)}`, { signal: controller.signal })
+      void request<{ items: { sessionId: string; snippet: string }[]; hasMore: boolean }>(`/api/agent/search?query=${encodeURIComponent(normalizedQuery)}`, { signal: controller.signal })
         .then(value => { if (!controller.signal.aborted) setRemote({ query: normalizedQuery, ...value, pending: false, failed: false }); })
         .catch(() => { if (!controller.signal.aborted) setRemote({ query: normalizedQuery, items: [], pending: false, hasMore: false, failed: true }); });
     }, 200);

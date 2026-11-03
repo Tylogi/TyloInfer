@@ -1,5 +1,4 @@
 import type { ReactNode } from 'react';
-import { useRuntime } from './RuntimeProvider';
 import { serverCapabilities } from './serverCapabilities';
 import { ScreenHeader, EmptyPanel } from './display';
 import { useSettings } from '../features/settings/SettingsProvider';
@@ -12,9 +11,8 @@ const features = {
 
 /** Preserve future routes without mounting effects for unavailable server resources. */
 export function ServerFeature({ feature, children }: { feature: keyof typeof features; children: ReactNode }) {
-  const { runtime } = useRuntime();
   const { tr } = useSettings();
-  if (serverCapabilities(runtime)[feature]) return children;
+  if (serverCapabilities()[feature]) return children;
   const [zh, en, detailZh, detailEn] = features[feature];
   return <section className="dashboard-view">
     <ScreenHeader title={tr(zh, en)} subtitle={tr('当前服务暂不支持此功能', 'Unavailable on this server')} />
