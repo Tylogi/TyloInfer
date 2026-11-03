@@ -581,7 +581,8 @@ void keys_and_network() {
     for (const auto* role : {"viewer", "operator", "administrator"}) {
         const auto issued = issue({{"name", role}, {"role", role}});
         const auto credentials = bearer(issued.at("token"));
-        CHECK(server.get("/api/v1/runtime/status", credentials).status == 404);
+        CHECK(server.get("/api/v1/runtime/status", credentials).status == 200);
+        CHECK(server.get("/api/v1/runtime/resources", credentials).status == 200);
         CHECK(server.get("/api/v1/models/directories", credentials).status == (std::string(role) == "viewer" ? 403 : 200));
         CHECK(server.get("/api/v1/models/00000000000000000000000000000000/directory", credentials).status == (std::string(role) == "viewer" ? 403 : 404));
         CHECK(server.get("/api/v1/models", credentials).status == 200);
@@ -624,6 +625,63 @@ void keys_and_network() {
     CHECK(restarted.raw("POST", "/api/v1/auth/keys/invalid/rotate", admin).status == 400);
     Database database(f.data / "server.sqlite3");
     CHECK(database.scalar("SELECT count(*) FROM sessions") == "0");
+}
+
+void runtime_observation() {
+    Fixture f;
+    auto server = f.start({}, root_environment);
+    for (const auto* path : {"/api/v1/runtime/status", "/api/v1/runtime/metrics", "/api/v1/runtime/logs",
+            "/api/v1/runtime/resources", "/api/v1/runtime/serving", "/api/v1/runtime/models",
+            "/api/v1/runtime/instances/00000000-0000-4000-8000-000000000001"})
+        CHECK(server.get(path).status == 401);
+    const auto idle = server.get("/api/v1/runtime/status", admin).document();
+    CHECK(idle == json({{"source", "native-instances"}, {"status", "ok"}, {"runtime_state", "idle"}}));
+    CHECK(server.get("/api/v1/runtime/status?instance_id=", admin).status == 400);
+    CHECK(server.get("/api/v1/runtime/status?instance_id=not-a-uuid", admin).status == 400);
+    CHECK(server.get("/api/v1/runtime/status?instance_id=00000000-0000-4000-8000-000000000001", admin).status == 404);
+    CHECK(server.get("/api/v1/runtime/instances/00000000-0000-4000-8000-000000000001", admin).status == 404);
+    CHECK(server.get("/api/v1/runtime/instances/not-a-uuid", admin).status == 400);
+    CHECK(server.get("/api/v1/runtime/models", admin).document() == json({{"data", json::array()}}));
+    CHECK(server.get("/api/v1/runtime/metrics", admin).document() == json({{"data", json::array()}}));
+    CHECK(server.get("/api/v1/runtime/logs", admin).document() == json({{"data", json::array()}}));
+    for (const auto* query : {"?limit=0", "?limit=2001", "?limit=two", "?instance_id=nope"}) {
+        CHECK(server.get(std::string("/api/v1/runtime/metrics") + query, admin).status == 400);
+        CHECK(server.get(std::string("/api/v1/runtime/logs") + query, admin).status == 400);
+    }
+    CHECK(server.get("/api/v1/runtime/metrics?since=yesterday", admin).status == 400);
+    for (const auto* query : {"?after=-1", "?level=trace", "?level="})
+        CHECK(server.get(std::string("/api/v1/runtime/logs") + query, admin).status == 400);
+    CHECK(server.get("/api/v1/runtime/metrics?limit=1&since=2024-01-02T03:04:05.500+00:00", admin).status == 200);
+    CHECK(server.get("/api/v1/runtime/logs?limit=2000&after=0&level=warning", admin).document() ==
+        json({{"data", json::array()}}));
+    const auto serving = server.get("/api/v1/runtime/serving", admin).document();
+    CHECK(serving.at("scope") == "session");
+    CHECK(serving.at("started_at").get<double>() > 0);
+    CHECK(serving.at("activity").empty());
+    CHECK(serving.at("totals") == json({{"completed_requests", 0}, {"prompt_tokens", 0}, {"prefill_tokens", 0},
+        {"completion_tokens", 0}, {"cached_tokens", 0}, {"prefill_tps", nullptr}, {"decode_tps", nullptr},
+        {"ttft_ms", nullptr}, {"cache_hit_rate", nullptr}}));
+    CHECK(server.get("/api/v1/runtime/serving?scope=alltime&model=any", admin).document().at("scope") == "alltime");
+    CHECK(server.get("/api/v1/runtime/serving?scope=week", admin).status == 400);
+    CHECK(server.get("/api/v1/runtime/serving?model=", admin).status == 400);
+    const auto resources = server.get("/api/v1/runtime/resources", admin).document();
+    CHECK(resources.at("cpu_name").is_null());
+    CHECK(resources.at("cpu_cores").get<int>() >= 1);
+    CHECK(resources.at("gpus").empty() && resources.at("disks").empty() && resources.at("weights").empty());
+    CHECK(resources.at("interval_seconds").is_null() && resources.at("cpu_utilization_percent").is_null());
+    CHECK(resources.at("memory_total_bytes").get<std::int64_t>() > 0);
+    CHECK(resources.at("memory_available_bytes").get<std::int64_t>() > 0);
+    CHECK(resources.at("memory_used_bytes").get<std::int64_t>() >= 0);
+    CHECK(resources.at("memory_bandwidth_bytes_per_second").is_null() &&
+        resources.at("memory_bandwidth_limit_bytes_per_second").is_null() &&
+        resources.at("memory_bandwidth_utilization_percent").is_null());
+    std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+    const auto second = server.get("/api/v1/runtime/resources", admin).document();
+    const auto interval = second.at("interval_seconds").get<double>();
+    const auto utilization = second.at("cpu_utilization_percent").get<double>();
+    CHECK(interval >= 1.0 && interval <= 10.0);
+    CHECK(utilization >= 0.0 && utilization <= 100.0);
+    server.stop();
 }
 
 void model_catalog() {
@@ -1166,6 +1224,7 @@ int run_tests(const fs::path& server, bool models_only) {
         {"model roots", model_roots}, {"model inspection", model_inspection}, {"model deletion", model_deletion}} : Tests{
         {"CLI and lifetime", cli_and_lifetime}, {"locks and ports", locks_and_ports}, {"static files", static_files},
         {"policy and protocols", policy_and_protocols}, {"keys and network", keys_and_network},
+        {"runtime observation", runtime_observation},
         {"shutdown with pending work", shutdown_with_pending_work}, {"database migrations", databases_and_migration}};
     int failures = 0;
     for (const auto& test : tests) {

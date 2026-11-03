@@ -134,7 +134,7 @@ Json searched(const Hub::Page& value) {
     return {{"data", std::move(data)}, {"next_cursor", value.cursor.empty() ? Json(nullptr) : Json(value.cursor)}};
 }
 Json system_profile(const std::string& backend) {
-    std::int64_t physical = 0, available = 0;
+    const auto [physical, available] = host_memory_bytes();
     const char* platform = "unknown";
     const char* machine = "unknown";
 #ifdef _WIN32
@@ -142,12 +142,6 @@ Json system_profile(const std::string& backend) {
 #else
     utsname names{};
     if (uname(&names) == 0) { platform = names.sysname; machine = names.machine; }
-    const auto pages = sysconf(_SC_PHYS_PAGES), block = sysconf(_SC_PAGESIZE);
-    if (pages > 0 && block > 0) physical = static_cast<std::int64_t>(pages) * static_cast<std::int64_t>(block);
-#ifdef _SC_AVPHYS_PAGES
-    const long free_pages = sysconf(_SC_AVPHYS_PAGES);
-    if (free_pages > 0 && block > 0) available = static_cast<std::int64_t>(free_pages) * static_cast<std::int64_t>(block);
-#endif
 #endif
     const auto normalized = backend == "cuda" ? "cuda" : backend == "hip" ? "rocm" : backend.empty() ? "cpu" : "unknown";
     const auto capacity = physical ? Json(physical) : Json(nullptr);

@@ -1608,6 +1608,54 @@ void names_http_checks(const fs::path& executable) {
     CHECK(restored.aliases().at("beta") == "next");
 }
 
+void runtime_observation_checks(const fs::path& executable) {
+    Server server(executable, true);
+    fixture_model(server.root / "alpha");
+    const auto artifact = register_checkpoint(server, server.root / "alpha", "served");
+    CHECK(server.complete(server.post("/api/v1/models/load", {{"artifact_id", artifact}}))["status"] == "succeeded");
+    httplib::Client client("127.0.0.1", server.port);
+    const auto get = [&](const std::string& path) {
+        const auto response = client.Get(path);
+        CHECK(response);
+        return std::make_pair(response->status, Json::parse(response->body));
+    };
+    const auto listed = get("/api/v1/runtime/instances").second.at("data");
+    CHECK(listed.size() == 1);
+    const auto id = listed.at(0).at("instance_id").get<std::string>();
+    const auto detail = get("/api/v1/runtime/instances/" + id);
+    CHECK(detail.first == 200 && detail.second.at("instance_id") == id &&
+        detail.second.at("artifact_id") == listed.at(0).at("artifact_id") &&
+        detail.second.at("context_size") == listed.at(0).at("context_size") &&
+        detail.second.at("capabilities") == listed.at(0).at("capabilities"));
+    CHECK(detail.second.at("state") == "loaded" && detail.second.at("model") == "served" &&
+        detail.second.at("backend") == "fixture");
+    const auto missing = get("/api/v1/runtime/instances/00000000-0000-4000-8000-000000000001");
+    CHECK(missing.first == 404 && missing.second.at("error").at("code") == "runtime_instance_not_found");
+    CHECK(get("/api/v1/runtime/instances/not-a-uuid").first == 400);
+    const auto status = get("/api/v1/runtime/status?instance_id=" + id).second;
+    CHECK(status.at("source") == "native-instances" && status.at("instance_id") == id && status.at("model") == "served");
+    CHECK(status.at("runtime_state") == "ready" && status.at("max_context") == 128 && status.at("active_requests") == 0);
+    CHECK(status.at("model_capabilities").at("architecture_family") == "fixture");
+    CHECK(get("/api/v1/runtime/status").second.at("instance_id") == id);
+    CHECK(get("/api/v1/runtime/status?instance_id=00000000-0000-4000-8000-000000000001").first == 404);
+    const auto models = get("/api/v1/runtime/models").second.at("data");
+    CHECK(models.size() == 1 && models.at(0).at("id") == "served");
+    const auto resources = get("/api/v1/runtime/resources").second;
+    CHECK(resources.at("weights").size() == 1 && resources.at("weights")[0].at("instance_id") == id &&
+        resources.at("weights")[0].at("model") == "served");
+    CHECK(resources.at("weights")[0].at("expert_read_bytes_per_second").is_null());
+    CHECK(resources.at("gpus").empty() && resources.at("disks").empty());
+    CHECK(get("/api/v1/runtime/serving?scope=alltime").second.at("scope") == "alltime");
+    CHECK(get("/api/v1/runtime/metrics?limit=1").second.at("data").empty());
+    CHECK(get("/api/v1/runtime/logs?level=error").second.at("data").empty());
+    CHECK(server.complete(server.post("/api/v1/models/unload", {{"instance_id", id}}))["status"] == "succeeded");
+    CHECK(get("/api/v1/runtime/instances/" + id).first == 404);
+    CHECK(get("/api/v1/runtime/models").second.at("data").empty());
+    CHECK(get("/api/v1/runtime/status").second.at("runtime_state") == "idle");
+    CHECK(get("/api/v1/runtime/resources").second.at("weights").empty());
+    server.process->close_input(); CHECK(server.process->wait() == 0);
+}
+
 void session_http_checks(const fs::path& executable) {
     Server server(executable, true);
     fixture_model(server.root / "model");
@@ -2082,6 +2130,10 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string(argv[1]) == "--jobs") {
             jobs_checks(); jobs_http_checks(fs::absolute(fs::u8path(argv[0])));
             std::cout << "native job checks passed\n"; return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "--runtime-observation") {
+            runtime_observation_checks(fs::absolute(fs::u8path(argv[0])));
+            std::cout << "native runtime observation checks passed\n"; return 0;
         }
         if (argc == 4 && std::string(argv[1]) == "--cuda-resources") {
             cuda_resource_checks(fs::absolute(fs::u8path(argv[2])), fs::u8path(argv[3]));

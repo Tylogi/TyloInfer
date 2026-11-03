@@ -5,6 +5,7 @@
 #include "api/http.h"
 #include "api/inference.h"
 #include "api/models.h"
+#include "api/runtime.h"
 #include "api/jobs.h"
 #include "api/hub.h"
 #include "hub/hub.h"
@@ -310,6 +311,7 @@ int run(const Config& config, const std::atomic<bool>& stop_requested, EngineFac
     });
     register_auth(http, auth);
     register_models(http, models, instances, jobs, backend);
+    register_runtime(http, instances);
     register_jobs(http, jobs, streams);
     register_hub(http, hub, models, jobs, backend);
     register_inference(http, instances, streams);

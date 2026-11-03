@@ -31,7 +31,7 @@ configure_file(storage/schema.h.in generated/schema.h @ONLY)
 add_library(tyloinfer-server-core STATIC server.cpp instance.cpp api/inference.cpp api/anthropic.cpp api/models.cpp
     auth/auth.cpp auth/keys.cpp api/auth.cpp storage/storage.cpp storage/files.cpp models/catalog.cpp models/instances.cpp models/aliases.cpp
     models/analysis.cpp models/deletion.cpp
-    jobs/jobs.cpp api/jobs.cpp sessions/sessions.cpp api/sessions.cpp hub/hub.cpp hub/fetch.cpp api/hub.cpp)
+    jobs/jobs.cpp api/jobs.cpp sessions/sessions.cpp api/sessions.cpp hub/hub.cpp hub/fetch.cpp api/hub.cpp api/runtime.cpp)
 target_include_directories(tyloinfer-server-core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
 target_link_libraries(tyloinfer-server-core PUBLIC mfq-http mfq-protocol mfq-paged-prefix-cache mfq-model-source SQLite::SQLite3)
 target_link_libraries(tyloinfer-server-core PRIVATE CURL::libcurl OpenSSL::Crypto)
@@ -88,6 +88,8 @@ if(BUILD_TESTING)
     set_tests_properties(tyloinfer-server-load-test PROPERTIES TIMEOUT 90 LABELS "native-server;stage4")
     add_test(NAME tyloinfer-server-jobs-test COMMAND tyloinfer-server-inference-test --jobs)
     set_tests_properties(tyloinfer-server-jobs-test PROPERTIES TIMEOUT 90 LABELS "native-server;stage4")
+    add_test(NAME tyloinfer-server-runtime-observation-test COMMAND tyloinfer-server-inference-test --runtime-observation)
+    set_tests_properties(tyloinfer-server-runtime-observation-test PROPERTIES TIMEOUT 90 LABELS "native-server;stage4")
     add_executable(tyloinfer-server-catalog-formats-test ../tests/server_model_catalog_test.cpp)
     target_link_libraries(tyloinfer-server-catalog-formats-test PRIVATE tyloinfer-server-core mfq-ggml)
     target_compile_features(tyloinfer-server-catalog-formats-test PRIVATE cxx_std_17)
