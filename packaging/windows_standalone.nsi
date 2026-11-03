@@ -21,10 +21,12 @@ Var Parameters
 Var CacheRoot
 Var CachePath
 Var Stage
+Var StagingRoot
 Var Mutex
 Var WaitPid
 
 Section
+  StrCpy $Mutex 0
   ${GetParameters} $Parameters
   ReadEnvStr $CacheRoot "TYLOINFER_STUDIO_RUNTIME_CACHE"
   ${If} $CacheRoot == ""
@@ -32,10 +34,12 @@ Section
   ${EndIf}
   ${GetOptions} $Parameters "/CACHE_DIR=" $0
   ${IfNot} ${Errors}
+    CreateDirectory "$0"
+    IfErrors failed
     GetFullPathName $CacheRoot "$0"
+    IfErrors failed
   ${EndIf}
   StrCpy $CachePath "$CacheRoot\@PAYLOAD_ID@"
-  StrCpy $Stage "$CachePath.partial"
 
   System::Call 'kernel32::CreateMutexW(p 0, i 0, w "Local\TyloInferStudio-@PAYLOAD_ID@") p .r0'
   StrCpy $Mutex $0
@@ -49,14 +53,21 @@ Section
   ${EndIf}
 
   IfFileExists "$CachePath\.ready" 0 extract
-  IfFileExists "$CachePath\tyloinfer.exe" 0 extract
-  IfFileExists "$CachePath\mfq-runtime.exe" 0 extract
-  IfFileExists "$CachePath\tyloinfer-cli\tyloinfer-cli.exe" 0 extract
-  IfFileExists "$CachePath\web-ui\index.html" cached extract
+@PAYLOAD_CHECKS@
+  Goto cached
 
 extract:
+  ClearErrors
   SetOutPath "$CacheRoot"
-  RMDir /r "$Stage"
+  IfErrors failed
+  GetTempFileName $StagingRoot "$CacheRoot"
+  IfErrors failed
+  ; Delete only the newly reserved empty file; leave old caches and failed payloads for manual cleanup.
+  Delete "$StagingRoot"
+  IfErrors failed
+  CreateDirectory "$StagingRoot"
+  IfErrors failed
+  StrCpy $Stage "$StagingRoot\payload"
   ClearErrors
 @PAYLOAD_FILES@
   FileOpen $0 "$Stage\.ready" w
@@ -65,9 +76,19 @@ extract:
   FileClose $0
   IfErrors failed
   SetOutPath "$CacheRoot"
-  RMDir /r "$CachePath"
-  Rename "$Stage" "$CachePath"
+  IfFileExists "$CachePath\." 0 publish
+  Rename "$CachePath" "$StagingRoot\previous"
   IfErrors failed
+publish:
+  ClearErrors
+  Rename "$Stage" "$CachePath"
+  IfErrors rollback
+  Goto cached
+
+rollback:
+  IfFileExists "$StagingRoot\previous\." 0 failed
+  Rename "$StagingRoot\previous" "$CachePath"
+  Goto failed
 
 cached:
   System::Call 'kernel32::ReleaseMutex(p $Mutex)'

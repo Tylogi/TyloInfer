@@ -31,14 +31,16 @@ import { useMessageActions } from './hooks/useMessageActions';
 import { useVoiceConversation } from '../voice/useVoiceConversation';
 import { isGenerationBusy } from './state/generationController';
 import { conversationActions } from './state/conversationStore';
+import { normalizeStudioPath, STUDIO_PATHS } from '../../navigation';
 
 
 function useChatDomain() {
   const location = useLocation();
-  const [visited, setVisited] = useState(location.pathname === '/chat');
+  const chatRoute = normalizeStudioPath(location.pathname) === STUDIO_PATHS.chat;
+  const [visited, setVisited] = useState(chatRoute);
   useEffect(() => {
-    if (location.pathname === '/chat') setVisited(true);
-  }, [location.pathname]);
+    if (chatRoute) setVisited(true);
+  }, [chatRoute]);
   const { controller: generation, phase: generationPhase } = useChatGeneration({
     onSessionState: (id, state, revision) =>
       conversationActions.setSessions((current) =>
@@ -48,7 +50,7 @@ function useChatDomain() {
       conversationActions.applySynchronized(session, messages, responses),
   });
   const conversation = useConversationSessions(
-    visited || location.pathname === '/chat',
+    visited || chatRoute,
     isGenerationBusy(generationPhase),
   );
   const {
@@ -110,7 +112,7 @@ function useChatDomain() {
     [],
   );
 
-
+  /** Validate service support before publishing optimistic input and starting text generation. */
   const generate = useCallback(
     async (
       session: Session,
@@ -127,6 +129,12 @@ function useChatDomain() {
         return;
       const inference = inferenceRef.current;
       if (!inference.availableModelNames.includes(inference.selectedModel)) return;
+      if (inference.nativeTextOnly && (session.mode !== 'text' || input.some(part => !['text', 'reasoning', 'tool_call', 'tool_result'].includes(part.type)))) {
+        throw new Error(trRef.current('原生服务当前仅支持文本聊天，暂不支持附件或语音。', 'The native server supports text chat only. Attachments and voice are unavailable.'));
+      }
+      if (inference.nativeTextOnly && inference.sampling.reasoning_effort) {
+        throw new Error(trRef.current('原生服务暂不支持思考档位。请将思考档位设为标准后重试。', 'The native server does not support reasoning effort. Set reasoning effort to Standard and retry.'));
+      }
       setError(null);
       if (optimistic)
         setMessages((current) => [
@@ -163,7 +171,7 @@ function useChatDomain() {
     ],
   );
 
-
+  /** Prepare supported input and preserve unaccepted drafts when native service checks fail. */
   const send = useCallback(
     async (text: string, accepted: () => void) => {
       if (!active || !conversation.conversationReady || busy || recoveryNeeded) return;
@@ -175,6 +183,9 @@ function useChatDomain() {
       const resumeCapture = Boolean(controller?.capturing);
       const currentInference = inferenceRef.current;
       try {
+        if (currentInference.nativeTextOnly && attachments.getAttachments().length) {
+          throw new Error(trRef.current('原生服务暂不支持文档或媒体上传。请移除附件后重试。', 'The native server does not support document or media uploads. Remove attachments and retry.'));
+        }
         if (
           active.mode !== 'text' &&
           currentInference.realtimeAvailable &&
@@ -423,11 +434,9 @@ const ChatContext: Context<ReturnType<typeof useChatDomain> | null> =
   import.meta.hot?.data?.chatContext ?? createContext<ReturnType<typeof useChatDomain> | null>(null);
 if (import.meta.hot?.data) import.meta.hot.data.chatContext = ChatContext;
 
-
-
-
-
-
+/**
+ * Keep conversation and generation lifecycles mounted across route changes.
+ */
 export function ChatProvider({ children }: { children: ReactNode }) {
   return (
     <ChatAttachmentsProvider>
@@ -442,11 +451,9 @@ function ChatLifecycleProvider({ children }: { children: ReactNode }) {
   return <ChatContext.Provider value={value}>{children}</ChatContext.Provider>;
 }
 
-
-
-
-
-
+/**
+ * Read conversation, inference and generation controls from the chat provider.
+ */
 export function useChat() {
   const value = useContext(ChatContext);
   if (!value) throw new Error('ChatProvider is missing');

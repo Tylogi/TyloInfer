@@ -29,9 +29,12 @@ describe('业务职责边界', () => {
   it('业务模块不能依赖App，运行时启动不请求页面专属资源', () => {
     for (const file of files(join(root, 'features'))) expect(readFileSync(file, 'utf8')).not.toMatch(/from ['"][^'"]*\/App['"]/);
     const runtime = source('app/RuntimeProvider.tsx');
-    for (const request of ['datasets', 'evaluations', 'modelArtifacts', 'runtimeLogs', 'generationPresets', 'artifactLineage']) {
+    for (const request of ['datasets', 'evaluations', 'runtimeLogs', 'generationPresets', 'artifactLineage']) {
       expect(runtime).not.toContain(`.${request}(`);
     }
+    // Native load jobs contain only asset IDs; resolve their names from the lightweight catalog without rescanning models or components.
+    expect(runtime).toContain('modelsApi.modelArtifacts()');
+    expect(runtime).not.toMatch(/modelsApi\.modelArtifacts\([^)]*true/);
   });
   it('业务模块按领域依赖资源 API，不依赖统一聚合入口', () => {
     for (const file of files(root)) {

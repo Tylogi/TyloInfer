@@ -72,20 +72,14 @@ export interface JobState {
 
 
   addJob: (job: JobResource) => void;
-
-
-
-
-
-
+  /**
+   * Merge progress, native result or failure details into a job without accepting older snapshots.
+   */
   updateJob: (id: string, patch: Partial<JobResource>) => void;
-
-
-
-
-
-
-
+  /**
+   * Subscribe to a job's SSE stream and apply phase, result and error events immediately.
+   * Returns a cleanup function that stops only the subscription owned by this call.
+   */
   streamJobEvents: (id: string, options?: StreamJobEventsOptions) => () => void;
 
 
@@ -184,8 +178,14 @@ export const useJobStore = create<JobState>()((set, get) => ({
               : null;
           get().updateJob(id, {
             ...(status ? { status } : {}),
-            ...(typeof event.progress === 'number' ? { progress: event.progress } : {}),
+            ...(typeof event.progress === 'number' ? { progress: event.progress }
+              : event.type === 'progress' && typeof event.data.progress === 'number' ? { progress: event.data.progress } : {}),
             ...(event.type === 'progress' ? { progress_data: event.data } : {}),
+            ...(event.type === 'state' && 'result' in event.data ? { result: event.data.result as JobResource['result'] } : {}),
+            ...(event.type === 'state' && 'error' in event.data ? { error: event.data.error as JobResource['error'] } : {}),
+            ...(event.type === 'state' && typeof event.data.cancel_requested === 'boolean'
+              ? { cancel_requested: event.data.cancel_requested } : {}),
+            ...(status === 'succeeded' ? { progress: 1 } : {}),
             updated_at: event.created_at,
           });
           if (status && TERMINAL_STATUSES.has(status)) {
