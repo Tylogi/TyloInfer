@@ -1,6 +1,7 @@
 #include "runtime.h"
 #include "http.h"
 #include "instance.h"
+#include "instance_json.h"
 #include "engine.h"
 #include "models/instances.h"
 #include "protocol.h"
@@ -66,6 +67,13 @@ void valid_timestamp(const httplib::Request& request, const char* name) {
     input >> std::get_time(&parts, "%Y-%m-%dT%H:%M:%S");
     if (input.fail() || (value.size() > 19 && value[19] != '.' && value[19] != '+' && value[19] != 'Z' && value[19] != '-'))
         throw ApiError(400, "invalid_request", std::string(name) + " must be an ISO-8601 timestamp");
+}
+
+void fields(const json& body, std::initializer_list<const char*> allowed) {
+    if (!body.is_object()) throw ApiError(400, "invalid_request", "request must be a JSON object");
+    for (const auto& item : body.items())
+        if (std::find(allowed.begin(), allowed.end(), item.key()) == allowed.end())
+            throw ApiError(400, "invalid_request", "unknown model operation parameter: " + item.key());
 }
 
 std::int64_t metrics_age_ms(const InstanceInfo& item) {
@@ -251,6 +259,19 @@ void register_runtime(httplib::Server& http, ModelInstances& instances) {
             ? json{{"source", "native-instances"}, {"status", "ok"}, {"runtime_state", "idle"}}
             : status_json(*loaded));
     });
+    http.Get("/api/v1/runtime/instances", [&](const httplib::Request&, httplib::Response& response) {
+        auto data = json::array();
+        for (const auto& item : instances.list()) data.push_back(instance_json(item));
+        set_json(response, {{"data", std::move(data)}});
+    });
+    http.Get("/api/v1/runtime/instances/([^/]+)", [&](const httplib::Request& request, httplib::Response& response) {
+        const auto id = normalize_uuid(request.matches[1]);
+        const auto items = instances.list();
+        const auto found = find_instance(items, id);
+        if (found == items.end())
+            throw ApiError(404, "runtime_instance_not_found", "runtime instance was not found: " + id);
+        set_json(response, instance_json(*found));
+    });
     http.Get("/api/v1/runtime/metrics", [&](const httplib::Request& request, httplib::Response& response) {
         query_uuid(request, "instance_id");
         if (request.has_param("since")) valid_timestamp(request, "since");
@@ -293,6 +314,18 @@ void register_runtime(httplib::Server& http, ModelInstances& instances) {
             data.push_back({{"id", item.model}});
         }
         set_json(response, {{"data", std::move(data)}});
+    });
+    http.Get("/api/v1/runtime/model-aliases", [&](const httplib::Request&, httplib::Response& response) {
+        set_json(response, {{"aliases", instances.aliases()}});
+    });
+    http.Put("/api/v1/runtime/model-aliases", [&](const httplib::Request& request, httplib::Response& response) {
+        const auto body = parse_json(request);
+        fields(body, {"aliases"});
+        if (!body.contains("aliases") || !body["aliases"].is_object())
+            throw ApiError(400, "invalid_request", "aliases must be an object of strings");
+        for (const auto& value : body["aliases"])
+            if (!value.is_string()) throw ApiError(400, "invalid_request", "aliases must be an object of strings");
+        set_json(response, {{"aliases", instances.set_aliases(body["aliases"].get<ModelInstances::Aliases>())}});
     });
 }
 } // namespace mfq::server

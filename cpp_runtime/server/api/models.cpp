@@ -1,8 +1,6 @@
 #include "models.h"
 #include "http.h"
-#include "protocol.h"
-#include "models/analysis.h"
-#include "models/deletion.h"
+#include "instance_json.h"
 #include "models/instances.h"
 #include "models/errors.h"
 #include "jobs/jobs.h"
@@ -40,19 +38,6 @@ json artifacts(const std::vector<ModelCatalog::Artifact>& entries, const ModelIn
     return {{"data", std::move(data)}};
 }
 
-json instance_json(const InstanceInfo& item) {
-    const auto state = item.state == InstanceInfo::State::loaded ? "loaded" :
-        item.state == InstanceInfo::State::unloading ? "unloading" : "failed";
-    return {{"instance_id", item.id}, {"model", item.model}, {"artifact_id", item.artifact_id}, {"backend", item.backend},
-        {"state", state}, {"context_size", item.capabilities.max_context}, {"max_requests", item.capabilities.max_requests},
-        {"active_requests", item.execution.requests}, {"input_bytes", item.execution.input_bytes},
-        {"capabilities", mfq::protocol::model_capability_profile_json(item.capabilities.capabilities)},
-        {"policy", {{"pin", item.policy.pin}, {"idle_ttl_seconds", item.policy.idle_ttl ? json(item.policy.idle_ttl->count()) : json(nullptr)}}},
-        {"metrics_age_ms", std::max<std::int64_t>(0, std::chrono::duration_cast<std::chrono::milliseconds>(
-            engine::Clock::now() - item.execution.captured).count())},
-        {"metrics", item.execution.runtime}, {"session_metrics", item.execution.session}};
-}
-
 void fields(const json& request, std::initializer_list<const char*> allowed) {
     if (!request.is_object()) throw ApiError(400, "invalid_request", "request must be a JSON object");
     for (const auto& item : request.items())
@@ -73,36 +58,9 @@ std::int64_t integer(const json& request, const char* field, std::int64_t fallba
         throw ApiError(400, "invalid_request", std::string(field) + " is outside its supported range");
     return value.get<std::int64_t>();
 }
-
-bool boolean_query(const httplib::Request& request, const char* name) {
-    const auto value = request.get_param_value(name);
-    if (request.has_param(name) && value != "true" && value != "false" && value != "1" && value != "0")
-        throw ApiError(400, "invalid_request", std::string(name) + " must be a boolean");
-    return value == "true" || value == "1";
-}
-
-void valid_token(const std::string& token) {
-    if (token.size() != 64 || !std::all_of(token.begin(), token.end(),
-            [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); }))
-        throw ApiError(400, "invalid_request", "token must be a SHA-256 hexadecimal digest");
-}
 } // namespace
 
-void register_models(httplib::Server& http, ModelCatalog& catalog, ModelInstances& instances, Jobs& jobs,
-        const std::string& backend) {
-    const bool cuda = backend == "cuda";
-    http.Get("/api/v1/runtime/model-aliases", [&](const httplib::Request&, httplib::Response& response) {
-        set_json(response, {{"aliases", instances.aliases()}});
-    });
-    http.Put("/api/v1/runtime/model-aliases", [&](const httplib::Request& request, httplib::Response& response) {
-        const auto body = parse_json(request);
-        fields(body, {"aliases"});
-        if (!body.contains("aliases") || !body["aliases"].is_object())
-            throw ApiError(400, "invalid_request", "aliases must be an object of strings");
-        for (const auto& value : body["aliases"])
-            if (!value.is_string()) throw ApiError(400, "invalid_request", "aliases must be an object of strings");
-        set_json(response, {{"aliases", instances.set_aliases(body["aliases"].get<ModelInstances::Aliases>())}});
-    });
+void register_models(httplib::Server& http, ModelCatalog& catalog, ModelInstances& instances, Jobs& jobs) {
     http.Get("/api/v1/models", [&](const httplib::Request& request, httplib::Response& response) {
         const auto refresh = request.get_param_value("refresh");
         if (request.has_param("refresh") && refresh != "true" && refresh != "false" && refresh != "1" && refresh != "0")
@@ -136,29 +94,6 @@ void register_models(httplib::Server& http, ModelCatalog& catalog, ModelInstance
             {"reason", support.reason.empty() ? json(nullptr) : json(support.reason)},
             {"declared_context_capacity", artifact.context_capacity ? json(*artifact.context_capacity) : json(nullptr)},
             {"load", {{"cancellation", "after_return"}, {"progress", "phase"}}}});
-    });
-    http.Get("/api/v1/models/([^/]+)/analysis", [&](const httplib::Request& request, httplib::Response& response) {
-        set_json(response, checkpoint_analysis_json(catalog.resolve(request.matches[1]), cuda));
-    });
-    http.Get("/api/v1/models/([^/]+)/cache-profile", [&](const httplib::Request& request, httplib::Response& response) {
-        set_json(response, model_cache_profile_json(catalog.resolve(request.matches[1]),
-            boolean_query(request, "include_recurrent"), cuda));
-    });
-    http.Get("/api/v1/models/([^/]+)/deletion", [&](const httplib::Request& request, httplib::Response& response) {
-        set_json(response, deletion_plan_json(model_deletion_plan(catalog.resolve(request.matches[1]))));
-    });
-    http.Post("/api/v1/models/([^/]+)/delete", [&](const httplib::Request& request, httplib::Response& response) {
-        const auto body = parse_json(request);
-        fields(body, {"token"});
-        const auto token = selector(body, "token");
-        valid_token(token);
-        const auto artifact = catalog.resolve(request.matches[1]);
-        if (instances.busy_for(artifact.id, artifact.name))
-            throw ModelError(ModelError::Kind::conflict, "model_delete_busy",
-                "Unload the model and wait for loading to finish before deleting it");
-        const auto result = delete_model_files(artifact, token);
-        catalog.list(true);
-        set_json(response, result);
     });
     http.Post("/api/v1/models/load", [&](const httplib::Request& request, httplib::Response& response) {
         const auto body = parse_json(request);
@@ -210,20 +145,6 @@ void register_models(httplib::Server& http, ModelCatalog& catalog, ModelInstance
         });
         response.set_header("Location", "/api/v1/jobs/" + operation);
         set_json(response, {{"operation_id", operation}, {"status", "accepted"}}, 202);
-    });
-    http.Get("/api/v1/runtime/instances", [&](const httplib::Request&, httplib::Response& response) {
-        auto data = json::array();
-        for (const auto& item : instances.list()) data.push_back(instance_json(item));
-        set_json(response, {{"data", std::move(data)}});
-    });
-    http.Get("/api/v1/runtime/instances/([^/]+)", [&](const httplib::Request& request, httplib::Response& response) {
-        const auto id = normalize_uuid(request.matches[1]);
-        const auto items = instances.list();
-        const auto found = std::find_if(items.begin(), items.end(),
-            [&](const auto& item) { return item.id == id; });
-        if (found == items.end())
-            throw ApiError(404, "runtime_instance_not_found", "runtime instance was not found: " + id);
-        set_json(response, instance_json(*found));
     });
 }
 }
