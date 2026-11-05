@@ -9,19 +9,12 @@ CMake、旧目录收尾、Metal/HIP、工具接线、测试迁移和运行继续
 
 Gemma4 保持当前支持范围或明确拒绝，不新增媒体、MTP、session 或 batch 能力；其他 family 的迁移不作为其公共接口收敛的前置条件。
 
-1. 实现[Tensor 抽象接口及具体数据表示](architecture.md#统一-tensor-契约)：DenseTensor 与 TQ/NINT/NVQ/MX 等实现继承 Tensor，统一逻辑 shape/dtype、布局和存储枚举；复用现有编码、缓冲区与数值实现。
-2. 将 Loader、模型字段、共享 Attention/MLP、视觉、State、公共 ops 及必要 CUDA 消费者迁至引用/智能指针契约，清除抽象 Tensor 的按值构造、容器与返回接口；明确对象、view、只读别名及异步结果的所有权。
-   拆除 Weights、QuantLinear/QuantLinearGroup/Experts 体系及旧对象强转，不将其整体搬入 Tensor 子类；分组使用有序权重指针列表，保留联合投影与输出边界。
-3. 补齐各编码、专家与分片的准备、完整缓冲区遍历、设备搬运和 view/cast 规则，复用 backing 去重统计；统一 TQ、MX 等实现的逻辑信息与物理字节语义。
-   [相容性检查](architecture.md#公共-ops-与后端分派)覆盖 embedding、expert、attention 状态 view/元数据、CPU 暂存、实际 host 计算、分片及异步结果；不新增注册系统或公共 Task IR。
-4. 将 Engine 收敛为构造注入 CausalModel 与 Executor，移出 CUDA friend 写入内部字段、向下转换及设备装配职责，保持当前单请求支持范围。
-   其余旧 Engine 装配随对应 family 迁移；资源管理者留在 state、weights 和后端执行设施，不新增 Runtime 转发壳或资源袋。
-5. 将多态 Tensor、view 及全部 backing 接入[执行完成与资源保活契约](architecture.md#executor-与执行作用域)，协调外部权重及 offload，补齐取消、加载失败、卸载/reload、异步输出与租约的退休接线。
-   收拢共享视觉的设备选择、权重暂存和空间估算，移除写死 CUDA 0 的转换与剩余计算图回调壳；保持输出迁出借用存储后再归还的顺序。
-   补齐剩余 legacy、媒体及资源退休入口的作用域覆盖；复用已有 scope/drain，不将整设备同步优化另列为当前前置任务。
+1. ~~实现 Tensor 抽象接口及具体数据表示~~ 完成：Tensor 为抽象数据接口，DenseTensor 与 TQ/NINT/NVQ/MX/SQ 实现继承之；逻辑 shape/dtype、缓冲区枚举与字节语义统一，backing 去重统计复用。
+2. ~~拆除 Weights、QuantLinear/QuantLinearGroup/Experts 值聚合体系~~ 完成：投影权重为持有 `shared_ptr<const Tensor>` 的记录，分组用有序 `QuantLinearRef` 列表；Engine 构造注入 `EngineParts{model, executor, impl}`，friend 写字段、`assemble_engine` 与向下转换已删。
+3. ~~补齐编码、专家与分片的准备、缓冲区遍历、设备搬运和 view/cast 规则~~ 完成：准备走 `Tensor::relocated()`/`QuantLinear::relocated()` 发布新表示；专家池按 family 枚举全部缓冲区（NEPQ 保持聚合但暴露 buffers()），`mixed_moe_storage_bytes` 与驻留检查复用 backing 去重；view/cast 规则写入 Tensor 契约：编码表示无 dense view，`buffers()` 只用于记账/驻留/保活。
+4. ~~将多态 Tensor、view 及全部 backing 接入执行完成与资源保活契约~~ 源码完成：共享视觉的设备选择收拢到 primary/像素设备（移除写死 CUDA 0 的转换），借用存储的输出统一"迁出后再归还"（generation/MTP prefill、视觉 loan.finish）；TQ 驻留权重经 `Tensor::record_stream` 保活；卸载/reload 经 `Engine::rebuild`→`unload_model`→drain 排空。嵌套 scope、同线程多 Engine、协程暂停/恢复、异常恢复、并行工作区隔离和异步保活待运行验证恢复后验收。
 
-**源码完成条件：** 一阶段 CUDA 路径经 Tensor 抽象接口及引用/智能指针访问各数据表示，基类无格式字段或数值实现，编码、view、执行相容性与生命周期契约落地；Gemma4 的装配、生成和释放经注入的公共模型/执行契约组织，模型不依赖 Executor，通用运行代码不访问 family 私有布局。
-所有资源 owner、作用域和完成时点可定位。嵌套 scope、同线程多 Engine、协程暂停/恢复、异常恢复、并行工作区隔离和异步保活待验证工作恢复后验收。
+**源码完成条件已满足：** CUDA 路径经 Tensor 抽象接口及引用/智能指针访问各数据表示，基类无格式字段或数值实现；Gemma4 的装配、生成和释放经注入的公共模型/执行契约组织，模型不依赖 Executor，通用运行代码不访问 family 私有布局。剩余为运行验收（见暂缓事项）。
 
 ## 2. 拆除剩余通用 Block 与旧执行适配
 
