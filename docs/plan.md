@@ -25,6 +25,12 @@ Qwen4Exp、DeepSeek V4.1 及其共享消费者仍须拆除公共 Block 继承树
 - 迁移相关 family 的旧 Engine 装配和 CudaExecutionContext 借用壳，清理 Executor 中失去用途的整层执行辅助；CUDA 生产消费者迁完后删除旧实现、模板和转发头。
 - 收敛模型中剩余的 Transform 与计算图回调，由具体模型计算单元解释执行顺序。
 
+进度：虚 Block 树与 FullBlock 已删（40339d4），Qwen4Block 公开为 qwen4_exp/block.h 层记录，deepseek_v41::Block 脱离继承，块向量归各模型，dynamic_cast 探测清零。剩余按 Gemma4 形态推进，每步保持可编译：
+1. 状态拆分：deepseek_v41::Block 的 AttentionState 与 speculative_* 归 `DeepseekV41State`（每请求，持每层状态向量）；qwen4_exp 的 Gdn/Qsa/Ple 递归缓存与 decode-graph 保留状态同样归请求 State。session capture/restore、dspark 预测器阶段、prefill 消费者同步改读 State。
+2. 前向归模型：`forward(model, state, input, options)` 家族自由函数解释层序，替代逐块 `CudaExecutionContext&` 传递；块记录只剩权重与设备位。
+3. Model 实现 `tyloi::models::CausalModel`、State 实现 `tyloi::models::State`（同 gemma4）；两族迁入 EngineParts 注入的新 Engine 装配。
+4. 删脚手架：CudaCausalOps、CausalModelBase 对这两族的实例化、causal_forward.h 通用循环、adapter_* 钩子与 session_codec 通用模板。
+
 保留数学、dtype、校验、CPU/layer placement、投影顺序、回滚事务和存储身份。暂缓的 Metal/HIP、测试与工具引用登记待恢复，不为其保留源码副本或旧抽象。
 **源码完成条件：** 活动 CUDA 生产代码不再依赖公共 Block 运行框架及其类型探测，各模型只组合所需计算单元，状态与执行资源的所有者清楚。
 
