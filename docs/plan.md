@@ -31,6 +31,12 @@ Qwen4Exp、DeepSeek V4.1 及其共享消费者仍须拆除公共 Block 继承树
 3. Model 实现 `tyloi::models::CausalModel`、State 实现 `tyloi::models::State`（同 gemma4）；两族迁入 EngineParts 注入的新 Engine 装配。
 4. 删脚手架：CudaCausalOps、CausalModelBase 对这两族的实例化、causal_forward.h 通用循环、adapter_* 钩子与 session_codec 通用模板。
 
+deepseek_v41 状态拆分已落地（357359e）：每请求每层 `LayerState`（KV 环+推测检查点+ids+层标志）挂在 `SharedState::layers`，Block 经 `L()` 访问，块记录只余权重与放置。dsv41 迁 `Text<Model,State>` 的映射：
+- `dsv41::Model : CausalModel`：config + `vector<Block>`（纯权重）+ Engram 工厂参数；forward 由家族自由函数实现（现 `CausalModelBase::hidden_forward_inputs` 的几何准备+层循环+adapter 钩子移入），embed/normalize/softcap/logits 对应现 adapter/embed_tokens。
+- `dsv41::State : models::State`：持 `SharedState`（含 layers、engram_hashes、previous_pre、image_mask、session）；storage()=各层 KV 环前缀；graph_state()=现 graph_warmup_state；text session 走现 session.cpp 的 capture/restore。
+- 装配：load.cpp 变体加 `Text<dsv41::Model, dsv41::State>`，generate/batch/mtp 换 FLOW(Model, State) 实例化；dspark 预测器与 vision adapter 经 Parts 传入。
+- qwen4 先拆 Gdn/Qsa/Ple 私有态（conv_/state_/saved_*，129 处）为 `GdnState/QsaState/PleState`，decode-graph 对块内部张量的引用（graph_registry、graph_warmup_state）随之改捕 State 侧，再按同一映射迁 Text。
+
 保留数学、dtype、校验、CPU/layer placement、投影顺序、回滚事务和存储身份。暂缓的 Metal/HIP、测试与工具引用登记待恢复，不为其保留源码副本或旧抽象。
 **源码完成条件：** 活动 CUDA 生产代码不再依赖公共 Block 运行框架及其类型探测，各模型只组合所需计算单元，状态与执行资源的所有者清楚。
 
