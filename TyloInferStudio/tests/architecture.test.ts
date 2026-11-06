@@ -14,7 +14,7 @@ describe('业务职责边界', () => {
     const app = source('App.tsx');
     expect(app).not.toMatch(/\buseState\b|\buseEffect\b|\bapi\.|\bfetch\(|<form\b|<input\b/);
     expect(app.split('\n').length).toBeLessThan(100);
-    for (const route of ['agent', 'chat', 'models', 'runtime', 'resources', 'logs', 'model-hub', 'evaluations']) {
+    for (const route of ['chat', 'models', 'runtime', 'resources', 'logs', 'model-hub', 'analysis']) {
       expect(app).toContain(`path="${route}"`);
     }
     expect(app).not.toContain('QuantizationPage');
@@ -29,7 +29,7 @@ describe('业务职责边界', () => {
   it('业务模块不能依赖App，运行时启动不请求页面专属资源', () => {
     for (const file of files(join(root, 'features'))) expect(readFileSync(file, 'utf8')).not.toMatch(/from ['"][^'"]*\/App['"]/);
     const runtime = source('app/RuntimeProvider.tsx');
-    for (const request of ['datasets', 'evaluations', 'runtimeLogs', 'generationPresets', 'artifactLineage']) {
+    for (const request of ['runtimeLogs', 'generationPresets', 'artifactLineage']) {
       expect(runtime).not.toContain(`.${request}(`);
     }
     // Native load jobs contain only asset IDs; resolve their names from the lightweight catalog without rescanning models or components.

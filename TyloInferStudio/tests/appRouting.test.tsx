@@ -87,9 +87,6 @@ beforeEach(() => {
     if (path === '/api/hub/official') return json({ data: [], refreshing: false });
     if (path === '/api/hub/models') return json({ data: [], next_cursor: null });
     if (path === '/api/hub/download-directory') return json({ actual_directory: 'D:/isolated/models', default_directory: 'D:/isolated/models', evict_prefix_cache: false });
-    if (runtime.runtime.source !== 'native-instances' && ['/api/agent/state', '/api/agent/start'].includes(path)) {
-      return json({ running: path.endsWith('/start'), workspaces: [], sessions: [], models: [], approvals: [] });
-    }
     if (path === '/api/sessions' && method === 'GET') return json({ data: sessions });
     if (path === '/api/sessions' && method === 'POST') {
       sessions = [savedSession()]; return json(sessions[0]);
@@ -108,16 +105,6 @@ beforeEach(() => {
 });
 
 afterEach(() => { cleanup(); vi.useRealTimers(); setApiBaseUrl(''); vi.unstubAllGlobals(); });
-
-it.each([
-  ['/evaluations', 'datasets, quality evaluations or benchmark jobs'],
-])('keeps %s as an unavailable entry without mounting requests or polling', async (path, detail) => {
-  renderApp(path);
-  expect(await screen.findByText(new RegExp(detail))).toBeInTheDocument();
-  vi.useFakeTimers();
-  await act(async () => { await vi.advanceTimersByTimeAsync(12000); });
-  expect(requests.filter(request => !request.path.startsWith('/api/sessions'))).toEqual([]);
-});
 
 it('retains native authentication and aliases while all runtime settings tabs avoid unsupported APIs', async () => {
   setApiBaseUrl('http://127.0.0.1:59421');
@@ -149,24 +136,12 @@ it('searches and browses the native hub while keeping cache reclamation unavaila
   expect(requests.filter(request => !['/api/sessions', '/api/jobs/kinds', '/api/hub/download-directory', '/api/hub/official', '/api/hub/models'].includes(request.path))).toEqual([]);
 });
 
-it.each(['/chat', '/chat/'])('renders the real native chat page at %s without redirecting or calling Agent APIs', async path => {
+it.each(['/chat', '/chat/'])('renders the real native chat page at %s without redirecting', async path => {
   renderApp(path);
   await waitFor(() => expect(screen.getByRole('textbox', { name: 'Message' })).toBeEnabled());
   expect(screen.getByLabelText('Current path')).toHaveTextContent(path);
   expect(screen.getByRole('heading', { name: 'Native conversation' })).toBeInTheDocument();
-  expect(requests.some(request => request.path.startsWith('/api/agent'))).toBe(false);
-  expect(screen.getByRole('button', { name: 'Text chat' })).toHaveAttribute('aria-current', 'page');
-});
-
-it('explains native Agent unavailability and opens the actual text chat route', async () => {
-  renderApp('/agent?workspace=old-workspace&session=old-session');
-  expect(await screen.findByRole('heading', { name: 'Agent is unavailable on this server' })).toBeInTheDocument();
-  expect(screen.queryByRole('combobox', { name: 'Workspace' })).not.toBeInTheDocument();
-  expect(screen.queryByRole('button', { name: 'Add workspace' })).not.toBeInTheDocument();
-  fireEvent.click(screen.getByRole('button', { name: 'Open text chat' }));
-  await waitFor(() => expect(screen.getByRole('textbox', { name: 'Message' })).toBeEnabled());
-  expect(screen.getByLabelText('Current path').textContent).toBe('/chat');
-  expect(requests.some(request => request.path.startsWith('/api/agent'))).toBe(false);
+  expect(within(screen.getByRole('navigation', { name: 'Inference' })).getByRole('button', { name: 'Chat' })).toHaveAttribute('aria-current', 'page');
 });
 
 it('allows a native idle server to open and create text chats, then guides model selection', async () => {
@@ -195,7 +170,7 @@ it('keeps a real text stream alive across App routes and synchronizes persisted 
   fireEvent.click(screen.getByRole('button', { name: 'Overview' }));
   await screen.findByRole('heading', { name: 'Overview' });
   expect(generationSignal?.aborted).toBe(false);
-  fireEvent.click(within(screen.getByRole('navigation', { name: 'Inference' })).getByRole('button', { name: 'Text chat' }));
+  fireEvent.click(within(screen.getByRole('navigation', { name: 'Inference' })).getByRole('button', { name: 'Chat' }));
   await screen.findByRole('button', { name: 'Stop generation' });
   expect(generationSignal?.aborted).toBe(false);
   sessions = [{ ...savedSession(), revision: 2 }];
@@ -224,7 +199,7 @@ it('opens native chat from the overview and advertises the configured dynamic se
   expect(screen.getAllByText('http://127.0.0.1:59421/v1').length).toBeGreaterThan(0);
   expect(screen.getByText('http://127.0.0.1:59421/v1/messages')).toBeInTheDocument();
   expect(screen.queryByText('http://127.0.0.1:8090/v1')).not.toBeInTheDocument();
-  fireEvent.click(screen.getByRole('button', { name: 'Chat' }));
+  fireEvent.click(within(screen.getByRole('main')).getByRole('button', { name: 'Chat' }));
   await waitFor(() => expect(screen.getByRole('textbox', { name: 'Message' })).toBeEnabled());
   expect(screen.getByLabelText('Current path').textContent).toBe('/chat');
 });

@@ -96,14 +96,6 @@ export async function mockStudioServer(page: Page, options: MockOptions = {}) {
     state.requests.push(`${method} ${path}`);
     const json = async (value: unknown) => route.fulfill({ json: value });
     if (path === '/api/auth/policy' && method === 'GET') return json({ enabled: false, has_key: false });
-    if (path === '/api/agent/state' || path === '/api/agent/start') return json({
-      running: false, workspaces: [], sessions: [], models: [], approvals: [],
-    });
-    if (/^\/api\/agent\/sessions\/[^/]+\/controls$/.test(path)) return json({
-      values: { modelSelection: { next: null }, plan: { active: false, pending: null }, permissions: { currentValue: 'workspace-write' } },
-      commands: [{ name: 'plan', description: 'Enter or leave plan mode', input: { hint: '[off|message]' } }],
-      permissions: [{ value: 'read-only', name: 'read-only' }, { value: 'workspace-write', name: 'workspace-write' }, { value: 'danger-full-access', name: 'danger-full-access' }],
-    });
     if (path === '/api/hub/official') return json(officialCatalog);
     if (path === '/api/hub/download-directory') return json({ directory: null, actual_directory: '/tmp/studio/models', default_directory: '/tmp/studio/models' });
     if (path === '/api/quantization/workspace' && method === 'GET')
@@ -265,9 +257,6 @@ export async function mockStudioServer(page: Page, options: MockOptions = {}) {
         '/api/jobs',
         '/api/presets',
         '/api/runtime/profiles',
-        '/api/datasets',
-        '/api/datasets/catalog',
-        '/api/evaluations',
         '/api/cluster/nodes',
       ].includes(path)
     )

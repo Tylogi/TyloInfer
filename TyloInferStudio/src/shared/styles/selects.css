@@ -37,7 +37,6 @@ select:disabled { cursor: default; }
 .compact-select:has(select:disabled) { opacity: .5; }
 .compact-select > select:not([multiple]):not([size]) { position: absolute; z-index: 1; inset: 0; width: 100%; max-width: none; height: 100%; min-height: 0; margin: 0; opacity: 0; }
 .analysis-checkpoint-bar .compact-select { width: min(360px, 100%); font-size: 12px; }
-.evaluation-fields .compact-select { font-size: 13px; }
 .chat-model-summary { width: min(320px, 100%); min-width: 0; }
 .chat-model-summary select:not([multiple]):not([size]) { min-height: 22px; border: 0; border-radius: 0; padding: 0 25px 0 0; background-color: transparent; background-position: right center; }
 .composer-toolbar select:not([multiple]):not([size]) { height: 31px; min-height: 31px; border-radius: 8px; padding: 0 25px 0 9px; background-position: right 8px center; }

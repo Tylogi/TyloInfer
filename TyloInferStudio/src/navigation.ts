@@ -2,9 +2,9 @@
  * TyloInfer 页面导航定义，统一维护桌面端与浏览器端共用的路由路径。
  */
 
-export type ViewName = 'chat' | 'agent' | 'dashboard' | 'lab' | 'versions';
+export type ViewName = 'chat' | 'dashboard' | 'lab' | 'versions';
 export type DashboardPage = 'overview' | 'models' | 'connections' | 'cache' | 'logs';
-export type LabPage = 'models' | 'evaluations' | 'analysis';
+export type LabPage = 'models' | 'analysis';
 
 export interface StudioLocation {
   view: ViewName;
@@ -15,21 +15,14 @@ export interface StudioLocation {
 export const STUDIO_PATHS = {
   overview: '/',
   chat: '/chat',
-  agent: '/agent',
   models: '/models',
   server: '/runtime',
   resources: '/resources',
   modelHub: '/model-hub',
-  evaluations: '/evaluations',
   analysis: '/analysis',
   versions: '/versions',
   logs: '/logs',
 } as const;
-
-/** Choose an available primary conversation entry without redirecting explicit Agent links. */
-export function primaryConversationPath(runtimeSource?: string): string {
-  return runtimeSource === 'native-instances' ? STUDIO_PATHS.chat : STUDIO_PATHS.agent;
-}
 
 const DASHBOARD_PATHS: Record<DashboardPage, string> = {
   overview: STUDIO_PATHS.overview,
@@ -41,7 +34,6 @@ const DASHBOARD_PATHS: Record<DashboardPage, string> = {
 
 const LAB_PATHS: Record<LabPage, string> = {
   models: STUDIO_PATHS.modelHub,
-  evaluations: STUDIO_PATHS.evaluations,
   analysis: STUDIO_PATHS.analysis,
 };
 
@@ -60,9 +52,6 @@ export function resolveStudioLocation(pathname: string): StudioLocation {
   const normalizedPath = normalizeStudioPath(pathname);
   if (normalizedPath === STUDIO_PATHS.versions) {
     return { view: 'versions', dashboardPage: 'overview', labPage: 'models' };
-  }
-  if (normalizedPath === STUDIO_PATHS.agent) {
-    return { view: 'agent', dashboardPage: 'overview', labPage: 'models' };
   }
   if (normalizedPath === STUDIO_PATHS.chat) {
     return { view: 'chat', dashboardPage: 'overview', labPage: 'models' };

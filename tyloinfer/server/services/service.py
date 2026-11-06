@@ -34,12 +34,10 @@ from tyloinfer.server.state.catalog import (
     ModelRegistrationError,
 )
 from tyloinfer.server.services.checkpoint_analysis import analyze_checkpoint
-from tyloinfer.server.services.agent_runtime import AgentRuntime
 from tyloinfer.server.services.model_deletion import ModelDeletionError, delete_model_files, model_deletion_plan
 from tyloinfer.server.services.model_memory import checkpoint_cache_profile
 from tyloinfer.server.services.documents import DocumentExtractionError, extract_document
 from tyloinfer.server.services.desktop import FileManagerUnavailableError, open_directory
-from tyloinfer.server.services.evaluation_datasets import official_for_digest
 from tyloinfer.server.services.hub import (
     HubCatalog,
     HubError,
@@ -59,9 +57,7 @@ from tyloinfer.server.protocol.models import (
     AppendMessageResult,
     ArtifactLineageList,
     AudioPart,
-    CompareEvaluationsRequest,
     ContentPart,
-    CreateDatasetRequest,
     CreateDocumentRequest,
     CreateGenerationPresetRequest,
     CreateJobRequest,
@@ -69,17 +65,11 @@ from tyloinfer.server.protocol.models import (
     CreateResponseRequest,
     CreateRuntimeProfileRequest,
     CreateSessionRequest,
-    DatasetList,
-    DatasetResource,
     DeleteWorkspaceArtifactRequest,
     DocumentPart,
     DocumentResource,
     ErrorDetail,
     ErrorEvent,
-    EvaluationComparisonResource,
-    EvaluationComparisonRow,
-    EvaluationKind,
-    EvaluationResultList,
     ForkSessionRequest,
     GeneratedAudioPart,
     GenerationPresetList,
@@ -159,8 +149,6 @@ from tyloinfer.server.protocol.models import (
 )
 from tyloinfer.server.state.storage import (
     BeginResponseResult,
-    DatasetNotFoundError,
-    EvaluationNotFoundError,
     GenerationPresetNotFoundError,
     IdempotencyConflictError,
     InvalidJobStateError,
@@ -308,7 +296,6 @@ class ServerService:
         stream_keepalive_seconds: float = 15.0,
     ) -> None:
         self.store = store
-        self.agent_runtime = AgentRuntime(store.path.parent / 'agent')
         self.model_aliases = store.runtime_model_aliases()
         self.backend = backend
         self.jobs = jobs or JobManager(store)
@@ -385,7 +372,6 @@ class ServerService:
                 task.cancel()
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
-            await self.agent_runtime.close()
             await self.backend.aclose()
 
     async def create_job(self, request: CreateJobRequest) -> JobResource:
@@ -1235,125 +1221,6 @@ class ServerService:
             limit=limit,
         )
         return ArtifactLineageList(data=data)
-
-    async def create_dataset(self, request: CreateDatasetRequest) -> DatasetResource:
-        if self.tool_handlers is None:
-            raise ServiceError(501, "workspace_unavailable", "workspace tools are unavailable")
-        try:
-            manifest = await asyncio.to_thread(
-                self.tool_handlers.workspace_file_manifest,
-                request.artifact_uri,
-            )
-            spec = official_for_digest(request.kind, manifest["sha256"], manifest["byte_size"])
-            request = request.model_copy(update={"name": spec.name, "source_uri": spec.url,
-                "revision": spec.revision, "metadata": spec.metadata()})
-            return await asyncio.to_thread(
-                self.store.create_dataset,
-                request,
-                sha256=manifest["sha256"],
-                byte_size=manifest["byte_size"],
-            )
-        except JobExecutionError as error:
-            raise ServiceError(
-                422, error.detail.code, error.detail.message, retryable=error.detail.retryable
-            ) from error
-        except StorageError as error:
-            raise ServiceError(409, "dataset_conflict", str(error)) from error
-
-    async def list_datasets(self) -> DatasetList:
-        registered = await asyncio.to_thread(self.store.list_datasets)
-        official = []
-        for dataset in registered:
-            try:
-                spec = official_for_digest(dataset.kind, dataset.sha256, dataset.byte_size)
-                if self.tool_handlers is None:
-                    continue
-                manifest = await asyncio.to_thread(self.tool_handlers.workspace_file_manifest, dataset.artifact_uri)
-                if (manifest["sha256"], manifest["byte_size"]) != (spec.sha256, spec.byte_size):
-                    continue
-            except (JobExecutionError, OSError):
-                continue
-            official.append(dataset.model_copy(update={"name": spec.name, "source_uri": spec.url,
-                "revision": spec.revision, "metadata": spec.metadata()}))
-        return DatasetList(data=official)
-
-    async def delete_dataset(self, dataset_id: UUID) -> None:
-        try:
-            await asyncio.to_thread(self.store.delete_dataset, dataset_id)
-        except DatasetNotFoundError as error:
-            raise ServiceError(404, "dataset_not_found", str(error)) from error
-
-    async def evaluations(
-        self,
-        *,
-        kind: EvaluationKind | None,
-        model_id: str | None,
-        limit: int,
-    ) -> EvaluationResultList:
-        return EvaluationResultList(
-            data=await asyncio.to_thread(
-                self.store.list_evaluations,
-                kind=kind,
-                model_id=model_id,
-                limit=limit,
-            )
-        )
-
-    async def compare_evaluations(
-        self, request: CompareEvaluationsRequest
-    ) -> EvaluationComparisonResource:
-        try:
-            evaluations = [
-                await asyncio.to_thread(self.store.get_evaluation, identifier)
-                for identifier in request.evaluation_ids
-            ]
-        except EvaluationNotFoundError as error:
-            raise ServiceError(404, "evaluation_not_found", str(error)) from error
-        keys = {item.comparison_key for item in evaluations}
-        kinds = {item.kind for item in evaluations}
-        if len(keys) != 1 or len(kinds) != 1:
-            raise ServiceError(
-                409,
-                "evaluations_not_comparable",
-                "evaluations must have matching kind, dataset, and execution parameters",
-            )
-        for item in evaluations:
-            if item.kind in {"perplexity", "accuracy_benchmark"}:
-                manifest = item.dataset_manifest
-                try:
-                    official_for_digest("wikitext2" if item.kind == "perplexity" else "custom",
-                        manifest.get("source_sha256", manifest.get("sha256")), manifest.get("source_byte_size", manifest.get("byte_size")))
-                except JobExecutionError as error:
-                    raise ServiceError(409, "unofficial_evaluation", "legacy or custom dataset results cannot be compared as official evaluations") from error
-        numeric_names = sorted(
-            set.intersection(
-                *[
-                    {
-                        key
-                        for key, value in item.metrics.items()
-                        if isinstance(value, (int, float)) and not isinstance(value, bool)
-                    }
-                    for item in evaluations
-                ]
-            )
-        )
-        baseline = evaluations[0]
-        rows: list[EvaluationComparisonRow] = []
-        for item in evaluations:
-            deltas: dict[str, float | None] = {}
-            ratios: dict[str, float | None] = {}
-            for name in numeric_names:
-                value = float(item.metrics[name])
-                base = float(baseline.metrics[name])
-                deltas[name] = value - base
-                ratios[name] = value / base if base != 0.0 else None
-            rows.append(EvaluationComparisonRow(evaluation=item, deltas=deltas, ratios=ratios))
-        return EvaluationComparisonResource(
-            comparison_key=baseline.comparison_key,
-            baseline_id=baseline.id,
-            metrics=numeric_names,
-            rows=rows,
-        )
 
     async def create_remote_node(self, request: CreateRemoteNodeRequest) -> RemoteNodeResource:
         try:

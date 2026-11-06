@@ -16,7 +16,7 @@ from tyloinfer.server.state.catalog import ModelCatalog
 
 def make_handlers(workspace: Path) -> ToolJobHandlers:
     return ToolJobHandlers(ModelCatalog([workspace / 'models']),
-        ToolJobPaths(workspace, Path(sys.executable), None, None, None, None, internal_modelscope=True, internal_huggingface=True))
+        ToolJobPaths(workspace, Path(sys.executable), None, None, None, internal_modelscope=True, internal_huggingface=True))
 
 
 def test_download_directory_api_persists_and_uses_server_folder_ids(tmp_path: Path) -> None:

@@ -6,13 +6,11 @@ import asyncio
 import hashlib
 import fnmatch
 import json
-import math
 import os
 import re
 import shutil
 import signal
 import subprocess
-import sys
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable
@@ -20,22 +18,17 @@ from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
-from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field
 from tyloinfer.formats.header import TYLOINFER_SUFFIXES
 from tyloinfer.formats.companions import with_engram_shards
 from tyloinfer.formats.gguf import is_gguf_path
 
 from tyloinfer.server.api.network import download_environment, hub_download_url
 from tyloinfer.server.protocol.models import ErrorDetail
-from tyloinfer.server.protocol.reference import Wt2ReferencePayload
 from tyloinfer.server.services.jobs import JobContext, JobExecutionError, TypedJobHandler
 from tyloinfer.server.services.download_directory import DownloadDirectorySettings
 from tyloinfer.server.runtime.disk_budget import DiskBudget, volume
-from tyloinfer.server.services.inference_benchmark import InferenceBenchmarkPayload, WikitextQualityPayload, run_inference_benchmark
-from tyloinfer.server.services.accuracy_benchmark import AccuracyBenchmarkPayload, run_accuracy_benchmark
-from tyloinfer.server.services.evaluation_datasets import OfficialDatasetDownloadPayload, download_official_dataset, materialize_wt2, WT2_TEXT_SHA256
 from tyloinfer.server.state.catalog import ModelArtifactNotFoundError, ModelCatalog
 from tyloinfer.server.state.storage import StorageError
 
@@ -89,32 +82,6 @@ class ContainerValidationPayload(_Payload):
     model: str = Field(min_length=1, max_length=255)
 
 
-class PerplexityPayload(_Payload):
-    model: str = Field(min_length=1, max_length=255)
-    dataset_file: str = Field(min_length=1, max_length=1024)
-    dataset: str = Field(default="custom", min_length=1, max_length=255)
-    dataset_id: UUID | None = None
-    context_size: int = Field(default=512, ge=32)
-    chunks: int | None = Field(default=None, ge=1)
-    parallel: int = Field(default=1, ge=1, le=64)
-    ubatch_size: int | None = Field(default=None, ge=1)
-    kl_reference: str | None = Field(default=None, max_length=1024)
-    kl_manifest: str | None = Field(default=None, max_length=1024)
-    score_count: int | None = Field(default=None, ge=1)
-    logits_file: str | None = Field(default=None, max_length=1024)
-    logits_manifest: str | None = Field(default=None, max_length=1024)
-    model_label: str | None = Field(default=None, max_length=255)
-    moe_gpu_cache_gb: float | None = Field(default=None, ge=0.0)
-
-
-class KernelBenchmarkPayload(_Payload):
-    model: str = Field(min_length=1, max_length=255)
-    tensor: str = Field(min_length=1, max_length=1024)
-    repetitions: int = Field(default=20, ge=1, le=10000)
-    experts: list[int] = Field(default_factory=list, max_length=256)
-    swiglu: bool = False
-
-
 @dataclass(frozen=True)
 class ToolJobPaths:
     work_root: Path
@@ -122,7 +89,6 @@ class ToolJobPaths:
     modelscope: Path | None
     huggingface: Path | None
     runtime: Path | None
-    perplexity: Path | None
     diagnostics: Path | None = None
     standalone_cli: bool = False
     internal_modelscope: bool = False
@@ -178,8 +144,6 @@ class ToolJobHandlers:
 
     def handlers(self) -> dict[str, Any]:
         result: dict[str, Any] = {
-            "dataset.download": TypedJobHandler(self.download_evaluation_dataset, OfficialDatasetDownloadPayload),
-            "reference.wikitext2": TypedJobHandler(self.wikitext_reference, Wt2ReferencePayload),
             "model.validate": TypedJobHandler(self.validate_container, ContainerValidationPayload),
         }
         if self.voice_component is not None:
@@ -193,15 +157,6 @@ class ToolJobHandlers:
         if self.paths.huggingface is not None or self.paths.internal_huggingface:
             result["download.huggingface"] = TypedJobHandler(
                 self.download_huggingface, HuggingFaceDownloadPayload
-            )
-        if self.paths.perplexity is not None:
-            result["evaluate.wikitext2"] = TypedJobHandler(self.wikitext_quality, WikitextQualityPayload)
-        if self.runtime_manager is not None:
-            result["benchmark.inference"] = TypedJobHandler(self.inference_benchmark, InferenceBenchmarkPayload)
-            result["evaluate.accuracy"] = TypedJobHandler(self.accuracy_benchmark, AccuracyBenchmarkPayload)
-        if self.paths.runtime is not None:
-            result["benchmark.kernel"] = TypedJobHandler(
-                self.kernel_benchmark, KernelBenchmarkPayload
             )
         return result
 
@@ -219,14 +174,6 @@ class ToolJobHandlers:
                 activation = {"active": False, "reason": "activation_failed", "error": str(error)}
                 await context.log(f"Voice component installed but activation failed: {error}")
         return {**result, "activation": activation}
-
-    @staticmethod
-    def _resolve_reference_backend(backend: str) -> str:
-        return ("metal" if sys.platform == "darwin" else "cuda") if backend == "auto" else backend
-
-
-
-
 
     async def download_modelscope(
         self, context: JobContext, payload: dict[str, Any]
@@ -463,278 +410,6 @@ class ToolJobHandlers:
             "summary": output[-1] if output else "ok",
         }
 
-    async def inference_benchmark(self, context: JobContext, payload: dict[str, Any]) -> dict[str, Any]:
-        return await run_inference_benchmark(context, payload, self.runtime_manager)
-
-    async def download_evaluation_dataset(self, context: JobContext, payload: dict[str, Any]) -> dict[str, Any]:
-        return await download_official_dataset(context, payload, self.root)
-
-    async def accuracy_benchmark(self, context: JobContext, payload: dict[str, Any]) -> dict[str, Any]:
-        request = AccuracyBenchmarkPayload.model_validate(payload)
-        dataset = await asyncio.to_thread(context.store.get_dataset, request.dataset_id)
-        path = self._input(dataset.artifact_uri.removeprefix("workspace://"))
-        return await run_accuracy_benchmark(context, payload, self.runtime_manager, path, self.root)
-
-    async def wikitext_quality(self, context: JobContext, payload: dict[str, Any]) -> dict[str, Any]:
-        request = WikitextQualityPayload.model_validate(payload)
-        artifact = await self._model(request.model)
-        if self.runtime_manager is not None:
-            instances = await self.runtime_manager.instances()
-            if any(item.model == artifact.resource.name and item.state.value in {"ready", "busy", "loading"} for item in instances.data):
-                raise self._failure("quality_model_loaded", "quality evaluation loads a separate process; unload this model first to avoid duplicating resident weights")
-        dataset = await asyncio.to_thread(context.store.get_dataset, request.dataset_id)
-        if dataset.kind != "wikitext2":
-            raise self._failure("wrong_dataset_kind", "WT2 quality requires a WikiText-2 dataset")
-        source = self._input(dataset.artifact_uri.removeprefix("workspace://"))
-        text_path = await asyncio.to_thread(materialize_wt2, source, dataset)
-        path = self._artifact_uri(text_path).removeprefix("workspace://")
-        manifest_path = self._input(request.reference_manifest.removeprefix("workspace://"))
-        if manifest_path.stat().st_size > 1024 * 1024:
-            raise self._failure("invalid_reference_manifest", "reference manifest exceeds 1 MiB")
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if manifest.get("dataset", {}).get("sha256") != WT2_TEXT_SHA256:
-            raise self._failure("reference_dataset_mismatch", "reference logits do not belong to this dataset")
-        geometry = manifest.get("evaluation", {})
-        if geometry.get("n_ctx") != request.context_size or geometry.get("n_seq") != request.parallel:
-            raise self._failure("reference_geometry_mismatch", "ctx and parallel sequences must match the reference logits manifest")
-        return await self.perplexity(context, {"model": request.model, "dataset_file": path,
-            "dataset": "wikitext2", "dataset_id": str(request.dataset_id),
-            "context_size": request.context_size, "chunks": request.chunks, "parallel": request.parallel,
-            "kl_reference": request.reference_logits.removeprefix("workspace://"),
-            "kl_manifest": request.reference_manifest.removeprefix("workspace://"),
-            "moe_gpu_cache_gb": request.moe_gpu_cache_gb})
-
-    async def wikitext_reference(self, context: JobContext, payload: dict[str, Any]) -> dict[str, Any]:
-        request = Wt2ReferencePayload.model_validate(payload)
-        from tyloinfer.evaluation.source import source_summary
-        model = Path(request.model).expanduser()
-        model = (model if model.is_absolute() else self.root / model).resolve()
-        source = await asyncio.to_thread(source_summary, model)
-        if not source['reference_supported']:
-            raise self._failure('reference_architecture_unsupported', 'WT2 source generation currently supports original Qwen3.5 and Gemma4 HF architectures, including supported native QAT weights')
-        dataset = await asyncio.to_thread(context.store.get_dataset, request.dataset_id)
-        if dataset.kind != 'wikitext2':
-            raise self._failure('wrong_dataset_kind', 'WT2 generation requires the official WikiText-2 dataset')
-        text = await asyncio.to_thread(materialize_wt2, self._input(dataset.artifact_uri.removeprefix('workspace://')), dataset)
-        output = Path(request.output).expanduser()
-        output = (output if output.is_absolute() else self.root / output).resolve()
-        manifest = output.with_name(output.name + '.manifest.json')
-        if output.exists() or manifest.exists():
-            raise self._failure('output_exists', 'reference output or manifest already exists')
-        backend = self._resolve_reference_backend(request.backend)
-        argv = self._mfq_command('wt2-reference', '--model', source['path'], '--dataset', str(text),
-            '--output', str(output), '--context-size', str(request.context_size), '--chunks', str(request.chunks),
-            '--backend', backend, '--device', 'mps' if backend == 'metal' else 'cuda:0')
-        if not request.layerwise:
-            argv.append('--resident')
-        if backend == 'cuda':
-            argv.extend(['--runtime', str(self._required_executable(self.paths.runtime, 'TyloInfer native CUDA runtime'))])
-
-        loading_data = {}
-        def progress(line):
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                return None
-            if event.get('event') == 'wt2_layer':
-                return .05 + .7 * event['layer'] / event['layers'], f"Reference layer {event['layer']}/{event['layers']}", loading_data.copy()
-            if event.get('event') == 'wt2_head':
-                return .75 + .23 * event['chunk'] / event['chunks'], f"Reference head {event['chunk']}/{event['chunks']}", loading_data.copy()
-            if event.get('event') == 'source_loading':
-                loading_data['source_loading'] = event
-                return .02, 'Insufficient free memory; using layerwise loading' if event.get('fallback_reason') else 'Source loading mode selected', loading_data.copy()
-            return None
-
-        async with self._reference_lock:
-            lines = await self._run(context, argv, progress_parser=progress, final_progress=.99)
-        result = self._last_json_event(lines, 'wt2_reference_saved')
-        if not result or not output.is_file() or not manifest.is_file():
-            raise self._failure('reference_output_missing', 'reference generator produced no complete logits/manifest pair')
-        for path in (output, manifest):
-            await context.artifact(name=path.name, uri=path.as_uri(), media_type='application/octet-stream' if path == output else 'application/json',
-                metadata={'path': str(path), 'total_bytes': path.stat().st_size})
-        return {**result, 'dataset_id': str(request.dataset_id), 'artifact_kind': 'wt2-reference'}
-
-    async def perplexity(self, context: JobContext, payload: dict[str, Any]) -> dict[str, Any]:
-        request = PerplexityPayload.model_validate(payload)
-        artifact = await self._model(request.model)
-        executable = self._required_executable(self.paths.perplexity, "TyloInfer perplexity")
-        dataset = self._input(request.dataset_file)
-        argv = [
-            str(executable),
-            "--model",
-            str(artifact.path),
-            "--dataset",
-            request.dataset,
-            "--ctx-size",
-            str(request.context_size),
-            "--parallel",
-            str(request.parallel),
-        ]
-        if request.chunks is not None:
-            argv.extend(["--chunks", str(request.chunks)])
-        if request.ubatch_size is not None:
-            argv.extend(["--ubatch-size", str(request.ubatch_size)])
-        if request.kl_reference is not None:
-            argv.extend(["--kl-base", str(self._input(request.kl_reference))])
-        else:
-            argv.extend(["--file", str(dataset)])
-        if request.kl_manifest is not None:
-            argv.extend(["--kl-manifest", str(self._input(request.kl_manifest))])
-        if request.score_count is not None:
-            argv.extend(["--kl-score-count", str(request.score_count)])
-        if request.logits_file is not None:
-            logits = self._output(request.logits_file)
-            logits.parent.mkdir(parents=True, exist_ok=True)
-            argv.extend(["--logits-file", str(logits)])
-            if request.logits_manifest is not None:
-                manifest = self._output(request.logits_manifest)
-                argv.extend(["--logits-manifest", str(manifest)])
-        else:
-            logits = None
-        if request.model_label is not None:
-            argv.extend(["--model-label", request.model_label])
-        if request.moe_gpu_cache_gb is not None:
-            argv.extend(["--moe-gpu-cache-gb", str(request.moe_gpu_cache_gb)])
-        lines = await self._run(
-            context,
-            argv,
-            progress_pattern=re.compile(r"^\[(\d+)\]"),
-            progress_total=request.chunks,
-        )
-        result: dict[str, Any] = {
-            "model_id": artifact.resource.name,
-            "artifact_id": artifact.resource.id,
-            "dataset": request.dataset,
-            "context_size": request.context_size,
-        }
-        final = next((line for line in reversed(lines) if "Final estimate:" in line), None)
-        kl = next((line for line in reversed(lines) if line.startswith("cpp_kl_result ")), None)
-        if final:
-            match = re.search(r"PPL = ([0-9.eE+-]+) \+/- ([0-9.eE+-]+)", final)
-            if match:
-                result.update(perplexity=float(match.group(1)), uncertainty=float(match.group(2)))
-        if kl:
-            for key, value in re.findall(r"([a-z_]+)=([^ ]+)", kl):
-                try:
-                    result[key] = float(value)
-                except ValueError:
-                    result[key] = value
-        if request.kl_reference is not None:
-            if not kl or any(not isinstance(result.get(key), (int, float)) or not math.isfinite(result[key]) for key in ("kld", "same_top", "scored_tokens")):
-                raise self._failure("quality_metrics_missing", "runtime did not return valid KLD/Top1 metrics")
-            if not 0 <= result["same_top"] <= 1 or result["scored_tokens"] <= 0:
-                raise self._failure("quality_metrics_invalid", "runtime returned invalid Top1 or scored token count")
-            result["top1_agreement"] = result["same_top"]
-        if logits is not None:
-            await context.artifact(
-                name=logits.name,
-                uri=self._artifact_uri(logits),
-                metadata={
-                    "source_uris": [f"mfq://{artifact.resource.id}"],
-                    "parameters": request.model_dump(mode="json"),
-                    "dataset": request.dataset,
-                    "context_size": request.context_size,
-                },
-            )
-            result["logits"] = self._artifact_uri(logits)
-        metrics = {
-            key: value
-            for key, value in result.items()
-            if key not in {"model_id", "artifact_id", "dataset", "context_size", "logits"}
-        }
-        manifest = self._file_manifest(dataset)
-        manifest.update(name=request.dataset)
-        if request.dataset_id:
-            registered = await asyncio.to_thread(context.store.get_dataset, request.dataset_id)
-            manifest.update(source_sha256=registered.sha256, source_byte_size=registered.byte_size,
-                official_id="wt2-raw-test" if request.dataset == "wikitext2" else None,
-                text_protocol="mfq-wt2-text-v1" if request.dataset == "wikitext2" else None)
-        comparison = {
-            "kind": "perplexity",
-            "dataset_sha256": manifest["sha256"],
-            "source_sha256": manifest.get("source_sha256"),
-            "context_size": request.context_size,
-            "chunks": request.chunks,
-            "parallel": request.parallel,
-            "ubatch_size": request.ubatch_size,
-            "score_count": request.score_count,
-            "kl_reference": self._input_manifest(request.kl_reference),
-            "kl_manifest": self._input_manifest(request.kl_manifest),
-        }
-        evaluation = await context.evaluation(
-            kind="perplexity",
-            model_id=artifact.resource.name,
-            metrics=metrics,
-            parameters=request.model_dump(mode="json"),
-            comparison_parameters=comparison,
-            dataset_id=request.dataset_id,
-            dataset_manifest=manifest,
-            runtime_identity=self._runtime_identity(
-                executable,
-                artifact.resource.name,
-                artifact.resource.id,
-            ),
-        )
-        result["evaluation_id"] = str(evaluation.id)
-        return result
-
-    async def kernel_benchmark(
-        self, context: JobContext, payload: dict[str, Any]
-    ) -> dict[str, Any]:
-        request = KernelBenchmarkPayload.model_validate(payload)
-        artifact = await self._model(request.model)
-        runtime = self._required_executable(self.paths.runtime, "TyloInfer runtime")
-        argv = [
-            str(runtime),
-            "--model",
-            str(artifact.path),
-            "--tensor",
-            request.tensor,
-            "--benchmark-reps",
-            str(request.repetitions),
-        ]
-        if request.experts:
-            argv.extend(["--benchmark-experts", ",".join(map(str, request.experts))])
-        if request.swiglu:
-            argv.append("--benchmark-swiglu")
-        lines = await self._run(context, argv)
-        summary = lines[-1] if lines else ""
-        parsed: dict[str, Any] = {
-            "summary": summary,
-            "model_id": artifact.resource.name,
-            "artifact_id": artifact.resource.id,
-        }
-        for key, value in re.findall(r"([a-z_]+)=([^ ]+)", summary):
-            try:
-                parsed[key] = float(value)
-            except ValueError:
-                parsed[key] = value
-        evaluation = await context.evaluation(
-            kind="kernel_benchmark",
-            model_id=artifact.resource.name,
-            metrics={
-                key: value
-                for key, value in parsed.items()
-                if key not in {"model_id", "artifact_id"}
-            },
-            parameters=request.model_dump(mode="json"),
-            comparison_parameters={
-                "kind": "kernel_benchmark",
-                "tensor": request.tensor,
-                "repetitions": request.repetitions,
-                "experts": request.experts,
-                "swiglu": request.swiglu,
-            },
-            runtime_identity=self._runtime_identity(
-                runtime,
-                artifact.resource.name,
-                artifact.resource.id,
-            ),
-        )
-        parsed["evaluation_id"] = str(evaluation.id)
-        return parsed
-
     async def _run(
         self,
         context: JobContext,
@@ -822,27 +497,6 @@ class ToolJobHandlers:
             # child here so it cannot hold disk-budget locks during that close.
             await stop()
             raise
-
-
-    @staticmethod
-    def _read_json(path: Path) -> dict[str, Any]:
-        try:
-            document = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return {}
-        return document if isinstance(document, dict) else {}
-
-    @staticmethod
-    def _last_json_event(lines: list[str], event: str) -> dict[str, Any] | None:
-        for line in reversed(lines):
-            try:
-                document = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(document, dict) and document.get("event") == event:
-                return document
-        return None
-
 
     async def _download_result(
         self,
@@ -1076,26 +730,6 @@ class ToolJobHandlers:
         return {
             "sha256": digest.hexdigest(),
             "byte_size": path.stat().st_size,
-        }
-
-    def _input_manifest(self, value: str | None) -> dict[str, Any] | None:
-        if value is None:
-            return None
-        return self._file_manifest(self._input(value))
-
-    @staticmethod
-    def _runtime_identity(
-        executable: Path,
-        model_id: str,
-        artifact_id: str,
-    ) -> dict[str, Any]:
-        stat = executable.stat()
-        return {
-            "executable": executable.name,
-            "executable_bytes": stat.st_size,
-            "executable_modified_ns": stat.st_mtime_ns,
-            "model_id": model_id,
-            "artifact_id": artifact_id,
         }
 
     @staticmethod
