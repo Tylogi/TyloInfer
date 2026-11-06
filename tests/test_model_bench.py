@@ -7,13 +7,11 @@ import sys
 import textwrap
 import time
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
 from bench import model_bench
-from tyloinfer.server.services.inference_benchmark import validate_benchmark_run
-from tyloinfer.server.services.jobs import JobExecutionError
+from tyloinfer.evaluation.inference import BenchmarkValidationError, validate_benchmark_result
 
 
 def native_result():
@@ -148,8 +146,8 @@ def test_cli_and_server_reject_the_same_invalid_metrics(runtime_script, section,
         assert runtime.generate("invalid", 32, 8, False, 1)["status"] == "error"
     finally:
         runtime.close()
-    with pytest.raises(JobExecutionError):
-        validate_benchmark_run(result, SimpleNamespace(prompt_tokens=32, output_tokens=8), "decode")
+    with pytest.raises(BenchmarkValidationError):
+        validate_benchmark_result(result, 32, 8, "decode")
 
 
 def test_requested_mtp_must_execute(runtime_script):

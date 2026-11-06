@@ -128,8 +128,6 @@ class AuthenticationPolicy:
 
 
 def required_scope(method: str, path: str) -> ApiKeyScope:
-    if path.startswith('/api/v1/agent'):
-        return 'admin'
     if path == "/api/v1/hub/download-directory":
         return "models"
     if path.startswith("/api/v1/runtime/cache/entries") or path == "/api/v1/runtime/cache/purge":
@@ -145,7 +143,7 @@ def required_scope(method: str, path: str) -> ApiKeyScope:
     if path.startswith(("/api/v1/models", "/api/v1/runtime", "/api/v1/hub")):
         return "models" if method != "GET" else "inference"
     if path.startswith(
-        ("/api/v1/jobs", "/api/v1/artifacts", "/api/v1/datasets", "/api/v1/evaluations", "/api/v1/quantization")
+        ("/api/v1/jobs", "/api/v1/artifacts", "/api/v1/quantization")
     ):
         return "jobs"
     return "inference"

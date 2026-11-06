@@ -5,7 +5,7 @@ import { useJobStore } from '../../stores/jobStore';
 import { useSettings } from '../settings/SettingsProvider';
 import { Icon, TMPanel, ModelMonogram } from '../../app/display';
 import { formatNumber, formatDuration } from '../../app/formatters';
-import { primaryConversationPath, STUDIO_PATHS } from '../../navigation';
+import { STUDIO_PATHS } from '../../navigation';
 import { openAIEndpoint } from './endpoint';
 import { getApiBaseUrl } from '../../shared/api/client';
 import { ModelVendorMark } from '../../app/ModelVendorMark';
@@ -19,7 +19,7 @@ export function RuntimeHero() {
   const { tr } = useSettings();
   const navigate = useNavigate();
   const openStudioPage = (localCheckpoints = false) => navigate(`${STUDIO_PATHS.models}${localCheckpoints ? '#local-checkpoints' : ''}`);
-  const openConversationPage = () => navigate(primaryConversationPath(runtime?.source));
+  const openConversationPage = () => navigate(STUDIO_PATHS.chat);
   const runtimeModelName = runtime?.model || 'Empty';
   const modelHero = useMemo(() => {
     const activeLoadJob = jobs.find(
@@ -118,7 +118,7 @@ export function RuntimeHero() {
         </button>
         <button className={modelHero.state === 'ready' ? 'primary runtime-hero-chat' : undefined} onClick={openConversationPage} type="button">
           <Icon name="chat" size={15} />
-          {runtime?.source === 'native-instances' ? tr('聊天', 'Chat') : 'Agent'}
+          {tr('聊天', 'Chat')}
         </button>
       </div>
     </TMPanel>

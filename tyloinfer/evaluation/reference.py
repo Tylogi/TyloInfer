@@ -13,6 +13,9 @@ import numpy as np
 from tyloinfer.evaluation.source import ReferenceSource, loading_plan
 from tyloinfer.formats.tokenizer_identity import tokenizer_identity
 
+# SHA-256 of the official mfq-wt2-text-v1 corpus; WT2 reference output is only valid for it.
+WT2_TEXT_SHA256 = '7952b062817620ac99b47296dc945942b55068d0e85baf1f95f300c7ad1480ef'
+
 
 def sha256(path):
     with Path(path).open('rb') as stream:
@@ -127,7 +130,6 @@ def tokenize_windows(root, text, context, chunks, vocabulary_size=None):
 
 
 def generate_reference(model, dataset, output, *, context_size=512, chunks=8, device='mps', layerwise=True, runtime=None):
-    from tyloinfer.server.services.evaluation_datasets import WT2_TEXT_SHA256
     source = ReferenceSource(model)
     dataset, output = Path(dataset).resolve(), Path(output).resolve()
     manifest = output.with_name(output.name + '.manifest.json')
@@ -182,7 +184,6 @@ def generate_reference(model, dataset, output, *, context_size=512, chunks=8, de
 
 def _save_manifest(source, dataset, output, manifest, tokens, tokenizer, identity,
         config_hash, execution, mode, device, context_size, chunks, scored, nll, perplexity):
-    from tyloinfer.server.services.evaluation_datasets import WT2_TEXT_SHA256
     document = {'format': 'mfq.perplexity-logits-manifest.v1',
         'producer': {'tool': 'tyloinfer.wt2-reference', 'runtime': execution['runtime'], 'device': device},
         'reference': {'magic': '_logit3_', 'file': {'name': output.name, 'bytes': output.stat().st_size, 'sha256': sha256(output)},

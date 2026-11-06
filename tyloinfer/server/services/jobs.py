@@ -3,10 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
-import os
-import platform
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -18,8 +15,6 @@ from pydantic import BaseModel
 from tyloinfer.server.protocol.models import (
     CreateJobRequest,
     ErrorDetail,
-    EvaluationKind,
-    EvaluationResultResource,
     JobEventLevel,
     JobEventType,
     JobKindList,
@@ -154,44 +149,6 @@ class JobContext:
             self.job_id,
         )
 
-    async def evaluation(
-        self,
-        *,
-        kind: EvaluationKind,
-        model_id: str,
-        metrics: dict[str, Any],
-        parameters: dict[str, Any],
-        comparison_parameters: dict[str, Any],
-        dataset_id: UUID | None = None,
-        dataset_manifest: dict[str, Any] | None = None,
-        runtime_identity: dict[str, Any] | None = None,
-    ) -> EvaluationResultResource:
-        canonical = json.dumps(
-            comparison_parameters,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=True,
-        ).encode("utf-8")
-        return await asyncio.to_thread(
-            self.store.record_evaluation,
-            job_id=self.job_id,
-            kind=kind,
-            model_id=model_id,
-            metrics=metrics,
-            parameters=parameters,
-            dataset_id=dataset_id,
-            dataset_manifest=dataset_manifest or {},
-            hardware_identity={
-                "system": platform.system(),
-                "release": platform.release(),
-                "machine": platform.machine(),
-                "processor": platform.processor(),
-                "cpu_count": os.cpu_count(),
-            },
-            runtime_identity=runtime_identity or {},
-            comparison_key=hashlib.sha256(canonical).hexdigest(),
-        )
-
     async def cleanup(self) -> None:
         for callback in reversed(self._cleanup_callbacks):
             with suppress(Exception):
@@ -228,6 +185,7 @@ class JobManager:
             raise RuntimeError("job handlers must be registered before the manager starts")
         if kind in self.handlers:
             raise ValueError(f"job kind is already registered: {kind}")
+
         self.handlers[kind] = handler
 
     def kinds(self) -> JobKindList:

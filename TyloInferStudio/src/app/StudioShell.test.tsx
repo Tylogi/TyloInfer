@@ -54,9 +54,9 @@ describe('StudioShell 持久运行时告警', () => {
     const tools = screen.getByRole('button', { name: '工具' });
     expect(tools).toHaveAttribute('aria-expanded', 'true');
     expect(screen.getByRole('button', { name: '分析' })).toBeVisible();
-    expect(screen.getByText('Agent', { selector: '.sidebar-group-label' })).toBeVisible();
-    expect(screen.getByRole('button', { name: '新建会话' })).toBeVisible();
-    expect(screen.queryByText('代理', { selector: '.sidebar-group-label' })).not.toBeInTheDocument();
+    expect(screen.getByText('推理', { selector: '.sidebar-group-label' })).toBeVisible();
+    expect(screen.getByRole('button', { name: '聊天' })).toBeVisible();
+    expect(screen.queryByText('Agent', { selector: '.sidebar-group-label' })).not.toBeInTheDocument();
     expect(document.querySelector('#studio-sidebar .appearance-controls')).toBeNull();
     fireEvent.click(tools);
     expect(tools).toHaveAttribute('aria-expanded', 'false');

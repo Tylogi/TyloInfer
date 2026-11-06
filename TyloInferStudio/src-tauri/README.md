@@ -16,7 +16,7 @@ resource_dir/
   licenses/
 ```
 
-Windows 子进程的 `PATH` 首项是服务可执行文件所在目录，原有搜索路径继续保留。macOS 继续打包 MLX metallib、`mfq-metal` 和现有 Frameworks 资源。旧的 Python CLI、推理 sidecar 和 `agent-runtime` 不再属于 Studio 的发行配置。
+Windows 子进程的 `PATH` 首项是服务可执行文件所在目录，原有搜索路径继续保留。macOS 继续打包 MLX metallib、`mfq-metal` 和现有 Frameworks 资源。旧的 Python CLI 与推理 sidecar 不再属于 Studio 的发行配置。
 
 开发构建依次检查发行资源位置，以及仓库内 `build/native-server/server/`、`Release/`、`RelWithDebInfo/`、`Debug/`、`MinSizeRel/` 的原生服务。显式设置 `TYLOINFER_SERVER_EXECUTABLE` 可指定其他构建的绝对路径；覆盖值无效时直接报错。发行构建不探测开发目录。
 
@@ -37,4 +37,4 @@ Windows 子进程的 `PATH` 首项是服务可执行文件所在目录，原有�
 
 设置 `TYLOINFER_TEST_SERVER_EXECUTABLE` 后，执行 `cargo test --locked native_server_lifecycle_smoke -- --ignored --nocapture`，可验证真实原生服务的启动、身份握手、认证请求、EOF 关闭和同一工作区换端口重启。该测试在 `target/native-server-smoke-*` 保留数据库及日志，便于检查。
 
-原生服务当前没有 agent 后台消费者，因此本次不打包 `agent-runtime`，也不提供该后台执行能力。MLX / Frameworks 资源保留不代表原生服务已经接入 Metal 推理引擎；模型执行能力取决于原生服务实际编译的后端。完整安装包、更新包与前端交互需要与包装脚本一起联调，Windows 上的 Rust 单元测试不能替代 macOS 打包运行验证。
+原生服务当前不提供 agent 后台执行能力。MLX / Frameworks 资源保留不代表原生服务已经接入 Metal 推理引擎；模型执行能力取决于原生服务实际编译的后端。完整安装包、更新包与前端交互需要与包装脚本一起联调，Windows 上的 Rust 单元测试不能替代 macOS 打包运行验证。

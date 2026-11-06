@@ -4,12 +4,12 @@
 @container (max-width: 620px) {
   .metric-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .cache-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .node-form, .dataset-form { grid-template-columns: 1fr 1fr; }
+  .node-form { grid-template-columns: 1fr 1fr; }
 }
 
 @container (max-width: 390px) {
   .metric-grid, .cache-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .node-form, .dataset-form { grid-template-columns: 1fr; }
+  .node-form { grid-template-columns: 1fr; }
   .panel-heading p { display: none; }
 }
 

@@ -1,9 +1,7 @@
 // Native route capabilities; the native server's registered routes are the only source.
 const nativeCapabilities = {
-  agent: false, // the separate agent-runtime service is not verified against the native server
   resources: true,
   analysis: true,
-  evaluations: false,
   runtimeConfiguration: false, // listener, cache and cluster policy surfaces are not implemented natively
   officialCatalog: true,
   hubSearch: true,

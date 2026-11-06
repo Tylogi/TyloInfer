@@ -1,5 +1,5 @@
 import { useEffect, useState, type ComponentProps } from 'react';
-import { CaretRightIcon, NotePencilIcon } from '@phosphor-icons/react';
+import { CaretRightIcon } from '@phosphor-icons/react';
 import { useLocation, useNavigate } from 'react-router';
 import { useRuntime } from './RuntimeProvider';
 import { useSettings } from '../features/settings/SettingsProvider';
@@ -11,10 +11,8 @@ import { Icon } from './display';
 import tyloInferMark from '../assets/tylogi-ai-lab-mark.svg';
 import { formatNumber } from './formatters';
 import { studioBuild } from '../features/settings/releases';
-import { AgentWorkspaceSidebar } from '../features/agent/AgentWorkspaceSidebar';
-import { useSidebarScroll } from './useSidebarScroll';
 import { dashboardPath, labPath, resolveStudioLocation, isStudioPath,
-  primaryConversationPath, STUDIO_PATHS, type DashboardPage, type LabPage } from '../navigation';
+  STUDIO_PATHS, type DashboardPage, type LabPage } from '../navigation';
 
 type NavItem = {
   label: [string, string];
@@ -25,7 +23,7 @@ type NavItem = {
   count?: number;
 };
 
-/** Render service-aware conversation entries while retaining supported Agent workspaces. */
+/** Render the fixed Studio navigation for every supported service. */
 export function StudioSidebar() {
   const location = useLocation();
   const navigate = useNavigate();
@@ -35,7 +33,6 @@ export function StudioSidebar() {
   const releaseBuild = studioUpdates.status?.current_release ?? studioBuild.release;
   const revision = version.split('+dev.')[1]?.split('.')[0];
   const { runtime } = useRuntime();
-  const native = runtime?.source === 'native-instances';
   const sidebarOpen = useUiStore((state) => state.sidebarOpen);
   const closeSidebar = useUiStore((state) => state.closeSidebar);
   const openSidebar = useUiStore((state) => state.openSidebar);
@@ -43,9 +40,7 @@ export function StudioSidebar() {
   const { dashboardPage, labPage } = currentLocation;
   const view = isStudioPath(location.pathname) ? currentLocation.view : 'not-found';
   const activeRequests = Number(runtime?.active_requests || 0);
-  const agentWorkspace = new URLSearchParams(location.search).get('workspace');
   const [toolsOpen, setToolsOpen] = useState(true);
-  const { scrollRef, scrollAll } = useSidebarScroll();
 
   useEffect(() => { closeSidebar(); }, [location.pathname, closeSidebar]);
   useEffect(() => {
@@ -69,18 +64,17 @@ export function StudioSidebar() {
         active: view === 'dashboard' && dashboardPage === 'connections', current: true },
       { label: ['资源', 'Resources'], icon: 'droplet', path: dashboard('cache'),
         active: view === 'dashboard' && dashboardPage === 'cache', current: true },
+      { label: ['聊天', 'Chat'], icon: 'chat', path: STUDIO_PATHS.chat,
+        active: view === 'chat', current: true },
     ] },
     { label: ['工具', 'Tools'], items: [
       { label: ['分析', 'Analysis'], icon: 'search', path: lab('analysis'),
         active: view === 'lab' && labPage === 'analysis' },
       { label: ['下载', 'Downloads'], icon: 'download', path: lab('models'),
         active: view === 'lab' && labPage === 'models' },
-      { label: ['测评', 'Evaluations'], icon: 'activity', path: lab('evaluations'),
-        active: view === 'lab' && labPage === 'evaluations' },
       { label: ['日志', 'Logs'], icon: 'scroll', path: dashboard('logs'),
         active: view === 'dashboard' && dashboardPage === 'logs', current: true },
     ] },
-    { label: ['Agent', 'Agent'], items: [] },
   ];
 
   function open(path: string) {
@@ -95,37 +89,29 @@ export function StudioSidebar() {
           <img src={tyloInferMark} alt="" />
           <div><strong>TyloInfer</strong></div>
         </div>
-        <div className="sidebar-scroll" ref={scrollRef} data-scroll-mode={scrollAll ? 'all' : 'workspaces'}>
+        <div className="sidebar-scroll">
           <nav className="sectioned-nav" aria-label={tr('推理', 'Inference')}>
             {groups.map((group) => (
-              <section key={group.label[1]} className={group.label[1] === 'Agent' ? 'sidebar-agent-section' : undefined}>
+              <section key={group.label[1]}>
                 {group.label[1] === 'Tools' ? <button className="sidebar-group-toggle sidebar-section-heading" type="button" aria-expanded={toolsOpen}
                   aria-controls="sidebar-tools" onClick={() => setToolsOpen(value => !value)}>
                   <span>{tr(...group.label)}</span><CaretRightIcon size={10} weight="fill" />
-                </button> : <div className="sidebar-group-label sidebar-section-heading">{group.label[1] === 'Agent' && native ? tr('对话', 'Conversations') : tr(...group.label)}</div>}
-                {group.label[1] === 'Agent' ? <button type="button" className="agent-new-conversation"
-                  aria-current={native ? view === 'chat' ? 'page' : undefined : view === 'agent' && !location.search ? 'page' : undefined}
-                  onClick={() => open(!native && agentWorkspace ? `/agent?workspace=${encodeURIComponent(agentWorkspace)}` : primaryConversationPath(runtime?.source))}>
-                  <NotePencilIcon size={14} /><span>{native ? tr('文本聊天', 'Text chat') : tr('新建会话', 'New conversation')}</span>
-                </button> : <div id={group.label[1] === 'Tools' ? 'sidebar-tools' : undefined} className="sidebar-nav-items" hidden={group.label[1] === 'Tools' && !toolsOpen}>
-                {group.items.map((item) => (
-                  <button
-                    aria-current={item.active ? 'page' : undefined}
-                    className={item.active ? 'active' : ''}
-                    key={item.path}
-                    onClick={() => open(item.path)}
-                    type="button"
-                  >
-                    <Icon name={item.icon} />
-                    {tr(...item.label)}
-                    {item.count != null && <span>{formatNumber(item.count)}</span>}
-                  </button>
-                ))}
-                </div>}
-                {group.label[1] === 'Agent' && (native ? <div className="sidebar-nav-items">
-                  <button type="button" aria-current={view === 'agent' ? 'page' : undefined} className={view === 'agent' ? 'active' : ''}
-                    onClick={() => open(STUDIO_PATHS.agent)}><Icon name="info" />{tr('Agent（暂不可用）', 'Agent (unavailable)')}</button>
-                </div> : <AgentWorkspaceSidebar onOpen={open} />)}
+                </button> : <div className="sidebar-group-label sidebar-section-heading">{tr(...group.label)}</div>}
+                <div id={group.label[1] === 'Tools' ? 'sidebar-tools' : undefined} className="sidebar-nav-items" hidden={group.label[1] === 'Tools' && !toolsOpen}>
+                  {group.items.map((item) => (
+                    <button
+                      aria-current={item.active ? 'page' : undefined}
+                      className={item.active ? 'active' : ''}
+                      key={item.path}
+                      onClick={() => open(item.path)}
+                      type="button"
+                    >
+                      <Icon name={item.icon} />
+                      {tr(...item.label)}
+                      {item.count != null && <span>{formatNumber(item.count)}</span>}
+                    </button>
+                  ))}
+                </div>
               </section>
             ))}
           </nav>
@@ -138,8 +124,8 @@ export function StudioSidebar() {
             <strong title={version}>v{version.split('+')[0]}</strong>
             <small>{studioUpdates.busy?.startsWith('download:') ? tr('正在下载更新', 'Downloading update')
               : studioUpdates.status?.update_available ? tr('有新 Release', 'New Release available')
-              : releaseBuild ? tr('Release · 版本管理', 'Release · Versions')
-                : `${tr('开发版', 'Dev')} · ${revision || tr('版本管理', 'Versions')}`}</small>
+                : releaseBuild ? tr('Release · 版本管理', 'Release · Versions')
+                  : `${tr('开发版', 'Dev')} · ${revision || tr('版本管理', 'Versions')}`}</small>
           </span>
         </button>
       </aside>

@@ -29,7 +29,7 @@ for (const language of ['zh-CN', 'en'] as const) {
       });
     })).toBe(true);
     await page.screenshot({ path: testInfo.outputPath('remote-routing.png'), animations: 'disabled' });
-    await page.goto('/agent');
+    await page.goto('/chat');
     await expect(page.locator('main h1')).toBeVisible();
     expect(state.requests.some(request => request.includes('/mcp/'))).toBe(false);
     expect(state.unexpected).toEqual([]);

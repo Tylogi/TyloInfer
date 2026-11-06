@@ -72,7 +72,7 @@ def test_other_volume_does_not_consume_download_space(budget, tmp_path, monkeypa
 @pytest.mark.parametrize('outcome', ['success', 'failure', 'cancel'])
 def test_download_releases_budget_after_process_stops(budget, tmp_path, monkeypatch, outcome):
     async def run():
-        handlers = ToolJobHandlers(ModelCatalog([]), ToolJobPaths(tmp_path, Path(sys.executable), None, None, None, None))
+        handlers = ToolJobHandlers(ModelCatalog([]), ToolJobPaths(tmp_path, Path(sys.executable), None, None, None))
         entered = asyncio.Event()
         stopped = False
         async def transfer(*args, **kwargs):
@@ -108,7 +108,7 @@ def test_sparse_partial_file_does_not_release_unwritten_download_space(budget, t
         size = 10 << 20
         with (directory / 'weights.incomplete').open('wb') as stream:
             stream.truncate(size)
-        handlers = ToolJobHandlers(ModelCatalog([]), ToolJobPaths(tmp_path, Path(sys.executable), None, None, None, None))
+        handlers = ToolJobHandlers(ModelCatalog([]), ToolJobPaths(tmp_path, Path(sys.executable), None, None, None))
         async def transfer(*args, **kwargs):
             assert budget.reserved(directory) >= size + (512 << 20) - 4096
         monkeypatch.setattr(handlers, '_run', transfer)

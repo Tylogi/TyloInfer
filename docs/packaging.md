@@ -12,8 +12,8 @@ packaging/Resources/licenses/        -> resource_dir/licenses/
 TyloInferStudio/dist/                 -> resource_dir/web-ui/
 ```
 
-产品不打包、发现或启动 Python 服务、`tyloinfer-cli`、旧推理 sidecar 或
-`agent-runtime`。构建机上的 Python 3.11+ 仅执行资源清单、路径扫描、ZIP 与校验和工具；
+产品不打包、发现或启动 Python 服务、`tyloinfer-cli` 或旧推理 sidecar。
+构建机上的 Python 3.11+ 仅执行资源清单、路径扫描、ZIP 与校验和工具；
 不需要为 Windows 发行版执行 `uv sync`、安装 PyInstaller 或重建开发虚拟环境。
 源码树中保留的 Python CLI、PyInstaller hooks 和相关旧测试属于独立开发工具，
 不表示它们仍是 Studio 产品的运行依赖。

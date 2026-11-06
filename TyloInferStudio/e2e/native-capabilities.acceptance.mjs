@@ -63,11 +63,6 @@ try {
   await page.screenshot({ path: resolve(output, 'model-directory.png') });
   report.checks.push('Model management opens the real native directory browser');
 
-  for (const [path, detail] of [['evaluations', 'datasets, quality evaluations or benchmark jobs']]) {
-    await page.goto(`${baseURL}/${path}`);
-    await page.getByText(new RegExp(detail)).waitFor();
-    await page.screenshot({ path: resolve(output, `${path}.png`) });
-  }
   await page.goto(`${baseURL}/runtime`);
   await page.getByRole('combobox', { name: 'Authentication', exact: true }).waitFor();
   assert(await page.getByRole('spinbutton', { name: 'OpenAI port' }).isDisabled());
@@ -83,7 +78,7 @@ try {
   await page.getByRole('textbox', { name: 'Search models' }).waitFor();
   assert(await page.getByRole('button', { name: 'Search', exact: true }).isEnabled());
   await page.waitForTimeout(6500);
-  const unsupported = /\/api\/(?:runtime\/(?:listener|memory-policy|cache|serving|context-policy|inference-policy)|cluster|datasets|evaluations)/;
+  const unsupported = /\/api\/(?:runtime\/(?:listener|memory-policy|cache|serving|context-policy|inference-policy)|cluster)/;
   assert.deepEqual(requests.filter(request => unsupported.test(request.url)), []);
   assert.deepEqual(httpErrors.filter(response => response.url.startsWith(baseURL)), []);
   assert.deepEqual(consoleErrors, []);

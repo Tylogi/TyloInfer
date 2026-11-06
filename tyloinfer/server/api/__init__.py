@@ -5,7 +5,6 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
-import secrets
 from typing import Any
 
 from fastapi import FastAPI, Request, Response
@@ -17,7 +16,6 @@ from fastapi.responses import JSONResponse
 from tyloinfer.server.api.auth import ApiKeyManager, AuthenticationPolicy, required_scope
 from tyloinfer.server.api.anthropic_compat import error_body as anthropic_error_body, error_type as anthropic_error_type, is_anthropic_request
 from tyloinfer.server.api.routes.anthropic import router as anthropic_router
-from tyloinfer.server.api.routes.agent import router as agent_router
 from tyloinfer.server.api.routes import ERROR_RESPONSES as ERROR_RESPONSES
 from tyloinfer.server.api.routes.auth import router as auth_router
 from tyloinfer.server.api.routes.jobs import event_router as job_event_router
@@ -25,7 +23,6 @@ from tyloinfer.server.api.routes.jobs import router as job_router
 from tyloinfer.server.api.routes.media import router as media_router
 from tyloinfer.server.api.routes.models import hub_router
 from tyloinfer.server.api.routes.models import router as model_router
-from tyloinfer.server.api.routes.reference import router as reference_router
 from tyloinfer.server.api.routes.openai import router as openai_router
 from tyloinfer.server.api.routes.runtime import profile_router
 from tyloinfer.server.api.routes.runtime import router as runtime_router
@@ -66,7 +63,6 @@ def create_app(
         lifespan=lifespan,
     )
     app.state.service = service
-    app.state.agent_token = secrets.token_urlsafe(32)
     app.state.server_identity = server_identity if server_identity is not None else make_server_identity()
     app.state.api_key = api_key
     app.state.api_keys = api_keys
@@ -88,10 +84,7 @@ def create_app(
             authenticated = api_keys.authenticate(supplied, include_root=False) if api_keys is not None else None
             legacy = policy.matches(supplied)
             scope = required_scope(request.method, request.url.path)
-            agent_credential = secrets.compare_digest(supplied, app.state.agent_token)
-            if agent_credential and scope != 'inference':
-                return JSONResponse(status_code=403, content=ErrorResponse(error=ErrorDetail(code='insufficient_scope', message='The agent model credential is restricted to inference.')).model_dump(mode='json'))
-            if not legacy and not agent_credential and authenticated is None:
+            if not legacy and authenticated is None:
                 detail = ErrorDetail(code="unauthorized", message="invalid API credential")
                 return JSONResponse(
                     status_code=401,
@@ -159,7 +152,6 @@ def create_app(
         )
 
     app.include_router(openai_router)
-    app.include_router(agent_router)
     app.include_router(anthropic_router)
     app.include_router(auth_router)
     app.include_router(initial_session_router)
@@ -170,7 +162,6 @@ def create_app(
     app.include_router(session_router)
     app.include_router(media_router)
     app.include_router(model_router)
-    app.include_router(reference_router)
     app.include_router(runtime_router)
 
     if web_root is not None:
