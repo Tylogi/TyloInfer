@@ -190,6 +190,9 @@ class SessionStore:
             connection.executescript(
                 Path(__file__).with_name("schema.sql").read_text(encoding="utf-8")
             )
+            # The evaluation feature is gone; databases built by older builds still carry its tables.
+            connection.execute("DROP TABLE IF EXISTS evaluation_results")
+            connection.execute("DROP TABLE IF EXISTS datasets")
             existing = connection.execute(
                 "SELECT value FROM schema_meta WHERE key = 'schema_version'"
             ).fetchone()

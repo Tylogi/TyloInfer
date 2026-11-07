@@ -131,38 +131,6 @@ CREATE TABLE IF NOT EXISTS api_keys (
     last_used_at TEXT
 );
 
-CREATE TABLE IF NOT EXISTS datasets (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL UNIQUE,
-    kind TEXT NOT NULL,
-    artifact_uri TEXT NOT NULL,
-    sha256 TEXT NOT NULL,
-    byte_size INTEGER NOT NULL CHECK (byte_size >= 0),
-    source_uri TEXT,
-    revision TEXT,
-    metadata_json TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS evaluation_results (
-    id TEXT PRIMARY KEY,
-    job_id TEXT NOT NULL UNIQUE REFERENCES jobs(id) ON DELETE CASCADE,
-    kind TEXT NOT NULL,
-    model_id TEXT NOT NULL,
-    metrics_json TEXT NOT NULL,
-    parameters_json TEXT NOT NULL,
-    dataset_id TEXT REFERENCES datasets(id) ON DELETE SET NULL,
-    dataset_manifest_json TEXT NOT NULL,
-    hardware_identity_json TEXT NOT NULL,
-    runtime_identity_json TEXT NOT NULL,
-    comparison_key TEXT NOT NULL,
-    created_at TEXT NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS evaluation_results_comparison
-    ON evaluation_results(comparison_key, created_at DESC);
-
 CREATE TABLE IF NOT EXISTS remote_nodes (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL UNIQUE,
