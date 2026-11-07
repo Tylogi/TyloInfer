@@ -1,10 +1,7 @@
-"""Generate and verify the checked-in MFQ Server OpenAPI contract."""
+"""Build the MFQ Server OpenAPI contract in memory from the contract app."""
 
 from __future__ import annotations
 
-import argparse
-import json
-from pathlib import Path
 from typing import Any
 
 from tyloinfer.server.api import create_contract_app
@@ -40,27 +37,3 @@ def build_openapi_schema() -> dict[str, Any]:
     schema["components"]["schemas"].update(nested_schemas)
     schema["components"]["schemas"]["RealtimeFrame"] = realtime_schema
     return schema
-
-
-def render_openapi() -> str:
-    return json.dumps(build_openapi_schema(), indent=2, sort_keys=True) + "\n"
-
-
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("path", type=Path)
-    parser.add_argument("--check", action="store_true")
-    args = parser.parse_args(argv)
-    rendered = render_openapi()
-    if args.check:
-        if not args.path.is_file() or args.path.read_text(encoding="utf-8") != rendered:
-            print(f"OpenAPI contract is stale: {args.path}")
-            return 1
-        return 0
-    args.path.parent.mkdir(parents=True, exist_ok=True)
-    args.path.write_text(rendered, encoding="utf-8", newline="\n")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

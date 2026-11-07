@@ -964,8 +964,7 @@ thinking 的 `signature` 为空串。
 ## 7. Python 后端
 
 Python 服务（`tyloinfer/server`）仍是独立入口，其独有接口——文档抽取与
-`/api/documents`、实时/语音、量化、数据集与评估、集群节点、运行时 profile 与
-缓存管理等——以 `tyloinfer/server` 代码及其 `tyloinfer/server/protocol/openapi.json`
-为准。媒体上传与取回两边都有，但路径、错误码与能力边界各自定义：原生侧见 §5.5，
+`/api/documents`、实时/语音、量化、集群节点、运行时 profile 与缓存管理等——以
+`tyloinfer/server` 代码为准。媒体上传与取回两边都有，但路径、错误码与能力边界各自定义：原生侧见 §5.5，
 原生侧不提取文档文本，也不把媒体片段送进生成推理。本文只描述原生 C++ server
 已实现的能力，不能把 Python 服务的接口清单当作原生服务已实现的能力。

@@ -1,15 +1,13 @@
 from __future__ import annotations
 
-import json
 from datetime import datetime, timezone
-from importlib.resources import files
 from uuid import UUID
 
 import pytest
 from pydantic import TypeAdapter, ValidationError
 
 from tyloinfer.server.api import create_app, create_contract_app
-from tyloinfer.server.api.openapi import REALTIME_EVENTS, build_openapi_schema, render_openapi
+from tyloinfer.server.api.openapi import REALTIME_EVENTS, build_openapi_schema
 from tyloinfer.server.protocol.models import (
     PROTOCOL_VERSION,
     ContentPart,
@@ -208,13 +206,6 @@ def test_openapi_contract_has_all_native_routes_and_realtime_extension() -> None
     app = create_contract_app()
     assert app.url_path_for("realtime") == "/api/v1/realtime"
     assert app.url_path_for("runtime_realtime") == "/api/v1/runtime/realtime"
-
-
-def test_checked_in_openapi_is_current() -> None:
-    path = files("tyloinfer.server").joinpath("protocol", "openapi.json")
-    assert path.read_text(encoding="utf-8") == render_openapi()
-    parsed = json.loads(path.read_text(encoding="utf-8"))
-    assert parsed["openapi"].startswith("3.1.")
 
 
 def test_optional_api_auth_and_security_headers() -> None:
