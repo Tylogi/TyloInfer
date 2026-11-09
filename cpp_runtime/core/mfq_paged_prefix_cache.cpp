@@ -503,6 +503,16 @@ public:
         }
         namespace_dir_ = config_.cache_dir /
             block_hash_hex(compatibility_hash_);
+#ifdef _WIN32
+        // Hash directories and filenames can exceed the legacy Win32 limit.
+        auto native = std::filesystem::absolute(namespace_dir_).lexically_normal().wstring();
+        if (native.compare(0, 4, L"\\\\?\\") != 0) {
+            native = native.compare(0, 2, L"\\\\") == 0
+                ? L"\\\\?\\UNC\\" + native.substr(2)
+                : L"\\\\?\\" + native;
+        }
+        namespace_dir_ = std::filesystem::path(std::move(native));
+#endif
         std::error_code error;
         std::filesystem::create_directories(namespace_dir_, error);
         if (error) {

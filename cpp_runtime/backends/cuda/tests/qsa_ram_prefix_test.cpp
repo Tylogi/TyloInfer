@@ -402,7 +402,14 @@ void large_tq4_prefill(int heads=6,int kh=2,int width=63) {
 #include "qwen4_host_session_test.h"
 #include "qsa_history_test.h"
 int main(int argc,char** argv)try {
-    const auto directory=argc>1?std::filesystem::path(argv[1]):std::filesystem::current_path()/"packed-prefix-test-data";
+    const auto parent=argc>1?std::filesystem::path(argv[1]):std::filesystem::current_path()/"packed-prefix-test-data";
+    std::filesystem::create_directories(parent);
+    std::filesystem::path directory;
+    // Existing MTP checkpoints must not become a fresh run's ordinary baseline.
+    for(std::size_t id=0;;++id) {
+        directory=parent/("r"+std::to_string(id));
+        if(std::filesystem::create_directory(directory))break;
+    }
     if(argc>2 && std::string(argv[2])=="packed-page"){packed_page_roundtrip(directory);index_archive_slices(directory/"index-slices");return 0;}
     int devices=0;if(cudaGetDeviceCount(&devices)!=cudaSuccess || !devices)return 77;
     if(argc>2 && std::string(argv[2])=="host-session"){check_qwen4_host_recurrent_restore();return 0;}
