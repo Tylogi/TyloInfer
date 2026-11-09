@@ -4,6 +4,7 @@
 #include "float_projection.h"
 #include "gated_residual_fused.h"
 #include "../ops/gguf/gguf_residual.h"
+#include "storage/dense_weight_placement.h"
 #include "selected_attention.h"
 #include "qwen4_exp.h"
 #include <limits>
@@ -286,7 +287,9 @@ LinearGroup grouped_linear(CudaExecutionContext& execution, std::vector<Linear>&
         for(auto& bucket:buckets) {
             // Subsets of an existing group already alias its immutable image.
             // Share activation quantization without joining those bytes again.
-            if(!combine_rows) {
+            if(!combine_rows || std::any_of(bucket.weights.begin(),bucket.weights.end(),[](const GgufWeight* weight) {
+                    return mfq::cuda::host_mapped_weight(weight->packed);
+                })) {
                 for(std::size_t i=0;i<bucket.weights.size();++i)
                     groups.push_back({*bucket.weights[i],{bucket.indices[i]},{0,bucket.weights[i]->out}});
                 continue;

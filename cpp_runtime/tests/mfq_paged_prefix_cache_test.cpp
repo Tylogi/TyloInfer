@@ -497,6 +497,34 @@ int main() try {
         }
     }
     std::filesystem::remove_all(tail_root);
+    const auto checkpoint_root=temporary_directory();
+    for(const bool disk:{false,true}) {
+        PagedPrefixCacheConfig config{checkpoint_root,disk?"checkpoint-disk":"checkpoint-ram",4,
+            disk?4096U:0U,disk?0U:4096U,8};
+        config.retain_tail_versions=4;
+        const std::vector<int64_t> prompt{1,2,3,4,5,6,7,8,90,91};
+        const auto check=[&](PagedPrefixCache& cache) {
+            const auto longer=cache.match(prompt,"image-A",false);
+            require(longer.matched_tokens==8,"longer full-block prefix did not match");
+            const auto shorter=cache.match_shorter_tail(prompt,longer,0,"image-A");
+            require(shorter.matched_tokens==7 && shorter.blocks.size()==2 &&
+                cache.load_prefix(shorter.blocks).back()->at(0)==7,
+                "longer full-block branch hid a retained partial checkpoint");
+            require(!cache.match_shorter_tail(prompt,longer,7,"image-A").matched_tokens,
+                "shorter checkpoint did not respect the known restored boundary");
+            require(!cache.match_shorter_tail(prompt,longer,0,"image-B").matched_tokens,
+                "shorter checkpoint ignored the extra input key");
+        };
+        {PagedPrefixCache cache(config);
+            const auto parent=cache.store({},prompt.data(),4,payload({4}),"image-A");
+            cache.store(parent,prompt.data()+4,3,payload({7}),"image-A");
+            const auto full=cache.store(parent,prompt.data()+4,4,payload({8}),"image-A");
+            const std::array<int64_t,2> generated{81,82};
+            cache.store(full,generated.data(),generated.size(),payload({10}),"image-A");
+            cache.flush();check(cache);}
+        if(disk){PagedPrefixCache cache(config);check(cache);}
+    }
+    std::filesystem::remove_all(checkpoint_root);
     const auto growing_root = temporary_directory();
     {
         PagedPrefixCache cache({growing_root, "growing-tails", 8, 4096, 64, 8});

@@ -616,6 +616,7 @@ class ModelLoadRequest(ProtocolModel):
     context_size: int | None = Field(default=None, ge=512, le=2147483647)
     yarn_enabled: bool | None = Field(default=None, strict=True)
     prefill_chunk_size: Literal["auto"] | Annotated[int, Field(ge=1, le=8192)] = "auto"
+    prefill_mode: Literal["precise", "fast"] = "precise"
     moe_gpu_cache_gb: float | None = Field(
         default=None,
         ge=0.0,

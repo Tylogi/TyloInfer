@@ -53,6 +53,7 @@ export interface RuntimeRequestMetrics {
 }
 
 export interface RuntimeStatus {
+  prefill_modes?: ('precise' | 'fast')[];
   gpu_devices?: { id: string; name: string; memory_total_bytes?: number | null;
     memory_available_bytes?: number | null; unified_memory?: boolean }[];
   memory_architecture?: 'unified' | 'discrete' | 'unknown';

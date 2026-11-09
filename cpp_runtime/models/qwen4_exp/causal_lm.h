@@ -17,8 +17,16 @@ auto load_residual(Loader &ops, const Config &c, const std::string &p, bool comb
     return ops.residual(std::move(norm), std::move(down), std::move(up), std::move(injection), c);
 }
 
+template<class Loader>
+auto load_dense_ffn(Loader& ops,const Config& c,const std::string& p,int)
+    -> decltype(ops.dense_ffn(p,c)) {return ops.dense_ffn(p,c);}
+template<class Loader>
+auto load_dense_ffn(Loader& ops,const Config&,const std::string& p,long)
+    -> decltype(ops.linear(p)) {throw std::runtime_error("Dense Qwen4 FFN is unavailable in this backend");}
+
 template <class Loader>
 auto load_ffn(Loader &ops, const Config &c, int layer, const std::string &p) {
+    if(!c.experts)return load_dense_ffn(ops,c,p,0);
     auto gate_up = ops.routed_gate_up(p, layer, c.experts, c.moe_width, c.hidden);
     auto down = ops.routed(p + ".experts.down.weight", layer, c.experts, c.hidden, c.moe_width);
     auto router = ops.linear(p + ".router.weight");
@@ -30,10 +38,15 @@ auto load_ffn(Loader &ops, const Config &c, int layer, const std::string &p) {
                    std::move(sg), std::move(su), std::move(sd), c);
 }
 
+template<class Loader>
+auto ple_embedding_width(Loader& ops,const Config&,int)->decltype(ops.ple_width()) {return ops.ple_width();}
+template<class Loader>
+int64_t ple_embedding_width(Loader&,const Config& c,long) {return c.hidden;}
+
 template <class Loader>
 auto load_ple(Loader &ops, const Config &c, const std::string &p) {
     std::vector<typename Loader::Embedding> shards;
-    int64_t rows = 0, width = c.hidden / ((c.ngram - 1) * c.ngram_heads);
+    int64_t rows = 0, width = ple_embedding_width(ops,c,0) / ((c.ngram - 1) * c.ngram_heads);
     for (int64_t i = 0; i < c.shards; ++i) {
         auto [embedding, shape] = ops.embedding(p + ".ngram.shard." + std::to_string(i) + ".weight");
         require_model(shape[1] == width && shape[0] > 0 && (!rows || shape[0] == rows),
@@ -190,7 +203,7 @@ auto decoder_layer_chained(Tensor hidden, bool has_ple, bool linear,
 
 template <class Backend> struct CausalLm : models::CausalModelBase<Backend, CausalLm<Backend>> {
     using Tensor = typename Backend::Tensor;
-    static bool accepts_backbone(std::string_view backbone) { return backbone == "qwen4_exp"; }
+    static bool accepts_backbone(std::string_view backbone) { return backbone == "qwen4_exp" || backbone=="qwen4"; }
     template <class Graph, class Source>
     void adapter_load_config(std::string_view payload, const Graph &graph, const Source &source) {
         auto &config = this->config;
@@ -212,7 +225,7 @@ template <class Backend> struct CausalLm : models::CausalModelBase<Backend, Caus
         metadata.tie_word_embeddings = config.tied_embeddings;
         metadata.multi_axis_positions = true;
         metadata.flash_next = true;
-        metadata.model_type = "qwen4_exp";
+        metadata.model_type = config.experts?"qwen4_exp":"qwen4";
         metadata.layer_types = config.layer_types;
     }
     Tensor adapter_prepare_hidden(Tensor hidden, int64_t batch, int64_t tokens) const {

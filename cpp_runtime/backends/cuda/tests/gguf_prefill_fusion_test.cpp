@@ -8,16 +8,76 @@
 #include "mfq_cuda_norm_ops.h"
 #include "mfq_cuda_activation_ops.h"
 #include <cstring>
+#include <cstdlib>
 #include <cmath>
 #include <iostream>
 #include <stdexcept>
 #include <string_view>
 namespace tb=mfq_tensor_backend;
 void require(bool p,const char* message){if(!p)throw std::runtime_error(message);}
+void fast_prefill_consumers() {
+  const auto setting=[](const char* value) {
+#ifdef _WIN32
+    _putenv_s("TYLOINFER_PREFILL_MODE",value);
+#else
+    setenv("TYLOINFER_PREFILL_MODE",value,1);
+#endif
+  };
+  const auto make_weight=[](int rows,int columns,int seed) {
+    auto host=tb::empty({rows,columns},tb::TensorOptions{}.dtype(tb::kFloat32).device(tb::kCPU));
+    for(int64_t i=0;i<host.numel();++i)host.data_ptr<float>()[i]=float(std::sin(i*.031+seed)*.03);
+    const auto stride=ggml_row_size(GGML_TYPE_Q8_0,columns);
+    auto packed=tb::empty({int64_t(rows*stride)},host.options().dtype(tb::kUInt8));
+    for(int row=0;row<rows;++row)quantize_row_q8_0_ref(host.data_ptr<float>()+row*columns,
+        reinterpret_cast<block_q8_0*>(packed.data_ptr<uint8_t>()+row*stride),columns);
+    QuantLinear result;result.kind=QuantLinearKind::Gguf;result.logical_out=rows;result.logical_neuron_len=columns;
+    result.gguf.type=GGML_TYPE_Q8_0;result.gguf.out=rows;result.gguf.neuron_len=columns;
+    result.gguf.row_bytes=stride;result.gguf.packed=packed.to(tb::kCUDA);return result;
+  };
+  setting("fast");CudaExecutionContext execution;
+  FFN ffn;ffn.gate_up.layers={make_weight(512,256,1),make_weight(512,256,2)};
+  ffn.gate_up.outs={512,512};ffn.down=make_weight(256,512,3);
+  const auto f=tb::TensorOptions{}.dtype(tb::kFloat32).device(tb::kCPU);
+  const auto stream=mfq_get_current_cuda_stream(0);
+  for(int tokens:{513,547})for(float scale:{.25f,1.5f}) {
+    auto host=tb::empty({tokens,256},f);
+    for(int64_t i=0;i<host.numel();++i)host.data_ptr<float>()[i]=std::sin(float(i)*.047f)*scale;
+    auto input=host.to(tb::kCUDA,tb::kFloat16),residual=tb::full_like(input,.03125);
+    auto parts=ffn.gate_up.forward(execution,input);auto materialized=tb::empty_like(parts[0]);
+    mfq::cuda::gguf::materialize_gated_input(parts[1].data_ptr(),parts[0].data_ptr(),true,
+        materialized.numel(),true,materialized.data_ptr(),stream.stream());
+    const auto expected=ffn.down.gguf.forward_base(materialized,true,residual).cpu();
+    const auto fused=ffn.try_forward_gguf_prefill_residual(execution,input,residual);
+    require(fused.has_value(),"Fast residual FFN was not selected");
+    const auto actual=fused->cpu();
+    require(actual.sizes()==expected.sizes() && std::memcmp(actual.data_ptr(),expected.data_ptr(),actual.nbytes())==0,
+        "Fast residual FFN differs from separately rounded gate and W8A8 input packing");
+    const auto saved=residual.to(tb::kCPU,tb::kFloat32);
+    for(int64_t i=0;i<saved.numel();++i)require(saved.data_ptr<float>()[i]==.03125f,"Fast FFN modified its residual input");
+  }
+  auto projection=make_weight(256,512,4);
+  auto source=tb::empty({1,4,513,128},f),gate=tb::empty({1,513,512},f);
+  for(int64_t i=0;i<source.numel();++i)source.data_ptr<float>()[i]=std::sin(float(i)*.021f)*.3f;
+  for(int64_t i=0;i<gate.numel();++i)gate.data_ptr<float>()[i]=std::cos(float(i)*.051f)*2.f;
+  source=source.to(tb::kCUDA);gate=gate.to(tb::kCUDA);auto norm=tb::ones({128},source.options());
+  auto normalized=rms_norm_cuda(source.reshape({-1,128}),norm,1e-6).reshape_as(source)
+      .transpose(1,2).contiguous().reshape({1,513,512});
+  const auto expected=projection.forward_input_mul(execution,normalized,gate,2).cpu();
+  const auto actual=projection.forward_input_rms_silu(execution,source,gate,norm,1e-6).cpu();
+  require(std::memcmp(actual.data_ptr(),expected.data_ptr(),actual.nbytes())==0,
+      "Fast grouped RMS/gate projection differs from explicit normalization and W8A8 projection");
+  require(!gguf_rms_gated_product(projection.gguf,source,gate,norm,1e-6,true).defined(),
+      "Fast mode entered the scaled FP16 output projection");
+  setting("precise");
+  require(gguf_rms_gated_product(projection.gguf,source,gate,norm,1e-6,true).defined(),
+      "Precise mode lost its scaled FP16 output projection");
+  std::cout<<"Fast residual FFN byte parity, immutable residual, RMS/gate projection and precise-mode isolation PASS\n";
+}
 int main(int argc,char** argv)try {
   int device_count=0;if(cudaGetDeviceCount(&device_count)!=cudaSuccess || !device_count)return 77;
   if(!mfq::cuda::gguf::grouped_f16_available(0))return 77;
   const MfqCudaGuard guard(0);const auto stream=mfq_get_current_cuda_stream(0);
+  if(argc==2 && std::string_view(argv[1])=="--fast-consumer-check"){fast_prefill_consumers();return 0;}
   const bool elementwise_only=argc==2 && std::string_view(argv[1])=="--elementwise-check";
   if(argc==2 && std::string_view(argv[1])=="--disabled-path-check") {
     auto input=tb::zeros({512,32},tb::TensorOptions{}.dtype(tb::kFloat32).device(tb::kCUDA));

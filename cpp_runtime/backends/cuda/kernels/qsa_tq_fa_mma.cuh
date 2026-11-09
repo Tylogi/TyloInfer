@@ -11,8 +11,9 @@
 
 using namespace ggml_cuda_mma;
 
-static __device__ __forceinline__ int64_t qsa_fa_kv_row(int64_t row,int heads) {
-    return (row/4)*(4*int64_t(heads))+row%4;
+static __device__ __forceinline__ int64_t qsa_fa_kv_row(int64_t row,int heads,const int* compact=nullptr) {
+    const auto block=compact?int64_t(max(compact[row/4],0)):row/4;
+    return block*(4*int64_t(heads))+row%4;
 }
 
 
@@ -22,6 +23,7 @@ struct QsaFaHistory {
     float* norm=nullptr;
     int block_count=0,selected_count=0;
     int gqa=8,microblock_heads=1;
+    const int* compact_blocks=nullptr;
 };
 
 
@@ -404,7 +406,7 @@ static constexpr __device__ int ggml_cuda_fattn_mma_get_nstages(
 template<int stride_tile, int nwarps, int nbatch_fa, bool use_cp_async, bool oob_check, bool use_sparse>
 static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
         const half2 * const __restrict__ KV, half2 * const __restrict__ tile_KV, const int D2, const int stride_KV,
-        const int k_VKQ_0, const int i_sup, const int32_t * const __restrict__ indices, int microblock_heads=1) {
+        const int k_VKQ_0, const int i_sup, const int32_t * const __restrict__ indices, int microblock_heads=1,const int* compact=nullptr) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     // K/V data is loaded with decreasing granularity for D for better memory bandwidth.
     // The minimum granularity is 16 bytes.
@@ -452,7 +454,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
                 for (int k0 = k0_start; k0 < k0_stop; k0 += stride_k) {
                     const int k = k0 + (stride_k == warp_size ? threadIdx.x : threadIdx.x % stride_k);
 
-                    cp_async_cg_16<preload>(tile_KV_32 + swizzle<stride_tile*sizeof(half2), char>(i*stride_tile*sizeof(half2) + k*chunk_size, i), KV + qsa_fa_kv_row(i_KV,microblock_heads)*stride_KV + k*h2_per_chunk);
+                    cp_async_cg_16<preload>(tile_KV_32 + swizzle<stride_tile*sizeof(half2), char>(i*stride_tile*sizeof(half2) + k*chunk_size, i), KV + qsa_fa_kv_row(i_KV,microblock_heads,compact)*stride_KV + k*h2_per_chunk);
                 }
             }
         };
@@ -490,10 +492,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
                     const half2 * src;
                     if constexpr (use_sparse) {
                         const int32_t index = i < i_sup ? indices[k_VKQ_0 + i] : -1;
-                        src = index >= 0 ? KV + qsa_fa_kv_row(index,microblock_heads)*stride_KV + k*h2_per_chunk : zero;
+                        src = index >= 0 ? KV + qsa_fa_kv_row(index,microblock_heads,compact)*stride_KV + k*h2_per_chunk : zero;
                     } else if (!oob_check || i < i_sup) {
                         const int64_t i_KV = indices ? max(indices[k_VKQ_0 + i], 0) : k_VKQ_0 + i;
-                        src = KV + qsa_fa_kv_row(i_KV,microblock_heads)*stride_KV + k*h2_per_chunk;
+                        src = KV + qsa_fa_kv_row(i_KV,microblock_heads,compact)*stride_KV + k*h2_per_chunk;
                     } else {
                         src = zero;
                     }
@@ -666,7 +668,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         cp_async_wait_all();
         __syncthreads();
         flash_attn_ext_f16_load_tile<stride_tile_V, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
-            (V_h2, tile_V, nbatch_V2, stride_V, k_VKQ_0, k_VKQ_sup, indices, history.microblock_heads);
+            (V_h2, tile_V, nbatch_V2, stride_V, k_VKQ_0, k_VKQ_sup, indices, history.microblock_heads,history.compact_blocks);
     } else {
         // the sparse mask values are gathered per element, always load them synchronously
         constexpr bool use_cp_async = nstages == 1 && !use_sparse;
@@ -686,7 +688,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             const int k0_diff = k0_stop - k0_start;
             constexpr bool use_cp_async = nstages == 1;
             flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
-                (K_h2 + k0_start, tile_K, k0_diff, stride_K, k_VKQ_0, k_VKQ_sup, indices, history.microblock_heads);
+                (K_h2 + k0_start, tile_K, k0_diff, stride_K, k_VKQ_0, k_VKQ_sup, indices, history.microblock_heads,history.compact_blocks);
             if (use_cp_async) {
                 cp_async_wait_all();
             }
@@ -1053,7 +1055,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                     (mask_h, tile_mask, stride_mask, k_VKQ_0 + nbatch_fa, next_sup, jt*ncols1, ne01, indices);
             }
             flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
-                (K_h2, tile_K, nbatch_K2, stride_K, k_VKQ_0 + nbatch_fa, next_sup, indices, history.microblock_heads);
+                (K_h2, tile_K, nbatch_K2, stride_K, k_VKQ_0 + nbatch_fa, next_sup, indices, history.microblock_heads,history.compact_blocks);
         }
     }
 
@@ -1069,7 +1071,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             if (!V_is_K_view || i0_stop > 2*nbatch_K2) {
                 constexpr bool use_cp_async = nstages == 1;
                 flash_attn_ext_f16_load_tile<stride_tile_V, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
-                    (V_h2 + i0_start/2, tile_V, i0_diff/2, stride_V, k_VKQ_0, k_VKQ_sup, indices, history.microblock_heads);
+                    (V_h2 + i0_start/2, tile_V, i0_diff/2, stride_V, k_VKQ_0, k_VKQ_sup, indices, history.microblock_heads,history.compact_blocks);
                 if (use_cp_async) {
                     cp_async_wait_all();
                 }
@@ -1404,7 +1406,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                 (mask_h, tile_mask, stride_mask, kb0*nbatch_fa, k_VKQ_sup, jt*ncols1, ne01, indices);
         }
         flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
-            (K_h2, tile_K, nbatch_K2, stride_K, kb0*nbatch_fa, k_VKQ_sup, indices, history.microblock_heads);
+            (K_h2, tile_K, nbatch_K2, stride_K, kb0*nbatch_fa, k_VKQ_sup, indices, history.microblock_heads,history.compact_blocks);
     }
 
     // kb0_start is always < kb0_stop so the last iter can be executed unconditionally.

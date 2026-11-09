@@ -82,7 +82,7 @@ inline constexpr CudaBackbone cuda_backbone(
     if (implementation == "gemma4") return CudaBackbone::gemma4;
     if (implementation == "glm_dsa") return CudaBackbone::glm_dsa;
     if (implementation == "glm5_next") return CudaBackbone::glm5_next;
-    if (implementation == "qwen4_exp") return CudaBackbone::qwen4_exp;
+    if (implementation == "qwen4_exp" || implementation=="qwen4") return CudaBackbone::qwen4_exp;
     if (implementation == "deepseek_v4") {
         return CudaBackbone::deepseek_v4;
     }
@@ -100,7 +100,7 @@ inline CudaModelPlan cuda_model_plan(
     CudaModelPlan result;
     result.backbone = cuda_backbone(graph.backbone);
     const auto* vision = graph.component("vision");
-    if ((graph.backbone == "qwen3_5" || graph.backbone == "qwen4_exp") && vision != nullptr &&
+    if ((graph.backbone == "qwen3_5" || graph.backbone == "qwen4_exp" || graph.backbone=="qwen4") && vision != nullptr &&
         vision->tensor_root == "vision" &&
         vision->implementation == "grid_vit" &&
         vision->input_contract == kMfqGridVisionInputContract &&
@@ -138,7 +138,7 @@ inline CudaModelPlan cuda_model_plan(
         predictor->tensor_root == "predictor") {
         result.predictor = CudaPredictorAdapter::qwen35;
     }
-    if ((graph.backbone=="qwen4_exp" || graph.backbone=="glm5_next") && predictor!=nullptr &&
+    if ((graph.backbone=="qwen4_exp" || graph.backbone=="qwen4" || graph.backbone=="glm5_next") && predictor!=nullptr &&
         predictor->implementation=="next_token_prediction" && predictor->tensor_root=="predictor") {
         result.predictor=CudaPredictorAdapter::flash_next;
     }

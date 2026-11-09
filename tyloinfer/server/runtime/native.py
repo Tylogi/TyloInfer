@@ -12,7 +12,7 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from tyloinfer.formats.assets import (
@@ -81,6 +81,18 @@ def append_native_prefill_chunk_override(
     if type(prefill_chunk_size) is not int or not 1 <= prefill_chunk_size <= 8192:
         raise NativeRuntimeError("prefill chunk size must be auto or an integer in [1, 8192]")
     command.extend(["--prefill-chunk-size", str(prefill_chunk_size)])
+
+
+def apply_native_prefill_mode(environment: dict[str, str], backend: str, mode: str) -> None:
+    """Apply an explicit per-worker mode without changing the parent environment."""
+    if mode not in {"precise", "fast"}:
+        raise NativeRuntimeError("prefill mode must be precise or fast")
+    if mode == "fast" and backend != "cuda":
+        raise NativeRuntimeError("fast prefill currently requires CUDA")
+    if backend == "cuda":
+        environment["TYLOINFER_PREFILL_MODE"] = mode
+    else:
+        environment.pop("TYLOINFER_PREFILL_MODE", None)
 
 
 def native_request_capacity(
@@ -213,6 +225,7 @@ class NativeRuntime:
     backend: str
     context_size: int = 0
     prefill_chunk_size: int | str = "auto"
+    prefill_mode: str = field(default="precise", kw_only=True)
     continuous_batching: int = 0
     routed_expert_bytes: int = 0
     moe_gpu_cache_gb: float | None = None
@@ -282,16 +295,16 @@ class NativeRuntime:
             subprocess.list2cmdline(command),
             flush=True,
         )
+        environment = native_runtime_environment(
+            self.executable, self.backend,
+            base={**os.environ, **dict(self.environment or {})}, model=self.model,
+        )
+        apply_native_prefill_mode(environment, self.backend, self.prefill_mode)
         self.process = subprocess.Popen(
             command,
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
             stdin=subprocess.DEVNULL,
-            env=native_runtime_environment(
-                self.executable,
-                self.backend,
-                base={**os.environ, **dict(self.environment or {})},
-                model=self.model,
-            ),
+            env=environment,
         )
         self._wait_until_ready()
 

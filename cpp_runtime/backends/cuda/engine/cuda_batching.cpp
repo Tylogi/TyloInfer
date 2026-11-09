@@ -6,15 +6,20 @@
 #include "core/full_block.h"
 #include "models/qwen35/ops.h"
 #include "storage/moe_expert_cache.h"
+#include "storage/text_session_cache.h"
 #include "runtime/execution_options.h"
 #include "prefill_budget.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -30,10 +35,25 @@ static mfq::engine::PrefillChunk budget_batch_prefill(Model& model,
         CudaExecutionContext& execution,mfq::engine::PrefillChunk chunk,std::size_t growth=0) {
     const auto context=default_context(execution.layer_placement.primary_device());
     const auto transfer=moe_prefill_workspace_budget(execution.moe_expert_cache,false).transfer_bytes;
-    const auto fixed=mfq::engine::prefill_budget_add((std::size_t(1)<<30)+growth,transfer);
-    const auto available=context->available_memory()+context->workspace_available();
-    const auto row_bytes=std::size_t(model.hidden_size())*model.hc_mult()*sizeof(float)*8;
+    const auto available=mfq::engine::prefill_budget_add(
+        mfq::engine::prefill_budget_add(context->available_memory(),context->workspace_available()),
+        context->reusable_workspace_bytes());
+    const auto mandatory=mfq::engine::prefill_budget_add(growth,transfer);
+    // Weight decoding already tiles to the remaining live memory. Reserve
+    // a proportional share when concurrent states leave less than 2 GiB.
+    const auto remaining=available>mandatory?available-mandatory:0;
+    const auto fixed=mfq::engine::prefill_budget_add(mandatory,std::min(std::size_t(1)<<30,remaining/2));
+    int64_t dense_width=0;
+    if constexpr(std::is_same_v<Model,Qwen4CausalLm>)
+        if(!model.config.experts)dense_width=model.config.moe_width;
+    const auto row_bytes=mfq::engine::prefill_activation_row_bytes(model.hidden_size(),model.hc_mult(),dense_width);
     const auto selected=mfq::engine::select_prefill_chunk(chunk.count,chunk.count,available,fixed,row_bytes);
+    if(const auto* trace=std::getenv("TYLOINFER_TRACE_KERNEL_DISPATCH");trace && trace[0]=='1') {
+        static thread_local bool reported=false;
+        if(!reported || !selected){reported=true;std::fprintf(stderr,
+            "native_cuda_batch_prefill_budget actual_match=1 available=%zu fixed=%zu row_bytes=%zu dense_width=%lld selected=%lld\n",
+            available,fixed,row_bytes,(long long)dense_width,(long long)selected);}
+    }
     if(!selected)throw mfq::engine::InferenceInputError(
         mfq::engine::InferenceInputErrorCode::ContextLength,
         "insufficient CUDA workspace for batched prefill; reduce concurrent requests");
@@ -480,8 +500,8 @@ void QwenBatchOperations::recover(State &state) {
 }
 
 FlashNextBatchOperations::FlashNextBatchOperations(Qwen4CausalLm& model,
-        CudaExecutionContext& execution, CudaContinuousBatchConfig config)
-    : model_(model), execution_(execution), config_(std::move(config)) {
+        CudaExecutionContext& execution, CudaContinuousBatchConfig config,internal::TextSessionCache* cache)
+    : model_(model), execution_(execution), config_(std::move(config)),prefix_cache_(cache) {
     TYLOINFER_RUNTIME_CHECK(config_.max_sequences > 0 && config_.max_sequences <= 32,
                       "Flash-Next continuous batching supports 1..32 requests");
     model_.reset(1);
@@ -502,6 +522,7 @@ mfq::engine::Metrics FlashNextBatchOperations::metrics() const {
         {"continuous_batching_packed_prefill_batches",double(packed_prefill_batches_)},
         {"continuous_batching_packed_prefill_requests",double(packed_prefill_requests_)},
         {"continuous_batching_packed_prefill_tokens",double(packed_prefill_tokens_)},
+        {"continuous_batching_memory_waits",double(memory_waits_)},
         {"continuous_batching_moe_cached_row_serial",0.0},
         {"continuous_batching_cuda_graph_captures",double(graph_ ? graph_->captures() : 0)},
         {"continuous_batching_cuda_graph_replays",double(graph_ ? graph_->replays() : 0)},
@@ -509,6 +530,58 @@ mfq::engine::Metrics FlashNextBatchOperations::metrics() const {
         {"continuous_batching_request_contexts",double(contexts)}};
 }
 void FlashNextBatchOperations::suspend_decode() { if (graph_) graph_->clear(); }
+std::size_t FlashNextBatchOperations::prefix_tokens(const std::shared_ptr<Request>& request) const {
+    return prefix_cache_ && prefix_cache_->persistent_prefix_enabled() && !request->prompt.empty()
+        ?std::min(request->cache_plan.stable_prefix_tokens,request->prompt.size()-1):0;
+}
+std::optional<std::size_t> FlashNextBatchOperations::prepare(const std::shared_ptr<Request>& request) {
+    MfqCudaGuard guard(execution_.layer_placement.primary_device());
+    std::size_t required=0;
+    for(const auto& weak:requests_)if(const auto peer=weak.lock();peer && peer!=request && peer->cache)
+        required=std::max(required,peer->cache->resident_bytes());
+    const bool peers=required!=0;
+    if(peers && request->wait_for_release>released_states_)return {};
+    const auto defer=[&] {
+        request->wait_for_release=released_states_+1;++memory_waits_;
+    };
+    if(peers) {
+        const auto context=default_context(execution_.layer_placement.primary_device());
+        const auto available=mfq::engine::prefill_budget_add(context->available_memory(),context->workspace_available());
+        required=mfq::engine::prefill_budget_add(required,
+            request->prompt.size()>SIZE_MAX/sizeof(int64_t)?SIZE_MAX:request->prompt.size()*sizeof(int64_t));
+        if(required>available) {
+            defer();
+            if(const auto* trace=std::getenv("TYLOINFER_TRACE_KERNEL_DISPATCH");trace && trace[0]=='1')
+                std::fprintf(stderr,"native_cuda_batch_memory_wait actual_match=1 required_bytes=%zu available_bytes=%zu\n",required,available);
+            return {};
+        }
+    }
+    request->prefix_boundary=prefix_tokens(request);
+    if(!request->prefix_boundary)return 0;
+    std::size_t restored=0;
+    try {
+        initialize_prefill(request,{0,0,false});
+        restored=request->cache->restore_prefix(model_,*prefix_cache_,request->cache_plan.session_id,
+            request->prompt,request->prefix_boundary);
+    }catch(const std::exception& error) {
+        const std::string_view message=error.what();
+        const bool capacity=dynamic_cast<const MfqResourceExhausted*>(&error) ||
+            message.starts_with("CUDA process VRAM limit exceeded:") ||
+            message.starts_with("CUDA VRAM limit exceeded:") ||
+            message.starts_with("CUDA pinned allocation failed:");
+        if(!peers || !capacity)throw;
+        discard_prefill(request);request->prefill_offset=request->cache_length=0;
+        request->prefix_stored=false;defer();
+        if(const auto* trace=std::getenv("TYLOINFER_TRACE_KERNEL_DISPATCH");trace && trace[0]=='1')
+            std::fprintf(stderr,"native_cuda_batch_memory_wait actual_match=1 allocation_retry=1\n");
+        return {};
+    }
+    request->cache_length=request->prefill_offset=int64_t(restored);
+    request->prefix_stored=restored==request->prefix_boundary;
+    if(const auto* trace=std::getenv("TYLOINFER_TRACE_KERNEL_DISPATCH");trace && trace[0]=='1')
+        std::fprintf(stderr,"native_cuda_batch_prefix actual_match=1 boundary=%zu reused=%zu\n",request->prefix_boundary,restored);
+    return restored;
+}
 void FlashNextBatchOperations::resume_decode(int64_t) {}
 static std::exception_ptr flash_next_prefill_failure(std::exception_ptr failure) {
     try {std::rethrow_exception(failure);}
@@ -537,11 +610,17 @@ void FlashNextBatchOperations::initialize_prefill(
             // unused while independent batch rows own their own context.
             qwen4_release_decode_graphs(model_,nullptr);
             model_.reset(1);
+            qwen4_release_idle_indexers(model_);
             release_moe_decode_buffers(execution_.moe_expert_cache);
             default_context(execution_.layer_placement.primary_device())->reclaim_idle_memory();
         }
         requests_.push_back(request);
         request->cache = std::make_unique<Qwen4BatchRequestState>(model_);
+        if(const auto* trace=std::getenv("TYLOINFER_TRACE_KERNEL_DISPATCH");trace && trace[0]=='1') {
+            const auto context=default_context(execution_.layer_placement.primary_device());
+            std::fprintf(stderr,"native_cuda_batch_state actual_match=1 state_bytes=%zu allocated_bytes=%zu local_bytes=%zu\n",
+                request->cache->resident_bytes(),context->memory_stats().allocated,context->local_memory_usage());
+        }
         request->prefill_ids = mfq_tensor_backend::tensor(request->prompt,
             mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64)
                 .device(mfq_tensor_backend::Device(mfq_tensor_backend::kCUDA,
@@ -554,6 +633,12 @@ void FlashNextBatchOperations::initialize_prefill(
 }
 FlashNextBatchOperations::Sample FlashNextBatchOperations::finish_prefill(
         const std::shared_ptr<Request>& request,Tensor next) {
+    if(request->prefix_boundary && !request->prefix_stored &&
+            request->cache->position()==int64_t(request->prefix_boundary)) {
+        request->prefix_stored=true;
+        try {request->cache->store_prefix(model_,*prefix_cache_,request->cache_plan.session_id,request->prompt);}
+        catch(const std::exception& error){std::fprintf(stderr,"runtime_session_cache action=skip error=%s\n",error.what());}
+    }
     if (!next.defined()) return {};
     const auto token=next.item<int64_t>();
     double milliseconds=request->packed_prefill_ms;
@@ -669,7 +754,9 @@ void FlashNextBatchOperations::activate(const std::shared_ptr<Request>& request,
 void FlashNextBatchOperations::discard_prefill(const std::shared_ptr<Request>& request) {
     if (graph_) graph_->clear();
     finish_moe_expert_exchanges(execution_.moe_expert_cache);
+    if(request->cache)++released_states_;
     request->cache.reset(); request->prefill_ids = {}; request->prefill_timers.clear(); request->packed_prefill_ms=0;
+    request->counts={};request->sampler.reset();
 }
 void FlashNextBatchOperations::retire(const std::vector<std::shared_ptr<Request>>& retired,int64_t) {
     for (const auto& request : retired) discard_prefill(request);

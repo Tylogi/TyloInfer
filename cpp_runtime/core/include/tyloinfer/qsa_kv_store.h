@@ -50,6 +50,9 @@ public:
     // storage. Scatter reads retain bounded workspace and amplification;
     // ordinary random recall keeps its exact ranges.
     void read_into_batch(const std::vector<ReadRequest>& requests);
+    // A retained block's byte offset is immutable until its final lease ends.
+    std::size_t read_offset(const BlockPtr& block) const;
+    std::size_t read_size(const BlockPtr& block) const;
     void flush();
     QsaKvStoreStats stats() const;
     const QsaKvStoreConfig& config() const noexcept;

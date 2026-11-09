@@ -12,9 +12,14 @@ public:
     ~GgufPrefillInputScope();
     static bool lookup(const mfq_tensor_backend::Tensor& input,
         mfq_tensor_backend::Tensor& half,mfq_tensor_backend::Tensor& exponents);
+    static bool lookup_w8a8(const mfq_tensor_backend::Tensor& input,
+        mfq_tensor_backend::Tensor& codes,mfq_tensor_backend::Tensor& scales);
     static std::unique_ptr<GgufPrefillInputScope> prepare_rms(
         const mfq_tensor_backend::Tensor& input,const mfq_tensor_backend::Tensor& weight,
         double eps,double offset,mfq_tensor_backend::Tensor& normalized);
+    static std::unique_ptr<GgufPrefillInputScope> prepare_gated(
+        const mfq_tensor_backend::Tensor& up,const mfq_tensor_backend::Tensor& gate,
+        bool silu,mfq_tensor_backend::Tensor& materialized);
 };
 mfq_tensor_backend::Tensor gguf_rms_gated_prefill(const GgufWeight& weight,
     const mfq_tensor_backend::Tensor& attended,const mfq_tensor_backend::Tensor& gate,

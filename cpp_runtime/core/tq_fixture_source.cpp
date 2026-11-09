@@ -1,5 +1,7 @@
 #include "tyloinfer/tq_fixture_source.h"
 #include "tyloinfer/mfq_model_source.h"
+#include "tyloinfer/gguf_model_source.h"
+#include "tyloinfer/gguf_quant.h"
 #include "nlohmann/json.hpp"
 #include <algorithm>
 #include <array>
@@ -142,7 +144,13 @@ class Fixture final:public ModelSource {
     std::vector<TensorMetadata> tensors_;
     std::unordered_map<std::string,std::size_t> index_;
     std::unordered_map<std::string,TensorReader> readers_;
+    std::unordered_map<std::string,TensorBatchReader> batch_readers_;
     std::unordered_map<std::string,std::string> metadata_;
+    HadamardTransforms hadamard_;
+    std::vector<std::shared_ptr<const ModelSource>> borrowed_;
+    std::vector<std::filesystem::path> paths_;
+    std::vector<std::string> assets_;
+    std::optional<std::vector<std::byte>> config_;
 public:
     explicit Fixture(const std::filesystem::path& path) {
         std::ifstream input(path);json spec;input>>spec;
@@ -150,6 +158,15 @@ public:
             throw std::invalid_argument("expected an explicit synthetic TQ fixture");
         base_=std::make_shared<MfqModelSource>(std::filesystem::u8path(spec.at("reference").get<std::string>()));
         tensors_=base_->tensors();metadata_=base_->metadata();metadata_["tq.synthetic"]="true";
+        paths_=base_->source_paths();assets_=base_->assets();
+        if(spec.contains("config_patch")) {
+            auto config=json::parse(base_->model_config_json());
+            config.merge_patch(spec.at("config_patch"));
+            const auto text=config.dump();config_.emplace(text.size());
+            std::memcpy(config_->data(),text.data(),text.size());
+            if(std::find(assets_.begin(),assets_.end(),kModelConfigAsset)==assets_.end())
+                assets_.emplace_back(kModelConfigAsset);
+        }
         // Synthetic conversion can replace a legacy combined Gate/Up bank
         // with two ordinary tensors, while retaining all unchanged assets.
         const auto removed=spec.value("remove_tensors",std::vector<std::string>{});
@@ -212,25 +229,135 @@ public:
             }
         }
         metadata_["tq.segments"]=segmented.dump();
+        auto rotations=metadata_.count("gguf_hadamard")?json::parse(metadata_.at("gguf_hadamard")):json::object();
+        auto grouped_rotations=metadata_.count("gguf_hadamard_grouped_gdn")?
+            json::parse(metadata_.at("gguf_hadamard_grouped_gdn")):json::object();
+        for(const auto& borrowed:spec.value("borrowed_sources",json::array())) {
+            auto borrowed_path=std::filesystem::u8path(borrowed.at("path").get<std::string>());
+            if(borrowed_path.is_relative())borrowed_path=path.parent_path()/borrowed_path;
+            std::shared_ptr<const ModelSource> source;
+            if(is_gguf_file(borrowed_path))source=std::make_shared<GgufModelSource>(borrowed_path);
+            else source=std::make_shared<MfqModelSource>(borrowed_path);
+            borrowed_.push_back(source);
+            const auto& source_metadata=source->metadata();
+            const auto source_rotations=source_metadata.count("gguf_hadamard")?
+                json::parse(source_metadata.at("gguf_hadamard")):json::object();
+            const auto source_groups=source_metadata.count("gguf_hadamard_grouped_gdn")?
+                json::parse(source_metadata.at("gguf_hadamard_grouped_gdn")):json::object();
+            for(const auto& file:source->source_paths())
+                if(std::find(paths_.begin(),paths_.end(),file)==paths_.end())paths_.push_back(file);
+            for(const auto& entry:borrowed.at("tensors")) {
+                const auto name=entry.is_string()?entry.get<std::string>():entry.at("name").get<std::string>();
+                const auto from=entry.is_string()?name:entry.value("source",name);
+                if(removed_names.count(name) || readers_.count(name))
+                    throw std::invalid_argument("conflicting synthetic tensor replacement: "+name);
+                const auto* original=source->find_tensor(from);
+                if(!original)throw std::invalid_argument("borrowed synthetic tensor is missing: "+from);
+                auto tensor=*original;tensor.name=name;
+                rotations.erase(name);grouped_rotations.erase(name);
+                if(source_rotations.contains(from))rotations[name]=source_rotations.at(from);
+                if(source_groups.contains(from))grouped_rotations[name]=source_groups.at(from);
+                auto read=source->tensor_reader(from);
+                auto batch=source->tensor_batch_reader(from);
+                if(entry.is_object() && entry.contains("rows_per_group")) {
+                    if(!mfq::gguf::is_quantized(tensor.dtype) || !tensor.shape || tensor.shape->size()!=2 ||
+                            tensor.shape->at(0)<=0 || tensor.shape->at(1)<=0)
+                        throw std::invalid_argument("borrowed row view requires a fixed-row GGUF matrix");
+                    const auto rows=std::uint64_t(tensor.shape->at(0));
+                    const auto group=entry.at("source_rows_per_group").get<std::uint64_t>();
+                    const auto selected=entry.at("rows_per_group").get<std::uint64_t>();
+                    const auto offset=entry.value("row_offset",std::uint64_t(0));
+                    if(!group || !selected || rows%group || offset>group || selected>group-offset || tensor.nbytes%rows)
+                        throw std::invalid_argument("invalid borrowed row grouping");
+                    const auto row_bytes=tensor.nbytes/rows;
+                    if(!row_bytes)throw std::invalid_argument("empty borrowed matrix rows");
+                    const auto span=selected*row_bytes,source_span=group*row_bytes;
+                    tensor.shape->at(0)=std::int64_t(rows/group*selected);
+                    tensor.nbytes=rows/group*span;
+                    read=[source,read=std::move(read),total=tensor.nbytes,span,source_span,skip=offset*row_bytes]
+                         (std::uint64_t position,std::byte* output,std::size_t size) {
+                        if(position>total || size>total-position)
+                            throw std::out_of_range("borrowed row view read is out of bounds");
+                        while(size) {
+                            const auto within=position%span;
+                            const auto count=std::min<std::uint64_t>(size,span-within);
+                            read(position/span*source_span+skip+within,output,std::size_t(count));
+                            position+=count;output+=count;size-=std::size_t(count);
+                        }
+                    };
+                    if(batch)batch=[source,batch=std::move(batch),total=tensor.nbytes,span,source_span,skip=offset*row_bytes]
+                            (const std::vector<ReadSpan>& requests) {
+                        std::vector<ReadSpan> translated;
+                        for(const auto& request:requests) {
+                            auto position=request.offset;auto* output=request.destination;auto size=request.size;
+                            if(position>total || size>total-position)
+                                throw std::out_of_range("borrowed row view batch is out of bounds");
+                            while(size) {
+                                const auto count=std::min<std::uint64_t>(size,span-position%span);
+                                translated.push_back({position/span*source_span+skip+position%span,output,std::size_t(count)});
+                                position+=count;output+=count;size-=std::size_t(count);
+                            }
+                        }
+                        batch(translated);
+                    };
+                }
+                if(entry.is_object() && entry.contains("shape") &&
+                   (!tensor.shape || *tensor.shape!=entry.at("shape").get<std::vector<std::int64_t>>()))
+                    throw std::invalid_argument("borrowed tensor shape differs from its declared view");
+                readers_.emplace(name,[source,read=std::move(read),total=tensor.nbytes](auto offset,auto* output,auto bytes) {
+                    if(offset>total || bytes>total-offset)throw std::out_of_range("borrowed tensor read is out of bounds");
+                    read(offset,output,bytes);
+                });
+                if(batch)batch_readers_.emplace(name,[source,batch=std::move(batch),total=tensor.nbytes]
+                        (const std::vector<ReadSpan>& requests) {
+                    for(const auto& request:requests)
+                        if(request.offset>total || request.size>total-request.offset)
+                            throw std::out_of_range("borrowed tensor batch is out of bounds");
+                    batch(requests);
+                });
+                const auto existing=std::find_if(tensors_.begin(),tensors_.end(),[&](const auto& value){return value.name==name;});
+                if(existing==tensors_.end())tensors_.push_back(std::move(tensor));else *existing=std::move(tensor);
+            }
+        }
+        if(!rotations.empty()) {
+            metadata_["gguf_hadamard"]=rotations.dump();
+            metadata_["gguf_requires_hadamard"]="true";
+            for(const auto& entry:rotations.items())
+                hadamard_.emplace(entry.key(),HadamardTransform{
+                    entry.value().at("block_size").get<int64_t>(),
+                    entry.value().at("signs").get<std::vector<int8_t>>()});
+        }
+        if(!grouped_rotations.empty())metadata_["gguf_hadamard_grouped_gdn"]=grouped_rotations.dump();
         for(std::size_t i=0;i<tensors_.size();++i)index_.emplace(tensors_[i].name,i);
     }
-    const std::vector<std::filesystem::path>& source_paths()const noexcept override{return base_->source_paths();}
+    const std::vector<std::filesystem::path>& source_paths()const noexcept override{return paths_;}
     std::string_view architecture()const noexcept override{return base_->architecture();}
     const std::unordered_map<std::string,std::string>& metadata()const noexcept override{return metadata_;}
+    const HadamardTransforms* hadamard_transforms()const noexcept override{return &hadamard_;}
     const std::vector<TensorMetadata>& tensors()const noexcept override{return tensors_;}
     const TensorMetadata* find_tensor(std::string_view name)const noexcept override {
         const auto item=index_.find(std::string(name));return item==index_.end()?nullptr:&tensors_[item->second];
     }
     TensorReader tensor_reader(std::string_view name)const override {
+        if(!find_tensor(name))throw std::invalid_argument("unknown synthetic tensor: "+std::string(name));
         const auto item=readers_.find(std::string(name));return item==readers_.end()?base_->tensor_reader(name):item->second;
+    }
+    TensorBatchReader tensor_batch_reader(std::string_view name)const override {
+        if(!find_tensor(name))throw std::invalid_argument("unknown synthetic tensor: "+std::string(name));
+        if(const auto item=batch_readers_.find(std::string(name));item!=batch_readers_.end())return item->second;
+        // Synthetic replacements must never expose a reader for the base image.
+        if(readers_.count(std::string(name)))return {};
+        return base_->tensor_batch_reader(name);
     }
     void read_range_into(std::string_view name,std::uint64_t offset,std::byte* out,std::size_t size)const override {
         tensor_reader(name)(offset,out,size);
     }
     bool supports_parallel_tensor_reads()const noexcept override{return true;}
-    const std::vector<std::string>& assets()const noexcept override{return base_->assets();}
-    bool has_asset(std::string_view name)const noexcept override{return base_->has_asset(name);}
-    std::vector<std::byte> read_asset(std::string_view name)const override{return base_->read_asset(name);}
+    const std::vector<std::string>& assets()const noexcept override{return assets_;}
+    bool has_asset(std::string_view name)const noexcept override{return (config_ && name==kModelConfigAsset) || base_->has_asset(name);}
+    std::vector<std::byte> read_asset(std::string_view name)const override {
+        return config_ && name==kModelConfigAsset?*config_:base_->read_asset(name);
+    }
     std::optional<ModelGraph> model_graph()const override{return base_->model_graph();}
 };
 }

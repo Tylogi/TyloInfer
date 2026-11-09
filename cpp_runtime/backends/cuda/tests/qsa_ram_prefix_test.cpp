@@ -1,4 +1,5 @@
 #include "storage/session_state.h"
+#include "storage/qsa_ram_session.h"
 #include "runtime/qsa_tq_cache.h"
 #include "runtime/qsa_tq_session.h"
 #include "mfq_cuda_context.h"
@@ -28,8 +29,9 @@ void failed_restore(mfq::cuda::QsaTqCache& runtime,const mfq::cuda::QsaTqSession
     require(rejected && runtime.stats().resident_bytes==0,"Failed prefix restore retained partial RAM KV");
 }
 void same(const tb::Tensor& a,const tb::Tensor& b) {
-    require(a.sizes()==b.sizes() && !std::memcmp(a.data_ptr(),b.data_ptr(),a.nbytes()),
-        "Compressed prefix changed exact index selection or attention output");
+    const auto x=a.contiguous().cpu(),y=b.contiguous().cpu();
+    require(x.scalar_type()==y.scalar_type() && x.sizes()==y.sizes() &&
+        !std::memcmp(x.data_ptr(),y.data_ptr(),x.nbytes()),"Session restoration changed tensor dtype, shape or values");
 }
 void index_archive_slices(const std::filesystem::path& directory) {
     constexpr std::size_t width=128,raw=8*width,stride=2*(width+2),length=raw+stride,padding=13;
@@ -75,6 +77,86 @@ void index_archive_slices(const std::filesystem::path& directory) {
     session.read_slice_into(raw,output.data()+4,stride,length);verify();
     std::cout<<"Index archive slices: exact INT16 suffix, direct/vector/session/resident sources, full geometry and destination bounds PASS\n";
 }
+void packed_page_roundtrip(const std::filesystem::path& directory) {
+    namespace qsa=tyloinfer::qsa;
+    using mfq::cuda::internal::write_ram_qsa_page;
+    using mfq::cuda::internal::read_ram_qsa_page;
+    for(int width:{63,257}) {
+        mfq::cache::QsaKvStoreConfig cfg;cfg.directory=(directory/std::to_string(width)).string();
+        cfg.buffer_bytes=cfg.budget_bytes=64<<10;
+        auto store=std::make_shared<mfq::cache::QsaKvStore>(cfg);
+        mfq::cuda::QsaTqSession state;state.tokens=2400;state.heads=6;state.kv_heads=2;
+        state.width=width;state.padded=(width+255)/256*256;state.index_width=7;state.ram_bits=4;
+        state.kv=std::make_shared<qsa::RamKvSnapshot>();
+        const size_t rows=state.kv_heads*state.padded*4/256;
+        const size_t fp16=rows*512,affine=((rows*3+3)&~size_t(3))+rows*256;
+        const size_t tq4=((rows*2+(rows+1)/2+(rows*3+7)/8+3)&~size_t(3))+rows*128;
+        const size_t index_bytes=state.index_width*10+4;
+        for(size_t id=0;id<600;++id) {
+            const auto bits=id%3==0?0:id%3==1?qsa::affine8_tag:4;
+            const auto bytes=id%3==0?fp16:id%3==1?affine:tq4;
+            auto data=std::make_shared<std::vector<uint8_t>>(2*bytes);
+            auto index=std::make_shared<std::vector<uint8_t>>(index_bytes);
+            for(size_t j=0;j<data->size();++j)(*data)[j]=uint8_t(13*id+29*j);
+            for(size_t j=0;j<index->size();++j)(*index)[j]=uint8_t(7*id+31*j);
+            qsa::RamKvSnapshotBlock block;block.access=17*id;block.bytes={2*fp16,2*affine,2*tq4};
+            block.tier=qsa::RamKvTier(id%3);
+            auto image=std::make_shared<qsa::RamKvImage>();image->owner=data;
+            image->key=data->data();image->value=data->data()+bytes;
+            image->key_bytes=image->value_bytes=bytes;image->key_bits=image->value_bits=uint8_t(bits);
+            image->key_state_bits=id%2?14:16;
+            auto archive=std::make_shared<mfq::cuda::QsaIndexArchive>();
+            if(id%4==0) {
+                block.image=image;archive->resident=index;
+            }else {
+                auto backing=std::make_shared<qsa::RamKvBacking>();
+                backing->key_bytes=backing->value_bytes=bytes;
+                backing->key_bits=backing->value_bits=uint8_t(bits);
+                backing->key_state_bits=image->key_state_bits;backing->tier=block.tier;
+                if(id%4==1) {
+                    auto source=std::make_shared<qsa::RamKvReadSource>();source->bytes=data->size();
+                    source->read_range_into=[data](size_t at,uint8_t* target,size_t count){std::memcpy(target,data->data()+at,count);};
+                    backing->source=source;
+                    auto indices=std::make_shared<qsa::RamKvReadSource>();indices->bytes=index->size();
+                    indices->read_range_into=[index](size_t at,uint8_t* target,size_t count){std::memcpy(target,index->data()+at,count);};
+                    archive->bind(indices,0,index->size());
+                }else {
+                    backing->store=store;backing->block=store->write(*data);block.tier=qsa::RamKvTier::Ssd;
+                    archive->store=store;archive->block=store->write(*index);
+                }
+                block.backing=backing;
+            }
+            state.kv->blocks.push_back(std::move(block));state.index.push_back(std::move(archive));
+        }
+        store->flush();
+        for(const auto span:{std::pair<size_t,size_t>{0,2400},{0,1031},{1031,1369}}) {
+            CudaPagedWriter reference;
+            for(int value:{state.heads,state.kv_heads,state.width,state.padded,state.index_width,state.ram_bits})
+                reference.scalar<uint32_t>(uint32_t(value));
+            const auto first=span.first/4,last=(span.first+span.second)/4;
+            reference.scalar<uint32_t>(uint32_t(last-first));
+            for(auto id=first;id<last;++id) {
+                const auto& b=state.kv->blocks[id];const auto image=b.read();const auto index=state.index[id]->read();
+                reference.scalar<uint32_t>(uint32_t(b.tier));for(auto n:b.bytes)reference.scalar<uint64_t>(n);
+                reference.scalar<uint64_t>(b.access);
+                for(unsigned n:{image.key_bits,image.value_bits,image.key_state_bits,image.value_state_bits})reference.scalar<uint32_t>(n);
+                for(auto n:{image.key.size(),image.value.size(),index->size()})reference.scalar<uint64_t>(n);
+                reference.raw(image.key.data(),image.key.size());reference.raw(image.value.data(),image.value.size());
+                reference.raw(index->data(),index->size());
+            }
+            const auto expected=std::move(reference).finish();CudaPagedWriter writer;
+            write_ram_qsa_page(writer,state,span.first,span.second,false);const auto actual=std::move(writer).finish();
+            require(*expected==*actual,"Batched prefix serialization changed persisted bytes");
+            if(span.first==0 && span.second==2400) {
+                CudaPagedReader reader(*actual);std::shared_ptr<mfq::cuda::QsaTqSession> restored;
+                read_ram_qsa_page(reader,actual,{},0,2400,false,restored,false);reader.expect_end();
+                CudaPagedWriter repeated;write_ram_qsa_page(repeated,*restored,0,2400,false);
+                require(*std::move(repeated).finish()==*actual,"Packed prefix roundtrip changed precision or payload");
+            }
+        }
+    }
+    std::cout<<"Packed QSA page CPU check: scalar-format byte parity, mixed tiers/backings, bounded batches, unaligned pages and roundtrip PASS\n";
+}
 void run(int bits,size_t page,const std::filesystem::path& directory) {
     setting("TYLOINFER_QSA_RAM_KV_BITS",std::to_string(bits));
     setting("TYLOINFER_QSA_RAM_BUDGET_BYTES","0");
@@ -106,6 +188,9 @@ void run(int bits,size_t page,const std::filesystem::path& directory) {
     state.payload=std::move(layers);state.qwen4_positions=tb::arange(prefix,f.dtype(tb::kInt64)).reshape({1,prefix});
     state.mtp.emplace();state.mtp->cache_pos=prefix;state.mtp->last_target_hidden=tb::zeros({1,1,5},f);
     Qwen4BlockSessionState head;head.adaptive_qsa=runtime.capture_session(prefix);
+    const auto& recurrent_layer=std::get<std::vector<Qwen4BlockSessionState>>(state.payload)[1];
+    head.convolution=recurrent_layer.convolution.clone();head.recurrent=recurrent_layer.recurrent.clone();
+    head.ple_convolution=recurrent_layer.ple_convolution.clone();
     // Real predictor layers own independent index archives. This fixture uses
     // the same values for both layers, but must preserve that ownership rule.
     for(auto& archive:head.adaptive_qsa->index)archive=std::make_shared<mfq::cuda::QsaIndexArchive>(*archive);
@@ -131,6 +216,18 @@ void run(int bits,size_t page,const std::filesystem::path& directory) {
     std::vector<CudaPagedPayload> payloads;
     for(size_t i=0;i<(prefix+page-1)/page;++i)payloads.push_back(encode_cuda_qwen4_paged_block(state,page,i));
     auto decoded=decode_cuda_qwen4_paged_session(payloads,state.tokens,page);
+    auto host_decoded=decode_cuda_qwen4_paged_session(payloads,state.tokens,page,true);
+    const auto& host_layer=std::get<std::vector<Qwen4BlockSessionState>>(host_decoded.payload)[1];
+    const auto& device_layer=std::get<std::vector<Qwen4BlockSessionState>>(decoded.payload)[1];
+    for(const auto* tensor:{&host_layer.convolution,&host_layer.recurrent,&host_layer.ple_convolution})
+        require(!tensor->is_cuda(),"Cold prefix allocated an incoming recurrent state on GPU");
+    for(const auto* tensor:{&device_layer.convolution,&device_layer.recurrent,&device_layer.ple_convolution})
+        require(tensor->is_cuda(),"Hot prefix lost its device recurrent snapshot");
+    same(host_layer.convolution,device_layer.convolution);same(host_layer.recurrent,device_layer.recurrent);
+    same(host_layer.ple_convolution,device_layer.ple_convolution);
+    require(!host_decoded.mtp->qwen4_blocks[0].recurrent.is_cuda() && decoded.mtp->qwen4_blocks[0].recurrent.is_cuda(),
+        "MTP recurrent prefix did not follow cold/hot placement");
+    same(host_decoded.mtp->qwen4_blocks[0].recurrent,decoded.mtp->qwen4_blocks[0].recurrent);
     auto packed=std::get<std::vector<Qwen4BlockSessionState>>(decoded.payload)[0].adaptive_qsa;
     require(packed && !packed->borrow_prefix,"Standalone codec unexpectedly enabled SSD borrowing");
     runtime.reset();failed_restore(runtime,*packed,false);
@@ -302,11 +399,24 @@ void large_tq4_prefill(int heads=6,int kh=2,int width=63) {
         "Large TQ4 append lost constant-value reconstruction");
     std::cout<<"8192-token forced TQ4 encoding and M4 continuation PASS kv_heads="<<kh<<" width="<<width<<" elapsed_ms="<<elapsed<<"\n";
 }
+#include "qwen4_host_session_test.h"
+#include "qsa_history_test.h"
 int main(int argc,char** argv)try {
+    const auto parent=argc>1?std::filesystem::path(argv[1]):std::filesystem::current_path()/"packed-prefix-test-data";
+    std::filesystem::create_directories(parent);
+    std::filesystem::path directory;
+    // Existing MTP checkpoints must not become a fresh run's ordinary baseline.
+    for(std::size_t id=0;;++id) {
+        directory=parent/("r"+std::to_string(id));
+        if(std::filesystem::create_directory(directory))break;
+    }
+    if(argc>2 && std::string(argv[2])=="packed-page"){packed_page_roundtrip(directory);index_archive_slices(directory/"index-slices");return 0;}
     int devices=0;if(cudaGetDeviceCount(&devices)!=cudaSuccess || !devices)return 77;
-    const auto directory=argc>1?std::filesystem::path(argv[1]):std::filesystem::current_path()/"packed-prefix-test-data";
+    if(argc>2 && std::string(argv[2])=="host-session"){check_qwen4_host_recurrent_restore();return 0;}
     if(argc>2 && std::string(argv[2])=="shared-codec"){shared_codec(true);return 0;}
     if(argc>2 && std::string(argv[2])=="large-tq4"){large_tq4_prefill();large_tq4_prefill(24,4,256);return 0;}
+    check_qwen4_host_recurrent_restore();
+    check_qsa_recall_history();
     index_archive_slices(directory/"index-slices");
     for(int bits:{16,8,4})for(size_t page:{size_t(64),size_t(65)})run(bits,page,directory);
     pressure(directory/"pressure");

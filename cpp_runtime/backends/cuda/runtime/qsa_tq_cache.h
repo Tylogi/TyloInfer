@@ -23,6 +23,9 @@ public:
     // Retire completed GPU append owners without joining background codecs.
     void collect();
     void release_idle();
+    // The owner must retire captured consumers before parking an empty cache.
+    // Its indexer allocation is restored by the next forward or session load.
+    void release_empty_indexer();
     void set_budget(std::size_t bytes);
     // Attention scratch follows the live allocator budget independently of FFN.
     int64_t prefill_rows(int64_t requested) const;

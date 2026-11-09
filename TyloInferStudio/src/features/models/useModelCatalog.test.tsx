@@ -17,13 +17,14 @@ import { DEFAULT_LOAD_CONTEXT } from './loadContextDefaults';
 const state = vi.hoisted(() => ({
   ready: false,
   connectionRevision: 0,
+  runtime: null as { prefill_modes: ('precise' | 'fast')[] } | null,
   refreshRuntime: vi.fn(),
   setSelectedModel: vi.fn(),
 }));
 vi.mock('../../app/RuntimeProvider', () => ({
   useRuntime: () => ({
     ...state,
-    runtime: null,
+    runtime: state.runtime,
     models: [],
     instances: [],
     jobs: [],
@@ -67,6 +68,7 @@ beforeEach(() => {
   useToastStore.getState().clearToasts();
   state.ready = false;
   state.connectionRevision = 0;
+  state.runtime = null;
   setApiBaseUrl('');
   localStorage.clear();
   vi.mocked(isStudio).mockReturnValue(false);
@@ -76,6 +78,26 @@ beforeEach(() => {
 });
 
 describe('useModelCatalog', () => {
+  it('sends fast prefill separately from automatic KV settings only when the worker supports it', async () => {
+    state.ready = true;
+    state.runtime = { prefill_modes: ['precise', 'fast'] };
+    vi.mocked(modelsApi.modelArtifacts).mockResolvedValue([{ ...artifact, format: 'gguf' }]);
+    const load = vi.spyOn(modelsApi, 'loadModel').mockResolvedValue({ operation_id: 'load', status: 'accepted' });
+    const { result, rerender } = renderHook(useModelCatalog, { wrapper: Wrapper });
+    await waitFor(() => expect(result.current.artifacts).toHaveLength(1));
+    act(() => result.current.openModelSettings(artifact.name));
+    act(() => result.current.setLoadContext({ ...DEFAULT_LOAD_CONTEXT, prefill_mode: 'fast' }));
+    await act(async () => result.current.loadArtifact(artifact.name));
+    expect(load).toHaveBeenLastCalledWith(artifact.name, null, 'auto', {
+      pin: false, device_ids: [], idle_ttl_seconds: null, prefill_mode: 'fast',
+    });
+    state.runtime = { prefill_modes: ['precise'] };
+    rerender();
+    await act(async () => result.current.loadArtifact(artifact.name));
+    expect(load).toHaveBeenLastCalledWith(artifact.name, null, 'auto', {
+      pin: false, device_ids: [], idle_ttl_seconds: null,
+    });
+  });
   it('registers standalone table assets without attempting to load them as models', async () => {
     const component = { ...artifact, asset_kind: 'engram' as const, loadable: false };
     vi.mocked(modelsApi.modelArtifacts).mockResolvedValue([component]);

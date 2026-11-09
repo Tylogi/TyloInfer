@@ -16,6 +16,7 @@ struct TqPrefillAttention {
     const void* gate=nullptr;std::int64_t gate_token_stride=0,gate_head_stride=0;
     bool query_half=false,gate_half=false,output_half=false;
     cudaStream_t stream=nullptr;
+    const std::int32_t* compact_blocks=nullptr;
 };
 // Decoded K/V are [four-token block, KV head, token, padded channel].
 // A byte stores the four visibility bits of one selected microblock.

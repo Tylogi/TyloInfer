@@ -122,7 +122,7 @@ export const modelsApi = {
     model: string,
     contextSize: number | null = null,
     prefillChunkSize: number | 'auto' = 'auto',
-    policy: { pin?: boolean; idle_ttl_seconds?: number | null; device_ids?: string[]; context_management?: ModelLoadContextSettings; gguf_companions?: string[] } = {},
+    policy: { pin?: boolean; idle_ttl_seconds?: number | null; device_ids?: string[]; context_management?: ModelLoadContextSettings; gguf_companions?: string[]; prefill_mode?: 'precise' | 'fast' } = {},
   ): Promise<{ operation_id: string; status: 'accepted' }> {
     return request('/api/v1/models/load', {
       method: 'POST',
@@ -130,6 +130,7 @@ export const modelsApi = {
         model,
         context_size: contextSize,
         prefill_chunk_size: prefillChunkSize,
+        ...(policy.prefill_mode ? { prefill_mode: policy.prefill_mode } : {}),
         pin: policy.pin ?? false,
         ...(policy.context_management ? { context_management: {
           automatic: policy.context_management.automatic, ssd_kv: policy.context_management.ssd_kv,

@@ -110,6 +110,10 @@ public:
         const std::vector<std::int64_t>& token_ids,
         std::string_view extra_key = {},
         bool record_query = true);
+    // Find a retained partial checkpoint hidden by a longer full-block chain.
+    PrefixMatch match_shorter_tail(const std::vector<std::int64_t>& token_ids,
+        const PrefixMatch& longer, std::size_t minimum_tokens,
+        std::string_view extra_key = {});
 
     // Record the effective prefix actually restored by a higher-level codec.
     // Hybrid caches may need to back off from a structurally matched KV chain

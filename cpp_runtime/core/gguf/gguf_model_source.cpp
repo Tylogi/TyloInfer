@@ -967,52 +967,6 @@ GgufModelSource::GgufModelSource(const std::filesystem::path& path,
         }
     }
     if (!mixed_experts.empty()) impl_->metadata["gguf_mixed_experts"] = mixed_experts.dump();
-    if (meta.contains("prism.hadamard.version")) {
-        const auto version = meta.at("prism.hadamard.version").get<int>();
-        const auto block = meta.value("prism.hadamard.block_size", int64_t{0});
-        const auto mode = meta.value("prism.hadamard.sign_mode", std::string{});
-        if ((version != 1 && version != 2) || block < 1 || (block & (block - 1)) || block > INT32_MAX ||
-            meta.value("prism.hadamard.transform", std::string{}) != "normalized-sylvester-walsh-hadamard" ||
-            meta.value("prism.hadamard.axis", std::string{}) != "input-last-dimension" ||
-            (mode != "explicit" && mode != "identity"))
-            throw std::runtime_error("unsupported GGUF Hadamard transform metadata");
-        if (!meta.value("prism.hadamard.inverse_weight_names", json::array()).empty() ||
-            meta.value("prism.hadamard.tied_output", false) || meta.value("prism.hadamard.gdn_v_grouped", false))
-            throw std::runtime_error("GGUF inverse embedding or grouped GDN Hadamard layout is unsupported");
-        std::map<int64_t, std::vector<int8_t>> signs;
-        if (mode == "explicit") {
-            const auto widths = meta.at("prism.hadamard.sign_widths").get<std::vector<int64_t>>();
-            const auto values = meta.at("prism.hadamard.sign_values").get<std::vector<int>>();
-            std::size_t offset = 0;
-            for (const auto width : widths) {
-                if (width < 1 || width % block || uint64_t(width) > values.size() - offset || signs.count(width))
-                    throw std::runtime_error("invalid GGUF Hadamard sign widths");
-                std::vector<int8_t> pattern;
-                for (int64_t i = 0; i < width; ++i) {
-                    const int value = values[offset++];
-                    if (value != 1 && value != -1) throw std::runtime_error("invalid GGUF Hadamard sign value");
-                    pattern.push_back(int8_t(value));
-                }
-                signs.emplace(width, std::move(pattern));
-            }
-            if (widths.empty() || offset != values.size()) throw std::runtime_error("GGUF Hadamard sign vector lengths differ");
-        }
-        json transforms = json::object();
-        const auto weights = meta.at("prism.hadamard.weight_names").get<std::vector<std::string>>();
-        if (weights.empty()) throw std::runtime_error("GGUF Hadamard weight list is empty");
-        for (const auto& original : weights) {
-            const auto name = canonical_name(original, &meta);
-            const auto record = impl_->records.find(name);
-            if (record == impl_->records.end() || !record->second.tensor.shape || record->second.tensor.shape->size() < 2 ||
-                record->second.tensor.dtype.rfind("GGUF_", 0) != 0 || transforms.contains(name))
-                throw std::runtime_error("invalid or unsupported GGUF Hadamard weight");
-            const auto width = record->second.tensor.shape->back();
-            if (width % block || (mode == "explicit" && !signs.count(width)))
-                throw std::runtime_error("GGUF Hadamard weight has no compatible sign vector");
-            transforms[name] = {{"block_size", block}, {"signs", mode == "explicit" ? json(signs.at(width)) : json::array()}};
-        }
-        impl_->metadata["gguf_hadamard"] = transforms.dump();
-    }
     if (impl_->arch == "qwen4exp") {
         const auto blocks = meta.at("qwen4exp.block_count").get<int64_t>();
         for (int64_t block = 0; block < blocks; ++block) {
@@ -1157,9 +1111,8 @@ GgufModelSource::GgufModelSource(const std::filesystem::path& path,
             meta.value("prism.hadamard.axis", std::string{}) != "input-last-dimension" ||
             (mode != "explicit" && mode != "identity"))
             throw std::runtime_error("unsupported GGUF Hadamard transform metadata");
-        if (!meta.value("prism.hadamard.inverse_weight_names", json::array()).empty() ||
-            meta.value("prism.hadamard.tied_output", false) || meta.value("prism.hadamard.gdn_v_grouped", false))
-            throw std::runtime_error("GGUF inverse embedding or grouped GDN Hadamard layout is unsupported");
+        if (meta.value("prism.hadamard.tied_output", false))
+            throw std::runtime_error("GGUF tied Hadamard output layout is unsupported");
         std::map<int64_t, std::vector<int8_t>> signs;
         if (mode == "explicit") {
             const auto widths = meta.at("prism.hadamard.sign_widths").get<std::vector<int64_t>>();
@@ -1179,8 +1132,19 @@ GgufModelSource::GgufModelSource(const std::filesystem::path& path,
             if (widths.empty() || offset != values.size()) throw std::runtime_error("GGUF Hadamard sign vector lengths differ");
         }
         json transforms = json::object();
-        const auto weights = meta.at("prism.hadamard.weight_names").get<std::vector<std::string>>();
+        auto weights = meta.at("prism.hadamard.weight_names").get<std::vector<std::string>>();
         if (weights.empty()) throw std::runtime_error("GGUF Hadamard weight list is empty");
+        for(const auto& inverse:meta.value("prism.hadamard.inverse_weight_names",std::vector<std::string>{})) {
+            if(inverse!="token_embd.weight")
+                throw std::runtime_error("unsupported GGUF inverse Hadamard lookup table");
+            weights.push_back(inverse);
+        }
+        const bool grouped=meta.value("prism.hadamard.gdn_v_grouped",false);
+        const auto key_heads=meta.value(impl_->arch+".ssm.group_count",int64_t(0));
+        const auto value_heads=meta.value(impl_->arch+".ssm.time_step_rank",int64_t(0));
+        if(grouped && (key_heads<=0 || value_heads<=0 || value_heads%key_heads || value_heads>INT32_MAX))
+            throw std::runtime_error("invalid GGUF grouped GDN Hadamard heads");
+        json grouped_weights=json::object();
         for (const auto& original : weights) {
             const auto name = canonical_name(original, &meta);
             const auto record = impl_->records.find(name);
@@ -1190,10 +1154,15 @@ GgufModelSource::GgufModelSource(const std::filesystem::path& path,
             const auto width = record->second.tensor.shape->back();
             if (width % block || (mode == "explicit" && !signs.count(width)))
                 throw std::runtime_error("GGUF Hadamard weight has no compatible sign vector");
+            if(grouped && original.size()>=15 && original.compare(original.size()-15,15,".ssm_out.weight")==0) {
+                if(width%value_heads)throw std::runtime_error("GGUF grouped GDN width differs from value heads");
+                grouped_weights[name]=json::array({key_heads,value_heads});
+            }
             transforms[name] = {{"block_size", block}, {"signs", mode == "explicit" ? json(signs.at(width)) : json::array()}};
             impl_->hadamard.emplace(name,HadamardTransform{block,mode=="explicit"?signs.at(width):std::vector<int8_t>{}});
         }
         impl_->metadata["gguf_hadamard"] = transforms.dump();
+        if(grouped)impl_->metadata["gguf_hadamard_grouped_gdn"]=grouped_weights.dump();
         impl_->metadata["gguf_requires_hadamard"] = "true";
     }
 }

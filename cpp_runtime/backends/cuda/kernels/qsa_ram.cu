@@ -48,6 +48,20 @@ __device__ void copy_image(std::uint8_t* out,const std::uint8_t* in,unsigned byt
     }
 }
 
+__global__ void copy_prefill_images(const RamBlockView* sources,int capacity,
+        const std::int32_t* ids,const TqBlockView* destinations,TqBlockView* views) {
+    const int id=ids[blockIdx.x];
+    if(id<0 || id>=capacity){asm volatile("trap;");return;}
+    const auto source=sources[id];const auto destination=destinations[blockIdx.x];
+    if(!source.image.key || !source.image.value ||
+            source.image.key_bits!=destination.key_bits || source.image.value_bits!=destination.value_bits) {
+        asm volatile("trap;");return;
+    }
+    copy_image(const_cast<std::uint8_t*>(destination.key),source.image.key,source.key_bytes);
+    copy_image(const_cast<std::uint8_t*>(destination.value),source.image.value,source.value_bytes);
+    if(!threadIdx.x)views[id]=destination;
+}
+
 __global__ void reset_cache_slots(RamCacheSlot* slots,int count) {
     const auto at=std::int64_t(blockIdx.x)*blockDim.x+threadIdx.x;
     if(at<count)slots[at]=RamCacheSlot{};
@@ -336,6 +350,14 @@ int tq_publish_ram_sources(RamBlockView* sources,int capacity,const std::int32_t
     if(count<0 || capacity<0)return cudaErrorInvalidValue;if(!count)return cudaSuccess;
     if(!sources || !ids || !images || !capacity)return cudaErrorInvalidValue;
     publish_sources<<<unsigned((std::int64_t(count)+255)/256),256,0,stream>>>(sources,ids,images,count,capacity,live);
+    return cudaGetLastError();
+}
+int tq_copy_ram_prefill(const RamBlockView* sources,int capacity,const std::int32_t* ids,
+        const TqBlockView* destinations,TqBlockView* views,int count,cudaStream_t stream) {
+    if(count<0 || capacity<0)return cudaErrorInvalidValue;
+    if(!count)return cudaSuccess;
+    if(!sources || !ids || !destinations || !views || !capacity)return cudaErrorInvalidValue;
+    copy_prefill_images<<<count,256,0,stream>>>(sources,capacity,ids,destinations,views);
     return cudaGetLastError();
 }
 int tq_publish_ram_append(RamBlockView* sources,int capacity,const TqBlockView* live,

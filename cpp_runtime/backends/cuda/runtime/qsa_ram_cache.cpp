@@ -1,4 +1,5 @@
 #include "qsa_ram_cache.h"
+#include "mapped_storage.h"
 #include "kernels/qsa_ram.h"
 #include "mfq_cuda_context.h"
 #include "mfq_cuda_resident_allocations.h"
@@ -76,7 +77,7 @@ struct RamAccount {
 struct PrefillTransfer {
     std::shared_ptr<RamAccount> account;
     std::size_t charge=0,packet_bytes=0;
-    std::array<tb::Tensor,2> packets,records;
+    std::array<tb::Tensor,2> packets,records,ids;
     std::array<cudaEvent_t,2> done{};
     ~PrefillTransfer() {
         for(auto event:done)if(event) {
@@ -642,6 +643,7 @@ static std::shared_ptr<void> hold_worker_workspace(std::shared_ptr<RamWorker> ow
 }
 void prepare_qsa_ram_workspace(std::size_t bytes,
         const std::function<QsaRamWorkspaceProgress()>& reclaim) {
+    if(mfq::sample_host_memory().available_host_bytes()>=bytes)return;
     auto previous=reclaim();bool retried=false;
     while(mfq::sample_host_memory().available_host_bytes()<bytes) {
         const auto current=reclaim();
@@ -717,7 +719,9 @@ struct QsaRamCache::Impl {
                 }
                 return result;
             });
-        sources=tb::zeros({capacity,int64_t(sizeof(tq::RamBlockView))},options.dtype(tb::kUInt8));
+        sources=host_metadata_enabled(device)?
+            zero_mapped_metadata(capacity,sizeof(tq::RamBlockView),options,device):
+            tb::zeros({capacity,int64_t(sizeof(tq::RamBlockView))},options.dtype(tb::kUInt8));
         const auto tq4=tq4_bytes(rows);
         cache_stride=((b==16?2*fp16_bytes:b==8?2*affine_bytes:2*tq4)+31)&~std::size_t(15);
         spill_stride=(2*tq4+31)&~std::size_t(15);
@@ -1167,19 +1171,38 @@ QsaRamCache::Tensor QsaRamCache::prepared_views()const {
     if(!impl_->arena)throw std::logic_error("QSA RAM staging arena was not prepared");
     return impl_->arena->views;
 }
-std::optional<QsaRamPrefillStage> QsaRamCache::stage_prefill(std::size_t blocks) {
+std::optional<QsaRamPrefillStage> QsaRamCache::stage_prefill(std::size_t blocks,std::size_t protected_bytes) {
+    return stage_prefill_impl(blocks,nullptr,protected_bytes);
+}
+std::optional<QsaRamPrefillStage> QsaRamCache::stage_prefill_selected(std::size_t blocks,
+        const std::vector<std::size_t>& ids,std::size_t protected_bytes) {
+    for(std::size_t i=0;i<ids.size();++i)
+        if(ids[i]>=blocks || (i && ids[i]<=ids[i-1]))throw std::invalid_argument("Prefill block IDs must be sorted, unique and in range");
+    return stage_prefill_impl(blocks,&ids,protected_bytes);
+}
+std::optional<QsaRamPrefillStage> QsaRamCache::stage_prefill_impl(std::size_t blocks,
+        const std::vector<std::size_t>* ids,std::size_t protected_bytes) {
     auto& s=*impl_;if(!blocks)return {};
+    const auto selected_count=ids?ids->size():blocks;
+    struct ReadOrder {std::size_t index,id;unsigned kind;std::uintptr_t source;std::uint64_t offset;};
     const auto stream=mfq_current_cuda_stream();cudaStreamCaptureStatus capture;
     check(cudaStreamIsCapturing(stream,&capture));
     if(capture!=cudaStreamCaptureStatusNone)throw std::logic_error("Layer KV staging requires uncaptured prefill");
     constexpr auto maximum_io_records=(1ULL<<20)/sizeof(tq::RamKvReadInto);
-    const auto io_bytes=tq::RamKvStore::sequential_read_workspace(std::min(blocks,std::size_t(maximum_io_records)));
+    const auto read_bytes=tq::RamKvStore::sequential_read_workspace(std::min(selected_count,std::size_t(maximum_io_records)));
+    constexpr auto order_stride=sizeof(ReadOrder)+sizeof(std::size_t)+sizeof(tq::RamKvSnapshotBlock);
+    if(ids && selected_count>(SIZE_MAX-read_bytes)/order_stride)throw std::overflow_error("Prefill I/O order size overflows");
+    const auto io_bytes=read_bytes+(ids?selected_count*order_stride:0);
     const auto io_reservation=hold_worker_workspace(s.worker,io_bytes);
     if(mfq::sample_host_memory().available_host_bytes()<io_bytes)
         prepare_qsa_ram_workspace(io_bytes,[this]{return reclaim_shared_workspace();});
     // Re-evaluate physical pressure before taking leases that prevent KV
     // reclamation. Waiting only for an earlier codec plan uses a stale budget.
-    const auto snapshot=this->snapshot(blocks);
+    s.worker->collect();
+    wait();
+    if(ids && blocks>s.store->stats().blocks)throw std::out_of_range("QSA snapshot exceeds context");
+    const auto snapshot=ids?std::shared_ptr<tq::RamKvSnapshot>{}:s.store->snapshot(blocks);
+    auto selected=ids?s.store->sources(*ids):std::vector<tq::RamKvSnapshotBlock>{};
     std::size_t bytes=0,largest=0;
     const auto image_bytes=[](const tq::RamKvSnapshotBlock& source) {
         const auto kb=source.image?source.image->key_bytes:source.backing->key_bytes;
@@ -1189,7 +1212,8 @@ std::optional<QsaRamPrefillStage> QsaRamCache::stage_prefill(std::size_t blocks)
         if(extent>SIZE_MAX-15 || vb>SIZE_MAX-15-extent)throw std::overflow_error("Prefill KV image overflows");
         return (extent+vb+15)&~std::size_t(15);
     };
-    for(const auto& source:snapshot->blocks) {
+    for(std::size_t i=0;i<selected_count;++i) {
+        const auto& source=ids?selected[i]:snapshot->blocks[i];
         if(!source.image && !source.backing)throw std::runtime_error("Prefill KV source is absent");
         const auto count=image_bytes(source);
         if(count>SIZE_MAX-bytes)throw std::overflow_error("Prefill KV layer overflows");
@@ -1199,7 +1223,33 @@ std::optional<QsaRamPrefillStage> QsaRamCache::stage_prefill(std::size_t blocks)
     const auto free=context->available_memory(),workspace=context->workspace_available();
     const auto available=free>SIZE_MAX-workspace?SIZE_MAX:free+workspace;
     const auto table_bytes=s.live.nbytes();
-    if(table_bytes>available || bytes>available-table_bytes)return {};
+    if(protected_bytes>available || table_bytes>available-protected_bytes ||
+            bytes>available-protected_bytes-table_bytes)return {};
+    std::vector<std::size_t> read_order;
+    if(ids && selected_count>1) {
+        std::vector<ReadOrder> order;order.reserve(selected_count);
+        for(std::size_t i=0;i<selected_count;++i) {
+            const auto id=(*ids)[i];const auto& source=selected[i];
+            if(source.image)order.push_back({i,id,0,0,reinterpret_cast<std::uintptr_t>(source.image->key)});
+            else if(source.backing->source) {
+                const auto& backing=*source.backing;const auto& input=*backing.source;
+                if(input.file_reader) {
+                    if(backing.offset>UINT64_MAX-input.file_offset)throw std::out_of_range("Prefill file offset overflows");
+                    order.push_back({i,id,1,reinterpret_cast<std::uintptr_t>(input.file_reader.get()),input.file_offset+backing.offset});
+                }else order.push_back({i,id,2,reinterpret_cast<std::uintptr_t>(backing.source.get()),backing.offset});
+            }else {
+                const auto& backing=*source.backing;
+                order.push_back({i,id,3,reinterpret_cast<std::uintptr_t>(backing.store.get()),backing.store->read_offset(backing.block)});
+            }
+        }
+        const auto less=[](const ReadOrder& a,const ReadOrder& b) {
+            return std::tie(a.kind,a.source,a.offset,a.id)<std::tie(b.kind,b.source,b.offset,b.id);
+        };
+        if(!std::is_sorted(order.begin(),order.end(),less))std::sort(order.begin(),order.end(),less);
+        read_order.reserve(selected_count);for(const auto& entry:order)read_order.push_back(entry.index);
+        // Plan across the complete selected union before packetizing. Block
+        // IDs stay unchanged in the GPU descriptor table and attention mask.
+    }
     constexpr auto maximum_records=(1ULL<<20)/sizeof(tq::RamKvReadInto);
     const auto packet_bytes=std::max(largest,std::size_t(8ULL<<20));
     auto& retained=s.worker->prefill_transfer;
@@ -1211,8 +1261,9 @@ std::optional<QsaRamPrefillStage> QsaRamCache::stage_prefill(std::size_t blocks)
         for(int slot=0;slot<2;++slot) {
             next->packets[slot]=tb::empty({int64_t(packet_bytes)},cpu);
             next->records[slot]=tb::empty({int64_t(maximum_records*sizeof(tq::TqBlockView))},cpu);
+            next->ids[slot]=tb::empty({int64_t(maximum_records)},cpu.dtype(tb::kInt32));
         }
-        for(int slot=0;slot<2;++slot)next->charge+=next->packets[slot].nbytes()+next->records[slot].nbytes();
+        for(int slot=0;slot<2;++slot)next->charge+=next->packets[slot].nbytes()+next->records[slot].nbytes()+next->ids[slot].nbytes();
         next->account->physical.fetch_add(next->charge);retained=std::move(next);
     }
     // All layers on this model stream share the ring. Each slot's event
@@ -1223,18 +1274,34 @@ std::optional<QsaRamPrefillStage> QsaRamCache::stage_prefill(std::size_t blocks)
     result.payload.record_stream(reinterpret_cast<std::uintptr_t>(stream));
     result.views.record_stream(reinterpret_cast<std::uintptr_t>(stream));
     constexpr int ring=2;
-    std::size_t first=0,offset=0,turn=0;bool submitted=false;
+    const auto source_at=[&](std::size_t index)->const tq::RamKvSnapshotBlock& {
+        return ids?selected[index]:snapshot->blocks[index];
+    };
+    const auto can_gather=[&](std::size_t index) {
+        const auto id=ids?(*ids)[index]:index;const auto& source=source_at(index);
+        if(!s.mapped_capability || !source.image || id>=s.host_sources.size())return false;
+        const auto& published=s.host_sources[id];
+        return published.generation==source.generation && published.image.key && published.image.value &&
+            published.key_bytes==source.image->key_bytes && published.value_bytes==source.image->value_bytes;
+    };
+    std::size_t first=0,offset=0,turn=0,gathered_bytes=0;bool submitted=false;
+    std::shared_ptr<void> retained_sources;cudaEvent_t source_done=nullptr;
     try {
-        while(first<blocks) {
+        while(first<selected_count) {
             const auto slot=turn++%ring;
             if(host->done[slot])check(cudaEventSynchronize(host->done[slot]));
             auto* records=host->records[slot].data_ptr<tq::TqBlockView>();
+            auto* indices=host->ids[slot].data_ptr<std::int32_t>();
             std::vector<tq::RamKvReadInto> reads;
             std::size_t used=0,end=first,packed=0;
+            const bool resident_packet=can_gather(read_order.empty()?first:read_order[first]);
             // Bound the CPU request descriptors independently of KV image
             // sizes; this packet limit never limits the GPU attention tile.
-            while(end<blocks && reads.size()<maximum_records) {
-                const auto& source=snapshot->blocks[end];const auto count=image_bytes(source);
+            while(end<selected_count && end-first<maximum_records) {
+                const auto index=read_order.empty()?end:read_order[end];
+                const auto id=ids?(*ids)[index]:index;
+                const auto& source=source_at(index);const auto count=image_bytes(source);
+                if(can_gather(index)!=resident_packet)break;
                 if(count>packet_bytes-used)break;
                 const auto kb=source.image?source.image->key_bytes:source.backing->key_bytes;
                 const auto vb=source.image?source.image->value_bytes:source.backing->value_bytes;
@@ -1245,40 +1312,74 @@ std::optional<QsaRamPrefillStage> QsaRamCache::stage_prefill(std::size_t blocks)
                 auto* device=result.payload.data_ptr<std::uint8_t>()+offset+used;
                 records[end-first]={device,device+((kb+15)&~std::size_t(15)),
                     tq::tq_precision_flags(key_bits,key_states),tq::tq_precision_flags(value_bits,value_states)};
-                reads.push_back({&source,host->packets[slot].data_ptr<std::uint8_t>()+packed,kb+vb});
+                indices[end-first]=std::int32_t(id);
+                if(!resident_packet)reads.push_back({&source,host->packets[slot].data_ptr<std::uint8_t>()+packed,kb+vb});
                 packed+=kb+vb;
                 used+=count;++end;
             }
-            s.store->read_packed_cpu_into_batch(reads);
-            // Expand backwards in the existing packet so unread source bytes
-            // survive overlap while device descriptors retain their alignment.
-            std::size_t expanded=used;
-            for(auto i=reads.size();i-->0;) {
-                const auto& source=*reads[i].source;
-                const auto kb=source.image?source.image->key_bytes:source.backing->key_bytes;
-                const auto vb=source.image?source.image->value_bytes:source.backing->value_bytes;
-                const auto extent=(kb+15)&~std::size_t(15);
-                expanded-=image_bytes(source);
-                auto* destination=host->packets[slot].data_ptr<std::uint8_t>()+expanded;
-                if(destination!=reads[i].destination || extent!=kb) {
-                    std::memmove(destination+extent,reads[i].destination+kb,vb);
-                    std::memmove(destination,reads[i].destination,kb);
+            if(!resident_packet) {
+                s.store->read_packed_cpu_into_batch(reads);
+                // Expand backwards so unread bytes survive alignment padding.
+                std::size_t expanded=used;
+                for(auto i=reads.size();i-->0;) {
+                    const auto& source=*reads[i].source;
+                    const auto kb=source.image?source.image->key_bytes:source.backing->key_bytes;
+                    const auto vb=source.image?source.image->value_bytes:source.backing->value_bytes;
+                    const auto extent=(kb+15)&~std::size_t(15);
+                    expanded-=image_bytes(source);
+                    auto* destination=host->packets[slot].data_ptr<std::uint8_t>()+expanded;
+                    if(destination!=reads[i].destination || extent!=kb) {
+                        std::memmove(destination+extent,reads[i].destination+kb,vb);
+                        std::memmove(destination,reads[i].destination,kb);
+                    }
                 }
+                check(cudaMemcpyAsync(result.payload.data_ptr<std::uint8_t>()+offset,
+                    host->packets[slot].data_ptr(),used,cudaMemcpyHostToDevice,stream));submitted=true;
             }
-            check(cudaMemcpyAsync(result.payload.data_ptr<std::uint8_t>()+offset,
-                host->packets[slot].data_ptr(),used,cudaMemcpyHostToDevice,stream));submitted=true;
-            check(cudaMemcpyAsync(result.views.data_ptr<tq::TqBlockView>()+first,records,
+            if(ids || resident_packet) {
+                void* mapped_records=nullptr;void* mapped_ids=nullptr;
+                check(cudaHostGetDevicePointer(&mapped_records,records,0));
+                check(cudaHostGetDevicePointer(&mapped_ids,indices,0));
+                if(resident_packet) {
+                    check(tq::tq_copy_ram_prefill(s.sources.data_ptr<tq::RamBlockView>(),s.capacity,
+                        static_cast<const std::int32_t*>(mapped_ids),static_cast<const tq::TqBlockView*>(mapped_records),
+                        result.views.data_ptr<tq::TqBlockView>(),int(end-first),stream));
+                    submitted=true;gathered_bytes+=used;
+                }else check(tq::tq_scatter_prefill_views(static_cast<const tq::TqBlockView*>(mapped_records),
+                    static_cast<const std::int32_t*>(mapped_ids),result.views.data_ptr<tq::TqBlockView>(),int(end-first),stream));
+            }else check(cudaMemcpyAsync(result.views.data_ptr<tq::TqBlockView>()+first,records,
                 (end-first)*sizeof(*records),cudaMemcpyHostToDevice,stream));
+            if(resident_packet && (end==selected_count || !can_gather(read_order.empty()?end:read_order[end]))) {
+                if(!source_done)check(cudaEventCreateWithFlags(&source_done,cudaEventDisableTiming));
+                check(cudaEventRecord(source_done,stream));
+            }
             if(!host->done[slot])check(cudaEventCreateWithFlags(&host->done[slot],cudaEventDisableTiming));
             check(cudaEventRecord(host->done[slot],stream));offset+=used;first=end;
         }
+        if(gathered_bytes) {
+            const auto status=cudaEventQuery(source_done);
+            if(status==cudaSuccess) {check(cudaEventDestroy(source_done));source_done=nullptr;}
+            else {
+                if(status!=cudaErrorNotReady)check(status);
+                if(ids)retained_sources=std::make_shared<std::vector<tq::RamKvSnapshotBlock>>(std::move(selected));
+                else retained_sources=snapshot;
+                RamRetirement pending;pending.temporary=retained_sources;pending.done=source_done;
+                s.worker->retire(std::move(pending));source_done=nullptr;
+            }
+        }
     }catch(...){
         if(submitted)(void)cudaStreamSynchronize(stream);
+        if(source_done)(void)cudaEventDestroy(source_done);
         throw;
     }
     if(const auto* trace=std::getenv("TYLOINFER_TRACE_QSA_TQ");trace && trace[0]=='1')std::fprintf(stderr,
-        "native_qsa_prefill_layer_stage actual_match=1 blocks=%zu encoded_bytes=%zu original_precision=1 packet_bytes=%zu payload_cuda=%d descriptors_cuda=%d pinned_ring_bytes=%zu shared_host_ring=1\n",
-        blocks,bytes,packet_bytes,int(result.payload.is_cuda()),int(result.views.is_cuda()),host->charge);
+        "native_qsa_prefill_layer_stage actual_match=1 blocks=%zu selected_blocks=%zu encoded_bytes=%zu original_precision=1 packet_bytes=%zu payload_cuda=%d descriptors_cuda=%d pinned_ring_bytes=%zu shared_host_ring=1\n",
+        blocks,selected_count,bytes,packet_bytes,int(result.payload.is_cuda()),int(result.views.is_cuda()),host->charge);
+    if(gathered_bytes)if(const auto* trace=std::getenv("TYLOINFER_TRACE_KERNEL_DISPATCH");trace && trace[0]=='1') {
+        static thread_local bool reported=false;
+        if(!reported){reported=true;std::fprintf(stderr,
+            "native_qsa_prefill_ram_gather actual_match=1 bytes=%zu original_precision=1 cpu_payload_copy=0\n",gathered_bytes);}
+    }
     return result;
 }
 bool QsaRamCache::collect_graph_selection(const Tensor& selected,int queries,int count) {
@@ -1530,6 +1631,10 @@ QsaRamCache::Tensor QsaRamCache::stage(const Tensor& selected,int queries,int co
 void QsaRamCache::observe(const std::vector<double>& hits,std::uint64_t epoch) {
     auto& s=*impl_;s.drain();std::vector<std::size_t> touched;
     const auto blocks=s.store->stats().blocks;for(std::size_t id=0;id<std::min(blocks,hits.size());++id)if(hits[id]>0)touched.push_back(id);
+    observe_selected(touched,epoch);
+}
+void QsaRamCache::observe_selected(const std::vector<std::size_t>& touched,std::uint64_t epoch) {
+    auto& s=*impl_;s.drain();
     s.store->touch(touched,epoch);
     if(s.maintenance.valid()) {
         if(s.maintenance.wait_for(std::chrono::seconds(0))!=std::future_status::ready)return;
@@ -1650,7 +1755,9 @@ void QsaRamCache::restore(const tq::RamKvSnapshot& state,bool borrow_prefix,
     const auto append=s.restore_append_blocks(state.blocks.size());
     const auto fresh_bytes=2*(s.bits==16?s.fp16_bytes:s.affine_bytes);
     const auto growth=append && fresh_bytes>SIZE_MAX/append?SIZE_MAX:append*fresh_bytes;
-    const auto append_bytes=s.ssd_enabled?growth:0;
+    // Match the maintenance margin before hydrating cold images, so the
+    // first append does not immediately evict freshly restored payload.
+    const auto append_bytes=s.ssd_enabled?std::max(growth,physical_budget-s.maintenance_budget(physical_budget)):0;
     const auto budget=physical_budget;
     try{s.store->restore(state,budget,borrow_prefix,false,block_read,
         [&](const auto& image,std::size_t remaining){return s.pool->allocate(image,&remaining);},append_bytes);

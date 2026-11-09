@@ -48,7 +48,8 @@ void rotate_gpu(const GgufInputRotation& rotation, const tb::Tensor& input, cons
 }
 
 bool GgufInputRotation::equivalent(const GgufInputRotation& other) const {
-    return block == other.block && signs_cpu == other.signs_cpu;
+    return block == other.block && signs_cpu == other.signs_cpu &&
+        value_heads == other.value_heads && key_heads == other.key_heads;
 }
 bool same_gguf_rotation(const std::shared_ptr<const GgufInputRotation>& a,
         const std::shared_ptr<const GgufInputRotation>& b) {
@@ -58,10 +59,33 @@ void GgufInputRotation::apply_cpu(float* values,std::int64_t rows,std::int64_t w
     if(block<=0 || (block&(block-1)) || rows<0 || width<=0 || width%block || rows>INT64_MAX/width ||
             (!signs_cpu.empty() && int64_t(signs_cpu.size())!=width))
         throw std::invalid_argument("GGUF CPU Hadamard geometry");
+    const auto permute=[&](bool inverse) {
+        if(!value_heads)return;
+        if(key_heads<=0 || value_heads%key_heads || width%value_heads)
+            throw std::invalid_argument("GGUF grouped GDN Hadamard geometry");
+        const auto head_width=width/value_heads;
+        const auto ratio=value_heads/key_heads;
+        std::vector<float> row(width);
+        for(int64_t r=0;r<rows;++r) {
+            auto* x=values+r*width;
+            for(int h=0;h<value_heads;++h) {
+                const auto grouped=(h%key_heads)*ratio+h/key_heads;
+                for(int64_t d=0;d<head_width;++d)
+                    row[(inverse?h:grouped)*head_width+d]=x[(inverse?grouped:h)*head_width+d];
+            }
+            std::copy(row.begin(),row.end(),x);
+        }
+    };
+    if(!adjoint)permute(false);
     rotate_cpu(values,rows,width,block,signs_cpu,adjoint);
+    if(adjoint)permute(true);
     if(half)for(int64_t i=0;i<rows*width;++i)values[i]=ggml_fp16_to_fp32(ggml_fp32_to_fp16(values[i]));
 }
 void GgufInputRotation::apply_inplace(tb::Tensor input, bool adjoint) const {
+    if(value_heads) {
+        input.copy_(apply(input,adjoint));
+        return;
+    }
     TYLOINFER_RUNTIME_CHECK(block > 0 && !(block & (block - 1)) && input.dim() >= 1 && input.is_contiguous() && input.size(-1) > 0 &&
         input.size(-1) % block == 0 && (signs_cpu.empty() || int64_t(signs_cpu.size()) == input.size(-1)) &&
         (input.scalar_type() == tb::kFloat32 || input.scalar_type() == tb::kFloat16),
@@ -84,12 +108,28 @@ tb::Tensor GgufInputRotation::apply(tb::Tensor input, bool adjoint) const {
     TYLOINFER_RUNTIME_CHECK(block > 0 && !(block & (block - 1)) && source.dim() >= 1 && source.size(-1) > 0 &&
         source.size(-1) % block == 0 && (signs_cpu.empty() || int64_t(signs_cpu.size()) == source.size(-1)),
         "GGUF Hadamard activation geometry differs");
+    const auto width=source.size(-1),rows=source.numel()/width;
     if (source.is_cuda()) {
+        if(value_heads && (key_heads<=0 || value_heads%key_heads || width%value_heads))
+            throw std::invalid_argument("GGUF grouped GDN Hadamard geometry");
+        if(value_heads && !adjoint)
+            source=source.reshape({rows,value_heads/key_heads,key_heads,width/value_heads})
+                .transpose(1,2).contiguous().reshape(source.sizes());
         auto result = tb::empty_like(source);
         if (source.numel()) rotate_gpu(*this, source, result, adjoint);
+        if(value_heads && adjoint)
+            result=result.reshape({rows,key_heads,value_heads/key_heads,width/value_heads})
+                .transpose(1,2).contiguous().reshape(source.sizes());
         return result;
     }
-    auto result = source.clone(); apply_inplace(result, adjoint);
+    auto result=source.clone();
+    if(result.scalar_type()==tb::kFloat32)
+        apply_cpu(result.data_ptr<float>(),rows,width,false,adjoint);
+    else {
+        auto values=result.to(tb::kFloat32).contiguous();
+        apply_cpu(values.data_ptr<float>(),rows,width,true,adjoint);
+        result.copy_(values.to(tb::kFloat16));
+    }
     return result;
 }
 
@@ -127,10 +167,20 @@ std::shared_ptr<const GgufInputRotation> load_gguf_input_rotation(const mfq::Mod
             std::any_of(signs.begin(), signs.end(), [](int sign) { return sign != 1 && sign != -1; }))
         throw std::invalid_argument("GGUF Hadamard basis is incompatible with the projection slice");
     auto result = std::make_shared<GgufInputRotation>(); result->block = int(block);
+    if(const auto found=source.metadata().find("gguf_hadamard_grouped_gdn");found!=source.metadata().end()) {
+        const auto groups=nlohmann::json::parse(found->second);
+        if(groups.contains(name)) {
+            result->key_heads=groups.at(name).at(0).get<int>();
+            result->value_heads=groups.at(name).at(1).get<int>();
+            if(first!=0 || last!=width || result->key_heads<=0 || result->value_heads<=0 ||
+                    result->value_heads%result->key_heads || width%result->value_heads)
+                throw std::invalid_argument("GGUF grouped GDN Hadamard requires complete compatible heads");
+        }
+    }
     if (!signs.empty()) result->signs_cpu.assign(signs.begin() + first, signs.begin() + last);
     if (std::all_of(result->signs_cpu.begin(), result->signs_cpu.end(), [](int sign) { return sign == 1; }))
         result->signs_cpu.clear();
-    if (block == 1 && result->signs_cpu.empty()) return {};
+    if (block == 1 && result->signs_cpu.empty() && !result->value_heads) return {};
     if (cuda) {
         const MfqCudaGuard guard(device);
         if (block > 128) {

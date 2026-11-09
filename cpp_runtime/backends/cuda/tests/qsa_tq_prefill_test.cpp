@@ -156,6 +156,69 @@ struct Fixture {
                 throw std::runtime_error("Staged attention changed history mass");
     }
 };
+
+void compact_union_guards() {
+    for(int format:{0,254,4}) {
+        Fixture f(9,8,2,256,17,5,format,true);
+        const int rows=f.kh*4,bytes=rows*512;
+        auto host_views=f.views.cpu();
+        auto* records=host_views.data_ptr<tq::TqBlockView>();
+        records[f.blocks-1].key=f.payload.data_ptr<uint8_t>()+(f.blocks-1)*bytes;
+        records[f.blocks-1].value=f.payload.data_ptr<uint8_t>()+(2*f.blocks-1)*bytes;
+        f.views.copy_(host_views);
+        std::vector<tq::SelectedBlock> selections(std::size_t(f.queries)*f.count);
+        for(std::size_t i=0;i<selections.size();++i)
+            selections[i]={i%5==0?-1:i%3==0?f.blocks-1:i%3==1?1:9,i%7==0?0u:5u};
+        f.selected.copy_(upload(selections.data(),selections.size()*sizeof(selections[0])));
+        f.run(true);
+        const auto full=f.decoded.cpu();
+        constexpr int capacity=3,guard=32;
+        const auto elements=int64_t(capacity)*f.kh*4*f.padded;
+        auto keys=tb::empty({elements*2+guard},f.views.options());
+        auto values=tb::empty_like(keys);
+        auto ids=tb::empty({capacity+guard/4},f.requested.options());
+        auto map=tb::empty({f.blocks},f.requested.options());
+        auto used=tb::empty({1},f.requested.options());
+        const auto run=[&] {
+            ck(cudaMemsetAsync(keys.data_ptr(),0xa5,keys.nbytes(),mfq_current_cuda_stream()));
+            ck(cudaMemsetAsync(values.data_ptr(),0xa5,values.nbytes(),mfq_current_cuda_stream()));
+            ck(cudaMemsetAsync(ids.data_ptr(),0xa5,ids.nbytes(),mfq_current_cuda_stream()));
+            ck(tq::tq_stage_attention_compact(f.views.data_ptr<tq::TqBlockView>(),f.relative.data_ptr<uint16_t>(),
+                keys.data_ptr<uint16_t>(),values.data_ptr<uint16_t>(),f.blocks,f.kh,f.padded,
+                f.selected.data_ptr<tq::SelectedBlock>(),f.queries,f.count,map.data_ptr<int32_t>(),
+                ids.data_ptr<int32_t>(),used.data_ptr<int32_t>(),mfq_current_cuda_stream()));
+        };
+        const auto verify=[&](int expected) {
+            const auto count=used.cpu(),order=ids.cpu(),k=keys.cpu(),v=values.cpu();
+            if(count.data_ptr<int32_t>()[0]!=expected)throw std::runtime_error("Compact staging changed selected union size");
+            const auto row_bytes=std::size_t(f.kh)*4*f.padded*2;
+            for(int slot=0;slot<expected;++slot) {
+                const auto block=order.data_ptr<int32_t>()[slot];
+                if(block!=1 && block!=9 && block!=f.blocks-1)throw std::runtime_error("Compact staging included an unselected block");
+                for(int kind=0;kind<2;++kind) {
+                    const auto* actual=static_cast<const uint8_t*>((kind?v:k).data_ptr())+slot*row_bytes;
+                    const auto* reference=static_cast<const uint8_t*>(full.data_ptr())+(std::size_t(kind)*f.blocks+block)*row_bytes;
+                    if(std::memcmp(actual,reference,row_bytes))throw std::runtime_error("Compact staging changed original KV bytes");
+                }
+            }
+            for(const auto& tensor:{k,v,order}) {
+                const auto* data=static_cast<const uint8_t*>(tensor.data_ptr());
+                for(std::size_t i=tensor.nbytes()-guard;i<tensor.nbytes();++i)
+                    if(data[i]!=0xa5)throw std::runtime_error("Compact staging exceeded the actual selected union allocation");
+            }
+        };
+        run();verify(capacity);
+        cudaGraph_t graph;cudaGraphExec_t executable;
+        ck(cudaStreamBeginCapture(mfq_current_cuda_stream(),cudaStreamCaptureModeThreadLocal));
+        run();ck(cudaStreamEndCapture(mfq_current_cuda_stream(),&graph));
+        ck(cudaGraphInstantiate(&executable,graph,0));
+        f.selected.zero_();ck(cudaGraphLaunch(executable,mfq_current_cuda_stream()));verify(0);
+        f.selected.copy_(upload(selections.data(),selections.size()*sizeof(selections[0])));
+        ck(cudaGraphLaunch(executable,mfq_current_cuda_stream()));verify(capacity);
+        ck(cudaGraphExecDestroy(executable));ck(cudaGraphDestroy(graph));
+    }
+    std::cout<<"Compact selected-union bounds, original KV, partial masks, output guards and changing Graph selections PASS\n";
+}
 int main() try {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices)
@@ -163,6 +226,7 @@ int main() try {
     auto stream = mfq::cuda::stream_from_pool(false);
     mfq::cuda::StreamGuard guard(stream);
     tb::NoGradGuard nograd;
+    compact_union_guards();
     int cases = 0;
     for (int w : {17, 257, 1024})
         for (int ratio : {4, 5, 8, 12})

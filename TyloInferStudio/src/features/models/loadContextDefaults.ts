@@ -3,6 +3,7 @@ import type { KvQuantizationSettings } from '../../shared/api/resources/runtime'
 
 export interface LoadContextDefaults {
   context_size: number | null;
+  prefill_mode: 'precise' | 'fast';
   automatic: boolean;
   ssd_kv: boolean;
   ram_preallocated: boolean;
@@ -11,7 +12,7 @@ export interface LoadContextDefaults {
 }
 
 export const DEFAULT_LOAD_CONTEXT: LoadContextDefaults = {
-  context_size: null, automatic: true, ssd_kv: false,
+  context_size: null, prefill_mode: 'precise', automatic: true, ssd_kv: false,
   ram_preallocated: true, vram_preallocated: true,
   kv_quantization: { enabled: false, bits: 4, algorithm: 'turboquant' },
 };
@@ -25,6 +26,7 @@ export function readLoadContext(model?: string): LoadContextDefaults {
     const value = JSON.parse(localStorage.getItem(key(model)) || '{}');
     if (!value || typeof value !== 'object' || Array.isArray(value)) return structuredClone(DEFAULT_LOAD_CONTEXT);
     const result = structuredClone(DEFAULT_LOAD_CONTEXT);
+    if (value.prefill_mode === 'precise' || value.prefill_mode === 'fast') result.prefill_mode = value.prefill_mode;
     if (Number.isSafeInteger(value.context_size) && value.context_size >= 512 && value.context_size <= 2147483647)
       result.context_size = value.context_size;
     for (const field of ['automatic', 'ssd_kv', 'ram_preallocated', 'vram_preallocated'] as const)

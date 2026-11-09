@@ -143,6 +143,32 @@ void check_session_read_window(const std::filesystem::path& root) {
     std::cout<<"Session recovery: exact gaps/duplicates/reversed destinations/guards, bounded amplification, nested disable and prevalidation PASS\n";
 }
 
+void check_selected_sources(const std::filesystem::path& root) {
+    tq::RamKvStoreConfig cfg;cfg.pressure.canonical_tier=tq::RamKvTier::Tq4;
+    cfg.pressure.ssd_enabled=true;cfg.session_ssd=disk(root);
+    tq::RamKvStore store(cfg,allocate,encode,[](const auto&){});
+    for(unsigned id=0;id<4;++id)store.append(image(30+id,256,4),{1024,512,256},1024);
+    assert(store.maintain(512).fits());cfg.session_ssd->flush();
+    auto all=store.snapshot(4);
+    const auto before=store.stats().ssd_read_bytes;
+    assert(store.sources({}).empty());
+    const std::vector<std::size_t> ids{3,0,3};const auto selected=store.sources(ids);
+    assert(selected.size()==ids.size() && store.stats().ssd_read_bytes==before);
+    for(std::size_t i=0;i<ids.size();++i) {
+        const auto& original=all->blocks[ids[i]];const auto& source=selected[i];
+        assert(source.image==original.image && source.backing==original.backing &&
+            source.generation==original.generation && source.access==original.access && source.tier==original.tier);
+    }
+    try{store.sources({0,4});assert(false);}catch(const std::out_of_range&){}
+    std::weak_ptr<const tq::RamKvImage> unselected;
+    for(std::size_t id:{1,2})if(all->blocks[id].image)unselected=all->blocks[id].image;
+    assert(!unselected.expired());all.reset();store.truncate(0);
+    assert(unselected.expired());
+    for(std::size_t i=0;i<ids.size();++i) {
+        const auto bytes=store.read_cpu(selected[i]);
+        assert(bytes.key.front()==30+ids[i] && bytes.value.front()==37+ids[i]);
+    }
+}
 void check_shared_read_source(const std::filesystem::path& root) {
     auto data=std::make_shared<std::vector<std::uint8_t>>(541,17);
     std::fill(data->begin()+7,data->begin()+136,31);
@@ -679,7 +705,8 @@ void check_native_file_batch(const std::filesystem::path& root,bool packed=false
     assert(store.stats().ssd_read_bytes==blocks.size()*72);
     std::cout<<"Retained multi-file QSA batch, unaligned K/V, exact accounting and offset overflow PASS\n";
 }
-void check_sequential_file_reads(const std::filesystem::path& root,bool packed=false) {
+void check_sequential_file_reads(const std::filesystem::path& root,bool packed=false,
+    mfq::FileReadMode mode=mfq::FileReadMode::Buffered) {
     std::filesystem::create_directories(root);
     std::array<std::vector<std::uint8_t>,3> data;
     std::array<std::shared_ptr<tq::RamKvReadSource>,3> sources;
@@ -691,7 +718,7 @@ void check_sequential_file_reads(const std::filesystem::path& root,bool packed=f
             stream.write(reinterpret_cast<const char*>(data[file].data()),data[file].size());}
         sources[file]=std::make_shared<tq::RamKvReadSource>();
         sources[file]->bytes=data[file].size()-31;
-        sources[file]->file_reader=std::make_shared<mfq::FileRangeReader>(path,mfq::FileReadMode::Buffered);
+        sources[file]->file_reader=std::make_shared<mfq::FileRangeReader>(path,mode);
         sources[file]->file_offset=31;
     }
     tq::RamKvStore store({},allocate,encode,[](const auto&){});
@@ -756,7 +783,104 @@ void check_sequential_file_reads(const std::filesystem::path& root,bool packed=f
     for(auto& bytes:output)bytes.fill(0xa5);
     read_batch(reads,true);check();
     assert(store.stats().ssd_read_bytes-after_failure==3*64*36);
+    // Alternating handles cross several queue waves without coalescing ranges.
+    for(std::size_t i=0;i<blocks.size();++i)if(!blocks[i].image) {
+        auto backing=std::make_shared<tq::RamKvBacking>(*blocks[i].backing);
+        backing->source=sources[i%3];blocks[i].backing=std::move(backing);
+    }
+    for(auto& bytes:output)bytes.fill(0xa5);
+    read_batch(reads,true);
+    for(std::size_t i=0;i<blocks.size();++i) {
+        const auto* key=blocks[i].image?blocks[i].image->key:
+            data[i%3].data()+31+blocks[i].backing->offset;
+        const auto* value=blocks[i].image?blocks[i].image->value:key+17;
+        assert(output[i].front()==0xa5 && output[i].back()==0xa5);
+        assert(std::equal(output[i].begin()+1,output[i].begin()+18,key));
+        assert(std::equal(output[i].begin()+(packed?18:33),output[i].begin()+(packed?37:52),value));
+    }
     std::cout<<"Sequential file KV: bounded gapped reads, mixed RAM, scatter order and failure/retry PASS\n";
+}
+void check_buffered_coalesced_waves(const std::filesystem::path& root) {
+    std::filesystem::create_directories(root);
+    constexpr std::size_t count=4097,key_bytes=1031,value_bytes=1065,stride=2500;
+    std::vector<std::uint8_t> data(count*stride);
+    for(std::size_t i=0;i<data.size();++i)data[i]=std::uint8_t(i*13^(i>>9));
+    const auto path=root/"payload";
+    {std::ofstream file(path,std::ios::binary);
+        file.write(reinterpret_cast<const char*>(data.data()),data.size());}
+    auto input=std::make_shared<tq::RamKvReadSource>();input->bytes=data.size();
+    input->file_reader=std::make_shared<mfq::FileRangeReader>(path,mfq::FileReadMode::Buffered);
+    std::vector<tq::RamKvSnapshotBlock> blocks(count);
+    std::vector<std::array<std::uint8_t,key_bytes+value_bytes+2>> output(count);
+    std::vector<tq::RamKvReadInto> requests;requests.reserve(count);
+    for(std::size_t i=0;i<count;++i) {
+        auto backing=std::make_shared<tq::RamKvBacking>();
+        backing->source=input;backing->offset=i*stride;
+        backing->key_bytes=key_bytes;backing->value_bytes=value_bytes;
+        backing->key_bits=backing->value_bits=4;blocks[i].backing=std::move(backing);
+        output[i].fill(0xa5);
+        requests.push_back({&blocks[i],output[i].data()+1,key_bytes+value_bytes});
+    }
+    tq::RamKvStore store({},allocate,encode,[](const auto&){});
+    store.read_packed_cpu_into_batch(requests,true);
+    for(std::size_t i=0;i<count;++i) {
+        assert(output[i].front()==0xa5 && output[i].back()==0xa5);
+        assert(std::equal(output[i].begin()+1,output[i].end()-1,data.begin()+i*stride));
+    }
+    const auto stats=input->file_reader->stats();
+    assert(store.stats().ssd_read_bytes==count*(key_bytes+value_bytes));
+    assert(stats.calls<count/8 && stats.logical_bytes<=2*count*(key_bytes+value_bytes));
+    std::cout<<"Buffered coalesced KV: multi-wave scatter and guarded uneven tail PASS\n";
+}
+void check_large_session_windows(const std::filesystem::path& root) {
+    auto source=disk(root);
+    std::vector<mfq::cache::QsaKvStore::BlockPtr> stored;
+    constexpr std::size_t bytes=4192,count=256;
+    for(unsigned i=0;i<2*count;++i) {
+        std::vector<std::uint8_t> data(bytes);
+        for(std::size_t j=0;j<bytes;++j)data[j]=std::uint8_t(i*71+j*13+j/37);
+        stored.push_back(source->write(std::move(data)));
+    }
+    source->flush();
+    tq::RamKvStore store({},allocate,encode,[](const auto&){});
+    std::vector<tq::RamKvSnapshotBlock> blocks(count);
+    std::vector<std::vector<std::uint8_t>> output(count,std::vector<std::uint8_t>(bytes+2));
+    std::vector<tq::RamKvReadInto> reads;
+    for(std::size_t i=0;i<count;++i) {
+        auto backing=std::make_shared<tq::RamKvBacking>();
+        backing->store=source;backing->block=stored[2*i];
+        backing->key_bytes=2049;backing->value_bytes=bytes-backing->key_bytes;
+        blocks[i].backing=std::move(backing);blocks[i].tier=tq::RamKvTier::Ssd;
+        reads.push_back({&blocks[i],output[i].data()+1,bytes});
+    }
+    std::uint64_t random_reads=0;
+    for(const bool sequential:{false,true}) {
+        for(auto& row:output)std::fill(row.begin(),row.end(),0xa5);
+        const auto before=source->stats();
+        store.read_packed_cpu_into_batch(reads,sequential);
+        const auto after=source->stats();
+        for(std::size_t i=0;i<count;++i) {
+            assert(output[i].front()==0xa5 && output[i].back()==0xa5);
+            for(std::size_t j=0;j<bytes;++j)
+                assert(output[i][j+1]==std::uint8_t(2*i*71+j*13+j/37));
+        }
+        const auto native_reads=after.reads-before.reads;
+        if(!sequential)random_reads=native_reads;
+        else {
+            assert(native_reads*4<random_reads);
+            assert(after.read_bytes-before.read_bytes<=2*count*bytes);
+        }
+    }
+    const auto accounted=store.stats().ssd_read_bytes;
+    for(auto& row:output)std::fill(row.begin(),row.end(),0xa5);
+    tq::read_packed_snapshot_images(reads);
+    for(std::size_t i=0;i<count;++i) {
+        assert(output[i].front()==0xa5 && output[i].back()==0xa5);
+        for(std::size_t j=0;j<bytes;++j)
+            assert(output[i][j+1]==std::uint8_t(2*i*71+j*13+j/37));
+    }
+    assert(store.stats().ssd_read_bytes==accounted);
+    std::cout<<"Session KV large gapped windows: exact payloads, guards, bounded read amplification and fewer reads PASS\n";
 }
 void check_batched_ssd(const std::filesystem::path& root) {
     std::vector<std::future<void>> jobs;
@@ -941,6 +1065,8 @@ int main(int argc,char** argv)try {
     check_session_read_window(root/"session-window");
     check_native_file_batch(root/"packed-native-files",true);
     check_sequential_file_reads(root/"packed-sequential-files",true);
+    check_buffered_coalesced_waves(root/"buffered-coalesced-waves");
+    check_selected_sources(root/"selected-sources");
     check_shared_read_source(root/"shared-reader");
     check_mixed_precision_recall(root/"mixed-recall");
     check_read_views(root/"read-views");
@@ -952,6 +1078,9 @@ int main(int argc,char** argv)try {
     check_relocation();
     check_native_file_batch(root/"native-files");
     check_sequential_file_reads(root/"sequential-files");
+    check_sequential_file_reads(root/"sequential-direct-files",false,mfq::FileReadMode::Direct);
+    check_sequential_file_reads(root/"packed-sequential-direct-files",true,mfq::FileReadMode::Direct);
+    check_large_session_windows(root/"large-session-windows");
     check_admit_view(root/"admit-view");
     check_bulk_touches(root/"bulk-touches");
     check_batched_ssd(root/"batch-io");

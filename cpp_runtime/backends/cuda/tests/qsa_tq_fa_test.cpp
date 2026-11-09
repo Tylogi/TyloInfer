@@ -88,7 +88,7 @@ void check_prefill_graph() {
 
  cudaStream_t stream;ck(cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking));
  tq::TqPrefillGraph graph;int cases=0;
- for(int q:{33,67,33})for(int width:{17,256})for(int ratio:{4,6,9})for(bool observe:{true,false}) {
+ for(int q:{16,17,31,33,67,33})for(int width:{17,256})for(int ratio:{4,6,9})for(bool observe:{true,false}) {
   GraphFixture f(q,q==67?260:128,2,ratio,width,16);ck(cudaDeviceSynchronize());auto a=f.args();a.stream=stream;
   if(!observe)a.hits=a.mass=nullptr;
   ck(cudaError_t(tq::tq_sparse_attention_prefill(a)));ck(cudaStreamSynchronize(stream));auto expected=read_graph_output(f);
@@ -131,8 +131,69 @@ void check_prefill_graph() {
  assert_graph_equal(ea,read_graph_output(first));assert_graph_history(ha,first);
  std::cout<<"QSA graph exact parity PASS cases="<<cases<<"; shape/pointer updates, observer topology changes, in-flight updates and outer capture PASS"<<std::endl;
 }
+void check_compact_operands() {
+ cudaStream_t stream;ck(cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking));
+ tq::TqPrefillGraph graph;int cases=0;
+ for(int ratio:{4,6,9})for(int width:{17,256}) {
+  GraphFixture f(width==17?17:35,8192,2,ratio,width,16);
+  const int capacity=std::min(f.blocks,f.queries*f.count),plane=capacity*f.kvheads*4*256;
+  Device<half> full_keys(f.rows*f.kvheads*256),full_values(f.rows*f.kvheads*256),compact_keys(plane),compact_values(plane);
+  const int mode_rows=f.kvheads*4,metadata=(2*mode_rows+(mode_rows+1)/2+3)&~3,image_bytes=metadata+mode_rows*256;
+  Device<uint8_t> quantized(size_t(f.blocks)*2*image_bytes);
+  std::vector<uint8_t> encoded(size_t(f.blocks)*2*image_bytes);
+  for(int b=0;b<f.blocks;++b)for(int kind=0;kind<2;++kind) {
+   auto* image=encoded.data()+(size_t(b)*2+kind)*image_bytes;
+   for(int row=0;row<mode_rows;++row){const half scale=__float2half(.1f);std::memcpy(image+row*2,&scale,2);}
+   for(int i=metadata;i<image_bytes;++i)image[i]=uint8_t(i*17+b*31+kind*7);
+  }
+  quantized.put(encoded);
+  Device<tq::TqBlockView> views(f.blocks);Device<uint16_t> relative(16);
+  std::vector<uint16_t> rel(16);const half unit=__float2half(1.f);
+  for(auto& value:rel)std::memcpy(&value,&unit,2);relative.put(rel);
+  Device<uint32_t> requested(f.blocks);Device<int32_t> map(f.blocks),ids(capacity),used(1);
+  ck(cudaMemset(full_keys.p,0,size_t(f.rows)*f.kvheads*256*sizeof(half)));
+  ck(cudaMemset(full_values.p,0,size_t(f.rows)*f.kvheads*256*sizeof(half)));
+  std::vector<tq::TqBlockView> source(f.blocks);
+  for(int b=0;b<f.blocks;++b) {
+   source[b]={reinterpret_cast<uint8_t*>(f.keys.p+b*f.kvheads*4*256),
+    reinterpret_cast<uint8_t*>(f.values.p+b*f.kvheads*4*256),0,0};
+   if(b%3==0)source[b]={quantized.p+size_t(b)*2*image_bytes,quantized.p+(size_t(b)*2+1)*image_bytes,
+     tq::tq_precision_flags(4,14),tq::tq_precision_flags(8)};
+  }
+  views.put(source);ck(cudaDeviceSynchronize());
+  for(int iteration=0;iteration<3;++iteration) {
+   // Duplicate selections, empty query groups and a different union per replay.
+   std::vector<tq::SelectedBlock> selection(size_t(f.queries)*f.count);
+   for(int t=0;t<f.queries;++t)for(int j=0;j<f.count;++j)
+    selection[size_t(t)*f.count+j]=t<8?tq::SelectedBlock{-1,0}:
+      tq::SelectedBlock{(j*73+t/8*11+iteration*257)%f.blocks,uint32_t((j+t)%16)};
+   f.selected.put(selection);ck(cudaDeviceSynchronize());
+   ck(cudaError_t(tq::tq_stage_attention_blocks(views.p,relative.p,reinterpret_cast<uint16_t*>(full_keys.p),
+     reinterpret_cast<uint16_t*>(full_values.p),f.blocks,f.kvheads,256,stream,f.selected.p,f.queries,f.count,requested.p)));
+   auto a=f.args();a.stream=stream;a.keys=reinterpret_cast<uint16_t*>(full_keys.p);a.values=reinterpret_cast<uint16_t*>(full_values.p);
+   clear_graph_history(f,stream);ck(cudaError_t(tq::tq_sparse_attention_prefill(a)));ck(cudaStreamSynchronize(stream));
+   const auto expected=read_graph_output(f);const auto history=read_graph_history(f);
+   ck(cudaError_t(tq::tq_stage_attention_compact(views.p,relative.p,reinterpret_cast<uint16_t*>(compact_keys.p),
+     reinterpret_cast<uint16_t*>(compact_values.p),f.blocks,f.kvheads,256,f.selected.p,f.queries,f.count,map.p,ids.p,used.p,stream)));
+   a.keys=reinterpret_cast<uint16_t*>(compact_keys.p);a.values=reinterpret_cast<uint16_t*>(compact_values.p);a.compact_blocks=map.p;
+   clear_graph_history(f,stream);ck(cudaError_t(graph.run(a)));ck(cudaStreamSynchronize(stream));
+   assert_graph_equal(expected,read_graph_output(f));assert_graph_history(history,f);
+   int actual=0;ck(cudaMemcpy(&actual,used.p,sizeof(int),cudaMemcpyDeviceToHost));
+   std::vector<int32_t> mapping(f.blocks);ck(cudaMemcpy(mapping.data(),map.p,f.blocks*sizeof(int32_t),cudaMemcpyDeviceToHost));
+   std::vector<bool> seen(f.blocks,false);int expected_count=0;
+   for(const auto selected:selection)if(selected.id>=0 && selected.token_mask && !seen[selected.id]){seen[selected.id]=true;++expected_count;}
+   if(actual!=expected_count || actual>capacity)throw std::runtime_error("Compact QSA union count mismatch");
+   for(int b=0;b<f.blocks;++b)if(seen[b]?(mapping[b]<0 || mapping[b]>=actual):(mapping[b]!=-1))
+     throw std::runtime_error("Compact QSA mapping retained a stale block");
+   ++cases;
+  }
+ }
+ ck(cudaStreamDestroy(stream));
+ std::cout<<"Compact QSA mixed FP16/TQ4/TQ8 unions, changing selections, duplicates, empty groups and original-ID history PASS cases="<<cases<<std::endl;
+}
 int main()try {
     check_materialized_gate();
+    check_compact_operands();
     constexpr int queries=33,kvheads=2,count=16,padded=256;
     int cases=0;double maxrel=0,maxmass=0;
     for(int rows:{128,260,65536}) {

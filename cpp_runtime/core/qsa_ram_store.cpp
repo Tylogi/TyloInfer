@@ -22,9 +22,14 @@ struct SequentialFileSpan {
     const mfq::FileRangeReader* reader;
     mfq::ReadSpan span;
 };
-using SequentialFileGroup=std::pair<std::size_t,std::size_t>;
-constexpr std::size_t sequential_read_window=ScopedFileReadWindow::capacity;
+struct SequentialFileGroup {
+    std::size_t begin,end;
+    std::shared_ptr<const mfq::FileRangeReader> reader;
+};
+constexpr std::size_t sequential_read_window=1u<<20;
 constexpr unsigned sequential_read_threads=4;
+constexpr unsigned sequential_read_batch=64;
+struct SequentialScatter {std::size_t begin,end,offset;};
 
 bool read_sequential_files(const std::vector<RamKvReadInto>& requests,std::uint64_t& completed,bool padded) {
     completed=0;
@@ -70,9 +75,9 @@ bool read_sequential_files(const std::vector<RamKvReadInto>& requests,std::uint6
         const auto& input=*backing.source;
         spans.push_back({input.file_reader.get(),{input.file_offset+backing.offset,
             reinterpret_cast<std::byte*>(request.destination),backing.key_bytes+backing.value_bytes}});
-        if(groups.empty() || spans[groups.back().first].reader!=input.file_reader.get())
-            groups.emplace_back(spans.size()-1,spans.size());
-        else groups.back().second=spans.size();
+        if(groups.empty() || groups.back().reader.get()!=input.file_reader.get())
+            groups.push_back({spans.size()-1,spans.size(),input.file_reader});
+        else groups.back().end=spans.size();
     }
     std::atomic<std::uint64_t> done{0};
     const auto threads=unsigned(std::min<std::size_t>({sequential_read_threads,
@@ -80,9 +85,41 @@ bool read_sequential_files(const std::vector<RamKvReadInto>& requests,std::uint6
     const auto read_group=[&](std::int64_t first,std::int64_t last) {
         // Release each worker's window before its workspace reservation ends.
         std::unique_ptr<std::uint8_t[]> buffer;
+        std::size_t buffer_capacity=0;
+#if defined(_WIN32)
+        // Buffered ranges share the native overlapped queue. Keep coalesced
+        // windows bounded by the same per-worker reservation as direct reads.
+        std::vector<mfq::FileReadRange> pending;
+        std::vector<SequentialScatter> scatter;
+        std::size_t pending_bytes=0,pending_useful=0;
+        const auto flush=[&] {
+            if(pending.empty())return;
+            if(const auto* trace=std::getenv("TYLOINFER_TRACE_KERNEL_DISPATCH");trace && trace[0]=='1') {
+                static std::atomic<bool> reported{false};
+                if(!reported.exchange(true))std::fprintf(stderr,
+                    "native_qsa_buffered_batch actual_match=1 ranges=%zu coalesced=%zu scratch_bytes=%zu native_overlapped=1\n",
+                    pending.size(),scatter.size(),pending_bytes);
+            }
+            mfq::FileRangeReader::read_many(pending);
+            for(const auto& copy:scatter)for(auto at=copy.begin;at<copy.end;++at) {
+                const auto& span=spans[at].span;
+                std::memcpy(span.destination,buffer.get()+copy.offset+
+                    std::size_t(span.offset-spans[copy.begin].span.offset),span.size);
+            }
+            done.fetch_add(pending_useful,std::memory_order_relaxed);
+            pending.clear();scatter.clear();pending_bytes=pending_useful=0;
+        };
+#endif
         for(auto group=first;group<last;++group) {
-            const auto [begin,end]=groups[std::size_t(group)];
+            const auto& range=groups[std::size_t(group)];
+            const auto begin=range.begin,end=range.end;
             const auto* reader=spans[begin].reader;
+            const bool direct=reader->stats().mode==mfq::FileReadMode::Direct;
+            const auto window=direct
+                ?sequential_read_window:ScopedFileReadWindow::capacity;
+#if defined(_WIN32)
+            if(direct)flush();
+#endif
             for(auto i=begin;i<end;) {
                 auto after=i+1;
                 const auto start=spans[i].span.offset;
@@ -93,14 +130,35 @@ bool read_sequential_files(const std::vector<RamKvReadInto>& requests,std::uint6
                     if(next.offset<start || next.size>SIZE_MAX-useful)break;
                     const auto high=std::max(finish,next.offset+next.size);
                     const auto bytes=high-start;
-                    if(bytes>sequential_read_window || (bytes+1)/2>useful+next.size)break;
+                    if(bytes>window || (bytes+1)/2>useful+next.size)break;
                     useful+=next.size;
                     finish=high;
                     ++after;
                 }
+#if defined(_WIN32)
+                if(!direct) {
+                    const auto bytes=std::size_t(finish-start);
+                    const auto scratch=after==i+1?0:bytes;
+                    if(pending.size()>=sequential_read_batch || scratch>sequential_read_window-pending_bytes)flush();
+                    auto* destination=spans[i].span.destination;
+                    if(scratch) {
+                        if(buffer_capacity<sequential_read_window) {
+                            buffer.reset(new std::uint8_t[sequential_read_window]);
+                            buffer_capacity=sequential_read_window;
+                        }
+                        destination=reinterpret_cast<std::byte*>(buffer.get()+pending_bytes);
+                        scatter.push_back({i,after,pending_bytes});pending_bytes+=scratch;
+                    }
+                    pending.push_back({range.reader,{start,destination,bytes}});
+                    pending_useful+=useful;i=after;continue;
+                }
+#endif
                 if(after==i+1)reader->read(start,spans[i].span.destination,spans[i].span.size);
                 else {
-                    if(!buffer)buffer=std::make_unique<std::uint8_t[]>(sequential_read_window);
+                    if(buffer_capacity<window) {
+                        buffer.reset(new std::uint8_t[window]);
+                        buffer_capacity=window;
+                    }
                     reader->read(start,reinterpret_cast<std::byte*>(buffer.get()),std::size_t(finish-start));
                     for(auto at=i;at<after;++at) {
                         const auto& span=spans[at].span;
@@ -111,6 +169,9 @@ bool read_sequential_files(const std::vector<RamKvReadInto>& requests,std::uint6
                 i=after;
             }
         }
+#if defined(_WIN32)
+        flush();
+#endif
     };
     try {
         static thread_local mfq::HostParallelPool readers;
@@ -129,8 +190,8 @@ bool read_sequential_files(const std::vector<RamKvReadInto>& requests,std::uint6
     if(const auto* trace=std::getenv("TYLOINFER_TRACE_KERNEL_DISPATCH");trace && trace[0]=='1') {
         static std::atomic<bool> reported{false};
         if(!reported.exchange(true))std::fprintf(stderr,
-            "native_qsa_sequential_files actual_match=1 requests=%zu groups=%zu threads=%u window_bytes=%zu max_read_amplification=2\n",
-            requests.size(),groups.size(),threads,sequential_read_window);
+            "native_qsa_sequential_files actual_match=1 requests=%zu groups=%zu threads=%u direct_window_bytes=%zu buffered_window_bytes=%zu max_read_amplification=2\n",
+            requests.size(),groups.size(),threads,sequential_read_window,ScopedFileReadWindow::capacity);
     }
     return true;
 }
@@ -138,7 +199,8 @@ bool read_sequential_files(const std::vector<RamKvReadInto>& requests,std::uint6
 
 std::size_t RamKvStore::sequential_read_workspace(std::size_t requests) {
     constexpr auto per_request=sizeof(SequentialFileSpan)+sizeof(SequentialFileGroup);
-    constexpr auto windows=sequential_read_threads*sequential_read_window;
+    constexpr auto windows=sequential_read_threads*(sequential_read_window+
+        sequential_read_batch*(sizeof(mfq::FileReadRange)+sizeof(SequentialScatter)));
     if(requests>(SIZE_MAX-windows)/per_request)
         throw std::overflow_error("QSA sequential read workspace overflow");
     return requests*per_request+windows;
@@ -696,6 +758,15 @@ RamKvSnapshotBlock RamKvStore::source(std::size_t id)const {
     auto& s=*impl_;std::lock_guard<std::mutex> lock(s.mutex);const auto& e=s.entries.at(id);
     return {e.image,e.backing,e.bytes,e.generation,e.access,e.tier};
 }
+std::vector<RamKvSnapshotBlock> RamKvStore::sources(const std::vector<std::size_t>& ids)const {
+    auto& s=*impl_;std::lock_guard<std::mutex> lock(s.mutex);
+    std::vector<RamKvSnapshotBlock> result;result.reserve(ids.size());
+    for(const auto id:ids) {
+        const auto& e=s.entries.at(id);
+        result.push_back({e.image,e.backing,e.bytes,e.generation,e.access,e.tier});
+    }
+    return result;
+}
 MicroblockImage RamKvStore::read_cpu(const RamKvSnapshotBlock& source) {
     return copy_image(read_cpu_view(source));
 }
@@ -711,7 +782,7 @@ RamKvImage RamKvStore::read_cpu_view(const RamKvSnapshotBlock& source,std::size_
 void RamKvStore::read_cpu_into(const RamKvSnapshotBlock& source,std::uint8_t* destination,std::size_t capacity) {
     read_cpu_image(source,destination,capacity,true);
 }
-void RamKvStore::read_cpu_image(const RamKvSnapshotBlock& source,std::uint8_t* destination,std::size_t capacity,bool padded) {
+static std::size_t read_snapshot_image(const RamKvSnapshotBlock& source,std::uint8_t* destination,std::size_t capacity,bool padded) {
     if(!destination)throw std::invalid_argument("Missing QSA CPU read destination");
     const auto* resident=source.image.get();const auto* backing=source.backing.get();
     if(resident)validate(source.image);
@@ -724,7 +795,7 @@ void RamKvStore::read_cpu_image(const RamKvSnapshotBlock& source,std::uint8_t* d
     const auto extent=padded?((kb+15)&~std::size_t(15)):kb;
     if(extent>capacity || vb>capacity-extent)throw std::out_of_range("QSA CPU read destination is too small");
     if(resident) {
-        std::memcpy(destination,resident->key,kb);std::memcpy(destination+extent,resident->value,vb);return;
+        std::memcpy(destination,resident->key,kb);std::memcpy(destination+extent,resident->value,vb);return 0;
     }
     if(backing->source) {
         backing->source->read_into(backing->offset,destination,kb+vb);
@@ -733,8 +804,13 @@ void RamKvStore::read_cpu_image(const RamKvSnapshotBlock& source,std::uint8_t* d
         backing->store->read_into(backing->block,destination,kb+vb);
         if(extent!=kb)std::memmove(destination+extent,destination+kb,vb);
     }
-    auto& s=*impl_;std::lock_guard<std::mutex> lock(s.mutex);s.counters.ssd_read_bytes+=kb+vb;
+    return kb+vb;
 }
+void RamKvStore::read_cpu_image(const RamKvSnapshotBlock& source,std::uint8_t* destination,std::size_t capacity,bool padded) {
+    const auto bytes=read_snapshot_image(source,destination,capacity,padded);
+    if(bytes) {auto& s=*impl_;std::lock_guard<std::mutex> lock(s.mutex);s.counters.ssd_read_bytes+=bytes;}
+}
+
 void RamKvStore::admit_read(std::size_t id,std::uint64_t generation,const MicroblockImage& image,std::size_t budget) {
     RamKvImage view;
     view.key=image.key.data();view.value=image.value.data();
@@ -753,7 +829,7 @@ void RamKvStore::read_cpu_into_batch(const std::vector<RamKvReadInto>& requests,
 void RamKvStore::read_packed_cpu_into_batch(const std::vector<RamKvReadInto>& requests,bool sequential) {
     read_cpu_batch(requests,sequential,false);
 }
-void RamKvStore::read_cpu_batch(const std::vector<RamKvReadInto>& requests,bool sequential,bool padded) {
+static void read_snapshot_batch(const std::vector<RamKvReadInto>& requests,bool sequential,bool padded,std::uint64_t& completed) {
     for(const auto& r:requests) {
         if(!r.source || !r.destination)throw std::invalid_argument("Missing QSA batch read destination");
         const auto& s=*r.source;
@@ -766,16 +842,14 @@ void RamKvStore::read_cpu_batch(const std::vector<RamKvReadInto>& requests,bool 
         if(extent>r.capacity || vb>r.capacity-extent)throw std::out_of_range("QSA batch read destination is too small");
     }
     if(sequential) {
-        std::uint64_t completed=0;
+        std::uint64_t file_completed=0;
         try {
-            if(read_sequential_files(requests,completed,padded)) {
-                std::lock_guard<std::mutex> lock(impl_->mutex);
-                impl_->counters.ssd_read_bytes+=completed;
+            if(read_sequential_files(requests,file_completed,padded)) {
+                completed+=file_completed;
                 return;
             }
         }catch(...) {
-            std::lock_guard<std::mutex> lock(impl_->mutex);
-            impl_->counters.ssd_read_bytes+=completed;
+            completed+=file_completed;
             throw;
         }
     }
@@ -787,7 +861,7 @@ void RamKvStore::read_cpu_batch(const std::vector<RamKvReadInto>& requests,bool 
     if(sequential)read_window.emplace();
     for(const auto& r:requests) {
         const auto& source=*r.source;
-        if(source.image)read_cpu_image(source,r.destination,r.capacity,padded);
+        if(source.image)completed+=read_snapshot_image(source,r.destination,r.capacity,padded);
         else if(!sequential && source.backing->source && source.backing->source->file_reader) {
             const auto& backing=*source.backing;const auto& input=*backing.source;
             const auto bytes=backing.key_bytes+backing.value_bytes;
@@ -798,7 +872,7 @@ void RamKvStore::read_cpu_batch(const std::vector<RamKvReadInto>& requests,bool 
             file_bytes+=bytes;
         }
         else if(!sequential && source.backing->source)sources[source.backing->source.get()].push_back(&r);
-        else if(source.backing->source)read_cpu_image(source,r.destination,r.capacity,padded);
+        else if(source.backing->source)completed+=read_snapshot_image(source,r.destination,r.capacity,padded);
         else groups[source.backing->store.get()].push_back(&r);
     }
 
@@ -822,7 +896,7 @@ void RamKvStore::read_cpu_batch(const std::vector<RamKvReadInto>& requests,bool 
             const auto& b=*r->source->backing;const auto extent=padded?((b.key_bytes+15)&~std::size_t(15)):b.key_bytes;
             if(extent!=b.key_bytes)std::memmove(r->destination+extent,r->destination+b.key_bytes,b.value_bytes);
         }
-        std::lock_guard<std::mutex> lock(impl_->mutex);impl_->counters.ssd_read_bytes+=bytes;
+        completed+=bytes;
     }
     if(!file_ranges.empty()) {
         mfq::FileRangeReader::read_many(file_ranges);
@@ -830,7 +904,7 @@ void RamKvStore::read_cpu_batch(const std::vector<RamKvReadInto>& requests,bool 
             const auto& b=*r.source->backing;const auto extent=padded?((b.key_bytes+15)&~std::size_t(15)):b.key_bytes;
             if(extent!=b.key_bytes)std::memmove(r.destination+extent,r.destination+b.key_bytes,b.value_bytes);
         }
-        std::lock_guard<std::mutex> lock(impl_->mutex);impl_->counters.ssd_read_bytes+=file_bytes;
+        completed+=file_bytes;
     }
     for(const auto& [store,group]:groups) {
         std::vector<mfq::cache::QsaKvStore::ReadRequest> reads;reads.reserve(group.size());
@@ -844,9 +918,22 @@ void RamKvStore::read_cpu_batch(const std::vector<RamKvReadInto>& requests,bool 
             const auto& b=*r->source->backing;const auto extent=padded?((b.key_bytes+15)&~std::size_t(15)):b.key_bytes;
             if(extent!=b.key_bytes)std::memmove(r->destination+extent,r->destination+b.key_bytes,b.value_bytes);
         }
-        std::lock_guard<std::mutex> lock(impl_->mutex);impl_->counters.ssd_read_bytes+=bytes;
+        completed+=bytes;
     }
 }
+void read_packed_snapshot_images(const std::vector<RamKvReadInto>& requests) {
+    std::uint64_t completed=0;read_snapshot_batch(requests,true,false,completed);
+}
+void RamKvStore::read_cpu_batch(const std::vector<RamKvReadInto>& requests,bool sequential,bool padded) {
+    std::uint64_t completed=0;
+    const auto account=[&] {
+        if(completed) {std::lock_guard<std::mutex> lock(impl_->mutex);impl_->counters.ssd_read_bytes+=completed;}
+    };
+    try {read_snapshot_batch(requests,sequential,padded,completed);}
+    catch(...) {account();throw;}
+    account();
+}
+
 void RamKvStore::admit_read(std::size_t id,std::uint64_t generation,const RamKvImage& image,std::size_t budget) {
     impl_->admit_read(id,generation,image,{},budget);
 }

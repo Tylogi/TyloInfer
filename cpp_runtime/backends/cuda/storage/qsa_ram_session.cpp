@@ -1,9 +1,12 @@
 #include "qsa_ram_session.h"
+#include "tyloinfer/file_read_window.h"
 #include <algorithm>
 #include <array>
 #include <climits>
 #include <cstring>
 #include <limits>
+#include <map>
+#include <memory>
 
 namespace mfq::cuda::internal {
 namespace tb=mfq_tensor_backend;
@@ -62,15 +65,60 @@ void write_ram_qsa_page(CudaPagedWriter& w,const QsaTqSession& s,size_t start,si
     for(int n:{s.heads,s.kv_heads,s.width,s.padded,s.index_width,s.ram_bits})w.scalar<uint32_t>(uint32_t(n));
     const auto first=start/4,last=(start+count)/4;
     w.scalar<uint32_t>(uint32_t(last-first));
-    for(auto id=first;id<last;++id) {
-        const auto& b=s.kv->blocks[id];const auto image=b.read();
-        w.scalar<uint32_t>(uint32_t(b.tier));
-        for(auto n:b.bytes)w.scalar<uint64_t>(n);
-        w.scalar<uint64_t>(b.access);
-        for(unsigned n:{image.key_bits,image.value_bits,image.key_state_bits,image.value_state_bits})w.scalar<uint32_t>(n);
-        require(bool(s.index[id]),"missing QSA index archive");const auto index=s.index[id]->read();
-        w.scalar<uint64_t>(image.key.size());w.scalar<uint64_t>(image.value.size());w.scalar<uint64_t>(index->size());
-        w.raw(image.key.data(),image.key.size());w.raw(image.value.data(),image.value.size());w.raw(index->data(),index->size());
+    struct Record {
+        size_t id,key,value,index,offset;
+        std::array<unsigned,4> bits;
+    };
+    constexpr size_t byte_budget=2u<<20,record_budget=256;
+    std::vector<Record> records;records.reserve(std::min(last-first,record_budget));
+    std::unique_ptr<uint8_t[]> data;size_t capacity=0;
+    for(auto begin=first;begin<last;) {
+        records.clear();size_t bytes=0;
+        for(auto id=begin;id<last && records.size()<record_budget;++id) {
+            const auto& b=s.kv->blocks[id];
+            require(bool(b.image) || bool(b.backing),"missing QSA snapshot payload");
+            const auto key=b.image?b.image->key_bytes:b.backing->key_bytes;
+            const auto value=b.image?b.image->value_bytes:b.backing->value_bytes;
+            require(bool(s.index[id]),"missing QSA index archive");
+            const auto& archive=*s.index[id];size_t index=0;
+            if(archive.resident)index=archive.resident->size();
+            else if(archive.source)index=archive.bytes;
+            else {
+                require(bool(archive.store) && bool(archive.block),"missing QSA index backing");
+                index=archive.store->read_size(archive.block);
+            }
+            require(key<=SIZE_MAX-value && index<=SIZE_MAX-key-value,"QSA prefix packet size overflow");
+            const auto count=key+value+index;
+            if(!records.empty() && (bytes>=byte_budget || count>byte_budget-bytes))break;
+            require(count<=SIZE_MAX-bytes,"QSA prefix packet size overflow");
+            const std::array<unsigned,4> bits=b.image?
+                std::array<unsigned,4>{b.image->key_bits,b.image->value_bits,b.image->key_state_bits,b.image->value_state_bits}:
+                std::array<unsigned,4>{b.backing->key_bits,b.backing->value_bits,b.backing->key_state_bits,b.backing->value_state_bits};
+            records.push_back({id,key,value,index,bytes,bits});bytes+=count;
+        }
+        if(bytes>capacity){data=std::make_unique_for_overwrite<uint8_t[]>(bytes);capacity=bytes;}
+        std::vector<qsa::RamKvReadInto> reads;reads.reserve(records.size());
+        std::map<size_t,std::vector<QsaIndexArchive::Slice>> indices;
+        for(const auto& record:records) {
+            auto* destination=data.get()+record.offset;
+            reads.push_back({&s.kv->blocks[record.id],destination,record.key+record.value});
+            indices[record.index].push_back({s.index[record.id].get(),destination+record.key+record.value});
+        }
+        {
+            tyloinfer::ScopedFileReadWindow sequential;
+            qsa::read_packed_snapshot_images(reads);
+            for(const auto& [size,slices]:indices)QsaIndexArchive::read_slices_into(slices,0,size,size);
+        }
+        for(const auto& record:records) {
+            const auto& b=s.kv->blocks[record.id];const auto* payload=data.get()+record.offset;
+            w.scalar<uint32_t>(uint32_t(b.tier));
+            for(auto n:b.bytes)w.scalar<uint64_t>(n);
+            w.scalar<uint64_t>(b.access);
+            for(auto n:record.bits)w.scalar<uint32_t>(n);
+            w.scalar<uint64_t>(record.key);w.scalar<uint64_t>(record.value);w.scalar<uint64_t>(record.index);
+            w.raw(payload,record.key+record.value+record.index);
+        }
+        begin+=records.size();
     }
     if(exact && s.tokens%4) {write_tail(w,s.tail_keys);write_tail(w,s.tail_values);write_tail(w,s.tail_index);}
 }

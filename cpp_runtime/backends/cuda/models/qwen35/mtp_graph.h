@@ -6,6 +6,7 @@
 #include "core/decode_graph.h"
 #include "runtime/decode_window.h"
 #include "mfq_cuda_context.h"
+#include "mfq_cuda_resident_allocations.h"
 #include "runtime/graph_pool_lease.h"
 #include "runtime/gdn_recorded_replay_batch.h"
 #include "mfq_cuda_sampling_ops.h"
@@ -50,6 +51,8 @@ class MtpTargetGraphs {
     uint64_t rollback_captures_ = 0, rollback_replays_ = 0;
     std::vector<const void*> addresses_;
     std::vector<Tensor> replay_workspace_;
+    struct SharedCheckpoint {Tensor convolution,recurrent;};
+    std::map<LinearAttentionBlock*,SharedCheckpoint> shared_checkpoints_;
 
     std::vector<const void*> state_addresses() const {
         std::vector<const void*> result;
@@ -103,7 +106,7 @@ public:
         if(!eligible(model_,ids))return {};
         const auto addresses=state_addresses();
         if(addresses!=addresses_) {
-            cells_.clear();active_=nullptr;addresses_=addresses;
+            cells_.clear();shared_checkpoints_.clear();active_=nullptr;addresses_=addresses;
         }
         const auto tokens=ids.size(1),start=model_.cache_pos;
         if(planned_length<=0)planned_length=model_.max_position_embeddings();
@@ -126,6 +129,14 @@ public:
             cell.positions.copy_(positions);cell.lengths.fill_(start+tokens);
         }
         if(!cell.graph.valid()) {
+            if(confirmed) {
+                const ResidentAllocationScope resident;
+                for(const auto& block:model_.blocks)if(auto* b=dynamic_cast<LinearAttentionBlock*>(block.get())) {
+                    auto& shared=shared_checkpoints_[b];
+                    if(!shared.convolution.defined())shared.convolution=mfq_tensor_backend::empty_like(b->mixer.convolution);
+                    if(!shared.recurrent.defined())shared.recurrent=mfq_tensor_backend::empty_like(b->mixer.recurrent);
+                }
+            }
             struct Saved {LinearAttentionBlock* block;Tensor convolution,recurrent;};
             std::vector<Saved> saved;
             for(const auto& block:model_.blocks)if(auto* b=dynamic_cast<LinearAttentionBlock*>(block.get()))
@@ -153,8 +164,17 @@ public:
                     planned_length,FullBlock::kDecodeAttentionMaxParts);
                 context.sequence_lengths=cell.lengths;
                 for(const auto& block:model_.blocks) {
+                    auto* linear=confirmed?dynamic_cast<LinearAttentionBlock*>(block.get()):nullptr;
+                    if(linear)linear->mixer.speculative_convolution=shared_checkpoints_.at(linear).convolution;
                     block->set_token_ids(cell.ids);
                     hidden=block->forward_context(*model_.execution,std::move(hidden),context,model_.rope);
+                    if(linear) {
+                        // Only one verification window is active. Its final
+                        // recurrence and rollback snapshot can serve all widths.
+                        auto& shared=shared_checkpoints_.at(linear);
+                        shared.recurrent.copy_(linear->mixer.speculative_recurrent);
+                        linear->mixer.speculative_recurrent=shared.recurrent;
+                    }
                     model_.adapter_capture_hidden(hidden);
                 }
                 model_.adapter_finish_forward(cell.positions,1,tokens);

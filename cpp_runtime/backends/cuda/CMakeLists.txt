@@ -90,6 +90,7 @@ set_target_properties(mfq-cuda-core PROPERTIES
 set(TYLOINFER_CUDA_KERNEL_SOURCES
     ${TYLOINFER_CUDA_ROOT}/kernels/qsa_ram.cu
     ${TYLOINFER_CUDA_ROOT}/kernels/qsa_tq.cu
+    ${TYLOINFER_CUDA_ROOT}/kernels/qsa_history.cu
     ${TYLOINFER_CUDA_ROOT}/kernels/qsa_tq_fa.cu
     ${TYLOINFER_CUDA_ROOT}/kernels/qsa_tq_encode.cu
     ${TYLOINFER_CUDA_ROOT}/kernels/qsa_tq_fit.cu
@@ -112,6 +113,7 @@ set(TYLOINFER_CUDA_KERNEL_SOURCES
     ${TYLOINFER_CUDA_ROOT}/kernels/gguf_q6_group.cu
     ${TYLOINFER_CUDA_ROOT}/kernels/gguf_gemm.cu
     ${TYLOINFER_CUDA_ROOT}/kernels/gguf_tensorcore.cu
+    ${TYLOINFER_CUDA_ROOT}/kernels/gguf_w8a8.cu
     ${TYLOINFER_CUDA_ROOT}/kernels/gguf_prefill_scale.cu
     ${TYLOINFER_CUDA_ROOT}/kernels/gguf_mmq.cu
     ${TYLOINFER_CUDA_ROOT}/kernels/gguf_window.cu
@@ -1014,6 +1016,12 @@ if(BUILD_TESTING)
     target_link_libraries(tyloinfer-cuda-qwen35-predictor-queue-test PRIVATE mfq-cuda-runtime)
     add_test(NAME tyloinfer-cuda-qwen35-predictor-queue-test COMMAND tyloinfer-cuda-qwen35-predictor-queue-test)
     set_tests_properties(tyloinfer-cuda-qwen35-predictor-queue-test PROPERTIES SKIP_RETURN_CODE 77)
+    add_executable(tyloinfer-cuda-qwen35-target-checkpoint-test ${TYLOINFER_CUDA_ROOT}/tests/qwen35_target_checkpoint_test.cpp)
+    mfq_configure_cuda_runtime_target(tyloinfer-cuda-qwen35-target-checkpoint-test)
+    target_compile_definitions(tyloinfer-cuda-qwen35-target-checkpoint-test PRIVATE TYLOINFER_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
+    target_link_libraries(tyloinfer-cuda-qwen35-target-checkpoint-test PRIVATE mfq-cuda-runtime)
+    add_test(NAME tyloinfer-cuda-qwen35-target-checkpoint-test COMMAND tyloinfer-cuda-qwen35-target-checkpoint-test)
+    set_tests_properties(tyloinfer-cuda-qwen35-target-checkpoint-test PROPERTIES SKIP_RETURN_CODE 77)
     add_executable(tyloinfer-cuda-attention-mma-prefill-test ${TYLOINFER_CUDA_ROOT}/tests/attention_mma_prefill_test.cpp)
     mfq_configure_cuda_runtime_target(tyloinfer-cuda-attention-mma-prefill-test)
     target_compile_definitions(tyloinfer-cuda-attention-mma-prefill-test PRIVATE TYLOINFER_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
@@ -1091,12 +1099,23 @@ if(BUILD_TESTING)
         ${TYLOINFER_CUDA_ROOT}/tests/gguf_iq_codebook_test.cu)
     add_test(NAME tyloinfer-cuda-gguf-row-correction-test COMMAND tyloinfer-cuda-gguf-runtime-test --row-correction-check)
     set_tests_properties(tyloinfer-cuda-gguf-row-correction-test PROPERTIES SKIP_RETURN_CODE 77)
+    add_test(NAME tyloinfer-cuda-gguf-quad-w8a8-test COMMAND tyloinfer-cuda-gguf-runtime-test --quad-w8a8-check)
+    add_test(NAME tyloinfer-cuda-gguf-mapped-weight-test COMMAND tyloinfer-cuda-gguf-runtime-test --mapped-dense-weight-check)
+    add_test(NAME tyloinfer-cuda-gguf-shared-w8a8-test COMMAND tyloinfer-cuda-gguf-runtime-test --shared-w8a8-prefill-check)
+    set_tests_properties(tyloinfer-cuda-gguf-shared-w8a8-test PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(tyloinfer-cuda-gguf-mapped-weight-test PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(tyloinfer-cuda-gguf-quad-w8a8-test PROPERTIES SKIP_RETURN_CODE 77)
     add_executable(tyloinfer-cuda-dflash2-test ${TYLOINFER_CUDA_ROOT}/tests/dflash2_test.cpp)
     add_executable(tyloinfer-cuda-gguf-window-test ${TYLOINFER_CUDA_ROOT}/tests/gguf_window_test.cpp)
     mfq_configure_cuda_runtime_target(tyloinfer-cuda-gguf-window-test)
     target_link_libraries(tyloinfer-cuda-gguf-window-test PRIVATE mfq-cuda-runtime)
     add_test(NAME tyloinfer-cuda-gguf-window-test COMMAND tyloinfer-cuda-gguf-window-test)
     set_tests_properties(tyloinfer-cuda-gguf-window-test PROPERTIES SKIP_RETURN_CODE 77)
+    add_executable(tyloinfer-cuda-gguf-w8a8-test ${TYLOINFER_CUDA_ROOT}/tests/gguf_w8a8_test.cpp)
+    mfq_configure_cuda_runtime_target(tyloinfer-cuda-gguf-w8a8-test)
+    target_link_libraries(tyloinfer-cuda-gguf-w8a8-test PRIVATE mfq-cuda-runtime)
+    add_test(NAME tyloinfer-cuda-gguf-w8a8-test COMMAND tyloinfer-cuda-gguf-w8a8-test)
+    set_tests_properties(tyloinfer-cuda-gguf-w8a8-test PROPERTIES SKIP_RETURN_CODE 77)
     add_executable(tyloinfer-cuda-gr-bf16-test ${TYLOINFER_CUDA_ROOT}/tests/gr_bf16_test.cpp)
     mfq_configure_cuda_runtime_target(tyloinfer-cuda-gr-bf16-test)
     target_link_libraries(tyloinfer-cuda-gr-bf16-test PRIVATE mfq-cuda-runtime)

@@ -376,6 +376,14 @@ void QsaKvStore::flush() {
     impl_->check();
 }
 
+std::size_t QsaKvStore::read_offset(const BlockPtr& block) const {
+    if(!block)throw std::invalid_argument("Missing QSA KV microblock");
+    return block->offset;
+}
+std::size_t QsaKvStore::read_size(const BlockPtr& block) const {
+    if(!block)throw std::invalid_argument("Missing QSA KV microblock");
+    return block->bytes;
+}
 void QsaKvStore::read_into_batch(const std::vector<ReadRequest>& requests) {
     for(const auto& r:requests)if(!r.block || !r.destination || r.bytes!=r.block->bytes)
         throw std::invalid_argument("QSA KV batch destination differs from its block");
@@ -389,8 +397,8 @@ void QsaKvStore::read_into_batch(const std::vector<ReadRequest>& requests) {
         }
     }
     std::sort(disk.begin(),disk.end(),[](const auto* a,const auto* b){return a->block->offset<b->block->offset;});
-    constexpr std::size_t window=tyloinfer::ScopedFileReadWindow::capacity;
     const bool sequential=tyloinfer::ScopedFileReadWindow::read_ahead_enabled();
+    const std::size_t window=sequential?std::size_t(1)<<20:tyloinfer::ScopedFileReadWindow::capacity;
     std::size_t requested=0,physical=0,operations=0;
     std::vector<std::uint8_t> buffer;
     for(std::size_t begin=0;begin<disk.size();) {

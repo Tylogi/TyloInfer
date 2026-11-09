@@ -2,7 +2,10 @@
 #include "storage/weight_loader.h"
 #include "storage/model_loader.h"
 #include "storage/mapped_embedding.h"
+#include "storage/dense_weight_placement.h"
 #include "mfq_weight_memory.h"
+#include "mfq_cuda_resident_allocations.h"
+#include "tyloinfer/gguf_quant.h"
 #include "models/qwen4_exp/mtp.h"
 #include "models/glm5_next/mtp.h"
 #include "models/qwen35/mtp.h"
@@ -65,6 +68,18 @@ template <class Model> struct CudaWeightLoader {
             model.execution->config.moe_pipeline && model.execution->config.moe_ram_pcie;
         const auto& dtype=require_tensor(source,name).dtype;
         const bool nint=mfq::mfq_compat_enabled && dtype=="NINT";
+        if((use_mapped || (!mapped && mfq::cuda::DenseWeightPlacementScope::limited())) &&
+                !mapped_control && model.has_independent_output_weights(*this) &&
+                !model.execution->tensor_parallel.enabled() && !model.execution->loading_cpu_layer &&
+                (use_mapped || mfq::cuda::DenseWeightPlacementScope::limited()) && mfq::gguf::is_quantized(dtype)) {
+            // Only selected embedding rows are read. Preserve device residency
+            // for projections that consume their complete matrix each token.
+            const mfq::cuda::DenseWeightPlacementScope host_rows(true,std::size_t(0));
+            auto result=load_quant_linear(*model.execution,source,name);
+            std::cerr<<"mapped_quantized_token_embedding rows="<<result.out()<<" width="<<result.neuron_len()
+                     <<" dtype="<<dtype<<" read=mapped_host"<<std::endl;
+            return result;
+        }
         if(use_mapped && model.has_independent_output_weights(*this) &&
                 !model.execution->tensor_parallel.enabled() && !model.execution->loading_cpu_layer &&
                 (dtype=="BF16" || dtype=="F16" || dtype=="F32" || nint)) {
@@ -226,13 +241,19 @@ Model mfq::cuda::load_causal_lm(CudaExecutionContext &execution, const std::stri
         }
     }
 
+    const mfq::cuda::DenseWeightPlacementScope weight_placement(model.num_experts()<=0);
     CudaWeightLoader<Model> weights{model, source};
+    {
+    // Immutable model tensors must not pin temporary prefill allocator pages.
+    // Routed images retain their separate, revocable allocation scope.
+    const mfq::cuda::ResidentAllocationScope resident_weights;
     if (load_input_output) {
         model.load_weights(weights, load_blocks);
     } else {
         if (load_blocks) throw std::invalid_argument("streamed model setup requires deferred blocks");
         model.adapter_load_final_state(source, model.output_norm);
         model.adapter_prepare_blocks(source);
+    }
     }
 
     execution.loading_cpu_layer = false;

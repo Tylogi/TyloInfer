@@ -2,6 +2,64 @@
 
 #include "gguf_split_activation_test.h"
 
+void run_quad_w8a8(bool quad=true) {
+    namespace gg=mfq::cuda::gguf;
+    const auto context=mfq::cuda::default_context(mfq_current_cuda_device());
+    const auto stream_handle=mfq_get_current_cuda_stream(mfq_current_cuda_device());
+    const auto stream=stream_handle.stream();
+    const auto same_bytes=[](tb::Tensor a,tb::Tensor b) {
+        a=a.to(tb::kCPU);b=b.to(tb::kCPU);
+        return a.nbytes()==b.nbytes() && std::memcmp(a.data_ptr(),b.data_ptr(),a.nbytes())==0;
+    };
+    int cases=0;
+    const std::vector<ggml_type> formats=quad?
+        std::vector<ggml_type>{GGML_TYPE_IQ1_S,GGML_TYPE_IQ1_M,GGML_TYPE_IQ2_XXS,GGML_TYPE_IQ2_XS,
+                              GGML_TYPE_IQ2_S,GGML_TYPE_IQ3_XXS,GGML_TYPE_IQ3_S,GGML_TYPE_Q2_K}:
+        std::vector<ggml_type>{GGML_TYPE_Q3_K,GGML_TYPE_Q4_K,GGML_TYPE_Q5_K,GGML_TYPE_Q6_K,
+                              GGML_TYPE_IQ4_XS,GGML_TYPE_IQ4_NL,GGML_TYPE_Q8_0,GGML_TYPE_PTQ1_0};
+    for(auto type:formats)
+    for(int rows:{1,7,17})for(int columns:type==GGML_TYPE_PTQ1_0?
+            std::vector<int>{128,256,640,768,5120,17408}:std::vector<int>{256,768,5120}) {
+        Source source;source.add("w",{rows,columns},type);
+        if(type==GGML_TYPE_PTQ1_0)source.full_compact_codes("w",type);
+        auto native=load_gguf_weight(source,"w",mfq_current_cuda_device());
+        auto packed=quad?tb::empty_like(native.packed):native.packed;
+        if(quad)gg::pack_quad_storage(type,native.packed.data_ptr(),native.row_bytes,rows,columns,packed.data_ptr(),stream);
+        auto decoded=native.dequantize_stored();
+        for(int begin:{0,rows-1}) {
+            const int count=rows-begin;
+            auto expected=tb::empty({count,columns},packed.options());
+            auto actual=tb::empty_like(expected);
+            auto reference_scales=tb::empty({count},decoded.options());
+            auto scales=tb::empty_like(reference_scales);
+            gg::w8a8::pack(decoded.data_ptr<float>()+begin*columns,false,count,columns,columns,
+                static_cast<std::int8_t*>(expected.data_ptr()),reference_scales.data_ptr<float>(),stream);
+            const auto invoke=[&] {
+                if(quad)return gg::decode_quad_rows_w8a8(type,packed.data_ptr(),rows,columns,begin,count,
+                    static_cast<std::int8_t*>(actual.data_ptr()),scales.data_ptr<float>(),stream);
+                return gg::decode_rows_w8a8(type,packed.data_ptr<std::uint8_t>()+begin*native.row_bytes,native.row_bytes,count,columns,
+                    static_cast<std::int8_t*>(actual.data_ptr()),scales.data_ptr<float>(),stream);
+            };
+            // Resource-limited devices retain the independently tested
+            // decoder plus pack path; no model or device whitelist is used.
+            const bool supported=gg::supports_rows_w8a8(type,packed.data_ptr(),columns,quad);
+            const bool launched=invoke();
+            require(supported==launched,"Fused W8A8 resource query disagrees with dispatch");
+            if(!launched)continue;
+            TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(stream));
+            require(same_bytes(actual,expected),"Fused W8A8 codes differ from separate decode/rotation");
+            require(same_bytes(scales,reference_scales),"Fused W8A8 scales differ from separate decode/rotation");
+            MfqCudaGraph graph;
+            graph.capture_begin();require(invoke(),"Fused W8A8 graph eligibility changed");graph.capture_end();graph.replay();
+            TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(stream));
+            require(same_bytes(actual,expected),"Fused W8A8 graph changed packed codes");
+            ++cases;
+        }
+    }
+    require(cases>0,"No fused W8A8 rows were tested on this device");
+    std::cout<<"GGUF fused W8A8 "<<(quad?"quad":"canonical")<<" decode checks PASS cases="<<cases<<'\n';
+}
+
 void run_quad_decode_views() {
     namespace gg=mfq::cuda::gguf;
     const auto context=mfq::cuda::default_context(mfq_current_cuda_device());
