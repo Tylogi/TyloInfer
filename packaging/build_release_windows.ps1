@@ -267,6 +267,8 @@ function Initialize-BuildEnvironment {
     Add-ToPath ([System.IO.Path]::Combine(
         [Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFilesX86), "NSIS"))
     Import-VisualStudioEnvironment
+    # Python extension builds must use the initialized SDK and toolchain.
+    $env:DISTUTILS_USE_SDK = "1"
 
     $Context.CudaRoot = Find-CudaRoot
     $env:CUDA_PATH = $Context.CudaRoot
@@ -472,7 +474,7 @@ function Build-NativeSidecar {
         "-G", "Ninja",
         "-DCMAKE_BUILD_TYPE=Release",
         "-DCMAKE_C_FLAGS=$env:CFLAGS",
-        "-DCMAKE_CXX_FLAGS=$env:CXXFLAGS",
+        "-DCMAKE_CXX_FLAGS=$env:CXXFLAGS /EHsc",
         "-DCMAKE_CUDA_FLAGS=$env:CUDAFLAGS $cudaFlags",
         "-DCMAKE_CUDA_COMPILER=$([System.IO.Path]::Combine($Context.CudaRoot, 'bin', 'nvcc.exe'))",
         "-DCMAKE_CUDA_ARCHITECTURES=$Architectures",

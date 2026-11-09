@@ -245,9 +245,12 @@ size_t session_tensor_bytes(const mfq_tensor_backend::Tensor& tensor);
 
 CudaPagedPayload encode_cuda_qwen4_paged_block(const TextSessionState&,size_t,size_t);
 TextSessionState decode_cuda_qwen4_paged_session(const std::vector<CudaPagedPayload>&,const std::vector<int64_t>&,size_t);
+TextSessionState decode_cuda_qwen4_paged_session(const std::vector<CudaPagedPayload>&,const std::vector<int64_t>&,size_t,bool host_recurrent);
 namespace mfq::cache {class PagedPrefixCache;struct PagedPrefixReadLease;}
 TextSessionState decode_cuda_qwen4_paged_prefix(mfq::cache::PagedPrefixCache&,
     std::vector<std::array<uint8_t,32>>&,const std::vector<int64_t>&,size_t);
+TextSessionState decode_cuda_qwen4_paged_prefix(mfq::cache::PagedPrefixCache&,
+    std::vector<std::array<uint8_t,32>>&,const std::vector<int64_t>&,size_t,bool host_recurrent);
 void bind_cuda_qwen4_paged_prefix(const TextSessionState&,mfq::cache::PagedPrefixCache&,
     const std::vector<std::array<uint8_t,32>>&);
 void refresh_cuda_qwen4_session_bytes(TextSessionState&);

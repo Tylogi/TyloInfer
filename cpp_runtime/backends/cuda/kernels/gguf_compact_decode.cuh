@@ -21,7 +21,7 @@ static __device__ __forceinline__ float scale_at(const std::uint8_t* at) {
     value.x = std::uint16_t(at[0]) | (std::uint16_t(at[1]) << 8);
     return __half2float(__half(value));
 }
-static __device__ __forceinline__ std::uint32_t ternary_four(const std::uint8_t* q, int lane) {
+static __device__ __forceinline__ std::uint32_t ternary_four(const std::uint8_t* q, int lane,bool aligned=false) {
     // PTQ1_0 stores digit planes over 16-byte, 8-byte and 2-byte tiles.
     // The last two lanes each span two planes of the final two bytes.
     constexpr std::uint32_t mask = 0x00ff00ffu, low = 0x00030003u;
@@ -30,7 +30,8 @@ static __device__ __forceinline__ std::uint32_t ternary_four(const std::uint8_t*
         const int digit = lane < 20 ? lane / 4 : (lane - 20) / 2;
         const int byte = lane < 20 ? (lane % 4) * 4 : 16 + ((lane - 20) % 2) * 4;
         const std::uint32_t power = (0x511b090301ULL >> (digit * 8)) & 255u;
-        const auto word = std::uint32_t(q[byte]) | (std::uint32_t(q[byte + 1]) << 8) |
+        const auto word = aligned?__ldg(reinterpret_cast<const std::uint32_t*>(q+byte)):
+            std::uint32_t(q[byte]) | (std::uint32_t(q[byte + 1]) << 8) |
             (std::uint32_t(q[byte + 2]) << 16) | (std::uint32_t(q[byte + 3]) << 24);
         // Two independent 16-bit lanes: 255*81 < 2^16. Masking reproduces
         // the normative uint8 wrap before *3, whose result is also <2^16.

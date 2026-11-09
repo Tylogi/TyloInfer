@@ -1,4 +1,5 @@
 #include "ffn.h"
+#include "gguf_prefill_fusion.h"
 #include "models/common/gated_mlp.h"
 #include "models/common/moe.h"
 
@@ -14,6 +15,8 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <optional>
 #include <stdexcept>
 #include <utility>
@@ -1105,12 +1108,20 @@ std::optional<mfq_tensor_backend::Tensor> FFN::try_forward_gguf_prefill_residual
         auto down_output=down.forward_input_mul(execution,parts[1],parts[0],2);
         return acc_cuda(residual,down_output.to(tb::kFloat16).contiguous());
     }
-    auto hidden=tb::empty_like(parts[0]);const auto stream=mfq_get_current_cuda_stream(input.get_device());
-    for(const auto& tensor:{parts[0],parts[1],hidden})mfq_cuda_record_stream(tensor,stream);
-    execution.profiler.measure("ffn.swiglu",[&]{
-        mfq::cuda::gguf::materialize_gated_input(parts[1].data_ptr(),parts[0].data_ptr(),true,hidden.numel(),true,hidden.data_ptr(),stream.stream());
-        return 0;
-    });
+    tb::Tensor hidden;
+    auto packet=GgufPrefillInputScope::prepare_gated(parts[1],parts[0],true,hidden);
+    if(packet)if(const auto* trace=std::getenv("TYLOINFER_TRACE_KERNEL_DISPATCH");trace && trace[0]=='1') {
+        static std::atomic<bool> reported{false};
+        if(!reported.exchange(true))std::fprintf(stderr,"native_gguf_ffn_residual_w8a8 actual_match=1 fused_gate=1 shared_input=1\n");
+    }
+    if(!packet) {
+        hidden=tb::empty_like(parts[0]);const auto stream=mfq_get_current_cuda_stream(input.get_device());
+        for(const auto& tensor:{parts[0],parts[1],hidden})mfq_cuda_record_stream(tensor,stream);
+        execution.profiler.measure("ffn.swiglu",[&]{
+            mfq::cuda::gguf::materialize_gated_input(parts[1].data_ptr(),parts[0].data_ptr(),true,hidden.numel(),true,hidden.data_ptr(),stream.stream());
+            return 0;
+        });
+    }
     return execution.profiler.measure("ffn.down_residual",[&]{return down.gguf.forward_base(hidden,true,residual);});
 }
 

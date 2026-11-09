@@ -675,7 +675,10 @@ void matvec_group(const DenseProjection* projections,std::size_t count,std::int6
                 entry.warps=canonical_iq4_k_warps(columns);
                 entry.cooperative=tokens>1 && entry.warps>1 && p.rows<=INT_MAX/tokens && p.stride<=INT_MAX;
             }
-            if constexpr(Format==GGML_TYPE_Q8_0 || Format==GGML_TYPE_Q3_K || Format==GGML_TYPE_IQ4_NL)if(tokens>1 && p.rows<=INT_MAX/tokens && p.stride<=INT_MAX) {
+            // Match the standalone reduction: below its cooperative threshold
+            // it scales partial integer dots instead of complete Q8 groups.
+            if constexpr(Format==GGML_TYPE_Q8_0 || Format==GGML_TYPE_Q3_K || Format==GGML_TYPE_IQ4_NL)if(tokens>1 &&
+                    columns/Dot<Format>::qk*Dot<Format>::parts>=64 && p.rows<=INT_MAX/tokens && p.stride<=INT_MAX) {
                 entry.whole_group=true;entry.cooperative=true;
                 entry.warps=projection_reduction_warps(columns/WholeQ8Prepared::qk);
             }

@@ -199,9 +199,25 @@ int tq_sparse_attention(const void* query, const float* key_signs, const float* 
 // Transient FP16 token tiles retain the exact operands of the streaming MMA
 // kernel. Compressed resident/archive images remain unchanged.
 bool tq_prefill_staging_available(int heads,int kv_heads,int padded);
+int tq_selected_block_mask(const SelectedBlock* selected,std::uint32_t* requested,
+    int queries,int count,int blocks,cudaStream_t stream);
+// Accumulate causal recall membership without clearing earlier queries.
+int tq_accumulate_recall_bits(const SelectedBlock* selected,const std::int64_t* positions,
+    std::uint32_t* recalled,int queries,int count,int blocks,cudaStream_t stream);
+// Source records may be mapped pinned packets; the caller retains them until
+// the stream completes. Destination indices are validated by the host planner.
+int tq_scatter_prefill_views(const TqBlockView* source,const std::int32_t* ids,
+    TqBlockView* destination,int count,cudaStream_t stream);
 int tq_stage_attention_blocks(const TqBlockView* blocks,const std::uint16_t* relative,
     std::uint16_t* keys,std::uint16_t* values,int count,int heads,int padded,cudaStream_t stream,
     const SelectedBlock* selected,int queries,int selected_count,std::uint32_t* requested);
+// Compact decoded storage retains original block IDs in selection/history.
+// map has block_count entries. ids must cover the unique valid selection
+// union; min(block_count, queries*count) is sufficient when it is unknown.
+int tq_stage_attention_compact(const TqBlockView* blocks,const std::uint16_t* relative,
+    std::uint16_t* keys,std::uint16_t* values,int block_count,int heads,int padded,
+    const SelectedBlock* selected,int queries,int count,std::int32_t* map,
+    std::int32_t* ids,std::int32_t* used,cudaStream_t stream);
 int tq_sparse_attention_staged(const std::uint16_t* staged_keys, const std::uint16_t* staged_values, const void* query, const float* key_signs, const float* value_signs,
     const std::uint16_t* relative, const TqBlockView* blocks, const SelectedBlock* selected,
     const std::int64_t* positions, void* output, float* rotated_query,

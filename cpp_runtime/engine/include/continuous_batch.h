@@ -42,7 +42,7 @@ template <class Ops> class ContinuousBatch {
         std::optional<PrefillChunk> prefill;
         std::optional<Sample> result;
         std::exception_ptr failure;
-        bool decode = false, active = false;
+        bool decode = false, active = false, prepared = false;
     };
     int64_t prefill_chunk_size, prefill_token_budget;
     Ops operations;
@@ -74,7 +74,7 @@ template <class Ops> class ContinuousBatch {
             if (work.active) {
                 std::erase(state.active, work.request);
                 operations.retire({work.request}, cache_position());
-            } else if (!work.failure) {
+            } else if (!work.failure && work.prepared) {
                 operations.suspend_decode();
                 operations.discard_prefill(work.request);
                 operations.resume_decode(cache_position());
@@ -148,8 +148,25 @@ template <class Ops> class ContinuousBatch {
         ExecutionCleanup cleanup{output.cleanup_failure, [&] { release(*work); }};
         SequenceOps ops{*this, *work};
         int64_t reused = 0, prefix = 0;
-        if constexpr (requires { operations.prepare(work->request); })
-            reused = operations.prepare(work->request);
+        if constexpr (requires { operations.prepare(work->request); }) {
+            while(!output.stopped()) {
+                work->prepared=true;
+                const auto prepared=operations.prepare(work->request);
+                if constexpr(requires { prepared.has_value(); }) {
+                    // An empty result owns no request resources and yields
+                    // admission until established requests release capacity.
+                    if(!prepared) {
+                        work->prepared=false;
+                        co_yield StepState::waiting;
+                        continue;
+                    }
+                    reused=*prepared;
+                }else reused=prepared;
+                break;
+            }
+            if(output.stopped())co_return;
+        }
+        work->prepared=true;
         if constexpr (requires { operations.prefix_tokens(work->request); })
             prefix = operations.prefix_tokens(work->request);
         auto sequence = generate_sequence(ops, output, input.prompt.size(), reused, prefix, prefill_chunk_size);

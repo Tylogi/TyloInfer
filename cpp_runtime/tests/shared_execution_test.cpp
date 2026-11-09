@@ -24,6 +24,7 @@
 #include <cassert>
 #include <numeric>
 #include <map>
+#include <set>
 
 using namespace mfq::engine;
 
@@ -165,6 +166,59 @@ void packed_prefill_plain_sample_test() {
     assert(groups[0] == std::vector<std::string>({"0", "1"}));
     assert(groups[1] == std::vector<std::string>{"2"} && groups[2] == std::vector<std::string>{"2"});
     for (const auto& row : tokens) assert(row == std::vector<int64_t>({10, 11}));
+}
+
+void deferred_preparation_test() {
+    struct Log {
+        std::set<std::string> live;
+        std::vector<std::string> prepared;
+        unsigned waits=0,unprepared_discards=0,suspends=0;
+    };
+    struct DeferredOps : BatchOps {
+        Log& log;
+        explicit DeferredOps(Log& value):log(value){}
+        std::optional<std::size_t> prepare(const std::shared_ptr<Request>& request) {
+            if(!log.live.empty()){++log.waits;return {};}
+            log.live.insert(request->id);log.prepared.push_back(request->id);return 0;
+        }
+        void suspend_decode(){++log.suspends;}
+        void discard_prefill(const std::shared_ptr<Request>& request) {
+            if(!log.live.erase(request->id))++log.unprepared_discards;
+        }
+        void retire(const std::vector<std::shared_ptr<Request>>& requests,int64_t) {
+            for(const auto& request:requests)assert(log.live.erase(request->id)==1);
+        }
+    };
+    for(bool cancel:{false,true}) {
+        Log log;BatchExecution<DeferredOps> ops(log);RequestExecutor executor(2);
+        std::map<std::string,std::vector<int64_t>> tokens;
+        std::map<std::string,int> failures,terminals;
+        const auto tick=[&](std::vector<RequestId> eligible) {
+            auto result=executor.step(eligible,ops);assert(result.status.healthy);
+            for(const auto& event:result.events) {
+                if(const auto* delta=std::get_if<OutputDelta>(&event.data))
+                    tokens[event.id].insert(tokens[event.id].end(),delta->token_ids.begin(),delta->token_ids.end());
+                failures[event.id]+=std::holds_alternative<Failed>(event.data);
+                terminals[event.id]+=terminal(event.data);
+            }
+        };
+        executor.admit(batch_request("resident",2,5),nullptr,batch_info(),ops);
+        for(int i=0;i<20 && tokens["resident"].empty();++i)tick({"resident"});
+        assert(tokens["resident"]==std::vector<int64_t>{10});
+        executor.admit(batch_request("waiting",2,3),nullptr,batch_info(),ops);
+        tick({"resident","waiting"});
+        assert(log.waits && log.prepared==std::vector<std::string>{"resident"});
+        if(cancel) {
+            const auto suspends=log.suspends;executor.cancel("waiting");tick({"resident"});
+            assert(log.suspends==suspends && log.unprepared_discards==0);
+        }
+        for(int i=0;i<80 && !executor.empty();++i)tick({"resident","waiting"});
+        assert(executor.empty() && log.live.empty() && log.unprepared_discards==0);
+        assert(tokens["resident"]==std::vector<int64_t>({10,11,12,13,14}));
+        assert(failures["resident"]==0 && failures["waiting"]==0 && terminals["resident"]==1 && terminals["waiting"]==1);
+        if(cancel)assert(tokens["waiting"].empty() && log.prepared.size()==1);
+        else assert(tokens["waiting"]==std::vector<int64_t>({10,11,12}) && log.prepared==std::vector<std::string>({"resident","waiting"}));
+    }
 }
 
 void staggered_decode_batch_test() {
@@ -1770,6 +1824,12 @@ struct ParameterLoader {
     }
     static Tensor gdn(GdnWeights w, const mfq::models::qwen4_exp::Config &) { return w[0]; }
     static Tensor qsa(QsaWeights w, const mfq::models::qwen4_exp::Config &) { return w[0]; }
+    Tensor dense_ffn(const std::string &p, const mfq::models::qwen4_exp::Config &) {
+        auto gate = linear(p + ".gate.weight");
+        linear(p + ".up.weight");
+        linear(p + ".down.weight");
+        return gate;
+    }
     template <class... Args> static Tensor moe(Args &&...) { return "moe"; }
     static Tensor gated_mlp(Tensor gate, Tensor, Tensor, double) { return gate; }
     auto embedding(const std::string &name) {
@@ -1795,6 +1855,7 @@ static void family_parameter_loading_test() {
     using namespace mfq::models;
     qwen4_exp::Config q{};
     q.hidden = 8; q.streams = 2; q.ngram = 2; q.ngram_heads = 1; q.shards = 2;
+    q.experts = 2;
     q.layer_types = {"linear_attention", "full_attention"}; q.ple_layers = {1};
     q.predictor_layers = 3; // Predictor depth is independent of the backbone schedule.
     ParameterLoader qops;
@@ -1803,6 +1864,25 @@ static void family_parameter_loading_test() {
     assert(linear.gdn == "model.block.0.linear_attention.qkv.weight" && linear.qsa.empty());
     assert(linear.ple == "model.block.0.position_embedding.ngram.shard.0.weight");
     assert(sparse.qsa == "model.block.1.attention.query.weight" && sparse.gdn.empty() && sparse.ple.empty());
+    assert(linear.ffn == "moe" && sparse.ffn == "moe");
+    auto dense_config = q;
+    dense_config.experts = 0;
+    ParameterLoader dense_ops;
+    dense_ops.qwen = true;
+    auto dense_linear = dense_ops.block(dense_config, 0, false);
+    auto dense_sparse = dense_ops.block(dense_config, 1, false);
+    assert(dense_linear.ffn == "model.block.0.mlp.gate.weight");
+    assert(dense_sparse.ffn == "model.block.1.mlp.gate.weight");
+    assert(dense_linear.gdn == linear.gdn && dense_sparse.qsa == sparse.qsa);
+    for (int layer = 0; layer < 2; ++layer) {
+        const auto p = "model.block." + std::to_string(layer) + ".mlp.";
+        for (const auto *role : {"gate", "up", "down"})
+            assert(std::find(dense_ops.names.begin(), dense_ops.names.end(),
+                             p + role + ".weight") != dense_ops.names.end());
+    }
+    for (const auto &name : dense_ops.names)
+        assert(name.find(".experts.") == std::string::npos &&
+               name.find(".router.") == std::string::npos);
     PredictorParameters<qwen4_exp::Config> qp;
     assert(qwen4_exp::load_predictor(qp, qops, q) && qp.layers.size() == 3 && qp.lengths.size() == 3);
     for (size_t i = 0; i < qp.layers.size(); ++i) {
@@ -2045,6 +2125,7 @@ int main() {
     batch_recoverable_failure_test();
     batch_alignment_test();
     staggered_decode_batch_test();
+    deferred_preparation_test();
     isolated_prefill_failure_test();
     packed_prefill_test();
     isolated_context_growth_test();

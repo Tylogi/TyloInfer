@@ -317,6 +317,75 @@ __device__ float4 input_four(const T* input, std::int64_t at, bool aligned) {
     }
 }
 
+// Four independent 128-value blocks share one warp. Each block uses eight
+// lanes and reuses its decoded integer quartets across the query window.
+__device__ __forceinline__ std::uint32_t ternary_packet_four(
+        std::uint32_t packet,int coordinate,unsigned active) {
+    constexpr std::uint32_t mask=0x00ff00ffu,low=0x00030003u;
+    const int index=coordinate<20?coordinate%4:coordinate<30?4+(coordinate-20)%2:6;
+    // All active lanes participate, including the final two-plane coordinates.
+    const auto word=__shfl_sync(active,packet,index,8);
+    std::uint32_t codes;
+    if(coordinate<30) {
+        const int digit=coordinate<20?coordinate/4:(coordinate-20)/2;
+        const std::uint32_t power=(0x511b090301ULL>>(digit*8))&255u;
+        const auto a=(((((word&mask)*power)&mask)*3)>>8)&low;
+        const auto b=((((((word>>8)&mask)*power)&mask)*3)>>8)&low;
+        codes=a|(b<<8);
+    }else {
+        const std::uint32_t power=(coordinate&1)?9u:1u;
+        const auto pair=(word&255u)|((word&0xff00u)<<8);
+        const auto a=(((((pair*power)&mask)*3)>>8)&low);
+        const auto b=(((((pair*(power*3))&mask)*3)>>8)&low);
+        codes=(a&255u)|((a>>8)&0xff00u)|((b<<16)&0xff0000u)|((b<<8)&0xff000000u);
+    }
+    return __vsub4(codes,0x01010101u);
+}
+template<int Tokens,class Output>
+// Limit register growth across four-query windows to preserve CTA occupancy.
+__global__ __launch_bounds__(128,8) void project_ptq_window(const std::uint8_t* weights,std::uint64_t stride,
+        std::int64_t rows,std::int64_t columns,const Q8* input,Output* output,bool aligned) {
+    const int lane=threadIdx.x%32,local=lane%8,group=lane/8;
+    for(auto tile=std::int64_t(blockIdx.x);tile<(rows+3)/4;tile+=gridDim.x) {
+        const auto row=tile*4+threadIdx.x/32;
+        if(row>=rows)continue;
+        float sums[Tokens]{};
+        for(auto block=std::int64_t(group);block<columns/128;block+=4) {
+            const auto* q=weights+row*stride+block*28;
+            const auto active=__activemask();
+            const auto* at=q+4*(local<7?local:6);
+            const auto packet=aligned?__ldg(reinterpret_cast<const std::uint32_t*>(at)):
+                std::uint32_t(at[0])|(std::uint32_t(at[1])<<8)|(std::uint32_t(at[2])<<16)|(std::uint32_t(at[3])<<24);
+            const auto scale_bits=__shfl_sync(active,packet,6,8);
+            const auto scale=__half2float(__ushort_as_half(std::uint16_t(scale_bits>>16)));
+            #pragma unroll
+            for(int part=0;part<4;++part) {
+                const int coordinate=local+part*8;
+                const auto codes=ternary_packet_four(packet,coordinate,active);
+                #pragma unroll
+                for(int m=0;m<Tokens;++m) {
+                    const auto& x=input[std::int64_t(m)*(columns/32)+block*4+coordinate/8];
+                    const auto values=*reinterpret_cast<const int*>(x.qs+(coordinate%8)*4);
+                    int dot=0;
+#if __CUDA_ARCH__ >= 610
+                    dot=__dp4a(int(codes),values,0);
+#else
+                    #pragma unroll
+                    for(int i=0;i<4;++i)dot+=std::int8_t(codes>>(8*i))*std::int8_t(unsigned(values)>>(8*i));
+#endif
+                    sums[m]+=scale*__half2float(x.d)*float(dot);
+                }
+            }
+        }
+        #pragma unroll
+        for(int m=0;m<Tokens;++m) {
+            #pragma unroll
+            for(int offset=16;offset;offset/=2)sums[m]+=__shfl_down_sync(0xffffffffu,sums[m],offset);
+            if(!lane)output[std::int64_t(m)*rows+row]=Output(sums[m]);
+        }
+    }
+}
+
 template<int Bits, int Steps, int Tile, bool ExactTile, class T, class Output>
 __global__ void project_compact(const std::uint8_t* weights, std::uint64_t stride,
         std::int64_t rows, std::int64_t columns, const T* input, std::int64_t tokens,
@@ -432,6 +501,25 @@ void compact_project(CompactFormat format, const void* packed, std::uint64_t str
         const auto launch_output = [&](auto* dest) {
             using Output = std::remove_pointer_t<decltype(dest)>;
             if (reinterpret_cast<std::uintptr_t>(dest) % alignof(Output)) throw std::invalid_argument("compact GGUF output alignment");
+            if constexpr(std::is_same_v<T,Q8>)if(format==CompactFormat::PTQ1_0 && tokens<=4) {
+                const bool aligned_weights=!(reinterpret_cast<std::uintptr_t>(packed)%4) && !(stride%4);
+                const auto launch=[&]<int Tile>() {
+                    const auto blocks=unsigned(std::min<std::int64_t>(65535,(rows+3)/4));
+                    project_ptq_window<Tile><<<blocks,128,0,stream>>>(static_cast<const std::uint8_t*>(packed),
+                        stride,rows,columns,x,dest,aligned_weights);
+                    check(cudaGetLastError());
+                    if(dispatch_trace::enabled())dispatch_trace::record(stream,"gguf_ptq_window",
+                        reinterpret_cast<const void*>(project_ptq_window<Tile,Output>),
+                        "format=143 token_tile="+std::to_string(Tile)+" block_lanes=8 packet_words=7 decode_reuse=1");
+                };
+                switch(tokens) {
+                    case 1:launch.template operator()<1>();break;
+                    case 2:launch.template operator()<2>();break;
+                    case 3:launch.template operator()<3>();break;
+                    default:launch.template operator()<4>();break;
+                }
+                return;
+            }
             const bool aligned = reinterpret_cast<std::uintptr_t>(x) % (std::is_same_v<T, __half> ? 4 : 16) == 0;
             dispatch(format, [&]<int Bits, int Steps>() {
                 const auto launch = [&]<int Tile, bool ExactTile>() {

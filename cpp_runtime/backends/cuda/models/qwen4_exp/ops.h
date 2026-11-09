@@ -13,6 +13,7 @@
 #include <vector>
 
 namespace mfq::cuda::qwen4_exp { struct Gr; struct Qwen4Block; }
+namespace mfq::cuda::internal { class TextSessionCache; }
 struct MtpModule;
 
 namespace mfq::cuda {
@@ -26,6 +27,7 @@ struct Qwen4HiddenCapture {
     mfq_tensor_backend::Tensor result(const mfq_tensor_backend::Tensor& fallback) const;
 };
 void qwen4_set_hidden_capture_layers(Qwen4CausalLm&, const std::vector<int64_t>&);
+void qwen4_release_idle_indexers(Qwen4CausalLm&);
 std::uint64_t qwen4_qsa_ssd_read_bytes(const Qwen4CausalLm&,const MtpModule* = nullptr);
 struct Qwen4DecodeGraph;
 class Qwen4BatchDecodeGraph;
@@ -40,6 +42,10 @@ class Qwen4BatchRequestState {
     int64_t position() const;
     std::size_t resident_bytes() const;
     std::size_t prefill_growth_bytes(int64_t tokens) const;
+    std::size_t restore_prefix(Qwen4CausalLm&,internal::TextSessionCache&,
+        const std::string& session,const std::vector<int64_t>& prompt,std::size_t limit);
+    void store_prefix(Qwen4CausalLm&,internal::TextSessionCache&,
+        const std::string& session,const std::vector<int64_t>& prompt);
   private:
     struct Impl;
     std::unique_ptr<Impl> state_;
@@ -94,8 +100,10 @@ void qwen4_warmup_decode_graphs(Qwen4CausalLm&,MtpModule*,int maximum_draft_dept
 std::size_t qwen4_mtp_graph_reserve(const Qwen4CausalLm&,const MtpModule*,int maximum_draft_depth=5);
 std::optional<std::size_t> qwen4_decode_transient_reserve(const Qwen4CausalLm&,const MtpModule*,int maximum_draft_depth);
 std::size_t qwen4_prefix_snapshot_bytes(const Qwen4CausalLm&,const MtpModule*);
+std::size_t qwen4_prefix_snapshot_workspace_bytes(const Qwen4CausalLm&,const MtpModule*);
 std::vector<std::pair<std::string,double>> qwen4_cache_memory_metrics(const Qwen4CausalLm&,const MtpModule*);
 bool qwen4_layer_major_prefill_eligible(const Qwen4CausalLm&, int64_t tokens);
+std::size_t qwen4_recurrent_state_growth_bytes(const Qwen4CausalLm&);
 mfq_tensor_backend::Tensor qwen4_layer_major_prefill_hidden(
     Qwen4CausalLm&, mfq_tensor_backend::Tensor ids, int64_t compute_chunk = 1024,
     bool last_only = true, const std::function<bool()>& cancelled = {},

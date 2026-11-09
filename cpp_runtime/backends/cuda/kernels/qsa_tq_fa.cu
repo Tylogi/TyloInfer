@@ -294,7 +294,7 @@ __global__ void qsa_fa_restore(tyloinfer::qsa::TqPrefillAttention a) {
     }
 }
 static int qsa_prefill_supported(const tyloinfer::qsa::TqPrefillAttention& a) {
-    if(a.queries<32 || a.width<1 || a.width>256 || a.heads<1 || a.kv_heads<1 || a.heads%a.kv_heads || a.kv_rows<4 || a.kv_rows%4 || a.count<1)
+    if(a.queries<16 || a.width<1 || a.width>256 || a.heads<1 || a.kv_heads<1 || a.heads%a.kv_heads || a.kv_rows<4 || a.kv_rows%4 || a.count<1)
         return int(cudaErrorNotSupported);
     if(tyloinfer::qsa::tq_prefill_attention_scratch(a.queries,a.heads,a.kv_rows)>a.temporary_bytes)
         return int(cudaErrorNotSupported);
@@ -335,6 +335,7 @@ int tyloinfer::qsa::tq_sparse_attention_prefill(const TqPrefillAttention& a) {
         else prepare_sparse_selected_union<32><<<tiles,256,0,a.stream>>>(mask,inverse,a.selected,a.positions,a.count,ids,counts,a.kv_rows,a.queries,index_rows);
     } else qsa_llama_prepare(a.selected,a.positions,inverse,mask,ids,a.queries,a.kv_rows,a.count,index_rows,a.stream);
     QsaFaHistory history{inverse,a.logmass,a.norm,a.kv_rows/4,a.count,a.heads/a.kv_heads,a.kv_heads};
+    history.compact_blocks=a.compact_blocks;
     if(parts>1) {
         auto* partial=reinterpret_cast<float*>(bytes+used);
         auto* norms=partial+int64_t(parts)*a.queries*a.heads*256;

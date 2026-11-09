@@ -1,5 +1,6 @@
 #include "float_projection.h"
 #include "gguf_weight.h"
+#include "gguf_prefill_fusion.h"
 #include "tyloinfer/gguf_model_source.h"
 #include "gguf_cpu.h"
 #include "tyloinfer/cpu_expert_pool.h"
@@ -18,6 +19,7 @@
 #include <bit>
 #include "../kernels/gguf.h"
 #include "../kernels/gguf_quad_storage.h"
+#include "../kernels/gguf_w8a8.h"
 #include "../kernels/gguf_quad_decode.h"
 #include "../kernels/gguf_m1_residual.h"
 #include "../kernels/gguf_compact.h"
@@ -25,6 +27,7 @@
 #include "cuda_execution.h"
 #include "quant_linear.h"
 #include "storage/weight_loader.h"
+#include "storage/dense_weight_placement.h"
 #include "storage/pinned_copy_plan.h"
 #include "storage/moe_pinned_expert_arena.h"
 #include "mfq_cuda_moe_ops.h"
@@ -3025,6 +3028,129 @@ public:
 #endif
     }
 };
+void run_mapped_dense_weights() {
+    {
+        const mfq::cuda::DenseWeightPlacementScope parent(true,std::size_t(32));
+        require(mfq::cuda::DenseWeightPlacementScope::limited(),"explicit placement budget was not enabled");
+        require(!mfq::cuda::DenseWeightPlacementScope::place_on_host(8),"explicit device budget was ignored");
+        {
+            const mfq::cuda::DenseWeightPlacementScope host(true,std::size_t(0));
+            require(mfq::cuda::DenseWeightPlacementScope::place_on_host(1),"host-only scope spent device budget");
+        }
+        require(!mfq::cuda::DenseWeightPlacementScope::place_on_host(24),"host rows consumed their caller's budget");
+        require(mfq::cuda::DenseWeightPlacementScope::place_on_host(1),"explicit device budget exceeded its bound");
+    }
+    const auto stream=mfq_current_cuda_stream();
+    const auto context=mfq::cuda::default_context(mfq_current_cuda_device());
+    const bool own_pool=!context->has_graph_pool(stream);
+    if(own_pool)context->begin_graph_pool(stream);
+    struct PoolEnd {std::shared_ptr<mfq::cuda::Context> c;cudaStream_t s;bool owned;
+        ~PoolEnd(){if(owned)c->end_graph_pool(s);}} pool{context,stream,own_pool};
+    int cases=0;
+    for(auto type:{GGML_TYPE_IQ2_XS,GGML_TYPE_Q4_0,GGML_TYPE_Q5_K}) {
+        Source source;source.add("projection",{17,768},type);
+        auto resident=load_gguf_weight(source,"projection",mfq_current_cuda_device());
+        resident.repack_inplace();
+        GgufWeight mapped;
+        {
+            ScopedEnvironment setting("TYLOINFER_DENSE_GPU_WEIGHT_BUDGET_BYTES","0");
+            const mfq::cuda::DenseWeightPlacementScope placement(true);
+            mapped=load_gguf_weight(source,"projection",mfq_current_cuda_device());
+            mapped.repack_inplace();
+            require(mfq::cuda::host_mapped_weight(mapped.packed) && mapped.quad_storage_rows==resident.quad_storage_rows,
+                "mapped weight was copied into resident compute storage");
+            {
+                const mfq::cuda::DenseWeightPlacementScope nested(false);
+                require(!mfq::cuda::DenseWeightPlacementScope::place_on_host(1),"nested placement was not disabled");
+            }
+            require(mfq::cuda::DenseWeightPlacementScope::place_on_host(1),"nested placement lost its caller's budget");
+        }
+        require(!mfq::cuda::DenseWeightPlacementScope::place_on_host(1),"placement escaped its load lifetime");
+        auto ids=tb::arange(0,17,tb::TensorOptions().device(tb::kCUDA).dtype(tb::kInt64));
+        const auto reference_rows=resident.embedding(ids).cpu();
+        const auto host_rows=mapped.embedding(ids).cpu();
+        require(std::memcmp(reference_rows.data_ptr(),host_rows.data_ptr(),reference_rows.nbytes())==0,
+            "mapped embedding rows changed their decoded values");
+        ++cases;
+        for(int tokens:{1,4,37})for(auto dtype:{tb::kFloat16,tb::kFloat32}) {
+            auto cpu=tb::empty({tokens,768},tb::TensorOptions().device(tb::kCPU).dtype(tb::kFloat32));
+            for(int64_t i=0;i<cpu.numel();++i)cpu.data_ptr<float>()[i]=std::sin(float(i)*.173f)*.2f;
+            auto input=cpu.to(tb::kCUDA,dtype);
+            const auto compare=[&](const tb::Tensor& output) {
+                const auto expected=resident.forward(input,false).to(tb::kCPU,tb::kFloat32).contiguous();
+                const auto actual=output.to(tb::kCPU,tb::kFloat32).contiguous();
+                require(std::memcmp(expected.data_ptr(),actual.data_ptr(),expected.nbytes())==0,
+                    "mapped weight projection changed the resident result");
+                ++cases;
+            };
+            compare(mapped.forward(input,false));
+            if(tokens<=4) {
+                mfq::cuda::DecodeWindow graph(stream);tb::Tensor output;
+                graph.capture([&]{output=mapped.forward(input,false);},[]{},[&]{output={};});
+                for(float scale:{.5f,-1.f}) {input.copy_(input*scale);graph.run();compare(output);}
+            }
+        }
+    }
+    std::cout<<"Mapped Dense weights: exact eager/Graph, load-scope lifetime and nested budgets PASS cases="<<cases<<'\n';
+}
+void run_shared_w8a8_prefill(bool gated_only=false) {
+    ScopedEnvironment fast("TYLOINFER_PREFILL_MODE","fast");
+    Source source;source.add("left",{32,768},GGML_TYPE_Q4_0);source.add("right",{64,768},GGML_TYPE_IQ2_XS);
+    auto left=load_gguf_weight(source,"left",mfq_current_cuda_device());
+    auto right=load_gguf_weight(source,"right",mfq_current_cuda_device());
+    left.repack_inplace();right.repack_inplace();int cases=0;
+    if(!gated_only)for(int rows:{512,768}) {
+        auto cpu=tb::empty({rows,768},tb::TensorOptions().device(tb::kCPU).dtype(tb::kFloat32));
+        for(int64_t i=0;i<cpu.numel();++i)cpu.data_ptr<float>()[i]=std::sin(float(i)*.173f)*.2f;
+        auto input=cpu.to(tb::kCUDA);
+        for(float scale:{.5f,-1.f,1.3f}) {
+            input.copy_(input*scale);
+            const auto a=left.forward(input).cpu(),b=right.forward(input).cpu();
+            {
+                const GgufPrefillInputScope scope(input);
+                for(const auto& pair:{std::pair{a,left.forward(input).cpu()},std::pair{b,right.forward(input).cpu()}}) {
+                    require(std::memcmp(pair.first.data_ptr(),pair.second.data_ptr(),pair.first.nbytes())==0,
+                        "shared W8A8 input packet changed projection results");
+                    ++cases;
+                }
+                tb::Tensor codes,scales;
+                require(GgufPrefillInputScope::lookup_w8a8(input,codes,scales) && codes.defined() && scales.defined(),
+                    "prefill projections did not populate their shared W8A8 packet");
+            }
+            tb::Tensor codes,scales;
+            require(!GgufPrefillInputScope::lookup_w8a8(input,codes,scales),"W8A8 packet escaped its projection group");
+        }
+    }
+    if(!gated_only){
+        std::cout<<"Shared W8A8 prefill: exact mixed projections and changing group inputs PASS cases="<<cases<<'\n';
+        return;
+    }
+    for(auto dtype:{tb::kFloat16,tb::kFloat32})for(bool silu:{false,true}) {
+        auto host=tb::empty({513,768},tb::TensorOptions().device(tb::kCPU).dtype(tb::kFloat32));
+        for(int64_t i=0;i<host.numel();++i)host.data_ptr<float>()[i]=std::sin(float(i)*.173f)*.3f;
+        auto input=host.to(tb::kCUDA,dtype),gate=(host.to(tb::kCUDA)*12.f).to(dtype);
+        auto expected=tb::empty_like(input);
+        mfq::cuda::gguf::materialize_gated_input(input.data_ptr(),gate.data_ptr(),dtype==tb::kFloat16,
+            input.numel(),silu,expected.data_ptr(),mfq_current_cuda_stream());
+        auto reference=left.forward(expected).cpu();
+        tb::Tensor materialized;
+        const auto scope=GgufPrefillInputScope::prepare_gated(input,gate,silu,materialized);
+        require(bool(scope),"fast gated prefill did not create its input packet");
+        const auto actual=left.forward(materialized).cpu(),wanted=expected.cpu(),gated=materialized.cpu();
+        require(std::memcmp(wanted.data_ptr(),gated.data_ptr(),wanted.nbytes())==0,"gated packet changed activation rounding");
+        require(std::memcmp(reference.data_ptr(),actual.data_ptr(),reference.nbytes())==0,"gated W8A8 packet changed projection output");
+        tb::Tensor codes,scales;
+        require(GgufPrefillInputScope::lookup_w8a8(materialized,codes,scales),"gated W8A8 packet was not reused");
+    }
+    {
+        ScopedEnvironment precise("TYLOINFER_PREFILL_MODE","precise");
+        auto input=tb::zeros({513,768},tb::TensorOptions().device(tb::kCUDA).dtype(tb::kFloat32));
+        tb::Tensor materialized;
+        require(!GgufPrefillInputScope::prepare_gated(input,input,false,materialized) && !materialized.defined(),
+            "precise mode entered the gated W8A8 path");
+    }
+    std::cout<<"Gated W8A8 scope: exact FP16/FP32 projections and precise-mode isolation PASS cases=5\n";
+}
 void run_gguf_residual_activation(int bench_tokens=0,int bench_columns=0,int bench_streams=0) {
     namespace gg=mfq::cuda::gguf;
     const bool benchmark=bench_tokens>0;
@@ -5516,6 +5642,21 @@ void run_row_correction(const char* dense_file,const char* moe_file) {
 }
 
 int main(int argc,char** argv) {
+    if(argc==2 && std::strcmp(argv[1],"--gated-w8a8-scope-check")==0) {
+        int devices=0;if(cudaGetDeviceCount(&devices)!=cudaSuccess || !devices)return 77;
+        try{run_shared_w8a8_prefill(true);return 0;}
+        catch(const std::exception& error){std::cerr<<error.what()<<'\n';return 1;}
+    }
+    if(argc==2 && std::strcmp(argv[1],"--shared-w8a8-prefill-check")==0) {
+        int devices=0;if(cudaGetDeviceCount(&devices)!=cudaSuccess || !devices)return 77;
+        try{run_shared_w8a8_prefill();return 0;}
+        catch(const std::exception& error){std::cerr<<error.what()<<'\n';return 1;}
+    }
+    if(argc==2 && std::strcmp(argv[1],"--mapped-dense-weight-check")==0) {
+        int devices=0;if(cudaGetDeviceCount(&devices)!=cudaSuccess || !devices)return 77;
+        try{run_mapped_dense_weights();return 0;}
+        catch(const std::exception& error){std::cerr<<error.what()<<'\n';return 1;}
+    }
     if(argc==2 && std::strcmp(argv[1],"--q2-packed-affine-check")==0) {
         int devices=0;if(cudaGetDeviceCount(&devices)!=cudaSuccess || !devices)return 77;
         try{run_q2_packed_affine();return 0;}
@@ -5528,6 +5669,11 @@ int main(int argc,char** argv) {
     }
     if(argc==2 && std::strcmp(argv[1],"--residual-rms-order-check")==0) {
         try{run_residual_rms_order();return 0;}
+        catch(const std::exception& error){std::cerr<<error.what()<<'\n';return 1;}
+    }
+    if(argc==2 && std::strcmp(argv[1],"--quad-w8a8-check")==0) {
+        int devices=0;if(cudaGetDeviceCount(&devices)!=cudaSuccess || !devices)return 77;
+        try{run_quad_w8a8();run_quad_w8a8(false);return 0;}
         catch(const std::exception& error){std::cerr<<error.what()<<'\n';return 1;}
     }
     if(argc==2 && std::strcmp(argv[1],"--quad-decode-check")==0) {

@@ -47,6 +47,15 @@ export function ModelLoadContext({ value, onChange, disabled = false, models = [
             patch({ context_size: text === '' ? null : Number(text) });
         }} onBlur={() => { if (!valid) setContextDraft(null); }} />} />
     {!valid && <p role="alert">{tr('请输入不小于 512 的有效整数，或留空使用服务端设置。', 'Enter a valid integer of at least 512, or leave empty to follow server settings.')}</p>}
+    {model?.format === 'gguf' && runtime?.prefill_modes?.includes('fast') &&
+      <SettingRow title={tr('上下文处理', 'Context processing')}
+        detail={tr('精确模式使用原有计算精度；快速模式使用 INT8 计算，可能影响输出质量。',
+          'Precise mode retains the original computation. Fast mode uses INT8 and may affect output quality.')}
+        trailing={<select aria-label={tr('上下文处理', 'Context processing')} disabled={disabled}
+          value={value.prefill_mode} onChange={event => patch({ prefill_mode: event.target.value as 'precise' | 'fast' })}>
+          <option value="precise">{tr('精确模式', 'Precise')}</option>
+          <option value="fast">{tr('快速模式', 'Fast')}</option>
+        </select>} />}
     <ModelLoadMemoryEstimate models={models} runtime={runtime} deviceIds={deviceIds}
       value={{ ...value, context_size: value.context_size ?? automaticContext ?? null }} valid={valid} disabled={disabled} onSparseChange={setDetectedSparse} />
     <div className="model-load-advanced-heading">

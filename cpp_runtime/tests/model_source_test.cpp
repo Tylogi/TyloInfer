@@ -5,6 +5,8 @@
 #include "tyloinfer/mapped_tensor_pages.h"
 #include "tyloinfer/mapped_prefetch_scope.h"
 #include "tyloinfer/tq_rows.h"
+#include "tyloinfer/tq_fixture_source.h"
+#include "nlohmann/json.hpp"
 
 #include <algorithm>
 #include <array>
@@ -289,6 +291,58 @@ void test_tq_reserved_descriptor_bits() {
     }
 }
 
+void test_borrowed_fixture(const std::filesystem::path& root,const std::filesystem::path& base) {
+    using Json=nlohmann::json;
+    const auto backing=root/"fixture-borrowed.mfq",file=root/"borrowed.tq-fixture.json";
+    write_mfq(backing,"model.token_embedding.weight",16);
+    const auto expected=[&]{mfq::MfqModelSource original(backing);return original.read("model.token_embedding.weight");}();
+    const auto reference=base.generic_u8string();
+    Json spec={{"format","mfq-tq-fixture-v1"},{"synthetic",true},
+        {"reference",std::string(reference.begin(),reference.end())},
+        {"source_files",Json::array()},{"tensors",Json::object()},
+        {"remove_tensors",{"model.token_embedding.weight"}},
+        {"config_patch",{{"max_position_embeddings",32768}}},
+        {"borrowed_sources",Json::array({{{"path","fixture-borrowed.mfq"},
+            {"tensors",Json::array({{{"name","copy.weight"},{"source","model.token_embedding.weight"}}})}}})}};
+    const auto save=[&]{std::ofstream(file)<<spec.dump();};save();
+    mfq::ModelSource::TensorReader retained;
+    mfq::ModelSource::TensorBatchReader retained_batch;
+    {
+        auto source=mfq::open_tq_fixture_source(file);
+        require(source->tensors().size()==1 && !source->find_tensor("model.token_embedding.weight"),
+            "removed fixture tensor remained in the inventory");
+        require(source->find_tensor("copy.weight")->dtype=="BF16" && source->read("copy.weight")==expected,
+            "borrowed fixture changed the encoding or bytes");
+        require(Json::parse(source->model_config_json()).at("max_position_embeddings")==32768,
+            "fixture config patch was not exposed through its asset");
+        bool rejected=false;
+        try{source->tensor_reader("model.token_embedding.weight");}catch(const std::invalid_argument&){rejected=true;}
+        require(rejected,"removed fixture tensor remained accessible through a retained base reader");
+        retained=source->tensor_reader("copy.weight");
+        retained_batch=source->tensor_batch_reader("copy.weight");
+        require(bool(retained_batch),"borrowed fixture lost its batched reader");
+        rejected=false;
+        try{source->tensor_batch_reader("model.token_embedding.weight");}catch(const std::invalid_argument&){rejected=true;}
+        require(rejected,"removed fixture tensor remained accessible through a batch reader");
+    }
+    std::vector<std::byte> actual(expected.size());retained(0,actual.data(),actual.size());
+    require(actual==expected,"borrowed fixture reader lost its source lifetime");
+    std::fill(actual.begin(),actual.end(),std::byte{});
+    const auto half=actual.size()/2;
+    retained_batch({{half,actual.data()+half,actual.size()-half},{0,actual.data(),half}});
+    require(actual==expected,"borrowed fixture batch lost source lifetime or range offsets");
+    bool rejected=false;
+    try{std::byte value;retained(expected.size(),&value,1);}catch(const std::out_of_range&){rejected=true;}
+    require(rejected,"borrowed fixture reader accepted an out-of-range read");
+    rejected=false;
+    try{std::byte value;retained_batch({{expected.size(),&value,1}});}catch(const std::out_of_range&){rejected=true;}
+    require(rejected,"borrowed fixture batch accepted an out-of-range read");
+    spec["borrowed_sources"][0]["tensors"].push_back(spec["borrowed_sources"][0]["tensors"][0]);save();
+    rejected=false;
+    try{mfq::open_tq_fixture_source(file);}catch(const std::invalid_argument&){rejected=true;}
+    require(rejected,"conflicting borrowed fixture definitions were accepted");
+}
+
 } // namespace
 
 int main() {
@@ -307,6 +361,7 @@ int main() {
         const auto legacy_gguf_path = root / "legacy-gguf-model.mfq";
         const auto hf_path = root / "hf";
         write_mfq(mfq_path);
+        test_borrowed_fixture(root,mfq_path);
         write_mfq(root/"mapped-large.mfq","model.token_embedding.weight",131072);
         write_mfq(
             legacy_mfq_path,

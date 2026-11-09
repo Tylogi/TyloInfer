@@ -326,7 +326,12 @@ template <class Backend> class SessionCache {
         const char *failure_action = "paged_codec_failed";
         try {
             auto state=[&]() -> Snapshot {
-            if constexpr(requires { Backend::decode_paged(*paged_cache_,match,prompt,limit); }) {
+            if constexpr(requires { Backend::decode_paged(*paged_cache_,match,prompt,limit,input_key,bool{}); }) {
+                return Backend::decode_paged(*paged_cache_,match,prompt,limit,input_key,
+                    native_hot_snapshots_ && snapshots_.enabled());
+            }else if constexpr(requires { Backend::decode_paged(*paged_cache_,match,prompt,limit,input_key); }) {
+                return Backend::decode_paged(*paged_cache_,match,prompt,limit,input_key);
+            }else if constexpr(requires { Backend::decode_paged(*paged_cache_,match,prompt,limit); }) {
                 return Backend::decode_paged(*paged_cache_,match,prompt,limit);
             }else {
             auto payloads=paged_cache_->load_prefix(match.blocks);

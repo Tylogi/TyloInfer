@@ -74,6 +74,7 @@ from tyloinfer.server.runtime.kv_budget import checkpoint_kv_budget, check_ssd_c
 from tyloinfer.server.runtime.native import (
     NativeRuntimeError,
     append_native_prefill_chunk_override,
+    apply_native_prefill_mode,
     find_native_runtime_resource,
     native_request_capacity,
     native_runtime_environment,
@@ -2279,6 +2280,7 @@ class RuntimePool:
             ) = self._runtime_memory_pressure_locked()
             memory_status = {
                 **memory_topology(),
+                "prefill_modes": ["precise", "fast"] if self.backend == "cuda" else ["precise"],
                 "mtp_service_enabled": self.inference_policy.mtp_enabled,
                 "runtime_memory_budget_bytes": self._resident_total_limit(),
                 "runtime_memory_effective_budget_bytes": effective_memory_budget,
@@ -4686,6 +4688,9 @@ class RuntimePool:
             self.executable, self.backend, model=artifact.path
         )
         process_environment.update(self.runtime_environment)
+        if request.prefill_mode == "fast" and artifact.resource.format != "gguf":
+            raise _job_error("prefill_mode_unsupported", "fast prefill currently requires GGUF weights")
+        apply_native_prefill_mode(process_environment, self.backend, request.prefill_mode)
         from tyloinfer.server.runtime.disk_budget import DiskBudget
         process_environment['TYLOINFER_DISK_BUDGET_DIR'] = str(DiskBudget().root)
         if self.backend == "cuda":
@@ -4825,6 +4830,13 @@ class RuntimePool:
 
     @staticmethod
     def _process_resident_bytes(pid: int) -> int | None:
+        if os.name == "nt":
+            import psutil
+
+            try:
+                return psutil.Process(pid).memory_info().rss
+            except (psutil.Error, OSError):
+                return None
         try:
             output = subprocess.check_output(
                 ["ps", "-o", "rss=", "-p", str(pid)],

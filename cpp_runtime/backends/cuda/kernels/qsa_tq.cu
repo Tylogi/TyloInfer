@@ -711,11 +711,14 @@ __global__ void mark_requested_blocks(const SelectedBlock* selected,uint32_t* re
 
 // Decode once for a batch, with the same FP32 H4 sum and final FP16
 // rounding as sparse_attention_mma8. Layout: [block,head,token,padded].
-template<int W> __global__ void stage_attention_blocks(const TqBlockView* blocks,
-    const half* relative,half* keys,half* values,int heads,const uint32_t* requested) {
+template<int W,bool Compact=false> __global__ void stage_attention_blocks(const TqBlockView* blocks,
+    const half* relative,half* keys,half* values,int heads,const uint32_t* requested,
+    const int* ids=nullptr,const int* used=nullptr) {
     constexpr int Rings=W/256;
-    const int block=blockIdx.x/heads,head=blockIdx.x%heads,kind=blockIdx.y;
-    if(!requested[block])return;
+    const int slot=blockIdx.x/heads,head=blockIdx.x%heads,kind=blockIdx.y;
+    if constexpr(Compact){if(slot>=*used)return;}
+    else if(!requested[slot])return;
+    const int block=Compact?ids[slot]:slot;
     const auto view=blocks[block];const auto* image=kind?view.value:view.key;
     const auto flags=kind?view.value_bits:view.key_bits;
     __shared__ TqRowView source[4*Rings];
@@ -734,10 +737,23 @@ template<int W> __global__ void stage_attention_blocks(const TqBlockView* blocks
                 const float sign=(__popc(unsigned(t&m))&1)?-.5f:.5f;
                 a.x+=sign*mode[m].x;a.y+=sign*mode[m].y;a.z+=sign*mode[m].z;a.w+=sign*mode[m].w;
             }
-            auto* out=(kind?values:keys)+((int64_t(block)*heads+head)*4+t)*W+d;
+            auto* out=(kind?values:keys)+((int64_t(slot)*heads+head)*4+t)*W+d;
             *reinterpret_cast<half2*>(out)=__floats2half2_rn(a.x,a.y);
             *reinterpret_cast<half2*>(out+2)=__floats2half2_rn(a.z,a.w);
         }
+    }
+}
+__global__ void scatter_prefill_views(const TqBlockView* source,const int32_t* ids,TqBlockView* destination,int count) {
+    const int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<count)destination[ids[i]]=source[i];
+}
+
+__global__ void compact_attention_blocks(const SelectedBlock* selected,int* map,int* ids,int* used,
+        int64_t total,int blocks) {
+    const auto i=int64_t(blockIdx.x)*blockDim.x+threadIdx.x;
+    if(i>=total)return;
+    const auto block=selected[i];
+    if(block.id>=0 && block.id<blocks && block.token_mask && atomicCAS(map+block.id,-1,-2)==-1) {
+        const int slot=atomicAdd(used,1);ids[slot]=block.id;atomicExch(map+block.id,slot);
     }
 }
 
@@ -1410,6 +1426,21 @@ bool tq_prefill_staging_available(int heads,int kv_heads,int padded) {
         case 512:return mma_attention_available<512,false,true>();
         case 1024:return mma_attention_available<1024,false,true>();default:return false;}
 }
+int tq_selected_block_mask(const SelectedBlock* selected,uint32_t* requested,
+    int queries,int count,int blocks,cudaStream_t stream) {
+    const auto total=int64_t(queries)*count;
+    if(!selected || !requested || queries<=0 || count<=0 || blocks<=0 || (total+255)/256>INT_MAX)
+        return int(cudaErrorInvalidValue);
+    clear_requested_blocks<<<unsigned((int64_t(blocks)+255)/256),256,0,stream>>>(requested,blocks);
+    mark_requested_blocks<<<unsigned((total+255)/256),256,0,stream>>>(selected,requested,total,blocks);
+    return int(cudaGetLastError());
+}
+int tq_scatter_prefill_views(const TqBlockView* source,const int32_t* ids,
+    TqBlockView* destination,int count,cudaStream_t stream) {
+    if(!source || !ids || !destination || count<=0)return int(cudaErrorInvalidValue);
+    scatter_prefill_views<<<unsigned((int64_t(count)+255)/256),256,0,stream>>>(source,ids,destination,count);
+    return int(cudaGetLastError());
+}
 int tq_stage_attention_blocks(const TqBlockView* blocks,const uint16_t* relative,
     uint16_t* keys,uint16_t* values,int count,int heads,int padded,cudaStream_t stream,
     const SelectedBlock* selected,int queries,int selected_count,uint32_t* requested) {
@@ -1422,6 +1453,24 @@ int tq_stage_attention_blocks(const TqBlockView* blocks,const uint16_t* relative
 #define STAGE(W) stage_attention_blocks<W><<<dim3(count*heads,2),128,0,stream>>>(blocks,reinterpret_cast<const half*>(relative),reinterpret_cast<half*>(keys),reinterpret_cast<half*>(values),heads,requested)
     switch(padded){case 256:STAGE(256);break;case 512:STAGE(512);break;case 1024:STAGE(1024);break;default:return int(cudaErrorInvalidValue);}
 #undef STAGE
+    return int(cudaGetLastError());
+}
+int tq_stage_attention_compact(const TqBlockView* blocks,const uint16_t* relative,
+    uint16_t* keys,uint16_t* values,int block_count,int heads,int padded,
+    const SelectedBlock* selected,int queries,int count,int32_t* map,int32_t* ids,int32_t* used,cudaStream_t stream) {
+    const auto total=int64_t(queries)*count;
+    const auto capacity=std::min(int64_t(block_count),total);
+    if(!blocks || !relative || !keys || !values || !selected || !map || !ids || !used ||
+        queries<=0 || count<=0 || block_count<=0 || heads<=0 || capacity>INT_MAX/heads || padded!=256 ||
+        (total+255)/256>INT_MAX)return int(cudaErrorInvalidValue);
+    auto error=cudaMemsetAsync(map,0xff,std::size_t(block_count)*sizeof(int),stream);
+    if(error!=cudaSuccess)return int(error);
+    error=cudaMemsetAsync(used,0,sizeof(int),stream);
+    if(error!=cudaSuccess)return int(error);
+    compact_attention_blocks<<<unsigned((total+255)/256),256,0,stream>>>(selected,map,ids,used,total,block_count);
+    stage_attention_blocks<256,true><<<dim3(unsigned(capacity*heads),2),128,0,stream>>>(blocks,
+        reinterpret_cast<const half*>(relative),reinterpret_cast<half*>(keys),reinterpret_cast<half*>(values),
+        heads,nullptr,ids,used);
     return int(cudaGetLastError());
 }
 } // namespace tyloinfer::qsa

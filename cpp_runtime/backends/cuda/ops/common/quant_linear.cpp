@@ -1955,6 +1955,9 @@ mfq_tensor_backend::Tensor QuantLinear::forward_input_mul(
             x.scalar_type()==gate.scalar_type() &&
             (x.scalar_type()==mfq_tensor_backend::kFloat16 || x.scalar_type()==mfq_tensor_backend::kFloat32)) {
         TYLOINFER_RUNTIME_CHECK(mode==1 || mode==2,"input gate mode must be sigmoid or SiLU");
+        mfq_tensor_backend::Tensor fast_gated;
+        if(auto scope=GgufPrefillInputScope::prepare_gated(x,gate,mode==2,fast_gated))
+            return forward(execution,fast_gated);
         auto gated=mfq_tensor_backend::empty_like(x);
         const auto stream=mfq_get_current_cuda_stream(x.get_device());
         for(const auto& tensor:{x,gate,gated})mfq_cuda_record_stream(tensor,stream);

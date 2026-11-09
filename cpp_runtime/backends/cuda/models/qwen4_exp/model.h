@@ -121,6 +121,18 @@ class Gdn {
             fused_preparation_ && fused_output_ && transposed_state_)
             core_workspace_=tb::zeros({1,nv_,d_+1},options);
     }
+    void prepare_request_state(int64_t batch) {
+        TYLOINFER_RUNTIME_CHECK(batch>0,"invalid recurrent state batch");
+#ifdef TYLOINFER_NATIVE_CUDA_RUNTIME
+        ResidentAllocationScope resident;
+#endif
+        const auto options=w_.norm.options().dtype(tb::kFloat32);
+        if(!conv_.defined() || conv_.size(0)!=batch)
+            conv_=tb::zeros({batch,kernel_-1,(2*nk_+nv_)*d_},options);
+        if(!state_.defined() || state_.size(0)!=batch)
+            state_=tb::zeros({batch,nv_,d_,d_},options);
+        initialize_request_cache();
+    }
     std::size_t growth_bytes() const {
         return (conv_.defined() ? 0 : std::size_t(kernel_-1)*(2*nk_+nv_)*d_*sizeof(float)) +
             (state_.defined() ? 0 : std::size_t(nv_)*d_*d_*sizeof(float));
@@ -146,7 +158,11 @@ class Gdn {
             TYLOINFER_RUNTIME_CHECK(conv_.defined() && state_.defined() && conv_.sizes()==restored.sizes() &&
                 state_.sizes()==recurrent.sizes(),"Qwen4 GDN graph session geometry changed");
             commit();conv_.copy_(restored);state_.copy_(recurrent);
-        } else {reset();conv_=restored.clone();state_=recurrent.clone();}
+        } else {
+            reset();
+            conv_=restored.is_cuda()?restored.clone():restored.to(w_.norm.options().dtype(restored.scalar_type()));
+            state_=recurrent.is_cuda()?recurrent.clone():recurrent.to(w_.norm.options().dtype(recurrent.scalar_type()));
+        }
     }
 
     Tensor recurrent_state() const {
@@ -711,7 +727,9 @@ class Gdn {
     int64_t nk_, nv_, d_, kernel_;
     double eps_;
     bool silu_gate_, fused_decode_,transposed_state_,fused_output_,grouped_projection_,fused_preparation_,fused_core_,tiled_heads_;
-    bool request_state_storage_=false;
+    // Recurrent state outlives projection scratch in both single-request and
+    // batched execution. Keep it in the resident pool from its first write.
+    bool request_state_storage_=true;
     Tensor conv_, state_, saved_conv_, saved_state_,core_workspace_;
     std::vector<Tensor> saved_prefix_conv_,saved_prefix_state_;
     int64_t saved_prefix_position_=-1;
@@ -965,7 +983,10 @@ class Ple {
             TYLOINFER_RUNTIME_CHECK(conv_.defined() && conv_.sizes()==convolution.sizes(),
                 "Qwen4 PLE graph session geometry changed");
             commit();conv_.copy_(convolution);
-        } else {reset();conv_=convolution.clone();}
+        } else {
+            reset();conv_=convolution.is_cuda()?convolution.clone():
+                convolution.to(w_.conv_norm.options().dtype(convolution.scalar_type()));
+        }
         embedding_.restore(std::move(context));
     }
     std::shared_ptr<RowStage> graph_stage(int64_t tokens,const tb::Device& device) {
@@ -1158,6 +1179,7 @@ class Qsa {
             static std::atomic<bool> reported{false};
             if(!reported.exchange(true))std::fprintf(stderr,"native_qsa_indexer_cache actual_match=1 format=int16_affine default=1\n");
         }
+        memory_manager_=memory;
         if(qsa_tq_cache_enabled()) {
             TYLOINFER_RUNTIME_CHECK(c_.pool==4 && !c_.dense_window && !quantization_.enabled(),
                 "adaptive QSA requires four-token sparse blocks and its own KV codec");
@@ -1166,7 +1188,6 @@ class Qsa {
                 memory?memory->ssd_enabled():kv_memory_options().placement=="auto_ssd");
             return;
         }
-        memory_manager_=memory;
         offload_ = std::move(offload);
         if(memory && !offload_)memory_=memory->add(c_.maximum,c_.kv_heads,key_width(),value_width(),
             c_.index_width,c_.pool,w_.query_norm.options().dtype(cache_dtype()),c_.dense_window?std::min(c_.maximum,c_.dense_window):
@@ -1191,6 +1212,7 @@ class Qsa {
         return adaptive_?adaptive_->reclaim_shared_host_workspace():QsaRamWorkspaceProgress{};
     }
     void release_idle_adaptive() {if(adaptive_)adaptive_->release_idle();}
+    void release_empty_indexer() {if(adaptive_)adaptive_->release_empty_indexer();}
     void set_adaptive_budget(std::size_t bytes) {if(adaptive_)adaptive_->set_budget(bytes);}
     int pending_device_graph_kind(int64_t tokens) const {return adaptive_?adaptive_->device_graph_kind(tokens):0;}
     bool pending_graph_task_supported() const {return adaptive_ && adaptive_->graph_task_supported();}

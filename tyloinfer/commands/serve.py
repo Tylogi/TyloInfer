@@ -366,6 +366,7 @@ def _run_locked(args: argparse.Namespace, identity: dict[str, str | int]) -> int
                 artifact_uri=f"mfq://{initial_artifact.resource.id}",
                 context_size=args.context_size or None,
                 prefill_chunk_size=args.prefill_chunk_size,
+                prefill_mode=args.prefill_mode,
                 moe_gpu_cache_gb=args.moe_gpu_cache_gb,
                 prefix_cache_enabled=not args.no_prefix_cache,
                 prefix_cache_disk_bytes=args.prefix_cache_disk_size,
@@ -499,6 +500,10 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         "--prefill-chunk-size", type=_prefill_chunk_size, default="auto",
         metavar="auto|N",
         help="prefill compute chunk limit (default: auto; CUDA chooses up to 8192)",
+    )
+    parser.add_argument(
+        "--prefill-mode", choices=("precise", "fast"), default="precise",
+        help="prefill mode (default: precise; fast uses CUDA GGUF INT8 computation)",
     )
     parser.add_argument(
         "--moe-gpu-cache-gb",

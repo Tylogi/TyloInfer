@@ -83,6 +83,8 @@ struct RamKvReadInto {
     std::uint8_t* destination=nullptr;
     std::size_t capacity=0;
 };
+// Immutable snapshots share the same bounded packed I/O as active caches.
+void read_packed_snapshot_images(const std::vector<RamKvReadInto>& requests);
 struct RamKvRelocation {
     std::size_t index=0;
     RamKvImagePtr image;
@@ -138,6 +140,8 @@ public:
     // Immutable CPU reads do not call the backend allocator or encoder. They
     // are safe while a device graph waits for its host I/O task.
     RamKvSnapshotBlock source(std::size_t id)const;
+    // Retain only requested immutable images, in caller order.
+    std::vector<RamKvSnapshotBlock> sources(const std::vector<std::size_t>& ids)const;
     MicroblockImage read_cpu(const RamKvSnapshotBlock& source);
     // Retain the encoded backing without splitting K/V into new arrays.
     // retained_bytes is the temporary allocation capacity, or zero when
@@ -147,7 +151,7 @@ public:
     // this separate buffer and retains it until all readers have finished.
     void read_cpu_into(const RamKvSnapshotBlock& source,std::uint8_t* destination,std::size_t capacity);
     void read_cpu_into_batch(const std::vector<RamKvReadInto>& requests);
-    // Upper bound for sequential file plans and their bounded per-worker windows.
+    // Upper bound for sequential file plans and their bounded read windows.
     static std::size_t sequential_read_workspace(std::size_t requests);
     // Random recall retains exact byte ranges and skips sequential readahead.
     void read_cpu_into_batch(const std::vector<RamKvReadInto>& requests,bool sequential);

@@ -195,6 +195,8 @@ export function useModelCatalog() {
         pin: options.pinned,
         device_ids: options.deviceIds,
         idle_ttl_seconds: options.idleTtl,
+        ...(options.context.prefill_mode === 'fast' && runtime?.prefill_modes?.includes('fast')
+          && artifacts.find(item => item.name === name)?.format === 'gguf' ? { prefill_mode: 'fast' as const } : {}),
         ...(!options.context.automatic ? { context_management: options.context } : {}),
         ...(companions?.length ? { gguf_companions: companions } : {}),
       });
@@ -247,6 +249,8 @@ export function useModelCatalog() {
           pin: options.pinned,
           device_ids: options.deviceIds,
           idle_ttl_seconds: options.idleTtl,
+          ...(options.context.prefill_mode === 'fast' && runtime?.prefill_modes?.includes('fast')
+            && artifact.format === 'gguf' ? { prefill_mode: 'fast' as const } : {}),
           ...(!options.context.automatic ? { context_management: options.context } : {}),
         });
         if (!current()) return;

@@ -635,6 +635,35 @@ public:
         return result;
     }
 
+    PrefixMatch match_shorter_tail(const std::vector<std::int64_t>& tokens,
+            const PrefixMatch& longer,std::size_t minimum,std::string_view extra_key) {
+        if(longer.matched_tokens>tokens.size() ||
+                longer.blocks.size()!=(longer.matched_tokens/config_.block_size_tokens+
+                    (longer.matched_tokens%config_.block_size_tokens!=0)))
+            throw std::invalid_argument("Invalid longer prefix chain");
+        for(auto depth=longer.blocks.size();depth-->0;) {
+            const auto offset=depth*config_.block_size_tokens;
+            if(offset>=longer.matched_tokens)continue;
+            const auto maximum=std::min(config_.block_size_tokens-1,longer.matched_tokens-offset-1);
+            if(offset+maximum<=minimum)break;
+            const auto parent=depth?longer.blocks[depth-1]:BlockHash{};
+            std::vector<std::size_t> lengths;
+            {std::lock_guard lock(mutex_);const auto tails=tail_lengths_.find(parent);
+                if(tails!=tail_lengths_.end())for(auto it=tails->second.rbegin();it!=tails->second.rend();++it)
+                    if(it->first<=maximum && offset+it->first>minimum)lengths.push_back(it->first);}
+            for(const auto count:lengths) {
+                const auto hash=block_hash(parent,tokens.data()+offset,count,extra_key);
+                std::lock_guard lock(mutex_);const auto disk=disk_.find(hash);
+                if(disk!=disk_.end() && (disk->second.parent!=parent || disk->second.token_count!=count))
+                    erase_corrupt_locked(hash);
+                if(!disk_.count(hash) && !pending_.count(hash) && !hot_.count(hash))continue;
+                PrefixMatch result;result.blocks.assign(longer.blocks.begin(),longer.blocks.begin()+depth);
+                result.blocks.push_back(hash);result.matched_tokens=offset+count;return result;
+            }
+        }
+        return {};
+    }
+
     void record_match(std::size_t matched_tokens) {
         std::lock_guard<std::mutex> lock(mutex_);
         ++metrics_.queries;
@@ -1960,6 +1989,11 @@ PrefixMatch PagedPrefixCache::match(
 
 void PagedPrefixCache::record_match(std::size_t matched_tokens) {
     implementation_->record_match(matched_tokens);
+}
+
+PrefixMatch PagedPrefixCache::match_shorter_tail(const std::vector<std::int64_t>& tokens,
+        const PrefixMatch& longer,std::size_t minimum,std::string_view extra_key) {
+    return implementation_->match_shorter_tail(tokens,longer,minimum,extra_key);
 }
 
 BlockHash PagedPrefixCache::store(

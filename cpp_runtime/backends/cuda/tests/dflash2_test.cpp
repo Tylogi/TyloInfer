@@ -1574,6 +1574,7 @@ int main(int argc, char** argv) {
         std::cout<<std::unitbuf;
         if(argc==2 && std::string(argv[1])=="--draft-input-check"){check_draft_inputs();return 0;}
         if(argc==2 && std::string(argv[1])=="--dense-target-hidden-check"){check_dense_target_hidden();return 0;}
+
         if(argc==4 && std::string(argv[1])=="--greedy-packet-bench"){benchmark_greedy_packet(std::stoi(argv[2]),std::stoi(argv[3]));return 0;}
         if(argc==2 && std::string(argv[1])=="--greedy-selector-check"){check_greedy_selector_walk();return 0;}
         if(argc==2 && std::string(argv[1])=="--greedy-probability-check"){check_greedy_probability();check_combined_sampling_packet();check_greedy_packet_export();return 0;}

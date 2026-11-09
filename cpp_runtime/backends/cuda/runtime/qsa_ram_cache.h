@@ -64,8 +64,12 @@ public:
         const Tensor& position,std::int64_t host_position,int appended,bool selection_ready=false);
     // Copy one layer's original encoded KV once for an entire prefill chunk.
     // Return no stage when current GPU workspace cannot hold its real bytes.
-    std::optional<QsaRamPrefillStage> stage_prefill(std::size_t blocks);
+    std::optional<QsaRamPrefillStage> stage_prefill(std::size_t blocks,std::size_t protected_bytes=0);
+    // Sorted, unique IDs share one encoded transfer across all score tiles.
+    std::optional<QsaRamPrefillStage> stage_prefill_selected(std::size_t blocks,
+        const std::vector<std::size_t>& ids,std::size_t protected_bytes=0);
     void observe(const std::vector<double>& hits,std::uint64_t epoch);
+    void observe_selected(const std::vector<std::size_t>& blocks,std::uint64_t epoch);
     void wait();
     void truncate(std::size_t blocks);
     bool graph_safe()const;
@@ -82,6 +86,8 @@ public:
     QsaRamMemory memory()const;
     std::vector<Tensor> resident_tensors()const;
 private:
+    std::optional<QsaRamPrefillStage> stage_prefill_impl(std::size_t blocks,
+        const std::vector<std::size_t>* ids,std::size_t protected_bytes);
     struct Impl;std::unique_ptr<Impl> impl_;
 };
 } // namespace mfq::cuda

@@ -17,7 +17,7 @@
 
 namespace {
 void require(bool value, const char* message) { if (!value) throw std::runtime_error(message); }
-void exercise_retained_files(const std::filesystem::path& base) {
+void exercise_retained_files(const std::filesystem::path& base, mfq::FileReadMode mode) {
     struct Files {
         std::vector<std::filesystem::path> paths;
         ~Files(){for(const auto& path:paths){std::error_code error;std::filesystem::remove(path,error);}}
@@ -29,7 +29,7 @@ void exercise_retained_files(const std::filesystem::path& base) {
         files.paths.push_back(base.string()+"-retained-"+std::to_string(i));
         {std::ofstream file(files.paths.back(),std::ios::binary);
             file.write(reinterpret_cast<const char*>(expected[i].data()),expected[i].size());}
-        readers.push_back(std::make_shared<mfq::FileRangeReader>(files.paths.back(),mfq::FileReadMode::Buffered));
+        readers.push_back(std::make_shared<mfq::FileRangeReader>(files.paths.back(),mode));
     }
     const auto check=[&](unsigned seed) {
         std::vector<std::vector<std::byte>> output(193,std::vector<std::byte>(133,std::byte{0x5a}));
@@ -70,10 +70,13 @@ void exercise_retained_files(const std::filesystem::path& base) {
     check(12);
     auto direct=std::make_shared<mfq::FileRangeReader>(files.paths[2],mfq::FileReadMode::Direct);
     std::array<std::byte,34> output{};
-    mfq::FileRangeReader::read_many({{direct,{3,output.data(),17}},{readers[4],{7,output.data()+17,17}}});
+    auto buffered=std::make_shared<mfq::FileRangeReader>(files.paths[4],mfq::FileReadMode::Buffered);
+    mfq::FileRangeReader::read_many({{direct,{3,output.data(),17}},{buffered,{7,output.data()+17,17}}});
     require(std::equal(output.begin(),output.begin()+17,expected[2].begin()+3) &&
         std::equal(output.begin()+17,output.end(),expected[4].begin()+7),"mixed direct/buffered sources changed bytes");
     mfq::FileRangeReader::read_many({});
+    for(const auto& retained:readers)require(!retained->stats().staging_bytes,
+        "multi-file queue retained active staging after completion or failure");
 }
 void exercise_scatter(const std::filesystem::path& path, const std::vector<std::byte>& expected,
     mfq::FileReadMode mode) {
@@ -501,7 +504,8 @@ int main() {
                 "Linux queue reused an incomplete failed request");
         }
 #endif
-        exercise_retained_files(path);
+        exercise_retained_files(path,mfq::FileReadMode::Buffered);
+        exercise_retained_files(path,mfq::FileReadMode::Direct);
         exercise_shared_staging(path);
         exercise_many_ranges(path,expected);
         exercise_scatter(path, expected, mfq::FileReadMode::Buffered);

@@ -234,6 +234,11 @@ int main() {
 
         const auto qwen4 = graph_with("qwen4_exp", "grid_vit", "next_token_prediction");
         const auto qwen4_plan = cuda_model_plan(qwen4);
+        auto dense_qwen4=qwen4;
+        dense_qwen4.architecture="qwen4";dense_qwen4.backbone="qwen4";
+        require(cuda_model_plan(dense_qwen4).backbone==CudaBackbone::qwen4_exp &&
+                cuda_model_plan(dense_qwen4).predictor==CudaPredictorAdapter::flash_next,
+                "Dense Qwen4 did not select the shared attention/GR execution implementation");
         require(cuda_backbone(qwen4.backbone) == CudaBackbone::qwen4_exp &&
             qwen4_plan.vision == CudaVisionAdapter::none && qwen4_plan.predictor == CudaPredictorAdapter::flash_next,
             "Qwen4 text/optional-component selection mismatch");

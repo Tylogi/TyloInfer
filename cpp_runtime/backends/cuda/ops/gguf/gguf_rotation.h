@@ -10,6 +10,7 @@ struct GgufInputRotation {
     int block = 1;
     std::vector<std::int8_t> signs_cpu;
     mfq_tensor_backend::Tensor signs_device;
+    int value_heads = 0, key_heads = 0;
     bool equivalent(const GgufInputRotation&) const;
     mfq_tensor_backend::Tensor apply(mfq_tensor_backend::Tensor input, bool adjoint = false) const;
     void apply_inplace(mfq_tensor_backend::Tensor input, bool adjoint = false) const;

@@ -1,7 +1,10 @@
 #pragma once
+#include "../kernels/gguf.h"
 #include "../kernels/gguf_input.h"
 #include "../ops/gguf/gguf_rotation.h"
 #include "nepq.h"
+#include "runtime/decode_window.h"
+#include <bit>
 
 namespace gguf_rotation_test {
 inline void bench(int rows,int columns) {
@@ -61,7 +64,73 @@ inline void bench(int rows,int columns) {
         TYLOINFER_NATIVE_CUDA_CHECK(cudaEventDestroy(begin));TYLOINFER_NATIVE_CUDA_CHECK(cudaEventDestroy(end));
     }
 }
+inline void require_grouped(bool value,const char* message) {
+    if(!value)throw std::runtime_error(message);
+}
+inline std::vector<float> grouped_reference(const float* input,int rows,int width,const GgufInputRotation& rotation,bool adjoint) {
+    const int heads=rotation.value_heads,keys=rotation.key_heads,ratio=heads/keys,dim=width/heads;
+    std::vector<float> result(rows*width);
+    for(int row=0;row<rows;++row)for(int k=0;k<width;++k) {
+        double sum=0;
+        for(int j=0;j<rotation.block;++j) {
+            const int at=k/rotation.block*rotation.block+j;
+            int source=at;
+            if(!adjoint) {
+                const int head=at/dim;
+                source=((head%ratio)*keys+head/ratio)*dim+at%dim;
+            }
+            double term=input[row*width+source];
+            if(!adjoint)term*=rotation.signs_cpu[at];
+            sum+=(std::popcount(unsigned((k%rotation.block)&j))&1)?-term:term;
+        }
+        sum/=std::sqrt(double(rotation.block));
+        if(adjoint)sum*=rotation.signs_cpu[k];
+        result[row*width+(adjoint?((k/dim)%ratio*keys+(k/dim)/ratio)*dim+k%dim:k)]=float(sum);
+    }
+    return result;
+}
+inline void check_grouped_layout() {
+    namespace tb=mfq_tensor_backend;
+    auto context=mfq::cuda::default_context();
+    int cases=0;
+    for(int heads:{4,6,8})for(int rows:{1,3})for(bool adjoint:{false,true}) {
+        const int keys=2,width=heads*8;
+        GgufInputRotation rotation;rotation.block=8;rotation.value_heads=heads;rotation.key_heads=keys;
+        rotation.signs_cpu.resize(width);
+        auto signs=tb::empty({width},tb::TensorOptions().device(tb::kCPU).dtype(tb::kInt8));
+        auto input=tb::empty({rows,width},tb::TensorOptions().device(tb::kCPU).dtype(tb::kFloat32));
+        for(int i=0;i<width;++i)signs.data_ptr<int8_t>()[i]=rotation.signs_cpu[i]=(i%3?1:-1);
+        for(int i=0;i<rows*width;++i)input.data_ptr<float>()[i]=std::sin(i*.137f);
+        rotation.signs_device=signs.to(tb::Device(tb::kCUDA,0));
+        const auto expected=grouped_reference(input.data_ptr<float>(),rows,width,rotation,adjoint);
+        for(auto device:{tb::kCPU,tb::kCUDA}) {
+            auto actual=rotation.apply(input.to(device),adjoint).cpu().contiguous();
+            for(int i=0;i<rows*width;++i)
+                require_grouped(std::abs(actual.data_ptr<float>()[i]-expected[i])<2e-6f,"Grouped transform differs from explicit Walsh permutation");
+            auto inplace=input.to(device).clone();rotation.apply_inplace(inplace,adjoint);inplace=inplace.cpu();
+            for(int i=0;i<rows*width;++i)
+                require_grouped(std::abs(inplace.data_ptr<float>()[i]-expected[i])<2e-6f,"Grouped in-place transform differs");
+            ++cases;
+        }
+        auto gpu=input.to(tb::kCUDA);auto roundtrip=rotation.apply(rotation.apply(gpu),true).cpu();
+        for(int i=0;i<rows*width;++i)
+            require_grouped(std::abs(roundtrip.data_ptr<float>()[i]-input.data_ptr<float>()[i])<2e-6f,
+                "Grouped transform round-trip differs");
+        const auto stream=mfq_current_cuda_stream();context->begin_graph_pool(stream);
+        {
+            tb::Tensor output;
+            mfq::cuda::DecodeWindow graph(stream);
+            graph.capture([&]{output=rotation.apply(gpu,adjoint);},[]{},[&]{output={};});
+            graph.run();auto actual=output.cpu();
+            for(int i=0;i<rows*width;++i)
+                require_grouped(std::abs(actual.data_ptr<float>()[i]-expected[i])<2e-6f,"Grouped Graph transform differs");
+        }
+        context->end_graph_pool(stream);
+    }
+    std::printf("Grouped Hadamard CPU/GPU/in-place/Graph explicit-Walsh cases=%d PASS\n",cases);
+}
 inline void check() {
+    check_grouped_layout();
     namespace tb=mfq_tensor_backend;
     namespace gg=mfq::cuda::gguf;
     const auto stream=mfq_current_cuda_stream();

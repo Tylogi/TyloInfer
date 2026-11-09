@@ -219,7 +219,7 @@ struct FileRangeReader::Impl {
 #endif
     }
 #if defined(_WIN32)
-    struct BufferedRange {const Impl* owner;ReadSpan span;};
+    struct NativeRange {const Impl* owner;ReadSpan span;};
     static BOOL complete_buffered(HANDLE handle,OVERLAPPED* request,DWORD* actual,bool pending) noexcept {
         unsigned spins=0;
         while(pending && !HasOverlappedIoCompleted(static_cast<const volatile OVERLAPPED*>(request))) {
@@ -228,7 +228,7 @@ struct FileRangeReader::Impl {
         }
         return GetOverlappedResult(handle,request,actual,FALSE);
     }
-    static void buffered_read_queue(const BufferedRange* ranges,std::size_t range_count) {
+    static void buffered_read_queue(const NativeRange* ranges,std::size_t range_count) {
         // Each worker owns a bounded queue of exact caller spans.
         // Operation state and destinations survive every pending read;
         // independent ranges are submitted before completion is polled.
@@ -296,7 +296,7 @@ struct FileRangeReader::Impl {
                 "native_file_read_many actual_match=1 files=%zu ranges=%zu bounded_queue=64 completion_poll=1\n",times.size(),range_count);
         }
     }
-    static void buffered_reads(const std::vector<BufferedRange>& ranges) {
+    static void buffered_reads(const std::vector<NativeRange>& ranges) {
         // Native submission itself is serial CPU work. Keep small queues on
         // the caller; larger queues share persistent independent I/O workers.
         const auto threads=int(std::min<std::size_t>({8,
@@ -314,6 +314,173 @@ struct FileRangeReader::Impl {
                 "native_file_read_submit_parallel actual_match=1 ranges=%zu threads=%d\n",ranges.size(),threads);
         }
     }
+
+    static void direct_reads(const std::vector<NativeRange>& ranges) {
+        using Clock=std::chrono::steady_clock;
+        using Interval=std::pair<Clock::time_point,Clock::time_point>;
+        std::map<const Impl*,Interval> times;
+        if(ranges.empty())return;
+        // The common arena satisfies every participating file's sector alignment.
+        const auto* arena_owner=ranges.front().owner;
+        for(const auto& range:ranges)
+            if(range.owner->alignment>arena_owner->alignment)arena_owner=range.owner;
+        const auto* failed_owner=arena_owner;
+        struct DirectEvents {
+            // Small random rows need enough outstanding I/O to hide device
+            // latency. The existing byte-wave limit still bounds staging RAM.
+            std::array<HANDLE,256> handles{};
+            ~DirectEvents(){for(auto handle:handles)if(handle)CloseHandle(handle);}
+            HANDLE at(std::size_t i) {
+                if(!handles[i])handles[i]=CreateEventW(nullptr,TRUE,FALSE,nullptr);
+                if(!handles[i])throw std::system_error(GetLastError(),std::system_category(),"create direct batch event");
+                return handles[i];
+            }
+        };
+        static thread_local DirectEvents events;
+        struct BatchStorage {
+            const Impl& owner;
+            void* data=nullptr;
+            std::size_t capacity=0;
+            explicit BatchStorage(const Impl& value):owner(value) {}
+            void release() {
+                if(!data)return;
+                owner.return_staging({data,capacity});data=nullptr;capacity=0;
+            }
+            void ensure(std::size_t bytes) {
+                if(bytes<=capacity)return;
+                // Every preceding wave was drained before the arena can grow.
+                release();const auto slab=owner.borrow_staging(bytes);data=slab.data;capacity=slab.bytes;
+            }
+            ~BatchStorage(){release();}
+        };
+        struct Request {
+            const Impl& owner;
+            Interval* interval=nullptr;
+            OVERLAPPED native{};
+            void* storage = nullptr;
+            std::byte* destination = nullptr;
+            std::size_t prefix = 0, bytes = 0, allocation = 0, storage_offset = 0;
+            bool submitted = false, finished = false;
+            bool aligned_target = false;
+            explicit Request(const Impl& value) : owner(value) {}
+            ~Request() {
+                if (submitted && !finished) {
+                    DWORD ignored = 0;
+                    GetOverlappedResult(owner.handle, &native, &ignored, TRUE);
+                }
+            }
+        };
+        // Destruction drains requests before releasing their common I/O target.
+        BatchStorage storage(*arena_owner);
+        std::array<std::optional<Request>,256> requests;
+        std::size_t count=0;
+        try {
+            // Keep several native reads outstanding even when only one cold
+            // projection is needed. Each bounded wave still owns one staging arena.
+            const auto wave_limit=direct_wave_limit(arena_owner->alignment);
+            std::size_t span_index = 0, span_offset = 0;
+            while (span_index < ranges.size()) {
+                std::size_t batch_bytes=0,wave_bytes=0;
+                // Bound both staging bytes and outstanding IRPs. Large expert
+                // batches reuse the 8 MiB arena instead of allocating a larger,
+                // uncached payload on every read. Events follow drained batches.
+                while (count < requests.size() && wave_bytes<wave_limit && span_index < ranges.size()) {
+                    const auto& range=ranges[span_index];
+                    const auto& span=range.span;
+                    const auto* owner=range.owner;
+                    const auto alignment=owner->alignment;
+                    const auto limit=std::min(std::size_t(std::numeric_limits<DWORD>::max())/alignment*alignment,
+                        direct_chunk_limit(alignment));
+                    if (span_offset == span.size) { ++span_index; span_offset = 0; continue; }
+                    const auto offset = span.offset + span_offset;
+                    const auto base = offset / alignment * alignment;
+                    report_direct_chunking(span.size-span_offset,limit);
+                    auto* request=&requests[count].emplace(*owner);
+                    request->prefix = static_cast<std::size_t>(offset - base);
+                    request->bytes = std::min(span.size - span_offset, limit - request->prefix);
+                    const auto required = request->prefix + request->bytes;
+                    request->allocation = required + (alignment - required % alignment) % alignment;
+                    if(count && request->allocation>wave_limit-wave_bytes) {
+                        requests[count].reset();break;
+                    }
+                    request->destination = span.destination + span_offset;
+                    request->aligned_target=!request->prefix && request->bytes==request->allocation &&
+                        reinterpret_cast<std::uintptr_t>(request->destination)%alignment==0;
+                    if(!request->aligned_target) {
+                        const auto padding=(alignment-batch_bytes%alignment)%alignment;
+                        if(padding>SIZE_MAX-batch_bytes || request->allocation>SIZE_MAX-batch_bytes-padding)
+                            throw std::overflow_error("direct read staging size overflow");
+                        if(count && request->allocation+padding>wave_limit-wave_bytes) {
+                            requests[count].reset();break;
+                        }
+                        request->storage_offset=batch_bytes+padding;
+                        batch_bytes=request->storage_offset+request->allocation;
+                        wave_bytes+=padding;
+                    }
+                    wave_bytes+=request->allocation;
+                    request->native.Offset = static_cast<DWORD>(base);
+                    request->native.OffsetHigh = static_cast<DWORD>(base >> 32);
+                    request->native.hEvent = events.at(count);
+                    span_offset += request->bytes;
+                    ++count;
+                }
+                storage.ensure(batch_bytes);
+                static std::atomic<bool> aligned_reported{false};
+                if(!aligned_reported.load(std::memory_order_relaxed)) {
+                    std::size_t direct=0;for(std::size_t i=0;i<count;++i)direct+=requests[i]->aligned_target;
+                    if(direct && !aligned_reported.exchange(true,std::memory_order_relaxed))
+                        std::fprintf(stderr,"model_direct_batch_target enabled=1 requests=%zu direct_requests=%zu staging_bytes=%zu\n",count,direct,batch_bytes);
+                }
+                static std::atomic<bool> reported{false};
+                if(count>1 && batch_bytes && !reported.load(std::memory_order_relaxed) && !reported.exchange(true,std::memory_order_relaxed))
+                    std::fprintf(stderr,"model_direct_staging_batch enabled=1 requests=%zu bytes=%zu arena_allocations=1\n",count,batch_bytes);
+                // Keep every IO request in this bounded batch outstanding before
+                // waiting for completion. Ordinary expert field batches fit here.
+                for (std::size_t i=0;i<count;++i) {
+                    auto& request=requests[i];
+                    request->storage=request->aligned_target?request->destination:
+                        static_cast<std::byte*>(storage.data)+request->storage_offset;
+                    failed_owner=&request->owner;
+                    auto& interval=times[failed_owner];request->interval=&interval;
+                    if(interval.first==Clock::time_point{})interval.first=Clock::now();
+                    request->owner.calls.fetch_add(1, std::memory_order_relaxed);
+                    const auto ok = ReadFile(request->owner.handle, request->storage,
+                        static_cast<DWORD>(request->allocation), nullptr, &request->native);
+                    const auto error = ok ? ERROR_SUCCESS : GetLastError();
+                    if (!ok && error != ERROR_IO_PENDING)
+                        throw std::system_error(error, std::system_category(), "submit batch read");
+                    request->submitted = true;
+                }
+                for (std::size_t i=0;i<count;++i) {
+                    auto& request=requests[i];
+                    failed_owner=&request->owner;
+                    DWORD actual = 0;
+                    const auto ok = GetOverlappedResult(request->owner.handle, &request->native, &actual, TRUE);
+                    request->finished = true;
+                    if (!ok) throw std::system_error(GetLastError(), std::system_category(), "complete batch read");
+                    request->interval->second=Clock::now();
+                    request->owner.physical.fetch_add(actual, std::memory_order_relaxed);
+                    if (actual < request->prefix + request->bytes)
+                        throw std::runtime_error("model file truncated during batch read");
+                }
+                for (std::size_t i=0;i<count;++i) {
+                    auto& request=requests[i];
+                    if(!request->aligned_target)copy_read_buffer(request->destination,
+                        static_cast<std::byte*>(request->storage) + request->prefix, request->bytes);
+                    request->owner.logical.fetch_add(request->bytes, std::memory_order_relaxed);
+                }
+                for(std::size_t i=0;i<count;++i)requests[i].reset();
+                count=0;
+            }
+        } catch (...) {
+            failed_owner->errors.fetch_add(1, std::memory_order_relaxed);
+            throw;
+    }
+    for(const auto& [owner,interval]:times)owner->nanos.fetch_add(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(interval.second-interval.first).count(),
+        std::memory_order_relaxed);
+    }
+
 
 #endif
 
@@ -555,7 +722,7 @@ struct LinuxAioContext {
 
 void FileRangeReader::read_many(const std::vector<FileReadRange>& ranges) {
 #if defined(_WIN32)
-    bool buffered=true;
+    bool buffered=true,direct=true;
 #endif
     for(const auto& range:ranges) {
         if(!range.reader)throw std::invalid_argument("Missing retained file reader");
@@ -565,17 +732,20 @@ void FileRangeReader::read_many(const std::vector<FileReadRange>& ranges) {
         if(span.size && !span.destination)throw std::invalid_argument("Multi-file read destination is null");
 #if defined(_WIN32)
         buffered&=owner.mode==FileReadMode::Buffered;
+        direct&=owner.mode==FileReadMode::Direct;
 #endif
     }
 #if defined(_WIN32)
-    if(buffered) {
-        std::vector<Impl::BufferedRange> native;native.reserve(ranges.size());
+    if(buffered || direct) {
+        std::vector<Impl::NativeRange> native;native.reserve(ranges.size());
         for(const auto& range:ranges)native.push_back({range.reader->impl_.get(),range.span});
-        Impl::buffered_reads(native);return;
+        if(buffered)Impl::buffered_reads(native);
+        else Impl::direct_reads(native);
+        return;
     }
 #endif
-    // Direct I/O keeps its alignment/staging rules; portable buffered readers
-    // retain positional semantics without sharing a mutable file cursor.
+    // Mixed modes and portable readers retain each file's staging rules
+    // without sharing a mutable file cursor.
     std::map<const FileRangeReader*,std::vector<ReadSpan>> groups;
     for(const auto& range:ranges)groups[range.reader.get()].push_back(range.span);
     for(const auto& [reader,spans]:groups)reader->read_batch(spans);
@@ -591,150 +761,14 @@ void FileRangeReader::read_batch(const std::vector<ReadSpan>& spans) const {
     }
 #if defined(_WIN32)
     if(impl_->mode==FileReadMode::Buffered) {
-        std::vector<Impl::BufferedRange> ranges;ranges.reserve(spans.size());
+        std::vector<Impl::NativeRange> ranges;ranges.reserve(spans.size());
         for(const auto& span:spans)ranges.push_back({impl_.get(),span});
         Impl::buffered_reads(ranges);return;
     }
 
-    struct DirectEvents {
-        // Small random rows need enough outstanding I/O to hide device
-        // latency. The existing byte-wave limit still bounds staging RAM.
-        std::array<HANDLE,256> handles{};
-        ~DirectEvents(){for(auto handle:handles)if(handle)CloseHandle(handle);}
-        HANDLE at(std::size_t i) {
-            if(!handles[i])handles[i]=CreateEventW(nullptr,TRUE,FALSE,nullptr);
-            if(!handles[i])throw std::system_error(GetLastError(),std::system_category(),"create direct batch event");
-            return handles[i];
-        }
-    };
-    static thread_local DirectEvents events;
-    struct BatchStorage {
-        const Impl& owner;
-        void* data=nullptr;
-        std::size_t capacity=0;
-        explicit BatchStorage(const Impl& value):owner(value) {}
-        void release() {
-            if(!data)return;
-            owner.return_staging({data,capacity});data=nullptr;capacity=0;
-        }
-        void ensure(std::size_t bytes) {
-            if(bytes<=capacity)return;
-            // Every preceding wave was drained before the arena can grow.
-            release();const auto slab=owner.borrow_staging(bytes);data=slab.data;capacity=slab.bytes;
-        }
-        ~BatchStorage(){release();}
-    };
-    struct Request {
-        const Impl& owner;
-        OVERLAPPED native{};
-        void* storage = nullptr;
-        std::byte* destination = nullptr;
-        std::size_t prefix = 0, bytes = 0, allocation = 0, storage_offset = 0;
-        bool submitted = false, finished = false;
-        bool aligned_target = false;
-        explicit Request(const Impl& value) : owner(value) {}
-        ~Request() {
-            if (submitted && !finished) {
-                DWORD ignored = 0;
-                GetOverlappedResult(owner.handle, &native, &ignored, TRUE);
-            }
-        }
-    };
-    const auto started = std::chrono::steady_clock::now();
-    // Destruction drains requests before releasing their common I/O target.
-    BatchStorage storage(*impl_);
-    std::array<std::optional<Request>,256> requests;
-    std::size_t count=0;
-    try {
-        const auto alignment = impl_->alignment;
-        // Keep several native reads outstanding even when only one cold
-        // projection is needed. Each bounded wave still owns one staging arena.
-        const auto limit = std::min(std::size_t(std::numeric_limits<DWORD>::max()) / alignment * alignment,
-            direct_chunk_limit(alignment));
-        const auto wave_limit=direct_wave_limit(alignment);
-        std::size_t span_index = 0, span_offset = 0;
-        while (span_index < spans.size()) {
-            std::size_t batch_bytes=0,wave_bytes=0;
-            // Bound both staging bytes and outstanding IRPs. Large expert
-            // batches reuse the 8 MiB arena instead of allocating a larger,
-            // uncached payload on every read. Events follow drained batches.
-            while (count < requests.size() && wave_bytes<wave_limit && span_index < spans.size()) {
-                const auto& span = spans[span_index];
-                if (span_offset == span.size) { ++span_index; span_offset = 0; continue; }
-                const auto offset = span.offset + span_offset;
-                const auto base = offset / alignment * alignment;
-                report_direct_chunking(span.size-span_offset,limit);
-                auto* request=&requests[count].emplace(*impl_);
-                request->prefix = static_cast<std::size_t>(offset - base);
-                request->bytes = std::min(span.size - span_offset, limit - request->prefix);
-                const auto required = request->prefix + request->bytes;
-                request->allocation = required + (alignment - required % alignment) % alignment;
-                if(count && request->allocation>wave_limit-wave_bytes) {
-                    requests[count].reset();break;
-                }
-                wave_bytes+=request->allocation;
-                request->destination = span.destination + span_offset;
-                request->aligned_target=!request->prefix && request->bytes==request->allocation &&
-                    reinterpret_cast<std::uintptr_t>(request->destination)%alignment==0;
-                if(!request->aligned_target) {
-                    if(request->allocation>SIZE_MAX-batch_bytes)throw std::overflow_error("direct read staging size overflow");
-                    request->storage_offset=batch_bytes;batch_bytes+=request->allocation;
-                }
-                request->native.Offset = static_cast<DWORD>(base);
-                request->native.OffsetHigh = static_cast<DWORD>(base >> 32);
-                request->native.hEvent = events.at(count);
-                span_offset += request->bytes;
-                ++count;
-            }
-            storage.ensure(batch_bytes);
-            static std::atomic<bool> aligned_reported{false};
-            if(!aligned_reported.load(std::memory_order_relaxed)) {
-                std::size_t direct=0;for(std::size_t i=0;i<count;++i)direct+=requests[i]->aligned_target;
-                if(direct && !aligned_reported.exchange(true,std::memory_order_relaxed))
-                    std::fprintf(stderr,"model_direct_batch_target enabled=1 requests=%zu direct_requests=%zu staging_bytes=%zu\n",count,direct,batch_bytes);
-            }
-            static std::atomic<bool> reported{false};
-            if(count>1 && batch_bytes && !reported.load(std::memory_order_relaxed) && !reported.exchange(true,std::memory_order_relaxed))
-                std::fprintf(stderr,"model_direct_staging_batch enabled=1 requests=%zu bytes=%zu arena_allocations=1\n",count,batch_bytes);
-            // Keep every IO request in this bounded batch outstanding before
-            // waiting for completion. Ordinary expert field batches fit here.
-            for (std::size_t i=0;i<count;++i) {
-                auto& request=requests[i];
-                request->storage=request->aligned_target?request->destination:
-                    static_cast<std::byte*>(storage.data)+request->storage_offset;
-                impl_->calls.fetch_add(1, std::memory_order_relaxed);
-                const auto ok = ReadFile(impl_->handle, request->storage,
-                    static_cast<DWORD>(request->allocation), nullptr, &request->native);
-                const auto error = ok ? ERROR_SUCCESS : GetLastError();
-                if (!ok && error != ERROR_IO_PENDING)
-                    throw std::system_error(error, std::system_category(), "submit batch read");
-                request->submitted = true;
-            }
-            for (std::size_t i=0;i<count;++i) {
-                auto& request=requests[i];
-                DWORD actual = 0;
-                const auto ok = GetOverlappedResult(impl_->handle, &request->native, &actual, TRUE);
-                request->finished = true;
-                if (!ok) throw std::system_error(GetLastError(), std::system_category(), "complete batch read");
-                impl_->physical.fetch_add(actual, std::memory_order_relaxed);
-                if (actual < request->prefix + request->bytes)
-                    throw std::runtime_error("model file truncated during batch read");
-            }
-            for (std::size_t i=0;i<count;++i) {
-                auto& request=requests[i];
-                if(!request->aligned_target)copy_read_buffer(request->destination,
-                    static_cast<std::byte*>(request->storage) + request->prefix, request->bytes);
-                impl_->logical.fetch_add(request->bytes, std::memory_order_relaxed);
-            }
-            for(std::size_t i=0;i<count;++i)requests[i].reset();
-            count=0;
-        }
-    } catch (...) {
-        impl_->errors.fetch_add(1, std::memory_order_relaxed);
-        throw;
-    }
-    impl_->nanos.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::steady_clock::now() - started).count(), std::memory_order_relaxed);
+    std::vector<Impl::NativeRange> ranges;ranges.reserve(spans.size());
+    for(const auto& span:spans)ranges.push_back({impl_.get(),span});
+    Impl::direct_reads(ranges);
 #elif defined(__linux__)
     if(impl_->mode==FileReadMode::Buffered) {
         for(const auto& span:spans)read(span.offset,span.destination,span.size);

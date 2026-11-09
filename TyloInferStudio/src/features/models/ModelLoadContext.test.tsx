@@ -67,6 +67,18 @@ const profile: ModelCacheProfile = { max_context: 131072, fixed_bytes: GiB,
   components: [{ group: 'QSA', name: 'raw_kv', layers: 2, kv_heads: 16, head_dimension: 256,
     bytes_per_row: 32768, tokens_per_row: 1, allocation: 'exact', minimum_rows: 16 }] };
 
+it('offers explicit fast prefill for supported GGUF workers and remembers the choice', () => {
+  const view = render(<Form models={[{ ...model, format: 'gguf' }]} runtime={{ prefill_modes: ['precise', 'fast'] }} />);
+  const choice = screen.getByRole('combobox', { name: '上下文处理' });
+  expect(choice).toHaveValue('precise');
+  fireEvent.change(choice, { target: { value: 'fast' } });
+  expect(readLoadContext().prefill_mode).toBe('fast');
+  expect(screen.getByRole('checkbox', { name: '自动' })).toBeChecked();
+  view.unmount();
+  render(<Form models={[{ ...model, format: 'gguf' }]} runtime={{ prefill_modes: ['precise'] }} />);
+  expect(screen.queryByRole('combobox', { name: '上下文处理' })).not.toBeInTheDocument();
+});
+
 it('shows zero backend headroom even when the OS still reports three GiB available', () => {
   render(<Form runtime={{ memory_architecture: 'unified', host_memory_available_bytes: 3 * GiB,
     runtime_memory_headroom_bytes: 0 }} />);

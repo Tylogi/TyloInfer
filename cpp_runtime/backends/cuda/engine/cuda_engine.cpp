@@ -303,7 +303,11 @@ struct CudaEngineState {
             });
         allocation_ceiling=mfq::cuda::default_context(execution->layer_placement.primary_device())->memory_stats().limit;
         if (config.continuous_batch.max_sequences) {
-            if constexpr (std::is_same_v<Model, Qwen35CausalLm> || std::is_same_v<Model,Qwen4CausalLm>)
+            if constexpr (std::is_same_v<Model,Qwen4CausalLm>)
+                batching = std::make_unique<ContinuousBatch<CudaBatchOperations<Model>>>(
+                    config.generation.prefill_chunk_size, config.continuous_batch.prefill_token_budget,
+                    language, *execution, config.continuous_batch,&cache);
+            else if constexpr (std::is_same_v<Model,Qwen35CausalLm>)
                 batching = std::make_unique<ContinuousBatch<CudaBatchOperations<Model>>>(
                     config.generation.prefill_chunk_size, config.continuous_batch.prefill_token_budget,
                     language, *execution, config.continuous_batch);
@@ -628,6 +632,9 @@ struct CudaEngineState {
                     metrics.emplace_back(stem+"kv_bytes",double(live+hot));
                     buffers+=buffer;
                 }
+                const auto allocation=mfq::cuda::default_context(device)->memory_stats();
+                metrics.emplace_back(stem+"allocation_limit_bytes",double(allocation.limit));
+                metrics.emplace_back(stem+"peak_allocated_bytes",double(allocation.peak));
                 allocated+=memory.allocated_bytes+external;reserved+=memory.reserved_bytes+external;free_bytes+=free;total_bytes+=total;
             }
             metrics.insert(metrics.end(),{{"device_free_bytes",double(free_bytes)}, {"device_total_bytes",double(total_bytes)},

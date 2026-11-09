@@ -51,6 +51,24 @@ from tyloinfer.server.state.storage import SessionStore
 from tyloinfer.tools.split_mfq import split_mfq
 
 
+@pytest.fixture(autouse=True)
+def _launch_python_runtime_fixtures(monkeypatch: pytest.MonkeyPatch) -> None:
+    if os.name != "nt":
+        return
+    launch = asyncio.create_subprocess_exec
+
+    async def start(program, *arguments, **kwargs):
+        path = Path(program)
+        if path.is_file():
+            with path.open("rb") as source:
+                is_script = source.read(2) == b"#!"
+            if is_script:
+                return await launch(sys.executable, str(path), *arguments, **kwargs)
+        return await launch(program, *arguments, **kwargs)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", start)
+
+
 class IdleBackend:
     async def aclose(self) -> None:
         return None
@@ -1367,6 +1385,7 @@ def test_empty_runtime_pool_reports_idle_state(tmp_path: Path, monkeypatch) -> N
         assert status.pop("prefix_cache_total_disk_max_bytes") > 0
         assert status == {
             **topology,
+            "prefill_modes": ["precise", "fast"] if pool.backend == "cuda" else ["precise"],
             "mtp_service_enabled": True,
             "prefix_cache_total_hot_bytes": 0,
             "prefix_cache_total_hot_max_bytes": 2 << 30,
@@ -1881,6 +1900,23 @@ def test_managed_native_runtime_leaves_default_prefill_chunk_to_model_autotune(
         assert "--prefill-chunk-size" not in automatic
         assert explicit[explicit.index("--prefill-chunk-size") + 1] == "4096"
 
+    asyncio.run(run())
+
+
+def test_managed_fast_prefill_reaches_only_the_selected_cuda_worker(tmp_path: Path):
+    async def run():
+        model = tmp_path / "tiny.tq"
+        _model(model, architecture="qwen35")
+        catalog = ModelCatalog([tmp_path], cache_seconds=0)
+        artifact = await catalog.resolve_path(model)
+        pool = RuntimePool(catalog, tmp_path / "worker", backend="cuda")
+        gguf = DiscoveredModel(resource=artifact.resource.model_copy(update={"format": "gguf"}),
+                               path=artifact.path, routed_expert_bytes=0)
+        for mode in ("fast", "precise"):
+            _, environment = pool._launch_configuration(gguf, ModelLoadRequest(model="tiny", prefill_mode=mode), port=43123)
+            assert environment["TYLOINFER_PREFILL_MODE"] == mode
+        with pytest.raises(JobExecutionError, match="GGUF"):
+            pool._launch_configuration(artifact, ModelLoadRequest(model="tiny", prefill_mode="fast"), port=43124)
     asyncio.run(run())
 
 

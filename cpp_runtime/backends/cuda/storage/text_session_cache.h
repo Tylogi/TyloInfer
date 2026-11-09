@@ -8,6 +8,7 @@
 #include <memory>
 #include <map>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -29,6 +30,10 @@ struct SessionCacheConfig;
 namespace mfq::cuda::internal {
 
 bool cuda_has_separate_memory();
+
+std::string cuda_prefix_cache_compatibility_key(
+    const mfq::ModelSource& source,std::int64_t max_position_embeddings,
+    std::string_view prefill_mode = {});
 
 struct TextSessionRestore {
     std::size_t tokens = 0;

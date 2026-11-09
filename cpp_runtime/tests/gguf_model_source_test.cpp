@@ -710,6 +710,56 @@ void compact_formats(const std::filesystem::path& directory) {
     require(rejected, "unsupported Gyro state width accepted");
     gguf_free(header); ggml_free(tensors);
 }
+void grouped_hadamard_metadata(const std::filesystem::path& directory) {
+    auto* tensors=ggml_init({1<<20,nullptr,false});
+    auto* header=gguf_init_empty();
+    gguf_set_val_str(header,"general.architecture","qwen35");
+    gguf_set_val_u32(header,"qwen35.embedding_length",128);
+    gguf_set_val_u32(header,"qwen35.block_count",1);
+    gguf_set_val_u32(header,"qwen35.attention.head_count",4);
+    gguf_set_val_u32(header,"qwen35.attention.head_count_kv",2);
+    gguf_set_val_u32(header,"qwen35.ssm.group_count",2);
+    gguf_set_val_u32(header,"qwen35.ssm.time_step_rank",4);
+    for(const auto* name:{"token_embd.weight","output.weight","blk.0.ssm_out.weight"}) {
+        auto* matrix=ggml_new_tensor_2d(tensors,GGML_TYPE_PTQ1_0,128,3);
+        ggml_set_name(matrix,name);std::memset(matrix->data,0,ggml_nbytes(matrix));
+        gguf_add_tensor(header,matrix);
+    }
+    gguf_set_val_u32(header,"prism.hadamard.version",1);
+    gguf_set_val_u32(header,"prism.hadamard.block_size",128);
+    gguf_set_val_str(header,"prism.hadamard.transform","normalized-sylvester-walsh-hadamard");
+    gguf_set_val_str(header,"prism.hadamard.axis","input-last-dimension");
+    gguf_set_val_str(header,"prism.hadamard.sign_mode","identity");
+    gguf_set_val_bool(header,"prism.hadamard.gdn_v_grouped",true);
+    const char* forward[]{"output.weight","blk.0.ssm_out.weight"};
+    const char* inverse[]{"token_embd.weight"};
+    gguf_set_arr_str(header,"prism.hadamard.weight_names",forward,2);
+    gguf_set_arr_str(header,"prism.hadamard.inverse_weight_names",inverse,1);
+    const auto path=directory/"grouped-hadamard.gguf";
+    const auto save=[&] {require(gguf_write_to_file(header,path.string().c_str(),false),"grouped Hadamard write failed");};
+    save();
+    {
+        mfq::GgufModelSource source(path);
+        require(source.hadamard_transforms()->count("model.token_embedding.weight")==1,
+            "latent embedding lost its inverse transform");
+        const auto grouped=nlohmann::json::parse(source.metadata().at("gguf_hadamard_grouped_gdn"));
+        require(grouped.at("model.block.0.linear_attention.output.weight")==nlohmann::json::array({2,4}),
+            "grouped GDN head geometry was not retained");
+        require(source.read("model.token_embedding.weight")==std::vector<std::byte>(84),
+            "inverse embedding transform changed stored bytes");
+    }
+    gguf_set_val_u32(header,"qwen35.ssm.group_count",3);save();
+    bool invalid=false;
+    try{mfq::GgufModelSource source(path);}catch(const std::runtime_error&){invalid=true;}
+    require(invalid,"incompatible grouped GDN heads were accepted");
+    gguf_set_val_u32(header,"qwen35.ssm.group_count",2);
+    const char* unsupported[]{"output.weight"};
+    gguf_set_arr_str(header,"prism.hadamard.inverse_weight_names",unsupported,1);save();
+    invalid=false;
+    try{mfq::GgufModelSource source(path);}catch(const std::runtime_error&){invalid=true;}
+    require(invalid,"an unsupported inverse lookup table was accepted");
+    gguf_free(header);ggml_free(tensors);
+}
 }
 
 namespace {
@@ -896,6 +946,7 @@ int main() {
         qwen4_source(directory);
         qwen35_nextn_companion_source(directory);
         compact_formats(directory);
+        grouped_hadamard_metadata(directory);
         deepseek_source(directory);
         std::filesystem::remove_all(directory);
         return 0;

@@ -244,6 +244,26 @@ int main() {
             require(rejected, "invalid active predictor configuration was accepted");
         }
 
+        auto dense=flash;
+        dense["model_type"]="qwen4_text";
+        dense["mtp_num_hidden_layers"]=0;
+        dense["intermediate_size"]=48;
+        dense["ple_embed_dim"]=16;
+        dense["output_gate_type"]="sigmoid";
+        for(const auto* name:{"num_experts","num_experts_per_tok","moe_intermediate_size","shared_expert_intermediate_size"})
+            dense.erase(name);
+        const auto dense_config=mfq::models::qwen4_exp::Config::parse(dense);
+        require(dense_config.experts==0 && dense_config.topk==0 && dense_config.moe_width==48 &&
+                dense_config.hidden==32 && !dense_config.silu_gate,
+                "Dense Qwen4 did not retain its dense FFN, residual or attention parameters");
+        require(mfq::models::qwen4_exp::Config::parse(nlohmann::json{{"model_type","qwen4"},{"text_config",dense}}).experts==0,
+                "nested Dense Qwen4 configuration was rejected");
+        dense["num_experts"]=4;
+        rejected=false;
+        try{static_cast<void>(mfq::models::qwen4_exp::Config::parse(dense));}
+        catch(const std::runtime_error&){rejected=true;}
+        require(rejected,"Dense Qwen4 accepted an undeclared routed architecture");
+
         std::cout << "model config tests passed\n";
         return 0;
     } catch (const std::exception& error) {

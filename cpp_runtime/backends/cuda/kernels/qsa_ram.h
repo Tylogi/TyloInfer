@@ -52,6 +52,11 @@ int tq_reset_ram_stage_cache(const RamStageCache& cache,cudaStream_t stream);
 // Serialized publication follows prior attention reads on the same stream.
 int tq_publish_ram_sources(RamBlockView* sources,int capacity,
     const std::int32_t* ids,const RamBlockView* images,int count,cudaStream_t stream,TqBlockView* live=nullptr);
+// Copy retained pinned RAM images directly into a variable-size PP payload.
+// All tables and images must remain GPU-readable until this stream completes.
+int tq_copy_ram_prefill(const RamBlockView* sources,int capacity,
+    const std::int32_t* ids,const TqBlockView* destinations,TqBlockView* views,
+    int count,cudaStream_t stream);
 // Bridge newly generated device images while their RAM archive is pending.
 // The live table contains FP16 H4 modes or canonical Affine8. Position is
 // either a device graph scalar or the supplied host position.

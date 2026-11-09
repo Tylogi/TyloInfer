@@ -28,6 +28,50 @@ template<class T> struct Device {
     Device(const Device&) = delete;
     Device& operator=(const Device&) = delete;
 };
+void ptq_grid_stride() {
+    constexpr int rows=4*65535+7,columns=128,stride=31;
+    std::vector<std::uint8_t> weights(std::size_t(rows)*stride+2);
+    const auto scale=__float2half(.03125f);
+    for(int row=0;row<rows;++row)std::memcpy(weights.data()+1+std::size_t(row)*stride+26,&scale,2);
+    Device<std::uint8_t> w(weights.size());
+    check(cudaMemcpy(w.data,weights.data(),weights.size(),cudaMemcpyHostToDevice));
+    for(int tokens:{1,4}) {
+        std::vector<Q8> input(std::size_t(tokens)*columns/32);
+        for(int m=0;m<tokens;++m)for(int block=0;block<columns/32;++block) {
+            auto& q=input[std::size_t(m)*columns/32+block];q.d=__float2half(.125f*(m+1));q.s=__float2half(0.f);
+            std::fill(std::begin(q.qs),std::end(q.qs),std::int8_t(7+m));
+        }
+        Device<Q8> x(input.size());Device<float> f(std::size_t(rows)*tokens+2);
+        Device<__half> h(std::size_t(rows)*tokens+2);
+        check(cudaMemcpy(x.data,input.data(),input.size()*sizeof(Q8),cudaMemcpyHostToDevice));
+        check(cudaMemset(f.data,0x5a,(std::size_t(rows)*tokens+2)*sizeof(float)));
+        check(cudaMemset(h.data,0x5a,(std::size_t(rows)*tokens+2)*sizeof(__half)));
+        cudaStream_t stream;check(cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking));
+        check(cudaStreamBeginCapture(stream,cudaStreamCaptureModeGlobal));
+        compact_project(CompactFormat::PTQ1_0,w.data+1,stride,rows,columns,x.data,CompactInput::Q8_1,tokens,f.data+1,false,stream);
+        compact_project(CompactFormat::PTQ1_0,w.data+1,stride,rows,columns,x.data,CompactInput::Q8_1,tokens,h.data+1,true,stream);
+        cudaGraph_t graph;check(cudaStreamEndCapture(stream,&graph));cudaGraphExec_t executable;
+        check(cudaGraphInstantiate(&executable,graph,0));check(cudaGraphLaunch(executable,stream));
+        check(cudaStreamSynchronize(stream));check(cudaGraphExecDestroy(executable));check(cudaGraphDestroy(graph));check(cudaStreamDestroy(stream));
+        std::vector<float> actual(std::size_t(rows)*tokens+2);
+        std::vector<__half> half_actual(actual.size());
+        check(cudaMemcpy(actual.data(),f.data,actual.size()*sizeof(float),cudaMemcpyDeviceToHost));
+        check(cudaMemcpy(half_actual.data(),h.data,half_actual.size()*sizeof(__half),cudaMemcpyDeviceToHost));
+        for(int m=0;m<tokens;++m)for(int row=0;row<rows;++row) {
+            const auto at=1+std::size_t(m)*rows+row;
+            const auto expected=-.5f*(m+1)*(7+m);
+            if(actual[at]!=expected || __half2float(half_actual[at])!=expected)
+                throw std::runtime_error("PTQ grid-stride tail changed its exact constant dot product");
+        }
+        const auto* fb=reinterpret_cast<const std::uint8_t*>(actual.data());
+        const auto* hb=reinterpret_cast<const std::uint8_t*>(half_actual.data());
+        for(int i=0;i<4;++i)if(fb[i]!=0x5a || fb[actual.size()*4-1-i]!=0x5a)
+            throw std::runtime_error("PTQ grid-stride projection overwrote float guards");
+        for(int i=0;i<2;++i)if(hb[i]!=0x5a || hb[half_actual.size()*2-1-i]!=0x5a)
+            throw std::runtime_error("PTQ grid-stride projection overwrote half guards");
+    }
+    std::puts("PTQ capped-grid row tail, partial K subgroup, unaligned stride and FP16/FP32 guards PASS");
+}
 float half_at(const void* at) { __half value; std::memcpy(&value, at, 2); return __half2float(value); }
 std::vector<float> reference(const std::vector<std::uint8_t>& weights, std::uint64_t stride,
         int format, int rows, int columns) {
@@ -369,6 +413,7 @@ int main(int argc, char** argv) {
             else run<Q8>(f, m, n, k, false, true, native_pair);
         }
         else {
+            ptq_grid_stride();
             for (int format = 143; format <= 151; ++format) {
                 for (int m : {1, 2, 3, 4, 5}) for (int rows : {1, 7}) for (int width : {128, 640}) {
                     run<__half>(format, m, rows, width, true, false);

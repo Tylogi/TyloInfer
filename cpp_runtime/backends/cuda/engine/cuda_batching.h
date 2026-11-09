@@ -6,6 +6,7 @@
 #include "cuda_sampling.h"
 #include "models/qwen35/batch_state.h"
 #include "models/qwen4_exp/ops.h"
+#include <cstdint>
 #include <type_traits>
 
 namespace mfq::cuda {
@@ -81,7 +82,12 @@ class QwenBatchOperations {
 };
 
 struct FlashNextBatchRequest : mfq::engine::BatchRequest {
-    using BatchRequest::BatchRequest;
+    FlashNextBatchRequest(std::string id,const mfq::engine::InferenceRequest& input)
+        :BatchRequest(std::move(id),input),cache_plan(input.cache_plan){}
+    MfqPromptCachePlan cache_plan;
+    std::size_t prefix_boundary=0;
+    bool prefix_stored=false;
+    std::uint64_t wait_for_release=0;
     std::optional<Sampler> sampler;
     mfq_tensor_backend::Tensor counts, prefill_ids;
     std::vector<std::unique_ptr<internal::PrefillCudaTimer>> prefill_timers;
@@ -96,12 +102,15 @@ class FlashNextBatchOperations {
     using State = mfq::engine::BatchState<Request>;
     using Sample = QwenBatchOperations::Sample;
     struct Decoded { Tensor logits, greedy_tokens; };
-    FlashNextBatchOperations(Qwen4CausalLm&, CudaExecutionContext&, CudaContinuousBatchConfig);
+    FlashNextBatchOperations(Qwen4CausalLm&, CudaExecutionContext&, CudaContinuousBatchConfig,
+        internal::TextSessionCache* cache=nullptr);
     ~FlashNextBatchOperations();
     int64_t vocab_size() const;
     int64_t max_context() const;
     mfq::engine::Metrics metrics() const;
     void suspend_decode();
+    std::optional<std::size_t> prepare(const std::shared_ptr<Request>&);
+    std::size_t prefix_tokens(const std::shared_ptr<Request>&) const;
     mfq::engine::PrefillChunk prefill_chunk(const std::shared_ptr<Request>&, mfq::engine::PrefillChunk);
     Sample prefill(const std::shared_ptr<Request>&, mfq::engine::PrefillChunk);
     std::size_t prefill_batch_limit() const;
@@ -124,10 +133,12 @@ class FlashNextBatchOperations {
     Qwen4CausalLm& model_;
     CudaExecutionContext& execution_;
     CudaContinuousBatchConfig config_;
+    internal::TextSessionCache* prefix_cache_=nullptr;
     std::vector<std::weak_ptr<Request>> requests_;
     std::unique_ptr<Qwen4BatchDecodeGraph> graph_;
     int64_t decode_batches_ = 0, decode_tokens_ = 0, greedy_batches_ = 0;
     int64_t packed_prefill_batches_ = 0, packed_prefill_requests_ = 0, packed_prefill_tokens_ = 0;
+    std::uint64_t released_states_=0, memory_waits_=0;
 };
 template<class Model> using CudaBatchOperations = std::conditional_t<
     std::is_same_v<Model,Qwen4CausalLm>, FlashNextBatchOperations, QwenBatchOperations>;
