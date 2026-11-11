@@ -519,32 +519,20 @@ bool Model::supports_speculation() const noexcept {
 bool supports_speculation(const Model& model) noexcept {
     return !model.layers.empty() &&
            std::all_of(model.layers.begin(), model.layers.end(), [](const Layer& layer) {
-               const auto* full = std::get_if<FullAttention>(&layer.weights);
+               const auto* full = std::get_if<::tyloi::models::FullAttention>(&layer.weights);
                return full == nullptr || !full->sliding;
            });
 }
 
-#ifdef TYLOINFER_NATIVE_CUDA
 DenseTensor forward_layer(const Layer& layer, LayerState& state, DenseTensor input,
-                     const AttentionStep& step, std::int64_t confirmed,
+                     const ::tyloi::models::AttentionStep& step, std::int64_t confirmed,
                      const tyloi::models::ForwardOptions& mode) {
-#else
-DenseTensor forward_layer(const Layer& layer, LayerState& state, Executor& executor,
-                     std::size_t scratch_index, DenseTensor input, const AttentionStep& step,
-                     std::int64_t confirmed, const Executor::Mode& mode) {
-#endif
     MfqCudaGuard guard(layer.device);
     if (const auto* mamba = std::get_if<Mamba>(&layer.weights)) {
         auto& activity = std::get<MambaState>(state);
-#ifdef TYLOINFER_NATIVE_CUDA
         const auto run = [&] {
             return mamba_forward(*mamba, activity, std::move(input));
         };
-#else
-        const auto run = [&] {
-            return mamba_forward(*mamba, activity, executor, std::move(input), mode);
-        };
-#endif
         if (confirmed == 0) return run();
         TYLOINFER_RUNTIME_CHECK(input.is_cuda() && !activity.mixer.pending() && confirmed > 0 &&
                                confirmed < input.size(1) && activity.mixer.defined(),
@@ -559,12 +547,8 @@ DenseTensor forward_layer(const Layer& layer, LayerState& state, Executor& execu
         }
     }
     if (const auto* moe = std::get_if<Moe>(&layer.weights))
-#ifdef TYLOINFER_NATIVE_CUDA
         return moe_forward(*moe, std::move(input));
-#else
-        return moe_forward(*moe, executor, std::move(input), mode);
-#endif
-    const auto& attention = std::get<FullAttention>(layer.weights);
+    const auto& attention = std::get<::tyloi::models::FullAttention>(layer.weights);
     auto& cache = std::get<tyloi::state::KvView>(state);
     const auto B = input.size(0), T = input.size(1), H = input.size(2);
     TYLOINFER_RUNTIME_CHECK(confirmed == 0 || !attention.sliding,
@@ -578,21 +562,12 @@ DenseTensor forward_layer(const Layer& layer, LayerState& state, Executor& execu
                         input.device(), attention.official_bf16 ? ::tyloi::kBFloat16 :
                         ::tyloi::kFloat16, attention.kv_quantization);
     cache.quantization = attention.kv_quantization;
-#ifdef TYLOINFER_NATIVE_CUDA
     auto output = attention.forward(::tyloi::Tensor(std::move(input)), step,
         cache, attention.attention_rope,
         attention.layer == mode.trace_layer ? mode.trace : nullptr);
     return attention_residual(output[0].dense(), output[1].dense(), B, T, H);
-#else
-    auto mixed = attention.forward(executor.projector(mode.ffn), executor.profiler(),
-        executor.attention_options(), std::move(input), step, cache,
-        executor.attention_scratch(scratch_index), attention.attention_rope,
-        attention.layer == mode.trace_layer ? mode.trace : nullptr);
-    return attention_residual(executor, std::move(mixed[0]), std::move(mixed[1]), B, T, H);
-#endif
 }
 
-#ifdef TYLOINFER_NATIVE_CUDA
 ::tyloi::Tensor Model::forward(tyloi::models::Input input, tyloi::models::State& state_value,
                                const tyloi::models::ForwardOptions& mode) const {
     if (input.suffix) throw std::invalid_argument("Nemotron-H does not support speculative suffix forwarding");
@@ -638,7 +613,7 @@ DenseTensor forward_layer(const Layer& layer, LayerState& state, Executor& execu
         const std::array<std::int64_t, 1> shape{B};
         input.lengths = tyloi::ops::full(shape, state.cache_pos + 1, primary);
     }
-    AttentionStep step{semantic, input.lengths, input.cache_positions ? physical : tyloi::Tensor{},
+    ::tyloi::models::AttentionStep step{semantic, input.lengths, input.cache_positions ? physical : tyloi::Tensor{},
         state.cache_pos, input.kv_length, input.attention_parts};
     auto hidden = tyloi::ops::contiguous(tyloi::ops::copy(embeddings, primary));
     const auto trace = [&](const tyloi::Tensor& value) {
@@ -664,79 +639,6 @@ DenseTensor forward_layer(const Layer& layer, LayerState& state, Executor& execu
     if (input.raw_hidden) *input.raw_hidden = finalized;
     return finalized;
 }
-#else
-DenseTensor forward(const Model& model, State& state, Executor& executor, Collectives& collectives,
-               const Executor::Mode& mode, tyloi::models::Input input) {
-    MfqCudaGuard guard(mode.primary);
-    auto ids = normalize_ids(collectives, mode.primary, std::move(input.ids).dense());
-    auto embeddings = input.embeddings ? *input.embeddings
-        : embed(model, executor, collectives, mode.primary, ids, mode);
-
-    const auto B = ids.size(0), T = ids.size(1);
-    tyloi::models::require_model(embeddings.dim() == 3 && embeddings.size(0) == B &&
-                               embeddings.size(1) == T && embeddings.size(2) == model.metadata.hidden_size,
-                               "inputs_embeds shape must match [batch,tokens,hidden_size]");
-    tyloi::models::require_model(state.speculative_start < 0,
-                               "commit or roll back the pending speculative pass before forwarding");
-    tyloi::models::require_model(input.confirmed >= 0 &&
-        (input.confirmed == 0 || (input.confirmed < T && B == 1 && state.cache_pos > 0 &&
-         !input.positions.defined() && !input.cache_positions.defined() &&
-         supports_speculation(model))),
-        "unsupported speculative backbone geometry");
-    if (input.confirmed > 0) {
-        tyloi::models::require_model(state.cache_pos + T <= model.metadata.max_position_embeddings,
-                                   "speculative pass exceeds context capacity");
-        state.speculative_start = state.cache_pos;
-        state.speculative_confirmed = input.confirmed;
-    }
-    if (state.cache_pos == 0) state.reset(B);
-    const auto options = ::tyloi::TensorOptions().device(::tyloi::Device(::tyloi::kCUDA, mode.primary))
-                             .dtype(::tyloi::kInt64);
-    auto physical = input.cache_positions.defined()
-        ? collectives.copy(input.cache_positions.dense().to(::tyloi::kInt64), mode.primary).contiguous()
-        : ::tyloi::cuda::arange(state.cache_pos, state.cache_pos + T, options);
-    auto semantic = input.positions.defined()
-        ? collectives.copy(input.positions.dense().to(::tyloi::kInt64), mode.primary).contiguous()
-        : (state.decode_position_delta == 0 ? physical : physical + state.decode_position_delta);
-    tyloi::models::require_model((physical.dim() == 1 && physical.numel() == T) ||
-        (physical.dim() == 2 && physical.size(0) == B && physical.size(1) == T),
-        "cache_positions must have shape [tokens] or [batch,tokens]");
-    tyloi::models::require_model((semantic.dim() == 1 && semantic.size(0) == T) ||
-        (semantic.dim() == 2 && semantic.size(0) == B && semantic.size(1) == T),
-        "position_ids must have shape [tokens] or [batch,tokens]");
-    if (!input.lengths.defined() && state.cache_pos > 0 && T == 1)
-        input.lengths = ::tyloi::cuda::full({B}, state.cache_pos + 1, options);
-    AttentionStep step{semantic, input.lengths ? MfqOptional<DenseTensor>(input.lengths.dense()) : mfq_nullopt,
-        input.cache_positions.defined() ? MfqOptional<DenseTensor>(physical) : mfq_nullopt,
-        state.cache_pos, input.kv_length, input.attention_parts};
-
-    auto hidden = collectives.copy(std::move(embeddings), mode.primary).contiguous();
-    const auto trace = [&](const DenseTensor& value) {
-        if (input.trace)
-            input.trace->push_back(collectives.copy(value, mode.primary).to(::tyloi::kFloat32).clone());
-    };
-    trace(hidden);
-    for (std::size_t index = 0; index < model.layers.size(); ++index) {
-        const auto& layer = model.layers[index];
-        MfqCudaGuard layer_guard(layer.device);
-        auto local = step;
-        local.positions = collectives.copy(step.positions.dense(), layer.device);
-        if (step.sequence_lengths.defined())
-            local.sequence_lengths = collectives.copy(step.sequence_lengths.dense(), layer.device);
-        if (step.cache_positions.defined())
-            local.cache_positions = collectives.copy(step.cache_positions.dense(), layer.device);
-        hidden = forward_layer(layer, state.layers[index], executor, index,
-            collectives.copy(std::move(hidden), layer.device), local, input.confirmed, mode);
-
-        trace(hidden);
-    }
-    if (!input.positions.defined() || input.advance) state.cache_pos += T;
-    hidden = collectives.copy(std::move(hidden), mode.primary);
-    auto finalized = normalize(model, executor, std::move(hidden), B, T);
-    if (input.raw_hidden) *input.raw_hidden = finalized;
-    return finalized;
-}
-#endif
 
 #ifndef TYLOINFER_NATIVE_CUDA
 void replay(const Model& model, State& state, Executor&, std::int64_t accepted) {
@@ -807,7 +709,7 @@ Layer load_layer(const ::tyloi::weights::Loader& weights,
             break;
         }
         case tyloi::models::nemotron_h::MixerKind::full_attention: {
-            auto& attention = result.weights.emplace<FullAttention>();
+            auto& attention = result.weights.emplace<::tyloi::models::FullAttention>();
             attention.kv_quantization = cuda_kv_quantization();
             tyloi::models::nemotron_h::load_attention(attention, loader, config, layer, tensor_root);
             break;
@@ -909,7 +811,7 @@ State::State(const Model& model) : layers(model.layers.size()) {
 #endif
                 }});
             layers[index].emplace<MambaState>();
-        } else if (const auto* full = std::get_if<FullAttention>(&layer.weights)) {
+        } else if (const auto* full = std::get_if<::tyloi::models::FullAttention>(&layer.weights)) {
             layout_.push_back({layer.device, FullLayout{full->kv_heads, full->attention_head_dim,
                 full->sliding ? full->attention_window : full->max_position_embeddings,
                 full->sliding, full->official_bf16 ? ::tyloi::kBFloat16 :

@@ -80,7 +80,7 @@ Components Components::load(
     Executor& executor,
     Collectives& copies,
     const int64_t& kv_capacity,
-    Trace* const& trace,
+    tyloi::ops::Trace* const& trace,
     const int& trace_scope,
     bool optional,
     bool cpu_offload,

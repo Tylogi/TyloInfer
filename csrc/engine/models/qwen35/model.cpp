@@ -6,7 +6,6 @@
 
 namespace tyloi::cuda::qwen35 {
 
-#ifdef TYLOINFER_NATIVE_CUDA
 ::tyloi::Tensor Model::embedding(const tyloi::Tensor& ids, int primary) const {
     if (ids.dim() != 1 && ids.dim() != 2)
         throw std::runtime_error("token IDs must have shape [tokens] or [batch,tokens]");
@@ -22,6 +21,5 @@ namespace tyloi::cuda::qwen35 {
     });
     return tyloi::ops::contiguous(tyloi::ops::cast(result, tyloi::ScalarType::float16));
 }
-#endif
 
 } // namespace tyloi::cuda::qwen35

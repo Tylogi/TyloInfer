@@ -5,7 +5,7 @@
 
 namespace tyloi::cuda::gemma4 {
 
-::tyloi::Tensor forward_layer(const Layer&, tyloi::state::KvView&, const tyloi::Tensor&, const AttentionStep&,
+::tyloi::Tensor forward_layer(const Layer&, tyloi::state::KvView&, const tyloi::Tensor&, const ::tyloi::models::AttentionStep&,
                      const Model::Options&);
 
 } // namespace tyloi::cuda::gemma4

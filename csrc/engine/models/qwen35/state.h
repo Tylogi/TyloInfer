@@ -8,10 +8,16 @@
 #include "engine/backends/cuda/ops/attention/linear.h"
 
 #include <cstdint>
+#include <algorithm>
 #include <variant>
 #include <vector>
 
 namespace tyloi::cuda::qwen35 {
+
+inline std::int64_t kv_capacity_for(bool sliding, std::int64_t capacity,
+                                    std::int64_t end, std::int64_t requested) noexcept {
+    return sliding || requested <= 0 ? capacity : std::max(end, requested);
+}
 
 struct Model;
 
@@ -49,7 +55,7 @@ struct Layout {
     std::variant<FullLayout, LinearLayout> attention;
 };
 
-class State {
+class State : public tyloi::models::State {
 public:
     struct Restore {
         std::vector<LayerState> layers;
@@ -57,27 +63,30 @@ public:
         std::int64_t decode_position_delta = 0;
     };
 
-    State(const Model& model, const bool& transposed);
+    State(const Model& model, bool transposed);
     State(const State&) = delete;
     State& operator=(const State&) = delete;
     State(State&&) noexcept = default;
     State& operator=(State&&) noexcept = default;
 
-    void preallocate();
-    void reset(std::int64_t new_batch);
-    std::int64_t position() const noexcept { return cache_pos; }
-    void advance(std::int64_t tokens) noexcept { cache_pos += tokens; }
-    void set_position_delta(std::int64_t delta) noexcept { decode_position_delta = delta; }
-    void commit_speculative();
+    void preallocate() override;
+    std::vector<std::pair<tyloi::Device, std::size_t>> preallocate_growth() const override;
+    std::vector<std::pair<tyloi::Device, std::size_t>> growth(
+        const tyloi::models::Input&, const tyloi::models::ForwardOptions&) const override;
+    void reset(std::int64_t new_batch) override;
+    std::int64_t position() const noexcept override { return cache_pos; }
+    void advance(std::int64_t tokens) noexcept override { cache_pos += tokens; }
+    void set_position_delta(std::int64_t delta) noexcept override { decode_position_delta = delta; }
+    void commit_speculative() override;
     std::int64_t rewind(std::int64_t accepted_suffix);
     void abort_speculative() noexcept;
 
-    std::vector<::tyloi::Tensor*> graph_state();
-    std::vector<::tyloi::Tensor> storage() const;
+    std::vector<::tyloi::Tensor*> graph_state() override;
+    std::vector<::tyloi::Tensor> storage() const override;
 
     TextSessionStateKind text_session_state_kind() const;
-    bool supports_text_session_state() const;
-    bool supports_paged_text_session_state() const;
+    bool supports_text_session_state() const override;
+    bool supports_paged_text_session_state() const override;
     TextSessionState capture_text_session_state(
         const std::vector<std::int64_t>& tokens) const;
     Restore prepare(const TextSessionState& state) const;
@@ -87,7 +96,6 @@ public:
     const std::vector<Layout>& layout() const noexcept { return layout_; }
 
     std::vector<LayerState> layers;
-    std::unique_ptr<tyloi::models::MtpState> predictor;
     std::int64_t cache_pos = 0;
     std::int64_t decode_position_delta = 0;
     std::int64_t speculative_start = -1;
@@ -97,7 +105,7 @@ public:
 private:
     std::vector<Layout> layout_;
     std::int64_t max_position_embeddings_;
-    const bool* transposed_;
+    bool transposed_;
 };
 
 } // namespace tyloi::cuda::qwen35

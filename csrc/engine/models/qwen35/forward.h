@@ -11,7 +11,6 @@
 
 namespace tyloi::cuda::qwen35 {
 
-#ifdef TYLOINFER_NATIVE_CUDA
 ::tyloi::Tensor embed(const Model&, Executor&, Collectives&, int primary, const ::tyloi::Tensor& ids,
              const Executor::Mode& = {});
 
@@ -24,20 +23,6 @@ namespace tyloi::cuda::qwen35 {
               const Executor::Mode& = {});
 
 ::tyloi::Tensor softcap(const Model&, Executor&, const ::tyloi::Tensor& logits);
-#else
-DenseTensor embed(const Model&, Executor&, Collectives&, int primary, DenseTensor ids,
-             const Executor::Mode& = {});
-
-DenseTensor forward(const Model&, State&, Executor&, Collectives&, const Executor::Mode&, tyloi::models::Input);
-
-DenseTensor normalize(const Model&, Executor&, DenseTensor hidden, std::int64_t batch,
-                 std::int64_t tokens);
-
-DenseTensor logits(const Model&, Executor&, DenseTensor hidden, bool capped = true,
-              const Executor::Mode& = {});
-
-DenseTensor softcap(const Model&, Executor&, DenseTensor logits);
-#endif
 
 bool supports_speculation(const Model&) noexcept;
 
@@ -50,13 +35,9 @@ DenseTensor forward_layer(
     tyloi::cuda::Executor& executor,
     std::size_t scratch_offset,
     DenseTensor input,
-    const AttentionStep& step,
+    const ::tyloi::models::AttentionStep& step,
     std::int64_t confirmed_prefix,
-#ifdef TYLOINFER_NATIVE_CUDA
     const tyloi::ops::RopeTable& rope,
-#else
-    const RopeCache& rope,
-#endif
     const Executor::Mode& options);
 
 } // namespace tyloi::cuda::qwen35

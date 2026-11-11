@@ -129,7 +129,7 @@ struct Mtp final : tyloi::models::Mtp {
         result->states.resize(layers.size());
         for (std::size_t index = 0; index < layers.size(); ++index) {
             const auto &layer = layers[index];
-            if (const auto *full = std::get_if<FullAttention>(&layer.weights)) {
+            if (const auto *full = std::get_if<::tyloi::models::FullAttention>(&layer.weights)) {
                 auto &cache = result->states[index].emplace<tyloi::state::KvView>();
                 if (::tyloi::cuda::options::kv_vram_preallocated()) {
                     MfqCudaGuard guard(layer.device);
@@ -249,21 +249,12 @@ struct Mtp final : tyloi::models::Mtp {
                 std::optional<DenseTensor> sequence_lengths;
                 if (tokens == 1 && state.lengths[stage] > 0)
                     sequence_lengths = lengths(x.size(0), state.lengths[stage] + 1, pos);
-#ifdef TYLOINFER_NATIVE_CUDA
-                AttentionStep step{pos, sequence_lengths.value_or(::tyloi::DenseTensor()), ::tyloi::Tensor{},
+                ::tyloi::models::AttentionStep step{pos, sequence_lengths.value_or(::tyloi::DenseTensor()), ::tyloi::Tensor{},
                                    state.lengths[stage], 0, 0};
-#else
-                AttentionStep step{pos, sequence_lengths.value_or(::tyloi::DenseTensor()), mfq_nullopt,
-                                   state.lengths[stage], 0, 0};
-#endif
+
                 for (std::size_t index = 0; index < model.layers.size(); ++index)
-#ifdef TYLOINFER_NATIVE_CUDA
                     x = forward_layer(model.layers[index], state.states[index],
                                       std::move(x), step, 0, mode);
-#else
-                    x = forward_layer(model.layers[index], state.states[index], *model.executor,
-                                      index, std::move(x), step, 0, mode);
-#endif
                 return x;
             }
 #ifdef TYLOINFER_NATIVE_CUDA
@@ -326,7 +317,7 @@ struct Mtp final : tyloi::models::Mtp {
         result.cache_pos = predictor_position;
         auto& snapshots = std::get<std::vector<KvSnapshot>>(result.payload);
         for (std::size_t index = 0; index < layers.size(); ++index) {
-            if (!std::holds_alternative<FullAttention>(layers[index].weights))
+            if (!std::holds_alternative<::tyloi::models::FullAttention>(layers[index].weights))
                 continue;
             MfqCudaGuard guard(layers[index].device);
             snapshots.push_back(
@@ -343,7 +334,7 @@ struct Mtp final : tyloi::models::Mtp {
         auto& state = this->state<PredictorState>(value);
         std::vector<std::size_t> saved;
         for (std::size_t index = 0; index < layers.size(); ++index)
-            if (std::holds_alternative<FullAttention>(layers[index].weights))
+            if (std::holds_alternative<::tyloi::models::FullAttention>(layers[index].weights))
                 saved.push_back(index);
         const auto *blocks = std::get_if<std::vector<KvSnapshot>>(&snapshot.payload);
         const auto *hidden = snapshot.last_target_hidden.representation<::tyloi::DenseTensor>();
@@ -355,7 +346,7 @@ struct Mtp final : tyloi::models::Mtp {
         for (std::size_t index = 0; index < saved.size(); ++index) {
             const auto layer_index = saved[index];
             MfqCudaGuard guard(layers[layer_index].device);
-            const auto& attention = std::get<FullAttention>(layers[layer_index].weights);
+            const auto& attention = std::get<::tyloi::models::FullAttention>(layers[layer_index].weights);
             restore_kv(std::get<tyloi::state::KvView>(state.states[layer_index]), (*blocks)[index],
                 attention.attention_head_dim,
                 attention.official_bf16 ? ::tyloi::kBFloat16 : ::tyloi::kFloat16,

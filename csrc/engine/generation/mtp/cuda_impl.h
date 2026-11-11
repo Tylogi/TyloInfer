@@ -322,7 +322,8 @@ template <class Model, class State> struct CudaMtpOps {
     target_graph_captures=weights.activity().graph_captures;
   }
   void rollback_target(std::int64_t accepted) {
-    if constexpr (std::is_base_of_v<tyloi::models::State, State>) {
+    if constexpr (std::is_base_of_v<tyloi::models::CausalModel, Model> &&
+                  std::is_base_of_v<tyloi::models::State, State>) {
       state.rollback_speculative(accepted);
     } else if constexpr (has_replay<Model, State>) {
 #ifdef TYLOINFER_NATIVE_CUDA

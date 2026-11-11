@@ -10,7 +10,7 @@ namespace tyloi::cuda::qwen35 {
 
 struct Predictor {
     struct Layer {
-        FullAttention attention;
+        ::tyloi::models::FullAttention attention;
 #ifdef TYLOINFER_NATIVE_CUDA
         ::tyloi::Tensor ffn_norm;
 #else

@@ -485,15 +485,10 @@ DenseTensor forward(const Model& model, State& state, Executor& executor, Collec
                                "position_ids must have shape [tokens] or [batch,tokens]");
     if (!input.lengths.defined() && state.cache_pos > 0 && T == 1)
         input.lengths = ::tyloi::cuda::full({B}, state.cache_pos + 1, options);
-#ifdef TYLOINFER_NATIVE_CUDA
-    AttentionStep step{semantic, input.lengths,
+    ::tyloi::models::AttentionStep step{semantic, input.lengths,
                        input.cache_positions.defined() ? physical : ::tyloi::DenseTensor{},
                        state.cache_pos, input.kv_length, input.attention_parts};
-#else
-    AttentionStep step{semantic, input.lengths ? MfqOptional<DenseTensor>(input.lengths.dense()) : mfq_nullopt,
-                       input.cache_positions.defined() ? MfqOptional<DenseTensor>(physical) : mfq_nullopt,
-                       state.cache_pos, input.kv_length, input.attention_parts};
-#endif
+
     auto hidden = collectives.copy(std::move(embeddings), mode.primary).contiguous()
                       .to(::tyloi::kFloat16).unsqueeze(2)
                       .expand({B, T, model.metadata.hc_mult, model.metadata.hidden_size}).contiguous();
@@ -1000,20 +995,16 @@ static ::tyloi::DenseTensor hc_post(const Layer& w, ::tyloi::DenseTensor x,
 
 static ::tyloi::DenseTensor
 attention_forward(const Layer& w, LayerState& state, Executor& executor,
-                  ::tyloi::DenseTensor x, const AttentionStep& step,
+                  ::tyloi::DenseTensor x, const ::tyloi::models::AttentionStep& step,
                   const Executor::Mode& mode) {
     auto &profiler = executor.profiler();
     auto project = executor.projector(mode.ffn);
     auto& scratch = executor.mla_scratch(w.device);
     scratch.ensure_compressed();
-#ifdef TYLOINFER_NATIVE_CUDA
     const auto positions = step.positions.dense();
     const MfqOptional<::tyloi::DenseTensor> seq_len = step.sequence_lengths
         ? MfqOptional<::tyloi::DenseTensor>(step.sequence_lengths.dense()) : mfq_nullopt;
-#else
-    const auto& positions = step.positions;
-    const auto& seq_len = step.sequence_lengths;
-#endif
+
     const auto cache_pos = step.cache_position;
     auto& local_cache = state.local_cache;
     const auto& hidden_size = w.hidden_size;
@@ -1423,7 +1414,7 @@ attention_forward(const Layer& w, LayerState& state, Executor& executor,
 }
 
 DenseTensor forward_layer(const Layer& w, LayerState& state, Executor& executor, DenseTensor x,
-                     DenseTensor current_ids, const AttentionStep& step, const Executor::Mode& mode) {
+                     DenseTensor current_ids, const ::tyloi::models::AttentionStep& step, const Executor::Mode& mode) {
     auto& profiler = executor.profiler();
     const auto& hidden_size = w.hidden_size;
     const auto& eps = w.eps;

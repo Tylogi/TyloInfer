@@ -170,13 +170,8 @@ Layer load_layer(const ::tyloi::weights::Loader& weights, const Config& config,
             config.attention_output_gate);
         full.attention.attention_rotary_dim = config.rotary_dim;
         full.attention.no_rope = config.positional_encoding == tyloi::models::PositionalEncoding::none;
-#ifdef TYLOINFER_NATIVE_CUDA
         full.ffn_norm = weights.tensor(std::string(tensor_root) + ".block." +
                                        std::to_string(index) + ".mlp.norm.weight");
-#else
-        full.ffn_norm = loader.dense(std::string(tensor_root) + ".block." +
-                                     std::to_string(index) + ".mlp.norm.weight");
-#endif
         full.ffn = tyloi::models::qwen35::load_ffn<Ffn>(loader, config, index, tensor_root);
         result.weights = std::move(full);
     } else {
@@ -195,11 +190,7 @@ Layer load_layer(const ::tyloi::weights::Loader& weights, const Config& config,
 #else
         linear.attention.attn_norm = loader.dense(prefix + "attention.norm.weight");
 #endif
-#ifdef TYLOINFER_NATIVE_CUDA
         linear.ffn_norm = weights.tensor(prefix + "mlp.norm.weight");
-#else
-        linear.ffn_norm = loader.dense(prefix + "mlp.norm.weight");
-#endif
         loader.load_linear_attention(linear.attention, config, index, tensor_root);
         linear.ffn = tyloi::models::qwen35::load_ffn<Ffn>(loader, config, index, tensor_root);
         result.weights = std::move(linear);
@@ -271,11 +262,7 @@ Model load(std::shared_ptr<const tyloi::ModelSource> source,
                            model.metadata.rope_interleaved, yarn);
             rope.configure_mrope(config.mrope_sections, config.mrope_interleaved,
                                  config.rotary_dim, device);
-#ifdef TYLOINFER_NATIVE_CUDA
             return rope.view();
-#else
-            return rope;
-#endif
         };
         const auto primary = ::tyloi::Device(
             ::tyloi::kCUDA, weights.placement.device);
@@ -295,11 +282,7 @@ Model load(std::shared_ptr<const tyloi::ModelSource> source,
         const auto output_name = std::string("model.output.weight");
         const bool independent_output = !config.tie_word_embeddings && weights.has(output_name);
         model.embed = weights.embedding("model.token_embedding.weight", independent_output);
-#ifdef TYLOINFER_NATIVE_CUDA
         model.output_norm = weights.tensor("model.output_norm.weight");
-#else
-        model.output_norm = weights.tensor("model.output_norm.weight").dense();
-#endif
         if (config.tie_word_embeddings || !weights.has(output_name)) {
             model.lm_head = weights.placement.tensor.enabled()
                 ? weights.weight("model.token_embedding.weight", TensorParallelAxis::Output)
@@ -323,11 +306,7 @@ Model load(std::shared_ptr<const tyloi::ModelSource> source,
     } else {
         if (options.load_layers)
             throw std::invalid_argument("streamed model setup requires deferred layers");
-#ifdef TYLOINFER_NATIVE_CUDA
         model.output_norm = weights.tensor("model.output_norm.weight");
-#else
-        model.output_norm = weights.tensor("model.output_norm.weight").dense();
-#endif
     }
     return model;
 }
@@ -348,27 +327,15 @@ std::optional<Predictor> load_predictor(TransformerWeightLoader& loader,
         "Qwen MTP requires declared predictor layers and shared embeddings");
     Predictor model;
     model.config = config;
-#ifdef TYLOINFER_NATIVE_CUDA
     model.hidden_norm = loader.weights.tensor("predictor.hidden_norm.weight");
     model.embedding_norm = loader.weights.tensor("predictor.embedding_norm.weight");
     model.output_norm = loader.weights.tensor("predictor.output_norm.weight");
-#else
-    model.hidden_norm = loader.dense("predictor.hidden_norm.weight");
-    model.embedding_norm = loader.dense("predictor.embedding_norm.weight");
-    model.output_norm = loader.dense("predictor.output_norm.weight");
-#endif
     model.fusion = loader.linear("predictor.fusion.weight");
     TYLOINFER_RUNTIME_CHECK(model.fusion.size(1) == 2 * config.hidden_size &&
         model.fusion.size(0) == config.hidden_size &&
-#ifdef TYLOINFER_NATIVE_CUDA
         model.hidden_norm.numel() == config.hidden_size &&
         model.embedding_norm.numel() == config.hidden_size &&
         model.output_norm.numel() == config.hidden_size,
-#else
-        model.hidden_norm.numel() == config.hidden_size &&
-        model.embedding_norm.numel() == config.hidden_size &&
-        model.output_norm.numel() == config.hidden_size,
-#endif
         "Qwen MTP component dimensions disagree with the backbone");
     model.layers.reserve(config.mtp_num_hidden_layers);
     for (int index = 0; index < config.mtp_num_hidden_layers; ++index) {
@@ -377,11 +344,7 @@ std::optional<Predictor> load_predictor(TransformerWeightLoader& loader,
         layer.attention.kv_quantization = quantization;
         tyloi::models::load_attention_mixer(layer.attention, loader, config, index, prefix,
             config.legacy_tensor_layout.norm_weight_offset, config.attention_output_gate);
-#ifdef TYLOINFER_NATIVE_CUDA
         layer.ffn_norm = loader.weights.tensor(prefix + "mlp.norm.weight");
-#else
-        layer.ffn_norm = loader.dense(prefix + "mlp.norm.weight");
-#endif
         layer.ffn = tyloi::models::qwen35::load_ffn<Ffn>(loader, config, index, "predictor");
         model.layers.push_back(std::move(layer));
     }

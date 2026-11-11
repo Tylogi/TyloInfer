@@ -53,7 +53,7 @@ struct Moe {
 };
 
 struct Layer {
-    std::variant<Mamba, FullAttention, Moe> weights;
+    std::variant<Mamba, ::tyloi::models::FullAttention, Moe> weights;
     int device = 0;
 };
 

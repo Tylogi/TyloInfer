@@ -47,13 +47,8 @@ struct Model
 #else
     DenseTensor output_norm;
 #endif
-#ifdef TYLOINFER_NATIVE_CUDA
     tyloi::ops::RopeTable rope, cpu_rope;
     std::unordered_map<int, tyloi::ops::RopeTable> device_ropes;
-#else
-    RopeCache rope, cpu_rope;
-    std::unordered_map<int, RopeCache> device_ropes;
-#endif
     std::vector<Layer> layers;
 };
 } // namespace tyloi::cuda::minicpmo45::text

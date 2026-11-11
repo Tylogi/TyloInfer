@@ -2,9 +2,11 @@
 #include "engine/models/session/snapshot.h"
 
 #include "engine/models/qwen35/model.h"
+#include "engine/models/input.h"
 
 #include <algorithm>
 #include <cstddef>
+#include <limits>
 #include <stdexcept>
 #include <utility>
 
@@ -114,9 +116,9 @@ void initialize_layers(std::vector<LayerState>& layers,
 
 } // namespace
 
-State::State(const Model& model, const bool& transposed)
+State::State(const Model& model, bool transposed)
     : max_position_embeddings_(model.metadata.max_position_embeddings),
-      transposed_(&transposed) {
+      transposed_(transposed) {
     layout_.reserve(model.layers.size());
     for (const auto& layer : model.layers) {
         if (const auto* full = std::get_if<Full>(&layer.weights)) {
@@ -160,6 +162,94 @@ void State::preallocate() {
             ::tyloi::Device(::tyloi::kCUDA, layer.device), full->dtype,
             full->quantization);
     }
+}
+
+std::vector<std::pair<tyloi::Device, std::size_t>> State::preallocate_growth() const {
+    std::vector<std::pair<tyloi::Device, std::size_t>> result;
+    for (std::size_t i = 0; i < layout_.size(); ++i) {
+        const auto& layer = layout_[i];
+        const auto* full = std::get_if<FullLayout>(&layer.attention);
+        if (layer.cpu || !full || std::get<tyloi::state::KvView>(layers[i]).defined()) continue;
+        const tyloi::Device device(tyloi::kCUDA, layer.device);
+        const auto bytes = tyloi::state::kv_bytes(1, full->kv_heads, full->capacity,
+            full->head_dim, full->sliding, full->dtype, full->quantization);
+        auto it = std::find_if(result.begin(), result.end(), [device](const auto& v) { return v.first == device; });
+        if (it == result.end()) result.emplace_back(device, bytes);
+        else {
+            if (it->second > std::numeric_limits<std::size_t>::max() - bytes)
+                throw std::overflow_error("Qwen3.5 state growth overflow");
+            it->second += bytes;
+        }
+    }
+    return result;
+}
+
+std::vector<std::pair<tyloi::Device, std::size_t>> State::growth(
+        const tyloi::models::Input& input, const tyloi::models::ForwardOptions& options) const {
+    const auto [next_batch, tokens] = input.shape();
+    if (batch <= 0 || next_batch != batch || cache_pos < 0 ||
+        cache_pos > max_position_embeddings_ || tokens > max_position_embeddings_ - cache_pos ||
+        input.suffix || input.confirmed < 0 || speculative_start >= 0 || options.primary < 0 ||
+        (input.confirmed > 0 && (input.confirmed >= tokens || batch != 1 || cache_pos == 0 ||
+         input.positions || input.cache_positions)) || layers.size() != layout_.size())
+        throw std::invalid_argument("invalid Qwen3.5 state growth");
+    const auto multiply = [](std::size_t a, std::size_t b) {
+        if (b && a > std::numeric_limits<std::size_t>::max() / b)
+            throw std::overflow_error("Qwen3.5 state growth overflow");
+        return a * b;
+    };
+    const auto sum = [](std::size_t a, std::size_t b) {
+        if (a > std::numeric_limits<std::size_t>::max() - b)
+            throw std::overflow_error("Qwen3.5 state growth overflow");
+        return a + b;
+    };
+    std::vector<std::pair<tyloi::Device, std::size_t>> result;
+    const auto add = [&](tyloi::Device device, std::size_t bytes) {
+        auto it = std::find_if(result.begin(), result.end(), [device](const auto& v) { return v.first == device; });
+        if (it == result.end()) result.emplace_back(device, bytes);
+        else it->second = sum(it->second, bytes);
+    };
+    for (std::size_t i = 0; i < layers.size(); ++i) {
+        const auto& layout = layout_[i];
+        const tyloi::Device device(layout.cpu ? tyloi::kCPU : tyloi::kCUDA, layout.cpu ? -1 : layout.device);
+        if (const auto* full = std::get_if<FullLayout>(&layout.attention)) {
+            const auto& cache = std::get<tyloi::state::KvView>(layers[i]);
+            if (input.confirmed > 0 && full->sliding)
+                throw std::invalid_argument("Qwen3.5 speculation does not support sliding attention");
+            if (cache.defined() && !cache.paged() && !full->sliding &&
+                cache.physical_key.size(2) < cache_pos + tokens)
+                throw std::invalid_argument("Qwen3.5 KV cache capacity is insufficient");
+            if (!cache.defined()) {
+                const auto capacity = kv_capacity_for(full->sliding, full->capacity,
+                    cache_pos + tokens, options.kv_capacity);
+                add(device, tyloi::state::kv_bytes(batch, full->kv_heads, capacity,
+                    full->head_dim, full->sliding, full->dtype, full->quantization));
+            }
+        } else {
+            const auto& linear = std::get<LinearLayout>(layout.attention);
+            const auto& state = std::get<LinearState>(layers[i]);
+            if (state.mixer.pending() || projected(state.projected) ||
+                (input.confirmed > 0 && (layout.cpu || !state.mixer.defined())))
+                throw std::invalid_argument("invalid Qwen3.5 recurrent state");
+            if (linear.key_heads <= 0 || linear.key_dim <= 0 || linear.value_heads <= 0 ||
+                linear.value_dim <= 0 || linear.conv_kernel <= 0)
+                throw std::invalid_argument("invalid Qwen3.5 recurrent layout");
+            const auto key = multiply(linear.key_heads, linear.key_dim);
+            const auto value = multiply(linear.value_heads, linear.value_dim);
+            const auto width = sum(multiply(2, key), value);
+            const auto conv = multiply(multiply(batch, linear.conv_kernel - 1), width);
+            const auto recurrent = multiply(multiply(multiply(batch, linear.value_heads), linear.value_dim), linear.value_dim);
+            const auto state_bytes = multiply(sum(conv, recurrent), sizeof(float));
+            if (!state.mixer.defined()) add(device, state_bytes);
+            if (input.confirmed > 0) {
+                add(device, state_bytes);
+                const auto rows = multiply(batch, tokens);
+                const auto projection = sum(sum(width, value), multiply(4, linear.value_heads));
+                add(device, multiply(multiply(rows, projection), sizeof(float)));
+            }
+        }
+    }
+    return result;
 }
 
 void State::reset(std::int64_t new_batch) {
@@ -330,7 +420,7 @@ TextSessionState State::capture_text_session_state(
                           "Qwen recurrent session state has a pending speculative pass");
             const auto snapshot = linear.mixer.snapshot();
             validate_linear_snapshot(layout, std::get<LinearLayout>(layout.attention), snapshot,
-                                     !layout.cpu && *transposed_);
+                                     !layout.cpu && transposed_);
             saved.kind = HybridBlockSessionStateKind::Recurrent;
             saved.convolution = snapshot.convolution;
             saved.recurrent = snapshot.recurrent;
@@ -386,7 +476,7 @@ State::Restore State::prepare(const TextSessionState& state) const {
                     throw CudaSessionStateError("Qwen recurrent session topology changed");
                 validate_linear_snapshot(layout, std::get<LinearLayout>(layout.attention),
                                          Recurrent::State{*convolution, *recurrent, saved.transposed},
-                                         !layout.cpu && *transposed_);
+                                         !layout.cpu && transposed_);
             }
         }
     }

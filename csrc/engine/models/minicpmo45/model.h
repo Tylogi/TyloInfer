@@ -47,13 +47,8 @@ struct Model
     CudaModelPlan plan;
     tyloi::models::ModelConfig config;
     tyloi::models::CausalLmMetadata metadata;
-#ifdef TYLOINFER_NATIVE_CUDA
     tyloi::ops::RopeTable rope, cpu_rope;
     std::unordered_map<int, tyloi::ops::RopeTable> device_ropes;
-#else
-    RopeCache rope, cpu_rope;
-    std::unordered_map<int, RopeCache> device_ropes;
-#endif
     ::tyloi::Tensor embed, lm_head;
 #ifdef TYLOINFER_NATIVE_CUDA
     ::tyloi::Tensor output_norm;

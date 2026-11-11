@@ -23,5 +23,5 @@ DenseTensor logits(const Model&, Executor&, DenseTensor hidden, bool capped = tr
 DenseTensor forward(const Model&, State&, Executor&, Collectives&, const Executor::Mode&, tyloi::models::Input);
 #endif
 DenseTensor forward_layer(const Layer&, LayerState&, Executor&, DenseTensor input, DenseTensor token_ids,
-                     const AttentionStep&, const Executor::Mode&);
+                     const ::tyloi::models::AttentionStep&, const Executor::Mode&);
 } // namespace tyloi::cuda::deepseek_v4

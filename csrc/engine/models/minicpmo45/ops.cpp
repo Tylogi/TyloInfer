@@ -78,11 +78,7 @@ Layer load_layer(const tyloi::weights::Loader& weights, const Config& config, in
     loader.preserve_projection_boundaries = true;
     const auto prefix = "model.block." + std::to_string(index) + ".";
     tyloi::models::load_attention_mixer(layer.attention, loader, config, index, prefix, 0.0);
-#ifdef TYLOINFER_NATIVE_CUDA
     layer.ffn_norm = weights.tensor(prefix + "mlp.norm.weight");
-#else
-    layer.ffn_norm = loader.dense(prefix + "mlp.norm.weight");
-#endif
     layer.ffn = tyloi::models::load_dense_ffn<tyloi::models::Mlp>(loader, config, prefix + "mlp.");
     return layer;
 }
@@ -105,11 +101,7 @@ void load(Model& model, const tyloi::weights::Loader& weights, LayerPlacementCon
         RopeCache rope(config.max_position_embeddings, config.rotary_dim, config.rope_base,
                          0, -1, device, true, yarn);
 
-#ifdef TYLOINFER_NATIVE_CUDA
         return rope.view();
-#else
-        return rope;
-#endif
     };
     model.rope = make_rope(::tyloi::Device(::tyloi::kCUDA, placement.primary_device()));
     if (cpu_layers > 0) model.cpu_rope = make_rope(::tyloi::Device(::tyloi::kCPU));
@@ -280,7 +272,6 @@ void State::restore_text_session_state(const TextSessionState& state) {
     batch = 1;
 }
 
-#ifdef TYLOINFER_NATIVE_CUDA
 namespace {
 Tensor token_ids(int primary, const Tensor& ids) {
     tyloi::models::require_model(ids.defined() && (ids.dim() == 1 || ids.dim() == 2),
@@ -354,7 +345,7 @@ Tensor Model::forward(tyloi::models::Input input, tyloi::models::State& state_va
             return tyloi::ops::contiguous(tyloi::ops::copy(value, device));
         };
         hidden = local(hidden);
-        AttentionStep step{local(positions), {}, local(physical), state.cache_pos,
+        ::tyloi::models::AttentionStep step{local(positions), {}, local(physical), state.cache_pos,
                            input.kv_length, input.attention_parts};
         if (input.lengths) step.sequence_lengths = local(input.lengths);
         auto& cache = state.layers[i];
@@ -380,113 +371,5 @@ Tensor Model::forward(tyloi::models::Input input, tyloi::models::State& state_va
     if (input.raw_hidden) *input.raw_hidden = std::move(hidden);
     return finalized;
 }
-#else
-namespace {
-DenseTensor token_ids(Collectives& copies, int primary, DenseTensor ids) {
-    tyloi::models::require_model(ids.dim() == 1 || ids.dim() == 2,
-        "token IDs must have shape [tokens] or [batch,tokens]");
-    if (ids.dim() == 1) ids = ids.unsqueeze(0);
-    tyloi::models::require_model(ids.size(0) > 0 && ids.size(1) > 0, "token IDs must not be empty");
-    return copies.copy(ids.to(::tyloi::kInt64), primary).contiguous();
-}
-}
-
-DenseTensor embed(const Model& model, Executor& executor, Collectives& copies, int primary,
-             DenseTensor ids, const Executor::Mode& mode) {
-    auto normalized = token_ids(copies, primary, std::move(ids));
-    return executor.profiler().measure("model.embed", [&] {
-        return ::tyloi::cuda::quant_embedding_lookup(model.embed, std::move(normalized));
-    }).to(::tyloi::kBFloat16).contiguous();
-}
-DenseTensor normalize(const Model& model, Executor& executor, DenseTensor hidden, int64_t batch, int64_t tokens) {
-    return executor.profiler().measure("model.output_norm", [&] {
-        return qwen_rms_norm_bf16(executor.attention_options().fused_norm,
-            hidden.reshape({batch * tokens, model.metadata.hidden_size}),
-            model.output_norm, model.metadata.rms_norm_eps, model.metadata.norm_weight_offset)
-            .reshape({batch, tokens, model.metadata.hidden_size});
-    });
-}
-DenseTensor logits(const Model& model, Executor& executor, DenseTensor hidden, bool,
-              const Executor::Mode& mode) {
-    return ::tyloi::cuda::logits(model.lm_head, std::move(hidden),
-        executor.projector(mode.ffn), executor.profiler(), 0.0)
-        .to(::tyloi::kBFloat16).contiguous();
-}
-DenseTensor forward(const Model& model, State& state, Executor& executor, Collectives& copies,
-               const Executor::Mode& run_mode, tyloi::models::Input input) {
-    auto mode = run_mode;
-    mode.ffn.independent = true;
-    MfqCudaGuard guard(mode.primary);
-    auto ids = token_ids(copies, mode.primary, std::move(input.ids).dense());
-    auto hidden = input.embeddings ? *input.embeddings
-        : embed(model, executor, copies, mode.primary, ids, mode);
-    const auto B = ids.size(0), T = ids.size(1);
-    tyloi::models::require_model(hidden.dim() == 3 && hidden.size(0) == B && hidden.size(1) == T &&
-        hidden.size(2) == model.metadata.hidden_size,
-        "inputs_embeds shape must match [batch,tokens,hidden_size]");
-    tyloi::models::require_model(input.confirmed == 0, "unsupported speculative backbone geometry");
-    if (state.cache_pos == 0) state.reset(B);
-    const auto options = ::tyloi::TensorOptions().dtype(::tyloi::kInt64).device(::tyloi::Device(::tyloi::kCUDA, mode.primary));
-    auto physical = input.cache_positions
-        ? copies.copy(
-            input.cache_positions->to(::tyloi::kInt64),
-            mode.primary).contiguous()
-        : ::tyloi::cuda::arange(state.cache_pos, state.cache_pos + T, options);
-    auto positions = input.positions
-        ? copies.copy(
-            input.positions->to(::tyloi::kInt64),
-            mode.primary).contiguous()
-        : (state.decode_position_delta ? physical + state.decode_position_delta : physical);
-    tyloi::models::require_model((physical.dim() == 1 && physical.numel() == T) ||
-        (physical.dim() == 2 && physical.size(0) == B && physical.size(1) == T),
-        "cache_positions must have shape [tokens] or [batch,tokens]");
-    tyloi::models::require_model((positions.dim() == 1 && positions.size(0) == T) ||
-        (positions.dim() == 2 && positions.size(0) == B && positions.size(1) == T),
-        "position_ids must have shape [tokens] or [batch,tokens]");
-    hidden = copies.copy(std::move(hidden), mode.primary).to(::tyloi::kBFloat16).contiguous();
-    const auto trace = [&] {
-        if (input.trace) input.trace->push_back(copies.copy(hidden, mode.primary).to(::tyloi::kFloat32).clone());
-    };
-    trace();
-    for (size_t i = 0; i < model.layers.size(); ++i) {
-        const auto& layer = model.layers[i];
-        const auto& attention = layer.attention;
-        MfqCudaGuard layer_guard(layer.device);
-        const auto local = [&](DenseTensor value) {
-            return layer.cpu ? value.to(::tyloi::kCPU).contiguous() : copies.copy(value, layer.device).contiguous();
-        };
-        hidden = local(std::move(hidden));
-        AttentionStep step{local(positions), {}, local(physical), state.cache_pos,
-                           input.kv_length, input.attention_parts};
-        if (input.lengths) step.sequence_lengths = local(*input.lengths);
-        auto& cache = state.layers[i];
-        const auto capacity = attention.sliding ? attention.attention_window :
-            (mode.kv_capacity > 0 ? std::max(state.cache_pos + T, mode.kv_capacity)
-                                  : attention.max_position_embeddings);
-        if (!cache.defined())
-            cache = tyloi::state::allocate_kv(
-                B, attention.kv_heads, capacity, attention.attention_head_dim,
-                attention.sliding, hidden.device(), ::tyloi::kBFloat16,
-                attention.kv_quantization);
-        cache.quantization = attention.kv_quantization;
-        const auto* rope = layer.cpu ? &model.cpu_rope : &model.rope;
-        if (!layer.cpu && !model.device_ropes.empty()) rope = &model.device_ropes.at(layer.device);
-        auto* layer_trace = mode.trace_layer == attention.layer ? mode.trace : nullptr;
-        auto output = attention.forward(executor.projector(mode.ffn), executor.profiler(),
-            executor.attention_options(), std::move(hidden), step, cache,
-            executor.attention_scratch(2 * i), *rope, layer_trace);
-        hidden = ::tyloi::models::full_ffn(
-            layer.ffn, layer.ffn_norm, std::move(output[0]), std::move(output[1]),
-            attention.rms_norm_eps, attention.norm_weight_offset,
-            attention.official_bf16, attention.attention_output_gate, layer_trace).dense();
-        trace();
-    }
-    if (!input.positions || input.advance) state.cache_pos += T;
-    hidden = copies.copy(std::move(hidden), mode.primary);
-    auto finalized = normalize(model, executor, hidden, B, T);
-    if (input.raw_hidden) *input.raw_hidden = std::move(hidden);
-    return finalized;
-}
-#endif
 
 } // namespace tyloi::cuda::minicpmo45::text

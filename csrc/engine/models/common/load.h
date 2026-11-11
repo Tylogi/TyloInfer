@@ -161,7 +161,8 @@ struct ParallelConfig;
 struct LayerPlacementConfig;
 namespace tyloi { class ModelSource; }
 namespace tyloi::weights { struct Loader; }
-namespace tyloi::cuda { struct FullAttention; class Ffn; }
+namespace tyloi::models { struct FullAttention; }
+namespace tyloi::cuda { class Ffn; }
 
 struct TransformerWeightLoader {
     const tyloi::weights::Loader& weights;
@@ -176,8 +177,8 @@ struct TransformerWeightLoader {
     ::tyloi::Tensor linear(const std::string& name) const;
     std::vector<::tyloi::Tensor> projections(const std::vector<std::string>& names) const;
     std::vector<::tyloi::Tensor> gate_up(const std::vector<std::string>& names, const ::tyloi::Tensor& down) const;
-    void qkv(tyloi::cuda::FullAttention& attention, const std::vector<std::string>& names) const;
-    void output(tyloi::cuda::FullAttention& attention, const std::string& name) const;
+    void qkv(tyloi::models::FullAttention& attention, const std::vector<std::string>& names) const;
+    void output(tyloi::models::FullAttention& attention, const std::string& name) const;
     void important_neurons(int64_t hidden, int64_t intermediate, tyloi::cuda::Ffn& ffn,
         const std::string& down, const std::string& gate, const std::string& up) const;
     void important_neurons(int64_t hidden, int64_t intermediate, tyloi::models::Mlp& ffn,

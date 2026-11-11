@@ -346,7 +346,7 @@ Tensor normalize_ids(int primary, const Tensor& ids) {
                                                   tyloi::Device(tyloi::kCUDA, primary)));
 }
 }
-static DenseTensor forward_layer(const Layer&, LayerState&, Selection&, DenseTensor, const AttentionStep&,
+static DenseTensor forward_layer(const Layer&, LayerState&, Selection&, DenseTensor, const ::tyloi::models::AttentionStep&,
                                  const tyloi::ops::RopeTable&, const tyloi::models::ForwardOptions&);
 Tensor Model::embedding(const Tensor& ids, int primary) const {
     auto normalized = normalize_ids(primary, ids);
@@ -401,7 +401,7 @@ Tensor Model::forward(tyloi::models::Input input, tyloi::models::State& state_va
         "position_ids must have shape [tokens] or [batch,tokens]");
     if (!input.lengths.defined() && state.cache_pos > 0 && T == 1)
         input.lengths = tyloi::ops::full(std::array<int64_t, 1>{B}, state.cache_pos + 1, primary);
-    AttentionStep step{semantic, input.lengths, input.cache_positions.defined() ? physical : Tensor{},
+    ::tyloi::models::AttentionStep step{semantic, input.lengths, input.cache_positions.defined() ? physical : Tensor{},
                        state.cache_pos, input.kv_length, input.attention_parts};
     auto hidden = tyloi::ops::contiguous(tyloi::ops::copy(embeddings, primary));
     const auto trace = [&](const Tensor& value) {
@@ -495,8 +495,8 @@ DenseTensor forward(const Model& model, State& state, Executor& executor, Collec
                                "position_ids must have shape [tokens] or [batch,tokens]");
     if (!input.lengths.has_value() && state.cache_pos > 0 && T == 1)
         input.lengths = ::tyloi::cuda::full({B}, state.cache_pos + 1, options);
-    AttentionStep step{semantic, input.lengths ? MfqOptional<DenseTensor>(DenseTensor(*input.lengths)) : mfq_nullopt,
-                       input.cache_positions.has_value() ? MfqOptional<DenseTensor>(physical) : mfq_nullopt,
+    ::tyloi::models::AttentionStep step{semantic, input.lengths ? ::tyloi::Tensor(DenseTensor(*input.lengths)) : ::tyloi::Tensor{},
+                       input.cache_positions.has_value() ? ::tyloi::Tensor(physical) : ::tyloi::Tensor{},
                        state.cache_pos, input.kv_length, input.attention_parts};
     auto hidden = collectives.copy(std::move(embeddings), mode.primary).contiguous();
     const auto trace = [&](const DenseTensor& value) {
@@ -509,11 +509,11 @@ DenseTensor forward(const Model& model, State& state, Executor& executor, Collec
         {
             MfqCudaGuard layer_guard(layer.device);
             auto local = step;
-            local.positions = collectives.copy(step.positions, layer.device);
-            if (step.sequence_lengths.has_value())
-                local.sequence_lengths = collectives.copy(DenseTensor(*step.sequence_lengths), layer.device);
-            if (step.cache_positions.has_value())
-                local.cache_positions = collectives.copy(DenseTensor(*step.cache_positions), layer.device);
+            local.positions = collectives.copy(step.positions.dense(), layer.device);
+            if (step.sequence_lengths.defined())
+                local.sequence_lengths = collectives.copy(step.sequence_lengths.dense(), layer.device);
+            if (step.cache_positions.defined())
+                local.cache_positions = collectives.copy(step.cache_positions.dense(), layer.device);
             const auto& rope = model.device_ropes.empty() ? model.rope : model.device_ropes.at(layer.device);
             hidden = forward_layer(layer, state.layers[index], state.selections.at(layer.device), executor,
                                    collectives.copy(std::move(hidden), layer.device), local, rope, mode);
@@ -643,14 +643,14 @@ void update_indexer(const Config& c, Selection& selection, const DenseTensor& in
 
 #ifdef TYLOINFER_NATIVE_CUDA
 static DenseTensor forward_layer(const Layer& layer, LayerState& state, Selection& selection,
-                     DenseTensor x, const AttentionStep& step, const tyloi::ops::RopeTable& rope,
+                     DenseTensor x, const ::tyloi::models::AttentionStep& step, const tyloi::ops::RopeTable& rope,
                      const tyloi::models::ForwardOptions&) {
     const auto measure = [&](const char* name, auto&& fn) {
         return tyloi::ops::measure(name, tyloi::Device(tyloi::kCUDA, layer.device), std::forward<decltype(fn)>(fn));
     };
 #else
 DenseTensor forward_layer(const Layer& layer, LayerState& state, Selection& selection,
-                     Executor& executor, DenseTensor x, const AttentionStep& step,
+                     Executor& executor, DenseTensor x, const ::tyloi::models::AttentionStep& step,
                      const RopeCache& rope, const Executor::Mode& mode) {
     auto& profiler = executor.profiler();
     const auto measure = [&](const char* name, auto&& fn) {
@@ -681,14 +681,10 @@ DenseTensor forward_layer(const Layer& layer, LayerState& state, Selection& sele
     const bool full_indexer = layer.full_indexer;
     auto& kv_cache = state.kv_cache;
     auto& index_cache = state.index_cache;
-#ifdef TYLOINFER_NATIVE_CUDA
     const auto& pos = step.positions.dense();
     const MfqOptional<DenseTensor> seq_len = step.sequence_lengths
         ? MfqOptional<DenseTensor>(step.sequence_lengths.dense()) : mfq_nullopt;
-#else
-    const auto& pos = step.positions;
-    const auto& seq_len = step.sequence_lengths;
-#endif
+
     const auto cache_pos = step.cache_position;
     const auto planned_kv_length = step.planned_kv_length;
     const int64_t B = x.size(0);

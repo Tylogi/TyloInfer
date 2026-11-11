@@ -104,7 +104,7 @@ std::vector<::tyloi::Tensor> TransformerWeightLoader::gate_up(const std::vector<
     return weights.gate_up(names, down, shared_gate_up_compatible_prefix,
                               preserve_projection_boundaries);
 }
-void TransformerWeightLoader::qkv(tyloi::cuda::FullAttention& block, const std::vector<std::string>& names) const {
+void TransformerWeightLoader::qkv(tyloi::models::FullAttention& block, const std::vector<std::string>& names) const {
     const bool mirror_kv = block.attention_output_gate &&
         tyloi::cuda::env_flag("TYLOINFER_TP_MIRROR_QWEN35_ATTENTION_KV", true) &&
         is_quant_dtype(tyloi::require_tensor(weights.source, names[1]).dtype) &&
@@ -118,7 +118,7 @@ void TransformerWeightLoader::qkv(tyloi::cuda::FullAttention& block, const std::
         block.qkv = weights.group(names, 2, nullptr, preserve_projection_boundaries);
     }
 }
-void TransformerWeightLoader::output(tyloi::cuda::FullAttention& block, const std::string& name) const {
+void TransformerWeightLoader::output(tyloi::models::FullAttention& block, const std::string& name) const {
     block.o = weights.weight(name);
 }
 void TransformerWeightLoader::important_neurons(int64_t hidden, int64_t intermediate, tyloi::cuda::Ffn& ffn,

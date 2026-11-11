@@ -17,10 +17,10 @@ struct LayerLoader {
     auto dense(const std::string& name) const {
         return weights.tensor(name);
     }
-    void qkv(FullAttention& attention, const std::vector<std::string>& names) const {
+    void qkv(::tyloi::models::FullAttention& attention, const std::vector<std::string>& names) const {
         attention.qkv = weights.group(names, 2);
     }
-    void output(FullAttention& attention, const std::string& name) const {
+    void output(::tyloi::models::FullAttention& attention, const std::string& name) const {
         attention.o = weights.weight(name);
     }
     static auto shape(const ::tyloi::Tensor& value) {

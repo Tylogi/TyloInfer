@@ -19,7 +19,7 @@ using Config = tyloi::models::gemma4::Config;
 class State;
 
 struct Layer {
-    FullAttention attention;
+    ::tyloi::models::FullAttention attention;
     ::tyloi::Tensor ffn_norm;
     tyloi::models::Mlp ffn;
     ::tyloi::Tensor attn_post_norm, ffn_post_norm, ffn_post_norm_1, ffn_pre_norm_2, ffn_post_norm_2;

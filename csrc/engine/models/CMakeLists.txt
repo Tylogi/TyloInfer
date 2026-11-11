@@ -10,7 +10,6 @@ set(TYLOINFER_CUDA_MODEL_SOURCES
     ${PROJECT_SOURCE_DIR}/engine/models/deepseek_v41/prefill.cpp
     ${PROJECT_SOURCE_DIR}/engine/models/deepseek_v41/dspark.cpp
     ${PROJECT_SOURCE_DIR}/engine/models/deepseek_v41/vision.cpp
-    ${PROJECT_SOURCE_DIR}/engine/models/common/attention.cpp
     ${PROJECT_SOURCE_DIR}/engine/models/qwen4_exp/ops.cpp
     ${PROJECT_SOURCE_DIR}/engine/models/qwen4_exp/layer.cpp
     ${PROJECT_SOURCE_DIR}/engine/models/qwen4_exp/state.cpp

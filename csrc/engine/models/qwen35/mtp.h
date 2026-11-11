@@ -20,13 +20,9 @@ void restore_session(State&, Mtp*, const TextSessionState&, const std::function<
 class Mtp final : public tyloi::models::Mtp {
 public:
     Mtp(Predictor model, ::tyloi::Tensor embedding,
-#ifdef TYLOINFER_NATIVE_CUDA
         tyloi::ops::RopeTable rope,
-#else
-        RopeCache rope,
-#endif
         std::unique_ptr<Executor> executor, Collectives& copies,
-        int device, const int64_t& kv_capacity, Trace* const& trace, const int& trace_scope,
+        int device, const int64_t& kv_capacity, tyloi::ops::Trace* const& trace, const int& trace_scope,
         bool preallocate);
 
     std::unique_ptr<tyloi::models::MtpState> make_state() const override;
@@ -54,16 +50,12 @@ private:
 
     Predictor model_;
     ::tyloi::Tensor embedding_;
-#ifdef TYLOINFER_NATIVE_CUDA
     tyloi::ops::RopeTable rope_;
-#else
-    RopeCache rope_;
-#endif
     std::unique_ptr<Executor> executor_;
     Collectives& copies_;
     int device_;
     const int64_t& kv_capacity_;
-    Trace* const& trace_;
+    tyloi::ops::Trace* const& trace_;
     const int& trace_scope_;
     bool preallocate_;
 };

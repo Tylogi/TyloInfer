@@ -196,7 +196,7 @@ namespace {
 }
 
 ::tyloi::Tensor forward_layer(const Layer& layer, tyloi::state::KvView& cache,
-                              const tyloi::Tensor& input, const AttentionStep& step,
+                              const tyloi::Tensor& input, const ::tyloi::models::AttentionStep& step,
                               const Model::Options& mode) {
     const auto B = input.size(0), T = input.size(1), H = input.size(2);
     const auto& attention = layer.attention;
@@ -265,7 +265,7 @@ tyloi::StepSequence<tyloi::models::Prepared> Model::prepare(
         const std::array<std::int64_t, 1> shape{B};
         input.lengths = tyloi::ops::full(shape, state.cache_pos + 1, primary);
     }
-    AttentionStep step{semantic, input.lengths, input.cache_positions ? physical : ::tyloi::Tensor{},
+    ::tyloi::models::AttentionStep step{semantic, input.lengths, input.cache_positions ? physical : ::tyloi::Tensor{},
                        state.cache_pos, input.kv_length, input.attention_parts};
     auto copied = tyloi::ops::copy(embeddings, primary);
     auto hidden = tyloi::ops::contiguous(copied);
