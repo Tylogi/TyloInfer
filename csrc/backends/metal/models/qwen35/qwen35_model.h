@@ -119,62 +119,10 @@ void validate_qwen35_model_bindings(
     const Config& config,
     const Qwen35TensorNames& names);
 
-using Qwen35RmsNorm = MlxRmsNorm;
-
 MlxRmsNorm load_qwen35_rms_norm(
     const MfqContainer& model,
     const std::string& name,
     double eps,
     double weight_offset = 1.0);
-
-class Qwen35Linear {
-public:
-    static Qwen35Linear load(
-        const MfqContainer& model,
-        const std::string& name);
-
-    explicit Qwen35Linear(MlxLinear linear);
-
-    mlx::core::array operator()(const mlx::core::array& input) const;
-
-    int input_size() const noexcept {
-        return linear_.input_size();
-    }
-    int output_size() const noexcept {
-        return linear_.output_size();
-    }
-    bool packed() const noexcept {
-        return linear_.packed();
-    }
-
-private:
-    MlxLinear linear_;
-};
-
-class Qwen35Embedding {
-public:
-    static Qwen35Embedding load(
-        const MfqContainer& model,
-        const std::string& name);
-
-    explicit Qwen35Embedding(MlxEmbedding embedding);
-
-    mlx::core::array operator()(
-        const mlx::core::array& token_ids,
-        mlx::core::Dtype dtype = mlx::core::float16) const;
-
-    mlx::core::array project(
-        const mlx::core::array& input) const;
-
-    int vocabulary_size() const noexcept {
-        return embedding_.vocabulary_size();
-    }
-    int hidden_size() const noexcept {
-        return embedding_.hidden_size();
-    }
-
-private:
-    MlxEmbedding embedding_;
-};
 
 } // namespace mfq::metal

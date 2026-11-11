@@ -52,20 +52,20 @@ public:
         Config config,
         MlxRmsNorm hidden_norm,
         MlxRmsNorm embedding_norm,
-        Qwen35Linear fusion,
+        MlxLinear fusion,
         std::vector<MlxQwen35FullAttentionBlock> layers,
         MlxRmsNorm output_norm);
 
     mlx::core::array forward(
         const mlx::core::array& hidden_states,
         const mlx::core::array& next_token_ids,
-        const Qwen35Embedding& embedding,
+        const MlxEmbedding& embedding,
         bool use_cache = true);
     mlx::core::array forward(
         const mlx::core::array& hidden_states,
         const mlx::core::array& next_token_ids,
         const mlx::core::array& positions,
-        const Qwen35Embedding& embedding,
+        const MlxEmbedding& embedding,
         bool use_cache = true);
     void reset_cache(int batch = 1, int initial_capacity = 16);
     void materialize_cache();
@@ -88,13 +88,13 @@ private:
         const mlx::core::array& hidden_states,
         const mlx::core::array& next_token_ids,
         const mlx::core::array* positions,
-        const Qwen35Embedding& embedding,
+        const MlxEmbedding& embedding,
         bool use_cache);
 
     Config config_;
     MlxRmsNorm hidden_norm_;
     MlxRmsNorm embedding_norm_;
-    Qwen35Linear fusion_;
+    MlxLinear fusion_;
     std::vector<MlxQwen35FullAttentionBlock> layers_;
     MlxRmsNorm output_norm_;
 };
@@ -110,10 +110,10 @@ public:
 
     MlxQwen35CausalLm(
         Config config,
-        Qwen35Embedding embedding,
+        MlxEmbedding embedding,
         std::vector<MlxQwen35Layer> layers,
         MlxRmsNorm output_norm,
-        std::optional<Qwen35Linear> output,
+        std::optional<MlxLinear> output,
         mlx::core::Dtype activation_dtype = mlx::core::float16,
         std::optional<MlxQwen35MtpModule> mtp = std::nullopt,
         std::optional<MlxGridVisionPromptComponent> vision = std::nullopt);
@@ -294,10 +294,10 @@ private:
         const mlx::core::array& hidden) const;
 
     Config config_;
-    Qwen35Embedding embedding_;
+    MlxEmbedding embedding_;
     std::vector<MlxQwen35Layer> layers_;
     MlxRmsNorm output_norm_;
-    std::optional<Qwen35Linear> output_;
+    std::optional<MlxLinear> output_;
     mlx::core::Dtype activation_dtype_;
     std::optional<MlxQwen35MtpModule> mtp_;
     std::optional<MlxGridVisionPromptComponent> vision_;

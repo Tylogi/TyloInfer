@@ -168,7 +168,7 @@ MlxQwen35MtpModule::load_if_present(
             "predictor.embedding_norm.weight",
             config.rms_norm_eps,
             config.legacy_tensor_layout.norm_weight_offset),
-        Qwen35Linear::load(
+        MlxLinear::load(
             model,
             "predictor.fusion.weight"),
         std::move(layers),
@@ -183,7 +183,7 @@ MlxQwen35MtpModule::MlxQwen35MtpModule(
     Config config,
     MlxRmsNorm hidden_norm,
     MlxRmsNorm embedding_norm,
-    Qwen35Linear fusion,
+    MlxLinear fusion,
     std::vector<MlxQwen35FullAttentionBlock> layers,
     MlxRmsNorm output_norm)
     : config_(std::move(config)),
@@ -212,7 +212,7 @@ void MlxQwen35MtpModule::validate_components() const {
 array MlxQwen35MtpModule::forward(
     const array& hidden_states,
     const array& next_token_ids,
-    const Qwen35Embedding& embedding,
+    const MlxEmbedding& embedding,
     bool use_cache) {
     return forward_impl(
         hidden_states,
@@ -226,7 +226,7 @@ array MlxQwen35MtpModule::forward(
     const array& hidden_states,
     const array& next_token_ids,
     const array& positions,
-    const Qwen35Embedding& embedding,
+    const MlxEmbedding& embedding,
     bool use_cache) {
     return forward_impl(
         hidden_states,
@@ -240,7 +240,7 @@ array MlxQwen35MtpModule::forward_impl(
     const array& hidden_states,
     const array& next_token_ids,
     const array* positions,
-    const Qwen35Embedding& embedding,
+    const MlxEmbedding& embedding,
     bool use_cache) {
     if (hidden_states.ndim() != 3 || next_token_ids.ndim() != 2 ||
         hidden_states.shape(0) != next_token_ids.shape(0) ||
@@ -407,11 +407,11 @@ MlxQwen35CausalLm MlxQwen35CausalLm::load(
     }
 
     auto embedding =
-        Qwen35Embedding::load(model, names.token_embedding);
-    std::optional<Qwen35Linear> output;
+        MlxEmbedding::load(model, names.token_embedding);
+    std::optional<MlxLinear> output;
     if (!runtime_config.tie_word_embeddings) {
         output.emplace(
-            Qwen35Linear::load(model, names.output));
+            MlxLinear::load(model, names.output));
     }
     auto mtp = MlxQwen35MtpModule::load_if_present(
         model,
@@ -434,10 +434,10 @@ MlxQwen35CausalLm MlxQwen35CausalLm::load(
 
 MlxQwen35CausalLm::MlxQwen35CausalLm(
     Config config,
-    Qwen35Embedding embedding,
+    MlxEmbedding embedding,
     std::vector<MlxQwen35Layer> layers,
     MlxRmsNorm output_norm,
-    std::optional<Qwen35Linear> output,
+    std::optional<MlxLinear> output,
     mlx::core::Dtype activation_dtype,
     std::optional<MlxQwen35MtpModule> mtp,
     std::optional<MlxGridVisionPromptComponent> vision)

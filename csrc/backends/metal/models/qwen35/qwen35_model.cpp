@@ -640,36 +640,4 @@ MlxRmsNorm load_qwen35_rms_norm(
         static_cast<float>(weight_offset));
 }
 
-Qwen35Linear Qwen35Linear::load(
-    const MfqContainer& model,
-    const std::string& name) {
-    return Qwen35Linear(MlxLinear::load(model, name));
-}
-
-Qwen35Linear::Qwen35Linear(MlxLinear linear)
-    : linear_(std::move(linear)) {}
-
-array Qwen35Linear::operator()(const array& input) const {
-    return linear_(input);
-}
-
-Qwen35Embedding Qwen35Embedding::load(
-    const MfqContainer& model,
-    const std::string& name) {
-    return Qwen35Embedding(MlxEmbedding::load(model, name));
-}
-
-Qwen35Embedding::Qwen35Embedding(MlxEmbedding embedding)
-    : embedding_(std::move(embedding)) {}
-
-array Qwen35Embedding::operator()(
-    const array& token_ids,
-    mlx::core::Dtype dtype) const {
-    return embedding_(token_ids, dtype);
-}
-
-array Qwen35Embedding::project(const array& input) const {
-    return embedding_.project(input);
-}
-
 } // namespace mfq::metal
