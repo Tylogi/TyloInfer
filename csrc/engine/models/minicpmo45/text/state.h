@@ -30,7 +30,7 @@ public:
     void set_position_delta(int64_t delta) noexcept { decode_position_delta = delta; }
 #ifdef TYLOINFER_NATIVE_CUDA
     std::vector<std::pair<tyloi::Device, std::size_t>> growth(
-        std::int64_t tokens, const tyloi::models::ForwardOptions& options) const override;
+        const tyloi::models::Input& input, const tyloi::models::ForwardOptions& options) const override;
 #endif
     std::vector<::tyloi::Tensor> storage() const;
     std::vector<::tyloi::Tensor*> graph_state() { return {}; }

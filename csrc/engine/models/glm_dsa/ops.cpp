@@ -71,8 +71,9 @@ void State::reset(int64_t next_batch) {
 
 #ifdef TYLOINFER_NATIVE_CUDA
 std::vector<std::pair<tyloi::Device, std::size_t>> State::growth(
-        std::int64_t tokens, const tyloi::models::ForwardOptions&) const {
-    if (batch <= 0 || tokens <= 0 || cache_pos < 0)
+        const tyloi::models::Input& input, const tyloi::models::ForwardOptions&) const {
+    const auto [next_batch, tokens] = input.shape();
+    if (batch <= 0 || next_batch != batch || cache_pos < 0 || input.confirmed != 0 || input.suffix)
         throw std::invalid_argument("GLM DSA allocation planning requires positive batch and tokens and a nonnegative position");
     if (cache_pos > std::numeric_limits<int64_t>::max() - tokens)
         throw std::overflow_error("GLM DSA allocation planning position overflow");

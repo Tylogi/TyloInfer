@@ -12,6 +12,7 @@
 namespace tyloi::models {
 
 struct ForwardOptions;
+struct Input;
 struct Mtp;
 
 class MtpState {
@@ -40,10 +41,10 @@ public:
     virtual std::int64_t position() const noexcept = 0;
     virtual void advance(std::int64_t tokens) noexcept = 0;
     virtual void set_position_delta(std::int64_t delta) noexcept = 0;
-    // Additional backing needed by ordinary forwarding after reset(batch), including replacement peaks.
-    // Speculative transactions, Graph preparation and session copies plan at their own allocation boundaries.
+    // Additional backing for this input after reset(batch), including replacements and verification checkpoints.
+    // Suffix setup, Graph preparation and session copies plan at their own allocation boundaries.
     virtual std::vector<std::pair<tyloi::Device, std::size_t>> growth(
-        std::int64_t, const ForwardOptions&) const {
+        const Input&, const ForwardOptions&) const {
         throw std::logic_error("state allocation planning is not implemented");
     }
     virtual void begin_speculative_suffix(std::int64_t) {

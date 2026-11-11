@@ -45,7 +45,6 @@ std::tuple<::tyloi::DenseTensor, bool, bool> generation_prefill(
             if(output && output->stopped())break;
             const auto rows=state.cache_pos==0?int64_t(1):std::min<int64_t>(4,chunk.count-offset);
 #ifdef TYLOINFER_NATIVE_CUDA
-            if (rows == 1) ops.reserve(rows);
             auto part=tyloi::ops::slice(ids,1,offset,offset+rows);
 #else
             auto part=ids.narrow(1,offset,rows);
@@ -55,17 +54,19 @@ std::tuple<::tyloi::DenseTensor, bool, bool> generation_prefill(
                     nullptr,{},&window_logits))
 #ifdef TYLOINFER_NATIVE_CUDA
                 hidden=std::move(*result);
-            else
-                hidden = model.forward(tyloi::models::Input{part, {}, {}, {}, {}, nullptr, nullptr,
-                                                            false, rows>1?1:0, 0, 0},
-                                       ops.state);
 #else
                 hidden=result->dense();
-            else
-                hidden = model.forward(tyloi::models::Input{part, {}, {}, {}, {}, nullptr, nullptr,
-                                                            false, rows>1?1:0, 0, 0},
-                                       ops.state).dense();
 #endif
+            else {
+                tyloi::models::Input input{part, {}, {}, {}, {}, nullptr, nullptr,
+                                          false, rows>1?1:0, 0, 0};
+#ifdef TYLOINFER_NATIVE_CUDA
+                ops.reserve(input);
+                hidden = model.forward(std::move(input), ops.state);
+#else
+                hidden = model.forward(std::move(input), ops.state).dense();
+#endif
+            }
             if(rows>1)state.commit_speculative();
             offset+=rows;
         }

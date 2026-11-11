@@ -125,8 +125,12 @@ tyloi::models::SnapshotSize snapshot_size(const State& state,const tyloi::models
 }
 
 std::vector<std::pair<tyloi::Device, std::size_t>> State::growth(
-        std::int64_t tokens, const tyloi::models::ForwardOptions& options) const {
-    if (batch <= 0 || tokens <= 0 || cache_pos < 0 || cache_pos > model_.max_position_embeddings() ||
+        const tyloi::models::Input& input, const tyloi::models::ForwardOptions& options) const {
+    const auto [input_batch, tokens] = input.shape();
+    if (batch <= 0 || input_batch != batch || input.suffix || input.cache_positions ||
+        input.confirmed < 0 || (input.confirmed > 0 &&
+            (input.confirmed >= tokens || batch != 1 || cache_pos <= 0 || !model_.supports_speculation())) ||
+        tokens <= 0 || cache_pos < 0 || cache_pos > model_.max_position_embeddings() ||
         tokens > model_.max_position_embeddings() - cache_pos || speculative_start >= 0 ||
         speculative_suffix_forward || options.primary < 0 || layers.size() != model_.layers.size())
         throw std::invalid_argument("invalid Qwen4 ordinary state growth");
@@ -152,9 +156,22 @@ std::vector<std::pair<tyloi::Device, std::size_t>> State::growth(
             throw std::invalid_argument("invalid Qwen4 position history");
         shape = dense.sizes().vec();
         shape.back() = cache_pos + tokens;
+    } else if (input.positions) {
+        shape = input.positions.dense().sizes().vec();
+        if (shape.empty() || shape.size() > 3 || shape.back() != tokens ||
+            (shape.size() > 1 && shape.front() != 3 && shape.front() != 4) ||
+            (shape.size() == 3 && shape[1] != batch))
+            throw std::invalid_argument("invalid Qwen4 input positions");
+        if (shape.size() > 1 && shape.front() == 4) shape.front() = 3;
     } else {
-        // The first input can supply up to four position axes for every batch row.
-        shape = {4, batch, tokens};
+        shape = {tokens};
+    }
+    if (positions) {
+        std::vector<int64_t> current_shape = input.positions ? input.positions.dense().sizes().vec() : std::vector<int64_t>{tokens};
+        if (current_shape.size() > 1 && current_shape.front() == 4) current_shape.front() = 3;
+        if (current_shape.size() != shape.size() || current_shape.empty() || current_shape.back() != tokens ||
+            !std::equal(current_shape.begin(), current_shape.end() - 1, shape.begin()))
+            throw std::invalid_argument("Qwen4 position history geometry changed");
     }
     const tyloi::Device primary(tyloi::kCUDA, options.primary);
     add(primary, tyloi::make_contiguous_view(nullptr, shape, tyloi::kInt64, primary).nbytes());
@@ -166,11 +183,13 @@ std::vector<std::pair<tyloi::Device, std::size_t>> State::growth(
         const auto device = block.cpu_offloaded ? tyloi::Device(tyloi::kCPU) : tyloi::Device(tyloi::kCUDA, block.cuda_device);
         if (block.ple) {
             const auto [retained, temporary] = block.ple->ordinary_growth_bytes(state.ple, batch, tokens);
+            if (input.confirmed > 0) add(device, block.ple->checkpoint_growth_bytes(state.ple, batch, tokens, input.confirmed));
             add(device, retained, temporary);
         }
         if (block.qsa) add(device, block.qsa->ordinary_growth_bytes(*state.qsa, batch, tokens));
         if (block.gdn) {
             const auto [retained, temporary] = block.gdn->ordinary_growth_bytes(state.gdn, batch, tokens);
+            if (input.confirmed > 0) add(device, block.gdn->checkpoint_growth_bytes(state.gdn, batch, tokens, input.confirmed));
             add(device, retained, temporary);
         }
     }

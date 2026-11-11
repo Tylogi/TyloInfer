@@ -410,6 +410,14 @@ template <class Model, class State> struct CudaMtpOps {
     return ::tyloi::cuda::cat(values, axis).contiguous();
   }
 #endif
+  void reserve_target(const tyloi::models::Input& input) {
+#ifdef TYLOINFER_NATIVE_CUDA
+    if constexpr (std::is_base_of_v<tyloi::models::CausalModel, Model> &&
+                  std::is_base_of_v<tyloi::models::State, State>) {
+      if (budget) budget->reserve(state.growth(input, tyloi::cuda::forward_options(mode)));
+    }
+#endif
+  }
   Tensor target_forward(Tensor ids, Tensor *raw = nullptr,
                         int64_t confirmed = 0) {
     projected_target_hidden = {}; projected_target_logits = {};
@@ -429,6 +437,7 @@ template <class Model, class State> struct CudaMtpOps {
     input.ids = std::move(ids);
     input.raw_hidden = raw;
     input.confirmed = confirmed;
+    reserve_target(input);
     auto hidden = mtp_detail::hidden(model, state, executor, collectives, mode, std::move(input));
     target_transfer_bytes=weights.activity().streamed_bytes-transfer_before;
     finish_profile();
@@ -503,7 +512,7 @@ template <class Model, class State> struct CudaMtpOps {
       return std::move(*result);
     tyloi::weights::Loan workspace(weights);
     const bool host_history=host_prompt_history(chunk.count);
-    const bool borrowed=transformed_prompt && generation_workspace(model,workspace,chunk.count);
+    bool borrowed=false;
     Tensor hidden;
     if (transformed_prompt) {
 #ifdef TYLOINFER_NATIVE_CUDA
@@ -531,6 +540,8 @@ template <class Model, class State> struct CudaMtpOps {
       input.raw_hidden = &raw;
 #endif
       input.advance = true;
+      reserve_target(input);
+      borrowed=generation_workspace(model,workspace,chunk.count);
       hidden = mtp_detail::hidden(model, state, executor, collectives, mode, std::move(input));
     } else {
       hidden = target_forward(std::move(ids), &raw);

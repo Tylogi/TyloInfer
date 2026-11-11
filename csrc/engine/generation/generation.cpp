@@ -4,7 +4,6 @@
 #include "engine/generation/decode.h"
 #include "engine/generation/generation.h"
 #include "engine/generation/sampling.h"
-#include "engine/generation/prefill_budget.h"
 #include "engine/models/causal_model.h"
 #include "engine/scheduler/request.h"
 #include "engine/models/source.h"
@@ -44,12 +43,8 @@ struct Plain {
         auto last = ops::contiguous(ops::cast(ops::select(hidden, 1, -1), kFloat16));
         return model.logits(last, capped);
     }
-    void reserve(int64_t tokens) {
-        for (const auto& [device, growth] : state.growth(tokens, forward_options)) {
-            if (!growth) continue;
-            if (device.is_cpu()) budget.reserve_ram(growth);
-            else budget.reserve_kv(device, prefill_budget_add(growth, std::size_t(64) << 20));
-        }
+    void reserve(const models::Input& input) {
+        budget.reserve(state.growth(input, forward_options));
     }
     double prefill(const PrefillChunk& chunk) {
         auto timer = executor.timer();
@@ -60,7 +55,7 @@ struct Plain {
             if (prepared->embeddings) model_input.embeddings = ops::contiguous(ops::slice(prepared->embeddings, 1, chunk.offset, chunk.offset + chunk.count));
             if (prepared->positions) model_input.positions = ops::contiguous(ops::slice(prepared->positions, -1, chunk.offset, chunk.offset + chunk.count));
         }
-        reserve(chunk.count);
+        reserve(model_input);
         auto hidden = model.forward(std::move(model_input), state, forward_options);
         if (prepared && prepared->transformed()) state.set_position_delta(prepared->decode_position_delta);
         timer->stop();
@@ -85,11 +80,11 @@ struct Plain {
         if (penalties && !graph_active) ops::add_token_counts(graph.counts, ops::contiguous(pending));
     }
     int64_t advance() {
-        reserve(1);
         if (!graph_active) {
             models::Input model_input;
             model_input.ids = ops::reshape(pending, {1, 1});
             model_input.advance = true;
+            reserve(model_input);
             auto profile = config.profile_decode ? executor.profile("runtime.decode") : nullptr;
             auto hidden = model.forward(std::move(model_input), state, forward_options);
             pending = sample_logits(sampler,
@@ -105,12 +100,13 @@ struct Plain {
             const auto requested = state.position() + input.sampling.max_tokens;
             const auto planned = decode_bucket(requested, info.max_context);
             const auto parts = ops::attention_parts(planned, graph.device);
+            models::Input model_input;
+            model_input.ids = graph.static_input; model_input.positions = graph.static_pos;
+            model_input.cache_positions = graph.static_pos; model_input.lengths = graph.static_len;
+            model_input.kv_length = planned; model_input.attention_parts = parts;
+            reserve(model_input);
             const auto sample_static = [&] {
-                models::Input model_input;
-                model_input.ids = graph.static_input; model_input.positions = graph.static_pos;
-                model_input.cache_positions = graph.static_pos; model_input.lengths = graph.static_len;
-                model_input.kv_length = planned; model_input.attention_parts = parts;
-                auto hidden = model.forward(std::move(model_input), state, forward_options);
+                auto hidden = model.forward(model_input, state, forward_options);
                 auto logits = ops::reshape(ops::contiguous(project(hidden, !(sampler.greedy() && !penalties))), {1, -1});
                 if (penalties) sampler.apply_penalties(logits, graph.counts);
                 return sampler.greedy() ? ops::sample_greedy(logits) :

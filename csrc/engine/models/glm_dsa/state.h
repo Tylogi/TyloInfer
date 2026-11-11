@@ -34,7 +34,7 @@ public:
 #ifdef TYLOINFER_NATIVE_CUDA
     // Plans ordinary forward allocations; other execution paths plan separately.
     std::vector<std::pair<tyloi::Device, std::size_t>> growth(
-        std::int64_t tokens, const tyloi::models::ForwardOptions& options) const override;
+        const tyloi::models::Input& input, const tyloi::models::ForwardOptions& options) const override;
     std::vector<::tyloi::Tensor> storage() const;
     std::vector<::tyloi::Tensor*> graph_state() { return {}; }
 #else

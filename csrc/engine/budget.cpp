@@ -83,6 +83,14 @@ void Budget::reserve_ram(std::size_t bytes) {
     weights_.reserve(bytes);
 }
 
+void Budget::reserve(std::span<const std::pair<Device, std::size_t>> growth) {
+    for (const auto& [device, bytes] : growth) {
+        if (!bytes) continue;
+        if (device.is_cpu()) reserve_ram(bytes);
+        else reserve_kv(device, prefill_budget_add(bytes, std::size_t(64) << 20));
+    }
+}
+
 std::size_t Budget::trim_prefix(std::size_t bytes, Device device) {
     std::size_t hot=0;
     for(const auto& [name,value]:cache_.metrics())

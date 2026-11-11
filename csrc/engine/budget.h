@@ -6,6 +6,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <span>
+#include <utility>
 
 namespace tyloi::state { class Sessions; }
 namespace tyloi::weights { class Memory; }
@@ -58,6 +60,7 @@ public:
     void reclaim_kv(Device device, std::size_t bytes);
     void reserve_kv(Device device, std::size_t bytes);
     void reserve_ram(std::size_t bytes);
+    void reserve(std::span<const std::pair<Device, std::size_t>> growth);
     void workspace(Device device, std::size_t bytes);
     PrefillChunk batch(Device device, std::size_t row_bytes, PrefillChunk chunk,
         std::size_t growth = 0);

@@ -2,7 +2,6 @@
 
 #include "engine/backends/cuda/native/env.h"
 #include "engine/generation/cuda.h"
-#include "engine/generation/prefill_budget.h"
 #include "engine/budget.h"
 #include "engine/weights/cache.h"
 #include "engine/weights/workspace.h"
@@ -241,15 +240,10 @@ template <typename Model, typename State> struct CudaGenerationOps {
         graph_active = graph_eligible();
     }
 
-    void reserve(int64_t tokens) {
+    void reserve(const tyloi::models::Input& input) {
 #ifdef TYLOINFER_NATIVE_CUDA
         if constexpr (causal<Model>) {
-            if (!budget) return;
-            for (const auto& [device, bytes] : state.growth(tokens, forward_options(mode))) {
-                if (!bytes) continue;
-                if (device.is_cpu()) budget->reserve_ram(bytes);
-                else budget->reserve_kv(device, tyloi::engine::prefill_budget_add(bytes, std::size_t(64) << 20));
-            }
+            if (budget) budget->reserve(state.growth(input, forward_options(mode)));
         }
 #endif
     }
@@ -279,9 +273,6 @@ template <typename Model, typename State> struct CudaGenerationOps {
         if (hidden.defined()) {
             // The layer-major path has already advanced every physical cache.
         } else if (prepared && prepared->transformed()) {
-            reserve(chunk.count);
-            tyloi::weights::Loan workspace(weights);
-            const bool borrowed=generation_workspace(model,workspace,chunk.count);
             tyloi::models::Input input;
 #ifdef TYLOINFER_NATIVE_CUDA
             input.ids = ids;
@@ -300,6 +291,9 @@ template <typename Model, typename State> struct CudaGenerationOps {
                                        .contiguous();
 #endif
             input.advance = true;
+            reserve(input);
+            tyloi::weights::Loan workspace(weights);
+            const bool borrowed=generation_workspace(model,workspace,chunk.count);
             hidden = ::tyloi::cuda::internal::generation_detail::hidden(
                 model, state, executor, collectives, mode, std::move(input));
             finish_prefill();
@@ -314,9 +308,10 @@ template <typename Model, typename State> struct CudaGenerationOps {
             }
             state.set_position_delta(prepared->decode_position_delta);
         } else {
-            reserve(chunk.count);
+            tyloi::models::Input input{std::move(ids)};
+            reserve(input);
             hidden = ::tyloi::cuda::internal::generation_detail::hidden(
-                model, state, executor, collectives, mode, tyloi::models::Input{std::move(ids)});
+                model, state, executor, collectives, mode, std::move(input));
         }
         // Match prompt-progress timing: first-token head/sampling and expert
         // restoration remain in TTFT, outside reported prefill throughput.
@@ -485,10 +480,12 @@ template <typename Model, typename State> struct CudaGenerationOps {
     std::int64_t advance() {
         if (!graph_active) {
             if(auto result=generation_decode(model,*this))return *result;
-            reserve(1);
 #ifdef TYLOINFER_NATIVE_CUDA
+            tyloi::models::Input input;
+            input.ids = tyloi::ops::reshape(pending, {1, 1});
+            reserve(input);
             pending = sample_token(model, state, executor, collectives, mode, profiler,
-                                   tyloi::ops::reshape(pending, {1, 1}), sampler, counts, constraint);
+                                   std::move(input.ids), sampler, counts, constraint);
             return tyloi::ops::item(pending);
 #else
             pending = sample_token(model, state, executor, collectives, mode, profiler,

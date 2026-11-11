@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <utility>
@@ -104,6 +105,20 @@ class EngramHashState {
         speculative_position_ = position_;
         speculative_context_ = context_;
         speculative_tokens_.clear();
+    }
+
+    std::size_t checkpoint_growth(int batch, std::int64_t tokens) const {
+        if (batch <= 0 || batch != batch_ || tokens <= 0 || position_ <= 0 ||
+            context_.empty() || speculative_context_)
+            throw std::invalid_argument("invalid DeepSeek-V4.1 Engram checkpoint allocation request");
+        const auto maximum = std::numeric_limits<std::size_t>::max() / sizeof(std::int64_t);
+        if (static_cast<std::uint64_t>(tokens) > maximum / static_cast<std::size_t>(batch))
+            throw std::overflow_error("DeepSeek-V4.1 Engram checkpoint size overflow");
+        const auto saved_tokens = static_cast<std::size_t>(batch) * static_cast<std::size_t>(tokens);
+        if (context_.size() > maximum - saved_tokens)
+            throw std::overflow_error("DeepSeek-V4.1 Engram checkpoint size overflow");
+        // Vector allocations may reserve more capacity than the requested elements.
+        return (context_.size() + saved_tokens) * sizeof(std::int64_t);
     }
 
     void commit_speculative() noexcept {

@@ -60,7 +60,7 @@ public:
 #ifdef TYLOINFER_NATIVE_CUDA
     void commit_speculative() override;
     std::vector<std::pair<tyloi::Device, std::size_t>> growth(
-        std::int64_t tokens, const tyloi::models::ForwardOptions&) const override;
+        const tyloi::models::Input&, const tyloi::models::ForwardOptions&) const override;
     std::vector<::tyloi::Tensor> storage() const override;
     std::vector<::tyloi::Tensor*> graph_state() override { return {}; }
     void rollback_speculative(std::int64_t accepted) override;

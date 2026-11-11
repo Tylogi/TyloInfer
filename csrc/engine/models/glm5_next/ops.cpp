@@ -225,8 +225,11 @@ void State::restore_text_session_state(const TextSessionState&) {
 
 #ifdef TYLOINFER_NATIVE_CUDA
 std::vector<std::pair<tyloi::Device, std::size_t>> State::growth(
-        std::int64_t tokens, const tyloi::models::ForwardOptions&) const {
-    if (batch <= 0 || tokens <= 0 || maximum_ <= 0 || cache_pos < 0 || cache_pos > maximum_ ||
+        const tyloi::models::Input& input, const tyloi::models::ForwardOptions&) const {
+    const auto [input_batch, tokens] = input.shape();
+    if (input.suffix || input.positions.defined() || input.cache_positions.defined() || input_batch != batch || input.confirmed < 0 ||
+        (input.confirmed > 0 && (input.confirmed >= tokens || batch != 1 || cache_pos <= 0)) ||
+        batch <= 0 || tokens <= 0 || maximum_ <= 0 || cache_pos < 0 || cache_pos > maximum_ ||
         tokens > maximum_ - cache_pos || speculative_start >= 0 ||
         kda_heads_ <= 0 || kda_width_ <= 0 || kda_kernel_ <= 1)
         throw std::invalid_argument("invalid GLM Flash-Next ordinary state growth");
@@ -246,15 +249,27 @@ std::vector<std::pair<tyloi::Device, std::size_t>> State::growth(
         if (const auto* kda = std::get_if<KdaState>(&layers[i])) {
             if (kda->pending() || (kda->conv.defined() && kda->conv.size(0) != batch))
                 throw std::invalid_argument("invalid GLM KDA state for growth");
-            const std::array<int64_t, 5> joined{batch, kda_kernel_ - 1 + tokens, 3, kda_heads_, kda_width_};
             const std::array<int64_t, 5> conv{batch, kda_kernel_ - 1, 3, kda_heads_, kda_width_};
             const std::array<int64_t, 4> recurrent{batch, kda_heads_, kda_width_, kda_width_};
-            const auto joined_bytes = tyloi::make_contiguous_view(nullptr, joined, tyloi::kFloat32, device).nbytes();
             const auto conv_bytes = tyloi::make_contiguous_view(nullptr, conv, tyloi::kFloat32, device).nbytes();
-            if (batch == 1) add(retained, joined_bytes);
-            else { add(temporary, joined_bytes); add(retained, conv_bytes); }
-            if (!kda->conv.defined()) add(temporary, conv_bytes);
-            add(retained, tyloi::make_contiguous_view(nullptr, recurrent, tyloi::kFloat32, device).nbytes());
+            const auto recurrent_bytes = tyloi::make_contiguous_view(nullptr, recurrent, tyloi::kFloat32, device).nbytes();
+            if (input.confirmed > 0) {
+                if (!kda->conv.defined() || !kda->recurrent.defined())
+                    throw std::invalid_argument("GLM KDA verification requires existing state");
+                const std::array<int64_t, 5> prefix{batch, kda_kernel_ - 1 + input.confirmed, 3, kda_heads_, kda_width_};
+                const std::array<int64_t, 5> suffix{batch, kda_kernel_ - 1 + tokens - input.confirmed, 3, kda_heads_, kda_width_};
+                add(retained, tyloi::make_contiguous_view(nullptr, prefix, tyloi::kFloat32, device).nbytes());
+                add(retained, tyloi::make_contiguous_view(nullptr, suffix, tyloi::kFloat32, device).nbytes());
+                add(retained, recurrent_bytes);
+                add(retained, recurrent_bytes);
+            } else {
+                const std::array<int64_t, 5> joined{batch, kda_kernel_ - 1 + tokens, 3, kda_heads_, kda_width_};
+                const auto joined_bytes = tyloi::make_contiguous_view(nullptr, joined, tyloi::kFloat32, device).nbytes();
+                if (batch == 1) add(retained, joined_bytes);
+                else { add(temporary, joined_bytes); add(retained, conv_bytes); }
+                if (!kda->conv.defined()) add(temporary, conv_bytes);
+                add(retained, recurrent_bytes);
+            }
         } else {
             const auto& mla = std::get<MlaState>(layers[i]);
             if (mla.latent.position() != cache_pos || mla.index.position() != cache_pos)

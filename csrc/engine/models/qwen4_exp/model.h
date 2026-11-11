@@ -165,6 +165,20 @@ class Gdn {
         }
         return {retained, temporary};
     }
+    std::size_t checkpoint_growth_bytes(const State& request, int64_t batch, int64_t tokens, int64_t confirmed) const {
+        if (tokens <= 8)
+            TYLOINFER_RUNTIME_CHECK(request.conv.dense().defined() && request.recurrent.dense().defined(),
+                                    "GDN verification requires committed recurrent state");
+        const auto count = tokens <= 8 ? tokens - confirmed : 1;
+        const std::array<int64_t,4> conv{batch, kernel_ - 1, 2 * nk_ + nv_, d_};
+        const std::array<int64_t,4> recurrent{batch, nv_, d_, d_};
+        const auto a = ::tyloi::make_contiguous_view(nullptr, conv, ::tyloi::kFloat32, w_->norm.device()).nbytes();
+        const auto b = ::tyloi::make_contiguous_view(nullptr, recurrent, ::tyloi::kFloat32, w_->norm.device()).nbytes();
+        if (a > std::numeric_limits<std::size_t>::max() - b ||
+            (a + b && std::size_t(count) > std::numeric_limits<std::size_t>::max() / (a + b)))
+            throw std::overflow_error("GDN checkpoint growth overflow");
+        return (a + b) * std::size_t(count);
+    }
     std::size_t request_cache_growth_bytes(const State& request) const {
         return growth_bytes(request) + (fused_core_ && fused_decode_ && fused_preparation_ &&
             fused_output_ && transposed_state_ && !request.core_workspace.dense().defined()
@@ -978,6 +992,18 @@ class Ple {
         }
         if (batch > 1 && a > std::numeric_limits<std::size_t>::max() - b) throw std::overflow_error("PLE growth overflow");
         return batch == 1 ? std::pair{a, b} : std::pair{b, a + b};
+    }
+    std::size_t checkpoint_growth_bytes(const State& state, int64_t batch, int64_t tokens, int64_t confirmed) const {
+        if (tokens <= 8) TYLOINFER_RUNTIME_CHECK(state.conv.defined(), "PLE verification requires committed convolution state");
+        const auto kernel = w_.conv.size(-1);
+        TYLOINFER_RUNTIME_CHECK(kernel > 0 && dilation_ > 0 && kernel - 1 <= std::numeric_limits<int64_t>::max() / dilation_,
+                                "invalid PLE checkpoint geometry");
+        const auto count = tokens <= 8 ? tokens - confirmed : 1;
+        const std::array<int64_t,4> shape{batch, (kernel - 1) * dilation_, streams_, hidden_};
+        const auto bytes = ::tyloi::make_contiguous_view(nullptr, shape, ::tyloi::kFloat32, w_.conv.device()).nbytes();
+        if (bytes && std::size_t(count) > std::numeric_limits<std::size_t>::max() / bytes)
+            throw std::overflow_error("PLE checkpoint growth overflow");
+        return bytes * std::size_t(count);
     }
     bool graph_supported() const { return embedding_.graph_supported(); }
     const NgramEmbedding::Context& session_context(const State& state) const { return embedding_.context(state.embedding); }

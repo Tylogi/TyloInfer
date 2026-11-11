@@ -47,8 +47,9 @@ void State::reset(std::int64_t next_batch) {
 }
 
 std::vector<std::pair<tyloi::Device, std::size_t>> State::growth(
-    std::int64_t tokens, const tyloi::models::ForwardOptions& options) const {
-    if (batch <= 0 || tokens <= 0 || cache_pos < 0)
+    const tyloi::models::Input& input, const tyloi::models::ForwardOptions& options) const {
+    const auto [next_batch, tokens] = input.shape();
+    if (batch <= 0 || next_batch != batch || cache_pos < 0 || input.confirmed != 0 || input.suffix)
         throw std::invalid_argument("Gemma4 KV planning requires positive batch and tokens and a nonnegative position");
     if (cache_pos > std::numeric_limits<std::int64_t>::max() - tokens)
         throw std::overflow_error("Gemma4 KV planning position overflow");

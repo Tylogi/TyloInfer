@@ -966,8 +966,12 @@ void State::commit_speculative() {
 
 #ifdef TYLOINFER_NATIVE_CUDA
 std::vector<std::pair<tyloi::Device, std::size_t>> State::growth(
-        std::int64_t tokens, const tyloi::models::ForwardOptions& options) const {
-    if (batch <= 0 || tokens <= 0 || cache_pos < 0 || speculative_start >= 0)
+        const tyloi::models::Input& input, const tyloi::models::ForwardOptions& options) const {
+    const auto [input_batch, tokens] = input.shape();
+    if (input.suffix || input_batch != batch || input.confirmed < 0 ||
+        (input.confirmed > 0 && (input.confirmed >= tokens || batch != 1 || cache_pos <= 0 ||
+                                 input.positions || input.cache_positions)) ||
+        batch <= 0 || tokens <= 0 || cache_pos < 0 || speculative_start >= 0)
         throw std::invalid_argument("invalid Nemotron-H state allocation request");
     if (cache_pos > std::numeric_limits<std::int64_t>::max() - tokens)
         throw std::overflow_error("Nemotron-H state position overflow");
@@ -979,6 +983,8 @@ std::vector<std::pair<tyloi::Device, std::size_t>> State::growth(
         const tyloi::Device device(tyloi::kCUDA, layout.device);
         std::size_t bytes = 0;
         if (const auto* full = std::get_if<FullLayout>(&layout.mixer)) {
+            if (input.confirmed > 0 && full->sliding)
+                throw std::invalid_argument("Nemotron-H sliding attention cannot verify speculative tokens");
             if (std::get<tyloi::state::KvView>(layers[index]).defined()) continue;
             const auto capacity = full->sliding ? full->capacity :
                 (options.kv_capacity > 0 ? std::max(end, options.kv_capacity) : full->capacity);
@@ -990,7 +996,9 @@ std::vector<std::pair<tyloi::Device, std::size_t>> State::growth(
             const auto [inner, width] = mamba_widths(mamba->heads, mamba->head_dim,
                                                     mamba->groups, mamba->state_size, mamba->conv_kernel);
             (void)inner;
-            if (mixer.defined()) continue;
+            if (mixer.defined() && input.confirmed == 0) continue;
+            if (input.confirmed > 0 && !mixer.defined())
+                throw std::invalid_argument("Nemotron-H verification requires existing mamba state");
             const std::array<std::int64_t, 3> conv{batch, mamba->conv_kernel - 1, width};
             const std::array<std::int64_t, 4> recurrent{batch, mamba->heads, mamba->head_dim, mamba->state_size};
             bytes = tyloi::make_contiguous_view(nullptr, conv, tyloi::kFloat32, device).nbytes();
@@ -998,6 +1006,16 @@ std::vector<std::pair<tyloi::Device, std::size_t>> State::growth(
             if (bytes > std::numeric_limits<std::size_t>::max() - recurrent_bytes)
                 throw std::overflow_error("Nemotron-H state byte count overflow");
             bytes += recurrent_bytes;
+            if (input.confirmed > 0) {
+                const std::array<std::int64_t, 3> xbc{batch, tokens, width};
+                const std::array<std::int64_t, 3> dt{batch, tokens, mamba->heads};
+                for (const auto value : {tyloi::make_contiguous_view(nullptr, xbc, tyloi::kFloat32, device).nbytes(),
+                                         tyloi::make_contiguous_view(nullptr, dt, tyloi::kFloat32, device).nbytes()}) {
+                    if (bytes > std::numeric_limits<std::size_t>::max() - value)
+                        throw std::overflow_error("Nemotron-H state byte count overflow");
+                    bytes += value;
+                }
+            }
         } else continue;
         auto entry = std::find_if(result.begin(), result.end(),
                                   [device](const auto& item) { return item.first == device; });
