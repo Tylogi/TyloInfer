@@ -147,8 +147,9 @@ Layer load_layer(const ::tyloi::weights::Loader& weights, const Config& config,
         throw std::invalid_argument("Qwen layer type disagrees with model config");
     MfqCudaGuard scope(weights.placement.device);
     Layer result;
-    result.device = weights.placement.device;
-    result.cpu = weights.placement.cpu;
+    result.device = weights.placement.cpu
+        ? ::tyloi::Device(::tyloi::kCPU)
+        : ::tyloi::Device(::tyloi::kCUDA, weights.placement.device);
     LayerLoader loader{{weights}, mirror_scalars};
     if (Config::attention_kind(type) == Config::AttentionKind::full) {
         Full full;
@@ -213,6 +214,7 @@ Model read(std::shared_ptr<const tyloi::ModelSource> source,
 void load(Model& model, const ::tyloi::weights::Loader& weights,
           LayerPlacementConfig& placement, const tyloi::ops::YarnScaling& yarn,
           int& cpu_layers, const LoadOptions& options) {
+    model.device = ::tyloi::Device(::tyloi::kCUDA, weights.placement.device);
     if (options.expert_parallel && model.config.num_experts <= 0)
         throw std::runtime_error("--expert-parallel requires a model with routed experts");
 

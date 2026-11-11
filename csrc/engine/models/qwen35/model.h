@@ -2,6 +2,7 @@
 
 #include "engine/models/qwen35/config.h"
 #include "engine/models/metadata.h"
+#include "engine/models/input.h"
 #include "engine/models/common/ffn.h"
 #include "engine/models/source/model_graph.h"
 #include "engine/models/common/attention.h"
@@ -32,14 +33,16 @@ struct Linear {
 
 struct Layer {
     std::variant<Full, Linear> weights;
-    int device = 0;
-    bool cpu = false;
+    tyloi::Device device;
 };
+
+class State;
 
 struct Model {
     std::shared_ptr<const tyloi::ModelSource> source;
     tyloi::ModelGraph graph;
     Config config;
+    tyloi::Device device;
     tyloi::models::CausalLmMetadata metadata;
     tyloi::ops::RopeTable rope, cpu_rope;
     std::unordered_map<int, tyloi::ops::RopeTable> device_ropes;
@@ -47,6 +50,9 @@ struct Model {
     ::tyloi::Tensor lm_head;
     ::tyloi::Tensor output_norm;
     std::vector<Layer> layers;
+    ::tyloi::Tensor forward(tyloi::models::Input input, State& state, const tyloi::models::ForwardOptions& options = {}) const;
+    void replay(State& state, std::int64_t accepted = 0) const;
+    bool supports_speculation() const noexcept;
     ::tyloi::Tensor embedding(const tyloi::Tensor& ids, int primary = 0) const;
     ::tyloi::Tensor normalize(const tyloi::Tensor& hidden, std::int64_t batch, std::int64_t tokens) const;
     ::tyloi::Tensor logits(const tyloi::Tensor& hidden, bool capped = true) const;

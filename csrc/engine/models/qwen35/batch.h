@@ -1,6 +1,6 @@
 #pragma once
 
-#include "engine/models/qwen35/forward.h"
+#include "engine/models/qwen35/forward_cuda.h"
 #include "engine/state/paged_kv.h"
 
 #include <cstdint>

@@ -46,6 +46,7 @@ struct ForwardOptions {
     ops::Trace* trace = nullptr;
     int trace_layer = -1;
     int primary = 0;
+    bool serial_experts = false;
 };
 
 struct Prepared {

@@ -15,7 +15,7 @@ std::vector<MtpState::Layout> layout(const tyloi::models::qwen35::Predictor& mod
     std::vector<MtpState::Layout> result;
     for (const auto& layer : model.layers) {
         const auto& a = layer.attention;
-        result.push_back({device, a.kv_heads, a.attention_head_dim, a.max_position_embeddings,
+        result.push_back({::tyloi::Device(::tyloi::kCUDA, device), a.kv_heads, a.attention_head_dim, a.max_position_embeddings,
             a.official_bf16 ? ::tyloi::kBFloat16 : ::tyloi::kFloat16, a.kv_quantization});
     }
     return result;
@@ -108,7 +108,7 @@ void Mtp::trim_cache_to(tyloi::models::MtpState& value, int64_t position) const 
 MtpSessionState Mtp::capture_session_state(const tyloi::models::MtpState& value,
                                            int64_t position, const ::tyloi::Tensor& hidden) const {
     MfqCudaGuard guard(device_);
-    return state<MtpState>(value).capture(position, hidden.dense());
+    return state<MtpState>(value).capture(position, hidden);
 }
 
 void restore_session(State& state, Mtp* mtp, const TextSessionState& snapshot,

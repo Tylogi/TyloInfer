@@ -5,7 +5,6 @@
 #include "engine/models/common/load.h"
 #include "engine/weights/loader.h"
 #include "engine/models/common/vision/grid_encoder.h"
-#include "engine/models/qwen35/forward.h"
 #include "engine/models/qwen35/load.h"
 #include "engine/models/qwen35/mtp.h"
 #include "engine/models/qwen35/state.h"
@@ -110,7 +109,7 @@ Components Components::load(
 
     if (components.plan.predictor == CudaPredictorAdapter::qwen35) {
         if (mtp_allowed && model.metadata.num_experts == 0 &&
-            supports_speculation(model)) {
+            model.supports_speculation()) {
             TransformerWeightLoader loader{weights};
             auto predictor = load_predictor(
                 loader, model.config, cuda_kv_quantization());

@@ -20,7 +20,7 @@ namespace tyloi::cuda {
 
 #ifdef TYLOINFER_NATIVE_CUDA
 inline tyloi::models::ForwardOptions forward_options(const Executor::Mode& mode) {
-    return {mode.kv_capacity, mode.trace, mode.trace_layer, mode.primary};
+    return {mode.kv_capacity, mode.trace, mode.trace_layer, mode.primary, mode.ffn.batch_serial};
 }
 #endif
 

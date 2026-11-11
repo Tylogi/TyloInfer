@@ -49,8 +49,7 @@ struct LinearLayout {
 };
 
 struct Layout {
-    int device = 0;
-    bool cpu = false;
+    tyloi::Device device;
     std::variant<FullLayout, LinearLayout> attention;
 };
 
@@ -93,6 +92,7 @@ public:
     void publish(Restore&& restore) noexcept;
 
     const std::vector<Layout>& layout() const noexcept { return layout_; }
+    bool transposed() const noexcept { return transposed_; }
 
     std::vector<LayerState> layers;
     std::int64_t cache_pos = 0;

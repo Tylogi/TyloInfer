@@ -129,6 +129,16 @@ Tensor merge_norms(const Tensor& dense, const Tensor& experts, const Tensor& res
                    const Tensor& expert_weight, const Tensor& output_weight,
                    const Tensor& scale, double eps);
 
+// Select a numerical device within the caller's execution resources; restore it without waiting.
+class DeviceScope {
+public:
+    explicit DeviceScope(Device device);
+    ~DeviceScope();
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
 // A CUDA target selects the measurement device; by default the current execution scope is used.
 class ProfileRange {
 public:
@@ -234,6 +244,7 @@ Tensor repeat_interleave(const Tensor& input, std::int64_t repeats, std::int64_t
 Tensor tril(const Tensor& input, std::int64_t diagonal = 0);
 Tensor masked_fill(const Tensor& input, const Tensor& mask, double value);
 // Fill supports CPU and CUDA; CUDA requires an execution scope.
+// Memory initialization uses current device resources without executor scratch.
 void fill(Tensor& input, double value);
 void masked_fill_inplace(Tensor& input, const Tensor& mask, double value);
 void scatter_add(Tensor& input, std::int64_t dim, const Tensor& indices, const Tensor& source);
@@ -266,6 +277,7 @@ inline Tensor expand(const Tensor& input, std::initializer_list<std::int64_t> sh
     return ops::expand(input, std::span<const std::int64_t>(shape.begin(), shape.size()));
 }
 Tensor cat(std::span<const Tensor> inputs, std::int64_t dim);
+// Allocation uses current device resources; it does not require executor scratch or wait.
 Tensor zeros(std::span<const std::int64_t> shape, const TensorOptions& options);
 inline Tensor zeros(std::initializer_list<std::int64_t> shape, const TensorOptions& options) {
     return zeros(std::span<const std::int64_t>(shape.begin(), shape.size()), options);

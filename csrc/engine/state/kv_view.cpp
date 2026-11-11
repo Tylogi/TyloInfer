@@ -6,9 +6,6 @@
 #include <stdexcept>
 #include <utility>
 
-#ifdef TYLOINFER_NATIVE_CUDA
-#include "engine/backends/cuda/kernels/mfq_cuda_kv_quantization.h"
-
 namespace {
 struct KvLayout {
     int64_t key_width, value_width;
@@ -29,15 +26,16 @@ KvLayout kv_layout(int64_t batch, int64_t heads, int64_t capacity, int64_t head_
     for (auto dimension : {batch, heads, capacity, head_dim})
         if (static_cast<std::uint64_t>(dimension) > std::numeric_limits<std::size_t>::max())
             throw std::overflow_error("KV tensor size overflow");
-    TYLOINFER_RUNTIME_CHECK(!ring || !quantization.enabled(),"TurboQuant ring cache is unsupported");
+    if (ring && quantization.enabled())
+        throw std::runtime_error("TurboQuant ring cache is unsupported");
     int64_t key_width = head_dim, value_width = head_dim;
     auto storage_dtype = dtype;
     if (quantization.enabled()) {
         if (!std::isfinite(quantization.bits) || quantization.bits < 2 || quantization.bits > 8 ||
             head_dim > std::numeric_limits<int>::max())
             throw std::invalid_argument("invalid TurboQuant KV layout");
-        key_width = tyloi::cuda::cuda_kv_packed_width(int(head_dim), quantization.key_bits());
-        value_width = tyloi::cuda::cuda_kv_packed_width(int(head_dim), quantization.value_bits());
+        key_width = tyloi::state::kv_packed_width(int(head_dim), quantization.key_bits());
+        value_width = tyloi::state::kv_packed_width(int(head_dim), quantization.value_bits());
         storage_dtype = tyloi::kInt32;
     }
     const auto item_size = tyloi::scalar_size(storage_dtype);
@@ -73,4 +71,3 @@ tyloi::state::KvView tyloi::state::allocate_kv(
     result.dtype = dtype;
     return result;
 }
-#endif

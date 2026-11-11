@@ -62,7 +62,7 @@ Batch::Batch(std::shared_ptr<const Model> weights, std::unique_ptr<Executor> exe
                 [&](const auto &value) {
                     using T = std::decay_t<decltype(value)>;
                     if constexpr (std::is_same_v<T, Full>) {
-                        layouts.push_back({layer.device,
+                        layouts.push_back({layer.device.index,
                             value.attention.kv_heads > 0 ? value.attention.kv_heads
                                                          : weights_->metadata.num_key_value_heads,
                             value.attention.attention_head_dim > 0
@@ -247,7 +247,7 @@ void Batch::bind_paged(State &state, const std::vector<const PagedKv::Sequence *
             [&](const auto &value) {
                 using T = std::decay_t<decltype(value)>;
                 if constexpr (std::is_same_v<T, Full>) {
-                    MfqCudaGuard guard(layer.device);
+                    MfqCudaGuard guard(layer.device.index);
                     auto *cache = std::get_if<tyloi::state::KvView>(&state.layers[state_index]);
                     TYLOINFER_RUNTIME_CHECK(cache, "continuous batching full state layout changed");
                     *cache = paged_kv_->view(paged_layer++, static_cast<int64_t>(sequences.size()));
@@ -308,7 +308,7 @@ std::string Batch::incompatibility(bool cpu_offload, int cached_slots) const {
     if (cpu_offload)
         return "continuous batching requires GPU-resident model blocks";
     for (const auto &layer : weights_->layers) {
-        if (layer.cpu)
+        if (layer.device.is_cpu())
             return "continuous batching cannot use CPU-offloaded blocks";
         const auto reason = std::visit(
             [&](const auto &value) -> std::string {
@@ -334,7 +334,7 @@ void Batch::copy_to_slot(State &target, const State &source, std::int64_t slot) 
                                 source.speculative_start < 0,
                             "continuous batching received an invalid stable slot");
     for (std::size_t index = 0; index < target.layers.size(); ++index) {
-        MfqCudaGuard guard(weights_->layers[index].device);
+        MfqCudaGuard guard(weights_->layers[index].device.index);
         auto &destination = target.layers[index];
         const auto &origin = source.layers[index];
         TYLOINFER_RUNTIME_CHECK(destination.index() == origin.index(),
@@ -441,7 +441,7 @@ BatchState Batch::capture_recurrent_slots(const std::vector<std::int32_t> &slots
         const auto *linear = std::get_if<LinearState>(&state_->layers[index]);
         if (!linear)
             continue;
-        MfqCudaGuard guard(weights_->layers[index].device);
+        MfqCudaGuard guard(weights_->layers[index].device.index);
         std::vector<DenseTensor> conv, recurrent;
         for (auto slot : slots) {
             conv.push_back(linear->mixer.view().convolution.dense().narrow(0, slot, 1));
@@ -466,7 +466,7 @@ void Batch::restore_recurrent_slots(const std::vector<std::int32_t> &slots,
         auto *linear = std::get_if<LinearState>(&state_->layers[index]);
         if (!linear)
             continue;
-        MfqCudaGuard guard(weights_->layers[index].device);
+        MfqCudaGuard guard(weights_->layers[index].device.index);
         const auto *saved = std::get_if<tyloi::state::Recurrent::State>(&state.layers[index]);
         TYLOINFER_RUNTIME_CHECK(saved && saved->defined() &&
                                     saved->convolution.size(0) == state.batch &&
@@ -478,7 +478,7 @@ void Batch::restore_recurrent_slots(const std::vector<std::int32_t> &slots,
         auto *linear = std::get_if<LinearState>(&state_->layers[index]);
         if (!linear)
             continue;
-        MfqCudaGuard guard(weights_->layers[index].device);
+        MfqCudaGuard guard(weights_->layers[index].device.index);
         const auto &saved = std::get<tyloi::state::Recurrent::State>(state.layers[index]);
         for (std::size_t row = 0; row < slots.size(); ++row) {
             linear->mixer.view().convolution.dense().narrow(0, slots[row], 1)

@@ -15,7 +15,7 @@ namespace tyloi::cuda::qwen35 {
         throw std::runtime_error("token IDs must not be empty");
     auto normalized = tyloi::ops::contiguous(tyloi::ops::copy(
         tyloi::ops::cast(input, tyloi::ScalarType::int64),
-        tyloi::Device{tyloi::DeviceType::cuda, primary}));
+        tyloi::Device{device.type, primary}));
     auto result = tyloi::ops::measure("model.embed", normalized.device(), [&] {
         return tyloi::ops::embedding(normalized, embed);
     });

@@ -27,6 +27,10 @@ add_library(mfq-engine STATIC
     models/nemotron_h/config.cpp
     models/nemotron_h/vision.cpp
     models/qwen35/config.cpp
+    models/qwen35/model.cpp
+    models/qwen35/forward.cpp
+    models/qwen35/state.cpp
+    models/qwen35/mtp_state.cpp
     models/qwen35/predictor.cpp
     models/qwen4_exp/config.cpp
     requests/constraint.cpp
@@ -40,6 +44,7 @@ add_library(mfq-engine STATIC
     state/session/prefix_cache.cpp
     state/qsa_sequence.cpp
     state/recurrent.cpp
+    state/kv_view.cpp
 )
 if(TYLOINFER_BUILD_CUDA_ENGINE)
     target_sources(mfq-engine PRIVATE scheduler/request.cpp)

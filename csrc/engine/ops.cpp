@@ -38,6 +38,19 @@
 
 namespace tyloi::ops {
 #ifdef TYLOINFER_NATIVE_CUDA
+struct DeviceScope::Impl {
+    std::optional<MfqCudaGuard> guard;
+
+    explicit Impl(Device target) {
+        if ((!target.is_cpu() && !target.is_cuda()) || (target.is_cuda() && target.index < 0))
+            throw std::invalid_argument("unsupported execution device");
+        if (target.is_cuda()) guard.emplace(target.index);
+    }
+};
+
+DeviceScope::DeviceScope(Device target) : impl_(std::make_unique<Impl>(target)) {}
+DeviceScope::~DeviceScope() = default;
+
 namespace {
 const DenseTensor& dense(const Tensor& value) {
     const auto* result = value.representation<DenseTensor>();
@@ -1143,11 +1156,11 @@ Tensor cat(std::span<const Tensor> values, std::int64_t dim) {
     return owner(cuda::ops::cat(dense_values, dim));
 }
 Tensor zeros(std::span<const std::int64_t> shape, const TensorOptions& options) {
-    device(options.target_device());
+    DeviceScope scope(options.target_device());
     return owner(cuda::ops::zeros(shape, options));
 }
 Tensor empty(std::span<const std::int64_t> shape, const TensorOptions& options) {
-    device(options.target_device());
+    DeviceScope scope(options.target_device());
     return owner(cuda::empty(shape, options));
 }
 Tensor sample_greedy(const Tensor& logits_tensor) {
@@ -1431,7 +1444,8 @@ void masked_fill_inplace(Tensor& value_tensor, const Tensor& mask_tensor, double
 }
 void fill(Tensor& value_tensor, double fill_value) {
     auto& value = ::tyloi::ops::dense(value_tensor);
-    input(value);
+    if (!value.defined()) throw std::invalid_argument("undefined tensor");
+    DeviceScope scope(value.device());
     if (value.is_cuda()) {
         cuda::ops::fill(value, fill_value);
         return;

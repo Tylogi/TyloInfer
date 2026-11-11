@@ -16,7 +16,7 @@ public:
     };
 
     struct Layout {
-        int device;
+        tyloi::Device device;
         int64_t heads, head_dim, capacity;
         ::tyloi::ScalarType dtype;
         tyloi::state::KvQuantization quantization;
@@ -30,7 +30,7 @@ public:
     void trim(int64_t position);
     std::vector<tyloi::state::KvView> views() const;
     MtpSessionState capture(int64_t target_position,
-        const ::tyloi::DenseTensor& hidden) const;
+        const ::tyloi::Tensor& hidden) const;
     Restore prepare(const MtpSessionState& saved) const;
     void stage(Restore& restore, const MtpSessionState& saved) const;
     void publish(Restore&& restore) noexcept;

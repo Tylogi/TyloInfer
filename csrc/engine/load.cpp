@@ -3,7 +3,7 @@
 #include "engine/models/load.h"
 #include "engine/models/load_internal.h"
 #include "engine/models/deepseek_v41/vision.h"
-#include "engine/models/qwen35/forward.h"
+#include "engine/models/qwen35/forward_cuda.h"
 #include "engine/models/minicpmo45/forward.h"
 #include "engine/models/minicpmo45/text/forward.h"
 #include "engine/models/glm_dsa/forward.h"
@@ -185,7 +185,7 @@ std::unique_ptr<engine::Engine> load_native_engine(CudaEngineOptions options, en
         config.stop_token_ids = models::stop_token_ids(models::config_json(*source, options.config_path), vocab_size);
         config.resident_budget_bytes = ::tyloi::cuda::options::resident_budget_bytes();
         config.decode_graph.enabled &= graph_allowed;
-        models::ForwardOptions forward{mode.kv_capacity, mode.trace, mode.trace_layer, mode.primary};
+        models::ForwardOptions forward{mode.kv_capacity, mode.trace, mode.trace_layer, mode.primary, mode.ffn.batch_serial};
         execution = std::move(root);
         if (target) {
             target->rebind(std::move(model), std::move(execution), std::move(config), std::move(source),

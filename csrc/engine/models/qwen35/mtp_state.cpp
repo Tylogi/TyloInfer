@@ -1,32 +1,40 @@
 #include "engine/models/qwen35/mtp_state.h"
 #include "engine/models/session/snapshot.h"
 #include "engine/ops.h"
-#include "engine/backends/cuda/native/tensor/backend.h"
 
 #include <algorithm>
+#include <stdexcept>
 
 namespace tyloi::cuda::qwen35 {
 
+namespace {
+void require_state(bool condition, const char* message) {
+    if (!condition) throw std::runtime_error(message);
+}
 
+bool on_device(const ::tyloi::Tensor& tensor, tyloi::Device device) {
+    return device.is_cpu() ? tensor.is_cpu() : tensor.device() == device;
+}
+} // namespace
 MtpState::MtpState(const tyloi::models::Mtp& owner, std::vector<Layout> layout, int64_t hidden)
     : tyloi::models::MtpState(owner), layout_(std::move(layout)), kv_(layout_.size()), hidden_(hidden) {}
 
 void MtpState::prepare(int64_t batch, int64_t tokens, int64_t kl_capacity) {
-    TYLOINFER_RUNTIME_CHECK(batch > 0 && tokens > 0, "invalid MTP state dimensions");
+    require_state(batch > 0 && tokens > 0, "invalid MTP state dimensions");
     for (size_t index = 0; index < kv_.size(); ++index) {
         const auto& layout = layout_[index];
-        TYLOINFER_RUNTIME_CHECK(position_ <= layout.capacity - tokens,
+        require_state(position_ <= layout.capacity - tokens,
             "Qwen MTP history exceeds context capacity");
         if (kv_[index].defined()) {
-            TYLOINFER_RUNTIME_CHECK(kv_[index].batch == batch,
+            require_state(kv_[index].batch == batch,
                 "MTP batch changed without resetting state");
             if (kv_[index].physical_key.size(2) >= position_ + tokens) continue;
         }
-        MfqCudaGuard guard(layout.device);
+        tyloi::ops::DeviceScope guard(layout.device);
         const auto capacity = kl_capacity > 0
             ? std::min(layout.capacity, std::max(position_ + tokens, kl_capacity)) : layout.capacity;
         auto grown = tyloi::state::allocate_kv(batch, layout.heads, capacity, layout.head_dim, false,
-            ::tyloi::Device(::tyloi::kCUDA, layout.device), layout.dtype, layout.quantization);
+            layout.device, layout.dtype, layout.quantization);
         if (kv_[index].defined() && position_ > 0) {
             auto key_prefix = tyloi::ops::slice(grown.physical_key, 2, 0, position_);
             auto value_prefix = tyloi::ops::slice(grown.physical_value, 2, 0, position_);
@@ -46,12 +54,12 @@ void MtpState::reset(int64_t batch) {
 }
 
 void MtpState::advance(int64_t tokens) {
-    TYLOINFER_RUNTIME_CHECK(tokens > 0, "MTP position must advance by consumed inputs");
+    require_state(tokens > 0, "MTP position must advance by consumed inputs");
     position_ += tokens;
 }
 
 void MtpState::trim(int64_t position) {
-    TYLOINFER_RUNTIME_CHECK(position >= 0 && position <= position_,
+    require_state(position >= 0 && position <= position_,
         "Qwen MTP cache trim position is invalid");
     position_ = position;
 }
@@ -60,15 +68,15 @@ std::vector<tyloi::state::KvView> MtpState::views() const {
     std::vector<tyloi::state::KvView> result;
     result.reserve(kv_.size());
     for (const auto& cache : kv_) {
-        TYLOINFER_RUNTIME_CHECK(cache.defined(), "MTP KV state is unavailable");
+        require_state(cache.defined(), "MTP KV state is unavailable");
         result.push_back(cache);
     }
     return result;
 }
 
-MtpSessionState MtpState::capture(int64_t target_position, const ::tyloi::DenseTensor& hidden) const {
+MtpSessionState MtpState::capture(int64_t target_position, const ::tyloi::Tensor& hidden) const {
     const auto position = target_position - 1;
-    if (position <= 0 || position > position_ || !hidden.defined() ||
+    if (position <= 0 || position > position_ || !hidden.defined() || hidden.is_encoded() ||
         hidden.dim() != 3 || hidden.size(0) != 1 || hidden.size(1) != 1 || hidden.size(2) != hidden_)
         throw std::runtime_error("Qwen MTP session boundary is unavailable");
     MtpSessionState saved;
@@ -76,21 +84,21 @@ MtpSessionState MtpState::capture(int64_t target_position, const ::tyloi::DenseT
     auto& blocks = std::get<std::vector<KvSnapshot>>(saved.payload);
     blocks.reserve(kv_.size());
     for (size_t index = 0; index < kv_.size(); ++index) {
-        MfqCudaGuard guard(layout_[index].device);
+        tyloi::ops::DeviceScope guard(layout_[index].device);
         blocks.push_back(capture_kv(kv_[index], position, saved.bytes));
     }
-    auto saved_hidden = hidden.clone();
+    auto saved_hidden = tyloi::ops::clone(hidden);
     saved.bytes += session_tensor_bytes(saved_hidden);
-    saved.last_target_hidden = std::make_shared<::tyloi::DenseTensor>(std::move(saved_hidden));
+    saved.last_target_hidden = std::move(saved_hidden);
     return saved;
 }
 
 MtpState::Restore MtpState::prepare(const MtpSessionState& saved) const {
     const auto* blocks = std::get_if<std::vector<KvSnapshot>>(&saved.payload);
-    const auto* hidden = saved.last_target_hidden.representation<::tyloi::DenseTensor>();
+    const auto& hidden = saved.last_target_hidden;
     if (saved.cache_pos <= 0 || blocks == nullptr || blocks->size() != kv_.size() ||
-        !hidden || !hidden->defined() || hidden->dim() != 3 ||
-        hidden->size(0) != 1 || hidden->size(1) != 1 || hidden->size(2) != hidden_)
+        !hidden.defined() || hidden.is_encoded() || hidden.dim() != 3 ||
+        hidden.size(0) != 1 || hidden.size(1) != 1 || hidden.size(2) != hidden_)
         throw CudaSessionStateError("Qwen MTP session state is incompatible");
     for (size_t index = 0; index < blocks->size(); ++index) {
         if (saved.cache_pos > layout_[index].capacity)
@@ -99,15 +107,15 @@ MtpState::Restore MtpState::prepare(const MtpSessionState& saved) const {
         const auto& layout = layout_[index];
         validate_kv(block);
         const auto key_width = layout.quantization.enabled()
-            ? cuda_kv_packed_width(int(layout.head_dim), layout.quantization.key_bits()) : layout.head_dim;
+            ? tyloi::state::kv_packed_width(int(layout.head_dim), layout.quantization.key_bits()) : layout.head_dim;
         const auto value_width = layout.quantization.enabled()
-            ? cuda_kv_packed_width(int(layout.head_dim), layout.quantization.value_bits()) : layout.head_dim;
+            ? tyloi::state::kv_packed_width(int(layout.head_dim), layout.quantization.value_bits()) : layout.head_dim;
         const auto dtype = layout.quantization.enabled() ? ::tyloi::kInt32 : layout.dtype;
         if (block.capacity > layout.capacity || block.ring ||
             block.k.size(1) != layout.heads || block.k.size(2) != saved.cache_pos ||
             block.k.size(3) != key_width || block.v.size(3) != value_width ||
-            block.k.scalar_type() != dtype || !block.k.is_cuda() || !block.v.is_cuda() ||
-            block.k.get_device() != layout.device || block.v.get_device() != layout.device)
+            block.k.scalar_type() != dtype || !on_device(block.k, layout.device) ||
+            !on_device(block.v, layout.device))
             throw CudaSessionStateError("Qwen MTP session KV topology changed");
     }
     return {std::vector<tyloi::state::KvView>(kv_.size()), saved.cache_pos};
@@ -117,7 +125,7 @@ void MtpState::stage(Restore& restore, const MtpSessionState& saved) const {
     const auto& blocks = std::get<std::vector<KvSnapshot>>(saved.payload);
     for (size_t index = 0; index < restore.kv.size(); ++index) {
         const auto& layout = layout_[index];
-        MfqCudaGuard guard(layout.device);
+        tyloi::ops::DeviceScope guard(layout.device);
         restore_kv(restore.kv[index], blocks[index], layout.head_dim,
             layout.dtype, layout.quantization);
     }

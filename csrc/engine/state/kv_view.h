@@ -6,8 +6,20 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <stdexcept>
 
 namespace tyloi::state {
+
+// Packed TurboQuant rows hold one FP32 norm and indices for the padded rotation width.
+inline int kv_packed_width(int dimension, int bits) {
+    if (bits < 2 || bits > 8)
+        throw std::runtime_error("invalid TurboQuant component bits");
+    if (dimension <= 0 || dimension > 1024)
+        throw std::runtime_error("unsupported TurboQuant KV head dimension");
+    int width = 1;
+    while (width < dimension) width *= 2;
+    return 1 + (width * bits + 31) / 32;
+}
 
 struct KvQuantization {
     double bits = 0;

@@ -1,9 +1,9 @@
 #include "engine/models/qwen35/state.h"
-#include "engine/backends/cuda/kernels/mfq_cuda_kv_quantization.h"
 #include "engine/models/session/snapshot.h"
 
 #include "engine/models/qwen35/model.h"
 #include "engine/models/input.h"
+#include "engine/ops.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -26,8 +26,7 @@ bool projected(const ::tyloi::models::LinearInputs& value) {
 }
 
 bool on_layer_device(const ::tyloi::Tensor& tensor, const Layout& layer) {
-    return layer.cpu ? tensor.is_cpu()
-                     : tensor.is_cuda() && tensor.get_device() == layer.device;
+    return layer.device.is_cpu() ? tensor.is_cpu() : tensor.device() == layer.device;
 }
 
 bool full_layout(const State& state) {
@@ -83,12 +82,12 @@ void validate_full_snapshot(const Layout& model_layer, const FullLayout& layer,
           state.v.size(1) == layer.kv_heads))
         throw CudaSessionStateError("Qwen full-attention session topology changed");
     const auto key_width = quantized
-                               ? cuda_kv_packed_width(static_cast<int>(layer.head_dim),
-                                                       layer.quantization.key_bits())
+                               ? tyloi::state::kv_packed_width(static_cast<int>(layer.head_dim),
+                                                               layer.quantization.key_bits())
                                : layer.head_dim;
     const auto value_width = quantized
-                                 ? cuda_kv_packed_width(static_cast<int>(layer.head_dim),
-                                                         layer.quantization.value_bits())
+                                 ? tyloi::state::kv_packed_width(static_cast<int>(layer.head_dim),
+                                                                 layer.quantization.value_bits())
                                  : layer.head_dim;
     if (state.k.size(3) != key_width || state.v.size(3) != value_width)
         throw CudaSessionStateError("Qwen full-attention session quantization changed");
@@ -123,7 +122,6 @@ State::State(const Model& model, bool transposed)
     for (const auto& layer : model.layers) {
         if (const auto* full = std::get_if<Full>(&layer.weights)) {
             layout_.push_back({layer.device,
-                               layer.cpu,
                                FullLayout{full->attention.kv_heads,
                                           full->attention.attention_head_dim,
                                           full->attention.sliding,
@@ -138,7 +136,6 @@ State::State(const Model& model, bool transposed)
             const auto* linear = std::get_if<Linear>(&layer.weights);
             require_state(linear != nullptr, "Qwen3.5 layer weight kind mismatch");
             layout_.push_back({layer.device,
-                               layer.cpu,
                                LinearLayout{linear->attention.key_heads,
                                             linear->attention.key_dim,
                                             linear->attention.value_heads,
@@ -153,13 +150,13 @@ void State::preallocate() {
     for (std::size_t index = 0; index < layout_.size(); ++index) {
         const auto& layer = layout_[index];
         const auto* full = std::get_if<FullLayout>(&layer.attention);
-        if (layer.cpu || full == nullptr) continue;
+        if (layer.device.is_cpu() || full == nullptr) continue;
         auto& cache = std::get<tyloi::state::KvView>(layers[index]);
         if (cache.defined()) continue;
-        MfqCudaGuard guard(layer.device);
+        tyloi::ops::DeviceScope guard(layer.device);
         cache = tyloi::state::allocate_kv(
             1, full->kv_heads, full->capacity, full->head_dim, full->sliding,
-            ::tyloi::Device(::tyloi::kCUDA, layer.device), full->dtype,
+            layer.device, full->dtype,
             full->quantization);
     }
 }
@@ -169,8 +166,8 @@ std::vector<std::pair<tyloi::Device, std::size_t>> State::preallocate_growth() c
     for (std::size_t i = 0; i < layout_.size(); ++i) {
         const auto& layer = layout_[i];
         const auto* full = std::get_if<FullLayout>(&layer.attention);
-        if (layer.cpu || !full || std::get<tyloi::state::KvView>(layers[i]).defined()) continue;
-        const tyloi::Device device(tyloi::kCUDA, layer.device);
+        if (layer.device.is_cpu() || !full || std::get<tyloi::state::KvView>(layers[i]).defined()) continue;
+        const tyloi::Device device = layer.device;
         const auto bytes = tyloi::state::kv_bytes(1, full->kv_heads, full->capacity,
             full->head_dim, full->sliding, full->dtype, full->quantization);
         auto it = std::find_if(result.begin(), result.end(), [device](const auto& v) { return v.first == device; });
@@ -211,7 +208,7 @@ std::vector<std::pair<tyloi::Device, std::size_t>> State::growth(
     };
     for (std::size_t i = 0; i < layers.size(); ++i) {
         const auto& layout = layout_[i];
-        const tyloi::Device device(layout.cpu ? tyloi::kCPU : tyloi::kCUDA, layout.cpu ? -1 : layout.device);
+        const tyloi::Device device = layout.device;
         if (const auto* full = std::get_if<FullLayout>(&layout.attention)) {
             const auto& cache = std::get<tyloi::state::KvView>(layers[i]);
             if (input.confirmed > 0 && full->sliding)
@@ -229,7 +226,7 @@ std::vector<std::pair<tyloi::Device, std::size_t>> State::growth(
             const auto& linear = std::get<LinearLayout>(layout.attention);
             const auto& state = std::get<LinearState>(layers[i]);
             if (state.mixer.pending() || projected(state.projected) ||
-                (input.confirmed > 0 && (layout.cpu || !state.mixer.defined())))
+                (input.confirmed > 0 && (layout.device.is_cpu() || !state.mixer.defined())))
                 throw std::invalid_argument("invalid Qwen3.5 recurrent state");
             if (linear.key_heads <= 0 || linear.key_dim <= 0 || linear.value_heads <= 0 ||
                 linear.value_dim <= 0 || linear.conv_kernel <= 0)
@@ -260,7 +257,7 @@ void State::reset(std::int64_t new_batch) {
     speculative_confirmed = 0;
     batch = new_batch;
     for (std::size_t index = 0; index < layers.size(); ++index) {
-        MfqCudaGuard guard(layout_[index].device);
+        tyloi::ops::DeviceScope guard(layout_[index].device);
         auto& state = layers[index];
         if (auto* cache = std::get_if<tyloi::state::KvView>(&state)) {
             if (cache->defined() && cache->batch != new_batch) *cache = {};
@@ -275,7 +272,7 @@ void State::reset(std::int64_t new_batch) {
 void State::commit_speculative() {
     require_state(speculative_start >= 0, "no speculative transaction");
     for (std::size_t index = 0; index < layers.size(); ++index) {
-        MfqCudaGuard guard(layout_[index].device);
+        tyloi::ops::DeviceScope guard(layout_[index].device);
         if (auto* linear = std::get_if<LinearState>(&layers[index])) {
             linear->projected = {};
             linear->mixer.commit();
@@ -292,7 +289,7 @@ std::int64_t State::rewind(std::int64_t accepted_suffix) {
     for (std::size_t index = 0; index < layers.size(); ++index) {
         auto* linear = std::get_if<LinearState>(&layers[index]);
         if (linear == nullptr) continue;
-        MfqCudaGuard guard(layout_[index].device);
+        tyloi::ops::DeviceScope guard(layout_[index].device);
         linear->mixer.rewind(keep);
     }
     return keep;
@@ -304,7 +301,7 @@ void State::abort_speculative() noexcept {
         auto* linear = std::get_if<LinearState>(&layers[index]);
         if (linear == nullptr) continue;
         try {
-            MfqCudaGuard guard(layout_[index].device);
+            tyloi::ops::DeviceScope guard(layout_[index].device);
             linear->mixer.abort();
         } catch (...) {
         }
@@ -391,7 +388,7 @@ TextSessionState State::capture_text_session_state(
             const auto& full = std::get<FullLayout>(layout.attention);
             const auto& cache = std::get<tyloi::state::KvView>(layers[index]);
             validate_cache_configuration(full, cache);
-            MfqCudaGuard guard(layout.device);
+            tyloi::ops::DeviceScope guard(layout.device);
             auto saved = capture_kv(cache, cache_pos, state.bytes);
             validate_full_snapshot(layout, full, saved);
             validate_full_snapshot_length(saved, cache_pos);
@@ -405,7 +402,7 @@ TextSessionState State::capture_text_session_state(
     saved_layers.reserve(layout_.size());
     for (std::size_t index = 0; index < layout_.size(); ++index) {
         const auto& layout = layout_[index];
-        MfqCudaGuard guard(layout.device);
+        tyloi::ops::DeviceScope guard(layout.device);
         HybridBlockSessionState saved;
         if (const auto* full = std::get_if<FullLayout>(&layout.attention)) {
             const auto& cache = std::get<tyloi::state::KvView>(layers[index]);
@@ -420,7 +417,7 @@ TextSessionState State::capture_text_session_state(
                           "Qwen recurrent session state has a pending speculative pass");
             const auto snapshot = linear.mixer.snapshot();
             validate_linear_snapshot(layout, std::get<LinearLayout>(layout.attention), snapshot,
-                                     !layout.cpu && transposed_);
+                                     !layout.device.is_cpu() && transposed_);
             saved.kind = HybridBlockSessionStateKind::Recurrent;
             saved.convolution = snapshot.convolution;
             saved.recurrent = snapshot.recurrent;
@@ -473,7 +470,7 @@ State::Restore State::prepare(const TextSessionState& state) const {
                 validate_linear_snapshot(layout, std::get<LinearLayout>(layout.attention),
                                          tyloi::state::Recurrent::State{
                                              saved.convolution, saved.recurrent, saved.transposed},
-                                         !layout.cpu && transposed_);
+                                         !layout.device.is_cpu() && transposed_);
             }
         }
     }
@@ -496,7 +493,7 @@ void State::stage(Restore& restore, const TextSessionState& state) const {
                                     : nullptr;
     for (std::size_t index = 0; index < layout_.size(); ++index) {
         const auto& layout = layout_[index];
-        MfqCudaGuard guard(layout.device);
+        tyloi::ops::DeviceScope guard(layout.device);
         if (const auto* full = std::get_if<FullLayout>(&layout.attention)) {
             const auto& saved = full_layers != nullptr
                                     ? full_layers->at(index)
