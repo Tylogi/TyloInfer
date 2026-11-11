@@ -56,7 +56,7 @@ void Engine::install(std::unique_ptr<tyloi::Executor::Graph> graph) {
         auto scope = executor_->enter();
         tyloi::weights::LoadScope memory_load(*ledger_);
         graph_.emplace(model_info_.max_context, config_.device, std::move(graph));
-        budget_.emplace(*ledger_, *weights_, *cache_, config_.device);
+        budget_.emplace(*executor_, *ledger_, *weights_, *cache_, config_.device);
         budget_->bind(false);
         if (const auto bytes = config_.resident_budget_bytes) {
             engine::SessionCommand command; command.kind = engine::SessionCommand::Kind::memory_budget; command.bytes = bytes;

@@ -1,7 +1,8 @@
 #include "engine/budget.h"
 
-#include "engine/backends/cuda/native/context.h"
-#include "engine/backends/cuda/native/tensor/backend.h"
+#ifndef TYLOINFER_NATIVE_CUDA
+#include "engine/backends/cuda/executor/executor.h"
+#endif
 #include "engine/generation/prefill_budget.h"
 #include "engine/state/session/sessions.h"
 #include "engine/requests/processor.h"
@@ -16,58 +17,63 @@
 #include <utility>
 
 namespace tyloi::engine {
-using namespace tyloi::cuda;
-
 static void require_cuda_device(Device device) {
     if (!device.is_cuda() || device.index < 0)
         throw std::invalid_argument("budget requires a CUDA device");
 }
 
-Budget::Budget(::tyloi::weights::Memory& weight_memory, ::tyloi::weights::Cache& weights,
+#ifdef TYLOINFER_NATIVE_CUDA
+Budget::Budget(::tyloi::Executor& executor,
+#else
+Budget::Budget(::tyloi::cuda::Executor& executor,
+#endif
+        ::tyloi::weights::Memory& weight_memory, ::tyloi::weights::Cache& weights,
         state::Sessions& cache, Device primary)
-    : weight_memory_(weight_memory), weights_(weights), cache_(cache),
-      primary_device_(primary.index), initial_expert_budget_(weights.budget()) {
+    : executor_(executor), weight_memory_(weight_memory), weights_(weights), cache_(cache),
+      primary_(primary), initial_expert_budget_(weights.budget()) {
     require_cuda_device(primary);
-    allocation_ceiling_ = default_context(primary_device_)->memory_stats().limit;
+    allocation_ceiling_ = memory(primary_).limit;
 }
 
 Budget::~Budget() { unbind(); }
 
 void Budget::bind(bool predictor) {
-    weights_.bind(*this, Device(kCUDA, primary_device_), predictor);
+    weights_.bind(*this, primary_, predictor);
 }
 
 void Budget::unbind() noexcept {
     weights_.unbind();
 }
 
+::tyloi::Executor::Memory Budget::memory(Device device) const {
+    return executor_.memory({&device, 1}).front();
+}
+
 void Budget::reclaim(std::size_t bytes) {
-    auto context=default_context(primary_device_);
-    const auto available=context->available_memory();
+    const auto available=memory(primary_).allocatable;
     if(available>=bytes)return;
     weights_.release_workspace(bytes, "workspace");
-    if(context->available_memory()>=bytes)return;
-    const auto released=trim_prefix(bytes, primary_device_);
-    context->reclaim_idle_memory();
+    if(memory(primary_).allocatable>=bytes)return;
+    const auto released=trim_prefix(bytes, primary_);
+    executor_.reclaim(primary_);
     if(released)std::cerr<<"runtime_workspace_reclaim requested_bytes="<<bytes
-        <<" available_bytes="<<context->available_memory()<<" prefix_released_bytes="<<released<<'\n';
+        <<" available_bytes="<<memory(primary_).allocatable<<" prefix_released_bytes="<<released<<'\n';
 }
 
 void Budget::reclaim_kv(Device device, std::size_t bytes) {
     require_cuda_device(device);
-    auto context = default_context(device.index);
-    if (context->available_memory() >= bytes) return;
-    if (device.index == primary_device_) {
+    if (memory(device).allocatable >= bytes) return;
+    if (device == primary_) {
         weights_.release_workspace(bytes, "kv_growth");
-        if (context->available_memory() >= bytes) return;
-        trim_prefix(bytes, primary_device_);
+        if (memory(device).allocatable >= bytes) return;
+        trim_prefix(bytes, primary_);
     }
-    context->reclaim_idle_memory();
+    executor_.reclaim(device);
 }
 
 void Budget::reserve_kv(Device device, std::size_t bytes) {
     reclaim_kv(device, bytes);
-    if (default_context(device.index)->available_memory() < bytes)
+    if (memory(device).allocatable < bytes)
         throw engine::InferenceInputError(engine::InferenceInputErrorCode::ContextLength,
             "insufficient VRAM for context growth; reduce concurrent requests or prompt length");
 }
@@ -77,33 +83,32 @@ void Budget::reserve_ram(std::size_t bytes) {
     weights_.reserve(bytes);
 }
 
-std::size_t Budget::trim_prefix(std::size_t bytes, int device) {
-    const auto context=default_context(device);
+std::size_t Budget::trim_prefix(std::size_t bytes, Device device) {
     std::size_t hot=0;
     for(const auto& [name,value]:cache_.metrics())
         if(name=="prefix_cache_hot_bytes")hot=std::size_t(value);
-    const auto shortage=bytes-context->available_memory();
+    const auto available=memory(device).allocatable;
+    const auto shortage=bytes>available?bytes-available:0;
     return cache_.trim_hot(hot>shortage?hot-shortage:0);
 }
 
 void Budget::workspace(Device device, std::size_t bytes) {
     require_cuda_device(device);
     weights_.workspace(bytes);
-    const auto context=default_context(device.index);
-    if(context->available_memory()>=bytes)return;
-    const auto released=trim_prefix(bytes, device.index);
-    context->reclaim_idle_memory();
+    if(memory(device).allocatable>=bytes)return;
+    const auto released=trim_prefix(bytes, device);
+    executor_.reclaim(device);
     std::cerr<<"runtime_workspace_budget requested_bytes="<<bytes
-        <<" available_bytes="<<context->available_memory()<<" prefix_released_bytes="<<released<<'\n';
+        <<" available_bytes="<<memory(device).allocatable<<" prefix_released_bytes="<<released<<'\n';
 }
 
 PrefillChunk Budget::batch(Device device, std::size_t row_bytes, PrefillChunk chunk,
         std::size_t growth) {
     require_cuda_device(device);
-    const auto context=default_context(device.index);
+    const auto resources=memory(device);
     const auto transfer=weights_.prefill_budget(false).transfer_bytes;
     const auto fixed=engine::prefill_budget_add((std::size_t(1)<<30)+growth,transfer);
-    const auto available=context->available_memory()+context->workspace_available();
+    const auto available=resources.allocatable+resources.workspace;
     const auto selected=engine::select_prefill_chunk(chunk.count,chunk.count,available,fixed,row_bytes);
     if(!selected)throw engine::InferenceInputError(
         engine::InferenceInputErrorCode::ContextLength,
@@ -115,7 +120,7 @@ PrefillChunk Budget::batch(Device device, std::size_t row_bytes, PrefillChunk ch
 void Budget::request(Device device, bool retire_decode) {
     require_cuda_device(device);
     weights_.request(retire_decode);
-    default_context(device.index)->reclaim_idle_memory();
+    executor_.reclaim(device);
 }
 
 void Budget::prepare_prefill(Device device, std::size_t tokens, std::int64_t limit,
@@ -127,8 +132,8 @@ void Budget::prepare_prefill(Device device, std::size_t tokens, std::int64_t lim
 
 std::int64_t Budget::prefill(std::size_t tokens, std::int64_t limit,
         std::size_t row_bytes, bool resumed, bool automatic) {
-    prepare_prefill(Device(kCUDA, primary_device_), tokens, limit, weights_.prefill_mode(tokens, resumed));
-    return chunk(Device(kCUDA, primary_device_), tokens, limit, row_bytes, resumed, automatic);
+    prepare_prefill(primary_, tokens, limit, weights_.prefill_mode(tokens, resumed));
+    return chunk(primary_, tokens, limit, row_bytes, resumed, automatic);
 }
 
 std::int64_t Budget::chunk(Device device, std::size_t tokens, std::int64_t limit,
@@ -139,8 +144,8 @@ std::int64_t Budget::chunk(Device device, std::size_t tokens, std::int64_t limit
     if (tokens <= 128) return std::min<int64_t>(std::max<std::size_t>(1, tokens), limit);
 
     auto budget = weights_.prefill_budget(allow_borrow);
-    auto context = default_context(device.index);
-    auto available = engine::prefill_budget_add(engine::prefill_budget_add(context->available_memory(), context->workspace_available()), budget.lendable_bytes);
+    auto resources = memory(device);
+    auto available = engine::prefill_budget_add(engine::prefill_budget_add(resources.allocatable, resources.workspace), budget.lendable_bytes);
     const auto sequence_bytes = allow_borrow
         ? std::size_t(tokens <= 16384 ? tokens : std::min<std::size_t>(tokens, limit)) * row_bytes * 3 / 8 : 0;
     const auto fixed = engine::prefill_budget_add(budget.reserve_bytes + sequence_bytes, budget.transfer_bytes);
@@ -149,7 +154,8 @@ std::int64_t Budget::chunk(Device device, std::size_t tokens, std::int64_t limit
     if (required > available) {
         workspace(device, required > budget.lendable_bytes ? required - budget.lendable_bytes : 0);
         budget = weights_.prefill_budget(allow_borrow);
-        available = engine::prefill_budget_add(context->available_memory() + context->workspace_available(), budget.lendable_bytes);
+        resources = memory(device);
+        available = engine::prefill_budget_add(resources.allocatable + resources.workspace, budget.lendable_bytes);
     }
     const auto chunk_size = engine::select_prefill_chunk(tokens, limit, available, fixed, row_bytes);
     if (!chunk_size) throw engine::InferenceInputError(engine::InferenceInputErrorCode::ContextLength,
@@ -172,7 +178,7 @@ bool Budget::snapshot(Device device, std::size_t bytes, std::size_t peak) {
     if (hot > target) cache_.trim_hot(target);
     const auto needed = peak + (std::size_t(64) << 20);
     workspace(device, needed);
-    const auto available = default_context(device.index)->available_memory();
+    const auto available = memory(device).allocatable;
     if (available < needed) {
         std::cerr << "runtime_session_cache action=skip reason=workspace_pressure"
             << " requested_bytes=" << needed << " available_bytes=" << available << '\n';
@@ -187,7 +193,7 @@ Budget::Change Budget::change(const engine::SessionCommand& command) {
 
 Budget::Change::Change(Budget& budget, const engine::SessionCommand& command)
     : budget_(budget), bytes(command.bytes) {
-    const auto context = default_context(budget.primary_device_);
+    const auto resources = budget.memory(budget.primary_);
     dense = budget.weight_memory_.resident_bytes();
     minimum = budget.weights_.minimum();
     requested_weights = command.weight_bytes.value_or(budget.weight_budget_);
@@ -198,34 +204,33 @@ Budget::Change::Change(Budget& budget, const engine::SessionCommand& command)
             : command.bytes
         : budget.allocation_ceiling_;
     if (limit) {
-        std::size_t free = 0, total = 0;
-        TYLOINFER_CUDA_CHECK(cudaMemGetInfo(&free, &total));
-        limit = std::min(limit, std::min(total, free + context->resident_memory_usage()));
+        limit = std::min(limit, std::min(resources.total, resources.available + resources.resident));
     }
     if (limit && limit < dense + minimum)
         throw std::invalid_argument("resident memory budget is below non-offloadable weights");
-    previous_limit = context->memory_stats().limit;
+    previous_limit = resources.limit;
     previous_experts = budget.weights_.budget();
-    before = context->resident_memory_usage();
+    before = resources.resident;
 }
 
 engine::SessionResult Budget::Change::apply() {
     auto& weights_ = budget_.weights_;
     auto& cache_ = budget_.cache_;
-    const auto context = default_context(budget_.primary_device_);
+    auto& executor = budget_.executor_;
+    const auto device = budget_.primary_;
     weights_.retire_decode();
-    context->reclaim_idle_memory();
+    executor.reclaim(device);
     auto target = requested_weights ? requested_weights - dense : budget_.initial_expert_budget_;
     std::size_t hot = 0, expert_bytes = 0;
     for (const auto& [name, value] : cache_.metrics())
         if (name == "prefix_cache_hot_bytes") hot = std::size_t(value);
     for (const auto& [name, value] : weights_.metrics())
         if (name == "resident_expert_cache_bytes") expert_bytes = std::size_t(value);
-    auto used = context->resident_memory_usage();
+    auto used = budget_.memory(device).resident;
     if (limit && used > limit) {
         cache_.trim_hot(hot > used - limit ? hot - (used - limit) : 0);
-        context->reclaim_idle_memory();
-        used = context->resident_memory_usage();
+        executor.reclaim(device);
+        used = budget_.memory(device).resident;
     }
     const auto fixed = used > expert_bytes ? used - expert_bytes : 0;
     if (limit) {
@@ -234,18 +239,18 @@ engine::SessionResult Budget::Change::apply() {
         target = std::min(target, limit - fixed);
     }
     try {
-        if (!limit || limit > previous_limit) context->set_memory_limit(limit);
+        if (!limit || limit > previous_limit) executor.set_memory_limit(device, limit);
         weights_.resize(std::max(target, minimum));
-        context->set_memory_limit(limit);
+        executor.set_memory_limit(device, limit);
     } catch (...) {
-        context->set_memory_limit(0);
+        executor.set_memory_limit(device, 0);
         weights_.resize(previous_experts);
-        context->set_memory_limit(previous_limit);
+        executor.set_memory_limit(device, previous_limit);
         throw;
     }
     budget_.resident_budget_ = bytes;
     budget_.weight_budget_ = requested_weights;
-    const auto after = context->resident_memory_usage();
+    const auto after = budget_.memory(device).resident;
     return {before > after ? before - after : 0, {}};
 }
 

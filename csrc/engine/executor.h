@@ -12,7 +12,10 @@ class Executor {
 public:
     struct Memory {
         Device device;
+        // Allocator accounting, followed by device physical free and total bytes.
         std::size_t allocated, reserved, available, total;
+        // Process limit (0 means unlimited), charged residency, allocatable bytes and reusable workspace.
+        std::size_t limit = 0, resident = 0, allocatable = 0, workspace = 0;
     };
 
     class Scope {
@@ -59,8 +62,11 @@ public:
     virtual std::unique_ptr<Timer> timer() = 0;
     virtual std::unique_ptr<Profile> profile(const char* name) = 0;
     virtual std::unique_ptr<Graph> graph() = 0;
-    // Query allocator and physical byte snapshots for the requested devices within this executor's scope.
+    // Query within this executor's scope; one snapshot per requested device, in the same order.
     virtual std::vector<Memory> memory(std::span<const Device> devices) const = 0;
+    // Call within this executor's scope; stop submissions before changing a limit.
+    virtual void reclaim(Device device) = 0;
+    virtual void set_memory_limit(Device device, std::size_t bytes) = 0;
     // Stop concurrent submissions and call within this executor's scope.
     // Wait for executor work; owners coordinate weights and offload separately.
     virtual void drain() = 0;

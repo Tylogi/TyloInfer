@@ -145,7 +145,8 @@ struct Text {
                 state.supports_text_session_state(), state.supports_text_session_state() ? 0 : 1,
                 cuda_has_separate_memory()) {
         try {
-        budget.emplace(*weight_memory, weights, cache,
+        auto scope = executor->enter();
+        budget.emplace(*executor, *weight_memory, weights, cache,
             tyloi::Device(tyloi::kCUDA, execution->config.layer_placement.primary_device()));
         if (offload) offload->bind_budget(&*budget);
         if (config.continuous_batch.max_sequences) {
@@ -260,7 +261,7 @@ struct Text {
             return tyloi::engine::resource_metrics(component_values,profile_metrics,std::move(memory),streamed_kv,
                 batch_metrics,kv_metrics,offload_metrics,predictor_metrics,source.get(),
                 *weight_memory,weights,cache,*budget,
-                execution->executor().memory(cuda_devices(execution->config)),
+                executor->memory(cuda_devices(execution->config)),
                 tyloi::Device(tyloi::kCUDA, execution->config.layer_placement.primary_device()),
                 execution->config.layer_placement.devices.size() <= 1 &&
                     !execution->config.tensor_parallel.enabled() && !execution->config.expert_parallel.enabled());

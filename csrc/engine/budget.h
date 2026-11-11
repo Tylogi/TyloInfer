@@ -1,7 +1,7 @@
 #pragma once
 
 #include "engine/requests/policy.h"
-#include "engine/tensor.h"
+#include "engine/executor.h"
 #include "engine/weights/cache.h"
 
 #include <cstddef>
@@ -9,13 +9,21 @@
 
 namespace tyloi::state { class Sessions; }
 namespace tyloi::weights { class Memory; }
+#ifndef TYLOINFER_NATIVE_CUDA
+namespace tyloi::cuda { class Executor; }
+#endif
 namespace tyloi::engine {
 struct SessionCommand;
 struct SessionResult;
 
 class Budget {
 public:
-    Budget(::tyloi::weights::Memory& weight_memory, ::tyloi::weights::Cache& weights,
+#ifdef TYLOINFER_NATIVE_CUDA
+    Budget(::tyloi::Executor& executor,
+#else
+    Budget(::tyloi::cuda::Executor& executor,
+#endif
+        ::tyloi::weights::Memory& weight_memory, ::tyloi::weights::Cache& weights,
         state::Sessions& cache, Device primary);
     ~Budget();
     Budget(const Budget&) = delete;
@@ -39,7 +47,7 @@ public:
         std::size_t previous_limit, previous_experts, before;
     };
 
-    // Create to validate, then retire State and apply once in the same quiescent owner CUDA scope.
+    // Create to validate, then retire State and apply once in the same quiescent owner scope.
     // Budget must outlive Change.
     Change change(const engine::SessionCommand& command);
 
@@ -63,11 +71,17 @@ public:
     bool snapshot(Device device, std::size_t bytes, std::size_t peak);
 
 private:
-    std::size_t trim_prefix(std::size_t bytes, int device);
+    ::tyloi::Executor::Memory memory(Device device) const;
+    std::size_t trim_prefix(std::size_t bytes, Device device);
+#ifdef TYLOINFER_NATIVE_CUDA
+    ::tyloi::Executor& executor_;
+#else
+    ::tyloi::cuda::Executor& executor_;
+#endif
     ::tyloi::weights::Memory& weight_memory_;
     ::tyloi::weights::Cache& weights_;
     state::Sessions& cache_;
-    int primary_device_;
+    Device primary_;
     std::size_t resident_budget_ = 0;
     std::size_t weight_budget_ = 0;
     std::size_t initial_expert_budget_ = 0;

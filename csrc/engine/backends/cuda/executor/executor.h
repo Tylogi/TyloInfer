@@ -36,6 +36,8 @@ public:
     std::unique_ptr<tyloi::Executor::Profile> profile(const char* name) override;
     std::unique_ptr<tyloi::Executor::Graph> graph() override;
     std::vector<tyloi::Executor::Memory> memory(std::span<const tyloi::Device> devices) const override;
+    void reclaim(tyloi::Device device) override;
+    void set_memory_limit(tyloi::Device device, std::size_t bytes) override;
     void drain() override;
     void clear() override;
     // Set the default device during loading, before publication or concurrent submissions.
@@ -43,6 +45,8 @@ public:
 #else
     std::unique_ptr<tyloi::Executor::Scope> enter();
     std::vector<tyloi::Executor::Memory> memory(std::span<const tyloi::Device> devices) const;
+    void reclaim(tyloi::Device device);
+    void set_memory_limit(tyloi::Device device, std::size_t bytes);
 #endif
     std::unique_ptr<tyloi::Executor::Scope> enter(int device);
     void reset();
