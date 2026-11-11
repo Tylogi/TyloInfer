@@ -123,7 +123,7 @@ struct Model : tyloi::models::CausalModel {
                                  const tyloi::models::ForwardOptions& options = {}) const override;
 
     // ---- speculative contract used by the MTP sequence
-    bool supports_speculation() const noexcept { return true; }
+    bool supports_speculation() const noexcept override { return true; }
     bool supports_suffix_speculation() const noexcept override { return true; }
     bool prefetch_token_rows(State& state, const ::tyloi::Tensor& ids);
 

@@ -674,11 +674,16 @@ template <class Model, class State, class Predictor> struct RequestOps {
     }
     Generation speculate(tyloi::engine::InferenceRequest &input, tyloi::engine::InferenceOutput &output,
         size_t reused, const ::tyloi::Tensor& restored, Hidden *committed) {
-        if constexpr (has_forward<Model, State> && !requires {
-            replay(model, state, *executor, int64_t{});
-        }) {
-            throw std::invalid_argument("this CUDA model has no speculative predictor");
-        } else {
+        if constexpr (
+#ifdef TYLOINFER_NATIVE_CUDA
+            (causal<Model> && std::is_base_of_v<tyloi::models::State, State>) ||
+#endif
+            requires { replay(model, state, *executor, int64_t{}); }) {
+#ifdef TYLOINFER_NATIVE_CUDA
+            if constexpr (causal<Model>)
+                if (!static_cast<const tyloi::models::CausalModel&>(model).supports_speculation())
+                    throw std::invalid_argument("this CUDA model has no speculative predictor");
+#endif
             prepare_prefill_workspace(input.prompt.size()-reused);
             return ::run_mtp_generation(model, state, executor, collectives,
                 mode, weights, info, source,
@@ -690,7 +695,7 @@ template <class Model, class State, class Predictor> struct RequestOps {
                 reused,
                 restored,
                 committed,prefix_boundary,&budget);
-        }
+        } else throw std::invalid_argument("this CUDA model has no speculative predictor");
     }
 };
 
