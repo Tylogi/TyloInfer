@@ -28,7 +28,8 @@ public:
     void capture_begin_shared();
     void capture_end();
     void replay();
-    void reset() noexcept;
+    void abort_capture();
+    void reset();
     bool valid() const noexcept { return executable_ != nullptr; }
     cudaGraphExec_t native_executable() const noexcept { return executable_; }
     std::size_t nodes() const;

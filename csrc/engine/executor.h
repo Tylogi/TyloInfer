@@ -41,6 +41,8 @@ public:
     // The parent Executor outlives Graph; do not keep its Scope across suspension.
     // Invalidate before prepare, restore after each warmup, then begin and end capture.
     // end retains backend scratch; matches compares it along with the supplied owners.
+    // invalidate waits for all consumers before releasing owners; failure retains them.
+    // A backend must not release unproven in-flight owners during destruction.
     class Graph {
     public:
         virtual ~Graph() = default;

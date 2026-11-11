@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <exception>
 #include <iostream>
 #include <unordered_set>
 #include <utility>
@@ -23,7 +24,14 @@ GraphWarmupScope::~GraphWarmupScope() {
 }
 
 Graph::~Graph() noexcept {
-    reset();
+    try { reset(); }
+    catch (const std::exception& error) {
+        std::cerr << "runtime_graph_retirement error=" << error.what() << std::endl;
+        std::terminate();
+    } catch (...) {
+        std::cerr << "runtime_graph_retirement error=unknown" << std::endl;
+        std::terminate();
+    }
 }
 
 Graph::Graph(Graph&& other) noexcept
@@ -38,7 +46,14 @@ Graph::Graph(Graph&& other) noexcept
 
 Graph& Graph::operator=(Graph&& other) noexcept {
     if (this != &other) {
-        reset();
+        try { reset(); }
+        catch (const std::exception& error) {
+            std::cerr << "runtime_graph_retirement error=" << error.what() << std::endl;
+            std::terminate();
+        } catch (...) {
+            std::cerr << "runtime_graph_retirement error=unknown" << std::endl;
+            std::terminate();
+        }
         device_ = other.device_;
         stream_ = std::move(other.stream_);
         context_ = std::move(other.context_);
@@ -76,10 +91,12 @@ void Graph::prepare_memory(
             throw Error(
                 "CUDA graph participant does not support async allocations");
         }
+        pool_streams_.reserve(pool_streams_.size() + 1);
+        pool_contexts_.reserve(pool_contexts_.size() + 1);
         participant_context->begin_graph_pool(candidate.stream());
-        participant_context->begin_graph_warmup(candidate.stream());
         pool_streams_.push_back(candidate);
-        pool_contexts_.push_back(std::move(participant_context));
+        pool_contexts_.push_back(participant_context);
+        participant_context->begin_graph_warmup(candidate.stream());
     };
     try {
         add_pool(stream_);
@@ -250,41 +267,49 @@ void Graph::replay() {
     TYLOINFER_NATIVE_CUDA_CHECK(cudaGraphLaunch(executable_, stream_.stream()));
 }
 
-void Graph::reset() noexcept {
-    on_device_noexcept(device_, [&] {
-        if (stream_) {
-            cudaStreamCaptureStatus capture_status =
-                cudaStreamCaptureStatusNone;
-            if (cudaStreamIsCapturing(
-                    stream_.stream(), &capture_status) == cudaSuccess &&
-                    capture_status != cudaStreamCaptureStatusNone) {
-                cudaGraph_t abandoned = nullptr;
-                if (cudaStreamEndCapture(
-                        stream_.stream(), &abandoned) == cudaSuccess &&
-                        abandoned != nullptr) {
-                    (void)cudaGraphDestroy(abandoned);
-                } else {
-                    (void)cudaGetLastError();
-                }
-            }
-            (void)cudaStreamSynchronize(stream_.stream());
-        }
-        if (executable_ != nullptr) {
-            (void)cudaGraphExecDestroy(executable_);
+void Graph::abort_capture() {
+    if (!stream_) return;
+    DeviceGuard guard(device_);
+    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+    TYLOINFER_NATIVE_CUDA_CHECK(cudaStreamIsCapturing(stream_.stream(), &status));
+    if (status != cudaStreamCaptureStatusNone) {
+        cudaGraph_t abandoned = nullptr;
+        const auto result = cudaStreamEndCapture(stream_.stream(), &abandoned);
+        if (abandoned) graph_ = abandoned;
+        TYLOINFER_NATIVE_CUDA_CHECK(result);
+    }
+}
+
+void Graph::reset() {
+    abort_capture();
+    std::exception_ptr failure;
+    const auto wait = [&](const StreamHandle& stream) {
+        if (!stream) return;
+        try {
+            DeviceGuard guard(stream.device_index());
+            TYLOINFER_NATIVE_CUDA_CHECK(cudaStreamSynchronize(stream.stream()));
+        } catch (...) { if (!failure) failure = std::current_exception(); }
+    };
+    wait(stream_);
+    for (const auto& stream : pool_streams_)
+        if (stream.device_index() != stream_.device_index() || stream.stream() != stream_.stream()) wait(stream);
+    if (failure) std::rethrow_exception(failure);
+    if (stream_ || executable_ || graph_ || !pool_streams_.empty()) {
+        DeviceGuard guard(device_);
+        if (executable_) {
+            TYLOINFER_NATIVE_CUDA_CHECK(cudaGraphExecDestroy(executable_));
             executable_ = nullptr;
         }
-        if (graph_ != nullptr) {
-            (void)cudaGraphDestroy(graph_);
+        if (graph_) {
+            TYLOINFER_NATIVE_CUDA_CHECK(cudaGraphDestroy(graph_));
             graph_ = nullptr;
         }
         for (std::size_t index = 0; index < pool_streams_.size(); ++index) {
-            pool_contexts_[index]->end_graph_capture(
-                pool_streams_[index].stream());
-            pool_contexts_[index]->end_graph_pool(
-                pool_streams_[index].stream());
+            pool_contexts_[index]->end_graph_capture(pool_streams_[index].stream());
+            pool_contexts_[index]->end_graph_pool(pool_streams_[index].stream());
         }
         if (shared_pool_ && context_) context_->end_graph_capture(stream_.stream());
-    });
+    }
     pool_contexts_.clear();
     pool_streams_.clear();
     context_.reset();
