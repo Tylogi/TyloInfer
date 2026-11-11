@@ -29,8 +29,10 @@ MiniCPMO45Runtime MiniCPMO45Runtime::load(
     return {language,
 #ifndef TYLOINFER_NATIVE_CUDA
             language_executor,
-#endif
             execution,
+#else
+            placement.primary_device(),
+#endif
             MiniCPMO45VisionEncoder::load(weights),
             MiniCPMO45Resampler::load(weights),
             MiniCPMO45AudioEncoder::load(weights),
@@ -231,7 +233,11 @@ void Components::start(const MfqDuplexSessionParams& parameters) {
         }
 
         MfqCudaGuard guard(
+#ifdef TYLOINFER_NATIVE_CUDA
+            state_->runtime.primary);
+#else
             state_->runtime.execution.config.layer_placement.primary_device());
+#endif
         ::tyloi::cuda::manual_seed(static_cast<int64_t>(parameters.seed));
         mfq_cuda_manual_seed_all(parameters.seed);
         auto special_ids = MiniCPMO45DuplexSpecialIds::from_tensor(
@@ -294,7 +300,11 @@ MfqDuplexStepResult Components::step(const MfqDuplexStepInput& input) {
         }
 
         MfqCudaGuard guard(
+#ifdef TYLOINFER_NATIVE_CUDA
+            state_->runtime.primary);
+#else
             state_->runtime.execution.config.layer_placement.primary_device());
+#endif
         if (!state_->duplex_session) {
             throw std::runtime_error(
                 "MiniCPM-o duplex session is not prepared");
@@ -355,7 +365,11 @@ MfqDuplexStepResult Components::step(const MfqDuplexStepInput& input) {
 
 void Components::stop() {
         MfqCudaGuard guard(
+#ifdef TYLOINFER_NATIVE_CUDA
+            state_->runtime.primary);
+#else
             state_->runtime.execution.config.layer_placement.primary_device());
+#endif
         mfq_cuda_synchronize();
         state_->duplex_session.reset();
         mfq_cuda_synchronize();

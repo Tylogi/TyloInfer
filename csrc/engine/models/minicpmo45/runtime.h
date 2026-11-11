@@ -1,6 +1,11 @@
 #pragma once
 
+#ifdef TYLOINFER_NATIVE_CUDA
+#include "engine/backends/cuda/executor/executor.h"
+struct CudaExecutionContext;
+#else
 #include "engine/backends/cuda/executor/execution.h"
+#endif
 #include "text/forward.h"
 #include "audio.h"
 #include "tts.h"
@@ -20,8 +25,10 @@ struct MiniCPMO45Runtime {
     const tyloi::cuda::minicpmo45::text::Model& language;
 #ifndef TYLOINFER_NATIVE_CUDA
     tyloi::cuda::Executor& language_executor;
-#endif
     CudaExecutionContext& execution;
+#else
+    int primary;
+#endif
     MiniCPMO45VisionEncoder vision;
     MiniCPMO45Resampler resampler;
     MiniCPMO45AudioEncoder audio;
@@ -65,12 +72,12 @@ struct MiniCPMO45Runtime {
 #endif
         tyloi::models::require_model(input_ids.dim() == 2,
             "MiniCPM-o input_ids must have shape [batch,tokens]");
-        const auto primary = execution.config.layer_placement.primary_device();
 #ifdef TYLOINFER_NATIVE_CUDA
         input_ids = tyloi::ops::contiguous(tyloi::ops::cast(input_ids, ::tyloi::kInt64,
             ::tyloi::Device(::tyloi::kCUDA, primary)));
         tyloi::models::minicpmo45::MultimodalResult<::tyloi::Tensor> result;
 #else
+        const auto primary = execution.config.layer_placement.primary_device();
         input_ids = input_ids.to(::tyloi::kCUDA, ::tyloi::kInt64).contiguous();
         tyloi::models::minicpmo45::MultimodalResult<::tyloi::DenseTensor> result;
 #endif
@@ -366,13 +373,13 @@ struct MiniCPMO45DuplexSession {
             }
 #ifdef TYLOINFER_NATIVE_CUDA
             token_ids = tyloi::ops::contiguous(tyloi::ops::cast(token_ids, ::tyloi::kInt64,
-                ::tyloi::Device(::tyloi::kCUDA, runtime.execution.config.layer_placement.primary_device())));
+                ::tyloi::Device(::tyloi::kCUDA, runtime.primary)));
 #else
             token_ids = token_ids.to(::tyloi::kCUDA, ::tyloi::kInt64).contiguous();
 #endif
         }
 #ifdef TYLOINFER_NATIVE_CUDA
-        const auto mode = runtime.execution.executor().forward_mode(runtime.execution.config.layer_placement.primary_device());
+        const auto mode = tyloi::cuda::Executor::current().forward_mode(runtime.primary);
         ::tyloi::Tensor hidden;
         {
             auto policy = tyloi::cuda::Executor::current_ffn();
@@ -403,10 +410,9 @@ struct MiniCPMO45DuplexSession {
 #ifdef TYLOINFER_NATIVE_CUDA
         if (token_ids.dim() == 0) token_ids = tyloi::ops::reshape(token_ids, {1});
         if (token_ids.dim() == 1) token_ids = tyloi::ops::unsqueeze(token_ids, 0);
-        const auto primary = runtime.execution.config.layer_placement.primary_device();
         token_ids = tyloi::ops::contiguous(tyloi::ops::cast(token_ids, ::tyloi::kInt64,
-            ::tyloi::Device(::tyloi::kCUDA, primary)));
-        return feed_embeddings(runtime.language.embedding(token_ids, primary), token_ids);
+            ::tyloi::Device(::tyloi::kCUDA, runtime.primary)));
+        return feed_embeddings(runtime.language.embedding(token_ids, runtime.primary), token_ids);
 #else
         if (token_ids.dim() == 0) token_ids = token_ids.reshape({1});
         if (token_ids.dim() == 1) token_ids = token_ids.unsqueeze(0);
