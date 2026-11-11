@@ -1260,12 +1260,19 @@ std::vector<std::pair<std::string,double>> qwen4_cache_memory_metrics(
         const qwen4_exp::Model& model,const qwen4_exp::State& state,const tyloi::models::Mtp* mtp) {
     // Shared checkpoint views and recurrent state aliases count once. These
     // are existing cache tensors; collecting telemetry never copies GPU data.
+#ifdef TYLOINFER_NATIVE_CUDA
+    std::map<int,std::vector<::tyloi::DenseTensor>> allocations;
+    const auto add=[&](const ::tyloi::DenseTensor& tensor) {
+        if(tensor.defined() && tensor.is_cuda()) allocations[tensor.get_device()].push_back(tensor);
+    };
+#else
     std::map<std::pair<int,std::uintptr_t>,std::size_t> allocations;
     const auto add=[&](const ::tyloi::DenseTensor& tensor) {
         if(!tensor.defined() || !tensor.is_cuda())return;
         auto& bytes=allocations[{tensor.get_device(),reinterpret_cast<std::uintptr_t>(tensor.data_ptr())}];
         bytes=std::max(bytes,std::size_t(tensor.numel())*tensor.element_size());
     };
+#endif
     const auto block_cache=[&](const qwen4_exp::Layer& block,const qwen4_exp::LayerState& layer) {
         if(block.qsa)for(const auto& tensor:block.qsa->resident_cache_tensors(*layer.qsa))add(tensor);
         if(block.gdn) { add(layer.gdn.conv.dense()); add(layer.gdn.recurrent.dense()); }
@@ -1288,7 +1295,16 @@ std::vector<std::pair<std::string,double>> qwen4_cache_memory_metrics(
     }
     std::size_t bytes=0;
     std::map<int,std::size_t> devices;
+#ifdef TYLOINFER_NATIVE_CUDA
+    for(const auto& [device,tensors]:allocations) {
+        std::vector<const ::tyloi::DenseTensor*> buffers;
+        for(const auto& tensor:tensors) buffers.push_back(&tensor);
+        const auto size=::tyloi::backing_bytes(buffers);
+        bytes+=size; devices[device]=size;
+    }
+#else
     for(const auto& [address,size]:allocations) { bytes+=size; devices[address.first]+=size; }
+#endif
     std::vector<std::pair<std::string,double>> result{{"kv_cache_bytes",double(bytes)},
         {"kv_cache_contexts",state.cache_pos>0?double(state.batch):0.0}};
     for(const auto& [device,size]:devices)result.emplace_back("gpu_"+std::to_string(device)+"_live_kv_bytes",double(size));
