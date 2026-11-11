@@ -6,6 +6,9 @@
 #include "engine/backends/cuda/native/collectives.h"
 #include "engine/backends/cuda/native/scope.h"
 #include <algorithm>
+#include <array>
+#include <limits>
+#include <map>
 #include "engine/models/common/load.h"
 #include "engine/weights/loader.h"
 #include "engine/models/session/paged.h"
@@ -179,7 +182,12 @@ void load(Model& model, const ::tyloi::weights::Loader& weights,
     }
 }
 
-State::State(const Model& model) {
+State::State(const Model& model)
+#ifdef TYLOINFER_NATIVE_CUDA
+    : maximum_(model.config.maximum), kda_heads_(model.config.kda_heads),
+      kda_width_(model.config.kda_width), kda_kernel_(model.config.kda_kernel)
+#endif
+{
     layers.reserve(model.layers.size());
     for (const auto& layer : model.layers) {
 #ifdef TYLOINFER_NATIVE_CUDA
@@ -216,6 +224,57 @@ void State::restore_text_session_state(const TextSessionState&) {
 }
 
 #ifdef TYLOINFER_NATIVE_CUDA
+std::vector<std::pair<tyloi::Device, std::size_t>> State::growth(
+        std::int64_t tokens, const tyloi::models::ForwardOptions&) const {
+    if (batch <= 0 || tokens <= 0 || maximum_ <= 0 || cache_pos < 0 || cache_pos > maximum_ ||
+        tokens > maximum_ - cache_pos || speculative_start >= 0 ||
+        kda_heads_ <= 0 || kda_width_ <= 0 || kda_kernel_ <= 1)
+        throw std::invalid_argument("invalid GLM Flash-Next ordinary state growth");
+    if (tokens > std::numeric_limits<std::int64_t>::max() - (kda_kernel_ - 1))
+        throw std::overflow_error("GLM KDA convolution length overflow");
+    struct Growth { std::size_t retained = 0, peak = 0; };
+    std::map<int, Growth> growth;
+    const auto add = [](std::size_t& total, std::size_t value) {
+        if (total > std::numeric_limits<std::size_t>::max() - value)
+            throw std::overflow_error("GLM state growth byte count overflow");
+        total += value;
+    };
+    for (std::size_t i = 0; i < layers.size(); ++i) {
+        if (devices[i] < 0) throw std::invalid_argument("invalid GLM state device");
+        const tyloi::Device device(tyloi::kCUDA, devices[i]);
+        std::size_t retained = 0, temporary = 0;
+        if (const auto* kda = std::get_if<KdaState>(&layers[i])) {
+            if (kda->pending() || (kda->conv.defined() && kda->conv.size(0) != batch))
+                throw std::invalid_argument("invalid GLM KDA state for growth");
+            const std::array<int64_t, 5> joined{batch, kda_kernel_ - 1 + tokens, 3, kda_heads_, kda_width_};
+            const std::array<int64_t, 5> conv{batch, kda_kernel_ - 1, 3, kda_heads_, kda_width_};
+            const std::array<int64_t, 4> recurrent{batch, kda_heads_, kda_width_, kda_width_};
+            const auto joined_bytes = tyloi::make_contiguous_view(nullptr, joined, tyloi::kFloat32, device).nbytes();
+            const auto conv_bytes = tyloi::make_contiguous_view(nullptr, conv, tyloi::kFloat32, device).nbytes();
+            if (batch == 1) add(retained, joined_bytes);
+            else { add(temporary, joined_bytes); add(retained, conv_bytes); }
+            if (!kda->conv.defined()) add(temporary, conv_bytes);
+            add(retained, tyloi::make_contiguous_view(nullptr, recurrent, tyloi::kFloat32, device).nbytes());
+        } else {
+            const auto& mla = std::get<MlaState>(layers[i]);
+            if (mla.latent.position() != cache_pos || mla.index.position() != cache_pos)
+                throw std::invalid_argument("GLM MLA/model cache positions diverged");
+            add(retained, mla.latent.growth_bytes(batch, tokens));
+            add(retained, mla.index.growth_bytes(batch, tokens));
+        }
+        auto& device_growth = growth[devices[i]];
+        auto peak = device_growth.retained;
+        add(peak, retained);
+        add(peak, temporary);
+        device_growth.peak = std::max(device_growth.peak, peak);
+        add(device_growth.retained, retained);
+    }
+    std::vector<std::pair<tyloi::Device, std::size_t>> result;
+    for (const auto& [device, value] : growth)
+        result.emplace_back(tyloi::Device(tyloi::kCUDA, device), value.peak);
+    return result;
+}
+
 std::vector<::tyloi::Tensor> State::storage() const {
     std::vector<::tyloi::Tensor> result;
     const auto add = [&](const DenseTensor& value) { if (value.defined()) result.emplace_back(value); };

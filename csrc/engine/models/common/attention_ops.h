@@ -4,6 +4,7 @@
 #include "engine/backends/cuda/ops/projection/projection.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <functional>
 #include <optional>
@@ -70,6 +71,16 @@ public:
         TYLOINFER_RUNTIME_CHECK(keep >= 0 && keep <= position_, "invalid sequence cache truncation");
         position_ = keep;
     }
+    std::size_t growth_bytes(int64_t batch, int64_t tokens) const {
+        TYLOINFER_RUNTIME_CHECK(batch > 0 && tokens > 0 && position_ >= 0 && position_ <= maximum_ &&
+            tokens <= maximum_ - position_, "invalid sequence cache growth");
+        TYLOINFER_RUNTIME_CHECK(!values_.defined() || values_.size(0) == batch,
+            "reset sequence cache before changing batch");
+        const auto required = position_ + tokens;
+        if (values_.defined() && required <= values_.size(1)) return 0;
+        const std::array<int64_t, 3> shape{batch, capacity_for(required), width_};
+        return ::tyloi::make_contiguous_view(nullptr, shape, dtype_, {}).nbytes();
+    }
     DenseTensor append(const DenseTensor& value) {
         TYLOINFER_RUNTIME_CHECK(value.is_cuda() && value.dim() == 3 && value.size(0) > 0 &&
             value.size(1) > 0 && value.size(2) == width_, "invalid sequence cache append");
@@ -78,8 +89,7 @@ public:
         TYLOINFER_RUNTIME_CHECK(value.size(1) <= maximum_ - position_, "sequence cache exceeds max_context");
         const auto required = position_ + value.size(1);
         if (!values_.defined() || required > values_.size(1)) {
-            int64_t capacity = values_.defined() ? values_.size(1) : std::min<int64_t>(16, maximum_);
-            while (capacity < required) capacity = std::min(maximum_, capacity > maximum_ / 2 ? maximum_ : capacity * 2);
+            const auto capacity = capacity_for(required);
             auto expanded = ::tyloi::cuda::zeros({value.size(0), capacity, width_}, value.options().dtype(dtype_));
             if (position_) expanded.narrow(1, 0, position_).copy_(values_.narrow(1, 0, position_));
             values_ = std::move(expanded);
@@ -89,6 +99,13 @@ public:
         return values_.narrow(1, 0, position_);
     }
 private:
+    int64_t capacity_for(int64_t required) const {
+        auto capacity = values_.defined() ? values_.size(1) : std::min<int64_t>(16, maximum_);
+        // replace_storage can install an empty prefix after leaving a graph.
+        if (capacity == 0) capacity = std::min<int64_t>(16, maximum_);
+        while (capacity < required) capacity = std::min(maximum_, capacity > maximum_ / 2 ? maximum_ : capacity * 2);
+        return capacity;
+    }
     int64_t maximum_, width_, position_ = 0;
     ::tyloi::ScalarType dtype_;
     DenseTensor values_;

@@ -59,6 +59,8 @@ public:
     void preallocate() {}
 #ifdef TYLOINFER_NATIVE_CUDA
     void commit_speculative() override;
+    std::vector<std::pair<tyloi::Device, std::size_t>> growth(
+        std::int64_t tokens, const tyloi::models::ForwardOptions&) const override;
     std::vector<::tyloi::Tensor> storage() const override;
     std::vector<::tyloi::Tensor*> graph_state() override { return {}; }
     void rollback_speculative(std::int64_t accepted) override;
@@ -82,6 +84,7 @@ public:
 #ifdef TYLOINFER_NATIVE_CUDA
 private:
     std::vector<int> devices;
+    std::int64_t maximum_, kda_heads_, kda_width_, kda_kernel_;
 #endif
 };
 
