@@ -1,6 +1,7 @@
 #include "engine/load.h"
 #include "engine/ops.h"
 #include "engine/models/load.h"
+#include "engine/models/load_internal.h"
 #include "engine/models/deepseek_v41/vision.h"
 #include "engine/models/qwen35/forward.h"
 #include "engine/models/minicpmo45/forward.h"
