@@ -8,11 +8,14 @@
 #include "engine/requests/policy.h"
 #include "engine/generation/sampling.h"
 #include "engine/models/common/load.h"
+#include "engine/models/input.h"
 #include "engine/models/common/attention.h"
 #include "engine/models/common/ffn.h"
 #include "engine/models/common/mlp.h"
+#ifndef TYLOINFER_NATIVE_CUDA
 #include "engine/backends/cuda/executor/executor.h"
 #include "engine/backends/cuda/ops/rope/rope.h"
+#endif
 #include "engine/state/kv_view.h"
 
 #include <array>
@@ -82,6 +85,11 @@ struct MiniCPMO45TtsSamplingOps {
 namespace tyloi::cuda::minicpmo45 {
 
 struct Tts {
+#ifdef TYLOINFER_NATIVE_CUDA
+    using Payload = ::tyloi::Tensor;
+#else
+    using Payload = ::tyloi::DenseTensor;
+#endif
     struct Layer {
         FullAttention attention;
 #ifdef TYLOINFER_NATIVE_CUDA
@@ -129,15 +137,15 @@ struct Tts {
         Tts result;
         result.device = weights.placement.device;
         result.config = tyloi::models::minicpmo45::tts_decoder_config();
-        RopeCache rope(
-            result.config.max_position_embeddings,
-            result.config.rotary_dim,
+#ifdef TYLOINFER_NATIVE_CUDA
+        result.rope = tyloi::ops::rope_table(
+            result.config.max_position_embeddings, result.config.rotary_dim,
+            result.config.rope_base, ::tyloi::Device(::tyloi::kCUDA, result.device), 0, -1);
+#else
+        result.rope = RopeCache(
+            result.config.max_position_embeddings, result.config.rotary_dim,
             result.config.rope_base, 0, -1,
             ::tyloi::Device(::tyloi::kCUDA, result.device));
-#ifdef TYLOINFER_NATIVE_CUDA
-        result.rope = rope.view();
-#else
-        result.rope = std::move(rope);
 #endif
         result.text_embedding = weights.weight("tts.text_embedding.weight");
         result.code_embedding = weights.weight("tts.code_embedding.0.weight");
@@ -149,8 +157,8 @@ struct Tts {
         result.output_norm = weights.native("tts.output_norm.weight");
         auto head_g_tensor = weights.native("tts.code_output.0.weight_norm.magnitude");
         auto head_v_tensor = weights.native("tts.code_output.0.weight_norm.direction");
-        if (head_g_tensor->dim() != 2 || head_g_tensor->size(0) != 6562 || head_g_tensor->size(1) != 1 ||
-                head_v_tensor->dim() != 2 || head_v_tensor->size(0) != 6562 || head_v_tensor->size(1) != 768 ||
+        if (head_g_tensor.dim() != 2 || head_g_tensor.size(0) != 6562 || head_g_tensor.size(1) != 1 ||
+                head_v_tensor.dim() != 2 || head_v_tensor.size(0) != 6562 || head_v_tensor.size(1) != 768 ||
 #else
         result.output_norm = weights.native("tts.output_norm.weight").dense();
         auto head_g = weights.native("tts.code_output.0.weight_norm.magnitude").dense();
@@ -158,10 +166,10 @@ struct Tts {
         if (head_g.sizes().vec() != std::vector<int64_t>({6562, 1}) ||
                 head_v.sizes().vec() != std::vector<int64_t>({6562, 768}) ||
 #endif
-                result.text_embedding->size(0) != 152064 ||
-                result.text_embedding->size(1) != 768 ||
-                result.code_embedding->size(0) != 6562 ||
-                result.code_embedding->size(1) != 768) {
+                result.text_embedding.size(0) != 152064 ||
+                result.text_embedding.size(1) != 768 ||
+                result.code_embedding.size(0) != 6562 ||
+                result.code_embedding.size(1) != 768) {
             throw std::runtime_error(
                 "MiniCPM-o TTS tensor shapes disagree with version 4.5");
         }
@@ -198,27 +206,52 @@ struct Tts {
         return result;
     }
 
-    ::tyloi::DenseTensor semantic_projection(const Projector& projector,
-                                                  ::tyloi::DenseTensor hidden) const {
-        auto projected = tyloi::cuda::biased(projector, semantic_projector1, hidden);
+    Payload semantic_projection(
+#ifndef TYLOINFER_NATIVE_CUDA
+            const Projector& projector,
+#endif
+            Payload hidden_value) const {
+#ifdef TYLOINFER_NATIVE_CUDA
+        auto projected = tyloi::ops::linear(hidden_value, semantic_projector1.weight, semantic_projector1.bias).dense();
+        projected = ::tyloi::cuda::relu(projected);
+        projected = tyloi::ops::linear(projected, semantic_projector2.weight, semantic_projector2.bias).dense();
+#else
+        auto projected = tyloi::cuda::biased(projector, semantic_projector1, hidden_value);
         projected = ::tyloi::cuda::relu(projected);
         projected = tyloi::cuda::biased(projector, semantic_projector2, projected);
+#endif
         auto norm = ::tyloi::cuda::sqrt(
             ::tyloi::cuda::sum(projected.to(::tyloi::kFloat32).square(), -1, true))
             .clamp_min(1e-12);
         return (projected / norm.to(projected.scalar_type())).contiguous();
     }
 
-    ::tyloi::DenseTensor speaker_projection(const Projector& projector,
-                                                 ::tyloi::DenseTensor hidden) const {
+    Payload speaker_projection(
+#ifndef TYLOINFER_NATIVE_CUDA
+            const Projector& projector,
+#endif
+            Payload hidden_value) const {
+#ifdef TYLOINFER_NATIVE_CUDA
+        auto hidden = tyloi::ops::linear(hidden_value, speaker_projector1.weight, speaker_projector1.bias).dense();
+        return tyloi::ops::linear(::tyloi::cuda::relu(hidden), speaker_projector2.weight, speaker_projector2.bias);
+#else
         return tyloi::cuda::biased(projector, speaker_projector2, ::tyloi::cuda::relu(
-                tyloi::cuda::biased(projector, speaker_projector1, hidden)));
+                tyloi::cuda::biased(projector, speaker_projector1, hidden_value)));
+#endif
     }
 
-    ::tyloi::DenseTensor condition(
+    Payload condition(
+#ifndef TYLOINFER_NATIVE_CUDA
             const Projector& projector,
-            ::tyloi::DenseTensor text_ids,
-            ::tyloi::DenseTensor language_hidden) const {
+#endif
+            Payload text_ids_value, Payload language_hidden_value) const {
+#ifdef TYLOINFER_NATIVE_CUDA
+        auto text_ids = text_ids_value.dense();
+        auto language_hidden = language_hidden_value.dense();
+#else
+        auto text_ids = text_ids_value;
+        auto language_hidden = language_hidden_value;
+#endif
         MfqCudaGuard guard(device);
         if (text_ids.dim() == 1) text_ids = text_ids.unsqueeze(0);
         if (language_hidden.dim() == 2) {
@@ -231,24 +264,39 @@ struct Tts {
             throw std::runtime_error(
                 "MiniCPM-o TTS condition expects one aligned text/hidden span");
         }
-        auto text = minicpmo45_embedding(*text_embedding, text_ids);
-        auto semantic = semantic_projection(projector, language_hidden)
-            .to(text.scalar_type());
-        auto merged = (text + semantic).contiguous();
+        auto text = minicpmo45_embedding(text_embedding, text_ids);
+        auto semantic = semantic_projection(
+#ifndef TYLOINFER_NATIVE_CUDA
+            projector,
+#endif
+            language_hidden);
+#ifdef TYLOINFER_NATIVE_CUDA
+        auto semantic_dense = semantic.dense().to(text.scalar_type());
+#else
+        auto semantic_dense = semantic.to(text.scalar_type());
+#endif
+        auto merged = (text + semantic_dense).contiguous();
         auto suffix_ids = ::tyloi::cuda::tensor(
             std::vector<int64_t>{151692, 151687},
             ::tyloi::TensorOptions().dtype(::tyloi::kInt64)
                 .device(::tyloi::kCUDA)).reshape({1, 2});
         auto suffix = minicpmo45_embedding(
-            *text_embedding, suffix_ids, text.scalar_type());
+            text_embedding, suffix_ids, text.scalar_type());
         return ::tyloi::cuda::cat({merged, suffix}, 1).contiguous();
     }
 
-    ::tyloi::DenseTensor duplex_condition(
+    Payload duplex_condition(
+#ifndef TYLOINFER_NATIVE_CUDA
             const Projector& projector,
-            ::tyloi::DenseTensor text_ids,
-            ::tyloi::DenseTensor language_hidden,
-            int64_t audio_bos_token) const {
+#endif
+            Payload text_ids_value, Payload language_hidden_value, int64_t audio_bos_token) const {
+#ifdef TYLOINFER_NATIVE_CUDA
+        auto text_ids = text_ids_value.dense();
+        auto language_hidden = language_hidden_value.dense();
+#else
+        auto text_ids = text_ids_value;
+        auto language_hidden = language_hidden_value;
+#endif
         MfqCudaGuard guard(device);
         if (text_ids.dim() == 1) text_ids = text_ids.unsqueeze(0);
         if (language_hidden.dim() == 2) {
@@ -258,30 +306,48 @@ struct Tts {
                 text_ids.size(0) != 1 || language_hidden.size(0) != 1 ||
                 text_ids.size(1) != language_hidden.size(1) ||
                 language_hidden.size(2) != 4096 ||
-                audio_bos_token < 0 || audio_bos_token >= text_embedding->size(0)) {
+                audio_bos_token < 0 || audio_bos_token >= text_embedding.size(0)) {
             throw std::runtime_error(
                 "MiniCPM-o duplex TTS condition has invalid geometry or audio BOS");
         }
         ::tyloi::DenseTensor condition;
         if (text_ids.size(1) > 0) {
-            auto text = minicpmo45_embedding(*text_embedding, text_ids);
-            auto semantic = semantic_projection(projector, language_hidden)
-                .to(text.scalar_type());
-            condition = (text + semantic).contiguous();
+            auto text = minicpmo45_embedding(text_embedding, text_ids);
+            auto semantic = semantic_projection(
+#ifndef TYLOINFER_NATIVE_CUDA
+                projector,
+#endif
+                language_hidden);
+#ifdef TYLOINFER_NATIVE_CUDA
+            auto semantic_dense = semantic.dense().to(text.scalar_type());
+#else
+            auto semantic_dense = semantic.to(text.scalar_type());
+#endif
+            condition = (text + semantic_dense).contiguous();
         }
         auto bos_ids = ::tyloi::cuda::tensor(
             std::vector<int64_t>{audio_bos_token},
             ::tyloi::TensorOptions().dtype(::tyloi::kInt64)
                 .device(::tyloi::kCUDA)).reshape({1, 1});
         auto bos = minicpmo45_embedding(
-            *text_embedding, bos_ids, ::tyloi::kBFloat16);
+            text_embedding, bos_ids, ::tyloi::kBFloat16);
         return condition.defined()
             ? ::tyloi::cuda::cat({condition, bos}, 1).contiguous()
             : bos.contiguous();
     }
 
-    ::tyloi::DenseTensor hidden_forward(State& state, Executor& executor,
-            const Executor::Mode& mode, ::tyloi::DenseTensor input_embeddings) const {
+    Payload hidden_forward(State& state,
+#ifdef TYLOINFER_NATIVE_CUDA
+            const tyloi::models::ForwardOptions& mode, Payload input_value
+#else
+            Executor& executor, const Executor::Mode& mode, Payload input_value
+#endif
+            ) const {
+#ifdef TYLOINFER_NATIVE_CUDA
+        auto input_embeddings = input_value.dense();
+#else
+        auto input_embeddings = input_value;
+#endif
         MfqCudaGuard guard(device);
         if (input_embeddings.dim() != 3 ||
                 input_embeddings.size(2) != config.hidden_size) {
@@ -323,7 +389,6 @@ struct Tts {
             cache.quantization = attention.kv_quantization;
             auto* layer_trace = mode.trace_layer == attention.layer ? mode.trace : nullptr;
 #ifdef TYLOINFER_NATIVE_CUDA
-            auto scope = executor.enter(device, mode.ffn);
             AttentionStep step{
                 ::tyloi::Tensor(positions),
                 sequence_length ? ::tyloi::Tensor(*sequence_length) : ::tyloi::Tensor{},
@@ -360,7 +425,12 @@ struct Tts {
             .contiguous();
     }
 
-    ::tyloi::DenseTensor logits(::tyloi::DenseTensor hidden) const {
+    Payload logits(Payload hidden_value) const {
+#ifdef TYLOINFER_NATIVE_CUDA
+        auto hidden = hidden_value.dense();
+#else
+        auto hidden = hidden_value;
+#endif
 #ifdef TYLOINFER_NATIVE_CUDA
         const auto& weight = code_head.dense();
 #else
@@ -381,10 +451,12 @@ struct Tts {
     };
 
     ChunkResult generate_duplex_chunk(
-            State& state, Executor& executor, const Executor::Mode& mode,
+            State& state,
 #ifdef TYLOINFER_NATIVE_CUDA
+            const tyloi::models::ForwardOptions& mode,
             ::tyloi::Tensor condition_embeddings_value,
 #else
+            Executor& executor, const Executor::Mode& mode,
             ::tyloi::DenseTensor condition_embeddings,
 #endif
             int64_t max_new_tokens,
@@ -401,7 +473,7 @@ struct Tts {
                 condition_embeddings.size(0) != 1 ||
                 condition_embeddings.size(2) != config.hidden_size ||
                 max_new_tokens <= 0 || minimum_new_tokens < 0 ||
-                eos_token < 0 || eos_token >= code_embedding->size(0) ||
+                eos_token < 0 || eos_token >= code_embedding.size(0) ||
                 temperature <= 0.0 || repetition_penalty <= 0.0) {
             throw std::runtime_error(
                 "MiniCPM-o duplex TTS generation limits are invalid");
@@ -411,10 +483,15 @@ struct Tts {
         auto current = condition_embeddings.to(::tyloi::kBFloat16).contiguous();
         bool finished = false;
         for (int64_t step = 0; step < max_new_tokens; ++step) {
-            auto hidden = hidden_forward(state, executor, mode, current);
-            auto step_logits = logits(
-                hidden.index({Slice(), -1, Slice()}))
+#ifdef TYLOINFER_NATIVE_CUDA
+            auto hidden = hidden_forward(state, mode, current).dense();
+            auto step_logits = logits(hidden.index({Slice(), -1, Slice()})).dense()
                 .to(::tyloi::kFloat32) / temperature;
+#else
+            auto hidden = hidden_forward(state, executor, mode, current);
+            auto step_logits = logits(hidden.index({Slice(), -1, Slice()}))
+                .to(::tyloi::kFloat32) / temperature;
+#endif
             if (!sampled.empty() && repetition_penalty != 1.0) {
                 const size_t begin = sampled.size() > 16
                     ? sampled.size() - 16 : 0;
@@ -443,7 +520,7 @@ struct Tts {
             finished = token.eq(eos_token).all().item<bool>();
             if (finished) break;
             current = minicpmo45_embedding(
-                *code_embedding, token.unsqueeze(1));
+                code_embedding, token.unsqueeze(1));
         }
         const int64_t returned = std::max<int64_t>(
             0, static_cast<int64_t>(sampled.size()) - 1);
@@ -461,14 +538,24 @@ struct Tts {
         return {codes, finished};
     }
 
-    ::tyloi::DenseTensor generate_official(
-        State& state, Executor& executor, const Executor::Mode& mode,
-        ::tyloi::DenseTensor condition_embeddings, int64_t steps, int64_t eos_token = 6561,
+    Payload generate_official(
+        State& state,
+#ifdef TYLOINFER_NATIVE_CUDA
+        const tyloi::models::ForwardOptions& mode, Payload condition_value,
+#else
+        Executor& executor, const Executor::Mode& mode, Payload condition_value,
+#endif
+        int64_t steps, int64_t eos_token = 6561,
         int64_t minimum_steps = 50, double temperature = 0.8, double top_p = 0.85,
         int64_t top_k = 25, double repetition_penalty = 1.05,
-        std::vector<::tyloi::DenseTensor> *logits_trace = nullptr, double min_p = 0.0,
+        std::vector<Payload> *logits_trace = nullptr, double min_p = 0.0,
         std::mt19937 *evaluator_rng = nullptr, int64_t evaluator_min_keep = 0) const {
         MfqCudaGuard guard(device);
+#ifdef TYLOINFER_NATIVE_CUDA
+        auto condition_embeddings = condition_value.dense();
+#else
+        auto condition_embeddings = condition_value;
+#endif
         const tyloi::models::minicpmo45::TtsSampling config{eos_token,          minimum_steps, top_k,
                                                           evaluator_min_keep, temperature,   top_p,
                                                           repetition_penalty, min_p};
@@ -484,9 +571,13 @@ struct Tts {
         const auto result = tyloi::engine::generate_tokens(
             steps,
             [&](int64_t step) {
+#ifdef TYLOINFER_NATIVE_CUDA
+                auto hidden = hidden_forward(state, mode, current).dense();
+                auto raw_step_logits = logits(hidden.index({Slice(), -1, Slice()})).dense().to(::tyloi::kFloat32);
+#else
                 auto hidden = hidden_forward(state, executor, mode, current);
-                auto raw_step_logits =
-                    logits(hidden.index({Slice(), -1, Slice()})).to(::tyloi::kFloat32);
+                auto raw_step_logits = logits(hidden.index({Slice(), -1, Slice()})).to(::tyloi::kFloat32);
+#endif
                 if (logits_trace)
                     logits_trace->push_back(raw_step_logits.clone());
                 return tyloi::models::minicpmo45::sample_tts(
@@ -496,7 +587,7 @@ struct Tts {
             [&](const DenseTensor &token, int64_t) { generated.push_back(token); },
             [&](const DenseTensor &token) { return token.eq(eos_token).all().item<bool>(); },
             [&](const DenseTensor &token) {
-                current = minicpmo45_embedding(*code_embedding, token.unsqueeze(1));
+                current = minicpmo45_embedding(code_embedding, token.unsqueeze(1));
             });
         auto sampled = ::tyloi::cuda::stack(generated, 1);
         return sampled.narrow(1, 0, result.tokens - (result.hit_eos ? 1 : 0))

@@ -680,8 +680,14 @@ struct MiniCPMO45DuplexSession {
                 hidden_tensor = ::tyloi::cuda::stack(spoken_hidden, 1)
                     .to(::tyloi::kBFloat16).contiguous();
             }
+#ifdef TYLOINFER_NATIVE_CUDA
+            auto tts_scope = runtime.tts_executor->enter(runtime.tts.device, runtime.tts_mode.ffn);
+#endif
             auto condition = runtime.tts.duplex_condition(
-                runtime.projector, text_id_tensor, hidden_tensor, ids.audio_bos);
+#ifndef TYLOINFER_NATIVE_CUDA
+                runtime.projector,
+#endif
+                text_id_tensor, hidden_tensor, ids.audio_bos);
             const bool first_tts_chunk = tts_text_start_position == 0;
             if (first_tts_chunk) {
                 tts_state.reset(1);
@@ -694,7 +700,14 @@ struct MiniCPMO45DuplexSession {
             const int64_t minimum_codes =
                 result.end_of_turn || first_tts_chunk ? 0 : 26;
             auto tts_result = runtime.tts.generate_duplex_chunk(
-                tts_state, *runtime.tts_executor, runtime.tts_mode, condition, 26, minimum_codes, 6561,
+                tts_state,
+#ifdef TYLOINFER_NATIVE_CUDA
+                tyloi::models::ForwardOptions{runtime.tts_mode.kv_capacity, runtime.tts_mode.trace,
+                                              runtime.tts_mode.trace_layer, runtime.tts_mode.primary},
+#else
+                *runtime.tts_executor, runtime.tts_mode,
+#endif
+                condition, 26, minimum_codes, 6561,
                 tts_temperature, tts_repetition_penalty);
             result.tts_codes = tts_result.codes;
             if (result.end_of_turn) {

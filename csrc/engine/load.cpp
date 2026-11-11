@@ -270,12 +270,7 @@ void setup_cuda_load(
         std::shared_ptr<KvMemoryManager>& kv, std::shared_ptr<KvOffloadStore>& offload) {
     drain_cuda(executor, weights, offload.get(),
                config.layer_placement, config.tensor_parallel, config.expert_parallel);
-#ifndef TYLOINFER_NATIVE_CUDA
-    executor.attention_scratch().clear();
-#endif
-    executor.branches().clear();
-    executor.profiler().reset();
-    executor.collectives().reset();
+    executor.reset();
     config.tensor_parallel = {};
     config.expert_parallel = {};
     config.layer_placement = {};
@@ -284,16 +279,7 @@ void setup_cuda_load(
     config.n_gpu_layers = -1;
     config.dense_cpu_layer_count = 0;
     config.drop_file_cache = false;
-    executor.mode().ffn.serial = false;
-    executor.mode().ffn.projection_major = false;
-    executor.mode().ffn.batch_serial = false;
-    executor.routes().clear();
-    executor.mmq().reset();
-    executor.mode().ffn.unfused = false;
-    executor.mode().ffn.materialized = false;
     config.weights.min_slots = 8;
-    executor.mode().trace_layer = -1;
-    executor.mode().trace = nullptr;
     offload.reset();
     kv.reset();
     weights.begin_load();

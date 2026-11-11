@@ -45,6 +45,7 @@ public:
     std::vector<tyloi::Executor::Memory> memory(std::span<const tyloi::Device> devices) const;
 #endif
     std::unique_ptr<tyloi::Executor::Scope> enter(int device);
+    void reset();
     void join();
     static Executor& current();
 #ifdef TYLOINFER_NATIVE_CUDA
