@@ -1,6 +1,7 @@
 #include "engine/models/source.h"
 #include "engine/ops.h"
 #include "engine/models/minicpmo45/model.h"
+#include "engine/backends/cuda/ops/rope/rope.h"
 #include "engine/models/common/load.h"
 #include "engine/weights/loader.h"
 #include "engine/models/source/model_graph.h"
@@ -10,6 +11,23 @@
 #include <utility>
 
 namespace tyloi::cuda::minicpmo45 {
+
+#ifdef TYLOINFER_NATIVE_CUDA
+tyloi::models::Info Model::info() const {
+    return tyloi::models::model_info(metadata);
+}
+MfqModelCapabilities Model::capabilities() const {
+    return {graph.architecture, graph.has_component("text"), false, false,
+            false, false, false, false, "model-graph"};
+}
+tyloi::engine::Metrics Model::metrics() const {
+    return {{"kv_memory_supported", 0.0}, {"kv_quantization_supported", 0.0},
+            {"kv_quantization_bits", 0.0}, {"vision_declared", double(graph.has_component("vision"))},
+            {"vision_supported", 0.0}, {"vision_available", 0.0},
+            {"mtp_declared", double(graph.has_component("predictor"))},
+            {"mtp_supported", 0.0}, {"mtp_available", 0.0}};
+}
+#endif
 
 Model read(std::shared_ptr<const tyloi::ModelSource> source, std::string_view definition, int64_t context) {
     validate_model_source(*source);

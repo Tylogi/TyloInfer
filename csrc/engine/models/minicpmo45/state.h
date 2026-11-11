@@ -2,6 +2,9 @@
 
 #include "engine/models/session/snapshot.h"
 #include "engine/state/kv_view.h"
+#ifdef TYLOINFER_NATIVE_CUDA
+#include "engine/models/state.h"
+#endif
 
 #include <cstdint>
 #include <vector>
@@ -10,7 +13,11 @@ namespace tyloi::cuda::minicpmo45 {
 
 struct Model;
 
-class State {
+class State
+#ifdef TYLOINFER_NATIVE_CUDA
+    : public tyloi::models::State
+#endif
+{
 public:
     struct Restore {
         std::vector<tyloi::state::KvView> layers;
@@ -29,6 +36,10 @@ public:
     int64_t position() const noexcept { return cache_pos; }
     void advance(int64_t tokens) noexcept { cache_pos += tokens; }
     void set_position_delta(int64_t delta) noexcept { decode_position_delta = delta; }
+#ifdef TYLOINFER_NATIVE_CUDA
+    std::vector<std::pair<tyloi::Device, std::size_t>> growth(
+        std::int64_t tokens, const tyloi::models::ForwardOptions& options) const override;
+#endif
     std::vector<::tyloi::Tensor> storage() const;
     std::vector<::tyloi::Tensor*> graph_state() { return {}; }
 
