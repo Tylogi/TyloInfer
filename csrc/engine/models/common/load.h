@@ -28,6 +28,28 @@ Ffn load_dense_ffn(Loader& ops, const ModelConfig& config, const std::string& pr
     return result;
 }
 
+template <class Loader>
+bool split_experts(Loader& ops, const std::string& prefix, int layer) {
+    const bool split = ops.has(prefix + "experts.gate.weight");
+    const bool fused = ops.has(prefix + "experts.gate_up.weight");
+    if (split != ops.has(prefix + "experts.up.weight") || fused == split ||
+        !ops.has(prefix + "experts.down.weight"))
+        throw std::runtime_error(
+            "routed MoE requires Down and exactly one fused or split "
+            "Gate/Up representation at layer " + std::to_string(layer));
+    return split;
+}
+
+template <class Loader>
+bool has_moe_latent(Loader& ops, const std::string& prefix, int layer) {
+    const bool has_in = ops.has(prefix + "latent.down.weight");
+    if (has_in != ops.has(prefix + "latent.up.weight"))
+        throw std::runtime_error(
+            "latent MoE requires both Down and Up latent projections at layer " +
+            std::to_string(layer));
+    return has_in;
+}
+
 // Routed banks may be gated (gate/up or fused gate_up) or ungated (up only).
 // An ungated expert's activation is relu^2, never a gate projection alias.
 template <class Ffn, class Loader>
@@ -59,11 +81,7 @@ Ffn load_moe_weights(Loader& ops, const std::string& prefix, int layer,
             result.activation = tyloi::ops::MlpActivation::relu_squared;
         ops.experts(result, ExpertProjection::up, up, layer);
     } else {
-        const bool split = has_gate, fused = has_gate_up;
-        if (split != ops.has(up) || fused == split || !ops.has(down))
-            throw std::runtime_error(
-                "routed MoE requires Down and exactly one fused or split "
-                "Gate/Up representation at layer " + std::to_string(layer));
+        const bool split = split_experts(ops, prefix, layer);
         result.moe_split_gate_up = split;
         if (split) {
             ops.experts(result, ExpertProjection::gate, gate, layer);
@@ -75,11 +93,7 @@ Ffn load_moe_weights(Loader& ops, const std::string& prefix, int layer,
     ops.experts(result, ExpertProjection::down, down, layer);
     const auto latent_in = prefix + "latent.down.weight";
     const auto latent_out = prefix + "latent.up.weight";
-    if (ops.has(latent_in) != ops.has(latent_out))
-        throw std::runtime_error(
-            "latent MoE requires both Down and Up latent projections at layer " +
-            std::to_string(layer));
-    if (ops.has(latent_in)) {
+    if (has_moe_latent(ops, prefix, layer)) {
         if constexpr (requires { result.moe_latent_in = ops.linear(latent_in); }) {
             result.moe_latent_in = ops.linear(latent_in);
             result.moe_latent_out = ops.linear(latent_out);
@@ -183,6 +197,8 @@ struct TransformerWeightLoader {
         const std::string& down, const std::string& gate, const std::string& up) const;
     void important_neurons(int64_t hidden, int64_t intermediate, tyloi::models::Mlp& ffn,
         const std::string& down, const std::string& gate, const std::string& up) const;
+    ::tyloi::Tensor expert(tyloi::models::ExpertProjection projection,
+                           const std::string& name, int layer) const;
     void experts(tyloi::cuda::Ffn& ffn, tyloi::models::ExpertProjection projection,
                  const std::string& name, int layer) const;
     ::tyloi::Tensor headwise(const std::string& name) const;

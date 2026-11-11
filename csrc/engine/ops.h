@@ -16,6 +16,8 @@
 #include <vector>
 
 
+namespace tyloi::weights { class ExpertBatch; }
+
 namespace tyloi::ops {
 
 // In the native CUDA runtime, computation requires CUDA unless stated below.
@@ -321,6 +323,18 @@ struct MoeRouting {
     bool delayed_softmax = false;
     double scale = 1.0;
 };
+
+struct ExpertSpec {
+    Tensor shared_gate, latent_in, latent_out;
+    double swiglu_limit = 0;
+    int layer = -1;
+};
+struct RoutedExperts { Tensor values, shared_logits; bool reduced = false; };
+// Flat F16 input and matching F32 input; the batch owns selected bank/route preparation.
+// Execute after the shared expert, then combine its F16 output with these routed values.
+RoutedExperts routed(const Tensor& input, const Tensor& input_f32, const Tensor& route_weights,
+                     weights::ExpertBatch& batch, const ExpertSpec& spec);
+Tensor combine_experts(const RoutedExperts& experts, const Tensor& route_weights, const Tensor& shared);
 
 struct SelectedExperts { Tensor ids, weights; };
 SelectedExperts topk(const Tensor& logits, std::int64_t count, const MoeRouting& routing,

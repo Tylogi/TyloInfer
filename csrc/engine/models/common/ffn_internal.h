@@ -3,14 +3,14 @@
 #include "engine/models/common/ffn.h"
 
 #include <stdexcept>
+#include <type_traits>
 
 namespace tyloi::models::ffn_internal {
 
-Tensor feed_forward(const Mlp& weights, const Tensor& input, bool bf16);
-Tensor feed_forward(const cuda::Ffn& weights, const Tensor& input, bool bf16);
+Tensor feed_forward(const Mlp& weights, const Tensor& input, bool bf16, bool serial_experts);
+Tensor feed_forward(const Moe& weights, const Tensor& input, bool bf16, bool serial_experts);
 
-template <class Weights>
-Tensor dense_ffn(const Weights& weights, const Tensor& input, bool bf16) {
+inline Tensor dense_ffn(const Mlp& weights, const Tensor& input, bool bf16) {
     if (!weights.down) throw std::runtime_error("FFN down projection is missing");
     if (bf16)
         return ops::bf16_mlp(input, weights.gate_up, weights.down,
@@ -27,23 +27,25 @@ Tensor dense_ffn(const Weights& weights, const Tensor& input, bool bf16) {
 }
 
 template <class Weights>
-Tensor full(const Weights& weights, bool routed, const Tensor& norm,
+Tensor full(const Weights& weights, const Tensor& norm,
     const Tensor& residual, const Tensor& attention_output,
     double epsilon, double offset, bool bf16, bool trace,
-    ops::Trace* trace_output) {
+    ops::Trace* trace_output, bool serial_experts = false) {
     const auto batch = residual.size(0), tokens = residual.size(1), width = residual.size(2);
     auto pair = ops::residual_norm(residual, attention_output, norm, epsilon, offset, bf16);
     auto input = ops::reshape(pair[1], {batch * tokens, width});
     if (trace && trace_output)
         trace_output->emplace_back("qwen.ffn_norm", ops::clone(ops::contiguous(
             ops::cast(ops::reshape(input, {batch, tokens, width}), ScalarType::float32))));
-    if (!routed && !bf16 && !weights.important_neurons) {
-        auto flat_residual = ops::reshape(pair[0], {batch * tokens, width});
-        if (auto fused = ops::mlp_residual(input, flat_residual, weights.gate_up,
-                weights.down, weights.activation, weights.swiglu_limit))
-            return ops::reshape(*fused, {batch, tokens, width});
+    if constexpr (!std::is_same_v<Weights, Moe>) {
+        if (!bf16 && !weights.important_neurons) {
+            auto flat_residual = ops::reshape(pair[0], {batch * tokens, width});
+            if (auto fused = ops::mlp_residual(input, flat_residual, weights.gate_up,
+                    weights.down, weights.activation, weights.swiglu_limit))
+                return ops::reshape(*fused, {batch, tokens, width});
+        }
     }
-    auto output = ops::reshape(feed_forward(weights, input, bf16), {batch, tokens, width});
+    auto output = ops::reshape(feed_forward(weights, input, bf16, serial_experts), {batch, tokens, width});
     if (trace && trace_output)
         trace_output->emplace_back("qwen.ffn_output", ops::clone(ops::contiguous(
             ops::cast(output, ScalarType::float32))));
@@ -51,19 +53,21 @@ Tensor full(const Weights& weights, bool routed, const Tensor& norm,
 }
 
 template <class Weights>
-Tensor linear(const Weights& weights, bool routed, const Tensor& norm,
+Tensor linear(const Weights& weights, const Tensor& norm,
     const Tensor& residual, const Tensor& attention_output,
-    double epsilon, double offset) {
+    double epsilon, double offset, bool serial_experts = false) {
     const auto batch = residual.size(0), tokens = residual.size(1), width = residual.size(2);
     auto pair = ops::recurrent_norm(residual, attention_output, norm, epsilon, offset);
     auto input = ops::reshape(pair[1], {batch * tokens, width});
-    if (!routed && !weights.important_neurons) {
-        auto flat_residual = ops::reshape(pair[0], {batch * tokens, width});
-        if (auto fused = ops::mlp_residual(input, flat_residual, weights.gate_up,
-                weights.down, weights.activation, weights.swiglu_limit, true))
-            return ops::reshape(*fused, {batch, tokens, width});
+    if constexpr (!std::is_same_v<Weights, Moe>) {
+        if (!weights.important_neurons) {
+            auto flat_residual = ops::reshape(pair[0], {batch * tokens, width});
+            if (auto fused = ops::mlp_residual(input, flat_residual, weights.gate_up,
+                    weights.down, weights.activation, weights.swiglu_limit, true))
+                return ops::reshape(*fused, {batch, tokens, width});
+        }
     }
-    auto output = ops::reshape(feed_forward(weights, input, false), {batch, tokens, width});
+    auto output = ops::reshape(feed_forward(weights, input, false, serial_experts), {batch, tokens, width});
     return ops::recurrent_add(pair[0], output);
 }
 

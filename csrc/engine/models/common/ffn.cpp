@@ -2,7 +2,7 @@
 
 namespace tyloi::models {
 
-Tensor ffn_internal::feed_forward(const Mlp& weights, const Tensor& input, bool bf16) {
+Tensor ffn_internal::feed_forward(const Mlp& weights, const Tensor& input, bool bf16, bool) {
     return dense_ffn(weights, input, bf16);
 }
 
@@ -16,14 +16,14 @@ Tensor full_ffn(const Mlp& weights, const Tensor& norm,
     const Tensor& residual, const Tensor& attention_output,
     double epsilon, double offset, bool bf16, bool trace,
     ops::Trace* trace_output) {
-    return ffn_internal::full(weights, false, norm, residual, attention_output,
+    return ffn_internal::full(weights, norm, residual, attention_output,
         epsilon, offset, bf16, trace, trace_output);
 }
 
 Tensor linear_ffn(const Mlp& weights, const Tensor& norm,
     const Tensor& residual, const Tensor& attention_output,
     double epsilon, double offset) {
-    return ffn_internal::linear(weights, false, norm, residual, attention_output,
+    return ffn_internal::linear(weights, norm, residual, attention_output,
         epsilon, offset);
 }
 

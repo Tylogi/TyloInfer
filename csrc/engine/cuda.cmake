@@ -52,6 +52,7 @@ set(TYLOINFER_CUDA_LOADING_SOURCES
     ${PROJECT_SOURCE_DIR}/engine/weights/quant.cpp
     ${PROJECT_SOURCE_DIR}/engine/weights/memory.cpp
     ${PROJECT_SOURCE_DIR}/engine/weights/moe/experts.cpp
+    ${PROJECT_SOURCE_DIR}/engine/weights/moe/batch.cpp
     ${PROJECT_SOURCE_DIR}/engine/models/common/load.cpp
 )
 if(TYLOINFER_ENABLE_MFQ_COMPAT)

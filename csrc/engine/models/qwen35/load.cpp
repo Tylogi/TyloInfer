@@ -26,7 +26,6 @@ namespace tyloi::cuda::qwen35 {
 namespace {
 
 struct LayerLoader : TransformerWeightLoader {
-    using Ffn = tyloi::cuda::Ffn;
     bool mirror_scalars = true;
     using DenseTensor = ::tyloi::DenseTensor;
 
@@ -163,7 +162,7 @@ Layer load_layer(const ::tyloi::weights::Loader& weights, const Config& config,
         full.attention.no_rope = config.positional_encoding == tyloi::models::PositionalEncoding::none;
         full.ffn_norm = weights.tensor(std::string(tensor_root) + ".block." +
                                        std::to_string(index) + ".mlp.norm.weight");
-        full.ffn = tyloi::models::qwen35::load_ffn<Ffn>(loader, config, index, tensor_root);
+        full.ffn = tyloi::models::qwen35::load_ffn(loader, config, index, tensor_root);
         result.weights = std::move(full);
     } else {
         Linear linear;
@@ -179,7 +178,7 @@ Layer load_layer(const ::tyloi::weights::Loader& weights, const Config& config,
         linear.attention.attn_norm = weights.tensor(prefix + "attention.norm.weight");
         linear.ffn_norm = weights.tensor(prefix + "mlp.norm.weight");
         loader.load_linear_attention(linear.attention, config, index, tensor_root);
-        linear.ffn = tyloi::models::qwen35::load_ffn<Ffn>(loader, config, index, tensor_root);
+        linear.ffn = tyloi::models::qwen35::load_ffn(loader, config, index, tensor_root);
         result.weights = std::move(linear);
     }
     return result;

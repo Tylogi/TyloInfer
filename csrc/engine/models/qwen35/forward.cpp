@@ -298,7 +298,8 @@ DenseTensor forward_layer(Collectives& collectives, const Layer& layer, LayerSta
         return ::tyloi::models::full_ffn(
             full->ffn, full->ffn_norm, output[0], output[1],
             attention.rms_norm_eps, attention.norm_weight_offset,
-            attention.official_bf16, attention.attention_output_gate, trace).dense();
+            attention.official_bf16, attention.attention_output_gate, trace,
+            options.ffn.batch_serial).dense();
     }
     const auto* linear = std::get_if<Linear>(&layer.weights);
     auto* linear_state = std::get_if<LinearState>(&state);
@@ -325,7 +326,8 @@ DenseTensor forward_layer(Collectives& collectives, const Layer& layer, LayerSta
             ::tyloi::Tensor(std::move(input)), linear_view, captured);
         auto result = ::tyloi::models::linear_ffn(
             linear->ffn, linear->ffn_norm, std::move(output[0]), std::move(output[1]),
-            attention.rms_norm_eps, attention.norm_weight_offset).dense();
+            attention.rms_norm_eps, attention.norm_weight_offset,
+            options.ffn.batch_serial).dense();
         if (confirmed_prefix > 0) {
             ++linear_state->speculative_projection_batches;
             ++linear_state->speculative_ffn_batches;

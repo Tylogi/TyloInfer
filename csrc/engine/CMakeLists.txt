@@ -16,6 +16,7 @@ add_library(mfq-engine STATIC
     models/common/attention.cpp
     models/common/ffn.cpp
     models/common/linear.cpp
+    models/common/moe.cpp
     models/common/vision/grid_vision.cpp
     models/deepseek_v4/config.cpp
     models/deepseek_v41/config.cpp

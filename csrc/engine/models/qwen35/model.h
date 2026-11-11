@@ -2,7 +2,7 @@
 
 #include "engine/models/qwen35/config.h"
 #include "engine/models/metadata.h"
-#include "engine/backends/cuda/ops/ffn/ffn.h"
+#include "engine/models/common/ffn.h"
 #include "engine/models/source/model_graph.h"
 #include "engine/models/common/attention.h"
 #include "engine/models/common/linear.h"
@@ -16,19 +16,18 @@
 
 namespace tyloi::cuda::qwen35 {
 
-using DenseTensor = ::tyloi::DenseTensor;
 using Config = tyloi::models::qwen35::Config;
 
 struct Full {
     ::tyloi::models::FullAttention attention;
     ::tyloi::Tensor ffn_norm;
-    Ffn ffn;
+    ::tyloi::models::Ffn ffn;
 };
 
 struct Linear {
     ::tyloi::models::LinearAttention attention;
     ::tyloi::Tensor ffn_norm;
-    Ffn ffn;
+    ::tyloi::models::Ffn ffn;
 };
 
 struct Layer {

@@ -14,15 +14,10 @@ namespace tyloi::cuda::qwen35 {
 
 using DenseTensor = ::tyloi::DenseTensor;
 
-static bool has_cached_experts(const Ffn& ffn) {
-    if (!ffn.is_moe)
-        return false;
-    if (ffn.moe_split_gate_up)
-        return ::tyloi::weights::cached(ffn.moe_gate) ||
-            ::tyloi::weights::cached(ffn.moe_up) ||
-            ::tyloi::weights::cached(ffn.moe_down);
-    return ::tyloi::weights::cached(ffn.moe_gate_up) ||
-        ::tyloi::weights::cached(ffn.moe_down);
+static bool has_cached_experts(const ::tyloi::models::Ffn& ffn) {
+    const auto* moe = std::get_if<::tyloi::models::Moe>(&ffn);
+    return moe && (::tyloi::weights::cached(moe->down) ||
+        std::any_of(moe->gate_up.begin(), moe->gate_up.end(), ::tyloi::weights::cached));
 }
 
 Batch::~Batch() {
@@ -287,7 +282,7 @@ void Batch::bind_paged_slots() {
 bool Batch::has_moe() const {
     for (const auto &layer : weights_->layers) {
         const bool result = std::visit(
-            [](const auto &value) { return value.ffn.is_moe; }, layer.weights);
+            [](const auto &value) { return std::holds_alternative<::tyloi::models::Moe>(value.ffn); }, layer.weights);
         if (result)
             return true;
     }
@@ -321,8 +316,8 @@ std::string Batch::incompatibility(bool cpu_offload, int cached_slots) const {
                     if (value.attention.sliding)
                         return "continuous batching requires non-sliding Qwen attention";
                 }
-                if (has_cached_experts(value.ffn) &&
-                    value.ffn.moe_top_k > cached_slots)
+                const auto* moe = std::get_if<::tyloi::models::Moe>(&value.ffn);
+                if (moe && has_cached_experts(value.ffn) && moe->top_k > cached_slots)
                     return "continuous batching requires one cached slot per routed expert";
                 return {};
             },

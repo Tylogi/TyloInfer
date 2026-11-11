@@ -131,23 +131,21 @@ void TransformerWeightLoader::important_neurons(int64_t hidden, int64_t intermed
     load_important_branch(weights, hidden, intermediate, ffn, false,
         down, gate, up);
 }
-void TransformerWeightLoader::experts(tyloi::cuda::Ffn& ffn, tyloi::models::ExpertProjection projection,
+::tyloi::Tensor TransformerWeightLoader::expert(tyloi::models::ExpertProjection projection,
                                      const std::string& name, int layer) const {
     using Role = tyloi::models::ExpertProjection;
     const auto& record = tyloi::require_tensor(weights.source, name);
-    ::tyloi::Tensor* weight = nullptr;
     const char* role = nullptr;
     switch (projection) {
-        case Role::gate: weight = &ffn.moe_gate; role = "gate"; break;
-        case Role::up: weight = &ffn.moe_up; role = "up"; break;
-        case Role::gate_up: weight = &ffn.moe_gate_up; role = "gate_up"; break;
-        case Role::down: weight = &ffn.moe_down; role = "down"; break;
+        case Role::gate: role = "gate"; break;
+        case Role::up: role = "up"; break;
+        case Role::gate_up: role = "gate_up"; break;
+        case Role::down: role = "down"; break;
     }
     if(record.dtype=="TQ") {
         if(projection==Role::gate_up)
             throw std::invalid_argument("TQ MoE stores separate Gate, Up and Down tensors: "+name);
-        *weight = weights.experts(name, true, layer, role);
-        return;
+        return weights.experts(name, true, layer, role);
     }
     if (record.dtype == "F32" || record.dtype == "F16" || record.dtype == "BF16") {
         // Source-precision banks stay dense instead of entering an MFE cohort.
@@ -163,19 +161,28 @@ void TransformerWeightLoader::experts(tyloi::cuda::Ffn& ffn, tyloi::models::Expe
         if (bank.dim() != 3)
             throw std::runtime_error(
                 "dense routed expert tensor must be [experts,out,in]: " + name);
-        *weight = std::move(bank);
-        return;
+        return bank;
     }
 
 #if TYLOINFER_ENABLE_MFQ_COMPAT
     if (cpu_offloaded)
-        *weight = load_mfe_cpu_offloaded(weights.source, name);
+        return load_mfe_cpu_offloaded(weights.source, name);
     else
-        *weight = weights.experts(name, true, layer, role);
+        return weights.experts(name, true, layer, role);
 
 #else
     throw std::runtime_error("Legacy MFQ inference requires a compatibility build");
 #endif
+}
+void TransformerWeightLoader::experts(tyloi::cuda::Ffn& ffn, tyloi::models::ExpertProjection projection,
+                                     const std::string& name, int layer) const {
+    auto weight = expert(projection, name, layer);
+    switch (projection) {
+        case tyloi::models::ExpertProjection::gate: ffn.moe_gate = std::move(weight); break;
+        case tyloi::models::ExpertProjection::up: ffn.moe_up = std::move(weight); break;
+        case tyloi::models::ExpertProjection::gate_up: ffn.moe_gate_up = std::move(weight); break;
+        case tyloi::models::ExpertProjection::down: ffn.moe_down = std::move(weight); break;
+    }
 }
 ::tyloi::Tensor TransformerWeightLoader::headwise(const std::string& name) const {
 #if TYLOINFER_ENABLE_MFQ_COMPAT
