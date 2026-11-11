@@ -215,6 +215,7 @@ void load(Model& model, const ::tyloi::weights::Loader& weights,
           LayerPlacementConfig& placement, const tyloi::ops::YarnScaling& yarn,
           int& cpu_layers, const LoadOptions& options) {
     model.device = ::tyloi::Device(::tyloi::kCUDA, weights.placement.device);
+    model.recurrent_transposed = options.recurrent_transposed;
     if (options.expert_parallel && model.config.num_experts <= 0)
         throw std::runtime_error("--expert-parallel requires a model with routed experts");
 
@@ -295,6 +296,23 @@ void load(Model& model, const ::tyloi::weights::Loader& weights,
         if (options.load_layers)
             throw std::invalid_argument("streamed model setup requires deferred layers");
         model.output_norm = weights.tensor("model.output_norm.weight");
+    }
+}
+
+void load_vision(Model& model, const ::tyloi::weights::Loader& weights, bool resident) {
+    const auto plan = cuda_model_plan(model.graph);
+    if (plan.vision == CudaVisionAdapter::grid_vit) {
+        const auto* component = model.graph.component("vision");
+        const auto& config = model.config;
+        if (component == nullptr || !config.grid_vision ||
+            !config.image_token_id || !config.video_token_id)
+            throw std::runtime_error("CUDA grid-Vision configuration is incomplete");
+        model.vision.emplace(tyloi::models::grid::Vision::load(
+            weights, weights.cache(), *config.grid_vision,
+            *config.image_token_id, *config.video_token_id,
+            component->input_contract, component->position_policy, resident));
+    } else if (plan.vision != CudaVisionAdapter::none) {
+        throw std::runtime_error("CUDA vision adapter is unsupported for Qwen");
     }
 }
 

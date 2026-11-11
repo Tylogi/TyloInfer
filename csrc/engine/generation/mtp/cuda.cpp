@@ -1,5 +1,6 @@
 #include "engine/weights/cache.h"
-#include "engine/models/qwen35/forward_cuda.h"
+#include "engine/models/qwen35/model.h"
+#include "engine/models/qwen35/state.h"
 #include "engine/models/qwen35/mtp.h"
 #include "engine/models/glm5_next/forward.h"
 #include "engine/models/nemotron_h/forward.h"

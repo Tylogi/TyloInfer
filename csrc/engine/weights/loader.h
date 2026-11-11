@@ -62,6 +62,8 @@ struct Loader {
         result.placement.cpu = cpu;
         return result;
     }
+    // The cache must outlive users of the returned reference.
+    Cache& cache() const noexcept;
     bool has(const std::string& name) const { return has_tensor(source, name); }
     bool has_prefix(const std::string& prefix) const { return has_tensor_prefix(source, prefix); }
     // Dense parameters promote half precision to F32; native/host preserve stored dtype.

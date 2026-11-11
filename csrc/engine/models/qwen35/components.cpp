@@ -4,15 +4,13 @@
 
 #include "engine/models/common/load.h"
 #include "engine/weights/loader.h"
-#include "engine/models/common/vision/grid_encoder.h"
 #include "engine/models/qwen35/load.h"
 #include "engine/models/qwen35/mtp.h"
-#include "engine/models/qwen35/state.h"
 #include "engine/backends/cuda/kernels/mfq_cuda_kv_quantization.h"
 
 #include "engine/backends/cuda/native/collectives.h"
 #include "engine/backends/cuda/executor/executor.h"
-#include "engine/backends/cuda/ops/projection/projection.h"
+#include "engine/backends/cuda/executor/options.h"
 #include "engine/weights/placement.h"
 #include "engine/weights/cache.h"
 
@@ -48,29 +46,6 @@ void Components::describe(tyloi::engine::EngineInfo& info) const {
         caps.full_duplex, caps.mtp, "model-graph+cuda-adapters"};
 }
 
-tyloi::StepSequence<tyloi::models::Prepared> Components::prepare(
-    Model& language, tyloi::cache::Media& images,
-#ifndef TYLOINFER_NATIVE_CUDA
-    Projector projector, Collectives& collectives,
-#endif
-    int primary,
-#ifndef TYLOINFER_NATIVE_CUDA
-    Executor* executor,
-#endif
-    const std::vector<int64_t>& tokens, const MfqMultimodalInput& media) {
-    if (grid_vision)
-        return grid_vision->prepare(language, images,
-#ifndef TYLOINFER_NATIVE_CUDA
-            projector, collectives,
-#endif
-            primary,
-#ifndef TYLOINFER_NATIVE_CUDA
-            executor,
-#endif
-            tokens, media);
-    throw std::invalid_argument("model has no multimodal component");
-}
-
 Components Components::load(
     Model& model,
     const ::tyloi::weights::Loader& weights, ::tyloi::weights::Cache& cache,
@@ -90,22 +65,8 @@ Components Components::load(
         !placement.enabled() && cpu_layers == 0 && !cpu_offload &&
         cache.transfer() == ::tyloi::weights::Cache::Transfer::automatic;
 
-    if (components.plan.vision == CudaVisionAdapter::grid_vit) {
-        const auto* component = components.graph.component("vision");
-        const auto& config = model.config;
-        if (component == nullptr || !config.grid_vision ||
-            !config.image_token_id || !config.video_token_id) {
-            throw std::runtime_error(
-                "CUDA grid-Vision configuration is incomplete");
-        }
-        components.grid_vision.emplace(
-            grid_vision_runtime::CudaGridVisionPromptComponent::load(
-                weights, cache, *config.grid_vision,
-                *config.image_token_id, *config.video_token_id,
-                component->input_contract, component->position_policy));
-    } else if (components.plan.vision != CudaVisionAdapter::none) {
-        throw std::runtime_error("CUDA vision adapter is unsupported for Qwen");
-    }
+    load_vision(model, weights, options::vision_resident());
+    components.vision_available = model.vision.has_value();
 
     if (components.plan.predictor == CudaPredictorAdapter::qwen35) {
         if (mtp_allowed && model.metadata.num_experts == 0 &&

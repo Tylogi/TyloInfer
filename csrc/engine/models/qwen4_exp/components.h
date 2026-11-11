@@ -16,7 +16,7 @@ struct Model;
 class State;
 
 struct Components {
-    std::optional<grid_vision_runtime::CudaGridVisionPromptComponent> grid_vision;
+    std::optional<tyloi::models::grid::Vision> grid_vision;
     std::unique_ptr<tyloi::models::Mtp> mtp;
 
     static constexpr bool streamed_kv() noexcept { return true; }

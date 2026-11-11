@@ -129,7 +129,10 @@ Tensor forward_layer(const Layer& layer, LayerState& state, Tensor input,
 
 } // namespace
 
-Tensor Model::forward(models::Input input, State& state, const models::ForwardOptions& options) const {
+Tensor Model::forward(models::Input input, models::State& value, const models::ForwardOptions& options) const {
+    auto* selected = dynamic_cast<State*>(&value);
+    require_forward(selected && selected->belongs_to(*this), "Qwen3.5 state belongs to another model");
+    auto& state = *selected;
     require_forward(!input.suffix, "Qwen3.5 does not support speculative suffix forwarding");
     const Device primary{device.type, options.primary};
     ops::DeviceScope scope(primary);
@@ -217,6 +220,7 @@ bool Model::supports_speculation() const noexcept {
 }
 
 void Model::replay(State& state, std::int64_t accepted) const {
+    require_forward(state.belongs_to(*this), "Qwen3.5 state belongs to another model");
     require_forward(state.speculative_start >= 0 && accepted >= 0, "no speculative transaction");
     try {
         const auto keep = state.rewind(accepted);

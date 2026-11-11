@@ -125,7 +125,8 @@ inline constexpr auto with_model = []<typename F>(
                     tyloi::cuda::qwen35::LoadOptions{
                         .gpu_layers = execution.config.n_gpu_layers,
                         .expert_parallel = execution.config.expert_parallel.enabled(),
-                        .mirror_scalars = execution.config.tensor_parallel_mirror_linear_attention_scalars});
+                        .mirror_scalars = execution.config.tensor_parallel_mirror_linear_attention_scalars,
+                        .recurrent_transposed = execution.executor().mode().transposed});
                 state = std::make_unique<qwen35::State>(*owner, execution.executor().mode().transposed);
                 if (preallocate) state->preallocate();
                 auto components = qwen35::Components::load(

@@ -3,7 +3,8 @@
 #include "engine/models/load.h"
 #include "engine/models/load_internal.h"
 #include "engine/models/deepseek_v41/vision.h"
-#include "engine/models/qwen35/forward_cuda.h"
+#include "engine/models/qwen35/model.h"
+#include "engine/models/qwen35/state.h"
 #include "engine/models/minicpmo45/forward.h"
 #include "engine/models/minicpmo45/text/forward.h"
 #include "engine/models/glm_dsa/forward.h"
@@ -148,8 +149,9 @@ std::unique_ptr<engine::Engine> load_native_engine(CudaEngineOptions options, en
                     {load.layer_placement.primary_device(), false, load.drop_file_cache,
                      load.tensor_parallel, moe_parallel_config(load)});
                 load.dense_cpu_layer_count = 0;
-                model = models::load(source, definition, options.context_size, loader,
-                    load.layer_placement, load.n_gpu_layers, load.expert_parallel.enabled());
+                model = models::load(source, definition, loader, load.layer_placement,
+                    {.context = options.context_size, .gpu_layers = load.n_gpu_layers,
+                     .expert_parallel = load.expert_parallel.enabled(), .yarn = load.yarn});
                 state = model->make_state();
                 finalize_kv(kv.get(), *weights, offload);
                 std::size_t pending_kv = 0;

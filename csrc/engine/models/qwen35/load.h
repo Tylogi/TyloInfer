@@ -22,6 +22,7 @@ struct LoadOptions {
     int gpu_layers = -1;
     bool expert_parallel = false;
     bool mirror_scalars = true;
+    bool recurrent_transposed = false;
     bool load_layers = true;
     bool load_input_output = true;
 };
@@ -31,6 +32,8 @@ Model read(std::shared_ptr<const tyloi::ModelSource> source,
 void load(Model& model, const ::tyloi::weights::Loader& weights,
           LayerPlacementConfig& placement, const tyloi::ops::YarnScaling& yarn,
           int& cpu_layers, const LoadOptions& options);
+
+void load_vision(Model& model, const ::tyloi::weights::Loader& weights, bool resident = false);
 
 Layer load_layer(const ::tyloi::weights::Loader&, const Config&,
                  int index, const std::string& type, bool mirror_scalars = true,

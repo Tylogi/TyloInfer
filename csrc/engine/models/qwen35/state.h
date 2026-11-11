@@ -4,6 +4,7 @@
 #include "engine/models/state.h"
 #include "engine/state/kv_view.h"
 #include "engine/state/recurrent.h"
+#include "engine/state/media.h"
 #include "engine/models/common/linear.h"
 
 #include <cstdint>
@@ -76,6 +77,7 @@ public:
     void advance(std::int64_t tokens) noexcept override { cache_pos += tokens; }
     void set_position_delta(std::int64_t delta) noexcept override { decode_position_delta = delta; }
     void commit_speculative() override;
+    void rollback_speculative(std::int64_t accepted) override;
     std::int64_t rewind(std::int64_t accepted_suffix);
     void abort_speculative() noexcept;
 
@@ -93,7 +95,9 @@ public:
 
     const std::vector<Layout>& layout() const noexcept { return layout_; }
     bool transposed() const noexcept { return transposed_; }
+    bool belongs_to(const Model& model) const noexcept { return owner_ == &model; }
 
+    tyloi::cache::Media images;
     std::vector<LayerState> layers;
     std::int64_t cache_pos = 0;
     std::int64_t decode_position_delta = 0;
@@ -102,6 +106,7 @@ public:
     std::int64_t batch = 0;
 
 private:
+    const Model* owner_;
     std::vector<Layout> layout_;
     std::int64_t max_position_embeddings_;
     bool transposed_;

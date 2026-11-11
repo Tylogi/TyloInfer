@@ -1,6 +1,7 @@
 #include "engine/models/qwen4_exp/components.h"
 
 #include "engine/backends/cuda/executor/execution.h"
+#include "engine/backends/cuda/executor/options.h"
 #include "engine/models/source/model_config.h"
 #include "engine/models/qwen4_exp/ops.h"
 #include "engine/models/qwen4_exp/predictor.h"
@@ -29,15 +30,8 @@ tyloi::StepSequence<tyloi::models::Prepared> Components::prepare(
         Executor* executor,
 #endif
         const std::vector<int64_t>& tokens, const MfqMultimodalInput& media) {
-    if (grid_vision) return grid_vision->prepare(language, images,
-#ifndef TYLOINFER_NATIVE_CUDA
-        projector, collectives,
-#endif
-        primary,
-#ifndef TYLOINFER_NATIVE_CUDA
-        executor,
-#endif
-        tokens, media);
+    if (grid_vision) return grid_vision->prepare(
+        language, images, tyloi::Device(tyloi::kCUDA, primary), tokens, media);
     throw std::invalid_argument("model has no multimodal component");
 }
 
@@ -77,9 +71,9 @@ Components load_components(
             throw std::runtime_error("invalid Qwen4 grid-ViT text geometry or placeholder IDs");
         const auto* component = model.graph.component("vision");
         result.grid_vision.emplace(
-            tyloi::cuda::grid_vision_runtime::CudaGridVisionPromptComponent::load(
+            tyloi::models::grid::Vision::load(
                 weights, model.execution->weights, config, image, video,
-                component->input_contract, component->position_policy));
+                component->input_contract, component->position_policy, options::vision_resident()));
     } else if (model.plan.vision != tyloi::cuda::CudaVisionAdapter::none) {
         throw std::runtime_error("unsupported Qwen4 CUDA vision adapter");
     }

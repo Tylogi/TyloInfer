@@ -1,6 +1,5 @@
 set(TYLOINFER_CUDA_MODEL_SOURCES
     ${PROJECT_SOURCE_DIR}/engine/models/deepseek_v41/axial_patch_encoder.cpp
-    ${PROJECT_SOURCE_DIR}/engine/models/common/vision/grid_encoder.cpp
     ${PROJECT_SOURCE_DIR}/engine/models/deepseek_v4/ops.cpp
     ${PROJECT_SOURCE_DIR}/engine/models/deepseek_v41/ops.cpp
     ${PROJECT_SOURCE_DIR}/engine/models/deepseek_v41/components.cpp
@@ -33,7 +32,6 @@ set(TYLOINFER_MODELS_CUDA_SOURCES
     ${PROJECT_SOURCE_DIR}/engine/models/minicpmo45/state.cpp
     ${PROJECT_SOURCE_DIR}/engine/models/minicpmo45/forward.cpp
     ${PROJECT_SOURCE_DIR}/engine/models/qwen35/load.cpp
-    ${PROJECT_SOURCE_DIR}/engine/models/qwen35/forward_cuda.cpp
     ${PROJECT_SOURCE_DIR}/engine/models/qwen35/batch.cpp
     ${PROJECT_SOURCE_DIR}/engine/models/qwen35/batch_ops.cpp
     ${PROJECT_SOURCE_DIR}/engine/models/qwen35/mtp.cpp

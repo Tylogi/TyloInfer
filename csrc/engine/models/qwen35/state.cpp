@@ -116,7 +116,7 @@ void initialize_layers(std::vector<LayerState>& layers,
 } // namespace
 
 State::State(const Model& model, bool transposed)
-    : max_position_embeddings_(model.metadata.max_position_embeddings),
+    : owner_(&model), max_position_embeddings_(model.metadata.max_position_embeddings),
       transposed_(transposed) {
     layout_.reserve(model.layers.size());
     for (const auto& layer : model.layers) {
@@ -282,6 +282,10 @@ void State::commit_speculative() {
     speculative_confirmed = 0;
 }
 
+void State::rollback_speculative(std::int64_t accepted) {
+    owner_->replay(*this, accepted);
+}
+
 std::int64_t State::rewind(std::int64_t accepted_suffix) {
     require_state(speculative_start >= 0 && accepted_suffix >= 0,
                   "no speculative transaction");
@@ -331,6 +335,7 @@ std::vector<::tyloi::Tensor> State::storage() const {
     const auto append = [&result](const ::tyloi::Tensor& tensor) {
         if (tensor && tensor.defined()) result.push_back(tensor);
     };
+    append(images.tensor());
     for (const auto& state : layers) {
         if (const auto* cache = std::get_if<tyloi::state::KvView>(&state)) {
             if (cache->paged()) {

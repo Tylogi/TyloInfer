@@ -2,6 +2,7 @@
 
 #include "engine/models/causal_model.h"
 #include "engine/models/gemma4/load.h"
+#include "engine/models/qwen35/load.h"
 #include "engine/models/source.h"
 #include "engine/models/source/model_graph.h"
 
@@ -13,16 +14,25 @@ namespace tyloi::models {
 std::unique_ptr<CausalModel> load(
     std::shared_ptr<const ModelSource> source,
     std::string_view definition,
-    std::int64_t context,
     const weights::Loader& weights,
     LayerPlacementConfig& placement,
-    int gpu_layers,
-    bool expert_parallel) {
+    LoadOptions options) {
     const auto model_graph = graph(*source);
     if (model_graph.backbone == "gemma4") {
         return ::tyloi::cuda::gemma4::load(
-            std::move(source), definition, context, weights, placement,
-            gpu_layers, expert_parallel);
+            std::move(source), definition, options.context, weights, placement,
+            options.gpu_layers, options.expert_parallel);
+    }
+    if (model_graph.backbone == "qwen3_5" || model_graph.backbone == "generic_qwen") {
+        auto model = std::make_unique<::tyloi::cuda::qwen35::Model>(
+            ::tyloi::cuda::qwen35::read(std::move(source), definition, options.context));
+        int cpu_layers = 0;
+        ::tyloi::cuda::qwen35::load(*model, weights, placement, options.yarn, cpu_layers,
+            {.gpu_layers = options.gpu_layers, .expert_parallel = options.expert_parallel,
+             .mirror_scalars = options.mirror_scalars,
+             .recurrent_transposed = options.recurrent_transposed});
+        ::tyloi::cuda::qwen35::load_vision(*model, weights, options.vision_resident);
+        return model;
     }
     throw std::runtime_error(
         "unsupported model backbone: " + model_graph.backbone);

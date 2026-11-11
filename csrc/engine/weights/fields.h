@@ -4,6 +4,7 @@
 #include "engine/weights/sharded.h"
 
 #include <cstddef>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -12,9 +13,8 @@ namespace tyloi::weights::fields {
 // Read-only enumeration of the owning tensor handles a record needs.
 template <class Visitor>
 void tensors(const ::tyloi::Tensor& weight, Visitor visit) {
-    TYLOINFER_RUNTIME_CHECK(
-        weight.representation<::tyloi::ShardedTensor>() == nullptr,
-        "streamed vision weights require one CUDA device");
+    if (weight.representation<::tyloi::ShardedTensor>() != nullptr)
+        throw std::runtime_error("streamed vision weights require one CUDA device");
     if (!weight || !weight.defined()) return;
     visit(weight);
 }

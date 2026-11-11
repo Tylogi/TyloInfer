@@ -120,8 +120,11 @@ BatchOps::Sample BatchOps::prefill(const std::shared_ptr<Request>& request,
     tyloi::models::Input input;
     input.ids = request->prefill_ids.narrow(1, chunk.offset, chunk.count).contiguous();
     input.lengths = length.value_or(::tyloi::DenseTensor());
-    hidden = forward(*model_, request->cache.state(), request->cache.executor(),
-                     collectives_, mode_, std::move(input));
+    {
+        auto scope = request->cache.executor().enter(mfq_current_cuda_device(), mode_.ffn);
+        hidden = model_->forward(std::move(input), request->cache.state(),
+            {mode_.kv_capacity, mode_.trace, mode_.trace_layer, mode_.primary, mode_.ffn.batch_serial});
+    }
     const auto end = chunk.offset + chunk.count;
     if (end < request->prefill_ids.size(1)) {
         TYLOINFER_CUDA_CHECK(
@@ -313,9 +316,9 @@ BatchOps::Decoded BatchOps::decode(State& state) {
                 input.cache_positions = pos;
                 input.kv_length = planned_len;
                 input.attention_parts = graph_attention_parts;
-                auto hidden = forward(*model_, state_.state(), state_.executor(),
-                                      collectives_, mode,
-                                      std::move(input));
+                auto scope = state_.executor().enter(mfq_current_cuda_device(), mode.ffn);
+                auto hidden = model_->forward(std::move(input), state_.state(),
+                    {mode.kv_capacity, mode.trace, mode.trace_layer, mode.primary, mode.ffn.batch_serial});
                 auto current_logits = state_.logits_from_last_hidden(std::move(hidden), mode);
 #ifdef TYLOINFER_NATIVE_CUDA
                 return sample_greedy_cuda(current_logits.dense().contiguous().view({batch, -1}));
@@ -352,9 +355,9 @@ BatchOps::Decoded BatchOps::decode(State& state) {
             input.positions = pos;
             input.lengths = lengths;
             input.cache_positions = pos;
-            auto hidden = forward(*model_, state_.state(), state_.executor(),
-                                  collectives_, mode,
-                                  std::move(input));
+            auto scope = state_.executor().enter(mfq_current_cuda_device(), mode.ffn);
+            auto hidden = model_->forward(std::move(input), state_.state(),
+                {mode.kv_capacity, mode.trace, mode.trace_layer, mode.primary, mode.ffn.batch_serial});
             logits = state_.logits_from_last_hidden(std::move(hidden), mode);
         }
         state_.finish_decode(max_sequence_length);

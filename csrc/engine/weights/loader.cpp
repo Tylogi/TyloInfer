@@ -45,6 +45,8 @@ tyloi::weights::Loader::Loader(const tyloi::source::Source& source, Options opti
     : source(source), options(std::move(options)), placement(std::move(placement)),
       impl_(std::make_shared<Impl>(Impl{cache, detail::cache(cache).exec})) {}
 
+tyloi::weights::Cache& tyloi::weights::Loader::cache() const noexcept { return impl_->cache; }
+
 void LayerPlacementConfig::prepare(int64_t layers) {
     layer_devices.assign(static_cast<size_t>(layers), primary_device());
     if (!enabled()) return;

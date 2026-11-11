@@ -25,6 +25,8 @@ public:
         value_ = ::tyloi::Tensor{};
     }
 
+    const ::tyloi::Tensor& tensor() const noexcept { return value_; }
+
 private:
     std::string key_;
     ::tyloi::Tensor value_;

@@ -419,7 +419,8 @@ DenseTensor Batch::logits_from_last_hidden(DenseTensor hidden, const Executor::M
                     .to(::tyloi::kFloat16)
                     .contiguous();
 #endif
-    return qwen35::logits(*weights_, *executor_, std::move(last), true, mode);
+    auto scope = executor_->enter(mfq_current_cuda_device(), mode.ffn);
+    return weights_->logits(last, true);
 }
 
 std::vector<const void *> Batch::decode_state_addresses() {

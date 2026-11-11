@@ -11,8 +11,7 @@ tyloi::StepSequence<tyloi::models::Prepared> Text<M, S, P>::prepare(InferenceReq
         if (!components) throw std::invalid_argument("model has no multimodal component");
         return components->prepare(input.prompt, *input.vision);
     } else if constexpr (std::is_same_v<Model, qwen4_exp::Model> ||
-                         std::is_same_v<Model, nemotron_h::Model> ||
-                         std::is_same_v<Model, qwen35::Model>) {
+                         std::is_same_v<Model, nemotron_h::Model>) {
         return components.prepare(language, images,
 #ifndef TYLOINFER_NATIVE_CUDA
         execution->executor().projector(execution->executor().mode().ffn, model_parallel_primary_device(execution->config)),
