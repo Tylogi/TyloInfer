@@ -12,6 +12,7 @@
 namespace tyloi::cuda::nemotron_h {
 
 struct Model;
+struct Mamba;
 
 struct MambaState {
     Recurrent mixer;
@@ -20,7 +21,11 @@ struct MambaState {
 
 using LayerState = std::variant<std::monostate, MambaState, tyloi::state::KvView>;
 
-class State {
+class State
+#ifdef TYLOINFER_NATIVE_CUDA
+    : public tyloi::models::State
+#endif
+{
 public:
     explicit State(const Model&);
     State(const State&) = delete;
@@ -34,6 +39,9 @@ public:
     void set_position_delta(std::int64_t delta) noexcept { decode_position_delta = delta; }
     void preallocate();
     void commit_speculative();
+#ifdef TYLOINFER_NATIVE_CUDA
+    void rollback_speculative(std::int64_t accepted) override;
+#endif
     std::vector<::tyloi::Tensor> storage() const;
     std::vector<::tyloi::Tensor*> graph_state();
     TextSessionStateKind text_session_state_kind() const;
@@ -44,6 +52,9 @@ public:
 
     struct MambaLayout {
         std::int64_t heads, head_dim, state_size, groups, conv_kernel;
+#ifdef TYLOINFER_NATIVE_CUDA
+        const Mamba* weights;
+#endif
     };
     struct FullLayout {
         std::int64_t heads, head_dim, capacity;
@@ -58,7 +69,9 @@ public:
     const std::vector<Layout>& layout() const noexcept { return layout_; }
 
     std::vector<LayerState> layers;
+#ifndef TYLOINFER_NATIVE_CUDA
     std::unique_ptr<tyloi::models::MtpState> predictor;
+#endif
     std::int64_t cache_pos = 0, decode_position_delta = 0, batch = 0;
     std::int64_t speculative_start = -1, speculative_confirmed = 0;
 
