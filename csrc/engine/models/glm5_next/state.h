@@ -41,7 +41,11 @@ struct MlaState {
 
 using LayerState = std::variant<KdaState, MlaState>;
 
-class State {
+class State
+#ifdef TYLOINFER_NATIVE_CUDA
+    : public tyloi::models::State
+#endif
+{
 public:
     explicit State(const Model&);
     State(const State&) = delete;
@@ -53,11 +57,13 @@ public:
     void advance(int64_t tokens) noexcept { cache_pos += tokens; }
     void set_position_delta(int64_t delta) noexcept { decode_position_delta = delta; }
     void preallocate() {}
-    void commit_speculative();
 #ifdef TYLOINFER_NATIVE_CUDA
-    std::vector<::tyloi::Tensor> storage() const { return {}; }
-    std::vector<::tyloi::Tensor*> graph_state() { return {}; }
+    void commit_speculative() override;
+    std::vector<::tyloi::Tensor> storage() const override;
+    std::vector<::tyloi::Tensor*> graph_state() override { return {}; }
+    void rollback_speculative(std::int64_t accepted) override;
 #else
+    void commit_speculative();
     std::vector<DenseTensor> storage() const { return {}; }
     std::vector<DenseTensor*> graph_state() { return {}; }
 #endif
@@ -68,9 +74,15 @@ public:
     void restore_text_session_state(const TextSessionState&);
 
     std::vector<LayerState> layers;
+#ifndef TYLOINFER_NATIVE_CUDA
     std::unique_ptr<tyloi::models::MtpState> predictor;
+#endif
     int64_t cache_pos = 0, decode_position_delta = 0, batch = 0;
     int64_t speculative_start = -1, speculative_confirmed = 0;
+#ifdef TYLOINFER_NATIVE_CUDA
+private:
+    std::vector<int> devices;
+#endif
 };
 
 } // namespace tyloi::cuda::glm5_next

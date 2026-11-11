@@ -3,6 +3,9 @@
 #include "engine/models/glm5_next/weights.h"
 #include "engine/models/glm5_next/state.h"
 #include "engine/models/metadata.h"
+#ifdef TYLOINFER_NATIVE_CUDA
+#include "engine/models/causal_model.h"
+#endif
 #include "engine/models/common/capabilities.h"
 #include "engine/models/source.h"
 #include "engine/backends/cuda/ops/projection/quant_linear.h"
@@ -354,7 +357,24 @@ struct Layer {
     int device = 0;
 };
 
-struct Model {
+struct Model
+#ifdef TYLOINFER_NATIVE_CUDA
+    : tyloi::models::CausalModel
+#endif
+{
+#ifdef TYLOINFER_NATIVE_CUDA
+    tyloi::models::Info info() const override;
+    bool supports_speculation() const noexcept override;
+    MfqModelCapabilities capabilities() const override;
+    tyloi::engine::Metrics metrics() const override;
+    std::unique_ptr<tyloi::models::State> make_state() const override;
+    tyloi::StepSequence<tyloi::models::Prepared> prepare(const std::vector<std::int64_t>&, const MfqMultimodalInput&, tyloi::models::State&) const override;
+    ::tyloi::Tensor embedding(const ::tyloi::Tensor&, int primary = 0) const override;
+    ::tyloi::Tensor normalize(const ::tyloi::Tensor&, std::int64_t, std::int64_t) const override;
+    ::tyloi::Tensor softcap(const ::tyloi::Tensor&) const override;
+    ::tyloi::Tensor logits(const ::tyloi::Tensor&, bool capped = true) const override;
+    ::tyloi::Tensor forward(tyloi::models::Input, tyloi::models::State&, const tyloi::models::ForwardOptions& = {}) const override;
+#endif
     std::shared_ptr<const tyloi::ModelSource> source;
     tyloi::ModelGraph graph;
     CudaModelPlan plan;
