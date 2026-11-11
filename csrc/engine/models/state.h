@@ -37,6 +37,9 @@ public:
     virtual ~State() = default;
     std::unique_ptr<MtpState> predictor;
     virtual void preallocate() = 0;
+    virtual std::vector<std::pair<tyloi::Device, std::size_t>> preallocate_growth() const {
+        throw std::logic_error("state preallocation planning is not implemented");
+    }
     virtual void reset(std::int64_t batch) = 0;
     virtual std::int64_t position() const noexcept = 0;
     virtual void advance(std::int64_t tokens) noexcept = 0;

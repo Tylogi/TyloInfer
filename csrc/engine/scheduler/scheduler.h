@@ -67,6 +67,7 @@ private:
     bool stopping_ = false;
     bool reload_enabled_ = false;
     bool healthy_ = true;
+    std::exception_ptr shutdown_failure_;
     std::thread worker_;
     std::unordered_map<std::string, Request> requests_;
     std::deque<std::string> order_;

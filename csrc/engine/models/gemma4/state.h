@@ -26,6 +26,7 @@ public:
     State& operator=(State&&) noexcept = default;
 
     void preallocate() override;
+    std::vector<std::pair<tyloi::Device, std::size_t>> preallocate_growth() const override;
     // Allocate every missing layer cache as one group; a failure leaves no partial cache.
     void prepare_caches(std::int64_t batch, std::int64_t tokens,
         const tyloi::models::ForwardOptions& options);
@@ -56,6 +57,8 @@ public:
     std::int64_t batch = 0;
 
 private:
+    std::vector<std::pair<tyloi::Device, std::size_t>> cache_growth(
+        std::int64_t batch, std::int64_t tokens, const tyloi::models::ForwardOptions& options) const;
     std::vector<Layout> layout_;
     std::vector<::tyloi::Tensor> graph_views_;
 };

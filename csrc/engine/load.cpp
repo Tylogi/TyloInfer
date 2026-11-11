@@ -108,6 +108,7 @@ std::unique_ptr<engine::Engine> load_native_engine(CudaEngineOptions options, en
     CudaLoadConfig load;
     tyloi::engine::Config config;
     std::unique_ptr<Executor> root;
+    std::unique_ptr<tyloi::Executor> execution;
     std::unique_ptr<models::CausalModel> model;
     std::unique_ptr<models::State> state;
     std::unique_ptr<tyloi::state::Sessions> sessions;
@@ -130,6 +131,7 @@ std::unique_ptr<engine::Engine> load_native_engine(CudaEngineOptions options, en
             ledger = std::make_shared<tyloi::weights::Memory>();
             tyloi::weights::LoadScope memory_load(*ledger);
             config = internal::resolve_cuda_config(options);
+            config.preallocate_kv = ::tyloi::cuda::options::kv_vram_preallocated();
             if (config.continuous_batch.max_sequences)
                 throw std::invalid_argument("continuous batching is unavailable for this model");
             const auto kv_options = ::tyloi::cuda::options::qsa_kv_offload();
@@ -149,9 +151,18 @@ std::unique_ptr<engine::Engine> load_native_engine(CudaEngineOptions options, en
                 model = models::load(source, definition, options.context_size, loader,
                     load.layer_placement, load.n_gpu_layers, load.expert_parallel.enabled());
                 state = model->make_state();
-                if (::tyloi::cuda::options::kv_vram_preallocated()) state->preallocate();
                 finalize_kv(kv.get(), *weights, offload);
-                finish_load(kv.get(), *weights, load.report_cuda_memory);
+                std::size_t pending_kv = 0;
+                if (config.preallocate_kv) {
+                    const Device primary(kCUDA, load.layer_placement.primary_device());
+                    for (const auto& [device, bytes] : state->preallocate_growth()) {
+                        if (device != primary) continue;
+                        if (pending_kv > std::numeric_limits<std::size_t>::max() - bytes)
+                            throw std::overflow_error("pending KV reserve overflow");
+                        pending_kv += bytes;
+                    }
+                }
+                finish_load(kv.get(), *weights, load.report_cuda_memory, pending_kv);
                 if (offload) throw std::invalid_argument("CUDA streamed KV requires a QSA model");
             }
             graph = root->graph();
@@ -175,35 +186,46 @@ std::unique_ptr<engine::Engine> load_native_engine(CudaEngineOptions options, en
         config.resident_budget_bytes = ::tyloi::cuda::options::resident_budget_bytes();
         config.decode_graph.enabled &= graph_allowed;
         models::ForwardOptions forward{mode.kv_capacity, mode.trace, mode.trace_layer, mode.primary};
+        execution = std::move(root);
         if (target) {
-            target->rebind(std::move(model), std::move(root), std::move(config), std::move(source),
+            target->rebind(std::move(model), std::move(execution), std::move(config), std::move(source),
                 std::move(ledger), std::move(weights), std::move(state), std::move(sessions),
                 std::move(text), forward, std::move(graph));
             return {};
         }
-        return std::make_unique<engine::Engine>(std::move(model), std::move(root), std::move(config),
+        return std::make_unique<engine::Engine>(std::move(model), std::move(execution), std::move(config),
             std::move(source), std::move(ledger), std::move(weights), std::move(state),
             std::move(sessions), std::move(text), forward, std::move(graph));
     } catch (...) {
         const auto failure = std::current_exception();
-        if (root) {
-            try { if (weights) drain_cuda(*root, *weights, offload.get(), load.layer_placement, load.tensor_parallel, load.expert_parallel); }
-            catch (const std::exception& error) { std::cerr << "runtime_load_cleanup error=" << error.what() << '\n'; }
-            catch (...) { std::cerr << "runtime_load_cleanup error=unknown\n"; }
-            std::unique_ptr<tyloi::Executor::Scope> scope;
+        auto* owner = execution ? execution.get() : root.get();
+        if (owner) {
             try {
-                scope = root->enter(load.layer_placement.primary_device());
+                auto scope = owner->enter();
+                std::exception_ptr cleanup;
+                const auto finish = [&](auto&& work) {
+                    try { work(); } catch (...) { if (!cleanup) cleanup = std::current_exception(); }
+                };
+                if (graph) graph->invalidate();
+                finish([&] { if (weights) weights->drain(); });
+                finish([&] { if (offload) offload->flush(); });
+                finish([&] { owner->drain(); });
+                if (cleanup) std::rethrow_exception(cleanup);
+                if (weights) weights->release_workspace();
+                owner->drain();
+                graph.reset();
+                state.reset(); sessions.reset();
+                if (weights) weights->clear_workspace();
+                model.reset(); offload.reset(); kv.reset(); weights.reset();
+                owner->clear();
             } catch (const std::exception& error) {
-                std::cerr << "runtime_load_cleanup error=" << error.what() << '\n';
+                std::cerr << "runtime_load_cleanup error=" << error.what() << std::endl;
+                std::terminate();
             } catch (...) {
-                std::cerr << "runtime_load_cleanup error=unknown\n";
+                std::cerr << "runtime_load_cleanup error=unknown" << std::endl;
+                std::terminate();
             }
-            graph.reset();
-            try { root->clear(); }
-            catch (const std::exception& error) { std::cerr << "runtime_load_cleanup error=" << error.what() << '\n'; }
-            catch (...) { std::cerr << "runtime_load_cleanup error=unknown\n"; }
-            state.reset(); model.reset(); sessions.reset(); offload.reset(); kv.reset(); weights.reset();
-            scope.reset();
+            execution.reset();
             root.reset();
         }
         std::rethrow_exception(failure);
@@ -382,10 +404,14 @@ void finalize_kv(KvMemoryManager* kv, tyloi::weights::Cache& weights,
 }
 
 std::chrono::steady_clock::time_point finish_load(
-        KvMemoryManager* kv, tyloi::weights::Cache& weights, bool report_memory) {
+        KvMemoryManager* kv, tyloi::weights::Cache& weights, bool report_memory,
+        std::size_t pending_kv) {
     if (weights.needs_finalize()) {
+        const auto reserve = kv ? kv->growth_reserve() : 0;
+        if (reserve > std::numeric_limits<std::size_t>::max() - pending_kv)
+            throw std::overflow_error("KV reserve overflow");
         weights.finalize(
-            kv ? kv->growth_reserve() : 0,
+            reserve + pending_kv,
             kv ? kv->expert_budget_charge() : 0);
     }
     mfq_cuda_synchronize();

@@ -55,13 +55,13 @@ public:
         std::unique_ptr<models::State> model_state, std::unique_ptr<state::Sessions> sessions,
         std::unique_ptr<TextProcessor> text, models::ForwardOptions forward,
         std::unique_ptr<tyloi::Executor::Graph> graph);
-    // Retire active requests before replacing dependencies; the Scheduler remains attached.
-    void rebind(std::unique_ptr<models::CausalModel> model, std::unique_ptr<tyloi::Executor> executor,
-        Config config, std::shared_ptr<const ModelSource> source,
-        std::shared_ptr<weights::Memory> memory, std::unique_ptr<weights::Cache> weights,
-        std::unique_ptr<models::State> model_state, std::unique_ptr<state::Sessions> sessions,
-        std::unique_ptr<TextProcessor> text, models::ForwardOptions forward,
-        std::unique_ptr<tyloi::Executor::Graph> graph);
+    // Retire active requests first. Failed retirement leaves incoming owners with the caller.
+    void rebind(std::unique_ptr<models::CausalModel>&& model, std::unique_ptr<tyloi::Executor>&& executor,
+        Config config, std::shared_ptr<const ModelSource>&& source,
+        std::shared_ptr<weights::Memory>&& memory, std::unique_ptr<weights::Cache>&& weights,
+        std::unique_ptr<models::State>&& model_state, std::unique_ptr<state::Sessions>&& sessions,
+        std::unique_ptr<TextProcessor>&& text, models::ForwardOptions forward,
+        std::unique_ptr<tyloi::Executor::Graph>&& graph);
 #endif
     // Start one consumer before enable_reload(); next_reload() delivers posted work before shutdown.
     // Complete reply only after binding and its execution scopes have exited.

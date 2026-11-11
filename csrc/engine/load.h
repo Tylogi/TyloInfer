@@ -58,6 +58,7 @@ namespace tyloi::cuda {
 void finalize_kv(KvMemoryManager* kv, tyloi::weights::Cache& weights,
     std::shared_ptr<KvOffloadStore>& offload);
 std::chrono::steady_clock::time_point finish_load(
-    KvMemoryManager* kv, tyloi::weights::Cache& weights, bool report_memory);
+    KvMemoryManager* kv, tyloi::weights::Cache& weights, bool report_memory,
+    std::size_t pending_kv = 0);
 
 } // namespace tyloi::cuda

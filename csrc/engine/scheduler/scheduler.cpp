@@ -36,8 +36,8 @@ void Engine::start() {
     try { scheduler_ = std::make_unique<Scheduler>(*this); }
     catch (...) {
         try { unload_model(); }
-        catch (const std::exception& error) { std::cerr << "runtime_unload_cleanup error=" << error.what() << '\n'; }
-        catch (...) { std::cerr << "runtime_unload_cleanup error=unknown\n"; }
+        catch (const std::exception& error) { std::cerr << "runtime_unload_cleanup error=" << error.what() << '\n'; std::terminate(); }
+        catch (...) { std::cerr << "runtime_unload_cleanup error=unknown\n"; std::terminate(); }
         throw;
     }
 }
@@ -92,18 +92,29 @@ Scheduler::Scheduler(Engine& engine, Limits limits)
     std::promise<void> ready;
     auto initialized = ready.get_future();
     worker_ = std::thread([this, &ready] {
-        refresh_snapshot(true, false, true);
-        ready.set_value();
+        try {
+            refresh_snapshot(true, false, true);
+            ready.set_value();
+        } catch (...) {
+            ready.set_exception(std::current_exception());
+            return;
+        }
         loop();
     });
-    initialized.get();
+    try { initialized.get(); }
+    catch (...) { worker_.join(); throw; }
 }
-Scheduler::~Scheduler() { shutdown(); }
+Scheduler::~Scheduler() {
+    try { shutdown(); }
+    catch (const std::exception& error) { std::cerr << "runtime_shutdown error=" << error.what() << '\n'; }
+    catch (...) { std::cerr << "runtime_shutdown error=unknown\n"; }
+}
 void Scheduler::shutdown() {
     { std::lock_guard lock(mutex_); stopping_ = true; snapshot_.status.available = 0; }
     wake_->notify_one();
     reload_wake_.notify_all();
     if (worker_.joinable()) worker_.join();
+    if (shutdown_failure_) std::rethrow_exception(shutdown_failure_);
 }
 void Scheduler::enqueue(Command command) const {
     std::lock_guard lock(mutex_);
@@ -517,14 +528,19 @@ void Scheduler::loop() noexcept {
                 if (!status.healthy) throw std::runtime_error("engine is unhealthy");
                 executable = advanced || !events.empty();
             }
+            bool refresh;
+            { std::lock_guard lock(mutex_); refresh = std::exchange(snapshot_requested_, false); }
+            refresh_snapshot(healthy_, reload.has_value() || duplex_active || stopping, !commands.empty() || refresh);
         } catch (const std::exception& error) {
             healthy_ = false;
+            { std::lock_guard lock(mutex_); snapshot_.status = {0, false}; }
             retire_failed();
             for (auto& [id, request] : requests_)
                 if (!request.finished)
                     try { publish(request, {id, Failed{"backend_failure", error.what()}}); } catch (...) {}
         } catch (...) {
             healthy_ = false;
+            { std::lock_guard lock(mutex_); snapshot_.status = {0, false}; }
             retire_failed();
             for (auto& [id, request] : requests_)
                 if (!request.finished)
@@ -574,12 +590,16 @@ void Scheduler::loop() noexcept {
         }
         if (!order_.empty()) { order_.push_back(order_.front()); order_.pop_front(); }
         if (stopping && requests_.empty()) {
-            try { engine_.unload_model(); } catch (...) {}
+            try { engine_.unload_model(); }
+            catch (...) {
+                shutdown_failure_ = std::current_exception();
+                healthy_ = false;
+                std::lock_guard lock(mutex_);
+                snapshot_.status.healthy = false;
+                snapshot_.status.available = 0;
+            }
             return;
         }
-        bool refresh;
-        { std::lock_guard lock(mutex_); refresh = std::exchange(snapshot_requested_, false); }
-        refresh_snapshot(healthy_, reload.has_value() || duplex_active || stopping, !commands.empty() || refresh);
         if (!executable) {
             std::unique_lock lock(mutex_);
             if (mailbox_.empty() && !stopping_) {

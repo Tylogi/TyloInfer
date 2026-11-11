@@ -38,8 +38,11 @@ Engine::Engine(std::unique_ptr<models::CausalModel> model, std::unique_ptr<tyloi
 
 // Wiring that needs this Engine: caches, budget, expert space, reservations.
 void Engine::install(std::unique_ptr<tyloi::Executor::Graph> graph) {
+    // Keep the graph with its Executor even when metadata or scope setup fails.
+    graph_.emplace(0, config_.device, std::move(graph));
     try {
         model_info_ = model_->info();
+        graph_->generated_capacity = std::max<std::int64_t>(model_info_.max_context, 2048);
         info_ = {};
         auto& info = info_;
         info.max_requests = std::max<std::size_t>(1, config_.continuous_batch.max_sequences);
@@ -55,41 +58,35 @@ void Engine::install(std::unique_ptr<tyloi::Executor::Graph> graph) {
         if (text_) info.chat = text_->chat_template_capabilities();
         auto scope = executor_->enter();
         tyloi::weights::LoadScope memory_load(*ledger_);
-        graph_.emplace(model_info_.max_context, config_.device, std::move(graph));
         budget_.emplace(*executor_, *ledger_, *weights_, *cache_, config_.device);
         budget_->bind(false);
         if (const auto bytes = config_.resident_budget_bytes) {
             engine::SessionCommand command; command.kind = engine::SessionCommand::Kind::memory_budget; command.bytes = bytes;
             set_budget(command);
         }
+        if (config_.preallocate_kv) {
+            budget_->reserve(idle_state_->preallocate_growth());
+            idle_state_->preallocate();
+        }
         weights_->prepare(::tyloi::weights::Cache::Stage::loaded, config_.device, source_.get());
+        drain();
         ready_ = true;
     } catch (...) {
         const auto failure = std::current_exception();
-        if (graph) {
-            try {
-                auto scope = executor_->enter();
-                graph_.emplace(0, config_.device, std::move(graph));
-            } catch (...) { graph.reset(); }
-        }
         try { unload_model(); }
-        catch (const std::exception& error) { std::cerr << "runtime_load_cleanup error=" << error.what() << '\n'; }
-        catch (...) { std::cerr << "runtime_load_cleanup error=unknown\n"; }
+        catch (const std::exception& error) { std::cerr << "runtime_load_cleanup error=" << error.what() << std::endl; std::terminate(); }
+        catch (...) { std::cerr << "runtime_load_cleanup error=unknown" << std::endl; std::terminate(); }
         std::rethrow_exception(failure);
     }
 }
 
-void Engine::rebind(std::unique_ptr<models::CausalModel> model, std::unique_ptr<tyloi::Executor> executor,
-        Config config, std::shared_ptr<const ModelSource> source,
-        std::shared_ptr<weights::Memory> memory, std::unique_ptr<weights::Cache> weights,
-        std::unique_ptr<models::State> model_state, std::unique_ptr<state::Sessions> sessions,
-        std::unique_ptr<TextProcessor> text, models::ForwardOptions forward,
-        std::unique_ptr<tyloi::Executor::Graph> graph) {
-    std::exception_ptr failure;
-    if (executor_) {
-        try { unload_model(); }
-        catch (...) { failure = std::current_exception(); }
-    }
+void Engine::rebind(std::unique_ptr<models::CausalModel>&& model, std::unique_ptr<tyloi::Executor>&& executor,
+        Config config, std::shared_ptr<const ModelSource>&& source,
+        std::shared_ptr<weights::Memory>&& memory, std::unique_ptr<weights::Cache>&& weights,
+        std::unique_ptr<models::State>&& model_state, std::unique_ptr<state::Sessions>&& sessions,
+        std::unique_ptr<TextProcessor>&& text, models::ForwardOptions forward,
+        std::unique_ptr<tyloi::Executor::Graph>&& graph) {
+    if (executor_) unload_model();
     model_ = std::move(model);
     executor_ = std::move(executor);
     config_ = std::move(config);
@@ -100,25 +97,16 @@ void Engine::rebind(std::unique_ptr<models::CausalModel> model, std::unique_ptr<
     cache_ = std::move(sessions);
     text_ = std::move(text);
     forward_options_ = std::move(forward);
-    if (failure) {
-        try {
-            auto scope = executor_->enter();
-            graph_.emplace(0, config_.device, std::move(graph));
-        } catch (...) { graph.reset(); }
-        try { unload_model(); }
-        catch (const std::exception& error) { std::cerr << "runtime_load_cleanup error=" << error.what() << '\n'; }
-        catch (...) { std::cerr << "runtime_load_cleanup error=unknown\n"; }
-        std::rethrow_exception(failure);
-    }
     install(std::move(graph));
 }
 #endif
 Engine::~Engine() {
 #ifdef TYLOINFER_NATIVE_CUDA
-    if (scheduler_ || executor_) {
-        try { shutdown(); }
-        catch (const std::exception& error) { std::cerr << "runtime_unload_cleanup error=" << error.what() << '\n'; }
-        catch (...) { std::cerr << "runtime_unload_cleanup error=unknown\n"; }
+    scheduler_.reset();
+    if (executor_) {
+        try { unload_model(); }
+        catch (const std::exception& error) { std::cerr << "runtime_unload_cleanup error=" << error.what() << std::endl; std::terminate(); }
+        catch (...) { std::cerr << "runtime_unload_cleanup error=unknown" << std::endl; std::terminate(); }
     }
 #endif
 }
@@ -147,8 +135,14 @@ void Engine::prepare_request(Request& request, bool batched) {
 
 void Engine::retire_request(Request& request) noexcept {
     request.generation = {};
-    if (model_ && request.state) idle_state_ = std::move(request.state);
-    else request.state.reset();
+    if (!request.state) return;
+    idle_state_ = std::move(request.state);
+    try { drain(); }
+    catch (...) {
+        ready_ = false;
+        if (request.output && !request.output->cleanup_failure)
+            request.output->cleanup_failure = std::current_exception();
+    }
 }
 
 SessionResult Engine::session_command(const SessionCommand& command) {
@@ -161,7 +155,7 @@ SessionResult Engine::session_command(const SessionCommand& command) {
 void Engine::drain() {
     auto scope = executor_->enter();
     std::exception_ptr failure;
-    try { weights_->drain(); }
+    try { if (weights_) weights_->drain(); }
     catch (...) { failure = std::current_exception(); }
     try { executor_->drain(); }
     catch (...) { if (!failure) failure = std::current_exception(); }
@@ -170,29 +164,27 @@ void Engine::drain() {
 
 void Engine::unload_model() {
     ready_ = false;
-    std::exception_ptr failure;
-    const auto remember = [&](std::exception_ptr error) { if (!failure) failure = std::move(error); };
-    text_.reset();
     if (executor_) {
-        try { drain(); }
-        catch (...) { remember(std::current_exception()); }
-        std::unique_ptr<tyloi::Executor::Scope> scope;
-        try { scope = executor_->enter(); }
-        catch (...) { remember(std::current_exception()); }
+        auto scope = executor_->enter();
+        if (graph_) graph_->invalidate();
+        drain();
+        if (weights_) weights_->release_workspace();
+        drain();
+        // No owner is released until consumers and loan restoration have completed.
         clear_bindings();
         graph_.reset();
-        idle_state_.reset(); model_.reset();
-        weights_->clear_workspace();
+        idle_state_.reset();
+        if (weights_) weights_->clear_workspace();
         budget_.reset(); cache_.reset();
+        model_.reset();
         weights_.reset();
+        text_.reset();
         // Execution resources retire last: state and weight backing free first.
-        try { executor_->clear(); }
-        catch (...) { remember(std::current_exception()); }
+        executor_->clear();
         scope.reset();
         executor_.reset();
     }
     ledger_.reset(); source_.reset();
-    if (failure) std::rethrow_exception(failure);
 }
 
 ControlResult Engine::control_command(ControlRequest request) {
@@ -231,8 +223,13 @@ SessionResult Engine::set_budget(const SessionCommand& command) {
     if (!config_.online_budget)
         throw std::invalid_argument("online memory budgeting requires a single-device CUDA worker");
     auto change = budget_->change(command);
-    weights_->settle();
-    graph_->invalidate();
+    try {
+        weights_->settle();
+        graph_->invalidate();
+    } catch (...) {
+        ready_ = false;
+        throw;
+    }
     if (ready_) reset_states(1);
     if (idle_state_) idle_state_->reset(1);
     return change.apply();

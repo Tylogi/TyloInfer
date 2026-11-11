@@ -48,6 +48,7 @@ struct Config {
     std::unordered_set<std::int64_t> stop_token_ids;
     std::uint64_t resident_budget_bytes = 0;
     bool online_budget = true;
+    bool preallocate_kv = false;
     GenerationConfig generation;
     SessionCacheConfig session_cache;
     PrefixCacheConfig prefix_cache;
