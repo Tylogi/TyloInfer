@@ -49,7 +49,7 @@ DenseTensor copy_to_layer(Collectives& collectives, DenseTensor value, const Lay
     return local;
 }
 
-void prepare_linear_state(const LinearAttention& attention, LinearState& state,
+void prepare_linear_state(const ::tyloi::models::LinearAttention& attention, LinearState& state,
                           const DenseTensor& input, bool transposed) {
     if (state.mixer.defined()) return;
     const auto batch = input.size(0);
@@ -259,7 +259,7 @@ void replay(const Model& model, State& state, Executor& executor, std::int64_t a
             const auto* layer = std::get_if<Linear>(&model.layers[index].weights);
             require_forward(layer != nullptr, "Qwen3.5 recurrent layer weight kind mismatch");
             auto& state_view = linear->mixer.view();
-            const LinearView linear_view{
+            const ::tyloi::models::LinearView linear_view{
                 state_view.convolution, state_view.recurrent, state_view.transposed};
             auto scope = executor.enter(mfq_current_cuda_device(), FfnMode{});
             layer->attention.replay(linear_view, linear->projected,
@@ -329,12 +329,11 @@ DenseTensor forward_layer(Collectives& collectives, const Layer& layer, LayerSta
     }
     auto& state_view = linear_state->mixer.view();
     const auto captured = confirmed_prefix > 0 ? &linear_state->projected : nullptr;
-    const LinearView linear_view{
+    const ::tyloi::models::LinearView linear_view{
         state_view.convolution, state_view.recurrent, state_view.transposed};
     try {
         auto output = linear->attention.forward(
-            executor.projector(options.ffn), executor.profiler(), options.linear,
-            std::move(input), linear_view, captured);
+            ::tyloi::Tensor(std::move(input)), linear_view, captured);
         auto result = ::tyloi::models::linear_ffn(
             linear->ffn, linear->ffn_norm, std::move(output[0]), std::move(output[1]),
             attention.rms_norm_eps, attention.norm_weight_offset).dense();

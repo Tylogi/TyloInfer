@@ -1,4 +1,5 @@
 #include "engine/models/qwen35/state.h"
+#include "engine/backends/cuda/kernels/mfq_cuda_kv_quantization.h"
 #include "engine/models/session/snapshot.h"
 
 #include "engine/models/qwen35/model.h"
@@ -20,7 +21,7 @@ void require_state(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
 }
 
-bool projected(const LinearInputs& value) {
+bool projected(const ::tyloi::models::LinearInputs& value) {
     return value.qk.defined() || value.value.defined() || value.qkv.defined() ||
            value.gate.defined() || value.beta.defined() || value.batch != 0 ||
            value.tokens != 0 || value.split;
@@ -54,7 +55,7 @@ bool hybrid_layout(const State& state) {
 }
 
 void validate_linear_snapshot(const Layout& model_layer, const LinearLayout& layer,
-                             const Recurrent::State& mixer, bool transposed) {
+                             const tyloi::state::Recurrent::State& mixer, bool transposed) {
     const auto width = 2 * layer.key_heads * layer.key_dim +
                        layer.value_heads * layer.value_dim;
     if (!(mixer.defined() && mixer.transposed == transposed &&
@@ -475,7 +476,7 @@ State::Restore State::prepare(const TextSessionState& state) const {
                 if (!convolution || !recurrent)
                     throw CudaSessionStateError("Qwen recurrent session topology changed");
                 validate_linear_snapshot(layout, std::get<LinearLayout>(layout.attention),
-                                         Recurrent::State{*convolution, *recurrent, saved.transposed},
+                                         tyloi::state::Recurrent::State{*convolution, *recurrent, saved.transposed},
                                          !layout.cpu && transposed_);
             }
         }
@@ -519,7 +520,7 @@ void State::stage(Restore& restore, const TextSessionState& state) const {
                 convolution.sizes(), convolution.options());
             linear.mixer.view().recurrent = ::tyloi::cuda::empty(
                 recurrent.sizes(), recurrent.options());
-            linear.mixer.restore(Recurrent::State{convolution, recurrent, saved.transposed});
+            linear.mixer.restore(tyloi::state::Recurrent::State{convolution, recurrent, saved.transposed});
         }
     }
 }

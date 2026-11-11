@@ -14,6 +14,8 @@ add_library(mfq-engine STATIC
     models/minicpmo45/input.cpp
     models/deepseek_v41/axial_patch_vision.cpp
     models/common/attention.cpp
+    models/common/ffn.cpp
+    models/common/linear.cpp
     models/common/vision/grid_vision.cpp
     models/deepseek_v4/config.cpp
     models/deepseek_v41/config.cpp
@@ -35,6 +37,7 @@ add_library(mfq-engine STATIC
     state/session/paged.cpp
     state/session/prefix_cache.cpp
     state/qsa_sequence.cpp
+    state/recurrent.cpp
 )
 if(TYLOINFER_BUILD_CUDA_ENGINE)
     target_sources(mfq-engine PRIVATE scheduler/request.cpp)

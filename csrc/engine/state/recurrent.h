@@ -4,7 +4,7 @@
 
 #include <cstdint>
 
-namespace tyloi::cuda {
+namespace tyloi::state {
 
 class Recurrent {
 public:
@@ -44,4 +44,4 @@ private:
     int64_t tokens_ = 0;
 };
 
-} // namespace tyloi::cuda
+} // namespace tyloi::state

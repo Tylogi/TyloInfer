@@ -6,7 +6,7 @@
 #include "engine/models/source/model_graph.h"
 #include "engine/models/common/capabilities.h"
 #include "engine/models/common/attention.h"
-#include "engine/backends/cuda/ops/attention/linear.h"
+#include "engine/models/common/linear.h"
 #include "engine/backends/cuda/ops/projection/quant_linear.h"
 #include "engine/backends/cuda/ops/rope/rope.h"
 #include "engine/models/source.h"
@@ -29,7 +29,7 @@ struct Full {
 };
 
 struct Linear {
-    LinearAttention attention;
+    ::tyloi::models::LinearAttention attention;
     ::tyloi::Tensor ffn_norm;
     Ffn ffn;
 };

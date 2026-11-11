@@ -452,7 +452,7 @@ BatchState Batch::capture_recurrent_slots(const std::vector<std::int32_t> &slots
             conv.push_back(linear->mixer.view().convolution.dense().narrow(0, slot, 1));
             recurrent.push_back(linear->mixer.view().recurrent.dense().narrow(0, slot, 1));
         }
-        state.layers[index] = Recurrent::State{
+        state.layers[index] = tyloi::state::Recurrent::State{
             ::tyloi::cuda::cat(conv, 0).clone(),
             ::tyloi::cuda::cat(recurrent, 0).clone(),
             linear->mixer.view().transposed};
@@ -472,7 +472,7 @@ void Batch::restore_recurrent_slots(const std::vector<std::int32_t> &slots,
         if (!linear)
             continue;
         MfqCudaGuard guard(weights_->layers[index].device);
-        const auto *saved = std::get_if<Recurrent::State>(&state.layers[index]);
+        const auto *saved = std::get_if<tyloi::state::Recurrent::State>(&state.layers[index]);
         TYLOINFER_RUNTIME_CHECK(saved && saved->defined() &&
                                     saved->convolution.size(0) == state.batch &&
                                     saved->recurrent.size(0) == state.batch &&
@@ -484,7 +484,7 @@ void Batch::restore_recurrent_slots(const std::vector<std::int32_t> &slots,
         if (!linear)
             continue;
         MfqCudaGuard guard(weights_->layers[index].device);
-        const auto &saved = std::get<Recurrent::State>(state.layers[index]);
+        const auto &saved = std::get<tyloi::state::Recurrent::State>(state.layers[index]);
         for (std::size_t row = 0; row < slots.size(); ++row) {
             linear->mixer.view().convolution.dense().narrow(0, slots[row], 1)
                 .copy_(saved.convolution.dense().narrow(0, row, 1));

@@ -188,6 +188,17 @@ bool grouped(std::span<const Tensor> weights);
 // may group compatible weights while retaining separate unsupported projections.
 std::vector<Tensor> project_group(const Tensor& input, std::span<const Tensor> weights,
                                   std::size_t prefix);
+// Gates are [B,T,valueHeads]; results are [B,valueHeads,T].
+std::array<Tensor, 2> linear_gates(const Tensor& alpha, const Tensor& beta, const Tensor& dt_bias, const Tensor& a_log);
+// Empty value selects combined QKV; empty bias selects no bias. Updates convolution backing.
+std::array<Tensor, 3> linear_conv(Tensor& convolution, const Tensor& qkv_or_qk, const Tensor& value,
+    const Tensor& weight, const Tensor& bias, std::int64_t nk, std::int64_t nv,
+    std::int64_t dk, std::int64_t dv, double eps, bool replay = false);
+Tensor linear_recur(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& gate,
+    const Tensor& beta, Tensor& recurrent, bool transposed, bool tiled);
+Tensor silu_project(const Tensor& input, const Tensor& gate, const Tensor& weight);
+std::optional<std::vector<Tensor>> linear_shared(const Tensor& input, std::span<const Tensor> qkv,
+    const Tensor& z, std::span<const Tensor> ab);
 // Computes project(input * sigmoid(gate)).
 Tensor sigmoid_project(const Tensor& input, const Tensor& gate, const ::tyloi::Tensor& weight);
 // Copy, cast, views and allocation support CPU as well as CUDA, subject to dtype support.

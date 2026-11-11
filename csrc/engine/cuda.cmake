@@ -36,7 +36,6 @@ endfunction()
 
 set(TYLOINFER_CUDA_LOADING_SOURCES
     ${PROJECT_SOURCE_DIR}/engine/state/kv_view.cpp
-    ${PROJECT_SOURCE_DIR}/engine/state/recurrent.cpp
     ${PROJECT_SOURCE_DIR}/engine/state/paged_kv.cpp
     ${PROJECT_SOURCE_DIR}/engine/state/kv_offload.cpp
     ${PROJECT_SOURCE_DIR}/engine/state/kv_memory.cpp

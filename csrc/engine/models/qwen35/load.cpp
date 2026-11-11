@@ -32,12 +32,23 @@ struct LayerLoader : TransformerWeightLoader {
         return ::tyloi::cuda::log(-value);
     }
 
-    void linear_projections(LinearAttention& attention,
+    void linear_projections(::tyloi::models::LinearAttention& attention,
                             const tyloi::models::qwen35::LinearWeightNames& names,
                             bool split_qkv) const {
-#ifndef TYLOINFER_NATIVE_CUDA
-        attention.grouped_weights = weights.options.grouped;
-#endif
+        const auto dense_group = [&](std::initializer_list<std::pair<std::string, int64_t>> names) {
+            std::vector<::tyloi::Tensor> parts;
+            for (const auto& [name, rows] : names) {
+                auto weight = weights.tensor(name);
+                if (weight.dim() != 2)
+                    throw std::runtime_error("dense linear group expects 2D weights");
+                if (weight.size(0) != rows)
+                    throw std::runtime_error("dense linear group output width mismatch");
+                if (!parts.empty() && weight.size(1) != parts.front().size(1))
+                    throw std::runtime_error("cannot group dense tensors with different input width");
+                parts.push_back(tyloi::ops::cast(weight, ::tyloi::kFloat32));
+            }
+            return tyloi::ops::contiguous(tyloi::ops::cat(parts, 0));
+        };
         if (split_qkv) {
             attention.split_in_proj = true;
             attention.qkv_proj = weights.group({names.qk, names.value});
@@ -62,16 +73,14 @@ struct LayerLoader : TransformerWeightLoader {
                         attention.ab_nint_proj = weights.group({names.alpha, names.beta});
                     }
                 } else {
-                    attention.ab_proj = make_dense_group({
-                        weights.tensor(names.alpha),
-                        weights.tensor(names.beta)});
+                    attention.ab_proj = dense_group({{names.alpha, attention.value_heads},
+                                                     {names.beta, attention.value_heads}});
                 }
             } else {
                 attention.split_dense_zab = true;
-                attention.zab_proj = make_dense_group({
-                    weights.tensor(names.gate),
-                    weights.tensor(names.alpha),
-                    weights.tensor(names.beta)});
+                attention.zab_proj = dense_group({{names.gate, attention.value_heads * attention.value_dim},
+                                                  {names.alpha, attention.value_heads},
+                                                  {names.beta, attention.value_heads}});
             }
             return;
         }
@@ -86,37 +95,27 @@ struct LayerLoader : TransformerWeightLoader {
         } else {
             attention.dense_ab_tail = true;
             attention.in_proj = weights.group({names.qkv, names.gate});
-            attention.ab_proj = make_dense_group({
-                weights.tensor(names.alpha),
-                weights.tensor(names.beta)});
+            attention.ab_proj = dense_group({{names.alpha, attention.value_heads},
+                                             {names.beta, attention.value_heads}});
         }
     }
 
-    void linear_output(LinearAttention& attention, const std::string& name) const {
+    void linear_output(::tyloi::models::LinearAttention& attention, const std::string& name) const {
         if (is_quant_dtype(require_tensor(weights.source, name).dtype)) {
             attention.out_proj = weights.weight(name);
         } else {
             attention.dense_out_proj = true;
-#ifdef TYLOINFER_NATIVE_CUDA
             attention.out_proj_dense = weights.tensor(name);
             if (require_tensor(weights.source, name).dtype == "F16")
-                attention.out_proj_dense = std::make_shared<DenseTensor>(
-                    attention.out_proj_dense.dense()
-                        .to(::tyloi::kFloat16).contiguous());
+                attention.out_proj_dense = tyloi::ops::contiguous(
+                    tyloi::ops::cast(attention.out_proj_dense, ::tyloi::kFloat16));
             if (attention.out_proj_dense.dim() != 2)
-#else
-            attention.out_proj_dense = weights.tensor(name).dense();
-            if (require_tensor(weights.source, name).dtype == "F16")
-                attention.out_proj_dense =
-                    attention.out_proj_dense.to(::tyloi::kFloat16).contiguous();
-            if (attention.out_proj_dense.dim() != 2)
-#endif
                 throw std::runtime_error(
                     "dense linear_attention output projection must be 2D");
         }
     }
 
-    void load_linear_attention(LinearAttention& attention, const Config& config,
+    void load_linear_attention(::tyloi::models::LinearAttention& attention, const Config& config,
                                int layer, std::string_view tensor_root) const {
         const auto prefix = std::string(tensor_root) + ".block." + std::to_string(layer) + ".";
         const auto linear = prefix + "linear_attention.";
@@ -124,23 +123,13 @@ struct LayerLoader : TransformerWeightLoader {
             linear + "qkv.weight", linear + "qk.weight", linear + "value.weight",
             linear + "gate.weight", linear + "alpha.weight", linear + "beta.weight"};
         linear_projections(attention, names, has(names.qk) && has(names.value));
-#ifdef TYLOINFER_NATIVE_CUDA
         attention.conv_weight = weights.tensor(linear + "conv.weight");
         if (has(linear + "conv.bias")) attention.conv_bias = weights.tensor(linear + "conv.bias");
         attention.dt_bias = weights.tensor(linear + "dt_bias");
         auto a = weights.tensor(linear + "a");
         attention.a_log = config.legacy_tensor_layout.linear_attention_a_is_log
-            ? a : std::make_shared<DenseTensor>(log_negative(a.dense()));
+            ? a : ::tyloi::Tensor(log_negative(a.dense()));
         attention.linear_norm = weights.tensor(linear + "norm.weight");
-#else
-        attention.conv_weight = dense(linear + "conv.weight");
-        if (has(linear + "conv.bias")) attention.conv_bias = dense(linear + "conv.bias");
-        attention.dt_bias = dense(linear + "dt_bias");
-        auto a = dense(linear + "a");
-        attention.a_log = config.legacy_tensor_layout.linear_attention_a_is_log
-            ? a : log_negative(a);
-        attention.linear_norm = dense(linear + "norm.weight");
-#endif
         linear_output(attention, linear + "output.weight");
     }
 };
@@ -185,11 +174,7 @@ Layer load_layer(const ::tyloi::weights::Loader& weights, const Config& config,
         linear.attention.norm_weight_offset = config.legacy_tensor_layout.norm_weight_offset;
         linear.attention.tiled_v_heads = config.legacy_tensor_layout.qwen_gdn_gguf_layout;
         const auto prefix = std::string(tensor_root) + ".block." + std::to_string(index) + ".";
-#ifdef TYLOINFER_NATIVE_CUDA
         linear.attention.attn_norm = weights.tensor(prefix + "attention.norm.weight");
-#else
-        linear.attention.attn_norm = loader.dense(prefix + "attention.norm.weight");
-#endif
         linear.ffn_norm = weights.tensor(prefix + "mlp.norm.weight");
         loader.load_linear_attention(linear.attention, config, index, tensor_root);
         linear.ffn = tyloi::models::qwen35::load_ffn<Ffn>(loader, config, index, tensor_root);

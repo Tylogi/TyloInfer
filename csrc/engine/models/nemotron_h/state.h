@@ -15,7 +15,7 @@ struct Model;
 struct Mamba;
 
 struct MambaState {
-    Recurrent mixer;
+    tyloi::state::Recurrent mixer;
     ::tyloi::DenseTensor speculative_xbc, speculative_dt;
 };
 

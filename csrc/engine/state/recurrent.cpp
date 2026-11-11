@@ -1,11 +1,11 @@
 #include "engine/state/recurrent.h"
 
 #include "engine/ops.h"
-#include "backend.h"
 
+#include <stdexcept>
 #include <utility>
 
-namespace tyloi::cuda {
+namespace tyloi::state {
 
 namespace {
 ::tyloi::Tensor storage(const ::tyloi::Tensor& target,
@@ -29,13 +29,13 @@ void Recurrent::reset(int64_t batch) {
 }
 
 Recurrent::State Recurrent::snapshot() const {
-    TYLOINFER_RUNTIME_CHECK(defined() && !pending(),
-        "recurrent snapshot requires confirmed state");
+    if (!(defined() && !pending()))
+        throw std::runtime_error("recurrent snapshot requires confirmed state");
     return {::tyloi::ops::clone(state_.convolution), ::tyloi::ops::clone(state_.recurrent), state_.transposed};
 }
 
 void Recurrent::copy(const State& source) {
-    TYLOINFER_RUNTIME_CHECK(source.defined(), "recurrent snapshot is unavailable");
+    if (!source.defined()) throw std::runtime_error("recurrent snapshot is unavailable");
     // Prepare both allocations before changing either live tensor.
     auto convolution = storage(state_.convolution, source.convolution);
     auto recurrent = storage(state_.recurrent, source.recurrent);
@@ -50,8 +50,8 @@ void Recurrent::restore(const State& snapshot) {
 }
 
 void Recurrent::begin(int64_t start, int64_t confirmed, int64_t tokens) {
-    TYLOINFER_RUNTIME_CHECK(start >= 0 && confirmed > 0 && confirmed < tokens,
-        "invalid recurrent verification window");
+    if (!(start >= 0 && confirmed > 0 && confirmed < tokens))
+        throw std::runtime_error("invalid recurrent verification window");
     auto saved = snapshot();
     saved_ = std::move(saved);
     start_ = start;
@@ -60,9 +60,9 @@ void Recurrent::begin(int64_t start, int64_t confirmed, int64_t tokens) {
 }
 
 int64_t Recurrent::rewind(int64_t position) {
-    TYLOINFER_RUNTIME_CHECK(pending() && position >= start_ &&
-        position - start_ >= confirmed_ && position - start_ < tokens_,
-        "invalid recurrent rollback position");
+    if (!(pending() && position >= start_ &&
+        position - start_ >= confirmed_ && position - start_ < tokens_))
+        throw std::runtime_error("invalid recurrent rollback position");
     copy(saved_);
     return position - start_;
 }
@@ -80,4 +80,4 @@ void Recurrent::commit() noexcept {
     tokens_ = 0;
 }
 
-} // namespace tyloi::cuda
+} // namespace tyloi::state

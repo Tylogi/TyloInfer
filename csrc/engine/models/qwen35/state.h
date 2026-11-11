@@ -4,8 +4,7 @@
 #include "engine/models/state.h"
 #include "engine/state/kv_view.h"
 #include "engine/state/recurrent.h"
-#include "engine/backends/cuda/kernels/mfq_cuda_kv_quantization.h"
-#include "engine/backends/cuda/ops/attention/linear.h"
+#include "engine/models/common/linear.h"
 
 #include <cstdint>
 #include <algorithm>
@@ -24,8 +23,8 @@ struct Model;
 // Linear attention keeps the projected rows until a speculative pass has
 // either been committed or replayed from its confirmed prefix.
 struct LinearState {
-    Recurrent mixer;
-    LinearInputs projected;
+    tyloi::state::Recurrent mixer;
+    ::tyloi::models::LinearInputs projected;
     std::int64_t speculative_ffn_batches = 0;
     std::int64_t speculative_projection_batches = 0;
 };

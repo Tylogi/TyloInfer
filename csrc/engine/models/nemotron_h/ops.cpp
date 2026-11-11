@@ -1120,7 +1120,7 @@ void State::restore_text_session_state(const TextSessionState& saved) {
                 const auto& full = std::get<FullLayout>(layout_[index].mixer);
                 restore_kv(*cache, snapshot.full_attention, full.head_dim, full.dtype, full.quantization);
             } else if (auto* mamba = std::get_if<MambaState>(&layers[index])) {
-                mamba->mixer.restore(Recurrent::State{
+                mamba->mixer.restore(tyloi::state::Recurrent::State{
                     snapshot.convolution.dense(),
                     snapshot.recurrent.dense(), snapshot.transposed});
                 clear_speculative(*mamba);

@@ -18,6 +18,8 @@
 #include "engine/backends/cuda/native/profile.h"
 #include "engine/backends/cuda/native/device.h"
 #include "engine/backends/cuda/kernels/mfq_cuda_sampling_ops.h"
+#include "engine/backends/cuda/kernels/mfq_cuda_linear_attention_ops.h"
+#include "engine/backends/cuda/kernels/mfq_cuda_norm_ops.h"
 #include <cmath>
 #include <exception>
 #include <iostream>
@@ -468,7 +470,11 @@ Tensor rms_norm(const Tensor& value_tensor, const Tensor& weight_tensor, double 
     if (output_type != ScalarType::float32 && output_type != ScalarType::float16 &&
         output_type != ScalarType::bfloat16)
         throw std::invalid_argument("unsupported rms_norm output type");
-    require_cuda(value);
+    if (!value.is_cuda()) {
+        auto normalized = qwen_rms_norm(value.reshape({-1, value.size(-1)}).to(kFloat32),
+                                        weight_tensor, eps, offset);
+        return owner(normalized.to(output_type).contiguous().reshape(value.sizes()));
+    }
     return owner(cuda::ops::rms_norm(value, weight, eps, offset, output_type));
 }
 Tensor layer_norm(const Tensor& value_tensor, const Tensor& weight_tensor, const Tensor& bias_tensor, double epsilon) {
@@ -644,6 +650,155 @@ std::vector<Tensor> project_group(const Tensor& value_tensor, std::span<const Te
     const auto& value = ::tyloi::ops::dense(value_tensor);
     input(value);
     return owners(cuda::ops::project_group(value, weights, prefix));
+}
+std::array<Tensor, 2> linear_gates(const Tensor& alpha, const Tensor& beta, const Tensor& dt_bias, const Tensor& a_log) {
+    compatible(alpha, beta); compatible(alpha, dt_bias); compatible(alpha, a_log);
+    const auto& a = dense(alpha); const auto& b = dense(beta);
+    if (a.dim() != 3 || a.sizes() != b.sizes() || dt_bias.numel() != a.size(2) || a_log.numel() != a.size(2))
+        throw std::invalid_argument("linear gate geometry mismatch");
+    if (a.is_cuda()) {
+        auto result = linear_gate_beta_cuda(a, b, dense(dt_bias), dense(a_log));
+        return {owner(result[0]), owner(result[1])};
+    }
+    auto gate = cuda::softplus(a.to(kFloat32) + dense(dt_bias).to(kFloat32).reshape({1, 1, a.size(2)})) *
+        (-cuda::exp(dense(a_log).to(kFloat32))).reshape({1, 1, a.size(2)});
+    return {owner(gate.transpose(1, 2).contiguous()),
+            owner(cuda::sigmoid(b.to(kFloat32)).transpose(1, 2).contiguous())};
+}
+
+std::array<Tensor, 3> linear_conv(Tensor& convolution, const Tensor& qkv_or_qk, const Tensor& value,
+        const Tensor& weight, const Tensor& bias, std::int64_t nk, std::int64_t nv,
+        std::int64_t dk, std::int64_t dv, double eps, bool replay) {
+    compatible(convolution, qkv_or_qk); compatible(convolution, weight);
+    if (value.defined()) compatible(convolution, value);
+    if (bias.defined()) compatible(convolution, bias);
+    auto& state = dense(convolution); const auto& x = dense(qkv_or_qk); const auto& w = dense(weight);
+    const auto ksz = nk * dk, vsz = nv * dv, channels = 2 * ksz + vsz;
+    if (nk <= 0 || nv <= 0 || dk <= 0 || dv <= 0 || nv % nk || x.dim() != 3 || state.dim() != 3 ||
+        x.size(0) != state.size(0) || state.size(2) != channels || x.size(1) <= 0 ||
+        x.size(2) != (value.defined() ? 2 * ksz : channels) ||
+        (value.defined() && (value.dim() != 3 || value.size(0) != x.size(0) || value.size(1) != x.size(1) || value.size(2) != vsz)))
+        throw std::invalid_argument("linear convolution geometry mismatch");
+    const auto B = x.size(0), T = x.size(1), kernel = state.size(1) + 1;
+    const bool valid_weight = (w.dim() == 3 && w.size(1) == 1 &&
+        ((w.size(0) == channels && w.size(2) == kernel) ||
+         (!state.is_cuda() && w.size(0) != channels && w.size(0) == kernel && w.size(2) == channels))) ||
+        (w.dim() == 2 && ((w.size(0) == channels && w.size(1) == kernel) ||
+                          (w.size(0) != channels && w.size(1) == channels && w.size(0) == kernel)));
+    if (!valid_weight || (bias.defined() && bias.numel() != 0 &&
+                          (bias.dim() != 1 || bias.size(0) != channels)))
+        throw std::invalid_argument("linear convolution weight or bias geometry mismatch");
+    if (state.is_cuda() && (!state.is_contiguous() || state.scalar_type() != kFloat32 ||
+        !w.is_contiguous() || w.scalar_type() != kFloat32 ||
+        (bias.defined() && (!dense(bias).is_contiguous() || dense(bias).scalar_type() != kFloat32))))
+        throw std::invalid_argument("CUDA linear convolution state, weight and bias must be contiguous float32");
+    auto empty_bias = bias.defined() ? dense(bias) : cuda::empty({0}, TensorOptions().device(state.device()).dtype(kFloat32));
+    if (!replay && state.is_cuda() && value.defined() && (T == 1 || (T >= 256 && cuda::Executor::current().mode().linear.fused_conv))) {
+        auto result = T == 1 ? linear_conv_qkv_decode_cuda(state, x.contiguous(), dense(value).contiguous(), w, empty_bias, nk, nv, dk, dv, eps)
+            : linear_conv_qkv_prefill_cuda(state, x.contiguous(), dense(value).contiguous(), w, empty_bias, nk, nv, dk, dv, eps);
+        if (T != 1) state.copy_(result[3]);
+        return {owner(result[0]), owner(result[1]), owner(result[2])};
+    }
+    auto qkv = value.defined() ? cuda::cat({x.to(kFloat32), dense(value).to(kFloat32)}, -1) : x.to(kFloat32);
+    DenseTensor conv;
+    if (!replay && state.is_cuda() && T == 1) conv = ssm_conv_silu_decode_cuda(state, qkv, w, empty_bias);
+    else {
+        auto conv_input = cuda::cat({state, qkv}, 1);
+        state.copy_(conv_input.narrow(1, conv_input.size(1) - (kernel - 1), kernel - 1));
+        if (state.is_cuda()) conv = ssm_conv_silu_cuda(conv_input, w, empty_bias, T);
+        else {
+            auto wf = w.to(kFloat32);
+            if (wf.dim() == 3) wf = wf.squeeze(1);
+            if (wf.size(0) != channels && wf.size(1) == channels) wf = wf.transpose(0, 1).contiguous();
+            conv = (conv_input.unfold(1, kernel, 1) * wf.reshape({1, 1, channels, kernel})).sum(-1);
+            if (bias.defined() && bias.numel() != 0) conv = conv + dense(bias).to(kFloat32).reshape({1, 1, channels});
+            conv = cuda::silu(conv);
+        }
+    }
+    auto q = conv.narrow(2, 0, ksz).reshape({B,T,nk,dk}).transpose(1,2);
+    auto k = conv.narrow(2, ksz, ksz).reshape({B,T,nk,dk}).transpose(1,2);
+    auto v = conv.narrow(2, 2*ksz, vsz).reshape({B,T,nv,dv}).transpose(1,2);
+    if (state.is_cuda()) {
+        q = l2_norm_cuda(q.contiguous().reshape({-1, dk}), eps).reshape_as(q);
+        k = l2_norm_cuda(k.contiguous().reshape({-1, dk}), eps).reshape_as(k);
+    } else {
+        q = q.contiguous(); k = k.contiguous(); v = v.contiguous();
+        q = q / cuda::sqrt(q.square().sum(-1, true)).clamp_min(eps);
+        k = k / cuda::sqrt(k.square().sum(-1, true)).clamp_min(eps);
+    }
+    return {owner(q), owner(k), owner(v)};
+}
+
+Tensor linear_recur(const Tensor& query, const Tensor& key, const Tensor& value, const Tensor& gate,
+        const Tensor& beta, Tensor& recurrent, bool transposed, bool tiled) {
+    compatible(query, key); compatible(query, value); compatible(query, gate); compatible(query, beta); compatible(query, recurrent);
+    auto q = dense(query), k = dense(key), v = dense(value); auto& state = dense(recurrent);
+    const auto& g = dense(gate); const auto& b = dense(beta);
+    if (q.dim() != 4 || q.sizes() != k.sizes() || v.dim() != 4 || g.dim() != 3 || g.sizes() != b.sizes() ||
+        state.dim() != 4 || q.size(0) != v.size(0) || q.size(2) != v.size(2) || q.size(1) <= 0 ||
+        v.size(1) % q.size(1) || g.size(0) != v.size(0) || g.size(1) != v.size(1) || g.size(2) != v.size(2) ||
+        state.size(0) != v.size(0) || state.size(1) != v.size(1) ||
+        state.size(2) != (transposed ? v.size(3) : q.size(3)) || state.size(3) != (transposed ? q.size(3) : v.size(3)))
+        throw std::invalid_argument("linear recurrence geometry mismatch");
+    if (q.is_cuda()) {
+        std::vector<DenseTensor> result;
+        if (transposed) result = tiled ? gdn_inplace_transposed_tiled_cuda(q.contiguous(), k.contiguous(), v.contiguous(), g, b, state)
+                                       : gdn_inplace_transposed_cuda(q.contiguous(), k.contiguous(), v.contiguous(), g, b, state);
+        else result = tiled ? gdn_inplace_tiled_cuda(q.contiguous(), k.contiguous(), v.contiguous(), g, b, state)
+                            : gdn_inplace_cuda(q.contiguous(), k.contiguous(), v.contiguous(), g, b, state);
+        recurrent = owner(result[1]);
+        return owner(result[0]);
+    }
+    if (q.size(1) != v.size(1)) {
+        auto repeat = v.size(1) / q.size(1);
+        q = tiled ? q.repeat({1, repeat, 1, 1}) : q.repeat_interleave(repeat, 1);
+        k = tiled ? k.repeat({1, repeat, 1, 1}) : k.repeat_interleave(repeat, 1);
+    }
+    auto r = transposed ? state.transpose(-1,-2) : state;
+    std::vector<DenseTensor> outputs;
+    for (std::int64_t t = 0; t < v.size(2); ++t) {
+        auto qt = q.select(2,t), kt = k.select(2,t), vt = v.select(2,t);
+        r = r * cuda::exp(g.select(2,t)).reshape({v.size(0),v.size(1),1,1});
+        auto delta = (vt - cuda::matmul(r.transpose(-1,-2), kt.unsqueeze(-1)).squeeze(-1)) * b.select(2,t).unsqueeze(-1);
+        r = r + kt.unsqueeze(-1) * delta.unsqueeze(-2);
+        outputs.push_back(cuda::matmul(r.transpose(-1,-2), qt.unsqueeze(-1)).squeeze(-1) * (1.0 / std::sqrt(static_cast<double>(q.size(3)))));
+    }
+    recurrent = owner((transposed ? r.transpose(-1,-2) : r).contiguous());
+    return owner(cuda::stack(outputs, 2));
+}
+
+std::optional<std::vector<Tensor>> linear_shared(const Tensor& input_tensor, std::span<const Tensor> qkv,
+        const Tensor& z, std::span<const Tensor> ab) {
+    const auto& value = dense(input_tensor);
+    input(value);
+    if (!value.is_cuda() || !cuda::Executor::current().mode().linear.shared_input || qkv.size() != 2)
+        return std::nullopt;
+    std::vector<Tensor> projections{qkv[0], qkv[1], z};
+    if (ab.size() == 2 && ab[0].representation<ShardedTensor>() && ab[1].representation<ShardedTensor>()) {
+        projections.push_back(ab[0]);
+        projections.push_back(ab[1]);
+    }
+    if (!tensor_parallel_output_projections_compatible(projections)) return std::nullopt;
+    return measure("linear.split_projections", [&] {
+        return owners(cuda::Executor::current().projector(cuda::Executor::current_ffn()).grouped(projections, value));
+    });
+}
+
+Tensor silu_project(const Tensor& input_tensor, const Tensor& gate_tensor, const Tensor& weight) {
+    compatible(input_tensor, gate_tensor);
+    const auto& value = dense(input_tensor);
+    const auto& gate = dense(gate_tensor);
+    if (const auto* w = weight.representation<DenseTensor>(); w && !w->is_encoded()) {
+        compatible(input_tensor, weight);
+        if (value.dim() == 0 || value.sizes() != gate.sizes() || w->dim() != 2 || value.size(-1) != w->size(1))
+            throw std::invalid_argument("dense gated projection geometry mismatch");
+        auto shape = value.sizes().vec();
+        shape.back() = w->size(0);
+        auto gated = value.to(w->scalar_type()) * cuda::silu(gate.to(w->scalar_type()));
+        return owner(dense_projection(gated.reshape({-1, value.size(-1)}), *w).reshape(shape));
+    }
+    return owner(cuda::Executor::current().projector(cuda::Executor::current_ffn()).gated(
+        weight, value, gate, InputGateMode::Silu));
 }
 Tensor sigmoid_project(const Tensor& value_tensor, const Tensor& gate_tensor, const ::tyloi::Tensor& weight) {
     const auto& value = ::tyloi::ops::dense(value_tensor);
