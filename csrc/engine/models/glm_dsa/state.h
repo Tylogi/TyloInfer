@@ -1,6 +1,9 @@
 #pragma once
 
 #include "engine/models/session/snapshot.h"
+#ifdef TYLOINFER_NATIVE_CUDA
+#include "engine/models/state.h"
+#endif
 #include <cstdint>
 #include <map>
 #include <vector>
@@ -12,7 +15,11 @@ struct Model;
 struct LayerState { DenseTensor kv_cache, index_cache; };
 struct Selection { DenseTensor topk_indices; int64_t dense_prefix_rows = 0; };
 
-class State {
+class State
+#ifdef TYLOINFER_NATIVE_CUDA
+    : public tyloi::models::State
+#endif
+{
 public:
     explicit State(const Model&);
     State(const State&) = delete;
