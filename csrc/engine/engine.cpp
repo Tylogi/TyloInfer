@@ -181,12 +181,13 @@ void Engine::unload_model() {
         catch (...) { remember(std::current_exception()); }
         clear_bindings();
         graph_.reset();
-        try { executor_->clear(); }
-        catch (...) { remember(std::current_exception()); }
         idle_state_.reset(); model_.reset();
         weights_->clear_workspace();
         budget_.reset(); cache_.reset();
         weights_.reset();
+        // Execution resources retire last: state and weight backing free first.
+        try { executor_->clear(); }
+        catch (...) { remember(std::current_exception()); }
         scope.reset();
         executor_.reset();
     }

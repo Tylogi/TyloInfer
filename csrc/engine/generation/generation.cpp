@@ -49,13 +49,17 @@ struct Plain {
     double prefill(const PrefillChunk& chunk) {
         auto timer = executor.timer();
         models::Input model_input;
-        model_input.ids = ops::contiguous(ops::slice(full_ids, 1, chunk.offset, chunk.offset + chunk.count));
+        model_input.ids = ops::slice(full_ids, 1, chunk.offset, chunk.offset + chunk.count);
         model_input.advance = true;
         if (prepared && prepared->transformed()) {
-            if (prepared->embeddings) model_input.embeddings = ops::contiguous(ops::slice(prepared->embeddings, 1, chunk.offset, chunk.offset + chunk.count));
-            if (prepared->positions) model_input.positions = ops::contiguous(ops::slice(prepared->positions, -1, chunk.offset, chunk.offset + chunk.count));
+            if (prepared->embeddings) model_input.embeddings = ops::slice(prepared->embeddings, 1, chunk.offset, chunk.offset + chunk.count);
+            if (prepared->positions) model_input.positions = ops::slice(prepared->positions, -1, chunk.offset, chunk.offset + chunk.count);
         }
+        // Space is coordinated before this chunk materialises its own activations.
         reserve(model_input);
+        model_input.ids = ops::contiguous(model_input.ids);
+        if (model_input.embeddings) model_input.embeddings = ops::contiguous(model_input.embeddings);
+        if (model_input.positions) model_input.positions = ops::contiguous(model_input.positions);
         auto hidden = model.forward(std::move(model_input), state, forward_options);
         if (prepared && prepared->transformed()) state.set_position_delta(prepared->decode_position_delta);
         timer->stop();
