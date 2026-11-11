@@ -159,6 +159,7 @@ std::unique_ptr<engine::Engine> load_native_engine(CudaEngineOptions options, en
                 model->info().max_context, state->supports_text_session_state(),
                 state->supports_paged_text_session_state());
         }
+        root->mode().ffn.independent |= model->info().separate_projections;
         const auto mode = root->forward_mode(load.layer_placement.primary_device());
         config.device = Device(kCUDA, load.layer_placement.primary_device());
         config.devices = cuda_devices(load);

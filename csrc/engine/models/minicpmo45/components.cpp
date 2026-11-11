@@ -16,7 +16,9 @@
 
 MiniCPMO45Runtime MiniCPMO45Runtime::load(
         const tyloi::cuda::minicpmo45::text::Model& language,
+#ifndef TYLOINFER_NATIVE_CUDA
         tyloi::cuda::Executor& language_executor,
+#endif
         const tyloi::weights::Loader& weights,
         CudaExecutionContext& execution) {
     auto &placement = execution.config.layer_placement;
@@ -24,7 +26,11 @@ MiniCPMO45Runtime MiniCPMO45Runtime::load(
 #ifndef TYLOINFER_NATIVE_CUDA
     auto projector = execution.executor().projector(execution.executor().mode().ffn, model_parallel_primary_device(execution.config));
 #endif
-    return {language, language_executor, execution,
+    return {language,
+#ifndef TYLOINFER_NATIVE_CUDA
+            language_executor,
+#endif
+            execution,
             MiniCPMO45VisionEncoder::load(weights),
             MiniCPMO45Resampler::load(weights),
             MiniCPMO45AudioEncoder::load(weights),
@@ -39,13 +45,20 @@ MiniCPMO45Runtime MiniCPMO45Runtime::load(
 namespace tyloi::cuda::minicpmo45 {
 
 std::unique_ptr<Components> load_components(text::Model& model,
-        Executor& executor, const tyloi::weights::Loader& weights,
+#ifndef TYLOINFER_NATIVE_CUDA
+        Executor& executor,
+#endif
+        const tyloi::weights::Loader& weights,
         bool load_optional_components, CudaExecutionContext& execution) {
     if (!load_optional_components || model.plan.vision == CudaVisionAdapter::none)
         return nullptr;
     if (model.plan.vision != CudaVisionAdapter::minicpmo45)
         throw std::runtime_error("unsupported MiniCPM-o CUDA vision adapter");
-    return std::make_unique<Components>(model, executor, weights, execution);
+    return std::make_unique<Components>(model,
+#ifndef TYLOINFER_NATIVE_CUDA
+        executor,
+#endif
+        weights, execution);
 }
 
 struct Components::State {
@@ -53,16 +66,29 @@ struct Components::State {
     std::optional<MiniCPMO45DuplexSession> duplex_session;
 
     State(const text::Model& language,
-          Executor& language_executor, const tyloi::weights::Loader& weights,
+#ifndef TYLOINFER_NATIVE_CUDA
+          Executor& language_executor,
+#endif
+          const tyloi::weights::Loader& weights,
           CudaExecutionContext& execution)
-        : runtime(MiniCPMO45Runtime::load(language, language_executor,
+        : runtime(MiniCPMO45Runtime::load(language,
+#ifndef TYLOINFER_NATIVE_CUDA
+                                         language_executor,
+#endif
                                          weights, execution)) {}
 };
 
 Components::Components(const text::Model& language,
-                       Executor& language_executor, const tyloi::weights::Loader& weights,
+#ifndef TYLOINFER_NATIVE_CUDA
+                       Executor& language_executor,
+#endif
+                       const tyloi::weights::Loader& weights,
                        CudaExecutionContext& execution)
-    : state_(std::make_unique<State>(language, language_executor, weights,
+    : state_(std::make_unique<State>(language,
+#ifndef TYLOINFER_NATIVE_CUDA
+                                     language_executor,
+#endif
+                                     weights,
                                      execution)) {}
 
 Components::~Components() = default;

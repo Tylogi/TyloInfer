@@ -26,6 +26,7 @@ struct Info {
     std::size_t prefill_row_bytes;
     bool decode_graph;
     bool double_warmup;
+    bool separate_projections = false;
 };
 
 struct CausalLmMetadata {

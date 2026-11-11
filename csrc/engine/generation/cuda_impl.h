@@ -74,7 +74,9 @@ auto hidden(Model& model, State& state, tyloi::cuda::Executor* executor,
     TYLOINFER_RUNTIME_CHECK(executor != nullptr,
                             "CUDA model forward requires an executor");
 #ifdef TYLOINFER_NATIVE_CUDA
-    auto scope = Executor::current().enter(mode.ffn);
+    auto policy = mode.ffn;
+    if constexpr (causal<Model>) policy.independent |= model.info().separate_projections;
+    auto scope = Executor::current().enter(policy);
     if constexpr (causal<Model>) {
         return model.forward(std::move(input), state, forward_options(mode));
     } else {

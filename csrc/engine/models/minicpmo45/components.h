@@ -17,7 +17,10 @@ namespace text { struct Model; }
 class Components {
   public:
     Components(const text::Model& language,
-               Executor& language_executor, const tyloi::weights::Loader& weights,
+#ifndef TYLOINFER_NATIVE_CUDA
+               Executor& language_executor,
+#endif
+               const tyloi::weights::Loader& weights,
                CudaExecutionContext& execution);
     ~Components();
 
@@ -33,7 +36,10 @@ class Components {
 };
 
 std::unique_ptr<Components> load_components(text::Model& model,
-    Executor& executor, const tyloi::weights::Loader& weights,
+#ifndef TYLOINFER_NATIVE_CUDA
+    Executor& executor,
+#endif
+    const tyloi::weights::Loader& weights,
     bool load_optional_components, CudaExecutionContext& execution);
 } // namespace minicpmo45
 } // namespace tyloi::cuda

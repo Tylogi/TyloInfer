@@ -94,16 +94,21 @@ Tensor hidden(Model& model, State& state, tyloi::cuda::Executor* executor,
               tyloi::models::Input input) {
   static_assert(has_forward<Model, State>);
 #ifdef TYLOINFER_NATIVE_CUDA
-  auto scope = tyloi::cuda::Executor::current().enter(mode.ffn);
+  auto policy = mode.ffn;
   if constexpr (requires { static_cast<const tyloi::models::CausalModel&>(model).forward(
                              std::move(input), state, tyloi::cuda::forward_options(mode)); }) {
     const tyloi::models::CausalModel& causal = model;
+    policy.independent |= causal.info().separate_projections;
+    auto scope = tyloi::cuda::Executor::current().enter(policy);
     auto result = causal.forward(std::move(input), state, tyloi::cuda::forward_options(mode));
     TYLOINFER_RUNTIME_CHECK(result.defined(), "CUDA model forward returned no hidden tensor");
     return result;
   } else
 #endif
   {
+#ifdef TYLOINFER_NATIVE_CUDA
+    auto scope = tyloi::cuda::Executor::current().enter(policy);
+#endif
     TYLOINFER_RUNTIME_CHECK(executor != nullptr,
                             "CUDA model forward requires an executor");
     return forward(model, state, *executor, collectives, mode, std::move(input));
@@ -445,7 +450,9 @@ template <class Model, class State> struct CudaMtpOps {
       input.suffix = true;
 #ifdef TYLOINFER_NATIVE_CUDA
       input.raw_hidden = raw;
-      auto scope = tyloi::cuda::Executor::current().enter(mode.ffn);
+      auto policy = mode.ffn;
+      policy.independent |= causal.info().separate_projections;
+      auto scope = tyloi::cuda::Executor::current().enter(policy);
       auto hidden = causal.forward(std::move(input), state, tyloi::cuda::forward_options(mode));
 #else
       ::tyloi::Tensor raw_result;
