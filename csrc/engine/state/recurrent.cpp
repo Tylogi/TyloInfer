@@ -1,24 +1,28 @@
 #include "engine/state/recurrent.h"
 
+#include "engine/ops.h"
+#include "backend.h"
+
 #include <utility>
 
 namespace tyloi::cuda {
 
 namespace {
-::tyloi::DenseTensor storage(const ::tyloi::DenseTensor& target,
-                                   const ::tyloi::DenseTensor& source) {
-    if (target.defined() && target.sizes() == source.sizes() &&
+::tyloi::Tensor storage(const ::tyloi::Tensor& target,
+                        const ::tyloi::Tensor& source) {
+    const auto& source_dense = source.dense();
+    if (target.defined() && target.dense().sizes() == source_dense.sizes() &&
         target.scalar_type() == source.scalar_type() && target.device() == source.device())
         return target;
-    return ::tyloi::cuda::empty(source.sizes(), source.options());
+    return ::tyloi::ops::empty(source_dense.sizes(), source.options());
 }
 } // namespace
 
 void Recurrent::reset(int64_t batch) {
     commit();
     if (defined() && state_.convolution.size(0) == batch && state_.recurrent.size(0) == batch) {
-        state_.convolution.zero_();
-        state_.recurrent.zero_();
+        ::tyloi::ops::fill(state_.convolution, 0);
+        ::tyloi::ops::fill(state_.recurrent, 0);
     } else {
         state_ = {};
     }
@@ -27,7 +31,7 @@ void Recurrent::reset(int64_t batch) {
 Recurrent::State Recurrent::snapshot() const {
     TYLOINFER_RUNTIME_CHECK(defined() && !pending(),
         "recurrent snapshot requires confirmed state");
-    return {state_.convolution.clone(), state_.recurrent.clone(), state_.transposed};
+    return {::tyloi::ops::clone(state_.convolution), ::tyloi::ops::clone(state_.recurrent), state_.transposed};
 }
 
 void Recurrent::copy(const State& source) {
@@ -35,8 +39,8 @@ void Recurrent::copy(const State& source) {
     // Prepare both allocations before changing either live tensor.
     auto convolution = storage(state_.convolution, source.convolution);
     auto recurrent = storage(state_.recurrent, source.recurrent);
-    convolution.copy_(source.convolution);
-    recurrent.copy_(source.recurrent);
+    ::tyloi::ops::copy_into(convolution, source.convolution);
+    ::tyloi::ops::copy_into(recurrent, source.recurrent);
     state_ = {std::move(convolution), std::move(recurrent), source.transposed};
 }
 

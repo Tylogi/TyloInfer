@@ -295,11 +295,17 @@ MfqDuplexStepResult Components::step(const MfqDuplexStepInput& input) {
 
         MfqDuplexStepResult response;
         auto generated = result.generated_ids
+#ifdef TYLOINFER_NATIVE_CUDA
+            .dense()
+#endif
             .to(::tyloi::kCPU, ::tyloi::kInt64).contiguous().reshape({-1});
         const auto * generated_data = generated.template data_ptr<int64_t>();
         response.generated_tokens.assign(
             generated_data, generated_data + generated.numel());
         auto codes = result.tts_codes
+#ifdef TYLOINFER_NATIVE_CUDA
+            .dense()
+#endif
             .to(::tyloi::kCPU, ::tyloi::kInt32).contiguous().reshape({-1});
         const auto * code_data = codes.template data_ptr<int32_t>();
         response.audio_tokens.assign(

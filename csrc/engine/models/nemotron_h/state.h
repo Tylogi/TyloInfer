@@ -35,7 +35,7 @@ public:
     void preallocate();
     void commit_speculative();
     std::vector<::tyloi::Tensor> storage() const;
-    std::vector<::tyloi::DenseTensor*> graph_state();
+    std::vector<::tyloi::Tensor*> graph_state();
     TextSessionStateKind text_session_state_kind() const;
     bool supports_text_session_state() const;
     bool supports_paged_text_session_state() const;

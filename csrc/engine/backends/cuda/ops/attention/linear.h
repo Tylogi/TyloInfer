@@ -20,8 +20,8 @@ struct LinearInputs {
 };
 
 struct LinearView {
-    ::tyloi::DenseTensor& convolution;
-    ::tyloi::DenseTensor& recurrent;
+    ::tyloi::Tensor& convolution;
+    ::tyloi::Tensor& recurrent;
     bool transposed;
 };
 

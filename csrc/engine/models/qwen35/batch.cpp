@@ -396,8 +396,8 @@ void Batch::copy_to_slot(State &target, const State &source, std::int64_t slot) 
             const auto &source = from.mixer.view();
             auto &target_view = state.mixer.view();
             if (!target_view.defined()) {
-                auto convolution_shape = source.convolution.sizes().vec();
-                auto recurrent_shape = source.recurrent.sizes().vec();
+                auto convolution_shape = source.convolution.dense().sizes().vec();
+                auto recurrent_shape = source.recurrent.dense().sizes().vec();
                 convolution_shape[0] = target.batch;
                 recurrent_shape[0] = target.batch;
                 target_view.convolution = ::tyloi::cuda::zeros(
@@ -408,8 +408,8 @@ void Batch::copy_to_slot(State &target, const State &source, std::int64_t slot) 
             }
             TYLOINFER_RUNTIME_CHECK(target_view.transposed == source.transposed,
                                     "continuous batching recurrent layout changed");
-            target_view.convolution.narrow(0, slot, 1).copy_(source.convolution);
-            target_view.recurrent.narrow(0, slot, 1).copy_(source.recurrent);
+            target_view.convolution.dense().narrow(0, slot, 1).copy_(source.convolution.dense());
+            target_view.recurrent.dense().narrow(0, slot, 1).copy_(source.recurrent.dense());
         }
     }
 }
@@ -432,7 +432,7 @@ std::vector<const void *> Batch::decode_state_addresses() {
     const auto storage = state_->storage();
     addresses.reserve(storage.size());
     for (const auto &tensor : storage)
-        addresses.push_back(tensor.data_ptr());
+        addresses.push_back(tensor.dense().data_ptr());
     return addresses;
 }
 
@@ -449,8 +449,8 @@ BatchState Batch::capture_recurrent_slots(const std::vector<std::int32_t> &slots
         MfqCudaGuard guard(weights_->layers[index].device);
         std::vector<DenseTensor> conv, recurrent;
         for (auto slot : slots) {
-            conv.push_back(linear->mixer.view().convolution.narrow(0, slot, 1));
-            recurrent.push_back(linear->mixer.view().recurrent.narrow(0, slot, 1));
+            conv.push_back(linear->mixer.view().convolution.dense().narrow(0, slot, 1));
+            recurrent.push_back(linear->mixer.view().recurrent.dense().narrow(0, slot, 1));
         }
         state.layers[index] = Recurrent::State{
             ::tyloi::cuda::cat(conv, 0).clone(),
@@ -486,10 +486,10 @@ void Batch::restore_recurrent_slots(const std::vector<std::int32_t> &slots,
         MfqCudaGuard guard(weights_->layers[index].device);
         const auto &saved = std::get<Recurrent::State>(state.layers[index]);
         for (std::size_t row = 0; row < slots.size(); ++row) {
-            linear->mixer.view().convolution.narrow(0, slots[row], 1)
-                .copy_(saved.convolution.narrow(0, row, 1));
-            linear->mixer.view().recurrent.narrow(0, slots[row], 1)
-                .copy_(saved.recurrent.narrow(0, row, 1));
+            linear->mixer.view().convolution.dense().narrow(0, slots[row], 1)
+                .copy_(saved.convolution.dense().narrow(0, row, 1));
+            linear->mixer.view().recurrent.dense().narrow(0, slots[row], 1)
+                .copy_(saved.recurrent.dense().narrow(0, row, 1));
         }
     }
 }

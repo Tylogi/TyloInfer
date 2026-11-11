@@ -159,10 +159,10 @@ static DenseTensor mamba_forward(const Mamba& weights, MambaState& activity, Exe
                         const auto& conv_weight = conv_weight_value;
 #endif
                         if (T == 1)
-                            return ssm_conv_silu_decode_cuda(state.convolution, xbc, conv_weight,
+                            return ssm_conv_silu_decode_cuda(state.convolution.dense(), xbc, conv_weight,
                                                              bias);
-                        auto conv_input = ::tyloi::cuda::cat({state.convolution, xbc}, 1);
-                        state.convolution.copy_(next_convolution_state(conv_input, conv_kernel));
+                        auto conv_input = ::tyloi::cuda::cat({state.convolution.dense(), xbc}, 1);
+                        state.convolution.dense().copy_(next_convolution_state(conv_input, conv_kernel));
                         return ssm_conv_silu_cuda(conv_input, conv_weight, bias, T);
                     });
                     auto x = convolved.narrow(2, 0, inner)
@@ -189,7 +189,7 @@ static DenseTensor mamba_forward(const Mamba& weights, MambaState& activity, Exe
 #endif
                         if (T == 1) {
                             auto y = selective_state_scan_decode_cuda(
-                                state.recurrent, signals[0].select(1, 0).contiguous(),
+                                state.recurrent.dense(), signals[0].select(1, 0).contiguous(),
                                 dt.select(1, 0).contiguous(), dt_bias, a_log,
                                 signals[1].select(1, 0).contiguous(),
                                 signals[2].select(1, 0).contiguous(), d, time_step_limit_lo,
@@ -198,7 +198,7 @@ static DenseTensor mamba_forward(const Mamba& weights, MambaState& activity, Exe
                         }
                         auto scanned = selective_state_scan_prefill_cuda(
                             signals[0], dt, dt_bias, a_log, signals[1], signals[2], d,
-                            state.recurrent, time_step_limit_lo, time_step_limit_hi);
+                            state.recurrent.dense(), time_step_limit_lo, time_step_limit_hi);
                         return std::array<DenseTensor, 2>{std::move(scanned[0]), std::move(scanned[1])};
                     });
                 },
@@ -223,7 +223,7 @@ static DenseTensor mamba_forward(const Mamba& weights, MambaState& activity, Exe
                 },
                 [&](const DenseTensor& final_state) {
                     if (final_state.defined())
-                        state.recurrent.copy_(final_state);
+                        state.recurrent.dense().copy_(final_state);
                 });
     xn = {};
     auto rr = x.reshape({-1, H});
@@ -276,8 +276,8 @@ static void replay_recurrent(const Mamba& weights, MambaState& activity, int64_t
                                                    .device(::tyloi::kCUDA)
                                                    .dtype(::tyloi::kFloat32));
 #endif
-    auto conv_input = ::tyloi::cuda::cat({state.convolution, xbc}, 1);
-    state.convolution.copy_(next_convolution_state(conv_input, conv_kernel));
+    auto conv_input = ::tyloi::cuda::cat({state.convolution.dense(), xbc}, 1);
+    state.convolution.dense().copy_(next_convolution_state(conv_input, conv_kernel));
 #ifdef TYLOINFER_NATIVE_CUDA
     const auto& conv_weight = conv_weight_value.dense();
 #else
@@ -303,9 +303,9 @@ static void replay_recurrent(const Mamba& weights, MambaState& activity, int64_t
     const auto& d = d_value;
 #endif
     auto scanned = selective_state_scan_prefill_cuda(x, dt, dt_bias, a_log, b, c, d,
-                                                     state.recurrent, time_step_limit_lo,
+                                                     state.recurrent.dense(), time_step_limit_lo,
                                                      time_step_limit_hi);
-    state.recurrent.copy_(scanned[1]);
+    state.recurrent.dense().copy_(scanned[1]);
 }
 
 static void rollback_speculative(const Mamba& weights, MambaState& activity, int64_t keep_position) {
@@ -908,8 +908,8 @@ std::vector<::tyloi::Tensor> State::storage() const {
     return result;
 }
 
-std::vector<DenseTensor*> State::graph_state() {
-    std::vector<DenseTensor*> result;
+std::vector<::tyloi::Tensor*> State::graph_state() {
+    std::vector<::tyloi::Tensor*> result;
     for (auto& layer : layers) {
         auto* mamba = std::get_if<MambaState>(&layer);
         if (mamba == nullptr) continue;
@@ -984,8 +984,8 @@ TextSessionState State::capture_text_session_state(const std::vector<std::int64_
                 throw std::runtime_error("Nemotron-H mamba session state is unavailable");
             snapshot.kind = HybridBlockSessionStateKind::Recurrent;
             const auto mixer = mamba->mixer.snapshot();
-            snapshot.convolution = std::make_shared<DenseTensor>(mixer.convolution);
-            snapshot.recurrent = std::make_shared<DenseTensor>(mixer.recurrent);
+            snapshot.convolution = mixer.convolution;
+            snapshot.recurrent = mixer.recurrent;
             snapshot.transposed = mixer.transposed;
             saved.bytes += session_tensor_bytes(snapshot.convolution);
             saved.bytes += session_tensor_bytes(snapshot.recurrent);

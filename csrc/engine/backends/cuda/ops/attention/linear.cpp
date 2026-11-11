@@ -161,8 +161,8 @@ std::array<::tyloi::DenseTensor, 2> LinearAttention::cpu(
               [&](const LinearProjections<
                   ::tyloi::DenseTensor> &p) {
                 auto qkv = p.qkv, qk_part = p.qk, v_part = p.value;
-                auto conv_input = ::tyloi::cuda::cat({state.convolution, qkv}, 1);
-                state.convolution.copy_(conv_input.narrow(
+                auto conv_input = ::tyloi::cuda::cat({state.convolution.dense(), qkv}, 1);
+                state.convolution.dense().copy_(conv_input.narrow(
                     1,
                     conv_input.size(1) -
                         (conv_kernel - 1),
@@ -241,7 +241,7 @@ std::array<::tyloi::DenseTensor, 2> LinearAttention::cpu(
                   std::array<::tyloi::DenseTensor, 2> gates) {
                 auto q = qkv[0], k = qkv[1], v = qkv[2];
                 auto gate_t = gates[0], beta_t = gates[1];
-                auto recurrent = state.recurrent;
+                auto recurrent = state.recurrent.dense();
                 std::vector<::tyloi::DenseTensor> outputs;
                 outputs.reserve(static_cast<size_t>(T));
                 const double retrieve_scale =
@@ -506,7 +506,7 @@ std::array<::tyloi::DenseTensor, 2> LinearAttention::cuda(
                   auto qkv_fast =
                       profiler.measure("linear.conv_qkv_prefill", [&]() {
                         return linear_conv_qkv_prefill_cuda(
-                            state.convolution, qk_part.contiguous(),
+                            state.convolution.dense(), qk_part.contiguous(),
                             v_part.contiguous(), conv_weight, bias, nk, nv, dk,
                             dv, rms_norm_eps);
                       });
@@ -515,12 +515,12 @@ std::array<::tyloi::DenseTensor, 2> LinearAttention::cuda(
                   v = qkv_fast[2];
                   // Runtime CUDA graphs retain this state storage address
                   // across requests.
-                  state.convolution.copy_(qkv_fast[3]);
+                  state.convolution.dense().copy_(qkv_fast[3]);
                 } else if (T == 1 && split_in_proj) {
                   auto qkv_fast =
                       profiler.measure("linear.conv_qkv_decode", [&]() {
                         return linear_conv_qkv_decode_cuda(
-                            state.convolution, qk_part.contiguous(),
+                            state.convolution.dense(), qk_part.contiguous(),
                             v_part.contiguous(), conv_weight, bias, nk, nv, dk,
                             dv, rms_norm_eps);
                       });
@@ -539,12 +539,12 @@ std::array<::tyloi::DenseTensor, 2> LinearAttention::cuda(
                   ::tyloi::DenseTensor conv;
                   if (T == 1) {
                     conv = profiler.measure("linear.conv_silu_decode", [&]() {
-                      return ssm_conv_silu_decode_cuda(state.convolution, qkv,
+                      return ssm_conv_silu_decode_cuda(state.convolution.dense(), qkv,
                                                        conv_weight, bias);
                     });
                   } else {
                     auto conv_in = profiler.measure("linear.conv_input", [&]() {
-                      return ::tyloi::cuda::cat({state.convolution, qkv}, 1);
+                      return ::tyloi::cuda::cat({state.convolution.dense(), qkv}, 1);
                     });
                     auto next_conv_state =
                         profiler.measure("linear.conv_state_update", [&]() {
@@ -557,7 +557,7 @@ std::array<::tyloi::DenseTensor, 2> LinearAttention::cuda(
                                    Slice()})
                               .contiguous();
                         });
-                    state.convolution.copy_(next_conv_state);
+                    state.convolution.dense().copy_(next_conv_state);
                     conv = profiler.measure("linear.conv_silu", [&]() {
                       return ssm_conv_silu_cuda(conv_in, conv_weight, bias, T);
                     });
@@ -607,17 +607,17 @@ std::array<::tyloi::DenseTensor, 2> LinearAttention::cuda(
                     if (tiled_v_heads)
                       return gdn_inplace_transposed_tiled_cuda(
                           rq.contiguous(), rk.contiguous(), rv.contiguous(), rg,
-                          rb, state.recurrent);
+                          rb, state.recurrent.dense());
                     return gdn_inplace_transposed_cuda(
                         rq.contiguous(), rk.contiguous(), rv.contiguous(), rg,
-                        rb, state.recurrent);
+                        rb, state.recurrent.dense());
                   }
                   if (tiled_v_heads)
                     return gdn_inplace_tiled_cuda(
                         rq.contiguous(), rk.contiguous(), rv.contiguous(), rg,
-                        rb, state.recurrent);
+                        rb, state.recurrent.dense());
                   return gdn_inplace_cuda(rq.contiguous(), rk.contiguous(),
-                                          rv.contiguous(), rg, rb, state.recurrent);
+                                          rv.contiguous(), rg, rb, state.recurrent.dense());
                 };
                 auto gd = profiler.measure("linear.gdn", [&]() {
                   return recurrent_step(q, k, v, gate_t, beta_t);
@@ -711,8 +711,8 @@ void LinearAttention::replay(
                        ::tyloi::kFloat32)},
                   -1)
             : inputs.qkv.narrow(1, 0, T);
-    auto conv_input = ::tyloi::cuda::cat({state.convolution, qkv}, 1);
-    state.convolution.copy_(conv_input.narrow(
+    auto conv_input = ::tyloi::cuda::cat({state.convolution.dense(), qkv}, 1);
+    state.convolution.dense().copy_(conv_input.narrow(
         1, conv_input.size(1) - (conv_kernel - 1),
         conv_kernel - 1));
 #ifdef TYLOINFER_NATIVE_CUDA
@@ -735,17 +735,17 @@ void LinearAttention::replay(
       output = tiled_v_heads
                    ? gdn_inplace_transposed_tiled_cuda(
                          q.contiguous(), k.contiguous(), v.contiguous(), gate,
-                         beta, state.recurrent)
+                         beta, state.recurrent.dense())
                    : gdn_inplace_transposed_cuda(q.contiguous(), k.contiguous(),
                                                  v.contiguous(), gate, beta,
-                                                 state.recurrent);
+                                                 state.recurrent.dense());
     } else {
       output =
           tiled_v_heads
               ? gdn_inplace_tiled_cuda(q.contiguous(), k.contiguous(),
-                                       v.contiguous(), gate, beta, state.recurrent)
+                                       v.contiguous(), gate, beta, state.recurrent.dense())
               : gdn_inplace_cuda(q.contiguous(), k.contiguous(), v.contiguous(),
-                                 gate, beta, state.recurrent);
+                                 gate, beta, state.recurrent.dense());
     }
     state.recurrent = output[1];
 }

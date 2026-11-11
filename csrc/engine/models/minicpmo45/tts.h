@@ -372,7 +372,11 @@ struct Tts {
     }
 
     struct ChunkResult {
+#ifdef TYLOINFER_NATIVE_CUDA
+        ::tyloi::Tensor codes;
+#else
         ::tyloi::DenseTensor codes;
+#endif
         bool finished = false;
     };
 

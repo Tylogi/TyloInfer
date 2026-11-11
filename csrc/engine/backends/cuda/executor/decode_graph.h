@@ -154,7 +154,7 @@ void prepare_decode_graph_memory(
         saved.push_back({state, ::tyloi::ops::clone(*state),
                          decode_graph_detail::snapshot_layout(*state)});
 #else
-        saved.push_back({state, ::tyloi::DenseTensor(*state).clone(), state->data_ptr()});
+        saved.push_back({state, state->dense().clone(), state->dense().data_ptr()});
 #endif
     }
     const int64_t saved_position = position_state.position();
@@ -167,9 +167,9 @@ void prepare_decode_graph_memory(
             TYLOINFER_RUNTIME_CHECK(decode_graph_detail::same_layout(state.layout, *state.target),
                 "decode warmup changed recurrent storage addresses");
 #else
-            TYLOINFER_RUNTIME_CHECK(state.target->data_ptr() == state.address,
+            TYLOINFER_RUNTIME_CHECK(state.target->dense().data_ptr() == state.address,
                 "decode warmup changed recurrent storage addresses");
-            ::tyloi::DenseTensor(*state.target).copy_(state.value);
+            state.target->dense().copy_(state.value);
 #endif
         }
         TYLOINFER_RUNTIME_CHECK(position_state.position() == saved_position,

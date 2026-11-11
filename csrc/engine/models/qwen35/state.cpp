@@ -225,8 +225,8 @@ void State::abort_speculative() noexcept {
     speculative_confirmed = 0;
 }
 
-std::vector<::tyloi::DenseTensor*> State::graph_state() {
-    std::vector<::tyloi::DenseTensor*> result;
+std::vector<::tyloi::Tensor*> State::graph_state() {
+    std::vector<::tyloi::Tensor*> result;
     for (auto& state : layers) {
         auto* linear = std::get_if<LinearState>(&state);
         if (linear == nullptr) continue;
@@ -332,8 +332,8 @@ TextSessionState State::capture_text_session_state(
             validate_linear_snapshot(layout, std::get<LinearLayout>(layout.attention), snapshot,
                                      !layout.cpu && *transposed_);
             saved.kind = HybridBlockSessionStateKind::Recurrent;
-            saved.convolution = std::make_shared<DenseTensor>(snapshot.convolution);
-            saved.recurrent = std::make_shared<DenseTensor>(snapshot.recurrent);
+            saved.convolution = snapshot.convolution;
+            saved.recurrent = snapshot.recurrent;
             saved.transposed = snapshot.transposed;
             state.bytes += session_tensor_bytes(snapshot.convolution);
             state.bytes += session_tensor_bytes(snapshot.recurrent);

@@ -206,10 +206,17 @@ struct MiniCPMO45DuplexSpecialIds {
 };
 
 struct MiniCPMO45DuplexStepResult {
+#ifdef TYLOINFER_NATIVE_CUDA
+    ::tyloi::Tensor decision_logits;
+    ::tyloi::Tensor audio_embeddings;
+    ::tyloi::Tensor generated_ids;
+    ::tyloi::Tensor tts_codes;
+#else
     ::tyloi::DenseTensor decision_logits;
     ::tyloi::DenseTensor audio_embeddings;
     ::tyloi::DenseTensor generated_ids;
     ::tyloi::DenseTensor tts_codes;
+#endif
     bool is_listen = false;
     bool end_of_turn = false;
     bool tts_force_flush = false;
@@ -468,7 +475,11 @@ struct MiniCPMO45DuplexSession {
         auto pending = feed_id(ids.unit_start);
         ::tyloi::DenseTensor generation_logits;
         bool has_content = false;
+#ifdef TYLOINFER_NATIVE_CUDA
+        ::tyloi::Tensor audio_embeddings;
+#else
         ::tyloi::DenseTensor audio_embeddings;
+#endif
 
         if (pixels.defined()) {
             if (!patch_mask.defined() || !target_sizes.defined()) {
@@ -526,12 +537,12 @@ struct MiniCPMO45DuplexSession {
                 audio_features.to(::tyloi::kCUDA),
                 audio_prefix_extra_frames,
                 audio_suffix_extra_frames);
-#ifdef TYLOINFER_NATIVE_CUDA
-            audio_embeddings = encoded_audio.dense();
-#else
             audio_embeddings = std::move(encoded_audio);
-#endif
+#ifdef TYLOINFER_NATIVE_CUDA
+            pending = feed_embeddings(audio_embeddings.dense());
+#else
             pending = feed_embeddings(audio_embeddings);
+#endif
             generation_logits = pending.first;
             ++audio_chunk_index;
             has_content = true;

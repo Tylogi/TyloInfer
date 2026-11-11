@@ -1,6 +1,6 @@
 #pragma once
 
-#include "backend.h"
+#include "engine/tensor.h"
 
 #include <cstdint>
 
@@ -9,7 +9,7 @@ namespace tyloi::cuda {
 class Recurrent {
 public:
     struct State {
-        ::tyloi::DenseTensor convolution, recurrent;
+        ::tyloi::Tensor convolution, recurrent;
         bool transposed = true;
 
         bool defined() const noexcept {
