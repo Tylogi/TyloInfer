@@ -73,8 +73,7 @@ else()
 endif()
 add_library(mfq-cuda-loading OBJECT ${TYLOINFER_CUDA_LOADING_SOURCES})
 mfq_configure_cuda_engine_target(mfq-cuda-loading)
-target_compile_definitions(mfq-cuda-loading PRIVATE
-    TYLOINFER_NATIVE_CUDA=1 NOMINMAX)
+target_compile_definitions(mfq-cuda-loading PRIVATE NOMINMAX)
 set_target_properties(mfq-cuda-loading PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 add_subdirectory(${PROJECT_SOURCE_DIR}/engine/models ${CMAKE_CURRENT_BINARY_DIR}/models)

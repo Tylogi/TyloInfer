@@ -382,8 +382,7 @@ endif()
 add_library(mfq-cuda-execution OBJECT ${TYLOINFER_CUDA_EXECUTION_SOURCES})
 mfq_configure_cuda_backend_target(mfq-cuda-execution)
 target_link_libraries(mfq-cuda-execution PRIVATE mfq-cpu-execution mfq-engine)
-target_compile_definitions(mfq-cuda-execution PRIVATE
-    TYLOINFER_NATIVE_CUDA=1 NOMINMAX)
+target_compile_definitions(mfq-cuda-execution PRIVATE NOMINMAX)
 set_target_properties(mfq-cuda-execution PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 set_source_files_properties(
