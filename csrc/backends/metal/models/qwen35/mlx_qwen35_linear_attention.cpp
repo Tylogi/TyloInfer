@@ -116,7 +116,7 @@ void validate_position_shape(
 MlxQwen35LinearAttentionBlock
 MlxQwen35LinearAttentionBlock::load(
     const MfqContainer& model,
-    const Qwen35Config& config,
+    const Config& config,
     const Qwen35TensorNames& names,
     std::size_t layer_index) {
     if (layer_index >=
@@ -156,12 +156,12 @@ MlxQwen35LinearAttentionBlock::load(
             resolved.linear_conv_bias);
     return MlxQwen35LinearAttentionBlock(
         config,
-        config.linear_qkv_gguf_layout,
+        config.legacy_tensor_layout.qwen_gdn_gguf_layout,
         load_qwen35_rms_norm(
             model,
             resolved.attention_norm,
             config.rms_norm_eps,
-            config.norm_weight_offset),
+            config.legacy_tensor_layout.norm_weight_offset),
         std::move(combined_qkv),
         std::move(split_qk),
         std::move(split_value),
@@ -180,12 +180,12 @@ MlxQwen35LinearAttentionBlock::load(
             model,
             resolved.ffn_norm,
             config.rms_norm_eps,
-            config.norm_weight_offset),
+            config.legacy_tensor_layout.norm_weight_offset),
         MlxQwen35DenseSwiGlu::load(model, resolved));
 }
 
 MlxQwen35LinearAttentionBlock::MlxQwen35LinearAttentionBlock(
-    Qwen35Config config,
+    Config config,
     bool gguf_layout,
     MlxRmsNorm attention_norm,
     std::optional<MlxLinear> combined_qkv,
@@ -241,7 +241,7 @@ MlxQwen35LinearAttentionBlock::MlxQwen35LinearAttentionBlock(
     // forward() rebuilt 48 Exp/Negative primitives for every decode token.
     // Materialize the converted value once and reuse it across the lifetime
     // of the block instead.
-    if (config_.linear_a_is_log) {
+    if (config_.legacy_tensor_layout.linear_attention_a_is_log) {
         a_ = mlx::core::contiguous(
             -mlx::core::exp(a_));
         a_.eval();
@@ -335,11 +335,11 @@ validate_components() const {
             "linear value head dimension");
     const int key_size =
         checked_int(
-            config_.linear_key_size(),
+            config_.linear_k_size(),
             "linear key size");
     const int value_size =
         checked_int(
-            config_.linear_value_size(),
+            config_.linear_v_size(),
             "linear value size");
     const int channels =
         checked_int(
@@ -599,9 +599,9 @@ array MlxQwen35LinearAttentionBlock::forward(
     }
 
     const int key_size =
-        static_cast<int>(config_.linear_key_size());
+        static_cast<int>(config_.linear_k_size());
     const int value_size =
-        static_cast<int>(config_.linear_value_size());
+        static_cast<int>(config_.linear_v_size());
     const int channels =
         static_cast<int>(config_.linear_qkv_size());
     const int key_heads =

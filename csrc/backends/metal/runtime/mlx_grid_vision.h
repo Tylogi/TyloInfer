@@ -1,6 +1,6 @@
 #pragma once
 
-#include "grid_vision.h"
+#include "engine/models/common/vision/grid_vision.h"
 #include "mfq_container.h"
 #include "mlx_multimodal.h"
 
@@ -13,12 +13,12 @@
 
 namespace mfq::metal {
 
-using ::mfq::GridVisionConfig;
-using ::mfq::GridVisionLayout;
-using ::mfq::LearnedPositionInterpolation;
-using ::mfq::make_grid_vision_layout;
-using ::mfq::make_learned_position_interpolation;
-using GridThw = ::mfq::GridShape;
+using ::tyloi::GridVisionConfig;
+using ::tyloi::GridVisionLayout;
+using ::tyloi::LearnedPositionInterpolation;
+using ::tyloi::make_grid_vision_layout;
+using ::tyloi::make_learned_position_interpolation;
+using GridThw = ::tyloi::GridShape;
 
 // Reusable learned-position, axial-RoPE grid ViT encoder. Its default loader
 // consumes only the canonical MFQ namespace from mlx_tensor_schema.h.

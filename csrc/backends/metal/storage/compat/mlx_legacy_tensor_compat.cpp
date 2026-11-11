@@ -1,9 +1,8 @@
 #include "mlx_legacy_tensor_compat.h"
 
 #include "mfq_container.h"
-#include "mfq_legacy_model_graph.h"
-#include "mfq_legacy_tensor_names.h"
-#include "mfq_model_graph.h"
+#include "engine/models/source/legacy_graph.h"
+#include "engine/models/source/legacy_names.h"
 
 #include <stdexcept>
 #include <string>
@@ -41,7 +40,7 @@ std::string legacy_model_config(const MfqContainer& model) {
 void install_legacy_tensor_compatibility(MfqContainer& model) {
     if (model.model_graph()) return;
     if (!model.contains(std::string(kModelConfigAsset))) return;
-    auto compatibility = mfq::models::legacy_names(
+    auto compatibility = tyloi::models::legacy_names(
         model.header().architecture,
         legacy_model_config(model),
         stored_tensor_names(model));
@@ -50,9 +49,9 @@ void install_legacy_tensor_compatibility(MfqContainer& model) {
         compatibility.layout);
 }
 
-mfq::MfqModelGraph effective_model_graph(const MfqContainer& model) {
+tyloi::ModelGraph effective_model_graph(const MfqContainer& model) {
     if (auto graph = model.model_graph()) return *graph;
-    return mfq::synthesize_legacy_model_graph(
+    return tyloi::synthesize_legacy_model_graph(
         model.header().architecture,
         legacy_model_config(model),
         [&model](std::string_view name) {

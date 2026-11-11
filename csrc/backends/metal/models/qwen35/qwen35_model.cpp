@@ -7,7 +7,7 @@
 #include "mlx_vq.h"
 #endif
 
-#include "nlohmann/json.hpp"
+#include "mlx_legacy_tensor_compat.h"
 
 #include <algorithm>
 #include <cmath>
@@ -21,263 +21,7 @@
 namespace mfq::metal {
 namespace {
 
-using json = nlohmann::json;
 using mlx::core::array;
-
-const json& object_or_self(const json& root, const char* key) {
-    const auto found = root.find(key);
-    if (found == root.end()) {
-        return root;
-    }
-    if (!found->is_object()) {
-        throw std::runtime_error(
-            std::string("embedded model config ") + key +
-            " must be an object");
-    }
-    return *found;
-}
-
-const json& object_or_empty(
-    const json& parent,
-    const char* key,
-    const json& empty) {
-    const auto found = parent.find(key);
-    if (found == parent.end() || found->is_null()) {
-        return empty;
-    }
-    if (!found->is_object()) {
-        throw std::runtime_error(
-            std::string("embedded model config ") + key +
-            " must be an object");
-    }
-    return *found;
-}
-
-std::int64_t required_integer(const json& object, const char* key) {
-    const auto found = object.find(key);
-    if (found == object.end() || !found->is_number_integer()) {
-        throw std::runtime_error(
-            std::string("embedded model config requires integer ") + key);
-    }
-    return found->get<std::int64_t>();
-}
-
-std::int64_t optional_integer(
-    const json& object,
-    const char* key,
-    std::int64_t default_value) {
-    const auto found = object.find(key);
-    if (found == object.end() || found->is_null()) {
-        return default_value;
-    }
-    if (!found->is_number_integer()) {
-        throw std::runtime_error(
-            std::string("embedded model config ") + key +
-            " must be an integer");
-    }
-    return found->get<std::int64_t>();
-}
-
-double optional_number(
-    const json& object,
-    const char* key,
-    double default_value) {
-    const auto found = object.find(key);
-    if (found == object.end() || found->is_null()) {
-        return default_value;
-    }
-    if (!found->is_number()) {
-        throw std::runtime_error(
-            std::string("embedded model config ") + key +
-            " must be a number");
-    }
-    return found->get<double>();
-}
-
-bool optional_boolean(
-    const json& object,
-    const char* key,
-    bool default_value) {
-    const auto found = object.find(key);
-    if (found == object.end() || found->is_null()) {
-        return default_value;
-    }
-    if (!found->is_boolean()) {
-        throw std::runtime_error(
-            std::string("embedded model config ") + key +
-            " must be boolean");
-    }
-    return found->get<bool>();
-}
-
-std::optional<std::int64_t> optional_token_id(
-    const json& object,
-    const char* key) {
-    const auto found = object.find(key);
-    if (found == object.end() || found->is_null()) {
-        return std::nullopt;
-    }
-    if (!found->is_number_integer()) {
-        throw std::runtime_error(
-            std::string("embedded model config ") + key +
-            " must be an integer");
-    }
-    const auto value = found->get<std::int64_t>();
-    if (value < 0) {
-        throw std::runtime_error(
-            std::string("embedded model config ") + key +
-            " must be non-negative");
-    }
-    return value;
-}
-
-std::string optional_string(
-    const json& object,
-    const char* key,
-    std::string default_value = {}) {
-    const auto found = object.find(key);
-    if (found == object.end() || found->is_null()) {
-        return default_value;
-    }
-    if (!found->is_string()) {
-        throw std::runtime_error(
-            std::string("embedded model config ") + key +
-            " must be a string");
-    }
-    return found->get<std::string>();
-}
-
-std::vector<std::int64_t> optional_integer_array(
-    const json& object,
-    const char* key) {
-    const auto found = object.find(key);
-    if (found == object.end() || found->is_null()) {
-        return {};
-    }
-    if (!found->is_array()) {
-        throw std::runtime_error(
-            std::string("embedded model config ") + key +
-            " must be an array");
-    }
-    std::vector<std::int64_t> result;
-    result.reserve(found->size());
-    for (const auto& value : *found) {
-        if (!value.is_number_integer()) {
-            throw std::runtime_error(
-                std::string("embedded model config ") + key +
-                " entries must be integers");
-        }
-        result.push_back(value.get<std::int64_t>());
-    }
-    return result;
-}
-
-std::vector<std::string> layer_types(
-    const json& object,
-    std::int64_t count) {
-    const auto found = object.find("layer_types");
-    if (found == object.end() || found->is_null()) {
-        return std::vector<std::string>(
-            static_cast<std::size_t>(count),
-            "full_attention");
-    }
-    if (!found->is_array()) {
-        throw std::runtime_error(
-            "embedded model config layer_types must be an array");
-    }
-    std::vector<std::string> result;
-    result.reserve(found->size());
-    for (const auto& value : *found) {
-        if (!value.is_string()) {
-            throw std::runtime_error(
-                "embedded model config layer_types entries must be strings");
-        }
-        result.push_back(value.get<std::string>());
-    }
-    return result;
-}
-
-void validate_config(const Qwen35Config& config) {
-    const auto positive = [](std::int64_t value, const char* name) {
-        if (value <= 0 ||
-            value > std::numeric_limits<std::int32_t>::max()) {
-            throw std::runtime_error(
-                std::string("invalid Qwen3.5 config ") + name);
-        }
-    };
-    positive(config.vocab_size, "vocab_size");
-    positive(config.hidden_size, "hidden_size");
-    positive(config.intermediate_size, "intermediate_size");
-    positive(config.num_hidden_layers, "num_hidden_layers");
-    positive(config.num_attention_heads, "num_attention_heads");
-    positive(config.num_key_value_heads, "num_key_value_heads");
-    positive(config.max_position_embeddings, "max_position_embeddings");
-    positive(config.head_dim, "head_dim");
-    positive(config.rotary_dim, "rotary_dim");
-    positive(config.linear_conv_kernel_dim, "linear_conv_kernel_dim");
-    positive(config.linear_key_head_dim, "linear_key_head_dim");
-    positive(config.linear_value_head_dim, "linear_value_head_dim");
-    if (config.linear_num_key_heads < 0 ||
-        config.linear_num_value_heads < 0 ||
-        config.full_attention_interval < 0 ||
-        config.mtp_num_hidden_layers < 0) {
-        throw std::runtime_error(
-            "invalid negative Qwen3.5 count in model config");
-    }
-    positive(config.linear_key_heads(), "linear key head count");
-    positive(config.linear_value_heads(), "linear value head count");
-    if (config.rotary_dim > config.head_dim) {
-        throw std::runtime_error(
-            "invalid Qwen3.5 config rotary_dim exceeds head_dim");
-    }
-    if (!std::isfinite(config.rope_base) || config.rope_base <= 0.0 ||
-        !std::isfinite(config.rms_norm_eps) ||
-        config.rms_norm_eps <= 0.0) {
-        throw std::runtime_error(
-            "invalid Qwen3.5 RoPE or RMSNorm configuration");
-    }
-    if (config.layer_types.size() !=
-        static_cast<std::size_t>(config.num_hidden_layers)) {
-        throw std::runtime_error(
-            "Qwen3.5 layer_types length does not match num_hidden_layers");
-    }
-    for (const auto& type : config.layer_types) {
-        if (type != "full_attention" &&
-            type != "linear_attention") {
-            throw std::runtime_error(
-                "unsupported Qwen3.5 layer type: " + type);
-        }
-    }
-    std::int64_t rope_section_sum = 0;
-    for (const auto section : config.rope_sections) {
-        if (section < 0) {
-            throw std::runtime_error(
-                "invalid Qwen3.5 config rope_sections entry");
-        }
-        rope_section_sum += section;
-    }
-    if (!config.rope_sections.empty() &&
-        rope_section_sum * 2 != config.rotary_dim) {
-        throw std::runtime_error(
-            "Qwen3.5 mRoPE sections do not cover rotary_dim");
-    }
-    if (config.vision) {
-        config.vision->validate();
-        if (config.vision->out_hidden_size != config.hidden_size) {
-            throw std::runtime_error(
-                "Qwen vision output width does not match text hidden size");
-        }
-        if (!config.image_token_id || !config.video_token_id ||
-            !config.vision_start_token_id || !config.vision_end_token_id) {
-            throw std::runtime_error(
-                "Qwen vision config requires all multimodal token IDs");
-        }
-        if (*config.image_token_id == *config.video_token_id) {
-            throw std::runtime_error(
-                "Qwen image/video token IDs must differ");
-        }
-    }
-}
 
 class PrefixCursor {
 public:
@@ -476,160 +220,14 @@ array load_norm_weight(
 
 } // namespace
 
-Qwen35Config Qwen35Config::from_json(std::string_view payload) {
-    json root;
-    try {
-        root = json::parse(payload.begin(), payload.end());
-    } catch (const json::exception& error) {
-        throw std::runtime_error(
-            std::string("invalid embedded model config JSON: ") +
-            error.what());
-    }
-    if (!root.is_object()) {
-        throw std::runtime_error(
-            "embedded model config must be a JSON object");
-    }
-    const auto& text = object_or_self(root, "text_config");
-    static const json empty = json::object();
-    const auto& rope_parameters =
-        object_or_empty(text, "rope_parameters", empty);
-    const auto& full_rope =
-        object_or_empty(rope_parameters, "full_attention", empty);
-
-    Qwen35Config config;
-    const auto model_type = optional_string(root, "model_type", optional_string(text, "model_type"));
-    config.text_model_type = optional_string(text, "model_type", model_type);
-    json geometry;
-    geometry["model_type"] = model_type;
-    for (const auto* name : {"vocab_size", "hidden_size", "intermediate_size",
-            "num_hidden_layers", "num_attention_heads", "num_key_value_heads",
-            "max_position_embeddings"}) {
-        geometry[name] = required_integer(text, name);
-    }
-    const auto hidden = geometry["hidden_size"].get<std::int64_t>();
-    const auto heads = geometry["num_attention_heads"].get<std::int64_t>();
-    const auto default_head_dim = heads > 0 && hidden % heads == 0 ? hidden / heads : 0;
-    geometry["head_dim"] = optional_integer(text, "head_dim", default_head_dim);
-    geometry["rope_theta"] = optional_number(full_rope, "rope_theta",
-        optional_number(rope_parameters, "rope_theta", optional_number(text, "rope_theta", 1'000'000.0)));
-    geometry["partial_rotary_factor"] = optional_number(full_rope, "partial_rotary_factor",
-        optional_number(rope_parameters, "partial_rotary_factor", optional_number(text, "partial_rotary_factor", 1.0)));
-    geometry["rms_norm_eps"] = optional_number(text, "rms_norm_eps", 1e-6);
-    geometry["tie_word_embeddings"] = optional_boolean(text, "tie_word_embeddings", false);
-    const auto layer_count = geometry["num_hidden_layers"].get<std::int64_t>();
-    if (layer_count <= 0 || layer_count > std::numeric_limits<std::int32_t>::max())
-        throw std::runtime_error("invalid Qwen3.5 config num_hidden_layers");
-    const auto layers = ::mfq::metal::layer_types(text, layer_count);
-    if (layers.empty()) throw std::runtime_error("Qwen3.5 layer_types length does not match num_hidden_layers");
-    geometry["layer_types"] = layers;
-    auto yarn_rope = full_rope.empty() ? rope_parameters : full_rope;
-    if (yarn_rope.empty() && text.contains("rope_scaling")) yarn_rope = text.at("rope_scaling");
-    const auto rope_type = optional_string(yarn_rope, "rope_type", optional_string(yarn_rope, "type", "default"));
-    config.yarn_max_factor = rope_type == "default" || rope_type == "yarn"
-        ? optional_number(yarn_rope, "factor", 4.0) : 1.0;
-    config.yarn.beta_fast = optional_number(yarn_rope, "beta_fast", 32.0);
-    config.yarn.beta_slow = optional_number(yarn_rope, "beta_slow", 1.0);
-    if (rope_type == "yarn") geometry["max_position_embeddings"] = optional_integer(yarn_rope,
-        "original_max_position_embeddings", geometry["max_position_embeddings"].get<std::int64_t>());
-    static_cast<tyloi::models::ModelConfig&>(config) =
-        tyloi::models::ModelConfig::from_json(geometry.dump());
-    (void)qwen_yarn_capacity(config.max_position_embeddings, config.yarn_max_factor);
-    config.rope_sections =
-        optional_integer_array(full_rope, "mrope_section");
-    if (config.rope_sections.empty()) {
-        config.rope_sections =
-            optional_integer_array(rope_parameters, "mrope_section");
-    }
-    config.norm_weight_offset =
-        optional_number(text, "norm_weight_offset", 1.0);
-    config.attention_output_gate =
-        optional_boolean(text, "attn_output_gate", false);
-    config.output_gate_type =
-        optional_string(text, "output_gate_type");
-    config.full_attention_interval =
-        optional_integer(text, "full_attention_interval", 0);
-    config.linear_conv_kernel_dim =
-        optional_integer(text, "linear_conv_kernel_dim", 4);
-    config.linear_key_head_dim =
-        optional_integer(text, "linear_key_head_dim", 128);
-    config.linear_value_head_dim =
-        optional_integer(text, "linear_value_head_dim", 128);
-    config.linear_num_key_heads =
-        optional_integer(text, "linear_num_key_heads", 0);
-    config.linear_num_value_heads =
-        optional_integer(text, "linear_num_value_heads", 0);
-    config.linear_a_is_log =
-        optional_boolean(text, "linear_a_is_log", true);
-    config.mrope_interleaved =
-        optional_boolean(rope_parameters, "mrope_interleaved", false);
-    config.mtp_num_hidden_layers =
-        optional_integer(text, "mtp_num_hidden_layers", 0);
-    config.mtp_use_dedicated_embeddings =
-        optional_boolean(text, "mtp_use_dedicated_embeddings", false);
-    config.image_token_id = optional_token_id(root, "image_token_id");
-    config.video_token_id = optional_token_id(root, "video_token_id");
-    config.vision_start_token_id =
-        optional_token_id(root, "vision_start_token_id");
-    config.vision_end_token_id =
-        optional_token_id(root, "vision_end_token_id");
-
-    const auto vision_found = root.find("vision_config");
-    if (vision_found != root.end() && !vision_found->is_null()) {
-        if (!vision_found->is_object()) {
-            throw std::runtime_error(
-                "embedded model config vision_config must be an object");
-        }
-        const auto& vision = *vision_found;
-        const auto hidden_act = optional_string(
-            vision,
-            "hidden_act",
-            "gelu_pytorch_tanh");
-        if (hidden_act != "gelu_pytorch_tanh") {
-            throw std::runtime_error(
-                "Qwen grid-ViT requires gelu_pytorch_tanh hidden_act");
-        }
-        const auto& vision_rope =
-            object_or_empty(vision, "rope_parameters", empty);
-        GridVisionConfig vision_config;
-        vision_config.hidden_size =
-            required_integer(vision, "hidden_size");
-        vision_config.intermediate_size =
-            required_integer(vision, "intermediate_size");
-        vision_config.depth = required_integer(vision, "depth");
-        vision_config.num_heads = required_integer(vision, "num_heads");
-        vision_config.in_channels =
-            optional_integer(vision, "in_channels", 3);
-        vision_config.patch_size =
-            required_integer(vision, "patch_size");
-        vision_config.temporal_patch_size =
-            required_integer(vision, "temporal_patch_size");
-        vision_config.spatial_merge_size =
-            required_integer(vision, "spatial_merge_size");
-        vision_config.out_hidden_size =
-            required_integer(vision, "out_hidden_size");
-        vision_config.num_position_embeddings =
-            required_integer(vision, "num_position_embeddings");
-        vision_config.rope_theta = optional_number(
-            vision_rope,
-            "rope_theta",
-            optional_number(vision, "rope_theta", 10'000.0));
-        vision_config.layer_norm_eps =
-            optional_number(vision, "layer_norm_eps", 1e-6);
-        vision_config.validate();
-        config.vision = std::move(vision_config);
-    }
-
-    validate_config(config);
-    return config;
-}
-
-Qwen35Config Qwen35Config::from_mfq(const MfqContainer& model) {
+Config load_qwen35_config(const MfqContainer& model) {
     if (!model.contains(std::string(kMfqModelConfigAsset))) {
-        throw std::runtime_error(
-            "MFQ has no embedded model config asset");
+        throw std::runtime_error("MFQ has no embedded model config asset");
     }
-    return from_json(
-        model.read_text(std::string(kMfqModelConfigAsset)));
+    auto config = Config::from_json(
+        model.read_text(std::string(kMfqModelConfigAsset)), effective_model_graph(model));
+    config.legacy_tensor_layout = model.legacy_tensor_layout();
+    return config.context(0);
 }
 
 Qwen35TensorNames Qwen35TensorNames::canonical() {
@@ -687,17 +285,6 @@ Qwen35ResolvedLayerNames Qwen35TensorNames::layer(
         format_layer_name(linear_norm, index),
         format_layer_name(linear_output, index),
     };
-}
-
-Qwen35Config adapt_qwen35_config_for_storage(
-    Qwen35Config config,
-    bool legacy_gguf_semantics) {
-    if (legacy_gguf_semantics) {
-        config.norm_weight_offset = 0.0;
-        config.linear_a_is_log = false;
-        config.linear_qkv_gguf_layout = true;
-    }
-    return config;
 }
 
 Qwen35TensorMetadata inspect_qwen35_tensor_metadata(
@@ -867,7 +454,7 @@ Qwen35TensorMetadata inspect_qwen35_tensor_metadata(
 
 void validate_qwen35_model_bindings(
     const MfqContainer& model,
-    const Qwen35Config& config,
+    const Config& config,
     const Qwen35TensorNames& names) {
     require_tensor(
         model,
@@ -964,12 +551,12 @@ void validate_qwen35_model_bindings(
             require_tensor(
                 model,
                 *layer.linear_qk,
-                {2 * config.linear_key_size(), config.hidden_size},
+                {2 * config.linear_k_size(), config.hidden_size},
                 false);
             require_tensor(
                 model,
                 *layer.linear_value,
-                {config.linear_value_size(), config.hidden_size},
+                {config.linear_v_size(), config.hidden_size},
                 false);
         } else {
             require_tensor(
@@ -981,7 +568,7 @@ void validate_qwen35_model_bindings(
         require_tensor(
             model,
             layer.linear_z,
-            {config.linear_value_size(), config.hidden_size},
+            {config.linear_v_size(), config.hidden_size},
             false);
         require_tensor(
             model,
@@ -1037,7 +624,7 @@ void validate_qwen35_model_bindings(
         require_tensor(
             model,
             layer.linear_output,
-            {config.hidden_size, config.linear_value_size()},
+            {config.hidden_size, config.linear_v_size()},
             false);
     }
 }

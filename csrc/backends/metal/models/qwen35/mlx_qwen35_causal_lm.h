@@ -45,11 +45,11 @@ class MlxQwen35MtpModule {
 public:
     static std::optional<MlxQwen35MtpModule> load_if_present(
         const MfqContainer& model,
-        const Qwen35Config& config,
+        const Config& config,
         const Qwen35TensorNames& names);
 
     MlxQwen35MtpModule(
-        Qwen35Config config,
+        Config config,
         MlxRmsNorm hidden_norm,
         MlxRmsNorm embedding_norm,
         Qwen35Linear fusion,
@@ -91,7 +91,7 @@ private:
         const Qwen35Embedding& embedding,
         bool use_cache);
 
-    Qwen35Config config_;
+    Config config_;
     MlxRmsNorm hidden_norm_;
     MlxRmsNorm embedding_norm_;
     Qwen35Linear fusion_;
@@ -105,11 +105,11 @@ public:
 
     static MlxQwen35CausalLm load(
         const MfqContainer& model,
-        const Qwen35Config& config,
+        const Config& config,
         const Qwen35TensorNames& names);
 
     MlxQwen35CausalLm(
-        Qwen35Config config,
+        Config config,
         Qwen35Embedding embedding,
         std::vector<MlxQwen35Layer> layers,
         MlxRmsNorm output_norm,
@@ -227,7 +227,7 @@ public:
         return true;
     }
 
-    const Qwen35Config& config() const noexcept {
+    const Config& config() const noexcept {
         return config_;
     }
     std::size_t layer_count() const noexcept {
@@ -293,7 +293,7 @@ private:
     mlx::core::array project_normalized(
         const mlx::core::array& hidden) const;
 
-    Qwen35Config config_;
+    Config config_;
     Qwen35Embedding embedding_;
     std::vector<MlxQwen35Layer> layers_;
     MlxRmsNorm output_norm_;

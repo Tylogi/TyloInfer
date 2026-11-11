@@ -2,9 +2,10 @@
 
 #include "mlx_legacy_tensor_compat.h"
 
-#include "engine/models/common/mfq_source.h"
-#include "engine/models/common/gguf_source.h"
+#include "engine/models/source/mfq_source.h"
+#include "engine/models/source/gguf_source.h"
 #include "engine/weights/encoding/tq_rows.h"
+#include "engine/weights/source/gguf.h"
 #include "nlohmann/json.hpp"
 
 #include <algorithm>
@@ -199,7 +200,8 @@ struct MfqContainer::RandomAccessFiles : std::enable_shared_from_this<RandomAcce
 
 void MfqContainer::load_hf_directory(
     const std::filesystem::path& requested_path, const std::string& source_prefix) {
-    hf_source_ = std::make_shared<mfq::models::HfSource>(requested_path, source_prefix);
+    hf_source_ = std::make_shared<tyloi::models::HfSource>(requested_path, source_prefix);
+    legacy_tensor_layout_ = hf_source_->tensor_layout();
     header_.version = 2;
     header_.architecture = std::string(hf_source_->architecture());
     header_.extra_json = hf_source_->metadata();
@@ -243,8 +245,8 @@ MfqContainer::MfqContainer(std::filesystem::path path, std::string hf_source_pre
         load_hf_directory(path, hf_source_prefix);
         return;
     }
-    if (mfq::is_gguf_file(path)) {
-        gguf_source_ = std::make_shared<mfq::models::GgufSource>(path, std::move(gguf_companions));
+    if (tyloi::is_gguf_file(path)) {
+        gguf_source_ = std::make_shared<tyloi::models::GgufSource>(path, std::move(gguf_companions));
         header_.version = 2;
         header_.architecture = std::string(gguf_source_->architecture());
         header_.extra_json = gguf_source_->metadata();
@@ -258,10 +260,13 @@ MfqContainer::MfqContainer(std::filesystem::path path, std::string hf_source_pre
             records_.emplace(name, MfqRecord{name, "BLOB", "BLOB", path, 0,
                 gguf_source_->read_asset(name).size()});
         header_.record_count = static_cast<std::uint32_t>(records_.size());
-        legacy_tensor_layout_.qwen_gdn_gguf_layout = header_.architecture == "qwen35" || header_.architecture == "qwen35moe";
+        legacy_tensor_layout_ = gguf_source_->tensor_layout();
+        // shortcut: GGUF source omits Qwen35 layout flags; remove with the shared Loader migration.
+        if (header_.architecture == "qwen35" || header_.architecture == "qwen35moe")
+            legacy_tensor_layout_ = {0.0, false, true};
         return;
     }
-    mfq::models::MfqSource source(std::move(path));
+    tyloi::models::MfqSource source(std::move(path));
     header_.version = source.header().version;
     header_.architecture = source.header().architecture;
     header_.extra_json = source.header().metadata;
@@ -317,7 +322,7 @@ std::vector<std::int64_t> MfqContainer::tq_shape(const std::string& name) const 
             break;
         }
     }
-    return mfq::tq_tensor_shape(entry.nbytes,
+    return tyloi::tq_tensor_shape(entry.nbytes,
         [&](std::uint64_t offset, std::byte* output, std::size_t size) {
             read_range_into(name, offset, {output, size});
         }, std::move(logical));
@@ -403,7 +408,7 @@ MfqMappedBytes MfqContainer::map_record_range(const std::string& name, std::uint
         throw std::out_of_range("mapped tensor range is out of bounds: " + name);
     if (!size) return {};
     if (hf_source_ || gguf_source_) {
-        const mfq::ModelSource& source = hf_source_ ? *hf_source_ : *gguf_source_;
+        const tyloi::ModelSource& source = hf_source_ ? *hf_source_ : *gguf_source_;
         const auto range = source.tensor_file_range_at(value.name, offset, size);
         if (!range) {
             auto bytes = std::make_shared<std::vector<std::uint8_t>>(read_range(name, offset, size));
@@ -536,7 +541,7 @@ void MfqContainer::read_range_into(
         return;
     }
     if (hf_source_ || gguf_source_) {
-        const mfq::ModelSource& source = hf_source_ ? *hf_source_ : *gguf_source_;
+        const tyloi::ModelSource& source = hf_source_ ? *hf_source_ : *gguf_source_;
         if (source.has_asset(value.name)) {
             const auto bytes = source.read_asset(value.name);
             std::copy_n(
@@ -583,7 +588,7 @@ void MfqContainer::readv_range(const std::string& name, std::uint64_t relative_o
         || total > maximum - value.offset - relative_offset)
         throw std::runtime_error("MFQ record byte range is too large: " + name);
     if (gguf_source_) {
-        std::vector<mfq::ReadSpan> spans;
+        std::vector<tyloi::ReadSpan> spans;
         for (const auto destination : destinations) {
             spans.push_back({relative_offset, destination.data(), destination.size()});
             relative_offset += destination.size();
@@ -608,15 +613,15 @@ void MfqContainer::drop_source_file_cache() const noexcept {
     if (gguf_source_) gguf_source_->drop_file_cache();
 }
 
-std::optional<mfq::MfqModelGraph> MfqContainer::model_graph() const {
-    const std::string asset(mfq::kMfqModelGraphAsset);
+std::optional<tyloi::ModelGraph> MfqContainer::model_graph() const {
+    const std::string asset(tyloi::kModelGraphAsset);
     if (!contains(asset)) return std::nullopt;
-    return mfq::MfqModelGraph::from_json(read_text(asset));
+    return tyloi::ModelGraph::from_json(read_text(asset));
 }
 
 void MfqContainer::install_legacy_aliases(
         std::unordered_map<std::string, std::string> canonical_to_stored,
-        mfq::MfqLegacyTensorLayout layout) {
+        tyloi::TensorLayout layout) {
     if (model_graph()) {
         throw std::invalid_argument(
             "canonical MFQ model graphs cannot install legacy tensor aliases");

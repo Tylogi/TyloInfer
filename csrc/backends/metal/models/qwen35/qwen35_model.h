@@ -1,6 +1,6 @@
 #pragma once
 
-#include "engine/models/source/model_config.h"
+#include "engine/models/qwen35/config.h"
 #include "mfq_container.h"
 #include "mlx_grid_vision.h"
 #include "mlx_tensor.h"
@@ -20,66 +20,9 @@ namespace mfq::metal {
 inline constexpr std::string_view kMfqModelConfigAsset =
     "__mfq_asset__/model_config.json";
 
-struct Qwen35Config : tyloi::models::ModelConfig {
-    std::string text_model_type;
-    MlxYarnScaling yarn;
-    double yarn_max_factor = 4.0;
-    std::vector<std::int64_t> rope_sections;
-    double norm_weight_offset = 1.0;
-    bool attention_output_gate = false;
-    std::string output_gate_type;
-    std::int64_t full_attention_interval = 0;
-    std::int64_t linear_conv_kernel_dim = 4;
-    std::int64_t linear_key_head_dim = 128;
-    std::int64_t linear_value_head_dim = 128;
-    std::int64_t linear_num_key_heads = 0;
-    std::int64_t linear_num_value_heads = 0;
-    bool linear_a_is_log = true;
-    bool linear_qkv_gguf_layout = false;
-    bool mrope_interleaved = false;
-    std::int64_t mtp_num_hidden_layers = 0;
-    bool mtp_use_dedicated_embeddings = false;
-    std::optional<GridVisionConfig> vision;
-    std::optional<std::int64_t> image_token_id;
-    std::optional<std::int64_t> video_token_id;
-    std::optional<std::int64_t> vision_start_token_id;
-    std::optional<std::int64_t> vision_end_token_id;
+using tyloi::models::qwen35::Config;
 
-    static Qwen35Config from_json(std::string_view payload);
-    static Qwen35Config from_mfq(const MfqContainer& model);
-
-    std::int64_t attention_size() const noexcept {
-        return num_attention_heads * head_dim;
-    }
-    std::int64_t kv_size() const noexcept {
-        return num_key_value_heads * head_dim;
-    }
-    std::int64_t query_projection_size() const noexcept {
-        return attention_size() * (attention_output_gate ? 2 : 1);
-    }
-    std::int64_t linear_key_heads() const noexcept {
-        return linear_num_key_heads > 0
-            ? linear_num_key_heads
-            : num_key_value_heads;
-    }
-    std::int64_t linear_value_heads() const noexcept {
-        return linear_num_value_heads > 0
-            ? linear_num_value_heads
-            : num_attention_heads;
-    }
-    std::int64_t linear_key_size() const noexcept {
-        return linear_key_heads() * linear_key_head_dim;
-    }
-    std::int64_t linear_value_size() const noexcept {
-        return linear_value_heads() * linear_value_head_dim;
-    }
-    std::int64_t linear_qkv_size() const noexcept {
-        return 2 * linear_key_size() + linear_value_size();
-    }
-    bool has_vision() const noexcept {
-        return vision.has_value();
-    }
-};
+Config load_qwen35_config(const MfqContainer& model);
 
 struct Qwen35TensorMetadata {
     std::string dtype;
@@ -167,20 +110,13 @@ struct Qwen35TensorNames {
     Qwen35ResolvedLayerNames layer(std::size_t index) const;
 };
 
-// GGUF Qwen3.5 exports store already-shifted RMSNorm weights and the
-// materialized negative SSM decay instead of the original A_log. Match the
-// CUDA runtime's layout adaptation before constructing model components.
-Qwen35Config adapt_qwen35_config_for_storage(
-    Qwen35Config config,
-    bool legacy_gguf_semantics);
-
 Qwen35TensorMetadata inspect_qwen35_tensor_metadata(
     const MfqContainer& model,
     const std::string& name);
 
 void validate_qwen35_model_bindings(
     const MfqContainer& model,
-    const Qwen35Config& config,
+    const Config& config,
     const Qwen35TensorNames& names);
 
 using Qwen35RmsNorm = MlxRmsNorm;

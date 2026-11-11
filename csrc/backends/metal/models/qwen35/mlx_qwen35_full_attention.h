@@ -69,12 +69,12 @@ class MlxQwen35FullAttentionBlock {
 public:
     static MlxQwen35FullAttentionBlock load(
         const MfqContainer& model,
-        const Qwen35Config& config,
+        const Config& config,
         const Qwen35TensorNames& names,
         std::size_t layer_index);
 
     MlxQwen35FullAttentionBlock(
-        Qwen35Config config,
+        Config config,
         MlxRmsNorm attention_norm,
         MlxLinear query,
         MlxLinear key,
@@ -134,7 +134,7 @@ public:
         return cache_batch_;
     }
 
-    const Qwen35Config& config() const noexcept {
+    const Config& config() const noexcept {
         return config_;
     }
     bool uses_grouped_qkv() const noexcept {
@@ -153,7 +153,8 @@ private:
         int position_offset,
         bool use_cache);
 
-    Qwen35Config config_;
+    Config config_;
+    MlxYarnScaling yarn_;
     MlxRmsNorm attention_norm_;
     MlxLinear query_;
     MlxLinear key_;

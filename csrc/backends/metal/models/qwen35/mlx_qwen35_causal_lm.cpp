@@ -108,7 +108,7 @@ array validate_positions(
 std::optional<MlxQwen35MtpModule>
 MlxQwen35MtpModule::load_if_present(
     const MfqContainer& model,
-    const Qwen35Config& config,
+    const Config& config,
     const Qwen35TensorNames&) {
     const bool complete = model.contains("predictor.fusion.weight");
     const bool has_any = complete ||
@@ -135,7 +135,7 @@ MlxQwen35MtpModule::load_if_present(
     if (model.contains("predictor.output.weight"))
         throw std::runtime_error("Qwen3.5 dedicated MTP output heads are not supported");
 
-    Qwen35Config mtp_config = config;
+    Config mtp_config = config;
     const auto mtp_names = Qwen35TensorNames::predictor();
     mtp_config.num_hidden_layers = config.mtp_num_hidden_layers;
     mtp_config.layer_types.assign(
@@ -162,12 +162,12 @@ MlxQwen35MtpModule::load_if_present(
             model,
             "predictor.hidden_norm.weight",
             config.rms_norm_eps,
-            config.norm_weight_offset),
+            config.legacy_tensor_layout.norm_weight_offset),
         load_qwen35_rms_norm(
             model,
             "predictor.embedding_norm.weight",
             config.rms_norm_eps,
-            config.norm_weight_offset),
+            config.legacy_tensor_layout.norm_weight_offset),
         Qwen35Linear::load(
             model,
             "predictor.fusion.weight"),
@@ -176,11 +176,11 @@ MlxQwen35MtpModule::load_if_present(
             model,
             "predictor.output_norm.weight",
             config.rms_norm_eps,
-            config.norm_weight_offset));
+            config.legacy_tensor_layout.norm_weight_offset));
 }
 
 MlxQwen35MtpModule::MlxQwen35MtpModule(
-    Qwen35Config config,
+    Config config,
     MlxRmsNorm hidden_norm,
     MlxRmsNorm embedding_norm,
     Qwen35Linear fusion,
@@ -339,12 +339,7 @@ MlxQwen35CausalLm MlxQwen35CausalLm::load(
         throw std::runtime_error(
             "model graph does not describe a Qwen3.5 causal runtime");
     }
-    auto config = adapt_qwen35_config_for_storage(
-        Qwen35Config::from_mfq(model),
-        model.legacy_tensor_layout().qwen_gdn_gguf_layout);
-    if (requested_context == 0) requested_context = static_cast<int>(config.max_position_embeddings);
-    config.yarn = qwen_yarn_scaling(config.yarn, config.max_position_embeddings, requested_context, config.yarn_max_factor);
-    config.max_position_embeddings = requested_context;
+    auto config = load_qwen35_config(model).context(requested_context);
     auto runtime = load(model, config, Qwen35TensorNames::canonical());
     const bool predictor_declared = graph.has_component("predictor");
     if (predictor_declared != runtime.mtp_.has_value()) {
@@ -355,14 +350,14 @@ MlxQwen35CausalLm MlxQwen35CausalLm::load(
     }
     if (const auto* vision = graph.component("vision")) {
         if (vision->implementation != "grid_vit" ||
-            !config.vision || !config.image_token_id ||
+            !config.grid_vision || !config.image_token_id ||
             !config.video_token_id) {
             throw std::runtime_error(
                 "model graph Vision component is incompatible with Qwen3.5");
         }
         runtime.vision_.emplace(MlxGridVisionPromptComponent::load(
             model,
-            *config.vision,
+            *config.grid_vision,
             *config.image_token_id,
             *config.video_token_id,
             vision->input_contract,
@@ -373,7 +368,7 @@ MlxQwen35CausalLm MlxQwen35CausalLm::load(
 
 MlxQwen35CausalLm MlxQwen35CausalLm::load(
     const MfqContainer& model,
-    const Qwen35Config& config,
+    const Config& config,
     const Qwen35TensorNames& names) {
     const auto& runtime_config = config;
     validate_qwen35_model_bindings(
@@ -431,14 +426,14 @@ MlxQwen35CausalLm MlxQwen35CausalLm::load(
             model,
             names.output_norm,
             runtime_config.rms_norm_eps,
-            runtime_config.norm_weight_offset),
+            runtime_config.legacy_tensor_layout.norm_weight_offset),
         std::move(output),
         mlx::core::float16,
         std::move(mtp));
 }
 
 MlxQwen35CausalLm::MlxQwen35CausalLm(
-    Qwen35Config config,
+    Config config,
     Qwen35Embedding embedding,
     std::vector<MlxQwen35Layer> layers,
     MlxRmsNorm output_norm,

@@ -304,7 +304,7 @@ MlxNemotronHRadioPromptComponent MlxNemotronHRadioPromptComponent::load(
     const NemotronHRadioConfig& config,
     std::string input_contract,
     std::string position_policy) {
-    if (input_contract != mfq::kMfqRadioCpeInputContract) {
+    if (input_contract != tyloi::kRadioCpeInputContract) {
         throw std::invalid_argument(
             "unsupported RADIO vision input contract: " + input_contract);
     }

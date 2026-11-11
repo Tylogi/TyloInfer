@@ -14,8 +14,8 @@ bool dense_dtype_supported(const std::string& dtype) {
     return dtype == "BF16" || dtype == "F16" || dtype == "F32";
 }
 
-const mfq::MfqGraphComponent& require_component(
-    const mfq::MfqModelGraph& graph,
+const tyloi::ModelGraphComponent& require_component(
+    const tyloi::ModelGraph& graph,
     const char* kind) {
     const auto* component = graph.component(kind);
     if (component == nullptr) {
@@ -49,7 +49,7 @@ NemotronHComponents resolve_nemotron_h_components(const MfqContainer& model) {
         // tower takes normalized row-major patches and has no position
         // policy, so a mismatched declaration cannot be fed.
         if (vision.implementation != "radio" ||
-            vision.input_contract != mfq::kMfqRadioCpeInputContract) {
+            vision.input_contract != tyloi::kRadioCpeInputContract) {
             throw std::runtime_error(
                 "Nemotron-H Metal vision requires the radio/radio_cpe.v1 vision component");
         }

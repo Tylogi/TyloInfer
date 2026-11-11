@@ -1,9 +1,8 @@
 #pragma once
 
-#include "engine/models/common/hf_source.h"
-#include "mfq_legacy_tensor_names.h"
-#include "mfq_format_compat.h"
-#include "engine/models/common/model_graph.h"
+#include "engine/models/source/hf_source.h"
+#include "engine/models/source/legacy_names.h"
+#include "engine/models/source/model_graph.h"
 
 #include <cstdint>
 #include <filesystem>
@@ -128,18 +127,18 @@ public:
     // New canonical artifacts describe their executable graph explicitly.
     // A missing asset identifies a pre-schema artifact and is handled only by
     // the dedicated compatibility adapter at the application boundary.
-    std::optional<mfq::MfqModelGraph> model_graph() const;
+    std::optional<tyloi::ModelGraph> model_graph() const;
 
     // Compatibility adapters may expose a pre-schema record under its
     // canonical name exactly once at the container boundary. Runtime modules
     // never probe aliases or source-framework spellings themselves.
     void install_legacy_aliases(
         std::unordered_map<std::string, std::string> canonical_to_stored,
-        mfq::MfqLegacyTensorLayout layout = {});
+        tyloi::TensorLayout layout = {});
     bool has_legacy_aliases() const noexcept {
         return !legacy_aliases_.empty();
     }
-    const mfq::MfqLegacyTensorLayout& legacy_tensor_layout() const noexcept {
+    const tyloi::TensorLayout& legacy_tensor_layout() const noexcept {
         return legacy_tensor_layout_;
     }
 
@@ -154,10 +153,10 @@ private:
     MfqHeader header_;
     std::vector<std::filesystem::path> source_paths_;
     RecordMap records_;
-    std::shared_ptr<mfq::models::HfSource> hf_source_;
-    std::shared_ptr<const mfq::ModelSource> gguf_source_;
+    std::shared_ptr<tyloi::models::HfSource> hf_source_;
+    std::shared_ptr<const tyloi::ModelSource> gguf_source_;
     std::unordered_map<std::string, std::string> legacy_aliases_;
-    mfq::MfqLegacyTensorLayout legacy_tensor_layout_;
+    tyloi::TensorLayout legacy_tensor_layout_;
     std::shared_ptr<RandomAccessFiles> random_access_files_;
     mutable std::shared_ptr<LoadProgress> load_progress_;
 };

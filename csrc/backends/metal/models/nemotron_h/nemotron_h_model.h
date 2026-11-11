@@ -1,7 +1,7 @@
 #pragma once
 
 #include "mfq_container.h"
-#include "mfq_model_graph.h"
+#include "engine/models/source/model_graph.h"
 #include "mlx_tensor.h"
 #include "mlx_transformer.h"
 #include "models/nemotron_h/config.h"

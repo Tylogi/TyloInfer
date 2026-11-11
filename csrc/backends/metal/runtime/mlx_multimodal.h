@@ -1,6 +1,6 @@
 #pragma once
 
-#include "grid_vision.h"
+#include "engine/models/common/vision/grid_vision.h"
 
 #include <array>
 #include <cstdint>
@@ -30,7 +30,7 @@ struct MlxPreparedPrompt {
     }
 };
 
-using MlxGridShape = ::mfq::GridShape;
+using MlxGridShape = ::tyloi::GridShape;
 
 // Architecture-neutral output of a patch-grid media processor. Pixel
 // normalization and patchification happen outside the runtime; model adapters

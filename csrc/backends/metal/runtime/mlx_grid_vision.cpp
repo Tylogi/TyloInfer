@@ -1,6 +1,6 @@
 #include "mlx_grid_vision.h"
 
-#include "mfq_model_graph.h"
+#include "engine/models/source/model_graph.h"
 #include "mlx_tensor.h"
 #include "mlx_transformer.h"
 
@@ -17,6 +17,8 @@ namespace {
 
 using mlx::core::array;
 using mlx::core::Shape;
+using tyloi::GridVisionTensorRole;
+using tyloi::grid_vision_canonical_name;
 
 int checked_int(std::int64_t value, const char *name) {
   if (value <= 0 || value > std::numeric_limits<int>::max()) {
@@ -495,11 +497,11 @@ MlxGridVisionPromptComponent MlxGridVisionPromptComponent::load(
     const MfqContainer &model, const GridVisionConfig &config,
     std::int64_t image_token_id, std::int64_t video_token_id,
     std::string input_contract, std::string position_policy) {
-  if (input_contract != mfq::kMfqGridVisionInputContract) {
+  if (input_contract != tyloi::kGridVisionInputContract) {
     throw std::invalid_argument(
         "unsupported grid-Vision input contract: " + input_contract);
   }
-  if (position_policy != mfq::kMfqGridMropePositionPolicy) {
+  if (position_policy != tyloi::kGridMropePositionPolicy) {
     throw std::invalid_argument(
         "unsupported grid-Vision position policy: " + position_policy);
   }

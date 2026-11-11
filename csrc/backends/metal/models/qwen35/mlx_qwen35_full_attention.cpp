@@ -41,7 +41,7 @@ int checked_int(std::int64_t value, const char* name) {
 std::optional<MlxRmsNorm> load_optional_norm(
     const MfqContainer& model,
     const std::string& name,
-    const Qwen35Config& config) {
+    const Config& config) {
     if (!model.contains(name)) {
         return std::nullopt;
     }
@@ -49,7 +49,7 @@ std::optional<MlxRmsNorm> load_optional_norm(
         model,
         name,
         config.rms_norm_eps,
-        config.norm_weight_offset);
+        config.legacy_tensor_layout.norm_weight_offset);
 }
 
 void validate_position_shape(
@@ -170,7 +170,7 @@ array MlxQwen35DenseSwiGlu::forward_normalized(const array& input, const MlxRmsN
 MlxQwen35FullAttentionBlock
 MlxQwen35FullAttentionBlock::load(
     const MfqContainer& model,
-    const Qwen35Config& config,
+    const Config& config,
     const Qwen35TensorNames& names,
     std::size_t layer_index) {
     const int layer_count =
@@ -191,7 +191,7 @@ MlxQwen35FullAttentionBlock::load(
             model,
             resolved.attention_norm,
             config.rms_norm_eps,
-            config.norm_weight_offset),
+            config.legacy_tensor_layout.norm_weight_offset),
         MlxLinear::load(model, resolved.attention_query),
         MlxLinear::load(model, resolved.attention_key),
         MlxLinear::load(model, resolved.attention_value),
@@ -208,12 +208,12 @@ MlxQwen35FullAttentionBlock::load(
             model,
             resolved.ffn_norm,
             config.rms_norm_eps,
-            config.norm_weight_offset),
+            config.legacy_tensor_layout.norm_weight_offset),
         MlxQwen35DenseSwiGlu::load(model, resolved));
 }
 
 MlxQwen35FullAttentionBlock::MlxQwen35FullAttentionBlock(
-    Qwen35Config config,
+    Config config,
     MlxRmsNorm attention_norm,
     MlxLinear query,
     MlxLinear key,
@@ -224,6 +224,10 @@ MlxQwen35FullAttentionBlock::MlxQwen35FullAttentionBlock(
     MlxRmsNorm ffn_norm,
     MlxQwen35DenseSwiGlu ffn)
     : config_(std::move(config)),
+      yarn_(qwen_yarn_scaling(
+          MlxYarnScaling{false, 1.0, config_.yarn.beta_fast, config_.yarn.beta_slow},
+          config_.yarn.original_context > 0 ? config_.yarn.original_context : config_.max_position_embeddings,
+          config_.max_position_embeddings, config_.yarn_max_factor)),
       attention_norm_(std::move(attention_norm)),
       query_(std::move(query)),
       key_(std::move(key)),
@@ -277,13 +281,13 @@ void MlxQwen35FullAttentionBlock::validate_components() const {
         throw std::runtime_error(
             "invalid Qwen3.5 full-attention configuration");
     }
-    if (!config_.rope_sections.empty()) {
-        if (config_.rope_sections.size() != 3) {
+    if (!config_.mrope_sections.empty()) {
+        if (config_.mrope_sections.size() != 3) {
             throw std::runtime_error(
                 "Qwen3.5 MRoPE sections must have three entries");
         }
         std::int64_t section_sum = 0;
-        for (const auto section : config_.rope_sections) {
+        for (const auto section : config_.mrope_sections) {
             if (section < 0) {
                 throw std::runtime_error(
                     "Qwen3.5 MRoPE sections cannot be negative");
@@ -592,26 +596,26 @@ array MlxQwen35FullAttentionBlock::forward_impl(
             *positions,
             static_cast<int>(config_.rotary_dim),
             static_cast<float>(config_.rope_base),
-            config_.rope_sections,
-            config_.mrope_interleaved, config_.yarn);
+            config_.mrope_sections,
+            config_.mrope_interleaved, yarn_);
         key = apply_rope(
             key,
             *positions,
             static_cast<int>(config_.rotary_dim),
             static_cast<float>(config_.rope_base),
-            config_.rope_sections,
-            config_.mrope_interleaved, config_.yarn);
+            config_.mrope_sections,
+            config_.mrope_interleaved, yarn_);
     } else {
         query = apply_rope(
             query,
             static_cast<int>(config_.rotary_dim),
             static_cast<float>(config_.rope_base),
-            position_offset, config_.yarn);
+            position_offset, yarn_);
         key = apply_rope(
             key,
             static_cast<int>(config_.rotary_dim),
             static_cast<float>(config_.rope_base),
-            position_offset, config_.yarn);
+            position_offset, yarn_);
     }
 
     array key_cache = key;

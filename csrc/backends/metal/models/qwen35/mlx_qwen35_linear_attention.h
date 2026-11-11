@@ -35,12 +35,12 @@ class MlxQwen35LinearAttentionBlock {
 public:
     static MlxQwen35LinearAttentionBlock load(
         const MfqContainer& model,
-        const Qwen35Config& config,
+        const Config& config,
         const Qwen35TensorNames& names,
         std::size_t layer_index);
 
     MlxQwen35LinearAttentionBlock(
-        Qwen35Config config,
+        Config config,
         bool gguf_layout,
         MlxRmsNorm attention_norm,
         std::optional<MlxLinear> combined_qkv,
@@ -131,7 +131,7 @@ public:
         const noexcept {
         return recurrent_state_;
     }
-    const Qwen35Config& config() const noexcept {
+    const Config& config() const noexcept {
         return config_;
     }
 
@@ -139,7 +139,7 @@ private:
     void validate_components() const;
     void report_cache_resources() noexcept;
 
-    Qwen35Config config_;
+    Config config_;
     bool gguf_layout_ = false;
     bool split_input_ = false;
     MlxRmsNorm attention_norm_;

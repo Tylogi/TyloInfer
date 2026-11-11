@@ -7,7 +7,7 @@
 #include "mlx_nemotron_h_causal_lm.h"
 #include "mlx_qwen35_causal_lm.h"
 
-#include "engine/models/common/model_graph.h"
+#include "engine/models/source/model_graph.h"
 #include "engine/requests/media.h"
 #include "mlx_generation_job.h"
 
@@ -43,37 +43,37 @@ std::vector<MlxDeepseekV41ImageInput> prepare_deepseek_v41_images(
     const DeepseekV41Config& config);
 
 MlxEngineComponents make_mlx_engine_components(
-    const MfqModelGraph* graph,
+    const tyloi::ModelGraph* graph,
     std::shared_ptr<std::mutex> runtime_mutex,
     std::shared_ptr<std::optional<MlxQwen35CausalLm>> runtime,
     mlx::core::Stream runtime_stream);
 
 MlxEngineComponents make_mlx_engine_components(
-    const MfqModelGraph* graph,
+    const tyloi::ModelGraph* graph,
     std::shared_ptr<std::mutex> runtime_mutex,
     std::shared_ptr<std::optional<MlxMiniCPMO45Runtime>> runtime,
     mlx::core::Stream runtime_stream);
 
 MlxEngineComponents make_mlx_engine_components(
-    const MfqModelGraph* graph,
+    const tyloi::ModelGraph* graph,
     std::shared_ptr<std::mutex> runtime_mutex,
     std::shared_ptr<std::optional<MlxDeepseekV4CausalLm>> runtime,
     mlx::core::Stream runtime_stream);
 
 MlxEngineComponents make_mlx_engine_components(
-    const MfqModelGraph* graph,
+    const tyloi::ModelGraph* graph,
     std::shared_ptr<std::mutex> runtime_mutex,
     std::shared_ptr<std::optional<MlxDeepseekV41CausalLm>> runtime,
     mlx::core::Stream runtime_stream);
 
 MlxEngineComponents make_mlx_engine_components(
-    const MfqModelGraph* graph,
+    const tyloi::ModelGraph* graph,
     std::shared_ptr<std::mutex> runtime_mutex,
     std::shared_ptr<std::optional<MlxQwen4CausalLm>> runtime,
     mlx::core::Stream runtime_stream);
 
 MlxEngineComponents make_mlx_engine_components(
-    const MfqModelGraph* graph,
+    const tyloi::ModelGraph* graph,
     std::shared_ptr<std::mutex> runtime_mutex,
     std::shared_ptr<std::optional<MlxNemotronHCausalLm>> runtime,
     mlx::core::Stream runtime_stream);

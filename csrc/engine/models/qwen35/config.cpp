@@ -3,6 +3,8 @@
 #include "nlohmann/json.hpp"
 
 #include <algorithm>
+#include <cmath>
+#include <limits>
 #include <numeric>
 #include <stdexcept>
 #include <string>
@@ -25,6 +27,19 @@ Config Config::from_json(
 
     Config config;
     static_cast<ModelConfig&>(config) = ModelConfig::from_json(payload);
+    config.text_model_type = text.value("model_type", config.model_type);
+    config.legacy_tensor_layout.norm_weight_offset = text.value("norm_weight_offset", 1.0);
+    config.legacy_tensor_layout.linear_attention_a_is_log = text.value("linear_a_is_log", true);
+    for (const auto& [name, target] : {
+            std::pair{"vision_start_token_id", &config.vision_start_token_id},
+            std::pair{"vision_end_token_id", &config.vision_end_token_id}}) {
+        if (document.contains(name) && !document.at(name).is_null()) {
+            const auto value = document.at(name).get<std::int64_t>();
+            if (value < 0 || value >= config.vocab_size)
+                throw std::runtime_error(std::string("invalid Qwen ") + name);
+            *target = value;
+        }
+    }
     config.num_experts = text.value(
         "num_experts",
         text.value("n_routed_experts", std::int64_t{0}));
@@ -96,6 +111,27 @@ Config Config::from_json(
             "Qwen rope_parameters.full_attention must be an object");
     }
 
+    const auto& yarn_rope = !full_rope.empty() ? full_rope :
+        (!rope_parameters.empty() ? rope_parameters :
+         (text.contains("rope_scaling") ? text.at("rope_scaling") : empty));
+    if (!yarn_rope.is_object()) throw std::runtime_error("Qwen rope scaling must be an object");
+    const auto rope_type = yarn_rope.value("rope_type", yarn_rope.value("type", std::string("default")));
+    config.yarn_max_factor = rope_type == "default" || rope_type == "yarn"
+        ? yarn_rope.value("factor", 4.0) : 1.0;
+    config.yarn.beta_fast = yarn_rope.value("beta_fast", 32.0);
+    config.yarn.beta_slow = yarn_rope.value("beta_slow", 1.0);
+    if (rope_type == "yarn")
+        config.yarn.original_context = yarn_rope.value("original_max_position_embeddings", config.max_position_embeddings);
+
+    const auto* rope = full_rope.contains("mrope_section") ? &full_rope : &rope_parameters;
+    if (rope->contains("mrope_section")) {
+        config.mrope_sections = rope->at("mrope_section").get<std::vector<std::int64_t>>();
+        if (config.mrope_sections.size() != 3 ||
+            std::any_of(config.mrope_sections.begin(), config.mrope_sections.end(), [](std::int64_t value) { return value < 0; }) ||
+            std::accumulate(config.mrope_sections.begin(), config.mrope_sections.end(), std::int64_t{0}) != config.rotary_dim / 2)
+            throw std::runtime_error("Qwen grid-MRoPE sections must be three nonnegative values summing to rotary_dim / 2");
+    }
+    config.mrope_interleaved = rope_parameters.value("mrope_interleaved", false);
     if (graph.component("vision") == nullptr) return config;
     if (!document.contains("vision_config") ||
             !document.at("vision_config").is_object()) {
@@ -159,29 +195,25 @@ Config Config::from_json(
         throw std::runtime_error(
             "Qwen grid-ViT placeholder token IDs must differ");
     }
-    const auto* rope = full_rope.contains("mrope_section")
-        ? &full_rope : &rope_parameters;
-    if (!rope->contains("mrope_section") ||
-            !rope->at("mrope_section").is_array()) {
-        throw std::runtime_error(
-            "Qwen grid-MRoPE requires rope mrope_section");
-    }
-    config.mrope_sections =
-        rope->at("mrope_section").get<std::vector<std::int64_t>>();
-    config.mrope_interleaved =
-        rope_parameters.value("mrope_interleaved", false);
-    if (config.mrope_sections.size() != 3 ||
-            std::any_of(
-                config.mrope_sections.begin(), config.mrope_sections.end(),
-                [](std::int64_t value) { return value < 0; }) ||
-            std::accumulate(
-                config.mrope_sections.begin(), config.mrope_sections.end(),
-                std::int64_t{0}) != config.rotary_dim / 2) {
-        throw std::runtime_error(
-            "Qwen grid-MRoPE sections must be three nonnegative values summing to rotary_dim / 2");
-    }
+    if (config.mrope_sections.empty())
+        throw std::runtime_error("Qwen grid-MRoPE requires rope mrope_section");
     config.grid_vision = parsed;
     return config;
+}
+
+Config Config::context(std::int64_t requested) const {
+    auto result = *this;
+    const auto native = yarn.original_context > 0 ? yarn.original_context : max_position_embeddings;
+    if (native <= 0 || !std::isfinite(yarn_max_factor) || yarn_max_factor < 1.0 ||
+        yarn_max_factor * native > std::numeric_limits<int>::max())
+        throw std::invalid_argument("invalid Qwen YaRN context limit");
+    if (requested == 0) requested = native;
+    if (requested <= 0 || requested > static_cast<std::int64_t>(std::floor(native * yarn_max_factor)))
+        throw std::invalid_argument("context exceeds the YaRN extension limit");
+    result.yarn.original_context = native;
+    result.yarn.factor = std::max(1.0, double(requested) / native);
+    result.max_position_embeddings = requested;
+    return result;
 }
 
 } // namespace tyloi::models::qwen35

@@ -17,6 +17,9 @@ namespace tyloi::models::qwen35 {
 
 struct Config : ModelConfig {
     TensorLayout legacy_tensor_layout;
+    std::string text_model_type;
+    tyloi::ops::YarnScaling yarn;
+    double yarn_max_factor = 4.0;
     bool attention_output_gate = false;
     std::int64_t num_experts = 0;
     std::int64_t num_experts_per_tok = 0;
@@ -37,6 +40,8 @@ struct Config : ModelConfig {
     std::optional<GridVisionConfig> grid_vision;
     std::optional<std::int64_t> image_token_id;
     std::optional<std::int64_t> video_token_id;
+    std::optional<std::int64_t> vision_start_token_id;
+    std::optional<std::int64_t> vision_end_token_id;
 
     enum class AttentionKind { full, linear };
     static AttentionKind attention_kind(std::string_view type) {
@@ -59,12 +64,21 @@ struct Config : ModelConfig {
     }
 
     std::int64_t linear_k_size() const noexcept {
-        return linear_num_key_heads * linear_key_head_dim;
+        return linear_key_heads() * linear_key_head_dim;
     }
     std::int64_t linear_v_size() const noexcept {
-        return linear_num_value_heads * linear_value_head_dim;
+        return linear_value_heads() * linear_value_head_dim;
     }
 
+    std::int64_t attention_size() const noexcept { return num_attention_heads * head_dim; }
+    std::int64_t kv_size() const noexcept { return num_key_value_heads * head_dim; }
+    std::int64_t query_projection_size() const noexcept { return attention_size() * (attention_output_gate ? 2 : 1); }
+    std::int64_t linear_key_heads() const noexcept { return linear_num_key_heads > 0 ? linear_num_key_heads : num_key_value_heads; }
+    std::int64_t linear_value_heads() const noexcept { return linear_num_value_heads > 0 ? linear_num_value_heads : num_attention_heads; }
+    std::int64_t linear_qkv_size() const noexcept { return 2 * linear_k_size() + linear_v_size(); }
+    bool has_vision() const noexcept { return grid_vision.has_value(); }
+
+    Config context(std::int64_t requested) const;
     static Config from_json(std::string_view payload, const ModelGraph &graph);
 
 };

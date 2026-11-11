@@ -799,7 +799,7 @@ std::shared_ptr<mfq::cache::PagedPrefixCache> make_metal_paged_cache(
             const auto native_context = [&] {
                 if constexpr (std::is_same_v<Runtime, mfq::metal::MlxQwen4CausalLm>)
                     return mfq::metal::Qwen4Config::from_mfq(container).max_position_embeddings;
-                else return mfq::metal::Qwen35Config::from_mfq(container).max_position_embeddings;
+                else return mfq::metal::load_qwen35_config(container).max_position_embeddings;
             }();
             if (context_size > native_context) config.compatibility_key += "\nqwen-yarn-v1";
         }
@@ -2974,7 +2974,7 @@ int run_loaded_runtime(
             vision != nullptr && runtime_components.multimodal_generate) {
             capabilities.image_input = true;
             capabilities.video_input =
-                vision->input_contract == mfq::kMfqGridVisionInputContract ||
+                vision->input_contract == tyloi::kGridVisionInputContract ||
                 vision->input_contract == "minicpmo45.v1";
         }
         capabilities.audio_input =
@@ -3344,7 +3344,7 @@ int run_native_runtime(
     }
 
     const auto config =
-        mfq::metal::Qwen35Config::from_mfq(container);
+        mfq::metal::load_qwen35_config(container);
     const auto extended_context = mfq::metal::qwen_yarn_capacity(config.max_position_embeddings, config.yarn_max_factor);
     const auto context = static_cast<int>(std::min(arguments.context_size,
         arguments.yarn_context_extension ? extended_context : config.max_position_embeddings));

@@ -96,7 +96,7 @@ MlxGridMropePositions build_grid_mrope_positions(
     int spatial_merge_size,
     const std::vector<MlxGridShape>& image_grids,
     const std::vector<MlxGridShape>& video_grids) {
-    auto positions = ::mfq::build_grid_mrope_positions(
+    auto positions = ::tyloi::build_grid_mrope_positions(
         token_ids, image_token_id, video_token_id, spatial_merge_size,
         image_grids, video_grids);
     return {
