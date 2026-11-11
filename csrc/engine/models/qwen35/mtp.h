@@ -19,7 +19,7 @@ void restore_session(State&, Mtp*, const TextSessionState&, const std::function<
 
 class Mtp final : public tyloi::models::Mtp {
 public:
-    Mtp(Predictor model, ::tyloi::Tensor embedding,
+    Mtp(tyloi::models::qwen35::Predictor model, ::tyloi::Tensor embedding,
         tyloi::ops::RopeTable rope,
         std::unique_ptr<Executor> executor, Collectives& copies,
         int device, const int64_t& kv_capacity, tyloi::ops::Trace* const& trace, const int& trace_scope,
@@ -48,7 +48,7 @@ private:
         MtpState& state, ::tyloi::DenseTensor hidden, ::tyloi::DenseTensor next_ids,
         ::tyloi::DenseTensor positions) const;
 
-    Predictor model_;
+    tyloi::models::qwen35::Predictor model_;
     ::tyloi::Tensor embedding_;
     tyloi::ops::RopeTable rope_;
     std::unique_ptr<Executor> executor_;

@@ -1,32 +1,29 @@
 #pragma once
 
 #include "engine/models/qwen35/config.h"
-#include "engine/backends/cuda/ops/ffn/ffn.h"
 #include "engine/models/common/attention.h"
+#include "engine/models/common/mlp.h"
 
+#include <span>
 #include <vector>
 
-namespace tyloi::cuda::qwen35 {
+namespace tyloi::models::qwen35 {
 
 struct Predictor {
     struct Layer {
         ::tyloi::models::FullAttention attention;
-#ifdef TYLOINFER_NATIVE_CUDA
         ::tyloi::Tensor ffn_norm;
-#else
-        ::tyloi::DenseTensor ffn_norm;
-#endif
-        Ffn ffn;
+        Mlp ffn;
     };
 
     tyloi::models::qwen35::Config config;
     ::tyloi::Tensor fusion;
-#ifdef TYLOINFER_NATIVE_CUDA
     ::tyloi::Tensor hidden_norm, embedding_norm, output_norm;
-#else
-    ::tyloi::DenseTensor hidden_norm, embedding_norm, output_norm;
-#endif
     std::vector<Layer> layers;
+
+    Tensor forward(const Tensor& hidden, const Tensor& embeddings, const AttentionStep& step,
+                   std::span<const state::KvView> kv, const ops::RopeTable& rope,
+                   ops::Trace* trace = nullptr, int trace_layer = -1) const;
 };
 
-} // namespace tyloi::cuda::qwen35
+} // namespace tyloi::models::qwen35

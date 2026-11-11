@@ -7,6 +7,7 @@
 #include "engine/models/qwen35/weights.h"
 
 #include "engine/models/common/load.h"
+#include "engine/models/common/capabilities.h"
 #include "engine/models/source/model_graph.h"
 #include "engine/weights/loader.h"
 #include "engine/backends/cuda/ops/projection/projection.h"
@@ -191,9 +192,9 @@ Model read(std::shared_ptr<const tyloi::ModelSource> source,
     model.source = std::move(source);
     const auto& source_ref = *model.source;
     model.graph = tyloi::models::graph(source_ref);
-    model.plan = cuda_model_plan(model.graph);
+    const auto plan = cuda_model_plan(model.graph);
     if (model.graph.component("vision") != nullptr &&
-        model.plan.vision != CudaVisionAdapter::grid_vit)
+        plan.vision != CudaVisionAdapter::grid_vit)
         throw std::runtime_error("Qwen CUDA vision requires grid_vit/grid_vision.v1/grid_mrope");
     if (model.graph.backbone != "qwen3_5" && model.graph.backbone != "generic_qwen")
         throw std::runtime_error("Qwen3.5 loading requires a Qwen-compatible model graph");
@@ -235,7 +236,7 @@ void load(Model& model, const ::tyloi::weights::Loader& weights,
                   << " gpu=" << placed_cpu_layers << '-' << model.config.num_hidden_layers - 1
                   << " cpu_threads=" << mfq_get_num_threads() << std::endl;
     }
-    if (model.plan.vision == CudaVisionAdapter::grid_vit && placed_cpu_layers > 0)
+    if (cuda_model_plan(model.graph).vision == CudaVisionAdapter::grid_vit && placed_cpu_layers > 0)
         throw std::runtime_error("CUDA grid-Vision currently requires GPU-resident text layers");
 
     cpu_layers = placed_cpu_layers;
@@ -296,7 +297,7 @@ void load(Model& model, const ::tyloi::weights::Loader& weights,
     }
 }
 
-std::optional<Predictor> load_predictor(TransformerWeightLoader& loader,
+std::optional<tyloi::models::qwen35::Predictor> load_predictor(TransformerWeightLoader& loader,
                                          const Config& config,
                                          tyloi::state::KvQuantization quantization) {
     const bool fusion_present = loader.has("predictor.fusion.weight");
@@ -310,7 +311,7 @@ std::optional<Predictor> load_predictor(TransformerWeightLoader& loader,
     }
     TYLOINFER_RUNTIME_CHECK(config.mtp_num_hidden_layers > 0 && !config.mtp_use_dedicated_embeddings,
         "Qwen MTP requires declared predictor layers and shared embeddings");
-    Predictor model;
+    tyloi::models::qwen35::Predictor model;
     model.config = config;
     model.hidden_norm = loader.weights.tensor("predictor.hidden_norm.weight");
     model.embedding_norm = loader.weights.tensor("predictor.embedding_norm.weight");
@@ -325,12 +326,16 @@ std::optional<Predictor> load_predictor(TransformerWeightLoader& loader,
     model.layers.reserve(config.mtp_num_hidden_layers);
     for (int index = 0; index < config.mtp_num_hidden_layers; ++index) {
         const auto prefix = "predictor.block." + std::to_string(index) + ".";
-        Predictor::Layer layer;
+        tyloi::models::qwen35::Predictor::Layer layer;
         layer.attention.kv_quantization = quantization;
         tyloi::models::load_attention_mixer(layer.attention, loader, config, index, prefix,
             config.legacy_tensor_layout.norm_weight_offset, config.attention_output_gate);
         layer.ffn_norm = loader.weights.tensor(prefix + "mlp.norm.weight");
-        layer.ffn = tyloi::models::qwen35::load_ffn<Ffn>(loader, config, index, "predictor");
+        const auto mlp = prefix + "mlp.";
+        if (loader.has(mlp + "experts.gate_up.weight") || loader.has(mlp + "experts.gate.weight") ||
+            loader.has(mlp + "experts.up.weight") || loader.has(mlp + "experts.down.weight"))
+            throw std::runtime_error("Qwen MTP requires dense predictor projections");
+        layer.ffn = tyloi::models::load_dense_ffn<tyloi::models::Mlp>(loader, config, mlp);
         model.layers.push_back(std::move(layer));
     }
     return model;

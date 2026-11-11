@@ -3,6 +3,7 @@
 #include "engine/ops.h"
 
 #include "engine/engine.h"
+#include "engine/models/common/capabilities.h"
 #include "engine/models/common/vision/grid_encoder.h"
 #include "engine/state/media.h"
 #include "engine/models/qwen35/model.h"

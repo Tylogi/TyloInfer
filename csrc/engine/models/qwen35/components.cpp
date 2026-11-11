@@ -85,7 +85,7 @@ Components Components::load(
     bool optional,
     bool cpu_offload,
     bool preallocate) {
-    Components components{model.graph, model.plan};
+    Components components{model.graph, cuda_model_plan(model.graph)};
     if (!optional) return components;
     const bool mtp_allowed =
         !placement.enabled() && cpu_layers == 0 && !cpu_offload &&

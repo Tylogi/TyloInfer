@@ -4,7 +4,6 @@
 #include "engine/models/metadata.h"
 #include "engine/backends/cuda/ops/ffn/ffn.h"
 #include "engine/models/source/model_graph.h"
-#include "engine/models/common/capabilities.h"
 #include "engine/models/common/attention.h"
 #include "engine/models/common/linear.h"
 #include "engine/models/source.h"
@@ -41,7 +40,6 @@ struct Layer {
 struct Model {
     std::shared_ptr<const tyloi::ModelSource> source;
     tyloi::ModelGraph graph;
-    CudaModelPlan plan;
     Config config;
     tyloi::models::CausalLmMetadata metadata;
     tyloi::ops::RopeTable rope, cpu_rope;
