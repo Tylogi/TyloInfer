@@ -1,5 +1,6 @@
 #pragma once
 
+#include "engine/models/source/model_config.h"
 #include "mfq_container.h"
 #include "mlx_grid_vision.h"
 #include "mlx_tensor.h"
@@ -19,28 +20,14 @@ namespace mfq::metal {
 inline constexpr std::string_view kMfqModelConfigAsset =
     "__mfq_asset__/model_config.json";
 
-struct Qwen35Config {
-    std::string model_type;
+struct Qwen35Config : tyloi::models::ModelConfig {
     std::string text_model_type;
-    std::int64_t vocab_size = 0;
-    std::int64_t hidden_size = 0;
-    std::int64_t intermediate_size = 0;
-    std::int64_t num_hidden_layers = 0;
-    std::int64_t num_attention_heads = 0;
-    std::int64_t num_key_value_heads = 0;
-    std::int64_t max_position_embeddings = 0;
-    std::int64_t head_dim = 0;
-    double rope_base = 1'000'000.0;
     MlxYarnScaling yarn;
     double yarn_max_factor = 4.0;
-    std::int64_t rotary_dim = 0;
     std::vector<std::int64_t> rope_sections;
-    double rms_norm_eps = 1e-6;
     double norm_weight_offset = 1.0;
-    bool tie_word_embeddings = false;
     bool attention_output_gate = false;
     std::string output_gate_type;
-    std::vector<std::string> layer_types;
     std::int64_t full_attention_interval = 0;
     std::int64_t linear_conv_kernel_dim = 4;
     std::int64_t linear_key_head_dim = 128;

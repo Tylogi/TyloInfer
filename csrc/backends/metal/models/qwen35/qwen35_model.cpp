@@ -497,24 +497,31 @@ Qwen35Config Qwen35Config::from_json(std::string_view payload) {
         object_or_empty(rope_parameters, "full_attention", empty);
 
     Qwen35Config config;
-    config.model_type = optional_string(
-        root,
-        "model_type",
-        optional_string(text, "model_type"));
-    config.text_model_type =
-        optional_string(text, "model_type", config.model_type);
-    config.vocab_size = required_integer(text, "vocab_size");
-    config.hidden_size = required_integer(text, "hidden_size");
-    config.intermediate_size =
-        required_integer(text, "intermediate_size");
-    config.num_hidden_layers =
-        required_integer(text, "num_hidden_layers");
-    config.num_attention_heads =
-        required_integer(text, "num_attention_heads");
-    config.num_key_value_heads =
-        required_integer(text, "num_key_value_heads");
-    config.max_position_embeddings =
-        required_integer(text, "max_position_embeddings");
+    const auto model_type = optional_string(root, "model_type", optional_string(text, "model_type"));
+    config.text_model_type = optional_string(text, "model_type", model_type);
+    json geometry;
+    geometry["model_type"] = model_type;
+    for (const auto* name : {"vocab_size", "hidden_size", "intermediate_size",
+            "num_hidden_layers", "num_attention_heads", "num_key_value_heads",
+            "max_position_embeddings"}) {
+        geometry[name] = required_integer(text, name);
+    }
+    const auto hidden = geometry["hidden_size"].get<std::int64_t>();
+    const auto heads = geometry["num_attention_heads"].get<std::int64_t>();
+    const auto default_head_dim = heads > 0 && hidden % heads == 0 ? hidden / heads : 0;
+    geometry["head_dim"] = optional_integer(text, "head_dim", default_head_dim);
+    geometry["rope_theta"] = optional_number(full_rope, "rope_theta",
+        optional_number(rope_parameters, "rope_theta", optional_number(text, "rope_theta", 1'000'000.0)));
+    geometry["partial_rotary_factor"] = optional_number(full_rope, "partial_rotary_factor",
+        optional_number(rope_parameters, "partial_rotary_factor", optional_number(text, "partial_rotary_factor", 1.0)));
+    geometry["rms_norm_eps"] = optional_number(text, "rms_norm_eps", 1e-6);
+    geometry["tie_word_embeddings"] = optional_boolean(text, "tie_word_embeddings", false);
+    const auto layer_count = geometry["num_hidden_layers"].get<std::int64_t>();
+    if (layer_count <= 0 || layer_count > std::numeric_limits<std::int32_t>::max())
+        throw std::runtime_error("invalid Qwen3.5 config num_hidden_layers");
+    const auto layers = ::mfq::metal::layer_types(text, layer_count);
+    if (layers.empty()) throw std::runtime_error("Qwen3.5 layer_types length does not match num_hidden_layers");
+    geometry["layer_types"] = layers;
     auto yarn_rope = full_rope.empty() ? rope_parameters : full_rope;
     if (yarn_rope.empty() && text.contains("rope_scaling")) yarn_rope = text.at("rope_scaling");
     const auto rope_type = optional_string(yarn_rope, "rope_type", optional_string(yarn_rope, "type", "default"));
@@ -522,52 +529,23 @@ Qwen35Config Qwen35Config::from_json(std::string_view payload) {
         ? optional_number(yarn_rope, "factor", 4.0) : 1.0;
     config.yarn.beta_fast = optional_number(yarn_rope, "beta_fast", 32.0);
     config.yarn.beta_slow = optional_number(yarn_rope, "beta_slow", 1.0);
-    if (rope_type == "yarn") config.max_position_embeddings = optional_integer(yarn_rope,
-        "original_max_position_embeddings", config.max_position_embeddings);
+    if (rope_type == "yarn") geometry["max_position_embeddings"] = optional_integer(yarn_rope,
+        "original_max_position_embeddings", geometry["max_position_embeddings"].get<std::int64_t>());
+    static_cast<tyloi::models::ModelConfig&>(config) =
+        tyloi::models::ModelConfig::from_json(geometry.dump());
     (void)qwen_yarn_capacity(config.max_position_embeddings, config.yarn_max_factor);
-    const auto default_head_dim =
-        config.hidden_size % config.num_attention_heads == 0
-        ? config.hidden_size / config.num_attention_heads
-        : 0;
-    config.head_dim =
-        optional_integer(text, "head_dim", default_head_dim);
-
-    config.rope_base = optional_number(
-        full_rope,
-        "rope_theta",
-        optional_number(
-            rope_parameters,
-            "rope_theta",
-            optional_number(text, "rope_theta", 1'000'000.0)));
-    const auto partial_rotary_factor = optional_number(
-        full_rope,
-        "partial_rotary_factor",
-        optional_number(
-            rope_parameters,
-            "partial_rotary_factor",
-            optional_number(text, "partial_rotary_factor", 1.0)));
-    config.rotary_dim = static_cast<std::int64_t>(
-        std::llround(
-            partial_rotary_factor *
-            static_cast<double>(config.head_dim)));
     config.rope_sections =
         optional_integer_array(full_rope, "mrope_section");
     if (config.rope_sections.empty()) {
         config.rope_sections =
             optional_integer_array(rope_parameters, "mrope_section");
     }
-    config.rms_norm_eps =
-        optional_number(text, "rms_norm_eps", 1e-6);
     config.norm_weight_offset =
         optional_number(text, "norm_weight_offset", 1.0);
-    config.tie_word_embeddings =
-        optional_boolean(text, "tie_word_embeddings", false);
     config.attention_output_gate =
         optional_boolean(text, "attn_output_gate", false);
     config.output_gate_type =
         optional_string(text, "output_gate_type");
-    config.layer_types =
-        ::mfq::metal::layer_types(text, config.num_hidden_layers);
     config.full_attention_interval =
         optional_integer(text, "full_attention_interval", 0);
     config.linear_conv_kernel_dim =
