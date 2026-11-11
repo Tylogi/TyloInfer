@@ -382,13 +382,21 @@ struct Tts {
 
     ChunkResult generate_duplex_chunk(
             State& state, Executor& executor, const Executor::Mode& mode,
+#ifdef TYLOINFER_NATIVE_CUDA
+            ::tyloi::Tensor condition_embeddings_value,
+#else
             ::tyloi::DenseTensor condition_embeddings,
+#endif
             int64_t max_new_tokens,
             int64_t minimum_new_tokens,
             int64_t eos_token,
             double temperature,
             double repetition_penalty) const {
         MfqCudaGuard guard(device);
+#ifdef TYLOINFER_NATIVE_CUDA
+        auto condition_embeddings = condition_embeddings_value.defined()
+            ? condition_embeddings_value.dense() : ::tyloi::DenseTensor();
+#endif
         if (condition_embeddings.dim() != 3 ||
                 condition_embeddings.size(0) != 1 ||
                 condition_embeddings.size(2) != config.hidden_size ||

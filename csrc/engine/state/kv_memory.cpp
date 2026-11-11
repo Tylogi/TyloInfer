@@ -437,11 +437,13 @@ void KvMemoryManager::finalize(tyloi::weights::Cache& cache, std::size_t minimum
         if(lending_) {
             a->expert_regions.push_back(cache_->lend_kv(a->index,a->maximum,std::size_t(a->index_width)*2,false));
             a->expert_regions.push_back(cache_->lend_kv(a->pooled,(a->maximum+a->pool-1)/a->pool,std::size_t(a->index_width)*2,false,a->pool));
-            const auto& k=a->hot.exclusive()?a->hot.keys:a->keys;
-            const auto& v=a->hot.exclusive()?a->hot.values:a->values;
-            if(a->hot.exclusive() || (!a->host && !a->offload))for(int64_t h=0;h<a->heads;++h) {
-                a->expert_regions.push_back(cache_->lend_kv(k.narrow(1,h,1),k.size(2),std::size_t(a->key_width)*width_bytes(a->options),a->hot.exclusive()));
-                a->expert_regions.push_back(cache_->lend_kv(v.narrow(1,h,1),v.size(2),std::size_t(a->value_width)*width_bytes(a->options),a->hot.exclusive()));
+            if(a->hot.exclusive() || (!a->host && !a->offload)) {
+                const auto& k=a->hot.exclusive()?a->hot.keys:a->keys.dense();
+                const auto& v=a->hot.exclusive()?a->hot.values:a->values.dense();
+                for(int64_t h=0;h<a->heads;++h) {
+                    a->expert_regions.push_back(cache_->lend_kv(k.narrow(1,h,1),k.size(2),std::size_t(a->key_width)*width_bytes(a->options),a->hot.exclusive()));
+                    a->expert_regions.push_back(cache_->lend_kv(v.narrow(1,h,1),v.size(2),std::size_t(a->value_width)*width_bytes(a->options),a->hot.exclusive()));
+                }
             }
         }
     }

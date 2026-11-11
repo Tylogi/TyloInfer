@@ -1193,7 +1193,7 @@ class Qsa {
     }
     void activate_memory(State& request) {
         if(!managed_memory(request))return;
-        if(!request.index.storage().defined())request.index.replace_storage(request.memory->index);
+        if(!request.index.storage().defined())request.index.replace_storage(request.memory->index.dense());
         request.graph_index=request.index.storage();
         request.graph_pooled=request.memory->pooled;
         if(request.memory->offload) {
