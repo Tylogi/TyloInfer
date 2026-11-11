@@ -78,6 +78,7 @@ public:
     std::int64_t speculative_start = -1;
     std::int64_t speculative_confirmed = 0;
     bool speculative_suffix_forward = false;
+    bool speculative_suffix_journal = false;
     ::tyloi::Tensor positions;
     std::vector<std::unique_ptr<LayerState>> layers;
     std::unique_ptr<Qwen4DecodeGraph> graph_registry;

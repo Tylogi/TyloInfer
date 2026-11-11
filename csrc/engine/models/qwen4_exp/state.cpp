@@ -127,7 +127,9 @@ tyloi::models::SnapshotSize snapshot_size(const State& state,const tyloi::models
 std::vector<std::pair<tyloi::Device, std::size_t>> State::growth(
         const tyloi::models::Input& input, const tyloi::models::ForwardOptions& options) const {
     const auto [input_batch, tokens] = input.shape();
-    if (batch <= 0 || input_batch != batch || input.suffix || input.cache_positions ||
+    if (batch <= 0 || input_batch != batch || input.cache_positions ||
+        (input.suffix && (input.confirmed != 0 || batch != 1 || cache_pos <= 0 ||
+                          !model_.supports_suffix_speculation())) ||
         input.confirmed < 0 || (input.confirmed > 0 &&
             (input.confirmed >= tokens || batch != 1 || cache_pos <= 0 || !model_.supports_speculation())) ||
         tokens <= 0 || cache_pos < 0 || cache_pos > model_.max_position_embeddings() ||
@@ -149,6 +151,31 @@ std::vector<std::pair<tyloi::Device, std::size_t>> State::growth(
         entry->retained = checked(entry->retained, retained);
         entry->peak = std::max(entry->peak, checked(entry->retained, temporary));
     };
+    if (input.suffix) {
+        for (std::size_t i = 0; i < layers.size(); ++i) {
+            const auto& block = *model_.layers[i];
+            const auto& layer = *layers[i];
+            const auto device = block.cpu_offloaded ? tyloi::Device(tyloi::kCPU) : tyloi::Device(tyloi::kCUDA, block.cuda_device);
+            if (block.gdn) {
+                TYLOINFER_RUNTIME_CHECK(!layer.gdn.saved_conv.defined() && layer.gdn.conv.dense().defined() &&
+                    layer.gdn.recurrent.dense().defined(), "GDN suffix requires committed recurrent state");
+                add(device, layer.gdn.conv.dense().nbytes());
+                add(device, layer.gdn.recurrent.dense().nbytes());
+            }
+            if (block.ple) {
+                TYLOINFER_RUNTIME_CHECK(!layer.ple.saved && layer.ple.conv.defined(), "PLE suffix requires committed convolution state");
+#ifdef TYLOINFER_NATIVE_CUDA
+                add(device, layer.ple.conv.dense().nbytes());
+#else
+                add(device, layer.ple.conv.nbytes());
+#endif
+                const auto& context = block.ple->session_context(layer.ple);
+                if (context.tokens.size() > std::numeric_limits<std::size_t>::max() / sizeof(int64_t))
+                    throw std::overflow_error("PLE suffix context overflow");
+                add(tyloi::Device(tyloi::kCPU), context.tokens.size() * sizeof(int64_t));
+            }
+        }
+    }
     std::vector<int64_t> shape;
     if (positions) {
         const auto& dense = positions.dense();
@@ -182,6 +209,10 @@ std::vector<std::pair<tyloi::Device, std::size_t>> State::growth(
             throw std::invalid_argument("pending Qwen4 speculative state");
         const auto device = block.cpu_offloaded ? tyloi::Device(tyloi::kCPU) : tyloi::Device(tyloi::kCUDA, block.cuda_device);
         if (block.ple) {
+            if (input.suffix) {
+                const auto [retained, temporary] = block.ple->context_growth_bytes(state.ple, batch, tokens);
+                add(tyloi::Device(tyloi::kCPU), retained, temporary);
+            }
             const auto [retained, temporary] = block.ple->ordinary_growth_bytes(state.ple, batch, tokens);
             if (input.confirmed > 0) add(device, block.ple->checkpoint_growth_bytes(state.ple, batch, tokens, input.confirmed));
             add(device, retained, temporary);
@@ -244,9 +275,50 @@ std::vector<tyloi::Tensor*> State::graph_state() {
 }
 
 void State::begin_speculative_suffix(std::int64_t draft_tokens) {
-    tyloi::models::require_model(model_.supports_suffix_speculation() && draft_tokens > 0 &&
-                                     cache_pos + draft_tokens <= model_.max_position_embeddings(),
+    tyloi::models::require_model(model_.supports_suffix_speculation() && draft_tokens > 0 && batch == 1 &&
+                                     cache_pos > 0 && cache_pos <= model_.max_position_embeddings() &&
+                                     draft_tokens <= model_.max_position_embeddings() - cache_pos &&
+                                     speculative_start < 0 && !speculative_suffix_forward,
                                  "invalid speculative suffix");
+    struct Checkpoint {
+        DenseTensor conv, recurrent, ple_conv;
+        NgramEmbedding::Context context;
+    };
+    std::vector<Checkpoint> saved(layers.size());
+    for (std::size_t i = 0; i < layers.size(); ++i) {
+        const auto& block = *model_.layers[i];
+        const auto& layer = *layers[i];
+        MfqCudaGuard guard(block.cuda_device);
+        if (block.gdn) {
+            TYLOINFER_RUNTIME_CHECK(!layer.gdn.saved_conv.defined() && layer.gdn.conv.dense().defined() &&
+                layer.gdn.recurrent.dense().defined(), "GDN suffix requires committed recurrent state");
+            saved[i].conv = layer.gdn.conv.dense().clone();
+            saved[i].recurrent = layer.gdn.recurrent.dense().clone();
+        }
+        if (block.ple) {
+            TYLOINFER_RUNTIME_CHECK(!layer.ple.saved && layer.ple.conv.defined(), "PLE suffix requires committed convolution state");
+#ifdef TYLOINFER_NATIVE_CUDA
+            saved[i].ple_conv = layer.ple.conv.dense().clone();
+#else
+            saved[i].ple_conv = layer.ple.conv.clone();
+#endif
+            saved[i].context = block.ple->session_context(layer.ple);
+        }
+    }
+    for (std::size_t i = 0; i < layers.size(); ++i) {
+        auto& layer = *layers[i];
+        if (model_.layers[i]->gdn) {
+            layer.gdn.saved_conv = std::move(saved[i].conv);
+            layer.gdn.saved_state = std::move(saved[i].recurrent);
+        }
+        if (model_.layers[i]->ple) {
+            layer.ple.saved_conv = std::move(saved[i].ple_conv);
+            layer.ple.saved_context = std::move(saved[i].context);
+            layer.ple.saved = true;
+        }
+    }
+    speculative_prefix_retention = false;
+    speculative_suffix_journal = true;
     speculative_start = cache_pos;
     speculative_confirmed = 0;
 }
@@ -256,6 +328,7 @@ void State::commit_speculative() {
     for (std::size_t i=0; i<model_.layers.size(); ++i)
         layers[i]->commit(*model_.layers[i]);
     speculative_prefix_retention = false;
+    speculative_suffix_journal = false;
     speculative_start = -1;
     speculative_confirmed = 0;
 }

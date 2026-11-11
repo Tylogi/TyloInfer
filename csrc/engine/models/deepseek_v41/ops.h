@@ -1142,8 +1142,8 @@ struct CedEncoding {
 };
 ::tyloi::Tensor deepseek_v41_prefill_input(
     Model& model, State& state, const ::tyloi::Tensor& ids, std::int64_t compute_chunk);
-std::optional<CedEncoding> deepseek_v41_prefill_encode(
-    Model& model, State& state, const ::tyloi::Tensor& ids, std::int64_t compute_chunk,
+bool deepseek_v41_prefill_encode_chunk(
+    Model& model, State& state, CedEncoding& encoded, std::int64_t offset, std::int64_t count,
     const std::function<bool()>& stopped, bool capture_raw_hidden);
 ::tyloi::Tensor deepseek_v41_prefill_decode(
     Model& model, State& state, CedEncoding encoded, const std::function<bool()>& stopped,

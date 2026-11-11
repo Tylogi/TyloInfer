@@ -107,7 +107,6 @@ std::int64_t prefill_span(const Model&, const State&, std::size_t tokens,
                       "invalid DeepSeek-V4.1 encoder prefill request");
     if (state.batch != batch || state.cache_pos == 0) {
         state.reset(batch);
-        state.allocate();
     }
     const auto& config = model.config;
     const auto split = config.causal_encoder_layers;
@@ -115,72 +114,69 @@ std::int64_t prefill_span(const Model&, const State&, std::size_t tokens,
     return ids;
 }
 
-std::optional<CedEncoding> deepseek_v41_prefill_encode(
-    Model& model, State& state, const ::tyloi::Tensor& input_ids, int64_t compute_chunk,
+bool deepseek_v41_prefill_encode_chunk(
+    Model& model, State& state, CedEncoding& encoded, int64_t offset, int64_t count,
     const std::function<bool()>& stopped, bool capture_raw_hidden) {
 #ifndef TYLOINFER_NATIVE_CUDA
     auto scope = model.execution_scope();
 #endif
-    auto ids = input_ids.dense();
-    const auto batch = ids.size(0), tokens = ids.size(1);
-    const auto begin = state.cache_pos, end = begin + tokens;
+    const auto batch = encoded.batch;
     const auto& config = model.config;
     const auto split = config.causal_encoder_layers;
-    const auto* profile=tyloi::cuda::env_lookup("TYLOINFER_PROFILE_SSD_EXPERTS");
-    const bool trace=profile && profile[0]=='1';
-    compute_chunk = std::min<int64_t>(compute_chunk, 8192);
-    DenseTensor tail_hidden, tail_pre, tail_ids;
-    HashBatch tail_hashes;
+    const auto* profile = tyloi::cuda::env_lookup("TYLOINFER_PROFILE_SSD_EXPERTS");
+    const bool trace = profile && profile[0] == '1';
     const auto cancelled = [&] {
         if (!stopped || !stopped()) return false;
         state.reset(batch);
         return true;
     };
-    for (int64_t offset = 0; offset < tokens; offset += compute_chunk) {
-        if (cancelled()) return {};
-        const auto count = std::min(compute_chunk, tokens - offset);
-        auto chunk_ids = ids.narrow(1, offset, count).contiguous();
-        auto positions = ::tyloi::cuda::arange(state.cache_pos, state.cache_pos + count,
-                                               ::tyloi::TensorOptions()
-                                                   .device(::tyloi::kCUDA)
-                                                   .dtype(::tyloi::kInt64));
-        DenseTensor host_ids;
-        if (model.needs_host_tokens)
-            host_ids = chunk_ids.to(::tyloi::kCPU, ::tyloi::kInt64).contiguous();
-        auto hidden = model.prepare_hidden(model.embed_tokens(chunk_ids), batch, count);
-        state.begin_forward(capture_raw_hidden);
-        for (int64_t layer = 0; layer < split; ++layer) {
-            if (cancelled()) return {};
-            if(trace)std::cerr<<"runtime_deepseek_v41_prefill phase=encoder layer="<<layer<<" tokens="<<count<<'\n';
-            hidden = forward_layer(model,state,ids,layer,std::move(hidden),positions,host_ids);
-        }
-        // Decoder global KV comes from the encoder boundary for every prompt token.
-        // Decoder attention and FFNs run only over the bounded local replay below.
-        for (int64_t layer = split; layer < model.num_hidden_layers(); ++layer) {
-            auto& block = *model.blocks.at(layer);
-            if (!block.kv_source()) continue;
-            auto source = deepseek_v41_hc_input_cuda(hidden, state.shared->previous_pre,
-#ifdef TYLOINFER_NATIVE_CUDA
-                                                     block.attention_norm.dense(), config.rms_eps);
-#else
-                                                     block.attention_norm, config.rms_eps);
-#endif
-            tyloi::ops::measure("deepseek_v41.ced.global_kv", [&] {
-                block.publish_compressed_source(*state.shared, source, state.cache_pos);
-                return source;
-            });
-            state.shared->layers.at(static_cast<std::size_t>(layer)).prefilled_global_end = state.cache_pos + count;
-        }
-        tail_hidden = append_tail(tail_hidden, hidden, config.sliding_window);
-        tail_pre = append_tail(tail_pre, state.shared->previous_pre, config.sliding_window);
-        tail_ids = append_tail(tail_ids, chunk_ids, config.sliding_window);
-        tail_hashes = append_hash_tail(tail_hashes, state.shared->engram_hashes,
-                                       static_cast<int>(config.sliding_window));
-        state.cache_pos += count;
+    if (cancelled()) return false;
+    TYLOINFER_RUNTIME_CHECK(offset >= 0 && count > 0 && encoded.compute_chunk > 0 &&
+        offset <= encoded.tokens && count <= encoded.tokens - offset && count <= encoded.compute_chunk &&
+        encoded.begin >= 0 && encoded.begin <= model.max_position_embeddings() &&
+        offset <= model.max_position_embeddings() - encoded.begin &&
+        count <= model.max_position_embeddings() - (encoded.begin + offset) &&
+        state.batch == batch && state.cache_pos == encoded.begin + offset,
+        "invalid DeepSeek-V4.1 encoder chunk progression");
+    auto chunk_ids = encoded.ids.narrow(1, offset, count).contiguous();
+    auto positions = ::tyloi::cuda::arange(state.cache_pos, state.cache_pos + count,
+                                           ::tyloi::TensorOptions()
+                                               .device(::tyloi::kCUDA)
+                                               .dtype(::tyloi::kInt64));
+    DenseTensor host_ids;
+    if (model.needs_host_tokens)
+        host_ids = chunk_ids.to(::tyloi::kCPU, ::tyloi::kInt64).contiguous();
+    auto hidden = model.prepare_hidden(model.embed_tokens(chunk_ids), batch, count);
+    state.begin_forward(capture_raw_hidden);
+    for (int64_t layer = 0; layer < split; ++layer) {
+        if (cancelled()) return false;
+        if(trace)std::cerr<<"runtime_deepseek_v41_prefill phase=encoder layer="<<layer<<" tokens="<<count<<'\n';
+        hidden = forward_layer(model,state,encoded.ids,layer,std::move(hidden),positions,host_ids);
     }
-    return CedEncoding{std::move(ids), std::move(tail_hidden), std::move(tail_pre),
-                       std::move(tail_ids), std::move(tail_hashes),
-                       batch, begin, end, tokens, compute_chunk};
+    // Decoder global KV comes from the encoder boundary for every prompt token.
+    // Decoder attention and FFNs run only over the bounded local replay below.
+    for (int64_t layer = split; layer < model.num_hidden_layers(); ++layer) {
+        auto& block = *model.blocks.at(layer);
+        if (!block.kv_source()) continue;
+        auto source = deepseek_v41_hc_input_cuda(hidden, state.shared->previous_pre,
+#ifdef TYLOINFER_NATIVE_CUDA
+                                                 block.attention_norm.dense(), config.rms_eps);
+#else
+                                                 block.attention_norm, config.rms_eps);
+#endif
+        tyloi::ops::measure("deepseek_v41.ced.global_kv", [&] {
+            block.publish_compressed_source(*state.shared, source, state.cache_pos);
+            return source;
+        });
+        state.shared->layers.at(static_cast<std::size_t>(layer)).prefilled_global_end = state.cache_pos + count;
+    }
+    encoded.tail_hidden = append_tail(encoded.tail_hidden, hidden, config.sliding_window);
+    encoded.tail_pre = append_tail(encoded.tail_pre, state.shared->previous_pre, config.sliding_window);
+    encoded.tail_ids = append_tail(encoded.tail_ids, chunk_ids, config.sliding_window);
+    encoded.tail_hashes = append_hash_tail(encoded.tail_hashes, state.shared->engram_hashes,
+                                   static_cast<int>(config.sliding_window));
+    state.cache_pos += count;
+    return true;
 }
 
 ::tyloi::Tensor deepseek_v41_prefill_decode(

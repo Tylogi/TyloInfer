@@ -763,6 +763,18 @@ class NgramEmbedding {
     }
     void reset(State& state) const { state.context = {};state.hash_ready=false; }
     bool graph_supported() const { return bool(source_) || bool(stage_factory_); }
+    std::pair<std::size_t, std::size_t> context_growth_bytes(const State& state, int64_t batch, int64_t tokens) const {
+        TYLOINFER_RUNTIME_CHECK(batch > 0 && tokens > 0 && ngram_ > 1 &&
+            tokens <= std::numeric_limits<int64_t>::max() - (ngram_ - 1), "invalid ngram growth geometry");
+        const std::array<int64_t,2> next{batch, ngram_ - 1};
+        const std::array<int64_t,2> history{batch, ngram_ - 1 + tokens};
+        const auto retained = ::tyloi::make_contiguous_view(nullptr, next, ::tyloi::kInt64, {}).nbytes();
+        auto temporary = ::tyloi::make_contiguous_view(nullptr, history, ::tyloi::kInt64, {}).nbytes();
+        if (state.context.tokens.size() > (std::numeric_limits<std::size_t>::max() - temporary) / sizeof(int64_t))
+            throw std::overflow_error("ngram context growth overflow");
+        temporary += state.context.tokens.size() * sizeof(int64_t);
+        return {retained, temporary};
+    }
     const Context &context(const State& state) const { return state.context; }
     void restore(State& state,Context context) const { state.context = std::move(context);state.hash_ready=false; }
     Context prefix_context(const State& state,const DenseTensor& host_ids,int64_t count) const {
@@ -1004,6 +1016,9 @@ class Ple {
         if (bytes && std::size_t(count) > std::numeric_limits<std::size_t>::max() / bytes)
             throw std::overflow_error("PLE checkpoint growth overflow");
         return bytes * std::size_t(count);
+    }
+    std::pair<std::size_t, std::size_t> context_growth_bytes(const State& state, int64_t batch, int64_t tokens) const {
+        return embedding_.context_growth_bytes(state.embedding, batch, tokens);
     }
     bool graph_supported() const { return embedding_.graph_supported(); }
     const NgramEmbedding::Context& session_context(const State& state) const { return embedding_.context(state.embedding); }

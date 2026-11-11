@@ -30,6 +30,9 @@ public:
     void reset(std::int64_t batch) override;
     void allocate();
 #ifdef TYLOINFER_NATIVE_CUDA
+    std::vector<std::pair<tyloi::Device, std::size_t>> allocation_growth() const;
+    std::vector<std::pair<tyloi::Device, std::size_t>> ced_growth(
+        std::int64_t position, std::int64_t tokens, std::int64_t first_layer, std::int64_t last_layer) const;
     std::vector<std::pair<tyloi::Device, std::size_t>> growth(
         const tyloi::models::Input& input, const tyloi::models::ForwardOptions&) const override;
 #endif

@@ -1885,6 +1885,7 @@ void qwen4_exp::State::reset(int64_t new_batch) {
     speculative_start = -1;
     speculative_confirmed = 0;
     speculative_suffix_forward = false;
+    speculative_suffix_journal = false;
     speculative_prefix_retention = false;
     if(model_.execution)model_.execution->weights.finish_exchange();
     const bool retain=reuse_decode_graphs && new_batch==1 && graph_registry && graph_registry->reusable();
@@ -2409,12 +2410,15 @@ tyloi::StepSequence<tyloi::models::Prepared> Model::prepare(
 void State::rollback_speculative(std::int64_t accepted) {
     tyloi::models::require_model(speculative_start >= 0 && accepted >= 0,
                                  "no speculative transaction");
+    tyloi::models::require_model(!speculative_suffix_journal || accepted == 0,
+                                 "suffix checkpoint cannot retain an accepted prefix");
     const auto keep = speculative_start + speculative_confirmed + accepted;
     speculative_prefix_retention=false;
     for (std::size_t i=0;i<model_.layers.size();++i)
         layers[i]->rollback(*model_.layers[i],keep);
     if (positions.defined()) positions=positions.dense().narrow(-1,0,keep);
     cache_pos = keep;
+    speculative_suffix_journal=false;
     speculative_start = -1;
     speculative_confirmed = 0;
 }

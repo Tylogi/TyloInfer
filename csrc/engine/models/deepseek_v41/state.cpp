@@ -127,14 +127,100 @@ void State::allocate() {
 }
 
 #ifdef TYLOINFER_NATIVE_CUDA
+namespace {
+std::size_t block_allocation_bytes(const Block& block, std::int64_t batch, tyloi::Device device) {
+    const auto bytes = [&](std::int64_t rows, std::int64_t width, tyloi::ScalarType dtype) {
+        if (rows <= 0 || width <= 0) throw std::invalid_argument("invalid DeepSeek-V4.1 cache dimensions");
+        const std::array<std::int64_t, 3> shape{batch, rows, width};
+        return tyloi::make_contiguous_view(nullptr, shape, dtype, device).nbytes();
+    };
+    auto total = bytes(block.config.sliding_window, block.config.head_dim, tyloi::kFloat16);
+    const auto add = [&](std::size_t value) {
+        if (total > std::numeric_limits<std::size_t>::max() - value)
+            throw std::overflow_error("DeepSeek-V4.1 state byte count overflow");
+        total += value;
+    };
+    if (block.kv_source()) {
+        if (block.ratio <= 0 || block.max_context <= 0)
+            throw std::invalid_argument("invalid DeepSeek-V4.1 compressed cache dimensions");
+        const auto capacity = std::max<std::int64_t>(1, block.max_context / block.ratio);
+        add(bytes(capacity, block.config.head_dim, tyloi::kFloat16));
+        add(bytes(capacity, block.config.index_head_dim, tyloi::kFloat16));
+        if (block.ratio > 1) {
+            add(bytes(block.ratio, block.config.head_dim, tyloi::kFloat32));
+            add(bytes(block.ratio, block.config.head_dim, tyloi::kFloat32));
+        }
+    }
+    return total;
+}
+
+std::size_t engram_allocation_bytes(const deepseek_v41_runtime::SharedState& shared,
+                                   const Block& block, std::int64_t batch, std::int64_t tokens,
+                                   tyloi::Device device) {
+    const auto& engram = shared.engram_states.at(static_cast<std::size_t>(block.layer));
+    if (!engram) return 0;
+    const auto columns = shared.config.engram_max_ngram_size - 1;
+    const auto heads = shared.config.engram_n_heads;
+    const auto limit = std::numeric_limits<std::int64_t>::max();
+    if (columns <= 0 || heads <= 0 || batch > limit / tokens ||
+        batch * tokens > limit / columns || batch * tokens * columns > limit / heads)
+        throw std::overflow_error("DeepSeek-V4.1 Engram row count overflow");
+    return engram->growth(static_cast<std::size_t>(batch * tokens * columns * heads), device);
+}
+
+void add_device_bytes(std::vector<std::pair<tyloi::Device, std::size_t>>& result,
+                      tyloi::Device device, std::size_t bytes) {
+    auto entry = std::find_if(result.begin(), result.end(),
+                              [device](const auto& item) { return item.first == device; });
+    if (entry == result.end()) result.emplace_back(device, bytes);
+    else {
+        if (entry->second > std::numeric_limits<std::size_t>::max() - bytes)
+            throw std::overflow_error("DeepSeek-V4.1 state byte count overflow");
+        entry->second += bytes;
+    }
+}
+}
+
+std::vector<std::pair<tyloi::Device, std::size_t>> State::allocation_growth() const {
+    if (batch <= 0 || cache_pos != 0 || speculative_start >= 0)
+        throw std::invalid_argument("invalid DeepSeek-V4.1 initial allocation request");
+    std::vector<std::pair<tyloi::Device, std::size_t>> result;
+    for (const auto& block : model_.blocks) {
+        if (block->cuda_device < 0) throw std::invalid_argument("invalid DeepSeek-V4.1 state device");
+        const tyloi::Device device(tyloi::kCUDA, block->cuda_device);
+        add_device_bytes(result, device, block_allocation_bytes(*block, batch, device));
+    }
+    return result;
+}
+
+std::vector<std::pair<tyloi::Device, std::size_t>> State::ced_growth(
+        std::int64_t position, std::int64_t tokens, std::int64_t first_layer,
+        std::int64_t last_layer) const {
+    if (batch <= 0 || position < 0 || tokens <= 0 || speculative_start >= 0 ||
+        position > model_.max_position_embeddings() || tokens > model_.max_position_embeddings() - position ||
+        first_layer < 0 || last_layer < first_layer ||
+        static_cast<std::uint64_t>(last_layer) > model_.blocks.size())
+        throw std::invalid_argument("invalid DeepSeek-V4.1 CED allocation request");
+    std::vector<std::pair<tyloi::Device, std::size_t>> result;
+    for (auto index = first_layer; index < last_layer; ++index) {
+        const auto& block = *model_.blocks[static_cast<std::size_t>(index)];
+        if (block.cuda_device < 0) throw std::invalid_argument("invalid DeepSeek-V4.1 state device");
+        const tyloi::Device device(tyloi::kCUDA, block.cuda_device);
+        if (shared->engram_states.at(static_cast<std::size_t>(block.layer)))
+            add_device_bytes(result, device, engram_allocation_bytes(*shared, block, batch, tokens, device));
+    }
+    return result;
+}
+
 std::vector<std::pair<tyloi::Device, std::size_t>> State::growth(
         const tyloi::models::Input& input, const tyloi::models::ForwardOptions&) const {
     const auto [input_batch, tokens] = input.shape();
-    if (input.suffix || batch <= 0 || input_batch != batch || tokens <= 0 || cache_pos < 0 || speculative_start >= 0 ||
+    if (batch <= 0 || input_batch != batch || tokens <= 0 || cache_pos < 0 || speculative_start >= 0 ||
         cache_pos > std::numeric_limits<std::int64_t>::max() - tokens)
         throw std::invalid_argument("invalid DeepSeek-V4.1 state allocation request");
     if (cache_pos + tokens > model_.max_position_embeddings() || input.positions || input.cache_positions ||
-        input.confirmed < 0 || (input.confirmed > 0 &&
+        input.confirmed < 0 || (input.suffix && (input.confirmed != 0 || batch != 1 ||
+            cache_pos <= 0 || !model_.supports_suffix_speculation())) || (input.confirmed > 0 &&
             (input.confirmed >= tokens || batch != 1 || cache_pos <= 0 || !model_.supports_speculation())))
         throw std::invalid_argument("invalid DeepSeek-V4.1 forward allocation geometry");
     struct Growth { tyloi::Device device; std::size_t retained = 0, peak = 0; };
@@ -150,7 +236,7 @@ std::vector<std::pair<tyloi::Device, std::size_t>> State::growth(
             throw std::overflow_error("DeepSeek-V4.1 state byte count overflow");
         entry->peak = std::max(entry->peak, entry->retained + temporary);
     };
-    if (input.confirmed > 0) {
+    if (input.confirmed > 0 || input.suffix) {
         if (!shared->engram_hash) throw std::invalid_argument("DeepSeek-V4.1 Engram state is unavailable");
         add(tyloi::Device(tyloi::kCPU), shared->engram_hash->checkpoint_growth(
             static_cast<int>(batch), tokens));
@@ -164,20 +250,9 @@ std::vector<std::pair<tyloi::Device, std::size_t>> State::growth(
             return tyloi::make_contiguous_view(nullptr, shape, dtype, device).nbytes();
         };
         if (cache_pos == 0) {
-            add(device, bytes(block->config.sliding_window, block->config.head_dim, tyloi::kFloat16));
-            if (block->kv_source()) {
-                if (block->ratio <= 0 || block->max_context <= 0)
-                    throw std::invalid_argument("invalid DeepSeek-V4.1 compressed cache dimensions");
-                const auto capacity = std::max<std::int64_t>(1, block->max_context / block->ratio);
-                add(device, bytes(capacity, block->config.head_dim, tyloi::kFloat16));
-                add(device, bytes(capacity, block->config.index_head_dim, tyloi::kFloat16));
-                if (block->ratio > 1) {
-                    add(device, bytes(block->ratio, block->config.head_dim, tyloi::kFloat32));
-                    add(device, bytes(block->ratio, block->config.head_dim, tyloi::kFloat32));
-                }
-            }
+            add(device, block_allocation_bytes(*block, batch, device));
         }
-        if (input.confirmed > 0) {
+        if (input.confirmed > 0 || input.suffix) {
             const auto& layer = shared->layers.at(static_cast<std::size_t>(block->layer));
             if (layer.speculative_pending || !layer.local_kv.defined() ||
                 layer.position != cache_pos || tokens > block->config.sliding_window)
@@ -197,16 +272,8 @@ std::vector<std::pair<tyloi::Device, std::size_t>> State::growth(
                 add(device, projected); add(device, projected);
             }
         }
-        const auto& engram = shared->engram_states.at(static_cast<std::size_t>(block->layer));
-        if (engram) {
-            const auto columns = shared->config.engram_max_ngram_size - 1;
-            const auto heads = shared->config.engram_n_heads;
-            const auto limit = std::numeric_limits<std::int64_t>::max();
-            if (columns <= 0 || heads <= 0 || batch > limit / tokens ||
-                batch * tokens > limit / columns || batch * tokens * columns > limit / heads)
-                throw std::overflow_error("DeepSeek-V4.1 Engram row count overflow");
-            add(device, engram->growth(static_cast<std::size_t>(batch * tokens * columns * heads), device));
-        }
+        if (shared->engram_states.at(static_cast<std::size_t>(block->layer)))
+            add(device, engram_allocation_bytes(*shared, *block, batch, tokens, device));
     }
     std::vector<std::pair<tyloi::Device, std::size_t>> result;
     for (const auto& value : growth) result.emplace_back(value.device, value.peak);

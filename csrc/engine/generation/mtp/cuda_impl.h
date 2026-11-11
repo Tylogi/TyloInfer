@@ -459,6 +459,10 @@ template <class Model, class State> struct CudaMtpOps {
       input.suffix = true;
 #ifdef TYLOINFER_NATIVE_CUDA
       input.raw_hidden = raw;
+#endif
+      reserve_target(input);
+      state.begin_speculative_suffix(input.shape().second);
+#ifdef TYLOINFER_NATIVE_CUDA
       auto policy = mode.ffn;
       policy.independent |= causal.info().separate_projections;
       auto scope = tyloi::cuda::Executor::current().enter(policy);
