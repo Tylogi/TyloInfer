@@ -1289,18 +1289,6 @@ std::vector<std::pair<std::string,double>> qwen4_cache_memory_metrics(
     std::size_t bytes=0;
     std::map<int,std::size_t> devices;
     for(const auto& [address,size]:allocations) { bytes+=size; devices[address.first]+=size; }
-    if(model.execution->kv)
-        for(const auto& metric:model.execution->kv->metrics())
-            if(metric.first=="kv_memory_gpu_bytes") {
-                bytes+=std::size_t(metric.second);
-                devices[model.execution->config.layer_placement.primary_device()]+=std::size_t(metric.second);
-            }
-    if(model.execution->offload)
-        for(const auto& metric:model.execution->offload->metrics())
-            if(metric.first=="qsa_kv_resident_bytes") {
-                bytes+=std::size_t(metric.second);
-                devices[model.execution->config.layer_placement.primary_device()]+=std::size_t(metric.second);
-            }
     std::vector<std::pair<std::string,double>> result{{"kv_cache_bytes",double(bytes)},
         {"kv_cache_contexts",state.cache_pos>0?double(state.batch):0.0}};
     for(const auto& [device,size]:devices)result.emplace_back("gpu_"+std::to_string(device)+"_live_kv_bytes",double(size));

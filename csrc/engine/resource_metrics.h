@@ -54,6 +54,28 @@ inline Metrics resource_metrics(
         {"ssd_ple_enabled", ple > 0 ? 1.0 : 0.0},
         {"ssd_ple_payload_bytes", double(ple)}});
     if (memory) {
+        std::size_t shared_kv_bytes = 0;
+        bool shared_kv_reported = false;
+        for (const auto& [name, value] : kv_metrics)
+            if (name == "kv_memory_gpu_bytes") {
+                shared_kv_bytes += std::size_t(value);
+                shared_kv_reported = true;
+            }
+        if (offload_metrics)
+            for (const auto& [name, value] : *offload_metrics)
+                if (name == "qsa_kv_resident_bytes") {
+                    shared_kv_bytes += std::size_t(value);
+                    shared_kv_reported = true;
+                }
+        const auto primary_live = "gpu_" + std::to_string(primary.index) + "_live_kv_bytes";
+        bool primary_reported = false;
+        for (auto& [name, value] : *memory) {
+            if (name == "kv_cache_bytes" || name == primary_live)
+                value += double(shared_kv_bytes);
+            if (name == primary_live) primary_reported = true;
+        }
+        if (shared_kv_reported && !primary_reported)
+            memory->emplace_back(primary_live, double(shared_kv_bytes));
         for (auto& [name, value] : *memory)
             for (const auto& [batch_name, batch_value] : batch_metrics) {
                 if (name == "kv_cache_bytes" && batch_name == "continuous_batching_request_kv_bytes")
