@@ -185,9 +185,14 @@ void State::commit_speculative() {
 }
 
 TextSessionStateKind State::text_session_state_kind() const {
-    return model_.execution && !model_.execution->offload && !model_.layers.empty()
-        ? TextSessionStateKind::Qwen4
-        : TextSessionStateKind::Unsupported;
+    if (model_.layers.empty() || layers.size() != model_.layers.size())
+        return TextSessionStateKind::Unsupported;
+    for (std::size_t i = 0; i < layers.size(); ++i) {
+        if (!layers[i] || (model_.layers[i]->qsa && (!layers[i]->qsa ||
+                !model_.layers[i]->qsa->supports_session(*layers[i]->qsa))))
+            return TextSessionStateKind::Unsupported;
+    }
+    return TextSessionStateKind::Qwen4;
 }
 
 bool State::supports_text_session_state() const {

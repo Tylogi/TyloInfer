@@ -356,7 +356,7 @@ struct DeepseekV41Dspark final : tyloi::models::Mtp {
         throw std::runtime_error("DeepSeek-V4.1 DSpark uses blockwise drafting");
     }
 
-    bool supports_session_state() const noexcept override {return true;}
+    bool supports_session_state(const tyloi::models::MtpState&) const noexcept override {return true;}
 
     MtpSessionState capture_session_state(const tyloi::models::MtpState& value,
                                           int64_t cache_pos,

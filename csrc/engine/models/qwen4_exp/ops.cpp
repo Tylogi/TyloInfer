@@ -529,8 +529,16 @@ std::unique_ptr<tyloi::engine::mtp::DepthPolicy> Predictor::depth_policy(
     return std::make_unique<tyloi::engine::mtp::AdaptivePolicy>(maximum_depth, &state, true, batch);
 }
 
-bool Predictor::supports_session_state() const noexcept {
-    return execution && !execution->offload && !layers.empty();
+bool Predictor::supports_session_state(const tyloi::models::MtpState& value) const noexcept {
+    if (!value.belongs_to(*this) || layers.empty()) return false;
+    const auto& request = static_cast<const PredictorState&>(value);
+    if (request.layer_states.size() != layers.size()) return false;
+    for (std::size_t i = 0; i < layers.size(); ++i) {
+        if (!request.layer_states[i] ||
+            (layers[i]->qsa && (!request.layer_states[i]->qsa ||
+                !layers[i]->qsa->supports_session(*request.layer_states[i]->qsa)))) return false;
+    }
+    return true;
 }
 
 MtpSessionState Predictor::capture_session_state(const tyloi::models::MtpState& value, int64_t target_position,const tyloi::Tensor& input_hidden) const {
@@ -538,11 +546,11 @@ MtpSessionState Predictor::capture_session_state(const tyloi::models::MtpState& 
     const auto& hidden=input_hidden.dense();
     const auto position=target_position-1;
 #ifdef TYLOINFER_NATIVE_CUDA
-    TYLOINFER_RUNTIME_CHECK(supports_session_state() && position>0 && position<=request.position() &&
+    TYLOINFER_RUNTIME_CHECK(supports_session_state(value) && position>0 && position<=request.position() &&
         hidden.defined() && hidden.dim()==3 && hidden.size(0)==1 && hidden.size(1)==1 && hidden.size(2)==hidden_norm.numel(),
         "Qwen4 MTP session boundary is unavailable");
 #else
-    TYLOINFER_RUNTIME_CHECK(supports_session_state() && position>0 && position<=request.position() &&
+    TYLOINFER_RUNTIME_CHECK(supports_session_state(value) && position>0 && position<=request.position() &&
         hidden.defined() && hidden.dim()==3 && hidden.size(0)==1 && hidden.size(1)==1 && hidden.size(2)==hidden_norm.numel(),
         "Qwen4 MTP session boundary is unavailable");
 #endif
@@ -569,14 +577,14 @@ void Predictor::restore_session_state(tyloi::models::MtpState& value, const MtpS
     const auto* snapshot=std::get_if<tyloi::models::qwen4_exp::MtpSnapshot>(&state.payload);
     const auto* hidden=state.last_target_hidden.representation<DenseTensor>();
 #ifdef TYLOINFER_NATIVE_CUDA
-    TYLOINFER_RUNTIME_CHECK(supports_session_state() && state.cache_pos>0 &&
+    TYLOINFER_RUNTIME_CHECK(supports_session_state(value) && state.cache_pos>0 &&
         snapshot && snapshot->layers.size()==layers.size() && snapshot->positions.size()==layers.size() &&
         snapshot->lengths.size()==layers.size() && snapshot->lengths.front()==state.cache_pos &&
         hidden && hidden->defined() && hidden->dim()==3 &&
         hidden->size(0)==1 && hidden->size(1)==1 &&
         hidden->size(2)==hidden_norm.numel(),"incompatible Qwen4 MTP session state");
 #else
-    TYLOINFER_RUNTIME_CHECK(supports_session_state() && state.cache_pos>0 &&
+    TYLOINFER_RUNTIME_CHECK(supports_session_state(value) && state.cache_pos>0 &&
         snapshot && snapshot->layers.size()==layers.size() && snapshot->positions.size()==layers.size() &&
         snapshot->lengths.size()==layers.size() && snapshot->lengths.front()==state.cache_pos &&
         hidden && hidden->defined() && hidden->dim()==3 &&

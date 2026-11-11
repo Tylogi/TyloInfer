@@ -35,7 +35,7 @@ public:
         const ::tyloi::Tensor& next_ids, const ::tyloi::Tensor& positions = {}) const override;
 
     void trim_cache_to(tyloi::models::MtpState& state, int64_t position) const override;
-    bool supports_session_state() const noexcept override { return true; }
+    bool supports_session_state(const tyloi::models::MtpState&) const noexcept override { return true; }
     MtpSessionState capture_session_state(const tyloi::models::MtpState& state, int64_t target_cache_position,
         const ::tyloi::Tensor& last_target_hidden) const override;
 

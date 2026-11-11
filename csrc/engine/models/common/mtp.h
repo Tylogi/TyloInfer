@@ -49,7 +49,7 @@ struct Mtp {
     virtual bool retains_partial_target_prefix() const noexcept {
         return false;
     }
-    virtual bool supports_session_state() const noexcept { return false; }
+    virtual bool supports_session_state(const MtpState&) const noexcept { return false; }
     virtual MtpSessionState capture_session_state(
         const MtpState&,
         std::int64_t,

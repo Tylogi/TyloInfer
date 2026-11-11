@@ -78,6 +78,12 @@ template <class Backend> class SessionCache : public tyloi::state::Sessions {
         const std::string &input_key = {}) {
         if (!supported_)
             return {};
+        if (mtp) {
+            if constexpr (requires { state.predictor; }) {
+                if (!state.predictor || !state.predictor->belongs_to(*mtp) ||
+                    !mtp->supports_session_state(*state.predictor)) return {};
+            } else return {};
+        }
         if (paged_cache_ && !native_hot_snapshots_) {
             auto restored = restore_paged(
                 state, resources, requested_session, prompt, maximum_prefix_tokens, mtp, input_key);
@@ -89,7 +95,7 @@ template <class Backend> class SessionCache : public tyloi::state::Sessions {
             native_hot_snapshots_ && requested_session.empty() ? "\x01prefix-global" : requested_session,
             prompt, maximum_prefix_tokens, [&](const Snapshot &state) {
             return state.input_key == input_key &&
-                   (mtp == nullptr || (mtp->supports_session_state() && state.mtp.has_value()));
+                   (mtp == nullptr || state.mtp.has_value());
         });
         if (!match) {
             if (paged_cache_ && native_hot_snapshots_)
@@ -402,7 +408,7 @@ template <class Backend> class SessionCache : public tyloi::state::Sessions {
             }();
             if(snapshot.tokens.empty()) {paged_cache_->record_match(0);return {};}
             snapshot.input_key=input_key;
-            if(mtp && (!mtp->supports_session_state() || !snapshot.mtp)) {
+            if(mtp && !snapshot.mtp) {
                 paged_cache_->record_match(0);return {};
             }
             invalid_action = "paged_restore_invalidate";

@@ -1261,7 +1261,7 @@ class Qsa {
         bytes += std::size_t((capacity+c_.pool-1)/c_.pool) * c_.index_width * 2;
         return bytes;
     }
-    bool supports_session(const State& request) const { return !request.offload && !(request.memory && request.memory->offload); }
+    bool supports_session(const State& request) const noexcept { return !request.offload && !(request.memory && request.memory->offload); }
     std::size_t session_bytes(const State& request,int64_t count) const {
         if(count<=0)return 0;
         return std::size_t(count)*(c_.kv_heads*(key_width()+value_width())*(quantization_.enabled()?4:2)+

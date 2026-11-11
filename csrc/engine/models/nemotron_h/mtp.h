@@ -307,7 +307,7 @@ struct Mtp final : tyloi::models::Mtp {
     bool preserve_output_dtype() const noexcept override { return true; }
     bool retains_partial_target_prefix() const noexcept override { return true; }
 
-    bool supports_session_state() const noexcept override { return true; }
+    bool supports_session_state(const tyloi::models::MtpState&) const noexcept override { return true; }
 
     MtpSessionState
     capture_session_state(const tyloi::models::MtpState& value,

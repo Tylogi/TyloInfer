@@ -42,7 +42,9 @@ struct Predictor final : tyloi::models::Mtp {
     Linear embedding_fusion, hidden_fusion;
     std::unique_ptr<GatedResidual> final_mixer;
     std::vector<std::unique_ptr<Layer>> layers;
+#ifndef TYLOINFER_NATIVE_CUDA
     CudaExecutionContext *execution = nullptr;
+#endif
 
     Predictor();
     ~Predictor() override;
@@ -81,7 +83,7 @@ struct Predictor final : tyloi::models::Mtp {
     bool preserve_output_dtype() const noexcept override;
     std::unique_ptr<tyloi::engine::mtp::DepthPolicy> depth_policy(
         int maximum_depth, tyloi::engine::mtp::PolicyState& state) const override;
-    bool supports_session_state() const noexcept override;
+    bool supports_session_state(const tyloi::models::MtpState&) const noexcept override;
     MtpSessionState capture_session_state(const tyloi::models::MtpState&, int64_t,const tyloi::Tensor&) const override;
     void restore_session_state(tyloi::models::MtpState&, const MtpSessionState&) const override;
 };

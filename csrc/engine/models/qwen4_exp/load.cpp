@@ -228,7 +228,9 @@ std::optional<Predictor> Predictor::load_if_present(CudaExecutionContext &execut
                                                       ::tyloi::Tensor embedding, ::tyloi::Tensor output,
                                                       double softcap) {
     Predictor result;
+#ifndef TYLOINFER_NATIVE_CUDA
     result.execution = &execution;
+#endif
     result.embedding = std::move(embedding);
     result.output = std::move(output);
     result.softcap = softcap;

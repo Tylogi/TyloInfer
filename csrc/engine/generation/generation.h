@@ -90,7 +90,7 @@ Generation generate_session(Ops& ops, InferenceRequest& request, InferenceOutput
     if constexpr(requires { ops.set_prefix_boundary(size_t{}); })
         ops.set_prefix_boundary(prefix_boundary);
     typename Ops::Restore restored;
-    if (caching && (!use_mtp || mtp->supports_session_state()))
+    if (caching)
         restored = session_cache.restore_best(state,
             ops.drain,
             use_mtp ? mtp : nullptr,
