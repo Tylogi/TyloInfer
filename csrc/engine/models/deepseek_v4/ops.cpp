@@ -641,13 +641,13 @@ static PoolSnapshot capture_pool(const PoolState &source, int64_t cache_pos, siz
         throw std::runtime_error("DeepSeek V4 session compressor state is unavailable");
     }
     const int64_t visible = std::min<int64_t>(cache_pos / source.ratio, source.capacity);
-    state.state_kv = std::make_shared<DenseTensor>(source.state_kv.clone());
-    state.state_gate = std::make_shared<DenseTensor>(source.state_gate.clone());
+    state.state_kv = source.state_kv.clone();
+    state.state_gate = source.state_gate.clone();
     if (source.overlap) {
-        state.previous_kv = std::make_shared<DenseTensor>(source.previous_kv.clone());
-        state.previous_gate = std::make_shared<DenseTensor>(source.previous_gate.clone());
+        state.previous_kv = source.previous_kv.clone();
+        state.previous_gate = source.previous_gate.clone();
     }
-    state.pool = std::make_shared<DenseTensor>(source.pool.narrow(1, 0, visible).clone());
+    state.pool = source.pool.narrow(1, 0, visible).clone();
     bytes += session_tensor_bytes(state.state_kv);
     bytes += session_tensor_bytes(state.state_gate);
     if (state.previous_kv) bytes += session_tensor_bytes(state.previous_kv);
@@ -672,34 +672,20 @@ static void restore_pool(PoolState &target, const PoolSnapshot &state) {
         throw CudaSessionStateError("DeepSeek V4 saved compressor state is invalid");
     }
     target.capacity = state.capacity;
-#ifdef TYLOINFER_NATIVE_CUDA
     auto state_kv = restore_session_tensor(target.state_kv, state.state_kv);
     target.state_kv = state_kv ? state_kv.dense() : DenseTensor{};
     auto state_gate = restore_session_tensor(target.state_gate, state.state_gate);
     target.state_gate = state_gate ? state_gate.dense() : DenseTensor{};
-#else
-    restore_session_tensor(target.state_kv, state.state_kv);
-    restore_session_tensor(target.state_gate, state.state_gate);
-#endif
     if (state.overlap) {
-#ifdef TYLOINFER_NATIVE_CUDA
         auto previous_kv = restore_session_tensor(target.previous_kv, state.previous_kv);
         target.previous_kv = previous_kv ? previous_kv.dense() : DenseTensor{};
         auto previous_gate = restore_session_tensor(target.previous_gate, state.previous_gate);
         target.previous_gate = previous_gate ? previous_gate.dense() : DenseTensor{};
-#else
-        restore_session_tensor(target.previous_kv, state.previous_kv);
-        restore_session_tensor(target.previous_gate, state.previous_gate);
-#endif
     } else {
         target.previous_kv = ::tyloi::DenseTensor();
         target.previous_gate = ::tyloi::DenseTensor();
     }
-#ifdef TYLOINFER_NATIVE_CUDA
     target.pool = restore_session_prefix_tensor(target.pool, state.pool, 1, state.capacity).dense();
-#else
-    restore_session_prefix_tensor(target.pool, state.pool, 1, state.capacity);
-#endif
 }
 
 void PoolState::reset(int64_t batch, int64_t max_positions) {
@@ -865,8 +851,13 @@ void State::reset(int64_t next_batch) {
     }
 }
 
+#ifdef TYLOINFER_NATIVE_CUDA
+std::vector<::tyloi::Tensor> State::storage() const {
+    std::vector<::tyloi::Tensor> result;
+#else
 std::vector<DenseTensor> State::storage() const {
     std::vector<DenseTensor> result;
+#endif
     const auto append = [&](const DenseTensor& tensor) { if (tensor.defined()) result.push_back(tensor); };
     const auto pool = [&](const PoolState& state) {
         append(state.state_kv); append(state.state_gate); append(state.previous_kv);
@@ -901,7 +892,7 @@ TextSessionState State::capture_text_session_state(const std::vector<int64_t>& t
         if (!layer.local_cache.defined())
             throw std::runtime_error("DeepSeek V4 local session cache is unavailable");
         tyloi::models::deepseek_v4::BlockSnapshot saved;
-        saved.local_cache = std::make_shared<DenseTensor>(layer.local_cache.clone());
+        saved.local_cache = layer.local_cache.clone();
         state.bytes += session_tensor_bytes(saved.local_cache);
         saved.compressor = capture_pool(layer.compressor, cache_pos, state.bytes);
         saved.indexer_compressor = capture_pool(layer.indexer_compressor, cache_pos, state.bytes);
@@ -923,12 +914,8 @@ void State::restore_text_session_state(const TextSessionState& state) {
         if (!saved.local_cache || !saved.local_cache.defined() || saved.local_cache.dim() != 3 ||
             saved.local_cache.size(0) != 1 || saved.local_cache.size(1) != 128)
             throw CudaSessionStateError("DeepSeek V4 saved local cache is invalid");
-#ifdef TYLOINFER_NATIVE_CUDA
         auto local_cache = restore_session_tensor(layer.local_cache, saved.local_cache);
         layer.local_cache = local_cache ? local_cache.dense() : DenseTensor{};
-#else
-        restore_session_tensor(layer.local_cache, saved.local_cache);
-#endif
         restore_pool(layer.compressor, saved.compressor);
         restore_pool(layer.indexer_compressor, saved.indexer_compressor);
     }

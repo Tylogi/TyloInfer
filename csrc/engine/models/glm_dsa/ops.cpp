@@ -85,8 +85,13 @@ void State::reset(int64_t next_batch) {
     }
 }
 
+#ifdef TYLOINFER_NATIVE_CUDA
+std::vector<::tyloi::Tensor> State::storage() const {
+    std::vector<::tyloi::Tensor> result;
+#else
 std::vector<DenseTensor> State::storage() const {
     std::vector<DenseTensor> result;
+#endif
     for (const auto& layer : layers) {
         if (layer.kv_cache.defined()) result.push_back(layer.kv_cache);
         if (layer.index_cache.defined()) result.push_back(layer.index_cache);
@@ -125,14 +130,14 @@ TextSessionState State::capture_text_session_state(const std::vector<int64_t>& t
         tyloi::models::glm_dsa::BlockSnapshot saved;
         saved.full_indexer = layout_[i].full_indexer;
         saved.kv_capacity = layer.kv_cache.size(2);
-        saved.kv_cache = std::make_shared<DenseTensor>(layer.kv_cache.narrow(2, 0, cache_pos).clone());
+        saved.kv_cache = layer.kv_cache.narrow(2, 0, cache_pos).clone();
         state.bytes += session_tensor_bytes(saved.kv_cache);
         if (saved.full_indexer) {
             if (!layer.index_cache.defined() || layer.index_cache.dim() != 3 ||
                 layer.index_cache.size(0) != 1 || cache_pos > layer.index_cache.size(1))
                 throw std::runtime_error("GLM DSA session index cache is unavailable");
             saved.index_capacity = layer.index_cache.size(1);
-            saved.index_cache = std::make_shared<DenseTensor>(layer.index_cache.narrow(1, 0, cache_pos).clone());
+            saved.index_cache = layer.index_cache.narrow(1, 0, cache_pos).clone();
             state.bytes += session_tensor_bytes(saved.index_cache);
         }
         saved_layers.push_back(std::move(saved));
@@ -154,20 +159,12 @@ void State::restore_text_session_state(const TextSessionState& state) {
             saved.kv_cache.dim() != 4 || saved.kv_cache.size(0) != 1 ||
             saved.kv_cache.size(2) != state.cache_pos)
             throw CudaSessionStateError("GLM DSA saved MLA cache is invalid");
-#ifdef TYLOINFER_NATIVE_CUDA
         layer.kv_cache = restore_session_prefix_tensor(layer.kv_cache, saved.kv_cache, 2, saved.kv_capacity).dense();
-#else
-        restore_session_prefix_tensor(layer.kv_cache, saved.kv_cache, 2, saved.kv_capacity);
-#endif
         if (saved.full_indexer) {
             if (!saved.index_cache || !saved.index_cache.defined() || saved.index_cache.dim() != 3 ||
                 saved.index_cache.size(0) != 1 || saved.index_cache.size(1) != state.cache_pos)
                 throw CudaSessionStateError("GLM DSA saved index cache is invalid");
-#ifdef TYLOINFER_NATIVE_CUDA
             layer.index_cache = restore_session_prefix_tensor(layer.index_cache, saved.index_cache, 1, saved.index_capacity).dense();
-#else
-            restore_session_prefix_tensor(layer.index_cache, saved.index_cache, 1, saved.index_capacity);
-#endif
         } else layer.index_cache = {};
     }
     for (auto& [device, selection] : selections) {

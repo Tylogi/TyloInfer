@@ -29,8 +29,13 @@ public:
     void advance(int64_t tokens) noexcept { cache_pos += tokens; }
     void set_position_delta(int64_t delta) noexcept { decode_position_delta = delta; }
     void preallocate() {}
+#ifdef TYLOINFER_NATIVE_CUDA
+    std::vector<::tyloi::Tensor> storage() const;
+    std::vector<::tyloi::Tensor*> graph_state() { return {}; }
+#else
     std::vector<DenseTensor> storage() const;
     std::vector<DenseTensor*> graph_state() { return {}; }
+#endif
     TextSessionStateKind text_session_state_kind() const;
     bool supports_text_session_state() const;
     bool supports_paged_text_session_state() const { return false; }

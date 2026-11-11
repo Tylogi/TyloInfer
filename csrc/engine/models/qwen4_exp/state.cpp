@@ -209,8 +209,8 @@ TextSessionState State::capture_text_session_state(const std::vector<std::int64_
     tyloi::models::qwen4_exp::Snapshot snapshot;
     for (std::size_t i=0; i<model_.layers.size(); ++i)
         snapshot.layers.push_back(capture_layer_session(*model_.layers[i], *layers[i], cache_pos, state.bytes));
-    snapshot.positions = std::make_shared<DenseTensor>(positions.clone());
-    state.bytes += session_tensor_bytes(*snapshot.positions);
+    snapshot.positions = std::make_shared<DenseTensor>(positions.dense().clone());
+    state.bytes += session_tensor_bytes(snapshot.positions);
     state.payload = std::move(snapshot);
     return state;
 }

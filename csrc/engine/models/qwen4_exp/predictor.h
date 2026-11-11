@@ -22,7 +22,7 @@ struct PredictorState final : tyloi::models::MtpState {
     int64_t position() const noexcept override;
 
     std::vector<std::unique_ptr<LayerState>> layer_states;
-    std::vector<::tyloi::DenseTensor> positions;
+    std::vector<::tyloi::Tensor> positions;
     std::vector<int64_t> lengths;
     int64_t batch = 0;
 };

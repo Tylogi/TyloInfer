@@ -64,7 +64,7 @@ public:
     void commit_speculative();
     void rollback_speculative(std::int64_t accepted);
     void begin_forward();
-    void finish_forward(const ::tyloi::DenseTensor& full_positions, std::int64_t batch,
+    void finish_forward(const ::tyloi::Tensor& full_positions, std::int64_t batch,
                         std::int64_t tokens);
 
     std::int64_t cache_pos = 0;
@@ -73,7 +73,7 @@ public:
     std::int64_t speculative_start = -1;
     std::int64_t speculative_confirmed = 0;
     bool speculative_suffix_forward = false;
-    ::tyloi::DenseTensor positions;
+    ::tyloi::Tensor positions;
     std::vector<std::unique_ptr<LayerState>> layers;
     std::unique_ptr<Qwen4DecodeGraph> graph_registry;
     bool reuse_decode_graphs = false;
