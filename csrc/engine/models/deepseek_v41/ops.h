@@ -434,27 +434,26 @@ struct Block final {
     void reset(SharedState& shared, std::int64_t batch) {
         auto& layer_state = shared.layers.at(static_cast<std::size_t>(layer));
         const auto half = ::tyloi::TensorOptions()
-                              .device(::tyloi::kCUDA)
+                              .device(::tyloi::Device(::tyloi::kCUDA, cuda_device))
                               .dtype(::tyloi::kFloat16);
-        layer_state.local_kv =
-            ::tyloi::cuda::zeros({batch, config.sliding_window, config.head_dim}, half);
-        layer_state.compressed_kv = DenseTensor();
-        layer_state.index_k = DenseTensor();
-        layer_state.partial_kv = DenseTensor();
-        layer_state.partial_score = DenseTensor();
+        auto local_kv = ::tyloi::cuda::zeros({batch, config.sliding_window, config.head_dim}, half);
+        DenseTensor compressed_kv, index_k, partial_kv, partial_score;
         if (kv_source()) {
             const auto capacity = std::max<std::int64_t>(1, max_context / ratio);
-            layer_state.compressed_kv =
-                ::tyloi::cuda::zeros({batch, capacity, config.head_dim}, half);
-            layer_state.index_k =
-                ::tyloi::cuda::zeros({batch, capacity, config.index_head_dim}, half);
+            compressed_kv = ::tyloi::cuda::zeros({batch, capacity, config.head_dim}, half);
+            index_k = ::tyloi::cuda::zeros({batch, capacity, config.index_head_dim}, half);
             if (ratio > 1) {
                 const auto fp32 = half.dtype(::tyloi::kFloat32);
-                layer_state.partial_kv = ::tyloi::cuda::zeros({batch, ratio, config.head_dim}, fp32);
-                layer_state.partial_score = ::tyloi::cuda::full(
+                partial_kv = ::tyloi::cuda::zeros({batch, ratio, config.head_dim}, fp32);
+                partial_score = ::tyloi::cuda::full(
                     {batch, ratio, config.head_dim}, -std::numeric_limits<float>::infinity(), fp32);
             }
         }
+        layer_state.local_kv = std::move(local_kv);
+        layer_state.compressed_kv = std::move(compressed_kv);
+        layer_state.index_k = std::move(index_k);
+        layer_state.partial_kv = std::move(partial_kv);
+        layer_state.partial_score = std::move(partial_score);
         layer_state.position = 0;
         layer_state.compressed_length = 0;
         layer_state.partial_length = 0;
