@@ -2,6 +2,7 @@
 #include "engine/tensor.h"
 #include "engine/weights/encoding/quant/nint_rows.h"
 #include <memory>
+#include <utility>
 namespace tyloi {class NintRowCache;}
 struct NintRowSource {
     explicit NintRowSource(std::vector<std::shared_ptr<tyloi::NintRows>>);
@@ -30,7 +31,10 @@ public:
         const ::tyloi::Device& device);
     std::shared_ptr<NintRowStage> make_stage(const std::vector<int64_t>& shape,
         const ::tyloi::Device& device);
+    std::size_t stage_bytes(const std::vector<int64_t>& shape, const ::tyloi::Device& device) const;
     void upload(NintRowStage&,const std::vector<int64_t>& ids,const std::vector<int64_t>& shape);
 private:
+    std::pair<std::size_t, bool> stage_layout(const std::vector<int64_t>& shape,
+        const ::tyloi::Device& device) const;
     struct Impl;std::unique_ptr<Impl> impl_;
 };

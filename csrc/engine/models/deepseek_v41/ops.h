@@ -467,8 +467,6 @@ struct Block final {
         layer_state.speculative_pending = false;
         layer_state.prefilled_global_end = -1;
         layer_state.replay_local_window = false;
-        if (layer == 0)
-            shared.reset_session(batch);
     }
 
     bool supports_speculation() const noexcept { return true; }

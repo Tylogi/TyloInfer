@@ -301,6 +301,7 @@ class EngramTable {
         State(const State&) = delete;
         State& operator=(const State&) = delete;
         std::vector<::tyloi::Tensor> storage() const;
+        std::size_t growth(std::size_t count, const ::tyloi::Device& device) const;
 
       private:
         friend class EngramTable;

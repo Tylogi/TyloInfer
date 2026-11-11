@@ -105,7 +105,10 @@ std::int64_t prefill_span(const Model&, const State&, std::size_t tokens,
                           state.speculative_start < 0 &&
                           state.cache_pos + tokens <= model.max_position_embeddings(),
                       "invalid DeepSeek-V4.1 encoder prefill request");
-    if (state.batch != batch || state.cache_pos == 0) state.reset(batch);
+    if (state.batch != batch || state.cache_pos == 0) {
+        state.reset(batch);
+        state.allocate();
+    }
     const auto& config = model.config;
     const auto split = config.causal_encoder_layers;
     TYLOINFER_RUNTIME_CHECK(split > 0 && split < model.num_hidden_layers(), "invalid CED encoder boundary");

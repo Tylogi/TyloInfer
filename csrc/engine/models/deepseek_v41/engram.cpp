@@ -229,6 +229,32 @@ std::vector<::tyloi::Tensor> EngramTable::State::storage() const {
     return result;
 }
 
+std::size_t EngramTable::State::growth(std::size_t count, const ::tyloi::Device& device) const {
+    if (!impl_ || !count || !device.is_cuda() || device.index < 0)
+        throw std::invalid_argument("invalid DeepSeek-V4.1 Engram allocation request");
+    if (impl_->shared->tq_table) return 0;
+#if TYLOINFER_ENABLE_MFQ_COMPAT
+    if (impl_->nint_pipeline) {
+        if (impl_->nint_stage && impl_->nint_stage_rows == count &&
+            impl_->nint_stage->output().device() == device) return 0;
+        if (count > static_cast<std::size_t>(std::numeric_limits<int64_t>::max()))
+            throw std::overflow_error("DeepSeek-V4.1 Engram row count overflow");
+        return impl_->nint_pipeline->stage_bytes({static_cast<int64_t>(count)}, device);
+    }
+#endif
+    const auto rows = std::min(count, static_cast<std::size_t>(impl_->shared->rows));
+    const auto row_bytes = impl_->shared->row_bytes;
+    if (rows > (std::numeric_limits<std::size_t>::max() - 7) / row_bytes)
+        throw std::overflow_error("DeepSeek-V4.1 Engram packet is too large");
+    const auto inverse_offset = (rows * row_bytes + 7) & ~std::size_t(7);
+    if (count > (std::numeric_limits<std::size_t>::max() - inverse_offset) / sizeof(int64_t))
+        throw std::overflow_error("DeepSeek-V4.1 Engram inverse packet is too large");
+    const auto bytes = inverse_offset + count * sizeof(int64_t);
+    if (impl_->stage && impl_->stage->host.size() >= bytes && impl_->stage->packet.device() == device)
+        return 0;
+    return bytes;
+}
+
 EngramTable::EngramTable(std::shared_ptr<const Shared> shared) : shared_(std::move(shared)) {}
 EngramTable::~EngramTable() = default;
 

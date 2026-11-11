@@ -451,8 +451,10 @@ void Model::validate_forward(std::int64_t, std::int64_t tokens, std::int64_t cac
         state.speculative_start = state.cache_pos;
         state.speculative_confirmed = confirmed;
     }
-    if (state.cache_pos == 0)
+    if (state.cache_pos == 0) {
         state.reset(B);
+        state.allocate();
+    }
     auto positions = ::tyloi::cuda::arange(state.cache_pos, state.cache_pos + T,
                                            ::tyloi::TensorOptions()
                                                .device(::tyloi::kCUDA)

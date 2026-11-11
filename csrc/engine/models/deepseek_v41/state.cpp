@@ -6,6 +6,8 @@
 #include "engine/models/session/state.h"
 
 #include <algorithm>
+#include <array>
+#include <limits>
 #include <stdexcept>
 
 namespace tyloi::cuda::deepseek_v41_runtime {
@@ -116,9 +118,67 @@ void State::reset(std::int64_t next_batch) {
     speculative_confirmed = 0;
     speculative_suffix_forward = false;
     batch = next_batch;
-    for (auto& block : model_.blocks)
-        block->reset(*shared, next_batch);
+    for (auto& layer : shared->layers) layer = {};
+    shared->reset_session(next_batch);
 }
+
+void State::allocate() {
+    for (auto& block : model_.blocks) block->reset(*shared, batch);
+}
+
+#ifdef TYLOINFER_NATIVE_CUDA
+std::vector<std::pair<tyloi::Device, std::size_t>> State::growth(
+        std::int64_t tokens, const tyloi::models::ForwardOptions&) const {
+    if (batch <= 0 || tokens <= 0 || cache_pos < 0 || speculative_start >= 0 ||
+        cache_pos > std::numeric_limits<std::int64_t>::max() - tokens)
+        throw std::invalid_argument("invalid DeepSeek-V4.1 state allocation request");
+    std::vector<std::pair<tyloi::Device, std::size_t>> result;
+    const auto add = [&](tyloi::Device device, std::size_t bytes) {
+        auto entry = std::find_if(result.begin(), result.end(),
+                                  [device](const auto& item) { return item.first == device; });
+        if (entry == result.end()) result.emplace_back(device, bytes);
+        else {
+            if (entry->second > std::numeric_limits<std::size_t>::max() - bytes)
+                throw std::overflow_error("DeepSeek-V4.1 state byte count overflow");
+            entry->second += bytes;
+        }
+    };
+    for (const auto& block : model_.blocks) {
+        if (block->cuda_device < 0) throw std::invalid_argument("invalid DeepSeek-V4.1 state device");
+        const tyloi::Device device(tyloi::kCUDA, block->cuda_device);
+        if (cache_pos == 0) {
+            const auto bytes = [&](std::int64_t rows, std::int64_t width, tyloi::ScalarType dtype) {
+                if (rows <= 0 || width <= 0) throw std::invalid_argument("invalid DeepSeek-V4.1 cache dimensions");
+                const std::array<std::int64_t, 3> shape{batch, rows, width};
+                return tyloi::make_contiguous_view(nullptr, shape, dtype, device).nbytes();
+            };
+            add(device, bytes(block->config.sliding_window, block->config.head_dim, tyloi::kFloat16));
+            if (block->kv_source()) {
+                if (block->ratio <= 0 || block->max_context <= 0)
+                    throw std::invalid_argument("invalid DeepSeek-V4.1 compressed cache dimensions");
+                const auto capacity = std::max<std::int64_t>(1, block->max_context / block->ratio);
+                add(device, bytes(capacity, block->config.head_dim, tyloi::kFloat16));
+                add(device, bytes(capacity, block->config.index_head_dim, tyloi::kFloat16));
+                if (block->ratio > 1) {
+                    add(device, bytes(block->ratio, block->config.head_dim, tyloi::kFloat32));
+                    add(device, bytes(block->ratio, block->config.head_dim, tyloi::kFloat32));
+                }
+            }
+        }
+        const auto& engram = shared->engram_states.at(static_cast<std::size_t>(block->layer));
+        if (engram) {
+            const auto columns = shared->config.engram_max_ngram_size - 1;
+            const auto heads = shared->config.engram_n_heads;
+            const auto limit = std::numeric_limits<std::int64_t>::max();
+            if (columns <= 0 || heads <= 0 || batch > limit / tokens ||
+                batch * tokens > limit / columns || batch * tokens * columns > limit / heads)
+                throw std::overflow_error("DeepSeek-V4.1 Engram row count overflow");
+            add(device, engram->growth(static_cast<std::size_t>(batch * tokens * columns * heads), device));
+        }
+    }
+    return result;
+}
+#endif
 
 std::vector<::tyloi::Tensor> State::storage() const {
     std::vector<::tyloi::Tensor> result;
@@ -287,34 +347,18 @@ void State::restore_text_session_state(const TextSessionState& state) {
         Block& block=*model_.blocks[i];
         MfqCudaGuard guard(block.cuda_device);
         const auto& saved=snapshot->blocks[i];auto& target=shared->layers.at(i);
-#ifdef TYLOINFER_NATIVE_CUDA
         auto local_kv=restore_session_tensor(target.local_kv,saved.local_kv);
         target.local_kv=local_kv.defined()?local_kv.dense():DenseTensor{};
-#else
-        restore_session_tensor(target.local_kv,saved.local_kv);
-#endif
         if(block.kv_source()) {
-#ifdef TYLOINFER_NATIVE_CUDA
             target.compressed_kv=restore_session_prefix_tensor(target.compressed_kv,saved.compressed_kv,1,
                                           std::max<int64_t>(1,block.max_context/block.ratio)).dense();
             target.index_k=restore_session_prefix_tensor(target.index_k,saved.index_k,1,
                                           std::max<int64_t>(1,block.max_context/block.ratio)).dense();
-#else
-            restore_session_prefix_tensor(target.compressed_kv,saved.compressed_kv,1,
-                                          std::max<int64_t>(1,block.max_context/block.ratio));
-            restore_session_prefix_tensor(target.index_k,saved.index_k,1,
-                                          std::max<int64_t>(1,block.max_context/block.ratio));
-#endif
             if(block.ratio>1) {
-#ifdef TYLOINFER_NATIVE_CUDA
                 auto partial_kv=restore_session_tensor(target.partial_kv,saved.partial_kv);
                 target.partial_kv=partial_kv.defined()?partial_kv.dense():DenseTensor{};
                 auto partial_score=restore_session_tensor(target.partial_score,saved.partial_score);
                 target.partial_score=partial_score.defined()?partial_score.dense():DenseTensor{};
-#else
-                restore_session_tensor(target.partial_kv,saved.partial_kv);
-                restore_session_tensor(target.partial_score,saved.partial_score);
-#endif
             }
         }
         target.position=state.cache_pos;target.compressed_length=saved.compressed_length;

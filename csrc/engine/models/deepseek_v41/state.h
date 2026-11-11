@@ -28,6 +28,11 @@ public:
 
     void preallocate() override {}
     void reset(std::int64_t batch) override;
+    void allocate();
+#ifdef TYLOINFER_NATIVE_CUDA
+    std::vector<std::pair<tyloi::Device, std::size_t>> growth(
+        std::int64_t tokens, const tyloi::models::ForwardOptions&) const override;
+#endif
     std::int64_t position() const noexcept override { return cache_pos; }
     void advance(std::int64_t tokens) noexcept override { cache_pos += tokens; }
     void set_position_delta(std::int64_t delta) noexcept override { decode_position_delta = delta; }
