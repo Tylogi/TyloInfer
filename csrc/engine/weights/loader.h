@@ -14,7 +14,7 @@
 #include <string>
 #include <vector>
 
-namespace tyloi { class MfeTensor; class NintRows; }
+namespace tyloi { class MfeTensor; }
 namespace tyloi::weights { class Cache; }
 
 struct MfqDropFileCacheGuard {
@@ -31,13 +31,9 @@ struct MfqDropFileCacheGuard {
     }
 };
 
-std::shared_ptr<tyloi::NintRows> load_nint_row_table(
-    const tyloi::source::Source& source, const std::string& name, bool prefer_mapping=false);
-
 namespace tyloi::weights {
 // The source and cache owner outlive all loading, including streamed media layers.
 struct Loader {
-    using DenseTensor = ::tyloi::DenseTensor;
     struct Options {
         MoeLoadOptions quant;
         bool grouped = true;
@@ -97,7 +93,7 @@ private:
     Loader(const tyloi::source::Source& source, Options options, Placement placement,
            Cache& cache);
     friend class Cache;
-    DenseTensor host_value(const std::string& name) const;
+    ::tyloi::DenseTensor host_value(const std::string& name) const;
     std::shared_ptr<const ::tyloi::MfeTensor> build_experts(
         const std::string& name, bool cacheable, int layer, const std::string& role) const;
 };

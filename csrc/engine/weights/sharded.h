@@ -75,10 +75,15 @@ public:
                 throw std::invalid_argument("cannot record one stream for multiple devices");
         for (const auto& shard : shards) shard.weight.record_stream(stream, lifetime);
     }
-    std::shared_ptr<TensorImpl> relocated(Device) const override {
+    std::shared_ptr<TensorImpl> relocated(Device target) const override {
+        if (!target.is_cuda())
+            throw std::invalid_argument("sharded tensor relocation requires its CUDA device");
+        for (const auto& shard : shards)
+            if (shard.device != target.index)
+                throw std::invalid_argument("cannot relocate shards assigned to different devices");
         auto moved = shards;
         for (auto& shard : moved)
-            shard.weight = shard.weight.relocated(Device(kCUDA, shard.device));
+            shard.weight = shard.weight.relocated(target);
         return std::make_shared<ShardedTensor>(size(0), size(1), scalar_type(), axis, std::move(moved));
     }
 

@@ -6,6 +6,7 @@
 #include "engine/backends/cuda/ops/projection/nint.h"
 #include "engine/backends/cuda/ops/projection/quant_linear.h"
 #include "engine/weights/loader.h"
+#include "engine/weights/source/read.h"
 #include "engine/weights/group.h"
 #include "engine/weights/encoding/quant/nint_rows.h"
 #include "engine/weights/encoding/tq.h"

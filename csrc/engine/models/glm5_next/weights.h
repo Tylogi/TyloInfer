@@ -23,7 +23,7 @@ auto load_ffn(Loader &ops, const Config &c, int layer, const std::string &p, boo
     auto router = ops.weight(p + ".router.weight");
     auto shared = load_dense_ffn(ops, p + ".shared_expert", c.swiglu_limit);
 #ifdef TYLOINFER_NATIVE_CUDA
-    auto bias = std::make_shared<typename Loader::DenseTensor>(
+    auto bias = ::tyloi::Tensor(
         ops.dense(p + ".router.bias").dense()
             .to(::tyloi::kFloat32).contiguous());
 #else
@@ -131,10 +131,10 @@ bool load_predictor(Predictor &result, Loader &ops, const Config &c) {
     }
     result.config = c;
 #ifdef TYLOINFER_NATIVE_CUDA
-    result.embedding_norm = std::make_shared<typename Loader::DenseTensor>(
+    result.embedding_norm = ::tyloi::Tensor(
         ops.dense("predictor.embedding_norm.weight").dense()
             .to(::tyloi::kFloat32).contiguous());
-    result.hidden_norm = std::make_shared<typename Loader::DenseTensor>(
+    result.hidden_norm = ::tyloi::Tensor(
         ops.dense("predictor.hidden_norm.weight").dense()
             .to(::tyloi::kFloat32).contiguous());
     result.output_norm = ops.dense("predictor.output_norm.weight");
