@@ -8,6 +8,7 @@
 
 #include "engine/models/common/load.h"
 #include "engine/models/common/capabilities.h"
+#include "engine/models/load.h"
 #include "engine/models/source/model_graph.h"
 #include "engine/weights/loader.h"
 #include "engine/backends/cuda/ops/projection/projection.h"
@@ -208,6 +209,18 @@ Model read(std::shared_ptr<const tyloi::ModelSource> source,
     if (model.config.num_hidden_layers != model.graph.topology.text_layers)
         throw std::runtime_error("model graph/config text-layer topology mismatch");
     model.metadata = tyloi::models::qwen35::metadata_from_config(model.config);
+    return model;
+}
+
+std::unique_ptr<Model> load(std::shared_ptr<const tyloi::ModelSource> source,
+                            std::string_view definition, const ::tyloi::weights::Loader& weights,
+                            LayerPlacementConfig& placement, const tyloi::models::LoadOptions& options,
+                            int& cpu_layers) {
+    auto model = std::make_unique<Model>(read(std::move(source), definition, options.context));
+    load(*model, weights, placement, options.yarn, cpu_layers,
+         {.gpu_layers = options.gpu_layers, .expert_parallel = options.expert_parallel,
+          .mirror_scalars = options.mirror_scalars,
+          .recurrent_transposed = options.recurrent_transposed});
     return model;
 }
 

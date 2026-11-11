@@ -8,7 +8,10 @@
 namespace tyloi::cuda::qwen35 {
 
 tyloi::models::Info Model::info() const {
-    return tyloi::models::model_info(metadata);
+    auto result = tyloi::models::model_info(metadata);
+    for (const auto& layer : layers)
+        if (layer.device.is_cpu()) result.decode_graph = false;
+    return result;
 }
 
 MfqModelCapabilities Model::capabilities() const {

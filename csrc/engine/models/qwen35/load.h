@@ -15,6 +15,7 @@
 struct LayerPlacementConfig;
 struct TransformerWeightLoader;
 namespace tyloi::weights { struct Loader; }
+namespace tyloi::models { struct LoadOptions; }
 
 namespace tyloi::cuda::qwen35 {
 
@@ -29,6 +30,10 @@ struct LoadOptions {
 
 Model read(std::shared_ptr<const tyloi::ModelSource> source,
            std::string_view definition, std::int64_t context);
+std::unique_ptr<Model> load(std::shared_ptr<const tyloi::ModelSource> source,
+                            std::string_view definition, const ::tyloi::weights::Loader& weights,
+                            LayerPlacementConfig& placement, const tyloi::models::LoadOptions& options,
+                            int& cpu_layers);
 void load(Model& model, const ::tyloi::weights::Loader& weights,
           LayerPlacementConfig& placement, const tyloi::ops::YarnScaling& yarn,
           int& cpu_layers, const LoadOptions& options);

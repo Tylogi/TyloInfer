@@ -13,6 +13,7 @@
 #include "engine/models/source/model_config.h"
 #include "engine/models/source/model_graph.h"
 #include "engine/models/qwen35/load.h"
+#include "engine/models/load.h"
 #include "engine/models/glm_dsa/load.h"
 #include "engine/models/glm_dsa/state.h"
 #include "engine/models/deepseek_v4/load.h"
@@ -118,15 +119,16 @@ inline constexpr auto with_model = []<typename F>(
                 auto definition = tyloi::models::config_json(*source, options.config_path);
                 definition = configure_yarn(execution.config.yarn, execution.config.yarn_context_extension,
                     std::move(definition), tyloi::models::graph(*source).backbone, options.context_size);
-                owner = std::make_shared<qwen35::Model>(qwen35::read(source, definition, options.context_size));
-                qwen35::load(
-                    *owner, weights, execution.config.layer_placement, execution.config.yarn,
-                    execution.config.dense_cpu_layer_count,
-                    tyloi::cuda::qwen35::LoadOptions{
+                owner = qwen35::load(
+                    source, definition, weights, execution.config.layer_placement,
+                    tyloi::models::LoadOptions{
+                        .context = options.context_size,
                         .gpu_layers = execution.config.n_gpu_layers,
                         .expert_parallel = execution.config.expert_parallel.enabled(),
+                        .recurrent_transposed = execution.executor().mode().transposed,
                         .mirror_scalars = execution.config.tensor_parallel_mirror_linear_attention_scalars,
-                        .recurrent_transposed = execution.executor().mode().transposed});
+                        .yarn = execution.config.yarn},
+                    execution.config.dense_cpu_layer_count);
                 state = std::make_unique<qwen35::State>(*owner, execution.executor().mode().transposed);
                 if (preallocate) state->preallocate();
                 auto components = qwen35::Components::load(

@@ -151,7 +151,11 @@ std::unique_ptr<engine::Engine> load_native_engine(CudaEngineOptions options, en
                 load.dense_cpu_layer_count = 0;
                 model = models::load(source, definition, loader, load.layer_placement,
                     {.context = options.context_size, .gpu_layers = load.n_gpu_layers,
-                     .expert_parallel = load.expert_parallel.enabled(), .yarn = load.yarn});
+                     .expert_parallel = load.expert_parallel.enabled(),
+                     .recurrent_transposed = root->mode().transposed,
+                     .vision_resident = ::tyloi::cuda::options::vision_resident(),
+                     .mirror_scalars = load.tensor_parallel_mirror_linear_attention_scalars,
+                     .yarn = load.yarn});
                 state = model->make_state();
                 finalize_kv(kv.get(), *weights, offload);
                 std::size_t pending_kv = 0;

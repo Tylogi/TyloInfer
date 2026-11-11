@@ -24,13 +24,9 @@ std::unique_ptr<CausalModel> load(
             options.gpu_layers, options.expert_parallel);
     }
     if (model_graph.backbone == "qwen3_5" || model_graph.backbone == "generic_qwen") {
-        auto model = std::make_unique<::tyloi::cuda::qwen35::Model>(
-            ::tyloi::cuda::qwen35::read(std::move(source), definition, options.context));
         int cpu_layers = 0;
-        ::tyloi::cuda::qwen35::load(*model, weights, placement, options.yarn, cpu_layers,
-            {.gpu_layers = options.gpu_layers, .expert_parallel = options.expert_parallel,
-             .mirror_scalars = options.mirror_scalars,
-             .recurrent_transposed = options.recurrent_transposed});
+        auto model = ::tyloi::cuda::qwen35::load(
+            std::move(source), definition, weights, placement, options, cpu_layers);
         ::tyloi::cuda::qwen35::load_vision(*model, weights, options.vision_resident);
         return model;
     }
