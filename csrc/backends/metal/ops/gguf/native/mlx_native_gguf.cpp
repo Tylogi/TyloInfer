@@ -39,6 +39,8 @@ array row_major_view(const array& input) {
 }
 
 const char* source_for(const std::string& name) {
+    if (name.starts_with("dense_gguf_gate_up_pair")) return native_gguf::dense_pair_source;
+    if (name.starts_with("dense_gguf_gate_up")) return native_gguf::dense_source;
     if (name.starts_with("hyper_connection")) return native_gguf::hyper_source;
     if (name == "gguf_repack" || name == "moe_expert_load") return native_gguf::repack_source;
     if (name.starts_with("gguf_decode_sg_") || name == "decode_linear_gguf_prepare" || name.starts_with("moe_expert_gguf_sg"))
@@ -132,7 +134,8 @@ struct Graph {
         if (!commands.command().events.empty()) throw std::invalid_argument("native GGUF graph contains unsupported host/event steps");
         for (const auto& dispatch : commands.dispatches()) {
             std::vector<std::uint32_t> formats;
-            if (dispatch.pipelineName == "moe_native_single_gate_up" || dispatch.pipelineName == "moe_native_single_gate_up_split") {
+            if (dispatch.pipelineName == "moe_native_single_gate_up" || dispatch.pipelineName == "moe_native_single_gate_up_split" ||
+                dispatch.pipelineName == "moe_native_single_gate_up_split4") {
                 if (dispatch.bytes.size() != 1 || dispatch.bytes.front().sizeBytes != sizeof(MoeGgufGateUpParams))
                     throw std::invalid_argument("native GGUF Gate/Up parameters differ");
                 MoeGgufGateUpParams p;
@@ -584,22 +587,26 @@ MlxNativeGgufWeight mlx_native_affine_pack(const array& values, const array& sca
     return result;
 }
 
-std::vector<array> mlx_native_gguf_project(std::span<const MlxNativeGgufWeight> weights, const array& input) {
+std::vector<array> mlx_native_gguf_project(std::span<const MlxNativeGgufWeight> weights, const array& input,
+    std::optional<Dtype> output_dtype) {
     if (weights.empty() || input.ndim() < 1) throw std::invalid_argument("native GGUF projection requires matrices");
+    const auto result_dtype = output_dtype.value_or(input.dtype());
+    if (result_dtype != float16 && result_dtype != bfloat16 && result_dtype != float32)
+        throw std::invalid_argument("native GGUF output dtype must be floating point");
     if (weights.size() > 3) {
-        auto first = mlx_native_gguf_project(weights.first(3), input);
-        auto rest = mlx_native_gguf_project(weights.subspan(3), input);
+        auto first = mlx_native_gguf_project(weights.first(3), input, result_dtype);
+        auto rest = mlx_native_gguf_project(weights.subspan(3), input, result_dtype);
         first.insert(first.end(), rest.begin(), rest.end());
         return first;
     }
     const int width = weights.front().width, count = int(input.size() / width);
     if (input.shape(-1) != width || count < 1)
         throw std::invalid_argument("native GGUF projection input shape differs");
-    if (count > SPLASH_PREFILL_TOKEN_BUDGET && input.dtype() == float32) {
+    if (count > SPLASH_PREFILL_TOKEN_BUDGET && result_dtype == float32) {
         const auto flat = reshape(input, {count, width});
         std::vector<std::vector<array>> chunks(weights.size());
         for (int begin = 0; begin < count; begin += SPLASH_PREFILL_TOKEN_BUDGET) {
-            auto part = mlx_native_gguf_project(weights, slice(flat, {begin, 0}, {std::min(count, begin + int(SPLASH_PREFILL_TOKEN_BUDGET)), width}));
+            auto part = mlx_native_gguf_project(weights, slice(flat, {begin, 0}, {std::min(count, begin + int(SPLASH_PREFILL_TOKEN_BUDGET)), width}), result_dtype);
             for (std::size_t i = 0; i < part.size(); ++i) chunks[i].push_back(std::move(part[i]));
         }
         std::vector<array> result;
@@ -617,15 +624,18 @@ std::vector<array> mlx_native_gguf_project(std::span<const MlxNativeGgufWeight> 
         if (weight.width != width) throw std::invalid_argument("native GGUF projections have different inputs");
         inputs.insert(inputs.end(), weight.planes.begin(), weight.planes.end()); total += weight.storage_outputs();
     }
-    const auto output_type = input.dtype() == float32 && count <= 32 && weights.size() == 1 ? float32 : bfloat16;
+    const auto output_type = result_dtype == float32 && count <= 32 && weights.size() == 1 ? float32 : bfloat16;
     const int gpu_cores = count <= 4 ? std::max(1, metal_apple_gpu_core_count()) : 1;
     const bool vector_decode = count == 1 && total / 64 <= gpu_cores * 8 &&
-        std::none_of(weights.begin(), weights.end(), [gpu_cores](const auto& weight) {
+        std::none_of(weights.begin(), weights.end(), [gpu_cores, total](const auto& weight) {
             return weight.format == GGUF_FMT_IQ4XS && weight.width >= 4096 && weight.width > weight.outputs &&
-                weight.storage_outputs() / 64 * 8 < gpu_cores * 6;
+                total / 64 * 8 < gpu_cores * 6;
         });
     const bool small_decode = count >= 2 && count <= 4 && total / 64 <= gpu_cores * 8 &&
-        std::none_of(weights.begin(), weights.end(), [](const auto& weight) { return quant_affine_format(weight.format); });
+        std::none_of(weights.begin(), weights.end(), [](const auto& weight) { return quant_affine_format(weight.format); }) &&
+        !(count > 2 && (width > total || total / 64 >= gpu_cores) &&
+            std::all_of(weights.begin(), weights.end(), [](const auto& weight) { return weight.format >= 0; }) &&
+            capabilities().appleGpuFamily >= 10);
     auto key = graph_key(1, requested, weights); key.push_back(output_type == float32);
     key.push_back(vector_decode); key.push_back(small_decode ? count : 0);
     auto graph = cached_graph(std::move(key), count <= 32, [&] {
@@ -635,7 +645,7 @@ std::vector<array> mlx_native_gguf_project(std::span<const MlxNativeGgufWeight> 
             result->rows = count;
             GgufDecodeFusedParams params{};
             params.input_size = width; params.out_stride = total; params.splits = 1;
-            const auto target = gpu_cores * 6;
+            const auto target = gpu_cores * (width >= 4096 && width < total ? 48 : 6);
             while (params.splits < 8 && total / 64 * params.splits < target &&
                 width / 32 % (params.splits * 2) == 0 && width / 32 / (params.splits * 2) >= 8)
                 params.splits *= 2;
@@ -695,16 +705,18 @@ std::vector<array> mlx_native_gguf_project(std::span<const MlxNativeGgufWeight> 
     if (rows > count) inputs[0] = concatenate({inputs[0], zeros({rows - count, width}, bfloat16)}, 0);
     std::vector<array> result;
     auto all = execute(graph, std::move(inputs), {rows, total}, output_type);
+    if (rows == 1 && weights.size() > 1) all = astype(all, result_dtype);
     int begin = 0;
     for (const auto& weight : weights) {
         auto block = slice(all, {0, begin}, {count, begin + weight.outputs});
         auto shape = input.shape(); shape.back() = weight.outputs;
-        result.push_back(reshape(astype(block, input.dtype()), shape)); begin += weight.storage_outputs();
+        result.push_back(reshape(astype(block, result_dtype), shape)); begin += weight.storage_outputs();
     }
     return result;
 }
 
-array mlx_native_gguf_swiglu(const MlxNativeGgufWeight& gate, const MlxNativeGgufWeight& up, const array& input) {
+static array native_gguf_swiglu_impl(const MlxNativeGgufWeight& gate, const MlxNativeGgufWeight& up,
+    const array& input, bool bfloat_intermediate, std::optional<Dtype> activation_dtype = std::nullopt) {
     if (gate.width != up.width || gate.outputs != up.outputs || input.ndim() < 2 || input.shape(-1) != gate.width)
         throw std::invalid_argument("native GGUF Gate/Up shapes differ");
     const int width = gate.width, count = int(input.size() / width), output = gate.storage_outputs();
@@ -725,7 +737,37 @@ array mlx_native_gguf_swiglu(const MlxNativeGgufWeight& gate, const MlxNativeGgu
     const bool decode = count <= 32;
     const int requested = decode ? (count + 7) / 8 * 8 : count;
     const std::array weights{gate, up};
-    auto graph = cached_graph(graph_key(2, requested, weights), decode, [&] {
+    const bool column_decode = count <= 2 && output >= width && gate.format >= 0 && up.format >= 0 &&
+        gate.format < GGUF_FMT_COUNT && up.format < GGUF_FMT_COUNT &&
+        !quant_affine_format(gate.format) && !quant_affine_format(up.format);
+    const auto dtype = activation_dtype.value_or(input.dtype());
+    const bool round_fp16 = bfloat_intermediate && column_decode && dtype == float16;
+    auto key = graph_key(2, requested, weights); key.push_back(column_decode ? count : 0); key.push_back(round_fp16);
+    auto graph = cached_graph(std::move(key), decode, [&] {
+        if (column_decode) {
+            auto result = std::make_shared<Graph>(); result->inputs = inputs.size(); result->pooled = true; result->rows = count;
+            std::vector<MetalBuffer> buffers{{0, uint64_t(count) * width * 2}};
+            for (const auto offset : {1, 4})
+                for (int plane = 0; plane < 3; ++plane)
+                    buffers.push_back({std::size_t(offset + plane), weights[offset == 1 ? 0 : 1].planes[plane].nbytes()});
+            buffers.push_back({result->inputs, uint64_t(count) * output * 2});
+            const int target = width >= 4096 ? 4 : 1;
+            int splits = 1;
+            while (splits < target && width / 32 % (2 * splits) == 0 && width / 32 / (2 * splits) >= 8)
+                splits *= 2;
+            const auto compact_format = [](int format) {
+                return format == GGUF_FMT_IQ2XXS || format == GGUF_FMT_IQ2XS || format == GGUF_FMT_IQ2S ||
+                    format == GGUF_FMT_IQ3XXS || format == GGUF_FMT_IQ3S;
+            };
+            const auto kernel = std::string(count == 2 ? "dense_gguf_gate_up_pair" : "dense_gguf_gate_up") +
+                (compact_format(gate.format) && compact_format(up.format) ? "_grid" : "") +
+                (splits == 4 ? "_split4" : splits == 2 ? "_split" : "");
+            struct DenseGateUpParams { uint32_t input_size, output_size, gate_format, up_format, round_fp16; };
+            result->commands.add(kernel, std::move(buffers),
+                DenseGateUpParams{uint32_t(width), uint32_t(output), uint32_t(gate.format), uint32_t(up.format), uint32_t(round_fp16)},
+                {uint32_t(output / (32 / splits)), 1, 1}, {64, 1, 1});
+            return result;
+        }
         Linear linear(capabilities());
         auto result = std::make_shared<Graph>(); result->inputs = 7; result->pooled = decode;
         std::vector<Projection> projections;
@@ -753,7 +795,18 @@ array mlx_native_gguf_swiglu(const MlxNativeGgufWeight& gate, const MlxNativeGgu
     if (rows > count) inputs[0] = concatenate({inputs[0], zeros({rows - count, width}, bfloat16)}, 0);
     auto all = execute(graph, std::move(inputs), {rows, output}, bfloat16);
     auto shape = input.shape(); shape.back() = gate.outputs;
-    return reshape(astype(slice(all, {0, 0}, {count, gate.outputs}), input.dtype()), shape);
+    return reshape(astype(slice(all, {0, 0}, {count, gate.outputs}), round_fp16 ? bfloat16 : dtype), shape);
+}
+
+array mlx_native_gguf_swiglu(const MlxNativeGgufWeight& gate, const MlxNativeGgufWeight& up, const array& input) {
+    return native_gguf_swiglu_impl(gate, up, input, false);
+}
+
+array mlx_native_gguf_ffn(const MlxNativeGgufWeight& gate, const MlxNativeGgufWeight& up,
+    const MlxNativeGgufWeight& down, const array& input, std::optional<Dtype> activation_dtype) {
+    if (down.width != gate.outputs) throw std::invalid_argument("native GGUF FFN intermediate width differs");
+    const auto middle = native_gguf_swiglu_impl(gate, up, input, true, activation_dtype);
+    return astype(mlx_native_gguf_project(std::span(&down, 1), middle)[0], activation_dtype.value_or(input.dtype()));
 }
 
 array mlx_native_gguf_moe(const MlxNativeGgufMoe& weights, const array& input) {
@@ -777,21 +830,13 @@ array mlx_native_gguf_moe(const MlxNativeGgufMoe& weights, const array& input) {
         std::none_of(weights.routed.begin(), weights.routed.end(),
             [](const auto& weight) { return quant_affine_format(weight.format); });
     const int intermediate = weights.routed[0].outputs, experts = weights.routed[0].experts;
-    const int rows = single || pair ? actual : actual <= 32 ? (actual + 7) / 8 * 8 : actual;
+    const int rows = actual;
     auto x = reshape(row_major_view(astype(input, bfloat16)), {actual, width});
-    if (rows > actual) x = concatenate({x, zeros({rows - actual, width}, bfloat16)}, 0);
     std::vector<array> inputs{x, weights.router, weights.scalar_gate, weights.slots};
-    inputs.reserve(23);
+    inputs.reserve(22);
     for (int i = 0; i < 3; ++i) {
         for (const auto* weight : {&weights.routed[i], &weights.shared[i]})
             inputs.insert(inputs.end(), weight->planes.begin(), weight->planes.end());
-    }
-    MetalBuffer verify;
-    if (actual <= 32 && !single && !pair) {
-        std::vector<uint32_t> valid(rows / 8);
-        for (int i = 0; i < int(valid.size()); ++i) valid[i] = std::min(8, actual - i * 8);
-        verify = {inputs.size(), valid.size() * sizeof(uint32_t)};
-        inputs.emplace_back(valid.begin(), Shape{int(valid.size())}, uint32);
     }
     auto key = graph_key(4, rows, weights.routed);
     const auto shared_key = graph_key(4, rows, weights.shared);
@@ -848,24 +893,34 @@ array mlx_native_gguf_moe(const MlxNativeGgufMoe& weights, const array& input) {
                 return format == GGUF_FMT_IQ2XXS || format == GGUF_FMT_IQ2XS || format == GGUF_FMT_IQ2S ||
                     format == GGUF_FMT_IQ3XXS || format == GGUF_FMT_IQ3S;
             };
+            const int gate_format = weights.routed[0].format, up_format = weights.routed[1].format;
+            const bool split_formats = grid_format(gate_format) || grid_format(up_format) ||
+                (gate_format != up_format && (gate_format == GGUF_FMT_IQ4XS || up_format == GGUF_FMT_IQ4XS));
             if (pair) {
                 struct PairGateUpParams { MoeGgufGateUpParams projection; uint32_t routes; };
                 static_assert(sizeof(PairGateUpParams) == 8 * sizeof(uint32_t));
-                const bool split_gate_up = width >= 1024 && intermediate < width &&
-                    grid_format(weights.routed[0].format) && grid_format(weights.routed[1].format);
+                const bool split_gate_up = width >= 1024 && intermediate < width && split_formats;
                 result->commands.add(split_gate_up ? "moe_native_pair_gate_up_split" : "moe_native_pair_gate_up", std::move(upper),
                     PairGateUpParams{{uint32_t(width), uint32_t(intermediate), uint32_t(experts),
                         block.gate.routed.formatId, block.gate.shared.formatId, block.up.routed.formatId, block.up.shared.formatId}, uint32_t(routes)},
                     {uint32_t(intermediate / (split_gate_up ? 16 : 32)), uint32_t(2 * routes), uint32_t(actual / 2)}, {64, 1, 1});
             } else {
+                const auto low_bit = [&](int format) {
+                    return format == GGUF_FMT_Q2K || format == GGUF_FMT_Q3K || grid_format(format);
+                };
+                const auto cores = metal_apple_gpu_core_count();
+                const auto tiles = std::uint64_t(intermediate / 32) * routes;
+                const bool low_pair = gate_format != GGUF_FMT_IQ3S && up_format != GGUF_FMT_IQ3S &&
+                    low_bit(gate_format) && low_bit(up_format);
                 const bool split_gate_up = !vector && width >= 1024 && intermediate < width &&
-                    grid_format(weights.routed[0].format) && grid_format(weights.routed[1].format) &&
-                    std::uint64_t(intermediate / 32) * routes <= std::uint64_t(metal_apple_gpu_core_count()) * 8;
+                    ((grid_format(gate_format) && grid_format(up_format)) || low_pair) && cores > 0 && tiles <= std::uint64_t(cores) * 8;
+                const int splits = split_gate_up ? (low_pair && tiles <= std::uint64_t(cores) * 4 ? 4 : 2) : 1;
                 result->commands.add(vector ? "moe_affine_vector_gate_up" : split_gate_up
-                        ? "moe_native_single_gate_up_split" : "moe_native_single_gate_up", std::move(upper),
+                        ? splits == 4 ? "moe_native_single_gate_up_split4" : "moe_native_single_gate_up_split"
+                        : "moe_native_single_gate_up", std::move(upper),
                     MoeGgufGateUpParams{uint32_t(width), uint32_t(intermediate), uint32_t(experts),
                         block.gate.routed.formatId, block.gate.shared.formatId, block.up.routed.formatId, block.up.shared.formatId},
-                    {uint32_t(intermediate / (vector && width <= intermediate ? 64 : split_gate_up ? 16 : 32)), uint32_t(routes), 1},
+                    {uint32_t(intermediate / (vector && width <= intermediate ? 64 : 32 / splits)), uint32_t(routes), 1},
                     {uint32_t(vector ? 256 : 64), 1, 1});
             }
             const auto values = fields(block.down);
@@ -892,17 +947,17 @@ array mlx_native_gguf_moe(const MlxNativeGgufMoe& weights, const array& input) {
                 MoeCombineParams{1, uint32_t(width), uint32_t(routes)}, {uint32_t((width + 255) / 256), 1, 1}, {256, 1, 1});
             return result;
         }
-        const auto plan = actual <= 32 ? MoE::decodePlan(shape, rows / 8, configuration) : MoE::prefillPlan(shape, rows, configuration);
+        const auto plan = actual <= 32 ? MoE::decodeRowsPlan(shape, rows, configuration) : MoE::prefillPlan(shape, rows, configuration);
         MoeScratch work;
         for (const auto& field : kMoeScratchFields)
             work.*field.buffer = result->temporary(plan.workspace().*field.bytes, field.buffer == &MoeScratch::routeRows);
         const auto residual = result->temporary(std::size_t(rows) * width * 2, true);
         MoE::add(result->commands, {.input = {0, x.nbytes()}, .residual = residual,
-            .output = {result->inputs, std::uint64_t(rows) * width * 2}, .scratch = work, .verifyRows = verify}, block, plan);
+            .output = {result->inputs, std::uint64_t(rows) * width * 2}, .scratch = work}, block, plan);
         return result;
     });
     auto result = execute(graph, std::move(inputs), {rows, width}, bfloat16);
-    return reshape(astype(slice(result, {0, 0}, {actual, width}), input.dtype()), input.shape());
+    return reshape(astype(result, input.dtype()), input.shape());
 }
 
 }

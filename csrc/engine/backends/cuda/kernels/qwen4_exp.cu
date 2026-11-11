@@ -1,6 +1,9 @@
-#include "env.h"
+#include "engine/backends/cuda/native/env.h"
+#include <cub/block/block_scan.cuh>
+#include <math_constants.h>
 #include "qwen4_exp.h"
 #include "mfq_cuda_norm_ops.h"
+#include "engine/backends/cuda/kernels/kernel_dispatch_trace.h"
 
 #include "selected_attention.h"
 
@@ -8,6 +11,9 @@
 #include <cstdlib>
 #include <limits>
 #include <type_traits>
+#include <atomic>
+#include <cstdio>
+#include <algorithm>
 #include <cub/block/block_radix_sort.cuh>
 
 namespace mfq_qwen4_exp {
@@ -147,24 +153,26 @@ __global__ void gated_residual_mix_kernel(const Gate* projection,const Value* no
         output[i]=static_cast<Output>(sum/streams);
     }
 }
-template<class Value>
-__global__ void gated_residual_post_kernel(const Value* branch,const Value* residual,
-    const Value* injection,Value* output,int64_t count,int hidden,int streams) {
-    for(int64_t i=int64_t(blockIdx.x)*blockDim.x+threadIdx.x;i<count;i+=int64_t(gridDim.x)*blockDim.x) {
-        const int64_t sample=i/(int64_t(hidden)*streams);
-        const int stream=int((i/hidden)%streams);
-        const Value update=static_cast<Value>(__fmul_rn(static_cast<float>(branch[sample*hidden+i%hidden]),
-            static_cast<float>(injection[sample*streams+stream])));
-        output[i]=static_cast<Value>(__fadd_rn(static_cast<float>(residual[i]),static_cast<float>(update)));
-    }
-}
-
 template<class Branch,class Residual,class Injection>
 using ResidualUpdate=std::conditional_t<std::is_same_v<Branch,float> ||
     std::is_same_v<Injection,float>,float,mfq_half>;
 template<class Branch,class Residual,class Injection>
 using ResidualOutput=std::conditional_t<std::is_same_v<Residual,float> ||
     std::is_same_v<ResidualUpdate<Branch,Residual,Injection>,float>,float,mfq_half>;
+
+template<class Branch,class Residual,class Injection>
+__global__ void gated_residual_post_kernel(const Branch* branch,const Residual* residual,
+    const Injection* injection,ResidualOutput<Branch,Residual,Injection>* output,int64_t count,int hidden,int streams) {
+    using Update=ResidualUpdate<Branch,Residual,Injection>;
+    using Output=ResidualOutput<Branch,Residual,Injection>;
+    for(int64_t i=int64_t(blockIdx.x)*blockDim.x+threadIdx.x;i<count;i+=int64_t(gridDim.x)*blockDim.x) {
+        const int64_t sample=i/(int64_t(hidden)*streams);
+        const int stream=int((i/hidden)%streams);
+        const Update update=static_cast<Update>(__fmul_rn(static_cast<float>(branch[sample*hidden+i%hidden]),
+            static_cast<float>(injection[sample*streams+stream])));
+        output[i]=static_cast<Output>(__fadd_rn(static_cast<float>(residual[i]),static_cast<float>(update)));
+    }
+}
 
 template<class Branch,class Residual,class Injection>
 __global__ void gated_residual_post_norm_kernel(const Branch* branch,const Residual* residual,
@@ -290,6 +298,59 @@ std::vector<DenseTensor> gated_residual_pre(
     return {mixed, input, injection};
 }
 
+bool try_gated_residual_post_out(const DenseTensor& branch,const DenseTensor& residual,
+        const DenseTensor& injection,const DenseTensor& output,int64_t streams) {
+    const auto supported=[](const DenseTensor& t){return t.defined() && t.is_cuda() && t.is_contiguous() &&
+        (t.scalar_type()==::tyloi::kFloat16 || t.scalar_type()==::tyloi::kFloat32);};
+    if(streams<1 || streams>INT_MAX || !supported(branch) || !supported(residual) || !supported(injection) ||
+            !supported(output) || branch.device()!=residual.device() || injection.device()!=residual.device() ||
+            output.device()!=residual.device() || branch.dim()<1 || branch.size(-1)<1 || branch.size(-1)>INT_MAX ||
+            branch.dim()!=residual.dim() || branch.dim()!=injection.dim() || output.sizes()!=residual.sizes())return false;
+    auto shape=branch.sizes().vec();shape.back()*=streams;
+    if(shape!=residual.sizes().vec())return false;
+    shape.back()=streams;if(shape!=injection.sizes().vec())return false;
+    const int mode=(branch.scalar_type()==::tyloi::kFloat32?4:0) |
+        (residual.scalar_type()==::tyloi::kFloat32?2:0) | (injection.scalar_type()==::tyloi::kFloat32?1:0);
+    if(output.scalar_type()!=(mode?::tyloi::kFloat32: ::tyloi::kFloat16))return false;
+    if(!output.numel())return true;
+    const auto overlap=[](const DenseTensor& a,const DenseTensor& b) {
+        const auto x=reinterpret_cast<std::uintptr_t>(a.data_ptr()),y=reinterpret_cast<std::uintptr_t>(b.data_ptr());
+        return x<=y?y-x<a.nbytes():x-y<b.nbytes();
+    };
+    if(overlap(output,branch) || overlap(output,injection) ||
+            (overlap(output,residual) && output.data_ptr()!=residual.data_ptr()))return false;
+    const MfqCudaGuard guard(residual.device());
+    const auto count=output.numel();const int blocks=int((count+255)/256),hidden=int(branch.size(-1));
+    const auto stream=mfq_current_cuda_stream();
+    const auto launch=[&](auto b,auto r,auto i) {
+        using Branch=decltype(b);using Residual=decltype(r);using Injection=decltype(i);
+        using Output=ResidualOutput<Branch,Residual,Injection>;
+        gated_residual_post_kernel<Branch,Residual,Injection><<<blocks,256,0,stream>>>(branch.data_ptr<Branch>(),
+            residual.data_ptr<Residual>(),injection.data_ptr<Injection>(),output.data_ptr<Output>(),count,hidden,int(streams));
+        if(tyloi::cuda::dispatch_trace::enabled())tyloi::cuda::dispatch_trace::record(stream,"gr_residual_post",
+            reinterpret_cast<const void*>(gated_residual_post_kernel<Branch,Residual,Injection>),
+            "M="+std::to_string(branch.numel()/hidden)+" hidden="+std::to_string(hidden)+" streams="+std::to_string(streams)+
+            " type_flags="+std::to_string(mode)+" inplace="+std::to_string(output.data_ptr()==residual.data_ptr()));
+    };
+    const auto residual_type=[&](auto b,auto i) {
+        if(residual.scalar_type()==::tyloi::kFloat16)launch(b,mfq_half{},i);else launch(b,float{},i);
+    };
+    const auto injection_type=[&](auto b) {
+        if(injection.scalar_type()==::tyloi::kFloat16)residual_type(b,mfq_half{});else residual_type(b,float{});
+    };
+    if(branch.scalar_type()==::tyloi::kFloat16)injection_type(mfq_half{});else injection_type(float{});
+    TYLOINFER_CUDA_KERNEL_LAUNCH_CHECK();
+    for(const auto& t:{branch,residual,injection,output})t.record_stream(reinterpret_cast<std::uintptr_t>(stream));
+    if(const auto* trace=tyloi::cuda::env_lookup("TYLOINFER_TRACE_KERNEL_DISPATCH");trace && trace[0]=='1' && branch.numel()/hidden>32) {
+        static std::atomic<unsigned> reported{0};
+        const bool inplace=output.data_ptr()==residual.data_ptr();const unsigned bit=inplace?1:2;
+        if(!(reported.fetch_or(bit,std::memory_order_relaxed)&bit))std::fprintf(stderr,
+            "native_gr_prefill_post actual_match=1 M=%lld hidden=%d streams=%lld type_flags=%d inplace=%d\n",
+            static_cast<long long>(branch.numel()/hidden),hidden,static_cast<long long>(streams),mode,int(inplace));
+    }
+    return true;
+}
+
 DenseTensor gated_residual_post(const DenseTensor& branch, const DenseTensor& residual,
                            const DenseTensor& injection, int64_t streams) {
     mfq_selected_attention::values({&branch, &residual, &injection});
@@ -301,17 +362,13 @@ DenseTensor gated_residual_post(const DenseTensor& branch, const DenseTensor& re
     shape.back() = streams;
     TYLOINFER_RUNTIME_CHECK(injection.sizes().vec() == shape, "Qwen4 injection shape disagrees");
     MfqCudaGuard guard(branch.device());
+    const auto value=[](const DenseTensor& t){return t.scalar_type()==::tyloi::kFloat16 || t.scalar_type()==::tyloi::kFloat32;};
     if(branch.is_contiguous() && residual.is_contiguous() && injection.is_contiguous() &&
-        branch.scalar_type()==residual.scalar_type() && branch.scalar_type()==injection.scalar_type() &&
-        (branch.scalar_type()==::tyloi::kFloat16 || branch.scalar_type()==::tyloi::kFloat32)) {
-        auto output=::tyloi::cuda::empty_like(residual);const auto count=output.numel();
-        if(count==0)return output;
-        const int blocks=int((count+255)/256),hidden=int(branch.size(-1));
-        if(branch.scalar_type()==::tyloi::kFloat16)
-            gated_residual_post_kernel<<<blocks,256,0,mfq_current_cuda_stream()>>>(branch.data_ptr<mfq_half>(),residual.data_ptr<mfq_half>(),injection.data_ptr<mfq_half>(),output.data_ptr<mfq_half>(),count,hidden,int(streams));
-        else
-            gated_residual_post_kernel<<<blocks,256,0,mfq_current_cuda_stream()>>>(branch.data_ptr<float>(),residual.data_ptr<float>(),injection.data_ptr<float>(),output.data_ptr<float>(),count,hidden,int(streams));
-        return output;
+            value(branch) && value(residual) && value(injection)) {
+        const auto dtype=branch.scalar_type()==::tyloi::kFloat32 || residual.scalar_type()==::tyloi::kFloat32 ||
+            injection.scalar_type()==::tyloi::kFloat32?::tyloi::kFloat32: ::tyloi::kFloat16;
+        auto output=::tyloi::cuda::empty(residual.sizes(),residual.options().dtype(dtype));
+        if(try_gated_residual_post_out(branch,residual,injection,output,streams))return output;
     }
     return residual + (branch.unsqueeze(-2) * injection.unsqueeze(-1)).reshape(residual.sizes());
 }
@@ -432,84 +489,213 @@ DenseTensor live_block_scores(const DenseTensor& query,const DenseTensor& pooled
 }
 
 namespace {
+__device__ void emit_selected_blocks(const int64_t* ids,int32_t* selected,int64_t position,
+        int pool,int count,int budget,int row) {
+    const int slots=(budget+2*pool-2)/pool;
+    const uint32_t full=pool==32?0xffffffffu:(1u<<pool)-1;
+    for(int slot=threadIdx.x;slot<slots;slot+=blockDim.x) {
+        int64_t id=-1;uint32_t mask=0;
+        if(position+1<=budget) {
+            const int64_t live=position+1-int64_t(slot)*pool;
+            if(live>0){id=slot;mask=live>=pool?full:(1u<<int(live))-1;}
+        }else if(slot<count) {
+            const auto block=ids[slot];
+            if(block*pool+pool-1<=position){id=block;mask=full;}
+        }else if(slot==budget/pool) {
+            const int tail=int((position+1)%pool);
+            if(tail){id=(position+1)/pool;mask=(1u<<tail)-1;}
+        }
+        const auto at=(int64_t(row)*slots+slot)*2;
+        selected[at]=int32_t(id);selected[at+1]=int32_t(mask);
+    }
+}
+__global__ void selected_blocks_from_ids(const int64_t* ids,const int64_t* positions,int32_t* selected,
+        int pool,int count,int budget) {
+    const int row=blockIdx.x;
+    emit_selected_blocks(ids+int64_t(row)*count,selected,positions[row],pool,count,budget,row);
+}
+#include "qsa_topk_threshold.cuh"
+
 template<int Items>
 __device__ void live_topk_sort(const float* source,const int64_t* ids,float* output,int64_t* out_ids,
-        int row,int columns,int begin,int live,int pools,int count,int64_t out,unsigned char* temporary) {
-    using Sort=cub::BlockRadixSort<float,256,Items,int64_t>;
-    float keys[Items];int64_t indices[Items];
+        int row,int columns,int begin,int live,int pools,int count,int64_t out,unsigned char* temporary,bool emit_tokens) {
+    // Candidate columns are already bounded by INT_MAX at the public API.
+    // Keep CUB's internal values compact; widen only when publishing IDs.
+    using Sort=cub::BlockRadixSort<float,256,Items,int32_t>;
+    float keys[Items];int32_t indices[Items];
 #pragma unroll
     for(int i=0;i<Items;++i) {
         const int column=begin+threadIdx.x*Items+i;
         const auto at=int64_t(row)*columns+column;
-        keys[i]=column<live?source[at]:-1e30f;
-        indices[i]=column<live?(ids?ids[at]:column):pools;
+        keys[i]=column<live?source[at]:-CUDART_INF_F;
+        indices[i]=column<live?int32_t(ids?ids[at]:column):pools;
     }
     Sort(*reinterpret_cast<typename Sort::TempStorage*>(temporary)).SortDescending(keys,indices);
+    // CUB no longer needs its storage once every thread has its sorted
+    // register values. Reuse it for the final token expansion instead of
+    // writing and rereading an otherwise unused global candidate list.
+    if(emit_tokens)__syncthreads();
+    auto* selected_ids=emit_tokens?reinterpret_cast<int64_t*>(temporary):out_ids+out;
 #pragma unroll
     for(int i=0;i<Items;++i) {
         const int rank=threadIdx.x*Items+i;
-        if(rank<count){output[out+rank]=keys[i];out_ids[out+rank]=indices[i];}
+        if(rank<count){if(!emit_tokens)output[out+rank]=keys[i];selected_ids[rank]=indices[i];}
     }
 }
+template<bool Blocks,int Items=16>
 __global__ void live_topk_blocks_kernel(const float* source,const int64_t* ids,
         float* output,int64_t* out_ids,const int64_t* positions,int columns,
-        int pools,int pool,int count,int stage,bool compact) {
+        int pools,int pool,int count,int stage,bool compact,int32_t* selected,int budget) {
     constexpr int tile=4096;
     extern __shared__ __align__(16) unsigned char temporary[];
-    const int row=blockIdx.y,begin=int(blockIdx.x)*tile,tiles=(columns+tile-1)/tile;
+    const int row=blockIdx.y,begin=int(blockIdx.x)*tile,tiles=int((int64_t(columns)+tile-1)/tile);
     int live=int(min(int64_t(pools),max(int64_t(0),(positions[row]+1)/pool)));
     for(int s=0;s<stage;++s)live=live/tile*count+min(count,live%tile);
     const int available=min(tile,max(0,live-begin));
     const int64_t out=(int64_t(row)*tiles+blockIdx.x)*count;
+    auto* selected_ids=selected?reinterpret_cast<int64_t*>(temporary):out_ids+out;
     // Entirely unused tiles and already reduced candidate lists need no sort.
     if(available<=count) {
         for(int i=threadIdx.x;i<count;i+=256) {
             const auto at=int64_t(row)*columns+begin+i;
-            output[out+i]=i<available?source[at]:-1e30f;
-            out_ids[out+i]=i<available?(ids?ids[at]:begin+i):pools;
+            if(!selected)output[out+i]=i<available?source[at]:-1e30f;
+            selected_ids[i]=i<available?(ids?ids[at]:begin+i):pools;
         }
-        return;
-    }
+    } else {
     // The graph reserves the maximum context, while each replay has a much
     // shorter live prefix. Keep the reduction tiles and output layout fixed,
     // but sort only the power-of-two range containing this tile's live rows.
     // CUB's stable ordering is unchanged because input column order is kept.
-    if(compact && available<=1024)
-        live_topk_sort<4>(source,ids,output,out_ids,row,columns,begin,live,pools,count,out,temporary);
+    if constexpr(Blocks)
+        live_topk_threshold<Items>(source,ids,output,out_ids,row,columns,begin,available,pools,count,out,temporary,selected!=nullptr);
+    else if(compact && available<=256)
+        live_topk_sort<1>(source,ids,output,out_ids,row,columns,begin,live,pools,count,out,temporary,selected!=nullptr);
+    else if(compact && available<=512)
+        live_topk_sort<2>(source,ids,output,out_ids,row,columns,begin,live,pools,count,out,temporary,selected!=nullptr);
+    else if(compact && available<=1024)
+        live_topk_sort<4>(source,ids,output,out_ids,row,columns,begin,live,pools,count,out,temporary,selected!=nullptr);
     else if(compact && available<=2048)
-        live_topk_sort<8>(source,ids,output,out_ids,row,columns,begin,live,pools,count,out,temporary);
-    else live_topk_sort<16>(source,ids,output,out_ids,row,columns,begin,live,pools,count,out,temporary);
+        live_topk_sort<8>(source,ids,output,out_ids,row,columns,begin,live,pools,count,out,temporary,selected!=nullptr);
+    else live_topk_sort<16>(source,ids,output,out_ids,row,columns,begin,live,pools,count,out,temporary,selected!=nullptr);
+    }
+    if(selected) {
+        // Only the final reduction has one CTA per query. Its IDs are now
+        // complete; publish them to this CTA before expanding whole pools
+        // and the incomplete causal tail into the existing token order.
+        __syncthreads();
+        const int64_t position=positions[row];
+        if constexpr(Blocks) {
+            emit_selected_blocks(selected_ids,selected,position,pool,count,budget,row);
+            return;
+        }
+        const int width=budget+pool-1;
+        for(int slot=threadIdx.x;slot<width;slot+=blockDim.x) {
+            int64_t token=-1;
+            if(position+1<=budget) {
+                if(slot<=position)token=slot;
+            } else if(int64_t(slot)<int64_t(count)*pool) {
+                const int64_t block=selected_ids[slot/pool];
+                if(block*pool+pool-1<=position)token=block*pool+slot%pool;
+            } else if(slot>=budget) {
+                const int offset=slot-budget;
+                const int64_t tail=(position+1)%pool;
+                if(offset<tail)token=position+1-tail+offset;
+            }
+            selected[int64_t(row)*width+slot]=int32_t(token);
+        }
+    }
 }
 }
 
-DenseTensor live_topk_blocks(const DenseTensor& scores,const DenseTensor& positions,int64_t pool,int64_t count) {
+static DenseTensor live_topk_impl(const DenseTensor& scores,const DenseTensor& positions,int64_t pool,int64_t count,int64_t budget,bool emit_blocks=false) {
+    TYLOINFER_RUNTIME_CHECK(!budget || (pool>0 && pool<=INT_MAX && budget>0 &&
+        budget<=INT_MAX-pool && count<=budget/pool),"invalid live QSA token selection geometry");
     const auto* option=tyloi::cuda::env_lookup("TYLOINFER_QSA_LIVE_TOPK");
-    if((option && option[0]=='0') || count>1024)
-        return std::get<1>(::tyloi::cuda::topk(scores,count,-1,true,false));
+    if((option && option[0]=='0') || count>1024) {
+        auto ids=std::get<1>(::tyloi::cuda::topk(scores,count,-1,true,false));
+        if(emit_blocks) {
+            auto selected=::tyloi::cuda::empty({1,scores.size(1),(budget+2*pool-2)/pool,2},scores.options().dtype(::tyloi::kInt32));
+            selected_blocks_from_ids<<<unsigned(scores.size(1)),256,0,mfq_current_cuda_stream()>>>(
+                ids.data_ptr<int64_t>(),positions.data_ptr<int64_t>(),selected.data_ptr<int32_t>(),int(pool),int(count),int(budget));
+            TYLOINFER_CUDA_KERNEL_LAUNCH_CHECK();return selected;
+        }
+        return budget?mfq_selected_attention::block_indices_to_tokens(ids,positions,pool,budget):ids;
+    }
     TYLOINFER_RUNTIME_CHECK(scores.is_cuda() && scores.is_contiguous() && scores.dim()==3 && scores.size(0)==1 &&
         scores.scalar_type()==::tyloi::kFloat32 && positions.is_cuda() && positions.is_contiguous() &&
         positions.scalar_type()==::tyloi::kInt64 && positions.numel()==scores.size(1) && pool>0 &&
-        count>0 && count<=scores.size(2),"invalid live QSA top-k geometry");
+        count>0 && count<=scores.size(2) && scores.size(1)<=INT_MAX && scores.size(2)<=INT_MAX,
+        "invalid live QSA top-k geometry");
     MfqCudaGuard guard(scores.device());
     const int rows=int(scores.size(1)),pools=int(scores.size(2));
     const auto* compact_option=tyloi::cuda::env_lookup("TYLOINFER_QSA_TOPK_LIVE_TILE");
     const bool compact=!compact_option || compact_option[0]!='0';
     int columns=pools,stage=0;
     auto keys=scores;DenseTensor ids;
-    constexpr auto bytes=sizeof(cub::BlockRadixSort<float,256,16,int64_t>::TempStorage);
-    if constexpr(bytes>49152)TYLOINFER_CUDA_CHECK(cudaFuncSetAttribute(live_topk_blocks_kernel,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,int(bytes)));
+    DenseTensor selected;
+    if(budget)selected=emit_blocks?
+        ::tyloi::cuda::empty({1,rows,(budget+2*pool-2)/pool,2},scores.options().dtype(::tyloi::kInt32)):
+        ::tyloi::cuda::empty({1,rows,budget+pool-1},scores.options().dtype(::tyloi::kInt32));
+    constexpr auto max_bytes=sizeof(cub::BlockRadixSort<float,256,16,int32_t>::TempStorage);
+    if constexpr(max_bytes>49152)TYLOINFER_CUDA_CHECK(cudaFuncSetAttribute(live_topk_blocks_kernel<false>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,int(max_bytes)));
     do {
-        const int tiles=(columns+4095)/4096;
+        const int tiles=int((int64_t(columns)+4095)/4096);
+        // The maximum candidate count is known without reading live graph
+        // positions. Smaller contexts do not need the largest CUB workspace.
+        const auto sort_bytes=emit_blocks?std::size_t(0):compact && columns<=1024?sizeof(cub::BlockRadixSort<float,256,4,int32_t>::TempStorage):
+            compact && columns<=2048?sizeof(cub::BlockRadixSort<float,256,8,int32_t>::TempStorage):
+            sizeof(cub::BlockRadixSort<float,256,16,int32_t>::TempStorage);
+        // The final emitter reuses this memory for public INT64 IDs, even
+        // when the live candidate count is small enough to skip sorting.
+        const auto bytes=std::max(std::max(sort_bytes,emit_blocks?std::size_t(8192):std::size_t(0)),budget?std::size_t(count)*sizeof(int64_t):std::size_t(0));
         auto next=::tyloi::cuda::empty({1,rows,tiles*count},scores.options());
         auto next_ids=::tyloi::cuda::empty(next.sizes(),scores.options().dtype(::tyloi::kInt64));
-        live_topk_blocks_kernel<<<dim3(tiles,rows),256,bytes,mfq_current_cuda_stream()>>>(
+        const auto launch=[&]<bool Blocks,int Items=16>() {
+        live_topk_blocks_kernel<Blocks,Items><<<dim3(tiles,rows),256,bytes,mfq_current_cuda_stream()>>>(
             keys.data_ptr<float>(),ids.defined()?ids.data_ptr<int64_t>():nullptr,
             next.data_ptr<float>(),next_ids.data_ptr<int64_t>(),positions.data_ptr<int64_t>(),
-            columns,pools,int(pool),int(count),stage++,compact);
+            columns,pools,int(pool),int(count),stage,compact,
+            tiles==1 && selected.defined()?selected.data_ptr<int32_t>():nullptr,int(budget));
+        if(tyloi::cuda::dispatch_trace::enabled())tyloi::cuda::dispatch_trace::record(
+            mfq_current_cuda_stream(),"qsa_live_topk",reinterpret_cast<const void*>(live_topk_blocks_kernel<Blocks,Items>),
+            "M="+std::to_string(rows)+" candidate_columns="+std::to_string(columns)+
+            " count="+std::to_string(count)+" selection_fused="+std::to_string(tiles==1 && selected.defined())+
+            " block_output="+std::to_string(Blocks)+
+            " selection_algorithm="+std::string(Blocks?"radix_threshold":"radix_sort")+
+            " minimum_sort_items="+std::to_string(compact?1:16)+" shared_bytes="+std::to_string(bytes));
+        };
+        // The fixed column capacity bounds each thread's live values,
+        // even while device-side positions grow across graph replays.
+        if(emit_blocks) {
+            if(columns<=256)launch.template operator()<true,1>();
+            else if(columns<=512)launch.template operator()<true,2>();
+            else if(columns<=1024)launch.template operator()<true,4>();
+            else if(columns<=2048)launch.template operator()<true,8>();
+            else launch.template operator()<true,16>();
+        }else launch.template operator()<false>();
+        ++stage;
         TYLOINFER_CUDA_KERNEL_LAUNCH_CHECK();keys=std::move(next);ids=std::move(next_ids);columns=tiles*int(count);
     } while(columns>count);
-    return ids;
+    return budget?selected:ids;
+}
+
+DenseTensor live_topk_blocks(const DenseTensor& scores,const DenseTensor& positions,int64_t pool,int64_t count) {
+    return live_topk_impl(scores,positions,pool,count,0);
+}
+
+DenseTensor live_topk_selected_tokens(const DenseTensor& scores,const DenseTensor& positions,int64_t pool,int64_t count,int64_t budget) {
+    return live_topk_impl(scores,positions,pool,count,budget);
+}
+
+DenseTensor live_topk_selected_blocks(const DenseTensor& scores,const DenseTensor& positions,int64_t pool,int64_t count,int64_t budget) {
+    TYLOINFER_RUNTIME_CHECK(scores.is_cuda() && scores.is_contiguous() && scores.dim()==3 && scores.size(0)==1 &&
+        scores.scalar_type()==::tyloi::kFloat32 && positions.is_cuda() && positions.is_contiguous() &&
+        positions.scalar_type()==::tyloi::kInt64 && positions.numel()==scores.size(1) && count<=scores.size(2) &&
+        scores.size(1)<=INT_MAX && scores.size(2)<=INT_MAX && pool>0 && pool<=32 && budget>0 && budget%pool==0 &&
+        budget<=INT_MAX-2*pool && count>0 && count<=budget/pool,
+        "invalid live QSA block-mask geometry");
+    return live_topk_impl(scores,positions,pool,count,budget,true);
 }
 
 std::vector<DenseTensor> ple_dilated_conv_silu(const DenseTensor& input,

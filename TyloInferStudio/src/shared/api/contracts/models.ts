@@ -5,6 +5,9 @@ export interface ModelArtifact {
   name: string;
   architecture: string;
   format: 'tq' | 'hf' | 'gguf';
+  asset_kind?: 'model' | 'ple' | 'engram';
+  owned_file_bytes?: number | null;
+  gguf_companion_required?: boolean;
   shard_count: number;
   missing_shards?: number;
   total_bytes: number;
@@ -183,6 +186,13 @@ export interface HubModelSummary {
   likes: number;
   total_bytes: number;
   updated_at?: string | null;
+  formats?: ('tq' | 'gguf' | 'mlx' | 'hf')[];
+  trending_score?: number;
+}
+
+export interface HubModelSearchPage {
+  data: HubModelSummary[];
+  next_cursor?: string | null;
 }
 
 export interface ModelConfigurationStatus {

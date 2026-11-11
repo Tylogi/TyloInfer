@@ -33,6 +33,11 @@ it('retains the normal Models action when a model is running', () => {
   expect(screen.getByTestId('location').textContent).toBe('/models');
 });
 
+it('does not expose the removed agent action', () => {
+  render(<MemoryRouter><RuntimeHero /><Location /></MemoryRouter>);
+  expect(screen.queryByRole('button', { name: 'Agent' })).not.toBeInTheDocument();
+});
+
 it('shows an interrupted load after runtime cleanup and lets a new retry show its progress', () => {
   const interrupted = { id: 'old-load', kind: 'model.load', status: 'interrupted', progress: .2,
     cancel_requested: false, payload: { model: 'fixture-model' },

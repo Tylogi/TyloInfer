@@ -98,6 +98,8 @@ template <class Backend> class SessionCache : public tyloi::state::Sessions {
             return {};
         }
         try {
+            if constexpr(requires { Backend::prepare_restore(*match->state,bool{}); })
+                Backend::prepare_restore(*match->state,paged_cache_ && paged_disk_budget_>0);
             Restore restored{match->tokens(), {}};
             if (mtp != nullptr)
                 restored.mtp_last_target_hidden = match->state->mtp->last_target_hidden;
@@ -131,6 +133,7 @@ template <class Backend> class SessionCache : public tyloi::state::Sessions {
         if constexpr(requires { Backend::paged_media(state); })paged_media|=Backend::paged_media(state);
         if (paged_cache_ && paged_media && (!state.mtp.has_value() || paged_mtp)) {
             store_paged(session_id, state);
+            if constexpr(requires { Backend::refresh_bytes(state); })Backend::refresh_bytes(state);
             if (!native_hot_snapshots_) return;
         }
         if ((!native_hot_snapshots_ && session_id.empty()) || !snapshots_.enabled())
@@ -318,6 +321,16 @@ template <class Backend> class SessionCache : public tyloi::state::Sessions {
             Backend::release_host_cache();
     }
 
+    std::function<uint64_t(uint64_t)> ram_reclaimer() const {
+        auto reclaim=tyloi::cache::make_ram_prefix_reclaimer(paged_cache_);
+        if (!reclaim) return {};
+        return [reclaim=std::move(reclaim)](uint64_t bytes) {
+            const auto released=reclaim(bytes);
+            if (released) Backend::release_host_cache();
+            return released;
+        };
+    }
+
     uint64_t refresh_disk_index() {
         if (!paged_cache_) return 0;
         const auto removed = paged_cache_->blocks.refresh_disk_index();
@@ -344,11 +357,6 @@ template <class Backend> class SessionCache : public tyloi::state::Sessions {
             return {};
         }
 
-        auto payloads = paged_cache_->blocks.load_prefix(match.blocks);
-        if (payloads.empty()) {
-            paged_cache_->record_match(0);
-            return {};
-        }
         const auto fail = [&](const char *action, const std::exception &error, bool invalidate) {
             if (invalidate && !match.blocks.empty()) {
                 paged_cache_->blocks.invalidate(match.blocks.back());
@@ -363,9 +371,14 @@ template <class Backend> class SessionCache : public tyloi::state::Sessions {
         const char *invalid_action = "paged_codec_invalidate";
         const char *failure_action = "paged_codec_failed";
         try {
+            auto snapshot=[&]() -> Snapshot {
+            if constexpr(requires { Backend::decode_paged(*paged_cache_,match,prompt,limit); }) {
+                return Backend::decode_paged(*paged_cache_,match,prompt,limit);
+            }else {
+            auto payloads=paged_cache_->blocks.load_prefix(match.blocks);
             if constexpr(requires { Backend::decodable_blocks(payloads); })
                 payloads.resize(Backend::decodable_blocks(payloads));
-            if(payloads.empty()) { paged_cache_->record_match(0);return {}; }
+            if(payloads.empty())return {};
             if (payloads.size() != match.blocks.size()) {
                 match.blocks.resize(payloads.size());
                 match.matched_tokens = payloads.size() * paged_cache_->block_size_tokens();
@@ -384,14 +397,18 @@ template <class Backend> class SessionCache : public tyloi::state::Sessions {
                 throw StateError("paged prefix exceeds the requested prefix");
             std::vector<int64_t> matched_tokens(
                 prompt.begin(), prompt.begin() + static_cast<std::ptrdiff_t>(match.matched_tokens));
-            auto snapshot =
-                Backend::decode(payloads, matched_tokens, paged_cache_->block_size_tokens());
-            snapshot.input_key = input_key;
+            return Backend::decode(payloads, matched_tokens, paged_cache_->block_size_tokens());
+            }
+            }();
+            if(snapshot.tokens.empty()) {paged_cache_->record_match(0);return {};}
+            snapshot.input_key=input_key;
             if(mtp && (!mtp->supports_session_state() || !snapshot.mtp)) {
                 paged_cache_->record_match(0);return {};
             }
             invalid_action = "paged_restore_invalidate";
             failure_action = "paged_restore_failed";
+            if constexpr(requires { Backend::prepare_restore(snapshot,bool{}); })
+                Backend::prepare_restore(snapshot,paged_disk_budget_>0);
             Restore restored{match.matched_tokens,{}};
             if(mtp)
                 restored.mtp_last_target_hidden=snapshot.mtp->last_target_hidden;
@@ -463,6 +480,9 @@ template <class Backend> class SessionCache : public tyloi::state::Sessions {
                     if(refreshed!=blocks[index])throw std::runtime_error("prefix checkpoint changed block identity");
                 }
             }
+        }
+        if constexpr(requires { Backend::bind_paged(state,*paged_cache_,blocks); }) {
+            if(paged_disk_budget_>0)Backend::bind_paged(state,*paged_cache_,blocks);
         }
         if (!session_id.empty()) {
             paged_bindings_.bind(session_id, std::move(blocks), partial?state.tokens.size():full_blocks * block_size);

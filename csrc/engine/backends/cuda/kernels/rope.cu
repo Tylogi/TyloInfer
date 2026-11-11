@@ -6,12 +6,21 @@
 //   out[t,j+half] = x1*cos + x0*sin
 
 #include <cuda_runtime.h>
-#include "backend.h"
+#include "engine/backends/cuda/native/tensor/backend.h"
 #include <cuda_bf16.h>
 #include <cmath>
 #include <algorithm>
 #include <utility>
 #include <vector>
+#include <cstdlib>
+#include <cstdint>
+#include <map>
+#include <mutex>
+#include <tuple>
+#include <type_traits>
+#ifdef TYLOINFER_NATIVE_CUDA_RUNTIME
+#include "kernel_dispatch_trace.h"
+#endif
 
 constexpr int ROPE_BD = 256;
 
@@ -24,25 +33,50 @@ __device__ int64_t rotary_position(const void* positions, bool wide, int64_t ind
                 : static_cast<const int32_t*>(positions)[index];
 }
 
-template<class Value>
+__device__ float2 normalized_rotary_angles(const void* positions,bool wide_positions,
+    const float* frequencies,const int32_t* selected_axes,int column,int token,int64_t batch,
+    int tokens,int axes,int batches,int maximum) {
+    int axis=selected_axes[column];
+    if(axis>=axes)axis=0;
+    const int64_t index=(int64_t(axis)*batches+(batches==1?0:batch))*tokens+token;
+    const int64_t raw_position=rotary_position(positions,wide_positions,index);
+#ifdef TYLOINFER_NATIVE_CUDA_RUNTIME
+    int position=wide_positions?__double2int_rz(double(raw_position)):int(raw_position);
+#else
+    int position=static_cast<int32_t>(raw_position);
+#endif
+    position=max(0,min(maximum-1,position));
+    const float angle=__fmul_rn(float(position),frequencies[column]);
+    double sine,cosine;
+    ::sincos(double(angle),&sine,&cosine);
+    return make_float2(float(cosine),float(sine));
+}
+
+template<bool Compact,class Value,bool Affine=false>
 __global__ void qsa_pool_rotary_cache_kernel(const Value* index,const float* weight,const void* positions,
         bool wide_positions,const int64_t* cache,const float* frequencies,const int32_t* selected_axes,Value* output,
         int tokens,int width,int pool,int maximum,int rotary_maximum,int pairs,int axes,float eps,
-        int64_t row_stride,int64_t column_stride) {
+        int64_t row_stride,int64_t column_stride,double attention_factor) {
     const int token=blockIdx.x,column=threadIdx.x;
-    const int64_t block=cache[token]/pool,start=block*pool;
+    const int64_t block=Compact?int64_t(token):cache[token]/pool,start=block*pool;
     // A verify batch can touch one block repeatedly. Only its last query writes
     // the pooled entry; all queries observe the same completed raw cache.
-    if(token+1<tokens && cache[token+1]/pool==block)return;
+    if constexpr(!Compact)if(token+1<tokens && cache[token+1]/pool==block)return;
     __shared__ float means[256],partial[256];
     float mean=0;
     if(column<width) {
         float sum=0;
         for(int i=0;i<pool;++i) {
             const int64_t row=min(max(int64_t(0),start+i),int64_t(maximum)-1);
-            sum=__fadd_rn(sum,float(index[row*row_stride+column*column_stride]));
+            float value;
+            if constexpr(Affine) {
+                const auto* record=index+row*row_stride;
+                value=float(int(record[column])-int(record[width+1]))*__half2float(__ushort_as_half(uint16_t(record[width])));
+            }else value=float(index[row*row_stride+column*column_stride]);
+            sum=__fadd_rn(sum,value);
         }
-        mean=float(Value(__fdiv_rn(sum,float(pool))));
+        if constexpr(Affine)mean=__fdiv_rn(sum,float(pool));
+        else mean=float(Value(__fdiv_rn(sum,float(pool))));
     }
     means[column]=mean;partial[column]=__fadd_rn(0.f,__fmul_rn(mean,mean));
     __syncthreads();
@@ -53,11 +87,44 @@ __global__ void qsa_pool_rotary_cache_kernel(const Value* index,const float* wei
         __syncthreads();
     }
     const float inverse=__fdiv_rn(1.f,__fsqrt_rn(__fadd_rn(__fdiv_rn(partial[0],float(width)),eps)));
-    const auto normalized=[&](int col){return Value(__fmul_rn(__fmul_rn(means[col],inverse),__fadd_rn(weight[col],1.f)));};
+    using Normal=std::conditional_t<Affine,float,Value>;
+    const auto normalized=[&](int col){return Normal(__fmul_rn(__fmul_rn(means[col],inverse),__fadd_rn(weight[col],1.f)));};
+    if constexpr(Affine) {
+        float value=0;
+        if(column<width) {
+            if(column>=2*pairs)value=normalized(column);
+            else {
+                const int pair=column%pairs;int axis=selected_axes[pair];if(axis>=axes)axis=0;
+                int64_t raw=rotary_position(positions,wide_positions,int64_t(axis)*tokens+token);
+                if constexpr(!Compact)raw+=start-cache[token];
+                const int pos=max(0,min(rotary_maximum-1,int(raw)));
+                const float angle=__fmul_rn(float(pos),frequencies[pair]);
+                double sine,cosine;::sincos(double(angle),&sine,&cosine);
+                const float cs=float(double(float(cosine))*attention_factor),sn=float(double(float(sine))*attention_factor);
+                const auto first=float(normalized(pair)),second=float(normalized(pair+pairs));
+                value=column<pairs?__fsub_rn(__fmul_rn(first,cs),__fmul_rn(second,sn)):
+                    __fadd_rn(__fmul_rn(second,cs),__fmul_rn(first,sn));
+            }
+        }
+        // Finish every reader of the normalized input before reusing its array.
+        __syncthreads();means[column]=value;partial[column]=fminf(0.f,value);__syncthreads();
+        for(int stride=blockDim.x/2;stride;stride/=2){if(column<stride)partial[column]=fminf(partial[column],partial[column+stride]);__syncthreads();}
+        const float lo=partial[0];__syncthreads();partial[column]=fmaxf(0.f,value);__syncthreads();
+        for(int stride=blockDim.x/2;stride;stride/=2){if(column<stride)partial[column]=fmaxf(partial[column],partial[column+stride]);__syncthreads();}
+        const float step=fmaxf(__fmul_rn(__fsub_rn(partial[0],lo),1.f/65535.f),0x1p-24f);
+        auto scale=__float2half_rn(step);if(__half2float(scale)<step)scale=__ushort_as_half(__half_as_ushort(scale)+1);
+        const float scale_value=__half2float(scale);
+        const int zp=max(-32768,min(32767,-32768-int(nearbyintf(lo/scale_value))));
+        auto* record=output+block*(width+2);
+        if(!column){record[width]=int16_t(__half_as_ushort(scale));record[width+1]=int16_t(zp);}
+        if(column<width)record[column]=int16_t(max(-32768,min(32767,int(nearbyintf(means[column]/scale_value))+zp)));
+        return;
+    }
     if(column>=width-pairs)return;
     if(column>=pairs){output[block*width+column+pairs]=normalized(column+pairs);return;}
     int axis=selected_axes[column];if(axis>=axes)axis=0;
-    const int64_t raw=rotary_position(positions,wide_positions,int64_t(axis)*tokens+token)-cache[token]+start;
+    int64_t raw=rotary_position(positions,wide_positions,int64_t(axis)*tokens+token);
+    if constexpr(!Compact)raw+=start-cache[token];
     int position;
 #ifdef TYLOINFER_NATIVE_CUDA
     position=wide_positions?__double2int_rz(double(raw)):int(raw);
@@ -66,7 +133,9 @@ __global__ void qsa_pool_rotary_cache_kernel(const Value* index,const float* wei
 #endif
     position=max(0,min(rotary_maximum-1,position));
     const float angle=__fmul_rn(float(position),frequencies[column]);
-    const float cosine=float(::cos(double(angle))),sine=float(::sin(double(angle)));
+    double wide_sine,wide_cosine;
+    ::sincos(double(angle),&wide_sine,&wide_cosine);
+    const float cosine=float(double(float(wide_cosine))*attention_factor),sine=float(double(float(wide_sine))*attention_factor);
     const float first=float(normalized(column)),second=float(normalized(column+pairs));
     output[block*width+column]=Value(__fsub_rn(__fmul_rn(first,cosine),__fmul_rn(second,sine)));
     output[block*width+column+pairs]=Value(__fadd_rn(__fmul_rn(second,cosine),__fmul_rn(first,sine)));
@@ -75,11 +144,12 @@ __global__ void qsa_pool_rotary_cache_kernel(const Value* index,const float* wei
 void qsa_pool_rotary_cache_cuda(const ::tyloi::DenseTensor& index,const ::tyloi::DenseTensor& weight,
         const ::tyloi::DenseTensor& positions,const ::tyloi::DenseTensor& cache,
         const ::tyloi::DenseTensor& frequencies,const ::tyloi::DenseTensor& axes,
-        const ::tyloi::DenseTensor& output,int64_t pool,int64_t maximum,int64_t rotary_maximum,double eps) {
-    TYLOINFER_RUNTIME_CHECK(index.is_cuda() && index.dim()==3 && index.size(0)==1 && index.size(2)>0 && index.size(2)<=256 &&
-        (index.scalar_type()==::tyloi::kFloat16 || index.scalar_type()==::tyloi::kFloat32) && pool>0 && pool<=INT_MAX &&
+        const ::tyloi::DenseTensor& output,int64_t pool,int64_t maximum,int64_t rotary_maximum,double eps,double attention_factor) {
+
+    TYLOINFER_RUNTIME_CHECK(index.is_cuda() && index.dim()==3 && index.size(0)==1 && index.size(2)>0 && index.size(2)<=(index.scalar_type()==::tyloi::kInt16?258:256) &&
+        (index.scalar_type()==::tyloi::kFloat16 || index.scalar_type()==::tyloi::kFloat32 || index.scalar_type()==::tyloi::kInt16) && pool>0 && pool<=INT_MAX &&
         maximum>0 && maximum<=index.size(1) && maximum<=INT_MAX && rotary_maximum>0 && rotary_maximum<=INT_MAX &&
-        std::isfinite(eps) && eps>=0,"invalid pooled rotary geometry");
+        std::isfinite(eps) && eps>=0 && std::isfinite(attention_factor) && attention_factor>0,"invalid pooled rotary geometry");
     TYLOINFER_RUNTIME_CHECK(cache.device()==index.device() && cache.is_contiguous() && cache.dim()==1 &&
         cache.numel()>0 && cache.numel()<=32 && cache.scalar_type()==::tyloi::kInt64 &&
         positions.device()==index.device() && positions.is_contiguous() && positions.dim()>=1 && positions.dim()<=3 &&
@@ -87,25 +157,65 @@ void qsa_pool_rotary_cache_cuda(const ::tyloi::DenseTensor& index,const ::tyloi:
         (positions.scalar_type()==::tyloi::kInt32 || positions.scalar_type()==::tyloi::kInt64),"invalid pooled rotary positions");
     TYLOINFER_RUNTIME_CHECK(output.device()==index.device() && output.is_contiguous() && output.dim()==3 && output.size(0)==1 &&
         output.size(1)>=(maximum+pool-1)/pool && output.size(2)==index.size(2) && output.scalar_type()==index.scalar_type() &&
-        weight.device()==index.device() && weight.is_contiguous() && weight.scalar_type()==::tyloi::kFloat32 && weight.numel()==index.size(2) &&
+        weight.device()==index.device() && weight.is_contiguous() && weight.scalar_type()==::tyloi::kFloat32 && weight.numel()==index.size(2)-(index.scalar_type()==::tyloi::kInt16?2:0) &&
         frequencies.device()==index.device() && frequencies.is_contiguous() && frequencies.scalar_type()==::tyloi::kFloat32 &&
-        frequencies.dim()==1 && frequencies.numel()>0 && frequencies.numel()<=index.size(2)/2 &&
+        frequencies.dim()==1 && frequencies.numel()>0 && frequencies.numel()<=(index.size(2)-(index.scalar_type()==::tyloi::kInt16?2:0))/2 &&
         axes.device()==index.device() && axes.is_contiguous() && axes.scalar_type()==::tyloi::kInt32 && axes.sizes()==frequencies.sizes(),
         "invalid pooled rotary storage");
-    MfqCudaGuard guard(index.device());const int width=int(index.size(2));
+    MfqCudaGuard guard(index.device());const int width=int(index.size(2))-(index.scalar_type()==::tyloi::kInt16?2:0);
     const int threads=width<=32?32:width<=64?64:width<=128?128:256;
     const auto launch=[&](auto* source,auto* target) {
-        qsa_pool_rotary_cache_kernel<<<unsigned(cache.numel()),threads,0,mfq_current_cuda_stream()>>>(source,
+        qsa_pool_rotary_cache_kernel<false,std::remove_cv_t<std::remove_pointer_t<decltype(source)>>,std::is_same_v<std::remove_cv_t<std::remove_pointer_t<decltype(source)>>,int16_t>><<<unsigned(cache.numel()),threads,0,mfq_current_cuda_stream()>>>(source,
             weight.data_ptr<float>(),positions.data_ptr(),positions.scalar_type()==::tyloi::kInt64,cache.data_ptr<int64_t>(),
             frequencies.data_ptr<float>(),axes.data_ptr<int32_t>(),target,int(cache.numel()),width,int(pool),int(maximum),
-            int(rotary_maximum),int(frequencies.numel()),positions.dim()==1?1:int(positions.size(0)),float(eps),index.stride(1),index.stride(2));
+            int(rotary_maximum),int(frequencies.numel()),positions.dim()==1?1:int(positions.size(0)),float(eps),index.stride(1),index.stride(2),attention_factor);
     };
     if(index.scalar_type()==::tyloi::kFloat16)launch(reinterpret_cast<const __half*>(index.data_ptr()),reinterpret_cast<__half*>(output.data_ptr()));
+    else if(index.scalar_type()==::tyloi::kInt16)launch(index.data_ptr<int16_t>(),output.data_ptr<int16_t>());
     else launch(index.data_ptr<float>(),output.data_ptr<float>());
     TYLOINFER_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-template<class Value>
+void qsa_pool_rotary_cuda(const ::tyloi::DenseTensor& index,const ::tyloi::DenseTensor& weight,
+        const ::tyloi::DenseTensor& positions,const ::tyloi::DenseTensor& frequencies,
+        const ::tyloi::DenseTensor& axes,const ::tyloi::DenseTensor& output,
+        int64_t pool,int64_t rotary_maximum,double eps,double attention_factor) {
+
+    TYLOINFER_RUNTIME_CHECK(index.is_cuda() && index.dim()==3 && index.size(0)==1 && index.size(1)>0 &&
+        index.size(1)<=INT_MAX && index.size(2)>0 && index.size(2)<=(index.scalar_type()==::tyloi::kInt16?258:256) && pool>0 && pool<=INT_MAX &&
+        index.size(1)%pool==0 && (index.scalar_type()==::tyloi::kFloat16 || index.scalar_type()==::tyloi::kFloat32 || index.scalar_type()==::tyloi::kInt16) &&
+        rotary_maximum>0 && rotary_maximum<=INT_MAX && std::isfinite(eps) && eps>=0 && std::isfinite(attention_factor) && attention_factor>0,
+        "invalid compact pooled rotary geometry");
+    const int64_t tokens=index.size(1)/pool;
+    TYLOINFER_RUNTIME_CHECK(positions.device()==index.device() && positions.is_contiguous() &&
+        positions.dim()>=1 && positions.dim()<=3 && positions.size(-1)==tokens &&
+        (positions.dim()<3 || positions.size(1)==1) &&
+        (positions.scalar_type()==::tyloi::kInt32 || positions.scalar_type()==::tyloi::kInt64) &&
+        output.device()==index.device() && output.is_contiguous() && output.dim()==3 &&
+        output.size(0)==1 && output.size(1)==tokens && output.size(2)==index.size(2) &&
+        output.scalar_type()==index.scalar_type() && weight.device()==index.device() &&
+        weight.is_contiguous() && weight.scalar_type()==::tyloi::kFloat32 && weight.numel()==index.size(2)-(index.scalar_type()==::tyloi::kInt16?2:0) &&
+        frequencies.device()==index.device() && frequencies.is_contiguous() &&
+        frequencies.scalar_type()==::tyloi::kFloat32 && frequencies.dim()==1 && frequencies.numel()>0 &&
+        frequencies.numel()<=(index.size(2)-(index.scalar_type()==::tyloi::kInt16?2:0))/2 && axes.device()==index.device() && axes.is_contiguous() &&
+        axes.scalar_type()==::tyloi::kInt32 && axes.sizes()==frequencies.sizes(),
+        "invalid compact pooled rotary storage");
+    MfqCudaGuard guard(index.device());const int width=int(index.size(2))-(index.scalar_type()==::tyloi::kInt16?2:0);
+    const int threads=width<=32?32:width<=64?64:width<=128?128:256;
+    const auto launch=[&](auto* source,auto* target) {
+        qsa_pool_rotary_cache_kernel<true,std::remove_cv_t<std::remove_pointer_t<decltype(source)>>,std::is_same_v<std::remove_cv_t<std::remove_pointer_t<decltype(source)>>,int16_t>><<<unsigned(tokens),threads,0,mfq_current_cuda_stream()>>>(source,
+            weight.data_ptr<float>(),positions.data_ptr(),positions.scalar_type()==::tyloi::kInt64,nullptr,
+            frequencies.data_ptr<float>(),axes.data_ptr<int32_t>(),target,int(tokens),width,int(pool),int(index.size(1)),
+            int(rotary_maximum),int(frequencies.numel()),positions.dim()==1?1:int(positions.size(0)),
+            float(eps),index.stride(1),index.stride(2),attention_factor);
+    };
+    if(index.scalar_type()==::tyloi::kFloat16)launch(reinterpret_cast<const __half*>(index.data_ptr()),reinterpret_cast<__half*>(output.data_ptr()));
+    else if(index.scalar_type()==::tyloi::kInt16)launch(index.data_ptr<int16_t>(),output.data_ptr<int16_t>());
+    else launch(index.data_ptr<float>(),output.data_ptr<float>());
+    TYLOINFER_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+template<class Value,bool FusedReduction>
 __device__ __forceinline__ void rotary_normalized_row(
     const Value* input, const float* weight, const void* positions, bool wide_positions,
     const float* frequencies, const int32_t* selected_axes, Value* output,
@@ -113,7 +223,7 @@ __device__ __forceinline__ void rotary_normalized_row(
     float eps, RotaryProjectionLayout layout, __half* key_cache,
     const void* cache_positions, bool wide_cache_positions, int64_t capacity,
     const void* projected_value, bool float_value, RotaryProjectionLayout value_layout,
-    __half* value_cache, int64_t row, int active_threads) {
+    __half* value_cache, int64_t row, int active_threads,const float2* rotations,double attention_factor) {
     const int64_t batch = row / (int64_t(heads) * tokens);
     const int head = int((row / tokens) % heads), token = int(row % tokens);
     const int64_t source = batch * layout.batch + token * layout.token + head * layout.head;
@@ -125,13 +235,43 @@ __device__ __forceinline__ void rotary_normalized_row(
     __shared__ float partial[256];
     partial[threadIdx.x] = sum;
     __syncthreads();
-    for (int stride = active_threads / 2; stride > 0; stride /= 2) {
-        if (threadIdx.x < stride)
-            partial[threadIdx.x] = __fadd_rn(partial[threadIdx.x], partial[threadIdx.x + stride]);
+    float inverse;
+    if constexpr(FusedReduction) {
+        if(threadIdx.x<32) {
+            const int lane=threadIdx.x;
+            float merged;
+            // Preserve the original descending pairwise tree across warps,
+            // then finish within one warp. Compute the inverse only once.
+            if(active_threads==256) {
+                const float a=__fadd_rn(partial[lane],partial[lane+128]);
+                const float b=__fadd_rn(partial[lane+32],partial[lane+160]);
+                const float c=__fadd_rn(partial[lane+64],partial[lane+192]);
+                const float d=__fadd_rn(partial[lane+96],partial[lane+224]);
+                merged=__fadd_rn(__fadd_rn(a,c),__fadd_rn(b,d));
+            }else if(active_threads==128) {
+                merged=__fadd_rn(__fadd_rn(partial[lane],partial[lane+64]),
+                    __fadd_rn(partial[lane+32],partial[lane+96]));
+            }else if(active_threads==64)merged=__fadd_rn(partial[lane],partial[lane+32]);
+            else merged=partial[lane];
+            #pragma unroll
+            for(int offset=16;offset;offset>>=1)
+                merged=__fadd_rn(merged,__shfl_down_sync(0xffffffffu,merged,offset));
+            if(!lane) {
+                const float mean=__fdiv_rn(merged,float(width));
+                partial[0]=__fdiv_rn(1.f,__fsqrt_rn(__fadd_rn(mean,eps)));
+            }
+        }
         __syncthreads();
+        inverse=partial[0];
+    }else {
+        for (int stride = active_threads / 2; stride > 0; stride /= 2) {
+            if (threadIdx.x < stride)
+                partial[threadIdx.x] = __fadd_rn(partial[threadIdx.x], partial[threadIdx.x + stride]);
+            __syncthreads();
+        }
+        const float mean = __fdiv_rn(partial[0], float(width));
+        inverse = __fdiv_rn(1.f, __fsqrt_rn(__fadd_rn(mean, eps)));
     }
-    const float mean = __fdiv_rn(partial[0], float(width));
-    const float inverse = __fdiv_rn(1.f, __fsqrt_rn(__fadd_rn(mean, eps)));
     const auto normalized = [&](int column) {
         const float scaled = __fmul_rn(float(input[source + int64_t(column) * layout.column]), inverse);
         return Value(__fmul_rn(scaled, __fadd_rn(weight[column], 1.f)));
@@ -150,19 +290,10 @@ __device__ __forceinline__ void rotary_normalized_row(
             store(column + pairs, normalized(column + pairs));
             continue;
         }
-        int axis = selected_axes[column];
-        if (axis >= axes) axis = 0;
-        const int64_t position_index = (int64_t(axis) * batches + (batches == 1 ? 0 : batch)) * tokens + token;
-        const int64_t raw_position = rotary_position(positions, wide_positions, position_index);
-#ifdef TYLOINFER_NATIVE_CUDA
-        // Preserve native tensor conversion through double, including overflow.
-        int position = wide_positions ? __double2int_rz(double(raw_position)) : int(raw_position);
-#else
-        int position = static_cast<int32_t>(raw_position);
-#endif
-        position = max(0, min(maximum - 1, position));
-        const float angle = __fmul_rn(float(position), frequencies[column]);
-        const float cosine = float(::cos(double(angle))), sine = float(::sin(double(angle)));
+        const auto rotation=rotations?rotations[((batches==1?0:batch)*tokens+token)*pairs+column]:
+            normalized_rotary_angles(positions,wide_positions,frequencies,selected_axes,column,token,batch,
+                tokens,axes,batches,maximum);
+        const float cosine=float(double(rotation.x)*attention_factor),sine=float(double(rotation.y)*attention_factor);
         const float first = float(normalized(column)), second = float(normalized(column + pairs));
         store(column, Value(__fsub_rn(__fmul_rn(first, cosine), __fmul_rn(second, sine))));
         store(column + pairs, Value(__fadd_rn(__fmul_rn(second, cosine), __fmul_rn(first, sine))));
@@ -178,7 +309,7 @@ __device__ __forceinline__ void rotary_normalized_row(
     }
 }
 
-template<class Value>
+template<class Value,bool FusedReduction>
 __global__ void rotary_normalized_cached_kernel(
     const Value* input, const float* weight, const void* positions, bool wide_positions,
     const float* frequencies, const int32_t* selected_axes, Value* output,
@@ -186,10 +317,10 @@ __global__ void rotary_normalized_cached_kernel(
     float eps, RotaryProjectionLayout layout, __half* key_cache,
     const void* cache_positions, bool wide_cache_positions, int64_t capacity,
     const void* projected_value, bool float_value, RotaryProjectionLayout value_layout,
-    __half* value_cache) {
-    rotary_normalized_row<Value>(input,weight,positions,wide_positions,frequencies,selected_axes,output,
+    __half* value_cache,const float2* rotations,double attention_factor) {
+    rotary_normalized_row<Value,FusedReduction>(input,weight,positions,wide_positions,frequencies,selected_axes,output,
         heads,tokens,width,pairs,axes,batches,maximum,eps,layout,key_cache,
-        cache_positions,wide_cache_positions,capacity,projected_value,float_value,value_layout,value_cache,blockIdx.x,blockDim.x);
+        cache_positions,wide_cache_positions,capacity,projected_value,float_value,value_layout,value_cache,blockIdx.x,blockDim.x,rotations,attention_factor);
 }
 
 struct RotaryNormalizedProjection {
@@ -212,28 +343,129 @@ struct RotaryNormalizedProjection {
     RotaryProjectionLayout value_layout;
     __half* value_cache;
     int64_t rows;
+    const float2* rotations=nullptr;
+    double attention_factor=1.0;
 };
 struct RotaryNormalizedGroup { RotaryNormalizedProjection entries[3]; int count; };
-template<class Value>
+
+__global__ void rotary_shared_angles_kernel(RotaryNormalizedProjection p,float2* output,int64_t count) {
+    for(int64_t index=int64_t(blockIdx.x)*blockDim.x+threadIdx.x;index<count;
+            index+=int64_t(gridDim.x)*blockDim.x) {
+        const int column=int(index%p.pairs),token=int(index/p.pairs%p.tokens);
+        const int64_t batch=index/p.pairs/p.tokens;
+        output[index]=normalized_rotary_angles(p.positions,p.wide_positions,p.frequencies,p.selected_axes,
+            column,token,batch,p.tokens,p.axes,p.batches,p.maximum);
+    }
+}
+
+bool fused_rotary_reduction_enabled() {
+    const auto* option=tyloi::cuda::env_lookup("TYLOINFER_ROTARY_FUSED_REDUCTION");
+    return !option || option[0]!='0';
+}
+
+bool shared_rotary_angles_enabled(const void* function,int threads,int64_t rows) {
+    const auto* option=tyloi::cuda::env_lookup("TYLOINFER_ROTARY_SHARED_ANGLES");
+    if(option && option[0]=='0')return false;
+    if(option && option[0]=='1')return true;
+    if(!function)return false;
+    // Small windows execute duplicated angles in parallel. Amortize a
+    // separate angle launch only beyond two fully resident waves, using the
+    // actual kernel's register/shared-memory occupancy on the current device.
+    static std::mutex mutex;
+    static std::map<std::tuple<int,int,std::uintptr_t>,int64_t> capacities;
+    int device=0;TYLOINFER_CUDA_CHECK(cudaGetDevice(&device));
+    const auto key=std::make_tuple(device,threads,reinterpret_cast<std::uintptr_t>(function));
+    std::lock_guard<std::mutex> lock(mutex);
+    auto found=capacities.find(key);
+    if(found==capacities.end()) {
+        int blocks=0,sms=0;
+        TYLOINFER_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks,function,threads,0));
+        TYLOINFER_CUDA_CHECK(cudaDeviceGetAttribute(&sms,cudaDevAttrMultiProcessorCount,device));
+        found=capacities.emplace(key,int64_t(blocks)*sms).first;
+    }
+    return rows>2*found->second;
+}
+
+::tyloi::DenseTensor prepare_rotary_shared_angles(const RotaryNormalizedProjection& p,
+        const ::tyloi::DenseTensor& like) {
+
+    auto angles=::tyloi::cuda::empty({int64_t(p.batches),int64_t(p.tokens),int64_t(p.pairs),2},like.options().dtype(::tyloi::kFloat32));
+    const auto count=angles.numel()/2;
+    // One warp per block distributes the expensive double-precision functions
+    // across SMs even for short decode windows. Bound a grid-stride launch.
+    const auto blocks=unsigned(std::min<int64_t>((count+31)/32,65535));
+    rotary_shared_angles_kernel<<<blocks,32,0,mfq_current_cuda_stream()>>>(p,
+        reinterpret_cast<float2*>(angles.data_ptr<float>()),count);
+    TYLOINFER_CUDA_KERNEL_LAUNCH_CHECK();
+#ifdef TYLOINFER_NATIVE_CUDA_RUNTIME
+    if(tyloi::cuda::dispatch_trace::enabled())tyloi::cuda::dispatch_trace::record(mfq_current_cuda_stream(),
+        "rotary_shared_angles",reinterpret_cast<const void*>(rotary_shared_angles_kernel),
+        "tokens="+std::to_string(p.tokens)+" batches="+std::to_string(p.batches)+" pairs="+std::to_string(p.pairs));
+#endif
+    return angles;
+}
+
+bool same_rotary_angles(const RotaryNormalizedProjection& a,const RotaryNormalizedProjection& b) {
+    return a.positions==b.positions && a.wide_positions==b.wide_positions &&
+        a.frequencies==b.frequencies && a.selected_axes==b.selected_axes &&
+        a.tokens==b.tokens && a.pairs==b.pairs && a.axes==b.axes &&
+        a.batches==b.batches && a.maximum==b.maximum;
+}
+template<class Value,bool FusedReduction>
 __global__ void rotary_normalized_grouped_kernel(RotaryNormalizedGroup group) {
     int64_t row=blockIdx.x;int selected=0;
     while(selected+1<group.count && row>=group.entries[selected].rows) {
         row-=group.entries[selected].rows;++selected;
     }
     const auto& p=group.entries[selected];
-    rotary_normalized_row<Value>(static_cast<const Value*>(p.input),p.weight,p.positions,p.wide_positions,
+    rotary_normalized_row<Value,FusedReduction>(static_cast<const Value*>(p.input),p.weight,p.positions,p.wide_positions,
         p.frequencies,p.selected_axes,static_cast<Value*>(p.output),p.heads,p.tokens,p.width,p.pairs,
         p.axes,p.batches,p.maximum,p.eps,p.layout,p.key_cache,p.cache_positions,p.wide_cache_positions,
-        p.capacity,p.projected_value,p.float_value,p.value_layout,p.value_cache,row,p.threads);
+        p.capacity,p.projected_value,p.float_value,p.value_layout,p.value_cache,row,p.threads,p.rotations,p.attention_factor);
 }
 template<class Value>
 void launch_rotary_normalized(const RotaryNormalizedProjection& p) {
-    rotary_normalized_cached_kernel<Value><<<unsigned(p.rows),p.threads,0,mfq_current_cuda_stream()>>>(
+    const auto launch=[&](auto fused) {
+        constexpr bool Fused=decltype(fused)::value;
+        const auto function=rotary_normalized_cached_kernel<Value,Fused>;
+        function<<<unsigned(p.rows),p.threads,0,mfq_current_cuda_stream()>>>(
         static_cast<const Value*>(p.input),p.weight,p.positions,p.wide_positions,
         p.frequencies,p.selected_axes,static_cast<Value*>(p.output),p.heads,p.tokens,p.width,p.pairs,
         p.axes,p.batches,p.maximum,p.eps,p.layout,p.key_cache,p.cache_positions,p.wide_cache_positions,
-        p.capacity,p.projected_value,p.float_value,p.value_layout,p.value_cache);
-    TYLOINFER_CUDA_KERNEL_LAUNCH_CHECK();
+        p.capacity,p.projected_value,p.float_value,p.value_layout,p.value_cache,p.rotations,p.attention_factor);
+        TYLOINFER_CUDA_KERNEL_LAUNCH_CHECK();
+#ifdef TYLOINFER_NATIVE_CUDA_RUNTIME
+        if(tyloi::cuda::dispatch_trace::enabled())tyloi::cuda::dispatch_trace::record(mfq_current_cuda_stream(),
+            "rotary_normalized_cached",reinterpret_cast<const void*>(function),
+            "fused_reduction="+std::to_string(Fused)+" width="+std::to_string(p.width)+" attention_factor="+std::to_string(p.attention_factor));
+#endif
+    };
+    if(fused_rotary_reduction_enabled())launch(std::true_type{});else launch(std::false_type{});
+}
+
+template<class Value>
+void launch_rotary_normalized_grouped(const RotaryNormalizedGroup& group,unsigned rows,int threads) {
+    const auto launch=[&](auto fused) {
+        constexpr bool Fused=decltype(fused)::value;
+        const auto function=rotary_normalized_grouped_kernel<Value,Fused>;
+        function<<<rows,threads,0,mfq_current_cuda_stream()>>>(group);
+        TYLOINFER_CUDA_KERNEL_LAUNCH_CHECK();
+#ifdef TYLOINFER_NATIVE_CUDA_RUNTIME
+        if(tyloi::cuda::dispatch_trace::enabled())tyloi::cuda::dispatch_trace::record(mfq_current_cuda_stream(),
+            "rotary_normalized_grouped",reinterpret_cast<const void*>(function),
+            "fused_reduction="+std::to_string(Fused)+" rows="+std::to_string(rows)+" attention_factor="+std::to_string(group.entries[0].attention_factor));
+#endif
+    };
+    if(fused_rotary_reduction_enabled())launch(std::true_type{});else launch(std::false_type{});
+}
+
+template<class Value>
+const void* rotary_normalized_function(bool grouped) {
+    if(fused_rotary_reduction_enabled())return grouped?
+        reinterpret_cast<const void*>(rotary_normalized_grouped_kernel<Value,true>):
+        reinterpret_cast<const void*>(rotary_normalized_cached_kernel<Value,true>);
+    return grouped?reinterpret_cast<const void*>(rotary_normalized_grouped_kernel<Value,false>):
+        reinterpret_cast<const void*>(rotary_normalized_cached_kernel<Value,false>);
 }
 
 static std::pair<::tyloi::DenseTensor,RotaryNormalizedProjection> prepare_rotary_normalized(
@@ -307,11 +539,19 @@ static std::pair<::tyloi::DenseTensor,RotaryNormalizedProjection> prepare_rotary
     ::tyloi::DenseTensor positions, ::tyloi::DenseTensor frequencies,
     ::tyloi::DenseTensor axes, int64_t maximum, double eps,
     ::tyloi::DenseTensor key_cache, ::tyloi::DenseTensor cache_positions,
-    ::tyloi::DenseTensor projected_value, ::tyloi::DenseTensor value_cache) {
-
+    ::tyloi::DenseTensor projected_value, ::tyloi::DenseTensor value_cache,double attention_factor) {
+    TYLOINFER_RUNTIME_CHECK(std::isfinite(attention_factor) && attention_factor>0,"invalid rotary attention factor");
     auto prepared=prepare_rotary_normalized(input,weight,positions,frequencies,axes,maximum,eps,
         key_cache,cache_positions,projected_value,value_cache);
+    prepared.second.attention_factor=attention_factor;
     MfqCudaGuard guard(input.device());
+    ::tyloi::DenseTensor angles;
+    const auto function=input.scalar_type()==::tyloi::kFloat32?
+        rotary_normalized_function<float>(false):rotary_normalized_function<__half>(false);
+    if(prepared.second.heads>1 && shared_rotary_angles_enabled(function,prepared.second.threads,prepared.second.rows)) {
+        angles=prepare_rotary_shared_angles(prepared.second,input);
+        prepared.second.rotations=reinterpret_cast<const float2*>(angles.data_ptr<float>());
+    }
     if(input.scalar_type()==::tyloi::kFloat32)launch_rotary_normalized<float>(prepared.second);
     else launch_rotary_normalized<__half>(prepared.second);
     return prepared.first;
@@ -323,9 +563,14 @@ std::vector<::tyloi::DenseTensor> rotary_normalized_grouped_cuda(
     ::tyloi::DenseTensor positions,::tyloi::DenseTensor frequencies,
     ::tyloi::DenseTensor axes,int64_t maximum,double eps,int cache_entry,
     ::tyloi::DenseTensor key_cache,::tyloi::DenseTensor cache_positions,
-    ::tyloi::DenseTensor projected_value,::tyloi::DenseTensor value_cache) {
+    ::tyloi::DenseTensor projected_value,::tyloi::DenseTensor value_cache,
+    const std::vector<::tyloi::DenseTensor>& entry_positions,double attention_factor) {
+
+    TYLOINFER_RUNTIME_CHECK(std::isfinite(attention_factor) && attention_factor>0,"invalid grouped rotary attention factor");
     TYLOINFER_RUNTIME_CHECK(!inputs.empty() && inputs.size()<=3 && weights.size()==inputs.size(),
         "normalized rotary group must contain one to three input/weight pairs");
+    TYLOINFER_RUNTIME_CHECK(entry_positions.empty() || entry_positions.size()==inputs.size(),
+        "normalized rotary positions must match the input group");
     TYLOINFER_RUNTIME_CHECK((cache_entry>=0 && cache_entry<int(inputs.size())) ||
         (!key_cache.defined() && !cache_positions.defined() && !projected_value.defined() && !value_cache.defined()),
         "normalized rotary cache entry is outside the group");
@@ -333,25 +578,38 @@ std::vector<::tyloi::DenseTensor> rotary_normalized_grouped_cuda(
     std::vector<::tyloi::DenseTensor> outputs;outputs.reserve(inputs.size());
     int64_t rows=0;int threads=32;bool uniform=true;
     for(size_t i=0;i<inputs.size();++i) {
-        auto prepared=prepare_rotary_normalized(inputs[i],weights[i],positions,frequencies,axes,maximum,eps,
+        auto prepared=prepare_rotary_normalized(inputs[i],weights[i],entry_positions.empty()?positions:entry_positions[i],frequencies,axes,maximum,eps,
             int(i)==cache_entry?key_cache: ::tyloi::DenseTensor{},int(i)==cache_entry?cache_positions: ::tyloi::DenseTensor{},
             int(i)==cache_entry?projected_value: ::tyloi::DenseTensor{},int(i)==cache_entry?value_cache: ::tyloi::DenseTensor{});
         TYLOINFER_RUNTIME_CHECK(inputs[i].device()==inputs[0].device(),"normalized rotary group device mismatch");
         uniform=uniform && inputs[i].scalar_type()==inputs[0].scalar_type();
-        group.entries[i]=prepared.second;outputs.push_back(std::move(prepared.first));
+        group.entries[i]=prepared.second;group.entries[i].attention_factor=attention_factor;outputs.push_back(std::move(prepared.first));
         rows+=prepared.second.rows;threads=std::max(threads,prepared.second.threads);
     }
     MfqCudaGuard guard(inputs[0].device());
+    std::vector<::tyloi::DenseTensor> angles(inputs.size());
+    const auto function=!uniform?nullptr:inputs[0].scalar_type()==::tyloi::kFloat32?
+        rotary_normalized_function<float>(true):rotary_normalized_function<__half>(true);
+    if(shared_rotary_angles_enabled(function,threads,rows))for(int i=0;i<group.count;++i) {
+        auto& p=group.entries[i];
+        int64_t sharing_heads=0;
+        for(int j=0;j<group.count;++j)if(same_rotary_angles(p,group.entries[j])) {
+            sharing_heads+=group.entries[j].heads;
+            if(j<i && group.entries[j].rotations)p.rotations=group.entries[j].rotations;
+        }
+        if(!p.rotations && sharing_heads>1) {
+            angles[i]=prepare_rotary_shared_angles(p,inputs[i]);
+            p.rotations=reinterpret_cast<const float2*>(angles[i].data_ptr<float>());
+        }
+    }
     if(!uniform || rows>INT_MAX) {
         for(size_t i=0;i<inputs.size();++i) {
             if(inputs[i].scalar_type()==::tyloi::kFloat32)launch_rotary_normalized<float>(group.entries[i]);
             else launch_rotary_normalized<__half>(group.entries[i]);
         }
     } else {
-        if(inputs[0].scalar_type()==::tyloi::kFloat32)
-            rotary_normalized_grouped_kernel<float><<<unsigned(rows),threads,0,mfq_current_cuda_stream()>>>(group);
-        else rotary_normalized_grouped_kernel<__half><<<unsigned(rows),threads,0,mfq_current_cuda_stream()>>>(group);
-        TYLOINFER_CUDA_KERNEL_LAUNCH_CHECK();
+        if(inputs[0].scalar_type()==::tyloi::kFloat32)launch_rotary_normalized_grouped<float>(group,unsigned(rows),threads);
+        else launch_rotary_normalized_grouped<__half>(group,unsigned(rows),threads);
     }
     return outputs;
 }
@@ -361,7 +619,7 @@ __global__ void rotary_embedding_cached_kernel(
     const Value* __restrict__ input,const int32_t* __restrict__ positions,
     const float* __restrict__ frequencies,const int32_t* __restrict__ selected_axes,
     Value* __restrict__ output,int64_t rows,int heads,int tokens,int width,int pairs,
-    int axes,int batches,int maximum) {
+    int axes,int batches,int maximum,double attention_factor) {
     const int columns=width-pairs;
     const int64_t total=rows*columns;
     for(int64_t linear=int64_t(blockIdx.x)*blockDim.x+threadIdx.x;
@@ -380,7 +638,9 @@ __global__ void rotary_embedding_cached_kernel(
         position=max(0,min(maximum-1,position));
         const float angle=__fmul_rn(float(position),frequencies[column]);
         // Match native tensor sin/cos promotion and every stored FP32 product.
-        const float cosine=float(::cos(double(angle))),sine=float(::sin(double(angle)));
+        double wide_sine,wide_cosine;
+        ::sincos(double(angle),&wide_sine,&wide_cosine);
+        const float cosine=float(double(float(wide_cosine))*attention_factor),sine=float(double(float(wide_sine))*attention_factor);
         const float first=float(input[offset+column]),second=float(input[offset+column+pairs]);
         const float a=__fsub_rn(__fmul_rn(first,cosine),__fmul_rn(second,sine));
         const float b=__fadd_rn(__fmul_rn(second,cosine),__fmul_rn(first,sine));
@@ -390,7 +650,9 @@ __global__ void rotary_embedding_cached_kernel(
 
 ::tyloi::DenseTensor rotary_embedding_cached_cuda(
     ::tyloi::DenseTensor input,::tyloi::DenseTensor positions,
-    ::tyloi::DenseTensor frequencies,::tyloi::DenseTensor axes,int64_t maximum) {
+    ::tyloi::DenseTensor frequencies,::tyloi::DenseTensor axes,int64_t maximum,double attention_factor) {
+
+    TYLOINFER_RUNTIME_CHECK(std::isfinite(attention_factor) && attention_factor>0,"invalid rotary attention factor");
     TYLOINFER_RUNTIME_CHECK(input.is_cuda() && positions.is_cuda() && frequencies.is_cuda() && axes.is_cuda() &&
         input.device()==positions.device() && input.device()==frequencies.device() && input.device()==axes.device(),
         "cached rotary tensors must share a CUDA device");
@@ -412,7 +674,7 @@ __global__ void rotary_embedding_cached_kernel(
         rotary_embedding_cached_kernel<Value><<<blocks,128,0,mfq_current_cuda_stream()>>>(
             reinterpret_cast<const Value*>(input.data_ptr()),positions.data_ptr<int32_t>(),frequencies.data_ptr<float>(),
             axes.data_ptr<int32_t>(),reinterpret_cast<Value*>(output.data_ptr()),rows,int(input.size(1)),int(input.size(2)),
-            int(input.size(3)),int(pairs),int(position_axes),int(batches),int(maximum));
+            int(input.size(3)),int(pairs),int(position_axes),int(batches),int(maximum),attention_factor);
     };
     if(input.scalar_type()==::tyloi::kFloat32)launch(float{});else launch(__half{});
     TYLOINFER_CUDA_KERNEL_LAUNCH_CHECK();return output;

@@ -69,11 +69,11 @@ public:
         }
         return result;
     }
-    void record_stream(std::uintptr_t stream) const override {
+    void record_stream(std::uintptr_t stream, std::shared_ptr<void> lifetime = {}) const override {
         for (const auto& shard : shards)
             if (!shard.weight || shard.device != shards.front().device)
                 throw std::invalid_argument("cannot record one stream for multiple devices");
-        for (const auto& shard : shards) shard.weight.record_stream(stream);
+        for (const auto& shard : shards) shard.weight.record_stream(stream, lifetime);
     }
     std::shared_ptr<TensorImpl> relocated(Device) const override {
         auto moved = shards;

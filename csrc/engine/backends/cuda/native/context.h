@@ -64,6 +64,9 @@ struct DeviceMemoryStats {
     std::size_t peak = 0;
 };
 
+struct PhysicalDeviceMemoryStats { std::size_t total=0, free=0, used=0; };
+std::optional<PhysicalDeviceMemoryStats> physical_device_memory_stats(int device);
+
 class Context final : public std::enable_shared_from_this<Context> {
 public:
     explicit Context(int device);
@@ -73,6 +76,9 @@ public:
     Stream& stream() noexcept { return stream_; }
     const Stream& stream() const noexcept { return stream_; }
     BlasHandle& blas() noexcept { return blas_; }
+    BlasHandle& blas(cudaStream_t stream);
+    std::size_t reusable_workspace_bytes() const;
+    bool has_graph_pool(cudaStream_t stream) const;
     std::shared_ptr<ParallelBatchMatmulContext> parallel_blas;
     cudaMemPool_t memory_pool() const noexcept { return pool_; }
     bool supports_async_allocations() const noexcept { return async_allocations_; }
@@ -138,6 +144,8 @@ private:
     };
     std::unique_ptr<WorkspaceLoan> workspace_loan_;
     std::unordered_map<cudaStream_t, GraphPool> graph_pools_;
+    std::mutex stream_blas_mutex_;
+    std::unordered_map<cudaStream_t,std::unique_ptr<BlasHandle>> stream_blas_;
 };
 
 // One set belongs to one Engine; standalone tensor callers use a thread-local set.

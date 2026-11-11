@@ -390,24 +390,30 @@ class ResponsePerformance(ProtocolModel):
     mtp_drafted_tokens: int = Field(default=0, ge=0)
     mtp_accepted_tokens: int = Field(default=0, ge=0)
     mtp_acceptance_rate: float = Field(default=0.0, ge=0.0, le=1.0)
-    mtp_selected_depth: int = Field(default=0, ge=0, le=5)
+    mtp_selected_depth: int = Field(default=0, ge=0, le=7)
     mtp_depth_0_cycles: int = Field(default=0, ge=0)
     mtp_depth_1_cycles: int = Field(default=0, ge=0)
     mtp_depth_2_cycles: int = Field(default=0, ge=0)
     mtp_depth_3_cycles: int = Field(default=0, ge=0)
     mtp_depth_4_cycles: int = Field(default=0, ge=0)
     mtp_depth_5_cycles: int = Field(default=0, ge=0)
+    mtp_depth_6_cycles: int = Field(default=0, ge=0)
+    mtp_depth_7_cycles: int = Field(default=0, ge=0)
     mtp_position_1_acceptance_rate: float = Field(default=0.0, ge=0.0, le=1.0)
     mtp_position_2_acceptance_rate: float = Field(default=0.0, ge=0.0, le=1.0)
     mtp_position_3_acceptance_rate: float = Field(default=0.0, ge=0.0, le=1.0)
     mtp_position_4_acceptance_rate: float = Field(default=0.0, ge=0.0, le=1.0)
     mtp_position_5_acceptance_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    mtp_position_6_acceptance_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    mtp_position_7_acceptance_rate: float = Field(default=0.0, ge=0.0, le=1.0)
     mtp_depth_0_cycle_ms: float = Field(default=0.0, ge=0.0)
     mtp_depth_1_cycle_ms: float = Field(default=0.0, ge=0.0)
     mtp_depth_2_cycle_ms: float = Field(default=0.0, ge=0.0)
     mtp_depth_3_cycle_ms: float = Field(default=0.0, ge=0.0)
     mtp_depth_4_cycle_ms: float = Field(default=0.0, ge=0.0)
     mtp_depth_5_cycle_ms: float = Field(default=0.0, ge=0.0)
+    mtp_depth_6_cycle_ms: float = Field(default=0.0, ge=0.0)
+    mtp_depth_7_cycle_ms: float = Field(default=0.0, ge=0.0)
     mtp_target_ms: float = Field(default=0.0, ge=0.0)
     mtp_head_ms: float = Field(default=0.0, ge=0.0)
     mtp_rollback_ms: float = Field(default=0.0, ge=0.0)
@@ -603,6 +609,7 @@ class ModelLoadContextSettings(ProtocolModel):
 class ModelLoadRequest(ProtocolModel):
     model: str = Field(min_length=1, max_length=255)
     artifact_uri: str | None = Field(default=None, min_length=1)
+    gguf_companions: list[Annotated[str, Field(min_length=1)]] = Field(default_factory=list, max_length=16)
     device_ids: list[str] = Field(default_factory=list)
     idle_ttl_seconds: int | None = Field(default=None, ge=0)
     pin: bool = False
@@ -920,6 +927,9 @@ class ModelArtifactResource(ProtocolModel):
     name: str = Field(min_length=1, max_length=255)
     architecture: str = Field(min_length=1, max_length=128)
     format: Literal["tq", "hf", "gguf"] = "tq"
+    asset_kind: Literal['model', 'ple', 'engram'] = 'model'
+    owned_file_bytes: int | None = Field(default=None, ge=0)
+    gguf_companion_required: bool = False
     shard_count: int = Field(ge=1)
     missing_shards: int = Field(default=0, ge=0)
     total_bytes: int = Field(ge=0)
@@ -1030,10 +1040,13 @@ class HubModelSummary(ProtocolModel):
     likes: int = Field(default=0, ge=0)
     total_bytes: int = Field(default=0, ge=0)
     updated_at: AwareDatetime | None = None
+    formats: list[Literal["tq", "gguf", "mlx", "hf"]] = Field(default_factory=list)
+    trending_score: float = 0
 
 
 class HubModelSearchResult(ProtocolModel):
     data: list[HubModelSummary]
+    next_cursor: str | None = None
 
 
 class HubModelFile(ProtocolModel):
@@ -1066,7 +1079,7 @@ class HubModelVariant(ProtocolModel):
     label: str = Field(min_length=1, max_length=255)
     format: Literal["tq", "hf", "gguf", "unknown"]
     precision: str | None = Field(default=None, max_length=128)
-    files: list[str] = Field(default_factory=list, max_length=256)
+    files: list[str] = Field(default_factory=list, max_length=4096)
     byte_size: int = Field(default=0, ge=0)
     resident_weight_bytes: int | None = Field(default=None, ge=0)
     estimated_resident_weight_bytes: int | None = Field(default=None, ge=0)
@@ -1225,130 +1238,6 @@ class ArtifactLineageResource(ProtocolModel):
 
 class ArtifactLineageList(ProtocolModel):
     data: list[ArtifactLineageResource]
-
-
-DatasetKind = Literal["wikitext2", "custom"]
-EvaluationKind = Literal["perplexity", "kernel_benchmark", "inference_benchmark", "accuracy_benchmark"]
-
-
-class EvaluationToolsResource(ProtocolModel):
-    workspace_root: str | None = None
-    api_base: str
-    quality_available: bool
-    reference_available: bool = False
-    benchmark_available: bool
-    accuracy_available: bool = False
-    task_benchmarks: dict[str, dict[str, Any]] = Field(default_factory=dict)
-
-
-class ProbabilityScoreRequest(ProtocolModel):
-    instance_id: UUID
-    prompt: str = Field(min_length=1, max_length=65536)
-    continuations: list[Annotated[str, Field(min_length=1, max_length=16384)]] = Field(min_length=1, max_length=64)
-    mode: Literal["continuation", "next_token"] = "continuation"
-
-
-class ProbabilityScore(ProtocolModel):
-    token_ids: list[int]
-    token_logprobs: list[Annotated[float, Field(allow_inf_nan=False, le=0.00001)]]
-    log_likelihood: float = Field(allow_inf_nan=False)
-
-
-class ProbabilityScoreResult(ProtocolModel):
-    prompt_tokens: int = Field(ge=1)
-    scores: list[ProbabilityScore]
-    log_base: Literal["e"]
-    tokenization: Literal["raw-no-special-tokens"]
-
-
-class OfficialDatasetResource(ProtocolModel):
-    id: str
-    name: str
-    kind: DatasetKind
-    repository: str
-    revision: str
-    filename: str
-    sha256: str = Field(pattern=SHA256_PATTERN)
-    byte_size: int
-    rows: int
-    license: str
-    format: str = "parquet"
-    split: str = "test"
-    task: str | None = None
-    origin: Literal["huggingface", "github"] = "huggingface"
-
-
-class OfficialDatasetList(ProtocolModel):
-    data: list[OfficialDatasetResource]
-
-
-class CreateDatasetRequest(ProtocolModel):
-    name: str = Field(min_length=1, max_length=128)
-    kind: DatasetKind = "custom"
-    artifact_uri: str = Field(pattern=r"^workspace://[^\x00]+$")
-    source_uri: str | None = Field(default=None, max_length=2048)
-    revision: str | None = Field(default=None, max_length=255)
-    metadata: dict[str, Any] = Field(default_factory=dict)
-
-
-class DatasetResource(ProtocolModel):
-    id: UUID
-    name: str
-    kind: DatasetKind
-    artifact_uri: str
-    sha256: str = Field(pattern=SHA256_PATTERN)
-    byte_size: int = Field(ge=0)
-    source_uri: str | None = None
-    revision: str | None = None
-    metadata: dict[str, Any] = Field(default_factory=dict)
-    created_at: AwareDatetime
-    updated_at: AwareDatetime
-
-
-class DatasetList(ProtocolModel):
-    data: list[DatasetResource]
-
-
-class EvaluationResultResource(ProtocolModel):
-    id: UUID
-    job_id: UUID
-    kind: EvaluationKind
-    model_id: str = Field(min_length=1, max_length=255)
-    metrics: dict[str, Any] = Field(default_factory=dict)
-    parameters: dict[str, Any] = Field(default_factory=dict)
-    dataset_id: UUID | None = None
-    dataset_manifest: dict[str, Any] = Field(default_factory=dict)
-    hardware_identity: dict[str, Any] = Field(default_factory=dict)
-    runtime_identity: dict[str, Any] = Field(default_factory=dict)
-    comparison_key: str = Field(pattern=SHA256_PATTERN)
-    created_at: AwareDatetime
-
-
-class EvaluationResultList(ProtocolModel):
-    data: list[EvaluationResultResource]
-
-
-class CompareEvaluationsRequest(ProtocolModel):
-    evaluation_ids: list[UUID] = Field(min_length=2, max_length=16)
-
-    @model_validator(mode="after")
-    def validate_evaluations(self) -> CompareEvaluationsRequest:
-        if len(set(self.evaluation_ids)) != len(self.evaluation_ids):
-            raise ValueError("evaluation IDs must be unique")
-        return self
-
-
-class EvaluationComparisonRow(ProtocolModel):
-    evaluation: EvaluationResultResource
-    deltas: dict[str, float | None] = Field(default_factory=dict)
-    ratios: dict[str, float | None] = Field(default_factory=dict)
-
-
-class EvaluationComparisonResource(ProtocolModel):
-    comparison_key: str = Field(pattern=SHA256_PATTERN)
-    baseline_id: UUID
-    metrics: list[str]
-    rows: list[EvaluationComparisonRow]
 
 
 class ModelFeatureSet(ProtocolModel):

@@ -440,7 +440,6 @@ def test_native_cli_uses_backend_neutral_model_and_tokenizer_options() -> None:
     sources = (
         CUDA_APP + "\n" + CUDA_RUNTIME_COMMAND + "\n" + CUDA_CLI,
         DECODE_APP,
-        (METAL / "apps" / "mfq_perplexity_mlx.cpp").read_text(encoding="utf-8"),
     )
     for source in sources:
         assert '"--model"' in source
@@ -452,14 +451,10 @@ def test_native_cli_uses_backend_neutral_model_and_tokenizer_options() -> None:
 
 def test_cuda_cli_is_a_thin_client_of_the_runtime_library() -> None:
     apps = ROOT / "csrc" / "backends" / "cuda" / "apps"
-    for name in ("runtime", "diagnostics", "eval"):
+    for name in ("runtime", "diagnostics"):
         source = (apps / f"{name}_main.cpp").read_text(encoding="utf-8")
         assert f"mfq::cuda::commands::run_{name}(argc, argv)" in source
-        if name == 'runtime':
-            assert 'std::string_view(argv[1]) == "--wt2-reference"' in source
-            assert 'mfq::cuda::commands::run_reference(argc, argv)' in source
-        else:
-            assert "argv[" not in source
+        assert "argv[" not in source
         assert "struct Model" not in source
 
     cmake = (ROOT / "csrc" / "backends" / "cuda" / "CMakeLists.txt").read_text(
@@ -480,7 +475,7 @@ def test_cuda_cli_is_a_thin_client_of_the_runtime_library() -> None:
     assert "mfq-cuda-runtime mfq-runtime-communication" in cmake
     assert "${TYLOINFER_CUDA_ROOT}/commands/runtime.cpp" in cmake
     assert "${TYLOINFER_CUDA_ROOT}/commands/diagnostics.cpp" in cmake
-    assert "${TYLOINFER_CUDA_ROOT}/commands/eval.cpp" in cmake
+    assert "${TYLOINFER_CUDA_ROOT}/commands/eval.cpp" not in cmake
     assert ("mfq-" + "decode") not in cmake
     assert "execute_runtime" in CUDA_RUNTIME_COMMAND
     assert "RuntimeExecution" not in CUDA_RUNTIME_SOURCE
@@ -1366,7 +1361,6 @@ def test_cuda_ops_and_execution_are_real_compilation_units() -> None:
         "diagnostics/linear_checks.cpp",
         "diagnostics/moe_checks.cpp",
         "diagnostics/session_checks.cpp",
-        "eval/kl.cpp",
     )
     for relative in required:
         assert (cuda / relative).is_file()
@@ -1398,7 +1392,9 @@ def test_cuda_ops_and_execution_are_real_compilation_units() -> None:
     assert "struct QuantLinear" not in CUDA_RUNTIME_SOURCE
     assert "cuda_quantized_ops" not in CUDA_BACKEND_SOURCE
     includes = re.findall(r'#include\s+["<]([^">]+\.inc)[">]', CUDA_BACKEND_SOURCE)
-    assert set(includes) == {'../mfq/linear_dispatch.inc', '../mfq/linear_reference.inc', '../mfq/linear_groups.inc'}
+    # Static codebook data does not introduce another operator dispatch unit.
+    dispatch_includes = set(includes) - {'../../../third_party/agention-gyro/codebook_f16.inc'}
+    assert dispatch_includes == {'../mfq/linear_dispatch.inc', '../mfq/linear_reference.inc', '../mfq/linear_groups.inc'}
 
 
 def test_cuda_build_dependencies_separate_ops_from_shared_execution() -> None:

@@ -10,12 +10,26 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include "components/io/read_span.h"
+
+namespace tyloi {class FileRangeReader;}
 
 namespace tyloi::cache {
 
 using BlockHash = std::array<std::uint8_t, 32>;
 using PagedPrefixPayload =
     std::shared_ptr<const std::vector<std::uint8_t>>;
+
+// Retains the existing SSD file, without retaining its full payload in RAM.
+// Byte ranges remain readable after cache eviction, replacement or clear().
+struct PagedPrefixReadLease {
+    std::size_t payload_bytes=0;
+    std::function<std::vector<std::uint8_t>(std::size_t,std::size_t)> read_range;
+    std::function<void(std::size_t,std::uint8_t*,std::size_t)> read_range_into;
+    std::function<void(const std::vector<tyloi::ReadSpan>&)> read_ranges_into;
+    std::shared_ptr<const tyloi::FileRangeReader> file_reader;
+    std::uint64_t file_offset=0;
+};
 
 BlockHash sha256(const void* data, std::size_t size);
 BlockHash sha256(std::string_view value);
@@ -100,6 +114,18 @@ public:
     std::optional<std::vector<std::uint8_t>> load(const BlockHash& hash);
     std::vector<PagedPrefixPayload> load_prefix(
         const std::vector<BlockHash>& blocks);
+
+    // No SSD lease is returned while a newer RAM version awaits persistence.
+    // load/load_prefix still expose that current version without forcing a write.
+    std::shared_ptr<const PagedPrefixReadLease> borrow(const BlockHash& block);
+    // Verify file leases with the configured bounded read parallelism. Keeps
+    // only file handles and small checksum buffers; missing entries are null.
+    std::vector<std::shared_ptr<const PagedPrefixReadLease>> borrow_prefix(
+        const std::vector<BlockHash>& blocks);
+
+    // Remove a block that passed file-integrity checks but failed the
+    // runtime codec's semantic validation. This rare path waits for an
+    // in-flight write of the same content-addressed block to settle first.
     bool invalidate(const BlockHash& block);
 
     void pin(const std::vector<BlockHash>& blocks);
@@ -117,5 +143,10 @@ private:
     class Implementation;
     std::unique_ptr<Implementation> implementation_;
 };
+
+// Disposable RAM payloads yield to active KV before its precision is reduced.
+// The callback does not extend the cache's lifetime or capture its engine.
+std::function<std::uint64_t(std::uint64_t)> make_ram_prefix_reclaimer(
+    std::weak_ptr<PagedPrefixCache> cache);
 
 } // namespace tyloi::cache

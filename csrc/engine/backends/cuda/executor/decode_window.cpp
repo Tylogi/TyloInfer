@@ -1,7 +1,7 @@
-#include "env.h"
+#include "engine/backends/cuda/native/env.h"
 #include "decode_window.h"
 #include "engine/backends/cuda/executor/options.h"
-#include "context.h"
+#include "engine/backends/cuda/native/context.h"
 #include "engine/backends/cuda/native/graph.h"
 #include "engine/backends/cuda/native/device.h"
 #include "components/error.h"
@@ -121,6 +121,8 @@ DecodeWindow::DecodeWindow(cudaStream_t stream,bool layer_profile,bool independe
 void DecodeWindow::mark(int layer,const char* phase) {
     profile_layer_=layer;
     if(!layer_profile_)return;
+    if(const auto* scope=tyloi::cuda::env_lookup("TYLOINFER_TRACE_LAYER_TIMINGS");scope && std::strcmp(scope,"4")==0 &&
+        std::strncmp(phase,"qsa_cache_",10)!=0 && std::strcmp(phase,"window_begin")!=0 && std::strcmp(phase,"window_end")!=0)return;
     // Scope 2 keeps the MFE phase boundaries. Timing every small operation
     // measurably perturbs Windows graph replay; ordinary execution adds none.
     if(const auto* scope=tyloi::cuda::env_lookup("TYLOINFER_TRACE_LAYER_TIMINGS");scope &&
@@ -131,7 +133,10 @@ void DecodeWindow::mark(int layer,const char* phase) {
         // input preparation (including the mapped host-plan wait). Scope 2
         // retains its existing event count for historical comparisons.
         constexpr const char* boundaries[]={"attention_core_begin","attention_core_end",
-            "ffn_pre_end","expert_begin","shared_end","ple_begin","ple_end","gate_up_end","down_end"};
+            "ffn_pre_end","expert_begin","shared_end","ple_begin","ple_end","gate_up_end","down_end",
+            "cpu_merge_begin","cpu_merge_end","resident_gate_up_end","resident_down_end","stream_copy_join","stream_gate_up_join","stream_down_join",
+            "gdn_input_end","gdn_recurrence_end","qsa_input_end","qsa_attention_end",
+            "cpu_input_publish_end","route_publish_end","input_fusion_end","head_begin","head_norm_end","head_projection_end"};
         if(std::none_of(std::begin(phases),std::end(phases),
                 [&](const char* allowed){return std::strcmp(phase,allowed)==0;}) &&
             (std::strcmp(scope,"3")!=0 || std::none_of(std::begin(boundaries),std::end(boundaries),
@@ -198,6 +203,25 @@ std::vector<DecodeWindow::GpuPhase> DecodeWindow::gpu_phases() const {
     }
     return phases;
 }
+struct DecodeWindow::BranchPool {
+    StreamHandle stream;
+    std::shared_ptr<Context> context;
+    explicit BranchPool(StreamHandle value):stream(std::move(value)),context(default_context(stream.device_index())) {
+        context->begin_graph_pool(stream.stream());
+    }
+    ~BranchPool(){context->end_graph_pool(stream.stream());}
+};
+void DecodeWindow::prepare_branch_stream(const StreamHandle& stream,std::shared_ptr<void>& owner) {
+    if(active!=this)throw std::logic_error("parallel stream outside window recording");
+    if(!stream || stream.stream()==stream_)throw std::invalid_argument("parallel stream must differ from its parent");
+    auto pool=std::static_pointer_cast<BranchPool>(owner);
+    if(pool && (pool->stream.stream()!=stream.stream() || pool->stream.device_index()!=stream.device_index()))
+        throw std::logic_error("parallel stream pool owner changed");
+    if(pool && std::find(branch_pools_.begin(),branch_pools_.end(),pool)!=branch_pools_.end())return;
+    if(recording_segments_)throw std::logic_error("parallel stream was not prepared before graph capture");
+    if(!pool){pool=std::make_shared<BranchPool>(stream);owner=pool;}
+    branch_pools_.push_back(std::move(pool));
+}
 DecodeWindow::~DecodeWindow() {
     // Mapped flags and task owners must survive the last consumer, including
     // a graph released by a failed CPU or I/O phase.
@@ -205,9 +229,9 @@ DecodeWindow::~DecodeWindow() {
     (void)cudaStreamSynchronize(stream_);
     graphs_.clear();
     for(auto& task:tasks_)if(task.cleanup)task.cleanup();
-    if(replays_ && tyloi::cuda::env_lookup("TYLOINFER_TRACE_NATIVE_CUDA_GRAPH"))
+    if((replays_ || async_replays_) && tyloi::cuda::env_lookup("TYLOINFER_TRACE_NATIVE_CUDA_GRAPH"))
         std::cerr<<"native_cuda_window tasks="<<tasks_.size()<<" replays="<<replays_
-            <<" capture_ns="<<capture_ns_<<" replay_ns="<<replay_ns_
+            <<" async_replays="<<async_replays_<<" capture_ns="<<capture_ns_<<" replay_ns="<<replay_ns_
             <<" reset_ns="<<reset_ns_<<" launch_ns="<<launch_ns_<<" serve_ns="<<serve_ns_
             <<" wait_ns="<<wait_ns_<<" finish_ns="<<finish_ns_<<" profile_ns="<<profile_ns_
             <<" role="<<profile_role_<<" rows="<<profile_rows_
@@ -238,7 +262,7 @@ void DecodeWindow::set_kernel_rows(std::size_t segment,cudaGraphNode_t node,unsi
 }
 void DecodeWindow::host_barrier(std::function<void()> serve) {
     if(active!=this)throw std::logic_error("host I/O barrier outside window capture");
-    if(recording_segments_)graphs_.end(barriers_.size(),1);
+    if(recording_segments_)graphs_.end_segment(barriers_.size(),1);
     barriers_.push_back({tasks_.size(),std::move(serve)});
     if(recording_segments_)graphs_.begin(barriers_.size(),1);
 }
@@ -279,7 +303,11 @@ void DecodeWindow::capture(const std::function<void()>& body,const std::function
         // in capture, including a previously unused output projection.
         for(int pass=0;pass<2;++pass) {
             {int device=0;TYLOINFER_NATIVE_CUDA_CHECK(cudaGetDevice(&device));
-                GraphWarmupScope warmup(default_context(device),stream_);body();}
+                GraphWarmupScope warmup(default_context(device),stream_);
+                std::vector<std::unique_ptr<GraphWarmupScope>> branches;
+                for(const auto& pool:branch_pools_)
+                    branches.push_back(std::make_unique<GraphWarmupScope>(pool->context,pool->stream.stream()));
+                body();}
             TYLOINFER_NATIVE_CUDA_CHECK(cudaStreamSynchronize(stream_));restore();
             release_warm_outputs();
             if(!pass){tasks_.clear();barriers_.clear();}
@@ -287,8 +315,22 @@ void DecodeWindow::capture(const std::function<void()>& body,const std::function
         const auto warm_tasks=tasks_.size(),warm_barriers=barriers_.size();tasks_.clear();barriers_.clear();
         checkpoint("record");
         try {
-            recording_segments_=true;graphs_.begin(0,1);body();graphs_.end(barriers_.size(),1);
+            struct BranchCapture {
+                const std::vector<std::shared_ptr<BranchPool>>& pools;
+                std::size_t started=0;
+                explicit BranchCapture(const std::vector<std::shared_ptr<BranchPool>>& value):pools(value) {
+                    try {
+                        for(const auto& pool:pools){pool->context->begin_graph_capture(pool->stream.stream());++started;}
+                    }catch(...){finish();throw;}
+                }
+                void finish()noexcept {
+                    while(started){const auto& pool=pools[--started];pool->context->end_graph_capture(pool->stream.stream());}
+                }
+                ~BranchCapture(){finish();}
+            } branch_capture(branch_pools_);
+            recording_segments_=true;graphs_.begin(0,1);body();graphs_.end_segment(barriers_.size(),1);
             recording_segments_=false;
+            if(!nodes())throw Error("CUDA decode window body produced no work");
         } catch(const std::exception& failure) {
             recording_segments_=false;graphs_.clear();
             const std::string error=failure.what();
@@ -324,6 +366,17 @@ void DecodeWindow::capture(const std::function<void()>& body,const std::function
         restore();failed_=true;throw;
     }
 }
+bool DecodeWindow::enqueue_if_device_only() {
+    if(!tasks_.empty() || !barriers_.empty() || layer_profile_)return false;
+    if(!valid() || failed_)throw std::logic_error("MFQ device graph is not ready");
+    std::string error;
+    if(!graphs_.find(0,1)->launch(stream_,error)) {
+        failed_=true;throw std::runtime_error(error);
+    }
+    ++async_replays_;
+    return true;
+}
+
 void DecodeWindow::run() {
     if(failed_ || !valid())throw std::runtime_error("MFQ window is unavailable after a failed execution");
     const HostRegistrationBlock registration;

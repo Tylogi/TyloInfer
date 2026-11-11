@@ -143,7 +143,7 @@ inline bool mfq_hip_graph_capture_supported() {
 inline void mfq_hip_record_stream(
     const ::mfq::cuda::Tensor& tensor,
     const MfqCudaStream& stream) {
-    tensor.record_stream(reinterpret_cast<std::uintptr_t>(stream.stream()));
+    tensor.record_stream(reinterpret_cast<std::uintptr_t>(stream.stream()),stream.lifetime());
 }
 
 struct MfqCudaMemoryStats {

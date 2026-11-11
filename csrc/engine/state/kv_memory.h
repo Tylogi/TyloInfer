@@ -1,6 +1,6 @@
 #pragma once
 
-#include "backend.h"
+#include "engine/backends/cuda/native/tensor/backend.h"
 #include "engine/state/kv_offload.h"
 #include "engine/backends/cuda/kernels/mfq_cuda_kv_hot_cache.h"
 #include "engine/weights/workspace.h"
@@ -55,6 +55,7 @@ public:
     void bind_budget(tyloi::engine::Budget* budget) { budget_ = budget; }
     std::shared_ptr<KvOffloadStore> offload() const { return offload_; }
     bool dynamic() const { return options_.dynamic; }
+    bool ssd_enabled() const { return options_.placement=="auto_ssd"; }
     std::size_t growth_reserve() const;
     std::size_t expert_budget_charge() const;
     std::vector<std::pair<std::string,double>> metrics() const;

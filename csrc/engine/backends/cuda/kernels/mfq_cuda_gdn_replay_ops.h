@@ -1,0 +1,51 @@
+#pragma once
+#include "engine/backends/cuda/native/tensor/backend.h"
+#include <cstdint>
+#include <vector>
+struct GdnReplayLayer {
+    const void* qkv;const void* alpha;const void* beta;
+    float* convolution;float* state;float* next_convolution;
+    const float* weight;const float* bias;const float* a_log;
+    std::int64_t qkv_stride,alpha_stride,alpha_head_stride,beta_stride,beta_head_stride;
+    int key_heads,value_heads,channels,tokens,weight_layout;
+    int transposed,tiled_heads,qkv_float,gate_float;
+    float convolution_eps;
+    // Optional [tokens,value_heads,257]: normalized key, rank-one delta,
+    // decay. These are computed by verification, without changing state.
+    const float* updates=nullptr;
+};
+// Evaluate a window into separate final-state storage. Confirmed state stays
+// unchanged until the caller commits the full window or replays a prefix.
+// Returns output, final convolution, final recurrence, and [T,Hv,257]
+// normalized-key/rank-one-delta/decay records for exact prefix replay.
+std::vector<::tyloi::DenseTensor> gdn_verify_window_cuda(
+    const ::tyloi::DenseTensor& qkv,const ::tyloi::DenseTensor& output_gate,
+    const ::tyloi::DenseTensor& alpha,const ::tyloi::DenseTensor& beta,
+    const ::tyloi::DenseTensor& convolution_state,const ::tyloi::DenseTensor& recurrent_state,
+    const ::tyloi::DenseTensor& convolution_weight,const ::tyloi::DenseTensor& dt_bias,
+    const ::tyloi::DenseTensor& a_log,const ::tyloi::DenseTensor& norm_weight,
+    int key_heads,int value_heads,double convolution_eps,double norm_eps,
+    bool silu_gate,bool output_half,bool transposed_state,bool tiled_heads=false,
+    bool quantize_output=false,bool position_major=false);
+// Apply verification's recorded rank-one updates and convolution history in
+// one state-only launch. Exact input/output aliases are supported; partial
+// aliases and unsupported geometry return false before modifying outputs.
+bool try_gdn_replay_updates_cuda(
+    const ::tyloi::DenseTensor& qkv,const ::tyloi::DenseTensor& updates,
+    const ::tyloi::DenseTensor& initial_convolution,const ::tyloi::DenseTensor& initial_recurrent,
+    ::tyloi::DenseTensor& convolution,::tyloi::DenseTensor& recurrent,
+    std::int64_t retained_tokens,bool transposed_state);
+// The descriptors and next-convolution buffers persist across windows. State
+// commits run across layers, followed by one convolution-history copy.
+void gdn_replay_commit_layers_cuda(const ::tyloi::DenseTensor& descriptors,
+    int layers,int maximum_heads,int maximum_channels,int keep,bool recorded_updates=false);
+// Read a proposed window without changing committed state, or replay only
+// its accepted prefix to commit. No full per-prefix state snapshots.
+std::vector<::tyloi::DenseTensor> gdn_replay_window_cuda(
+    const ::tyloi::DenseTensor& qkv,const ::tyloi::DenseTensor& output_gate,
+    const ::tyloi::DenseTensor& alpha,const ::tyloi::DenseTensor& beta,
+    const ::tyloi::DenseTensor& convolution_state,const ::tyloi::DenseTensor& recurrent_state,
+    const ::tyloi::DenseTensor& convolution_weight,const ::tyloi::DenseTensor& dt_bias,
+    const ::tyloi::DenseTensor& a_log,const ::tyloi::DenseTensor& norm_weight,
+    int key_heads,int value_heads,double convolution_eps,double norm_eps,
+    bool silu_gate,bool output_half,bool transposed_state,bool commit,bool tiled_heads=false,bool record_updates=false,bool quantize_output=false,bool position_major=false);

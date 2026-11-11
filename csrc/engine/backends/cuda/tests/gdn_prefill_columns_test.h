@@ -1,26 +1,28 @@
 #pragma once
-#include "env.h"
+#include "engine/backends/cuda/native/env.h"
 
 class GdnColumnsScope {
     std::string previous_;
     bool present_;
+    const char* key_;
 public:
-    explicit GdnColumnsScope(int columns):present_(tyloi::cuda::env_lookup("TYLOINFER_GDN_PREFILL_COLUMNS")!=nullptr) {
-        if(present_)previous_=tyloi::cuda::env_lookup("TYLOINFER_GDN_PREFILL_COLUMNS");
-        set(columns);
+    explicit GdnColumnsScope(int columns,const char* key="TYLOINFER_GDN_PREFILL_COLUMNS"):present_(tyloi::cuda::env_lookup(key)!=nullptr),key_(key) {
+        if(present_)previous_=tyloi::cuda::env_lookup(key_);
+        set(columns,key_);
     }
-    static void set(int columns) {
+    static void set(int columns,const char* key="TYLOINFER_GDN_PREFILL_COLUMNS") {
         const auto value=columns<0?std::string():std::to_string(columns);
-        if(value.empty()?tyloi::cuda::env_clear("TYLOINFER_GDN_PREFILL_COLUMNS"):tyloi::cuda::env_set("TYLOINFER_GDN_PREFILL_COLUMNS",value.c_str()))
+        if(value.empty()?tyloi::cuda::env_clear(key):tyloi::cuda::env_set(key,value.c_str()))
             throw std::runtime_error("GDN columns option");
     }
     ~GdnColumnsScope() {
-        if(present_)tyloi::cuda::env_set("TYLOINFER_GDN_PREFILL_COLUMNS",previous_.c_str());
-        else tyloi::cuda::env_clear("TYLOINFER_GDN_PREFILL_COLUMNS");
+        if(present_)tyloi::cuda::env_set(key_,previous_.c_str());
+        else tyloi::cuda::env_clear(key_);
     }
 };
 
 void gdn_prefill_columns_case() {
+    GdnColumnsScope keyhead(0,"TYLOINFER_GDN_PREFILL_KEYHEAD");
     GdnColumnsScope option(0);
     const auto bits=[](const Tensor& a,const Tensor& b,const char* label) {
         auto x=a.cpu().contiguous(),y=b.cpu().contiguous();

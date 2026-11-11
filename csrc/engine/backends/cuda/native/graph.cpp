@@ -2,6 +2,7 @@
 #include "graph.h"
 #include "context.h"
 #include "device.h"
+#include <cuda.h>
 
 #include <algorithm>
 #include <cstdlib>
@@ -57,11 +58,9 @@ void Graph::prepare_memory() {
 void Graph::prepare_memory(
         const std::vector<StreamHandle>& participant_streams) {
     reset();
-    auto stream = current_stream();
-    auto context = default_context(stream.device_index());
-    stream_ = std::move(stream);
+    stream_ = current_stream();
     device_ = stream_.device_index();
-    context_ = std::move(context);
+    context_ = default_context(device_);
     const auto add_pool = [&](const StreamHandle& candidate) {
         if (!candidate) return;
         const auto duplicate = std::find_if(
@@ -110,7 +109,7 @@ void Graph::capture_begin() {
                 pool_streams_[index].stream());
         }
         TYLOINFER_NATIVE_CUDA_CHECK(cudaStreamBeginCapture(
-            stream_.stream(), cudaStreamCaptureModeThreadLocal));
+            stream_.stream(), cudaStreamCaptureModeGlobal));
     } catch (...) {
         for (std::size_t index = 0; index < pool_streams_.size(); ++index) {
             pool_contexts_[index]->end_graph_capture(
@@ -122,11 +121,9 @@ void Graph::capture_begin() {
 
 void Graph::capture_begin_shared() {
     if (stream_ || graph_ || executable_) throw Error("graph already owns a capture");
-    auto stream = current_stream();
-    auto context = default_context(stream.device_index());
-    stream_ = std::move(stream);
+    stream_ = current_stream();
     device_ = stream_.device_index();
-    context_ = std::move(context);
+    context_ = default_context(device_);
     shared_pool_ = true;
     context_->begin_graph_capture(stream_.stream());
     try {
@@ -176,10 +173,18 @@ void Graph::capture_end() {
         const char* resources=tyloi::cuda::env_lookup("TYLOINFER_TRACE_NATIVE_CUDA_KERNEL_RESOURCES");
         std::size_t kernels = 0;
         std::size_t copies = 0;
+        std::size_t memops = 0;
         for (auto node : nodes) {
-            cudaGraphNodeType type = cudaGraphNodeTypeEmpty;
-            TYLOINFER_NATIVE_CUDA_CHECK(cudaGraphNodeGetType(node, &type));
-            if (type == cudaGraphNodeTypeKernel) {
+            // The Runtime API cannot classify a driver BatchMemOp node in
+            // older toolkits, even though capture/instantiate/replay support
+            // it. Query through the API that defines that node type.
+            CUgraphNodeType type = CU_GRAPH_NODE_TYPE_EMPTY;
+            const auto queried=cuGraphNodeGetType(reinterpret_cast<CUgraphNode>(node),&type);
+            if(queried!=CUDA_SUCCESS) {
+                const char* error=nullptr;cuGetErrorString(queried,&error);
+                throw Error(std::string("CUDA graph node type: ")+(error?error:"driver error"));
+            }
+            if (type == CU_GRAPH_NODE_TYPE_KERNEL) {
                 ++kernels;
                 if(resources && std::atoi(resources)!=0) {
                     cudaKernelNodeParams params{};
@@ -195,13 +200,15 @@ void Graph::capture_end() {
                             <<" dynamic_shared_bytes="<<params.sharedMemBytes<<'\n';
                     }
                 }
-            } else if (type == cudaGraphNodeTypeMemcpy) {
+            } else if (type == CU_GRAPH_NODE_TYPE_MEMCPY) {
                 ++copies;
-            } else if (type == cudaGraphNodeTypeMemAlloc) {
+            } else if (type == CU_GRAPH_NODE_TYPE_BATCH_MEM_OP) {
+                ++memops;
+            } else if (type == CU_GRAPH_NODE_TYPE_MEM_ALLOC) {
                 cudaMemAllocNodeParams params{};
                 TYLOINFER_NATIVE_CUDA_CHECK(cudaGraphMemAllocNodeGetParams(node, &params));
                 allocations.insert(reinterpret_cast<void*>(params.dptr));
-            } else if (type == cudaGraphNodeTypeMemFree) {
+            } else if (type == CU_GRAPH_NODE_TYPE_MEM_FREE) {
                 void* pointer = nullptr;
                 TYLOINFER_NATIVE_CUDA_CHECK(cudaGraphMemFreeNodeGetParams(node, &pointer));
                 frees.insert(pointer);
@@ -218,6 +225,7 @@ void Graph::capture_end() {
         std::cerr << "native_cuda_graph nodes=" << count
                   << " kernels=" << kernels
                   << " copies=" << copies
+                  << " memops=" << memops
                   << " allocations=" << allocations.size()
                   << " frees=" << frees.size()
                   << " allocation_only=" << allocation_only
@@ -230,7 +238,7 @@ void Graph::capture_end() {
         upload == nullptr || std::atoi(upload) != 0) {
         TYLOINFER_NATIVE_CUDA_CHECK(cudaGraphUpload(executable_, stream_.stream()));
         TYLOINFER_NATIVE_CUDA_CHECK(cudaStreamSynchronize(stream_.stream()));
-        context_->check_memory_limit();
+        default_context(stream_.device_index())->check_memory_limit();
     }
 }
 
@@ -243,7 +251,7 @@ void Graph::replay() {
 }
 
 void Graph::reset() noexcept {
-    internal::on_device_noexcept(device_, [&] {
+    on_device_noexcept(device_, [&] {
         if (stream_) {
             cudaStreamCaptureStatus capture_status =
                 cudaStreamCaptureStatusNone;

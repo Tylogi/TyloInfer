@@ -58,6 +58,9 @@ public:
     int device_index() const noexcept { return device_; }
     int device() const noexcept { return device_; }
     cudaStream_t stream() const noexcept { return stream_; }
+    std::shared_ptr<void> lifetime() const noexcept {
+        return owner_.use_count() ? std::shared_ptr<void>(owner_, reinterpret_cast<void*>(stream_)) : std::shared_ptr<void>{};
+    }
     operator cudaStream_t() const noexcept { return stream_; }
     explicit operator bool() const noexcept { return stream_ != nullptr; }
 

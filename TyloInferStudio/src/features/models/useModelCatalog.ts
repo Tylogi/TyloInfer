@@ -15,6 +15,9 @@ import { useJobStore } from '../../stores/jobStore';
 import { readModelDirectory, saveModelDirectory } from './modelDirectoryPreference';
 import { readLoadContext, saveLoadContext, type LoadContextDefaults } from './loadContextDefaults';
 
+type LoadPreferences = { context: LoadContextDefaults; pinned: boolean; deviceIds: string[]; idleTtl: number | null };
+const defaultPreferences = (name: string): LoadPreferences => ({ context: readLoadContext(name), pinned: false, deviceIds: [], idleTtl: null });
+
 export function useModelCatalog() {
   const {
     runtime,
@@ -41,13 +44,24 @@ export function useModelCatalog() {
     toast.error(errorMessage(cause, tr));
   };
   const [modelFilter, setModelFilter] = useState('');
-  const [loadPinned, setLoadPinned] = useState(false);
-  const [loadDeviceIds, setLoadDeviceIds] = useState<string[]>([]);
-  const [loadIdleTtl, setLoadIdleTtl] = useState<number | null>(null);
-  const [loadContext, updateLoadContext] = useState(readLoadContext);
+  const [settingsModel, setSettingsModel] = useState<string | null>(null);
+  const [loadPreferences, setLoadPreferences] = useState<Record<string, LoadPreferences>>({});
+  const modelSettingsTriggerRef = useRef<HTMLElement | null>(null);
+  const preferences = settingsModel ? loadPreferences[settingsModel] ?? defaultPreferences(settingsModel) : defaultPreferences('');
+  const { pinned: loadPinned, deviceIds: loadDeviceIds, idleTtl: loadIdleTtl, context: loadContext } = preferences;
+  function changePreferences(change: Partial<LoadPreferences>) {
+    if (settingsModel) setLoadPreferences(current => ({ ...current, [settingsModel]: { ...current[settingsModel] ?? defaultPreferences(settingsModel), ...change } }));
+  }
+  const setLoadPinned = (pinned: boolean) => changePreferences({ pinned });
+  const setLoadDeviceIds = (deviceIds: string[]) => changePreferences({ deviceIds });
+  const setLoadIdleTtl = (idleTtl: number | null) => changePreferences({ idleTtl });
   function setLoadContext(value: LoadContextDefaults) {
-    updateLoadContext(value);
-    saveLoadContext(value);
+    changePreferences({ context: value });
+    if (settingsModel) saveLoadContext(value, settingsModel);
+  }
+  function openModelSettings(name: string) {
+    modelSettingsTriggerRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    setSettingsModel(name);
   }
   const [modelBrowser, setModelBrowser] = useState<ModelDirectoryList | null>(null);
   const [modelBrowserOpen, updateModelBrowserOpen] = useState(false);
@@ -86,8 +100,8 @@ export function useModelCatalog() {
     updateModelBrowserOpen(false);
     setBusy(false);
     setModelDeletion(null);
-    setLoadDeviceIds([]);
-    updateLoadContext(readLoadContext());
+    setSettingsModel(null);
+    setLoadPreferences({});
   }, [connectionRevision]);
   useEffect(() => {
     if (!ready) return;
@@ -123,7 +137,7 @@ export function useModelCatalog() {
       polling = true;
       const request = ++artifactRequest.current;
       try {
-        const items = await modelsApi.modelArtifacts(true);
+        const items = await modelsApi.modelArtifacts(true, true);
         if (active && request === artifactRequest.current) { setArtifacts(items); reported = false; }
       } catch (cause) {
         if (active && request === artifactRequest.current && !reported) { reportError(cause); reported = true; }
@@ -168,22 +182,28 @@ export function useModelCatalog() {
       ),
     [artifacts, modelFilter],
   );
-  async function loadArtifact(name: string) {
+  async function loadArtifact(name: string, companions?: string[]) {
     const current = connectionScope();
     if (busy) return;
     setBusy(true);
     try {
-      await modelsApi.loadModel(name, loadContext.context_size ?? 32768, 'auto', {
-        pin: loadPinned,
-        device_ids: loadDeviceIds,
-        idle_ttl_seconds: loadIdleTtl,
-        context_management: loadContext,
+      if (artifacts.some(item => item.name === name && item.asset_kind && item.asset_kind !== 'model')) {
+        throw new Error(tr('配套资产不能单独作为模型加载。', 'Companion assets cannot be loaded as standalone models.'));
+      }
+      const options = loadPreferences[name] ?? defaultPreferences(name);
+      await modelsApi.loadModel(name, options.context.context_size, 'auto', {
+        pin: options.pinned,
+        device_ids: options.deviceIds,
+        idle_ttl_seconds: options.idleTtl,
+        ...(!options.context.automatic ? { context_management: options.context } : {}),
+        ...(companions?.length ? { gguf_companions: companions } : {}),
       });
       if (!current()) return;
       navigate(STUDIO_PATHS.models);
       await refreshRuntime(false);
       if (!current()) return;
       setSelectedModel(name);
+      setSettingsModel(null);
     } catch (cause) {
       if (current()) reportError(cause);
     } finally {
@@ -194,11 +214,12 @@ export function useModelCatalog() {
   async function finishModelRegistration(names: string[], current: () => boolean) {
     if (!current()) return;
     const request = ++artifactRequest.current;
-    const nextArtifacts = await modelsApi.modelArtifacts(true);
+    const nextArtifacts = await modelsApi.modelArtifacts(true, true);
     if (!current()) return;
     if (request === artifactRequest.current) setArtifacts(nextArtifacts);
-    const registered = nextArtifacts.filter((item) => names.includes(item.name));
-    if (!registered.length) {
+    const selected = nextArtifacts.filter((item) => names.includes(item.name));
+    const registered = selected.filter(item => !item.asset_kind || item.asset_kind === 'model');
+    if (!selected.length) {
       throw new Error(
         tr(
           '所选目录中的模型没有出现在模型目录中。',
@@ -220,12 +241,13 @@ export function useModelCatalog() {
       const loaded =
         instances.some((item) => item.model === artifact.name && item.state !== 'failed') ||
         runtime?.model === artifact.name;
-      if (!loaded) {
-        await modelsApi.loadModel(artifact.name, loadContext.context_size ?? 32768, 'auto', {
-          pin: loadPinned,
-          device_ids: loadDeviceIds,
-          idle_ttl_seconds: loadIdleTtl,
-          context_management: loadContext,
+      if (!loaded && !artifact.gguf_companion_required) {
+        const options = loadPreferences[artifact.name] ?? defaultPreferences(artifact.name);
+        await modelsApi.loadModel(artifact.name, options.context.context_size, 'auto', {
+          pin: options.pinned,
+          device_ids: options.deviceIds,
+          idle_ttl_seconds: options.idleTtl,
+          ...(!options.context.automatic ? { context_management: options.context } : {}),
         });
         if (!current()) return;
       }
@@ -234,7 +256,7 @@ export function useModelCatalog() {
     navigate(STUDIO_PATHS.models);
     await refreshRuntime(false);
     if (!current()) return;
-    if (registered.length === 1) setSelectedModel(registered[0].name);
+    if (registered.length === 1 && !registered[0].gguf_companion_required) setSelectedModel(registered[0].name);
   }
 
   async function openModelDirectory(directoryId?: string | null, path?: string | null) {
@@ -378,7 +400,7 @@ export function useModelCatalog() {
       setArtifacts(items => items.filter(item => item.id !== plan.model_id));
       setModelDeletion(null);
       const request = ++artifactRequest.current;
-      const next = await modelsApi.modelArtifacts(true);
+      const next = await modelsApi.modelArtifacts(true, true);
       if (current() && request === artifactRequest.current) setArtifacts(next);
     } catch (cause) {
       if (current()) reportError(cause);
@@ -447,5 +469,9 @@ export function useModelCatalog() {
     prepareModelDeletion,
     cancelModelDeletion,
     confirmModelDeletion,
+    settingsModel,
+    setSettingsModel,
+    openModelSettings,
+    modelSettingsTriggerRef,
   };
 }

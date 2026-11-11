@@ -32,27 +32,15 @@ dependencies = [
     "numpy>=1.24.0",
     "Pillow>=10.0.0",
     "pypdf>=5.0.0",
-    "pyarrow>=14.0.0",
     "psutil>=5.9.0",
     "pydantic>=2.8.0",
     "tokenizers>=0.19.0",
     "tqdm>=4.66.0",
     "uvicorn>=0.30.0",
-    "websockets>=12.0",
+    "websockets>=15.0",
 ]
 
 [project.optional-dependencies]
-benchmark = [
-    "pandas>=2.0.0,<3",
-    "sympy>=1.13.0",
-    "regex>=2024.0.0",
-    "loguru>=0.7.0",
-    "PyYAML>=6.0.0",
-    "antlr4-python3-runtime==4.11.1",
-]
-reference = [
-    "mlx-lm==0.31.3; sys_platform == 'darwin' and platform_machine == 'arm64'",
-]
 dev = [
     "pytest>=7.0.0",
     "ruff>=0.1.0",
@@ -111,6 +99,8 @@ where = ["."]
 include = ["tyloinfer*"]
 
 [tool.setuptools.package-data]
+"tyloinfer._gyro" = ["*.h", "*.inc", "*.c", "*.bin", "LICENSE", "NOTICE"]
+"tyloinfer.kernels.hip" = ["*.hip", "*.h"]
 "tyloinfer.kernels.cuda" = ["tq_ops.cu", "tq_ops.h", "tq_*.cuh"]
 "tyloinfer.kernels.metal" = ["tq_decode.h", "tq_matmul.h"]
 "tyloinfer.server" = [
@@ -119,12 +109,6 @@ include = ["tyloinfer*"]
 
 [tool.uv]
 override-dependencies = ["librosa>=0.10.0"]
-conflicts = [
-    [
-        { extra = "reference" },
-        { extra = "minicpmo45" },
-    ],
-]
 
 [tool.black]
 line-length = 100

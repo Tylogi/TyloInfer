@@ -32,7 +32,12 @@ struct Predictor {
     bool bootstrap = false;
     bool split = false;
     bool blockwise = false;
+    bool greedy_block=false;
+    int block_depth=0,greedy_block_calls=0;
+    int context_batch = 1;
+    int preferred_context_update_batch_size() const {return context_batch;}
     std::vector<std::pair<int64_t,int64_t>> context_appends;
+    int deferred_context_appends=0;
     int maximum_draft_depth() const { return 3; }
     bool dspark_policy() const { return legacy; }
     bool blockwise_drafting() const { return blockwise; }
@@ -52,9 +57,16 @@ struct Predictor {
         if(!blockwise || position || value.shape.at(1)>tokens)throw std::logic_error("invalid context seed");
         position=tokens-value.shape.at(1);append_target_context(value,position);
     }
+    void append_target_context_for_draft(Tensor value,int64_t start) {
+        ++deferred_context_appends;append_target_context(value,start);
+    }
     Tensor draft_block(int, Tensor, int depth) {
         if(!blockwise)throw std::logic_error("not blockwise");
-        return {{1,depth,1},true};
+        block_depth=depth;return {{1,depth,1},true};
+    }
+    std::vector<int32_t> draft_greedy_tokens(Tensor) {
+        if(!greedy_block)return {};
+        ++greedy_block_calls;return std::vector<int32_t>(block_depth,1);
     }
     Tensor draft_next(Tensor hidden, Tensor) {
         if(!blockwise)throw std::logic_error("not blockwise");
@@ -156,6 +168,43 @@ struct Ops {
     }
 };
 
+void run_probability_options() {
+    struct ProbabilityOps:Ops {
+        mtp::DraftProbabilityOptions policy;
+        auto mtp_probability_options() const {return policy;}
+        static std::pair<int32_t,float> greedy_probability(Tensor logits,Tensor counts) {
+            return {Ops::sample_normal(logits,counts),.8f};
+        }
+    };
+    for(int mode=0;mode<4;++mode) {
+        Model model;Predictor predictor;predictor.blockwise=mode==2;
+        mtp::DraftProbabilityOptions policy;
+        policy.minimum_probability=mode==1?.9:mode==2?.99:.5;
+        if(mode==2)policy.chain_confidence=.6;
+        if(mode==3){policy.minimum_probability=0.;policy.cost_aware=true;}
+        InferenceRequest request;request.chat=false;request.prompt={0,0,0};
+        request.sampling.max_tokens=20;request.sampling.mtp_max_draft_tokens=3;
+        request.sampling.temperature=0.;
+        InferenceOutput output(request,nullptr,"probability-policy");
+        Tensor last;
+        auto generation=speculative_sequence(ProbabilityOps{Ops{model,predictor},policy},
+            request,output,512,0,Tensor{},&last);
+        std::vector<int64_t> tokens;
+        while(auto step=generation.next())if(step.value)
+            if(const auto* delta=std::get_if<TokenOutput>(&*step.value))
+                tokens.insert(tokens.end(),delta->token_ids.begin(),delta->token_ids.end());
+        if(tokens!=std::vector<int64_t>(20,0) || model.cache_pos!=22 || !Ops::defined(last))
+            throw std::runtime_error("probability-gated MTP changed output or committed cache boundary");
+        const auto& stats=output.metrics.mtp;
+        if((mode==0 && !stats.depth_cycles[3]) || (mode==1 && stats.drafted_tokens) ||
+            (mode==2 && (!stats.depth_cycles[2] || stats.depth_cycles[3])) ||
+            (mode==3 && !stats.depth_cycles[0]))
+            throw std::runtime_error("explicit MTP probability policy did not control the actual verification width");
+        if(stats.park_count || stats.reentry_probes)
+            throw std::runtime_error("explicit probability policy inherited default adaptive parking");
+    }
+}
+
 void run(bool dspark,bool metal_policy=false,bool inherited_park=false) {
     struct PolicyOps : Ops {
         bool metal_policy;
@@ -255,6 +304,74 @@ void run_chunked_prompt_history(bool streaming, int reused) {
     if(boundaries.empty() || (streaming?boundaries.front()>=13:boundaries.front()!=13) ||
         mtp.position!=12 || last_hidden.start!=12 || output.result.completion_tokens!=1)
         throw std::runtime_error("streamed prompt history changed the final cache boundary");
+}
+
+void run_native_prompt_checkpoint() {
+    for(bool streaming:{false,true})for(int reused:{0,1,4})
+    for(int stable:{0,1,2,5,9,12,13,14})for(int chunk:{1,4,64})for(bool cancel:{false,true}) {
+        const bool checkpoint=stable>reused && stable<13;
+        if(cancel && !checkpoint)continue;
+        struct CheckpointOps:Ops {
+            bool streaming;
+            std::vector<int64_t>* pairs;
+            std::vector<PrefillChunk>* chunks;
+            bool stream_prompt_history(int64_t) const {return streaming;}
+            static Tensor slice(Tensor value,int axis,int64_t begin,int64_t length) {
+                value=Ops::slice(value,axis,begin,length);value.start+=begin;return value;
+            }
+            static Tensor concatenate(const std::vector<Tensor>& values,int axis) {
+                int64_t end=values.front().start;
+                for(const auto& value:values) {
+                    if(value.start!=end)throw std::runtime_error("native checkpoint concatenated disjoint hidden rows");
+                    end+=size(value,axis);
+                }
+                return Ops::concatenate(values,axis);
+            }
+            Prefill prefill(PrefillChunk chunk) {
+                if(chunk.offset!=model.cache_pos)throw std::runtime_error("native checkpoint repeated target rows");
+                chunks->push_back(chunk);model.cache_pos+=chunk.count;
+                Tensor hidden{{1,chunk.count,1},false,chunk.offset};
+                return {hidden,hidden,1.0};
+            }
+            double predictor_prefill(Tensor hidden,Tensor ids,Tensor positions) {
+                if(hidden.start+1!=ids.start || size(hidden,1)!=size(ids,1) || ids.start!=mtp.position+1)
+                    throw std::runtime_error("native checkpoint lost or repeated a predictor pair");
+                for(int64_t i=0;i<size(ids,1);++i)pairs->push_back(ids.start+i);
+                (void)predictor_step(hidden,ids,positions);return 2.0;
+            }
+        };
+        Model model;model.cache_pos=reused;
+        Predictor mtp;mtp.position=reused?reused-1:0;
+        InferenceRequest request;request.prompt=std::vector<int64_t>(13,0);
+        request.sampling.max_tokens=8;request.stop_token_ids={0};
+        InferenceOutput output(request,nullptr,"native-prompt-checkpoint");
+        Tensor hidden,restored{{1,1,1},false,reused-1};
+        std::vector<int64_t> pairs,boundaries;std::vector<PrefillChunk> chunks;
+        auto generation=speculative_sequence(CheckpointOps{{model,mtp},streaming,&pairs,&chunks},
+            request,output,chunk,reused,restored,&hidden,stable);
+        while(auto step=generation.next())if(step.value)
+            if(const auto* progress=std::get_if<PrefillProgress>(&*step.value);progress && progress->session_boundary) {
+                if(output.metrics.saw_token || mtp.position!=model.cache_pos-1 ||
+                        !Ops::defined(hidden) || Ops::size(hidden,1)!=1 || hidden.start!=model.cache_pos-1)
+                    throw std::runtime_error("native snapshot target/predictor/hidden boundaries disagree");
+                boundaries.push_back(model.cache_pos);
+                if(progress->timing.prompt_tokens!=model.cache_pos-reused)
+                    throw std::runtime_error("native checkpoint omitted target tokens from PP");
+                if(cancel)output.result.cancelled=true;
+            }
+        std::vector<int64_t> expected_boundaries;
+        if(checkpoint)expected_boundaries.push_back(stable);
+        if(!cancel)expected_boundaries.push_back(13);
+        if(boundaries!=expected_boundaries || output.result.completion_tokens!=(cancel?0:1))
+            throw std::runtime_error("native checkpoint emitted a wrong boundary or ignored cancellation");
+        std::vector<int64_t> expected_pairs;
+        const auto end=cancel?stable:13;
+        for(int i=std::max(1,reused);i<end;++i)expected_pairs.push_back(i);
+        if(pairs!=expected_pairs || model.cache_pos!=end || mtp.position!=end-1)
+            throw std::runtime_error("native checkpoint changed the target or predictor history");
+        for(const auto& part:chunks)if(part.last!=(part.offset+part.count==13))
+            throw std::runtime_error("native checkpoint changed the last-chunk flag");
+    }
 }
 
 void run_prompt_snapshot_boundary() {
@@ -449,10 +566,14 @@ void run_batched_greedy(bool penalties) {
 
 void run_committed_route_hooks(bool accept_all,bool cancel_during_target=false,bool partial=false,bool retain_prefix=true,
         bool split=false,int depth=3) {
-    struct Journal {int pending=0,begins=0,commits=0,cancels=0,rows=0;};
+    struct Journal {int pending=0,begins=0,commits=0,cancels=0,rows=0,rollbacks=0;};
     struct JournalOps : Ops {
         Journal* journal;bool accept_all,cancel_target,partial,retain_prefix;InferenceOutput* output;
         bool retains_partial_target_prefix(int)const{return retain_prefix;}
+        void rollback_target(int64_t keep) {
+            if(!journal->pending)throw std::runtime_error("rollback lost pending verification routes");
+            ++journal->rollbacks;model.rollback_speculative(int(keep));
+        }
         void begin_target_routes(int rows) {
             if(journal->pending || rows<1)throw std::runtime_error("route journal nested or entered ordinary prefill");
             journal->pending=rows;++journal->begins;
@@ -491,6 +612,8 @@ void run_committed_route_hooks(bool accept_all,bool cancel_during_target=false,b
     while(generation.next().value){}
     if(journal.pending || !journal.begins || journal.begins!=journal.commits+journal.cancels)
         throw std::runtime_error("MTP route journal was left pending");
+    if(!accept_all && !cancel_during_target && !journal.rollbacks)
+        throw std::runtime_error("backend target rollback hook was not used");
     if(cancel_during_target ? journal.cancels!=1 || journal.commits!=0 :
             journal.cancels!=0 || (partial?journal.rows!=((retain_prefix?2:1)-int(split))*journal.commits:
                 accept_all?journal.rows<=(1-int(split))*journal.commits:journal.rows!=(1-int(split))*journal.commits))
@@ -795,6 +918,38 @@ void run_restored_blockwise_context() {
     assert(rejected && predictor.context_appends.empty() && model.cache_pos==4);
 }
 
+void run_bounded_blockwise_prompt() {
+    for(const int window:{1,5,16})for(const int chunk:{3,32})for(const int stable:{0,19}) {
+        Model model;Predictor predictor;predictor.blockwise=true;
+        InferenceRequest request;request.prompt=std::vector<int64_t>(23,1);
+        request.sampling.max_tokens=8;request.stop_token_ids={0};
+        struct WindowOps:Ops {
+            int window;
+            int64_t initial_blockwise_context_window() const {return window;}
+            static Tensor slice(Tensor value,int axis,int64_t begin,int64_t count) {
+                value=Ops::slice(value,axis,begin,count);if(axis==1)value.start+=begin;return value;
+            }
+            Prefill prefill(PrefillChunk chunk) {
+                auto result=Ops::prefill(chunk);result.raw.start=chunk.offset;return result;
+            }
+            double blockwise_prompt_context(Tensor context,int64_t position,bool seed) {
+                if(seed && (size(context,1)!=std::min<int64_t>(position,window) ||
+                        context.start!=position-size(context,1)))
+                    throw std::runtime_error("Bounded draft seed lost the exact global prompt suffix");
+                if(seed)mtp.seed_target_context(context,position);
+                else mtp.append_target_context(context,position-size(context,1));
+                return 0.;
+            }
+        };
+        InferenceOutput output(request,nullptr,"bounded-draft-prompt");Tensor hidden;
+        auto sequence=speculative_sequence(WindowOps{{model,predictor},window},request,output,chunk,
+            0,Tensor{},stable?&hidden:nullptr,stable);
+        while(sequence.next()){}
+        if(output.result.completion_tokens!=1 || predictor.position!=23 || model.cache_pos!=23)
+            throw std::runtime_error("Bounded prompt history changed final cache or output boundaries");
+    }
+    std::cout<<"Sliding draft prompt window: suffix/global position/chunk/checkpoint parity PASS\n";
+}
 void run_blockwise_prompt_checkpoint() {
     for(int reused:{0,4})for(int stable:{5,9})for(int chunk:{3,64})for(bool tail_only:{false,true}) {
         if(tail_only && chunk<64)continue;
@@ -842,17 +997,31 @@ void run_blockwise_prompt_checkpoint() {
             position+=part.count;
         }
         if(position!=10)throw std::runtime_error("MTP checkpoint omitted a prompt suffix");
+        if(predictor.deferred_context_appends)throw std::runtime_error("MTP prompt priming used the deferred decode API");
+    }
+}
+void run_blockwise_greedy_hook() {
+    for(bool fast:{false,true})for(bool penalties:{false,true}) {
+        Model model;Predictor predictor;predictor.blockwise=true;predictor.legacy=true;predictor.greedy_block=fast;
+        InferenceRequest request;request.prompt={0,0,0};request.sampling.max_tokens=12;
+        InferenceOutput output(request,nullptr,"blockwise-greedy-hook");Tensor hidden;
+        Ops ops{model,predictor};ops.penalties=penalties;
+        auto generation=speculative_sequence(std::move(ops),request,output,16,0,Tensor{},&hidden);
+        while(generation.next()){}
+        if((predictor.greedy_block_calls>0)!=(fast && !penalties) || output.result.completion_tokens!=12 ||
+                predictor.cache_position()!=model.cache_pos || model.cache_pos!=14 || predictor.deferred_context_appends==0)
+            throw std::runtime_error("blockwise greedy hook skipped its eligible path, ignored penalties, or changed committed history");
     }
 }
 void run_blockwise_final_context() {
-    for(bool accepted:{false,true})for(bool eos:{false,true})for(int limit:{2,3,4,7,8}) {
+    for(int batch:{1,8})for(bool accepted:{false,true})for(bool eos:{false,true})for(int limit:{2,3,4,7,8}) {
         struct BlockOps:Ops {
             bool accepted;
             std::vector<int32_t> greedy_tokens(Tensor logits) {
                 return std::vector<int32_t>(size(logits,0),accepted?1:0);
             }
         };
-        Model model;Predictor predictor;predictor.blockwise=true;
+        Model model;Predictor predictor;predictor.blockwise=true;predictor.context_batch=batch;
         InferenceRequest request;request.prompt={0,0,0};request.sampling.max_tokens=limit;
         if(eos)request.stop_token_ids={1};
         InferenceOutput output(request,nullptr,"blockwise-final-context");
@@ -871,6 +1040,176 @@ void run_blockwise_final_context() {
         }
         if(position!=model.cache_pos)throw std::runtime_error("block predictor final history is incomplete");
     }
+}
+
+void run_parked_blockwise_history() {
+    for(bool eos:{false,true})for(int limit:{19,64}) {
+        struct ParkedOps:Ops {
+            bool eos;
+            bool metal_mtp_policy() const {return true;}
+            int32_t sample_constrained(Tensor logits,Tensor counts,const MfqTokenConstraintPtr&) {
+                return eos && model.cache_pos>=10?2:sample_normal(logits,counts);
+            }
+        };
+        Model model;Predictor predictor;predictor.blockwise=true;predictor.context_batch=8;
+        mtp::v1::BatchDepthPolicy previous({"parked"},3);previous.start_parked(128);
+        predictor.policy_state.park_batch(previous);
+        InferenceRequest request;request.prompt={0,0,0};request.sampling.max_tokens=limit;
+        if(eos)request.stop_token_ids={2};
+        InferenceOutput output(request,nullptr,"parked-blockwise-history");Tensor hidden;
+        auto generation=speculative_sequence(ParkedOps{{model,predictor},eos},request,output,16,0,Tensor{},&hidden);
+        while(generation.next()){}
+        int64_t consumed=0;bool batched=false;
+        for(const auto& [start,rows]:predictor.context_appends) {
+            if(start!=consumed || rows<1 || rows>8)throw std::runtime_error("parked block history skipped or duplicated rows");
+            consumed+=rows;batched|=start>=3 && rows>1;
+        }
+        if(consumed!=model.cache_pos || predictor.cache_position()!=model.cache_pos || !batched ||
+                predictor.context_appends.size()>std::size_t(limit/8+4) || !Ops::defined(hidden))
+            throw std::runtime_error("parked block history did not batch or flush before its final snapshot");
+    }
+}
+
+void run_queued_greedy_chain() {
+    struct QueuedOps:Ops {
+        int* calls;bool available,accept_all,probability;int depth;
+        int fixed_mtp_draft_depth() const {return depth;}
+        mtp::DraftProbabilityOptions mtp_probability_options() const {
+            mtp::DraftProbabilityOptions result;if(probability)result.minimum_probability=.5;return result;
+        }
+        int32_t sample_normal(Tensor logits,Tensor counts) {return accept_all?0:Ops::sample_normal(logits,counts);}
+        std::pair<int32_t,float> greedy_probability(Tensor logits,Tensor counts) {return {sample_normal(logits,counts),.8f};}
+        std::optional<std::vector<int32_t>> predictor_greedy_chain(Tensor hidden,Tensor ids,Tensor positions,int requested,int32_t anchor) {
+            ++*calls;if(!available)return {};
+            if(requested<2 || requested>depth || size(hidden,1)!=size(ids,1) || anchor!=0 ||
+                    (defined(positions) && positions.shape.back()!=size(ids,1)))
+                throw std::runtime_error("queued predictor received an invalid history or anchor");
+            mtp.position+=size(ids,1)+requested-1;
+            return std::vector<int32_t>(requested,accept_all?0:1);
+        }
+    };
+    int cases=0;
+    for(bool accept:{false,true})for(int depth:{1,2,3})for(int mode=0;mode<5;++mode) {
+        std::vector<int64_t> reference;int64_t reference_model=-1,reference_predictor=-1;
+        uint64_t reference_accepted=0;
+        for(bool available:{false,true}) {
+            Model model;Predictor predictor;Prepared prepared;prepared.positions={{3}};prepared.embeddings={{1,3,1}};
+            predictor.blockwise=mode==4;
+            InferenceRequest request;request.chat=false;request.prompt={0,0,0};
+            request.sampling.max_tokens=19;request.sampling.mtp_max_draft_tokens=depth;request.sampling.temperature=0.;
+            prepared.token_ids=request.prompt;
+            InferenceOutput output(request,nullptr,"queued-greedy-chain");Tensor last;int calls=0;
+            Ops base{model,predictor};base.prepared=mode==1?&prepared:nullptr;base.penalties=mode==2;
+            auto generation=speculative_sequence(QueuedOps{base,&calls,available,accept,mode==3,depth},
+                request,output,512,0,Tensor{},&last);
+            std::vector<int64_t> tokens;
+            while(auto step=generation.next())if(step.value)
+                if(const auto* delta=std::get_if<TokenOutput>(&*step.value))
+                    tokens.insert(tokens.end(),delta->token_ids.begin(),delta->token_ids.end());
+            if(!available) {
+                reference=tokens;reference_model=model.cache_pos;reference_predictor=predictor.cache_position();
+                reference_accepted=output.metrics.mtp.accepted_tokens;
+            } else if(tokens!=reference || model.cache_pos!=reference_model || predictor.cache_position()!=reference_predictor ||
+                    output.metrics.mtp.accepted_tokens!=reference_accepted || !Ops::defined(last))
+                throw std::runtime_error("queued MTP changed tokens, acceptance or committed cache boundaries");
+            const bool eligible=depth>1 && mode<2;
+            if(eligible?(calls==0):(calls!=0))throw std::runtime_error("queued MTP bypassed its sampling/history capability checks");
+            ++cases;
+        }
+    }
+    std::cout<<"Queued greedy chain/fallback/positions/tails/penalties/probability/blockwise cases="<<cases<<" PASS\n";
+}
+
+void run_commit_target_hook() {
+    struct AcceptedOps:Ops {
+        int fixed_mtp_draft_depth()const{return 3;}
+        int32_t sample_normal(Tensor,Tensor){return 0;}
+    };
+    struct CommitOps:AcceptedOps {
+        int* commits;
+        void commit_target(){++*commits;model.commit_speculative();}
+    };
+    std::vector<int64_t> reference;int64_t target_end=-1,predictor_end=-1;
+    for(bool hooked:{false,true}) {
+        Model model;Predictor predictor;int commits=0;
+        InferenceRequest request;request.chat=false;request.prompt={0,0,0};
+        request.sampling.max_tokens=19;request.sampling.mtp_max_draft_tokens=3;request.sampling.temperature=0.;
+        InferenceOutput output(request,nullptr,"target-commit-hook");Tensor last;
+        AcceptedOps base{Ops{model,predictor}};
+        auto generation=hooked
+            ?speculative_sequence(CommitOps{base,&commits},request,output,512,0,Tensor{},&last)
+            :speculative_sequence(base,request,output,512,0,Tensor{},&last);
+        std::vector<int64_t> tokens;
+        while(auto step=generation.next())if(step.value)
+            if(const auto* delta=std::get_if<TokenOutput>(&*step.value))
+                tokens.insert(tokens.end(),delta->token_ids.begin(),delta->token_ids.end());
+        if(!hooked){reference=tokens;target_end=model.cache_pos;predictor_end=predictor.cache_position();}
+        else if(!commits || tokens!=reference || model.cache_pos!=target_end || predictor.cache_position()!=predictor_end)
+            throw std::runtime_error("Target commit hook changed output/cache or was bypassed");
+    }
+    std::cout<<"Target commit hook and legacy fallback PASS\n";
+}
+
+void run_device_draft_verification() {
+    struct LegacyOps:Ops {
+        bool perfect;int depth;
+        int fixed_mtp_draft_depth()const{return depth;}
+        int32_t sample_normal(Tensor logits,Tensor counts){return perfect?0:Ops::sample_normal(logits,counts);}
+    };
+    struct DeviceOps:LegacyOps {
+        bool enabled;int* queued;int* resolved;int* pending_rows;
+        Tensor enqueue_greedy_chain(Tensor hidden,Tensor,Tensor,int count,Tensor* verification_ids) {
+            if(!enabled)return {};
+            ++*queued;mtp.position+=size(hidden,1)+count-1;
+            *pending_rows=count+1;*verification_ids={{1,*pending_rows}};
+            return {{count},true,perfect?0:1};
+        }
+        std::pair<std::vector<int32_t>,std::vector<int32_t>> resolve_queued_greedy(
+                const Tensor& proposals,const Tensor& targets) {
+            if(*pending_rows!=size(targets,0) || model.cache_pos<*pending_rows)
+                throw std::runtime_error("Queued drafts were resolved before target verification");
+            ++*resolved;*pending_rows=0;
+            return {std::vector<int32_t>(size(proposals,0),int32_t(proposals.start)),
+                std::vector<int32_t>(size(targets,0),0)};
+        }
+    };
+    static_assert(requires(DeviceOps& ops,Tensor tensor,Tensor* ids) {
+        ops.enqueue_greedy_chain(tensor,tensor,tensor,int{},ids);
+        ops.resolve_queued_greedy(tensor,tensor);
+    });
+    int cases=0;
+    for(bool perfect:{false,true})for(int depth:{1,2,3})for(int limit:{2,19}) {
+        std::vector<int64_t> expected;int64_t target_end=-1,predictor_end=-1;
+        for(int mode:{0,1,2}) {
+            Model model;Predictor predictor;int queued=0,resolved=0,pending_rows=0;
+            InferenceRequest request;request.chat=false;request.prompt={0,0,0};
+            request.sampling.max_tokens=limit;request.sampling.mtp_max_draft_tokens=depth;
+            request.sampling.temperature=0.;
+            InferenceOutput output(request,nullptr,"device-draft-verification");Tensor last;
+            LegacyOps legacy{Ops{model,predictor},perfect,depth};
+            auto generation=mode==0?speculative_sequence(legacy,request,output,512,0,Tensor{},&last):
+                speculative_sequence(DeviceOps{legacy,mode==2,&queued,&resolved,&pending_rows},
+                    request,output,512,0,Tensor{},&last);
+            std::vector<int64_t> tokens;
+            while(auto step=generation.next())if(step.value)
+                if(const auto* delta=std::get_if<TokenOutput>(&*step.value))
+                    tokens.insert(tokens.end(),delta->token_ids.begin(),delta->token_ids.end());
+            if(!mode){expected=tokens;target_end=model.cache_pos;predictor_end=predictor.cache_position();}
+            else {
+                if(tokens!=expected || model.cache_pos!=target_end || predictor.cache_position()!=predictor_end ||
+                        queued!=resolved || pending_rows || ((mode==1 || depth==1 || limit==2) && queued) ||
+                        (mode==2 && depth>1 && limit==19 && !queued))
+                    throw std::runtime_error("Device draft verification mismatch: mode="+std::to_string(mode)+
+                        " perfect="+std::to_string(perfect)+" depth="+std::to_string(depth)+" limit="+std::to_string(limit)+
+                        " tokens="+std::to_string(tokens==expected)+" target="+std::to_string(model.cache_pos)+
+                        "/"+std::to_string(target_end)+" predictor="+std::to_string(predictor.cache_position())+
+                        "/"+std::to_string(predictor_end)+" queued="+std::to_string(queued)+" resolved="+
+                        std::to_string(resolved)+" pending="+std::to_string(pending_rows));
+                ++cases;
+            }
+        }
+    }
+    std::cout<<"Device drafts, combined verification, full/partial acceptance and fallback PASS cases="<<cases<<'\n';
 }
 
 int main() try {
@@ -897,13 +1236,16 @@ int main() try {
     run_prepared_default_positions();
     run_restored_blockwise_context();
     run_blockwise_prompt_checkpoint();
-    run_blockwise_final_context();
+    run_bounded_blockwise_prompt();
+    run_blockwise_greedy_hook();run_blockwise_final_context();
+    run_parked_blockwise_history();
     run(false);
     run(false,true);
     run(false,true,true);
     run(true);
     run_dspark_draft_cost();
     for(bool streaming:{false,true})for(int reused:{0,4})run_chunked_prompt_history(streaming,reused);
+    run_native_prompt_checkpoint();
     run_prompt_snapshot_boundary();
     run_bootstrap_publication();
     run_target_initialization();
@@ -929,5 +1271,9 @@ int main() try {
     batch_policy_short_response();
     batch_policy_adaptation();
     batch_policy_observations();
+    run_probability_options();
+    run_queued_greedy_chain();
+    run_commit_target_hook();
+    run_device_draft_verification();
     std::cout << "shared speculative sequence output/cache/dispatch tests passed\n";
 }catch(const std::exception& error){std::cerr<<error.what()<<'\n';return 1;}

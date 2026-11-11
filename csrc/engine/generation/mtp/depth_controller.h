@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../prefill_activity.h"
+#include "engine/generation/mtp/limits.h"
 #include "batch_policy.h"
 #include "batch_policy_v1.h"
 
@@ -23,26 +24,41 @@ public:
     explicit DepthController(int maximum_depth = 3,
             const DepthController* seed = nullptr,
             double marginal_ms = 7.0, double exit_margin = 1.15,
-            bool gradual_warmup = false, double cold_window_ms = 0.0)
-        : maximum_depth_(std::clamp(maximum_depth, 1, 5)),
+            bool gradual_warmup = false, double cold_window_ms = 0.0, bool blockwise = false,
+            bool periodic_cost = true)
+        : maximum_depth_(std::clamp(maximum_depth, 1, kMaximumReportedDraftDepth)),
           current_depth_(maximum_depth_),
           gradual_warmup_(gradual_warmup),
+           blockwise_(blockwise),
+           periodic_cost_(periodic_cost),
           marginal_ms_(marginal_ms > 0.0 ? marginal_ms : 7.0),
           exit_margin_(std::clamp(exit_margin, 1.0, 1.5)),
           acceptance_(static_cast<std::size_t>(maximum_depth_)),
           cycle_ms_(static_cast<std::size_t>(maximum_depth_ + 1)),
           cycle_age_ms_(static_cast<std::size_t>(maximum_depth_ + 1)) {
         if(gradual_warmup && cold_window_ms>0.0 && (!seed || seed->measurement_order_.empty())) {
-            cold_window_ms_=cold_window_ms;cold_tokens_left_=48;cold_maximum_depth_=1;
+            cold_window_ms_=cold_window_ms;cold_tokens_left_=48;
+            cold_maximum_depth_=blockwise_?maximum_depth_:1;
         }
         acceptance_.front() = 0.6;
         if(gradual_warmup) {
             // Establish ordinary-decode cost before wider speculation. A
             // fresh width cap must not postpone the baseline for 48 tokens.
-            // Cover the default four-window residency exchange period rather
-            // than calibrating from three cheap windows between exchanges.
-            warmup_={1,0,0,0,0,1};
-            for(int depth=2;depth<=maximum_depth_;++depth)warmup_.push_back(depth);
+            // Resident weights do not need to sample an expert-exchange
+            // period. A baseline before and after the width sweep still
+            // checks that the ordinary path has warmed.
+            const int baseline_samples=periodic_cost_?4:1;
+            warmup_.push_back(blockwise_?maximum_depth_:1);
+            warmup_.insert(warmup_.end(),baseline_samples,0);
+            warmup_.push_back(blockwise_?maximum_depth_:1);
+            if(blockwise_) {
+                // A block predictor reads its draft weights for the whole
+                // block even when only one proposal is requested. Measure
+                // its full useful window before estimating narrower costs.
+                for(int depth=maximum_depth_-1;depth>0;--depth)warmup_.push_back(depth);
+            } else {
+                for(int depth=2;depth<=maximum_depth_;++depth)warmup_.push_back(depth);
+            }
         } else for (int index = 1; index <= maximum_depth_; ++index)
             warmup_.push_back(maximum_depth_+1-index);
         current_depth_=warmup_.front();
@@ -60,13 +76,13 @@ public:
             // the first revisit. Refresh every width once more before those
             // transient costs can park MTP for the rest of a short response.
             // Continuations and re-entry already have an inherited policy.
-            if(gradual_warmup && (!seed || seed->measurement_order_.empty()))
+            if(gradual_warmup && periodic_cost_ && (!seed || seed->measurement_order_.empty()))
                 for(int depth=maximum_depth_;depth>0;--depth)warmup_.push_back(depth);
         }
         // The first scalar samples can retain cold residency costs even after
         // a shallow replay becomes faster. Refresh the baseline at the end as
         // well, so that cheap ordinary decode is compared at the same stage.
-        if(gradual_warmup)warmup_.insert(warmup_.end(),{0,0,0,0});
+        if(gradual_warmup)warmup_.insert(warmup_.end(),periodic_cost_?4:1,0);
         if (seed && !seed->measurement_order_.empty()) {
             width_baseline_ms_=seed->width_baseline_ms_;
             for (int position = 0; position < std::min(maximum_depth_, seed->maximum_depth_); ++position)
@@ -75,10 +91,26 @@ public:
                 const auto index = static_cast<std::size_t>(depth);
                 cycle_ms_[index] = seed->cycle_ms_[index];
                 if (cycle_ms_[index])
-                    cycle_age_ms_[index] = std::numeric_limits<double>::infinity();
+                    cycle_age_ms_[index] = !periodic_cost_ && !seed->periodic_cost_
+                        ? seed->cycle_age_ms_[index] : std::numeric_limits<double>::infinity();
             }
             for (int depth : seed->measurement_order_)
                 if (depth <= maximum_depth_) measurement_order_.push_back(depth);
+            if(gradual_warmup_ && !periodic_cost_ && !seed->periodic_cost_) {
+                // Refresh the best measured width and ordinary cost. Other
+                // resident widths remain useful priors until a baseline
+                // change or the normal exploration schedule refreshes them.
+                int preferred=1;double best=-1.0;
+                for(int depth=1;depth<=maximum_depth_;++depth) {
+                    if(!cycle_ms_[static_cast<std::size_t>(depth)])continue;
+                    const double candidate=score(depth);
+                    if(candidate>best){preferred=depth;best=candidate;}
+                }
+                warmup_={preferred,0,0,preferred};
+                current_depth_=preferred;
+                cycle_age_ms_[static_cast<std::size_t>(preferred)]=
+                    std::numeric_limits<double>::infinity();
+            }
         }
     }
 
@@ -128,7 +160,8 @@ public:
             update_time(used_depth, cycle_ms);
             if(gradual_warmup_ && used_depth>0)width_baseline_ms_[used_depth]=cycle_ms_.front().value_or(0.0);
         }
-        if(time_sample && used_depth==1 && cycle_ms_.front())post_baseline_shallow_=true;
+        if(time_sample && (used_depth==1 || !periodic_cost_) && cycle_ms_.front())
+            post_baseline_shallow_=true;
         for (auto& age : cycle_age_ms_) if (age) *age += cycle_ms;
         if (time_sample) cycle_age_ms_[static_cast<std::size_t>(used_depth)] = 0.0;
         milliseconds_since_probe_ += cycle_ms;
@@ -141,7 +174,7 @@ public:
             // current marginal cost. Defer predicted losing wider windows to
             // periodic exploration instead of forcing them into every short
             // response. Cold latency limits also skip blocked warmup entries.
-            if(gradual_warmup_ && post_baseline_shallow_) {
+            if(gradual_warmup_ && post_baseline_shallow_ && !blockwise_) {
                 while(!warmup_.empty() && warmup_.front()>1) {
                     const int next=warmup_.front();
                     const bool cold_blocked=cold_tokens_left_>0 && next>cold_maximum_depth_ &&
@@ -191,7 +224,10 @@ public:
             std::optional<int>{}:explore_due?most_stale():best_rival();
         if (!target) return;
         current_depth_ = *target;
-        probe_left_ = 4;
+        // Resident weights have no exchange cycle to average. Match their
+        // one-sample baseline calibration instead of discarding three extra
+        // speculative rounds during every ordinary-cost refresh.
+        probe_left_ = *target==0 && !periodic_cost_ ? 1 : 4;
         milliseconds_since_probe_ = 0.0;
         if (explore_due && !baseline_due) milliseconds_since_explore_ = 0.0;
     }
@@ -221,17 +257,20 @@ public:
     }
 
 private:
-    bool baseline_warmed_since_width(int depth) const {
-        return gradual_warmup_ && cache_resweep_ && depth>0 && width_baseline_ms_[depth]>0.0 &&
-            cycle_ms_.front() && *cycle_ms_.front()>0.0 && *cycle_ms_.front()<0.9*width_baseline_ms_[depth];
+    bool baseline_changed_since_width(int depth) const {
+        if(!gradual_warmup_ || !cache_resweep_ || depth<=0 || width_baseline_ms_[depth]<=0.0 ||
+                !cycle_ms_.front() || *cycle_ms_.front()<=0.0)return false;
+        const double previous=width_baseline_ms_[depth],current=*cycle_ms_.front();
+        return current<0.9*previous || (!periodic_cost_ && current>1.1*previous);
     }
     bool width_needs_measurement(int depth) const {
         const auto index = static_cast<std::size_t>(depth);
         return !cycle_ms_[index] || cycle_age_ms_[index] == std::numeric_limits<double>::infinity() ||
-            baseline_warmed_since_width(depth);
+            baseline_changed_since_width(depth);
     }
     bool needs_wider_measurement() const {
-        if (!gradual_warmup_ || !post_baseline_shallow_ || conditional_acceptance(0) < 0.65)
+        if (!gradual_warmup_ || !post_baseline_shallow_ ||
+                (!blockwise_ && conditional_acceptance(0) < 0.65))
             return false;
         for (int depth = 2; depth <= maximum_depth_; ++depth)
             if (width_needs_measurement(depth)) return true;
@@ -240,8 +279,10 @@ private:
     std::optional<int> unmeasured_width() const {
         if (!needs_wider_measurement()) return std::nullopt;
         const int maximum = cold_tokens_left_ > 0 ? cold_maximum_depth_ : maximum_depth_;
-        for (int depth = 2; depth <= maximum; ++depth)
+        for (int index = 2; index <= maximum; ++index) {
+            const int depth=blockwise_?maximum+2-index:index;
             if (width_needs_measurement(depth)) return depth;
+        }
         return std::nullopt;
     }
     void seed_width_cost(int depth,double cycle_ms) {
@@ -265,7 +306,7 @@ private:
             estimate=total/baseline_warmup_count_;
             return;
         }
-        const bool warmed=baseline_warmed_since_width(depth);
+        const bool warmed=baseline_changed_since_width(depth);
         if (!estimate || cycle_age_ms_[index] == std::numeric_limits<double>::infinity() || warmed) {
             if (!estimate) measurement_order_.push_back(depth);
             if(warmed)std::fprintf(stderr,"runtime_mtp_cache_resweep enabled=1 depth=%d previous_base_ms=%.4f current_base_ms=%.4f previous_cycle_ms=%.4f cycle_ms=%.4f\n",
@@ -385,7 +426,7 @@ private:
 
     int maximum_depth_;
     int current_depth_;
-    bool gradual_warmup_=false,post_baseline_shallow_=false;
+    bool gradual_warmup_=false,post_baseline_shallow_=false,blockwise_=false,periodic_cost_=true;
     int probe_left_ = 0;
     int exit_streak_ = 0;
     int cold_tokens_left_=0,cold_maximum_depth_=1;
@@ -400,9 +441,9 @@ private:
     std::vector<int> warmup_;
     std::vector<int> measurement_order_;
     std::array<double,4> baseline_warmup_ms_{};
-    std::array<double,6> width_baseline_ms_{};
-    std::array<std::array<double,4>,6> width_cost_ms_{};
-    std::array<std::size_t,6> width_cost_count_{},width_cost_next_{};
+    std::array<double,kMaximumReportedDraftDepth+1> width_baseline_ms_{};
+    std::array<std::array<double,4>,kMaximumReportedDraftDepth+1> width_cost_ms_{};
+    std::array<std::size_t,kMaximumReportedDraftDepth+1> width_cost_count_{},width_cost_next_{};
     bool cost_window_reported_=false;
     bool cost_window_=[] {
         const auto* option=std::getenv("TYLOINFER_MTP_COST_WINDOW");return !option || option[0]!='0';
@@ -415,7 +456,8 @@ private:
 
 class PolicyState {
 public:
-    DepthController begin(int maximum_depth,bool gradual_warmup=false,double cold_window_ms=0.0) const {
+    DepthController begin(int maximum_depth,bool gradual_warmup=false,double cold_window_ms=0.0,
+            bool blockwise=false,bool periodic_cost=true) const {
         // CUDA measures complete graph windows, including drafting and exact
         // sampling. Do not discard a measured 3-15% gain by imposing the
         // generic loop's initial tax; observed plain-loop tax still overrides it.
@@ -424,7 +466,8 @@ public:
             const double age = std::chrono::duration<double>(Clock::now()-loop_tax_time_).count();
             margin += (*loop_tax_-margin) * std::exp(-age/600.0);
         }
-        return DepthController(maximum_depth, seed_ ? &*seed_ : nullptr, 7.0, margin,gradual_warmup,cold_window_ms);
+        return DepthController(maximum_depth, seed_ ? &*seed_ : nullptr, 7.0, margin,
+            gradual_warmup,cold_window_ms,blockwise,periodic_cost);
     }
     void remember(const DepthController& controller) { seed_ = controller; }
     void seed_batch(v1::BatchDepthPolicy& policy) const { batch_memory_.seed(policy); }
@@ -521,42 +564,72 @@ class AdaptivePolicy final : public DepthPolicy {
 public:
     using Clock = BatchDepthPolicy::Clock;
     AdaptivePolicy(int maximum_depth, PolicyState* state = nullptr,bool gradual_warmup=false,
-            bool batch_policy=false)
-        : state_(state ? *state : local_state_),gradual_warmup_(gradual_warmup) {
-        if(batch_policy) {
-            batch_.emplace(std::vector<std::string>{"cuda-mtp"},maximum_depth);
+            bool metal_batch_policy=false,int fixed_depth=0,bool blockwise=false,bool periodic_cost=true)
+        : state_(state ? *state : local_state_),gradual_warmup_(gradual_warmup),blockwise_(blockwise),
+          periodic_cost_(periodic_cost),fixed_depth_(fixed_depth) {
+        if(fixed_depth_<0 || fixed_depth_>maximum_depth)
+            throw std::invalid_argument("fixed MTP draft depth exceeds the request limit");
+        if(fixed_depth_) {
+            std::fprintf(stderr,"runtime_mtp_fixed_depth selected=%d maximum=%d\n",fixed_depth_,maximum_depth);
+            return;
+        }
+        if(metal_batch_policy) {
+            // Joint block predictors change the whole proposal distribution
+            // with width. Keep their accumulated per-width yield history;
+            // sequential predictors can replace stale confidence on re-probe.
+            batch_.emplace(std::vector<std::string>{"cuda-mtp"},maximum_depth,0,!blockwise_);
             state_.seed_batch(*batch_);
             seeded_batch_park_=batch_->remaining()!=0;
         }
-        else controller_.emplace(state_.begin(maximum_depth,gradual_warmup_,gradual_warmup_?60.0:0.0));
+        else controller_.emplace(state_.begin(maximum_depth,gradual_warmup_,
+            gradual_warmup_?60.0:0.0,blockwise_,periodic_cost_));
         if(gradual_warmup_)
-            std::fprintf(stderr,"runtime_mtp_depth_policy name=%s maximum_depth=%d\n",
-                batch_?"metal_batch_v1":"cuda_adaptive",maximum_depth);
+            std::fprintf(stderr,"runtime_mtp_depth_policy name=%s maximum_depth=%d periodic_weight_cost=%d yield_recency_refresh=%d baseline_loss_confirmation=%d\n",
+                batch_?"metal_batch_v1":"cuda_adaptive",maximum_depth,int(periodic_cost_),batch_?int(batch_->refresh_yields()):-1,int(batch_.has_value()));
     }
     ~AdaptivePolicy() override {
         if (controller_) state_.remember(*controller_);
         if (batch_) state_.retire_batch(*batch_);
     }
-    int depth() const noexcept override {
+    int depth() const noexcept {
+        if(fixed_depth_)return fixed_depth_;
         return batch_ ? batch_->depth() : park_.parked ? 0 : controller_->depth();
     }
-    int maximum_depth() const noexcept override {
+    int maximum_depth() const noexcept {
+        if(fixed_depth_)return fixed_depth_;
         return batch_ ? batch_->maximum() : controller_->maximum_depth();
     }
-    bool parked() const noexcept override { return batch_ ? batch_->remaining()!=0 : park_.parked; }
-    std::optional<double> measured_cycle_ms(int depth) const override {
+    bool parked() const noexcept { return !fixed_depth_ && (batch_ ? batch_->remaining()!=0 : park_.parked); }
+    std::optional<double> measured_cycle_ms(int depth) const {
+        if(fixed_depth_)return depth>=0 && depth<=fixed_depth_ && fixed_samples_[depth]
+            ?std::optional<double>(fixed_total_ms_[depth]/fixed_samples_[depth]):std::nullopt;
         return batch_ ? batch_->cost(depth) : controller_->measured_cycle_ms(depth);
     }
     void observe_window(int used,int accepted,Clock::time_point started,Clock::time_point finished,
-            bool time_sample=true) override {
+            bool time_sample=true) {
+        if(fixed_depth_) {
+            observe(used,accepted,std::chrono::duration<double,std::milli>(finished-started).count(),time_sample);
+            return;
+        }
         if(batch_)observe_batch(used,accepted,started,finished,time_sample);
         else observe(used,accepted,std::chrono::duration<double,std::milli>(finished-started).count(),time_sample);
     }
-    void observe_plain_window(Clock::time_point started,Clock::time_point finished,bool time_sample=true) override {
+    void observe_plain_window(Clock::time_point started,Clock::time_point finished,bool time_sample=true) {
+        if(fixed_depth_) {
+            observe(0,0,std::chrono::duration<double,std::milli>(finished-started).count(),time_sample);
+            return;
+        }
         if(batch_)observe_batch(0,0,started,finished,time_sample);
         else observe_plain(std::chrono::duration<double,std::milli>(finished-started).count(),time_sample);
     }
     void observe(int used, int accepted, double elapsed_ms, bool time_sample = true) {
+        if(fixed_depth_) {
+            if(time_sample && used>=0 && used<=fixed_depth_ && std::isfinite(elapsed_ms) && elapsed_ms>0) {
+                fixed_total_ms_[used]+=elapsed_ms;
+                ++fixed_samples_[used];
+            }
+            return;
+        }
         if(batch_) {
             const auto finished=Clock::now();
             observe_window(used,accepted,finished-std::chrono::duration_cast<Clock::duration>(
@@ -575,6 +648,7 @@ public:
         }
     }
     void observe_plain(double elapsed_ms, bool time_sample = true) {
+        if(fixed_depth_) { observe(0,0,elapsed_ms,time_sample);return; }
         if(batch_) {
             const auto finished=Clock::now();
             observe_plain_window(finished-std::chrono::duration_cast<Clock::duration>(
@@ -588,7 +662,8 @@ public:
             // samples since parking must replace that older baseline first.
             state_.remember(*controller_);
             park_.begin_probe();
-            controller_.emplace(state_.begin(controller_->maximum_depth(),gradual_warmup_));
+            controller_.emplace(state_.begin(controller_->maximum_depth(),gradual_warmup_,0.0,
+                blockwise_,periodic_cost_));
             ++reentries_;
             trace_decision("reentry",0,0,elapsed_ms,time_sample,true);
         }
@@ -612,6 +687,15 @@ private:
                 static_cast<unsigned long long>(parks()),static_cast<unsigned long long>(reentries_),
                 batch_->cost(0).value_or(0),batch_->cost(1).value_or(0),
                 batch_->cost(2).value_or(0),batch_->cost(3).value_or(0));
+            // Wider block drafts need the same measured yield/cost evidence
+            // as shallow native MTP. Emit it only under the existing trace.
+            for(int candidate=0;candidate<=batch_->maximum();++candidate) {
+                const auto cost=batch_->cost(candidate).value_or(0.);
+                const auto committed=batch_->committed_tokens(candidate);
+                const auto tokens=batch_->ordinary_requests()+batch_->requests().size()*committed;
+                std::fprintf(stderr,"runtime_mtp_batch_candidate depth=%d cycle_ms=%.4f committed=%.5f tokens_per_ms=%.6f selected=%d\n",
+                    candidate,cost,committed,cost>0?tokens/cost:0.,int(candidate==depth()));
+            }
         }
     }
     void trace_decision(const char* event,int used,int accepted,double elapsed,bool valid,bool force=false) {
@@ -620,7 +704,7 @@ private:
         ++trace_observations_;
         if(!force && trace_observations_>12 && depth==trace_depth_ && warm==trace_warm_ && !c.should_exit())return;
         trace_depth_=depth;trace_warm_=warm;
-        std::array<double,6> costs{};std::array<double,5> acceptance{};
+        std::array<double,kMaximumReportedDraftDepth+1> costs{};std::array<double,kMaximumReportedDraftDepth> acceptance{};
         for(int i=0;i<=c.maximum_depth();++i)costs[i]=c.measured_cycle_ms(i).value_or(0.0);
         for(int i=0;i<c.maximum_depth();++i)acceptance[i]=c.conditional_acceptance(i);
         std::fprintf(stderr,"runtime_mtp_policy_decision event=%s used=%d accepted=%d cycle_ms=%.4f valid=%d depth=%d warm=%d losing=%d exit=%d gain=%.4f ms0=%.4f ms1=%.4f ms2=%.4f ms3=%.4f ms4=%.4f ms5=%.4f a1=%.5f a2=%.5f a3=%.5f a4=%.5f a5=%.5f\n",
@@ -631,7 +715,10 @@ private:
     uint64_t trace_observations_=0;int trace_depth_=-1;bool trace_warm_=false;
     PolicyState local_state_;
     PolicyState& state_;
-    bool gradual_warmup_=false;
+    bool gradual_warmup_=false,blockwise_=false,periodic_cost_=true;
+    int fixed_depth_=0;
+    std::array<double,kMaximumReportedDraftDepth+1> fixed_total_ms_{};
+    std::array<std::uint64_t,kMaximumReportedDraftDepth+1> fixed_samples_{};
     std::optional<DepthController> controller_;
     std::optional<v1::BatchDepthPolicy> batch_;
     bool seeded_batch_park_=false;

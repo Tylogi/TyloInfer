@@ -439,8 +439,8 @@ function Initialize-PythonEnvironment {
     Add-ToPath (Join-Path $Context.VenvDirectory "Scripts")
 
     $syncArguments = @(
-        "sync", "--locked", "--active", "--no-default-groups", "--no-install-project",
-        "--group", "release", "--extra", "benchmark"
+        "sync", "--locked", "--active", "--no-default-groups", "--no-editable",
+        "--group", "release"
     )
     Invoke-Checked $Context.Tools.Uv $syncArguments
 
@@ -602,6 +602,7 @@ function Remove-PyInstallerCache {
 
 function Build-NsisInstaller {
     param([Parameter(Mandatory)][hashtable] $Context)
+
 
     $cargoTargetDirectory = if ([string]::IsNullOrWhiteSpace($env:CARGO_TARGET_DIR)) {
         Join-Path $Context.StudioDirectory "src-tauri\target"

@@ -1,9 +1,10 @@
 {
   "bundle": {
-    "targets": ["dmg"],
+    "targets": [
+      "dmg"
+    ],
     "externalBin": [
-      "../../packaging/sidecars/mfq-decode-metal",
-      "../../packaging/sidecars/mfq-perplexity"
+      "../../packaging/sidecars/mfq-decode-metal"
     ],
     "resources": {
       "../dist": "web-ui",

@@ -26,7 +26,7 @@ from tyloinfer.formats.compat import canonical_dtype
 from tyloinfer.formats.header import TYLOINFER_SUFFIXES
 from tyloinfer.formats.io import open_mmap
 from tyloinfer.formats.shards import matching_shard_paths as _matching_tq_shards, parse_shard_path as _parse_tq_shard
-from tyloinfer.formats.gguf import gguf_is_table_component, matching_gguf_shard_paths, parse_gguf_shard_path
+from tyloinfer.formats.gguf import gguf_is_table_component, gguf_part_paths, is_gguf_path, matching_gguf_shard_paths, parse_gguf_shard_path
 from tyloinfer.server.protocol.models import (
     ModelArtifactList,
     ModelArtifactResource,
@@ -37,6 +37,7 @@ from tyloinfer.server.protocol.models import (
 from tyloinfer.server.state.model_weights import estimated_resident_weight_bytes, estimated_weight_roles, weight_role
 from tyloinfer.server.services.model_context import declared_context_size, yarn_context_limits
 from tyloinfer.server.services.desktop import directory_opener
+from tyloinfer.server.state.table_components import TableComponent, component_base, component_resource, inspect_table_component, table_record_kind
 
 MODEL_FILE_INDEX = ".tq-files.json"
 _MODEL_SUFFIXES = (*TYLOINFER_SUFFIXES, '.gguf')
@@ -76,14 +77,34 @@ class DiscoveredModel:
     always_streamed_bytes: int = 0
     source_config: dict | None = None
     source_tensors: dict | None = None
+    file_paths: tuple[Path, ...] = ()
 
 
 def parse_shard_path(path: Path):
-    return parse_gguf_shard_path(path) if path.suffix.casefold() == '.gguf' else _parse_tq_shard(path)
+    return parse_gguf_shard_path(path) if is_gguf_path(path) else _parse_tq_shard(path)
 
 
 def matching_shard_paths(path: Path):
-    return matching_gguf_shard_paths(path) if path.suffix.casefold() == '.gguf' else _matching_tq_shards(path)
+    if is_gguf_path(path):
+        return matching_gguf_shard_paths(path)
+    parsed = _parse_tq_shard(path)
+    return _matching_tq_shards(parsed[0] if parsed else path)
+
+
+def _is_model_path(path: Path) -> bool:
+    return path.suffix.casefold() in _MODEL_SUFFIXES or is_gguf_path(path)
+
+
+def _is_gguf_table(path: Path, cache: dict[Path, bool]) -> bool:
+    if not is_gguf_path(path):
+        return False
+    try:
+        first = gguf_part_paths(path, require_complete=False)[0]
+        if first not in cache:
+            cache[first] = gguf_is_table_component(path)
+        return cache[first]
+    except (OSError, ValueError):
+        return False
 
 
 def _is_routed_expert_tensor(name: str) -> bool:
@@ -133,6 +154,7 @@ class ModelCatalog:
         self.cache_seconds = max(0.0, cache_seconds)
         self._native_inspector = native_inspector
         self._source_metadata: dict[Path, tuple[tuple, dict]] = {}
+        self._table_metadata: dict[Path, tuple[tuple, TableComponent | None]] = {}
         self._models: dict[str, DiscoveredModel] = {}
         self._last_scan = float("-inf")
         self._last_scan_attempt = float("-inf")
@@ -143,11 +165,11 @@ class ModelCatalog:
         self._directory_ids: dict[str, Path] = {}
         self._directory_secret = os.urandom(32)
 
-    async def list(self, *, refresh: bool = False) -> ModelArtifactList:
+    async def list(self, *, refresh: bool = False, include_components: bool = False) -> ModelArtifactList:
         models = await self._snapshot(refresh=refresh)
         return ModelArtifactList(
             data=sorted(
-                (item.resource for item in models.values()),
+                (item.resource for item in models.values() if include_components or item.resource.asset_kind == 'model'),
                 key=lambda item: (item.name.casefold(), item.id),
             )
         )
@@ -178,13 +200,13 @@ class ModelCatalog:
         exact = models.get(identifier)
         if exact is not None:
             return exact
-        matches = [item for item in models.values() if item.resource.name == identifier]
+        matches = [item for item in models.values() if item.resource.name == identifier and item.resource.asset_kind == 'model']
         if not matches:
             models = await self._snapshot(refresh=True)
             exact = models.get(identifier)
             if exact is not None:
                 return exact
-            matches = [item for item in models.values() if item.resource.name == identifier]
+            matches = [item for item in models.values() if item.resource.name == identifier and item.resource.asset_kind == 'model']
         if len(matches) == 1:
             return matches[0]
         if len(matches) > 1:
@@ -216,7 +238,7 @@ class ModelCatalog:
                     first = next(
                         (
                             candidate
-                            for candidate in matching_shard_paths(parsed[0])
+                            for candidate in matching_shard_paths(requested)
                             if parse_shard_path(candidate)[1] == 1
                         ),
                         None,
@@ -224,7 +246,7 @@ class ModelCatalog:
                     if first is not None:
                         inspect_path = first
             supported_path = (
-                inspect_path.is_file() and inspect_path.suffix.casefold() in _MODEL_SUFFIXES
+                inspect_path.is_file() and _is_model_path(inspect_path)
             ) or (inspect_path.is_dir() and self._is_hf_model_directory(inspect_path))
             if supported_path:
                 direct = await asyncio.to_thread(self._inspect_source, privacy_root, inspect_path)
@@ -347,13 +369,12 @@ class ModelCatalog:
     def _immediate_model_count(path: Path) -> int:
         try:
             mfq_models: set[Path] = set()
+            tables: dict[Path, bool] = {}
             for item in path.iterdir():
-                if not item.is_file() or item.suffix.casefold() not in _MODEL_SUFFIXES:
+                if not item.is_file() or not _is_model_path(item):
                     continue
-                if item.suffix.casefold() == '.gguf':
-                    with contextlib.suppress(OSError, ValueError):
-                        if gguf_is_table_component(item):
-                            continue
+                if _is_gguf_table(item, tables):
+                    continue
                 try:
                     parsed = parse_shard_path(item)
                 except ValueError:
@@ -403,7 +424,7 @@ class ModelCatalog:
         files = []
         for item in entries:
             with contextlib.suppress(OSError):
-                if item.is_file() and item.suffix.casefold() in _MODEL_SUFFIXES:
+                if item.is_file() and _is_model_path(item):
                     files.append(ModelDirectoryFile(name=item.name, byte_size=item.stat().st_size))
         files.sort(key=lambda item: (item.name.casefold(), item.name))
         parent = current.parent if current.parent != current else None
@@ -423,16 +444,12 @@ class ModelCatalog:
     def _registration_paths(directory: Path) -> list[Path]:
         grouped: dict[Path, list[Path]] = {}
         try:
-            candidates = sorted(path for path in directory.rglob("*") if path.suffix.casefold() in _MODEL_SUFFIXES)
+            candidates = sorted(path for path in directory.rglob("*") if _is_model_path(path))
         except OSError as error:
             raise ModelRegistrationError("cannot scan selected model directory") from error
         for candidate in candidates:
             if not candidate.is_file():
                 continue
-            if candidate.suffix.casefold() == '.gguf':
-                with contextlib.suppress(OSError, ValueError):
-                    if gguf_is_table_component(candidate):
-                        continue
             try:
                 parsed = parse_shard_path(candidate)
             except ValueError as error:
@@ -614,11 +631,14 @@ class ModelCatalog:
         result: dict[str, DiscoveredModel] = {}
         model_paths: dict[str, Path] = {}
         models_by_name: dict[str, DiscoveredModel] = {}
+        tables: dict[Path, bool] = {}
+        components: dict[tuple[Path, str], dict[Path, TableComponent]] = {}
+        mixed_components: set[tuple[Path, str]] = set()
         for root in self.roots:
             if not root.is_dir():
                 continue
             grouped: dict[Path, list[Path]] = {}
-            paths = {path for path in root.rglob("*") if path.suffix.casefold() in _MODEL_SUFFIXES}
+            paths = {path for path in root.rglob("*") if _is_model_path(path)}
             paths.update(self._registered_paths(root))
             paths.update(
                 config.parent
@@ -628,28 +648,41 @@ class ModelCatalog:
             if self._is_hf_model_directory(root):
                 paths.add(root)
             for path in sorted(paths):
-                if path.suffix.casefold() == '.gguf':
-                    try:
-                        if gguf_is_table_component(path):
-                            continue
-                    except (OSError, ValueError):
-                        pass
+                component = self._table_component(path)
+                if component is not None:
+                    if component.mixed_kinds:
+                        mixed_components.update((component_base(component.path), kind) for kind in component.mixed_kinds)
+                    else:
+                        components.setdefault((component_base(component.path), component.kind), {})[component.path] = component
+                        continue
+                if _is_gguf_table(path, tables):
+                    continue
                 try:
                     parsed = parse_shard_path(path)
                 except ValueError:
                     parsed = None
                 grouped.setdefault(parsed[0] if parsed is not None else path, []).append(path)
             for paths in grouped.values():
-                path = next(
-                    (
-                        item
-                        for item in paths
-                        if (parsed := parse_shard_path(item)) is None or parsed[1] == 1
-                    ),
-                    paths[0],
-                )
+                path = paths[0]
+                for item in paths:
+                    try:
+                        parsed = parse_shard_path(item)
+                    except ValueError:
+                        continue
+                    if parsed is None or parsed[1] == 1:
+                        path = item
+                        break
                 privacy_root = root if path.is_relative_to(root) else path.parent
                 discovered = self._inspect_source(privacy_root, path)
+                if discovered.resource.format == 'hf' and discovered.resource.complete:
+                    config = json.loads((discovered.path / 'config.json').read_text(encoding='utf-8'))
+                    for shard in discovered.file_paths:
+                        component = self._table_component(shard, config)
+                        if component is not None:
+                            if component.mixed_kinds:
+                                mixed_components.update((component_base(component.path), kind) for kind in component.mixed_kinds)
+                            else:
+                                components.setdefault((component_base(component.path), component.kind), {})[component.path] = component
                 canonical_path = self._canonical_model_path(discovered.path)
                 previous_path = model_paths.get(discovered.resource.name)
                 if previous_path is not None and previous_path != canonical_path:
@@ -675,7 +708,52 @@ class ModelCatalog:
                 previous = result.get(discovered.resource.id)
                 if previous is None or str(path) < str(previous.path):
                     result[discovered.resource.id] = discovered
+        table_files: set[Path] = set()
+        for key, group in components.items():
+            if key in mixed_components:
+                continue
+            parts = list(group.values())
+            resource, files = component_resource(parts)
+            table_files.update(files)
+            result[resource.id] = DiscoveredModel(resource, parts[0].path, file_paths=files)
+        for key, artifact in list(result.items()):
+            if artifact.resource.asset_kind != 'model' or not artifact.file_paths:
+                continue
+            owned_bytes = sum(path.stat().st_size for path in set(artifact.file_paths) if path.resolve() not in table_files)
+            result[key] = replace(artifact, resource=artifact.resource.model_copy(update={'owned_file_bytes': owned_bytes}))
         return result
+
+    def _table_component(self, path: Path, config: dict | None = None) -> TableComponent | None:
+        if not path.is_file():
+            return None
+        try:
+            files = gguf_part_paths(path) if is_gguf_path(path) else (path,)
+            first = files[0]
+            signature = tuple((str(item), item.stat().st_size, item.stat().st_mtime_ns) for item in files)
+            is_hf = path.suffix.casefold() == '.safetensors'
+            if is_hf:
+                source = path.parent / 'config.json'
+                signature += ((str(source), source.stat().st_size, source.stat().st_mtime_ns),)
+            cached = self._table_metadata.get(first)
+            if cached is not None and cached[0] == signature:
+                return cached[1]
+            if is_hf:
+                tensors = {name: value for name, value in self._safetensors_header(first).items() if name != '__metadata__'}
+                kinds = set()
+                for name in tensors:
+                    mapped = map_source_tensor_name(name, config or {})
+                    kinds.add(table_record_kind(mapped.canonical_name if mapped is not None else name))
+                table_kinds = kinds - {None}
+                pure = None not in kinds and len(kinds) == 1
+                component = TableComponent(first, (first,), next(iter(table_kinds)) if pure else 'mixed',
+                    (config or {}).get('model_type', 'unknown'), len(tensors), tuple(sorted({entry['dtype'] for entry in tensors.values()})),
+                    tuple(sorted(table_kinds)) if not pure else ()) if table_kinds else None
+            else:
+                component = inspect_table_component(first, include_mixed=True)
+            self._table_metadata[first] = (signature, component)
+            return component
+        except (OSError, ValueError, TypeError, struct.error, UnicodeError):
+            return None
 
     @staticmethod
     def _registered_paths(root: Path) -> set[Path]:
@@ -701,7 +779,7 @@ class ModelCatalog:
             if resolved.is_dir() and ModelCatalog._is_hf_model_directory(resolved):
                 result.add(resolved)
                 continue
-            if resolved.suffix.casefold() not in _MODEL_SUFFIXES:
+            if not _is_model_path(resolved):
                 continue
             if resolved.is_file():
                 try:
@@ -711,11 +789,11 @@ class ModelCatalog:
                 if parsed is None:
                     result.add(resolved)
                 else:
-                    result.update(matching_shard_paths(parsed[0]))
+                    result.update(matching_shard_paths(resolved))
         return result
 
     def _inspect_source(self, root: Path, path: Path) -> DiscoveredModel:
-        if path.suffix.casefold() != '.gguf':
+        if not is_gguf_path(path):
             artifact = self._inspect(root, path)
             if artifact.resource.format != 'hf' or not artifact.resource.complete or 'U32' not in artifact.resource.dtypes:
                 return artifact
@@ -749,8 +827,12 @@ class ModelCatalog:
                 return replace(artifact, resource=artifact.resource.model_copy(update={
                     'loadable': False, 'error': str(failure).replace(str(root), '<model-root>'),
                 }))
-        parsed = parse_gguf_shard_path(path)
-        paths = tuple(candidate for candidate in matching_shard_paths(parsed[0])
+        parse_error = None
+        try:
+            parsed = parse_gguf_shard_path(path)
+        except ValueError as failure:
+            parsed, parse_error = None, failure
+        paths = tuple(candidate for candidate in matching_shard_paths(path)
             if parse_shard_path(candidate)[2] == parsed[2]) if parsed else (path,)
         stats = tuple(candidate.stat() for candidate in paths)
         count = parsed[2] if parsed else 1
@@ -767,6 +849,8 @@ class ModelCatalog:
         roles = {role: 0 for role in ('dense', 'experts', 'embedding')}
         experts = streamed = 0
         try:
+            if parse_error is not None:
+                raise parse_error
             if missing:
                 raise ValueError(f'GGUF checkpoint is missing {missing} shard(s)')
             if gguf_is_table_component(path):
@@ -776,7 +860,9 @@ class ModelCatalog:
             tensors = metadata['tensors']
             architecture = _native_architecture(metadata)
             supported = {'Q4_0', 'Q4_1', 'Q5_0', 'Q5_1', 'Q8_0', 'Q2_K', 'Q3_K', 'Q4_K', 'Q5_K', 'Q6_K',
-                'Q8_K', 'IQ2_XXS', 'IQ2_XS', 'IQ2_S', 'IQ3_XXS', 'IQ3_S', 'IQ4_NL', 'IQ4_XS', 'Q2_0'}
+                'Q8_K', 'IQ2_XXS', 'IQ2_XS', 'IQ2_S', 'IQ3_XXS', 'IQ3_S', 'IQ4_NL', 'IQ4_XS', 'Q2_0',
+                'PTQ1_0', 'TQ2_T', 'TQK4', 'TQK5', 'TQK6', 'TQK7', 'TQP5', 'TQP6', 'TQP7',
+                'MXFP4', 'MIXED', 'ENGRAM_MXFP8'}
             unsupported = set()
             for tensor, record in tensors.items():
                 dtype, size = record['dtype'], int(record['nbytes'])
@@ -795,7 +881,12 @@ class ModelCatalog:
         except Exception as failure:
             error = str(failure).replace(str(root), '<model-root>')
         capacity, yarn_capacity, yarn_factor = yarn_context_limits(config, architecture)
+        text = config.get('text_config', config)
+        companion_required = isinstance(text, dict) and any(
+            f'model.block.{layer}.associative_memory.embedding.weight' not in tensors
+            for layer in text.get('engram_layer_ids', []) or [])
         resource = ModelArtifactResource(id=identifier, name=name, architecture=architecture, format='gguf',
+            gguf_companion_required=companion_required,
             shard_count=count, missing_shards=missing, total_bytes=sum(stat.st_size for stat in stats),
             estimated_resident_weight_bytes=sum(roles.values()) if tensors else None,
             estimated_weight_bytes_by_role=roles if tensors else {}, ssd_ple_bytes=streamed if tensors else None,
@@ -803,7 +894,7 @@ class ModelCatalog:
             tensor_count=len(tensors), record_count=len(tensors), dtypes=sorted({item['dtype'] for item in tensors.values()}),
             complete=not missing, loadable=loadable, error=error,
             modified_at=datetime.fromtimestamp(max((stat.st_mtime for stat in stats), default=path.stat().st_mtime), timezone.utc))
-        return DiscoveredModel(resource, path, experts, streamed, config, tensors)
+        return DiscoveredModel(resource, path, experts, streamed, config, tensors, paths)
 
     def _inspect_native_metadata(self, path: Path, signature: tuple) -> dict:
         if self._native_inspector is None:
@@ -825,9 +916,11 @@ class ModelCatalog:
             parsed = None
         name = (parsed[0] if parsed is not None else path).stem
         relative = path.relative_to(root).as_posix()
+        file_paths: tuple[Path, ...] = ()
         try:
             with open_mmap(path) as store:
                 paths = tuple(store.paths)
+                file_paths = paths
                 stats = tuple(item.stat() for item in paths)
                 dtypes = sorted({record.dtype for record in store.records.values()})
                 tensor_count = sum(
@@ -902,6 +995,7 @@ class ModelCatalog:
             remaining = tuple(candidate for candidate in matching_shard_paths(parsed[0])
                 if candidate.is_file() and parse_shard_path(candidate)[2] == parsed[2]) if parsed is not None else (path,)
             remaining_stats = tuple(item.stat() for item in remaining) or (stat,)
+            file_paths = remaining
             identifier = hashlib.sha256(f"{relative}\0{stat.st_size}".encode()).hexdigest()[:32]
             resource = ModelArtifactResource(
                 id=identifier,
@@ -926,6 +1020,7 @@ class ModelCatalog:
             always_streamed_bytes=(
                 always_streamed_bytes if resource.complete else 0
             ),
+            file_paths=file_paths,
         )
 
     @staticmethod
@@ -957,6 +1052,8 @@ class ModelCatalog:
             if len(raw_size) != 8:
                 raise ValueError(f"truncated Safetensors header: {path.name}")
             size = struct.unpack("<Q", raw_size)[0]
+            if size > 16 * 1024 * 1024 or size > path.stat().st_size - 8:
+                raise ValueError(f"invalid Safetensors header length: {path.name}")
             raw_header = stream.read(size)
         if len(raw_header) != size:
             raise ValueError(f"truncated Safetensors header: {path.name}")
@@ -1108,4 +1205,5 @@ class ModelCatalog:
             always_streamed_bytes=(
                 always_streamed_bytes if resource.complete else 0
             ),
+            file_paths=shard_paths if resource.complete else (),
         )

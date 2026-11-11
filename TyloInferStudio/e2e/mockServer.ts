@@ -65,6 +65,7 @@ export const officialCatalog: OfficialModelList = {
 interface MockOptions {
   language?: 'zh-CN' | 'en';
   theme?: 'light' | 'dark';
+  preserveSettings?: boolean;
 
   failFirstSync?: boolean;
 
@@ -82,12 +83,13 @@ export async function mockStudioServer(page: Page, options: MockOptions = {}) {
   let responses: ResponseResource[] = [];
   let failedSync = false;
   let releasePending: (() => void) | undefined;
-  await page.addInitScript(({ language, theme }) => {
+  await page.addInitScript(({ language, theme, preserveSettings }) => {
+    if (preserveSettings && localStorage.getItem('tyloinfer.studio.generation.v1')) return;
     localStorage.setItem(
       'tyloinfer.studio.generation.v1',
       JSON.stringify({ language, theme }),
     );
-  }, { language: options.language ?? 'en', theme: options.theme ?? 'light' });
+  }, { language: options.language ?? 'en', theme: options.theme ?? 'light', preserveSettings: options.preserveSettings ?? false });
   await page.route('**/api/v1/**', async (route) => {
     const path = new URL(route.request().url()).pathname;
     const method = route.request().method();
@@ -119,9 +121,6 @@ export async function mockStudioServer(page: Page, options: MockOptions = {}) {
     if (path.startsWith('/api/v1/runtime/yarn/')) return json({ supported: false,
       native_context: 262144, maximum_context: 262144, maximum_factor: 1, enabled: false, effective_factor: 1 });
     if (/^\/api\/v1\/models\/[^/]+\/cache-profile$/.test(path)) return json(null);
-    if (path === '/api/v1/evaluations/tools')
-      return json({ workspace_root: null, api_base: 'http://127.0.0.1:8090/v1',
-        quality_available: false, benchmark_available: false, accuracy_available: false, task_benchmarks: {} });
     if (path === '/api/v1/runtime/status')
       return json({
         runtime_state: 'ready',
@@ -301,9 +300,6 @@ export async function mockStudioServer(page: Page, options: MockOptions = {}) {
         '/api/v1/presets',
         '/api/v1/runtime/profiles',
         '/api/v1/artifacts/lineage',
-        '/api/v1/datasets',
-        '/api/v1/datasets/catalog',
-        '/api/v1/evaluations',
         '/api/v1/cluster/nodes',
       ].includes(path)
     )

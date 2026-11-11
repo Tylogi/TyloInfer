@@ -1,7 +1,7 @@
 #include "execution_fixture.h"
-#include "mfq_cuda_norm_ops.h"
+#include "engine/backends/cuda/kernels/mfq_cuda_norm_ops.h"
 #include "memory_tensor_source.h"
-#include "execution/execution.h"
+#include "engine/backends/cuda/executor/execution.h"
 #include "cuda_runtime_config.h"
 #include "cuda_sampling.h"
 #include "diagnostics/generation_result.h"
@@ -9,19 +9,20 @@
 #include "mfq_paged_prefix_cache.h"
 #include "models/gemma4/causal_lm.h"
 #include "models/minicpmo45/ops.h"
-#include "models/minicpmo45/tts.h"
-#include "models/qwen35/linear_attention.h"
+#include "engine/models/minicpmo45/tts.h"
+#include "engine/backends/cuda/ops/attention/linear.h"
 #include "models/qwen35/ops.h"
-#include "models/qwen4_exp/model.h"
-#include "engine/models/common/session/state.h"
+#include "engine/models/qwen4_exp/model.h"
+#include "engine/models/session/state.h"
 #include "moe.h"
-#include "storage/weights/moe/expert_store.h"
-#include "storage/weights/moe/expert_cache.h"
-#include "storage/weights/loaders/weight.h"
-#include "storage/state/kv_memory.h"
-#include "storage/weights/moe/kv_expert_loan.h"
+#include "engine/weights/moe/expert_store.h"
+#include "engine/weights/moe/expert_cache.h"
+#include "engine/weights/loader.h"
+#include "engine/state/kv_memory.h"
+#include "engine/weights/moe/kv_expert_loan.h"
 #include "storage/weights/moe/dma_copy_batch.h"
 #include "mfe_cached_dispatch_test.h"
+#include "engine/backends/cuda/kernels/attention_mma_verify.h"
 
 #include <algorithm>
 #include <cmath>
@@ -40,6 +41,119 @@ static void check(bool ok, const char *message) {
     if (!ok)
         throw std::runtime_error(message);
 }
+
+static void check_attention_logical_prefix() {
+
+    const auto context = default_context();
+    const auto stream = mfq_current_cuda_stream();
+    context->begin_graph_pool(stream);
+    int cases = 0, skipped = 0;
+    for (auto [width, capacity] : {std::pair{64, 1024}, std::pair{128, 1024},
+                                  std::pair{256, 32768}, std::pair{512, 1024}})
+    for (int ratio : {6, 10}) for (int tokens : {2, 3, 4})
+    for (auto query_type : {::tyloi::kFloat16, ::tyloi::kFloat32}) {
+        constexpr int batch = 2, kv_heads = 2, initialized_rows = 160;
+        const int heads = kv_heads * ratio;
+        const auto cpu = ::tyloi::TensorOptions().device(::tyloi::kCPU).dtype(::tyloi::kFloat32);
+        auto query_cpu = ::tyloi::cuda::empty({batch, heads, tokens, width}, cpu);
+        auto key_cpu = ::tyloi::cuda::empty({batch, kv_heads, initialized_rows, width}, cpu);
+        auto value_cpu = ::tyloi::cuda::empty({batch, kv_heads, initialized_rows, width}, cpu);
+        for (int64_t i = 0; i < query_cpu.numel(); ++i)
+            query_cpu.data_ptr<float>()[i] = .6f * std::sin(float(i % 1009) * .173f);
+        for (int64_t i = 0; i < key_cpu.numel(); ++i) {
+            key_cpu.data_ptr<float>()[i] = .7f * std::cos(float(i % 2003) * .079f);
+            value_cpu.data_ptr<float>()[i] = .8f * std::sin(float(i % 1019) * .053f);
+        }
+        query_cpu = query_cpu.to(query_type).to(::tyloi::kFloat32);
+        key_cpu = key_cpu.to(::tyloi::kFloat16).to(::tyloi::kFloat32);
+        value_cpu = value_cpu.to(::tyloi::kFloat16).to(::tyloi::kFloat32);
+        auto query = query_cpu.to(query_type).to(::tyloi::kCUDA);
+        auto cache_options = cpu.device(::tyloi::kCUDA).dtype(::tyloi::kFloat16);
+        auto keys = ::tyloi::cuda::full({batch, kv_heads, capacity, width}, NAN, cache_options);
+        auto values = ::tyloi::cuda::full({batch, kv_heads, capacity, width}, NAN, cache_options);
+        keys.narrow(2, 0, initialized_rows).copy_(key_cpu.to(::tyloi::kFloat16).to(::tyloi::kCUDA));
+        values.narrow(2, 0, initialized_rows).copy_(value_cpu.to(::tyloi::kFloat16).to(::tyloi::kCUDA));
+        auto lengths_cpu = ::tyloi::cuda::empty({batch}, cpu.dtype(::tyloi::kInt64));
+        lengths_cpu.data_ptr<int64_t>()[0] = 19;
+        lengths_cpu.data_ptr<int64_t>()[1] = 11;
+        auto lengths = lengths_cpu.to(::tyloi::kCUDA);
+        ::tyloi::DenseTensor output;
+        const double scale = 1. / std::sqrt(double(width));
+        const auto body = [&] {
+            output = {};
+            output = try_attention_mma_verify_cuda(query, keys, values, lengths, scale, capacity);
+        };
+        { GraphWarmupScope warmup(context, stream); body(); }
+        if (!output.defined()) { ++skipped; continue; }
+        TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(stream));
+        output = {};
+        Graph graph;
+        graph.capture_begin_shared(); body(); graph.capture_end();
+        for (int length : {19, 129, 37}) {
+            lengths_cpu.data_ptr<int64_t>()[0] = length;
+            lengths_cpu.data_ptr<int64_t>()[1] = length - 7;
+            lengths.copy_(lengths_cpu.to(::tyloi::kCUDA));
+            graph.replay();
+            auto actual = output.to(::tyloi::kCPU, ::tyloi::kFloat32).contiguous();
+            const auto* q = query_cpu.data_ptr<float>();
+            const auto* k = key_cpu.data_ptr<float>();
+            const auto* v = value_cpu.data_ptr<float>();
+            for (int b = 0; b < batch; ++b) for (int t = 0; t < tokens; ++t)
+            for (int h = 0; h < heads; ++h) {
+                const int count = int(lengths_cpu.data_ptr<int64_t>()[b]) - tokens + t + 1;
+                std::vector<double> scores(count);
+                double maximum = -INFINITY;
+                for (int s = 0; s < count; ++s) {
+                    double score = 0;
+                    for (int d = 0; d < width; ++d)
+                        score += double(q[((b * heads + h) * tokens + t) * width + d]) *
+                            k[((int64_t(b) * kv_heads + h / ratio) * initialized_rows + s) * width + d];
+                    scores[s] = score * scale;
+                    maximum = std::max(maximum, scores[s]);
+                }
+                double total = 0;
+                for (auto& score : scores) { score = std::exp(score - maximum); total += score; }
+                for (int d = 0; d < width; ++d) {
+                    double reference = 0;
+                    for (int s = 0; s < count; ++s)
+                        reference += scores[s] *
+                            v[((int64_t(b) * kv_heads + h / ratio) * initialized_rows + s) * width + d];
+                    const float value = actual.data_ptr<float>()[((b * tokens + t) * heads + h) * width + d];
+                    check(std::isfinite(value) && std::abs(value - reference / total) < .002,
+                          "logical-prefix attention differs from independent causal reference");
+                }
+            }
+            ++cases;
+        }
+    }
+    context->end_graph_pool(stream);
+    std::cout << "Logical-prefix attention: " << cases << " changing Graph/reference cases passed; "
+              << skipped << " variants unavailable with current MMA resources\n";
+}
+
+struct MemoryTensorSource final : tyloi::ModelSource {
+    std::vector<uint8_t> bytes;
+    std::vector<tyloi::TensorMetadata> records{{"weight", "F32", "F32", std::nullopt, 0}};
+    std::vector<std::filesystem::path> paths;
+    std::unordered_map<std::string, std::string> meta;
+    std::vector<std::string> asset_names;
+    const std::vector<std::filesystem::path>& source_paths() const noexcept override { return paths; }
+    std::string_view architecture() const noexcept override { return {}; }
+    const std::unordered_map<std::string, std::string>& metadata() const noexcept override { return meta; }
+    const std::vector<tyloi::TensorMetadata>& tensors() const noexcept override { return records; }
+    const tyloi::TensorMetadata* find_tensor(std::string_view name) const noexcept override {
+        for(const auto& record:records)if(record.name==name)return &record;
+        return nullptr;
+    }
+    void read_range_into(std::string_view, uint64_t offset, std::byte* output, size_t size) const override {
+        check(offset <= bytes.size() && size <= bytes.size() - offset, "memory fixture range");
+        if (size) std::memcpy(output, bytes.data() + offset, size);
+    }
+    const std::vector<std::string>& assets() const noexcept override { return asset_names; }
+    bool has_asset(std::string_view) const noexcept override { return false; }
+    std::vector<std::byte> read_asset(std::string_view) const override { throw std::runtime_error("no assets"); }
+    std::optional<tyloi::ModelGraph> model_graph() const override { return std::nullopt; }
+};
 
 static void check_sampling_fallback() {
     namespace tb=tyloi::cuda;
@@ -856,6 +970,95 @@ static void check_batching(const char* model_path, const char* tokenizer) {
     check_media_steps(*engine, model_path);
 }
 
+static void check_speculative_recurrent_input_reuse() {
+
+    const auto data=[](std::vector<int64_t> shape,float phase,float scale) {
+        auto cpu=::tyloi::cuda::empty(shape,::tyloi::TensorOptions().device(::tyloi::kCPU).dtype(::tyloi::kFloat32));
+        for(int64_t i=0;i<cpu.numel();++i)cpu.data_ptr<float>()[i]=std::sin(float(i)*.037f+phase)*scale;
+        return cpu.to(::tyloi::kCUDA);
+    };
+    int cases=0;
+    double largest_fused_relative_error=0;
+    for(int batch:{1,2})for(int width:{32,64,128})for(int tokens:{2,3,4,8})
+    for(bool transposed:{false,true})for(bool tiled:{false,true})for(int retained=1;retained<tokens;++retained) {
+        const int nk=2,nv=4,channels=(2*nk+nv)*width;
+        auto convolution=data({batch,3,channels},.1f,.2f);
+        auto recurrent=data({batch,nv,width,width},.2f,.01f);
+        auto projected=data({batch,tokens,channels+7},.3f,.4f).narrow(2,0,channels);
+        auto weight=data({channels,1,4},.4f,.3f);
+        auto empty=::tyloi::cuda::empty({0},convolution.options());
+        auto conv=ssm_conv_silu_cuda(::tyloi::cuda::cat({convolution,projected},1),weight,empty,tokens);
+        auto q=conv.narrow(2,0,nk*width).reshape({batch,tokens,nk,width}).transpose(1,2);
+        auto k=conv.narrow(2,nk*width,nk*width).reshape({batch,tokens,nk,width}).transpose(1,2);
+        auto v=conv.narrow(2,2*nk*width,nv*width).reshape({batch,tokens,nv,width}).transpose(1,2);
+        q=l2_norm_cuda(q.contiguous().reshape({-1,width}),1e-6).reshape_as(q);
+        k=l2_norm_cuda(k.contiguous().reshape({-1,width}),1e-6).reshape_as(k);
+        qwen35::LinearRecurrentInputs inputs;
+        inputs.batch=batch;inputs.tokens=tokens;inputs.qkv=projected;
+        inputs.gate=data({batch,nv,tokens},.5f,.1f);
+        inputs.beta=data({batch,nv,tokens},.6f,.2f)+.5f;
+        qwen35::LinearAttentionBlock reference,reused,fused;
+        for(auto* block:{&reference,&reused,&fused}) {
+            block->qwen_config.linear_conv_kernel_dim=4;
+            block->qwen_config.linear_num_key_heads=nk;
+            block->qwen_config.linear_num_value_heads=nv;
+            block->qwen_config.linear_key_head_dim=width;
+            block->qwen_config.linear_value_head_dim=width;
+            block->qwen_config.rms_norm_eps=1e-6;
+            block->transposed_gdn_state=transposed;block->conv_weight=weight;
+            block->tiled_v_heads=tiled;
+            block->mixer.convolution=convolution.clone();block->mixer.recurrent=recurrent.clone();
+        }
+        reference.replay_recurrent_cuda(inputs,retained);
+        inputs.normalized_q=q.contiguous();inputs.normalized_k=k.contiguous();inputs.convolved_v=v;
+        reused.replay_recurrent_cuda(inputs,retained);
+        const auto* conv_address=fused.mixer.convolution.data_ptr();
+        const auto* state_address=fused.mixer.recurrent.data_ptr();
+        fused.mixer.convolution.fill_(-5);fused.mixer.recurrent.fill_(-7);
+        check(try_gdn_replay_state_cuda(inputs.normalized_k,inputs.convolved_v,inputs.gate,inputs.beta,
+            inputs.qkv,convolution,recurrent,fused.mixer.convolution,fused.mixer.recurrent,
+            retained,transposed,tiled),"fused GDN replay did not accept strided retained inputs");
+        const auto exact=[](const auto& a,const auto& b) {
+            auto x=a.cpu().contiguous(),y=b.cpu().contiguous();
+            return x.nbytes()==y.nbytes() && std::memcmp(x.data_ptr(),y.data_ptr(),x.nbytes())==0;
+        };
+        check(exact(reference.mixer.convolution,reused.mixer.convolution),
+            "reused recurrent inputs changed convolution rollback");
+        check(exact(reference.mixer.recurrent,reused.mixer.recurrent),
+            "reused recurrent inputs changed GDN rollback");
+        const bool same_convolution=exact(reference.mixer.convolution,fused.mixer.convolution);
+        bool same_recurrent=exact(reference.mixer.recurrent,fused.mixer.recurrent);
+        if(!same_recurrent) {
+            auto a=reference.mixer.recurrent.cpu().contiguous(),b=fused.mixer.recurrent.cpu().contiguous();
+            double error=0,norm=0,max_error=0;
+            for(int64_t i=0;i<a.numel();++i) {
+                const double d=double(a.data_ptr<float>()[i])-b.data_ptr<float>()[i];
+                error+=d*d;norm+=double(a.data_ptr<float>()[i])*a.data_ptr<float>()[i];
+                max_error=std::max(max_error,std::abs(d));
+            }
+            const double relative=std::sqrt(error/std::max(norm,1e-30));
+            largest_fused_relative_error=std::max(largest_fused_relative_error,relative);
+            // The state-only kernel explicitly contracts the rank-one update;
+            // existing readout kernels can contract either product instead.
+            same_recurrent=std::isfinite(relative) && relative<=1e-6 && max_error<=1e-6;
+            if(!same_recurrent)std::cerr<<"GDN state replay relative="<<relative<<" max="<<max_error<<'\n';
+        }
+        check(same_convolution && same_recurrent,
+            "fused GDN state replay differs from raw convolution/recurrent replay");
+        check(conv_address==fused.mixer.convolution.data_ptr() && state_address==fused.mixer.recurrent.data_ptr(),
+            "fused GDN replay replaced graph state storage");
+        auto alias_state=recurrent.clone(),alias_conv=::tyloi::cuda::empty_like(convolution);
+        check(try_gdn_replay_state_cuda(inputs.normalized_k,inputs.convolved_v,inputs.gate,inputs.beta,
+            inputs.qkv,convolution,alias_state,alias_conv,alias_state,
+            retained,transposed,tiled),"in-place retained GDN commit rejected a safe column alias");
+        check(exact(alias_state,fused.mixer.recurrent) && exact(alias_conv,fused.mixer.convolution),
+            "in-place retained GDN commit differs from independent-output replay");
+        ++cases;
+    }
+    std::cout<<"Retained Q/K/V and fused GDN rollback: "<<cases
+        <<" cases PASS, largest fused state relative error="<<largest_fused_relative_error<<'\n';
+}
+
 static void check_retained_recurrent_storage() {
     namespace tb=tyloi::cuda;
     const auto options=tyloi::TensorOptions().device(tyloi::kCUDA).dtype(tyloi::kFloat32);
@@ -887,6 +1090,9 @@ static void check_kv_memory() {
     KvMemoryManager manager(config);
     auto allocation=manager.add(32768,2,128,128,16,4,options);
     manager.finalize();
+    check(allocation->index.scalar_type()==::tyloi::kInt16 && allocation->pooled.scalar_type()==::tyloi::kInt16 &&
+        allocation->index.size(-1)==18 && allocation->pooled.size(-1)==18,
+        "QSA Indexer allocation lost INT16 affine scale/zero records");
     const auto bytes=allocation->gpu_bytes();
     auto* address=allocation->keys.data_ptr();
     auto prefix=tb::full({1,2,16,128},3.0,options);
@@ -1006,7 +1212,7 @@ static void check_exclusive_kv() {
         const int kw=bits?cuda_kv_packed_width(width,int(std::floor(bits))):width;
         const int vw=bits?cuda_kv_packed_width(width,int(std::ceil(bits))):width;
         KvMemoryOptions policy;policy.budget_policy=true;policy.ram_limit_set=true;policy.ram_limit=1<<20;
-        policy.gpu_budget=(maximum+maximum/4)*8*2+cells*heads*(kw+vw)*(bits?4:2);
+        policy.gpu_budget=(maximum+maximum/4)*(8+2)*2+cells*heads*(kw+vw)*(bits?4:2);
         KvMemoryManager manager(policy);
         auto memory=manager.add(maximum,heads,kw,vw,8,4,options.dtype(bits?tyloi::kInt32:tyloi::kFloat16));manager.finalize();
         check(memory->hot.exclusive(),"budgeted KV did not use exclusive GPU/RAM tiers");
@@ -1546,6 +1752,9 @@ using namespace tyloi;
 int main(int argc, char** argv) try {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) return 77;
+    if (argc == 2 && std::string(argv[1]) == "--attention-prefix-check") {
+        check_attention_logical_prefix(); return 0;
+    }
     if(argc==2 && std::string(argv[1])=="--tq-tp-check") {check_tq_parallel();return 0;}
     if(argc==2 && std::string(argv[1])=="--workspace-loan-check") {
         check_workspace_loan();check_graph_workspace_reuse();
@@ -1591,6 +1800,8 @@ int main(int argc, char** argv) try {
     check_gelu_approximations();
     check_streamed_graph_segments();
     check_retained_recurrent_storage();
+    check_speculative_recurrent_input_reuse();
+    check_attention_logical_prefix();
     check_sampling_storage();
     check_linear_execution();
     check_graph_warmup_state();

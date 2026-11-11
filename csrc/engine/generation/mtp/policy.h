@@ -2,6 +2,7 @@
 
 #include "depth_controller.h"
 #include "metrics.h"
+#include "limits.h"
 
 // Host-side MTP depth selection and chain verification shared by engines.
 // Inputs to distribution() have already received the sampler's penalties.
@@ -20,7 +21,6 @@
 
 namespace tyloi::engine::mtp {
 
-inline constexpr int kMaximumDraftDepth = 5;
 
 struct ChainVerification {
     std::size_t accepted_drafts = 0;

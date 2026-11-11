@@ -1,7 +1,7 @@
-#include "env.h"
-#include "context.h"
+#include "engine/backends/cuda/native/env.h"
+#include "engine/backends/cuda/native/context.h"
 #include "tensor.h"
-#include "matmul_rows.h"
+#include "engine/backends/cuda/native/matmul_rows.h"
 #include "engine/weights/memory.h"
 #include <cstring>
 
@@ -154,6 +154,7 @@ using namespace tyloi;
 
 #include "matmul_rows_test.h"
 #include "contiguous_convert_test.h"
+#include "strided_copy_test.h"
 }  // namespace
 
 int main(int argc,char** argv) try {
@@ -167,6 +168,7 @@ int main(int argc,char** argv) try {
     using namespace tyloi::cuda;
 using namespace tyloi;
     const Device cuda_device{DeviceType::cuda, 0};
+    if(argc==2 && std::string(argv[1])=="--strided-copy-check") {check_strided_inner_copy();return 0;}
     if(argc==2 && std::string(argv[1])=="--where-broadcast-check") {check_where_broadcast();return 0;}
     check_where_broadcast();
     if(argc==2 && std::string(argv[1])=="--contiguous-convert-check") {
@@ -627,6 +629,30 @@ using namespace tyloi;
     }
     TYLOINFER_NATIVE_CUDA_CHECK(cudaStreamSynchronize(usage_stream.stream()));
     require_close(host_values(consumed)[5], 1296.0f, 0.0f, "cross-stream lifetime");
+
+    // Weights may outlive a short-lived branch executor. Its stream must
+    // remain valid until the storage's deferred consumer fence is recorded.
+    auto retained_consumer=input.square();
+    std::weak_ptr<void> retained_stream_lifetime;
+    {
+        auto short_lived=stream_from_pool(false,input.get_device());
+        retained_stream_lifetime=short_lived.lifetime();
+        Event ready;ready.record(current_stream(input.get_device()).stream());
+        {
+            StreamGuard selected(short_lived);
+            TYLOINFER_NATIVE_CUDA_CHECK(cudaStreamWaitEvent(short_lived.stream(),ready.get(),0));
+            retained_consumer.record_stream(reinterpret_cast<std::uintptr_t>(short_lived.stream()),short_lived.lifetime());
+            // A later raw registration must preserve existing ownership.
+            retained_consumer.record_stream(reinterpret_cast<std::uintptr_t>(short_lived.stream()));
+            auto result=retained_consumer.square();
+            TYLOINFER_NATIVE_CUDA_CHECK(cudaStreamSynchronize(short_lived.stream()));
+            require_close(host_values(result)[5],1296.0f,0.0f,"owned consumer stream result");
+        }
+    }
+    require(!retained_stream_lifetime.expired(),"consumer stream was destroyed before its tensor storage");
+    retained_consumer={};
+    require(retained_stream_lifetime.expired(),"consumer stream ownership leaked after storage release");
+    TYLOINFER_NATIVE_CUDA_CHECK(cudaGetLastError());
 
     if (default_context(0)->supports_async_allocations()) {
         auto graph_stream = stream_from_pool(false, 0);

@@ -1,10 +1,16 @@
-#include "env.h"
+#include "engine/backends/cuda/native/env.h"
 #include <math_constants.h>
 #include <cuda_fp16.h>
-#include "backend.h"
+#include "engine/backends/cuda/native/tensor/backend.h"
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <climits>
+#include <unordered_set>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include "attention_mma_verify.h"
+#include "engine/backends/cuda/kernels/mfq_cuda_attention_ops.h"
 
 #define TYLOINFER_FATTN_KERNEL_ONLY
 #include "mfq_fattn_mma_f16.cuh"
@@ -344,6 +350,16 @@ static ::tyloi::DenseTensor mfq_attention_mma_launch(
     const auto status = cudaGetLastError();
     TYLOINFER_RUNTIME_CHECK(status == cudaSuccess,
                 "mfq_attention_mma256 launch failed: ", cudaGetErrorString(status));
+    if (const char* trace = tyloi::cuda::env_lookup("TYLOINFER_TRACE_KERNEL_DISPATCH"); trace && trace[0] == '1') {
+        static std::atomic_flag reported = ATOMIC_FLAG_INIT;
+        if (!reported.test_and_set()) {
+            cudaFuncAttributes attributes{};
+            const auto result = cudaFuncGetAttributes(&attributes, kernel);
+            std::fprintf(stderr, "native_attention_prefill_mma actual_launch=1 q_tile=%d head_tile=%d "
+                "M=%d q_heads=%d kv_heads=%d registers=%d shared_bytes=%zu resource_status=%d\n",
+                ncols1, ncols2, T, Hq, Hk, attributes.numRegs, shared_total, int(result));
+        }
+    }
     return out;
 }
 
@@ -365,10 +381,15 @@ static ::tyloi::DenseTensor mfq_attention_mma_launch(
     TYLOINFER_RUNTIME_CHECK(D == 256 && k.size(3) == D && v.size(3) == D, "mfq_attention_mma256: head_dim must be 256");
     const int gqa_ratio = Hk > 0 ? Hq / Hk : 0;
     TYLOINFER_RUNTIME_CHECK(Hk > 0 && Hq % Hk == 0 &&
-                (gqa_ratio == 4 || gqa_ratio == 8) &&
+                gqa_ratio > 0 &&
                 k.size(0) == B && v.size(0) == B &&
                 k.size(2) == T && v.size(2) == T && v.size(1) == Hk,
-                "mfq_attention_mma256: requires self-attention with GQA ratio 4 or 8");
+                "mfq_attention_mma256: requires self-attention with an integral GQA ratio");
+    // A single head column covers every integral GQA ratio, including tails.
+    // Keep 32 MMA columns: this body is compiled for Volta, Turing and newer;
+    // the bundled Turing implementation omits tiles wider than 32 columns.
+    if (gqa_ratio != 4 && gqa_ratio != 8)
+        return mfq_attention_mma_launch<256, 256, 32, 1>(q, k, v, scale, false, 0);
     if (T % FATTN_KQ_STRIDE == 0) {
         return gqa_ratio == 8
             ? mfq_attention_mma_launch<256, 256, 8, 8>(
@@ -697,7 +718,7 @@ static ::tyloi::DenseTensor attention_glm_mla576_cached_impl(
 }
 
 template<int DKQ_EXPECTED, int DV_EXPECTED, int NCOLS1, int NCOLS2,
-         bool V_IS_K_VIEW = false>
+         bool V_IS_K_VIEW = false,bool OwnedWorkspace=false>
 static ::tyloi::DenseTensor mfq_attention_mma_decode_impl(
     ::tyloi::DenseTensor q, ::tyloi::DenseTensor k_cache, ::tyloi::DenseTensor v_cache,
     ::tyloi::DenseTensor seq_len, double scale, int64_t planned_len,
@@ -714,6 +735,7 @@ static ::tyloi::DenseTensor mfq_attention_mma_decode_impl(
     TYLOINFER_RUNTIME_CHECK(seq_len.is_cuda() && seq_len.is_contiguous() &&
                 seq_len.scalar_type() == ::tyloi::kInt64,
                 "mfq_attention_mma_decode: seq_len must be contiguous CUDA int64[B]");
+    if constexpr(!OwnedWorkspace) {
     TYLOINFER_RUNTIME_CHECK(mask.is_cuda() && mask.is_contiguous() && mask.scalar_type() == ::tyloi::kFloat16 &&
                 mask.dim() == 2,
                 "mfq_attention_mma_decode: mask must be contiguous CUDA f16[B, stride]");
@@ -722,11 +744,13 @@ static ::tyloi::DenseTensor mfq_attention_mma_decode_impl(
                 "mfq_attention_mma_decode: kv_max must be contiguous CUDA int32[B]");
     TYLOINFER_RUNTIME_CHECK(meta.is_cuda() && meta.is_contiguous() && meta.scalar_type() == ::tyloi::kFloat32,
                 "mfq_attention_mma_decode: meta must be contiguous CUDA f32");
-    TYLOINFER_RUNTIME_CHECK(q.dim() == 4 && q.size(2) == 1 && k_cache.dim() == 4 && v_cache.dim() == 4,
+    }
+    TYLOINFER_RUNTIME_CHECK(q.dim() == 4 && (OwnedWorkspace?(q.size(2)>=1 && q.size(2)<=8):q.size(2)==1) && k_cache.dim() == 4 && v_cache.dim() == 4,
                 "mfq_attention_mma_decode: expected q[B,Hq,1,D], cache[B,Hk,max_seq,D]");
 
     const int B = (int)q.size(0);
     const int Hq = (int)q.size(1);
+    const int T = (int)q.size(2);
     const int D = (int)q.size(3);
     const int Hk = (int)k_cache.size(1);
     const int max_seq = (int)k_cache.size(2);
@@ -736,16 +760,19 @@ static ::tyloi::DenseTensor mfq_attention_mma_decode_impl(
                 v_cache.size(3) ==
                     (V_IS_K_VIEW ? DKQ_EXPECTED : DV_EXPECTED),
                  "mfq_attention_mma_decode: unexpected head_dim");
-    TYLOINFER_RUNTIME_CHECK(Hq % Hk == 0 && Hq / Hk >= NCOLS2 &&
-                (Hq / Hk) % NCOLS2 == 0 &&
+    // The MMA query loader, output writer and stream-K fixup all mask
+    // the final GQA tile. A group need not fill or divide NCOLS2.
+    TYLOINFER_RUNTIME_CHECK(Hk > 0 && Hq > 0 && Hq % Hk == 0 &&
                 k_cache.size(0) == B && v_cache.size(0) == B &&
                  v_cache.size(1) == Hk && v_cache.size(2) == max_seq,
                  "mfq_attention_mma_decode: unsupported GQA ratio");
     TYLOINFER_RUNTIME_CHECK(planned_len >= 1 && planned_len <= max_seq,
                 "mfq_attention_mma_decode: planned_len is outside cache capacity");
-    const int mask_stride = (int)mask.size(1);
+    const int mask_stride = OwnedWorkspace?0:(int)mask.size(1);
+    if constexpr(!OwnedWorkspace) {
     TYLOINFER_RUNTIME_CHECK(mask.size(0) == B && mask_stride >= planned_len && kv_max.numel() >= B,
                 "mfq_attention_mma_decode: workspace shape mismatch");
+    }
 
     constexpr int ncols1 = NCOLS1;
     constexpr int ncols2 = NCOLS2;
@@ -786,19 +813,24 @@ static ::tyloi::DenseTensor mfq_attention_mma_decode_impl(
         q_in_reg ? std::max(shared_q, shared_kv + shared_mask)
                  : shared_q + shared_kv + shared_mask);
 
+    constexpr bool logical_prefix = OwnedWorkspace || ncols1==1;
     using Kernel = decltype(&flash_attn_ext_f16<
-        DKQ_EXPECTED, DV_EXPECTED, ncols1, ncols2, false, V_IS_K_VIEW>);
+        DKQ_EXPECTED, DV_EXPECTED, ncols1, ncols2, false, V_IS_K_VIEW, false, logical_prefix>);
     Kernel kernel = flash_attn_ext_f16<
-        DKQ_EXPECTED, DV_EXPECTED, ncols1, ncols2, false, V_IS_K_VIEW>;
-    static bool shmem_set[32] = {};
-    TYLOINFER_RUNTIME_CHECK(device >= 0 && device < 32, "mfq_attention_mma_decode: unsupported CUDA device index");
-    if (!shmem_set[device]) {
-        status = cudaFuncSetAttribute(
-            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shmem);
-        TYLOINFER_RUNTIME_CHECK(status == cudaSuccess,
-                    "mfq_attention_mma_decode: cudaFuncSetAttribute failed: ",
-                    cudaGetErrorString(status));
-        shmem_set[device] = true;
+        DKQ_EXPECTED, DV_EXPECTED, ncols1, ncols2, false, V_IS_K_VIEW, false, logical_prefix>;
+    if constexpr(OwnedWorkspace) {
+        int limit=0;cudaDeviceGetAttribute(&limit,cudaDevAttrMaxSharedMemoryPerBlockOptin,device);
+        cudaFuncAttributes attributes{};
+        if(cudaFuncGetAttributes(&attributes,kernel)!=cudaSuccess ||
+                shmem+attributes.sharedSizeBytes>std::size_t(limit) ||
+                (attributes.ptxVersion<70 && !(attributes.ptxVersion==0 && attributes.binaryVersion>=70)))return {};
+    }
+    static thread_local std::unordered_set<int> shmem_set;
+    if(!shmem_set.contains(device)) {
+        status=cudaFuncSetAttribute(kernel,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)shmem);
+        if constexpr(OwnedWorkspace)if(status!=cudaSuccess)return {};
+        TYLOINFER_RUNTIME_CHECK(status==cudaSuccess,"mfq_attention_mma_decode: cudaFuncSetAttribute failed: ",cudaGetErrorString(status));
+        shmem_set.insert(device);
     }
 
     const int gqa_ratio = Hq / Hk;
@@ -808,19 +840,20 @@ static ::tyloi::DenseTensor mfq_attention_mma_decode_impl(
     int max_blocks_per_sm = 0;
     status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
         &max_blocks_per_sm, kernel, 32 * nwarps, shmem);
+    if constexpr(OwnedWorkspace)if(status!=cudaSuccess || max_blocks_per_sm<=0)return {};
     TYLOINFER_RUNTIME_CHECK(status == cudaSuccess && max_blocks_per_sm > 0,
                 "mfq_attention_mma_decode: occupancy query failed: ", cudaGetErrorString(status));
     const int resident_blocks = max_blocks_per_sm * properties.multiProcessorCount;
     const int tile_waves = (ntiles_dst + resident_blocks - 1) / resident_blocks;
     const int tile_efficiency = 100 * ntiles_dst / (resident_blocks * tile_waves);
-    bool stream_k = cc >= 890 || tile_efficiency < 75;
+    bool stream_k = tile_efficiency < 75;
     const char * stream_k_env = tyloi::cuda::env_lookup("TYLOINFER_MMA_ATTENTION_DECODE_STREAMK");
     if (stream_k_env != nullptr) stream_k = stream_k_env[0] != '0';
     int raw_blocks = stream_k
         ? std::min(resident_blocks, ntiles_dst * ntiles_kv)
         : ntiles_dst;
-    if (stream_k && cc >= 800 && cc < 890) {
-        // On Ampere, filling every resident block slot makes the serial fixup
+    if (stream_k) {
+        // Filling every resident block slot makes the serial fixup
         // unnecessarily expensive for decode. One block per active SM is
         // sufficient until each block owns a long run of KV tiles.
         constexpr int max_kv_tiles_per_reduced_block = 32;
@@ -841,33 +874,63 @@ static ::tyloi::DenseTensor mfq_attention_mma_decode_impl(
                 : resident_blocks_per_tile);
         raw_blocks = ntiles_dst * target_blocks_per_tile;
     }
-    const int rounded_blocks = std::max(
-        ntiles_dst, (raw_blocks / ntiles_dst) * ntiles_dst);
-    const int blocks_per_tile = rounded_blocks / ntiles_dst;
+    // Callers can retain a workspace planned with a larger KV tile. Split-K
+    // changes only the partitioning: bound its grid by the actual supplied
+    // storage, then distribute every KV tile over the remaining blocks.
+    if constexpr(!OwnedWorkspace) {
+    const int64_t workspace_blocks = meta.numel() /
+        (int64_t(2) * ncols * (2 + DV_EXPECTED / 2));
+    TYLOINFER_RUNTIME_CHECK(workspace_blocks >= ntiles_dst,
+                "mfq_attention_mma_decode: meta workspace too small");
+    raw_blocks = int(std::min<int64_t>(raw_blocks, workspace_blocks));
+    }
+    // Keep each query tile's K partition independent of the token window.
+    // Extra causal queries add output tiles, with the same per-tile arithmetic.
+    const int query_tiles=(T+ncols1-1)/ncols1;
+    const int base_blocks=std::max(ntiles_dst,(raw_blocks/ntiles_dst)*ntiles_dst);
+    const int blocks_per_tile=base_blocks/ntiles_dst;
+    const int rounded_blocks=base_blocks*query_tiles;
+    const int destination_tiles=ntiles_dst*query_tiles;
     const size_t meta_float2 = (size_t)rounded_blocks * ncols * (2 + DV_EXPECTED / 2);
+    if constexpr(OwnedWorkspace) {
+        // Scalar callers already own a persistent stream-K workspace. Keep it
+        // when compatible; verification windows may acquire their graph pool
+        // workspace. Capacity follows this launch, never a device/model label.
+        if(!meta.defined() || meta.device()!=q.device() || !meta.is_contiguous() ||
+                meta.scalar_type()!=::tyloi::kFloat32 ||
+                static_cast<size_t>(meta.numel())<2*meta_float2)
+            meta=::tyloi::cuda::empty({int64_t(2*meta_float2)},q.options());
+    }
+    else {
     TYLOINFER_RUNTIME_CHECK((size_t)meta.numel() >= 2 * meta_float2,
                 "mfq_attention_mma_decode: meta workspace too small");
+    }
 
     auto stream = mfq_current_cuda_stream();
-    const int prep_blocks = std::min(
-        65535, std::max(1, (B * mask_stride + 255) / 256));
-    mfq_decode_mask_kernel<<<prep_blocks, 256, 0, stream>>>(
-        reinterpret_cast<half*>(mask.data_ptr<mfq_half>()), kv_max.data_ptr<int>(),
-        seq_len.data_ptr<int64_t>(), B, mask_stride, nbatch_fa);
+    if constexpr(!logical_prefix) {
+        const int prep_blocks = std::min(
+            65535, std::max(1, (B * mask_stride + 255) / 256));
+        mfq_decode_mask_kernel<<<prep_blocks, 256, 0, stream>>>(
+            reinterpret_cast<half*>(mask.data_ptr<mfq_half>()), kv_max.data_ptr<int>(),
+            seq_len.data_ptr<int64_t>(), B, mask_stride, nbatch_fa);
+    }
 
-    auto out = ::tyloi::cuda::empty({B, 1, Hq, DV_EXPECTED}, q.options());
-    const uint3 ne01 = init_fastdiv_values(1);
+    auto out = ::tyloi::cuda::empty({B, T, Hq, DV_EXPECTED}, q.options());
+    const uint3 ne01 = init_fastdiv_values(T);
     const uint32_t n_head_log2 = 1u << (uint32_t)floorf(log2f((float)Hq));
     kernel<<<rounded_blocks, dim3(32, nwarps, 1), shmem, stream>>>(
         reinterpret_cast<const char*>(q.data_ptr<float>()),
         reinterpret_cast<const char*>(k_cache.data_ptr<mfq_half>()),
         reinterpret_cast<const char*>(v_cache.data_ptr<mfq_half>()),
-        reinterpret_cast<const char*>(mask.data_ptr<mfq_half>()),
-        nullptr, kv_max.data_ptr<int>(), static_cast<float*>(out.data_ptr()),
+        logical_prefix ? nullptr : reinterpret_cast<const char*>(mask.data_ptr<mfq_half>()),
+        nullptr, [&] {
+            if constexpr(logical_prefix)return seq_len.data_ptr<int64_t>();
+            else return kv_max.data_ptr<int>();
+        }(), static_cast<float*>(out.data_ptr()),
         reinterpret_cast<float2*>(meta.data_ptr<float>()),
         (float)scale, 0.0f, 1.0f, 1.0f, n_head_log2, 0.0f,
         DKQ_EXPECTED, ne01, Hq, B,
-        DKQ_EXPECTED * (int)sizeof(float), DKQ_EXPECTED * (int)sizeof(float), Hq * DKQ_EXPECTED * (int)sizeof(float),
+        DKQ_EXPECTED * (int)sizeof(float), T * DKQ_EXPECTED * (int)sizeof(float), Hq * T * DKQ_EXPECTED * (int)sizeof(float),
         DKQ_EXPECTED, (int)planned_len, Hk, B,
         DKQ_EXPECTED * (int)sizeof(half), max_seq * DKQ_EXPECTED * (int)sizeof(half),
         (int64_t)Hk * max_seq * DKQ_EXPECTED * (int)sizeof(half),
@@ -881,14 +944,14 @@ static ::tyloi::DenseTensor mfq_attention_mma_decode_impl(
                 cudaGetErrorString(status));
 
     if (blocks_per_tile > 1) {
-        const uint3 fd0 = init_fastdiv_values(Hk * iter_z_gqa);
-        const uint3 fd1 = init_fastdiv_values(iter_z_gqa);
-        const uint3 fd2 = init_fastdiv_values(1);
+        const uint3 fd0 = init_fastdiv_values(Hk * iter_z_gqa * query_tiles);
+        const uint3 fd1 = init_fastdiv_values(iter_z_gqa * query_tiles);
+        const uint3 fd2 = init_fastdiv_values(query_tiles);
         flash_attn_stream_k_fixup_uniform<DV_EXPECTED, ncols1, ncols2>
-            <<<dim3(ntiles_dst, ncols1, ncols2), DV_EXPECTED, 0, stream>>>(
+            <<<dim3(destination_tiles, ncols1, ncols2), DV_EXPECTED, 0, stream>>>(
                 static_cast<float*>(out.data_ptr()),
                 reinterpret_cast<const float2*>(meta.data_ptr<float>()),
-                1, Hq, Hk, rounded_blocks, gqa_ratio, blocks_per_tile, fd0, fd1, fd2);
+                T, Hq, Hk, rounded_blocks, gqa_ratio, blocks_per_tile, fd0, fd1, fd2);
         status = cudaGetLastError();
         TYLOINFER_RUNTIME_CHECK(status == cudaSuccess, "mfq_attention_mma_decode fixup launch failed: ",
                     cudaGetErrorString(status));
@@ -901,8 +964,13 @@ static ::tyloi::DenseTensor mfq_attention_mma_decode_impl(
     ::tyloi::DenseTensor seq_len, double scale, int64_t planned_len,
     ::tyloi::DenseTensor mask, ::tyloi::DenseTensor kv_max, ::tyloi::DenseTensor meta)
 {
-    return mfq_attention_mma_decode_impl<256, 256, 1, 8>(
+    auto result=mfq_attention_mma_decode_impl<256, 256, 4, 8, false, true>(
         q, k_cache, v_cache, seq_len, scale, planned_len, mask, kv_max, meta);
+    if(result.defined())return result;
+    // No compiled FP16 MMA body or insufficient actual CTA resources.
+    // The generic cache operator supports the same causal query window.
+    return attention_cache_swa_planned_cuda(
+        q,k_cache,v_cache,seq_len,scale,k_cache.size(2),planned_len);
 }
 
 ::tyloi::DenseTensor mfq_attention_mma512_decode_cuda(
@@ -910,8 +978,13 @@ static ::tyloi::DenseTensor mfq_attention_mma_decode_impl(
     ::tyloi::DenseTensor seq_len, double scale, int64_t planned_len,
     ::tyloi::DenseTensor mask, ::tyloi::DenseTensor kv_max, ::tyloi::DenseTensor meta)
 {
-    return mfq_attention_mma_decode_impl<512, 512, 1, 8>(
+    auto result=mfq_attention_mma_decode_impl<512, 512, 4, 8, false, true>(
         q, k_cache, v_cache, seq_len, scale, planned_len, mask, kv_max, meta);
+    if(result.defined())return result;
+    // No compiled FP16 MMA body or insufficient actual CTA resources.
+    // The generic cache operator supports the same causal query window.
+    return attention_cache_swa_planned_cuda(
+        q,k_cache,v_cache,seq_len,scale,k_cache.size(2),planned_len);
 }
 
 ::tyloi::DenseTensor attention_glm_mla576_decode_cuda(
@@ -930,4 +1003,34 @@ static ::tyloi::DenseTensor mfq_attention_mma_decode_impl(
 {
     return mfq_attention_mma_decode_impl<256, 256, 4, 2>(
         q, k_cache, v_cache, seq_len, scale, planned_len, mask, kv_max, meta);
+}
+
+
+::tyloi::DenseTensor try_attention_mma_verify_cuda(
+        ::tyloi::DenseTensor q,::tyloi::DenseTensor k,::tyloi::DenseTensor v,
+        ::tyloi::DenseTensor lengths,double scale,int64_t planned_length) {
+
+    if(!q.is_cuda() || !k.is_cuda() || !v.is_cuda() || q.dim()!=4 || k.dim()!=4 || v.dim()!=4 ||
+            q.size(2)<2 || q.size(2)>8 || k.scalar_type()!=::tyloi::kFloat16 || v.scalar_type()!=::tyloi::kFloat16 ||
+            (q.scalar_type()!=::tyloi::kFloat16 && q.scalar_type()!=::tyloi::kFloat32))return {};
+    int major=0;cudaDeviceGetAttribute(&major,cudaDevAttrComputeCapabilityMajor,q.get_device());
+    if(major<7)return {}; // FP16 MMA instructions require Volta or newer.
+    q=q.to(::tyloi::kFloat32).contiguous();
+    const auto width=[&]<int D>() {
+        const auto launch=[&]<int Count>() {
+            return mfq_attention_mma_decode_impl<D,D,Count,8,false,true>(q,k,v,lengths,scale,planned_length,{},{},{});
+        };
+        // Four queries and eight GQA columns use the common 32-column MMA
+        // body. The tile remains the same across singleton/verification calls.
+        return launch.template operator()<4>();
+    };
+    ::tyloi::DenseTensor result;
+    switch(q.size(3)) {
+        case 64:result=width.template operator()<64>();break;
+        case 128:result=width.template operator()<128>();break;
+        case 256:result=width.template operator()<256>();break;
+        case 512:result=width.template operator()<512>();break;
+        default:return {};
+    }
+    return result;
 }

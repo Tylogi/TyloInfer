@@ -95,7 +95,7 @@ describe('test_model_hub_accepts_repository_links_and_downloads_into_the_model_c
     const inspect = vi.spyOn(modelsApi, 'resolveHubModel').mockResolvedValue(info);
     const createJob = vi.spyOn(jobsApi, 'createJob').mockResolvedValue(job);
     render(<MemoryRouter><ModelHubPage /></MemoryRouter>);
-    fireEvent.click(screen.getByRole('tab', { name: 'Community' }));
+    fireEvent.click(screen.getByRole('tab', { name: 'Model browser' }));
     fireEvent.change(screen.getByPlaceholderText('Model name, owner/repo, or repository URL'), { target: { value: `https://${host}/team/model/tree/main` } });
     fireEvent.click(screen.getByRole('button', { name: 'Search' }));
     const download = await screen.findByRole('button', { name: 'Download' });
@@ -103,6 +103,7 @@ describe('test_model_hub_accepts_repository_links_and_downloads_into_the_model_c
     expect(inspect).toHaveBeenCalledExactlyOnceWith(
       `https://${host}/team/model/tree/main`,
       'huggingface',
+      expect.any(AbortSignal),
     );
     fireEvent.click(download);
     await waitFor(() => expect(createJob).toHaveBeenCalledExactlyOnceWith(`download.${provider}`, {

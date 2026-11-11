@@ -53,8 +53,8 @@ public:
     std::vector<const DenseTensor*> buffers() const override { return {&image_}; }
     const std::shared_ptr<TensorStorage>& storage() const noexcept { return storage_; }
     std::size_t byte_offset() const noexcept { return byte_offset_; }
-    void record_stream(std::uintptr_t stream) const override {
-        if (storage_ && storage_->record_stream) storage_->record_stream(stream);
+    void record_stream(std::uintptr_t stream, std::shared_ptr<void> lifetime = {}) const override {
+        if (storage_ && storage_->record_stream) storage_->record_stream(stream, lifetime);
     }
     std::shared_ptr<TensorImpl> relocated(Device target) const override {
         auto moved = std::make_shared<TqTensor>(*this);

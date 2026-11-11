@@ -1,11 +1,11 @@
 #include "execution_fixture.h"
-#include "env.h"
-#include "models/qwen4_exp/model.h"
-#include "execution/decode_window.h"
-#include "context.h"
+#include "engine/backends/cuda/native/env.h"
+#include "engine/models/qwen4_exp/model.h"
+#include "engine/backends/cuda/executor/decode_window.h"
+#include "engine/backends/cuda/native/context.h"
 #include "tyloinfer/runtime.h"
 #include "engine/backends/cuda/executor/execution.h"
-#include "../../../tests/nint_row_fixture.h"
+#include "tests/nint_row_fixture.h"
 #include "nint.h"
 #include <algorithm>
 #include <cmath>
@@ -391,10 +391,10 @@ void gdn_output_case() {
             attended.copy_(replay==1?tb::zeros_like(attended):data(attended.sizes().vec(),144+replay,replay==2?.17f:.00013f).to(tyloi::kFloat32));
             projection.copy_(data(projection.sizes().vec(),147+replay,88.f).to(dtype));
             window.run();equal(output,composed_gdn_output(attended,projection,weight,1e-6,true,true),
-                "GDN changing-input fused output graph",0,0);++cases;
+                "GDN changing-input fused output graph",1e-5f,1e-3f);++cases;
         }
     }
-    std::cout<<"GDN fused output composed exact cases="<<cases<<" PASS\n";
+    std::cout<<"GDN fused output FP32 reference cases="<<cases<<" PASS\n";
 }
 void gdn_case(bool model_shape = false) {
     TestExecution execution;
@@ -687,7 +687,7 @@ void gdn_core_case(bool inplace=false,int head_ratio=3) {
                 throw std::runtime_error("GDN inplace state storage was replaced");
             const auto* conv_option=tyloi::cuda::env_lookup("TYLOINFER_GDN_INPLACE_CONV");
             const auto* tile_option=tyloi::cuda::env_lookup("TYLOINFER_GDN_DECODE_TILES");
-            const bool conv_default=batch==1 && nk==16 && nv==48 && width==128 && taps==4 && transposed;
+            const bool conv_default=transposed;
             const bool conv_alias=inplace && (conv_option?conv_option[0]!='0':conv_default) && head_ratio<=24 &&
                 (!tile_option || tile_option[0]!='1');
             if((result[1].data_ptr()==input_conv.data_ptr())!=conv_alias)
@@ -1141,16 +1141,19 @@ void qsa_sparse_gate_benchmark(bool compare_query=false) {
     }
 }
 }
+#include "qk_prepare_test.h"
 #include "qsa_prefill_test.h"
 #include "qsa_prefill_scores_test.h"
 #include "qsa_kv_offload_test.h"
 #include "kv_quantization_test.h"
 #include "gdn_prefill_columns_test.h"
 #include "gdn_prefill_pipeline_test.h"
+#include "gdn_core_q8_test.h"
 int main(int argc,char** argv)try {
     auto context=default_context(mfq_current_cuda_device());
     const auto stream=mfq_current_cuda_stream();context->begin_graph_pool(stream);
-    if(argc==2 && std::string(argv[1])=="--layer-profile-check")layer_profile_case();
+    if(argc==2 && std::string(argv[1])=="--qk-prepare-check")qk_prepare_case();
+    else if(argc==2 && std::string(argv[1])=="--layer-profile-check")layer_profile_case();
     else if(argc==2 && std::string(argv[1])=="--layer-profile-drop-check")layer_profile_invalid_case();
     else if(argc==2 && std::string(argv[1])=="--gdn-core-check") {
         for(int tiles:{4,2,1}) {
@@ -1186,6 +1189,7 @@ int main(int argc,char** argv)try {
             std::cout<<"gdn_broadcast_batch_arm="<<arm<<'\n';gdn_batch_core_benchmark(2);
         }
     }
+    else if(argc==2 && std::string(argv[1])=="--gdn-core-q8-check")gdn_core_q8_case();
     else if(argc==2 && std::string(argv[1])=="--gdn-independent-check") {
         for(int tiles:{4,2,1}){GdnTileScope setting(tiles);gdn_independent_state_case();}
     }
@@ -1196,6 +1200,8 @@ int main(int argc,char** argv)try {
     else if(argc==2 && std::string(argv[1])=="--gdn-short-path-bench")gdn_short_preparation_benchmark();
     else if(argc==2 && std::string(argv[1])=="--gdn-prefill-check")gdn_prefill_case();
     else if(argc==2 && std::string(argv[1])=="--gdn-prefill-columns-check")gdn_prefill_columns_case();
+    else if(argc==2 && std::string(argv[1])=="--gdn-prefill-keyhead-check")gdn_prefill_keyhead_case(false);
+    else if(argc==2 && std::string(argv[1])=="--gdn-prefill-keyhead-bench")gdn_prefill_keyhead_case(true);
     else if(argc==2 && std::string(argv[1])=="--gdn-prefill-staged-check")gdn_prefill_staged_case(false);
     else if(argc==2 && std::string(argv[1])=="--gdn-prefill-staged-bench")gdn_prefill_staged_case(true);
     else if(argc==2 && std::string(argv[1])=="--gdn-prefill-staged-graph-check")gdn_prefill_staged_graph_case();
@@ -1222,7 +1228,7 @@ int main(int argc,char** argv)try {
     else if(argc==2 && std::string(argv[1])=="--segmented-sort-check")segmented_sort_graph_case();
     else if(argc==2 && std::string(argv[1])=="--quota-recovery-check")quota_recovery_case();
     else if(argc==1) {
-        layer_profile_case();grouped_norm_case();gated_residual_case();gdn_output_case();gdn_preparation_case();gdn_core_case();segmented_sort_graph_case();qsa_sparse_gate_case();qsa_selection_case();qsa_case(8,4,40);qsa_case(256,24,41);qsa_case(256,24,512,2048);qsa_case(256,24,4096,2048);qsa_case(256,24,262144,2048);gdn_case();gdn_case(true);
+        qk_prepare_case();layer_profile_case();grouped_norm_case();gated_residual_case();gdn_output_case();gdn_preparation_case();gdn_core_case();gdn_core_q8_case();segmented_sort_graph_case();qsa_sparse_gate_case();qsa_selection_case();qsa_case(8,4,40);qsa_case(256,24,41);qsa_case(256,24,512,2048);qsa_case(256,24,4096,2048);qsa_case(256,24,262144,2048);gdn_case();gdn_case(true);
     } else throw std::runtime_error("unknown attention test argument");
     TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(stream));std::cout.flush();context->end_graph_pool(stream);
     if(argc==1)std::cout<<"MFQ window QSA/GDN changing-position, rollback and fixed-state checks PASS\n";

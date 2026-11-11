@@ -1,5 +1,6 @@
 #include "qsa_blocks.h"
 #include "disk_budget.h"
+#include "engine/weights/encoding/file_read_window.h"
 
 #include <algorithm>
 #include <condition_variable>
@@ -20,6 +21,7 @@
 #include <limits>
 #include <climits>
 #include <cstdio>
+#include <cstdlib>
 #ifdef _WIN32
 #include <io.h>
 #include <fcntl.h>
@@ -56,11 +58,6 @@ int open_temporary(const std::filesystem::path& directory) {
     return descriptor;
 #endif
 }
-#ifdef _WIN32
-// CRT descriptors use a shared seek cursor. Serialize seek+I/O, never cache
-// payloads here. POSIX retains concurrent positional reads and writes.
-std::mutex file_mutex;
-#endif
 void close_file(int descriptor) {
 #ifdef _WIN32
     ::_close(descriptor);
@@ -68,7 +65,7 @@ void close_file(int descriptor) {
     ::close(descriptor);
 #endif
 }
-int truncate_file(int descriptor) {
+int truncate_file(int descriptor,[[maybe_unused]] std::mutex& file_mutex) {
 #ifdef _WIN32
     std::lock_guard<std::mutex> lock(file_mutex);
     return ::_chsize_s(descriptor, 0);
@@ -76,7 +73,8 @@ int truncate_file(int descriptor) {
     return ::ftruncate(descriptor, 0);
 #endif
 }
-std::int64_t write_file(int descriptor, const void* data, std::size_t bytes, std::int64_t offset) {
+std::int64_t write_file(int descriptor, const void* data, std::size_t bytes, std::int64_t offset,
+        [[maybe_unused]] std::mutex& file_mutex) {
 #ifdef _WIN32
     std::lock_guard<std::mutex> lock(file_mutex);
     if (::_lseeki64(descriptor, offset, SEEK_SET) < 0) return -1;
@@ -85,11 +83,22 @@ std::int64_t write_file(int descriptor, const void* data, std::size_t bytes, std
     return ::pwrite(descriptor, data, bytes, static_cast<off_t>(offset));
 #endif
 }
-std::int64_t read_file(int descriptor, void* data, std::size_t bytes, std::int64_t offset) {
+std::int64_t read_file(int descriptor, void* data, std::size_t bytes, std::int64_t offset,
+        [[maybe_unused]] std::mutex& file_mutex) {
 #ifdef _WIN32
     std::lock_guard<std::mutex> lock(file_mutex);
-    if (::_lseeki64(descriptor, offset, SEEK_SET) < 0) return -1;
-    return ::_read(descriptor, data, static_cast<unsigned>(std::min(bytes, std::size_t{INT_MAX})));
+    if(offset<0){errno=EINVAL;return -1;}
+    // A synchronous handle accepts an explicit OVERLAPPED offset. Recall
+    // each microblock with one read instead of a separate seek and CRT read.
+    OVERLAPPED position{};position.Offset=DWORD(std::uint64_t(offset));
+    position.OffsetHigh=DWORD(std::uint64_t(offset)>>32);
+    DWORD count=0;
+    if(!ReadFile(reinterpret_cast<HANDLE>(::_get_osfhandle(descriptor)),data,
+            DWORD(std::min(bytes,std::size_t{INT_MAX})),&count,&position)) {
+        if(GetLastError()==ERROR_HANDLE_EOF)return 0;
+        errno=EIO;return -1;
+    }
+    return count;
 #else
     return ::pread(descriptor, data, bytes, static_cast<off_t>(offset));
 #endif
@@ -131,6 +140,17 @@ struct QsaKvStore::Impl {
     }
 
     void check() const { if (error) std::rethrow_exception(error); }
+    void read_payload(const Block& block,std::uint8_t* destination) {
+        std::size_t done=0;
+        while(done<block.bytes) {
+            const auto count=read_file(fd,destination+done,block.bytes-done,
+                static_cast<std::int64_t>(block.offset+done),io_mutex);
+            if(count<0 && errno==EINTR)continue;
+            if(count<=0)throw std::runtime_error("QSA KV SSD read failed");
+            done+=static_cast<std::size_t>(count);
+        }
+        ++reads;read_bytes+=block.bytes;
+    }
 
     std::size_t hot_limit() const {
         const auto available = config.budget_bytes - config.buffer_bytes;
@@ -173,7 +193,7 @@ struct QsaKvStore::Impl {
         }
         free_offsets[block->bytes].push_back(block->offset);
         if (block->queued) disk_bytes -= block->bytes;
-        if (--live_blocks == 0 && truncate_file(fd) == 0) {
+        if (--live_blocks == 0 && truncate_file(fd,io_mutex) == 0) {
             free_offsets.clear();
             next_offset = 0;
         }
@@ -181,34 +201,60 @@ struct QsaKvStore::Impl {
 
     void run() {
         while (true) {
-            std::shared_ptr<Block> block;
-            {
+            std::vector<std::shared_ptr<Block>> batch;
+            std::size_t batch_bytes=0;
+            try {
                 std::unique_lock<std::recursive_mutex> guard(mutex);
                 changed.wait(guard, [&] { return stopping || !queue.empty(); });
                 if (queue.empty()) return;
-                block = std::move(queue.front());
-                queue.pop_front();
+                // Pending payloads occupy at most half the I/O budget. The
+                // other half holds this bounded contiguous write image.
+                batch.reserve(queue.size());
+                while(!queue.empty() && queue.front()->bytes<=config.buffer_bytes/2-batch_bytes) {
+                    batch_bytes+=queue.front()->bytes;
+                    batch.push_back(std::move(queue.front()));queue.pop_front();
+                }
+            }catch(...) {
+                std::lock_guard<std::recursive_mutex> guard(mutex);
+                if(!error)error=std::current_exception();changed.notify_all();return;
             }
             std::exception_ptr failure;
             try {
-                DiskWriteGuard space_guard(directory, block->bytes);
+                DiskWriteGuard space_guard(directory,batch_bytes);
                 if (!space_guard.allowed()) throw std::runtime_error("SSD space is reserved for downloads; QSA KV cannot grow");
-                std::size_t done = 0;
-                while (done < block->bytes) {
-                    const auto written = write_file(fd, block->pending->data() + done,
-                        block->bytes - done, static_cast<std::int64_t>(block->offset + done));
-                    if (written < 0 && errno == EINTR) continue;
-                    if (written <= 0) throw std::runtime_error("QSA KV SSD write failed");
-                    done += static_cast<std::size_t>(written);
+                std::sort(batch.begin(),batch.end(),[](const auto& a,const auto& b){return a->offset<b->offset;});
+                std::vector<std::uint8_t> bytes(batch_bytes);
+                std::size_t at=0;
+                for(const auto& block:batch) {
+                    std::memcpy(bytes.data()+at,block->pending->data(),block->bytes);at+=block->bytes;
                 }
+                std::size_t begin=0,buffer_offset=0,operations=0;
+                while(begin<batch.size()) {
+                    auto end=begin+1;auto size=batch[begin]->bytes;
+                    while(end<batch.size() && batch[end]->offset==batch[begin]->offset+size)
+                        size+=batch[end++]->bytes;
+                    std::size_t done=0;
+                    while(done<size) {
+                        const auto written=write_file(fd,bytes.data()+buffer_offset+done,size-done,
+                            static_cast<std::int64_t>(batch[begin]->offset+done),io_mutex);
+                        if(written<0 && errno==EINTR)continue;
+                        if(written<=0)throw std::runtime_error("QSA KV SSD write failed");
+                        done+=static_cast<std::size_t>(written);++operations;
+                    }
+                    buffer_offset+=size;begin=end;
+                }
+                if(std::getenv("TYLOINFER_TRACE_QSA_IO"))std::fprintf(stderr,
+                    "native_qsa_ssd_write_batch actual_match=1 blocks=%zu bytes=%zu operations=%zu buffer_limit=%zu\n",
+                    batch.size(),batch_bytes,operations,config.buffer_bytes/2);
             } catch (...) { failure = std::current_exception(); }
             {
                 std::lock_guard<std::recursive_mutex> guard(mutex);
                 if (failure && !error) error = failure;
-                block->ready = !failure;
-                if (!failure) written_bytes += block->bytes;
-                pending_bytes -= block->bytes;
-                block->pending.reset();
+                for(const auto& block:batch) {
+                    block->ready=!failure;
+                    if(!failure)written_bytes+=block->bytes;
+                    pending_bytes-=block->bytes;block->pending.reset();
+                }
                 changed.notify_all();
             }
         }
@@ -222,6 +268,9 @@ struct QsaKvStore::Impl {
     QsaKvStoreConfig config;
     std::filesystem::path directory;
     int fd = -1;
+    // A CRT descriptor has a shared seek cursor. Serialize seek+I/O per
+    // store, allowing independent files/layers to progress concurrently.
+    std::mutex io_mutex;
     mutable std::recursive_mutex mutex;
     std::condition_variable_any changed;
     std::thread worker;
@@ -294,16 +343,7 @@ std::shared_ptr<const std::vector<std::uint8_t>> QsaKvStore::read(const BlockPtr
     }
     if (!block->ready) throw std::runtime_error("QSA KV microblock was not written");
     auto bytes = std::make_shared<std::vector<std::uint8_t>>(block->bytes);
-    std::size_t done = 0;
-    while (done < bytes->size()) {
-        const auto read = read_file(impl_->fd, bytes->data() + done, bytes->size() - done,
-            static_cast<std::int64_t>(block->offset + done));
-        if (read < 0 && errno == EINTR) continue;
-        if (read <= 0) throw std::runtime_error("QSA KV SSD read failed");
-        done += static_cast<std::size_t>(read);
-    }
-    ++impl_->reads;
-    impl_->read_bytes += bytes->size();
+    impl_->read_payload(*block,bytes->data());
     if (bytes->size() <= impl_->hot_limit()) {
         auto& order = impl_->lru[block->priority];
         order.push_front(block->id);
@@ -314,10 +354,85 @@ std::shared_ptr<const std::vector<std::uint8_t>> QsaKvStore::read(const BlockPtr
     return bytes;
 }
 
+void QsaKvStore::read_into(const BlockPtr& block,std::uint8_t* destination,std::size_t bytes) {
+    if(!block || !destination || bytes!=block->bytes)
+        throw std::invalid_argument("QSA KV destination size differs from its block");
+    std::unique_lock<std::recursive_mutex> guard(impl_->mutex);impl_->check();
+    if(block->pending) {
+        ++impl_->hits;std::memcpy(destination,block->pending->data(),bytes);return;
+    }
+    const auto found=impl_->hot.find(block->id);
+    if(found!=impl_->hot.end()) {
+        ++impl_->hits;auto& order=impl_->lru[block->priority];
+        order.splice(order.begin(),order,found->second.order);
+        std::memcpy(destination,found->second.bytes->data(),bytes);return;
+    }
+    if(!block->ready)throw std::runtime_error("QSA KV microblock was not written");
+    impl_->read_payload(*block,destination);
+}
+
 void QsaKvStore::flush() {
     std::unique_lock<std::recursive_mutex> guard(impl_->mutex);
     impl_->changed.wait(guard, [&] { return impl_->error || impl_->pending_bytes == 0; });
     impl_->check();
+}
+
+void QsaKvStore::read_into_batch(const std::vector<ReadRequest>& requests) {
+    for(const auto& r:requests)if(!r.block || !r.destination || r.bytes!=r.block->bytes)
+        throw std::invalid_argument("QSA KV batch destination differs from its block");
+    std::unique_lock<std::recursive_mutex> guard(impl_->mutex);impl_->check();
+    std::vector<const ReadRequest*> disk;disk.reserve(requests.size());
+    for(const auto& r:requests) {
+        if(r.block->pending || impl_->hot.count(r.block->id))read_into(r.block,r.destination,r.bytes);
+        else {
+            if(!r.block->ready)throw std::runtime_error("QSA KV microblock was not written");
+            disk.push_back(&r);
+        }
+    }
+    std::sort(disk.begin(),disk.end(),[](const auto* a,const auto* b){return a->block->offset<b->block->offset;});
+    constexpr std::size_t window=tyloinfer::ScopedFileReadWindow::capacity;
+    const bool sequential=tyloinfer::ScopedFileReadWindow::read_ahead_enabled();
+    std::size_t requested=0,physical=0,operations=0;
+    std::vector<std::uint8_t> buffer;
+    for(std::size_t begin=0;begin<disk.size();) {
+        auto end=begin+1;std::size_t bytes=disk[begin]->bytes,useful=bytes;
+        const auto start=disk[begin]->block->offset;
+        const auto destination=reinterpret_cast<std::uintptr_t>(disk[begin]->destination);
+        bool direct=true;
+        while(end<disk.size()) {
+            const auto& next=*disk[end];const auto offset=next.block->offset;
+            if(next.bytes>SIZE_MAX-offset || next.bytes>SIZE_MAX-useful)break;
+            const auto finish=std::max(start+bytes,offset+next.bytes);
+            const auto extent=finish-start;
+            const bool contiguous=direct && offset==start+bytes && bytes<=UINTPTR_MAX-destination &&
+                reinterpret_cast<std::uintptr_t>(next.destination)==destination+bytes;
+            // A contiguous caller-owned span needs no scatter workspace.
+            // Keep random reads and gapped bounce reads within their window.
+            if(extent>window && !(sequential && contiguous))break;
+            if(sequential) {
+                // Only recovery opts into gaps. Bound actual read bytes by
+                // twice the requested payload and the existing workspace cap.
+                if((extent+1)/2>useful+next.bytes)break;
+            }else if(offset!=start+bytes)break;
+            direct=contiguous;bytes=extent;useful+=next.bytes;++end;
+        }
+        Block span;span.offset=start;span.bytes=bytes;
+        if(direct)impl_->read_payload(span,disk[begin]->destination);
+        else {
+            buffer.resize(bytes);
+            impl_->read_payload(span,buffer.data());
+            for(auto i=begin;i<end;++i)
+                std::memcpy(disk[i]->destination,buffer.data()+disk[i]->block->offset-start,disk[i]->bytes);
+        }
+        requested+=useful;physical+=bytes;++operations;
+        begin=end;
+    }
+    if(sequential && !disk.empty())if(const auto* trace=std::getenv("TYLOINFER_TRACE_KERNEL_DISPATCH");trace && trace[0]=='1') {
+        static std::atomic<bool> reported{false};
+        if(!reported.exchange(true))std::fprintf(stderr,
+            "native_qsa_session_window actual_match=1 blocks=%zu reads=%zu requested_bytes=%zu physical_bytes=%zu scatter_window_bytes=%zu contiguous_direct=1 max_read_amplification=2\n",
+            disk.size(),operations,requested,physical,window);
+    }
 }
 
 QsaKvStoreStats QsaKvStore::stats() const {

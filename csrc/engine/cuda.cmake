@@ -136,7 +136,7 @@ set_target_properties(mfq-cuda-engine PROPERTIES
 # The CLI tools carry legacy code that still targets the pre-Tensor-unification
 # APIs; keep them out of library and test builds until they are ported.
 option(TYLOINFER_BUILD_CLI_TOOLS
-    "Build the native CLI tools (mfq-runtime, mfq-diagnostics, mfq-eval)" OFF)
+    "Build the native CLI tools (mfq-runtime, mfq-diagnostics)" OFF)
 if(TYLOINFER_BUILD_CLI_TOOLS)
     option(TYLOINFER_BUILD_TORCH_REFERENCE_RUNTIME
         "Build the optional LibTorch CUDA runtime used only for A/B validation"
@@ -191,6 +191,5 @@ if(TYLOINFER_BUILD_CLI_TOOLS)
         )
     endif()
     include(${PROJECT_SOURCE_DIR}/diagnostics/cuda.cmake)
-    include(${PROJECT_SOURCE_DIR}/eval/cuda.cmake)
     include(${PROJECT_SOURCE_DIR}/apps/cuda.cmake)
 endif()

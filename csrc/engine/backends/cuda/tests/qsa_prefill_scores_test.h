@@ -1,5 +1,6 @@
 #pragma once
-#include "env.h"
+#include "engine/backends/cuda/native/env.h"
+#include "qsa_compact_pool_test.h"
 
 void qsa_live_pool_write_case() {
     int cases=0;const auto stream=mfq_current_cuda_stream();
@@ -172,6 +173,7 @@ void qsa_live_topk_tile_case() {
 }
 
 void qsa_live_scores_case() {
+    qsa_compact_pool_test::check();
     qsa_live_pool_case();
     qsa_live_topk_tile_case();
     struct Setting {

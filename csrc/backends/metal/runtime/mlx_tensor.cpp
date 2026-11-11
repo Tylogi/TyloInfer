@@ -669,7 +669,7 @@ array MlxLinear::moe_shared(
 }
 
 void MlxLinear::prepare_grouped_row_matmul(int group_count) const {
-    if (!tq_weight_ref()) return;
+    if (!tq_weight_ref() && !gguf_weight_ref()) return;
     if (auto* preparation = MlxKernelPreparation::current()) preparation->collect([&] {
         for (const auto rows : preparation->row_buckets())
             for (auto dtype : {mlx::core::float16, mlx::core::float32})
@@ -696,6 +696,7 @@ array MlxLinear::grouped_row_matmul(
     if (const auto* weight = std::get_if<MlxNint8ZeroWeight>(&weight_)) return weight->grouped_row_matmul(input, group_count);
 #endif
     if (const auto* tq = std::get_if<MlxTqWeight>(&weight_)) return tq->grouped_row_matmul(input, group_count);
+    if (const auto* gguf = std::get_if<MlxGgufWeight>(&weight_)) return gguf->grouped_row_matmul(input, group_count);
     if (mlx_reference_enabled()) {
         if (auto dense = unpack_quantized_weight(
                 weight_, output_size_)) {
@@ -954,6 +955,12 @@ struct MlxProjectionBatch::Impl {
         for (const auto* source : sources) {
             linears.push_back(*source);
         }
+        bfloat_input = std::all_of(linears.begin(), linears.end(), [](const auto& linear) {
+            if (const auto* weight = linear.gguf_weight_ref())
+                return !weight->has_hadamard() && weight->native_weight_ref();
+            const auto* dense = linear.dense_weight_ref();
+            return dense && dense->dtype() == mlx::core::bfloat16;
+        });
 
         std::vector<const MlxLinear*> references;
         references.reserve(linears.size());
@@ -1072,6 +1079,7 @@ struct MlxProjectionBatch::Impl {
     std::vector<MlxLinear> linears;
     std::vector<Segment> segments;
     std::size_t grouped_projection_count = 0;
+    bool bfloat_input = false;
 };
 
 MlxProjectionBatch::MlxProjectionBatch(
@@ -1095,6 +1103,20 @@ MlxProjectionBatch::MlxProjectionBatch(
 
 std::vector<array> MlxProjectionBatch::operator()(
     const array& input) const {
+    return project(input, std::nullopt);
+}
+
+std::vector<array> MlxProjectionBatch::forward_normalized(
+    const array& input, const MlxRmsNorm& norm) const {
+    const bool bfloat_consumers = input.dtype() == mlx::core::float16 && input.ndim() >= 2 &&
+        input.shape(-1) == norm.width() && input.size() / std::size_t(norm.width()) <= 8 &&
+        impl_->bfloat_input;
+    if (bfloat_consumers) return project(norm(input, mlx::core::bfloat16), input.dtype());
+    return (*this)(norm(input));
+}
+
+std::vector<array> MlxProjectionBatch::project(
+    const array& input, std::optional<Dtype> native_output_dtype) const {
     const std::size_t rows =
         input.ndim() == 0 || input.shape(-1) <= 0
         ? 0
@@ -1105,7 +1127,7 @@ std::vector<array> MlxProjectionBatch::operator()(
         const bool affine_vector = rows == 1 && std::all_of(segment.indices.begin(), segment.indices.end(),
             [&](const auto index) { return impl_->linears[index].affine_weight_ref() != nullptr; });
         if (!segment.native.empty() && !affine_vector) {
-            auto values = mlx_native_gguf_project(segment.native, input);
+            auto values = mlx_native_gguf_project(segment.native, input, native_output_dtype);
             for (std::size_t offset = 0; offset < segment.indices.size(); ++offset)
                 outputs[segment.indices[offset]] = std::move(values[offset]);
             continue;
@@ -1133,8 +1155,17 @@ std::vector<array> MlxProjectionBatch::operator()(
                 outputs[segment.indices[offset]] = std::move(values[offset]);
             continue;
         }
-        for (const auto index : segment.indices)
+        for (const auto index : segment.indices) {
+            if (native_output_dtype) {
+                const auto* weight = impl_->linears[index].gguf_weight_ref();
+                if (weight && weight->native_weight_ref()) {
+                    outputs[index] = mlx_native_gguf_project(
+                        std::span(weight->native_weight_ref(), 1), input, native_output_dtype).front();
+                    continue;
+                }
+            }
             outputs[index] = impl_->linears[index](input);
+        }
     }
     return outputs;
 }
@@ -1155,7 +1186,9 @@ array MlxProjectionBatch::swiglu(
     if (const auto* gate = impl_->linears[0].tq_weight_ref()) {
         if (const auto* up = impl_->linears[1].tq_weight_ref()) {
             const int tokens = input.size() / gate->input_size();
-            auto result = gate->swiglu(*up, input, mlx::core::zeros(Shape{tokens, 1}, mlx::core::int32), limit);
+            static const auto single_expert = array({0}, Shape{1, 1}, mlx::core::int32);
+            const auto ids = tokens == 1 ? single_expert : mlx::core::zeros(Shape{tokens, 1}, mlx::core::int32);
+            auto result = gate->swiglu(*up, input, ids, limit);
             auto shape = input.shape(); shape.back() = gate->output_size();
             return mlx::core::reshape(result, shape);
         }

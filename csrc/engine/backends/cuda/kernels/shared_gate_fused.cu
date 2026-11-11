@@ -1,10 +1,117 @@
-#include "env.h"
+#include "engine/backends/cuda/native/env.h"
 #include "mfq_cuda_shared_gate.h"
-#include "context.h"
+#include "engine/backends/cuda/native/context.h"
 #include "engine/backends/cuda/native/device.h"
 #include "shared_gate_fused.cuh"
+#include "kernel_dispatch_trace.h"
 #include "engine/weights/nint.h"
 #include <cstdlib>
+#include <algorithm>
+#include <stdexcept>
+
+namespace {
+template<class Input,class Output,int Threads,bool Staged>
+__global__ void shared_gate_multiply_f32(const Input* input,const float* weight,const Output* expert,
+        float* output,int64_t width,int64_t output_width) {
+    // Preserve the original 128-lane FMA and reduction order. Extra lanes
+    // cooperate on the loads and output pass, without re-associating dots.
+    __shared__ float partial[4];
+    const int lane=threadIdx.x%32,warp=threadIdx.x/32;
+    const auto* x=input+int64_t(blockIdx.x)*width;
+    const float* dot_weight=weight;const Input* dot_input=x;
+    if constexpr(Staged) {
+        extern __shared__ uint4 storage[];
+        auto* staged_weight=reinterpret_cast<float*>(storage);
+        auto* staged_input=reinterpret_cast<Input*>(staged_weight+width);
+        for(int64_t i=threadIdx.x;i<width;i+=Threads){staged_weight[i]=weight[i];staged_input[i]=x[i];}
+        __syncthreads();dot_weight=staged_weight;dot_input=staged_input;
+    }
+    float sum=0.f;
+    if(threadIdx.x<128) {
+        for(int64_t i=threadIdx.x;i<width;i+=128)sum=__fmaf_rn(dot_weight[i],float(dot_input[i]),sum);
+        for(int offset=16;offset;offset>>=1)sum+=__shfl_down_sync(0xffffffffu,sum,offset);
+        if(!lane)partial[warp]=sum;
+    }
+    __syncthreads();
+    if(!warp) {
+        sum=lane<4?partial[lane]:0.f;
+        for(int offset=16;offset;offset>>=1)sum+=__shfl_down_sync(0xffffffffu,sum,offset);
+        if(!lane)partial[0]=1.f/(1.f+expf(-sum));
+    }
+    __syncthreads();
+    const auto first=int64_t(blockIdx.x)*output_width;
+    for(int64_t i=threadIdx.x;i<output_width;i+=Threads)
+        output[first+i]=__fmul_rn(partial[0],float(expert[first+i]));
+}
+}
+
+std::optional<::tyloi::DenseTensor> try_shared_gate_multiply_cuda(
+        const ::tyloi::DenseTensor& input,const ::tyloi::DenseTensor& weight,
+        const ::tyloi::DenseTensor& expert_output) {
+
+    const auto supported=[](const auto& value) {
+        return value.defined() && value.is_cuda() && value.is_contiguous() && value.dim()==2;
+    };
+    if(!supported(input) || !supported(weight) || !supported(expert_output) ||
+            input.device()!=weight.device() || input.device()!=expert_output.device() ||
+            weight.scalar_type()!=::tyloi::kFloat32 || weight.size(0)!=1 || input.size(1)<1 ||
+            weight.size(1)!=input.size(1) || input.size(0)<1 ||
+            expert_output.size(0)!=input.size(0) || expert_output.size(1)<1 ||
+            (input.scalar_type()!=::tyloi::kFloat16 && input.scalar_type()!=::tyloi::kFloat32) ||
+            (expert_output.scalar_type()!=::tyloi::kFloat16 && expert_output.scalar_type()!=::tyloi::kFloat32))return std::nullopt;
+    // Scalar gates retain FP32 dots and outputs. More lanes hide the
+    // dependent input loads and shorten the fused output pass.
+    tyloi::cuda::DeviceGuard guard(input.get_device());
+    int grid_limit=0;
+    TYLOINFER_NATIVE_CUDA_CHECK(cudaDeviceGetAttribute(&grid_limit,cudaDevAttrMaxGridDimX,input.get_device()));
+    if(input.size(0)>grid_limit)return std::nullopt;
+    auto output=::tyloi::cuda::empty(expert_output.sizes(),expert_output.options().dtype(::tyloi::kFloat32));
+    const auto stream_handle=tyloi::cuda::current_stream(input.get_device());
+    const auto stream=stream_handle.stream();
+    for(const auto& tensor:{input,weight,expert_output,output})mfq_cuda_record_stream(tensor,stream_handle);
+    const auto launch=[&](auto* source,auto* expert) {
+        using Input=std::remove_cv_t<std::remove_pointer_t<decltype(source)>>;
+        using Expert=std::remove_cv_t<std::remove_pointer_t<decltype(expert)>>;
+        const auto invoke=[&]<int Threads,bool Staged>() ->bool {
+            const auto function=shared_gate_multiply_f32<Input,Expert,Threads,Staged>;
+            cudaFuncAttributes attributes{};
+            TYLOINFER_NATIVE_CUDA_CHECK(cudaFuncGetAttributes(&attributes,function));
+            if(attributes.maxThreadsPerBlock<Threads)return false;
+            size_t shared=0;
+            if constexpr(Staged) {
+                int regular=0,optin=0;
+                TYLOINFER_NATIVE_CUDA_CHECK(cudaDeviceGetAttribute(&regular,cudaDevAttrMaxSharedMemoryPerBlock,input.get_device()));
+                TYLOINFER_NATIVE_CUDA_CHECK(cudaDeviceGetAttribute(&optin,cudaDevAttrMaxSharedMemoryPerBlockOptin,input.get_device()));
+                const auto capacity=size_t(std::max(regular,optin));
+                if(uint64_t(input.size(1))>capacity/(sizeof(Input)+sizeof(float)))return false;
+                shared=size_t(input.size(1))*(sizeof(Input)+sizeof(float));
+                if(shared+attributes.sharedSizeBytes>capacity)return false;
+                if(shared>size_t(attributes.maxDynamicSharedSizeBytes))
+                    TYLOINFER_NATIVE_CUDA_CHECK(cudaFuncSetAttribute(function,cudaFuncAttributeMaxDynamicSharedMemorySize,int(shared)));
+            }
+            function<<<unsigned(input.size(0)),Threads,shared,stream>>>(source,weight.data_ptr<float>(),expert,
+                output.data_ptr<float>(),input.size(1),expert_output.size(1));
+            if(tyloi::cuda::dispatch_trace::enabled())tyloi::cuda::dispatch_trace::record(stream,"shared_gate_multiply_f32",
+                reinterpret_cast<const void*>(function),"rows="+std::to_string(input.size(0))+" K="+
+                std::to_string(input.size(1))+" output_width="+std::to_string(expert_output.size(1))+
+                " threads="+std::to_string(Threads)+" input_cache="+std::to_string(Staged)+" original_dot_threads=128 output_float=1");
+            return true;
+        };
+        // Roughly eight input/output coordinates per lane bound the serial
+        // work. This depends on work size, not a GPU or checkpoint identity.
+        const auto work=std::max(input.size(1),expert_output.size(1));
+        if(work>256*8 && invoke.template operator()<512,true>())return;
+        if(work>128*8 && invoke.template operator()<256,true>())return;
+        if(!invoke.template operator()<128,false>())throw std::runtime_error("Shared gate exceeds device block resources");
+    };
+    const auto choose_output=[&](auto* source) {
+        if(expert_output.scalar_type()==::tyloi::kFloat16)launch(source,static_cast<const __half*>(expert_output.data_ptr()));
+        else launch(source,expert_output.data_ptr<float>());
+    };
+    if(input.scalar_type()==::tyloi::kFloat16)choose_output(static_cast<const __half*>(input.data_ptr()));
+    else choose_output(input.data_ptr<float>());
+    TYLOINFER_NATIVE_CUDA_CHECK(cudaGetLastError());return output;
+}
 
 #if TYLOINFER_ENABLE_MFQ_COMPAT
 namespace {
@@ -192,16 +299,22 @@ std::optional<::tyloi::DenseTensor> try_shared_gate_sigmoid_cuda(
         input.get_device()!=weight.get_device() || !input.is_contiguous() || !weight.is_contiguous() ||
         input.scalar_type()!=::tyloi::kFloat16 || weight.scalar_type()!=::tyloi::kBFloat16 ||
         input.dim()!=2 || weight.dim()!=2 || weight.size(0)!=1 ||
-        input.size(0)<1 || input.size(0)>8 || input.size(1)<1 || input.size(1)>4096 ||
+        input.size(0)<1 || input.size(1)<1 ||
         input.size(1)!=weight.size(1))return std::nullopt;
-    auto output=::tyloi::cuda::empty({input.size(0),1},weight.options());
     tyloi::cuda::DeviceGuard guard(input.get_device());
+    int maximum_grid=0;
+    TYLOINFER_NATIVE_CUDA_CHECK(cudaDeviceGetAttribute(&maximum_grid,cudaDevAttrMaxGridDimX,input.get_device()));
+    if(input.size(0)>maximum_grid)return std::nullopt;
+    auto output=::tyloi::cuda::empty({input.size(0),1},input.options());
     const auto stream=tyloi::cuda::current_stream(input.get_device()).stream();
-    tyloi::cuda::shared_gate_detail::project_sigmoid<128,true,false>
+    tyloi::cuda::shared_gate_detail::project_sigmoid<128,true,false,true>
         <<<int(input.size(0)),128,0,stream>>>(
             static_cast<const __half*>(input.data_ptr()),
             static_cast<const __nv_bfloat16*>(weight.data_ptr()),nullptr,
-            static_cast<__nv_bfloat16*>(output.data_ptr()),int(input.size(1)));
+            static_cast<__half*>(output.data_ptr()),input.size(1));
     TYLOINFER_NATIVE_CUDA_CHECK(cudaGetLastError());
+    if(tyloi::cuda::dispatch_trace::enabled())tyloi::cuda::dispatch_trace::record(stream,"shared_gate_sigmoid",
+        reinterpret_cast<const void*>(tyloi::cuda::shared_gate_detail::project_sigmoid<128,true,false,true>),
+        "rows="+std::to_string(input.size(0))+" K="+std::to_string(input.size(1))+" output_half=1");
     return output;
 }

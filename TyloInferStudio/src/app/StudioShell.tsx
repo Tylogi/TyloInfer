@@ -12,6 +12,7 @@ import { StudioSidebar } from './StudioSidebar';
 import { RuntimeAlerts } from './RuntimeAlerts';
 import { ServerConnectionPage } from './ServerConnectionPage';
 import { resolveStudioLocation, isStudioPath } from '../navigation';
+import { isAssetLoadError } from './assetRecovery';
 
 
 class PageErrorBoundary extends Component<{ children: ReactNode }, { detail: string | null }> {
@@ -23,7 +24,10 @@ class PageErrorBoundary extends Component<{ children: ReactNode }, { detail: str
     if (this.state.detail !== null)
       return (
         <FailurePage detail={this.state.detail} kind="render"
-          onRetry={() => this.setState({ detail: null })} />
+          onRetry={() => {
+            if (isAssetLoadError(this.state.detail)) window.location.reload();
+            else this.setState({ detail: null });
+          }} />
       );
     return this.props.children;
   }
@@ -37,7 +41,7 @@ export function StudioShell() {
   const currentLocation = resolveStudioLocation(location.pathname);
   const view = isStudioPath(location.pathname) ? currentLocation.view : 'not-found';
   const pageAvailable = ready || view === 'not-found' ||
-    location.pathname === '/runtime' || location.pathname === '/settings' || view === 'versions';
+    location.pathname === '/runtime' || view === 'versions';
   const connectionProblem = ready ? connectionError : connectionError ?? refreshError;
   const hasAlerts = pageAvailable && Boolean(
     connectionProblem || (ready && (refreshError || Object.keys(jobStreamErrors).length)),
@@ -58,7 +62,7 @@ export function StudioShell() {
           {tr('跳到主要内容', 'Skip to main content')}
         </a>
         <StudioSidebar />
-        <main className={`${view === 'chat' ? 'workspace chat-workspace' : 'workspace'}${hasAlerts ? ' has-runtime-alerts' : ''}`}
+        <main className={`${'workspace'}${hasAlerts ? ' has-runtime-alerts' : ''}`}
           id="studio-main" tabIndex={-1}>
           {hasAlerts && <RuntimeAlerts connectionProblem={connectionProblem} />}
           {pageAvailable ? (

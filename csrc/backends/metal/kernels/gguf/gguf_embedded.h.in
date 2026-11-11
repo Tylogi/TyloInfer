@@ -3,8 +3,22 @@ static constexpr const char* kGgufDecode = R"GGUFMETAL(
 #define GGML_COMMON_DECL_METAL
 #define GGML_COMMON_IMPL_METAL
 @TYLOINFER_GGUF_COMMON_SOURCE@
+alignas(4) constant ushort gguf_gyro_codebook[4096] = {
+@TYLOINFER_GYRO_CODEBOOK_SOURCE@
+};
 @TYLOINFER_GGUF_DECODE_SOURCE@
 )GGUFMETAL";
+static constexpr const char* kGgufStagedCodebooks = R"GGUFCODEBOOK(
+constant half4 gguf_iq3_vectors[4096] = {
+@TYLOINFER_GGUF_IQ3_VECTOR_SOURCE@
+};
+constant half4 gguf_iq3s_vectors[8192] = {
+@TYLOINFER_GGUF_IQ3S_VECTOR_SOURCE@
+};
+constant half2 gguf_iq4_pairs[256] = {
+@TYLOINFER_GGUF_IQ4_PAIR_SOURCE@
+};
+)GGUFCODEBOOK";
 static constexpr const char* kGgufNax = R"GGUFNAX(
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 @TYLOINFER_NAX_FRAGMENT_SOURCE@

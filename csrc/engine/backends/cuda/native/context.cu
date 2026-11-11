@@ -4,6 +4,8 @@
 #include "device.h"
 #include "resident_allocations.h"
 #include "components/error.h"
+#include "process_memory.h"
+#include <cuda.h>
 
 #include <algorithm>
 #include <atomic>
@@ -27,6 +29,45 @@
 #endif
 
 namespace tyloi::cuda {
+std::optional<PhysicalDeviceMemoryStats> physical_device_memory_stats(int device) {
+#ifdef _WIN32
+    // Adapted from Strata's nvml_device_free (src/core/expert_cache.cpp, MIT;
+    // ../../../third_party/strata.LICENSE). NVML reports the whole card while
+    // CUDA/DXGI can expose this process's allowance under WDDM. A free-memory
+    // bound must honor both before admitting revocable expert pages.
+    // nvmlMemory_t ABI: NVIDIA NVML API, structnvmlMemory__t.html (v1).
+    struct Memory {unsigned long long total,free,used;};
+    struct Library {
+        using Init=int(*)();
+        using Handle=int(*)(const char*,void**);
+        using Query=int(*)(void*,Memory*);
+        Handle handle=nullptr;
+        Query query=nullptr;
+        Library() {
+            const auto module=LoadLibraryExW(L"nvml.dll",nullptr,LOAD_LIBRARY_SEARCH_SYSTEM32);
+            if(!module)return;
+            const auto init=reinterpret_cast<Init>(GetProcAddress(module,"nvmlInit_v2"));
+            const auto by_bus=reinterpret_cast<Handle>(GetProcAddress(module,"nvmlDeviceGetHandleByPciBusId_v2"));
+            const auto memory=reinterpret_cast<Query>(GetProcAddress(module,"nvmlDeviceGetMemoryInfo"));
+            if(init && by_bus && memory && init()==0){handle=by_bus;query=memory;}
+            // The driver library remains loaded for the CUDA context lifetime.
+        }
+    };
+    static const Library library;
+    if(library.query) {
+        char bus[64]{};
+        void* handle=nullptr;
+        Memory memory{};
+        if(cudaDeviceGetPCIBusId(bus,sizeof(bus),device)==cudaSuccess &&
+                library.handle(bus,&handle)==0 && library.query(handle,&memory)==0 &&
+                memory.free<=memory.total && memory.used<=memory.total)
+            return PhysicalDeviceMemoryStats{std::size_t(memory.total),std::size_t(memory.free),std::size_t(memory.used)};
+    }
+#else
+    (void)device;
+#endif
+    return {};
+}
 namespace {
 __global__ void record_gpu_timestamp_kernel(uint64_t* timestamps, std::size_t index) {
     unsigned long long nanoseconds;
@@ -38,17 +79,27 @@ void record_gpu_timestamp(uint64_t* timestamps, std::size_t index, cudaStream_t 
     record_gpu_timestamp_kernel<<<1,1,0,stream>>>(timestamps,index);
     TYLOINFER_NATIVE_CUDA_CHECK(cudaGetLastError());
 }
-namespace { thread_local bool resident_allocations=false; }
+namespace { thread_local bool resident_allocations=false,routed_weight_allocations=false; }
 ResidentAllocationScope::ResidentAllocationScope(bool enabled) noexcept
     :previous_(resident_allocations) {resident_allocations=enabled;}
 void ResidentAllocationScope::finish() noexcept {
     if(active_){resident_allocations=previous_;active_=false;}
 }
+RoutedWeightAllocationScope::RoutedWeightAllocationScope(bool enabled) noexcept
+    :resident_(enabled),previous_(routed_weight_allocations) {routed_weight_allocations=enabled;}
+RoutedWeightAllocationScope::~RoutedWeightAllocationScope() noexcept {routed_weight_allocations=previous_;}
 
 struct AllocationBudget {
-    std::mutex pool_mutex;
+    std::mutex graph_memory_mutex;
     // Retired pools remain visible until their persistent request tensors die.
-    std::unordered_map<cudaMemPool_t,bool> pools;
+    std::unordered_map<cudaMemPool_t,bool> graph_memory_pools;
+    // Concurrent graph streams share backing pages. Their reuse/lifetime
+    // bookkeeping remains stream-local; one driver pool per branch exhausts
+    // finite CUDA pool handles even with ample free device memory.
+    cudaMemPool_t shared_graph_memory_pool=nullptr;
+    std::size_t shared_graph_pool_users=0;
+    cudaMemPool_t resident_memory_pool=nullptr;
+    cudaMemPool_t routed_weight_memory_pool=nullptr;
     std::size_t limit = 0;
     std::atomic<std::size_t> allocated{},peak{};
 #ifdef _WIN32
@@ -235,8 +286,8 @@ Context::Context(int device)
                 }
             }
             // The VRAM limit remains process-wide while each Engine owns its pools.
-            std::lock_guard lock(allocation_budget_->pool_mutex);
-            allocation_budget_->pools.emplace(pool_, false);
+            std::lock_guard lock(allocation_budget_->graph_memory_mutex);
+            allocation_budget_->graph_memory_pools.emplace(pool_, false);
         } catch (...) {
             (void)cudaMemPoolDestroy(pool_);
             throw;
@@ -249,13 +300,26 @@ Context::~Context() noexcept {
         (void)cudaStreamSynchronize(stream_.get());
         parallel_blas.reset();
         while (!graph_pools_.empty()) end_graph_pool(graph_pools_.begin()->first);
-        std::lock_guard lock(allocation_budget_->pool_mutex);
+        std::lock_guard lock(allocation_budget_->graph_memory_mutex);
         for (auto memory : {resident_pool_, pool_}) {
             if (!memory) continue;
-            allocation_budget_->pools.erase(memory);
+            allocation_budget_->graph_memory_pools.erase(memory);
             (void)cudaMemPoolDestroy(memory);
         }
     });
+}
+
+BlasHandle& Context::blas(cudaStream_t stream) {
+    if(stream==stream_.get())return blas_;
+    std::lock_guard lock(stream_blas_mutex_);
+    auto& handle=stream_blas_[stream];
+    if(!handle) {
+        DeviceGuard guard(device_);cudaStreamCaptureStatus capture;
+        TYLOINFER_NATIVE_CUDA_CHECK(cudaStreamIsCapturing(stream,&capture));
+        if(capture!=cudaStreamCaptureStatusNone)throw Error("cuBLAS stream was not prepared before capture");
+        auto candidate=std::make_unique<BlasHandle>(device_);candidate->set_stream(stream);handle=std::move(candidate);
+    }
+    return *handle;
 }
 
 DeviceMemoryStats Context::memory_stats() const noexcept {
@@ -273,6 +337,27 @@ std::size_t Context::local_memory_usage() const {
     }
 #endif
     return memory_stats().allocated;
+}
+
+std::optional<ProcessDeviceMemoryStats> process_device_memory_stats(int device) {
+#ifdef _WIN32
+    const auto allocation=device_allocation_budget(device);
+    if(allocation->adapter) {
+        DXGI_QUERY_VIDEO_MEMORY_INFO memory{};
+        if(SUCCEEDED(allocation->adapter->QueryVideoMemoryInfo(0,DXGI_MEMORY_SEGMENT_GROUP_LOCAL,&memory))) {
+            ProcessDeviceMemoryStats result{std::size_t(memory.Budget),std::size_t(memory.CurrentUsage),
+                std::size_t(memory.CurrentReservation)};
+            DXGI_QUERY_VIDEO_MEMORY_INFO shared{};
+            if(SUCCEEDED(allocation->adapter->QueryVideoMemoryInfo(0,DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL,&shared))) {
+                result.shared_budget=std::size_t(shared.Budget);result.shared_usage=std::size_t(shared.CurrentUsage);
+            }
+            return result;
+        }
+    }
+#else
+    (void)device;
+#endif
+    return {};
 }
 
 std::size_t Context::resident_memory_usage() const {
@@ -307,21 +392,32 @@ std::pair<std::uint64_t,std::uint64_t> Context::pool_memory_stats() const {
         TYLOINFER_NATIVE_CUDA_CHECK(cudaMemPoolGetAttribute(memory,cudaMemPoolAttrReservedMemCurrent,&current_reserved));
         used+=current_used;reserved+=current_reserved;
     };
-    std::lock_guard lock(allocation_budget_->pool_mutex);
-    for(const auto& [memory,retired]:allocation_budget_->pools)add(memory);
+    std::lock_guard lock(allocation_budget_->graph_memory_mutex);
+    for(const auto& [memory,retired]:allocation_budget_->graph_memory_pools)add(memory);
     return {used,reserved};
 }
 
+std::size_t Context::reusable_workspace_bytes() const {
+    if(!pool_)return 0;
+    DeviceGuard guard(device_);
+    std::uint64_t used=0,reserved=0;
+    TYLOINFER_NATIVE_CUDA_CHECK(cudaMemPoolGetAttribute(pool_,cudaMemPoolAttrUsedMemCurrent,&used));
+    TYLOINFER_NATIVE_CUDA_CHECK(cudaMemPoolGetAttribute(pool_,cudaMemPoolAttrReservedMemCurrent,&reserved));
+    return reserved>used?std::size_t(reserved-used):0;
+}
+
 void Context::trim_pool_pages() const {
-    std::lock_guard lock(allocation_budget_->pool_mutex);
-    for(auto entry=allocation_budget_->pools.begin();entry!=allocation_budget_->pools.end();) {
+    std::lock_guard lock(allocation_budget_->graph_memory_mutex);
+    for(auto entry=allocation_budget_->graph_memory_pools.begin();entry!=allocation_budget_->graph_memory_pools.end();) {
         const auto [memory,retired]=*entry;
         TYLOINFER_NATIVE_CUDA_CHECK(cudaMemPoolTrimTo(memory,0));
         std::uint64_t used=0;
         if(retired)TYLOINFER_NATIVE_CUDA_CHECK(cudaMemPoolGetAttribute(memory,cudaMemPoolAttrUsedMemCurrent,&used));
         if(retired && !used) {
             TYLOINFER_NATIVE_CUDA_CHECK(cudaMemPoolDestroy(memory));
-            entry=allocation_budget_->pools.erase(entry);
+            if(allocation_budget_->shared_graph_memory_pool==memory)
+                allocation_budget_->shared_graph_memory_pool=nullptr;
+            entry=allocation_budget_->graph_memory_pools.erase(entry);
         } else ++entry;
     }
 }
@@ -330,6 +426,7 @@ std::size_t Context::available_memory() const {
     DeviceGuard guard(device_);
     std::size_t free=0,total=0;
     TYLOINFER_NATIVE_CUDA_CHECK(cudaMemGetInfo(&free,&total));
+    if(const auto physical=physical_device_memory_stats(device_))free=std::min(free,physical->free);
 #ifdef _WIN32
     // CUDA may allocate beyond WDDM's current local-memory budget and let the
     // driver page live weights through system RAM. Price revocable caches and
@@ -482,7 +579,8 @@ void* Context::allocate(std::size_t bytes, cudaStream_t stream) {
     {
         std::lock_guard lock(graph_pool_mutex_);
         if (auto pool = graph_pools_.find(allocation_stream);
-            pool != graph_pools_.end() && (pool->second.warming || pool->second.capturing)) {
+            pool != graph_pools_.end() && (pool->second.capturing ||
+                (pool->second.warming && !resident_allocations))) {
             if(pool->second.memory)allocation_pool=pool->second.memory;
             pooled_allocation=true;
             // Stable size classes let serial graph shapes share scratch. The
@@ -537,8 +635,9 @@ void* Context::allocate(std::size_t bytes, cudaStream_t stream) {
     if(async && resident_allocations && !pooled_allocation) {
         // Pack the many small recurrent tensors into their own pages instead
         // of paying cudaMalloc's WDDM allocation granularity for every layer.
-        std::lock_guard lock(allocation_budget_->pool_mutex);
-        auto& memory=resident_pool_;
+        std::lock_guard lock(allocation_budget_->graph_memory_mutex);
+        auto& memory=routed_weight_allocations?allocation_budget_->routed_weight_memory_pool:
+            allocation_budget_->resident_memory_pool;
         if(!memory) {
             cudaMemPoolProps properties{};
             properties.allocType=cudaMemAllocationTypePinned;
@@ -548,7 +647,7 @@ void* Context::allocate(std::size_t bytes, cudaStream_t stream) {
             try {
                 std::uint64_t threshold=std::numeric_limits<std::uint64_t>::max();
                 TYLOINFER_NATIVE_CUDA_CHECK(cudaMemPoolSetAttribute(memory,cudaMemPoolAttrReleaseThreshold,&threshold));
-                allocation_budget_->pools.emplace(memory,false);
+                allocation_budget_->graph_memory_pools.emplace(memory,false);
             } catch(...) {(void)cudaMemPoolDestroy(memory);memory=nullptr;throw;}
         }
         allocation_pool=memory;
@@ -671,6 +770,9 @@ void Context::release(
     allocation_budget_->release(bytes);
 }
 
+bool Context::has_graph_pool(cudaStream_t stream) const {
+    std::lock_guard lock(graph_pool_mutex_);return graph_pools_.count(stream)!=0;
+}
 void Context::begin_graph_pool(cudaStream_t stream) {
     if (stream == nullptr) {
         throw std::invalid_argument("CUDA graph memory pool requires a stream");
@@ -690,28 +792,36 @@ void Context::begin_graph_pool(cudaStream_t stream) {
         properties.location.type=cudaMemLocationTypeDevice;
         properties.location.id=device_;
         cudaMemPool_t memory=nullptr;
+        std::lock_guard shared_lock(allocation_budget_->graph_memory_mutex);
         try {
             // A workspace may outlive its graph by one operation. Reap its
             // retired pool once its async free completes; pool handles are a
             // finite driver resource even when their pages have been trimmed.
             {
-                std::lock_guard shared_lock(allocation_budget_->pool_mutex);
-                for(auto entry=allocation_budget_->pools.begin();
-                        entry!=allocation_budget_->pools.end();) {
+                if(allocation_budget_->shared_graph_memory_pool) {
+                    memory=allocation_budget_->shared_graph_memory_pool;
+                    ++allocation_budget_->shared_graph_pool_users;
+                    allocation_budget_->graph_memory_pools.at(memory)=false;
+                    graph_pools_.at(stream).memory=memory;
+                    return;
+                }
+                for(auto entry=allocation_budget_->graph_memory_pools.begin();
+                        entry!=allocation_budget_->graph_memory_pools.end();) {
                     std::uint64_t used=0;
                     if(entry->second)TYLOINFER_NATIVE_CUDA_CHECK(cudaMemPoolGetAttribute(
                         entry->first,cudaMemPoolAttrUsedMemCurrent,&used));
                     if(entry->second && !used) {
                         TYLOINFER_NATIVE_CUDA_CHECK(cudaMemPoolDestroy(entry->first));
-                        entry=allocation_budget_->pools.erase(entry);
+                        entry=allocation_budget_->graph_memory_pools.erase(entry);
                     } else ++entry;
                 }
             }
             TYLOINFER_NATIVE_CUDA_CHECK(cudaMemPoolCreate(&memory,&properties));
             std::uint64_t threshold=std::numeric_limits<std::uint64_t>::max();
             TYLOINFER_NATIVE_CUDA_CHECK(cudaMemPoolSetAttribute(memory,cudaMemPoolAttrReleaseThreshold,&threshold));
-            std::lock_guard shared_lock(allocation_budget_->pool_mutex);
-            allocation_budget_->pools.emplace(memory,false);
+            allocation_budget_->graph_memory_pools.emplace(memory,false);
+            allocation_budget_->shared_graph_memory_pool=memory;
+            ++allocation_budget_->shared_graph_pool_users;
             graph_pools_.at(stream).memory=memory;
         } catch(...) {
             if(memory)(void)cudaMemPoolDestroy(memory);
@@ -779,12 +889,16 @@ void Context::end_graph_pool(cudaStream_t stream) noexcept {
         // Request workspaces can outlive their graph. Keep that CUDA pool
         // registered until their asynchronous releases finish as well.
         if(pool.memory) {
-            std::lock_guard lock(allocation_budget_->pool_mutex);
+            std::lock_guard lock(allocation_budget_->graph_memory_mutex);
+            if(pool.memory==allocation_budget_->shared_graph_memory_pool &&
+                    --allocation_budget_->shared_graph_pool_users) return;
             std::uint64_t used=0;
             if(cudaMemPoolGetAttribute(pool.memory,cudaMemPoolAttrUsedMemCurrent,&used)==cudaSuccess && !used) {
-                allocation_budget_->pools.erase(pool.memory);
+                allocation_budget_->graph_memory_pools.erase(pool.memory);
                 (void)cudaMemPoolDestroy(pool.memory);
-            } else allocation_budget_->pools.at(pool.memory)=true;
+                if(pool.memory==allocation_budget_->shared_graph_memory_pool)
+                    allocation_budget_->shared_graph_memory_pool=nullptr;
+            } else allocation_budget_->graph_memory_pools.at(pool.memory)=true;
         }
     });
 }

@@ -30,7 +30,7 @@ public:
     bool is_contiguous() const noexcept override { return false; }
     bool is_encoded() const noexcept override { return true; }
     std::vector<const DenseTensor*> buffers() const override { return {}; }
-    void record_stream(std::uintptr_t) const override {}
+    void record_stream(std::uintptr_t, std::shared_ptr<void> = {}) const override {}
     std::shared_ptr<TensorImpl> relocated(Device) const override;
 };
 

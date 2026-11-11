@@ -2,9 +2,156 @@ METAL_FUNC uint gguf_sign_mask(uint index) {
     return index | ((popcount(index) & 1u) << 7u);
 }
 
+METAL_FUNC float gguf_mxfp4_scale(uint exponent) {
+    return as_type<float>(exponent < 2u ? 0x00200000u << exponent : (exponent - 1u) << 23u);
+}
+
+METAL_FUNC float gguf_mxfp4_code(uint code) {
+    constexpr char values[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+    return float(values[code]);
+}
+
+template<uint LANES, typename X>
+METAL_FUNC float gguf_ptq_dot128(device const uchar* row, X x, uint k, uint lane) {
+    auto block = row + ulong(k / 128u) * 28u;
+    constexpr uint powers[5] = {1u, 3u, 9u, 27u, 81u};
+    float sum = 0.f;
+    if constexpr (LANES == 8u) {
+        uint codes = uint(block[lane]) | (uint(block[lane + 8u]) << 16u);
+        float2 pair(0.f);
+        for (uint digit = 0u; digit < 5u; ++digit) {
+            codes *= 3u;
+            const uint trits = (codes >> 8u) & 0x00030003u;
+            codes &= 0x00ff00ffu;
+            pair += float2(float(int(trits & 3u) - 1), float(int(trits >> 16u) - 1)) *
+                float2(float(x[k + lane + digit * 16u]), float(x[k + lane + 8u + digit * 16u]));
+        }
+        sum = pair.x + pair.y;
+    } else for (uint byte = lane; byte < 16u; byte += LANES) {
+        const uint code = block[byte];
+        for (uint digit = 0u; digit < 5u; ++digit)
+            sum += float(int((((code * powers[digit]) & 255u) * 3u) >> 8u) - 1) * float(x[k + byte + digit * 16u]);
+    }
+    for (uint byte = lane; byte < 8u; byte += LANES) {
+        uint code = block[16u + byte];
+        for (uint digit = 0u; digit < 5u; ++digit) {
+            code *= 3u;
+            sum += float(int(code >> 8u) - 1) * float(x[k + 80u + byte + digit * 8u]);
+            code &= 255u;
+        }
+    }
+    for (uint tail = lane; tail < 8u; tail += LANES) {
+        const uint code = block[24u + tail % 2u];
+        const uint digit = tail / 2u;
+        sum += float(int((((code * powers[digit]) & 255u) * 3u) >> 8u) - 1) * float(x[k + 120u + tail]);
+    }
+    return float(*reinterpret_cast<device const half*>(block + 26u)) * sum;
+}
+
+template<uint V, typename X>
+METAL_FUNC float gguf_q2_dot(device const uchar* row, X input, uint k) {
+    auto block = row + ulong(k / 64u) * 18u;
+    auto codes = block + 2u + (k % 64u) / 4u;
+    float sum = 0.f;
+    for (uint j = 0u; j < V; j += 4u) {
+        const uint4 values = (uint4(codes[j / 4u]) >> uint4(0u, 2u, 4u, 6u)) & 3u;
+        sum += dot(float4(values) - 1.f, float4(input[k + j], input[k + j + 1u], input[k + j + 2u], input[k + j + 3u]));
+    }
+    return float(*reinterpret_cast<device const half*>(block)) * sum;
+}
+
+template<int F>
+METAL_FUNC uint gguf_gyro_hash(device const uchar* stream, uint step) {
+    constexpr uint bits = F == 144 ? 8u : F == 145 || F == 148 ? 6u : F == 146 || F == 149 ? 7u : F == 151 ? 4u : 5u;
+    constexpr uint steps = F >= 147 && F <= 149 ? 64u : 32u;
+    constexpr uint bytes = steps * bits / 8u;
+    uint state;
+    if constexpr (F == 144) state = (uint(stream[(step + 31u) % 32u]) << 8u) | uint(stream[step]);
+    else {
+        const uint offset = (steps - 1u - step) * bits, byte = offset / 8u;
+        const uint window = uint(stream[byte]) | (uint(stream[(byte + 1u) % bytes]) << 8u) |
+            (uint(stream[(byte + 2u) % bytes]) << 16u);
+        state = window >> (offset % 8u);
+    }
+    return (state & 32767u) * 0x9e3779b1u;
+}
+
+template<int F>
+METAL_FUNC uint2 gguf_gyro_hash_pair(device const uchar* stream, uint step) {
+    constexpr uint bits = F == 147 ? 5u : F == 148 ? 6u : 7u;
+    constexpr uint bytes = 8u * bits;
+    const uint offset = (62u - step) * bits, byte = offset / 8u;
+    const uint window = uint(stream[byte]) | (uint(stream[(byte + 1u) % bytes]) << 8u) |
+        (uint(stream[(byte + 2u) % bytes]) << 16u) | (uint(stream[(byte + 3u) % bytes]) << 24u);
+    return ((uint2(window) >> uint2(offset + bits - byte * 8u, offset - byte * 8u)) & 32767u) * 0x9e3779b1u;
+}
+
+template<int F, uint V, typename X>
+METAL_FUNC float gguf_gyro_dot(device const uchar* row, X input, uint k) {
+    constexpr uint bits = F == 144 ? 8u : F == 145 || F == 148 ? 6u : F == 146 || F == 149 ? 7u : F == 151 ? 4u : 5u;
+    constexpr uint values = F >= 147 && F <= 149 ? 2u : 4u;
+    auto block = row + ulong(k / 128u) * (2u + 128u / values * bits / 8u);
+    auto stream = block + 2u;
+    auto table = reinterpret_cast<constant const uint*>(gguf_gyro_codebook);
+    float4 partial(0.f);
+    uint4 hashes;
+#pragma clang loop unroll(full)
+    for (uint j = 0u; j < V; j += 4u) {
+        const uint step = (k % 128u + j) / values;
+        uint first, second;
+        if constexpr (V >= 16u && F != 144) {
+            constexpr uint span = values * 4u, bytes = 128u / values * bits / 8u;
+            if (j % span == 0u) {
+                const uint offset = (128u / values - 4u - step) * bits, byte = offset / 8u;
+                const uint low = uint(stream[byte]) | (uint(stream[(byte + 1u) % bytes]) << 8u)
+                    | (uint(stream[(byte + 2u) % bytes]) << 16u) | (uint(stream[(byte + 3u) % bytes]) << 24u);
+                const uint high = uint(stream[(byte + 4u) % bytes]) | (uint(stream[(byte + 5u) % bytes]) << 8u);
+                const uint4 shifts = uint4(3u, 2u, 1u, 0u) * bits + offset % 8u;
+                hashes = (((uint4(low) >> shifts) | ((uint4(high) << 1u) << (31u - shifts))) & 32767u) * 0x9e3779b1u;
+            }
+            if constexpr (values == 2u) {
+                first = hashes[(j % span) / 2u] >> 21u;
+                second = hashes[(j % span) / 2u + 1u] >> 21u;
+            } else {
+                const uint hash = hashes[j % span / 4u];
+                first = hash >> 21u; second = (hash >> 10u) & 2047u;
+            }
+        } else if constexpr (values == 2u) {
+            const auto hashes = gguf_gyro_hash_pair<F>(stream, step);
+            first = hashes.x >> 21u; second = hashes.y >> 21u;
+        } else {
+            const uint hash = gguf_gyro_hash<F>(stream, step);
+            first = hash >> 21u; second = (hash >> 10u) & 2047u;
+        }
+        const float4 codes(float2(as_type<half2>(table[first])), float2(as_type<half2>(table[second])));
+        partial = fma(codes, float4(input[k + j], input[k + j + 1u], input[k + j + 2u], input[k + j + 3u]), partial);
+    }
+    return float(*reinterpret_cast<device const half*>(block)) * ((partial.x + partial.y) + (partial.z + partial.w));
+}
+
 template<int F> METAL_FUNC float gguf_value(device const uchar* row, uint k) {
     uint j = k % 32u, p = k % 256u;
-    if constexpr (F == 42) {
+    if constexpr (F >= 144 && F <= 151) {
+        constexpr uint bits = F == 144 ? 8u : F == 145 || F == 148 ? 6u : F == 146 || F == 149 ? 7u : F == 151 ? 4u : 5u;
+        constexpr uint values = F >= 147 && F <= 149 ? 2u : 4u;
+        auto block = row + ulong(k / 128u) * (2u + 128u / values * bits / 8u);
+        const uint local = k % 128u, hash = gguf_gyro_hash<F>(block + 2u, local / values);
+        const uint index = local % values < 2u ? hash >> 21u : (hash >> 10u) & 2047u;
+        return float(*reinterpret_cast<device const half*>(block)) *
+            float(as_type<half>(gguf_gyro_codebook[index * 2u + local % 2u]));
+    } else if constexpr (F == 143) {
+        auto block = row + ulong(k / 128u) * 28u;
+        const uint p = k % 128u;
+        const uint index = p < 80u ? p % 16u : p < 120u ? 16u + (p - 80u) % 8u : 24u + (p - 120u) % 2u;
+        const uint digit = p < 80u ? p / 16u : p < 120u ? (p - 80u) / 8u : (p - 120u) / 2u;
+        constexpr uint powers[5] = {1u, 3u, 9u, 27u, 81u};
+        const uint shifted = (uint(block[index]) * powers[digit]) & 255u;
+        return float(*reinterpret_cast<device const half*>(block + 26u)) * (int((shifted * 3u) >> 8u) - 1);
+    } else if constexpr (F == 39) {
+        auto block = row + ulong(k / 32u) * 17u;
+        const uint code = (uint(block[1u + j % 16u]) >> (4u * (j / 16u))) & 15u;
+        return gguf_mxfp4_code(code) * gguf_mxfp4_scale(block[0]);
+    } else if constexpr (F == 42) {
         auto block = row + ulong(k / 64u) * 18u;
         const float scale = float(*reinterpret_cast<device const half*>(block));
         const uint code = (block[2u + (k % 64u) / 4u] >> (2u * (k % 4u))) & 3u;
@@ -86,6 +233,27 @@ template<int F> METAL_FUNC float gguf_value(device const uchar* row, uint k) {
         uint value = uint((iq2xs_grid[code & 511u] >> (8u * c)) & 255ul);
         uint scale = (b->scales[group] >> (4u * (sub / 2u))) & 15u;
         return float(b->d) * (.5f + scale) * .25f * value * ((signs & (1u << c)) ? -1.f : 1.f);
+    } else if constexpr (F == 19 || F == 29) {
+        uint code;
+        float scale, delta;
+        if constexpr (F == 19) {
+            auto b = reinterpret_cast<device const block_iq1_s*>(row) + k / 256u;
+            const uint high = b->qh[p / 32u];
+            code = b->qs[p / 8u] | (((high >> (3u * (p % 32u / 8u))) & 7u) << 8u);
+            scale = float(b->d) * (2u * ((high >> 12u) & 7u) + 1u);
+            delta = high & 0x8000u ? -0.125f : 0.125f;
+        } else {
+            auto b = reinterpret_cast<device const block_iq1_m*>(row) + k / 256u;
+            auto sc = reinterpret_cast<device const ushort*>(b->scales);
+            const ushort d = (sc[0] >> 12u) | ((sc[1] >> 8u) & 0xf0u) |
+                ((sc[2] >> 4u) & 0xf00u) | (sc[3] & 0xf000u);
+            const uint high = b->qh[p / 16u] >> (4u * (p % 16u / 8u));
+            code = b->qs[p / 8u] | ((high & 7u) << 8u);
+            scale = float(as_type<half>(d)) * (2u * ((sc[p / 64u] >> (3u * (p % 64u / 16u))) & 7u) + 1u);
+            delta = high & 8u ? -0.125f : 0.125f;
+        }
+        const uint value = (iq1s_grid_gpu[code] >> (8u * (p % 4u) + 4u * (p % 8u / 4u))) & 15u;
+        return scale * (float(value) - 1.f + delta);
     } else if constexpr (F == 22) {
         auto b = reinterpret_cast<device const block_iq2_s*>(row) + k / 256u;
         uint group = p / 32u, sub = (p % 32u) / 8u, c = p % 8u;
@@ -128,6 +296,7 @@ template<int F> METAL_FUNC float gguf_value(device const uchar* row, uint k) {
 
 template<int F> struct GgufConstantLookup {
     enum {
+        signed_values = 0,
         entry_words = F == 18 || F == 21 ? 1 : 2,
         grid_words = F == 16 ? 512 : F == 17 ? 1024 : F == 22 ? 2048 : F == 18 ? 256 : F == 21 ? 512 : 0,
         words = grid_words,
@@ -145,6 +314,7 @@ template<int F> struct GgufConstantLookup {
 };
 
 template<int F> struct GgufThreadgroupLookup {
+    enum { signed_values = 0 };
     threadgroup const uint* table;
     METAL_FUNC uint word(uint index, uint part) const {
         return table[index * GgufConstantLookup<F>::entry_words + part];
@@ -159,7 +329,42 @@ template<int F> METAL_FUNC void gguf_load_lookup(threadgroup uint* table, uint l
 }
 
 template<int F, typename Lookup> METAL_FUNC float4 gguf_values4(device const uchar* row, uint k, Lookup lookup) {
-    if constexpr (F == 42) {
+    if constexpr (F >= 144 && F <= 151) {
+        constexpr uint bits = F == 144 ? 8u : F == 145 || F == 148 ? 6u : F == 146 || F == 149 ? 7u : F == 151 ? 4u : 5u;
+        constexpr uint values = F >= 147 && F <= 149 ? 2u : 4u;
+        auto block = row + ulong(k / 128u) * (2u + 128u / values * bits / 8u);
+        const uint step = (k % 128u) / values;
+        uint2 hashes;
+        if constexpr (values == 2u) hashes = gguf_gyro_hash_pair<F>(block + 2u, step);
+        else hashes = uint2(gguf_gyro_hash<F>(block + 2u, step));
+        const uint first = hashes.x >> 21u;
+        const uint second = values == 2u ? hashes.y >> 21u : (hashes.x >> 10u) & 2047u;
+        const auto a = as_type<half>(gguf_gyro_codebook[first * 2u]), b = as_type<half>(gguf_gyro_codebook[first * 2u + 1u]);
+        const auto c = as_type<half>(gguf_gyro_codebook[second * 2u]), d = as_type<half>(gguf_gyro_codebook[second * 2u + 1u]);
+        return float4(a, b, c, d) * float(*reinterpret_cast<device const half*>(block));
+    } else if constexpr (F == 143) {
+        auto block = row + ulong(k / 128u) * 28u;
+        const uint p = k % 128u;
+        const uint index = p < 80u ? p % 16u : p < 120u ? 16u + (p - 80u) % 8u : 24u;
+        constexpr uint powers[5] = {1u, 3u, 9u, 27u, 81u};
+        uint4 codes, power;
+        if (p < 120u) {
+            codes = uint4(block[index], block[index + 1u], block[index + 2u], block[index + 3u]);
+            power = uint4(powers[p < 80u ? p / 16u : (p - 80u) / 8u]);
+        } else {
+            codes = uint4(block[24], block[25], block[24], block[25]);
+            const uint digit = (p - 120u) / 2u;
+            power = uint4(powers[digit], powers[digit], powers[digit + 1u], powers[digit + 1u]);
+        }
+        const uint4 trits = (((codes * power) & 255u) * 3u) >> 8u;
+        return (float4(trits) - 1.f) * float(*reinterpret_cast<device const half*>(block + 26u));
+    } else if constexpr (F == 39) {
+        auto block = row + ulong(k / 32u) * 17u;
+        const uint p = 1u + k % 16u, shift = 4u * ((k % 32u) / 16u);
+        const uint4 codes = (uint4(block[p], block[p + 1u], block[p + 2u], block[p + 3u]) >> shift) & 15u;
+        return float4(gguf_mxfp4_code(codes.x), gguf_mxfp4_code(codes.y),
+            gguf_mxfp4_code(codes.z), gguf_mxfp4_code(codes.w)) * gguf_mxfp4_scale(block[0]);
+    } else if constexpr (F == 42) {
         auto block = row + ulong(k / 64u) * 18u;
         const uint codes = block[2u + (k % 64u) / 4u];
         const float scale = float(*reinterpret_cast<device const half*>(block));
@@ -258,6 +463,45 @@ METAL_FUNC uint gguf_read_u32(device const uchar* bytes) {
 }
 
 template<int F, typename X>
+METAL_FUNC float gguf_low_k_dot16(device const uchar* row, X input, uint k) {
+    const uint p = k % 256u, group = p / 16u;
+    device const uchar* codes;
+    device const uchar* high = nullptr;
+    float scale, minimum = 0.f;
+    if constexpr (F == 10) {
+        const auto block = reinterpret_cast<device const block_q2_K*>(row) + k / 256u;
+        const uint s = block->scales[group];
+        codes = block->qs + (p / 128u) * 32u + p % 32u;
+        scale = float(block->d) * float(s & 15u);
+        minimum = float(block->dmin) * float(s >> 4u);
+    } else {
+        const auto block = reinterpret_cast<device const block_q3_K*>(row) + k / 256u;
+        const uint lo = (block->scales[group % 8u] >> (4u * (group / 8u))) & 15u;
+        const uint hi = (block->scales[8u + group % 4u] >> (2u * (group / 4u))) & 3u;
+        codes = block->qs + (p / 128u) * 32u + p % 32u;
+        high = block->hmask + p % 32u;
+        scale = float(block->d) * float(int(lo | (hi << 4u)) - 32);
+    }
+    float4 partial(0.f), total(0.f);
+#pragma clang loop unroll(full)
+    for (uint local = 0u; local < 16u; local += 4u) {
+        const uint4 codes4 = (uint4(gguf_read_u32(codes + local)) >> uint4(0u, 8u, 16u, 24u))
+            >> (2u * ((p % 128u) / 32u));
+        float4 values = float4(codes4 & 3u);
+        if constexpr (F == 11) {
+            const uint4 mask = uint4(gguf_read_u32(high + local)) >> uint4(0u, 8u, 16u, 24u);
+            values -= select(float4(4.f), float4(0.f), (mask & (1u << (p / 32u))) != 0u);
+        }
+        const float4 x(input[k + local], input[k + local + 1u], input[k + local + 2u], input[k + local + 3u]);
+        partial = fma(values, x, partial);
+        if constexpr (F == 10) total += x;
+    }
+    const float sum = (partial.x + partial.y) + (partial.z + partial.w);
+    if constexpr (F == 10) return scale * sum - minimum * ((total.x + total.y) + (total.z + total.w));
+    else return scale * sum;
+}
+
+template<int F, typename X>
 METAL_FUNC float gguf_iq4_dot32(device const uchar* row, X input, uint k) {
     device const uchar* codes;
     float scale;
@@ -286,23 +530,28 @@ METAL_FUNC float gguf_iq4_dot32(device const uchar* row, X input, uint k) {
     return scale * sum;
 }
 
-template<int F, typename X, typename Lookup>
-METAL_FUNC float gguf_iq_dot16(device const uchar* row, X input, uint k, Lookup lookup) {
+template<int F, int Values, typename X, typename Lookup>
+METAL_FUNC float gguf_iq_dot_values(device const uchar* row, X input, uint k, Lookup lookup) {
     constexpr uint block_bytes = F == 16 ? 66u : F == 17 ? 74u : F == 22 ? 82u : F == 18 ? 98u : 110u;
     const auto block = row + ulong(k / 256u) * block_bytes;
-    const uint group = (k % 256u) / 32u, first = (k % 32u) / 8u;
-    uint auxiliary = 0u;
+    const uint group = (k % 256u) / 32u, first = Values == 32 ? 0u : (k % 32u) / 8u;
+    uint auxiliary = 0u, scales = 0u;
     float scale = float(*reinterpret_cast<device const half*>(block));
+    float high_scale = 0.f;
     if constexpr (F == 16 || F == 18) {
         auxiliary = gguf_read_u32(block + (F == 16 ? 6u + group * 8u : 66u + group * 4u));
         scale *= (.5f + float(auxiliary >> 28u)) * (F == 16 ? .25f : .5f);
     } else if constexpr (F == 17 || F == 22) {
-        scale *= (.5f + float((block[(F == 17 ? 66u : 74u) + group] >> (4u * (first / 2u))) & 15u)) * .25f;
+        scales = block[(F == 17 ? 66u : 74u) + group];
+        if constexpr (Values == 32) high_scale = scale * (.5f + float(scales >> 4u)) * .25f;
+        scale *= (.5f + float((scales >> (4u * (first / 2u))) & 15u)) * .25f;
     } else {
         scale *= float(1u + 2u * ((block[106u + group / 2u] >> (4u * (group % 2u))) & 15u));
     }
-    float sum = 0.f;
-    for (uint section = 0u; section < 2u; ++section) {
+    float sum = 0.f, high_sum = 0.f;
+    uint high_bits = 0u;
+    if constexpr (F == 21 || F == 22) high_bits = block[66u + group];
+    for (uint section = 0u; section < Values / 8u; ++section) {
         const uint sub = first + section;
         uint signs, indices[2];
         if constexpr (F == 16) {
@@ -314,28 +563,41 @@ METAL_FUNC float gguf_iq_dot16(device const uchar* row, X input, uint k, Lookup 
             signs = lookup.sign(code >> 9u);
         } else if constexpr (F == 22) {
             indices[0] = indices[1] = uint(block[2u + group * 4u + sub])
-                | (((uint(block[66u + group]) >> (2u * sub)) & 3u) << 8u);
+                | (((high_bits >> (2u * sub)) & 3u) << 8u);
             signs = block[34u + group * 4u + sub];
         } else if constexpr (F == 18) {
             indices[0] = block[2u + group * 8u + sub * 2u];
             indices[1] = block[3u + group * 8u + sub * 2u];
             signs = lookup.sign((auxiliary >> (7u * sub)) & 127u);
         } else {
-            const uint high = block[66u + group];
-            indices[0] = uint(block[2u + group * 8u + sub * 2u]) | (((high >> (sub * 2u)) & 1u) << 8u);
-            indices[1] = uint(block[3u + group * 8u + sub * 2u]) | (((high >> (sub * 2u + 1u)) & 1u) << 8u);
+            indices[0] = uint(block[2u + group * 8u + sub * 2u]) | (((high_bits >> (sub * 2u)) & 1u) << 8u);
+            indices[1] = uint(block[3u + group * 8u + sub * 2u]) | (((high_bits >> (sub * 2u + 1u)) & 1u) << 8u);
             signs = block[74u + group * 4u + sub];
         }
         for (uint part = 0u; part < 2u; ++part) {
-            const uint word = lookup.word(indices[part], F == 18 || F == 21 ? 0u : part);
-            const float4 values = float4(as_type<uchar4>(word));
-            const float4 signed_values = select(values, -values,
-                (uint4(signs >> (part * 4u)) & uint4(1u, 2u, 4u, 8u)) != 0u);
+            float4 signed_values;
+            if constexpr ((F == 18 || F == 21) && Lookup::signed_values)
+                signed_values = lookup.values(indices[part], signs, part * 4u);
+            else {
+                const uint word = lookup.word(indices[part], F == 18 || F == 21 ? 0u : part);
+                const float4 values = float4(as_type<uchar4>(word));
+                signed_values = select(values, -values,
+                    (uint4(signs >> (part * 4u)) & uint4(1u, 2u, 4u, 8u)) != 0u);
+            }
             const uint offset = k + section * 8u + part * 4u;
-            sum += dot(signed_values, float4(input[offset], input[offset + 1u], input[offset + 2u], input[offset + 3u]));
+            const float value = dot(signed_values, float4(input[offset], input[offset + 1u], input[offset + 2u], input[offset + 3u]));
+            if constexpr (Values == 32 && (F == 17 || F == 22)) {
+                if (section < 2u) sum += value; else high_sum += value;
+            } else sum += value;
         }
     }
-    return scale * sum;
+    if constexpr (Values == 32 && (F == 17 || F == 22)) return scale * sum + high_scale * high_sum;
+    else return scale * sum;
+}
+
+template<int F, typename X, typename Lookup>
+METAL_FUNC float gguf_iq_dot16(device const uchar* row, X input, uint k, Lookup lookup) {
+    return gguf_iq_dot_values<F, 16>(row, input, k, lookup);
 }
 
 template<typename X> METAL_FUNC float gguf_q6_dot16(device const uchar* row, X input, uint k) {
@@ -352,6 +614,25 @@ template<typename X> METAL_FUNC float gguf_q6_dot16(device const uchar* row, X i
         sum += dot(float4(q) - 32.f, x);
     }
     return (float(block->d) * float(block->scales[p / 16u])) * sum;
+}
+
+template<int F, typename X> METAL_FUNC float gguf_q8_dot32(device const uchar* row, X input, uint k) {
+    device const int8_t* codes;
+    float scale;
+    if constexpr (F == 8) {
+        auto block = reinterpret_cast<device const block_q8_0*>(row) + k / 32u;
+        codes = block->qs;
+        scale = float(block->d);
+    } else {
+        auto block = reinterpret_cast<device const block_q8_K*>(row) + k / 256u;
+        codes = block->qs + k % 256u;
+        scale = block->d;
+    }
+    float sum = 0.f;
+    for (uint j = 0u; j < 32u; j += 4u)
+        sum += dot(float4(codes[j], codes[j + 1u], codes[j + 2u], codes[j + 3u]),
+            float4(input[k + j], input[k + j + 1u], input[k + j + 2u], input[k + j + 3u]));
+    return scale * sum;
 }
 
 template<int F, typename X> METAL_FUNC float gguf_dot32(device const uchar* row, X input, uint k) {

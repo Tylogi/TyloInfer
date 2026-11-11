@@ -1,0 +1,13 @@
+Gyro TQ trellis tensor formats: specification and reference implementation
+Copyright 2026 AgentionAI (Laurent Zuijdwijk)
+
+This product includes the Gyro format specification and reference code developed by
+AgentionAI (https://gitlab.com/agentionai-group/agention-gyro).
+
+The Gyro format builds on trellis-coded quantization with incoherence processing as
+described in QTIP (Tseng et al., 2024, "QTIP: Quantization with Trellises and Incoherence
+Processing").
+
+The normative codebook is included with its declaration reformatted.
+The codebook binary16 values are unchanged. Runtime format decoders follow the
+reference bitstream and codebook specification.

@@ -3,6 +3,7 @@
 #include "../../hip/include/backend.h"
 
 #include <cstddef>
+#include <array>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -16,6 +17,7 @@
 
 struct Dsv4PoolState;
 struct FullBlock;
+namespace mfq::cuda {struct QsaTqSession;}
 namespace mfq::models::deepseek_v41 { struct EngramHashSnapshot; }
 
 struct FullBlockSessionState {
@@ -100,6 +102,7 @@ struct Qwen4BlockSessionState {
     mfq_tensor_backend::Tensor convolution, recurrent, ple_convolution;
     int64_t ple_batch = 0;
     std::vector<int64_t> ple_tokens;
+    std::shared_ptr<mfq::cuda::QsaTqSession> adaptive_qsa;
 };
 
 struct MtpSessionState {
@@ -196,9 +199,13 @@ public:
     std::pair<mfq_tensor_backend::Tensor, int> tensor();
     void skip(size_t bytes,const char* name);
     void expect_end() const;
+    size_t remaining() const;
+    void skip(size_t bytes) {
+        if(bytes>remaining())throw CudaSessionStateError("truncated CUDA paged cache range");
+        cursor_+=bytes;
+    }
 
 private:
-    size_t remaining() const;
 
     const uint8_t* cursor_;
     const uint8_t* end_;
@@ -240,6 +247,13 @@ size_t session_tensor_bytes(const mfq_tensor_backend::Tensor& tensor);
 
 CudaPagedPayload encode_cuda_qwen4_paged_block(const TextSessionState&,size_t,size_t);
 TextSessionState decode_cuda_qwen4_paged_session(const std::vector<CudaPagedPayload>&,const std::vector<int64_t>&,size_t);
+namespace mfq::cache {class PagedPrefixCache;struct PagedPrefixReadLease;}
+TextSessionState decode_cuda_qwen4_paged_prefix(mfq::cache::PagedPrefixCache&,
+    std::vector<std::array<uint8_t,32>>&,const std::vector<int64_t>&,size_t);
+void bind_cuda_qwen4_paged_prefix(const TextSessionState&,mfq::cache::PagedPrefixCache&,
+    const std::vector<std::array<uint8_t,32>>&);
+void refresh_cuda_qwen4_session_bytes(TextSessionState&);
+void prepare_cuda_qwen4_session_restore(const TextSessionState&,bool);
 size_t cuda_paged_decodable_blocks(const std::vector<CudaPagedPayload>&);
 size_t cuda_paged_payload_tokens(const CudaPagedPayload&);
 CudaPagedPayload encode_cuda_deepseek_v41_paged_block(const TextSessionState&,size_t,size_t);

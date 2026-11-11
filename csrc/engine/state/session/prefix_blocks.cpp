@@ -1,9 +1,12 @@
 #include "prefix_blocks.h"
 #include "../disk_budget.h"
+#include "engine/weights/encoding/file_read_window.h"
+#include "components/io/file_range_reader.h"
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cerrno>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
@@ -24,9 +27,16 @@
 
 #if defined(__APPLE__)
 #include <CommonCrypto/CommonDigest.h>
+#elif defined(TYLOINFER_PREFIX_OPENSSL)
+#include <openssl/evp.h>
 #endif
 
 #if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <bcrypt.h>
 #include <fcntl.h>
 #include <io.h>
 #else
@@ -45,6 +55,126 @@ constexpr std::uint64_t kHeaderBytes =
 constexpr std::string_view kHashDomain = "mfq-paged-prefix-v1";
 constexpr std::uint64_t kDiskSafeDenominator = 10;
 
+class PrefixFileLease {
+public:
+    explicit PrefixFileLease(const std::filesystem::path& path):file_(std::make_shared<tyloi::FileRangeReader>(path,tyloi::FileReadMode::Buffered)),bytes_(file_->size()){}
+    std::uint64_t size()const{return bytes_;}
+    std::shared_ptr<const tyloi::FileRangeReader> reader()const{return file_;}
+    void read(std::uint64_t offset,void* destination,std::size_t bytes) {
+        if(offset>bytes_ || bytes>bytes_-offset)throw std::out_of_range("borrowed SSD prefix byte range");
+        if(tyloinfer::ScopedFileReadWindow::read(identity_,bytes_,offset,destination,bytes,
+                [this](auto at,auto* output,auto count){read_uncached(at,output,count);}))return;
+        read_uncached(offset,destination,bytes);
+    }
+    void read_batch(const std::vector<tyloi::ReadSpan>& spans){
+        if(spans.size()==1)file_->read(spans[0].offset,spans[0].destination,spans[0].size);
+        else file_->read_batch(spans);
+    }
+private:
+    void read_uncached(std::uint64_t offset,void* destination,std::size_t bytes) {
+        file_->read(offset,static_cast<std::byte*>(destination),bytes);
+    }
+    std::shared_ptr<tyloi::FileRangeReader> file_;
+    std::uint64_t bytes_=0;
+    inline static std::atomic<std::uint64_t> next_identity_{1};
+    const std::uint64_t identity_=next_identity_.fetch_add(1,std::memory_order_relaxed);
+};
+
+#if defined(__APPLE__)
+class Sha256State {
+public:
+    Sha256State(){CC_SHA256_Init(&state_);}
+    void update(const void* data,std::size_t size) {
+        auto* bytes=static_cast<const std::uint8_t*>(data);
+        while(size) {
+            const auto count=std::min<std::size_t>(size,std::numeric_limits<CC_LONG>::max());
+            CC_SHA256_Update(&state_,bytes,static_cast<CC_LONG>(count));bytes+=count;size-=count;
+        }
+    }
+    BlockHash finish(){BlockHash result{};CC_SHA256_Final(result.data(),&state_);return result;}
+private:
+    CC_SHA256_CTX state_{};
+};
+#elif defined(_WIN32)
+class Sha256State {
+    static void check(NTSTATUS status) {
+        if(status<0)throw std::runtime_error("prefix SHA-256 failed: "+std::to_string(status));
+    }
+    struct Provider {
+        BCRYPT_ALG_HANDLE algorithm=nullptr;
+        ULONG object_bytes=0;
+        Provider() {
+            check(BCryptOpenAlgorithmProvider(&algorithm,BCRYPT_SHA256_ALGORITHM,nullptr,0));
+            ULONG received=0;
+            const auto status=BCryptGetProperty(algorithm,BCRYPT_OBJECT_LENGTH,
+                reinterpret_cast<PUCHAR>(&object_bytes),sizeof(object_bytes),&received,0);
+            if(status<0){BCryptCloseAlgorithmProvider(algorithm,0);algorithm=nullptr;check(status);}
+        }
+        ~Provider(){if(algorithm)BCryptCloseAlgorithmProvider(algorithm,0);}
+    };
+    static Provider& provider(){static Provider value;return value;}
+public:
+    Sha256State():object_(provider().object_bytes) {
+        check(BCryptCreateHash(provider().algorithm,&hash_,object_.data(),
+            static_cast<ULONG>(object_.size()),nullptr,0,0));
+    }
+    ~Sha256State(){if(hash_)BCryptDestroyHash(hash_);}
+    Sha256State(const Sha256State&)=delete;
+    Sha256State& operator=(const Sha256State&)=delete;
+    void update(const void* data,std::size_t size) {
+        auto* bytes=static_cast<const std::uint8_t*>(data);
+        while(size) {
+            // Coalesce token-ID/header updates; bulk file buffers go directly
+            // to the provider without another payload copy.
+            if(!buffered_ && size>=buffer_.size()) {
+                const auto count=static_cast<ULONG>(std::min<std::size_t>(size,std::numeric_limits<ULONG>::max()));
+                check(BCryptHashData(hash_,const_cast<PUCHAR>(bytes),count,0));bytes+=count;size-=count;
+            }else {
+                const auto count=std::min(size,buffer_.size()-buffered_);
+                std::memcpy(buffer_.data()+buffered_,bytes,count);buffered_+=count;bytes+=count;size-=count;
+                if(buffered_==buffer_.size())flush();
+            }
+        }
+    }
+    BlockHash finish() {
+        flush();
+        BlockHash result{};check(BCryptFinishHash(hash_,result.data(),static_cast<ULONG>(result.size()),0));return result;
+    }
+private:
+    void flush() {
+        if(buffered_)check(BCryptHashData(hash_,buffer_.data(),static_cast<ULONG>(buffered_),0));
+        buffered_=0;
+    }
+    std::vector<UCHAR> object_;
+    BCRYPT_HASH_HANDLE hash_=nullptr;
+    std::array<UCHAR,4096> buffer_{};
+    std::size_t buffered_=0;
+};
+#elif defined(TYLOINFER_PREFIX_OPENSSL)
+class Sha256State {
+public:
+    Sha256State():state_(EVP_MD_CTX_new()) {
+        if(!state_)throw std::bad_alloc();
+        if(EVP_DigestInit_ex(state_,EVP_sha256(),nullptr)!=1) {
+            EVP_MD_CTX_free(state_);state_=nullptr;throw std::runtime_error("prefix SHA-256 initialization failed");
+        }
+    }
+    ~Sha256State(){EVP_MD_CTX_free(state_);}
+    Sha256State(const Sha256State&)=delete;
+    Sha256State& operator=(const Sha256State&)=delete;
+    void update(const void* data,std::size_t size) {
+        if(size && EVP_DigestUpdate(state_,data,size)!=1)throw std::runtime_error("prefix SHA-256 update failed");
+    }
+    BlockHash finish() {
+        BlockHash result{};unsigned size=0;
+        if(EVP_DigestFinal_ex(state_,result.data(),&size)!=1 || size!=result.size())
+            throw std::runtime_error("prefix SHA-256 finalization failed");
+        return result;
+    }
+private:
+    EVP_MD_CTX* state_;
+};
+#else
 constexpr std::array<std::uint32_t, 64> kShaConstants{
     0x428a2f98U, 0x71374491U, 0xb5c0fbcfU, 0xe9b5dba5U,
     0x3956c25bU, 0x59f111f1U, 0x923f82a4U, 0xab1c5ed5U,
@@ -179,6 +309,7 @@ private:
     std::size_t block_size_ = 0;
     std::uint64_t total_bytes_ = 0;
 };
+#endif
 
 template <typename T>
 void hash_little_endian(Sha256State& state, T value) {
@@ -275,26 +406,9 @@ void sync_directory_best_effort(const std::filesystem::path& path) noexcept {
 } // namespace
 
 BlockHash sha256(const void* data, std::size_t size) {
-#if defined(__APPLE__)
-    CC_SHA256_CTX state;
-    CC_SHA256_Init(&state);
-    const auto* bytes = static_cast<const std::uint8_t*>(data);
-    while (size > 0) {
-        const auto count = std::min<std::size_t>(
-            size, std::numeric_limits<CC_LONG>::max());
-        CC_SHA256_Update(
-            &state, bytes, static_cast<CC_LONG>(count));
-        bytes += count;
-        size -= count;
-    }
-    BlockHash digest{};
-    CC_SHA256_Final(digest.data(), &state);
-    return digest;
-#else
     Sha256State state;
     state.update(data, size);
     return state.finish();
-#endif
 }
 
 BlockHash sha256(std::string_view value) {
@@ -336,6 +450,10 @@ BlockHash prefix_block_hash(
 
 class PrefixBlockStore::Implementation {
 private:
+    struct ReadLeaseMemo {
+        std::weak_ptr<const PagedPrefixReadLease> lease;
+        std::filesystem::file_time_type stamp{};
+    };
     struct DiskEntry {
         std::filesystem::path path;
         BlockHash parent{};
@@ -344,6 +462,9 @@ private:
         std::uint64_t file_bytes = 0;
         std::uint64_t last_used = 0;
         std::size_t pins = 0;
+        // Only a weak verified lease: retain neither payload RAM nor an idle
+        // file handle. Replacing/reindexing an entry creates a new identity.
+        std::shared_ptr<ReadLeaseMemo> reader=std::make_shared<ReadLeaseMemo>();
     };
 
     struct HotEntry {
@@ -609,6 +730,103 @@ public:
         const auto payloads = load_prefix({hash});
         if (payloads.empty()) return std::nullopt;
         return *payloads.front();
+    }
+
+    std::shared_ptr<const PagedPrefixReadLease> borrow(const BlockHash& hash) {
+        std::shared_ptr<PrefixFileLease> file;
+        std::shared_ptr<ReadLeaseMemo> memo;
+        std::filesystem::file_time_type stamp{};
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            writes_finished_.wait(lock,[&]{return pending_.count(hash)==0;});
+            // A deferred RAM replacement supersedes the old SSD file even
+            // before it is persisted. Callers must load that current RAM
+            // version; lending the old file can lose a new exact/MTP state.
+            if(deferred_.count(hash))return {};
+            const auto found=disk_.find(hash);if(found==disk_.end())return {};
+            std::error_code error;stamp=std::filesystem::last_write_time(found->second.path,error);
+            if(error)return {};
+            if(auto retained=found->second.reader->lease.lock();retained && found->second.reader->stamp==stamp) {
+                found->second.last_used=++clock_;return retained;
+            }
+            // A changed file must pass its checksum again. A verifier already
+            // in flight keeps its own memo and cannot publish into this one.
+            if(found->second.reader->stamp!=stamp) {
+                found->second.reader=std::make_shared<ReadLeaseMemo>();found->second.reader->stamp=stamp;
+            }
+            memo=found->second.reader;
+            try {file=std::make_shared<PrefixFileLease>(found->second.path);}catch(...){return {};}
+            found->second.last_used=++clock_;
+        }
+        try {
+            std::string bytes(std::size_t(kHeaderBytes),'\0');file->read(0,bytes.data(),bytes.size());
+            std::istringstream input(bytes,std::ios::in|std::ios::binary);ParsedHeader header;
+            if(!read_header(input,header) || header.hash!=hash ||
+                header.payload_bytes>std::numeric_limits<std::size_t>::max() ||
+                file->size()<kHeaderBytes || header.payload_bytes!=file->size()-kHeaderBytes)return {};
+            Sha256State checksum;std::array<std::uint8_t,64*1024> buffer;
+            for(std::uint64_t at=0;at<header.payload_bytes;) {
+                const auto count=std::size_t(std::min<std::uint64_t>(buffer.size(),header.payload_bytes-at));
+                file->read(kHeaderBytes+at,buffer.data(),count);checksum.update(buffer.data(),count);at+=count;
+            }
+            if(checksum.finish()!=header.payload_hash)return {};
+            auto result=std::make_shared<PagedPrefixReadLease>();result->payload_bytes=std::size_t(header.payload_bytes);
+            result->file_reader=file->reader();result->file_offset=kHeaderBytes;
+            result->read_range=[file,size=result->payload_bytes](std::size_t offset,std::size_t count) {
+                if(offset>size || count>size-offset)throw std::out_of_range("borrowed SSD prefix payload range");
+                std::vector<std::uint8_t> bytes(count);file->read(kHeaderBytes+offset,bytes.data(),count);return bytes;
+            };
+            result->read_range_into=[file,size=result->payload_bytes](std::size_t offset,std::uint8_t* destination,std::size_t count) {
+                if(offset>size || count>size-offset)throw std::out_of_range("borrowed SSD prefix payload range");
+                if(count && !destination)throw std::invalid_argument("borrowed SSD prefix destination is null");
+                if(count)file->read(kHeaderBytes+offset,destination,count);
+            };
+            result->read_ranges_into=[file,size=result->payload_bytes](const std::vector<tyloi::ReadSpan>& spans) {
+                std::vector<tyloi::ReadSpan> absolute;absolute.reserve(spans.size());
+                for(const auto& span:spans) {
+                    if(span.offset>size || span.size>size-span.offset)throw std::out_of_range("borrowed SSD prefix payload range");
+                    if(span.size && !span.destination)throw std::invalid_argument("borrowed SSD prefix destination is null");
+                    absolute.push_back({kHeaderBytes+span.offset,span.destination,span.size});
+                }
+                if(spans.size()>1)if(const auto* option=std::getenv("TYLOINFER_TRACE_KERNEL_DISPATCH");option && option[0]=='1') {
+                    static std::atomic<bool> reported{false};
+                    if(!reported.exchange(true,std::memory_order_relaxed))std::fprintf(stderr,
+                        "prefix_random_read_batch actual_match=1 ranges=%zu exact_ranges=1 native_file_queue=1\n",spans.size());
+                }
+                file->read_batch(absolute);
+            };
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                const auto found=disk_.find(hash);
+                if(found!=disk_.end() && found->second.reader==memo) {
+                    if(auto retained=memo->lease.lock())return retained;
+                    memo->stamp=stamp;memo->lease=result;
+                }
+            }
+            return result;
+        }catch(...){return {};}
+    }
+
+    std::vector<std::shared_ptr<const PagedPrefixReadLease>> borrow_prefix(const std::vector<BlockHash>& blocks) {
+        std::vector<std::shared_ptr<const PagedPrefixReadLease>> result(blocks.size());
+        std::size_t count=0;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if(config_.max_disk_bytes==0 || blocks.empty())return result;
+            count=std::min(blocks.size(),config_.max_parallel_reads);
+        }
+        if(count==1){for(std::size_t i=0;i<blocks.size();++i)result[i]=borrow(blocks[i]);return result;}
+        std::atomic<std::size_t> next{0};std::mutex errors;std::exception_ptr failure;
+        std::vector<std::thread> workers;
+        struct Join {std::vector<std::thread>& workers;~Join(){for(auto& worker:workers)if(worker.joinable())worker.join();}} join{workers};
+        workers.reserve(count);
+        for(std::size_t n=0;n<count;++n)workers.emplace_back([&] {
+            for(auto i=next.fetch_add(1);i<blocks.size();i=next.fetch_add(1))try {result[i]=borrow(blocks[i]);}
+            catch(...){std::lock_guard<std::mutex> lock(errors);if(!failure)failure=std::current_exception();}
+        });
+        for(auto& worker:workers)worker.join();
+        if(failure)std::rethrow_exception(failure);
+        return result;
     }
 
     std::vector<PagedPrefixPayload> load_prefix(
@@ -1491,6 +1709,15 @@ private:
         const auto budget = effective_disk_budget_locked();
         const auto target = reserved_bytes >= budget ? 0 : budget - reserved_bytes;
         std::size_t evicted = 0;
+        // A durable child needs its ancestors to match as a prefix. Removing
+        // an old interior block would strand every newer block behind it.
+        // Among branch leaves retain the existing LRU and reader-pin rules.
+        // Only build this index when eviction is actually necessary.
+        std::unordered_map<BlockHash, std::size_t, HashHasher> children;
+        if (disk_bytes_ > target) {
+            children.reserve(disk_.size());
+            for (const auto& [hash, entry] : disk_) ++children[entry.parent];
+        }
         while (disk_bytes_ > target && !disk_.empty()) {
             auto victim = disk_.end();
             for (auto iterator = disk_.begin(); iterator != disk_.end();
@@ -1503,6 +1730,8 @@ private:
                     pending_.count(iterator->first) != 0) {
                     continue;
                 }
+                const auto descendants = children.find(iterator->first);
+                if (descendants != children.end() && descendants->second) continue;
                 if (victim == disk_.end() ||
                     iterator->second.last_used < victim->second.last_used) {
                     victim = iterator;
@@ -1520,7 +1749,10 @@ private:
             if (config_.spill_hot_on_eviction && hot_.count(hash) && !deferred_.count(hash))
                 deferred_[hash] = WriteRequest{hash, victim->second.parent, victim->second.token_count,
                     hot_.at(hash).payload, cache_epoch_, false, {}};
+            const auto parent = victim->second.parent;
             disk_.erase(victim);
+            const auto siblings = children.find(parent);
+            if (siblings != children.end() && siblings->second) --siblings->second;
             forget_tail_if_unused_locked(hash);
             ++metrics_.evictions;
             if (++evicted >= max_evictions) break;
@@ -1699,6 +1931,13 @@ std::vector<PagedPrefixPayload> PrefixBlockStore::load_prefix(
     return implementation_->load_prefix(blocks);
 }
 
+std::shared_ptr<const PagedPrefixReadLease> PrefixBlockStore::borrow(const BlockHash& block) {
+    return implementation_->borrow(block);
+}
+std::vector<std::shared_ptr<const PagedPrefixReadLease>> PrefixBlockStore::borrow_prefix(const std::vector<BlockHash>& blocks) {
+    return implementation_->borrow_prefix(blocks);
+}
+
 bool PrefixBlockStore::invalidate(const BlockHash& block) {
     return implementation_->invalidate(block);
 }
@@ -1741,6 +1980,18 @@ std::size_t PrefixBlockStore::clear() {
 
 PrefixBlockStoreMetrics PrefixBlockStore::metrics() const {
     return implementation_->metrics();
+}
+
+std::function<std::uint64_t(std::uint64_t)> make_ram_prefix_reclaimer(
+        std::weak_ptr<PagedPrefixCache> cache) {
+    if (cache.expired()) return {};
+    return [cache=std::move(cache)](std::uint64_t bytes) -> std::uint64_t {
+        if (!bytes) return 0;
+        const auto owner=cache.lock();
+        if (!owner) return 0;
+        const auto hot=owner->metrics().hot_bytes;
+        return hot ? owner->trim_hot(hot>bytes ? hot-bytes : 0) : 0;
+    };
 }
 
 } // namespace tyloi::cache

@@ -30,9 +30,9 @@ public:
     const Device& device() const noexcept override { return primary().device(); }
     bool is_contiguous() const noexcept override { return false; }
     bool is_encoded() const noexcept override { return true; }
-    void record_stream(std::uintptr_t stream) const override {
+    void record_stream(std::uintptr_t stream, std::shared_ptr<void> lifetime = {}) const override {
         for (const auto* buffer : buffers())
-            if (buffer && buffer->defined()) buffer->record_stream(stream);
+            if (buffer && buffer->defined()) buffer->record_stream(stream, lifetime);
     }
 
     std::shared_ptr<TensorImpl> relocated(Device target) const override {

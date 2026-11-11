@@ -1,4 +1,5 @@
 #pragma once
+#include "limits.h"
 
 #include <array>
 #include <cstdint>
@@ -9,7 +10,6 @@
 
 namespace tyloi::engine::mtp {
 
-inline constexpr int kMaximumReportedDraftDepth = 7;
 
 struct GenerationStats {
     bool available = false;

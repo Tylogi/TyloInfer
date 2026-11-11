@@ -3,7 +3,6 @@ if(TARGET mfq-transport)
         ${PROJECT_SOURCE_DIR}/apps/runtime_main.cpp
         ${PROJECT_SOURCE_DIR}/commands/runtime.cpp
         ${PROJECT_SOURCE_DIR}/commands/cli.cpp
-        ${PROJECT_SOURCE_DIR}/commands/reference.cpp
         ${PROJECT_SOURCE_DIR}/commands/minicpmo45.cpp
     )
     target_link_libraries(mfq-runtime PRIVATE
@@ -18,19 +17,12 @@ add_executable(mfq-diagnostics
 )
 target_link_libraries(mfq-diagnostics PRIVATE mfq-cuda-diagnostics)
 
-add_executable(mfq-eval
-    ${PROJECT_SOURCE_DIR}/apps/eval_main.cpp
-    ${PROJECT_SOURCE_DIR}/commands/eval.cpp
-    ${PROJECT_SOURCE_DIR}/commands/cli.cpp
-)
-target_link_libraries(mfq-eval PRIVATE mfq-cuda-eval)
 
 if(TARGET mfq-cuda-torch-engine)
     add_executable(mfq-runtime-torch
         ${PROJECT_SOURCE_DIR}/apps/runtime_main.cpp
         ${PROJECT_SOURCE_DIR}/commands/runtime.cpp
         ${PROJECT_SOURCE_DIR}/commands/cli.cpp
-        ${PROJECT_SOURCE_DIR}/commands/reference.cpp
         ${PROJECT_SOURCE_DIR}/commands/minicpmo45.cpp
     )
     target_link_libraries(mfq-runtime-torch PRIVATE
@@ -43,7 +35,7 @@ if(TARGET mfq-cuda-torch-engine)
     )
 endif()
 
-foreach(target mfq-runtime mfq-diagnostics mfq-eval mfq-runtime-torch)
+foreach(target mfq-runtime mfq-diagnostics mfq-runtime-torch)
     if(TARGET ${target})
         mfq_configure_cuda_engine_target(${target})
         target_compile_definitions(${target} PRIVATE NOMINMAX)

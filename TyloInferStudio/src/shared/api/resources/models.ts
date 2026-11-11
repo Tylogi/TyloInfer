@@ -6,6 +6,7 @@ import type {
   CheckpointAnalysis,
   ModelDirectoryList,
   HubModelSummary,
+  HubModelSearchPage,
   HubModelInfo,
   HubDownloadReuseRequest,
   HubDownloadReuseResponse,
@@ -36,6 +37,15 @@ export interface DownloadDirectoryStatus {
 }
 
 export const modelsApi = {
+  browseHubModels(provider: HubModelSummary['provider'], query: string, options: {
+    formats: ('tq' | 'gguf' | 'mlx')[]; sort: 'relevance' | 'downloads' | 'likes' | 'updated';
+    direction: 'asc' | 'desc'; cursor?: string | null; signal?: AbortSignal;
+  }): Promise<HubModelSearchPage> {
+    const params = new URLSearchParams({ provider, query, formats: options.formats.join(','),
+      sort: options.sort, direction: options.direction, limit: '40', browse: 'true' });
+    if (options.cursor) params.set('cursor', options.cursor);
+    return request(`/api/v1/hub/models?${params}`, { signal: options.signal });
+  },
   downloadReuse(payload: HubDownloadReuseRequest, signal?: AbortSignal): Promise<HubDownloadReuseResponse> {
     return request('/api/v1/hub/download-reuse', { method: 'POST', body: JSON.stringify(payload), signal });
   },
@@ -54,19 +64,19 @@ export const modelsApi = {
     return request('/api/v1/hub/download-sources/probe', { method: 'POST', body: JSON.stringify({ sources }), signal });
   },
 
-  async modelArtifacts(refresh = false): Promise<ModelArtifact[]> {
+  async modelArtifacts(refresh = false, includeComponents = false): Promise<ModelArtifact[]> {
     return (
-      await request<{ data: ModelArtifact[] }>(`/api/v1/models${refresh ? '?refresh=true' : ''}`)
+      await request<{ data: ModelArtifact[] }>(`/api/v1/models${refresh || includeComponents ? `?${new URLSearchParams({ ...(refresh ? { refresh: 'true' } : {}), ...(includeComponents ? { include_components: 'true' } : {}) })}` : ''}`)
     ).data;
   },
 
 
-  modelDirectories(directoryId?: string | null, path?: string | null): Promise<ModelDirectoryList> {
+  modelDirectories(directoryId?: string | null, path?: string | null, signal?: AbortSignal): Promise<ModelDirectoryList> {
     const query = new URLSearchParams();
     if (directoryId) query.set('directory_id', directoryId);
     else if (path?.trim()) query.set('path', path.trim());
     const suffix = query.size ? `?${query.toString()}` : '';
-    return request(`/api/v1/models/directories${suffix}`);
+    return request(`/api/v1/models/directories${suffix}`, { signal });
   },
 
   modelArtifactDirectory(modelId: string): Promise<ModelDirectoryList> {
@@ -112,7 +122,7 @@ export const modelsApi = {
     model: string,
     contextSize: number | null = null,
     prefillChunkSize: number | 'auto' = 'auto',
-    policy: { pin?: boolean; idle_ttl_seconds?: number | null; device_ids?: string[]; context_management?: ModelLoadContextSettings } = {},
+    policy: { pin?: boolean; idle_ttl_seconds?: number | null; device_ids?: string[]; context_management?: ModelLoadContextSettings; gguf_companions?: string[] } = {},
   ): Promise<{ operation_id: string; status: 'accepted' }> {
     return request('/api/v1/models/load', {
       method: 'POST',
@@ -127,6 +137,7 @@ export const modelsApi = {
           kv_quantization: policy.context_management.kv_quantization,
         } } : {}),
         ...(policy.device_ids?.length ? { device_ids: policy.device_ids } : {}),
+        ...(policy.gguf_companions?.length ? { gguf_companions: policy.gguf_companions } : {}),
         idle_ttl_seconds: policy.pin ? null : (policy.idle_ttl_seconds ?? null),
       }),
     });
@@ -147,9 +158,15 @@ export const modelsApi = {
   async searchHubModels(
     provider: HubModelSummary['provider'],
     query: string,
+    options: { format?: 'all' | 'tq' | 'gguf' | 'mlx'; sort?: 'downloads' | 'likes' | 'updated'; limit?: number; signal?: AbortSignal } = {},
   ): Promise<HubModelSummary[]> {
-    const params = new URLSearchParams({ provider, query, limit: '20' });
-    return (await request<{ data: HubModelSummary[] }>(`/api/v1/hub/models?${params}`)).data;
+    const params = new URLSearchParams({ provider, query, limit: String(options.limit ?? 40), format: options.format ?? 'all', sort: options.sort ?? 'downloads' });
+    return (await request<{ data: HubModelSummary[] }>(`/api/v1/hub/models?${params}`, { signal: options.signal })).data;
+  },
+
+  hubModelReadme(model: Pick<HubModelInfo, 'provider' | 'repo_id' | 'revision'>, signal?: AbortSignal): Promise<{ content: string | null }> {
+    const [owner, name] = model.repo_id.split('/');
+    return request(`/api/v1/hub/models/${model.provider}/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/readme?${new URLSearchParams({ revision: model.revision })}`, { signal });
   },
 
 
@@ -161,9 +178,11 @@ export const modelsApi = {
   resolveHubModel(
     reference: string,
     fallbackProvider: HubModelSummary['provider'],
+    signal?: AbortSignal,
   ): Promise<HubModelInfo> {
     return request('/api/v1/hub/resolve', {
       method: 'POST',
+      signal,
       body: JSON.stringify({
         reference,
         fallback_provider: fallbackProvider,
@@ -176,11 +195,12 @@ export const modelsApi = {
     provider: HubModelSummary['provider'],
     repoId: string,
     revision?: string,
+    signal?: AbortSignal,
   ): Promise<HubModelInfo> {
     const [owner, name] = repoId.split('/', 2);
     const suffix = revision ? `?revision=${encodeURIComponent(revision)}` : '';
     return request(
-      `/api/v1/hub/models/${provider}/${encodeURIComponent(owner)}/${encodeURIComponent(name)}${suffix}`,
+      `/api/v1/hub/models/${provider}/${encodeURIComponent(owner)}/${encodeURIComponent(name)}${suffix}`, { signal },
     );
   },
 

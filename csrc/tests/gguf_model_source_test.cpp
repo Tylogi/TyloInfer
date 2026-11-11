@@ -1,15 +1,20 @@
-#include "engine/models/common/gguf_source.h"
-#include "engine/models/common/model_config.h"
-#include "ggml.h"
+#include "engine/models/source/gguf_source.h"
+#include "engine/models/source/model_config.h"
+#include "components/ggml/include/ggml.h"
 #include "gguf.h"
-#include "nlohmann/json.hpp"
+#include "components/json/nlohmann/json.hpp"
 
 #include <algorithm>
 #include <chrono>
+#include <array>
+#include <cstdlib>
 #include <cmath>
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <iomanip>
+#include <map>
+#include <sstream>
 
 
 namespace {
@@ -24,8 +29,311 @@ std::vector<std::byte> read_tensor(
 } // namespace
 
 void require(bool ok, const char* message) { if (!ok) throw std::runtime_error(message); }
+void grouped_source_reads(const tyloi::GgufModelSource& source) {
+    const auto reader=source.tensor_group_reader();
+    require(reader==source.tensor_group_reader(),"grouped tensor readers do not share a source identity");
+    std::vector<std::vector<std::byte>> expected,actual;
+    expected.reserve(source.tensors().size());actual.reserve(source.tensors().size());
+    for(const auto& tensor:source.tensors()) {
+        expected.push_back(source.read(tensor.name));actual.emplace_back(expected.back().size(),std::byte{0x5a});
+    }
+    std::vector<tyloi::GgufModelSource::NamedReadSpan> spans;
+    for(std::size_t i=source.tensors().size();i-->0;) {
+        const auto& tensor=source.tensors()[i];const auto half=actual[i].size()/2;
+        spans.push_back({tensor.name,{half,actual[i].empty()?nullptr:actual[i].data()+half,actual[i].size()-half}});
+        spans.push_back({tensor.name,{0,actual[i].data(),half}});
+        spans.push_back({tensor.name,{tensor.nbytes,nullptr,0}});
+    }
+    (*reader)(spans);
+    require(actual==expected,"grouped cross-tensor reads changed bytes");
+    (*reader)({});
+    if(source.tensors().empty())return;
+    const auto& first=source.tensors().front();
+    std::array<std::byte,32> aliased{},reference{};
+    for(const auto& tensor:source.tensors())if(tensor.nbytes>=32 && first.nbytes>=32) {
+        const auto a=source.tensor_reader(first.name),b=source.tensor_reader(tensor.name);
+        a(1,reference.data(),19);b(3,reference.data()+7,15);
+        (*reader)({{first.name,{1,aliased.data(),19}},{tensor.name,{3,aliased.data()+7,15}}});
+        require(aliased==reference,"grouped reads changed overlapping destination order");break;
+    }
+    const auto rejects=[&](tyloi::GgufModelSource::NamedReadSpan bad) {
+        std::byte unchanged{0x5a};bool rejected=false;
+        try{(*reader)({{first.name,{0,&unchanged,1}},bad});}catch(const std::exception&){rejected=true;}
+        require(rejected && unchanged==std::byte{0x5a},"grouped read failed to validate all ranges before writing");
+    };
+    rejects({"missing-group-tensor",{0,nullptr,0}});
+    rejects({first.name,{first.nbytes,nullptr,1}});
+    rejects({first.name,{0,nullptr,1}});
+    if(first.nbytes>=2)rejects({first.name,{0,reinterpret_cast<std::byte*>(UINTPTR_MAX),2}});
+}
+#include "gguf_qwen35_mtp_test.h"
+struct MirrorSetting {
+    std::string previous;bool present=false;
+    explicit MirrorSetting(const std::filesystem::path& directory) {
+        if(const auto* value=std::getenv("TYLOINFER_MODEL_MIRROR_DIRS")){present=true;previous=value;}
+        set(directory.string().c_str());
+    }
+    static void set(const char* value) {
+#if defined(_WIN32)
+        _putenv_s("TYLOINFER_MODEL_MIRROR_DIRS",value?value:"");
+#else
+        if(value)setenv("TYLOINFER_MODEL_MIRROR_DIRS",value,1);else unsetenv("TYLOINFER_MODEL_MIRROR_DIRS");
+#endif
+    }
+    ~MirrorSetting(){set(present?previous.c_str():nullptr);}
+};
+
+
+void raw_part_source(const std::filesystem::path& path, const std::vector<std::filesystem::path>& companions = {},
+        std::size_t first_cut = 37, int count = 4, int width = 2) {
+    std::ifstream input(path, std::ios::binary);
+    const std::vector<char> bytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    const tyloi::GgufModelSource complete(path, companions);
+    grouped_source_reads(complete);
+    std::vector<std::size_t> cuts{0, first_cut, bytes.size() / 2 + 3, bytes.size() - 7, bytes.size()};
+    if (count != 4) {
+        cuts = {0, first_cut};
+        for (int i = 2; i <= count; ++i)
+            cuts.push_back(first_cut + (bytes.size() - first_cut) * (i - 1) / (count - 1));
+    }
+    std::vector<std::filesystem::path> parts;
+    for (std::size_t i = 1; i < cuts.size(); ++i) {
+        std::ostringstream name;
+        name << path.filename().string() << ".part-" << std::setfill('0') << std::setw(width) << i << "-of-" << std::setw(width) << count;
+        parts.push_back(path.parent_path() / name.str());
+        std::ofstream output(parts.back(), std::ios::binary);
+        output.write(bytes.data() + cuts[i - 1], cuts[i] - cuts[i - 1]);
+    }
+    require(!tyloi::is_gguf_file(path.parent_path() / "bad.gguf.part-00-of-04"), "invalid raw part number was recognized");
+    for (const auto& selected : {parts.front(), parts.back()}) {
+        require(tyloi::is_gguf_file(selected), "noninitial raw GGUF part not recognized");
+        const std::shared_ptr<const tyloi::ModelSource> source = companions.empty() ? tyloi::open_model_source(selected)
+            : std::make_shared<tyloi::GgufModelSource>(selected, companions);
+        require(source->architecture() == complete.architecture() && source->metadata() == complete.metadata() &&
+            source->tensors().size() == complete.tensors().size(), "raw parts changed model metadata");
+        require(source->source_paths().size() == parts.size() + companions.size(), "raw parts source paths missing");
+        grouped_source_reads(dynamic_cast<const tyloi::GgufModelSource&>(*source));
+        for (const auto& tensor : complete.tensors()) {
+            const auto expected = complete.read(tensor.name);
+            require(source->read(tensor.name) == expected, "raw part tensor bytes changed");
+            const auto original_range = complete.tensor_file_range(tensor.name);
+            if (original_range && original_range->path == path)
+                require(!source->tensor_file_range(tensor.name), "raw part tensor exposed a false contiguous file range");
+            std::vector<std::byte> actual(expected.size()), tail(13);
+            source->tensor_batch_reader(tensor.name)({{uint64_t(expected.size() - 13), tail.data(), tail.size()},
+                {0, actual.data(), actual.size()}, {tensor.nbytes, nullptr, 0}});
+            require(actual == expected && std::equal(tail.begin(), tail.end(), expected.end() - 13), "raw part batch read changed bytes");
+        }
+        for (const auto& asset : complete.assets())
+            require(source->read_asset(asset) == complete.read_asset(asset), "raw parts changed tokenizer or assets");
+    }
+    tyloi::ModelSource::TensorReader retained;
+    std::shared_ptr<const tyloi::GgufModelSource::TensorGroupReader> retained_group;
+    std::string retained_name;
+    std::vector<std::byte> expected;
+    {
+        const tyloi::GgufModelSource source(parts.back(), companions);
+        const auto name = source.tensors().front().name;
+        expected = source.read(name);
+        retained = source.tensor_reader(name);
+        retained_name=name;retained_group=source.tensor_group_reader();
+    }
+    std::vector<std::byte> actual(expected.size());
+    retained(0, actual.data(), actual.size());
+    require(actual == expected, "retained raw part reader expired");
+    const auto hidden = parts[1].string() + ".missing";
+    std::filesystem::rename(parts[1], hidden);
+    retained(0, actual.data(), actual.size());
+    require(actual == expected, "retained raw part reader changed after rename");
+    std::fill(actual.begin(),actual.end(),std::byte{0});
+    (*retained_group)({{retained_name,{0,actual.data(),actual.size()}}});
+    require(actual==expected,"grouped reader expired or reopened a renamed source");
+    bool missing = false;
+    try { tyloi::GgufModelSource invalid(parts.front(), companions); } catch (const std::runtime_error&) { missing = true; }
+    require(missing, "incomplete raw GGUF parts accepted");
+    std::filesystem::rename(hidden, parts[1]);
+    std::filesystem::resize_file(parts[2], 1);
+    bool truncated = false;
+    try { tyloi::GgufModelSource invalid(parts.front(), companions); } catch (const std::runtime_error&) { truncated = true; }
+    require(truncated, "truncated raw GGUF payload accepted");
+}
+
+void gyro_layout() {
+    static const uint16_t codebook[]{
+#include "components/agention-gyro/codebook_f16.inc"
+    };
+    for (const auto type : {GGML_TYPE_TQ2_T, GGML_TYPE_TQK4, GGML_TYPE_TQK5, GGML_TYPE_TQK6,
+            GGML_TYPE_TQK7, GGML_TYPE_TQP5, GGML_TYPE_TQP6, GGML_TYPE_TQP7}) {
+        const int bits = type == GGML_TYPE_TQ2_T ? 8 : type == GGML_TYPE_TQK4 ? 4 :
+            type == GGML_TYPE_TQK5 || type == GGML_TYPE_TQP5 ? 5 : type == GGML_TYPE_TQK6 || type == GGML_TYPE_TQP6 ? 6 : 7;
+        const int steps = type >= GGML_TYPE_TQP5 && type <= GGML_TYPE_TQP7 ? 64 : 32;
+        const int length = steps * bits / 8;
+        require(ggml_type_size(type) == std::size_t(length + 2) && ggml_blck_size(type) == 128,
+            "Gyro block layout differs from its specification");
+        std::vector<uint8_t> bytes((length + 2) * 2);
+        std::vector<float> expected(256), actual(256);
+        for (int b = 0; b < 2; ++b) {
+            const float scale = b ? -2.f : .5f;
+            const auto half = ggml_fp32_to_fp16(scale);
+            auto* block = bytes.data() + b * (length + 2);
+            std::memcpy(block, &half, 2);
+            for (int j = 0; j < length; ++j) block[2 + j] = uint8_t(j * 37 + b * 19 + 3);
+            for (int t = 0; t < steps; ++t) {
+                uint32_t state = 0;
+                for (int bit = 0; bit < 16; ++bit) {
+                    const int at = type == GGML_TYPE_TQ2_T ? ((t * 8 + bit) % (length * 8))
+                        : (((steps - 1 - t) * bits + bit) % (length * 8));
+                    const int index = type == GGML_TYPE_TQ2_T ?
+                        (bit < 8 ? 2 + t : 2 + (t + 31) % 32) : 2 + at / 8;
+                    state |= uint32_t((block[index] >> (at % 8)) & 1) << bit;
+                }
+                const uint32_t hash = (state & 32767u) * uint32_t(0x9e3779b1);
+                for (int j = 0; j < 128 / steps; ++j) {
+                    const auto index = j < 2 ? hash >> 21 : (hash >> 10) & 2047;
+                    expected[b * 128 + t * (128 / steps) + j] = scale * ggml_fp16_to_fp32(codebook[index * 2 + j % 2]);
+                }
+            }
+        }
+        ggml_get_type_traits(type)->to_float(bytes.data(), actual.data(), actual.size());
+        require(actual == expected, "Gyro circular stream or codebook indexing differs");
+        require(ggml_validate_row_data(type, bytes.data(), bytes.size()), "valid Gyro payload rejected");
+    }
+    std::vector<uint8_t> example{0, 0x3c, 7, 0x18, 0x29, 0x3a, 0x4b, 0x5c, 0x6d, 0x7e,
+        0x8f, 0xa0, 0xb1, 0xc2, 0xd3, 0xe4, 0xf5, 6};
+    std::vector<float> decoded(128);
+    ggml_get_type_traits(GGML_TYPE_TQK4)->to_float(example.data(), decoded.data(), decoded.size());
+    require(decoded[0] == .98681640625f && decoded[1] == .455322265625f && decoded[2] == -.2119140625f &&
+        decoded[3] == .65380859375f, "Gyro normative TQK4 worked example differs");
+}
+
+void ptq1_layout() {
+    std::vector<uint8_t> q2(36, 0xe4);
+    const auto q2_scale = ggml_fp32_to_fp16(.5f);
+    std::memcpy(q2.data(), &q2_scale, 2);
+    std::memcpy(q2.data() + 18, &q2_scale, 2);
+    require(ggml_validate_row_data(GGML_TYPE_Q2_0, q2.data(), q2.size()), "Q2_0 valid payload rejected");
+    require(!ggml_validate_row_data(GGML_TYPE_Q2_0, q2.data(), q2.size() - 1), "Q2_0 partial block accepted");
+    const uint16_t nan_scale = 0x7e00;
+    std::memcpy(q2.data() + 18, &nan_scale, 2);
+    require(!ggml_validate_row_data(GGML_TYPE_Q2_0, q2.data(), q2.size()), "Q2_0 NaN scale accepted");
+    constexpr int blocks = 243;
+    std::vector<uint8_t> bytes(blocks * 28);
+    std::vector<float> expected(blocks * 128), decoded(expected.size());
+    for (int b = 0; b < blocks; ++b) {
+        const float scale = b % 3 == 0 ? 0.f : b % 3 == 1 ? .5f : -1.5f;
+        const auto half = ggml_fp32_to_fp16(scale);
+        std::memcpy(bytes.data() + b * 28 + 26, &half, 2);
+        for (int byte = 0; byte < 26; ++byte) {
+            int code = byte < 24 ? (b + byte * 17) % 243 : ((b + byte * 17) % 81) * 3;
+            bytes[b * 28 + byte] = uint8_t((code * 256 + 242) / 243);
+            const int width = byte < 16 ? 16 : byte < 24 ? 8 : 2;
+            const int base = byte < 16 ? byte : byte < 24 ? 80 + byte - 16 : 120 + byte - 24;
+            for (int digit = 4; digit >= 0; --digit) {
+                const int trit = code % 3;
+                code /= 3;
+                if (byte < 24 || digit < 4)
+                    expected[b * 128 + base + digit * width] = scale * (trit - 1);
+            }
+        }
+    }
+    ggml_get_type_traits(GGML_TYPE_PTQ1_0)->to_float(bytes.data(), decoded.data(), decoded.size());
+    require(decoded == expected, "PTQ1_0 ternary packing differs from canonical codes");
+    require(ggml_validate_row_data(GGML_TYPE_PTQ1_0, bytes.data(), bytes.size()), "PTQ1_0 valid payload rejected");
+    require(!ggml_validate_row_data(GGML_TYPE_PTQ1_0, bytes.data(), bytes.size() - 1), "PTQ1_0 partial block accepted");
+    const uint16_t invalid = 0x7c00;
+    std::memcpy(bytes.data() + 26, &invalid, 2);
+    require(!ggml_validate_row_data(GGML_TYPE_PTQ1_0, bytes.data(), bytes.size()), "PTQ1_0 infinite scale accepted");
+    require(!ggml_validate_row_data(static_cast<ggml_type>(142), bytes.data(), 28), "undefined GGUF type accepted");
+}
+
+void deepseek_source(const std::filesystem::path& directory) {
+    using nlohmann::json;
+    auto* tensors = ggml_init({1 << 20, nullptr, false});
+    auto* file = gguf_init_empty();
+    gguf_set_val_str(file, "general.architecture", "deepseek41");
+    const json config{{"model_type", "deepseek_v41"}, {"text_config", {
+        {"model_type", "deepseek_v41_text"}, {"hidden_size", 256}, {"vocab_size", 3},
+        {"num_hidden_layers", 2}, {"engram_layer_ids", {1}}, {"engram_num_embeddings", {8}},
+        {"engram_max_ngram_size", 2}, {"engram_n_heads", 2}, {"engram_head_dim", 256},
+        {"engram_compressed_vocab_size", 2}, {"engram_pad_token_id", 0}}}};
+    gguf_set_val_str(file, "deepseek41.config", config.dump().c_str());
+    gguf_set_val_str(file, "deepseek41.engram.encoding", "e4m3_e8m0_32_row264");
+    const uint32_t layers[]{1}, rows[]{8}, primes[]{3, 5}, tokens[]{0, 1, 0};
+    const uint64_t multipliers[]{3, 5};
+    gguf_set_arr_data(file, "deepseek41.engram.layer_ids", GGUF_TYPE_UINT32, layers, 1);
+    gguf_set_arr_data(file, "deepseek41.engram.rows", GGUF_TYPE_UINT32, rows, 1);
+    gguf_set_arr_data(file, "deepseek41.engram.primes", GGUF_TYPE_UINT32, primes, 2);
+    gguf_set_arr_data(file, "deepseek41.engram.token_map", GGUF_TYPE_UINT32, tokens, 3);
+    gguf_set_arr_data(file, "deepseek41.engram.multipliers", GGUF_TYPE_UINT64, multipliers, 2);
+    gguf_set_val_u32(file, "deepseek41.engram.compressed_vocab_size", 2);
+    gguf_set_val_u32(file, "deepseek41.engram.pad_id", 0);
+    auto* embedding = ggml_new_tensor_2d(tensors, GGML_TYPE_F16, 256, 3);
+    ggml_set_name(embedding, "token_embd.weight");
+    std::memset(embedding->data, 0, ggml_nbytes(embedding));
+    gguf_add_tensor(file, embedding);
+    auto* engram = ggml_new_tensor_2d(tensors, GGML_TYPE_I8, 264, 8);
+    ggml_set_name(engram, "blk.1.engram_embd.weight");
+    for (std::size_t i = 0; i < ggml_nbytes(engram); ++i) static_cast<uint8_t*>(engram->data)[i] = uint8_t(i);
+    gguf_add_tensor(file, engram);
+    for (const auto& [stored, canonical] : std::map<std::string, std::string>{
+        {"hc_attn_fn.weight", "attention.mhc.pre.function"}, {"hc_ffn_base.weight", "mlp.mhc.pre.base"},
+        {"attn_q_a.weight", "attention.query_a.weight"}, {"attn_kv.weight", "attention.key_value.weight"},
+        {"attn_compressor_kv.weight", "attention.compressor.key_value.weight"},
+        {"indexer.attn_q_b.weight", "attention.indexer.query.weight"},
+        {"indexer.attn_k.weight", "attention.indexer.key.weight"}, {"indexer.proj.weight", "attention.indexer.score.weight"},
+        {"engram_q_norm.weight", "associative_memory.query.weight"},
+        {"engram_kv.weight", "associative_memory.projection.weight"},
+        {"exp_probs_b.bias", "mlp.router.bias"}, {"exp_probs_b_vl.bias", "mlp.router.vision_bias"}}) {
+        auto* tensor = ggml_new_tensor_2d(tensors, GGML_TYPE_F32, 32, 2);
+        ggml_set_name(tensor, ("blk.1." + stored).c_str());
+        std::memset(tensor->data, 0, ggml_nbytes(tensor));
+        gguf_add_tensor(file, tensor);
+    }
+    const auto path = directory / "deepseek.gguf";
+    require(gguf_write_to_file(file, path.string().c_str(), false), "DeepSeek fixture write failed");
+    const tyloi::GgufModelSource source(path);
+    require(json::parse(source.model_config_json()) == config, "DeepSeek embedded config changed");
+    const auto name = "model.block.1.associative_memory.embedding.weight";
+    const auto* table = source.find_tensor(name);
+    require(table && table->dtype == "GGUF_ENGRAM_MXFP8" && table->nbytes == 8 * 264 &&
+        *table->shape == std::vector<int64_t>({8, 256}), "DeepSeek Engram wire layout changed");
+    require(source.tensor_file_range(name).has_value() &&
+        source.read(name, 263, 3) == std::vector<std::byte>({std::byte{7}, std::byte{8}, std::byte{9}}),
+        "DeepSeek Engram row boundary or file mapping changed");
+    for (const auto* suffix : {"attention.mhc.pre.function", "mlp.mhc.pre.base", "attention.query_a.weight",
+        "attention.key_value.weight", "attention.compressor.key_value.weight", "attention.indexer.query.weight",
+        "attention.indexer.key.weight", "attention.indexer.score.weight", "associative_memory.query.weight",
+        "associative_memory.projection.weight", "mlp.router.bias", "mlp.router.vision_bias"})
+        require(source.find_tensor("model.block.1." + std::string(suffix)), "DeepSeek tensor alias missing");
+    const auto hash = source.read_asset("__mfq_asset__/deepseek-v41-engram-v1.bin");
+    require(hash.size() == 104 && std::memcmp(hash.data(), "MFQENGR1", 8) == 0,
+        "DeepSeek Engram hash asset layout differs");
+    const auto read_u64 = [&](std::size_t at) { uint64_t v; std::memcpy(&v, hash.data() + at, 8); return v; };
+    require(read_u64(36) == 8 && read_u64(44) == 3 && read_u64(52) == 5 &&
+        read_u64(60) == 0 && read_u64(68) == 3 && read_u64(76) == 3 && read_u64(84) == 5,
+        "DeepSeek Engram bucket offsets or multipliers differ");
+    const auto rejects = [&] {
+        require(gguf_write_to_file(file, path.string().c_str(), false), "invalid DeepSeek fixture write failed");
+        bool rejected = false;
+        try { tyloi::GgufModelSource invalid(path); } catch (const std::exception&) { rejected = true; }
+        require(rejected, "invalid DeepSeek GGUF accepted");
+    };
+    gguf_set_val_u32(file, "deepseek41.engram.pad_id", 1); rejects();
+    gguf_set_val_u32(file, "deepseek41.engram.pad_id", 0);
+    const uint32_t invalid_primes[]{3, 7};
+    gguf_set_arr_data(file, "deepseek41.engram.primes", GGUF_TYPE_UINT32, invalid_primes, 2); rejects();
+    gguf_set_arr_data(file, "deepseek41.engram.primes", GGUF_TYPE_UINT32, primes, 2);
+    gguf_set_val_str(file, "deepseek41.engram.encoding", "unknown"); rejects();
+    gguf_set_val_str(file, "deepseek41.engram.encoding", "e4m3_e8m0_32_row264");
+    auto invalid_config = config;
+    invalid_config["text_config"]["hidden_size"] = 128;
+    gguf_set_val_str(file, "deepseek41.config", invalid_config.dump().c_str()); rejects();
+    gguf_free(file); ggml_free(tensors);
+}
 
 void qwen4_source(const std::filesystem::path& directory) {
+    gyro_layout();
+    ptq1_layout();
     auto* tensors = ggml_init({2 << 20, nullptr, false});
     auto* main = gguf_init_empty();
     gguf_set_val_str(main, "general.architecture", "qwen4exp");
@@ -71,6 +379,10 @@ void qwen4_source(const std::filesystem::path& directory) {
         std::memcpy(static_cast<uint8_t*>(down->data) + offset, &scale, 2);
     }
     gguf_add_tensor(main, down);
+    auto* gate = ggml_new_tensor_3d(tensors, GGML_TYPE_PTQ1_0, 256, 3, 2);
+    ggml_set_name(gate, "blk.0.ffn_gate_exps.weight");
+    std::memset(gate->data, 0, ggml_nbytes(gate));
+    gguf_add_tensor(main, gate);
     auto* embedding = ggml_new_tensor_2d(tensors, GGML_TYPE_Q4_K, 256, 3);
     ggml_set_name(embedding, "token_embd.weight");
     std::memset(embedding->data, 0, ggml_nbytes(embedding));
@@ -79,8 +391,56 @@ void qwen4_source(const std::filesystem::path& directory) {
     ggml_set_name(qkv, "blk.0.attn_qkv.weight");
     std::memset(qkv->data, 0, ggml_nbytes(qkv));
     gguf_add_tensor(main, qkv);
+    const std::vector<int32_t> gu_types{143, 42, 143, 11}, down_types{42, 11, 143, 42};
+    const std::vector<int32_t> uniform_gu(4, 143);
+    std::map<std::string, std::vector<std::byte>> mixed_payloads;
+    for (const int layer : {1, 2}) {
+    for (const auto* role : {"gate", "up", "down"}) {
+        const auto& types = std::string_view(role) == "down" ? down_types : layer == 1 ? gu_types : uniform_gu;
+        auto& payload = mixed_payloads[std::to_string(layer) + role];
+        for (const auto type : {GGML_TYPE_PTQ1_0, GGML_TYPE_Q2_0, GGML_TYPE_Q3_K}) {
+            const auto count = std::count(types.begin(), types.end(), int32_t(type));
+            if (!count) continue;
+            auto* t = ggml_new_tensor_3d(tensors, type, 256, 3, count);
+            auto suffix = std::string(ggml_type_name(type));
+            std::transform(suffix.begin(), suffix.end(), suffix.begin(), [](unsigned char c) { return std::tolower(c); });
+            const auto name = "blk." + std::to_string(layer) + ".ffn_" + role + "_exps" +
+                (count == 4 ? std::string{} : "." + suffix) + ".weight";
+            ggml_set_name(t, name.c_str());
+            int slot = 0;
+            const auto bytes = ggml_row_size(type, 256) * 3;
+            for (int e = 0; e < 4; ++e) if (types[e] == type)
+                std::memset(static_cast<uint8_t*>(t->data) + slot++ * bytes, e + 17, bytes);
+            gguf_add_tensor(main, t);
+        }
+        for (int e = 0; e < 4; ++e) {
+            const auto bytes = ggml_row_size(static_cast<ggml_type>(types[e]), 256) * 3;
+            payload.insert(payload.end(), bytes, std::byte(e + 17));
+        }
+    }
+    for (const auto* kind : {"gu", "down"}) {
+        if (layer == 2 && std::string_view(kind) == "gu") continue;
+        auto* t = ggml_new_tensor_1d(tensors, GGML_TYPE_I32, 4);
+        const auto name = "blk." + std::to_string(layer) + ".ffn_exps_" + kind + "_type";
+        ggml_set_name(t, name.c_str());
+        const auto& values = std::string_view(kind) == "gu" ? gu_types : down_types;
+        std::memcpy(t->data, values.data(), 16);
+        gguf_add_tensor(main, t);
+    }
+    }
     const auto main_path = directory / "qwen4.gguf";
     require(gguf_write_to_file(main, main_path.string().c_str(), false), "Qwen4 main write failed");
+    auto* type_map = ggml_get_tensor(tensors, "blk.1.ffn_exps_gu_type");
+    for (const int32_t invalid : {142, 11}) {
+        static_cast<int32_t*>(type_map->data)[0] = invalid;
+        const auto invalid_path = directory / ("mixed-invalid-" + std::to_string(invalid) + ".gguf");
+        require(gguf_write_to_file(main, invalid_path.string().c_str(), false), "invalid mixed fixture write failed");
+        bool rejected = false;
+        try { tyloi::GgufModelSource invalid_source(invalid_path); }
+        catch (const std::runtime_error&) { rejected = true; }
+        require(rejected, "invalid mixed expert type or slot count accepted");
+    }
+    static_cast<int32_t*>(type_map->data)[0] = gu_types[0];
     auto* companion = gguf_init_empty();
     auto* ple = ggml_new_tensor_2d(tensors, GGML_TYPE_IQ4_NL, 128, 4);
     ggml_set_name(ple, "per_layer_token_embd.weight");
@@ -89,11 +449,70 @@ void qwen4_source(const std::filesystem::path& directory) {
     const auto table_path = directory / "ple.gguf";
     require(gguf_write_to_file(companion, table_path.string().c_str(), false), "Qwen4 PLE write failed");
     gguf_free(main); gguf_free(companion); ggml_free(tensors);
-    const tyloi::models::GgufSource source(main_path, {table_path});
+    raw_part_source(main_path, {table_path});
+    const tyloi::GgufModelSource source(main_path, {table_path});
+    for (const auto* role : {"gate", "up", "down"}) {
+        const auto name = std::string("model.block.1.mlp.experts.") + role + ".weight";
+        const auto* tensor = source.find_tensor(name);
+        require(tensor && tensor->dtype == "GGUF_MIXED" &&
+            *tensor->shape == std::vector<int64_t>({4, 3, 256}), "mixed expert bank was not normalized");
+        const auto& expected = mixed_payloads.at(std::string("1") + role);
+        require(source.read(name) == expected, "mixed expert bank did not preserve expert order");
+        require(!source.tensor_file_range(name), "mixed expert bank exposed a false contiguous file range");
+        std::vector<std::byte> partial(97), tail(17);
+        source.tensor_batch_reader(name)({{499, partial.data(), partial.size()}, {expected.size() - 17, tail.data(), tail.size()}});
+        require(std::equal(partial.begin(), partial.end(), expected.begin() + 499) &&
+            std::equal(tail.begin(), tail.end(), expected.end() - 17), "mixed expert cross-format range reads differ");
+        const auto batch = source.tensor_batch_reader(name);
+        std::vector<std::byte> reordered(320), duplicate(111), overlap(100), wanted(100);
+        batch({{expected.size() - 83, reordered.data(), 83}, {0, reordered.data() + 83, 111},
+            {91, reordered.data() + 194, 126}, {0, duplicate.data(), 111}, {expected.size(), nullptr, 0}});
+        require(std::equal(reordered.begin(), reordered.begin() + 83, expected.end() - 83) &&
+            std::equal(reordered.begin() + 83, reordered.begin() + 194, expected.begin()) &&
+            std::equal(reordered.begin() + 194, reordered.end(), expected.begin() + 91) &&
+            std::equal(duplicate.begin(), duplicate.end(), expected.begin()), "mixed expert reordered or duplicate reads differ");
+        std::copy_n(expected.begin(), wanted.size(), wanted.begin());
+        std::copy_n(expected.end() - 40, 40, wanted.begin() + 13);
+        batch({{0, overlap.data(), overlap.size()}, {expected.size() - 40, overlap.data() + 13, 40}});
+        require(overlap == wanted, "mixed expert overlapping destinations lost caller order");
+        std::fill(overlap.begin(), overlap.end(), std::byte{99});
+        bool invalid = false;
+        try { batch({{0, overlap.data(), overlap.size()}, {expected.size(), overlap.data(), 1}}); }
+        catch (const std::out_of_range&) { invalid = true; }
+        require(invalid && overlap == std::vector<std::byte>(100, std::byte{99}), "invalid mixed batch changed a destination");
+        invalid = false;
+        try { source.tensor_reader(name)(0, nullptr, 1); }
+        catch (const std::invalid_argument&) { invalid = true; }
+        require(invalid, "mixed scalar reader accepted a null destination");
+        tyloi::ModelSource::TensorReader retained;
+        tyloi::ModelSource::TensorBatchReader retained_batch;
+        {
+            const tyloi::GgufModelSource temporary(main_path, {table_path});
+            retained = temporary.tensor_reader(name);
+            retained_batch = temporary.tensor_batch_reader(name);
+        }
+        retained(expected.size(), nullptr, 0);
+        retained(91, duplicate.data(), duplicate.size());
+        retained_batch({{expected.size() - overlap.size(), overlap.data(), overlap.size()}});
+        require(std::equal(duplicate.begin(), duplicate.end(), expected.begin() + 91) &&
+            std::equal(overlap.begin(), overlap.end(), expected.end() - overlap.size()), "retained mixed reader expired");
+        const auto layouts = nlohmann::json::parse(source.metadata().at("gguf_mixed_experts"));
+        require(layouts.at(name).size() == 4 && layouts.at(name)[2]["dtype"] == "GGUF_PTQ1_0",
+            "mixed expert precision map was lost");
+    }
+    const auto* only_down = source.find_tensor("model.block.2.mlp.experts.down.weight");
+    require(only_down && only_down->dtype == "GGUF_MIXED" &&
+        source.read(only_down->name) == mixed_payloads.at("2down"), "Down-only mixed expert map was not normalized");
+    require(source.find_tensor("model.block.2.mlp.experts.gate.weight")->dtype == "GGUF_PTQ1_0",
+        "uniform Gate bank was changed by a mixed Down map");
     const auto* packed_down = source.find_tensor("model.block.0.mlp.experts.down.weight");
     require(packed_down && packed_down->dtype == "GGUF_Q2_0" && packed_down->nbytes == 108 &&
         *packed_down->shape == std::vector<int64_t>({2, 3, 64}), "GGUF Q2_0 expert metadata wrong");
-    const auto packed_bytes = read_tensor(source, packed_down->name);
+    const auto packed_bytes = source.read(packed_down->name);
+    const auto* packed_gate = source.find_tensor("model.block.0.mlp.experts.gate.weight");
+    require(packed_gate && packed_gate->dtype == "GGUF_PTQ1_0" && packed_gate->nbytes == 336 &&
+        *packed_gate->shape == std::vector<int64_t>({2, 3, 256}), "GGUF PTQ1_0 expert metadata wrong");
+    require(source.read(packed_gate->name) == std::vector<std::byte>(336), "GGUF PTQ1_0 payload changed");
     std::vector<float> decoded(384);
     ggml_get_type_traits(GGML_TYPE_Q2_0)->to_float(packed_bytes.data(), decoded.data(), decoded.size());
     for (std::size_t i = 0; i < decoded.size(); ++i)
@@ -149,7 +568,44 @@ void qwen4_source(const std::filesystem::path& directory) {
     float original_norm = 0;
     std::memcpy(&original_norm, predictor_norm.data() + 12, 4);
     require(original_norm == .25f, "raw MTP companion norm was converted as a folded main-model norm");
-    require(read_tensor(with_predictor, packed_down->name) == packed_bytes, "MTP companion changed backbone weights");
+    require(with_predictor.read(packed_down->name) == packed_bytes, "MTP companion changed backbone weights");
+    {
+        auto* canonical_tensors = ggml_init({3 << 20, nullptr, false});
+        auto* canonical = gguf_init_empty();
+        gguf_set_val_str(canonical, "general.architecture", "qwen4exp-mtp");
+        const auto add = [&](const char* name, ggml_type type, std::vector<int64_t> shape) {
+            std::reverse(shape.begin(), shape.end());
+            auto* tensor = ggml_new_tensor(canonical_tensors, type, int(shape.size()), shape.data());
+            ggml_set_name(tensor, name);
+            std::memset(tensor->data, 0, ggml_nbytes(tensor));
+            if (type == GGML_TYPE_F32)
+                for (int64_t i = 0; i < ggml_nelements(tensor); ++i) static_cast<float*>(tensor->data)[i] = 1.25f;
+            gguf_add_tensor(canonical, tensor);
+        };
+        add("predictor.embedding_norm.weight", GGML_TYPE_F32, {256});
+        add("predictor.hidden_norm.weight", GGML_TYPE_F32, {512});
+        add("predictor.fusion.embedding.weight", GGML_TYPE_BF16, {256, 256});
+        add("predictor.fusion.hidden.weight", GGML_TYPE_BF16, {256, 256});
+        add("predictor.block.0.attention.query.weight", GGML_TYPE_BF16, {512, 256});
+        add("predictor.block.0.mlp.router.weight", GGML_TYPE_F32, {4, 256});
+        add("predictor.block.0.mlp.experts.gate.weight", GGML_TYPE_Q2_0, {4, 128, 256});
+        add("predictor.block.0.mlp.experts.up.weight", GGML_TYPE_Q2_0, {4, 128, 256});
+        add("predictor.block.0.mlp.experts.down.weight", GGML_TYPE_Q2_0, {4, 256, 128});
+        add("predictor.output.weight", GGML_TYPE_Q6_K, {32, 256});
+        add("predictor.output.token_ids", GGML_TYPE_I64, {32});
+        const auto canonical_path = directory / "canonical-predictor.gguf";
+        require(gguf_write_to_file(canonical, canonical_path.string().c_str(), false), "canonical MTP write failed");
+        const tyloi::GgufModelSource canonical_source(main_path, {table_path, canonical_path});
+        const auto canonical_config = nlohmann::json::parse(canonical_source.model_config_json());
+        require(canonical_config["mtp_num_hidden_layers"] == 1, "canonical MTP layer count differs");
+        require(canonical_source.find_tensor("predictor.block.0.mlp.experts.gate.weight") &&
+            canonical_source.find_tensor("predictor.block.0.mlp.experts.up.weight") &&
+            canonical_source.find_tensor("predictor.output.token_ids"), "canonical MTP tensors were discarded");
+        const auto norm = canonical_source.read("predictor.embedding_norm.weight");
+        float delta = 0; std::memcpy(&delta, norm.data() + 12, 4);
+        require(delta == .25f, "canonical MTP norm no longer uses the backbone convention");
+        gguf_free(canonical); ggml_free(canonical_tensors);
+    }
     add_predictor("mtp.unsupported.weight", GGML_TYPE_F32, {1});
     require(gguf_write_to_file(predictor, predictor_path.string().c_str(), false), "GGUF invalid predictor write failed");
     bool unsupported_predictor = false;
@@ -157,6 +613,187 @@ void qwen4_source(const std::filesystem::path& directory) {
     catch (const std::runtime_error&) { unsupported_predictor = true; }
     require(unsupported_predictor, "GGUF predictor silently ignored unsupported tensors");
     gguf_free(predictor); ggml_free(predictor_tensors);
+    const auto mixed_reader = source.tensor_reader("model.block.1.mlp.experts.gate.weight");
+    const auto mixed_batch = source.tensor_batch_reader("model.block.1.mlp.experts.gate.weight");
+    std::filesystem::resize_file(main_path, 0);
+    std::byte target{};
+    bool truncated = false;
+    try { mixed_reader(0, &target, 1); } catch (const std::runtime_error&) { truncated = true; }
+    require(truncated, "mixed scalar reader accepted a truncated backing file");
+    truncated = false;
+    try { mixed_batch({{0, &target, 1}}); } catch (const std::runtime_error&) { truncated = true; }
+    require(truncated, "mixed batch reader accepted a truncated backing file");
+}
+}
+
+namespace {
+void compact_formats(const std::filesystem::path& directory) {
+    auto* tensors = ggml_init({2 << 20, nullptr, false});
+    auto* header = gguf_init_empty();
+    gguf_set_val_str(header, "general.architecture", "qwen35");
+    gguf_set_val_u32(header, "qwen35.embedding_length", 128);
+    gguf_set_val_u32(header, "qwen35.block_count", 1);
+    gguf_set_val_u32(header, "qwen35.attention.head_count", 1);
+    gguf_set_val_u32(header, "qwen35.attention.head_count_kv", 1);
+    gguf_set_val_u32(header, "qwen35.context_length", 32768);
+    gguf_set_val_f32(header, "qwen35.rope.freq_base", 10000.f);
+    gguf_set_val_u32(header, "agention.trellis.state_bits", 15);
+    std::vector<std::vector<std::byte>> payloads;
+    for (int type = GGML_TYPE_PTQ1_0; type <= GGML_TYPE_TQK4; ++type) {
+        auto* matrix = ggml_new_tensor_2d(tensors, ggml_type(type), 128, 7);
+        const auto name = "compact." + std::to_string(type) + ".weight";
+        ggml_set_name(matrix, name.c_str());
+        auto* bytes = static_cast<std::byte*>(matrix->data);
+        for (std::size_t i = 0; i < ggml_nbytes(matrix); ++i) bytes[i] = std::byte((i * 37 + type) % 256);
+        payloads.emplace_back(bytes, bytes + ggml_nbytes(matrix));
+        gguf_add_tensor(header, matrix);
+    }
+    const auto path = directory / "compact-formats.gguf";
+    require(gguf_write_to_file(header, path.string().c_str(), false), "compact GGUF write failed");
+    {
+        tyloi::GgufModelSource source(path);
+        for (int type = GGML_TYPE_PTQ1_0; type <= GGML_TYPE_TQK4; ++type) {
+            const auto name = "compact." + std::to_string(type) + ".weight";
+            const auto* tensor = source.find_tensor(name);
+            auto dtype = std::string("GGUF_") + ggml_type_name(ggml_type(type));
+            std::transform(dtype.begin(), dtype.end(), dtype.begin(), [](unsigned char c) { return std::toupper(c); });
+            require(tensor && tensor->dtype == dtype && *tensor->shape == std::vector<int64_t>({7, 128}),
+                "compact GGUF type/shape changed");
+            require(source.read(name) == payloads[type - GGML_TYPE_PTQ1_0], "compact GGUF changed original bytes");
+        }
+    }
+    gguf_set_val_u32(header, "prism.hadamard.version", 2);
+    gguf_set_val_u32(header, "prism.hadamard.block_size", 128);
+    gguf_set_val_str(header, "prism.hadamard.transform", "normalized-sylvester-walsh-hadamard");
+    gguf_set_val_str(header, "prism.hadamard.axis", "input-last-dimension");
+    gguf_set_val_str(header, "prism.hadamard.sign_mode", "explicit");
+    const int64_t widths[]{128};
+    std::array<int8_t, 128> signs{};
+    for (int i = 0; i < 128; ++i) signs[i] = (i * 17 + i / 7) % 3 ? -1 : 1;
+    gguf_set_arr_data(header, "prism.hadamard.sign_widths", GGUF_TYPE_INT64, widths, 1);
+    gguf_set_arr_data(header, "prism.hadamard.sign_values", GGUF_TYPE_INT8, signs.data(), signs.size());
+    std::vector<std::string> names;
+    for (int type = GGML_TYPE_PTQ1_0; type <= GGML_TYPE_TQK4; ++type)
+        names.push_back("compact." + std::to_string(type) + ".weight");
+    std::vector<const char*> name_pointers;
+    for (const auto& name : names) name_pointers.push_back(name.c_str());
+    gguf_set_arr_str(header, "prism.hadamard.weight_names", name_pointers.data(), name_pointers.size());
+    const auto rotated = directory / "compact-hadamard.gguf";
+    require(gguf_write_to_file(header, rotated.string().c_str(), false), "Hadamard metadata write failed");
+    {
+        tyloi::GgufModelSource source(rotated);
+        const auto transforms = nlohmann::json::parse(source.metadata().at("gguf_hadamard"));
+        require(transforms.size() == names.size() && source.metadata().at("gguf_requires_hadamard") == "true",
+            "Hadamard metadata/capability requirement missing");
+        const auto* parsed=source.hadamard_transforms();
+        require(parsed && parsed==source.hadamard_transforms() && parsed->size()==names.size(),
+            "Hadamard source did not retain one immutable parsed map");
+        for (const auto& name : names) require(transforms.at(name).at("block_size") == 128 &&
+            transforms.at(name).at("signs").get<std::vector<int8_t>>() == std::vector<int8_t>(signs.begin(), signs.end()),
+            "Hadamard signs or block size changed");
+        for(const auto& name:names)require(parsed->at(name).block_size==128 &&
+            parsed->at(name).signs==transforms.at(name).at("signs").get<std::vector<int8_t>>(),
+            "Typed Hadamard map differs from normalized metadata");
+    }
+    signs[3] = 0;
+    gguf_set_arr_data(header, "prism.hadamard.sign_values", GGUF_TYPE_INT8, signs.data(), signs.size());
+    const auto bad_sign = directory / "compact-invalid-sign.gguf";
+    require(gguf_write_to_file(header, bad_sign.string().c_str(), false), "invalid-sign fixture write failed");
+    bool sign_rejected = false;
+    try { tyloi::GgufModelSource source(bad_sign); }
+    catch (const std::runtime_error& error) { sign_rejected = std::string(error.what()).find("sign value") != std::string::npos; }
+    require(sign_rejected, "Hadamard accepted a non-sign value");
+    gguf_set_val_u32(header, "prism.hadamard.version", 1);
+    gguf_set_val_str(header, "prism.hadamard.sign_mode", "identity");
+    const auto identity = directory / "compact-hadamard-identity.gguf";
+    require(gguf_write_to_file(header, identity.string().c_str(), false), "identity-Hadamard fixture write failed");
+    {
+        tyloi::GgufModelSource source(identity);
+        const auto transforms = nlohmann::json::parse(source.metadata().at("gguf_hadamard"));
+        for (const auto& name : names) require(transforms.at(name).at("signs").empty(), "Identity Hadamard acquired signs");
+        for(const auto& name:names)require(source.hadamard_transforms()->at(name).signs.empty(),
+            "Typed identity Hadamard acquired signs");
+    }
+    gguf_set_val_u32(header, "agention.trellis.state_bits", 14);
+    const auto invalid = directory / "compact-invalid-state.gguf";
+    require(gguf_write_to_file(header, invalid.string().c_str(), false), "invalid-state fixture write failed");
+    bool rejected = false;
+    try { tyloi::GgufModelSource source(invalid); }
+    catch (const std::runtime_error& error) { rejected = std::string(error.what()).find("state_bits=15") != std::string::npos; }
+    require(rejected, "unsupported Gyro state width accepted");
+    gguf_free(header); ggml_free(tensors);
+}
+}
+
+namespace {
+void qwen35_nextn_source(const std::filesystem::path& directory) {
+    auto* tensors = ggml_init({1 << 20, nullptr, false});
+    auto* header = gguf_init_empty();
+    gguf_set_val_str(header, "general.architecture", "qwen35");
+    gguf_set_val_u32(header, "qwen35.embedding_length", 128);
+    gguf_set_val_u32(header, "qwen35.block_count", 3);
+    gguf_set_val_u32(header, "qwen35.attention.head_count", 1);
+    for (const auto* name : {"blk.0.attn_qkv.weight", "blk.1.attn_q.weight", "blk.2.attn_q.weight"}) {
+        auto* tensor = ggml_new_tensor_2d(tensors, GGML_TYPE_F16, 128, 128);
+        ggml_set_name(tensor, name);
+        std::memset(tensor->data, 0, ggml_nbytes(tensor));
+        gguf_add_tensor(header, tensor);
+    }
+    const auto path = directory / "qwen35-nextn.gguf";
+    for (const int predictors : {0, 1, 2}) {
+        gguf_set_val_u32(header, "qwen35.nextn_predict_layers", predictors);
+        require(gguf_write_to_file(header, path.string().c_str(), false), "NextN fixture write failed");
+        tyloi::GgufModelSource source(path);
+        const auto config = nlohmann::json::parse(source.model_config_json());
+        require(config.at("num_hidden_layers") == 3 - predictors && config.at("layer_types").size() == 3 - predictors,
+            "GGUF NextN blocks leaked into the ordinary backbone");
+        require(config.at("layer_types").at(0) == "linear_attention", "NextN changed the backbone attention types");
+        const auto nextn_query = predictors > 0 ?
+            "predictor.block." + std::to_string(predictors - 1) + ".attention.query.weight" :
+            "model.block.2.attention.query.weight";
+        require(source.find_tensor(nextn_query), "NextN tensor record was discarded");
+        require(config.at("mtp_num_hidden_layers") == 0, "partial NextN fixture advertised a complete MTP head");
+    }
+    for (int invalid = 0; invalid < 4; ++invalid) {
+        if (invalid == 0) gguf_set_val_u32(header, "qwen35.nextn_predict_layers", 3);
+        else if (invalid == 1) gguf_set_val_u32(header, "qwen35.nextn_predict_layers", 4);
+        else if (invalid == 2) gguf_set_val_i32(header, "qwen35.nextn_predict_layers", -1);
+        else gguf_set_val_f32(header, "qwen35.nextn_predict_layers", .5f);
+        require(gguf_write_to_file(header, path.string().c_str(), false), "invalid NextN fixture write failed");
+        bool rejected = false;
+        try { tyloi::GgufModelSource source(path); }
+        catch (const std::runtime_error& error) { rejected = std::string(error.what()).find("NextN layer count") != std::string::npos; }
+        require(rejected, "invalid GGUF NextN layer count accepted");
+    }
+    gguf_set_val_u32(header, "qwen35.nextn_predict_layers", 1);
+    for (const auto* suffix : {"enorm", "hnorm", "shared_head_norm"}) {
+        auto* tensor = ggml_new_tensor_1d(tensors, GGML_TYPE_F32, 128);
+        ggml_set_name(tensor, (std::string("blk.2.nextn.") + suffix + ".weight").c_str());
+        std::fill_n(static_cast<float*>(tensor->data), 128, .5f);
+        gguf_add_tensor(header, tensor);
+    }
+    auto* fusion = ggml_new_tensor_2d(tensors, GGML_TYPE_F16, 256, 128);
+    ggml_set_name(fusion, "blk.2.nextn.eh_proj.weight");
+    std::memset(fusion->data, 0, ggml_nbytes(fusion));
+    gguf_add_tensor(header, fusion);
+    require(gguf_write_to_file(header, path.string().c_str(), false), "MTP fixture write failed");
+    {
+        tyloi::GgufModelSource source(path);
+        const auto config = nlohmann::json::parse(source.model_config_json());
+        require(config.at("num_hidden_layers") == 2 && config.at("mtp_num_hidden_layers") == 1,
+            "GGUF NextN MTP geometry lost");
+        require(config.at("mtp_use_dedicated_embeddings") == false, "shared MTP embeddings became dedicated");
+        const auto* record = source.find_tensor("predictor.fusion.weight");
+        require(record && record->shape == std::vector<int64_t>{128, 256}, "GGUF NextN fusion layout differs");
+        for (const auto* name : {"predictor.embedding_norm.weight", "predictor.hidden_norm.weight", "predictor.output_norm.weight"})
+            require(source.find_tensor(name), "GGUF NextN normalization alias missing");
+        const auto norm = source.read("predictor.embedding_norm.weight");
+        float norm_value = 0;
+        std::memcpy(&norm_value, norm.data() + 12, sizeof(norm_value));
+        require(norm_value == .5f, "GGUF NextN changed the absolute normalization weights");
+        require(!source.find_tensor("model.block.2.attention.query.weight"), "MTP block remained in the backbone namespace");
+    }
+    gguf_free(header); ggml_free(tensors);
 }
 
 int main() {
@@ -186,6 +823,10 @@ int main() {
         gguf_add_tensor(gguf, norm);
         const auto path = directory / "model.gguf";
         require(gguf_write_to_file(gguf, path.string().c_str(), false), "GGUF write failed");
+        raw_part_source(path);
+        raw_part_source(path, {}, 2);
+        raw_part_source(path, {}, 2, 16, 0);
+        raw_part_source(path, {}, 2, 16, 2);
         gguf_set_val_u16(gguf, "split.count", 2);
         gguf_set_val_u16(gguf, "split.no", 0);
         gguf_set_val_i32(gguf, "split.tensors.count", 3);
@@ -215,11 +856,28 @@ int main() {
         gguf_free(gguf); ggml_free(tensors);
         auto source = tyloi::open_model_source(path);
         require(source->architecture() == "qwen35", "architecture lost");
+        const auto& layout=source->legacy_tensor_compatibility().layout;
+        require(layout.norm_weight_offset==0.0 && !layout.linear_attention_a_is_log &&
+            layout.qwen_gdn_gguf_layout,"canonical Qwen GGUF tensor conventions lost");
+        require(source->legacy_tensor_compatibility().canonical_to_stored.empty(),
+            "canonical GGUF source exposed raw-name remapping");
         const auto* table = source->find_tensor("model.token_embedding.weight");
         require(table && table->dtype == "GGUF_Q4_K" && *table->shape == std::vector<int64_t>({3, 256}), "GGUF quantized metadata wrong");
         const auto data = read_tensor(*source, table->name);
         require(data.size() == 3 * 144 && data.front() == std::byte{17}, "packed GGUF data changed");
-        const auto dense = read_tensor(*source, "model.output_norm.weight");
+        {
+            const auto mirror=directory/"mirror";std::filesystem::create_directory(mirror);
+            std::filesystem::copy_file(path,mirror/path.filename());
+            MirrorSetting setting(mirror);
+            tyloi::GgufModelSource mirrored(path);
+            const auto read=mirrored.tensor_reader(table->name);
+            const auto batch=mirrored.tensor_batch_reader(table->name);
+            std::array<std::byte,19> first{},last{};
+            read(0,first.data(),first.size());batch({{13,last.data(),last.size()}});
+            require(std::equal(first.begin(),first.end(),data.begin()) &&
+                std::equal(last.begin(),last.end(),data.begin()+13),"GGUF mirror integration changed original quantized bytes");
+        }
+        const auto dense = source->read("model.output_norm.weight");
         require(dense.size() == 12 + 256 * 4 && dense[0] == std::byte{1}, "dense prefix missing");
         float end = 0;
         std::memcpy(&end, dense.data() + dense.size() - 4, 4);
@@ -234,6 +892,10 @@ int main() {
         try { source->read_range_into(table->name, 1, nullptr, table->nbytes); } catch (const std::out_of_range&) { bounded = true; }
         require(bounded, "out-of-range GGUF read accepted");
         const auto reader = source->tensor_reader(table->name);
+        const auto io_before=source->file_read_stats();std::byte probe{};
+        reader(0,&probe,1);const auto io_after=source->file_read_stats();
+        require(io_after.files>0 && io_after.calls>io_before.calls &&
+            io_after.logical_bytes==io_before.logical_bytes+1,"GGUF reads or retained staging memory are missing from telemetry");
         source.reset();
         std::byte value{};
         reader(0, &value, 1);
@@ -242,7 +904,11 @@ int main() {
         bool truncated = false;
         try { tyloi::models::GgufSource invalid(path); } catch (const std::runtime_error&) { truncated = true; }
         require(truncated, "truncated GGUF accepted");
+        qwen35_nextn_source(directory);
         qwen4_source(directory);
+        qwen35_nextn_companion_source(directory);
+        compact_formats(directory);
+        deepseek_source(directory);
         std::filesystem::remove_all(directory);
         return 0;
     } catch (const std::exception& error) {

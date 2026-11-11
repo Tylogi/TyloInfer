@@ -124,7 +124,7 @@ std::vector<const tyloi::DenseTensor*> tyloi::MfeTensor::buffers() const {
     return result;
 }
 
-void tyloi::MfeTensor::record_stream(std::uintptr_t stream) const {
+void tyloi::MfeTensor::record_stream(std::uintptr_t stream, std::shared_ptr<void> lifetime) const {
     int cuda_device = -1;
     for (const auto& shard : shards) {
         if (cuda_device >= 0 && cuda_device != shard.device)
@@ -137,7 +137,7 @@ void tyloi::MfeTensor::record_stream(std::uintptr_t stream) const {
         cuda_device = buffer->get_device();
     }
     for (const auto* buffer : buffers())
-        if (buffer && buffer->defined()) buffer->record_stream(stream);
+        if (buffer && buffer->defined()) buffer->record_stream(stream, lifetime);
 }
 
 std::shared_ptr<::tyloi::TensorImpl> tyloi::MfeTensor::relocated(Device target) const {

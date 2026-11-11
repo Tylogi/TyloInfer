@@ -395,7 +395,8 @@ public:
         const array& expert_ids,
         const array& route_weights,
         const array* route_groups = nullptr) const {
-        if (gguf_ || affine_) return moe_weighted_reduce(routed_matmul(input, expert_ids), route_weights);
+        if (gguf_) return gguf_->routed_weighted_matmul(input, expert_ids, route_weights);
+        if (affine_) return moe_weighted_reduce(routed_matmul(input, expert_ids), route_weights);
         if (tq_) return tq_->routed_matmul_reduce(input, expert_ids, route_weights);
         if (mfq::mfq_compat_enabled && packed_) {
             return packed_->routed_matmul_reduce(
@@ -435,14 +436,29 @@ public:
         const MlxGgufWeight* shared_up = nullptr, const MlxGgufWeight* shared_down = nullptr,
         const array* shared_logits = nullptr) const {
         if (!gguf_ || !gguf_up_ || !down.gguf_) return std::nullopt;
+        if (gguf_->has_mixed_formats() || gguf_up_->has_mixed_formats() || down.gguf_->has_mixed_formats()) {
+            if (!gguf_->has_mixed_formats() || !gguf_up_->has_mixed_formats() || !down.gguf_->has_mixed_formats() ||
+                ids.shape(0) <= 8 || shared_gate || shared_up || shared_down || shared_logits) return std::nullopt;
+            const auto plan = gguf_route_plan(ids, gguf_->expert_count(), true);
+            const auto hidden = gguf_->routed_swiglu(*gguf_up_, input, ids, &plan);
+            return down.gguf_->routed_weighted_matmul(hidden, ids, weights, &plan);
+        }
+        if ((gguf_->has_hadamard() || gguf_up_->has_hadamard() || down.gguf_->has_hadamard()) &&
+            (shared_gate || shared_up || shared_down || shared_logits)) return std::nullopt;
+        const bool compact = gguf_compact_ffn_available(*gguf_, *gguf_up_, *down.gguf_, ids);
+        if (!compact && !gguf_->has_staged_planes() && !gguf_up_->has_staged_planes() && gguf_short_sparse_routes(ids, gguf_->expert_count())) {
+            if (ids.shape(0) <= 6 || shared_gate || shared_up || shared_down || shared_logits) return std::nullopt;
+            const auto plan = gguf_route_plan(ids, gguf_->expert_count());
+            return down.gguf_->routed_weighted_matmul(gguf_->routed_swiglu(*gguf_up_, input, ids, &plan), ids, weights, &plan);
+        }
         const int tile = gguf_prefill_tile_rows(*gguf_, *gguf_up_, *down.gguf_, ids);
-        if (!gguf_expert_prefill_available(input) &&
-            !(tile == 8 && gguf_->has_staged_planes() && gguf_up_->has_staged_planes() && down.gguf_->has_staged_planes()))
+        if (!gguf_expert_prefill_available(input) && !compact)
             return std::nullopt;
         if (tile == 16 && (gguf_->has_staged_planes() || gguf_up_->has_staged_planes() || down.gguf_->has_staged_planes()))
             return std::nullopt;
         const bool shared = shared_gate && shared_up && shared_down && shared_logits;
-        if (shared && (tile == 16 || shared_gate->input_size() != gguf_->input_size() ||
+        if (shared && (tile == 16 || !shared_gate->has_staged_planes() || !shared_up->has_staged_planes() ||
+            !shared_down->has_staged_planes() || shared_gate->input_size() != gguf_->input_size() ||
             shared_gate->output_size() != gguf_->output_size() || shared_up->input_size() != gguf_up_->input_size() ||
             shared_up->output_size() != gguf_up_->output_size() || shared_down->input_size() != down.gguf_->input_size() ||
             shared_down->output_size() != down.gguf_->output_size())) return std::nullopt;
@@ -793,12 +809,15 @@ private:
                 return std::nullopt;
             };
             const auto lower = convert(down_), upper = convert(up_);
-            if (lower && upper && (!injection_ || injection_->dense_weight_ref() || injection_->affine_weight_ref())) {
+            if (lower && upper && (!injection_ || injection_->dense_weight_ref() ||
+                injection_->affine_weight_ref() || injection_->gguf_weight_ref())) {
                 native_hyper_.emplace(std::array{*lower, *upper});
                 native_norm_.emplace(mlx::core::astype(norm_, mlx::core::float32) + array(1.f));
                 if (injection_) {
                     if (const auto* weight = injection_->dense_weight_ref())
                         native_inject_.emplace(mlx::core::astype(*weight, mlx::core::float32));
+                    else if (const auto* weight = injection_->gguf_weight_ref())
+                        native_inject_.emplace(weight->dequantize(mlx::core::float32));
                     else native_inject_.emplace(injection_->affine_weight_ref()->dequantize(mlx::core::float32));
                 }
                 native_norm_->eval(); MlxWeightResidency::track(*native_norm_);
@@ -1054,7 +1073,7 @@ public:
                 const auto shared = prefix + ".shared_expert." + projection + ".weight";
                 use_native &= model.contains(routed) && model.contains(shared);
                 if (model.contains(routed) && model.contains(shared)) {
-                    gguf &= is_gguf_dtype(model.record(routed).dtype) && is_gguf_dtype(model.record(shared).dtype);
+                    gguf &= MlxGgufWeight::supports_native(model, routed) && MlxGgufWeight::supports_native(model, shared);
                     affine &= MlxAffineWeight::supports_native(model, routed) && MlxAffineWeight::supports_native(model, shared);
                 }
             }
@@ -2981,7 +3000,7 @@ private:
         MlxRmsNorm output_norm,
         MlxLinear output)
         : config_(std::move(config)),
-          qkv_(std::move(qkv)),
+          qkv_(coalesce_qk(std::move(qkv))),
           gate_(std::move(gate)),
           alpha_(std::move(alpha)),
           beta_(std::move(beta)),
@@ -2999,6 +3018,7 @@ private:
         const int hidden = static_cast<int>(config_.hidden_size);
         const std::vector<int> widths = qkv_.size() == 3
             ? std::vector<int>{key_width(), key_width(), value_width()}
+            : qkv_.size() == 2 ? std::vector<int>{2 * key_width(), value_width()}
             : std::vector<int>{2 * key_width() + value_width()};
         if (qkv_.size() != widths.size())
             throw std::runtime_error("invalid Qwen4 GDN projection count");
@@ -3082,12 +3102,26 @@ private:
         }
     }
 
+    static std::vector<MlxLinear> coalesce_qk(std::vector<MlxLinear> projections) {
+        if (projections.size() == 3) {
+            const auto* query = projections[0].tq_weight_ref();
+            const auto* key = projections[1].tq_weight_ref();
+            if (query && key && query->experts() == 1 && key->experts() == 1
+                && query->output_size() == key->output_size() && query->can_concatenate_rows(*key)) {
+                projections[0] = MlxLinear(MlxTqWeight::concatenate_projections({*query, *key}));
+                projections.erase(projections.begin() + 1);
+            }
+        }
+        return projections;
+    }
+
     std::vector<array> project_inputs(const array& hidden) const {
         auto projected = input_projections_(hidden);
         if (qkv_.size() == 3)
             return {mlx::core::concatenate({projected[0], projected[1]}, -1),
                 std::move(projected[2]), std::move(projected[3]),
                 std::move(projected[4]), std::move(projected[5])};
+        if (qkv_.size() == 2) return projected;
         auto qkv = mlx::core::split(projected[0], Shape{2 * key_width()}, -1);
         return {std::move(qkv[0]), std::move(qkv[1]), std::move(projected[1]),
             std::move(projected[2]), std::move(projected[3])};
@@ -3553,8 +3587,15 @@ public:
         }
         for (auto& value : input_projections)
             if (value.dtype() != hidden.dtype()) value = mlx::core::astype(value, hidden.dtype());
+        const bool use_prologue = !config_.yarn.enabled && qsa_decode_prologue_enabled() &&
+            batch == 1 && tokens >= 1 && tokens <= MlxQwen4CausalLm::maximum_verification_rows &&
+            positions_current.dtype() == mlx::core::int32 && positions_current.shape() == Shape{tokens} &&
+            query_norm_.eps() == key_norm_.eps() && query_norm_.eps() == index_query_norm_.eps();
+        auto* lora = MlxMtpLora::current();
+        std::optional<array> separate_gate;
         auto query_full = std::move(input_projections[0]);
-        if (gate_) {
+        if (gate_ && use_prologue && !(lora && lora->active())) separate_gate = input_projections[4];
+        else if (gate_) {
             const Shape heads{batch, tokens, static_cast<int>(config_.num_attention_heads),
                 static_cast<int>(config_.head_dim)};
             query_full = mlx::core::reshape(mlx::core::concatenate({
@@ -3562,7 +3603,7 @@ public:
                 mlx::core::reshape(input_projections[4], heads)}, -1),
                 Shape{batch, tokens, static_cast<int>(2 * config_.num_attention_heads * config_.head_dim)});
         }
-        if (auto* lora = MlxMtpLora::current(); lora && lora->active()) {
+        if (lora && lora->active()) {
             auto parts = mlx::core::split(mlx::core::reshape(query_full,
                 {batch, tokens, int(config_.num_attention_heads), 2 * int(config_.head_dim)}), 2, -1);
             auto q = lora->apply("attention.q", hidden, mlx::core::reshape(parts[0],
@@ -3580,12 +3621,7 @@ public:
                 config_.indexer_n_heads * config_.indexer_head_dim)},
             -1);
         auto prologue = [&]() -> MlxQwen4QsaDecodePrologue {
-            if (!config_.yarn.enabled && qsa_decode_prologue_enabled() &&
-                batch == 1 && tokens >= 1 && tokens <= MlxQwen4CausalLm::maximum_verification_rows &&
-                positions_current.dtype() == mlx::core::int32 &&
-                positions_current.shape() == Shape{tokens} &&
-                query_norm_.eps() == key_norm_.eps() &&
-                query_norm_.eps() == index_query_norm_.eps()) {
+            if (use_prologue) {
                 return qwen4_qsa_decode_prologue(
                     query_full,
                     key_full,
@@ -3603,7 +3639,7 @@ public:
                     static_cast<float>(config_.rope_theta),
                     query_norm_.eps(), use_cache && (offloaded_kv_ || !cache_ || !cache_->quantized()) ? &value_full : nullptr,
                     use_cache && batch_ == batch && (offloaded_kv_ || (cache_ && !cache_->quantized())) &&
-                        cache_position() >= config_.indexer_budget);
+                        cache_position() >= config_.indexer_budget, separate_gate ? &*separate_gate : nullptr);
             }
             auto query_parts = mlx::core::split(
                 mlx::core::reshape(
@@ -3947,13 +3983,16 @@ private:
                                 mlx::core::reshape(query_gate, heads), mlx::core::reshape(projected[4], heads)}, -1),
                                 Shape{1, rows, static_cast<int>(2 * config_.num_attention_heads * config_.head_dim)});
                         }
-                        for (const bool half_query : {false, true}) {
-                            const auto cached = qwen4_qsa_decode_prologue(query_gate, projected[1], projected[3],
+                        for (const bool half_query : {false, true}) for (const bool separate : {false, true})
+                            for (const bool cached_outputs : {false, true}) {
+                            if (separate && !gate_) continue;
+                            const auto cached = qwen4_qsa_decode_prologue(separate ? projected[0] : query_gate, projected[1], projected[3],
                                 query_norm_.weight(), key_norm_.weight(), index_query_norm_.weight(), mlx::core::zeros({rows}, mlx::core::int32),
                                 static_cast<int>(config_.num_attention_heads), static_cast<int>(config_.num_key_value_heads),
                                 static_cast<int>(config_.indexer_n_heads), static_cast<int>(config_.head_dim),
                                 static_cast<int>(config_.indexer_head_dim), static_cast<int>(config_.rotary_dim),
-                                static_cast<float>(config_.rope_theta), query_norm_.eps(), &projected[2], half_query);
+                                static_cast<float>(config_.rope_theta), query_norm_.eps(), cached_outputs ? &projected[2] : nullptr, half_query,
+                                separate ? &projected[4] : nullptr);
                             preparation->add(cached.query);
                         }
                     }

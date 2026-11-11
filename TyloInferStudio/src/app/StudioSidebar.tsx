@@ -1,4 +1,5 @@
-import { useEffect, type ComponentProps } from 'react';
+import { useEffect, useState, type ComponentProps } from 'react';
+import { CaretRightIcon } from '@phosphor-icons/react';
 import { useLocation, useNavigate } from 'react-router';
 import { useRuntime } from './RuntimeProvider';
 import { useSettings } from '../features/settings/SettingsProvider';
@@ -38,14 +39,11 @@ export function StudioSidebar() {
   const { dashboardPage, labPage } = currentLocation;
   const view = isStudioPath(location.pathname) ? currentLocation.view : 'not-found';
   const activeRequests = Number(runtime?.active_requests || 0);
+  const [toolsOpen, setToolsOpen] = useState(true);
 
   useEffect(() => { closeSidebar(); }, [location.pathname, closeSidebar]);
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if ((event.ctrlKey || event.metaKey) && event.key === ',') {
-        event.preventDefault();
-        navigate('/settings');
-      }
       if (event.key === 'Escape') closeSidebar();
     };
     window.addEventListener('keydown', onKeyDown);
@@ -66,23 +64,13 @@ export function StudioSidebar() {
       { label: ['资源', 'Resources'], icon: 'droplet', path: dashboard('cache'),
         active: view === 'dashboard' && dashboardPage === 'cache', current: true },
     ] },
-    { label: ['交互', 'Playground'], items: [
-      { label: ['对话', 'Chat'], icon: 'chat', path: '/chat', active: view === 'chat', current: true },
-      { label: ['应用', 'Applications'], icon: 'link', path: '/applications', active: view === 'applications' },
-    ] },
     { label: ['工具', 'Tools'], items: [
       { label: ['分析', 'Analysis'], icon: 'search', path: lab('analysis'),
         active: view === 'lab' && labPage === 'analysis' },
       { label: ['下载', 'Downloads'], icon: 'download', path: lab('models'),
         active: view === 'lab' && labPage === 'models' },
-      { label: ['测评', 'Evaluations'], icon: 'activity', path: lab('evaluations'),
-        active: view === 'lab' && labPage === 'evaluations' },
-    ] },
-    { label: ['系统', 'System'], items: [
       { label: ['日志', 'Logs'], icon: 'scroll', path: dashboard('logs'),
         active: view === 'dashboard' && dashboardPage === 'logs', current: true },
-      { label: ['设置', 'Settings'], icon: 'settings', path: '/settings',
-        active: view === 'dashboard' && dashboardPage === 'settings', current: true },
     ] },
   ];
 
@@ -102,7 +90,11 @@ export function StudioSidebar() {
           <nav className="sectioned-nav" aria-label={tr('推理', 'Inference')}>
             {groups.map((group) => (
               <section key={group.label[1]}>
-                <div className="sidebar-group-label">{tr(...group.label)}</div>
+                {group.label[1] === 'Tools' ? <button className="sidebar-group-toggle sidebar-section-heading" type="button" aria-expanded={toolsOpen}
+                  aria-controls="sidebar-tools" onClick={() => setToolsOpen(value => !value)}>
+                  <span>{tr(...group.label)}</span><CaretRightIcon size={10} weight="fill" />
+                </button> : <div className="sidebar-group-label sidebar-section-heading">{tr(...group.label)}</div>}
+                <div id={group.label[1] === 'Tools' ? 'sidebar-tools' : undefined} className="sidebar-nav-items" hidden={group.label[1] === 'Tools' && !toolsOpen}>
                 {group.items.map((item) => (
                   <button
                     aria-current={item.active ? 'page' : undefined}
@@ -116,6 +108,7 @@ export function StudioSidebar() {
                     {item.count != null && <span>{formatNumber(item.count)}</span>}
                   </button>
                 ))}
+                </div>
               </section>
             ))}
           </nav>

@@ -1,20 +1,20 @@
 #include "execution_fixture.h"
-#include "env.h"
-#include "storage/weights/moe/expert_cache.h"
-#include "storage/weights/moe/expert_cache_internal.h"
+#include "engine/backends/cuda/native/env.h"
+#include "engine/weights/moe/expert_cache.h"
+#include "engine/weights/moe/expert_cache_internal.h"
 #include "execution/moe_ffn_pipeline.h"
-#include "storage/weights/moe/quant_range_source.h"
-#include "storage/weights/moe/pinned_expert_arena.h"
-#include "storage/weights/loaders/weight.h"
-#include "execution/decode_window.h"
+#include "engine/weights/moe/quant_range_source.h"
+#include "engine/weights/moe/pinned_expert_arena.h"
+#include "engine/weights/loader.h"
+#include "engine/backends/cuda/executor/decode_window.h"
 #include "storage/weights/moe/native_dma_batch.h"
-#include "context.h"
+#include "engine/backends/cuda/native/context.h"
 #include "tyloinfer/runtime.h"
 #include "nint_prefill_cache.h"
 #include "mfe_ffn_runtime.h"
-#include "models/common/ffn.h"
-#include "mfq_cuda_activation_ops.h"
-#include "format.h"
+#include "engine/models/common/ffn.h"
+#include "engine/backends/cuda/kernels/mfq_cuda_activation_ops.h"
+#include "engine/weights/format.h"
 #include <array>
 #include <chrono>
 #include <condition_variable>
@@ -304,12 +304,16 @@ void check_packed_metadata() {
 }
 void check_pinned_arena() {
     auto arena=std::make_shared<MoePinnedExpertArena>(1024);
+    check(arena->largest_free_bytes()==1024,"empty pinned arena lost its free interval size");
     auto a=arena->allocate(255),b=arena->allocate(256),c=arena->allocate(512);
     check(a && b && c && arena->used_bytes()==1024,"pinned expert allocations were not bounded and aligned");
     check(!arena->allocate(16),"pinned expert arena exceeded its capacity");
+    check(arena->largest_free_bytes()==0,"full pinned arena reported a free interval");
     a.reset();c.reset();
+    check(arena->largest_free_bytes()==512,"fragmented pinned arena counted separated free intervals as contiguous");
     check(!arena->allocate(768),"pinned arena reused an interval protected by a live lease");
     b.reset();
+    check(arena->largest_free_bytes()==1024,"pinned arena free size did not follow interval coalescing");
     auto joined=arena->allocate(1024);
     check(joined && joined->data()==arena->data(),"pinned expert intervals did not coalesce");
     auto storage=arena->tensor();arena.reset();

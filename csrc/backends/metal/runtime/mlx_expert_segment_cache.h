@@ -14,6 +14,14 @@ struct MlxExpertSegment {
     std::string tensor;
     std::uint64_t offset = 0;
     std::size_t expert_bytes = 0;
+    std::vector<std::uint64_t> expert_offsets;
+    std::vector<std::size_t> expert_sizes;
+    std::uint64_t begin(int expert) const noexcept {
+        return expert_offsets.empty() ? offset + std::uint64_t(expert) * expert_bytes : expert_offsets[expert];
+    }
+    std::size_t size(int expert) const noexcept {
+        return expert_sizes.empty() ? expert_bytes : expert_sizes[expert];
+    }
 };
 struct MlxExpertSegments {
     int experts = 0;
@@ -30,6 +38,7 @@ public:
         const mlx::core::array* parallel = nullptr);
     const std::vector<mlx::core::array>& address_tables(std::size_t layer) const;
     const std::shared_ptr<MlxWeightResidency>& residency() const noexcept;
+    void set_prefill_next_rows(std::size_t layer, std::size_t rows);
     std::size_t limit_bytes() const noexcept;
     std::size_t backing_bytes() const noexcept;
     std::size_t resident_bytes() const noexcept;

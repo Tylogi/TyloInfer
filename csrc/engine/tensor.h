@@ -335,7 +335,7 @@ struct TensorStorage {
     std::size_t bytes = 0;
     Device device{};
     bool pinned = false;
-    std::function<void(std::uintptr_t)> record_stream;
+    std::function<void(std::uintptr_t,std::shared_ptr<void>)> record_stream;
 };
 
 class IntArrayRef {
@@ -465,7 +465,7 @@ public:
     // which publishes a new one through relocated(); a published weight is
     // never rewritten in place.
     virtual std::vector<const DenseTensor*> buffers() const = 0;
-    virtual void record_stream(std::uintptr_t stream) const = 0;
+    virtual void record_stream(std::uintptr_t stream, std::shared_ptr<void> lifetime = {}) const = 0;
 
     // Backing buffers that exist, derived from buffers().
     std::vector<std::shared_ptr<TensorStorage>> backings() const;
@@ -522,10 +522,11 @@ public:
     DenseTensor& dense() noexcept { return *this; }
     std::vector<const DenseTensor*> buffers() const override { return {this}; }
     std::shared_ptr<TensorImpl> relocated(Device device) const override;
+    std::weak_ptr<void> weak_storage_owner() const noexcept { return storage_; }
     const std::shared_ptr<TensorStorage>& storage() const noexcept { return storage_; }
     std::size_t byte_offset() const noexcept { return byte_offset_; }
-    void record_stream(std::uintptr_t stream) const override {
-        if (storage_ && storage_->record_stream) storage_->record_stream(stream);
+    void record_stream(std::uintptr_t stream, std::shared_ptr<void> lifetime = {}) const override {
+        if (storage_ && storage_->record_stream) storage_->record_stream(stream, lifetime);
     }
 
     ScalarType dtype() const noexcept { return TensorImpl::dtype(); }
@@ -803,7 +804,7 @@ public:
     bool is_encoded() const noexcept { return reference().is_encoded(); }
     std::vector<const DenseTensor*> buffers() const { return reference().buffers(); }
     std::vector<std::shared_ptr<TensorStorage>> backings() const { return reference().backings(); }
-    void record_stream(std::uintptr_t stream) const { reference().record_stream(stream); }
+    void record_stream(std::uintptr_t stream, std::shared_ptr<void> lifetime = {}) const { reference().record_stream(stream, lifetime); }
     Tensor relocated(Device device) const { return Tensor{reference().relocated(device)}; }
 
     ScalarType dtype() const noexcept { return reference().dtype(); }

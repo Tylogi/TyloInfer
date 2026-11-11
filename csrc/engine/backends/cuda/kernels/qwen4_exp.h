@@ -1,7 +1,7 @@
 #pragma once
 #include "mfq_cuda_kv_hot_cache.h"
 
-#include "backend.h"
+#include "engine/backends/cuda/native/tensor/backend.h"
 
 #include <optional>
 #include <vector>
@@ -21,6 +21,10 @@ std::vector<DenseTensor> gated_residual_pre(
     int64_t hc_count, double eps);
 DenseTensor gated_residual_post(
     const DenseTensor&, const DenseTensor&, const DenseTensor&, int64_t hc_count);
+// Writes a compatible FP16/FP32 output directly; exact residual aliasing is
+// supported. Unsupported views/types/overlap return false without writing.
+bool try_gated_residual_post_out(const DenseTensor& branch,const DenseTensor& residual,
+    const DenseTensor& injection,const DenseTensor& output,int64_t hc_count);
 std::vector<DenseTensor> gated_residual_post_norm(
     const DenseTensor& branch, const DenseTensor& residual, const DenseTensor& injection,
     const DenseTensor& norm, int64_t hc_count, double eps);
@@ -31,6 +35,14 @@ std::vector<DenseTensor> live_index_pool(const DenseTensor& index, const DenseTe
     const DenseTensor& cache_positions, int64_t pool, int64_t maximum);
 DenseTensor live_topk_blocks(const DenseTensor& scores, const DenseTensor& cache_positions,
     int64_t pool, int64_t count);
+DenseTensor live_topk_selected_tokens(const DenseTensor& scores, const DenseTensor& cache_positions,
+    int64_t pool, int64_t count, int64_t budget);
+// [1,queries,ceil((budget+pool-1)/pool),2] int32 (block ID, token mask).
+// Whole-block budgets and pool widths up to 32 are supported.
+// Returns the selected block set with causal masks. Order is unspecified;
+// equal scores prefer lower block IDs. Attention does not depend on rank order.
+DenseTensor live_topk_selected_blocks(const DenseTensor& scores, const DenseTensor& cache_positions,
+    int64_t pool, int64_t count, int64_t budget);
 std::vector<DenseTensor> ple_dilated_conv_silu(
     const DenseTensor&, const DenseTensor&, const std::optional<DenseTensor>& state,
     int64_t dilation);

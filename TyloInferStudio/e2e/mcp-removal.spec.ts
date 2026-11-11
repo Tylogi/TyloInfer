@@ -2,7 +2,7 @@ import { expect, test } from '@playwright/test';
 import { mockStudioServer } from './mockServer';
 
 for (const language of ['zh-CN', 'en'] as const) {
-  test(`service and chat have no managed MCP dependency (${language})`, async ({ page }, testInfo) => {
+  test(`service has no managed MCP dependency (${language})`, async ({ page }, testInfo) => {
     const state = await mockStudioServer(page, { language });
     await page.route('**/api/v1/runtime/model-aliases', route => route.fulfill({ json: { aliases: {} } }));
     await page.route('**/api/v1/runtime/memory-policy', route => route.fulfill({ json: {
@@ -15,6 +15,7 @@ for (const language of ['zh-CN', 'en'] as const) {
     const errors: string[] = [];
     page.on('pageerror', error => errors.push(error.message));
     await page.goto('/runtime');
+    await page.getByRole('tab', { name: language === 'zh-CN' ? '高级' : 'Advanced', exact: true }).click();
     await expect(page.getByText(language === 'zh-CN' ? '远程路由' : 'Remote routing', { exact: true })).toBeVisible();
     await expect(page.getByRole('textbox', { name: language === 'zh-CN' ? '节点名称' : 'Node name' })).toBeVisible();
     await expect(page.getByText('MCP', { exact: true })).toHaveCount(0);
@@ -28,10 +29,6 @@ for (const language of ['zh-CN', 'en'] as const) {
       });
     })).toBe(true);
     await page.screenshot({ path: testInfo.outputPath('remote-routing.png'), animations: 'disabled' });
-    await page.goto('/chat');
-    await expect(page.locator('main h1')).toBeVisible();
-    expect(state.requests.some(request => request.includes('/mcp/'))).toBe(false);
-    expect(state.unexpected).toEqual([]);
     expect(errors).toEqual([]);
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
   });

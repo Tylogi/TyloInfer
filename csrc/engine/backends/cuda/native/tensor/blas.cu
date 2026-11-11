@@ -1,6 +1,6 @@
-#include "env.h"
+#include "engine/backends/cuda/native/env.h"
 #include "ops_common.cuh"
-#include "matmul_rows.h"
+#include "engine/backends/cuda/native/matmul_rows.h"
 #include "engine/backends/cuda/native/context.h"
 #include "engine/backends/cuda/native/stream.h"
 #include "engine/backends/cuda/native/device.h"
@@ -266,8 +266,7 @@ DenseTensor matmul(const DenseTensor& left_source, const DenseTensor& right_sour
     DeviceGuard guard(left.get_device());
     auto context = default_context(left.get_device());
     const auto stream = current_stream(left.get_device()).stream();
-    if(!row_pipeline_handle)context->blas().set_stream(stream);
-    const auto handle = row_pipeline_handle?row_pipeline_handle:context->blas().get();
+    const auto handle = row_pipeline_handle?row_pipeline_handle:context->blas(stream).get();
     const auto data_type = cuda_data_type(left.scalar_type());
 
     const bool left_row_major = left.stride(-1) == 1;
