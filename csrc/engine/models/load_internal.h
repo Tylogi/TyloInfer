@@ -154,7 +154,7 @@ inline constexpr auto with_model = []<typename F>(
             auto state = std::make_unique<minicpmo45::text::State>(*owner);
             state->preallocate();
             auto executor = execution.executor().fork(model_parallel_primary_device(execution.config));
-            auto components = minicpmo45::load_components(*owner, *state, *executor, weights,
+            auto components = minicpmo45::load_components(*owner, *executor, weights,
                 load_optional_components, execution);
             return finish(owner, state, executor, components, started);
         }

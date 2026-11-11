@@ -16,7 +16,6 @@
 
 MiniCPMO45Runtime MiniCPMO45Runtime::load(
         const tyloi::cuda::minicpmo45::text::Model& language,
-        tyloi::cuda::minicpmo45::text::State& language_state,
         tyloi::cuda::Executor& language_executor,
         const tyloi::weights::Loader& weights,
         CudaExecutionContext& execution) {
@@ -25,7 +24,7 @@ MiniCPMO45Runtime MiniCPMO45Runtime::load(
 #ifndef TYLOINFER_NATIVE_CUDA
     auto projector = execution.executor().projector(execution.executor().mode().ffn, model_parallel_primary_device(execution.config));
 #endif
-    return {language, language_state, language_executor, execution,
+    return {language, language_executor, execution,
             MiniCPMO45VisionEncoder::load(weights),
             MiniCPMO45Resampler::load(weights),
             MiniCPMO45AudioEncoder::load(weights),
@@ -39,31 +38,31 @@ MiniCPMO45Runtime MiniCPMO45Runtime::load(
 
 namespace tyloi::cuda::minicpmo45 {
 
-std::unique_ptr<Components> load_components(text::Model& model, text::State& state,
+std::unique_ptr<Components> load_components(text::Model& model,
         Executor& executor, const tyloi::weights::Loader& weights,
         bool load_optional_components, CudaExecutionContext& execution) {
     if (!load_optional_components || model.plan.vision == CudaVisionAdapter::none)
         return nullptr;
     if (model.plan.vision != CudaVisionAdapter::minicpmo45)
         throw std::runtime_error("unsupported MiniCPM-o CUDA vision adapter");
-    return std::make_unique<Components>(model, state, executor, weights, execution);
+    return std::make_unique<Components>(model, executor, weights, execution);
 }
 
 struct Components::State {
     MiniCPMO45Runtime runtime;
     std::optional<MiniCPMO45DuplexSession> duplex_session;
 
-    State(const text::Model& language, text::State& language_state,
+    State(const text::Model& language,
           Executor& language_executor, const tyloi::weights::Loader& weights,
           CudaExecutionContext& execution)
-        : runtime(MiniCPMO45Runtime::load(language, language_state, language_executor,
+        : runtime(MiniCPMO45Runtime::load(language, language_executor,
                                          weights, execution)) {}
 };
 
-Components::Components(const text::Model& language, text::State& language_state,
+Components::Components(const text::Model& language,
                        Executor& language_executor, const tyloi::weights::Loader& weights,
                        CudaExecutionContext& execution)
-    : state_(std::make_unique<State>(language, language_state, language_executor, weights,
+    : state_(std::make_unique<State>(language, language_executor, weights,
                                      execution)) {}
 
 Components::~Components() = default;
@@ -319,7 +318,7 @@ MfqDuplexStepResult Components::step(const MfqDuplexStepInput& input) {
         response.end_of_turn = result.end_of_turn;
         response.tts_force_flush = result.tts_force_flush;
         response.audio_chunk_index = state_->duplex_session->audio_chunk_index;
-        response.language_cache_position = state_->runtime.language_state.cache_pos;
+        response.language_cache_position = state_->duplex_session->language_state.cache_pos;
         response.audio_cache_position = state_->duplex_session->audio_state.cache_length();
         response.tts_cache_position = state_->duplex_session->tts_state.position;
         response.inference_ms =
@@ -333,7 +332,6 @@ void Components::stop() {
             state_->runtime.execution.config.layer_placement.primary_device());
         mfq_cuda_synchronize();
         state_->duplex_session.reset();
-        state_->runtime.language_state.reset(1);
         mfq_cuda_synchronize();
 }
 } // namespace tyloi::cuda::minicpmo45

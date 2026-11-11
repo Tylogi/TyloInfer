@@ -12,11 +12,11 @@ namespace tyloi::weights { struct Loader; }
 namespace tyloi::cuda {
 class Executor;
 namespace minicpmo45 {
-namespace text { struct Model; class State; }
+namespace text { struct Model; }
 
 class Components {
   public:
-    Components(const text::Model& language, text::State& language_state,
+    Components(const text::Model& language,
                Executor& language_executor, const tyloi::weights::Loader& weights,
                CudaExecutionContext& execution);
     ~Components();
@@ -32,7 +32,7 @@ class Components {
     std::unique_ptr<State> state_;
 };
 
-std::unique_ptr<Components> load_components(text::Model& model, text::State& state,
+std::unique_ptr<Components> load_components(text::Model& model,
     Executor& executor, const tyloi::weights::Loader& weights,
     bool load_optional_components, CudaExecutionContext& execution);
 } // namespace minicpmo45

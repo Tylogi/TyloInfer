@@ -4,7 +4,7 @@
 #include "engine/models/common/mlp.h"
 #include "engine/models/common/load.h"
 #include "engine/weights/loader.h"
-#include "engine/models/common/causal_forward.h"
+#include "engine/models/common/check.h"
 #include "engine/models/session/state.h"
 #include "engine/models/source/model_graph.h"
 #include "engine/backends/cuda/native/collectives.h"

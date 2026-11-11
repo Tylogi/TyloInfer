@@ -18,7 +18,6 @@ inline auto minicpmo45_parse_bounds(::tyloi::DenseTensor bounds, const char *lab
 
 struct MiniCPMO45Runtime {
     const tyloi::cuda::minicpmo45::text::Model& language;
-    tyloi::cuda::minicpmo45::text::State& language_state;
     tyloi::cuda::Executor& language_executor;
     CudaExecutionContext& execution;
     MiniCPMO45VisionEncoder vision;
@@ -32,7 +31,6 @@ struct MiniCPMO45Runtime {
 #endif
 
     static MiniCPMO45Runtime load(const tyloi::cuda::minicpmo45::text::Model& language,
-                                  tyloi::cuda::minicpmo45::text::State& language_state,
                                   tyloi::cuda::Executor& language_executor,
                                   const tyloi::weights::Loader& weights,
                                   CudaExecutionContext& execution);
@@ -234,6 +232,7 @@ struct MiniCPMO45DuplexStepResult {
 
 struct MiniCPMO45DuplexSession {
     MiniCPMO45Runtime & runtime;
+    tyloi::cuda::minicpmo45::text::State language_state;
     MiniCPMO45AudioEncoder::State audio_state;
     tyloi::cuda::minicpmo45::Tts::State tts_state;
     MiniCPMO45DuplexSpecialIds ids;
@@ -258,8 +257,9 @@ struct MiniCPMO45DuplexSession {
             MiniCPMO45DuplexSpecialIds ids_,
             std::vector<int64_t> forbidden_ids_,
             bool greedy_)
-        : runtime(runtime_), audio_state(runtime_.audio), tts_state(runtime_.tts), ids(ids_),
+        : runtime(runtime_), language_state(runtime_.language), audio_state(runtime_.audio), tts_state(runtime_.tts), ids(ids_),
           forbidden_ids(std::move(forbidden_ids_)), greedy(greedy_) {
+        language_state.preallocate();
         if (std::find(forbidden_ids.begin(), forbidden_ids.end(),
                 ids.chunk_eos) == forbidden_ids.end()) {
             forbidden_ids.push_back(ids.chunk_eos);
@@ -280,7 +280,7 @@ struct MiniCPMO45DuplexSession {
             ::tyloi::DenseTensor reference_audio_features = ::tyloi::DenseTensor(),
             ::tyloi::DenseTensor system_suffix_ids = ::tyloi::DenseTensor()) {
 #endif
-        runtime.language_state.reset(1);
+        language_state.reset(1);
         audio_state.reset();
         tts_state.reset(1);
         generated_text_ids.clear();
@@ -353,7 +353,7 @@ struct MiniCPMO45DuplexSession {
             token_ids = token_ids.to(::tyloi::kCUDA, ::tyloi::kInt64).contiguous();
         }
         auto hidden = tyloi::cuda::minicpmo45::text::forward(
-            runtime.language, runtime.language_state, runtime.language_executor,
+            runtime.language, language_state, runtime.language_executor,
             runtime.execution.executor().collectives(), runtime.execution.executor().forward_mode(runtime.execution.config.layer_placement.primary_device()),
             tyloi::models::Input{token_ids, embeddings.to(::tyloi::kBFloat16).contiguous()});
         auto logits = tyloi::cuda::minicpmo45::text::logits(
