@@ -5,6 +5,11 @@
 #include "engine/models/nemotron_h/forward.h"
 #include "engine/models/qwen4_exp/mtp_ops.h"
 #include "engine/models/deepseek_v41/mtp_ops.h"
+#ifdef TYLOINFER_NATIVE_CUDA
+#include "engine/models/minicpmo45/forward.h"
+#include "engine/models/minicpmo45/text/forward.h"
+#include "engine/models/glm_dsa/forward.h"
+#endif
 
 #include "engine/generation/mtp/cuda_impl.h"
 
@@ -18,6 +23,11 @@
       const tyloi::models::Prepared *, std::size_t,                            \
       ::tyloi::Tensor, ::tyloi::Tensor *,      \
       std::size_t, tyloi::engine::Budget*)
+#ifdef TYLOINFER_NATIVE_CUDA
+TYLOINFER_INSTANTIATE_MTP(tyloi::cuda::minicpmo45::Model, tyloi::cuda::minicpmo45::State);
+TYLOINFER_INSTANTIATE_MTP(tyloi::cuda::minicpmo45::text::Model, tyloi::cuda::minicpmo45::text::State);
+TYLOINFER_INSTANTIATE_MTP(tyloi::cuda::glm_dsa::Model, tyloi::cuda::glm_dsa::State);
+#endif
 TYLOINFER_INSTANTIATE_MTP(tyloi::cuda::glm5_next::Model, tyloi::cuda::glm5_next::State);
 TYLOINFER_INSTANTIATE_MTP(tyloi::cuda::qwen4_exp::Model, tyloi::cuda::qwen4_exp::State);
 TYLOINFER_INSTANTIATE_MTP(tyloi::cuda::deepseek_v41::Model, tyloi::cuda::deepseek_v41::State);

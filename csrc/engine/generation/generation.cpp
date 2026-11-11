@@ -45,8 +45,11 @@ struct Plain {
         return model.logits(last, capped);
     }
     void reserve(int64_t tokens) {
-        for (const auto& [device, growth] : state.growth(tokens, forward_options))
-            if (growth) budget.reserve_kv(device, prefill_budget_add(growth, std::size_t(64) << 20));
+        for (const auto& [device, growth] : state.growth(tokens, forward_options)) {
+            if (!growth) continue;
+            if (device.is_cpu()) budget.reserve_ram(growth);
+            else budget.reserve_kv(device, prefill_budget_add(growth, std::size_t(64) << 20));
+        }
     }
     double prefill(const PrefillChunk& chunk) {
         auto timer = executor.timer();

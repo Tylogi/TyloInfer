@@ -2,6 +2,7 @@
 
 #include "engine/backends/cuda/native/env.h"
 #include "engine/generation/cuda.h"
+#include "engine/generation/prefill_budget.h"
 #include "engine/budget.h"
 #include "engine/weights/cache.h"
 #include "engine/weights/workspace.h"
@@ -240,6 +241,19 @@ template <typename Model, typename State> struct CudaGenerationOps {
         graph_active = graph_eligible();
     }
 
+    void reserve(int64_t tokens) {
+#ifdef TYLOINFER_NATIVE_CUDA
+        if constexpr (causal<Model>) {
+            if (!budget) return;
+            for (const auto& [device, bytes] : state.growth(tokens, forward_options(mode))) {
+                if (!bytes) continue;
+                if (device.is_cpu()) budget->reserve_ram(bytes);
+                else budget->reserve_kv(device, tyloi::engine::prefill_budget_add(bytes, std::size_t(64) << 20));
+            }
+        }
+#endif
+    }
+
     double prefill(const tyloi::engine::PrefillChunk &chunk) {
 #ifdef TYLOINFER_NATIVE_CUDA
         auto scope = Executor::current().enter(mode.ffn);
@@ -265,6 +279,7 @@ template <typename Model, typename State> struct CudaGenerationOps {
         if (hidden.defined()) {
             // The layer-major path has already advanced every physical cache.
         } else if (prepared && prepared->transformed()) {
+            reserve(chunk.count);
             tyloi::weights::Loan workspace(weights);
             const bool borrowed=generation_workspace(model,workspace,chunk.count);
             tyloi::models::Input input;
@@ -299,6 +314,7 @@ template <typename Model, typename State> struct CudaGenerationOps {
             }
             state.set_position_delta(prepared->decode_position_delta);
         } else {
+            reserve(chunk.count);
             hidden = ::tyloi::cuda::internal::generation_detail::hidden(
                 model, state, executor, collectives, mode, tyloi::models::Input{std::move(ids)});
         }
@@ -469,6 +485,7 @@ template <typename Model, typename State> struct CudaGenerationOps {
     std::int64_t advance() {
         if (!graph_active) {
             if(auto result=generation_decode(model,*this))return *result;
+            reserve(1);
 #ifdef TYLOINFER_NATIVE_CUDA
             pending = sample_token(model, state, executor, collectives, mode, profiler,
                                    tyloi::ops::reshape(pending, {1, 1}), sampler, counts, constraint);

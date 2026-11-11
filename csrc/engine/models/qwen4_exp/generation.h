@@ -45,6 +45,7 @@ std::tuple<::tyloi::DenseTensor, bool, bool> generation_prefill(
             if(output && output->stopped())break;
             const auto rows=state.cache_pos==0?int64_t(1):std::min<int64_t>(4,chunk.count-offset);
 #ifdef TYLOINFER_NATIVE_CUDA
+            if (rows == 1) ops.reserve(rows);
             auto part=tyloi::ops::slice(ids,1,offset,offset+rows);
 #else
             auto part=ids.narrow(1,offset,rows);

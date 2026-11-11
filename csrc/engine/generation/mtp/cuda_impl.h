@@ -894,6 +894,12 @@ run_mtp_generation(Model &model, State &state, tyloi::cuda::Executor* executor,
                    ::tyloi::Tensor restored_last_hidden,
                    ::tyloi::Tensor *session_last_hidden,
                    std::size_t stable_prefix_tokens, tyloi::engine::Budget* budget) {
+#ifdef TYLOINFER_NATIVE_CUDA
+  if constexpr (std::is_base_of_v<tyloi::models::CausalModel, Model>) {
+    if (!static_cast<const tyloi::models::CausalModel&>(model).supports_speculation())
+      throw std::invalid_argument("this CUDA model has no speculative predictor");
+  }
+#endif
   if (!state.predictor || !state.predictor->belongs_to(mtp))
     throw std::invalid_argument("predictor state is unavailable or belongs to another model");
   auto logical_chunk=prefill_chunk_size;
