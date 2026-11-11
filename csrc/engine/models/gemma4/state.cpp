@@ -12,7 +12,7 @@ std::unique_ptr<tyloi::models::State> Model::make_state() const {
     return std::make_unique<State>(*this);
 }
 
-State::State(const Model& model) : layers(model.layers.size()) {
+State::State(const Model& model) : layers(model.layers.size()), graph_views_(model.layers.size() * 2) {
     layout_.reserve(model.layers.size());
     for (const auto& layer : model.layers) {
         const auto& attention = layer.attention;
@@ -39,6 +39,8 @@ void State::reset(std::int64_t next_batch) {
     for (std::size_t index = 0; index < layers.size(); ++index) {
         auto& cache = layers[index];
         if (!cache.defined() || cache.batch != next_batch) {
+            graph_views_[2 * index] = {};
+            graph_views_[2 * index + 1] = {};
             cache = {};
         }
     }
@@ -93,8 +95,10 @@ std::vector<tyloi::Tensor*> State::graph_state() {
     }
     std::vector<tyloi::Tensor*> result;
     result.reserve(views.size());
-    for (auto& view : views) result.push_back(&view);
-    graph_views_ = std::move(views);
+    for (std::size_t index = 0; index < views.size(); ++index) {
+        graph_views_[index] = std::move(views[index]);
+        result.push_back(&graph_views_[index]);
+    }
     return result;
 }
 
