@@ -21,43 +21,63 @@ struct MiniCPMO45WhisperAttention {
         return result;
     }
 
+#ifdef TYLOINFER_NATIVE_CUDA
+    ::tyloi::Tensor forward(::tyloi::Tensor input_value, ::tyloi::Tensor mask_value,
+                            ::tyloi::Tensor *key_cache = nullptr,
+                            ::tyloi::Tensor *value_cache = nullptr) const {
+        auto input = input_value.dense();
+#else
     ::tyloi::DenseTensor forward(const tyloi::cuda::Projector& projector,
-                                       ::tyloi::DenseTensor input,
-                                       MfqOptional<::tyloi::DenseTensor> mask,
-                                       ::tyloi::DenseTensor *key_cache = nullptr,
-                                       ::tyloi::DenseTensor *value_cache = nullptr) const {
+                                  ::tyloi::DenseTensor input,
+                                  MfqOptional<::tyloi::DenseTensor> mask,
+                                  ::tyloi::DenseTensor *key_cache = nullptr,
+                                  ::tyloi::DenseTensor *value_cache = nullptr) const {
+#endif
         const int64_t batch = input.size(0);
         const int64_t tokens = input.size(1);
-        auto reshape = [&](::tyloi::DenseTensor value) {
-            return value.reshape({batch, tokens, heads, head_dim}).transpose(1, 2).contiguous();
-        };
-        using DenseTensor = ::tyloi::DenseTensor;
-        return tyloi::models::minicpmo45::encoder_attention(
-            input, key_cache && value_cache,
-            [&](const DenseTensor &x) { return reshape(tyloi::cuda::biased(projector, q, x)); },
-            [&](const DenseTensor &x) { return reshape(tyloi::cuda::biased(projector, k, x)); },
-            [&](const DenseTensor &x) { return reshape(tyloi::cuda::biased(projector, v, x)); },
-            [&](DenseTensor &key, DenseTensor &value) {
-                if (key_cache->defined()) {
-                    key = ::tyloi::cuda::cat({*key_cache, key}, 2).contiguous();
-                    value = ::tyloi::cuda::cat({*value_cache, value}, 2).contiguous();
-                }
-                *key_cache = key;
-                *value_cache = value;
-            },
-            [&](DenseTensor query, DenseTensor key, DenseTensor value) {
-                std::optional<::tyloi::DenseTensor> attention_mask = std::nullopt;
-                if (mask.has_value()) {
-                    attention_mask = mask.value().to(query.scalar_type());
-                }
-                return mfq_scaled_dot_product_attention(query, key, value, attention_mask, 0.0,
-                                                        false, std::nullopt, false)
-                    .contiguous();
-            },
-            [&](DenseTensor attended) {
-                attended = attended.transpose(1, 2).reshape({batch, tokens, heads * head_dim});
-                return tyloi::cuda::biased(projector, output, attended);
-            });
+#ifdef TYLOINFER_NATIVE_CUDA
+        auto query = tyloi::ops::linear(input_value, q.weight, q.bias).dense()
+            .reshape({batch, tokens, heads, head_dim}).transpose(1, 2).contiguous();
+        auto key = tyloi::ops::linear(input_value, k.weight, k.bias).dense()
+            .reshape({batch, tokens, heads, head_dim}).transpose(1, 2).contiguous();
+        auto value = tyloi::ops::linear(input_value, v.weight, v.bias).dense()
+            .reshape({batch, tokens, heads, head_dim}).transpose(1, 2).contiguous();
+#else
+        auto query = tyloi::cuda::biased(projector, q, input)
+            .reshape({batch, tokens, heads, head_dim}).transpose(1, 2).contiguous();
+        auto key = tyloi::cuda::biased(projector, k, input)
+            .reshape({batch, tokens, heads, head_dim}).transpose(1, 2).contiguous();
+        auto value = tyloi::cuda::biased(projector, v, input)
+            .reshape({batch, tokens, heads, head_dim}).transpose(1, 2).contiguous();
+#endif
+        if (key_cache && value_cache) {
+            if (key_cache->defined()) {
+#ifdef TYLOINFER_NATIVE_CUDA
+                key = ::tyloi::cuda::cat({key_cache->dense(), key}, 2).contiguous();
+                value = ::tyloi::cuda::cat({value_cache->dense(), value}, 2).contiguous();
+#else
+                key = ::tyloi::cuda::cat({*key_cache, key}, 2).contiguous();
+                value = ::tyloi::cuda::cat({*value_cache, value}, 2).contiguous();
+#endif
+            }
+            *key_cache = key;
+            *value_cache = value;
+        }
+        std::optional<::tyloi::DenseTensor> attention_mask = std::nullopt;
+#ifdef TYLOINFER_NATIVE_CUDA
+        if (mask_value.defined()) attention_mask = mask_value.dense().to(query.scalar_type());
+#else
+        if (mask.has_value()) attention_mask = mask.value().to(query.scalar_type());
+#endif
+        auto attended = mfq_scaled_dot_product_attention(query, key, value, attention_mask, 0.0,
+                                                         false, std::nullopt, false)
+                            .contiguous().transpose(1, 2)
+                            .reshape({batch, tokens, heads * head_dim});
+#ifdef TYLOINFER_NATIVE_CUDA
+        return tyloi::ops::linear(attended, output.weight, output.bias);
+#else
+        return tyloi::cuda::biased(projector, output, attended);
+#endif
     }
 };
 
@@ -74,8 +94,11 @@ struct MiniCPMO45WhisperLayer {
 #endif
     tyloi::weights::BiasWeight fc1;
     tyloi::weights::BiasWeight fc2;
-    ::tyloi::DenseTensor key_cache;
-    ::tyloi::DenseTensor value_cache;
+#ifdef TYLOINFER_NATIVE_CUDA
+    ::tyloi::Tensor key_cache, value_cache;
+#else
+    ::tyloi::DenseTensor key_cache, value_cache;
+#endif
 
     static MiniCPMO45WhisperLayer load(const tyloi::weights::Loader& weights,
                                        int index) {
@@ -102,29 +125,33 @@ struct MiniCPMO45WhisperLayer {
     }
 
     void reset() {
-        key_cache = ::tyloi::DenseTensor();
-        value_cache = ::tyloi::DenseTensor();
+        key_cache = {};
+        value_cache = {};
     }
 
-    ::tyloi::DenseTensor forward(const tyloi::cuda::Projector& projector,
-                                       ::tyloi::DenseTensor input,
-                                       MfqOptional<::tyloi::DenseTensor> mask,
-                                       bool use_cache) {
 #ifdef TYLOINFER_NATIVE_CUDA
-        auto normalized = minicpmo45_layer_norm(input, *attention_norm_weight, *attention_norm_bias, 1e-5);
-#else
+    ::tyloi::Tensor forward(::tyloi::Tensor input_value, ::tyloi::Tensor mask, bool use_cache) {
+        auto input = input_value.dense();
         auto normalized = minicpmo45_layer_norm(input, attention_norm_weight, attention_norm_bias, 1e-5);
-#endif
+        auto branch = attention.forward(normalized, mask, use_cache ? &key_cache : nullptr,
+                                        use_cache ? &value_cache : nullptr).dense();
+#else
+    ::tyloi::DenseTensor forward(const tyloi::cuda::Projector& projector,
+                                  ::tyloi::DenseTensor input,
+                                  MfqOptional<::tyloi::DenseTensor> mask, bool use_cache) {
+        auto normalized = minicpmo45_layer_norm(input, attention_norm_weight, attention_norm_bias, 1e-5);
         auto branch = attention.forward(projector, normalized, mask, use_cache ? &key_cache : nullptr,
                                         use_cache ? &value_cache : nullptr);
-        input = (input + branch).contiguous();
-#ifdef TYLOINFER_NATIVE_CUDA
-        normalized = minicpmo45_layer_norm(input, *final_norm_weight, *final_norm_bias, 1e-5);
-#else
-        normalized = minicpmo45_layer_norm(input, final_norm_weight, final_norm_bias, 1e-5);
 #endif
+        input = (input + branch).contiguous();
+        normalized = minicpmo45_layer_norm(input, final_norm_weight, final_norm_bias, 1e-5);
+#ifdef TYLOINFER_NATIVE_CUDA
+        branch = tyloi::ops::linear(normalized, fc1.weight, fc1.bias).dense();
+        branch = tyloi::ops::linear(::tyloi::cuda::gelu(branch), fc2.weight, fc2.bias).dense();
+#else
         branch = tyloi::cuda::biased(projector, fc2,
             ::tyloi::cuda::gelu(tyloi::cuda::biased(projector, fc1, normalized)));
+#endif
         return (input + branch).contiguous();
     }
 };
@@ -181,12 +208,12 @@ struct MiniCPMO45AudioEncoder {
             result.layers.push_back(MiniCPMO45WhisperLayer::load(weights, index));
         }
 #ifdef TYLOINFER_NATIVE_CUDA
-        if (result.conv1_weight->dim() != 3 || result.conv1_weight->size(0) != 1024 ||
-            result.conv1_weight->size(1) != 80 || result.conv1_weight->size(2) != 3 ||
-            result.conv2_weight->dim() != 3 || result.conv2_weight->size(0) != 1024 ||
-            result.conv2_weight->size(1) != 1024 || result.conv2_weight->size(2) != 3 ||
-            result.position_embedding->dim() != 2 || result.position_embedding->size(0) != 1500 ||
-            result.position_embedding->size(1) != 1024) {
+        if (result.conv1_weight.dim() != 3 || result.conv1_weight.size(0) != 1024 ||
+            result.conv1_weight.size(1) != 80 || result.conv1_weight.size(2) != 3 ||
+            result.conv2_weight.dim() != 3 || result.conv2_weight.size(0) != 1024 ||
+            result.conv2_weight.size(1) != 1024 || result.conv2_weight.size(2) != 3 ||
+            result.position_embedding.dim() != 2 || result.position_embedding.size(0) != 1500 ||
+            result.position_embedding.size(1) != 1024) {
 #else
         if (result.conv1_weight.sizes().vec() != std::vector<int64_t>({1024, 80, 3}) ||
             result.conv2_weight.sizes().vec() != std::vector<int64_t>({1024, 1024, 3}) ||
@@ -208,21 +235,61 @@ struct MiniCPMO45AudioEncoder {
         return layers.front().key_cache.size(2);
     }
 
+private:
+    ::tyloi::DenseTensor convolve(::tyloi::DenseTensor features) const {
 #ifdef TYLOINFER_NATIVE_CUDA
-    ::tyloi::Tensor forward_streaming(const tyloi::cuda::Projector& projector,
-                                      ::tyloi::Tensor features_value,
-                                      int64_t prefix_extra_frames, int64_t suffix_extra_frames) {
+        const auto& weight1 = conv1_weight.dense();
+        const auto& bias1 = conv1_bias.dense();
+        const auto& weight2 = conv2_weight.dense();
+        const auto& bias2 = conv2_bias.dense();
 #else
-    ::tyloi::DenseTensor forward_streaming(const tyloi::cuda::Projector& projector,
-                                           ::tyloi::DenseTensor features_value,
-                                           int64_t prefix_extra_frames, int64_t suffix_extra_frames) {
+        const auto& weight1 = conv1_weight;
+        const auto& bias1 = conv1_bias;
+        const auto& weight2 = conv2_weight;
+        const auto& bias2 = conv2_bias;
 #endif
+        auto hidden = ::tyloi::cuda::gelu(::tyloi::cuda::conv1d(
+            features.to(weight1.scalar_type()), weight1, bias1,
+            std::vector<int64_t>{1}, std::vector<int64_t>{1}, std::vector<int64_t>{1}, 1));
+        return ::tyloi::cuda::gelu(::tyloi::cuda::conv1d(
+            hidden, weight2, bias2,
+            std::vector<int64_t>{2}, std::vector<int64_t>{1}, std::vector<int64_t>{1}, 1));
+    }
+
+    ::tyloi::DenseTensor project_and_pool(
+#ifndef TYLOINFER_NATIVE_CUDA
+        const tyloi::cuda::Projector& projector,
+#endif
+        ::tyloi::DenseTensor hidden, bool streaming) const {
+        hidden = minicpmo45_layer_norm(hidden, final_norm_weight, final_norm_bias, 1e-5);
 #ifdef TYLOINFER_NATIVE_CUDA
+        hidden = tyloi::ops::linear(hidden, projector1.weight, projector1.bias).dense();
+        hidden = ::tyloi::cuda::relu(hidden);
+        hidden = tyloi::ops::linear(hidden, projector2.weight, projector2.bias).dense();
+#else
+        hidden = tyloi::cuda::biased(projector, projector1, hidden);
+        hidden = ::tyloi::cuda::relu(hidden);
+        hidden = tyloi::cuda::biased(projector, projector2, hidden);
+#endif
+        if (streaming && hidden.size(1) < 5)
+            throw std::runtime_error("MiniCPM-o streaming audio chunk is too short for stride-5 pooling");
+        return ::tyloi::cuda::avg_pool1d(
+                   hidden.transpose(1, 2), std::vector<int64_t>{5}, std::vector<int64_t>{5})
+            .transpose(1, 2).contiguous();
+    }
+
+public:
+#ifdef TYLOINFER_NATIVE_CUDA
+    ::tyloi::Tensor forward_streaming(::tyloi::Tensor features_value,
+                                      int64_t prefix_extra_frames, int64_t suffix_extra_frames) {
         if (!features_value.defined())
             throw std::runtime_error("MiniCPM-o streaming audio expects [1,80,frames] and "
                                      "non-negative extra-frame counts");
         const auto& features = features_value.dense();
 #else
+    ::tyloi::DenseTensor forward_streaming(const tyloi::cuda::Projector& projector,
+                                           ::tyloi::DenseTensor features_value,
+                                           int64_t prefix_extra_frames, int64_t suffix_extra_frames) {
         const auto& features = features_value;
 #endif
         if (features.dim() != 3 || features.size(0) != 1 || features.size(1) != 80 ||
@@ -231,102 +298,40 @@ struct MiniCPMO45AudioEncoder {
                                      "non-negative extra-frame counts");
         }
         const int64_t conv_tokens_before_crop = (features.size(2) - 1) / 2 + 1;
+        if (cache_length() + conv_tokens_before_crop >= position_embedding.size(0)) reset();
+        auto hidden = convolve(features);
+        const int64_t prefix_to_remove = prefix_extra_frames > 0 ? (prefix_extra_frames + 1) / 2 : 0;
+        const int64_t suffix_to_remove = suffix_extra_frames > 0 ? (suffix_extra_frames + 1) / 2 : 0;
+        if (prefix_to_remove + suffix_to_remove >= hidden.size(2))
+            throw std::runtime_error("MiniCPM-o streaming audio extra context removes every frame");
+        if (prefix_to_remove > 0)
+            hidden = hidden.narrow(2, prefix_to_remove, hidden.size(2) - prefix_to_remove);
+        if (suffix_to_remove > 0)
+            hidden = hidden.narrow(2, 0, hidden.size(2) - suffix_to_remove);
+        hidden = hidden.transpose(1, 2).contiguous();
+        const int64_t past = cache_length();
+        const int64_t tokens = hidden.size(1);
+        if (past + tokens > position_embedding.size(0))
+            throw std::runtime_error("MiniCPM-o streaming Whisper position cache exceeds 1500 frames");
 #ifdef TYLOINFER_NATIVE_CUDA
-        if (cache_length() + conv_tokens_before_crop >= position_embedding->size(0)) {
+        const auto& position = position_embedding.dense();
 #else
-        if (cache_length() + conv_tokens_before_crop >= position_embedding.size(0)) {
+        const auto& position = position_embedding;
 #endif
-            reset();
+        hidden = hidden + position.narrow(0, past, tokens);
+        auto mask = ::tyloi::cuda::zeros({1, 1, tokens, past + tokens}, hidden.options());
+        for (auto& layer : layers) {
+#ifdef TYLOINFER_NATIVE_CUDA
+            hidden = layer.forward(hidden, mask, true).dense();
+#else
+            hidden = layer.forward(projector, hidden, mask, true);
+#endif
         }
-
-        using DenseTensor = ::tyloi::DenseTensor;
-        return tyloi::finish_steps(tyloi::models::minicpmo45::audio_encoder(
-            features, layers,
-            [&](DenseTensor features) {
-#ifdef TYLOINFER_NATIVE_CUDA
-                const auto& weight = conv1_weight.dense();
-                const auto& bias = conv1_bias.dense();
-#else
-                const auto& weight = conv1_weight;
-                const auto& bias = conv1_bias;
+        return project_and_pool(
+#ifndef TYLOINFER_NATIVE_CUDA
+            projector,
 #endif
-                return ::tyloi::cuda::conv1d(
-                    features.to(weight.scalar_type()), weight, bias,
-                    std::vector<int64_t>{1}, std::vector<int64_t>{1}, std::vector<int64_t>{1}, 1);
-            },
-            [](DenseTensor x) { return ::tyloi::cuda::gelu(x); },
-            [&](DenseTensor hidden) {
-#ifdef TYLOINFER_NATIVE_CUDA
-                const auto& weight = conv2_weight.dense();
-                const auto& bias = conv2_bias.dense();
-#else
-                const auto& weight = conv2_weight;
-                const auto& bias = conv2_bias;
-#endif
-                return ::tyloi::cuda::conv1d(hidden, weight, bias,
-                                                  std::vector<int64_t>{2}, std::vector<int64_t>{1},
-                                                  std::vector<int64_t>{1}, 1);
-            },
-            [&](DenseTensor hidden) {
-                const int64_t prefix_to_remove =
-                    prefix_extra_frames > 0 ? (prefix_extra_frames + 1) / 2 : 0;
-                const int64_t suffix_to_remove =
-                    suffix_extra_frames > 0 ? (suffix_extra_frames + 1) / 2 : 0;
-                if (prefix_to_remove + suffix_to_remove >= hidden.size(2)) {
-                    throw std::runtime_error(
-                        "MiniCPM-o streaming audio extra context removes every frame");
-                }
-                if (prefix_to_remove > 0) {
-                    hidden = hidden.narrow(2, prefix_to_remove, hidden.size(2) - prefix_to_remove);
-                }
-                if (suffix_to_remove > 0) {
-                    hidden = hidden.narrow(2, 0, hidden.size(2) - suffix_to_remove);
-                }
-                hidden = hidden.transpose(1, 2).contiguous();
-
-                const int64_t past = cache_length();
-                const int64_t tokens = hidden.size(1);
-#ifdef TYLOINFER_NATIVE_CUDA
-                if (past + tokens > position_embedding->size(0)) {
-#else
-                if (past + tokens > position_embedding.size(0)) {
-#endif
-                    throw std::runtime_error(
-                        "MiniCPM-o streaming Whisper position cache exceeds 1500 frames");
-                }
-#ifdef TYLOINFER_NATIVE_CUDA
-                const auto& position = position_embedding.dense();
-#else
-                const auto& position = position_embedding;
-#endif
-                hidden = hidden + position.narrow(0, past, tokens);
-                auto attention_mask =
-                    ::tyloi::cuda::zeros({1, 1, tokens, past + tokens}, hidden.options());
-                return std::array<DenseTensor, 2>{hidden, attention_mask};
-            },
-            [&](auto &layer, DenseTensor hidden, DenseTensor mask) {
-                return layer.forward(projector, hidden, mask, true);
-            },
-            [&](DenseTensor hidden) {
-#ifdef TYLOINFER_NATIVE_CUDA
-                return minicpmo45_layer_norm(hidden, *final_norm_weight, *final_norm_bias, 1e-5);
-#else
-                return minicpmo45_layer_norm(hidden, final_norm_weight, final_norm_bias, 1e-5);
-#endif
-            },
-            [&](DenseTensor hidden) { return tyloi::cuda::biased(projector, projector1, hidden); },
-            [](DenseTensor hidden) { return ::tyloi::cuda::relu(hidden); },
-            [&](DenseTensor hidden) { return tyloi::cuda::biased(projector, projector2, hidden); },
-            [&](DenseTensor hidden) {
-                if (hidden.size(1) < 5) {
-                    throw std::runtime_error(
-                        "MiniCPM-o streaming audio chunk is too short for stride-5 pooling");
-                }
-                return ::tyloi::cuda::avg_pool1d(
-                           hidden.transpose(1, 2), std::vector<int64_t>{5}, std::vector<int64_t>{5})
-                    .transpose(1, 2)
-                    .contiguous();
-            }));
+            hidden, true);
     }
 
 #ifdef TYLOINFER_NATIVE_CUDA
@@ -350,146 +355,73 @@ struct MiniCPMO45AudioEncoder {
 
 #ifdef TYLOINFER_NATIVE_CUDA
     tyloi::StepSequence<::tyloi::Tensor> forward_steps(
-        tyloi::cuda::Projector projector, ::tyloi::Tensor features_value,
-        ::tyloi::Tensor raw_lengths_value, bool use_cache = false) {
-#else
-    tyloi::StepSequence<::tyloi::DenseTensor> forward_steps(
-        tyloi::cuda::Projector projector, ::tyloi::DenseTensor features_value,
-        ::tyloi::DenseTensor raw_lengths_value, bool use_cache = false) {
-#endif
-#ifdef TYLOINFER_NATIVE_CUDA
+        ::tyloi::Tensor features_value, ::tyloi::Tensor raw_lengths_value, bool use_cache = false) {
         if (!features_value.defined() || !raw_lengths_value.defined())
             throw std::runtime_error("MiniCPM-o audio input geometry is invalid");
         const auto& features = features_value.dense();
         const auto& raw_lengths = raw_lengths_value.dense();
 #else
+    tyloi::StepSequence<::tyloi::DenseTensor> forward_steps(
+        tyloi::cuda::Projector projector, ::tyloi::DenseTensor features_value,
+        ::tyloi::DenseTensor raw_lengths_value, bool use_cache = false) {
         const auto& features = features_value;
         const auto& raw_lengths = raw_lengths_value;
 #endif
         if (features.dim() != 3 || features.size(1) != 80 || raw_lengths.dim() != 1 ||
-            raw_lengths.size(0) != features.size(0)) {
+            raw_lengths.size(0) != features.size(0))
             throw std::runtime_error("MiniCPM-o audio input geometry is invalid");
+        auto hidden = convolve(features).transpose(1, 2).contiguous();
+        const int64_t tokens = hidden.size(1);
+        int64_t past = 0;
+        if (use_cache && !layers.empty() && layers.front().key_cache.defined())
+            past = layers.front().key_cache.size(2);
+        if (past + tokens > position_embedding.size(0))
+            throw std::runtime_error("MiniCPM-o Whisper position cache exceeds 1500 frames");
+#ifdef TYLOINFER_NATIVE_CUDA
+        const auto& position = position_embedding.dense();
+#else
+        const auto& position = position_embedding;
+#endif
+        hidden = hidden + position.narrow(0, past, tokens);
+        // The official graph compares raw feature lengths with post-convolution positions.
+        auto length_tensor = raw_lengths.to(::tyloi::kCUDA, ::tyloi::kInt64).contiguous();
+        auto key_positions = ::tyloi::cuda::arange(
+            past + tokens, ::tyloi::TensorOptions().device(::tyloi::kCUDA).dtype(::tyloi::kInt64));
+        auto valid_keys = key_positions.unsqueeze(0) < (length_tensor + past).unsqueeze(1);
+        auto query_positions = ::tyloi::cuda::arange(
+            past, past + tokens, ::tyloi::TensorOptions().device(::tyloi::kCUDA).dtype(::tyloi::kInt64));
+        auto chunk_visible = key_positions.unsqueeze(0) <
+            ((query_positions / tyloi::models::minicpmo45::audio_chunk_frames + 1) *
+             tyloi::models::minicpmo45::audio_chunk_frames).unsqueeze(1);
+        auto visible = valid_keys.unsqueeze(1) & chunk_visible.unsqueeze(0);
+        auto mask = ::tyloi::cuda::zeros(
+            {features.size(0), 1, tokens, past + tokens},
+            ::tyloi::TensorOptions().device(::tyloi::kCUDA).dtype(::tyloi::kFloat32))
+            .masked_fill(visible.logical_not().unsqueeze(1), -std::numeric_limits<float>::infinity());
+        co_yield tyloi::StepState::advanced;
+        for (auto& layer : layers) {
+#ifdef TYLOINFER_NATIVE_CUDA
+            hidden = layer.forward(hidden, mask, use_cache).dense();
+#else
+            hidden = layer.forward(projector, hidden, mask, use_cache);
+#endif
+            co_yield tyloi::StepState::advanced;
         }
-        using DenseTensor = ::tyloi::DenseTensor;
-        auto encoding = tyloi::models::minicpmo45::audio_encoder(
-            features, layers,
-            [&](DenseTensor features) {
 #ifdef TYLOINFER_NATIVE_CUDA
-                const auto& weight = conv1_weight.dense();
-                const auto& bias = conv1_bias.dense();
+        co_yield ::tyloi::Tensor(project_and_pool(hidden, false));
 #else
-                const auto& weight = conv1_weight;
-                const auto& bias = conv1_bias;
+        co_yield project_and_pool(projector, hidden, false);
 #endif
-                return ::tyloi::cuda::conv1d(
-                    features.to(weight.scalar_type()), weight, bias,
-                    std::vector<int64_t>{1}, std::vector<int64_t>{1}, std::vector<int64_t>{1}, 1);
-            },
-            [](DenseTensor x) { return ::tyloi::cuda::gelu(x); },
-            [&](DenseTensor hidden) {
-#ifdef TYLOINFER_NATIVE_CUDA
-                const auto& weight = conv2_weight.dense();
-                const auto& bias = conv2_bias.dense();
-#else
-                const auto& weight = conv2_weight;
-                const auto& bias = conv2_bias;
-#endif
-                return ::tyloi::cuda::conv1d(hidden, weight, bias,
-                                                  std::vector<int64_t>{2}, std::vector<int64_t>{1},
-                                                  std::vector<int64_t>{1}, 1);
-            },
-            [&](DenseTensor hidden) {
-                hidden = hidden.transpose(1, 2).contiguous();
-                const int64_t tokens = hidden.size(1);
-                int64_t past = 0;
-                if (use_cache && !layers.empty() && layers.front().key_cache.defined()) {
-                    past = layers.front().key_cache.size(2);
-                }
-#ifdef TYLOINFER_NATIVE_CUDA
-                if (past + tokens > position_embedding->size(0)) {
-#else
-                if (past + tokens > position_embedding.size(0)) {
-#endif
-                    throw std::runtime_error(
-                        "MiniCPM-o Whisper position cache exceeds 1500 frames");
-                }
-#ifdef TYLOINFER_NATIVE_CUDA
-                const auto& position = position_embedding.dense();
-#else
-                const auto& position = position_embedding;
-#endif
-                hidden = hidden + position.narrow(0, past, tokens);
-
-                // Preserve the official graph: its padding comparison uses the raw
-                // Whisper feature lengths against the post-convolution sequence.
-                auto length_tensor =
-                    raw_lengths.to(::tyloi::kCUDA, ::tyloi::kInt64)
-                        .contiguous();
-                auto key_positions = ::tyloi::cuda::arange(
-                    past + tokens, ::tyloi::TensorOptions()
-                                       .device(::tyloi::kCUDA)
-                                       .dtype(::tyloi::kInt64));
-                auto valid_keys = key_positions.unsqueeze(0) < (length_tensor + past).unsqueeze(1);
-                auto query_positions =
-                    ::tyloi::cuda::arange(past, past + tokens,
-                                               ::tyloi::TensorOptions()
-                                                   .device(::tyloi::kCUDA)
-                                                   .dtype(::tyloi::kInt64));
-                // Official MiniCPM-o 4.5 uses audio_chunk_length=1.0. Whisper emits
-                // 50 encoder frames per second, and every query can see its current
-                // 50-frame chunk plus all preceding chunks.
-                auto chunk_visible =
-                    key_positions.unsqueeze(0) <
-                    ((query_positions / tyloi::models::minicpmo45::audio_chunk_frames + 1) *
-                     tyloi::models::minicpmo45::audio_chunk_frames)
-                        .unsqueeze(1);
-                auto visible = valid_keys.unsqueeze(1) & chunk_visible.unsqueeze(0);
-                auto attention_mask =
-                    ::tyloi::cuda::zeros({features.size(0), 1, tokens, past + tokens},
-                                              ::tyloi::TensorOptions()
-                                                  .device(::tyloi::kCUDA)
-                                                  .dtype(::tyloi::kFloat32))
-                        .masked_fill(visible.logical_not().unsqueeze(1),
-                                     -std::numeric_limits<float>::infinity());
-                return std::array<DenseTensor, 2>{hidden, attention_mask};
-            },
-            [&](auto &layer, DenseTensor hidden, DenseTensor mask) {
-                return layer.forward(projector, hidden, mask, use_cache);
-            },
-            [&](DenseTensor hidden) {
-#ifdef TYLOINFER_NATIVE_CUDA
-                return minicpmo45_layer_norm(hidden, *final_norm_weight, *final_norm_bias, 1e-5);
-#else
-                return minicpmo45_layer_norm(hidden, final_norm_weight, final_norm_bias, 1e-5);
-#endif
-            },
-            [&](DenseTensor hidden) { return tyloi::cuda::biased(projector, projector1, hidden); },
-            [](DenseTensor hidden) { return ::tyloi::cuda::relu(hidden); },
-            [&](DenseTensor hidden) { return tyloi::cuda::biased(projector, projector2, hidden); },
-            [&](DenseTensor hidden) {
-                return ::tyloi::cuda::avg_pool1d(
-                           hidden.transpose(1, 2), std::vector<int64_t>{5}, std::vector<int64_t>{5})
-                    .transpose(1, 2)
-                    .contiguous();
-            });
-        while (auto step = encoding.next()) {
-#ifdef TYLOINFER_NATIVE_CUDA
-            if (step.value) co_yield ::tyloi::Tensor(std::move(*step.value));
-#else
-            if (step.value) co_yield std::move(*step.value);
-#endif
-            else co_yield step.state;
-        }
     }
 
 #ifdef TYLOINFER_NATIVE_CUDA
-    ::tyloi::Tensor forward(const tyloi::cuda::Projector& projector,
-        ::tyloi::Tensor features, ::tyloi::Tensor lengths, bool use_cache = false) {
+    ::tyloi::Tensor forward(::tyloi::Tensor features, ::tyloi::Tensor lengths, bool use_cache = false) {
+        return tyloi::finish_steps(forward_steps(std::move(features), std::move(lengths), use_cache));
+    }
 #else
     ::tyloi::DenseTensor forward(const tyloi::cuda::Projector& projector,
         ::tyloi::DenseTensor features, ::tyloi::DenseTensor lengths, bool use_cache = false) {
-#endif
-        return tyloi::finish_steps(
-            forward_steps(projector, std::move(features), std::move(lengths), use_cache));
+        return tyloi::finish_steps(forward_steps(projector, std::move(features), std::move(lengths), use_cache));
     }
+#endif
 };

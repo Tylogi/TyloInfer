@@ -1,12 +1,12 @@
 #pragma once
 
-#include "engine/generation/sequence.h"
-#include "engine/ops.h"
-#include "engine/models/common/causal_forward.h"
+#include "engine/models/common/check.h"
 #include <algorithm>
-#include <array>
+#include <cstddef>
+#include <cstdint>
 #include <cmath>
 #include <span>
+#include <utility>
 #include <vector>
 
 namespace tyloi::models::minicpmo45 {
@@ -29,70 +29,9 @@ inline std::vector<MediaBound> media_bounds(std::span<const int64_t> values) {
     return result;
 }
 
-template <class DenseTensor> struct MultimodalInputs {
-    DenseTensor ids, pixels, patch_mask, target_sizes, audio_features, audio_lengths;
-    std::vector<MediaBound> images, audios;
+template <class Tensor> struct MultimodalResult {
+    Tensor vision_states, image_embeddings, audio_embeddings, input_embeddings;
 };
-template <class DenseTensor> struct MultimodalResult {
-    DenseTensor vision_states, image_embeddings, audio_embeddings, input_embeddings;
-};
-
-// The model owns modality order, resampling, and replacement geometry. Device
-// copies and the actual slice/scatter operations are supplied by the backend.
-template <class Ops>
-tyloi::StepSequence<MultimodalResult<typename Ops::DenseTensor>>
-encode(Ops &ops, MultimodalInputs<typename Ops::DenseTensor> &input) {
-    if (ops.rank(input.ids) == 1)
-        input.ids = ops.batch_ids(std::move(input.ids));
-    require_model(ops.rank(input.ids) == 2, "MiniCPM-o input_ids must have shape [batch,tokens]");
-    input.ids = ops.device_ids(std::move(input.ids));
-    MultimodalResult<typename Ops::DenseTensor> result;
-    result.input_embeddings = ops.embed(input.ids);
-    co_yield tyloi::StepState::advanced;
-    auto check_bound = [&](const MediaBound &bound, const auto &encoded, int64_t length) {
-        require_model(bound.batch >= 0 && bound.batch < ops.size(input.ids, 0) &&
-                          bound.source >= 0 && bound.source < ops.size(encoded, 0) &&
-                          bound.begin >= 0 && bound.end > bound.begin &&
-                          bound.end <= ops.size(input.ids, 1) && bound.end - bound.begin == length,
-                      "MiniCPM-o media bound does not match encoded length");
-    };
-    if (!input.images.empty()) {
-        require_model(ops.defined(input.pixels) && ops.defined(input.patch_mask) &&
-                          ops.defined(input.target_sizes),
-                      "image bounds require image tensors");
-        auto vision = ops.vision(input.pixels, input.patch_mask, input.target_sizes);
-        while (auto step = vision.next()) {
-            if (step.value) result.vision_states = std::move(*step.value);
-            else co_yield step.state;
-        }
-        result.image_embeddings = ops.resample(result.vision_states, input.target_sizes);
-        co_yield tyloi::StepState::advanced;
-        for (const auto &bound : input.images) {
-            check_bound(bound, result.image_embeddings, ops.size(result.image_embeddings, 1));
-            ops.scatter(result.input_embeddings, result.image_embeddings, bound);
-            co_yield tyloi::StepState::advanced;
-        }
-    }
-    if (!input.audios.empty()) {
-        require_model(ops.defined(input.audio_features) && ops.defined(input.audio_lengths),
-                      "audio bounds require audio tensors");
-        ops.reset_audio();
-        auto audio = ops.audio(input.audio_features, input.audio_lengths);
-        while (auto step = audio.next()) {
-            if (step.value) result.audio_embeddings = std::move(*step.value);
-            else co_yield step.state;
-        }
-        auto lengths = ops.audio_lengths(input.audio_lengths);
-        for (const auto &bound : input.audios) {
-            require_model(bound.source >= 0 && size_t(bound.source) < lengths.size(),
-                          "audio bound source is out of range");
-            check_bound(bound, result.audio_embeddings, lengths[bound.source]);
-            ops.scatter(result.input_embeddings, result.audio_embeddings, bound);
-            co_yield tyloi::StepState::advanced;
-        }
-    }
-    co_yield std::move(result);
-}
 
 struct TtsSampling {
     int64_t eos_token = 6561, minimum_steps = 50, top_k = 25, minimum_keep = 0;
@@ -169,57 +108,5 @@ inline int64_t pooled_audio_length(int64_t frames) {
     return pooled;
 }
 inline constexpr int64_t audio_chunk_frames = 50;
-
-template <class DenseTensor, class Query, class Key, class Value, class Cache, class Attend,
-          class Output>
-auto encoder_attention(DenseTensor hidden, bool cached, Query query, Key key, Value value, Cache cache,
-                       Attend attend, Output output) {
-    auto q = query(hidden);
-    auto k = key(hidden);
-    auto v = value(hidden);
-    if (cached)
-        cache(k, v);
-    return output(attend(std::move(q), std::move(k), std::move(v)));
-}
-
-template <class DenseTensor, class Layers, class Conv1, class Gelu, class Conv2, class Prepare,
-          class Layer, class Normalize, class Project1, class Relu, class Project2, class Pool>
-tyloi::StepSequence<DenseTensor> audio_encoder(DenseTensor features, Layers &layers, Conv1 conv1, Gelu gelu, Conv2 conv2,
-                   Prepare prepare, Layer layer, Normalize normalize, Project1 project1, Relu relu,
-                   Project2 project2, Pool pool) {
-    auto hidden = gelu(conv1(std::move(features)));
-    hidden = gelu(conv2(std::move(hidden)));
-    auto prepared = prepare(std::move(hidden));
-    hidden = std::move(prepared[0]);
-    co_yield tyloi::StepState::advanced;
-    for (auto& block : layers) {
-        hidden = layer(block, std::move(hidden), prepared[1]);
-        co_yield tyloi::StepState::advanced;
-    }
-    co_yield pool(project2(relu(project1(normalize(std::move(hidden))))));
-}
-
-template <class DenseTensor, class Layers, class Patch, class Prepare, class Layer, class Normalize>
-tyloi::StepSequence<DenseTensor> vision_encoder(DenseTensor pixels, Layers &layers, Patch patch, Prepare prepare, Layer layer,
-                    Normalize normalize) {
-    auto hidden = prepare(patch(std::move(pixels)));
-    co_yield tyloi::StepState::advanced;
-    for (const auto& block : layers) {
-        hidden = layer(block, std::move(hidden));
-        co_yield tyloi::StepState::advanced;
-    }
-    co_yield normalize(std::move(hidden));
-}
-
-template <class ProjectKv, class NormKv, class NormQ, class Query, class Key, class Value,
-          class Attend, class Output, class NormOutput, class Final>
-auto resample(ProjectKv project_kv, NormKv norm_kv, NormQ norm_q, Query query, Key key, Value value,
-              Attend attend, Output output, NormOutput norm_output, Final final) {
-    auto kv = norm_kv(project_kv());
-    auto q = query(norm_q());
-    auto k = key(kv);
-    auto v = value(kv);
-    return final(norm_output(output(attend(std::move(q), std::move(k), std::move(v)))));
-}
 
 } // namespace tyloi::models::minicpmo45

@@ -2,6 +2,7 @@
 
 #include "engine/weights/loader.h"
 #include "engine/models/minicpmo45/media.h"
+#include "engine/models/minicpmo45/config.h"
 
 #include "vision.h"
 #include <random>

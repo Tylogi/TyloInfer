@@ -27,81 +27,15 @@ struct MiniCPMO45Runtime {
     tyloi::cuda::minicpmo45::Tts tts;
     std::unique_ptr<tyloi::cuda::Executor> tts_executor;
     const tyloi::cuda::Executor::Mode tts_mode;
+#ifndef TYLOINFER_NATIVE_CUDA
     tyloi::cuda::Projector projector;
+#endif
 
     static MiniCPMO45Runtime load(const tyloi::cuda::minicpmo45::text::Model& language,
                                   tyloi::cuda::minicpmo45::text::State& language_state,
                                   tyloi::cuda::Executor& language_executor,
                                   const tyloi::weights::Loader& weights,
                                   CudaExecutionContext& execution);
-
-    struct EncodeOps {
-#ifdef TYLOINFER_NATIVE_CUDA
-        using DenseTensor = ::tyloi::Tensor;
-#else
-        using DenseTensor = ::tyloi::DenseTensor;
-#endif
-        MiniCPMO45Runtime &runtime;
-        static int64_t rank(const DenseTensor &t) { return t.dim(); }
-        static int64_t size(const DenseTensor &t, int axis) { return t.size(axis); }
-        static bool defined(const DenseTensor &t) { return t.defined(); }
-        static DenseTensor batch_ids(DenseTensor t) {
-#ifdef TYLOINFER_NATIVE_CUDA
-            return t.dense().unsqueeze(0);
-#else
-            return t.unsqueeze(0);
-#endif
-        }
-        static DenseTensor device_ids(DenseTensor t) {
-#ifdef TYLOINFER_NATIVE_CUDA
-            return t.dense().to(::tyloi::kCUDA, ::tyloi::kInt64).contiguous();
-#else
-            return t.to(::tyloi::kCUDA, ::tyloi::kInt64).contiguous();
-#endif
-        }
-        DenseTensor embed(DenseTensor ids) {
-            return tyloi::cuda::minicpmo45::text::embed(
-                runtime.language, runtime.language_executor, runtime.execution.executor().collectives(),
-                runtime.execution.config.layer_placement.primary_device(), std::move(ids),
-                runtime.execution.executor().forward_mode(runtime.execution.config.layer_placement.primary_device()));
-        }
-        auto vision(DenseTensor pixels, DenseTensor mask, DenseTensor sizes) {
-#ifdef TYLOINFER_NATIVE_CUDA
-            pixels = pixels.dense().to(::tyloi::kCUDA);
-#else
-            pixels = pixels.to(::tyloi::kCUDA);
-#endif
-            return runtime.vision.forward_steps(runtime.projector, pixels, mask, sizes);
-        }
-        DenseTensor resample(DenseTensor hidden, DenseTensor sizes) {
-            return runtime.resampler.forward(runtime.projector, hidden, sizes);
-        }
-        void reset_audio() { runtime.audio.reset(); }
-        auto audio(DenseTensor features, DenseTensor lengths) {
-#ifdef TYLOINFER_NATIVE_CUDA
-            features = features.dense().to(::tyloi::kCUDA);
-#else
-            features = features.to(::tyloi::kCUDA);
-#endif
-            return runtime.audio.forward_steps(runtime.projector, features, lengths, false);
-        }
-        static auto audio_lengths(DenseTensor lengths) {
-            return MiniCPMO45AudioEncoder::pooled_lengths(lengths);
-        }
-        static void scatter(DenseTensor &target, const DenseTensor &source,
-                            const tyloi::models::minicpmo45::MediaBound &bound) {
-#ifdef TYLOINFER_NATIVE_CUDA
-            auto& target_dense = target.dense();
-            const auto& source_dense = source.dense();
-#else
-            auto& target_dense = target;
-            const auto& source_dense = source;
-#endif
-            target_dense.index({bound.batch, Slice(bound.begin, bound.end), Slice()})
-                .copy_(source_dense.index({bound.source, Slice(0, bound.end - bound.begin), Slice()})
-                           .to(target_dense.scalar_type()));
-        }
-    };
 
 #ifdef TYLOINFER_NATIVE_CUDA
     tyloi::StepSequence<tyloi::models::minicpmo45::MultimodalResult<::tyloi::Tensor>>
@@ -116,29 +50,105 @@ struct MiniCPMO45Runtime {
            ::tyloi::DenseTensor image_bounds, ::tyloi::DenseTensor audio_features,
            ::tyloi::DenseTensor audio_lengths, ::tyloi::DenseTensor audio_bounds) {
 #endif
-        EncodeOps ops{*this};
 #ifdef TYLOINFER_NATIVE_CUDA
-        tyloi::models::minicpmo45::MultimodalInputs<::tyloi::Tensor> input{
+        auto images = image_bounds.defined() ? minicpmo45_parse_bounds(image_bounds.dense(), "image")
+            : std::vector<tyloi::models::minicpmo45::MediaBound>{};
+        auto audios = audio_bounds.defined() ? minicpmo45_parse_bounds(audio_bounds.dense(), "audio")
+            : std::vector<tyloi::models::minicpmo45::MediaBound>{};
+        if (input_ids.dim() == 1) input_ids = tyloi::ops::unsqueeze(input_ids, 0);
 #else
-        tyloi::models::minicpmo45::MultimodalInputs<::tyloi::DenseTensor> input{
+        auto images = minicpmo45_parse_bounds(image_bounds, "image");
+        auto audios = minicpmo45_parse_bounds(audio_bounds, "audio");
+        if (input_ids.dim() == 1) input_ids = input_ids.unsqueeze(0);
 #endif
-            input_ids,
-            pixels,
-            patch_mask,
-            target_sizes,
-            audio_features,
-            audio_lengths,
+        tyloi::models::require_model(input_ids.dim() == 2,
+            "MiniCPM-o input_ids must have shape [batch,tokens]");
+        const auto primary = execution.config.layer_placement.primary_device();
 #ifdef TYLOINFER_NATIVE_CUDA
-            image_bounds.defined() ? minicpmo45_parse_bounds(image_bounds.dense(), "image")
-                                   : std::vector<tyloi::models::minicpmo45::MediaBound>{},
-            audio_bounds.defined() ? minicpmo45_parse_bounds(audio_bounds.dense(), "audio")
-                                   : std::vector<tyloi::models::minicpmo45::MediaBound>{}};
+        input_ids = tyloi::ops::contiguous(tyloi::ops::cast(input_ids, ::tyloi::kInt64,
+            ::tyloi::Device(::tyloi::kCUDA, primary)));
+        tyloi::models::minicpmo45::MultimodalResult<::tyloi::Tensor> result;
 #else
-            minicpmo45_parse_bounds(image_bounds, "image"),
-            minicpmo45_parse_bounds(audio_bounds, "audio")};
+        input_ids = input_ids.to(::tyloi::kCUDA, ::tyloi::kInt64).contiguous();
+        tyloi::models::minicpmo45::MultimodalResult<::tyloi::DenseTensor> result;
 #endif
-        auto encoding = tyloi::models::minicpmo45::encode(ops, input);
-        while (auto step = encoding.next()) co_yield std::move(step);
+        result.input_embeddings = tyloi::cuda::minicpmo45::text::embed(
+            language, language_executor, execution.executor().collectives(), primary, input_ids,
+            execution.executor().forward_mode(primary));
+        co_yield tyloi::StepState::advanced;
+        const auto scatter = [&](const auto& encoded,
+                const tyloi::models::minicpmo45::MediaBound& bound, int64_t length) {
+            tyloi::models::require_model(bound.batch >= 0 && bound.batch < input_ids.size(0) &&
+                bound.source >= 0 && bound.source < encoded.size(0) && bound.begin >= 0 &&
+                bound.end > bound.begin && bound.end <= input_ids.size(1) && bound.end - bound.begin == length,
+                "MiniCPM-o media bound does not match encoded length");
+#ifdef TYLOINFER_NATIVE_CUDA
+            auto& target = result.input_embeddings.dense();
+            const auto& source = encoded.dense();
+#else
+            auto& target = result.input_embeddings;
+            const auto& source = encoded;
+#endif
+            target.index({bound.batch, Slice(bound.begin, bound.end), Slice()})
+                .copy_(source.index({bound.source, Slice(0, bound.end - bound.begin), Slice()})
+                    .to(target.scalar_type()));
+        };
+        if (!images.empty()) {
+            tyloi::models::require_model(pixels.defined() && patch_mask.defined() && target_sizes.defined(),
+                "image bounds require image tensors");
+#ifdef TYLOINFER_NATIVE_CUDA
+            pixels = tyloi::ops::cast(pixels, pixels.scalar_type(), ::tyloi::Device(::tyloi::kCUDA, primary));
+#else
+            pixels = pixels.to(::tyloi::kCUDA);
+#endif
+            auto encoding = vision.forward_steps(
+#ifndef TYLOINFER_NATIVE_CUDA
+                projector,
+#endif
+                pixels, patch_mask, target_sizes);
+            while (auto step = encoding.next()) {
+                if (step.value) result.vision_states = std::move(*step.value);
+                else co_yield step.state;
+            }
+            result.image_embeddings = resampler.forward(
+#ifndef TYLOINFER_NATIVE_CUDA
+                projector,
+#endif
+                result.vision_states, target_sizes);
+            co_yield tyloi::StepState::advanced;
+            for (const auto& bound : images) {
+                scatter(result.image_embeddings, bound, result.image_embeddings.size(1));
+                co_yield tyloi::StepState::advanced;
+            }
+        }
+        if (!audios.empty()) {
+            tyloi::models::require_model(audio_features.defined() && audio_lengths.defined(),
+                "audio bounds require audio tensors");
+            audio.reset();
+#ifdef TYLOINFER_NATIVE_CUDA
+            audio_features = tyloi::ops::cast(audio_features, audio_features.scalar_type(),
+                ::tyloi::Device(::tyloi::kCUDA, primary));
+#else
+            audio_features = audio_features.to(::tyloi::kCUDA);
+#endif
+            auto encoding = audio.forward_steps(
+#ifndef TYLOINFER_NATIVE_CUDA
+                projector,
+#endif
+                audio_features, audio_lengths, false);
+            while (auto step = encoding.next()) {
+                if (step.value) result.audio_embeddings = std::move(*step.value);
+                else co_yield step.state;
+            }
+            const auto lengths = MiniCPMO45AudioEncoder::pooled_lengths(audio_lengths);
+            for (const auto& bound : audios) {
+                tyloi::models::require_model(bound.source >= 0 && size_t(bound.source) < lengths.size(),
+                    "audio bound source is out of range");
+                scatter(result.audio_embeddings, bound, lengths[bound.source]);
+                co_yield tyloi::StepState::advanced;
+            }
+        }
+        co_yield std::move(result);
     }
 };
 
@@ -292,7 +302,9 @@ struct MiniCPMO45DuplexSession {
                 std::vector<int64_t>{reference_audio_features.size(2)},
                 ::tyloi::TensorOptions().dtype(::tyloi::kInt64));
             auto embeddings = runtime.audio.forward(
+#ifndef TYLOINFER_NATIVE_CUDA
                 runtime.projector,
+#endif
 #ifdef TYLOINFER_NATIVE_CUDA
                 reference_audio_features.dense().to(::tyloi::kCUDA),
 #else
@@ -363,7 +375,11 @@ struct MiniCPMO45DuplexSession {
         if (token_ids.dim() == 1) token_ids = token_ids.unsqueeze(0);
         token_ids = token_ids.to(::tyloi::kCUDA, ::tyloi::kInt64).contiguous();
         return feed_embeddings(
-            MiniCPMO45Runtime::EncodeOps{runtime}.embed(token_ids), token_ids);
+            tyloi::cuda::minicpmo45::text::embed(runtime.language, runtime.language_executor,
+                runtime.execution.executor().collectives(),
+                runtime.execution.config.layer_placement.primary_device(), token_ids,
+                runtime.execution.executor().forward_mode(runtime.execution.config.layer_placement.primary_device())),
+            token_ids);
     }
 
 #ifdef TYLOINFER_NATIVE_CUDA
@@ -521,10 +537,15 @@ struct MiniCPMO45DuplexSession {
                     "MiniCPM-o duplex image pixels require patch mask and target sizes");
             }
             auto vision_states = runtime.vision.forward(
+#ifndef TYLOINFER_NATIVE_CUDA
                 runtime.projector,
+#endif
                 pixels.to(::tyloi::kCUDA), patch_mask, target_sizes);
             auto image_embeddings = runtime.resampler.forward(
-                runtime.projector, vision_states, target_sizes);
+#ifndef TYLOINFER_NATIVE_CUDA
+                runtime.projector,
+#endif
+                vision_states, target_sizes);
 #ifdef TYLOINFER_NATIVE_CUDA
             const auto& image_embeddings_dense = image_embeddings.dense();
 #else
@@ -571,7 +592,9 @@ struct MiniCPMO45DuplexSession {
 
         if (audio_features.defined()) {
             auto encoded_audio = runtime.audio.forward_streaming(
+#ifndef TYLOINFER_NATIVE_CUDA
                 runtime.projector,
+#endif
                 audio_features.to(::tyloi::kCUDA),
                 audio_prefix_extra_frames,
                 audio_suffix_extra_frames);

@@ -22,14 +22,19 @@ MiniCPMO45Runtime MiniCPMO45Runtime::load(
         CudaExecutionContext& execution) {
     auto &placement = execution.config.layer_placement;
     MfqCudaGuard guard(placement.primary_device());
+#ifndef TYLOINFER_NATIVE_CUDA
     auto projector = execution.executor().projector(execution.executor().mode().ffn, model_parallel_primary_device(execution.config));
+#endif
     return {language, language_state, language_executor, execution,
             MiniCPMO45VisionEncoder::load(weights),
             MiniCPMO45Resampler::load(weights),
             MiniCPMO45AudioEncoder::load(weights),
             tyloi::cuda::minicpmo45::Tts::load(weights),
-            execution.executor().fork(model_parallel_primary_device(execution.config)), execution.executor().forward_mode(execution.config.layer_placement.primary_device()),
-            projector};
+            execution.executor().fork(model_parallel_primary_device(execution.config)), execution.executor().forward_mode(execution.config.layer_placement.primary_device())
+#ifndef TYLOINFER_NATIVE_CUDA
+            , projector
+#endif
+    };
 }
 
 namespace tyloi::cuda::minicpmo45 {
