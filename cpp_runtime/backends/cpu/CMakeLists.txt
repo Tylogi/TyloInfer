@@ -99,8 +99,3 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64|i.86)$")
     endif()
 endif()
 add_library(mfq::cpu-ops ALIAS mfq-cpu-ops)
-
-if(BUILD_TESTING AND TYLOINFER_ENABLE_MFQ_COMPAT)
-    add_executable(mfq-cpu-nvq-bench ${TYLOINFER_REPOSITORY_ROOT}/bench/cpu_nvq_bench.cpp)
-    target_link_libraries(mfq-cpu-nvq-bench PRIVATE mfq-cpu-ops)
-endif()
