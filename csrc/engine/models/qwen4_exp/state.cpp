@@ -6,6 +6,8 @@
 #include "engine/models/session/state.h"
 
 #include <algorithm>
+#include <iterator>
+#include <limits>
 #include <stdexcept>
 
 namespace tyloi::cuda::qwen4_exp {
@@ -120,6 +122,61 @@ tyloi::models::SnapshotSize snapshot_size(const State& state,const tyloi::models
     }
     // Transposed graph KV can temporarily require a contiguous copy of the checkpoint.
     return {bytes, bytes * 2};
+}
+
+std::vector<std::pair<tyloi::Device, std::size_t>> State::growth(
+        std::int64_t tokens, const tyloi::models::ForwardOptions& options) const {
+    if (batch <= 0 || tokens <= 0 || cache_pos < 0 || cache_pos > model_.max_position_embeddings() ||
+        tokens > model_.max_position_embeddings() - cache_pos || speculative_start >= 0 ||
+        speculative_suffix_forward || options.primary < 0 || layers.size() != model_.layers.size())
+        throw std::invalid_argument("invalid Qwen4 ordinary state growth");
+    struct Growth { tyloi::Device device; std::size_t retained = 0, peak = 0; };
+    std::vector<Growth> growth;
+    const auto add = [&](tyloi::Device device, std::size_t retained, std::size_t temporary = 0) {
+        if (device.is_cuda() && device.index < 0) throw std::invalid_argument("invalid Qwen4 state device");
+        auto entry = std::find_if(growth.begin(), growth.end(),
+            [device](const auto& value) { return value.device == device; });
+        if (entry == growth.end()) { growth.push_back({device}); entry = std::prev(growth.end()); }
+        const auto checked = [](std::size_t a, std::size_t b) {
+            if (a > std::numeric_limits<std::size_t>::max() - b)
+                throw std::overflow_error("Qwen4 state growth overflow");
+            return a + b;
+        };
+        entry->retained = checked(entry->retained, retained);
+        entry->peak = std::max(entry->peak, checked(entry->retained, temporary));
+    };
+    std::vector<int64_t> shape;
+    if (positions) {
+        const auto& dense = positions.dense();
+        if (dense.dim() < 1 || dense.dim() > 3 || dense.size(-1) != cache_pos)
+            throw std::invalid_argument("invalid Qwen4 position history");
+        shape = dense.sizes().vec();
+        shape.back() = cache_pos + tokens;
+    } else {
+        // The first input can supply up to four position axes for every batch row.
+        shape = {4, batch, tokens};
+    }
+    const tyloi::Device primary(tyloi::kCUDA, options.primary);
+    add(primary, tyloi::make_contiguous_view(nullptr, shape, tyloi::kInt64, primary).nbytes());
+    for (std::size_t i = 0; i < layers.size(); ++i) {
+        const auto& block = *model_.layers[i];
+        const auto& state = *layers[i];
+        if ((block.gdn && state.gdn.saved_conv.defined()) || (block.ple && state.ple.saved))
+            throw std::invalid_argument("pending Qwen4 speculative state");
+        const auto device = block.cpu_offloaded ? tyloi::Device(tyloi::kCPU) : tyloi::Device(tyloi::kCUDA, block.cuda_device);
+        if (block.ple) {
+            const auto [retained, temporary] = block.ple->ordinary_growth_bytes(state.ple, batch, tokens);
+            add(device, retained, temporary);
+        }
+        if (block.qsa) add(device, block.qsa->ordinary_growth_bytes(*state.qsa, batch, tokens));
+        if (block.gdn) {
+            const auto [retained, temporary] = block.gdn->ordinary_growth_bytes(state.gdn, batch, tokens);
+            add(device, retained, temporary);
+        }
+    }
+    std::vector<std::pair<tyloi::Device, std::size_t>> result;
+    for (const auto& value : growth) result.emplace_back(value.device, value.peak);
+    return result;
 }
 
 std::vector<::tyloi::Tensor> State::storage() const {

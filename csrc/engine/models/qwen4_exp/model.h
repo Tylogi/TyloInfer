@@ -23,7 +23,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdio>
+#include <limits>
 #include <memory>
+#include <stdexcept>
 #include <numeric>
 #include <set>
 #include <unordered_map>
@@ -122,6 +124,46 @@ class Gdn {
     std::size_t growth_bytes(const State& request) const {
         return (request.conv.dense().defined() ? 0 : std::size_t(kernel_-1)*(2*nk_+nv_)*d_*sizeof(float)) +
             (request.recurrent.dense().defined() ? 0 : std::size_t(nv_)*d_*d_*sizeof(float));
+    }
+    std::pair<std::size_t, std::size_t> ordinary_growth_bytes(const State& request, int64_t batch, int64_t tokens) const {
+        TYLOINFER_RUNTIME_CHECK(batch > 0 && tokens > 0 && nk_ > 0 && nv_ > 0 && d_ > 0 && kernel_ > 1 &&
+            nk_ <= (std::numeric_limits<int64_t>::max() - nv_) / 2 &&
+            tokens <= std::numeric_limits<int64_t>::max() - (kernel_ - 1), "invalid GDN growth geometry");
+        if (request.conv.dense().defined())
+            TYLOINFER_RUNTIME_CHECK(request.conv.dense().size(0) == batch, "GDN batch changed");
+        const auto device = w_->norm.device();
+        const auto bytes = [&](const auto& shape) {
+            return ::tyloi::make_contiguous_view(nullptr, shape, ::tyloi::kFloat32, device).nbytes();
+        };
+        std::size_t retained = 0, temporary = 0;
+        const auto add = [](std::size_t& total, std::size_t value) {
+            if (total > std::numeric_limits<std::size_t>::max() - value) throw std::overflow_error("GDN growth overflow");
+            total += value;
+        };
+        const std::array<int64_t,4> joined{batch, kernel_ - 1 + tokens, 2 * nk_ + nv_, d_};
+        const std::array<int64_t,4> conv{batch, kernel_ - 1, 2 * nk_ + nv_, d_};
+        const std::array<int64_t,4> recurrent{batch, nv_, d_, d_};
+        const auto joined_bytes = bytes(joined), conv_bytes = bytes(conv), recurrent_bytes = bytes(recurrent);
+        if (!request.conv.dense().defined() && batch == 1 && !request.resident) add(retained, joined_bytes);
+        else add(temporary, joined_bytes);
+        if (batch > 1) add(temporary, conv_bytes);
+        if (!request.conv.dense().defined()) {
+            add(temporary, conv_bytes);
+            if (batch > 1 && !request.resident) { temporary -= conv_bytes; add(retained, conv_bytes); }
+            if (request.resident) add(retained, conv_bytes);
+        }
+        if (request.recurrent.dense().defined()) add(temporary, recurrent_bytes);
+        else {
+            add(retained, recurrent_bytes);
+            if (request.resident) add(temporary, recurrent_bytes);
+        }
+        if (tokens == 1 && request.conv.dense().defined() && request.recurrent.dense().defined() &&
+            !request.core_workspace.dense().defined() && fused_core_ && fused_decode_ &&
+            fused_preparation_ && fused_output_ && transposed_state_) {
+            if (d_ == std::numeric_limits<int64_t>::max()) throw std::overflow_error("GDN workspace overflow");
+            const std::array<int64_t,3> workspace{batch, nv_, d_ + 1}; add(retained, bytes(workspace));
+        }
+        return {retained, temporary};
     }
     std::size_t request_cache_growth_bytes(const State& request) const {
         return growth_bytes(request) + (fused_core_ && fused_decode_ && fused_preparation_ &&
@@ -918,6 +960,25 @@ class Ple {
     const DenseTensor &conv_state(const State& state) const { return state.conv; }
     std::vector<DenseTensor*> graph_state(State& state) const { return {&state.conv}; }
 #endif
+    std::pair<std::size_t, std::size_t> ordinary_growth_bytes(const State& state, int64_t batch, int64_t tokens) const {
+        if (state.conv.defined()) TYLOINFER_RUNTIME_CHECK(state.conv.size(0) == batch, "PLE batch changed");
+        const auto kernel = w_.conv.size(-1);
+        TYLOINFER_RUNTIME_CHECK(batch > 0 && tokens > 0 && kernel > 0 && dilation_ > 0 &&
+            kernel - 1 <= std::numeric_limits<int64_t>::max() / dilation_, "invalid PLE growth geometry");
+        const auto history = (kernel - 1) * dilation_;
+        TYLOINFER_RUNTIME_CHECK(tokens <= std::numeric_limits<int64_t>::max() - history, "PLE growth overflow");
+        const std::array<int64_t,4> joined{batch, history + tokens, streams_, hidden_};
+        const std::array<int64_t,4> conv{batch, history, streams_, hidden_};
+        const auto device = w_.conv.device();
+        const auto a = ::tyloi::make_contiguous_view(nullptr, joined, ::tyloi::kFloat32, device).nbytes();
+        const auto b = ::tyloi::make_contiguous_view(nullptr, conv, ::tyloi::kFloat32, device).nbytes();
+        if (state.conv.defined()) {
+            if (batch > 1 && a > std::numeric_limits<std::size_t>::max() - b) throw std::overflow_error("PLE growth overflow");
+            return {0, a + (batch > 1 ? b : 0)};
+        }
+        if (batch > 1 && a > std::numeric_limits<std::size_t>::max() - b) throw std::overflow_error("PLE growth overflow");
+        return batch == 1 ? std::pair{a, b} : std::pair{b, a + b};
+    }
     bool graph_supported() const { return embedding_.graph_supported(); }
     const NgramEmbedding::Context& session_context(const State& state) const { return embedding_.context(state.embedding); }
     void restore_graph_context(State& state,NgramEmbedding::Context context) const { embedding_.restore(state.embedding,std::move(context)); }
@@ -1251,6 +1312,17 @@ class Qsa {
             bytes += std::size_t(capacity) * width * (cache != &request.index && quantization_.enabled() ? 4 : 2);
         }
         return bytes;
+    }
+    std::size_t ordinary_growth_bytes(const State& request, int64_t batch, int64_t tokens) const {
+        if (managed_memory(request) || request.offload) return 0;
+        if (request.graph_keys.defined()) return growth_bytes(request, tokens);
+        std::size_t total = 0;
+        for (const auto* cache : {&request.keys, &request.values, &request.index}) {
+            const auto bytes = cache->growth_bytes(batch, tokens);
+            if (total > std::numeric_limits<std::size_t>::max() - bytes) throw std::overflow_error("QSA growth overflow");
+            total += bytes;
+        }
+        return total;
     }
     std::size_t graph_growth_bytes(const State& request,int64_t capacity) const {
         if(managed_memory(request))return request.memory->growth_bytes(capacity);
