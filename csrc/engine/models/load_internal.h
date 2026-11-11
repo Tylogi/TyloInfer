@@ -115,16 +115,17 @@ inline constexpr auto with_model = []<typename F>(
                 std::unique_ptr<qwen35::State> state;
                 auto executor = execution.executor().fork(model_parallel_primary_device(execution.config));
                 const bool preallocate = ::tyloi::cuda::options::kv_vram_preallocated();
-                owner = std::make_shared<qwen35::Model>(qwen35::load(
-                    source, weights, execution.config.layer_placement, execution.config.yarn,
+                auto definition = tyloi::models::config_json(*source, options.config_path);
+                definition = configure_yarn(execution.config.yarn, execution.config.yarn_context_extension,
+                    std::move(definition), tyloi::models::graph(*source).backbone, options.context_size);
+                owner = std::make_shared<qwen35::Model>(qwen35::read(source, definition, options.context_size));
+                qwen35::load(
+                    *owner, weights, execution.config.layer_placement, execution.config.yarn,
                     execution.config.dense_cpu_layer_count,
                     tyloi::cuda::qwen35::LoadOptions{
-                        .config_path = options.config_path,
-                        .context_size = options.context_size,
                         .gpu_layers = execution.config.n_gpu_layers,
-                        .extend_yarn = execution.config.yarn_context_extension,
                         .expert_parallel = execution.config.expert_parallel.enabled(),
-                        .mirror_scalars = execution.config.tensor_parallel_mirror_linear_attention_scalars}));
+                        .mirror_scalars = execution.config.tensor_parallel_mirror_linear_attention_scalars});
                 state = std::make_unique<qwen35::State>(*owner, execution.executor().mode().transposed);
                 if (preallocate) state->preallocate();
                 auto components = qwen35::Components::load(

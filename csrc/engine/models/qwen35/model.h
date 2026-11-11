@@ -7,8 +7,6 @@
 #include "engine/models/common/capabilities.h"
 #include "engine/models/common/attention.h"
 #include "engine/models/common/linear.h"
-#include "engine/backends/cuda/ops/projection/quant_linear.h"
-#include "engine/backends/cuda/ops/rope/rope.h"
 #include "engine/models/source.h"
 
 #include <cstdint>
@@ -53,6 +51,9 @@ struct Model {
     ::tyloi::Tensor output_norm;
     std::vector<Layer> layers;
     ::tyloi::Tensor embedding(const tyloi::Tensor& ids, int primary = 0) const;
+    ::tyloi::Tensor normalize(const tyloi::Tensor& hidden, std::int64_t batch, std::int64_t tokens) const;
+    ::tyloi::Tensor logits(const tyloi::Tensor& hidden, bool capped = true) const;
+    ::tyloi::Tensor softcap(const tyloi::Tensor& logits) const;
 };
 
 } // namespace tyloi::cuda::qwen35

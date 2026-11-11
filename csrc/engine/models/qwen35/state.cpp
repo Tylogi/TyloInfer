@@ -15,8 +15,6 @@ namespace tyloi::cuda::qwen35 {
 
 namespace {
 
-using DenseTensor = ::tyloi::DenseTensor;
-
 void require_state(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
 }
@@ -28,7 +26,7 @@ bool projected(const ::tyloi::models::LinearInputs& value) {
 }
 
 bool on_layer_device(const ::tyloi::Tensor& tensor, const Layout& layer) {
-    return layer.cpu ? !tensor.is_cuda()
+    return layer.cpu ? tensor.is_cpu()
                      : tensor.is_cuda() && tensor.get_device() == layer.device;
 }
 
@@ -59,6 +57,7 @@ void validate_linear_snapshot(const Layout& model_layer, const LinearLayout& lay
     const auto width = 2 * layer.key_heads * layer.key_dim +
                        layer.value_heads * layer.value_dim;
     if (!(mixer.defined() && mixer.transposed == transposed &&
+          !mixer.convolution.is_encoded() && !mixer.recurrent.is_encoded() &&
           mixer.convolution.scalar_type() == ::tyloi::kFloat32 &&
           mixer.recurrent.scalar_type() == ::tyloi::kFloat32 &&
           mixer.convolution.dim() == 3 && mixer.convolution.size(0) == 1 &&
@@ -471,12 +470,9 @@ State::Restore State::prepare(const TextSessionState& state) const {
             } else {
                 if (saved.kind != HybridBlockSessionStateKind::Recurrent)
                     throw CudaSessionStateError("Qwen hybrid recurrent layer changed");
-                const auto* convolution = saved.convolution.representation<DenseTensor>();
-                const auto* recurrent = saved.recurrent.representation<DenseTensor>();
-                if (!convolution || !recurrent)
-                    throw CudaSessionStateError("Qwen recurrent session topology changed");
                 validate_linear_snapshot(layout, std::get<LinearLayout>(layout.attention),
-                                         tyloi::state::Recurrent::State{*convolution, *recurrent, saved.transposed},
+                                         tyloi::state::Recurrent::State{
+                                             saved.convolution, saved.recurrent, saved.transposed},
                                          !layout.cpu && transposed_);
             }
         }
@@ -513,13 +509,15 @@ void State::stage(Restore& restore, const TextSessionState& state) const {
             auto& linear = std::get<LinearState>(restore.layers[index]);
             linear.speculative_ffn_batches = current.speculative_ffn_batches;
             linear.speculative_projection_batches = current.speculative_projection_batches;
-            const auto& convolution = saved.convolution.dense();
-            const auto& recurrent = saved.recurrent.dense();
+            const auto& convolution = saved.convolution;
+            const auto& recurrent = saved.recurrent;
             // Candidate owns copy targets through the caller's asynchronous drain.
-            linear.mixer.view().convolution = ::tyloi::cuda::empty(
-                convolution.sizes(), convolution.options());
-            linear.mixer.view().recurrent = ::tyloi::cuda::empty(
-                recurrent.sizes(), recurrent.options());
+            linear.mixer.view().convolution = tyloi::ops::empty(
+                {convolution.size(0), convolution.size(1), convolution.size(2)},
+                convolution.options());
+            linear.mixer.view().recurrent = tyloi::ops::empty(
+                {recurrent.size(0), recurrent.size(1), recurrent.size(2), recurrent.size(3)},
+                recurrent.options());
             linear.mixer.restore(tyloi::state::Recurrent::State{convolution, recurrent, saved.transposed});
         }
     }

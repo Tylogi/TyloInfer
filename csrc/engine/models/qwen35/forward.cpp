@@ -78,30 +78,19 @@ void clear_linear_speculative(LinearState& state) noexcept {
 
 ::tyloi::Tensor normalize(const Model& model, Executor& executor, const ::tyloi::Tensor& hidden_handle,
                  std::int64_t batch, std::int64_t tokens) {
-    auto hidden = hidden_handle.dense();
-    hidden = hidden.reshape({batch, tokens, model.metadata.hidden_size});
     auto scope = executor.enter(mfq_current_cuda_device(), FfnMode{});
-    return tyloi::ops::measure("model.output_norm", hidden.device(), [&] {
-        return tyloi::ops::rms_norm(::tyloi::Tensor(std::move(hidden)), model.output_norm,
-                                    model.metadata.rms_norm_eps,
-                                    model.metadata.norm_weight_offset);
-    });
+    return model.normalize(hidden_handle, batch, tokens);
 }
 
 ::tyloi::Tensor softcap(const Model& model, Executor& executor, const ::tyloi::Tensor& logits_handle) {
     auto scope = executor.enter(mfq_current_cuda_device(), FfnMode{});
-    return tyloi::ops::softcap(logits_handle, model.metadata.final_logit_softcapping);
+    return model.softcap(logits_handle);
 }
 
 ::tyloi::Tensor logits(const Model& model, Executor& executor, const ::tyloi::Tensor& hidden_handle, bool capped,
               const Executor::Mode& mode) {
-    auto hidden = hidden_handle.dense();
     auto scope = executor.enter(mfq_current_cuda_device(), mode.ffn);
-    auto result = tyloi::ops::measure("model.lm_head", hidden.device(), [&] {
-        return tyloi::ops::project(::tyloi::Tensor(std::move(hidden)), model.lm_head);
-    });
-    return capped ? tyloi::ops::softcap(result, model.metadata.final_logit_softcapping)
-                  : result;
+    return model.logits(hidden_handle, capped);
 }
 
 namespace {

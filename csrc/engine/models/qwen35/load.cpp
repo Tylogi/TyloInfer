@@ -7,10 +7,11 @@
 #include "engine/models/qwen35/weights.h"
 
 #include "engine/models/common/load.h"
-#include "engine/models/source/model_config.h"
 #include "engine/models/source/model_graph.h"
 #include "engine/weights/loader.h"
 #include "engine/backends/cuda/ops/projection/projection.h"
+#include "engine/backends/cuda/ops/rope/rope.h"
+#include "engine/backends/cuda/kernels/mfq_cuda_kv_quantization.h"
 #include "engine/weights/quant.h"
 #include "engine/weights/source/read.h"
 
@@ -183,10 +184,8 @@ Layer load_layer(const ::tyloi::weights::Loader& weights, const Config& config,
     return result;
 }
 
-Model load(std::shared_ptr<const tyloi::ModelSource> source,
-           const ::tyloi::weights::Loader& weights, LayerPlacementConfig& placement,
-           tyloi::ops::YarnScaling& yarn, int& cpu_layers,
-           const LoadOptions& options) {
+Model read(std::shared_ptr<const tyloi::ModelSource> source,
+           std::string_view definition, std::int64_t context) {
     tyloi::cuda::validate_model_source(*source);
     Model model;
     model.source = std::move(source);
@@ -196,22 +195,24 @@ Model load(std::shared_ptr<const tyloi::ModelSource> source,
     if (model.graph.component("vision") != nullptr &&
         model.plan.vision != CudaVisionAdapter::grid_vit)
         throw std::runtime_error("Qwen CUDA vision requires grid_vit/grid_vision.v1/grid_mrope");
-    auto definition = tyloi::models::config_json(source_ref, options.config_path);
-    definition = tyloi::cuda::configure_yarn(yarn, options.extend_yarn, std::move(definition),
-                                           model.graph.backbone, options.context_size);
     if (model.graph.backbone != "qwen3_5" && model.graph.backbone != "generic_qwen")
         throw std::runtime_error("Qwen3.5 loading requires a Qwen-compatible model graph");
     model.config = Config::from_json(definition, model.graph);
     model.config.legacy_tensor_layout = source_ref.tensor_layout();
-    if (options.context_size > 0) {
-        if (options.context_size > model.config.max_position_embeddings)
+    if (context > 0) {
+        if (context > model.config.max_position_embeddings)
             throw std::runtime_error("--ctx-size exceeds max_position_embeddings");
-        model.config.max_position_embeddings = options.context_size;
+        model.config.max_position_embeddings = context;
     }
     if (model.config.num_hidden_layers != model.graph.topology.text_layers)
         throw std::runtime_error("model graph/config text-layer topology mismatch");
     model.metadata = tyloi::models::qwen35::metadata_from_config(model.config);
+    return model;
+}
 
+void load(Model& model, const ::tyloi::weights::Loader& weights,
+          LayerPlacementConfig& placement, const tyloi::ops::YarnScaling& yarn,
+          int& cpu_layers, const LoadOptions& options) {
     if (options.expert_parallel && model.config.num_experts <= 0)
         throw std::runtime_error("--expert-parallel requires a model with routed experts");
 
@@ -293,7 +294,6 @@ Model load(std::shared_ptr<const tyloi::ModelSource> source,
             throw std::invalid_argument("streamed model setup requires deferred layers");
         model.output_norm = weights.tensor("model.output_norm.weight");
     }
-    return model;
 }
 
 std::optional<Predictor> load_predictor(TransformerWeightLoader& loader,

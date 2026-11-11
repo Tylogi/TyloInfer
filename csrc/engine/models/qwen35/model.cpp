@@ -22,4 +22,23 @@ namespace tyloi::cuda::qwen35 {
     return tyloi::ops::contiguous(tyloi::ops::cast(result, tyloi::ScalarType::float16));
 }
 
+::tyloi::Tensor Model::normalize(const tyloi::Tensor& hidden, std::int64_t batch, std::int64_t tokens) const {
+    auto shaped = tyloi::ops::reshape(hidden, {batch, tokens, metadata.hidden_size});
+    return tyloi::ops::measure("model.output_norm", shaped.device(), [&] {
+        return tyloi::ops::rms_norm(shaped, output_norm, metadata.rms_norm_eps,
+                                    metadata.norm_weight_offset);
+    });
+}
+
+::tyloi::Tensor Model::softcap(const tyloi::Tensor& logits) const {
+    return tyloi::ops::softcap(logits, metadata.final_logit_softcapping);
+}
+
+::tyloi::Tensor Model::logits(const tyloi::Tensor& hidden, bool capped) const {
+    auto result = tyloi::ops::measure("model.lm_head", hidden.device(), [&] {
+        return tyloi::ops::project(hidden, lm_head);
+    });
+    return capped ? softcap(result) : result;
+}
+
 } // namespace tyloi::cuda::qwen35

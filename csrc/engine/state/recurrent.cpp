@@ -4,17 +4,25 @@
 
 #include <stdexcept>
 #include <utility>
+#include <vector>
 
 namespace tyloi::state {
 
 namespace {
 ::tyloi::Tensor storage(const ::tyloi::Tensor& target,
                         const ::tyloi::Tensor& source) {
-    const auto& source_dense = source.dense();
-    if (target.defined() && target.dense().sizes() == source_dense.sizes() &&
-        target.scalar_type() == source.scalar_type() && target.device() == source.device())
-        return target;
-    return ::tyloi::ops::empty(source_dense.sizes(), source.options());
+    if (target.defined() && target.dim() == source.dim() &&
+        target.scalar_type() == source.scalar_type() && target.device() == source.device()) {
+        bool reuse = true;
+        for (std::int64_t axis = 0; axis < source.dim(); ++axis)
+            if (target.size(axis) != source.size(axis)) { reuse = false; break; }
+        if (reuse) return target;
+    }
+    std::vector<std::int64_t> shape;
+    shape.reserve(source.dim());
+    for (std::int64_t axis = 0; axis < source.dim(); ++axis)
+        shape.push_back(source.size(axis));
+    return ::tyloi::ops::empty(shape, source.options());
 }
 } // namespace
 
