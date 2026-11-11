@@ -43,6 +43,7 @@ struct GraphConfig {
 };
 
 struct Config {
+    Device device;
     std::vector<Device> devices;
     std::unordered_set<std::int64_t> stop_token_ids;
     std::uint64_t resident_budget_bytes = 0;

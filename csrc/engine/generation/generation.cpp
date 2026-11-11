@@ -71,7 +71,7 @@ struct Plain {
     }
     int64_t first_token() {
         const auto token = ops::item(pending);
-        weights.prepare(::tyloi::weights::Cache::Stage::decode, Device(kCUDA, forward_options.primary), source);
+        weights.prepare(::tyloi::weights::Cache::Stage::decode, config.device, source);
         graph_active = config.decode_graph.enabled &&
             (!prepared || !prepared->transformed()) && !input.token_constraint && info.decode_graph &&
             graph.graph && input.sampling.max_tokens >= config.decode_graph.minimum_generation_tokens &&
@@ -199,7 +199,7 @@ struct Native {
         const auto chunk_size = budget.prefill(prompt.size(), config.generation.prefill_chunk_size,
             info.prefill_row_bytes, state.position() > 0, config.prefill_chunk_auto);
         auto full_ids = ops::reshape(ops::tensor(std::span<const int64_t>(prompt),
-            Device(kCUDA, forward_options.primary)), {1, -1});
+            config.device), {1, -1});
         graph.ensure_storage(info.vocab_size);
         Sampler sampler(input.sampling, full_ids.device());
         const bool penalties = sampler.has_penalties();

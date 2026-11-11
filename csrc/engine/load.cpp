@@ -160,6 +160,7 @@ std::unique_ptr<engine::Engine> load_native_engine(CudaEngineOptions options, en
                 state->supports_paged_text_session_state());
         }
         const auto mode = root->forward_mode(load.layer_placement.primary_device());
+        config.device = Device(kCUDA, load.layer_placement.primary_device());
         config.devices = cuda_devices(load);
         config.online_budget = load.layer_placement.devices.size() <= 1 &&
             !load.tensor_parallel.enabled() && !load.expert_parallel.enabled();
