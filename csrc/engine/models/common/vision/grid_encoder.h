@@ -1,5 +1,7 @@
 #pragma once
 #include "engine/models/common/prompt.h"
+#include "engine/models/common/check.h"
+#include "engine/generation/sequence.h"
 
 #include "engine/weights/fields.h"
 #include "engine/weights/cache.h"
@@ -9,7 +11,6 @@
 #include "engine/backends/cuda/ops/projection/projection.h"
 #include "engine/backends/cuda/ops/vision/attention.h"
 #include "engine/ops.h"
-#include "engine/models/common/vision/grid_forward.h"
 #include "engine/models/common/vision/grid_vision.h"
 #include "engine/requests/media.h"
 #include "engine/state/session/prefix_cache.h"
@@ -43,11 +44,11 @@ class CudaGridVisionEncoder {
 
 #ifdef TYLOINFER_NATIVE_CUDA
     tyloi::StepSequence<::tyloi::Tensor> encode(
-                                   ::tyloi::Tensor pixels, const std::vector<GridShape> &grids) const;
+                                   ::tyloi::Tensor pixels, std::vector<GridShape> grids) const;
 #else
     tyloi::StepSequence<DenseTensor> encode(
                                    Projector projector,
-                                   DenseTensor pixels, const std::vector<GridShape> &grids) const;
+                                   DenseTensor pixels, std::vector<GridShape> grids) const;
 #endif
 
     const GridVisionConfig &config() const noexcept { return config_; }
@@ -256,26 +257,20 @@ class CudaGridVisionPromptComponent {
                 else
                     co_yield step.state;
             }
+            const auto unit = encoder_.config().spatial_merge_size * encoder_.config().spatial_merge_size;
+            tyloi::models::require_model(unit > 0 && patches.size(0) > 0 && patches.size(0) % unit == 0,
+                          "grid-Vision patch count is not divisible by merge unit");
             const auto merge = [&](const auto &norm, const auto &up, const auto &down) {
-                return tyloi::models::grid_vision::merge(
 #ifdef TYLOINFER_NATIVE_CUDA
-                    patches, patches.size(0), encoder_.config(),
-                    [&](::tyloi::Tensor value) { return norm(value); },
-                    [](::tyloi::Tensor value, int64_t rows, int64_t width) {
-                        return tyloi::ops::reshape(value, {rows, width});
-                    },
-                    [&](::tyloi::Tensor value) { return tyloi::ops::affine(value, up.weight, up.bias); },
-                    [](::tyloi::Tensor value) { return tyloi::ops::gelu(value); },
-                    [&](::tyloi::Tensor value) { return tyloi::ops::affine(value, down.weight, down.bias); });
+                auto grouped = tyloi::ops::reshape(norm(patches),
+                    {patches.size(0) / unit, unit * encoder_.config().hidden_size});
+                return tyloi::ops::affine(tyloi::ops::gelu(
+                    tyloi::ops::affine(grouped, up.weight, up.bias)), down.weight, down.bias);
 #else
-                    patches, patches.size(0), encoder_.config(),
-                    [&](DenseTensor value) { return norm(value); },
-                    [](DenseTensor value, int64_t rows, int64_t width) {
-                        return value.reshape({rows, width});
-                    },
-                    [&](DenseTensor value) { return tyloi::cuda::affine(projector, up, std::move(value)); },
-                    [](DenseTensor value) { return ::tyloi::cuda::gelu(value, "none"); },
-                    [&](DenseTensor value) { return tyloi::cuda::affine(projector, down, std::move(value)); });
+                auto grouped = norm(patches).reshape(
+                    {patches.size(0) / unit, unit * encoder_.config().hidden_size});
+                return tyloi::cuda::affine(projector, down, ::tyloi::cuda::gelu(
+                    tyloi::cuda::affine(projector, up, std::move(grouped)), "none"));
 #endif
             };
             if (encoder_.host_weights()) {
@@ -312,72 +307,59 @@ class CudaGridVisionPromptComponent {
             co_yield tyloi::StepState::advanced;
         }
 
-        auto prepared = tyloi::models::grid_vision::prepare(
 #ifdef TYLOINFER_NATIVE_CUDA
-            token_ids, merged, merged.size(0), image_token_id_, video_token_id_, encoder_.config(),
+        auto ids = tyloi::ops::tensor(token_ids, tyloi::Device{tyloi::kCUDA, primary});
+        auto shaped = tyloi::ops::reshape(ids, {1, -1});
+        auto embeddings = tyloi::ops::contiguous(language.embedding(shaped, primary));
 #else
-            token_ids, merged, merged.size(0), image_token_id_, video_token_id_, encoder_.config(),
+        auto ids = ::tyloi::cuda::tensor(token_ids, ::tyloi::TensorOptions()
+            .dtype(::tyloi::kInt64).device(::tyloi::kCUDA)).reshape({1, -1});
+        DenseTensor embeddings;
+        if constexpr (requires(const Model &value, tyloi::cuda::Executor &value_executor,
+                               tyloi::cuda::Collectives &collectives, int primary,
+                               DenseTensor value_ids) {
+                          embed(value, value_executor, collectives, primary, std::move(value_ids));
+                      }) {
+            if (!executor)
+                throw std::invalid_argument("CUDA grid-Vision Qwen embedding requires an executor");
+            embeddings = embed(language, *executor, collectives, primary, std::move(ids)).contiguous();
+        } else {
+            embeddings = language.embed_forward(ids).contiguous();
+        }
 #endif
-            {grid},
-            [&](const auto &tokens) {
+        std::vector<int64_t> placeholders;
+        for (size_t i = 0; i < token_ids.size(); ++i) {
+            if (token_ids[i] == image_token_id_)
+                placeholders.push_back(static_cast<int64_t>(i));
+            else if (token_ids[i] == video_token_id_)
+                throw std::invalid_argument(
+                    "grid-Vision image preparation does not accept video placeholders");
+        }
+        if (static_cast<int64_t>(placeholders.size()) != merged.size(0))
+            throw std::invalid_argument("image placeholders disagree with merged vision patches");
 #ifdef TYLOINFER_NATIVE_CUDA
-                auto ids = tyloi::ops::tensor(tokens, tyloi::Device{tyloi::kCUDA, primary});
-                auto shaped = tyloi::ops::reshape(ids, {1, -1});
-                return tyloi::ops::contiguous(language.embedding(shaped, primary));
+        auto index = tyloi::ops::tensor(placeholders, embeddings.device());
+        tyloi::ops::index_copy(embeddings, 1, index,
+            tyloi::ops::unsqueeze(tyloi::ops::cast(merged, embeddings.scalar_type()), 0));
 #else
-                auto ids =
-                    ::tyloi::cuda::tensor(tokens, ::tyloi::TensorOptions()
-                                                           .dtype(::tyloi::kInt64)
-                                                           .device(::tyloi::kCUDA));
-                ids = ids.reshape({1, -1});
-                if constexpr (requires(const Model &value, tyloi::cuda::Executor &value_executor,
-                                       tyloi::cuda::Collectives &collectives, int primary,
-                                       DenseTensor value_ids) {
-                                  embed(value, value_executor, collectives, primary,
-                                        std::move(value_ids));
-                              }) {
-                    if (!executor)
-                        throw std::invalid_argument(
-                            "CUDA grid-Vision Qwen embedding requires an executor");
-                    return embed(language, *executor, collectives, primary, std::move(ids))
-                        .contiguous();
-                } else {
-                    return language.embed_forward(ids).contiguous();
-                }
+        auto index = ::tyloi::cuda::tensor(placeholders, ::tyloi::TensorOptions()
+            .dtype(::tyloi::kInt64).device(::tyloi::kCUDA));
+        embeddings.index_copy_(1, index, merged.to(embeddings.scalar_type()).unsqueeze(0));
 #endif
-            },
+        auto semantic = build_grid_mrope_positions(token_ids, image_token_id_, video_token_id_,
+            static_cast<int32_t>(encoder_.config().spatial_merge_size), {grid}, {});
 #ifdef TYLOINFER_NATIVE_CUDA
-            [](::tyloi::Tensor& embeddings, const ::tyloi::Tensor& vision, const std::vector<int64_t> &indices) {
-                auto index = tyloi::ops::tensor(indices, embeddings.device());
-                tyloi::ops::index_copy(embeddings, 1, index,
-                    tyloi::ops::unsqueeze(tyloi::ops::cast(vision, embeddings.scalar_type()), 0));
+        auto positions = tyloi::ops::tensor(semantic.values, tyloi::Device{tyloi::DeviceType::cpu, 0});
+        positions = tyloi::ops::reshape(positions, {3, semantic.token_count});
+        positions = tyloi::ops::cast(positions, ::tyloi::kInt32, tyloi::Device{tyloi::kCUDA, primary});
+        positions = tyloi::ops::cast(positions, ::tyloi::kInt64);
 #else
-            [](DenseTensor &embeddings, const DenseTensor &vision, const std::vector<int64_t> &indices) {
-                auto index =
-                    ::tyloi::cuda::tensor(indices, ::tyloi::TensorOptions()
-                                                            .dtype(::tyloi::kInt64)
-                                                            .device(::tyloi::kCUDA));
-                embeddings.index_copy_(1, index, vision.to(embeddings.scalar_type()).unsqueeze(0));
+        auto positions = ::tyloi::cuda::tensor(semantic.values, ::tyloi::TensorOptions()
+            .dtype(::tyloi::kInt32).device(::tyloi::kCPU))
+            .reshape({3, semantic.token_count}).to(::tyloi::kCUDA).to(::tyloi::kInt64);
 #endif
-            },
-            [primary](const GridMropePositions &positions) {
-#ifdef TYLOINFER_NATIVE_CUDA
-                auto values = tyloi::ops::tensor(positions.values, tyloi::Device{tyloi::DeviceType::cpu, 0});
-                values = tyloi::ops::reshape(values, {3, positions.token_count});
-                values = tyloi::ops::cast(values, ::tyloi::kInt32, tyloi::Device{tyloi::kCUDA, primary});
-                return tyloi::ops::cast(values, ::tyloi::kInt64);
-#else
-                return ::tyloi::cuda::tensor(positions.values,
-                                                  ::tyloi::TensorOptions()
-                                                      .dtype(::tyloi::kInt32)
-                                                      .device(::tyloi::kCPU))
-                    .reshape({3, positions.token_count})
-                    .to(::tyloi::kCUDA)
-                    .to(::tyloi::kInt64);
-#endif
-            });
-        co_yield tyloi::models::Prepared{token_ids, std::move(prepared.embeddings),
-                                    std::move(prepared.positions), prepared.decode_delta,
+        co_yield tyloi::models::Prepared{token_ids, std::move(embeddings),
+                                    std::move(positions), semantic.decode_delta,
                                     std::move(cache_key)};
     }
 

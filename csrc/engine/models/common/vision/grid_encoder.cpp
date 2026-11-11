@@ -5,6 +5,7 @@
 #include "engine/weights/loader.h"
 
 #include <algorithm>
+#include <cmath>
 #include <stdexcept>
 
 namespace tyloi::cuda::grid_vision_runtime {
@@ -130,149 +131,132 @@ tyloi::StepSequence<DenseTensor> CudaGridVisionEncoder::encode(
     Projector projector,
     DenseTensor pixels,
 #endif
-    const std::vector<GridShape> &grids) const {
+    std::vector<GridShape> grids) const {
     // Everything this encoder stages follows the pixels' device.
-#ifdef TYLOINFER_NATIVE_CUDA
     const auto device = pixels.device();
-#else
-    const auto device = pixels.device();
-#endif
-    return tyloi::models::grid_vision::encode(
-        std::move(pixels), config_, grids, blocks_,
-        [this, device](auto input, int64_t count) {
+    const auto layout = make_grid_vision_layout(grids, static_cast<int32_t>(config_.spatial_merge_size));
+    const auto side = static_cast<int32_t>(std::sqrt(static_cast<double>(config_.num_position_embeddings)));
+    const auto interpolation = make_learned_position_interpolation(
+        grids, static_cast<int32_t>(config_.spatial_merge_size), side);
+    const auto count = layout.patch_count;
+    auto patch = [&](auto input) {
 #ifdef TYLOINFER_NATIVE_CUDA
-            if (input.dim() == 5)
-                input = tyloi::ops::reshape(input, {input.size(0), -1});
-            if (input.dim() != 2 || input.size(0) != count ||
-                input.size(1) != config_.patch_width())
+        if (input.dim() == 5)
+            input = tyloi::ops::reshape(input, {input.size(0), -1});
 #else
-            if (input.dim() == 5)
-                input = input.reshape({input.size(0), -1});
-            if (input.dim() != 2 || input.size(0) != count ||
-                input.size(1) != config_.patch_width())
+        if (input.dim() == 5)
+            input = input.reshape({input.size(0), -1});
 #endif
-                throw std::runtime_error(
-                    "grid-ViT pixel values must be flattened CxTxHxW patches");
-            auto run = [&] {
+        if (input.dim() != 2 || input.size(0) != count ||
+            input.size(1) != config_.patch_width())
+            throw std::runtime_error(
+                "grid-ViT pixel values must be flattened CxTxHxW patches");
+        auto run = [&] {
 #ifdef TYLOINFER_NATIVE_CUDA
-                auto weight = tyloi::ops::cast(patch_weight_, patch_weight_.scalar_type(), device);
-                weight = tyloi::ops::reshape(weight, {config_.hidden_size, config_.patch_width()});
-                auto output = tyloi::ops::matmul(tyloi::ops::cast(input, weight.scalar_type()),
-                                               tyloi::ops::transpose(weight, 0, 1));
-                auto bias = tyloi::ops::cast(patch_bias_, patch_bias_.scalar_type(), device);
-                bias = tyloi::ops::cast(bias, output.scalar_type());
-                return tyloi::ops::add(output, bias);
+            auto weight = tyloi::ops::cast(patch_weight_, patch_weight_.scalar_type(), device);
+            weight = tyloi::ops::reshape(weight, {config_.hidden_size, config_.patch_width()});
+            auto output = tyloi::ops::matmul(tyloi::ops::cast(input, weight.scalar_type()),
+                                           tyloi::ops::transpose(weight, 0, 1));
+            auto bias = tyloi::ops::cast(patch_bias_, patch_bias_.scalar_type(), device);
+            bias = tyloi::ops::cast(bias, output.scalar_type());
+            return tyloi::ops::add(output, bias);
 #else
-                auto weight = patch_weight_.to(::tyloi::kCUDA)
-                                  .reshape({config_.hidden_size, config_.patch_width()});
-                auto output = ::tyloi::cuda::matmul(input.to(weight.scalar_type()),
-                                                         weight.transpose(0, 1));
-                return output + patch_bias_.to(::tyloi::kCUDA)
-                                   .to(output.scalar_type());
+            auto weight = patch_weight_.to(::tyloi::kCUDA)
+                              .reshape({config_.hidden_size, config_.patch_width()});
+            auto output = ::tyloi::cuda::matmul(input.to(weight.scalar_type()),
+                                                     weight.transpose(0, 1));
+            return output + patch_bias_.to(::tyloi::kCUDA)
+                               .to(output.scalar_type());
 #endif
-            };
-            if (!host_weights()) return run();
-            tyloi::weights::Loan loan(weights_,
+        };
+        if (!host_weights()) return run();
+        tyloi::weights::Loan loan(weights_,
+                   patch_weight_.nbytes() + patch_bias_.nbytes() +
+                   std::size_t(count * config_.hidden_size) * 16);
 #ifdef TYLOINFER_NATIVE_CUDA
-                       patch_weight_.nbytes() + patch_bias_.nbytes() +
+        return loan.finish(run());
 #else
-                       patch_weight_.nbytes() + patch_bias_.nbytes() +
+        return DenseTensor(loan.finish(std::make_shared<DenseTensor>(run())).dense());
 #endif
-                       std::size_t(count * config_.hidden_size) * 16);
+    };
+    auto hidden = patch(std::move(pixels));
+    auto position = [&] {
+        auto run = [&] {
 #ifdef TYLOINFER_NATIVE_CUDA
-            return loan.finish(run());
+            auto position_weight = tyloi::ops::cast(position_weight_, position_weight_.scalar_type(), device);
+            auto index = tyloi::ops::tensor(interpolation.indices, tyloi::Device{tyloi::DeviceType::cpu, 0});
+            index = tyloi::ops::cast(index, ::tyloi::kInt32, position_weight.device());
+            index = tyloi::ops::cast(index, ::tyloi::kInt64);
+            auto weights = tyloi::ops::tensor(interpolation.weights, tyloi::Device{tyloi::DeviceType::cpu, 0});
+            weights = tyloi::ops::reshape(weights, {interpolation.patch_count, 4, 1});
+            weights = tyloi::ops::cast(weights, ::tyloi::kFloat32, position_weight.device());
+            auto selected = tyloi::ops::index_select(position_weight, 0, tyloi::ops::reshape(index, {-1}));
+            selected = tyloi::ops::reshape(selected, {interpolation.patch_count, 4, config_.hidden_size});
+            return tyloi::ops::sum(tyloi::ops::multiply(selected, weights), 1);
 #else
-            return DenseTensor(loan.finish(std::make_shared<DenseTensor>(run())).dense());
+            auto position_weight = position_weight_.to(::tyloi::kCUDA);
+            auto index = ::tyloi::cuda::tensor(
+                             interpolation.indices,
+                             ::tyloi::TensorOptions()
+                                 .dtype(::tyloi::kInt32)
+                                 .device(::tyloi::kCPU))
+                             .to(position_weight.device())
+                             .to(::tyloi::kInt64);
+            auto weights = ::tyloi::cuda::tensor(
+                               interpolation.weights,
+                               ::tyloi::TensorOptions()
+                                   .dtype(::tyloi::kFloat32)
+                                   .device(::tyloi::kCPU))
+                               .reshape({interpolation.patch_count, 4, 1})
+                               .to(position_weight.device());
+            return ::tyloi::cuda::sum(
+                position_weight.index_select(0, index.reshape({-1}))
+                        .reshape({interpolation.patch_count, 4, config_.hidden_size}) *
+                    weights,
+                1);
 #endif
-        },
-        [this, device](const LearnedPositionInterpolation &interpolation) {
-            auto run = [&] {
+        };
+        if (!host_weights()) return run();
+        tyloi::weights::Loan loan(weights_,
+                   position_weight_.nbytes() +
+                   std::size_t(interpolation.patch_count * config_.hidden_size) * 48);
 #ifdef TYLOINFER_NATIVE_CUDA
-                auto position_weight = tyloi::ops::cast(position_weight_, position_weight_.scalar_type(), device);
-                auto index = tyloi::ops::tensor(interpolation.indices, tyloi::Device{tyloi::DeviceType::cpu, 0});
-                index = tyloi::ops::cast(index, ::tyloi::kInt32, position_weight.device());
-                index = tyloi::ops::cast(index, ::tyloi::kInt64);
-                auto weights = tyloi::ops::tensor(interpolation.weights, tyloi::Device{tyloi::DeviceType::cpu, 0});
-                weights = tyloi::ops::reshape(weights, {interpolation.patch_count, 4, 1});
-                weights = tyloi::ops::cast(weights, ::tyloi::kFloat32, position_weight.device());
-                auto selected = tyloi::ops::index_select(position_weight, 0, tyloi::ops::reshape(index, {-1}));
-                selected = tyloi::ops::reshape(selected, {interpolation.patch_count, 4, config_.hidden_size});
-                return tyloi::ops::sum(tyloi::ops::multiply(selected, weights), 1);
+        return loan.finish(run());
 #else
-                auto position_weight = position_weight_.to(::tyloi::kCUDA);
-                auto index = ::tyloi::cuda::tensor(
-                                 interpolation.indices,
-                                 ::tyloi::TensorOptions()
-                                     .dtype(::tyloi::kInt32)
-                                     .device(::tyloi::kCPU))
-                                 .to(position_weight.device())
-                                 .to(::tyloi::kInt64);
-                auto weights = ::tyloi::cuda::tensor(
-                                   interpolation.weights,
-                                   ::tyloi::TensorOptions()
-                                       .dtype(::tyloi::kFloat32)
-                                       .device(::tyloi::kCPU))
-                                   .reshape({interpolation.patch_count, 4, 1})
-                                   .to(position_weight.device());
-                return ::tyloi::cuda::sum(
-                    position_weight.index_select(0, index.reshape({-1}))
-                            .reshape({interpolation.patch_count, 4, config_.hidden_size}) *
-                        weights,
-                    1);
+        return DenseTensor(loan.finish(std::make_shared<DenseTensor>(run())).dense());
 #endif
-            };
-            if (!host_weights()) return run();
-            tyloi::weights::Loan loan(weights_,
+    };
+    {
+        auto learned = position();
 #ifdef TYLOINFER_NATIVE_CUDA
-                       position_weight_.nbytes() +
+        auto dtype = hidden.scalar_type();
+        hidden = tyloi::ops::add(hidden, tyloi::ops::cast(learned, dtype));
 #else
-                       position_weight_.nbytes() +
+        hidden = hidden + learned.to(hidden.scalar_type());
 #endif
-                       std::size_t(interpolation.patch_count * config_.hidden_size) * 48);
-#ifdef TYLOINFER_NATIVE_CUDA
-            return loan.finish(run());
-#else
-            return DenseTensor(loan.finish(std::make_shared<DenseTensor>(run())).dense());
-#endif
-        },
-        [](auto hidden, auto learned) {
-#ifdef TYLOINFER_NATIVE_CUDA
-            auto dtype = hidden.scalar_type();
-            return tyloi::ops::add(hidden, tyloi::ops::cast(learned, dtype));
-#else
-            return hidden + learned.to(hidden.scalar_type());
-#endif
-        },
-        [this
-#ifndef TYLOINFER_NATIVE_CUDA
-         , projector
-#endif
-        ](const auto &block, auto value, const GridVisionLayout &layout) {
+    }
+    co_yield tyloi::StepState::advanced;
+    for (const auto &block : blocks_) {
+        {
+            auto value = std::move(hidden);
             // FP32 RoPE intermediates, Q/K/V copies and residual overlap;
             // FFN input/output plus a decoded FP16 projection. GELU is fused.
             const auto projection_scratch =
                 std::size_t(2) * config_.hidden_size *
                 std::max<int64_t>(3 * config_.hidden_size, config_.intermediate_size);
             if (host_weights()) {
-#ifdef TYLOINFER_NATIVE_CUDA
                 tyloi::weights::Loan loan(weights_, ::tyloi::weights::fields::bytes(block) + value.nbytes() * 16 + projection_scratch +
                            std::size_t(value.size(0) * config_.intermediate_size) * 12 +
                            (std::size_t(16) << 20));
+#ifdef TYLOINFER_NATIVE_CUDA
                 ::tyloi::Tensor output;
 #else
-                tyloi::weights::Loan loan(weights_, ::tyloi::weights::fields::bytes(block) + value.nbytes() * 16 + projection_scratch +
-                           std::size_t(value.size(0) * config_.intermediate_size) * 12 +
-                           (std::size_t(16) << 20));
                 DenseTensor output;
 #endif
                 {
                     // Block weights stage on the same device as the hidden state.
                     auto resident = block;
-#ifdef TYLOINFER_NATIVE_CUDA
                     ::tyloi::weights::fields::to_device(resident, value.device());
-#else
-                    ::tyloi::weights::fields::to_device(resident, value.device());
-#endif
                     output = resident(
 #ifndef TYLOINFER_NATIVE_CUDA
                         projector,
@@ -280,17 +264,21 @@ tyloi::StepSequence<DenseTensor> CudaGridVisionEncoder::encode(
                         value, layout.positions, layout.segment_lengths);
                 }
 #ifdef TYLOINFER_NATIVE_CUDA
-                return loan.finish(std::move(output));
+                hidden = loan.finish(std::move(output));
 #else
-                return DenseTensor(loan.finish(std::make_shared<DenseTensor>(std::move(output))).dense());
+                hidden = DenseTensor(loan.finish(std::make_shared<DenseTensor>(std::move(output))).dense());
 #endif
-            }
-            return block(
+            } else {
+                hidden = block(
 #ifndef TYLOINFER_NATIVE_CUDA
-                projector,
+                    projector,
 #endif
-                std::move(value), layout.positions, layout.segment_lengths);
-        });
+                    std::move(value), layout.positions, layout.segment_lengths);
+            }
+        }
+        co_yield tyloi::StepState::advanced;
+    }
+    co_yield std::move(hidden);
 }
 
 CudaGridVisionEncoder::CudaGridVisionEncoder(
