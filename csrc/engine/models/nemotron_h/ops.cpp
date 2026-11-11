@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <array>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -31,6 +32,23 @@ namespace tyloi::cuda::nemotron_h {
 namespace {
 
 using DenseTensor = ::tyloi::DenseTensor;
+
+std::pair<int64_t, int64_t> mamba_widths(int64_t heads, int64_t head_dim,
+                                         int64_t groups, int64_t state_size, int64_t kernel) {
+    if (heads <= 0 || head_dim <= 0 || groups <= 0 || state_size <= 0 || kernel <= 0)
+        throw std::invalid_argument("invalid Nemotron-H mamba dimensions");
+    const auto limit = std::numeric_limits<int64_t>::max();
+    if (heads > limit / head_dim || groups > limit / state_size)
+        throw std::overflow_error("Nemotron-H mamba width overflow");
+    const auto inner = heads * head_dim;
+    const auto grouped = groups * state_size;
+    if (grouped > (limit - inner) / 2)
+        throw std::overflow_error("Nemotron-H mamba width overflow");
+    const auto conv = inner + 2 * grouped;
+    if (inner > limit - conv || heads > limit - conv - inner)
+        throw std::overflow_error("Nemotron-H mamba width overflow");
+    return {inner, conv};
+}
 
 // Mamba-2 has the same state lifetime as GDN but different equations: the
 // depthwise convolution state and the selective-scan state are separate, and
@@ -94,8 +112,7 @@ static DenseTensor mamba_forward(const Mamba& weights, MambaState& activity, Exe
     const int64_t head_dim = mamba_head_dim;
     const int64_t groups = mamba_groups;
     const int64_t state_width = ssm_state_size;
-    const int64_t inner = heads * head_dim;
-    const int64_t conv_width = inner + 2 * groups * state_width;
+    const auto [inner, conv_width] = mamba_widths(heads, head_dim, groups, state_width, conv_kernel);
     const int64_t projection_width = conv_width + inner + heads;
     const auto f32 = ::tyloi::TensorOptions()
                          .device(::tyloi::kCUDA)
@@ -948,6 +965,52 @@ void State::commit_speculative() {
 }
 
 #ifdef TYLOINFER_NATIVE_CUDA
+std::vector<std::pair<tyloi::Device, std::size_t>> State::growth(
+        std::int64_t tokens, const tyloi::models::ForwardOptions& options) const {
+    if (batch <= 0 || tokens <= 0 || cache_pos < 0 || speculative_start >= 0)
+        throw std::invalid_argument("invalid Nemotron-H state allocation request");
+    if (cache_pos > std::numeric_limits<std::int64_t>::max() - tokens)
+        throw std::overflow_error("Nemotron-H state position overflow");
+    const auto end = cache_pos + tokens;
+    std::vector<std::pair<tyloi::Device, std::size_t>> result;
+    for (std::size_t index = 0; index < layers.size(); ++index) {
+        const auto& layout = layout_[index];
+        if (layout.device < 0) throw std::invalid_argument("invalid Nemotron-H state device");
+        const tyloi::Device device(tyloi::kCUDA, layout.device);
+        std::size_t bytes = 0;
+        if (const auto* full = std::get_if<FullLayout>(&layout.mixer)) {
+            if (std::get<tyloi::state::KvView>(layers[index]).defined()) continue;
+            const auto capacity = full->sliding ? full->capacity :
+                (options.kv_capacity > 0 ? std::max(end, options.kv_capacity) : full->capacity);
+            bytes = tyloi::state::kv_bytes(batch, full->heads, capacity, full->head_dim,
+                                          full->sliding, full->dtype, full->quantization);
+        } else if (const auto* mamba = std::get_if<MambaLayout>(&layout.mixer)) {
+            const auto& mixer = std::get<MambaState>(layers[index]).mixer;
+            if (mixer.pending()) throw std::invalid_argument("Nemotron-H speculative state is pending");
+            const auto [inner, width] = mamba_widths(mamba->heads, mamba->head_dim,
+                                                    mamba->groups, mamba->state_size, mamba->conv_kernel);
+            (void)inner;
+            if (mixer.defined()) continue;
+            const std::array<std::int64_t, 3> conv{batch, mamba->conv_kernel - 1, width};
+            const std::array<std::int64_t, 4> recurrent{batch, mamba->heads, mamba->head_dim, mamba->state_size};
+            bytes = tyloi::make_contiguous_view(nullptr, conv, tyloi::kFloat32, device).nbytes();
+            const auto recurrent_bytes = tyloi::make_contiguous_view(nullptr, recurrent, tyloi::kFloat32, device).nbytes();
+            if (bytes > std::numeric_limits<std::size_t>::max() - recurrent_bytes)
+                throw std::overflow_error("Nemotron-H state byte count overflow");
+            bytes += recurrent_bytes;
+        } else continue;
+        auto entry = std::find_if(result.begin(), result.end(),
+                                  [device](const auto& item) { return item.first == device; });
+        if (entry == result.end()) result.emplace_back(device, bytes);
+        else {
+            if (entry->second > std::numeric_limits<std::size_t>::max() - bytes)
+                throw std::overflow_error("Nemotron-H state byte count overflow");
+            entry->second += bytes;
+        }
+    }
+    return result;
+}
+
 void State::rollback_speculative(std::int64_t accepted) {
     tyloi::models::require_model(speculative_start >= 0 && accepted >= 0, "no speculative transaction");
     const auto keep = speculative_start + speculative_confirmed + accepted;

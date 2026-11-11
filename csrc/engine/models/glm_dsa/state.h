@@ -32,6 +32,9 @@ public:
     void set_position_delta(int64_t delta) noexcept { decode_position_delta = delta; }
     void preallocate() {}
 #ifdef TYLOINFER_NATIVE_CUDA
+    // Plans ordinary forward allocations; other execution paths plan separately.
+    std::vector<std::pair<tyloi::Device, std::size_t>> growth(
+        std::int64_t tokens, const tyloi::models::ForwardOptions& options) const override;
     std::vector<::tyloi::Tensor> storage() const;
     std::vector<::tyloi::Tensor*> graph_state() { return {}; }
 #else
@@ -49,7 +52,11 @@ public:
     int64_t cache_pos = 0, decode_position_delta = 0, batch = 0;
 
 private:
-    struct Layout { int device; bool full_indexer; };
+    struct Layout {
+        int device;
+        bool full_indexer;
+        int64_t capacity, index_head_dim, index_topk;
+    };
     std::vector<Layout> layout_;
 };
 } // namespace tyloi::cuda::glm_dsa

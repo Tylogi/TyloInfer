@@ -23,6 +23,7 @@
 #include <array>
 #include <cmath>
 #include <iostream>
+#include <limits>
 
 using ::tyloi::indexing::Slice;
 
@@ -47,7 +48,8 @@ std::unique_ptr<tyloi::models::State> Model::make_state() const { return std::ma
 State::State(const Model& model) : layers(model.layers.size()) {
     layout_.reserve(model.layers.size());
     for (const auto& layer : model.layers) {
-        layout_.push_back({layer.device, layer.full_indexer});
+        layout_.push_back({layer.device, layer.full_indexer, layer.config.max_position_embeddings,
+                           layer.config.index_head_dim, layer.config.index_topk});
         selections.try_emplace(layer.device);
     }
 }
@@ -68,6 +70,53 @@ void State::reset(int64_t next_batch) {
 }
 
 #ifdef TYLOINFER_NATIVE_CUDA
+std::vector<std::pair<tyloi::Device, std::size_t>> State::growth(
+        std::int64_t tokens, const tyloi::models::ForwardOptions&) const {
+    if (batch <= 0 || tokens <= 0 || cache_pos < 0)
+        throw std::invalid_argument("GLM DSA allocation planning requires positive batch and tokens and a nonnegative position");
+    if (cache_pos > std::numeric_limits<int64_t>::max() - tokens)
+        throw std::overflow_error("GLM DSA allocation planning position overflow");
+    const auto end = cache_pos + tokens;
+    struct Amount { std::size_t kv = 0, previous = 0, peak = 0; };
+    std::map<int, Amount> devices;
+    const auto add = [](std::size_t left, std::size_t right) {
+        if (left > std::numeric_limits<std::size_t>::max() - right)
+            throw std::overflow_error("GLM DSA allocation planning byte count overflow");
+        return left + right;
+    };
+    for (std::size_t i = 0; i < layers.size(); ++i) {
+        const auto& layout = layout_[i];
+        if (layout.device < 0 || layout.capacity <= 0 || layout.index_head_dim <= 0 || layout.index_topk <= 0 ||
+            end > layout.capacity)
+            throw std::invalid_argument("GLM DSA allocation planning layout or capacity is invalid");
+        if ((layout.full_indexer && layers[i].kv_cache.defined() != layers[i].index_cache.defined()) ||
+            (!layout.full_indexer && layers[i].index_cache.defined()))
+            throw std::invalid_argument("GLM DSA allocation planning found an incomplete cache");
+        auto& amount = devices[layout.device];
+        const tyloi::Device device(tyloi::kCUDA, layout.device);
+        if (!layers[i].kv_cache.defined()) {
+            amount.kv = add(amount.kv, tyloi::make_contiguous_view(nullptr,
+                std::array<int64_t, 4>{batch, 1, layout.capacity, 576}, tyloi::kFloat16, device).nbytes());
+            if (layout.full_indexer)
+                amount.kv = add(amount.kv, tyloi::make_contiguous_view(nullptr,
+                    std::array<int64_t, 3>{batch, layout.capacity, layout.index_head_dim}, tyloi::kFloat16, device).nbytes());
+        }
+        if (layout.full_indexer) {
+            const auto prefix = std::clamp(layout.index_topk - cache_pos, int64_t{0}, tokens);
+            const auto rows = tokens - prefix;
+            const auto bytes = rows == 0 ? 0 : tyloi::make_contiguous_view(nullptr,
+                std::array<int64_t, 3>{batch, rows, layout.index_topk}, tyloi::kInt32, device).nbytes();
+            amount.peak = std::max(amount.peak, add(amount.previous, bytes));
+            amount.previous = bytes;
+        }
+    }
+    std::vector<std::pair<tyloi::Device, std::size_t>> result;
+    result.reserve(devices.size());
+    for (const auto& [device, amount] : devices)
+        result.emplace_back(tyloi::Device(tyloi::kCUDA, device), add(amount.kv, amount.peak));
+    return result;
+}
+
 std::vector<::tyloi::Tensor> State::storage() const {
     std::vector<::tyloi::Tensor> result;
 #else
@@ -655,12 +704,12 @@ DenseTensor forward_layer(const Layer& layer, LayerState& state, Selection& sele
         auto options = ::tyloi::TensorOptions()
                            .device(::tyloi::kCUDA)
                            .dtype(::tyloi::kFloat16);
-        kv_cache =
-            ::tyloi::cuda::empty({B, 1, c.max_position_embeddings, kMlaWidth}, options);
-        if (full_indexer) {
-            index_cache = ::tyloi::cuda::empty(
-                {B, c.max_position_embeddings, c.index_head_dim}, options);
-        }
+        auto next_kv = ::tyloi::cuda::empty({B, 1, c.max_position_embeddings, kMlaWidth}, options);
+        DenseTensor next_index;
+        if (full_indexer)
+            next_index = ::tyloi::cuda::empty({B, c.max_position_embeddings, c.index_head_dim}, options);
+        kv_cache = std::move(next_kv);
+        if (full_indexer) index_cache = std::move(next_index);
     }
 
     x = x.to(::tyloi::kFloat16).contiguous();
