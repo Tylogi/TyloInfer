@@ -26,18 +26,6 @@ private:
     const Mtp* model_;
 };
 
-struct CausalState {
-    int64_t position() const noexcept { return cache_pos; }
-    void advance(int64_t tokens) noexcept { cache_pos += tokens; }
-    void set_position_delta(int64_t delta) noexcept { decode_position_delta = delta; }
-
-    int64_t cache_pos = 0;
-    int64_t decode_position_delta = 0;
-    int64_t speculative_start = -1;
-    int64_t speculative_confirmed = 0;
-    bool speculative_suffix_forward = false;
-};
-
 class State {
 public:
     State() = default;
@@ -56,6 +44,16 @@ public:
         std::int64_t, const ForwardOptions&) const {
         throw std::logic_error("state allocation planning is not implemented");
     }
+    virtual void begin_speculative_suffix(std::int64_t) {
+        throw std::logic_error("speculative suffix is not supported");
+    }
+    virtual void commit_speculative() {
+        throw std::logic_error("speculative transactions are not supported");
+    }
+    virtual void rollback_speculative(std::int64_t) {
+        throw std::logic_error("speculative transactions are not supported");
+    }
+    virtual bool retains_partial_prefix(std::int64_t) const noexcept { return false; }
     // Owners keep storage alive; deduplicate using backing identity, not object identity.
     virtual std::vector<::tyloi::Tensor> storage() const = 0;
     // Borrow writable objects from this state; their lifetime remains tied to it.

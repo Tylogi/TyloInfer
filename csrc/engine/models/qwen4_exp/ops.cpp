@@ -2379,25 +2379,19 @@ tyloi::StepSequence<tyloi::models::Prepared> Model::prepare(
 
 ::tyloi::Tensor Model::forward(tyloi::models::Input input, tyloi::models::State& state_value,
                                     const tyloi::models::ForwardOptions&) const {
-    return std::make_shared<::tyloi::DenseTensor>(qwen4_forward(*this, static_cast<State&>(state_value), std::move(input)));
-}
-
-::tyloi::Tensor Model::hidden_forward_speculative_suffix(State& state, ::tyloi::Tensor ids,
-                                                       ::tyloi::Tensor* raw_hidden) {
-    tyloi::models::require_model(state.speculative_start >= 0 && state.speculative_confirmed == 0 &&
-                                     !state.speculative_suffix_forward,
-                                 "speculative suffix is not active");
-    state.speculative_suffix_forward = true;
-    try {
-        auto result = qwen4_forward(*this, state,
-                                    tyloi::models::Input{std::move(ids), {}, {}, {}, {}, nullptr,
-                                                         raw_hidden, false, 0, 0, 0});
-        state.speculative_suffix_forward = false;
-        return result;
-    } catch (...) {
-        state.speculative_suffix_forward = false;
-        throw;
+    auto& state = static_cast<State&>(state_value);
+    if (input.suffix) {
+        tyloi::models::require_model(state.speculative_start >= 0 && state.speculative_confirmed == 0 &&
+                                         !state.speculative_suffix_forward,
+                                     "speculative suffix is not active");
     }
+    struct SuffixScope {
+        State& state;
+        bool active;
+        ~SuffixScope() { if (active) state.speculative_suffix_forward = false; }
+    } scope{state, input.suffix};
+    if (input.suffix) state.speculative_suffix_forward = true;
+    return std::make_shared<::tyloi::DenseTensor>(qwen4_forward(*this, state, std::move(input)));
 }
 
 void State::rollback_speculative(std::int64_t accepted) {

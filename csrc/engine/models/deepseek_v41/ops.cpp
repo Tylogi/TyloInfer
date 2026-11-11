@@ -407,30 +407,23 @@ void Model::validate_forward(std::int64_t, std::int64_t tokens, std::int64_t cac
         "DeepSeek-V4.1 currently requires contiguous causal cache positions");
 }
 
-::tyloi::Tensor Model::hidden_forward_speculative_suffix(State& state, ::tyloi::Tensor ids,
-                                                       ::tyloi::Tensor* raw_hidden) {
-    require_model(state.speculative_start >= 0 && state.speculative_confirmed == 0 &&
-                      !state.speculative_suffix_forward,
-                  "speculative suffix is not active");
-    state.speculative_suffix_forward = true;
-    try {
-        auto result = forward(tyloi::models::Input{std::move(ids), {}, {}, {}, {}, nullptr,
-                                                   raw_hidden, false, 0, 0, 0},
-                              state);
-        state.speculative_suffix_forward = false;
-        return result;
-    } catch (...) {
-        state.speculative_suffix_forward = false;
-        throw;
-    }
-}
-
 // The decode forward, ported from the retired generic causal loop. The block
 // records own the layer math; this owns geometry, speculation bookkeeping and
 // device placement of the walked tensors.
 ::tyloi::Tensor Model::forward(tyloi::models::Input input, tyloi::models::State& state_value,
                                     const tyloi::models::ForwardOptions&) const {
     auto& state = static_cast<State&>(state_value);
+    if (input.suffix) {
+        require_model(state.speculative_start >= 0 && state.speculative_confirmed == 0 &&
+                          !state.speculative_suffix_forward,
+                      "speculative suffix is not active");
+    }
+    struct SuffixScope {
+        State& state;
+        bool active;
+        ~SuffixScope() { if (active) state.speculative_suffix_forward = false; }
+    } suffix_scope{state, input.suffix};
+    if (input.suffix) state.speculative_suffix_forward = true;
 #ifndef TYLOINFER_NATIVE_CUDA
     auto scope = execution_scope();
 #endif

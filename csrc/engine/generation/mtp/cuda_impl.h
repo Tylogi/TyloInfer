@@ -262,7 +262,10 @@ template <class Model, class State> struct CudaMtpOps {
     return mtp_bootstrap_before_publication(model,option);
   }
   bool retains_partial_target_prefix(int accepted) const {
-    return mtp_retains_partial_target_prefix(model,state,mtp,accepted);
+    if constexpr (std::is_base_of_v<tyloi::models::State, State>)
+      return state.retains_partial_prefix(accepted) || mtp.retains_partial_target_prefix();
+    else
+      return mtp_retains_partial_target_prefix(model,state,mtp,accepted);
   }
   std::size_t predictor_history_merge_limit() const {
     return mtp_history_merge_limit(model);
@@ -315,7 +318,9 @@ template <class Model, class State> struct CudaMtpOps {
     target_graph_captures=weights.activity().graph_captures;
   }
   void rollback_target(std::int64_t accepted) {
-    if constexpr (has_replay<Model, State>) {
+    if constexpr (std::is_base_of_v<tyloi::models::State, State>) {
+      state.rollback_speculative(accepted);
+    } else if constexpr (has_replay<Model, State>) {
 #ifdef TYLOINFER_NATIVE_CUDA
       auto scope = tyloi::cuda::Executor::current().enter(mode.ffn);
 #endif
@@ -426,15 +431,44 @@ template <class Model, class State> struct CudaMtpOps {
     return hidden;
   }
   Tensor target_suffix(Tensor ids, Tensor *raw) {
-    if constexpr (requires(Model& value) { value.supports_suffix_speculation(); }) {
-      TYLOINFER_RUNTIME_CHECK(model.supports_suffix_speculation(),
+    if constexpr (std::is_base_of_v<tyloi::models::CausalModel, Model> &&
+                  std::is_base_of_v<tyloi::models::State, State>) {
+      const tyloi::models::CausalModel& causal = model;
+      TYLOINFER_RUNTIME_CHECK(causal.supports_suffix_speculation(),
                               "model does not support speculative suffix forwarding");
-    }
-    if constexpr (requires(Model& value, State& value_state, ::tyloi::Tensor value_ids, ::tyloi::Tensor* value_raw) {
-                    value.hidden_forward_speculative_suffix(value_state,std::move(value_ids), value_raw);
-                  }) {
       projected_target_hidden = {}; projected_target_logits = {};
-      projected_target_compact={};
+      projected_target_compact = {};
+      projected_target_greedy.clear();
+      const auto transfer_before=weights.activity().streamed_bytes;
+      const auto costs_before=profile_target()?target_costs():std::array<double,6>{};
+      tyloi::models::Input input;
+      input.ids = std::move(ids);
+      input.suffix = true;
+#ifdef TYLOINFER_NATIVE_CUDA
+      input.raw_hidden = raw;
+      auto scope = tyloi::cuda::Executor::current().enter(mode.ffn);
+      auto hidden = causal.forward(std::move(input), state, tyloi::cuda::forward_options(mode));
+#else
+      ::tyloi::Tensor raw_result;
+      input.raw_hidden = raw ? &raw_result : nullptr;
+      auto result = causal.forward(std::move(input), state);
+      auto hidden = result.dense();
+      if (raw && raw_result) *raw = raw_result.dense();
+#endif
+      target_transfer_bytes+=weights.activity().streamed_bytes-transfer_before;
+      if(profile_target()) {
+        const auto costs_after=target_costs();
+        for(std::size_t i=0;i<target_profile.size();++i)target_profile[i]+=costs_after[i]-costs_before[i];
+      }
+      return hidden;
+    } else if constexpr (requires(Model& value, State& value_state, ::tyloi::Tensor value_ids, ::tyloi::Tensor* value_raw) {
+                           value.hidden_forward_speculative_suffix(value_state,std::move(value_ids), value_raw);
+                         }) {
+      if constexpr (requires(Model& value) { value.supports_suffix_speculation(); })
+        TYLOINFER_RUNTIME_CHECK(model.supports_suffix_speculation(),
+                                "model does not support speculative suffix forwarding");
+      projected_target_hidden = {}; projected_target_logits = {};
+      projected_target_compact = {};
       projected_target_greedy.clear();
       const auto transfer_before=weights.activity().streamed_bytes;
       const auto costs_before=profile_target()?target_costs():std::array<double,6>{};

@@ -28,6 +28,7 @@ public:
     virtual Tensor normalize(const Tensor& hidden, std::int64_t batch, std::int64_t tokens) const = 0;
     virtual Tensor softcap(const Tensor& logits) const = 0;
     virtual Tensor logits(const Tensor& hidden, bool capped = true) const = 0;
+    virtual bool supports_suffix_speculation() const noexcept { return false; }
     virtual Tensor forward(Input input, State& state, const ForwardOptions& options = {}) const = 0;
 };
 

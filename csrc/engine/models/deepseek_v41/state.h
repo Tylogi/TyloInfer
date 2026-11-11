@@ -43,9 +43,9 @@ public:
     void restore_text_session_state(const TextSessionState& state);
 
     // Speculative suffix journal; the block records hold the checkpoints.
-    void begin_speculative_suffix(std::int64_t draft_tokens);
-    void commit_speculative();
-    void rollback_speculative(std::int64_t accepted);
+    void begin_speculative_suffix(std::int64_t draft_tokens) override;
+    void commit_speculative() override;
+    void rollback_speculative(std::int64_t accepted) override;
 
     std::unique_ptr<deepseek_v41_runtime::SharedState> shared;
     std::int64_t cache_pos = 0;

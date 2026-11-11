@@ -20,6 +20,8 @@ struct Input {
     std::int64_t confirmed = 0;
     std::int64_t kv_length = 0;
     std::int64_t attention_parts = 0;
+    // Draft rows for an already-started speculative suffix transaction.
+    bool suffix = false;
 };
 
 struct ForwardOptions {

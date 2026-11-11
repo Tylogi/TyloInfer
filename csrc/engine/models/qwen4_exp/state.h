@@ -60,9 +60,12 @@ public:
     void restore_text_session_state(const TextSessionState& state);
 
     // Speculative suffix journal; the layer records hold the checkpoints.
-    void begin_speculative_suffix(std::int64_t draft_tokens);
-    void commit_speculative();
-    void rollback_speculative(std::int64_t accepted);
+    void begin_speculative_suffix(std::int64_t draft_tokens) override;
+    void commit_speculative() override;
+    void rollback_speculative(std::int64_t accepted) override;
+    bool retains_partial_prefix(std::int64_t accepted) const noexcept override {
+        return speculative_prefix_retention && accepted >= 0;
+    }
     void begin_forward();
     void finish_forward(const ::tyloi::Tensor& full_positions, std::int64_t batch,
                         std::int64_t tokens);

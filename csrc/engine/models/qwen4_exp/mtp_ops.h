@@ -34,10 +34,6 @@ inline bool mtp_host_prompt_history(qwen4_exp::Model& model, int64_t tokens) {
     return bytes+(std::size_t(32)<<20)>default_context(mfq_current_cuda_device())->available_memory();
 }
 inline bool mtp_bootstrap_before_publication(qwen4_exp::Model&, const char* option) { return !option || option[0]!='0'; }
-template<class Mtp> bool mtp_retains_partial_target_prefix(qwen4_exp::Model& model, qwen4_exp::State& state, Mtp& mtp, int accepted) {
-    if(state.speculative_prefix_retention && accepted>=0)return true;
-    return mtp.retains_partial_target_prefix();
-}
 inline std::size_t mtp_history_merge_limit(qwen4_exp::Model&) { return 128; }
 inline std::size_t mtp_history_flush_threshold(qwen4_exp::Model&, const char* option) { return !option || option[0]!='0'?4:512; }
 inline std::size_t mtp_parked_history_flush_threshold(qwen4_exp::Model&, const char* option) { return !option || option[0]!='0'?16:512; }
