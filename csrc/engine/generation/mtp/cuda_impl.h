@@ -48,7 +48,6 @@ using tyloi::cuda::generation_workspace;
 using tyloi::cuda::mtp_stream_prompt_history;
 using tyloi::cuda::mtp_host_prompt_history;
 using tyloi::cuda::mtp_bootstrap_before_publication;
-using tyloi::cuda::mtp_retains_partial_target_prefix;
 using tyloi::cuda::mtp_history_merge_limit;
 using tyloi::cuda::mtp_history_flush_threshold;
 using tyloi::cuda::mtp_parked_history_flush_threshold;
@@ -265,7 +264,7 @@ template <class Model, class State> struct CudaMtpOps {
     if constexpr (std::is_base_of_v<tyloi::models::State, State>)
       return state.retains_partial_prefix(accepted) || mtp.retains_partial_target_prefix();
     else
-      return mtp_retains_partial_target_prefix(model,state,mtp,accepted);
+      return mtp.retains_partial_target_prefix();
   }
   std::size_t predictor_history_merge_limit() const {
     return mtp_history_merge_limit(model);
@@ -454,31 +453,6 @@ template <class Model, class State> struct CudaMtpOps {
       auto result = causal.forward(std::move(input), state);
       auto hidden = result.dense();
       if (raw && raw_result) *raw = raw_result.dense();
-#endif
-      target_transfer_bytes+=weights.activity().streamed_bytes-transfer_before;
-      if(profile_target()) {
-        const auto costs_after=target_costs();
-        for(std::size_t i=0;i<target_profile.size();++i)target_profile[i]+=costs_after[i]-costs_before[i];
-      }
-      return hidden;
-    } else if constexpr (requires(Model& value, State& value_state, ::tyloi::Tensor value_ids, ::tyloi::Tensor* value_raw) {
-                           value.hidden_forward_speculative_suffix(value_state,std::move(value_ids), value_raw);
-                         }) {
-      if constexpr (requires(Model& value) { value.supports_suffix_speculation(); })
-        TYLOINFER_RUNTIME_CHECK(model.supports_suffix_speculation(),
-                                "model does not support speculative suffix forwarding");
-      projected_target_hidden = {}; projected_target_logits = {};
-      projected_target_compact = {};
-      projected_target_greedy.clear();
-      const auto transfer_before=weights.activity().streamed_bytes;
-      const auto costs_before=profile_target()?target_costs():std::array<double,6>{};
-#ifdef TYLOINFER_NATIVE_CUDA
-      auto hidden=model.hidden_forward_speculative_suffix(state,ids, raw);
-#else
-      ::tyloi::Tensor raw_result;
-      auto result=model.hidden_forward_speculative_suffix(state,ids, raw ? &raw_result : nullptr);
-      auto hidden=result.dense();
-      if(raw && raw_result)*raw=raw_result.dense();
 #endif
       target_transfer_bytes+=weights.activity().streamed_bytes-transfer_before;
       if(profile_target()) {
