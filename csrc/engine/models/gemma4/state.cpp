@@ -25,12 +25,30 @@ State::State(const Model& model) : layers(model.layers.size()), graph_views_(mod
 }
 
 void State::preallocate() {
+    prepare_caches(1, 0, {});
+}
+
+void State::prepare_caches(std::int64_t batch, std::int64_t tokens,
+        const tyloi::models::ForwardOptions& options) {
+    if (batch <= 0 || tokens < 0 || cache_pos < 0)
+        throw std::invalid_argument("Gemma4 KV preparation requires a positive batch and a nonnegative position");
+    if (cache_pos > std::numeric_limits<std::int64_t>::max() - tokens)
+        throw std::overflow_error("Gemma4 KV preparation position overflow");
+    const auto end = cache_pos + tokens;
+    std::vector<tyloi::state::KvView> prepared;
     for (std::size_t index = 0; index < layers.size(); ++index) {
         if (layers[index].defined()) continue;
         const auto& layout = layout_[index];
-        layers[index] = tyloi::state::allocate_kv(1, layout.heads, layout.capacity, layout.head_dim, layout.sliding,
-            tyloi::Device(tyloi::DeviceType::cuda, layout.device), layout.dtype, layout.quantization);
+        const auto capacity = kv_capacity_for(layout.sliding, layout.capacity, end, options.kv_capacity);
+        prepared.push_back(tyloi::state::allocate_kv(batch, layout.heads, capacity, layout.head_dim,
+            layout.sliding, tyloi::Device(tyloi::DeviceType::cuda, layout.device), layout.dtype,
+            layout.quantization));
     }
+    // Publish only once every layer cache exists, so a failed allocation cannot
+    // leave a half-populated cache that later forwards treat as allocated.
+    std::size_t next = 0;
+    for (std::size_t index = 0; index < layers.size(); ++index)
+        if (!layers[index].defined()) layers[index] = std::move(prepared[next++]);
 }
 
 void State::reset(std::int64_t next_batch) {
@@ -58,8 +76,7 @@ std::vector<std::pair<tyloi::Device, std::size_t>> State::growth(
     for (std::size_t index = 0; index < layers.size(); ++index) {
         if (layers[index].defined()) continue;
         const auto& layout = layout_[index];
-        const auto capacity = layout.sliding ? layout.capacity
-            : (options.kv_capacity > 0 ? std::max(end, options.kv_capacity) : layout.capacity);
+        const auto capacity = kv_capacity_for(layout.sliding, layout.capacity, end, options.kv_capacity);
         const auto bytes = tyloi::state::kv_bytes(batch, layout.heads, capacity, layout.head_dim,
                                                   layout.sliding, layout.dtype, layout.quantization);
         const tyloi::Device device(tyloi::DeviceType::cuda, layout.device);

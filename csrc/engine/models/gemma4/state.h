@@ -3,10 +3,17 @@
 #include "engine/models/state.h"
 #include "engine/state/kv_view.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <vector>
 
 namespace tyloi::cuda::gemma4 {
+
+// One capacity rule shared by planning, group allocation and the direct forward fallback.
+inline std::int64_t kv_capacity_for(bool sliding, std::int64_t layer_capacity,
+    std::int64_t end, std::int64_t requested) noexcept {
+    return sliding || requested <= 0 ? layer_capacity : std::max(end, requested);
+}
 
 struct Model;
 
@@ -19,6 +26,9 @@ public:
     State& operator=(State&&) noexcept = default;
 
     void preallocate() override;
+    // Allocate every missing layer cache as one group; a failure leaves no partial cache.
+    void prepare_caches(std::int64_t batch, std::int64_t tokens,
+        const tyloi::models::ForwardOptions& options);
     void reset(std::int64_t batch) override;
     std::int64_t position() const noexcept override { return cache_pos; }
     void advance(std::int64_t tokens) noexcept override { cache_pos += tokens; }

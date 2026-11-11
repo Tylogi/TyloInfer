@@ -200,9 +200,10 @@ namespace {
                               const Model::Options& mode) {
     const auto B = input.size(0), T = input.size(1), H = input.size(2);
     const auto& attention = layer.attention;
-    const auto capacity = attention.sliding ? attention.attention_window
-        : (mode.kv_capacity > 0 ? std::max<std::int64_t>(step.cache_position + T, mode.kv_capacity)
-                                : attention.max_position_embeddings);
+    const auto layer_capacity = attention.sliding ? attention.attention_window
+                                                  : attention.max_position_embeddings;
+    const auto capacity = kv_capacity_for(attention.sliding, layer_capacity,
+                                          step.cache_position + T, mode.kv_capacity);
     if (!cache.defined()) {
         cache = tyloi::state::allocate_kv(B, attention.kv_heads, capacity, attention.attention_head_dim,
                         attention.sliding, input.device(),
@@ -240,6 +241,8 @@ tyloi::StepSequence<tyloi::models::Prepared> Model::prepare(
     tyloi::models::require_model(input.confirmed >= 0 && input.confirmed == 0,
                                "unsupported speculative backbone geometry");
     if (state.cache_pos == 0) state.reset(B);
+    // Missing layer caches go in as one group, before any layer computes.
+    state.prepare_caches(B, T, mode);
 
     const tyloi::Device primary{tyloi::DeviceType::cuda, mode.primary};
     auto positions_on_primary = [&](const tyloi::Tensor& value) {
