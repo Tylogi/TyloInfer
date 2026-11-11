@@ -44,7 +44,7 @@ void run(int bits,int heads,int width,std::size_t cache_bytes,int initial_count=
             double mean=0,power=0;
             for(int t=0;t<=start+row;++t){const auto x=source[(t*kh+head/(heads/kh))*width+d];mean+=x;power+=x*x;}
             mean*=.5/(start+row+1);power*=.25/(start+row+1);
-            const double difference=actual.data_ptr<float>()[(row*heads+head)*width+d]-mean;
+            const double difference=actual.template data_ptr<float>()[(row*heads+head)*width+d]-mean;
             if(!std::isfinite(difference))throw std::runtime_error("Nonfinite RAM attention output");
             error+=difference*difference;energy+=power;
         }
@@ -492,7 +492,7 @@ void packed_spill_cache(const std::string& directory) {
     const auto verify=[&](const auto& views,unsigned seed) {
         auto records=views.to(tb::kCPU).contiguous();
         for(int at=0;at<count;++at)if(ids[at]>=0) {
-            const auto& view=records.data_ptr<tq::TqBlockView>()[at];
+            const auto& view=records.template data_ptr<tq::TqBlockView>()[at];
             std::vector<std::uint8_t> bytes(ids[at]<2?32768:8380);
             for(const auto* source:{view.key,view.value}) {
                 if(cudaMemcpy(bytes.data(),source,bytes.size(),cudaMemcpyDefault)!=cudaSuccess)

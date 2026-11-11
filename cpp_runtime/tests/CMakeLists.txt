@@ -5,13 +5,6 @@ else()
     add_compile_options(-UNDEBUG)
 endif()
 
-add_executable(mfq-benchmark-validation-test benchmark_validation_test.cpp)
-target_include_directories(mfq-benchmark-validation-test PRIVATE
-    ${TYLOINFER_REPOSITORY_ROOT}/bench
-)
-target_compile_features(mfq-benchmark-validation-test PRIVATE cxx_std_17)
-add_test(NAME mfq-benchmark-validation-test COMMAND mfq-benchmark-validation-test)
-
 add_executable(mfq-cuda-tensor-view-test
     ${PROJECT_SOURCE_DIR}/backends/cuda/tests/mfq_cuda_tensor_view_test.cpp
 )
@@ -109,9 +102,6 @@ target_link_libraries(tyloinfer-gguf-model-source-test PRIVATE mfq-ggml)
 mfq_add_core_test(mfq-file-range-reader-test file_range_reader_test.cpp)
 mfq_add_core_test(mfq-mirrored-file-reader-test mirrored_file_reader_test.cpp)
 mfq_add_core_test(mfq-moe-dispatch-plan-test moe_dispatch_plan_test.cpp)
-add_executable(mfq-moe-residency-bench ${PROJECT_SOURCE_DIR}/../bench/moe_residency_bench.cpp)
-target_link_libraries(mfq-moe-residency-bench PRIVATE mfq-core)
-target_compile_features(mfq-moe-residency-bench PRIVATE cxx_std_17)
 mfq_add_core_test(mfq-nint-rows-test nint_rows_test.cpp)
 mfq_add_core_test(mfq-quant-expert-range-test quant_expert_range_test.cpp)
 mfq_add_core_test(mfq-host-parallel-test host_parallel_test.cpp)

@@ -1499,7 +1499,7 @@ int verify_two_stage_shared(const std::filesystem::path& root,bool transfer_cach
     if(compare_dense)std::cout<<"nvq_dense_pipeline_conversions="<<dense_conversions<<" PASS\n";
     return cases;
 }
-#include "../../../../bench/moe_residency_copy_bench.h"
+#include "moe_residency_copy_bench.h"
 int verify_transfer_hit_reservation(const std::filesystem::path& root) {
     const std::array<MfqCudaStream,2> streams={mfq_get_stream_from_pool(),mfq_get_current_cuda_stream()};
     const auto counter=[](const std::shared_ptr<MoeExpertCache>& cache,const char* name) {

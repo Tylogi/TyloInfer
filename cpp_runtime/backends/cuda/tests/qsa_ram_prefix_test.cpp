@@ -268,7 +268,7 @@ void shared_codec(bool fingerprints=false) {
         auto result=cache.forward(query,kv,kv,iq,raw,pos,pool,false,tb::zeros({1,count,heads,width},f)).to(tb::kCPU).contiguous();
         double error=0,energy=0;
         for(int64_t i=0;i<result.numel();++i) {
-            const double x=result.data_ptr<float>()[i],expected=.5f*value;
+            const double x=result.template data_ptr<float>()[i],expected=.5f*value;
             require(std::isfinite(x),"Shared codec produced a nonfinite value");error+=(x-expected)*(x-expected);energy+=expected*expected;
         }
         require(error<std::max(energy,1e-30)*.02,"Shared codec lost constant-value reconstruction");
