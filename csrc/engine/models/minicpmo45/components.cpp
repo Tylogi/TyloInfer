@@ -320,7 +320,7 @@ MfqDuplexStepResult Components::step(const MfqDuplexStepInput& input) {
         response.tts_force_flush = result.tts_force_flush;
         response.audio_chunk_index = state_->duplex_session->audio_chunk_index;
         response.language_cache_position = state_->runtime.language_state.cache_pos;
-        response.audio_cache_position = state_->runtime.audio.cache_length();
+        response.audio_cache_position = state_->duplex_session->audio_state.cache_length();
         response.tts_cache_position = state_->duplex_session->tts_state.position;
         response.inference_ms =
             std::chrono::duration<double, std::milli>(
@@ -334,7 +334,6 @@ void Components::stop() {
         mfq_cuda_synchronize();
         state_->duplex_session.reset();
         state_->runtime.language_state.reset(1);
-        state_->runtime.audio.reset();
         mfq_cuda_synchronize();
 }
 } // namespace tyloi::cuda::minicpmo45

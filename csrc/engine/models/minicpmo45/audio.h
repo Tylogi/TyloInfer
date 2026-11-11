@@ -94,11 +94,13 @@ struct MiniCPMO45WhisperLayer {
 #endif
     tyloi::weights::BiasWeight fc1;
     tyloi::weights::BiasWeight fc2;
+    struct State {
 #ifdef TYLOINFER_NATIVE_CUDA
-    ::tyloi::Tensor key_cache, value_cache;
+        ::tyloi::Tensor key_cache, value_cache;
 #else
-    ::tyloi::DenseTensor key_cache, value_cache;
+        ::tyloi::DenseTensor key_cache, value_cache;
 #endif
+    };
 
     static MiniCPMO45WhisperLayer load(const tyloi::weights::Loader& weights,
                                        int index) {
@@ -124,24 +126,19 @@ struct MiniCPMO45WhisperLayer {
         return result;
     }
 
-    void reset() {
-        key_cache = {};
-        value_cache = {};
-    }
-
 #ifdef TYLOINFER_NATIVE_CUDA
-    ::tyloi::Tensor forward(::tyloi::Tensor input_value, ::tyloi::Tensor mask, bool use_cache) {
+    ::tyloi::Tensor forward(::tyloi::Tensor input_value, ::tyloi::Tensor mask, State& state, bool use_cache) const {
         auto input = input_value.dense();
         auto normalized = minicpmo45_layer_norm(input, attention_norm_weight, attention_norm_bias, 1e-5);
-        auto branch = attention.forward(normalized, mask, use_cache ? &key_cache : nullptr,
-                                        use_cache ? &value_cache : nullptr).dense();
+        auto branch = attention.forward(normalized, mask, use_cache ? &state.key_cache : nullptr,
+                                        use_cache ? &state.value_cache : nullptr).dense();
 #else
     ::tyloi::DenseTensor forward(const tyloi::cuda::Projector& projector,
                                   ::tyloi::DenseTensor input,
-                                  MfqOptional<::tyloi::DenseTensor> mask, bool use_cache) {
+                                  MfqOptional<::tyloi::DenseTensor> mask, State& state, bool use_cache) const {
         auto normalized = minicpmo45_layer_norm(input, attention_norm_weight, attention_norm_bias, 1e-5);
-        auto branch = attention.forward(projector, normalized, mask, use_cache ? &key_cache : nullptr,
-                                        use_cache ? &value_cache : nullptr);
+        auto branch = attention.forward(projector, normalized, mask, use_cache ? &state.key_cache : nullptr,
+                                        use_cache ? &state.value_cache : nullptr);
 #endif
         input = (input + branch).contiguous();
         normalized = minicpmo45_layer_norm(input, final_norm_weight, final_norm_bias, 1e-5);
@@ -224,16 +221,20 @@ struct MiniCPMO45AudioEncoder {
         return result;
     }
 
-    void reset() {
-        for (auto &layer : layers)
-            layer.reset();
-    }
+    struct State {
+        std::vector<MiniCPMO45WhisperLayer::State> layers;
 
-    int64_t cache_length() const {
-        if (layers.empty() || !layers.front().key_cache.defined())
-            return 0;
-        return layers.front().key_cache.size(2);
-    }
+        explicit State(const MiniCPMO45AudioEncoder& encoder) : layers(encoder.layers.size()) {}
+
+        void reset() {
+            for (auto& layer : layers) layer = {};
+        }
+
+        int64_t cache_length() const {
+            if (layers.empty() || !layers.front().key_cache.defined()) return 0;
+            return layers.front().key_cache.size(2);
+        }
+    };
 
 private:
     ::tyloi::DenseTensor convolve(::tyloi::DenseTensor features) const {
@@ -281,7 +282,7 @@ private:
 public:
 #ifdef TYLOINFER_NATIVE_CUDA
     ::tyloi::Tensor forward_streaming(::tyloi::Tensor features_value,
-                                      int64_t prefix_extra_frames, int64_t suffix_extra_frames) {
+                                      int64_t prefix_extra_frames, int64_t suffix_extra_frames, State& state) const {
         if (!features_value.defined())
             throw std::runtime_error("MiniCPM-o streaming audio expects [1,80,frames] and "
                                      "non-negative extra-frame counts");
@@ -289,7 +290,7 @@ public:
 #else
     ::tyloi::DenseTensor forward_streaming(const tyloi::cuda::Projector& projector,
                                            ::tyloi::DenseTensor features_value,
-                                           int64_t prefix_extra_frames, int64_t suffix_extra_frames) {
+                                           int64_t prefix_extra_frames, int64_t suffix_extra_frames, State& state) const {
         const auto& features = features_value;
 #endif
         if (features.dim() != 3 || features.size(0) != 1 || features.size(1) != 80 ||
@@ -298,7 +299,7 @@ public:
                                      "non-negative extra-frame counts");
         }
         const int64_t conv_tokens_before_crop = (features.size(2) - 1) / 2 + 1;
-        if (cache_length() + conv_tokens_before_crop >= position_embedding.size(0)) reset();
+        if (state.cache_length() + conv_tokens_before_crop >= position_embedding.size(0)) state.reset();
         auto hidden = convolve(features);
         const int64_t prefix_to_remove = prefix_extra_frames > 0 ? (prefix_extra_frames + 1) / 2 : 0;
         const int64_t suffix_to_remove = suffix_extra_frames > 0 ? (suffix_extra_frames + 1) / 2 : 0;
@@ -309,7 +310,7 @@ public:
         if (suffix_to_remove > 0)
             hidden = hidden.narrow(2, 0, hidden.size(2) - suffix_to_remove);
         hidden = hidden.transpose(1, 2).contiguous();
-        const int64_t past = cache_length();
+        const int64_t past = state.cache_length();
         const int64_t tokens = hidden.size(1);
         if (past + tokens > position_embedding.size(0))
             throw std::runtime_error("MiniCPM-o streaming Whisper position cache exceeds 1500 frames");
@@ -320,11 +321,11 @@ public:
 #endif
         hidden = hidden + position.narrow(0, past, tokens);
         auto mask = ::tyloi::cuda::zeros({1, 1, tokens, past + tokens}, hidden.options());
-        for (auto& layer : layers) {
+        for (size_t index = 0; index < layers.size(); ++index) {
 #ifdef TYLOINFER_NATIVE_CUDA
-            hidden = layer.forward(hidden, mask, true).dense();
+            hidden = layers[index].forward(hidden, mask, state.layers[index], true).dense();
 #else
-            hidden = layer.forward(projector, hidden, mask, true);
+            hidden = layers[index].forward(projector, hidden, mask, state.layers[index], true);
 #endif
         }
         return project_and_pool(
@@ -355,7 +356,7 @@ public:
 
 #ifdef TYLOINFER_NATIVE_CUDA
     tyloi::StepSequence<::tyloi::Tensor> forward_steps(
-        ::tyloi::Tensor features_value, ::tyloi::Tensor raw_lengths_value, bool use_cache = false) {
+        ::tyloi::Tensor features_value, ::tyloi::Tensor raw_lengths_value, State& state, bool use_cache = false) const {
         if (!features_value.defined() || !raw_lengths_value.defined())
             throw std::runtime_error("MiniCPM-o audio input geometry is invalid");
         const auto& features = features_value.dense();
@@ -363,7 +364,7 @@ public:
 #else
     tyloi::StepSequence<::tyloi::DenseTensor> forward_steps(
         tyloi::cuda::Projector projector, ::tyloi::DenseTensor features_value,
-        ::tyloi::DenseTensor raw_lengths_value, bool use_cache = false) {
+        ::tyloi::DenseTensor raw_lengths_value, State& state, bool use_cache = false) const {
         const auto& features = features_value;
         const auto& raw_lengths = raw_lengths_value;
 #endif
@@ -372,9 +373,7 @@ public:
             throw std::runtime_error("MiniCPM-o audio input geometry is invalid");
         auto hidden = convolve(features).transpose(1, 2).contiguous();
         const int64_t tokens = hidden.size(1);
-        int64_t past = 0;
-        if (use_cache && !layers.empty() && layers.front().key_cache.defined())
-            past = layers.front().key_cache.size(2);
+        const int64_t past = use_cache ? state.cache_length() : 0;
         if (past + tokens > position_embedding.size(0))
             throw std::runtime_error("MiniCPM-o Whisper position cache exceeds 1500 frames");
 #ifdef TYLOINFER_NATIVE_CUDA
@@ -399,11 +398,11 @@ public:
             ::tyloi::TensorOptions().device(::tyloi::kCUDA).dtype(::tyloi::kFloat32))
             .masked_fill(visible.logical_not().unsqueeze(1), -std::numeric_limits<float>::infinity());
         co_yield tyloi::StepState::advanced;
-        for (auto& layer : layers) {
+        for (size_t index = 0; index < layers.size(); ++index) {
 #ifdef TYLOINFER_NATIVE_CUDA
-            hidden = layer.forward(hidden, mask, use_cache).dense();
+            hidden = layers[index].forward(hidden, mask, state.layers[index], use_cache).dense();
 #else
-            hidden = layer.forward(projector, hidden, mask, use_cache);
+            hidden = layers[index].forward(projector, hidden, mask, state.layers[index], use_cache);
 #endif
             co_yield tyloi::StepState::advanced;
         }
@@ -415,13 +414,13 @@ public:
     }
 
 #ifdef TYLOINFER_NATIVE_CUDA
-    ::tyloi::Tensor forward(::tyloi::Tensor features, ::tyloi::Tensor lengths, bool use_cache = false) {
-        return tyloi::finish_steps(forward_steps(std::move(features), std::move(lengths), use_cache));
+    ::tyloi::Tensor forward(::tyloi::Tensor features, ::tyloi::Tensor lengths, State& state, bool use_cache = false) const {
+        return tyloi::finish_steps(forward_steps(std::move(features), std::move(lengths), state, use_cache));
     }
 #else
     ::tyloi::DenseTensor forward(const tyloi::cuda::Projector& projector,
-        ::tyloi::DenseTensor features, ::tyloi::DenseTensor lengths, bool use_cache = false) {
-        return tyloi::finish_steps(forward_steps(projector, std::move(features), std::move(lengths), use_cache));
+        ::tyloi::DenseTensor features, ::tyloi::DenseTensor lengths, State& state, bool use_cache = false) const {
+        return tyloi::finish_steps(forward_steps(projector, std::move(features), std::move(lengths), state, use_cache));
     }
 #endif
 };

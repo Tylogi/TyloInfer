@@ -124,7 +124,7 @@ struct MiniCPMO45Runtime {
         if (!audios.empty()) {
             tyloi::models::require_model(audio_features.defined() && audio_lengths.defined(),
                 "audio bounds require audio tensors");
-            audio.reset();
+            MiniCPMO45AudioEncoder::State audio_state(audio);
 #ifdef TYLOINFER_NATIVE_CUDA
             audio_features = tyloi::ops::cast(audio_features, audio_features.scalar_type(),
                 ::tyloi::Device(::tyloi::kCUDA, primary));
@@ -135,7 +135,7 @@ struct MiniCPMO45Runtime {
 #ifndef TYLOINFER_NATIVE_CUDA
                 projector,
 #endif
-                audio_features, audio_lengths, false);
+                audio_features, audio_lengths, audio_state, false);
             while (auto step = encoding.next()) {
                 if (step.value) result.audio_embeddings = std::move(*step.value);
                 else co_yield step.state;
@@ -234,6 +234,7 @@ struct MiniCPMO45DuplexStepResult {
 
 struct MiniCPMO45DuplexSession {
     MiniCPMO45Runtime & runtime;
+    MiniCPMO45AudioEncoder::State audio_state;
     tyloi::cuda::minicpmo45::Tts::State tts_state;
     MiniCPMO45DuplexSpecialIds ids;
     std::vector<int64_t> forbidden_ids;
@@ -257,7 +258,7 @@ struct MiniCPMO45DuplexSession {
             MiniCPMO45DuplexSpecialIds ids_,
             std::vector<int64_t> forbidden_ids_,
             bool greedy_)
-        : runtime(runtime_), tts_state(runtime_.tts), ids(ids_),
+        : runtime(runtime_), audio_state(runtime_.audio), tts_state(runtime_.tts), ids(ids_),
           forbidden_ids(std::move(forbidden_ids_)), greedy(greedy_) {
         if (std::find(forbidden_ids.begin(), forbidden_ids.end(),
                 ids.chunk_eos) == forbidden_ids.end()) {
@@ -280,7 +281,7 @@ struct MiniCPMO45DuplexSession {
             ::tyloi::DenseTensor system_suffix_ids = ::tyloi::DenseTensor()) {
 #endif
         runtime.language_state.reset(1);
-        runtime.audio.reset();
+        audio_state.reset();
         tts_state.reset(1);
         generated_text_ids.clear();
         audio_chunk_index = 0;
@@ -310,9 +311,9 @@ struct MiniCPMO45DuplexSession {
 #else
                 reference_audio_features.to(::tyloi::kCUDA),
 #endif
-                raw_lengths, false);
+                raw_lengths, audio_state, false);
             feed_embeddings(embeddings);
-            runtime.audio.reset();
+            audio_state.reset();
         }
         if (system_suffix_ids.defined() &&
                 system_suffix_ids.numel() > 0) {
@@ -597,7 +598,7 @@ struct MiniCPMO45DuplexSession {
 #endif
                 audio_features.to(::tyloi::kCUDA),
                 audio_prefix_extra_frames,
-                audio_suffix_extra_frames);
+                audio_suffix_extra_frames, audio_state);
             audio_embeddings = std::move(encoded_audio);
             pending = feed_embeddings(audio_embeddings);
 #ifdef TYLOINFER_NATIVE_CUDA
