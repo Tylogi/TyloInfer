@@ -504,6 +504,29 @@ AttentionResult dispatch_attention(const AttentionInput& request,
         std::move(query), std::move(cache), std::move(indices), std::move(mask),
         std::move(sinks), scratch.meta, scale);
 }
+::tyloi::DenseTensor ops::mla_attention(
+    ::tyloi::DenseTensor query, ::tyloi::DenseTensor cache,
+    ::tyloi::DenseTensor lengths, ::tyloi::DenseTensor indices,
+    std::int64_t length, std::int64_t planned, double scale) {
+    MfqCudaGuard guard(query.device().index);
+    auto& scratch = Executor::current().mla_scratch(query.device().index);
+    const auto batch = query.size(0);
+    if (indices.defined()) {
+        scratch.ensure_meta();
+        return attention_glm_mla_sparse_cuda(query,
+            cache.reshape({batch, cache.size(2), cache.size(3)}), indices,
+            scratch.attention_meta, scale);
+    }
+    if (lengths.defined() && query.size(2) == 1 && batch == 1) {
+        const auto capacity = planned > 0 ? planned : length;
+        scratch.ensure_decode_workspace(batch, capacity);
+        return attention_glm_mla576_decode_cuda(query, cache, lengths, scale, capacity,
+            scratch.decode_mask, scratch.kv_max, scratch.attention_meta);
+    }
+    scratch.ensure_dense_workspace(batch, query.size(2), length);
+    return attention_glm_mla576_cached_cuda(query, cache, length,
+        scratch.dense_mask, scratch.kv_max, scratch.attention_meta, scale);
+}
 #endif
 
 } // namespace tyloi::cuda

@@ -21,6 +21,7 @@
 #include <cmath>
 #include <exception>
 #include <iostream>
+#include <limits>
 #endif
 
 namespace tyloi::ops {
@@ -153,6 +154,30 @@ Tensor sparse_attention(const Tensor& query_tensor, const Tensor& cache_tensor,
         throw std::invalid_argument("sparse attention geometry is incompatible");
     return owner(cuda::ops::sparse_attention(
         query, cache, indices, mask, sinks, scale_value));
+}
+
+Tensor mla_attention(const Tensor& query, const Tensor& cache, const Tensor& lengths,
+                     const Tensor& indices, std::int64_t length, std::int64_t planned, double scale) {
+    compatible(query, cache);
+    require_cuda(query);
+    if (query.dim() != 4 || cache.dim() != 4 || query.size(0) != cache.size(0) ||
+        cache.size(1) != 1 || query.size(3) != 576 || cache.size(3) != 576 ||
+        length <= 0 || length > cache.size(2) || planned < 0 ||
+        (planned > 0 && (planned < length || planned > cache.size(2))))
+        throw std::invalid_argument("MLA attention geometry is incompatible");
+    if (lengths) {
+        compatible(query, lengths);
+        if (lengths.dim() != 1 || lengths.size(0) != query.size(0))
+            throw std::invalid_argument("MLA lengths must have shape [batch]");
+    }
+    if (indices) {
+        compatible(query, indices);
+        if (indices.dim() != 3 || indices.size(0) != query.size(0) || indices.size(1) != query.size(2))
+            throw std::invalid_argument("MLA indices must have shape [batch,tokens,selected]");
+    }
+    return owner(cuda::ops::mla_attention(dense(query), dense(cache),
+        lengths ? dense(lengths) : DenseTensor{}, indices ? dense(indices) : DenseTensor{},
+        length, planned, scale));
 }
 
 TailRopeTable tail_rope_table(std::int64_t max_positions, double base, std::int64_t compress_ratio,
@@ -542,6 +567,16 @@ Tensor project(const Tensor& value_tensor, const ::tyloi::Tensor& weight) {
     input(value);
     return owner(cuda::ops::project(value, weight));
 }
+Tensor head_project(const Tensor& value, const Tensor& weight) {
+    input(value);
+    require_cuda(value);
+    if (!weight || !weight.defined() || value.dim() != 4 || weight.dim() != 3 ||
+        value.numel() <= 0 || value.size(2) <= 0 || value.size(2) > std::numeric_limits<int>::max() ||
+        value.size(3) <= 0 || value.size(2) != weight.size(0) || value.size(3) != weight.size(2))
+        throw std::invalid_argument("head-wise projection geometry is incompatible");
+    return owner(cuda::ops::head_project(dense(value), weight));
+}
+
 Tensor project(const Tensor& value, const Tensor& weight, const Tensor& ids) {
     compatible(value, ids);
     return owner(cuda::ops::project(dense(value), weight, dense(ids)));

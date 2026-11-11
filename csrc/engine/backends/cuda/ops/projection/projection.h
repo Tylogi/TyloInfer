@@ -18,6 +18,7 @@ bool grouped(std::span<const ::tyloi::Tensor> weights);
 std::vector<tyloi::DenseTensor> project_group(tyloi::DenseTensor input,
     std::span<const ::tyloi::Tensor> weights, std::size_t prefix);
 tyloi::DenseTensor sigmoid_project(tyloi::DenseTensor input, tyloi::DenseTensor gate, const ::tyloi::Tensor& weight);
+tyloi::DenseTensor head_project(tyloi::DenseTensor input, const ::tyloi::Tensor& weight);
 }
 #endif
 

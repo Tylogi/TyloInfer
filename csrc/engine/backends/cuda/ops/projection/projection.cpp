@@ -148,6 +148,21 @@ tyloi::DenseTensor tyloi::cuda::ops::project(tyloi::DenseTensor input, const ::t
         weight, std::move(input), std::move(ids));
 }
 
+tyloi::DenseTensor tyloi::cuda::ops::head_project(tyloi::DenseTensor input, const ::tyloi::Tensor& weight) {
+#if TYLOINFER_ENABLE_MFQ_COMPAT
+    MfqCudaGuard guard(input.device().index);
+    auto& executor = Executor::current();
+    const auto rows = input.numel() / input.size(3);
+    const auto& route = executor.mla_scratch(input.device().index).head_route(
+        rows, static_cast<int>(input.size(2)));
+    auto output = executor.projector(Executor::current_ffn()).run(
+        weight, input.contiguous().reshape({rows, input.size(3)}), route);
+    return output.reshape({input.size(0), input.size(1), input.size(2), weight.size(1)});
+#else
+    throw std::runtime_error("Legacy head-wise projections require a compatibility build");
+#endif
+}
+
 tyloi::DenseTensor tyloi::cuda::ops::low_rank(tyloi::DenseTensor input, const ::tyloi::Tensor& output_a,
                                             const ::tyloi::Tensor& output_b, int64_t groups,
                                             bool groupwise, bool profile) {

@@ -47,6 +47,10 @@ Tensor attention(const Tensor& query, const Tensor& key, const Tensor& value,
 Tensor sparse_attention(const Tensor& query, const Tensor& cache,
                         const Tensor& indices, const Tensor& mask,
                         const Tensor& sinks, double scale);
+// GLM MLA query [B,H,T,576], KV [B,1,C,576]; optional lengths [B] and indices [B,T,K].
+// Empty indices select dense prefill or decode; the backend retains masks and metadata.
+Tensor mla_attention(const Tensor& query, const Tensor& cache, const Tensor& lengths,
+                     const Tensor& indices, std::int64_t length, std::int64_t planned, double scale);
 // Writes the supplied backing and returns visible KV; paged prefixes may be gathered.
 // An unpaged, unquantized zero-batch write can use CPU tensors.
 std::pair<Tensor, Tensor> append_kv(state::KvView kv, const Tensor& key, const Tensor& value,
@@ -166,6 +170,8 @@ Tensor embedding(const Tensor& ids, const ::tyloi::Tensor& weight);
 Tensor project(const Tensor& input, const ::tyloi::Tensor& weight);
 // Select one weight bank per route; keep the route axis in the result.
 Tensor project(const Tensor& input, const Tensor& weight, const Tensor& ids);
+// Input [B,T,H,D], weight [H,O,D], result [B,T,H,O]; backend caches head routes.
+Tensor head_project(const Tensor& input, const Tensor& weight);
 // Input starts with [batch,tokens]; each group has output_a.size(1) values.
 // Two projections preserve those axes and return output_b.size(0) channels.
 Tensor low_rank(const Tensor& input, const Tensor& output_a, const Tensor& output_b,
