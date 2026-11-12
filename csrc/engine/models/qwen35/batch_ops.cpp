@@ -33,12 +33,25 @@ bool batch_graph_enabled(const Model& model, const tyloi::engine::ContinuousBatc
            mfq_cuda_graph_capture_supported();
 }
 
+static std::shared_ptr<const Model> require_weights(std::shared_ptr<const Model> model) {
+    if (!model)
+        throw std::invalid_argument("continuous batching requires Qwen35 model weights");
+    return model;
+}
+
+static std::unique_ptr<Executor> require_executor(std::unique_ptr<Executor> executor) {
+    if (!executor)
+        throw std::invalid_argument("continuous batching requires an executor");
+    return executor;
+}
+
 BatchOps::BatchOps(std::shared_ptr<const Model> model, std::unique_ptr<Executor> executor,
                    Collectives& collectives, Executor::Mode mode, Batch::Options options,
                    tyloi::engine::Budget& budget,
                    tyloi::engine::ContinuousBatchConfig config)
-    : model_(std::move(model)), collectives_(collectives), mode_(mode),
-      state_(model_, std::move(executor), mode_.transposed, options),
+    : model_(require_weights(std::move(model))), collectives_(collectives), mode_(mode),
+      executor_(require_executor(std::move(executor))),
+      state_(model_, mode_.transposed, options),
       budget_(budget), config_(std::move(config)),
       max_sequences_(static_cast<int32_t>(config_.max_sequences)),
       moe_enabled_(state_.has_moe()),
@@ -94,6 +107,8 @@ void BatchOps::suspend_decode() { invalidate_decode_graph(); }
 BatchOps::Sample BatchOps::prefill(const std::shared_ptr<Request>& request,
                                    tyloi::engine::PrefillChunk chunk) {
     const int primary = mode_.primary;
+    if (chunk.offset == 0 && !request->executor)
+        request->executor = executor_->fork();
     state_.prepare_prefill(request->cache, chunk.offset, request->prompt.size());
     if (chunk.offset == 0) {
         request->prefill_ids =
@@ -121,7 +136,7 @@ BatchOps::Sample BatchOps::prefill(const std::shared_ptr<Request>& request,
     input.ids = request->prefill_ids.narrow(1, chunk.offset, chunk.count).contiguous();
     input.lengths = length.value_or(::tyloi::DenseTensor());
     {
-        auto scope = request->cache.executor().enter(mfq_current_cuda_device(), mode_.ffn);
+        auto scope = request->executor->enter(mfq_current_cuda_device(), mode_.ffn);
         hidden = model_->forward(std::move(input), request->cache.state(),
             {mode_.kv_capacity, mode_.trace, mode_.trace_layer, mode_.primary, mode_.ffn.batch_serial});
     }
@@ -135,7 +150,7 @@ BatchOps::Sample BatchOps::prefill(const std::shared_ptr<Request>& request,
     }
     if (end < static_cast<int64_t>(request->prompt.size()))
         return {};
-    auto logits = state_.logits_from_last_hidden(std::move(hidden), mode_);
+    auto logits = logits_from_last_hidden(std::move(hidden), mode_);
     TYLOINFER_RUNTIME_CHECK(final_timer != nullptr, "continuous batching lost the prefill timer");
     TYLOINFER_CUDA_CHECK(
         cudaEventRecord(final_timer->finished_event(), mfq_get_current_cuda_stream()));
@@ -162,7 +177,10 @@ void BatchOps::activate(const std::shared_ptr<Request>& request, const Sample& s
 #else
         sample_token_counts_add_cuda(request->counts, sample.next.contiguous());
 #endif
+    TYLOINFER_RUNTIME_CHECK(request->executor,
+                            "continuous batching request has no prefill state");
     state_.activate(request->cache);
+    request->executor.reset();
 }
 
 void BatchOps::resume_decode(int64_t cache_position) {
@@ -170,15 +188,19 @@ void BatchOps::resume_decode(int64_t cache_position) {
 }
 
 void BatchOps::discard_prefill(const std::shared_ptr<Request>& request) {
-    state_.discard_prefill(request->cache);
+    mfq_cuda_synchronize();
+    state_.release(request->cache);
+    request->executor.reset();
     request->prefill_timers.clear();
     request->prefill_ids = DenseTensor();
 }
 
 void BatchOps::retire(const std::vector<std::shared_ptr<Request>>& retired,
                       int64_t cache_position) {
-    for (const auto& request : retired)
+    for (const auto& request : retired) {
         state_.release(request->cache);
+        request->executor.reset();
+    }
     if (cache_position == 0)
         invalidate_decode_graph();
     state_.finish_retire(cache_position);
@@ -203,6 +225,21 @@ void BatchOps::invalidate_decode_graph() {
     for (auto& graph : decode_graphs_)
         graph->invalidate();
     decode_graphs_.clear();
+}
+
+std::vector<const void*> BatchOps::decode_state_addresses() {
+    std::vector<const void*> addresses;
+    const auto storage = state_.state().storage();
+    addresses.reserve(storage.size());
+    for (const auto& tensor : storage)
+        addresses.push_back(tensor.dense().data_ptr());
+    return addresses;
+}
+
+::tyloi::Tensor BatchOps::logits_from_last_hidden(::tyloi::Tensor hidden, const Executor::Mode& mode) {
+    auto last = tyloi::ops::contiguous(tyloi::ops::cast(tyloi::ops::select(hidden, 1, -1), ::tyloi::kFloat16));
+    auto scope = executor_->enter(mfq_current_cuda_device(), mode.ffn);
+    return model_->logits(last, true);
 }
 
 BatchOps::Decoded BatchOps::decode(State& state) {
@@ -235,7 +272,7 @@ BatchOps::Decoded BatchOps::decode(State& state) {
     bool graph_decode = false;
     if (batch >= 2 && batch_greedy && config_.greedy &&
         batch_graph_enabled(*model_, config_)) {
-        graph_state_addresses = state_.decode_state_addresses();
+        graph_state_addresses = decode_state_addresses();
         const auto found =
             std::find_if(decode_graphs_.begin(), decode_graphs_.end(), [&](const auto& graph) {
                 return graph->matches(batch, planned_len, graph_state_addresses);
@@ -316,10 +353,10 @@ BatchOps::Decoded BatchOps::decode(State& state) {
                 input.cache_positions = pos;
                 input.kv_length = planned_len;
                 input.attention_parts = graph_attention_parts;
-                auto scope = state_.executor().enter(mfq_current_cuda_device(), mode.ffn);
+                auto scope = executor_->enter(mfq_current_cuda_device(), mode.ffn);
                 auto hidden = model_->forward(std::move(input), state_.state(),
                     {mode.kv_capacity, mode.trace, mode.trace_layer, mode.primary, mode.ffn.batch_serial});
-                auto current_logits = state_.logits_from_last_hidden(std::move(hidden), mode);
+                auto current_logits = logits_from_last_hidden(std::move(hidden), mode);
 #ifdef TYLOINFER_NATIVE_CUDA
                 return sample_greedy_cuda(current_logits.dense().contiguous().view({batch, -1}));
 #else
@@ -339,7 +376,7 @@ BatchOps::Decoded BatchOps::decode(State& state) {
                     decode_graph->graph->capture_begin();
                     decode_graph->static_next = invoke();
                     decode_graph->graph->capture_end();
-                    decode_graph->set_key(batch, planned_len, state_.decode_state_addresses());
+                    decode_graph->set_key(batch, planned_len, decode_state_addresses());
                     ++cuda_graph_captures_;
                 } catch (...) {
                     decode_graph->invalidate();
@@ -355,10 +392,10 @@ BatchOps::Decoded BatchOps::decode(State& state) {
             input.positions = pos;
             input.lengths = lengths;
             input.cache_positions = pos;
-            auto scope = state_.executor().enter(mfq_current_cuda_device(), mode.ffn);
+            auto scope = executor_->enter(mfq_current_cuda_device(), mode.ffn);
             auto hidden = model_->forward(std::move(input), state_.state(),
                 {mode.kv_capacity, mode.trace, mode.trace_layer, mode.primary, mode.ffn.batch_serial});
-            logits = state_.logits_from_last_hidden(std::move(hidden), mode);
+            logits = logits_from_last_hidden(std::move(hidden), mode);
         }
         state_.finish_decode(max_sequence_length);
     } catch (...) {
@@ -431,7 +468,15 @@ void BatchOps::recover(State& state) {
         caches.push_back(&request->cache);
     for (const auto& request : state.active)
         caches.push_back(&request->cache);
+    try {
+        mfq_cuda_synchronize();
+    } catch (...) {
+    }
     state_.recover(caches);
+    for (const auto& request : state.prefilling)
+        request->executor.reset();
+    for (const auto& request : state.active)
+        request->executor.reset();
     invalidate_decode_graph();
 }
 

@@ -6,7 +6,7 @@
 #include "engine/models/common/components.h"
 #include "engine/models/qwen4_exp/components.h"
 #include "engine/models/qwen4_exp/batch.h"
-#include "engine/models/qwen35/batch.h"
+#include "engine/models/qwen35/batch_ops.h"
 #include "engine/models/qwen4_exp/ops.h"
 #include "engine/models/nemotron_h/components.h"
 #include "engine/models/common/mtp.h"

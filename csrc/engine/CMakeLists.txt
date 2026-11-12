@@ -33,6 +33,7 @@ add_library(mfq-engine STATIC
     models/nemotron_h/config.cpp
     models/nemotron_h/vision.cpp
     models/qwen35/config.cpp
+    models/qwen35/batch.cpp
     models/qwen35/model.cpp
     models/qwen35/forward.cpp
     models/qwen35/state.cpp

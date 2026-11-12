@@ -12,7 +12,14 @@
 
 namespace tyloi::cuda::qwen35 {
 
-using DenseTensor = ::tyloi::DenseTensor;
+using ::tyloi::Tensor;
+
+static std::vector<std::int64_t> shape(const Tensor &tensor) {
+    std::vector<std::int64_t> result;
+    for (std::int64_t dim = 0; dim < tensor.dim(); ++dim)
+        result.push_back(tensor.size(dim));
+    return result;
+}
 
 static bool has_cached_experts(const ::tyloi::models::Ffn& ffn) {
     const auto* moe = std::get_if<::tyloi::models::Moe>(&ffn);
@@ -24,7 +31,6 @@ Batch::~Batch() {
     if (state_)
         detach_paged(*state_);
     state_.reset();
-    executor_.reset();
 }
 
 static std::shared_ptr<const Model>
@@ -34,17 +40,8 @@ require_weights(std::shared_ptr<const Model> weights) {
     return weights;
 }
 
-static std::unique_ptr<Executor>
-require_executor(std::unique_ptr<Executor> executor) {
-    if (!executor)
-        throw std::invalid_argument("continuous batching requires an executor");
-    return executor;
-}
-
-Batch::Batch(std::shared_ptr<const Model> weights, std::unique_ptr<Executor> executor,
-             const bool &transposed, Options options)
+Batch::Batch(std::shared_ptr<const Model> weights, bool transposed, Options options)
     : weights_(require_weights(std::move(weights))), transposed_(transposed),
-      executor_(require_executor(std::move(executor))),
       state_(std::make_unique<State>(*weights_, transposed_)) {
     if (options.slots == 0 ||
         options.slots > static_cast<std::size_t>(std::numeric_limits<int32_t>::max()))
@@ -91,14 +88,12 @@ void Batch::prepare_prefill(RequestState &request, std::int64_t offset, std::int
                             "continuous batching prefill state is invalid");
     if (!request.state_) {
         TYLOINFER_RUNTIME_CHECK(offset == 0, "continuous batching lost prefill state");
-        auto executor = executor_->fork();
         auto state = std::make_unique<State>(*weights_, transposed_);
         state->reset(1);
         if (paged_kv_) {
             detach_paged(*state);
             paged_kv_->ensure_tokens(request.pages_, tokens);
         }
-        request.executor_ = std::move(executor);
         request.state_ = std::move(state);
     }
     if (paged_kv_)
@@ -106,7 +101,7 @@ void Batch::prepare_prefill(RequestState &request, std::int64_t offset, std::int
 }
 
 void Batch::activate(RequestState &request) {
-    TYLOINFER_RUNTIME_CHECK(request.slot_ < 0 && request.state_ && request.executor_,
+    TYLOINFER_RUNTIME_CHECK(request.slot_ < 0 && request.state_,
                             "continuous batching request has no prefill state");
     const auto free = std::find(slots_.begin(), slots_.end(), nullptr);
     TYLOINFER_RUNTIME_CHECK(free != slots_.end(), "continuous batching has no free stable slot");
@@ -133,7 +128,6 @@ void Batch::activate(RequestState &request) {
         if (paged_kv_)
             bind_paged_slots();
         request.state_.reset();
-        request.executor_.reset();
     } catch (...) {
         if (request.slot_ == slot) {
             *free = nullptr;
@@ -184,12 +178,6 @@ void Batch::release(RequestState &request) {
     if (paged_kv_)
         paged_kv_->release(request.pages_);
     request.state_.reset();
-    request.executor_.reset();
-}
-
-void Batch::discard_prefill(RequestState &request) {
-    mfq_cuda_synchronize();
-    release(request);
 }
 
 void Batch::finish_retire(std::int64_t cache_position) {
@@ -228,10 +216,6 @@ void Batch::prepare_decode(std::int64_t cache_position) {
 void Batch::finish_decode(std::int64_t cache_position) { state_->cache_pos = cache_position; }
 
 void Batch::recover(const std::vector<RequestState *> &requests) {
-    try {
-        mfq_cuda_synchronize();
-    } catch (...) {
-    }
     for (auto *request : requests)
         release(*request);
     finish_retire(0);
@@ -247,7 +231,7 @@ void Batch::bind_paged(State &state, const std::vector<const PagedKv::Sequence *
             [&](const auto &value) {
                 using T = std::decay_t<decltype(value)>;
                 if constexpr (std::is_same_v<T, Full>) {
-                    MfqCudaGuard guard(layer.device.index);
+                    tyloi::ops::DeviceScope guard(layer.device);
                     auto *cache = std::get_if<tyloi::state::KvView>(&state.layers[state_index]);
                     TYLOINFER_RUNTIME_CHECK(cache, "continuous batching full state layout changed");
                     *cache = paged_kv_->view(paged_layer++, static_cast<int64_t>(sequences.size()));
@@ -334,7 +318,7 @@ void Batch::copy_to_slot(State &target, const State &source, std::int64_t slot) 
                                 source.speculative_start < 0,
                             "continuous batching received an invalid stable slot");
     for (std::size_t index = 0; index < target.layers.size(); ++index) {
-        MfqCudaGuard guard(weights_->layers[index].device.index);
+        tyloi::ops::DeviceScope guard(weights_->layers[index].device);
         auto &destination = target.layers[index];
         const auto &origin = source.layers[index];
         TYLOINFER_RUNTIME_CHECK(destination.index() == origin.index(),
@@ -367,8 +351,8 @@ void Batch::copy_to_slot(State &target, const State &source, std::int64_t slot) 
                         "continuous batching stable slot KV geometry changed");
                 if (!cache->defined()) {
                     *cache = from;
-                    auto key_shape = from_key.sizes().vec();
-                    auto value_shape = from_value.sizes().vec();
+                    auto key_shape = shape(from_key);
+                    auto value_shape = shape(from_value);
                     key_shape[0] = target.batch;
                     value_shape[0] = target.batch;
                     cache->physical_key = tyloi::ops::zeros(key_shape, from_key.options());
@@ -391,45 +375,22 @@ void Batch::copy_to_slot(State &target, const State &source, std::int64_t slot) 
             const auto &source = from.mixer.view();
             auto &target_view = state.mixer.view();
             if (!target_view.defined()) {
-                auto convolution_shape = source.convolution.dense().sizes().vec();
-                auto recurrent_shape = source.recurrent.dense().sizes().vec();
+                auto convolution_shape = shape(source.convolution);
+                auto recurrent_shape = shape(source.recurrent);
                 convolution_shape[0] = target.batch;
                 recurrent_shape[0] = target.batch;
-                target_view.convolution = ::tyloi::cuda::zeros(
+                target_view.convolution = ::tyloi::ops::zeros(
                     convolution_shape, source.convolution.options());
-                target_view.recurrent = ::tyloi::cuda::zeros(
+                target_view.recurrent = ::tyloi::ops::zeros(
                     recurrent_shape, source.recurrent.options());
                 target_view.transposed = source.transposed;
             }
             TYLOINFER_RUNTIME_CHECK(target_view.transposed == source.transposed,
                                     "continuous batching recurrent layout changed");
-            target_view.convolution.dense().narrow(0, slot, 1).copy_(source.convolution.dense());
-            target_view.recurrent.dense().narrow(0, slot, 1).copy_(source.recurrent.dense());
+            tyloi::ops::copy_into(tyloi::ops::slice(target_view.convolution, 0, slot, slot + 1), source.convolution);
+            tyloi::ops::copy_into(tyloi::ops::slice(target_view.recurrent, 0, slot, slot + 1), source.recurrent);
         }
     }
-}
-
-#ifdef TYLOINFER_NATIVE_CUDA
-::tyloi::Tensor Batch::logits_from_last_hidden(::tyloi::Tensor hidden, const Executor::Mode& mode) {
-    auto last = tyloi::ops::contiguous(tyloi::ops::cast(tyloi::ops::select(hidden, 1, -1), ::tyloi::kFloat16));
-#else
-DenseTensor Batch::logits_from_last_hidden(DenseTensor hidden, const Executor::Mode& mode) {
-    auto last = hidden.index({::tyloi::indexing::Slice(), -1,
-                              ::tyloi::indexing::Slice()})
-                    .to(::tyloi::kFloat16)
-                    .contiguous();
-#endif
-    auto scope = executor_->enter(mfq_current_cuda_device(), mode.ffn);
-    return weights_->logits(last, true);
-}
-
-std::vector<const void *> Batch::decode_state_addresses() {
-    std::vector<const void *> addresses;
-    const auto storage = state_->storage();
-    addresses.reserve(storage.size());
-    for (const auto &tensor : storage)
-        addresses.push_back(tensor.dense().data_ptr());
-    return addresses;
 }
 
 BatchState Batch::capture_recurrent_slots(const std::vector<std::int32_t> &slots) const {
@@ -442,15 +403,15 @@ BatchState Batch::capture_recurrent_slots(const std::vector<std::int32_t> &slots
         const auto *linear = std::get_if<LinearState>(&state_->layers[index]);
         if (!linear)
             continue;
-        MfqCudaGuard guard(weights_->layers[index].device.index);
-        std::vector<DenseTensor> conv, recurrent;
+        tyloi::ops::DeviceScope guard(weights_->layers[index].device);
+        std::vector<Tensor> conv, recurrent;
         for (auto slot : slots) {
-            conv.push_back(linear->mixer.view().convolution.dense().narrow(0, slot, 1));
-            recurrent.push_back(linear->mixer.view().recurrent.dense().narrow(0, slot, 1));
+            conv.push_back(tyloi::ops::slice(linear->mixer.view().convolution, 0, slot, slot + 1));
+            recurrent.push_back(tyloi::ops::slice(linear->mixer.view().recurrent, 0, slot, slot + 1));
         }
         state.layers[index] = tyloi::state::Recurrent::State{
-            ::tyloi::cuda::cat(conv, 0).clone(),
-            ::tyloi::cuda::cat(recurrent, 0).clone(),
+            tyloi::ops::clone(tyloi::ops::cat(conv, 0)),
+            tyloi::ops::clone(tyloi::ops::cat(recurrent, 0)),
             linear->mixer.view().transposed};
     }
     return state;
@@ -467,7 +428,7 @@ void Batch::restore_recurrent_slots(const std::vector<std::int32_t> &slots,
         auto *linear = std::get_if<LinearState>(&state_->layers[index]);
         if (!linear)
             continue;
-        MfqCudaGuard guard(weights_->layers[index].device.index);
+        tyloi::ops::DeviceScope guard(weights_->layers[index].device);
         const auto *saved = std::get_if<tyloi::state::Recurrent::State>(&state.layers[index]);
         TYLOINFER_RUNTIME_CHECK(saved && saved->defined() &&
                                     saved->convolution.size(0) == state.batch &&
@@ -479,13 +440,13 @@ void Batch::restore_recurrent_slots(const std::vector<std::int32_t> &slots,
         auto *linear = std::get_if<LinearState>(&state_->layers[index]);
         if (!linear)
             continue;
-        MfqCudaGuard guard(weights_->layers[index].device.index);
+        tyloi::ops::DeviceScope guard(weights_->layers[index].device);
         const auto &saved = std::get<tyloi::state::Recurrent::State>(state.layers[index]);
         for (std::size_t row = 0; row < slots.size(); ++row) {
-            linear->mixer.view().convolution.dense().narrow(0, slots[row], 1)
-                .copy_(saved.convolution.dense().narrow(0, row, 1));
-            linear->mixer.view().recurrent.dense().narrow(0, slots[row], 1)
-                .copy_(saved.recurrent.dense().narrow(0, row, 1));
+            tyloi::ops::copy_into(tyloi::ops::slice(linear->mixer.view().convolution, 0, slots[row], slots[row] + 1),
+                                  tyloi::ops::slice(saved.convolution, 0, row, row + 1));
+            tyloi::ops::copy_into(tyloi::ops::slice(linear->mixer.view().recurrent, 0, slots[row], slots[row] + 1),
+                                  tyloi::ops::slice(saved.recurrent, 0, row, row + 1));
         }
     }
 }

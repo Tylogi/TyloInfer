@@ -1,6 +1,5 @@
 #pragma once
 
-#include "engine/backends/cuda/executor/executor.h"
 #include "engine/models/qwen35/model.h"
 #include "engine/models/qwen35/state.h"
 #include "engine/state/paged_kv.h"
@@ -11,8 +10,6 @@
 #include <variant>
 #include <vector>
 
-namespace tyloi::engine { class Batch; class Budget; struct ContinuousBatchConfig; }
-
 namespace tyloi::cuda::qwen35 {
 
 // A copyable snapshot is only needed for paused recurrent decode rows. KV state
@@ -22,7 +19,7 @@ struct BatchState {
     std::vector<std::variant<tyloi::state::KvView, tyloi::state::Recurrent::State>> layers;
 };
 
-// A request owns its prefill state and executor. The batch only copies state
+// A request owns its prefill state. The batch only copies state
 // into a stable decode slot; immutable weights are shared by every request.
 class RequestState {
   public:
@@ -32,12 +29,9 @@ class RequestState {
     std::int32_t slot() const noexcept { return slot_; }
     qwen35::State &state() noexcept { return *state_; }
     const qwen35::State &state() const noexcept { return *state_; }
-    Executor &executor() noexcept { return *executor_; }
-    const Executor &executor() const noexcept { return *executor_; }
 
   private:
     friend class Batch;
-    std::unique_ptr<Executor> executor_;
     std::unique_ptr<qwen35::State> state_;
     PagedKv::Sequence pages_;
     std::int32_t slot_ = -1;
@@ -53,8 +47,7 @@ class Batch {
         int cached_slots = 0;
     };
 
-    Batch(std::shared_ptr<const Model> weights, std::unique_ptr<Executor> executor,
-          const bool &transposed, Options options);
+    Batch(std::shared_ptr<const Model> weights, bool transposed, Options options);
     Batch(const Batch &) = delete;
     Batch &operator=(const Batch &) = delete;
     ~Batch();
@@ -69,7 +62,6 @@ class Batch {
     void prepare_prefill(RequestState &request, std::int64_t offset, std::int64_t tokens);
     void activate(RequestState &request);
     void resume_decode(std::int64_t cache_position);
-    void discard_prefill(RequestState &request);
     void release(RequestState &request);
     void finish_retire(std::int64_t cache_position);
     void ensure_decode_tokens(const RequestState &request, std::int64_t tokens);
@@ -77,20 +69,12 @@ class Batch {
     void finish_decode(std::int64_t cache_position);
     void recover(const std::vector<RequestState *> &requests);
 
-#ifdef TYLOINFER_NATIVE_CUDA
-    ::tyloi::Tensor logits_from_last_hidden(::tyloi::Tensor hidden, const Executor::Mode&);
-#else
-    ::tyloi::DenseTensor logits_from_last_hidden(::tyloi::DenseTensor hidden, const Executor::Mode&);
-#endif
-    std::vector<const void *> decode_state_addresses();
     BatchState capture_recurrent_slots(const std::vector<std::int32_t> &slots) const;
     void restore_recurrent_slots(const std::vector<std::int32_t> &slots,
                                  const BatchState &state);
 
     qwen35::State &state() noexcept { return *state_; }
     const qwen35::State &state() const noexcept { return *state_; }
-    Executor &executor() noexcept { return *executor_; }
-    const Executor &executor() const noexcept { return *executor_; }
 
   private:
     void copy_to_slot(qwen35::State &target, const qwen35::State &source,
@@ -102,8 +86,7 @@ class Batch {
     std::string incompatibility(bool cpu_offload, int cached_slots) const;
 
     std::shared_ptr<const Model> weights_;
-    const bool &transposed_;
-    std::unique_ptr<Executor> executor_;
+    const bool transposed_;
     std::unique_ptr<qwen35::State> state_;
     std::vector<RequestState *> slots_;
     std::int64_t slot_releases_ = 0;
@@ -113,14 +96,3 @@ class Batch {
 };
 
 } // namespace tyloi::cuda::qwen35
-
-namespace tyloi::cuda {
-
-// serial is startup-only: release idle preallocated KV; running independent serial state is omitted.
-std::unique_ptr<tyloi::engine::Batch> make_batch(
-    std::shared_ptr<const qwen35::Model> model, qwen35::State* serial,
-    std::unique_ptr<Executor> executor, Collectives& copies, Executor::Mode mode,
-    tyloi::engine::Budget& budget, tyloi::engine::ContinuousBatchConfig config,
-    std::int64_t chunk_size, bool preallocate, bool cpu_offload, int cached_slots);
-
-} // namespace tyloi::cuda
