@@ -4,6 +4,8 @@
 #include "engine/backends/metal/native/profile.h"
 #include "mlx_kernel_prepare.h"
 #include "engine/backends/metal/native/stream.h"
+#include "engine/backends/metal/native/tensor/tensor.h"
+#include "engine/backends/metal/ops/tensor.h"
 
 #include <algorithm>
 #include <array>
@@ -76,7 +78,8 @@ array validate_positions(
             "Qwen3.5 positions must use int32 or int64 values");
     }
 
-    auto result = mlx::core::contiguous(positions);
+    auto prepared = tyloi::metal::ops::contiguous(tyloi::metal::tensor(positions));
+    auto result = tyloi::metal::array(prepared);
     tyloi::metal::eval(result);
     if (result.dtype() == mlx::core::int32) {
         const auto* values = result.data<std::int32_t>();

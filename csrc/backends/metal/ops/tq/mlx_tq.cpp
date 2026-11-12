@@ -1,6 +1,7 @@
 #include "mlx_indirect_weight_residency.h"
 #include "mlx_tq.h"
 #include "engine/backends/metal/native/tensor/tensor.h"
+#include "engine/backends/metal/ops/tensor.h"
 #include "mfq_container.h"
 #include "mfq_tq_embedded.h"
 #include "engine/backends/metal/native/resident_allocations.h"
@@ -1800,15 +1801,15 @@ MlxTqWeight MlxTqWeight::expert_view(int expert) const {
     auto result = *this;
     result.rows_ = output_size(); result.experts_ = 1;
     const int begin = expert * result.rows_;
-    result.descriptors_ = tyloi::metal::tensor(slice(tyloi::metal::array(descriptors_), {begin}, {begin + result.rows_}));
+    result.descriptors_ = tyloi::metal::ops::slice(descriptors_, 0, begin, begin + result.rows_);
     if (pooled_) result.descriptors_ = tyloi::metal::tensor(mlx::core::concatenate({tyloi::metal::array(result.descriptors_),
-        slice(tyloi::metal::array(descriptors_), {rows_ + expert}, {rows_ + expert + 1})}));
+        tyloi::metal::array(tyloi::metal::ops::slice(descriptors_, 0, rows_ + expert, rows_ + expert + 1))}));
     if (!columns_) {
         const int groups = (width_ + group_size_ - 1) / group_size_;
         const int stride = tyloi::metal::array(scales_).dtype() == float32 ? groups : groups / 2;
-        result.scales_ = tyloi::metal::tensor(slice(tyloi::metal::array(scales_), {begin * stride}, {(begin + result.rows_) * stride}));
+        result.scales_ = tyloi::metal::ops::slice(scales_, 0, begin * stride, (begin + result.rows_) * stride);
     } else if (columns_ == 2) {
-        result.scales_ = tyloi::metal::tensor(slice(tyloi::metal::array(scales_), {expert * width_}, {(expert + 1) * width_}));
+        result.scales_ = tyloi::metal::ops::slice(scales_, 0, expert * width_, (expert + 1) * width_);
         result.columns_ = 1;
         result.group_size_ = 512;
     }

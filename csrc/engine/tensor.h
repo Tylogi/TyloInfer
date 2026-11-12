@@ -468,7 +468,7 @@ public:
     //
     // View and cast rules: an encoded representation has no dense view of the
     // values it stands for, so reshape/narrow/cast never apply to it. buffers()
-    // enumerates the payload for accounting, residency and keep-alive only.
+    // enumerates directly addressable payload; backings() supplies physical owners.
     // The only path that changes a representation's storage is preparation,
     // which publishes a new one through relocated(); a published weight is
     // never rewritten in place.
@@ -478,6 +478,11 @@ public:
     // Physical backings that currently exist; empty does not imply undefined.
     // The default derives them from dense buffers; opaque representations may override.
     virtual std::vector<std::shared_ptr<TensorStorage>> backings() const;
+    // This is metadata; lazy representations must avoid traversing their graph here.
+    virtual bool is_pinned() const noexcept {
+        const auto storages = backings();
+        return !storages.empty() && storages.front()->pinned;
+    }
 
     // A copy of this representation with every buffer resident on `device`,
     // keeping the encoding. Weight preparation uses this; a published weight
@@ -491,9 +496,8 @@ public:
     bool is_metal() const noexcept { return defined() && device().is_metal(); }
     std::size_t element_size() const noexcept { return scalar_size(scalar_type()); }
     TensorOptions options() const noexcept {
-        const auto storages = backings();
         return TensorOptions{}.dtype(scalar_type()).device(device()).pinned_memory(
-            !storages.empty() && storages.front()->pinned);
+            is_pinned());
     }
     void require_dense() const {
         if (is_encoded()) throw std::invalid_argument("operation requires a dense tensor");
@@ -526,6 +530,7 @@ public:
     const Device& device() const noexcept override { return view_.device; }
     bool is_contiguous() const noexcept override { return defined() && view_.is_contiguous(); }
     bool is_encoded() const noexcept override { return false; }
+    bool is_pinned() const noexcept override { return storage_ && storage_->pinned; }
     // DenseTensor is already the concrete representation; the accessor exists
     // so callers can treat a handle and a representation the same way.
     const DenseTensor& dense() const noexcept { return *this; }

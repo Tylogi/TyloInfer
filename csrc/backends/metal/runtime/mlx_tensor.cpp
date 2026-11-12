@@ -12,6 +12,7 @@
 #include <mlx/allocator.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdlib>
 #include <cstdint>
@@ -654,7 +655,8 @@ array MlxLinear::operator()(const array& input) const {
                 output_size_);
         }
     }
-    return mlx::core::matmul(source, mlx::core::transpose(dense));
+    const auto transposed = tyloi::metal::ops::transpose(std::get<tyloi::Tensor>(weight_), 0, 1);
+    return mlx::core::matmul(source, tyloi::metal::array(transposed));
 }
 
 array MlxLinear::moe_shared(
@@ -735,14 +737,10 @@ array MlxLinear::grouped_row_matmul(
                 source,
                 dense->dtype());
         }
-        const auto grouped_weight =
-            mlx::core::reshape(
-                *dense,
-                Shape{
-                    group_count,
-                    output_size_ / group_count,
-                    input_size_,
-                });
+        const std::array<std::int64_t, 3> shape{
+            group_count, output_size_ / group_count, input_size_};
+        const auto grouped = tyloi::metal::ops::reshape(*weight, shape);
+        const auto& grouped_weight = tyloi::metal::array(grouped);
         return mlx::core::sum(
             mlx::core::expand_dims(source, -2) *
                 grouped_weight,
@@ -1462,9 +1460,10 @@ array MlxEmbedding::project(const array& input) const {
     if (source.dtype() != dense.dtype()) {
         source = mlx::core::astype(source, dense.dtype());
     }
+    const auto transposed = tyloi::metal::ops::transpose(std::get<tyloi::Tensor>(weight_), 0, 1);
     return mlx::core::matmul(
         source,
-        mlx::core::transpose(dense));
+        tyloi::metal::array(transposed));
 }
 
 } // namespace mfq::metal

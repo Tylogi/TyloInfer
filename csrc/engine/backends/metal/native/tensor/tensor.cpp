@@ -4,6 +4,7 @@
 
 #include <limits>
 #include <stdexcept>
+#include <unordered_set>
 #include <utility>
 
 namespace tyloi::metal {
@@ -46,8 +47,7 @@ public:
     }
     std::size_t nbytes() const override { return value_.nbytes(); }
     std::size_t backing_nbytes() const override {
-        const auto storage = backings();
-        return storage.empty() ? 0 : storage.front()->bytes;
+        return backing_bytes(backings());
     }
     std::int64_t size(std::int64_t dimension) const override {
         if (dimension < 0) dimension += dim();
@@ -58,17 +58,32 @@ public:
     const Device& device() const noexcept override { return device_; }
     bool is_contiguous() const noexcept override { return value_.flags().row_contiguous; }
     bool is_encoded() const noexcept override { return false; }
+    bool is_pinned() const noexcept override { return false; }
     std::vector<const DenseTensor*> buffers() const override { return {}; }
     std::vector<std::shared_ptr<TensorStorage>> backings() const override {
-        auto data = value_.data_shared_ptr();
-        if (!data) return {};
-        auto buffer = allocation_buffer(*data);
-        if (!buffer.ptr()) return {};
-        auto storage = std::make_shared<TensorStorage>();
-        storage->owner = std::shared_ptr<void>(data, buffer.ptr());
-        storage->bytes = static_cast<MTL::Buffer*>(buffer.ptr())->allocatedSize();
-        storage->device = device_;
-        return {std::move(storage)};
+        std::vector<std::shared_ptr<TensorStorage>> storages;
+        std::vector<mlx::core::array> worklist{value_};
+        std::unordered_set<std::uintptr_t> visited;
+        while (!worklist.empty()) {
+            auto node = std::move(worklist.back());
+            worklist.pop_back();
+            if (!visited.insert(node.id()).second) continue;
+            auto data = node.data_shared_ptr();
+            if (data) {
+                auto buffer = allocation_buffer(*data);
+                if (buffer.ptr()) {
+                    auto storage = std::make_shared<TensorStorage>();
+                    storage->owner = std::shared_ptr<void>(data, buffer.ptr());
+                    storage->bytes = static_cast<MTL::Buffer*>(buffer.ptr())->allocatedSize();
+                    storage->device = device_;
+                    storages.push_back(std::move(storage));
+                    continue;
+                }
+            }
+            const auto& inputs = node.inputs();
+            worklist.insert(worklist.end(), inputs.rbegin(), inputs.rend());
+        }
+        return storages;
     }
     void record_stream(std::uintptr_t, std::shared_ptr<void>) const override {
         throw std::runtime_error("Metal tensor stream recording is not supported");
