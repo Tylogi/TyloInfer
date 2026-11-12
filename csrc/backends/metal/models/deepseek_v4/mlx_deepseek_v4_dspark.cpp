@@ -4,7 +4,7 @@
 #include "mlx_deepseek_v4_attention.h"
 #include "mlx_deepseek_v4_hc.h"
 #include "mlx_dsa.h"
-#include "mlx_eval_timing.h"
+#include "engine/backends/metal/native/profile.h"
 #include "mlx_sampling.h"
 #include "mlx_sparse_attention.h"
 #include "mlx_transformer.h"
@@ -915,7 +915,7 @@ MlxDeepseekV4DSpark::draft_impl(
                  ++attempt) {
                 impl_->ssd_expert_cache->begin_route_transaction();
                 auto trial = run_stages(hidden_checkpoint);
-                detail::eval_with_timing(trial);
+                tyloi::metal::eval_with_timing(trial);
                 auto transaction =
                     impl_->ssd_expert_cache->resolve_route_transaction();
                 if (transaction.all_hit) {

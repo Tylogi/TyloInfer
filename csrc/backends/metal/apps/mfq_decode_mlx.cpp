@@ -10,7 +10,7 @@
 #include "mlx_resident_budget.h"
 #include "mlx_qwen4_causal_lm.h"
 #include "mlx_qwen35_causal_lm.h"
-#include "engine/backends/metal/ops/stream.h"
+#include "engine/backends/metal/native/stream.h"
 #include "mlx_tensor.h"
 #include "qwen35_model.h"
 
@@ -82,7 +82,7 @@ void release_model_load_staging_memory(
     // both the MLX cache and macOS malloc's large-object depot. Keeping those
     // pages makes a single fully resident model look tens of GiB larger and
     // can force useful weights into swap before the first request.
-    tyloi::metal::ops::drain(runtime_stream);
+    tyloi::metal::drain(runtime_stream);
     release_allocator_caches();
 }
 
@@ -1884,8 +1884,7 @@ public:
     void execute(const std::vector<mfq::engine::RequestId>& eligible) override {
         if (!batching || batching->empty() || eligible.empty()) return;
         std::lock_guard lock(*runtime_mutex);
-        mlx::core::set_default_device(mlx::core::Device::gpu);
-        mlx::core::set_default_stream(runtime_stream);
+        tyloi::metal::bind(runtime_stream);
         mfq::metal::MlxResidentBudgetScope budget_scope(
             [this](std::size_t bytes) { enforce_memory_budget(bytes); },
             [this](std::size_t bytes) { return optional_memory_fits(bytes); });
@@ -1897,8 +1896,7 @@ public:
         auto generation = batching->generate(id, input, output);
         mfq::engine::ExecutionCleanup cleanup{output.cleanup_failure, [&] {
             std::lock_guard lock(*runtime_mutex);
-            mlx::core::set_default_device(mlx::core::Device::gpu);
-            mlx::core::set_default_stream(runtime_stream);
+            tyloi::metal::bind(runtime_stream);
             mfq::metal::MlxResidentBudgetScope budget_scope(
                 [this](std::size_t bytes) { enforce_memory_budget(bytes); },
                 [this](std::size_t bytes) { return optional_memory_fits(bytes); });
@@ -1907,8 +1905,7 @@ public:
         while (true) {
             auto step = [&] {
                 std::lock_guard lock(*runtime_mutex);
-                mlx::core::set_default_device(mlx::core::Device::gpu);
-                mlx::core::set_default_stream(runtime_stream);
+                tyloi::metal::bind(runtime_stream);
                 mfq::metal::MlxResidentBudgetScope budget_scope(
                     [this](std::size_t bytes) { enforce_memory_budget(bytes); },
                     [this](std::size_t bytes) { return optional_memory_fits(bytes); });
@@ -1944,9 +1941,7 @@ public:
                     throw std::runtime_error(
                         "model runtime is unavailable after a failed reload");
                 }
-                mlx::core::set_default_device(
-                    mlx::core::Device::gpu);
-                mlx::core::set_default_stream(runtime_stream);
+                tyloi::metal::bind(runtime_stream);
                 mfq::metal::MlxSamplingParams parameters;
                 parameters.temperature = sampling.temperature;
                 parameters.top_k = sampling.top_k;
@@ -1976,7 +1971,7 @@ public:
                 enforce_memory_budget(0);
                 if (runtime_components.speculative_generate && !request.vision &&
                     runtime_components.speculative_generate(prompt, sampling, job, token_constraint, prefill_chunk_size)) {
-                    tyloi::metal::ops::drain(runtime_stream);
+                    tyloi::metal::drain(runtime_stream);
                     return;
                 }
                 if constexpr (requires { loaded_runtime.begin_mtp_session(std::string{}); })
@@ -2082,7 +2077,7 @@ public:
                 }
                 (void)generated;
             }
-            tyloi::metal::ops::drain(runtime_stream);
+            tyloi::metal::drain(runtime_stream);
             if constexpr (requires(Runtime& value) { value.last_mtp_stats(); }) {
                 const auto& stats = runtime_holder->value().last_mtp_stats();
                 job.mtp = {stats.available, stats.used, stats.cycles,
@@ -2092,7 +2087,7 @@ public:
                     stats.standard_tokens, stats.park_count, stats.reentry_probes};
             }
         } catch (...) {
-            tyloi::metal::ops::drain(runtime_stream);
+            tyloi::metal::drain(runtime_stream);
             throw;
         }
     }
@@ -2100,10 +2095,8 @@ public:
     std::int64_t reload(std::int64_t requested_context) override {
         std::lock_guard<std::mutex> lock(*runtime_mutex);
         batching.reset();
-        mlx::core::set_default_device(
-            mlx::core::Device::gpu);
-        mlx::core::set_default_stream(runtime_stream);
-        tyloi::metal::ops::drain(runtime_stream);
+        tyloi::metal::bind(runtime_stream);
+        tyloi::metal::drain(runtime_stream);
 
         const auto previous_context = *loaded_context;
         session_cache->clear_live_sessions();
@@ -2243,9 +2236,8 @@ public:
         case Kind::refresh:
             return {session_cache->refresh_disk_index(), {}};
         case Kind::clear: {
-            mlx::core::set_default_device(mlx::core::Device::gpu);
-            mlx::core::set_default_stream(runtime_stream);
-            tyloi::metal::ops::drain(runtime_stream);
+            tyloi::metal::bind(runtime_stream);
+            tyloi::metal::drain(runtime_stream);
             const auto released = session_cache->clear();
             if (runtime_holder->has_value()) {
                 if constexpr (requires(Runtime& value) { value.clear_mtp_sessions(); })
@@ -2272,8 +2264,7 @@ public:
                 if constexpr (requires(Runtime& runtime, mlx::core::array ids) { runtime.score_forward(ids, false); }) {
                     std::lock_guard<std::mutex> lock(*runtime_mutex);
                     if (!runtime_holder->has_value()) throw std::runtime_error("model runtime is unavailable");
-                    mlx::core::set_default_device(mlx::core::Device::gpu);
-                    mlx::core::set_default_stream(runtime_stream);
+                    tyloi::metal::bind(runtime_stream);
                     mfq::metal::MlxResidentBudgetScope budget_scope(
                         [this](std::size_t bytes) { enforce_memory_budget(bytes); },
                         [this](std::size_t bytes) { return optional_memory_fits(bytes); });
@@ -2296,13 +2287,13 @@ public:
                             const int begin = value.next_token ? rows.shape(0) - 1 : static_cast<int>(value.prompt_tokens) - 1;
                             rows = mlx::core::astype(mlx::core::slice(rows, {begin, 0}, {begin + (value.next_token ? 1 : count), rows.shape(1)}), mlx::core::float32);
                             auto logprobs = rows - mlx::core::logsumexp(rows, -1, true);
-                            if (value.next_token) { logprobs.eval(); next_logprobs = logprobs; }
+                            if (value.next_token) { tyloi::metal::eval(logprobs); next_logprobs = logprobs; }
                             return logprobs;
                         }();
                         std::vector<std::int32_t> ids(targets.begin(), targets.end());
                         auto selected = mlx::core::take_along_axis(score,
                             mlx::core::array(ids.begin(), mlx::core::Shape{count, 1}, mlx::core::int32), -1);
-                        selected.eval();
+                        tyloi::metal::eval(selected);
                         const auto* numbers = selected.template data<float>();
                         mfq::engine::TokenLikelihood output{targets, {}, 0};
                         for (int token = 0; token < count; ++token) {
@@ -2350,7 +2341,7 @@ private:
             if (room == std::numeric_limits<std::size_t>::max())
                 room = runtime.ssd_expert_payload_bytes() ? runtime.ssd_expert_payload_bytes() : runtime.resident_full_expert_bytes();
             if (room != std::numeric_limits<std::size_t>::max()) {
-                tyloi::metal::ops::drain(runtime_stream);
+                tyloi::metal::drain(runtime_stream);
                 const auto active = mlx::core::get_active_memory();
                 const auto full = runtime.resident_full_expert_bytes();
                 runtime.set_expert_cache_limit(room);
@@ -2398,7 +2389,7 @@ private:
             throw mfq::metal::MlxResidentBudgetExceeded("resident memory budget cannot accommodate this allocation");
         const auto target = budget - allocation;
         if (used() <= target) return;
-        tyloi::metal::ops::drain(runtime_stream);
+        tyloi::metal::drain(runtime_stream);
         const auto clear_allocator_excess = [&] {
             if (mlx::core::get_cache_memory() > reserve) mlx::core::clear_cache();
         };

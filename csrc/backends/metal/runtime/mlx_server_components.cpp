@@ -1,5 +1,5 @@
 #include "mlx_server_components.h"
-#include "engine/backends/metal/ops/stream.h"
+#include "engine/backends/metal/native/stream.h"
 
 #include <chrono>
 #include <cstdint>
@@ -135,8 +135,7 @@ static MlxEngineComponents make_grid_vision_engine_components(
             input.image_grids = grid_shapes(media.image_grid);
             input.video_grids = grid_shapes(media.video_grid);
 
-            mlx::core::set_default_device(mlx::core::Device::gpu);
-            mlx::core::set_default_stream(runtime_stream);
+            tyloi::metal::bind(runtime_stream);
             const auto component_started =
                 std::chrono::steady_clock::now();
             auto prepared = runtime.prepare_multimodal_prompt(prompt, input);
@@ -144,8 +143,8 @@ static MlxEngineComponents make_grid_vision_engine_components(
                 throw std::runtime_error(
                     "multimodal component did not produce embeddings");
             }
-            prepared.embeddings->eval();
-            mlx::core::synchronize(runtime_stream);
+            tyloi::metal::eval(*prepared.embeddings);
+            tyloi::metal::wait(runtime_stream);
             const auto component_ms =
                 std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - component_started)
@@ -226,8 +225,7 @@ MlxEngineComponents make_mlx_engine_components(
                     throw std::invalid_argument(
                         "MiniCPM-o media bounds are invalid");
                 }
-                mlx::core::set_default_device(mlx::core::Device::gpu);
-                mlx::core::set_default_stream(runtime_stream);
+                tyloi::metal::bind(runtime_stream);
 
                 std::vector<std::int32_t> prompt_ids;
                 prompt_ids.reserve(prompt.size());
@@ -341,10 +339,9 @@ MlxEngineComponents make_mlx_engine_components(
                 throw std::runtime_error(
                     "MiniCPM-o runtime is unavailable");
             }
-            mlx::core::set_default_device(mlx::core::Device::gpu);
-            mlx::core::set_default_stream(runtime_stream);
+            tyloi::metal::bind(runtime_stream);
             auto& runtime = runtime_holder->value();
-            tyloi::metal::ops::drain(runtime_stream);
+            tyloi::metal::drain(runtime_stream);
             runtime.reset();
             mlx::core::clear_cache();
 
@@ -418,7 +415,7 @@ MlxEngineComponents make_mlx_engine_components(
                 system_prefix_ids,
                 reference_features,
                 system_suffix_ids);
-            mlx::core::synchronize(runtime_stream);
+            tyloi::metal::wait(runtime_stream);
         };
     result.duplex.step =
         [runtime_mutex, runtime_holder, runtime_stream](
@@ -440,8 +437,7 @@ MlxEngineComponents make_mlx_engine_components(
                 throw std::runtime_error(
                     "MiniCPM-o runtime is unavailable");
             }
-            mlx::core::set_default_device(mlx::core::Device::gpu);
-            mlx::core::set_default_stream(runtime_stream);
+            tyloi::metal::bind(runtime_stream);
             auto& runtime = runtime_holder->value();
             if (!runtime.duplex_prepared()) {
                 throw std::runtime_error(
@@ -472,9 +468,9 @@ MlxEngineComponents make_mlx_engine_components(
 
             const auto started = std::chrono::steady_clock::now();
             auto generated = runtime.duplex_step(inputs);
-            generated.generated_ids.eval();
-            generated.tts_codes.eval();
-            mlx::core::synchronize(runtime_stream);
+            tyloi::metal::eval(generated.generated_ids);
+            tyloi::metal::eval(generated.tts_codes);
+            tyloi::metal::wait(runtime_stream);
 
             MfqDuplexStepResult response;
             const auto* generated_ids =
@@ -504,9 +500,8 @@ MlxEngineComponents make_mlx_engine_components(
          runtime_holder = std::move(runtime_holder), runtime_stream]() {
             std::lock_guard<std::mutex> lock(*runtime_mutex);
             if (!runtime_holder->has_value()) return;
-            mlx::core::set_default_device(mlx::core::Device::gpu);
-            mlx::core::set_default_stream(runtime_stream);
-            tyloi::metal::ops::drain(runtime_stream);
+            tyloi::metal::bind(runtime_stream);
+            tyloi::metal::drain(runtime_stream);
             runtime_holder->value().reset();
             mlx::core::clear_cache();
             malloc_zone_pressure_relief(nullptr, 0);
@@ -550,8 +545,7 @@ MlxEngineComponents make_mlx_engine_components(
                 throw std::invalid_argument(
                     "DeepSeek-V4 received a foreign multimodal payload");
             }
-            mlx::core::set_default_device(mlx::core::Device::gpu);
-            mlx::core::set_default_stream(runtime_stream);
+            tyloi::metal::bind(runtime_stream);
             const auto& config = runtime_holder->value().config();
             const auto pixel_shape = checked_shape(
                 media.pixel_shape, "pixel_values");
@@ -742,8 +736,7 @@ MlxEngineComponents make_mlx_engine_components(
                 throw std::runtime_error(
                     "DeepSeek-V4.1 runtime is unavailable after a failed reload");
             }
-            mlx::core::set_default_device(mlx::core::Device::gpu);
-            mlx::core::set_default_stream(runtime_stream);
+            tyloi::metal::bind(runtime_stream);
             const auto images = prepare_deepseek_v41_images(prompt, media, runtime_holder->value().config());
             std::function<void(std::size_t, double)> report_prefill;
             {

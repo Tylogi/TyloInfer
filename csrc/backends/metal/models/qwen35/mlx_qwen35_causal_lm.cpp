@@ -1,9 +1,9 @@
 #include "mlx_qwen35_causal_lm.h"
 #include "mlx_legacy_tensor_compat.h"
 #include "mlx_mtp.h"
-#include "mlx_eval_timing.h"
+#include "engine/backends/metal/native/profile.h"
 #include "mlx_kernel_prepare.h"
-#include "engine/backends/metal/ops/stream.h"
+#include "engine/backends/metal/native/stream.h"
 
 #include <algorithm>
 #include <array>
@@ -77,7 +77,7 @@ array validate_positions(
     }
 
     auto result = mlx::core::contiguous(positions);
-    tyloi::metal::ops::eval(result);
+    tyloi::metal::eval(result);
     if (result.dtype() == mlx::core::int32) {
         const auto* values = result.data<std::int32_t>();
         for (std::size_t index = 0; index < result.size(); ++index) {
@@ -721,7 +721,7 @@ MlxQwen35CausalLm::forward_embeddings_impl(
         if (std::binary_search(hidden_capture_layers_.begin(), hidden_capture_layers_.end(), int(layer_index)))
             captured.push_back(hidden);
         if (dispatch_decode && (layer_index < 6 || layer_index % 3 == 0))
-            tyloi::metal::ops::submit({hidden});
+            tyloi::metal::submit({hidden});
         ++layer_index;
     }
     if (!captured.empty()) hidden_capture_ = mlx::core::concatenate(captured, -1);
@@ -1218,7 +1218,7 @@ std::int32_t MlxQwen35CausalLm::generate_prepared_impl(
     } stable_restore{*this, stable_snapshot};
 
     const bool profile_prefill =
-        detail::component_profile_requested();
+        tyloi::metal::component_profile_requested();
     tyloi::profiling::Components component_profile;
     const auto profile_started = std::chrono::steady_clock::now();
     auto logits = [&]() {
@@ -1374,11 +1374,11 @@ std::int32_t MlxQwen35CausalLm::generate_prepared_impl(
             return std::move(*stable_logits);
         }();
         if (profile_prefill) {
-            detail::profile_eval("qwen35.output", value);
+            tyloi::metal::profile_eval("qwen35.output", value);
         } else if (prefill_callback) {
             // Build the lazy graph before entering eval_with_timing().
             // Only MLX execution/synchronization contributes to prefill.
-            detail::eval_with_timing(value);
+            tyloi::metal::eval_with_timing(value);
         }
         return value;
     }();
@@ -1544,7 +1544,7 @@ std::int32_t MlxQwen35CausalLm::generate_prepared_impl(
             auto anchor = positions
                 ? mtp_->forward(batch.hidden, batch.token_ids, *positions, embedding_, true)
                 : mtp_->forward(batch.hidden, batch.token_ids, embedding_, true);
-            tyloi::metal::ops::eval(anchor);
+            tyloi::metal::eval(anchor);
             predictor_history_position += batch.token_ids.shape(1);
         };
         std::optional<MlxMtpDraftContext> terminal_context;
@@ -1563,7 +1563,7 @@ std::int32_t MlxQwen35CausalLm::generate_prepared_impl(
                     Shape{1, accepted, static_cast<int>(config_.hidden_size)});
                 array shifted(context.next_token_ids.begin(), Shape{1, accepted}, mlx::core::int32);
                 auto value = mtp_->forward(rows, shifted, embedding_, true);
-                tyloi::metal::ops::eval(value);
+                tyloi::metal::eval(value);
                 predictor_history_position += accepted;
                 folded_history = accepted;
             }
@@ -1773,7 +1773,7 @@ std::int32_t MlxQwen35CausalLm::generate_prepared_impl(
                 : sampler.sample(logits);
             std::optional<array> next_logits, next_hidden;
             if (!token_constraint && generated + 1 < generation_limit) {
-                tyloi::metal::ops::submit({sampled});
+                tyloi::metal::submit({sampled});
                 DecodeCheckpoint checkpoint;
                 checkpoint.reserve(layers_.size());
                 for (const auto& layer : layers_) {
@@ -1794,9 +1794,9 @@ std::int32_t MlxQwen35CausalLm::generate_prepared_impl(
                 } else {
                     next_logits = mlx_last_token_logits(forward_decode(ids), vocab);
                 }
-                tyloi::metal::ops::submit({*next_logits});
+                tyloi::metal::submit({*next_logits});
             }
-            tyloi::metal::ops::eval(sampled);
+            tyloi::metal::eval(sampled);
             auto token = sampled.data<std::int32_t>()[0];
             if (token < 0 || token >= vocab) {
                 throw std::runtime_error("Qwen3.5 sampler returned an out-of-range token");
@@ -1804,12 +1804,12 @@ std::int32_t MlxQwen35CausalLm::generate_prepared_impl(
             if (token_constraint && !token_constraint->allows(token)) {
                 auto adjusted = counts.has_value() ? sampler.apply_penalties(logits, *counts) : logits;
                 adjusted = mlx::core::contiguous(mlx::core::astype(adjusted, mlx::core::float32));
-                tyloi::metal::ops::eval(adjusted);
+                tyloi::metal::eval(adjusted);
                 std::vector<float> masked(adjusted.data<float>(), adjusted.data<float>() + vocab);
                 token_constraint->apply(masked.data(), masked.size());
                 const array constrained_logits(masked.begin(), Shape{1, vocab}, mlx::core::float32);
                 sampled = sampler.sample(constrained_logits);
-                tyloi::metal::ops::eval(sampled);
+                tyloi::metal::eval(sampled);
                 token = sampled.data<std::int32_t>()[0];
                 if (token < 0 || token >= vocab || !token_constraint->allows(token)) {
                     throw std::runtime_error("Qwen3.5 constrained sampler returned an invalid token");

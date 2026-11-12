@@ -2,7 +2,7 @@
 #include "mlx_resource_telemetry.h"
 
 #include "mfe_expert_store.h"
-#include "mlx_eval_timing.h"
+#include "engine/backends/metal/native/profile.h"
 
 #include <algorithm>
 #include <array>
@@ -1428,7 +1428,7 @@ MlxSsdPreparedRoutes MlxMoeSsdExpertCache::prepare_routes(
         expert_ids.dtype() == mlx::core::int32
             ? expert_ids
             : mlx::core::astype(expert_ids, mlx::core::int32));
-    detail::eval_with_timing(host_ids);
+    tyloi::metal::eval_with_timing(host_ids);
     std::vector<std::int32_t> active(
         host_ids.data<std::int32_t>(),
         host_ids.data<std::int32_t>() + host_ids.size());

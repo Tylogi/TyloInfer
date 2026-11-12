@@ -1,5 +1,5 @@
 #include "mlx_qwen35_full_attention.h"
-#include "mlx_eval_timing.h"
+#include "engine/backends/metal/native/profile.h"
 #include "mlx_kernel_prepare.h"
 #include "native/mlx_native_gguf.h"
 
@@ -530,7 +530,7 @@ array MlxQwen35FullAttentionBlock::forward_impl(
     auto key_full = std::move(projected.at(1));
     auto value_full = std::move(projected.at(2));
     if (tyloi::profiling::active()) {
-        detail::profile_eval(
+        tyloi::metal::profile_eval(
             "qwen35.full_attention.qkv",
             {query_full, key_full, value_full});
     }
@@ -634,7 +634,7 @@ array MlxQwen35FullAttentionBlock::forward_impl(
         key_cache,
         value_cache,
         true);
-    detail::profile_eval("qwen35.full_attention.sdpa", attended);
+    tyloi::metal::profile_eval("qwen35.full_attention.sdpa", attended);
     attended = mlx::core::reshape(
         mlx::core::transpose(attended, {0, 2, 1, 3}),
         Shape{batch, tokens, attention_size});
@@ -646,9 +646,9 @@ array MlxQwen35FullAttentionBlock::forward_impl(
     }
 
     auto residual = input + output_(attended);
-    detail::profile_eval("qwen35.full_attention.output", residual);
+    tyloi::metal::profile_eval("qwen35.full_attention.output", residual);
     residual = residual + ffn_.forward_normalized(residual, ffn_norm_);
-    detail::profile_eval("qwen35.ffn", residual);
+    tyloi::metal::profile_eval("qwen35.ffn", residual);
     return residual;
 }
 

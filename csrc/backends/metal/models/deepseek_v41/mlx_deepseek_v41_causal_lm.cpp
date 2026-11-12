@@ -1,6 +1,6 @@
 #include "mlx_deepseek_v41_causal_lm.h"
 
-#include "mlx_eval_timing.h"
+#include "engine/backends/metal/native/profile.h"
 #include "mlx_legacy_tensor_compat.h"
 #include "mlx_transformer.h"
 #include "mfe_expert_store.h"
@@ -235,7 +235,7 @@ void MlxDeepseekV41Layer::append_ced_encoder_context(
     (void)attention_.forward(slice_tokens(source, begin, source.shape(1)),
         state.attention, shared, pos0 + begin, true, &source);
     state.attention.local_kv = std::move(local);
-    detail::eval_with_timing({*state.attention.compressed_kv, *state.attention.index_k});
+    tyloi::metal::eval_with_timing({*state.attention.compressed_kv, *state.attention.index_k});
 }
 
 std::optional<MlxQuantizedRowStoreStats>
@@ -520,7 +520,7 @@ void MlxDeepseekV41CausalLm::materialize_states(
         if (state.partial_kv) arrays.push_back(*state.partial_kv);
         if (state.partial_score) arrays.push_back(*state.partial_score);
     }
-    detail::eval_with_timing(std::move(arrays));
+    tyloi::metal::eval_with_timing(std::move(arrays));
 }
 
 namespace {
@@ -532,7 +532,7 @@ void materialize_deepseek_v41_dspark_state(
     for (std::size_t stage = 0; stage < state.stages(); ++stage) {
         rings.push_back(state.ring(stage));
     }
-    if (!rings.empty()) detail::eval_with_timing(std::move(rings));
+    if (!rings.empty()) tyloi::metal::eval_with_timing(std::move(rings));
 }
 
 } // namespace
@@ -942,7 +942,7 @@ array MlxDeepseekV41CausalLm::forward_impl(
                             restored.insert(restored.end(), std::make_move_iterator(values.begin()),
                                 std::make_move_iterator(values.end()));
                         }
-                        detail::eval_with_timing(std::move(restored));
+                        tyloi::metal::eval_with_timing(std::move(restored));
                     };
                     auto trial_hidden = hidden;
                     auto trial_pre = previous_pre;
@@ -992,7 +992,7 @@ array MlxDeepseekV41CausalLm::forward_impl(
                             continue;
                         }
                         routes[completed].resolve();
-                        detail::eval_with_timing(trial_hidden);
+                        tyloi::metal::eval_with_timing(trial_hidden);
                         restore(completed);
                         if (completed > 0) {
                             for (std::size_t offset = 0; offset < completed; ++offset)
@@ -1006,7 +1006,7 @@ array MlxDeepseekV41CausalLm::forward_impl(
                             continue;
                         }
                     } catch (...) {
-                        try { detail::eval_with_timing(trial_hidden); } catch (...) {}
+                        try { tyloi::metal::eval_with_timing(trial_hidden); } catch (...) {}
                         try { restore(); } catch (...) {}
                         throw;
                     }
@@ -1109,7 +1109,7 @@ array MlxDeepseekV41CausalLm::forward_impl(
                             std::make_move_iterator(values.begin()),
                             std::make_move_iterator(values.end()));
                     }
-                    detail::eval_with_timing(std::move(backups));
+                    tyloi::metal::eval_with_timing(std::move(backups));
                     ssd_expert_cache_->begin_route_transaction();
                     auto trial_hidden = hidden_checkpoint;
                     auto trial_previous_pre = previous_pre_checkpoint;
@@ -1134,7 +1134,7 @@ array MlxDeepseekV41CausalLm::forward_impl(
                             result.attention_input,
                             trial_targets);
                     }
-                    detail::eval_with_timing(trial_hidden);
+                    tyloi::metal::eval_with_timing(trial_hidden);
                     auto transaction =
                         ssd_expert_cache_->resolve_route_transaction();
                     if (transaction.all_hit) {
@@ -1165,7 +1165,7 @@ array MlxDeepseekV41CausalLm::forward_impl(
                             std::make_move_iterator(values.begin()),
                             std::make_move_iterator(values.end()));
                     }
-                    detail::eval_with_timing(std::move(restored));
+                    tyloi::metal::eval_with_timing(std::move(restored));
                     for (const auto& route : transaction.routes) {
                         auto prepared = ssd_expert_cache_->prepare(
                             route.layer,
@@ -1184,7 +1184,7 @@ array MlxDeepseekV41CausalLm::forward_impl(
                                 auto restored =
                                     layers_[index].rollback_route_replay(
                                         states_[index]);
-                                detail::eval_with_timing(
+                                tyloi::metal::eval_with_timing(
                                     std::move(restored));
                             } catch (...) {
                             }
@@ -1273,7 +1273,7 @@ void MlxDeepseekV41CausalLm::begin_speculative_target(
         speculative_engram_snapshot_ = engram_hash_.snapshot();
         speculative_token_ids_ = token_ids;
         speculative_cache_start_ = cache_position_;
-        detail::eval_with_timing(std::move(checkpoints));
+        tyloi::metal::eval_with_timing(std::move(checkpoints));
     } catch (...) {
         abort_speculative_target();
         throw;
@@ -1319,7 +1319,7 @@ void MlxDeepseekV41CausalLm::rollback_speculative_target(
     speculative_engram_snapshot_.reset();
     speculative_token_ids_.reset();
     speculative_cache_start_ = -1;
-    detail::eval_with_timing(std::move(restored));
+    tyloi::metal::eval_with_timing(std::move(restored));
 }
 
 void MlxDeepseekV41CausalLm::abort_speculative_target() noexcept {

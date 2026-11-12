@@ -1,5 +1,7 @@
 #include "mlx_sampling.h"
 
+#include "engine/backends/metal/native/stream.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
@@ -1401,7 +1403,7 @@ std::vector<float> host_sampling_distribution(
     auto values = mlx::core::contiguous(mlx::core::astype(
         mlx::core::reshape(logits, Shape{checked_int(logits.size(), "logits size")}),
         mlx::core::float32));
-    values.eval();
+    tyloi::metal::eval(values);
     const int vocab = static_cast<int>(values.size());
     if (vocab <= 0 || (params.top_k > 0 && params.top_k > vocab)) {
         throw std::invalid_argument(

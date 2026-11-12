@@ -1,7 +1,7 @@
 #include "mlx_deepseek_v4_causal_lm.h"
 
 #include "mfe_expert_store.h"
-#include "mlx_eval_timing.h"
+#include "engine/backends/metal/native/profile.h"
 #include "mlx_mtp.h"
 #include "mlx_transformer.h"
 
@@ -639,7 +639,7 @@ array MlxDeepseekV4Layer::forward(
         components_.attention_norm,
         attention_norm_);
     auto branch = attention_hc.reduced;
-    detail::profile_eval(
+    tyloi::metal::profile_eval(
         "layer.attention_hc_pre_norm",
         branch);
     branch = components_.attention(
@@ -657,13 +657,13 @@ array MlxDeepseekV4Layer::forward(
               residual,
               attention_hc.post,
               attention_hc.combination);
-    detail::profile_eval(
+    tyloi::metal::profile_eval(
         "layer.attention_hc_post",
         result);
     if (routed_prefetch != nullptr) {
         // Attention has no dependency on the expert banks. Materialize it
         // while the SSD workers fill the alternating routed buffer.
-        detail::eval_with_timing(result);
+        tyloi::metal::eval_with_timing(result);
     }
 
     residual = result;
@@ -675,7 +675,7 @@ array MlxDeepseekV4Layer::forward(
         components_.ffn_norm,
         ffn_norm_);
     branch = ffn_hc.reduced;
-    detail::profile_eval(
+    tyloi::metal::profile_eval(
         "layer.ffn_hc_pre_norm",
         branch);
     auto moe_branches = components_.moe.forward_branches(
@@ -694,7 +694,7 @@ array MlxDeepseekV4Layer::forward(
               residual,
               ffn_hc.post,
               ffn_hc.combination);
-    detail::profile_eval(
+    tyloi::metal::profile_eval(
         "layer.ffn_hc_post",
         output);
     return output;
@@ -1079,7 +1079,7 @@ void MlxDeepseekV4CausalLm::materialize_states(
     for (const auto& state : states) {
         append_state_arrays(state, arrays);
     }
-    detail::eval_with_timing(std::move(arrays));
+    tyloi::metal::eval_with_timing(std::move(arrays));
 }
 
 void MlxDeepseekV4CausalLm::materialize_layer_range(
@@ -1095,7 +1095,7 @@ void MlxDeepseekV4CausalLm::materialize_layer_range(
     for (std::size_t index = begin; index < end; ++index) {
         append_state_arrays(states_[index], outputs);
     }
-    detail::eval_with_timing(std::move(outputs));
+    tyloi::metal::eval_with_timing(std::move(outputs));
 }
 
 void MlxDeepseekV4CausalLm::capture_dspark_target(
@@ -1278,7 +1278,7 @@ array MlxDeepseekV4CausalLm::forward_streaming_layers(
                         trial,
                         targets != nullptr ? &trial_targets : nullptr);
                 }
-                detail::eval_with_timing(trial);
+                tyloi::metal::eval_with_timing(trial);
                 auto transaction =
                     ssd_expert_cache_->resolve_route_transaction();
                 if (transaction.all_hit) {
@@ -1352,7 +1352,7 @@ void MlxDeepseekV4CausalLm::begin_speculative_target(
     // checkpoint before verification can overwrite those physical rows, but
     // submit the independent layer copies together instead of imposing one
     // host synchronization per layer.
-    detail::eval_with_timing(std::move(checkpoints));
+    tyloi::metal::eval_with_timing(std::move(checkpoints));
 }
 
 void MlxDeepseekV4CausalLm::commit_speculative_target() noexcept {
@@ -1379,7 +1379,7 @@ void MlxDeepseekV4CausalLm::rollback_speculative_target(
     }
     // Keep the restored cache materialized before the next decode cycle while
     // avoiding one synchronization boundary per layer.
-    detail::eval_with_timing(std::move(restored));
+    tyloi::metal::eval_with_timing(std::move(restored));
     cache_position_ -= draft_tokens - accepted_tokens;
 }
 
@@ -1480,7 +1480,7 @@ array MlxDeepseekV4CausalLm::forward_chunk(
         target_hiddens.resize(
             config_.dspark_target_layer_ids.size());
     }
-    detail::profile_eval(
+    tyloi::metal::profile_eval(
         "model.embedding_broadcast",
         hidden_values);
     const bool bounded_prefill = tokens > 1;
@@ -1548,13 +1548,13 @@ array MlxDeepseekV4CausalLm::forward_chunk(
                   hidden,
               });
     auto headed = head(head_input);
-    detail::profile_eval(
+    tyloi::metal::profile_eval(
         "model.final_hc_norm",
         headed);
     auto logits = mlx::core::astype(
         output_(headed),
         mlx::core::float32);
-    detail::profile_eval(
+    tyloi::metal::profile_eval(
         "model.lm_head_cast",
         logits);
     if (!materialize_bounded_prefill) {
@@ -1584,11 +1584,11 @@ array MlxDeepseekV4CausalLm::forward_chunk(
             }
         }
         if (tyloi::profiling::active()) {
-            detail::profile_eval(
+            tyloi::metal::profile_eval(
                 "model.finalize_cache",
                 std::move(outputs));
         } else {
-            detail::eval_with_timing(
+            tyloi::metal::eval_with_timing(
                 std::move(outputs));
         }
         if (mfq::mfq_compat_enabled && ssd_expert_cache_ &&
@@ -1877,7 +1877,7 @@ void materialize_deepseek_v4_dspark_state(
     for (std::size_t stage = 0; stage < state.stages(); ++stage) {
         rings.push_back(state.ring(stage));
     }
-    if (!rings.empty()) detail::eval_with_timing(std::move(rings));
+    if (!rings.empty()) tyloi::metal::eval_with_timing(std::move(rings));
 }
 
 } // namespace
@@ -2271,7 +2271,7 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
     double llm_prefill_evaluation_ms = 0.0;
     double multimodal_prefill_evaluation_ms = 0.0;
     const bool profile_prefill =
-        detail::component_profile_requested();
+        tyloi::metal::component_profile_requested();
     tyloi::profiling::Components prefill_component_profile;
     const auto prefill_component_started =
         std::chrono::steady_clock::now();
@@ -2343,7 +2343,7 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
                     // server reports both costs in the correct buckets.
                     tyloi::profiling::EvaluationScope multimodal_timing(
                         &multimodal_prefill_evaluation_ms);
-                    detail::eval_with_timing(embeddings);
+                    tyloi::metal::eval_with_timing(embeddings);
                 }
                 auto visibility = deepseek_v4_image_visibility(
                     prompt,
@@ -2375,7 +2375,7 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
                     requested_stable_count < prompt.size()) {
                     auto prefix_logits = prefill_range(
                         0, requested_stable_count);
-                    detail::eval_with_timing(prefix_logits);
+                    tyloi::metal::eval_with_timing(prefix_logits);
                     materialize_states(states_);
                     return prefill_range(
                         requested_stable_count, prompt.size());
@@ -2415,7 +2415,7 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
             // DeepSeek evaluates layer/state chunks eagerly. Their wrapped
             // eval calls accumulate above; this final eval adds only the
             // remaining output-head graph.
-            detail::eval_with_timing(value);
+            tyloi::metal::eval_with_timing(value);
         }
         if (dspark_active) {
             // DSpark prompt K/V construction belongs to prefill. Submit the
@@ -2428,7 +2428,7 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
                  ++stage) {
                 rings.push_back(dspark_state->ring(stage));
             }
-            detail::eval_with_timing(std::move(rings));
+            tyloi::metal::eval_with_timing(std::move(rings));
         }
         return value;
     }();
@@ -2583,12 +2583,12 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
     while (generated < max_tokens) {
         const int decode_step = generated;
         const int profile_skip =
-            detail::component_profile_skip_steps();
+            tyloi::metal::component_profile_skip_steps();
         const bool profile_this_step =
-            detail::component_profile_requested()
+            tyloi::metal::component_profile_requested()
             && decode_step >= profile_skip
             && decode_step - profile_skip
-                < detail::component_profile_steps();
+                < tyloi::metal::component_profile_steps();
         tyloi::profiling::Components component_profile;
         tyloi::profiling::ProfileScope profile_scope(
             profile_this_step
@@ -2639,7 +2639,7 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
             ? sampler.sample(logits, *counts)
             : sampler.sample(logits);
         if (profile_this_step) {
-            detail::profile_eval(
+            tyloi::metal::profile_eval(
                 "model.sampling",
                 sampled);
         } else {

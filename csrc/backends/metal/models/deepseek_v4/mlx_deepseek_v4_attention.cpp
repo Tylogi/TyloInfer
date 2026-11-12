@@ -1,5 +1,5 @@
 #include "mlx_deepseek_v4_attention.h"
-#include "mlx_eval_timing.h"
+#include "engine/backends/metal/native/profile.h"
 
 #include "mlx_detached_copy.h"
 #include "mlx_grouped_linear.h"
@@ -1914,7 +1914,7 @@ struct MlxDeepseekV4Attention::Impl {
                 groups * rank,
             });
         if (tyloi::profiling::active()) {
-            detail::profile_eval(
+            tyloi::metal::profile_eval(
                 std::string("attention.r")
                     + std::to_string(ratio)
                     + ".output_projection_a",
@@ -1922,7 +1922,7 @@ struct MlxDeepseekV4Attention::Impl {
         }
         auto result = components.wo_b(low_rank);
         if (tyloi::profiling::active()) {
-            detail::profile_eval(
+            tyloi::metal::profile_eval(
                 std::string("attention.r")
                     + std::to_string(ratio)
                     + ".output_projection_b",
@@ -2175,7 +2175,7 @@ array MlxDeepseekV4Attention::operator()(
                 + "." + component;
         };
     if (tyloi::profiling::active()) {
-        detail::profile_eval(
+        tyloi::metal::profile_eval(
             profile_component("input_projections"),
             projected);
     }
@@ -2184,7 +2184,7 @@ array MlxDeepseekV4Attention::operator()(
         projected.at(output++));
     auto kv = projected.at(output++);
     if (tyloi::profiling::active()) {
-        detail::profile_eval(
+        tyloi::metal::profile_eval(
             profile_component("q_rank_norm"),
             q_rank);
     }
@@ -2216,7 +2216,7 @@ array MlxDeepseekV4Attention::operator()(
         speculation->local_kv = kv;
     }
     if (tyloi::profiling::active()) {
-        detail::profile_eval(
+        tyloi::metal::profile_eval(
             profile_component("kv_norm_rope"),
             kv);
     }
@@ -2352,7 +2352,7 @@ array MlxDeepseekV4Attention::operator()(
         if (state.indexer_) {
             append_pool(*state.indexer_);
         }
-        detail::profile_eval(
+        tyloi::metal::profile_eval(
             profile_component("compressor_update"),
             std::move(compressor_state));
     }
@@ -2382,7 +2382,7 @@ array MlxDeepseekV4Attention::operator()(
         if (index_query_projection) {
             query_values.push_back(*index_query_projection);
         }
-        detail::profile_eval(
+        tyloi::metal::profile_eval(
             profile_component("q_b_projection"),
             std::move(query_values));
     }
@@ -2399,7 +2399,7 @@ array MlxDeepseekV4Attention::operator()(
         false,
         impl_->rms_params);
     if (tyloi::profiling::active()) {
-        detail::profile_eval(
+        tyloi::metal::profile_eval(
             profile_component("q_rms_rope"),
             q);
     }
@@ -2413,7 +2413,7 @@ array MlxDeepseekV4Attention::operator()(
         positions,
         pos0);
     if (tyloi::profiling::active()) {
-        detail::profile_eval(
+        tyloi::metal::profile_eval(
             profile_component("indexer_topk"),
             topk);
     }
@@ -2605,11 +2605,11 @@ array MlxDeepseekV4Attention::operator()(
     }
     if (tyloi::profiling::active()) {
         if (direct_decode || direct_multi) {
-            detail::profile_eval(
+            tyloi::metal::profile_eval(
                 profile_component("cache_update"),
                 std::vector<array>{state.local_});
         } else {
-            detail::profile_eval(
+            tyloi::metal::profile_eval(
                 profile_component("cache_plan"),
                 std::vector<array>{
                     state.local_,
@@ -2618,7 +2618,7 @@ array MlxDeepseekV4Attention::operator()(
                     plan->second,
                 });
         }
-        detail::profile_eval(
+        tyloi::metal::profile_eval(
             profile_component("sparse_core"),
             attended);
     }

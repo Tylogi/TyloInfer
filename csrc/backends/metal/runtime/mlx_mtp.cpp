@@ -1,7 +1,8 @@
 #include "mlx_mtp.h"
 
-#include "mlx_eval_timing.h"
+#include "engine/backends/metal/native/profile.h"
 #include "mlx_sampling.h"
+#include "engine/backends/metal/native/stream.h"
 
 #include <algorithm>
 #include <chrono>
@@ -546,7 +547,7 @@ void materialize_profiled_draft(PreparedMtpDraft& draft) {
     if (draft.compact_probabilities) {
         pending.push_back(*draft.compact_probabilities);
     }
-    mlx::core::eval(std::move(pending));
+    tyloi::metal::eval(std::move(pending));
 }
 
 array mtp_sampling_row(
@@ -663,7 +664,7 @@ mfq::StepSequence<MtpDraftStep> prepare_mtp_draft(
         pending.push_back(*indices);
         pending.push_back(*probabilities);
     }
-    mlx::core::async_eval(std::move(pending));
+    tyloi::metal::submit(std::move(pending));
     co_yield MtpDraftStep{PreparedMtpDraft{
         requested,
         std::move(token_values),
@@ -703,7 +704,7 @@ std::size_t mlx_prime_mtp_history(
             Shape{0, offset + 1},
             Shape{batch, offset + count + 1});
         auto anchor = fold(hidden_rows, shifted_ids, offset);
-        mlx::core::async_eval(std::vector<array>{std::move(anchor)});
+        tyloi::metal::submit(std::vector<array>{std::move(anchor)});
     }
     return static_cast<std::size_t>(pairs);
 }
@@ -779,7 +780,7 @@ void mlx_prime_mtp_chunk(const array& hidden, const array& ids,
             {*previous_hidden, mlx::core::slice(hidden, Shape{0, 0, 0},
                 Shape{hidden.shape(0), count - 1, hidden.shape(2)})}, 1);
         auto value = fold(rows, ids, offset - 1);
-        value.eval();
+        tyloi::metal::eval(value);
     } else if (count > 1) {
         mlx_prime_mtp_history(hidden, ids,
             [&](const array& rows, const array& shifted, int pair_offset) {
@@ -837,7 +838,7 @@ MlxMtpGeneration mlx_mtp_generation(
         if (sampled.dtype() != mlx::core::int32 || sampled.size() != 1 ||
             !sampled.flags().row_contiguous)
             throw std::runtime_error("MTP target sampler returned incompatible tokens");
-        sampled.eval();
+        tyloi::metal::eval(sampled);
         auto token = sampled.data<std::int32_t>()[0];
         if (token < 0 || token >= request.vocab) {
             throw std::runtime_error(
@@ -849,7 +850,7 @@ MlxMtpGeneration mlx_mtp_generation(
                 : logits;
             adjusted = mlx::core::contiguous(
                 mlx::core::astype(adjusted, mlx::core::float32));
-            adjusted.eval();
+            tyloi::metal::eval(adjusted);
             std::vector<float> masked(
                 adjusted.data<float>(),
                 adjusted.data<float>() + request.vocab);
@@ -859,7 +860,7 @@ MlxMtpGeneration mlx_mtp_generation(
                 Shape{1, request.vocab},
                 mlx::core::float32);
             sampled = sampler.sample(constrained_logits);
-            sampled.eval();
+            tyloi::metal::eval(sampled);
             token = sampled.data<std::int32_t>()[0];
             if (token < 0 || token >= request.vocab ||
                 !constraint->allows(token)) {
@@ -1010,7 +1011,7 @@ MlxMtpGeneration mlx_mtp_generation(
         const int draft_count = draft.depth;
         tyloi::profiling::Components target_profile;
         const bool profile_target_components =
-            profile_phases && detail::component_profile_requested();
+            profile_phases && tyloi::metal::component_profile_requested();
         co_yield MlxMtpTargetRequest{pending, draft.tokens, draft_count};
         const auto target_started = std::chrono::steady_clock::now();
         auto target = [&]() {
@@ -1019,7 +1020,7 @@ MlxMtpGeneration mlx_mtp_generation(
             auto result = callbacks.verify_target(
                 pending, draft.tokens, draft_count);
             if (profile_phases) {
-                mlx::core::eval(result.logits, result.hidden);
+                tyloi::metal::eval(std::vector<array>{result.logits, result.hidden});
             }
             return result;
         }();
@@ -1081,7 +1082,7 @@ MlxMtpGeneration mlx_mtp_generation(
                 if (target_tokens.dtype() != mlx::core::int32 ||
                     target_tokens.shape() != Shape{draft_count + 1} || !target_tokens.flags().row_contiguous)
                     throw std::runtime_error("MTP verification received incompatible greedy tokens");
-                mlx::core::eval(draft.tokens, target_tokens);
+                tyloi::metal::eval(std::vector<array>{draft.tokens, target_tokens});
                 const auto* ids = draft.tokens.data<std::int32_t>();
                 draft_ids.assign(ids, ids + draft_count);
                 verification = verify_greedy_mtp(draft_ids,
@@ -1095,7 +1096,7 @@ MlxMtpGeneration mlx_mtp_generation(
                             target_tokens, Shape{draft_count + 1}),
                     },
                     0);
-                compact.eval();
+                tyloi::metal::eval(compact);
                 const auto* resolved = compact.data<std::int32_t>();
                 draft_ids.assign(resolved, resolved + draft_count);
                 verification = verify_greedy_mtp(
@@ -1131,7 +1132,7 @@ MlxMtpGeneration mlx_mtp_generation(
                 random,
                 draft_count,
                 request.sampling.top_k);
-            compact.eval();
+            tyloi::metal::eval(compact);
             const auto* resolved = compact.data<std::int32_t>();
             draft_ids.assign(resolved + 2, resolved + 2 + draft_count);
             verification = {
@@ -1145,7 +1146,7 @@ MlxMtpGeneration mlx_mtp_generation(
                 throw std::runtime_error(
                     "host MTP verification requires exactly one draft");
             }
-            draft.tokens.eval();
+            tyloi::metal::eval(draft.tokens);
             const auto draft_id = draft.tokens.data<std::int32_t>()[0];
             draft_ids.push_back(draft_id);
             verification = verify_stochastic_mtp(

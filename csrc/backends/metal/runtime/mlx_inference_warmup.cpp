@@ -1,4 +1,5 @@
 #include "mlx_inference_warmup.h"
+#include "engine/backends/metal/native/stream.h"
 
 #include <algorithm>
 #include <chrono>
@@ -12,9 +13,11 @@ void warm_sorting() {
     for (const auto dtype : {mlx::core::int32, mlx::core::float32}) {
         for (const int size : {128, 256, 512, 1024, 2048, 2049}) {
             const auto input = mlx::core::zeros({size}, dtype, mlx::core::Device::gpu);
-            mlx::core::eval(mlx::core::argsort(input, -1, mlx::core::Device::gpu));
+            tyloi::metal::eval(std::vector<mlx::core::array>{
+                mlx::core::argsort(input, -1, mlx::core::Device::gpu)});
             if (dtype == mlx::core::int32)
-                mlx::core::eval(mlx::core::sort(input, -1, mlx::core::Device::gpu));
+                tyloi::metal::eval(std::vector<mlx::core::array>{
+                    mlx::core::sort(input, -1, mlx::core::Device::gpu)});
         }
     }
 }

@@ -6,7 +6,7 @@
 #include "mlx_sampling.h"
 #include "mlx_tensor.h"
 #include "mlx_transformer.h"
-#include "mlx_eval_timing.h"
+#include "engine/backends/metal/native/profile.h"
 
 #include "nlohmann/json.hpp"
 
@@ -1721,11 +1721,11 @@ private:
             auto up = up_(input);
             return gate * mlx::core::sigmoid(gate) * up;
         }();
-        detail::profile_eval("minicpmo.ffn_gate_up", activated);
+        tyloi::metal::profile_eval("minicpmo.ffn_gate_up", activated);
         auto output = residual != nullptr
             ? down_.add_to(activated, *residual)
             : down_(activated);
-        detail::profile_eval("minicpmo.ffn_down", output);
+        tyloi::metal::profile_eval("minicpmo.ffn_down", output);
         return output;
     }
     MiniLinear gate_;
@@ -1848,7 +1848,7 @@ public:
         const int batch = input.shape(0);
         const int tokens = input.shape(1);
         auto normalized = attention_norm_(input);
-        detail::profile_eval("minicpmo.attention_norm", normalized);
+        tyloi::metal::profile_eval("minicpmo.attention_norm", normalized);
         std::vector<array> projections;
         if (qkv_) {
             projections = (*qkv_)(normalized);
@@ -1862,9 +1862,9 @@ public:
         auto query_projection = std::move(projections.at(0));
         auto key_projection = std::move(projections.at(1));
         auto value_projection = std::move(projections.at(2));
-        detail::profile_eval("minicpmo.q_proj", query_projection);
-        detail::profile_eval("minicpmo.k_proj", key_projection);
-        detail::profile_eval("minicpmo.v_proj", value_projection);
+        tyloi::metal::profile_eval("minicpmo.q_proj", query_projection);
+        tyloi::metal::profile_eval("minicpmo.k_proj", key_projection);
+        tyloi::metal::profile_eval("minicpmo.v_proj", value_projection);
         array query = query_projection;
         array key = key_projection;
         if (use_cache && !cache_) reset_cache(batch);
@@ -1969,10 +1969,10 @@ public:
                   {0, 2, 1, 3});
         if (tyloi::profiling::active()) {
             if (use_inline_kv_post) {
-                detail::profile_eval(
+                tyloi::metal::profile_eval(
                     "minicpmo.qkv_norm_rope", query);
             } else {
-                detail::profile_eval(
+                tyloi::metal::profile_eval(
                     "minicpmo.qkv_norm_rope",
                     std::vector<array>{query, key, value});
             }
@@ -2018,7 +2018,7 @@ public:
             }
             if (tyloi::profiling::active() &&
                 !use_combined_kv_write) {
-                detail::profile_eval(
+                tyloi::metal::profile_eval(
                     "minicpmo.kv_append",
                     std::vector<array>{
                         cache_->key_storage(),
@@ -2043,12 +2043,12 @@ public:
         attended = mlx::core::reshape(
             mlx::core::transpose(attended, {0, 2, 1, 3}),
             Shape{batch, tokens, config_.query_heads * config_.head_dim});
-        detail::profile_eval("minicpmo.attention", attended);
+        tyloi::metal::profile_eval("minicpmo.attention", attended);
         auto residual = output_.add_to(attended, input);
-        detail::profile_eval(
+        tyloi::metal::profile_eval(
             "minicpmo.attention_output", residual);
         auto output = ffn_.add_to(ffn_norm_(residual), residual);
-        detail::profile_eval("minicpmo.ffn", output);
+        tyloi::metal::profile_eval("minicpmo.ffn", output);
         return output;
     }
 
@@ -5355,7 +5355,7 @@ std::int32_t MlxMiniCPMO45Runtime::generate(
             }
             return std::move(*stable_logits);
         }();
-        if (prefill_callback) detail::eval_with_timing(result);
+        if (prefill_callback) tyloi::metal::eval_with_timing(result);
         return result;
     }();
     if (prefill_callback) {
@@ -5370,12 +5370,12 @@ std::int32_t MlxMiniCPMO45Runtime::generate(
     while (generated < generation_limit) {
         const int decode_step = generated;
         const int profile_skip =
-            detail::component_profile_skip_steps();
+            tyloi::metal::component_profile_skip_steps();
         const bool profile_this_step =
-            detail::component_profile_requested() &&
+            tyloi::metal::component_profile_requested() &&
             decode_step >= profile_skip &&
             decode_step - profile_skip <
-                detail::component_profile_steps();
+                tyloi::metal::component_profile_steps();
         tyloi::profiling::Components component_profile;
         tyloi::profiling::ProfileScope profile_scope(
             profile_this_step ? &component_profile : nullptr);
@@ -5388,7 +5388,7 @@ std::int32_t MlxMiniCPMO45Runtime::generate(
                 : sampler.sample(logits);
         }();
         if (profile_this_step) {
-            detail::profile_eval("minicpmo.sampling", token_array);
+            tyloi::metal::profile_eval("minicpmo.sampling", token_array);
         } else {
             token_array.eval();
         }
@@ -5438,7 +5438,7 @@ std::int32_t MlxMiniCPMO45Runtime::generate(
             : mlx_last_token_logits(
                   implementation_->language.forward(token_ids, true),
                   config.vocab);
-        detail::profile_eval("minicpmo.logits", logits);
+        tyloi::metal::profile_eval("minicpmo.logits", logits);
         report_decode_components(
             profile_this_step,
             decode_step,
@@ -5589,7 +5589,7 @@ std::int32_t MlxMiniCPMO45Runtime::generate_multimodal(
         result.logits =
             implementation_->language.logits(result.hidden_states);
         auto value = mlx_last_token_logits(result.logits, config.vocab);
-        if (prefill_callback) detail::eval_with_timing(value);
+        if (prefill_callback) tyloi::metal::eval_with_timing(value);
         if (prefill_callback) {
             llm_prefill_ms = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - llm_started).count();
@@ -5618,12 +5618,12 @@ std::int32_t MlxMiniCPMO45Runtime::generate_multimodal(
     while (generated < generation_limit) {
         const int decode_step = generated;
         const int profile_skip =
-            detail::component_profile_skip_steps();
+            tyloi::metal::component_profile_skip_steps();
         const bool profile_this_step =
-            detail::component_profile_requested() &&
+            tyloi::metal::component_profile_requested() &&
             decode_step >= profile_skip &&
             decode_step - profile_skip <
-                detail::component_profile_steps();
+                tyloi::metal::component_profile_steps();
         tyloi::profiling::Components component_profile;
         tyloi::profiling::ProfileScope profile_scope(
             profile_this_step ? &component_profile : nullptr);
@@ -5636,7 +5636,7 @@ std::int32_t MlxMiniCPMO45Runtime::generate_multimodal(
                 : sampler.sample(logits);
         }();
         if (profile_this_step) {
-            detail::profile_eval("minicpmo.sampling", token_array);
+            tyloi::metal::profile_eval("minicpmo.sampling", token_array);
         } else {
             token_array.eval();
         }
@@ -5686,7 +5686,7 @@ std::int32_t MlxMiniCPMO45Runtime::generate_multimodal(
             : mlx_last_token_logits(
                   implementation_->language.forward(token_ids, true),
                   config.vocab);
-        detail::profile_eval("minicpmo.logits", logits);
+        tyloi::metal::profile_eval("minicpmo.logits", logits);
         report_decode_components(
             profile_this_step,
             decode_step,

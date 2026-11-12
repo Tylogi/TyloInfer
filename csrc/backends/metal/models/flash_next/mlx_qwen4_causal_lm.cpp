@@ -4,7 +4,7 @@
 #include "mlx_affine_rows.h"
 #include "mlx_float_rows.h"
 
-#include "mlx_eval_timing.h"
+#include "engine/backends/metal/native/profile.h"
 #include "mlx_detached_copy.h"
 #include "qwen4_ops.h"
 #include "mlx_legacy_tensor_compat.h"
@@ -1167,7 +1167,7 @@ public:
                 static_cast<int>(config_.hidden_size)});
         auto router_logits = router_(source);
         if (tyloi::profiling::active()) {
-            detail::profile_eval("qwen4.moe.router", router_logits);
+            tyloi::metal::profile_eval("qwen4.moe.router", router_logits);
         }
         auto routes = moe_topk(
             router_logits,
@@ -1191,7 +1191,7 @@ public:
             }
         }
         if (tyloi::profiling::active()) {
-            detail::profile_eval(
+            tyloi::metal::profile_eval(
                 "qwen4.moe.topk",
                 std::vector<array>{routes.ids, routes.weights});
         }
@@ -1203,7 +1203,7 @@ public:
         if (gate_up_ && down_ && shared_weights[0]) {
             if (auto combined = gate_up_->gguf_prefill_ffn(*down_, source, routes.ids, routes.weights,
                 shared_weights[0], shared_weights[1], shared_weights[2], &shared_gate)) {
-                detail::profile_eval("qwen4.moe.grouped_ffn", *combined);
+                tyloi::metal::profile_eval("qwen4.moe.grouped_ffn", *combined);
                 return mlx::core::reshape(*combined, value.shape());
             }
         }
@@ -1216,9 +1216,9 @@ public:
             if (gate_up_ && gate_up_->uses_affine() && down_->uses_affine()) {
                 const auto plan = MlxAffineRoutePlan::from_topk(routes.ids, gate_up_->experts());
                 auto intermediate = gate_up_->routed_swiglu(source, routes.ids, nullptr, &plan);
-                detail::profile_eval("qwen4.moe.routed_gate_up", intermediate);
+                tyloi::metal::profile_eval("qwen4.moe.routed_gate_up", intermediate);
                 auto output = down_->affine_down(intermediate, plan);
-                detail::profile_eval("qwen4.moe.routed_down", output);
+                tyloi::metal::profile_eval("qwen4.moe.routed_down", output);
                 return plan.restore(output);
             }
             if (native_expert_cache_) {
@@ -1232,18 +1232,18 @@ public:
                 if (tokens == 1) {
                     auto output = tq_expert_cache_->apply_ffn(expert_cache_layer_, source,
                         routes.ids, routes.weights, 0.f, false, parallel_shared ? &*parallel_shared : nullptr);
-                    detail::profile_eval("qwen4.moe.routed_ffn", output);
+                    tyloi::metal::profile_eval("qwen4.moe.routed_ffn", output);
                     return output;
                 }
                 return tq_expert_cache_->apply(expert_cache_layer_, routes.ids, [&](const auto& weights, const array* reuse) {
                     auto intermediate = weights.gate.swiglu(weights.up, source, routes.ids, 0.f, false, reuse);
-                    detail::profile_eval("qwen4.moe.routed_gate_up", intermediate);
+                    tyloi::metal::profile_eval("qwen4.moe.routed_gate_up", intermediate);
                     return intermediate;
                 }, [&](const auto& weights, const array& intermediate, const array* reuse) {
                     auto output = routed_is_reduced
                         ? weights.down.routed_matmul_reduce(intermediate, routes.ids, routes.weights, reuse)
                         : weights.down.routed_matmul(intermediate, routes.ids, reuse);
-                    detail::profile_eval("qwen4.moe.routed_down", output);
+                    tyloi::metal::profile_eval("qwen4.moe.routed_down", output);
                     return output;
                 }, parallel_shared ? &*parallel_shared : nullptr);
             }
@@ -1262,7 +1262,7 @@ public:
                 auto intermediate = weights.gate_up.swiglu(
                     source, routes.ids, 0.0f);
                 if (tyloi::profiling::active()) {
-                    detail::profile_eval(
+                    tyloi::metal::profile_eval(
                         "qwen4.moe.routed_gate_up",
                         intermediate);
                 }
@@ -1274,7 +1274,7 @@ public:
                     : weights.down(intermediate, routes.ids);
                 routed_is_reduced = tokens <= 6;
                 if (tyloi::profiling::active()) {
-                    detail::profile_eval(
+                    tyloi::metal::profile_eval(
                         "qwen4.moe.routed_down", output);
                 }
                 return output;
@@ -1286,7 +1286,7 @@ public:
                     prepared.weights().gate_up.swiglu(
                         source, prepared.expert_ids(), 0.0f);
                 if (tyloi::profiling::active()) {
-                    detail::profile_eval(
+                    tyloi::metal::profile_eval(
                         "qwen4.moe.routed_gate_up",
                         intermediate);
                 }
@@ -1299,7 +1299,7 @@ public:
                           intermediate, prepared.expert_ids());
                 routed_is_reduced = tokens <= 6;
                 if (tyloi::profiling::active()) {
-                    detail::profile_eval(
+                    tyloi::metal::profile_eval(
                         "qwen4.moe.routed_down", output);
                 }
                 return output;
@@ -1398,7 +1398,7 @@ public:
                     return gate.routed_swiglu(source, local_ids, 0.0f, local_groups);
                 }();
                 if (tyloi::profiling::active()) {
-                    detail::profile_eval(
+                    tyloi::metal::profile_eval(
                         "qwen4.moe.routed_gate_up", intermediate);
                 }
                 if ((tokens <= 6 || batched_decode || sorted_routes) && !tyloi::profiling::active())
@@ -1412,7 +1412,7 @@ public:
                     auto output = down.routed_matmul_sorted(intermediate, local_ids,
                         *sorted_routes, true, false, 0.0f, &plan);
                     if (tyloi::profiling::active())
-                        detail::profile_eval("qwen4.moe.routed_down", output);
+                        tyloi::metal::profile_eval("qwen4.moe.routed_down", output);
                     return mlx::core::reshape(mlx::core::take(output,
                         moe_inverse_permutation(*sorted_routes), 0),
                         Shape{tokens, global_ids.shape(1), down.out_per_expert()});
@@ -1430,7 +1430,7 @@ public:
                     : down.routed_matmul(intermediate, local_ids, local_groups);
                 routed_is_reduced = combine_routes;
                 if (tyloi::profiling::active()) {
-                    detail::profile_eval(
+                    tyloi::metal::profile_eval(
                         "qwen4.moe.routed_down", output);
                 }
                 return output;
@@ -1479,7 +1479,7 @@ public:
                     0.0f,
                     &gate_plan);
                 if (tyloi::profiling::active()) {
-                    detail::profile_eval(
+                    tyloi::metal::profile_eval(
                         "qwen4.moe.routed_gate_up",
                         intermediate);
                 }
@@ -1492,7 +1492,7 @@ public:
                     0.0f,
                     down_plan.has_value() ? &*down_plan : &gate_plan);
                 if (tyloi::profiling::active()) {
-                    detail::profile_eval(
+                    tyloi::metal::profile_eval(
                         "qwen4.moe.routed_down",
                         sorted);
                 }
@@ -1503,14 +1503,14 @@ public:
             }
             if (auto output = gate_up_->gguf_prefill_ffn(*down_, source, routes.ids, routes.weights)) {
                 routed_is_reduced = true;
-                if (tyloi::profiling::active()) detail::profile_eval("qwen4.moe.routed_ffn", *output);
+                if (tyloi::profiling::active()) tyloi::metal::profile_eval("qwen4.moe.routed_ffn", *output);
                 return std::move(*output);
             }
             auto intermediate = gate_up_->routed_swiglu(
                 source,
                 routes.ids, route_groups);
             if (tyloi::profiling::active()) {
-                detail::profile_eval(
+                tyloi::metal::profile_eval(
                     "qwen4.moe.routed_gate_up",
                     intermediate);
             }
@@ -1527,7 +1527,7 @@ public:
                 : down_->routed_matmul(intermediate, routes.ids, route_groups);
             routed_is_reduced = combine_routes;
             if (tyloi::profiling::active()) {
-                detail::profile_eval("qwen4.moe.routed_down", output);
+                tyloi::metal::profile_eval("qwen4.moe.routed_down", output);
             }
             return output;
         }();
@@ -1543,10 +1543,10 @@ public:
         }
         auto shared = parallel_shared ? *parallel_shared : shared_(source);
         if (tyloi::profiling::active()) {
-            detail::profile_eval("qwen4.moe.shared", shared);
+            tyloi::metal::profile_eval("qwen4.moe.shared", shared);
         }
         if (tyloi::profiling::active()) {
-            detail::profile_eval("qwen4.moe.shared_gate", shared_gate);
+            tyloi::metal::profile_eval("qwen4.moe.shared_gate", shared_gate);
         }
         auto output = routed_is_reduced
             ? moe_add_shared_gate(
@@ -1566,7 +1566,7 @@ public:
                   shared,
                   shared_gate);
         if (tyloi::profiling::active()) {
-            detail::profile_eval("qwen4.moe.reduce", output);
+            tyloi::metal::profile_eval("qwen4.moe.reduce", output);
         }
         return mlx::core::reshape(output, value.shape());
     }
@@ -2630,7 +2630,7 @@ public:
         const std::vector<int>& positions, const std::vector<int>& offsets, int confirmed = 0) {
         const int batch = static_cast<int>(caches.size());
         auto projected = decode_input_projections(grouped);
-        detail::profile_eval("qwen4.batch.attention.inputs", projected);
+        tyloi::metal::profile_eval("qwen4.batch.attention.inputs", projected);
         std::vector<array> outputs;
         outputs.reserve(batch);
         for (int index = 0; index < batch; ++index) {
@@ -2650,9 +2650,9 @@ public:
             }
             exchange_cache(*caches[index]);
         }
-        detail::profile_eval("qwen4.batch.attention.core", outputs);
+        tyloi::metal::profile_eval("qwen4.batch.attention.core", outputs);
         auto output = decode_output_projection(mlx::core::concatenate(outputs, 1));
-        detail::profile_eval("qwen4.batch.attention.output", output);
+        tyloi::metal::profile_eval("qwen4.batch.attention.output", output);
         return output;
     }
     virtual void trim_cache_to(int) {
@@ -2694,7 +2694,7 @@ public:
         const int batch = hidden.shape(0);
         auto grouped = mlx::core::reshape(hidden, {1, batch * tokens, hidden.shape(2)});
         auto projected = project_inputs(grouped);
-        detail::profile_eval("qwen4.batch.attention.inputs", projected);
+        tyloi::metal::profile_eval("qwen4.batch.attention.inputs", projected);
         std::vector<MlxGatedDeltaDecodeInput> inputs;
         inputs.reserve(batch);
         for (int row = 0; row < batch; ++row) {
@@ -2724,9 +2724,9 @@ public:
             cache.position += tokens;
             outputs.push_back(std::move(decoded[row].output));
         }
-        detail::profile_eval("qwen4.batch.attention.core", outputs);
+        tyloi::metal::profile_eval("qwen4.batch.attention.core", outputs);
         auto output = output_(mlx::core::astype(mlx::core::concatenate(outputs, 1), hidden.dtype()));
-        detail::profile_eval("qwen4.batch.attention.output", output);
+        tyloi::metal::profile_eval("qwen4.batch.attention.output", output);
         return mlx::core::reshape(output, {batch, tokens, output.shape(2)});
     }
     std::vector<array> decode_input_projections(const array& hidden) override {
@@ -3130,8 +3130,8 @@ private:
     std::vector<array> decode_step(const std::vector<array>& inputs,
         const std::vector<array>* projected = nullptr, bool project_output = true) {
         auto projections = projected ? *projected : project_inputs(inputs[0]);
-        detail::profile_eval("qwen4.gdn.qkv", {projections[0], projections[1]});
-        detail::profile_eval("qwen4.gdn.gate", projections[2]);
+        tyloi::metal::profile_eval("qwen4.gdn.qkv", {projections[0], projections[1]});
+        tyloi::metal::profile_eval("qwen4.gdn.gate", projections[2]);
         const Shape gates{1, 1, static_cast<int>(config_.linear_num_value_heads)};
         auto decoded = gated_delta_decode_step(
             projections[0], projections[1], projections[2],
@@ -3143,11 +3143,11 @@ private:
             static_cast<int>(config_.linear_num_value_heads),
             static_cast<int>(config_.linear_value_head_dim),
             1e-6f, output_norm_.eps(), config_.output_gate_silu, config_.linear_tiled_heads, inputs[0].dtype());
-        detail::profile_eval("qwen4.gdn.decode_step",
+        tyloi::metal::profile_eval("qwen4.gdn.decode_step",
             {decoded.output, decoded.convolution_state, decoded.recurrent_state});
         auto normalized = mlx::core::astype(decoded.output, inputs[0].dtype());
         auto output = project_output ? output_(normalized) : std::move(normalized);
-        detail::profile_eval("qwen4.gdn.output", output);
+        tyloi::metal::profile_eval("qwen4.gdn.output", output);
         return {std::move(output), std::move(decoded.convolution_state),
             std::move(decoded.recurrent_state)};
     }
@@ -3160,9 +3160,9 @@ private:
         auto input_projections = projected ? *projected : project_inputs(hidden);
         auto qk = std::move(input_projections[0]);
         auto value = std::move(input_projections[1]);
-        detail::profile_eval("qwen4.gdn.qkv", {qk, value});
+        tyloi::metal::profile_eval("qwen4.gdn.qkv", {qk, value});
         auto z = std::move(input_projections[2]);
-        detail::profile_eval("qwen4.gdn.gate", z);
+        tyloi::metal::profile_eval("qwen4.gdn.gate", z);
         const Shape gate_shape{
             batch, tokens, static_cast<int>(config_.linear_num_value_heads)};
         auto alpha = mlx::core::reshape(input_projections[3], gate_shape);
@@ -3174,7 +3174,7 @@ private:
             decay_scale_);
         auto recurrent_gate = std::move(gates.gate);
         auto recurrent_beta = std::move(gates.beta);
-        detail::profile_eval(
+        tyloi::metal::profile_eval(
             "qwen4.gdn.gates", {recurrent_gate, recurrent_beta});
         auto convolved = linear_conv_qkv(
             inputs[1],
@@ -3187,7 +3187,7 @@ private:
             static_cast<int>(config_.linear_value_head_dim),
             std::nullopt,
             1e-6f);
-        detail::profile_eval(
+        tyloi::metal::profile_eval(
             "qwen4.gdn.conv",
             {
                 convolved.query,
@@ -3203,7 +3203,7 @@ private:
             recurrent_beta,
             inputs[2],
             true, config_.linear_tiled_heads);
-        detail::profile_eval(
+        tyloi::metal::profile_eval(
             "qwen4.gdn.recurrent",
             {recurrent.output, recurrent.state});
         auto normalized = [&]() {
@@ -3234,9 +3234,9 @@ private:
                 Shape{batch, tokens, value_width()});
             return mlx::core::astype(value, hidden.dtype());
         }();
-        detail::profile_eval("qwen4.gdn.output_gate", normalized);
+        tyloi::metal::profile_eval("qwen4.gdn.output_gate", normalized);
         auto output = project_output ? output_(normalized) : std::move(normalized);
-        detail::profile_eval("qwen4.gdn.output", output);
+        tyloi::metal::profile_eval("qwen4.gdn.output", output);
         return {std::move(output), std::move(convolved.state), std::move(recurrent.state),
             std::move(qk), std::move(value), std::move(recurrent_gate), std::move(recurrent_beta)};
     }
@@ -4272,10 +4272,10 @@ public:
             uniform = uniform && offsets[row + 1] - offsets[row] == offsets[1];
         if (ple_) {
             streams = streams + ple_->forward_requests(streams, ids, offsets, caches, confirmed, prefetched_ple);
-            detail::profile_eval("qwen4.ple", streams);
+            tyloi::metal::profile_eval("qwen4.ple", streams);
         }
         auto av = attention_gr_.pre(streams);
-        detail::profile_eval("qwen4.attention_mhc_pre", av.branch);
+        tyloi::metal::profile_eval("qwen4.attention_mhc_pre", av.branch);
         auto attention = [&] {
             if (!decode || !uniform)
                 return attention_->forward_packed_requests(av.branch, caches, positions, offsets, confirmed);
@@ -4285,9 +4285,9 @@ public:
             return mlx::core::reshape(result, {1, batch * tokens, result.shape(2)});
         }();
         auto fv = ffn_gr_.pre_after(attention, av);
-        detail::profile_eval("qwen4.attention_post_ffn_pre", fv.branch);
+        tyloi::metal::profile_eval("qwen4.attention_post_ffn_pre", fv.branch);
         auto result = ffn_gr_.post(moe_(fv.branch, prefetched_routed, decode), fv);
-        detail::profile_eval("qwen4.ffn_mhc_post", result);
+        tyloi::metal::profile_eval("qwen4.ffn_mhc_post", result);
         return result;
     }
     void prepare_training(MlxMtpLora& lora) const {
@@ -4471,12 +4471,12 @@ public:
                     use_cache,
                     speculative_confirmed,
                     prefetched_ple);
-            detail::profile_eval("qwen4.ple", hidden_streams);
+            tyloi::metal::profile_eval("qwen4.ple", hidden_streams);
         }
         auto attention_values = residual_state && *residual_state && !ple_
             ? attention_gr_.pre_after((*residual_state)->branch, (*residual_state)->values)
             : attention_gr_.pre(hidden_streams);
-        detail::profile_eval(
+        tyloi::metal::profile_eval(
             "qwen4.attention_mhc_pre",
             attention_values.branch);
         auto branch = attention_->forward(
@@ -4485,14 +4485,14 @@ public:
             positions_full,
             use_cache,
             speculative_confirmed);
-        detail::profile_eval(attention_->profile_name(), branch);
+        tyloi::metal::profile_eval(attention_->profile_name(), branch);
         auto ffn_values = ffn_gr_.pre_after(branch, attention_values);
-        detail::profile_eval(
+        tyloi::metal::profile_eval(
             "qwen4.attention_mhc_post",
             ffn_values.residual);
-        detail::profile_eval("qwen4.ffn_mhc_pre", ffn_values.branch);
+        tyloi::metal::profile_eval("qwen4.ffn_mhc_pre", ffn_values.branch);
         branch = moe_(ffn_values.branch, prefetched, false, deferred_route);
-        detail::profile_eval("qwen4.moe", branch);
+        tyloi::metal::profile_eval("qwen4.moe", branch);
         auto output = ffn_gr_.post(branch, ffn_values);
         if (residual_state) residual_state->emplace(DeferredResidual{branch, ffn_values});
         if (lora) {
@@ -4511,7 +4511,7 @@ public:
                 });
             } else lora->capture({}, {});
         }
-        detail::profile_eval("qwen4.ffn_mhc_post", output);
+        tyloi::metal::profile_eval("qwen4.ffn_mhc_post", output);
         return output;
     }
 
@@ -5509,7 +5509,7 @@ struct MlxQwen4CausalLm::Impl {
                 defer_residual ? &residual_state : nullptr);
             if (!auxiliary_layers.empty()) append_hidden_capture(index, streams, captured);
             if (prefetched != nullptr) {
-                detail::eval_with_timing(streams);
+                tyloi::metal::eval_with_timing(streams);
                 residual_state.reset();
                 routed_pipeline[index % 2].reset();
                 if (index + 2 < layers.size()) {
@@ -5525,7 +5525,7 @@ struct MlxQwen4CausalLm::Impl {
         }
         if (!captured.empty()) auxiliary_hidden = mlx::core::concatenate(captured, -1);
         auto output_hidden = mixer.mix(streams);
-        detail::profile_eval("qwen4.final_mhc", output_hidden);
+        tyloi::metal::profile_eval("qwen4.final_mhc", output_hidden);
         if (last_token_only && tokens > 1) {
             output_hidden = mlx::core::slice(
                 output_hidden,
@@ -5787,7 +5787,7 @@ std::vector<array> MlxQwen4CausalLm::prefill_requests(
             layer_caches, positions, offsets, false, 0, prefetched, &ple_pipeline[index]);
         if (!impl_->auxiliary_layers.empty()) impl_->append_hidden_capture(index, streams, captured);
         if (prefetched) {
-            detail::eval_with_timing(streams);
+            tyloi::metal::eval_with_timing(streams);
             routed[index % 2].reset();
             if (index + 2 < impl_->layers.size())
                 routed[index % 2] = impl_->layers[index + 2].prefetch_routed(packed.size());
@@ -6116,9 +6116,9 @@ std::pair<array, array> MlxQwen4CausalLm::forward_packed_requests(
     }
     if (!captured.empty()) impl_->auxiliary_hidden = mlx::core::concatenate(captured, -1);
     auto output_hidden = impl_->mixer.mix(streams);
-    detail::profile_eval("qwen4.final_mhc", output_hidden);
+    tyloi::metal::profile_eval("qwen4.final_mhc", output_hidden);
     auto logits = project_logits(impl_->output, impl_->embedding, output_hidden);
-    detail::profile_eval("qwen4.output", logits);
+    tyloi::metal::profile_eval("qwen4.output", logits);
     for (std::size_t row = 0; row < caches.size(); ++row) {
         const auto& cache = caches[row];
         const int count = offsets[row + 1] - offsets[row];
@@ -6461,7 +6461,7 @@ std::int32_t MlxQwen4CausalLm::generate_prepared_impl(
     }
     double prefill_ms = 0.0;
     std::optional<array> prefill_hidden;
-    const bool profile_prefill = detail::component_profile_requested();
+    const bool profile_prefill = tyloi::metal::component_profile_requested();
     tyloi::profiling::Components component_profile;
     const auto profile_started = std::chrono::steady_clock::now();
     auto logits = [&] {
@@ -6508,9 +6508,9 @@ std::int32_t MlxQwen4CausalLm::generate_prepared_impl(
         auto value = mlx_last_token_logits(
             *last_logits, vocab);
         if (profile_prefill) {
-            detail::profile_eval("qwen4.output", value);
+            tyloi::metal::profile_eval("qwen4.output", value);
         } else if (prefill_callback) {
-            detail::eval_with_timing(value);
+            tyloi::metal::eval_with_timing(value);
         }
         return value;
     }();
@@ -6833,10 +6833,10 @@ std::int32_t MlxQwen4CausalLm::generate_prepared_impl(
         if (callback && !callback(token)) break;
         if (generated == limit) break;
         const int decode_step = generated - 1;
-        const int profile_skip = detail::component_profile_skip_steps();
-        const bool profile_step = detail::component_profile_requested()
+        const int profile_skip = tyloi::metal::component_profile_skip_steps();
+        const bool profile_step = tyloi::metal::component_profile_requested()
             && decode_step >= profile_skip
-            && decode_step - profile_skip < detail::component_profile_steps();
+            && decode_step - profile_skip < tyloi::metal::component_profile_steps();
         tyloi::profiling::Components decode_profile;
         tyloi::profiling::ProfileScope decode_profile_scope(
             profile_step ? &decode_profile : nullptr);
@@ -6850,7 +6850,7 @@ std::int32_t MlxQwen4CausalLm::generate_prepared_impl(
             logits = mlx_last_token_logits(forward(token_ids, true), vocab);
         }
         if (profile_step) {
-            detail::profile_eval("qwen4.output", logits);
+            tyloi::metal::profile_eval("qwen4.output", logits);
             const double wall_ms = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - decode_started).count();
             const double evaluated_ms = decode_profile.evaluated_ms();

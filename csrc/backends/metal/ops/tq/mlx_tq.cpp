@@ -5,7 +5,7 @@
 #include "mlx_weight_residency.h"
 #include "mlx_moe_ops.h"
 #include "mlx_platform.h"
-#include "mlx_eval_timing.h"
+#include "engine/backends/metal/native/profile.h"
 #include "mlx_tq_rows.h"
 #include "tyloinfer/tq_rows.h"
 

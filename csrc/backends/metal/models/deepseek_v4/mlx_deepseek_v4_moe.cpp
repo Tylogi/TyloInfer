@@ -1,6 +1,6 @@
 #include "mlx_deepseek_v4_moe.h"
 
-#include "mlx_eval_timing.h"
+#include "engine/backends/metal/native/profile.h"
 #include "mlx_platform.h"
 #include "mlx_moe_ops.h"
 
@@ -135,7 +135,7 @@ int count_available(const array& value) {
         mlx::core::astype(
             value,
             mlx::core::uint8));
-    detail::eval_with_timing(bytes);
+    tyloi::metal::eval_with_timing(bytes);
     return static_cast<int>(
         std::count(
             bytes.data<std::uint8_t>(),
@@ -1323,10 +1323,10 @@ MlxDeepseekV4Moe::forward_branches(
         // The SSD workers are already reading the routed bank. Submit the
         // independent shared/router projections while those reads are in
         // flight, then wait only for the residual storage latency below.
-        detail::eval_with_timing(projections);
+        tyloi::metal::eval_with_timing(projections);
     }
     if (tyloi::profiling::active()) {
-        detail::profile_eval(
+        tyloi::metal::profile_eval(
             "moe.shared_router_projections",
             projections);
     }
@@ -1530,7 +1530,7 @@ MlxDeepseekV4Moe::forward_branches(
         packed_expert_ids = true;
     }
     if (tyloi::profiling::active()) {
-        detail::profile_eval(
+        tyloi::metal::profile_eval(
             "moe.routing",
             std::vector<array>{
                 expert_ids,
@@ -1552,13 +1552,13 @@ MlxDeepseekV4Moe::forward_branches(
             auto result = moe_limited_swiglu_split(
                 shared_gate_up,
                 static_cast<float>(config_.swiglu_limit));
-            detail::profile_eval(
+            tyloi::metal::profile_eval(
                 "moe.shared_swiglu",
                 result);
             return result;
         }();
         auto result = shared_down_(shared_hidden);
-        detail::profile_eval(
+        tyloi::metal::profile_eval(
             "moe.shared_down",
             result);
         return result;
@@ -1637,7 +1637,7 @@ MlxDeepseekV4Moe::forward_branches(
                 static_cast<float>(config_.swiglu_limit),
                 true);
             if (tyloi::profiling::active()) {
-                detail::profile_eval(
+                tyloi::metal::profile_eval(
                     "moe.routed_gate_up_swiglu",
                     routed_hidden);
             }
@@ -1649,7 +1649,7 @@ MlxDeepseekV4Moe::forward_branches(
                 nullptr,
                 true);
             if (tyloi::profiling::active()) {
-                detail::profile_eval(
+                tyloi::metal::profile_eval(
                     "moe.routed_down",
                     down_sorted);
             }
@@ -1658,7 +1658,7 @@ MlxDeepseekV4Moe::forward_branches(
                 moe_inverse_permutation(route_order),
                 route_weights);
             if (tyloi::profiling::active()) {
-                detail::profile_eval(
+                tyloi::metal::profile_eval(
                     "moe.route_reduce",
                     output);
             }
@@ -1752,7 +1752,7 @@ MlxDeepseekV4Moe::forward_branches(
                         config_.swiglu_limit));
             }();
             if (tyloi::profiling::active()) {
-                detail::profile_eval(
+                tyloi::metal::profile_eval(
                     "moe.routed_gate_up_swiglu",
                     routed_hidden);
             }
@@ -1767,7 +1767,7 @@ MlxDeepseekV4Moe::forward_branches(
                       true,
                       down_plan.has_value() ? &*down_plan : &gate_plan);
             if (tyloi::profiling::active()) {
-                detail::profile_eval(
+                tyloi::metal::profile_eval(
                     "moe.routed_down",
                     down_sorted);
             }
@@ -1776,7 +1776,7 @@ MlxDeepseekV4Moe::forward_branches(
                 moe_inverse_permutation(route_order),
                 route_weights);
             if (tyloi::profiling::active()) {
-                detail::profile_eval(
+                tyloi::metal::profile_eval(
                     "moe.route_reduce",
                     output);
             }
@@ -1839,7 +1839,7 @@ MlxDeepseekV4Moe::forward_branches(
                                       config_.swiglu_limit));
                 }();
             if (tyloi::profiling::active()) {
-                detail::profile_eval(
+                tyloi::metal::profile_eval(
                     "moe.routed_gate_up_swiglu",
                     routed_hidden);
                 auto routed_pairs = expert_map != nullptr
@@ -1852,13 +1852,13 @@ MlxDeepseekV4Moe::forward_branches(
                               routed_hidden,
                               route_ids)
                         : down->forward(routed_hidden, route_ids);
-                detail::profile_eval(
+                tyloi::metal::profile_eval(
                     "moe.routed_down",
                     routed_pairs);
                 auto output = moe_weighted_reduce(
                     routed_pairs,
                     route_weights);
-                detail::profile_eval(
+                tyloi::metal::profile_eval(
                     "moe.route_reduce",
                     output);
                 return output;
@@ -1897,7 +1897,7 @@ MlxDeepseekV4Moe::forward_branches(
                 nullptr,
                 nullptr,
                 &weights.down);
-            detail::eval_with_timing(routed);
+            tyloi::metal::eval_with_timing(routed);
         } else {
             bool device_route_hit = false;
             std::optional<array> evaluated_host_ids;
@@ -1926,7 +1926,7 @@ MlxDeepseekV4Moe::forward_branches(
                     mlx::core::astype(expert_ids, mlx::core::int32));
                 const auto eval_begin =
                     std::chrono::steady_clock::now();
-                detail::eval_with_timing(
+                tyloi::metal::eval_with_timing(
                     std::vector<array>{
                         host_ids,
                         expert_weights,
@@ -2004,7 +2004,7 @@ MlxDeepseekV4Moe::forward_branches(
                     std::chrono::steady_clock::now();
                 const double route_sync_cpu_begin =
                     current_thread_cpu_seconds();
-                detail::eval_with_timing(host_ids);
+                tyloi::metal::eval_with_timing(host_ids);
                 const double route_sync_cpu_seconds =
                     current_thread_cpu_seconds() - route_sync_cpu_begin;
                 const double route_sync_seconds =
@@ -2114,7 +2114,7 @@ MlxDeepseekV4Moe::forward_branches(
                             overlap_values.push_back(*ready_down);
                         }
                     }
-                    detail::eval_with_timing(
+                    tyloi::metal::eval_with_timing(
                         std::move(overlap_values));
                 },
                 [
@@ -2150,7 +2150,7 @@ MlxDeepseekV4Moe::forward_branches(
                             source,
                             *pending_slot_ids,
                             static_cast<float>(config_.swiglu_limit)));
-                    detail::eval_with_timing(*pending_gate_up);
+                    tyloi::metal::eval_with_timing(*pending_gate_up);
                 });
             const auto& weights = prepared.weights();
             const auto slot_for_expert = prepared.slot_for_expert();
@@ -2234,7 +2234,7 @@ MlxDeepseekV4Moe::forward_branches(
                 mlx::core::astype(
                     expert_ids,
                     mlx::core::int32));
-        detail::eval_with_timing(host_ids);
+        tyloi::metal::eval_with_timing(host_ids);
         const auto* id_values =
             host_ids.data<std::int32_t>();
         const int routes =
@@ -2361,7 +2361,7 @@ MlxDeepseekV4Moe::forward_branches(
             // prefill, finish each weighted chunk before advancing so the
             // graph never retains packed inputs for every prior chunk.
             if (rows > kStreamRows) {
-                detail::eval_with_timing(chunk_output);
+                tyloi::metal::eval_with_timing(chunk_output);
             }
             chunks.push_back(
                 std::move(chunk_output));
@@ -2400,7 +2400,7 @@ MlxDeepseekV4Moe::forward_with_routing(
         input,
         token_ids);
     auto output = branches.routed + branches.shared;
-    detail::profile_eval(
+    tyloi::metal::profile_eval(
         "moe.output_add",
         output);
     return {

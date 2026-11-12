@@ -2,7 +2,7 @@
 
 #include "mlx_detached_copy.h"
 #include "mlx_gguf.h"
-#include "mlx_eval_timing.h"
+#include "engine/backends/metal/native/profile.h"
 #include "mlx_kernel_prepare.h"
 
 #include <cmath>
@@ -682,19 +682,19 @@ array MlxQwen35LinearAttentionBlock::forward(
         recurrent_state_ = std::move(decoded.recurrent_state);
         cache_position_ += tokens;
         report_cache_resources();
-        detail::profile_eval("qwen35.linear_attention.fused_decode", decoded.output);
+        tyloi::metal::profile_eval("qwen35.linear_attention.fused_decode", decoded.output);
         auto projected = output_(decoded.output);
         if (projected.dtype() != activation_dtype)
             projected = mlx::core::astype(projected, activation_dtype);
         auto residual = input + projected;
-        detail::profile_eval("qwen35.linear_attention.output", residual);
+        tyloi::metal::profile_eval("qwen35.linear_attention.output", residual);
         residual = residual + ffn_.forward_normalized(residual, ffn_norm_);
-        detail::profile_eval("qwen35.ffn", residual);
+        tyloi::metal::profile_eval("qwen35.ffn", residual);
         return residual;
     }
     const auto beta = mlx::core::sigmoid(beta_logits);
     if (tyloi::profiling::active()) {
-        detail::profile_eval(
+        tyloi::metal::profile_eval(
             "qwen35.linear_attention.projections",
             {qk, value_input, z, alpha, beta});
     }
@@ -749,7 +749,7 @@ array MlxQwen35LinearAttentionBlock::forward(
         convolution_bias_,
         static_cast<float>(config_.rms_norm_eps));
     if (tyloi::profiling::active()) {
-        detail::profile_eval(
+        tyloi::metal::profile_eval(
             "qwen35.linear_attention.conv",
             {convolved.query, convolved.key, convolved.value,
              convolved.state});
@@ -764,7 +764,7 @@ array MlxQwen35LinearAttentionBlock::forward(
         false,
         gguf_layout_);
     if (tyloi::profiling::active()) {
-        detail::profile_eval(
+        tyloi::metal::profile_eval(
             "qwen35.linear_attention.recurrent",
             {recurrent.output, recurrent.state});
     }
@@ -792,9 +792,9 @@ array MlxQwen35LinearAttentionBlock::forward(
         mlx::core::astype(
             gated_value,
             activation_dtype));
-    detail::profile_eval("qwen35.linear_attention.output", residual);
+    tyloi::metal::profile_eval("qwen35.linear_attention.output", residual);
     residual = residual + ffn_.forward_normalized(residual, ffn_norm_);
-    detail::profile_eval("qwen35.ffn", residual);
+    tyloi::metal::profile_eval("qwen35.ffn", residual);
     return residual;
 }
 

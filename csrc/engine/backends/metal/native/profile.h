@@ -8,10 +8,10 @@
 
 #include <mlx/mlx.h>
 
-#include "engine/backends/metal/ops/stream.h"
+#include "stream.h"
 #include "engine/executor.h"
 
-namespace mfq::metal::detail {
+namespace tyloi::metal {
 
 inline bool component_profile_requested() noexcept {
     static const bool requested = [] {
@@ -46,14 +46,14 @@ inline int component_profile_skip_steps() noexcept {
 }
 
 inline void eval_with_timing(mlx::core::array& value) {
-    tyloi::profiling::measure([&value]() { tyloi::metal::ops::eval(value); });
+    tyloi::profiling::measure([&value]() { tyloi::metal::eval(value); });
 }
 
 inline void eval_with_timing(
     std::vector<mlx::core::array> values) {
     tyloi::profiling::measure(
         [values = std::move(values)]() mutable {
-            tyloi::metal::ops::eval(std::move(values));
+            tyloi::metal::eval(std::move(values));
         });
 }
 
@@ -62,7 +62,7 @@ inline void profile_eval(
     mlx::core::array& value) {
     tyloi::profiling::component(
         component,
-        [&value]() { tyloi::metal::ops::eval(value); });
+        [&value]() { tyloi::metal::eval(value); });
 }
 
 inline void profile_eval(
@@ -71,8 +71,8 @@ inline void profile_eval(
     tyloi::profiling::component(
         component,
         [values = std::move(values)]() mutable {
-            tyloi::metal::ops::eval(std::move(values));
+            tyloi::metal::eval(std::move(values));
         });
 }
 
-}  // namespace mfq::metal::detail
+}  // namespace tyloi::metal

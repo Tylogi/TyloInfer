@@ -17,7 +17,7 @@
 #include "mlx_nint8_zero.h"
 #include "mlx_mx.h"
 #include "mlx_fp8_sq.h"
-#include "mlx_eval_timing.h"
+#include "engine/backends/metal/native/profile.h"
 #include "mlx_mxfp4_sq.h"
 #include "mlx_platform.h"
 #include "mlx_reference.h"

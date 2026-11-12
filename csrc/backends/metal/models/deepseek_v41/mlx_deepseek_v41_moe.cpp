@@ -1,6 +1,6 @@
 #include "mlx_deepseek_v41_moe.h"
 
-#include "mlx_eval_timing.h"
+#include "engine/backends/metal/native/profile.h"
 #include "mlx_kernel_prepare.h"
 #include "mlx_moe_ops.h"
 #include "mlx_gguf_prefill.h"
@@ -577,7 +577,7 @@ MlxDeepseekV41MoeResult MlxDeepseekV41Moe::forward(
             routed_hidden,
             routes.ids,
             routes.weights);
-        detail::eval_with_timing(routed);
+        tyloi::metal::eval_with_timing(routed);
     } else if (route_transaction) {
         auto snapshot = ssd_expert_cache_->snapshot_page_table(
             expert_cache_layer_);
@@ -618,7 +618,7 @@ MlxDeepseekV41MoeResult MlxDeepseekV41Moe::forward(
         }
         auto global_ids = mlx::core::contiguous(
             mlx::core::astype(routes.ids, mlx::core::int32));
-        detail::eval_with_timing(global_ids);
+        tyloi::metal::eval_with_timing(global_ids);
         if (rows <= 6) mlx::core::async_eval({shared});
         const auto* ids = global_ids.data<std::int32_t>();
         std::vector<std::int32_t> active;
