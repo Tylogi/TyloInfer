@@ -6,6 +6,7 @@
 #include <chrono>
 #include <initializer_list>
 #include <map>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -22,6 +23,9 @@ public:
         std::size_t allocated, reserved, available, total;
         // Process limit (0 means unlimited), charged residency, allocatable bytes and reusable workspace.
         std::size_t limit = 0, resident = 0, allocatable = 0, workspace = 0;
+        // Shared CPU/accelerator RAM reports the same canonical device for both views.
+        std::optional<Device> pool = {};
+        std::size_t wired = 0;
     };
 
     class Scope {

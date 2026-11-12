@@ -2,6 +2,7 @@
 #include "mlx_tq.h"
 #include "engine/backends/metal/native/tensor/tensor.h"
 #include "engine/backends/metal/ops/tensor.h"
+#include "engine/weights/memory.h"
 #include "mfq_container.h"
 #include "mfq_tq_embedded.h"
 #include "engine/backends/metal/native/resident_allocations.h"
@@ -1352,7 +1353,11 @@ MlxTqWeight::MlxTqWeight(array words, array descriptors, array scales,
     int columns, std::size_t bytes, bool pooled)
     : words_(tyloi::metal::tensor(std::move(words))), descriptors_(tyloi::metal::tensor(std::move(descriptors))), scales_(tyloi::metal::tensor(std::move(scales))),
       rows_(rows), width_(width), input_columns_(input_columns), experts_(experts),
-      group_size_(group_size), columns_(columns), pooled_(pooled), nbytes_(bytes) {}
+      group_size_(group_size), columns_(columns), pooled_(pooled), nbytes_(bytes) {
+    tyloi::weights::observe_weight(words_);
+    tyloi::weights::observe_weight(descriptors_);
+    tyloi::weights::observe_weight(scales_);
+}
 
 MlxTqWeight MlxTqWeight::from_blob(std::span<const std::uint8_t> blob,
     int input_columns, int experts) {

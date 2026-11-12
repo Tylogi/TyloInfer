@@ -1,7 +1,7 @@
 #include "mlx_nint.h"
 #include "mlx_nint_metadata.h"
 #include "engine/backends/metal/native/kernel.h"
-#include "mlx_memory_residency.h"
+#include "engine/backends/metal/native/memory.h"
 #include "mlx_resident_budget.h"
 #include "engine/backends/metal/native/resident_allocations.h"
 
@@ -79,7 +79,7 @@ bool dense_nint_prefers_dequantize(
     }
     if (rows < crossover) return false;
     auto limit = mlx::core::get_memory_limit();
-    if (const auto wired = MlxMemoryResidency::configured_limit(); wired != 0)
+    if (const auto wired = tyloi::metal::wired_limit(); wired != 0)
         limit = std::min(limit, wired);
     const auto active = mlx::core::get_active_memory();
     auto available = limit > active ? limit - active : 0;

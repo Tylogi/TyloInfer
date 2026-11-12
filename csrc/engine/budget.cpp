@@ -14,9 +14,12 @@
 #include <utility>
 
 namespace tyloi::engine {
-static void require_cuda_device(Device device) {
-    if (!device.is_cuda() || device.index < 0)
-        throw std::invalid_argument("budget requires a CUDA device");
+static void require_device(Device device) {
+    if (device.is_cuda()) {
+        if (device.index < 0) throw std::invalid_argument("budget requires a CUDA device");
+    } else if (!device.is_metal() || device.index != 0) {
+        throw std::invalid_argument("budget requires a supported device");
+    }
 }
 
 Budget::Budget(::tyloi::Executor& executor,
@@ -24,8 +27,10 @@ Budget::Budget(::tyloi::Executor& executor,
         state::Sessions& cache, Device primary)
     : executor_(executor), weight_memory_(weight_memory), weights_(weights), cache_(cache),
       primary_(primary), initial_expert_budget_(weights.budget()) {
-    require_cuda_device(primary);
-    allocation_ceiling_ = memory(primary_).limit;
+    require_device(primary);
+    const auto resources = memory(primary_);
+    allocation_ceiling_ = resources.limit;
+    shared_memory_ = resources.pool.has_value();
 }
 
 Budget::~Budget() { unbind(); }
@@ -54,7 +59,7 @@ void Budget::reclaim(std::size_t bytes) {
 }
 
 void Budget::reclaim_kv(Device device, std::size_t bytes) {
-    require_cuda_device(device);
+    require_device(device);
     if (memory(device).allocatable >= bytes) return;
     if (device == primary_) {
         weights_.release_workspace(bytes, "kv_growth");
@@ -68,15 +73,40 @@ void Budget::reserve_kv(Device device, std::size_t bytes) {
     reclaim_kv(device, bytes);
     if (memory(device).allocatable < bytes)
         throw engine::InferenceInputError(engine::InferenceInputErrorCode::ContextLength,
-            "insufficient VRAM for context growth; reduce concurrent requests or prompt length");
+            device.is_cuda()
+                ? "insufficient VRAM for context growth; reduce concurrent requests or prompt length"
+                : "insufficient RAM for context growth; reduce concurrent requests or prompt length");
 }
 
 void Budget::reserve_ram(std::size_t bytes) {
     cache_.reserve_ram(bytes);
     weights_.reserve(bytes);
+    if (bytes && shared_memory_)
+        reserve_kv(primary_, bytes);
 }
 
 void Budget::reserve(std::span<const std::pair<Device, std::size_t>> growth) {
+    if (shared_memory_) {
+        std::size_t cpu = 0, accelerator = 0;
+        for (const auto& [device, bytes] : growth) {
+            if (!bytes) continue;
+            if (device.is_cpu() && device.index == 0) cpu = prefill_budget_add(cpu, bytes);
+            else {
+                require_device(device);
+                if (device != primary_) throw std::invalid_argument("budget requires a supported device");
+                accelerator = prefill_budget_add(accelerator, bytes);
+            }
+        }
+        if (!cpu && !accelerator) return;
+        auto total = prefill_budget_add(cpu, accelerator);
+        if (accelerator) total = prefill_budget_add(total, std::size_t(64) << 20);
+        if (cpu) {
+            cache_.reserve_ram(cpu);
+            weights_.reserve(cpu);
+        }
+        reserve_kv(primary_, total);
+        return;
+    }
     for (const auto& [device, bytes] : growth) {
         if (!bytes) continue;
         if (device.is_cpu()) reserve_ram(bytes);
@@ -94,7 +124,7 @@ std::size_t Budget::trim_prefix(std::size_t bytes, Device device) {
 }
 
 void Budget::workspace(Device device, std::size_t bytes) {
-    require_cuda_device(device);
+    require_device(device);
     weights_.workspace(bytes);
     if(memory(device).allocatable>=bytes)return;
     const auto released=trim_prefix(bytes, device);
@@ -105,7 +135,7 @@ void Budget::workspace(Device device, std::size_t bytes) {
 
 PrefillChunk Budget::batch(Device device, std::size_t row_bytes, PrefillChunk chunk,
         std::size_t growth) {
-    require_cuda_device(device);
+    require_device(device);
     const auto resources=memory(device);
     const auto transfer=weights_.prefill_budget(false).transfer_bytes;
     const auto fixed=engine::prefill_budget_add((std::size_t(1)<<30)+growth,transfer);
@@ -113,20 +143,22 @@ PrefillChunk Budget::batch(Device device, std::size_t row_bytes, PrefillChunk ch
     const auto selected=engine::select_prefill_chunk(chunk.count,chunk.count,available,fixed,row_bytes);
     if(!selected)throw engine::InferenceInputError(
         engine::InferenceInputErrorCode::ContextLength,
-        "insufficient CUDA workspace for batched prefill; reduce concurrent requests");
+        device.is_cuda()
+            ? "insufficient CUDA workspace for batched prefill; reduce concurrent requests"
+            : "insufficient device workspace for batched prefill; reduce concurrent requests");
     chunk.count=selected;
     return chunk;
 }
 
 void Budget::request(Device device, bool retire_decode) {
-    require_cuda_device(device);
+    require_device(device);
     weights_.request(retire_decode);
     executor_.reclaim(device);
 }
 
 void Budget::prepare_prefill(Device device, std::size_t tokens, std::int64_t limit,
         ::tyloi::weights::Cache::Prefill mode, bool retire_decode) {
-    require_cuda_device(device);
+    require_device(device);
     if (auto bytes = weights_.prepare_prefill(device, tokens, limit, mode, retire_decode))
         workspace(device, *bytes);
 }
@@ -139,7 +171,7 @@ std::int64_t Budget::prefill(std::size_t tokens, std::int64_t limit,
 
 std::int64_t Budget::chunk(Device device, std::size_t tokens, std::int64_t limit,
         std::size_t row_bytes, bool resumed, bool automatic, bool allow_borrow) {
-    require_cuda_device(device);
+    require_device(device);
     if (weights_.prefill_mode(tokens, resumed) == ::tyloi::weights::Cache::Prefill::retained)
         return std::min<int64_t>(4, limit);
     if (tokens <= 128) return std::min<int64_t>(std::max<std::size_t>(1, tokens), limit);
@@ -160,7 +192,9 @@ std::int64_t Budget::chunk(Device device, std::size_t tokens, std::int64_t limit
     }
     const auto chunk_size = engine::select_prefill_chunk(tokens, limit, available, fixed, row_bytes);
     if (!chunk_size) throw engine::InferenceInputError(engine::InferenceInputErrorCode::ContextLength,
-        "insufficient CUDA workspace for prefill computation and expert transfer buffers");
+        device.is_cuda()
+            ? "insufficient CUDA workspace for prefill computation and expert transfer buffers"
+            : "insufficient device workspace for prefill computation and expert transfer buffers");
     std::cerr << "runtime_prefill_plan mode=" << (automatic ? "auto" : "limited")
               << " tokens=" << tokens << " limit=" << limit << " compute_chunk=" << chunk_size
               << " available_bytes=" << available << " lendable_bytes=" << budget.lendable_bytes
@@ -169,7 +203,7 @@ std::int64_t Budget::chunk(Device device, std::size_t tokens, std::int64_t limit
 }
 
 bool Budget::snapshot(Device device, std::size_t bytes, std::size_t peak) {
-    require_cuda_device(device);
+    require_device(device);
     std::size_t hot = 0, limit = 0;
     for (const auto& metric : cache_.metrics()) {
         if (metric.first == "prefix_cache_hot_bytes") hot = std::size_t(metric.second);

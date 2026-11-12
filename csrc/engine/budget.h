@@ -74,6 +74,7 @@ private:
     ::tyloi::weights::Cache& weights_;
     state::Sessions& cache_;
     Device primary_;
+    bool shared_memory_ = false;
     std::size_t resident_budget_ = 0;
     std::size_t weight_budget_ = 0;
     std::size_t initial_expert_budget_ = 0;

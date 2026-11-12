@@ -1,6 +1,8 @@
 #include "memory.h"
+#include "resident_allocations.h"
 
 #include <algorithm>
+#include <atomic>
 #include <mach/mach.h>
 #include <sys/sysctl.h>
 
@@ -9,6 +11,8 @@
 
 namespace tyloi::metal {
 namespace {
+
+std::atomic<std::size_t> configured_wired_limit{0};
 
 template <typename Device>
 static bool available(Device& device) {
@@ -62,10 +66,20 @@ Memory memory() {
     if (pages > std::numeric_limits<std::size_t>::max() / page_size) {
         throw std::overflow_error("available physical memory exceeds size_t");
     }
+    task_vm_info_data_t task_info_data{};
+    mach_msg_type_number_t task_count = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO,
+            reinterpret_cast<task_info_t>(&task_info_data), &task_count) != KERN_SUCCESS ||
+        task_count < TASK_VM_INFO_REV1_COUNT) {
+        throw std::runtime_error("cannot determine process physical footprint");
+    }
+    if (task_info_data.phys_footprint > std::numeric_limits<std::size_t>::max()) {
+        throw std::overflow_error("process physical footprint exceeds size_t");
+    }
     return {active_memory(), cache_memory(), wired_memory(), memory_limit(),
         std::min(static_cast<std::size_t>(pages) * page_size,
                  static_cast<std::size_t>(total)),
-        static_cast<std::size_t>(total)};
+        static_cast<std::size_t>(total), static_cast<std::size_t>(task_info_data.phys_footprint)};
 }
 
 std::size_t memory_limit() { return mlx::core::get_memory_limit(); }
@@ -115,7 +129,32 @@ std::size_t wired_memory() {
     return allocated_bytes(mlx::core::metal::device(mlx::core::Device::gpu));
 }
 void set_cache_limit(std::size_t limit) { mlx::core::set_cache_limit(limit); }
-void set_wired_limit(std::size_t limit) { mlx::core::set_wired_limit(limit); }
+std::size_t wired_limit() { return configured_wired_limit.load(std::memory_order_relaxed); }
+void set_wired_limit(std::size_t limit) {
+    if (limit == 0 || !residency_available()) {
+        throw std::runtime_error("Metal memory wiring is unavailable");
+    }
+    mlx::core::set_wired_limit(limit);
+    configured_wired_limit.store(limit, std::memory_order_relaxed);
+    ResidentAllocations::begin_load();
+}
+void refresh_residency() {
+    const auto limit = wired_limit();
+    if (limit == 0) return;
+    const auto active = active_memory();
+    if (active > limit) {
+        throw std::runtime_error(
+            "Metal active memory exceeds the wired budget; "
+            "reduce resident experts or unload an idle model");
+    }
+    mlx::core::set_wired_limit(limit - 1);
+    mlx::core::set_wired_limit(limit);
+    if (wired_memory() < active) {
+        throw std::runtime_error(
+            "Metal residency does not cover the loaded allocations; "
+            "reduce resident experts or unload an idle model");
+    }
+}
 void clear_cache() { mlx::core::clear_cache(); }
 
 }  // namespace tyloi::metal

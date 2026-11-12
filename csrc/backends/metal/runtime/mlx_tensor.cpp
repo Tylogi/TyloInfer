@@ -6,6 +6,7 @@
 #include "engine/backends/metal/native/resident_allocations.h"
 #include "engine/backends/metal/native/tensor/tensor.h"
 #include "engine/backends/metal/ops/tensor.h"
+#include "engine/weights/memory.h"
 #include "mlx_gguf_staged.h"
 #include "../ops/gguf/native/mlx_native_gguf.h"
 
@@ -484,6 +485,7 @@ array load_dense_array(
 
     const auto tensor = tyloi::metal::copy_from_host(
         cursor.data(), shape, tyloi::metal::scalar_type(dtype));
+    tyloi::weights::observe_weight(tensor);
     auto result = tyloi::metal::array(tensor);
     tyloi::metal::ResidentAllocations::track(result);
     return result;
@@ -907,6 +909,7 @@ void MlxLinear::materialize_fp16() {
         dense && (!g_fp16_weight_scopes || tyloi::metal::array(*dense).dtype() == mlx::core::float16)) return;
     auto dense = materialize_weight_fp16(weight_, output_size_);
     weight_ = tyloi::metal::tensor(std::move(dense));
+    tyloi::weights::observe_weight(std::get<tyloi::Tensor>(weight_));
 }
 
 std::optional<MlxGroupedLinear> mlx_group_linears(
@@ -1357,6 +1360,7 @@ void MlxEmbedding::materialize_fp16() {
         dense && (!g_fp16_weight_scopes || tyloi::metal::array(*dense).dtype() == mlx::core::float16)) return;
     auto dense = materialize_weight_fp16(weight_, vocabulary_size_);
     weight_ = tyloi::metal::tensor(std::move(dense));
+    tyloi::weights::observe_weight(std::get<tyloi::Tensor>(weight_));
 }
 
 Dtype MlxEmbedding::preferred_activation_dtype() const noexcept {

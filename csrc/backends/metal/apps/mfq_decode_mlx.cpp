@@ -1,4 +1,5 @@
 #include "engine/backends/metal/executor/executor.h"
+#include "engine/weights/memory.h"
 #include "engine/backends/metal/native/memory.h"
 #include "mfq_container.h"
 #include "mlx_deepseek_v4_causal_lm.h"
@@ -8,7 +9,6 @@
 #include "mlx_nemotron_h_causal_lm.h"
 #include "nemotron_h_model.h"
 #include "mlx_moe.h"
-#include "mlx_memory_residency.h"
 #include "mlx_resident_budget.h"
 #include "mlx_qwen4_causal_lm.h"
 #include "mlx_qwen35_causal_lm.h"
@@ -620,7 +620,7 @@ void configure_mlx_metal() {
                 if (limit == 0) {
                     throw std::runtime_error("device returned a zero limit");
                 }
-                mfq::metal::MlxMemoryResidency::configure(limit);
+                tyloi::metal::set_wired_limit(limit);
                 std::cerr << "Metal wired memory limit: " << limit
                           << " bytes (device recommendation)\n";
             } catch (const std::exception& error) {
@@ -1832,6 +1832,7 @@ public:
         std::shared_ptr<std::optional<Runtime>> runtime,
         std::shared_ptr<Cache> cache, Loader loader, PagedCacheFactory factory,
         std::shared_ptr<std::int64_t> context, std::shared_ptr<tyloi::metal::Executor> executor,
+        std::shared_ptr<tyloi::weights::Memory> ledger,
         int chunk_size, std::size_t cache_limit,
         mfq::metal::MlxEngineComponents components,
         mfq::metal::MlxSamplingParams prepare_sampling, int prepare_routes, int prepare_vocab,
@@ -1839,7 +1840,7 @@ public:
         : runtime_mutex(std::move(mutex)), runtime_holder(std::move(runtime)),
           session_cache(std::move(cache)), load_runtime(std::move(loader)),
           paged_cache_factory(std::move(factory)), loaded_context(std::move(context)),
-          runtime_executor(std::move(executor)), prefill_chunk_size(chunk_size),
+          runtime_executor(std::move(executor)), weight_memory(std::move(ledger)), prefill_chunk_size(chunk_size),
           allocator_cache_limit(cache_limit), runtime_components(std::move(components)),
           preparation_sampling(prepare_sampling), preparation_routes(prepare_routes),
           preparation_vocab(prepare_vocab), warmup_prompt(std::move(prepare_prompt)),
@@ -2449,9 +2450,9 @@ private:
             usage.dynamic_weight_bytes + usage.cache_bytes) + offloaded + prefix + adapters + tyloi::metal::cache_memory();
     }
     void capture_weight_residency() {
-        mfq::metal::MlxMemoryResidency::refresh();
+        tyloi::metal::refresh_residency();
         weight_residency = tyloi::metal::ResidentAllocations::finish_load(
-            mfq::metal::MlxMemoryResidency::configured_limit());
+            tyloi::metal::wired_limit());
         const auto usage = mfq::metal::MlxResourceTelemetry::snapshot();
         const auto other = usage.cache_bytes + usage.dynamic_weight_bytes;
         const auto active = tyloi::metal::active_memory();
@@ -2503,16 +2504,18 @@ private:
                 std::is_same_v<Runtime, mfq::metal::MlxQwen35CausalLm> ||
                 std::is_same_v<Runtime, mfq::metal::MlxMiniCPMO45Runtime>) ? 1.0 : 0.0},
             {"metal_wired_limit_bytes", static_cast<double>(
-                mfq::metal::MlxMemoryResidency::configured_limit())},
+                tyloi::metal::wired_limit())},
             {"metal_wired_bytes", static_cast<double>(
-                mfq::metal::MlxMemoryResidency::wired_bytes())},
+                tyloi::metal::wired_memory())},
             {"metal_wired_available",
-                mfq::metal::MlxMemoryResidency::configured_limit() > 0 ? 1.0 : 0.0},
+                tyloi::metal::wired_limit() > 0 ? 1.0 : 0.0},
             {"ple_source_bytes_read", static_cast<double>(
                 mfq::metal::MlxResourceTelemetry::ple_read_counter().load(std::memory_order_relaxed))},
         };
         std::unique_lock lock(*runtime_mutex, std::try_to_lock);
         if (lock.owns_lock() && runtime_holder->has_value()) {
+            metrics.emplace_back("tracked_weight_backing_bytes",
+                static_cast<double>(weight_memory->resident_bytes()));
             if (batching) {
                 auto batch_metrics = batching->metrics();
                 metrics.insert(metrics.end(), batch_metrics.begin(), batch_metrics.end());
@@ -2819,6 +2822,7 @@ private:
     PagedCacheFactory paged_cache_factory;
     std::shared_ptr<std::int64_t> loaded_context;
     std::shared_ptr<tyloi::metal::Executor> runtime_executor;
+    std::shared_ptr<tyloi::weights::Memory> weight_memory;
     int prefill_chunk_size;
     std::size_t allocator_cache_limit;
     mfq::metal::MlxSamplingParams preparation_sampling;
@@ -2848,7 +2852,8 @@ auto make_runtime(
     std::string model_type,
     std::int64_t maximum_context,
     std::int64_t vocabulary_size,
-    std::shared_ptr<tyloi::metal::Executor> runtime_executor) {
+    std::shared_ptr<tyloi::metal::Executor> runtime_executor,
+    std::shared_ptr<tyloi::weights::Memory> weight_memory) {
     container.stop_load_observation();
     std::cerr << "mfq_load_progress stage=finalizing" << std::endl;
     constexpr const char* tokenizer_asset =
@@ -3000,12 +3005,14 @@ auto make_runtime(
     info.duplex = static_cast<bool>(runtime_components.duplex);
     info.reload = true;
     info.probability = requires(Runtime& runtime, mlx::core::array ids) { runtime.score_forward(ids, false); };
-    auto reload_runtime = [&container, loader = std::move(load_runtime)](std::int64_t context) {
+    auto reload_runtime = [&container, weight_memory, loader = std::move(load_runtime)](std::int64_t context) {
         container.observe_load_records([](std::size_t completed, std::size_t total) {
             std::cerr << "mfq_load_progress completed=" << completed
                       << " total=" << total << std::endl;
         });
         try {
+            *weight_memory = tyloi::weights::Memory{};
+            tyloi::weights::LoadScope memory_load(*weight_memory);
             auto loaded = loader(context);
             container.stop_load_observation();
             std::cerr << "mfq_load_progress stage=finalizing" << std::endl;
@@ -3017,7 +3024,7 @@ auto make_runtime(
     };
     auto engine_model = std::make_unique<LoadedMetalModel<Runtime, decltype(reload_runtime)>>(
         runtime_mutex, runtime_holder, session_cache, std::move(reload_runtime),
-        paged_cache_factory, loaded_context, runtime_executor, prefill_chunk_size,
+        paged_cache_factory, loaded_context, runtime_executor, weight_memory, prefill_chunk_size,
         allocator_cache_limit, std::move(runtime_components), preparation_sampling,
         preparation_routes, static_cast<int>(vocabulary_size),
         text->tokenizer().tokenize("Explain how computers use memory to run language models. "
@@ -3051,6 +3058,7 @@ auto load_runtime(
         std::make_shared<tyloi::metal::Stream>(
             mlx::core::new_thread_unsafe_stream(mlx::core::Device::gpu)));
     auto execution_scope = runtime_executor->enter();
+    auto weight_memory = std::make_shared<tyloi::weights::Memory>();
     mfq::metal::MlxKernelPreparation preparation(static_cast<int>(arguments.context_size),
         arguments.prefill_chunk_size);
     const auto started =
@@ -3079,9 +3087,11 @@ auto load_runtime(
             << "Loading native C++/MLX DeepSeek-V4.1 model "
                "on Apple GPU..."
             << std::endl;
-        auto runtime =
-            mfq::metal::MlxDeepseekV41CausalLm::load(
+        auto runtime = [&] {
+            tyloi::weights::LoadScope memory_load(*weight_memory);
+            return mfq::metal::MlxDeepseekV41CausalLm::load(
                 container, context, expert_cache_bytes);
+        }();
         release_model_load_staging_memory(runtime_executor);
         const auto load_seconds =
             std::chrono::duration<double>(
@@ -3118,7 +3128,7 @@ auto load_runtime(
                 : config.text_model_type,
             config.max_position_embeddings,
             config.vocab,
-            runtime_executor);
+            runtime_executor, weight_memory);
     }
     if (backbone == "deepseek_v4") {
         const auto config =
@@ -3139,11 +3149,13 @@ auto load_runtime(
             << "Loading native C++/MLX DeepSeek-V4 model "
                "on Apple GPU..."
             << std::endl;
-        auto runtime =
-            mfq::metal::MlxDeepseekV4CausalLm::load(
+        auto runtime = [&] {
+            tyloi::weights::LoadScope memory_load(*weight_memory);
+            return mfq::metal::MlxDeepseekV4CausalLm::load(
                 container,
                 context,
                 expert_cache_bytes);
+        }();
         release_model_load_staging_memory(runtime_executor);
         const auto load_seconds =
             std::chrono::duration<double>(
@@ -3187,7 +3199,7 @@ auto load_runtime(
                 : config.model_type,
             config.max_position_embeddings,
             config.vocab,
-            runtime_executor);
+            runtime_executor, weight_memory);
     }
 
     if (backbone == "nemotron_h") {
@@ -3199,7 +3211,10 @@ auto load_runtime(
         std::cout
             << "Loading native C++/MLX Nemotron-H model on Apple GPU..."
             << std::endl;
-        auto runtime = mfq::metal::MlxNemotronHCausalLm::load(container, context);
+        auto runtime = [&] {
+            tyloi::weights::LoadScope memory_load(*weight_memory);
+            return mfq::metal::MlxNemotronHCausalLm::load(container, context);
+        }();
         release_model_load_staging_memory(runtime_executor);
         const auto load_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - started).count();
@@ -3230,7 +3245,7 @@ auto load_runtime(
                                   : config.model_type,
             config.max_position_embeddings,
             config.vocab_size,
-            runtime_executor);
+            runtime_executor, weight_memory);
     }
 
     if (backbone == "minicpmo45") {
@@ -3238,11 +3253,13 @@ auto load_runtime(
             << "Loading native C++/MLX MiniCPM-o 4.5 Qwen3-8B "
                "on Apple GPU..."
             << std::endl;
-        auto runtime =
-            mfq::metal::MlxMiniCPMO45Runtime::load(
+        auto runtime = [&] {
+            tyloi::weights::LoadScope memory_load(*weight_memory);
+            return mfq::metal::MlxMiniCPMO45Runtime::load(
                 container,
                 arguments.context_size,
                 arguments.server);
+        }();
         release_model_load_staging_memory(runtime_executor);
         tyloi::metal::set_cache_limit(kMinicpmoDuplexCacheLimitBytes);
         const auto load_seconds = std::chrono::duration<double>(
@@ -3271,7 +3288,7 @@ auto load_runtime(
             "minicpmo",
             maximum_context,
             vocabulary,
-            runtime_executor);
+            runtime_executor, weight_memory);
     }
 
     if (backbone == "qwen4_exp") {
@@ -3295,9 +3312,11 @@ auto load_runtime(
             << "Loading native C++/MLX Qwen4-Exp model "
                "on Apple GPU..."
             << std::endl;
-        auto runtime =
-            mfq::metal::MlxQwen4CausalLm::load(
+        auto runtime = [&] {
+            tyloi::weights::LoadScope memory_load(*weight_memory);
+            return mfq::metal::MlxQwen4CausalLm::load(
                 container, context, expert_cache_bytes);
+        }();
         release_model_load_staging_memory(runtime_executor);
         const auto load_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - started).count();
@@ -3333,7 +3352,7 @@ auto load_runtime(
                 : config.text_model_type,
             extended_context,
             config.vocab_size,
-            runtime_executor);
+            runtime_executor, weight_memory);
     }
 
     if (backbone != "qwen3_5") {
@@ -3352,8 +3371,10 @@ auto load_runtime(
         << "Loading native C++/MLX Qwen3.5 model "
            "on Apple GPU..."
         << std::endl;
-    auto runtime =
-        mfq::metal::MlxQwen35CausalLm::load(container, context);
+    auto runtime = [&] {
+        tyloi::weights::LoadScope memory_load(*weight_memory);
+        return mfq::metal::MlxQwen35CausalLm::load(container, context);
+    }();
     release_model_load_staging_memory(runtime_executor);
     const auto load_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - started).count();
@@ -3378,7 +3399,7 @@ auto load_runtime(
             : config.text_model_type,
         extended_context,
         config.vocab_size,
-        runtime_executor);
+        runtime_executor, weight_memory);
 }
 #endif
 

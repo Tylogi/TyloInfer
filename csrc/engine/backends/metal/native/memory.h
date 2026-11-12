@@ -31,7 +31,7 @@ PackedLayout packed_layout(std::size_t elements);
 
 // MLX's process-wide limit is a guideline, not a reservation of physical RAM.
 struct Memory {
-    std::size_t active, cache, wired, limit, available, total;
+    std::size_t active, cache, wired, limit, available, total, footprint;
 };
 
 Memory memory();
@@ -42,8 +42,10 @@ std::size_t active_memory();
 std::size_t cache_memory();
 std::size_t peak_memory();
 std::size_t wired_memory();
+std::size_t wired_limit();
 void set_cache_limit(std::size_t limit);
 void set_wired_limit(std::size_t limit);
+void refresh_residency();
 void clear_cache();
 
 // Large model-load scratch buffers must bypass Darwin malloc's large-object

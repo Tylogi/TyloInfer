@@ -5,6 +5,7 @@
 #include "engine/backends/metal/native/resident_allocations.h"
 #include "../gguf/native/mlx_native_gguf.h"
 #include "engine/weights/encoding/mlx_affine.h"
+#include "engine/weights/memory.h"
 
 #include <mlx/allocator.h>
 #include <climits>
@@ -38,7 +39,11 @@ mfq::MlxAffineLayout read_layout(const MfqContainer& model, const std::string& n
 MlxAffineWeight::MlxAffineWeight(array values, array scales, array biases, int bits, int group_size, int width)
     : values_(tyloi::metal::tensor(std::move(values))), scales_(tyloi::metal::tensor(std::move(scales))),
       biases_(tyloi::metal::tensor(std::move(biases))),
-      bits_(bits), group_size_(group_size), width_(width) {}
+      bits_(bits), group_size_(group_size), width_(width) {
+    tyloi::weights::observe_weight(values_);
+    tyloi::weights::observe_weight(scales_);
+    tyloi::weights::observe_weight(biases_);
+}
 
 MlxAffineWeight MlxAffineWeight::from_arrays(array values, array scales, array biases, int bits, int group_size) {
     if (values.dtype() != uint32 || (values.ndim() != 2 && values.ndim() != 3) || bits < 1 ||
@@ -103,7 +108,10 @@ void MlxAffineWeight::prepare_native() {
         !mlx_native_affine_supported(bits_, group_size_, output_size(), width_)) return;
     auto weight = mlx_native_affine_pack(tyloi::metal::array(values_), tyloi::metal::array(scales_), tyloi::metal::array(biases_), bits_, group_size_);
     eval(std::vector<array>(weight.planes.begin(), weight.planes.end()));
-    for (const auto& plane : weight.planes) tyloi::metal::ResidentAllocations::track(plane);
+    for (const auto& plane : weight.planes) {
+        tyloi::metal::ResidentAllocations::track(plane);
+        tyloi::weights::observe_weight(tyloi::metal::tensor(plane));
+    }
     native_ = std::make_shared<MlxNativeGgufWeight>(std::move(weight));
 }
 

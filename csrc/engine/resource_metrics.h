@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <optional>
+#include <set>
 #include <span>
 #include <string>
 #include <utility>
@@ -93,17 +94,24 @@ inline Metrics resource_metrics(
     };
     auto prefix_bytes = cache.device_hot_bytes();
     std::size_t allocated = 0, reserved = 0, free_bytes = 0, total_bytes = 0, buffers = 0;
+    std::size_t charged = 0, wired = 0, cached = 0, cuda_allocated = 0, cuda_reserved = 0;
+    bool shared_pool = false, cuda_devices = false;
+    std::set<std::pair<DeviceType, int>> pools;
     for (const auto& snapshot : devices) {
-        const auto device = snapshot.device.index;
-        const auto external = snapshot.device == primary ? metric_bytes("kv_memory_vmm_bytes") : 0;
-        const auto resident = std::max(snapshot.reserved, snapshot.allocated) + external;
+        const auto accounting = snapshot.pool.value_or(snapshot.device);
+        if (snapshot.pool && !pools.emplace(accounting.type, accounting.index).second) continue;
+        const auto device = accounting.index;
+        const auto external = !snapshot.pool && accounting == primary ? metric_bytes("kv_memory_vmm_bytes") : 0;
+        const auto resident = snapshot.pool
+            ? std::max(snapshot.resident, std::max(snapshot.reserved, snapshot.allocated))
+            : std::max(snapshot.reserved, snapshot.allocated) + external;
         const auto stem = "gpu_" + std::to_string(device) + "_";
-        auto device_weights = ledger.resident_bytes(device);
-        if (snapshot.device == primary)
+        auto device_weights = snapshot.pool ? ledger.resident_bytes() : ledger.resident_bytes(device);
+        if (accounting == primary)
             device_weights += metric_bytes("resident_expert_cache_bytes");
         const auto hot = prefix_bytes[device];
         auto live = metric_bytes(stem + "live_kv_bytes");
-        if (snapshot.device == primary)
+        if (accounting == primary)
             for (const auto& [name, value] : batch_metrics)
                 if (name == "continuous_batching_request_kv_bytes")
                     live += std::size_t(value);
@@ -124,12 +132,26 @@ inline Metrics resource_metrics(
         reserved += snapshot.reserved + external;
         free_bytes += snapshot.available;
         total_bytes += snapshot.total;
+        charged += resident;
+        wired += snapshot.wired;
+        cached += snapshot.reserved > snapshot.allocated ? snapshot.reserved - snapshot.allocated : 0;
+        shared_pool = shared_pool || snapshot.pool.has_value();
+        if (accounting.is_cuda()) {
+            cuda_devices = true;
+            cuda_allocated += snapshot.allocated + external;
+            cuda_reserved += snapshot.reserved + external;
+        }
     }
     metrics.insert(metrics.end(), {
         {"device_free_bytes", double(free_bytes)},
         {"device_total_bytes", double(total_bytes)},
-        {"cuda_allocated_bytes", double(allocated)},
-        {"cuda_reserved_bytes", double(reserved)}});
+        {"device_allocated_bytes", double(allocated)},
+        {"device_reserved_bytes", double(reserved)},
+        {"device_wired_bytes", double(wired)},
+        {"device_allocator_cache_bytes", double(cached)}});
+    if (cuda_devices)
+        metrics.insert(metrics.end(), {{"cuda_allocated_bytes", double(cuda_allocated)},
+            {"cuda_reserved_bytes", double(cuda_reserved)}});
     if (memory)
         metrics.emplace_back("resident_buffer_bytes", double(buffers));
     const auto expert_bytes = metric_bytes("resident_expert_cache_bytes");
@@ -139,7 +161,7 @@ inline Metrics resource_metrics(
         {"resident_weight_dynamic_budget", online_budget_supported ? 1.0 : 0.0},
         {"resident_memory_budget_bytes", double(budget.resident())},
         {"resident_weight_budget_bytes", double(budget.weights())},
-        {"resident_memory_used_bytes", double(std::max(allocated, reserved))},
+        {"resident_memory_used_bytes", double(shared_pool ? charged : std::max(allocated, reserved))},
         {"resident_reclaimable_weight_bytes", double(expert_bytes > minimum ? expert_bytes - minimum : 0)}});
     metrics.emplace_back("qsa_kv_offload_supported", streamed_kv ? 1.0 : 0.0);
     if (offload_metrics) {

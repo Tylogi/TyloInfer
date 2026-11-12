@@ -67,20 +67,22 @@ std::unique_ptr<tyloi::Executor::Graph> Executor::graph() {
 
 std::vector<tyloi::Executor::Memory> Executor::memory(std::span<const Device> devices) const {
     require_current();
-    for (const auto device : devices) require_device(device);
+    for (const auto device : devices)
+        if (device != Device{DeviceType::cpu, 0}) require_device(device);
     if (devices.empty()) return {};
     const auto snapshot = metal::memory();
     const auto unlimited = std::numeric_limits<std::size_t>::max();
     if (snapshot.active > unlimited - snapshot.cache)
         throw std::overflow_error("Metal allocator accounting overflow");
     const auto reserved = snapshot.active + snapshot.cache;
-    const auto headroom = snapshot.limit > reserved ? snapshot.limit - reserved : 0;
+    const auto resident = std::max(reserved, snapshot.footprint);
+    const auto headroom = snapshot.limit > resident ? snapshot.limit - resident : 0;
     std::vector<tyloi::Executor::Memory> result;
     result.reserve(devices.size());
     for (const auto device : devices)
         result.push_back({device, snapshot.active, reserved, snapshot.available, snapshot.total,
-            snapshot.limit == unlimited ? 0 : snapshot.limit, reserved,
-            std::min(snapshot.available, headroom), 0});
+            snapshot.limit == unlimited ? 0 : snapshot.limit, resident,
+            std::min(snapshot.available, headroom), 0, Device{DeviceType::metal, 0}, snapshot.wired});
     return result;
 }
 
@@ -98,6 +100,8 @@ void Executor::set_memory_limit(Device device, std::size_t bytes) {
     if (bytes && metal::active_memory() > bytes)
         throw std::invalid_argument("Metal memory limit is smaller than live allocations");
     metal::clear_cache();
+    if (bytes && metal::memory().footprint > bytes)
+        throw std::invalid_argument("Metal memory limit is smaller than the process footprint");
     metal::set_memory_limit(bytes ? bytes : std::numeric_limits<std::size_t>::max());
 }
 
