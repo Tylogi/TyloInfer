@@ -45,10 +45,14 @@ DenseTensor& Tensor::dense() {
     return *value;
 }
 
-std::shared_ptr<TensorImpl> DenseTensor::relocated(Device target) const {
-    return defined() && device() != target
-        ? std::make_shared<DenseTensor>(to(target))
-        : std::make_shared<DenseTensor>(*this);
+Tensor Tensor::relocated(Device target) const {
+    if (!impl_) return {};
+    if (const auto* value = representation<DenseTensor>()) {
+        return value->defined() && value->device() != target
+            ? Tensor{value->to(target)}
+            : Tensor{*value};
+    }
+    return Tensor{impl_->relocated(target)};
 }
 
 DenseTensor reshape(const DenseTensor& source, std::span<const std::int64_t> shape) {

@@ -1,20 +1,16 @@
 #include "tensor.h"
 
+#include "engine/backends/metal/native/stream.h"
+
 #include <mlx/backend/metal/device.h>
 
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <unordered_set>
 #include <utility>
 
 namespace tyloi::metal {
-namespace {
-
-template <typename Data>
-auto allocation_buffer(Data& data) {
-    if constexpr (requires { data.buffer(); }) return data.buffer();
-    else return data.buffer;
-}
 
 ScalarType scalar_type(mlx::core::Dtype dtype) {
     namespace mx = mlx::core;
@@ -31,6 +27,14 @@ ScalarType scalar_type(mlx::core::Dtype dtype) {
     if (dtype == mx::bfloat16) return ScalarType::bfloat16;
     if (dtype == mx::float32) return ScalarType::float32;
     throw std::invalid_argument("unsupported MLX tensor dtype");
+}
+
+namespace {
+
+template <typename Data>
+auto allocation_buffer(Data& data) {
+    if constexpr (requires { data.buffer(); }) return data.buffer();
+    else return data.buffer;
 }
 
 class Array final : public TensorImpl {
@@ -89,8 +93,8 @@ public:
         throw std::runtime_error("Metal tensor stream recording is not supported");
     }
     std::shared_ptr<TensorImpl> relocated(Device device) const override {
-        if (device != device_) throw std::invalid_argument("Metal tensor relocation is not supported");
-        return std::make_shared<Array>(value_);
+        if (device == device_) return std::make_shared<Array>(value_);
+        return metal::copy(metal::tensor(value_), device).implementation();
     }
 
     const mlx::core::array& value() const noexcept { return value_; }
@@ -120,6 +124,107 @@ mlx::core::Dtype dtype(ScalarType type) {
         case ScalarType::float32: return mx::float32;
         default: throw std::invalid_argument("unsupported Metal tensor dtype");
     }
+}
+
+namespace {
+
+struct Layout {
+    mlx::core::Shape shape;
+    std::size_t elements;
+    std::size_t bytes;
+};
+
+Layout layout(std::span<const std::int64_t> shape, ScalarType type) {
+    (void)dtype(type);
+    if (shape.size() > kMaximumTensorRank) throw std::invalid_argument("tensor rank exceeds maximum");
+    Layout result{{}, 1, 0};
+    bool empty = false;
+    for (auto extent : shape) {
+        if (extent < 0 || extent > std::numeric_limits<int>::max())
+            throw std::invalid_argument("invalid Metal tensor extent");
+        result.shape.push_back(static_cast<int>(extent));
+        empty |= extent == 0;
+    }
+    if (empty) result.elements = 0;
+    else for (auto extent : shape) {
+        if (result.elements > static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max()) / extent)
+            throw std::overflow_error("tensor element count overflow");
+        result.elements *= static_cast<std::size_t>(extent);
+    }
+    const auto width = scalar_size(type);
+    if (result.elements > std::numeric_limits<std::size_t>::max() / width)
+        throw std::overflow_error("tensor byte count overflow");
+    result.bytes = result.elements * width;
+    return result;
+}
+
+}  // namespace
+
+Tensor copy_from_host(const void* data, std::span<const std::int64_t> shape, ScalarType type) {
+    auto dimensions = layout(shape, type);
+    if (dimensions.bytes && !data) throw std::invalid_argument("null tensor data");
+    auto result = mlx::core::array(
+        mlx::core::allocator::malloc(dimensions.bytes), std::move(dimensions.shape), dtype(type));
+    if (dimensions.bytes) std::memcpy(result.data<std::byte>(), data, dimensions.bytes);
+    return tensor(std::move(result));
+}
+
+Tensor copy(const Tensor& value, Device target) {
+    const Device cpu{DeviceType::cpu, 0};
+    const Device gpu{DeviceType::metal, 0};
+    if (!value.defined() || value.is_encoded() || (target != cpu && target != gpu) ||
+        (value.device() != cpu && value.device() != gpu))
+        throw std::invalid_argument("copy requires CPU 0 or Metal 0 dense tensors");
+    const auto* dense = value.representation<DenseTensor>();
+    const auto* metal_array = value.representation<Array>();
+    if ((value.device() == cpu && !dense) || (value.device() == gpu && !metal_array))
+        throw std::invalid_argument("unsupported tensor representation");
+    if (value.device() == target) return value;
+
+    if (dense) {
+        const auto& view = dense->view_descriptor();
+        if (view.rank > kMaximumTensorRank) throw std::invalid_argument("tensor rank exceeds maximum");
+        const auto shape = std::span(view.sizes.data(), view.rank);
+        const auto dimensions = layout(shape, view.scalar_type);
+        if (dimensions.bytes && !view.data) throw std::invalid_argument("null tensor data");
+        if (!dimensions.bytes || view.is_contiguous()) return copy_from_host(view.data, shape, view.scalar_type);
+        auto result = mlx::core::array(
+            mlx::core::allocator::malloc(dimensions.bytes), dimensions.shape, dtype(view.scalar_type));
+        auto* output = result.data<std::byte>();
+        const auto* input = static_cast<const std::byte*>(view.data);
+        const auto width = scalar_size(view.scalar_type);
+        for (std::size_t index = 0; index < dimensions.elements; ++index) {
+            auto remaining = index;
+            __int128 offset = 0;
+            for (std::size_t axis = view.rank; axis > 0; --axis) {
+                const auto extent = static_cast<std::size_t>(view.sizes[axis - 1]);
+                offset += static_cast<__int128>(remaining % extent) * view.strides[axis - 1];
+                remaining /= extent;
+            }
+            offset *= width;
+            if (offset < std::numeric_limits<std::ptrdiff_t>::min() ||
+                offset > std::numeric_limits<std::ptrdiff_t>::max())
+                throw std::overflow_error("tensor stride offset overflow");
+            std::memcpy(output + index * width, input + static_cast<std::ptrdiff_t>(offset), width);
+        }
+        return tensor(std::move(result));
+    }
+
+    const auto& input = metal_array->value();
+    std::vector<std::int64_t> shape(input.shape().begin(), input.shape().end());
+    const auto dimensions = layout(shape, value.scalar_type());
+    const auto view = make_contiguous_view(nullptr, shape, value.scalar_type(), cpu);
+    auto source = mlx::core::contiguous(input);
+    metal::eval(source);
+    auto storage = std::make_shared<TensorStorage>();
+    if (dimensions.bytes) {
+        storage->owner = std::shared_ptr<void>(::operator new(dimensions.bytes), [](void* data) { ::operator delete(data); });
+        storage->base = storage->owner.get();
+        std::memcpy(storage->base, source.data<std::byte>(), dimensions.bytes);
+    }
+    storage->bytes = dimensions.bytes;
+    storage->device = cpu;
+    return DenseTensor(storage, view);
 }
 
 tyloi::Tensor tensor(mlx::core::array value) {

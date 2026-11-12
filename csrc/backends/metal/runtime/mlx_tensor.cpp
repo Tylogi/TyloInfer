@@ -9,8 +9,6 @@
 #include "mlx_gguf_staged.h"
 #include "../ops/gguf/native/mlx_native_gguf.h"
 
-#include <mlx/allocator.h>
-
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -25,6 +23,7 @@
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 namespace mfq::metal {
 namespace {
@@ -461,7 +460,7 @@ array load_dense_array(
     if (dimensions == 0 || dimensions > 8) {
         throw std::runtime_error("invalid dense MFQ dimension count");
     }
-    Shape shape;
+    std::vector<std::int64_t> shape;
     shape.reserve(dimensions);
     std::size_t elements = 1;
     for (std::uint32_t index = 0; index < dimensions; ++index) {
@@ -473,7 +472,7 @@ array load_dense_array(
                     static_cast<std::size_t>(value)) {
             throw std::runtime_error("invalid dense MFQ shape");
         }
-        shape.push_back(static_cast<std::int32_t>(value));
+        shape.push_back(value);
         elements *= static_cast<std::size_t>(value);
     }
     const auto [dtype, item_size] = dense_dtype(dtype_name);
@@ -483,14 +482,9 @@ array load_dense_array(
         throw std::runtime_error("dense MFQ payload length mismatch");
     }
 
-    auto result = array(
-        mlx::core::allocator::malloc(cursor.remaining()),
-        std::move(shape),
-        dtype);
-    std::memcpy(
-        result.data<std::uint8_t>(),
-        cursor.data(),
-        cursor.remaining());
+    const auto tensor = tyloi::metal::copy_from_host(
+        cursor.data(), shape, tyloi::metal::scalar_type(dtype));
+    auto result = tyloi::metal::array(tensor);
     tyloi::metal::ResidentAllocations::track(result);
     return result;
 }

@@ -726,6 +726,20 @@ int checked_int(std::size_t value) {
     if (value > INT_MAX) throw std::overflow_error("GGUF tensor dimension exceeds runtime limits");
     return static_cast<int>(value);
 }
+struct PackedGeometry { int format, rows, row_bytes; };
+PackedGeometry packed_geometry(std::string_view dtype, const Shape& shape, std::size_t bytes) {
+    const auto format = std::find_if(std::begin(formats), std::end(formats),
+        [&](const Format& f) { return dtype == f.name; });
+    if (format == std::end(formats)) throw std::invalid_argument("unsupported native GGUF format: " + std::string(dtype));
+    if ((shape.size() != 2 && shape.size() != 3) ||
+        std::any_of(shape.begin(), shape.end(), [](int d) { return d <= 0; }) || shape.back() % format->block)
+        throw std::invalid_argument("invalid GGUF matrix shape or block alignment");
+    const auto row_bytes = checked_int(std::size_t(shape.back() / format->block) * format->bytes);
+    const auto rows = std::size_t(shape[shape.size() - 2]) * (shape.size() == 3 ? shape[0] : 1);
+    if (rows > SIZE_MAX / row_bytes || rows * row_bytes != bytes)
+        throw std::invalid_argument("GGUF packed tensor length mismatch");
+    return {format->id, checked_int(rows), row_bytes};
+}
 array parameters(int k, int n, int m, int stride, int experts, int routes = 1, bool shared = false) {
     return array({uint32_t(k), uint32_t(n), uint32_t(m), uint32_t(stride),
                   uint32_t(experts), uint32_t(routes), uint32_t(shared)});
@@ -803,24 +817,16 @@ void MlxGgufWeight::prepare_grouped() {
 }
 
 MlxGgufWeight MlxGgufWeight::allocate_packed(std::string_view dtype, Shape shape, std::size_t bytes) {
-    const auto format = std::find_if(std::begin(formats), std::end(formats),
-        [&](const Format& f) { return dtype == f.name; });
-    if (format == std::end(formats)) throw std::invalid_argument("unsupported native GGUF format: " + std::string(dtype));
-    if ((shape.size() != 2 && shape.size() != 3) ||
-        std::any_of(shape.begin(), shape.end(), [](int d) { return d <= 0; }) || shape.back() % format->block)
-        throw std::invalid_argument("invalid GGUF matrix shape or block alignment");
-    const auto row_bytes = checked_int(std::size_t(shape.back() / format->block) * format->bytes);
-    const auto rows = std::size_t(shape[shape.size() - 2]) * (shape.size() == 3 ? shape[0] : 1);
-    if (rows > SIZE_MAX / row_bytes || rows * row_bytes != bytes)
-        throw std::invalid_argument("GGUF packed tensor length mismatch");
-    auto packed = array(allocator::malloc(bytes), Shape{checked_int(rows), row_bytes}, uint8);
-    return MlxGgufWeight(std::move(packed), std::move(shape), format->id, row_bytes);
+    const auto geometry = packed_geometry(dtype, shape, bytes);
+    auto packed = array(allocator::malloc(bytes), Shape{geometry.rows, geometry.row_bytes}, uint8);
+    return MlxGgufWeight(std::move(packed), std::move(shape), geometry.format, geometry.row_bytes);
 }
 MlxGgufWeight MlxGgufWeight::from_bytes(std::string_view dtype,
     std::span<const std::uint8_t> bytes, Shape shape) {
-    auto result = allocate_packed(dtype, std::move(shape), bytes.size());
-    auto packed = tyloi::metal::array(result.bytes_);
-    std::memcpy(packed.data<std::uint8_t>(), bytes.data(), bytes.size());
+    const auto geometry = packed_geometry(dtype, shape, bytes.size());
+    const std::int64_t packed_shape[]{geometry.rows, geometry.row_bytes};
+    const auto tensor = tyloi::metal::copy_from_host(bytes.data(), packed_shape, tyloi::metal::scalar_type(uint8));
+    auto result = MlxGgufWeight(tyloi::metal::array(tensor), std::move(shape), geometry.format, geometry.row_bytes);
     if (use_nax() && result.expert_count() <= 512)
         MlxGgufStagedPrefill::prepare(result);
     tyloi::metal::ResidentAllocations::track(tyloi::metal::array(result.bytes_));

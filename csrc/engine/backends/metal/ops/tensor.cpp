@@ -29,6 +29,10 @@ int dimension(std::int64_t dim, std::size_t rank) {
 
 }  // namespace
 
+Tensor copy(const Tensor& value, Device target) {
+    return metal::copy(value, target);
+}
+
 Tensor clone(const Tensor& value) {
     const auto& source = input(value);
     if (source.size() >= static_cast<std::size_t>(std::numeric_limits<int>::max())) {

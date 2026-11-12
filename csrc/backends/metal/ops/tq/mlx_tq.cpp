@@ -1320,8 +1320,9 @@ template <typename T> T load_le(std::span<const std::uint8_t> data, std::size_t 
 array copy_array(const std::uint8_t* data, std::size_t count, Dtype dtype) {
     if (count > std::size_t(std::numeric_limits<int>::max()))
         throw std::runtime_error("TQ array exceeds backend dimension limit");
-    auto result = array(allocator::malloc(count * size_of(dtype)), Shape{int(count)}, dtype);
-    std::memcpy(result.data<std::uint8_t>(), data, count * size_of(dtype));
+    const std::int64_t shape[]{static_cast<std::int64_t>(count)};
+    const auto tensor = tyloi::metal::copy_from_host(data, shape, tyloi::metal::scalar_type(dtype));
+    auto result = tyloi::metal::array(tensor);
     tyloi::metal::ResidentAllocations::track(result);
     return result;
 }

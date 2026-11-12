@@ -487,7 +487,10 @@ public:
     // A copy of this representation with every buffer resident on `device`,
     // keeping the encoding. Weight preparation uses this; a published weight
     // is never rewritten in place.
-    virtual std::shared_ptr<TensorImpl> relocated(Device device) const = 0;
+    // Dense relocation stays on the handle to keep its vtable storage-only.
+    virtual std::shared_ptr<TensorImpl> relocated(Device) const {
+        throw std::invalid_argument("tensor representation relocation is not supported");
+    }
 
     ScalarType dtype() const noexcept { return scalar_type(); }
     int get_device() const noexcept { return device().index; }
@@ -536,7 +539,6 @@ public:
     const DenseTensor& dense() const noexcept { return *this; }
     DenseTensor& dense() noexcept { return *this; }
     std::vector<const DenseTensor*> buffers() const override { return {this}; }
-    std::shared_ptr<TensorImpl> relocated(Device device) const override;
     std::weak_ptr<void> weak_storage_owner() const noexcept { return storage_; }
     const std::shared_ptr<TensorStorage>& storage() const noexcept { return storage_; }
     std::size_t byte_offset() const noexcept { return byte_offset_; }
@@ -835,7 +837,7 @@ public:
     void record_stream(std::uintptr_t stream, std::shared_ptr<void> lifetime = {}) const {
         if (impl_) impl_->record_stream(stream, lifetime);
     }
-    Tensor relocated(Device device) const { return impl_ ? Tensor{impl_->relocated(device)} : Tensor{}; }
+    Tensor relocated(Device device) const;
 
     ScalarType dtype() const noexcept { return scalar_type(); }
     int get_device() const noexcept { return device().index; }
