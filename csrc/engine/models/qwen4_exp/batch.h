@@ -50,6 +50,7 @@ class BatchOps {
     BatchOps(qwen4_exp::Model&, CudaExecutionContext&, tyloi::engine::Budget&,
              tyloi::engine::ContinuousBatchConfig);
     ~BatchOps();
+    void bind(tyloi::engine::Budget& budget) noexcept { budget_ = &budget; }
     int64_t vocab_size() const;
     int64_t max_context() const;
     tyloi::engine::Metrics metrics() const;
@@ -82,7 +83,7 @@ class BatchOps {
 
     qwen4_exp::Model& model_;
     CudaExecutionContext& execution_;
-    tyloi::engine::Budget& budget_; // The owner keeps the budget alive until batch destruction.
+    tyloi::engine::Budget* budget_; // The owner keeps the budget alive until batch destruction.
     tyloi::engine::ContinuousBatchConfig config_;
     std::vector<std::weak_ptr<Request>> requests_;
     std::unique_ptr<Qwen4BatchDecodeGraph> graph_;

@@ -1,5 +1,7 @@
 #include "engine/engine.h"
 #include "engine/scheduler/scheduler.h"
+#include "engine/generation/batch.h"
+#include "engine/generation/generation.h"
 
 #include <algorithm>
 #include <exception>
@@ -26,10 +28,10 @@ Engine::Engine(std::unique_ptr<models::CausalModel> model, std::unique_ptr<tyloi
         std::shared_ptr<weights::Memory> memory, std::unique_ptr<weights::Cache> weights,
         std::unique_ptr<models::State> model_state, std::unique_ptr<state::Sessions> sessions,
         std::unique_ptr<TextProcessor> text, models::ForwardOptions forward,
-        std::unique_ptr<tyloi::Executor::Graph> graph) {
+        std::unique_ptr<tyloi::Executor::Graph> graph, std::unique_ptr<Batch> batch) {
     rebind(std::move(model), std::move(executor), std::move(config), std::move(source),
         std::move(memory), std::move(weights), std::move(model_state), std::move(sessions),
-        std::move(text), std::move(forward), std::move(graph));
+        std::move(text), std::move(forward), std::move(graph), std::move(batch));
     start();
 }
 
@@ -38,6 +40,8 @@ void Engine::install(std::unique_ptr<tyloi::Executor::Graph> graph) {
     // Keep the graph with its Executor even when metadata or scope setup fails.
     graph_.emplace(0, config_.device, std::move(graph));
     try {
+        if (config_.continuous_batch.max_sequences && !batch_)
+            throw std::invalid_argument("continuous batching is unavailable for this model");
         model_info_ = model_->info();
         graph_->generated_capacity = std::max<std::int64_t>(model_info_.max_context, 2048);
         info_ = {};
@@ -57,6 +61,7 @@ void Engine::install(std::unique_ptr<tyloi::Executor::Graph> graph) {
         tyloi::weights::LoadScope memory_load(*ledger_);
         budget_.emplace(*executor_, *ledger_, *weights_, *cache_, config_.device);
         budget_->bind(false);
+        if (batch_) batch_->bind(*budget_);
         if (const auto bytes = config_.resident_budget_bytes) {
             engine::SessionCommand command; command.kind = engine::SessionCommand::Kind::memory_budget; command.bytes = bytes;
             set_budget(command);
@@ -82,7 +87,7 @@ void Engine::rebind(std::unique_ptr<models::CausalModel>&& model, std::unique_pt
         std::shared_ptr<weights::Memory>&& memory, std::unique_ptr<weights::Cache>&& weights,
         std::unique_ptr<models::State>&& model_state, std::unique_ptr<state::Sessions>&& sessions,
         std::unique_ptr<TextProcessor>&& text, models::ForwardOptions forward,
-        std::unique_ptr<tyloi::Executor::Graph>&& graph) {
+        std::unique_ptr<tyloi::Executor::Graph>&& graph, std::unique_ptr<Batch>&& batch) {
     if (executor_) unload_model();
     model_ = std::move(model);
     executor_ = std::move(executor);
@@ -92,6 +97,7 @@ void Engine::rebind(std::unique_ptr<models::CausalModel>&& model, std::unique_pt
     weights_ = std::move(weights);
     idle_state_ = std::move(model_state);
     cache_ = std::move(sessions);
+    batch_ = std::move(batch);
     text_ = std::move(text);
     forward_options_ = std::move(forward);
     install(std::move(graph));
@@ -113,6 +119,10 @@ std::unique_ptr<tyloi::Executor::Scope> Engine::enter() { return executor_->ente
 
 void Engine::prepare_request(Request& request, bool batched) {
     engine::prepare_request(request, text_.get(), info_, batched, false);
+    if (batched) {
+        if (!batch_) throw std::logic_error("continuous batching is unavailable for this model");
+        return;
+    }
     if (!idle_state_) {
         request.output.reset();
         request.input = {};
@@ -161,6 +171,7 @@ void Engine::unload_model() {
         // No owner is released until consumers and loan restoration have completed.
         clear_bindings();
         graph_.reset();
+        batch_.reset();
         idle_state_.reset();
         if (weights_) weights_->clear_workspace();
         budget_.reset(); cache_.reset();
@@ -190,18 +201,22 @@ ControlResult Engine::control_command(ControlRequest request) {
             } else { text_->prepare_duplex_step(value.text, value.input); return std::move(value.input); }
         } else if constexpr (std::is_same_v<T, engine::GetMetrics>) {
             return resource_metrics(model_->metrics(), {}, std::nullopt, false,
-                {}, {}, std::nullopt, {}, source_.get(),
+                batch_ ? batch_->metrics() : Metrics{}, {}, std::nullopt, {}, source_.get(),
                 *ledger_, *weights_, *cache_, *budget_,
                 executor_->memory(config_.devices), config_.device, config_.online_budget);
         } else throw std::invalid_argument("model has no duplex component");
     }, std::move(request));
 }
 
-bool Engine::can_batch(const EngineRequest&) const { return false; }
+bool Engine::can_batch(const EngineRequest& request) const {
+    return batch_ && batch_compatible(request, cache_->persistent_prefix_enabled(), model_->predictor() != nullptr);
+}
 
 bool Engine::exclusive() const { return false; }
 
-void Engine::execute(const std::vector<RequestId>&) {}
+void Engine::execute(const std::vector<RequestId>& eligible) {
+    if (batch_) batch_->step(eligible);
+}
 
 void Engine::clear_bindings() noexcept {
     if (budget_) budget_->unbind();
@@ -214,6 +229,7 @@ SessionResult Engine::set_budget(const SessionCommand& command) {
     try {
         weights_->settle();
         graph_->invalidate();
+        if (batch_) batch_->release_idle_buffers();
     } catch (...) {
         ready_ = false;
         throw;

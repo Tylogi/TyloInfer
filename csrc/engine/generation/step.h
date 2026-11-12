@@ -1,6 +1,5 @@
 #pragma once
 
-#include "../engine.h"
 #include "../requests/output.h"
 #include "sequence.h"
 #include "../requests/policy.h"

@@ -53,8 +53,8 @@ using tyloi::cuda::make_batch;
 
 template <class M, class S>
 std::unique_ptr<engine::Batch> make_batch(
-    std::shared_ptr<const M>, S*, std::unique_ptr<Executor>, Collectives&,
-    Executor::Mode, tyloi::engine::Budget&, tyloi::engine::ContinuousBatchConfig,
+    const M&, S*, std::unique_ptr<Executor>, Collectives&,
+    Executor::Mode, tyloi::engine::ContinuousBatchConfig,
     std::int64_t, bool, bool, int) {
     throw std::invalid_argument("continuous batching is unavailable for this model");
 }
@@ -161,15 +161,16 @@ struct Text {
                 auto batch_config = config.continuous_batch;
                 batch_config.cuda_graph &= model_parallel_cuda_graph_enabled(execution->config, execution->executor(), execution->weights);
                 batching = make_batch(
-                    std::shared_ptr<const Model>(model), &state, execution->executor().fork(model_parallel_primary_device(execution->config)),
+                    language, &state, execution->executor().fork(model_parallel_primary_device(execution->config)),
                     execution->executor().collectives(), execution->executor().forward_mode(execution->config.layer_placement.primary_device()),
-                    *budget, std::move(batch_config),
+                    std::move(batch_config),
                     config.generation.prefill_chunk_size,
                     ::tyloi::cuda::options::kv_vram_preallocated(),
                     execution->config.dense_cpu_layer_count != 0 ||
                         !execution->config.dsv4_cpu_offload_layers.empty(),
                     execution->config.weights.min_slots);
             }
+            batching->bind(*budget);
         }
 #ifdef TYLOINFER_NATIVE_CUDA
         budget->bind(component_predictor(components) != nullptr);

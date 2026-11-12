@@ -2,6 +2,7 @@
 #include "engine/budget.h"
 #include "engine/generation/decode.h"
 #include "engine/generation/generation.h"
+#include "engine/generation/batch.h"
 #include "engine/generation/mtp/state.h"
 #include "engine/generation/sampling.h"
 #include "engine/models/causal_model.h"
@@ -240,6 +241,10 @@ struct Native {
 } // namespace
 
 StepSequence<EventData> Engine::generate(const RequestId& id, Request& request) {
+    if (request.batched) {
+        if (!batch_) throw std::logic_error("batch generation is unavailable");
+        return batch_->generate(id, request.input, *request.output);
+    }
     return generate_prepared(
         Native{*model_, *request.state, *executor_, *budget_, *graph_, *weights_, model_info_,
                config_, forward_options_, source_.get(), *cache_, [this] { drain(); }},

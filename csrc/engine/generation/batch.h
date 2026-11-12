@@ -6,9 +6,13 @@
 
 namespace tyloi::engine {
 
+class Budget;
+
 class Batch {
   public:
     virtual ~Batch() = default;
+    // Bind before accepting requests; the budget must outlive the batch.
+    virtual void bind(Budget&) = 0;
     virtual Generation generate(std::string id, InferenceRequest&, InferenceOutput&) = 0;
     virtual void step(const std::vector<std::string>& eligible) = 0;
     virtual Metrics metrics() const = 0;
@@ -132,6 +136,7 @@ template <class Ops> class ContinuousBatch : public Batch {
     };
 
   public:
+    void bind(Budget& budget) override { operations.bind(budget); }
     bool empty() const noexcept { return requests.empty(); }
     void invalidate_runtime_policy() {
         if constexpr (requires { operations.invalidate_runtime_policy(); }) operations.invalidate_runtime_policy();

@@ -33,16 +33,9 @@ Batch::~Batch() {
     state_.reset();
 }
 
-static std::shared_ptr<const Model>
-require_weights(std::shared_ptr<const Model> weights) {
-    if (!weights)
-        throw std::invalid_argument("continuous batching requires Qwen35 model weights");
-    return weights;
-}
-
-Batch::Batch(std::shared_ptr<const Model> weights, bool transposed, Options options)
-    : weights_(require_weights(std::move(weights))), transposed_(transposed),
-      state_(std::make_unique<State>(*weights_, transposed_)) {
+Batch::Batch(const Model &weights, bool transposed, Options options)
+    : weights_(weights), transposed_(transposed),
+      state_(std::make_unique<State>(weights_, transposed_)) {
     if (options.slots == 0 ||
         options.slots > static_cast<std::size_t>(std::numeric_limits<int32_t>::max()))
         throw std::invalid_argument("continuous batching max sequences must be positive int32");
@@ -54,23 +47,23 @@ Batch::Batch(std::shared_ptr<const Model> weights, bool transposed, Options opti
     if (options.paged) {
         paged_slots_.resize(options.slots);
         std::vector<PagedKv::Layout> layouts;
-        for (const auto &layer : weights_->layers) {
+        for (const auto &layer : weights_.layers) {
             std::visit(
                 [&](const auto &value) {
                     using T = std::decay_t<decltype(value)>;
                     if constexpr (std::is_same_v<T, Full>) {
                         layouts.push_back({layer.device.index,
                             value.attention.kv_heads > 0 ? value.attention.kv_heads
-                                                         : weights_->metadata.num_key_value_heads,
+                                                         : weights_.metadata.num_key_value_heads,
                             value.attention.attention_head_dim > 0
                                 ? value.attention.attention_head_dim
-                                : weights_->metadata.head_dim,
+                                : weights_.metadata.head_dim,
                             value.attention.kv_quantization});
                     }
                 },
                 layer.weights);
         }
-        paged_kv_ = std::make_unique<PagedKv>(layouts, weights_->metadata.max_position_embeddings,
+        paged_kv_ = std::make_unique<PagedKv>(layouts, weights_.metadata.max_position_embeddings,
                                                static_cast<int32_t>(options.slots),
                                                options.preallocate);
         detach_paged(*state_);
@@ -88,7 +81,7 @@ void Batch::prepare_prefill(RequestState &request, std::int64_t offset, std::int
                             "continuous batching prefill state is invalid");
     if (!request.state_) {
         TYLOINFER_RUNTIME_CHECK(offset == 0, "continuous batching lost prefill state");
-        auto state = std::make_unique<State>(*weights_, transposed_);
+        auto state = std::make_unique<State>(weights_, transposed_);
         state->reset(1);
         if (paged_kv_) {
             detach_paged(*state);
@@ -226,7 +219,7 @@ void Batch::bind_paged(State &state, const std::vector<const PagedKv::Sequence *
     paged_kv_->update(sequences);
     std::size_t state_index = 0;
     std::size_t paged_layer = 0;
-    for (const auto &layer : weights_->layers) {
+    for (const auto &layer : weights_.layers) {
         std::visit(
             [&](const auto &value) {
                 using T = std::decay_t<decltype(value)>;
@@ -264,7 +257,7 @@ void Batch::bind_paged_slots() {
 }
 
 bool Batch::has_moe() const {
-    for (const auto &layer : weights_->layers) {
+    for (const auto &layer : weights_.layers) {
         const bool result = std::visit(
             [](const auto &value) { return std::holds_alternative<::tyloi::models::Moe>(value.ffn); }, layer.weights);
         if (result)
@@ -273,7 +266,7 @@ bool Batch::has_moe() const {
     return false;
 }
 
-bool Batch::has_cached_moe() const { return has_cached_moe(*weights_); }
+bool Batch::has_cached_moe() const { return has_cached_moe(weights_); }
 
 bool Batch::has_cached_moe(const Model &model) {
     for (const auto &layer : model.layers) {
@@ -287,11 +280,11 @@ bool Batch::has_cached_moe(const Model &model) {
 }
 
 std::string Batch::incompatibility(bool cpu_offload, int cached_slots) const {
-    if (weights_->layers.empty())
+    if (weights_.layers.empty())
         return "continuous batching requires at least one model block";
     if (cpu_offload)
         return "continuous batching requires GPU-resident model blocks";
-    for (const auto &layer : weights_->layers) {
+    for (const auto &layer : weights_.layers) {
         if (layer.device.is_cpu())
             return "continuous batching cannot use CPU-offloaded blocks";
         const auto reason = std::visit(
@@ -318,7 +311,7 @@ void Batch::copy_to_slot(State &target, const State &source, std::int64_t slot) 
                                 source.speculative_start < 0,
                             "continuous batching received an invalid stable slot");
     for (std::size_t index = 0; index < target.layers.size(); ++index) {
-        tyloi::ops::DeviceScope guard(weights_->layers[index].device);
+        tyloi::ops::DeviceScope guard(weights_.layers[index].device);
         auto &destination = target.layers[index];
         const auto &origin = source.layers[index];
         TYLOINFER_RUNTIME_CHECK(destination.index() == origin.index(),
@@ -403,7 +396,7 @@ BatchState Batch::capture_recurrent_slots(const std::vector<std::int32_t> &slots
         const auto *linear = std::get_if<LinearState>(&state_->layers[index]);
         if (!linear)
             continue;
-        tyloi::ops::DeviceScope guard(weights_->layers[index].device);
+        tyloi::ops::DeviceScope guard(weights_.layers[index].device);
         std::vector<Tensor> conv, recurrent;
         for (auto slot : slots) {
             conv.push_back(tyloi::ops::slice(linear->mixer.view().convolution, 0, slot, slot + 1));
@@ -428,7 +421,7 @@ void Batch::restore_recurrent_slots(const std::vector<std::int32_t> &slots,
         auto *linear = std::get_if<LinearState>(&state_->layers[index]);
         if (!linear)
             continue;
-        tyloi::ops::DeviceScope guard(weights_->layers[index].device);
+        tyloi::ops::DeviceScope guard(weights_.layers[index].device);
         const auto *saved = std::get_if<tyloi::state::Recurrent::State>(&state.layers[index]);
         TYLOINFER_RUNTIME_CHECK(saved && saved->defined() &&
                                     saved->convolution.size(0) == state.batch &&
@@ -440,7 +433,7 @@ void Batch::restore_recurrent_slots(const std::vector<std::int32_t> &slots,
         auto *linear = std::get_if<LinearState>(&state_->layers[index]);
         if (!linear)
             continue;
-        tyloi::ops::DeviceScope guard(weights_->layers[index].device);
+        tyloi::ops::DeviceScope guard(weights_.layers[index].device);
         const auto &saved = std::get<tyloi::state::Recurrent::State>(state.layers[index]);
         for (std::size_t row = 0; row < slots.size(); ++row) {
             tyloi::ops::copy_into(tyloi::ops::slice(linear->mixer.view().convolution, 0, slots[row], slots[row] + 1),

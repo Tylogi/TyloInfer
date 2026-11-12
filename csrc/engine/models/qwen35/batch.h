@@ -47,7 +47,8 @@ class Batch {
         int cached_slots = 0;
     };
 
-    Batch(std::shared_ptr<const Model> weights, bool transposed, Options options);
+    // The model must outlive the batch.
+    Batch(const Model &weights, bool transposed, Options options);
     Batch(const Batch &) = delete;
     Batch &operator=(const Batch &) = delete;
     ~Batch();
@@ -85,7 +86,7 @@ class Batch {
     void detach_paged(qwen35::State &state) noexcept;
     std::string incompatibility(bool cpu_offload, int cached_slots) const;
 
-    std::shared_ptr<const Model> weights_;
+    const Model &weights_;
     const bool transposed_;
     std::unique_ptr<qwen35::State> state_;
     std::vector<RequestState *> slots_;

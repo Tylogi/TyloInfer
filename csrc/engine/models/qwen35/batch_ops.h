@@ -51,12 +51,14 @@ class BatchOps {
     };
 
     // Calls run inside the owner's CUDA device/context scope.
-    BatchOps(std::shared_ptr<const Model>, std::unique_ptr<Executor>, Collectives&,
-             Executor::Mode, Batch::Options, tyloi::engine::Budget&,
+    // The model must outlive the operations.
+    BatchOps(const Model&, std::unique_ptr<Executor>, Collectives&,
+             Executor::Mode, Batch::Options,
              tyloi::engine::ContinuousBatchConfig);
     ~BatchOps();
     BatchOps(const BatchOps&) = delete;
     BatchOps& operator=(const BatchOps&) = delete;
+    void bind(tyloi::engine::Budget& budget) noexcept { budget_ = &budget; }
     int64_t vocab_size() const;
     int64_t max_context() const;
     tyloi::engine::Metrics metrics() const;
@@ -80,12 +82,12 @@ class BatchOps {
     std::vector<const void*> decode_state_addresses();
     ::tyloi::Tensor logits_from_last_hidden(::tyloi::Tensor hidden, const Executor::Mode& mode);
 
-    std::shared_ptr<const Model> model_;
+    const Model& model_;
     Collectives& collectives_;
     const Executor::Mode mode_;
     std::unique_ptr<Executor> executor_;
     Batch state_;
-    tyloi::engine::Budget& budget_; // The owner keeps the budget alive until batch destruction.
+    tyloi::engine::Budget* budget_ = nullptr;
     const tyloi::engine::ContinuousBatchConfig config_;
     int32_t max_sequences_ = 0;
     bool moe_enabled_ = false;
@@ -107,9 +109,9 @@ namespace tyloi::cuda {
 
 // serial is startup-only: release idle preallocated KV; running independent serial state is omitted.
 std::unique_ptr<tyloi::engine::Batch> make_batch(
-    std::shared_ptr<const qwen35::Model> model, qwen35::State* serial,
+    const qwen35::Model& model, qwen35::State* serial,
     std::unique_ptr<Executor> executor, Collectives& copies, Executor::Mode mode,
-    tyloi::engine::Budget& budget, tyloi::engine::ContinuousBatchConfig config,
+    tyloi::engine::ContinuousBatchConfig config,
     std::int64_t chunk_size, bool preallocate, bool cpu_offload, int cached_slots);
 
 } // namespace tyloi::cuda

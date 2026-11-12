@@ -24,19 +24,14 @@ using DenseTensor = ::tyloi::DenseTensor;
 
 tyloi::engine::PrefillChunk BatchOps::prefill_chunk(
         const std::shared_ptr<Request>&, tyloi::engine::PrefillChunk chunk) {
-    const auto row_bytes = std::size_t(model_->metadata.hidden_size) * model_->metadata.hc_mult * sizeof(float) * 8;
-    return budget_.batch(tyloi::Device{tyloi::DeviceType::cuda, mode_.primary}, row_bytes, chunk);
+    TYLOINFER_RUNTIME_CHECK(budget_, "continuous batching budget is not bound");
+    const auto row_bytes = std::size_t(model_.metadata.hidden_size) * model_.metadata.hc_mult * sizeof(float) * 8;
+    return budget_->batch(tyloi::Device{tyloi::DeviceType::cuda, mode_.primary}, row_bytes, chunk);
 }
 
 bool batch_graph_enabled(const Model& model, const tyloi::engine::ContinuousBatchConfig& config) {
     return config.cuda_graph && !Batch::has_cached_moe(model) &&
            mfq_cuda_graph_capture_supported();
-}
-
-static std::shared_ptr<const Model> require_weights(std::shared_ptr<const Model> model) {
-    if (!model)
-        throw std::invalid_argument("continuous batching requires Qwen35 model weights");
-    return model;
 }
 
 static std::unique_ptr<Executor> require_executor(std::unique_ptr<Executor> executor) {
@@ -45,23 +40,22 @@ static std::unique_ptr<Executor> require_executor(std::unique_ptr<Executor> exec
     return executor;
 }
 
-BatchOps::BatchOps(std::shared_ptr<const Model> model, std::unique_ptr<Executor> executor,
+BatchOps::BatchOps(const Model& model, std::unique_ptr<Executor> executor,
                    Collectives& collectives, Executor::Mode mode, Batch::Options options,
-                   tyloi::engine::Budget& budget,
                    tyloi::engine::ContinuousBatchConfig config)
-    : model_(require_weights(std::move(model))), collectives_(collectives), mode_(mode),
+    : model_(model), collectives_(collectives), mode_(mode),
       executor_(require_executor(std::move(executor))),
       state_(model_, mode_.transposed, options),
-      budget_(budget), config_(std::move(config)),
+      config_(std::move(config)),
       max_sequences_(static_cast<int32_t>(config_.max_sequences)),
       moe_enabled_(state_.has_moe()),
       cached_moe_enabled_(state_.has_cached_moe()) {}
 
 BatchOps::~BatchOps() = default;
 
-int64_t BatchOps::vocab_size() const { return model_->metadata.vocab_size; }
+int64_t BatchOps::vocab_size() const { return model_.metadata.vocab_size; }
 
-int64_t BatchOps::max_context() const { return model_->metadata.max_position_embeddings; }
+int64_t BatchOps::max_context() const { return model_.metadata.max_position_embeddings; }
 
 std::vector<std::pair<std::string, double>> BatchOps::metrics() const {
     const auto paged = state_.paged_kv_stats();
@@ -137,7 +131,7 @@ BatchOps::Sample BatchOps::prefill(const std::shared_ptr<Request>& request,
     input.lengths = length.value_or(::tyloi::DenseTensor());
     {
         auto scope = request->executor->enter(mfq_current_cuda_device(), mode_.ffn);
-        hidden = model_->forward(std::move(input), request->cache.state(),
+        hidden = model_.forward(std::move(input), request->cache.state(),
             {mode_.kv_capacity, mode_.trace, mode_.trace_layer, mode_.primary, mode_.ffn.batch_serial});
     }
     const auto end = chunk.offset + chunk.count;
@@ -239,7 +233,7 @@ std::vector<const void*> BatchOps::decode_state_addresses() {
 ::tyloi::Tensor BatchOps::logits_from_last_hidden(::tyloi::Tensor hidden, const Executor::Mode& mode) {
     auto last = tyloi::ops::contiguous(tyloi::ops::cast(tyloi::ops::select(hidden, 1, -1), ::tyloi::kFloat16));
     auto scope = executor_->enter(mfq_current_cuda_device(), mode.ffn);
-    return model_->logits(last, true);
+    return model_.logits(last, true);
 }
 
 BatchOps::Decoded BatchOps::decode(State& state) {
@@ -271,7 +265,7 @@ BatchOps::Decoded BatchOps::decode(State& state) {
     bool graph_cache_hit = false;
     bool graph_decode = false;
     if (batch >= 2 && batch_greedy && config_.greedy &&
-        batch_graph_enabled(*model_, config_)) {
+        batch_graph_enabled(model_, config_)) {
         graph_state_addresses = decode_state_addresses();
         const auto found =
             std::find_if(decode_graphs_.begin(), decode_graphs_.end(), [&](const auto& graph) {
@@ -354,7 +348,7 @@ BatchOps::Decoded BatchOps::decode(State& state) {
                 input.kv_length = planned_len;
                 input.attention_parts = graph_attention_parts;
                 auto scope = executor_->enter(mfq_current_cuda_device(), mode.ffn);
-                auto hidden = model_->forward(std::move(input), state_.state(),
+                auto hidden = model_.forward(std::move(input), state_.state(),
                     {mode.kv_capacity, mode.trace, mode.trace_layer, mode.primary, mode.ffn.batch_serial});
                 auto current_logits = logits_from_last_hidden(std::move(hidden), mode);
 #ifdef TYLOINFER_NATIVE_CUDA
@@ -370,7 +364,7 @@ BatchOps::Decoded BatchOps::decode(State& state) {
                     auto graph_warmup_states = state_.state().graph_state();
                     prepare_decode_graph_memory(
                         graph_warmup_states, state_.state(),
-                        model_->metadata.decode_graph_double_warmup, *decode_graph->graph,
+                        model_.metadata.decode_graph_double_warmup, *decode_graph->graph,
                         [&]() { (void)invoke(); },
                         decode_graph->participant_streams(collectives_));
                     decode_graph->graph->capture_begin();
@@ -393,7 +387,7 @@ BatchOps::Decoded BatchOps::decode(State& state) {
             input.lengths = lengths;
             input.cache_positions = pos;
             auto scope = executor_->enter(mfq_current_cuda_device(), mode.ffn);
-            auto hidden = model_->forward(std::move(input), state_.state(),
+            auto hidden = model_.forward(std::move(input), state_.state(),
                 {mode.kv_capacity, mode.trace, mode.trace_layer, mode.primary, mode.ffn.batch_serial});
             logits = logits_from_last_hidden(std::move(hidden), mode);
         }
@@ -485,9 +479,9 @@ void BatchOps::recover(State& state) {
 namespace tyloi::cuda {
 
 std::unique_ptr<tyloi::engine::Batch> make_batch(
-    std::shared_ptr<const qwen35::Model> model, qwen35::State* serial,
+    const qwen35::Model& model, qwen35::State* serial,
     std::unique_ptr<Executor> executor, Collectives& copies, Executor::Mode mode,
-    tyloi::engine::Budget& budget, tyloi::engine::ContinuousBatchConfig config,
+    tyloi::engine::ContinuousBatchConfig config,
     std::int64_t chunk_size, bool preallocate, bool cpu_offload, int cached_slots) {
     if (serial && preallocate) {
         for (auto& layer_state : serial->layers)
@@ -497,8 +491,8 @@ std::unique_ptr<tyloi::engine::Batch> make_batch(
                                          cpu_offload, cached_slots};
     const auto token_budget = config.prefill_token_budget;
     return std::make_unique<tyloi::engine::ContinuousBatch<qwen35::BatchOps>>(
-        chunk_size, token_budget, std::move(model), std::move(executor), copies, mode, options,
-        budget, std::move(config));
+        chunk_size, token_budget, model, std::move(executor), copies, mode, options,
+        std::move(config));
 }
 
 } // namespace tyloi::cuda

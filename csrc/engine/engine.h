@@ -5,6 +5,7 @@
 #include "requests/result.h"
 #include "executor.h"
 #include "generation/sequence.h"
+#include "generation/batch.h"
 #include "config.h"
 #include "budget.h"
 #include "generation/decode.h"
@@ -46,19 +47,20 @@ struct EngineStatus {
 };
 class Engine {
 public:
+    // A batch borrows the model and execution resources; Engine retires it first.
     Engine(std::unique_ptr<models::CausalModel> model, std::unique_ptr<tyloi::Executor> executor,
         Config config, std::shared_ptr<const ModelSource> source,
         std::shared_ptr<weights::Memory> memory, std::unique_ptr<weights::Cache> weights,
         std::unique_ptr<models::State> model_state, std::unique_ptr<state::Sessions> sessions,
         std::unique_ptr<TextProcessor> text, models::ForwardOptions forward,
-        std::unique_ptr<tyloi::Executor::Graph> graph);
+        std::unique_ptr<tyloi::Executor::Graph> graph, std::unique_ptr<Batch> batch = {});
     // Retire active requests first. Failed retirement leaves incoming owners with the caller.
     void rebind(std::unique_ptr<models::CausalModel>&& model, std::unique_ptr<tyloi::Executor>&& executor,
         Config config, std::shared_ptr<const ModelSource>&& source,
         std::shared_ptr<weights::Memory>&& memory, std::unique_ptr<weights::Cache>&& weights,
         std::unique_ptr<models::State>&& model_state, std::unique_ptr<state::Sessions>&& sessions,
         std::unique_ptr<TextProcessor>&& text, models::ForwardOptions forward,
-        std::unique_ptr<tyloi::Executor::Graph>&& graph);
+        std::unique_ptr<tyloi::Executor::Graph>&& graph, std::unique_ptr<Batch>&& batch = {});
     // Start one consumer before enable_reload(); next_reload() delivers posted work before shutdown.
     // Complete reply only after binding and its execution scopes have exited.
     struct Reload { std::int64_t context; std::promise<void> reply; };
@@ -128,6 +130,7 @@ private:
     std::optional<Decode> graph_;
     std::unique_ptr<state::Sessions> cache_;
     std::optional<Budget> budget_;
+    std::unique_ptr<Batch> batch_;
     std::unique_ptr<TextProcessor> text_;
     EngineInfo info_;
     bool ready_ = false;
