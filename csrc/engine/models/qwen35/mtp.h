@@ -13,7 +13,7 @@ namespace tyloi::cuda::qwen35 {
 class State;
 class Mtp;
 
-void restore_session(State&, Mtp*, const TextSessionState&, const std::function<void()>&);
+void restore_session(State&, tyloi::models::Mtp*, const TextSessionState&, const std::function<void()>&);
 
 class Mtp final : public tyloi::models::Mtp {
 public:

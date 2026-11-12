@@ -134,7 +134,7 @@ inline constexpr auto with_model = []<typename F>(
                 if (preallocate) state->preallocate();
                 std::unique_ptr<tyloi::Executor> predictor_execution;
                 auto components = qwen35::Components::load(
-                    *owner, weights, execution.weights, execution.config.layer_placement, execution.config.dense_cpu_layer_count,
+                    *owner, weights, execution.config.layer_placement, execution.config.dense_cpu_layer_count,
                     *executor, predictor_execution, load_optional_components,
                     !execution.config.dsv4_cpu_offload_layers.empty(), preallocate);
                 return finish(owner, state, executor, components, started, std::move(predictor_execution));

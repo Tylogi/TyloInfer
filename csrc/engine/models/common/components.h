@@ -18,6 +18,8 @@ tyloi::models::Mtp* component_predictor(const Parts& parts) {
         return parts.get();
     else if constexpr (requires { static_cast<tyloi::models::Mtp*>(parts.mtp.get()); })
         return parts.mtp.get();
+    else if constexpr (requires { static_cast<tyloi::models::Mtp*>(parts.mtp); })
+        return parts.mtp;
     else
         return nullptr;
 }

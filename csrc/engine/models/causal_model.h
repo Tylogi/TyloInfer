@@ -21,6 +21,8 @@ public:
     virtual Info info() const = 0;
     virtual MfqModelCapabilities capabilities() const = 0;
     virtual tyloi::engine::Metrics metrics() const = 0;
+    // Borrowed from this model; predictor state belongs to the request.
+    virtual Mtp* predictor() const noexcept { return nullptr; }
     virtual std::unique_ptr<State> make_state() const = 0;
     virtual tyloi::StepSequence<Prepared> prepare(const std::vector<std::int64_t>& tokens,
         const MfqMultimodalInput& media, State& state) const = 0;

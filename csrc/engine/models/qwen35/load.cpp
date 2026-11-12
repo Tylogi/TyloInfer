@@ -4,6 +4,7 @@
 
 #include "backend.h"
 #include "engine/models/qwen35/metadata.h"
+#include "engine/models/qwen35/mtp.h"
 #include "engine/models/qwen35/weights.h"
 
 #include "engine/models/common/load.h"
@@ -11,6 +12,7 @@
 #include "engine/models/load.h"
 #include "engine/models/source/model_graph.h"
 #include "engine/weights/loader.h"
+#include "engine/weights/cache.h"
 #include "engine/backends/cuda/ops/projection/projection.h"
 #include "engine/backends/cuda/ops/rope/rope.h"
 #include "engine/backends/cuda/kernels/mfq_cuda_kv_quantization.h"
@@ -326,6 +328,29 @@ void load_vision(Model& model, const ::tyloi::weights::Loader& weights, bool res
             component->input_contract, component->position_policy, resident));
     } else if (plan.vision != CudaVisionAdapter::none) {
         throw std::runtime_error("CUDA vision adapter is unsupported for Qwen");
+    }
+}
+
+void load_components(Model& model, const ::tyloi::weights::Loader& weights,
+        const LayerPlacementConfig& placement, int cpu_layers, bool cpu_offload,
+        bool resident, bool preallocate) {
+    const auto plan = cuda_model_plan(model.graph);
+    const bool mtp_allowed =
+        !placement.enabled() && cpu_layers == 0 && !cpu_offload &&
+        weights.cache().transfer() == ::tyloi::weights::Cache::Transfer::automatic;
+
+    load_vision(model, weights, resident);
+    if (plan.predictor == CudaPredictorAdapter::qwen35) {
+        if (mtp_allowed && model.metadata.num_experts == 0 && model.supports_speculation()) {
+            TransformerWeightLoader loader{weights};
+            auto predictor = load_predictor(loader, model, cuda_kv_quantization());
+            if (predictor) model.mtp = std::make_unique<Mtp>(std::move(*predictor), preallocate);
+        } else {
+            std::cerr
+                << "qwen_mtp unavailable: CUDA adapter requires dense GPU-resident Qwen blocks\n";
+        }
+    } else if (plan.predictor != CudaPredictorAdapter::none) {
+        throw std::runtime_error("CUDA predictor adapter is unsupported for Qwen");
     }
 }
 

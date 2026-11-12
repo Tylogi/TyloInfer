@@ -2,8 +2,6 @@
 #include "engine/ops.h"
 #include "engine/models/qwen35/components.h"
 
-#include "engine/models/common/load.h"
-#include "engine/weights/loader.h"
 #include "engine/models/qwen35/load.h"
 #include "engine/models/qwen35/mtp.h"
 #include "engine/models/qwen35/state.h"
@@ -12,10 +10,6 @@
 
 #include "engine/backends/cuda/executor/executor.h"
 #include "engine/backends/cuda/executor/options.h"
-#include "engine/weights/placement.h"
-#include "engine/weights/cache.h"
-
-#include <iostream>
 #include <stdexcept>
 #include <utility>
 
@@ -49,9 +43,9 @@ void Components::describe(tyloi::engine::EngineInfo& info) const {
 
 Components Components::load(
     Model& model,
-    const ::tyloi::weights::Loader& weights, ::tyloi::weights::Cache& cache,
-    LayerPlacementConfig& placement,
-    int& cpu_layers,
+    const ::tyloi::weights::Loader& weights,
+    const LayerPlacementConfig& placement,
+    int cpu_layers,
     Executor& executor,
     std::unique_ptr<tyloi::Executor>& predictor_execution,
     bool optional,
@@ -59,41 +53,22 @@ Components Components::load(
     bool preallocate) {
     Components components{model.graph, cuda_model_plan(model.graph)};
     if (!optional) return components;
-    const bool mtp_allowed =
-        !placement.enabled() && cpu_layers == 0 && !cpu_offload &&
-        cache.transfer() == ::tyloi::weights::Cache::Transfer::automatic;
-
-    load_vision(model, weights, options::vision_resident());
+    load_components(model, weights, placement, cpu_layers, cpu_offload,
+        options::vision_resident(), preallocate);
     components.vision_available = model.vision.has_value();
-
-    if (components.plan.predictor == CudaPredictorAdapter::qwen35) {
-        if (mtp_allowed && model.metadata.num_experts == 0 &&
-            model.supports_speculation()) {
-            TransformerWeightLoader loader{weights};
-            auto predictor = load_predictor(
-                loader, model, cuda_kv_quantization());
-            if (predictor) {
-                auto predictor_executor = executor.fork(model.device.index);
-                predictor_executor->mode().ffn = FfnMode{};
-                predictor_execution = std::move(predictor_executor);
-                components.mtp = std::make_unique<Mtp>(
-                    std::move(*predictor), preallocate);
-            }
-        } else {
-            std::cerr
-                << "qwen_mtp unavailable: CUDA adapter requires dense GPU-resident Qwen blocks\n";
-        }
-    } else if (components.plan.predictor != CudaPredictorAdapter::none) {
-        throw std::runtime_error("CUDA predictor adapter is unsupported for Qwen");
+    components.mtp = model.mtp.get();
+    if (components.mtp) {
+        auto predictor_executor = executor.fork(model.device.index);
+        predictor_executor->mode().ffn = FfnMode{};
+        predictor_execution = std::move(predictor_executor);
     }
     return components;
 }
 
-void restore_session(State& state, Mtp* mtp, const TextSessionState& snapshot,
+void restore_session(State& state, tyloi::models::Mtp* mtp, const TextSessionState& snapshot,
         const std::function<void()>& drain) {
     tyloi::cuda::internal::CudaSessionOps::restore(
-        static_cast<tyloi::models::State&>(state), snapshot, drain,
-        static_cast<tyloi::models::Mtp*>(mtp));
+        static_cast<tyloi::models::State&>(state), snapshot, drain, mtp);
 }
 
 } // namespace tyloi::cuda::qwen35

@@ -40,7 +40,9 @@ tyloi::engine::Metrics Model::metrics() const {
 }
 
 std::unique_ptr<tyloi::models::State> Model::make_state() const {
-    return std::make_unique<State>(*this, recurrent_transposed);
+    auto result = std::make_unique<State>(*this, recurrent_transposed);
+    if (mtp) result->predictor = mtp->make_state();
+    return result;
 }
 
 tyloi::StepSequence<tyloi::models::Prepared> Model::prepare(

@@ -15,7 +15,6 @@
 namespace tyloi { class Executor; }
 
 namespace tyloi::weights {
-class Cache;
 struct Loader;
 }
 
@@ -31,10 +30,10 @@ struct Components {
     tyloi::ModelGraph graph;
     CudaModelPlan plan;
     bool vision_available = false;
-    std::unique_ptr<Mtp> mtp;
+    Mtp* mtp = nullptr;
 
-    static Components load(Model& model, const ::tyloi::weights::Loader& weights, ::tyloi::weights::Cache& cache,
-        LayerPlacementConfig& placement, int& cpu_layers, Executor& executor,
+    static Components load(Model& model, const ::tyloi::weights::Loader& weights,
+        const LayerPlacementConfig& placement, int cpu_layers, Executor& executor,
         std::unique_ptr<tyloi::Executor>& predictor_execution,
         bool optional, bool cpu_offload, bool preallocate);
 

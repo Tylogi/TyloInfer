@@ -39,6 +39,9 @@ void load(Model& model, const ::tyloi::weights::Loader& weights,
           int& cpu_layers, const LoadOptions& options);
 
 void load_vision(Model& model, const ::tyloi::weights::Loader& weights, bool resident = false);
+void load_components(Model& model, const ::tyloi::weights::Loader& weights,
+                     const LayerPlacementConfig& placement, int cpu_layers, bool cpu_offload,
+                     bool resident, bool preallocate);
 
 Layer load_layer(const ::tyloi::weights::Loader&, const Config&,
                  int index, const std::string& type, bool mirror_scalars = true,

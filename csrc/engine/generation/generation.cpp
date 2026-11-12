@@ -202,7 +202,14 @@ struct Native {
     bool batched() const { return false; }
     bool has_hidden(const Hidden& hidden) const { return hidden && hidden.defined(); }
     void invalidate_plan() { graph.invalidate(); }
-    void reset() { state.reset(1); }
+    void reset() {
+        state.reset(1);
+        if (auto* predictor = model.predictor()) {
+            if (!state.predictor || !state.predictor->belongs_to(*predictor))
+                throw std::invalid_argument("predictor state is unavailable or belongs to another model");
+            predictor->reset(*state.predictor, 1);
+        }
+    }
     void release() {
         trace_expert_cache("end");
         try { reset(); }

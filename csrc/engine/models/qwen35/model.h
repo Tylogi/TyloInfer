@@ -1,6 +1,7 @@
 #pragma once
 
 #include "engine/models/qwen35/config.h"
+#include "engine/models/qwen35/mtp.h"
 #include "engine/models/causal_model.h"
 #include "engine/models/common/vision/grid_encoder.h"
 #include "engine/models/metadata.h"
@@ -54,11 +55,13 @@ struct Model : tyloi::models::CausalModel {
     ::tyloi::Tensor output_norm;
     std::vector<Layer> layers;
     std::optional<tyloi::models::grid::Vision> vision;
+    std::unique_ptr<qwen35::Mtp> mtp;
     bool recurrent_transposed = false;
     tyloi::models::Info info() const override;
     MfqModelCapabilities capabilities() const override;
     tyloi::engine::Metrics metrics() const override;
     std::unique_ptr<tyloi::models::State> make_state() const override;
+    tyloi::models::Mtp* predictor() const noexcept override { return mtp.get(); }
     tyloi::StepSequence<tyloi::models::Prepared> prepare(
         const std::vector<std::int64_t>& tokens, const MfqMultimodalInput& media,
         tyloi::models::State& state) const override;

@@ -27,7 +27,8 @@ std::unique_ptr<CausalModel> load(
         int cpu_layers = 0;
         auto model = ::tyloi::cuda::qwen35::load(
             std::move(source), definition, weights, placement, options, cpu_layers);
-        ::tyloi::cuda::qwen35::load_vision(*model, weights, options.vision_resident);
+        ::tyloi::cuda::qwen35::load_components(
+            *model, weights, placement, cpu_layers, false, options.vision_resident, false);
         return model;
     }
     throw std::runtime_error(
