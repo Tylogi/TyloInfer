@@ -58,9 +58,7 @@ Components Components::load(
     components.vision_available = model.vision.has_value();
     components.mtp = model.mtp.get();
     if (components.mtp) {
-        auto predictor_executor = executor.fork(model.device.index);
-        predictor_executor->mode().ffn = FfnMode{};
-        predictor_execution = std::move(predictor_executor);
+        predictor_execution = executor.fork(model.device.index);
     }
     return components;
 }

@@ -611,10 +611,18 @@ template <class Model, class State> struct CudaMtpOps {
     auto scope = tyloi::cuda::Executor::current().enter(mode.ffn);
     predictor_options = tyloi::cuda::forward_options(mode);
     predictor_options.kv_capacity = tyloi::cuda::Executor::current().mmq().kv_cache_capacity;
+    if (predictor_execution) predictor_options.serial_experts = false;
 #endif
     tyloi::models::MtpStep result;
     {
+#ifdef TYLOINFER_NATIVE_CUDA
+      auto* cuda_predictor = dynamic_cast<tyloi::cuda::Executor*>(predictor_execution);
+      TYLOINFER_RUNTIME_CHECK(!predictor_execution || cuda_predictor,
+                              "CUDA MTP predictor requires a CUDA executor");
+      auto predictor_scope = cuda_predictor ? cuda_predictor->enter(mode.primary, tyloi::cuda::FfnMode{}) : nullptr;
+#else
       auto predictor_scope = predictor_execution ? predictor_execution->enter() : nullptr;
+#endif
       result = mtp.step(predictor, hidden, ids, positions, predictor_options);
     }
 #ifdef TYLOINFER_NATIVE_CUDA
