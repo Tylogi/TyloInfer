@@ -1,6 +1,6 @@
 #pragma once
 
-#include "mlx_weight_residency.h"
+#include "engine/backends/metal/native/resident_allocations.h"
 #include "engine/backends/metal/native/memory.h"
 
 #include <atomic>
@@ -17,7 +17,7 @@ public:
         }
         tyloi::metal::set_wired_limit(limit);
         limit_bytes().store(limit, std::memory_order_relaxed);
-        MlxWeightResidency::begin_load();
+        tyloi::metal::ResidentAllocations::begin_load();
     }
 
     static void refresh() {

@@ -2,7 +2,7 @@
 #include "mlx_tq.h"
 #include "mfq_container.h"
 #include "mfq_tq_embedded.h"
-#include "mlx_weight_residency.h"
+#include "engine/backends/metal/native/resident_allocations.h"
 #include "mlx_moe_ops.h"
 #include "mlx_platform.h"
 #include "engine/backends/metal/native/profile.h"
@@ -1320,7 +1320,7 @@ array copy_array(const std::uint8_t* data, std::size_t count, Dtype dtype) {
         throw std::runtime_error("TQ array exceeds backend dimension limit");
     auto result = array(allocator::malloc(count * size_of(dtype)), Shape{int(count)}, dtype);
     std::memcpy(result.data<std::uint8_t>(), data, count * size_of(dtype));
-    MlxWeightResidency::track(result);
+    tyloi::metal::ResidentAllocations::track(result);
     return result;
 }
 
@@ -1339,7 +1339,7 @@ array prepare_scales(std::span<const std::uint8_t> blob, std::size_t offset,
             target[group] = anchor * float(relative[code]);
         }
     }
-    MlxWeightResidency::track(result);
+    tyloi::metal::ResidentAllocations::track(result);
     return result;
 }
 } // namespace
@@ -1431,8 +1431,8 @@ MlxTqWeight MlxTqWeight::from_expert_rows(const MlxMappedTqRows& table,
         }
         base += range.bytes / 4;
     }
-    if (!word_pool) MlxWeightResidency::track(packed);
-    MlxWeightResidency::track(descriptors); MlxWeightResidency::track(scales);
+    if (!word_pool) tyloi::metal::ResidentAllocations::track(packed);
+    tyloi::metal::ResidentAllocations::track(descriptors); tyloi::metal::ResidentAllocations::track(scales);
     const auto resident_bytes = 64 + words * 4 + descriptors.nbytes() + scales.nbytes();
     return MlxTqWeight(std::move(packed), std::move(descriptors), std::move(scales), rows,
         width, table.width(), count, columns ? out : gs, columns ? 2 : 0, resident_bytes, word_pool != nullptr);
@@ -1574,8 +1574,8 @@ MlxTqWeight MlxTqWeight::concatenate(const std::vector<MlxTqWeight>& weights, bo
         word_base += weight.words_.size(); row_base += weight.rows_;
         projection_base += weight.output_size();
     }
-    MlxWeightResidency::track(packed); MlxWeightResidency::track(descriptors);
-    if (!first.columns_) MlxWeightResidency::track(scales);
+    tyloi::metal::ResidentAllocations::track(packed); tyloi::metal::ResidentAllocations::track(descriptors);
+    if (!first.columns_) tyloi::metal::ResidentAllocations::track(scales);
     return MlxTqWeight(std::move(packed), std::move(descriptors), std::move(scales), rows,
         first.width_, first.input_columns_, projections ? first.experts_ : int(experts),
         first.group_size_, first.columns_, 64 + words * 4 + rows * 8 + scale_bytes);

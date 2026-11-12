@@ -4,7 +4,7 @@
 #include "mlx_expert_segment_cache.h"
 #include "mlx_kernel_prepare.h"
 #include "mlx_moe_ops.h"
-#include "mlx_weight_residency.h"
+#include "engine/backends/metal/native/resident_allocations.h"
 #include "engine/weights/encoding/mlx_affine.h"
 
 #include <climits>
@@ -26,7 +26,7 @@ array ffn(const std::array<MlxAffineIndirectWeight, 3>& weights, const array& in
 }
 
 std::array<MlxAffineIndirectWeight, 3> bind_affine_layer(const Layer& layer, const std::vector<array>& tables,
-    const std::shared_ptr<MlxWeightResidency>& residency) {
+    const std::shared_ptr<tyloi::metal::ResidentAllocations>& residency) {
     const auto make = [&](int projection) {
         const auto& layout = layer[projection];
         Shape shape; for (const auto dim : layout.shape) shape.push_back(int(dim));
@@ -96,7 +96,7 @@ void MlxAffineExpertCache::prepare_layer(std::size_t index, int top_k) const {
         const std::vector<std::uint64_t> empty(layer[0].shape[0], 0);
         tables.emplace_back(empty.begin(), Shape{int(layer[0].shape[0])}, uint64);
     }
-    const auto residency = std::shared_ptr<MlxWeightResidency>(MlxWeightResidency::retain_arrays(tables, 1u << 20, true));
+    const auto residency = std::shared_ptr<tyloi::metal::ResidentAllocations>(tyloi::metal::ResidentAllocations::retain_arrays(tables, 1u << 20, true));
     const auto weights = bind_affine_layer(layer, tables, residency);
     preparation->collect([&] {
         for (const auto rows : preparation->row_buckets())

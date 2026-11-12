@@ -4,7 +4,7 @@
 #include "mlx_tq_rows.h"
 #include "mlx_moe_ops.h"
 #include "mfq_container.h"
-#include "mlx_weight_residency.h"
+#include "engine/backends/metal/native/resident_allocations.h"
 #include "mlx_resource_telemetry.h"
 #include "mlx_kernel_prepare.h"
 #include "mlx_pinned_pool_storage.h"
@@ -75,7 +75,7 @@ struct PoolBuffer {
 struct PoolLifetime {
     std::vector<array> chunks;
     array handle = array(0, uint64);
-    std::shared_ptr<MlxWeightResidency> residency;
+    std::shared_ptr<tyloi::metal::ResidentAllocations> residency;
 };
 
 struct Pool {
@@ -455,7 +455,7 @@ struct MlxTqExpertCache::Impl {
         std::vector<array> buffers;
         for(const auto& pool:pools)buffers.insert(buffers.end(),pool.chunks.begin(),pool.chunks.end());
         if(pool_residency)pool_residency->update_arrays(buffers,budget);
-        else pool_residency=MlxWeightResidency::retain_arrays(buffers,budget,true);
+        else pool_residency=tyloi::metal::ResidentAllocations::retain_arrays(buffers,budget,true);
         for(auto& pool:pools) {
             pool.lifetime->residency=pool_residency;
             register_indirect_weight_pool(pool.words,pool_residency);
@@ -1132,7 +1132,7 @@ struct MlxTqExpertCache::Impl {
     std::vector<HotRoute> hot_routes;
     std::size_t metadata = 0, backing = 0;
     std::array<std::size_t, 3> bank_largest{}, bank_capacity{};
-    std::shared_ptr<MlxWeightResidency> pool_residency;
+    std::shared_ptr<tyloi::metal::ResidentAllocations> pool_residency;
     std::atomic<std::size_t> allocated{0}, requested_limit{0};
     std::atomic<std::uint64_t> requests{0}, hits{0}, misses{0}, evictions{0}, bytes_read{0}, read_calls{0};
     std::atomic<std::uint64_t> overlapped_read_batches{0};

@@ -1,5 +1,5 @@
 #pragma once
-#include "mlx_weight_residency.h"
+#include "engine/backends/metal/native/resident_allocations.h"
 #include "engine/backends/metal/native/kernel.h"
 #include <mlx/fast.h>
 #include <mlx/primitives.h>
@@ -10,7 +10,7 @@ namespace mfq::metal {
 struct MlxIndirectWeightRegistry {
     struct Entry {
         std::weak_ptr<mlx::core::array::Data> allocation;
-        std::weak_ptr<MlxWeightResidency> residency;
+        std::weak_ptr<tyloi::metal::ResidentAllocations> residency;
     };
     std::mutex mutex;
     std::atomic<bool> active{false};
@@ -21,7 +21,7 @@ inline MlxIndirectWeightRegistry& indirect_weight_registry() {
     return registry;
 }
 inline void register_indirect_weight_pool(const mlx::core::array& words,
-        const std::shared_ptr<MlxWeightResidency>& residency) {
+        const std::shared_ptr<tyloi::metal::ResidentAllocations>& residency) {
     auto& registry=indirect_weight_registry();
     std::lock_guard lock(registry.mutex);
     std::erase_if(registry.entries,[](const auto& item){return item.second.allocation.expired()||item.second.residency.expired();});
@@ -31,7 +31,7 @@ inline void register_indirect_weight_pool(const mlx::core::array& words,
 class MlxIndirectWeightKernel final:public mlx::core::Primitive,public tyloi::metal::PreparableKernel {
 public:
     MlxIndirectWeightKernel(std::shared_ptr<mlx::core::Primitive> kernel,
-            std::vector<std::shared_ptr<MlxWeightResidency>> residency,
+            std::vector<std::shared_ptr<tyloi::metal::ResidentAllocations>> residency,
             std::vector<std::shared_ptr<mlx::core::array::Data>> handles)
         :Primitive(kernel->stream()),kernel_(std::move(kernel)),residency_(std::move(residency)),
             handles_(std::move(handles)){}
@@ -49,7 +49,7 @@ public:
     }
 private:
     std::shared_ptr<mlx::core::Primitive> kernel_;
-    std::vector<std::shared_ptr<MlxWeightResidency>> residency_;
+    std::vector<std::shared_ptr<tyloi::metal::ResidentAllocations>> residency_;
     std::vector<std::shared_ptr<mlx::core::array::Data>> handles_;
 };
 inline mlx::core::fast::CustomKernelFunction indirect_weight_metal_kernel(
@@ -61,7 +61,7 @@ inline mlx::core::fast::CustomKernelFunction indirect_weight_metal_kernel(
         auto values=function(std::forward<decltype(arguments)>(arguments)...);
         auto& registry = indirect_weight_registry();
         if (!registry.active.load(std::memory_order_acquire)) return values;
-        std::vector<std::shared_ptr<MlxWeightResidency>> residency;
+        std::vector<std::shared_ptr<tyloi::metal::ResidentAllocations>> residency;
         std::vector<std::shared_ptr<mlx::core::array::Data>> handles;
         {
             std::lock_guard lock(registry.mutex);

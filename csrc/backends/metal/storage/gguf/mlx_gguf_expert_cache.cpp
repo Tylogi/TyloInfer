@@ -4,7 +4,7 @@
 #include "mlx_expert_segment_cache.h"
 #include "mlx_kernel_prepare.h"
 #include "mlx_moe_ops.h"
-#include "mlx_weight_residency.h"
+#include "engine/backends/metal/native/resident_allocations.h"
 #include "nlohmann/json.hpp"
 
 #include <algorithm>
@@ -152,7 +152,7 @@ void MlxGgufExpertCache::prepare_layer(std::size_t index, int top_k, float limit
             auto table = zeros({layer[p].shape[0]}, uint64);
             table.eval();
             const auto bytes = static_cast<MTL::Buffer*>(table.buffer().ptr())->allocatedSize();
-            std::shared_ptr<MlxWeightResidency> residency = MlxWeightResidency::retain_arrays({table}, bytes, true);
+            std::shared_ptr<tyloi::metal::ResidentAllocations> residency = tyloi::metal::ResidentAllocations::retain_arrays({table}, bytes, true);
             auto weight = layer[p].expert_dtypes.empty()
                 ? MlxGgufWeight::from_address_table(layer[p].dtype, layer[p].shape, table, std::move(residency))
                 : MlxGgufWeight::from_mixed_address_table(layer[p].shape, layer[p].expert_dtypes, table, std::move(residency));

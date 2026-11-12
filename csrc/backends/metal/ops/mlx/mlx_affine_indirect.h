@@ -4,14 +4,15 @@
 #include <array>
 #include <memory>
 
+namespace tyloi::metal { class ResidentAllocations; }
+
 namespace mfq::metal {
-class MlxWeightResidency;
 class MlxAffineIndirectWeight {
 public:
     static constexpr int kVectorRows = 6;
     static MlxAffineIndirectWeight from_address_tables(mlx::core::Shape shape, int bits, int group_size,
         mlx::core::Dtype scale_dtype, std::array<mlx::core::array, 3> tables,
-        std::shared_ptr<MlxWeightResidency> residency);
+        std::shared_ptr<tyloi::metal::ResidentAllocations> residency);
     mlx::core::array routed_matmul(const mlx::core::array& input, const mlx::core::array& ids,
         bool shared_input, const MlxExpertRouteTiles* plan = nullptr) const;
     mlx::core::array routed_swiglu(const MlxAffineIndirectWeight& up, const mlx::core::array& input,

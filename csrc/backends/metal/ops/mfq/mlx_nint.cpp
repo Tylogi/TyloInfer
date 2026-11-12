@@ -3,7 +3,7 @@
 #include "engine/backends/metal/native/kernel.h"
 #include "mlx_memory_residency.h"
 #include "mlx_resident_budget.h"
-#include "mlx_weight_residency.h"
+#include "engine/backends/metal/native/resident_allocations.h"
 
 #include "tyloinfer/nint_blob.h"
 #include "mfq_mfe_prefill_embedded.h"
@@ -1151,7 +1151,7 @@ array make_array(
     const std::vector<T, Allocator>& values,
     Shape shape) {
     auto result = array(values.begin(), std::move(shape));
-    MlxWeightResidency::track(result);
+    tyloi::metal::ResidentAllocations::track(result);
     return result;
 }
 

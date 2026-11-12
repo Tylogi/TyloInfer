@@ -2,7 +2,7 @@
 #include "hf_safetensors_store.h"
 #include "engine/backends/metal/native/kernel.h"
 #include "mlx_tensor.h"
-#include "mlx_weight_residency.h"
+#include "engine/backends/metal/native/resident_allocations.h"
 #include "mlx_kernel_prepare.h"
 #include "engine/generation/mtp/policy.h"
 #include "../flash_next/mlx_qwen4_causal_lm.h"
@@ -153,7 +153,7 @@ struct Loader {
             throw std::invalid_argument("DFlash2 tensor shape or precision differs: " + name);
         auto value = array(allocator::malloc(record.nbytes), shape, bfloat16);
         store.read_tensor(record, {reinterpret_cast<std::byte*>(value.data<std::uint8_t>()), std::size_t(record.nbytes)});
-        if (retain) { bytes += value.nbytes(); MlxWeightResidency::track(value); allocations.push_back(value); }
+        if (retain) { bytes += value.nbytes(); tyloi::metal::ResidentAllocations::track(value); allocations.push_back(value); }
         return value;
     }
     MlxLinear linear(const std::string& name, int rows, int columns) {
@@ -161,7 +161,7 @@ struct Loader {
         auto quantized = quantize(source, 64, 4, "affine");
         eval(quantized);
         for (const auto& value : quantized) {
-            bytes += value.nbytes(); MlxWeightResidency::track(value); allocations.push_back(value);
+            bytes += value.nbytes(); tyloi::metal::ResidentAllocations::track(value); allocations.push_back(value);
         }
         MlxLinear result(MlxAffineWeight::from_arrays(quantized[0], quantized[1], quantized[2], 4, 64));
         bytes += result.affine_weight_ref()->packed_nbytes() - quantized[0].nbytes() - quantized[1].nbytes() - quantized[2].nbytes();
@@ -269,7 +269,7 @@ MlxDFlash2 MlxDFlash2::load(const std::filesystem::path& directory) {
 const MlxDFlash2Config& MlxDFlash2::config() const noexcept { return impl_->config; }
 std::size_t MlxDFlash2::weight_bytes() const noexcept { return impl_->bytes; }
 void MlxDFlash2::track_weights() const {
-    for (const auto& value : impl_->allocations) MlxWeightResidency::track(value);
+    for (const auto& value : impl_->allocations) tyloi::metal::ResidentAllocations::track(value);
 }
 std::size_t MlxDFlash2Context::bytes() const noexcept {
     std::size_t result = window ? window->nbytes() : 0;

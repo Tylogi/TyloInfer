@@ -9,7 +9,7 @@
 #include "metal/abi/GgufRepack.h"
 #include "metal/abi/Gguf.h"
 #include "mfq_container.h"
-#include "mlx_weight_residency.h"
+#include "engine/backends/metal/native/resident_allocations.h"
 #include "ggml.h"
 
 #include <mlx/allocator.h>
@@ -393,7 +393,7 @@ bool single_row_moe(const MlxNativeGgufMoe& weights, int actual) {
 
 MlxNativeGgufWeight mlx_native_gguf_float(const array& weight) {
     if (weight.dtype() == float16) {
-        auto exact = astype(weight, float32); exact.eval(); MlxWeightResidency::track(exact);
+        auto exact = astype(weight, float32); exact.eval(); tyloi::metal::ResidentAllocations::track(exact);
         return mlx_native_gguf_float(exact);
     }
     if (weight.ndim() != 2 || (weight.dtype() != bfloat16 && weight.dtype() != float32))
@@ -515,7 +515,7 @@ MlxNativeGgufWeight mlx_native_gguf_load(const MfqContainer& model, const std::s
     model.read_range_into(name, 0, {reinterpret_cast<std::byte*>(packed.data<std::uint8_t>()), std::size_t(record.nbytes)});
     auto result = mlx_native_gguf_pack(packed, type, experts * rows, width, int(record.nbytes / (experts * rows)));
     eval(std::vector<array>(result.planes.begin(), result.planes.end()));
-    for (const auto& plane : result.planes) MlxWeightResidency::track(plane);
+    for (const auto& plane : result.planes) tyloi::metal::ResidentAllocations::track(plane);
     result.outputs = rows; result.experts = experts;
     model.record_prepared(name);
     return result;

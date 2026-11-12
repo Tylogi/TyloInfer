@@ -2104,7 +2104,7 @@ public:
         weight_residency.reset();
         runtime_holder->reset();
         release_model_load_staging_memory(runtime_stream);
-        mfq::metal::MlxWeightResidency::begin_load();
+        tyloi::metal::ResidentAllocations::begin_load();
         const auto started =
             std::chrono::steady_clock::now();
         std::cout
@@ -2155,7 +2155,7 @@ public:
                 weight_residency.reset();
                 runtime_holder->reset();
                 release_model_load_staging_memory(runtime_stream);
-                mfq::metal::MlxWeightResidency::begin_load();
+                tyloi::metal::ResidentAllocations::begin_load();
                 mfq::metal::MlxKernelPreparation preparation(static_cast<int>(previous_context), prefill_chunk_size);
                 preparation.set_routes(preparation_routes);
                 runtime_holder->emplace(
@@ -2443,7 +2443,7 @@ private:
     }
     void capture_weight_residency() {
         mfq::metal::MlxMemoryResidency::refresh();
-        weight_residency = mfq::metal::MlxWeightResidency::finish_load(
+        weight_residency = tyloi::metal::ResidentAllocations::finish_load(
             mfq::metal::MlxMemoryResidency::configured_limit());
         const auto usage = mfq::metal::MlxResourceTelemetry::snapshot();
         const auto other = usage.cache_bytes + usage.dynamic_weight_bytes;
@@ -2824,7 +2824,7 @@ private:
     std::atomic<std::size_t> resident_budget{0};
     std::atomic<std::size_t> resident_weight_budget{0};
     mfq::metal::MlxEngineComponents runtime_components;
-    std::unique_ptr<mfq::metal::MlxWeightResidency> weight_residency;
+    std::unique_ptr<tyloi::metal::ResidentAllocations> weight_residency;
     using MetalBatch = mfq::engine::ContinuousBatch<mfq::metal::MlxQwen4BatchOperations>;
     int configured_batch_capacity;
     std::size_t batching_capacity = 1;

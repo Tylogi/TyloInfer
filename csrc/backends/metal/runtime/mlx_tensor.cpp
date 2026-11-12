@@ -3,7 +3,7 @@
 #include "mlx_moe_ops.h"
 #include "mlx_reference.h"
 #include "mlx_transformer.h"
-#include "mlx_weight_residency.h"
+#include "engine/backends/metal/native/resident_allocations.h"
 #include "mlx_gguf_staged.h"
 #include "../ops/gguf/native/mlx_native_gguf.h"
 
@@ -489,7 +489,7 @@ array load_dense_array(
         result.data<std::uint8_t>(),
         cursor.data(),
         cursor.remaining());
-    MlxWeightResidency::track(result);
+    tyloi::metal::ResidentAllocations::track(result);
     return result;
 }
 

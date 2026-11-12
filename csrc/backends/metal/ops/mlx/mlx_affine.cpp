@@ -2,7 +2,7 @@
 #include "mlx_affine_staged.h"
 #include "mlx_moe_ops.h"
 #include "mfq_container.h"
-#include "mlx_weight_residency.h"
+#include "engine/backends/metal/native/resident_allocations.h"
 #include "../gguf/native/mlx_native_gguf.h"
 #include "engine/weights/encoding/mlx_affine.h"
 
@@ -54,7 +54,7 @@ MlxAffineWeight MlxAffineWeight::from_arrays(array values, array scales, array b
         !values.flags().row_contiguous || !scales.flags().row_contiguous || !biases.flags().row_contiguous)
         throw std::invalid_argument("MLX affine auxiliary array shape/layout mismatch");
     eval(values, scales, biases);
-    MlxWeightResidency::track(values); MlxWeightResidency::track(scales); MlxWeightResidency::track(biases);
+    tyloi::metal::ResidentAllocations::track(values); tyloi::metal::ResidentAllocations::track(scales); tyloi::metal::ResidentAllocations::track(biases);
     return MlxAffineWeight(std::move(values), std::move(scales), std::move(biases), bits, group_size, int(layout.shape.back()));
 }
 MlxAffineWeight MlxAffineWeight::load(const MfqContainer& model, const std::string& name) {
@@ -102,7 +102,7 @@ void MlxAffineWeight::prepare_native() {
         !mlx_native_affine_supported(bits_, group_size_, output_size(), width_)) return;
     auto weight = mlx_native_affine_pack(values_, scales_, biases_, bits_, group_size_);
     eval(std::vector<array>(weight.planes.begin(), weight.planes.end()));
-    for (const auto& plane : weight.planes) MlxWeightResidency::track(plane);
+    for (const auto& plane : weight.planes) tyloi::metal::ResidentAllocations::track(plane);
     native_ = std::make_shared<MlxNativeGgufWeight>(std::move(weight));
 }
 

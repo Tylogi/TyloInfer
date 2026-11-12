@@ -476,7 +476,7 @@ if (group == 0u && lane == 0u && row < N) {
 
 MlxGgufWeight MlxGgufWeight::from_mixed_experts(Shape shape, const std::vector<std::int32_t>& ids,
     const std::vector<std::string>& dtypes, const std::vector<array>& packed,
-    std::shared_ptr<MlxWeightResidency> residency) {
+    std::shared_ptr<tyloi::metal::ResidentAllocations> residency) {
     if (shape.size() != 3 || std::any_of(shape.begin(), shape.end(), [](int d) { return d <= 0; }) ||
         ids.empty() || ids.size() != packed.size() || ids.size() != dtypes.size())
         throw std::invalid_argument("invalid GGUF mixed expert table");
@@ -500,10 +500,10 @@ MlxGgufWeight MlxGgufWeight::from_mixed_experts(Shape shape, const std::vector<s
     struct Lifetime {
         std::vector<array> experts;
         array table;
-        std::shared_ptr<MlxWeightResidency> residency;
+        std::shared_ptr<tyloi::metal::ResidentAllocations> residency;
     };
     auto lifetime = std::make_shared<Lifetime>(Lifetime{packed, array(addresses.begin(), Shape{shape[0]}, uint64),
-        residency ? std::move(residency) : MlxWeightResidency::retain_arrays(packed, allocated, true)});
+        residency ? std::move(residency) : tyloi::metal::ResidentAllocations::retain_arrays(packed, allocated, true)});
     auto table = mlx_buffer_view(lifetime->table.buffer(), lifetime->table.shape(), uint64, lifetime);
     register_indirect_weight_pool(table, lifetime->residency);
     MlxGgufWeight result(std::move(table), std::move(shape), -1, 0, true);
@@ -514,7 +514,7 @@ MlxGgufWeight MlxGgufWeight::from_mixed_experts(Shape shape, const std::vector<s
 }
 
 MlxGgufWeight MlxGgufWeight::from_mixed_address_table(Shape shape, const std::vector<std::string>& dtypes,
-    array table, std::shared_ptr<MlxWeightResidency> residency) {
+    array table, std::shared_ptr<tyloi::metal::ResidentAllocations> residency) {
     if (shape.size() != 3 || std::any_of(shape.begin(), shape.end(), [](int d) { return d <= 0; }) ||
         dtypes.size() != std::size_t(shape[0]) || table.dtype() != uint64 || table.shape() != Shape{shape[0]} ||
         !table.flags().row_contiguous || !residency)
@@ -528,7 +528,7 @@ MlxGgufWeight MlxGgufWeight::from_mixed_address_table(Shape shape, const std::ve
         layout[e * 2] = types[index]; layout[e * 2 + 1] = std::uint32_t(stride); mask |= 1 << index;
     }
     table.eval();
-    struct Lifetime { array table; std::shared_ptr<MlxWeightResidency> residency; };
+    struct Lifetime { array table; std::shared_ptr<tyloi::metal::ResidentAllocations> residency; };
     auto owner = std::make_shared<Lifetime>(Lifetime{table, std::move(residency)});
     auto handle = mlx_buffer_view(table.buffer(), table.shape(), uint64, owner);
     register_indirect_weight_pool(handle, owner->residency);

@@ -2,7 +2,7 @@
 
 #include "mlx_platform.h"
 #include "mlx_transformer.h"
-#include "mlx_weight_residency.h"
+#include "engine/backends/metal/native/resident_allocations.h"
 
 #include <algorithm>
 #include <array>
@@ -212,7 +212,7 @@ int checked_dimension(std::uint64_t value, const char* name) {
 template <typename T>
 array make_array(std::span<const T> values, Shape shape) {
     auto result = array(values.begin(), std::move(shape));
-    MlxWeightResidency::track(result);
+    tyloi::metal::ResidentAllocations::track(result);
     return result;
 }
 

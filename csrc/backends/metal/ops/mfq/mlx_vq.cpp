@@ -1,6 +1,6 @@
 #include "mlx_vq.h"
 #include "mlx_nvq_decode.h"
-#include "mlx_weight_residency.h"
+#include "engine/backends/metal/native/resident_allocations.h"
 
 #include "../../../../core/compat/mfq_format_compat.h"
 #include "nvq_codebooks.generated.h"
@@ -2905,7 +2905,7 @@ array make_array(
     const std::vector<T, Allocator>& values,
     Shape shape) {
     auto result = array(values.begin(), std::move(shape));
-    MlxWeightResidency::track(result);
+    tyloi::metal::ResidentAllocations::track(result);
     return result;
 }
 

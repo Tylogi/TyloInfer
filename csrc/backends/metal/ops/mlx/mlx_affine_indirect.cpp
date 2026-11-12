@@ -205,7 +205,7 @@ MlxAffineIndirectWeight::MlxAffineIndirectWeight(Shape shape, int bits, int grou
     std::array<array, 3> tables) : shape_(std::move(shape)), bits_(bits), group_size_(group), dtype_(dtype), tables_(std::move(tables)) {}
 
 MlxAffineIndirectWeight MlxAffineIndirectWeight::from_address_tables(Shape shape, int bits, int group,
-    Dtype dtype, std::array<array, 3> tables, std::shared_ptr<MlxWeightResidency> residency) {
+    Dtype dtype, std::array<array, 3> tables, std::shared_ptr<tyloi::metal::ResidentAllocations> residency) {
     mfq::MlxAffineLayout layout;
     layout.shape.assign(shape.begin(), shape.end()); layout.bits = bits; layout.group_size = group;
     layout.scale_dtype = dtype == bfloat16 ? "BF16" : dtype == float16 ? "F16" : dtype == float32 ? "F32" : "";
@@ -215,7 +215,7 @@ MlxAffineIndirectWeight MlxAffineIndirectWeight::from_address_tables(Shape shape
         if (table.dtype() != uint64 || table.shape() != Shape{shape[0]} || !table.flags().row_contiguous)
             throw std::invalid_argument("invalid indirect MLX expert address table");
         table.eval();
-        struct Lifetime { array table; std::shared_ptr<MlxWeightResidency> residency; };
+        struct Lifetime { array table; std::shared_ptr<tyloi::metal::ResidentAllocations> residency; };
         auto owner = std::make_shared<Lifetime>(Lifetime{table, residency});
         table = mlx_buffer_view(table.buffer(), table.shape(), uint64, owner);
         register_indirect_weight_pool(table, residency);

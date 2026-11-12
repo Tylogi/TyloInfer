@@ -2,7 +2,7 @@
 #include "mfq_container.h"
 #include "mlx_resource_telemetry.h"
 #include "mlx_streamed_weight_pool.h"
-#include "mlx_weight_residency.h"
+#include "engine/backends/metal/native/resident_allocations.h"
 #include "backends/cpu/native/host_parallel.h"
 
 #include <algorithm>
@@ -122,7 +122,7 @@ struct MlxExpertSegmentCache::Impl {
                 }
                 const std::vector<std::uint64_t> empty(layer.source.experts, 0);
                 layer.tables.emplace_back(empty.begin(), Shape{layer.source.experts}, uint64);
-                MlxWeightResidency::track(layer.tables.back());
+                tyloi::metal::ResidentAllocations::track(layer.tables.back());
             }
             long double layer_bytes = static_cast<long double>(layer.entry_bytes) * layer.source.experts;
             if (variable) {
@@ -447,7 +447,7 @@ MlxExpertSegmentCache::MlxExpertSegmentCache(const MfqContainer& model, std::vec
     std::size_t budget, int workers, bool prefill_read_ahead)
     : impl_(std::make_shared<Impl>(model, std::move(layers), budget, workers, prefill_read_ahead)) {}
 const std::vector<array>& MlxExpertSegmentCache::address_tables(std::size_t layer) const { return impl_->layers.at(layer).tables; }
-const std::shared_ptr<MlxWeightResidency>& MlxExpertSegmentCache::residency() const noexcept { return impl_->pool->residency(); }
+const std::shared_ptr<tyloi::metal::ResidentAllocations>& MlxExpertSegmentCache::residency() const noexcept { return impl_->pool->residency(); }
 void MlxExpertSegmentCache::set_prefill_next_rows(std::size_t layer, std::size_t rows) {
     std::lock_guard lock(impl_->mutex);
     impl_->prefill_next_rows.at(layer) = rows;

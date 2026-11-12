@@ -6,9 +6,10 @@
 #include <string>
 #include <vector>
 
+namespace tyloi::metal { class ResidentAllocations; }
+
 namespace mfq::metal {
 class MfqContainer;
-class MlxWeightResidency;
 
 struct MlxExpertSegment {
     std::string tensor;
@@ -37,7 +38,7 @@ public:
         const std::function<mlx::core::array(const mlx::core::array&, bool)>& second_stage,
         const mlx::core::array* parallel = nullptr);
     const std::vector<mlx::core::array>& address_tables(std::size_t layer) const;
-    const std::shared_ptr<MlxWeightResidency>& residency() const noexcept;
+    const std::shared_ptr<tyloi::metal::ResidentAllocations>& residency() const noexcept;
     void set_prefill_next_rows(std::size_t layer, std::size_t rows);
     std::size_t limit_bytes() const noexcept;
     std::size_t backing_bytes() const noexcept;

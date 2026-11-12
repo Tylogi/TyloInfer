@@ -2,7 +2,7 @@
 #include "mlx_gguf_rotation.h"
 #include "engine/backends/metal/native/kernel.h"
 #include "mfq_container.h"
-#include "mlx_weight_residency.h"
+#include "engine/backends/metal/native/resident_allocations.h"
 #include "nlohmann/json.hpp"
 
 #include <cmath>
@@ -61,7 +61,7 @@ void MlxGgufWeight::configure_hadamard(const MfqContainer& model, const std::str
     for (const auto value : pattern) if (value != -1.f && value != 1.f)
         throw std::invalid_argument("invalid GGUF Hadamard sign");
     auto signs = pattern.empty() ? array(1.f) : array(pattern.begin(), Shape{input_size()}, float32);
-    MlxWeightResidency::track(signs);
+    tyloi::metal::ResidentAllocations::track(signs);
     rotation_ = std::make_shared<MlxGgufRotation>(MlxGgufRotation{block, pattern, std::move(signs)});
 }
 

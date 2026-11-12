@@ -22,7 +22,7 @@
 #include "mlx_sparse_attention.h"
 #include "mlx_tensor.h"
 #include "mlx_kernel_prepare.h"
-#include "mlx_weight_residency.h"
+#include "engine/backends/metal/native/resident_allocations.h"
 #include "mlx_mtp_lora.h"
 #include "engine/config.h"
 #include "backends/cpu/storage/prefix_blocks.h"
@@ -820,8 +820,8 @@ private:
                         native_inject_.emplace(weight->dequantize(mlx::core::float32));
                     else native_inject_.emplace(injection_->affine_weight_ref()->dequantize(mlx::core::float32));
                 }
-                native_norm_->eval(); MlxWeightResidency::track(*native_norm_);
-                if (native_inject_) { native_inject_->eval(); MlxWeightResidency::track(*native_inject_); }
+                native_norm_->eval(); tyloi::metal::ResidentAllocations::track(*native_norm_);
+                if (native_inject_) { native_inject_->eval(); tyloi::metal::ResidentAllocations::track(*native_inject_); }
             }
         }
         if (auto* preparation = MlxKernelPreparation::current()) {
@@ -1614,7 +1614,7 @@ private:
             auto router_values = floating(router_, false), scalar_values = floating(shared_gate_, true);
             auto slots = mlx::core::arange(int(config_.num_experts), mlx::core::uint32);
             mlx::core::eval(router_values, scalar_values, slots);
-            MlxWeightResidency::track(router_values); MlxWeightResidency::track(scalar_values); MlxWeightResidency::track(slots);
+            tyloi::metal::ResidentAllocations::track(router_values); tyloi::metal::ResidentAllocations::track(scalar_values); tyloi::metal::ResidentAllocations::track(slots);
             native_moe_.emplace(MlxNativeGgufMoe{std::move(*native_routed), std::move(*shared),
                 std::move(router_values), std::move(scalar_values), std::move(slots), int(config_.num_experts_per_tok)});
         }

@@ -1,6 +1,6 @@
 #include "mlx_streamed_weight_pool.h"
 #include "mlx_pinned_pool_storage.h"
-#include "mlx_weight_residency.h"
+#include "engine/backends/metal/native/resident_allocations.h"
 #include "mlx_buffer_view.h"
 
 #include <mlx/allocator.h>
@@ -22,7 +22,7 @@ struct MlxStreamedWeightPool::Impl {
     };
     std::shared_ptr<detail::MlxPinnedPoolStorage> storage;
     std::vector<array> chunks;
-    std::shared_ptr<MlxWeightResidency> residency;
+    std::shared_ptr<tyloi::metal::ResidentAllocations> residency;
     std::map<std::size_t, std::size_t> free, occupied;
     std::size_t limit, chunk_bytes, capacity = 0, generation = 0;
 
@@ -87,7 +87,7 @@ struct MlxStreamedWeightPool::Impl {
             next.push_back(mlx_buffer_view(owner->value, Shape{int(length / 4096), 4096}, uint8, owner));
         }
         if (residency) residency->update_arrays(next, bytes);
-        else if (bytes) residency = MlxWeightResidency::retain_arrays(next, bytes, true);
+        else if (bytes) residency = tyloi::metal::ResidentAllocations::retain_arrays(next, bytes, true);
         chunks = std::move(next);
         if (!storage->pin_prefix(bytes) && storage->locked_bytes > bytes)
             throw std::runtime_error("cannot release streamed expert memory locks");
@@ -148,6 +148,6 @@ std::size_t MlxStreamedWeightPool::batch_capacity(std::size_t bytes) const noexc
     const auto overhead = (impl_->limit - 1) / impl_->chunk_bytes * (bytes - impl_->page);
     return overhead < impl_->limit ? (impl_->limit - overhead) / bytes : 0;
 }
-const std::shared_ptr<MlxWeightResidency>& MlxStreamedWeightPool::residency() const noexcept { return impl_->residency; }
+const std::shared_ptr<tyloi::metal::ResidentAllocations>& MlxStreamedWeightPool::residency() const noexcept { return impl_->residency; }
 
 } // namespace mfq::metal

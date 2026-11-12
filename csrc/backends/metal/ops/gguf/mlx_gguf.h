@@ -8,9 +8,10 @@
 #include <string_view>
 #include "mlx_expert_route_tiles.h"
 
+namespace tyloi::metal { class ResidentAllocations; }
+
 namespace mfq::metal {
 class MfqContainer;
-class MlxWeightResidency;
 class MlxGgufPrefillPlan;
 class MlxGgufStagedPrefill;
 struct MlxNativeGgufWeight;
@@ -34,16 +35,16 @@ public:
         std::span<const std::uint8_t> bytes, mlx::core::Shape shape);
     static MlxGgufWeight from_experts(std::string_view dtype, mlx::core::Shape shape,
         const std::vector<std::int32_t>& ids, const std::vector<mlx::core::array>& packed,
-        std::shared_ptr<MlxWeightResidency> residency = {});
+        std::shared_ptr<tyloi::metal::ResidentAllocations> residency = {});
     static MlxGgufWeight from_mixed_experts(mlx::core::Shape shape,
         const std::vector<std::int32_t>& ids, const std::vector<std::string>& dtypes,
         const std::vector<mlx::core::array>& packed,
-        std::shared_ptr<MlxWeightResidency> residency = {});
+        std::shared_ptr<tyloi::metal::ResidentAllocations> residency = {});
     static MlxGgufWeight from_address_table(std::string_view dtype, mlx::core::Shape shape,
-        mlx::core::array table, std::shared_ptr<MlxWeightResidency> residency);
+        mlx::core::array table, std::shared_ptr<tyloi::metal::ResidentAllocations> residency);
     static MlxGgufWeight from_mixed_address_table(mlx::core::Shape shape,
         const std::vector<std::string>& dtypes, mlx::core::array table,
-        std::shared_ptr<MlxWeightResidency> residency);
+        std::shared_ptr<tyloi::metal::ResidentAllocations> residency);
     mlx::core::array matmul(const mlx::core::array& input) const;
     mlx::core::array grouped_row_matmul(const mlx::core::array& input, int groups) const;
     mlx::core::array swiglu(const MlxGgufWeight& up, const mlx::core::array& input) const;

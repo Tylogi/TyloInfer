@@ -5,8 +5,9 @@
 #include <memory>
 #include <optional>
 
+namespace tyloi::metal { class ResidentAllocations; }
+
 namespace mfq::metal {
-class MlxWeightResidency;
 
 class MlxStreamedWeightPool {
 public:
@@ -24,7 +25,7 @@ public:
     std::size_t generation() const noexcept;
     std::size_t pinned_bytes() const noexcept;
     std::size_t batch_capacity(std::size_t entry_bytes) const noexcept;
-    const std::shared_ptr<MlxWeightResidency>& residency() const noexcept;
+    const std::shared_ptr<tyloi::metal::ResidentAllocations>& residency() const noexcept;
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

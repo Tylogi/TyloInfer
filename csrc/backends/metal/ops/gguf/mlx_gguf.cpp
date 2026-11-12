@@ -8,7 +8,7 @@
 
 #include "mfq_container.h"
 #include "gguf_embedded.h"
-#include "mlx_weight_residency.h"
+#include "engine/backends/metal/native/resident_allocations.h"
 #include "mlx_indirect_weight_residency.h"
 #include "mlx_buffer_view.h"
 #include "mlx_platform.h"
@@ -310,7 +310,7 @@ private:
     std::array<std::uint32_t, 7> params_;
     int format_; Dtype dtype_; int values_, lanes_; bool routed_, indirect_, grouped_;
     std::string key_;
-    std::shared_ptr<MlxWeightResidency> residency_;
+    std::shared_ptr<tyloi::metal::ResidentAllocations> residency_;
 };
 constexpr const char* swiglu_source = R"METAL(
 uint lane = thread_index_in_simdgroup;
@@ -596,7 +596,7 @@ private:
     int gate_format_, up_format_; Dtype dtype_; int lanes_, values_;
     bool indirect_gate_, indirect_up_, routed_, separate_input_, constant_iq2_, compact_iq3s_, signed_iq3_, independent_;
     std::string key_;
-    std::vector<std::shared_ptr<MlxWeightResidency>> owners_;
+    std::vector<std::shared_ptr<tyloi::metal::ResidentAllocations>> owners_;
 };
 const fast::CustomKernelFunction& embedding_kernel() {
     static const auto kernel = fast::metal_kernel("tinfer_gguf_embedding",
@@ -796,8 +796,8 @@ void MlxGgufWeight::prepare_grouped() {
     if (native_ || mixed_layout_ || rotation_ || !use_nax()) return;
     MlxGgufStagedPrefill::prepare(*this);
     if (planes_) {
-        MlxWeightResidency::track(bytes_);
-        for (const auto& plane : *planes_) MlxWeightResidency::track(plane);
+        tyloi::metal::ResidentAllocations::track(bytes_);
+        for (const auto& plane : *planes_) tyloi::metal::ResidentAllocations::track(plane);
     }
 }
 
@@ -821,13 +821,13 @@ MlxGgufWeight MlxGgufWeight::from_bytes(std::string_view dtype,
     std::memcpy(result.bytes_.data<std::uint8_t>(), bytes.data(), bytes.size());
     if (use_nax() && result.expert_count() <= 512)
         MlxGgufStagedPrefill::prepare(result);
-    MlxWeightResidency::track(result.bytes_);
-    if (result.planes_) for (const auto& plane : *result.planes_) MlxWeightResidency::track(plane);
+    tyloi::metal::ResidentAllocations::track(result.bytes_);
+    if (result.planes_) for (const auto& plane : *result.planes_) tyloi::metal::ResidentAllocations::track(plane);
     return result;
 }
 MlxGgufWeight MlxGgufWeight::from_experts(std::string_view dtype, Shape shape,
     const std::vector<std::int32_t>& ids, const std::vector<array>& packed,
-    std::shared_ptr<MlxWeightResidency> residency) {
+    std::shared_ptr<tyloi::metal::ResidentAllocations> residency) {
     if (shape.size() != 3 || shape[0] <= 0 || shape[1] <= 0 || ids.empty() || ids.size() != packed.size())
         throw std::invalid_argument("invalid GGUF resident expert table");
     const auto stride = gguf_packed_row_bytes(dtype, shape[2]);
@@ -845,11 +845,11 @@ MlxGgufWeight MlxGgufWeight::from_experts(std::string_view dtype, Shape shape,
     struct Lifetime {
         std::vector<array> experts;
         array table;
-        std::shared_ptr<MlxWeightResidency> residency;
+        std::shared_ptr<tyloi::metal::ResidentAllocations> residency;
     };
     auto lifetime = std::make_shared<Lifetime>(Lifetime{packed,
         array(addresses.begin(), Shape{shape[0]}, uint64),
-        residency ? std::move(residency) : MlxWeightResidency::retain_arrays(packed, allocated, true)});
+        residency ? std::move(residency) : tyloi::metal::ResidentAllocations::retain_arrays(packed, allocated, true)});
     auto table = mlx_buffer_view(lifetime->table.buffer(), lifetime->table.shape(), uint64, lifetime);
     register_indirect_weight_pool(table, lifetime->residency);
     const auto format = std::find_if(std::begin(formats), std::end(formats),
@@ -909,24 +909,24 @@ MlxGgufWeight MlxGgufWeight::load(const MfqContainer& model, const std::string& 
     if (native_projection && result.shape_.size() == 2 && supports_native(model, name)) {
         auto prepared = mlx_native_gguf_pack(result.bytes_, result.format_, result.output_size(), result.input_size(), result.row_bytes_);
         eval(std::vector<array>(prepared.planes.begin(), prepared.planes.end()));
-        for (const auto& plane : prepared.planes) MlxWeightResidency::track(plane);
+        for (const auto& plane : prepared.planes) tyloi::metal::ResidentAllocations::track(plane);
         result.native_ = std::make_shared<MlxNativeGgufWeight>(std::move(prepared));
     }
     if (!result.native_ && use_nax() && result.expert_count() <= 512)
         MlxGgufStagedPrefill::prepare(result);
-    MlxWeightResidency::track(result.bytes_);
-    if (result.planes_) for (const auto& plane : *result.planes_) MlxWeightResidency::track(plane);
+    tyloi::metal::ResidentAllocations::track(result.bytes_);
+    if (result.planes_) for (const auto& plane : *result.planes_) tyloi::metal::ResidentAllocations::track(plane);
     model.record_prepared(name);
     return result;
 }
 MlxGgufWeight MlxGgufWeight::from_address_table(std::string_view dtype, Shape shape,
-    array table, std::shared_ptr<MlxWeightResidency> residency) {
+    array table, std::shared_ptr<tyloi::metal::ResidentAllocations> residency) {
     if (shape.size() != 3 || shape[0] <= 0 || shape[1] <= 0 || table.dtype() != uint64 ||
         table.shape() != Shape{shape[0]} || !table.flags().row_contiguous || !residency)
         throw std::invalid_argument("invalid GGUF pooled expert address table");
     const auto stride = gguf_packed_row_bytes(dtype, shape[2]);
     table.eval();
-    struct Lifetime { array table; std::shared_ptr<MlxWeightResidency> residency; };
+    struct Lifetime { array table; std::shared_ptr<tyloi::metal::ResidentAllocations> residency; };
     auto owner = std::make_shared<Lifetime>(Lifetime{table, std::move(residency)});
     auto handle = mlx_buffer_view(table.buffer(), table.shape(), uint64, owner);
     register_indirect_weight_pool(handle, owner->residency);

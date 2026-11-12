@@ -5,7 +5,7 @@
 #include "mlx_kernel_prepare.h"
 #include "engine/backends/metal/native/kernel.h"
 #include "mlx_builtin_kernels.h"
-#include "mlx_weight_residency.h"
+#include "engine/backends/metal/native/resident_allocations.h"
 #include "mlx_nvq_decode.h"
 #include "mlx_resource_telemetry.h"
 #include "mlx_resident_budget.h"
@@ -2569,7 +2569,7 @@ array allocate_packed_array(std::size_t bytes, Dtype dtype) {
     const Shape shape = layout.is_matrix()
         ? Shape{layout.rows, layout.columns} : Shape{layout.columns};
     auto result = array(mlx::core::allocator::malloc(bytes), shape, dtype);
-    MlxWeightResidency::track(result);
+    tyloi::metal::ResidentAllocations::track(result);
     return result;
 }
 
@@ -2716,7 +2716,7 @@ public:
                 source != nullptr && source->dtype() == dtype) {
                 auto result = mlx::core::reshape(*source, shape);
                 result.eval();
-                MlxWeightResidency::track(result);
+                tyloi::metal::ResidentAllocations::track(result);
                 return result;
             }
         }
@@ -2754,7 +2754,7 @@ public:
             auto result = mlx::core::reshape(mlx::core::view(
                 mlx::core::concatenate(std::move(parts), 0, mlx::core::Device::gpu), dtype), shape);
             result.eval();
-            MlxWeightResidency::track(result);
+            tyloi::metal::ResidentAllocations::track(result);
             return result;
         }
         auto result = arena ? array(shape, dtype, nullptr, {}) : allocate_packed_array(bytes, dtype);
@@ -2891,7 +2891,7 @@ array make_int32_array(
         return result;
     }
     auto result = array(values.begin(), std::move(shape));
-    MlxWeightResidency::track(result);
+    tyloi::metal::ResidentAllocations::track(result);
     return result;
 }
 
