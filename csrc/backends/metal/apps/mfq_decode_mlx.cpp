@@ -1,3 +1,4 @@
+#include "engine/backends/metal/executor/executor.h"
 #include "engine/backends/metal/native/memory.h"
 #include "mfq_container.h"
 #include "mlx_deepseek_v4_causal_lm.h"
@@ -78,12 +79,13 @@ void release_allocator_caches() {
 }
 
 void release_model_load_staging_memory(
-    const std::shared_ptr<tyloi::metal::Stream>& runtime_stream) {
+    const std::shared_ptr<tyloi::metal::Executor>& runtime_executor) {
     // Model conversion and MFE repacking leave large, now-unused buffers in
     // both the MLX cache and macOS malloc's large-object depot. Keeping those
     // pages makes a single fully resident model look tens of GiB larger and
     // can force useful weights into swap before the first request.
-    tyloi::metal::drain(*runtime_stream);
+    auto execution_scope = runtime_executor->enter();
+    runtime_executor->drain();
     release_allocator_caches();
 }
 
@@ -1829,7 +1831,7 @@ public:
     LoadedMetalModel(std::shared_ptr<std::mutex> mutex,
         std::shared_ptr<std::optional<Runtime>> runtime,
         std::shared_ptr<Cache> cache, Loader loader, PagedCacheFactory factory,
-        std::shared_ptr<std::int64_t> context, std::shared_ptr<tyloi::metal::Stream> stream,
+        std::shared_ptr<std::int64_t> context, std::shared_ptr<tyloi::metal::Executor> executor,
         int chunk_size, std::size_t cache_limit,
         mfq::metal::MlxEngineComponents components,
         mfq::metal::MlxSamplingParams prepare_sampling, int prepare_routes, int prepare_vocab,
@@ -1837,7 +1839,7 @@ public:
         : runtime_mutex(std::move(mutex)), runtime_holder(std::move(runtime)),
           session_cache(std::move(cache)), load_runtime(std::move(loader)),
           paged_cache_factory(std::move(factory)), loaded_context(std::move(context)),
-          runtime_stream(stream), prefill_chunk_size(chunk_size),
+          runtime_executor(std::move(executor)), prefill_chunk_size(chunk_size),
           allocator_cache_limit(cache_limit), runtime_components(std::move(components)),
           preparation_sampling(prepare_sampling), preparation_routes(prepare_routes),
           preparation_vocab(prepare_vocab), warmup_prompt(std::move(prepare_prompt)),
@@ -1885,7 +1887,7 @@ public:
     void execute(const std::vector<mfq::engine::RequestId>& eligible) override {
         if (!batching || batching->empty() || eligible.empty()) return;
         std::lock_guard lock(*runtime_mutex);
-        tyloi::metal::StreamGuard stream_guard(*runtime_stream);
+        auto execution_scope = runtime_executor->enter();
         mfq::metal::MlxResidentBudgetScope budget_scope(
             [this](std::size_t bytes) { enforce_memory_budget(bytes); },
             [this](std::size_t bytes) { return optional_memory_fits(bytes); });
@@ -1897,7 +1899,7 @@ public:
         auto generation = batching->generate(id, input, output);
         mfq::engine::ExecutionCleanup cleanup{output.cleanup_failure, [&] {
             std::lock_guard lock(*runtime_mutex);
-            tyloi::metal::StreamGuard stream_guard(*runtime_stream);
+            auto execution_scope = runtime_executor->enter();
             mfq::metal::MlxResidentBudgetScope budget_scope(
                 [this](std::size_t bytes) { enforce_memory_budget(bytes); },
                 [this](std::size_t bytes) { return optional_memory_fits(bytes); });
@@ -1906,7 +1908,7 @@ public:
         while (true) {
             auto step = [&] {
                 std::lock_guard lock(*runtime_mutex);
-                tyloi::metal::StreamGuard stream_guard(*runtime_stream);
+                auto execution_scope = runtime_executor->enter();
                 mfq::metal::MlxResidentBudgetScope budget_scope(
                     [this](std::size_t bytes) { enforce_memory_budget(bytes); },
                     [this](std::size_t bytes) { return optional_memory_fits(bytes); });
@@ -1942,7 +1944,7 @@ public:
                     throw std::runtime_error(
                         "model runtime is unavailable after a failed reload");
                 }
-                tyloi::metal::StreamGuard stream_guard(*runtime_stream);
+                auto execution_scope = runtime_executor->enter();
                 mfq::metal::MlxSamplingParams parameters;
                 parameters.temperature = sampling.temperature;
                 parameters.top_k = sampling.top_k;
@@ -1972,7 +1974,7 @@ public:
                 enforce_memory_budget(0);
                 if (runtime_components.speculative_generate && !request.vision &&
                     runtime_components.speculative_generate(prompt, sampling, job, token_constraint, prefill_chunk_size)) {
-                    tyloi::metal::drain(*runtime_stream);
+                    runtime_executor->drain();
                     return;
                 }
                 if constexpr (requires { loaded_runtime.begin_mtp_session(std::string{}); })
@@ -2078,7 +2080,10 @@ public:
                 }
                 (void)generated;
             }
-            tyloi::metal::drain(*runtime_stream);
+            {
+                auto execution_scope = runtime_executor->enter();
+                runtime_executor->drain();
+            }
             if constexpr (requires(Runtime& value) { value.last_mtp_stats(); }) {
                 const auto& stats = runtime_holder->value().last_mtp_stats();
                 job.mtp = {stats.available, stats.used, stats.cycles,
@@ -2088,7 +2093,8 @@ public:
                     stats.standard_tokens, stats.park_count, stats.reentry_probes};
             }
         } catch (...) {
-            tyloi::metal::drain(*runtime_stream);
+            auto execution_scope = runtime_executor->enter();
+            runtime_executor->drain();
             throw;
         }
     }
@@ -2096,14 +2102,14 @@ public:
     std::int64_t reload(std::int64_t requested_context) override {
         std::lock_guard<std::mutex> lock(*runtime_mutex);
         batching.reset();
-        tyloi::metal::StreamGuard stream_guard(*runtime_stream);
-        tyloi::metal::drain(*runtime_stream);
+        auto execution_scope = runtime_executor->enter();
+        runtime_executor->drain();
 
         const auto previous_context = *loaded_context;
         session_cache->clear_live_sessions();
         weight_residency.reset();
         runtime_holder->reset();
-        release_model_load_staging_memory(runtime_stream);
+        release_model_load_staging_memory(runtime_executor);
         tyloi::metal::ResidentAllocations::begin_load();
         const auto started =
             std::chrono::steady_clock::now();
@@ -2132,7 +2138,7 @@ public:
                 cache_bytes_from_environment(
                     "TYLOINFER_SERVER_PREFIX_CACHE_HOT_BYTES",
                     2ULL * 1024ULL * 1024ULL * 1024ULL));
-            release_model_load_staging_memory(runtime_stream);
+            release_model_load_staging_memory(runtime_executor);
             capture_weight_residency();
             *loaded_context = requested_context;
             warm_runtime();
@@ -2154,7 +2160,7 @@ public:
             try {
                 weight_residency.reset();
                 runtime_holder->reset();
-                release_model_load_staging_memory(runtime_stream);
+                release_model_load_staging_memory(runtime_executor);
                 tyloi::metal::ResidentAllocations::begin_load();
                 mfq::metal::MlxKernelPreparation preparation(static_cast<int>(previous_context), prefill_chunk_size);
                 preparation.set_routes(preparation_routes);
@@ -2177,7 +2183,7 @@ public:
                     cache_bytes_from_environment(
                         "TYLOINFER_SERVER_PREFIX_CACHE_HOT_BYTES",
                         2ULL * 1024ULL * 1024ULL * 1024ULL));
-                release_model_load_staging_memory(runtime_stream);
+                release_model_load_staging_memory(runtime_executor);
                 capture_weight_residency();
                 *loaded_context = previous_context;
                 warm_runtime();
@@ -2218,6 +2224,7 @@ public:
             return {removed + session_cache->close_session(command.source), {}};
         }
         case Kind::memory_budget: {
+            auto execution_scope = runtime_executor->enter();
             const auto previous = resident_budget.load();
             const auto previous_weights = resident_weight_budget.load();
             const auto before = tyloi::metal::active_memory();
@@ -2237,8 +2244,8 @@ public:
         case Kind::refresh:
             return {session_cache->refresh_disk_index(), {}};
         case Kind::clear: {
-            tyloi::metal::StreamGuard stream_guard(*runtime_stream);
-            tyloi::metal::drain(*runtime_stream);
+            auto execution_scope = runtime_executor->enter();
+            runtime_executor->drain();
             const auto released = session_cache->clear();
             if (runtime_holder->has_value()) {
                 if constexpr (requires(Runtime& value) { value.clear_mtp_sessions(); })
@@ -2265,7 +2272,7 @@ public:
                 if constexpr (requires(Runtime& runtime, mlx::core::array ids) { runtime.score_forward(ids, false); }) {
                     std::lock_guard<std::mutex> lock(*runtime_mutex);
                     if (!runtime_holder->has_value()) throw std::runtime_error("model runtime is unavailable");
-                    tyloi::metal::StreamGuard stream_guard(*runtime_stream);
+                    auto execution_scope = runtime_executor->enter();
                     mfq::metal::MlxResidentBudgetScope budget_scope(
                         [this](std::size_t bytes) { enforce_memory_budget(bytes); },
                         [this](std::size_t bytes) { return optional_memory_fits(bytes); });
@@ -2342,7 +2349,7 @@ private:
             if (room == std::numeric_limits<std::size_t>::max())
                 room = runtime.ssd_expert_payload_bytes() ? runtime.ssd_expert_payload_bytes() : runtime.resident_full_expert_bytes();
             if (room != std::numeric_limits<std::size_t>::max()) {
-                tyloi::metal::drain(*runtime_stream);
+                runtime_executor->drain();
                 const auto active = tyloi::metal::active_memory();
                 const auto full = runtime.resident_full_expert_bytes();
                 runtime.set_expert_cache_limit(room);
@@ -2390,7 +2397,7 @@ private:
             throw mfq::metal::MlxResidentBudgetExceeded("resident memory budget cannot accommodate this allocation");
         const auto target = budget - allocation;
         if (used() <= target) return;
-        tyloi::metal::drain(*runtime_stream);
+        runtime_executor->drain();
         const auto clear_allocator_excess = [&] {
             if (tyloi::metal::cache_memory() > reserve) tyloi::metal::clear_cache();
         };
@@ -2796,7 +2803,7 @@ private:
                 if constexpr (requires { runtime.clear_cache(); }) runtime.clear_cache();
                 else runtime.reset();
             }
-            release_model_load_staging_memory(runtime_stream);
+            release_model_load_staging_memory(runtime_executor);
         };
         bool warmup_mtp = runtime_components.mtp_available;
         if constexpr (requires { runtime.supports_mtp(); })
@@ -2811,7 +2818,7 @@ private:
     Loader load_runtime;
     PagedCacheFactory paged_cache_factory;
     std::shared_ptr<std::int64_t> loaded_context;
-    std::shared_ptr<tyloi::metal::Stream> runtime_stream;
+    std::shared_ptr<tyloi::metal::Executor> runtime_executor;
     int prefill_chunk_size;
     std::size_t allocator_cache_limit;
     mfq::metal::MlxSamplingParams preparation_sampling;
@@ -2841,7 +2848,7 @@ auto make_runtime(
     std::string model_type,
     std::int64_t maximum_context,
     std::int64_t vocabulary_size,
-    std::shared_ptr<tyloi::metal::Stream> runtime_stream) {
+    std::shared_ptr<tyloi::metal::Executor> runtime_executor) {
     container.stop_load_observation();
     std::cerr << "mfq_load_progress stage=finalizing" << std::endl;
     constexpr const char* tokenizer_asset =
@@ -2850,7 +2857,7 @@ auto make_runtime(
             value.prewarm_ssd_expert_arena();
         }) {
         model.prewarm_ssd_expert_arena();
-        release_model_load_staging_memory(runtime_stream);
+        release_model_load_staging_memory(runtime_executor);
     }
     int prefill_chunk_size = arguments.prefill_chunk_size;
     if (!arguments.prefill_chunk_size_explicit &&
@@ -2945,7 +2952,7 @@ auto make_runtime(
         &model_graph,
         runtime_mutex,
         runtime_holder,
-        runtime_stream);
+        runtime_executor);
     if (!arguments.dflash2_draft.empty()) {
         if constexpr (std::is_same_v<Runtime, mfq::metal::MlxQwen4CausalLm> ||
             std::is_same_v<Runtime, mfq::metal::MlxQwen35CausalLm>) {
@@ -3010,7 +3017,7 @@ auto make_runtime(
     };
     auto engine_model = std::make_unique<LoadedMetalModel<Runtime, decltype(reload_runtime)>>(
         runtime_mutex, runtime_holder, session_cache, std::move(reload_runtime),
-        paged_cache_factory, loaded_context, runtime_stream, prefill_chunk_size,
+        paged_cache_factory, loaded_context, runtime_executor, prefill_chunk_size,
         allocator_cache_limit, std::move(runtime_components), preparation_sampling,
         preparation_routes, static_cast<int>(vocabulary_size),
         text->tokenizer().tokenize("Explain how computers use memory to run language models. "
@@ -3040,9 +3047,10 @@ auto load_runtime(
             "pass --tokenizer PATH");
     }
 
-    const auto runtime_stream = std::make_shared<tyloi::metal::Stream>(
-        mlx::core::new_thread_unsafe_stream(mlx::core::Device::gpu));
-    tyloi::metal::StreamGuard stream_guard(*runtime_stream);
+    const auto runtime_executor = std::make_shared<tyloi::metal::Executor>(
+        std::make_shared<tyloi::metal::Stream>(
+            mlx::core::new_thread_unsafe_stream(mlx::core::Device::gpu)));
+    auto execution_scope = runtime_executor->enter();
     mfq::metal::MlxKernelPreparation preparation(static_cast<int>(arguments.context_size),
         arguments.prefill_chunk_size);
     const auto started =
@@ -3074,7 +3082,7 @@ auto load_runtime(
         auto runtime =
             mfq::metal::MlxDeepseekV41CausalLm::load(
                 container, context, expert_cache_bytes);
-        release_model_load_staging_memory(runtime_stream);
+        release_model_load_staging_memory(runtime_executor);
         const auto load_seconds =
             std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - started).count();
@@ -3110,7 +3118,7 @@ auto load_runtime(
                 : config.text_model_type,
             config.max_position_embeddings,
             config.vocab,
-            runtime_stream);
+            runtime_executor);
     }
     if (backbone == "deepseek_v4") {
         const auto config =
@@ -3136,7 +3144,7 @@ auto load_runtime(
                 container,
                 context,
                 expert_cache_bytes);
-        release_model_load_staging_memory(runtime_stream);
+        release_model_load_staging_memory(runtime_executor);
         const auto load_seconds =
             std::chrono::duration<double>(
                 std::chrono::steady_clock::now() -
@@ -3179,7 +3187,7 @@ auto load_runtime(
                 : config.model_type,
             config.max_position_embeddings,
             config.vocab,
-            runtime_stream);
+            runtime_executor);
     }
 
     if (backbone == "nemotron_h") {
@@ -3192,7 +3200,7 @@ auto load_runtime(
             << "Loading native C++/MLX Nemotron-H model on Apple GPU..."
             << std::endl;
         auto runtime = mfq::metal::MlxNemotronHCausalLm::load(container, context);
-        release_model_load_staging_memory(runtime_stream);
+        release_model_load_staging_memory(runtime_executor);
         const auto load_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - started).count();
         std::cout
@@ -3222,7 +3230,7 @@ auto load_runtime(
                                   : config.model_type,
             config.max_position_embeddings,
             config.vocab_size,
-            runtime_stream);
+            runtime_executor);
     }
 
     if (backbone == "minicpmo45") {
@@ -3235,7 +3243,7 @@ auto load_runtime(
                 container,
                 arguments.context_size,
                 arguments.server);
-        release_model_load_staging_memory(runtime_stream);
+        release_model_load_staging_memory(runtime_executor);
         tyloi::metal::set_cache_limit(kMinicpmoDuplexCacheLimitBytes);
         const auto load_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - started).count();
@@ -3263,7 +3271,7 @@ auto load_runtime(
             "minicpmo",
             maximum_context,
             vocabulary,
-            runtime_stream);
+            runtime_executor);
     }
 
     if (backbone == "qwen4_exp") {
@@ -3290,7 +3298,7 @@ auto load_runtime(
         auto runtime =
             mfq::metal::MlxQwen4CausalLm::load(
                 container, context, expert_cache_bytes);
-        release_model_load_staging_memory(runtime_stream);
+        release_model_load_staging_memory(runtime_executor);
         const auto load_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - started).count();
         std::cout
@@ -3325,7 +3333,7 @@ auto load_runtime(
                 : config.text_model_type,
             extended_context,
             config.vocab_size,
-            runtime_stream);
+            runtime_executor);
     }
 
     if (backbone != "qwen3_5") {
@@ -3346,7 +3354,7 @@ auto load_runtime(
         << std::endl;
     auto runtime =
         mfq::metal::MlxQwen35CausalLm::load(container, context);
-    release_model_load_staging_memory(runtime_stream);
+    release_model_load_staging_memory(runtime_executor);
     const auto load_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - started).count();
     std::cout
@@ -3370,7 +3378,7 @@ auto load_runtime(
             : config.text_model_type,
         extended_context,
         config.vocab_size,
-        runtime_stream);
+        runtime_executor);
 }
 #endif
 

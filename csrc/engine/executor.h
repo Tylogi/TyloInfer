@@ -4,6 +4,7 @@
 
 #include <memory>
 #include <chrono>
+#include <initializer_list>
 #include <map>
 #include <span>
 #include <string>
@@ -33,6 +34,8 @@ public:
     public:
         virtual ~Timer() = default;
         virtual void stop() = 0;
+        // Lazy backends evaluate these results at the timing boundary.
+        virtual void stop(std::initializer_list<Tensor>) { stop(); }
         virtual double elapsed_ms() const = 0;
     };
 
@@ -41,6 +44,7 @@ public:
     public:
         virtual ~Profile() = default;
         virtual void finish() = 0;
+        virtual void finish(std::initializer_list<Tensor>) { finish(); }
     };
 
     // The parent Executor outlives Graph; do not keep its Scope across suspension.

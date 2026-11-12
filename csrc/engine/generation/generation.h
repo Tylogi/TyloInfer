@@ -37,7 +37,9 @@ Generation generate_prepared(Operations operations, State &state, tyloi::Executo
             {
                 auto timer = executor.timer();
                 step = preparation.next();
-                timer->stop();
+                if (step.value)
+                    timer->stop({step.value->embeddings, step.value->positions, step.value->image_mask});
+                else timer->stop();
                 output.metrics.multimodal_ms += timer->elapsed_ms();
             }
             if (step.value) {

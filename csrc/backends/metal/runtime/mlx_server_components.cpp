@@ -1,3 +1,4 @@
+#include "engine/backends/metal/executor/executor.h"
 #include "engine/backends/metal/native/memory.h"
 #include "mlx_server_components.h"
 #include "engine/backends/metal/native/stream.h"
@@ -84,7 +85,7 @@ static MlxEngineComponents make_grid_vision_engine_components(
     const tyloi::ModelGraph* graph,
     std::shared_ptr<std::mutex> runtime_mutex,
     std::shared_ptr<std::optional<Runtime>> runtime_holder,
-    std::shared_ptr<tyloi::metal::Stream> runtime_stream,
+    std::shared_ptr<tyloi::metal::Executor> runtime_executor,
     std::string_view vision_implementation = "grid_vit") {
     MlxEngineComponents result;
     result.mtp_available =
@@ -99,7 +100,7 @@ static MlxEngineComponents make_grid_vision_engine_components(
     }
     result.multimodal_generate =
         [runtime_mutex = std::move(runtime_mutex),
-         runtime_holder = std::move(runtime_holder), runtime_stream](
+         runtime_holder = std::move(runtime_holder), runtime_executor](
             const std::vector<std::int64_t>& prompt,
             const MfqMultimodalInput& media,
             const MfqSamplingParams& sampling,
@@ -136,7 +137,7 @@ static MlxEngineComponents make_grid_vision_engine_components(
             input.image_grids = grid_shapes(media.image_grid);
             input.video_grids = grid_shapes(media.video_grid);
 
-            tyloi::metal::StreamGuard stream_scope(*runtime_stream);
+            auto execution_scope = runtime_executor->enter();
             const auto component_started =
                 std::chrono::steady_clock::now();
             auto prepared = runtime.prepare_multimodal_prompt(prompt, input);
@@ -145,7 +146,7 @@ static MlxEngineComponents make_grid_vision_engine_components(
                     "multimodal component did not produce embeddings");
             }
             tyloi::metal::eval(*prepared.embeddings);
-            tyloi::metal::wait(*runtime_stream);
+            tyloi::metal::wait(runtime_executor->stream());
             const auto component_ms =
                 std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - component_started)
@@ -175,23 +176,23 @@ MlxEngineComponents make_mlx_engine_components(
     const tyloi::ModelGraph* graph,
     std::shared_ptr<std::mutex> runtime_mutex,
     std::shared_ptr<std::optional<MlxQwen35CausalLm>> runtime_holder,
-    std::shared_ptr<tyloi::metal::Stream> runtime_stream) {
+    std::shared_ptr<tyloi::metal::Executor> runtime_executor) {
     return make_grid_vision_engine_components(graph, std::move(runtime_mutex),
-        std::move(runtime_holder), runtime_stream);
+        std::move(runtime_holder), runtime_executor);
 }
 
 MlxEngineComponents make_mlx_engine_components(
     const tyloi::ModelGraph* graph,
     std::shared_ptr<std::mutex> runtime_mutex,
     std::shared_ptr<std::optional<MlxNemotronHCausalLm>> runtime_holder,
-    std::shared_ptr<tyloi::metal::Stream> runtime_stream) {
+    std::shared_ptr<tyloi::metal::Executor> runtime_executor) {
     // RADIO is the only vision implementation this backbone declares; the
     // grid-vision adapter already owns the media payload conversion.
     return make_grid_vision_engine_components(
         graph,
         std::move(runtime_mutex),
         std::move(runtime_holder),
-        runtime_stream,
+        runtime_executor,
         "radio");
 }
 
@@ -199,12 +200,12 @@ MlxEngineComponents make_mlx_engine_components(
     const tyloi::ModelGraph* graph,
     std::shared_ptr<std::mutex> runtime_mutex,
     std::shared_ptr<std::optional<MlxMiniCPMO45Runtime>> runtime_holder,
-    std::shared_ptr<tyloi::metal::Stream> runtime_stream) {
+    std::shared_ptr<tyloi::metal::Executor> runtime_executor) {
     MlxEngineComponents result;
     if (component_with_implementation(
             graph, "vision", "minicpmo45_vision") != nullptr) {
         result.multimodal_generate =
-            [runtime_mutex, runtime_holder, runtime_stream](
+            [runtime_mutex, runtime_holder, runtime_executor](
                 const std::vector<std::int64_t>& prompt,
                 const MfqMultimodalInput& media,
                 const MfqSamplingParams& sampling,
@@ -226,7 +227,7 @@ MlxEngineComponents make_mlx_engine_components(
                     throw std::invalid_argument(
                         "MiniCPM-o media bounds are invalid");
                 }
-                tyloi::metal::StreamGuard stream_scope(*runtime_stream);
+                auto execution_scope = runtime_executor->enter();
 
                 std::vector<std::int32_t> prompt_ids;
                 prompt_ids.reserve(prompt.size());
@@ -329,7 +330,7 @@ MlxEngineComponents make_mlx_engine_components(
         return result;
     }
     result.duplex.start =
-        [runtime_mutex, runtime_holder, runtime_stream](
+        [runtime_mutex, runtime_holder, runtime_executor](
             const MfqDuplexSessionParams& parameters) {
             if (parameters.special_ids.size() != 15) {
                 throw std::invalid_argument(
@@ -340,9 +341,9 @@ MlxEngineComponents make_mlx_engine_components(
                 throw std::runtime_error(
                     "MiniCPM-o runtime is unavailable");
             }
-            tyloi::metal::StreamGuard stream_scope(*runtime_stream);
+            auto execution_scope = runtime_executor->enter();
             auto& runtime = runtime_holder->value();
-            tyloi::metal::drain(*runtime_stream);
+            runtime_executor->drain();
             runtime.reset();
             tyloi::metal::clear_cache();
 
@@ -416,10 +417,10 @@ MlxEngineComponents make_mlx_engine_components(
                 system_prefix_ids,
                 reference_features,
                 system_suffix_ids);
-            tyloi::metal::wait(*runtime_stream);
+            tyloi::metal::wait(runtime_executor->stream());
         };
     result.duplex.step =
-        [runtime_mutex, runtime_holder, runtime_stream](
+        [runtime_mutex, runtime_holder, runtime_executor](
             const MfqDuplexStepInput& input) {
             const bool has_audio = input.audio_frames > 0;
             const bool has_text = !input.text_tokens.empty();
@@ -438,7 +439,7 @@ MlxEngineComponents make_mlx_engine_components(
                 throw std::runtime_error(
                     "MiniCPM-o runtime is unavailable");
             }
-            tyloi::metal::StreamGuard stream_scope(*runtime_stream);
+            auto execution_scope = runtime_executor->enter();
             auto& runtime = runtime_holder->value();
             if (!runtime.duplex_prepared()) {
                 throw std::runtime_error(
@@ -471,7 +472,7 @@ MlxEngineComponents make_mlx_engine_components(
             auto generated = runtime.duplex_step(inputs);
             tyloi::metal::eval(generated.generated_ids);
             tyloi::metal::eval(generated.tts_codes);
-            tyloi::metal::wait(*runtime_stream);
+            tyloi::metal::wait(runtime_executor->stream());
 
             MfqDuplexStepResult response;
             const auto* generated_ids =
@@ -498,11 +499,11 @@ MlxEngineComponents make_mlx_engine_components(
         };
     result.duplex.stop =
         [runtime_mutex = std::move(runtime_mutex),
-         runtime_holder = std::move(runtime_holder), runtime_stream]() {
+         runtime_holder = std::move(runtime_holder), runtime_executor]() {
             std::lock_guard<std::mutex> lock(*runtime_mutex);
             if (!runtime_holder->has_value()) return;
-            tyloi::metal::StreamGuard stream_scope(*runtime_stream);
-            tyloi::metal::drain(*runtime_stream);
+            auto execution_scope = runtime_executor->enter();
+            runtime_executor->drain();
             runtime_holder->value().reset();
             tyloi::metal::clear_cache();
             malloc_zone_pressure_relief(nullptr, 0);
@@ -514,7 +515,7 @@ MlxEngineComponents make_mlx_engine_components(
     const tyloi::ModelGraph* graph,
     std::shared_ptr<std::mutex> runtime_mutex,
     std::shared_ptr<std::optional<MlxDeepseekV4CausalLm>> runtime_holder,
-    std::shared_ptr<tyloi::metal::Stream> runtime_stream) {
+    std::shared_ptr<tyloi::metal::Executor> runtime_executor) {
     MlxEngineComponents result;
     const bool legacy_hf = graph == nullptr;
     result.mtp_available =
@@ -529,7 +530,7 @@ MlxEngineComponents make_mlx_engine_components(
     }
     result.multimodal_generate =
         [runtime_mutex = std::move(runtime_mutex),
-         runtime_holder = std::move(runtime_holder), runtime_stream](
+         runtime_holder = std::move(runtime_holder), runtime_executor](
             const std::vector<std::int64_t>& prompt,
             const MfqMultimodalInput& media,
             const MfqSamplingParams& sampling,
@@ -546,7 +547,7 @@ MlxEngineComponents make_mlx_engine_components(
                 throw std::invalid_argument(
                     "DeepSeek-V4 received a foreign multimodal payload");
             }
-            tyloi::metal::StreamGuard stream_scope(*runtime_stream);
+            auto execution_scope = runtime_executor->enter();
             const auto& config = runtime_holder->value().config();
             const auto pixel_shape = checked_shape(
                 media.pixel_shape, "pixel_values");
@@ -710,7 +711,7 @@ MlxEngineComponents make_mlx_engine_components(
     const tyloi::ModelGraph* graph,
     std::shared_ptr<std::mutex> runtime_mutex,
     std::shared_ptr<std::optional<MlxDeepseekV41CausalLm>> runtime_holder,
-    std::shared_ptr<tyloi::metal::Stream> runtime_stream) {
+    std::shared_ptr<tyloi::metal::Executor> runtime_executor) {
     MlxEngineComponents result;
     result.mtp_available =
         component_declared(graph, "predictor") &&
@@ -724,7 +725,7 @@ MlxEngineComponents make_mlx_engine_components(
     }
     result.multimodal_generate =
         [runtime_mutex = std::move(runtime_mutex),
-         runtime_holder = std::move(runtime_holder), runtime_stream](
+         runtime_holder = std::move(runtime_holder), runtime_executor](
             const std::vector<std::int64_t>& prompt,
             const MfqMultimodalInput& media,
             const MfqSamplingParams& sampling,
@@ -737,7 +738,7 @@ MlxEngineComponents make_mlx_engine_components(
                 throw std::runtime_error(
                     "DeepSeek-V4.1 runtime is unavailable after a failed reload");
             }
-            tyloi::metal::StreamGuard stream_scope(*runtime_stream);
+            auto execution_scope = runtime_executor->enter();
             const auto images = prepare_deepseek_v41_images(prompt, media, runtime_holder->value().config());
             std::function<void(std::size_t, double)> report_prefill;
             {
@@ -763,9 +764,9 @@ MlxEngineComponents make_mlx_engine_components(
     const tyloi::ModelGraph* graph,
     std::shared_ptr<std::mutex> runtime_mutex,
     std::shared_ptr<std::optional<MlxQwen4CausalLm>> runtime_holder,
-    std::shared_ptr<tyloi::metal::Stream> runtime_stream) {
+    std::shared_ptr<tyloi::metal::Executor> runtime_executor) {
     return make_grid_vision_engine_components(graph, std::move(runtime_mutex),
-        std::move(runtime_holder), runtime_stream);
+        std::move(runtime_holder), runtime_executor);
 }
 
 } // namespace mfq::metal

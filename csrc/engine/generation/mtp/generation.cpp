@@ -154,7 +154,7 @@ struct MtpOps {
             input.raw_hidden = &raw; input.advance = true;
             hidden = forward(std::move(input));
         } else hidden = target_forward(std::move(ids), &raw);
-        timer->stop();
+        timer->stop({hidden, raw});
         return {std::move(hidden), std::move(raw), timer->elapsed_ms()};
     }
     Tensor ids_for(std::vector<int64_t> tokens) {
@@ -193,8 +193,8 @@ struct MtpOps {
     double predictor_prefill(Tensor hidden, Tensor ids, Tensor positions) {
         auto timer = executor.timer();
         hidden = ops::copy(hidden, device);
-        (void)predictor_step(std::move(hidden), std::move(ids), std::move(positions));
-        timer->stop();
+        const auto result = predictor_step(std::move(hidden), std::move(ids), std::move(positions));
+        timer->stop({result.sample_hidden, result.chain_hidden, result.sample_logits});
         return timer->elapsed_ms();
     }
     void trace_prompt_prefill(double target_ms, double predictor_ms, double workspace_ms) const {

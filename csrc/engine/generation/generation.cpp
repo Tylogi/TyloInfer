@@ -67,7 +67,7 @@ struct Plain {
         if (model_input.positions) model_input.positions = ops::contiguous(model_input.positions);
         auto hidden = model.forward(std::move(model_input), state, forward_options);
         if (prepared && prepared->transformed()) state.set_position_delta(prepared->decode_position_delta);
-        timer->stop();
+        timer->stop({hidden});
         if (!output.stopped() && chunk.offset + chunk.count == int64_t(input.prompt.size()))
             pending = sample_logits(sampler, project(hidden, true), graph.counts, input.token_constraint);
         const auto ms = timer->elapsed_ms();
@@ -99,7 +99,7 @@ struct Plain {
             pending = sample_logits(sampler,
                 project(hidden, !(sampler.greedy() && !penalties && !input.token_constraint)),
                 graph.counts, input.token_constraint);
-            if (profile) profile->finish();
+            if (profile) profile->finish({pending});
             return ops::item(pending);
         }
         auto scope = graph.graph->enter();

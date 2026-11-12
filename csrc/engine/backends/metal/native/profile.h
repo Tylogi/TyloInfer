@@ -13,6 +13,11 @@
 
 namespace tyloi::metal {
 
+// Host wall time includes explicit evaluation and completion waits.
+std::unique_ptr<tyloi::Executor::Timer> timer(std::shared_ptr<Stream> stream);
+std::unique_ptr<tyloi::Executor::Profile> profile(
+    std::shared_ptr<Stream> stream, const char* name);
+
 inline bool component_profile_requested() noexcept {
     static const bool requested = [] {
         const char* value =

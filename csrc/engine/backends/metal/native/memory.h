@@ -29,6 +29,14 @@ struct PackedLayout {
 
 PackedLayout packed_layout(std::size_t elements);
 
+// MLX's process-wide limit is a guideline, not a reservation of physical RAM.
+struct Memory {
+    std::size_t active, cache, wired, limit, available, total;
+};
+
+Memory memory();
+std::size_t memory_limit();
+void set_memory_limit(std::size_t bytes);
 bool residency_available();
 std::size_t active_memory();
 std::size_t cache_memory();

@@ -17,7 +17,7 @@
 
 #include <mlx/mlx.h>
 
-namespace tyloi::metal { class Stream; }
+namespace tyloi::metal { class Executor; }
 
 namespace mfq::metal {
 
@@ -48,36 +48,36 @@ MlxEngineComponents make_mlx_engine_components(
     const tyloi::ModelGraph* graph,
     std::shared_ptr<std::mutex> runtime_mutex,
     std::shared_ptr<std::optional<MlxQwen35CausalLm>> runtime,
-    std::shared_ptr<tyloi::metal::Stream> runtime_stream);
+    std::shared_ptr<tyloi::metal::Executor> runtime_executor);
 
 MlxEngineComponents make_mlx_engine_components(
     const tyloi::ModelGraph* graph,
     std::shared_ptr<std::mutex> runtime_mutex,
     std::shared_ptr<std::optional<MlxMiniCPMO45Runtime>> runtime,
-    std::shared_ptr<tyloi::metal::Stream> runtime_stream);
+    std::shared_ptr<tyloi::metal::Executor> runtime_executor);
 
 MlxEngineComponents make_mlx_engine_components(
     const tyloi::ModelGraph* graph,
     std::shared_ptr<std::mutex> runtime_mutex,
     std::shared_ptr<std::optional<MlxDeepseekV4CausalLm>> runtime,
-    std::shared_ptr<tyloi::metal::Stream> runtime_stream);
+    std::shared_ptr<tyloi::metal::Executor> runtime_executor);
 
 MlxEngineComponents make_mlx_engine_components(
     const tyloi::ModelGraph* graph,
     std::shared_ptr<std::mutex> runtime_mutex,
     std::shared_ptr<std::optional<MlxDeepseekV41CausalLm>> runtime,
-    std::shared_ptr<tyloi::metal::Stream> runtime_stream);
+    std::shared_ptr<tyloi::metal::Executor> runtime_executor);
 
 MlxEngineComponents make_mlx_engine_components(
     const tyloi::ModelGraph* graph,
     std::shared_ptr<std::mutex> runtime_mutex,
     std::shared_ptr<std::optional<MlxQwen4CausalLm>> runtime,
-    std::shared_ptr<tyloi::metal::Stream> runtime_stream);
+    std::shared_ptr<tyloi::metal::Executor> runtime_executor);
 
 MlxEngineComponents make_mlx_engine_components(
     const tyloi::ModelGraph* graph,
     std::shared_ptr<std::mutex> runtime_mutex,
     std::shared_ptr<std::optional<MlxNemotronHCausalLm>> runtime,
-    std::shared_ptr<tyloi::metal::Stream> runtime_stream);
+    std::shared_ptr<tyloi::metal::Executor> runtime_executor);
 
 } // namespace mfq::metal

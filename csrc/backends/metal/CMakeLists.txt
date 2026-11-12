@@ -334,9 +334,11 @@ configure_file(kernels/mlx/mlx_affine_nax.h.in mlx_affine_nax.h @ONLY)
 
 add_library(mfq-metal-runtime STATIC
     ${PROJECT_SOURCE_DIR}/engine/backends/metal/native/stream.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/metal/native/profile.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/metal/native/memory.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/metal/native/resident_allocations.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/metal/native/tensor/tensor.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/metal/executor/executor.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/metal/ops/tensor.cpp
     storage/hf_safetensors_store.cpp
     storage/mfq_container.cpp
