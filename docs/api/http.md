@@ -1,8 +1,8 @@
-# MFQ Server HTTP API
+# TyloInfer Server HTTP API
 
-MFQ Server provides a persistent HTTP API for TyloInfer, scripts, and SDKs.
+TyloInfer Server provides a persistent HTTP API for TyloInfer, scripts, and SDKs.
 The machine-readable contract is
-[`mfq/server/protocol/openapi.json`](../../tyloinfer/server/protocol/openapi.json); it
+[`tyloinfer/server/protocol/openapi.json`](../../tyloinfer/server/protocol/openapi.json); it
 defines all fields, constraints, and response schemas.
 
 Default server address:
@@ -12,8 +12,10 @@ http://127.0.0.1:8090
 ```
 
 The versioned API root is `http://127.0.0.1:8090/api/v1`. The current OpenAPI
-contract contains 88 HTTP paths and 112 operations. The unversioned `/health`
-endpoint and the compatibility endpoints under `/v1` are not part of OpenAPI.
+contract is the source of truth for the endpoint inventory; use the schema
+from the same checkout as the server rather than a fixed path/operation count.
+The unversioned `/health` endpoint and compatibility endpoints under `/v1`
+are not part of OpenAPI.
 
 The running server exposes Swagger and the live schema at:
 
@@ -217,6 +219,10 @@ jobs.
 | `PUT` | `/api/v1/hub/download-directory` | `ConfigureDownloadDirectoryRequest` | `200 Object` |
 | `POST` | `/api/v1/hub/download-sources/probe` | `HubDownloadProbeRequest` | `200 Object` |
 | `POST` | `/api/v1/models/directories/open` | `OpenModelDirectoryRequest` | `200 OpenModelDirectoryResult` |
+| `GET` | `/api/v1/hub/models/{provider}/{owner}/{name}/readme` | — | `200 Object` |
+| `POST` | `/api/v1/hub/download-reuse` | `HubDownloadReuseRequest` | `200 HubDownloadReuseResponse` |
+| `GET` | `/api/v1/models/{model_id}/deletion` | — | `200 ModelDeletionPlan` |
+| `POST` | `/api/v1/models/{model_id}/delete` | `DeleteModelRequest` | `200 Object` |
 | `GET` | `/api/v1/models/{model_id}/analysis` | — | `200 CheckpointAnalysis` |
 | `GET` | `/api/v1/models/{model_id}/cache-profile` | — | `200 ModelCacheProfile` or `200 null` |
 | `GET` | `/api/v1/models/{model_id}/directory` | — | `200 ModelDirectoryList` |
@@ -265,6 +271,7 @@ by environment-variable name and are not persisted as plaintext values.
 | `PATCH` | `/api/v1/runtime/instances/{instance_id}` | `UpdateRuntimeInstanceRequest` | `200 RuntimeInstanceResource` |
 | `GET` | `/api/v1/runtime/logs` | — | `200 RuntimeLogList` |
 | `GET` | `/api/v1/runtime/metrics` | — | `200 RuntimeMetricList` |
+| `GET` | `/api/v1/runtime/serving` | — | `200 Object` |
 | `GET` | `/api/v1/runtime/models` | — | `200 Object` |
 | `GET` | `/api/v1/runtime/profiles` | — | `200 RuntimeProfileList` |
 | `POST` | `/api/v1/runtime/profiles` | `CreateRuntimeProfileRequest` | `201 RuntimeProfileResource` |

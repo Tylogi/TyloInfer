@@ -1,18 +1,19 @@
 # Self-contained releases
 
-MFQ desktop releases support macOS and Windows. Build scripts live in
+TyloInfer Studio desktop releases support macOS and Windows. Build scripts live in
 `packaging/` and write artifacts to `packaging/dist/`.
 
 The packages include the server, Python environment, native runtime, and
-required runtime libraries. `mfq serve` or TyloInfer manages the native
+required runtime libraries. `tyloinfer serve` or TyloInfer manages the native
 sidecars.
 
 ## macOS
 
-The macOS release packages the `mfq` service CLI and TyloInfer into an
-Apple Silicon DMG. It includes:
+The macOS release packages the TyloInfer service CLI and Studio into an
+Apple Silicon DMG. The frozen CLI is named `tyloinfer-cli` inside the bundle;
+source checkouts use the public `tyloinfer` command. It includes:
 
-- the unified `mfq` CLI with service and model management;
+- the unified service CLI with service and model management;
 - the private native `mfq-decode-metal` sidecar;
 - `libmlx`, `libjaccl`, `mlx.metallib`, and the AVFoundation video bridge;
 - TyloInfer and its production Web UI, without PyTorch.
@@ -30,8 +31,8 @@ code signatures, then copies the DMG to `packaging/dist/`.
 
 ## Windows
 
-The Windows release packages `mfq serve`, TyloInfer, and the native CUDA
-`mfq-runtime` sidecar into a single x64 NSIS installer. Service and model management are included. The package
+The Windows release packages the service CLI (`tyloinfer-cli.exe`), Studio,
+and the native CUDA `mfq-runtime` sidecar into a single x64 NSIS installer. Service and model management are included. The package
 excludes PyTorch and the training, calibration, quantization, and MiniCPM-o
 dependency groups. The CUDA, cuBLAS, MSVC, and optional OpenMP runtime DLLs are
 bundled with the sidecar, so end users do not need Python, the CUDA Toolkit, or a
@@ -57,7 +58,9 @@ CUDA Toolkit.
 
 ## Runtime behavior
 
-TyloInfer starts `mfq serve` locally without a model. The catalog and native
-file picker can load, unload, or replace `.mfq` models. Studio records external
+Studio starts the bundled CLI's `serve` subcommand locally without a model. The catalog and native
+file picker can load, unload, or replace GGUF and TQ models (`.mfq` is also
+recognized). Architecture and tensor-format coverage still follows the
+[runtime support matrix](runtime/support.md). Studio records external
 paths without copying files; selecting one shard registers the full sibling
 shard family.

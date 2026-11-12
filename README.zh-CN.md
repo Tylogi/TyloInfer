@@ -23,6 +23,8 @@ Apple Silicon 使用 Metal；NVIDIA GPU 支持 Linux 和 Windows 下的 CUDA。R
 
 ## 推理性能
 
+以下为此前报告的测量值，并非本轮文档更新重新验证的结果，也不保证在你的硬件上达到相同速度。目前表格尚未关联完整复现记录：准确的 TyloInfer 提交版本、模型及配套权重版本、命令、原始日志、重复次数与统计方式。不要将其视为当前代码版本的实测结果或各引擎的普遍排名。配置及证据记录要求见[性能测量指南](docs/benchmarking.md)，包括 MTP/DFlash2 设置和前缀缓存冷／热状态。
+
 Apple M5 Max · 40 核 GPU · 128 GiB · GGUF IQ3_XXS · 4,096 token 输入，单位为 token/s。
 
 ### Qwen3.8-Flash-Next
@@ -100,6 +102,34 @@ uv run tyloinfer serve --model /models/model.gguf
 ```
 
 `.tq` 模型同样使用此命令。分片模型选择首个分片，并将完整分片放在同一目录。
+
+### 验证第一次请求
+
+加载模型后，保持服务运行，另开一个终端。以下以默认的本机监听、未开启鉴权为例：
+
+```sh
+curl http://127.0.0.1:8090/health
+curl http://127.0.0.1:8090/v1/models
+```
+
+`/health` 应返回 `"status":"ok"`；它只检查服务，不代表模型已就绪。将 `/v1/models` 中目标模型的 `id` 填入下方 `MODEL_ID`，把 JSON 保存为 `request.json`：
+
+```json
+{
+  "model": "MODEL_ID",
+  "messages": [{"role": "user", "content": "Say hello in one sentence."}],
+  "max_tokens": 256,
+  "stream": false
+}
+```
+
+```sh
+curl -H "Content-Type: application/json" --data-binary "@request.json" http://127.0.0.1:8090/v1/chat/completions
+```
+
+PowerShell 中将 `curl` 改为 `curl.exe`。请求成功应返回 HTTP 200，包含 `object: "chat.completion"` 和 `choices[0].message` 中的助手消息；推理模型还可能返回 `reasoning_content`。模型列表为空或请求返回错误，不算通过推理验证。鉴权及排障见[首次请求说明](docs/cli/serve.md#first-api-request)。
+
+以上示例已对照 API 实现静态核对，本轮文档更新未加载模型实跑。它们用于检查服务能否完成请求，不用于复现性能表。
 
 ### 接入 Agent 与客户端
 

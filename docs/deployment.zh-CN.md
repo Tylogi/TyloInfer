@@ -1,7 +1,7 @@
 # 服务部署与性能设置
 
-以下以 **Windows / Linux、单张 NVIDIA GPU、MFQ 权重**为例，推荐配置针对
-Qwen3.8-Flash-Next 等需要 RAM 流式专家的模型。完整参数见 [`mfq serve`](cli/serve.md)。
+以下以 **Windows / Linux、单张 NVIDIA GPU、GGUF / TQ 权重**为例，配置说明针对
+Qwen3.8-Flash-Next 等需要 RAM 流式专家的模型。完整参数见 [`tyloinfer serve`](cli/serve.md)。
 
 ## 1. 构建当前版本
 
@@ -10,10 +10,10 @@ Qwen3.8-Flash-Next 等需要 RAM 流式专家的模型。完整参数见 [`mfq s
 Linux 使用 GCC / Clang。详细要求见[构建说明](cli/build.md#backend-requirements)。
 
 ```shell
-git clone https://github.com/Tylogi/TyloInfer.git MFQ
-cd MFQ
+git clone https://github.com/Tylogi/TyloInfer.git
+cd TyloInfer
 uv sync
-uv run mfq build --backend cuda --build-type Release -j 8
+uv run tyloinfer build --backend cuda --build-type Release -j 8
 ```
 
 原生 CUDA 推理无需安装 PyTorch。**更新源码后重新执行构建命令**；已有的托管二进制
@@ -24,16 +24,17 @@ uv run mfq build --backend cuda --build-type Release -j 8
 Linux：
 
 ```shell
-uv run mfq serve --backend cuda --model "/models/model-00001-of-00005.mfq" --context-size 32768 --max-runtime-instances 1 --port 8090 --no-web-ui
+uv run tyloinfer serve --backend cuda --model "/models/model-00001-of-00005.tq" --context-size 32768 --max-runtime-instances 1 --port 8090 --no-web-ui
 ```
 
 Windows PowerShell：
 
 ```powershell
-uv run mfq serve --backend cuda --model "./Models/model-00001-of-00005.mfq" --context-size 32768 --max-runtime-instances 1 --port 8090 --no-web-ui
+uv run tyloinfer serve --backend cuda --model "./Models/model-00001-of-00005.tq" --context-size 32768 --max-runtime-instances 1 --port 8090 --no-web-ui
 ```
 
-替换模型路径；分片模型指定第一片，并保留全部配套分片和共享表文件。
+替换为实际 GGUF / TQ 模型路径；`.mfq` 容器后缀仍可识别，但不代表所有旧量化格式默认可用。
+分片模型指定第一片，并保留全部配套分片和共享表文件；具体格式与后端限制见[支持矩阵](runtime/support.md)。
 `--no-web-ui` 适合 API 部署，不需要 Node.js。需要网页界面时去掉它，按提示安装
 Node.js/npm；推理后端相同。
 
@@ -81,12 +82,12 @@ PowerShell 使用 `curl.exe`。加载返回 `202` 和操作 ID，通过
 
 ## 4. 快路径是否需要手工开启？
 
-**通过 `mfq serve` 加载受支持的 CUDA MoE 模型时，大部分已自动配置。**
+**通过 `tyloinfer serve` 加载受支持的 CUDA MoE 模型时，大部分已自动配置。**
 服务会选择专家缓存、RAM 锁页、两阶段 FFN、传输复用、整层 prefill 和异步上传；
 CUDA Graph、主要融合算子默认开启。通常不需要复制一长串环境变量。
 
 直接执行 `mfq-runtime` 不会经过 Python 服务的缓存和内存规划，部分原生默认值不同。
-部署应使用 `mfq serve`；`--running-executable` 仅在明确需要使用匹配的预编译运行时
+部署应使用 `tyloinfer serve`；`--running-executable` 仅在明确需要使用匹配的预编译运行时
 时指定，避免误用另一份旧二进制。
 
 旧的实验环境变量会覆盖服务默认配置。速度异常时，检查启动环境中是否遗留
@@ -95,6 +96,11 @@ CUDA Graph、主要融合算子默认开启。通常不需要复制一长串环�
 `TYLOINFER_PROFILE_*`。只移除自己设置过的覆盖值，不要批量清空全部 `TYLOINFER_*`。
 
 ## 5. 检查服务和速度
+
+首次上手请先完成[最小 API 请求闭环](cli/serve.md#first-api-request)，按返回的精确模型 ID
+确认 HTTP 200 和非空 assistant 内容。下例用于随后检查 MTP 和指标，不是性能表复现。
+以下命令默认本机无鉴权；启用鉴权时，为 `/v1` 和 `/api/v1` 请求添加 Bearer 凭据，
+PowerShell 使用 `curl.exe`，不要把实际密钥写进共享示例或日志。
 
 ```shell
 curl http://127.0.0.1:8090/health
@@ -146,4 +152,10 @@ decode 不包含首 token 出来前的等待。
 
 这份指南参考了 [Strata 的部署说明](https://github.com/Niko1221/Strata/blob/main/docs/INSTALL.md)
 和[分块、专家缓存说明](https://github.com/Niko1221/Strata/blob/main/docs/DETAILS.md)。
-参数和默认值以 MFQ 自身为准；其他后端参见[支持矩阵](runtime/support.md)和[构建说明](cli/build.md)。
+参数和默认值以 TyloInfer 自身为准；其他后端参见[支持矩阵](runtime/support.md)和[构建说明](cli/build.md)。
+
+## 7. 性能记录与复现边界
+
+首页性能数字不是本轮文档修订实跑结果；当前没有与整张表逐项关联的完整原始记录。
+实验版本、模型哈希、采样、草稿配置、冷/热缓存和重复次数均须记录，详见
+[性能复现与记录指南](benchmarking.md)。不要把上述短请求当成首页性能表的复现。

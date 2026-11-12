@@ -23,6 +23,8 @@ Apple Silicon uses Metal; NVIDIA GPUs use CUDA on Linux and Windows. ROCm suppor
 
 ## Performance
 
+These are previously reported measurements, not results revalidated by the current documentation update or a guarantee for your hardware. The tables do not yet link a complete reproduction record: the exact TyloInfer commit, model and companion revisions, commands, raw logs, repeat count, and summary statistic. Do not assume they describe the current checkout or establish a general ranking across engines. See the [benchmarking guide](docs/benchmarking.md) for configuration and evidence to record, including MTP/DFlash2 settings and cold/warm prefix-cache behavior.
+
 Apple M5 Max · 40-core GPU · 128 GiB · GGUF IQ3_XXS · 4,096-token input. Speeds in tokens/s.
 
 ### Qwen3.8-Flash-Next
@@ -100,6 +102,34 @@ uv run tyloinfer serve --model /models/model.gguf
 ```
 
 The same command accepts `.tq` checkpoints. For sharded models, select the first shard and keep the complete set in one directory.
+
+### Verify your first request
+
+After loading a model, leave the server running and open another terminal. The following assumes the default local listener without authentication:
+
+```sh
+curl http://127.0.0.1:8090/health
+curl http://127.0.0.1:8090/v1/models
+```
+
+`/health` should report `"status":"ok"`; this checks the service, not model readiness. Copy the intended model's `id` from `/v1/models` into `MODEL_ID` below and save the JSON as `request.json`:
+
+```json
+{
+  "model": "MODEL_ID",
+  "messages": [{"role": "user", "content": "Say hello in one sentence."}],
+  "max_tokens": 256,
+  "stream": false
+}
+```
+
+```sh
+curl -H "Content-Type: application/json" --data-binary "@request.json" http://127.0.0.1:8090/v1/chat/completions
+```
+
+In PowerShell, use `curl.exe` instead of `curl`. A successful request returns HTTP 200 with `object: "chat.completion"` and an assistant message in `choices[0].message`; reasoning models may also return `reasoning_content`. An empty model list or a request error is not a successful inference check. See [first-request troubleshooting and authentication](docs/cli/serve.md#first-api-request).
+
+These examples were checked against the API implementation, but were not executed with a model during this documentation update. They are a service smoke test, not a reproduction of the performance tables.
 
 ### Connect your tools
 

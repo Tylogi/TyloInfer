@@ -1,6 +1,6 @@
-# `mfq serve`
+# `tyloinfer serve`
 
-`mfq serve` starts the API and Web UI, with or without an initial model. It
+`tyloinfer serve` starts the API and Web UI, with or without an initial model. It
 selects the C++ executable and manages workers on private loopback ports.
 
 For copyable CUDA deployment commands and performance settings, see the
@@ -11,7 +11,7 @@ For copyable CUDA deployment commands and performance settings, see the
 Sync the server and backend dependencies once:
 
 ```shell
-cd /path/to/MFQ
+cd /path/to/TyloInfer
 uv sync --extra metal
 ```
 
@@ -21,50 +21,106 @@ does not require PyTorch or LibTorch.
 Start an idle server:
 
 ```shell
-uv run mfq serve
+uv run tyloinfer serve
 ```
 
 Open the model catalog in TyloInfer or the Web UI to load a discovered model.
-To load one model before the server becomes available, pass its existing MFQ
-path:
+To load one model before the server becomes available, pass its existing path:
 
 ```shell
-uv run mfq serve --model /models/model.mfq
+uv run tyloinfer serve --model /models/model.gguf
 ```
 
 The server listens on `http://127.0.0.1:8090` by default. `Ctrl-C` stops the
-server and its private workers. `--model` must point to an existing `.mfq`
-file.
+server and its private workers. `--model` accepts an existing GGUF or TQ file;
+`.mfq` remains a recognized container suffix. For a sharded model, select the
+first shard and keep all sibling shards and required companion files together.
+Supported native Hugging Face model directories can also be selected; exact
+architecture, artifact and backend coverage is in the
+[support matrix](../runtime/support.md). A recognized suffix is not a guarantee
+that every tensor format or model graph is supported. Legacy inference formats
+require the [compatibility build](build.md#native-format-profiles).
 
 Without `--running-executable`, run through uv from the checkout that supplies
-the installed `mfq` package. The first run may compile the runtime, so the
-[`mfq build` requirements](build.md#backend-requirements) apply. Packaged
+the installed `tyloinfer` package. The first run may compile the runtime, so the
+[`tyloinfer build` requirements](build.md#backend-requirements) apply. Packaged
 runtimes do not need CMake, `nvcc`, or a source tree.
+
+## First API request
+
+After startup loading finishes, or after the UI reports the model ready, run
+these requests from another terminal. This example uses a trusted loopback
+listener with authentication disabled:
+
+```shell
+curl --fail-with-body http://127.0.0.1:8090/health
+curl --fail-with-body http://127.0.0.1:8090/v1/models
+```
+
+Health should return `"status":"ok"`; it only checks the service, not that a
+model can generate. Copy the exact model `id` returned by `/v1/models` and save
+this body as `request.json`, replacing `MODEL_ID`:
+
+```json
+{
+  "model": "MODEL_ID",
+  "messages": [{"role": "user", "content": "Say hello in one sentence."}],
+  "max_tokens": 128,
+  "temperature": 0,
+  "enable_thinking": false,
+  "enable_mtp": false,
+  "stream": false
+}
+```
+
+```shell
+curl --fail-with-body http://127.0.0.1:8090/v1/chat/completions \
+  -H 'Content-Type: application/json' --data-binary '@request.json'
+```
+
+`--fail-with-body` requires curl 7.76 or newer; with older curl, explicitly
+check the HTTP status so an error response is not mistaken for success.
+In Windows PowerShell use `curl.exe`, not the `curl` alias, and put the last
+command on one line (or use PowerShell backticks, not shell backslashes).
+When authentication is enabled, add an `Authorization: Bearer <token>` header
+to the `/v1` requests; `/health` remains public. Do not paste real keys into
+shared logs or example files.
+
+Success means HTTP `200`, `object: "chat.completion"`, and an assistant message
+in `choices[0].message` with nonempty `content`. This smoke test is not a
+performance measurement. For API-loaded models, `202 Accepted` is only queue
+acceptance: inspect the operation through the jobs API and wait for the
+instance to become `ready` before testing. For `401` check the credential;
+for model-not-found check the exact ID and loaded instance; for `503` inspect
+worker startup/load logs and runtime state.
+
+These commands are based on the current API implementation. This documentation
+revision did not load a model or execute an end-to-end inference test.
 
 ## How the native runtime is selected
 
-`mfq serve` detects the host backend and selects the runtime in this order:
+`tyloinfer serve` detects the host backend and selects the runtime in this order:
 
 1. `--running-executable` uses a prebuilt binary and skips managed-build
    lookup, compiler detection, and compilation.
-2. If the recorded executable exists, MFQ uses it directly.
-3. If the manifest exists but the executable is missing, MFQ rebuilds it in the
+2. If the recorded executable exists, TyloInfer uses it directly.
+3. If the manifest exists but the executable is missing, TyloInfer rebuilds it in the
    recorded build directory with the recorded generator, build type, and CMake
    arguments.
-4. If no matching manifest exists, MFQ performs a default build and creates the
+4. If no matching manifest exists, TyloInfer performs a default build and creates the
    manifest.
 
 A manifest must match the source checkout, operating system, machine
 architecture, and backend. Mismatched manifests are ignored.
 
 The manifest is always read from `<repo>/build/mfq-runtime.json`, where
-`<repo>` is the checkout supplying the running `mfq` command. A default build
+`<repo>` is the checkout supplying the running `tyloinfer` command. A default build
 uses `<repo>/cpp_runtime` as its source and `<repo>/build/cpp_runtime` as its
 build directory. `--build-dir` changes only the CMake build tree; the manifest
 remains under `<repo>/build`.
 
 Source installations use the managed build automatically, including a custom
-`mfq build --build-dir`. Packaged distributions pass their bundled worker with
+`tyloinfer build --build-dir`. Packaged distributions pass their bundled worker with
 `--running-executable`.
 
 ## Application and private listeners
@@ -72,14 +128,14 @@ Source installations use the managed build automatically, including a custom
 `--host` and `--port` control only the user-facing FastAPI/Uvicorn listener:
 
 ```shell
-uv run mfq serve \
-  --model /models/model.mfq \
+uv run tyloinfer serve \
+  --model /models/model.gguf \
   --host 0.0.0.0 \
   --port 9000
 ```
 
 The native worker always binds to `127.0.0.1` on a dynamically reserved port.
-MFQ passes requests to that private address and disables environment HTTP proxy
+TyloInfer passes requests to that private address and disables environment HTTP proxy
 handling for internal connections.
 
 `0.0.0.0` is a bind address, not a browser destination. On the same machine,
@@ -90,7 +146,7 @@ starting the listener:
 
 ```shell
 TYLOINFER_SERVER_API_KEY='replace-with-a-secret' \
-  uv run mfq serve --model /models/model.mfq --host 0.0.0.0
+  uv run tyloinfer serve --model /models/model.gguf --host 0.0.0.0
 ```
 
 `--api-key-env` changes the name of the environment variable read by the
@@ -116,15 +172,17 @@ To use another variable name:
 
 ```shell
 TYLOINFER_PRODUCTION_KEY='replace-with-a-secret' \
-  uv run mfq serve --model /models/model.mfq --api-key-env TYLOINFER_PRODUCTION_KEY
+  uv run tyloinfer serve --model /models/model.gguf --api-key-env TYLOINFER_PRODUCTION_KEY
 ```
 
 In PowerShell, set `$env:TYLOINFER_SERVER_API_KEY = 'replace-with-a-secret'` before
-running `uv run mfq serve`. TyloInfer desktop can store this token in its
-**Remote MFQ Server API key** field. The standalone browser UI currently has no
-credential prompt, so use it without server authentication only on a trusted
-loopback listener, or connect through the desktop application when
-authentication is enabled.
+running `uv run tyloinfer serve`. The current browser UI and Studio show an
+**API Key** sign-in page when authentication is required. Browser credentials
+are held in memory; reloading the page may require signing in again. Studio
+can persist credentials through the system credential store. Use a key with
+appropriate permissions; a valid inference key need not grant administrative
+access. For remote access, use a trusted network or HTTPS through a correctly
+configured reverse proxy: API-key authentication alone does not encrypt HTTP.
 
 ## Web UI
 
@@ -136,16 +194,16 @@ root, such as `http://127.0.0.1:8090/`. Asset selection follows this order:
 3. `TYLOINFER_SERVER_WEB_ROOT` supplies a prebuilt directory when the CLI option is
    absent.
 4. Packaged Studio servers use their bundled `web-ui` assets without Node.js/npm.
-5. Otherwise, MFQ looks for `TyloInferStudio` in the source checkout.
+5. Otherwise, TyloInfer looks for `TyloInferStudio` in the source checkout.
 
 Studio starts both the API and Web UI on the same listener; it does not open a
 browser automatically. The desktop client and browsers share that server.
 
-A prebuilt directory must contain `index.html`. MFQ checks explicit and
+A prebuilt directory must contain `index.html`. TyloInfer checks explicit and
 environment-provided directories before starting the backend or loading a
 model.
 
-In automatic source mode, MFQ rebuilds the UI when the sources are newer than
+In automatic source mode, TyloInfer rebuilds the UI when the sources are newer than
 `dist/index.html`:
 
 1. `npm ci`
@@ -160,10 +218,10 @@ Explicit Web UI modes:
 
 ```shell
 # Serve an existing Web UI build.
-uv run mfq serve --model /models/model.mfq --web-root /srv/mfq-web
+uv run tyloinfer serve --model /models/model.gguf --web-root /srv/tyloinfer-web
 
 # Start only the API.
-uv run mfq serve --model /models/model.mfq --no-web-ui
+uv run tyloinfer serve --model /models/model.gguf --no-web-ui
 ```
 
 `--web-root` and `--no-web-ui` are mutually exclusive. When neither is given,
@@ -176,8 +234,8 @@ Without it, the server stays idle until Studio, the Web UI, or the model API
 loads a model. Repeat `--model-dir` to add discovery roots:
 
 ```shell
-uv run mfq serve \
-  --model /models/default.mfq \
+uv run tyloinfer serve \
+  --model /models/default.tq \
   --model-dir /models/team-a \
   --model-dir /models/team-b
 ```
@@ -199,8 +257,11 @@ curl -X POST http://127.0.0.1:8090/api/v1/models/load \
 The request returns `202 Accepted` and an `operation_id` for the background
 load job.
 
-The catalog name is the filename without `.mfq`. A shard such as
-`model-00001-of-00003.mfq` belongs to catalog entry `model`.
+For file checkpoints, the catalog name omits the suffix (`.gguf`, `.tq`, or
+`.mfq`) and shard numbering. For example,
+`model-00001-of-00003.tq` belongs to catalog entry `model`. Native HF directory
+models use their discovered catalog ID. Always query `/v1/models` rather than
+guessing an ID from a path.
 
 Catalog names must be unique across discovery roots. Startup and refresh fail
 if two artifacts have the same name. Runtime model IDs and inference routing
@@ -208,26 +269,26 @@ use the catalog name; a separate hash tracks the artifact and profile drift.
 
 ## Storage and workspace
 
-By default, managed server data is stored in `./.mfq`: `server.sqlite3` holds
+By default, managed server data is stored in `./.tyloinfer`: `server.sqlite3` holds
 persistent state, while `media/`, `models/`, and `components/` hold managed
 files. User-selected tool-job paths remain restricted to the current working
 directory.
 
 ```shell
-uv run mfq serve \
-  --model /models/model.mfq \
-  --data-dir /var/lib/mfq \
-  --work-dir /srv/mfq-work
+uv run tyloinfer serve \
+  --model /models/model.gguf \
+  --data-dir /var/lib/tyloinfer \
+  --work-dir /srv/tyloinfer-work
 ```
 
 For long-running servers, place the data and work directories on writable,
-persistent paths. MFQ resolves data, work, and model paths before startup.
+persistent paths. TyloInfer resolves data, work, and model paths before startup.
 
 ## Runtime controls
 
 ```shell
-uv run mfq serve \
-  --model /models/model.mfq \
+uv run tyloinfer serve \
+  --model /models/model.gguf \
   --context-size 32768 \
   --prefill-chunk-size auto \
   --runtime-startup-timeout 1800
@@ -261,11 +322,58 @@ worker, and `--runtime-idle-timeout` is the default unload delay for idle
 unpinned models; instances may override it through the runtime API.
 `--no-access-log` silences the per-request access-log line.
 
+## Speculative decoding (MTP / DFlash2)
+
+Native MTP needs predictor weights compatible with the target graph; enabling
+MTP is not enough when those weights are absent. DFlash2 needs a matching draft
+checkpoint. The current CLI exposes these explicit companion controls for CUDA:
+
+```shell
+# Native MTP companion for a CUDA GGUF target.
+uv run tyloinfer serve --backend cuda --model /models/target.gguf \
+  --mtp-native-draft /models/matching-mtp.gguf --no-web-ui
+
+# DFlash2 checkpoint directory (the CLI describes the CUDA Flash-Next path).
+uv run tyloinfer serve --backend cuda --model /models/target.gguf \
+  --dflash2-draft /models/matching-dflash2 --no-web-ui
+```
+
+Replace all paths with compatible artifacts. These are configuration examples,
+not the missing exact recipes for the README performance table. The draft
+switches are mutually exclusive, the native companion must be an existing
+file, and the DFlash2 path must be an existing directory. Neither switch is a
+Metal companion-loading recipe; both explicitly require CUDA in this CLI.
+Do not infer that every architecture or backend supports every draft method.
+
+| Option | Effect | Default |
+| --- | --- | --- |
+| `--mtp-native-draft PATH` | Native MTP GGUF companion for a CUDA GGUF target. | No explicit override |
+| `--dflash2-draft PATH` | DFlash2 checkpoint directory for the supported CUDA path. | No explicit override |
+| `--spec-min-p P` / `--mtp-min-probability P` | CUDA greedy draft probability threshold, in `[0,1]`; `0` disables the threshold. | No CLI override |
+| `--draft-conf P` / `--dflash2-draft-confidence P` | CUDA greedy DFlash2 cumulative confidence, in `[0,1]`; nonzero overrides `--spec-min-p`. | No CLI override |
+| `--mtp-cost-aware` / `--no-mtp-cost-aware` | Select CUDA greedy native MTP depth using measured cost and calibrated probabilities. | No CLI override |
+
+Explicit probability/cost switches also require CUDA. If omitted, the CLI does
+not override the corresponding runtime environment policies; record inherited
+`TYLOINFER_MTP_SPEC_MIN_P`, `TYLOINFER_DFLASH2_DRAFT_CONF`, and
+`TYLOINFER_MTP_SPEC_COST` when comparing runs.
+
+For an OpenAI chat request, `"enable_mtp": false` requests an ordinary decode
+baseline; `"enable_mtp": true` permits speculation and
+`"mtp_max_draft_tokens": 3` caps draft depth. Availability still depends on
+model weights, runtime support, and scheduling (see
+[continuous batching limits](../runtime/cuda-continuous-batching.md)). Inspect
+reported `mfq_metrics` such as `mtp_used` and `mtp_acceptance_rate` when present;
+do not assume the requested path actually ran. The metrics name is a retained
+wire-format identifier, not the public CLI name. See
+[performance recording and limitations](../benchmarking.md) before comparing
+speeds.
+
 ## Command options
 
 | Option | Meaning | Default |
 | --- | --- | --- |
-| `--model PATH` | Optional initial MFQ model file. | None |
+| `--model PATH` | Optional initial GGUF/TQ file or supported native HF directory. | None |
 | `--running-executable PATH` | Prebuilt native worker used by packaged deployments. | Managed build |
 | `--host HOST` | Public API bind address. | `127.0.0.1` |
 | `--port PORT` | OpenAI API bind port. | Saved listener port or `8090` |
@@ -274,7 +382,7 @@ unpinned models; instances may override it through the runtime API.
 | `--context-size N` | Target context; `0` uses saved policy or declared model capacity. | `0` |
 | `--prefill-chunk-size auto\|N` | Native compute chunk limit; CUDA selects a fitting tile up to 8192. | `auto` |
 | `--runtime-startup-timeout SECONDS` | Time allowed for native startup. | `1800` |
-| `--data-dir PATH` | Managed database, media, models, and components. | `./.mfq` |
+| `--data-dir PATH` | Managed database, media, models, and components. | `./.tyloinfer` |
 | `--db PATH` | Deprecated explicit database override retained for compatibility. | None |
 | `--web-root PATH` | Prebuilt Web UI directory. | Auto-detect |
 | `--no-web-ui` | Disable Web UI discovery and building. | Off |
@@ -305,14 +413,14 @@ automatically from `--data-dir`.
 
 ### The model file is rejected immediately
 
-When supplied, `--model` must be an existing file. Check the path before
+When supplied, `--model` must be an existing model file or supported native HF directory. Check the path before
 debugging runtime or server startup.
 
 ### Native startup times out
 
 Model loading is included in the startup deadline. Increase
 `--runtime-startup-timeout` for large models or slower storage, then inspect the
-native worker output printed by `mfq serve`.
+native worker output printed by `tyloinfer serve`.
 
 ### The public port is already in use
 
@@ -321,5 +429,5 @@ does not need configuration.
 
 ### Web UI assets are missing
 
-Install Node.js/npm so MFQ can build `TyloInferStudio`, pass a valid
+Install Node.js/npm so TyloInfer can build `TyloInferStudio`, pass a valid
 `--web-root`, or use `--no-web-ui` for an API-only process.
