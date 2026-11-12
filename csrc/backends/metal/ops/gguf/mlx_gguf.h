@@ -1,6 +1,7 @@
 #pragma once
 
 #include <mlx/mlx.h>
+#include "engine/tensor.h"
 #include <array>
 #include <memory>
 #include <optional>
@@ -87,14 +88,14 @@ private:
         const mlx::core::array& up_input, const mlx::core::array& ids, float limit, bool separate_input) const;
     mlx::core::array rotate_input(const mlx::core::array& input) const;
     mlx::core::array unrotate_rows(const mlx::core::array& input, mlx::core::Dtype dtype) const;
-    mlx::core::array bytes_;
+    tyloi::Tensor bytes_;
     mlx::core::Shape shape_;
     int format_;
     int row_bytes_;
     bool indirect_;
-    std::optional<std::array<mlx::core::array, 2>> planes_;
+    std::optional<std::array<tyloi::Tensor, 2>> planes_;
     std::shared_ptr<const MlxNativeGgufWeight> native_;
-    std::optional<mlx::core::array> mixed_layout_;
+    std::optional<tyloi::Tensor> mixed_layout_;
     int mixed_mask_ = 0;
     std::size_t mixed_payload_bytes_ = 0;
     std::shared_ptr<const MlxGgufRotation> rotation_;

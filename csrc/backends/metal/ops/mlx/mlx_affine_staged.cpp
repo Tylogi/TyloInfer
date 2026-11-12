@@ -309,7 +309,7 @@ std::optional<mlx::core::array> MlxAffineStaged::project(const MlxAffineWeight& 
     if (!plan.order_ || plan.tokens_ <= 6 || plan.experts_ > 2048 ||
         width % 32 || output % 32 || (swiglu && output % 64) ||
         (weight.group_size_ != 32 && weight.group_size_ != 64 && weight.group_size_ != 128) ||
-        (weight.scales_.dtype() != float16 && weight.scales_.dtype() != bfloat16) ||
+        (weight.activation_dtype() != float16 && weight.activation_dtype() != bfloat16) ||
         input.size() >= std::uint64_t(1) << 32 || mlx_metal_nax_disabled() ||
         !mlx_apple_chip_starts_with("Apple M5")) return std::nullopt;
     const auto total = std::int64_t(plan.tokens_) * plan.routes_;
@@ -326,7 +326,7 @@ std::optional<mlx::core::array> MlxAffineStaged::project(const MlxAffineWeight& 
         plan.tiles_[slot].emplace(result[0], result[1]);
     }
     const auto& [tiles, count] = *plan.tiles_[slot];
-    auto x = reshape(astype(input, weight.scales_.dtype()), {-1, width});
+    auto x = reshape(astype(input, weight.activation_dtype()), {-1, width});
     const auto params = array({output, width, shared_input ? plan.routes_ : 1,
         !shared_input && input_in_route_order ? 1 : 0}, int32);
     const int columns = (output + 63) / 64;
@@ -334,10 +334,10 @@ std::optional<mlx::core::array> MlxAffineStaged::project(const MlxAffineWeight& 
     const std::tuple<int, int, int> grid = config.tile_x
         ? std::tuple{config.tile_x * threads, ((capacity + config.tile_x - 1) / config.tile_x) * columns, 1}
         : std::tuple{columns * threads, capacity, 1};
-    const auto result_dtype = swiglu ? input.dtype() : weight.scales_.dtype();
-    auto result = projection_kernel()({x, weight.values_, weight.scales_, weight.biases_, *plan.order_, tiles, count, params},
+    const auto result_dtype = swiglu ? input.dtype() : weight.activation_dtype();
+    auto result = projection_kernel()({x, tyloi::metal::array(weight.values_), tyloi::metal::array(weight.scales_), tyloi::metal::array(weight.biases_), *plan.order_, tiles, count, params},
         {{int(total), 1, swiglu ? output / 2 : output}}, {result_dtype}, grid, {threads, 1, 1},
-        {{"T", weight.scales_.dtype()}, {"Q", weight.bits_}, {"GS", weight.group_size_},
+        {{"T", weight.activation_dtype()}, {"Q", weight.bits_}, {"GS", weight.group_size_},
          {"BM", config.rows}, {"BK", config.depth}, {"DB", config.double_buffer},
          {"GX", config.tile_x}, {"PAD", config.padding}, {"AN", output % 64 == 0},
          {"AK", width % config.depth == 0}, {"PAIR", swiglu}, {"Y", result_dtype}, {"INDIRECT", false}}, std::nullopt, false, {})[0];

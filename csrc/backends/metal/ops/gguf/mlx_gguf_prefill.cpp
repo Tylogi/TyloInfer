@@ -1,3 +1,4 @@
+#include "engine/backends/metal/native/tensor/tensor.h"
 #include "mlx_gguf_prefill.h"
 #include "engine/backends/metal/native/kernel.h"
 #include "mlx_gguf_staged.h"
@@ -683,7 +684,7 @@ array MlxGgufPrefillPlan::gate_up_inputs(const MlxGgufWeight& gate, const MlxGgu
     const auto& first = reverse ? up : gate;
     const auto& second = reverse ? gate : up;
     const auto& second_input = up_input ? *up_input : input;
-    return gate_up_kernel()({first.bytes_, second.bytes_, reverse ? second_input : input, routes_->bounds, routes_->tile_offsets,
+    return gate_up_kernel()({tyloi::metal::array(first.bytes_), tyloi::metal::array(second.bytes_), reverse ? second_input : input, routes_->bounds, routes_->tile_offsets,
         array({uint32_t(gate.input_size()), uint32_t(n), uint32_t(padded_rows_), uint32_t(gate.expert_count()) | (uint32_t(reverse) << 31u),
             uint32_t(first.row_bytes_), uint32_t(second.row_bytes_), std::bit_cast<uint32_t>(limit)}), reverse ? input : second_input}, {{padded_rows_, n}}, {dtype_},
         {((n + 127) / 128) * 128, routes_->tiles, 1}, {128, 1, 1},
@@ -718,7 +719,7 @@ array MlxGgufPrefillPlan::down(const MlxGgufWeight& weight, const array& hidden,
         MlxGgufStagedPrefill::prefers_weighted_down(weight) && grouped_->descriptors.size() == std::size_t(selected_))
         return MlxGgufStagedPrefill::weighted_down(weight, hidden,
             reshape(grouped_->descriptors, {1, selected_}), probabilities, dtype_);
-    const auto regular_down = [&] { return down_kernel()({weight.bytes_, astype(hidden, float16), routes_->tile_offsets,
+    const auto regular_down = [&] { return down_kernel()({tyloi::metal::array(weight.bytes_), astype(hidden, float16), routes_->tile_offsets,
         array({uint32_t(weight.input_size()), uint32_t(n), uint32_t(padded_rows_), uint32_t(weight.expert_count()),
             uint32_t(weight.row_bytes_)})}, {{padded_rows_, n}}, {dtype_},
         {((n + 127) / 128) * 64, routes_->tiles, 1}, {64, 1, 1},

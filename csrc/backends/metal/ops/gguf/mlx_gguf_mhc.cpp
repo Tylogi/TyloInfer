@@ -1,3 +1,4 @@
+#include "engine/backends/metal/native/tensor/tensor.h"
 #include "mlx_gguf.h"
 #include "engine/backends/metal/native/kernel.h"
 #include "mlx_tensor.h"
@@ -157,16 +158,16 @@ std::optional<std::vector<array>> MlxGgufWeight::gated_residual(const array& nor
     const array params({uint32_t(input_size()), uint32_t(output_size())});
     const bool independent_injection = rows == 1 && dtype == float32;
     auto first = independent_injection
-        ? single_down_kernel()({source, bytes_, params}, {{rows, output_size()}}, {dtype},
+        ? single_down_kernel()({source, tyloi::metal::array(bytes_), params}, {{rows, output_size()}}, {dtype},
             {((output_size() + 15) / 16) * 128, 1, 1}, {128, 1, 1},
             {{"T", dtype}, {"HC", streams}}, std::nullopt, false, {})
-        : down_kernel()({source, bytes_, inject, params}, {{rows, output_size()}, {rows, streams}},
+        : down_kernel()({source, tyloi::metal::array(bytes_), inject, params}, {{rows, output_size()}, {rows, streams}},
         {dtype, gate_dtype}, {((output_size() + (injection ? streams : 0) + 3) / 4) * 128, rows, 1}, {128, 1, 1},
         {{"T", dtype}, {"I", inject.dtype()}, {"G", gate_dtype}, {"HC", streams}, {"HAS_INJECT", int(injection != nullptr)}},
         std::nullopt, false, {});
     auto shape = normalized.shape(); shape.back() /= streams;
     const int threads = 32 * streams;
-    auto mixed = mix_kernel()({first[0], up.bytes_, source, params}, {shape}, {dtype},
+    auto mixed = mix_kernel()({first[0], tyloi::metal::array(up.bytes_), source, params}, {shape}, {dtype},
         {((input_size() / streams + 7) / 8) * threads, rows, 1}, {threads, 1, 1},
         {{"T", dtype}, {"HC", streams}, {"PRECISE", int(independent_injection)}}, std::nullopt, false, {}).front();
     std::vector<array> result{std::move(mixed)};

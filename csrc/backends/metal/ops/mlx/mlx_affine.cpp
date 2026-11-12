@@ -36,7 +36,8 @@ mfq::MlxAffineLayout read_layout(const MfqContainer& model, const std::string& n
 }
 
 MlxAffineWeight::MlxAffineWeight(array values, array scales, array biases, int bits, int group_size, int width)
-    : values_(std::move(values)), scales_(std::move(scales)), biases_(std::move(biases)),
+    : values_(tyloi::metal::tensor(std::move(values))), scales_(tyloi::metal::tensor(std::move(scales))),
+      biases_(tyloi::metal::tensor(std::move(biases))),
       bits_(bits), group_size_(group_size), width_(width) {}
 
 MlxAffineWeight MlxAffineWeight::from_arrays(array values, array scales, array biases, int bits, int group_size) {
@@ -90,17 +91,17 @@ bool MlxAffineWeight::supports_native(const MfqContainer& model, const std::stri
 }
 std::optional<MlxAffineWeight> MlxAffineWeight::join_rows(const MlxAffineWeight& first, const MlxAffineWeight& second) {
     if (first.bits_ != second.bits_ || first.group_size_ != second.group_size_ || first.width_ != second.width_ ||
-        first.scales_.dtype() != second.scales_.dtype() || first.values_.ndim() != second.values_.ndim() ||
+        first.activation_dtype() != second.activation_dtype() || first.values_.dim() != second.values_.dim() ||
         first.expert_count() != second.expert_count()) return std::nullopt;
-    return from_arrays(concatenate({first.values_, second.values_}, -2),
-        concatenate({first.scales_, second.scales_}, -2), concatenate({first.biases_, second.biases_}, -2),
+    return from_arrays(concatenate({tyloi::metal::array(first.values_), tyloi::metal::array(second.values_)}, -2),
+        concatenate({tyloi::metal::array(first.scales_), tyloi::metal::array(second.scales_)}, -2), concatenate({tyloi::metal::array(first.biases_), tyloi::metal::array(second.biases_)}, -2),
         first.bits_, first.group_size_);
 }
 void MlxAffineWeight::prepare_native() {
-    if (native_ || scales_.dtype() != bfloat16 ||
-        (values_.ndim() == 3 && output_size() % 64) ||
+    if (native_ || activation_dtype() != bfloat16 ||
+        (values_.dim() == 3 && output_size() % 64) ||
         !mlx_native_affine_supported(bits_, group_size_, output_size(), width_)) return;
-    auto weight = mlx_native_affine_pack(values_, scales_, biases_, bits_, group_size_);
+    auto weight = mlx_native_affine_pack(tyloi::metal::array(values_), tyloi::metal::array(scales_), tyloi::metal::array(biases_), bits_, group_size_);
     eval(std::vector<array>(weight.planes.begin(), weight.planes.end()));
     for (const auto& plane : weight.planes) tyloi::metal::ResidentAllocations::track(plane);
     native_ = std::make_shared<MlxNativeGgufWeight>(std::move(weight));
@@ -114,23 +115,23 @@ std::size_t MlxAffineWeight::packed_nbytes() const noexcept {
 
 array MlxAffineWeight::matmul(const array& input) const {
     check_input(input, width_);
-    if (values_.ndim() != 2) throw std::invalid_argument("MLX expert matrix requires routed projection");
+    if (values_.dim() != 2) throw std::invalid_argument("MLX expert matrix requires routed projection");
     if (native_ && input.ndim() >= 2 && input.size() > std::size_t(width_))
         return mlx_native_gguf_project(std::span(native_.get(), 1), input)[0];
-    auto result = quantized_matmul(astype(input, scales_.dtype()), values_, scales_, biases_,
+    auto result = quantized_matmul(astype(input, activation_dtype()), tyloi::metal::array(values_), tyloi::metal::array(scales_), tyloi::metal::array(biases_),
         true, group_size_, bits_, "affine");
     return result.dtype() == input.dtype() ? result : astype(result, input.dtype());
 }
 array MlxAffineWeight::dequantize(Dtype dtype) const {
-    return mlx::core::dequantize(values_, scales_, biases_, group_size_, bits_, "affine", std::nullopt, dtype);
+    return mlx::core::dequantize(tyloi::metal::array(values_), tyloi::metal::array(scales_), tyloi::metal::array(biases_), group_size_, bits_, "affine", std::nullopt, dtype);
 }
 array MlxAffineWeight::embedding(const array& ids, Dtype dtype) const {
-    if (values_.ndim() != 2) throw std::invalid_argument("MLX embedding requires a matrix");
+    if (values_.dim() != 2) throw std::invalid_argument("MLX embedding requires a matrix");
     auto shape = ids.shape(); shape.push_back(width_);
     if (!ids.size()) return zeros(shape, dtype);
     auto index = astype(ids, int32);
     auto safe = clip(index, array(0, int32), array(output_size() - 1, int32));
-    auto packed = take(values_, safe, 0), scales = take(scales_, safe, 0), biases = take(biases_, safe, 0);
+    auto packed = take(tyloi::metal::array(values_), safe, 0), scales = take(tyloi::metal::array(scales_), safe, 0), biases = take(tyloi::metal::array(biases_), safe, 0);
     auto result = mlx::core::dequantize(packed, scales, biases, group_size_, bits_, "affine", std::nullopt, dtype);
     return where(expand_dims(logical_and(index >= 0, index < output_size()), -1), result, zeros(shape, dtype));
 }
@@ -172,7 +173,7 @@ array MlxAffineWeight::routed_matmul(const array& input, const array& ids, bool 
 
 array MlxAffineWeight::routed_swiglu(const array& input, const MlxAffineRoutePlan& plan) const {
     check_input(input, width_);
-    if (values_.ndim() != 3 || plan.experts_ != expert_count() || output_size() % 2 ||
+    if (values_.dim() != 3 || plan.experts_ != expert_count() || output_size() % 2 ||
         input.size() / width_ != std::size_t(plan.tokens_))
         throw std::invalid_argument("MLX routed Gate/Up shape mismatch");
     if (auto result = MlxAffineStaged::project(*this, input, plan, true, false, true)) return *result;
@@ -182,20 +183,20 @@ array MlxAffineWeight::routed_swiglu(const array& input, const MlxAffineRoutePla
 array MlxAffineWeight::routed_matmul(const array& input, const MlxAffineRoutePlan& plan,
     bool shared_input, bool input_in_route_order) const {
     check_input(input, width_);
-    if (values_.ndim() != 3 || plan.experts_ != expert_count() ||
+    if (values_.dim() != 3 || plan.experts_ != expert_count() ||
         input.size() / width_ != std::size_t(plan.tokens_) * (shared_input ? 1 : plan.routes_))
         throw std::invalid_argument("MLX routed projection shape mismatch");
     const Shape shape{plan.tokens_, plan.routes_, output_size()};
     if (!plan.tokens_) return zeros(shape, input.dtype());
     if (auto result = MlxAffineStaged::project(*this, input, plan, shared_input, input_in_route_order))
         return *result;
-    auto x = astype(input, scales_.dtype());
+    auto x = astype(input, activation_dtype());
     if (plan.order_) {
         x = reshape(x, {-1, 1, width_});
         if (shared_input) x = take(x, floor_divide(*plan.order_, array(plan.routes_, uint32)), 0);
         else if (!input_in_route_order) x = take(x, *plan.order_, 0);
     } else x = reshape(x, {plan.tokens_, shared_input ? 1 : plan.routes_, 1, width_});
-    auto result = gather_qmm(x, values_, scales_, biases_, std::nullopt, plan.ids_,
+    auto result = gather_qmm(x, tyloi::metal::array(values_), tyloi::metal::array(scales_), tyloi::metal::array(biases_), std::nullopt, plan.ids_,
         true, group_size_, bits_, "affine", std::nullopt, plan.order_.has_value());
     result = astype(result, input.dtype());
     return reshape(result, plan.order_ ? Shape{plan.tokens_ * plan.routes_, 1, output_size()} : shape);

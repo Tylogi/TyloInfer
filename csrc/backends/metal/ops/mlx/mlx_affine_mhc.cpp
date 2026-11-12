@@ -116,19 +116,20 @@ const fast::CustomKernelFunction& mix_kernel() {
 std::optional<std::vector<array>> MlxAffineWeight::gated_residual(const array& normalized,
     const MlxAffineWeight& up, const MlxAffineWeight* injection, int streams) const {
     const auto dtype = normalized.dtype();
-    if (values_.ndim() != 2 || up.values_.ndim() != 2 || normalized.ndim() < 2 ||
-        (dtype != float16 && dtype != bfloat16) || dtype != scales_.dtype() || dtype != up.scales_.dtype() ||
+    if (values_.dim() != 2 || up.values_.dim() != 2 || normalized.ndim() < 2 ||
+        (dtype != float16 && dtype != bfloat16) || dtype != activation_dtype() || dtype != up.activation_dtype() ||
         streams < 2 || streams > 8 || width_ % streams || normalized.shape(-1) != width_ ||
         up.input_size() != output_size() || up.output_size() != width_ || output_size() > 1024 ||
-        (injection && (injection->values_.ndim() != 2 || injection->width_ != width_ ||
-            injection->output_size() != streams || injection->scales_.dtype() != dtype))) return std::nullopt;
+        (injection && (injection->values_.dim() != 2 || injection->width_ != width_ ||
+            injection->output_size() != streams || injection->activation_dtype() != dtype))) return std::nullopt;
     const int rows = int(normalized.size() / width_);
     if (rows < 1 || rows > 6) return std::nullopt;
     const auto& inject = injection ? *injection : *this;
     const int splits = rows == 1 && width_ >= 4096 &&
         width_ / streams % group_size_ == 0 && width_ / streams % inject.group_size_ == 0 ? streams : 1;
     auto source = reshape(normalized, {rows, width_});
-    auto first = down_kernel()({source, values_, scales_, biases_, inject.values_, inject.scales_, inject.biases_},
+    auto first = down_kernel()({source, tyloi::metal::array(values_), tyloi::metal::array(scales_), tyloi::metal::array(biases_),
+        tyloi::metal::array(inject.values_), tyloi::metal::array(inject.scales_), tyloi::metal::array(inject.biases_)},
         {{rows, splits, output_size() + streams}}, {float32},
         {((output_size() + (injection ? streams : 0) + 3) / 4) * 128, splits, rows}, {128, 1, 1},
         {{"T", dtype}, {"WIDTH", width_}, {"LOW", output_size()}, {"HC", streams},
@@ -136,7 +137,8 @@ std::optional<std::vector<array>> MlxAffineWeight::gated_residual(const array& n
          {"HAS_INJECT", int(injection != nullptr)}, {"SPLITS", splits}}, std::nullopt, false, {});
     auto shape = normalized.shape(); shape.back() /= streams;
     auto gate_shape = normalized.shape(); gate_shape.back() = streams;
-    auto mixed = mix_kernel()({first[0], up.values_, up.scales_, up.biases_, source}, {shape, gate_shape}, {dtype, dtype},
+    auto mixed = mix_kernel()({first[0], tyloi::metal::array(up.values_), tyloi::metal::array(up.scales_),
+        tyloi::metal::array(up.biases_), source}, {shape, gate_shape}, {dtype, dtype},
         {((width_ / streams + 15) / 16) * 128, rows, 1}, {128, 1, 1},
         {{"T", dtype}, {"Q", up.bits_}, {"GS", up.group_size_}, {"LOW", output_size()},
          {"HIDDEN", width_ / streams}, {"HC", streams}, {"SPLITS", splits},

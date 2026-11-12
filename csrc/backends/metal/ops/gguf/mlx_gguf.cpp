@@ -1,3 +1,4 @@
+#include "engine/backends/metal/native/tensor/tensor.h"
 #include "mlx_gguf.h"
 #include "engine/backends/metal/native/kernel.h"
 #include "mfq_mlx_utils_embedded.h"
@@ -790,14 +791,14 @@ MlxGgufRoutePlan gguf_route_plan(const array& ids, int experts, bool wide_mixed)
         use_nax() && experts > 0 && ids.size() / experts >= 32 ? 32 : 16);
 }
 MlxGgufWeight::MlxGgufWeight(array bytes, Shape shape, int format, int row_bytes, bool indirect)
-    : bytes_(std::move(bytes)), shape_(std::move(shape)), format_(format), row_bytes_(row_bytes), indirect_(indirect) {}
+    : bytes_(tyloi::metal::tensor(std::move(bytes))), shape_(std::move(shape)), format_(format), row_bytes_(row_bytes), indirect_(indirect) {}
 
 void MlxGgufWeight::prepare_grouped() {
     if (native_ || mixed_layout_ || rotation_ || !use_nax()) return;
     MlxGgufStagedPrefill::prepare(*this);
     if (planes_) {
-        tyloi::metal::ResidentAllocations::track(bytes_);
-        for (const auto& plane : *planes_) tyloi::metal::ResidentAllocations::track(plane);
+        tyloi::metal::ResidentAllocations::track(tyloi::metal::array(bytes_));
+        for (const auto& plane : *planes_) tyloi::metal::ResidentAllocations::track(tyloi::metal::array(plane));
     }
 }
 
@@ -818,11 +819,12 @@ MlxGgufWeight MlxGgufWeight::allocate_packed(std::string_view dtype, Shape shape
 MlxGgufWeight MlxGgufWeight::from_bytes(std::string_view dtype,
     std::span<const std::uint8_t> bytes, Shape shape) {
     auto result = allocate_packed(dtype, std::move(shape), bytes.size());
-    std::memcpy(result.bytes_.data<std::uint8_t>(), bytes.data(), bytes.size());
+    auto packed = tyloi::metal::array(result.bytes_);
+    std::memcpy(packed.data<std::uint8_t>(), bytes.data(), bytes.size());
     if (use_nax() && result.expert_count() <= 512)
         MlxGgufStagedPrefill::prepare(result);
-    tyloi::metal::ResidentAllocations::track(result.bytes_);
-    if (result.planes_) for (const auto& plane : *result.planes_) tyloi::metal::ResidentAllocations::track(plane);
+    tyloi::metal::ResidentAllocations::track(tyloi::metal::array(result.bytes_));
+    if (result.planes_) for (const auto& plane : *result.planes_) tyloi::metal::ResidentAllocations::track(tyloi::metal::array(plane));
     return result;
 }
 MlxGgufWeight MlxGgufWeight::from_experts(std::string_view dtype, Shape shape,
@@ -905,17 +907,18 @@ MlxGgufWeight MlxGgufWeight::load(const MfqContainer& model, const std::string& 
     }
     auto result = allocate_packed(record.dtype, std::move(shape), record.nbytes);
     result.configure_hadamard(model, name);
-    model.read_range_into(name, 0, {reinterpret_cast<std::byte*>(result.bytes_.data<std::uint8_t>()), record.nbytes});
+    auto packed = tyloi::metal::array(result.bytes_);
+    model.read_range_into(name, 0, {reinterpret_cast<std::byte*>(packed.data<std::uint8_t>()), record.nbytes});
     if (native_projection && result.shape_.size() == 2 && supports_native(model, name)) {
-        auto prepared = mlx_native_gguf_pack(result.bytes_, result.format_, result.output_size(), result.input_size(), result.row_bytes_);
+        auto prepared = mlx_native_gguf_pack(tyloi::metal::array(result.bytes_), result.format_, result.output_size(), result.input_size(), result.row_bytes_);
         eval(std::vector<array>(prepared.planes.begin(), prepared.planes.end()));
         for (const auto& plane : prepared.planes) tyloi::metal::ResidentAllocations::track(plane);
         result.native_ = std::make_shared<MlxNativeGgufWeight>(std::move(prepared));
     }
     if (!result.native_ && use_nax() && result.expert_count() <= 512)
         MlxGgufStagedPrefill::prepare(result);
-    tyloi::metal::ResidentAllocations::track(result.bytes_);
-    if (result.planes_) for (const auto& plane : *result.planes_) tyloi::metal::ResidentAllocations::track(plane);
+    tyloi::metal::ResidentAllocations::track(tyloi::metal::array(result.bytes_));
+    if (result.planes_) for (const auto& plane : *result.planes_) tyloi::metal::ResidentAllocations::track(tyloi::metal::array(plane));
     model.record_prepared(name);
     return result;
 }
@@ -937,7 +940,7 @@ MlxGgufWeight MlxGgufWeight::from_address_table(std::string_view dtype, Shape sh
 std::size_t MlxGgufWeight::packed_nbytes() const noexcept {
     const auto transform_bytes = rotation_ ? rotation_->signs.nbytes() : 0;
     if (mixed_layout_) return mixed_payload_bytes_ + bytes_.nbytes() + mixed_layout_->nbytes() + transform_bytes;
-    std::size_t bytes = bytes_.size() + transform_bytes + (planes_ ? (*planes_)[0].nbytes() + (*planes_)[1].nbytes() : 0);
+    std::size_t bytes = bytes_.numel() + transform_bytes + (planes_ ? tyloi::metal::array((*planes_)[0]).nbytes() + tyloi::metal::array((*planes_)[1]).nbytes() : 0);
     if (native_) for (const auto& plane : native_->planes) bytes += plane.nbytes();
     return bytes;
 }
@@ -971,8 +974,8 @@ array MlxGgufWeight::matmul(const array& input) const {
     }
     if (m <= 6) return array(shape, input.dtype(), std::make_shared<GgufProjection>(default_stream(Device::gpu),
         std::array<std::uint32_t, 7>{uint32_t(input_size()), uint32_t(output_size()), uint32_t(m), uint32_t(row_bytes_), 1, 1, 0},
-        format_, input.dtype(), projection_values(format_, m), projection_lanes(format_, input_size(), output_size(), m), false, false, bytes_),
-        std::vector<array>{bytes_, x});
+        format_, input.dtype(), projection_values(format_, m), projection_lanes(format_, input_size(), output_size(), m), false, false, tyloi::metal::array(bytes_)),
+        std::vector<array>{tyloi::metal::array(bytes_), x});
     if (m >= 64 && use_nax() && input_size() % 64 == 0 && MlxGgufStagedPrefill::supports(*this))
         return MlxGgufStagedPrefill::dense(*this, x);
     if (dense_prefill_fits())
@@ -980,11 +983,11 @@ array MlxGgufWeight::matmul(const array& input) const {
     const auto params = parameters(input_size(), output_size(), m, row_bytes_, 1);
     if (use_nax()) {
         const int tile_rows = m >= 32 ? 32 : 16;
-        return nax_prefill_kernel(false)({bytes_, x, params}, {shape}, {input.dtype()},
+        return nax_prefill_kernel(false)({tyloi::metal::array(bytes_), x, params}, {shape}, {input.dtype()},
             {((output_size() + 127) / 128) * 128, (m + tile_rows - 1) / tile_rows, 1}, {128, 1, 1},
             {{"F", format_}, {"T", input.dtype()}, {"BM", tile_rows}}, std::nullopt, false, {}).front();
     }
-    return prefill_kernel()({bytes_, x, params}, {shape}, {input.dtype()},
+    return prefill_kernel()({tyloi::metal::array(bytes_), x, params}, {shape}, {input.dtype()},
         {((output_size() + 31) / 32) * 128, (m + 15) / 16, 1}, {128, 1, 1},
         {{"F", format_}, {"T", input.dtype()}}, std::nullopt, false, {}).front();
 }
@@ -995,7 +998,7 @@ array MlxGgufWeight::embedding(const array& ids, Dtype dtype) const {
     if (!ids.size()) return zeros(shape, dtype);
     if (rotation_) { auto plain = *this; plain.rotation_.reset(); return unrotate_rows(plain.embedding(ids, float32), dtype); }
     if (planes_) return MlxGgufStagedPrefill::embedding(*this, ids, dtype);
-    return embedding_kernel()({bytes_, contiguous(astype(ids, int32)),
+    return embedding_kernel()({tyloi::metal::array(bytes_), contiguous(astype(ids, int32)),
         parameters(input_size(), output_size(), checked_int(ids.size()), row_bytes_, 1)},
         {shape}, {dtype}, {((input_size() / 4 + 127) / 128) * 128, checked_int(ids.size()), 1}, {128, 1, 1},
         {{"F", format_}, {"T", dtype}}, std::nullopt, false, {}).front();
@@ -1025,8 +1028,8 @@ array MlxGgufWeight::swiglu(const MlxGgufWeight& up, const array& input) const {
     return array(shape, input.dtype(), std::make_shared<GgufSwiGLU>(default_stream(Device::gpu),
         std::array<std::uint32_t, 10>{uint32_t(input_size()), uint32_t(output_size()), uint32_t(rows), uint32_t(row_bytes_),
             1, 1, 1, uint32_t(up.row_bytes_), 0, 0},
-        format_, up.format_, input.dtype(), lanes, values, false, false, bytes_, up.bytes_, false),
-        std::vector<array>{bytes_, up.bytes_, contiguous(input), bytes_, contiguous(input)});
+        format_, up.format_, input.dtype(), lanes, values, false, false, tyloi::metal::array(bytes_), tyloi::metal::array(up.bytes_), false),
+        std::vector<array>{tyloi::metal::array(bytes_), tyloi::metal::array(up.bytes_), contiguous(input), tyloi::metal::array(bytes_), contiguous(input)});
 }
 array MlxGgufWeight::dequantize(Dtype dtype) const {
     if (indirect_) throw std::invalid_argument("GGUF streamed expert tables cannot be expanded as one dense tensor");
@@ -1036,7 +1039,7 @@ array MlxGgufWeight::dequantize(Dtype dtype) const {
     if (planes_) return MlxGgufStagedPrefill::dequantize(*this, dtype);
     const auto rows = checked_int(std::size_t(output_size()) * expert_count());
     const auto blocks = std::size_t(rows) * input_size() / 32;
-    return dequantize_kernel()({bytes_, parameters(input_size(), rows, 1, row_bytes_, 1)},
+    return dequantize_kernel()({tyloi::metal::array(bytes_), parameters(input_size(), rows, 1, row_bytes_, 1)},
         {shape_}, {dtype}, {checked_int((blocks + 127) / 128 * 128), 1, 1}, {128, 1, 1},
         {{"F", format_}, {"T", dtype}}, std::nullopt, false, {}).front();
 }
@@ -1055,8 +1058,8 @@ array MlxGgufWeight::grouped_row_matmul(const array& input, int groups) const {
         return array(shape, input.dtype(), std::make_shared<GgufProjection>(default_stream(Device::gpu),
             std::array<std::uint32_t, 7>{uint32_t(input_size()), uint32_t(output_size() / groups), uint32_t(rows),
                 uint32_t(row_bytes_), uint32_t(groups), 1, 0}, format_, input.dtype(), projection_values(format_, rows),
-            projection_lanes(format_, input_size(), output_size() / groups, rows), false, false, bytes_, true),
-            std::vector<array>{bytes_, contiguous(input)});
+            projection_lanes(format_, input_size(), output_size() / groups, rows), false, false, tyloi::metal::array(bytes_), true),
+            std::vector<array>{tyloi::metal::array(bytes_), contiguous(input)});
     }
     auto grouped = *this;
     grouped.shape_ = Shape{groups, output_size() / groups, input_size()};
@@ -1091,12 +1094,12 @@ array MlxGgufWeight::routed_matmul(const array& input, const array& expert_ids, 
         std::optional<MlxGgufRoutePlan> owned;
         if (!plan) { owned = gguf_route_plan(expert_ids, expert_count()); plan = &*owned; }
         const bool sparse = gguf_short_sparse_routes(expert_ids, expert_count());
-        if (use_nax()) return nax_prefill_kernel(true)({bytes_, contiguous(input), plan->order, plan->bounds, plan->tile_offsets,
+        if (use_nax()) return nax_prefill_kernel(true)({tyloi::metal::array(bytes_), contiguous(input), plan->order, plan->bounds, plan->tile_offsets,
             parameters(input_size(), output_size(), tokens, row_bytes_, expert_count(), routes, shared_input)},
             {shape}, {input.dtype()}, {((output_size() + 127) / 128) * 128, plan->tiles, 1}, {128, 1, 1},
             {{"F", format_}, {"T", input.dtype()}, {"INDIRECT", indirect_}, {"BM", plan->tile_rows},
                 {"SPARSE", sparse}}, 0.f, false, {}).front();
-        return routed_prefill_kernel()({bytes_, contiguous(input), plan->order, plan->bounds, plan->tile_offsets,
+        return routed_prefill_kernel()({tyloi::metal::array(bytes_), contiguous(input), plan->order, plan->bounds, plan->tile_offsets,
             parameters(input_size(), output_size(), tokens, row_bytes_, expert_count(), routes, shared_input)},
             {shape}, {input.dtype()}, {((output_size() + 31) / 32) * 128, plan->tiles, 1}, {128, 1, 1},
             {{"F", format_}, {"T", input.dtype()}, {"INDIRECT", indirect_}}, 0.f, false, {}).front();
@@ -1104,8 +1107,8 @@ array MlxGgufWeight::routed_matmul(const array& input, const array& expert_ids, 
     return array(shape, input.dtype(), std::make_shared<GgufProjection>(default_stream(Device::gpu),
         std::array<std::uint32_t, 7>{uint32_t(input_size()), uint32_t(output_size()), uint32_t(tokens), uint32_t(row_bytes_),
             uint32_t(expert_count()), uint32_t(routes), uint32_t(shared_input)},
-        format_, input.dtype(), projection_values(format_), projection_lanes(format_, input_size(), output_size()), true, indirect_, bytes_),
-        std::vector<array>{bytes_, contiguous(input), contiguous(astype(expert_ids, int32))});
+        format_, input.dtype(), projection_values(format_), projection_lanes(format_, input_size(), output_size()), true, indirect_, tyloi::metal::array(bytes_)),
+        std::vector<array>{tyloi::metal::array(bytes_), contiguous(input), contiguous(astype(expert_ids, int32))});
 }
 array MlxGgufWeight::routed_swiglu(const MlxGgufWeight& up, const array& input,
     const array& expert_ids, const MlxGgufRoutePlan* plan, float limit) const {
@@ -1174,8 +1177,8 @@ array MlxGgufWeight::routed_swiglu_inputs(const MlxGgufWeight& up, const array& 
     return array(Shape{tokens, routes, output_size()}, input.dtype(), std::make_shared<GgufSwiGLU>(default_stream(Device::gpu),
         std::array<std::uint32_t, 10>{uint32_t(input_size()), uint32_t(output_size()), uint32_t(tokens), uint32_t(first.row_bytes_),
             uint32_t(expert_count()), uint32_t(routes), 1, uint32_t(second.row_bytes_), limit > 0.f ? std::bit_cast<uint32_t>(limit) : 0u, uint32_t(reverse)},
-        first.format_, second.format_, input.dtype(), lanes, values, first.indirect_, second.indirect_, first.bytes_, second.bytes_, true, separate_input),
-        std::vector<array>{first.bytes_, second.bytes_, contiguous(reverse ? up_input : input),
+        first.format_, second.format_, input.dtype(), lanes, values, first.indirect_, second.indirect_, tyloi::metal::array(first.bytes_), tyloi::metal::array(second.bytes_), true, separate_input),
+        std::vector<array>{tyloi::metal::array(first.bytes_), tyloi::metal::array(second.bytes_), contiguous(reverse ? up_input : input),
             contiguous(astype(expert_ids, int32)), contiguous(reverse ? input : up_input)});
 }
 } // namespace mfq::metal

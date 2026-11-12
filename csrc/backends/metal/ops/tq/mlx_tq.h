@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 #include <mlx/mlx.h>
+#include "engine/tensor.h"
 
 namespace mfq::metal {
 class MfqContainer;
@@ -102,7 +103,7 @@ private:
         const mlx::core::array& ids, const MlxTqWeight* up,
         float limit, bool gelu, int split = 0, const mlx::core::array* reuse = nullptr) const;
     static MlxTqWeight concatenate(const std::vector<MlxTqWeight>& weights, bool projections);
-    mlx::core::array words_, descriptors_, scales_;
+    tyloi::Tensor words_, descriptors_, scales_;
     int rows_, width_, input_columns_, experts_, group_size_, columns_;
     bool pooled_;
     std::size_t nbytes_;

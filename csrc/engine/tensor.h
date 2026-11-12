@@ -31,6 +31,9 @@ enum class ScalarType : std::uint8_t {
     float32,
     float64,
     float8_e4m3fn,
+    uint16,
+    uint32,
+    uint64,
 };
 
 enum class DeviceType : std::uint8_t {
@@ -49,13 +52,16 @@ constexpr std::size_t scalar_size(ScalarType type) {
         case ScalarType::float8_e4m3fn:
             return 1;
         case ScalarType::int16:
+        case ScalarType::uint16:
         case ScalarType::float16:
         case ScalarType::bfloat16:
             return 2;
         case ScalarType::int32:
+        case ScalarType::uint32:
         case ScalarType::float32:
             return 4;
         case ScalarType::int64:
+        case ScalarType::uint64:
         case ScalarType::float64:
             return 8;
     }
@@ -690,6 +696,9 @@ private:
         switch (type) {
             case ScalarType::boolean: return static_cast<T>(*static_cast<const bool*>(pointer));
             case ScalarType::uint8: return static_cast<T>(*static_cast<const std::uint8_t*>(pointer));
+            case ScalarType::uint16: return static_cast<T>(*static_cast<const std::uint16_t*>(pointer));
+            case ScalarType::uint32: return static_cast<T>(*static_cast<const std::uint32_t*>(pointer));
+            case ScalarType::uint64: return static_cast<T>(*static_cast<const std::uint64_t*>(pointer));
             case ScalarType::int8: return static_cast<T>(*static_cast<const std::int8_t*>(pointer));
             case ScalarType::int16: return static_cast<T>(*static_cast<const std::int16_t*>(pointer));
             case ScalarType::int32: return static_cast<T>(*static_cast<const std::int32_t*>(pointer));

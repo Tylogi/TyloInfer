@@ -1,3 +1,4 @@
+#include "engine/backends/metal/native/tensor/tensor.h"
 #include "mlx_gguf_staged.h"
 #include "mlx_gguf_prefill.h"
 #include "engine/backends/metal/native/kernel.h"
@@ -1411,18 +1412,18 @@ bool MlxGgufStagedPrefill::supports_grouped(const MlxGgufWeight& weight) noexcep
 void MlxGgufStagedPrefill::prepare(MlxGgufWeight& weight) {
     if (weight.planes_ || !supports(weight)) return;
     const int rows = weight.expert_count() * weight.output_size();
-    auto planes = pack(weight.bytes_, zeros({1}, float16), weight.format_, rows,
+    auto planes = pack(tyloi::metal::array(weight.bytes_), zeros({1}, float16), weight.format_, rows,
         weight.input_size(), weight.row_bytes_);
     eval(planes);
-    weight.planes_.emplace(std::array<array, 2>{std::move(planes[1]), std::move(planes[2])});
-    weight.bytes_ = std::move(planes[0]);
+    weight.planes_.emplace(std::array<tyloi::Tensor, 2>{tyloi::metal::tensor(std::move(planes[1])), tyloi::metal::tensor(std::move(planes[2]))});
+    weight.bytes_ = tyloi::metal::tensor(std::move(planes[0]));
 }
 
 array MlxGgufStagedPrefill::dequantize(const MlxGgufWeight& weight, Dtype dtype) {
     if (!weight.planes_) throw std::invalid_argument("GGUF weight has no compressed planes");
     const auto groups = std::size_t(weight.expert_count()) * weight.output_size() * weight.input_size() / 32;
     if (groups > INT_MAX - 127) throw std::overflow_error("GGUF dequantization grid is too large");
-    return dequantize_planes_kernel()({weight.bytes_, (*weight.planes_)[0], (*weight.planes_)[1],
+    return dequantize_planes_kernel()({tyloi::metal::array(weight.bytes_), tyloi::metal::array((*weight.planes_)[0]), tyloi::metal::array((*weight.planes_)[1]),
         array({uint32_t(weight.input_size()), uint32_t(weight.expert_count() * weight.output_size())})},
         {weight.shape_}, {dtype}, {int((groups + 127) / 128 * 128), 1, 1}, {128, 1, 1},
         {{"F", weight.format_}, {"T", dtype}}, std::nullopt, false, {}).front();
@@ -1434,7 +1435,7 @@ array MlxGgufStagedPrefill::embedding(const MlxGgufWeight& weight, const array& 
     const auto groups = ids.size() * (weight.input_size() / 32);
     if (groups > INT_MAX - 127) throw std::overflow_error("GGUF embedding grid is too large");
     auto shape = ids.shape(); shape.push_back(weight.input_size());
-    return embedding_planes_kernel()({weight.bytes_, (*weight.planes_)[0], (*weight.planes_)[1],
+    return embedding_planes_kernel()({tyloi::metal::array(weight.bytes_), tyloi::metal::array((*weight.planes_)[0]), tyloi::metal::array((*weight.planes_)[1]),
         contiguous(astype(ids, int32)), array({uint32_t(weight.input_size()), uint32_t(weight.output_size()), uint32_t(ids.size())})},
         {shape}, {dtype}, {int((groups + 127) / 128 * 128), 1, 1}, {128, 1, 1},
         {{"F", weight.format_}, {"T", dtype}}, std::nullopt, false, {}).front();
@@ -1452,7 +1453,7 @@ array MlxGgufStagedPrefill::project(const MlxGgufWeight& weight, const array& in
         : weight.output_size() >= 16384 ? 1 : 4;
     const int tile_rows = m <= 6 ? 6 : 8;
     auto shape = input.shape(); shape.back() = weight.output_size() / groups;
-    return projection_kernel()({weight.bytes_, (*weight.planes_)[0], (*weight.planes_)[1], contiguous(input),
+    return projection_kernel()({tyloi::metal::array(weight.bytes_), tyloi::metal::array((*weight.planes_)[0]), tyloi::metal::array((*weight.planes_)[1]), contiguous(input),
         array({uint32_t(weight.input_size()), uint32_t(weight.output_size()), uint32_t(m), uint32_t(groups)})},
         {shape}, {input.dtype()}, {weight.output_size() / (64 / lanes) * 64, int((m + tile_rows - 1) / tile_rows), 1}, {64, 1, 1},
         {{"F", weight.format_}, {"T", input.dtype()}, {"L", lanes}, {"MR", tile_rows}, {"GROUPED", groups > 1}}, std::nullopt, false, {}).front();
@@ -1517,7 +1518,7 @@ std::vector<array> MlxGgufStagedPrefill::project_many(std::span<const MlxGgufWei
         const auto& weight = weights[std::min(std::size_t(i), weights.size() - 1)];
         if (!weight.planes_ || weight.shape_.size() != 2 || weight.input_size() != k)
             throw std::invalid_argument("GGUF projection batch requires matching native matrices");
-        inputs.insert(inputs.end(), {weight.bytes_, (*weight.planes_)[0], (*weight.planes_)[1]});
+        inputs.insert(inputs.end(), {tyloi::metal::array(weight.bytes_), tyloi::metal::array((*weight.planes_)[0]), tyloi::metal::array((*weight.planes_)[1])});
         const int n = i < weights.size() ? weight.output_size() : 0;
         const int lanes = weight.output_size() >= 16384 ? 1 : 4;
         auto shape = input.shape(); shape.back() = n;
@@ -1539,8 +1540,8 @@ std::vector<array> MlxGgufStagedPrefill::project_many(std::span<const MlxGgufWei
 array MlxGgufStagedPrefill::dense(const MlxGgufWeight& weight, const array& input) {
     const int k = weight.input_size(), n = weight.output_size();
     const int m = int(input.size() / k);
-    auto planes = weight.planes_ ? std::vector<array>{weight.bytes_, (*weight.planes_)[0], (*weight.planes_)[1]}
-        : pack(weight.bytes_, input, weight.format_, n, k, weight.row_bytes_);
+    auto planes = weight.planes_ ? std::vector<array>{tyloi::metal::array(weight.bytes_), tyloi::metal::array((*weight.planes_)[0]), tyloi::metal::array((*weight.planes_)[1])}
+        : pack(tyloi::metal::array(weight.bytes_), input, weight.format_, n, k, weight.row_bytes_);
     auto shape = input.shape(); shape.back() = n;
     auto result = dense_kernel()({planes[0], planes[1], planes[2], contiguous(astype(input, float16)),
         array({uint32_t(k), uint32_t(n), uint32_t(m)})}, {shape}, {float32},
@@ -1560,7 +1561,7 @@ array MlxGgufStagedPrefill::dense_small(const MlxGgufWeight& weight, const array
     if (rows < 8) x = concatenate({x, zeros({8 - int(rows), k}, float16)}, 0);
     const int splits = compact_splits(n, k);
     if (splits > 1) {
-        auto partial = compact_split_kernel()({weight.bytes_, (*weight.planes_)[0], (*weight.planes_)[1], x,
+        auto partial = compact_split_kernel()({tyloi::metal::array(weight.bytes_), tyloi::metal::array((*weight.planes_)[0]), tyloi::metal::array((*weight.planes_)[1]), x,
             array({uint32_t(k), uint32_t(n), uint32_t(splits)})}, {{splits, 8, n}}, {float32},
             {n, splits, 1}, {64, 1, 1}, {{"F", weight.format_}}, std::nullopt, false, {})[0];
         auto output = astype(sum(partial, 0), input.dtype());
@@ -1623,8 +1624,8 @@ array MlxGgufStagedPrefill::gate_up(const MlxGgufWeight& gate, const MlxGgufWeig
             !(single_token && first.format_ == 146 && second.format_ == 149);
         const auto& second_input = up_input ? *up_input : input;
         static const auto counters = [] { const std::array<uint32_t, 64> values{}; return array(values.data(), Shape{64}, uint32); }();
-        auto result = independent_gate_up_kernel()({first.bytes_, (*first.planes_)[0], (*first.planes_)[1],
-            second.bytes_, (*second.planes_)[0], (*second.planes_)[1], reverse ? second_input : input, reverse ? input : second_input, routes.descriptors,
+        auto result = independent_gate_up_kernel()({tyloi::metal::array(first.bytes_), tyloi::metal::array((*first.planes_)[0]), tyloi::metal::array((*first.planes_)[1]),
+            tyloi::metal::array(second.bytes_), tyloi::metal::array((*second.planes_)[0]), tyloi::metal::array((*second.planes_)[1]), reverse ? second_input : input, reverse ? input : second_input, routes.descriptors,
             array({uint32_t(gate.input_size()), uint32_t(n), uint32_t(gate.expert_count()), std::bit_cast<uint32_t>(limit), uint32_t(reverse), uint32_t(source_topk)}),
             routes.count, routes.grouped_routes, counters}, {{output_rows, n}}, {dtype},
             {n / (interleaved ? 8 : 16) * 64, interleaved ? routes.tiles : 2, interleaved ? 1 : routes.tiles}, {64, 1, 1},
@@ -1646,15 +1647,15 @@ array MlxGgufStagedPrefill::gate_up(const MlxGgufWeight& gate, const MlxGgufWeig
     const auto* shared_second = reverse ? shared_gate : shared_up;
     const auto& second_input = up_input ? *up_input : input;
     const auto empty_meta = array({uint16_t(0)}, uint16);
-    const auto aux = [](const MlxGgufWeight& w) { return w.planes_ ? (*w.planes_)[0] : w.bytes_; };
-    const auto meta = [&](const MlxGgufWeight& w) { return w.planes_ ? (*w.planes_)[1] : empty_meta; };
+    const auto aux = [](const MlxGgufWeight& w) { return w.planes_ ? tyloi::metal::array((*w.planes_)[0]) : tyloi::metal::array(w.bytes_); };
+    const auto meta = [&](const MlxGgufWeight& w) { return w.planes_ ? tyloi::metal::array((*w.planes_)[1]) : empty_meta; };
     const bool serial = q8 && !shared && (routes.tile_rows == 1 ||
         (routes.tile_rows <= 8 && routes.maximum_live_rows > 0 && routes.maximum_live_rows <= 2));
-    return gate_up_kernel()({first.bytes_, second.bytes_, reverse ? second_input : input, routes.descriptors, routes.count,
+    return gate_up_kernel()({tyloi::metal::array(first.bytes_), tyloi::metal::array(second.bytes_), reverse ? second_input : input, routes.descriptors, routes.count,
         array({uint32_t(gate.input_size()), uint32_t(n), uint32_t(input.shape(0)), uint32_t(gate.expert_count()),
             uint32_t(routes.tile_rows == 1 ? routes.descriptors.size() : 0), std::bit_cast<uint32_t>(limit),
             uint32_t(source_topk) | (uint32_t(reverse) << 31u)}),
-        aux(first), meta(first), aux(second), meta(second), reverse ? input : second_input, shared_first->bytes_, shared_second->bytes_,
+        aux(first), meta(first), aux(second), meta(second), reverse ? input : second_input, tyloi::metal::array(shared_first->bytes_), tyloi::metal::array(shared_second->bytes_),
         aux(*shared_first), meta(*shared_first), aux(*shared_second), meta(*shared_second), routes.grouped_routes},
         {{output_rows, n}}, {dtype}, {n / ((serial ? 64 : 32) / column_lanes) * 64, routes.tiles, 1}, {64, 1, 1},
         {{"FG", first.format_}, {"FU", second.format_}, {"T", dtype}, {"PG", first.planes_.has_value()},
@@ -1679,11 +1680,11 @@ array MlxGgufStagedPrefill::down(const MlxGgufWeight& weight, const array& input
     const int column_lanes = ((routes.tile_rows == 1 && weight.input_size() > n) ||
         (routes.tile_rows == 8 && !weight.planes_)) ? 4 : 1;
     const auto empty_meta = array({uint16_t(0)}, uint16);
-    return down_kernel()({weight.bytes_, contiguous(astype(input, float16)), routes.descriptors, routes.count,
+    return down_kernel()({tyloi::metal::array(weight.bytes_), contiguous(astype(input, float16)), routes.descriptors, routes.count,
         array({uint32_t(weight.input_size()), uint32_t(n), uint32_t(input.shape(0)), uint32_t(weight.expert_count()),
             uint32_t(routes.tile_rows == 1 ? routes.descriptors.size() : 0), std::bit_cast<uint32_t>(limit)}),
-        weight.planes_ ? (*weight.planes_)[0] : weight.bytes_, weight.planes_ ? (*weight.planes_)[1] : empty_meta,
-        shared->bytes_, shared->planes_ ? (*shared->planes_)[0] : shared->bytes_, shared->planes_ ? (*shared->planes_)[1] : empty_meta,
+        weight.planes_ ? tyloi::metal::array((*weight.planes_)[0]) : tyloi::metal::array(weight.bytes_), weight.planes_ ? tyloi::metal::array((*weight.planes_)[1]) : empty_meta,
+        tyloi::metal::array(shared->bytes_), shared->planes_ ? tyloi::metal::array((*shared->planes_)[0]) : tyloi::metal::array(shared->bytes_), shared->planes_ ? tyloi::metal::array((*shared->planes_)[1]) : empty_meta,
         gate ? *gate : input},
         {{output_rows, n}}, {dtype}, {n * column_lanes, routes.tiles, 1}, {64, 1, 1},
         {{"F", weight.format_}, {"T", dtype}, {"PACKED", weight.planes_.has_value()}, {"MAX_ROWS", routes.tile_rows},
@@ -1702,7 +1703,7 @@ array MlxGgufStagedPrefill::weighted_down(const MlxGgufWeight& weight, const arr
     while (groups < 8 && groups < ids.shape(1)) groups *= 2;
     if (weight.format_ < 144) groups = std::min(16, ids.shape(1));
     const int threads = groups * 32;
-    return weighted_down_kernel()({weight.bytes_, (*weight.planes_)[0], (*weight.planes_)[1],
+    return weighted_down_kernel()({tyloi::metal::array(weight.bytes_), tyloi::metal::array((*weight.planes_)[0]), tyloi::metal::array((*weight.planes_)[1]),
         contiguous(astype(input, float16)), contiguous(reshape(astype(ids, int32), {-1})),
         contiguous(reshape(astype(probabilities, float32), {-1})),
         array({uint32_t(weight.input_size()), uint32_t(n), uint32_t(weight.expert_count()), uint32_t(ids.shape(1)), uint32_t(groups)})},

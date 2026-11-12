@@ -1,5 +1,7 @@
 #pragma once
 
+#include "engine/backends/metal/native/tensor/tensor.h"
+
 #include <mlx/mlx.h>
 #include <array>
 #include <optional>
@@ -47,14 +49,14 @@ public:
     std::optional<std::vector<mlx::core::array>> gated_residual(const mlx::core::array& normalized,
         const MlxAffineWeight& up, const MlxAffineWeight* injection, int streams) const;
     int input_size() const noexcept { return width_; }
-    int output_size() const noexcept { return values_.shape(-2); }
-    int expert_count() const noexcept { return values_.ndim() == 3 ? values_.shape(0) : 1; }
-    mlx::core::Dtype activation_dtype() const noexcept { return scales_.dtype(); }
+    int output_size() const noexcept { return values_.size(-2); }
+    int expert_count() const noexcept { return values_.dim() == 3 ? values_.size(0) : 1; }
+    mlx::core::Dtype activation_dtype() const noexcept { return tyloi::metal::array(scales_).dtype(); }
     std::size_t packed_nbytes() const noexcept;
 private:
     MlxAffineWeight(mlx::core::array values, mlx::core::array scales, mlx::core::array biases,
         int bits, int group_size, int width);
-    mlx::core::array values_, scales_, biases_;
+    tyloi::Tensor values_, scales_, biases_;
     int bits_, group_size_, width_;
     std::shared_ptr<const MlxNativeGgufWeight> native_;
     friend class MlxAffineStaged;

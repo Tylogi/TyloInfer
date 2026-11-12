@@ -1,5 +1,6 @@
 #include "mlx_indirect_weight_residency.h"
 #include "mlx_tq.h"
+#include "engine/backends/metal/native/tensor/tensor.h"
 #include "mfq_container.h"
 #include "mfq_tq_embedded.h"
 #include "engine/backends/metal/native/resident_allocations.h"
@@ -1347,7 +1348,7 @@ array prepare_scales(std::span<const std::uint8_t> blob, std::size_t offset,
 MlxTqWeight::MlxTqWeight(array words, array descriptors, array scales,
     int rows, int width, int input_columns, int experts, int group_size,
     int columns, std::size_t bytes, bool pooled)
-    : words_(std::move(words)), descriptors_(std::move(descriptors)), scales_(std::move(scales)),
+    : words_(tyloi::metal::tensor(std::move(words))), descriptors_(tyloi::metal::tensor(std::move(descriptors))), scales_(tyloi::metal::tensor(std::move(scales))),
       rows_(rows), width_(width), input_columns_(input_columns), experts_(experts),
       group_size_(group_size), columns_(columns), pooled_(pooled), nbytes_(bytes) {}
 
@@ -1514,9 +1515,9 @@ bool MlxTqWeight::can_concatenate_rows(const MlxTqWeight& other) const {
     return !pooled_ && !other.pooled_ && columns_ != 2 && other.columns_ != 2
         && input_columns_ == other.input_columns_ && width_ == other.width_
         && group_size_ == other.group_size_ && columns_ == other.columns_
-        && scales_.dtype() == other.scales_.dtype()
-        && (!columns_ || std::memcmp(scales_.data<std::uint8_t>(),
-            other.scales_.data<std::uint8_t>(), scales_.nbytes()) == 0);
+        && tyloi::metal::array(scales_).dtype() == tyloi::metal::array(other.scales_).dtype()
+        && (!columns_ || std::memcmp(tyloi::metal::array(scales_).data<std::uint8_t>(),
+            tyloi::metal::array(other.scales_).data<std::uint8_t>(), scales_.nbytes()) == 0);
 }
 
 MlxTqWeight MlxTqWeight::concatenate_projections(const std::vector<MlxTqWeight>& weights) {
@@ -1537,29 +1538,29 @@ MlxTqWeight MlxTqWeight::concatenate(const std::vector<MlxTqWeight>& weights, bo
             || (!projections && first.output_size() != weight.output_size())
             || (projections && first.experts_ != weight.experts_))
             throw std::invalid_argument("TQ concatenation geometry differs");
-        words += weight.words_.size(); rows += weight.rows_; experts += weight.experts_;
+        words += weight.words_.numel(); rows += weight.rows_; experts += weight.experts_;
         outputs += weight.output_size();
     }
     if (words > std::size_t(INT_MAX) || rows > std::size_t(INT_MAX) || experts > std::size_t(INT_MAX))
         throw std::invalid_argument("TQ concatenation exceeds backend dimension limit");
     const int groups = (first.width_ + first.group_size_ - 1) / first.group_size_;
-    const std::size_t scale_stride = first.scales_.dtype() == float32 ? groups * sizeof(float) : groups / 2;
+    const std::size_t scale_stride = tyloi::metal::array(first.scales_).dtype() == float32 ? groups * sizeof(float) : groups / 2;
     const std::size_t scale_bytes = first.columns_ ? first.scales_.nbytes() : rows * scale_stride;
-    const std::size_t scale_count = scale_bytes / size_of(first.scales_.dtype());
+    const std::size_t scale_count = scale_bytes / size_of(tyloi::metal::array(first.scales_).dtype());
     if (scale_count > std::size_t(INT_MAX))
         throw std::invalid_argument("TQ concatenation scale metadata exceeds backend dimension limit");
     auto packed = array(allocator::malloc(words * 4), Shape{int(words)}, uint32);
     auto descriptors = array(allocator::malloc(rows * 8), Shape{int(rows)}, uint64);
-    auto scales = first.columns_ ? first.scales_
-        : array(allocator::malloc(scale_bytes), Shape{int(scale_count)}, first.scales_.dtype());
+    auto scales = first.columns_ ? tyloi::metal::array(first.scales_)
+        : array(allocator::malloc(scale_bytes), Shape{int(scale_count)}, tyloi::metal::array(first.scales_).dtype());
     mfq::TqLayout layout; layout.compact = first.width_ % 256 != 0;
     auto* target_desc = descriptors.data<std::uint64_t>();
     std::size_t word_base = 0, row_base = 0, projection_base = 0;
     for (std::size_t p = 0; p < weights.size(); ++p) {
         const auto& weight = weights[p];
         std::memcpy(packed.data<std::uint32_t>() + word_base,
-            weight.words_.data<std::uint32_t>(), weight.words_.nbytes());
-        const auto* source = weight.descriptors_.data<std::uint64_t>();
+            tyloi::metal::array(weight.words_).data<std::uint32_t>(), weight.words_.nbytes());
+        const auto* source = tyloi::metal::array(weight.descriptors_).data<std::uint64_t>();
         const int block_rows = projections ? weight.output_size() : weight.rows_;
         const int blocks = projections ? first.experts_ : 1;
         for (int e = 0; e < blocks; ++e) {
@@ -1569,9 +1570,9 @@ MlxTqWeight MlxTqWeight::concatenate(const std::vector<MlxTqWeight>& weights, bo
             for (int r = 0; r < block_rows; ++r)
                 target_desc[to + r] = layout.rebase(source[from + r], std::uint64_t(layout.offset(source[from + r])) + word_base);
             if (!first.columns_) std::memcpy(scales.data<std::uint8_t>() + to * scale_stride,
-                weight.scales_.data<std::uint8_t>() + from * scale_stride, block_rows * scale_stride);
+                tyloi::metal::array(weight.scales_).data<std::uint8_t>() + from * scale_stride, block_rows * scale_stride);
         }
-        word_base += weight.words_.size(); row_base += weight.rows_;
+        word_base += weight.words_.numel(); row_base += weight.rows_;
         projection_base += weight.output_size();
     }
     tyloi::metal::ResidentAllocations::track(packed); tyloi::metal::ResidentAllocations::track(descriptors);
@@ -1599,24 +1600,24 @@ array MlxTqWeight::project_column_inputs(const array& input, const array& ids,
     record_dispatch(input, output_size(), experts_, up ? "column_pair_inputs" : "column_inputs");
     if (up) {
         auto prepared = prepare_column_pair_inputs(*up, input, canonical);
-        return column_pair_kernel()({words_, descriptors_, up->words_, up->descriptors_, relative_table(),
-                prepared[0], prepared[1], canonical, array({limit}), scales_}, {Shape{tokens, routes, output_size()}}, {float16},
+        return column_pair_kernel()({tyloi::metal::array(words_), tyloi::metal::array(descriptors_), tyloi::metal::array(up->words_), tyloi::metal::array(up->descriptors_), relative_table(),
+                prepared[0], prepared[1], canonical, array({limit}), tyloi::metal::array(scales_)}, {Shape{tokens, routes, output_size()}}, {float16},
             {((output_size() + 3) / 4) * 128, total, 1}, {128, 1, 1},
             {{"K", input_columns_}, {"WIDTH_G", width_}, {"WIDTH_U", up->width_},
              {"OUT", output_size()}, {"EXPERTS", experts_}, {"GELU", gelu},
-             {"POOLED_G", pool_kind(pooled_,words_)}, {"POOLED_U", pool_kind(up->pooled_,up->words_)}, {"PREPARE_DOWN", false},
+             {"POOLED_G", pool_kind(pooled_,tyloi::metal::array(words_))}, {"POOLED_U", pool_kind(up->pooled_,tyloi::metal::array(up->words_))}, {"PREPARE_DOWN", false},
              {"DOWN_COLUMN", 0}, {"DOWN_WIDTH", 0}}, std::nullopt, false, {}).front();
     }
-    return column_projection_kernel()({words_, descriptors_, relative_table(), prepare_column_inputs(input, canonical), canonical},
+    return column_projection_kernel()({tyloi::metal::array(words_), tyloi::metal::array(descriptors_), relative_table(), prepare_column_inputs(input, canonical), canonical},
         {Shape{tokens, routes, output_size()}}, {float16}, {((output_size() + 7) / 8) * 128, total, 1}, {128, 1, 1},
-        {{"K", input_columns_}, {"WIDTH", width_}, {"OUT", output_size()}, {"EXPERTS", experts_}, {"POOLED", pool_kind(pooled_,words_)}},
+        {{"K", input_columns_}, {"WIDTH", width_}, {"OUT", output_size()}, {"EXPERTS", experts_}, {"POOLED", pool_kind(pooled_,tyloi::metal::array(words_))}},
         std::nullopt, false, {}).front();
 }
 
 array MlxTqWeight::prepare_column_inputs(const array& input, const array& ids) const {
     const int tokens = ids.shape(0), routes = ids.shape(1), total = tokens * routes;
     const auto source = contiguous(reshape(input, {-1, input_columns_}));
-    return column_input_kernel()({source, scales_, ids}, {Shape{total, input_columns_}}, {float32},
+    return column_input_kernel()({source, tyloi::metal::array(scales_), ids}, {Shape{total, input_columns_}}, {float32},
         {(input_columns_ + 3) / 4, total, 1}, {128, 1, 1},
         {{"K", input_columns_}, {"WIDTH", width_}, {"EXPERTS", experts_}, {"ROUTES", routes},
          {"COLUMN", columns_}, {"SHARED_INPUT", source.shape(0) == tokens}}, std::nullopt, false, {}).front();
@@ -1626,7 +1627,7 @@ std::vector<array> MlxTqWeight::prepare_column_pair_inputs(const MlxTqWeight& up
         const array& input, const array& ids) const {
     const int tokens = ids.shape(0), routes = ids.shape(1), total = tokens * routes;
     const auto source = contiguous(reshape(input, {-1, input_columns_}));
-    return column_pair_input_kernel()({source, scales_, up.scales_, ids},
+    return column_pair_input_kernel()({source, tyloi::metal::array(scales_), tyloi::metal::array(up.scales_), ids},
         {Shape{total, input_columns_}, Shape{total, input_columns_}}, {float32, float32},
         {(input_columns_ + 3) / 4, total, 1}, {128, 1, 1},
         {{"K", input_columns_}, {"WIDTH_G", width_}, {"WIDTH_U", up.width_},
@@ -1671,7 +1672,7 @@ std::vector<array> MlxTqWeight::matmul_many_impl(std::span<const MlxTqWeight> we
         });
     if (column_batch) {
         std::vector<array> prepare_inputs{contiguous(reshape(input, {-1, width}))};
-        for (const auto& weight : weights) prepare_inputs.push_back(weight.scales_);
+        for (const auto& weight : weights) prepare_inputs.push_back(tyloi::metal::array(weight.scales_));
         auto prepared = column_batch_kernel(weights.size(), true)(prepare_inputs,
             {Shape{int(weights.size()), width}}, {float32}, {(width + 3) / 4, int(weights.size()), 1}, {128, 1, 1},
             {{"K", width}}, std::nullopt, false, {}).front();
@@ -1681,11 +1682,11 @@ std::vector<array> MlxTqWeight::matmul_many_impl(std::span<const MlxTqWeight> we
         for (std::size_t p = 0; p < weights.size(); ++p) {
             const auto& weight = weights[p];
             const auto suffix = std::to_string(p);
-            inputs.insert(inputs.end(), {weight.words_, weight.descriptors_});
+            inputs.insert(inputs.end(), {tyloi::metal::array(weight.words_), tyloi::metal::array(weight.descriptors_)});
             templates.emplace_back("BEGIN" + suffix, total);
             total += weight.output_size();
             templates.emplace_back("END" + suffix, total);
-            templates.emplace_back("POOLED" + suffix, pool_kind(weight.pooled_,weight.words_));
+            templates.emplace_back("POOLED" + suffix, pool_kind(weight.pooled_,tyloi::metal::array(weight.words_)));
             templates.emplace_back("WIDTH" + suffix, weight.width_);
         }
         record_dispatch(input, total, 1, "dense_column_inputs");
@@ -1733,14 +1734,14 @@ std::vector<array> MlxTqWeight::matmul_many_impl(std::span<const MlxTqWeight> we
         if (weight.experts_ != 1 || weight.input_size() != width || total > INT_MAX - weight.output_size())
             throw std::invalid_argument("TQ projection batch geometry differs");
         const auto suffix = std::to_string(p);
-        inputs.insert(inputs.end(), {weight.words_, weight.descriptors_, weight.scales_});
+        inputs.insert(inputs.end(), {tyloi::metal::array(weight.words_), tyloi::metal::array(weight.descriptors_), tyloi::metal::array(weight.scales_)});
         templates.emplace_back("BEGIN" + suffix, total);
         total += weight.output_size();
         templates.emplace_back("END" + suffix, total);
         templates.emplace_back("COLUMN" + suffix, weight.columns_);
         templates.emplace_back("WIDTH" + suffix, weight.width_);
         templates.emplace_back("GS" + suffix, weight.group_size_);
-        templates.emplace_back("POOLED" + suffix, pool_kind(weight.pooled_,weight.words_));
+        templates.emplace_back("POOLED" + suffix, pool_kind(weight.pooled_,tyloi::metal::array(weight.words_)));
     }
     templates.emplace_back("TOTAL", total);
     record_dispatch(input, total, 1, staging ? "dense_staged_gemm" : shared ? "dense_shared_nax" : nax ? splits > 1 ? "dense_nax_split" : "dense_nax"
@@ -1760,8 +1761,8 @@ std::vector<array> MlxTqWeight::matmul_many_impl(std::span<const MlxTqWeight> we
     const bool select_decode = tokens == 1 && mode == TqBatchMode::Vector && weights.size() > 1
         && std::all_of(weights.begin(), weights.end(), [&](const auto& weight) {
             return weight.columns_ == first.columns_ && weight.width_ == first.width_
-                && weight.group_size_ == first.group_size_ && weight.scales_.dtype() == first.scales_.dtype()
-                && weight.words_.size() >= 8 && weight.descriptors_.size() >= 8 && weight.scales_.size() >= 8;
+                && weight.group_size_ == first.group_size_ && tyloi::metal::array(weight.scales_).dtype() == tyloi::metal::array(first.scales_).dtype()
+                && weight.words_.numel() >= 8 && weight.descriptors_.numel() >= 8 && weight.scales_.numel() >= 8;
         });
     if (gated_groups) {
         templates.emplace_back("GROUPS", gated_groups);
@@ -1799,15 +1800,15 @@ MlxTqWeight MlxTqWeight::expert_view(int expert) const {
     auto result = *this;
     result.rows_ = output_size(); result.experts_ = 1;
     const int begin = expert * result.rows_;
-    result.descriptors_ = slice(descriptors_, {begin}, {begin + result.rows_});
-    if (pooled_) result.descriptors_ = mlx::core::concatenate({result.descriptors_,
-        slice(descriptors_, {rows_ + expert}, {rows_ + expert + 1})});
+    result.descriptors_ = tyloi::metal::tensor(slice(tyloi::metal::array(descriptors_), {begin}, {begin + result.rows_}));
+    if (pooled_) result.descriptors_ = tyloi::metal::tensor(mlx::core::concatenate({tyloi::metal::array(result.descriptors_),
+        slice(tyloi::metal::array(descriptors_), {rows_ + expert}, {rows_ + expert + 1})}));
     if (!columns_) {
         const int groups = (width_ + group_size_ - 1) / group_size_;
-        const int stride = scales_.dtype() == float32 ? groups : groups / 2;
-        result.scales_ = slice(scales_, {begin * stride}, {(begin + result.rows_) * stride});
+        const int stride = tyloi::metal::array(scales_).dtype() == float32 ? groups : groups / 2;
+        result.scales_ = tyloi::metal::tensor(slice(tyloi::metal::array(scales_), {begin * stride}, {(begin + result.rows_) * stride}));
     } else if (columns_ == 2) {
-        result.scales_ = slice(scales_, {expert * width_}, {(expert + 1) * width_});
+        result.scales_ = tyloi::metal::tensor(slice(tyloi::metal::array(scales_), {expert * width_}, {(expert + 1) * width_}));
         result.columns_ = 1;
         result.group_size_ = 512;
     }
@@ -1840,7 +1841,7 @@ array MlxTqWeight::project(const array& input, const array& ids,
         return project_column_inputs(input, ids, up, limit, gelu);
     if (reuse && !split && (!up || (input_columns_ >= 1024
         && columns_ == u.columns_ && width_ == u.width_ && group_size_ == u.group_size_
-        && scales_.dtype() == u.scales_.dtype()))) {
+        && tyloi::metal::array(scales_).dtype() == tyloi::metal::array(u.scales_).dtype()))) {
         if (reuse->ndim() != 2 || (reuse->shape(1) != 3 && reuse->shape(1) != 5 && reuse->shape(1) != 7 && reuse->shape(1) != 18) || reuse->shape(0) <= 0
             || reuse->dtype() != int32 || !reuse->flags().row_contiguous || tokens > 16)
             throw std::invalid_argument("invalid TQ repeated route plan");
@@ -1867,12 +1868,12 @@ array MlxTqWeight::project(const array& input, const array& ids,
         record_dispatch(input, out, experts_, reuse_nax ? "routed_reuse_nax"
             : column_single ? up ? "routed_pair_reuse_column" : "routed_reuse_column"
             : up ? "routed_pair_reuse" : "routed_reuse");
-        std::vector<array> arguments{words_, descriptors_, scales_, relative_table(), u.words_, u.descriptors_, u.scales_,
+        std::vector<array> arguments{tyloi::metal::array(words_), tyloi::metal::array(descriptors_), tyloi::metal::array(scales_), relative_table(), tyloi::metal::array(u.words_), tyloi::metal::array(u.descriptors_), tyloi::metal::array(u.scales_),
             contiguous(reshape(input, {-1, input_columns_})), *reuse, array({limit})};
         std::vector<std::pair<std::string, fast::TemplateArg>> templates{
              {"T", dtype}, {"OUT", out}, {"K", input_columns_}, {"EXPERTS", experts_}, {"ROUTES", routes},
              {"WIDTH_G", width_}, {"GS_G", group_size_}, {"COLUMN_G", columns_},
-             {"POOLED_G", pool_kind(pooled_,words_)}, {"POOLED_U", pool_kind(u.pooled_,u.words_)},
+             {"POOLED_G", pool_kind(pooled_,tyloi::metal::array(words_))}, {"POOLED_U", pool_kind(u.pooled_,tyloi::metal::array(u.words_))},
              {"REUSE_ROWS", direct ? tokens <= 2 ? 2 : tokens <= 4 ? 4 : tokens <= 6 ? 6 : 4 : reuse->shape(1) - 1},
              {"DIRECT_PLAN", direct},
              {"MIN_NAX_ROWS", nax_rows},
@@ -1897,19 +1898,19 @@ array MlxTqWeight::project(const array& input, const array& ids,
         && input_columns_ >= 2048 && std::int64_t(out) * 2 <= input_columns_) {
         record_dispatch(input, out, 1, "dense_pair_reuse");
         return dense_pair_kernel()(
-            {words_, descriptors_, scales_, relative_table(), u.words_, u.descriptors_, u.scales_,
+            {tyloi::metal::array(words_), tyloi::metal::array(descriptors_), tyloi::metal::array(scales_), relative_table(), tyloi::metal::array(u.words_), tyloi::metal::array(u.descriptors_), tyloi::metal::array(u.scales_),
              contiguous(reshape(input, {tokens, input_columns_})), contiguous(astype(ids, int32)), array({limit})},
             {Shape{tokens, 1, out}}, {dtype}, {((out + 1) / 2) * 128, 1, 1}, {128, 1, 1},
             {{"T", dtype}, {"OUT", out}, {"K", input_columns_}, {"BM", tokens},
              {"STRIDE_G", output_size()}, {"STRIDE_U", u.output_size()}, {"BASE_U", split},
              {"WIDTH_G", width_}, {"WIDTH_U", u.width_}, {"GS_G", group_size_}, {"GS_U", u.group_size_},
-             {"COLUMN_G", columns_}, {"COLUMN_U", u.columns_}, {"POOLED_G", pool_kind(pooled_,words_)}, {"POOLED_U", pool_kind(u.pooled_,u.words_)},
+             {"COLUMN_G", columns_}, {"COLUMN_U", u.columns_}, {"POOLED_G", pool_kind(pooled_,tyloi::metal::array(words_))}, {"POOLED_U", pool_kind(u.pooled_,tyloi::metal::array(u.words_))},
              {"GELU", gelu}}, std::nullopt, false, {}).front();
     }
     const bool paired_routes = (up || split) && (experts_ > 1 || (tokens <= 6 && out < input_columns_))
         && tokens <= 16 && tokens % 2 == 0
         && lanes == 32 && columns_ == u.columns_ && width_ == u.width_ && group_size_ == u.group_size_
-        && scales_.dtype() == u.scales_.dtype();
+        && tyloi::metal::array(scales_).dtype() == tyloi::metal::array(u.scales_).dtype();
     if (experts_ == 1 && routes == 1 && !split && up && !paired_routes
         && (use_nax(input) || stage_weights(input, std::int64_t(output_size()) * 2)
             || (output_size() >= input_columns_
@@ -1934,7 +1935,7 @@ array MlxTqWeight::project(const array& input, const array& ids,
         if (up && !split && ((nax && block_rows == 128) || (!nax && input_columns_ >= 1024))) {
             record_dispatch(input, out, experts_, nax ? "routed_pair_shared_nax" : "routed_pair_simd");
             const int tile_columns = nax ? 64 : 32;
-            return routed_pair_matmul_kernel(nax)({words_, descriptors_, scales_, u.words_, u.descriptors_, u.scales_,
+            return routed_pair_matmul_kernel(nax)({tyloi::metal::array(words_), tyloi::metal::array(descriptors_), tyloi::metal::array(scales_), tyloi::metal::array(u.words_), tyloi::metal::array(u.descriptors_), tyloi::metal::array(u.scales_),
                 relative_table(), contiguous(reshape(input, {-1, input_columns_})), contiguous(order),
                 plan.block_meta, plan.block_count, array({limit})},
                 {Shape{tokens, routes, out}}, {dtype},
@@ -1942,7 +1943,7 @@ array MlxTqWeight::project(const array& input, const array& ids,
                 {{"T", dtype}, {"K", input_columns_}, {"OUT", out}, {"EXPERTS", experts_},
                  {"BM", block_rows}, {"NAX", nax}, {"ROUTES", routes}, {"SHARED_INPUT", source_rows == std::size_t(tokens)},
                  {"WIDTH_G", width_}, {"WIDTH_U", u.width_}, {"GS_G", group_size_}, {"GS_U", u.group_size_},
-                 {"COLUMN_G", columns_}, {"COLUMN_U", u.columns_}, {"POOLED_G", pool_kind(pooled_,words_)}, {"POOLED_U", pool_kind(u.pooled_,u.words_)},
+                 {"COLUMN_G", columns_}, {"COLUMN_U", u.columns_}, {"POOLED_G", pool_kind(pooled_,tyloi::metal::array(words_))}, {"POOLED_U", pool_kind(u.pooled_,tyloi::metal::array(u.words_))},
                  {"GELU", gelu}}, std::nullopt, false, {}).front();
         }
         auto gate = routed_matmul_sorted(input, canonical, order, plan);
@@ -1956,7 +1957,7 @@ array MlxTqWeight::project(const array& input, const array& ids,
     const int outputs_per_group = paired_routes ? 2 : rows_per_group;
     record_dispatch(input, out, experts_, paired_routes ? "routed_pair_tokens" : up || split ? "routed_pair" : "routed_matvec");
     return (paired_routes ? paired_route_kernel() : projection_kernel())(
-        {words_, descriptors_, scales_, relative_table(), u.words_, u.descriptors_, u.scales_,
+        {tyloi::metal::array(words_), tyloi::metal::array(descriptors_), tyloi::metal::array(scales_), relative_table(), tyloi::metal::array(u.words_), tyloi::metal::array(u.descriptors_), tyloi::metal::array(u.scales_),
          contiguous(reshape(input, {-1, input_columns_})), contiguous(astype(ids, int32)), array({limit})},
         {Shape{tokens, routes, out}}, {dtype},
         {((out + outputs_per_group - 1) / outputs_per_group) * 128, paired_routes ? total / 2 : total, 1}, {128, 1, 1},
@@ -1964,7 +1965,7 @@ array MlxTqWeight::project(const array& input, const array& ids,
          {"STRIDE_G", output_size()}, {"STRIDE_U", u.output_size()}, {"BASE_U", split},
          {"WIDTH_G", width_}, {"WIDTH_U", u.width_}, {"GS_G", group_size_}, {"GS_U", u.group_size_},
          {"COLUMN_G", columns_}, {"COLUMN_U", u.columns_}, {"EXPERTS", experts_}, {"ROUTES", routes},
-         {"POOLED_G", pool_kind(pooled_,words_)}, {"POOLED_U", pool_kind(u.pooled_,u.words_)},
+         {"POOLED_G", pool_kind(pooled_,tyloi::metal::array(words_))}, {"POOLED_U", pool_kind(u.pooled_,tyloi::metal::array(u.words_))},
          {"SHARED_INPUT", source_rows == std::size_t(tokens)}, {"PAIR", up != nullptr || split != 0}, {"GELU", gelu}},
         std::nullopt, false, {}).front();
 }
@@ -1991,10 +1992,10 @@ array MlxTqWeight::rms_matmul(const array& input, float eps) const {
         const auto source = contiguous(reshape(input, {int(tokens), input_columns_}));
         record_dispatch(input, rows_, 1, "rms_projection_nax");
         const auto parts = rms_nax_projection_kernel()(
-            {source, words_, descriptors_, scales_, relative_table()}, {Shape{splits, int(tokens), rows_}}, {float32},
+            {source, tyloi::metal::array(words_), tyloi::metal::array(descriptors_), tyloi::metal::array(scales_), relative_table()}, {Shape{splits, int(tokens), rows_}}, {float32},
             {((rows_ + 31) / 32) * 32, int((tokens + 15) / 16), splits}, {32, 1, 1},
             {{"T", input.dtype()}, {"OUT", rows_}, {"K", input_columns_}, {"WIDTH", width_}, {"GS", group_size_},
-             {"COLUMNS", columns_}, {"POOLED", pool_kind(pooled_,words_)}, {"CHUNK", chunk}}, std::nullopt, false, {}).front();
+             {"COLUMNS", columns_}, {"POOLED", pool_kind(pooled_,tyloi::metal::array(words_))}, {"CHUNK", chunk}}, std::nullopt, false, {}).front();
         auto shape = input.shape(); shape.back() = rows_;
         return reshape(rms_nax_reduce_kernel()({source, parts, array({eps})}, {Shape{int(tokens), rows_}}, {float32},
             {int(tokens) * 32, 1, 1}, {128, 1, 1},
@@ -2008,10 +2009,10 @@ array MlxTqWeight::rms_matmul(const array& input, float eps) const {
     record_dispatch(input, rows_, 1, "rms_projection");
     auto shape = input.shape(); shape.back() = rows_;
     return rms_projection_kernel()(
-        {words_, descriptors_, scales_, relative_table(), contiguous(reshape(input, {int(tokens), input_columns_})), array({eps})},
+        {tyloi::metal::array(words_), tyloi::metal::array(descriptors_), tyloi::metal::array(scales_), relative_table(), contiguous(reshape(input, {int(tokens), input_columns_})), array({eps})},
         {shape}, {float32}, {rows_ * 512, int(tokens), 1}, {512, 1, 1},
         {{"T", input.dtype()}, {"OUT", rows_}, {"K", input_columns_}, {"WIDTH", width_}, {"GS", group_size_},
-         {"COLUMNS", columns_}, {"POOLED", pool_kind(pooled_,words_)}}, std::nullopt, false, {}).front();
+         {"COLUMNS", columns_}, {"POOLED", pool_kind(pooled_,tyloi::metal::array(words_))}}, std::nullopt, false, {}).front();
 }
 
 bool MlxTqWeight::can_fuse_gated_mix(const array& input) const {
@@ -2034,12 +2035,12 @@ array MlxTqWeight::gated_mix(const array& input, const array& streams, int group
     auto shape = input.shape(); shape.back() = hidden;
     record_dispatch(input, output_size(), 1, nax ? "gated_mix_nax" : "gated_mix");
     const int threads = nax ? groups * 32 : 128;
-    return reshape((nax ? gated_mix_nax_kernel() : gated_mix_kernel())({words_, descriptors_, scales_, relative_table(),
+    return reshape((nax ? gated_mix_nax_kernel() : gated_mix_kernel())({tyloi::metal::array(words_), tyloi::metal::array(descriptors_), tyloi::metal::array(scales_), relative_table(),
         contiguous(reshape(input, {tokens, input_columns_})), contiguous(reshape(streams, {tokens, output_size()}))},
         {Shape{tokens, hidden}}, {input.dtype()},
         {nax ? ((hidden + 31) / 32) * threads : ((hidden + 3) / 4) * 128, (tokens + batch - 1) / batch, 1}, {threads, 1, 1},
         {{"T", input.dtype()}, {"K", input_columns_}, {"WIDTH", width_}, {"GS", group_size_},
-         {"COLUMNS", columns_}, {"HIDDEN", hidden}, {"GROUPS", groups}, {"POOLED", pool_kind(pooled_,words_)}, {"BM", batch},
+         {"COLUMNS", columns_}, {"HIDDEN", hidden}, {"GROUPS", groups}, {"POOLED", pool_kind(pooled_,tyloi::metal::array(words_))}, {"BM", batch},
          {"COMPACT", input.dtype() == float16 && input_columns_ >= 256 && input_columns_ < 512 && batch >= 3}},
         std::nullopt, false, {}).front(), shape);
 }
@@ -2148,14 +2149,14 @@ array MlxTqWeight::routed_matmul_sorted(const array& input, const array& ids,
     const int threads = !nax ? plan.block_rows * 4 : shared ? plan.block_rows * 2 : 128;
     const int columns = !nax ? 32 : shared ? 64 : 128;
     record_dispatch(input, output_size(), experts_, !nax ? "routed_simd" : shared ? "routed_shared_nax" : "routed_nax");
-    return routed_nax_kernel()({words_, descriptors_, scales_, relative_table(),
+    return routed_nax_kernel()({tyloi::metal::array(words_), tyloi::metal::array(descriptors_), tyloi::metal::array(scales_), relative_table(),
         contiguous(reshape(input, {-1, input_columns_})), contiguous(astype(order, int32)),
         plan.block_meta, plan.block_count},
         {Shape{tokens, routes, output_size()}}, {input.dtype()},
         {((output_size() + columns - 1) / columns) * threads, plan.max_blocks, 1}, {threads, 1, 1},
         {{"T", input.dtype()}, {"K", input_columns_}, {"OUT", output_size()}, {"WIDTH", width_},
          {"GS", group_size_}, {"COLUMNS", columns_}, {"EXPERTS", experts_}, {"BM", plan.block_rows},
-         {"POOLED", pool_kind(pooled_,words_)},
+         {"POOLED", pool_kind(pooled_,tyloi::metal::array(words_))},
          {"ROUTES", routes}, {"SHARED_INPUT", source_rows == std::size_t(tokens)}, {"SHARED_TILE", shared}, {"NAX", nax}},
         std::nullopt, false, {}).front();
 }
@@ -2181,13 +2182,13 @@ array MlxTqWeight::routed_matmul_reduce(const array& input, const array& ids, co
     }
     record_dispatch(input, output_size(), experts_, "routed_reduce");
     return routed_reduce_kernel()(
-        {words_, descriptors_, scales_, relative_table(), contiguous(reshape(input, {-1, input_columns_})),
+        {tyloi::metal::array(words_), tyloi::metal::array(descriptors_), tyloi::metal::array(scales_), relative_table(), contiguous(reshape(input, {-1, input_columns_})),
          contiguous(astype(ids, int32)), contiguous(astype(weights, float32))},
         {Shape{tokens, output_size()}}, {dtype}, {output_size() * routes * lanes, tokens, 1},
         {routes * lanes, 1, 1},
         {{"T", dtype}, {"LANES", lanes}, {"OUT", output_size()}, {"K", input_columns_},
          {"WIDTH", width_}, {"GS", group_size_}, {"COLUMNS", columns_}, {"EXPERTS", experts_},
-         {"POOLED", pool_kind(pooled_,words_)},
+         {"POOLED", pool_kind(pooled_,tyloi::metal::array(words_))},
          {"ROUTES", routes}, {"SHARED_INPUT", source_rows == std::size_t(tokens)}},
         std::nullopt, false, {}).front();
 }
@@ -2210,11 +2211,11 @@ array MlxTqWeight::grouped_row_matmul(const array& input, int groups) const {
             && staged_weights_fit(input_columns_, rows_, dtype))) {
         record_dispatch(input, out, groups, "grouped_staged_gemm", tokens);
         auto values = batch_kernel(1, TqBatchMode::StageWeights)(
-            {contiguous(reshape(input, {-1, input_columns_})), relative_table(), words_, descriptors_, scales_},
+            {contiguous(reshape(input, {-1, input_columns_})), relative_table(), tyloi::metal::array(words_), tyloi::metal::array(descriptors_), tyloi::metal::array(scales_)},
             {Shape{rows_, input_columns_}}, {dtype == float16 ? float16 : float32},
             {(input_columns_ + 3) / 4, rows_, 1}, {128, 1, 1},
             {{"T", dtype}, {"LANES", 16}, {"K", input_columns_}, {"BEGIN0", 0}, {"END0", rows_},
-             {"COLUMN0", columns_}, {"WIDTH0", width_}, {"GS0", group_size_}, {"POOLED0", pool_kind(pooled_,words_)}, {"TOTAL", rows_}},
+             {"COLUMN0", columns_}, {"WIDTH0", width_}, {"GS0", group_size_}, {"POOLED0", pool_kind(pooled_,tyloi::metal::array(words_))}, {"TOTAL", rows_}},
             std::nullopt, false, {}).front();
         auto source = astype(transpose(reshape(input, {tokens, groups, input_columns_}), {1, 0, 2}), values.dtype());
         values = transpose(reshape(values, {groups, out, input_columns_}), {0, 2, 1});
@@ -2241,11 +2242,11 @@ array MlxTqWeight::grouped_row_matmul(const array& input, int groups) const {
         if (threads > INT_MAX) throw std::invalid_argument("TQ grouped projection grid is too large");
         const array sizes({tokens}, int32);
         auto values = grouped_kernel(nax)(
-            {words_, descriptors_, scales_, relative_table(), contiguous(reshape(input, {-1, input_columns_})), sizes},
+            {tyloi::metal::array(words_), tyloi::metal::array(descriptors_), tyloi::metal::array(scales_), relative_table(), contiguous(reshape(input, {-1, input_columns_})), sizes},
             {splits > 1 ? Shape{splits, tokens, rows_} : Shape{tokens, rows_}}, {splits > 1 ? float32 : dtype},
             {int(threads), (tokens + bm - 1) / bm, splits}, {128, 1, 1},
             {{"T", dtype}, {"O", splits > 1 ? float32 : dtype}, {"TOTAL", rows_}, {"OUT", out}, {"GROUPS", groups}, {"K", input_columns_},
-             {"WIDTH", width_}, {"GS", group_size_}, {"COLUMNS", columns_}, {"POOLED", pool_kind(pooled_,words_)},
+             {"WIDTH", width_}, {"GS", group_size_}, {"COLUMNS", columns_}, {"POOLED", pool_kind(pooled_,tyloi::metal::array(words_))},
              {"LANES", lanes}, {"FIXED", fixed},
              {"COMPACT", fixed && lanes == 32 && tokens >= 3 && input_columns_ >= 4096 && out <= input_columns_ / 2},
              {"BM", bm}, {"SPLITS", splits}, {"CHUNK", int((std::int64_t(input_columns_) + splits * 256 - 1) / (splits * 256) * 256)}},
@@ -2257,8 +2258,8 @@ array MlxTqWeight::grouped_row_matmul(const array& input, int groups) const {
     }
     auto grouped = *this;
     grouped.experts_ = groups;
-    if (pooled_) grouped.descriptors_ = mlx::core::concatenate({slice(descriptors_, {0}, {rows_}),
-        broadcast_to(slice(descriptors_, {rows_}, {rows_ + 1}), {groups})});
+    if (pooled_) grouped.descriptors_ = tyloi::metal::tensor(mlx::core::concatenate({slice(tyloi::metal::array(descriptors_), {0}, {rows_}),
+        broadcast_to(slice(tyloi::metal::array(descriptors_), {rows_}, {rows_ + 1}), {groups})}));
     auto ids = broadcast_to(arange(groups, int32), {tokens, groups});
     return reshape(grouped.routed_matmul(input, ids), shape);
 }
@@ -2280,13 +2281,13 @@ MlxTqFfnIntermediate MlxTqWeight::swiglu_for_down(const MlxTqWeight& up, const M
         auto canonical = contiguous(astype(ids, int32));
         auto prepared = prepare_column_pair_inputs(up, input, canonical);
         record_dispatch(input, output_size(), experts_, "column_pair_down_inputs");
-        auto values = column_pair_kernel()({words_, descriptors_, up.words_, up.descriptors_, relative_table(),
-                prepared[0], prepared[1], canonical, array({limit}), down.scales_},
+        auto values = column_pair_kernel()({tyloi::metal::array(words_), tyloi::metal::array(descriptors_), tyloi::metal::array(up.words_), tyloi::metal::array(up.descriptors_), relative_table(),
+                prepared[0], prepared[1], canonical, array({limit}), tyloi::metal::array(down.scales_)},
             {Shape{1, ids.shape(1), output_size()}}, {float32},
             {((output_size() + 3) / 4) * 128, ids.shape(1), 1}, {128, 1, 1},
             {{"K", input_columns_}, {"WIDTH_G", width_}, {"WIDTH_U", up.width_},
              {"OUT", output_size()}, {"EXPERTS", experts_}, {"GELU", gelu},
-             {"POOLED_G", pool_kind(pooled_,words_)}, {"POOLED_U", pool_kind(up.pooled_,up.words_)}, {"PREPARE_DOWN", true},
+             {"POOLED_G", pool_kind(pooled_,tyloi::metal::array(words_))}, {"POOLED_U", pool_kind(up.pooled_,tyloi::metal::array(up.words_))}, {"PREPARE_DOWN", true},
              {"DOWN_COLUMN", down.columns_}, {"DOWN_WIDTH", down.width_}}, std::nullopt, false, {}).front();
         return {std::move(values), true};
     }
@@ -2310,12 +2311,12 @@ array MlxTqWeight::routed_down_pairs(const MlxTqFfnIntermediate& intermediate,
         || values.shape() != Shape{1, ids.shape(1), input_columns_})
         throw std::invalid_argument("TQ prepared Down activations differ");
     record_dispatch(values, output_size(), experts_, "prepared_column_inputs", 1);
-    auto pairs = column_projection_kernel()({words_, descriptors_, relative_table(),
+    auto pairs = column_projection_kernel()({tyloi::metal::array(words_), tyloi::metal::array(descriptors_), relative_table(),
             contiguous(values), contiguous(astype(ids, int32))},
         {Shape{1, ids.shape(1), output_size()}}, {float16},
         {((output_size() + 7) / 8) * 128, ids.shape(1), 1}, {128, 1, 1},
         {{"K", input_columns_}, {"WIDTH", width_}, {"OUT", output_size()}, {"EXPERTS", experts_},
-         {"POOLED", pool_kind(pooled_,words_)}}, std::nullopt, false, {}).front();
+         {"POOLED", pool_kind(pooled_,tyloi::metal::array(words_))}}, std::nullopt, false, {}).front();
     return pairs;
 }
 
@@ -2328,19 +2329,20 @@ array MlxTqWeight::embedding(const array& ids, Dtype dtype) const {
     if (!ids.size() || (dtype != float16 && dtype != bfloat16 && dtype != float32))
         throw std::invalid_argument("invalid TQ embedding request");
     auto shape = ids.shape(); shape.push_back(input_columns_);
-    return embedding_kernel()({words_, descriptors_, scales_, relative_table(), contiguous(astype(ids, int32))},
+    return embedding_kernel()({tyloi::metal::array(words_), tyloi::metal::array(descriptors_), tyloi::metal::array(scales_), relative_table(), contiguous(astype(ids, int32))},
         {shape}, {dtype}, {(input_columns_ + 3) / 4, int(ids.size()), 1}, {128, 1, 1},
         {{"T", dtype}, {"ROWS", rows_}, {"K", input_columns_}, {"WIDTH", width_}, {"OUT", output_size()},
-         {"GS", group_size_}, {"COLUMNS", columns_}, {"POOLED", pool_kind(pooled_,words_)}}, std::nullopt, false, {}).front();
+         {"GS", group_size_}, {"COLUMNS", columns_}, {"POOLED", pool_kind(pooled_,tyloi::metal::array(words_))}}, std::nullopt, false, {}).front();
 }
 
 void MlxTqWeight::set_expert_word_offset(int expert, std::uint64_t word_offset) {
     if (!pooled_ || expert < 0 || expert >= experts_)
         throw std::out_of_range("invalid TQ pooled expert");
-    auto* descriptors = descriptors_.data<std::uint64_t>();
+    auto descriptor_array = tyloi::metal::array(descriptors_);
+    auto* descriptors = descriptor_array.data<std::uint64_t>();
     const auto last = descriptors[(expert + 1) * output_size() - 1];
     const auto words = std::uint32_t(last) + std::uint64_t(width_) * (((last >> 32) & 7) + 1) / 32;
-    if (word_offset > words_.size() || words > words_.size() - word_offset)
+    if (word_offset > words_.numel() || words > words_.numel() - word_offset)
         throw std::out_of_range("TQ expert exceeds the word pool");
     descriptors[rows_ + expert] = word_offset;
 }

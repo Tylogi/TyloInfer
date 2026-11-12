@@ -1,6 +1,7 @@
 #include "engine/backends/metal/native/memory.h"
 #include "mlx_indirect_weight_residency.h"
 #include "mlx_tq_expert_cache.h"
+#include "engine/backends/metal/native/tensor/tensor.h"
 #include "mlx_tq_rows.h"
 #include "mlx_moe_ops.h"
 #include "mfq_container.h"
@@ -408,7 +409,7 @@ struct MlxTqExpertCache::Impl {
         for (int projection = 0; projection < 3; ++projection) {
             pools[projection].allocate_storage(capacities[projection]);
             allocated += pools[projection].capacity;
-            for (auto& layer : layers) layer.banks[projection].weight->words_ = pools[projection].words;
+            for (auto& layer : layers) layer.banks[projection].weight->words_ = tyloi::metal::tensor(pools[projection].words);
         }
         for (auto& layer : layers) {
             layer.weights = std::make_unique<MlxTqExpertWeights>(MlxTqExpertWeights{
@@ -464,13 +465,15 @@ struct MlxTqExpertCache::Impl {
 
     void bind_pools() {
         for (auto& layer : layers) {
-            for (int p = 0; p < 3; ++p) layer.banks[p].weight->words_ = pools[p].words;
+            for (int p = 0; p < 3; ++p) layer.banks[p].weight->words_ = tyloi::metal::tensor(pools[p].words);
             layer.weights = std::make_unique<MlxTqExpertWeights>(MlxTqExpertWeights{
                 *layer.banks[0].weight, *layer.banks[1].weight, *layer.banks[2].weight});
         }
-        for(const auto& [key,entry]:entries)for(int projection=0;projection<3;++projection)
-            layers[entry.layer].banks[projection].weight->descriptors_.data<std::uint64_t>()[
+        for(const auto& [key,entry]:entries)for(int projection=0;projection<3;++projection) {
+            auto descriptors = tyloi::metal::array(layers[entry.layer].banks[projection].weight->descriptors_);
+            descriptors.data<std::uint64_t>()[
                 layers[entry.layer].banks[projection].weight->rows_+entry.expert]=pools[projection].address(entry.allocations[projection].offset);
+        }
     }
 
     void release_pools() {
@@ -549,14 +552,15 @@ struct MlxTqExpertCache::Impl {
                     }
                     if (entry == entries.end()) break;
                     entry->second.allocations[p] = *target;
-                    layers[entry->second.layer].banks[p].weight->descriptors_.data<std::uint64_t>()[
+                    auto descriptors = tyloi::metal::array(layers[entry->second.layer].banks[p].weight->descriptors_);
+                    descriptors.data<std::uint64_t>()[
                         layers[entry->second.layer].banks[p].weight->rows_+entry->second.expert]=pools[p].address(target->offset);
                 }
             }
 
             for (auto& layer : layers) {
                 layer.weights.reset();
-                for (auto& bank : layer.banks) bank.weight->words_ = array(0, uint32);
+                for (auto& bank : layer.banks) bank.weight->words_ = tyloi::metal::tensor(array(0, uint32));
             }
             for (auto& pool : pools) { pool.words=array(0,uint32);pool.lifetime.reset(); }
             try {
@@ -714,7 +718,8 @@ struct MlxTqExpertCache::Impl {
             if(next>pool.capacity||span.bytes>pool.capacity-next)throw std::runtime_error("TQ compacted working set exceeds the chunked pool");
             if (span.offset != next) std::memmove(pool.data + next, pool.data + span.offset, span.bytes);
             span.offset = next;
-            layers[entry->layer].banks[projection].weight->descriptors_.data<std::uint64_t>()[
+            auto descriptors = tyloi::metal::array(layers[entry->layer].banks[projection].weight->descriptors_);
+            descriptors.data<std::uint64_t>()[
                 layers[entry->layer].banks[projection].weight->rows_+entry->expert]=pool.address(next);
             next += span.bytes;
         }
@@ -846,9 +851,11 @@ struct MlxTqExpertCache::Impl {
                 for (int p = 0; p < 3; ++p)
                     if (!job.demand->loaded.at(entry.expert*3+p))
                         throw std::logic_error("required expert prefetch was skipped");
-                for (int p = 0; p < 3; ++p)
-                    layers[job.layer].banks[p].weight->descriptors_.data<std::uint64_t>()[
+                for (int p = 0; p < 3; ++p) {
+                    auto descriptors = tyloi::metal::array(layers[job.layer].banks[p].weight->descriptors_);
+                    descriptors.data<std::uint64_t>()[
                         layers[job.layer].banks[p].weight->rows_ + entry.expert] = pools[p].address(entry.allocations[p].offset);
+                }
             }
         } catch (...) {
             for (const auto key : job.added)
@@ -983,8 +990,10 @@ struct MlxTqExpertCache::Impl {
             const auto publish_offsets = [&](int first, int last) {
                 for (const auto key : added) {
                     const auto& entry = entries.at(key);
-                    for (int p = first; p < last; ++p)
-                        layer.banks[p].weight->descriptors_.data<std::uint64_t>()[layer.banks[p].weight->rows_+entry.expert]=pools[p].address(entry.allocations[p].offset);
+                    for (int p = first; p < last; ++p) {
+                        auto descriptors = tyloi::metal::array(layer.banks[p].weight->descriptors_);
+                        descriptors.data<std::uint64_t>()[layer.banks[p].weight->rows_+entry.expert]=pools[p].address(entry.allocations[p].offset);
+                    }
                 }
             };
             if (stage && !preload && gate_up_reads < reads.size()) {

@@ -1,3 +1,4 @@
+#include "engine/backends/metal/native/tensor/tensor.h"
 #include "mlx_gguf_staged.h"
 #include "engine/backends/metal/native/kernel.h"
 #include "../../platform/metal_device_info.h"
@@ -238,7 +239,7 @@ std::optional<std::vector<array>> MlxGgufStagedPrefill::project_split_many(
         if (count > INT_MAX) throw std::overflow_error("GGUF split projection scratch exceeds the array limit");
         const int counter_count = s > 1 ? std::max(kDeviceScratchElements, n / 64) : kDeviceScratchElements;
         if (i < weights.size()) workspace_sizes[i] = {i * 5 + 3, i * 5 + 4, count, counter_count};
-        inputs.insert(inputs.end(), {weight.bytes_, (*weight.planes_)[0], (*weight.planes_)[1],
+        inputs.insert(inputs.end(), {tyloi::metal::array(weight.bytes_), tyloi::metal::array((*weight.planes_)[0]), tyloi::metal::array((*weight.planes_)[1]),
             scratch, counters});
         auto shape = input.shape(); shape.back() = n;
         shapes.push_back(n ? std::move(shape) : Shape{1});

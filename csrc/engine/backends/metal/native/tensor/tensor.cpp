@@ -19,6 +19,9 @@ ScalarType scalar_type(mlx::core::Dtype dtype) {
     namespace mx = mlx::core;
     if (dtype == mx::bool_) return ScalarType::boolean;
     if (dtype == mx::uint8) return ScalarType::uint8;
+    if (dtype == mx::uint16) return ScalarType::uint16;
+    if (dtype == mx::uint32) return ScalarType::uint32;
+    if (dtype == mx::uint64) return ScalarType::uint64;
     if (dtype == mx::int8) return ScalarType::int8;
     if (dtype == mx::int16) return ScalarType::int16;
     if (dtype == mx::int32) return ScalarType::int32;

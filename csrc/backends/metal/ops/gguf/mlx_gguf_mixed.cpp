@@ -1,3 +1,4 @@
+#include "engine/backends/metal/native/tensor/tensor.h"
 #include "mlx_gguf.h"
 #include "mlx_gguf_staged.h"
 #include "gguf_embedded.h"
@@ -507,7 +508,7 @@ MlxGgufWeight MlxGgufWeight::from_mixed_experts(Shape shape, const std::vector<s
     auto table = mlx_buffer_view(lifetime->table.buffer(), lifetime->table.shape(), uint64, lifetime);
     register_indirect_weight_pool(table, lifetime->residency);
     MlxGgufWeight result(std::move(table), std::move(shape), -1, 0, true);
-    result.mixed_layout_ = array(layout.begin(), Shape{result.expert_count(), 2}, uint32);
+    result.mixed_layout_ = tyloi::metal::tensor(array(layout.begin(), Shape{result.expert_count(), 2}, uint32));
     result.mixed_mask_ = mask;
     for (const auto& value : packed) result.mixed_payload_bytes_ += value.nbytes();
     return result;
@@ -533,7 +534,7 @@ MlxGgufWeight MlxGgufWeight::from_mixed_address_table(Shape shape, const std::ve
     auto handle = mlx_buffer_view(table.buffer(), table.shape(), uint64, owner);
     register_indirect_weight_pool(handle, owner->residency);
     MlxGgufWeight result(std::move(handle), std::move(shape), -1, 0, true);
-    result.mixed_layout_ = array(layout.begin(), Shape{result.expert_count(), 2}, uint32);
+    result.mixed_layout_ = tyloi::metal::tensor(array(layout.begin(), Shape{result.expert_count(), 2}, uint32));
     result.mixed_mask_ = mask;
     return result;
 }
@@ -546,7 +547,7 @@ array MlxGgufWeight::mixed_matmul(const array& input, const array& ids, bool sha
     if (tokens > 8 && simd_prefill(input_size(), n, expert_count(), ids.size())) {
         std::optional<MlxGgufRoutePlan> owned;
         if (!plan) { owned = gguf_route_plan(ids, expert_count(), true); plan = &*owned; }
-        return simd_prefill_kernel()({bytes_, *mixed_layout_, contiguous(input), plan->order, plan->bounds, plan->tile_offsets, params},
+        return simd_prefill_kernel()({tyloi::metal::array(bytes_), tyloi::metal::array(*mixed_layout_), contiguous(input), plan->order, plan->bounds, plan->tile_offsets, params},
             {shape}, {input.dtype()}, {((n + 31) / 32) * 128, plan->tiles, (plan->tile_rows + 15) / 16}, {128, 1, 1},
             {{"MASK", mixed_mask_}, {"T", input.dtype()}, {"SHARED", shared_input}, {"BM", plan->tile_rows}}, 0.f, false, {}).front();
     }
@@ -554,18 +555,18 @@ array MlxGgufWeight::mixed_matmul(const array& input, const array& ids, bool sha
         std::optional<MlxGgufRoutePlan> owned;
         if (!plan) { owned = gguf_route_plan(ids, expert_count(), true); plan = &*owned; }
         if (!gather_prefill(input_size(), n, expert_count(), ids.size(), *plan))
-            return prefill_kernel(false)({bytes_, *mixed_layout_, contiguous(input), plan->order, plan->bounds, plan->tile_offsets, params},
+            return prefill_kernel(false)({tyloi::metal::array(bytes_), tyloi::metal::array(*mixed_layout_), contiguous(input), plan->order, plan->bounds, plan->tile_offsets, params},
                 {shape}, {input.dtype()}, {((n + 127) / 128) * 128, plan->tiles, 1}, {128, 1, 1},
                 {{"MASK", mixed_mask_}, {"T", input.dtype()}, {"SHARED", shared_input}, {"BM", plan->tile_rows},
                     {"SPARSE", ids.size() <= std::size_t(expert_count()) * 2}}, 0.f, false, {}).front();
         const auto gathered = gathered_input ? *gathered_input
             : gather_prefill_input(input, expert_count(), routes, shared_input, *plan);
-        return prefill_kernel(true)({bytes_, *mixed_layout_, gathered, plan->order, plan->bounds, plan->tile_offsets,
+        return prefill_kernel(true)({tyloi::metal::array(bytes_), tyloi::metal::array(*mixed_layout_), gathered, plan->order, plan->bounds, plan->tile_offsets,
             array({uint32_t(input_size()), uint32_t(n), uint32_t(expert_count()), uint32_t(routes), uint32_t(plan->tiles * plan->tile_rows)})},
             {shape}, {input.dtype()}, {((n + 127) / 128) * 128, plan->tiles, 1}, {128, 1, 1},
             {{"MASK", mixed_mask_}, {"T", input.dtype()}, {"SHARED", false}, {"BM", plan->tile_rows}}, 0.f, false, {}).front();
     }
-    return project_kernel()({bytes_, *mixed_layout_, contiguous(input), contiguous(astype(ids, int32)), params},
+    return project_kernel()({tyloi::metal::array(bytes_), tyloi::metal::array(*mixed_layout_), contiguous(input), contiguous(astype(ids, int32)), params},
         {shape}, {input.dtype()}, {((n + 15) / 16) * 128, int(ids.size()), 1}, {128, 1, 1},
         {{"MASK", mixed_mask_}, {"T", input.dtype()}, {"SHARED", shared_input}}, std::nullopt, false, {}).front();
 }
@@ -590,11 +591,11 @@ array MlxGgufWeight::mixed_swiglu(const MlxGgufWeight& up, const array& input, c
     const bool staged = planes_.has_value() || up.planes_.has_value();
     const auto params = array({uint32_t(input_size()), uint32_t(n), uint32_t(expert_count()), uint32_t(ids.shape(1)),
         limit > 0.f ? std::bit_cast<uint32_t>(limit) : 0u, planes_ ? 0u : uint32_t(row_bytes_), up.planes_ ? 0u : uint32_t(up.row_bytes_)});
-    std::vector<array> inputs{bytes_, mixed_layout_ ? *mixed_layout_ : params,
-        up.bytes_, up.mixed_layout_ ? *up.mixed_layout_ : params, contiguous(input), contiguous(astype(ids, int32)),
+    std::vector<array> inputs{tyloi::metal::array(bytes_), mixed_layout_ ? tyloi::metal::array(*mixed_layout_) : params,
+        tyloi::metal::array(up.bytes_), up.mixed_layout_ ? tyloi::metal::array(*up.mixed_layout_) : params, contiguous(input), contiguous(astype(ids, int32)),
         params};
-    if (staged) inputs.insert(inputs.end(), {planes_ ? (*planes_)[0] : params, planes_ ? (*planes_)[1] : params,
-        up.planes_ ? (*up.planes_)[0] : params, up.planes_ ? (*up.planes_)[1] : params});
+    if (staged) inputs.insert(inputs.end(), {planes_ ? tyloi::metal::array((*planes_)[0]) : params, planes_ ? tyloi::metal::array((*planes_)[1]) : params,
+        up.planes_ ? tyloi::metal::array((*up.planes_)[0]) : params, up.planes_ ? tyloi::metal::array((*up.planes_)[1]) : params});
     return gate_up_kernel(staged)(inputs,
         {{ids.shape(0), ids.shape(1), n}}, {input.dtype()}, {((n + 15) / 16) * 128, int(ids.size()), 1}, {128, 1, 1},
         {{"GMASK", mixed_mask_}, {"UMASK", up.mixed_mask_}, {"T", input.dtype()},
@@ -629,7 +630,7 @@ array MlxGgufWeight::routed_weighted_matmul(const array& input, const array& ids
     const int threads = groups * 32;
     const auto params = array({uint32_t(input_size()), uint32_t(n), uint32_t(expert_count()), uint32_t(ids.shape(1)),
         uint32_t(row_bytes_), uint32_t(groups)});
-    return weighted_kernel()({bytes_, mixed_layout_ ? *mixed_layout_ : params, contiguous(input), contiguous(astype(ids, int32)),
+    return weighted_kernel()({tyloi::metal::array(bytes_), mixed_layout_ ? tyloi::metal::array(*mixed_layout_) : params, contiguous(input), contiguous(astype(ids, int32)),
         contiguous(astype(probabilities, float32)),
         params},
         {{ids.shape(0), n}}, {input.dtype()}, {((n + 32 / lanes - 1) / (32 / lanes)) * threads, ids.shape(0), 1}, {threads, 1, 1},
