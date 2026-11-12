@@ -2,9 +2,8 @@
 #include "engine/models/session/snapshot.h"
 
 #include "engine/models/qwen35/state.h"
+#include "engine/models/session/cache.h"
 #include "engine/backends/cuda/native/collectives.h"
-#include <exception>
-#include <optional>
 
 namespace tyloi::cuda::qwen35 {
 
@@ -113,29 +112,9 @@ MtpSessionState Mtp::capture_session_state(const tyloi::models::MtpState& value,
 
 void restore_session(State& state, Mtp* mtp, const TextSessionState& snapshot,
         const std::function<void()>& drain) {
-    auto target = state.prepare(snapshot);
-    std::optional<MtpState::Restore> predictor;
-    MtpState* predictor_state = nullptr;
-    if (mtp != nullptr) {
-        if (!state.predictor || !snapshot.mtp || snapshot.mtp->cache_pos != snapshot.cache_pos - 1)
-            throw CudaSessionStateError("Qwen MTP session boundary is incompatible");
-        predictor_state = &mtp->state<MtpState>(*state.predictor);
-        predictor.emplace(predictor_state->prepare(*snapshot.mtp));
-    }
-    try {
-        state.stage(target, snapshot);
-        if (predictor_state) predictor_state->stage(*predictor, *snapshot.mtp);
-        drain();
-        state.publish(std::move(target));
-        if (predictor_state) predictor_state->publish(std::move(*predictor));
-    } catch (...) {
-        const auto error = std::current_exception();
-        try {
-            drain();
-        } catch (...) {
-        }
-        std::rethrow_exception(error);
-    }
+    tyloi::cuda::internal::CudaSessionOps::restore(
+        static_cast<tyloi::models::State&>(state), snapshot, drain,
+        static_cast<tyloi::models::Mtp*>(mtp));
 }
 
 } // namespace tyloi::cuda::qwen35

@@ -121,6 +121,25 @@ MtpState::Restore MtpState::prepare(const MtpSessionState& saved) const {
     return {std::vector<tyloi::state::KvView>(kv_.size()), saved.cache_pos};
 }
 
+namespace {
+class SessionRestore final : public tyloi::models::Restore {
+public:
+    SessionRestore(MtpState& state, const MtpSessionState& saved)
+        : state_(state), saved_(saved), candidate_(state.prepare(saved_)) {}
+    void stage() override { state_.stage(candidate_, saved_); }
+    void publish() noexcept override { state_.publish(std::move(candidate_)); }
+
+private:
+    MtpState& state_;
+    MtpSessionState saved_;
+    MtpState::Restore candidate_;
+};
+} // namespace
+
+std::unique_ptr<tyloi::models::Restore> MtpState::prepare_restore(const MtpSessionState& saved) {
+    return std::make_unique<SessionRestore>(*this, saved);
+}
+
 void MtpState::stage(Restore& restore, const MtpSessionState& saved) const {
     const auto& blocks = std::get<std::vector<KvSnapshot>>(saved.payload);
     for (size_t index = 0; index < restore.kv.size(); ++index) {

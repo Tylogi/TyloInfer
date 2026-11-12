@@ -41,9 +41,6 @@ public:
     bool retains_partial_target_prefix() const noexcept override { return true; }
 
 private:
-    friend void restore_session(State&, Mtp*, const TextSessionState&,
-        const std::function<void()>&);
-
     ::tyloi::DenseTensor evaluate(
         MtpState& state, ::tyloi::DenseTensor hidden, ::tyloi::DenseTensor next_ids,
         ::tyloi::DenseTensor positions) const;

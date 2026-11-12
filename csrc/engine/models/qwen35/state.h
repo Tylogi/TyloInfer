@@ -88,7 +88,9 @@ public:
     bool supports_text_session_state() const override;
     bool supports_paged_text_session_state() const override;
     TextSessionState capture_text_session_state(
-        const std::vector<std::int64_t>& tokens) const;
+        const std::vector<std::int64_t>& tokens) const override;
+    std::unique_ptr<tyloi::models::Restore> prepare_restore(
+        const TextSessionState& state, const tyloi::models::Mtp* predictor_model = nullptr) override;
     Restore prepare(const TextSessionState& state) const;
     void stage(Restore& restore, const TextSessionState& state) const;
     void publish(Restore&& restore) noexcept;

@@ -6,6 +6,8 @@
 #include "sessions.h"
 #include "../../requests/result.h"
 #include "engine/tensor.h"
+#include "engine/models/state.h"
+#include "engine/models/common/mtp.h"
 
 #include <algorithm>
 #include <iostream>
@@ -67,8 +69,15 @@ template <class Backend> class SessionCache : public tyloi::state::Sessions {
           trace_(session_config.trace), supported_(supported), disabled_reason_(disabled_reason),
           native_hot_snapshots_(native_hot_snapshots) {}
 
-    bool persistent_prefix_enabled() const noexcept {
+    bool persistent_prefix_enabled() const noexcept override {
         return static_cast<bool>(paged_cache_) || (native_hot_snapshots_ && supported_ && snapshots_.enabled());
+    }
+
+    tyloi::state::SessionRestore restore_best(tyloi::models::State &state, std::function<void()> &drain,
+        tyloi::models::Mtp *mtp, const std::string &session, const std::vector<int64_t> &prompt,
+        size_t maximum_prefix, const std::string &input_key = {}) override {
+        return restore_best<tyloi::models::State, std::function<void()>, tyloi::models::Mtp>(
+            state, drain, mtp, session, prompt, maximum_prefix, input_key);
     }
 
     template <typename State, typename Resources, typename Predictor>
@@ -129,7 +138,7 @@ template <class Backend> class SessionCache : public tyloi::state::Sessions {
         }
     }
 
-    void store(const std::string &session_id, Snapshot state) {
+    void store(const std::string &session_id, Snapshot state) override {
         reserve_ram(state.bytes);
         if (!supported_)
             return;

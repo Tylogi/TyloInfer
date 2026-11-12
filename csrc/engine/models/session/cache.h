@@ -30,14 +30,9 @@ namespace tyloi::cuda::internal {
 
 bool cuda_has_separate_memory();
 
-struct TextSessionRestore {
-    std::size_t tokens = 0;
-    ::tyloi::Tensor mtp_last_target_hidden;
-};
-
 struct CudaSessionOps {
     using Snapshot = TextSessionState;
-    using Restore = TextSessionRestore;
+    using Restore = tyloi::state::SessionRestore;
     using StateError = CudaSessionStateError;
 
     static TextSessionState decode(
@@ -67,6 +62,9 @@ struct CudaSessionOps {
             throw CudaSessionStateError("model state has no predictor state");
         }
     }
+
+    static void restore(tyloi::models::State& state, const Snapshot& snapshot,
+        const std::function<void()>& drain, tyloi::models::Mtp* mtp);
 
     template <class State, class Predictor>
     static void restore(

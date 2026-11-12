@@ -3,10 +3,14 @@
 #include "engine/budget.h"
 #include "engine/generation/decode.h"
 #include "engine/generation/generation.h"
+#include "engine/generation/mtp/state.h"
 #include "engine/generation/sampling.h"
 #include "engine/models/causal_model.h"
+#include "engine/models/common/mtp.h"
+#include "engine/models/session/snapshot.h"
 #include "engine/scheduler/request.h"
 #include "engine/models/source.h"
+#include "engine/state/session/sessions.h"
 #include "engine/weights/cache.h"
 
 #include <algorithm>
@@ -161,6 +165,8 @@ struct Plain {
 
 struct Native {
     using Prepared = models::Prepared;
+    using Hidden = Tensor;
+    using Restore = state::SessionRestore;
     models::CausalModel& model;
     models::State& state;
     tyloi::Executor& executor;
@@ -171,6 +177,10 @@ struct Native {
     const Config& config;
     const models::ForwardOptions& forward_options;
     const ModelSource* source;
+    state::Sessions& cache;
+    std::function<void()> drain;
+    mtp::State mtp_state;
+    models::Mtp* mtp = nullptr;
     std::optional<Prepared> prepared;
 
     StepSequence<Prepared> prepare(InferenceRequest& input, models::State& target) {
@@ -190,6 +200,9 @@ struct Native {
         weights.trace(boundary, wait, source);
     }
     void prepare_request(const InferenceRequest&) { trace_expert_cache("begin"); }
+    bool batched() const { return false; }
+    bool has_hidden(const Hidden& hidden) const { return hidden && hidden.defined(); }
+    void invalidate_plan() { graph.invalidate(); }
     void reset() { state.reset(1); }
     void release() {
         trace_expert_cache("end");
@@ -197,9 +210,9 @@ struct Native {
         catch (...) { graph.invalidate(); throw; }
         if (std::uncaught_exceptions()) graph.invalidate();
     }
-    Generation plain(InferenceRequest& input, InferenceOutput& output, std::size_t, std::size_t) {
+    Generation plain(InferenceRequest& input, InferenceOutput& output, std::size_t reused, std::size_t stable) {
         const auto& prompt = input.prompt;
-        const auto chunk_size = budget.prefill(prompt.size(), config.generation.prefill_chunk_size,
+        const auto chunk_size = budget.prefill(prompt.size() - reused, config.generation.prefill_chunk_size,
             info.prefill_row_bytes, state.position() > 0, config.prefill_chunk_auto);
         auto full_ids = ops::reshape(ops::tensor(std::span<const int64_t>(prompt),
             config.device), {1, -1});
@@ -210,16 +223,11 @@ struct Native {
         Plain plain{model, state, executor, budget, graph, weights, info, config,
                     forward_options, source, input, output, prepared, chunk_size,
                     std::move(full_ids), std::move(sampler), penalties};
-        auto sequence = generate_sequence(std::ref(plain), output, prompt.size(), 0, 0, chunk_size);
-        bool traced_decode = false;
-        while (auto step = sequence.next()) {
-            if (auto* delta = step.value ? std::get_if<OutputDelta>(&*step.value) : nullptr;
-                delta && !traced_decode && !delta->token_ids.empty()) {
-                trace_expert_cache("decode_begin", false);
-                traced_decode = true;
-            }
-            co_yield std::move(step);
-        }
+        auto sequence = generate_sequence(std::ref(plain), output, prompt.size(), reused, stable, chunk_size);
+        while (auto step = sequence.next()) co_yield std::move(step);
+    }
+    Generation speculate(InferenceRequest&, InferenceOutput&, std::size_t, const Tensor&, Hidden*) {
+        throw std::invalid_argument("this engine has no speculative predictor");
     }
 };
 
@@ -228,7 +236,7 @@ struct Native {
 StepSequence<EventData> Engine::generate(const RequestId& id, Request& request) {
     return generate_prepared(
         Native{*model_, *request.state, *executor_, *budget_, *graph_, *weights_, model_info_,
-               config_, forward_options_, source_.get()},
+               config_, forward_options_, source_.get(), *cache_, [this] { drain(); }},
         *request.state, *executor_, request.input, *request.output, id, request.batched);
 }
 } // namespace tyloi::engine

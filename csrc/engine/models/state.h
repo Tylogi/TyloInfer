@@ -9,11 +9,22 @@
 #include <utility>
 #include <vector>
 
+struct TextSessionState;
+struct MtpSessionState;
+
 namespace tyloi::models {
 
 struct ForwardOptions;
 struct Input;
 struct Mtp;
+
+class Restore {
+public:
+    virtual ~Restore() = default;
+    virtual void stage() = 0;
+    // Publish only after staged copies have completed.
+    virtual void publish() noexcept = 0;
+};
 
 class MtpState {
 public:
@@ -23,6 +34,7 @@ public:
     MtpState& operator=(const MtpState&) = delete;
     bool belongs_to(const Mtp& model) const noexcept { return model_ == &model; }
     virtual std::int64_t position() const noexcept = 0;
+    virtual std::unique_ptr<Restore> prepare_restore(const ::MtpSessionState& snapshot);
 private:
     const Mtp* model_;
 };
@@ -66,6 +78,12 @@ public:
     virtual std::vector<tyloi::Tensor*> graph_state() = 0;
     virtual bool supports_text_session_state() const = 0;
     virtual bool supports_paged_text_session_state() const = 0;
+    virtual ::TextSessionState capture_text_session_state(
+        const std::vector<std::int64_t>& tokens) const;
+    // Preparation validates without submitting copies; the candidate owns staged backing.
+    // This State outlives the transaction.
+    virtual std::unique_ptr<Restore> prepare_restore(
+        const ::TextSessionState& snapshot, const Mtp* predictor_model = nullptr);
 };
 
 } // namespace tyloi::models

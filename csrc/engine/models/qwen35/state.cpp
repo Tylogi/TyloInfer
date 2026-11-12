@@ -487,6 +487,44 @@ State::Restore State::prepare(const TextSessionState& state) const {
     return result;
 }
 
+namespace {
+class SessionRestore final : public tyloi::models::Restore {
+public:
+    SessionRestore(State& state, const TextSessionState& snapshot,
+                   const tyloi::models::Mtp* predictor_model)
+        : state_(state), snapshot_(snapshot), target_(state.prepare(snapshot_)) {
+        if (predictor_model) {
+            if (!state_.predictor || !snapshot_.mtp ||
+                snapshot_.mtp->cache_pos != snapshot_.cache_pos - 1)
+                throw CudaSessionStateError("Qwen MTP session boundary is incompatible");
+            if (!state_.predictor->belongs_to(*predictor_model))
+                throw std::invalid_argument("predictor state belongs to another model");
+            predictor_ = state_.predictor->prepare_restore(*snapshot_.mtp);
+        }
+    }
+
+    void stage() override {
+        state_.stage(target_, snapshot_);
+        if (predictor_) predictor_->stage();
+    }
+    void publish() noexcept override {
+        state_.publish(std::move(target_));
+        if (predictor_) predictor_->publish();
+    }
+
+private:
+    State& state_;
+    TextSessionState snapshot_;
+    State::Restore target_;
+    std::unique_ptr<tyloi::models::Restore> predictor_;
+};
+} // namespace
+
+std::unique_ptr<tyloi::models::Restore> State::prepare_restore(
+        const TextSessionState& state, const tyloi::models::Mtp* predictor_model) {
+    return std::make_unique<SessionRestore>(*this, state, predictor_model);
+}
+
 void State::stage(Restore& restore, const TextSessionState& state) const {
     const auto kind = text_session_state_kind();
     const auto* full_layers = kind == TextSessionStateKind::FullAttention

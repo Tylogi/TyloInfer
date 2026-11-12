@@ -567,7 +567,7 @@ namespace generation_detail {
 
 template <class Model, class State, class Predictor> struct RequestOps {
     using Hidden = ::tyloi::Tensor;
-    using Restore = TextSessionRestore;
+    using Restore = tyloi::state::SessionRestore;
     Model &model;
     State &state;
     tyloi::cuda::Executor* executor;

@@ -31,6 +31,7 @@ public:
     std::vector<tyloi::state::KvView> views() const;
     MtpSessionState capture(int64_t target_position,
         const ::tyloi::Tensor& hidden) const;
+    std::unique_ptr<tyloi::models::Restore> prepare_restore(const MtpSessionState& saved) override;
     Restore prepare(const MtpSessionState& saved) const;
     void stage(Restore& restore, const MtpSessionState& saved) const;
     void publish(Restore&& restore) noexcept;
