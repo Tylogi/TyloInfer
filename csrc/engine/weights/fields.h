@@ -49,12 +49,12 @@ void to_device(Weights& weights, ::tyloi::Device device) {
 
 template <class Weights>
 std::size_t bytes(const Weights& weights) {
-    std::vector<const ::tyloi::DenseTensor*> buffers;
+    std::vector<std::shared_ptr<::tyloi::TensorStorage>> backings;
     tensors(weights, [&](const ::tyloi::Tensor& tensor) {
-        const auto parts = tensor.buffers();
-        buffers.insert(buffers.end(), parts.begin(), parts.end());
+        const auto parts = tensor.backings();
+        backings.insert(backings.end(), parts.begin(), parts.end());
     });
-    return ::tyloi::backing_bytes(buffers);
+    return ::tyloi::backing_bytes(backings);
 }
 
 } // namespace tyloi::weights::fields

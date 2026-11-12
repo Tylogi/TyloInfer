@@ -54,7 +54,7 @@ public:
     int64_t dim() const noexcept override { return 2; }
     int64_t numel() const override { return view_.numel(); }
     std::size_t nbytes() const override { return view_.nbytes(); }
-    std::size_t backing_nbytes() const override { return backing_bytes(buffers()); }
+    std::size_t backing_nbytes() const override { return backing_bytes(backings()); }
     int64_t size(int64_t dimension) const override { return view_.size(dimension); }
     ScalarType scalar_type() const noexcept override { return view_.scalar_type; }
     const Device& device() const noexcept override { return view_.device; }
@@ -65,6 +65,15 @@ public:
         for (const auto& shard : shards) {
             if (!shard.weight) continue;
             auto part = shard.weight.buffers();
+            result.insert(result.end(), part.begin(), part.end());
+        }
+        return result;
+    }
+    std::vector<std::shared_ptr<TensorStorage>> backings() const override {
+        std::vector<std::shared_ptr<TensorStorage>> result;
+        for (const auto& shard : shards) {
+            if (!shard.weight) continue;
+            auto part = shard.weight.backings();
             result.insert(result.end(), part.begin(), part.end());
         }
         return result;

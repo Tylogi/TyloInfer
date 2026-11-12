@@ -891,6 +891,7 @@ std::vector<DenseTensor> chunk(const DenseTensor& source, std::int64_t chunks, s
 // Physical bytes of a set of buffers, counted once per backing identity.
 // Aliased views of one storage contribute only the first one seen.
 std::size_t backing_bytes(std::span<const DenseTensor* const> buffers);
+std::size_t backing_bytes(std::span<const std::shared_ptr<TensorStorage>> storages);
 
 DenseTensor operator+(const DenseTensor& left, const DenseTensor& right);
 DenseTensor operator+(const DenseTensor& left, double right);
