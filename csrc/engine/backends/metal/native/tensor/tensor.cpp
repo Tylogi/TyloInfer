@@ -65,29 +65,7 @@ public:
     bool is_pinned() const noexcept override { return false; }
     std::vector<const DenseTensor*> buffers() const override { return {}; }
     std::vector<std::shared_ptr<TensorStorage>> backings() const override {
-        std::vector<std::shared_ptr<TensorStorage>> storages;
-        std::vector<mlx::core::array> worklist{value_};
-        std::unordered_set<std::uintptr_t> visited;
-        while (!worklist.empty()) {
-            auto node = std::move(worklist.back());
-            worklist.pop_back();
-            if (!visited.insert(node.id()).second) continue;
-            auto data = node.data_shared_ptr();
-            if (data) {
-                auto buffer = allocation_buffer(*data);
-                if (buffer.ptr()) {
-                    auto storage = std::make_shared<TensorStorage>();
-                    storage->owner = std::shared_ptr<void>(data, buffer.ptr());
-                    storage->bytes = static_cast<MTL::Buffer*>(buffer.ptr())->allocatedSize();
-                    storage->device = device_;
-                    storages.push_back(std::move(storage));
-                    continue;
-                }
-            }
-            const auto& inputs = node.inputs();
-            worklist.insert(worklist.end(), inputs.rbegin(), inputs.rend());
-        }
-        return storages;
+        return metal::backings(value_);
     }
     void record_stream(std::uintptr_t, std::shared_ptr<void>) const override {
         throw std::runtime_error("Metal tensor stream recording is not supported");
@@ -106,6 +84,32 @@ private:
 };
 
 }  // namespace
+
+std::vector<std::shared_ptr<TensorStorage>> backings(const mlx::core::array& value) {
+    std::vector<std::shared_ptr<TensorStorage>> storages;
+    std::vector<mlx::core::array> worklist{value};
+    std::unordered_set<std::uintptr_t> visited;
+    while (!worklist.empty()) {
+        auto node = std::move(worklist.back());
+        worklist.pop_back();
+        if (!visited.insert(node.id()).second) continue;
+        auto data = node.data_shared_ptr();
+        if (data) {
+            auto buffer = allocation_buffer(*data);
+            if (buffer.ptr()) {
+                auto storage = std::make_shared<TensorStorage>();
+                storage->owner = std::shared_ptr<void>(data, buffer.ptr());
+                storage->bytes = static_cast<MTL::Buffer*>(buffer.ptr())->allocatedSize();
+                storage->device = Device{DeviceType::metal, 0};
+                storages.push_back(std::move(storage));
+                continue;
+            }
+        }
+        const auto& inputs = node.inputs();
+        worklist.insert(worklist.end(), inputs.rbegin(), inputs.rend());
+    }
+    return storages;
+}
 
 mlx::core::Dtype dtype(ScalarType type) {
     namespace mx = mlx::core;

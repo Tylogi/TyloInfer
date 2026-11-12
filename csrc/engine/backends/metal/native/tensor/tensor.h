@@ -11,6 +11,7 @@ tyloi::Tensor tensor(mlx::core::array value);
 const mlx::core::array& array(const tyloi::Tensor& value);
 mlx::core::Dtype dtype(ScalarType type);
 ScalarType scalar_type(mlx::core::Dtype dtype);
+std::vector<std::shared_ptr<TensorStorage>> backings(const mlx::core::array& value);
 Tensor copy_from_host(const void* data, std::span<const std::int64_t> shape, ScalarType type);
 Tensor copy(const Tensor& value, Device target);
 

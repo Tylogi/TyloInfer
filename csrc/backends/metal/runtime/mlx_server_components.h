@@ -17,6 +17,8 @@
 
 #include <mlx/mlx.h>
 
+namespace tyloi::metal { class Stream; }
+
 namespace mfq::metal {
 
 // Native payload translation is private to the Metal engine. The scheduler
@@ -46,36 +48,36 @@ MlxEngineComponents make_mlx_engine_components(
     const tyloi::ModelGraph* graph,
     std::shared_ptr<std::mutex> runtime_mutex,
     std::shared_ptr<std::optional<MlxQwen35CausalLm>> runtime,
-    mlx::core::Stream runtime_stream);
+    std::shared_ptr<tyloi::metal::Stream> runtime_stream);
 
 MlxEngineComponents make_mlx_engine_components(
     const tyloi::ModelGraph* graph,
     std::shared_ptr<std::mutex> runtime_mutex,
     std::shared_ptr<std::optional<MlxMiniCPMO45Runtime>> runtime,
-    mlx::core::Stream runtime_stream);
+    std::shared_ptr<tyloi::metal::Stream> runtime_stream);
 
 MlxEngineComponents make_mlx_engine_components(
     const tyloi::ModelGraph* graph,
     std::shared_ptr<std::mutex> runtime_mutex,
     std::shared_ptr<std::optional<MlxDeepseekV4CausalLm>> runtime,
-    mlx::core::Stream runtime_stream);
+    std::shared_ptr<tyloi::metal::Stream> runtime_stream);
 
 MlxEngineComponents make_mlx_engine_components(
     const tyloi::ModelGraph* graph,
     std::shared_ptr<std::mutex> runtime_mutex,
     std::shared_ptr<std::optional<MlxDeepseekV41CausalLm>> runtime,
-    mlx::core::Stream runtime_stream);
+    std::shared_ptr<tyloi::metal::Stream> runtime_stream);
 
 MlxEngineComponents make_mlx_engine_components(
     const tyloi::ModelGraph* graph,
     std::shared_ptr<std::mutex> runtime_mutex,
     std::shared_ptr<std::optional<MlxQwen4CausalLm>> runtime,
-    mlx::core::Stream runtime_stream);
+    std::shared_ptr<tyloi::metal::Stream> runtime_stream);
 
 MlxEngineComponents make_mlx_engine_components(
     const tyloi::ModelGraph* graph,
     std::shared_ptr<std::mutex> runtime_mutex,
     std::shared_ptr<std::optional<MlxNemotronHCausalLm>> runtime,
-    mlx::core::Stream runtime_stream);
+    std::shared_ptr<tyloi::metal::Stream> runtime_stream);
 
 } // namespace mfq::metal
