@@ -8,7 +8,6 @@
 #include "engine/models/qwen35/mtp.h"
 #include "engine/backends/cuda/kernels/mfq_cuda_kv_quantization.h"
 
-#include "engine/backends/cuda/native/collectives.h"
 #include "engine/backends/cuda/executor/executor.h"
 #include "engine/backends/cuda/executor/options.h"
 #include "engine/weights/placement.h"
@@ -52,7 +51,6 @@ Components Components::load(
     LayerPlacementConfig& placement,
     int& cpu_layers,
     Executor& executor,
-    Collectives& copies,
     const int64_t& kv_capacity,
     tyloi::ops::Trace* const& trace,
     const int& trace_scope,
@@ -73,12 +71,11 @@ Components Components::load(
             model.supports_speculation()) {
             TransformerWeightLoader loader{weights};
             auto predictor = load_predictor(
-                loader, model.config, cuda_kv_quantization());
+                loader, model, cuda_kv_quantization());
             if (predictor) {
                 // Mtp retains these references, so they must outlive the result.
                 components.mtp = std::make_unique<Mtp>(
-                    std::move(*predictor), model.embed, model.rope,
-                    executor.fork(), copies, weights.placement.device,
+                    std::move(*predictor), executor.fork(),
                     kv_capacity, trace, trace_scope, preallocate);
             }
         } else {

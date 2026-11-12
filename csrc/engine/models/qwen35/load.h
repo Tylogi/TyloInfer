@@ -45,6 +45,6 @@ Layer load_layer(const ::tyloi::weights::Loader&, const Config&,
                  std::string_view tensor_root = "model");
 
 std::optional<tyloi::models::qwen35::Predictor> load_predictor(
-    TransformerWeightLoader&, const Config&, tyloi::state::KvQuantization);
+    TransformerWeightLoader&, const Model&, tyloi::state::KvQuantization);
 
 } // namespace tyloi::cuda::qwen35

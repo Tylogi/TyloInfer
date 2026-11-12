@@ -3,7 +3,6 @@
 #include "engine/models/qwen35/predictor.h"
 #include "engine/models/session/snapshot.h"
 #include "engine/backends/cuda/executor/executor.h"
-#include "engine/backends/cuda/ops/rope/rope.h"
 #include "engine/models/qwen35/mtp_state.h"
 #include "engine/models/common/mtp.h"
 
@@ -19,10 +18,8 @@ void restore_session(State&, Mtp*, const TextSessionState&, const std::function<
 
 class Mtp final : public tyloi::models::Mtp {
 public:
-    Mtp(tyloi::models::qwen35::Predictor model, ::tyloi::Tensor embedding,
-        tyloi::ops::RopeTable rope,
-        std::unique_ptr<Executor> executor, Collectives& copies,
-        int device, const int64_t& kv_capacity, tyloi::ops::Trace* const& trace, const int& trace_scope,
+    Mtp(tyloi::models::qwen35::Predictor model, std::unique_ptr<Executor> executor,
+        const int64_t& kv_capacity, tyloi::ops::Trace* const& trace, const int& trace_scope,
         bool preallocate);
 
     std::unique_ptr<tyloi::models::MtpState> make_state() const override;
@@ -41,16 +38,8 @@ public:
     bool retains_partial_target_prefix() const noexcept override { return true; }
 
 private:
-    ::tyloi::DenseTensor evaluate(
-        MtpState& state, ::tyloi::DenseTensor hidden, ::tyloi::DenseTensor next_ids,
-        ::tyloi::DenseTensor positions) const;
-
     tyloi::models::qwen35::Predictor model_;
-    ::tyloi::Tensor embedding_;
-    tyloi::ops::RopeTable rope_;
     std::unique_ptr<Executor> executor_;
-    Collectives& copies_;
-    int device_;
     const int64_t& kv_capacity_;
     tyloi::ops::Trace* const& trace_;
     const int& trace_scope_;

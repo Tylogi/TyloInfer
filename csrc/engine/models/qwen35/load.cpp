@@ -330,8 +330,9 @@ void load_vision(Model& model, const ::tyloi::weights::Loader& weights, bool res
 }
 
 std::optional<tyloi::models::qwen35::Predictor> load_predictor(TransformerWeightLoader& loader,
-                                         const Config& config,
+                                         const Model& target,
                                          tyloi::state::KvQuantization quantization) {
+    const auto& config = target.config;
     const bool fusion_present = loader.has("predictor.fusion.weight");
     const bool any = fusion_present || loader.has("predictor.hidden_norm.weight") ||
         loader.has("predictor.embedding_norm.weight") ||
@@ -345,6 +346,9 @@ std::optional<tyloi::models::qwen35::Predictor> load_predictor(TransformerWeight
         "Qwen MTP requires declared predictor layers and shared embeddings");
     tyloi::models::qwen35::Predictor model;
     model.config = config;
+    model.embedding = target.embed;
+    model.rope = target.rope;
+    model.device = target.device;
     model.hidden_norm = loader.weights.tensor("predictor.hidden_norm.weight");
     model.embedding_norm = loader.weights.tensor("predictor.embedding_norm.weight");
     model.output_norm = loader.weights.tensor("predictor.output_norm.weight");
