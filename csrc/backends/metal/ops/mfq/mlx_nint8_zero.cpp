@@ -1,6 +1,6 @@
 #include "mlx_nint8_zero.h"
 
-#include "mlx_staging_allocator.h"
+#include "engine/backends/metal/native/memory.h"
 
 #include <mlx/allocator.h>
 
@@ -646,9 +646,9 @@ MlxNint8ZeroWeight MlxNint8ZeroWeight::from_blob(
             "invalid NINT8-0 block payload length");
     }
 
-    detail::StagingVector<std::int8_t> q(
+    tyloi::metal::StagingVector<std::int8_t> q(
         checked_product(blocks, kBlockElements, "quantized value count"));
-    detail::StagingVector<std::uint16_t> scales(blocks);
+    tyloi::metal::StagingVector<std::uint16_t> scales(blocks);
     for (std::size_t block = 0; block < blocks; ++block) {
         scales[block] =
             cursor.scalar<std::uint16_t>("block scale");

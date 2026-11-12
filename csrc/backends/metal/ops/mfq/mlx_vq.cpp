@@ -4,7 +4,7 @@
 
 #include "../../../../core/compat/mfq_format_compat.h"
 #include "nvq_codebooks.generated.h"
-#include "mlx_staging_allocator.h"
+#include "engine/backends/metal/native/memory.h"
 #include <mlx/allocator.h>
 
 #include <algorithm>
@@ -1138,11 +1138,11 @@ public:
         return result;
     }
 
-    detail::StagingVector<std::uint8_t> bytes(
+    tyloi::metal::StagingVector<std::uint8_t> bytes(
         std::size_t count,
         const char* name) {
         require(count, name);
-        detail::StagingVector<std::uint8_t> result(
+        tyloi::metal::StagingVector<std::uint8_t> result(
             blob_.begin() + static_cast<std::ptrdiff_t>(offset_),
             blob_.begin()
                 + static_cast<std::ptrdiff_t>(offset_ + count));
@@ -1251,7 +1251,7 @@ std::size_t packed_nbytes(
     ) / 8;
 }
 
-detail::StagingVector<std::uint8_t> padded_stream(
+tyloi::metal::StagingVector<std::uint8_t> padded_stream(
     BlobCursor& cursor,
     std::size_t count,
     int bits,
@@ -1261,16 +1261,16 @@ detail::StagingVector<std::uint8_t> padded_stream(
     const auto* source = cursor.view(size, name);
     if (borrowed) {
         *borrowed = {source, size};
-        return detail::StagingVector<std::uint8_t>(8, 0);
+        return tyloi::metal::StagingVector<std::uint8_t>(8, 0);
     }
-    detail::StagingVector<std::uint8_t> result;
+    tyloi::metal::StagingVector<std::uint8_t> result;
     result.reserve(size + 8);
     result.insert(result.end(), source, source + size);
     result.resize(size + 8, 0);
     return result;
 }
 
-detail::StagingVector<std::uint16_t> unpack_u16_stream(
+tyloi::metal::StagingVector<std::uint16_t> unpack_u16_stream(
     BlobCursor& cursor,
     std::size_t count,
     int bits,
@@ -1278,7 +1278,7 @@ detail::StagingVector<std::uint16_t> unpack_u16_stream(
     const auto bytes = cursor.bytes(
         packed_nbytes(count, bits),
         name);
-    detail::StagingVector<std::uint16_t> result(count, 0);
+    tyloi::metal::StagingVector<std::uint16_t> result(count, 0);
     for (std::size_t index = 0; index < count; ++index) {
         const auto first_bit = index * static_cast<std::size_t>(bits);
         std::uint16_t value = 0;
@@ -1297,12 +1297,12 @@ float half_to_float(std::uint16_t bits) {
     return static_cast<float>(std::bit_cast<_Float16>(bits));
 }
 
-detail::StagingVector<float> read_half_values(
+tyloi::metal::StagingVector<float> read_half_values(
     BlobCursor& cursor,
     std::size_t count,
     const char* name,
     bool require_nonnegative = true) {
-    detail::StagingVector<float> result(count);
+    tyloi::metal::StagingVector<float> result(count);
     for (auto& value : result) {
         value = half_to_float(
             cursor.scalar<std::uint16_t>(name));
@@ -1358,7 +1358,7 @@ MatrixHeader read_matrix_header(
     return result;
 }
 
-detail::StagingVector<std::int8_t> decode_lattice_codebook(
+tyloi::metal::StagingVector<std::int8_t> decode_lattice_codebook(
     const std::uint16_t* words,
     int entries,
     int vector_size) {
@@ -1368,7 +1368,7 @@ detail::StagingVector<std::int8_t> decode_lattice_codebook(
             "invalid VQ lattice codebook dimensions");
     }
     const int digit_bits = vector_size == 8 ? 2 : 3;
-    detail::StagingVector<std::int8_t> result(
+    tyloi::metal::StagingVector<std::int8_t> result(
         checked_product(
             static_cast<std::size_t>(entries),
             static_cast<std::size_t>(vector_size),
@@ -1390,7 +1390,7 @@ detail::StagingVector<std::int8_t> decode_lattice_codebook(
     return result;
 }
 
-detail::StagingVector<std::int8_t> decode_lattice_codebook(
+tyloi::metal::StagingVector<std::int8_t> decode_lattice_codebook(
     const std::uint8_t* bytes,
     int entries,
     int vector_size) {
@@ -1409,10 +1409,10 @@ detail::StagingVector<std::int8_t> decode_lattice_codebook(
         vector_size);
 }
 
-detail::StagingVector<std::int8_t> decode_ternary_codebook(
+tyloi::metal::StagingVector<std::int8_t> decode_ternary_codebook(
     const std::uint16_t* words,
     int entries) {
-    detail::StagingVector<std::int8_t> result(
+    tyloi::metal::StagingVector<std::int8_t> result(
         checked_product(
             static_cast<std::size_t>(entries),
             std::size_t{8},
@@ -1437,7 +1437,7 @@ detail::StagingVector<std::int8_t> decode_ternary_codebook(
     return result;
 }
 
-detail::StagingVector<std::int8_t> decode_ternary_codebook(
+tyloi::metal::StagingVector<std::int8_t> decode_ternary_codebook(
     const std::uint8_t* bytes,
     int entries) {
     std::vector<std::uint16_t> words(
@@ -2236,7 +2236,7 @@ NepqProfile nepq_profile(int id) {
     }
 }
 
-detail::StagingVector<std::int8_t> parse_rotation_payload(
+tyloi::metal::StagingVector<std::int8_t> parse_rotation_payload(
     std::span<const std::uint8_t> payload,
     int input_size,
     int rotation_block,
@@ -2282,7 +2282,7 @@ detail::StagingVector<std::int8_t> parse_rotation_payload(
         throw std::runtime_error(
             "invalid NEPQ rotation metadata tail");
     }
-    detail::StagingVector<std::int8_t> signs(raw.size());
+    tyloi::metal::StagingVector<std::int8_t> signs(raw.size());
     std::memcpy(signs.data(), raw.data(), raw.size());
     for (const auto sign : signs) {
         if (sign != -1 && sign != 1) {

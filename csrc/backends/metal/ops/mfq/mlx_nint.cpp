@@ -8,7 +8,7 @@
 #include "tyloinfer/nint_blob.h"
 #include "mfq_mfe_prefill_embedded.h"
 #include "mlx_platform.h"
-#include "mlx_staging_allocator.h"
+#include "engine/backends/metal/native/memory.h"
 
 #include <mlx/allocator.h>
 #include <mlx/backend/metal/device.h>
@@ -1032,7 +1032,7 @@ public:
         return value;
     }
 
-    detail::StagingVector<std::uint8_t> bytes(
+    tyloi::metal::StagingVector<std::uint8_t> bytes(
         std::size_t count,
         const char* name,
         std::size_t extra_capacity = 0) {
@@ -1040,7 +1040,7 @@ public:
         if (extra_capacity > std::numeric_limits<std::size_t>::max() - count) {
             throw std::runtime_error("NINT stream capacity overflows");
         }
-        detail::StagingVector<std::uint8_t> result;
+        tyloi::metal::StagingVector<std::uint8_t> result;
         result.reserve(count + extra_capacity);
         result.insert(result.end(),
             blob_.begin() + static_cast<std::ptrdiff_t>(offset_),
@@ -1095,23 +1095,23 @@ std::uint8_t packed_value(
         (value >> shift) & ((1u << bits) - 1u));
 }
 
-detail::StagingVector<std::uint8_t> unpack_values(
+tyloi::metal::StagingVector<std::uint8_t> unpack_values(
     std::span<const std::uint8_t> data,
     std::size_t count,
     int bits) {
-    detail::StagingVector<std::uint8_t> result(count);
+    tyloi::metal::StagingVector<std::uint8_t> result(count);
     for (std::size_t index = 0; index < count; ++index) {
         result[index] = packed_value(data, index, bits);
     }
     return result;
 }
 
-detail::StagingVector<std::uint8_t> pack_values(
+tyloi::metal::StagingVector<std::uint8_t> pack_values(
     std::span<const std::uint8_t> values,
     int bits,
     std::size_t extra_capacity = 0) {
     const auto bytes = packed_size(values.size(), bits);
-    detail::StagingVector<std::uint8_t> result;
+    tyloi::metal::StagingVector<std::uint8_t> result;
     result.reserve(bytes + extra_capacity);
     result.resize(bytes, 0);
     for (std::size_t index = 0; index < values.size(); ++index) {
@@ -1127,12 +1127,12 @@ detail::StagingVector<std::uint8_t> pack_values(
     return result;
 }
 
-detail::StagingVector<std::uint8_t> read_old_values(
+tyloi::metal::StagingVector<std::uint8_t> read_old_values(
     BlobCursor& cursor,
     std::size_t count,
     int storage_bytes,
     const char* name) {
-    detail::StagingVector<std::uint8_t> result(count);
+    tyloi::metal::StagingVector<std::uint8_t> result(count);
     for (std::size_t index = 0; index < count; ++index) {
         const std::uint32_t value = storage_bytes == 1
             ? cursor.scalar<std::uint8_t>(name)
@@ -1664,7 +1664,7 @@ detail::ParsedNintStorage detail::parse_nint_blob(
         throw std::runtime_error("inconsistent NINT Metal dimensions");
     }
 
-    detail::StagingVector<std::uint32_t> neuron_packed(output_size);
+    tyloi::metal::StagingVector<std::uint32_t> neuron_packed(output_size);
     for (std::size_t row = 0; row < output_size; ++row) {
         const auto value = cursor.scalar<std::uint16_t>("neuron scale");
         neuron_packed[row] = value;
@@ -1696,13 +1696,13 @@ detail::ParsedNintStorage detail::parse_nint_blob(
     std::span<const std::uint8_t> borrowed_q;
     std::vector<std::span<const std::uint8_t>> borrowed_sub_scale, borrowed_sub_min;
 
-    detail::StagingVector<std::uint8_t> sub_scale;
-    detail::StagingVector<std::uint8_t> sub_min;
-    detail::StagingVector<std::uint8_t> row_sub_bits(
+    tyloi::metal::StagingVector<std::uint8_t> sub_scale;
+    tyloi::metal::StagingVector<std::uint8_t> sub_min;
+    tyloi::metal::StagingVector<std::uint8_t> row_sub_bits(
         output_size,
         static_cast<std::uint8_t>(sub_bits));
-    detail::StagingVector<std::uint8_t> row_sub_layout(output_size);
-    detail::StagingVector<std::uint32_t> row_sub_offsets(output_size);
+    tyloi::metal::StagingVector<std::uint8_t> row_sub_layout(output_size);
+    tyloi::metal::StagingVector<std::uint32_t> row_sub_offsets(output_size);
     if (adaptive_storage) {
         const auto selector_bytes = packed_size(output_size, kSubSelectorBits);
         const auto selectors = unpack_values(
@@ -1785,9 +1785,9 @@ detail::ParsedNintStorage detail::parse_nint_blob(
     sub_scale.insert(sub_scale.end(), 2u, 0u);
     sub_min.insert(sub_min.end(), 2u, 0u);
 
-    detail::StagingVector<std::uint8_t> q_packed;
-    detail::StagingVector<std::uint8_t> row_q_layout(output_size);
-    detail::StagingVector<std::uint32_t> row_q_byte_offsets(output_size);
+    tyloi::metal::StagingVector<std::uint8_t> q_packed;
+    tyloi::metal::StagingVector<std::uint8_t> row_q_layout(output_size);
+    tyloi::metal::StagingVector<std::uint32_t> row_q_byte_offsets(output_size);
     if (adaptive_storage) {
         const auto selector_bytes = packed_size(output_size, kQSelectorBits);
         const auto selectors = unpack_values(
@@ -1878,7 +1878,7 @@ detail::ParsedNintStorage detail::parse_nint_blob(
         descriptor.distribution_entropy -=
             probability * std::log2(probability);
     }
-    detail::StagingVector<std::uint32_t> row_metadata(
+    tyloi::metal::StagingVector<std::uint32_t> row_metadata(
         static_cast<std::size_t>(output_size) * 4u);
     for (std::size_t row = 0; row < output_size; ++row) {
         const auto base = row * 4u;
@@ -2294,7 +2294,7 @@ MlxNintSwiGluPair::from_weights(
 
     const auto& gate_metadata = gate.row_metadata();
     const auto& up_metadata = up.row_metadata();
-    detail::StagingVector<std::uint32_t> metadata(
+    tyloi::metal::StagingVector<std::uint32_t> metadata(
         gate_metadata.size() + up_metadata.size());
     std::copy_n(
         gate_metadata.data<std::uint32_t>(),
@@ -2325,7 +2325,7 @@ MlxNintSwiGluPair::from_weights(
         metadata[sub_offset] += static_cast<std::uint32_t>(gate_sub_bytes);
     }
 
-    detail::StagingVector<std::uint8_t> q_values(
+    tyloi::metal::StagingVector<std::uint8_t> q_values(
         gate.packed_values().size() + up.packed_values().size());
     std::copy_n(
         gate.packed_values().data<std::uint8_t>(),
@@ -2336,9 +2336,9 @@ MlxNintSwiGluPair::from_weights(
         up.packed_values().size(),
         q_values.begin() + static_cast<std::ptrdiff_t>(
             gate.packed_values().size()));
-    detail::StagingVector<std::uint8_t> sub_scale_values(
+    tyloi::metal::StagingVector<std::uint8_t> sub_scale_values(
         gate.sub_scales().size() + up.sub_scales().size());
-    detail::StagingVector<std::uint8_t> sub_min_values(
+    tyloi::metal::StagingVector<std::uint8_t> sub_min_values(
         gate.sub_mins().size() + up.sub_mins().size());
     std::copy_n(
         gate.sub_scales().data<std::uint8_t>(),
@@ -2409,7 +2409,7 @@ array pack_nint_single_row(const MlxNintWeight& weight) {
     auto metadata = weight.row_metadata();
     metadata.eval();
     std::copy_n(metadata.data<std::uint32_t>(), 4, header.begin() + 4);
-    detail::StagingVector<std::uint8_t> packed(checked_shape(size, "packed NINT router bytes"));
+    tyloi::metal::StagingVector<std::uint8_t> packed(checked_shape(size, "packed NINT router bytes"));
     std::memcpy(packed.data(), header.data(), header_bytes);
     for (std::size_t index = 0; index < streams.size(); ++index) {
         auto stream = streams[index];

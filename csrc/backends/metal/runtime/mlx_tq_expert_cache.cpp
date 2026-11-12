@@ -1,3 +1,4 @@
+#include "engine/backends/metal/native/memory.h"
 #include "mlx_indirect_weight_residency.h"
 #include "mlx_tq_expert_cache.h"
 #include "mlx_tq_rows.h"
@@ -480,7 +481,7 @@ struct MlxTqExpertCache::Impl {
             pool.free.clear(); pool.sizes.clear();
         }
         bind_pools();
-        mlx::core::clear_cache();
+        tyloi::metal::clear_cache();
         allocated = metadata;
         resources.set({0, 0, metadata, backing, 0});
     }

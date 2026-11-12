@@ -1,3 +1,4 @@
+#include "engine/backends/metal/native/memory.h"
 #include "mlx_server_components.h"
 #include "engine/backends/metal/native/stream.h"
 
@@ -343,7 +344,7 @@ MlxEngineComponents make_mlx_engine_components(
             auto& runtime = runtime_holder->value();
             tyloi::metal::drain(runtime_stream);
             runtime.reset();
-            mlx::core::clear_cache();
+            tyloi::metal::clear_cache();
 
             MlxMiniCPMO45DuplexConfig config;
             auto& ids = config.special_ids;
@@ -503,7 +504,7 @@ MlxEngineComponents make_mlx_engine_components(
             tyloi::metal::bind(runtime_stream);
             tyloi::metal::drain(runtime_stream);
             runtime_holder->value().reset();
-            mlx::core::clear_cache();
+            tyloi::metal::clear_cache();
             malloc_zone_pressure_relief(nullptr, 0);
         };
     return result;

@@ -1,3 +1,4 @@
+#include "engine/backends/metal/native/memory.h"
 #include "mfq_container.h"
 #include "mlx_deepseek_v4_causal_lm.h"
 #include "mlx_deepseek_v41_causal_lm.h"
@@ -72,7 +73,7 @@ void release_host_allocator_cache() {
 }
 
 void release_allocator_caches() {
-    mlx::core::clear_cache();
+    tyloi::metal::clear_cache();
     release_host_allocator_cache();
 }
 
@@ -2219,7 +2220,7 @@ public:
         case Kind::memory_budget: {
             const auto previous = resident_budget.load();
             const auto previous_weights = resident_weight_budget.load();
-            const auto before = mlx::core::get_active_memory();
+            const auto before = tyloi::metal::active_memory();
             resident_budget = command.bytes;
             if (command.weight_bytes) resident_weight_budget = *command.weight_bytes;
             try {
@@ -2230,7 +2231,7 @@ public:
             catch (...) { resident_budget = previous; resident_weight_budget = previous_weights; throw; }
             if (batching && (resident_budget.load() != previous || resident_weight_budget.load() != previous_weights))
                 batching->invalidate_runtime_policy();
-            const auto after = mlx::core::get_active_memory();
+            const auto after = tyloi::metal::active_memory();
             return {before > after ? before - after : 0, {}};
         }
         case Kind::refresh:
@@ -2332,7 +2333,7 @@ private:
             if (total) {
                 const auto available = runtime.reclaimable_expert_bytes();
                 const auto used = resident_memory_used();
-                const auto cached = mlx::core::get_cache_memory();
+                const auto cached = tyloi::metal::cache_memory();
                 const auto other = used > available ? used - available : 0;
                 const auto fixed = other - std::min(other, cached);
                 const auto reserve = std::max(resident_allocator_reserve_bytes(total), cached);
@@ -2342,13 +2343,13 @@ private:
                 room = runtime.ssd_expert_payload_bytes() ? runtime.ssd_expert_payload_bytes() : runtime.resident_full_expert_bytes();
             if (room != std::numeric_limits<std::size_t>::max()) {
                 tyloi::metal::drain(runtime_stream);
-                const auto active = mlx::core::get_active_memory();
+                const auto active = tyloi::metal::active_memory();
                 const auto full = runtime.resident_full_expert_bytes();
                 runtime.set_expert_cache_limit(room);
                 if (runtime.resident_full_expert_bytes() != full) weight_residency.reset();
                 resident_weight_baseline = resident_dense_weight_baseline + runtime.resident_full_expert_bytes();
-                if (mlx::core::get_active_memory() < active || runtime.resident_full_expert_bytes() != full) {
-                    mlx::core::clear_cache();
+                if (tyloi::metal::active_memory() < active || runtime.resident_full_expert_bytes() != full) {
+                    tyloi::metal::clear_cache();
                     release_host_allocator_cache();
                 }
             }
@@ -2359,7 +2360,7 @@ private:
         if (!budget || !runtime_holder->has_value()) return true;
         const auto used = resident_memory_used() + mfq::metal::MlxResidentBudgetScope::temporary_bytes();
         const auto reserve = resident_allocator_reserve_bytes(budget);
-        const auto cached = mlx::core::get_cache_memory();
+        const auto cached = tyloi::metal::cache_memory();
         const auto headroom = reserve > cached ? reserve - cached : 0;
         return used <= budget && headroom <= budget - used && allocation <= budget - used - headroom;
     }
@@ -2374,7 +2375,7 @@ private:
             ~RestoreAllocatorCache() {
                 const auto limit = std::uncaught_exceptions() > exceptions ? previous : target;
                 if (current == limit) return;
-                mlx::core::set_cache_limit(limit);
+                tyloi::metal::set_cache_limit(limit);
                 current = limit;
             }
         } restore_cache{allocator_cache_limit, allocator_cache_limit,
@@ -2382,7 +2383,7 @@ private:
         if (!budget || !runtime_holder->has_value()) return;
         auto used = [&] {
             const auto actual = resident_memory_used() + mfq::metal::MlxResidentBudgetScope::temporary_bytes();
-            const auto cached = mlx::core::get_cache_memory();
+            const auto cached = tyloi::metal::cache_memory();
             return actual + (reserve > cached ? reserve - cached : 0);
         };
         if (allocation > budget || reserve > budget - allocation)
@@ -2391,7 +2392,7 @@ private:
         if (used() <= target) return;
         tyloi::metal::drain(runtime_stream);
         const auto clear_allocator_excess = [&] {
-            if (mlx::core::get_cache_memory() > reserve) mlx::core::clear_cache();
+            if (tyloi::metal::cache_memory() > reserve) tyloi::metal::clear_cache();
         };
         clear_allocator_excess();
         std::size_t prefix = 0;
@@ -2437,8 +2438,8 @@ private:
                 if (stats) offloaded = stats->hot_bytes + stats->pending_bytes;
             }
         }
-        return std::max(mlx::core::get_active_memory(), resident_weight_baseline +
-            usage.dynamic_weight_bytes + usage.cache_bytes) + offloaded + prefix + adapters + mlx::core::get_cache_memory();
+        return std::max(tyloi::metal::active_memory(), resident_weight_baseline +
+            usage.dynamic_weight_bytes + usage.cache_bytes) + offloaded + prefix + adapters + tyloi::metal::cache_memory();
     }
     void capture_weight_residency() {
         mfq::metal::MlxMemoryResidency::refresh();
@@ -2446,7 +2447,7 @@ private:
             mfq::metal::MlxMemoryResidency::configured_limit());
         const auto usage = mfq::metal::MlxResourceTelemetry::snapshot();
         const auto other = usage.cache_bytes + usage.dynamic_weight_bytes;
-        const auto active = mlx::core::get_active_memory();
+        const auto active = tyloi::metal::active_memory();
         resident_weight_baseline = active > other ? active - other : 0;
         resident_dense_weight_baseline = resident_weight_baseline;
         if constexpr (requires(Runtime& value) { value.reclaimable_expert_bytes(); }) {
@@ -2469,7 +2470,7 @@ private:
             }
         }
         std::vector<std::pair<std::string, double>> metrics{
-            {"mlx_active_bytes", static_cast<double>(mlx::core::get_active_memory())},
+            {"mlx_active_bytes", static_cast<double>(tyloi::metal::active_memory())},
 #if TYLOINFER_ENABLE_MFQ_COMPAT
             {"mfe_packed_copy_count", static_cast<double>(mfq::metal::MlxMfeWeight::packed_copy_count())},
             {"ssd_expert_indirect_dispatch_count", static_cast<double>(mfq::metal::MlxMfeWeight::indirect_dispatch_count())},
@@ -2483,9 +2484,9 @@ private:
                 std::is_same_v<Runtime, mfq::metal::MlxQwen35CausalLm>) ? 1.0 : 0.0},
             {"kv_quantization_bits", (std::is_same_v<Runtime, mfq::metal::MlxQwen4CausalLm> ||
                 std::is_same_v<Runtime, mfq::metal::MlxQwen35CausalLm>) ? mfq::metal::mlx_kv_quantization().bits : 0.0},
-            {"mlx_cache_bytes", static_cast<double>(mlx::core::get_cache_memory())},
+            {"mlx_cache_bytes", static_cast<double>(tyloi::metal::cache_memory())},
             {"mlx_cache_limit_bytes", static_cast<double>(allocator_cache_limit)},
-            {"mlx_peak_bytes", static_cast<double>(mlx::core::get_peak_memory())},
+            {"mlx_peak_bytes", static_cast<double>(tyloi::metal::peak_memory())},
             {"resident_memory_budget_bytes", static_cast<double>(resident_budget.load())},
             {"resident_weight_budget_bytes", static_cast<double>(resident_weight_budget.load())},
             {"resident_weight_dynamic_budget", (std::is_same_v<Runtime, mfq::metal::MlxQwen4CausalLm> ||
@@ -2874,7 +2875,7 @@ int run_loaded_runtime(
         }
     }
     const auto allocator_cache_limit = server_cache_limit_bytes();
-    mlx::core::set_cache_limit(allocator_cache_limit);
+    tyloi::metal::set_cache_limit(allocator_cache_limit);
     MfqHttpRuntimeTransportConfig transport_config;
     transport_config.host = arguments.host;
     transport_config.port = arguments.port;
@@ -3237,7 +3238,7 @@ int run_native_runtime(
                 arguments.context_size,
                 arguments.server);
         release_model_load_staging_memory(runtime_stream);
-        mlx::core::set_cache_limit(kMinicpmoDuplexCacheLimitBytes);
+        tyloi::metal::set_cache_limit(kMinicpmoDuplexCacheLimitBytes);
         const auto load_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - started).count();
         const auto maximum_context = runtime.maximum_context();

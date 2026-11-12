@@ -9,7 +9,7 @@
 
 #include <mlx/mlx.h>
 
-#include "mlx_staging_allocator.h"
+#include "engine/backends/metal/native/memory.h"
 
 namespace mfq::metal {
 
@@ -29,10 +29,10 @@ struct NintDescriptor {
 
 namespace detail {
 struct ParsedNintStorage {
-    StagingVector<std::uint8_t> q_packed;
-    StagingVector<std::uint8_t> sub_scale;
-    StagingVector<std::uint8_t> sub_min;
-    StagingVector<std::uint32_t> row_metadata;
+    tyloi::metal::StagingVector<std::uint8_t> q_packed;
+    tyloi::metal::StagingVector<std::uint8_t> sub_scale;
+    tyloi::metal::StagingVector<std::uint8_t> sub_min;
+    tyloi::metal::StagingVector<std::uint32_t> row_metadata;
     int bits;
     int group_size;
     int groups;

@@ -1,7 +1,7 @@
 #include "mlx_grouped_linear.h"
 #include "engine/backends/metal/native/kernel.h"
 #include "mlx_nvq_decode.h"
-#include "mlx_staging_allocator.h"
+#include "engine/backends/metal/native/memory.h"
 
 #include <mlx/allocator.h>
 #include <mlx/backend/metal/device.h>
@@ -601,7 +601,7 @@ array make_raw_array(
         throw std::runtime_error(
             "grouped linear packed stream is misaligned");
     }
-    const auto layout = detail::packed_storage_layout(
+    const auto layout = tyloi::metal::packed_layout(
         bytes.size() / dtype.size());
     const Shape shape = layout.is_matrix()
         ? Shape{layout.rows, layout.columns}

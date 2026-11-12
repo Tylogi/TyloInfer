@@ -9,7 +9,7 @@
 
 #include <mlx/mlx.h>
 
-#include "mlx_staging_allocator.h"
+#include "engine/backends/metal/native/memory.h"
 
 namespace mfq::metal {
 
@@ -23,18 +23,18 @@ bool vq_native_nvq1(int layout, int group_size, int vector_size, std::string_vie
     int index_bits, int state_bits, int bank_mode, int aux_mode, int table_banks) noexcept;
 
 struct ParsedVqStorage {
-    StagingVector<std::uint8_t> indices;
-    StagingVector<std::uint8_t> states_packed;
-    StagingVector<std::uint8_t> auxiliary;
-    StagingVector<float> anchors;
-    StagingVector<std::int8_t> codebooks;
-    StagingVector<float> scales;
-    StagingVector<std::uint8_t> state_to_codebank;
-    StagingVector<std::uint8_t> bank_ids;
-    StagingVector<std::int8_t> rotation_signs;
-    StagingVector<float> residual_codebook;
-    StagingVector<std::int16_t> residual_first;
-    StagingVector<std::int16_t> residual_second;
+    tyloi::metal::StagingVector<std::uint8_t> indices;
+    tyloi::metal::StagingVector<std::uint8_t> states_packed;
+    tyloi::metal::StagingVector<std::uint8_t> auxiliary;
+    tyloi::metal::StagingVector<float> anchors;
+    tyloi::metal::StagingVector<std::int8_t> codebooks;
+    tyloi::metal::StagingVector<float> scales;
+    tyloi::metal::StagingVector<std::uint8_t> state_to_codebank;
+    tyloi::metal::StagingVector<std::uint8_t> bank_ids;
+    tyloi::metal::StagingVector<std::int8_t> rotation_signs;
+    tyloi::metal::StagingVector<float> residual_codebook;
+    tyloi::metal::StagingVector<std::int16_t> residual_first;
+    tyloi::metal::StagingVector<std::int16_t> residual_second;
     float parameter = 0.0f;
     std::string label;
     std::vector<int> output_shape;

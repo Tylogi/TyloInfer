@@ -22,7 +22,7 @@
 #include "mlx_mxfp4_sq.h"
 #include "mlx_platform.h"
 #include "mlx_reference.h"
-#include "mlx_staging_allocator.h"
+#include "engine/backends/metal/native/memory.h"
 #include "mlx_vq.h"
 
 #include <mlx/allocator.h>
@@ -2565,7 +2565,7 @@ array allocate_packed_array(std::size_t bytes, Dtype dtype) {
     if (bytes == 0 || bytes % dtype.size() != 0) {
         throw std::runtime_error("MFE packed stream is misaligned");
     }
-    const auto layout = detail::packed_storage_layout(bytes / dtype.size());
+    const auto layout = tyloi::metal::packed_layout(bytes / dtype.size());
     const Shape shape = layout.is_matrix()
         ? Shape{layout.rows, layout.columns} : Shape{layout.columns};
     auto result = array(mlx::core::allocator::malloc(bytes), shape, dtype);
@@ -2590,17 +2590,17 @@ array allocate_wire_array(std::size_t bytes, bool account = false) {
         mlx::core::allocator::Buffer buffer{nullptr};
         ~Storage() {
             if (buffer.ptr()) mlx::core::allocator::release(buffer);
-            detail::MmapAllocator<std::uint8_t>{}.deallocate(data, bytes);
+            tyloi::metal::StagingAllocator<std::uint8_t>{}.deallocate(data, bytes);
             if (accounted) uncached_packed_storage_bytes.fetch_sub(bytes, std::memory_order_relaxed);
         }
     };
-    const auto layout = detail::packed_storage_layout(bytes);
+    const auto layout = tyloi::metal::packed_layout(bytes);
     const Shape shape = layout.is_matrix()
         ? Shape{layout.rows, layout.columns} : Shape{layout.columns};
     const auto page = static_cast<std::size_t>(getpagesize());
     auto storage = std::make_shared<Storage>();
     storage->bytes = checked_add(bytes, page - 1, "MFE wire allocation") / page * page;
-    storage->data = detail::MmapAllocator<std::uint8_t>{}.allocate(storage->bytes);
+    storage->data = tyloi::metal::StagingAllocator<std::uint8_t>{}.allocate(storage->bytes);
     storage->buffer = mlx::core::allocator::make_buffer(storage->data, storage->bytes);
     if (!storage->buffer.ptr()) return allocate_packed_array(bytes, mlx::core::uint8);
     if (account) {
@@ -2687,7 +2687,7 @@ public:
     }
 
     template <typename T>
-    void append(detail::StagingVector<T> source) {
+    void append(tyloi::metal::StagingVector<T> source) {
         const auto bytes = checked_product(source.size(), sizeof(T), "packed stream size");
         append_chunk(std::move(source), bytes);
     }
@@ -2708,7 +2708,7 @@ public:
         if (bytes % dtype.size() != 0) {
             throw std::runtime_error("MFE packed stream is misaligned");
         }
-        const auto layout = detail::packed_storage_layout(bytes / dtype.size());
+        const auto layout = tyloi::metal::packed_layout(bytes / dtype.size());
         const Shape shape = layout.is_matrix()
             ? Shape{layout.rows, layout.columns} : Shape{layout.columns};
         if (chunks_.size() == 1) {
@@ -2796,9 +2796,9 @@ public:
 
 private:
     using Chunk = std::variant<array, std::span<const std::uint8_t>, std::uint8_t,
-        detail::StagingVector<std::uint8_t>, detail::StagingVector<std::uint32_t>,
-        detail::StagingVector<float>, detail::StagingVector<std::int8_t>,
-        detail::StagingVector<std::int16_t>, std::array<std::uint8_t, sizeof(float)>>;
+        tyloi::metal::StagingVector<std::uint8_t>, tyloi::metal::StagingVector<std::uint32_t>,
+        tyloi::metal::StagingVector<float>, tyloi::metal::StagingVector<std::int8_t>,
+        tyloi::metal::StagingVector<std::int16_t>, std::array<std::uint8_t, sizeof(float)>>;
 
     template <typename T>
     void append_chunk(T source, std::size_t bytes) {
@@ -7208,7 +7208,7 @@ array concatenate_1d(
                 value.nbytes(),
                 "packed concatenation bytes");
         }
-        detail::StagingVector<std::uint8_t> bytes(total_bytes);
+        tyloi::metal::StagingVector<std::uint8_t> bytes(total_bytes);
         std::size_t offset = 0;
         for (const auto& value : values) {
             std::memcpy(
