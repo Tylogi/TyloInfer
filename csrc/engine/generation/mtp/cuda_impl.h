@@ -2,6 +2,7 @@
 
 #include "engine/generation/cuda.h"
 #include "engine/generation/mtp/sequence.h"
+#include "engine/generation/mtp/sampling.h"
 #include "engine/weights/workspace.h"
 #include "engine/budget.h"
 
@@ -700,9 +701,9 @@ template <class Model, class State> struct CudaMtpOps {
                             "batched greedy MTP sampling geometry is invalid");
     if(!projected_target_greedy.empty() && same_data(logits,projected_target_logits))
       return projected_target_greedy;
-    auto host=tyloi::ops::copy(tyloi::ops::sample_greedy(tyloi::ops::contiguous(logits)),tyloi::Device(tyloi::kCPU));
-    const auto* tokens=host.dense().template data_ptr<int64_t>();
-    return std::vector<int32_t>(tokens,tokens+host.numel());
+    const auto tokens=tyloi::ops::read_integers(
+        tyloi::ops::sample_greedy(tyloi::ops::contiguous(logits)));
+    return std::vector<int32_t>(tokens.begin(),tokens.end());
   }
   int32_t sample_constrained(Tensor logits, Tensor token_counts, const MfqTokenConstraintPtr& constraint) {
     if(!constraint && sampler().greedy() && !penalties)return sample_normal(logits,token_counts);
@@ -718,7 +719,7 @@ template <class Model, class State> struct CudaMtpOps {
       tyloi::ops::apply_penalties(logits,token_counts,parameters.presence_penalty,
                                   parameters.frequency_penalty,parameters.repetition_penalty);
     }
-    return tyloi::cuda::SamplingOps::probabilities(logits.dense(),parameters);
+    return tyloi::engine::mtp::probabilities(logits,parameters);
   }
   Tensor captured_compact(const Tensor& logits,const MfqSamplingParams& parameters) {
     if(projected_target_compact && same_data(projected_target_logits,logits) &&
@@ -727,8 +728,8 @@ template <class Model, class State> struct CudaMtpOps {
 #ifdef TYLOINFER_MTP_VERIFY_GRAPH_TOPK
         static thread_local std::array<bool,33> checked{};
         if(!checked[logits.size(0)]) {
-          auto expected=tyloi::cuda::SamplingOps::compact_radix_rows(logits.dense(),parameters);
-          auto actual=tyloi::cuda::SamplingOps::compact_rows_from_host(projected_target_compact.dense(),parameters);
+          auto expected=tyloi::engine::mtp::compact_rows(logits,parameters,true);
+          auto actual=tyloi::engine::mtp::compact_rows_from_packed(projected_target_compact,parameters);
           TYLOINFER_RUNTIME_CHECK(expected.size()==actual.size(),"captured MTP top-k row count differs");
           for(std::size_t row=0;row<actual.size();++row) {
             TYLOINFER_RUNTIME_CHECK(expected[row].tokens==actual[row].tokens,"captured MTP top-k token IDs differ");
@@ -750,13 +751,13 @@ template <class Model, class State> struct CudaMtpOps {
                             "compact CUDA MTP sampling requires top-k 1-64");
     logits=tyloi::ops::reshape(tyloi::ops::contiguous(logits),{1,-1});
     if(!penalties)if(auto host=captured_compact(logits,parameters);host)
-      return std::move(tyloi::cuda::SamplingOps::compact_rows_from_host(host.dense(),parameters).front());
+      return std::move(tyloi::engine::mtp::compact_rows_from_packed(host,parameters).front());
     if(penalties) {
       logits=tyloi::ops::clone(logits);
       tyloi::ops::apply_penalties(logits,token_counts,parameters.presence_penalty,
                                   parameters.frequency_penalty,parameters.repetition_penalty);
     }
-    return tyloi::cuda::SamplingOps::compact_probabilities(logits.dense(),parameters);
+    return std::move(tyloi::engine::mtp::compact_rows(logits,parameters).front());
   }
   std::vector<tyloi::engine::mtp::CompactDistribution>
   compact_probability_rows(Tensor logits,const MfqSamplingParams& parameters) {
@@ -764,8 +765,8 @@ template <class Model, class State> struct CudaMtpOps {
                             "batched compact CUDA MTP sampling geometry is invalid");
     logits=tyloi::ops::contiguous(logits);
     if(auto host=captured_compact(logits,parameters);host)
-      return tyloi::cuda::SamplingOps::compact_rows_from_host(host.dense(),parameters);
-    return tyloi::cuda::SamplingOps::compact_probability_rows(logits.dense(),parameters);
+      return tyloi::engine::mtp::compact_rows_from_packed(host,parameters);
+    return tyloi::engine::mtp::compact_rows(logits,parameters);
   }
   Tensor logits_for(Tensor normalized) {
     if(same_view(projected_predictor_hidden,normalized))return projected_predictor_logits;

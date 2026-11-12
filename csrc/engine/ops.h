@@ -287,6 +287,16 @@ inline Tensor empty(std::initializer_list<std::int64_t> shape, const TensorOptio
     return empty(std::span<const std::int64_t>(shape.begin(), shape.size()), options);
 }
 Tensor sample_greedy(const Tensor& logits);
+// Synchronous owned host reads.
+std::vector<float> read_floats(const Tensor& input);
+std::vector<std::int64_t> read_integers(const Tensor& input);
+// [rows,vocab], count 1..64; returns flattened [rows,count] values and IDs.
+// force_compact selects the compact kernel for verification regardless of the environment.
+std::pair<std::vector<float>, std::vector<std::int64_t>> read_topk(
+    const Tensor& logits, std::int64_t count, bool force_compact = false);
+// I64 [rows,stride>=count] packets: F32 bits in the high 32 bits, token ID in the low 32.
+std::pair<std::vector<float>, std::vector<std::int64_t>> unpack_topk(
+    const Tensor& packets, std::int64_t count);
 void decode_commit(const Tensor& next, Tensor& generated, Tensor& step,
                    Tensor& input, Tensor& position, Tensor& length);
 Tensor sample_stochastic(const Tensor& logits, const Tensor& random,

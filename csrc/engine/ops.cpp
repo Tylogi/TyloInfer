@@ -27,10 +27,13 @@
 #include "engine/backends/cuda/ops/rope/tail.h"
 #include "engine/backends/cuda/native/profile.h"
 #include "engine/backends/cuda/native/device.h"
+#include "engine/backends/cuda/native/env.h"
 #include "engine/backends/cuda/kernels/mfq_cuda_sampling_ops.h"
 #include "engine/backends/cuda/kernels/mfq_cuda_linear_attention_ops.h"
 #include "engine/backends/cuda/kernels/mfq_cuda_norm_ops.h"
+#include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <exception>
 #include <iostream>
 #include <limits>
@@ -1168,6 +1171,63 @@ Tensor sample_greedy(const Tensor& logits_tensor) {
     input(logits);
     require_cuda(logits);
     return owner(::sample_greedy_cuda(logits));
+}
+
+std::vector<float> read_floats(const Tensor& tensor) {
+    const auto& value = dense(tensor);
+    input(value);
+    auto host = value.to(kFloat32).cpu().contiguous();
+    std::vector<float> result(static_cast<std::size_t>(host.numel()));
+    if (!result.empty()) std::copy_n(host.data_ptr<float>(), result.size(), result.data());
+    return result;
+}
+std::vector<std::int64_t> read_integers(const Tensor& tensor) {
+    const auto& value = dense(tensor);
+    input(value);
+    auto host = (value.scalar_type() == kInt64 ? value : value.to(kInt64)).cpu().contiguous();
+    std::vector<std::int64_t> result(static_cast<std::size_t>(host.numel()));
+    if (!result.empty()) std::copy_n(host.data_ptr<std::int64_t>(), result.size(), result.data());
+    return result;
+}
+std::pair<std::vector<float>, std::vector<std::int64_t>> unpack_topk(
+        const Tensor& tensor, std::int64_t count) {
+    const auto& packets = dense(tensor);
+    input(packets);
+    if (packets.dim() != 2 || packets.size(0) < 1 || packets.scalar_type() != kInt64 ||
+        count < 1 || count > 64 || packets.size(1) < count)
+        throw std::invalid_argument("top-k packets must be int64 [rows,stride] with stride >= count and count in [1,64]");
+    auto host = packets.cpu().contiguous();
+    const auto size = static_cast<std::size_t>(host.size(0)) * static_cast<std::size_t>(count);
+    std::vector<float> values(size);
+    std::vector<std::int64_t> indices(size);
+    const auto* data = host.data_ptr<std::int64_t>();
+    for (std::int64_t row = 0; row < host.size(0); ++row) {
+        for (std::int64_t column = 0; column < count; ++column) {
+            const auto packet = static_cast<std::uint64_t>(data[row * host.size(1) + column]);
+            const auto raw = static_cast<std::uint32_t>(packet >> 32);
+            const auto offset = static_cast<std::size_t>(row * count + column);
+            std::memcpy(&values[offset], &raw, sizeof(raw));
+            indices[offset] = static_cast<std::uint32_t>(packet);
+        }
+    }
+    return {std::move(values), std::move(indices)};
+}
+std::pair<std::vector<float>, std::vector<std::int64_t>> read_topk(
+        const Tensor& tensor, std::int64_t count, bool force_compact) {
+    const auto& logits = dense(tensor);
+    input(logits);
+    require_cuda(logits);
+    if (logits.dim() != 2 || logits.size(0) < 1 || count < 1 || count > 64 || count > logits.size(1))
+        throw std::invalid_argument("top-k logits must be [rows,vocab] with count in [1,min(vocab,64)]");
+    const auto* option = force_compact ? nullptr : cuda::env_lookup("TYLOINFER_MTP_RADIX_TOPK");
+    if (force_compact || (option && option[0] == '1' && logits.size(0) <= 32))
+        return unpack_topk(owner(::sample_top_k_compact_cuda(logits, count)), count);
+    auto selected = ::tyloi::cuda::topk(logits, count, -1, true, true);
+    auto values = std::get<0>(selected).to(kCPU, kFloat32).contiguous();
+    auto indices = std::get<1>(selected).to(kCPU, kInt64).contiguous();
+    const auto size = static_cast<std::size_t>(values.numel());
+    return {{values.data_ptr<float>(), values.data_ptr<float>() + size},
+            {indices.data_ptr<std::int64_t>(), indices.data_ptr<std::int64_t>() + size}};
 }
 
 void decode_commit(const Tensor& next, Tensor& generated, Tensor& step,
