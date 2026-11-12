@@ -1,12 +1,7 @@
 #include "engine/models/qwen35/mtp.h"
-#include "engine/models/session/snapshot.h"
-
-#include "engine/models/qwen35/state.h"
-#include "engine/models/session/cache.h"
-#include "engine/backends/cuda/native/tensor/backend.h"
+#include "engine/ops.h"
 
 namespace tyloi::cuda::qwen35 {
-
 
 namespace {
 
@@ -22,10 +17,10 @@ std::vector<MtpState::Layout> layout(const tyloi::models::qwen35::Predictor& mod
 
 } // namespace
 
-Mtp::Mtp(tyloi::models::qwen35::Predictor model, std::unique_ptr<Executor> executor,
+Mtp::Mtp(tyloi::models::qwen35::Predictor model,
         const int64_t& kv_capacity, tyloi::ops::Trace* const& trace, const int& trace_scope,
         bool preallocate)
-    : model_(std::move(model)), executor_(std::move(executor)),
+    : model_(std::move(model)),
       kv_capacity_(kv_capacity), trace_(trace), trace_scope_(trace_scope), preallocate_(preallocate) {}
 
 std::unique_ptr<tyloi::models::MtpState> Mtp::make_state() const {
@@ -42,9 +37,6 @@ tyloi::models::MtpStep Mtp::step(tyloi::models::MtpState& value, const ::tyloi::
         const ::tyloi::Tensor& next_ids, const ::tyloi::Tensor& positions) const {
     auto& request = state<MtpState>(value);
     const int device = model_.device.index;
-    MfqCudaGuard guard(device);
-    const FfnMode mode{};
-    auto executor_scope = executor_->enter(device, mode);
     const tyloi::models::ForwardOptions options{kv_capacity_, trace_, trace_scope_, device};
     auto output = model_.step(hidden, next_ids, positions, request, options);
     return {output, output};
@@ -56,15 +48,8 @@ void Mtp::trim_cache_to(tyloi::models::MtpState& value, int64_t position) const 
 
 MtpSessionState Mtp::capture_session_state(const tyloi::models::MtpState& value,
                                            int64_t position, const ::tyloi::Tensor& hidden) const {
-    MfqCudaGuard guard(model_.device.index);
+    tyloi::ops::DeviceScope guard(model_.device);
     return state<MtpState>(value).capture(position, hidden);
-}
-
-void restore_session(State& state, Mtp* mtp, const TextSessionState& snapshot,
-        const std::function<void()>& drain) {
-    tyloi::cuda::internal::CudaSessionOps::restore(
-        static_cast<tyloi::models::State&>(state), snapshot, drain,
-        static_cast<tyloi::models::Mtp*>(mtp));
 }
 
 } // namespace tyloi::cuda::qwen35

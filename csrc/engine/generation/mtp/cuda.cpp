@@ -23,7 +23,7 @@
       InferenceRequest &, InferenceOutput &, int64_t,                            \
       const tyloi::models::Prepared *, std::size_t,                            \
       ::tyloi::Tensor, ::tyloi::Tensor *,      \
-      std::size_t, tyloi::engine::Budget*)
+      std::size_t, tyloi::engine::Budget*, tyloi::Executor*)
 #ifdef TYLOINFER_NATIVE_CUDA
 TYLOINFER_INSTANTIATE_MTP(tyloi::cuda::minicpmo45::Model, tyloi::cuda::minicpmo45::State);
 TYLOINFER_INSTANTIATE_MTP(tyloi::cuda::minicpmo45::text::Model, tyloi::cuda::minicpmo45::text::State);

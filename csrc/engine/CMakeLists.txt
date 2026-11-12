@@ -36,6 +36,7 @@ add_library(mfq-engine STATIC
     models/qwen35/forward.cpp
     models/qwen35/state.cpp
     models/qwen35/mtp_state.cpp
+    models/qwen35/mtp.cpp
     models/qwen35/predictor.cpp
     models/qwen4_exp/config.cpp
     requests/constraint.cpp

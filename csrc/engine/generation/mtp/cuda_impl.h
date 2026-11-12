@@ -142,6 +142,7 @@ template <class Model, class State> struct CudaMtpOps {
   int64_t prefill_compute_chunk;
   InferenceOutput* output;
   tyloi::engine::Budget* budget=nullptr;
+  tyloi::Executor* predictor_execution;
   // Destroy after local/result tensors, including cancellation of priming.
   std::unique_ptr<tyloi::weights::Loan> predictor_loan;
   const ::tyloi::TensorOptions options =
@@ -304,7 +305,7 @@ template <class Model, class State> struct CudaMtpOps {
              tyloi::models::Mtp &mtp, tyloi::engine::mtp::State &mtp_state,
              const tyloi::models::Prepared *prepared,
              int64_t compute_chunk, InferenceOutput* output,
-             tyloi::engine::Budget* budget = nullptr)
+             tyloi::engine::Budget* budget, tyloi::Executor* predictor_execution)
       : model(model), state(state), executor(executor), collectives(collectives), mode(mode),
         weights(weights), info(info), source(source), mtp(mtp), predictor(*state.predictor), mtp_state(mtp_state), prepared(prepared),
         transformed_prompt(prepared && prepared->transformed()),
@@ -318,7 +319,7 @@ template <class Model, class State> struct CudaMtpOps {
 #endif
                           ? 3
                           : 1), prefill_compute_chunk(compute_chunk), output(output),
-        budget(budget) {
+        budget(budget), predictor_execution(predictor_execution) {
     target_graph_captures=weights.activity().graph_captures;
   }
   void rollback_target(std::int64_t accepted) {
@@ -607,7 +608,11 @@ template <class Model, class State> struct CudaMtpOps {
 #ifdef TYLOINFER_NATIVE_CUDA
     auto scope = tyloi::cuda::Executor::current().enter(mode.ffn);
 #endif
-    auto result=mtp.step(predictor,hidden, ids, positions);
+    tyloi::models::MtpStep result;
+    {
+      auto predictor_scope = predictor_execution ? predictor_execution->enter() : nullptr;
+      result = mtp.step(predictor, hidden, ids, positions);
+    }
 #ifdef TYLOINFER_NATIVE_CUDA
     projected_predictor_logits = result.sample_logits;
 #else
@@ -909,7 +914,8 @@ run_mtp_generation(Model &model, State &state, tyloi::cuda::Executor* executor,
                    std::size_t reused_tokens,
                    ::tyloi::Tensor restored_last_hidden,
                    ::tyloi::Tensor *session_last_hidden,
-                   std::size_t stable_prefix_tokens, tyloi::engine::Budget* budget) {
+                   std::size_t stable_prefix_tokens, tyloi::engine::Budget* budget,
+                   tyloi::Executor* predictor_execution) {
 #ifdef TYLOINFER_NATIVE_CUDA
   if constexpr (std::is_base_of_v<tyloi::models::CausalModel, Model>) {
     if (!static_cast<const tyloi::models::CausalModel&>(model).supports_speculation())
@@ -925,7 +931,7 @@ run_mtp_generation(Model &model, State &state, tyloi::cuda::Executor* executor,
   }
   return tyloi::engine::speculative_sequence(
       mtp_detail::CudaMtpOps<Model, State>{model, state, executor, collectives, mode, weights, info, source, mtp, mtp_state, prepared,
-                               prefill_chunk_size, &output, budget},
+                               prefill_chunk_size, &output, budget, predictor_execution},
       request, output,
       logical_chunk, reused_tokens, std::move(restored_last_hidden),
       session_last_hidden,stable_prefix_tokens);

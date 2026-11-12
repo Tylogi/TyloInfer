@@ -28,7 +28,7 @@ namespace tyloi::cuda::internal {
         tyloi::engine::mtp::State &,                                                                  \
         PREDICTOR *,                                                                      \
         std::optional<tyloi::models::Prepared>,                                                         \
-        tyloi::engine::Batch*, std::string);
+        tyloi::engine::Batch*, std::string, tyloi::Executor*);
 TYLOINFER_INSTANTIATE_FLOW(tyloi::cuda::minicpmo45::Model, tyloi::cuda::minicpmo45::State, tyloi::models::Mtp)
 TYLOINFER_INSTANTIATE_FLOW(tyloi::cuda::minicpmo45::text::Model, tyloi::cuda::minicpmo45::text::State, tyloi::models::Mtp)
 TYLOINFER_INSTANTIATE_FLOW(tyloi::cuda::glm_dsa::Model, tyloi::cuda::glm_dsa::State, tyloi::models::Mtp)

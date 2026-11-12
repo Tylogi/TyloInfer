@@ -590,6 +590,7 @@ template <class Model, class State, class Predictor> struct RequestOps {
     std::optional<tyloi::models::Prepared> prepared;
     tyloi::engine::Batch* batching;
     std::string request_id;
+    tyloi::Executor* predictor_execution;
 
     bool batched() const { return batching != nullptr; }
     void trace_expert_cache(const char* boundary, bool wait = true) {
@@ -708,7 +709,7 @@ template <class Model, class State, class Predictor> struct RequestOps {
                 prepared ? &*prepared : nullptr,
                 reused,
                 restored,
-                committed,prefix_boundary,&budget);
+                committed,prefix_boundary,&budget,predictor_execution);
         } else throw std::invalid_argument("this CUDA model has no speculative predictor");
     }
 };
@@ -727,7 +728,7 @@ Generation generate(Model &model, State &state, tyloi::cuda::Executor* executor,
     tyloi::engine::InferenceOutput &output, tyloi::engine::mtp::State &mtp_state,
     Predictor *mtp,
     std::optional<tyloi::models::Prepared> prepared,
-    tyloi::engine::Batch* batching, std::string request_id) {
+    tyloi::engine::Batch* batching, std::string request_id, tyloi::Executor* predictor_execution) {
     if (mtp) {
         if constexpr (requires { state.predictor; }) {
             if (!state.predictor || !state.predictor->belongs_to(*mtp))
@@ -742,7 +743,7 @@ Generation generate(Model &model, State &state, tyloi::cuda::Executor* executor,
                                      std::move(drain), info, source, graph, cache, config, mtp_state,
                                      mtp,
                                      std::move(prepared), batching,
-                                     std::move(request_id)},
+                                     std::move(request_id), predictor_execution},
         request,
         output);
 }

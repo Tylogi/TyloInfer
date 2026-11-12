@@ -54,7 +54,8 @@ inline constexpr auto with_model = []<typename F>(
         F&& run) -> auto {
     CudaScope scope(execution.config.layer_placement.primary_device(), execution.executor().contexts());
     auto source = tyloi::open_model_source(options.model_path);
-    auto finish = [&](auto& owner, auto& state, auto& executor, auto& components, auto started) {
+    auto finish = [&](auto& owner, auto& state, auto& executor, auto& components, auto started,
+                      std::unique_ptr<tyloi::Executor> predictor_execution = {}) {
         auto& model = *owner;
         using Model = std::remove_cvref_t<decltype(model)>;
         if constexpr(std::is_same_v<Model,qwen4_exp::Model>)
@@ -69,7 +70,7 @@ inline constexpr auto with_model = []<typename F>(
             execution.weights, execution.offload);
         const auto loaded_at = tyloi::cuda::finish_load(
             execution.kv.get(), execution.weights, execution.config.report_cuda_memory);
-        return run(owner, state, executor, components, started, loaded_at, source);
+        return run(owner, state, executor, components, started, loaded_at, source, std::move(predictor_execution));
     };
     auto load_tts = [&] {
         auto started = std::chrono::steady_clock::now();
@@ -131,13 +132,14 @@ inline constexpr auto with_model = []<typename F>(
                     execution.config.dense_cpu_layer_count);
                 state = std::make_unique<qwen35::State>(*owner, execution.executor().mode().transposed);
                 if (preallocate) state->preallocate();
+                std::unique_ptr<tyloi::Executor> predictor_execution;
                 auto components = qwen35::Components::load(
                     *owner, weights, execution.weights, execution.config.layer_placement, execution.config.dense_cpu_layer_count,
-                    *executor,
+                    *executor, predictor_execution,
                     execution.executor().mmq().kv_cache_capacity, execution.executor().mode().trace,
                     execution.executor().mode().trace_layer, load_optional_components,
                     !execution.config.dsv4_cpu_offload_layers.empty(), preallocate);
-                return finish(owner, state, executor, components, started);
+                return finish(owner, state, executor, components, started, std::move(predictor_execution));
             } else {
                 throw std::runtime_error("unsupported CUDA model backbone");
             }

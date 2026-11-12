@@ -29,7 +29,7 @@ struct CudaProfiler;
 namespace tyloi::cuda::internal {
 
 // Creation and every resume run inside the owner's CUDA device/context scope.
-// The budget is borrowed until the sequence is destroyed.
+// Budget and predictor execution are borrowed until the sequence is destroyed.
 template <typename Model, typename State, typename Predictor = tyloi::models::Mtp>
 tyloi::engine::Generation generate(
     Model& model, State& state, tyloi::cuda::Executor* executor,
@@ -44,11 +44,11 @@ tyloi::engine::Generation generate(
     Predictor* mtp = nullptr,
     std::optional<tyloi::models::Prepared> prepared = {},
     tyloi::engine::Batch* batching = nullptr,
-    std::string request_id = {});
+    std::string request_id = {}, tyloi::Executor* predictor_execution = nullptr);
 } // namespace tyloi::cuda::internal
 
 // Creation and every resume run inside the owner's CUDA device/context scope.
-// A supplied budget is borrowed until the sequence is destroyed.
+// A supplied budget and predictor execution are borrowed until the sequence is destroyed.
 template <typename Model, typename State>
 tyloi::engine::Generation run_mtp_generation(
     Model& model, State& state, tyloi::cuda::Executor* executor,
@@ -62,4 +62,4 @@ tyloi::engine::Generation run_mtp_generation(
     ::tyloi::Tensor restored_last_hidden = {},
     ::tyloi::Tensor* session_last_hidden = nullptr,
     std::size_t stable_prefix_tokens = 0,
-    tyloi::engine::Budget* budget = nullptr);
+    tyloi::engine::Budget* budget = nullptr, tyloi::Executor* predictor_execution = nullptr);

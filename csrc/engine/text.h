@@ -77,6 +77,7 @@ struct Text {
     std::unique_ptr<State> owned_state;
     std::unique_ptr<Executor> executor;
     tyloi::cache::Media images;
+    std::unique_ptr<tyloi::Executor> predictor_execution;
     Parts components;
     Model& language;
     State& state;
@@ -112,6 +113,7 @@ struct Text {
         }
         owned_state.reset();
         components = Parts{};
+        predictor_execution.reset();
     }
 
     bool online_budget_supported() const {
@@ -126,13 +128,15 @@ struct Text {
             std::unique_ptr<Executor> executor_owner, Parts model_components,
             tyloi::engine::Config runtime_config,
             std::shared_ptr<const tyloi::ModelSource> model_source,
-            std::shared_ptr<tyloi::weights::Memory> ledger)
+            std::shared_ptr<tyloi::weights::Memory> ledger,
+            std::unique_ptr<tyloi::Executor> predictor_execution_owner = {})
         : weight_memory(std::move(ledger)), execution(&borrowed), root_executor(borrowed.executor()),
           weights(borrowed_weights),
           kv(borrowed_kv), offload(borrowed_offload), config(std::move(runtime_config)),
           source(std::move(model_source)),
           model(std::move(model_owner)), owned_state(std::move(state_owner)),
-          executor(std::move(executor_owner)), components(std::move(model_components)),
+          executor(std::move(executor_owner)), predictor_execution(std::move(predictor_execution_owner)),
+          components(std::move(model_components)),
           language(*model), state([this]() -> State& {
               if constexpr (std::is_same_v<Model, State>) return language;
               else return *owned_state;

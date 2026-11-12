@@ -6,6 +6,8 @@
 #include "engine/weights/loader.h"
 #include "engine/models/qwen35/load.h"
 #include "engine/models/qwen35/mtp.h"
+#include "engine/models/qwen35/state.h"
+#include "engine/models/session/cache.h"
 #include "engine/backends/cuda/kernels/mfq_cuda_kv_quantization.h"
 
 #include "engine/backends/cuda/executor/executor.h"
@@ -51,6 +53,7 @@ Components Components::load(
     LayerPlacementConfig& placement,
     int& cpu_layers,
     Executor& executor,
+    std::unique_ptr<tyloi::Executor>& predictor_execution,
     const int64_t& kv_capacity,
     tyloi::ops::Trace* const& trace,
     const int& trace_scope,
@@ -73,9 +76,12 @@ Components Components::load(
             auto predictor = load_predictor(
                 loader, model, cuda_kv_quantization());
             if (predictor) {
+                auto predictor_executor = executor.fork(model.device.index);
+                predictor_executor->mode().ffn = FfnMode{};
+                predictor_execution = std::move(predictor_executor);
                 // Mtp retains these references, so they must outlive the result.
                 components.mtp = std::make_unique<Mtp>(
-                    std::move(*predictor), executor.fork(),
+                    std::move(*predictor),
                     kv_capacity, trace, trace_scope, preallocate);
             }
         } else {
@@ -86,6 +92,13 @@ Components Components::load(
         throw std::runtime_error("CUDA predictor adapter is unsupported for Qwen");
     }
     return components;
+}
+
+void restore_session(State& state, Mtp* mtp, const TextSessionState& snapshot,
+        const std::function<void()>& drain) {
+    tyloi::cuda::internal::CudaSessionOps::restore(
+        static_cast<tyloi::models::State&>(state), snapshot, drain,
+        static_cast<tyloi::models::Mtp*>(mtp));
 }
 
 } // namespace tyloi::cuda::qwen35

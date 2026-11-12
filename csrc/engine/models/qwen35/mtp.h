@@ -2,7 +2,6 @@
 
 #include "engine/models/qwen35/predictor.h"
 #include "engine/models/session/snapshot.h"
-#include "engine/backends/cuda/executor/executor.h"
 #include "engine/models/qwen35/mtp_state.h"
 #include "engine/models/common/mtp.h"
 
@@ -18,12 +17,13 @@ void restore_session(State&, Mtp*, const TextSessionState&, const std::function<
 
 class Mtp final : public tyloi::models::Mtp {
 public:
-    Mtp(tyloi::models::qwen35::Predictor model, std::unique_ptr<Executor> executor,
+    Mtp(tyloi::models::qwen35::Predictor model,
         const int64_t& kv_capacity, tyloi::ops::Trace* const& trace, const int& trace_scope,
         bool preallocate);
 
     std::unique_ptr<tyloi::models::MtpState> make_state() const override;
     void reset(tyloi::models::MtpState& state, int64_t batch = 1) const override;
+    // The caller owns the predictor execution scope.
     tyloi::models::MtpStep step(tyloi::models::MtpState& state, const ::tyloi::Tensor& hidden,
         const ::tyloi::Tensor& next_ids, const ::tyloi::Tensor& positions = {}) const override;
 
@@ -39,7 +39,6 @@ public:
 
 private:
     tyloi::models::qwen35::Predictor model_;
-    std::unique_ptr<Executor> executor_;
     const int64_t& kv_capacity_;
     tyloi::ops::Trace* const& trace_;
     const int& trace_scope_;

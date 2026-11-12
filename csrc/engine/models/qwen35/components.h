@@ -12,6 +12,8 @@
 #include <memory>
 #include <stdexcept>
 
+namespace tyloi { class Executor; }
+
 namespace tyloi::weights {
 class Cache;
 struct Loader;
@@ -33,6 +35,7 @@ struct Components {
 
     static Components load(Model& model, const ::tyloi::weights::Loader& weights, ::tyloi::weights::Cache& cache,
         LayerPlacementConfig& placement, int& cpu_layers, Executor& executor,
+        std::unique_ptr<tyloi::Executor>& predictor_execution,
         const int64_t& kv_capacity, tyloi::ops::Trace* const& trace,
         const int& trace_scope, bool optional, bool cpu_offload, bool preallocate);
 

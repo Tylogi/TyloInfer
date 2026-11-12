@@ -165,7 +165,7 @@ class EngineInstance final : public Engine {
                 }
                 state = Load(*execution, options, true,
                     [&](auto& model, auto& model_state, auto& model_executor, auto& components,
-                        auto, auto, auto source) -> State {
+                        auto, auto, auto source, std::unique_ptr<tyloi::Executor> predictor_execution) -> State {
                         using Model = typename std::remove_reference_t<decltype(model)>::element_type;
                         using ModelState = typename std::remove_reference_t<decltype(model_state)>::element_type;
                         using Parts = std::remove_cvref_t<decltype(components)>;
@@ -179,7 +179,7 @@ class EngineInstance final : public Engine {
                             *execution, weights, kv, offload, std::move(model),
                             std::move(model_state), std::move(model_executor),
                             std::move(components), config,
-                            std::move(source), weight_memory);
+                            std::move(source), weight_memory, std::move(predictor_execution));
                     });
                 auto result = visit([&](auto& state) {
                     EngineInfo info;
