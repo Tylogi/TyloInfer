@@ -6,6 +6,7 @@
 #include "executor.h"
 #include "generation/sequence.h"
 #include "generation/batch.h"
+#include "generation/mtp/state.h"
 #include "config.h"
 #include "budget.h"
 #include "generation/decode.h"
@@ -53,14 +54,16 @@ public:
         std::shared_ptr<weights::Memory> memory, std::unique_ptr<weights::Cache> weights,
         std::unique_ptr<models::State> model_state, std::unique_ptr<state::Sessions> sessions,
         std::unique_ptr<TextProcessor> text, models::ForwardOptions forward,
-        std::unique_ptr<tyloi::Executor::Graph> graph, std::unique_ptr<Batch> batch = {});
+        std::unique_ptr<tyloi::Executor::Graph> graph, std::unique_ptr<Batch> batch = {},
+        std::unique_ptr<tyloi::Executor> predictor_execution = {});
     // Retire active requests first. Failed retirement leaves incoming owners with the caller.
     void rebind(std::unique_ptr<models::CausalModel>&& model, std::unique_ptr<tyloi::Executor>&& executor,
         Config config, std::shared_ptr<const ModelSource>&& source,
         std::shared_ptr<weights::Memory>&& memory, std::unique_ptr<weights::Cache>&& weights,
         std::unique_ptr<models::State>&& model_state, std::unique_ptr<state::Sessions>&& sessions,
         std::unique_ptr<TextProcessor>&& text, models::ForwardOptions forward,
-        std::unique_ptr<tyloi::Executor::Graph>&& graph, std::unique_ptr<Batch>&& batch = {});
+        std::unique_ptr<tyloi::Executor::Graph>&& graph, std::unique_ptr<Batch>&& batch = {},
+        std::unique_ptr<tyloi::Executor>&& predictor_execution = {});
     // Start one consumer before enable_reload(); next_reload() delivers posted work before shutdown.
     // Complete reply only after binding and its execution scopes have exited.
     struct Reload { std::int64_t context; std::promise<void> reply; };
@@ -120,6 +123,8 @@ private:
     void clear_bindings() noexcept;
     std::unique_ptr<models::CausalModel> model_;
     std::unique_ptr<tyloi::Executor> executor_;
+    std::unique_ptr<tyloi::Executor> predictor_execution_;
+    mtp::State mtp_state_;
     Config config_;
     std::shared_ptr<const ModelSource> source_;
     std::shared_ptr<weights::Memory> ledger_;

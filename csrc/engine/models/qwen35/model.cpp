@@ -16,7 +16,7 @@ tyloi::models::Info Model::info() const {
 
 MfqModelCapabilities Model::capabilities() const {
     return {graph.architecture, graph.has_component("text"), vision.has_value(), false,
-            false, false, false, false, "model-graph"};
+            false, false, false, bool(mtp), "model-graph"};
 }
 
 tyloi::engine::Metrics Model::metrics() const {
@@ -36,7 +36,7 @@ tyloi::engine::Metrics Model::metrics() const {
             {"vision_supported", double(graph.has_component("vision"))},
             {"vision_available", double(vision.has_value())},
             {"mtp_declared", double(graph.has_component("predictor"))},
-            {"mtp_supported", 0.0}, {"mtp_available", 0.0}};
+            {"mtp_supported", double(mtp_supported)}, {"mtp_available", double(bool(mtp))}};
 }
 
 std::unique_ptr<tyloi::models::State> Model::make_state() const {

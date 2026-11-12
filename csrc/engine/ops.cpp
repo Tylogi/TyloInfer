@@ -54,6 +54,22 @@ struct DeviceScope::Impl {
 DeviceScope::DeviceScope(Device target) : impl_(std::make_unique<Impl>(target)) {}
 DeviceScope::~DeviceScope() = default;
 
+std::unique_ptr<::tyloi::Executor::Scope> dense_scope(::tyloi::Executor* executor, Device target) {
+    if (!executor) return cuda::Executor::current().enter(cuda::FfnMode{});
+    if (!target.is_cuda() || target.index < 0)
+        throw std::invalid_argument("dense scope requires a CUDA device");
+    auto* cuda_executor = dynamic_cast<cuda::Executor*>(executor);
+    if (!cuda_executor) throw std::invalid_argument("dense scope requires a CUDA executor");
+    return cuda_executor->enter(target.index, cuda::FfnMode{});
+}
+
+std::int64_t kv_capacity(Device target) {
+    if (!target.is_cuda() || target.index < 0)
+        throw std::invalid_argument("KV capacity requires a CUDA device");
+    DeviceScope scope(target);
+    return cuda::Executor::current().mmq().kv_cache_capacity;
+}
+
 namespace {
 const DenseTensor& dense(const Tensor& value) {
     const auto* result = value.representation<DenseTensor>();

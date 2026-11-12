@@ -12,6 +12,7 @@ add_library(mfq-engine STATIC
     generation/decode.cpp
     generation/generation.cpp
     generation/mtp/metrics.cpp
+    generation/mtp/generation.cpp
     generation/mtp/sampling.cpp
     models/prepare.cpp
     models/state.cpp

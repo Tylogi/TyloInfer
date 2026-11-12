@@ -4,6 +4,7 @@
 #include "engine/generation/generation.h"
 #include "engine/generation/batch.h"
 #include "engine/generation/mtp/state.h"
+#include "engine/generation/mtp/generation.h"
 #include "engine/generation/sampling.h"
 #include "engine/models/causal_model.h"
 #include "engine/models/common/mtp.h"
@@ -179,8 +180,10 @@ struct Native {
     const ModelSource* source;
     state::Sessions& cache;
     std::function<void()> drain;
-    mtp::State mtp_state;
-    models::Mtp* mtp = nullptr;
+    mtp::State& mtp_state;
+    models::Mtp* mtp;
+    tyloi::Executor* predictor_execution;
+    std::size_t prefix_boundary = 0;
     std::optional<Prepared> prepared;
 
     StepSequence<Prepared> prepare(InferenceRequest& input, models::State& target) {
@@ -203,6 +206,7 @@ struct Native {
     bool batched() const { return false; }
     bool has_hidden(const Hidden& hidden) const { return hidden && hidden.defined(); }
     void invalidate_plan() { graph.invalidate(); }
+    void set_prefix_boundary(std::size_t tokens) { prefix_boundary = tokens; }
     void reset() {
         state.reset(1);
         if (auto* predictor = model.predictor()) {
@@ -233,8 +237,14 @@ struct Native {
         auto sequence = generate_sequence(std::ref(plain), output, prompt.size(), reused, stable, chunk_size);
         while (auto step = sequence.next()) co_yield std::move(step);
     }
-    Generation speculate(InferenceRequest&, InferenceOutput&, std::size_t, const Tensor&, Hidden*) {
-        throw std::invalid_argument("this engine has no speculative predictor");
+    Generation speculate(InferenceRequest& input, InferenceOutput& output, std::size_t reused,
+                         const Tensor& restored, Hidden* last_hidden) {
+        if (!predictor_execution) throw std::invalid_argument("predictor executor is unavailable");
+        const auto chunk_size = budget.prefill(input.prompt.size() - reused, config.generation.prefill_chunk_size,
+            info.prefill_row_bytes, state.position() > 0, config.prefill_chunk_auto);
+        return generate_mtp(model, state, executor, *predictor_execution, weights, budget, source,
+            mtp_state, input, output, chunk_size, prepared ? &*prepared : nullptr, reused, restored,
+            last_hidden, prefix_boundary, config.device, forward_options, config.profile_mtp);
     }
 };
 
@@ -247,7 +257,8 @@ StepSequence<EventData> Engine::generate(const RequestId& id, Request& request) 
     }
     return generate_prepared(
         Native{*model_, *request.state, *executor_, *budget_, *graph_, *weights_, model_info_,
-               config_, forward_options_, source_.get(), *cache_, [this] { drain(); }},
+               config_, forward_options_, source_.get(), *cache_, [this] { drain(); },
+               mtp_state_, model_->predictor(), predictor_execution_.get()},
         *request.state, *executor_, request.input, *request.output, id, request.batched);
 }
 } // namespace tyloi::engine

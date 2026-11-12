@@ -110,6 +110,7 @@ std::unique_ptr<engine::Engine> load_native_engine(CudaEngineOptions options, en
     tyloi::engine::Config config;
     std::unique_ptr<Executor> root;
     std::unique_ptr<tyloi::Executor> execution;
+    std::unique_ptr<tyloi::Executor> predictor_execution;
     std::unique_ptr<models::CausalModel> model;
     std::unique_ptr<models::State> state;
     std::unique_ptr<tyloi::state::Sessions> sessions;
@@ -156,6 +157,8 @@ std::unique_ptr<engine::Engine> load_native_engine(CudaEngineOptions options, en
                      .vision_resident = ::tyloi::cuda::options::vision_resident(),
                      .mirror_scalars = load.tensor_parallel_mirror_linear_attention_scalars,
                      .yarn = load.yarn});
+                if (model->predictor())
+                    predictor_execution = root->fork(load.layer_placement.primary_device());
                 state = model->make_state();
                 finalize_kv(kv.get(), *weights, offload);
                 std::size_t pending_kv = 0;
@@ -196,12 +199,13 @@ std::unique_ptr<engine::Engine> load_native_engine(CudaEngineOptions options, en
         if (target) {
             target->rebind(std::move(model), std::move(execution), std::move(config), std::move(source),
                 std::move(ledger), std::move(weights), std::move(state), std::move(sessions),
-                std::move(text), forward, std::move(graph));
+                std::move(text), forward, std::move(graph), {}, std::move(predictor_execution));
             return {};
         }
         return std::make_unique<engine::Engine>(std::move(model), std::move(execution), std::move(config),
             std::move(source), std::move(ledger), std::move(weights), std::move(state),
-            std::move(sessions), std::move(text), forward, std::move(graph));
+            std::move(sessions), std::move(text), forward, std::move(graph),
+            std::unique_ptr<engine::Batch>{}, std::move(predictor_execution));
     } catch (...) {
         const auto failure = std::current_exception();
         auto* owner = execution ? execution.get() : root.get();
@@ -215,6 +219,12 @@ std::unique_ptr<engine::Engine> load_native_engine(CudaEngineOptions options, en
                 if (graph) graph->invalidate();
                 finish([&] { if (weights) weights->drain(); });
                 finish([&] { if (offload) offload->flush(); });
+                finish([&] {
+                    if (predictor_execution) {
+                        auto predictor_scope = predictor_execution->enter();
+                        predictor_execution->drain();
+                    }
+                });
                 finish([&] { owner->drain(); });
                 if (cleanup) std::rethrow_exception(cleanup);
                 if (weights) weights->release_workspace();
@@ -223,6 +233,11 @@ std::unique_ptr<engine::Engine> load_native_engine(CudaEngineOptions options, en
                 state.reset(); sessions.reset();
                 if (weights) weights->clear_workspace();
                 model.reset(); offload.reset(); kv.reset(); weights.reset();
+                if (predictor_execution) {
+                    auto predictor_scope = predictor_execution->enter();
+                    predictor_execution->clear();
+                }
+                predictor_execution.reset();
                 owner->clear();
             } catch (const std::exception& error) {
                 std::cerr << "runtime_load_cleanup error=" << error.what() << std::endl;
@@ -263,6 +278,7 @@ tyloi::engine::Config resolve_cuda_config(
         const CudaEngineOptions& options) {
     const auto* profile_decode = env_lookup("TYLOINFER_PROFILE_DECODE");
     const bool profile_decode_enabled = profile_decode && profile_decode[0] == '1';
+    const auto* profile_mtp = env_lookup("TYLOINFER_PROFILE_MTP");
     const auto* trace_moe = env_lookup("TYLOINFER_TRACE_MOE_SUMMARY");
     const bool trace_moe_enabled = trace_moe && trace_moe[0] && trace_moe[0] != '0';
     if(options.prefill_chunk_size < 0 || options.prefill_chunk_size > 8192)
@@ -272,6 +288,7 @@ tyloi::engine::Config resolve_cuda_config(
     auto config = tyloi::engine::resolve_config(chunk_limit);
     config.prefill_chunk_auto = prefill_chunk_auto;
     config.profile_decode = profile_decode_enabled;
+    config.profile_mtp = profile_mtp && profile_mtp[0] == '1';
     config.trace_moe = trace_moe_enabled;
     config.continuous_batch =
         tyloi::engine::resolve_batch_config(options.continuous_batching, chunk_limit);

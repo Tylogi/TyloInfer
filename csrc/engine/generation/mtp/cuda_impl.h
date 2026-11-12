@@ -3,6 +3,7 @@
 #include "engine/generation/cuda.h"
 #include "engine/generation/mtp/sequence.h"
 #include "engine/generation/mtp/sampling.h"
+#include "engine/generation/mtp/generation.h"
 #include "engine/weights/workspace.h"
 #include "engine/budget.h"
 
@@ -610,16 +611,14 @@ template <class Model, class State> struct CudaMtpOps {
 #ifdef TYLOINFER_NATIVE_CUDA
     auto scope = tyloi::cuda::Executor::current().enter(mode.ffn);
     predictor_options = tyloi::cuda::forward_options(mode);
-    predictor_options.kv_capacity = tyloi::cuda::Executor::current().mmq().kv_cache_capacity;
+    predictor_options.kv_capacity = tyloi::ops::kv_capacity(tyloi::Device(tyloi::kCUDA,mode.primary));
     if (predictor_execution) predictor_options.serial_experts = false;
 #endif
     tyloi::models::MtpStep result;
     {
 #ifdef TYLOINFER_NATIVE_CUDA
-      auto* cuda_predictor = dynamic_cast<tyloi::cuda::Executor*>(predictor_execution);
-      TYLOINFER_RUNTIME_CHECK(!predictor_execution || cuda_predictor,
-                              "CUDA MTP predictor requires a CUDA executor");
-      auto predictor_scope = cuda_predictor ? cuda_predictor->enter(mode.primary, tyloi::cuda::FfnMode{}) : nullptr;
+      auto predictor_scope = predictor_execution
+          ? tyloi::ops::dense_scope(predictor_execution, tyloi::Device(tyloi::kCUDA,mode.primary)) : nullptr;
 #else
       auto predictor_scope = predictor_execution ? predictor_execution->enter() : nullptr;
 #endif
@@ -782,7 +781,7 @@ template <class Model, class State> struct CudaMtpOps {
     auto input=tyloi::ops::contiguous(mtp.preserve_output_dtype()?normalized:tyloi::ops::cast(normalized,tyloi::kFloat16));
     if constexpr (requires { static_cast<const tyloi::models::CausalModel&>(model).logits(input,true); }) {
       const tyloi::models::CausalModel& causal=model;
-      auto scope=tyloi::cuda::Executor::current().enter(tyloi::cuda::FfnMode{});
+      auto scope=tyloi::ops::dense_scope(nullptr,input.device());
       auto result=causal.logits(input,true);
       TYLOINFER_RUNTIME_CHECK(result.defined(),"CUDA model logits returned no tensor");
       return result;
@@ -941,6 +940,21 @@ run_mtp_generation(Model &model, State &state, tyloi::cuda::Executor* executor,
     logical_chunk=prefill_span(model,state,request.prompt.size(),prefill_chunk_size,reused_tokens,0,
         prepared && prepared->transformed(),reused_tokens>0 && prefill_chunk_size<=8);
   }
+#ifdef TYLOINFER_NATIVE_CUDA
+  if constexpr (std::is_base_of_v<tyloi::models::CausalModel, Model> &&
+                std::is_base_of_v<tyloi::models::State, State>) {
+    const tyloi::models::CausalModel& causal = model;
+    if (causal.predictor() == &mtp) {
+      if (!budget || !predictor_execution)
+        throw std::invalid_argument("predictor execution resources are unavailable");
+      return tyloi::engine::generate_mtp(causal, state, tyloi::cuda::Executor::current(),
+          *predictor_execution, weights, *budget, source, mtp_state, request, output,
+          logical_chunk, prepared, reused_tokens, std::move(restored_last_hidden), session_last_hidden,
+          stable_prefix_tokens, tyloi::Device(tyloi::kCUDA, mode.primary),
+          tyloi::cuda::forward_options(mode), mtp_detail::CudaMtpOps<Model, State>::profile_target());
+    }
+  }
+#endif
   return tyloi::engine::speculative_sequence(
       mtp_detail::CudaMtpOps<Model, State>{model, state, executor, collectives, mode, weights, info, source, mtp, mtp_state, prepared,
                                prefill_chunk_size, &output, budget, predictor_execution},

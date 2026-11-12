@@ -2,6 +2,8 @@
 #include "engine/scheduler/scheduler.h"
 #include "engine/generation/batch.h"
 #include "engine/generation/generation.h"
+#include "engine/generation/mtp/metrics.h"
+#include "engine/models/common/mtp.h"
 
 #include <algorithm>
 #include <exception>
@@ -28,10 +30,11 @@ Engine::Engine(std::unique_ptr<models::CausalModel> model, std::unique_ptr<tyloi
         std::shared_ptr<weights::Memory> memory, std::unique_ptr<weights::Cache> weights,
         std::unique_ptr<models::State> model_state, std::unique_ptr<state::Sessions> sessions,
         std::unique_ptr<TextProcessor> text, models::ForwardOptions forward,
-        std::unique_ptr<tyloi::Executor::Graph> graph, std::unique_ptr<Batch> batch) {
+        std::unique_ptr<tyloi::Executor::Graph> graph, std::unique_ptr<Batch> batch,
+        std::unique_ptr<tyloi::Executor> predictor_execution) {
     rebind(std::move(model), std::move(executor), std::move(config), std::move(source),
         std::move(memory), std::move(weights), std::move(model_state), std::move(sessions),
-        std::move(text), std::move(forward), std::move(graph), std::move(batch));
+        std::move(text), std::move(forward), std::move(graph), std::move(batch), std::move(predictor_execution));
     start();
 }
 
@@ -42,6 +45,10 @@ void Engine::install(std::unique_ptr<tyloi::Executor::Graph> graph) {
     try {
         if (config_.continuous_batch.max_sequences && !batch_)
             throw std::invalid_argument("continuous batching is unavailable for this model");
+        auto* predictor = model_->predictor();
+        if (predictor && (!idle_state_ || !idle_state_->predictor || !idle_state_->predictor->belongs_to(*predictor) ||
+                          !predictor_execution_ || !model_->supports_speculation()))
+            throw std::invalid_argument("predictor resources are unavailable or incompatible");
         model_info_ = model_->info();
         graph_->generated_capacity = std::max<std::int64_t>(model_info_.max_context, 2048);
         info_ = {};
@@ -60,7 +67,7 @@ void Engine::install(std::unique_ptr<tyloi::Executor::Graph> graph) {
         auto scope = executor_->enter();
         tyloi::weights::LoadScope memory_load(*ledger_);
         budget_.emplace(*executor_, *ledger_, *weights_, *cache_, config_.device);
-        budget_->bind(false);
+        budget_->bind(predictor != nullptr);
         if (batch_) batch_->bind(*budget_);
         if (const auto bytes = config_.resident_budget_bytes) {
             engine::SessionCommand command; command.kind = engine::SessionCommand::Kind::memory_budget; command.bytes = bytes;
@@ -87,10 +94,13 @@ void Engine::rebind(std::unique_ptr<models::CausalModel>&& model, std::unique_pt
         std::shared_ptr<weights::Memory>&& memory, std::unique_ptr<weights::Cache>&& weights,
         std::unique_ptr<models::State>&& model_state, std::unique_ptr<state::Sessions>&& sessions,
         std::unique_ptr<TextProcessor>&& text, models::ForwardOptions forward,
-        std::unique_ptr<tyloi::Executor::Graph>&& graph, std::unique_ptr<Batch>&& batch) {
+        std::unique_ptr<tyloi::Executor::Graph>&& graph, std::unique_ptr<Batch>&& batch,
+        std::unique_ptr<tyloi::Executor>&& predictor_execution) {
     if (executor_) unload_model();
     model_ = std::move(model);
     executor_ = std::move(executor);
+    predictor_execution_ = std::move(predictor_execution);
+    mtp_state_ = {};
     config_ = std::move(config);
     source_ = std::move(source);
     ledger_ = std::move(memory);
@@ -118,7 +128,7 @@ bool Engine::ready() const { return ready_; }
 std::unique_ptr<tyloi::Executor::Scope> Engine::enter() { return executor_->enter(); }
 
 void Engine::prepare_request(Request& request, bool batched) {
-    engine::prepare_request(request, text_.get(), info_, batched, false);
+    engine::prepare_request(request, text_.get(), info_, batched, model_->predictor() != nullptr);
     if (batched) {
         if (!batch_) throw std::logic_error("continuous batching is unavailable for this model");
         return;
@@ -153,8 +163,14 @@ SessionResult Engine::session_command(const SessionCommand& command) {
 void Engine::drain() {
     auto scope = executor_->enter();
     std::exception_ptr failure;
+    try {
+        if (predictor_execution_) {
+            auto predictor_scope = predictor_execution_->enter();
+            predictor_execution_->drain();
+        }
+    } catch (...) { failure = std::current_exception(); }
     try { if (weights_) weights_->drain(); }
-    catch (...) { failure = std::current_exception(); }
+    catch (...) { if (!failure) failure = std::current_exception(); }
     try { executor_->drain(); }
     catch (...) { if (!failure) failure = std::current_exception(); }
     if (failure) std::rethrow_exception(failure);
@@ -178,6 +194,12 @@ void Engine::unload_model() {
         model_.reset();
         weights_.reset();
         text_.reset();
+        mtp_state_ = {};
+        if (predictor_execution_) {
+            auto predictor_scope = predictor_execution_->enter();
+            predictor_execution_->clear();
+        }
+        predictor_execution_.reset();
         // Execution resources retire last: state and weight backing free first.
         executor_->clear();
         scope.reset();
@@ -200,8 +222,10 @@ ControlResult Engine::control_command(ControlRequest request) {
                 text_->prepare_duplex_session(value.prompt, value.parameters); return std::move(value.parameters);
             } else { text_->prepare_duplex_step(value.text, value.input); return std::move(value.input); }
         } else if constexpr (std::is_same_v<T, engine::GetMetrics>) {
+            Metrics predictor_metrics;
+            if (model_->predictor()) mtp::append_generation_metrics(predictor_metrics, mtp_state_.stats);
             return resource_metrics(model_->metrics(), {}, std::nullopt, false,
-                batch_ ? batch_->metrics() : Metrics{}, {}, std::nullopt, {}, source_.get(),
+                batch_ ? batch_->metrics() : Metrics{}, {}, std::nullopt, predictor_metrics, source_.get(),
                 *ledger_, *weights_, *cache_, *budget_,
                 executor_->memory(config_.devices), config_.device, config_.online_budget);
         } else throw std::invalid_argument("model has no duplex component");
@@ -235,7 +259,10 @@ SessionResult Engine::set_budget(const SessionCommand& command) {
         throw;
     }
     if (ready_) reset_states(1);
-    if (idle_state_) idle_state_->reset(1);
+    if (idle_state_) {
+        idle_state_->reset(1);
+        if (auto* predictor = model_->predictor()) predictor->reset(*idle_state_->predictor, 1);
+    }
     return change.apply();
 }
 

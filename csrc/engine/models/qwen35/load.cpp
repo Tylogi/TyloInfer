@@ -335,6 +335,7 @@ void load_components(Model& model, const ::tyloi::weights::Loader& weights,
         const LayerPlacementConfig& placement, int cpu_layers, bool cpu_offload,
         bool resident, bool preallocate) {
     const auto plan = cuda_model_plan(model.graph);
+    model.mtp_supported = plan.predictor == CudaPredictorAdapter::qwen35;
     const bool mtp_allowed =
         !placement.enabled() && cpu_layers == 0 && !cpu_offload &&
         weights.cache().transfer() == ::tyloi::weights::Cache::Transfer::automatic;

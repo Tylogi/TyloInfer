@@ -1,6 +1,7 @@
 #pragma once
 
 #include "engine/tensor.h"
+#include "engine/executor.h"
 #include "engine/requests/constraint.h"
 #include "engine/state/kv_view.h"
 
@@ -24,6 +25,12 @@ namespace tyloi::ops {
 // CUDA execution and prepared-weight operations require an execution scope.
 // qkv_norm and append_kv also require a scope for their CPU passthrough cases.
 using Trace = std::vector<std::pair<std::string, Tensor>>;
+
+// Neutral dense projection/FFN policy; null borrows the active executor, otherwise binds its device.
+// The scope does not wait and must end before suspending generation.
+std::unique_ptr<::tyloi::Executor::Scope> dense_scope(::tyloi::Executor* executor, Device device);
+// Live capacity override in the active execution resources.
+std::int64_t kv_capacity(Device device);
 
 // Query, key and value are [B,H,T,D]; KV may use fewer heads.
 struct AttentionInput {
