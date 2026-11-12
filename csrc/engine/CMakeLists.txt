@@ -8,7 +8,9 @@ set_target_properties(mfq-tensor PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 add_library(mfq-engine STATIC
     config.cpp
+    engine.cpp
     generation/decode.cpp
+    generation/generation.cpp
     generation/mtp/metrics.cpp
     models/prepare.cpp
     models/state.cpp
@@ -43,6 +45,7 @@ add_library(mfq-engine STATIC
     requests/processor.cpp
     requests/tokenizer.cpp
     scheduler/scheduler.cpp
+    scheduler/request.cpp
     state/session/paged.cpp
     state/session/prefix_cache.cpp
     state/qsa_sequence.cpp
@@ -50,7 +53,6 @@ add_library(mfq-engine STATIC
     state/kv_view.cpp
 )
 if(TYLOINFER_BUILD_CUDA_ENGINE)
-    target_sources(mfq-engine PRIVATE scheduler/request.cpp)
     target_compile_definitions(mfq-engine PUBLIC TYLOINFER_NATIVE_CUDA=1)
 endif()
 add_library(mfq::engine ALIAS mfq-engine)

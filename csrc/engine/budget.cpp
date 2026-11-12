@@ -1,8 +1,5 @@
 #include "engine/budget.h"
 
-#ifndef TYLOINFER_NATIVE_CUDA
-#include "engine/backends/cuda/executor/executor.h"
-#endif
 #include "engine/generation/prefill_budget.h"
 #include "engine/state/session/sessions.h"
 #include "engine/requests/processor.h"
@@ -22,11 +19,7 @@ static void require_cuda_device(Device device) {
         throw std::invalid_argument("budget requires a CUDA device");
 }
 
-#ifdef TYLOINFER_NATIVE_CUDA
 Budget::Budget(::tyloi::Executor& executor,
-#else
-Budget::Budget(::tyloi::cuda::Executor& executor,
-#endif
         ::tyloi::weights::Memory& weight_memory, ::tyloi::weights::Cache& weights,
         state::Sessions& cache, Device primary)
     : executor_(executor), weight_memory_(weight_memory), weights_(weights), cache_(cache),

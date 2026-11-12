@@ -6,7 +6,6 @@
 #include <iostream>
 #include <utility>
 
-#ifdef TYLOINFER_NATIVE_CUDA
 #include "engine/resource_metrics.h"
 #include "engine/models/prepare.h"
 #include "engine/models/source.h"
@@ -18,12 +17,10 @@
 #include "engine/state/session/sessions.h"
 #include <stdexcept>
 #include <type_traits>
-#endif
 
 namespace tyloi::engine {
 
 Engine::Engine() = default;
-#ifdef TYLOINFER_NATIVE_CUDA
 Engine::Engine(std::unique_ptr<models::CausalModel> model, std::unique_ptr<tyloi::Executor> executor,
         Config config, std::shared_ptr<const ModelSource> source,
         std::shared_ptr<weights::Memory> memory, std::unique_ptr<weights::Cache> weights,
@@ -99,24 +96,15 @@ void Engine::rebind(std::unique_ptr<models::CausalModel>&& model, std::unique_pt
     forward_options_ = std::move(forward);
     install(std::move(graph));
 }
-#endif
 Engine::~Engine() {
-#ifdef TYLOINFER_NATIVE_CUDA
     scheduler_.reset();
     if (executor_) {
         try { unload_model(); }
         catch (const std::exception& error) { std::cerr << "runtime_unload_cleanup error=" << error.what() << std::endl; std::terminate(); }
         catch (...) { std::cerr << "runtime_unload_cleanup error=unknown" << std::endl; std::terminate(); }
     }
-#endif
 }
 
-#ifndef TYLOINFER_NATIVE_CUDA
-void Engine::retire_request(Request& request) noexcept {
-    request.generation = {};
-    request.state.reset();
-}
-#else
 EngineInfo Engine::describe() const { return info_; }
 
 bool Engine::ready() const { return ready_; }
@@ -234,7 +222,5 @@ SessionResult Engine::set_budget(const SessionCommand& command) {
     if (idle_state_) idle_state_->reset(1);
     return change.apply();
 }
-
-#endif
 
 } // namespace tyloi::engine

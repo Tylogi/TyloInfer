@@ -11,20 +11,13 @@
 
 namespace tyloi::state { class Sessions; }
 namespace tyloi::weights { class Memory; }
-#ifndef TYLOINFER_NATIVE_CUDA
-namespace tyloi::cuda { class Executor; }
-#endif
 namespace tyloi::engine {
 struct SessionCommand;
 struct SessionResult;
 
 class Budget {
 public:
-#ifdef TYLOINFER_NATIVE_CUDA
     Budget(::tyloi::Executor& executor,
-#else
-    Budget(::tyloi::cuda::Executor& executor,
-#endif
         ::tyloi::weights::Memory& weight_memory, ::tyloi::weights::Cache& weights,
         state::Sessions& cache, Device primary);
     ~Budget();
@@ -76,11 +69,7 @@ public:
 private:
     ::tyloi::Executor::Memory memory(Device device) const;
     std::size_t trim_prefix(std::size_t bytes, Device device);
-#ifdef TYLOINFER_NATIVE_CUDA
     ::tyloi::Executor& executor_;
-#else
-    ::tyloi::cuda::Executor& executor_;
-#endif
     ::tyloi::weights::Memory& weight_memory_;
     ::tyloi::weights::Cache& weights_;
     state::Sessions& cache_;
