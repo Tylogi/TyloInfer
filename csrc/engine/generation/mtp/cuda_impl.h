@@ -605,13 +605,16 @@ template <class Model, class State> struct CudaMtpOps {
   }
 #endif
   tyloi::models::MtpStep predictor_step(Tensor hidden, Tensor ids, Tensor positions) {
+    tyloi::models::ForwardOptions predictor_options;
 #ifdef TYLOINFER_NATIVE_CUDA
     auto scope = tyloi::cuda::Executor::current().enter(mode.ffn);
+    predictor_options = tyloi::cuda::forward_options(mode);
+    predictor_options.kv_capacity = tyloi::cuda::Executor::current().mmq().kv_cache_capacity;
 #endif
     tyloi::models::MtpStep result;
     {
       auto predictor_scope = predictor_execution ? predictor_execution->enter() : nullptr;
-      result = mtp.step(predictor, hidden, ids, positions);
+      result = mtp.step(predictor, hidden, ids, positions, predictor_options);
     }
 #ifdef TYLOINFER_NATIVE_CUDA
     projected_predictor_logits = result.sample_logits;

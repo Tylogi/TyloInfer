@@ -17,11 +17,8 @@ std::vector<MtpState::Layout> layout(const tyloi::models::qwen35::Predictor& mod
 
 } // namespace
 
-Mtp::Mtp(tyloi::models::qwen35::Predictor model,
-        const int64_t& kv_capacity, tyloi::ops::Trace* const& trace, const int& trace_scope,
-        bool preallocate)
-    : model_(std::move(model)),
-      kv_capacity_(kv_capacity), trace_(trace), trace_scope_(trace_scope), preallocate_(preallocate) {}
+Mtp::Mtp(tyloi::models::qwen35::Predictor model, bool preallocate)
+    : model_(std::move(model)), preallocate_(preallocate) {}
 
 std::unique_ptr<tyloi::models::MtpState> Mtp::make_state() const {
     auto result = std::make_unique<MtpState>(*this, layout(model_, model_.device), model_.config.hidden_size);
@@ -34,10 +31,9 @@ void Mtp::reset(tyloi::models::MtpState& value, int64_t batch) const {
 }
 
 tyloi::models::MtpStep Mtp::step(tyloi::models::MtpState& value, const ::tyloi::Tensor& hidden,
-        const ::tyloi::Tensor& next_ids, const ::tyloi::Tensor& positions) const {
+        const ::tyloi::Tensor& next_ids, const ::tyloi::Tensor& positions,
+        const tyloi::models::ForwardOptions& options) const {
     auto& request = state<MtpState>(value);
-    const int device = model_.device.index;
-    const tyloi::models::ForwardOptions options{kv_capacity_, trace_, trace_scope_, device};
     auto output = model_.step(hidden, next_ids, positions, request, options);
     return {output, output};
 }

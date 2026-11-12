@@ -470,7 +470,8 @@ std::pair<DenseTensor, DenseTensor> Predictor::evaluate(tyloi::models::MtpState&
 }
 
 tyloi::models::MtpStep Predictor::step(tyloi::models::MtpState& value, const tyloi::Tensor& input_hidden, const tyloi::Tensor& input_ids,
-                                      const tyloi::Tensor& input_positions) const {
+                                      const tyloi::Tensor& input_positions,
+                                      const tyloi::models::ForwardOptions&) const {
     const auto& hidden=input_hidden.dense();
     const auto& ids=input_ids.dense();
     auto positions=input_positions.defined()?input_positions.dense():DenseTensor{};

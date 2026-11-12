@@ -70,7 +70,8 @@ struct Predictor final : tyloi::models::Mtp {
                                        bool history_only = false) const;
 
     tyloi::models::MtpStep step(tyloi::models::MtpState&, const tyloi::Tensor& hidden, const tyloi::Tensor& ids,
-                                const tyloi::Tensor& positions = {}) const override;
+                                const tyloi::Tensor& positions = {},
+                                const tyloi::models::ForwardOptions& = {}) const override;
     void history_step(tyloi::models::MtpState&, DenseTensor hidden, DenseTensor ids, DenseTensor positions = {},
                       bool scalar_chain = false) const;
 

@@ -54,9 +54,6 @@ Components Components::load(
     int& cpu_layers,
     Executor& executor,
     std::unique_ptr<tyloi::Executor>& predictor_execution,
-    const int64_t& kv_capacity,
-    tyloi::ops::Trace* const& trace,
-    const int& trace_scope,
     bool optional,
     bool cpu_offload,
     bool preallocate) {
@@ -79,10 +76,8 @@ Components Components::load(
                 auto predictor_executor = executor.fork(model.device.index);
                 predictor_executor->mode().ffn = FfnMode{};
                 predictor_execution = std::move(predictor_executor);
-                // Mtp retains these references, so they must outlive the result.
                 components.mtp = std::make_unique<Mtp>(
-                    std::move(*predictor),
-                    kv_capacity, trace, trace_scope, preallocate);
+                    std::move(*predictor), preallocate);
             }
         } else {
             std::cerr

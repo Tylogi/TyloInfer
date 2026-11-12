@@ -628,7 +628,8 @@ std::pair<DenseTensor, DenseTensor> Mtp::evaluate(tyloi::models::MtpState& value
 
 tyloi::models::MtpStep Mtp::step(tyloi::models::MtpState& value,
                                   const ::tyloi::Tensor& hidden, const ::tyloi::Tensor& ids,
-                                  const ::tyloi::Tensor& positions) const {
+                                  const ::tyloi::Tensor& positions,
+                                  const tyloi::models::ForwardOptions&) const {
     if (positions.defined())
         throw std::runtime_error("this CUDA MTP predictor does not accept explicit positions");
     auto result = evaluate(value, hidden.dense(),
