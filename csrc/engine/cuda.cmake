@@ -82,7 +82,6 @@ add_subdirectory(${PROJECT_SOURCE_DIR}/engine/models ${CMAKE_CURRENT_BINARY_DIR}
 set(TYLOINFER_CUDA_ENGINE_SOURCES
     ${PROJECT_SOURCE_DIR}/engine/generation/generation.cpp
     ${PROJECT_SOURCE_DIR}/engine/generation/cuda.cpp
-    ${PROJECT_SOURCE_DIR}/engine/generation/decode.cpp
     ${PROJECT_SOURCE_DIR}/engine/generation/mtp/cuda.cpp
     ${PROJECT_SOURCE_DIR}/engine/engine.cpp
     ${PROJECT_SOURCE_DIR}/engine/models/session/cache.cpp

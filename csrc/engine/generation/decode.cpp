@@ -1,6 +1,5 @@
 #include "engine/generation/decode.h"
 
-#ifdef TYLOINFER_NATIVE_CUDA
 #include <algorithm>
 #include <utility>
 
@@ -56,4 +55,3 @@ void Decode::invalidate() {
     static_next = {}; valid_ = false;
 }
 } // namespace tyloi::engine
-#endif

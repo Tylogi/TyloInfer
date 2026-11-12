@@ -1,6 +1,5 @@
 #pragma once
 
-#ifdef TYLOINFER_NATIVE_CUDA
 #include "engine/executor.h"
 #include "engine/ops.h"
 #include "engine/requests/sampling.h"
@@ -34,4 +33,3 @@ private:
     bool greedy_ = false, valid_ = false;
 };
 } // namespace tyloi::engine
-#endif
