@@ -1,6 +1,6 @@
 #include "mlx_dflash2.h"
 #include "hf_safetensors_store.h"
-#include "mlx_cached_kernel.h"
+#include "engine/backends/metal/native/kernel.h"
 #include "mlx_tensor.h"
 #include "mlx_weight_residency.h"
 #include "mlx_kernel_prepare.h"
@@ -30,7 +30,7 @@ array rotated(const array& value, int dimension, float theta, int offset) {
 
 array dynamic_convolution(const array& input, const array& dynamic, const array& base,
     const array& residual, int group, bool finish) {
-    static const auto kernel = cached_metal_kernel("tinfer_dflash2_dynamic_convolution",
+    static const auto kernel = tyloi::metal::custom_kernel("tinfer_dflash2_dynamic_convolution",
         {"input", "dynamic", "base", "residual", "params"}, {"output"}, R"METAL(
 uint index = thread_position_in_grid.x;
 uint hidden = params[0], rows = params[1], groups = hidden / params[2], stage = params[3];
@@ -52,7 +52,7 @@ output[index] = bfloat(result);
 }
 
 std::pair<array, array> candidates(const array& logits, int rows, int vocabulary) {
-    static const auto kernel = cached_metal_kernel("tinfer_dflash2_top16",
+    static const auto kernel = tyloi::metal::custom_kernel("tinfer_dflash2_top16",
         {"values", "ids", "params"}, {"scores", "tokens"}, R"METAL(
 const uint tid = thread_index_in_threadgroup, lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
 const uint shards = params[1], row = threadgroup_position_in_grid.x / (FIRST ? shards : 1u);
@@ -108,7 +108,7 @@ for (uint rank = 0u; rank < 16u; ++rank) {
 MlxDFlash2Proposal select_proposals(const array& logits, const array& hidden,
     const array& predecessor, const array& successor, int anchor, const MlxDFlash2Config& config) {
     auto [unary, ids] = candidates(logits, config.block_size - 1, config.vocabulary);
-    static const auto kernel = cached_metal_kernel("tinfer_dflash2_select_chain",
+    static const auto kernel = tyloi::metal::custom_kernel("tinfer_dflash2_select_chain",
         {"unary", "ids", "hidden", "predecessor", "successor", "params"}, {"tokens", "confidence"}, R"METAL(
 uint lane = thread_index_in_simdgroup, candidate = simdgroup_index_in_threadgroup;
 threadgroup float scores[16]; threadgroup uint previous;

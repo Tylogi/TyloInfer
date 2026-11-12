@@ -1,5 +1,5 @@
 #include "mlx_grouped_linear.h"
-#include "mlx_kernel_prepare.h"
+#include "engine/backends/metal/native/kernel.h"
 #include "mlx_nvq_decode.h"
 #include "mlx_staging_allocator.h"
 
@@ -1018,7 +1018,7 @@ struct NintProjectionConfig {
     }
 };
 
-class NintProjectionPrimitive final : public mlx::core::UnaryPrimitive, public MlxPreparableKernel {
+class NintProjectionPrimitive final : public mlx::core::UnaryPrimitive, public tyloi::metal::PreparableKernel {
 public:
     NintProjectionPrimitive(
         mlx::core::Stream stream,
@@ -1046,7 +1046,7 @@ public:
     void prepare_gpu() override { (void)prepared_kernel(); }
 
     MTL::ComputePipelineState* prepared_kernel() {
-        auto& device = kernel_device(stream().device);
+        auto& device = tyloi::metal::kernel_device(stream().device);
         CompileOptions options;
         options.math_mode = MathMode::Fast;
         auto* library = device.get_library(
@@ -2838,7 +2838,7 @@ std::shared_ptr<const DirectProjectionPlan> make_direct_projection_plan(
     return plan;
 }
 
-class DirectProjectionPrimitive final : public mlx::core::UnaryPrimitive, public MlxPreparableKernel {
+class DirectProjectionPrimitive final : public mlx::core::UnaryPrimitive, public tyloi::metal::PreparableKernel {
 public:
     DirectProjectionPrimitive(
         mlx::core::Stream stream,
@@ -2849,7 +2849,7 @@ public:
     void prepare_gpu() override { (void)prepared_kernel(); }
 
     MTL::ComputePipelineState* prepared_kernel() {
-        auto& device = kernel_device(stream().device);
+        auto& device = tyloi::metal::kernel_device(stream().device);
         CompileOptions options;
         options.math_mode = MathMode::Fast;
         auto* library = device.get_library(

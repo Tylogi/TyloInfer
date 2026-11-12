@@ -48,7 +48,7 @@ constexpr char kShortMerge[] = R"CSA2(
 bool csa2_nax_supported(Stream stream) {
     if (mlx_metal_nax_disabled()) return false;
     if (__builtin_available(macOS 26.2, iOS 26.2, tvOS 26.2, visionOS 26.2, *)) {
-        const auto& device = kernel_device(stream.device);
+        const auto& device = tyloi::metal::kernel_device(stream.device);
         const auto& architecture = device.get_architecture();
         return !architecture.empty() && device.get_architecture_gen() >=
             (architecture.back() == 'p' ? 18 : 17);
@@ -56,7 +56,7 @@ bool csa2_nax_supported(Stream stream) {
     return false;
 }
 
-class Csa2Short final : public Primitive, public MlxPreparableKernel {
+class Csa2Short final : public Primitive, public tyloi::metal::PreparableKernel {
 public:
     Csa2Short(Stream stream, int dim, int position, int window, bool unpacked = false, int rotary = 0)
         : Primitive(stream), dim_(dim), position_(position), window_(window), rotary_(rotary), unpacked_(unpacked) {
@@ -68,7 +68,7 @@ public:
     }
 
     void prepare_gpu() override {
-        auto& device = kernel_device(stream().device);
+        auto& device = tyloi::metal::kernel_device(stream().device);
         auto* library = prepared_library();
         for (const auto* suffix : {"_shared", "_scalar", "_merge"})
             (void)device.get_kernel(kernel_prefix() + suffix, library);
@@ -94,7 +94,7 @@ public:
         partial.set_data(allocator::malloc(partial.nbytes()));
         auto& output = outputs.front();
         output.set_data(allocator::malloc(output.nbytes()));
-        auto& device = kernel_device(stream().device);
+        auto& device = tyloi::metal::kernel_device(stream().device);
         auto* library = prepared_library();
         auto& encoder = mlx::core::metal::get_command_encoder(stream());
         encoder.add_temporary(partial);
@@ -145,7 +145,7 @@ private:
         CompileOptions options;
         options.math_mode = MathMode::Fast;
         const auto key = preparation_key() + "_merge";
-        return kernel_device(stream().device).get_library(key, options, [this, key] {
+        return tyloi::metal::kernel_device(stream().device).get_library(key, options, [this, key] {
             return std::string(kCsa2Header) + "\n#define CSA2_INVERSE_ROPE 1\nconstant int D = "
                 + std::to_string(dim_) + ";\nconstant int ROTARY = " + std::to_string(rotary_) + ";\n"
                 "kernel void " + key + "(const device float* partial [[buffer(0)]], "
@@ -162,7 +162,7 @@ private:
     MTL::Library* prepared_library() {
         CompileOptions options;
         options.math_mode = MathMode::Fast;
-        return kernel_device(stream().device).get_library(kernel_prefix(), options, [this] {
+        return tyloi::metal::kernel_device(stream().device).get_library(kernel_prefix(), options, [this] {
             std::string source = nax_ ? "#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\n"
                 "#define UNROLL _Pragma(\"clang loop unroll(full)\")\n" : "";
             if (unpacked_) source += "#define CSA2_UNPACKED 1\n";

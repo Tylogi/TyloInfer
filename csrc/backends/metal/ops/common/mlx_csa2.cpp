@@ -1,5 +1,5 @@
 #include "mlx_csa2.h"
-#include "mlx_kernel_prepare.h"
+#include "engine/backends/metal/native/kernel.h"
 #include "mlx_platform.h"
 #include "mfq_mfe_prefill_embedded.h"
 #include <mlx/backend/metal/device.h>
@@ -116,7 +116,7 @@ struct PackedParams {
     std::int64_t Q[3],Local[3],Pooled[2],Topk[3],O[3];
 };
 
-class Csa2Prefill final : public Primitive, public MlxPreparableKernel {
+class Csa2Prefill final : public Primitive, public tyloi::metal::PreparableKernel {
 public:
     Csa2Prefill(Stream stream, int offset, int ratio, int window, Dtype dtype, bool unpack)
         : Primitive(stream), offset_(offset), ratio_(ratio), window_(window), dtype_(dtype), unpack_(unpack) {}
@@ -126,12 +126,12 @@ public:
     std::string preparation_key() const override { return name_string(); }
     MTL::Library* library() {
         CompileOptions options; options.math_mode=MathMode::Fast;
-        return kernel_device(stream().device).get_library("mfq_csa2_prefill_v1", options, [] {
+        return tyloi::metal::kernel_device(stream().device).get_library("mfq_csa2_prefill_v1", options, [] {
             return std::string(detail::kSteelAttentionSource)+detail::kCsa2PrefillSource;
         });
     }
     void prepare_gpu() override {
-        auto& d=kernel_device(stream().device); auto* lib=library();
+        auto& d=tyloi::metal::kernel_device(stream().device); auto* lib=library();
         (void)d.get_kernel(name_string(),lib);
         if(unpack_)(void)d.get_kernel(dtype_==float16?"mfq_csa2_unpack_f16":"mfq_csa2_unpack_bf16",lib);
     }
@@ -143,7 +143,7 @@ public:
             {q.strides(0),q.strides(1),q.strides(2)}, {local.strides(0),0,local.strides(1)},
             {pooled.strides(0),pooled.strides(1)},{ids.strides(0),0,ids.strides(1)},
             {result.strides(0),result.strides(1),result.strides(2)}};
-        auto& device=kernel_device(stream().device);auto* lib=library();
+        auto& device=tyloi::metal::kernel_device(stream().device);auto* lib=library();
         auto& encoder=mlx::core::metal::get_command_encoder(stream());
         auto local_values=local, pooled_values=pooled;
         if(unpack_) {

@@ -1,6 +1,6 @@
 #include "mlx_gguf_staged.h"
 #include "mlx_gguf_prefill.h"
-#include "mlx_cached_kernel.h"
+#include "engine/backends/metal/native/kernel.h"
 #include "gguf_embedded.h"
 #include "../../platform/metal_device_info.h"
 
@@ -695,7 +695,7 @@ __attribute__((noinline)) void gate_up_columns(Input x, uint live, uint k, uint 
 }
 
 const fast::CustomKernelFunction& pack_kernel() {
-    static const auto kernel = cached_metal_kernel("tinfer_gguf_prefill_pack_planes",
+    static const auto kernel = tyloi::metal::custom_kernel("tinfer_gguf_prefill_pack_planes",
         {"packed", "anchor", "params"}, {"payload", "auxiliary", "metadata"}, R"METAL(
 uint at = thread_position_in_grid.x, groups = params[0] / 32u, rows = params[1];
 if (at >= groups * rows) return;
@@ -791,7 +791,7 @@ std::vector<array> pack(const array& bytes, const array& anchor, int format, int
 }
 
 const fast::CustomKernelFunction& dequantize_planes_kernel() {
-    static const auto kernel = cached_metal_kernel("tinfer_gguf_planes_dequantize",
+    static const auto kernel = tyloi::metal::custom_kernel("tinfer_gguf_planes_dequantize",
         {"p0", "p1", "meta", "params"}, {"out"}, R"METAL(
 uint at = thread_position_in_grid.x, k = params[0], rows = params[1], groups = k / 32u;
 threadgroup uint table[PlaneLayout<F>::table_words];
@@ -813,7 +813,7 @@ decode_group_chunks<F, float>(payload, staged_lookup<F>(table), group,
 }
 
 const fast::CustomKernelFunction& embedding_planes_kernel() {
-    static const auto kernel = cached_metal_kernel("tinfer_gguf_planes_embedding",
+    static const auto kernel = tyloi::metal::custom_kernel("tinfer_gguf_planes_embedding",
         {"p0", "p1", "meta", "ids", "params"}, {"out"}, R"METAL(
 uint at = thread_position_in_grid.x, groups = params[0] / 32u;
 threadgroup uint table[PlaneLayout<F>::table_words];
@@ -837,7 +837,7 @@ decode_group_chunks<F, float>(payload, staged_lookup<F>(table), group,
 }
 
 const fast::CustomKernelFunction& independent_gate_up_kernel() {
-    static const auto kernel = cached_metal_kernel("tinfer_gguf_independent_gate_up",
+    static const auto kernel = tyloi::metal::custom_kernel("tinfer_gguf_independent_gate_up",
         {"gate", "gate_aux", "gate_meta", "up", "up_aux", "up_meta", "x", "x_up", "ids", "params", "count", "slots", "counters"},
         {"y"}, R"METAL(
 const uint tid = thread_index_in_threadgroup, lane = thread_index_in_simdgroup;
@@ -924,7 +924,7 @@ else columns(integral_constant<int, 2>{});
 }
 
 const fast::CustomKernelFunction& gate_up_kernel() {
-    static const auto kernel = cached_metal_kernel("tinfer_gguf_prefill_staged_gate_up",
+    static const auto kernel = tyloi::metal::custom_kernel("tinfer_gguf_prefill_staged_gate_up",
         {"gate", "up", "x", "descriptors", "count", "params", "gate_aux", "gate_meta", "up_aux", "up_meta", "x_up",
             "shared_gate", "shared_up", "shared_gate_aux", "shared_gate_meta", "shared_up_aux", "shared_up_meta", "slots"}, {"y"}, R"METAL(
 uint tile = threadgroup_position_in_grid.y;
@@ -1063,7 +1063,7 @@ else {
 }
 
 const fast::CustomKernelFunction& projection_kernel() {
-    static const auto kernel = cached_metal_kernel("tinfer_gguf_planes_projection",
+    static const auto kernel = tyloi::metal::custom_kernel("tinfer_gguf_planes_projection",
         {"p0", "p1", "meta", "x", "params"}, {"out"}, R"METAL(
 const uint lane = thread_index_in_simdgroup, part = lane % L;
 const uint column = (threadgroup_position_in_grid.x * 2u + simdgroup_index_in_threadgroup) * (32u / L) + lane / L;
@@ -1106,7 +1106,7 @@ for (uint row = 0u; row < uint(MR); ++row) {
 }
 
 const fast::CustomKernelFunction& projection_many_kernel() {
-    static const auto kernel = cached_metal_kernel("tinfer_gguf_planes_projection_many",
+    static const auto kernel = tyloi::metal::custom_kernel("tinfer_gguf_planes_projection_many",
         {"p00", "p01", "m0", "p10", "p11", "m1", "p20", "p21", "m2", "p30", "p31", "m3", "x", "params"},
         {"out0", "out1", "out2", "out3"}, R"METAL(
 uint tile = threadgroup_position_in_grid.x;
@@ -1164,7 +1164,7 @@ void planes_project(device const uchar* p0, Auxiliary p1, Scales meta,
 }
 
 const fast::CustomKernelFunction& down_kernel() {
-    static const auto kernel = cached_metal_kernel("tinfer_gguf_prefill_staged_down",
+    static const auto kernel = tyloi::metal::custom_kernel("tinfer_gguf_prefill_staged_down",
         {"packed", "x", "descriptors", "count", "params", "aux", "meta", "shared_packed", "shared_aux", "shared_meta", "gates"}, {"y"}, R"METAL(
 uint tile = threadgroup_position_in_grid.y;
 if (tile >= uint(count[0])) return;
@@ -1252,7 +1252,7 @@ else {
 }
 
 const fast::CustomKernelFunction& weighted_down_kernel() {
-    static const auto kernel = cached_metal_kernel("tinfer_gguf_planes_down_reduce",
+    static const auto kernel = tyloi::metal::custom_kernel("tinfer_gguf_planes_down_reduce",
         {"packed", "aux", "meta", "x", "ids", "probabilities", "params"}, {"y"}, R"METAL(
 uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
 uint k = params[0], n = params[1], experts = params[2], routes = params[3], groups = params[4];
@@ -1295,7 +1295,7 @@ int compact_splits(int n, int k) {
 }
 
 const fast::CustomKernelFunction& compact_split_kernel() {
-    static const auto kernel = cached_metal_kernel("tinfer_gguf_compact_matrix_split",
+    static const auto kernel = tyloi::metal::custom_kernel("tinfer_gguf_compact_matrix_split",
         {"p0", "p1", "meta", "x", "params"}, {"partial"}, R"METAL(
 uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
 uint k = params[0], n = params[1], splits = params[2], split = threadgroup_position_in_grid.y;
@@ -1335,7 +1335,7 @@ for (ushort i = 0; i < accum.get_capacity(); ++i) if (accum.is_valid_element(i))
 }
 
 const fast::CustomKernelFunction& dense_kernel() {
-    static const auto kernel = cached_metal_kernel("tinfer_gguf_prefill_staged_dense",
+    static const auto kernel = tyloi::metal::custom_kernel("tinfer_gguf_prefill_staged_dense",
         {"p0", "p1", "meta", "x", "params"}, {"y"}, R"METAL(
 uint k = params[0], n = params[1], m = params[2];
 uint n0 = threadgroup_position_in_grid.x * 64u;

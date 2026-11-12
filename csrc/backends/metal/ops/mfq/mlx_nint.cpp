@@ -1,6 +1,6 @@
 #include "mlx_nint.h"
 #include "mlx_nint_metadata.h"
-#include "mlx_kernel_prepare.h"
+#include "engine/backends/metal/native/kernel.h"
 #include "mlx_memory_residency.h"
 #include "mlx_resident_budget.h"
 #include "mlx_weight_residency.h"
@@ -93,7 +93,7 @@ bool dense_nint_prefers_dequantize(
     return MlxResidentBudgetScope::permits_optional(temporary);
 }
 
-class DenseNintMmqPrimitive final : public mlx::core::UnaryPrimitive, public MlxPreparableKernel {
+class DenseNintMmqPrimitive final : public mlx::core::UnaryPrimitive, public tyloi::metal::PreparableKernel {
 public:
     DenseNintMmqPrimitive(
         mlx::core::Stream stream,
@@ -133,7 +133,7 @@ public:
 
     MTL::ComputePipelineState* prepared_kernel(const char* name = nullptr) {
         auto& selected_stream = stream();
-        auto& device = kernel_device(selected_stream.device);
+        auto& device = tyloi::metal::kernel_device(selected_stream.device);
         CompileOptions options;
         options.math_mode = MathMode::Fast;
         auto* library = device.get_library(
@@ -1314,7 +1314,7 @@ const std::shared_ptr<const NintMatmulPlan>& compiled_nint_matmul_plan(
     return local_cache.back().plan;
 }
 
-class NintMatmulPrimitive final : public mlx::core::UnaryPrimitive, public MlxPreparableKernel {
+class NintMatmulPrimitive final : public mlx::core::UnaryPrimitive, public tyloi::metal::PreparableKernel {
 public:
     NintMatmulPrimitive(
         mlx::core::Stream stream, std::shared_ptr<const NintMatmulPlan> plan, int rows)
@@ -1325,7 +1325,7 @@ public:
 
     MTL::ComputePipelineState* prepared_kernel() {
         auto& selected_stream = stream();
-        auto& device = kernel_device(selected_stream.device);
+        auto& device = tyloi::metal::kernel_device(selected_stream.device);
         CompileOptions options;
         options.math_mode = MathMode::Fast;
         auto* library = device.get_library(plan_->kernel_name, options,

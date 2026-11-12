@@ -1,4 +1,5 @@
 #include "mlx_gguf_prefill.h"
+#include "engine/backends/metal/native/kernel.h"
 #include "mlx_gguf_staged.h"
 #include "mlx_gguf_rotation.h"
 #include "mlx_moe_ops.h"
@@ -150,7 +151,7 @@ void fill_right(thread Right& right, device const uchar* matrix, uint first_n, u
 }
 
 const fast::CustomKernelFunction& mapping_kernel() {
-    static const auto kernel = cached_metal_kernel("tinfer_gguf_prefill_positions",
+    static const auto kernel = tyloi::metal::custom_kernel("tinfer_gguf_prefill_positions",
         {"ids", "order", "bounds", "offsets", "params"}, {"positions", "slots"}, R"METAL(
 uint at = thread_position_in_grid.x;
 if (at >= params[0]) return;
@@ -184,7 +185,7 @@ operation.run(left, right, destination);
 }
 
 const fast::CustomKernelFunction& gather_kernel() {
-    static const auto kernel = cached_metal_kernel("tinfer_gguf_prefill_gather",
+    static const auto kernel = tyloi::metal::custom_kernel("tinfer_gguf_prefill_gather",
         {"x", "slots", "offsets", "params", "descriptors"}, {"y"}, R"METAL(
 uint tile = threadgroup_position_in_grid.x;
 uint k = params[0], routes = params[1], tile_rows = params[3];
@@ -210,7 +211,7 @@ for (uint local = thread_index_in_threadgroup / 32u; local < capacity; local += 
 }
 
 const fast::CustomKernelFunction& rotated_gather_kernel() {
-    static const auto kernel = cached_metal_kernel("tinfer_gguf_rotated_gate_up_gather",
+    static const auto kernel = tyloi::metal::custom_kernel("tinfer_gguf_rotated_gate_up_gather",
         {"x", "slots", "offsets", "params", "gate_signs", "up_signs", "descriptors"}, {"g", "u"}, R"METAL(
 uint tile = threadgroup_position_in_grid.x;
 if (tile >= uint(offsets[params[2]])) return;
@@ -254,7 +255,7 @@ float4 gguf_gather_rotate(float4 value, uint lane) {
 }
 
 const fast::CustomKernelFunction& restore_kernel() {
-    static const auto kernel = cached_metal_kernel("tinfer_gguf_grouped_restore",
+    static const auto kernel = tyloi::metal::custom_kernel("tinfer_gguf_grouped_restore",
         {"x", "positions", "params"}, {"y"}, R"METAL(
 uint at = thread_position_in_grid.x;
 uint n = params[0];
@@ -407,7 +408,7 @@ for (ushort i = 0; i < sum.get_capacity(); ++i) if (sum.is_valid_element(i)) {
 }
 
 const fast::CustomKernelFunction& reduce_kernel() {
-    static const auto kernel = cached_metal_kernel("tinfer_gguf_prefill_reduce",
+    static const auto kernel = tyloi::metal::custom_kernel("tinfer_gguf_prefill_reduce",
         {"x", "positions", "weights", "params"}, {"y"}, R"METAL(
 uint index = thread_position_in_grid.x;
 uint n = params[0], tokens = params[1], count = params[2];

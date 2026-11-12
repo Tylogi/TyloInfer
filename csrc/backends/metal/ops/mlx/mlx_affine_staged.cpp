@@ -1,5 +1,5 @@
 #include "mlx_affine_staged.h"
-#include "mlx_cached_kernel.h"
+#include "engine/backends/metal/native/kernel.h"
 #include "mlx_affine.h"
 #include "mlx_affine_indirect.h"
 #include "mlx_affine_nax.h"
@@ -30,7 +30,7 @@ Geometry geometry(int rows, int experts, int width, int output) {
 }
 
 const fast::CustomKernelFunction& tile_kernel() {
-    static const auto kernel = cached_metal_kernel("tinfer_affine_segment_tiles",
+    static const auto kernel = tyloi::metal::custom_kernel("tinfer_affine_segment_tiles",
         {"ids", "params"}, {"tiles", "count"}, R"METAL(
         threadgroup uint first[MAXE], end[MAXE], sums[32];
         const uint tid = thread_index_in_threadgroup;
@@ -293,7 +293,7 @@ const fast::CustomKernelFunction& projection_kernel(bool indirect = false) {
         }
         )METAL";
     static const std::vector<std::string> inputs{"x", "packed", "scales", "biases", "order", "tiles", "count", "params"};
-    static const auto direct = cached_metal_kernel("tinfer_affine_segmented_nax", inputs, {"y"},
+    static const auto direct = tyloi::metal::custom_kernel("tinfer_affine_segmented_nax", inputs, {"y"},
         source, staged_header(), true, false, options);
     static const auto indexed = indirect_weight_metal_kernel("tinfer_affine_segmented_nax_indirect", inputs, {"y"},
         source, staged_header(), true, false, options);

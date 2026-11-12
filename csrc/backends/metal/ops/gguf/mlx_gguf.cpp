@@ -1,4 +1,5 @@
 #include "mlx_gguf.h"
+#include "engine/backends/metal/native/kernel.h"
 #include "mfq_mlx_utils_embedded.h"
 #include "mlx_gguf_prefill.h"
 #include "mlx_gguf_staged.h"
@@ -239,7 +240,7 @@ void gguf_sparse_rows(device const uchar* matrix, device const T* x, device T* y
 )METAL";
     return source;
 }
-class GgufProjection final : public Primitive, public MlxPreparableKernel {
+class GgufProjection final : public Primitive, public tyloi::metal::PreparableKernel {
 public:
     GgufProjection(Stream stream, std::array<std::uint32_t, 7> params, int format, Dtype dtype,
         int values, int lanes, bool routed, bool indirect, const array& packed, bool grouped = false)
@@ -258,7 +259,7 @@ public:
     std::string preparation_key() const override { return key_; }
     void prepare_gpu() override { (void)pipeline(); }
     MTL::ComputePipelineState* pipeline() {
-        auto& device = kernel_device(stream().device);
+        auto& device = tyloi::metal::kernel_device(stream().device);
         CompileOptions options;
         options.math_mode = MathMode::Fast;
         auto* library = device.get_library(key_, options, [this] {
@@ -466,7 +467,7 @@ if (group == 1u && !local && row < N) {
 }
 )METAL";
 
-class GgufSwiGLU final : public Primitive, public MlxPreparableKernel {
+class GgufSwiGLU final : public Primitive, public tyloi::metal::PreparableKernel {
 public:
     GgufSwiGLU(Stream stream, std::array<std::uint32_t, 10> params, int gate_format, int up_format,
         Dtype dtype, int lanes, int values, bool indirect_gate, bool indirect_up, const array& gate, const array& up,
@@ -508,7 +509,7 @@ public:
     std::string preparation_key() const override { return key_; }
     void prepare_gpu() override { (void)pipeline(); }
     MTL::ComputePipelineState* pipeline() {
-        auto& device = kernel_device(stream().device);
+        auto& device = tyloi::metal::kernel_device(stream().device);
         CompileOptions options;
         options.math_mode = MathMode::Fast;
         auto* library = device.get_library(key_, options, [this] {

@@ -1,5 +1,5 @@
 #include "mlx_gguf.h"
-#include "mlx_cached_kernel.h"
+#include "engine/backends/metal/native/kernel.h"
 #include "mlx_tensor.h"
 
 namespace mfq::metal {
@@ -46,7 +46,7 @@ inline float q8_hc_dot(device const uchar* packed, X input, uint row, uint lane,
 const fast::CustomKernelFunction& single_down_kernel() {
     CompileOptions options;
     options.math_mode = MathMode::Fast;
-    static const auto kernel = cached_metal_kernel("tinfer_gguf_hc_down_block",
+    static const auto kernel = tyloi::metal::custom_kernel("tinfer_gguf_hc_down_block",
         {"input", "down", "params"}, {"low"}, R"METAL(
         const uint width = params[0], low_width = params[1];
         const uint lane = thread_index_in_simdgroup;

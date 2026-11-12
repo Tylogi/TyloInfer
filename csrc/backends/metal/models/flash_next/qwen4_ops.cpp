@@ -1,7 +1,6 @@
 #include "qwen4_ops.h"
 #include "mlx_nint_metadata.h"
-#include "mlx_kernel_prepare.h"
-#include "mlx_cached_kernel.h"
+#include "engine/backends/metal/native/kernel.h"
 
 #include "mlx_transformer.h"
 #include "mlx_sparse_attention.h"
@@ -33,7 +32,7 @@ using mlx::core::MathMode;
 constexpr int kGatedHcProjectionThreads = 256;
 constexpr int kGatedHcUpThreads = 320;
 
-class QsaOutputGatePrimitive final : public mlx::core::Primitive, public MlxPreparableKernel {
+class QsaOutputGatePrimitive final : public mlx::core::Primitive, public tyloi::metal::PreparableKernel {
 public:
     QsaOutputGatePrimitive(mlx::core::Stream stream, std::array<mlx::core::Dtype, 3> types,
         int heads, int dimension)
@@ -47,7 +46,7 @@ public:
     void prepare_gpu() override { (void)prepared_kernel(); }
 
     MTL::ComputePipelineState* prepared_kernel() {
-        auto& device = kernel_device(stream().device);
+        auto& device = tyloi::metal::kernel_device(stream().device);
         const auto metal_type = [](mlx::core::Dtype dtype) {
             return dtype == mlx::core::float16 ? "half" : dtype == mlx::core::bfloat16 ? "bfloat" : "float";
         };
@@ -1036,7 +1035,7 @@ const mlx::core::fast::CustomKernelFunction& grouped_rms_affine_kernel() {
     static const auto kernel = [] {
         CompileOptions options;
         options.math_mode = MathMode::Safe;
-        return cached_metal_kernel(
+        return tyloi::metal::custom_kernel(
             "mfq_cpp_qwen_grouped_rms_affine",
             {"input", "weight", "epsilon"},
             {"output"},
@@ -1054,7 +1053,7 @@ grouped_rms_affine_write_kernel() {
     static const auto kernel = [] {
         CompileOptions options;
         options.math_mode = MathMode::Safe;
-        return cached_metal_kernel(
+        return tyloi::metal::custom_kernel(
             "mfq_cpp_qwen_grouped_rms_affine_write",
             {
                 "residual",
@@ -1074,14 +1073,14 @@ grouped_rms_affine_write_kernel() {
 }
 
 const mlx::core::fast::CustomKernelFunction& grouped_rms_projection_kernel() {
-    static const auto kernel = cached_metal_kernel(
+    static const auto kernel = tyloi::metal::custom_kernel(
         "mfq_cpp_qwen_grouped_rms_projection", {"input", "weight", "epsilon"}, {"output", "rms"},
         kGroupedRmsAffineSource, "#define MFQ_HC_REMATERIALIZE\n");
     return kernel;
 }
 
 const mlx::core::fast::CustomKernelFunction& grouped_rms_write_projection_kernel() {
-    static const auto kernel = cached_metal_kernel(
+    static const auto kernel = tyloi::metal::custom_kernel(
         "mfq_cpp_qwen_grouped_rms_write_projection", {"residual", "branch", "injection", "weight", "epsilon"},
         {"updated", "normalized", "rms"}, kGroupedRmsAffineWriteSource, "#define MFQ_HC_REMATERIALIZE\n");
     return kernel;
@@ -1096,7 +1095,7 @@ struct QsaPrologueConfig {
     bool separate_gate;
 };
 
-class QsaProloguePrimitive final : public mlx::core::Primitive, public MlxPreparableKernel {
+class QsaProloguePrimitive final : public mlx::core::Primitive, public tyloi::metal::PreparableKernel {
 public:
     QsaProloguePrimitive(mlx::core::Stream stream, QsaPrologueConfig config)
         : Primitive(stream), config_(config),
@@ -1114,7 +1113,7 @@ public:
     void prepare_gpu() override { (void)prepared_kernel(); }
 
     MTL::ComputePipelineState* prepared_kernel() {
-        auto& device = kernel_device(stream().device);
+        auto& device = tyloi::metal::kernel_device(stream().device);
         CompileOptions options;
         options.math_mode = MathMode::Fast;
         auto* library = device.get_library(
@@ -1223,7 +1222,7 @@ const mlx::core::fast::CustomKernelFunction& gated_hc_post_kernel() {
     static const auto kernel = [] {
         CompileOptions options;
         options.math_mode = MathMode::Safe;
-        return cached_metal_kernel(
+        return tyloi::metal::custom_kernel(
             "mfq_cpp_qwen_gated_hc_post",
             {"branch", "residual", "injection"},
             {"output"},
@@ -1251,7 +1250,7 @@ const mlx::core::fast::CustomKernelFunction& gated_hc_projection_kernel() {
     static const auto kernel = [] {
         CompileOptions options;
         options.math_mode = MathMode::Safe;
-        return cached_metal_kernel(
+        return tyloi::metal::custom_kernel(
             "mfq_cpp_qwen_gated_hc_projection",
             {"normalized", "down_weight", "injection_weight"},
             {"down", "injection"},
@@ -1268,7 +1267,7 @@ const mlx::core::fast::CustomKernelFunction& gated_hc_up_collapse_kernel() {
     static const auto kernel = [] {
         CompileOptions options;
         options.math_mode = MathMode::Fast;
-        return cached_metal_kernel(
+        return tyloi::metal::custom_kernel(
             "mfq_cpp_qwen_gated_hc_up_collapse",
             {"down_projection", "up_weight", "normalized"},
             {"branch"},
@@ -1282,7 +1281,7 @@ const mlx::core::fast::CustomKernelFunction& gated_hc_up_collapse_kernel() {
 }
 
 const mlx::core::fast::CustomKernelFunction& gated_hc_mix_kernel() {
-    static const auto kernel = cached_metal_kernel(
+    static const auto kernel = tyloi::metal::custom_kernel(
         "mfq_cpp_qwen_gated_hc_mix",
         {"logits", "normalized"},
         {"branch"},
@@ -1306,7 +1305,7 @@ const mlx::core::fast::CustomKernelFunction& gated_hc_mix_kernel() {
 }
 
 const mlx::core::fast::CustomKernelFunction& gated_hc_recomputed_mix_kernel() {
-    static const auto kernel = cached_metal_kernel(
+    static const auto kernel = tyloi::metal::custom_kernel(
         "mfq_cpp_qwen_gated_hc_recomputed_mix", {"logits", "residual", "weight", "rms"}, {"branch"}, R"METAL(
 uint index = thread_position_in_grid.x;
 if (index >= uint(residual_shape[0]) * uint(HIDDEN)) return;
@@ -1332,7 +1331,7 @@ const mlx::core::fast::CustomKernelFunction& gated_hc_norm_down_kernel() {
     static const auto kernel = [] {
         CompileOptions options;
         options.math_mode = MathMode::Fast;
-        return cached_metal_kernel(
+        return tyloi::metal::custom_kernel(
             "mfq_cpp_qwen_gated_hc_norm_down",
             {
                 "input",
@@ -1362,7 +1361,7 @@ gated_hc_write_norm_down_kernel() {
     static const auto kernel = [] {
         CompileOptions options;
         options.math_mode = MathMode::Fast;
-        return cached_metal_kernel(
+        return tyloi::metal::custom_kernel(
             "mfq_cpp_qwen_gated_hc_write_norm_down",
             {
                 "previous_residual",
@@ -1394,7 +1393,7 @@ const mlx::core::fast::CustomKernelFunction& gated_hc_parts_up_kernel() {
     static const auto kernel = [] {
         CompileOptions options;
         options.math_mode = MathMode::Fast;
-        return cached_metal_kernel(
+        return tyloi::metal::custom_kernel(
             "mfq_cpp_qwen_gated_hc_parts_up",
             {"normalized", "parts", "up_weight", "up_rows", "up_scales", "up_minima"},
             {"branch", "injection"},
@@ -1939,7 +1938,7 @@ const mlx::core::fast::CustomKernelFunction& gated_hc_activation_kernel() {
     static const auto kernel = [] {
         CompileOptions options;
         options.math_mode = MathMode::Safe;
-        return cached_metal_kernel("mfq_gated_hc_activation",
+        return tyloi::metal::custom_kernel("mfq_gated_hc_activation",
             {"down", "inject"}, {"low", "injection"}, R"METAL(
 uint index = thread_position_in_grid.x;
 if (index < uint(down_shape[0])) {
@@ -2166,7 +2165,7 @@ array qwen4_stream_mean(const array& streams, int hidden, int count) {
     if (streams.ndim() != 3 || hidden <= 0 || count <= 0 ||
         std::int64_t(hidden) * count != streams.shape(2) || streams.shape(0) <= 0 || streams.shape(1) <= 0)
         throw std::invalid_argument("invalid Qwen4 stream capture geometry");
-    static const auto kernel = cached_metal_kernel("tinfer_qwen4_stream_mean_capture",
+    static const auto kernel = tyloi::metal::custom_kernel("tinfer_qwen4_stream_mean_capture",
         {"input", "params"}, {"output"}, R"METAL(
 uint index = thread_position_in_grid.x;
 uint hidden = params[0], groups = params[1], rows = params[2];
@@ -2548,7 +2547,7 @@ array qwen4_qsa_pool_index_keys(const array& raw_keys, const array& norm_weight,
         throw std::invalid_argument("QSA index pool geometry disagrees");
     static const auto kernel = [] {
         CompileOptions options; options.math_mode = MathMode::Fast;
-        return cached_metal_kernel("mfq_qsa_index_pool", {"raw", "weight", "positions", "params", "scalars"},
+        return tyloi::metal::custom_kernel("mfq_qsa_index_pool", {"raw", "weight", "positions", "params", "scalars"},
             {"output"}, R"METAL(
     const uint block = threadgroup_position_in_grid.x, batch = threadgroup_position_in_grid.y;
     const uint lane = thread_index_in_simdgroup;

@@ -3,6 +3,7 @@
 
 #include <coroutine>
 #include "mlx_kernel_prepare.h"
+#include "engine/backends/metal/native/kernel.h"
 #include "mlx_builtin_kernels.h"
 #include "mlx_weight_residency.h"
 #include "mlx_nvq_decode.h"
@@ -2908,7 +2909,7 @@ struct PackedCopyBatch {
     bool operator==(const PackedCopyBatch&) const = default;
 };
 
-class PackedCopyPrimitive final : public mlx::core::UnaryPrimitive, public MlxPreparableKernel {
+class PackedCopyPrimitive final : public mlx::core::UnaryPrimitive, public tyloi::metal::PreparableKernel {
 public:
     PackedCopyPrimitive(mlx::core::Stream stream, Shape shape, std::vector<PackedCopyBatch> batches)
         : UnaryPrimitive(stream), shape_(std::move(shape)), batches_(std::move(batches)) {}
@@ -2947,7 +2948,7 @@ public:
     std::vector<Shape> output_shapes(const std::vector<array>&) override { return {shape_}; }
 private:
     MTL::ComputePipelineState* kernel() {
-        auto& device = kernel_device(stream().device);
+        auto& device = tyloi::metal::kernel_device(stream().device);
         auto* library = device.get_library(preparation_key(), [] {
             std::ostringstream source;
             source << "#include <metal_stdlib>\nusing namespace metal;\n"
@@ -3776,7 +3777,7 @@ std::string make_native_moe_source(
 }
 
 class NativeMfePrimitive final
-    : public mlx::core::UnaryPrimitive, public MlxPreparableKernel {
+    : public mlx::core::UnaryPrimitive, public tyloi::metal::PreparableKernel {
 public:
     NativeMfePrimitive(
         mlx::core::Stream stream,
@@ -3790,7 +3791,7 @@ public:
 
     MTL::ComputePipelineState* prepared_kernel() {
         auto& selected_stream = stream();
-        auto& device = kernel_device(
+        auto& device = tyloi::metal::kernel_device(
             selected_stream.device);
         CompileOptions compile_options;
         compile_options.math_mode = MathMode::Fast;
@@ -4670,7 +4671,7 @@ std::string make_mfe_nint_down_source(
     return source.str();
 }
 
-class MfeNintDecodePrimitive final : public mlx::core::Primitive, public MlxPreparableKernel {
+class MfeNintDecodePrimitive final : public mlx::core::Primitive, public tyloi::metal::PreparableKernel {
 public:
     MfeNintDecodePrimitive(
         mlx::core::Stream stream,
@@ -4686,7 +4687,7 @@ public:
 
     MTL::ComputePipelineState* prepared_kernel() {
         auto& selected_stream = stream();
-        auto& device = kernel_device(selected_stream.device);
+        auto& device = tyloi::metal::kernel_device(selected_stream.device);
         CompileOptions options;
         options.math_mode = MathMode::Fast;
         auto* library = device.get_library(
@@ -4984,7 +4985,7 @@ std::string make_mxfp4_decode_reduce_source(
 }
 
 class Mxfp4DecodeReducePrimitive final
-    : public mlx::core::UnaryPrimitive, public MlxPreparableKernel {
+    : public mlx::core::UnaryPrimitive, public tyloi::metal::PreparableKernel {
 public:
     Mxfp4DecodeReducePrimitive(
         mlx::core::Stream stream,
@@ -4998,7 +4999,7 @@ public:
 
     MTL::ComputePipelineState* prepared_kernel() {
         auto& selected_stream = stream();
-        auto& device = kernel_device(
+        auto& device = tyloi::metal::kernel_device(
             selected_stream.device);
         CompileOptions compile_options;
         compile_options.math_mode = MathMode::Fast;
@@ -5242,7 +5243,7 @@ std::string make_mxfp4_pair_swiglu_source(
 }
 
 class Mxfp4PairSwiGluPrimitive final
-    : public mlx::core::UnaryPrimitive, public MlxPreparableKernel {
+    : public mlx::core::UnaryPrimitive, public tyloi::metal::PreparableKernel {
 public:
     Mxfp4PairSwiGluPrimitive(
         mlx::core::Stream stream,
@@ -5256,7 +5257,7 @@ public:
 
     MTL::ComputePipelineState* prepared_kernel() {
         auto& selected_stream = stream();
-        auto& device = kernel_device(
+        auto& device = tyloi::metal::kernel_device(
             selected_stream.device);
         CompileOptions compile_options;
         compile_options.math_mode = MathMode::Fast;
@@ -5344,7 +5345,7 @@ array mxfp4_pair_swiglu_dispatch(
 }
 
 class Mxfp4BlocksPrimitive final
-    : public mlx::core::UnaryPrimitive, public MlxPreparableKernel {
+    : public mlx::core::UnaryPrimitive, public tyloi::metal::PreparableKernel {
 public:
     Mxfp4BlocksPrimitive(
         mlx::core::Stream stream,
@@ -5356,7 +5357,7 @@ public:
     void prepare_gpu() override { (void)prepared_kernel(); }
 
     MTL::ComputePipelineState* prepared_kernel() {
-        auto& device = kernel_device(stream().device);
+        auto& device = tyloi::metal::kernel_device(stream().device);
         CompileOptions compile_options;
         compile_options.math_mode = MathMode::Fast;
         auto* library = device.get_library(
@@ -5386,7 +5387,7 @@ public:
         output.set_data(
             mlx::core::allocator::malloc(output.nbytes()));
         auto& selected_stream = stream();
-        auto& device = kernel_device(
+        auto& device = tyloi::metal::kernel_device(
             selected_stream.device);
         auto* kernel = prepared_kernel();
         auto& encoder =
@@ -5457,7 +5458,7 @@ array mxfp4_blocks_dispatch(
 }
 
 class GroupedMmqPrimitive final
-    : public mlx::core::UnaryPrimitive, public MlxPreparableKernel {
+    : public mlx::core::UnaryPrimitive, public tyloi::metal::PreparableKernel {
 public:
     GroupedMmqPrimitive(
         mlx::core::Stream stream,
@@ -5501,7 +5502,7 @@ public:
     }
 
     MTL::ComputePipelineState* prepared_partition() {
-        auto& device = kernel_device(stream().device);
+        auto& device = tyloi::metal::kernel_device(stream().device);
         const int passes = static_cast<int>(config_.cohort_populations->size());
         const std::string name = "mfq_grouped_mfe_partition_v1_p" + std::to_string(passes);
         CompileOptions options;
@@ -5549,7 +5550,7 @@ kernel void mfq_grouped_mfe_partition(
 
     std::vector<std::tuple<MTL::ComputePipelineState*, int, int, int, int>> prepared_kernels() {
         auto& selected_stream = stream();
-        auto& device = kernel_device(
+        auto& device = tyloi::metal::kernel_device(
             selected_stream.device);
         CompileOptions compile_options;
         compile_options.math_mode = MathMode::Fast;

@@ -1,9 +1,8 @@
 #include "mlx_native_gguf.h"
 #include "gguf_sources.h"
-#include "mlx_kernel_prepare.h"
+#include "engine/backends/metal/native/kernel.h"
 #include "../../../platform/metal_device_info.h"
 #include "mlx_platform.h"
-#include "mlx_cached_kernel.h"
 #include "ops/Linear.hpp"
 #include "ops/MoE.hpp"
 #include "ops/HyperConnection.hpp"
@@ -35,7 +34,7 @@ using splash::metal::CommandGraph;
 using namespace splash::ops;
 
 array row_major_view(const array& input) {
-    return mlx_row_contiguous_view(input, default_stream(Device::gpu));
+    return tyloi::metal::row_contiguous_view(input, default_stream(Device::gpu));
 }
 
 const char* source_for(const std::string& name) {
@@ -72,7 +71,7 @@ struct Pipeline {
         std::lock_guard lock(mutex);
         if (!value) {
             const char* source = source_for(name);
-            auto& device = kernel_device(stream.device);
+            auto& device = tyloi::metal::kernel_device(stream.device);
             const auto hash = std::hash<std::string_view>{}(source);
             static std::mutex libraries_mutex;
             static std::unordered_map<const char*, std::shared_ptr<std::mutex>> library_mutexes;
@@ -210,7 +209,7 @@ GraphKey graph_key(std::uint64_t kind, std::uint64_t rows,
     return key;
 }
 
-class NativeGraph final : public Primitive, public MlxPreparableKernel {
+class NativeGraph final : public Primitive, public tyloi::metal::PreparableKernel {
 public:
     NativeGraph(Stream stream, std::shared_ptr<Graph> graph) : Primitive(stream), graph_(std::move(graph)) {}
     const char* name() const override { return "MlxNativeGgufGraph"; }
@@ -560,7 +559,7 @@ MlxNativeGgufWeight mlx_native_affine_pack(const array& values, const array& sca
         values.dtype() != uint32 || scales.dtype() != bfloat16 || biases.dtype() != bfloat16 ||
         (values.ndim() == 3 && values.shape(-2) % 64))
         throw std::invalid_argument("native affine planes require BF16 group coefficients");
-    static const auto kernel = cached_metal_kernel("tinfer_native_affine_blocks", {"values", "scales", "biases", "params"},
+    static const auto kernel = tyloi::metal::custom_kernel("tinfer_native_affine_blocks", {"values", "scales", "biases", "params"},
         {"blocks"}, R"METAL(
     const uint i = thread_position_in_grid.x, k = params[0], n = params[1], bits = params[2], gs = params[3];
     const uint groups = k / gs;

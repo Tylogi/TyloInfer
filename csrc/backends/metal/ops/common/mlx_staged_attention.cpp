@@ -1,6 +1,6 @@
 #include "mlx_staged_attention.h"
 #include <mlx/primitives.h>
-#include "mlx_cached_kernel.h"
+#include "engine/backends/metal/native/kernel.h"
 #include "mlx_platform.h"
 #include "ops/gguf/native/gguf_sources.h"
 
@@ -39,7 +39,7 @@ array attention_kv_rows(const array& value) {
 }
 
 const fast::CustomKernelFunction& attention_pack_kv() {
-    static const auto kernel = cached_metal_kernel("tyloinfer_gqa_pack_tail_kv_v1",
+    static const auto kernel = tyloi::metal::custom_kernel("tyloinfer_gqa_pack_tail_kv_v1",
         {"keys", "values", "params"}, {"packed_keys", "packed_values"}, R"METAL(
 const uint index = thread_position_in_grid.x, head = index / (32 * 256);
 const uint flat = index % (32 * 256), dim = flat % 256;
@@ -55,7 +55,7 @@ packed_keys[index] = k; packed_values[index] = v;
 }
 
 const fast::CustomKernelFunction& attention_partial() {
-    static const auto kernel = cached_metal_kernel("tyloinfer_gqa_staged_partial_v2",
+    static const auto kernel = tyloi::metal::custom_kernel("tyloinfer_gqa_staged_partial_v2",
         {"queries", "keys", "values", "tail_keys", "tail_values", "params"}, {"partials", "statistics"}, R"METAL(
 constexpr uint M = 8 * GROUP, N = 32;
 threadgroup float scores[M * N], row_max[M], row_sum[M], previous_scale[M];
@@ -74,7 +74,7 @@ splash_paged_attention_tile<KH, GROUP, 8, 256, 0, Input>(
 }
 
 const fast::CustomKernelFunction& attention_reduce() {
-    static const auto kernel = cached_metal_kernel("tyloinfer_gqa_staged_reduce_v1",
+    static const auto kernel = tyloi::metal::custom_kernel("tyloinfer_gqa_staged_reduce_v1",
         {"partials", "statistics", "params"}, {"output"}, R"METAL(
 threadgroup float weights[128], group_values[8];
 constexpr uint M = 8 * GROUP;

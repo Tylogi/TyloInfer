@@ -1,5 +1,4 @@
 #include "mlx_kernel_prepare.h"
-#include "mfq_mlx_utils_embedded.h"
 
 #include <algorithm>
 #include <atomic>
@@ -7,14 +6,11 @@
 #include <cstdlib>
 #include <iostream>
 #include <mutex>
-#include <sstream>
 #include <stdexcept>
+#include <string_view>
 #include <thread>
 
-#include <mlx/backend/metal/device.h>
-#include <mlx/fast_primitives.h>
 #include <mlx/primitives.h>
-#include <mlx/version.h>
 
 namespace mfq::metal {
 namespace {
@@ -43,34 +39,6 @@ mlx::core::array preparation_view_input(const mlx::core::array& input, std::stri
         ? input.primitive().stream() : mlx::core::default_stream(mlx::core::Device::gpu));
 }
 
-}
-
-std::string mlx_kernel_preparation_key(const mlx::core::Primitive& primitive) {
-    if (const auto* native = dynamic_cast<const MlxPreparableKernel*>(&primitive))
-        return native->preparation_key();
-    if (std::string_view(primitive.name()) != "CustomKernel")
-        throw std::invalid_argument("Metal kernel does not support preparation");
-    const auto state = static_cast<const mlx::core::fast::CustomKernel&>(primitive).state();
-    std::ostringstream key;
-    key << std::get<0>(state);
-#if MLX_VERSION_NUMERIC >= 32001
-    key << '_' << std::hex << std::hash<std::string>{}(std::get<1>(state))
-        << '_' << std::dec << std::get<10>(state);
-#endif
-    return key.str();
-}
-
-void prepare_mlx_kernel_gpu(mlx::core::Primitive& primitive) {
-    if (auto* native = dynamic_cast<MlxPreparableKernel*>(&primitive)) {
-        native->prepare_gpu();
-        return;
-    }
-    const auto key = mlx_kernel_preparation_key(primitive);
-    const auto state = static_cast<mlx::core::fast::CustomKernel&>(primitive).state();
-    auto& device = mlx::core::metal::device(primitive.stream().device);
-    auto* library = device.get_library(key, mlx::core::CompileOptions(std::get<10>(state)),
-        [&] { return std::string(detail::kMlxUtilsSource) + std::get<1>(state); });
-    (void)device.get_kernel(std::get<0>(state), library);
 }
 
 thread_local MlxKernelPreparation* MlxKernelPreparation::active_ = nullptr;
@@ -110,9 +78,9 @@ void MlxKernelPreparation::add(const mlx::core::array& output) {
         if (!value.has_primitive()) return;
         const auto primitive = value.primitive_ptr();
         if (!visited.insert(primitive.get()).second) return;
-        if (dynamic_cast<MlxPreparableKernel*>(primitive.get()) || std::string_view(primitive->name()) == "CustomKernel") {
-            if (keys_.insert("kernel:" + mlx_kernel_preparation_key(*primitive)).second)
-                jobs_.push_back([primitive] { prepare_mlx_kernel_gpu(*primitive); });
+        if (dynamic_cast<tyloi::metal::PreparableKernel*>(primitive.get()) || std::string_view(primitive->name()) == "CustomKernel") {
+            if (keys_.insert("kernel:" + tyloi::metal::kernel_key(*primitive)).second)
+                jobs_.push_back([primitive] { tyloi::metal::prepare_kernel(*primitive); });
         } else if (const auto* compiled = dynamic_cast<mlx::core::Compiled*>(primitive.get());
             compiled || std::string_view(primitive->name()) == "ScatterAxis" ||
                 std::string_view(primitive->name()) == "Gather") {

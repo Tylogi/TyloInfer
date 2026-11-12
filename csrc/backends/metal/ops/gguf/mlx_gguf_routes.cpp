@@ -1,5 +1,5 @@
 #include "mlx_gguf_routes.h"
-#include "mlx_cached_kernel.h"
+#include "engine/backends/metal/native/kernel.h"
 #include <algorithm>
 #include <climits>
 #include <stdexcept>
@@ -21,7 +21,7 @@ MlxGgufGroupedRoutes gguf_group_routes(const array& ids, int experts, int tile_r
     const auto capacity = compact ? std::min(tiles * tile_rows, ids.size() +
         std::min(ids.size(), std::size_t(experts)) * tail_padding +
         (shared ? std::size_t(ids.shape(0)) + tail_padding : 0u)) : tiles * tile_rows;
-    static const auto kernel = cached_metal_kernel("tinfer_gguf_group_routes",
+    static const auto kernel = tyloi::metal::custom_kernel("tinfer_gguf_group_routes",
         {"ids", "params"}, {"descriptors", "count", "offsets", "grouped", "positions"}, R"METAL(
 uint tid = thread_index_in_threadgroup, lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
 uint routes = params[0], experts = params[1], rows = params[2], selected = params[3], shared = params[4];

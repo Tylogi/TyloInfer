@@ -353,8 +353,7 @@ add_library(mfq-metal-runtime STATIC
     runtime/mlx_pre_ln_vision.cpp
     runtime/mlx_sampling.cpp
     runtime/mlx_kernel_prepare.cpp
-    runtime/mlx_cached_kernel.cpp
-    runtime/mlx_kernel_cache.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/metal/native/kernel.cpp
     runtime/mlx_builtin_kernels.cpp
     runtime/mlx_inference_warmup.cpp
     runtime/mlx_tensor.cpp

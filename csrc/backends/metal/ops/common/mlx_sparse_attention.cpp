@@ -1,5 +1,5 @@
 #include "mlx_sparse_attention.h"
-#include "mlx_kernel_prepare.h"
+#include "engine/backends/metal/native/kernel.h"
 #include "mlx_builtin_kernels.h"
 
 #include "mfq_mfe_prefill_embedded.h"
@@ -40,14 +40,14 @@ using TemplateArgs = std::vector<
 #include "../../kernels/common/mfq_sparse_attention_kernels.inc"
 #include "../../kernels/common/mfq_sparse_block_nax.inc"
 
-class QsaPrefillScoresPrimitive final : public mlx::core::Primitive, public MlxPreparableKernel {
+class QsaPrefillScoresPrimitive final : public mlx::core::Primitive, public tyloi::metal::PreparableKernel {
 public:
     QsaPrefillScoresPrimitive(mlx::core::Stream stream, int offset)
         : Primitive(stream), offset_(offset) {}
 
     std::string preparation_key() const override { return "mfq_qsa_prefill_scores"; }
     void prepare_gpu() override {
-        auto& device = kernel_device(stream().device);
+        auto& device = tyloi::metal::kernel_device(stream().device);
         auto* library = prepared_library();
         (void)device.get_kernel("mfq_qsa_prefill_scores_f16", library);
         (void)device.get_kernel("mfq_qsa_prefill_scores_bf16", library);
@@ -56,7 +56,7 @@ public:
     MTL::Library* prepared_library() {
         CompileOptions options;
         options.math_mode = MathMode::Fast;
-        return kernel_device(stream().device).get_library(
+        return tyloi::metal::kernel_device(stream().device).get_library(
             "mfq_qsa_prefill_indexer_v1", options, qsa_prefill_indexer_source);
     }
 
@@ -70,7 +70,7 @@ public:
         const auto& key = inputs.at(1);
         auto& output = outputs.front();
         output.set_data(mlx::core::allocator::malloc(output.nbytes()));
-        auto& device = kernel_device(stream().device);
+        auto& device = tyloi::metal::kernel_device(stream().device);
         auto* library = prepared_library();
         const char* name = query.dtype() == mlx::core::float16
             ? "mfq_qsa_prefill_scores_f16" : "mfq_qsa_prefill_scores_bf16";
@@ -120,7 +120,7 @@ struct QsaPrefillTopKParams {
     bool causal_valid_prefix;
 };
 
-class QsaPrefillTopKPrimitive final : public mlx::core::Primitive, public MlxPreparableKernel {
+class QsaPrefillTopKPrimitive final : public mlx::core::Primitive, public tyloi::metal::PreparableKernel {
 public:
     explicit QsaPrefillTopKPrimitive(mlx::core::Stream stream)
         : Primitive(stream) {}
@@ -129,7 +129,7 @@ public:
     void prepare_gpu() override { (void)prepared_kernel(); }
 
     MTL::ComputePipelineState* prepared_kernel() {
-        auto& device = kernel_device(stream().device);
+        auto& device = tyloi::metal::kernel_device(stream().device);
         CompileOptions options;
         options.math_mode = MathMode::Fast;
         auto* library = device.get_library("mfq_qsa_prefill_indexer_v1",
@@ -237,7 +237,7 @@ Kernel make_sparse_kernel(
         options);
 }
 
-class SparseIndexerTopkPrimitive final : public mlx::core::Primitive, public MlxPreparableKernel {
+class SparseIndexerTopkPrimitive final : public mlx::core::Primitive, public tyloi::metal::PreparableKernel {
 public:
     SparseIndexerTopkPrimitive(
         mlx::core::Stream stream, int heads, int items,
@@ -250,7 +250,7 @@ public:
     void prepare_gpu() override { (void)prepared_kernel(); }
 
     MTL::ComputePipelineState* prepared_kernel() {
-        auto& device = kernel_device(stream().device);
+        auto& device = tyloi::metal::kernel_device(stream().device);
         CompileOptions options;
         options.math_mode = MathMode::Fast;
         auto* library = device.get_library(
@@ -354,7 +354,7 @@ bool sparse_block_nax_available() {
         if (!__builtin_available(macOS 26.2, iOS 26.2, tvOS 26.2, visionOS 26.2, *)) {
             return false;
         }
-        const auto& device = kernel_device(mlx::core::Device::gpu);
+        const auto& device = tyloi::metal::kernel_device(mlx::core::Device::gpu);
         const auto& architecture = device.get_architecture();
         return !architecture.empty() && device.get_architecture_gen() >=
             (architecture.back() == 'p' ? 18 : 17);
@@ -417,7 +417,7 @@ constexpr const char* kSparseBlockGatherSource = R"METAL(
             if (head == 0 && dim == 0) valid[row * selected + token] = present;
         )METAL";
 
-class SparseBlockGatherPrimitive final : public mlx::core::Primitive, public MlxPreparableKernel {
+class SparseBlockGatherPrimitive final : public mlx::core::Primitive, public tyloi::metal::PreparableKernel {
 public:
     SparseBlockGatherPrimitive(
         mlx::core::Stream stream, Dtype dtype,
@@ -434,7 +434,7 @@ public:
     void prepare_gpu() override { (void)prepared_kernel(); }
 
     MTL::ComputePipelineState* prepared_kernel() {
-        auto& device = kernel_device(stream().device);
+        auto& device = tyloi::metal::kernel_device(stream().device);
         CompileOptions options;
         options.math_mode = MathMode::Fast;
         auto* library = device.get_library(
@@ -638,7 +638,7 @@ struct SparseCircularMlaParams {
 };
 
 int sdpa_decode_partitions(mlx::core::Stream stream, int keys, int gqa) {
-    const auto& architecture = kernel_device(stream.device).get_architecture();
+    const auto& architecture = tyloi::metal::kernel_device(stream.device).get_architecture();
     if (architecture.empty()) return 0;
     const char family = architecture.back();
     const bool two_pass = family == 'd' ? keys >= 1024
@@ -657,7 +657,7 @@ int sdpa_decode_partitions(mlx::core::Stream stream, int keys, int gqa) {
 }
 
 class SparseBlockGqaPrimitive final
-    : public mlx::core::UnaryPrimitive, public MlxPreparableKernel {
+    : public mlx::core::UnaryPrimitive, public tyloi::metal::PreparableKernel {
 public:
     SparseBlockGqaPrimitive(
         mlx::core::Stream stream,
@@ -679,7 +679,7 @@ public:
     void prepare_gpu() override { (void)prepared_kernel(); }
 
     MTL::ComputePipelineState* prepared_kernel() {
-        auto& device = kernel_device(stream().device);
+        auto& device = tyloi::metal::kernel_device(stream().device);
         CompileOptions options;
         options.math_mode = MathMode::Fast;
         if (vector_decode_) {
@@ -727,7 +727,7 @@ public:
         }
         output.set_data(mlx::core::allocator::malloc(output.nbytes()));
         auto& selected_stream = stream();
-        auto& device = kernel_device(selected_stream.device);
+        auto& device = tyloi::metal::kernel_device(selected_stream.device);
         auto* kernel = prepared_kernel();
         auto& encoder = mlx::core::metal::get_command_encoder(selected_stream);
         encoder.set_compute_pipeline_state(kernel);
@@ -829,7 +829,7 @@ public:
 
 private:
     MTL::ComputePipelineState* prepared_nax_kernel() {
-        auto& device = kernel_device(stream().device);
+        auto& device = tyloi::metal::kernel_device(stream().device);
         CompileOptions options;
         options.math_mode = MathMode::Fast;
         const std::string name = "mfq_sparse_block_gqa_split_nax_f32_" + mlx::core::type_to_name(dtype_);
@@ -875,7 +875,7 @@ private:
 };
 
 class SparseSelectedMlaPrimitive final
-    : public mlx::core::UnaryPrimitive, public MlxPreparableKernel {
+    : public mlx::core::UnaryPrimitive, public tyloi::metal::PreparableKernel {
 public:
     SparseSelectedMlaPrimitive(
         mlx::core::Stream stream,
@@ -887,7 +887,7 @@ public:
     void prepare_gpu() override { (void)prepared_kernel(); }
 
     MTL::ComputePipelineState* prepared_kernel() {
-        auto& device = kernel_device(stream().device);
+        auto& device = tyloi::metal::kernel_device(stream().device);
         CompileOptions options;
         options.math_mode = MathMode::Fast;
         auto* library = device.get_library(
@@ -915,7 +915,7 @@ public:
         }
         output.set_data(mlx::core::allocator::malloc(output.nbytes()));
         auto& selected_stream = stream();
-        auto& device = kernel_device(selected_stream.device);
+        auto& device = tyloi::metal::kernel_device(selected_stream.device);
         auto* kernel = prepared_kernel();
         auto& encoder =
             mlx::core::metal::get_command_encoder(selected_stream);
@@ -964,7 +964,7 @@ private:
 };
 
 class SparseCircularMlaPrimitive final
-    : public mlx::core::UnaryPrimitive, public MlxPreparableKernel {
+    : public mlx::core::UnaryPrimitive, public tyloi::metal::PreparableKernel {
 public:
     SparseCircularMlaPrimitive(
         mlx::core::Stream stream,
@@ -976,7 +976,7 @@ public:
     void prepare_gpu() override { (void)prepared_kernel(); }
 
     MTL::ComputePipelineState* prepared_kernel() {
-        auto& device = kernel_device(stream().device);
+        auto& device = tyloi::metal::kernel_device(stream().device);
         CompileOptions options;
         options.math_mode = MathMode::Fast;
         auto* library = device.get_library(
@@ -1004,7 +1004,7 @@ public:
         }
         output.set_data(mlx::core::allocator::malloc(output.nbytes()));
         auto& selected_stream = stream();
-        auto& device = kernel_device(selected_stream.device);
+        auto& device = tyloi::metal::kernel_device(selected_stream.device);
         auto* kernel = prepared_kernel();
         auto& encoder =
             mlx::core::metal::get_command_encoder(selected_stream);

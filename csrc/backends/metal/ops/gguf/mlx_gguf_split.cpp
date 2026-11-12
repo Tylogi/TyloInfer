@@ -1,6 +1,5 @@
 #include "mlx_gguf_staged.h"
-#include "mlx_cached_kernel.h"
-#include "mlx_kernel_prepare.h"
+#include "engine/backends/metal/native/kernel.h"
 #include "../../platform/metal_device_info.h"
 
 #include <mlx/allocator.h>
@@ -16,15 +15,15 @@ constexpr int kDeviceScratchElements = 64;
 
 using WorkspaceSizes = std::array<MlxGgufWorkspace, 4>;
 
-class SplitWorkspaceKernel final : public Primitive, public MlxPreparableKernel {
+class SplitWorkspaceKernel final : public Primitive, public tyloi::metal::PreparableKernel {
 public:
     SplitWorkspaceKernel(std::shared_ptr<Primitive> kernel, std::span<const MlxGgufWorkspace> sizes)
         : Primitive(kernel->stream()), kernel_(std::move(kernel)), count_(sizes.size()) {
         std::copy(sizes.begin(), sizes.end(), sizes_.begin());
     }
     const char* name() const override { return "GgufSplitWorkspace"; }
-    std::string preparation_key() const override { return mlx_kernel_preparation_key(*kernel_); }
-    void prepare_gpu() override { prepare_mlx_kernel_gpu(*kernel_); }
+    std::string preparation_key() const override { return tyloi::metal::kernel_key(*kernel_); }
+    void prepare_gpu() override { tyloi::metal::prepare_kernel(*kernel_); }
     void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
         throw std::runtime_error("GGUF split projection requires Metal");
     }
@@ -63,7 +62,7 @@ int partition_count(int outputs, int width, int cores) {
 }
 
 const fast::CustomKernelFunction& split_kernel(const std::string& header) {
-    static const auto kernel = cached_metal_kernel("tinfer_gguf_planes_split_projection",
+    static const auto kernel = tyloi::metal::custom_kernel("tinfer_gguf_planes_split_projection",
         {"p00", "p01", "m0", "s0", "c0", "p10", "p11", "m1", "s1", "c1",
             "p20", "p21", "m2", "s2", "c2", "p30", "p31", "m3", "s3", "c3", "x", "params"},
         {"out0", "out1", "out2", "out3"}, R"METAL(

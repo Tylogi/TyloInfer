@@ -1,6 +1,5 @@
 #include "mlx_linear_attention.h"
-#include "mlx_kernel_prepare.h"
-#include "mlx_cached_kernel.h"
+#include "engine/backends/metal/native/kernel.h"
 #include "../../platform/metal_device_info.h"
 
 #include <algorithm>
@@ -480,7 +479,7 @@ std::string gdn_step_source(
     return source;
 }
 
-class GdnStepPrimitive final : public mlx::core::Primitive, public MlxPreparableKernel {
+class GdnStepPrimitive final : public mlx::core::Primitive, public tyloi::metal::PreparableKernel {
 public:
     GdnStepPrimitive(mlx::core::Stream stream, GdnStepConfig config)
         : Primitive(stream), config_(config),
@@ -507,7 +506,7 @@ public:
     }
 
     MTL::ComputePipelineState* prepared_kernel(bool normalize = false) {
-        auto& device = kernel_device(stream().device);
+        auto& device = tyloi::metal::kernel_device(stream().device);
         CompileOptions options;
         options.math_mode = MathMode::Fast;
         auto* library = device.get_library(
@@ -1173,7 +1172,7 @@ else run(integral_constant<bool, false>{});
 
 array projection_contiguous(const array& value) {
     if (value.ndim() > 0 && value.size() == std::size_t(value.shape(-1)))
-        return mlx_row_contiguous_view(value, mlx::core::default_stream(mlx::core::default_device()));
+        return tyloi::metal::row_contiguous_view(value, mlx::core::default_stream(mlx::core::default_device()));
     return mlx::core::contiguous(value);
 }
 
@@ -2057,7 +2056,7 @@ namespace {
 using GatedDeltaCacheStep = std::function<std::vector<array>(const std::vector<array>&)>;
 
 const mlx::core::fast::CustomKernelFunction& fused_gdn_cache_replay_kernel() {
-    static const auto kernel = cached_metal_kernel("mfq_cpp_gdn_cache_replay_fused_v1",
+    static const auto kernel = tyloi::metal::custom_kernel("mfq_cpp_gdn_cache_replay_fused_v1",
         {"qk", "value", "convolution", "recurrent", "weight", "gate", "beta", "params"},
         {"convolution_out", "recurrent_out"}, R"METAL(
 const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;

@@ -1,5 +1,5 @@
 #include "mlx_dsa_cache_ops.h"
-#include "mlx_kernel_prepare.h"
+#include "engine/backends/metal/native/kernel.h"
 
 #include <mlx/backend/metal/device.h>
 #include <mlx/primitives.h>
@@ -179,7 +179,7 @@ struct PackParams {
     float eps;
 };
 
-class DsaPackStore final : public Primitive, public MlxPreparableKernel {
+class DsaPackStore final : public Primitive, public tyloi::metal::PreparableKernel {
 public:
     DsaPackStore(Stream stream, int begin, int rotary, int gs, bool e4,
         float eps, bool normalize, bool emit, Dtype dtype)
@@ -193,11 +193,11 @@ public:
     MTL::Library* library() {
         CompileOptions options;
         options.math_mode = MathMode::Fast;
-        return kernel_device(stream().device).get_library("mfq_dsa_pack_store_v1", options,
+        return tyloi::metal::kernel_device(stream().device).get_library("mfq_dsa_pack_store_v1", options,
             [] { return std::string(kPackStoreSource); });
     }
     void prepare_gpu() override {
-        (void)kernel_device(stream().device).get_kernel(name_string(), library());
+        (void)tyloi::metal::kernel_device(stream().device).get_kernel(name_string(), library());
     }
     void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
         throw std::runtime_error("DSA packed cache update requires Metal");
@@ -210,7 +210,7 @@ public:
             std::uint32_t(begin_), std::uint32_t(rotary_), std::uint32_t(gs_),
             std::uint32_t(e4_), std::uint32_t(normalize_), std::uint32_t(emit_), eps_};
         auto& encoder = mlx::core::metal::get_command_encoder(stream());
-        encoder.set_compute_pipeline_state(kernel_device(stream().device).get_kernel(name_string(), library()));
+        encoder.set_compute_pipeline_state(tyloi::metal::kernel_device(stream().device).get_kernel(name_string(), library()));
         encoder.set_output_array(out[0], 0);
         for (int i = 1; i < 5; ++i) encoder.set_input_array(in[i], i);
         encoder.set_output_array(out[1], 5);
