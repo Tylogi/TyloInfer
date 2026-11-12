@@ -1325,7 +1325,7 @@ MlxDeepseekV4Moe::forward_branches(
         // flight, then wait only for the residual storage latency below.
         detail::eval_with_timing(projections);
     }
-    if (detail::component_profile_active()) {
+    if (tyloi::profiling::active()) {
         detail::profile_eval(
             "moe.shared_router_projections",
             projections);
@@ -1529,7 +1529,7 @@ MlxDeepseekV4Moe::forward_branches(
                 array(8, mlx::core::int32)));
         packed_expert_ids = true;
     }
-    if (detail::component_profile_active()) {
+    if (tyloi::profiling::active()) {
         detail::profile_eval(
             "moe.routing",
             std::vector<array>{
@@ -1620,7 +1620,7 @@ MlxDeepseekV4Moe::forward_branches(
             && gate_up->prefers_mxfp4_smallm_nax(route_ids)
             && down->prefers_mxfp4_smallm_nax(route_ids);
         if (smallm_gather_qmm) {
-            detail::profile_marker(
+            tyloi::profiling::mark(
                 "moe.dispatch.resident_smallm_gather_qmm");
             const int routes = route_ids.shape(1);
             auto route_order = mlx::core::contiguous(
@@ -1636,7 +1636,7 @@ MlxDeepseekV4Moe::forward_branches(
                 route_order,
                 static_cast<float>(config_.swiglu_limit),
                 true);
-            if (detail::component_profile_active()) {
+            if (tyloi::profiling::active()) {
                 detail::profile_eval(
                     "moe.routed_gate_up_swiglu",
                     routed_hidden);
@@ -1648,7 +1648,7 @@ MlxDeepseekV4Moe::forward_branches(
                 true,
                 nullptr,
                 true);
-            if (detail::component_profile_active()) {
+            if (tyloi::profiling::active()) {
                 detail::profile_eval(
                     "moe.routed_down",
                     down_sorted);
@@ -1657,14 +1657,14 @@ MlxDeepseekV4Moe::forward_branches(
                 std::move(down_sorted),
                 moe_inverse_permutation(route_order),
                 route_weights);
-            if (detail::component_profile_active()) {
+            if (tyloi::profiling::active()) {
                 detail::profile_eval(
                     "moe.route_reduce",
                     output);
             }
             return output;
         } else if (grouped_prefill) {
-            detail::profile_marker("moe.dispatch.resident_grouped_prefill");
+            tyloi::profiling::mark("moe.dispatch.resident_grouped_prefill");
             const int routes = route_ids.shape(1);
             auto route_order = mlx::core::contiguous(
                 mlx::core::astype(
@@ -1751,7 +1751,7 @@ MlxDeepseekV4Moe::forward_branches(
                     static_cast<float>(
                         config_.swiglu_limit));
             }();
-            if (detail::component_profile_active()) {
+            if (tyloi::profiling::active()) {
                 detail::profile_eval(
                     "moe.routed_gate_up_swiglu",
                     routed_hidden);
@@ -1766,7 +1766,7 @@ MlxDeepseekV4Moe::forward_branches(
                       route_order,
                       true,
                       down_plan.has_value() ? &*down_plan : &gate_plan);
-            if (detail::component_profile_active()) {
+            if (tyloi::profiling::active()) {
                 detail::profile_eval(
                     "moe.routed_down",
                     down_sorted);
@@ -1775,14 +1775,14 @@ MlxDeepseekV4Moe::forward_branches(
                 std::move(down_sorted),
                 moe_inverse_permutation(route_order),
                 route_weights);
-            if (detail::component_profile_active()) {
+            if (tyloi::profiling::active()) {
                 detail::profile_eval(
                     "moe.route_reduce",
                     output);
             }
             return output;
         } else {
-            detail::profile_marker("moe.dispatch.resident_direct");
+            tyloi::profiling::mark("moe.dispatch.resident_direct");
             array routed_hidden = precomputed_hidden != nullptr
                 ? *precomputed_hidden
                 : [&]() {
@@ -1838,7 +1838,7 @@ MlxDeepseekV4Moe::forward_branches(
                                   static_cast<float>(
                                       config_.swiglu_limit));
                 }();
-            if (detail::component_profile_active()) {
+            if (tyloi::profiling::active()) {
                 detail::profile_eval(
                     "moe.routed_gate_up_swiglu",
                     routed_hidden);

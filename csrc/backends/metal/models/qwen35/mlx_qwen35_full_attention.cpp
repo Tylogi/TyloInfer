@@ -529,7 +529,7 @@ array MlxQwen35FullAttentionBlock::forward_impl(
     auto query_full = std::move(projected.at(0));
     auto key_full = std::move(projected.at(1));
     auto value_full = std::move(projected.at(2));
-    if (detail::component_profile_active()) {
+    if (tyloi::profiling::active()) {
         detail::profile_eval(
             "qwen35.full_attention.qkv",
             {query_full, key_full, value_full});

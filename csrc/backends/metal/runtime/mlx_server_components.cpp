@@ -1,5 +1,5 @@
 #include "mlx_server_components.h"
-#include "engine/backends/metal/ops/execution.h"
+#include "engine/backends/metal/ops/stream.h"
 
 #include <chrono>
 #include <cstdint>

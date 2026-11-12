@@ -693,7 +693,7 @@ array MlxQwen35LinearAttentionBlock::forward(
         return residual;
     }
     const auto beta = mlx::core::sigmoid(beta_logits);
-    if (detail::component_profile_active()) {
+    if (tyloi::profiling::active()) {
         detail::profile_eval(
             "qwen35.linear_attention.projections",
             {qk, value_input, z, alpha, beta});
@@ -748,7 +748,7 @@ array MlxQwen35LinearAttentionBlock::forward(
         dimension,
         convolution_bias_,
         static_cast<float>(config_.rms_norm_eps));
-    if (detail::component_profile_active()) {
+    if (tyloi::profiling::active()) {
         detail::profile_eval(
             "qwen35.linear_attention.conv",
             {convolved.query, convolved.key, convolved.value,
@@ -763,7 +763,7 @@ array MlxQwen35LinearAttentionBlock::forward(
         use_cache ? recurrent_state_ : std::nullopt,
         false,
         gguf_layout_);
-    if (detail::component_profile_active()) {
+    if (tyloi::profiling::active()) {
         detail::profile_eval(
             "qwen35.linear_attention.recurrent",
             {recurrent.output, recurrent.state});

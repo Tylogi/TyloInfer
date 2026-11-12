@@ -1388,7 +1388,7 @@ void report_decode_components(
     int step,
     int cache_position,
     const std::chrono::steady_clock::time_point& started,
-    const detail::ComponentProfile& profile) {
+    const tyloi::profiling::Components& profile) {
     if (!enabled) return;
     const double wall_ms =
         std::chrono::duration<double, std::milli>(
@@ -1967,7 +1967,7 @@ public:
                           config_.head_dim,
                       }),
                   {0, 2, 1, 3});
-        if (detail::component_profile_active()) {
+        if (tyloi::profiling::active()) {
             if (use_inline_kv_post) {
                 detail::profile_eval(
                     "minicpmo.qkv_norm_rope", query);
@@ -2016,7 +2016,7 @@ public:
                 keys = std::move(cached.first);
                 values = std::move(cached.second);
             }
-            if (detail::component_profile_active() &&
+            if (tyloi::profiling::active() &&
                 !use_combined_kv_write) {
                 detail::profile_eval(
                     "minicpmo.kv_append",
@@ -5284,7 +5284,7 @@ std::int32_t MlxMiniCPMO45Runtime::generate(
     } stable_restore{implementation_->language, stable_snapshot};
 
     auto logits = [&]() {
-        detail::ScopedMlxEvaluationTiming timing(
+        tyloi::profiling::EvaluationScope timing(
             prefill_callback ? &prefill_ms : nullptr);
         const auto forward_range = [&](std::size_t begin, std::size_t end) {
             if (begin >= end || end > prompt.size()) {
@@ -5304,7 +5304,7 @@ std::int32_t MlxMiniCPMO45Runtime::generate(
                 config.vocab);
         };
         const auto materialize_text_cache = [&]() {
-            detail::measure_evaluation([&]() {
+            tyloi::profiling::measure([&]() {
                 implementation_->language.materialize_cache();
             });
         };
@@ -5376,8 +5376,8 @@ std::int32_t MlxMiniCPMO45Runtime::generate(
             decode_step >= profile_skip &&
             decode_step - profile_skip <
                 detail::component_profile_steps();
-        detail::ComponentProfile component_profile;
-        detail::ScopedComponentProfile profile_scope(
+        tyloi::profiling::Components component_profile;
+        tyloi::profiling::ProfileScope profile_scope(
             profile_this_step ? &component_profile : nullptr);
         const auto component_started =
             std::chrono::steady_clock::now();
@@ -5624,8 +5624,8 @@ std::int32_t MlxMiniCPMO45Runtime::generate_multimodal(
             decode_step >= profile_skip &&
             decode_step - profile_skip <
                 detail::component_profile_steps();
-        detail::ComponentProfile component_profile;
-        detail::ScopedComponentProfile profile_scope(
+        tyloi::profiling::Components component_profile;
+        tyloi::profiling::ProfileScope profile_scope(
             profile_this_step ? &component_profile : nullptr);
         const auto component_started =
             std::chrono::steady_clock::now();

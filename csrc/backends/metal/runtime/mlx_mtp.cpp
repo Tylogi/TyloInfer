@@ -1008,13 +1008,13 @@ MlxMtpGeneration mlx_mtp_generation(
             continue;
         }
         const int draft_count = draft.depth;
-        detail::ComponentProfile target_profile;
+        tyloi::profiling::Components target_profile;
         const bool profile_target_components =
             profile_phases && detail::component_profile_requested();
         co_yield MlxMtpTargetRequest{pending, draft.tokens, draft_count};
         const auto target_started = std::chrono::steady_clock::now();
         auto target = [&]() {
-            detail::ScopedComponentProfile profile_scope(
+            tyloi::profiling::ProfileScope profile_scope(
                 profile_target_components ? &target_profile : nullptr);
             auto result = callbacks.verify_target(
                 pending, draft.tokens, draft_count);

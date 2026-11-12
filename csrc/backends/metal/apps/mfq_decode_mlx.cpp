@@ -10,7 +10,7 @@
 #include "mlx_resident_budget.h"
 #include "mlx_qwen4_causal_lm.h"
 #include "mlx_qwen35_causal_lm.h"
-#include "engine/backends/metal/ops/execution.h"
+#include "engine/backends/metal/ops/stream.h"
 #include "mlx_tensor.h"
 #include "qwen35_model.h"
 

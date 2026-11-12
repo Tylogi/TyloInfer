@@ -925,7 +925,7 @@ array MlxDeepseekV41CausalLm::forward_impl(
     if (!route_transaction) {
         for (std::size_t index = 0; index < layer_count; ++index) {
             if (mfq::mfq_compat_enabled && mfe_offload_cache_ && batch == 1 && tokens == 1 && cache_position_ > 0 &&
-                !image_mask && speculative_cache_start_ < 0 && !detail::component_profile_active()) {
+                !image_mask && speculative_cache_start_ < 0 && !tyloi::profiling::active()) {
                 std::vector<MlxMfeCachedRoute> routes;
                 for (auto next = index; next < layers_.size() && next < index + 4; ++next) {
                     auto route = layers_[next].cached_route();

@@ -1913,7 +1913,7 @@ struct MlxDeepseekV4Attention::Impl {
                 tokens,
                 groups * rank,
             });
-        if (detail::component_profile_active()) {
+        if (tyloi::profiling::active()) {
             detail::profile_eval(
                 std::string("attention.r")
                     + std::to_string(ratio)
@@ -1921,7 +1921,7 @@ struct MlxDeepseekV4Attention::Impl {
                 low_rank);
         }
         auto result = components.wo_b(low_rank);
-        if (detail::component_profile_active()) {
+        if (tyloi::profiling::active()) {
             detail::profile_eval(
                 std::string("attention.r")
                     + std::to_string(ratio)
@@ -2174,7 +2174,7 @@ array MlxDeepseekV4Attention::operator()(
                 + std::to_string(ratio)
                 + "." + component;
         };
-    if (detail::component_profile_active()) {
+    if (tyloi::profiling::active()) {
         detail::profile_eval(
             profile_component("input_projections"),
             projected);
@@ -2183,7 +2183,7 @@ array MlxDeepseekV4Attention::operator()(
     auto q_rank = impl_->q_norm(
         projected.at(output++));
     auto kv = projected.at(output++);
-    if (detail::component_profile_active()) {
+    if (tyloi::profiling::active()) {
         detail::profile_eval(
             profile_component("q_rank_norm"),
             q_rank);
@@ -2215,7 +2215,7 @@ array MlxDeepseekV4Attention::operator()(
     if (speculation != nullptr) {
         speculation->local_kv = kv;
     }
-    if (detail::component_profile_active()) {
+    if (tyloi::profiling::active()) {
         detail::profile_eval(
             profile_component("kv_norm_rope"),
             kv);
@@ -2331,7 +2331,7 @@ array MlxDeepseekV4Attention::operator()(
     }
 
     if (
-        detail::component_profile_active()
+        tyloi::profiling::active()
         && impl_->ratio != 0
     ) {
         std::vector<array> compressor_state;
@@ -2377,7 +2377,7 @@ array MlxDeepseekV4Attention::operator()(
     q_projected = mlx::core::reshape(
         std::move(q_projected),
         Shape{batch, tokens, heads, head_dim});
-    if (detail::component_profile_active()) {
+    if (tyloi::profiling::active()) {
         std::vector<array> query_values{q_projected};
         if (index_query_projection) {
             query_values.push_back(*index_query_projection);
@@ -2398,7 +2398,7 @@ array MlxDeepseekV4Attention::operator()(
         impl_->rms_params,
         false,
         impl_->rms_params);
-    if (detail::component_profile_active()) {
+    if (tyloi::profiling::active()) {
         detail::profile_eval(
             profile_component("q_rms_rope"),
             q);
@@ -2412,7 +2412,7 @@ array MlxDeepseekV4Attention::operator()(
         state,
         positions,
         pos0);
-    if (detail::component_profile_active()) {
+    if (tyloi::profiling::active()) {
         detail::profile_eval(
             profile_component("indexer_topk"),
             topk);
@@ -2603,7 +2603,7 @@ array MlxDeepseekV4Attention::operator()(
             *pending_local_values,
             *pending_local_indices);
     }
-    if (detail::component_profile_active()) {
+    if (tyloi::profiling::active()) {
         if (direct_decode || direct_multi) {
             detail::profile_eval(
                 profile_component("cache_update"),

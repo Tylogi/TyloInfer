@@ -1126,7 +1126,7 @@ array MlxDeepseekV4CausalLm::forward_resident_layers(
         eager_layer_materialization
         && targets == nullptr
         && visibility == nullptr
-        && !detail::component_profile_active();
+        && !tyloi::profiling::active();
     const int eval_group = grouped_prefill
         ? resident_prefill_eval_group_layers()
         : 1;
@@ -1583,7 +1583,7 @@ array MlxDeepseekV4CausalLm::forward_chunk(
                 append_pool(*state.indexer());
             }
         }
-        if (detail::component_profile_active()) {
+        if (tyloi::profiling::active()) {
             detail::profile_eval(
                 "model.finalize_cache",
                 std::move(outputs));
@@ -2272,16 +2272,16 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
     double multimodal_prefill_evaluation_ms = 0.0;
     const bool profile_prefill =
         detail::component_profile_requested();
-    detail::ComponentProfile prefill_component_profile;
+    tyloi::profiling::Components prefill_component_profile;
     const auto prefill_component_started =
         std::chrono::steady_clock::now();
     auto logits = [&]() {
         mfq::engine::PrefillActivity prefill_activity;
-        detail::ScopedComponentProfile component_scope(
+        tyloi::profiling::ProfileScope component_scope(
             profile_prefill
                 ? &prefill_component_profile
                 : nullptr);
-        detail::ScopedMlxEvaluationTiming timing(
+        tyloi::profiling::EvaluationScope timing(
             prefill_callback
                 ? &llm_prefill_evaluation_ms
                 : nullptr);
@@ -2341,7 +2341,7 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
                     // MLX is lazy: materialize the vision tower and aligner
                     // before the language model consumes their output so the
                     // server reports both costs in the correct buckets.
-                    detail::ScopedMlxEvaluationTiming multimodal_timing(
+                    tyloi::profiling::EvaluationScope multimodal_timing(
                         &multimodal_prefill_evaluation_ms);
                     detail::eval_with_timing(embeddings);
                 }
@@ -2589,8 +2589,8 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
             && decode_step >= profile_skip
             && decode_step - profile_skip
                 < detail::component_profile_steps();
-        detail::ComponentProfile component_profile;
-        detail::ScopedComponentProfile profile_scope(
+        tyloi::profiling::Components component_profile;
+        tyloi::profiling::ProfileScope profile_scope(
             profile_this_step
                 ? &component_profile
                 : nullptr);

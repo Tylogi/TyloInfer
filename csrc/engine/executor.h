@@ -3,7 +3,12 @@
 #include "engine/tensor.h"
 
 #include <memory>
+#include <chrono>
+#include <map>
 #include <span>
+#include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 namespace tyloi {
@@ -77,3 +82,78 @@ public:
 };
 
 } // namespace tyloi
+
+namespace tyloi::profiling {
+
+struct Timing {
+    double elapsed_ms = 0;
+    std::size_t evaluations = 0;
+};
+
+class Components {
+public:
+    void record(std::string_view component, double elapsed_ms);
+    const std::map<std::string, Timing>& timings() const noexcept;
+    double evaluated_ms() const noexcept;
+
+private:
+    std::map<std::string, Timing> timings_;
+};
+
+// Scopes must be destroyed in reverse order on the thread that created them.
+class ProfileScope {
+public:
+    explicit ProfileScope(Components* profile) noexcept;
+    ProfileScope(const ProfileScope&) = delete;
+    ProfileScope& operator=(const ProfileScope&) = delete;
+    ~ProfileScope();
+
+private:
+    static thread_local Components* active_;
+    Components* previous_ = nullptr;
+    friend bool active() noexcept;
+    friend void mark(std::string_view);
+    template<class Function> friend void component(std::string_view, Function&&);
+};
+
+class EvaluationScope {
+public:
+    explicit EvaluationScope(double* elapsed_ms) noexcept;
+    EvaluationScope(const EvaluationScope&) = delete;
+    EvaluationScope& operator=(const EvaluationScope&) = delete;
+    ~EvaluationScope();
+
+private:
+    static thread_local double* active_;
+    double* previous_ = nullptr;
+    template<class Function> friend void measure(Function&&);
+};
+
+bool active() noexcept;
+void mark(std::string_view component);
+
+// Lazy graph construction is excluded; only explicit evaluation is timed.
+template<class Function>
+void measure(Function&& function) {
+    if (EvaluationScope::active_ == nullptr) {
+        std::forward<Function>(function)();
+        return;
+    }
+    const auto started = std::chrono::steady_clock::now();
+    std::forward<Function>(function)();
+    *EvaluationScope::active_ += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - started).count();
+}
+
+template<class Function>
+void component(std::string_view name, Function&& function) {
+    if (ProfileScope::active_ == nullptr) {
+        return;
+    }
+    const auto started = std::chrono::steady_clock::now();
+    std::forward<Function>(function)();
+    ProfileScope::active_->record(name, std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - started).count());
+}
+
+} // namespace tyloi::profiling

@@ -3,7 +3,7 @@
 #include "mlx_mtp.h"
 #include "mlx_eval_timing.h"
 #include "mlx_kernel_prepare.h"
-#include "engine/backends/metal/ops/execution.h"
+#include "engine/backends/metal/ops/stream.h"
 
 #include <algorithm>
 #include <array>
@@ -687,7 +687,7 @@ MlxQwen35CausalLm::forward_embeddings_impl(
         ? embeddings
         : mlx::core::astype(embeddings, activation_dtype_);
     const bool dispatch_decode = use_cache && batch == 1 && tokens == 1 && position > 0 &&
-        !detail::component_profile_active() && MlxKernelPreparation::current() == nullptr;
+        !tyloi::profiling::active() && MlxKernelPreparation::current() == nullptr;
     std::size_t layer_index = 0;
     std::vector<array> captured;
     if (!hidden_capture_layers_.empty()) hidden_capture_.reset();
@@ -916,7 +916,7 @@ void MlxQwen35CausalLm::prepare_cache_for_prefill(
 }
 
 void MlxQwen35CausalLm::materialize_prefill_state() {
-    detail::measure_evaluation([this]() {
+    tyloi::profiling::measure([this]() {
         visit_layers(
             layers_,
             [](auto& layer) {
@@ -1219,13 +1219,13 @@ std::int32_t MlxQwen35CausalLm::generate_prepared_impl(
 
     const bool profile_prefill =
         detail::component_profile_requested();
-    detail::ComponentProfile component_profile;
+    tyloi::profiling::Components component_profile;
     const auto profile_started = std::chrono::steady_clock::now();
     auto logits = [&]() {
         mfq::engine::PrefillActivity prefill_activity;
-        detail::ScopedComponentProfile component_scope(
+        tyloi::profiling::ProfileScope component_scope(
             profile_prefill ? &component_profile : nullptr);
-        detail::ScopedMlxEvaluationTiming timing(
+        tyloi::profiling::EvaluationScope timing(
             prefill_callback
                 ? &prefill_evaluation_ms
                 : nullptr);

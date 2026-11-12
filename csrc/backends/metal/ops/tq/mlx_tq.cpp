@@ -32,8 +32,8 @@ int pool_kind(bool pooled,const array& words) {
 }
 
 void record_dispatch(const array& input, int outputs, int experts, const char* mode, int rows = 0) {
-    if (!detail::component_profile_active()) return;
-    detail::profile_marker(std::string("tq.dispatch.") + mode + ".dtype"
+    if (!tyloi::profiling::active()) return;
+    tyloi::profiling::mark(std::string("tq.dispatch.") + mode + ".dtype"
         + (input.dtype() == float16 ? "f16" : input.dtype() == bfloat16 ? "bf16" : "f32")
         + ".M" + std::to_string(rows ? rows : input.size() / input.shape(-1))
         + ".K" + std::to_string(input.shape(-1)) + ".N" + std::to_string(outputs)

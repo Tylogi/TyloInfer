@@ -606,7 +606,7 @@ MlxDeepseekV41MoeResult MlxDeepseekV41Moe::forward(
             return {mlx::core::reshape(std::move(output), input.shape()),
                 mlx::core::reshape(std::move(shared), input.shape())};
         }
-        if (rows == 1 && !image_mask && !detail::component_profile_active()) {
+        if (rows == 1 && !image_mask && !tyloi::profiling::active()) {
             if (auto cached = cached_route()) {
                 auto output = cached->forward(source, routes.ids, swiglu_limit_, &routes.weights);
                 mlx::core::async_eval({output});

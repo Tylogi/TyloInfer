@@ -1166,7 +1166,7 @@ public:
                     static_cast<std::size_t>(config_.hidden_size)),
                 static_cast<int>(config_.hidden_size)});
         auto router_logits = router_(source);
-        if (detail::component_profile_active()) {
+        if (tyloi::profiling::active()) {
             detail::profile_eval("qwen4.moe.router", router_logits);
         }
         auto routes = moe_topk(
@@ -1190,7 +1190,7 @@ public:
                     shared_(source), shared_gate_(source)), value.shape());
             }
         }
-        if (detail::component_profile_active()) {
+        if (tyloi::profiling::active()) {
             detail::profile_eval(
                 "qwen4.moe.topk",
                 std::vector<array>{routes.ids, routes.weights});
@@ -1261,7 +1261,7 @@ public:
                 const auto& weights = prefetched->wait();
                 auto intermediate = weights.gate_up.swiglu(
                     source, routes.ids, 0.0f);
-                if (detail::component_profile_active()) {
+                if (tyloi::profiling::active()) {
                     detail::profile_eval(
                         "qwen4.moe.routed_gate_up",
                         intermediate);
@@ -1273,7 +1273,7 @@ public:
                           routes.weights)
                     : weights.down(intermediate, routes.ids);
                 routed_is_reduced = tokens <= 6;
-                if (detail::component_profile_active()) {
+                if (tyloi::profiling::active()) {
                     detail::profile_eval(
                         "qwen4.moe.routed_down", output);
                 }
@@ -1285,7 +1285,7 @@ public:
                 auto intermediate =
                     prepared.weights().gate_up.swiglu(
                         source, prepared.expert_ids(), 0.0f);
-                if (detail::component_profile_active()) {
+                if (tyloi::profiling::active()) {
                     detail::profile_eval(
                         "qwen4.moe.routed_gate_up",
                         intermediate);
@@ -1298,14 +1298,14 @@ public:
                     : prepared.weights().down(
                           intermediate, prepared.expert_ids());
                 routed_is_reduced = tokens <= 6;
-                if (detail::component_profile_active()) {
+                if (tyloi::profiling::active()) {
                     detail::profile_eval(
                         "qwen4.moe.routed_down", output);
                 }
                 return output;
             }
             if (mfq::mfq_compat_enabled && mfe_offload_cache_) {
-                if (tokens == 1 && !detail::component_profile_active()) {
+                if (tokens == 1 && !tyloi::profiling::active()) {
                     auto local_route = deferred_route ? std::nullopt : cached_route();
                     auto* cached = deferred_route ? deferred_route : local_route ? &*local_route : nullptr;
                     if (cached) {
@@ -1397,11 +1397,11 @@ public:
                     }
                     return gate.routed_swiglu(source, local_ids, 0.0f, local_groups);
                 }();
-                if (detail::component_profile_active()) {
+                if (tyloi::profiling::active()) {
                     detail::profile_eval(
                         "qwen4.moe.routed_gate_up", intermediate);
                 }
-                if ((tokens <= 6 || batched_decode || sorted_routes) && !detail::component_profile_active())
+                if ((tokens <= 6 || batched_decode || sorted_routes) && !tyloi::profiling::active())
                     mlx::core::async_eval({intermediate});
                 auto down = mfe_offload_cache_->grouped_mfe(
                     down_name_, active, activation_counts, prefill_scan);
@@ -1411,7 +1411,7 @@ public:
                         : down.build_grouped_mmq_plan(local_ids, *sorted_routes, rows);
                     auto output = down.routed_matmul_sorted(intermediate, local_ids,
                         *sorted_routes, true, false, 0.0f, &plan);
-                    if (detail::component_profile_active())
+                    if (tyloi::profiling::active())
                         detail::profile_eval("qwen4.moe.routed_down", output);
                     return mlx::core::reshape(mlx::core::take(output,
                         moe_inverse_permutation(*sorted_routes), 0),
@@ -1429,7 +1429,7 @@ public:
                           routes.weights, local_groups)
                     : down.routed_matmul(intermediate, local_ids, local_groups);
                 routed_is_reduced = combine_routes;
-                if (detail::component_profile_active()) {
+                if (tyloi::profiling::active()) {
                     detail::profile_eval(
                         "qwen4.moe.routed_down", output);
                 }
@@ -1478,7 +1478,7 @@ public:
                     true,
                     0.0f,
                     &gate_plan);
-                if (detail::component_profile_active()) {
+                if (tyloi::profiling::active()) {
                     detail::profile_eval(
                         "qwen4.moe.routed_gate_up",
                         intermediate);
@@ -1491,7 +1491,7 @@ public:
                     false,
                     0.0f,
                     down_plan.has_value() ? &*down_plan : &gate_plan);
-                if (detail::component_profile_active()) {
+                if (tyloi::profiling::active()) {
                     detail::profile_eval(
                         "qwen4.moe.routed_down",
                         sorted);
@@ -1503,13 +1503,13 @@ public:
             }
             if (auto output = gate_up_->gguf_prefill_ffn(*down_, source, routes.ids, routes.weights)) {
                 routed_is_reduced = true;
-                if (detail::component_profile_active()) detail::profile_eval("qwen4.moe.routed_ffn", *output);
+                if (tyloi::profiling::active()) detail::profile_eval("qwen4.moe.routed_ffn", *output);
                 return std::move(*output);
             }
             auto intermediate = gate_up_->routed_swiglu(
                 source,
                 routes.ids, route_groups);
-            if (detail::component_profile_active()) {
+            if (tyloi::profiling::active()) {
                 detail::profile_eval(
                     "qwen4.moe.routed_gate_up",
                     intermediate);
@@ -1526,12 +1526,12 @@ public:
                       routes.weights, route_groups)
                 : down_->routed_matmul(intermediate, routes.ids, route_groups);
             routed_is_reduced = combine_routes;
-            if (detail::component_profile_active()) {
+            if (tyloi::profiling::active()) {
                 detail::profile_eval("qwen4.moe.routed_down", output);
             }
             return output;
         }();
-        if (!detail::component_profile_active() &&
+        if (!tyloi::profiling::active() &&
             !routed_is_reduced && !pairs_are_sorted) {
             return mlx::core::reshape(
                 shared_.moe_shared(
@@ -1542,10 +1542,10 @@ public:
                 value.shape());
         }
         auto shared = parallel_shared ? *parallel_shared : shared_(source);
-        if (detail::component_profile_active()) {
+        if (tyloi::profiling::active()) {
             detail::profile_eval("qwen4.moe.shared", shared);
         }
-        if (detail::component_profile_active()) {
+        if (tyloi::profiling::active()) {
             detail::profile_eval("qwen4.moe.shared_gate", shared_gate);
         }
         auto output = routed_is_reduced
@@ -1565,7 +1565,7 @@ public:
                   routes.weights,
                   shared,
                   shared_gate);
-        if (detail::component_profile_active()) {
+        if (tyloi::profiling::active()) {
             detail::profile_eval("qwen4.moe.reduce", output);
         }
         return mlx::core::reshape(output, value.shape());
@@ -2923,7 +2923,7 @@ public:
         if (fused_decode) {
             const std::vector<array> inputs{
                 hidden, *convolution_state_, *recurrent_state_};
-            auto decoded = detail::component_profile_active()
+            auto decoded = tyloi::profiling::active()
                 ? decode_step(inputs) : compiled_decode_(inputs);
             convolution_state_ = std::move(decoded[1]);
             recurrent_state_ = std::move(decoded[2]);
@@ -2941,7 +2941,7 @@ public:
                     static_cast<int>(config_.linear_value_head_dim)}, mlx::core::float32),
         };
         auto decoded = use_cache && batch == 1 && tokens >= 2 && tokens <= MlxQwen4CausalLm::maximum_verification_rows &&
-                !detail::component_profile_active()
+                !tyloi::profiling::active()
             ? compiled_batch_step_(inputs) : batch_step(inputs);
         if (use_cache && rollback_ && rollback_->position == position_ &&
             rollback_->total_tokens == tokens) {
@@ -2967,7 +2967,7 @@ public:
             throw std::runtime_error(
                 "Qwen4 GDN has no speculative rollback state");
         }
-        auto restored = !detail::component_profile_active()
+        auto restored = !tyloi::profiling::active()
             ? compiled_replay_(*rollback_, accepted_tokens)
             : replay_gated_delta_speculative_prefix(
             *rollback_,
@@ -5430,7 +5430,7 @@ struct MlxQwen4CausalLm::Impl {
         auto current_positions = prompt_positions.current(full_positions, start, tokens);
         const bool bounded_prefill = tokens > 1;
         const bool dispatch_decode = batch == 1 && tokens <= maximum_verification_rows && decode_async_enabled() &&
-            !detail::component_profile_active();
+            !tyloi::profiling::active();
         const auto dispatch_interval = static_cast<std::size_t>(decode_async_interval());
         const auto rows = static_cast<std::size_t>(batch) *
             static_cast<std::size_t>(tokens);
@@ -5438,7 +5438,7 @@ struct MlxQwen4CausalLm::Impl {
         std::vector<array> captured;
         std::optional<Qwen4Layer::DeferredResidual> residual_state;
         const bool defer_residual = rows <= 4 && auxiliary_layers.empty() && !MlxMtpLora::current() &&
-            !detail::component_profile_active();
+            !tyloi::profiling::active();
         std::array<
             std::optional<MlxSsdPrefetchedExpertLayer>,
             2> routed_pipeline;
@@ -5450,7 +5450,7 @@ struct MlxQwen4CausalLm::Impl {
         }
         for (std::size_t index = 0; index < layers.size(); ++index) {
             if (use_cache && batch == 1 && tokens == 1 && !speculative_confirmed &&
-                !MlxMtpLora::current() && !detail::component_profile_active()) {
+                !MlxMtpLora::current() && !tyloi::profiling::active()) {
                 std::vector<Qwen4CachedRoute> routes;
                 std::vector<Qwen4Layer::RouteCheckpoint> states;
                 for (auto next = index; next < layers.size() && next < index + 4; ++next) {
@@ -6462,13 +6462,13 @@ std::int32_t MlxQwen4CausalLm::generate_prepared_impl(
     double prefill_ms = 0.0;
     std::optional<array> prefill_hidden;
     const bool profile_prefill = detail::component_profile_requested();
-    detail::ComponentProfile component_profile;
+    tyloi::profiling::Components component_profile;
     const auto profile_started = std::chrono::steady_clock::now();
     auto logits = [&] {
         mfq::engine::PrefillActivity prefill_activity;
-        detail::ScopedComponentProfile component_scope(
+        tyloi::profiling::ProfileScope component_scope(
             profile_prefill ? &component_profile : nullptr);
-        detail::ScopedMlxEvaluationTiming timing(
+        tyloi::profiling::EvaluationScope timing(
             prefill_callback ? &prefill_ms : nullptr);
         std::optional<array> last_logits;
         for (std::size_t offset = reused; offset < prompt.size();) {
@@ -6837,8 +6837,8 @@ std::int32_t MlxQwen4CausalLm::generate_prepared_impl(
         const bool profile_step = detail::component_profile_requested()
             && decode_step >= profile_skip
             && decode_step - profile_skip < detail::component_profile_steps();
-        detail::ComponentProfile decode_profile;
-        detail::ScopedComponentProfile decode_profile_scope(
+        tyloi::profiling::Components decode_profile;
+        tyloi::profiling::ProfileScope decode_profile_scope(
             profile_step ? &decode_profile : nullptr);
         const auto decode_started = std::chrono::steady_clock::now();
         if (prefix_cache) {

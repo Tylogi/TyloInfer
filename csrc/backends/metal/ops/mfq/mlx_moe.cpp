@@ -12937,7 +12937,7 @@ array MlxMfeWeight::routed_swiglu_pair(
                 const int workgroups = checked_int(checked_product(checked_product(tokens, routes, "paired MFE routes"),
                     (std::size_t(impl_->out_per_expert) + output_rows - 1) / output_rows,
                     "paired MFE workgroups"), "paired MFE workgroups");
-                detail::profile_marker("mfe.dispatch.indirect_pair_native");
+                tyloi::profiling::mark("mfe.dispatch.indirect_pair_native");
                 return native_moe_dispatch(std::move(inputs), NativeMoeConfig{
                     .dtype = source.dtype(),
                     .output_shape = Shape{tokens, routes, impl_->out_per_expert},
@@ -12974,11 +12974,11 @@ array MlxMfeWeight::routed_swiglu_pair(
                 });
             }
         }
-        detail::profile_marker("mfe.dispatch.mxfp4_pair_fallback");
+        tyloi::profiling::mark("mfe.dispatch.mxfp4_pair_fallback");
         return fallback();
     }
 
-    detail::profile_marker("mfe.dispatch.mxfp4_pair_native");
+    tyloi::profiling::mark("mfe.dispatch.mxfp4_pair_native");
 
     auto source = input;
     if (source.dtype() != mlx::core::float16
@@ -13255,7 +13255,7 @@ std::optional<array> MlxMfeWeight::decode_nint_shared(
     stage_two_inputs.push_back(shared_down.sub_mins());
     stage_two_inputs.push_back(std::move(ids));
     stage_two_inputs.push_back(std::move(weights));
-    detail::profile_marker("mfe.dispatch.two_stage_nint_shared");
+    tyloi::profiling::mark("mfe.dispatch.two_stage_nint_shared");
     auto outputs = mfe_nint_decode_dispatch(std::move(stage_two_inputs), config, 2);
     return std::move(outputs.front());
 }
@@ -13307,7 +13307,7 @@ array MlxMfeWeight::routed_matmul_reduce(
         || input.shape(2) != impl_->neuron_len
         || expert_ids.shape(1) <= 0
         || expert_ids.shape(1) > 16) {
-        detail::profile_marker("mfe.dispatch.mxfp4_down_reduce_fallback");
+        tyloi::profiling::mark("mfe.dispatch.mxfp4_down_reduce_fallback");
         return fallback();
     }
 
@@ -13324,11 +13324,11 @@ array MlxMfeWeight::routed_matmul_reduce(
             for (std::size_t index = 0; index < expert_ids.size(); ++index)
                 if (groups[index * 8 + 1] > 1) return fallback();
         }
-        detail::profile_marker("mfe.dispatch.mixed_down_reduce_native");
+        tyloi::profiling::mark("mfe.dispatch.mixed_down_reduce_native");
         return routed_matmul_impl(input, expert_ids, false, 0.0f, nullptr, false, nullptr, &route_weights);
     }
 
-    detail::profile_marker("mfe.dispatch.mxfp4_down_reduce_native");
+    tyloi::profiling::mark("mfe.dispatch.mxfp4_down_reduce_native");
 
     auto source = input;
     if (source.dtype() != mlx::core::float16

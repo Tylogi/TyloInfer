@@ -9,6 +9,7 @@ set_target_properties(mfq-tensor PROPERTIES POSITION_INDEPENDENT_CODE ON)
 add_library(mfq-engine STATIC
     config.cpp
     engine.cpp
+    executor.cpp
     generation/decode.cpp
     generation/generation.cpp
     generation/mtp/metrics.cpp
