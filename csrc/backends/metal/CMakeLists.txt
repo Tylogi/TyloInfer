@@ -333,6 +333,7 @@ configure_file(kernels/gguf/gguf_embedded.h.in gguf_embedded.h @ONLY)
 configure_file(kernels/mlx/mlx_affine_nax.h.in mlx_affine_nax.h @ONLY)
 
 add_library(mfq-metal-runtime STATIC
+    ${PROJECT_SOURCE_DIR}/engine/backends/metal/ops/execution.cpp
     storage/hf_safetensors_store.cpp
     storage/mfq_container.cpp
     storage/mfe_expert_store.cpp

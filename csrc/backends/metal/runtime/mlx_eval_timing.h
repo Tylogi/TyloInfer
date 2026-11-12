@@ -11,6 +11,8 @@
 
 #include <mlx/mlx.h>
 
+#include "engine/backends/metal/ops/execution.h"
+
 namespace mfq::metal::detail {
 
 // MLX graph construction is lazy and can be substantial for a full model.
@@ -153,14 +155,14 @@ void measure_evaluation(Function&& function) {
 }
 
 inline void eval_with_timing(mlx::core::array& value) {
-    measure_evaluation([&value]() { value.eval(); });
+    measure_evaluation([&value]() { tyloi::metal::ops::eval(value); });
 }
 
 inline void eval_with_timing(
     std::vector<mlx::core::array> values) {
     measure_evaluation(
         [values = std::move(values)]() mutable {
-            mlx::core::eval(std::move(values));
+            tyloi::metal::ops::eval(std::move(values));
         });
 }
 
@@ -186,7 +188,7 @@ inline void profile_eval(
     mlx::core::array& value) {
     profile_evaluation(
         component,
-        [&value]() { value.eval(); });
+        [&value]() { tyloi::metal::ops::eval(value); });
 }
 
 inline void profile_eval(
@@ -195,7 +197,7 @@ inline void profile_eval(
     profile_evaluation(
         component,
         [values = std::move(values)]() mutable {
-            mlx::core::eval(std::move(values));
+            tyloi::metal::ops::eval(std::move(values));
         });
 }
 

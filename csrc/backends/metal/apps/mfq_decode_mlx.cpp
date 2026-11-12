@@ -10,7 +10,7 @@
 #include "mlx_resident_budget.h"
 #include "mlx_qwen4_causal_lm.h"
 #include "mlx_qwen35_causal_lm.h"
-#include "mlx_stream_sync.h"
+#include "engine/backends/metal/ops/execution.h"
 #include "mlx_tensor.h"
 #include "qwen35_model.h"
 
@@ -82,7 +82,7 @@ void release_model_load_staging_memory(
     // both the MLX cache and macOS malloc's large-object depot. Keeping those
     // pages makes a single fully resident model look tens of GiB larger and
     // can force useful weights into swap before the first request.
-    mfq::metal::drain_metal_work(runtime_stream);
+    tyloi::metal::ops::drain(runtime_stream);
     release_allocator_caches();
 }
 
@@ -1976,7 +1976,7 @@ public:
                 enforce_memory_budget(0);
                 if (runtime_components.speculative_generate && !request.vision &&
                     runtime_components.speculative_generate(prompt, sampling, job, token_constraint, prefill_chunk_size)) {
-                    mfq::metal::drain_metal_work(runtime_stream);
+                    tyloi::metal::ops::drain(runtime_stream);
                     return;
                 }
                 if constexpr (requires { loaded_runtime.begin_mtp_session(std::string{}); })
@@ -2082,7 +2082,7 @@ public:
                 }
                 (void)generated;
             }
-            mfq::metal::drain_metal_work(runtime_stream);
+            tyloi::metal::ops::drain(runtime_stream);
             if constexpr (requires(Runtime& value) { value.last_mtp_stats(); }) {
                 const auto& stats = runtime_holder->value().last_mtp_stats();
                 job.mtp = {stats.available, stats.used, stats.cycles,
@@ -2092,7 +2092,7 @@ public:
                     stats.standard_tokens, stats.park_count, stats.reentry_probes};
             }
         } catch (...) {
-            mfq::metal::drain_metal_work(runtime_stream);
+            tyloi::metal::ops::drain(runtime_stream);
             throw;
         }
     }
@@ -2103,7 +2103,7 @@ public:
         mlx::core::set_default_device(
             mlx::core::Device::gpu);
         mlx::core::set_default_stream(runtime_stream);
-        mfq::metal::drain_metal_work(runtime_stream);
+        tyloi::metal::ops::drain(runtime_stream);
 
         const auto previous_context = *loaded_context;
         session_cache->clear_live_sessions();
@@ -2245,7 +2245,7 @@ public:
         case Kind::clear: {
             mlx::core::set_default_device(mlx::core::Device::gpu);
             mlx::core::set_default_stream(runtime_stream);
-            mfq::metal::drain_metal_work(runtime_stream);
+            tyloi::metal::ops::drain(runtime_stream);
             const auto released = session_cache->clear();
             if (runtime_holder->has_value()) {
                 if constexpr (requires(Runtime& value) { value.clear_mtp_sessions(); })
@@ -2350,7 +2350,7 @@ private:
             if (room == std::numeric_limits<std::size_t>::max())
                 room = runtime.ssd_expert_payload_bytes() ? runtime.ssd_expert_payload_bytes() : runtime.resident_full_expert_bytes();
             if (room != std::numeric_limits<std::size_t>::max()) {
-                mfq::metal::drain_metal_work(runtime_stream);
+                tyloi::metal::ops::drain(runtime_stream);
                 const auto active = mlx::core::get_active_memory();
                 const auto full = runtime.resident_full_expert_bytes();
                 runtime.set_expert_cache_limit(room);
@@ -2398,7 +2398,7 @@ private:
             throw mfq::metal::MlxResidentBudgetExceeded("resident memory budget cannot accommodate this allocation");
         const auto target = budget - allocation;
         if (used() <= target) return;
-        mfq::metal::drain_metal_work(runtime_stream);
+        tyloi::metal::ops::drain(runtime_stream);
         const auto clear_allocator_excess = [&] {
             if (mlx::core::get_cache_memory() > reserve) mlx::core::clear_cache();
         };

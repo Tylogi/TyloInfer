@@ -3,7 +3,6 @@
 #include "engine/generation/batch.h"
 #include "mlx_qwen4_causal_lm.h"
 #include "mlx_resident_budget.h"
-#include "mlx_stream_sync.h"
 #include "engine/generation/mtp/batch_policy.h"
 
 #include <chrono>

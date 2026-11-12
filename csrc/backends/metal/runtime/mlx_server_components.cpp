@@ -1,5 +1,5 @@
 #include "mlx_server_components.h"
-#include "mlx_stream_sync.h"
+#include "engine/backends/metal/ops/execution.h"
 
 #include <chrono>
 #include <cstdint>
@@ -344,7 +344,7 @@ MlxEngineComponents make_mlx_engine_components(
             mlx::core::set_default_device(mlx::core::Device::gpu);
             mlx::core::set_default_stream(runtime_stream);
             auto& runtime = runtime_holder->value();
-            drain_metal_work(runtime_stream);
+            tyloi::metal::ops::drain(runtime_stream);
             runtime.reset();
             mlx::core::clear_cache();
 
@@ -506,7 +506,7 @@ MlxEngineComponents make_mlx_engine_components(
             if (!runtime_holder->has_value()) return;
             mlx::core::set_default_device(mlx::core::Device::gpu);
             mlx::core::set_default_stream(runtime_stream);
-            drain_metal_work(runtime_stream);
+            tyloi::metal::ops::drain(runtime_stream);
             runtime_holder->value().reset();
             mlx::core::clear_cache();
             malloc_zone_pressure_relief(nullptr, 0);
