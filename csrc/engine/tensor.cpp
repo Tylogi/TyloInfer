@@ -34,12 +34,6 @@ std::size_t normalize_dimension(std::int64_t dimension, std::size_t rank, bool a
 
 }  // namespace
 
-const TensorImpl& Tensor::reference() const noexcept {
-    if (impl_) return *impl_;
-    static const DenseTensor undefined;
-    return undefined;
-}
-
 const DenseTensor& Tensor::dense() const {
     const auto* value = dynamic_cast<const DenseTensor*>(impl_.get());
     if (!value) throw std::invalid_argument("operation requires a dense tensor");
@@ -51,14 +45,6 @@ DenseTensor& Tensor::dense() {
     if (!value) throw std::invalid_argument("operation requires a dense tensor");
     return *value;
 }
-
-std::vector<std::shared_ptr<TensorStorage>> TensorImpl::backings() const {
-    std::vector<std::shared_ptr<TensorStorage>> result;
-    for (const auto* buffer : buffers())
-        if (buffer && buffer->defined()) result.push_back(buffer->storage());
-    return result;
-}
-
 
 std::shared_ptr<TensorImpl> DenseTensor::relocated(Device target) const {
     return defined() && device() != target

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "mfq_container.h"
+#include "engine/tensor.h"
 #include "mlx_grouped_linear.h"
 #include "mlx_mx.h"
 #include "mlx_tq.h"
@@ -103,7 +104,7 @@ public:
         return output_size_;
     }
     bool packed() const noexcept {
-        return !std::holds_alternative<mlx::core::array>(weight_);
+        return !std::holds_alternative<tyloi::Tensor>(weight_);
     }
     std::optional<MlxGroupedLinearWeightRef>
     grouped_weight_ref() const noexcept;
@@ -132,7 +133,7 @@ private:
         MlxTqWeight,
         MlxGgufWeight,
         MlxAffineWeight,
-        mlx::core::array> weight_;
+        tyloi::Tensor> weight_;
     int input_size_ = 0;
     int output_size_ = 0;
 };
@@ -237,7 +238,7 @@ private:
         MlxTqWeight,
         MlxGgufWeight,
         MlxAffineWeight,
-        mlx::core::array> weight_;
+        tyloi::Tensor> weight_;
     int vocabulary_size_ = 0;
     int hidden_size_ = 0;
     std::optional<mlx::core::Dtype> activation_dtype_;

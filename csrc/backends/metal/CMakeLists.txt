@@ -336,6 +336,7 @@ add_library(mfq-metal-runtime STATIC
     ${PROJECT_SOURCE_DIR}/engine/backends/metal/native/stream.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/metal/native/memory.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/metal/native/resident_allocations.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/metal/native/tensor/tensor.cpp
     storage/hf_safetensors_store.cpp
     storage/mfq_container.cpp
     storage/mfe_expert_store.cpp

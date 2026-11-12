@@ -36,6 +36,7 @@ enum class ScalarType : std::uint8_t {
 enum class DeviceType : std::uint8_t {
     cpu,
     cuda,
+    metal,
 };
 
 inline constexpr std::size_t kMaximumTensorRank = 8;
@@ -71,6 +72,7 @@ struct Device {
 
     constexpr bool is_cpu() const noexcept { return type == DeviceType::cpu; }
     constexpr bool is_cuda() const noexcept { return type == DeviceType::cuda; }
+    constexpr bool is_metal() const noexcept { return type == DeviceType::metal; }
     constexpr bool operator==(const Device&) const noexcept = default;
 };
 
@@ -368,8 +370,8 @@ private:
 };
 
 inline std::ostream& operator<<(std::ostream& stream, const Device& device) {
-    stream << (device.is_cuda() ? "cuda" : "cpu");
-    if (device.is_cuda() || device.index != 0) stream << ':' << device.index;
+    stream << (device.is_cuda() ? "cuda" : device.is_metal() ? "metal" : "cpu");
+    if (device.is_cuda() || device.is_metal() || device.index != 0) stream << ':' << device.index;
     return stream;
 }
 
@@ -454,9 +456,9 @@ public:
     virtual const Device& device() const noexcept = 0;
     virtual bool is_contiguous() const noexcept = 0;
     virtual bool is_encoded() const noexcept = 0;
-    // Every buffer this representation requires, in declaration order: values,
-    // scales, codebooks, packed payloads. An undefined entry means the weight
-    // is not prepared. Callers deduplicate by storage identity.
+    // Directly enumerable dense buffers, in declaration order: values, scales,
+    // codebooks, packed payloads. An undefined entry means a field is not prepared.
+    // Opaque or lazy representations may expose no dense buffers.
     //
     // View and cast rules: an encoded representation has no dense view of the
     // values it stands for, so reshape/narrow/cast never apply to it. buffers()
@@ -467,8 +469,9 @@ public:
     virtual std::vector<const DenseTensor*> buffers() const = 0;
     virtual void record_stream(std::uintptr_t stream, std::shared_ptr<void> lifetime = {}) const = 0;
 
-    // Backing buffers that exist, derived from buffers().
-    std::vector<std::shared_ptr<TensorStorage>> backings() const;
+    // Physical backings that currently exist; empty does not imply undefined.
+    // The default derives them from dense buffers; opaque representations may override.
+    virtual std::vector<std::shared_ptr<TensorStorage>> backings() const;
 
     // A copy of this representation with every buffer resident on `device`,
     // keeping the encoding. Weight preparation uses this; a published weight
@@ -479,6 +482,7 @@ public:
     int get_device() const noexcept { return device().index; }
     bool is_cpu() const noexcept { return defined() && device().is_cpu(); }
     bool is_cuda() const noexcept { return defined() && device().is_cuda(); }
+    bool is_metal() const noexcept { return defined() && device().is_metal(); }
     std::size_t element_size() const noexcept { return scalar_size(scalar_type()); }
     TensorOptions options() const noexcept {
         const auto storages = backings();
@@ -751,6 +755,13 @@ private:
     std::size_t byte_offset_ = 0;
 };
 
+inline std::vector<std::shared_ptr<TensorStorage>> TensorImpl::backings() const {
+    std::vector<std::shared_ptr<TensorStorage>> result;
+    for (const auto* buffer : buffers())
+        if (buffer && buffer->defined()) result.push_back(buffer->storage());
+    return result;
+}
+
 // Public data currency for models, state and ops: a copyable handle over a
 // polymorphic representation. Copying a handle shares the implementation and
 // its backing, never the data. Callers never dereference or unwrap it.
@@ -793,32 +804,38 @@ public:
     }
     const std::shared_ptr<TensorImpl>& implementation() const noexcept { return impl_; }
 
-    std::int64_t dim() const noexcept { return reference().dim(); }
-    std::int64_t numel() const { return reference().numel(); }
-    std::size_t nbytes() const { return reference().nbytes(); }
-    std::size_t backing_nbytes() const { return reference().backing_nbytes(); }
-    std::int64_t size(std::int64_t dimension) const { return reference().size(dimension); }
-    ScalarType scalar_type() const noexcept { return reference().scalar_type(); }
-    const Device& device() const noexcept { return reference().device(); }
-    bool is_contiguous() const noexcept { return reference().is_contiguous(); }
-    bool is_encoded() const noexcept { return reference().is_encoded(); }
-    std::vector<const DenseTensor*> buffers() const { return reference().buffers(); }
-    std::vector<std::shared_ptr<TensorStorage>> backings() const { return reference().backings(); }
-    void record_stream(std::uintptr_t stream, std::shared_ptr<void> lifetime = {}) const { reference().record_stream(stream, lifetime); }
-    Tensor relocated(Device device) const { return Tensor{reference().relocated(device)}; }
+    std::int64_t dim() const noexcept { return impl_ ? impl_->dim() : 0; }
+    std::int64_t numel() const { return impl_ ? impl_->numel() : 0; }
+    std::size_t nbytes() const { return impl_ ? impl_->nbytes() : 0; }
+    std::size_t backing_nbytes() const { return impl_ ? impl_->backing_nbytes() : 0; }
+    std::int64_t size(std::int64_t dimension) const {
+        if (!impl_) throw std::out_of_range("tensor dimension is out of range");
+        return impl_->size(dimension);
+    }
+    ScalarType scalar_type() const noexcept { return impl_ ? impl_->scalar_type() : ScalarType::float32; }
+    const Device& device() const noexcept { return impl_ ? impl_->device() : empty_device_; }
+    bool is_contiguous() const noexcept { return impl_ && impl_->is_contiguous(); }
+    bool is_encoded() const noexcept { return impl_ && impl_->is_encoded(); }
+    std::vector<const DenseTensor*> buffers() const { return impl_ ? impl_->buffers() : std::vector<const DenseTensor*>{}; }
+    std::vector<std::shared_ptr<TensorStorage>> backings() const { return impl_ ? impl_->backings() : std::vector<std::shared_ptr<TensorStorage>>{}; }
+    void record_stream(std::uintptr_t stream, std::shared_ptr<void> lifetime = {}) const {
+        if (impl_) impl_->record_stream(stream, lifetime);
+    }
+    Tensor relocated(Device device) const { return impl_ ? Tensor{impl_->relocated(device)} : Tensor{}; }
 
-    ScalarType dtype() const noexcept { return reference().dtype(); }
-    int get_device() const noexcept { return reference().get_device(); }
-    bool is_cpu() const noexcept { return reference().is_cpu(); }
-    bool is_cuda() const noexcept { return reference().is_cuda(); }
-    std::size_t element_size() const noexcept { return reference().element_size(); }
-    TensorOptions options() const noexcept { return reference().options(); }
-    void require_dense() const { reference().require_dense(); }
+    ScalarType dtype() const noexcept { return scalar_type(); }
+    int get_device() const noexcept { return device().index; }
+    bool is_cpu() const noexcept { return defined() && device().is_cpu(); }
+    bool is_cuda() const noexcept { return defined() && device().is_cuda(); }
+    bool is_metal() const noexcept { return defined() && device().is_metal(); }
+    std::size_t element_size() const noexcept { return scalar_size(scalar_type()); }
+    TensorOptions options() const noexcept {
+        return impl_ ? impl_->options() : TensorOptions{}.dtype(scalar_type()).device(device()).pinned_memory(false);
+    }
+    void require_dense() const { if (impl_) impl_->require_dense(); }
 
 private:
-    // An empty handle reports the same metadata as an undefined DenseTensor.
-    const TensorImpl& reference() const noexcept;
-
+    inline static constexpr Device empty_device_{};
     std::shared_ptr<TensorImpl> impl_;
 };
 

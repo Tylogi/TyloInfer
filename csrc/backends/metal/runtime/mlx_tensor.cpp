@@ -4,6 +4,7 @@
 #include "mlx_reference.h"
 #include "mlx_transformer.h"
 #include "engine/backends/metal/native/resident_allocations.h"
+#include "engine/backends/metal/native/tensor/tensor.h"
 #include "mlx_gguf_staged.h"
 #include "../ops/gguf/native/mlx_native_gguf.h"
 
@@ -318,10 +319,11 @@ array materialize_weight_fp16(
     auto dense = std::visit(
         [&](const auto& value) -> array {
             using Weight = std::decay_t<decltype(value)>;
-            if constexpr (std::is_same_v<Weight, array>) {
-                return value.dtype() == mlx::core::float16
-                    ? value
-                    : mlx::core::astype(value, mlx::core::float16);
+            if constexpr (std::is_same_v<Weight, tyloi::Tensor>) {
+                const auto& dense = tyloi::metal::array(value);
+                return dense.dtype() == mlx::core::float16
+                    ? dense
+                    : mlx::core::astype(dense, mlx::core::float16);
             } else if constexpr (
                 std::is_same_v<Weight, MlxMxWeight>
             ) {
@@ -566,13 +568,13 @@ MlxLinear::MlxLinear(MlxMxWeight weight)
 
 
 MlxLinear::MlxLinear(array weight)
-    : weight_(std::move(weight)) {
-    const auto& dense = std::get<array>(weight_);
-    if (dense.ndim() != 2) {
+    : weight_(tyloi::metal::tensor(std::move(weight))) {
+    const auto& dense = std::get<tyloi::Tensor>(weight_);
+    if (dense.dim() != 2) {
         throw std::runtime_error("dense linear weight must have rank two");
     }
-    output_size_ = dense.shape(0);
-    input_size_ = dense.shape(1);
+    output_size_ = dense.size(0);
+    input_size_ = dense.size(1);
 }
 
 std::optional<array> MlxLinear::greedy_argmax(
@@ -612,7 +614,7 @@ array MlxLinear::operator()(const array& input) const {
     if (const auto* packed = std::get_if<MlxMxWeight>(&weight_)) {
         return preserve_input_dtype(packed->matmul(input));
     }
-    const auto& dense = std::get<array>(weight_);
+    const auto& dense = tyloi::metal::array(std::get<tyloi::Tensor>(weight_));
     auto source = input;
     if (source.dtype() != dense.dtype()) {
         source = mlx::core::astype(source, dense.dtype());
@@ -725,8 +727,9 @@ array MlxLinear::grouped_row_matmul(
             input,
             group_count);
     }
-    if (const auto* dense =
-            std::get_if<array>(&weight_)) {
+    if (const auto* weight =
+            std::get_if<tyloi::Tensor>(&weight_)) {
+        const auto* dense = &tyloi::metal::array(*weight);
         auto source = input;
         if (source.dtype() != dense->dtype()) {
             source = mlx::core::astype(
@@ -867,8 +870,8 @@ MlxLinear::grouped_weight_ref() const noexcept {
         return MlxGroupedLinearWeightRef{packed};
     }
     if (const auto* dense =
-            std::get_if<array>(&weight_)) {
-        return MlxGroupedLinearWeightRef{dense};
+            std::get_if<tyloi::Tensor>(&weight_)) {
+        return MlxGroupedLinearWeightRef{&tyloi::metal::array(*dense)};
     }
     return std::nullopt;
 }
@@ -901,17 +904,18 @@ void MlxLinear::prepare_grouped_gguf() {
 }
 
 const array* MlxLinear::dense_weight_ref() const noexcept {
-    return std::get_if<array>(&weight_);
+    const auto* dense = std::get_if<tyloi::Tensor>(&weight_);
+    return dense ? &tyloi::metal::array(*dense) : nullptr;
 }
 
 void MlxLinear::materialize_fp16() {
     if (std::holds_alternative<MlxAffineWeight>(weight_)) return;
     if (std::holds_alternative<MlxGgufWeight>(weight_)) return;
     if (std::holds_alternative<MlxTqWeight>(weight_)) return;
-    if (const auto* dense = std::get_if<array>(&weight_);
-        dense && (!g_fp16_weight_scopes || dense->dtype() == mlx::core::float16)) return;
+    if (const auto* dense = std::get_if<tyloi::Tensor>(&weight_);
+        dense && (!g_fp16_weight_scopes || tyloi::metal::array(*dense).dtype() == mlx::core::float16)) return;
     auto dense = materialize_weight_fp16(weight_, output_size_);
-    weight_ = std::move(dense);
+    weight_ = tyloi::metal::tensor(std::move(dense));
 }
 
 std::optional<MlxGroupedLinear> mlx_group_linears(
@@ -1345,23 +1349,23 @@ MlxEmbedding::MlxEmbedding(MlxMxWeight weight)
       weight_(std::move(weight)) {}
 
 MlxEmbedding::MlxEmbedding(array weight)
-    : weight_(std::move(weight)) {
-    const auto& dense = std::get<array>(weight_);
-    if (dense.ndim() != 2) {
+    : weight_(tyloi::metal::tensor(std::move(weight))) {
+    const auto& dense = std::get<tyloi::Tensor>(weight_);
+    if (dense.dim() != 2) {
         throw std::runtime_error("dense embedding weight must have rank two");
     }
-    vocabulary_size_ = dense.shape(0);
-    hidden_size_ = dense.shape(1);
+    vocabulary_size_ = dense.size(0);
+    hidden_size_ = dense.size(1);
 }
 
 void MlxEmbedding::materialize_fp16() {
     if (std::holds_alternative<MlxAffineWeight>(weight_)) return;
     if (std::holds_alternative<MlxGgufWeight>(weight_)) return;
     if (std::holds_alternative<MlxTqWeight>(weight_)) return;
-    if (const auto* dense = std::get_if<array>(&weight_);
-        dense && (!g_fp16_weight_scopes || dense->dtype() == mlx::core::float16)) return;
+    if (const auto* dense = std::get_if<tyloi::Tensor>(&weight_);
+        dense && (!g_fp16_weight_scopes || tyloi::metal::array(*dense).dtype() == mlx::core::float16)) return;
     auto dense = materialize_weight_fp16(weight_, vocabulary_size_);
-    weight_ = std::move(dense);
+    weight_ = tyloi::metal::tensor(std::move(dense));
 }
 
 Dtype MlxEmbedding::preferred_activation_dtype() const noexcept {
@@ -1422,7 +1426,7 @@ array MlxEmbedding::operator()(
         ids = mlx::core::astype(ids, mlx::core::int32);
     }
     auto result = mlx::core::take(
-        std::get<array>(weight_),
+        tyloi::metal::array(std::get<tyloi::Tensor>(weight_)),
         ids,
         0);
     return result.dtype() == dtype
@@ -1454,7 +1458,7 @@ array MlxEmbedding::project(const array& input) const {
     if (const auto* packed = std::get_if<MlxMxWeight>(&weight_)) {
         return packed->matmul(input);
     }
-    const auto& dense = std::get<array>(weight_);
+    const auto& dense = tyloi::metal::array(std::get<tyloi::Tensor>(weight_));
     auto source = input;
     if (source.dtype() != dense.dtype()) {
         source = mlx::core::astype(source, dense.dtype());
