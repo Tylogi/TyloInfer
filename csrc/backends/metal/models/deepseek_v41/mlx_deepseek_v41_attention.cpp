@@ -3,7 +3,8 @@
 #include "mlx_dsa.h"
 #include "mlx_dsa_cache_ops.h"
 #include "mlx_csa2.h"
-#include "mlx_detached_copy.h"
+#include "engine/backends/metal/ops/tensor.h"
+#include "engine/backends/metal/native/tensor/tensor.h"
 #include "mlx_mx.h"
 #include "mlx_sparse_attention.h"
 #include "mlx_transformer.h"
@@ -465,11 +466,13 @@ MlxDeepseekV41AttentionState::snapshot(bool copy_arrays) const {
     }
     const auto copy_optional = [copy_arrays](const std::optional<array>& value) {
         return value
-            ? std::optional<array>(copy_arrays ? detached_copy(*value) : *value)
+            ? std::optional<array>(copy_arrays ? mlx::core::array(tyloi::metal::array(
+                tyloi::metal::ops::clone(tyloi::metal::tensor(*value)))) : *value)
             : std::nullopt;
     };
     MlxDeepseekV41AttentionState result;
-    result.local_kv = copy_arrays ? detached_copy(local_kv) : local_kv;
+    result.local_kv = copy_arrays ? mlx::core::array(tyloi::metal::array(
+        tyloi::metal::ops::clone(tyloi::metal::tensor(local_kv)))) : local_kv;
     result.compressed_kv = copy_optional(compressed_kv);
     result.index_k = copy_optional(index_k);
     result.partial_kv = copy_optional(partial_kv);
@@ -683,10 +686,12 @@ std::vector<array> MlxDeepseekV41Attention::begin_speculative(
     std::optional<array> partial_kv_backup;
     std::optional<array> partial_score_backup;
     if (state.partial_kv) {
-        partial_kv_backup = detached_copy(*state.partial_kv);
+        partial_kv_backup = mlx::core::array(tyloi::metal::array(
+            tyloi::metal::ops::clone(tyloi::metal::tensor(*state.partial_kv))));
     }
     if (state.partial_score) {
-        partial_score_backup = detached_copy(*state.partial_score);
+        partial_score_backup = mlx::core::array(tyloi::metal::array(
+            tyloi::metal::ops::clone(tyloi::metal::tensor(*state.partial_score))));
     }
     state.speculation = std::make_shared<
         MlxDeepseekV41AttentionSpeculation>(

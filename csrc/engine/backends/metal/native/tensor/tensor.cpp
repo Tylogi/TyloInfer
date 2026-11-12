@@ -88,6 +88,25 @@ private:
 
 }  // namespace
 
+mlx::core::Dtype dtype(ScalarType type) {
+    namespace mx = mlx::core;
+    switch (type) {
+        case ScalarType::boolean: return mx::bool_;
+        case ScalarType::uint8: return mx::uint8;
+        case ScalarType::uint16: return mx::uint16;
+        case ScalarType::uint32: return mx::uint32;
+        case ScalarType::uint64: return mx::uint64;
+        case ScalarType::int8: return mx::int8;
+        case ScalarType::int16: return mx::int16;
+        case ScalarType::int32: return mx::int32;
+        case ScalarType::int64: return mx::int64;
+        case ScalarType::float16: return mx::float16;
+        case ScalarType::bfloat16: return mx::bfloat16;
+        case ScalarType::float32: return mx::float32;
+        default: throw std::invalid_argument("unsupported Metal tensor dtype");
+    }
+}
+
 tyloi::Tensor tensor(mlx::core::array value) {
     return tyloi::Tensor{std::make_shared<Array>(std::move(value))};
 }

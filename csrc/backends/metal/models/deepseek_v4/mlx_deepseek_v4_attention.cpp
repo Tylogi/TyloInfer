@@ -1,7 +1,8 @@
 #include "mlx_deepseek_v4_attention.h"
 #include "engine/backends/metal/native/profile.h"
 
-#include "mlx_detached_copy.h"
+#include "engine/backends/metal/ops/tensor.h"
+#include "engine/backends/metal/native/tensor/tensor.h"
 #include "mlx_grouped_linear.h"
 #include "mlx_transformer.h"
 
@@ -846,7 +847,8 @@ MlxDeepseekV4PoolState::snapshot() const {
         const std::optional<array>& value)
         -> std::optional<array> {
         return value
-            ? std::optional<array>(detached_copy(*value))
+            ? std::optional<array>(mlx::core::array(tyloi::metal::array(
+                tyloi::metal::ops::clone(tyloi::metal::tensor(*value)))))
             : std::nullopt;
     };
     MlxDeepseekV4PoolState result(
@@ -860,8 +862,10 @@ MlxDeepseekV4PoolState::snapshot() const {
         // Retaining the fixed-capacity pool here would pin one context-sized
         // allocation per historical session snapshot after reset_cache().
         mlx::core::array(0.0f),
-        detached_copy(state_kv_),
-        detached_copy(state_gate_),
+        mlx::core::array(tyloi::metal::array(
+            tyloi::metal::ops::clone(tyloi::metal::tensor(state_kv_)))),
+        mlx::core::array(tyloi::metal::array(
+            tyloi::metal::ops::clone(tyloi::metal::tensor(state_gate_)))),
         copy_optional(prev_kv_),
         copy_optional(prev_gate_));
     result.pool_len_ = pool_len_;
@@ -870,7 +874,8 @@ MlxDeepseekV4PoolState::snapshot() const {
         const auto& visible_pool = pool_prefix_backup_
             ? *pool_prefix_backup_
             : pool_prefix(*this);
-        result.pool_prefix_backup_ = detached_copy(visible_pool);
+        result.pool_prefix_backup_ = mlx::core::array(tyloi::metal::array(
+            tyloi::metal::ops::clone(tyloi::metal::tensor(visible_pool))));
     }
     return result;
 }
@@ -1242,7 +1247,8 @@ struct MlxDeepseekV4LayerSpeculation {
 MlxDeepseekV4LayerState
 MlxDeepseekV4LayerState::snapshot() const {
     MlxDeepseekV4LayerState result(
-        detached_copy(local_),
+        mlx::core::array(tyloi::metal::array(
+            tyloi::metal::ops::clone(tyloi::metal::tensor(local_)))),
         main_
             ? std::optional<MlxDeepseekV4PoolState>(
                   main_->snapshot())

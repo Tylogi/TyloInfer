@@ -1,6 +1,7 @@
 #include "mlx_deepseek_v4_dspark.h"
 
-#include "mlx_detached_copy.h"
+#include "engine/backends/metal/ops/tensor.h"
+#include "engine/backends/metal/native/tensor/tensor.h"
 #include "mlx_deepseek_v4_attention.h"
 #include "mlx_deepseek_v4_hc.h"
 #include "mlx_dsa.h"
@@ -330,7 +331,8 @@ const array& MlxDeepseekV4DSparkState::ring(std::size_t stage) const {
 MlxDeepseekV4DSparkState MlxDeepseekV4DSparkState::snapshot() const {
     std::vector<array> rings;
     rings.reserve(rings_.size());
-    for (const auto& ring : rings_) rings.push_back(detached_copy(ring));
+    for (const auto& ring : rings_) rings.push_back(mlx::core::array(tyloi::metal::array(
+        tyloi::metal::ops::clone(tyloi::metal::tensor(ring)))));
     return MlxDeepseekV4DSparkState(std::move(rings), position_);
 }
 

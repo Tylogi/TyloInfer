@@ -1,6 +1,7 @@
 #include "mlx_qwen35_linear_attention.h"
 
-#include "mlx_detached_copy.h"
+#include "engine/backends/metal/ops/tensor.h"
+#include "engine/backends/metal/native/tensor/tensor.h"
 #include "mlx_gguf.h"
 #include "engine/backends/metal/native/profile.h"
 #include "mlx_kernel_prepare.h"
@@ -498,8 +499,10 @@ MlxQwen35LinearAttentionBlock::snapshot_cache(bool detached) const {
         throw std::runtime_error(
             "Qwen3.5 linear-attention cache is unavailable");
     }
-    auto convolution = detached ? detached_copy(*convolution_state_) : *convolution_state_;
-    auto recurrent = detached ? detached_copy(*recurrent_state_) : *recurrent_state_;
+    auto convolution = detached ? mlx::core::array(tyloi::metal::array(
+        tyloi::metal::ops::clone(tyloi::metal::tensor(*convolution_state_)))) : *convolution_state_;
+    auto recurrent = detached ? mlx::core::array(tyloi::metal::array(
+        tyloi::metal::ops::clone(tyloi::metal::tensor(*recurrent_state_)))) : *recurrent_state_;
     if (detached) mlx::core::eval(convolution, recurrent);
     return {
         std::move(convolution),
@@ -526,8 +529,10 @@ void MlxQwen35LinearAttentionBlock::restore_cache(
         throw std::runtime_error(
             "Qwen3.5 linear-attention cache snapshot topology mismatch");
     }
-    auto convolution = detached ? detached_copy(snapshot.convolution_state) : snapshot.convolution_state;
-    auto recurrent = detached ? detached_copy(snapshot.recurrent_state) : snapshot.recurrent_state;
+    auto convolution = detached ? mlx::core::array(tyloi::metal::array(
+        tyloi::metal::ops::clone(tyloi::metal::tensor(snapshot.convolution_state)))) : snapshot.convolution_state;
+    auto recurrent = detached ? mlx::core::array(tyloi::metal::array(
+        tyloi::metal::ops::clone(tyloi::metal::tensor(snapshot.recurrent_state)))) : snapshot.recurrent_state;
     if (detached) mlx::core::eval(convolution, recurrent);
     convolution_state_ = std::move(convolution);
     recurrent_state_ = std::move(recurrent);

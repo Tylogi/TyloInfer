@@ -5,7 +5,8 @@
 #include "mlx_float_rows.h"
 
 #include "engine/backends/metal/native/profile.h"
-#include "mlx_detached_copy.h"
+#include "engine/backends/metal/ops/tensor.h"
+#include "engine/backends/metal/native/tensor/tensor.h"
 #include "qwen4_ops.h"
 #include "mlx_legacy_tensor_compat.h"
 #include "mlx_linear_attention.h"
@@ -2271,7 +2272,8 @@ public:
     }
     void snapshot(MlxQwen4LayerCacheSnapshot& state) const {
         if (!convolution_state_ || rollback_) throw std::runtime_error("PLE checkpoint is not committed");
-        state.ple_convolution = detached_copy(*convolution_state_);
+        state.ple_convolution = mlx::core::array(tyloi::metal::array(
+            tyloi::metal::ops::clone(tyloi::metal::tensor(*convolution_state_))));
         state.ple_convolution->eval();
         state.ple_context = embedding_.context();
     }
@@ -2285,7 +2287,8 @@ public:
             state.ple_convolution->dtype() != mlx::core::float32)
             throw std::runtime_error("PLE checkpoint topology mismatch");
         reset(state.batch);
-        convolution_state_ = detached_copy(*state.ple_convolution);
+        convolution_state_ = mlx::core::array(tyloi::metal::array(
+            tyloi::metal::ops::clone(tyloi::metal::tensor(*state.ple_convolution))));
         convolution_state_->eval();
         embedding_.restore_context(state.ple_context);
         resources_.set({cache_bytes(), static_cast<std::size_t>(batch_)});
@@ -2769,8 +2772,10 @@ public:
         MlxQwen4LayerCacheSnapshot state;
         state.position = position_;
         state.batch = batch_;
-        state.convolution = detached_copy(*convolution_state_);
-        state.recurrent = detached_copy(*recurrent_state_);
+        state.convolution = mlx::core::array(tyloi::metal::array(
+            tyloi::metal::ops::clone(tyloi::metal::tensor(*convolution_state_))));
+        state.recurrent = mlx::core::array(tyloi::metal::array(
+            tyloi::metal::ops::clone(tyloi::metal::tensor(*recurrent_state_))));
         mlx::core::eval(*state.convolution, *state.recurrent);
         return state;
     }
@@ -2786,8 +2791,10 @@ public:
                 static_cast<int>(config_.linear_value_head_dim)} ||
             state.convolution->dtype() != mlx::core::float32 || state.recurrent->dtype() != mlx::core::float32)
             throw std::runtime_error("GDN checkpoint topology mismatch");
-        convolution_state_ = detached_copy(*state.convolution);
-        recurrent_state_ = detached_copy(*state.recurrent);
+        convolution_state_ = mlx::core::array(tyloi::metal::array(
+            tyloi::metal::ops::clone(tyloi::metal::tensor(*state.convolution))));
+        recurrent_state_ = mlx::core::array(tyloi::metal::array(
+            tyloi::metal::ops::clone(tyloi::metal::tensor(*state.recurrent))));
         mlx::core::eval(*convolution_state_, *recurrent_state_);
         batch_ = state.batch;
         position_ = state.position;
@@ -3430,14 +3437,16 @@ public:
         state.batch = batch_;
         state.index_start = index_tail_start_;
         state.index_ratio = static_cast<int>(config_.indexer_compress_ratio);
-        state.index_keys = detached ? detached_copy(*index_tail_) : *index_tail_;
+        state.index_keys = detached ? mlx::core::array(tyloi::metal::array(
+            tyloi::metal::ops::clone(tyloi::metal::tensor(*index_tail_)))) : *index_tail_;
         if (offloaded_kv_) {
             state.offloaded_kv = offloaded_kv_->snapshot();
             if (offloaded_pool_->position()) state.offloaded_pooled_keys = offloaded_pool_->snapshot();
         } else {
             state.kv = cache_->snapshot(detached);
             if (pooled_index_cache_.position() > 0)
-                state.pooled_keys = detached ? detached_copy(pooled_index_cache_.view()) : pooled_index_cache_.view();
+                state.pooled_keys = detached ? mlx::core::array(tyloi::metal::array(
+                    tyloi::metal::ops::clone(tyloi::metal::tensor(pooled_index_cache_.view())))) : pooled_index_cache_.view();
         }
         if (state.index_keys) state.index_keys->eval();
         if (state.pooled_keys) state.pooled_keys->eval();
@@ -3463,7 +3472,8 @@ public:
             (pooled && !state.pooled_keys && !state.offloaded_pooled_keys))
             throw std::runtime_error("QSA checkpoint topology mismatch");
         reset(state.batch);
-        index_tail_ = detached_copy(*state.index_keys);
+        index_tail_ = mlx::core::array(tyloi::metal::array(
+            tyloi::metal::ops::clone(tyloi::metal::tensor(*state.index_keys))));
         index_tail_start_ = state.index_start;
         index_position_ = state.position;
         index_resources_.set({index_tail_->nbytes() + index_tail_->dtype().size(), static_cast<std::size_t>(state.batch)});
@@ -3903,8 +3913,10 @@ private:
             else pooled_index_cache_.append(pooled);
         }
         const int keep = std::max(index_tail_start_, std::max(0, end - MlxQwen4CausalLm::maximum_verification_rows) / ratio * ratio);
-        index_tail_ = detached_copy(mlx::core::slice(raw, Shape{0, keep - index_tail_start_, 0},
-            Shape{keys.shape(0), raw.shape(1), keys.shape(2)}));
+        index_tail_ = mlx::core::array(tyloi::metal::array(
+            tyloi::metal::ops::clone(tyloi::metal::tensor(mlx::core::slice(
+                raw, Shape{0, keep - index_tail_start_, 0},
+                Shape{keys.shape(0), raw.shape(1), keys.shape(2)})))));
         index_tail_start_ = keep;
         index_position_ = end;
         index_resources_.set({index_tail_->nbytes() + index_tail_->dtype().size(), static_cast<std::size_t>(keys.shape(0))});
@@ -3913,8 +3925,10 @@ private:
         if (position < index_tail_start_ || position > index_position_)
             throw std::runtime_error("QSA rollback exceeds the uncommitted index tail");
         if (position == 0) index_tail_.reset();
-        else index_tail_ = detached_copy(mlx::core::slice(*index_tail_, Shape{0, 0, 0},
-            Shape{batch_, position - index_tail_start_, static_cast<int>(config_.indexer_head_dim)}));
+        else index_tail_ = mlx::core::array(tyloi::metal::array(
+            tyloi::metal::ops::clone(tyloi::metal::tensor(mlx::core::slice(
+                *index_tail_, Shape{0, 0, 0},
+                Shape{batch_, position - index_tail_start_, static_cast<int>(config_.indexer_head_dim)})))));
         index_position_ = position;
         index_resources_.set({index_tail_ ? index_tail_->nbytes() + index_tail_->dtype().size() : 0,
             index_tail_ ? static_cast<std::size_t>(batch_) : 0});
@@ -4586,8 +4600,10 @@ public:
             }
             if (position < state.index_start)
                 throw std::runtime_error("MTP checkpoint exceeds the uncommitted index tail");
-            state.index_keys = detached_copy(mlx::core::slice(*state.index_keys, Shape{0, 0, 0},
-                Shape{state.batch, position - state.index_start, state.index_keys->shape(2)}));
+            state.index_keys = mlx::core::array(tyloi::metal::array(
+                tyloi::metal::ops::clone(tyloi::metal::tensor(mlx::core::slice(
+                    *state.index_keys, Shape{0, 0, 0},
+                    Shape{state.batch, position - state.index_start, state.index_keys->shape(2)})))));
             const int pooled = position / static_cast<int>(config_.indexer_compress_ratio);
             if (state.offloaded_pooled_keys) {
                 if (!pooled) state.offloaded_pooled_keys.reset();

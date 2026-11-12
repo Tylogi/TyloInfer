@@ -1,6 +1,7 @@
 #include "mlx_nemotron_h_linear_attention.h"
 
-#include "mlx_detached_copy.h"
+#include "engine/backends/metal/ops/tensor.h"
+#include "engine/backends/metal/native/tensor/tensor.h"
 #include "mlx_linear_attention.h"
 #include "mlx_nemotron_h_ops.h"
 
@@ -202,8 +203,10 @@ MlxNemotronHRecurrentSnapshot MlxNemotronHLinearAttentionBlock::snapshot_cache()
         throw std::runtime_error(
             "Nemotron-H mamba cache is unavailable");
     }
-    auto convolution = detached_copy(*convolution_state_);
-    auto recurrent = detached_copy(*recurrent_state_);
+    auto convolution = mlx::core::array(tyloi::metal::array(
+        tyloi::metal::ops::clone(tyloi::metal::tensor(*convolution_state_))));
+    auto recurrent = mlx::core::array(tyloi::metal::array(
+        tyloi::metal::ops::clone(tyloi::metal::tensor(*recurrent_state_))));
     mlx::core::eval(convolution, recurrent);
     return {std::move(convolution), std::move(recurrent), cache_position_, cache_batch_};
 }
@@ -225,8 +228,10 @@ void MlxNemotronHLinearAttentionBlock::restore_cache(
         throw std::runtime_error(
             "Nemotron-H mamba cache snapshot topology mismatch");
     }
-    convolution_state_ = detached_copy(snapshot.convolution_state);
-    recurrent_state_ = detached_copy(snapshot.recurrent_state);
+    convolution_state_ = mlx::core::array(tyloi::metal::array(
+        tyloi::metal::ops::clone(tyloi::metal::tensor(snapshot.convolution_state))));
+    recurrent_state_ = mlx::core::array(tyloi::metal::array(
+        tyloi::metal::ops::clone(tyloi::metal::tensor(snapshot.recurrent_state))));
     mlx::core::eval(*convolution_state_, *recurrent_state_);
     cache_position_ = snapshot.position;
     cache_batch_ = snapshot.batch;

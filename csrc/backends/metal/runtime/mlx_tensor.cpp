@@ -5,6 +5,7 @@
 #include "mlx_transformer.h"
 #include "engine/backends/metal/native/resident_allocations.h"
 #include "engine/backends/metal/native/tensor/tensor.h"
+#include "engine/backends/metal/ops/tensor.h"
 #include "mlx_gguf_staged.h"
 #include "../ops/gguf/native/mlx_native_gguf.h"
 
@@ -320,10 +321,8 @@ array materialize_weight_fp16(
         [&](const auto& value) -> array {
             using Weight = std::decay_t<decltype(value)>;
             if constexpr (std::is_same_v<Weight, tyloi::Tensor>) {
-                const auto& dense = tyloi::metal::array(value);
-                return dense.dtype() == mlx::core::float16
-                    ? dense
-                    : mlx::core::astype(dense, mlx::core::float16);
+                return tyloi::metal::array(
+                    tyloi::metal::ops::cast(value, tyloi::ScalarType::float16));
             } else if constexpr (
                 std::is_same_v<Weight, MlxMxWeight>
             ) {

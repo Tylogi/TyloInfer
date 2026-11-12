@@ -2,7 +2,8 @@
 #include "mlx_resident_budget.h"
 #include "mlx_staged_attention.h"
 
-#include "mlx_detached_copy.h"
+#include "engine/backends/metal/ops/tensor.h"
+#include "engine/backends/metal/native/tensor/tensor.h"
 
 #include <algorithm>
 #include <bit>
@@ -895,8 +896,10 @@ MlxKvCacheSnapshot MlxKvCache::snapshot(bool detached) const {
             "cannot snapshot an empty or inconsistent KV cache");
     }
     auto visible = physical_view();
-    auto key = detached ? detached_copy(visible.first) : visible.first;
-    auto value = detached ? detached_copy(visible.second) : visible.second;
+    auto key = detached ? mlx::core::array(tyloi::metal::array(
+        tyloi::metal::ops::clone(tyloi::metal::tensor(visible.first)))) : visible.first;
+    auto value = detached ? mlx::core::array(tyloi::metal::array(
+        tyloi::metal::ops::clone(tyloi::metal::tensor(visible.second)))) : visible.second;
     mlx::core::eval(key, value);
     return MlxKvCacheSnapshot{
         batch_,
@@ -935,12 +938,14 @@ void MlxKvCache::restore_snapshot(
     auto value = mlx::core::zeros(Shape{batch_, heads_, snapshot.capacity, value_.shape(3)}, value_.dtype());
     key = mlx::core::slice_update(
         key,
-        detached_copy(snapshot.key),
+        mlx::core::array(tyloi::metal::array(
+            tyloi::metal::ops::clone(tyloi::metal::tensor(snapshot.key)))),
         Shape{0, 0, 0, 0},
         Shape{batch_, heads_, snapshot.position, key_.shape(3)});
     value = mlx::core::slice_update(
         value,
-        detached_copy(snapshot.value),
+        mlx::core::array(tyloi::metal::array(
+            tyloi::metal::ops::clone(tyloi::metal::tensor(snapshot.value)))),
         Shape{0, 0, 0, 0},
         Shape{batch_, heads_, snapshot.position, value_.shape(3)});
     mlx::core::eval(key, value);

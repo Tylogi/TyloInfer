@@ -9,5 +9,6 @@ namespace tyloi::metal {
 // Arrays stay lazy; borrowed references live as long as the Tensor representation.
 tyloi::Tensor tensor(mlx::core::array value);
 const mlx::core::array& array(const tyloi::Tensor& value);
+mlx::core::Dtype dtype(ScalarType type);
 
 }  // namespace tyloi::metal
