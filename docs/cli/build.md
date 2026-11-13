@@ -150,9 +150,9 @@ missing executable.
 
 `--dry-run` does not compile an executable or update the manifest.
 
-The public command is `tyloinfer`, not `mfq`. Native executable names such as
-`mfq-runtime` and `mfq-decode-metal`, and the manifest `mfq-runtime.json`, are
-retained internal names; do not rename them when following these instructions.
+The public CLI is `tyloinfer`. Native binaries (`mfq-runtime`,
+`mfq-decode-metal`) and the build manifest (`mfq-runtime.json`) retain their
+names.
 
 ## Backend requirements
 
@@ -175,9 +175,9 @@ uv run tyloinfer build
 - Linux with a ROCm/HIP toolchain and `hipcc`;
 - CMake 3.26 or newer and a C++ toolchain.
 
-Use `uv run tyloinfer build --backend hip`. This is not a claim of CUDA feature
-parity; consult the [known gaps](../runtime/support.md#amd-gpus-and-rocm-hip)
-before choosing a model.
+Use `uv run tyloinfer build --backend hip`. For model coverage and
+backend-specific settings, see the
+[support matrix](../runtime/support.md#amd-gpus-and-rocm-hip).
 
 ### CUDA
 

@@ -23,7 +23,7 @@ Apple Silicon uses Metal; NVIDIA GPUs use CUDA on Linux and Windows. ROCm suppor
 
 ## Performance
 
-These are previously reported measurements, not results revalidated by the current documentation update or a guarantee for your hardware. The tables do not yet link a complete reproduction record: the exact TyloInfer commit, model and companion revisions, commands, raw logs, repeat count, and summary statistic. Do not assume they describe the current checkout or establish a general ranking across engines. See the [benchmarking guide](docs/benchmarking.md) for configuration and evidence to record, including MTP/DFlash2 settings and cold/warm prefix-cache behavior.
+These are previously reported project measurements. Test conditions are listed with each table. See the [benchmarking guide](docs/benchmarking.md) for measurement steps and configuration records.
 
 Apple M5 Max · 40-core GPU · 128 GiB · GGUF IQ3_XXS · 4,096-token input. Speeds in tokens/s.
 
@@ -127,9 +127,7 @@ curl http://127.0.0.1:8090/v1/models
 curl -H "Content-Type: application/json" --data-binary "@request.json" http://127.0.0.1:8090/v1/chat/completions
 ```
 
-In PowerShell, use `curl.exe` instead of `curl`. A successful request returns HTTP 200 with `object: "chat.completion"` and an assistant message in `choices[0].message`; reasoning models may also return `reasoning_content`. An empty model list or a request error is not a successful inference check. See [first-request troubleshooting and authentication](docs/cli/serve.md#first-api-request).
-
-These examples were checked against the API implementation, but were not executed with a model during this documentation update. They are a service smoke test, not a reproduction of the performance tables.
+In PowerShell, use `curl.exe` instead of `curl`. A successful request returns HTTP 200 with `object: "chat.completion"` and an assistant message in `choices[0].message`; reasoning models may also return `reasoning_content`. See [first-request troubleshooting and authentication](docs/cli/serve.md#first-api-request).
 
 ### Connect your tools
 

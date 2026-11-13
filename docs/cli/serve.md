@@ -87,15 +87,11 @@ to the `/v1` requests; `/health` remains public. Do not paste real keys into
 shared logs or example files.
 
 Success means HTTP `200`, `object: "chat.completion"`, and an assistant message
-in `choices[0].message` with nonempty `content`. This smoke test is not a
-performance measurement. For API-loaded models, `202 Accepted` is only queue
-acceptance: inspect the operation through the jobs API and wait for the
-instance to become `ready` before testing. For `401` check the credential;
-for model-not-found check the exact ID and loaded instance; for `503` inspect
-worker startup/load logs and runtime state.
-
-These commands are based on the current API implementation. This documentation
-revision did not load a model or execute an end-to-end inference test.
+in `choices[0].message` with nonempty `content`. For API-loaded models,
+`202 Accepted` confirms the load job was queued: inspect the operation through
+the jobs API and wait for the instance to become `ready` before testing.
+For `401`, check the credential; for model-not-found, check the exact ID and
+loaded instance; for `503`, inspect worker startup/load logs and runtime state.
 
 ## How the native runtime is selected
 
@@ -324,9 +320,9 @@ unpinned models; instances may override it through the runtime API.
 
 ## Speculative decoding (MTP / DFlash2)
 
-Native MTP needs predictor weights compatible with the target graph; enabling
-MTP is not enough when those weights are absent. DFlash2 needs a matching draft
-checkpoint. The current CLI exposes these explicit companion controls for CUDA:
+Native MTP requires predictor weights compatible with the target graph;
+DFlash2 requires a matching draft checkpoint. The following CUDA examples
+configure the companion weights:
 
 ```shell
 # Native MTP companion for a CUDA GGUF target.
@@ -338,12 +334,10 @@ uv run tyloinfer serve --backend cuda --model /models/target.gguf \
   --dflash2-draft /models/matching-dflash2 --no-web-ui
 ```
 
-Replace all paths with compatible artifacts. These are configuration examples,
-not the missing exact recipes for the README performance table. The draft
-switches are mutually exclusive, the native companion must be an existing
-file, and the DFlash2 path must be an existing directory. Neither switch is a
-Metal companion-loading recipe; both explicitly require CUDA in this CLI.
-Do not infer that every architecture or backend supports every draft method.
+These companion-loading switches require CUDA and are mutually exclusive.
+Use an existing native MTP GGUF file or DFlash2 checkpoint directory compatible
+with the target model. See the [support matrix](../runtime/support.md) for model
+and backend coverage.
 
 | Option | Effect | Default |
 | --- | --- | --- |
@@ -363,11 +357,10 @@ baseline; `"enable_mtp": true` permits speculation and
 `"mtp_max_draft_tokens": 3` caps draft depth. Availability still depends on
 model weights, runtime support, and scheduling (see
 [continuous batching limits](../runtime/cuda-continuous-batching.md)). Inspect
-reported `mfq_metrics` such as `mtp_used` and `mtp_acceptance_rate` when present;
-do not assume the requested path actually ran. The metrics name is a retained
-wire-format identifier, not the public CLI name. See
-[performance recording and limitations](../benchmarking.md) before comparing
-speeds.
+`mfq_metrics` such as `mtp_used` and `mtp_acceptance_rate`, when present, to
+check which path ran. This response field retains its existing name. For
+measurement steps and configuration records, see the
+[performance measurement guide](../benchmarking.md).
 
 ## Command options
 

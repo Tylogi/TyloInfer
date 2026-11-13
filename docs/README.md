@@ -2,12 +2,9 @@
 
 TyloInfer provides TQ inference, CUDA/Metal runtimes, and local serving.
 
-These source-checkout guides describe the current public `tyloinfer` CLI.
-English references are complemented by a Chinese deployment guide; they are
-not a complete bilingual manual. Use documentation from the same Git revision
-as the installed code. Internal names such as `mfq-runtime`,
-`build/mfq-runtime.json`, `mfq_metrics`, and the `MFQ1` container magic remain
-valid; there is no public `mfq` command registered by this package.
+These guides cover the public `tyloinfer` CLI and APIs, with English references
+and a Chinese deployment guide. Use documentation from the same Git revision
+as the installed code.
 
 ## Get started
 
@@ -15,7 +12,7 @@ valid; there is no public `mfq` command registered by this package.
 - [Build the C++ runtime](cli/build.md)
 - [Run TyloInfer Server and Studio](cli/serve.md)
 - [Complete the first API request](cli/serve.md#first-api-request)
-- [Record performance and understand reproduction limits](benchmarking.md)
+- [Measure and record performance](benchmarking.md)
 - [Create a self-contained release](packaging.md)
 - [Check model and backend support](runtime/support.md)
 
@@ -31,11 +28,10 @@ valid; there is no public `mfq` command registered by this package.
 
 ## Documentation checks
 
-From the repository root, run `python3 -B scripts/check_docs.py`. This
-read-only standard-library check covers public command names, local Markdown
-links/anchors, JSON/JSONL examples, the HTTP API table against checked-in
-OpenAPI, and selected CLI defaults/options. It does not build the native
-runtime, launch the UI, validate external download links, or run inference.
+From the repository root, run `python3 -B scripts/check_docs.py`. This static
+check covers public command names, local Markdown links/anchors, JSON/JSONL
+examples, the HTTP API table against checked-in OpenAPI, and selected CLI
+defaults/options. It uses only the standard library and CLI parser.
 
 ## APIs
 
