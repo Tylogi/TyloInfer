@@ -17,6 +17,7 @@ add_library(mfq-engine STATIC
     generation/mtp/sampling.cpp
     models/prepare.cpp
     models/state.cpp
+    models/session/tensors.cpp
     models/deepseek_v4/input.cpp
     models/minicpmo45/input.cpp
     models/deepseek_v41/axial_patch_vision.cpp
