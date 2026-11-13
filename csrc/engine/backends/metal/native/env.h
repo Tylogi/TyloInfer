@@ -5,6 +5,12 @@
 
 namespace mfq::metal {
 
+inline bool mlx_metal_nax_disabled() noexcept {
+    const auto* value = std::getenv("TYLOINFER_METAL_DISABLE_NAX");
+    return value != nullptr && (std::string_view(value) == "1"
+        || std::string_view(value) == "true" || std::string_view(value) == "on");
+}
+
 // Numerical-audit mode. Packed weights stay resident, but every projection is
 // independently unpacked to FP16 and evaluated with MLX dense matmul. Native
 // MXFP4/MXFP8 and dense BF16/F16/F32 tensors retain their original execution.

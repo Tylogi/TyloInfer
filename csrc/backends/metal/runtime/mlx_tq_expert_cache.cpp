@@ -1,5 +1,5 @@
 #include "engine/backends/metal/native/memory.h"
-#include "mlx_indirect_weight_residency.h"
+#include "engine/backends/metal/native/indirect.h"
 #include "mlx_tq_expert_cache.h"
 #include "engine/backends/metal/native/tensor/tensor.h"
 #include "mlx_tq_rows.h"
@@ -8,8 +8,8 @@
 #include "engine/backends/metal/native/resident_allocations.h"
 #include "mlx_resource_telemetry.h"
 #include "mlx_kernel_prepare.h"
-#include "mlx_pinned_pool_storage.h"
-#include "mlx_buffer_view.h"
+#include "engine/backends/metal/native/pinned.h"
+#include "engine/backends/metal/native/tensor/buffer.h"
 #include "backends/cpu/native/host_parallel.h"
 
 #include <mlx/allocator.h>

@@ -1,7 +1,7 @@
 #include "mlx_deepseek_v4_moe.h"
 
 #include "engine/backends/metal/native/profile.h"
-#include "mlx_platform.h"
+#include "engine/backends/metal/native/device.h"
 #include "mlx_moe_ops.h"
 
 #include <algorithm>

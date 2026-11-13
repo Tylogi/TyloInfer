@@ -4,7 +4,7 @@
 #include <coroutine>
 #include "mlx_kernel_prepare.h"
 #include "engine/backends/metal/native/kernel.h"
-#include "mlx_builtin_kernels.h"
+#include "engine/backends/metal/kernels/source.h"
 #include "engine/backends/metal/native/resident_allocations.h"
 #include "mlx_nvq_decode.h"
 #include "mlx_resource_telemetry.h"
@@ -20,8 +20,8 @@
 #include "mlx_fp8_sq.h"
 #include "engine/backends/metal/native/profile.h"
 #include "mlx_mxfp4_sq.h"
-#include "mlx_platform.h"
-#include "mlx_reference.h"
+#include "engine/backends/metal/native/device.h"
+#include "engine/backends/metal/native/env.h"
 #include "engine/backends/metal/native/memory.h"
 #include "mlx_vq.h"
 

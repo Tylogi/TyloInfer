@@ -1,7 +1,7 @@
 #include "mlx_staged_attention.h"
 #include <mlx/primitives.h>
 #include "engine/backends/metal/native/kernel.h"
-#include "mlx_platform.h"
+#include "engine/backends/metal/native/env.h"
 #include "ops/gguf/native/gguf_sources.h"
 
 #include <mlx/backend/metal/device.h>

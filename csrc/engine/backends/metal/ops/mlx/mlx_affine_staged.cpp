@@ -3,9 +3,10 @@
 #include "mlx_affine.h"
 #include "mlx_affine_indirect.h"
 #include "mlx_affine_nax.h"
-#include "mlx_indirect_weight_residency.h"
+#include "engine/backends/metal/native/indirect.h"
 #include "mlx_moe_ops.h"
-#include "mlx_platform.h"
+#include "engine/backends/metal/native/device.h"
+#include "engine/backends/metal/native/env.h"
 
 #include <algorithm>
 #include <climits>

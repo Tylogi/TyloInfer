@@ -1,9 +1,10 @@
 #include "mlx_sparse_attention.h"
 #include "engine/backends/metal/native/kernel.h"
-#include "mlx_builtin_kernels.h"
+#include "engine/backends/metal/kernels/source.h"
 
 #include "mfq_mfe_prefill_embedded.h"
-#include "mlx_platform.h"
+#include "engine/backends/metal/native/device.h"
+#include "engine/backends/metal/native/env.h"
 
 #include <mlx/backend/metal/device.h>
 #include <mlx/backend/metal/utils.h>

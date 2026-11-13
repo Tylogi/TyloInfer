@@ -1,7 +1,7 @@
 #include "mlx_tensor.h"
 #include "mlx_kernel_prepare.h"
 #include "mlx_moe_ops.h"
-#include "mlx_reference.h"
+#include "engine/backends/metal/native/env.h"
 #include "mlx_transformer.h"
 #include "engine/backends/metal/native/resident_allocations.h"
 #include "engine/backends/metal/native/tensor/tensor.h"

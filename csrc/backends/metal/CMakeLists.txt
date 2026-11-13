@@ -360,7 +360,7 @@ add_library(mfq-metal-runtime STATIC
     runtime/mlx_sampling.cpp
     runtime/mlx_kernel_prepare.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/metal/native/kernel.cpp
-    runtime/mlx_builtin_kernels.cpp
+    ${TYLOINFER_METAL_ROOT}/kernels/source.cpp
     runtime/mlx_inference_warmup.cpp
     runtime/mlx_tensor.cpp
     runtime/mlx_transformer.cpp
@@ -699,7 +699,7 @@ set(_TYLOINFER_METAL_RUNTIME_BUNDLE_DIR
     "${CMAKE_CURRENT_BINARY_DIR}/lib")
 option(TYLOINFER_BUILD_PRECOMPILED_METAL "Build bundled MFQ Metal libraries" OFF)
 add_executable(mfq-metal-source-export
-    apps/mfq_metal_source_export.cpp runtime/mlx_builtin_kernels.cpp)
+    apps/mfq_metal_source_export.cpp ${TYLOINFER_METAL_ROOT}/kernels/source.cpp)
 target_include_directories(mfq-metal-source-export PRIVATE
     "${PROJECT_SOURCE_DIR}"
     "${CMAKE_CURRENT_BINARY_DIR}/ops/gguf/native"

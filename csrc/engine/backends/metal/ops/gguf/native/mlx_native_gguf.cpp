@@ -2,7 +2,7 @@
 #include "gguf_sources.h"
 #include "engine/backends/metal/native/kernel.h"
 #include "engine/backends/metal/native/device.h"
-#include "mlx_platform.h"
+#include "engine/backends/metal/native/env.h"
 #include "ops/Linear.hpp"
 #include "ops/MoE.hpp"
 #include "ops/HyperConnection.hpp"

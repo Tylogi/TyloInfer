@@ -1,6 +1,6 @@
 #include "mlx_csa2.h"
 #include "engine/backends/metal/native/kernel.h"
-#include "mlx_platform.h"
+
 #include "mfq_mfe_prefill_embedded.h"
 #include <mlx/backend/metal/device.h>
 #include <mlx/backend/metal/utils.h>

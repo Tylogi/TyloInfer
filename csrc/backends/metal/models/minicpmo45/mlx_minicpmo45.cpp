@@ -2,7 +2,7 @@
 #include "mlx_pre_ln_vision.h"
 #include "mlx_multimodal.h"
 
-#include "mlx_platform.h"
+#include "engine/backends/metal/native/device.h"
 #include "mlx_sampling.h"
 #include "mlx_tensor.h"
 #include "mlx_transformer.h"

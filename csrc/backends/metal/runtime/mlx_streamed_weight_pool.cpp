@@ -1,7 +1,7 @@
 #include "mlx_streamed_weight_pool.h"
-#include "mlx_pinned_pool_storage.h"
+#include "engine/backends/metal/native/pinned.h"
 #include "engine/backends/metal/native/resident_allocations.h"
-#include "mlx_buffer_view.h"
+#include "engine/backends/metal/native/tensor/buffer.h"
 
 #include <mlx/allocator.h>
 #include <algorithm>

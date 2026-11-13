@@ -1,6 +1,6 @@
-#include "mlx_builtin_kernels.h"
+#include "engine/backends/metal/kernels/source.h"
 #if TYLOINFER_ENABLE_MFQ_COMPAT
-#include "mlx_nint_metadata.h"
+#include "engine/backends/metal/ops/mfq/mlx_nint_metadata.h"
 #endif
 #include "mfq_mfe_prefill_embedded.h"
 #include <utility>

@@ -1,4 +1,4 @@
-#include "mlx_builtin_kernels.h"
+#include "engine/backends/metal/kernels/source.h"
 #include "gguf_sources.h"
 
 #include <filesystem>

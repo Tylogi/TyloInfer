@@ -5,8 +5,9 @@
 #include "mlx_gguf_rotation.h"
 #include "mlx_moe_ops.h"
 #include "gguf_embedded.h"
-#include "mlx_indirect_weight_residency.h"
-#include "mlx_platform.h"
+#include "engine/backends/metal/native/indirect.h"
+#include "engine/backends/metal/native/device.h"
+#include "engine/backends/metal/native/env.h"
 
 #include <climits>
 #include <bit>

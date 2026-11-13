@@ -7,8 +7,8 @@
 
 #include "tyloinfer/nint_blob.h"
 #include "mfq_mfe_prefill_embedded.h"
-#include "mlx_platform.h"
-#include "engine/backends/metal/native/memory.h"
+#include "engine/backends/metal/native/device.h"
+#include "engine/backends/metal/native/env.h"
 
 #include <mlx/allocator.h>
 #include <mlx/backend/metal/device.h>

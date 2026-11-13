@@ -20,8 +20,7 @@ using ::tyloi::make_grid_vision_layout;
 using ::tyloi::make_learned_position_interpolation;
 using GridThw = ::tyloi::GridShape;
 
-// Reusable learned-position, axial-RoPE grid ViT encoder. Its default loader
-// consumes only the canonical MFQ namespace from mlx_tensor_schema.h.
+// Reusable learned-position, axial-RoPE grid ViT encoder.
 class MlxGridVisionEncoder {
 public:
   static MlxGridVisionEncoder load(const MfqContainer &model,

@@ -1,6 +1,6 @@
 #include "mlx_mx.h"
 
-#include "mlx_platform.h"
+#include "engine/backends/metal/native/device.h"
 #include "mlx_transformer.h"
 #include "engine/backends/metal/native/resident_allocations.h"
 
