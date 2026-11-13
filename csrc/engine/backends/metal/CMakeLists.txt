@@ -1,24 +1,24 @@
 find_package(Threads REQUIRED)
 
-set(TYLOINFER_METAL_ROOT "${PROJECT_SOURCE_DIR}/engine/backends/metal")
+set(TYLOINFER_METAL_ROOT "${CMAKE_CURRENT_SOURCE_DIR}")
 set(TYLOINFER_METAL_INCLUDE_DIRS
     ${PROJECT_SOURCE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/storage
-    ${CMAKE_CURRENT_SOURCE_DIR}/storage/gguf
-    ${CMAKE_CURRENT_SOURCE_DIR}/storage/mlx
-    ${CMAKE_CURRENT_SOURCE_DIR}/storage/compat
-    ${CMAKE_CURRENT_SOURCE_DIR}/runtime
+    ${PROJECT_SOURCE_DIR}/backends/metal/storage
+    ${PROJECT_SOURCE_DIR}/backends/metal/storage/gguf
+    ${PROJECT_SOURCE_DIR}/backends/metal/storage/mlx
+    ${PROJECT_SOURCE_DIR}/backends/metal/storage/compat
+    ${PROJECT_SOURCE_DIR}/backends/metal/runtime
     ${TYLOINFER_METAL_ROOT}/ops/common
     ${TYLOINFER_METAL_ROOT}/ops/tq
     ${TYLOINFER_METAL_ROOT}/ops/gguf
     ${TYLOINFER_METAL_ROOT}/ops/mlx
     ${TYLOINFER_METAL_ROOT}/ops/mfq
-    ${CMAKE_CURRENT_SOURCE_DIR}/models/deepseek_v4
-    ${CMAKE_CURRENT_SOURCE_DIR}/models/deepseek_v41
-    ${CMAKE_CURRENT_SOURCE_DIR}/models/flash_next
-    ${CMAKE_CURRENT_SOURCE_DIR}/models/qwen35
-    ${CMAKE_CURRENT_SOURCE_DIR}/models/minicpmo45
-    ${CMAKE_CURRENT_SOURCE_DIR}/models/nemotron_h
+    ${PROJECT_SOURCE_DIR}/backends/metal/models/deepseek_v4
+    ${PROJECT_SOURCE_DIR}/backends/metal/models/deepseek_v41
+    ${PROJECT_SOURCE_DIR}/backends/metal/models/flash_next
+    ${PROJECT_SOURCE_DIR}/backends/metal/models/qwen35
+    ${PROJECT_SOURCE_DIR}/backends/metal/models/minicpmo45
+    ${PROJECT_SOURCE_DIR}/backends/metal/models/nemotron_h
 )
 
 set(TYLOINFER_MLX_ROOT "" CACHE PATH
@@ -76,14 +76,14 @@ find_library(TYLOINFER_COREVIDEO_FRAMEWORK CoreVideo REQUIRED)
 find_library(TYLOINFER_IOSURFACE_FRAMEWORK IOSurface REQUIRED)
 find_library(TYLOINFER_IOKIT_FRAMEWORK IOKit REQUIRED)
 
-add_library(mfq-ane STATIC ${TYLOINFER_METAL_ROOT}/native/ane.mm runtime/mtp_lora.cpp)
+add_library(mfq-ane STATIC ${TYLOINFER_METAL_ROOT}/native/ane.mm ${PROJECT_SOURCE_DIR}/backends/metal/runtime/mtp_lora.cpp)
 target_include_directories(mfq-ane PUBLIC ${TYLOINFER_METAL_ROOT}/native)
-target_include_directories(mfq-ane PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/runtime)
+target_include_directories(mfq-ane PUBLIC ${PROJECT_SOURCE_DIR}/backends/metal/runtime)
 target_compile_features(mfq-ane PUBLIC cxx_std_20)
 target_compile_options(mfq-ane PRIVATE -fobjc-arc)
 target_link_libraries(mfq-ane PRIVATE ${TYLOINFER_FOUNDATION_FRAMEWORK} ${TYLOINFER_IOSURFACE_FRAMEWORK})
 
-add_executable(mfq-ane-test tests/mfq_ane_test.cpp)
+add_executable(mfq-ane-test ${PROJECT_SOURCE_DIR}/backends/metal/tests/mfq_ane_test.cpp)
 target_link_libraries(mfq-ane-test PRIVATE mfq-ane)
 target_compile_features(mfq-ane-test PRIVATE cxx_std_20)
 
@@ -340,33 +340,33 @@ add_library(mfq-metal-runtime STATIC
     ${PROJECT_SOURCE_DIR}/engine/backends/metal/native/tensor/tensor.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/metal/executor/executor.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/metal/ops/tensor.cpp
-    storage/hf_safetensors_store.cpp
-    storage/mfq_container.cpp
-    storage/mfe_expert_store.cpp
-    storage/mlx_quantized_row_store.cpp
-    runtime/mlx_tq_expert_cache.cpp
-    runtime/mlx_streamed_weight_pool.cpp
-    runtime/mlx_expert_segment_cache.cpp
-    storage/mlx_tq_rows.cpp
-    storage/compat/mlx_legacy_tensor_compat.cpp
-    runtime/mlx_axial_patch_vision.cpp
-    runtime/mlx_grid_vision.cpp
-    runtime/mlx_mtp.cpp
-    runtime/mlx_mtp_lora.cpp
-    runtime/mlx_ane_matmul.cpp
-    runtime/mtp_lora_sessions.cpp
-    runtime/mlx_multimodal.cpp
-    runtime/mlx_pre_ln_vision.cpp
-    runtime/mlx_sampling.cpp
-    runtime/mlx_kernel_prepare.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/storage/hf_safetensors_store.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/storage/mfq_container.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/storage/mfe_expert_store.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/storage/mlx_quantized_row_store.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/runtime/mlx_tq_expert_cache.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/runtime/mlx_streamed_weight_pool.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/runtime/mlx_expert_segment_cache.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/storage/mlx_tq_rows.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/storage/compat/mlx_legacy_tensor_compat.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/runtime/mlx_axial_patch_vision.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/runtime/mlx_grid_vision.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/runtime/mlx_mtp.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/runtime/mlx_mtp_lora.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/runtime/mlx_ane_matmul.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/runtime/mtp_lora_sessions.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/runtime/mlx_multimodal.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/runtime/mlx_pre_ln_vision.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/runtime/mlx_sampling.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/runtime/mlx_kernel_prepare.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/metal/native/kernel.cpp
     ${TYLOINFER_METAL_ROOT}/kernels/source.cpp
-    runtime/mlx_inference_warmup.cpp
-    runtime/mlx_tensor.cpp
-    runtime/mlx_transformer.cpp
-    runtime/mlx_kv_quantization.cpp
-    runtime/mlx_qsa_kv_offload.cpp
-    models/dflash2/mlx_dflash2.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/runtime/mlx_inference_warmup.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/runtime/mlx_tensor.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/runtime/mlx_transformer.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/runtime/mlx_kv_quantization.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/runtime/mlx_qsa_kv_offload.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/models/dflash2/mlx_dflash2.cpp
     ${TYLOINFER_METAL_ROOT}/ops/common/mlx_linear_attention.cpp
     ${TYLOINFER_METAL_ROOT}/ops/common/mlx_staged_attention.cpp
     ${TYLOINFER_METAL_ROOT}/ops/common/mlx_moe_ops.cpp
@@ -377,35 +377,35 @@ add_library(mfq-metal-runtime STATIC
     ${TYLOINFER_METAL_ROOT}/ops/common/mlx_sparse_prefill_tiles.cpp
     ${TYLOINFER_METAL_ROOT}/ops/common/mlx_csa2.cpp
     ${TYLOINFER_METAL_ROOT}/ops/common/mlx_dsa_cache_ops.cpp
-    models/deepseek_v4/deepseek_v4_model.cpp
-    models/deepseek_v4/mlx_deepseek_v4_attention.cpp
-    models/deepseek_v4/mlx_deepseek_v4_causal_lm.cpp
-    models/deepseek_v4/mlx_deepseek_v4_dspark.cpp
-    models/deepseek_v4/mlx_deepseek_v4_hc.cpp
-    models/deepseek_v4/mlx_deepseek_v4_moe.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/models/deepseek_v4/deepseek_v4_model.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/models/deepseek_v4/mlx_deepseek_v4_attention.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/models/deepseek_v4/mlx_deepseek_v4_causal_lm.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/models/deepseek_v4/mlx_deepseek_v4_dspark.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/models/deepseek_v4/mlx_deepseek_v4_hc.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/models/deepseek_v4/mlx_deepseek_v4_moe.cpp
     ${TYLOINFER_METAL_ROOT}/ops/common/mlx_dsa.cpp
-    models/deepseek_v4/mlx_deepseek_v4_vision.cpp
-    models/deepseek_v41/mlx_deepseek_v41_attention.cpp
-    models/deepseek_v41/mlx_deepseek_v41_causal_lm.cpp
-    models/deepseek_v41/mlx_deepseek_v41_dspark.cpp
-    models/deepseek_v41/mlx_deepseek_v41_engram.cpp
-    models/deepseek_v41/mlx_deepseek_v41_mhc.cpp
-    models/deepseek_v41/mlx_deepseek_v41_moe.cpp
-    models/deepseek_v41/mlx_deepseek_v41_vision.cpp
-    models/flash_next/mlx_qwen4_causal_lm.cpp
-    models/flash_next/qwen4_ops.cpp
-    models/minicpmo45/mlx_minicpmo45.cpp
-    models/qwen35/mlx_qwen35_causal_lm.cpp
-    models/qwen35/mlx_qwen35_full_attention.cpp
-    models/qwen35/mlx_qwen35_linear_attention.cpp
-    models/qwen35/qwen35_model.cpp
-    models/nemotron_h/mlx_nemotron_h_attention.cpp
-    models/nemotron_h/mlx_nemotron_h_causal_lm.cpp
-    models/nemotron_h/mlx_nemotron_h_linear_attention.cpp
-    models/nemotron_h/mlx_nemotron_h_moe.cpp
-    models/nemotron_h/mlx_nemotron_h_ops.cpp
-    models/nemotron_h/mlx_nemotron_h_vision.cpp
-    models/nemotron_h/nemotron_h_model.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/models/deepseek_v4/mlx_deepseek_v4_vision.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/models/deepseek_v41/mlx_deepseek_v41_attention.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/models/deepseek_v41/mlx_deepseek_v41_causal_lm.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/models/deepseek_v41/mlx_deepseek_v41_dspark.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/models/deepseek_v41/mlx_deepseek_v41_engram.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/models/deepseek_v41/mlx_deepseek_v41_mhc.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/models/deepseek_v41/mlx_deepseek_v41_moe.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/models/deepseek_v41/mlx_deepseek_v41_vision.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/models/flash_next/mlx_qwen4_causal_lm.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/models/flash_next/qwen4_ops.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/models/minicpmo45/mlx_minicpmo45.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/models/qwen35/mlx_qwen35_causal_lm.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/models/qwen35/mlx_qwen35_full_attention.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/models/qwen35/mlx_qwen35_linear_attention.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/models/qwen35/qwen35_model.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/models/nemotron_h/mlx_nemotron_h_attention.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/models/nemotron_h/mlx_nemotron_h_causal_lm.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/models/nemotron_h/mlx_nemotron_h_linear_attention.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/models/nemotron_h/mlx_nemotron_h_moe.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/models/nemotron_h/mlx_nemotron_h_ops.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/models/nemotron_h/mlx_nemotron_h_vision.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/models/nemotron_h/nemotron_h_model.cpp
 )
 if(TYLOINFER_ENABLE_MFQ_COMPAT)
     target_sources(mfq-metal-runtime PRIVATE
@@ -416,8 +416,8 @@ if(TYLOINFER_ENABLE_MFQ_COMPAT)
         ${TYLOINFER_METAL_ROOT}/ops/mfq/mlx_nint_rows.cpp
         ${TYLOINFER_METAL_ROOT}/ops/mfq/mlx_nint8_zero.cpp
         ${TYLOINFER_METAL_ROOT}/ops/mfq/mlx_vq.cpp
-        runtime/mlx_ssd_expert_arena.cpp
-        runtime/mlx_ssd_expert_cache.cpp
+        ${PROJECT_SOURCE_DIR}/backends/metal/runtime/mlx_ssd_expert_arena.cpp
+        ${PROJECT_SOURCE_DIR}/backends/metal/runtime/mlx_ssd_expert_cache.cpp
         ${TYLOINFER_METAL_ROOT}/ops/mfq/mlx_grouped_linear_mfq.cpp
     )
 else()
@@ -426,8 +426,8 @@ endif()
 add_library(mfq::metal-runtime ALIAS mfq-metal-runtime)
 target_sources(mfq-metal-runtime PRIVATE ${TYLOINFER_METAL_ROOT}/native/device.cpp)
 if(BUILD_TESTING)
-add_executable(tyloinfer-metal-affine-test tests/mlx_affine_test.cpp)
-add_executable(tyloinfer-metal-dflash2-test tests/mlx_dflash2_test.cpp)
+add_executable(tyloinfer-metal-affine-test ${PROJECT_SOURCE_DIR}/backends/metal/tests/mlx_affine_test.cpp)
+add_executable(tyloinfer-metal-dflash2-test ${PROJECT_SOURCE_DIR}/backends/metal/tests/mlx_dflash2_test.cpp)
 target_link_libraries(tyloinfer-metal-dflash2-test PRIVATE mfq-metal-engine)
 target_compile_features(tyloinfer-metal-dflash2-test PRIVATE cxx_std_20)
 set_target_properties(tyloinfer-metal-dflash2-test PROPERTIES BUILD_RPATH "${TYLOINFER_MLX_ROOT}/lib")
@@ -436,7 +436,7 @@ target_link_libraries(tyloinfer-metal-affine-test PRIVATE mfq-metal-runtime)
 target_compile_features(tyloinfer-metal-affine-test PRIVATE cxx_std_20)
 set_target_properties(tyloinfer-metal-affine-test PROPERTIES BUILD_RPATH "${TYLOINFER_MLX_ROOT}/lib")
 add_test(NAME tyloinfer-metal-affine-test COMMAND tyloinfer-metal-affine-test)
-add_executable(tyloinfer-metal-gguf-test tests/mlx_gguf_test.cpp)
+add_executable(tyloinfer-metal-gguf-test ${PROJECT_SOURCE_DIR}/backends/metal/tests/mlx_gguf_test.cpp)
 target_include_directories(tyloinfer-metal-gguf-test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/ops/gguf/native")
 target_link_libraries(tyloinfer-metal-gguf-test PRIVATE mfq-metal-runtime mfq-ggml)
 target_include_directories(tyloinfer-metal-gguf-test PRIVATE "${PROJECT_SOURCE_DIR}/components/ggml/src")
@@ -477,8 +477,8 @@ add_test(NAME tyloinfer-metal-gguf-native-hyper-no-nax-test
     COMMAND ${CMAKE_COMMAND} -E env TYLOINFER_METAL_DISABLE_NAX=1 $<TARGET_FILE:tyloinfer-metal-gguf-test> native-hyper)
 add_test(NAME tyloinfer-metal-gguf-no-nax-test
     COMMAND ${CMAKE_COMMAND} -E env TYLOINFER_METAL_DISABLE_NAX=1 $<TARGET_FILE:tyloinfer-metal-gguf-test>)
-add_executable(tyloinfer-metal-gguf-cache-test tests/mlx_gguf_expert_cache_test.cpp)
-add_executable(tyloinfer-metal-gguf-deepseek41-test tests/mlx_gguf_deepseek41_test.cpp)
+add_executable(tyloinfer-metal-gguf-cache-test ${PROJECT_SOURCE_DIR}/backends/metal/tests/mlx_gguf_expert_cache_test.cpp)
+add_executable(tyloinfer-metal-gguf-deepseek41-test ${PROJECT_SOURCE_DIR}/backends/metal/tests/mlx_gguf_deepseek41_test.cpp)
 target_link_libraries(tyloinfer-metal-gguf-deepseek41-test PRIVATE mfq-metal-runtime mfq-ggml)
 target_include_directories(tyloinfer-metal-gguf-deepseek41-test PRIVATE "${PROJECT_SOURCE_DIR}/components/ggml/src")
 target_compile_features(tyloinfer-metal-gguf-deepseek41-test PRIVATE cxx_std_20)
@@ -486,12 +486,12 @@ set_target_properties(tyloinfer-metal-gguf-deepseek41-test PROPERTIES BUILD_RPAT
 add_test(NAME tyloinfer-metal-gguf-deepseek41-test COMMAND tyloinfer-metal-gguf-deepseek41-test)
 add_test(NAME tyloinfer-metal-gguf-deepseek41-no-nax-test
     COMMAND ${CMAKE_COMMAND} -E env TYLOINFER_METAL_DISABLE_NAX=1 $<TARGET_FILE:tyloinfer-metal-gguf-deepseek41-test>)
-add_executable(tyloinfer-metal-gguf-gyro-rotation-test tests/mlx_gguf_gyro_test.cpp)
+add_executable(tyloinfer-metal-gguf-gyro-rotation-test ${PROJECT_SOURCE_DIR}/backends/metal/tests/mlx_gguf_gyro_test.cpp)
 target_link_libraries(tyloinfer-metal-gguf-gyro-rotation-test PRIVATE mfq-metal-runtime mfq-ggml)
 target_compile_features(tyloinfer-metal-gguf-gyro-rotation-test PRIVATE cxx_std_20)
 set_target_properties(tyloinfer-metal-gguf-gyro-rotation-test PROPERTIES BUILD_RPATH "${TYLOINFER_MLX_ROOT}/lib")
 add_test(NAME tyloinfer-metal-gguf-gyro-rotation-test COMMAND tyloinfer-metal-gguf-gyro-rotation-test)
-add_executable(tyloinfer-metal-gguf-projection-moe-test tests/mlx_gguf_projection_moe_test.cpp)
+add_executable(tyloinfer-metal-gguf-projection-moe-test ${PROJECT_SOURCE_DIR}/backends/metal/tests/mlx_gguf_projection_moe_test.cpp)
 target_link_libraries(tyloinfer-metal-gguf-projection-moe-test PRIVATE mfq-metal-runtime mfq-ggml)
 target_include_directories(tyloinfer-metal-gguf-projection-moe-test PRIVATE "${PROJECT_SOURCE_DIR}/components/ggml/src")
 target_compile_features(tyloinfer-metal-gguf-projection-moe-test PRIVATE cxx_std_20)
@@ -514,19 +514,19 @@ set_target_properties(tyloinfer-metal-gguf-cache-test PROPERTIES BUILD_RPATH "${
 add_test(NAME tyloinfer-metal-gguf-cache-test COMMAND tyloinfer-metal-gguf-cache-test)
 add_test(NAME tyloinfer-metal-gguf-cache-no-nax-test
     COMMAND ${CMAKE_COMMAND} -E env TYLOINFER_METAL_DISABLE_NAX=1 $<TARGET_FILE:tyloinfer-metal-gguf-cache-test>)
-add_executable(tyloinfer-metal-affine-cache-test tests/mlx_affine_expert_cache_test.cpp)
+add_executable(tyloinfer-metal-affine-cache-test ${PROJECT_SOURCE_DIR}/backends/metal/tests/mlx_affine_expert_cache_test.cpp)
 target_link_libraries(tyloinfer-metal-affine-cache-test PRIVATE mfq-metal-runtime)
 target_compile_features(tyloinfer-metal-affine-cache-test PRIVATE cxx_std_20)
 set_target_properties(tyloinfer-metal-affine-cache-test PROPERTIES BUILD_RPATH "${TYLOINFER_MLX_ROOT}/lib")
 add_test(NAME tyloinfer-metal-affine-cache-test COMMAND tyloinfer-metal-affine-cache-test)
 add_test(NAME tyloinfer-metal-affine-cache-no-nax-test
     COMMAND ${CMAKE_COMMAND} -E env TYLOINFER_METAL_DISABLE_NAX=1 $<TARGET_FILE:tyloinfer-metal-affine-cache-test>)
-add_executable(tyloinfer-metal-compiled-prepare-test tests/mlx_compiled_prepare_test.cpp)
+add_executable(tyloinfer-metal-compiled-prepare-test ${PROJECT_SOURCE_DIR}/backends/metal/tests/mlx_compiled_prepare_test.cpp)
 target_link_libraries(tyloinfer-metal-compiled-prepare-test PRIVATE mfq-metal-runtime)
 target_compile_features(tyloinfer-metal-compiled-prepare-test PRIVATE cxx_std_20)
 set_target_properties(tyloinfer-metal-compiled-prepare-test PROPERTIES BUILD_RPATH "${TYLOINFER_MLX_ROOT}/lib")
 add_test(NAME tyloinfer-metal-compiled-prepare-test COMMAND tyloinfer-metal-compiled-prepare-test)
-add_executable(tyloinfer-metal-cached-kernel-test tests/mlx_cached_kernel_test.cpp)
+add_executable(tyloinfer-metal-cached-kernel-test ${PROJECT_SOURCE_DIR}/backends/metal/tests/mlx_cached_kernel_test.cpp)
 target_link_libraries(tyloinfer-metal-cached-kernel-test PRIVATE mfq-metal-runtime)
 target_compile_features(tyloinfer-metal-cached-kernel-test PRIVATE cxx_std_20)
 set_target_properties(tyloinfer-metal-cached-kernel-test PROPERTIES BUILD_RPATH "${TYLOINFER_MLX_ROOT}/lib")
@@ -583,8 +583,8 @@ tyloinfer_add_metal_format(tyloinfer-metal-gguf-ops
     ${TYLOINFER_METAL_ROOT}/ops/gguf/mlx_gguf_staged.cpp
     ${TYLOINFER_METAL_ROOT}/ops/gguf/mlx_gguf_split.cpp
     ${TYLOINFER_METAL_ROOT}/ops/gguf/mlx_gguf_mhc.cpp
-    storage/gguf/mlx_gguf_rows.cpp
-    storage/gguf/mlx_gguf_expert_cache.cpp)
+    ${PROJECT_SOURCE_DIR}/backends/metal/storage/gguf/mlx_gguf_rows.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/storage/gguf/mlx_gguf_expert_cache.cpp)
 target_include_directories(tyloinfer-metal-gguf-ops PRIVATE
     "${TYLOINFER_METAL_ROOT}/ops/gguf/native"
     "${TYLOINFER_METAL_ROOT}/ops/gguf/native/metal"
@@ -597,16 +597,16 @@ tyloinfer_add_metal_format(tyloinfer-metal-mlx-ops
     ${TYLOINFER_METAL_ROOT}/ops/mlx/mlx_affine_staged.cpp
     ${TYLOINFER_METAL_ROOT}/ops/mlx/mlx_affine_mhc.cpp
     ${TYLOINFER_METAL_ROOT}/ops/mlx/mlx_affine_indirect.cpp
-    storage/mlx/mlx_affine_rows.cpp
-    storage/mlx/mlx_affine_expert_cache.cpp)
+    ${PROJECT_SOURCE_DIR}/backends/metal/storage/mlx/mlx_affine_rows.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/storage/mlx/mlx_affine_expert_cache.cpp)
 target_link_libraries(tyloinfer-metal-gguf-ops PRIVATE mfq-ggml)
 
-add_executable(mfq-metal-tq-test tests/mlx_tq_test.cpp)
+add_executable(mfq-metal-tq-test ${PROJECT_SOURCE_DIR}/backends/metal/tests/mlx_tq_test.cpp)
 target_link_libraries(mfq-metal-tq-test PRIVATE mfq-metal-runtime)
 target_include_directories(mfq-metal-tq-test PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 target_compile_features(mfq-metal-tq-test PRIVATE cxx_std_20)
 set_target_properties(mfq-metal-tq-test PROPERTIES BUILD_RPATH "${TYLOINFER_MLX_ROOT}/lib")
-add_executable(tyloinfer-metal-tq-benchmark tests/mlx_tq_benchmark.cpp)
+add_executable(tyloinfer-metal-tq-benchmark ${PROJECT_SOURCE_DIR}/backends/metal/tests/mlx_tq_benchmark.cpp)
 target_link_libraries(tyloinfer-metal-tq-benchmark PRIVATE mfq-metal-runtime)
 target_compile_features(tyloinfer-metal-tq-benchmark PRIVATE cxx_std_20)
 set_target_properties(tyloinfer-metal-tq-benchmark PROPERTIES BUILD_RPATH "${TYLOINFER_MLX_ROOT}/lib")
@@ -630,33 +630,33 @@ if(BUILD_TESTING)
 endif()
 
 if(TARGET mfq-paged-prefix-cache)
-    add_executable(mfq-metal-tq-model-benchmark tests/mlx_tq_model_benchmark.cpp)
+    add_executable(mfq-metal-tq-model-benchmark ${PROJECT_SOURCE_DIR}/backends/metal/tests/mlx_tq_model_benchmark.cpp)
     target_link_libraries(mfq-metal-tq-model-benchmark PRIVATE mfq-metal-runtime mfq-paged-prefix-cache)
     target_compile_features(mfq-metal-tq-model-benchmark PRIVATE cxx_std_20)
     set_target_properties(mfq-metal-tq-model-benchmark PROPERTIES BUILD_RPATH "${TYLOINFER_MLX_ROOT}/lib")
 endif()
 
 add_library(mfq-metal-engine STATIC
-    runtime/mlx_engine.cpp
-    runtime/mlx_generation_job.cpp
-    runtime/mlx_server_components.cpp
-    runtime/mlx_dflash2_serving.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/runtime/mlx_engine.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/runtime/mlx_generation_job.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/runtime/mlx_server_components.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/runtime/mlx_dflash2_serving.cpp
 )
 target_link_libraries(mfq-metal-engine PUBLIC mfq-metal-runtime mfq-engine)
 target_compile_features(mfq-metal-engine PUBLIC cxx_std_20)
 
-add_executable(mfq-metal-engine-test tests/mlx_engine_test.cpp)
+add_executable(mfq-metal-engine-test ${PROJECT_SOURCE_DIR}/backends/metal/tests/mlx_engine_test.cpp)
 target_link_libraries(mfq-metal-engine-test PRIVATE mfq-metal-engine)
 target_compile_features(mfq-metal-engine-test PRIVATE cxx_std_20)
 add_test(NAME mfq-metal-engine-test COMMAND mfq-metal-engine-test)
 
-add_executable(mfq-qsa-kv-offload-test tests/qsa_kv_offload_test.cpp runtime/mlx_paged_session_codec.cpp)
+add_executable(mfq-qsa-kv-offload-test ${PROJECT_SOURCE_DIR}/backends/metal/tests/qsa_kv_offload_test.cpp ${PROJECT_SOURCE_DIR}/backends/metal/runtime/mlx_paged_session_codec.cpp)
 target_link_libraries(mfq-qsa-kv-offload-test PRIVATE mfq-metal-runtime)
 target_compile_features(mfq-qsa-kv-offload-test PRIVATE cxx_std_20)
 add_test(NAME mfq-qsa-kv-offload-test COMMAND mfq-qsa-kv-offload-test)
 
 add_executable(mfq-decode-metal
-    apps/mfq_decode_mlx.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/apps/mfq_decode_mlx.cpp
 )
 add_dependencies(mfq-decode-metal mfq-avfoundation-video)
 target_link_libraries(mfq-decode-metal PRIVATE
@@ -667,12 +667,12 @@ target_link_options(mfq-decode-metal PRIVATE -Wl,-dead_strip)
 
 if(TARGET mfq-paged-prefix-cache)
     target_sources(mfq-decode-metal PRIVATE
-        runtime/mlx_paged_session_codec.cpp
+        ${PROJECT_SOURCE_DIR}/backends/metal/runtime/mlx_paged_session_codec.cpp
     )
 
     add_executable(mfq-metal-paged-session-codec-test
-        runtime/mlx_paged_session_codec.cpp
-        tests/mlx_paged_session_codec_test.cpp
+        ${PROJECT_SOURCE_DIR}/backends/metal/runtime/mlx_paged_session_codec.cpp
+        ${PROJECT_SOURCE_DIR}/backends/metal/tests/mlx_paged_session_codec_test.cpp
     )
     target_link_libraries(mfq-metal-paged-session-codec-test PRIVATE
         mfq-metal-runtime
@@ -699,11 +699,11 @@ set(_TYLOINFER_METAL_RUNTIME_BUNDLE_DIR
     "${CMAKE_CURRENT_BINARY_DIR}/lib")
 option(TYLOINFER_BUILD_PRECOMPILED_METAL "Build bundled MFQ Metal libraries" OFF)
 add_executable(mfq-metal-source-export
-    apps/mfq_metal_source_export.cpp ${TYLOINFER_METAL_ROOT}/kernels/source.cpp)
+    ${PROJECT_SOURCE_DIR}/backends/metal/apps/mfq_metal_source_export.cpp ${TYLOINFER_METAL_ROOT}/kernels/source.cpp)
 target_include_directories(mfq-metal-source-export PRIVATE
     "${PROJECT_SOURCE_DIR}"
     "${CMAKE_CURRENT_BINARY_DIR}/ops/gguf/native"
-    "${CMAKE_CURRENT_SOURCE_DIR}/runtime" "${TYLOINFER_METAL_ROOT}/ops/common" "${TYLOINFER_METAL_ROOT}/ops/tq" "${TYLOINFER_METAL_ROOT}/ops/mfq" "${CMAKE_CURRENT_BINARY_DIR}")
+    "${PROJECT_SOURCE_DIR}/backends/metal/runtime" "${TYLOINFER_METAL_ROOT}/ops/common" "${TYLOINFER_METAL_ROOT}/ops/tq" "${TYLOINFER_METAL_ROOT}/ops/mfq" "${CMAKE_CURRENT_BINARY_DIR}")
 target_compile_features(mfq-metal-source-export PRIVATE cxx_std_20)
 if(TYLOINFER_BUILD_PRECOMPILED_METAL)
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
@@ -768,7 +768,7 @@ add_custom_target(mfq-metal-runtime-bundle
     DEPENDS "${_TYLOINFER_METAL_RUNTIME_BUNDLE_STAMP}")
 add_dependencies(mfq-decode-metal mfq-metal-runtime-bundle)
 
-add_executable(tyloinfer-metal-native-projection-test tests/mlx_mx_test.cpp)
+add_executable(tyloinfer-metal-native-projection-test ${PROJECT_SOURCE_DIR}/backends/metal/tests/mlx_mx_test.cpp)
 target_link_libraries(tyloinfer-metal-native-projection-test PRIVATE mfq-metal-runtime)
 target_compile_features(tyloinfer-metal-native-projection-test PRIVATE cxx_std_20)
 set_target_properties(tyloinfer-metal-native-projection-test PROPERTIES BUILD_RPATH "${TYLOINFER_MLX_ROOT}/lib")
@@ -776,7 +776,7 @@ add_test(NAME tyloinfer-metal-native-projection-test COMMAND tyloinfer-metal-nat
 
 if(TYLOINFER_ENABLE_MFQ_COMPAT)
 add_executable(mfq-metal-container-test
-    tests/mfq_container_test.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/tests/mfq_container_test.cpp
 )
 target_link_libraries(mfq-metal-container-test PRIVATE
     mfq-metal-runtime
@@ -790,7 +790,7 @@ endif()
 
 if(TYLOINFER_ENABLE_MFQ_COMPAT)
 add_executable(mfq-metal-nint-test
-    tests/mlx_nint_test.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/tests/mlx_nint_test.cpp
 )
 target_link_libraries(mfq-metal-nint-test PRIVATE
     mfq-metal-runtime
@@ -807,7 +807,7 @@ add_test(NAME mfq-metal-nint-portable-test
 endif()
 
 if(TYLOINFER_ENABLE_MFQ_COMPAT)
-add_executable(mfq-metal-kernel-prepare-test tests/mlx_kernel_prepare_test.cpp)
+add_executable(mfq-metal-kernel-prepare-test ${PROJECT_SOURCE_DIR}/backends/metal/tests/mlx_kernel_prepare_test.cpp)
 target_link_libraries(mfq-metal-kernel-prepare-test PRIVATE mfq-metal-runtime)
 target_compile_features(mfq-metal-kernel-prepare-test PRIVATE cxx_std_20)
 set_target_properties(mfq-metal-kernel-prepare-test PROPERTIES BUILD_RPATH "${TYLOINFER_MLX_ROOT}/lib")
@@ -818,14 +818,14 @@ add_test(NAME mfq-metal-kernel-prepare-portable-test
 
 endif()
 
-add_executable(mfq-metal-inference-warmup-test tests/mlx_inference_warmup_test.cpp)
+add_executable(mfq-metal-inference-warmup-test ${PROJECT_SOURCE_DIR}/backends/metal/tests/mlx_inference_warmup_test.cpp)
 target_link_libraries(mfq-metal-inference-warmup-test PRIVATE mfq-metal-runtime)
 target_compile_features(mfq-metal-inference-warmup-test PRIVATE cxx_std_20)
 set_target_properties(mfq-metal-inference-warmup-test PROPERTIES BUILD_RPATH "${TYLOINFER_MLX_ROOT}/lib")
 add_test(NAME mfq-metal-inference-warmup-test COMMAND mfq-metal-inference-warmup-test)
 
 if(TYLOINFER_ENABLE_MFQ_COMPAT)
-add_executable(mfq-metal-nint-rows-test tests/mlx_nint_rows_test.cpp)
+add_executable(mfq-metal-nint-rows-test ${PROJECT_SOURCE_DIR}/backends/metal/tests/mlx_nint_rows_test.cpp)
 target_link_libraries(mfq-metal-nint-rows-test PRIVATE mfq-metal-runtime)
 target_compile_features(mfq-metal-nint-rows-test PRIVATE cxx_std_20)
 set_target_properties(mfq-metal-nint-rows-test PROPERTIES
@@ -834,7 +834,7 @@ add_test(NAME mfq-metal-nint-rows-test COMMAND mfq-metal-nint-rows-test)
 
 endif()
 
-add_executable(mfq-metal-memory-residency-test tests/mlx_memory_residency_test.cpp)
+add_executable(mfq-metal-memory-residency-test ${PROJECT_SOURCE_DIR}/backends/metal/tests/mlx_memory_residency_test.cpp)
 target_link_libraries(mfq-metal-memory-residency-test PRIVATE mfq-metal-runtime)
 target_compile_features(mfq-metal-memory-residency-test PRIVATE cxx_std_20)
 target_compile_options(mfq-metal-memory-residency-test PRIVATE -UNDEBUG)
@@ -844,7 +844,7 @@ add_test(NAME mfq-metal-memory-residency-test COMMAND mfq-metal-memory-residency
 
 if(TYLOINFER_ENABLE_MFQ_COMPAT)
 add_executable(mfq-metal-mx-test
-    tests/mlx_mx_test.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/tests/mlx_mx_test.cpp
 )
 target_link_libraries(mfq-metal-mx-test PRIVATE
     mfq-metal-runtime
@@ -859,7 +859,7 @@ endif()
 
 if(TYLOINFER_ENABLE_MFQ_COMPAT)
 add_executable(mfq-metal-fp8-sq-test
-    tests/mlx_fp8_sq_test.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/tests/mlx_fp8_sq_test.cpp
 )
 target_link_libraries(mfq-metal-fp8-sq-test PRIVATE
     mfq-metal-runtime
@@ -874,7 +874,7 @@ endif()
 
 if(TYLOINFER_ENABLE_MFQ_COMPAT)
 add_executable(mfq-metal-mxfp4-sq2-test
-    tests/mlx_mxfp4_sq2_test.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/tests/mlx_mxfp4_sq2_test.cpp
 )
 target_link_libraries(mfq-metal-mxfp4-sq2-test PRIVATE
     mfq-metal-runtime
@@ -892,7 +892,7 @@ endif()
 
 if(TYLOINFER_ENABLE_MFQ_COMPAT)
 add_executable(mfq-metal-mxfp4-sq2-benchmark
-    benchmarks/mlx_mxfp4_sq2_benchmark.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/benchmarks/mlx_mxfp4_sq2_benchmark.cpp
 )
 target_link_libraries(mfq-metal-mxfp4-sq2-benchmark PRIVATE
     mfq-metal-runtime
@@ -906,7 +906,7 @@ endif()
 
 if(TYLOINFER_ENABLE_MFQ_COMPAT)
 add_executable(mfq-metal-mxfp4-sq3-test
-    tests/mlx_mxfp4_sq3_test.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/tests/mlx_mxfp4_sq3_test.cpp
 )
 target_link_libraries(mfq-metal-mxfp4-sq3-test PRIVATE
     mfq-metal-runtime
@@ -924,7 +924,7 @@ endif()
 
 if(TYLOINFER_ENABLE_MFQ_COMPAT)
 add_executable(mfq-metal-mxfp4-sq3-benchmark
-    benchmarks/mlx_mxfp4_sq3_benchmark.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/benchmarks/mlx_mxfp4_sq3_benchmark.cpp
 )
 target_link_libraries(mfq-metal-mxfp4-sq3-benchmark PRIVATE
     mfq-metal-runtime
@@ -937,7 +937,7 @@ set_target_properties(mfq-metal-mxfp4-sq3-benchmark PROPERTIES
 endif()
 
 add_executable(mfq-metal-mx-benchmark
-    benchmarks/mlx_mx_benchmark.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/benchmarks/mlx_mx_benchmark.cpp
 )
 target_link_libraries(mfq-metal-mx-benchmark PRIVATE
     mfq-metal-runtime
@@ -949,7 +949,7 @@ set_target_properties(mfq-metal-mx-benchmark PROPERTIES
 
 if(TYLOINFER_ENABLE_MFQ_COMPAT)
 add_executable(mfq-metal-nint-benchmark
-    benchmarks/mlx_nint_benchmark.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/benchmarks/mlx_nint_benchmark.cpp
 )
 target_link_libraries(mfq-metal-nint-benchmark PRIVATE
     mfq-metal-runtime
@@ -962,7 +962,7 @@ set_target_properties(mfq-metal-nint-benchmark PROPERTIES
 endif()
 
 add_executable(mfq-metal-dense-smallm-benchmark
-    benchmarks/mlx_dense_smallm_benchmark.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/benchmarks/mlx_dense_smallm_benchmark.cpp
 )
 target_link_libraries(mfq-metal-dense-smallm-benchmark PRIVATE
     mfq-metal-runtime
@@ -978,7 +978,7 @@ set_target_properties(mfq-metal-dense-smallm-benchmark PROPERTIES
 
 if(TYLOINFER_ENABLE_MFQ_COMPAT)
 add_executable(mfq-metal-mfe-smallm-benchmark
-    benchmarks/mlx_mfe_smallm_benchmark.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/benchmarks/mlx_mfe_smallm_benchmark.cpp
 )
 target_link_libraries(mfq-metal-mfe-smallm-benchmark PRIVATE
     mfq-metal-runtime
@@ -992,7 +992,7 @@ endif()
 
 if(TYLOINFER_ENABLE_MFQ_COMPAT)
 add_executable(mfq-metal-vq-smallm-benchmark
-    benchmarks/mlx_vq_smallm_benchmark.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/benchmarks/mlx_vq_smallm_benchmark.cpp
 )
 target_link_libraries(mfq-metal-vq-smallm-benchmark PRIVATE
     mfq-metal-runtime
@@ -1006,7 +1006,7 @@ endif()
 
 if(TYLOINFER_ENABLE_MFQ_COMPAT)
 add_executable(mfq-metal-mfe-prefill-benchmark
-    benchmarks/mlx_mfe_prefill_benchmark.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/benchmarks/mlx_mfe_prefill_benchmark.cpp
 )
 target_link_libraries(mfq-metal-mfe-prefill-benchmark PRIVATE mfq-metal-runtime)
 target_compile_features(mfq-metal-mfe-prefill-benchmark PRIVATE cxx_std_20)
@@ -1015,7 +1015,7 @@ endif()
 
 if(TYLOINFER_ENABLE_MFQ_COMPAT)
 add_executable(mfq-metal-vq-benchmark
-    benchmarks/mlx_vq_benchmark.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/benchmarks/mlx_vq_benchmark.cpp
 )
 target_link_libraries(mfq-metal-vq-benchmark PRIVATE
     mfq-metal-runtime
@@ -1029,7 +1029,7 @@ endif()
 
 if(TYLOINFER_ENABLE_MFQ_COMPAT)
 add_executable(mfq-metal-grouped-linear-benchmark
-    benchmarks/mlx_grouped_linear_benchmark.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/benchmarks/mlx_grouped_linear_benchmark.cpp
 )
 target_link_libraries(mfq-metal-grouped-linear-benchmark PRIVATE
     mfq-metal-runtime
@@ -1044,7 +1044,7 @@ endif()
 
 if(TYLOINFER_ENABLE_MFQ_COMPAT)
 add_executable(mfq-metal-qwen35-projection-profile
-    tools/qwen35_projection_profile.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/tools/qwen35_projection_profile.cpp
 )
 target_link_libraries(
     mfq-metal-qwen35-projection-profile PRIVATE
@@ -1061,7 +1061,7 @@ set_target_properties(
 endif()
 
 add_executable(mfq-metal-qwen35-decode-overhead-profile
-    tools/qwen35_decode_overhead_profile.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/tools/qwen35_decode_overhead_profile.cpp
 )
 target_link_libraries(
     mfq-metal-qwen35-decode-overhead-profile PRIVATE
@@ -1077,7 +1077,7 @@ set_target_properties(
 
 if(TYLOINFER_ENABLE_MFQ_COMPAT)
 add_executable(mfq-metal-nint8-zero-test
-    tests/mlx_nint8_zero_test.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/tests/mlx_nint8_zero_test.cpp
 )
 target_link_libraries(mfq-metal-nint8-zero-test PRIVATE
     mfq-metal-runtime
@@ -1095,7 +1095,7 @@ endif()
 
 if(TYLOINFER_ENABLE_MFQ_COMPAT)
 add_executable(mfq-metal-grouped-linear-test
-    tests/mlx_grouped_linear_test.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/tests/mlx_grouped_linear_test.cpp
 )
 target_link_libraries(mfq-metal-grouped-linear-test PRIVATE
     mfq-metal-runtime
@@ -1113,7 +1113,7 @@ add_test(
 endif()
 
 add_executable(mfq-metal-deepseek-v4-hc-test
-    tests/mlx_deepseek_v4_hc_test.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/tests/mlx_deepseek_v4_hc_test.cpp
 )
 target_link_libraries(
     mfq-metal-deepseek-v4-hc-test PRIVATE
@@ -1131,7 +1131,7 @@ add_test(
 )
 
 add_executable(mfq-metal-deepseek-v41-fusions-test
-    tests/mlx_deepseek_v41_fusions_test.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/tests/mlx_deepseek_v41_fusions_test.cpp
 )
 target_link_libraries(mfq-metal-deepseek-v41-fusions-test PRIVATE mfq-metal-runtime)
 target_compile_features(mfq-metal-deepseek-v41-fusions-test PRIVATE cxx_std_20)
@@ -1142,7 +1142,7 @@ add_test(NAME mfq-metal-deepseek-v41-fusions-test COMMAND mfq-metal-deepseek-v41
 
 if(TYLOINFER_ENABLE_MFQ_COMPAT)
 add_executable(mfq-metal-deepseek-v4-model-test
-    tests/deepseek_v4_model_test.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/tests/deepseek_v4_model_test.cpp
 )
 target_link_libraries(
     mfq-metal-deepseek-v4-model-test PRIVATE
@@ -1162,12 +1162,12 @@ add_test(
 endif()
 
 add_executable(mfq-metal-hf-safetensors-store-test
-    storage/hf_safetensors_store.cpp
-    tests/hf_safetensors_store_test.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/storage/hf_safetensors_store.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/tests/hf_safetensors_store_test.cpp
 )
 
 target_include_directories(mfq-metal-hf-safetensors-store-test PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/storage
+    ${PROJECT_SOURCE_DIR}/backends/metal/storage
 )
 target_link_libraries(mfq-metal-hf-safetensors-store-test PRIVATE mfq-model-source)
 target_compile_features(
@@ -1178,7 +1178,7 @@ add_test(
 )
 
 add_executable(mfq-metal-quantized-row-store-test
-    tests/mlx_quantized_row_store_test.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/tests/mlx_quantized_row_store_test.cpp
 )
 target_link_libraries(mfq-metal-quantized-row-store-test PRIVATE
     mfq-metal-runtime
@@ -1195,7 +1195,7 @@ add_test(
 
 if(TYLOINFER_ENABLE_MFQ_COMPAT)
 add_executable(mfq-metal-ssd-expert-benchmark
-    benchmarks/ssd_expert_benchmark.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/benchmarks/ssd_expert_benchmark.cpp
 )
 target_link_libraries(
     mfq-metal-ssd-expert-benchmark PRIVATE
@@ -1212,7 +1212,7 @@ endif()
 
 if(TYLOINFER_ENABLE_MFQ_COMPAT)
 add_executable(mfq-metal-deepseek-v4-moe-smallm-benchmark
-    benchmarks/mlx_deepseek_v4_moe_smallm_benchmark.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/benchmarks/mlx_deepseek_v4_moe_smallm_benchmark.cpp
 )
 target_link_libraries(
     mfq-metal-deepseek-v4-moe-smallm-benchmark PRIVATE
@@ -1229,7 +1229,7 @@ endif()
 
 if(TYLOINFER_ENABLE_MFQ_COMPAT)
 add_executable(mfq-metal-ssd-expert-arena-test
-    tests/mlx_ssd_expert_arena_test.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/tests/mlx_ssd_expert_arena_test.cpp
 )
 target_link_libraries(
     mfq-metal-ssd-expert-arena-test PRIVATE
@@ -1250,7 +1250,7 @@ endif()
 
 if(TYLOINFER_ENABLE_MFQ_COMPAT)
 add_executable(mfq-metal-ssd-expert-real-smoke
-    tools/ssd_expert_real_smoke.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/tools/ssd_expert_real_smoke.cpp
 )
 target_link_libraries(
     mfq-metal-ssd-expert-real-smoke PRIVATE
@@ -1266,7 +1266,7 @@ set_target_properties(
 endif()
 
 add_executable(mfq-metal-ssd-hf-model-smoke
-    tools/ssd_hf_model_smoke.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/tools/ssd_hf_model_smoke.cpp
 )
 target_link_libraries(
     mfq-metal-ssd-hf-model-smoke PRIVATE
@@ -1280,7 +1280,7 @@ set_target_properties(
 )
 
 add_executable(mfq-metal-ssd-hf-prefill-smoke
-    tools/ssd_hf_prefill_smoke.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/tools/ssd_hf_prefill_smoke.cpp
 )
 target_link_libraries(
     mfq-metal-ssd-hf-prefill-smoke PRIVATE
@@ -1294,7 +1294,7 @@ set_target_properties(
 )
 
 add_executable(mfq-metal-deepseek-v4-attention-test
-    tests/mlx_deepseek_v4_attention_test.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/tests/mlx_deepseek_v4_attention_test.cpp
 )
 target_link_libraries(
     mfq-metal-deepseek-v4-attention-test PRIVATE
@@ -1313,7 +1313,7 @@ add_test(
 
 if(TYLOINFER_ENABLE_MFQ_COMPAT)
 add_executable(mfq-metal-deepseek-v4-causal-lm-test
-    tests/mlx_deepseek_v4_causal_lm_test.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/tests/mlx_deepseek_v4_causal_lm_test.cpp
 )
 target_link_libraries(
     mfq-metal-deepseek-v4-causal-lm-test PRIVATE
@@ -1333,7 +1333,7 @@ add_test(
 endif()
 
 add_executable(mfq-metal-deepseek-v4-sparse-test
-    tests/mlx_deepseek_v4_sparse_test.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/tests/mlx_deepseek_v4_sparse_test.cpp
 )
 target_link_libraries(
     mfq-metal-deepseek-v4-sparse-test PRIVATE
@@ -1352,7 +1352,7 @@ add_test(
 
 if(TYLOINFER_ENABLE_MFQ_COMPAT)
 add_executable(mfq-metal-deepseek-v4-moe-test
-    tests/mlx_deepseek_v4_moe_test.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/tests/mlx_deepseek_v4_moe_test.cpp
 )
 target_link_libraries(
     mfq-metal-deepseek-v4-moe-test PRIVATE
@@ -1371,7 +1371,7 @@ add_test(
 
 endif()
 
-add_executable(mfq-metal-mtp-test tests/mlx_mtp_test.cpp)
+add_executable(mfq-metal-mtp-test ${PROJECT_SOURCE_DIR}/backends/metal/tests/mlx_mtp_test.cpp)
 target_link_libraries(mfq-metal-mtp-test PRIVATE mfq-metal-runtime)
 target_compile_features(mfq-metal-mtp-test PRIVATE cxx_std_20)
 set_target_properties(mfq-metal-mtp-test PROPERTIES
@@ -1379,14 +1379,14 @@ set_target_properties(mfq-metal-mtp-test PROPERTIES
 )
 add_test(NAME mfq-metal-mtp-test COMMAND mfq-metal-mtp-test)
 
-add_executable(mfq-mtp-lora-sessions-test tests/mtp_lora_sessions_test.cpp)
+add_executable(mfq-mtp-lora-sessions-test ${PROJECT_SOURCE_DIR}/backends/metal/tests/mtp_lora_sessions_test.cpp)
 target_link_libraries(mfq-mtp-lora-sessions-test PRIVATE mfq-metal-runtime)
 target_compile_features(mfq-mtp-lora-sessions-test PRIVATE cxx_std_20)
 add_test(NAME mfq-mtp-lora-sessions-test COMMAND mfq-mtp-lora-sessions-test)
 
 if(TYLOINFER_ENABLE_MFQ_COMPAT)
 add_executable(mfq-metal-deepseek-v4-dspark-test
-    tests/mlx_deepseek_v4_dspark_test.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/tests/mlx_deepseek_v4_dspark_test.cpp
 )
 target_link_libraries(
     mfq-metal-deepseek-v4-dspark-test PRIVATE
@@ -1406,7 +1406,7 @@ add_test(
 endif()
 
 add_executable(mfq-metal-deepseek-v4-vision-test
-    tests/mlx_deepseek_v4_vision_test.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/tests/mlx_deepseek_v4_vision_test.cpp
 )
 target_link_libraries(
     mfq-metal-deepseek-v4-vision-test PRIVATE
@@ -1424,7 +1424,7 @@ add_test(
 )
 
 add_executable(mfq-metal-deepseek-v41-vision-test
-    tests/mlx_deepseek_v41_vision_test.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/tests/mlx_deepseek_v41_vision_test.cpp
 )
 target_link_libraries(mfq-metal-deepseek-v41-vision-test PRIVATE mfq-metal-runtime)
 target_compile_features(mfq-metal-deepseek-v41-vision-test PRIVATE cxx_std_20)
@@ -1438,7 +1438,7 @@ if(TYLOINFER_ENABLE_MFQ_COMPAT)
 endif()
 
 add_executable(mfq-metal-moe-ops-test
-    tests/mlx_moe_ops_test.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/tests/mlx_moe_ops_test.cpp
 )
 target_link_libraries(mfq-metal-moe-ops-test PRIVATE
     mfq-metal-runtime
@@ -1455,8 +1455,8 @@ add_test(
 
 if(TYLOINFER_ENABLE_MFQ_COMPAT)
 add_executable(mfq-metal-moe-test
-    runtime/mlx_paged_session_codec.cpp
-    tests/mlx_moe_test.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/runtime/mlx_paged_session_codec.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/tests/mlx_moe_test.cpp
 )
 target_link_libraries(mfq-metal-moe-test PRIVATE
     mfq-metal-runtime
@@ -1486,7 +1486,7 @@ endif()
 
 if(TYLOINFER_ENABLE_MFQ_COMPAT)
 add_executable(mfq-metal-vq-test
-    tests/mlx_vq_test.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/tests/mlx_vq_test.cpp
 )
 target_link_libraries(mfq-metal-vq-test PRIVATE
     mfq-metal-runtime
@@ -1505,7 +1505,7 @@ endif()
 
 if(TYLOINFER_ENABLE_MFQ_COMPAT)
 add_executable(mfq-metal-tensor-test
-    tests/mlx_tensor_test.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/tests/mlx_tensor_test.cpp
 )
 target_link_libraries(mfq-metal-tensor-test PRIVATE
     mfq-metal-runtime
@@ -1520,7 +1520,7 @@ endif()
 
 if(TYLOINFER_ENABLE_MFQ_COMPAT)
 add_executable(mfq-metal-dynamic-geometry-test
-    tests/mlx_dynamic_geometry_test.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/tests/mlx_dynamic_geometry_test.cpp
 )
 target_link_libraries(mfq-metal-dynamic-geometry-test PRIVATE mfq-metal-runtime)
 target_compile_features(mfq-metal-dynamic-geometry-test PRIVATE cxx_std_20)
@@ -1532,7 +1532,7 @@ add_test(NAME mfq-metal-dynamic-geometry-test COMMAND mfq-metal-dynamic-geometry
 endif()
 
 add_executable(mfq-metal-transformer-test
-    tests/mlx_transformer_test.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/tests/mlx_transformer_test.cpp
 )
 target_link_libraries(mfq-metal-transformer-test PRIVATE
     mfq-metal-runtime
@@ -1547,7 +1547,7 @@ add_test(
 )
 
 add_executable(mfq-metal-multimodal-test
-    tests/mlx_multimodal_test.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/tests/mlx_multimodal_test.cpp
 )
 target_link_libraries(mfq-metal-multimodal-test PRIVATE
     mfq-metal-runtime
@@ -1562,7 +1562,7 @@ add_test(
 )
 
 add_executable(mfq-metal-linear-attention-test
-    tests/mlx_linear_attention_test.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/tests/mlx_linear_attention_test.cpp
 )
 target_link_libraries(mfq-metal-linear-attention-test PRIVATE
     mfq-metal-runtime
@@ -1579,7 +1579,7 @@ add_test(
 
 if(TYLOINFER_ENABLE_MFQ_COMPAT)
 add_executable(mfq-metal-qwen35-config-test
-    tests/qwen35_config_test.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/tests/qwen35_config_test.cpp
 )
 target_link_libraries(mfq-metal-qwen35-config-test PRIVATE
     mfq-metal-runtime
@@ -1597,7 +1597,7 @@ add_test(
 endif()
 
 add_executable(mfq-metal-qwen4-config-test
-    tests/qwen4_config_test.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/tests/qwen4_config_test.cpp
 )
 
 target_link_libraries(mfq-metal-qwen4-config-test PRIVATE
@@ -1613,13 +1613,13 @@ add_test(
     COMMAND mfq-metal-qwen4-config-test
 )
 
-add_executable(mfq-metal-qwen4-batching-test tests/mlx_qwen4_batching_test.cpp)
+add_executable(mfq-metal-qwen4-batching-test ${PROJECT_SOURCE_DIR}/backends/metal/tests/mlx_qwen4_batching_test.cpp)
 target_link_libraries(mfq-metal-qwen4-batching-test PRIVATE mfq-metal-runtime mfq-engine)
 target_compile_features(mfq-metal-qwen4-batching-test PRIVATE cxx_std_20)
 set_target_properties(mfq-metal-qwen4-batching-test PROPERTIES BUILD_RPATH "${TYLOINFER_MLX_ROOT}/lib")
 
 add_executable(mfq-metal-sparse-attention-test
-    tests/mlx_sparse_attention_test.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/tests/mlx_sparse_attention_test.cpp
 )
 target_link_libraries(mfq-metal-sparse-attention-test PRIVATE
     mfq-metal-runtime
@@ -1634,14 +1634,14 @@ add_test(
     COMMAND mfq-metal-sparse-attention-test
 )
 
-add_executable(tyloinfer-metal-dense-hc-test tests/mlx_dense_hc_test.cpp)
+add_executable(tyloinfer-metal-dense-hc-test ${PROJECT_SOURCE_DIR}/backends/metal/tests/mlx_dense_hc_test.cpp)
 target_link_libraries(tyloinfer-metal-dense-hc-test PRIVATE mfq-metal-runtime)
 target_compile_features(tyloinfer-metal-dense-hc-test PRIVATE cxx_std_20)
 set_target_properties(tyloinfer-metal-dense-hc-test PROPERTIES BUILD_RPATH "${TYLOINFER_MLX_ROOT}/lib")
 add_test(NAME tyloinfer-metal-dense-hc-test COMMAND tyloinfer-metal-dense-hc-test)
 
 add_executable(mfq-metal-qwen-gated-hc-test
-    tests/qwen_gated_hc_test.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/tests/qwen_gated_hc_test.cpp
 )
 target_link_libraries(mfq-metal-qwen-gated-hc-test PRIVATE
     mfq-metal-runtime
@@ -1660,7 +1660,7 @@ set_tests_properties(mfq-metal-qwen-gated-hc-no-nax-test PROPERTIES
     ENVIRONMENT "TYLOINFER_METAL_DISABLE_NAX=1;MFQ_METAL_DISABLE_NAX=1")
 
 add_executable(mfq-metal-grid-vision-test
-    tests/mlx_grid_vision_test.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/tests/mlx_grid_vision_test.cpp
 )
 target_link_libraries(
     mfq-metal-grid-vision-test PRIVATE
@@ -1678,7 +1678,7 @@ add_test(
 )
 
 add_executable(mfq-metal-qwen35-full-attention-test
-    tests/mlx_qwen35_full_attention_test.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/tests/mlx_qwen35_full_attention_test.cpp
 )
 target_link_libraries(
     mfq-metal-qwen35-full-attention-test PRIVATE
@@ -1696,7 +1696,7 @@ add_test(
 )
 
 add_executable(mfq-metal-qwen35-linear-attention-test
-    tests/mlx_qwen35_linear_attention_test.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/tests/mlx_qwen35_linear_attention_test.cpp
 )
 target_link_libraries(
     mfq-metal-qwen35-linear-attention-test PRIVATE
@@ -1714,7 +1714,7 @@ add_test(
 )
 
 add_executable(mfq-metal-sampling-test
-    tests/mlx_sampling_test.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/tests/mlx_sampling_test.cpp
 )
 target_link_libraries(mfq-metal-sampling-test PRIVATE
     mfq-metal-runtime
@@ -1729,7 +1729,7 @@ add_test(
 )
 
 add_executable(mfq-metal-qwen35-causal-lm-test
-    tests/mlx_qwen35_causal_lm_test.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/tests/mlx_qwen35_causal_lm_test.cpp
 )
 target_link_libraries(
     mfq-metal-qwen35-causal-lm-test PRIVATE
@@ -1747,7 +1747,7 @@ add_test(
 )
 
 add_executable(mfq-metal-nemotron-test
-    tests/mlx_nemotron_h_test.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/tests/mlx_nemotron_h_test.cpp
 )
 target_link_libraries(
     mfq-metal-nemotron-test PRIVATE
@@ -1762,7 +1762,7 @@ set_target_properties(
 add_test(NAME mfq-metal-nemotron-conv-test
     COMMAND mfq-metal-nemotron-test --check-cached-conv)
 add_executable(mfq-metal-minicpmo45-test
-    tests/mlx_minicpmo45_test.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/tests/mlx_minicpmo45_test.cpp
 )
 target_link_libraries(
     mfq-metal-minicpmo45-test PRIVATE
@@ -1780,7 +1780,7 @@ add_test(
 )
 
 add_executable(mfq-metal-qwen35-grouped-parity
-    tools/qwen35_grouped_parity.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/tools/qwen35_grouped_parity.cpp
 )
 target_link_libraries(
     mfq-metal-qwen35-grouped-parity PRIVATE

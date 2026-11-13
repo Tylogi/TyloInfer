@@ -97,7 +97,7 @@ endif()
 if(TYLOINFER_BUILD_METAL_RUNTIME)
     enable_language(OBJCXX)
     # Keep the established build output path and executable locations.
-    add_subdirectory(backends/metal metal)
+    add_subdirectory(engine/backends/metal metal)
 endif()
 
 if(TYLOINFER_BUILD_CUDA_ENGINE)
