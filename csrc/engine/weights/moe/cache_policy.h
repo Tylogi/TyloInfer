@@ -63,7 +63,7 @@ public:
 
     void prepare_resize(int capacity) {
         if (capacity <= 0) throw std::invalid_argument("MoE cache capacity must be positive");
-        for (const auto& slot : slots_) if (slot.inflight)
+        for (const auto& slot : slots_) if (slot.inflight || slot.pins)
             throw std::runtime_error("cannot resize an in-flight MoE cache");
         slots_.reserve(static_cast<size_t>(capacity));
         free_.reserve(static_cast<size_t>(capacity));
@@ -75,7 +75,7 @@ public:
         const int previous = this->capacity();
         if (capacity < previous) {
             for (int slot = capacity; slot < previous; ++slot) {
-                if (slots_[slot].key) by_key_.erase(*slots_[slot].key);
+                if (slots_[slot].key) erase_index(*slots_[slot].key, slot);
                 erase_lru(slot);
             }
             free_.erase(std::remove_if(free_.begin(), free_.end(), [&](int slot) { return slot >= capacity; }), free_.end());
@@ -121,7 +121,7 @@ public:
         } else {
             if (!low_priority_sources_.empty()) for (const int candidate : lru_) {
                 const auto& state = slots_[static_cast<size_t>(candidate)];
-                if (!state.inflight && state.key && std::binary_search(low_priority_sources_.begin(),
+                if (!state.inflight && !state.pins && state.key && std::binary_search(low_priority_sources_.begin(),
                         low_priority_sources_.end(), state.key->source)) {
                     slot = candidate;
                     break;
@@ -129,7 +129,7 @@ public:
             }
             for (const int candidate : lru_) {
                 if (slot >= 0) break;
-                if (!slots_[static_cast<size_t>(candidate)].inflight) {
+                if (!slots_[static_cast<size_t>(candidate)].inflight && !slots_[static_cast<size_t>(candidate)].pins) {
                     slot = candidate;
                     break;
                 }
@@ -141,7 +141,7 @@ public:
             Slot & state = checked(slot);
             replaced = state.key;
             if (state.key.has_value()) {
-                by_key_.erase(*state.key);
+                erase_index(*state.key, slot);
             }
             erase_lru(slot);
         }
@@ -153,6 +153,25 @@ public:
         by_key_.emplace(key, slot);
         append_lru(slot);
         return {slot, state.generation, false, replaced};
+    }
+
+    uint64_t generation(int slot) const { return checked(slot).generation; }
+    size_t pins(int slot) const { return checked(slot).pins; }
+    bool pin(int slot, uint64_t generation) {
+        auto& state = checked(slot);
+        if (!state.key || state.generation != generation) return false;
+        ++state.pins; return true;
+    }
+    bool unpin(int slot, uint64_t generation) {
+        auto& state = checked(slot);
+        if (state.generation != generation || !state.pins) return false;
+        --state.pins; return true;
+    }
+    bool detach(const MoeCacheKey& key, int slot, uint64_t generation) {
+        auto& state = checked(slot);
+        if (!state.key || !(*state.key == key) || state.generation != generation) return false;
+        erase_index(key, slot);
+        return true;
     }
 
     void touch(int slot) {
@@ -183,10 +202,10 @@ public:
             uint64_t generation) {
         Slot & state = checked(slot);
         if (!state.key.has_value() || !(*state.key == key) ||
-                state.generation != generation) {
+                state.generation != generation || state.pins) {
             return false;
         }
-        by_key_.erase(key);
+        erase_index(key, slot);
         state.key.reset();
         state.inflight = false;
         erase_lru(slot);
@@ -199,7 +218,7 @@ public:
     }
     bool replace(int slot,const MoeCacheKey& expected,const MoeCacheKey& replacement) {
         auto& state=checked(slot);
-        if(!state.key || !(*state.key==expected) || by_key_.count(replacement))return false;
+        if(!state.key || state.pins || !(*state.key==expected) || slot_for(expected)!=slot || by_key_.count(replacement))return false;
         by_key_.emplace(replacement,slot);
         by_key_.erase(expected);state.key=replacement;++state.generation;state.inflight=false;
         if(state.listed)lru_.splice(lru_.end(),lru_,state.position);
@@ -215,7 +234,7 @@ public:
     };
     Replacement prepare_replace(int slot,const MoeCacheKey& expected,const MoeCacheKey& replacement) {
         const auto& state=checked(slot);
-        if(!state.key || !(*state.key==expected) || by_key_.count(replacement))
+        if(!state.key || state.pins || !(*state.key==expected) || slot_for(expected)!=slot || by_key_.count(replacement))
             throw std::runtime_error("MoE replacement no longer owns its slot");
         // Reserve all possible simultaneous replacements before payload writes.
         by_key_.reserve(slots_.size()*2);
@@ -227,8 +246,8 @@ public:
     }
     bool replacement_valid(const Replacement& change) const {
         const auto& state=checked(change.slot);
-        return !change.committed && state.key && *state.key==change.expected &&
-            state.generation==change.generation && !by_key_.count(change.replacement);
+        return !change.committed && !state.pins && state.key && *state.key==change.expected &&
+            state.generation==change.generation && slot_for(change.expected)==change.slot && !by_key_.count(change.replacement);
     }
     bool commit_replace(Replacement& change) {
         if(!replacement_valid(change))return false;
@@ -242,7 +261,8 @@ public:
     void rollback_replace(Replacement& change) {
         auto& state=checked(change.slot);
         if(change.committed) {
-            if(!state.key || !(*state.key==change.replacement) || state.generation!=change.generation+1)
+            if(!state.key || state.pins || !(*state.key==change.replacement) ||
+                    state.generation!=change.generation+1 || slot_for(change.replacement)!=change.slot)
                 throw std::runtime_error("MoE replacement changed during rollback");
             change.incoming=by_key_.extract(change.replacement);
             by_key_.insert(std::move(change.original));state.key=change.expected;state.generation=change.generation;
@@ -257,6 +277,7 @@ private:
         std::optional<MoeCacheKey> key;
         uint64_t generation = 0;
         bool inflight = false;
+        size_t pins = 0;
         bool listed = false;
         std::list<int>::iterator position;
     };
@@ -273,6 +294,11 @@ private:
             throw std::out_of_range("MoE cache slot is out of range");
         }
         return slots_[static_cast<size_t>(slot)];
+    }
+
+    void erase_index(const MoeCacheKey& key, int slot) {
+        const auto found = by_key_.find(key);
+        if (found != by_key_.end() && found->second == slot) by_key_.erase(found);
     }
 
     void erase_lru(int slot) {

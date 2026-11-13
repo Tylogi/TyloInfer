@@ -1,3 +1,4 @@
+#include "engine/weights/moe/cache_policy.h"
 #include "mlx_ssd_expert_cache.h"
 #include "mlx_resource_telemetry.h"
 
@@ -20,16 +21,24 @@
 #include <string>
 #include <string_view>
 #include <thread>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
 namespace mfq::metal {
 namespace {
 
-std::uint64_t expert_key(std::size_t layer, std::int32_t expert) {
-    return (static_cast<std::uint64_t>(layer) << 32u) |
-        static_cast<std::uint32_t>(expert);
+tyloi::MoeCacheKey expert_key(std::size_t layer, std::int32_t expert) {
+    if (layer > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+        throw std::out_of_range("SSD expert cache layer exceeds key range");
+    return {0, static_cast<int>(layer), expert};
+}
+
+int book_capacity(std::size_t slots) {
+    if (slots < 6)
+        throw std::invalid_argument("SSD expert cache must hold at least six routed experts");
+    if (slots > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+        throw std::out_of_range("SSD expert cache capacity exceeds slot range");
+    return static_cast<int>(slots);
 }
 
 std::size_t prefill_slot_count(
@@ -83,10 +92,6 @@ struct MlxMoeSsdExpertCache::Impl {
 
     struct Slot {
         State state = State::empty;
-        std::uint64_t key = 0;
-        std::uint64_t generation = 0;
-        std::uint64_t last_use = 0;
-        std::size_t pins = 0;
         std::shared_future<void> gate_up_ready;
         std::shared_future<void> ready;
     };
@@ -189,12 +194,13 @@ struct MlxMoeSsdExpertCache::Impl {
               intermediate_size,
               store.max_num_experts()),
           slots(slot_count),
+          book(book_capacity(slot_count)),
           page_tables(store.num_layers()),
           route_confidence(store.num_layers(), 0) {
-        if (slot_count < 6) {
-            throw std::invalid_argument(
-                "SSD expert cache must hold at least six routed experts");
-        }
+        if (total_slots > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
+            store.num_layers() > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
+            store.max_num_experts() > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+            throw std::out_of_range("SSD expert cache geometry exceeds key range");
         if (worker_count == 0) {
             throw std::invalid_argument("SSD expert IO worker count must be positive");
         }
@@ -225,26 +231,20 @@ struct MlxMoeSsdExpertCache::Impl {
         ++counters.requests;
         const auto key = expert_key(layer, expert);
         while (true) {
-            auto found = resident.find(key);
-            if (found != resident.end()) {
-                auto& slot = slots[found->second];
-                if (slot.state == State::ready ||
-                    slot.state == State::loading) {
+            const int found = book.slot_for(key);
+            if (found >= 0) {
+                auto& slot = slots[found];
+                if (slot.state == State::ready || slot.state == State::loading) {
                     ++counters.hits;
-                    if (slot.state == State::loading) {
-                        ++counters.coalesced;
-                    }
-                    ++slot.pins;
-                    slot.last_use = ++clock;
-                    return {
-                        .slot = found->second,
-                        .generation = slot.generation,
+                    if (slot.state == State::loading) ++counters.coalesced;
+                    const auto lease = book.acquire(key);
+                    book.pin(found, lease.generation);
+                    return {.slot = static_cast<std::size_t>(found),
+                        .generation = lease.generation,
                         .gate_up_ready = slot.gate_up_ready,
-                        .ready = slot.ready,
-                        .cache_hit = true,
-                    };
+                        .ready = slot.ready, .cache_hit = true};
                 }
-                resident.erase(found);
+                book.detach(key, found, book.generation(found));
             }
             if (active_page_table_snapshots == 0) {
                 break;
@@ -257,47 +257,31 @@ struct MlxMoeSsdExpertCache::Impl {
             }
         }
 
-        std::size_t victim = slots.size();
-        std::uint64_t oldest = std::numeric_limits<std::uint64_t>::max();
-        for (std::size_t index = 0; index < slots.size(); ++index) {
-            const auto& slot = slots[index];
-            if (slot.state == State::empty) {
-                victim = index;
-                break;
-            }
-            if (slot.state != State::loading && slot.pins == 0 &&
-                slot.last_use < oldest) {
-                oldest = slot.last_use;
-                victim = index;
-            }
+        auto gate_up_completion = std::make_shared<std::promise<void>>();
+        auto completion = std::make_shared<std::promise<void>>();
+        auto gate_up_ready = gate_up_completion->get_future().share();
+        auto ready = completion->get_future().share();
+        tyloi::MoeCacheSlotLease lease;
+        try { lease = book.acquire(key); }
+        catch (const std::runtime_error&) {
+            throw std::runtime_error("SSD expert cache has no unpinned eviction slot");
         }
-        if (victim == slots.size()) {
-            throw std::runtime_error(
-                "SSD expert cache has no unpinned eviction slot");
-        }
+        const auto victim = static_cast<std::size_t>(lease.slot);
         auto& slot = slots[victim];
         if (slot.state != State::empty) {
-            invalidate_page_table(slot.key);
-            resident.erase(slot.key);
+            if (lease.replaced) invalidate_page_table(*lease.replaced);
             ++counters.evictions;
         }
-        auto gate_up_completion =
-            std::make_shared<std::promise<void>>();
-        auto completion = std::make_shared<std::promise<void>>();
+        book.mark_inflight(lease.slot);
+        book.pin(lease.slot, lease.generation);
         slot.state = State::loading;
-        slot.key = key;
-        ++slot.generation;
-        slot.last_use = ++clock;
-        slot.pins = 1;
-        slot.gate_up_ready =
-            gate_up_completion->get_future().share();
-        slot.ready = completion->get_future().share();
-        resident.emplace(key, victim);
+        slot.gate_up_ready = std::move(gate_up_ready);
+        slot.ready = std::move(ready);
         ++counters.misses;
         auto load = std::make_shared<ParallelLoad>();
         load->arena_slot = prefill_slots + victim;
         load->cache_slot = victim;
-        load->generation = slot.generation;
+        load->generation = lease.generation;
         load->layer = layer;
         load->expert = expert;
         load->gate_up_completion = gate_up_completion;
@@ -314,7 +298,7 @@ struct MlxMoeSsdExpertCache::Impl {
         }
         const auto result = Acquisition{
             .slot = victim,
-            .generation = slot.generation,
+            .generation = lease.generation,
             .gate_up_ready = slot.gate_up_ready,
             .ready = slot.ready,
             .cache_hit = false,
@@ -328,22 +312,14 @@ struct MlxMoeSsdExpertCache::Impl {
         std::size_t layer,
         std::int32_t expert) {
         std::scoped_lock lock(mutex);
-        const auto found = resident.find(expert_key(layer, expert));
-        if (found == resident.end()) {
-            return std::nullopt;
-        }
-        auto& slot = slots[found->second];
-        if (slot.state != State::ready && slot.state != State::loading) {
-            return std::nullopt;
-        }
-        ++slot.pins;
-        return Acquisition{
-            .slot = found->second,
-            .generation = slot.generation,
-            .gate_up_ready = slot.gate_up_ready,
-            .ready = slot.ready,
-            .cache_hit = true,
-        };
+        const int found = book.slot_for(expert_key(layer, expert));
+        if (found < 0) return std::nullopt;
+        auto& slot = slots[found];
+        if (slot.state != State::ready && slot.state != State::loading) return std::nullopt;
+        const auto generation = book.generation(found);
+        book.pin(found, generation);
+        return Acquisition{.slot = static_cast<std::size_t>(found), .generation = generation,
+            .gate_up_ready = slot.gate_up_ready, .ready = slot.ready, .cache_hit = true};
     }
 
     void observe_route(std::size_t layer, bool all_hit) noexcept {
@@ -396,10 +372,7 @@ struct MlxMoeSsdExpertCache::Impl {
             if (acquired.slot >= slots.size()) {
                 continue;
             }
-            auto& slot = slots[acquired.slot];
-            if (slot.generation == acquired.generation && slot.pins != 0) {
-                --slot.pins;
-            }
+            book.unpin(static_cast<int>(acquired.slot), acquired.generation);
         }
         if (buffer < prefill_busy.size()) {
             prefill_busy[buffer] = false;
@@ -412,10 +385,7 @@ struct MlxMoeSsdExpertCache::Impl {
             if (acquired.slot >= slots.size()) {
                 continue;
             }
-            auto& slot = slots[acquired.slot];
-            if (slot.generation == acquired.generation && slot.pins != 0) {
-                --slot.pins;
-            }
+            book.unpin(static_cast<int>(acquired.slot), acquired.generation);
         }
     }
 
@@ -435,11 +405,7 @@ struct MlxMoeSsdExpertCache::Impl {
                 if (acquired.slot >= slots.size()) {
                     continue;
                 }
-                auto& slot = slots[acquired.slot];
-                if (slot.generation == acquired.generation &&
-                    slot.pins != 0) {
-                    --slot.pins;
-                }
+                book.unpin(static_cast<int>(acquired.slot), acquired.generation);
             }
             deferred.clear();
             if (deferred_page_table_snapshots != 0) {
@@ -561,18 +527,16 @@ struct MlxMoeSsdExpertCache::Impl {
                     const auto cache_slot = static_cast<std::size_t>(
                         arena_slot -
                         static_cast<std::int32_t>(prefill_slots));
-                    const auto found = resident.find(
-                        expert_key(route.layer, expert));
+                    const auto found = book.slot_for(expert_key(route.layer, expert));
                     if (cache_slot >= slots.size() ||
-                        found == resident.end() ||
-                        found->second != cache_slot) {
+                        found < 0 ||
+                        static_cast<std::size_t>(found) != cache_slot) {
                         selection.all_hit = false;
                         break;
                     }
                     const auto& slot = slots[cache_slot];
                     if (slot.state != State::ready ||
-                        slot.key != expert_key(route.layer, expert) ||
-                        slot.generation != (*route.generation_map)[
+                        book.generation(static_cast<int>(cache_slot)) != (*route.generation_map)[
                             static_cast<std::size_t>(expert)]) {
                         selection.all_hit = false;
                         break;
@@ -589,7 +553,7 @@ struct MlxMoeSsdExpertCache::Impl {
                         const auto cache_slot = static_cast<std::size_t>(
                             arena_slot -
                             static_cast<std::int32_t>(prefill_slots));
-                        slots[cache_slot].last_use = ++clock;
+                        book.touch(static_cast<int>(cache_slot));
                     }
                 } else {
                     ++counters.device_route_misses;
@@ -637,8 +601,9 @@ struct MlxMoeSsdExpertCache::Impl {
             {
                 std::scoped_lock lock(mutex);
                 auto& slot = slots[load->cache_slot];
-                if (slot.generation == load->generation) {
+                if (book.generation(static_cast<int>(load->cache_slot)) == load->generation) {
                     slot.state = State::failed;
+                    book.clear_inflight(static_cast<int>(load->cache_slot));
                 }
                 ++counters.failures;
             }
@@ -726,13 +691,14 @@ struct MlxMoeSsdExpertCache::Impl {
                 {
                     std::scoped_lock lock(mutex);
                     auto& slot = slots[load->cache_slot];
-                    if (slot.generation != load->generation ||
+                    if (book.generation(static_cast<int>(load->cache_slot)) != load->generation ||
                         slot.state != State::loading) {
                         throw std::logic_error(
                             "SSD expert slot changed while loading");
                     }
                     slot.state = State::ready;
-                    invalidate_page_table(slot.key);
+                    book.clear_inflight(static_cast<int>(load->cache_slot));
+                    invalidate_page_table(*book.key_for(static_cast<int>(load->cache_slot)));
                     ++counters.loads;
                     counters.bytes_read += load->bytes.load();
                     counters.read_calls += load->read_calls.load();
@@ -816,8 +782,8 @@ struct MlxMoeSsdExpertCache::Impl {
         return result;
     }
 
-    void invalidate_page_table(std::uint64_t key) noexcept {
-        const auto layer = static_cast<std::size_t>(key >> 32u);
+    void invalidate_page_table(const tyloi::MoeCacheKey& key) noexcept {
+        const auto layer = static_cast<std::size_t>(key.cohort);
         if (layer < page_tables.size()) {
             ++page_tables[layer].version;
         }
@@ -835,9 +801,8 @@ struct MlxMoeSsdExpertCache::Impl {
     mutable std::mutex mutex;
     std::condition_variable condition;
     bool stopping = false;
-    std::uint64_t clock = 0;
     std::vector<Slot> slots;
-    std::unordered_map<std::uint64_t, std::size_t> resident;
+    tyloi::MoeCacheSlotBook book;
     std::deque<Task> tasks;
     std::vector<Acquisition> deferred;
     std::vector<std::thread> workers;
@@ -919,19 +884,17 @@ struct MlxSsdExpertPageTableSnapshot::Impl {
                     const auto cache_slot = static_cast<std::size_t>(
                         arena_slot -
                         static_cast<std::int32_t>(cache->prefill_slots));
-                    const auto found = cache->resident.find(
-                        expert_key(layer, expert));
+                    const auto found = cache->book.slot_for(expert_key(layer, expert));
                     if (cache_slot >= cache->slots.size() ||
-                        found == cache->resident.end() ||
-                        found->second != cache_slot) {
+                        found < 0 ||
+                        static_cast<std::size_t>(found) != cache_slot) {
                         valid = false;
                         break;
                     }
                     const auto& slot = cache->slots[cache_slot];
                     if (slot.state !=
                             MlxMoeSsdExpertCache::Impl::State::ready ||
-                        slot.key != expert_key(layer, expert) ||
-                        slot.generation != (*generation_map)[
+                        cache->book.generation(static_cast<int>(cache_slot)) != (*generation_map)[
                             static_cast<std::size_t>(expert)]) {
                         valid = false;
                         break;
@@ -948,7 +911,7 @@ struct MlxSsdExpertPageTableSnapshot::Impl {
                     const auto cache_slot = static_cast<std::size_t>(
                         arena_slot -
                         static_cast<std::int32_t>(cache->prefill_slots));
-                    cache->slots[cache_slot].last_use = ++cache->clock;
+                    cache->book.touch(static_cast<int>(cache_slot));
                 }
             } else {
                 ++cache->counters.device_route_misses;
@@ -961,11 +924,7 @@ struct MlxSsdExpertPageTableSnapshot::Impl {
                 if (acquired.slot >= cache->slots.size()) {
                     continue;
                 }
-                auto& slot = cache->slots[acquired.slot];
-                if (slot.generation == acquired.generation &&
-                    slot.pins != 0) {
-                    --slot.pins;
-                }
+                cache->book.unpin(static_cast<int>(acquired.slot), acquired.generation);
             }
             cache->deferred.clear();
             if (cache->deferred_page_table_snapshots != 0) {
@@ -1487,21 +1446,20 @@ MlxMoeSsdExpertCache::snapshot_page_table(std::size_t layer) {
                 expert_count,
                 0);
             for (std::size_t expert = 0; expert < expert_count; ++expert) {
-                const auto found = impl_->resident.find(expert_key(
-                    layer,
-                    static_cast<std::int32_t>(expert)));
-                if (found == impl_->resident.end()) {
+                const auto found = impl_->book.slot_for(expert_key(
+                    layer, static_cast<std::int32_t>(expert)));
+                if (found < 0) {
                     continue;
                 }
-                const auto& slot = impl_->slots[found->second];
+                const auto& slot = impl_->slots[found];
                 if (slot.state != Impl::State::ready) {
                     continue;
                 }
                 (*slot_map)[expert] = static_cast<std::int32_t>(
-                    impl_->prefill_slots + found->second);
-                (*generation_map)[expert] = slot.generation;
+                    impl_->prefill_slots + found);
+                (*generation_map)[expert] = impl_->book.generation(found);
                 device_generations[expert] =
-                    static_cast<std::uint32_t>(slot.generation);
+                    static_cast<std::uint32_t>(impl_->book.generation(found));
                 device_readiness[expert] = 1;
             }
             page_table.slot_ids = std::make_shared<mlx::core::array>(
@@ -1653,13 +1611,14 @@ void MlxMoeSsdExpertCache::clear() {
         throw std::runtime_error(
             "cannot clear SSD expert cache while a page table is active");
     }
-    for (auto& slot : impl_->slots) {
-        if (slot.state == Impl::State::loading || slot.pins != 0) {
+    for (std::size_t i = 0; i < impl_->slots.size(); ++i) {
+        const auto& slot = impl_->slots[i];
+        if (slot.state == Impl::State::loading || impl_->book.pins(static_cast<int>(i)) != 0) {
             throw std::runtime_error(
                 "cannot clear SSD expert cache while experts are in use");
         }
     }
-    impl_->resident.clear();
+    impl_->book = tyloi::MoeCacheSlotBook(book_capacity(impl_->slot_count));
     for (auto& slot : impl_->slots) {
         slot = {};
     }
