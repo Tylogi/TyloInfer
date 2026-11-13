@@ -155,7 +155,7 @@ private:
     MlxLinear output_;
     MlxRmsNorm ffn_norm_;
     MlxQwen35DenseSwiGlu ffn_;
-    tyloi::state::Recurrent::State state_{{}, {}, false};
+    tyloi::state::Recurrent cache_;
     tyloi::state::Recurrent::State zero_state_{{}, {}, false};
     MlxResourceTelemetry resources_;
     int zero_cache_batch_ = 0;

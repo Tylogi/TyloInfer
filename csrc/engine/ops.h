@@ -21,7 +21,8 @@ namespace tyloi::weights { class ExpertBatch; }
 
 namespace tyloi::ops {
 
-// In the native CUDA runtime, computation requires CUDA unless stated below.
+// Storage operations select the compiled CPU, CUDA or Metal implementation.
+// Other computation requires CUDA unless stated below.
 // CUDA execution and prepared-weight operations require an execution scope.
 // qkv_norm and append_kv also require a scope for their CPU passthrough cases.
 using Trace = std::vector<std::pair<std::string, Tensor>>;
@@ -252,6 +253,7 @@ Tensor tril(const Tensor& input, std::int64_t diagonal = 0);
 Tensor masked_fill(const Tensor& input, const Tensor& mask, double value);
 // Fill supports CPU and CUDA; CUDA requires an execution scope.
 // Memory initialization uses current device resources without executor scratch.
+// Metal currently supports zero fill on contiguous storage.
 void fill(Tensor& input, double value);
 void masked_fill_inplace(Tensor& input, const Tensor& mask, double value);
 void scatter_add(Tensor& input, std::int64_t dim, const Tensor& indices, const Tensor& source);
@@ -269,6 +271,7 @@ inline Tensor from_blob(void* data, std::initializer_list<std::int64_t> shape, c
 }
 Tensor copy(const Tensor& input, Device target);
 // Writes destination's existing backing; source and destination may use different devices.
+// Metal requires matching contiguous tensors on the same device; partial overlap is rejected.
 void copy_into(Tensor destination, const Tensor& source);
 Tensor cast(const Tensor& input, ScalarType type);
 // Targeted cast uses native tensor conversion; CUDA copy uses execution collectives.

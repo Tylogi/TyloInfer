@@ -18,6 +18,8 @@ public:
     };
 
     Recurrent() = default;
+    Recurrent(Recurrent&&) noexcept = default;
+    Recurrent& operator=(Recurrent&&) noexcept = default;
     Recurrent(const Recurrent&) = delete;
     Recurrent& operator=(const Recurrent&) = delete;
 

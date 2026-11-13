@@ -38,6 +38,8 @@ set_target_properties(mfq-cpu-execution PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # Compressed host math; shared by CUDA offload and other host consumers.
 add_library(mfq-cpu-ops STATIC
+    ops/tensor.cpp
+    ops/tensor.h
     native/features.cpp
     native/features.h
     native/host_memory_copy.cpp
@@ -54,6 +56,7 @@ target_include_directories(mfq-cpu-ops PRIVATE
 )
 target_link_libraries(mfq-cpu-ops PUBLIC mfq-host-parallel)
 target_compile_features(mfq-cpu-ops PUBLIC cxx_std_17)
+target_compile_features(mfq-cpu-ops PRIVATE cxx_std_20)
 set_target_properties(mfq-cpu-ops PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64|i.86)$")

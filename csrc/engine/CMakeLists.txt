@@ -7,6 +7,7 @@ set_target_properties(mfq-tensor PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 add_library(mfq-engine STATIC
     config.cpp
+    storage_ops.cpp
     engine.cpp
     executor.cpp
     generation/decode.cpp
@@ -60,6 +61,17 @@ add_library(mfq-engine STATIC
 )
 if(TYLOINFER_BUILD_CUDA_ENGINE)
     target_compile_definitions(mfq-engine PUBLIC TYLOINFER_NATIVE_CUDA=1)
+    target_include_directories(mfq-engine PRIVATE
+        ${TYLOINFER_REPOSITORY_ROOT}
+        ${PROJECT_SOURCE_DIR}/engine/backends/cuda/native
+        ${PROJECT_SOURCE_DIR}/engine/backends/cuda/native/tensor
+        ${PROJECT_SOURCE_DIR}/engine/backends/cuda/kernels)
+    target_link_libraries(mfq-engine PRIVATE
+        CUDA::cudart CUDA::cublas mfq-ggml-internal-headers)
+endif()
+if(TYLOINFER_BUILD_METAL_RUNTIME)
+    target_compile_definitions(mfq-engine PUBLIC TYLOINFER_NATIVE_MLX_RUNTIME=1)
+    target_link_libraries(mfq-engine PRIVATE mfq-metal-ops)
 endif()
 add_library(mfq::engine ALIAS mfq-engine)
 target_include_directories(mfq-engine
@@ -81,6 +93,7 @@ target_link_libraries(mfq-engine PUBLIC
     mfq-json
     mfq-prefix-blocks
     mfq-qsa-kv-store
+    mfq-cpu-ops
 )
 set_target_properties(mfq-engine PROPERTIES POSITION_INDEPENDENT_CODE ON)
 

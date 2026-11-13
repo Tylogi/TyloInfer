@@ -6,6 +6,11 @@
 
 namespace tyloi::metal::ops {
 
+Tensor empty(std::span<const std::int64_t> shape, const TensorOptions& options);
+Tensor zeros(std::span<const std::int64_t> shape, const TensorOptions& options);
+void copy_into(Tensor destination, const Tensor& source);
+void fill(Tensor& value, double number);
+
 Tensor copy(const Tensor& value, Device target);
 Tensor clone(const Tensor& value);
 Tensor cast(const Tensor& value, ScalarType type);

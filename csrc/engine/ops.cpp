@@ -45,7 +45,11 @@ struct DeviceScope::Impl {
     std::optional<MfqCudaGuard> guard;
 
     explicit Impl(Device target) {
-        if ((!target.is_cpu() && !target.is_cuda()) || (target.is_cuda() && target.index < 0))
+        if ((!target.is_cpu() && !target.is_cuda()
+#ifdef TYLOINFER_NATIVE_MLX_RUNTIME
+             && !(target.is_metal() && target.index == 0)
+#endif
+             ) || (target.is_cuda() && target.index < 0))
             throw std::invalid_argument("unsupported execution device");
         if (target.is_cuda()) guard.emplace(target.index);
     }
@@ -1124,13 +1128,6 @@ Tensor copy(const Tensor& value_tensor, Device target) {
     device(target);
     return owner(cuda::ops::copy(value, target));
 }
-void copy_into(Tensor destination_tensor, const Tensor& source_tensor) {
-    auto& destination = ::tyloi::ops::dense(destination_tensor);
-    const auto& source = ::tyloi::ops::dense(source_tensor);
-    input(destination);
-    input(source);
-    cuda::ops::copy_into(destination, source);
-}
 Tensor cast(const Tensor& value_tensor, ScalarType type) {
     const auto& value = ::tyloi::ops::dense(value_tensor);
     input(value);
@@ -1146,11 +1143,6 @@ Tensor contiguous(const Tensor& value_tensor) {
     const auto& value = ::tyloi::ops::dense(value_tensor);
     input(value);
     return owner(cuda::ops::contiguous(value));
-}
-Tensor clone(const Tensor& value_tensor) {
-    const auto& value = ::tyloi::ops::dense(value_tensor);
-    input(value);
-    return owner(cuda::ops::clone(value));
 }
 Tensor reshape(const Tensor& value_tensor, std::span<const std::int64_t> shape) {
     const auto& value = ::tyloi::ops::dense(value_tensor);
@@ -1173,14 +1165,6 @@ Tensor cat(std::span<const Tensor> values, std::int64_t dim) {
         dense_values.push_back(dense(value));
     }
     return owner(cuda::ops::cat(dense_values, dim));
-}
-Tensor zeros(std::span<const std::int64_t> shape, const TensorOptions& options) {
-    DeviceScope scope(options.target_device());
-    return owner(cuda::ops::zeros(shape, options));
-}
-Tensor empty(std::span<const std::int64_t> shape, const TensorOptions& options) {
-    DeviceScope scope(options.target_device());
-    return owner(cuda::empty(shape, options));
 }
 Tensor sample_greedy(const Tensor& logits_tensor) {
     const auto& logits = dense(logits_tensor);
@@ -1517,57 +1501,6 @@ void masked_fill_inplace(Tensor& value_tensor, const Tensor& mask_tensor, double
     compatible(value, mask);
     require_cuda(value);
     cuda::ops::masked_fill_inplace(value, mask, fill_value);
-}
-void fill(Tensor& value_tensor, double fill_value) {
-    auto& value = ::tyloi::ops::dense(value_tensor);
-    if (!value.defined()) throw std::invalid_argument("undefined tensor");
-    DeviceScope scope(value.device());
-    if (value.is_cuda()) {
-        cuda::ops::fill(value, fill_value);
-        return;
-    }
-    if (!value.is_contiguous())
-        throw std::invalid_argument("CPU fill requires a contiguous tensor");
-    if (fill_value == 0.0) {
-        std::memset(value.data_ptr(), 0, value.nbytes());
-        return;
-    }
-    switch (value.scalar_type()) {
-        case ScalarType::boolean:
-            std::fill_n(value.data_ptr<bool>(), value.numel(), fill_value != 0.0);
-            break;
-        case ScalarType::uint8:
-            std::fill_n(value.data_ptr<std::uint8_t>(), value.numel(), static_cast<std::uint8_t>(fill_value));
-            break;
-        case ScalarType::int8:
-            std::fill_n(value.data_ptr<std::int8_t>(), value.numel(), static_cast<std::int8_t>(fill_value));
-            break;
-        case ScalarType::int16:
-            std::fill_n(value.data_ptr<std::int16_t>(), value.numel(), static_cast<std::int16_t>(fill_value));
-            break;
-        case ScalarType::int32:
-            std::fill_n(value.data_ptr<std::int32_t>(), value.numel(), static_cast<std::int32_t>(fill_value));
-            break;
-        case ScalarType::int64:
-            std::fill_n(value.data_ptr<std::int64_t>(), value.numel(), static_cast<std::int64_t>(fill_value));
-            break;
-        case ScalarType::float16:
-            std::fill_n(value.data_ptr<std::uint16_t>(), value.numel(),
-                cuda::encode_float16(static_cast<float>(fill_value)));
-            break;
-        case ScalarType::bfloat16:
-            std::fill_n(value.data_ptr<std::uint16_t>(), value.numel(),
-                cuda::encode_bfloat16(static_cast<float>(fill_value)));
-            break;
-        case ScalarType::float32:
-            std::fill_n(value.data_ptr<float>(), value.numel(), static_cast<float>(fill_value));
-            break;
-        case ScalarType::float64:
-            std::fill_n(value.data_ptr<double>(), value.numel(), fill_value);
-            break;
-        default:
-            throw std::invalid_argument("CPU fill for this scalar type is not implemented yet");
-    }
 }
 void scatter_add(Tensor& value_tensor, std::int64_t dim, const Tensor& indices_tensor, const Tensor& source_tensor) {
     auto& value = ::tyloi::ops::dense(value_tensor);

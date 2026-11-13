@@ -76,6 +76,18 @@ find_library(TYLOINFER_COREVIDEO_FRAMEWORK CoreVideo REQUIRED)
 find_library(TYLOINFER_IOSURFACE_FRAMEWORK IOSurface REQUIRED)
 find_library(TYLOINFER_IOKIT_FRAMEWORK IOKit REQUIRED)
 
+add_library(mfq-metal-ops STATIC
+    ${TYLOINFER_METAL_ROOT}/native/stream.cpp
+    ${TYLOINFER_METAL_ROOT}/native/tensor/tensor.cpp
+    ${TYLOINFER_METAL_ROOT}/ops/tensor.cpp
+)
+target_include_directories(mfq-metal-ops PUBLIC ${PROJECT_SOURCE_DIR})
+target_compile_features(mfq-metal-ops PUBLIC cxx_std_20)
+target_link_libraries(mfq-metal-ops PUBLIC mfq-tensor PRIVATE
+    mfq-mlx Threads::Threads
+    ${TYLOINFER_METAL_FRAMEWORK} ${TYLOINFER_FOUNDATION_FRAMEWORK})
+set_target_properties(mfq-metal-ops PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 add_library(mfq-ane STATIC ${TYLOINFER_METAL_ROOT}/native/ane.mm ${PROJECT_SOURCE_DIR}/backends/metal/runtime/mtp_lora.cpp)
 target_include_directories(mfq-ane PUBLIC ${TYLOINFER_METAL_ROOT}/native)
 target_include_directories(mfq-ane PUBLIC ${PROJECT_SOURCE_DIR}/backends/metal/runtime)
@@ -333,14 +345,11 @@ configure_file(${TYLOINFER_METAL_ROOT}/kernels/gguf/gguf_embedded.h.in gguf_embe
 configure_file(${TYLOINFER_METAL_ROOT}/kernels/mlx/mlx_affine_nax.h.in mlx_affine_nax.h @ONLY)
 
 add_library(mfq-metal-runtime STATIC
-    ${PROJECT_SOURCE_DIR}/engine/backends/metal/native/stream.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/metal/native/profile.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/metal/native/memory.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/metal/native/allocation.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/metal/native/resident_allocations.cpp
-    ${PROJECT_SOURCE_DIR}/engine/backends/metal/native/tensor/tensor.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/metal/executor/executor.cpp
-    ${PROJECT_SOURCE_DIR}/engine/backends/metal/ops/tensor.cpp
     ${PROJECT_SOURCE_DIR}/backends/metal/storage/hf_safetensors_store.cpp
     ${PROJECT_SOURCE_DIR}/backends/metal/storage/mfq_container.cpp
     ${PROJECT_SOURCE_DIR}/backends/metal/storage/mfe_expert_store.cpp
@@ -541,6 +550,7 @@ target_include_directories(mfq-metal-runtime PRIVATE
     ${CMAKE_CURRENT_BINARY_DIR}
 )
 target_link_libraries(mfq-metal-runtime PUBLIC
+    mfq-metal-ops
     mfq-core
     mfq-models
     mfq-engine

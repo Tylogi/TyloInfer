@@ -4,7 +4,7 @@
 #include "engine/config.h"
 #include "engine/state/kv_layout.h"
 
-#include "engine/backends/metal/ops/tensor.h"
+#include "engine/ops.h"
 #include "engine/backends/metal/native/tensor/tensor.h"
 
 #include <algorithm>
@@ -921,9 +921,9 @@ MlxKvCacheSnapshot MlxKvCache::snapshot(bool detached) const {
     }
     auto visible = physical_view();
     auto key = detached ? mlx::core::array(tyloi::metal::array(
-        tyloi::metal::ops::clone(tyloi::metal::tensor(visible.first)))) : visible.first;
+        tyloi::ops::clone(tyloi::metal::tensor(visible.first)))) : visible.first;
     auto value = detached ? mlx::core::array(tyloi::metal::array(
-        tyloi::metal::ops::clone(tyloi::metal::tensor(visible.second)))) : visible.second;
+        tyloi::ops::clone(tyloi::metal::tensor(visible.second)))) : visible.second;
     mlx::core::eval(key, value);
     return MlxKvCacheSnapshot{
         static_cast<int>(kv_.batch),
@@ -967,13 +967,13 @@ void MlxKvCache::restore_snapshot(
     key = mlx::core::slice_update(
         key,
         mlx::core::array(tyloi::metal::array(
-            tyloi::metal::ops::clone(tyloi::metal::tensor(snapshot.key)))),
+            tyloi::ops::clone(tyloi::metal::tensor(snapshot.key)))),
         Shape{0, 0, 0, 0},
         Shape{static_cast<int>(kv_.batch), static_cast<int>(kv_.heads), snapshot.position, key_storage().shape(3)});
     value = mlx::core::slice_update(
         value,
         mlx::core::array(tyloi::metal::array(
-            tyloi::metal::ops::clone(tyloi::metal::tensor(snapshot.value)))),
+            tyloi::ops::clone(tyloi::metal::tensor(snapshot.value)))),
         Shape{0, 0, 0, 0},
         Shape{static_cast<int>(kv_.batch), static_cast<int>(kv_.heads), snapshot.position, value_storage().shape(3)});
     mlx::core::eval(key, value);

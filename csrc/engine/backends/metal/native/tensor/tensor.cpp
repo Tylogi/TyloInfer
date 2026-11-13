@@ -76,6 +76,11 @@ public:
     }
 
     const mlx::core::array& value() const noexcept { return value_; }
+    void replace(mlx::core::array value) {
+        if (value.shape() != value_.shape() || value.dtype() != value_.dtype())
+            throw std::invalid_argument("Metal tensor replacement metadata differs");
+        value_ = std::move(value);
+    }
 
 private:
     mlx::core::array value_;
@@ -164,6 +169,12 @@ Layout layout(std::span<const std::int64_t> shape, ScalarType type) {
 
 }  // namespace
 
+Tensor allocate(std::span<const std::int64_t> shape, ScalarType type) {
+    auto dimensions = layout(shape, type);
+    return tensor(mlx::core::array(mlx::core::allocator::malloc(dimensions.bytes),
+        std::move(dimensions.shape), dtype(type)));
+}
+
 Tensor copy_from_host(const void* data, std::span<const std::int64_t> shape, ScalarType type) {
     auto dimensions = layout(shape, type);
     if (dimensions.bytes && !data) throw std::invalid_argument("null tensor data");
@@ -239,6 +250,12 @@ const mlx::core::array& array(const tyloi::Tensor& value) {
     const auto* representation = value.representation<Array>();
     if (!representation) throw std::invalid_argument("tensor is not an MLX array");
     return representation->value();
+}
+
+void replace(Tensor& value, mlx::core::array replacement) {
+    auto* representation = value.representation<Array>();
+    if (!representation) throw std::invalid_argument("tensor is not an MLX array");
+    representation->replace(std::move(replacement));
 }
 
 }  // namespace tyloi::metal
