@@ -60,6 +60,7 @@ add_library(mfq-engine STATIC
     state/kv_view.cpp
     state/kv_layout.cpp
     state/paged_kv.cpp
+    state/kv_sequence.cpp
 )
 if(TYLOINFER_BUILD_CUDA_ENGINE)
     target_compile_definitions(mfq-engine PUBLIC TYLOINFER_NATIVE_CUDA=1)

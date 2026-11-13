@@ -19,6 +19,7 @@ struct KvOffloadConfig {
     bool preallocate = false;
     bool ram_preallocated = true;
     bool ssd_enabled = true;
+    ::tyloi::Device device{::tyloi::DeviceType::cuda, 0};
     std::size_t gpu_hot_bytes() const { return gpu_budget_bytes-buffer_bytes; }
 };
 
@@ -76,6 +77,7 @@ private:
     std::shared_ptr<KvOffloadStore> store_;
     int64_t width_, block_rows_, position_ = 0;
     ::tyloi::ScalarType dtype_;
+    ::tyloi::TensorOptions options_;
     std::vector<KvOffloadStore::BlockPtr> blocks_;
 };
 }

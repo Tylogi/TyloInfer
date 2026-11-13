@@ -265,4 +265,58 @@ Tensor update_slice(const Tensor& destination, const Tensor& source,
     return metal::tensor(mlx::core::slice_update(target, values, begin, end, gpu_stream()));
 }
 
+
+Tensor cat(std::span<const Tensor> values, std::int64_t dim) {
+    if (values.empty()) throw std::invalid_argument("Metal cat requires at least one tensor");
+    const auto& first = input(values.front());
+    const auto axis = dimension(dim, first.ndim());
+    std::vector<mlx::core::array> arrays;
+    arrays.reserve(values.size());
+    std::int64_t extent = 0;
+    for (const auto& value : values) {
+        const auto& item = input(value);
+        if (item.ndim() != first.ndim() || item.dtype() != first.dtype())
+            throw std::invalid_argument("Metal cat requires matching ranks and dtypes");
+        for (int index = 0; index < first.ndim(); ++index)
+            if (index != axis && item.shape(index) != first.shape(index))
+                throw std::invalid_argument("Metal cat shapes do not match");
+        if (item.shape(axis) > std::numeric_limits<int>::max() - extent)
+            throw std::overflow_error("Metal cat extent exceeds int32 limit");
+        extent += item.shape(axis);
+        arrays.push_back(item);
+    }
+    return metal::tensor(mlx::core::concatenate(std::move(arrays), axis, gpu_stream()));
+}
+
+Tensor index_select(const Tensor& value, std::int64_t dim, const Tensor& indices) {
+    const auto& source = input(value);
+    const auto& selected = input(indices);
+    const auto axis = dimension(dim, source.ndim());
+    if (selected.ndim() != 1 || (selected.dtype() != mlx::core::int32 && selected.dtype() != mlx::core::int64))
+        throw std::invalid_argument("Metal indices must be a one-dimensional integer tensor");
+    return metal::tensor(mlx::core::take(source, selected, axis, gpu_stream()));
+}
+
+void index_copy(Tensor& value, std::int64_t dim, const Tensor& indices, const Tensor& source) {
+    const auto& target = input(value);
+    const auto& selected = input(indices);
+    const auto& updates = input(source);
+    const auto axis = dimension(dim, target.ndim());
+    if (selected.ndim() != 1 || (selected.dtype() != mlx::core::int32 && selected.dtype() != mlx::core::int64))
+        throw std::invalid_argument("Metal indices must be a one-dimensional integer tensor");
+    if (target.ndim() != updates.ndim() || target.dtype() != updates.dtype() ||
+        updates.shape(axis) != selected.size())
+        throw std::invalid_argument("Metal index copy requires matching ranks and dtypes");
+    for (int index = 0; index < target.ndim(); ++index)
+        if (index != axis && target.shape(index) != updates.shape(index))
+            throw std::invalid_argument("Metal index copy shapes do not match");
+    if (!selected.size()) return;
+    mlx::core::Shape index_shape(target.ndim(), 1);
+    index_shape[axis] = updates.shape(axis);
+    auto expanded = mlx::core::broadcast_to(
+        mlx::core::reshape(selected, index_shape, gpu_stream()), updates.shape(), gpu_stream());
+    auto result = mlx::core::put_along_axis(target, expanded, updates, axis, gpu_stream());
+    metal::replace(value, std::move(result));
+}
+
 }  // namespace tyloi::metal::ops

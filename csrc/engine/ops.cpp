@@ -1143,18 +1143,6 @@ Tensor expand(const Tensor& value_tensor, std::span<const std::int64_t> shape) {
     input(value);
     return owner(tyloi::expand(value, shape));
 }
-Tensor cat(std::span<const Tensor> values, std::int64_t dim) {
-    if (values.empty()) throw std::invalid_argument("cat requires at least one tensor");
-    std::vector<DenseTensor> dense_values;
-    dense_values.reserve(values.size());
-    for (const auto& value : values) {
-        if (!value.defined()) throw std::invalid_argument("cat requires defined tensors");
-        if (dense_values.empty()) input(value);
-        else compatible(dense_values.front(), value);
-        dense_values.push_back(dense(value));
-    }
-    return owner(cuda::ops::cat(dense_values, dim));
-}
 Tensor sample_greedy(const Tensor& logits_tensor) {
     const auto& logits = dense(logits_tensor);
     input(logits);
@@ -1281,13 +1269,6 @@ Tensor unsqueeze(const Tensor& value_tensor, std::int64_t dim) {
     const auto& value = ::tyloi::ops::dense(value_tensor);
     input(value);
     return owner(tyloi::unsqueeze(value, dim));
-}
-Tensor index_select(const Tensor& value_tensor, std::int64_t dim, const Tensor& indices_tensor) {
-    const auto& value = ::tyloi::ops::dense(value_tensor);
-    const auto& indices = ::tyloi::ops::dense(indices_tensor);
-    compatible(value, indices);
-    require_cuda(value);
-    return owner(cuda::ops::index_select(value, dim, indices));
 }
 Tensor sum(const Tensor& value_tensor, std::int64_t dim, bool keepdim) {
     const auto& value = ::tyloi::ops::dense(value_tensor);

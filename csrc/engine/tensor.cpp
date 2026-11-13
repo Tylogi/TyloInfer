@@ -15,6 +15,18 @@ void count_storage(const std::shared_ptr<TensorStorage>& storage,
 
 }  // namespace
 
+const DenseTensor& Tensor::dense() const {
+    const auto* value = dynamic_cast<const DenseTensor*>(impl_.get());
+    if (!value) throw std::invalid_argument("operation requires a dense tensor");
+    return *value;
+}
+
+DenseTensor& Tensor::dense() {
+    auto* value = dynamic_cast<DenseTensor*>(impl_.get());
+    if (!value) throw std::invalid_argument("operation requires a dense tensor");
+    return *value;
+}
+
 std::size_t backing_bytes(std::span<const DenseTensor* const> buffers) {
     std::size_t total = 0;
     std::unordered_set<const void*> seen;

@@ -264,10 +264,50 @@ Tensor update_slice(const Tensor& destination, const Tensor& source, std::int64_
     return destination;
 }
 
+Tensor cat(std::span<const Tensor> values, std::int64_t dim) {
+#ifdef TYLOINFER_NATIVE_MLX_RUNTIME
+    for (const auto& value : values)
+        if (value.defined() && value.device().is_metal()) return metal::ops::cat(values, dim);
+#endif
+#ifdef TYLOINFER_NATIVE_CUDA
+    if (values.empty()) throw std::invalid_argument("cat requires at least one tensor");
+    std::vector<DenseTensor> dense_values;
+    dense_values.reserve(values.size());
+    for (const auto& value : values) {
+        if (!value.defined()) throw std::invalid_argument("cat requires defined tensors");
+        if (dense_values.empty()) input(value);
+        else compatible(dense_values.front(), value);
+        dense_values.push_back(dense(value));
+    }
+    return owner(cuda::ops::cat(dense_values, dim));
+#else
+    throw std::invalid_argument("cat is not supported");
+#endif
+}
+
+Tensor index_select(const Tensor& value_tensor, std::int64_t dim, const Tensor& indices_tensor) {
+#ifdef TYLOINFER_NATIVE_MLX_RUNTIME
+    if ((value_tensor.defined() && value_tensor.device().is_metal()) ||
+        (indices_tensor.defined() && indices_tensor.device().is_metal()))
+        return metal::ops::index_select(value_tensor, dim, indices_tensor);
+#endif
+#ifdef TYLOINFER_NATIVE_CUDA
+    const auto& value = ::tyloi::ops::dense(value_tensor);
+    const auto& indices = ::tyloi::ops::dense(indices_tensor);
+    compatible(value, indices);
+    require_cuda(value);
+    return owner(cuda::ops::index_select(value, dim, indices));
+#else
+    throw std::invalid_argument("index select is not supported");
+#endif
+}
+
 void index_copy(Tensor& value_tensor, std::int64_t dim, const Tensor& indices_tensor, const Tensor& source_tensor) {
 #ifdef TYLOINFER_NATIVE_MLX_RUNTIME
-    if (value_tensor.defined() && value_tensor.device().is_metal())
-        throw std::invalid_argument("Metal indexed update is not supported");
+    if (value_tensor.defined() && value_tensor.device().is_metal()) {
+        metal::ops::index_copy(value_tensor, dim, indices_tensor, source_tensor);
+        return;
+    }
 #endif
 #ifdef TYLOINFER_NATIVE_CUDA
     auto& value = ::tyloi::ops::dense(value_tensor);
@@ -283,3 +323,16 @@ void index_copy(Tensor& value_tensor, std::int64_t dim, const Tensor& indices_te
 }
 
 } // namespace tyloi::ops
+
+namespace tyloi {
+Tensor Tensor::relocated(Device target) const {
+    if (!impl_) return {};
+    if (device().is_metal() || target.is_metal()) return ops::copy(*this, target);
+    if (const auto* value = representation<DenseTensor>()) {
+        return value->defined() && value->device() != target
+            ? ops::copy(*this, target)
+            : Tensor{*value};
+    }
+    return Tensor{impl_->relocated(target)};
+}
+} // namespace tyloi

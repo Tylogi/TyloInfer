@@ -33,29 +33,6 @@ std::size_t normalize_dimension(std::int64_t dimension, std::size_t rank, bool a
 
 }  // namespace
 
-const DenseTensor& Tensor::dense() const {
-    const auto* value = dynamic_cast<const DenseTensor*>(impl_.get());
-    if (!value) throw std::invalid_argument("operation requires a dense tensor");
-    return *value;
-}
-
-DenseTensor& Tensor::dense() {
-    auto* value = dynamic_cast<DenseTensor*>(impl_.get());
-    if (!value) throw std::invalid_argument("operation requires a dense tensor");
-    return *value;
-}
-
-Tensor Tensor::relocated(Device target) const {
-    if (!impl_) return {};
-    if (device().is_metal() || target.is_metal()) return ops::copy(*this, target);
-    if (const auto* value = representation<DenseTensor>()) {
-        return value->defined() && value->device() != target
-            ? Tensor{value->to(target)}
-            : Tensor{*value};
-    }
-    return Tensor{impl_->relocated(target)};
-}
-
 DenseTensor reshape(const DenseTensor& source, std::span<const std::int64_t> shape) {
     const auto& view = source.view_descriptor();
     if (!source.defined()) {

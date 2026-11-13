@@ -320,6 +320,7 @@ Tensor unsqueeze(const Tensor& input, std::int64_t dim);
 Tensor slice(const Tensor& input, std::int64_t dim, std::int64_t start, std::int64_t end, std::int64_t step = 1);
 // Updates the selected region; the backend may reuse or replace destination backing.
 Tensor update_slice(const Tensor& destination, const Tensor& source, std::int64_t dim, std::int64_t start);
+// Index selection and updates dispatch to CUDA or Metal; indices share the input device.
 Tensor index_select(const Tensor& input, std::int64_t dim, const Tensor& indices);
 Tensor sum(const Tensor& input, std::int64_t dim, bool keepdim = false);
 // Modifies the input backing storage; Metal indexed update is not supported.

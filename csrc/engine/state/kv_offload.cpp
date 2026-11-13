@@ -42,11 +42,7 @@ struct Slots {
         free[offset]=bytes;
     }
 };
-::tyloi::DenseTensor indices(const std::vector<int64_t>& values, const ::tyloi::TensorOptions& options) {
-    auto cpu = ::tyloi::cuda::empty({static_cast<int64_t>(values.size())}, options.device(::tyloi::kCPU).dtype(::tyloi::kInt64));
-    if (!values.empty()) std::memcpy(cpu.data_ptr(), values.data(), values.size() * sizeof(int64_t));
-    return cpu.to(options.dtype(::tyloi::kInt64));
-}
+
 }
 
 struct KvOffloadStore::Block {
@@ -335,65 +331,6 @@ std::vector<std::pair<std::string, double>> KvOffloadStore::metrics() const {
         {"qsa_kv_gpu_evictions", double(impl_->evictions)}};
 }
 
-KvOffloadSequence::KvOffloadSequence(std::shared_ptr<KvOffloadStore> store, int64_t width, int64_t block_rows, ::tyloi::ScalarType dtype)
-    : store_(std::move(store)), width_(width), block_rows_(block_rows), dtype_(dtype) {
-    if (!store_ || width <= 0 || block_rows <= 0 || (dtype != ::tyloi::kFloat16 && dtype != ::tyloi::kInt32) ||
-        std::size_t(width) * block_rows * (dtype == ::tyloi::kInt32 ? 4 : 2) > store_->config().buffer_bytes / 2)
-        throw std::invalid_argument("invalid CUDA KV sequence geometry");
-}
-void KvOffloadSequence::reset() { blocks_.clear(); position_ = 0; }
-void KvOffloadSequence::append(const ::tyloi::Tensor& source) {
-    if (!source.is_cuda() || source.dim() != 2 || source.size(1) != width_ || source.size(0) <= 0)
-        throw std::invalid_argument("invalid CUDA KV rows");
-    const auto offset = position_;
-    const auto previous_count = blocks_.size();
-    const auto previous_tail = position_ % block_rows_ ? blocks_.back() : KvOffloadStore::BlockPtr{};
-    try {
-        auto rows = source.dense().to(dtype_);
-        if (position_ % block_rows_) {
-            auto previous = store_->read(blocks_.back());
-            rows = ::tyloi::cuda::cat({previous.dense(), rows}, 0);
-            blocks_.pop_back();
-        }
-        for (int64_t begin = 0; begin < rows.size(0); begin += block_rows_)
-            blocks_.push_back(store_->write(rows.narrow(0, begin, std::min(block_rows_, rows.size(0) - begin))));
-        position_ += source.size(0);
-    } catch (...) {
-        blocks_.resize(previous_count - (previous_tail ? 1 : 0));
-        if (previous_tail) blocks_.push_back(previous_tail);
-        position_ = offset; throw;
-    }
-}
-void KvOffloadSequence::truncate(int64_t position) {
-    if (position < 0 || position > position_) throw std::out_of_range("CUDA KV trim exceeds its sequence");
-    if (position == position_) return;
-    const auto full = position / block_rows_, tail = position % block_rows_;
-    KvOffloadStore::BlockPtr remainder;
-    if (tail) {
-        auto source = store_->read(blocks_.at(full));
-        remainder = store_->write(source.dense().narrow(0, 0, tail));
-    }
-    blocks_.resize(full);
-    if (remainder) blocks_.push_back(std::move(remainder));
-    position_ = position;
-}
-::tyloi::Tensor KvOffloadSequence::gather(const std::vector<int64_t>& rows) const {
-    if (rows.empty() || blocks_.empty()) throw std::invalid_argument("empty CUDA KV selection");
-    std::map<int64_t, std::pair<std::vector<int64_t>, std::vector<int64_t>>> groups;
-    for (std::size_t output = 0; output < rows.size(); ++output) {
-        if (rows[output] < 0 || rows[output] >= position_) throw std::out_of_range("CUDA KV selected row exceeds its sequence");
-        auto& group = groups[rows[output] / block_rows_];
-        group.first.push_back(rows[output] % block_rows_); group.second.push_back(output);
-    }
-    const auto options = blocks_.front()->options;
-    auto result = ::tyloi::cuda::empty({static_cast<int64_t>(rows.size()), width_}, options);
-    for (const auto& [block, group] : groups) {
-        auto payload = store_->read(blocks_.at(block));
-        auto selected = payload.dense().index_select(0, indices(group.first, options));
-        result.index_copy_(0, indices(group.second, options), selected);
-    }
-    return std::make_shared<::tyloi::DenseTensor>(std::move(result));
-}
 void KvOffloadSequence::gather_into(const std::vector<int64_t>& rows,const KvOffloadStore::GatherWorkspace& work) const {
     if(rows.empty() || int64_t(rows.size())>work.rows.size(0) || work.rows.size(1)!=width_ || work.rows.scalar_type()!=dtype_)
         throw std::invalid_argument("invalid fixed CUDA KV gather workspace");
@@ -458,18 +395,5 @@ void KvOffloadSequence::gather_into(const std::vector<int64_t>& rows,const KvOff
         int(std::min<std::size_t>(256,(total+4095)/4096)),256,stream);
     TYLOINFER_NATIVE_CUDA_CHECK(cudaGetLastError());
 }
-::tyloi::Tensor KvOffloadSequence::range(int64_t start, int64_t count) const {
-    if (start < 0 || count <= 0 || start > position_ || count > position_ - start)
-        throw std::out_of_range("CUDA KV range exceeds its sequence");
-    auto result = ::tyloi::cuda::empty({count, width_}, blocks_.front()->options);
-    for (int64_t written = 0; written < count;) {
-        const auto row = start + written, block = row / block_rows_, offset = row % block_rows_;
-        auto source = store_->read(blocks_.at(block));
-        const auto& dense_source = source.dense();
-        const auto n = std::min(count-written,dense_source.size(0)-offset);
-        result.narrow(0,written,n).copy_(dense_source.narrow(0,offset,n));
-        written += n;
-    }
-    return std::make_shared<::tyloi::DenseTensor>(std::move(result));
-}
+
 }
