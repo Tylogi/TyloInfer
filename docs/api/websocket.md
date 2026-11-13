@@ -1,6 +1,6 @@
-# MFQ Server WebSocket API
+# TyloInfer Server WebSocket API
 
-MFQ Server has two WebSocket paths. `/api/v1/runtime/realtime` proxies native
+TyloInfer Server has two WebSocket paths. `/api/v1/runtime/realtime` proxies native
 realtime audio in both directions. The legacy `/api/v1/realtime` route remains
 registered but rejects connections.
 
@@ -79,7 +79,7 @@ the server cancels the other direction and makes a best-effort close with code
 
 ### 2.1 Proxy boundary
 
-After authentication and connection setup, MFQ Server applies these rules:
+After authentication and connection setup, TyloInfer Server applies these rules:
 
 1. Client text frames are forwarded unchanged to the upstream runtime.
 2. Client binary frames are forwarded unchanged to the upstream runtime.
@@ -92,7 +92,7 @@ HTTP `ResponseResource` objects or SSE records to this socket.
 
 ### 2.2 Normalized `RealtimeFrame`
 
-The MFQ protocol model defines a normalized envelope for JSON realtime
+The TyloInfer protocol model defines a normalized envelope for JSON realtime
 messages. Clients using this format send and receive UTF-8 text frames:
 
 ```json
@@ -111,7 +111,7 @@ messages. Clients using this format send and receive UTF-8 text frames:
 | Envelope field | Type | Required | Description |
 |---|---|---:|---|
 | `protocol_version` | String | No | Fixed at `1.0`; defaults to `1.0` when omitted. |
-| `session_id` | UUID | Yes | MFQ session associated with the realtime connection. |
+| `session_id` | UUID | Yes | TyloInfer session associated with the realtime connection. |
 | `sequence` | Integer | Yes | Non-negative, monotonically increasing transport sequence. |
 | `timestamp` | DateTime | Yes | Timezone-aware message timestamp. |
 | `payload` | Object | Yes | Discriminated by `type`. |

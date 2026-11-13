@@ -101,6 +101,8 @@ uv run tyloinfer serve --model /models/model.gguf
 
 The same command accepts `.tq` checkpoints. For sharded models, select the first shard and keep the complete set in one directory.
 
+For API requests and authentication, see the [serving guide](docs/cli/serve.md#first-api-request).
+
 ### Connect your tools
 
 | Protocol | Address |

@@ -101,6 +101,8 @@ uv run tyloinfer serve --model /models/model.gguf
 
 `.tq` 模型同样使用此命令。分片模型选择首个分片，并将完整分片放在同一目录。
 
+API 请求与鉴权配置见[服务部署指南](docs/cli/serve.md#first-api-request)。
+
 ### 接入 Agent 与客户端
 
 | 协议 | 地址 |

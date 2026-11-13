@@ -1,6 +1,6 @@
 # MiniCPM-o 4.5 Runtime
 
-MFQ supports the official `OpenBMB/MiniCPM-o-4_5` composite graph in the
+TyloInfer supports the official `OpenBMB/MiniCPM-o-4_5` composite graph in the
 Python/CUDA runtime and in the native C++ CUDA and Apple MLX runtimes. The
 Python path delegates graph ownership to the official remote-code modules and
 replaces supported `Linear` and `Embedding` weights with packed operators. The
@@ -8,7 +8,7 @@ native paths implement SigLIP, the Resampler, Whisper, the Qwen3-8B language
 backbone, TTS, attention masks, and streaming caches directly.
 
 The runtime requires the official model directory for its tokenizer, processor,
-remote-code definitions, and Token2wav assets. MFQ does not copy those assets
+remote-code definitions, and Token2wav assets. TyloInfer does not copy those assets
 into the weight file.
 
 ## Environment
@@ -30,6 +30,12 @@ pip install -e ".[metal,minicpmo45-realtime]"
 ```
 
 ## Load
+
+The legacy NINT/MFQ examples below require the corresponding reference path or
+an explicit [native compatibility build](../cli/build.md#native-format-profiles).
+They are not the default GGUF/TQ quick-start recipe. Retained native executable
+names and the `MFQTNSR1` envelope are internal interfaces, not old public CLI
+aliases.
 
 ```python
 from tyloinfer.runtime import load_minicpmo45
@@ -55,7 +61,7 @@ Whisper, the audio projector, Qwen3, and the TTS code decoder. The same graph is
 available on Apple platforms through `MlxMiniCPMO45Runtime`; the Metal HTTP
 server loads the full visual graph for MiniCPM-o models.
 
-MFQd applies the MiniCPM-o image pipeline to HTTP input:
+TyloInfer Server applies the MiniCPM-o image pipeline to HTTP input:
 
 - optional 448-pixel slicing;
 - bicubic resize and `[0, 1]` conversion;
@@ -88,7 +94,7 @@ The CUDA diagnostic interface reads files with a shared prefix:
 
 The `.pt` suffix is kept for CLI compatibility. The self-contained CUDA runtime
 uses MFQ's `MFQTNSR1` envelope, not Python pickle. Files written by `torch.save`
-work only with the optional `mfq-runtime-torch` A/B runtime. Normal MFQd image,
+work only with the optional `mfq-runtime-torch` A/B runtime. Normal TyloInfer Server image,
 audio, and video requests do not use this diagnostic interface.
 
 ```bash
@@ -177,7 +183,7 @@ Start the media gateway with the official `assets/token2wav` directory and
 `system_ref_audio.wav` available below the assets root:
 
 ```bash
-mfq-minicpmo-realtime \
+tyloinfer-minicpmo-realtime \
   --backend http://127.0.0.1:8081 \
   --assets /models/OpenBMB/MiniCPM-o-4_5 \
   --host 127.0.0.1 \
