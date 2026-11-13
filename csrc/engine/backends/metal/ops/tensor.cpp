@@ -245,4 +245,24 @@ Tensor contiguous(const Tensor& value) {
     return metal::tensor(mlx::core::contiguous(source));
 }
 
+Tensor update_slice(const Tensor& destination, const Tensor& source,
+        std::int64_t dim, std::int64_t start) {
+    const auto& target = input(destination);
+    const auto& values = input(source);
+    if (target.ndim() != values.ndim() || target.dtype() != values.dtype())
+        throw std::invalid_argument("Metal slice update requires matching rank and dtype");
+    const auto axis = dimension(dim, target.ndim());
+    for (int index = 0; index < target.ndim(); ++index)
+        if (index != axis && target.shape(index) != values.shape(index))
+            throw std::invalid_argument("Metal slice update shapes do not match");
+    if (start < 0 || start > target.shape(axis) || values.shape(axis) > target.shape(axis) - start)
+        throw std::out_of_range("Metal slice update exceeds its destination");
+    if (!values.size()) return destination;
+    mlx::core::Shape begin(target.ndim(), 0);
+    auto end = target.shape();
+    begin[axis] = static_cast<int>(start);
+    end[axis] = static_cast<int>(start + values.shape(axis));
+    return metal::tensor(mlx::core::slice_update(target, values, begin, end, gpu_stream()));
+}
+
 }  // namespace tyloi::metal::ops

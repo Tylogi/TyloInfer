@@ -194,40 +194,4 @@ private:
     MlxResourceTelemetry resources_;
 };
 
-// Growable [batch,sequence,width] cache for non-attention recurrent/index
-// features. Model implementations provide only the feature producer; storage
-// growth and append semantics remain backend-wide.
-class MlxSequenceCache {
-public:
-    MlxSequenceCache(
-        int maximum_sequence,
-        int width,
-        mlx::core::Dtype dtype = mlx::core::float16);
-
-    void reset(int batch, int initial_capacity = 16);
-    std::pair<mlx::core::array, int> append(
-        const mlx::core::array& value);
-    mlx::core::array view() const;
-    void trim(int tokens);
-    void clear() noexcept;
-
-    int position() const noexcept {
-        return position_;
-    }
-    std::size_t storage_bytes() const noexcept {
-        return values_.defined() ? values_.nbytes() : 0;
-    }
-
-private:
-    void ensure_capacity(int required);
-
-    int maximum_sequence_;
-    int width_;
-    mlx::core::Dtype dtype_;
-    int batch_ = 0;
-    int position_ = 0;
-    tyloi::Tensor values_;
-    MlxResourceTelemetry resources_;
-};
-
 } // namespace mfq::metal

@@ -736,16 +736,6 @@ array initial_kv_key(int batch, int heads, int maximum_sequence, int head_dimens
     return mlx::core::zeros(Shape{batch, heads, capacity, static_cast<int>(layout.key_width)},
         quantization.enabled() ? mlx::core::uint32 : dtype);
 }
-
-std::size_t sequence_bytes(int batch, int capacity, int width, mlx::core::Dtype dtype) {
-    tyloi::TensorView view;
-    view.rank = 3;
-    view.sizes[0] = batch;
-    view.sizes[1] = capacity;
-    view.sizes[2] = width;
-    view.scalar_type = tyloi::metal::scalar_type(dtype);
-    return view.nbytes();
-}
 }
 
 MlxKvCache::MlxKvCache(
@@ -1061,120 +1051,6 @@ array MlxKvCache::sparse_attention(const array& query, const std::optional<array
     if (query.ndim() != 4 || query.shape(0) != static_cast<int>(kv_.batch) || query.shape(3) != static_cast<int>(kv_.head_dim))
         throw std::invalid_argument("compressed QSA query topology mismatch");
     return mlx_kv_sparse_attention(query, key_storage(), value_storage(), blocks, kv_.quantization, position_, query_offset, ratio, budget);
-}
-
-MlxSequenceCache::MlxSequenceCache(
-    int maximum_sequence,
-    int width,
-    mlx::core::Dtype dtype)
-    : maximum_sequence_(maximum_sequence),
-      width_(width),
-      dtype_(dtype) {
-    if (maximum_sequence_ <= 0 || width_ <= 0 ||
-        (dtype_ != mlx::core::float16 &&
-         dtype_ != mlx::core::bfloat16 &&
-         dtype_ != mlx::core::float32)) {
-        throw std::invalid_argument("invalid MLX sequence cache geometry");
-    }
-}
-
-void MlxSequenceCache::reset(
-    int batch,
-    int initial_capacity) {
-    if (batch <= 0 || initial_capacity <= 0) {
-        throw std::invalid_argument("invalid MLX sequence cache allocation");
-    }
-    const int capacity = std::min(
-        maximum_sequence_, initial_capacity);
-    MlxResidentBudgetScope::reserve(sequence_bytes(batch, capacity, width_, dtype_));
-    auto values = mlx::core::zeros(Shape{batch, capacity, width_}, dtype_);
-    values_ = tyloi::metal::tensor(std::move(values));
-    batch_ = batch;
-    position_ = 0;
-    resources_.set({values_.nbytes(), static_cast<std::size_t>(batch_)});
-}
-
-std::pair<array, int> MlxSequenceCache::append(
-    const array& value) {
-    if (value.ndim() != 3 || value.shape(0) <= 0 ||
-        value.shape(1) <= 0 || value.shape(2) != width_) {
-        throw std::runtime_error("MLX sequence-cache append mismatch");
-    }
-    if (!values_.defined() || batch_ != value.shape(0)) {
-        reset(value.shape(0), std::max(16, value.shape(1)));
-    }
-    const int start = position_;
-    const int end = start + value.shape(1);
-    ensure_capacity(end);
-    values_ = tyloi::metal::tensor(mlx::core::slice_update(
-        tyloi::metal::array(values_),
-        value.dtype() == dtype_
-            ? value
-            : mlx::core::astype(value, dtype_),
-        Shape{0, start, 0},
-        Shape{batch_, end, width_}));
-    position_ = end;
-    return {
-        mlx::core::slice(
-            tyloi::metal::array(values_),
-            Shape{0, 0, 0},
-            Shape{batch_, end, width_}),
-        start,
-    };
-}
-
-array MlxSequenceCache::view() const {
-    if (!values_.defined()) {
-        throw std::runtime_error("MLX sequence cache is not initialized");
-    }
-    return mlx::core::slice(
-        tyloi::metal::array(values_),
-        Shape{0, 0, 0},
-        Shape{batch_, position_, width_});
-}
-
-void MlxSequenceCache::trim(int tokens) {
-    if (tokens < 0 || tokens > position_) {
-        throw std::runtime_error("invalid MLX sequence-cache trim");
-    }
-    position_ -= tokens;
-}
-
-void MlxSequenceCache::clear() noexcept {
-    values_ = {};
-    batch_ = 0;
-    position_ = 0;
-    resources_.set({});
-}
-
-void MlxSequenceCache::ensure_capacity(int required) {
-    if (!values_.defined()) {
-        throw std::runtime_error("MLX sequence cache is not initialized");
-    }
-    if (required <= static_cast<int>(values_.size(1))) {
-        return;
-    }
-    if (required > maximum_sequence_) {
-        throw std::runtime_error("MLX sequence cache exceeds context capacity");
-    }
-    int capacity = static_cast<int>(values_.size(1));
-    while (capacity < required) {
-        if (capacity > maximum_sequence_ / 2) {
-            capacity = maximum_sequence_;
-            break;
-        }
-        capacity *= 2;
-    }
-    MlxResidentBudgetScope::reserve(sequence_bytes(batch_, capacity, width_, dtype_));
-    auto expanded = mlx::core::zeros(
-        Shape{batch_, capacity, width_}, dtype_);
-    expanded = mlx::core::slice_update(
-        expanded,
-        tyloi::metal::array(values_),
-        Shape{0, 0, 0},
-        Shape{batch_, static_cast<int>(values_.size(1)), width_});
-    values_ = tyloi::metal::tensor(std::move(expanded));
-    resources_.set({values_.nbytes(), static_cast<std::size_t>(batch_)});
 }
 
 } // namespace mfq::metal

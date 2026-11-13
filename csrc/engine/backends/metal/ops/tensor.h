@@ -17,6 +17,7 @@ Tensor cast(const Tensor& value, ScalarType type);
 Tensor reshape(const Tensor& value, std::span<const std::int64_t> shape);
 Tensor transpose(const Tensor& value, std::int64_t first, std::int64_t second);
 Tensor slice(const Tensor& value, std::int64_t dim, std::int64_t start, std::int64_t end, std::int64_t step = 1);
+Tensor update_slice(const Tensor& destination, const Tensor& source, std::int64_t dim, std::int64_t start);
 Tensor contiguous(const Tensor& value);
 
 }  // namespace tyloi::metal::ops

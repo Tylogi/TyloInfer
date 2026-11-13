@@ -26,6 +26,8 @@
 #include "engine/backends/metal/native/allocation.h"
 #include "mlx_mtp_lora.h"
 #include "engine/config.h"
+#include "engine/state/sequence.h"
+#include "mlx_resident_budget.h"
 #include "backends/cpu/storage/prefix_blocks.h"
 #include "mlx_transformer.h"
 #include "engine/backends/cpu/native/host_parallel.h"
@@ -114,13 +116,13 @@ struct Qwen4RequestLayerCache {
     std::unique_ptr<MlxKvCache> kv;
     std::unique_ptr<MlxQsaKvOffload> offloaded_kv;
     std::unique_ptr<MlxQsaIndexOffload> offloaded_pool;
-    std::optional<MlxSequenceCache> pooled;
+    std::optional<tyloi::state::Sequence> pooled;
     std::optional<array> convolution, recurrent, index_tail, ple_convolution;
     std::vector<std::int64_t> ple_context;
     std::optional<Qwen4PleSpeculativeState> ple_rollback;
     std::optional<MlxGatedDeltaSpeculativeState> gdn_rollback;
     int qsa_speculative_trim = 0;
-    MlxResourceTelemetry attention_resources, ple_resources;
+    MlxResourceTelemetry attention_resources, ple_resources, pooled_resources;
 };
 
 std::string mtp_source_identity(const MfqContainer& model) {
@@ -3315,7 +3317,7 @@ public:
     void exchange_cache(Qwen4RequestLayerCache& state) override {
         std::swap(speculative_trim_, state.qsa_speculative_trim);
         if (!state.pooled) state.pooled.emplace(maximum_,
-            static_cast<int>(config_.indexer_head_dim), mlx::core::float32);
+            static_cast<int>(config_.indexer_head_dim), tyloi::ScalarType::float32);
         std::swap(batch_, state.batch);
         cache_.swap(state.kv);
         offloaded_kv_.swap(state.offloaded_kv);
@@ -3324,6 +3326,7 @@ public:
         std::swap(index_tail_start_, state.index_start);
         std::swap(index_position_, state.index_position);
         std::swap(pooled_index_cache_, *state.pooled);
+        std::swap(pooled_resources_, state.pooled_resources);
         std::swap(index_resources_, state.attention_resources);
     }
     const std::vector<array>& training_context() const { return training_context_; }
@@ -3426,7 +3429,7 @@ public:
         if (index_position() != position)
             throw std::runtime_error("QSA history caches diverged");
         append_index_keys(raw_key, positions_full);
-        return mlx::core::depends({cache_->key_storage()}, {cache_->value_storage(), *index_tail_, pooled_index_cache_.view()}).at(0);
+        return mlx::core::depends({cache_->key_storage()}, {cache_->value_storage(), *index_tail_, tyloi::metal::array(pooled_index_cache_.view())}).at(0);
     }
 
     MlxQwen4LayerCacheSnapshot snapshot(bool detached) const override {
@@ -3446,7 +3449,7 @@ public:
             state.kv = cache_->snapshot(detached);
             if (pooled_index_cache_.position() > 0)
                 state.pooled_keys = detached ? mlx::core::array(tyloi::metal::array(
-                    tyloi::metal::ops::clone(tyloi::metal::tensor(pooled_index_cache_.view())))) : pooled_index_cache_.view();
+                    tyloi::metal::ops::clone(pooled_index_cache_.view()))) : tyloi::metal::array(pooled_index_cache_.view());
         }
         if (state.index_keys) state.index_keys->eval();
         if (state.pooled_keys) state.pooled_keys->eval();
@@ -3485,13 +3488,13 @@ public:
         } else {
             if (!state.kv) throw std::runtime_error("offloaded QSA checkpoint requires KV offload enabled");
             cache_->restore_snapshot(*state.kv);
-            if (state.pooled_keys) pooled_index_cache_.append(*state.pooled_keys);
+            if (state.pooled_keys) append_pooled(*state.pooled_keys);
         }
     }
     std::size_t cache_bytes() const noexcept override {
         return (cache_ ? cache_->key_storage().nbytes() +
             cache_->value_storage().nbytes() : 0) +
-            (index_tail_ ? index_tail_->nbytes() + index_tail_->dtype().size() : 0) + pooled_index_cache_.storage_bytes() +
+            (index_tail_ ? index_tail_->nbytes() + index_tail_->dtype().size() : 0) + (pooled_index_cache_.storage().defined() ? pooled_index_cache_.storage().nbytes() : 0) +
             (offloaded_kv_ ? offloaded_kv_->resident_bytes() : 0);
     }
     std::string_view profile_name() const noexcept override {
@@ -3542,7 +3545,9 @@ public:
             maximum_,
             static_cast<int>(config_.head_dim), 16, mlx::core::float16, true);
         if (!kv_store_) {
-            pooled_index_cache_.reset(batch);
+            MlxResidentBudgetScope::reserve(pooled_index_cache_.reset_bytes(batch));
+            pooled_index_cache_.reset(batch, 16, tyloi::Device{tyloi::DeviceType::metal, 0});
+            report_pooled_resources();
         }
         index_tail_.reset();
         index_tail_start_ = 0;
@@ -3560,7 +3565,8 @@ public:
         index_tail_start_ = 0;
         index_position_ = 0;
         index_resources_.set({});
-        pooled_index_cache_.clear();
+        pooled_index_cache_.reset();
+        report_pooled_resources();
         speculative_trim_ = 0;
         batch_ = 0;
     }
@@ -3757,7 +3763,7 @@ public:
         }
         const int ratio = static_cast<int>(config_.indexer_compress_ratio);
         const auto pooled_keys = [&]() -> array {
-            return use_cache ? pooled_index_cache_.view() : pool_index_keys(
+            return use_cache ? tyloi::metal::array(pooled_index_cache_.view()) : pool_index_keys(
                 raw_key, positions_full, 0, tokens / ratio);
         };
         if (auto* lora = MlxMtpLora::current(); lora && lora->collecting()) {
@@ -3843,7 +3849,7 @@ public:
                 : sparse;
         }();
         if (use_cache) attended = offloaded_kv_ ? mlx::core::depends({attended}, {*index_tail_}).at(0)
-            : mlx::core::depends({attended}, {*index_tail_, pooled_index_cache_.view()}).at(0);
+            : mlx::core::depends({attended}, {*index_tail_, tyloi::metal::array(pooled_index_cache_.view())}).at(0);
         const Shape gate_shape{batch, tokens, static_cast<int>(config_.num_attention_heads), static_cast<int>(config_.head_dim)};
         auto output_input = qwen4_qsa_output_gate(mlx::core::reshape(attended, gate_shape),
             mlx::core::reshape(output_gate, gate_shape), hidden.dtype());
@@ -3899,18 +3905,45 @@ private:
     int index_position() const noexcept {
         return index_position_;
     }
+    void report_pooled_resources() {
+        const auto& storage = pooled_index_cache_.storage();
+        if (storage.defined())
+            pooled_resources_.set({storage.nbytes(), static_cast<std::size_t>(storage.size(0))});
+        else
+            pooled_resources_.set({});
+    }
+    void append_pooled(const array& value) {
+        if (value.ndim() != 3 || value.shape(0) <= 0 || value.shape(1) <= 0 ||
+            value.shape(2) != config_.indexer_head_dim)
+            throw std::runtime_error("MLX sequence-cache append mismatch");
+        const int batch = value.shape(0), tokens = value.shape(1);
+        try {
+            if (!pooled_index_cache_.storage().defined() || pooled_index_cache_.storage().size(0) != batch) {
+                const int capacity = std::max(16, tokens);
+                MlxResidentBudgetScope::reserve(pooled_index_cache_.reset_bytes(batch, capacity));
+                pooled_index_cache_.reset(batch, capacity, tyloi::Device{tyloi::DeviceType::metal, 0});
+            }
+            if (const auto bytes = pooled_index_cache_.growth_bytes(batch, tokens))
+                MlxResidentBudgetScope::reserve(bytes);
+            pooled_index_cache_.append(tyloi::metal::tensor(value));
+        } catch (...) {
+            report_pooled_resources();
+            throw;
+        }
+        report_pooled_resources();
+    }
     void append_index_keys(const array& keys, const array& positions_full) {
         const int ratio = static_cast<int>(config_.indexer_compress_ratio);
         const int end = index_position_ + keys.shape(1);
         auto raw = mlx::core::astype(keys, mlx::core::float16);
         if (index_tail_) raw = mlx::core::concatenate({*index_tail_, raw}, 1);
-        const int cached = offloaded_pool_ ? offloaded_pool_->position() : pooled_index_cache_.position();
+        const int cached = offloaded_pool_ ? offloaded_pool_->position() : static_cast<int>(pooled_index_cache_.position());
         const int begin = cached - index_tail_start_ / ratio;
         const int complete = end / ratio - index_tail_start_ / ratio;
         if (begin < complete) {
             auto pooled = pool_index_keys(raw, positions_full, begin, complete, index_tail_start_);
             if (offloaded_pool_) offloaded_pool_->append(pooled);
-            else pooled_index_cache_.append(pooled);
+            else append_pooled(pooled);
         }
         const int keep = std::max(index_tail_start_, std::max(0, end - MlxQwen4CausalLm::maximum_verification_rows) / ratio * ratio);
         index_tail_ = mlx::core::array(tyloi::metal::array(
@@ -3970,7 +4003,7 @@ private:
               (maximum +
                static_cast<int>(config_.indexer_compress_ratio) - 1) /
                   static_cast<int>(config_.indexer_compress_ratio),
-              static_cast<int>(config_.indexer_head_dim), mlx::core::float32) {
+              static_cast<int>(config_.indexer_head_dim), tyloi::ScalarType::float32) {
         const int width = static_cast<int>(config_.num_attention_heads * config_.head_dim);
         if (query_.output_size() != (gate_ ? width : 2 * width) ||
             (gate_ && (gate_->input_size() != config_.hidden_size || gate_->output_size() != width)))
@@ -4197,8 +4230,7 @@ private:
             return;
         }
         if (pooled_index_cache_.position() > target) {
-            pooled_index_cache_.trim(
-                pooled_index_cache_.position() - target);
+            pooled_index_cache_.truncate(target);
         }
     }
 
@@ -4225,7 +4257,8 @@ private:
     int index_tail_start_ = 0;
     int index_position_ = 0;
     MlxResourceTelemetry index_resources_;
-    MlxSequenceCache pooled_index_cache_;
+    tyloi::state::Sequence pooled_index_cache_;
+    MlxResourceTelemetry pooled_resources_;
     int speculative_trim_ = 0;
     int batch_ = 0;
 };
@@ -4927,7 +4960,7 @@ struct MlxQwen4RequestCache {
         const auto add_layers = [&](const auto& list) { for (const auto& layer : list) {
             if (layer.kv) result += layer.kv->key_storage().nbytes() + layer.kv->value_storage().nbytes();
             if (layer.offloaded_kv) result += layer.offloaded_kv->resident_bytes();
-            if (layer.pooled) result += layer.pooled->storage_bytes();
+            if (layer.pooled) result += (layer.pooled->storage().defined() ? layer.pooled->storage().nbytes() : 0);
             for (const auto* value : {&layer.convolution, &layer.recurrent, &layer.index_tail, &layer.ple_convolution})
                 if (*value) result += (*value)->nbytes();
         }};
@@ -5707,7 +5740,7 @@ std::shared_ptr<MlxQwen4RequestCache> MlxQwen4CausalLm::make_request_cache() {
     cache->layers.resize(impl_->layers.size());
     if (impl_->mtp) cache->predictor_layers.resize(impl_->mtp->layer_count());
     for (auto& layer : cache->layers)
-        layer.pooled.emplace(impl_->maximum, static_cast<int>(impl_->config.indexer_head_dim), mlx::core::float32);
+        layer.pooled.emplace(impl_->maximum, static_cast<int>(impl_->config.indexer_head_dim), tyloi::ScalarType::float32);
     std::erase_if(impl_->request_caches, [](const auto& entry) { return entry.expired(); });
     impl_->request_caches.push_back(cache);
     return cache;

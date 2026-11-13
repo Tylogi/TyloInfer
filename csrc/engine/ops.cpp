@@ -1128,11 +1128,6 @@ Tensor copy(const Tensor& value_tensor, Device target) {
     device(target);
     return owner(cuda::ops::copy(value, target));
 }
-Tensor cast(const Tensor& value_tensor, ScalarType type) {
-    const auto& value = ::tyloi::ops::dense(value_tensor);
-    input(value);
-    return owner(cuda::ops::cast(value, type));
-}
 Tensor cast(const Tensor& value_tensor, ScalarType type, Device target) {
     const auto& value = ::tyloi::ops::dense(value_tensor);
     input(value);
@@ -1293,11 +1288,6 @@ Tensor unsqueeze(const Tensor& value_tensor, std::int64_t dim) {
     input(value);
     return owner(tyloi::unsqueeze(value, dim));
 }
-Tensor slice(const Tensor& value_tensor, std::int64_t dim, std::int64_t start, std::int64_t end, std::int64_t step) {
-    const auto& value = ::tyloi::ops::dense(value_tensor);
-    input(value);
-    return owner(tyloi::slice(value, dim, start, end, step));
-}
 Tensor index_select(const Tensor& value_tensor, std::int64_t dim, const Tensor& indices_tensor) {
     const auto& value = ::tyloi::ops::dense(value_tensor);
     const auto& indices = ::tyloi::ops::dense(indices_tensor);
@@ -1310,15 +1300,6 @@ Tensor sum(const Tensor& value_tensor, std::int64_t dim, bool keepdim) {
     input(value);
     require_cuda(value);
     return owner(cuda::ops::sum(value, dim, keepdim));
-}
-void index_copy(Tensor& value_tensor, std::int64_t dim, const Tensor& indices_tensor, const Tensor& source_tensor) {
-    auto& value = ::tyloi::ops::dense(value_tensor);
-    const auto& indices = ::tyloi::ops::dense(indices_tensor);
-    const auto& source = ::tyloi::ops::dense(source_tensor);
-    compatible(value, indices);
-    compatible(value, source);
-    require_cuda(value);
-    cuda::ops::index_copy(value, dim, indices, source);
 }
 std::vector<Tensor> chunk(const Tensor& value_tensor, std::int64_t count, std::int64_t dim) {
     const auto& value = ::tyloi::ops::dense(value_tensor);

@@ -52,6 +52,18 @@ void input(const Tensor& value_tensor) {
     value.require_dense();
     device(value.device());
 }
+void compatible(const Tensor& left_tensor, const Tensor& right_tensor) {
+    const auto& left = ::tyloi::ops::dense(left_tensor);
+    const auto& right = ::tyloi::ops::dense(right_tensor);
+    input(left);
+    input(right);
+    if (left.device() != right.device())
+        throw std::invalid_argument("tensor devices do not match");
+}
+void require_cuda(const Tensor& value_tensor) {
+    const auto& value = ::tyloi::ops::dense(value_tensor);
+    if (!value.device().is_cuda()) throw std::invalid_argument("operation requires a CUDA tensor");
+}
 }
 #endif
 
@@ -169,6 +181,85 @@ void fill(Tensor& value_tensor, double fill_value) {
     }
 #else
     cpu::ops::fill(value_tensor, fill_value);
+#endif
+}
+
+
+Tensor cast(const Tensor& value_tensor, ScalarType type) {
+#ifdef TYLOINFER_NATIVE_MLX_RUNTIME
+    if (value_tensor.defined() && value_tensor.device().is_metal()) return metal::ops::cast(value_tensor, type);
+#endif
+#ifdef TYLOINFER_NATIVE_CUDA
+    const auto& value = ::tyloi::ops::dense(value_tensor);
+    input(value);
+    return owner(cuda::ops::cast(value, type));
+#else
+    if (!value_tensor.defined() || value_tensor.is_encoded() ||
+        !value_tensor.device().is_cpu() || value_tensor.device().index != 0 ||
+        !value_tensor.representation<DenseTensor>())
+        throw std::invalid_argument("operation requires a dense CPU tensor");
+    if (value_tensor.scalar_type() != type)
+        throw std::invalid_argument("CPU cast conversion is not supported");
+    return value_tensor;
+#endif
+}
+
+Tensor slice(const Tensor& value_tensor, std::int64_t dim, std::int64_t start, std::int64_t end, std::int64_t step) {
+#ifdef TYLOINFER_NATIVE_MLX_RUNTIME
+    if (value_tensor.defined() && value_tensor.device().is_metal()) return metal::ops::slice(value_tensor, dim, start, end, step);
+#endif
+#ifdef TYLOINFER_NATIVE_CUDA
+    const auto& value = ::tyloi::ops::dense(value_tensor);
+    input(value);
+    return owner(tyloi::slice(value, dim, start, end, step));
+#else
+    const auto* value = value_tensor.representation<DenseTensor>();
+    if (!value_tensor.defined() || value_tensor.is_encoded() || !value ||
+        !value_tensor.device().is_cpu() || value_tensor.device().index != 0)
+        throw std::invalid_argument("operation requires a dense CPU tensor");
+    return std::make_shared<DenseTensor>(tyloi::slice(*value, dim, start, end, step));
+#endif
+}
+
+Tensor update_slice(const Tensor& destination, const Tensor& source, std::int64_t dim, std::int64_t start) {
+    if (!destination.defined() || !source.defined() || destination.is_encoded() || source.is_encoded())
+        throw std::invalid_argument("slice update requires defined dense tensors");
+    if (destination.device() != source.device() || destination.scalar_type() != source.scalar_type() ||
+        destination.dim() != source.dim())
+        throw std::invalid_argument("slice update tensors are incompatible");
+    const auto rank = destination.dim();
+    if (dim < 0) dim += rank;
+    if (dim < 0 || dim >= rank)
+        throw std::invalid_argument("slice update dimension is invalid");
+    for (std::int64_t axis = 0; axis < rank; ++axis)
+        if (axis != dim && destination.size(axis) != source.size(axis))
+            throw std::invalid_argument("slice update shape is incompatible");
+    const auto extent = source.size(dim), size = destination.size(dim);
+    if (start < 0 || start > size || extent < 0 || extent > size - start)
+        throw std::invalid_argument("slice update exceeds destination");
+#ifdef TYLOINFER_NATIVE_MLX_RUNTIME
+    if (destination.device().is_metal()) return metal::ops::update_slice(destination, source, dim, start);
+#endif
+    auto target = slice(destination, dim, start, start + extent, 1);
+    copy_into(target, source);
+    return destination;
+}
+
+void index_copy(Tensor& value_tensor, std::int64_t dim, const Tensor& indices_tensor, const Tensor& source_tensor) {
+#ifdef TYLOINFER_NATIVE_MLX_RUNTIME
+    if (value_tensor.defined() && value_tensor.device().is_metal())
+        throw std::invalid_argument("Metal indexed update is not supported");
+#endif
+#ifdef TYLOINFER_NATIVE_CUDA
+    auto& value = ::tyloi::ops::dense(value_tensor);
+    const auto& indices = ::tyloi::ops::dense(indices_tensor);
+    const auto& source = ::tyloi::ops::dense(source_tensor);
+    compatible(value, indices);
+    compatible(value, source);
+    require_cuda(value);
+    cuda::ops::index_copy(value, dim, indices, source);
+#else
+    throw std::invalid_argument("indexed update is not supported");
 #endif
 }
 

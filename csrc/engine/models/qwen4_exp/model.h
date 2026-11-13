@@ -13,6 +13,7 @@
 #include "engine/backends/cuda/kernels/ple_fused.h"
 #include "engine/weights/nint_row_pipeline.h"
 #include "engine/weights/row_stage.h"
+#include "engine/state/sequence.h"
 #include "engine/state/kv_offload.h"
 #include "engine/state/kv_memory.h"
 #include "engine/backends/cuda/executor/decode_window.h"
@@ -35,7 +36,6 @@ using attention_ops::DenseTensor;
 using attention_ops::Linear;
 using attention_ops::Embedding;
 using attention_ops::rms_norm;
-using attention_ops::SequenceCache;
 using attention_ops::select_pooled_blocks;
 
 struct GdnWeights {
@@ -1270,7 +1270,7 @@ class Qsa {
         State& operator=(const State&) = delete;
         State(State&&) = default;
         State& operator=(State&&) = default;
-        SequenceCache keys,values,index;
+        ::tyloi::state::Sequence keys,values,index;
         std::shared_ptr<KvOffloadStore> offload;
         std::unique_ptr<KvOffloadSequence> offloaded_kv,offloaded_index,offloaded_pooled;
         ::tyloi::Tensor graph_keys,graph_values,graph_pooled,graph_index;
@@ -1393,10 +1393,10 @@ class Qsa {
             state.keys=save((request.graph_keys.defined()?request.graph_keys.dense():DenseTensor{}).narrow(2,0,count).permute({0,2,1,3}).reshape({1,count,c_.kv_heads*key_width()}));
             state.values=save((request.graph_values.defined()?request.graph_values.dense():DenseTensor{}).narrow(2,0,count).permute({0,2,1,3}).reshape({1,count,c_.kv_heads*value_width()}));
         } else {
-            state.keys=save(request.keys.storage().narrow(1,0,count));
-            state.values=save(request.values.storage().narrow(1,0,count));
+            state.keys=save(request.keys.storage().dense().narrow(1,0,count));
+            state.values=save(request.values.storage().dense().narrow(1,0,count));
         }
-        state.index=save(request.index.storage().narrow(1,0,count));
+        state.index=save(request.index.storage().dense().narrow(1,0,count));
     }
     void restore_session(State& request,const tyloi::models::qwen4_exp::LayerSnapshot& state,int64_t count) {
         const auto* keys=state.keys.representation<DenseTensor>();
@@ -1425,7 +1425,7 @@ class Qsa {
     }
     std::vector<DenseTensor> resident_cache_tensors(const State& request) const {
         if(managed_memory(request))return {}; // Count physical GPU/RAM tiers through KvMemoryManager.
-        return {request.keys.storage(),request.values.storage(),request.index.storage(),(request.graph_keys.defined()?request.graph_keys.dense():DenseTensor{}),(request.graph_values.defined()?request.graph_values.dense():DenseTensor{}),(request.graph_pooled.defined()?request.graph_pooled.dense():DenseTensor{})};
+        return {request.keys.storage().defined()?request.keys.storage().dense():DenseTensor{},request.values.storage().defined()?request.values.storage().dense():DenseTensor{},request.index.storage().defined()?request.index.storage().dense():DenseTensor{},(request.graph_keys.defined()?request.graph_keys.dense():DenseTensor{}),(request.graph_values.defined()?request.graph_values.dense():DenseTensor{}),(request.graph_pooled.defined()?request.graph_pooled.dense():DenseTensor{})};
     }
     void leave_graph(State& request) {
         if(managed_memory(request)){request.graph_prepared=false;return;}
@@ -1456,7 +1456,7 @@ class Qsa {
             const auto n=position(request),pools=n/c_.pool;
             request.memory->ensure(n);
             if(pools) {
-                auto pooled=request.index.storage().narrow(1,0,pools*c_.pool).reshape({1,pools,c_.pool,c_.index_width}).to(::tyloi::kFloat32).mean(2).to(request.index.storage().scalar_type());
+                auto pooled=request.index.storage().dense().narrow(1,0,pools*c_.pool).reshape({1,pools,c_.pool,c_.index_width}).to(::tyloi::kFloat32).mean(2).to(request.index.storage().scalar_type());
 #ifdef TYLOINFER_NATIVE_CUDA
                 pooled=rms_norm(pooled,w_->index_key_norm.dense().to(::tyloi::kFloat32)+1,c_.eps);
 #else
@@ -1474,14 +1474,14 @@ class Qsa {
         TYLOINFER_RUNTIME_CHECK(capacity>=n && capacity<=c_.maximum,"invalid QSA graph capacity");
         auto graph_keys=::tyloi::cuda::zeros({1,c_.kv_heads,capacity,key_width()},request.keys.storage().options());
         auto graph_values=::tyloi::cuda::zeros({1,c_.kv_heads,capacity,value_width()},request.values.storage().options());
-        graph_keys.narrow(2,0,n).copy_(request.keys.storage().narrow(1,0,n).reshape({1,n,c_.kv_heads,key_width()}).permute({0,2,1,3}));
-        graph_values.narrow(2,0,n).copy_(request.values.storage().narrow(1,0,n).reshape({1,n,c_.kv_heads,value_width()}).permute({0,2,1,3}));
+        graph_keys.narrow(2,0,n).copy_(request.keys.storage().dense().narrow(1,0,n).reshape({1,n,c_.kv_heads,key_width()}).permute({0,2,1,3}));
+        graph_values.narrow(2,0,n).copy_(request.values.storage().dense().narrow(1,0,n).reshape({1,n,c_.kv_heads,value_width()}).permute({0,2,1,3}));
         request.index.prepare_fixed(capacity);
         request.graph_index=request.index.storage();
         auto graph_pooled=::tyloi::cuda::zeros({1,(capacity+c_.pool-1)/c_.pool,c_.index_width},request.index.storage().options());
         const auto pools=n/c_.pool;
         if(pools) {
-            auto pooled=request.index.storage().narrow(1,0,pools*c_.pool).reshape({1,pools,c_.pool,c_.index_width}).to(::tyloi::kFloat32).mean(2).to(request.index.storage().scalar_type());
+            auto pooled=request.index.storage().dense().narrow(1,0,pools*c_.pool).reshape({1,pools,c_.pool,c_.index_width}).to(::tyloi::kFloat32).mean(2).to(request.index.storage().scalar_type());
 #ifdef TYLOINFER_NATIVE_CUDA
             pooled=rms_norm(pooled,w_->index_key_norm.dense().to(::tyloi::kFloat32)+1,c_.eps);
 #else
@@ -1527,7 +1527,7 @@ class Qsa {
         if(exclusive) {
             const auto keys=(quantization_.enabled()?encode_key(p.key):p.key).permute({0,2,1,3});
             const auto values=(quantization_.enabled()?encode_value(p.value):p.value).permute({0,2,1,3});
-            index_written=request.memory->hot.append_decode(keys,values,cache_positions,p.raw,request.index.storage(),begin_prepare);
+            index_written=request.memory->hot.append_decode(keys,values,cache_positions,p.raw,request.index.storage().dense(),begin_prepare);
             if(!index_written)request.memory->hot.append(keys.to(cache_dtype()),values.to(cache_dtype()),cache_positions);
         }
         else if (!p.cache_written && !streamed) {
@@ -1582,13 +1582,13 @@ class Qsa {
         const auto* pool_write=tyloi::cuda::env_lookup("TYLOINFER_QSA_POOL_WRITE_FUSED");
         const bool pool_written=(!pool_fusion || pool_fusion[0]!='0') && (!pool_write || pool_write[0]!='0') &&
 #ifdef TYLOINFER_NATIVE_CUDA
-            request.index.storage().size(1)>=c_.maximum && rotary_->pool_normalized_into(request.index.storage(),w_->index_key_norm.dense(),
+            request.index.storage().size(1)>=c_.maximum && rotary_->pool_normalized_into(request.index.storage().dense(),w_->index_key_norm.dense(),
 #else
-            request.index.storage().size(1)>=c_.maximum && rotary_->pool_normalized_into(request.index.storage(),w_->index_key_norm,
+            request.index.storage().size(1)>=c_.maximum && rotary_->pool_normalized_into(request.index.storage().dense(),w_->index_key_norm,
 #endif
                 positions,cache_positions,graph_pooled,c_.pool,c_.maximum,c_.eps);
         if(!pool_written && rotary_->fused() && (!pool_fusion || pool_fusion[0]!='0') && request.index.storage().size(1)>=c_.maximum) {
-            auto prepared=mfq_qwen4_exp::live_index_pool(request.index.storage(),positions,cache_positions,c_.pool,c_.maximum);
+            auto prepared=mfq_qwen4_exp::live_index_pool(request.index.storage().dense(),positions,cache_positions,c_.pool,c_.maximum);
             block=prepared[1];
 #ifdef TYLOINFER_NATIVE_CUDA
             pooled=rotary_->forward_normalized(prepared[0].unsqueeze(2),w_->index_key_norm.dense(),prepared[2],c_.eps).squeeze(1);
@@ -1598,7 +1598,7 @@ class Qsa {
         }else if(!pool_written) {
             block=(cache_positions/c_.pool).to(::tyloi::kInt64);
             auto row=(block.unsqueeze(-1)*c_.pool+::tyloi::cuda::arange(c_.pool,block.options())).clamp(0,c_.maximum-1);
-            pooled=request.index.storage().index_select(1,row.reshape({-1})).reshape({1,t,c_.pool,c_.index_width}).to(::tyloi::kFloat32).mean(2).to(request.index.storage().scalar_type());
+            pooled=request.index.storage().dense().index_select(1,row.reshape({-1})).reshape({1,t,c_.pool,c_.index_width}).to(::tyloi::kFloat32).mean(2).to(request.index.storage().scalar_type());
 #ifdef TYLOINFER_NATIVE_CUDA
             pooled=rms_norm(pooled,w_->index_key_norm.dense().to(::tyloi::kFloat32)+1,c_.eps);
 #else
@@ -1788,12 +1788,12 @@ class Qsa {
                     }
                     request.keys.advance_fixed(t);request.values.advance_fixed(t);request.graph_prepared=false;
                 } else {
-                    p.key = request.keys.append(encode_key(p.key).reshape({b, t, -1}))
+                    p.key = request.keys.append(encode_key(p.key).reshape({b, t, -1})).dense()
                                 .reshape({b, offset + t, c_.kv_heads, key_width()});
-                    p.value = request.values.append(encode_value(p.value).reshape({b, t, -1}))
+                    p.value = request.values.append(encode_value(p.value).reshape({b, t, -1})).dense()
                                   .reshape({b, offset + t, c_.kv_heads, value_width()});
                 }
-                p.raw = request.index.append(p.raw);
+                p.raw = request.index.append(p.raw).dense();
             };
         if(history_only) {
             auto p=project_history(hidden,current_positions);
@@ -1976,7 +1976,7 @@ class Qsa {
                 ::tyloi::Tensor raw_owner;
                 DenseTensor raw;
                 if(managed_memory(request))
-                    raw=request.index.storage().narrow(1,first_pool*c_.pool,new_pools*c_.pool).reshape({new_pools*c_.pool,c_.index_width});
+                    raw=request.index.storage().dense().narrow(1,first_pool*c_.pool,new_pools*c_.pool).reshape({new_pools*c_.pool,c_.index_width});
                 else {
                     raw_owner=request.offloaded_index->range(first_pool * c_.pool, new_pools * c_.pool);
                     raw=raw_owner.dense();

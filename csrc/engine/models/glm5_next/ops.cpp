@@ -292,7 +292,7 @@ std::vector<std::pair<tyloi::Device, std::size_t>> State::growth(
 
 std::vector<::tyloi::Tensor> State::storage() const {
     std::vector<::tyloi::Tensor> result;
-    const auto add = [&](const DenseTensor& value) { if (value.defined()) result.emplace_back(value); };
+    const auto add = [&](const ::tyloi::Tensor& value) { if (value.defined()) result.emplace_back(value); };
     for (const auto& layer : layers) {
         if (const auto* kda = std::get_if<KdaState>(&layer)) {
             add(kda->conv); add(kda->recurrent); add(kda->rollback_conv); add(kda->rollback_recurrent);

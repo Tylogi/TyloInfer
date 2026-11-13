@@ -1,5 +1,5 @@
 # Keep storage and load accounting separate from DenseTensor numerical operations.
-add_library(mfq-tensor STATIC tensor.cpp dense_tensor.cpp weights/memory.cpp)
+add_library(mfq-tensor STATIC tensor.cpp views.cpp dense_tensor.cpp weights/memory.cpp)
 add_library(mfq::tensor ALIAS mfq-tensor)
 target_include_directories(mfq-tensor PUBLIC ${PROJECT_SOURCE_DIR})
 target_compile_features(mfq-tensor PUBLIC cxx_std_20)

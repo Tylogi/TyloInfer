@@ -18,7 +18,6 @@ using attention_ops::DenseTensor;
 using attention_ops::Linear;
 using attention_ops::Embedding;
 using attention_ops::rms_norm;
-using attention_ops::SequenceCache;
 using attention_ops::select_pooled_blocks;
 
 #ifdef TYLOINFER_NATIVE_CUDA
@@ -261,8 +260,8 @@ class SparseMla {
                 return Projection{qr, query, latent, packed};
             },
             [&](Projection &p) {
-                p.latent = state.latent.append(p.latent);
-                p.index = state.index.append(p.index);
+                p.latent = state.latent.append(p.latent).dense();
+                p.index = state.index.append(p.index).dense();
             },
             [&](const Projection &p) {
                 TYLOINFER_RUNTIME_CHECK(p.query.dim()==4 && p.query.size(2)==c_.heads,"GLM head-wise projection shape mismatch");
