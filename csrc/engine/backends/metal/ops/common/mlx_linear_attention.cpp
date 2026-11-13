@@ -1,6 +1,6 @@
 #include "mlx_linear_attention.h"
 #include "engine/backends/metal/native/kernel.h"
-#include "../../platform/metal_device_info.h"
+#include "engine/backends/metal/native/device.h"
 
 #include <algorithm>
 #include <array>

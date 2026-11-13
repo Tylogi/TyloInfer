@@ -1,7 +1,7 @@
 #include "mlx_native_gguf.h"
 #include "gguf_sources.h"
 #include "engine/backends/metal/native/kernel.h"
-#include "../../../platform/metal_device_info.h"
+#include "engine/backends/metal/native/device.h"
 #include "mlx_platform.h"
 #include "ops/Linear.hpp"
 #include "ops/MoE.hpp"

@@ -3,7 +3,7 @@
 #import <CoreVideo/CoreVideo.h>
 #import <Foundation/Foundation.h>
 
-#include "mfq_avfoundation_video.h"
+#include "avfoundation.h"
 
 #include <algorithm>
 #include <cstdio>

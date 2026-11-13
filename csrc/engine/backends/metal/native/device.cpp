@@ -1,4 +1,4 @@
-#include "metal_device_info.h"
+#include "device.h"
 
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>

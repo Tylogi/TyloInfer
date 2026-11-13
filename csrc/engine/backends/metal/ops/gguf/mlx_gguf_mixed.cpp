@@ -6,7 +6,7 @@
 #include "mlx_indirect_weight_residency.h"
 #include "mlx_platform.h"
 #include "mlx_moe_ops.h"
-#include "../../platform/metal_device_info.h"
+#include "engine/backends/metal/native/device.h"
 #include "ggml.h"
 
 #include <algorithm>

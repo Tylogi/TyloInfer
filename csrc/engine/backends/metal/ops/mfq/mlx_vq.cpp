@@ -2,7 +2,7 @@
 #include "mlx_nvq_decode.h"
 #include "engine/backends/metal/native/resident_allocations.h"
 
-#include "../../../../core/compat/mfq_format_compat.h"
+#include "engine/weights/encoding/legacy.h"
 #include "nvq_codebooks.generated.h"
 #include "engine/backends/metal/native/memory.h"
 #include <mlx/allocator.h>
@@ -2669,7 +2669,7 @@ VqTensorMetadata inspect_matrix_vq_header(
         magic);
     std::string profile_label;
 
-    if (dtype == mfq::kNvqDtype && magic_is(magic, "NQ1L")) {
+    if (dtype == tyloi::kNvqDtype && magic_is(magic, "NQ1L")) {
         if ((header.profile != 1 && header.profile != 2) ||
             header.bits == 0 ||
             header.bits > 8 ||
@@ -2679,7 +2679,7 @@ VqTensorMetadata inspect_matrix_vq_header(
                 "unsupported NVQ1-L header");
         }
         profile_label = "NVQ1-L";
-    } else if (dtype == mfq::kNvqDtype && magic_is(magic, "NQ1S")) {
+    } else if (dtype == tyloi::kNvqDtype && magic_is(magic, "NQ1S")) {
         if (header.profile != 1 ||
             header.bits != 4 ||
             header.group_size != 24 ||
@@ -2688,7 +2688,7 @@ VqTensorMetadata inspect_matrix_vq_header(
                 "unsupported NVQ1-S header");
         }
         profile_label = "NVQ1-S";
-    } else if (dtype == mfq::kNpqDtype &&
+    } else if (dtype == tyloi::kNpqDtype &&
                (magic_is(magic, "NPQS") || magic_is(magic, "NPQL"))) {
         const bool short_profile =
             magic_is(magic, "NPQS");
@@ -2703,7 +2703,7 @@ VqTensorMetadata inspect_matrix_vq_header(
                 "unsupported NPQ header");
         }
         profile_label = short_profile ? "NPQ0-S" : "NPQ0-L";
-    } else if (dtype == mfq::kNvqDtype &&
+    } else if (dtype == tyloi::kNvqDtype &&
                (magic_is(magic, "NVQ1") || magic_is(magic, "NIQ1"))) {
         constexpr std::uint8_t kIndexParity = 0x80;
         constexpr std::uint8_t kCustomCodebook = 0x40;
@@ -2790,7 +2790,7 @@ VqTensorMetadata inspect_nepq_header(
     const auto rotation_seed =
         cursor.scalar<std::uint64_t>("NEPQ rotation seed");
     const auto profile = nepq_profile(profile_id);
-    if (dtype != mfq::kNepqDtype || version != 1 ||
+    if (dtype != tyloi::kNepqDtype || version != 1 ||
         groups_per_super != 4 ||
         (flags & ~std::uint8_t{1}) != 0 ||
         ((flags & 1u) != 0) !=
@@ -2861,7 +2861,7 @@ CanonicalVq parse_vq(
     bool borrow_streams) {
     BlobCursor cursor(blob);
     const auto magic = cursor.magic("VQ payload magic");
-    if (dtype == mfq::kNpqDtype) {
+    if (dtype == tyloi::kNpqDtype) {
         if (!runtime_payload.empty()) {
             throw std::runtime_error(
                 "unexpected NPQ runtime metadata");
@@ -2874,12 +2874,12 @@ CanonicalVq parse_vq(
         }
         throw std::runtime_error("invalid NPQ payload magic");
     }
-    if (dtype == mfq::kNepqDtype) {
+    if (dtype == tyloi::kNepqDtype) {
         return parse_nepq(
             blob,
             runtime_payload);
     }
-    if (dtype == mfq::kNvqDtype) {
+    if (dtype == tyloi::kNvqDtype) {
         if (!runtime_payload.empty()) {
             throw std::runtime_error(
                 "unexpected NVQ runtime metadata");
@@ -3218,7 +3218,7 @@ common_templates(
 detail::ParsedVqStorage detail::parse_vq_blob(std::string_view dtype,
     std::span<const std::uint8_t> blob, std::span<const std::uint8_t> runtime_payload,
     bool borrow_streams) {
-    return parse_vq(mfq::canonical_format_dtype(dtype), blob, runtime_payload, borrow_streams);
+    return parse_vq(tyloi::canonical_format_dtype(dtype), blob, runtime_payload, borrow_streams);
 }
 
 bool detail::vq_native_jsc(int layout, int group_size, int state_bits, int table_banks,
@@ -3251,13 +3251,13 @@ VqTensorMetadata inspect_vq_blob(
     std::string_view dtype,
     std::span<const std::uint8_t> blob,
     std::span<const std::uint8_t> runtime_payload) {
-    const auto canonical = mfq::canonical_format_dtype(dtype);
+    const auto canonical = tyloi::canonical_format_dtype(dtype);
     if (!is_vq_dtype(canonical)) {
         throw std::runtime_error(
             "unsupported native Metal VQ dtype: "
             + std::string(dtype));
     }
-    if (canonical == mfq::kNepqDtype) {
+    if (canonical == tyloi::kNepqDtype) {
         return inspect_nepq_header(
             canonical,
             blob,
@@ -3270,10 +3270,10 @@ VqTensorMetadata inspect_vq_blob(
 }
 
 bool is_vq_dtype(std::string_view dtype) noexcept {
-    const auto canonical = mfq::canonical_format_dtype(dtype);
-    return canonical == mfq::kNvqDtype ||
-        canonical == mfq::kNpqDtype ||
-        canonical == mfq::kNepqDtype;
+    const auto canonical = tyloi::canonical_format_dtype(dtype);
+    return canonical == tyloi::kNvqDtype ||
+        canonical == tyloi::kNpqDtype ||
+        canonical == tyloi::kNepqDtype;
 }
 
 MlxVqWeight::MlxVqWeight(

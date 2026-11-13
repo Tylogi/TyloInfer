@@ -8,7 +8,7 @@
 #include "engine/backends/metal/ops/tensor.h"
 #include "engine/weights/memory.h"
 #include "mlx_gguf_staged.h"
-#include "../ops/gguf/native/mlx_native_gguf.h"
+#include "engine/backends/metal/ops/gguf/native/mlx_native_gguf.h"
 
 #include <algorithm>
 #include <array>

@@ -1,7 +1,7 @@
 #include "engine/backends/metal/native/tensor/tensor.h"
 #include "mlx_gguf_staged.h"
 #include "engine/backends/metal/native/kernel.h"
-#include "../../platform/metal_device_info.h"
+#include "engine/backends/metal/native/device.h"
 
 #include <mlx/allocator.h>
 #include <mlx/primitives.h>

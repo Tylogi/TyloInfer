@@ -3,7 +3,7 @@
 #include "mlx_gguf_prefill.h"
 #include "engine/backends/metal/native/kernel.h"
 #include "gguf_embedded.h"
-#include "../../platform/metal_device_info.h"
+#include "engine/backends/metal/native/device.h"
 
 #include <algorithm>
 #include <bit>

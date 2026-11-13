@@ -8,8 +8,8 @@
 
 namespace mfq::metal {
 namespace {
-#include "../kernels/common/mfq_qsa_prefill.inc"
-#include "../kernels/common/mfq_sdpa_decode.inc"
+#include "engine/backends/metal/kernels/common/mfq_qsa_prefill.inc"
+#include "engine/backends/metal/kernels/common/mfq_sdpa_decode.inc"
 }
 
 std::string qsa_prefill_indexer_source() {

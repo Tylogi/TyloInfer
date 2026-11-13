@@ -74,7 +74,7 @@ target_compile_options(tyloinfer-metal-gguf-plans PRIVATE
 
 if(BUILD_TESTING)
     add_executable(tyloinfer-native-gguf-plan-test
-        "${TYLOINFER_METAL_ROOT}/tests/native_gguf_plan_test.cpp"
+        "${PROJECT_SOURCE_DIR}/backends/metal/tests/native_gguf_plan_test.cpp"
         $<TARGET_OBJECTS:tyloinfer-metal-gguf-plans>)
     target_include_directories(tyloinfer-native-gguf-plan-test PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/metal"

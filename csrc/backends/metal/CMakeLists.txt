@@ -1,24 +1,24 @@
 find_package(Threads REQUIRED)
 
-set(TYLOINFER_METAL_ROOT "${CMAKE_CURRENT_SOURCE_DIR}")
+set(TYLOINFER_METAL_ROOT "${PROJECT_SOURCE_DIR}/engine/backends/metal")
 set(TYLOINFER_METAL_INCLUDE_DIRS
     ${PROJECT_SOURCE_DIR}
-    ${TYLOINFER_METAL_ROOT}/storage
-    ${TYLOINFER_METAL_ROOT}/storage/gguf
-    ${TYLOINFER_METAL_ROOT}/storage/mlx
-    ${TYLOINFER_METAL_ROOT}/storage/compat
-    ${TYLOINFER_METAL_ROOT}/runtime
+    ${CMAKE_CURRENT_SOURCE_DIR}/storage
+    ${CMAKE_CURRENT_SOURCE_DIR}/storage/gguf
+    ${CMAKE_CURRENT_SOURCE_DIR}/storage/mlx
+    ${CMAKE_CURRENT_SOURCE_DIR}/storage/compat
+    ${CMAKE_CURRENT_SOURCE_DIR}/runtime
     ${TYLOINFER_METAL_ROOT}/ops/common
     ${TYLOINFER_METAL_ROOT}/ops/tq
     ${TYLOINFER_METAL_ROOT}/ops/gguf
     ${TYLOINFER_METAL_ROOT}/ops/mlx
     ${TYLOINFER_METAL_ROOT}/ops/mfq
-    ${TYLOINFER_METAL_ROOT}/models/deepseek_v4
-    ${TYLOINFER_METAL_ROOT}/models/deepseek_v41
-    ${TYLOINFER_METAL_ROOT}/models/flash_next
-    ${TYLOINFER_METAL_ROOT}/models/qwen35
-    ${TYLOINFER_METAL_ROOT}/models/minicpmo45
-    ${TYLOINFER_METAL_ROOT}/models/nemotron_h
+    ${CMAKE_CURRENT_SOURCE_DIR}/models/deepseek_v4
+    ${CMAKE_CURRENT_SOURCE_DIR}/models/deepseek_v41
+    ${CMAKE_CURRENT_SOURCE_DIR}/models/flash_next
+    ${CMAKE_CURRENT_SOURCE_DIR}/models/qwen35
+    ${CMAKE_CURRENT_SOURCE_DIR}/models/minicpmo45
+    ${CMAKE_CURRENT_SOURCE_DIR}/models/nemotron_h
 )
 
 set(TYLOINFER_MLX_ROOT "" CACHE PATH
@@ -76,9 +76,9 @@ find_library(TYLOINFER_COREVIDEO_FRAMEWORK CoreVideo REQUIRED)
 find_library(TYLOINFER_IOSURFACE_FRAMEWORK IOSurface REQUIRED)
 find_library(TYLOINFER_IOKIT_FRAMEWORK IOKit REQUIRED)
 
-add_library(mfq-ane STATIC platform/mfq_ane.mm runtime/mtp_lora.cpp)
-target_include_directories(mfq-ane PUBLIC ${TYLOINFER_METAL_ROOT}/platform)
-target_include_directories(mfq-ane PUBLIC ${TYLOINFER_METAL_ROOT}/runtime)
+add_library(mfq-ane STATIC ${TYLOINFER_METAL_ROOT}/native/ane.mm runtime/mtp_lora.cpp)
+target_include_directories(mfq-ane PUBLIC ${TYLOINFER_METAL_ROOT}/native)
+target_include_directories(mfq-ane PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/runtime)
 target_compile_features(mfq-ane PUBLIC cxx_std_20)
 target_compile_options(mfq-ane PRIVATE -fobjc-arc)
 target_link_libraries(mfq-ane PRIVATE ${TYLOINFER_FOUNDATION_FRAMEWORK} ${TYLOINFER_IOSURFACE_FRAMEWORK})
@@ -88,10 +88,10 @@ target_link_libraries(mfq-ane-test PRIVATE mfq-ane)
 target_compile_features(mfq-ane-test PRIVATE cxx_std_20)
 
 add_library(mfq-avfoundation-video SHARED
-    platform/mfq_avfoundation_video.mm
+    ${PROJECT_SOURCE_DIR}/components/video/avfoundation.mm
 )
 target_include_directories(mfq-avfoundation-video PUBLIC
-    ${TYLOINFER_METAL_ROOT}/platform
+    ${PROJECT_SOURCE_DIR}/components/video
 )
 target_compile_features(mfq-avfoundation-video PRIVATE cxx_std_20)
 target_compile_options(mfq-avfoundation-video PRIVATE -fobjc-arc)
@@ -276,7 +276,7 @@ endif()
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${TYLOINFER_REPOSITORY_ROOT}/tyloinfer/kernels/metal/tq_decode.h"
     "${TYLOINFER_REPOSITORY_ROOT}/tyloinfer/kernels/metal/tq_matmul.h")
-configure_file(kernels/tq/mfq_tq_embedded.h.in mfq_tq_embedded.h @ONLY)
+configure_file(${TYLOINFER_METAL_ROOT}/kernels/tq/mfq_tq_embedded.h.in mfq_tq_embedded.h @ONLY)
 file(READ "${PROJECT_SOURCE_DIR}/components/ggml/src/ggml-common.h" TYLOINFER_GGUF_COMMON_SOURCE)
 function(tyloinfer_gguf_table type name count pattern output)
     set(_marker "GGML_TABLE_BEGIN(${type}, ${name}, ${count})")
@@ -329,8 +329,8 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${PROJECT_SOURCE_DIR}/third_party/agention-gyro/codebook_f16.inc"
     "${TYLOINFER_METAL_ROOT}/kernels/gguf/gguf_decode.h"
     "${TYLOINFER_METAL_ROOT}/kernels/gguf/gguf_matmul.h")
-configure_file(kernels/gguf/gguf_embedded.h.in gguf_embedded.h @ONLY)
-configure_file(kernels/mlx/mlx_affine_nax.h.in mlx_affine_nax.h @ONLY)
+configure_file(${TYLOINFER_METAL_ROOT}/kernels/gguf/gguf_embedded.h.in gguf_embedded.h @ONLY)
+configure_file(${TYLOINFER_METAL_ROOT}/kernels/mlx/mlx_affine_nax.h.in mlx_affine_nax.h @ONLY)
 
 add_library(mfq-metal-runtime STATIC
     ${PROJECT_SOURCE_DIR}/engine/backends/metal/native/stream.cpp
@@ -367,23 +367,23 @@ add_library(mfq-metal-runtime STATIC
     runtime/mlx_kv_quantization.cpp
     runtime/mlx_qsa_kv_offload.cpp
     models/dflash2/mlx_dflash2.cpp
-    ops/common/mlx_linear_attention.cpp
-    ops/common/mlx_staged_attention.cpp
-    ops/common/mlx_moe_ops.cpp
-    ops/common/mlx_expert_route_tiles.cpp
-    ops/common/mlx_mx.cpp
-    ops/tq/mlx_tq.cpp
-    ops/common/mlx_sparse_attention.cpp
-    ops/common/mlx_sparse_prefill_tiles.cpp
-    ops/common/mlx_csa2.cpp
-    ops/common/mlx_dsa_cache_ops.cpp
+    ${TYLOINFER_METAL_ROOT}/ops/common/mlx_linear_attention.cpp
+    ${TYLOINFER_METAL_ROOT}/ops/common/mlx_staged_attention.cpp
+    ${TYLOINFER_METAL_ROOT}/ops/common/mlx_moe_ops.cpp
+    ${TYLOINFER_METAL_ROOT}/ops/common/mlx_expert_route_tiles.cpp
+    ${TYLOINFER_METAL_ROOT}/ops/common/mlx_mx.cpp
+    ${TYLOINFER_METAL_ROOT}/ops/tq/mlx_tq.cpp
+    ${TYLOINFER_METAL_ROOT}/ops/common/mlx_sparse_attention.cpp
+    ${TYLOINFER_METAL_ROOT}/ops/common/mlx_sparse_prefill_tiles.cpp
+    ${TYLOINFER_METAL_ROOT}/ops/common/mlx_csa2.cpp
+    ${TYLOINFER_METAL_ROOT}/ops/common/mlx_dsa_cache_ops.cpp
     models/deepseek_v4/deepseek_v4_model.cpp
     models/deepseek_v4/mlx_deepseek_v4_attention.cpp
     models/deepseek_v4/mlx_deepseek_v4_causal_lm.cpp
     models/deepseek_v4/mlx_deepseek_v4_dspark.cpp
     models/deepseek_v4/mlx_deepseek_v4_hc.cpp
     models/deepseek_v4/mlx_deepseek_v4_moe.cpp
-    ops/common/mlx_dsa.cpp
+    ${TYLOINFER_METAL_ROOT}/ops/common/mlx_dsa.cpp
     models/deepseek_v4/mlx_deepseek_v4_vision.cpp
     models/deepseek_v41/mlx_deepseek_v41_attention.cpp
     models/deepseek_v41/mlx_deepseek_v41_causal_lm.cpp
@@ -409,22 +409,22 @@ add_library(mfq-metal-runtime STATIC
 )
 if(TYLOINFER_ENABLE_MFQ_COMPAT)
     target_sources(mfq-metal-runtime PRIVATE
-        ops/mfq/mlx_moe.cpp
-        ops/mfq/mlx_fp8_sq.cpp
-        ops/mfq/mlx_mxfp4_sq.cpp
-        ops/mfq/mlx_nint.cpp
-        ops/mfq/mlx_nint_rows.cpp
-        ops/mfq/mlx_nint8_zero.cpp
-        ops/mfq/mlx_vq.cpp
+        ${TYLOINFER_METAL_ROOT}/ops/mfq/mlx_moe.cpp
+        ${TYLOINFER_METAL_ROOT}/ops/mfq/mlx_fp8_sq.cpp
+        ${TYLOINFER_METAL_ROOT}/ops/mfq/mlx_mxfp4_sq.cpp
+        ${TYLOINFER_METAL_ROOT}/ops/mfq/mlx_nint.cpp
+        ${TYLOINFER_METAL_ROOT}/ops/mfq/mlx_nint_rows.cpp
+        ${TYLOINFER_METAL_ROOT}/ops/mfq/mlx_nint8_zero.cpp
+        ${TYLOINFER_METAL_ROOT}/ops/mfq/mlx_vq.cpp
         runtime/mlx_ssd_expert_arena.cpp
         runtime/mlx_ssd_expert_cache.cpp
-        ops/mfq/mlx_grouped_linear_mfq.cpp
+        ${TYLOINFER_METAL_ROOT}/ops/mfq/mlx_grouped_linear_mfq.cpp
     )
 else()
-    target_sources(mfq-metal-runtime PRIVATE ops/common/mlx_grouped_linear.cpp)
+    target_sources(mfq-metal-runtime PRIVATE ${TYLOINFER_METAL_ROOT}/ops/common/mlx_grouped_linear.cpp)
 endif()
 add_library(mfq::metal-runtime ALIAS mfq-metal-runtime)
-target_sources(mfq-metal-runtime PRIVATE platform/metal_device_info.cpp)
+target_sources(mfq-metal-runtime PRIVATE ${TYLOINFER_METAL_ROOT}/native/device.cpp)
 if(BUILD_TESTING)
 add_executable(tyloinfer-metal-affine-test tests/mlx_affine_test.cpp)
 add_executable(tyloinfer-metal-dflash2-test tests/mlx_dflash2_test.cpp)
@@ -569,19 +569,20 @@ function(tyloinfer_add_metal_format target)
     target_sources(mfq-metal-runtime PRIVATE $<TARGET_OBJECTS:${target}>)
 endfunction()
 
-add_subdirectory(ops/gguf/native)
+add_subdirectory("${TYLOINFER_METAL_ROOT}/ops/gguf/native"
+    "${CMAKE_CURRENT_BINARY_DIR}/ops/gguf/native")
 target_sources(mfq-metal-runtime PRIVATE $<TARGET_OBJECTS:tyloinfer-metal-gguf-plans>)
 
 tyloinfer_add_metal_format(tyloinfer-metal-gguf-ops
-    ops/gguf/native/mlx_native_gguf.cpp
-    ops/gguf/mlx_gguf.cpp
-    ops/gguf/mlx_gguf_mixed.cpp
-    ops/gguf/mlx_gguf_rotation.cpp
-    ops/gguf/mlx_gguf_prefill.cpp
-    ops/gguf/mlx_gguf_routes.cpp
-    ops/gguf/mlx_gguf_staged.cpp
-    ops/gguf/mlx_gguf_split.cpp
-    ops/gguf/mlx_gguf_mhc.cpp
+    ${TYLOINFER_METAL_ROOT}/ops/gguf/native/mlx_native_gguf.cpp
+    ${TYLOINFER_METAL_ROOT}/ops/gguf/mlx_gguf.cpp
+    ${TYLOINFER_METAL_ROOT}/ops/gguf/mlx_gguf_mixed.cpp
+    ${TYLOINFER_METAL_ROOT}/ops/gguf/mlx_gguf_rotation.cpp
+    ${TYLOINFER_METAL_ROOT}/ops/gguf/mlx_gguf_prefill.cpp
+    ${TYLOINFER_METAL_ROOT}/ops/gguf/mlx_gguf_routes.cpp
+    ${TYLOINFER_METAL_ROOT}/ops/gguf/mlx_gguf_staged.cpp
+    ${TYLOINFER_METAL_ROOT}/ops/gguf/mlx_gguf_split.cpp
+    ${TYLOINFER_METAL_ROOT}/ops/gguf/mlx_gguf_mhc.cpp
     storage/gguf/mlx_gguf_rows.cpp
     storage/gguf/mlx_gguf_expert_cache.cpp)
 target_include_directories(tyloinfer-metal-gguf-ops PRIVATE
@@ -592,10 +593,10 @@ target_include_directories(tyloinfer-metal-gguf-ops PRIVATE
 target_compile_options(tyloinfer-metal-gguf-ops PRIVATE
     -include "${CMAKE_CURRENT_BINARY_DIR}/ops/gguf/native/native_limits.h")
 tyloinfer_add_metal_format(tyloinfer-metal-mlx-ops
-    ops/mlx/mlx_affine.cpp
-    ops/mlx/mlx_affine_staged.cpp
-    ops/mlx/mlx_affine_mhc.cpp
-    ops/mlx/mlx_affine_indirect.cpp
+    ${TYLOINFER_METAL_ROOT}/ops/mlx/mlx_affine.cpp
+    ${TYLOINFER_METAL_ROOT}/ops/mlx/mlx_affine_staged.cpp
+    ${TYLOINFER_METAL_ROOT}/ops/mlx/mlx_affine_mhc.cpp
+    ${TYLOINFER_METAL_ROOT}/ops/mlx/mlx_affine_indirect.cpp
     storage/mlx/mlx_affine_rows.cpp
     storage/mlx/mlx_affine_expert_cache.cpp)
 target_link_libraries(tyloinfer-metal-gguf-ops PRIVATE mfq-ggml)
@@ -700,8 +701,9 @@ option(TYLOINFER_BUILD_PRECOMPILED_METAL "Build bundled MFQ Metal libraries" OFF
 add_executable(mfq-metal-source-export
     apps/mfq_metal_source_export.cpp runtime/mlx_builtin_kernels.cpp)
 target_include_directories(mfq-metal-source-export PRIVATE
+    "${PROJECT_SOURCE_DIR}"
     "${CMAKE_CURRENT_BINARY_DIR}/ops/gguf/native"
-    "${TYLOINFER_METAL_ROOT}/runtime" "${TYLOINFER_METAL_ROOT}/ops/common" "${TYLOINFER_METAL_ROOT}/ops/tq" "${TYLOINFER_METAL_ROOT}/ops/mfq" "${CMAKE_CURRENT_BINARY_DIR}")
+    "${CMAKE_CURRENT_SOURCE_DIR}/runtime" "${TYLOINFER_METAL_ROOT}/ops/common" "${TYLOINFER_METAL_ROOT}/ops/tq" "${TYLOINFER_METAL_ROOT}/ops/mfq" "${CMAKE_CURRENT_BINARY_DIR}")
 target_compile_features(mfq-metal-source-export PRIVATE cxx_std_20)
 if(TYLOINFER_BUILD_PRECOMPILED_METAL)
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
@@ -1165,7 +1167,7 @@ add_executable(mfq-metal-hf-safetensors-store-test
 )
 
 target_include_directories(mfq-metal-hf-safetensors-store-test PRIVATE
-    ${TYLOINFER_METAL_ROOT}/storage
+    ${CMAKE_CURRENT_SOURCE_DIR}/storage
 )
 target_link_libraries(mfq-metal-hf-safetensors-store-test PRIVATE mfq-model-source)
 target_compile_features(
