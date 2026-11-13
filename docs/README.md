@@ -2,17 +2,13 @@
 
 TyloInfer provides TQ inference, CUDA/Metal runtimes, and local serving.
 
-These guides cover the public `tyloinfer` CLI and APIs, with English references
-and a Chinese deployment guide. Use documentation from the same Git revision
-as the installed code.
-
 ## Get started
 
 - [Deploy a service and check performance (中文)](deployment.zh-CN.md)
 - [Build the C++ runtime](cli/build.md)
 - [Run TyloInfer Server and Studio](cli/serve.md)
 - [Complete the first API request](cli/serve.md#first-api-request)
-- [Measure and record performance](benchmarking.md)
+- [Measure inference performance](benchmarking.md)
 - [Create a self-contained release](packaging.md)
 - [Check model and backend support](runtime/support.md)
 
@@ -28,10 +24,10 @@ as the installed code.
 
 ## Documentation checks
 
-From the repository root, run `python3 -B scripts/check_docs.py`. This static
-check covers public command names, local Markdown links/anchors, JSON/JSONL
-examples, the HTTP API table against checked-in OpenAPI, and selected CLI
-defaults/options. It uses only the standard library and CLI parser.
+From the repository root, run `python3 -B scripts/check_docs.py`. This
+read-only standard-library check covers public command names, local Markdown
+links/anchors, JSON/JSONL examples, the HTTP API table against checked-in
+OpenAPI, and selected CLI defaults/options.
 
 ## APIs
 

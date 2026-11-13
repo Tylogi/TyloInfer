@@ -97,10 +97,10 @@ CUDA Graph、主要融合算子默认开启。通常不需要复制一长串环�
 
 ## 5. 检查服务和速度
 
-先完成[首次 API 请求](cli/serve.md#first-api-request)，使用返回的模型 ID，
-确认 HTTP 200 和非空助手回复，再用下例检查 MTP 和推理指标。
-以下命令按本机无鉴权配置编写；启用鉴权时，为 `/v1` 和 `/api/v1` 请求添加 Bearer 凭据。
-共享示例和日志中仅使用占位值。PowerShell 使用 `curl.exe`。
+首次上手请先完成[最小 API 请求闭环](cli/serve.md#first-api-request)，按返回的精确模型 ID
+确认 HTTP 200 和非空 assistant 内容，再检查 MTP 和性能指标。
+以下命令默认本机无鉴权；启用鉴权时，为 `/v1` 和 `/api/v1` 请求添加 Bearer 凭据，
+PowerShell 使用 `curl.exe`，不要把实际密钥写进共享示例或日志。
 
 ```shell
 curl http://127.0.0.1:8090/health
@@ -154,7 +154,8 @@ decode 不包含首 token 出来前的等待。
 和[分块、专家缓存说明](https://github.com/Niko1221/Strata/blob/main/docs/DETAILS.md)。
 参数和默认值以 TyloInfer 自身为准；其他后端参见[支持矩阵](runtime/support.md)和[构建说明](cli/build.md)。
 
-## 7. 记录性能测试
+## 7. 性能测量
 
-测试时保存代码版本、模型哈希、采样参数、草稿配置、缓存冷／热状态、重复次数和原始响应。
-测量步骤与记录清单见[性能测量指南](benchmarking.md)。
+模型就绪后测第一次请求，不额外预热、不等待，也不命中前缀缓存。
+各引擎使用相同输入和采样设置，分别比较普通解码、原生 MTP 和 DFlash2。
+具体步骤与统计口径见[性能测量指南](benchmarking.md)。

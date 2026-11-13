@@ -1,8 +1,4 @@
-"""Read-only documentation checks; run: python3 -B scripts/check_docs.py.
-
-Uses the standard library and CLI parser only; no model, server or build runs.
-Checks documentation structure/contracts, not inference or benchmark validity.
-"""
+"""Check documentation links, examples and CLI/API contracts without modifying files."""
 from __future__ import annotations
 
 import argparse
@@ -92,7 +88,6 @@ def check() -> None:
     print(f"PASS: {len(files)} Markdown files; {json_count} JSON examples; {link_count} local links/anchors")
     print(f"PASS: API table matches {len(schema['paths'])} paths / {len(operations)} operations and named schemas")
     print("PASS: public CLI identity, data-dir default and speculative decoding options")
-    print("NOT RUN: native build, Web UI, model inference or performance reproduction")
 
 
 if __name__ == "__main__":
