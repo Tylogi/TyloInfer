@@ -1,6 +1,7 @@
 #pragma once
 
 #include "mlx_ssd_expert_cache.h"
+#include "engine/weights/moe/segments.h"
 #include <functional>
 #include <memory>
 #include <string>
@@ -11,27 +12,9 @@ namespace tyloi::metal { class ResidentAllocations; }
 namespace mfq::metal {
 class MfqContainer;
 
-struct MlxExpertSegment {
-    std::string tensor;
-    std::uint64_t offset = 0;
-    std::size_t expert_bytes = 0;
-    std::vector<std::uint64_t> expert_offsets;
-    std::vector<std::size_t> expert_sizes;
-    std::uint64_t begin(int expert) const noexcept {
-        return expert_offsets.empty() ? offset + std::uint64_t(expert) * expert_bytes : expert_offsets[expert];
-    }
-    std::size_t size(int expert) const noexcept {
-        return expert_sizes.empty() ? expert_bytes : expert_sizes[expert];
-    }
-};
-struct MlxExpertSegments {
-    int experts = 0;
-    std::vector<MlxExpertSegment> fields;
-};
-
 class MlxExpertSegmentCache {
 public:
-    MlxExpertSegmentCache(const MfqContainer& model, std::vector<MlxExpertSegments> layers,
+    MlxExpertSegmentCache(const MfqContainer& model, std::vector<tyloi::weights::Segments> layers,
         std::size_t budget, int workers = 8, bool prefill_read_ahead = false);
     mlx::core::array apply(std::size_t layer, const mlx::core::array& ids,
         std::size_t first_stage_fields, const std::function<mlx::core::array()>& first_stage,

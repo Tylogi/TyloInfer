@@ -7,14 +7,14 @@
 
 namespace tyloi::metal { class ResidentAllocations; }
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
-class MlxStreamedWeightPool {
+class Pool {
 public:
-    MlxStreamedWeightPool(std::size_t limit, std::size_t maximum_entry);
-    ~MlxStreamedWeightPool();
-    MlxStreamedWeightPool(const MlxStreamedWeightPool&) = delete;
-    MlxStreamedWeightPool& operator=(const MlxStreamedWeightPool&) = delete;
+    Pool(std::size_t limit, std::size_t maximum_entry);
+    ~Pool();
+    Pool(const Pool&) = delete;
+    Pool& operator=(const Pool&) = delete;
     std::optional<std::size_t> allocate(std::size_t bytes);
     void release(std::size_t offset, std::size_t bytes);
     void set_limit(std::size_t limit);
@@ -31,4 +31,4 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

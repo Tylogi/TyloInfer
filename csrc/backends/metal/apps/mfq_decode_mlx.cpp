@@ -2233,7 +2233,7 @@ public:
             if (command.weight_bytes) resident_weight_budget = *command.weight_bytes;
             try {
                 if (resident_weight_budget && resident_weight_budget < resident_dense_weight_baseline)
-                    throw mfq::metal::MlxResidentBudgetExceeded("weight budget is smaller than non-offloadable weights");
+                    throw MfqResourceExhausted("weight budget is smaller than non-offloadable weights");
                 enforce_memory_budget(0); apply_expert_budget();
             }
             catch (...) { resident_budget = previous; resident_weight_budget = previous_weights; throw; }
@@ -2333,7 +2333,7 @@ private:
     void apply_expert_budget() {
         const auto weights = resident_weight_budget.load();
         if (weights && weights < resident_dense_weight_baseline)
-            throw mfq::metal::MlxResidentBudgetExceeded("weight budget is smaller than non-offloadable weights");
+            throw MfqResourceExhausted("weight budget is smaller than non-offloadable weights");
         if constexpr (requires(Runtime& value) { value.set_expert_cache_limit(std::size_t{}); }) {
             auto& runtime = runtime_holder->value();
             auto room = weights ? weights - resident_dense_weight_baseline : std::numeric_limits<std::size_t>::max();
@@ -2395,7 +2395,7 @@ private:
             return actual + (reserve > cached ? reserve - cached : 0);
         };
         if (allocation > budget || reserve > budget - allocation)
-            throw mfq::metal::MlxResidentBudgetExceeded("resident memory budget cannot accommodate this allocation");
+            throw MfqResourceExhausted("resident memory budget cannot accommodate this allocation");
         const auto target = budget - allocation;
         if (used() <= target) return;
         runtime_executor->drain();
@@ -2427,7 +2427,7 @@ private:
                 if (runtime.reclaimable_expert_bytes() >= available) break;
             }
         }
-        if (used() > target) throw mfq::metal::MlxResidentBudgetExceeded(
+        if (used() > target) throw MfqResourceExhausted(
             "resident memory budget exhausted by non-offloadable weights, live KV or execution buffers"
             "; used_bytes=" + std::to_string(used()) + "; target_bytes=" + std::to_string(target) +
             "; allocation_bytes=" + std::to_string(allocation) + "; budget_bytes=" + std::to_string(budget));

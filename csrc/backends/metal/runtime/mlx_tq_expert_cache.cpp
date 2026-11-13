@@ -10,7 +10,7 @@
 #include "mlx_kernel_prepare.h"
 #include "engine/backends/metal/native/pinned.h"
 #include "engine/backends/metal/native/tensor/buffer.h"
-#include "backends/cpu/native/host_parallel.h"
+#include "engine/backends/cpu/native/host_parallel.h"
 
 #include <mlx/allocator.h>
 #include <nlohmann/json.hpp>
@@ -1129,7 +1129,7 @@ struct MlxTqExpertCache::Impl {
     std::optional<std::pair<std::size_t, std::size_t>> lookahead;
     MfqContainer source;
     int io_workers;
-    mfq::HostParallelPool workers{{}, false};
+    tyloi::HostParallelPool workers{{}, false};
     std::mutex execution;
     std::vector<Layer> layers;
     std::array<Pool, 3> pools;

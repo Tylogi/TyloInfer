@@ -1,4 +1,4 @@
-#include "mlx_streamed_weight_pool.h"
+#include "engine/backends/metal/native/pool.h"
 #include "engine/backends/metal/native/pinned.h"
 #include "engine/backends/metal/native/resident_allocations.h"
 #include "engine/backends/metal/native/tensor/buffer.h"
@@ -10,17 +10,17 @@
 #include <map>
 #include <stdexcept>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 using namespace mlx::core;
 
-struct MlxStreamedWeightPool::Impl {
+struct Pool::Impl {
     const std::size_t page = std::size_t(getpagesize());
     struct Buffer {
-        std::shared_ptr<detail::MlxPinnedPoolStorage> owner;
+        std::shared_ptr<mfq::metal::detail::MlxPinnedPoolStorage> owner;
         allocator::Buffer value{nullptr};
         ~Buffer() { if (value.ptr()) allocator::release(value); }
     };
-    std::shared_ptr<detail::MlxPinnedPoolStorage> storage;
+    std::shared_ptr<mfq::metal::detail::MlxPinnedPoolStorage> storage;
     std::vector<array> chunks;
     std::shared_ptr<tyloi::metal::ResidentAllocations> residency;
     std::map<std::size_t, std::size_t> free, occupied;
@@ -33,7 +33,7 @@ struct MlxStreamedWeightPool::Impl {
             throw std::invalid_argument("streamed weight pool cannot hold its expert geometry");
         chunk_bytes = std::min(maximum_buffer, std::max(std::size_t{512} << 20,
             (maximum_entry + page - 1) / page * page));
-        storage = std::make_shared<detail::MlxPinnedPoolStorage>();
+        storage = std::make_shared<mfq::metal::detail::MlxPinnedPoolStorage>();
         storage->bytes = std::max(limit, std::size_t(device->recommendedMaxWorkingSetSize())) / page * page;
         storage->data = mmap(nullptr, storage->bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
         if (storage->data == MAP_FAILED) throw std::bad_alloc();
@@ -84,7 +84,7 @@ struct MlxStreamedWeightPool::Impl {
             auto owner = std::make_shared<Buffer>(); owner->owner = storage;
             owner->value = allocator::make_buffer(static_cast<std::byte*>(storage->data) + part * chunk_bytes, length);
             if (!owner->value.ptr()) throw std::runtime_error("cannot register streamed expert memory with Metal");
-            next.push_back(mlx_buffer_view(owner->value, Shape{int(length / 4096), 4096}, uint8, owner));
+            next.push_back(mfq::metal::mlx_buffer_view(owner->value, Shape{int(length / 4096), 4096}, uint8, owner));
         }
         if (residency) residency->update_arrays(next, bytes);
         else if (bytes) residency = tyloi::metal::ResidentAllocations::retain_arrays(next, bytes, true);
@@ -97,10 +97,10 @@ struct MlxStreamedWeightPool::Impl {
     }
 };
 
-MlxStreamedWeightPool::MlxStreamedWeightPool(std::size_t limit, std::size_t maximum_entry)
+Pool::Pool(std::size_t limit, std::size_t maximum_entry)
     : impl_(std::make_unique<Impl>(limit, maximum_entry)) {}
-MlxStreamedWeightPool::~MlxStreamedWeightPool() = default;
-std::optional<std::size_t> MlxStreamedWeightPool::allocate(std::size_t bytes) {
+Pool::~Pool() = default;
+std::optional<std::size_t> Pool::allocate(std::size_t bytes) {
     if (!bytes || bytes % impl_->page) throw std::invalid_argument("streamed expert allocation is not page aligned");
     if (bytes > impl_->limit || bytes > impl_->chunk_bytes) return std::nullopt;
     for (;;) {
@@ -117,37 +117,37 @@ std::optional<std::size_t> MlxStreamedWeightPool::allocate(std::size_t bytes) {
         impl_->resize(std::min(impl_->limit, ((impl_->capacity / impl_->chunk_bytes) + 1) * impl_->chunk_bytes));
     }
 }
-void MlxStreamedWeightPool::release(std::size_t offset, std::size_t bytes) {
+void Pool::release(std::size_t offset, std::size_t bytes) {
     const auto found = impl_->occupied.find(offset);
     if (found == impl_->occupied.end() || found->second != bytes)
         throw std::invalid_argument("streamed expert allocation was not live");
     impl_->occupied.erase(found); impl_->insert_free(offset, bytes);
 }
-void MlxStreamedWeightPool::set_limit(std::size_t limit) {
+void Pool::set_limit(std::size_t limit) {
     limit = limit / impl_->page * impl_->page;
     if (!limit || limit > impl_->storage->bytes) throw std::invalid_argument("streamed expert budget exceeds its reserved address space");
     impl_->resize(std::min(impl_->capacity, limit)); impl_->limit = limit;
 }
-void MlxStreamedWeightPool::clear() {
+void Pool::clear() {
     impl_->occupied.clear(); impl_->resize(0);
 }
-std::byte* MlxStreamedWeightPool::data(std::size_t offset) const {
+std::byte* Pool::data(std::size_t offset) const {
     if (offset >= impl_->capacity) throw std::out_of_range("streamed expert offset exceeds capacity");
     return static_cast<std::byte*>(impl_->storage->data) + offset;
 }
-std::uint64_t MlxStreamedWeightPool::address(std::size_t offset) const {
+std::uint64_t Pool::address(std::size_t offset) const {
     if (offset >= impl_->capacity) throw std::out_of_range("streamed expert offset exceeds capacity");
     return static_cast<const MTL::Buffer*>(impl_->chunks.at(offset / impl_->chunk_bytes).buffer().ptr())->gpuAddress()
         + offset % impl_->chunk_bytes;
 }
-std::size_t MlxStreamedWeightPool::capacity() const noexcept { return impl_->capacity; }
-std::size_t MlxStreamedWeightPool::generation() const noexcept { return impl_->generation; }
-std::size_t MlxStreamedWeightPool::pinned_bytes() const noexcept { return impl_->storage->locked_bytes; }
-std::size_t MlxStreamedWeightPool::batch_capacity(std::size_t bytes) const noexcept {
+std::size_t Pool::capacity() const noexcept { return impl_->capacity; }
+std::size_t Pool::generation() const noexcept { return impl_->generation; }
+std::size_t Pool::pinned_bytes() const noexcept { return impl_->storage->locked_bytes; }
+std::size_t Pool::batch_capacity(std::size_t bytes) const noexcept {
     if (bytes < impl_->page || bytes % impl_->page) return 0;
     const auto overhead = (impl_->limit - 1) / impl_->chunk_bytes * (bytes - impl_->page);
     return overhead < impl_->limit ? (impl_->limit - overhead) / bytes : 0;
 }
-const std::shared_ptr<tyloi::metal::ResidentAllocations>& MlxStreamedWeightPool::residency() const noexcept { return impl_->residency; }
+const std::shared_ptr<tyloi::metal::ResidentAllocations>& Pool::residency() const noexcept { return impl_->residency; }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

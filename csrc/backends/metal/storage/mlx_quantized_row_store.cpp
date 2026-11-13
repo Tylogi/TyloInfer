@@ -1,7 +1,7 @@
 #include "mlx_quantized_row_store.h"
 #include "mlx_resource_telemetry.h"
 #include "mlx_nint_rows.h"
-#include "backends/cpu/native/host_parallel.h"
+#include "engine/backends/cpu/native/host_parallel.h"
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -564,7 +564,7 @@ struct MlxQuantizedRowStore::Impl {
     std::vector<MfqMappedBytes> tq_mappings;
     std::unique_ptr<MlxMappedTqTable> tq;
     std::array<mlx::core::float16_t, 1u << 16u> decode_lut{};
-    mutable mfq::HostParallelPool workers;
+    mutable tyloi::HostParallelPool workers;
     int worker_count;
     mutable std::mutex mutex;
     mutable std::list<std::int64_t> recency;

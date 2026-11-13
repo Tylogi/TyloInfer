@@ -56,13 +56,13 @@ struct MlxGgufExpertCache::Impl {
     std::unique_ptr<MlxExpertSegmentCache> cache;
 
     Impl(const MfqContainer& source, const std::vector<std::string>& prefixes, std::size_t budget, int workers) : model(source) {
-        std::vector<MlxExpertSegments> segments;
+        std::vector<tyloi::weights::Segments> segments;
         const auto mixed = model.header().extra_json.find("gguf_mixed_experts");
         const auto mixed_layouts = mixed == model.header().extra_json.end() ? nlohmann::json::object()
             : nlohmann::json::parse(mixed->second);
         for (const auto& prefix : prefixes) {
             Layer layer;
-            MlxExpertSegments definition;
+            tyloi::weights::Segments definition;
             for (int p = 0; p < 3; ++p) {
                 const auto name = prefix + ".mlp.experts." + std::array{"gate", "up", "down"}[p] + ".weight";
                 auto& projection = layer[p];
@@ -77,7 +77,7 @@ struct MlxGgufExpertCache::Impl {
                     const auto& entries = mixed_layouts.at(name);
                     if (!entries.is_array() || entries.size() != std::size_t(shape[0]))
                         throw std::invalid_argument("GGUF mixed cache expert count differs");
-                    MlxExpertSegment field{name};
+                    tyloi::weights::Segment field{name};
                     std::size_t next = 0;
                     for (const auto& entry : entries) {
                         const auto dtype = entry.at("dtype").get<std::string>();

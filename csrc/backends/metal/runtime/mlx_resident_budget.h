@@ -3,12 +3,10 @@
 #include <cstddef>
 #include <functional>
 #include <limits>
-#include "tyloinfer/runtime.h"
+#include "components/error.h"
 #include <utility>
 
 namespace mfq::metal {
-
-using MlxResidentBudgetExceeded = MfqResourceExhausted;
 
 template <typename Runtime>
 std::size_t mlx_trim_expert_residency(Runtime& runtime, std::size_t bytes) {
@@ -18,7 +16,7 @@ std::size_t mlx_trim_expert_residency(Runtime& runtime, std::size_t bytes) {
     const auto full = runtime.resident_full_expert_bytes();
     const auto cache = runtime.expert_cache_limit_bytes();
     if (cache > std::numeric_limits<std::size_t>::max() - full)
-        throw MlxResidentBudgetExceeded("expert residency ceiling overflow");
+        throw MfqResourceExhausted("expert residency ceiling overflow");
     const auto released = runtime.set_expert_cache_limit(bytes);
     runtime.set_expert_cache_limit(full + cache);
     return released;

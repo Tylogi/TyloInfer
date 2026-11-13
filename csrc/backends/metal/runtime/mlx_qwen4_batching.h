@@ -298,7 +298,7 @@ public:
     }
     bool recoverable_failure(std::exception_ptr error) const {
         try { std::rethrow_exception(error); }
-        catch (const MlxResidentBudgetExceeded&) { return true; }
+        catch (const MfqResourceExhausted&) { return true; }
         catch (...) { return false; }
     }
     mfq::engine::Metrics metrics() const {

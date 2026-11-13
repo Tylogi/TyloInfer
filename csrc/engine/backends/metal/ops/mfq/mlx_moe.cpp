@@ -11,7 +11,7 @@
 #include "mlx_resident_budget.h"
 
 #include "mfq_container.h"
-#include "tyloinfer/host_parallel.h"
+#include "engine/backends/cpu/native/host_parallel.h"
 #include "mfq_mfe_prefill_embedded.h"
 #include "mlx_nint.h"
 #include "mlx_nint_metadata.h"
@@ -9174,7 +9174,7 @@ struct MlxMfeOffloadCache::Impl {
     std::size_t resident_bytes = 0;
     std::unordered_map<std::string, std::size_t> backing_records;
     MlxResourceTelemetry resources;
-    mfq::HostParallelPool io_workers{{}, false};
+    tyloi::HostParallelPool io_workers{{}, false};
     std::unordered_map<std::string, PreparedProjection> prepared;
     std::unordered_map<std::string,
         std::vector<std::shared_ptr<const MfeCachedExpert>>> resident_pages;

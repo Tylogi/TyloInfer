@@ -28,7 +28,7 @@
 #include "engine/config.h"
 #include "backends/cpu/storage/prefix_blocks.h"
 #include "mlx_transformer.h"
-#include "backends/cpu/native/host_parallel.h"
+#include "engine/backends/cpu/native/host_parallel.h"
 
 #include "nlohmann/json.hpp"
 #include <mlx/compile.h>
@@ -2240,7 +2240,7 @@ private:
             row_read_threads_ = static_cast<unsigned>(std::min<std::size_t>(
                 64, base_read_threads_ * std::min<std::size_t>(4, files.size())));
             if (row_read_threads_ > base_read_threads_)
-                row_workers_ = std::make_shared<mfq::HostParallelPool>(std::function<void(std::size_t)>{}, false);
+                row_workers_ = std::make_shared<tyloi::HostParallelPool>(std::function<void(std::size_t)>{}, false);
         }
         resources_.set({0, 0, 0, 0, payload});
     }
@@ -2255,7 +2255,7 @@ private:
     std::vector<std::int64_t> offsets_;
     std::vector<std::int64_t> vocab_;
     unsigned base_read_threads_ = 1, row_read_threads_ = 1;
-    std::shared_ptr<mfq::HostParallelPool> row_workers_;
+    std::shared_ptr<tyloi::HostParallelPool> row_workers_;
     int batch_ = 0;
     std::vector<std::int64_t> context_;
     MlxResourceTelemetry resources_;

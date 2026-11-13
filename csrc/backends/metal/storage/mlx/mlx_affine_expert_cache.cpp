@@ -44,10 +44,10 @@ struct MlxAffineExpertCache::Impl {
     std::unique_ptr<MlxExpertSegmentCache> cache;
 
     Impl(const MfqContainer& model, const std::vector<std::string>& prefixes, std::size_t budget, int workers) {
-        std::vector<MlxExpertSegments> definitions;
+        std::vector<tyloi::weights::Segments> definitions;
         for (const auto& prefix : prefixes) {
             Layer layer;
-            MlxExpertSegments definition;
+            tyloi::weights::Segments definition;
             for (int p = 0; p < 3; ++p) {
                 const auto name = prefix + ".mlp.experts." + std::array{"gate", "up", "down"}[p] + ".weight";
                 if (model.record(name).dtype != "MLX-AFFINE")
