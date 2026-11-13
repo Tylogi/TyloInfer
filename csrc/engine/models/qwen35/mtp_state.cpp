@@ -33,16 +33,10 @@ void MtpState::prepare(int64_t batch, int64_t tokens, int64_t kl_capacity) {
         tyloi::ops::DeviceScope guard(layout.device);
         const auto capacity = kl_capacity > 0
             ? std::min(layout.capacity, std::max(position_ + tokens, kl_capacity)) : layout.capacity;
-        auto grown = tyloi::state::allocate_kv(batch, layout.heads, capacity, layout.head_dim, false,
-            layout.device, layout.dtype, layout.quantization);
-        if (kv_[index].defined() && position_ > 0) {
-            auto key_prefix = tyloi::ops::slice(grown.physical_key, 2, 0, position_);
-            auto value_prefix = tyloi::ops::slice(grown.physical_value, 2, 0, position_);
-            tyloi::ops::copy_into(key_prefix,
-                tyloi::ops::slice(kv_[index].physical_key, 2, 0, position_));
-            tyloi::ops::copy_into(value_prefix,
-                tyloi::ops::slice(kv_[index].physical_value, 2, 0, position_));
-        }
+        auto grown = kv_[index].defined()
+            ? tyloi::state::grow_kv(kv_[index], capacity, position_)
+            : tyloi::state::allocate_kv(batch, layout.heads, capacity, layout.head_dim, false,
+                layout.device, layout.dtype, layout.quantization);
         kv_[index] = std::move(grown);
     }
 }

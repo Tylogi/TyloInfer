@@ -38,6 +38,8 @@ struct KvLayout {
     std::size_t bytes;
 };
 
+std::int64_t kv_capacity(std::int64_t current, std::int64_t required, std::int64_t maximum);
+
 // Zero capacity plans an empty initial cache without allocating device storage.
 KvLayout kv_layout(std::int64_t batch, std::int64_t heads, std::int64_t capacity,
     std::int64_t head_dim, bool ring, ScalarType dtype, KvQuantization quantization = {});

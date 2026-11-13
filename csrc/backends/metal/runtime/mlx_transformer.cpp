@@ -680,22 +680,6 @@ array mlx_circular_cache_history(
     return mlx::core::take(cache, indices, 1);
 }
 
-namespace {
-array initial_kv_key(int batch, int heads, int maximum_sequence, int head_dimension,
-    int initial_capacity, mlx::core::Dtype dtype, tyloi::state::KvQuantization quantization) {
-    if (batch <= 0 || heads <= 0 || maximum_sequence <= 0 || head_dimension <= 0 ||
-        initial_capacity < 0 || (dtype != mlx::core::float16 &&
-        dtype != mlx::core::bfloat16 && dtype != mlx::core::float32))
-        throw std::runtime_error("invalid KV cache dimensions or dtype");
-    const int capacity = std::min(initial_capacity, maximum_sequence);
-    const auto layout = tyloi::state::kv_layout(batch, heads, capacity, head_dimension,
-        false, tyloi::metal::scalar_type(dtype), quantization);
-    MlxResidentBudgetScope::reserve(layout.bytes);
-    return mlx::core::zeros(Shape{batch, heads, capacity, static_cast<int>(layout.key_width)},
-        quantization.enabled() ? mlx::core::uint32 : dtype);
-}
-}
-
 MlxKvCache::MlxKvCache(
     int batch,
     int heads,
@@ -705,16 +689,19 @@ MlxKvCache::MlxKvCache(
     mlx::core::Dtype dtype,
     bool quantization_allowed)
     : maximum_sequence_(maximum_sequence) {
-    kv_.batch = batch;
-    kv_.heads = heads;
-    kv_.head_dim = head_dimension;
-    kv_.quantization = quantization_allowed ? tyloi::engine::kv_quantization() : tyloi::state::KvQuantization{};
-    auto key = initial_kv_key(batch, heads, maximum_sequence, head_dimension, initial_capacity,
-        dtype, kv_.quantization);
-    kv_.dtype = tyloi::metal::scalar_type(dtype);
-    auto value = mlx::core::zeros(Shape{batch, heads, key.shape(2),
-        kv_.quantization.enabled() ? mlx_kv_packed_width(head_dimension, kv_.quantization.value_bits()) : head_dimension}, key.dtype());
-    set_storage(std::move(key), std::move(value));
+    const auto quantization = quantization_allowed ? tyloi::engine::kv_quantization() : tyloi::state::KvQuantization{};
+    if (batch <= 0 || heads <= 0 || maximum_sequence <= 0 || head_dimension <= 0 ||
+        initial_capacity < 0 || (dtype != mlx::core::float16 &&
+        dtype != mlx::core::bfloat16 && dtype != mlx::core::float32))
+        throw std::runtime_error("invalid KV cache dimensions or dtype");
+    const auto capacity = std::min(initial_capacity, maximum_sequence);
+    const auto logical_dtype = tyloi::metal::scalar_type(dtype);
+    const auto layout = tyloi::state::kv_layout(batch, heads, capacity, head_dimension,
+        false, logical_dtype, quantization);
+    MlxResidentBudgetScope::reserve(layout.bytes);
+    auto next = tyloi::state::allocate_kv(batch, heads, capacity, head_dimension, false,
+        tyloi::Device{tyloi::DeviceType::metal, 0}, logical_dtype, quantization);
+    kv_ = std::move(next);
     resources_.set({kv_.physical_key.nbytes() + kv_.physical_value.nbytes(), static_cast<std::size_t>(batch)});
 }
 
@@ -739,45 +726,12 @@ void MlxKvCache::ensure_capacity(int required) {
     if (required > maximum_sequence_) {
         throw std::runtime_error("KV cache exceeds maximum sequence length");
     }
-    int next_capacity = std::max(1, capacity());
-    while (next_capacity < required) {
-        if (next_capacity > maximum_sequence_ / 2) {
-            next_capacity = maximum_sequence_;
-            break;
-        }
-        next_capacity *= 2;
-    }
-    const Shape next_shape{
-        static_cast<int>(kv_.batch),
-        static_cast<int>(kv_.heads),
-        next_capacity,
-        key_storage().shape(3),
-    };
-    MlxResidentBudgetScope::reserve(tyloi::state::kv_layout(static_cast<int>(kv_.batch), static_cast<int>(kv_.heads), next_capacity,
-        static_cast<int>(kv_.head_dim), false, kv_.dtype, kv_.quantization).bytes);
-    auto next_key = mlx::core::zeros(next_shape, key_storage().dtype());
-    auto next_value_shape = next_shape; next_value_shape[3] = value_storage().shape(3);
-    auto next_value = mlx::core::zeros(next_value_shape, value_storage().dtype());
-    if (capacity() > 0) {
-        const Shape start{0, 0, 0, 0};
-        const Shape stop{
-            static_cast<int>(kv_.batch),
-            static_cast<int>(kv_.heads),
-            capacity(),
-            key_storage().shape(3),
-        };
-        next_key = mlx::core::slice_update(
-            next_key,
-            key_storage(),
-            start,
-            stop);
-        next_value = mlx::core::slice_update(
-            next_value,
-            value_storage(),
-            start,
-            Shape{static_cast<int>(kv_.batch), static_cast<int>(kv_.heads), capacity(), value_storage().shape(3)});
-    }
-    set_storage(std::move(next_key), std::move(next_value));
+    const auto old_capacity = capacity();
+    const auto next_capacity = tyloi::state::kv_capacity(old_capacity, required, maximum_sequence_);
+    MlxResidentBudgetScope::reserve(tyloi::state::kv_layout(kv_.batch, kv_.heads, next_capacity,
+        kv_.head_dim, false, kv_.dtype, kv_.quantization).bytes);
+    auto next = tyloi::state::grow_kv(kv_, next_capacity, old_capacity);
+    kv_ = std::move(next);
     resources_.set({key_storage().nbytes() + value_storage().nbytes(), static_cast<std::size_t>(kv_.batch)});
 }
 
@@ -871,8 +825,6 @@ void MlxKvCache::restore_snapshot(
         snapshot.key.dtype() != key_storage().dtype() || snapshot.value.dtype() != value_storage().dtype()) {
         throw std::runtime_error("KV cache snapshot topology mismatch");
     }
-    const Shape allocation_shape{
-        static_cast<int>(kv_.batch), static_cast<int>(kv_.heads), snapshot.capacity, key_storage().shape(3)};
     const auto allocation = tyloi::state::kv_layout(static_cast<int>(kv_.batch), static_cast<int>(kv_.heads), snapshot.capacity,
         static_cast<int>(kv_.head_dim), false, kv_.dtype, kv_.quantization).bytes;
     const auto copies = tyloi::state::kv_layout(static_cast<int>(kv_.batch), static_cast<int>(kv_.heads), snapshot.position,
@@ -880,22 +832,14 @@ void MlxKvCache::restore_snapshot(
     if (copies > std::numeric_limits<std::size_t>::max() - allocation)
         throw std::overflow_error("KV tensor size overflow");
     MlxResidentBudgetScope::reserve(allocation + copies);
-    auto key = mlx::core::zeros(allocation_shape, key_storage().dtype());
-    auto value = mlx::core::zeros(Shape{static_cast<int>(kv_.batch), static_cast<int>(kv_.heads), snapshot.capacity, value_storage().shape(3)}, value_storage().dtype());
-    key = mlx::core::slice_update(
-        key,
-        mlx::core::array(tyloi::metal::array(
-            tyloi::ops::clone(tyloi::metal::tensor(snapshot.key)))),
-        Shape{0, 0, 0, 0},
-        Shape{static_cast<int>(kv_.batch), static_cast<int>(kv_.heads), snapshot.position, key_storage().shape(3)});
-    value = mlx::core::slice_update(
-        value,
-        mlx::core::array(tyloi::metal::array(
-            tyloi::ops::clone(tyloi::metal::tensor(snapshot.value)))),
-        Shape{0, 0, 0, 0},
-        Shape{static_cast<int>(kv_.batch), static_cast<int>(kv_.heads), snapshot.position, value_storage().shape(3)});
-    mlx::core::eval(key, value);
-    set_storage(std::move(key), std::move(value));
+    auto next = tyloi::state::allocate_kv(kv_.batch, kv_.heads, snapshot.capacity, kv_.head_dim,
+        false, tyloi::Device{tyloi::DeviceType::metal, 0}, kv_.dtype, kv_.quantization);
+    next.physical_key = tyloi::ops::update_slice(next.physical_key,
+        tyloi::ops::clone(tyloi::metal::tensor(snapshot.key)), 2, 0);
+    next.physical_value = tyloi::ops::update_slice(next.physical_value,
+        tyloi::ops::clone(tyloi::metal::tensor(snapshot.value)), 2, 0);
+    mlx::core::eval(tyloi::metal::array(next.physical_key), tyloi::metal::array(next.physical_value));
+    kv_ = std::move(next);
     position_ = snapshot.position;
     resources_.set({key_storage().nbytes() + value_storage().nbytes(), static_cast<std::size_t>(kv_.batch)});
 }

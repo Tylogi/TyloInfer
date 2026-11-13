@@ -34,8 +34,12 @@ std::size_t kv_bytes(std::int64_t batch, std::int64_t heads, std::int64_t capaci
                      std::int64_t head_dim, bool ring, ScalarType dtype,
                      KvQuantization settings = {});
 
+// Metal accepts zero capacity for an initially empty cache.
 KvView allocate_kv(std::int64_t batch, std::int64_t heads, std::int64_t capacity,
                    std::int64_t head_dim, bool ring, Device device, ScalarType dtype,
                    KvQuantization settings = {});
+
+// Returns independent larger storage with the first keep rows; the source is unchanged.
+KvView grow_kv(const KvView& cache, std::int64_t capacity, std::int64_t keep);
 
 } // namespace tyloi::state

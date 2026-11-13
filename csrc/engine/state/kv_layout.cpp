@@ -12,6 +12,18 @@ std::size_t checked_multiply(std::size_t a, std::size_t b) {
 
 } // namespace
 
+std::int64_t kv_capacity(std::int64_t current, std::int64_t required, std::int64_t maximum) {
+    if (maximum <= 0 || current < 0 || current > maximum || required < 0 || required > maximum)
+        throw std::invalid_argument("invalid KV cache capacity");
+    if (required <= current) return current;
+    auto capacity = current > 0 ? current : 1;
+    while (capacity < required) {
+        if (capacity > maximum / 2) return maximum;
+        capacity *= 2;
+    }
+    return capacity;
+}
+
 KvLayout kv_layout(int64_t batch, int64_t heads, int64_t capacity, int64_t head_dim,
                    bool ring, ScalarType dtype, KvQuantization quantization) {
     if (batch <= 0 || heads <= 0 || capacity < 0 || head_dim <= 0)
