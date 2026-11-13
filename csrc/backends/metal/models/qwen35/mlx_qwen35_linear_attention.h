@@ -1,6 +1,7 @@
 #pragma once
 
 #include "mlx_linear_attention.h"
+#include "engine/state/recurrent.h"
 #include "mlx_qwen35_full_attention.h"
 #include "qwen35_model.h"
 
@@ -123,14 +124,8 @@ public:
         return alpha_beta_grouped_;
     }
 
-    const std::optional<mlx::core::array>& convolution_state()
-        const noexcept {
-        return convolution_state_;
-    }
-    const std::optional<mlx::core::array>& recurrent_state()
-        const noexcept {
-        return recurrent_state_;
-    }
+    std::optional<mlx::core::array> convolution_state() const;
+    std::optional<mlx::core::array> recurrent_state() const;
     const Config& config() const noexcept {
         return config_;
     }
@@ -160,10 +155,8 @@ private:
     MlxLinear output_;
     MlxRmsNorm ffn_norm_;
     MlxQwen35DenseSwiGlu ffn_;
-    std::optional<mlx::core::array> convolution_state_;
-    std::optional<mlx::core::array> recurrent_state_;
-    std::optional<mlx::core::array> zero_convolution_state_;
-    std::optional<mlx::core::array> zero_recurrent_state_;
+    tyloi::state::Recurrent::State state_{{}, {}, false};
+    tyloi::state::Recurrent::State zero_state_{{}, {}, false};
     MlxResourceTelemetry resources_;
     int zero_cache_batch_ = 0;
     int cache_position_ = 0;

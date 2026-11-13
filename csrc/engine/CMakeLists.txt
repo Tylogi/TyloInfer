@@ -54,6 +54,7 @@ add_library(mfq-engine STATIC
     state/session/prefix_cache.cpp
     state/qsa_sequence.cpp
     state/recurrent.cpp
+    state/recurrent_layout.cpp
     state/kv_view.cpp
     state/kv_layout.cpp
 )

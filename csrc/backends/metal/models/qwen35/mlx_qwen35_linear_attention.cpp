@@ -5,6 +5,8 @@
 #include "mlx_gguf.h"
 #include "engine/backends/metal/native/profile.h"
 #include "mlx_kernel_prepare.h"
+#include "mlx_resident_budget.h"
+#include "engine/state/recurrent_layout.h"
 
 #include <cmath>
 #include <limits>
@@ -442,49 +444,63 @@ void MlxQwen35LinearAttentionBlock::reset_cache(int batch) {
         checked_int(
             config_.linear_value_head_dim,
             "linear value head dimension");
-    if (!zero_convolution_state_ ||
-        !zero_recurrent_state_ ||
+    if (!zero_state_.defined() ||
         zero_cache_batch_ != batch) {
-        zero_convolution_state_ = mlx::core::zeros(
-            Shape{batch, kernel - 1, channels},
-            mlx::core::float32);
-        zero_recurrent_state_ = mlx::core::zeros(
-            Shape{batch, value_heads, dimension, dimension},
-            mlx::core::float32);
+        const auto layout = tyloi::state::recurrent_layout(
+            batch, channels, kernel, value_heads, dimension, dimension, false);
+        MlxResidentBudgetScope::reserve(layout.bytes);
+        tyloi::state::Recurrent::State zero{{}, {}, false};
+        zero.convolution = tyloi::metal::tensor(mlx::core::zeros(
+            Shape(layout.convolution.begin(), layout.convolution.end()), mlx::core::float32));
+        zero.recurrent = tyloi::metal::tensor(mlx::core::zeros(
+            Shape(layout.recurrent.begin(), layout.recurrent.end()), mlx::core::float32));
+        zero_state_ = std::move(zero);
         zero_cache_batch_ = batch;
     }
-    convolution_state_ = *zero_convolution_state_;
-    recurrent_state_ = *zero_recurrent_state_;
+    tyloi::state::Recurrent::State state{
+        tyloi::metal::tensor(tyloi::metal::array(zero_state_.convolution)),
+        tyloi::metal::tensor(tyloi::metal::array(zero_state_.recurrent)),
+        zero_state_.transposed};
+    state_ = std::move(state);
     cache_position_ = 0;
     cache_batch_ = batch;
     speculative_rollback_.reset();
     report_cache_resources();
 }
 
+std::optional<array> MlxQwen35LinearAttentionBlock::convolution_state() const {
+    if (!state_.convolution.defined()) return std::nullopt;
+    return tyloi::metal::array(state_.convolution);
+}
+
+std::optional<array> MlxQwen35LinearAttentionBlock::recurrent_state() const {
+    if (!state_.recurrent.defined()) return std::nullopt;
+    return tyloi::metal::array(state_.recurrent);
+}
+
 void MlxQwen35LinearAttentionBlock::report_cache_resources() noexcept {
     std::size_t bytes = 0;
     const auto count = [&bytes](const auto& live, const auto& zero) {
-        if (live) bytes += live->nbytes();
-        if (zero && (!live || live->id() != zero->id())) bytes += zero->nbytes();
+        if (live.defined()) bytes += tyloi::metal::array(live).nbytes();
+        if (zero.defined() && (!live.defined() || tyloi::metal::array(live).id() != tyloi::metal::array(zero).id()))
+            bytes += tyloi::metal::array(zero).nbytes();
     };
-    count(convolution_state_, zero_convolution_state_);
-    count(recurrent_state_, zero_recurrent_state_);
+    count(state_.convolution, zero_state_.convolution);
+    count(state_.recurrent, zero_state_.recurrent);
     resources_.set({bytes, bytes ? static_cast<std::size_t>(cache_batch_) : 0});
 }
 
 void MlxQwen35LinearAttentionBlock::materialize_cache() {
-    if (convolution_state_ && recurrent_state_) {
+    if (state_.defined()) {
         mlx::core::eval(
-            *convolution_state_,
-            *recurrent_state_);
+            tyloi::metal::array(state_.convolution),
+            tyloi::metal::array(state_.recurrent));
     }
 }
 
 void MlxQwen35LinearAttentionBlock::clear_cache() noexcept {
-    convolution_state_.reset();
-    recurrent_state_.reset();
-    zero_convolution_state_.reset();
-    zero_recurrent_state_.reset();
+    state_ = {{}, {}, false};
+    zero_state_ = {{}, {}, false};
     zero_cache_batch_ = 0;
     cache_position_ = 0;
     cache_batch_ = 0;
@@ -494,15 +510,15 @@ void MlxQwen35LinearAttentionBlock::clear_cache() noexcept {
 
 MlxQwen35LinearAttentionCacheSnapshot
 MlxQwen35LinearAttentionBlock::snapshot_cache(bool detached) const {
-    if (!convolution_state_ || !recurrent_state_ ||
+    if (!state_.defined() ||
         cache_position_ <= 0 || cache_batch_ <= 0) {
         throw std::runtime_error(
             "Qwen3.5 linear-attention cache is unavailable");
     }
     auto convolution = detached ? mlx::core::array(tyloi::metal::array(
-        tyloi::metal::ops::clone(tyloi::metal::tensor(*convolution_state_)))) : *convolution_state_;
+        tyloi::metal::ops::clone(state_.convolution))) : tyloi::metal::array(state_.convolution);
     auto recurrent = detached ? mlx::core::array(tyloi::metal::array(
-        tyloi::metal::ops::clone(tyloi::metal::tensor(*recurrent_state_)))) : *recurrent_state_;
+        tyloi::metal::ops::clone(state_.recurrent))) : tyloi::metal::array(state_.recurrent);
     if (detached) mlx::core::eval(convolution, recurrent);
     return {
         std::move(convolution),
@@ -534,8 +550,9 @@ void MlxQwen35LinearAttentionBlock::restore_cache(
     auto recurrent = detached ? mlx::core::array(tyloi::metal::array(
         tyloi::metal::ops::clone(tyloi::metal::tensor(snapshot.recurrent_state)))) : snapshot.recurrent_state;
     if (detached) mlx::core::eval(convolution, recurrent);
-    convolution_state_ = std::move(convolution);
-    recurrent_state_ = std::move(recurrent);
+    state_.convolution = tyloi::metal::tensor(std::move(convolution));
+    state_.recurrent = tyloi::metal::tensor(std::move(recurrent));
+    state_.transposed = false;
     cache_position_ = snapshot.position;
     cache_batch_ = snapshot.batch;
     speculative_rollback_.reset();
@@ -553,7 +570,7 @@ array MlxQwen35LinearAttentionBlock::forward(
             "Qwen3.5 linear-attention input must have a non-empty "
             "[batch,tokens,hidden] shape");
     }
-    if (use_cache && !convolution_state_) {
+    if (use_cache && !state_.convolution.defined()) {
         reset_cache(input.shape(0));
     }
     return forward(
@@ -584,7 +601,7 @@ array MlxQwen35LinearAttentionBlock::forward(
     }
 
     if (use_cache) {
-        if (!convolution_state_ || !recurrent_state_) {
+        if (!state_.defined()) {
             if (position_offset != 0) {
                 throw std::runtime_error(
                     "Qwen3.5 linear-attention cache must start "
@@ -672,7 +689,7 @@ array MlxQwen35LinearAttentionBlock::forward(
         const bool bf16_projection = tokens == 1 && activation_dtype == mlx::core::float16 && quantized_output &&
             !quantized_output->has_hadamard() && quantized_output->native_weight_ref();
         auto decoded = gated_delta_decode_step(qk, value_input, z, alpha, beta_logits,
-            *convolution_state_, *recurrent_state_, convolution_weight_, dt_bias_, a_,
+            tyloi::metal::array(state_.convolution), tyloi::metal::array(state_.recurrent), convolution_weight_, dt_bias_, a_,
             linear_norm_.weight(), key_heads, value_heads, dimension,
             static_cast<float>(config_.rms_norm_eps), linear_norm_.eps(), true,
             gguf_layout_, bf16_projection ? mlx::core::bfloat16 : activation_dtype, false, bf16_projection);
@@ -683,8 +700,8 @@ array MlxQwen35LinearAttentionBlock::forward(
             speculative_rollback_->gate = std::move(decoded.gate);
             speculative_rollback_->beta = std::move(decoded.beta);
         }
-        convolution_state_ = std::move(decoded.convolution_state);
-        recurrent_state_ = std::move(decoded.recurrent_state);
+        state_.convolution = tyloi::metal::tensor(std::move(decoded.convolution_state));
+        state_.recurrent = tyloi::metal::tensor(std::move(decoded.recurrent_state));
         cache_position_ += tokens;
         report_cache_resources();
         tyloi::metal::profile_eval("qwen35.linear_attention.fused_decode", decoded.output);
@@ -740,7 +757,7 @@ array MlxQwen35LinearAttentionBlock::forward(
             Shape{batch, kernel - 1, channels},
             mlx::core::float32);
     const auto& convolution_state = use_cache
-        ? *convolution_state_
+        ? tyloi::metal::array(state_.convolution)
         : zero_convolution_state;
     auto convolved = linear_conv_qkv(
         convolution_state,
@@ -765,7 +782,7 @@ array MlxQwen35LinearAttentionBlock::forward(
         convolved.value,
         recurrent_gate,
         recurrent_beta,
-        use_cache ? recurrent_state_ : std::nullopt,
+        use_cache ? recurrent_state() : std::nullopt,
         false,
         gguf_layout_);
     if (tyloi::profiling::active()) {
@@ -775,8 +792,8 @@ array MlxQwen35LinearAttentionBlock::forward(
     }
 
     if (use_cache) {
-        convolution_state_ = convolved.state;
-        recurrent_state_ = recurrent.state;
+        state_.convolution = tyloi::metal::tensor(convolved.state);
+        state_.recurrent = tyloi::metal::tensor(recurrent.state);
         cache_position_ += tokens;
         report_cache_resources();
     }
@@ -815,7 +832,7 @@ array MlxQwen35LinearAttentionBlock::forward_speculative(
     }
     const int batch = input.shape(0);
     const int tokens = input.shape(1);
-    if (!convolution_state_ || !recurrent_state_) {
+    if (!state_.defined()) {
         if (position_offset != 0) {
             throw std::runtime_error(
                 "Qwen3.5 speculative cache must start at position zero");
@@ -826,15 +843,15 @@ array MlxQwen35LinearAttentionBlock::forward_speculative(
         throw std::runtime_error(
             "Qwen3.5 speculative cache append must be contiguous");
     }
-    if (!convolution_state_ || !recurrent_state_) {
+    if (!state_.defined()) {
         throw std::runtime_error(
             "Qwen3.5 speculative recurrent checkpoint is unavailable");
     }
     speculative_rollback_.reset();
     speculative_rollback_.emplace(
         MlxQwen35LinearAttentionRollback{
-            *convolution_state_,
-            *recurrent_state_,
+            tyloi::metal::array(state_.convolution),
+            tyloi::metal::array(state_.recurrent),
             std::nullopt,
             std::nullopt,
             std::nullopt,
@@ -847,8 +864,8 @@ array MlxQwen35LinearAttentionBlock::forward_speculative(
     try {
         return forward(input, position_offset, true);
     } catch (...) {
-        convolution_state_ = speculative_rollback_->convolution_state;
-        recurrent_state_ = speculative_rollback_->recurrent_state;
+        state_.convolution = tyloi::metal::tensor(speculative_rollback_->convolution_state);
+        state_.recurrent = tyloi::metal::tensor(speculative_rollback_->recurrent_state);
         cache_position_ = speculative_rollback_->position;
         cache_batch_ = speculative_rollback_->batch;
         speculative_rollback_.reset();
@@ -883,8 +900,8 @@ void MlxQwen35LinearAttentionBlock::rollback_speculative(
         static_cast<float>(config_.rms_norm_eps),
         false,
         gguf_layout_);
-    convolution_state_ = std::move(restored.convolution_state);
-    recurrent_state_ = std::move(restored.recurrent_state);
+    state_.convolution = tyloi::metal::tensor(std::move(restored.convolution_state));
+    state_.recurrent = tyloi::metal::tensor(std::move(restored.recurrent_state));
     cache_position_ = restored.position;
     cache_batch_ = speculative_rollback_->batch;
     speculative_rollback_.reset();
@@ -904,7 +921,7 @@ array MlxQwen35LinearAttentionBlock::forward(
             "[batch,tokens,hidden] shape");
     }
     validate_position_shape(positions, input.shape(1));
-    if (use_cache && !convolution_state_) {
+    if (use_cache && !state_.convolution.defined()) {
         reset_cache(input.shape(0));
     }
     return forward(

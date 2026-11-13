@@ -4,6 +4,7 @@
 #include "engine/models/qwen35/model.h"
 #include "engine/models/input.h"
 #include "engine/ops.h"
+#include "engine/state/recurrent_layout.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -234,9 +235,11 @@ std::vector<std::pair<tyloi::Device, std::size_t>> State::growth(
             const auto key = multiply(linear.key_heads, linear.key_dim);
             const auto value = multiply(linear.value_heads, linear.value_dim);
             const auto width = sum(multiply(2, key), value);
-            const auto conv = multiply(multiply(batch, linear.conv_kernel - 1), width);
-            const auto recurrent = multiply(multiply(multiply(batch, linear.value_heads), linear.value_dim), linear.value_dim);
-            const auto state_bytes = multiply(sum(conv, recurrent), sizeof(float));
+            if (width > std::numeric_limits<std::int64_t>::max())
+                throw std::overflow_error("Qwen3.5 state growth overflow");
+            const auto state_bytes = tyloi::state::recurrent_layout(batch,
+                static_cast<std::int64_t>(width), linear.conv_kernel,
+                linear.value_heads, linear.value_dim, linear.value_dim, transposed_).bytes;
             if (!state.mixer.defined()) add(device, state_bytes);
             if (input.confirmed > 0) {
                 add(device, state_bytes);

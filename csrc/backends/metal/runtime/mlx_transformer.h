@@ -1,6 +1,7 @@
 #pragma once
 
 #include "mlx_resource_telemetry.h"
+#include "engine/state/kv_view.h"
 #include "engine/backends/metal/ops/attention/kv.h"
 
 #include <cstddef>
@@ -149,7 +150,7 @@ public:
         const mlx::core::array& key,
         const mlx::core::array& value);
     void append_only(const mlx::core::array& key, const mlx::core::array& value);
-    bool quantized() const noexcept { return quantization_.enabled(); }
+    bool quantized() const noexcept { return kv_.quantization.enabled(); }
     mlx::core::array attention(const mlx::core::array& query, bool causal = true) const;
     mlx::core::array sparse_attention(const mlx::core::array& query,
         const std::optional<mlx::core::array>& blocks, int query_offset, int ratio, int budget) const;
@@ -178,28 +179,17 @@ public:
     int position() const noexcept {
         return position_;
     }
-    int capacity() const noexcept {
-        return key_.shape(2);
-    }
-    const mlx::core::array& key_storage() const noexcept {
-        return key_;
-    }
-    const mlx::core::array& value_storage() const noexcept {
-        return value_;
-    }
+    int capacity() const noexcept { return static_cast<int>(kv_.physical_key.size(2)); }
+    const mlx::core::array& key_storage() const;
+    const mlx::core::array& value_storage() const;
 
 private:
     void ensure_capacity(int required);
+    void set_storage(mlx::core::array key, mlx::core::array value);
     std::pair<mlx::core::array, mlx::core::array> physical_view() const;
 
-    int batch_;
-    int heads_;
     int maximum_sequence_;
-    int head_dimension_;
-    mlx::core::Dtype dtype_;
-    tyloi::state::KvQuantization quantization_;
-    mlx::core::array key_;
-    mlx::core::array value_;
+    tyloi::state::KvView kv_;
     int position_ = 0;
     MlxResourceTelemetry resources_;
 };
@@ -225,7 +215,7 @@ public:
         return position_;
     }
     std::size_t storage_bytes() const noexcept {
-        return values_ ? values_->nbytes() : 0;
+        return values_.defined() ? values_.nbytes() : 0;
     }
 
 private:
@@ -236,7 +226,7 @@ private:
     mlx::core::Dtype dtype_;
     int batch_ = 0;
     int position_ = 0;
-    std::optional<mlx::core::array> values_;
+    tyloi::Tensor values_;
     MlxResourceTelemetry resources_;
 };
 
