@@ -254,13 +254,8 @@ std::vector<::tyloi::Tensor> State::storage() const {
             const auto& qsa=*layer.qsa;
             add(qsa.keys.storage());add(qsa.values.storage());add(qsa.index.storage());
             add(qsa.graph_keys);add(qsa.graph_values);add(qsa.graph_pooled);add(qsa.graph_index);
-            if(qsa.memory) {
-                add(qsa.memory->keys);add(qsa.memory->values);add(qsa.memory->index);add(qsa.memory->pooled);
-                const auto& hot=qsa.memory->hot;
-                add(hot.keys);add(hot.values);add(hot.mapping);add(hot.slot_ids);add(hot.requested);
-                add(hot.epochs);add(hot.queue);add(hot.control);add(hot.cold_keys);add(hot.cold_values);
-                add(hot.cold_mapping);add(hot.free_cold);add(hot.free_gpu);add(hot.cold_control);
-            }
+            if(qsa.memory)
+                for(const auto& value:qsa.memory->storage())add(value);
         }
     }
     return result;

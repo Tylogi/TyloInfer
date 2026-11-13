@@ -16,6 +16,7 @@
 #include "engine/state/sequence.h"
 #include "engine/state/kv_offload.h"
 #include "engine/state/kv_memory.h"
+#include "engine/backends/cuda/kernels/mfq_cuda_kv_hot_cache.h"
 #include "engine/backends/cuda/executor/decode_window.h"
 #include "engine/backends/cuda/kernels/mfq_cuda_kv_quantization.h"
 #include "engine/models/session/snapshot.h"
@@ -30,6 +31,8 @@
 #include <numeric>
 #include <set>
 #include <unordered_map>
+
+namespace tyloi::cuda { HotKvCache& kv_hot(KvMemoryAllocation&); }
 
 namespace tyloi::cuda::qwen4_exp {
 using attention_ops::DenseTensor;
@@ -1385,8 +1388,8 @@ class Qsa {
         const auto save=[&](const DenseTensor& tensor) {
             auto saved=std::make_shared<DenseTensor>(tensor.contiguous().clone());bytes+=session_tensor_bytes(*saved);return saved;
         };
-        if(managed_memory(request) && request.memory->hot.exclusive()) {
-            auto pair=request.memory->hot.gather(count);
+        if(managed_memory(request) && kv_hot(*request.memory).exclusive()) {
+            auto pair=kv_hot(*request.memory).gather(count);
             state.keys=save(pair.first.permute({0,2,1,3}).reshape({1,count,c_.kv_heads*key_width()}));
             state.values=save(pair.second.permute({0,2,1,3}).reshape({1,count,c_.kv_heads*value_width()}));
         } else if(request.graph_keys.defined()) {
@@ -1415,10 +1418,10 @@ class Qsa {
             auto k=keys->reshape({1,count,c_.kv_heads,key_width()}).permute({0,2,1,3});
             auto v=values->reshape({1,count,c_.kv_heads,value_width()}).permute({0,2,1,3});
             auto positions=::tyloi::cuda::arange(count,request.graph_keys.dense().options().dtype(::tyloi::kInt64));
-            if(request.memory->hot.exclusive())request.memory->hot.append(k,v,positions);
+            if(kv_hot(*request.memory).exclusive())kv_hot(*request.memory).append(k,v,positions);
             else {
                 (request.graph_keys.defined()?request.graph_keys.dense():DenseTensor{}).narrow(2,0,count).copy_(k);(request.graph_values.defined()?request.graph_values.dense():DenseTensor{}).narrow(2,0,count).copy_(v);
-                request.memory->hot.publish((request.graph_keys.defined()?request.graph_keys.dense():DenseTensor{}),(request.graph_values.defined()?request.graph_values.dense():DenseTensor{}),positions);
+                kv_hot(*request.memory).publish((request.graph_keys.defined()?request.graph_keys.dense():DenseTensor{}),(request.graph_values.defined()?request.graph_values.dense():DenseTensor{}),positions);
             }
             request.keys.advance_fixed(count);request.values.advance_fixed(count);request.index.append(*index);request.graph_prepared=false;
         } else {request.keys.append(*keys);request.values.append(*values);request.index.append(*index);}
@@ -1445,7 +1448,7 @@ class Qsa {
         request.values.reset();
         request.index.reset();
         request.graph_prepared=false;
-        if(managed_memory(request)){request.memory->hot.reset();activate_memory(request);return;}
+        if(managed_memory(request)){kv_hot(*request.memory).reset();activate_memory(request);return;}
         request.graph_keys={};request.graph_values={};request.graph_pooled={};request.graph_index={};
     }
     void prepare_graph(State& request,const DenseTensor& full_positions, int64_t capacity) {
@@ -1510,7 +1513,7 @@ class Qsa {
         auto graph_pooled = (request.graph_pooled.defined()?request.graph_pooled.dense():DenseTensor{});
         const auto t=hidden.size(1),pools=request.graph_pooled.size(1);
         const bool dense_capacity=(streamed?c_.maximum:request.graph_keys.size(2))<=c_.budget;
-        const bool exclusive=managed_memory(request) && request.memory->hot.exclusive();
+        const bool exclusive=managed_memory(request) && kv_hot(*request.memory).exclusive();
         auto p=history_only?project_history(hidden,positions):
             project(hidden,positions,!dense_capacity,cache_positions,
                        quantization_.enabled() || exclusive || streamed?DenseTensor{}:graph_keys,quantization_.enabled() || exclusive || streamed?DenseTensor{}:graph_values,
@@ -1527,14 +1530,14 @@ class Qsa {
         if(exclusive) {
             const auto keys=(quantization_.enabled()?encode_key(p.key):p.key).permute({0,2,1,3});
             const auto values=(quantization_.enabled()?encode_value(p.value):p.value).permute({0,2,1,3});
-            index_written=request.memory->hot.append_decode(keys,values,cache_positions,p.raw,request.index.storage().dense(),begin_prepare);
-            if(!index_written)request.memory->hot.append(keys.to(cache_dtype()),values.to(cache_dtype()),cache_positions);
+            index_written=kv_hot(*request.memory).append_decode(keys,values,cache_positions,p.raw,request.index.storage().dense(),begin_prepare);
+            if(!index_written)kv_hot(*request.memory).append(keys.to(cache_dtype()),values.to(cache_dtype()),cache_positions);
         }
         else if (!p.cache_written && !streamed) {
             graph_keys.index_copy_(2,cache_positions,encode_key(p.key).permute({0,2,1,3}));
             graph_values.index_copy_(2,cache_positions,encode_value(p.value).permute({0,2,1,3}));
         }
-        if(managed_memory(request) && !exclusive && !streamed)request.memory->hot.publish(graph_keys,graph_values,cache_positions);
+        if(managed_memory(request) && !exclusive && !streamed)kv_hot(*request.memory).publish(graph_keys,graph_values,cache_positions);
         if(!index_written)request.index.append_fixed(p.raw,cache_positions);
         mark("qsa_cache_end");
         if(history_only && streamed) {
@@ -1773,14 +1776,14 @@ class Qsa {
                 if(managed_memory(request)) {
                     TYLOINFER_RUNTIME_CHECK(b==1,"preallocated QSA expects one sequence per cache");
                     request.memory->ensure(offset+t);
-                    if(request.memory->hot.exclusive())request.memory->hot.append(encode_key(p.key).permute({0,2,1,3}),
+                    if(kv_hot(*request.memory).exclusive())kv_hot(*request.memory).append(encode_key(p.key).permute({0,2,1,3}),
                         encode_value(p.value).permute({0,2,1,3}),::tyloi::cuda::arange(offset,offset+t,hidden.options().dtype(::tyloi::kInt64)));
                     else {
                         graph_keys.narrow(2,offset,t).copy_(encode_key(p.key).permute({0,2,1,3}));
                         graph_values.narrow(2,offset,t).copy_(encode_value(p.value).permute({0,2,1,3}));
                     }
-                    if(request.memory->hot.defined()) {
-                        if(!request.memory->hot.exclusive())request.memory->hot.publish(graph_keys,graph_values,::tyloi::cuda::arange(offset,offset+t,hidden.options().dtype(::tyloi::kInt64)));
+                    if(kv_hot(*request.memory).defined()) {
+                        if(!kv_hot(*request.memory).exclusive())kv_hot(*request.memory).publish(graph_keys,graph_values,::tyloi::cuda::arange(offset,offset+t,hidden.options().dtype(::tyloi::kInt64)));
                         p.key=graph_keys.permute({0,2,1,3});p.value=graph_values.permute({0,2,1,3});
                     }else {
                         p.key=graph_keys.narrow(2,0,offset+t).permute({0,2,1,3});
@@ -1862,16 +1865,16 @@ class Qsa {
 
   private:
     HotKvView prepare_hot(State& request,const DenseTensor& selected,const DenseTensor& positions={},int64_t columns=0,bool epoch_ready=false) const {
-        if(!managed_memory(request) || !request.memory->hot.defined())return {};
+        if(!managed_memory(request) || !kv_hot(*request.memory).defined())return {};
         auto graph_keys = (request.graph_keys.defined()?request.graph_keys.dense():DenseTensor{});
         auto graph_values = (request.graph_values.defined()?request.graph_values.dense():DenseTensor{});
-        request.memory->hot.prepare(graph_keys,graph_values,selected,positions,columns,true,epoch_ready);
-        return request.memory->hot.view();
+        kv_hot(*request.memory).prepare(graph_keys,graph_values,selected,positions,columns,true,epoch_ready);
+        return kv_hot(*request.memory).view();
     }
     DenseTensor attend(State& request,const DenseTensor& query, DenseTensor keys, DenseTensor values, const DenseTensor& selected, int64_t offset) const {
-        if(managed_memory(request) && request.memory->hot.defined()) {
+        if(managed_memory(request) && kv_hot(*request.memory).defined()) {
             const auto positions=::tyloi::cuda::arange(offset,offset+query.size(2),query.options().dtype(::tyloi::kInt64));
-            const auto hot=offset+query.size(2)<=request.memory->hot.keys.size(2)?request.memory->hot.view():prepare_hot(request,selected,positions,offset+query.size(2));
+            const auto hot=offset+query.size(2)<=kv_hot(*request.memory).keys.size(2)?kv_hot(*request.memory).view():prepare_hot(request,selected,positions,offset+query.size(2));
             if(quantization_.enabled())return cuda_kv_attention(query,keys,values,quantization_,selected,positions,offset,{},0,{},{},0,hot);
             if(selected.defined())return mfq_qwen4_exp::sparse_gqa_attention(query,keys,values,selected,hot);
             return mfq_qwen4_exp::dense_gqa_attention(query,keys,values,offset,hot);

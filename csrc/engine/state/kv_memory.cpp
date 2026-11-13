@@ -1,5 +1,8 @@
 #include "env.h"
 #include "engine/state/kv_memory.h"
+#include "engine/backends/cuda/native/tensor/backend.h"
+#include "engine/backends/cuda/kernels/mfq_cuda_kv_hot_cache.h"
+#include "engine/weights/workspace.h"
 #include "engine/budget.h"
 #include "engine/generation/prefill_budget.h"
 #include "engine/backends/cuda/native/vmm.h"
@@ -96,37 +99,63 @@ std::set<int64_t> virtual_pages(int64_t maximum, int64_t heads, int64_t width,
 }
 }
 
-struct KvMemoryAllocation::Virtual {
-    vmm::VmmRange range;
-    int64_t maximum, heads, width, committed = 0;
-    std::size_t element;
-    Virtual(int64_t maximum, int64_t heads, int64_t width, std::size_t element)
-        : maximum(maximum), heads(heads), width(width), element(element) {
-        if (!range.reserve(std::size_t(maximum)*heads*width*element))
-            throw std::runtime_error("kv_dynamic_unavailable: CUDA virtual memory reservation failed");
-    }
-    ~Virtual() { (void)cudaDeviceSynchronize(); }
-    std::set<int64_t> missing(int64_t tokens) const {
-        tokens=std::min(maximum,((tokens+8191)/8192)*8192);
-        if (tokens <= committed) return {};
-        auto result=virtual_pages(maximum,heads,width,element,tokens);
-        for(auto it=result.begin();it!=result.end();)
-            if(range.mapped(*it))it=result.erase(it);else ++it;
-        return result;
-    }
-    void ensure(int64_t tokens) {
-        tokens=std::min(maximum,((tokens+8191)/8192)*8192);
-        const auto fresh = missing(tokens);
-        if (!fresh.empty()) TYLOINFER_NATIVE_CUDA_CHECK(cudaStreamSynchronize(current_stream().stream()));
-        for (const auto page : fresh) {
-            if (!range.map_range(page,page+1,[]{return vmm::VmmChunk(0);}))
-                throw std::runtime_error(insufficient);
-            TYLOINFER_NATIVE_CUDA_CHECK(cudaMemsetAsync(range.base()+page*vmm::vmm_granularity(),0,
-                vmm::vmm_granularity(),current_stream().stream()));
+struct KvMemoryAllocation::Native {
+    struct Virtual {
+        vmm::VmmRange range;
+        int64_t maximum, heads, width, committed = 0;
+        std::size_t element;
+        Virtual(int64_t maximum, int64_t heads, int64_t width, std::size_t element)
+            : maximum(maximum), heads(heads), width(width), element(element) {
+            if (!range.reserve(std::size_t(maximum)*heads*width*element))
+                throw std::runtime_error("kv_dynamic_unavailable: CUDA virtual memory reservation failed");
         }
-        committed = std::max(committed,tokens);
-    }
+        ~Virtual() { (void)cudaDeviceSynchronize(); }
+        std::set<int64_t> missing(int64_t tokens) const {
+            tokens=std::min(maximum,((tokens+8191)/8192)*8192);
+            if (tokens <= committed) return {};
+            auto result=virtual_pages(maximum,heads,width,element,tokens);
+            for(auto it=result.begin();it!=result.end();)
+                if(range.mapped(*it))it=result.erase(it);else ++it;
+            return result;
+        }
+        void ensure(int64_t tokens) {
+            tokens=std::min(maximum,((tokens+8191)/8192)*8192);
+            const auto fresh = missing(tokens);
+            if (!fresh.empty()) TYLOINFER_NATIVE_CUDA_CHECK(cudaStreamSynchronize(current_stream().stream()));
+            for (const auto page : fresh) {
+                if (!range.map_range(page,page+1,[]{return vmm::VmmChunk(0);}))
+                    throw std::runtime_error(insufficient);
+                TYLOINFER_NATIVE_CUDA_CHECK(cudaMemsetAsync(range.base()+page*vmm::vmm_granularity(),0,
+                    vmm::vmm_granularity(),current_stream().stream()));
+            }
+            committed = std::max(committed,tokens);
+        }
+    };
+
+    std::shared_ptr<Virtual> virtual_keys, virtual_values;
+    HotKvCache hot;
+    std::vector<tyloi::weights::KvRegion> expert_regions;
 };
+
+KvMemoryAllocation::Native& KvMemoryAllocation::native() {
+    if (!native_) native_ = std::make_shared<Native>();
+    return *native_;
+}
+
+HotKvCache& kv_hot(KvMemoryAllocation& allocation) { return allocation.native().hot; }
+
+std::vector<Tensor> KvMemoryAllocation::storage() const {
+    std::vector<Tensor> result;
+    const auto add = [&](const Tensor& value) { if (value.defined()) result.push_back(value); };
+    add(keys); add(values); add(index); add(pooled);
+    if (native_) {
+        const auto& hot = native_->hot;
+        add(hot.keys); add(hot.values); add(hot.mapping); add(hot.slot_ids); add(hot.requested);
+        add(hot.epochs); add(hot.queue); add(hot.control); add(hot.cold_keys); add(hot.cold_values);
+        add(hot.cold_mapping); add(hot.free_cold); add(hot.free_gpu); add(hot.cold_control);
+    }
+    return result;
+}
 
 namespace {
 std::size_t initial_virtual_bytes(const KvMemoryAllocation& a) {
@@ -165,22 +194,23 @@ std::size_t KvMemoryAllocation::raw_bytes() const {return std::size_t(maximum)*h
 std::size_t KvMemoryAllocation::index_bytes() const {return std::size_t(maximum+(maximum+pool-1)/pool)*index_width*2;}
 std::size_t KvMemoryAllocation::gpu_bytes() const {
     if (!ready) return 0;
-    if (virtual_keys) return index_bytes() + std::size_t(virtual_keys->range.mapped_count()+virtual_values->range.mapped_count())*vmm::vmm_granularity();
-    return index_bytes() + hot.bytes() + (host || offload ? 0 : raw_bytes());
+    if (native_ && native_->virtual_keys) return index_bytes() + std::size_t(native_->virtual_keys->range.mapped_count()+native_->virtual_values->range.mapped_count())*vmm::vmm_granularity();
+    return index_bytes() + (native_ ? native_->hot.bytes() : 0) + (host || offload ? 0 : raw_bytes());
 }
 std::size_t KvMemoryAllocation::ram_bytes() const {
     if(!ready)return 0;
-    if(hot.exclusive())return std::size_t(hot.cold_keys.numel()+hot.cold_values.numel())*width_bytes(options);
+    if(native_ && native_->hot.exclusive())return std::size_t(native_->hot.cold_keys.numel()+native_->hot.cold_values.numel())*width_bytes(options);
     return host?raw_bytes():0;
 }
 std::size_t KvMemoryAllocation::growth_bytes(int64_t tokens) const {
     tokens=std::min(maximum,tokens);
-    return virtual_keys ? (virtual_keys->missing(tokens).size()+virtual_values->missing(tokens).size())*vmm::vmm_granularity() : 0;
+    return native_ && native_->virtual_keys ? (native_->virtual_keys->missing(tokens).size()+native_->virtual_values->missing(tokens).size())*vmm::vmm_granularity() : 0;
 }
 void KvMemoryAllocation::ensure(int64_t tokens) {
     if (tokens<0 || tokens>maximum) throw std::invalid_argument("KV growth exceeds configured context");
-    if(!expert_regions.empty())expert_regions.front().advance(tokens+pool-1);
-    if (virtual_keys) {virtual_keys->ensure(tokens); virtual_values->ensure(tokens);}
+    if (!native_) return;
+    if(!native_->expert_regions.empty())native_->expert_regions.front().advance(tokens+pool-1);
+    if (native_->virtual_keys) {native_->virtual_keys->ensure(tokens); native_->virtual_values->ensure(tokens);}
 }
 KvMemoryManager::KvMemoryManager(KvMemoryOptions options):options_(std::move(options)) {}
 std::shared_ptr<KvMemoryAllocation> KvMemoryManager::add(int64_t maximum,int64_t heads,int64_t kw,int64_t vw,
@@ -189,8 +219,8 @@ std::shared_ptr<KvMemoryAllocation> KvMemoryManager::add(int64_t maximum,int64_t
         auto policy=options_;policy.additional_request=true;
         if(policy.budget_policy && policy.gpu_budget)for(const auto& weak:allocations_)if(auto existing=weak.lock()) {
             if(existing->maximum!=maximum || existing->heads!=heads || existing->key_width!=kw || existing->value_width!=vw)continue;
-            policy.gpu_budget=existing->index_bytes()+(existing->hot.exclusive()?
-                std::size_t(existing->hot.keys.numel()+existing->hot.values.numel())*width_bytes(existing->options):
+            policy.gpu_budget=existing->index_bytes()+(existing->native_ && existing->native_->hot.exclusive()?
+                std::size_t(existing->native_->hot.keys.numel()+existing->native_->hot.values.numel())*width_bytes(existing->options):
                 existing->host || existing->offload?0:existing->raw_bytes());
             break;
         }
@@ -413,36 +443,36 @@ void KvMemoryManager::finalize(tyloi::weights::Cache& cache, std::size_t minimum
         a->pooled=::tyloi::cuda::zeros({1,(a->maximum+a->pool-1)/a->pool,a->index_width},index_options);
         a->host=options_.placement=="ram" || automatic_ram_ || exclusive || raw_host_only;a->offload=offload_;
         if(options_.dynamic) {
-            a->virtual_keys=std::make_shared<KvMemoryAllocation::Virtual>(a->maximum,a->heads,a->key_width,width_bytes(a->options));
-            a->virtual_values=std::make_shared<KvMemoryAllocation::Virtual>(a->maximum,a->heads,a->value_width,width_bytes(a->options));
-            a->keys=external(a->virtual_keys->range.base(),a->virtual_keys,shape(a->key_width),a->options);
-            a->values=external(a->virtual_values->range.base(),a->virtual_values,shape(a->value_width),a->options);
+            a->native().virtual_keys=std::make_shared<KvMemoryAllocation::Native::Virtual>(a->maximum,a->heads,a->key_width,width_bytes(a->options));
+            a->native().virtual_values=std::make_shared<KvMemoryAllocation::Native::Virtual>(a->maximum,a->heads,a->value_width,width_bytes(a->options));
+            a->keys=external(a->native().virtual_keys->range.base(),a->native().virtual_keys,shape(a->key_width),a->options);
+            a->values=external(a->native().virtual_values->range.base(),a->native().virtual_values,shape(a->value_width),a->options);
             a->ensure(std::min<int64_t>(a->maximum,16384));
         } else if(exclusive) {
             auto cold_shape=[&](int64_t width){return std::vector<int64_t>{1,a->heads,a->maximum-cells,width};};
-            a->hot=HotKvCache::allocate(a->heads,a->maximum,cells,a->key_width,a->value_width,a->options);
+            a->native().hot=HotKvCache::allocate(a->heads,a->maximum,cells,a->key_width,a->value_width,a->options);
             auto cold_keys=host_tensor(cold_shape(a->key_width),a->options),cold_values=host_tensor(cold_shape(a->value_width),a->options);
-            a->hot.set_cold_storage(cold_keys,cold_values);
+            a->native().hot.set_cold_storage(cold_keys,cold_values);
             // Logical geometry only: tier-aware kernels resolve every row via
             // the maps. The owner retains the smaller physical RAM tensors.
             a->keys=external(cold_keys.data_ptr(),std::make_shared<::tyloi::DenseTensor>(cold_keys),shape(a->key_width),a->options);
             a->values=external(cold_values.data_ptr(),std::make_shared<::tyloi::DenseTensor>(cold_values),shape(a->value_width),a->options);
         } else if(a->host) {
             a->keys=host_tensor(shape(a->key_width),a->options);a->values=host_tensor(shape(a->value_width),a->options);
-            if(automatic_ram_)a->hot=HotKvCache::allocate(a->heads,a->maximum,cells,a->key_width,a->value_width,a->options);
+            if(automatic_ram_)a->native().hot=HotKvCache::allocate(a->heads,a->maximum,cells,a->key_width,a->value_width,a->options);
         } else if(!offload_) {
             a->keys=::tyloi::cuda::zeros(shape(a->key_width),a->options);a->values=::tyloi::cuda::zeros(shape(a->value_width),a->options);
         }
         a->ready=true;
         if(lending_) {
-            a->expert_regions.push_back(cache_->lend_kv(a->index,a->maximum,std::size_t(a->index_width)*2,false));
-            a->expert_regions.push_back(cache_->lend_kv(a->pooled,(a->maximum+a->pool-1)/a->pool,std::size_t(a->index_width)*2,false,a->pool));
-            if(a->hot.exclusive() || (!a->host && !a->offload)) {
-                const auto& k=a->hot.exclusive()?a->hot.keys:a->keys.dense();
-                const auto& v=a->hot.exclusive()?a->hot.values:a->values.dense();
+            a->native().expert_regions.push_back(cache_->lend_kv(a->index,a->maximum,std::size_t(a->index_width)*2,false));
+            a->native().expert_regions.push_back(cache_->lend_kv(a->pooled,(a->maximum+a->pool-1)/a->pool,std::size_t(a->index_width)*2,false,a->pool));
+            if(a->native().hot.exclusive() || (!a->host && !a->offload)) {
+                const auto& k=a->native().hot.exclusive()?a->native().hot.keys:a->keys.dense();
+                const auto& v=a->native().hot.exclusive()?a->native().hot.values:a->values.dense();
                 for(int64_t h=0;h<a->heads;++h) {
-                    a->expert_regions.push_back(cache_->lend_kv(k.narrow(1,h,1),k.size(2),std::size_t(a->key_width)*width_bytes(a->options),a->hot.exclusive()));
-                    a->expert_regions.push_back(cache_->lend_kv(v.narrow(1,h,1),v.size(2),std::size_t(a->value_width)*width_bytes(a->options),a->hot.exclusive()));
+                    a->native().expert_regions.push_back(cache_->lend_kv(k.narrow(1,h,1),k.size(2),std::size_t(a->key_width)*width_bytes(a->options),a->native().hot.exclusive()));
+                    a->native().expert_regions.push_back(cache_->lend_kv(v.narrow(1,h,1),v.size(2),std::size_t(a->value_width)*width_bytes(a->options),a->native().hot.exclusive()));
                 }
             }
         }
@@ -495,8 +525,8 @@ std::vector<std::pair<std::string,double>> KvMemoryManager::metrics() const {
     const auto loan=lending_?cache_->kv_metrics():tyloi::weights::Cache::KvMetrics{};
     for(auto& weak:allocations_)if(auto a=weak.lock()){
         gpu+=a->gpu_bytes();ram+=a->ram_bytes();capacity+=a->raw_bytes()+a->index_bytes();
-        if(a->virtual_keys)vmm+=a->gpu_bytes()-a->index_bytes();
-        if(a->hot.defined())resident_cells=resident_cells?std::min(resident_cells,a->hot.keys.size(2)):a->hot.keys.size(2);
+        if(a->native_ && a->native_->virtual_keys)vmm+=a->gpu_bytes()-a->index_bytes();
+        if(a->native_ && a->native_->hot.defined())resident_cells=resident_cells?std::min(resident_cells,a->native_->hot.keys.size(2)):a->native_->hot.keys.size(2);
     }
     return {{"kv_memory_supported",capacity?1.0:0.0},{"kv_memory_dynamic",options_.dynamic?1.0:0.0},
         {"kv_memory_preallocated",options_.dynamic?0.0:1.0},{"kv_memory_capacity_bytes",double(capacity)},

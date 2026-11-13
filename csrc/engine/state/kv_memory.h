@@ -1,9 +1,7 @@
 #pragma once
 
-#include "engine/backends/cuda/native/tensor/backend.h"
+#include "engine/tensor.h"
 #include "engine/state/kv_offload.h"
-#include "engine/backends/cuda/kernels/mfq_cuda_kv_hot_cache.h"
-#include "engine/weights/workspace.h"
 #include <memory>
 #include <string>
 #include <vector>
@@ -11,6 +9,7 @@
 namespace tyloi::engine { class Budget; }
 namespace tyloi::weights { class Cache; }
 namespace tyloi::cuda {
+struct HotKvCache;
 // Placement applies to raw K/V. Indexer and kernel scratch remain GPU-local.
 struct KvMemoryOptions {
     std::string placement = "auto";
@@ -26,23 +25,30 @@ struct KvMemoryOptions {
 KvMemoryOptions kv_memory_options();
 
 struct KvMemoryAllocation {
-    struct Virtual;
+    KvMemoryAllocation() = default;
+    KvMemoryAllocation(const KvMemoryAllocation&) = delete;
+    KvMemoryAllocation& operator=(const KvMemoryAllocation&) = delete;
+    KvMemoryAllocation(KvMemoryAllocation&&) noexcept = default;
+    KvMemoryAllocation& operator=(KvMemoryAllocation&&) noexcept = default;
     ::tyloi::Tensor keys, values, index, pooled;
     std::shared_ptr<KvOffloadStore> offload;
-    std::shared_ptr<Virtual> virtual_keys, virtual_values;
     int64_t maximum = 0, heads = 0, key_width = 0, value_width = 0, index_width = 0, pool = 0, selected_columns = 0;
     ::tyloi::TensorOptions options;
     bool host = false, ready = false;
-    HotKvCache hot;
-    std::vector<tyloi::weights::KvRegion> expert_regions;
+    std::vector<::tyloi::Tensor> storage() const;
     std::size_t raw_bytes() const;
     std::size_t index_bytes() const;
     std::size_t gpu_bytes() const;
     std::size_t ram_bytes() const;
     std::size_t growth_bytes(int64_t tokens) const;
     void ensure(int64_t tokens);
+private:
+    struct Native;
+    Native& native();
+    std::shared_ptr<Native> native_;
+    friend class KvMemoryManager;
+    friend HotKvCache& kv_hot(KvMemoryAllocation&);
 };
-
 class KvMemoryManager {
 public:
     explicit KvMemoryManager(KvMemoryOptions options = kv_memory_options());
