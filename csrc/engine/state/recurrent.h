@@ -17,6 +17,11 @@ public:
         }
     };
 
+    struct Checkpoint {
+        const State& state;
+        std::int64_t start, confirmed, tokens;
+    };
+
     Recurrent() = default;
     Recurrent(Recurrent&&) noexcept = default;
     Recurrent& operator=(Recurrent&&) noexcept = default;
@@ -29,9 +34,14 @@ public:
     bool pending() const noexcept { return start_ >= 0; }
 
     void reset(int64_t batch);
+    static State clone(const State& source);
     State snapshot() const;
     void restore(const State& snapshot);
     void begin(int64_t start, int64_t confirmed, int64_t tokens);
+    // Prepared values must remain unchanged while the live state advances.
+    void begin(int64_t start, int64_t confirmed, int64_t tokens, State checkpoint);
+    // The state reference remains valid until commit, restore, reset or a new begin.
+    Checkpoint checkpoint() const;
     // Keep the checkpoint until replay succeeds, so abort can undo a failed replay.
     int64_t rewind(int64_t position);
     void abort();

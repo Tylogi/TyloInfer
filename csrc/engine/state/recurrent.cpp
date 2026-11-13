@@ -36,10 +36,15 @@ void Recurrent::reset(int64_t batch) {
     }
 }
 
+Recurrent::State Recurrent::clone(const State& source) {
+    if (!source.defined()) throw std::runtime_error("recurrent snapshot is unavailable");
+    return {::tyloi::ops::clone(source.convolution), ::tyloi::ops::clone(source.recurrent), source.transposed};
+}
+
 Recurrent::State Recurrent::snapshot() const {
     if (!(defined() && !pending()))
         throw std::runtime_error("recurrent snapshot requires confirmed state");
-    return {::tyloi::ops::clone(state_.convolution), ::tyloi::ops::clone(state_.recurrent), state_.transposed};
+    return clone(state_);
 }
 
 void Recurrent::copy(const State& source) {
@@ -65,6 +70,34 @@ void Recurrent::begin(int64_t start, int64_t confirmed, int64_t tokens) {
     start_ = start;
     confirmed_ = confirmed;
     tokens_ = tokens;
+}
+
+void Recurrent::begin(int64_t start, int64_t confirmed, int64_t tokens, State checkpoint) {
+    if (!(start >= 0 && confirmed > 0 && confirmed < tokens))
+        throw std::runtime_error("invalid recurrent verification window");
+    if (!(defined() && !pending()))
+        throw std::runtime_error("recurrent snapshot requires confirmed state");
+    const auto matches = [](const Tensor& live, const Tensor& saved) {
+        if (!live.defined() || !saved.defined() || live.is_encoded() || saved.is_encoded() ||
+            live.dim() != saved.dim() || live.scalar_type() != saved.scalar_type() || live.device() != saved.device())
+            return false;
+        for (int64_t axis = 0; axis < live.dim(); ++axis)
+            if (live.size(axis) != saved.size(axis)) return false;
+        return true;
+    };
+    if (state_.transposed != checkpoint.transposed ||
+        !matches(state_.convolution, checkpoint.convolution) ||
+        !matches(state_.recurrent, checkpoint.recurrent))
+        throw std::invalid_argument("recurrent checkpoint topology mismatch");
+    saved_ = std::move(checkpoint);
+    start_ = start;
+    confirmed_ = confirmed;
+    tokens_ = tokens;
+}
+
+Recurrent::Checkpoint Recurrent::checkpoint() const {
+    if (!pending()) throw std::runtime_error("recurrent checkpoint is unavailable");
+    return {saved_, start_, confirmed_, tokens_};
 }
 
 int64_t Recurrent::rewind(int64_t position) {

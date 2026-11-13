@@ -2,6 +2,7 @@
 
 #include "mlx_linear_attention.h"
 #include "engine/state/recurrent.h"
+#include "engine/models/common/linear.h"
 #include "mlx_qwen35_full_attention.h"
 #include "qwen35_model.h"
 
@@ -22,9 +23,6 @@ struct MlxQwen35LinearAttentionCacheSnapshot {
         return convolution_state.nbytes() + recurrent_state.nbytes();
     }
 };
-
-using MlxQwen35LinearAttentionRollback =
-    MlxGatedDeltaSpeculativeState;
 
 // Qwen3.5/3.6 Gated DeltaNet decoder block.
 //
@@ -161,8 +159,7 @@ private:
     int zero_cache_batch_ = 0;
     int cache_position_ = 0;
     int cache_batch_ = 0;
-    std::optional<MlxQwen35LinearAttentionRollback>
-        speculative_rollback_;
+    tyloi::models::LinearInputs projected_;
 };
 
 } // namespace mfq::metal
