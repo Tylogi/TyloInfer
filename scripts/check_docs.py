@@ -1,4 +1,4 @@
-"""Read-only documentation checks; run: python3 -B docs/check_consistency.py.
+"""Read-only documentation checks; run: python3 -B scripts/check_docs.py.
 
 Uses the standard library and CLI parser only; no model, server or build runs.
 Checks documentation structure/contracts, not inference or benchmark validity.

@@ -31,7 +31,7 @@ valid; there is no public `mfq` command registered by this package.
 
 ## Documentation checks
 
-From the repository root, run `python3 -B docs/check_consistency.py`. This
+From the repository root, run `python3 -B scripts/check_docs.py`. This
 read-only standard-library check covers public command names, local Markdown
 links/anchors, JSON/JSONL examples, the HTTP API table against checked-in
 OpenAPI, and selected CLI defaults/options. It does not build the native
