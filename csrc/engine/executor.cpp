@@ -1,5 +1,13 @@
 #include "engine/executor.h"
 
+namespace tyloi {
+void Executor::submit(std::span<const Tensor> outputs) {
+    for (const auto& output : outputs)
+        if (output.defined() && output.device().is_metal())
+            throw std::invalid_argument("executor cannot submit lazy Metal tensors");
+}
+} // namespace tyloi
+
 namespace tyloi::profiling {
 
 thread_local Components* ProfileScope::active_ = nullptr;

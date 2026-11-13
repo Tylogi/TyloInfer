@@ -17,6 +17,7 @@ public:
     std::unique_ptr<tyloi::Executor::Timer> timer() override;
     std::unique_ptr<tyloi::Executor::Profile> profile(const char* name) override;
     std::unique_ptr<tyloi::Executor::Graph> graph() override;
+    void submit(std::span<const Tensor> outputs) override;
     std::vector<tyloi::Executor::Memory> memory(std::span<const Device> devices) const override;
     void reclaim(Device device) override;
     void set_memory_limit(Device device, std::size_t bytes) override;

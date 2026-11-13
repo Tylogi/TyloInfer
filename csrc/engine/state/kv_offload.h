@@ -8,6 +8,7 @@
 #include <vector>
 #include <utility>
 
+namespace tyloi { class Executor; }
 namespace tyloi::engine { class Budget; }
 namespace tyloi::weights { class Cache; }
 namespace tyloi::cuda {
@@ -41,7 +42,8 @@ public:
     static GatherLayout gather_layout(int64_t rows,int64_t width,::tyloi::ScalarType dtype,int64_t heads=1,int64_t key_width=0);
     std::shared_ptr<GatherWorkspace> gather_workspace(int64_t rows,int64_t width,::tyloi::ScalarType dtype,int64_t heads=1,int64_t key_width=0);
     std::size_t graph_workspace_bytes() const;
-    explicit KvOffloadStore(KvOffloadConfig config);
+    // Metal borrows this executor; it outlives the store and is active during device operations.
+    explicit KvOffloadStore(KvOffloadConfig config, ::tyloi::Executor* executor = nullptr);
     ~KvOffloadStore();
     BlockPtr write(const ::tyloi::Tensor& rows);
     ::tyloi::Tensor read(const BlockPtr& block);

@@ -35,7 +35,6 @@ function(mfq_configure_cuda_engine_target target)
 endfunction()
 
 set(TYLOINFER_CUDA_LOADING_SOURCES
-    ${PROJECT_SOURCE_DIR}/engine/state/kv_offload.cpp
     ${PROJECT_SOURCE_DIR}/engine/state/kv_memory.cpp
     ${PROJECT_SOURCE_DIR}/engine/weights/tq/load.cpp
     ${PROJECT_SOURCE_DIR}/engine/weights/tq/image.cpp

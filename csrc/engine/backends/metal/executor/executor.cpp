@@ -3,6 +3,7 @@
 #include "engine/backends/metal/native/memory.h"
 #include "engine/backends/metal/native/profile.h"
 #include "engine/backends/metal/native/stream.h"
+#include "engine/backends/metal/native/tensor/tensor.h"
 
 #include <algorithm>
 #include <limits>
@@ -63,6 +64,25 @@ std::unique_ptr<tyloi::Executor::Profile> Executor::profile(const char* name) {
 
 std::unique_ptr<tyloi::Executor::Graph> Executor::graph() {
     return {};
+}
+
+void Executor::submit(std::span<const Tensor> outputs) {
+    require_current();
+    std::vector<mlx::core::array> values;
+    values.reserve(outputs.size());
+    for (const auto& output : outputs) {
+        if (!output.defined()) continue;
+        if (output.is_encoded()) throw std::invalid_argument("cannot submit encoded tensor");
+        if (output.device() == Device{DeviceType::cpu, 0}) {
+            if (!output.representation<DenseTensor>())
+                throw std::invalid_argument("unsupported CPU tensor representation");
+            continue;
+        }
+        if (output.device() != Device{DeviceType::metal, 0})
+            throw std::invalid_argument("Metal submission requires CPU:0 or Metal:0 tensors");
+        values.push_back(metal::array(output));
+    }
+    if (!values.empty()) metal::submit(std::move(values));
 }
 
 std::vector<tyloi::Executor::Memory> Executor::memory(std::span<const Device> devices) const {

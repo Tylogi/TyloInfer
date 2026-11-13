@@ -77,6 +77,8 @@ public:
     virtual std::unique_ptr<Timer> timer() = 0;
     virtual std::unique_ptr<Profile> profile(const char* name) = 0;
     virtual std::unique_ptr<Graph> graph() = 0;
+    // Call within this executor's scope. Submit without waiting; results remain alive until completion.
+    virtual void submit(std::span<const Tensor> outputs);
     // Query within this executor's scope; one snapshot per requested device, in the same order.
     virtual std::vector<Memory> memory(std::span<const Device> devices) const = 0;
     // Call within this executor's scope; stop submissions before changing a limit.
