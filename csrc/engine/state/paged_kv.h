@@ -7,16 +7,17 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <utility>
 #include <vector>
 
-namespace tyloi::cuda {
+namespace tyloi::state {
 
 class PagedKv {
     struct Identity {};
 
 public:
     struct Layout {
-        int device = 0;
+        tyloi::Device device{tyloi::DeviceType::cuda, 0};
         int64_t heads = 0;
         int64_t head_dim = 0;
         tyloi::state::KvQuantization quantization;
@@ -48,7 +49,9 @@ public:
     bool ensure_tokens(Sequence& sequence, int64_t tokens);
     void release(Sequence& sequence);
     void update(const std::vector<const Sequence*>& sequences);
-    // Views borrow chunk backing and must retire before this store.
+    // Metal physical pages have shape [1,H,physical_pages*page_size,width].
+    // Reacquire after growth or update; old views retain old backing and do not follow replacements.
+    // Consumers must retire before pages are released/reused or this store is destroyed.
     tyloi::state::KvView view(size_t layer, int64_t batch) const;
     Stats stats() const noexcept;
 
@@ -60,11 +63,13 @@ private:
         Layout layout;
         int64_t key_width = 0, value_width = 0;
         ::tyloi::ScalarType dtype = ::tyloi::kFloat16;
-        ::tyloi::DenseTensor k_chunk_ptrs, v_chunk_ptrs;
-        std::vector<::tyloi::DenseTensor> k_chunks, v_chunks;
+        ::tyloi::Tensor k_chunk_ptrs, v_chunk_ptrs;
+        std::vector<::tyloi::Tensor> k_chunks, v_chunks;
+        KvView storage;
     };
     struct Chunk {
-        ::tyloi::DenseTensor k, v;
+        ::tyloi::Tensor k, v;
+        KvView storage;
     };
 
     static size_t checked_maximum_pages(int32_t sequences, int64_t pages_per_sequence);
@@ -80,7 +85,7 @@ private:
     std::vector<std::uint64_t> page_generations_;
     std::uint64_t generation_ = 1;
     std::vector<std::int32_t> host_page_table_;
-    std::map<int, ::tyloi::DenseTensor> device_page_tables_;
+    std::map<std::pair<DeviceType, std::int32_t>, ::tyloi::Tensor> device_page_tables_;
     std::vector<Pool> layers_;
     size_t storage_pages_ = 0;
     size_t reserved_bytes_ = 0;
@@ -90,4 +95,4 @@ private:
     std::atomic<size_t> release_count_metric_{0}, page_table_updates_metric_{0};
 };
 
-} // namespace tyloi::cuda
+} // namespace tyloi::state

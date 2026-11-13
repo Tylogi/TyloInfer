@@ -67,6 +67,25 @@ void require_cuda(const Tensor& value_tensor) {
 }
 #endif
 
+Tensor copy(const Tensor& value_tensor, Device target) {
+#ifdef TYLOINFER_NATIVE_MLX_RUNTIME
+    if (target.is_metal() || (value_tensor.defined() && value_tensor.device().is_metal()))
+        return metal::ops::copy(value_tensor, target);
+#endif
+#ifdef TYLOINFER_NATIVE_CUDA
+    const auto& value = ::tyloi::ops::dense(value_tensor);
+    input(value);
+    device(target);
+    return owner(cuda::ops::copy(value, target));
+#else
+    if (!value_tensor.defined() || value_tensor.is_encoded() ||
+        !value_tensor.representation<DenseTensor>() ||
+        value_tensor.device() != Device{DeviceType::cpu, 0} || target != Device{DeviceType::cpu, 0})
+        throw std::invalid_argument("copy requires a dense CPU:0 tensor and CPU:0 target");
+    return value_tensor;
+#endif
+}
+
 void copy_into(Tensor destination_tensor, const Tensor& source_tensor) {
 #ifdef TYLOINFER_NATIVE_MLX_RUNTIME
     if ((destination_tensor.defined() && destination_tensor.device().is_metal()) ||

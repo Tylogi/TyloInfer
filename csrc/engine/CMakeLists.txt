@@ -59,6 +59,7 @@ add_library(mfq-engine STATIC
     state/recurrent_layout.cpp
     state/kv_view.cpp
     state/kv_layout.cpp
+    state/paged_kv.cpp
 )
 if(TYLOINFER_BUILD_CUDA_ENGINE)
     target_compile_definitions(mfq-engine PUBLIC TYLOINFER_NATIVE_CUDA=1)
@@ -68,7 +69,7 @@ if(TYLOINFER_BUILD_CUDA_ENGINE)
         ${PROJECT_SOURCE_DIR}/engine/backends/cuda/native/tensor
         ${PROJECT_SOURCE_DIR}/engine/backends/cuda/kernels)
     target_link_libraries(mfq-engine PRIVATE
-        CUDA::cudart CUDA::cublas mfq-ggml-internal-headers)
+        CUDA::cudart CUDA::cublas mfq-cuda-core mfq-ggml-internal-headers)
 endif()
 if(TYLOINFER_BUILD_METAL_RUNTIME)
     target_compile_definitions(mfq-engine PUBLIC TYLOINFER_NATIVE_MLX_RUNTIME=1)

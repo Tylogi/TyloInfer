@@ -1,15 +1,33 @@
 #include "engine/state/paged_kv.h"
-#include "engine/backends/cuda/native/tensor/backend.h"
-#include "engine/backends/cuda/kernels/mfq_cuda_kv_quantization.h"
 
+#ifdef TYLOINFER_NATIVE_CUDA
+#include "engine/backends/cuda/native/tensor/backend.h"
 #include <cuda_runtime_api.h>
+#endif
 
 #include <algorithm>
+#include <array>
 #include <limits>
 #include <stdexcept>
 #include <utility>
 
-namespace tyloi::cuda {
+namespace tyloi::state {
+namespace {
+void require(bool condition, const char* message) {
+    if (!condition) throw std::runtime_error(message);
+}
+Tensor metal_table(std::vector<std::int32_t>& data, std::int64_t rows, std::int64_t columns) {
+    const std::array<std::int64_t, 2> shape{rows, columns};
+    const Device cpu{DeviceType::cpu, 0};
+    auto storage = std::make_shared<TensorStorage>();
+    storage->base = data.data();
+    storage->bytes = data.size() * sizeof(std::int32_t);
+    storage->device = cpu;
+    Tensor host{DenseTensor(std::move(storage), make_contiguous_view(data.data(), shape, kInt32, cpu))};
+    // Relocation copies the borrowed host bytes before this view is released.
+    return host.relocated(Device{DeviceType::metal, 0});
+}
+}
 
 PagedKv::PagedKv(const std::vector<Layout>& layouts, int64_t context,
                  int32_t sequences, bool preallocate)
@@ -18,7 +36,7 @@ PagedKv::PagedKv(const std::vector<Layout>& layouts, int64_t context,
       maximum_physical_pages_(checked_maximum_pages(sequences, logical_pages_per_sequence_)),
       allocator_(maximum_physical_pages_),
       host_page_table_(size_t(sequences) * size_t(logical_pages_per_sequence_), -1) {
-    TYLOINFER_RUNTIME_CHECK(maximum_sequences_ > 0 &&
+    require(maximum_sequences_ > 0 &&
         logical_pages_per_sequence_ > 0,
         "Paged KV requires positive sequence and context limits");
     const int64_t maximum_chunks =
@@ -27,61 +45,68 @@ PagedKv::PagedKv(const std::vector<Layout>& layouts, int64_t context,
     for (const auto& layout : layouts) {
         const auto heads = layout.heads;
         const auto head_dim = layout.head_dim;
-        TYLOINFER_RUNTIME_CHECK(heads > 0 && head_dim > 0,
+        require(heads > 0 && head_dim > 0,
             "Paged KV encountered invalid full-attention geometry");
-        const int device = layout.device;
-        MfqCudaGuard guard(device);
-        auto table = device_page_tables_.find(device);
-        if (table == device_page_tables_.end()) {
-            auto page_table = ::tyloi::cuda::empty(
-                {maximum_sequences_, logical_pages_per_sequence_},
-                ::tyloi::TensorOptions()
-                    .device(::tyloi::Device(
-                        ::tyloi::kCUDA, device))
-                    .dtype(::tyloi::kInt32));
-            page_table.fill_(-1);
-            device_page_tables_.emplace(device, std::move(page_table));
+        const auto device = layout.device;
+        if ((!device.is_cuda() || device.index < 0) && (!device.is_metal() || device.index != 0))
+            throw std::invalid_argument("Paged KV requires CUDA or Metal 0");
+#ifndef TYLOINFER_NATIVE_CUDA
+        if (device.is_cuda()) throw std::invalid_argument("Paged KV CUDA support is unavailable");
+#endif
+        const auto device_key = std::pair{device.type, device.index};
+        if (!device_page_tables_.contains(device_key)) {
+            if (device.is_metal()) {
+                device_page_tables_.emplace(device_key, metal_table(host_page_table_, maximum_sequences_, logical_pages_per_sequence_));
+            } else {
+#ifdef TYLOINFER_NATIVE_CUDA
+                MfqCudaGuard guard(device.index);
+                auto page_table = ::tyloi::cuda::empty({maximum_sequences_, logical_pages_per_sequence_},
+                    TensorOptions().device(device).dtype(kInt32));
+                page_table.fill_(-1);
+                device_page_tables_.emplace(device_key, std::move(page_table));
+#endif
+            }
         }
-        auto pointer_options = ::tyloi::TensorOptions()
-            .device(::tyloi::Device(
-                ::tyloi::kCUDA, device))
-            .dtype(::tyloi::kInt64);
         Pool pool;
         pool.layout = layout;
         pool.key_width = layout.quantization.enabled()
-            ? cuda_kv_packed_width(int(head_dim), layout.quantization.key_bits()) : head_dim;
+            ? kv_packed_width(int(head_dim), layout.quantization.key_bits()) : head_dim;
         pool.value_width = layout.quantization.enabled()
-            ? cuda_kv_packed_width(int(head_dim), layout.quantization.value_bits()) : head_dim;
+            ? kv_packed_width(int(head_dim), layout.quantization.value_bits()) : head_dim;
         pool.dtype = layout.quantization.enabled()
-            ? ::tyloi::kInt32 : ::tyloi::kFloat16;
-        pool.k_chunk_ptrs = ::tyloi::cuda::zeros(
-            {maximum_chunks}, pointer_options);
-        pool.v_chunk_ptrs = ::tyloi::cuda::zeros(
-            {maximum_chunks}, pointer_options);
+            ? (device.is_metal() ? ScalarType::uint32 : kInt32) : kFloat16;
+#ifdef TYLOINFER_NATIVE_CUDA
+        if (device.is_cuda()) {
+            MfqCudaGuard guard(device.index);
+            auto options = TensorOptions().device(device).dtype(kInt64);
+            pool.k_chunk_ptrs = ::tyloi::cuda::zeros({maximum_chunks}, options);
+            pool.v_chunk_ptrs = ::tyloi::cuda::zeros({maximum_chunks}, options);
+        }
+#endif
         layers_.push_back(std::move(pool));
     }
-    TYLOINFER_RUNTIME_CHECK(!layers_.empty(),
+    require(!layers_.empty(),
         "Paged KV requires at least one full-attention layer");
     if (preallocate)
         ensure_storage(static_cast<size_t>(logical_pages_per_sequence_));
 }
 
 bool PagedKv::ensure_tokens(Sequence& sequence, int64_t token_count) {
-    TYLOINFER_RUNTIME_CHECK(token_count >= 0 &&
+    require(token_count >= 0 &&
         token_count <= logical_pages_per_sequence_ * kPageSize,
         "Paged KV sequence length exceeds the configured context");
-    TYLOINFER_RUNTIME_CHECK(validate(sequence),
+    require(validate(sequence),
         "Paged KV sequence handle is invalid");
     const size_t required_pages = static_cast<size_t>(
         (token_count + kPageSize - 1) / kPageSize);
     if (required_pages <= sequence.physical_pages_.size()) return false;
     const size_t previous_size = sequence.physical_pages_.size();
     const size_t additional_pages = required_pages - previous_size;
-    TYLOINFER_RUNTIME_CHECK(generation_ !=
+    require(generation_ !=
         std::numeric_limits<std::uint64_t>::max(),
         "Paged KV allocation generation exhausted");
     const size_t live_pages = allocator_.live_pages();
-    TYLOINFER_RUNTIME_CHECK(additional_pages <= maximum_physical_pages_ - live_pages,
+    require(additional_pages <= maximum_physical_pages_ - live_pages,
         "Paged KV physical storage exhausted");
     const size_t required_highwatermark = std::max(
         allocator_.high_watermark(), live_pages + additional_pages);
@@ -110,7 +135,7 @@ bool PagedKv::ensure_tokens(Sequence& sequence, int64_t token_count) {
 }
 
 void PagedKv::release(Sequence& sequence) {
-    TYLOINFER_RUNTIME_CHECK(validate(sequence),
+    require(validate(sequence),
         "Paged KV sequence handle is invalid");
     if (sequence.physical_pages_.empty()) return;
     allocator_.release(sequence.physical_pages_);
@@ -121,14 +146,14 @@ void PagedKv::release(Sequence& sequence) {
 }
 
 void PagedKv::update(const std::vector<const Sequence*>& sequences) {
-    TYLOINFER_RUNTIME_CHECK(!sequences.empty() &&
+    require(!sequences.empty() &&
         sequences.size() <= static_cast<size_t>(maximum_sequences_),
         "Paged KV cannot update the requested batch size");
     const size_t rows = sequences.size();
     const size_t row_width =
         static_cast<size_t>(logical_pages_per_sequence_);
     for (const auto * sequence : sequences) {
-        TYLOINFER_RUNTIME_CHECK(sequence != nullptr &&
+        require(sequence != nullptr &&
             sequence->physical_pages_.size() <= row_width &&
             validate(*sequence),
             "Paged KV received an invalid sequence handle");
@@ -148,26 +173,35 @@ void PagedKv::update(const std::vector<const Sequence*>& sequences) {
     }
     const size_t bytes = rows * row_width * sizeof(std::int32_t);
     for (auto & [device, table] : device_page_tables_) {
-        MfqCudaGuard guard(device);
-        const auto stream = mfq_get_current_cuda_stream();
-        TYLOINFER_CUDA_CHECK(cudaMemcpyAsync(
-            table.data_ptr<std::int32_t>(), host_page_table_.data(),
-            bytes, cudaMemcpyHostToDevice, stream));
-        // The next update may rewrite this host buffer and device table.
-        // Order it after all previous users on the execution stream.
-        TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(stream));
+        if (device.first == DeviceType::metal) {
+            table = metal_table(host_page_table_, maximum_sequences_, logical_pages_per_sequence_);
+        } else {
+#ifdef TYLOINFER_NATIVE_CUDA
+            MfqCudaGuard guard(device.second);
+            const auto stream = mfq_get_current_cuda_stream();
+            TYLOINFER_CUDA_CHECK(cudaMemcpyAsync(
+                table.dense().data_ptr<std::int32_t>(), host_page_table_.data(),
+                bytes, cudaMemcpyHostToDevice, stream));
+            TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(stream));
+#endif
+        }
     }
     page_table_updates_metric_.fetch_add(1, std::memory_order_relaxed);
 }
 
 tyloi::state::KvView PagedKv::view(size_t index, int64_t batch) const {
-    TYLOINFER_RUNTIME_CHECK(batch > 0 && batch <= maximum_sequences_,
+    require(batch > 0 && batch <= maximum_sequences_,
         "Paged KV view batch size is invalid");
     const auto& pool = layers_.at(index);
     tyloi::state::KvView cache;
-    cache.key_chunk_ptrs = pool.k_chunk_ptrs;
-    cache.value_chunk_ptrs = pool.v_chunk_ptrs;
-    cache.page_table = device_page_tables_.at(pool.layout.device);
+    if (pool.layout.device.is_metal()) {
+        cache.physical_key = pool.storage.physical_key;
+        cache.physical_value = pool.storage.physical_value;
+    } else {
+        cache.key_chunk_ptrs = pool.k_chunk_ptrs;
+        cache.value_chunk_ptrs = pool.v_chunk_ptrs;
+    }
+    cache.page_table = device_page_tables_.at({pool.layout.device.type, pool.layout.device.index});
     cache.batch = batch;
     cache.heads = pool.layout.heads;
     cache.head_dim = pool.layout.head_dim;
@@ -237,50 +271,63 @@ void PagedKv::ensure_storage(size_t required_pages) {
     while (storage_pages_ < required_pages) {
         const size_t chunk_pages = std::min<size_t>(
             kPagesPerChunk, maximum_physical_pages_ - storage_pages_);
-        TYLOINFER_RUNTIME_CHECK(chunk_pages > 0,
+        require(chunk_pages > 0,
             "Paged KV physical storage exhausted");
         std::vector<Chunk> pending;
         pending.reserve(layers_.size());
         for (const auto & layer : layers_) {
-            MfqCudaGuard guard(layer.layout.device);
-            auto options = ::tyloi::TensorOptions()
-                .device(::tyloi::Device(
-                    ::tyloi::kCUDA, layer.layout.device))
-                .dtype(layer.dtype);
             Chunk chunk;
-            chunk.k = ::tyloi::cuda::empty(
-                {static_cast<int64_t>(chunk_pages), layer.layout.heads,
-                 kPageSize, layer.key_width}, options);
-            chunk.v = ::tyloi::cuda::empty(
-                {static_cast<int64_t>(chunk_pages), layer.layout.heads,
-                 kPageSize, layer.value_width}, options);
+            if (layer.layout.device.is_metal()) {
+                const auto capacity = static_cast<int64_t>((storage_pages_ + chunk_pages) * kPageSize);
+                if (layer.storage.defined())
+                    chunk.storage = grow_kv(layer.storage, capacity, static_cast<int64_t>(storage_pages_ * kPageSize));
+                else
+                    chunk.storage = allocate_kv(1, layer.layout.heads, capacity, layer.layout.head_dim,
+                        false, layer.layout.device, kFloat16, layer.layout.quantization);
+            } else {
+#ifdef TYLOINFER_NATIVE_CUDA
+                MfqCudaGuard guard(layer.layout.device.index);
+                auto options = TensorOptions().device(layer.layout.device).dtype(layer.dtype);
+                chunk.k = ::tyloi::cuda::empty(
+                    {static_cast<int64_t>(chunk_pages), layer.layout.heads, kPageSize, layer.key_width}, options);
+                chunk.v = ::tyloi::cuda::empty(
+                    {static_cast<int64_t>(chunk_pages), layer.layout.heads, kPageSize, layer.value_width}, options);
+#endif
+            }
             pending.push_back(std::move(chunk));
         }
         const size_t chunk_index = storage_pages_ / kPagesPerChunk;
         for (size_t index = 0; index < layers_.size(); ++index) {
             auto & layer = layers_[index];
             auto & chunk = pending[index];
-            const int64_t k_pointer = reinterpret_cast<int64_t>(
-                chunk.k.data_ptr());
-            const int64_t v_pointer = reinterpret_cast<int64_t>(
-                chunk.v.data_ptr());
-            MfqCudaGuard guard(layer.layout.device);
-            const auto stream = mfq_get_current_cuda_stream();
-            TYLOINFER_CUDA_CHECK(cudaMemcpyAsync(
-                layer.k_chunk_ptrs.data_ptr<int64_t>() + chunk_index,
-                &k_pointer, sizeof(k_pointer), cudaMemcpyHostToDevice, stream));
-            TYLOINFER_CUDA_CHECK(cudaMemcpyAsync(
-                layer.v_chunk_ptrs.data_ptr<int64_t>() + chunk_index,
-                &v_pointer, sizeof(v_pointer), cudaMemcpyHostToDevice, stream));
-            TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(stream));
+            if (layer.layout.device.is_cuda()) {
+#ifdef TYLOINFER_NATIVE_CUDA
+                const int64_t k_pointer = reinterpret_cast<int64_t>(chunk.k.dense().data_ptr());
+                const int64_t v_pointer = reinterpret_cast<int64_t>(chunk.v.dense().data_ptr());
+                MfqCudaGuard guard(layer.layout.device.index);
+                const auto stream = mfq_get_current_cuda_stream();
+                TYLOINFER_CUDA_CHECK(cudaMemcpyAsync(
+                    layer.k_chunk_ptrs.dense().data_ptr<int64_t>() + chunk_index,
+                    &k_pointer, sizeof(k_pointer), cudaMemcpyHostToDevice, stream));
+                TYLOINFER_CUDA_CHECK(cudaMemcpyAsync(
+                    layer.v_chunk_ptrs.dense().data_ptr<int64_t>() + chunk_index,
+                    &v_pointer, sizeof(v_pointer), cudaMemcpyHostToDevice, stream));
+                TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(stream));
+#endif
+            }
         }
         for (size_t index = 0; index < layers_.size(); ++index) {
-            reserved_bytes_ += pending[index].k.nbytes() +
-                pending[index].v.nbytes();
-            layers_[index].k_chunks.push_back(
-                std::move(pending[index].k));
-            layers_[index].v_chunks.push_back(
-                std::move(pending[index].v));
+            auto & layer = layers_[index];
+            auto & chunk = pending[index];
+            if (layer.layout.device.is_metal()) {
+                if (layer.storage.defined()) reserved_bytes_ -= layer.storage.physical_key.nbytes() + layer.storage.physical_value.nbytes();
+                reserved_bytes_ += chunk.storage.physical_key.nbytes() + chunk.storage.physical_value.nbytes();
+                layer.storage = std::move(chunk.storage);
+            } else {
+                reserved_bytes_ += chunk.k.nbytes() + chunk.v.nbytes();
+                layer.k_chunks.push_back(std::move(chunk.k));
+                layer.v_chunks.push_back(std::move(chunk.v));
+            }
         }
         storage_pages_ += chunk_pages;
         capacity_pages_metric_.store(
@@ -290,4 +337,4 @@ void PagedKv::ensure_storage(size_t required_pages) {
     }
 }
 
-} // namespace tyloi::cuda
+} // namespace tyloi::state

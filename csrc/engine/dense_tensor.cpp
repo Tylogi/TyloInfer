@@ -47,6 +47,7 @@ DenseTensor& Tensor::dense() {
 
 Tensor Tensor::relocated(Device target) const {
     if (!impl_) return {};
+    if (device().is_metal() || target.is_metal()) return ops::copy(*this, target);
     if (const auto* value = representation<DenseTensor>()) {
         return value->defined() && value->device() != target
             ? Tensor{value->to(target)}

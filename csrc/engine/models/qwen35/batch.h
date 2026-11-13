@@ -33,7 +33,7 @@ class RequestState {
   private:
     friend class Batch;
     std::unique_ptr<qwen35::State> state_;
-    PagedKv::Sequence pages_;
+    tyloi::state::PagedKv::Sequence pages_;
     std::int32_t slot_ = -1;
 };
 
@@ -57,7 +57,7 @@ class Batch {
     bool has_cached_moe() const;
     static bool has_cached_moe(const Model &model);
     bool paged_kv_enabled() const noexcept;
-    PagedKv::Stats paged_kv_stats() const noexcept;
+    tyloi::state::PagedKv::Stats paged_kv_stats() const noexcept;
     std::int64_t slot_releases() const noexcept { return slot_releases_; }
 
     void prepare_prefill(RequestState &request, std::int64_t offset, std::int64_t tokens);
@@ -81,7 +81,7 @@ class Batch {
     void copy_to_slot(qwen35::State &target, const qwen35::State &source,
                       std::int64_t slot) const;
     void bind_paged(qwen35::State &state,
-                    const std::vector<const PagedKv::Sequence *> &sequences);
+                    const std::vector<const tyloi::state::PagedKv::Sequence *> &sequences);
     void bind_paged_slots();
     void detach_paged(qwen35::State &state) noexcept;
     std::string incompatibility(bool cpu_offload, int cached_slots) const;
@@ -92,8 +92,8 @@ class Batch {
     std::vector<RequestState *> slots_;
     std::int64_t slot_releases_ = 0;
     bool page_table_dirty_ = false;
-    std::unique_ptr<PagedKv> paged_kv_;
-    std::vector<PagedKv::Sequence> paged_slots_;
+    std::unique_ptr<tyloi::state::PagedKv> paged_kv_;
+    std::vector<tyloi::state::PagedKv::Sequence> paged_slots_;
 };
 
 } // namespace tyloi::cuda::qwen35

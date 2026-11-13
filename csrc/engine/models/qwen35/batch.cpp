@@ -46,13 +46,13 @@ Batch::Batch(const Model &weights, bool transposed, Options options)
     state_->reset(static_cast<std::int64_t>(options.slots));
     if (options.paged) {
         paged_slots_.resize(options.slots);
-        std::vector<PagedKv::Layout> layouts;
+        std::vector<tyloi::state::PagedKv::Layout> layouts;
         for (const auto &layer : weights_.layers) {
             std::visit(
                 [&](const auto &value) {
                     using T = std::decay_t<decltype(value)>;
                     if constexpr (std::is_same_v<T, Full>) {
-                        layouts.push_back({layer.device.index,
+                        layouts.push_back({layer.device,
                             value.attention.kv_heads > 0 ? value.attention.kv_heads
                                                          : weights_.metadata.num_key_value_heads,
                             value.attention.attention_head_dim > 0
@@ -63,7 +63,7 @@ Batch::Batch(const Model &weights, bool transposed, Options options)
                 },
                 layer.weights);
         }
-        paged_kv_ = std::make_unique<PagedKv>(layouts, weights_.metadata.max_position_embeddings,
+        paged_kv_ = std::make_unique<tyloi::state::PagedKv>(layouts, weights_.metadata.max_position_embeddings,
                                                static_cast<int32_t>(options.slots),
                                                options.preallocate);
         detach_paged(*state_);
@@ -72,8 +72,8 @@ Batch::Batch(const Model &weights, bool transposed, Options options)
 
 bool Batch::paged_kv_enabled() const noexcept { return static_cast<bool>(paged_kv_); }
 
-PagedKv::Stats Batch::paged_kv_stats() const noexcept {
-    return paged_kv_ ? paged_kv_->stats() : PagedKv::Stats{};
+tyloi::state::PagedKv::Stats Batch::paged_kv_stats() const noexcept {
+    return paged_kv_ ? paged_kv_->stats() : tyloi::state::PagedKv::Stats{};
 }
 
 void Batch::prepare_prefill(RequestState &request, std::int64_t offset, std::int64_t tokens) {
@@ -214,7 +214,7 @@ void Batch::recover(const std::vector<RequestState *> &requests) {
     finish_retire(0);
 }
 
-void Batch::bind_paged(State &state, const std::vector<const PagedKv::Sequence *> &sequences) {
+void Batch::bind_paged(State &state, const std::vector<const tyloi::state::PagedKv::Sequence *> &sequences) {
     TYLOINFER_RUNTIME_CHECK(paged_kv_, "continuous batching paged KV state is unavailable");
     paged_kv_->update(sequences);
     std::size_t state_index = 0;
@@ -246,7 +246,7 @@ void Batch::detach_paged(State &state) noexcept {
 void Batch::bind_paged_slots() {
     if (!paged_kv_)
         return;
-    std::vector<const PagedKv::Sequence *> sequences;
+    std::vector<const tyloi::state::PagedKv::Sequence *> sequences;
     sequences.reserve(paged_slots_.size());
     for (auto &sequence : paged_slots_) {
         paged_kv_->ensure_tokens(sequence, 1);

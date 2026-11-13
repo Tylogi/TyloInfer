@@ -24,6 +24,9 @@ struct KvView {
 
     bool paged() const noexcept { return page_size > 0; }
     bool defined() const noexcept {
+        // Metal indexes physical rows; CUDA indexes chunks through pointer tables.
+        if (paged() && physical_key.is_metal())
+            return physical_value.is_metal() && page_table.defined();
         return paged()
             ? key_chunk_ptrs.defined() && value_chunk_ptrs.defined() && page_table.defined()
             : physical_key.defined() && physical_value.defined();

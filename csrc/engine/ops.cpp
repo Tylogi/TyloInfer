@@ -1122,12 +1122,6 @@ Tensor from_blob(void* data, std::span<const std::int64_t> shape, const TensorOp
     device(options.target_device());
     return owner(cuda::ops::from_blob(data, shape, options));
 }
-Tensor copy(const Tensor& value_tensor, Device target) {
-    const auto& value = ::tyloi::ops::dense(value_tensor);
-    input(value);
-    device(target);
-    return owner(cuda::ops::copy(value, target));
-}
 Tensor cast(const Tensor& value_tensor, ScalarType type, Device target) {
     const auto& value = ::tyloi::ops::dense(value_tensor);
     input(value);
