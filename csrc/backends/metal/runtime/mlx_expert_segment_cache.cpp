@@ -4,13 +4,13 @@
 #include "engine/backends/metal/native/pool.h"
 #include "engine/backends/metal/native/resident_allocations.h"
 #include "engine/backends/cpu/native/host_parallel.h"
+#include "engine/weights/lru.h"
 
 #include <algorithm>
 #include <chrono>
 #include <future>
 #include <list>
 #include <mutex>
-#include <unordered_map>
 #include <unordered_set>
 #include <unistd.h>
 
@@ -29,7 +29,7 @@ struct MlxExpertSegmentCache::Impl {
     };
     struct Entry {
         std::size_t offset = 0, bytes = 0;
-        std::list<std::uint64_t>::iterator recency, replaceable_recency;
+        std::list<std::uint64_t>::iterator replaceable_recency;
         bool preferred = false;
     };
     MfqContainer model;
@@ -40,10 +40,10 @@ struct MlxExpertSegmentCache::Impl {
     bool prefill_read_ahead;
     tyloi::HostParallelPool io;
     mutable std::mutex mutex;
-    std::list<std::uint64_t> lru, replaceable;
+    std::list<std::uint64_t> replaceable;
     bool prefill_priority_active = false;
     long double total_entry_bytes = 0, maximum_layer_bytes = 0;
-    std::unordered_map<std::uint64_t, Entry> entries;
+    tyloi::weights::Lru<std::uint64_t, Entry> entries{std::nullopt};
     MlxSsdExpertCacheStats counters;
     std::optional<array> pending;
     MlxResourceTelemetry resources;
@@ -100,7 +100,7 @@ struct MlxExpertSegmentCache::Impl {
     void rebuild_replaceable() {
         replaceable.clear();
         try {
-            for (auto key : lru) {
+            for (auto key : entries.keys()) {
                 auto& entry = entries.at(key);
                 if (entry.preferred) continue;
                 replaceable.push_back(key);
@@ -117,7 +117,7 @@ struct MlxExpertSegmentCache::Impl {
         if (!prefill_priority_active && rows >= std::size_t(layers[index].source.experts) &&
             static_cast<long double>(budget) < total_entry_bytes && usable > 0 &&
             usable * layers[index].source.experts >= total_entry_bytes) {
-            for (auto& [key, entry] : entries) entry.preferred = false;
+            for (const auto& [key, entry] : entries.entries()) entries.at(key).preferred = false;
             prefill_priority_active = true;
             rebuild_replaceable();
         }
@@ -129,14 +129,15 @@ struct MlxExpertSegmentCache::Impl {
             entries.at(key).replaceable_recency = replaceable.begin();
         } catch (const std::bad_alloc&) { end_prefill_priority(); }
     }
-    void touch(Entry& entry) {
-        lru.splice(lru.begin(), lru, entry.recency);
+    void touch(std::uint64_t key) {
+        auto& entry = entries.at(key);
+        entries.get(key);
         if (prefill_priority_active && !entry.preferred)
             replaceable.splice(replaceable.begin(), replaceable, entry.replaceable_recency);
     }
     void retain_prefill_tail(std::size_t index, const std::vector<std::int32_t>& ordered) {
         if (!prefill_priority_active) return;
-        for (auto& [key, entry] : entries) if (std::size_t(key >> 32) == index) entry.preferred = false;
+        for (const auto& [key, entry] : entries.entries()) if (std::size_t(key >> 32) == index) entries.at(key).preferred = false;
         rebuild_replaceable();
         if (!prefill_priority_active) return;
         const auto usable = std::max(0.L, static_cast<long double>(budget) - 2 * maximum_layer_bytes);
@@ -147,24 +148,22 @@ struct MlxExpertSegmentCache::Impl {
             replaceable.erase(entry.replaceable_recency);
         }
     }
-    void erase(std::unordered_map<std::uint64_t, Entry>::iterator found) {
-        const auto key = found->first;
+    void erase(std::uint64_t key) {
+        const auto& entry = entries.at(key);
         for (auto& table : layers.at(std::size_t(key >> 32)).tables)
             table.data<std::uint64_t>()[std::uint32_t(key)] = 0;
-        resident -= found->second.bytes;
-        pool->release(found->second.offset, found->second.bytes);
-        if (prefill_priority_active && !found->second.preferred) replaceable.erase(found->second.replaceable_recency);
-        lru.erase(found->second.recency); entries.erase(found); ++counters.evictions;
+        resident -= entry.bytes;
+        pool->release(entry.offset, entry.bytes);
+        if (prefill_priority_active && !entry.preferred) replaceable.erase(entry.replaceable_recency);
+        entries.erase(key); ++counters.evictions;
     }
     bool evict_one(const std::unordered_set<std::uint64_t>& protected_keys) {
-        const auto& candidates = prefill_priority_active ? replaceable : lru;
-        for (auto it = candidates.rbegin(); it != candidates.rend(); ++it) {
+        if (prefill_priority_active) for (auto it = replaceable.rbegin(); it != replaceable.rend(); ++it) {
             if (protected_keys.contains(*it)) continue;
-            erase(entries.find(*it)); return true;
+            erase(*it); return true;
         }
-        if (prefill_priority_active) for (auto it = lru.rbegin(); it != lru.rend(); ++it) {
-            if (protected_keys.contains(*it)) continue;
-            erase(entries.find(*it)); return true;
+        if (const auto* key = entries.oldest(protected_keys)) {
+            erase(*key); return true;
         }
         return false;
     }
@@ -190,8 +189,7 @@ struct MlxExpertSegmentCache::Impl {
                     entry.offset = SIZE_MAX;
                     continue;
                 }
-                lru.push_front(key); entry.recency = lru.begin();
-                try { entries.emplace(key, entry); } catch (...) { lru.pop_front(); throw; }
+                entries.put(key, entry, entry.bytes);
                 inserted(key);
                 entry.offset = SIZE_MAX;
             }
@@ -221,7 +219,7 @@ struct MlxExpertSegmentCache::Impl {
         std::size_t reserve = 0;
         for (int expert = 0; expert < layer.source.experts; ++expert) {
             const auto key = (std::uint64_t(index) << 32) | std::uint32_t(expert);
-            if (!entries.contains(key)) reserve += layer.layout.entry_size(expert);
+            if (!entries.find(key)) reserve += layer.layout.entry_size(expert);
         }
         if (!reserve || resident > budget || in_flight > budget - resident || reserve > budget - resident - in_flight) return;
         Prefetch state; state.layer = index;
@@ -235,7 +233,7 @@ struct MlxExpertSegmentCache::Impl {
             state.entries.reserve(layer.source.experts);
             for (int expert = 0; expert < layer.source.experts; ++expert) {
                 const auto key = (std::uint64_t(index) << 32) | std::uint32_t(expert);
-                if (entries.contains(key)) continue;
+                if (entries.find(key)) continue;
                 const auto bytes = layer.layout.entry_size(expert);
                 const auto offset = pool->allocate(bytes);
                 if (!offset) {
@@ -308,14 +306,14 @@ struct MlxExpertSegmentCache::Impl {
         for (const auto expert : selected) {
             const auto key = (std::uint64_t(index) << 32) | std::uint32_t(expert);
             protected_keys.insert(key);
-            if (!entries.contains(key)) reserve += layer.layout.entry_size(expert);
+            if (!entries.find(key)) reserve += layer.layout.entry_size(expert);
         }
         evict(reserve, protected_keys);
         for (const auto expert : selected) {
             const auto key = (std::uint64_t(index) << 32) | std::uint32_t(expert);
             ++counters.requests;
-            if (const auto found = entries.find(key); found != entries.end()) {
-                ++counters.hits; touch(found->second); continue;
+            if (entries.find(key)) {
+                ++counters.hits; touch(key); continue;
             }
             const auto bytes = layer.layout.entry_size(expert);
             auto offset = pool->allocate(bytes);
@@ -357,7 +355,7 @@ struct MlxExpertSegmentCache::Impl {
             };
             for (const auto expert : selected) {
                 const auto found = entries.find((std::uint64_t(index) << 32) | std::uint32_t(expert));
-                if (found != entries.end()) assign(expert, found->second.offset);
+                if (found) assign(expert, found->offset);
             }
             for (const auto& [key, entry] : pending) assign(std::int32_t(key), entry.offset);
         };
@@ -385,8 +383,7 @@ struct MlxExpertSegmentCache::Impl {
         counters.io_seconds += std::chrono::duration<double>(Clock::now() - start).count(); counters.read_calls += jobs.size();
         publish(staged ? first_fields : 0, layer.tables.size());
         for (auto& [key, entry] : pending) {
-            lru.push_front(key); entry.recency = lru.begin();
-            try { entries.emplace(key, entry); } catch (...) { lru.pop_front(); throw; }
+            entries.put(key, entry, entry.bytes);
             inserted(key);
             resident += entry.bytes; entry.offset = SIZE_MAX;
             counters.bytes_read += layer.layout.payload_size(std::int32_t(key)); ++counters.misses; ++counters.loads;
@@ -422,7 +419,7 @@ array MlxExpertSegmentCache::apply(std::size_t index, const array& ids, std::siz
     if (selected.front() < 0 || selected.back() >= layer.source.experts)
         throw std::invalid_argument("expert routes are outside the model");
     if (parallel && !parallel->is_available() && std::any_of(selected.begin(), selected.end(), [&](auto expert) {
-            return !impl_->entries.contains((std::uint64_t(index) << 32) | std::uint32_t(expert));
+            return !impl_->entries.find((std::uint64_t(index) << 32) | std::uint32_t(expert));
         })) async_eval({*parallel});
     impl_->finish_prefetch(index, selected);
     impl_->configure_prefill_priority(index, std::size_t(ids.shape(0)));
@@ -445,7 +442,7 @@ array MlxExpertSegmentCache::apply(std::size_t index, const array& ids, std::siz
         std::size_t in_flight = 0;
         if (!partial && impl_->prefill_read_ahead && std::size_t(ids.shape(0)) >= std::size_t(layer.source.experts))
             for (const auto expert : batch)
-                if (!impl_->entries.contains((std::uint64_t(index) << 32) | std::uint32_t(expert)))
+                if (!impl_->entries.find((std::uint64_t(index) << 32) | std::uint32_t(expert)))
                     in_flight += layer.layout.entry_size(expert);
         const auto io_before = impl_->counters.io_seconds;
         const auto prepare_start = Clock::now();
@@ -472,7 +469,7 @@ array MlxExpertSegmentCache::apply(std::size_t index, const array& ids, std::siz
         std::sort(recency.begin(), recency.end(), [&](auto a, auto b) { return last_use[a] < last_use[b]; });
         for (const auto expert : recency) {
             const auto key = (std::uint64_t(index) << 32) | std::uint32_t(expert);
-            impl_->touch(impl_->entries.at(key));
+            impl_->touch(key);
         }
         impl_->retain_prefill_tail(index, recency);
         impl_->counters.routed_graph_seconds += std::chrono::duration<double>(Clock::now() - graph_start).count();
@@ -493,9 +490,10 @@ std::size_t MlxExpertSegmentCache::set_limit(std::size_t bytes) {
     if (!target) throw std::invalid_argument("expert cache budget is smaller than a page");
     if (target < impl_->maximum_entry) throw std::invalid_argument("expert cache budget cannot hold one expert");
     impl_->end_prefill_priority();
-    for (auto it = impl_->entries.begin(); it != impl_->entries.end();) {
+    for (auto it = impl_->entries.entries().begin(); it != impl_->entries.entries().end();) {
         auto current = it++;
-        if (current->second.offset > target || current->second.bytes > target - current->second.offset) impl_->erase(current);
+        const auto& entry = current->second.value;
+        if (entry.offset > target || entry.bytes > target - entry.offset) impl_->erase(current->first);
     }
     impl_->pool->set_limit(bytes); impl_->budget = bytes; impl_->evict(0);
     return before - impl_->pool->capacity();
@@ -503,9 +501,9 @@ std::size_t MlxExpertSegmentCache::set_limit(std::size_t bytes) {
 MlxSsdExpertCacheStats MlxExpertSegmentCache::stats() const {
     std::lock_guard lock(impl_->mutex);
     auto result = impl_->counters;
-    result.resident_experts = impl_->entries.size(); result.resident_bytes = impl_->pool->capacity();
+    result.resident_experts = impl_->entries.entries().size(); result.resident_bytes = impl_->pool->capacity();
     std::size_t payload = 0, metadata = 0;
-    for (const auto& [key, entry] : impl_->entries) payload += impl_->layers.at(std::size_t(key >> 32)).layout.payload_size(std::int32_t(key));
+    for (const auto& [key, entry] : impl_->entries.entries()) payload += impl_->layers.at(std::size_t(key >> 32)).layout.payload_size(std::int32_t(key));
     for (const auto& layer : impl_->layers) for (const auto& table : layer.tables) metadata += table.buffer_size();
     result.cached_payload_bytes = payload; result.cache_metadata_bytes = metadata;
     result.pinned_cache_bytes = impl_->pool->pinned_bytes();
@@ -516,7 +514,7 @@ void MlxExpertSegmentCache::clear() {
     impl_->wait_pending();
     impl_->finish_prefetch();
     impl_->end_prefill_priority();
-    impl_->entries.clear(); impl_->lru.clear(); impl_->resident = 0;
+    impl_->entries.clear(); impl_->resident = 0;
     for (auto& layer : impl_->layers) for (auto& table : layer.tables)
         std::fill_n(table.data<std::uint64_t>(), layer.source.experts, std::uint64_t{0});
     impl_->pool->clear(); impl_->resources.set({0, 0, 0, impl_->backing, 0});

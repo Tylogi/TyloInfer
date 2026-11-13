@@ -2,6 +2,7 @@
 #include "mlx_resource_telemetry.h"
 #include "mlx_nint_rows.h"
 #include "engine/backends/cpu/native/host_parallel.h"
+#include "engine/weights/lru.h"
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -10,7 +11,6 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
-#include <list>
 #include <mutex>
 #include <stdexcept>
 #include <unordered_map>
@@ -89,7 +89,6 @@ float decode_e8m0(std::uint8_t raw) {
 struct MlxQuantizedRowStore::Impl {
     struct CacheEntry {
         std::vector<mlx::core::float16_t> values;
-        std::list<std::int64_t>::iterator recency;
         mfq::NintRowBatch packed;
         MlxTqRowBatch tq;
     };
@@ -195,7 +194,7 @@ struct MlxQuantizedRowStore::Impl {
         if (!tq) backing_bytes = model.record(record).nbytes;
         resources.bind([this] {
             std::lock_guard lock(mutex);
-            return MlxResourceUsage{0, 0, index_bytes + resident_cache_bytes, 0, backing_bytes};
+            return MlxResourceUsage{0, 0, index_bytes + cache.used(), 0, backing_bytes};
         });
         if (tq) for (const auto& name : prepared_names) model.record_prepared(name);
         else model.record_prepared(record);
@@ -399,36 +398,17 @@ struct MlxQuantizedRowStore::Impl {
             });
     }
 
-    void touch(
-        typename std::unordered_map<std::int64_t, CacheEntry>::iterator found)
-        const {
-        recency.splice(recency.begin(), recency, found->second.recency);
-        found->second.recency = recency.begin();
-    }
-
     void admit(RequestedRow row) const {
         if (cache_capacity == 0) return;
-        auto found = cache.find(row.row);
-        if (found != cache.end()) {
-            touch(found);
-            return;
+        if (cache.get(row.row)) return;
+        while (cache.entries().size() >= cache_capacity) {
+            cache.erase(*cache.oldest());
         }
-        while (cache.size() >= cache_capacity) {
-            const auto victim = recency.back();
-            recency.pop_back();
-            const auto& entry = cache.at(victim);
-            resident_cache_bytes -= entry.values.size() * sizeof(mlx::core::float16_t)
-                + entry.packed.packed_nbytes() + entry.packed.descriptors().size() * 4
-                + entry.tq.packed_nbytes();
-            cache.erase(victim);
-        }
-        recency.push_front(row.row);
-        resident_cache_bytes += row.values.size() * sizeof(mlx::core::float16_t)
+        const auto bytes = row.values.size() * sizeof(mlx::core::float16_t)
             + row.packed.packed_nbytes() + row.packed.descriptors().size() * 4
             + row.tq.packed_nbytes();
-        cache.emplace(
-            row.row,
-            CacheEntry{std::move(row.values), recency.begin(), std::move(row.packed), std::move(row.tq)});
+        cache.put(row.row,
+            CacheEntry{std::move(row.values), std::move(row.packed), std::move(row.tq)}, bytes);
     }
 
     MlxQuantizedRowBatch prepare_rows(std::span<const std::int64_t> row_ids) const {
@@ -462,13 +442,12 @@ struct MlxQuantizedRowStore::Impl {
                 const auto index = requested.size();
                 unique_index.emplace(row, index);
                 request_sources.push_back(index);
-                auto found = cache.find(row);
-                if (found == cache.end()) {
+                auto* found = cache.get(row);
+                if (!found) {
                     requested.push_back({row, {}, true});
                     misses.push_back(index);
                 } else {
-                    touch(found);
-                    requested.push_back({row, found->second.values, false, found->second.packed, found->second.tq});
+                    requested.push_back({row, found->values, false, found->packed, found->tq});
                 }
             }
         }
@@ -559,7 +538,6 @@ struct MlxQuantizedRowStore::Impl {
     std::size_t cache_capacity = 0;
     std::size_t index_bytes = 0;
     std::size_t backing_bytes = 0;
-    mutable std::size_t resident_cache_bytes = 0;
     std::unique_ptr<mfq::NintRows> nint;
     std::vector<MfqMappedBytes> tq_mappings;
     std::unique_ptr<MlxMappedTqTable> tq;
@@ -567,8 +545,7 @@ struct MlxQuantizedRowStore::Impl {
     mutable tyloi::HostParallelPool workers;
     int worker_count;
     mutable std::mutex mutex;
-    mutable std::list<std::int64_t> recency;
-    mutable std::unordered_map<std::int64_t, CacheEntry> cache;
+    mutable tyloi::weights::Lru<std::int64_t, CacheEntry> cache{std::nullopt};
     mutable MlxQuantizedRowStoreStats counters;
     MlxResourceTelemetry resources;
 };
@@ -621,15 +598,15 @@ int MlxQuantizedRowStore::width() const noexcept {
 
 std::size_t MlxQuantizedRowStore::cached_rows() const noexcept {
     std::scoped_lock lock(impl_->mutex);
-    return impl_->cache.size();
+    return impl_->cache.entries().size();
 }
 
 MlxQuantizedRowStoreStats MlxQuantizedRowStore::stats() const {
     std::scoped_lock lock(impl_->mutex);
     auto result = impl_->counters;
-    result.resident_rows = impl_->cache.size();
+    result.resident_rows = impl_->cache.entries().size();
     result.resident_payload_bytes =
-        impl_->index_bytes + impl_->resident_cache_bytes;
+        impl_->index_bytes + impl_->cache.used();
     result.cache_limit_bytes =
         impl_->index_bytes + impl_->cache_capacity * impl_->decoded_row_bytes;
     return result;
@@ -638,8 +615,6 @@ MlxQuantizedRowStoreStats MlxQuantizedRowStore::stats() const {
 void MlxQuantizedRowStore::clear() {
     std::scoped_lock lock(impl_->mutex);
     impl_->cache.clear();
-    impl_->recency.clear();
-    impl_->resident_cache_bytes = 0;
 }
 
 } // namespace mfq::metal

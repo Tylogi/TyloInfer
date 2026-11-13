@@ -1,3 +1,4 @@
+#include "engine/weights/lru.h"
 #include "engine/backends/metal/native/memory.h"
 #include "engine/backends/metal/native/indirect.h"
 #include "mlx_tq_expert_cache.h"
@@ -22,13 +23,11 @@
 #include <cstdio>
 #include <cstring>
 #include <future>
-#include <list>
 #include <map>
 #include <mutex>
 #include <numeric>
 #include <optional>
 #include <stdexcept>
-#include <unordered_map>
 #include <unordered_set>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -313,7 +312,6 @@ struct MlxTqExpertCache::Impl {
         std::size_t layer = 0;
         int expert = 0;
         std::array<Range, 3> allocations;
-        std::list<std::uint64_t>::iterator order;
         bool prefetched = false;
     };
     struct Read {
@@ -469,7 +467,8 @@ struct MlxTqExpertCache::Impl {
             layer.weights = std::make_unique<MlxTqExpertWeights>(MlxTqExpertWeights{
                 *layer.banks[0].weight, *layer.banks[1].weight, *layer.banks[2].weight});
         }
-        for(const auto& [key,entry]:entries)for(int projection=0;projection<3;++projection) {
+        for(const auto& [key,item]:entries.entries())for(int projection=0;projection<3;++projection) {
+            const auto& entry = item.value;
             auto descriptors = tyloi::metal::array(layers[entry.layer].banks[projection].weight->descriptors_);
             descriptors.data<std::uint64_t>()[
                 layers[entry.layer].banks[projection].weight->rows_+entry.expert]=pools[projection].address(entry.allocations[projection].offset);
@@ -530,31 +529,31 @@ struct MlxTqExpertCache::Impl {
             reusable &= pools[p].storage && capacities[p] <= pools[p].storage->bytes;
         if (reusable) {
             const auto before = allocated.load();
-            const std::vector<std::uint64_t> priority(order.begin(), order.end());
+            const std::vector<std::uint64_t> priority(entries.keys().begin(), entries.keys().end());
             for (const auto key : priority) {
                 auto entry = entries.find(key);
-                if (entry == entries.end()) continue;
+                if (!entry) continue;
                 for (int p = 0; p < 3; ++p) {
-                    const auto range = entry->second.allocations[p];
+                    const auto range = entry->allocations[p];
                     if (range.offset <= capacities[p] && range.bytes <= capacities[p] - range.offset) continue;
                     auto target = pools[p].relocate(range, capacities[p]);
                     while (!target) {
-                        const auto victim = entries.find(order.back());
-                        const bool current = victim == entry;
+                        const auto victim = *entries.oldest();
+                        const bool current = victim == key;
                         if(current&&compact(p,capacities[p])) {
-                            target=entry->second.allocations[p];
+                            target=entry->allocations[p];
                             break;
                         }
                         erase(victim);
                         evictions.fetch_add(1, std::memory_order_relaxed);
-                        if (current) { entry = entries.end(); break; }
+                        if (current) { entry = nullptr; break; }
                         target = pools[p].relocate(range, capacities[p]);
                     }
-                    if (entry == entries.end()) break;
-                    entry->second.allocations[p] = *target;
-                    auto descriptors = tyloi::metal::array(layers[entry->second.layer].banks[p].weight->descriptors_);
+                    if (!entry) break;
+                    entry->allocations[p] = *target;
+                    auto descriptors = tyloi::metal::array(layers[entry->layer].banks[p].weight->descriptors_);
                     descriptors.data<std::uint64_t>()[
-                        layers[entry->second.layer].banks[p].weight->rows_+entry->second.expert]=pools[p].address(target->offset);
+                        layers[entry->layer].banks[p].weight->rows_+entry->expert]=pools[p].address(target->offset);
                 }
             }
 
@@ -584,7 +583,7 @@ struct MlxTqExpertCache::Impl {
             preload_complete();
             return before > allocated ? before - allocated : 0;
         }
-        while (!entries.empty()) erase(entries.begin());
+        while (!entries.empty()) erase(*entries.oldest());
         const auto before = allocated.load();
         release_pools();
         try { allocate_pools(capacities); }
@@ -601,7 +600,7 @@ struct MlxTqExpertCache::Impl {
     void rebuild_free_ranges() {
         for (int p = 0; p < 3; ++p) {
             std::vector<Range> live;
-            for (const auto& [key, entry] : entries) live.push_back(entry.allocations[p]);
+            for (const auto& [key, entry] : entries.entries()) live.push_back(entry.value.allocations[p]);
             std::sort(live.begin(), live.end(), [](const auto a, const auto b) { return a.offset < b.offset; });
             auto& pool = pools[p];
             pool.free.clear(); pool.sizes.clear();
@@ -614,15 +613,15 @@ struct MlxTqExpertCache::Impl {
         }
     }
 
-    void erase(std::unordered_map<std::uint64_t, Entry>::iterator entry) {
-        --layers[entry->second.layer].cached;
+    void erase(std::uint64_t key) {
+        const auto entry = entries.find(key);
+        --layers[entry->layer].cached;
         for (int p = 0; p < 3; ++p) {
-            pools[p].release(entry->second.allocations[p]);
-            used.fetch_sub(entry->second.allocations[p].bytes, std::memory_order_relaxed);
+            pools[p].release(entry->allocations[p]);
+            used.fetch_sub(entry->allocations[p].bytes, std::memory_order_relaxed);
         }
-        order.erase(entry->second.order);
-        entries.erase(entry);
-        cached.store(entries.size(), std::memory_order_relaxed);
+        entries.erase(key);
+        cached.store(entries.entries().size(), std::memory_order_relaxed);
     }
 
     void record_hot_route(const HotRoute& route) {
@@ -638,9 +637,7 @@ struct MlxTqExpertCache::Impl {
         for (int expert = 0; expert < layer.experts; ++expert) if (selected[expert]) {
             ++count;
             const auto key = (std::uint64_t(route.layer) << 32) | std::uint32_t(expert);
-            const auto found = entries.find(key);
-            if (found == entries.end()) throw std::logic_error("TQ hot route was evicted before completion");
-            order.splice(order.begin(), order, found->second.order);
+            if (!entries.get(key)) throw std::logic_error("TQ hot route was evicted before completion");
         }
         requests.fetch_add(count, std::memory_order_relaxed);
         hits.fetch_add(count, std::memory_order_relaxed);
@@ -690,7 +687,7 @@ struct MlxTqExpertCache::Impl {
             }
             finish_pending();
         } catch (...) {
-            while (!entries.empty()) erase(entries.begin());
+            while (!entries.empty()) erase(*entries.oldest());
             throw;
         }
     }
@@ -698,7 +695,7 @@ struct MlxTqExpertCache::Impl {
     bool compact(int projection,std::size_t limit=SIZE_MAX) {
         if (resident_work) resident_work->values.wait();
         std::vector<Entry*> sorted;
-        for (auto& [key, entry] : entries) sorted.push_back(&entry);
+        for (const auto& [key, entry] : entries.entries()) sorted.push_back(entries.find(key));
         std::sort(sorted.begin(), sorted.end(), [&](auto* a, auto* b) {
             return a->allocations[projection].offset < b->allocations[projection].offset;
         });
@@ -754,15 +751,16 @@ struct MlxTqExpertCache::Impl {
             const std::unordered_set<std::uint64_t>& protected_keys, bool scan, bool preload,
             std::vector<std::uint64_t>& added, bool allow_compact) {
         auto& layer = layers[index];
+        added.reserve(added.size() + active.size());
         for (const int expert : active) {
             if (!preload) requests.fetch_add(1, std::memory_order_relaxed);
             const auto key = (std::uint64_t(index) << 32) | std::uint32_t(expert);
             auto found = entries.find(key);
-            if (found != entries.end()) {
+            if (found) {
                 if (!preload) hits.fetch_add(1, std::memory_order_relaxed);
                 if (allow_compact || !preload) {
-                    if (!(scan && found->second.prefetched)) order.splice(order.begin(), order, found->second.order);
-                    if (!preload) found->second.prefetched = false;
+                    if (!(scan && found->prefetched)) entries.get(key);
+                    if (!preload) found->prefetched = false;
                 }
                 continue;
             }
@@ -774,32 +772,35 @@ struct MlxTqExpertCache::Impl {
                 return true;
             };
             while (!fits()) {
-                auto victim = std::find_if(order.rbegin(), order.rend(), [&](auto key) { return !protected_keys.contains(key); });
-                if (victim == order.rend()) {
+                const auto victim = entries.oldest(protected_keys);
+                if (!victim) {
                     if (!allow_compact) return;
                     for (int p = 0; p < 3; ++p) compact(p);
                     if (!fits()) throw std::runtime_error("TQ expert cache working set is fragmented");
                     break;
                 }
-                erase(entries.find(*victim));
+                erase(*victim);
                 evictions.fetch_add(1, std::memory_order_relaxed);
             }
-            const auto position = order.insert(scan ? order.end() : order.begin(), key);
-            Entry entry{index, expert, {}, position};
+            std::size_t bytes = 0;
+            for (const auto size : sizes) {
+                if (size > SIZE_MAX - bytes) throw std::overflow_error("TQ cache allocation is too large");
+                bytes += size;
+            }
+            Entry entry{index, expert, {}};
             int taken = 0;
             try {
                 for (; taken < 3; ++taken) {
                     entry.allocations[taken] = pools[taken].take(sizes[taken]);
                     used.fetch_add(sizes[taken], std::memory_order_relaxed);
                 }
-                entries.emplace(key, entry);
+                entries.put(key, entry, bytes, scan);
                 ++layer.cached;
             } catch (...) {
                 for (int p = 0; p < taken; ++p) {
                     pools[p].release(entry.allocations[p]);
                     used.fetch_sub(sizes[p], std::memory_order_relaxed);
                 }
-                order.erase(position);
                 throw;
             }
             added.push_back(key);
@@ -842,12 +843,12 @@ struct MlxTqExpertCache::Impl {
             job.done.get();
             for (const auto key : job.added) {
                 auto found = entries.find(key);
-                if (found == entries.end()) throw std::logic_error("in-flight prefetch entry was evicted");
-                if (job.layer != current || !active || !std::binary_search(active->begin(), active->end(), found->second.expert)) {
-                    erase(found);
+                if (!found) throw std::logic_error("in-flight prefetch entry was evicted");
+                if (job.layer != current || !active || !std::binary_search(active->begin(), active->end(), found->expert)) {
+                    erase(key);
                     continue;
                 }
-                const auto& entry = found->second;
+                const auto& entry = *found;
                 for (int p = 0; p < 3; ++p)
                     if (!job.demand->loaded.at(entry.expert*3+p))
                         throw std::logic_error("required expert prefetch was skipped");
@@ -859,7 +860,7 @@ struct MlxTqExpertCache::Impl {
             }
         } catch (...) {
             for (const auto key : job.added)
-                if (auto entry = entries.find(key); entry != entries.end()) erase(entry);
+                if (entries.find(key)) erase(key);
             throw;
         }
     }
@@ -878,7 +879,7 @@ struct MlxTqExpertCache::Impl {
             admit(next, active, protected_keys, true, true, added, false);
             if (added.empty()) return;
             for (const auto key : added) entries.at(key).prefetched = true;
-            cached.store(entries.size(), std::memory_order_relaxed);
+            cached.store(entries.entries().size(), std::memory_order_relaxed);
             auto reads = reads_for(next, added, true);
             auto demand = std::make_shared<PrefillDemand>(layers[next].experts);
             auto done = std::async(std::launch::async, [this, demand, reads = std::move(reads)] {
@@ -902,7 +903,7 @@ struct MlxTqExpertCache::Impl {
             prefill_read_batches.fetch_add(1, std::memory_order_relaxed);
         } catch (...) {
             for (const auto key : added)
-                if (auto entry = entries.find(key); entry != entries.end()) erase(entry);
+                if (entries.find(key)) erase(key);
             throw;
         }
     }
@@ -1021,16 +1022,16 @@ struct MlxTqExpertCache::Impl {
                 publish_offsets(0, 3);
             }
             const auto read_done = Clock::now();
-            cached.store(entries.size(), std::memory_order_relaxed);
+            cached.store(entries.entries().size(), std::memory_order_relaxed);
             prepare_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-read_done).count());
         } catch (...) {
             if (stage_started) {
                 const auto failure = std::current_exception();
                 try { synchronize(default_stream(Device::gpu)); } catch (...) {}
-                for (auto key : added) if (auto found = entries.find(key); found != entries.end()) erase(found);
+                for (auto key : added) if (entries.find(key)) erase(key);
                 std::rethrow_exception(failure);
             }
-            for (auto key : added) if (auto found = entries.find(key); found != entries.end()) erase(found);
+            for (auto key : added) if (entries.find(key)) erase(key);
             throw;
         }
         try {
@@ -1066,7 +1067,7 @@ struct MlxTqExpertCache::Impl {
             if (partial) {
                 std::vector<std::uint8_t> resident(layer.experts, 0);
                 for (int expert = 0; expert < layer.experts; ++expert)
-                    resident[expert] = entries.contains((std::uint64_t(index) << 32) | std::uint32_t(expert));
+                    resident[expert] = entries.find((std::uint64_t(index) << 32) | std::uint32_t(expert)) != nullptr;
                 auto host = contiguous(astype(ids, int32));
                 auto masks = resident_routes(array(resident.begin(), Shape{layer.experts}, uint8), host, layer.experts);
                 hit_mask = std::move(masks[0]);
@@ -1133,8 +1134,7 @@ struct MlxTqExpertCache::Impl {
     std::mutex execution;
     std::vector<Layer> layers;
     std::array<Pool, 3> pools;
-    std::list<std::uint64_t> order;
-    std::unordered_map<std::uint64_t, Entry> entries;
+    tyloi::weights::Lru<std::uint64_t, Entry> entries{std::nullopt};
     std::optional<array> pending_output;
     std::optional<ResidentWork> resident_work;
     std::vector<array> hot_outputs;
@@ -1218,7 +1218,7 @@ void MlxTqExpertCache::clear() {
     impl_->finish_prefill();
     impl_->finish_pending();
     impl_->lookahead.reset();
-    while (!impl_->entries.empty()) impl_->erase(impl_->entries.begin());
+    while (!impl_->entries.empty()) impl_->erase(*impl_->entries.oldest());
 }
 
 void MlxTqExpertCache::prefill_lookahead(std::size_t layer, std::optional<std::size_t> next) {

@@ -11,8 +11,7 @@
 
 namespace tyloi::weights {
 
-// Values retain physical backing; this module owns byte admission and recency.
-// A caller holding a value keeps it alive independently of cache eviction.
+// Owns byte admission, lookup and recency; payload owners retain in-flight backing.
 template<class Key, class Value, class Hash = std::hash<Key>> class Lru {
     struct Entry {
         Value value;
@@ -43,6 +42,39 @@ public:
     std::optional<std::size_t> limit() const noexcept { return limit_; }
     bool empty() const noexcept { return entries_.empty(); }
     const auto& entries() const noexcept { return entries_; }
+    const auto& keys() const noexcept { return recent_; }
+
+    Value* find(const Key& key) {
+        const auto entry = entries_.find(key);
+        return entry == entries_.end() ? nullptr : &entry->second.value;
+    }
+    Value& at(const Key& key) { return entries_.at(key).value; }
+
+    // Key pointers remain valid until their entry is erased.
+    const Key* oldest() const noexcept {
+        return recent_.empty() ? nullptr : &recent_.back();
+    }
+    template<class Set> const Key* oldest(const Set& protected_keys) const {
+        for (auto key = recent_.rbegin(); key != recent_.rend(); ++key)
+            if (!protected_keys.contains(*key)) return &*key;
+        return nullptr;
+    }
+
+    bool erase(const Key& key) {
+        const auto entry = entries_.find(key);
+        if (entry == entries_.end()) return false;
+        assert(entry->second.bytes <= used_);
+        used_ -= entry->second.bytes;
+        recent_.erase(entry->second.recent);
+        entries_.erase(entry);
+        return true;
+    }
+
+    void clear() noexcept {
+        entries_.clear();
+        recent_.clear();
+        used_ = 0;
+    }
 
     Value* get(const Key& key) {
         const auto entry = entries_.find(key);
@@ -63,14 +95,14 @@ public:
         return true;
     }
 
-    void put(const Key& key, Value value, std::size_t bytes) {
+    void put(const Key& key, Value value, std::size_t bytes, bool cold = false) {
         if (entries_.count(key)) throw std::logic_error("duplicate weight cache entry");
         if (!reserve(bytes)) return;
-        recent_.push_front(key);
+        const auto position = recent_.insert(cold ? recent_.end() : recent_.begin(), key);
         try {
-            entries_.emplace(key, Entry{std::move(value), bytes, recent_.begin()});
+            entries_.emplace(key, Entry{std::move(value), bytes, position});
         } catch (...) {
-            recent_.pop_front();
+            recent_.erase(position);
             throw;
         }
         used_ += bytes;
