@@ -1,3 +1,4 @@
+#include "engine/config.h"
 #include "engine/backends/metal/executor/executor.h"
 #include "engine/weights/memory.h"
 #include "engine/backends/metal/native/memory.h"
@@ -797,7 +798,7 @@ std::shared_ptr<mfq::cache::PagedPrefixCache> make_metal_paged_cache(
         if (!container.source_paths().empty()) config.model_path = container.source_paths().front();
         config.compatibility_key = metal_prefix_cache_compatibility_key(
             container, Codec::name, context_size);
-        if constexpr (recurrent) config.compatibility_key += mfq::metal::mlx_kv_quantization_tag();
+        if constexpr (recurrent) config.compatibility_key += tyloi::engine::kv_quantization_tag();
         if constexpr (recurrent) {
             const auto native_context = [&] {
                 if constexpr (std::is_same_v<Runtime, mfq::metal::MlxQwen4CausalLm>)
@@ -2491,7 +2492,7 @@ private:
             {"kv_quantization_supported", (std::is_same_v<Runtime, mfq::metal::MlxQwen4CausalLm> ||
                 std::is_same_v<Runtime, mfq::metal::MlxQwen35CausalLm>) ? 1.0 : 0.0},
             {"kv_quantization_bits", (std::is_same_v<Runtime, mfq::metal::MlxQwen4CausalLm> ||
-                std::is_same_v<Runtime, mfq::metal::MlxQwen35CausalLm>) ? mfq::metal::mlx_kv_quantization().bits : 0.0},
+                std::is_same_v<Runtime, mfq::metal::MlxQwen35CausalLm>) ? tyloi::engine::kv_quantization().bits : 0.0},
             {"mlx_cache_bytes", static_cast<double>(tyloi::metal::cache_memory())},
             {"mlx_cache_limit_bytes", static_cast<double>(allocator_cache_limit)},
             {"mlx_peak_bytes", static_cast<double>(tyloi::metal::peak_memory())},

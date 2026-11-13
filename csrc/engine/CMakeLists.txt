@@ -55,6 +55,7 @@ add_library(mfq-engine STATIC
     state/qsa_sequence.cpp
     state/recurrent.cpp
     state/kv_view.cpp
+    state/kv_layout.cpp
 )
 if(TYLOINFER_BUILD_CUDA_ENGINE)
     target_compile_definitions(mfq-engine PUBLIC TYLOINFER_NATIVE_CUDA=1)

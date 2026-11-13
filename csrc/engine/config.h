@@ -3,13 +3,18 @@
 #include "requests/policy.h"
 #include "state/session/snapshot.h"
 #include "tensor.h"
+#include "state/kv_layout.h"
 
 #include <cstdint>
 #include <filesystem>
+#include <string>
 #include <unordered_set>
 #include <vector>
 
 namespace tyloi::engine {
+
+state::KvQuantization kv_quantization();
+std::string kv_quantization_tag();
 
 struct SessionCacheConfig {
     SessionSnapshotCacheConfig snapshots;

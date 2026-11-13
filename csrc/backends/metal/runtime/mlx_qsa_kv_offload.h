@@ -14,7 +14,7 @@ struct MlxQsaKvSnapshot {
     int dimension = 0;
     int maximum = 0;
     mlx::core::Dtype dtype = mlx::core::float16;
-    MlxKvQuantization quantization;
+    tyloi::state::KvQuantization quantization;
     MlxKvCacheSnapshot materialize(int start, int count) const;
     MlxQsaKvSnapshot prefix(int position) const;
 };
@@ -62,7 +62,7 @@ public:
     std::size_t resident_bytes() const noexcept;
 private:
     std::shared_ptr<QsaKvStore> store_;
-    MlxKvQuantization quantization_;
+    tyloi::state::KvQuantization quantization_;
     QsaKvSequence rows_;
     int heads_, dimension_, maximum_, ratio_;
     mlx::core::Dtype dtype_ = mlx::core::float16;

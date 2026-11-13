@@ -1,8 +1,7 @@
-#include "mlx_kv_quantization.h"
+#include "engine/backends/metal/ops/attention/kv.h"
 
 #include <algorithm>
 #include <cmath>
-#include <cstdlib>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -295,27 +294,9 @@ const Kernel& attention_output() {
 }
 }
 
-int MlxKvQuantization::key_bits() const noexcept { return static_cast<int>(std::floor(bits)); }
-int MlxKvQuantization::value_bits() const noexcept { return static_cast<int>(std::ceil(bits)); }
-bool mlx_kv_bits_valid(double bits) {
-    return bits == 0 || bits == 2 || bits == 2.5 || bits == 3 || bits == 3.5 || bits == 4 || bits == 6 || bits == 8;
-}
-MlxKvQuantization mlx_kv_quantization() {
-    const char* text = std::getenv("TYLOINFER_KV_TURBOQUANT_BITS");
-    if (!text || !*text) return {};
-    std::size_t consumed = 0;
-    const double bits = std::stod(text, &consumed);
-    if (consumed != std::string(text).size() || !mlx_kv_bits_valid(bits))
-        throw std::invalid_argument("invalid TurboQuant KV bit width");
-    return {bits};
-}
 int mlx_kv_packed_width(int dimension, int bits) {
     if (bits < 2 || bits > 8) throw std::invalid_argument("invalid TurboQuant component bits");
     return 1 + (rotation_width(dimension) * bits + 31) / 32;
-}
-std::string mlx_kv_quantization_tag() {
-    const auto settings = mlx_kv_quantization();
-    return settings.enabled() ? "-tq-v1-k" + std::to_string(settings.key_bits()) + "v" + std::to_string(settings.value_bits()) : "";
 }
 array mlx_kv_encode(const array& input, int bits, bool value) {
     const int dimension = input.shape(-1), width = rotation_width(dimension);
@@ -344,9 +325,9 @@ array mlx_kv_decode(const array& input, int dimension, int bits, bool value, mlx
 }
 
 array mlx_kv_sparse_attention(const array& query, const array& key, const array& value,
-    const std::optional<array>& blocks, MlxKvQuantization quantization,
+    const std::optional<array>& blocks, tyloi::state::KvQuantization quantization,
     int position, int query_offset, int ratio, int budget, const std::optional<array>& key_mask) {
-    if (!quantization.enabled() || !mlx_kv_bits_valid(quantization.bits) || query.ndim() != 4 ||
+    if (!quantization.enabled() || !tyloi::state::kv_bits_valid(quantization.bits) || query.ndim() != 4 ||
         key.ndim() != 4 || value.ndim() != 4 || key.dtype() != mlx::core::uint32 || value.dtype() != mlx::core::uint32 ||
         query.shape(0) != key.shape(0) || key.shape(0) != value.shape(0) || key.shape(1) != value.shape(1) ||
         query.shape(0) <= 0 || query.shape(1) <= 0 || key.shape(1) <= 0 || query.shape(1) % key.shape(1) ||

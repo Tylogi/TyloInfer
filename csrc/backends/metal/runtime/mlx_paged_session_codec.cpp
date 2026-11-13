@@ -254,7 +254,7 @@ struct DecodedLayer {
     int index_start = 0;
     int index_ratio = 0;
     Dtype dtype = mlx::core::float16;
-    MlxKvQuantization quantization;
+    tyloi::state::KvQuantization quantization;
     SerializedTensor first;
     SerializedTensor second;
     std::optional<SerializedTensor> index;
@@ -423,7 +423,7 @@ DecodedLayer read_layer(Reader& reader) {
     layer.exact = (flags & 1) != 0;
     if (flags & 2) {
         layer.quantization.bits = (flags >> 8) / 2.0;
-        if (!layer.quantization.enabled() || !mlx_kv_bits_valid(layer.quantization.bits))
+        if (!layer.quantization.enabled() || !tyloi::state::kv_bits_valid(layer.quantization.bits))
             throw std::runtime_error("invalid TurboQuant KV checkpoint bit width");
     } else if (flags & 0xff00) throw std::runtime_error("invalid KV checkpoint quantization flags");
     layer.batch = reader.scalar<std::int32_t>("batch");

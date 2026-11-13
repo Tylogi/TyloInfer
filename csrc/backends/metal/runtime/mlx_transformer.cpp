@@ -1,6 +1,8 @@
 #include "mlx_transformer.h"
 #include "mlx_resident_budget.h"
 #include "mlx_staged_attention.h"
+#include "engine/config.h"
+#include "engine/state/kv_layout.h"
 
 #include "engine/backends/metal/ops/tensor.h"
 #include "engine/backends/metal/native/tensor/tensor.h"
@@ -720,6 +722,32 @@ array mlx_circular_cache_history(
     return mlx::core::take(cache, indices, 1);
 }
 
+namespace {
+array initial_kv_key(int batch, int heads, int maximum_sequence, int head_dimension,
+    int initial_capacity, mlx::core::Dtype dtype, tyloi::state::KvQuantization quantization) {
+    if (batch <= 0 || heads <= 0 || maximum_sequence <= 0 || head_dimension <= 0 ||
+        initial_capacity < 0 || (dtype != mlx::core::float16 &&
+        dtype != mlx::core::bfloat16 && dtype != mlx::core::float32))
+        throw std::runtime_error("invalid KV cache dimensions or dtype");
+    const int capacity = std::min(initial_capacity, maximum_sequence);
+    const auto layout = tyloi::state::kv_layout(batch, heads, capacity, head_dimension,
+        false, tyloi::metal::scalar_type(dtype), quantization);
+    MlxResidentBudgetScope::reserve(layout.bytes);
+    return mlx::core::zeros(Shape{batch, heads, capacity, static_cast<int>(layout.key_width)},
+        quantization.enabled() ? mlx::core::uint32 : dtype);
+}
+
+std::size_t sequence_bytes(int batch, int capacity, int width, mlx::core::Dtype dtype) {
+    tyloi::TensorView view;
+    view.rank = 3;
+    view.sizes[0] = batch;
+    view.sizes[1] = capacity;
+    view.sizes[2] = width;
+    view.scalar_type = tyloi::metal::scalar_type(dtype);
+    return view.nbytes();
+}
+}
+
 MlxKvCache::MlxKvCache(
     int batch,
     int heads,
@@ -733,26 +761,11 @@ MlxKvCache::MlxKvCache(
       maximum_sequence_(maximum_sequence),
       head_dimension_(head_dimension),
       dtype_(dtype),
-      quantization_(quantization_allowed ? mlx_kv_quantization() : MlxKvQuantization{}),
-      key_(mlx::core::zeros(
-          Shape{
-              batch,
-              heads,
-              std::min(std::max(initial_capacity, 0), maximum_sequence),
-              quantization_.enabled() ? mlx_kv_packed_width(head_dimension, quantization_.key_bits()) : head_dimension,
-          },
-          quantization_.enabled() ? mlx::core::uint32 : dtype)),
+      quantization_(quantization_allowed ? tyloi::engine::kv_quantization() : tyloi::state::KvQuantization{}),
+      key_(initial_kv_key(batch, heads, maximum_sequence, head_dimension, initial_capacity,
+          dtype, quantization_)),
       value_(mlx::core::zeros(Shape{batch, heads, key_.shape(2),
           quantization_.enabled() ? mlx_kv_packed_width(head_dimension, quantization_.value_bits()) : head_dimension}, key_.dtype())) {
-    if (batch_ <= 0 || heads_ <= 0 ||
-        maximum_sequence_ <= 0 || head_dimension_ <= 0 ||
-        initial_capacity < 0 ||
-        (dtype_ != mlx::core::float16 &&
-         dtype_ != mlx::core::bfloat16 &&
-         dtype_ != mlx::core::float32)) {
-        throw std::runtime_error("invalid KV cache dimensions or dtype");
-    }
-    MlxResidentBudgetScope::reserve(key_.nbytes() + value_.nbytes());
     resources_.set({key_.nbytes() + value_.nbytes(), static_cast<std::size_t>(batch_)});
 }
 
@@ -781,8 +794,8 @@ void MlxKvCache::ensure_capacity(int required) {
         next_capacity,
         key_.shape(3),
     };
-    MlxResidentBudgetScope::reserve(std::size_t(batch_) * heads_ * next_capacity *
-        (key_.shape(3) + value_.shape(3)) * key_.dtype().size());
+    MlxResidentBudgetScope::reserve(tyloi::state::kv_layout(batch_, heads_, next_capacity,
+        head_dimension_, false, tyloi::metal::scalar_type(dtype_), quantization_).bytes);
     auto next_key = mlx::core::zeros(next_shape, key_.dtype());
     auto next_value_shape = next_shape; next_value_shape[3] = value_.shape(3);
     auto next_value = mlx::core::zeros(next_value_shape, value_.dtype());
@@ -931,9 +944,13 @@ void MlxKvCache::restore_snapshot(
     }
     const Shape allocation_shape{
         batch_, heads_, snapshot.capacity, key_.shape(3)};
-    MlxResidentBudgetScope::reserve(static_cast<std::size_t>(batch_) * heads_ * snapshot.capacity *
-        (key_.shape(3) + value_.shape(3)) * key_.dtype().size()
-        + snapshot.key.nbytes() + snapshot.value.nbytes());
+    const auto allocation = tyloi::state::kv_layout(batch_, heads_, snapshot.capacity,
+        head_dimension_, false, tyloi::metal::scalar_type(dtype_), quantization_).bytes;
+    const auto copies = tyloi::state::kv_layout(batch_, heads_, snapshot.position,
+        head_dimension_, false, tyloi::metal::scalar_type(dtype_), quantization_).bytes;
+    if (copies > std::numeric_limits<std::size_t>::max() - allocation)
+        throw std::overflow_error("KV tensor size overflow");
+    MlxResidentBudgetScope::reserve(allocation + copies);
     auto key = mlx::core::zeros(allocation_shape, key_.dtype());
     auto value = mlx::core::zeros(Shape{batch_, heads_, snapshot.capacity, value_.shape(3)}, value_.dtype());
     key = mlx::core::slice_update(
@@ -1060,11 +1077,11 @@ void MlxSequenceCache::reset(
     }
     const int capacity = std::min(
         maximum_sequence_, initial_capacity);
-    MlxResidentBudgetScope::reserve(std::size_t(batch) * capacity * width_ * mlx::core::size_of(dtype_));
+    MlxResidentBudgetScope::reserve(sequence_bytes(batch, capacity, width_, dtype_));
+    auto values = mlx::core::zeros(Shape{batch, capacity, width_}, dtype_);
+    values_ = std::move(values);
     batch_ = batch;
     position_ = 0;
-    values_ = mlx::core::zeros(
-        Shape{batch_, capacity, width_}, dtype_);
     resources_.set({values_->nbytes(), static_cast<std::size_t>(batch_)});
 }
 
@@ -1133,9 +1150,13 @@ void MlxSequenceCache::ensure_capacity(int required) {
     }
     int capacity = values_->shape(1);
     while (capacity < required) {
-        capacity = std::min(maximum_sequence_, capacity * 2);
+        if (capacity > maximum_sequence_ / 2) {
+            capacity = maximum_sequence_;
+            break;
+        }
+        capacity *= 2;
     }
-    MlxResidentBudgetScope::reserve(std::size_t(batch_) * capacity * width_ * mlx::core::size_of(dtype_));
+    MlxResidentBudgetScope::reserve(sequence_bytes(batch_, capacity, width_, dtype_));
     auto expanded = mlx::core::zeros(
         Shape{batch_, capacity, width_}, dtype_);
     expanded = mlx::core::slice_update(

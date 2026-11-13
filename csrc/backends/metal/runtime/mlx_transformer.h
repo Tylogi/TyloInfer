@@ -1,7 +1,7 @@
 #pragma once
 
 #include "mlx_resource_telemetry.h"
-#include "mlx_kv_quantization.h"
+#include "engine/backends/metal/ops/attention/kv.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -58,7 +58,7 @@ struct MlxKvCacheSnapshot {
     mlx::core::Dtype dtype = mlx::core::float16;
     mlx::core::array key = mlx::core::array(0.0f);
     mlx::core::array value = mlx::core::array(0.0f);
-    MlxKvQuantization quantization;
+    tyloi::state::KvQuantization quantization;
 
     std::size_t nbytes() const noexcept {
         return key.nbytes() + value.nbytes();
@@ -197,7 +197,7 @@ private:
     int maximum_sequence_;
     int head_dimension_;
     mlx::core::Dtype dtype_;
-    MlxKvQuantization quantization_;
+    tyloi::state::KvQuantization quantization_;
     mlx::core::array key_;
     mlx::core::array value_;
     int position_ = 0;

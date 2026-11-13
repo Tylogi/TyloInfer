@@ -9,6 +9,21 @@
 
 namespace tyloi::engine {
 
+state::KvQuantization kv_quantization() {
+    const char* text = std::getenv("TYLOINFER_KV_TURBOQUANT_BITS");
+    if (!text || !*text) return {};
+    std::size_t consumed = 0;
+    const double bits = std::stod(text, &consumed);
+    if (consumed != std::string(text).size() || !state::kv_bits_valid(bits))
+        throw std::invalid_argument("invalid TurboQuant KV bit width");
+    return {bits};
+}
+
+std::string kv_quantization_tag() {
+    const auto settings = kv_quantization();
+    return settings.enabled() ? "-tq-v1-k" + std::to_string(settings.key_bits()) + "v" + std::to_string(settings.value_bits()) : "";
+}
+
 std::uint64_t environment_uint64(
         const char* name, std::uint64_t fallback) {
     const char* value = std::getenv(name);

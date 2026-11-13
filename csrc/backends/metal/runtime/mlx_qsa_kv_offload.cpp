@@ -1,3 +1,4 @@
+#include "engine/config.h"
 #include "mlx_qsa_kv_offload.h"
 #include "qwen4_ops.h"
 #include "mlx_resident_budget.h"
@@ -71,7 +72,7 @@ std::shared_ptr<QsaKvStore> mlx_configure_qsa_kv_offload(
 
 MlxQsaKvOffload::MlxQsaKvOffload(std::shared_ptr<QsaKvStore> store,
     int heads, int dimension, int maximum, int ratio)
-    : store_(std::move(store)), quantization_(mlx_kv_quantization()),
+    : store_(std::move(store)), quantization_(tyloi::engine::kv_quantization()),
       rows_(store_, quantization_.enabled() ? static_cast<std::size_t>(heads) * 4 *
           (mlx_kv_packed_width(dimension, quantization_.key_bits()) + mlx_kv_packed_width(dimension, quantization_.value_bits()))
           : static_cast<std::size_t>(heads) * dimension * 4, ratio, 1),
