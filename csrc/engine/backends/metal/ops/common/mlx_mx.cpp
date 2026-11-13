@@ -2,7 +2,7 @@
 
 #include "engine/backends/metal/native/device.h"
 #include "mlx_transformer.h"
-#include "engine/backends/metal/native/resident_allocations.h"
+#include "engine/backends/metal/native/allocation.h"
 
 #include <algorithm>
 #include <array>
@@ -212,7 +212,7 @@ int checked_dimension(std::uint64_t value, const char* name) {
 template <typename T>
 array make_array(std::span<const T> values, Shape shape) {
     auto result = array(values.begin(), std::move(shape));
-    tyloi::metal::ResidentAllocations::track(result);
+    tyloi::metal::AllocationScope::record(result);
     return result;
 }
 

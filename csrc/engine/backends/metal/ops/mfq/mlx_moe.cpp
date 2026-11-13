@@ -6,7 +6,7 @@
 #include "mlx_kernel_prepare.h"
 #include "engine/backends/metal/native/kernel.h"
 #include "engine/backends/metal/kernels/source.h"
-#include "engine/backends/metal/native/resident_allocations.h"
+#include "engine/backends/metal/native/allocation.h"
 #include "mlx_nvq_decode.h"
 #include "mlx_resource_telemetry.h"
 #include "mlx_resident_budget.h"
@@ -2570,7 +2570,7 @@ array allocate_packed_array(std::size_t bytes, Dtype dtype) {
     const Shape shape = layout.is_matrix()
         ? Shape{layout.rows, layout.columns} : Shape{layout.columns};
     auto result = array(mlx::core::allocator::malloc(bytes), shape, dtype);
-    tyloi::metal::ResidentAllocations::track(result);
+    tyloi::metal::AllocationScope::record(result);
     return result;
 }
 
@@ -2717,7 +2717,7 @@ public:
                 source != nullptr && source->dtype() == dtype) {
                 auto result = mlx::core::reshape(*source, shape);
                 result.eval();
-                tyloi::metal::ResidentAllocations::track(result);
+                tyloi::metal::AllocationScope::record(result);
                 return result;
             }
         }
@@ -2755,7 +2755,7 @@ public:
             auto result = mlx::core::reshape(mlx::core::view(
                 mlx::core::concatenate(std::move(parts), 0, mlx::core::Device::gpu), dtype), shape);
             result.eval();
-            tyloi::metal::ResidentAllocations::track(result);
+            tyloi::metal::AllocationScope::record(result);
             return result;
         }
         auto result = arena ? array(shape, dtype, nullptr, {}) : allocate_packed_array(bytes, dtype);
@@ -2892,7 +2892,7 @@ array make_int32_array(
         return result;
     }
     auto result = array(values.begin(), std::move(shape));
-    tyloi::metal::ResidentAllocations::track(result);
+    tyloi::metal::AllocationScope::record(result);
     return result;
 }
 
@@ -10048,6 +10048,7 @@ std::vector<MlxMfeWeight> MlxMfeOffloadCache::grouped_mfe(
             offsets.push_back(checked_add(offsets.back(), work->count, "MFE grouped expert tasks"));
         }
     }
+    auto* allocation_log = tyloi::metal::AllocationScope::log();
     // Prefill has wide CPU parsing work; small route sets mostly contend on
     // the allocator's resource/residency lock once the I/O queue is saturated.
     if (prefix_ready) {
@@ -10083,6 +10084,7 @@ std::vector<MlxMfeWeight> MlxMfeOffloadCache::grouped_mfe(
             impl_->io_workers.run(0, offsets.back(), 1,
                 static_cast<int>(std::min<std::size_t>(offsets.back(), std::min(8u, workers))),
                 [&](std::int64_t begin, std::int64_t end) {
+                    tyloi::metal::AllocationScope allocation_scope(allocation_log);
                     while (begin < end) {
                         const auto index = std::upper_bound(offsets.begin(), offsets.end(),
                             static_cast<std::size_t>(begin)) - offsets.begin() - 1;
@@ -10124,6 +10126,7 @@ std::vector<MlxMfeWeight> MlxMfeOffloadCache::grouped_mfe(
         static_cast<int>(std::min(std::max<std::size_t>(1, offsets.back()),
             std::size_t(prefill_scan ? workers : std::min(kMfeSmallMReadWorkers, workers)))),
         [&](std::int64_t begin, std::int64_t end) {
+            tyloi::metal::AllocationScope allocation_scope(allocation_log);
             while (begin < end) {
                 const auto index = std::upper_bound(offsets.begin(), offsets.end(),
                     static_cast<std::size_t>(begin)) - offsets.begin() - 1;

@@ -5,7 +5,7 @@
 #include "engine/weights/memory.h"
 #include "mfq_container.h"
 #include "mfq_tq_embedded.h"
-#include "engine/backends/metal/native/resident_allocations.h"
+#include "engine/backends/metal/native/allocation.h"
 #include "mlx_moe_ops.h"
 #include "engine/backends/metal/native/device.h"
 #include "engine/backends/metal/native/env.h"
@@ -1325,7 +1325,7 @@ array copy_array(const std::uint8_t* data, std::size_t count, Dtype dtype) {
     const std::int64_t shape[]{static_cast<std::int64_t>(count)};
     const auto tensor = tyloi::metal::copy_from_host(data, shape, tyloi::metal::scalar_type(dtype));
     auto result = tyloi::metal::array(tensor);
-    tyloi::metal::ResidentAllocations::track(result);
+    tyloi::metal::AllocationScope::record(result);
     return result;
 }
 
@@ -1344,7 +1344,7 @@ array prepare_scales(std::span<const std::uint8_t> blob, std::size_t offset,
             target[group] = anchor * float(relative[code]);
         }
     }
-    tyloi::metal::ResidentAllocations::track(result);
+    tyloi::metal::AllocationScope::record(result);
     return result;
 }
 } // namespace
@@ -1440,8 +1440,8 @@ MlxTqWeight MlxTqWeight::from_expert_rows(const MlxMappedTqRows& table,
         }
         base += range.bytes / 4;
     }
-    if (!word_pool) tyloi::metal::ResidentAllocations::track(packed);
-    tyloi::metal::ResidentAllocations::track(descriptors); tyloi::metal::ResidentAllocations::track(scales);
+    if (!word_pool) tyloi::metal::AllocationScope::record(packed);
+    tyloi::metal::AllocationScope::record(descriptors); tyloi::metal::AllocationScope::record(scales);
     const auto resident_bytes = 64 + words * 4 + descriptors.nbytes() + scales.nbytes();
     return MlxTqWeight(std::move(packed), std::move(descriptors), std::move(scales), rows,
         width, table.width(), count, columns ? out : gs, columns ? 2 : 0, resident_bytes, word_pool != nullptr);
@@ -1583,8 +1583,8 @@ MlxTqWeight MlxTqWeight::concatenate(const std::vector<MlxTqWeight>& weights, bo
         word_base += weight.words_.numel(); row_base += weight.rows_;
         projection_base += weight.output_size();
     }
-    tyloi::metal::ResidentAllocations::track(packed); tyloi::metal::ResidentAllocations::track(descriptors);
-    if (!first.columns_) tyloi::metal::ResidentAllocations::track(scales);
+    tyloi::metal::AllocationScope::record(packed); tyloi::metal::AllocationScope::record(descriptors);
+    if (!first.columns_) tyloi::metal::AllocationScope::record(scales);
     return MlxTqWeight(std::move(packed), std::move(descriptors), std::move(scales), rows,
         first.width_, first.input_columns_, projections ? first.experts_ : int(experts),
         first.group_size_, first.columns_, 64 + words * 4 + rows * 8 + scale_bytes);

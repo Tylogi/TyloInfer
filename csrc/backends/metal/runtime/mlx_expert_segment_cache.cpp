@@ -3,6 +3,7 @@
 #include "mlx_resource_telemetry.h"
 #include "engine/backends/metal/native/pool.h"
 #include "engine/backends/metal/native/resident_allocations.h"
+#include "engine/backends/metal/native/allocation.h"
 #include "engine/backends/cpu/native/host_parallel.h"
 #include "engine/weights/lru.h"
 
@@ -85,7 +86,7 @@ struct MlxExpertSegmentCache::Impl {
             const std::vector<std::uint64_t> empty(layer.source.experts, 0);
             for (std::size_t i = 0; i < layer.source.fields.size(); ++i) {
                 layer.tables.emplace_back(empty.begin(), Shape{layer.source.experts}, uint64);
-                tyloi::metal::ResidentAllocations::track(layer.tables.back());
+                tyloi::metal::AllocationScope::record(layer.tables.back());
             }
         }
         prefill_next_rows.assign(layers.size(), SIZE_MAX);

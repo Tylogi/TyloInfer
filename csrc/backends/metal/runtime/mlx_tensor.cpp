@@ -3,7 +3,7 @@
 #include "mlx_moe_ops.h"
 #include "engine/backends/metal/native/env.h"
 #include "mlx_transformer.h"
-#include "engine/backends/metal/native/resident_allocations.h"
+#include "engine/backends/metal/native/allocation.h"
 #include "engine/backends/metal/native/tensor/tensor.h"
 #include "engine/backends/metal/ops/tensor.h"
 #include "engine/weights/memory.h"
@@ -487,7 +487,7 @@ array load_dense_array(
         cursor.data(), shape, tyloi::metal::scalar_type(dtype));
     tyloi::weights::observe_weight(tensor);
     auto result = tyloi::metal::array(tensor);
-    tyloi::metal::ResidentAllocations::track(result);
+    tyloi::metal::AllocationScope::record(result);
     return result;
 }
 

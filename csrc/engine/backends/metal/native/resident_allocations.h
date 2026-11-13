@@ -1,5 +1,7 @@
 #pragma once
 
+#include "allocation.h"
+
 #include <mlx/array.h>
 #include <mlx/backend/metal/device.h>
 
@@ -14,11 +16,6 @@
 namespace tyloi::metal {
 
 class ResidentAllocations {
-    struct Capture {
-        std::mutex mutex;
-        std::vector<std::weak_ptr<mlx::core::array::Data>> allocations;
-        std::size_t pending_bytes = 0;
-    };
     struct Allocation {
         std::weak_ptr<mlx::core::array::Data> owner;
         NS::SharedPtr<MTL::Buffer> buffer;
@@ -27,11 +24,7 @@ class ResidentAllocations {
     };
 
 public:
-    static void begin_load();
-
-    static void track(const mlx::core::array& value);
-
-    static std::unique_ptr<ResidentAllocations> finish_load(std::size_t limit);
+    static std::unique_ptr<ResidentAllocations> take(AllocationScope::Log& log, std::size_t limit);
 
     static std::unique_ptr<ResidentAllocations> retain_arrays(
         const std::vector<mlx::core::array>& values, std::size_t limit, bool indirect = false);
@@ -47,6 +40,7 @@ public:
     std::size_t bytes() const noexcept;
 
 private:
+    friend class AllocationScope;
     static void activate();
 
     explicit ResidentAllocations(
@@ -54,8 +48,6 @@ private:
         std::size_t limit, bool indirect = false);
 
     static bool supported();
-
-    static std::shared_ptr<Capture>& capture();
 
     std::vector<NS::SharedPtr<MTL::ResidencySet>> sets_;
     std::vector<std::shared_ptr<mlx::core::array::Data>> indirect_owners_;

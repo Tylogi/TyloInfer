@@ -1,5 +1,4 @@
 #include "memory.h"
-#include "resident_allocations.h"
 
 #include <algorithm>
 #include <atomic>
@@ -136,7 +135,6 @@ void set_wired_limit(std::size_t limit) {
     }
     mlx::core::set_wired_limit(limit);
     configured_wired_limit.store(limit, std::memory_order_relaxed);
-    ResidentAllocations::begin_load();
 }
 void refresh_residency() {
     const auto limit = wired_limit();

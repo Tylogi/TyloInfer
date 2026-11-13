@@ -23,34 +23,20 @@ static auto allocation_buffer(Data& data) {
 
 }
 
-void ResidentAllocations::begin_load() {
-    std::atomic_store_explicit(&capture(), std::make_shared<Capture>(), std::memory_order_release);
-}
-
-void ResidentAllocations::track(const mlx::core::array& value) {
-    const auto current = std::atomic_load_explicit(&capture(), std::memory_order_acquire);
-    if (!current || !value.data_shared_ptr()) return;
-    std::unique_lock lock(current->mutex);
-    current->allocations.push_back(value.data_shared_ptr());
-    current->pending_bytes += value.buffer_size();
-    if (current->pending_bytes < (std::size_t{4} << 30)) return;
-    current->pending_bytes = 0;
-    lock.unlock();
-    activate();
-}
-
-std::unique_ptr<ResidentAllocations> ResidentAllocations::finish_load(std::size_t limit) {
-    const auto current = std::atomic_exchange_explicit(
-        &capture(), std::shared_ptr<Capture>{}, std::memory_order_acq_rel);
-    if (!current || limit == 0 || !supported()) return {};
+std::unique_ptr<ResidentAllocations> ResidentAllocations::take(AllocationScope::Log& log, std::size_t limit) {
+    std::vector<std::weak_ptr<mlx::core::array::Data>> allocations;
+    {
+        std::lock_guard lock(log.mutex);
+        allocations.swap(log.allocations);
+        log.pending_bytes = 0;
+        log.recording = false;
+    }
+    if (limit == 0 || !supported()) return {};
     std::vector<std::shared_ptr<mlx::core::array::Data>> live;
     std::unordered_set<const void*> seen;
-    {
-        std::lock_guard lock(current->mutex);
-        for (const auto& weak : current->allocations) {
-            if (auto data = weak.lock(); data && allocation_buffer(*data).ptr()
-                && seen.insert(allocation_buffer(*data).ptr()).second) live.push_back(std::move(data));
-        }
+    for (const auto& weak : allocations) {
+        if (auto data = weak.lock(); data && allocation_buffer(*data).ptr()
+            && seen.insert(allocation_buffer(*data).ptr()).second) live.push_back(std::move(data));
     }
     if (live.empty()) return {};
     auto residency = std::unique_ptr<ResidentAllocations>(new ResidentAllocations(live, limit));
@@ -225,9 +211,4 @@ bool ResidentAllocations::supported() {
     return false;
 }
 
-std::shared_ptr<ResidentAllocations::Capture>& ResidentAllocations::capture() {
-    static std::shared_ptr<Capture> value;
-    return value;
-}
-
-}
+} // namespace tyloi::metal

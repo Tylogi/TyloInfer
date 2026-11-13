@@ -3,7 +3,7 @@
 #include "engine/backends/metal/native/kernel.h"
 #include "engine/backends/metal/native/memory.h"
 #include "mlx_resident_budget.h"
-#include "engine/backends/metal/native/resident_allocations.h"
+#include "engine/backends/metal/native/allocation.h"
 
 #include "tyloinfer/nint_blob.h"
 #include "mfq_mfe_prefill_embedded.h"
@@ -1151,7 +1151,7 @@ array make_array(
     const std::vector<T, Allocator>& values,
     Shape shape) {
     auto result = array(values.begin(), std::move(shape));
-    tyloi::metal::ResidentAllocations::track(result);
+    tyloi::metal::AllocationScope::record(result);
     return result;
 }
 

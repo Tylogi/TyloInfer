@@ -1,5 +1,7 @@
 #include "engine/config.h"
 #include "engine/backends/metal/executor/executor.h"
+#include "engine/backends/metal/native/allocation.h"
+#include "engine/backends/metal/native/resident_allocations.h"
 #include "engine/weights/memory.h"
 #include "engine/backends/metal/native/memory.h"
 #include "mfq_container.h"
@@ -1834,6 +1836,7 @@ public:
         std::shared_ptr<Cache> cache, Loader loader, PagedCacheFactory factory,
         std::shared_ptr<std::int64_t> context, std::shared_ptr<tyloi::metal::Executor> executor,
         std::shared_ptr<tyloi::weights::Memory> ledger,
+        std::shared_ptr<tyloi::metal::AllocationScope::Log> allocations,
         int chunk_size, std::size_t cache_limit,
         mfq::metal::MlxEngineComponents components,
         mfq::metal::MlxSamplingParams prepare_sampling, int prepare_routes, int prepare_vocab,
@@ -1841,7 +1844,8 @@ public:
         : runtime_mutex(std::move(mutex)), runtime_holder(std::move(runtime)),
           session_cache(std::move(cache)), load_runtime(std::move(loader)),
           paged_cache_factory(std::move(factory)), loaded_context(std::move(context)),
-          runtime_executor(std::move(executor)), weight_memory(std::move(ledger)), prefill_chunk_size(chunk_size),
+          runtime_executor(std::move(executor)), weight_memory(std::move(ledger)),
+          allocation_log(std::move(allocations)), prefill_chunk_size(chunk_size),
           allocator_cache_limit(cache_limit), runtime_components(std::move(components)),
           preparation_sampling(prepare_sampling), preparation_routes(prepare_routes),
           preparation_vocab(prepare_vocab), warmup_prompt(std::move(prepare_prompt)),
@@ -2112,7 +2116,8 @@ public:
         weight_residency.reset();
         runtime_holder->reset();
         release_model_load_staging_memory(runtime_executor);
-        tyloi::metal::ResidentAllocations::begin_load();
+        allocation_log->clear();
+        tyloi::metal::AllocationScope allocation_scope(allocation_log.get());
         const auto started =
             std::chrono::steady_clock::now();
         std::cout
@@ -2163,7 +2168,7 @@ public:
                 weight_residency.reset();
                 runtime_holder->reset();
                 release_model_load_staging_memory(runtime_executor);
-                tyloi::metal::ResidentAllocations::begin_load();
+                allocation_log->clear();
                 mfq::metal::MlxKernelPreparation preparation(static_cast<int>(previous_context), prefill_chunk_size);
                 preparation.set_routes(preparation_routes);
                 runtime_holder->emplace(
@@ -2452,8 +2457,8 @@ private:
     }
     void capture_weight_residency() {
         tyloi::metal::refresh_residency();
-        weight_residency = tyloi::metal::ResidentAllocations::finish_load(
-            tyloi::metal::wired_limit());
+        weight_residency = tyloi::metal::ResidentAllocations::take(
+            *allocation_log, tyloi::metal::wired_limit());
         const auto usage = mfq::metal::MlxResourceTelemetry::snapshot();
         const auto other = usage.cache_bytes + usage.dynamic_weight_bytes;
         const auto active = tyloi::metal::active_memory();
@@ -2824,6 +2829,7 @@ private:
     std::shared_ptr<std::int64_t> loaded_context;
     std::shared_ptr<tyloi::metal::Executor> runtime_executor;
     std::shared_ptr<tyloi::weights::Memory> weight_memory;
+    std::shared_ptr<tyloi::metal::AllocationScope::Log> allocation_log;
     int prefill_chunk_size;
     std::size_t allocator_cache_limit;
     mfq::metal::MlxSamplingParams preparation_sampling;
@@ -2854,7 +2860,8 @@ auto make_runtime(
     std::int64_t maximum_context,
     std::int64_t vocabulary_size,
     std::shared_ptr<tyloi::metal::Executor> runtime_executor,
-    std::shared_ptr<tyloi::weights::Memory> weight_memory) {
+    std::shared_ptr<tyloi::weights::Memory> weight_memory,
+    std::shared_ptr<tyloi::metal::AllocationScope::Log> allocation_log) {
     container.stop_load_observation();
     std::cerr << "mfq_load_progress stage=finalizing" << std::endl;
     constexpr const char* tokenizer_asset =
@@ -3025,7 +3032,7 @@ auto make_runtime(
     };
     auto engine_model = std::make_unique<LoadedMetalModel<Runtime, decltype(reload_runtime)>>(
         runtime_mutex, runtime_holder, session_cache, std::move(reload_runtime),
-        paged_cache_factory, loaded_context, runtime_executor, weight_memory, prefill_chunk_size,
+        paged_cache_factory, loaded_context, runtime_executor, weight_memory, allocation_log, prefill_chunk_size,
         allocator_cache_limit, std::move(runtime_components), preparation_sampling,
         preparation_routes, static_cast<int>(vocabulary_size),
         text->tokenizer().tokenize("Explain how computers use memory to run language models. "
@@ -3060,6 +3067,9 @@ auto load_runtime(
             mlx::core::new_thread_unsafe_stream(mlx::core::Device::gpu)));
     auto execution_scope = runtime_executor->enter();
     auto weight_memory = std::make_shared<tyloi::weights::Memory>();
+    auto allocation_log = std::make_shared<tyloi::metal::AllocationScope::Log>();
+    tyloi::metal::AllocationScope allocation_scope(
+        tyloi::metal::wired_limit() ? allocation_log.get() : nullptr);
     mfq::metal::MlxKernelPreparation preparation(static_cast<int>(arguments.context_size),
         arguments.prefill_chunk_size);
     const auto started =
@@ -3129,7 +3139,7 @@ auto load_runtime(
                 : config.text_model_type,
             config.max_position_embeddings,
             config.vocab,
-            runtime_executor, weight_memory);
+            runtime_executor, weight_memory, allocation_log);
     }
     if (backbone == "deepseek_v4") {
         const auto config =
@@ -3200,7 +3210,7 @@ auto load_runtime(
                 : config.model_type,
             config.max_position_embeddings,
             config.vocab,
-            runtime_executor, weight_memory);
+            runtime_executor, weight_memory, allocation_log);
     }
 
     if (backbone == "nemotron_h") {
@@ -3246,7 +3256,7 @@ auto load_runtime(
                                   : config.model_type,
             config.max_position_embeddings,
             config.vocab_size,
-            runtime_executor, weight_memory);
+            runtime_executor, weight_memory, allocation_log);
     }
 
     if (backbone == "minicpmo45") {
@@ -3289,7 +3299,7 @@ auto load_runtime(
             "minicpmo",
             maximum_context,
             vocabulary,
-            runtime_executor, weight_memory);
+            runtime_executor, weight_memory, allocation_log);
     }
 
     if (backbone == "qwen4_exp") {
@@ -3353,7 +3363,7 @@ auto load_runtime(
                 : config.text_model_type,
             extended_context,
             config.vocab_size,
-            runtime_executor, weight_memory);
+            runtime_executor, weight_memory, allocation_log);
     }
 
     if (backbone != "qwen3_5") {
@@ -3400,7 +3410,7 @@ auto load_runtime(
             : config.text_model_type,
         extended_context,
         config.vocab_size,
-        runtime_executor, weight_memory);
+        runtime_executor, weight_memory, allocation_log);
 }
 #endif
 
@@ -3473,6 +3483,9 @@ int main(int argc, char** argv) {
 
         if (!arguments.tensor.empty()) {
             configure_mlx_metal();
+            tyloi::metal::AllocationScope::Log allocation_log;
+            tyloi::metal::AllocationScope allocation_scope(
+                tyloi::metal::wired_limit() ? &allocation_log : nullptr);
             const auto& record = model.record(arguments.tensor);
             if (mfq::mfq_compat_enabled && record.dtype == "MFE") {
                 auto weight =

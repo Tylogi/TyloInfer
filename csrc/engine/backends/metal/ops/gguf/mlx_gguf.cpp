@@ -11,6 +11,7 @@
 #include "mfq_container.h"
 #include "gguf_embedded.h"
 #include "engine/backends/metal/native/resident_allocations.h"
+#include "engine/backends/metal/native/allocation.h"
 #include "engine/backends/metal/native/indirect.h"
 #include "engine/backends/metal/native/tensor/buffer.h"
 #include "engine/backends/metal/native/device.h"
@@ -815,9 +816,9 @@ void MlxGgufWeight::prepare_grouped() {
     if (native_ || mixed_layout_ || rotation_ || !use_nax()) return;
     MlxGgufStagedPrefill::prepare(*this);
     if (planes_) {
-        tyloi::metal::ResidentAllocations::track(tyloi::metal::array(bytes_));
+        tyloi::metal::AllocationScope::record(tyloi::metal::array(bytes_));
         for (const auto& plane : *planes_) {
-            tyloi::metal::ResidentAllocations::track(tyloi::metal::array(plane));
+            tyloi::metal::AllocationScope::record(tyloi::metal::array(plane));
             tyloi::weights::observe_weight(plane);
         }
     }
@@ -836,9 +837,9 @@ MlxGgufWeight MlxGgufWeight::from_bytes(std::string_view dtype,
     auto result = MlxGgufWeight(tyloi::metal::array(tensor), std::move(shape), geometry.format, geometry.row_bytes);
     if (use_nax() && result.expert_count() <= 512)
         MlxGgufStagedPrefill::prepare(result);
-    tyloi::metal::ResidentAllocations::track(tyloi::metal::array(result.bytes_));
+    tyloi::metal::AllocationScope::record(tyloi::metal::array(result.bytes_));
     if (result.planes_) for (const auto& plane : *result.planes_) {
-        tyloi::metal::ResidentAllocations::track(tyloi::metal::array(plane));
+        tyloi::metal::AllocationScope::record(tyloi::metal::array(plane));
         tyloi::weights::observe_weight(plane);
     }
     return result;
@@ -929,16 +930,16 @@ MlxGgufWeight MlxGgufWeight::load(const MfqContainer& model, const std::string& 
         auto prepared = mlx_native_gguf_pack(tyloi::metal::array(result.bytes_), result.format_, result.output_size(), result.input_size(), result.row_bytes_);
         eval(std::vector<array>(prepared.planes.begin(), prepared.planes.end()));
         for (const auto& plane : prepared.planes) {
-            tyloi::metal::ResidentAllocations::track(plane);
+            tyloi::metal::AllocationScope::record(plane);
             tyloi::weights::observe_weight(tyloi::metal::tensor(plane));
         }
         result.native_ = std::make_shared<MlxNativeGgufWeight>(std::move(prepared));
     }
     if (!result.native_ && use_nax() && result.expert_count() <= 512)
         MlxGgufStagedPrefill::prepare(result);
-    tyloi::metal::ResidentAllocations::track(tyloi::metal::array(result.bytes_));
+    tyloi::metal::AllocationScope::record(tyloi::metal::array(result.bytes_));
     if (result.planes_) for (const auto& plane : *result.planes_) {
-        tyloi::metal::ResidentAllocations::track(tyloi::metal::array(plane));
+        tyloi::metal::AllocationScope::record(tyloi::metal::array(plane));
         tyloi::weights::observe_weight(plane);
     }
     model.record_prepared(name);
