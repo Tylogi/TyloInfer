@@ -80,6 +80,8 @@ add_library(mfq-metal-ops STATIC
     ${TYLOINFER_METAL_ROOT}/native/stream.cpp
     ${TYLOINFER_METAL_ROOT}/native/tensor/tensor.cpp
     ${TYLOINFER_METAL_ROOT}/ops/tensor.cpp
+    ${TYLOINFER_METAL_ROOT}/ops/norm/rms.cpp
+    ${TYLOINFER_METAL_ROOT}/ops/norm/layer.cpp
 )
 target_include_directories(mfq-metal-ops PUBLIC ${PROJECT_SOURCE_DIR})
 target_compile_features(mfq-metal-ops PUBLIC cxx_std_20)

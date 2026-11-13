@@ -15,6 +15,15 @@
 
 namespace tyloi::ops {
 #ifndef TYLOINFER_NATIVE_CUDA
+namespace {
+const DenseTensor& cpu_view(const Tensor& tensor) {
+    const auto* value = tensor.representation<DenseTensor>();
+    if (!value || !value->defined() || value->is_encoded() ||
+        value->device() != Device{DeviceType::cpu, 0})
+        throw std::invalid_argument("view requires a dense CPU:0 tensor");
+    return *value;
+}
+} // namespace
 struct DeviceScope::Impl {
     explicit Impl(Device target) {
         if (!(target.is_cpu() && target.index == 0)
@@ -319,6 +328,91 @@ void index_copy(Tensor& value_tensor, std::int64_t dim, const Tensor& indices_te
     cuda::ops::index_copy(value, dim, indices, source);
 #else
     throw std::invalid_argument("indexed update is not supported");
+#endif
+}
+
+Tensor transpose(const Tensor& value_tensor, std::int64_t first, std::int64_t second) {
+#ifdef TYLOINFER_NATIVE_MLX_RUNTIME
+    if (value_tensor.defined() && value_tensor.device().is_metal())
+        return metal::ops::transpose(value_tensor, first, second);
+#endif
+#ifdef TYLOINFER_NATIVE_CUDA
+    const auto& value = ::tyloi::ops::dense(value_tensor);
+    input(value);
+    return owner(tyloi::transpose(value, first, second));
+#else
+    return std::make_shared<DenseTensor>(tyloi::transpose(cpu_view(value_tensor), first, second));
+#endif
+}
+
+Tensor contiguous(const Tensor& value_tensor) {
+#ifdef TYLOINFER_NATIVE_MLX_RUNTIME
+    if (value_tensor.defined() && value_tensor.device().is_metal())
+        return metal::ops::contiguous(value_tensor);
+#endif
+#ifdef TYLOINFER_NATIVE_CUDA
+    const auto& value = ::tyloi::ops::dense(value_tensor);
+    input(value);
+    return owner(cuda::ops::contiguous(value));
+#else
+    const auto& value = cpu_view(value_tensor);
+    return value.is_contiguous() ? value_tensor : cpu::ops::clone(value_tensor);
+#endif
+}
+
+Tensor reshape(const Tensor& value_tensor, std::span<const std::int64_t> shape) {
+#ifdef TYLOINFER_NATIVE_MLX_RUNTIME
+    if (value_tensor.defined() && value_tensor.device().is_metal())
+        return metal::ops::reshape(value_tensor, shape);
+#endif
+#ifdef TYLOINFER_NATIVE_CUDA
+    const auto& value = ::tyloi::ops::dense(value_tensor);
+    input(value);
+    return owner(tyloi::reshape(value, shape));
+#else
+    return std::make_shared<DenseTensor>(tyloi::reshape(cpu_view(value_tensor), shape));
+#endif
+}
+
+Tensor expand(const Tensor& value_tensor, std::span<const std::int64_t> shape) {
+#ifdef TYLOINFER_NATIVE_MLX_RUNTIME
+    if (value_tensor.defined() && value_tensor.device().is_metal())
+        return metal::ops::expand(value_tensor, shape);
+#endif
+#ifdef TYLOINFER_NATIVE_CUDA
+    const auto& value = ::tyloi::ops::dense(value_tensor);
+    input(value);
+    return owner(tyloi::expand(value, shape));
+#else
+    return std::make_shared<DenseTensor>(tyloi::expand(cpu_view(value_tensor), shape));
+#endif
+}
+
+Tensor select(const Tensor& value_tensor, std::int64_t dim, std::int64_t index) {
+#ifdef TYLOINFER_NATIVE_MLX_RUNTIME
+    if (value_tensor.defined() && value_tensor.device().is_metal())
+        return metal::ops::select(value_tensor, dim, index);
+#endif
+#ifdef TYLOINFER_NATIVE_CUDA
+    const auto& value = ::tyloi::ops::dense(value_tensor);
+    input(value);
+    return owner(tyloi::select(value, dim, index));
+#else
+    return std::make_shared<DenseTensor>(tyloi::select(cpu_view(value_tensor), dim, index));
+#endif
+}
+
+Tensor unsqueeze(const Tensor& value_tensor, std::int64_t dim) {
+#ifdef TYLOINFER_NATIVE_MLX_RUNTIME
+    if (value_tensor.defined() && value_tensor.device().is_metal())
+        return metal::ops::unsqueeze(value_tensor, dim);
+#endif
+#ifdef TYLOINFER_NATIVE_CUDA
+    const auto& value = ::tyloi::ops::dense(value_tensor);
+    input(value);
+    return owner(tyloi::unsqueeze(value, dim));
+#else
+    return std::make_shared<DenseTensor>(tyloi::unsqueeze(cpu_view(value_tensor), dim));
 #endif
 }
 

@@ -2,7 +2,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <optional>
 #include <utility>
 #include <vector>
 
@@ -44,33 +43,6 @@ mlx::core::array mlx_rope_adjacent(
     const mlx::core::array& cosine,
     const mlx::core::array& sine,
     bool inverse = false);
-
-class MlxRmsNorm {
-public:
-    MlxRmsNorm(
-        mlx::core::array weight,
-        float eps = 1e-6f,
-        float weight_offset = 0.0f);
-
-    mlx::core::array operator()(
-        const mlx::core::array& input,
-        std::optional<mlx::core::Dtype> output_dtype = std::nullopt) const;
-
-    int width() const noexcept {
-        return width_;
-    }
-    const mlx::core::array& weight() const noexcept {
-        return weight_;
-    }
-    float eps() const noexcept {
-        return eps_;
-    }
-
-private:
-    mlx::core::array weight_;
-    float eps_;
-    int width_;
-};
 
 mlx::core::array apply_rope(
     const mlx::core::array& input,

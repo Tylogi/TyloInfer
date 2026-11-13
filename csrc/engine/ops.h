@@ -21,7 +21,8 @@ namespace tyloi::weights { class ExpertBatch; }
 
 namespace tyloi::ops {
 
-// Storage operations select the compiled CPU, CUDA or Metal implementation.
+// Storage and views select the compiled CPU, CUDA or Metal implementation.
+// Basic math, reductions, normalization and activations also accept Metal.
 // Other computation requires CUDA unless stated below.
 // CUDA execution and prepared-weight operations require an execution scope.
 // qkv_norm and append_kv also require a scope for their CPU passthrough cases.

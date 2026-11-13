@@ -319,4 +319,147 @@ void index_copy(Tensor& value, std::int64_t dim, const Tensor& indices, const Te
     metal::replace(value, std::move(result));
 }
 
+
+Tensor add(const Tensor& left, const Tensor& right) {
+    return metal::tensor(mlx::core::add(input(left), input(right), gpu_stream()));
+}
+Tensor multiply(const Tensor& left, const Tensor& right) {
+    return metal::tensor(mlx::core::multiply(input(left), input(right), gpu_stream()));
+}
+Tensor matmul(const Tensor& left, const Tensor& right) {
+    return metal::tensor(mlx::core::matmul(input(left), input(right), gpu_stream()));
+}
+Tensor add(const Tensor& value, std::int64_t offset) {
+    const auto& x = input(value);
+    return metal::tensor(mlx::core::astype(mlx::core::add(x, mlx::core::array(offset, mlx::core::int64), gpu_stream()), x.dtype(), gpu_stream()));
+}
+// MLX scalar arithmetic uses FP32; results retain the activation dtype.
+Tensor divide(const Tensor& value, double number) {
+    const auto& x = input(value);
+    return metal::tensor(mlx::core::astype(mlx::core::divide(x, mlx::core::array(static_cast<float>(number)), gpu_stream()), x.dtype(), gpu_stream()));
+}
+Tensor scale(const Tensor& value, double number) {
+    const auto& x = input(value);
+    return metal::tensor(mlx::core::astype(mlx::core::multiply(x, mlx::core::array(static_cast<float>(number)), gpu_stream()), x.dtype(), gpu_stream()));
+}
+Tensor softcap(const Tensor& value, double number) {
+    const auto& x = input(value);
+    if (!(number > 0)) return value;
+    auto scaled = mlx::core::astype(mlx::core::divide(x, mlx::core::array(static_cast<float>(number)), gpu_stream()), x.dtype(), gpu_stream());
+    auto capped = mlx::core::tanh(scaled, gpu_stream());
+    return metal::tensor(mlx::core::astype(mlx::core::multiply(capped, mlx::core::array(static_cast<float>(number)), gpu_stream()), x.dtype(), gpu_stream()));
+}
+Tensor gelu(const Tensor& value, bool approximate) {
+    const auto& x = input(value);
+    const auto stream = gpu_stream();
+    const auto xf = mlx::core::astype(x, mlx::core::float32, stream);
+    mlx::core::array factor = approximate
+        ? mlx::core::tanh(mlx::core::multiply(mlx::core::array(0.7978845608028654f),
+              mlx::core::add(xf, mlx::core::multiply(mlx::core::array(0.044715f),
+                  mlx::core::multiply(mlx::core::square(xf, stream), xf, stream), stream), stream), stream), stream)
+        : mlx::core::erf(mlx::core::multiply(xf, mlx::core::array(0.7071067811865476f), stream), stream);
+    return metal::tensor(mlx::core::astype(mlx::core::multiply(mlx::core::multiply(xf, mlx::core::array(0.5f), stream),
+        mlx::core::add(mlx::core::array(1.0f), factor, stream), stream), x.dtype(), stream));
+}
+Tensor silu(const Tensor& value) {
+    const auto& x = input(value); const auto stream = gpu_stream();
+    return metal::tensor(mlx::core::astype(mlx::core::multiply(x, mlx::core::sigmoid(x, stream), stream), x.dtype(), stream));
+}
+Tensor relu_squared(const Tensor& value) {
+    const auto& x = input(value); const auto stream = gpu_stream();
+    return metal::tensor(mlx::core::astype(mlx::core::square(mlx::core::maximum(x, mlx::core::array(0), stream), stream), x.dtype(), stream));
+}
+Tensor abs(const Tensor& value) {
+    const auto& x = input(value); const auto stream = gpu_stream();
+    return metal::tensor(mlx::core::astype(mlx::core::abs(x, stream), x.dtype(), stream));
+}
+Tensor square(const Tensor& value) {
+    const auto& x = input(value); const auto stream = gpu_stream();
+    return metal::tensor(mlx::core::astype(mlx::core::square(x, stream), x.dtype(), stream));
+}
+Tensor exp(const Tensor& value) {
+    const auto& x = input(value); const auto stream = gpu_stream();
+    return metal::tensor(mlx::core::astype(mlx::core::exp(x, stream), x.dtype(), stream));
+}
+Tensor sqrt(const Tensor& value) {
+    const auto& x = input(value); const auto stream = gpu_stream();
+    return metal::tensor(mlx::core::astype(mlx::core::sqrt(x, stream), x.dtype(), stream));
+}
+Tensor logical_not(const Tensor& value) {
+    return metal::tensor(mlx::core::logical_not(input(value), gpu_stream()));
+}
+Tensor clamp(const Tensor& value, double minimum, double maximum) {
+    const auto& x = input(value); const auto stream = gpu_stream();
+    return metal::tensor(mlx::core::astype(mlx::core::clip(x, mlx::core::array(static_cast<float>(minimum)), mlx::core::array(static_cast<float>(maximum)), stream), x.dtype(), stream));
+}
+Tensor sum(const Tensor& value, std::int64_t dim, bool keepdim) {
+    const auto& x = input(value); const auto axis = dimension(dim, x.ndim()); const auto stream = gpu_stream();
+    if (x.shape(axis) == 0) throw std::invalid_argument("cannot reduce an empty dimension");
+    const bool floating = x.dtype() == mlx::core::float16 || x.dtype() == mlx::core::bfloat16 || x.dtype() == mlx::core::float32;
+    return metal::tensor(mlx::core::astype(mlx::core::sum(floating ? x : mlx::core::astype(x, mlx::core::int64, stream), axis, keepdim, stream), floating ? x.dtype() : mlx::core::int64, stream));
+}
+Tensor mean(const Tensor& value, std::int64_t dim, bool keepdim) {
+    const auto& x = input(value); const auto axis = dimension(dim, x.ndim()); const auto stream = gpu_stream();
+    if (x.shape(axis) == 0) throw std::invalid_argument("cannot reduce an empty dimension");
+    if (x.dtype() != mlx::core::float16 && x.dtype() != mlx::core::bfloat16 && x.dtype() != mlx::core::float32)
+        throw std::invalid_argument("native mean requires a floating dtype");
+    return metal::tensor(mlx::core::astype(mlx::core::mean(x, axis, keepdim, stream), x.dtype(), stream));
+}
+Tensor amax(const Tensor& value, std::int64_t dim, bool keepdim) {
+    const auto& x = input(value); const auto axis = dimension(dim, x.ndim()); const auto stream = gpu_stream();
+    if (x.shape(axis) == 0) throw std::invalid_argument("cannot reduce an empty dimension");
+    return metal::tensor(mlx::core::max(x, axis, keepdim, stream));
+}
+Tensor argmax(const Tensor& value, std::int64_t dim, bool keepdim) {
+    const auto& x = input(value); const auto axis = dimension(dim, x.ndim()); const auto stream = gpu_stream();
+    if (x.shape(axis) == 0) throw std::invalid_argument("cannot reduce an empty dimension");
+    return metal::tensor(mlx::core::astype(mlx::core::argmax(x, axis, keepdim, stream), mlx::core::int64, stream));
+}
+Tensor all(const Tensor& value, std::int64_t dim, bool keepdim) {
+    const auto& x = input(value); const auto axis = dimension(dim, x.ndim()); const auto stream = gpu_stream();
+    if (x.shape(axis) == 0) throw std::invalid_argument("cannot reduce an empty dimension");
+    return metal::tensor(mlx::core::all(x, axis, keepdim, stream));
+}
+Tensor any(const Tensor& value, std::int64_t dim, bool keepdim) {
+    const auto& x = input(value); const auto axis = dimension(dim, x.ndim()); const auto stream = gpu_stream();
+    if (x.shape(axis) == 0) throw std::invalid_argument("cannot reduce an empty dimension");
+    return metal::tensor(mlx::core::any(x, axis, keepdim, stream));
+}
+Tensor expand(const Tensor& value, std::span<const std::int64_t> shape) {
+    const auto& x = input(value);
+    if (shape.size() < static_cast<std::size_t>(x.ndim()) || shape.size() > kMaximumTensorRank)
+        throw std::invalid_argument("expand rank is incompatible with tensor rank");
+    mlx::core::Shape sizes; sizes.reserve(shape.size());
+    const auto offset = shape.size() - x.ndim();
+    for (std::size_t i = 0; i < shape.size(); ++i) {
+        auto requested = shape[i];
+        if (i < offset) {
+            if (requested < 0) throw std::invalid_argument("new expand dimensions must be explicit");
+        } else {
+            const auto extent = x.shape(static_cast<int>(i - offset));
+            if (requested == -1) requested = extent;
+            if (requested < 0 || (requested != extent && extent != 1))
+                throw std::invalid_argument("cannot expand a non-singleton dimension");
+        }
+        if (requested > std::numeric_limits<int>::max()) throw std::overflow_error("Metal tensor extent exceeds int32 limit");
+        sizes.push_back(static_cast<int>(requested));
+    }
+    return metal::tensor(mlx::core::broadcast_to(x, sizes, gpu_stream()));
+}
+Tensor unsqueeze(const Tensor& value, std::int64_t dim) {
+    const auto& x = input(value);
+    if (static_cast<std::size_t>(x.ndim()) >= kMaximumTensorRank) throw std::invalid_argument("cannot unsqueeze this tensor");
+    const auto axis = dimension(dim, x.ndim() + 1);
+    return metal::tensor(mlx::core::expand_dims(x, axis, gpu_stream()));
+}
+Tensor select(const Tensor& value, std::int64_t dim, std::int64_t index) {
+    const auto& x = input(value); const auto axis = dimension(dim, x.ndim());
+    const auto extent = x.shape(axis);
+    if (index < 0) index += extent;
+    if (index < 0 || index >= extent) throw std::out_of_range("tensor index is out of range");
+    mlx::core::Shape begin(x.ndim(), 0), end = x.shape();
+    begin[axis] = static_cast<int>(index); end[axis] = static_cast<int>(index + 1);
+    return metal::tensor(mlx::core::squeeze(mlx::core::slice(x, begin, end, gpu_stream()), axis, gpu_stream()));
+}
+
 }  // namespace tyloi::metal::ops

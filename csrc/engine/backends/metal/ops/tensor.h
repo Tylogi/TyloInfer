@@ -23,4 +23,30 @@ Tensor cat(std::span<const Tensor> values, std::int64_t dim);
 Tensor index_select(const Tensor& value, std::int64_t dim, const Tensor& indices);
 void index_copy(Tensor& value, std::int64_t dim, const Tensor& indices, const Tensor& source);
 
+Tensor add(const Tensor& left, const Tensor& right);
+Tensor multiply(const Tensor& left, const Tensor& right);
+Tensor matmul(const Tensor& left, const Tensor& right);
+Tensor add(const Tensor& value, std::int64_t offset);
+Tensor divide(const Tensor& value, double number);
+Tensor scale(const Tensor& value, double number);
+Tensor softcap(const Tensor& value, double number);
+Tensor gelu(const Tensor& value, bool approximate);
+Tensor silu(const Tensor& value);
+Tensor relu_squared(const Tensor& value);
+Tensor abs(const Tensor& value);
+Tensor square(const Tensor& value);
+Tensor exp(const Tensor& value);
+Tensor sqrt(const Tensor& value);
+Tensor logical_not(const Tensor& value);
+Tensor sum(const Tensor& value, std::int64_t dim, bool keepdim);
+Tensor mean(const Tensor& value, std::int64_t dim, bool keepdim);
+Tensor amax(const Tensor& value, std::int64_t dim, bool keepdim);
+Tensor argmax(const Tensor& value, std::int64_t dim, bool keepdim);
+Tensor all(const Tensor& value, std::int64_t dim, bool keepdim);
+Tensor any(const Tensor& value, std::int64_t dim, bool keepdim);
+Tensor clamp(const Tensor& value, double minimum, double maximum);
+Tensor expand(const Tensor& value, std::span<const std::int64_t> shape);
+Tensor unsqueeze(const Tensor& value, std::int64_t dim);
+Tensor select(const Tensor& value, std::int64_t dim, std::int64_t index);
+
 }  // namespace tyloi::metal::ops
