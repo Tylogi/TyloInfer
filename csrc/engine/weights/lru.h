@@ -43,6 +43,7 @@ public:
     bool empty() const noexcept { return entries_.empty(); }
     const auto& entries() const noexcept { return entries_; }
     const auto& keys() const noexcept { return recent_; }
+    void reserve_entries(std::size_t count) { entries_.reserve(count); }
 
     Value* find(const Key& key) {
         const auto entry = entries_.find(key);

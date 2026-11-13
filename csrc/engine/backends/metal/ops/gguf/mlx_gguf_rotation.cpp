@@ -3,6 +3,8 @@
 #include "engine/backends/metal/native/kernel.h"
 #include "mfq_container.h"
 #include "engine/backends/metal/native/resident_allocations.h"
+#include "engine/backends/metal/native/tensor/tensor.h"
+#include "engine/weights/memory.h"
 #include "nlohmann/json.hpp"
 
 #include <cmath>
@@ -62,6 +64,7 @@ void MlxGgufWeight::configure_hadamard(const MfqContainer& model, const std::str
         throw std::invalid_argument("invalid GGUF Hadamard sign");
     auto signs = pattern.empty() ? array(1.f) : array(pattern.begin(), Shape{input_size()}, float32);
     tyloi::metal::ResidentAllocations::track(signs);
+    tyloi::weights::observe_weight(tyloi::metal::tensor(signs));
     rotation_ = std::make_shared<MlxGgufRotation>(MlxGgufRotation{block, pattern, std::move(signs)});
 }
 

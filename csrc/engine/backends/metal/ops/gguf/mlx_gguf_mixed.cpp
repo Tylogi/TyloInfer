@@ -1,4 +1,5 @@
 #include "engine/backends/metal/native/tensor/tensor.h"
+#include "engine/weights/memory.h"
 #include "mlx_gguf.h"
 #include "mlx_gguf_staged.h"
 #include "gguf_embedded.h"
@@ -510,7 +511,11 @@ MlxGgufWeight MlxGgufWeight::from_mixed_experts(Shape shape, const std::vector<s
     MlxGgufWeight result(std::move(table), std::move(shape), -1, 0, true);
     result.mixed_layout_ = tyloi::metal::tensor(array(layout.begin(), Shape{result.expert_count(), 2}, uint32));
     result.mixed_mask_ = mask;
-    for (const auto& value : packed) result.mixed_payload_bytes_ += value.nbytes();
+    for (const auto& value : packed) {
+        result.mixed_payload_bytes_ += value.nbytes();
+        tyloi::weights::observe_weight(tyloi::metal::tensor(value));
+    }
+    tyloi::weights::observe_weight(*result.mixed_layout_);
     return result;
 }
 

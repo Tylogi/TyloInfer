@@ -1,4 +1,5 @@
 #include "mlx_moe.h"
+#include "engine/weights/lru.h"
 #include "mlx_moe_ops.h"
 
 #include <coroutine>
@@ -8711,7 +8712,6 @@ struct MlxMfeOffloadCache::Impl {
     };
 
     struct MfeCacheValue {
-        Key key;
         std::shared_ptr<const MfeCachedExpert> weight;
         std::uint8_t credit = 0;
         std::shared_ptr<void> pin;
@@ -8737,11 +8737,6 @@ struct MlxMfeOffloadCache::Impl {
     using MfeProjectionCache = std::unordered_map<
         std::string,
         std::shared_ptr<const MfeStreamProjection>>;
-    using MfeLru = std::list<MfeCacheValue>;
-    using MfeExpertCache = std::unordered_map<
-        Key,
-        MfeLru::iterator,
-        KeyHash>;
 
     Impl(
         const MfqContainer& source,
@@ -8819,14 +8814,14 @@ struct MlxMfeOffloadCache::Impl {
                 std::lock_guard lock(mutex);
                 const auto cached = mfe_cache.find(request.key);
                 page = request.page.lock();
-                if (!page || cached == mfe_cache.end() || cached->second->weight != page) continue;
+                if (!page || !cached || cached->weight != page) continue;
             }
             auto pin = page->weight.pin_packed_storage();
             {
                 std::lock_guard lock(mutex);
                 const auto cached = mfe_cache.find(request.key);
-                if (cached != mfe_cache.end() && cached->second->weight == page)
-                    cached->second->pin = std::move(pin);
+                if (cached && cached->weight == page)
+                    cached->pin = std::move(pin);
             }
         }
     }
@@ -9168,8 +9163,7 @@ struct MlxMfeOffloadCache::Impl {
     std::unordered_map<
         std::string,
         std::shared_ptr<const MfeStreamProjection>> mfe_projections;
-    MfeLru mfe_lru;
-    MfeExpertCache mfe_cache;
+    tyloi::weights::Lru<Key, MfeCacheValue, KeyHash> mfe_cache{std::nullopt};
     std::unordered_set<std::string> prefill_priority;
     std::size_t resident_bytes = 0;
     std::unordered_map<std::string, std::size_t> backing_records;
@@ -9210,20 +9204,20 @@ struct MlxMfeOffloadCache::Impl {
     void trim() {
         while (resident_bytes > cache_limit && !prepared.empty())
             drop_prepared(prepared.begin()->first);
-        while (resident_bytes > cache_limit && !mfe_lru.empty()) {
-            const auto victim = mfe_lru.begin();
-            if (victim->credit > 0) {
-                --victim->credit;
-                mfe_lru.splice(mfe_lru.end(), mfe_lru, victim);
+        while (resident_bytes > cache_limit && !mfe_cache.empty()) {
+            const auto& key = *mfe_cache.oldest();
+            auto& victim = mfe_cache.at(key);
+            if (victim.credit > 0) {
+                --victim.credit;
+                mfe_cache.get(key);
                 continue;
             }
-            drop_cached_view(victim->key.name);
-            resident_bytes -= victim->weight->packed_nbytes;
-            resident_pages.at(victim->key.name)[victim->key.expert].reset();
+            drop_cached_view(key.name);
+            resident_bytes -= victim.weight->packed_nbytes;
+            resident_pages.at(key.name)[key.expert].reset();
             ++stats.evictions;
-            cancel_pin(victim->key);
-            mfe_cache.erase(victim->key);
-            mfe_lru.erase(victim);
+            cancel_pin(key);
+            mfe_cache.erase(key);
         }
     }
 };
@@ -9462,7 +9456,7 @@ std::optional<std::vector<MlxMfeWeight>> MlxMfeOffloadCache::layer_mfe(
             for (const auto expert : active_experts) {
                 if (expert < 0 || expert >= projection->experts || !projection->experts_by_id[expert])
                     throw std::out_of_range("bulk MFE expert is unavailable");
-                if (!seen.insert(expert).second || impl_->mfe_cache.contains({name, expert})) continue;
+                if (!seen.insert(expert).second || impl_->mfe_cache.find({name, expert})) continue;
                 const auto& pool = projection->experts_by_id[expert]->pool;
                 missing_bytes = checked_add(missing_bytes, pool->payload_bytes / pool->expert_count,
                     "bulk MFE missing bytes");
@@ -9562,12 +9556,12 @@ MfeGroupTask MlxMfeOffloadCache::Impl::prepare_grouped(
                 if (expert < 0 || expert >= projection->experts || !projection->experts_by_id[expert])
                     throw std::out_of_range("streamed MFE expert is unavailable");
                 const auto cached = impl_->mfe_cache.find({name, expert});
-                const bool missing = cached == impl_->mfe_cache.end();
-                if (!missing) protected_pages.push_back(cached->second->weight);
+                const bool missing = !cached;
+                if (!missing) protected_pages.push_back(cached->weight);
                 const auto bytes = missing
                     ? streamed_expert_storage_bound(*projection, *projection->experts_by_id[expert])
                     : indirect_pages ? sizeof(std::int32_t) * (kDescriptorSize + 1)
-                        + 21 * sizeof(std::uint64_t) : cached->second->weight->packed_nbytes;
+                        + 21 * sizeof(std::uint64_t) : cached->weight->packed_nbytes;
                 const auto copies = missing && !indirect_pages ? std::size_t{5} : std::size_t{1};
                 working_bytes = checked_add(working_bytes, checked_product(bytes, copies,
                     "expert packed staging"), "active expert working set");
@@ -9636,11 +9630,11 @@ MfeGroupTask MlxMfeOffloadCache::Impl::prepare_grouped(
     const auto touch = [&](const Impl::Key& key, bool hit) {
         if (prefill_scan && !priority_scan) return;
         const auto cached = impl_->mfe_cache.find(key);
-        if (cached == impl_->mfe_cache.end()) return;
-        auto& value = *cached->second;
+        if (!cached) return;
+        auto& value = *cached;
         value.credit = static_cast<std::uint8_t>(std::min<unsigned>(3,
             value.credit + counts.at(key.expert) - (hit ? 0 : 1)));
-        impl_->mfe_lru.splice(impl_->mfe_lru.end(), impl_->mfe_lru, cached->second);
+        impl_->mfe_cache.get(key);
     };
     const auto reuse_packed = [&](const Impl::PreparedProjection& packed)
         -> std::optional<MlxMfeWeight> {
@@ -9683,8 +9677,8 @@ MfeGroupTask MlxMfeOffloadCache::Impl::prepare_grouped(
     pending.reserve(ordered_keys.size());
     for (const auto& key : ordered_keys) {
         const auto cached = impl_->mfe_cache.find(key);
-        if (cached != impl_->mfe_cache.end()) {
-            pages.push_back({key, cached->second->weight, false});
+        if (cached) {
+            pages.push_back({key, cached->weight, false});
             ++impl_->stats.expert_hits;
             continue;
         }
@@ -9726,7 +9720,7 @@ MfeGroupTask MlxMfeOffloadCache::Impl::prepare_grouped(
     }
     if (!indirect_pages && pending.empty()) {
         for (const auto& page : pages) {
-            if (impl_->mfe_cache.contains(page.key)) continue;
+            if (impl_->mfe_cache.find(page.key)) continue;
             bank_pages.push_back(page.value);
             bank_bytes = checked_add(bank_bytes, page.value->packed_nbytes + 128,
                 "in-flight MFE expert bytes");
@@ -9961,32 +9955,24 @@ MfeGroupTask MlxMfeOffloadCache::Impl::prepare_grouped(
     if (epoch != impl_->epoch) co_return result;
 
     if (std::any_of(pages.begin(), pages.end(), [&](const auto& page) {
-        return !page.value->transient && !impl_->mfe_cache.contains(page.key);
+        return !page.value->transient && !impl_->mfe_cache.find(page.key);
     })) impl_->drop_cached_view(name);
 
-    impl_->mfe_cache.reserve(checked_add(
-        impl_->mfe_cache.size(),
+    impl_->mfe_cache.reserve_entries(checked_add(
+        impl_->mfe_cache.entries().size(),
         static_cast<std::size_t>(std::count_if(
             pages.begin(), pages.end(),
             [](const auto& page) { return page.staged; })),
         "resident MFE cache entries"));
     for (const auto& page : pages) {
         if (page.value->transient) continue;
-        if (impl_->mfe_cache.contains(page.key)) continue;
+        if (impl_->mfe_cache.find(page.key)) continue;
         auto& by_id = impl_->resident_pages[name];
         if (by_id.empty()) by_id.resize(projection->experts);
         const auto bytes = checked_add(impl_->resident_bytes,
             page.value->packed_nbytes, "resident MFE expert bytes");
-        const auto inserted = prefill_scan && !priority_scan
-            ? impl_->mfe_lru.insert(impl_->mfe_lru.begin(), {page.key, page.value})
-            : impl_->mfe_lru.insert(impl_->mfe_lru.end(), {page.key, page.value});
-        try {
-            if (!impl_->mfe_cache.emplace(inserted->key, inserted).second)
-                throw std::logic_error("duplicate staged MFE expert cache key");
-        } catch (...) {
-            impl_->mfe_lru.erase(inserted);
-            throw;
-        }
+        impl_->mfe_cache.put(page.key, {page.value}, page.value->packed_nbytes,
+            prefill_scan && !priority_scan);
         impl_->resident_bytes = bytes;
         by_id[page.key.expert] = page.value;
     }
@@ -10000,8 +9986,8 @@ MfeGroupTask MlxMfeOffloadCache::Impl::prepare_grouped(
     impl_->trim();
     for (const auto& page : pages) {
         const auto cached = impl_->mfe_cache.find(page.key);
-        if (cached == impl_->mfe_cache.end()) continue;
-        auto& value = *cached->second;
+        if (!cached) continue;
+        auto& value = *cached;
         if (!value.pin_attempted) value.pin_attempted = impl_->enqueue_pin(page.key, value.weight);
     }
     co_return result;
@@ -10036,7 +10022,7 @@ std::vector<MlxMfeWeight> MlxMfeOffloadCache::grouped_mfe(
             for (std::size_t index = 0; index < names.size(); ++index) {
                 (void)impl_->mfe_projection_locked(names[index]);
                 for (const auto expert : active_experts)
-                    missing[index == 2] += !impl_->mfe_cache.contains({names[index], expert});
+                    missing[index == 2] += !impl_->mfe_cache.find({names[index], expert});
             }
             parallel = missing[0] && missing[1] && missing[0] + missing[1] <= std::min(8u, workers);
         }
@@ -10176,7 +10162,7 @@ MlxMfeOffloadCache::resident_packed_bytes() const {
 std::size_t
 MlxMfeOffloadCache::cached_expert_count() const {
     std::lock_guard lock(impl_->mutex);
-    return impl_->mfe_cache.size();
+    return impl_->mfe_cache.entries().size();
 }
 
 MlxMfeCacheReuseStats MlxMfeOffloadCache::reuse_stats() const {
@@ -10201,12 +10187,19 @@ void MlxMfeOffloadCache::set_prefill_priority(std::span<const std::string> names
     if (priority == impl_->prefill_priority) return;
     impl_->prefill_priority = std::move(priority);
     if (impl_->prefill_priority.empty()) return;
-    auto item = impl_->mfe_lru.begin();
-    for (std::size_t count = impl_->mfe_lru.size(); count > 0; --count) {
-        const auto current = item++;
-        const bool preferred = impl_->prefill_priority.contains(current->key.name);
-        current->credit = preferred ? 3 : 0;
-        if (preferred) impl_->mfe_lru.splice(impl_->mfe_lru.end(), impl_->mfe_lru, current);
+    const auto& keys = impl_->mfe_cache.keys();
+    if (keys.empty()) return;
+    auto current = std::prev(keys.end());
+    const auto last = keys.begin();
+    for (;;) {
+        const bool done = current == last;
+        const auto next = done ? keys.end() : std::prev(current);
+        auto& value = impl_->mfe_cache.at(*current);
+        const bool preferred = impl_->prefill_priority.contains(current->name);
+        value.credit = preferred ? 3 : 0;
+        if (preferred) impl_->mfe_cache.get(*current);
+        if (done) break;
+        current = next;
     }
 }
 
@@ -10217,16 +10210,21 @@ void MlxMfeOffloadCache::discard_record(
     impl_->drop_prepared(name);
     impl_->drop_cached_view(name);
     impl_->route_confidence.erase(name);
-    for (auto item = impl_->mfe_lru.begin();
-         item != impl_->mfe_lru.end();) {
-        if (item->key.name != name) {
-            ++item;
-            continue;
+    const auto& keys = impl_->mfe_cache.keys();
+    if (!keys.empty()) {
+        auto current = std::prev(keys.end());
+        const auto last = keys.begin();
+        for (;;) {
+            const bool done = current == last;
+            const auto next = done ? keys.end() : std::prev(current);
+            if (current->name == name) {
+                impl_->resident_bytes -= impl_->mfe_cache.at(*current).weight->packed_nbytes;
+                impl_->cancel_pin(*current);
+                impl_->mfe_cache.erase(*current);
+            }
+            if (done) break;
+            current = next;
         }
-        impl_->resident_bytes -= item->weight->packed_nbytes;
-        impl_->cancel_pin(item->key);
-        impl_->mfe_cache.erase(item->key);
-        item = impl_->mfe_lru.erase(item);
     }
     impl_->mfe_projections.erase(name);
     impl_->resident_pages.erase(name);
@@ -10247,7 +10245,6 @@ void MlxMfeOffloadCache::clear() {
         impl_->pin_pending.clear();
     }
     impl_->mfe_cache.clear();
-    impl_->mfe_lru.clear();
     impl_->mfe_projections.clear();
     impl_->resident_bytes = 0;
 }
@@ -12473,11 +12470,11 @@ bool MlxMfeOffloadCache::resolve_cached_projections(std::span<const std::shared_
             const auto count = counts.at(expert);
             const Impl::Key key{view->name, expert};
             const auto cached = impl_->mfe_cache.find(key);
-            if (cached == impl_->mfe_cache.end()) continue;
-            auto& value = *cached->second;
+            if (!cached) continue;
+            auto& value = *cached;
             value.credit = static_cast<std::uint8_t>(std::min<unsigned>(3, value.credit + count));
             if (value.credit >= 2 && !value.pin_attempted) value.pin_attempted = impl_->enqueue_pin(key, value.weight);
-            impl_->mfe_lru.splice(impl_->mfe_lru.end(), impl_->mfe_lru, cached->second);
+            impl_->mfe_cache.get(key);
         }
     }
     return true;
