@@ -9,8 +9,7 @@
 #include "engine/backends/metal/native/resident_allocations.h"
 #include "mlx_resource_telemetry.h"
 #include "mlx_kernel_prepare.h"
-#include "engine/backends/metal/native/pinned.h"
-#include "engine/backends/metal/native/tensor/buffer.h"
+#include "engine/backends/metal/native/tq_pool.h"
 #include "engine/backends/cpu/native/host_parallel.h"
 
 #include <mlx/allocator.h>
@@ -20,17 +19,13 @@
 #include <atomic>
 #include <chrono>
 #include <climits>
-#include <cstdio>
 #include <cstring>
 #include <future>
-#include <map>
 #include <mutex>
 #include <numeric>
 #include <optional>
 #include <stdexcept>
 #include <unordered_set>
-#include <sys/mman.h>
-#include <unistd.h>
 
 namespace mfq::metal {
 namespace {
@@ -41,8 +36,6 @@ std::size_t aligned(std::size_t size) {
     if (size > SIZE_MAX - 255) throw std::overflow_error("TQ cache allocation is too large");
     return (size + 255) / 256 * 256;
 }
-
-struct Range { std::size_t offset = 0, bytes = 0; };
 
 std::vector<array> resident_routes(const array& resident, const array& ids, int experts) {
     static const auto kernel = fast::metal_kernel("tyloinfer_tq_resident_routes",
@@ -59,173 +52,6 @@ missing[route] = cached ? -1 : expert;
         {int(ids.size()), 1, 1}, {32, 1, 1}, {{"EXPERTS", experts}}, std::nullopt, false, {});
 }
 
-std::size_t pool_page() {
-    static const auto page = std::max(std::size_t{4096}, std::size_t(getpagesize()));
-    return page;
-}
-
-using PoolStorage = detail::MlxPinnedPoolStorage;
-
-struct PoolBuffer {
-    std::shared_ptr<PoolStorage> storage;
-    allocator::Buffer buffer{nullptr};
-    ~PoolBuffer() { if (buffer.ptr()) allocator::release(buffer); }
-};
-
-struct PoolLifetime {
-    std::vector<array> chunks;
-    array handle = array(0, uint64);
-    std::shared_ptr<tyloi::metal::ResidentAllocations> residency;
-};
-
-struct Pool {
-    using Sizes = std::multimap<std::size_t, std::size_t>;
-    struct FreeRange { std::size_t bytes; Sizes::iterator size_entry; };
-    array words = array(0, uint32);
-    std::byte* data = nullptr;
-    std::size_t capacity = 0;
-    std::shared_ptr<PoolStorage> storage;
-    std::size_t chunk_bytes = pool_page();
-    std::vector<array> chunks;
-    std::shared_ptr<PoolLifetime> lifetime;
-    std::map<std::size_t, FreeRange> free;
-    Sizes sizes;
-
-    void insert_free(std::size_t offset, std::size_t bytes) {
-        while(bytes) {
-            const auto part=std::min(bytes,chunk_bytes-offset%chunk_bytes);
-            const auto position=sizes.emplace(part,offset);
-            try { free.emplace(offset,FreeRange{part,position}); }
-            catch (...) { sizes.erase(position);throw; }
-            offset+=part;bytes-=part;
-        }
-    }
-
-    std::uint64_t address(std::size_t offset) const {
-        if(offset>=capacity)throw std::out_of_range("TQ chunk offset exceeds capacity");
-        const auto& chunk=chunks.at(offset/chunk_bytes);
-        const auto buffer=chunk.buffer();
-        const auto address=static_cast<const MTL::Buffer*>(buffer.ptr())->gpuAddress()+offset%chunk_bytes;
-        return address;
-    }
-
-    void erase_free(std::map<std::size_t, FreeRange>::iterator range) {
-        sizes.erase(range->second.size_entry);
-        free.erase(range);
-    }
-
-    void reset_free(std::size_t offset) {
-        free.clear(); sizes.clear();
-        if (offset < capacity) insert_free(offset, capacity - offset);
-    }
-
-    void allocate_storage(std::size_t bytes) {
-        capacity = bytes / pool_page() * pool_page();
-        if (!capacity || capacity / 4096 > std::size_t(INT_MAX))
-            throw std::invalid_argument("invalid TQ expert pool capacity");
-        storage = std::make_shared<PoolStorage>();
-        storage->bytes = capacity;
-        storage->data = mmap(nullptr, capacity, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-        if (storage->data == MAP_FAILED) throw std::bad_alloc();
-        bind_storage(capacity);
-        reset_free(0);
-    }
-
-    void bind_storage(std::size_t bytes) {
-        if(!storage||!bytes||bytes>storage->bytes||bytes%pool_page())
-            throw std::invalid_argument("invalid TQ expert pool view");
-        if(bytes>capacity)madvise(static_cast<std::byte*>(storage->data)+capacity,bytes-capacity,MADV_FREE_REUSE);
-        const auto count=(bytes+chunk_bytes-1)/chunk_bytes;
-        std::size_t keep=0;
-        while(keep<chunks.size()&&keep<count&&chunks[keep].nbytes()==std::min(chunk_bytes,bytes-keep*chunk_bytes))++keep;
-        chunks.erase(chunks.begin()+keep,chunks.end());
-        for(std::size_t part=keep;part<count;++part) {
-            const auto length=std::min(chunk_bytes,bytes-part*chunk_bytes);
-            auto view=std::make_shared<PoolBuffer>();view->storage=storage;
-            view->buffer=allocator::make_buffer(static_cast<std::byte*>(storage->data)+part*chunk_bytes,length);
-            if(!view->buffer.ptr())throw std::runtime_error("cannot register TQ expert chunk with Metal");
-            chunks.push_back(mlx_buffer_view(view->buffer,Shape{int(length/4096),1024},uint32,view));
-        }
-        lifetime=std::make_shared<PoolLifetime>();lifetime->chunks=chunks;
-        const std::array<std::uint64_t, 8> handle{};
-        lifetime->handle = array(handle.data(), Shape{8}, uint64);
-        words = mlx_buffer_view(lifetime->handle.buffer(), lifetime->handle.shape(), uint64, lifetime);
-        if (!storage->pin_prefix(bytes)) {
-            if (storage->locked_bytes > bytes)
-                throw std::runtime_error("cannot release TQ expert page locks");
-            std::fprintf(stderr, "TQ expert page locking unavailable: requested=%zu locked=%zu error=%d\n",
-                bytes, storage->locked_bytes, storage->lock_error);
-        }
-        capacity=bytes;data=static_cast<std::byte*>(storage->data);
-    }
-
-    bool fits(std::size_t bytes, std::size_t limit = SIZE_MAX) const {
-        auto it = sizes.lower_bound(bytes);
-        if (limit == SIZE_MAX) return it != sizes.end();
-        for (; it != sizes.end(); ++it)
-            if (it->second <= limit && bytes <= limit - it->second) return true;
-        return false;
-    }
-
-    Range take(std::size_t bytes, std::size_t limit = SIZE_MAX) {
-        auto it = sizes.lower_bound(bytes);
-        if (limit != SIZE_MAX) while (it != sizes.end()
-            && (it->second > limit || bytes > limit - it->second)) ++it;
-        if (it == sizes.end()) throw std::runtime_error("TQ expert pool has no contiguous range");
-        const Range result{it->second, bytes};
-        const auto remaining = it->first - bytes;
-        auto size_node = sizes.extract(it);
-        auto range_node = free.extract(result.offset);
-        if (remaining) {
-            size_node.key() = remaining; size_node.mapped() = result.offset + bytes;
-            const auto position = sizes.insert(std::move(size_node));
-            range_node.key() = result.offset + bytes;
-            range_node.mapped() = FreeRange{remaining, position};
-            free.insert(std::move(range_node));
-        }
-        return result;
-    }
-
-    void release(Range range) {
-        auto next = free.lower_bound(range.offset);
-        if (next != free.begin()) {
-            const auto previous = std::prev(next);
-            if (previous->first + previous->second.bytes == range.offset
-                && previous->first/chunk_bytes==range.offset/chunk_bytes) {
-                range.offset = previous->first;
-                range.bytes += previous->second.bytes;
-                erase_free(previous);
-            }
-        }
-        if (next != free.end() && range.offset + range.bytes == next->first
-            && range.offset/chunk_bytes==next->first/chunk_bytes) {
-            range.bytes += next->second.bytes;
-            erase_free(next);
-        }
-        insert_free(range.offset, range.bytes);
-    }
-
-    std::optional<Range> relocate(Range range, std::size_t limit) {
-        if (fits(range.bytes, limit)) {
-            const auto target = take(range.bytes, limit);
-            std::memmove(data + target.offset, data + range.offset, range.bytes);
-            release(range);
-            return target;
-        }
-        const auto next = free.lower_bound(range.offset);
-        if (next == free.begin()) return std::nullopt;
-        const auto previous = std::prev(next);
-        if (previous->first/chunk_bytes!=range.offset/chunk_bytes
-            || previous->first + previous->second.bytes != range.offset
-            || previous->first > limit || range.bytes > limit - previous->first)
-            return std::nullopt;
-        const Range target{previous->first, range.bytes};
-        std::memmove(data + target.offset, data + range.offset, range.bytes);
-        erase_free(previous);
-        release({target.offset + target.bytes, range.offset - target.offset});
-        return target;
-    }
-};
 }
 
 void MlxTqExpertWeights::prepare(int top_k, float limit, bool gelu) const {
@@ -311,7 +137,7 @@ struct MlxTqExpertCache::Impl {
     struct Entry {
         std::size_t layer = 0;
         int expert = 0;
-        std::array<Range, 3> allocations;
+        std::array<tyloi::metal::TqRange, 3> allocations;
         bool prefetched = false;
     };
     struct Read {
@@ -390,8 +216,8 @@ struct MlxTqExpertCache::Impl {
                 for(const auto& range:layer.banks[projection].ranges)bytes+=aligned(range.bytes);
                 layer_max=std::max(layer_max,bytes);
             }
-            const auto device_limit=std::size_t(mlx::core::metal::device(Device::gpu).mtl_device()->maxBufferLength())/pool_page()*pool_page();
-            pool.chunk_bytes=std::min(device_limit,std::max(pool.chunk_bytes,(layer_max+pool_page()-1)/pool_page()*pool_page()));
+            const auto device_limit=std::size_t(mlx::core::metal::device(Device::gpu).mtl_device()->maxBufferLength())/tyloi::metal::pool_page()*tyloi::metal::pool_page();
+            pool.chunk_bytes=std::min(device_limit,std::max(pool.chunk_bytes,(layer_max+tyloi::metal::pool_page()-1)/tyloi::metal::pool_page()*tyloi::metal::pool_page()));
             std::size_t packed=0;
             for(const auto& layer:layers)for(const auto& range:layer.banks[projection].ranges) {
                 const auto size=aligned(range.bytes);
@@ -401,7 +227,7 @@ struct MlxTqExpertCache::Impl {
             }
             bank_capacity[projection]=packed;
         }
-        for (auto& capacity : bank_capacity) capacity = (capacity + pool_page() - 1) / pool_page() * pool_page();
+        for (auto& capacity : bank_capacity) capacity = (capacity + tyloi::metal::pool_page() - 1) / tyloi::metal::pool_page() * tyloi::metal::pool_page();
         const auto capacities = pool_capacities(budget);
         allocated = metadata;
         for (int projection = 0; projection < 3; ++projection) {
@@ -427,7 +253,7 @@ struct MlxTqExpertCache::Impl {
 
     std::array<std::size_t, 3> pool_capacities(std::size_t budget) const {
         std::array<std::size_t, 3> smallest{}, capacity{};
-        const auto page = pool_page();
+        const auto page = tyloi::metal::pool_page();
         const auto device_limit = std::size_t(mlx::core::metal::device(Device::gpu).mtl_device()->maxBufferLength())
             / page * page;
         for (int p = 0; p < 3; ++p) {
@@ -510,7 +336,7 @@ struct MlxTqExpertCache::Impl {
         std::lock_guard lock(execution);
         if (budget >= allocated) return 0;
         auto minimum = metadata;
-        for (auto bytes : bank_largest) minimum += (bytes + pool_page() - 1) / pool_page() * pool_page();
+        for (auto bytes : bank_largest) minimum += (bytes + tyloi::metal::pool_page() - 1) / tyloi::metal::pool_page() * tyloi::metal::pool_page();
         return resize(std::max(minimum, budget), true);
     }
 
@@ -575,8 +401,7 @@ struct MlxTqExpertCache::Impl {
                 std::rethrow_exception(failure);
             }
             rebuild_free_ranges();
-            for (int p = 0; p < 3; ++p) if (capacities[p] < previous[p])
-                madvise(pools[p].data + capacities[p], previous[p] - capacities[p], MADV_FREE_REUSABLE);
+            for (int p = 0; p < 3; ++p) pools[p].discard_tail(previous[p]);
             allocated = metadata + std::accumulate(capacities.begin(), capacities.end(), std::size_t{0});
             resources.set({0, 0, allocated.load(), backing, 0});
             if (!preserve_ceiling) requested_limit = budget;
@@ -599,7 +424,7 @@ struct MlxTqExpertCache::Impl {
 
     void rebuild_free_ranges() {
         for (int p = 0; p < 3; ++p) {
-            std::vector<Range> live;
+            std::vector<tyloi::metal::TqRange> live;
             for (const auto& [key, entry] : entries.entries()) live.push_back(entry.value.allocations[p]);
             std::sort(live.begin(), live.end(), [](const auto a, const auto b) { return a.offset < b.offset; });
             auto& pool = pools[p];
@@ -1133,7 +958,7 @@ struct MlxTqExpertCache::Impl {
     tyloi::HostParallelPool workers{{}, false};
     std::mutex execution;
     std::vector<Layer> layers;
-    std::array<Pool, 3> pools;
+    std::array<tyloi::metal::TqPool, 3> pools;
     tyloi::weights::Lru<std::uint64_t, Entry> entries{std::nullopt};
     std::optional<array> pending_output;
     std::optional<ResidentWork> resident_work;

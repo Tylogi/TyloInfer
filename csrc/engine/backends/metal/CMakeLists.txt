@@ -346,6 +346,7 @@ add_library(mfq-metal-runtime STATIC
     ${PROJECT_SOURCE_DIR}/backends/metal/storage/mlx_quantized_row_store.cpp
     ${PROJECT_SOURCE_DIR}/backends/metal/runtime/mlx_tq_expert_cache.cpp
     ${TYLOINFER_METAL_ROOT}/native/pool.cpp
+    ${TYLOINFER_METAL_ROOT}/native/tq_pool.cpp
     ${PROJECT_SOURCE_DIR}/backends/metal/runtime/mlx_expert_segment_cache.cpp
     ${PROJECT_SOURCE_DIR}/backends/metal/storage/mlx_tq_rows.cpp
     ${PROJECT_SOURCE_DIR}/backends/metal/storage/compat/mlx_legacy_tensor_compat.cpp

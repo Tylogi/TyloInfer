@@ -1,6 +1,7 @@
 #include "engine/weights/tq/cache.h"
 
 #include "engine/weights/tq/image.h"
+#include "engine/backends/cuda/ops/projection/tq.h"
 #include "engine/backends/cuda/native/device.h"
 #include "engine/backends/cuda/native/memory.h"
 #include "engine/backends/cuda/native/stream.h"
@@ -30,6 +31,20 @@ std::size_t available_host_bytes(std::size_t process_limit) {
     } catch(const std::runtime_error&) {return 0;}
 }
 }
+
+struct TqCache::Upload {
+    tyloi::cuda::Event event{cudaEventDisableTiming};
+    cudaStream_t producer;
+    explicit Upload(cudaStream_t stream) : producer(stream) {}
+};
+
+struct TqCache::ViewTable {
+    int device;
+    cudaStream_t stream;
+    ::tyloi::DenseTensor views;
+    std::vector<std::uintptr_t> images;
+    std::vector<std::uint8_t> bytes;
+};
 
 struct TqCache::HostImage {
     tyloi::TqLayout layout;
@@ -90,7 +105,7 @@ struct TqCache::Stage {
     void reuse(){if(pending){uploaded.synchronize();pending=false;}cursor=0;}
 };
 
-TqCache::HostTransfer::~HostTransfer() noexcept { try { ready->synchronize(); } catch (...) {} }
+TqCache::HostTransfer::~HostTransfer() noexcept { try { ready->event.synchronize(); } catch (...) {} }
 
 std::size_t TqCache::reserve_host_locked(std::size_t bytes) {
     if(!bytes || host_.empty())return 0;
@@ -267,9 +282,9 @@ std::vector<::tyloi::encoding::TqTensor> TqCache::get(std::uint64_t source,const
     const auto resources=tq_->get(device);
     std::vector<::tyloi::encoding::TqTensor> result;result.reserve(count);
     const auto stream=mfq_get_current_cuda_stream(device);
-    std::shared_ptr<tyloi::cuda::Event> uploaded;
+    std::shared_ptr<Upload> uploaded;
     for(auto it=host_transfers_.begin();it!=host_transfers_.end();)
-        if(it->ready->ready())it=host_transfers_.erase(it);else ++it;
+        if(it->ready->event.ready())it=host_transfers_.erase(it);else ++it;
     auto transfer=host_transfers_.end();
     std::unordered_set<cudaEvent_t> waited;
     try {
@@ -279,8 +294,8 @@ std::vector<::tyloi::encoding::TqTensor> TqCache::get(std::uint64_t source,const
     const DeviceKey device_key{key,device};
     ++calls_;
     if(const auto* resident=device_.get(device_key)) {
-        if(resident->producer!=stream.stream()) {
-            const auto event=resident->uploaded->get();
+        if(resident->uploaded->producer!=stream.stream()) {
+            const auto event=resident->uploaded->event.get();
             if(waited.insert(event).second)TYLOINFER_CUDA_CHECK(cudaStreamWaitEvent(stream.stream(),event,0));
             resources->retain(stream);
             mfq_cuda_record_stream(resident->weight,stream);
@@ -316,7 +331,7 @@ std::vector<::tyloi::encoding::TqTensor> TqCache::get(std::uint64_t source,const
     auto storage=::tyloi::cuda::empty({static_cast<std::int64_t>(needed)},::tyloi::TensorOptions().device(::tyloi::Device(::tyloi::kCUDA,device)).dtype(::tyloi::kUInt8));
     auto weight=tq_view(storage,image->layout,table.width());
     if(image->registered) {
-        if(!uploaded)uploaded=std::make_shared<tyloi::cuda::Event>(cudaEventDisableTiming);
+        if(!uploaded)uploaded=std::make_shared<Upload>(stream.stream());
         if(transfer==host_transfers_.end()) {
             host_transfers_.emplace_back();transfer=std::prev(host_transfers_.end());transfer->ready=uploaded;
         }
@@ -330,8 +345,8 @@ std::vector<::tyloi::encoding::TqTensor> TqCache::get(std::uint64_t source,const
         upload_submit_ms_+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count();
     }else upload(storage,image->bytes);
     if(!device_.limit() || needed<=*device_.limit()) {
-        if(!uploaded)uploaded=std::make_shared<tyloi::cuda::Event>(cudaEventDisableTiming);
-        device_.put(device_key,DeviceEntry{weight,uploaded,stream.stream(),image->source_bytes},needed);
+        if(!uploaded)uploaded=std::make_shared<Upload>(stream.stream());
+        device_.put(device_key,DeviceEntry{weight,uploaded,image->source_bytes},needed);
     }
     result.push_back(std::move(weight));
     if((calls_&4095)==0)report();
@@ -339,9 +354,9 @@ std::vector<::tyloi::encoding::TqTensor> TqCache::get(std::uint64_t source,const
     }catch(...) {
         // Publish readiness even when a later expert read/allocation
         // fails, before another request can observe the inserted entries.
-        if(uploaded)uploaded->record(stream.stream());
+        if(uploaded)uploaded->event.record(stream.stream());
         throw;
     }
-    if(uploaded)uploaded->record(stream.stream());
+    if(uploaded)uploaded->event.record(stream.stream());
     return result;
 }

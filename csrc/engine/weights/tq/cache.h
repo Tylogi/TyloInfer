@@ -1,18 +1,19 @@
 #pragma once
 
-#include "engine/backends/cuda/ops/projection/tq.h"
+#include "engine/weights/encoding/tq.h"
 #include "engine/weights/lru.h"
 
 #include <array>
+#include <cstdint>
 #include <list>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <utility>
 #include <unordered_map>
+#include <vector>
 
 namespace tyloi { class TqTable; }
-namespace tyloi::cuda { class Event; }
 class TqExec;
 
 // Selected weights own their backing after eviction; uploads retain host data
@@ -34,10 +35,11 @@ public:
     std::vector<std::pair<std::string, double>> metrics();
 
 private:
+    struct Upload;
     struct HostImage;
     struct Stage;
     struct HostTransfer {
-        std::shared_ptr<tyloi::cuda::Event> ready;
+        std::shared_ptr<Upload> ready;
         std::vector<std::shared_ptr<HostImage>> images;
         ~HostTransfer() noexcept;
     };
@@ -53,17 +55,10 @@ private:
     };
     struct DeviceEntry {
         ::tyloi::encoding::TqTensor weight;
-        std::shared_ptr<tyloi::cuda::Event> uploaded;
-        cudaStream_t producer = nullptr;
+        std::shared_ptr<Upload> uploaded;
         std::size_t source_bytes = 0;
     };
-    struct ViewTable {
-        int device;
-        cudaStream_t stream;
-        ::tyloi::DenseTensor views;
-        std::vector<std::uintptr_t> images;
-        std::vector<std::uint8_t> bytes;
-    };
+    struct ViewTable;
     struct DeviceStages {
         std::array<std::unique_ptr<Stage>, 2> stages;
         unsigned index = 0;
