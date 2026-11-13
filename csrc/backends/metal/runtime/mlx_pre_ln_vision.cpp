@@ -1,3 +1,4 @@
+#include "engine/backends/metal/ops/attention/attention.h"
 #include "mlx_pre_ln_vision.h"
 
 #include "mlx_legacy_tensor_compat.h"

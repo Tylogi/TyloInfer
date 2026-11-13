@@ -1,4 +1,6 @@
 #include "engine/backends/metal/ops/attention/kv.h"
+#include "engine/backends/metal/ops/attention/attention.h"
+#include "engine/backends/metal/native/tensor/tensor.h"
 
 #include <algorithm>
 #include <cmath>
@@ -13,6 +15,12 @@ namespace {
 using mlx::core::array;
 using mlx::core::Shape;
 using Kernel = mlx::core::fast::CustomKernelFunction;
+
+array floating(const array& input, mlx::core::Dtype dtype) {
+    auto result = input;
+    if (result.dtype() != dtype) result = mlx::core::astype(result, dtype);
+    return mlx::core::contiguous(result);
+}
 
 int rotation_width(int dimension) {
     if (dimension <= 0 || dimension > 1024) throw std::invalid_argument("unsupported TurboQuant KV head dimension");
@@ -293,6 +301,95 @@ const Kernel& attention_output() {
     return kernel;
 }
 }
+
+std::pair<array, array> mlx_kv_append(const tyloi::state::KvView& kv,
+    const array& key, const array& value, int position) {
+    const auto& key_storage = tyloi::metal::array(kv.physical_key);
+    const auto& value_storage = tyloi::metal::array(kv.physical_value);
+    const Shape start{0, 0, position, 0};
+    const Shape stop{static_cast<int>(kv.batch), static_cast<int>(kv.heads),
+        position + key.shape(2), key_storage.shape(3)};
+    auto next_key = mlx::core::slice_update(key_storage,
+        kv.quantization.enabled() ? mlx_kv_encode(floating(key, tyloi::metal::dtype(kv.dtype)), kv.quantization.key_bits(), false)
+                                  : floating(key, tyloi::metal::dtype(kv.dtype)), start, stop);
+    auto next_value = mlx::core::slice_update(value_storage,
+        kv.quantization.enabled() ? mlx_kv_encode(floating(value, tyloi::metal::dtype(kv.dtype)), kv.quantization.value_bits(), true)
+                                  : floating(value, tyloi::metal::dtype(kv.dtype)), start,
+        Shape{static_cast<int>(kv.batch), static_cast<int>(kv.heads), position + key.shape(2), value_storage.shape(3)});
+    return {std::move(next_key), std::move(next_value)};
+}
+
+std::pair<array, array> mlx_kv_view(const tyloi::state::KvView& kv, int position) {
+    const auto& key = tyloi::metal::array(kv.physical_key);
+    const auto& value = tyloi::metal::array(kv.physical_value);
+    const Shape start{0, 0, 0, 0};
+    auto result = std::pair{
+        mlx::core::slice(key, start, Shape{static_cast<int>(kv.batch), static_cast<int>(kv.heads), position, key.shape(3)}),
+        mlx::core::slice(value, start, Shape{static_cast<int>(kv.batch), static_cast<int>(kv.heads), position, value.shape(3)})};
+    if (kv.quantization.enabled())
+        return {mlx_kv_decode(result.first, static_cast<int>(kv.head_dim), kv.quantization.key_bits(), false, tyloi::metal::dtype(kv.dtype)),
+                mlx_kv_decode(result.second, static_cast<int>(kv.head_dim), kv.quantization.value_bits(), true, tyloi::metal::dtype(kv.dtype))};
+    return result;
+}
+
+array mlx_kv_attention(const array& query, const tyloi::state::KvView& kv, int position, bool causal) {
+    const auto& key_storage = tyloi::metal::array(kv.physical_key);
+    const auto& value_storage = tyloi::metal::array(kv.physical_value);
+    if (!kv.quantization.enabled()) {
+        const auto cached = mlx_kv_view(kv, position);
+        return scaled_dot_product_attention(query, cached.first, cached.second, causal);
+    }
+    if (query.ndim() != 4 || query.shape(0) != static_cast<int>(kv.batch) || query.shape(1) % static_cast<int>(kv.heads) ||
+        query.shape(3) != static_cast<int>(kv.head_dim) || query.shape(2) > position)
+        throw std::invalid_argument("quantized dense KV attention topology mismatch");
+    const int tokens = query.shape(2), groups = query.shape(1) / static_cast<int>(kv.heads), offset = position - tokens;
+    std::vector<array> outputs;
+    for (int begin = 0; begin < tokens; begin += 32) {
+        const int count = std::min(32, tokens - begin);
+        auto q = mlx::core::reshape(mlx::core::astype(mlx::core::slice(query, Shape{0, 0, begin, 0},
+            Shape{static_cast<int>(kv.batch), query.shape(1), begin + count, static_cast<int>(kv.head_dim)}), mlx::core::float32),
+            Shape{static_cast<int>(kv.batch), static_cast<int>(kv.heads), groups, count, static_cast<int>(kv.head_dim)});
+        std::optional<array> maximum, norm, weighted;
+        const int end = causal ? offset + begin + count : position;
+        for (int start = 0; start < end; start += 1024) {
+            const int rows = std::min(1024, end - start);
+            auto decode = [&](const array& source, bool value) {
+                auto packed = mlx::core::slice(source, Shape{0, 0, start, 0}, Shape{static_cast<int>(kv.batch), static_cast<int>(kv.heads), start + rows, source.shape(3)});
+                return mlx::core::expand_dims(mlx_kv_decode(packed, static_cast<int>(kv.head_dim),
+                    value ? kv.quantization.value_bits() : kv.quantization.key_bits(), value, mlx::core::float32), 2);
+            };
+            auto scores = mlx::core::matmul(q, mlx::core::swapaxes(decode(key_storage, false), -1, -2)) /
+                std::sqrt(static_cast<float>(static_cast<int>(kv.head_dim)));
+            if (causal) {
+                auto visible = mlx::core::reshape(mlx::core::arange(offset + begin + 1, offset + begin + count + 1, mlx::core::int32),
+                    Shape{1, 1, 1, count, 1});
+                scores = mlx::core::where(mlx::core::less(mlx::core::arange(start, start + rows, mlx::core::int32), visible),
+                    scores, array(-std::numeric_limits<float>::infinity()));
+            }
+            auto local_max = mlx::core::max(scores, -1, true);
+            auto safe_max = mlx::core::where(mlx::core::isfinite(local_max), local_max, array(0.0f));
+            auto probabilities = mlx::core::exp(scores - safe_max);
+            auto local_norm = mlx::core::sum(probabilities, -1, true);
+            auto local_weighted = mlx::core::matmul(probabilities, decode(value_storage, true));
+            if (maximum) {
+                auto next_max = mlx::core::maximum(*maximum, local_max);
+                auto current_scale = mlx::core::exp(safe_max - next_max);
+                auto previous_scale = mlx::core::exp(*maximum - next_max);
+                norm = *norm * previous_scale + local_norm * current_scale;
+                weighted = *weighted * previous_scale + local_weighted * current_scale;
+                maximum = std::move(next_max);
+            } else {
+                maximum = std::move(local_max); norm = std::move(local_norm); weighted = std::move(local_weighted);
+            }
+            mlx::core::eval(*maximum, *norm, *weighted);
+        }
+        auto output = mlx::core::reshape(mlx::core::astype(*weighted / *norm, query.dtype()),
+            Shape{static_cast<int>(kv.batch), query.shape(1), count, static_cast<int>(kv.head_dim)});
+        output.eval(); outputs.push_back(std::move(output));
+    }
+    return outputs.size() == 1 ? outputs.front() : mlx::core::concatenate(outputs, 2);
+}
+
 
 int mlx_kv_packed_width(int dimension, int bits) {
     if (bits < 2 || bits > 8) throw std::invalid_argument("invalid TurboQuant component bits");

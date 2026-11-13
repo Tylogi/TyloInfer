@@ -1,4 +1,6 @@
 #include "mlx_qwen4_causal_lm.h"
+#include "engine/backends/metal/ops/attention/attention.h"
+#include "engine/backends/metal/ops/attention/kv.h"
 #include "native/mlx_native_gguf.h"
 #include "mlx_gguf_rows.h"
 #include "mlx_affine_rows.h"
@@ -3749,7 +3751,7 @@ public:
             } else {
                 cache_->append_only(key, value);
                 if (!cache_->quantized()) {
-                    auto cache = cache_->view();
+                    auto cache = mlx_kv_view(cache_->storage(), cache_->position());
                     key_cache = std::move(cache.first);
                     value_cache = std::move(cache.second);
                 }
@@ -3786,7 +3788,12 @@ public:
             if (use_cache && cache_ && cache_->quantized()) {
                 std::optional<array> blocks;
                 if (cache_->position() > config_.indexer_budget) blocks = selected_blocks(index_query, pooled_keys(), query_offset);
-                return cache_->sparse_attention(query, blocks, query_offset, ratio, static_cast<int>(config_.indexer_budget));
+                if (query.ndim() != 4 || query.shape(0) != cache_->storage().batch ||
+                    query.shape(3) != cache_->storage().head_dim)
+                    throw std::invalid_argument("compressed QSA query topology mismatch");
+                return mlx_kv_sparse_attention(query, cache_->key_storage(), cache_->value_storage(),
+                    blocks, cache_->storage().quantization, cache_->position(), query_offset, ratio,
+                    static_cast<int>(config_.indexer_budget));
             }
             if (use_cache && offloaded_kv_) {
                 std::optional<array> blocks;

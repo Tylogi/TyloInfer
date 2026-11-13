@@ -2,7 +2,6 @@
 
 #include "mlx_resource_telemetry.h"
 #include "engine/state/kv_view.h"
-#include "engine/backends/metal/ops/attention/kv.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -114,14 +113,6 @@ mlx::core::array apply_rope(
     bool interleaved = false,
     const MlxYarnScaling& scaling = {});
 
-mlx::core::array scaled_dot_product_attention(
-    const mlx::core::array& query,
-    const mlx::core::array& key,
-    const mlx::core::array& value,
-    bool causal = true,
-    float scale = 0.0f,
-    const std::optional<mlx::core::array>& mask = std::nullopt);
-
 // Return the visible rows of a [batch,window,...] circular cache in
 // chronological order. `position` is the absolute position immediately after
 // the last committed row.
@@ -146,14 +137,9 @@ public:
 
     void materialize();
 
-    std::pair<mlx::core::array, mlx::core::array> append(
-        const mlx::core::array& key,
-        const mlx::core::array& value);
     void append_only(const mlx::core::array& key, const mlx::core::array& value);
     bool quantized() const noexcept { return kv_.quantization.enabled(); }
-    mlx::core::array attention(const mlx::core::array& query, bool causal = true) const;
-    mlx::core::array sparse_attention(const mlx::core::array& query,
-        const std::optional<mlx::core::array>& blocks, int query_offset, int ratio, int budget) const;
+    const tyloi::state::KvView& storage() const noexcept { return kv_; }
 
     // Reserve cache rows without materializing an indexed update. Specialized
     // decode primitives use this when the projection/post-processing kernel
@@ -163,8 +149,6 @@ public:
     // Discard an appended speculative suffix. Storage is intentionally kept;
     // the next append overwrites the now-invisible rows.
     void trim(int tokens);
-
-    std::pair<mlx::core::array, mlx::core::array> view() const;
 
     // Session snapshots own a compact copy of the visible prefix. Restoring
     // recreates the original allocation capacity without aliasing the saved

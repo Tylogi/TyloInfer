@@ -1,4 +1,5 @@
 #include "mlx_paged_session_codec.h"
+#include "engine/backends/metal/ops/attention/kv.h"
 #include "mlx_resident_budget.h"
 
 #include <algorithm>

@@ -1,3 +1,4 @@
+#include "engine/backends/metal/ops/attention/attention.h"
 #include "mlx_deepseek_v4_vision.h"
 
 #include "mlx_multimodal.h"

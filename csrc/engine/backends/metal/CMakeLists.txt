@@ -375,6 +375,7 @@ add_library(mfq-metal-runtime STATIC
     ${PROJECT_SOURCE_DIR}/backends/metal/runtime/mlx_inference_warmup.cpp
     ${PROJECT_SOURCE_DIR}/backends/metal/runtime/mlx_tensor.cpp
     ${PROJECT_SOURCE_DIR}/backends/metal/runtime/mlx_transformer.cpp
+    ${TYLOINFER_METAL_ROOT}/ops/attention/attention.cpp
     ${TYLOINFER_METAL_ROOT}/ops/attention/kv.cpp
     ${PROJECT_SOURCE_DIR}/backends/metal/runtime/mlx_qsa_kv_offload.cpp
     ${PROJECT_SOURCE_DIR}/backends/metal/models/dflash2/mlx_dflash2.cpp

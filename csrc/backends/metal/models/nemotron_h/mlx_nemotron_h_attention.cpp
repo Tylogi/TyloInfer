@@ -1,4 +1,6 @@
 #include "mlx_nemotron_h_attention.h"
+#include "engine/backends/metal/ops/attention/attention.h"
+#include "engine/backends/metal/ops/attention/kv.h"
 
 #include "mlx_nemotron_h_ops.h"
 
@@ -212,9 +214,10 @@ array MlxNemotronHAttentionBlock::forward_impl(
         if (!use_cache) {
             return scaled_dot_product_attention(query, key, value, true);
         }
-        auto cached = cache_->append(key, value);
+        cache_->append_only(key, value);
+        auto cached = mlx_kv_view(cache_->storage(), cache_->position());
         return cache_->quantized()
-            ? cache_->attention(query)
+            ? mlx_kv_attention(query, cache_->storage(), cache_->position())
             : scaled_dot_product_attention(
                   query, cached.first, cached.second, true);
     }();

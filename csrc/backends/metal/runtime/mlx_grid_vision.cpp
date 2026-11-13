@@ -1,3 +1,4 @@
+#include "engine/backends/metal/ops/attention/attention.h"
 #include "mlx_grid_vision.h"
 
 #include "engine/models/source/model_graph.h"

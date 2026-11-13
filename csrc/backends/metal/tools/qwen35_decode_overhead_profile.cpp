@@ -1,4 +1,6 @@
 #include "mfq_container.h"
+#include "engine/backends/metal/ops/attention/attention.h"
+#include "engine/backends/metal/ops/attention/kv.h"
 #include "mlx_linear_attention.h"
 #include "mlx_qwen35_causal_lm.h"
 #include "mlx_sampling.h"
@@ -484,9 +486,8 @@ double benchmark_full_attention_state(
                 dimension,
                 maximum_context,
                 mlx::core::float16));
-        auto views = caches.back()->append(
-            initial_key,
-            initial_value);
+        caches.back()->append_only(initial_key, initial_value);
+        auto views = mfq::metal::mlx_kv_view(caches.back()->storage(), caches.back()->position());
         initial_outputs.push_back(
             std::move(views.first));
         initial_outputs.push_back(
@@ -516,10 +517,9 @@ double benchmark_full_attention_state(
                     static_cast<int>(config.rotary_dim),
                     static_cast<float>(config.rope_base),
                     offset);
-                auto views =
-                    caches[
-                        static_cast<std::size_t>(index)]
-                        ->append(key, value);
+                auto& cache = *caches[static_cast<std::size_t>(index)];
+                cache.append_only(key, value);
+                auto views = mfq::metal::mlx_kv_view(cache.storage(), cache.position());
                 auto attended =
                     mfq::metal::scaled_dot_product_attention(
                         query,

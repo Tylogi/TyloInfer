@@ -1,4 +1,6 @@
 #include "mlx_minicpmo45.h"
+#include "engine/backends/metal/ops/attention/attention.h"
+#include "engine/backends/metal/ops/attention/kv.h"
 #include "mlx_pre_ln_vision.h"
 #include "mlx_multimodal.h"
 
@@ -2007,12 +2009,13 @@ public:
                 // The fused GQA path reads persistent storage directly. Do
                 // not create two dead slice nodes for every decoder layer.
                 if (!use_fused_gqa) {
-                    auto cached = cache_->view();
+                    auto cached = mlx_kv_view(cache_->storage(), cache_->position());
                     keys = std::move(cached.first);
                     values = std::move(cached.second);
                 }
             } else {
-                auto cached = cache_->append(key, value);
+                cache_->append_only(key, value);
+                auto cached = mlx_kv_view(cache_->storage(), cache_->position());
                 keys = std::move(cached.first);
                 values = std::move(cached.second);
             }

@@ -1,3 +1,4 @@
+#include "engine/backends/metal/ops/attention/attention.h"
 #include "qwen4_ops.h"
 #include "mlx_nint_metadata.h"
 #include "engine/backends/metal/native/kernel.h"

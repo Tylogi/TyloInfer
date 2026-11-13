@@ -1,3 +1,4 @@
+#include "engine/backends/metal/ops/attention/attention.h"
 #include "mlx_axial_patch_vision.h"
 
 #include "mlx_tensor.h"

@@ -1,3 +1,5 @@
+#include "engine/backends/metal/ops/attention/attention.h"
+#include "engine/backends/metal/ops/attention/kv.h"
 #include "engine/config.h"
 #include "mlx_qsa_kv_offload.h"
 #include "qwen4_ops.h"

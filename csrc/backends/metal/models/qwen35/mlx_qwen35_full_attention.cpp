@@ -1,4 +1,6 @@
 #include "mlx_qwen35_full_attention.h"
+#include "engine/backends/metal/ops/attention/attention.h"
+#include "engine/backends/metal/ops/attention/kv.h"
 #include "engine/backends/metal/native/profile.h"
 #include "mlx_kernel_prepare.h"
 #include "native/mlx_native_gguf.h"
@@ -623,13 +625,13 @@ array MlxQwen35FullAttentionBlock::forward_impl(
     if (use_cache) {
         cache_->append_only(key, value);
         if (!cache_->quantized()) {
-            auto cached = cache_->view();
+            auto cached = mlx_kv_view(cache_->storage(), cache_->position());
             key_cache = std::move(cached.first);
             value_cache = std::move(cached.second);
         }
     }
 
-    auto attended = use_cache && cache_->quantized() ? cache_->attention(query) : scaled_dot_product_attention(
+    auto attended = use_cache && cache_->quantized() ? mlx_kv_attention(query, cache_->storage(), cache_->position()) : scaled_dot_product_attention(
         query,
         key_cache,
         value_cache,
