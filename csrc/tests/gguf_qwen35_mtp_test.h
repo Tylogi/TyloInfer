@@ -36,7 +36,7 @@ void qwen35_nextn_companion_source(const std::filesystem::path& directory) {
         return path;
     };
     const auto main=fixture("qwen35-backbone.gguf",false),head=fixture("qwen35-with-nextn.gguf",true);
-    const tyloi::GgufModelSource plain(main),standalone(head),combined(main,{head});
+    const tyloi::models::GgufSource plain(main),standalone(head),combined(main,{head});
     const auto first_shard=directory/"qwen35-nextn-00001-of-00002.gguf";
     const auto last_shard=directory/"qwen35-nextn-00002-of-00002.gguf";
     {
@@ -56,7 +56,7 @@ void qwen35_nextn_companion_source(const std::filesystem::path& directory) {
         require(gguf_write_to_file(first.get(),first_shard.string().c_str(),false) &&
             gguf_write_to_file(last.get(),last_shard.string().c_str(),false),"Qwen nextn shard fixture write failed");
     }
-    const tyloi::GgufModelSource split(last_shard);
+    const tyloi::models::GgufSource split(last_shard);
     require(nlohmann::json::parse(plain.model_config_json()).value("mtp_num_hidden_layers",0)==0,"plain Qwen GGUF gained a predictor");
     for(const auto* source:{&standalone,&combined,&split}) {
         const auto config=nlohmann::json::parse(source->model_config_json());
@@ -81,7 +81,7 @@ void qwen35_nextn_companion_source(const std::filesystem::path& directory) {
     require(range && range->path==std::filesystem::absolute(head),"Qwen MTP companion lost its original file range");
     const auto rejects=[&](const std::filesystem::path& path,bool companion) {
         bool rejected=false;
-        try {tyloi::GgufModelSource source(companion?main:path,companion?std::vector<std::filesystem::path>{path}:std::vector<std::filesystem::path>{});}
+        try {tyloi::models::GgufSource source(companion?main:path,companion?std::vector<std::filesystem::path>{path}:std::vector<std::filesystem::path>{});}
         catch(const std::runtime_error&){rejected=true;}
         return rejected;
     };
@@ -89,7 +89,7 @@ void qwen35_nextn_companion_source(const std::filesystem::path& directory) {
     require(rejects(fixture("qwen35-incomplete-nextn.gguf",true,32,false),false),"incomplete Qwen nextn head accepted");
     require(rejects(fixture("qwen35-invalid-nextn-count.gguf",true,32,true,2),false),"invalid Qwen nextn block count accepted");
     bool duplicate=false;
-    try {tyloi::GgufModelSource invalid(head,{head});}catch(const std::runtime_error&){duplicate=true;}
+    try {tyloi::models::GgufSource invalid(head,{head});}catch(const std::runtime_error&){duplicate=true;}
     require(duplicate,"duplicate Qwen MTP source accepted");
     std::cout<<"Qwen GGUF native nextn and read-only head companion checks PASS\n";
 }

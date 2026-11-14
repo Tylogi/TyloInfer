@@ -1,4 +1,5 @@
 #include "engine/requests/tokenizer_identity.h"
+#include "engine/weights/gguf.h"
 #include "gguf.h"
 
 #include <cstdio>

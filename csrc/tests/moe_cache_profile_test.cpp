@@ -1,4 +1,4 @@
-#include "moe_cache_profile.h"
+#include "engine/weights/moe/profile.h"
 #include "moe_cache_profile_path.h"
 #include <chrono>
 

@@ -1,6 +1,6 @@
 #include "inference.h"
 #include "generation_policy.h"
-#include "gguf.h"
+#include "engine/weights/gguf.h"
 #include <cassert>
 int main() {
     using namespace tyloi::engine;

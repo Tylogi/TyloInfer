@@ -1,7 +1,7 @@
 #include "engine/models/source/gguf_source.h"
 #include "engine/models/source/model_config.h"
 #include "components/ggml/include/ggml.h"
-#include "gguf.h"
+#include "engine/weights/gguf.h"
 #include "components/json/nlohmann/json.hpp"
 
 #include <algorithm>
@@ -29,7 +29,7 @@ std::vector<std::byte> read_tensor(
 } // namespace
 
 void require(bool ok, const char* message) { if (!ok) throw std::runtime_error(message); }
-void grouped_source_reads(const tyloi::GgufModelSource& source) {
+void grouped_source_reads(const tyloi::models::GgufSource& source) {
     const auto reader=source.tensor_group_reader();
     require(reader==source.tensor_group_reader(),"grouped tensor readers do not share a source identity");
     std::vector<std::vector<std::byte>> expected,actual;
@@ -37,7 +37,7 @@ void grouped_source_reads(const tyloi::GgufModelSource& source) {
     for(const auto& tensor:source.tensors()) {
         expected.push_back(source.read(tensor.name));actual.emplace_back(expected.back().size(),std::byte{0x5a});
     }
-    std::vector<tyloi::GgufModelSource::NamedReadSpan> spans;
+    std::vector<tyloi::models::GgufSource::NamedReadSpan> spans;
     for(std::size_t i=source.tensors().size();i-->0;) {
         const auto& tensor=source.tensors()[i];const auto half=actual[i].size()/2;
         spans.push_back({tensor.name,{half,actual[i].empty()?nullptr:actual[i].data()+half,actual[i].size()-half}});
@@ -56,7 +56,7 @@ void grouped_source_reads(const tyloi::GgufModelSource& source) {
         (*reader)({{first.name,{1,aliased.data(),19}},{tensor.name,{3,aliased.data()+7,15}}});
         require(aliased==reference,"grouped reads changed overlapping destination order");break;
     }
-    const auto rejects=[&](tyloi::GgufModelSource::NamedReadSpan bad) {
+    const auto rejects=[&](tyloi::models::GgufSource::NamedReadSpan bad) {
         std::byte unchanged{0x5a};bool rejected=false;
         try{(*reader)({{first.name,{0,&unchanged,1}},bad});}catch(const std::exception&){rejected=true;}
         require(rejected && unchanged==std::byte{0x5a},"grouped read failed to validate all ranges before writing");
@@ -88,7 +88,7 @@ void raw_part_source(const std::filesystem::path& path, const std::vector<std::f
         std::size_t first_cut = 37, int count = 4, int width = 2) {
     std::ifstream input(path, std::ios::binary);
     const std::vector<char> bytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
-    const tyloi::GgufModelSource complete(path, companions);
+    const tyloi::models::GgufSource complete(path, companions);
     grouped_source_reads(complete);
     std::vector<std::size_t> cuts{0, first_cut, bytes.size() / 2 + 3, bytes.size() - 7, bytes.size()};
     if (count != 4) {
@@ -108,11 +108,11 @@ void raw_part_source(const std::filesystem::path& path, const std::vector<std::f
     for (const auto& selected : {parts.front(), parts.back()}) {
         require(tyloi::is_gguf_file(selected), "noninitial raw GGUF part not recognized");
         const std::shared_ptr<const tyloi::ModelSource> source = companions.empty() ? tyloi::open_model_source(selected)
-            : std::make_shared<tyloi::GgufModelSource>(selected, companions);
+            : std::make_shared<tyloi::models::GgufSource>(selected, companions);
         require(source->architecture() == complete.architecture() && source->metadata() == complete.metadata() &&
             source->tensors().size() == complete.tensors().size(), "raw parts changed model metadata");
         require(source->source_paths().size() == parts.size() + companions.size(), "raw parts source paths missing");
-        grouped_source_reads(dynamic_cast<const tyloi::GgufModelSource&>(*source));
+        grouped_source_reads(dynamic_cast<const tyloi::models::GgufSource&>(*source));
         for (const auto& tensor : complete.tensors()) {
             const auto expected = complete.read(tensor.name);
             require(source->read(tensor.name) == expected, "raw part tensor bytes changed");
@@ -128,11 +128,11 @@ void raw_part_source(const std::filesystem::path& path, const std::vector<std::f
             require(source->read_asset(asset) == complete.read_asset(asset), "raw parts changed tokenizer or assets");
     }
     tyloi::ModelSource::TensorReader retained;
-    std::shared_ptr<const tyloi::GgufModelSource::TensorGroupReader> retained_group;
+    std::shared_ptr<const tyloi::models::GgufSource::TensorGroupReader> retained_group;
     std::string retained_name;
     std::vector<std::byte> expected;
     {
-        const tyloi::GgufModelSource source(parts.back(), companions);
+        const tyloi::models::GgufSource source(parts.back(), companions);
         const auto name = source.tensors().front().name;
         expected = source.read(name);
         retained = source.tensor_reader(name);
@@ -149,12 +149,12 @@ void raw_part_source(const std::filesystem::path& path, const std::vector<std::f
     (*retained_group)({{retained_name,{0,actual.data(),actual.size()}}});
     require(actual==expected,"grouped reader expired or reopened a renamed source");
     bool missing = false;
-    try { tyloi::GgufModelSource invalid(parts.front(), companions); } catch (const std::runtime_error&) { missing = true; }
+    try { tyloi::models::GgufSource invalid(parts.front(), companions); } catch (const std::runtime_error&) { missing = true; }
     require(missing, "incomplete raw GGUF parts accepted");
     std::filesystem::rename(hidden, parts[1]);
     std::filesystem::resize_file(parts[2], 1);
     bool truncated = false;
-    try { tyloi::GgufModelSource invalid(parts.front(), companions); } catch (const std::runtime_error&) { truncated = true; }
+    try { tyloi::models::GgufSource invalid(parts.front(), companions); } catch (const std::runtime_error&) { truncated = true; }
     require(truncated, "truncated raw GGUF payload accepted");
 }
 
@@ -291,7 +291,7 @@ void deepseek_source(const std::filesystem::path& directory) {
     }
     const auto path = directory / "deepseek.gguf";
     require(gguf_write_to_file(file, path.string().c_str(), false), "DeepSeek fixture write failed");
-    const tyloi::GgufModelSource source(path);
+    const tyloi::models::GgufSource source(path);
     require(json::parse(source.model_config_json()) == config, "DeepSeek embedded config changed");
     const auto name = "model.block.1.associative_memory.embedding.weight";
     const auto* table = source.find_tensor(name);
@@ -315,7 +315,7 @@ void deepseek_source(const std::filesystem::path& directory) {
     const auto rejects = [&] {
         require(gguf_write_to_file(file, path.string().c_str(), false), "invalid DeepSeek fixture write failed");
         bool rejected = false;
-        try { tyloi::GgufModelSource invalid(path); } catch (const std::exception&) { rejected = true; }
+        try { tyloi::models::GgufSource invalid(path); } catch (const std::exception&) { rejected = true; }
         require(rejected, "invalid DeepSeek GGUF accepted");
     };
     gguf_set_val_u32(file, "deepseek41.engram.pad_id", 1); rejects();
@@ -436,7 +436,7 @@ void qwen4_source(const std::filesystem::path& directory) {
         const auto invalid_path = directory / ("mixed-invalid-" + std::to_string(invalid) + ".gguf");
         require(gguf_write_to_file(main, invalid_path.string().c_str(), false), "invalid mixed fixture write failed");
         bool rejected = false;
-        try { tyloi::GgufModelSource invalid_source(invalid_path); }
+        try { tyloi::models::GgufSource invalid_source(invalid_path); }
         catch (const std::runtime_error&) { rejected = true; }
         require(rejected, "invalid mixed expert type or slot count accepted");
     }
@@ -450,7 +450,7 @@ void qwen4_source(const std::filesystem::path& directory) {
     require(gguf_write_to_file(companion, table_path.string().c_str(), false), "Qwen4 PLE write failed");
     gguf_free(main); gguf_free(companion); ggml_free(tensors);
     raw_part_source(main_path, {table_path});
-    const tyloi::GgufModelSource source(main_path, {table_path});
+    const tyloi::models::GgufSource source(main_path, {table_path});
     for (const auto* role : {"gate", "up", "down"}) {
         const auto name = std::string("model.block.1.mlp.experts.") + role + ".weight";
         const auto* tensor = source.find_tensor(name);
@@ -487,7 +487,7 @@ void qwen4_source(const std::filesystem::path& directory) {
         tyloi::ModelSource::TensorReader retained;
         tyloi::ModelSource::TensorBatchReader retained_batch;
         {
-            const tyloi::GgufModelSource temporary(main_path, {table_path});
+            const tyloi::models::GgufSource temporary(main_path, {table_path});
             retained = temporary.tensor_reader(name);
             retained_batch = temporary.tensor_batch_reader(name);
         }
@@ -595,7 +595,7 @@ void qwen4_source(const std::filesystem::path& directory) {
         add("predictor.output.token_ids", GGML_TYPE_I64, {32});
         const auto canonical_path = directory / "canonical-predictor.gguf";
         require(gguf_write_to_file(canonical, canonical_path.string().c_str(), false), "canonical MTP write failed");
-        const tyloi::GgufModelSource canonical_source(main_path, {table_path, canonical_path});
+        const tyloi::models::GgufSource canonical_source(main_path, {table_path, canonical_path});
         const auto canonical_config = nlohmann::json::parse(canonical_source.model_config_json());
         require(canonical_config["mtp_num_hidden_layers"] == 1, "canonical MTP layer count differs");
         require(canonical_source.find_tensor("predictor.block.0.mlp.experts.gate.weight") &&
@@ -651,7 +651,7 @@ void compact_formats(const std::filesystem::path& directory) {
     const auto path = directory / "compact-formats.gguf";
     require(gguf_write_to_file(header, path.string().c_str(), false), "compact GGUF write failed");
     {
-        tyloi::GgufModelSource source(path);
+        tyloi::models::GgufSource source(path);
         for (int type = GGML_TYPE_PTQ1_0; type <= GGML_TYPE_TQK4; ++type) {
             const auto name = "compact." + std::to_string(type) + ".weight";
             const auto* tensor = source.find_tensor(name);
@@ -681,7 +681,7 @@ void compact_formats(const std::filesystem::path& directory) {
     const auto rotated = directory / "compact-hadamard.gguf";
     require(gguf_write_to_file(header, rotated.string().c_str(), false), "Hadamard metadata write failed");
     {
-        tyloi::GgufModelSource source(rotated);
+        tyloi::models::GgufSource source(rotated);
         const auto transforms = nlohmann::json::parse(source.metadata().at("gguf_hadamard"));
         require(transforms.size() == names.size() && source.metadata().at("gguf_requires_hadamard") == "true",
             "Hadamard metadata/capability requirement missing");
@@ -700,7 +700,7 @@ void compact_formats(const std::filesystem::path& directory) {
     const auto bad_sign = directory / "compact-invalid-sign.gguf";
     require(gguf_write_to_file(header, bad_sign.string().c_str(), false), "invalid-sign fixture write failed");
     bool sign_rejected = false;
-    try { tyloi::GgufModelSource source(bad_sign); }
+    try { tyloi::models::GgufSource source(bad_sign); }
     catch (const std::runtime_error& error) { sign_rejected = std::string(error.what()).find("sign value") != std::string::npos; }
     require(sign_rejected, "Hadamard accepted a non-sign value");
     gguf_set_val_u32(header, "prism.hadamard.version", 1);
@@ -708,7 +708,7 @@ void compact_formats(const std::filesystem::path& directory) {
     const auto identity = directory / "compact-hadamard-identity.gguf";
     require(gguf_write_to_file(header, identity.string().c_str(), false), "identity-Hadamard fixture write failed");
     {
-        tyloi::GgufModelSource source(identity);
+        tyloi::models::GgufSource source(identity);
         const auto transforms = nlohmann::json::parse(source.metadata().at("gguf_hadamard"));
         for (const auto& name : names) require(transforms.at(name).at("signs").empty(), "Identity Hadamard acquired signs");
         for(const auto& name:names)require(source.hadamard_transforms()->at(name).signs.empty(),
@@ -718,7 +718,7 @@ void compact_formats(const std::filesystem::path& directory) {
     const auto invalid = directory / "compact-invalid-state.gguf";
     require(gguf_write_to_file(header, invalid.string().c_str(), false), "invalid-state fixture write failed");
     bool rejected = false;
-    try { tyloi::GgufModelSource source(invalid); }
+    try { tyloi::models::GgufSource source(invalid); }
     catch (const std::runtime_error& error) { rejected = std::string(error.what()).find("state_bits=15") != std::string::npos; }
     require(rejected, "unsupported Gyro state width accepted");
     gguf_free(header); ggml_free(tensors);
@@ -743,7 +743,7 @@ void qwen35_nextn_source(const std::filesystem::path& directory) {
     for (const int predictors : {0, 1, 2}) {
         gguf_set_val_u32(header, "qwen35.nextn_predict_layers", predictors);
         require(gguf_write_to_file(header, path.string().c_str(), false), "NextN fixture write failed");
-        tyloi::GgufModelSource source(path);
+        tyloi::models::GgufSource source(path);
         const auto config = nlohmann::json::parse(source.model_config_json());
         require(config.at("num_hidden_layers") == 3 - predictors && config.at("layer_types").size() == 3 - predictors,
             "GGUF NextN blocks leaked into the ordinary backbone");
@@ -761,7 +761,7 @@ void qwen35_nextn_source(const std::filesystem::path& directory) {
         else gguf_set_val_f32(header, "qwen35.nextn_predict_layers", .5f);
         require(gguf_write_to_file(header, path.string().c_str(), false), "invalid NextN fixture write failed");
         bool rejected = false;
-        try { tyloi::GgufModelSource source(path); }
+        try { tyloi::models::GgufSource source(path); }
         catch (const std::runtime_error& error) { rejected = std::string(error.what()).find("NextN layer count") != std::string::npos; }
         require(rejected, "invalid GGUF NextN layer count accepted");
     }
@@ -778,7 +778,7 @@ void qwen35_nextn_source(const std::filesystem::path& directory) {
     gguf_add_tensor(header, fusion);
     require(gguf_write_to_file(header, path.string().c_str(), false), "MTP fixture write failed");
     {
-        tyloi::GgufModelSource source(path);
+        tyloi::models::GgufSource source(path);
         const auto config = nlohmann::json::parse(source.model_config_json());
         require(config.at("num_hidden_layers") == 2 && config.at("mtp_num_hidden_layers") == 1,
             "GGUF NextN MTP geometry lost");
@@ -869,7 +869,7 @@ int main() {
             const auto mirror=directory/"mirror";std::filesystem::create_directory(mirror);
             std::filesystem::copy_file(path,mirror/path.filename());
             MirrorSetting setting(mirror);
-            tyloi::GgufModelSource mirrored(path);
+            tyloi::models::GgufSource mirrored(path);
             const auto read=mirrored.tensor_reader(table->name);
             const auto batch=mirrored.tensor_batch_reader(table->name);
             std::array<std::byte,19> first{},last{};

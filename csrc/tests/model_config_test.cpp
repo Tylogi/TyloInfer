@@ -6,7 +6,7 @@
 #include "models/nemotron_h/config.h"
 #include "models/minicpmo45/config.h"
 #include "models/qwen35/config.h"
-#include "models/common/model_config.h"
+#include "engine/models/source/model_config.h"
 
 #include <iostream>
 #include <stdexcept>
@@ -91,7 +91,7 @@ int main() {
         }
         require(rejected, "invalid GLM DSA schedule was accepted");
 
-        tyloi::MfqModelGraph graph;
+        tyloi::ModelGraph graph;
         graph.backbone = "qwen3_5";
         const auto qwen = tyloi::models::qwen35::Config::from_json(R"({
             "model_type":"qwen3_5","text_config":{
@@ -179,7 +179,7 @@ int main() {
             "n_group":1,"topk_group":1,"num_nextn_predict_layers":1,
             "mtp_layers_block_type":["attention","moe"]}})");
         const auto predictor =
-            tyloi::models::nemotron_h::Config::from_json(released.dump(), tyloi::MfqModelGraph{});
+            tyloi::models::nemotron_h::Config::from_json(released.dump(), tyloi::ModelGraph{});
         require(predictor.num_nextn_predict_layers == 1 &&
                     predictor.mtp_mixers ==
                         std::vector<tyloi::models::nemotron_h::MixerKind>{
@@ -197,7 +197,7 @@ int main() {
             rejected = false;
             try {
                 static_cast<void>(
-                    tyloi::models::nemotron_h::Config::from_json(broken.dump(), tyloi::MfqModelGraph{}));
+                    tyloi::models::nemotron_h::Config::from_json(broken.dump(), tyloi::ModelGraph{}));
             } catch (const std::runtime_error&) {
                 rejected = true;
             }
@@ -208,7 +208,7 @@ int main() {
         rejected = false;
         try {
             static_cast<void>(
-                tyloi::models::nemotron_h::Config::from_json(orphaned.dump(), tyloi::MfqModelGraph{}));
+                tyloi::models::nemotron_h::Config::from_json(orphaned.dump(), tyloi::ModelGraph{}));
         } catch (const std::runtime_error&) {
             rejected = true;
         }

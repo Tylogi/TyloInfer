@@ -1,5 +1,5 @@
 #include "text_processor.h"
-#include "gguf.h"
+#include "engine/weights/gguf.h"
 #include "mfq_text.h"
 
 #include <chrono>

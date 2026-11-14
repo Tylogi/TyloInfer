@@ -46,7 +46,7 @@ void check_manifest_keys() {
 }
 
 void check_numerical_values() {
-    using mfq::bench::max_absolute_difference;
+    using tyloi::bench::max_absolute_difference;
     const std::array<float, 3> reference{1.0f, -2.0f, 0.0f};
     const std::array<float, 3> candidate{1.25f, -2.5f, 0.0f};
     assert(max_absolute_difference(reference.data(), reference.data(), reference.size()) == 0.0f);

@@ -1,7 +1,7 @@
-#include "tyloinfer/mfe_quant_expert_store.h"
-#include "tyloinfer/host_parallel.h"
-#include "tyloinfer/packed_nint_expert_store.h"
-#include "tyloinfer/model_source.h"
+#include "engine/weights/encoding/quant/mfe_quant_expert_store.h"
+#include "engine/backends/cpu/native/host_parallel.h"
+#include "engine/weights/encoding/quant/packed_nint_expert_store.h"
+#include "engine/models/source.h"
 #include "nint_row_fixture.h"
 
 #include <atomic>

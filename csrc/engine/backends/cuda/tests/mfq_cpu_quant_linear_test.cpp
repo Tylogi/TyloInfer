@@ -2,7 +2,7 @@
 #include "storage/weights/loaders/weight.h"
 #include "quant_linear.h"
 #include "execution/execution.h"
-#include "tyloinfer/nint_rows.h"
+#include "engine/weights/encoding/quant/nint_rows.h"
 #include "tyloinfer/nvq_rows.h"
 
 #include <cmath>

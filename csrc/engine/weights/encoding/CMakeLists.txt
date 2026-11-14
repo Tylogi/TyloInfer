@@ -27,6 +27,13 @@ add_library(mfq-quant-readers STATIC
     mx_blob.h
     tq_table.cpp
     tq_table.h
+    # Host codec implementations; their headers live in this directory.
+    # native/row_residual.cpp is deliberately absent: it still uses the removed
+    # GgufModelSource and legacy tensor alias API and does not compile.
+    ${PROJECT_SOURCE_DIR}/engine/backends/cpu/native/mirrored_file_reader.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cpu/native/qsa_adaptive_cache.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cpu/native/qsa_ram_store.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cpu/native/qsa_tq_cpu.cpp
 )
 target_include_directories(mfq-quant-readers PRIVATE
     ${PROJECT_SOURCE_DIR})

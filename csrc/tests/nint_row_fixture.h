@@ -1,11 +1,11 @@
 #pragma once
-#include "tyloinfer/nint_rows.h"
+#include "engine/weights/encoding/quant/nint_rows.h"
 #include <cmath>
 #include <cstdint>
 #include <vector>
 #include <utility>
 
-namespace mfq::test {
+namespace tyloi::test {
 
 template <typename T>
 void append(std::vector<std::uint8_t>& bytes, T value) {
@@ -106,7 +106,7 @@ inline float half_value(std::uint16_t bits) {
     return bits & 0x8000u ? -magnitude : magnitude;
 }
 
-inline float row_value(const NintRowBatch& batch, std::size_t row, int column) {
+inline float row_value(const tyloi::NintRowBatch& batch, std::size_t row, int column) {
     const auto* d = batch.descriptors().data() + row * 6;
     const auto bits = [&](int offset, int shift, int index, int width) {
         unsigned value = 0;
@@ -126,4 +126,4 @@ inline float row_value(const NintRowBatch& batch, std::size_t row, int column) {
     const volatile float minimum = half_value(d[5] >> 16) * m;
     return scaled - minimum;
 }
-} // namespace mfq::test
+} // namespace tyloi::test

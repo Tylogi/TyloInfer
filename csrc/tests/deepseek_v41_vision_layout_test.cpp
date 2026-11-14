@@ -1,4 +1,4 @@
-#include "models/common/axial_patch_vision.h"
+#include "engine/models/deepseek_v41/axial_patch_vision.h"
 
 #include <iostream>
 #include <stdexcept>

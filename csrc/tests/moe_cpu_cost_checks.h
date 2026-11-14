@@ -1,14 +1,14 @@
 #pragma once
-#include "tyloinfer/moe_cpu_cost_model.h"
-#include "tyloinfer/moe_cpu_calibration.h"
+#include "engine/weights/moe/cpu_cost_model.h"
+#include "engine/weights/moe/cpu_calibration.h"
 #include <memory>
 #include <string>
 
 
 inline int cpu_calibration_checks() {
-    using Observation=mfq::MoeCpuCalibration::Observation;
-    mfq::MoeCpuCostModel model;mfq::MoeCpuCalibration state;
-    const mfq::MoeCpuCostModel::Key key{1,2,3,1};
+    using Observation=tyloi::MoeCpuCalibrationState::Observation;
+    tyloi::MoeCpuCostModel model;tyloi::MoeCpuCalibrationState state;
+    const tyloi::MoeCpuCostModel::Key key{1,2,3,1};
     std::promise<Observation> promise;
     auto result=std::make_shared<std::future<Observation>>(promise.get_future());
     state.start([result]{return result->get();});
@@ -38,7 +38,7 @@ inline int cpu_calibration_checks() {
         throw std::runtime_error("invalid background timing corrupted CPU costs");
     std::weak_ptr<int> weak;
     {
-        mfq::MoeCpuCalibration lifetime;
+        tyloi::MoeCpuCalibrationState lifetime;
         auto owner=std::make_shared<int>(7);weak=owner;
         lifetime.start([owner,key]{return Observation{key,double(*owner)};});
         owner.reset();
@@ -51,8 +51,8 @@ inline int cpu_calibration_checks() {
 }
 
 inline int cpu_cost_checks() {
-    mfq::MoeCpuCostModel model;
-    const mfq::MoeCpuCostModel::Key key{17,17,23,1};
+    tyloi::MoeCpuCostModel model;
+    const tyloi::MoeCpuCostModel::Key key{17,17,23,1};
     int cases=0;
     if(model.estimate(key)!=0)throw std::runtime_error("unmeasured CPU work has a fabricated cost");++cases;
     model.observe(key,10000000,1);
@@ -90,12 +90,12 @@ inline int cpu_cost_checks() {
         try {model.observe(invalid,1.0,groups);}catch(const std::invalid_argument&){rejected=true;}
         if(!rejected)throw std::runtime_error("empty CPU geometry accepted");++cases;
     }
-    mfq::MoeCpuCostModel shared;
+    tyloi::MoeCpuCostModel shared;
     int calibrations=0;
     // Forty-eight layer instances, three compatible FFN signatures. Actual
     // retained samples are shared; no per-layer measurement is fabricated.
     for(int layer=0;layer<48;++layer) {
-        mfq::MoeCpuCostModel::Key same{std::uintptr_t(layer%3+1),7,9,1};
+        tyloi::MoeCpuCostModel::Key same{std::uintptr_t(layer%3+1),7,9,1};
         if(!shared.estimate(same)){shared.observe(same,1000.0*(layer%3+1),1);++calibrations;}
     }
     if(calibrations!=9)throw std::runtime_error("compatible layers recalibrated independently");++cases;

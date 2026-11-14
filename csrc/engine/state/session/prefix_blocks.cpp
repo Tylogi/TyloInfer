@@ -1982,16 +1982,4 @@ PrefixBlockStoreMetrics PrefixBlockStore::metrics() const {
     return implementation_->metrics();
 }
 
-std::function<std::uint64_t(std::uint64_t)> make_ram_prefix_reclaimer(
-        std::weak_ptr<PagedPrefixCache> cache) {
-    if (cache.expired()) return {};
-    return [cache=std::move(cache)](std::uint64_t bytes) -> std::uint64_t {
-        if (!bytes) return 0;
-        const auto owner=cache.lock();
-        if (!owner) return 0;
-        const auto hot=owner->metrics().hot_bytes;
-        return hot ? owner->trim_hot(hot>bytes ? hot-bytes : 0) : 0;
-    };
-}
-
 } // namespace tyloi::cache

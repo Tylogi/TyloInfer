@@ -4,7 +4,7 @@
 #include <cstdint>
 
 inline int residency_rank_checks() {
-    using namespace mfq::bench;
+    using namespace tyloi::bench;
     std::uint32_t random=719;
     const auto next=[&] {random^=random<<13;random^=random>>17;random^=random<<5;return random;};
     int cases=0;
@@ -13,7 +13,7 @@ inline int residency_rank_checks() {
         for(int b=0;b<layers;++b)for(int e=0;e<experts;++e)
             for(int p=0;p<(projections?3:1);++p)
                 entries.push_back({{b,e,projections?p:-1},std::size_t((b+e+p)%11)});
-        mfq::MoeResidencyRanker ranker(residency_layout(entries,12));
+        tyloi::MoeResidencyRanker ranker(residency_layout(entries,12));
         std::vector<float> heat(std::size_t(layers)*experts);
         std::vector<std::array<int,3>> states(heat.size());
         auto get_heat=[&](const ResidencyExpert& e){return heat[std::size_t(e.bundle)*experts+e.expert];};
@@ -34,11 +34,11 @@ inline int residency_rank_checks() {
             ++cases;
         }
     }
-    mfq::MoeResidencyRanker empty({});
+    tyloi::MoeResidencyRanker empty({});
     if(!empty.rank([](auto){return 0.0f;},[](auto){return 0;}).empty())
         throw std::runtime_error("empty expert topology produced candidates");
     bool rejected=false;
-    try {mfq::MoeResidencyRanker invalid({{{0,0,3}}});}
+    try {tyloi::MoeResidencyRanker invalid({{{0,0,3}}});}
     catch(const std::invalid_argument&){rejected=true;}
     if(!rejected)throw std::runtime_error("invalid expert topology accepted");
     return cases+2;

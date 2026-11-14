@@ -460,7 +460,7 @@ std::size_t RamKvStore::append_at_tier(RamKvImagePtr image,std::array<std::size_
         throw std::invalid_argument("QSA RAM tier size does not match its canonical image");
     if(prefix && (!valid_backing(*prefix) || unsigned(prefix->tier)>2))
         throw std::invalid_argument("Invalid QSA prefix backing");
-    std::lock_guard<std::mutex> lock(s.mutex);const auto id=s.entries.size(),generation=s.next();
+    std::lock_guard<std::mutex> lock(s.mutex);const std::size_t id=s.entries.size();const auto generation=s.next();
     if(image->bytes()>std::numeric_limits<std::size_t>::max()-s.counters.ram_bytes)
         throw std::overflow_error("QSA RAM byte count overflow");
     if(id==s.entries.capacity())s.entries.reserve(id?std::max(id+1,id+id/2):1);

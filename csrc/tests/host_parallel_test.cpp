@@ -285,7 +285,7 @@ void staged_checks() {
 int main(int argc, char**) {
     try {
         for(bool wait_idle:{true,false}) {
-            mfq::HostParallelPool spinning({},wait_idle,1000000);
+            tyloi::HostParallelPool spinning({},wait_idle,1000000);
             for(int threads:{2,4,1,3,2}) {
                 std::vector<std::atomic<int>> visits(137);
                 for(auto& v:visits)v=0;

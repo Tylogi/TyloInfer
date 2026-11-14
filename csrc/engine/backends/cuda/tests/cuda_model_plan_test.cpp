@@ -54,9 +54,9 @@ using namespace tyloi;
         auto qwen = graph_with(
             "qwen3_5", "grid_vit", "next_token_prediction");
         qwen.components.at(1).input_contract =
-            tyloi::kMfqGridVisionInputContract;
+            tyloi::kGridVisionInputContract;
         qwen.components.at(1).position_policy =
-            tyloi::kMfqGridMropePositionPolicy;
+            tyloi::kGridMropePositionPolicy;
         const auto qwen_plan = cuda_model_plan(qwen);
         require(
             cuda_backbone(qwen.backbone) == CudaBackbone::generic_qwen,
@@ -188,7 +188,7 @@ using namespace tyloi;
             "Nemotron-H optional component selection mismatch");
         auto nemotron_vision = nemotron;
         nemotron_vision.components.at(1).input_contract =
-            tyloi::kMfqRadioCpeInputContract;
+            tyloi::kRadioCpeInputContract;
         const auto nemotron_vision_plan = cuda_model_plan(nemotron_vision);
         require(
             nemotron_vision_plan.vision == CudaVisionAdapter::radio &&

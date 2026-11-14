@@ -110,4 +110,17 @@ PagedPrefixCacheMetrics PagedPrefixCache::metrics() const {
     return result;
 }
 
+// Disposable RAM payloads yield to active KV before its precision is reduced.
+std::function<std::uint64_t(std::uint64_t)> make_ram_prefix_reclaimer(
+        std::weak_ptr<PagedPrefixCache> cache) {
+    if (cache.expired()) return {};
+    return [cache=std::move(cache)](std::uint64_t bytes) -> std::uint64_t {
+        if (!bytes) return 0;
+        const auto owner=cache.lock();
+        if (!owner) return 0;
+        const auto hot=owner->metrics().hot_bytes;
+        return hot ? owner->blocks.trim_hot(hot>bytes ? hot-bytes : 0) : 0;
+    };
+}
+
 } // namespace tyloi::cache

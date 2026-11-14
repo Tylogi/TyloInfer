@@ -18,7 +18,7 @@
 #include "models/nemotron_h/causal_lm.h"
 #include "models/qwen35/causal_lm.h"
 #include "models/qwen4_exp/causal_lm.h"
-#include "sampling.h"
+#include "engine/generation/sampling.h"
 #include <algorithm>
 #include <array>
 #include <cassert>

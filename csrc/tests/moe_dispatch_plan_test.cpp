@@ -1,4 +1,4 @@
-#include "tyloinfer/moe_dispatch_plan.h"
+#include "engine/weights/moe/dispatch_plan.h"
 #include "moe_residency_rank_checks.h"
 #include <limits>
 #include "moe_cpu_cost_checks.h"

@@ -335,12 +335,12 @@ foreach(_TYLOINFER_IQ4_HIGH RANGE 0 15)
         string(APPEND TYLOINFER_GGUF_IQ4_PAIR_SOURCE "half2(${_TYLOINFER_IQ4_A}, ${_TYLOINFER_IQ4_B}),\n")
     endforeach()
 endforeach()
-file(READ "${PROJECT_SOURCE_DIR}/third_party/agention-gyro/codebook_f16.inc" TYLOINFER_GYRO_CODEBOOK_SOURCE)
+file(READ "${PROJECT_SOURCE_DIR}/components/agention-gyro/codebook_f16.inc" TYLOINFER_GYRO_CODEBOOK_SOURCE)
 file(READ "${TYLOINFER_METAL_ROOT}/kernels/gguf/gguf_decode.h" TYLOINFER_GGUF_DECODE_SOURCE)
 file(READ "${TYLOINFER_METAL_ROOT}/kernels/gguf/gguf_matmul.h" TYLOINFER_GGUF_MATMUL_SOURCE)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${PROJECT_SOURCE_DIR}/components/ggml/src/ggml-common.h"
-    "${PROJECT_SOURCE_DIR}/third_party/agention-gyro/codebook_f16.inc"
+    "${PROJECT_SOURCE_DIR}/components/agention-gyro/codebook_f16.inc"
     "${TYLOINFER_METAL_ROOT}/kernels/gguf/gguf_decode.h"
     "${TYLOINFER_METAL_ROOT}/kernels/gguf/gguf_matmul.h")
 configure_file(${TYLOINFER_METAL_ROOT}/kernels/gguf/gguf_embedded.h.in gguf_embedded.h @ONLY)

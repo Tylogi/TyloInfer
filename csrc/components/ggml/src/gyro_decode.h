@@ -2,7 +2,7 @@
 #define TYLOINFER_GYRO_DECODE_H
 
 static const uint16_t ggml_gyro_codebook[4096] = {
-#include "../../../third_party/agention-gyro/codebook_f16.inc"
+#include "../../agention-gyro/codebook_f16.inc"
 };
 
 static void dequantize_gyro(const void * src, float * dst, int64_t count, unsigned bits, unsigned steps) {

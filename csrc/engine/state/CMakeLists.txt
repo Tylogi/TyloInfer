@@ -5,9 +5,10 @@ add_library(mfq-qsa-kv-store STATIC
     ${CMAKE_CURRENT_SOURCE_DIR}/qsa_blocks.h
 )
 target_include_directories(mfq-qsa-kv-store PUBLIC
+    ${PROJECT_SOURCE_DIR}
     ${PROJECT_SOURCE_DIR}/engine/state
 )
-target_link_libraries(mfq-qsa-kv-store PRIVATE Threads::Threads)
+target_link_libraries(mfq-qsa-kv-store PUBLIC Threads::Threads mfq-quant-readers)
 target_compile_features(mfq-qsa-kv-store PUBLIC cxx_std_17)
 set_target_properties(mfq-qsa-kv-store PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
@@ -16,6 +17,7 @@ add_library(mfq-prefix-blocks STATIC
     ${CMAKE_CURRENT_SOURCE_DIR}/session/prefix_blocks.h
 )
 target_include_directories(mfq-prefix-blocks PUBLIC
+    ${PROJECT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/session
 )
 target_link_libraries(mfq-prefix-blocks PRIVATE Threads::Threads)

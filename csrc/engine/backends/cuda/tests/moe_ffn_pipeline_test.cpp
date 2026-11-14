@@ -7,7 +7,7 @@
 #include "storage/weights/moe/router_lookahead_audit.h"
 #include "mfq_cuda_moe_ops.h"
 #include "moe_cache_transfer.h"
-#include "storage/weights/moe/residency.h"
+#include "engine/weights/moe/residency.h"
 #include "storage/weights/moe/kv_expert_loan.h"
 #include "storage/weights/moe/quant_range_source.h"
 #include "storage/weights/moe/expert_cache.h"
@@ -15,7 +15,7 @@
 #include "storage/weights/loaders/weight.h"
 #include "moe.h"
 #include "ops/common/include/rope.h"
-#include "tyloinfer/moe_dispatch_plan.h"
+#include "engine/weights/moe/dispatch_plan.h"
 #include "tyloinfer/runtime.h"
 #include <filesystem>
 #include <fstream>

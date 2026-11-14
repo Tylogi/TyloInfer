@@ -4,89 +4,89 @@
 
 namespace tyloi::cuda {
 
-Tensor empty_cuda(std::span<const std::int64_t>, const TensorOptions&) {
+DenseTensor empty_cuda(std::span<const std::int64_t>, const TensorOptions&) {
     throw std::runtime_error("CUDA is unavailable in the host-only tensor test");
 }
 
-Tensor empty_pinned(std::span<const std::int64_t>, const TensorOptions&) {
+DenseTensor empty_pinned(std::span<const std::int64_t>, const TensorOptions&) {
     throw std::runtime_error("pinned memory is unavailable in the host-only tensor test");
 }
 
-Tensor copy_or_convert_cuda(const Tensor&, const TensorOptions&) {
+DenseTensor copy_or_convert_cuda(const DenseTensor&, const TensorOptions&) {
     throw std::runtime_error("CUDA is unavailable in the host-only tensor test");
 }
 
-void fill_cuda(Tensor&, double) {
+void fill_cuda(DenseTensor&, double) {
     throw std::runtime_error("CUDA is unavailable in the host-only tensor test");
 }
 
-void copy_cuda(Tensor&, const Tensor&) {
+void copy_cuda(DenseTensor&, const DenseTensor&) {
     throw std::runtime_error("CUDA is unavailable in the host-only tensor test");
 }
 
-Tensor make_contiguous_cuda(const Tensor&) {
+DenseTensor make_contiguous_cuda(const DenseTensor&) {
     throw std::runtime_error("CUDA is unavailable in the host-only tensor test");
 }
 
-Tensor mean_cuda(const Tensor&, std::int64_t, bool) {
+DenseTensor mean_cuda(const DenseTensor&, std::int64_t, bool) {
     throw std::runtime_error("CUDA is unavailable in the host-only tensor test");
 }
 
 #define TYLOINFER_HOST_CUDA_STUB(name, signature) \
-    Tensor name signature { \
+    DenseTensor name signature { \
         throw std::runtime_error("CUDA is unavailable in the host-only tensor test"); \
     }
 
 TYLOINFER_HOST_CUDA_STUB(reduce_cuda,
-    (const Tensor&, std::int64_t, bool, int))
+    (const DenseTensor&, std::int64_t, bool, int))
 TYLOINFER_HOST_CUDA_STUB(unary_cuda,
-    (const Tensor&, int, double, double))
+    (const DenseTensor&, int, double, double))
 TYLOINFER_HOST_CUDA_STUB(binary_cuda,
-    (const Tensor&, const Tensor&, int))
+    (const DenseTensor&, const DenseTensor&, int))
 TYLOINFER_HOST_CUDA_STUB(scalar_binary_cuda,
-    (const Tensor&, double, int, bool))
+    (const DenseTensor&, double, int, bool))
 TYLOINFER_HOST_CUDA_STUB(index_select_cuda,
-    (const Tensor&, std::int64_t, const Tensor&))
+    (const DenseTensor&, std::int64_t, const DenseTensor&))
 TYLOINFER_HOST_CUDA_STUB(gather_cuda,
-    (const Tensor&, std::int64_t, const Tensor&))
+    (const DenseTensor&, std::int64_t, const DenseTensor&))
 TYLOINFER_HOST_CUDA_STUB(repeat_cuda,
-    (const Tensor&, std::span<const std::int64_t>))
+    (const DenseTensor&, std::span<const std::int64_t>))
 TYLOINFER_HOST_CUDA_STUB(repeat_interleave_cuda,
-    (const Tensor&, std::int64_t, std::int64_t))
+    (const DenseTensor&, std::int64_t, std::int64_t))
 TYLOINFER_HOST_CUDA_STUB(masked_select_cuda,
-    (const Tensor&, const Tensor&))
+    (const DenseTensor&, const DenseTensor&))
 
 #undef TYLOINFER_HOST_CUDA_STUB
 
-void scatter_cuda(Tensor&, std::int64_t, const Tensor&, const Tensor&, bool) {
+void scatter_cuda(DenseTensor&, std::int64_t, const DenseTensor&, const DenseTensor&, bool) {
     throw std::runtime_error("CUDA is unavailable in the host-only tensor test");
 }
-void index_copy_cuda(Tensor&, std::int64_t, const Tensor&, const Tensor&) {
+void index_copy_cuda(DenseTensor&, std::int64_t, const DenseTensor&, const DenseTensor&) {
     throw std::runtime_error("CUDA is unavailable in the host-only tensor test");
 }
-void index_fill_cuda(Tensor&, std::int64_t, const Tensor&, double) {
+void index_fill_cuda(DenseTensor&, std::int64_t, const DenseTensor&, double) {
     throw std::runtime_error("CUDA is unavailable in the host-only tensor test");
 }
-void masked_fill_cuda(Tensor&, const Tensor&, double) {
+void masked_fill_cuda(DenseTensor&, const DenseTensor&, double) {
     throw std::runtime_error("CUDA is unavailable in the host-only tensor test");
 }
 
-bool equal(const Tensor&, const Tensor&) {
+bool equal(const DenseTensor&, const DenseTensor&) {
     throw std::runtime_error("CUDA is unavailable in the host-only tensor test");
 }
-Tensor where(const Tensor&, const Tensor&, double) {
+DenseTensor where(const DenseTensor&, const DenseTensor&, double) {
     throw std::runtime_error("CUDA is unavailable in the host-only tensor test");
 }
-Tensor arange(std::int64_t, const TensorOptions&) {
+DenseTensor arange(std::int64_t, const TensorOptions&) {
     throw std::runtime_error("CUDA is unavailable in the host-only tensor test");
 }
-Tensor operator<=(const Tensor&, const Tensor&) {
+DenseTensor operator<=(const DenseTensor&, const DenseTensor&) {
     throw std::runtime_error("CUDA is unavailable in the host-only tensor test");
 }
-Tensor operator+(const Tensor&, const Tensor&) {
+DenseTensor operator+(const DenseTensor&, const DenseTensor&) {
     throw std::runtime_error("CUDA is unavailable in the host-only tensor test");
 }
-Tensor operator+(const Tensor&, double) {
+DenseTensor operator+(const DenseTensor&, double) {
     throw std::runtime_error("CUDA is unavailable in the host-only tensor test");
 }
 

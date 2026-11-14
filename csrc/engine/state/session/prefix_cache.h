@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string_view>
 #include <vector>
 
@@ -66,5 +67,10 @@ private:
     std::atomic<std::uint64_t> hits_{0};
     std::atomic<std::uint64_t> hit_tokens_{0};
 };
+
+// Disposable RAM payloads yield to active KV before its precision is reduced.
+// The callback does not extend the cache's lifetime or capture its engine.
+std::function<std::uint64_t(std::uint64_t)> make_ram_prefix_reclaimer(
+    std::weak_ptr<PagedPrefixCache> cache);
 
 } // namespace tyloi::cache

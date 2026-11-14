@@ -4,7 +4,7 @@
 // that `RadioPatchEmbeddings._interpolate_position_embedding` performs by
 // upsampling to max(rows, columns) and cropping, so it is checked against
 // analytic weights rather than against a second copy of the formula.
-#include "models/nemotron_h/vision.h"
+#include "engine/models/nemotron_h/vision.h"
 
 #include <algorithm>
 #include <cmath>

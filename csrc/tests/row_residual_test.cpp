@@ -1,7 +1,9 @@
 #include "engine/models/source.h"
 #include "engine/models/source/hf_source.h"
+#include "engine/models/source/gguf_source.h"
 #include "engine/weights/encoding/row_residual.h"
 #include "row_residual_fixture.h"
+#include "engine/weights/gguf.h"
 #include "gguf.h"
 #include "nlohmann/json.hpp"
 #include <cstring>
@@ -32,7 +34,7 @@ int main() try {
     ggml_set_name(weight,"blk.0.ffn_gate.weight");
     std::memset(weight->data,17,ggml_nbytes(weight));gguf_add_tensor(header,weight);
     gguf_write_to_file(header,base.string().c_str(),false);gguf_free(header);ggml_free(context);
-    auto original=std::make_shared<tyloi::GgufModelSource>(base);
+    auto original=std::make_shared<tyloi::models::GgufSource>(base);
     const std::string name="model.block.0.mlp.gate.weight";
     const auto frozen=original->read(name);
     nlohmann::json document{{"format","tyloinfer-row-residual-v1"},

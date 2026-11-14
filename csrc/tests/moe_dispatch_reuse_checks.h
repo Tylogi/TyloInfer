@@ -1,5 +1,5 @@
 #pragma once
-#include "tyloinfer/moe_dispatch_plan.h"
+#include "engine/weights/moe/dispatch_plan.h"
 #include <stdexcept>
 
 inline int dispatch_reuse_checks() {

@@ -185,14 +185,14 @@ void test_shared_engram_shards(const std::filesystem::path& root, const std::str
     write_shared_fixture(shared, 1, table_name);
     const auto unrelated = root / "Engram" / ("other-EW-Engram-MXFP8-00002-of-00003" + suffix);
     write_shared_fixture(unrelated, 1, table_name);
-    for (auto mode : {mfq::FileReadMode::Buffered, mfq::FileReadMode::Direct}) {
-        const auto source = mfq::MfqModelSource::open_engram_shard(shared, mode);
+    for (auto mode : {tyloi::FileReadMode::Buffered, tyloi::FileReadMode::Direct}) {
+        const auto source = tyloi::models::MfqSource::open_engram_shard(shared, mode);
         require(source->source_paths() == std::vector<std::filesystem::path>{std::filesystem::canonical(shared)},
                 "explicit Engram reader discovered unrelated model shards");
         require(source->read(table_name).size() == 14, "explicit Engram shard read failed");
     }
     bool incomplete_rejected = false;
-    try { mfq::MfqModelSource incomplete(shared); }
+    try { tyloi::models::MfqSource incomplete(shared); }
     catch (const std::runtime_error&) { incomplete_rejected = true; }
     require(incomplete_rejected, "normal model loading accepted an Engram-only shard");
     for (const std::string precision : {"Q2.5", "Q3"}) {
@@ -236,7 +236,7 @@ void test_shared_engram_shards(const std::filesystem::path& root, const std::str
     write_shared_fixture(shared, 1, "model.output.other.weight");
     require(rejects(), "shared filename allowed a non-table substitution");
     bool table_only_rejected = false;
-    try { (void)mfq::MfqModelSource::open_engram_shard(shared); }
+    try { (void)tyloi::models::MfqSource::open_engram_shard(shared); }
     catch (const std::runtime_error&) { table_only_rejected = true; }
     require(table_only_rejected, "explicit Engram reader accepted non-table weights");
     write_shared_fixture(shared, 1, table_name, "wrong-architecture");
@@ -321,7 +321,7 @@ int main() {
         tyloi::MfqModelSource mfq_source(mfq_path);
         tyloi::MfqModelSource legacy_mfq_source(legacy_mfq_path);
         tyloi::MfqModelSource legacy_gguf_source(legacy_gguf_path);
-        tyloi::HfModelSource hf_source(hf_path);
+        tyloi::models::HfSource hf_source(hf_path);
         const tyloi::ModelSource& generic_hf = hf_source;
         require(!generic_hf.mapped_tensor_reader("model.token_embedding.weight"),
                 "unmapped source must advertise an empty mapped reader");
@@ -562,7 +562,7 @@ int main() {
                     std::to_integer<char>(mfe_bytes[3]) == '1',
                 "virtual MFE payload is invalid");
 
-        tyloi::HfModelSource fp8_128_source(root / "hf-fp8-128");
+        tyloi::models::HfSource fp8_128_source(root / "hf-fp8-128");
         const auto* fp8_128 = fp8_128_source.find_tensor("block.weight");
         require(fp8_128 != nullptr && fp8_128->dtype == "FP8-128SQ" &&
                     fp8_128->stored_dtype == "FP8-128SQ" &&
@@ -596,7 +596,7 @@ int main() {
                         fp8_128_bytes[fp8_128_layout.scales + 1]) == 0x3f,
                 "lossless FP8-128SQ payload differs from HF source bytes");
 
-        tyloi::HfModelSource fp8_128_explicit_source(
+        tyloi::models::HfSource fp8_128_explicit_source(
             root / "hf-fp8-128-explicit");
         const auto* fp8_128_explicit = fp8_128_explicit_source.find_tensor(
             "model.block.0.linear_attention.gate.weight");
@@ -609,7 +609,7 @@ int main() {
                     "model.block.0.linear_attention.gate.weight_scale") == nullptr,
                 "explicit block FP8 scale leaked into tensor enumeration");
 
-        tyloi::HfModelSource mxfp8_source(root / "hf-mxfp8");
+        tyloi::models::HfSource mxfp8_source(root / "hf-mxfp8");
         for (const auto& [name, nbytes] :
              std::array<std::pair<const char*, std::uint64_t>, 3>{{
                  {"block128.weight", 16441},

@@ -1,6 +1,6 @@
 // RADIO vision config contract: parses the released omni geometry and rejects
 // the variants the encoder cannot execute. No GPU or weights required.
-#include "models/nemotron_h/vision.h"
+#include "engine/models/nemotron_h/vision.h"
 
 #include <iostream>
 #include <stdexcept>

@@ -1,4 +1,4 @@
-#include "sampling.h"
+#include "engine/generation/sampling.h"
 
 #include <cassert>
 #include <cstdint>
@@ -19,6 +19,7 @@ struct FakeTensor {
 };
 
 struct FakeOps {
+    using DenseTensor = FakeTensor;
     using Tensor = FakeTensor;
     using Params = FakeParams;
 

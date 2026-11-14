@@ -1053,7 +1053,7 @@ endif()
     mfq_configure_cuda_runtime_target(tyloinfer-cuda-gguf-runtime-test)
     target_link_libraries(tyloinfer-cuda-gguf-runtime-test PRIVATE mfq-cuda-runtime)
     target_include_directories(tyloinfer-cuda-gguf-runtime-test PRIVATE
-        ${TYLOINFER_CUDA_ROOT}/../../third_party/strata/include)
+        ${PROJECT_SOURCE_DIR}/components/strata/include)
     target_compile_definitions(tyloinfer-cuda-gguf-runtime-test PRIVATE TYLOINFER_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
     set_target_properties(tyloinfer-cuda-gguf-runtime-test PROPERTIES
         CUDA_ARCHITECTURES "${TYLOINFER_CUDA_ARCHITECTURES}"

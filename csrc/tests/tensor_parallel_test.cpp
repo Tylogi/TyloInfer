@@ -1,4 +1,4 @@
-#include "tensor_parallel.h"
+#include "engine/weights/tensor_parallel.h"
 
 #include <iostream>
 #include <stdexcept>
