@@ -9,17 +9,20 @@
 #include "engine/backends/cuda/kernels/mfq_cuda_quant_ops.h"
 #include "engine/backends/cuda/kernels/mfq_cuda_nint_route_hint.h"
 #include "engine/weights/tq/routed.h"
+#include "engine/weights/encoding/rows.h"
+#include "engine/weights/tq/rows.h"
+#if TYLOINFER_ENABLE_MFQ_COMPAT
+#include "engine/backends/cuda/ops/projection/nint.h"
+#endif
 
 #include <algorithm>
 #include <optional>
 #include <numeric>
 #include <utility>
 
-#ifdef TYLOINFER_NATIVE_CUDA
 #include "engine/backends/cuda/executor/executor.h"
 #include "engine/backends/cuda/ops/projection/bias.h"
 #include "engine/ops.h"
-#endif
 
 namespace {
 #if TYLOINFER_ENABLE_MFQ_COMPAT
@@ -115,7 +118,7 @@ QuantLinearGroup tyloi::cuda::Projector::group(
                 result.nint.w = std::move(segments.front());
                 if (result.nint.w.q8_zero)
                     for (const auto& weight : weights)
-                        result.nint.projection_w.push_back(static_cast<const tyloi::NintTensor&>(*weight));
+                        result.nint.projection_w.push_back(*weight.representation<tyloi::NintTensor>());
             } else {
                 result.nint.split_w = std::move(segments);
                 result.nint.split_outs = std::move(sizes);
@@ -126,10 +129,16 @@ QuantLinearGroup tyloi::cuda::Projector::group(
     return result;
 }
 
-#ifdef TYLOINFER_NATIVE_CUDA
 tyloi::DenseTensor tyloi::cuda::ops::embedding(tyloi::DenseTensor ids, const ::tyloi::Tensor& weight) {
     std::optional<MfqCudaGuard> guard;
     if (ids.is_cuda()) guard.emplace(ids.device().index);
+    if (const auto* rows = weight.representation<tyloi::weights::Rows>()) {
+        if (rows->tq()) return lookup_tq_table(*rows->tq(), Tensor(std::move(ids))).dense();
+#if TYLOINFER_ENABLE_MFQ_COMPAT
+        if (rows->nint()) return nint_row_embedding_lookup(*rows->nint(), ids);
+#endif
+        throw std::invalid_argument("unsupported streamed row table");
+    }
     return quant_embedding_lookup(weight, ids);
 }
 
@@ -249,7 +258,6 @@ tyloi::DenseTensor tyloi::cuda::ops::sigmoid_project(tyloi::DenseTensor input, t
         weight, input,
         gate, InputGateMode::Sigmoid);
 }
-#endif
 
 ::tyloi::DenseTensor run_quant_linear_shard(
         CudaProfiler& profiler,
@@ -375,7 +383,6 @@ using ::tyloi::indexing::Slice;
         return profile ? profiler_.measure(name, operation) : operation();
     };
     const auto* tq_weight = output_a.representation<tyloi::encoding::TqTensor>();
-    const auto* nint = output_a.representation<tyloi::NintTensor>();
     if (tq_weight != nullptr) {
         auto low_rank = measure("dsv4.output_a", [&] {
             const auto resources = tq_.get(grouped.get_device());
@@ -385,6 +392,8 @@ using ::tyloi::indexing::Slice;
             return run(output_b, low_rank).reshape({batch, tokens, output_b.size(0)});
         });
     }
+#if TYLOINFER_ENABLE_MFQ_COMPAT
+    const auto* nint = output_a.representation<tyloi::NintTensor>();
     if (groupwise_output && tyloi::mfq_compat_enabled && nint != nullptr &&
         nint->bits == 8 && nint->gs == 48 && nint->out == groups * rank) {
         auto low_rank = measure("dsv4.output_a", [&]() {
@@ -394,6 +403,7 @@ using ::tyloi::indexing::Slice;
             return run(output_b, low_rank).reshape({batch, tokens, output_b.size(0)});
         });
     }
+#endif
     if (groupwise_output &&
         holds<tyloi::Mxfp8Tensor>(output_a) &&
         output_a.size(0) == groups * rank) {
@@ -687,7 +697,7 @@ bool Projector::grouped(std::span<const ::tyloi::Tensor> weights) const {
         }
 #if TYLOINFER_ENABLE_MFQ_COMPAT
         const auto* nint = weight.representation<tyloi::NintTensor>();
-        all_nint = all_nint && nint && nint->q_packed.is_cuda() && weight->size(1) == weights.front()->size(1);
+        all_nint = all_nint && nint && nint->q_packed.is_cuda() && weight.size(1) == weights.front().size(1);
 #else
         all_nint = false;
 #endif
@@ -911,6 +921,7 @@ std::vector<::tyloi::DenseTensor> Projector::run(
     if (tyloi::mfq_compat_enabled && group.nint_grouped) {
         return run(group.nint, x);
     }
+#if TYLOINFER_ENABLE_MFQ_COMPAT
     if (tyloi::mfq_compat_enabled && default_mmq && group.nvq_prefix2 && options_.nvq_fusion) {
         const auto* nvq0 = local_format<tyloi::NvqTensor>(group.layers[0]);
         const auto* nvq1 = local_format<tyloi::NvqTensor>(group.layers[1]);
@@ -957,6 +968,7 @@ std::vector<::tyloi::DenseTensor> Projector::run(
         }
         return result;
     }
+#endif
     std::vector<::tyloi::DenseTensor> result;
     if (default_mmq && group.decode_branch_parallel &&
             decode_branches(

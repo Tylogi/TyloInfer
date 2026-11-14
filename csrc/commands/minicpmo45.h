@@ -4,10 +4,8 @@
 #include <string>
 #include <string_view>
 
-struct CudaExecutionContext;
-
-namespace mfq::cuda {
-struct CudaLoadOptions;
+namespace tyloi::cuda {
+class Program;
 namespace commands { class ArgCursor; }
 
 namespace minicpmo45 {
@@ -28,20 +26,12 @@ bool parse_command_option(
     CommandOptions& result);
 void validate_command_options(const CommandOptions& options);
 
-int run_composite(
-    CudaExecutionContext& execution,
-    const CudaLoadOptions& load,
-    const CommandOptions& options);
-int run_duplex(
-    CudaExecutionContext& execution,
-    const CudaLoadOptions& load,
-    const CommandOptions& options);
-int run_eval_batch(
-    CudaExecutionContext& execution,
-    const std::string& model_path,
-    const std::string& config_path,
-    std::int64_t context_size,
-    std::int64_t vision_batch_size);
+/** Run the MiniCPM-o composite diagnostic using an owned native program. */
+int run_composite(Program& program, const CommandOptions& options);
+/** Run a MiniCPM-o duplex diagnostic using an owned native program. */
+int run_duplex(Program& program, const CommandOptions& options);
+/** Run the MiniCPM-o JSONL batch evaluator using an owned native program. */
+int run_eval_batch(Program& program, std::int64_t context_size, std::int64_t vision_batch_size);
 
 } // namespace minicpmo45
-} // namespace mfq::cuda
+} // namespace tyloi::cuda

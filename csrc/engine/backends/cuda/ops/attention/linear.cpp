@@ -1,17 +1,20 @@
 #include "linear.h"
+#include "engine/ops/linear.h"
+#include "engine/state/recurrent.h"
+#include "engine/backends/cuda/executor/executor.h"
+#define TYLOI_LINEAR_IMPL LinearCore
 #include "engine/ops.h"
 #include "engine/backends/cuda/ops/attention/attention.h"
 #include "engine/backends/cuda/ops/norm/rms.h"
 #include "engine/backends/cuda/kernels/mfq_cuda_linear_attention_ops.h"
 #include "engine/backends/cuda/kernels/mfq_cuda_norm_ops.h"
-#ifndef TYLOINFER_NATIVE_CUDA
 #include "engine/backends/cuda/ops/projection/projection.h"
-#endif
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <optional>
+#include <limits>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -42,7 +45,7 @@ DenseTensor linear_attention(DenseTensor normalized, Project project, Gates gate
 
 } // namespace
 
-std::array<::tyloi::DenseTensor, 2> LinearAttention::forward(
+std::array<::tyloi::DenseTensor, 2> TYLOI_LINEAR_IMPL::forward(
         const Projector& project, CudaProfiler& profiler, const Options& options,
         ::tyloi::DenseTensor input,
         LinearView state, LinearInputs* captured) const {
@@ -54,20 +57,13 @@ std::array<::tyloi::DenseTensor, 2> LinearAttention::forward(
                            : cpu(project, std::move(input), state);
 }
 
-std::array<::tyloi::DenseTensor, 2> LinearAttention::cpu(
+std::array<::tyloi::DenseTensor, 2> TYLOI_LINEAR_IMPL::cpu(
         const Projector& project, ::tyloi::DenseTensor x,
         LinearView state) const {
-#ifdef TYLOINFER_NATIVE_CUDA
     const auto in_group = !split_in_proj ? project.group(in_proj) : QuantLinearGroup{};
     const auto qkv_group = split_in_proj ? project.group(qkv_proj) : QuantLinearGroup{};
     const auto ab_group = split_in_proj && !split_dense_zab && ab_is_nint
         ? project.group(ab_nint_proj) : QuantLinearGroup{};
-#else
-    const auto in_group = !split_in_proj ? make_quant_group(in_proj, grouped_weights, true) : QuantLinearGroup{};
-    const auto qkv_group = split_in_proj ? make_quant_group(qkv_proj, grouped_weights, true) : QuantLinearGroup{};
-    const auto ab_group = split_in_proj && !split_dense_zab && ab_is_nint
-        ? make_quant_group(ab_nint_proj, grouped_weights, true) : QuantLinearGroup{};
-#endif
     const int64_t B = x.size(0), T = x.size(1), H = x.size(2);
     const int64_t nk = key_heads;
     const int64_t nv = value_heads;
@@ -77,9 +73,7 @@ std::array<::tyloi::DenseTensor, 2> LinearAttention::cpu(
     const int64_t vsz = (value_heads * value_dim);
     const int64_t conv_dim = 2 * ksz + vsz;
 
-#ifdef TYLOINFER_NATIVE_CUDA
     const auto& attn_norm = this->attn_norm.dense();
-#endif
     auto xn = qwen_rms_norm(
                   x.reshape({B * T, H}).to(::tyloi::kFloat32),
                   attn_norm, rms_norm_eps, norm_weight_offset)
@@ -139,15 +133,11 @@ std::array<::tyloi::DenseTensor, 2> LinearAttention::cpu(
                         .reshape({B, T, nv}));
                 auto alpha = alpha_raw.to(::tyloi::kFloat32)
                                  .reshape({B, T, nv});
-#ifdef TYLOINFER_NATIVE_CUDA
                 const auto& dt_bias = this->dt_bias.dense();
-#endif
                 auto gate = ::tyloi::cuda::softplus(
                     alpha + dt_bias.to(::tyloi::kFloat32)
                                 .reshape({1, 1, nv}));
-#ifdef TYLOINFER_NATIVE_CUDA
                 const auto& a_log = this->a_log.dense();
-#endif
                 auto coefficient = -::tyloi::cuda::exp(
                     a_log.to(::tyloi::kFloat32));
                 gate = gate * coefficient.reshape({1, 1, nv});
@@ -167,9 +157,7 @@ std::array<::tyloi::DenseTensor, 2> LinearAttention::cpu(
                     conv_input.size(1) -
                         (conv_kernel - 1),
                     conv_kernel - 1));
-#ifdef TYLOINFER_NATIVE_CUDA
                 const auto& conv_weight = this->conv_weight.dense();
-#endif
                 auto weight = conv_weight.to(::tyloi::kFloat32);
                 if (weight.dim() == 3)
                   weight = weight.squeeze(1);
@@ -192,15 +180,9 @@ std::array<::tyloi::DenseTensor, 2> LinearAttention::cpu(
                          {1, 1, conv_dim, conv_kernel}))
                         .sum(-1);
                 if (
-#ifdef TYLOINFER_NATIVE_CUDA
                     conv_bias && conv_bias.defined()
-#else
-                    conv_bias.defined()
-#endif
                 ) {
-#ifdef TYLOINFER_NATIVE_CUDA
                   const auto& conv_bias = this->conv_bias.dense();
-#endif
                   conv = conv + conv_bias.to(::tyloi::kFloat32)
                                     .reshape({1, 1, conv_dim});
                 }
@@ -275,9 +257,7 @@ std::array<::tyloi::DenseTensor, 2> LinearAttention::cpu(
                     y.reshape({-1, dv}).to(::tyloi::kFloat32);
                 auto inverse = ::tyloi::cuda::rsqrt(
                     y_flat.square().mean(-1, true) + rms_norm_eps);
-#ifdef TYLOINFER_NATIVE_CUDA
                 const auto& linear_norm = this->linear_norm.dense();
-#endif
                 auto y_norm = (y_flat * inverse *
                                linear_norm.to(::tyloi::kFloat32))
                                   .reshape_as(y);
@@ -291,9 +271,7 @@ std::array<::tyloi::DenseTensor, 2> LinearAttention::cpu(
                 auto zf = z.transpose(1, 2).contiguous().reshape({B, T, vsz});
                 ::tyloi::DenseTensor attention_output;
                 if (dense_out_proj) {
-#ifdef TYLOINFER_NATIVE_CUDA
                   const auto& out_proj_dense = this->out_proj_dense.dense();
-#endif
                   auto dtype = out_proj_dense.scalar_type();
                   auto gated =
                       yf.to(dtype) * ::tyloi::cuda::silu(zf.to(dtype));
@@ -310,21 +288,14 @@ std::array<::tyloi::DenseTensor, 2> LinearAttention::cpu(
     return std::array<::tyloi::DenseTensor, 2>{std::move(x), std::move(output)};
 }
 
-std::array<::tyloi::DenseTensor, 2> LinearAttention::cuda(
+std::array<::tyloi::DenseTensor, 2> TYLOI_LINEAR_IMPL::cuda(
         const Projector& project, CudaProfiler& profiler, const Options& options,
         ::tyloi::DenseTensor x,
         LinearView state, LinearInputs* captured) const {
-#ifdef TYLOINFER_NATIVE_CUDA
     const auto in_group = !split_in_proj ? project.group(in_proj) : QuantLinearGroup{};
     const auto qkv_group = split_in_proj ? project.group(qkv_proj) : QuantLinearGroup{};
     const auto ab_group = split_in_proj && !split_dense_zab && ab_is_nint
         ? project.group(ab_nint_proj) : QuantLinearGroup{};
-#else
-    const auto in_group = !split_in_proj ? make_quant_group(in_proj, grouped_weights, false) : QuantLinearGroup{};
-    const auto qkv_group = split_in_proj ? make_quant_group(qkv_proj, grouped_weights, false) : QuantLinearGroup{};
-    const auto ab_group = split_in_proj && !split_dense_zab && ab_is_nint
-        ? make_quant_group(ab_nint_proj, grouped_weights, false) : QuantLinearGroup{};
-#endif
     int64_t B = x.size(0), T = x.size(1), H = x.size(2);
     int64_t nk = key_heads,
             nv = value_heads;
@@ -334,9 +305,7 @@ std::array<::tyloi::DenseTensor, 2> LinearAttention::cuda(
             vsz = (value_heads * value_dim);
 
     auto xn = profiler.measure("linear.attn_norm", [&]() {
-#ifdef TYLOINFER_NATIVE_CUDA
             const auto& attn_norm = this->attn_norm.dense();
-#endif
             return qwen_rms_norm(
                        x.reshape({B * T, H}).to(::tyloi::kFloat32),
                        attn_norm, rms_norm_eps,
@@ -454,10 +423,8 @@ std::array<::tyloi::DenseTensor, 2> LinearAttention::cuda(
                 auto qkv = p.qkv, qk_part = p.qk, v_part = p.value;
                 auto alpha_raw = p.alpha, beta_raw = p.beta;
                 auto gates = profiler.measure("linear.gates_fused", [&]() {
-#ifdef TYLOINFER_NATIVE_CUDA
                   const auto& dt_bias = this->dt_bias.dense();
                   const auto& a_log = this->a_log.dense();
-#endif
                   return linear_gate_beta_cuda(alpha_raw.reshape({B, T, nv}),
                                                beta_raw.reshape({B, T, nv}),
                                                dt_bias, a_log);
@@ -481,7 +448,6 @@ std::array<::tyloi::DenseTensor, 2> LinearAttention::cuda(
               [&](const LinearProjections<
                   ::tyloi::DenseTensor> &p) {
                 auto qkv = p.qkv, qk_part = p.qk, v_part = p.value;
-#ifdef TYLOINFER_NATIVE_CUDA
                 std::optional<::tyloi::DenseTensor> empty_bias;
                 const auto& bias = conv_bias && conv_bias.defined()
                         ? conv_bias.dense()
@@ -490,15 +456,6 @@ std::array<::tyloi::DenseTensor, 2> LinearAttention::cuda(
                                        .device(::tyloi::kCUDA)
                                        .dtype(::tyloi::kFloat32)));
                 const auto& conv_weight = this->conv_weight.dense();
-#else
-                auto bias =
-                    conv_bias.defined()
-                        ? conv_bias
-                        : ::tyloi::cuda::empty(
-                              {0}, ::tyloi::TensorOptions()
-                                       .device(::tyloi::kCUDA)
-                                       .dtype(::tyloi::kFloat32));
-#endif
                 ::tyloi::DenseTensor q, k, v;
                 bool fused_prefill =
                     T >= 256 && options.fused_conv;
@@ -629,9 +586,7 @@ std::array<::tyloi::DenseTensor, 2> LinearAttention::cuda(
               },
               [&](::tyloi::DenseTensor y) {
                 auto y_norm = profiler.measure("linear.out_norm", [&]() {
-#ifdef TYLOINFER_NATIVE_CUDA
                   const auto& linear_norm = this->linear_norm.dense();
-#endif
                   return rms_norm_cuda(y.reshape({-1, dv}).to(
                                            ::tyloi::kFloat32),
                                        linear_norm, rms_norm_eps)
@@ -654,9 +609,7 @@ std::array<::tyloi::DenseTensor, 2> LinearAttention::cuda(
                 });
                 if (dense_out_proj) {
                   oo = profiler.measure("linear.out_proj_gate_dense", [&]() {
-#ifdef TYLOINFER_NATIVE_CUDA
                     const auto& out_proj_dense = this->out_proj_dense.dense();
-#endif
                     auto dtype = out_proj_dense.scalar_type();
                     auto gated =
                         yf.to(dtype) * ::tyloi::cuda::silu(zf.to(dtype));
@@ -674,7 +627,7 @@ std::array<::tyloi::DenseTensor, 2> LinearAttention::cuda(
     return std::array<::tyloi::DenseTensor, 2>{std::move(x), std::move(output)};
 }
 
-void LinearAttention::replay(
+void TYLOI_LINEAR_IMPL::replay(
         LinearView state, const LinearInputs& inputs, int64_t retained_tokens) const {
     TYLOINFER_RUNTIME_CHECK(retained_tokens > 0 && retained_tokens <= inputs.tokens &&
                           inputs.batch > 0 && inputs.split == split_in_proj,
@@ -687,7 +640,6 @@ void LinearAttention::replay(
     const int64_t dv = value_dim;
     const int64_t ksz = (key_heads * key_dim);
     const int64_t vsz = (value_heads * value_dim);
-#ifdef TYLOINFER_NATIVE_CUDA
     std::optional<::tyloi::DenseTensor> empty_bias;
     const auto& bias = conv_bias && conv_bias.defined()
                     ? conv_bias.dense()
@@ -695,14 +647,6 @@ void LinearAttention::replay(
                           {0}, ::tyloi::TensorOptions()
                                    .device(::tyloi::kCUDA)
                                    .dtype(::tyloi::kFloat32)));
-#else
-    auto bias = conv_bias.defined()
-                    ? conv_bias
-                    : ::tyloi::cuda::empty(
-                          {0}, ::tyloi::TensorOptions()
-                                   .device(::tyloi::kCUDA)
-                                   .dtype(::tyloi::kFloat32));
-#endif
     auto qkv =
         inputs.split
             ? ::tyloi::cuda::cat(
@@ -715,9 +659,7 @@ void LinearAttention::replay(
     state.convolution.dense().copy_(conv_input.narrow(
         1, conv_input.size(1) - (conv_kernel - 1),
         conv_kernel - 1));
-#ifdef TYLOINFER_NATIVE_CUDA
     const auto& conv_weight = this->conv_weight.dense();
-#endif
     auto conv = ssm_conv_silu_cuda(conv_input, conv_weight, bias, T);
     auto q = conv.narrow(2, 0, ksz).reshape({B, T, nk, dk}).transpose(1, 2);
     auto k = conv.narrow(2, ksz, ksz).reshape({B, T, nk, dk}).transpose(1, 2);
@@ -751,3 +693,211 @@ void LinearAttention::replay(
 }
 
 } // namespace tyloi::cuda
+
+#undef TYLOI_LINEAR_IMPL
+namespace tyloi::ops {
+struct Linear::State::Impl {
+    cuda::Recurrent mixer;
+    cuda::LinearInputs projected;
+};
+Linear::State::State() : impl_(std::make_unique<Impl>()) {}
+Linear::State::~State() = default;
+Linear::State::State(State&&) noexcept = default;
+Linear::State& Linear::State::operator=(State&&) noexcept = default;
+bool Linear::State::defined() const noexcept { return impl_->mixer.defined(); }
+bool Linear::State::pending() const noexcept { return impl_->mixer.pending(); }
+bool Linear::State::has_tape() const noexcept {
+    const auto& p = impl_->projected;
+    return p.qk.defined() || p.value.defined() || p.qkv.defined() || p.gate.defined() ||
+        p.beta.defined() || p.batch != 0 || p.tokens != 0 || p.split;
+}
+Linear::State::Snapshot Linear::State::view() const {
+    const auto& v = impl_->mixer.view();
+    return {v.convolution, v.recurrent, v.transposed};
+}
+Linear::State::Snapshot Linear::State::snapshot() const {
+    std::optional<MfqCudaGuard> guard;
+    if (defined() && impl_->mixer.view().convolution.device().is_cuda()) guard.emplace(impl_->mixer.view().convolution.device());
+    const auto v = impl_->mixer.snapshot();
+    return {v.convolution, v.recurrent, v.transposed};
+}
+void Linear::State::restore(const Snapshot& value) {
+    if (!value.convolution.defined() || !value.recurrent.defined())
+        throw std::runtime_error("recurrent snapshot is unavailable");
+    std::optional<MfqCudaGuard> guard;
+    if (value.convolution.device().is_cuda()) guard.emplace(value.convolution.device());
+    auto& live = impl_->mixer.view();
+    const auto prepare = [](Tensor& destination, const Tensor& source) {
+        bool same = destination.defined() && destination.dim() == source.dim() &&
+            destination.scalar_type() == source.scalar_type() && destination.device() == source.device();
+        if (same) for (std::int64_t i = 0; i < source.dim(); ++i)
+            if (destination.size(i) != source.size(i)) { same = false; break; }
+        if (!same) {
+            std::vector<std::int64_t> shape;
+            for (std::int64_t i = 0; i < source.dim(); ++i) shape.push_back(source.size(i));
+            destination = ops::empty(shape, source.options());
+        }
+    };
+    prepare(live.convolution, value.convolution);
+    prepare(live.recurrent, value.recurrent);
+    impl_->mixer.restore({value.convolution, value.recurrent, value.transposed});
+    impl_->projected = {};
+}
+void Linear::State::initialize(const Snapshot& layout, std::int64_t batch) {
+    if (defined() || !layout.convolution.defined() || !layout.recurrent.defined() || batch <= 0)
+        throw std::runtime_error("invalid recurrent batch initialization");
+    std::optional<MfqCudaGuard> guard;
+    if (layout.convolution.device().is_cuda()) guard.emplace(layout.convolution.device());
+    auto shape = [batch](const Tensor& value) {
+        std::vector<std::int64_t> result;
+        for (std::int64_t axis = 0; axis < value.dim(); ++axis) result.push_back(value.size(axis));
+        if (result.empty()) throw std::runtime_error("invalid recurrent batch geometry");
+        result[0] = batch;
+        return result;
+    };
+    auto& live = impl_->mixer.view();
+    live.convolution = ops::zeros(shape(layout.convolution), layout.convolution.options());
+    live.recurrent = ops::zeros(shape(layout.recurrent), layout.recurrent.options());
+    live.transposed = layout.transposed;
+}
+void Linear::State::reset(std::int64_t batch) {
+    std::optional<MfqCudaGuard> guard;
+    if (defined() && impl_->mixer.view().convolution.device().is_cuda()) guard.emplace(impl_->mixer.view().convolution.device());
+    impl_->mixer.reset(batch); impl_->projected = {};
+}
+void Linear::State::commit() noexcept { impl_->projected = {}; impl_->mixer.commit(); }
+std::int64_t Linear::State::rewind(std::int64_t position) {
+    std::optional<MfqCudaGuard> guard;
+    if (defined() && impl_->mixer.view().convolution.device().is_cuda()) guard.emplace(impl_->mixer.view().convolution.device());
+    return impl_->mixer.rewind(position);
+}
+void Linear::State::abort() {
+    std::optional<MfqCudaGuard> guard;
+    if (defined() && impl_->mixer.view().convolution.device().is_cuda()) guard.emplace(impl_->mixer.view().convolution.device());
+    try { impl_->mixer.abort(); }
+    catch (...) { impl_->projected = {}; throw; }
+    impl_->projected = {};
+}
+std::vector<Tensor*> Linear::State::graph_state() {
+    if (!defined() || pending() || has_tape()) throw std::runtime_error("decode graph requires confirmed recurrent state");
+    auto& v = impl_->mixer.view();
+    return {&v.convolution, &v.recurrent};
+}
+std::vector<Tensor> Linear::State::storage() const {
+    auto result = impl_->mixer.storage();
+    const auto& p = impl_->projected;
+    for (const auto* value : {&p.qk, &p.value, &p.qkv, &p.gate, &p.beta})
+        if (value->defined()) result.emplace_back(*value);
+    return result;
+}
+struct Linear::Impl {
+    cuda::LinearCore core;
+    Device target;
+    Impl(LinearWeights w, LinearConfig c) : target(c.target) {
+        std::optional<MfqCudaGuard> guard;
+        if (target.is_cuda()) guard.emplace(target);
+        core.key_heads=c.key_heads; core.value_heads=c.value_heads;
+        core.key_dim=c.key_dim; core.value_dim=c.value_dim; core.conv_kernel=c.conv_kernel;
+        core.rms_norm_eps=c.rms_norm_eps; core.norm_weight_offset=c.norm_weight_offset;
+        core.split_in_proj=c.split_in_proj; core.split_dense_zab=c.split_dense_zab;
+        core.dense_ab_tail=c.dense_ab_tail; core.ab_is_nint=c.ab_is_nint;
+        core.dense_out_proj=c.dense_out_proj; core.tiled_v_heads=c.tiled_v_heads;
+        core.attn_norm=std::move(w.attn_norm); core.conv_weight=std::move(w.conv_weight);
+        core.conv_bias=std::move(w.conv_bias); core.dt_bias=std::move(w.dt_bias);
+        core.a_log=std::move(w.a_log); core.linear_norm=std::move(w.linear_norm);
+        core.in_proj=std::move(w.in_proj); core.qkv_proj=std::move(w.qkv_proj);
+        core.ab_nint_proj=std::move(w.ab_nint_proj); core.z_proj=std::move(w.z_proj);
+        if (!w.ab_proj.empty()) core.ab_proj=tyloi::cuda::make_dense_group(w.ab_proj);
+        if (!w.zab_proj.empty()) core.zab_proj=tyloi::cuda::make_dense_group(w.zab_proj);
+        core.out_proj=std::move(w.out_proj); core.out_proj_dense=std::move(w.out_proj_dense);
+    }
+};
+Linear::Linear(LinearWeights weights, LinearConfig config)
+    : impl_(std::make_unique<Impl>(std::move(weights),config)) {}
+Linear::~Linear() = default;
+Linear::Linear(Linear&&) noexcept = default;
+Linear& Linear::operator=(Linear&&) noexcept = default;
+std::size_t Linear::growth(const State& state, std::int64_t batch, std::int64_t tokens,
+                           std::int64_t confirmed, bool reset) const {
+    if (batch <= 0 || tokens <= 0 || confirmed < 0 || confirmed >= tokens)
+        throw std::invalid_argument("invalid linear-attention growth geometry");
+    if (state.pending()) throw std::runtime_error("linear attention has a pending speculative pass");
+    if (reset && confirmed) throw std::invalid_argument("speculative linear attention requires existing history");
+    const auto view = state.view();
+    const bool retained = state.defined() && (!reset ||
+        (view.convolution.size(0) == batch && view.recurrent.size(0) == batch));
+    const auto mul = [](std::size_t a, std::size_t b) {
+        if (b && a > std::numeric_limits<std::size_t>::max()/b) throw std::overflow_error("linear-attention growth overflow");
+        return a*b;
+    };
+    const auto add = [](std::size_t a, std::size_t b) {
+        if (a > std::numeric_limits<std::size_t>::max()-b) throw std::overflow_error("linear-attention growth overflow");
+        return a+b;
+    };
+    const auto& c=impl_->core;
+    const auto width=add(mul(2,mul(c.key_heads,c.key_dim)),mul(c.value_heads,c.value_dim));
+    const auto conv=mul(mul(mul(batch,c.conv_kernel-1),width),4);
+    const auto recurrent=mul(mul(mul(mul(batch,c.value_heads),c.value_dim),c.value_dim),4);
+    std::size_t result=retained?0:add(conv,recurrent);
+    if (!confirmed) return result;
+    if (retained) {
+        result=add(result,mul(view.convolution.numel(),view.convolution.element_size()));
+        result=add(result,mul(view.recurrent.numel(),view.recurrent.element_size()));
+    } else result=add(result,add(conv,recurrent));
+    std::size_t projected=0;
+    const auto count=[&](const std::vector<Tensor>& weights) {
+        for (const auto& weight:weights) projected=add(projected,weight.size(0));
+    };
+    count(c.in_proj); count(c.qkv_proj); count(c.ab_nint_proj);
+    if (c.z_proj) projected=add(projected,c.z_proj.size(0));
+    for (const auto n:c.ab_proj.outs) projected=add(projected,n);
+    for (const auto n:c.zab_proj.outs) projected=add(projected,n);
+    // A grouped projection can retain non-tape outputs through shared backing;
+    // a non-split qkv cast can additionally allocate a separate F32 tensor.
+    if (!c.split_in_proj) projected=add(projected,width);
+    projected=add(projected,mul(2,c.value_heads));
+    return add(result,mul(mul(mul(batch,tokens),projected),4));
+}
+std::array<Tensor, 2> Linear::forward(State& state, const Tensor& input,
+                                      std::int64_t position, std::int64_t confirmed) const {
+    std::optional<MfqCudaGuard> guard;
+    if (impl_->target.is_cuda()) guard.emplace(impl_->target);
+    std::array<Tensor,2> result{Tensor{DenseTensor{}},Tensor{DenseTensor{}}};
+    auto& executor = cuda::Executor::current();
+    auto& mixer = state.impl_->mixer;
+    const auto& x = input.dense();
+    if (!mixer.defined()) {
+        const auto& c = impl_->core;
+        const auto width=2*c.key_heads*c.key_dim+c.value_heads*c.value_dim;
+        const auto options=x.options().dtype(kFloat32);
+        mixer.view()={cuda::zeros({x.size(0),c.conv_kernel-1,width},options),
+            cuda::zeros({x.size(0),c.value_heads,c.value_dim,c.value_dim},options),
+            x.is_cuda() && executor.mode().transposed};
+    }
+    if (confirmed == 0) {
+        if (mixer.pending()) throw std::runtime_error("linear attention has a pending speculative pass");
+    } else {
+        if (!x.is_cuda() || mixer.pending() || confirmed <= 0 || confirmed >= x.size(1))
+            throw std::runtime_error("invalid Qwen3.5 speculative linear-attention transaction");
+        mixer.begin(position,confirmed,x.size(1));
+    }
+    auto& v=mixer.view();
+    cuda::LinearView view{v.convolution.dense(),v.recurrent.dense(),v.transposed};
+    try {
+        auto output=impl_->core.forward(executor.projector(cuda::Executor::current_ffn()),executor.profiler(),
+            executor.mode().linear,x,view,confirmed>0 ? &state.impl_->projected : nullptr);
+        result[0].dense()=std::move(output[0]);
+        result[1].dense()=std::move(output[1]);
+        return result;
+    } catch (...) {
+        if (confirmed>0) state.abort();
+        throw;
+    }
+}
+void Linear::replay(State& state, std::int64_t retained) const {
+    std::optional<MfqCudaGuard> guard;
+    if (impl_->target.is_cuda()) guard.emplace(impl_->target);
+    auto& v=state.impl_->mixer.view();
+    impl_->core.replay({v.convolution.dense(),v.recurrent.dense(),v.transposed},state.impl_->projected,retained);
+}
+}

@@ -24,7 +24,7 @@ void load_ffn(Loader& ops, const Config& c, int i, Ffn& f) {
     const auto &config = c;
     const std::string p = "model.block." + std::to_string(i) + ".mlp.";
     if (config.mlp_layer_types.at(static_cast<size_t>(i)) == "sparse") {
-        f = models::load_moe_weights<Ffn>(ops, p, i, true);
+        models::load_moe_weights_into(f, ops, p, i, true);
         f.moe_top_k = static_cast<int>(c.num_experts_per_tok);
         f.moe_use_sigmoid = true;
         f.moe_use_sqrt_softplus = false;
@@ -59,17 +59,10 @@ void load_layer_weights(Block& b, Loader& ops, const Config& c, int i, const std
     b.config = c;
     b.layer = i;
     b.full_indexer = config.indexer_types.at(static_cast<size_t>(i)) == "full";
-#ifdef TYLOINFER_NATIVE_CUDA
     b.attn_norm = ops.weights.tensor(ap + "norm.weight");
     b.ffn_norm = ops.weights.tensor(lp + "mlp.norm.weight");
     b.q_a_norm = ops.weights.tensor(ap + "query_a_norm.weight");
     b.kv_a_norm = ops.weights.tensor(ap + "key_value_a_norm.weight");
-#else
-    b.attn_norm = ops.dense(ap + "norm.weight");
-    b.ffn_norm = ops.dense(lp + "mlp.norm.weight");
-    b.q_a_norm = ops.dense(ap + "query_a_norm.weight");
-    b.kv_a_norm = ops.dense(ap + "key_value_a_norm.weight");
-#endif
     std::vector<std::string> first_names = {
         ap + "query_a.weight",
         ap + "key_value_a.weight",
@@ -81,13 +74,8 @@ void load_layer_weights(Block& b, Loader& ops, const Config& c, int i, const std
         first_names.push_back(ap + "indexer.key.weight");
         first_names.push_back(ap + "indexer.score.weight");
         second_names.push_back(ap + "indexer.query.weight");
-#ifdef TYLOINFER_NATIVE_CUDA
         b.index_k_norm = ops.weights.tensor(ap + "indexer.key_norm.weight");
         b.index_k_bias = ops.weights.tensor(ap + "indexer.key_norm.bias");
-#else
-        b.index_k_norm = ops.dense(ap + "indexer.key_norm.weight");
-        b.index_k_bias = ops.dense(ap + "indexer.key_norm.bias");
-#endif
     }
     b.input_proj = ops.projections(first_names);
     b.q_proj = ops.projections(second_names);

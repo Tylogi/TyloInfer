@@ -12,27 +12,23 @@ namespace tyloi::cuda::deepseek_v41_runtime {
 
 class Vision {
 public:
-#ifndef TYLOINFER_NATIVE_CUDA
-    using DenseTensor = ::tyloi::DenseTensor;
-#endif
-    static Vision load(std::shared_ptr<const tyloi::ModelSource> source,tyloi::weights::Loader weights,::tyloi::weights::Cache& cache,const CommonConfig& config);
-    tyloi::StepSequence<tyloi::models::Prepared> prepare(deepseek_v41::Model& language, tyloi::cache::Media& images,
-#ifndef TYLOINFER_NATIVE_CUDA
-        Projector projector,
-#endif
+    /** Load the streamed vision adapter from its model source. */
+    static Vision load(std::shared_ptr<const tyloi::ModelSource> source, tyloi::weights::Loader weights,
+        const CommonConfig& config);
+    /** Prepare vision embeddings and participation masks using the owning request's media cache. */
+    tyloi::StepSequence<tyloi::models::Prepared> prepare(
+        const deepseek_v41::Model& language,
+        tyloi::cache::Media& images,
         const std::vector<int64_t>& tokens,const MfqMultimodalInput& media) const;
 private:
-    Vision(std::shared_ptr<const tyloi::ModelSource> source,tyloi::weights::Loader weights,::tyloi::weights::Cache& cache,CommonConfig config)
-        :source_(std::move(source)),weights_(std::move(weights)),cache_(cache),config_(std::move(config)) {}
-#ifdef TYLOINFER_NATIVE_CUDA
+    Vision(std::shared_ptr<const tyloi::ModelSource> source, tyloi::weights::Loader weights,
+        CommonConfig config)
+        : source_(std::move(source)), weights_(std::move(weights)),
+          config_(std::move(config)) {}
     tyloi::StepSequence<::tyloi::Tensor> encode(
         ::tyloi::Tensor patches,int height,int width) const;
-#else
-    tyloi::StepSequence<DenseTensor> encode(Projector projector, DenseTensor patches,int height,int width) const;
-#endif
     std::shared_ptr<const tyloi::ModelSource> source_;
     tyloi::weights::Loader weights_;
-    ::tyloi::weights::Cache& cache_;
     CommonConfig config_;
 };
 

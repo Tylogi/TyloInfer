@@ -37,6 +37,9 @@ add_library(mfq-cuda-core STATIC
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/native/graph.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/native/context.cu
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/native/tensor/tensor.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/native/tensor/host_math.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/native/tensor/host_blas.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/native/tensor/host_index.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/native/tensor/tensor.cu
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/native/tensor/blas.cu
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/native/tensor/creation.cu
@@ -116,9 +119,9 @@ set(TYLOINFER_CUDA_KERNEL_SOURCES
     ${TYLOINFER_CUDA_KERNEL_ROOT}/deepseek_v41.cu
     ${TYLOINFER_CUDA_KERNEL_ROOT}/embedding.cu
     ${TYLOINFER_CUDA_KERNEL_ROOT}/selected_attention.cu
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/sparse_mma_raw.cu
     ${TYLOINFER_CUDA_KERNEL_ROOT}/qwen4_exp.cu
     ${TYLOINFER_CUDA_KERNEL_ROOT}/ple_fused.cu
-    ${TYLOINFER_CUDA_KERNEL_ROOT}/glm5_next.cu
     ${TYLOINFER_CUDA_KERNEL_ROOT}/gated_delta_net.cu
     ${TYLOINFER_CUDA_KERNEL_ROOT}/gdn_replay.cu
     ${TYLOINFER_CUDA_KERNEL_ROOT}/gdn_replay_updates.cu
@@ -154,6 +157,7 @@ if(TYLOINFER_ENABLE_MFQ_COMPAT)
     ${TYLOINFER_CUDA_KERNEL_ROOT}/nint_short_decode.cu
     ${TYLOINFER_CUDA_KERNEL_ROOT}/nint_q8_decode.cu
     ${TYLOINFER_CUDA_KERNEL_ROOT}/nvq_matmul.cu
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/nvq_decode.cu
     ${TYLOINFER_CUDA_KERNEL_ROOT}/nvq_routed_reuse.cu
     ${TYLOINFER_CUDA_KERNEL_ROOT}/nvq1_decode.cu
     )
@@ -161,6 +165,22 @@ endif()
 
 add_library(mfq-cuda-native-kernels STATIC
     ${TYLOINFER_CUDA_KERNEL_SOURCES}
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/acc.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/norm/wrappers.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/activation.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/qwen4_exp.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/selected_attention.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/rope/wrappers.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/sampling.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/embedding.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/kv_cache.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/ssm_conv.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/glm5_next.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/attention/wrappers.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/attention/gdn_wrappers.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/ffn/moe_wrappers.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/projection/mx_wrappers.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/projection/nepq_wrappers.cpp
     ${TYLOINFER_CUDA_KERNEL_ROOT}/float_projection.cu
     ${TYLOINFER_CUDA_KERNEL_ROOT}/kv_quantization.cu
     ${TYLOINFER_CUDA_KERNEL_ROOT}/kv_hot_cache.cu
@@ -203,6 +223,12 @@ foreach(_type IN LISTS _tyloinfer_mmq_types)
 endforeach()
 if(TYLOINFER_ENABLE_MFQ_COMPAT)
     target_sources(mfq-cuda-native-kernels PRIVATE
+        ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/projection/nint_wrappers.cpp
+        ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/projection/nvq_wrappers.cpp
+        ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/projection/nvq_check.cu
+        ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/projection/nepq_residual_wrappers.cpp
+        ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/projection/fp8_sq_wrappers.cpp
+        ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/projection/mxfp4_sq_wrappers.cpp
         ${TYLOINFER_CUDA_KERNEL_ROOT}/gr_prefill_blas.cu
         ${TYLOINFER_CUDA_KERNEL_ROOT}/gated_residual_fused.cu
     )
@@ -236,9 +262,6 @@ if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13.0)
     set_property(SOURCE ${TYLOINFER_CUDA_KERNEL_ROOT}/gated_residual_fused.cu APPEND
         PROPERTY COMPILE_OPTIONS "--split-compile=0")
 endif()
-target_compile_definitions(mfq-cuda-native-kernels PRIVATE
-    TYLOINFER_NATIVE_CUDA=1
-)
 target_include_directories(mfq-cuda-native-kernels PRIVATE
     ${PROJECT_SOURCE_DIR}
     ${TYLOINFER_REPOSITORY_ROOT}
@@ -319,6 +342,10 @@ endfunction()
 set(TYLOINFER_CUDA_OP_SOURCES
     ${PROJECT_SOURCE_DIR}/engine/ops.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/tensor.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/rows.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/compact.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/mhc.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/engram.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/ffn/ffn.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/ffn/mlp.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/ffn/dense.cpp
@@ -331,10 +358,16 @@ set(TYLOINFER_CUDA_OP_SOURCES
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/attention/attention.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/attention/kv.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/attention/linear.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/attention/gdn.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/attention/qsa.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/attention/ple.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/attention/csa.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/rope/positions.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/norm/rms.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/rope/rope.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/ffn/routes.cpp
-    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/ffn/gated.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/ffn/shared.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/ffn/mixer.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/projection/tq.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/ffn/tq.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/projection/mx.cpp
@@ -358,16 +391,14 @@ endif()
 add_library(mfq-cuda-ops OBJECT ${TYLOINFER_CUDA_OP_SOURCES})
 mfq_configure_cuda_backend_target(mfq-cuda-ops)
 target_link_libraries(mfq-cuda-ops PRIVATE mfq-quant-readers)
-target_compile_definitions(mfq-cuda-ops PRIVATE
-    TYLOINFER_NATIVE_CUDA=1 NOMINMAX)
+target_compile_definitions(mfq-cuda-ops PRIVATE NOMINMAX)
 set_target_properties(mfq-cuda-ops PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 set(TYLOINFER_CUDA_EXECUTION_SOURCES
-    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/executor/execution.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/executor/options.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/executor/config.cpp
-    ${PROJECT_SOURCE_DIR}/engine/budget.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/executor/executor.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/executor/working_set.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/executor/decode_graph.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/executor/batch_graph.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/executor/tq.cpp

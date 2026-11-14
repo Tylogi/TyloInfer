@@ -1,6 +1,7 @@
 #pragma once
 
 #include "engine/backends/cuda/executor/executor.h"
+#include "engine/config.h"
 #include "engine/ops.h"
 #include "engine/weights/loader.h"
 #include "engine/weights/moe/options.h"
@@ -21,6 +22,14 @@ class Collectives;
 // Read once at owner construction; controls read on access stay in options.h.
 struct CudaLoadConfig {
     tyloi::weights::Loader::Options weights;
+    /** Decode profiling policy read by the CUDA configuration loader. */
+    bool profile_decode = false;
+    /** Speculative cycle profiling policy read by the CUDA configuration loader. */
+    bool profile_mtp = false;
+    /** MoE summary tracing policy read by the CUDA configuration loader. */
+    bool trace_moe = false;
+    /** Early token row prefetch policy frozen at load time. */
+    tyloi::engine::PrefetchConfig prefetch;
     bool report_cuda_memory = false;
     bool model_parallel_cuda_graph = true;
     bool tensor_parallel_cuda_graph = true;

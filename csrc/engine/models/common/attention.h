@@ -16,6 +16,8 @@ struct AttentionStep {
     std::int64_t cache_position = 0;
     std::int64_t planned_kv_length = 0;
     std::int64_t decode_attention_parts = 0;
+    /** Optional key-validity mask covering the visible cache. */
+    ::tyloi::Tensor attention_mask;
 };
 
 struct FullAttention {

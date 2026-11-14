@@ -3,12 +3,10 @@
 #include "engine/backends/cuda/executor/tq_moe.h"
 #include "engine/backends/cuda/executor/options.h"
 #include "engine/backends/cuda/native/collectives.h"
-#ifdef TYLOINFER_NATIVE_CUDA
 #include "engine/backends/cuda/executor/executor.h"
 #include "engine/backends/cuda/native/profile.h"
 #include "engine/backends/cuda/ops/ffn/moe.h"
 #include "engine/ops.h"
-#endif
 
 #if TYLOINFER_ENABLE_MFQ_COMPAT
 #include "engine/backends/cuda/ops/ffn/mfe.h"
@@ -195,7 +193,6 @@ DenseTensor Projector::run(const TqMoeBanks& banks, DenseTensor input, DenseTens
 
 } // namespace tyloi::cuda
 
-#ifdef TYLOINFER_NATIVE_CUDA
 namespace tyloi::ops {
 namespace {
 
@@ -221,8 +218,7 @@ tyloi::Tensor tyloi::ops::experts(const Tensor& input, const Tensor& ids, const 
     validate_expert_inputs(input, ids, weights, gate_up, down, width);
     auto& executor = cuda::Executor::current();
     const auto project = executor.projector(cuda::Executor::current_ffn());
-    auto banks = tq_banks(gate_up.empty() ? nullptr : gate_up.front(),
-                          gate_up.empty() ? nullptr : gate_up.back(), down);
+    auto banks = tq_banks(gate_up.front(), gate_up.back(), down);
     if (banks.gate || banks.up || banks.down) {
         TYLOINFER_RUNTIME_CHECK(gate_up.size() == 2 && down && banks.gate && banks.up && banks.down,
                                 "TQ MoE requires separate Gate, Up and Down banks");
@@ -265,4 +261,3 @@ tyloi::Tensor tyloi::ops::moe(const Tensor& input, const Tensor& ids, const Tens
     const auto routed = experts(input, ids, weights, gate_up, down, width).dense();
     return routed + shared_output;
 }
-#endif

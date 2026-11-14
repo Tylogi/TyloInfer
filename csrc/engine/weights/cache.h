@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <iosfwd>
 #include <memory>
 #include <optional>
 #include <string>
@@ -16,13 +17,6 @@
 namespace tyloi::engine { class Budget; }
 
 namespace tyloi::weights {
-class Cache;
-namespace detail {
-struct CacheData;
-CacheData& cache(Cache& value);
-const CacheData& cache(const Cache& value);
-}
-
 // The owner drains consumers and enters the CUDA scope before workspace operations.
 class Cache {
 public:
@@ -100,6 +94,8 @@ public:
     void configure(std::size_t bytes, const CachePolicy& policy, bool preload,
         const std::string& profile_path);
     std::vector<std::pair<std::string, double>> metrics() const;
+    /** Print the existing expert-cache statistics when that cache is configured. */
+    void report(std::ostream& output) const;
     Activity activity() const;
     std::size_t budget() const;
     std::size_t minimum() const;
@@ -107,6 +103,8 @@ public:
     bool graph_safe(Graph kind = Graph::native, bool parallel = false) const;
     Transfer transfer() const;
     Decode decode() const;
+    /** Report whether registered legacy experts completed preloading. */
+    bool legacy_experts_resident() const;
     bool split_prefill(std::int64_t rows) const;
     bool prepare_graph(Device device);
     bool needs_finalize() const;
@@ -141,9 +139,19 @@ public:
     void reset() noexcept;
 
 private:
-    friend detail::CacheData& detail::cache(Cache& value);
-    friend const detail::CacheData& detail::cache(const Cache& value);
-    std::unique_ptr<detail::CacheData> data_;
+    struct Resources;
+    std::unique_ptr<Resources> data_;
+    friend struct Loader;
+    friend class Loan;
+    /** Prepare an expert loan for the requesting owner. */
+    void lend(Loan& loan);
+    /** Load routed TQ weights using the cache's resources. */
+    Tensor routed_tq(const source::Source& source, const std::string& name,
+        const ParallelConfig& parallel);
+    /** Load routed TQ weights with the caller's expected logical geometry. */
+    Tensor routed_tq(const source::Source& source, const std::string& name,
+        const ParallelConfig& parallel, std::int64_t experts,
+        std::int64_t output, std::int64_t input);
     void restore_workspace(std::size_t reserve_bytes, const source::Source* source);
     std::size_t prefill_workspace_capacity() const noexcept;
     void append_workspace_metrics(std::vector<std::pair<std::string, double>>& metrics) const;

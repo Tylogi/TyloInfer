@@ -197,14 +197,15 @@ std::size_t segment_for(const tyloi::TqTable& table, std::uint64_t row) {
 
 namespace {
 
-class TqRowStage final : public RowStage {
+class TqRowStage final : public tyloi::weights::RowStage {
     std::vector<std::shared_ptr<tyloi::TqTable>> tables_;
     std::vector<std::int64_t> shape_;
     std::int64_t rows_per_shard_, count_ = 1, columns_ = 0;
     std::size_t image_stride_ = 0, images_offset_ = 0, bytes_ = 0;
     ::tyloi::Device device_;
     std::unique_ptr<tyloi::cuda::HostBuffer> host_;
-    ::tyloi::DenseTensor packet_, output_;
+    ::tyloi::DenseTensor packet_;
+    ::tyloi::Tensor output_;
     std::uint8_t* packet_address_ = nullptr;
     bool mapped_ = false, charged_ = false;
     std::vector<MfqCudaStream> streams_;
@@ -374,20 +375,20 @@ public:
     void decode() override {
         const MfqCudaGuard guard(device_);
         retain_stream();
-        mfq_cuda_record_stream(output_, mfq_get_current_cuda_stream(device_.index));
+        mfq_cuda_record_stream(output_.dense(), mfq_get_current_cuda_stream(device_.index));
         if (packet_.defined()) {
             mfq_cuda_record_stream(packet_, mfq_get_current_cuda_stream(device_.index));
         }
         status(mfq_tq_embedding_rows(
             reinterpret_cast<const TrellisProjectionView*>(packet_address_),
-            int(count_), int(columns_), output_.data_ptr(), 0,
+            int(count_), int(columns_), output_.dense().data_ptr(), 0,
             mfq_current_cuda_stream()));
     }
 };
 
 } // namespace
 
-std::shared_ptr<RowStage> make_tq_row_stage(
+std::shared_ptr<tyloi::weights::RowStage> make_tq_row_stage(
         const std::vector<std::shared_ptr<tyloi::TqTable>>& tables,
         std::int64_t rows_per_shard, const std::vector<std::int64_t>& shape,
         const ::tyloi::Device& device) {

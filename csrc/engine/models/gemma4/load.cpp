@@ -76,14 +76,13 @@ struct LayerLoader {
     }
 };
 
-Layer load_layer(const tyloi::weights::Loader& weights, const Config &config,
+void load_layer(Layer& result, const tyloi::weights::Loader& weights, const Config &config,
                  int layer, const std::string &type) {
-    Layer result;
     result.device = weights.placement.device;
     LayerLoader loader{weights};
     tyloi::models::gemma4::load_layer(result.attention, result, loader, config, layer, type);
-    return result;
 }
+
 
 void load(Model& model, const tyloi::weights::Loader& weights, LayerPlacementConfig& placement,
           int gpu_layers, bool expert_parallel, bool load_layers, bool load_input_output) {
@@ -117,7 +116,8 @@ void load(Model& model, const tyloi::weights::Loader& weights, LayerPlacementCon
                 const int device = placement.device_for_layer(index);
                 const auto& type = config.layer_types.at(static_cast<std::size_t>(index));
                 std::cerr << "loading layer " << index << ' ' << type << " CUDA" << std::endl;
-                model.layers.push_back(load_layer(weights.for_layer(device, false), config, index, type));
+                auto& layer = model.layers.emplace_back();
+                load_layer(layer, weights.for_layer(device, false), config, index, type);
             }
         }
     } else {
@@ -126,11 +126,12 @@ void load(Model& model, const tyloi::weights::Loader& weights, LayerPlacementCon
     }
 }
 
-std::unique_ptr<tyloi::models::CausalModel> load(
+void load(std::unique_ptr<tyloi::models::CausalModel>& owner,
         std::shared_ptr<const tyloi::ModelSource> source, std::string_view definition,
         std::int64_t context, const tyloi::weights::Loader& weights, LayerPlacementConfig& placement,
         int gpu_layers, bool expert_parallel) {
-    auto model = std::make_unique<Model>(read(std::move(source), definition, context));
+    owner = std::make_unique<Model>(read(std::move(source), definition, context));
+    auto* model = static_cast<Model*>(owner.get());
     load(*model, weights, placement, gpu_layers, expert_parallel);
     if (const auto* vision = model->graph.component("vision"); vision != nullptr &&
         vision->tensor_root == "vision" && vision->implementation == "radio" &&
@@ -138,7 +139,6 @@ std::unique_ptr<tyloi::models::CausalModel> load(
         vision->position_policy.empty()) {
         throw std::runtime_error("CUDA component adapter is unsupported for this model");
     }
-    return model;
 }
 
 } // namespace tyloi::cuda::gemma4

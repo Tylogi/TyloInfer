@@ -4,6 +4,9 @@
 #include "engine/weights/moe/prepare.h"
 #include "engine/weights/quant.h"
 #include "engine/weights/loader.h"
+#include "engine/weights/encoding/fp8_sq_blob.h"
+#include "engine/weights/encoding/mxfp4_sq_blob.h"
+#include "engine/backends/cuda/ops/projection/vq.h"
 #include "engine/backends/cuda/kernels/mfq_cuda_quant_ops.h"
 
 #include <algorithm>
@@ -490,6 +493,7 @@ tyloi::mfe::Data load_mfe_cpu(
         int tokens,
         int routes,
         bool routed_input) {
+    const MfqCudaGuard guard(input.device());
     auto cpu = tyloi::mfe::unpack(tyloi::read_tensor(source, name));
     auto reference = ::tyloi::cuda::empty(
         {tokens * routes, cpu.out_per_expert},
@@ -512,7 +516,7 @@ tyloi::mfe::Data load_mfe_cpu(
                 packed.neuron_min, packed.neuron_len, packed.gs);
         } else if (pool.dtype == "MXFP4") {
             dense_flat = dequant_mxfp4_cpu(pool.mxfp4)
-                .to(::tyloi::kCUDA).contiguous();
+                .to(input.device()).contiguous();
         } else if (pool.dtype == "NEPQ") {
             auto packed = to_device_nepq(tyloi::nepq::unpack(
                 pool.payload, pool.dtype, pool.runtime_payload), true);
@@ -558,13 +562,13 @@ tyloi::mfe::Data load_mfe_cpu(
                 {static_cast<int64_t>(pair_indices.size())},
                 ::tyloi::TensorOptions()
                     .dtype(::tyloi::kInt64))
-                .clone().to(::tyloi::kCUDA);
+                .clone().to(input.device());
             auto token_index = ::tyloi::cuda::from_blob(
                 token_indices.data(),
                 {static_cast<int64_t>(token_indices.size())},
                 ::tyloi::TensorOptions()
                     .dtype(::tyloi::kInt64))
-                .clone().to(::tyloi::kCUDA);
+                .clone().to(input.device());
             auto selected = routed_input
                 ? input.reshape({tokens * routes, cpu.neuron_len})
                       .index_select(0, pair_index)
