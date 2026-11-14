@@ -14,7 +14,7 @@ namespace tyloi::cuda::qwen4_exp {
 
 LayerState::LayerState(const Layer& layer) {
     if (layer.qsa)
-        qsa = std::make_unique<Qsa::State>(*layer.qsa);
+        qsa = std::make_unique<tyloi::ops::Qsa::State>(*layer.qsa);
 }
 
 void LayerState::reset(const Layer& layer) {
@@ -62,8 +62,13 @@ tyloi::models::qwen4_exp::LayerSnapshot capture_layer_session(
         bytes += session_tensor_bytes(*saved);
         return saved;
     };
-    if (layer.qsa)
-        layer.qsa->capture_session(*state.qsa, snapshot, position, bytes);
+    if (layer.qsa) {
+        tyloi::ops::Qsa::Snapshot attention;
+        layer.qsa->capture_session(*state.qsa, attention, position, bytes);
+        snapshot.keys = std::move(attention.keys);
+        snapshot.values = std::move(attention.values);
+        snapshot.index = std::move(attention.index);
+    }
     if (layer.gdn) {
         snapshot.convolution = save(state.gdn.conv.dense());
         snapshot.recurrent = save(state.gdn.recurrent.dense());
@@ -83,7 +88,7 @@ void restore_layer_session(
         const tyloi::models::qwen4_exp::LayerSnapshot& snapshot, std::int64_t position) {
     state.reset(layer);
     if (layer.qsa)
-        layer.qsa->restore_session(*state.qsa, snapshot, position);
+        layer.qsa->restore_session(*state.qsa, {snapshot.keys, snapshot.values, snapshot.index}, position);
     if (layer.gdn) {
         const auto* convolution = snapshot.convolution.representation<DenseTensor>();
         const auto* recurrent = snapshot.recurrent.representation<DenseTensor>();
@@ -217,7 +222,7 @@ std::vector<std::pair<tyloi::Device, std::size_t>> State::growth(
             if (input.confirmed > 0) add(device, block.ple->checkpoint_growth_bytes(state.ple, batch, tokens, input.confirmed));
             add(device, retained, temporary);
         }
-        if (block.qsa) add(device, block.qsa->ordinary_growth_bytes(*state.qsa, batch, tokens));
+        if (block.qsa) add(device, block.qsa->allocation_bytes(*state.qsa, batch, tokens, false));
         if (block.gdn) {
             const auto [retained, temporary] = block.gdn->ordinary_growth_bytes(state.gdn, batch, tokens);
             if (input.confirmed > 0) add(device, block.gdn->checkpoint_growth_bytes(state.gdn, batch, tokens, input.confirmed));
@@ -236,27 +241,15 @@ std::vector<::tyloi::Tensor> State::storage() const {
     for (std::size_t i=0;i<model_.layers.size();++i) {
         const auto& block=*model_.layers[i];
         const auto& layer=*layers[i];
-        if(block.gdn) {
-            const auto& gdn=layer.gdn;
-            // GDN reassigns the Dense representation in place. Capture an
-            // independent view so a later reset cannot replace this backing.
-            add(gdn.conv.dense());add(gdn.recurrent.dense());add(gdn.core_workspace.dense());
-            add(gdn.saved_conv);add(gdn.saved_state);
-            for(const auto& value:gdn.saved_prefix_conv)add(value);
-            for(const auto& value:gdn.saved_prefix_state)add(value);
-        }
+        if(block.gdn)
+            for(const auto& value:block.gdn->storage(layer.gdn))add(value);
         if(block.ple) {
             const auto& ple=layer.ple;
             add(ple.conv);add(ple.saved_conv);
             for(const auto& value:ple.saved_prefix_conv)add(value);
         }
-        if(block.qsa) {
-            const auto& qsa=*layer.qsa;
-            add(qsa.keys.storage());add(qsa.values.storage());add(qsa.index.storage());
-            add(qsa.graph_keys);add(qsa.graph_values);add(qsa.graph_pooled);add(qsa.graph_index);
-            if(qsa.memory)
-                for(const auto& value:qsa.memory->storage())add(value);
-        }
+        if(block.qsa)
+            for(const auto& value:block.qsa->storage(*layer.qsa))add(value);
     }
     return result;
 }

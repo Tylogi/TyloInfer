@@ -4,6 +4,8 @@
 
 #include "engine/models/qwen4_exp/model.h"
 #include "engine/ops/ffn.h"
+#include "engine/ops/gdn.h"
+#include "engine/ops/qsa.h"
 #include "engine/ops/residual.h"
 #include "engine/models/qwen4_exp/config.h"
 

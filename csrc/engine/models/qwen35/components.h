@@ -3,7 +3,7 @@
 #include "engine/ops.h"
 
 #include "engine/engine.h"
-#include "engine/models/common/capabilities.h"
+#include "engine/models/plan.h"
 #include "engine/models/qwen35/model.h"
 #include "engine/models/qwen35/mtp.h"
 #include "engine/backends/cuda/native/profile.h"
@@ -28,7 +28,7 @@ namespace tyloi::cuda::qwen35 {
 
 struct Components {
     tyloi::ModelGraph graph;
-    CudaModelPlan plan;
+    ::tyloi::models::Plan plan;
     bool vision_available = false;
     Mtp* mtp = nullptr;
 
@@ -37,8 +37,8 @@ struct Components {
         std::unique_ptr<tyloi::Executor>& predictor_execution,
         bool optional, bool cpu_offload, bool preallocate);
 
-    CudaComponentState state() const noexcept {
-        return cuda_component_state(
+    ::tyloi::models::ComponentState state() const noexcept {
+        return ::tyloi::models::component_state(
             graph, plan, vision_available, bool(mtp));
     }
 

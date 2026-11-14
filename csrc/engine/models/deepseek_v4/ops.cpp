@@ -1,3 +1,4 @@
+#include "engine/models/plan.h"
 #include "engine/backends/cuda/native/collectives.h"
 #include "engine/backends/cuda/native/scope.h"
 #include "engine/backends/cuda/ops/norm/rms.h"
@@ -301,7 +302,7 @@ Model read(std::shared_ptr<const tyloi::ModelSource> source, std::string_view de
     Model model;
     model.source = std::move(source);
     model.graph = tyloi::models::graph(*model.source);
-    model.plan = cuda_model_plan(model.graph);
+    model.plan = ::tyloi::models::model_plan(model.graph);
     tyloi::models::require_model(model.graph.backbone == "deepseek_v4",
                                "model backbone does not match the requested causal model");
     auto& c = model.config;

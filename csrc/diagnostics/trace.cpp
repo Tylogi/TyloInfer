@@ -126,7 +126,7 @@ int run_block_trace_compare(tyloi::cuda::Program& test,
     if (actual.trace.size() != expected.trace.size())
         throw std::runtime_error("block trace stage count mismatch");
     auto scope = test.executor().enter(test.config().layer_placement.primary_device());
-    const auto device = test.executor().device();
+    const auto device = tyloi::Device(tyloi::kCUDA, test.config().layer_placement.primary_device());
     for (std::size_t i = 0; i < actual.trace.size(); ++i) {
         auto ref = expected.trace[i].dense().to(device).reshape({-1}).to(tyloi::kFloat64);
         auto got = actual.trace[i].dense().to(device).reshape({-1}).to(tyloi::kFloat64);

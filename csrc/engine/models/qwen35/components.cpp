@@ -1,3 +1,4 @@
+#include "engine/models/plan.h"
 #include "engine/models/source.h"
 #include "engine/ops.h"
 #include "engine/models/qwen35/components.h"
@@ -33,7 +34,7 @@ tyloi::engine::Metrics Components::metrics() const {
 void Components::describe(tyloi::engine::EngineInfo& info) const {
     const auto component_state = state();
     info.multimodal = component_state.vision_available;
-    const auto caps = cuda_runtime_capabilities(
+    const auto caps = ::tyloi::models::runtime_capabilities(
         graph, plan, component_state, info.multimodal, false);
     info.duplex = caps.full_duplex;
     info.capabilities = {graph.architecture, caps.text,
@@ -51,7 +52,7 @@ Components Components::load(
     bool optional,
     bool cpu_offload,
     bool preallocate) {
-    Components components{model.graph, cuda_model_plan(model.graph)};
+    Components components{model.graph, ::tyloi::models::model_plan(model.graph)};
     if (!optional) return components;
     load_components(model, weights, placement, cpu_layers, cpu_offload,
         options::vision_resident(), preallocate);

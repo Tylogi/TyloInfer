@@ -210,8 +210,15 @@ Qsa::Graph::~Graph() = default;
 Qsa::Graph::Graph(Graph&&) noexcept = default;
 Qsa::Graph& Qsa::Graph::operator=(Graph&&) noexcept = default;
 bool Qsa::Graph::eligible() const {
-    return cuda::KvMemoryManager::graph_supported(impl_->independent) &&
-        (!impl_->independent || mfq_cuda_graph_capture_supported());
+    auto& executor = cuda::Executor::current();
+    const auto offload = executor.kv_offload();
+    if (offload) {
+        const auto* option = cuda::env_lookup("TYLOINFER_KV_STREAM_GRAPHS");
+        const auto manager = executor.kv_memory();
+        if (impl_->independent || !manager || !manager->offload() ||
+                (option && option[0] == '0')) return false;
+    }
+    return !impl_->independent || mfq_cuda_graph_capture_supported();
 }
 bool Qsa::Graph::reusable() const {
     if (impl_->requests.size() != 1 || impl_->requests.front().layers.empty()) return false;
@@ -234,7 +241,7 @@ void Qsa::Graph::admit(std::int64_t tokens, std::int64_t previous_capacity, bool
         if (tokens != 1) throw std::invalid_argument("independent QSA graph requires one token");
         std::int64_t required = 0;
         for (const auto& request : plan.requests) required = std::max(required, request.position + 1);
-        cuda::KvMemoryManager::ensure(required);
+        if (auto manager = cuda::Executor::current().kv_memory()) manager->ensure(required);
     } else {
         if (plan.requests.size() != 1) throw std::invalid_argument("single QSA graph requires one request");
         const auto& request = plan.requests.front();
@@ -246,7 +253,7 @@ void Qsa::Graph::admit(std::int64_t tokens, std::int64_t previous_capacity, bool
         if (!request.layers.empty()) {
             const auto& first = request.layers.front();
             if (first.first->graph_capacity(*first.second)) {
-                cuda::KvMemoryManager::ensure(required);
+                if (auto manager = cuda::Executor::current().kv_memory()) manager->ensure(required);
                 capacity = first.first->graph_capacity(*first.second);
             }
         }

@@ -28,6 +28,7 @@ public:
 
     void preallocate() override {}
     void reset(std::int64_t batch) override;
+    std::vector<std::pair<tyloi::Device, std::size_t>> reset_growth(std::int64_t batch) const override;
     void allocate();
 #ifdef TYLOINFER_NATIVE_CUDA
     std::vector<std::pair<tyloi::Device, std::size_t>> allocation_growth() const;

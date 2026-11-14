@@ -2,20 +2,19 @@
 #ifndef TYLOINFER_NATIVE_CUDA
 #include "engine/weights/cache.h"
 #include "engine/state/media.h"
-#include "engine/backends/cuda/executor/execution.h"
 #endif
 #include "engine/backends/cuda/kernels/mfq_cuda_norm_ops.h"
 #include "engine/backends/cuda/ops/norm/rms.h"
 #include "engine/backends/cuda/ops/ffn/ffn.h"
-#ifdef TYLOINFER_NATIVE_CUDA
 #include "engine/ops.h"
-#else
+#ifndef TYLOINFER_NATIVE_CUDA
 #include "engine/backends/cuda/ops/rope/tail.h"
 #endif
 #include "engine/models/deepseek_v41/causal_lm.h"
 
-#include "engine/models/common/capabilities.h"
+#include "engine/models/plan.h"
 #include "engine/models/causal_model.h"
+#include "engine/models/common/mtp.h"
 #include "engine/models/common/prompt.h"
 #include "engine/models/metadata.h"
 #include "engine/metrics.h"
@@ -40,8 +39,6 @@
 #include <string>
 #include <utility>
 #include <vector>
-
-struct CudaExecutionContext;
 
 namespace tyloi::cuda::deepseek_v41_runtime {
 
@@ -914,9 +911,6 @@ struct Block final {
     }
 
     DenseTensor forward(SharedState& shared,
-#ifndef TYLOINFER_NATIVE_CUDA
-                   CudaExecutionContext &execution,
-#endif
                    DenseTensor hidden, DenseTensor positions,
                    std::int64_t cache_position, const MfqOptional<DenseTensor> &sequence_lengths,
                    const MfqOptional<DenseTensor> &cache_positions = mfq_nullopt,
@@ -976,24 +970,12 @@ struct Block final {
 #else
                 auto bias=::tyloi::cuda::where(shared.routing_mask,vision_router_bias,mlp.moe_router_bias.dense()).contiguous();
 #endif
-#ifdef TYLOINFER_NATIVE_CUDA
                 return mlp.forward(
                     value.reshape({-1,config.hidden}), layer_state.current_ids, bias)
-#else
-                auto executor = execution.executor().fork(model_parallel_primary_device(execution.config));
-                return mlp.forward(
-                    value.reshape({-1,config.hidden}), *executor, execution.executor().forward_mode(execution.config.layer_placement.primary_device()).ffn, layer_state.current_ids, bias)
-#endif
                     .reshape({batch,tokens,config.hidden});
             }
-#ifdef TYLOINFER_NATIVE_CUDA
             return mlp.forward(
                     value.reshape({-1, config.hidden}), layer_state.current_ids)
-#else
-            auto executor = execution.executor().fork(model_parallel_primary_device(execution.config));
-            return mlp.forward(
-                    value.reshape({-1, config.hidden}), *executor, execution.executor().forward_mode(execution.config.layer_placement.primary_device()).ffn, layer_state.current_ids)
-#endif
                 .reshape({batch, tokens, config.hidden});
         });
         hidden = expand(output, hidden, ffn_mix, "deepseek_v41.mhc.mlp.expand");
@@ -1009,7 +991,6 @@ tyloi::cuda::Ffn load_moe_at(const tyloi::weights::Loader& weights,
 std::unique_ptr<Block> load_block(const tyloi::weights::Loader& weights,
                                     std::int64_t layer, const CommonConfig& config,
                                     ModelTables& tables, std::size_t engram_cache_rows);
-void validate_load_options(const CudaExecutionContext &execution);
 DenseTensor finalize_hidden(const SharedState &state, const DenseTensor &hidden);
 
 inline int run_self_check() {
@@ -1047,6 +1028,7 @@ struct Model : tyloi::models::CausalModel {
     tyloi::models::Info info() const override;
     MfqModelCapabilities capabilities() const override;
     tyloi::engine::Metrics metrics() const override;
+    tyloi::models::Mtp* predictor() const noexcept override { return mtp.get(); }
     std::unique_ptr<tyloi::models::State> make_state() const override;
     tyloi::StepSequence<tyloi::models::Prepared> prepare(const std::vector<std::int64_t>& tokens,
         const MfqMultimodalInput& media, tyloi::models::State& state) const override;
@@ -1067,12 +1049,9 @@ struct Model : tyloi::models::CausalModel {
     tyloi::models::CausalLmMetadata metadata;
     int primary_device = 0;
     bool needs_host_tokens = false;
-#ifndef TYLOINFER_NATIVE_CUDA
-    CudaExecutionContext* execution = nullptr;
-#endif
     std::shared_ptr<const tyloi::ModelSource> source;
     tyloi::ModelGraph graph;
-    CudaModelPlan plan;
+    ::tyloi::models::Plan plan;
     ::tyloi::Tensor embed;
 #ifdef TYLOINFER_NATIVE_CUDA
     ::tyloi::Tensor output_norm;
@@ -1084,23 +1063,13 @@ struct Model : tyloi::models::CausalModel {
     std::vector<std::unique_ptr<deepseek_v41_runtime::Block>> blocks;
     deepseek_v41_runtime::ModelTables tables;
     std::unique_ptr<deepseek_v41_runtime::Vision> vision;
+    std::unique_ptr<tyloi::models::Mtp> mtp;
     tyloi::cache::Media media;
 
     // ---- helpers absorbed from the retired CausalLm plumbing
-#ifndef TYLOINFER_NATIVE_CUDA
-    auto execution_scope() const {
-        return CudaScope(execution->config.layer_placement.primary_device(), execution->executor().contexts());
-    }
-#endif
     ::tyloi::DenseTensor device_ids(::tyloi::DenseTensor ids) const {
-#ifdef TYLOINFER_NATIVE_CUDA
         auto converted = tyloi::ops::cast(ids, ::tyloi::kInt64);
         return tyloi::ops::contiguous(tyloi::ops::copy(converted, ::tyloi::Device(::tyloi::kCUDA, primary_device))).dense();
-#else
-        return execution->executor().collectives()
-            .copy(ids.to(::tyloi::kInt64), execution->config.layer_placement.primary_device())
-            .contiguous();
-#endif
     }
     ::tyloi::DenseTensor embed_tokens(::tyloi::DenseTensor ids) const {
         return tyloi::ops::measure("model.embed", [&] { return tyloi::ops::embedding(ids, embed).dense(); });
@@ -1132,9 +1101,6 @@ struct Model : tyloi::models::CausalModel {
 
 void read(Model& model, std::shared_ptr<const tyloi::ModelSource> source,
          std::string_view definition, std::int64_t context_size);
-void load(Model& model, CudaExecutionContext& execution, int64_t context_size,
-          bool defer_moe_cache_finalize, bool load_blocks, bool load_optional_components);
-
 struct CedEncoding {
     ::tyloi::DenseTensor ids, tail_hidden, tail_pre, tail_ids;
     tyloi::models::deepseek_v41::EngramHashBatch tail_hashes;

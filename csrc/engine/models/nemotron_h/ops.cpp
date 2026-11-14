@@ -1,3 +1,4 @@
+#include "engine/models/plan.h"
 #include "engine/backends/cuda/native/collectives.h"
 #include "engine/backends/cuda/native/scope.h"
 #include "engine/models/session/snapshot.h"
@@ -441,18 +442,6 @@ static DenseTensor normalize_ids(Collectives& collectives, int primary, DenseTen
 #endif
 
 #ifdef TYLOINFER_NATIVE_CUDA
-tyloi::models::Info Model::info() const { return tyloi::models::model_info(metadata); }
-MfqModelCapabilities Model::capabilities() const {
-    return {graph.architecture, graph.has_component("text"), false, false, false, false, false, false, "model-graph"};
-}
-tyloi::engine::Metrics Model::metrics() const {
-    return {{"kv_memory_supported", 0.0}, {"kv_quantization_supported", 0.0}, {"kv_quantization_bits", 0.0}};
-}
-std::unique_ptr<tyloi::models::State> Model::make_state() const { return std::make_unique<State>(*this); }
-tyloi::StepSequence<tyloi::models::Prepared> Model::prepare(
-    const std::vector<std::int64_t>&, const MfqMultimodalInput&, tyloi::models::State&) const {
-    throw std::invalid_argument("model has no multimodal component");
-}
 ::tyloi::Tensor Model::normalize(const ::tyloi::Tensor& hidden, std::int64_t batch, std::int64_t tokens) const {
     auto shaped = tyloi::ops::reshape(hidden, {batch, tokens, metadata.hidden_size});
     return tyloi::ops::measure("model.output_norm", shaped.device(), [&] {
@@ -684,11 +673,11 @@ template <class MambaWeights> void convert_mamba_weights(MambaWeights& block) {
 
 void validate_components(const tyloi::ModelGraph& graph) {
     if (graph.component("vision") != nullptr &&
-        cuda_model_plan(graph).vision != CudaVisionAdapter::radio)
+        ::tyloi::models::model_plan(graph).vision != ::tyloi::models::VisionAdapter::radio)
         throw std::runtime_error(
             "Nemotron-H CUDA vision requires the radio/radio_cpe.v1 vision component");
     if (graph.component("predictor") != nullptr &&
-        cuda_model_plan(graph).predictor != CudaPredictorAdapter::nemotron_h)
+        ::tyloi::models::model_plan(graph).predictor != ::tyloi::models::PredictorAdapter::nemotron_h)
         throw std::runtime_error(
             "Nemotron-H CUDA multi-token prediction requires the nemotron_h_mtp predictor "
             "implementation under the predictor tensor root");
@@ -734,7 +723,7 @@ Model read(std::shared_ptr<const tyloi::ModelSource> source, std::string_view de
     Model model;
     model.source = std::move(source);
     model.graph = tyloi::models::graph(*model.source);
-    model.plan = cuda_model_plan(model.graph);
+    model.plan = ::tyloi::models::model_plan(model.graph);
     tyloi::models::require_model(model.graph.backbone == "nemotron_h",
                                "model backbone does not match the requested causal model");
     tyloi::models::nemotron_h::load_config(definition, model.graph, model.config, model.metadata);
@@ -757,6 +746,7 @@ void load(Model& model, const ::tyloi::weights::Loader& weights,
     if (expert_parallel && config.num_routed_experts <= 0)
         throw std::runtime_error("--expert-parallel requires a model with routed experts");
     placement.prepare(config.num_hidden_layers);
+    model.primary = placement.primary_device();
     const int cpu_layers = gpu_layers < 0 ? 0 :
         static_cast<int>(std::max<int64_t>(config.num_hidden_layers - gpu_layers, 0));
     if (cpu_layers > 0) {
@@ -799,7 +789,7 @@ void load(Model& model, const ::tyloi::weights::Loader& weights,
     }
 }
 
-State::State(const Model& model) : layers(model.layers.size()) {
+State::State(const Model& model) : layers(model.layers.size()), model_(&model) {
     layout_.reserve(model.layers.size());
     for (std::size_t index = 0; index < layers.size(); ++index) {
         const auto& layer = model.layers[index];

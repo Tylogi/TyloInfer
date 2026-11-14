@@ -83,6 +83,14 @@ void Gdn::initialize_request_cache(State& state, bool allocate_counters) const {
     impl_->core.initialize_request_cache(state, allocate_counters);
 }
 std::size_t Gdn::growth_bytes(const State& state) const { return impl_->core.growth_bytes(state); }
+std::pair<std::size_t, std::size_t> Gdn::ordinary_growth_bytes(
+        const State& state, std::int64_t batch, std::int64_t tokens) const {
+    return impl_->core.ordinary_growth_bytes(state, batch, tokens);
+}
+std::size_t Gdn::checkpoint_growth_bytes(
+        const State& state, std::int64_t batch, std::int64_t tokens, std::int64_t confirmed) const {
+    return impl_->core.checkpoint_growth_bytes(state, batch, tokens, confirmed);
+}
 std::size_t Gdn::request_cache_growth_bytes(const State& state) const {
     return impl_->core.request_cache_growth_bytes(state);
 }

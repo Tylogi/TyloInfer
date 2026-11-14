@@ -4,9 +4,7 @@
 #include "engine/models/session/snapshot.h"
 #include "engine/backends/cuda/executor/options.h"
 
-#ifndef TYLOINFER_NATIVE_CUDA
-#include "engine/backends/cuda/executor/execution.h"
-#endif
+#include "engine/backends/cuda/executor/executor.h"
 #include "engine/backends/cuda/ops/norm/rms.h"
 #include "engine/models/common/mtp.h"
 #include "engine/models/nemotron_h/forward.h"
@@ -56,20 +54,12 @@ struct Mtp final : tyloi::models::Mtp {
     DenseTensor embedding_norm, hidden_norm, output_norm;
 #endif
     std::vector<Layer> layers;
-#ifndef TYLOINFER_NATIVE_CUDA
-    CudaExecutionContext *execution = nullptr;
-    std::unique_ptr<Executor> executor;
-#endif
 
     // The predictor history shares the backbone context limit, which the
     // loader may have overridden with --ctx-size.
     int64_t predictor_capacity() const noexcept { return config.max_position_embeddings; }
 
-#ifdef TYLOINFER_NATIVE_CUDA
     static std::optional<Mtp> load_if_present(
-#else
-    static std::optional<Mtp> load_if_present(CudaExecutionContext &execution,
-#endif
                                               const ::tyloi::weights::Loader& weights,
                                               const tyloi::models::nemotron_h::Config &main,
                                               ::tyloi::Tensor embedding) {
@@ -83,10 +73,6 @@ struct Mtp final : tyloi::models::Mtp {
                           "Nemotron-H MTP requires one declared predictor stage");
         Mtp result;
         result.config = main;
-#ifndef TYLOINFER_NATIVE_CUDA
-        result.execution = &execution;
-        result.executor = execution.executor().fork(model_parallel_primary_device(execution.config));
-#endif
         result.embedding = std::move(embedding);
         result.primary = weights.placement.device;
 #ifdef TYLOINFER_NATIVE_CUDA
@@ -183,7 +169,7 @@ struct Mtp final : tyloi::models::Mtp {
                     embedded, like.scalar_type())).dense();
 #else
                 return tyloi::cuda::embed(model.embedding, std::move(ids),
-                    model.execution->executor().collectives(), model.execution->executor().profiler(), model.primary)
+                    Executor::current().collectives(), Executor::current().profiler(), model.primary)
                     .to(like.scalar_type());
 #endif
             }
@@ -230,7 +216,7 @@ struct Mtp final : tyloi::models::Mtp {
                     ::tyloi::Tensor(std::move(e)), ::tyloi::Tensor(std::move(h))}, -1);
                 return tyloi::ops::project(joined, model.fusion).dense();
 #else
-                return model.executor->projector(mode.ffn).run(
+                return Executor::current().projector(mode.ffn).run(
                     model.fusion, ::tyloi::cuda::cat({e, h}, -1));
 #endif
             }
@@ -262,7 +248,7 @@ struct Mtp final : tyloi::models::Mtp {
               tyloi::models::ForwardOptions{config.max_position_embeddings, nullptr, -1, primary}};
 #else
         } ops{*this, state,
-              execution->executor().forward_mode(execution->config.layer_placement.primary_device())};
+              Executor::current().forward_mode(primary)};
 #endif
         return tyloi::models::nemotron_h::mtp_predictor(ops, hidden, ids, supplied_positions, depth,
                                                      true);

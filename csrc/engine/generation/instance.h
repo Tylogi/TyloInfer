@@ -14,10 +14,10 @@ tyloi::StepSequence<tyloi::models::Prepared> Text<M, S, P>::prepare(InferenceReq
                          std::is_same_v<Model, nemotron_h::Model>) {
         return components.prepare(language, images,
 #ifndef TYLOINFER_NATIVE_CUDA
-        execution->executor().projector(execution->executor().mode().ffn, model_parallel_primary_device(execution->config)),
-        execution->executor().collectives(),
+        root_executor.projector(root_executor.mode().ffn, model_parallel_primary_device(load_config)),
+        root_executor.collectives(),
 #endif
-        execution->config.layer_placement.primary_device(),
+        load_config.layer_placement.primary_device(),
 #ifndef TYLOINFER_NATIVE_CUDA
         executor.get(),
 #endif
@@ -36,14 +36,14 @@ template <class M, class S, class P>
 Generation Text<M, S, P>::generate_text(InferenceRequest& input, InferenceOutput& output, State& state,
                                        std::optional<Prepared> prepared, const RequestId& id, bool batched) {
     return internal::generate(
-        language, state, executor.get(), execution->executor().collectives(),
-        execution->executor().forward_mode(execution->config.layer_placement.primary_device()), execution->executor().profiler(), weights, *budget,
-        execution->executor().mode().ffn.serial, execution->config.report_cuda_memory,
-        execution->config.dsv4_cpu_offload_layers.empty() && execution->config.dense_cpu_layer_count == 0 &&
-            model_parallel_cuda_graph_enabled(execution->config, execution->executor(), execution->weights),
+        language, state, executor.get(), root_executor.collectives(),
+        root_executor.forward_mode(load_config.layer_placement.primary_device()), root_executor.profiler(), weights, *budget,
+        root_executor.mode().ffn.serial, load_config.report_cuda_memory,
+        load_config.dsv4_cpu_offload_layers.empty() && load_config.dense_cpu_layer_count == 0 &&
+            model_parallel_cuda_graph_enabled(load_config, root_executor, weights),
         [this] {
-            drain_cuda(root_executor, weights, offload.get(), execution->config.layer_placement,
-                       execution->config.tensor_parallel, execution->config.expert_parallel);
+            drain_cuda(root_executor, weights, offload.get(), load_config.layer_placement,
+                       load_config.tensor_parallel, load_config.expert_parallel);
         },
         info, source.get(), graph, cache, config, input, output,
         mtp_state,

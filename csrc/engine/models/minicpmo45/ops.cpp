@@ -1,3 +1,4 @@
+#include "engine/models/plan.h"
 #include "engine/models/minicpmo45/text/load.h"
 #include "engine/models/minicpmo45/text/forward.h"
 #include "engine/models/common/ffn.h"
@@ -27,7 +28,7 @@ Model read(std::shared_ptr<const tyloi::ModelSource> source, std::string_view de
     Model model;
     model.source = std::move(source);
     model.graph = tyloi::models::graph(*model.source);
-    model.plan = cuda_model_plan(model.graph);
+    model.plan = ::tyloi::models::model_plan(model.graph);
     tyloi::models::require_model(model.graph.backbone == "minicpmo45",
         "model backbone does not match the requested causal model");
     auto& config = model.config;
@@ -94,7 +95,7 @@ void load(Model& model, const tyloi::weights::Loader& weights, LayerPlacementCon
         static_cast<int>(std::max<int64_t>(config.num_hidden_layers - gpu_layers, 0));
     if (cpu_layers > 0 && (weights.placement.tensor.enabled() || placement.enabled()))
         throw std::runtime_error("--n-gpu-layers cannot be combined with tensor/expert/layer parallelism");
-    if (model.plan.vision == CudaVisionAdapter::grid_vit && cpu_layers > 0)
+    if (model.plan.vision == ::tyloi::models::VisionAdapter::grid_vit && cpu_layers > 0)
         throw std::runtime_error("CUDA grid-Vision currently requires GPU-resident text layers");
     MfqCudaGuard guard(placement.primary_device());
     const auto make_rope = [&](::tyloi::Device device) {

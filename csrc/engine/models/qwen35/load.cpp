@@ -8,7 +8,7 @@
 #include "engine/models/qwen35/weights.h"
 
 #include "engine/models/common/load.h"
-#include "engine/models/common/capabilities.h"
+#include "engine/models/plan.h"
 #include "engine/models/load.h"
 #include "engine/models/source/model_graph.h"
 #include "engine/weights/loader.h"
@@ -195,9 +195,9 @@ Model read(std::shared_ptr<const tyloi::ModelSource> source,
     model.source = std::move(source);
     const auto& source_ref = *model.source;
     model.graph = tyloi::models::graph(source_ref);
-    const auto plan = cuda_model_plan(model.graph);
+    const auto plan = ::tyloi::models::model_plan(model.graph);
     if (model.graph.component("vision") != nullptr &&
-        plan.vision != CudaVisionAdapter::grid_vit)
+        plan.vision != ::tyloi::models::VisionAdapter::grid_vit)
         throw std::runtime_error("Qwen CUDA vision requires grid_vit/grid_vision.v1/grid_mrope");
     if (model.graph.backbone != "qwen3_5" && model.graph.backbone != "generic_qwen")
         throw std::runtime_error("Qwen3.5 loading requires a Qwen-compatible model graph");
@@ -253,7 +253,7 @@ void load(Model& model, const ::tyloi::weights::Loader& weights,
                   << " gpu=" << placed_cpu_layers << '-' << model.config.num_hidden_layers - 1
                   << " cpu_threads=" << mfq_get_num_threads() << std::endl;
     }
-    if (cuda_model_plan(model.graph).vision == CudaVisionAdapter::grid_vit && placed_cpu_layers > 0)
+    if (::tyloi::models::model_plan(model.graph).vision == ::tyloi::models::VisionAdapter::grid_vit && placed_cpu_layers > 0)
         throw std::runtime_error("CUDA grid-Vision currently requires GPU-resident text layers");
 
     cpu_layers = placed_cpu_layers;
@@ -315,8 +315,8 @@ void load(Model& model, const ::tyloi::weights::Loader& weights,
 }
 
 void load_vision(Model& model, const ::tyloi::weights::Loader& weights, bool resident) {
-    const auto plan = cuda_model_plan(model.graph);
-    if (plan.vision == CudaVisionAdapter::grid_vit) {
+    const auto plan = ::tyloi::models::model_plan(model.graph);
+    if (plan.vision == ::tyloi::models::VisionAdapter::grid_vit) {
         const auto* component = model.graph.component("vision");
         const auto& config = model.config;
         if (component == nullptr || !config.grid_vision ||
@@ -326,7 +326,7 @@ void load_vision(Model& model, const ::tyloi::weights::Loader& weights, bool res
             weights, weights.cache(), *config.grid_vision,
             *config.image_token_id, *config.video_token_id,
             component->input_contract, component->position_policy, resident));
-    } else if (plan.vision != CudaVisionAdapter::none) {
+    } else if (plan.vision != ::tyloi::models::VisionAdapter::none) {
         throw std::runtime_error("CUDA vision adapter is unsupported for Qwen");
     }
 }
@@ -334,14 +334,14 @@ void load_vision(Model& model, const ::tyloi::weights::Loader& weights, bool res
 void load_components(Model& model, const ::tyloi::weights::Loader& weights,
         const LayerPlacementConfig& placement, int cpu_layers, bool cpu_offload,
         bool resident, bool preallocate) {
-    const auto plan = cuda_model_plan(model.graph);
-    model.mtp_supported = plan.predictor == CudaPredictorAdapter::qwen35;
+    const auto plan = ::tyloi::models::model_plan(model.graph);
+    model.mtp_supported = plan.predictor == ::tyloi::models::PredictorAdapter::qwen35;
     const bool mtp_allowed =
         !placement.enabled() && cpu_layers == 0 && !cpu_offload &&
         weights.cache().transfer() == ::tyloi::weights::Cache::Transfer::automatic;
 
     load_vision(model, weights, resident);
-    if (plan.predictor == CudaPredictorAdapter::qwen35) {
+    if (plan.predictor == ::tyloi::models::PredictorAdapter::qwen35) {
         if (mtp_allowed && model.metadata.num_experts == 0 && model.supports_speculation()) {
             TransformerWeightLoader loader{weights};
             auto predictor = load_predictor(loader, model, cuda_kv_quantization());
@@ -350,7 +350,7 @@ void load_components(Model& model, const ::tyloi::weights::Loader& weights,
             std::cerr
                 << "qwen_mtp unavailable: CUDA adapter requires dense GPU-resident Qwen blocks\n";
         }
-    } else if (plan.predictor != CudaPredictorAdapter::none) {
+    } else if (plan.predictor != ::tyloi::models::PredictorAdapter::none) {
         throw std::runtime_error("CUDA predictor adapter is unsupported for Qwen");
     }
 }

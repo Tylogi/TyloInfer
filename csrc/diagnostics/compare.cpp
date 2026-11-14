@@ -60,27 +60,27 @@ Tensor last(Work& work, const Tensor& value, ScalarType dtype) {
 
 Tensor project(Work& work, const Tensor& value, ScalarType dtype, bool capped) {
     auto row = last(work, value, dtype);
-    return work.keep(capped ? work.program.model().logits(row, true) : work.program.model().project(row));
+    return work.keep(work.program.model().logits(row, capped));
 }
 
-models::Backbone family(Program& program) {
+std::string family(Program& program) {
     auto loader = program.loader();
     const auto* source = dynamic_cast<const ModelSource*>(&loader.source);
     if (!source) throw std::runtime_error("diagnostic model source is unavailable");
-    return models::model_plan(models::graph(*source)).backbone;
+    return models::graph(*source).backbone;
 }
 
-Tensor family_last_logits(Work& work, const Tensor& value, models::Backbone backbone) {
-    if (backbone == models::Backbone::qwen4_exp || backbone == models::Backbone::glm5_next) {
+Tensor family_last_logits(Work& work, const Tensor& value, const std::string& backbone) {
+    if (backbone == "qwen4_exp" || backbone == "glm5_next") {
         auto row = work.keep(value.dense().select(1, value.size(1)-1));
         return work.keep(work.program.model().logits(row, true));
     }
-    return project(work, value, backbone == models::Backbone::minicpmo45 ? kBFloat16 : kFloat16, true);
+    return project(work, value, backbone == "minicpmo45" ? kBFloat16 : kFloat16, true);
 }
 
-Tensor next(Work& work, const Tensor& value, models::Backbone backbone) {
-    const bool direct = backbone == models::Backbone::qwen4_exp || backbone == models::Backbone::glm5_next;
-    const bool mini = backbone == models::Backbone::minicpmo45;
+Tensor next(Work& work, const Tensor& value, const std::string& backbone) {
+    const bool direct = backbone == "qwen4_exp" || backbone == "glm5_next";
+    const bool mini = backbone == "minicpmo45";
     auto row = work.keep(value.dense().select(1, value.size(1)-1));
     if (!direct) row = work.keep(row.dense().to(mini ? kBFloat16 : kFloat16).contiguous());
     auto logits = work.keep(work.program.model().logits(row, false));
@@ -89,7 +89,8 @@ Tensor next(Work& work, const Tensor& value, models::Backbone backbone) {
 }
 
 Tensor length(Work& work) {
-    return work.keep(::tyloi::ops::full(std::array<std::int64_t, 1>{1}, work.program.state().position()+1, work.program.executor().device()));
+    const Device device(kCUDA, work.program.config().layer_placement.primary_device());
+    return work.keep(::tyloi::ops::full(std::array<std::int64_t, 1>{1}, work.program.state().position()+1, device));
 }
 
 void statistics(const Tensor& reference, const Tensor& candidate, const char* prefix, bool relative) {
@@ -112,10 +113,10 @@ void statistics(const Tensor& reference, const Tensor& candidate, const char* pr
 
 int compare_decode_splitk(Program& program, Tensor ids) {
     auto& executor = program.executor(); auto scope = executor.enter(); Work work{program}; ids = work.keep(std::move(ids));
-    auto kernels = executor.attention_kernels(); kernels.split_k = false;
+    auto kernels = executor.attention_options().kernels; kernels.split_k = false;
     Tensor ref, candidate;
     for (int pass = 0; pass < 2; ++pass) {
-        kernels.split_k = pass != 0; AttentionScope policy(executor, kernels);
+        kernels.split_k = pass != 0; auto policy = executor.enter(kernels);
         program.drain(); program.state().reset(1);
         (void)hidden(work, ids);
         auto decode = work.keep(ids.dense().select(1, ids.size(1)-1).reshape({1,1}));
@@ -130,27 +131,28 @@ int compare_decode_splitk(Program& program, Tensor ids) {
 int compare_mma_decode(Program& program, Tensor ids, int steps, std::int64_t planned_length) {
     if (steps < 1) throw std::invalid_argument("--compare-mma-decode-steps must be positive");
     auto& executor = program.executor(); auto scope = executor.enter(); Work work{program}; ids = work.keep(std::move(ids));
-    auto kernels = executor.attention_kernels(); auto backbone = family(program);
+    auto kernels = executor.attention_options().kernels; auto backbone = family(program);
+    const Device device(kCUDA, program.config().layer_placement.primary_device());
     std::vector<Tensor> reference; std::vector<std::int64_t> teachers; std::int64_t first = 0;
     kernels.mma_decode = false;
     {
-        AttentionScope policy(executor, kernels); program.drain(); program.state().reset(1);
+        auto policy = executor.enter(kernels); program.drain(); program.state().reset(1);
         auto input = work.keep(::tyloi::ops::reshape(next(work, hidden(work, ids), backbone), {1,1}));
         first = ::tyloi::ops::item(input);
         for (int step = 0; step < steps; ++step) {
             auto logits = project(work, hidden(work, input, length(work)), kFloat16, false);
             reference.push_back(work.keep(::tyloi::ops::clone(work.keep(logits.dense().to(kFloat32)))));
             auto token = ::tyloi::ops::item(work.keep(::tyloi::ops::argmax(reference.back(), -1))); teachers.push_back(token);
-            input = work.keep(::tyloi::ops::reshape(work.keep(::tyloi::ops::full(std::array<std::int64_t, 1>{1}, token, executor.device())), {1,1}));
+            input = work.keep(::tyloi::ops::reshape(work.keep(::tyloi::ops::full(std::array<std::int64_t, 1>{1}, token, device)), {1,1}));
             work.values.clear();
         }
     }
     const auto planned = planned_length > 0 ? planned_length : ids.size(1) + steps;
     if (planned > program.model().info().max_context) throw std::runtime_error("decode comparison planned length exceeds context capacity");
     kernels.mma_decode = true;
-    AttentionScope policy(executor, kernels); program.drain(); program.state().reset(1);
+    auto policy = executor.enter(kernels); program.drain(); program.state().reset(1);
     (void)next(work, hidden(work, ids), backbone);
-    auto input = work.keep(::tyloi::ops::reshape(work.keep(::tyloi::ops::full(std::array<std::int64_t, 1>{1}, first, executor.device())), {1,1}));
+    auto input = work.keep(::tyloi::ops::reshape(work.keep(::tyloi::ops::full(std::array<std::int64_t, 1>{1}, first, device)), {1,1}));
     double kl_sum=0., kl_max=0., abs_sum=0., delta_sq=0., reference_sq=0., max_abs=0.;
     int same=0, first_difference=-1; std::int64_t values=0;
     for (int step=0; step<steps; ++step) {
@@ -163,7 +165,7 @@ int compare_mma_decode(Program& program, Tensor ids, int steps, std::int64_t pla
         reference_sq+=ref.square().sum().item<double>(); max_abs=std::max(max_abs,delta.abs().max().item<double>());
         values+=delta.numel(); const bool equal=actual.argmax(-1).eq(ref.argmax(-1)).item<bool>();
         same += equal ? 1 : 0; if (!equal && first_difference<0) first_difference=step;
-        input = work.keep(::tyloi::ops::reshape(work.keep(::tyloi::ops::full(std::array<std::int64_t, 1>{1}, teachers[step], executor.device())), {1,1}));
+        input = work.keep(::tyloi::ops::reshape(work.keep(::tyloi::ops::full(std::array<std::int64_t, 1>{1}, teachers[step], device)), {1,1}));
         work.values.clear();
     }
     program.drain();
@@ -183,7 +185,7 @@ int repeat_prefill(Program& program, Tensor ids, int count, bool trace) {
         program.drain(); program.state().reset(1); const auto start=Clock::now();
         auto value = hidden(work, ids, {}, 0, trace ? &work.traces[i] : nullptr, trace ? &work.stages[i] : nullptr);
         auto logits = trace ? project(work, value, kFloat16, false) : family_last_logits(work, value, backbone);
-        executor.synchronize(); const auto end=Clock::now();
+        program.drain(); const auto end=Clock::now();
         std::cout << "prefill_repeat=" << i+1 << " sec=" << std::chrono::duration<double>(end-start).count()
                   << " top=" << ::tyloi::ops::item(work.keep(::tyloi::ops::argmax(logits,-1))) << '\n';
         if (trace && i>0) {
@@ -210,9 +212,9 @@ int repeat_prefill(Program& program, Tensor ids, int count, bool trace) {
 
 int compare_mma_attention(Program& program, Tensor ids) {
     auto& executor=program.executor(); auto scope=executor.enter(); Work work{program}; ids=work.keep(std::move(ids));
-    auto kernels=executor.attention_kernels(); auto backbone=family(program); Tensor ref, candidate;
+    auto kernels=executor.attention_options().kernels; auto backbone=family(program); Tensor ref, candidate;
     for (int pass=0; pass<2; ++pass) {
-        kernels.mma_prefill=pass!=0; kernels.bf16_flash128=pass!=0; AttentionScope policy(executor,kernels);
+        kernels.mma_prefill=pass!=0; kernels.bf16_flash128=pass!=0; auto policy=executor.enter(kernels);
         if (pass) { program.drain(); program.state().reset(1); }
         auto output=work.keep(family_last_logits(work,hidden(work,ids),backbone).dense().to(kFloat32));
         program.drain(); if (pass) candidate=output; else ref=output;

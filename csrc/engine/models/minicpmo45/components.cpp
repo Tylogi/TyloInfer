@@ -1,4 +1,4 @@
-#include "engine/backends/cuda/executor/execution.h"
+#include "engine/models/plan.h"
 #include "components.h"
 #include "runtime.h"
 
@@ -16,28 +16,22 @@
 
 MiniCPMO45Runtime MiniCPMO45Runtime::load(
         const tyloi::cuda::minicpmo45::text::Model& language,
-#ifndef TYLOINFER_NATIVE_CUDA
         tyloi::cuda::Executor& language_executor,
-#endif
-        const tyloi::weights::Loader& weights,
-        CudaExecutionContext& execution) {
-    auto &placement = execution.config.layer_placement;
-    MfqCudaGuard guard(placement.primary_device());
+        const tyloi::weights::Loader& weights, int primary) {
+    MfqCudaGuard guard(primary);
 #ifndef TYLOINFER_NATIVE_CUDA
-    auto projector = execution.executor().projector(execution.executor().mode().ffn, model_parallel_primary_device(execution.config));
+    auto projector = language_executor.projector(language_executor.mode().ffn);
 #endif
     return {language,
 #ifndef TYLOINFER_NATIVE_CUDA
             language_executor,
-            execution,
-#else
-            placement.primary_device(),
 #endif
+            primary,
             MiniCPMO45VisionEncoder::load(weights),
             MiniCPMO45Resampler::load(weights),
             MiniCPMO45AudioEncoder::load(weights),
             tyloi::cuda::minicpmo45::Tts::load(weights),
-            execution.executor().fork(model_parallel_primary_device(execution.config)), execution.executor().forward_mode(execution.config.layer_placement.primary_device())
+            language_executor.fork(), language_executor.forward_mode(primary)
 #ifndef TYLOINFER_NATIVE_CUDA
             , projector
 #endif
@@ -47,20 +41,13 @@ MiniCPMO45Runtime MiniCPMO45Runtime::load(
 namespace tyloi::cuda::minicpmo45 {
 
 std::unique_ptr<Components> load_components(text::Model& model,
-#ifndef TYLOINFER_NATIVE_CUDA
-        Executor& executor,
-#endif
-        const tyloi::weights::Loader& weights,
-        bool load_optional_components, CudaExecutionContext& execution) {
-    if (!load_optional_components || model.plan.vision == CudaVisionAdapter::none)
+        Executor& executor, const tyloi::weights::Loader& weights,
+        bool load_optional_components, int primary) {
+    if (!load_optional_components || model.plan.vision == ::tyloi::models::VisionAdapter::none)
         return nullptr;
-    if (model.plan.vision != CudaVisionAdapter::minicpmo45)
+    if (model.plan.vision != ::tyloi::models::VisionAdapter::minicpmo45)
         throw std::runtime_error("unsupported MiniCPM-o CUDA vision adapter");
-    return std::make_unique<Components>(model,
-#ifndef TYLOINFER_NATIVE_CUDA
-        executor,
-#endif
-        weights, execution);
+    return std::make_unique<Components>(model, executor, weights, primary);
 }
 
 struct Components::State {
@@ -68,30 +55,15 @@ struct Components::State {
     std::optional<MiniCPMO45DuplexSession> duplex_session;
 
     State(const text::Model& language,
-#ifndef TYLOINFER_NATIVE_CUDA
           Executor& language_executor,
-#endif
-          const tyloi::weights::Loader& weights,
-          CudaExecutionContext& execution)
-        : runtime(MiniCPMO45Runtime::load(language,
-#ifndef TYLOINFER_NATIVE_CUDA
-                                         language_executor,
-#endif
-                                         weights, execution)) {}
+          const tyloi::weights::Loader& weights, int primary)
+        : runtime(MiniCPMO45Runtime::load(language, language_executor, weights, primary)) {}
 };
 
 Components::Components(const text::Model& language,
-#ifndef TYLOINFER_NATIVE_CUDA
                        Executor& language_executor,
-#endif
-                       const tyloi::weights::Loader& weights,
-                       CudaExecutionContext& execution)
-    : state_(std::make_unique<State>(language,
-#ifndef TYLOINFER_NATIVE_CUDA
-                                     language_executor,
-#endif
-                                     weights,
-                                     execution)) {}
+                       const tyloi::weights::Loader& weights, int primary)
+    : state_(std::make_unique<State>(language, language_executor, weights, primary)) {}
 
 Components::~Components() = default;
 
@@ -232,12 +204,7 @@ void Components::start(const MfqDuplexSessionParams& parameters) {
                 "MiniCPM-o reference Mel geometry is invalid");
         }
 
-        MfqCudaGuard guard(
-#ifdef TYLOINFER_NATIVE_CUDA
-            state_->runtime.primary);
-#else
-            state_->runtime.execution.config.layer_placement.primary_device());
-#endif
+        MfqCudaGuard guard(state_->runtime.primary);
         ::tyloi::cuda::manual_seed(static_cast<int64_t>(parameters.seed));
         mfq_cuda_manual_seed_all(parameters.seed);
         auto special_ids = MiniCPMO45DuplexSpecialIds::from_tensor(
@@ -299,12 +266,7 @@ MfqDuplexStepResult Components::step(const MfqDuplexStepInput& input) {
                 "MiniCPM-o duplex generation requires at least two token slots");
         }
 
-        MfqCudaGuard guard(
-#ifdef TYLOINFER_NATIVE_CUDA
-            state_->runtime.primary);
-#else
-            state_->runtime.execution.config.layer_placement.primary_device());
-#endif
+        MfqCudaGuard guard(state_->runtime.primary);
         if (!state_->duplex_session) {
             throw std::runtime_error(
                 "MiniCPM-o duplex session is not prepared");
@@ -364,12 +326,7 @@ MfqDuplexStepResult Components::step(const MfqDuplexStepInput& input) {
 }
 
 void Components::stop() {
-        MfqCudaGuard guard(
-#ifdef TYLOINFER_NATIVE_CUDA
-            state_->runtime.primary);
-#else
-            state_->runtime.execution.config.layer_placement.primary_device());
-#endif
+        MfqCudaGuard guard(state_->runtime.primary);
         mfq_cuda_synchronize();
         state_->duplex_session.reset();
         mfq_cuda_synchronize();

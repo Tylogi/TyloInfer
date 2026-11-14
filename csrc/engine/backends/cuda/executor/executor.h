@@ -5,12 +5,12 @@
 #include "engine/backends/cuda/ops/attention/linear.h"
 #include "engine/backends/cuda/ops/ffn/dense.h"
 #include "engine/backends/cuda/ops/ffn/options.h"
-#include "engine/backends/cuda/ops/ffn/gated.h"
 #include "engine/executor.h"
 
 #include <memory>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <tuple>
 #include <unordered_map>
@@ -23,6 +23,8 @@ namespace tyloi::cuda {
 class Branches;
 class Collectives;
 class RouteStats;
+class KvMemoryManager;
+class KvOffloadStore;
 
 class Executor
 #ifdef TYLOINFER_NATIVE_CUDA
@@ -32,6 +34,7 @@ class Executor
 public:
 #ifdef TYLOINFER_NATIVE_CUDA
     std::unique_ptr<tyloi::Executor::Scope> enter() override;
+    std::unique_ptr<tyloi::Executor::Work> work() override;
     std::unique_ptr<tyloi::Executor::Timer> timer() override;
     std::unique_ptr<tyloi::Executor::Profile> profile(const char* name) override;
     std::unique_ptr<tyloi::Executor::Graph> graph() override;
@@ -52,6 +55,10 @@ public:
     void reset();
     void join();
     static Executor& current();
+    static Executor* active() noexcept;
+    void configure_kv(std::shared_ptr<KvMemoryManager> memory, std::shared_ptr<KvOffloadStore> offload);
+    std::shared_ptr<KvMemoryManager> kv_memory() const noexcept { return kv_memory_.lock(); }
+    std::shared_ptr<KvOffloadStore> kv_offload() const;
 #ifdef TYLOINFER_NATIVE_CUDA
     void wait();
     static const FfnMode& current_ffn();
@@ -64,9 +71,17 @@ public:
 #endif
     Collectives& collectives() noexcept { return collectives_; }
     const Collectives& collectives() const noexcept { return collectives_; }
+    struct Compute {
+        std::optional<bool> rotary;
+        std::optional<bool> attention_grouped;
+        std::optional<bool> residual_two_stage;
+        std::optional<bool> residual_dense_injection;
+    };
+
     struct Mode {
         FfnMode ffn;
         LinearAttention::Options linear;
+        Compute compute;
         std::int64_t kv_capacity = 0;
         bool transposed = true;
         Trace* trace = nullptr;
@@ -84,7 +99,7 @@ public:
                 .mma_prefill = true, .mma_decode = true, .split_k = true}};
         DenseOptions dense;
         FfnOptions ffn;
-        GatedResidual::Options residual;
+        ResidualOptions residual;
         bool gdn_fused_output = true;
         bool gdn_fused_preparation = true;
         bool gdn_fused_core = true;
@@ -126,7 +141,11 @@ public:
     Mode& mode() noexcept { return mode_; }
     const Mode& mode() const noexcept { return mode_; }
     Mode forward_mode(int primary) const;
-    const AttentionOptions& attention_options() const noexcept { return options_.attention; }
+    const AttentionOptions& attention_options() const noexcept;
+    ResidualOptions residual_options() const noexcept;
+    const Compute& compute() const noexcept;
+    std::unique_ptr<tyloi::Executor::Scope> enter(const Compute& policy);
+    std::unique_ptr<tyloi::Executor::Scope> enter(const AttentionKernels& kernels);
     bool fp32_residual() const noexcept { return options_.dense.fp32_residual; }
     AttentionScratch& attention_scratch(std::size_t index);
 #ifdef TYLOINFER_NATIVE_CUDA
@@ -140,7 +159,8 @@ public:
 private:
     Executor(ContextSet& contexts, CudaProfiler& profiler, KlMmqState& mmq, const std::shared_ptr<TqExec>& tq,
              Branches& branches, Collectives& collectives, RouteStats& routes,
-             const Options& options, Mode& mode, int primary);
+             const Options& options, Mode& mode, int primary,
+             std::weak_ptr<KvMemoryManager>, std::weak_ptr<KvOffloadStore>);
     std::unique_ptr<ContextSet> owned_contexts_;
     ContextSet& contexts_;
     std::unique_ptr<Options> owned_options_;
@@ -158,6 +178,8 @@ private:
     Collectives& collectives_;
     std::unique_ptr<RouteStats> owned_routes_;
     RouteStats& routes_;
+    std::weak_ptr<KvMemoryManager> kv_memory_;
+    std::weak_ptr<KvOffloadStore> kv_offload_;
     int primary_;
     std::vector<AttentionScratch> scratch_;
     MfeScratch mfe_scratch_;

@@ -1,3 +1,4 @@
+#include "engine/models/plan.h"
 #include "engine/models/session/snapshot.h"
 #include "engine/models/common/load.h"
 #include "engine/weights/loader.h"
@@ -294,15 +295,15 @@ tyloi::models::Info Model::info() const {
 }
 
 MfqModelCapabilities Model::capabilities() const {
-    const auto state = cuda_component_state(graph, plan, bool(vision), false);
-    const auto caps = cuda_runtime_capabilities(graph, plan, state, bool(vision), false);
+    const auto state = ::tyloi::models::component_state(graph, plan, bool(vision), false);
+    const auto caps = ::tyloi::models::runtime_capabilities(graph, plan, state, bool(vision), false);
     return {graph.architecture, caps.text, caps.image_input, caps.video_input,
         caps.audio_input, caps.audio_output, caps.full_duplex, caps.mtp,
         "model-graph+cuda-adapters"};
 }
 
 tyloi::engine::Metrics Model::metrics() const {
-    const auto state = cuda_component_state(graph, plan, bool(vision), false);
+    const auto state = ::tyloi::models::component_state(graph, plan, bool(vision), false);
     return {{"kv_memory_supported", 0.0},
         {"kv_quantization_supported", 0.0},
         {"kv_quantization_bits", 0.0},
@@ -327,9 +328,6 @@ tyloi::StepSequence<tyloi::models::Prepared> Model::prepare(
 }
 
 ::tyloi::Tensor Model::embedding(const tyloi::Tensor& ids, int) const {
-#ifndef TYLOINFER_NATIVE_CUDA
-    auto scope = execution_scope();
-#endif
     return std::make_shared<DenseTensor>(embed_tokens(device_ids(ids.dense())));
 }
 
@@ -424,9 +422,6 @@ void Model::validate_forward(std::int64_t, std::int64_t tokens, std::int64_t cac
         ~SuffixScope() { if (active) state.speculative_suffix_forward = false; }
     } suffix_scope{state, input.suffix};
     if (input.suffix) state.speculative_suffix_forward = true;
-#ifndef TYLOINFER_NATIVE_CUDA
-    auto scope = execution_scope();
-#endif
     const auto primary = ::tyloi::Device(::tyloi::kCUDA, primary_device);
     require_model(input.ids && input.ids.defined(), "token ids are required");
     auto ids = device_ids(input.ids.dense());
@@ -489,9 +484,6 @@ void Model::validate_forward(std::int64_t, std::int64_t tokens, std::int64_t cac
         else
             hidden = tyloi::ops::copy(hidden, ::tyloi::Device(::tyloi::kCUDA, block->cuda_device)).dense();
         hidden = block->forward(*state.shared,
-#ifndef TYLOINFER_NATIVE_CUDA
-                                *execution,
-#endif
                                 std::move(hidden), local_pos, state.cache_pos,
                                 mfq_nullopt, mfq_nullopt, confirmed);
         trace_layer();

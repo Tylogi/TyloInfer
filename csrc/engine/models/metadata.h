@@ -19,6 +19,8 @@ struct MfqModelCapabilities {
 
 namespace tyloi::models {
 
+enum class GraphWeights { native, resident };
+
 struct Info {
     std::int64_t vocab_size;
     std::int64_t max_context;
@@ -27,6 +29,8 @@ struct Info {
     bool decode_graph;
     bool double_warmup;
     bool separate_projections = false;
+    GraphWeights graph_weights = GraphWeights::resident;
+    bool streamed_kv = false;
 };
 
 struct CausalLmMetadata {

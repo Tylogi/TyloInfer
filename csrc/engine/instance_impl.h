@@ -5,9 +5,8 @@
 #include "env.h"
 #include "engine/load.h"
 #include "engine/drain.h"
-#include "engine/models/common/capabilities.h"
 #include "engine/backends/cuda/native/scope.h"
-#include "engine/backends/cuda/executor/execution.h"
+#include "engine/backends/cuda/executor/config.h"
 #include "engine/generation/instance.h"
 #include "engine/state/kv_memory.h"
 #include "engine/state/kv_offload.h"
@@ -41,11 +40,7 @@ class EngineInstance final : public Engine {
         if (!state) throw std::runtime_error("CUDA engine is unloaded");
         return std::visit([&](auto& value) -> decltype(auto) {
             if (!value) throw std::runtime_error("CUDA engine is unloaded");
-#ifdef TYLOINFER_NATIVE_CUDA
             auto guard = value->executor->enter();
-#else
-            CudaScope guard(value->execution->config.layer_placement.primary_device(), value->execution->executor().contexts());
-#endif
             ::tyloi::cuda::NoGradGuard no_grad;
             return run(*value);
         }, *state);
@@ -72,7 +67,7 @@ class EngineInstance final : public Engine {
 #ifdef TYLOINFER_NATIVE_CUDA
             return ops->executor->enter();
 #else
-            return ops->executor->enter(ops->execution->config.layer_placement.primary_device());
+            return ops->executor->enter(ops->load_config.layer_placement.primary_device());
 #endif
         }, *state);
     }
@@ -127,7 +122,7 @@ class EngineInstance final : public Engine {
     ::tyloi::weights::Cache weights;
     std::shared_ptr<KvOffloadStore> offload;
     std::unique_ptr<Executor> executor;
-    std::unique_ptr<CudaExecutionContext> execution;
+    CudaLoadConfig load_config;
     std::optional<State> state;
     std::unique_ptr<TextProcessor> text_;
     EngineInfo info_;
@@ -141,14 +136,13 @@ class EngineInstance final : public Engine {
                 tyloi::cuda::env_freeze();
                 if (dump_env) std::cerr << "cuda knobs at load:\n" << tyloi::cuda::env_dump();
                 if (!options.context_size) options.context_size = 32768;
-                if (execution) throw std::logic_error("CUDA load requires retired resources");
+                if (executor) throw std::logic_error("CUDA load requires retired resources");
                 auto [execution_config, numeric_options] = tyloi::cuda::load_cuda_execution_config();
                 executor = std::make_unique<Executor>(std::move(numeric_options), 0);
-                execution = std::make_unique<CudaExecutionContext>(
-                    *executor, std::move(execution_config), weights, kv, offload);
-                auto scope = executor->enter(execution->config.layer_placement.primary_device());
-                setup_cuda_load(options, execution->config, *executor, weights, kv, offload);
-                execution->executor().profiler().enabled = false;
+                load_config = std::move(execution_config);
+                auto scope = executor->enter(load_config.layer_placement.primary_device());
+                setup_cuda_load(options, load_config, *executor, weights, kv, offload);
+                executor->profiler().enabled = false;
                 auto weight_memory=std::make_shared<tyloi::weights::Memory>();
                 const tyloi::weights::LoadScope memory_load(*weight_memory);
                 auto config = resolve_cuda_config(options);
@@ -163,7 +157,7 @@ class EngineInstance final : public Engine {
                     kv.directory = kv_options.directory;
                     offload = std::make_shared<KvOffloadStore>(std::move(kv));
                 }
-                state = Load(*execution, options, true,
+                state = Load(load_config, *executor, weights, kv, offload, options, true,
                     [&](auto& model, auto& model_state, auto& model_executor, auto& components,
                         auto, auto, auto source, std::unique_ptr<tyloi::Executor> predictor_execution) -> State {
                         using Model = typename std::remove_reference_t<decltype(model)>::element_type;
@@ -176,7 +170,7 @@ class EngineInstance final : public Engine {
                         if (offload && !streamed_kv)
                             throw std::invalid_argument("CUDA streamed KV requires a QSA model");
                         return std::make_unique<Text<Model, ModelState, Parts>>(
-                            *execution, weights, kv, offload, std::move(model),
+                            load_config, *executor, weights, kv, offload, std::move(model),
                             std::move(model_state), std::move(model_executor),
                             std::move(components), config,
                             std::move(source), weight_memory, std::move(predictor_execution));
@@ -219,14 +213,15 @@ class EngineInstance final : public Engine {
         if (tyloi::cuda::env_frozen() && tyloi::cuda::env_flag("TYLOINFER_CUDA_ENV_DUMP", false))
             std::cerr << "cuda knobs in use:\n" << tyloi::cuda::env_dump();
         std::exception_ptr failure;
-        if (execution) {
+        if (executor) {
             try {
-                drain_cuda(*executor, weights, offload.get(), execution->config.layer_placement,
-                           execution->config.tensor_parallel, execution->config.expert_parallel);
+                drain_cuda(*executor, weights, offload.get(), load_config.layer_placement,
+                           load_config.tensor_parallel, load_config.expert_parallel);
             } catch (...) { failure = std::current_exception(); }
             {
-                CudaScope scope(execution->config.layer_placement.primary_device(), execution->executor().contexts());
+                auto scope = executor->enter(load_config.layer_placement.primary_device());
                 state.reset();
+                executor->configure_kv({}, {});
                 offload.reset();
                 kv.reset();
                 weights.clear_workspace();
@@ -237,7 +232,6 @@ class EngineInstance final : public Engine {
             kv.reset();
             weights.reset();
         }
-        execution.reset();
         executor.reset();
         if (failure) std::rethrow_exception(failure);
     }

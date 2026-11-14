@@ -85,14 +85,15 @@ Assembly assembly(const CudaLoadOptions& options, CudaLoadConfig& config,
     auto weights_loader = loader(config, weights, source);
     return {std::move(definition), std::move(weights_loader),
         models::LoadOptions{.context = options.context_size, .gpu_layers = config.n_gpu_layers,
-            .expert_parallel = config.expert_parallel.enabled(), .yarn = config.yarn,
+            .expert_parallel = config.expert_parallel.enabled(),
+            .recurrent_transposed = executor.mode().transposed,
+            .vision_resident = cuda::options::vision_resident(),
+            .mirror_scalars = config.tensor_parallel_mirror_linear_attention_scalars,
+            .yarn = config.yarn,
             .cpu_offload_layers = config.dsv4_cpu_offload_layers,
             .engram_cache_rows = config.deepseek_v41_engram_cache_rows,
             .host_tokens = config.cache.pipeline,
-            .mirror_scalars = config.tensor_parallel_mirror_linear_attention_scalars,
-            .optional_components = components,
-            .transfer_auto = weights.transfer() == ::tyloi::weights::Cache::Transfer::automatic,
-            .transposed = executor.mode().transposed}};
+            .optional_components = components}};
 }
 } // namespace
 
@@ -120,7 +121,7 @@ void configure_generation(engine::Config& runtime, const CudaLoadConfig& load,
     runtime.continuous_batch.cuda_graph &= allowed;
 }
 
-void configure_model_kv(Executor& executor, std::shared_ptr<KvMemoryManager>& kv,
+void configure_model_kv(std::shared_ptr<KvMemoryManager>& kv,
         std::shared_ptr<KvOffloadStore>& offload) {
     const auto options = cuda::options::qsa_kv_offload();
     kv = std::make_shared<KvMemoryManager>();
@@ -133,7 +134,6 @@ void configure_model_kv(Executor& executor, std::shared_ptr<KvMemoryManager>& kv
         config.directory = options.directory;
         offload = std::make_shared<KvOffloadStore>(std::move(config));
     }
-    executor.configure_kv(kv, offload);
 }
 
 void load_model(std::unique_ptr<models::CausalModel>& owner, const CudaLoadOptions& options,
@@ -198,9 +198,6 @@ struct Program::Impl {
         try { executor->clear(); }
         catch (const std::exception& error) { std::cerr << "program_cleanup error=" << error.what() << '\n'; }
         catch (...) { std::cerr << "program_cleanup error=unknown\n"; }
-        try { executor->configure_kv({}, {}); }
-        catch (const std::exception& error) { std::cerr << "program_cleanup error=" << error.what() << '\n'; }
-        catch (...) { std::cerr << "program_cleanup error=unknown\n"; }
         offload.reset(); kv.reset(); weights.reset(); ledger.reset(); source.reset();
         scope.reset();
         executor.reset();
@@ -232,7 +229,8 @@ std::unique_ptr<Program> Program::open(CudaLoadOptions options, bool adapt) {
     auto scope = p.executor->enter(p.config.layer_placement.primary_device());
     internal::setup_cuda_load(p.options, p.config, *p.executor, *p.weights, p.kv, p.offload);
     p.executor->set_primary(p.config.layer_placement.primary_device());
-    internal::configure_model_kv(*p.executor, p.kv, p.offload);
+    internal::configure_model_kv(p.kv, p.offload);
+    p.executor->configure_kv(p.kv, p.offload);
     return program;
 }
 
@@ -248,13 +246,13 @@ void Program::load(bool components) {
         if (p.offload && !p.model->info().streamed_kv)
             throw std::invalid_argument("CUDA streamed KV requires a QSA model");
         p.state = p.model->make_state();
+        if (auto* predictor = p.model->predictor(); predictor && !p.state->predictor)
+            p.state->predictor = predictor->make_state();
         if (cuda::options::kv_vram_preallocated()) p.state->preallocate();
         Executor::prepare(p.model->info().vocab_size);
         finalize_kv(p.kv.get(), *p.weights, p.offload);
-        finish_load(p.kv.get(), *p.weights, p.config.report_cuda_memory);
         p.executor->configure_kv(p.kv, p.offload);
-        if (p.offload && !p.model->info().streamed_kv)
-            throw std::invalid_argument("CUDA streamed KV requires a QSA model");
+        finish_load(p.kv.get(), *p.weights, p.config.report_cuda_memory);
     }
 }
 
@@ -339,7 +337,7 @@ void Program::configure(engine::Config config) {
     p.run_config = std::move(config);
     auto& runtime = p.run_config;
     p.run_info = p.model->info();
-    if (auto* predictor = p.model->mtp(); predictor &&
+    if (auto* predictor = p.model->predictor(); predictor &&
         (!p.state->predictor || !p.state->predictor->belongs_to(*predictor)))
         throw std::invalid_argument("predictor state is unavailable or belongs to another model");
     internal::configure_generation(runtime, p.config, *p.executor, *p.weights, p.run_info);
@@ -347,9 +345,10 @@ void Program::configure(engine::Config config) {
     p.forward = {mode.kv_capacity, mode.trace, mode.trace_layer, mode.primary};
     p.sessions = internal::make_sessions(*p.source, runtime.session_cache, runtime.prefix_cache,
         p.run_info.max_context, p.state->supports_text_session_state(), p.state->supports_paged_text_session_state());
-    p.graph.emplace(p.run_info.max_context, p.executor->device(), p.executor->graph());
+    p.graph.emplace(p.run_info.max_context,
+        Device(kCUDA, p.config.layer_placement.primary_device()), p.executor->graph());
     p.budget.emplace(*p.ledger, *p.weights, *p.sessions, *p.executor);
-    p.budget->bind(p.model->mtp() != nullptr);
+    p.budget->bind(p.model->predictor() != nullptr);
     if (runtime.resident_budget_bytes) {
         if (!runtime.online_budget)
             throw std::invalid_argument("online memory budgeting requires a single-device CUDA worker");
@@ -360,7 +359,7 @@ void Program::configure(engine::Config config) {
         p.weights->settle();
         p.graph->invalidate();
         p.state->release_graphs();
-        auto* predictor = p.model->mtp();
+        auto* predictor = p.model->predictor();
         if (predictor && (!p.state->predictor || !p.state->predictor->belongs_to(*predictor)))
             throw std::invalid_argument("predictor state is unavailable or belongs to another model");
         for (const auto& [device, bytes] : p.state->reset_growth(1))
@@ -470,7 +469,7 @@ StepSequence<engine::EventData> Program::generate(engine::InferenceRequest& requ
     RequestWork work{*this, {}, p.running};
     work.job = engine::generate({*p.model, *p.state, *p.executor, *p.budget, *p.graph, *p.weights,
         *p.sessions, p.run_info, p.run_config, p.forward, p.source.get(), p.mtp_policy,
-        predictor ? p.model->mtp() : nullptr}, request, output, std::move(id));
+        predictor ? p.model->predictor() : nullptr}, request, output, std::move(id));
     while (auto step = work.job.next()) co_yield std::move(step);
     work.complete = true;
 }

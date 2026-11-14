@@ -1,3 +1,4 @@
+#include "engine/models/plan.h"
 #include "engine/models/deepseek_v41/ops.h"
 #include "engine/models/deepseek_v41/load.h"
 #include "engine/models/deepseek_v41/vision.h"
@@ -92,7 +93,7 @@ void load(std::unique_ptr<tyloi::models::CausalModel>& owner,
     model->primary_device = placement.primary_device();
     model->needs_host_tokens = options.host_tokens;
     load_weights(*model, weights, placement, options.engram_cache_rows, true);
-    model->predictor = load_components(*model, weights, true);
+    model->mtp = load_components(*model, weights, options.optional_components);
 }
 
 } // namespace tyloi::cuda::deepseek_v41

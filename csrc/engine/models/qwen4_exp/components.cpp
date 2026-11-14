@@ -1,7 +1,8 @@
+#include "engine/models/plan.h"
 #include "engine/models/qwen4_exp/components.h"
 
-#include "engine/backends/cuda/executor/execution.h"
-#include "engine/backends/cuda/executor/options.h"
+#include "engine/models/load.h"
+#include "engine/backends/cuda/executor/executor.h"
 #include "engine/models/source/model_config.h"
 #include "engine/models/qwen4_exp/ops.h"
 #include "engine/models/qwen4_exp/predictor.h"
@@ -21,15 +22,15 @@ std::optional<tyloi::engine::Metrics> Components::memory_metrics(const Model& la
 }
 
 tyloi::StepSequence<tyloi::models::Prepared> Components::prepare(
-        Model& language, tyloi::cache::Media& images,
+        const Model& language, tyloi::cache::Media& images,
 #ifndef TYLOINFER_NATIVE_CUDA
-        Projector projector, Collectives& collectives,
+        Projector, Collectives&,
 #endif
         int primary,
 #ifndef TYLOINFER_NATIVE_CUDA
-        Executor* executor,
+        Executor*,
 #endif
-        const std::vector<int64_t>& tokens, const MfqMultimodalInput& media) {
+        const std::vector<int64_t>& tokens, const MfqMultimodalInput& media) const {
     if (grid_vision) return grid_vision->prepare(
         language, images, tyloi::Device(tyloi::kCUDA, primary), tokens, media);
     throw std::invalid_argument("model has no multimodal component");
@@ -38,10 +39,10 @@ tyloi::StepSequence<tyloi::models::Prepared> Components::prepare(
 Components load_components(
         tyloi::cuda::qwen4_exp::Model& model,
         const tyloi::weights::Loader& weights,
-        bool load_optional_components) {
+        bool load_optional_components, const tyloi::models::LoadOptions& load_options) {
     Components result;
     if (!load_optional_components) return result;
-    if (model.plan.vision == tyloi::cuda::CudaVisionAdapter::grid_vit) {
+    if (model.plan.vision == ::tyloi::models::VisionAdapter::grid_vit) {
         const auto document = nlohmann::json::parse(
             tyloi::models::config_json(*model.source));
         const auto& vision = document.at("vision_config");
@@ -72,24 +73,24 @@ Components load_components(
         const auto* component = model.graph.component("vision");
         result.grid_vision.emplace(
             tyloi::models::grid::Vision::load(
-                weights, model.execution->weights, config, image, video,
-                component->input_contract, component->position_policy, options::vision_resident()));
-    } else if (model.plan.vision != tyloi::cuda::CudaVisionAdapter::none) {
+                weights, weights.cache(), config, image, video,
+                component->input_contract, component->position_policy, load_options.vision_resident));
+    } else if (model.plan.vision != ::tyloi::models::VisionAdapter::none) {
         throw std::runtime_error("unsupported Qwen4 CUDA vision adapter");
     }
-    if (model.plan.predictor != tyloi::cuda::CudaPredictorAdapter::none &&
+    if (model.plan.predictor != ::tyloi::models::PredictorAdapter::none &&
              model.plan.predictor !=
-                 tyloi::cuda::CudaPredictorAdapter::flash_next) {
+                 ::tyloi::models::PredictorAdapter::flash_next) {
         throw std::runtime_error(
             "unsupported Qwen4 CUDA component adapter");
     }
     if (model.plan.predictor ==
-            tyloi::cuda::CudaPredictorAdapter::none) return result;
+            ::tyloi::models::PredictorAdapter::none) return result;
     TYLOINFER_RUNTIME_CHECK(
         model.supports_speculation(),
         "invalid Flash-Next predictor model");
     auto predictor = tyloi::cuda::qwen4_exp::Predictor::load_if_present(
-        *model.execution, weights, model.config, model.embed, model.lm_head,
+        weights, load_options, model.config, model.embed, model.lm_head,
         model.metadata.final_logit_softcapping);
     if (predictor) {
         result.mtp =

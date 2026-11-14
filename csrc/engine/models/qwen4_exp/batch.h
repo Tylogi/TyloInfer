@@ -1,7 +1,7 @@
 #pragma once
 
 #include "engine/models/batch.h"
-#include "engine/backends/cuda/executor/execution.h"
+#include "engine/backends/cuda/executor/executor.h"
 #include "engine/models/qwen4_exp/ops.h"
 #include "engine/config.h"
 #include "engine/generation/batch.h"
@@ -47,8 +47,8 @@ class BatchOps {
 #endif
     };
 
-    BatchOps(qwen4_exp::Model&, CudaExecutionContext&, tyloi::engine::Budget&,
-             tyloi::engine::ContinuousBatchConfig);
+    BatchOps(qwen4_exp::Model&, tyloi::weights::Cache&, tyloi::engine::Budget&,
+             tyloi::engine::ContinuousBatchConfig, bool cache_pipeline);
     ~BatchOps();
     void bind(tyloi::engine::Budget& budget) noexcept { budget_ = &budget; }
     int64_t vocab_size() const;
@@ -82,7 +82,8 @@ class BatchOps {
 #endif
 
     qwen4_exp::Model& model_;
-    CudaExecutionContext& execution_;
+    tyloi::weights::Cache& weights_;
+    bool cache_pipeline_;
     tyloi::engine::Budget* budget_; // The owner keeps the budget alive until batch destruction.
     tyloi::engine::ContinuousBatchConfig config_;
     std::vector<std::weak_ptr<Request>> requests_;
@@ -97,7 +98,7 @@ class BatchOps {
 namespace tyloi::cuda {
 
 std::unique_ptr<tyloi::engine::Batch> make_batch(
-    qwen4_exp::Model& model, CudaExecutionContext& execution, tyloi::engine::Budget& budget,
-    const tyloi::engine::ContinuousBatchConfig& config, std::int64_t chunk_size);
+    qwen4_exp::Model& model, tyloi::weights::Cache& weights, tyloi::engine::Budget& budget,
+    const tyloi::engine::ContinuousBatchConfig& config, std::int64_t chunk_size, bool cache_pipeline);
 
 } // namespace tyloi::cuda

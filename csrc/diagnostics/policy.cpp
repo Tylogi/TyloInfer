@@ -180,14 +180,14 @@ int run_policy(Program& program, Tensor ids, const PolicyOptions& options) {
             settings.set("TYLOINFER_TRACE_MHC_TIMINGS","0");
         }
         select(settings,options.policy,on);
-        auto compute=executor.mode().compute;
+        auto compute=executor.compute();
         if(options.policy==Policy::rotary_fusion)compute.rotary=on;
         if(options.policy==Policy::attention_grouping) { compute.rotary=true; compute.attention_grouped=on; }
         if(options.policy==Policy::mhc_fusion) {
             compute.rotary=true; compute.attention_grouped=true;
             compute.residual_two_stage=on; compute.residual_dense_injection=on && residual.dense_injection;
         }
-        PolicyScope policy(executor,std::move(compute));
+        auto policy=executor.enter(compute);
         Retire pass_retire{program};
         std::cout << name << "_pass=" << pass << " phase=" << on << " begin=1";
         if(options.phase_timings)std::cout << " mfe_phase_timings=" << timed;

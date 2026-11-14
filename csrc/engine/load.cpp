@@ -1,3 +1,4 @@
+#include "engine/models/plan.h"
 #include "engine/load.h"
 #include "engine/ops.h"
 #include "engine/models/load.h"
@@ -72,10 +73,10 @@ std::unique_ptr<engine::Engine> load_native_engine(CudaEngineOptions options, en
 
 std::unique_ptr<engine::Engine> load_cuda_engine(CudaEngineOptions options) {
     auto source = tyloi::open_model_source(options.model_path);
-    const auto backbone = cuda_backbone(tyloi::models::graph(*source).backbone);
+    const auto backbone = ::tyloi::models::backbone(tyloi::models::graph(*source).backbone);
     source.reset();
 #ifdef TYLOINFER_NATIVE_CUDA
-    if (backbone == CudaBackbone::gemma4) {
+    if (backbone == ::tyloi::models::Backbone::gemma4) {
         return load_native_engine(std::move(options), nullptr);
     }
 #endif
@@ -140,6 +141,7 @@ std::unique_ptr<engine::Engine> load_native_engine(CudaEngineOptions options, en
             if (kv_options.gpu_budget_bytes)
                 throw std::invalid_argument("CUDA streamed KV requires a QSA model");
             kv = std::make_shared<KvMemoryManager>();
+            root->configure_kv(kv, offload);
             {
                 auto scope = root->enter(load.layer_placement.primary_device());
                 source = tyloi::open_model_source(options.model_path);
@@ -161,6 +163,7 @@ std::unique_ptr<engine::Engine> load_native_engine(CudaEngineOptions options, en
                     predictor_execution = root->fork(load.layer_placement.primary_device());
                 state = model->make_state();
                 finalize_kv(kv.get(), *weights, offload);
+                root->configure_kv(kv, offload);
                 std::size_t pending_kv = 0;
                 if (config.preallocate_kv) {
                     const Device primary(kCUDA, load.layer_placement.primary_device());
@@ -232,13 +235,14 @@ std::unique_ptr<engine::Engine> load_native_engine(CudaEngineOptions options, en
                 graph.reset();
                 state.reset(); sessions.reset();
                 if (weights) weights->clear_workspace();
-                model.reset(); offload.reset(); kv.reset(); weights.reset();
+                model.reset(); offload.reset(); kv.reset();
                 if (predictor_execution) {
                     auto predictor_scope = predictor_execution->enter();
                     predictor_execution->clear();
                 }
                 predictor_execution.reset();
                 owner->clear();
+                weights.reset();
             } catch (const std::exception& error) {
                 std::cerr << "runtime_load_cleanup error=" << error.what() << std::endl;
                 std::terminate();

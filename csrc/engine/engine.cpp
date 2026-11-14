@@ -192,7 +192,6 @@ void Engine::unload_model() {
         if (weights_) weights_->clear_workspace();
         budget_.reset(); cache_.reset();
         model_.reset();
-        weights_.reset();
         text_.reset();
         mtp_state_ = {};
         if (predictor_execution_) {
@@ -202,6 +201,7 @@ void Engine::unload_model() {
         predictor_execution_.reset();
         // Execution resources retire last: state and weight backing free first.
         executor_->clear();
+        weights_.reset();
         scope.reset();
         executor_.reset();
     }

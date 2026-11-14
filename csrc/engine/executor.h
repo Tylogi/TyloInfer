@@ -15,6 +15,8 @@
 
 namespace tyloi {
 
+struct LayerEvent;
+
 class Executor {
 public:
     struct Memory {
@@ -31,6 +33,15 @@ public:
     class Scope {
     public:
         virtual ~Scope() = default;
+    };
+
+    // The executor outlives this working set; enter only while resuming its job.
+    class Work {
+    public:
+        virtual ~Work() = default;
+        virtual std::unique_ptr<Scope> enter() { return std::make_unique<Scope>(); }
+        virtual void step(const LayerEvent&) {}
+        virtual void finish() {}
     };
 
     // Starts on creation; stop records completion and elapsed_ms waits for it.
@@ -74,6 +85,7 @@ public:
     // Destroy scopes in reverse order on the entering thread, before their resources.
     // Exiting a scope does not synchronize device work.
     virtual std::unique_ptr<Scope> enter() = 0;
+    virtual std::unique_ptr<Work> work() { return std::make_unique<Work>(); }
     virtual std::unique_ptr<Timer> timer() = 0;
     virtual std::unique_ptr<Profile> profile(const char* name) = 0;
     virtual std::unique_ptr<Graph> graph() = 0;

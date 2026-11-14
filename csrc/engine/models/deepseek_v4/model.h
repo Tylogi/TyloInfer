@@ -1,5 +1,6 @@
 #pragma once
 
+#include "engine/models/plan.h"
 #include "engine/backends/cuda/ops/ffn/ffn.h"
 #include "engine/backends/cuda/ops/projection/quant_linear.h"
 #include "engine/ops.h"

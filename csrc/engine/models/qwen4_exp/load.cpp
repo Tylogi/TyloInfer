@@ -1,8 +1,7 @@
+#include "engine/models/plan.h"
 #include "engine/models/qwen4_exp/ops.h"
 #include "engine/models/qwen4_exp/layer.h"
 #include "engine/models/qwen4_exp/causal_lm.h"
-#include "engine/backends/cuda/executor/options.h"
-#include "engine/backends/cuda/executor/tq.h"
 #include "engine/backends/cuda/ops/projection/nint.h"
 #include "engine/backends/cuda/ops/projection/quant_linear.h"
 #include "engine/weights/loader.h"
@@ -14,8 +13,13 @@
 #include "engine/weights/tq/rows.h"
 #include "engine/weights/nint_row_pipeline.h"
 #include "engine/models/qwen4_exp/predictor.h"
+#include "engine/ops/ffn.h"
+#include "engine/ops/gdn.h"
+#include "engine/ops/qsa.h"
+#include "engine/ops/residual.h"
 
-#include "engine/backends/cuda/executor/execution.h"
+#include "engine/backends/cuda/executor/executor.h"
+#include "engine/models/load.h"
 #include "engine/backends/cuda/native/scope.h"
 #include "engine/models/common/check.h"
 #include "engine/models/common/load.h"
@@ -33,10 +37,8 @@ namespace tyloi::cuda::qwen4_exp {
 using Config = tyloi::models::qwen4_exp::Config;
 
 struct LayerLoader : tyloi::weights::Loader {
-    using GdnWeights = qwen4_exp::GdnWeights;
-    using QsaWeights = qwen4_exp::QsaWeights;
     using PleWeights = qwen4_exp::PleWeights;
-    CudaExecutionContext& execution;
+    const tyloi::ops::YarnScaling& yarn;
     struct Embedding {
         attention_ops::Embedding function;
         std::shared_ptr<tyloi::NintRows> range;
@@ -44,36 +46,19 @@ struct LayerLoader : tyloi::weights::Loader {
         DenseTensor operator()(const DenseTensor& ids) const { return function(ids); }
     };
 
-    auto residual_linear(const std::string &name) const {
-        const auto part = name=="model.mhc.pre.down.weight" || name=="predictor.mhc.pre.down.weight"
-            ? GatedResidual::Part::final_down
-            : name=="model.mhc.pre.up.weight" || name=="predictor.mhc.pre.up.weight"
-                ? GatedResidual::Part::final_up : GatedResidual::Part::generic;
-#ifdef TYLOINFER_NATIVE_CUDA
-        return GatedResidual::projection(weight(name), part);
-#else
-        return GatedResidual::projection(weight(name), execution.executor().projector(execution.executor().mode().ffn, model_parallel_primary_device(execution.config)), execution.executor().profiler(),
-                                          execution.executor().options().residual, part);
-#endif
+    auto residual(::tyloi::Tensor norm, ::tyloi::Tensor down, ::tyloi::Tensor up,
+                  ::tyloi::Tensor injection, const Config& c, bool final) const {
+        return tyloi::ops::Residual(
+            {std::move(norm), std::move(down), std::move(up), std::move(injection)},
+            {c.hidden, c.streams, c.eps, final, tyloi::Device(tyloi::kCUDA, placement.device)});
     }
-#ifdef TYLOINFER_NATIVE_CUDA
-    GatedResidual residual(::tyloi::Tensor norm, GatedResidual::Projection down,
-#else
-    GatedResidual residual(DenseTensor norm, GatedResidual::Projection down,
-#endif
-        GatedResidual::Projection up, GatedResidual::Projection injection, const Config &c) const {
-        return {std::move(norm), std::move(down), std::move(up), std::move(injection),
-#ifdef TYLOINFER_NATIVE_CUDA
-                c.hidden, c.streams, c.eps};
-#else
-                c.hidden, c.streams, c.eps, execution.executor().options().residual, execution.executor().mode().ffn.batch_serial};
-#endif
+    static auto final_mixer(tyloi::ops::Residual value) {
+        return std::make_unique<tyloi::ops::Residual>(std::move(value));
     }
-    static auto final_mixer(GatedResidual weights) { return std::make_unique<GatedResidual>(std::move(weights)); }
     auto gdn_weights(const std::string &p) const {
         const bool independent = has(p + ".query.weight") || has(p + ".key.weight") || has(p + ".value.weight");
         TYLOINFER_RUNTIME_CHECK(!independent || !has(p + ".qkv.weight"), "ambiguous Qwen4 GDN input projections");
-        GdnWeights w;
+        tyloi::ops::GdnWeights w;
         if(independent)for(const auto* name:{"query","key","value"})
             w.input_projection.push_back(weight(p+"."+name+".weight"));
         else w.input_projection.push_back(weight(p+".qkv.weight"));
@@ -82,78 +67,68 @@ struct LayerLoader : tyloi::weights::Loader {
         w.input_projection.push_back(weight(p+".beta.weight"));
         w.qkv_count=independent?3:1;
         w.output=weight(p+".output.weight");
-#ifdef TYLOINFER_NATIVE_CUDA
         w.conv=dense(p+".conv.weight");
         w.dt_bias=dense(p+".dt_bias");
         w.a_log=dense(p+".a");
         w.norm=dense(p+".norm.weight");
-#else
-        w.conv=dense(p+".conv.weight").dense();
-        w.dt_bias=dense(p+".dt_bias").dense();
-        w.a_log=dense(p+".a").dense();
-        w.norm=dense(p+".norm.weight").dense();
-#endif
         return w;
     }
     auto qsa_weights(const std::string &p) const {
-        QsaWeights w;
+        tyloi::ops::QsaWeights w;
         for(const auto* name:{"query","key","value"})
             w.input_projection.push_back(weight(p+"."+name+".weight"));
         w.input_projection.push_back(weight(p+".indexer.query_key.weight"));
         w.output=weight(p+".output.weight");
-#ifdef TYLOINFER_NATIVE_CUDA
         w.query_norm=dense(p+".query_norm.weight");
         w.key_norm=dense(p+".key_norm.weight");
         w.index_query_norm=dense(p+".indexer.query_norm.weight");
         w.index_key_norm=dense(p+".indexer.key_norm.weight");
-#else
-        w.query_norm=dense(p+".query_norm.weight").dense();
-        w.key_norm=dense(p+".key_norm.weight").dense();
-        w.index_query_norm=dense(p+".indexer.query_norm.weight").dense();
-        w.index_key_norm=dense(p+".indexer.key_norm.weight").dense();
-#endif
         if(has(p+".gate.weight")) {
             w.input_projection.push_back(weight(p+".gate.weight"));
             w.has_gate=true;
         }
         return w;
     }
-    auto gdn(GdnWeights weights, const Config &c) const {
-        weights.input_projection=tyloi::weights::pack_projections(std::move(weights.input_projection),
-            options.grouped,placement.cpu);
-        auto shared=std::make_shared<const GdnWeights>(std::move(weights));
-        return std::make_unique<Gdn>(std::move(shared), c.key_heads, c.value_heads, c.linear_width,
-                                     c.kernel, c.eps, c.silu_gate,true,execution.executor().mode().transposed,
-                                     execution.executor().options().gdn_fused_output,true,execution.executor().options().gdn_fused_preparation,
-                                     execution.executor().options().gdn_fused_core);
+    auto gdn(tyloi::ops::GdnWeights weights, const Config& c) const {
+        weights.input_projection = tyloi::weights::pack_projections(
+            std::move(weights.input_projection), options.grouped, placement.cpu);
+        return std::make_unique<tyloi::ops::Gdn>(std::move(weights), c.key_heads, c.value_heads,
+            c.linear_width, c.kernel, c.eps, c.silu_gate, tyloi::Device(tyloi::kCUDA, placement.device));
     }
-    auto qsa(QsaWeights weights, const Config &c) const {
-        weights.input_projection=tyloi::weights::pack_projections(std::move(weights.input_projection),
-            options.grouped,placement.cpu);
-        QsaConfig geometry{c.heads, c.kv_heads, c.width, c.index_heads, c.index_width,
-                           c.pool, c.budget, c.maximum, c.eps};
-#ifdef TYLOINFER_NATIVE_CUDA
-        constexpr bool default_rotary_fusion = true;
-#else
-        constexpr bool default_rotary_fusion = false;
-#endif
-        auto rotary = std::make_shared<RotaryEmbedding>(c.rotary, c.maximum, c.rope_base,
-            c.sections, c.interleaved,
-            ::tyloi::cuda::options::rotary_fusion().value_or(default_rotary_fusion), execution.config.yarn);
-        for(auto* norm:{&weights.query_norm,&weights.key_norm,&weights.index_query_norm,&weights.index_key_norm})
-#ifdef TYLOINFER_NATIVE_CUDA
-            if((*norm)->defined())*norm=std::make_shared<DenseTensor>(
-                *norm.dense().to(::tyloi::kFloat32).contiguous());
-#else
-            if(norm->defined())*norm=norm->to(::tyloi::kFloat32).contiguous();
-#endif
-        auto shared=std::make_shared<const QsaWeights>(std::move(weights));
-        return std::make_unique<Qsa>(std::move(shared), geometry, std::move(rotary), true, true, execution.offload, execution.kv);
+    auto qsa(tyloi::ops::QsaWeights weights, const Config& c) const {
+        weights.input_projection = tyloi::weights::pack_projections(
+            std::move(weights.input_projection), options.grouped, placement.cpu);
+        for (auto* norm : {&weights.query_norm, &weights.key_norm, &weights.index_query_norm, &weights.index_key_norm})
+            if (norm->defined()) *norm = tyloi::ops::contiguous(tyloi::ops::cast(*norm, tyloi::kFloat32));
+        tyloi::ops::QsaConfig geometry{c.heads, c.kv_heads, c.width, c.index_heads, c.index_width,
+            c.pool, c.budget, c.maximum, c.eps, c.rotary, c.rope_base, c.sections, c.interleaved,
+            yarn, tyloi::Device(tyloi::kCUDA, placement.device)};
+        return std::make_unique<tyloi::ops::Qsa>(std::move(weights), std::move(geometry));
     }
-    auto moe(std::vector<Linear> gate_up, Linear down, Linear router,
-                    Linear shared_gate, Linear sg, Linear su, Linear sd, const Config &c) const {
-        return Moe(std::move(gate_up), std::move(down), std::move(router), std::move(shared_gate),
-                   std::move(sg), std::move(su), std::move(sd), c);
+    auto moe(std::vector<tyloi::Tensor> gate_up, tyloi::Tensor down, tyloi::Tensor router,
+             tyloi::Tensor shared_gate, tyloi::Tensor sg, tyloi::Tensor su, tyloi::Tensor sd,
+             const Config& c, int layer) const {
+        tyloi::ops::FfnWeights f;
+        f.is_moe = true;
+        f.gate_up = std::move(gate_up);
+        f.down = std::move(down);
+        f.moe_router = std::move(router);
+        f.moe_shared_gate = std::move(shared_gate);
+        f.shared = std::make_unique<tyloi::ops::FfnWeights>();
+        f.shared->gate_up = {std::move(sg), std::move(su)};
+        f.shared->down = std::move(sd);
+        const auto routing = c.routing();
+        f.moe_top_k = static_cast<int>(c.topk);
+        f.moe_use_sigmoid = routing.activation == tyloi::ops::RouterActivation::sigmoid;
+        f.moe_use_sqrt_softplus = routing.activation == tyloi::ops::RouterActivation::sqrt_softplus;
+        f.moe_normalize = routing.normalize;
+        f.moe_delayed_softmax = routing.delayed_softmax;
+        f.moe_router_scale = routing.scale;
+        f.moe_layer = layer;
+        f.qwen_hidden = c.hidden;
+        f.qwen_moe_width = c.moe_width;
+        f.target = tyloi::Device(tyloi::kCUDA, placement.device);
+        return tyloi::ops::qwen4_ffn_weights(std::move(f));
     }
     auto embedding(const std::string &name) const {
         if(tyloi::is_tq_table(source,name)) {
@@ -175,8 +150,8 @@ struct LayerLoader : tyloi::weights::Loader {
 #endif
 
         auto weight = this->weight(name);
-        Embedding lookup{[weight](const DenseTensor &ids) { return quant_embedding_lookup(*weight, ids); },{}};
-        return std::pair{std::move(lookup), std::array<int64_t, 2>{weight->size(0), weight->size(1)}};
+        Embedding lookup{[weight](const DenseTensor &ids) { return quant_embedding_lookup(weight, ids); },{}};
+        return std::pair{std::move(lookup), std::array<int64_t, 2>{weight.size(0), weight.size(1)}};
     }
     std::vector<int64_t> integers(const std::string &name) const {
         const auto &type = require_tensor(source, name).dtype;
@@ -217,26 +192,25 @@ struct LayerLoader : tyloi::weights::Loader {
 
 std::unique_ptr<Layer> LayerLoader::layer(const Config &c, int layer, bool predictor) {
     auto result = std::make_unique<Layer>();
-    LayerLoader loader{*this, execution};
+    result->cuda_device = placement.device;
+    result->cpu_offloaded = placement.cpu;
+    LayerLoader loader{*this, yarn};
     loader.role = "qwen4_exp";
     tyloi::models::qwen4_exp::load_layer(*result, loader, c, layer, predictor);
     return result;
 }
 
-std::optional<Predictor> Predictor::load_if_present(CudaExecutionContext &execution,
-                                                      const tyloi::weights::Loader& weights,
+std::optional<Predictor> Predictor::load_if_present(const tyloi::weights::Loader& weights,
+                                                      const tyloi::models::LoadOptions& options,
                                                       const tyloi::models::qwen4_exp::Config &main,
                                                       ::tyloi::Tensor embedding, ::tyloi::Tensor output,
                                                       double softcap) {
     Predictor result;
-#ifndef TYLOINFER_NATIVE_CUDA
-    result.execution = &execution;
-#endif
     result.embedding = std::move(embedding);
     result.output = std::move(output);
     result.softcap = softcap;
     result.primary = weights.placement.device;
-    LayerLoader loader{weights,execution};
+    LayerLoader loader{weights, options.yarn};
     loader.role = "qwen4_exp";
     if (!tyloi::models::qwen4_exp::load_predictor(result, loader, main))
         return std::nullopt;
@@ -251,7 +225,7 @@ void read(Model& model, std::shared_ptr<const tyloi::ModelSource> model_source,
     const auto& source = *model.source;
     validate_model_source(source);
     model.graph = tyloi::models::graph(source);
-    model.plan = cuda_model_plan(model.graph);
+    model.plan = ::tyloi::models::model_plan(model.graph);
     require_model(Model::accepts_backbone(model.graph.backbone),
                   "model backbone does not match the requested causal model");
     model.load_config(definition);
@@ -265,43 +239,30 @@ void read(Model& model, std::shared_ptr<const tyloi::ModelSource> model_source,
     }
 }
 
-void load(Model& model, CudaExecutionContext& execution, std::int64_t context_size,
-          bool defer_moe_cache_finalize, bool load_layers) {
-    auto definition = tyloi::models::config_json(*model.source, {});
-    definition = configure_yarn(execution.config.yarn, execution.config.yarn_context_extension,
-        std::move(definition), model.graph.backbone, context_size);
-    read(model, model.source, definition, context_size);
-    model.execution = &execution;
-    validate_native_placement(execution.config.tensor_parallel, execution.config.layer_placement,
-                              execution.config.n_gpu_layers);
-    if (execution.config.expert_parallel.enabled() && model.metadata.num_experts <= 0)
+void load(Model& model, const tyloi::weights::Loader& tensors, LayerPlacementConfig& placement,
+          const tyloi::models::LoadOptions& options, bool load_layers) {
+    validate_native_placement(tensors.placement.tensor, placement, options.gpu_layers);
+    if (options.expert_parallel && model.metadata.num_experts <= 0)
         throw std::runtime_error("--expert-parallel requires a model with routed experts");
-    execution.config.layer_placement.prepare(model.num_hidden_layers());
-    execution.config.dense_cpu_layer_count = 0;
-    if (execution.config.n_gpu_layers >= 0) {
-        execution.config.dense_cpu_layer_count = static_cast<int>(
-            std::max<std::int64_t>(model.num_hidden_layers() - execution.config.n_gpu_layers, 0));
-        if (execution.config.dense_cpu_layer_count > 0) {
-            if (model_parallel_enabled(execution.config) || execution.config.layer_placement.enabled())
-                throw std::runtime_error(
-                    "--n-gpu-layers cannot be combined with tensor/expert/layer parallelism");
-            std::cerr << "dense_layer_placement cpu=0-" << (execution.config.dense_cpu_layer_count - 1)
-                      << " gpu=" << execution.config.dense_cpu_layer_count << '-'
-                      << (model.num_hidden_layers() - 1) << " cpu_threads=" << mfq_get_num_threads()
-                      << std::endl;
-        }
+    placement.prepare(model.num_hidden_layers());
+    const int dense_cpu_layer_count = options.gpu_layers >= 0
+        ? static_cast<int>(std::max<std::int64_t>(model.num_hidden_layers() - options.gpu_layers, 0)) : 0;
+    if (dense_cpu_layer_count > 0) {
+        if (tensors.placement.tensor.enabled() || options.expert_parallel || placement.enabled())
+            throw std::runtime_error("--n-gpu-layers cannot be combined with tensor/expert/layer parallelism");
+        std::cerr << "dense_layer_placement cpu=0-" << (dense_cpu_layer_count - 1)
+                  << " gpu=" << dense_cpu_layer_count << '-' << (model.num_hidden_layers() - 1)
+                  << " cpu_threads=" << mfq_get_num_threads() << std::endl;
     }
-    CudaScope model_guard(execution.config.layer_placement.primary_device(), execution.executor().contexts());
-    if (model.plan.vision == CudaVisionAdapter::grid_vit && execution.config.dense_cpu_layer_count > 0)
+    CudaScope model_guard(placement.primary_device(), Executor::current().contexts());
+    if (model.plan.vision == ::tyloi::models::VisionAdapter::grid_vit && dense_cpu_layer_count > 0)
         throw std::runtime_error("CUDA grid-Vision currently requires GPU-resident text layers");
-    auto tensors = execution.weights.loader(*model.source, execution.config.weights,
-        {execution.config.layer_placement.primary_device(), false, execution.config.drop_file_cache,
-         execution.config.tensor_parallel, moe_parallel_config(execution.config)});
+    model.primary_device = placement.primary_device();
     constexpr auto embedding = "model.token_embedding.weight";
     constexpr auto output = "model.output.weight";
     const bool independent = !model.tie_word_embeddings() && tensors.has(output);
     model.embed = tensors.embedding(embedding, independent);
-    LayerLoader loader{tensors, execution};
+    LayerLoader loader{tensors, options.yarn};
     loader.role = "qwen4_exp";
     model.final_mixer = loader.final_mixer(
         tyloi::models::qwen4_exp::load_residual(loader, model.config, "model.mhc.pre", false));
@@ -311,21 +272,17 @@ void load(Model& model, CudaExecutionContext& execution, std::int64_t context_si
     if (load_layers) {
         model.layers.reserve(static_cast<std::size_t>(model.num_hidden_layers()));
         for (int layer = 0; layer < model.num_hidden_layers(); ++layer) {
-            const int device = execution.config.layer_placement.device_for_layer(layer);
-            const bool cpu = layer < execution.config.dense_cpu_layer_count;
+            const int device = placement.device_for_layer(layer);
+            const bool cpu = layer < dense_cpu_layer_count;
             MfqCudaGuard layer_guard(device);
             std::cerr << "loading layer " << layer << ' '
                       << model.metadata.layer_types.at(static_cast<std::size_t>(layer)) << ' '
                       << (cpu ? "CPU" : "CUDA") << std::endl;
-            LayerLoader placed{tensors.for_layer(device, cpu), execution};
+            LayerLoader placed{tensors.for_layer(device, cpu), options.yarn};
             auto block = placed.layer(model.config, layer, false);
-            block->cuda_device = device;
-            block->cpu_offloaded = cpu;
             model.layers.push_back(std::move(block));
         }
     }
-    if (!defer_moe_cache_finalize)
-        execution.weights.finalize();
 }
 
 } // namespace tyloi::cuda::qwen4_exp

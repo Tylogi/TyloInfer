@@ -1,6 +1,7 @@
 #include "executor.h"
 
 #include "engine/backends/cuda/executor/tq.h"
+#include "engine/backends/cuda/executor/working_set.h"
 #include "engine/backends/cuda/native/branches.h"
 #include "engine/backends/cuda/native/collectives.h"
 #include "engine/backends/cuda/native/context.h"
@@ -11,6 +12,7 @@
 #include "engine/backends/cuda/kernels/mfq_cuda_sampling_ops.h"
 #include "engine/backends/cuda/kernels/gr_prefill_blas.h"
 #include "engine/backends/cuda/ops/projection/mmq.h"
+#include "engine/state/kv_memory.h"
 #include "diagnostics/route_stats.h"
 
 #include <exception>
@@ -206,9 +208,11 @@ Executor::Executor(Options options, int primary)
 
 Executor::Executor(ContextSet& contexts, CudaProfiler& profiler, KlMmqState& mmq, const std::shared_ptr<TqExec>& tq,
         Branches& branches, Collectives& collectives, RouteStats& routes,
-        const Options& options, Mode& mode, int primary)
+        const Options& options, Mode& mode, int primary,
+        std::weak_ptr<KvMemoryManager> kv_memory, std::weak_ptr<KvOffloadStore> kv_offload)
     : contexts_(contexts), options_(options), mode_(mode), profiler_(profiler), mmq_(mmq), tq_(tq), branches_(branches),
-      collectives_(collectives), routes_(routes), primary_(primary) {}
+      collectives_(collectives), routes_(routes), kv_memory_(std::move(kv_memory)),
+      kv_offload_(std::move(kv_offload)), primary_(primary) {}
 
 Executor::~Executor() = default;
 
@@ -257,6 +261,7 @@ void Executor::clear() {
     }
     tq_->clear();
     branches_.clear();
+    configure_kv({}, {});
 }
 #endif
 
@@ -298,14 +303,18 @@ std::unique_ptr<Executor> Executor::fork() const {
 
 std::unique_ptr<Executor> Executor::fork(int primary) const {
     return std::unique_ptr<Executor>(new Executor(contexts_, profiler_, mmq_, tq_, branches_,
-        collectives_, routes_, options_, mode_, primary));
+        collectives_, routes_, options_, mode_, primary, kv_memory_, kv_offload_));
 }
 
-Executor::Mode Executor::forward_mode(int primary) const {
-    auto snapshot = mode_;
-    snapshot.kv_capacity = mmq_.kv_cache_capacity;
-    snapshot.primary = primary;
-    return snapshot;
+void Executor::configure_kv(std::shared_ptr<KvMemoryManager> memory, std::shared_ptr<KvOffloadStore> offload) {
+    kv_memory_ = std::move(memory);
+    kv_offload_ = std::move(offload);
+}
+
+std::shared_ptr<KvOffloadStore> Executor::kv_offload() const {
+    if (auto offload = kv_offload_.lock()) return offload;
+    if (auto memory = kv_memory_.lock()) return memory->offload();
+    return {};
 }
 
 Projector Executor::projector(const FfnMode& mode) {
@@ -370,12 +379,15 @@ thread_local ExecutorScope* active_scope = nullptr;
 class ExecutorScope final : public tyloi::Executor::Scope {
 public:
     Executor& owner;
-#ifdef TYLOINFER_NATIVE_CUDA
     ExecutorScope(Executor& executor, int primary, ContextSet& contexts, const FfnMode& mode)
-        : owner(executor), ffn(mode), native_(std::in_place, primary, contexts),
+        : owner(executor), ffn(mode), compute(executor.mode().compute), attention(executor.options().attention),
+          native_(std::in_place, primary, contexts),
           no_grad_(std::in_place), previous_(active_scope) {
-        if (previous_ && &previous_->owner == &executor)
+        if (previous_ && &previous_->owner == &executor) {
             ffn.serial = ffn.serial || previous_->ffn.serial;
+            compute = previous_->compute;
+            attention = previous_->attention;
+        }
         active_scope = this;
     }
     ExecutorScope(Executor& executor, const FfnMode& mode)
@@ -384,27 +396,30 @@ public:
             throw std::logic_error("CUDA executor is not active");
         // Capture serialization remains in force through nested policy scopes.
         ffn.serial = ffn.serial || previous_->ffn.serial;
+        compute = previous_->compute;
+        attention = previous_->attention;
+        active_scope = this;
+    }
+    ExecutorScope(Executor& executor, const Executor::Compute* policy, const AttentionKernels* kernels)
+        : owner(executor), previous_(active_scope) {
+        if (!previous_ || &previous_->owner != &executor)
+            throw std::logic_error("CUDA executor is not active");
+        ffn = previous_->ffn;
+        compute = policy ? *policy : previous_->compute;
+        attention = previous_->attention;
+        if (kernels) attention.kernels = *kernels;
         active_scope = this;
     }
     FfnMode ffn;
-#else
-    ExecutorScope(Executor& executor, int primary, ContextSet& contexts)
-        : owner(executor), native_(primary, contexts), previous_(active_scope) {
-        active_scope = this;
-    }
-#endif
+    Executor::Compute compute;
+    AttentionOptions attention;
     ~ExecutorScope() override {
         active_scope = previous_;
     }
 
 private:
-#ifdef TYLOINFER_NATIVE_CUDA
     std::optional<CudaScope> native_;
     std::optional<::tyloi::cuda::NoGradGuard> no_grad_;
-#else
-    CudaScope native_;
-    ::tyloi::cuda::NoGradGuard no_grad_;
-#endif
     ExecutorScope* previous_;
 };
 } // namespace
@@ -417,11 +432,47 @@ std::unique_ptr<tyloi::Executor::Scope> Executor::enter(int device) {
 #ifdef TYLOINFER_NATIVE_CUDA
     return enter(device, active_scope && &active_scope->owner == this ? active_scope->ffn : mode_.ffn);
 #else
-    return std::make_unique<ExecutorScope>(*this, device, contexts_);
+    return std::make_unique<ExecutorScope>(*this, device, contexts_, mode_.ffn);
 #endif
 }
 
+Executor::Mode Executor::forward_mode(int primary) const {
+    auto snapshot = mode_;
+    snapshot.compute = compute();
+    snapshot.kv_capacity = mmq_.kv_cache_capacity;
+    snapshot.primary = primary;
+    return snapshot;
+}
+
+const Executor::Compute& Executor::compute() const noexcept {
+    return active_scope && &active_scope->owner == this ? active_scope->compute : mode_.compute;
+}
+
+const AttentionOptions& Executor::attention_options() const noexcept {
+    return active_scope && &active_scope->owner == this ? active_scope->attention : options_.attention;
+}
+
+ResidualOptions Executor::residual_options() const noexcept {
+    auto result = options_.residual;
+    const auto& policy = compute();
+    result.two_stage = policy.residual_two_stage.value_or(result.two_stage);
+    result.dense_injection = policy.residual_dense_injection.value_or(result.dense_injection);
+    return result;
+}
+
+std::unique_ptr<tyloi::Executor::Scope> Executor::enter(const Compute& policy) {
+    return std::make_unique<ExecutorScope>(*this, &policy, nullptr);
+}
+
+std::unique_ptr<tyloi::Executor::Scope> Executor::enter(const AttentionKernels& kernels) {
+    return std::make_unique<ExecutorScope>(*this, nullptr, &kernels);
+}
+
 #ifdef TYLOINFER_NATIVE_CUDA
+std::unique_ptr<tyloi::Executor::Work> Executor::work() {
+    return make_working_set(*this);
+}
+
 std::unique_ptr<tyloi::Executor::Timer> Executor::timer() {
     return std::make_unique<internal::PrefillCudaTimer>();
 }
@@ -447,6 +498,10 @@ const FfnMode& Executor::current_ffn() {
 Executor& Executor::current() {
     if (!active_scope) throw std::runtime_error("no active CUDA executor scope");
     return active_scope->owner;
+}
+
+Executor* Executor::active() noexcept {
+    return active_scope ? &active_scope->owner : nullptr;
 }
 
 void Executor::prepare(std::int64_t vocabulary) {

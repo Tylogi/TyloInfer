@@ -11,7 +11,6 @@
 #include "gguf_prefill_stager.h"
 #include "gguf_speculative_journal.h"
 #include "engine/backends/cuda/ops/projection/quant_linear.h"
-#include "engine/backends/cuda/executor/execution.h"
 #include "engine/weights/moe/expert_cache.h"
 #include "engine/weights/moe/pinned_expert_arena.h"
 #include "engine/weights/moe/pinned_copy_plan.h"
@@ -1708,9 +1707,11 @@ public:
     template<typename Fn> auto profile_prefill(const std::string& name,Fn&& fn) {
         return profiler_.measure(name,std::forward<Fn>(fn));
     }
-    explicit GgufExpertCache(CudaExecutionContext& execution,const tyloi::ModelSource& source)
-        : physical_limit_(execution.config.moe_host_physical_bytes),
-          configured_device_limit_(execution.config.moe_device_cache_bytes),profiler_(execution.profiler) {
+    GgufExpertCache(std::size_t host_physical_limit, std::size_t device_limit,
+        std::size_t host_limit, std::size_t moe_device_budget, CudaProfiler& profiler,
+        const tyloi::ModelSource& source)
+        : physical_limit_(host_physical_limit),
+          configured_device_limit_(device_limit),profiler_(profiler) {
         route_trace_=tyloi::cuda::gguf::RouteTrace::from_environment();
         try {
             // Keep a small transfer ring available before bulk weight pinning
@@ -1738,7 +1739,7 @@ public:
                 direct_host_.reset();direct_mapped_=nullptr;
             }
         }
-        host_limit_ = execution.config.moe_host_cache_bytes;
+        host_limit_ = host_limit;
         TYLOINFER_CUDA_CHECK(tyloi::cuda::moe_mapped_copy_launch_geometry(&upload_blocks_,&upload_threads_));
         if (!host_limit_) host_limit_ = host_available() / 5 * 4;
         ordinary_host_limit_=host_limit_;
@@ -1749,7 +1750,7 @@ public:
             // Honor an explicit RAM cache cap. Automatic mode may retain the
             // complete original image only while leaving 10% of available RAM
             // for later allocations; under pressure reserve_host drops it.
-            const auto budget=execution.config.moe_host_cache_bytes?host_limit_:available-available/10;
+            const auto budget=host_limit?host_limit_:available-available/10;
             if(planned && planned->bytes<=budget && planned->bytes<=available-available/10) {
                 try {
                     planned->load(source,mfq_current_cuda_device());
@@ -1762,8 +1763,7 @@ public:
             } else std::fprintf(stderr,"native_gguf_host_snapshot skipped=ram_budget required=%zu available=%zu budget=%zu\n",
                 planned?planned->bytes:0,available,budget);
         }
-        if (!configured_device_limit_ && execution.moe_expert_cache)
-            configured_device_limit_ = moe_expert_cache_budget_bytes(execution.moe_expert_cache);
+        if (!configured_device_limit_) configured_device_limit_ = moe_device_budget;
         // Create before a graph temporarily pins its serving caller. Linux
         // threads otherwise inherit that narrow affinity at the first update.
         admission_executor_=std::make_unique<GgufAdmissionExecutor>();
@@ -3576,8 +3576,9 @@ bool set_gguf_reuse_learning(const std::shared_ptr<GgufExpertCache>& cache,bool 
     return cache?cache->set_reuse_learning(enabled):false;
 }
 
-GgufRoutedWeight::GgufRoutedWeight(CudaExecutionContext& execution,
-    const tyloi::ModelSource& source, const std::string& name) {
+GgufRoutedWeight::GgufRoutedWeight(std::size_t host_physical_limit, std::size_t device_limit,
+    std::size_t host_limit, std::size_t moe_device_budget, CudaProfiler& profiler,
+    std::shared_ptr<GgufExpertCache>& shared_cache, const tyloi::ModelSource& source, const std::string& name) {
     const auto* record = source.find_tensor(name);
     if (!record || !record->shape || record->shape->size() != 3)
         throw std::invalid_argument("GGUF expert bank must be [experts,out,in]: " + name);
@@ -3621,8 +3622,9 @@ GgufRoutedWeight::GgufRoutedWeight(CudaExecutionContext& execution,
         std::fprintf(stderr,"native_gguf_predictor_resident actual_match=1 bank=%s bytes=%llu device=%d\n",
             name.c_str(),static_cast<unsigned long long>(record->nbytes),device);
     }
-    if (!execution.gguf_expert_cache) execution.gguf_expert_cache = std::make_shared<GgufExpertCache>(execution,source);
-    cache = execution.gguf_expert_cache;
+    if (!shared_cache) shared_cache = std::make_shared<GgufExpertCache>(
+        host_physical_limit, device_limit, host_limit, moe_device_budget, profiler, source);
+    cache = shared_cache;
     if(resident) {
         const tyloi::cuda::ResidentAllocationScope permanent;
         auto addresses=::tyloi::cuda::empty({experts},::tyloi::TensorOptions().device(::tyloi::kCPU).dtype(::tyloi::kInt64));

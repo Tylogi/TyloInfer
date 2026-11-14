@@ -25,6 +25,13 @@ struct MtpStep {
 struct Mtp {
     virtual ~Mtp() = default;
     virtual std::unique_ptr<MtpState> make_state() const = 0;
+    // Predictors that allocate on reset report new backing before admission.
+    virtual std::vector<std::pair<Device, std::size_t>> reset_growth(
+            const MtpState& state, std::int64_t batch) const {
+        if (!state.belongs_to(*this) || batch <= 0)
+            throw std::invalid_argument("invalid predictor reset state or batch");
+        return {};
+    }
     virtual void reset(MtpState& state, int64_t batch = 1) const = 0;
     virtual MtpStep step(
         MtpState& state,

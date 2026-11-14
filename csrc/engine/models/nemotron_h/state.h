@@ -28,6 +28,7 @@ class State
 {
 public:
     explicit State(const Model&);
+    bool belongs_to(const Model& model) const noexcept { return model_ == &model; }
     State(const State&) = delete;
     State& operator=(const State&) = delete;
     State(State&&) noexcept = default;
@@ -78,6 +79,7 @@ public:
     std::int64_t speculative_start = -1, speculative_confirmed = 0;
 
 private:
+    const Model* model_;
     std::vector<Layout> layout_;
 };
 

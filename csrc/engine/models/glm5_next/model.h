@@ -6,7 +6,7 @@
 #ifdef TYLOINFER_NATIVE_CUDA
 #include "engine/models/causal_model.h"
 #endif
-#include "engine/models/common/capabilities.h"
+#include "engine/models/plan.h"
 #include "engine/models/source.h"
 #include "engine/backends/cuda/ops/projection/quant_linear.h"
 #include "engine/models/common/attention_ops.h"
@@ -376,7 +376,7 @@ struct Model
 #endif
     std::shared_ptr<const tyloi::ModelSource> source;
     tyloi::ModelGraph graph;
-    CudaModelPlan plan;
+    ::tyloi::models::Plan plan;
     tyloi::models::glm5_next::Config config;
     tyloi::models::CausalLmMetadata metadata;
     ::tyloi::Tensor embed, lm_head;

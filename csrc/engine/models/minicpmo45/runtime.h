@@ -1,11 +1,6 @@
 #pragma once
 
-#ifdef TYLOINFER_NATIVE_CUDA
 #include "engine/backends/cuda/executor/executor.h"
-struct CudaExecutionContext;
-#else
-#include "engine/backends/cuda/executor/execution.h"
-#endif
 #include "text/forward.h"
 #include "audio.h"
 #include "tts.h"
@@ -25,10 +20,8 @@ struct MiniCPMO45Runtime {
     const tyloi::cuda::minicpmo45::text::Model& language;
 #ifndef TYLOINFER_NATIVE_CUDA
     tyloi::cuda::Executor& language_executor;
-    CudaExecutionContext& execution;
-#else
-    int primary;
 #endif
+    int primary;
     MiniCPMO45VisionEncoder vision;
     MiniCPMO45Resampler resampler;
     MiniCPMO45AudioEncoder audio;
@@ -40,11 +33,8 @@ struct MiniCPMO45Runtime {
 #endif
 
     static MiniCPMO45Runtime load(const tyloi::cuda::minicpmo45::text::Model& language,
-#ifndef TYLOINFER_NATIVE_CUDA
                                   tyloi::cuda::Executor& language_executor,
-#endif
-                                  const tyloi::weights::Loader& weights,
-                                  CudaExecutionContext& execution);
+                                  const tyloi::weights::Loader& weights, int primary);
 
 #ifdef TYLOINFER_NATIVE_CUDA
     tyloi::StepSequence<tyloi::models::minicpmo45::MultimodalResult<::tyloi::Tensor>>
@@ -77,7 +67,6 @@ struct MiniCPMO45Runtime {
             ::tyloi::Device(::tyloi::kCUDA, primary)));
         tyloi::models::minicpmo45::MultimodalResult<::tyloi::Tensor> result;
 #else
-        const auto primary = execution.config.layer_placement.primary_device();
         input_ids = input_ids.to(::tyloi::kCUDA, ::tyloi::kInt64).contiguous();
         tyloi::models::minicpmo45::MultimodalResult<::tyloi::DenseTensor> result;
 #endif
@@ -85,8 +74,8 @@ struct MiniCPMO45Runtime {
         result.input_embeddings = language.embedding(input_ids, primary);
 #else
         result.input_embeddings = tyloi::cuda::minicpmo45::text::embed(
-            language, language_executor, execution.executor().collectives(), primary, input_ids,
-            execution.executor().forward_mode(primary));
+            language, language_executor, language_executor.collectives(), primary, input_ids,
+            language_executor.forward_mode(primary));
 #endif
         co_yield tyloi::StepState::advanced;
         const auto scatter = [&](const auto& encoded,
@@ -393,11 +382,11 @@ struct MiniCPMO45DuplexSession {
 #else
         auto hidden = tyloi::cuda::minicpmo45::text::forward(
             runtime.language, language_state, runtime.language_executor,
-            runtime.execution.executor().collectives(), runtime.execution.executor().forward_mode(runtime.execution.config.layer_placement.primary_device()),
+            runtime.language_executor.collectives(), runtime.language_executor.forward_mode(runtime.primary),
             tyloi::models::Input{token_ids, embeddings.to(::tyloi::kBFloat16).contiguous()});
         auto logits = tyloi::cuda::minicpmo45::text::logits(
             runtime.language, runtime.language_executor, hidden.index({Slice(), -1, Slice()}),
-            true, runtime.execution.executor().forward_mode(runtime.execution.config.layer_placement.primary_device()));
+            true, runtime.language_executor.forward_mode(runtime.primary));
 #endif
         return {logits, hidden};
     }
@@ -419,9 +408,9 @@ struct MiniCPMO45DuplexSession {
         token_ids = token_ids.to(::tyloi::kCUDA, ::tyloi::kInt64).contiguous();
         return feed_embeddings(
             tyloi::cuda::minicpmo45::text::embed(runtime.language, runtime.language_executor,
-                runtime.execution.executor().collectives(),
-                runtime.execution.config.layer_placement.primary_device(), token_ids,
-                runtime.execution.executor().forward_mode(runtime.execution.config.layer_placement.primary_device())),
+                runtime.language_executor.collectives(),
+                runtime.primary, token_ids,
+                runtime.language_executor.forward_mode(runtime.primary)),
             token_ids);
 #endif
     }

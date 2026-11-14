@@ -67,13 +67,23 @@ class EngramHashState {
         }
     }
 
+    std::size_t reset_growth(int batch) const {
+        if (batch <= 0) throw std::invalid_argument("DeepSeek-V4.1 Engram batch must be positive");
+        const auto prefix = static_cast<std::size_t>(parameters_->max_ngram_size - 1);
+        if (static_cast<std::size_t>(batch) > std::numeric_limits<std::size_t>::max() / prefix ||
+            static_cast<std::size_t>(batch) * prefix > std::numeric_limits<std::size_t>::max() / sizeof(std::int64_t))
+            throw std::overflow_error("DeepSeek-V4.1 Engram reset size overflow");
+        const auto count = static_cast<std::size_t>(batch) * prefix;
+        return count > context_.capacity() ? count * sizeof(std::int64_t) : 0;
+    }
+
     void reset(int batch) {
         if (batch <= 0) {
             throw std::invalid_argument("DeepSeek-V4.1 Engram batch must be positive");
         }
         batch_ = batch;
         position_ = 0;
-        context_.assign(static_cast<std::size_t>(batch * (parameters_->max_ngram_size - 1)),
+        context_.assign(static_cast<std::size_t>(batch) * static_cast<std::size_t>(parameters_->max_ngram_size - 1),
                         parameters_->pad_id);
         speculative_context_.reset();
         speculative_position_ = -1;

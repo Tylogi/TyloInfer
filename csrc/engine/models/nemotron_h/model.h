@@ -5,7 +5,7 @@
 #include "engine/backends/cuda/ops/projection/quant_linear.h"
 #include "engine/models/nemotron_h/config.h"
 #include "engine/models/metadata.h"
-#include "engine/models/common/capabilities.h"
+#include "engine/models/plan.h"
 #include "engine/models/source.h"
 #ifdef TYLOINFER_NATIVE_CUDA
 #include "engine/models/causal_model.h"
@@ -21,6 +21,8 @@ namespace tyloi::cuda::nemotron_h {
 
 using DenseTensor = ::tyloi::DenseTensor;
 using Config = tyloi::models::nemotron_h::Config;
+
+struct Components;
 
 struct Mamba {
     int layer = -1;
@@ -64,7 +66,7 @@ struct Model
 {
     std::shared_ptr<const tyloi::ModelSource> source;
     tyloi::ModelGraph graph;
-    CudaModelPlan plan;
+    ::tyloi::models::Plan plan;
     Config config;
     tyloi::models::CausalLmMetadata metadata;
     ::tyloi::Tensor embed, lm_head;
@@ -74,7 +76,15 @@ struct Model
     DenseTensor output_norm;
 #endif
     std::vector<Layer> layers;
+    int primary = 0;
+    std::unique_ptr<Components> parts;
+
+    Model();
+    ~Model();
+    Model(Model&&) noexcept;
+    Model& operator=(Model&&) noexcept;
 #ifdef TYLOINFER_NATIVE_CUDA
+    tyloi::models::Mtp* predictor() const noexcept override;
     tyloi::models::Info info() const override;
     bool supports_speculation() const noexcept override;
     MfqModelCapabilities capabilities() const override;

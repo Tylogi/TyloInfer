@@ -13,7 +13,6 @@
 #include "engine/models/common/prompt.h"
 #include "engine/models/metadata.h"
 #include "engine/models/causal_model.h"
-#include "engine/backends/cuda/executor/execution.h"
 #include "engine/budget.h"
 #include "engine/backends/cuda/executor/tq.h"
 #include "engine/generation/cuda.h"
@@ -66,7 +65,7 @@ struct Text {
     using Parts = P;
 
     std::shared_ptr<tyloi::weights::Memory> weight_memory;
-    CudaExecutionContext* execution;
+    CudaLoadConfig& load_config;
     Executor& root_executor;
     ::tyloi::weights::Cache& weights;
     std::shared_ptr<KvMemoryManager>& kv;
@@ -117,11 +116,11 @@ struct Text {
     }
 
     bool online_budget_supported() const {
-        return execution->config.layer_placement.devices.size()<=1 && !execution->config.tensor_parallel.enabled()
-            && !execution->config.expert_parallel.enabled();
+        return load_config.layer_placement.devices.size()<=1 && !load_config.tensor_parallel.enabled()
+            && !load_config.expert_parallel.enabled();
     }
 
-    Text(CudaExecutionContext& borrowed, ::tyloi::weights::Cache& borrowed_weights,
+    Text(CudaLoadConfig& load, Executor& root, ::tyloi::weights::Cache& borrowed_weights,
             std::shared_ptr<KvMemoryManager>& borrowed_kv,
             std::shared_ptr<KvOffloadStore>& borrowed_offload,
             std::shared_ptr<Model> model_owner, std::unique_ptr<State> state_owner,
@@ -130,7 +129,7 @@ struct Text {
             std::shared_ptr<const tyloi::ModelSource> model_source,
             std::shared_ptr<tyloi::weights::Memory> ledger,
             std::unique_ptr<tyloi::Executor> predictor_execution_owner = {})
-        : weight_memory(std::move(ledger)), execution(&borrowed), root_executor(borrowed.executor()),
+        : weight_memory(std::move(ledger)), load_config(load), root_executor(root),
           weights(borrowed_weights),
           kv(borrowed_kv), offload(borrowed_offload), config(std::move(runtime_config)),
           source(std::move(model_source)),
@@ -151,24 +150,24 @@ struct Text {
         try {
         auto scope = executor->enter();
         budget.emplace(*executor, *weight_memory, weights, cache,
-            tyloi::Device(tyloi::kCUDA, execution->config.layer_placement.primary_device()));
+            tyloi::Device(tyloi::kCUDA, load_config.layer_placement.primary_device()));
         if (offload) offload->bind_budget(&*budget);
         if (config.continuous_batch.max_sequences) {
             if constexpr (std::is_same_v<Model,qwen4_exp::Model>)
-                batching = make_batch(language, *execution, *budget, config.continuous_batch,
-                    config.generation.prefill_chunk_size);
+                batching = make_batch(language, weights, *budget, config.continuous_batch,
+                    config.generation.prefill_chunk_size, load_config.cache.pipeline);
             else {
                 auto batch_config = config.continuous_batch;
-                batch_config.cuda_graph &= model_parallel_cuda_graph_enabled(execution->config, execution->executor(), execution->weights);
+                batch_config.cuda_graph &= model_parallel_cuda_graph_enabled(load_config, root_executor, weights);
                 batching = make_batch(
-                    language, &state, execution->executor().fork(model_parallel_primary_device(execution->config)),
-                    execution->executor().collectives(), execution->executor().forward_mode(execution->config.layer_placement.primary_device()),
+                    language, &state, root_executor.fork(model_parallel_primary_device(load_config)),
+                    root_executor.collectives(), root_executor.forward_mode(load_config.layer_placement.primary_device()),
                     std::move(batch_config),
                     config.generation.prefill_chunk_size,
                     ::tyloi::cuda::options::kv_vram_preallocated(),
-                    execution->config.dense_cpu_layer_count != 0 ||
-                        !execution->config.dsv4_cpu_offload_layers.empty(),
-                    execution->config.weights.min_slots);
+                    load_config.dense_cpu_layer_count != 0 ||
+                        !load_config.dsv4_cpu_offload_layers.empty(),
+                    load_config.weights.min_slots);
             }
             batching->bind(*budget);
         }
@@ -187,12 +186,12 @@ struct Text {
             qwen4_warmup_decode_graphs(language,state);
         }
         weights.prepare(::tyloi::weights::Cache::Stage::loaded,
-            tyloi::Device(tyloi::kCUDA, execution->config.layer_placement.primary_device()), source.get());
+            tyloi::Device(tyloi::kCUDA, load_config.layer_placement.primary_device()), source.get());
         } catch (...) {
             const auto failure = std::current_exception();
             try {
-                drain_cuda(root_executor, weights, offload.get(), execution->config.layer_placement,
-                           execution->config.tensor_parallel, execution->config.expert_parallel);
+                drain_cuda(root_executor, weights, offload.get(), load_config.layer_placement,
+                           load_config.tensor_parallel, load_config.expert_parallel);
             }
             catch (const std::exception& error) { std::cerr << "runtime_load_cleanup error=" << error.what() << '\n'; }
             batching.reset();
@@ -266,10 +265,10 @@ struct Text {
             return tyloi::engine::resource_metrics(component_values,profile_metrics,std::move(memory),streamed_kv,
                 batch_metrics,kv_metrics,offload_metrics,predictor_metrics,source.get(),
                 *weight_memory,weights,cache,*budget,
-                executor->memory(cuda_devices(execution->config)),
-                tyloi::Device(tyloi::kCUDA, execution->config.layer_placement.primary_device()),
-                execution->config.layer_placement.devices.size() <= 1 &&
-                    !execution->config.tensor_parallel.enabled() && !execution->config.expert_parallel.enabled());
+                executor->memory(cuda_devices(load_config)),
+                tyloi::Device(tyloi::kCUDA, load_config.layer_placement.primary_device()),
+                load_config.layer_placement.devices.size() <= 1 &&
+                    !load_config.tensor_parallel.enabled() && !load_config.expert_parallel.enabled());
         } else {
             if constexpr (std::is_same_v<Parts, std::unique_ptr<tyloi::cuda::minicpmo45::Components>>) {
                 if (!components) throw std::invalid_argument("model has no duplex component");

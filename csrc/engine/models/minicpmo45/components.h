@@ -7,7 +7,6 @@
 
 #include <memory>
 
-struct CudaExecutionContext;
 namespace tyloi::weights { struct Loader; }
 namespace tyloi::cuda {
 class Executor;
@@ -17,11 +16,8 @@ namespace text { struct Model; }
 class Components {
   public:
     Components(const text::Model& language,
-#ifndef TYLOINFER_NATIVE_CUDA
                Executor& language_executor,
-#endif
-               const tyloi::weights::Loader& weights,
-               CudaExecutionContext& execution);
+               const tyloi::weights::Loader& weights, int primary);
     ~Components();
 
     tyloi::StepSequence<tyloi::models::Prepared> prepare(const std::vector<int64_t>& prompt,
@@ -36,10 +32,7 @@ class Components {
 };
 
 std::unique_ptr<Components> load_components(text::Model& model,
-#ifndef TYLOINFER_NATIVE_CUDA
-    Executor& executor,
-#endif
-    const tyloi::weights::Loader& weights,
-    bool load_optional_components, CudaExecutionContext& execution);
+    Executor& executor, const tyloi::weights::Loader& weights,
+    bool load_optional_components, int primary);
 } // namespace minicpmo45
 } // namespace tyloi::cuda

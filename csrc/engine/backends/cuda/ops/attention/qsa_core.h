@@ -44,10 +44,13 @@ class QsaCore {
               values(model.c_.maximum, model.c_.kv_heads * model.value_width(), model.cache_dtype()),
               index(model.c_.maximum, model.c_.index_width)
               {
-            memory=allocate_kv(model.c_.maximum,model.c_.kv_heads,model.key_width(),model.value_width(),
-                model.c_.index_width,model.c_.pool,model.w_->query_norm.options().dtype(model.cache_dtype()),
-                model.c_.maximum<=model.c_.budget?model.c_.maximum:model.c_.budget+model.c_.pool-1);
-            if(memory && !memory->ready) offload=memory->offload;
+            auto& executor = Executor::current();
+            auto manager = executor.kv_memory();
+            if (manager)
+                memory=manager->add(model.c_.maximum,model.c_.kv_heads,model.key_width(),model.value_width(),
+                    model.c_.index_width,model.c_.pool,model.w_->query_norm.options().dtype(model.cache_dtype()),
+                    model.c_.maximum<=model.c_.budget?model.c_.maximum:model.c_.budget+model.c_.pool-1);
+            else offload = executor.kv_offload();
             if(offload) {
                 offloaded_kv=std::make_unique<KvOffloadSequence>(offload,model.c_.kv_heads*(model.key_width()+model.value_width()),model.c_.pool,model.cache_dtype());
                 offloaded_index=std::make_unique<KvOffloadSequence>(offload,model.c_.index_width,model.c_.pool);
@@ -93,7 +96,7 @@ class QsaCore {
     }
     std::vector<DenseTensor> project_inputs(const DenseTensor& x) const {
         std::vector<DenseTensor> projected;
-        const bool grouped=tyloi::cuda::Executor::current().mode().compute.attention_grouped.value_or(grouped_projection_) && ::tyloi::ops::grouped(w_->input_projection);
+        const bool grouped=tyloi::cuda::Executor::current().compute().attention_grouped.value_or(grouped_projection_) && ::tyloi::ops::grouped(w_->input_projection);
         if(grouped)
             { auto values=::tyloi::ops::project_group(x,w_->input_projection,1); for(const auto& value:values)projected.push_back(value.dense()); }
         else
@@ -950,7 +953,7 @@ class QsaCore {
                        std::vector<DenseTensor> projections={}) {
         const auto b=hidden.size(0),t=hidden.size(1);
         if(projections.empty()) {
-            if(tyloi::cuda::Executor::current().mode().compute.attention_grouped.value_or(grouped_projection_) && ::tyloi::ops::grouped(w_->input_projection))
+            if(tyloi::cuda::Executor::current().compute().attention_grouped.value_or(grouped_projection_) && ::tyloi::ops::grouped(w_->input_projection))
                 projections=project_inputs(hidden);
             else projections={project_query(hidden),
                 ::tyloi::ops::project(hidden,w_->input_projection[1]).dense(),

@@ -1,8 +1,10 @@
+#include "engine/models/plan.h"
 #include "engine/weights/cache.h"
 #include "engine/weights/workspace.h"
 #include "engine/models/session/snapshot.h"
 #include "env.h"
-#include "engine/backends/cuda/executor/execution.h"
+#include "engine/backends/cuda/executor/executor.h"
+#include "engine/backends/cuda/native/scope.h"
 #include "engine/backends/cuda/executor/decode_graph.h"
 #include "engine/backends/cuda/executor/options.h"
 #include "engine/backends/cuda/executor/tq.h"
@@ -30,12 +32,16 @@
 #include <iostream>
 #include <atomic>
 #include "engine/ops.h"
-#include "engine/backends/cuda/ops/ffn/gated.h"
-#include "engine/weights/nint_cache.h"
+#include "engine/ops/residual.h"
+#include "engine/ops/ffn.h"
+#include "engine/ops/gdn.h"
+#include "engine/ops/qsa.h"
+#include "engine/generation/sequence.h"
 #ifdef TYLOINFER_NATIVE_CUDA
 #include "matmul_rows.h"
 #include "engine/backends/cuda/native/graph.h"
 #endif
+#include <algorithm>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
@@ -45,36 +51,30 @@ namespace tyloi::cuda {
 namespace {
 
 struct GraphCheckpoint {
-    std::vector<::tyloi::DenseTensor> gdn_conv, gdn_state, ple_conv;
+    std::vector<::tyloi::Tensor> gdn_conv, gdn_state;
+    std::vector<::tyloi::DenseTensor> ple_conv;
 };
 
-GatedResidual::Result graph_attention(const qwen4_exp::Layer& weights, qwen4_exp::LayerState& state,
+tyloi::ops::Residual::Result graph_attention(const qwen4_exp::Layer& weights, qwen4_exp::LayerState& state,
         ::tyloi::DenseTensor x, const ::tyloi::DenseTensor& ids, const ::tyloi::DenseTensor& positions,
         const ::tyloi::DenseTensor& cache_positions, const ::tyloi::DenseTensor& ple_rows, int layer,
         int64_t confirmed = 0, GraphCheckpoint* checkpoint = nullptr,
-        const std::optional<GatedResidual::Result>& pending_residual = {}) {
+        const std::optional<tyloi::ops::Residual::Result>& pending_residual = {}) {
     if(auto* window=DecodeWindow::recording())window->set_profile_layer_kind(layer,weights.gdn?"gdn":"qsa");
     const auto mark=[&](const char* phase){if(auto* window=DecodeWindow::recording())window->mark(layer,phase);};
-    const bool detailed=::tyloi::cuda::options::mhc_timings();
-    const auto marker=[&](const char* role)->GatedResidualMarker {
-        if(!detailed || !DecodeWindow::recording())return {};
-        return [&,role](const char* phase) {
-            const auto name=std::string(role)+phase;mark(name.c_str());
-        };
-    };
     if(weights.ple)x=x+(confirmed
         ? weights.ple->forward_graph(state.ple, x,ids,ple_rows,confirmed,checkpoint->ple_conv)
         : weights.ple->forward_chunk(state.ple, x,ids,true,{},ple_rows));
     auto [attention_input,attention_residual,attention_gate]=pending_residual
-        ? weights.attention_gr.pre_after(x,pending_residual->residual,pending_residual->gate,marker("attention_mhc_"))
-        : weights.attention_gr.pre(x,marker("attention_mhc_"));
+        ? weights.attention_gr.pre_after(x,pending_residual->residual,pending_residual->gate,tyloi::ops::ResidualRole::attention)
+        : weights.attention_gr.pre(x,tyloi::ops::ResidualRole::attention);
     mark("attention_core_begin");
     auto attention_output=weights.gdn
         ? (confirmed ? weights.gdn->forward_graph(state.gdn, attention_input,confirmed,checkpoint->gdn_conv,checkpoint->gdn_state)
                      : weights.gdn->forward_chunk(state.gdn, attention_input,true))
         : weights.qsa->forward_graph(*state.qsa, attention_input,positions,cache_positions);
     mark("attention_core_end");
-    auto ffn_result=weights.ffn_gr.pre_after(attention_output,attention_residual,attention_gate,marker("ffn_mhc_"));
+    auto ffn_result=weights.ffn_gr.pre_after(attention_output,attention_residual,attention_gate,tyloi::ops::ResidualRole::ffn);
     mark("ffn_pre_end");
     attention_output={};
     return ffn_result;
@@ -82,10 +82,8 @@ GatedResidual::Result graph_attention(const qwen4_exp::Layer& weights, qwen4_exp
 
 } // namespace
 
-static bool streamed_decode_graphs(const CudaExecutionContext& execution) {
-    if(!execution.offload)return true;
-    const auto* option=tyloi::cuda::env_lookup("TYLOINFER_KV_STREAM_GRAPHS");
-    return execution.kv && execution.kv->offload() && (!option || option[0]!='0');
+static bool streamed_decode_graphs() {
+    return tyloi::ops::Qsa::Graph({}, false).eligible();
 }
 static ::tyloi::DenseTensor join_request_outputs(
         const std::vector<::tyloi::DenseTensor>& outputs,int64_t axis) {
@@ -127,180 +125,6 @@ static ::tyloi::DenseTensor append_decode_positions(
 namespace tyloi::cuda::qwen4_exp {
 using Config = tyloi::models::qwen4_exp::Config;
 
-// Preserve router and shared-expert arithmetic while regrouping routed experts.
-static thread_local int64_t qwen_prefill_reference_rows=0;
-struct QwenPrefillReferenceRowsScope {
-    int64_t previous;
-    explicit QwenPrefillReferenceRowsScope(int64_t rows):previous(qwen_prefill_reference_rows) {
-        qwen_prefill_reference_rows=rows;
-    }
-    ~QwenPrefillReferenceRowsScope(){qwen_prefill_reference_rows=previous;}
-};
-template<class Projection>
-static DenseTensor qwen_prefill_preserve_rows(const DenseTensor& source,Projection project) {
-    const auto rows=qwen_prefill_reference_rows;
-    if(rows<=0 || source.size(0)<=rows)return project(source);
-    DenseTensor output;
-    for(int64_t begin=0;begin<source.size(0);begin+=rows) {
-        const auto count=std::min<int64_t>(rows,source.size(0)-begin);
-        auto part=project(source.narrow(0,begin,count));
-        if(!output.defined()) {
-            auto shape=part.sizes().vec();shape[0]=source.size(0);
-            output=::tyloi::cuda::empty(shape,part.options());
-        }
-        output.narrow(0,begin,count).copy_(part);
-    }
-    return output;
-}
-
-// This scope is active only while an entire GDN layer is evaluated. Retain
-// each projection's original token count and therefore its GEMM arithmetic.
-static thread_local int64_t qwen_gdn_prefill_projection_rows=0;
-struct QwenGdnPrefillProjectionRowsScope {
-    int64_t previous;
-    explicit QwenGdnPrefillProjectionRowsScope(int64_t rows):previous(qwen_gdn_prefill_projection_rows) {
-        qwen_gdn_prefill_projection_rows=rows;
-    }
-    ~QwenGdnPrefillProjectionRowsScope(){qwen_gdn_prefill_projection_rows=previous;}
-};
-template<class Project>
-static DenseTensor qwen_gdn_project_rows(const DenseTensor& source,Project project) {
-    const auto rows=qwen_gdn_prefill_projection_rows;
-    if(rows<=0 || source.dim()!=3 || source.size(0)!=1 || source.size(1)<=rows)return project(source);
-#ifdef TYLOINFER_NATIVE_CUDA
-    const auto parallel_option=::tyloi::cuda::options::gdn_prefill_projection_streams();
-    const int streams=parallel_option?*parallel_option:2;
-    const auto tail=source.size(1)%rows;
-    if(streams>0 && (tail==0 || tail>8)) {
-        const tyloi::cuda::MatmulRowsScope gemm_rows(rows,streams);
-        return project(source);
-    }
-#endif
-    DenseTensor output;
-    for(int64_t begin=0;begin<source.size(1);begin+=rows) {
-        const auto count=std::min<int64_t>(rows,source.size(1)-begin);
-        auto part=project(source.narrow(1,begin,count));
-        if(!output.defined()) {
-            auto shape=part.sizes().vec();shape[1]=source.size(1);
-            output=::tyloi::cuda::empty(shape,part.options());
-        }
-        output.narrow(1,begin,count).copy_(part);
-    }
-    return output;
-}
-
-DenseTensor Gdn::project_weight(const ::tyloi::Tensor& weight,const DenseTensor& source) const {
-    return qwen_gdn_project_rows(source,[&](const DenseTensor& input){return ::tyloi::ops::project(input,weight).dense();});
-}
-
-DenseTensor Gdn::project_qkv(const DenseTensor& source) const {
-    if(w_->qkv_count==1)return project_weight(w_->input_projection[0],source);
-    return qwen_gdn_project_rows(source,[&](const DenseTensor& input) {
-        return ::tyloi::cuda::cat({::tyloi::ops::project(input,w_->input_projection[0]).dense(),
-            ::tyloi::ops::project(input,w_->input_projection[1]).dense(),
-            ::tyloi::ops::project(input,w_->input_projection[2]).dense()},-1);
-    });
-}
-
-std::vector<DenseTensor> Gdn::project_inputs(const DenseTensor& source) const {
-    if(!(grouped_projection_ && ::tyloi::ops::grouped(w_->input_projection)))
-        return {project_qkv(source),
-            project_weight(w_->input_projection[w_->qkv_count],source),
-            project_weight(w_->input_projection[w_->qkv_count+1],source),
-            project_weight(w_->input_projection[w_->qkv_count+2],source)};
-    auto* window=tyloi::cuda::DecodeWindow::recording();
-    if(window)window->mark_current("gdn_input_begin");
-    const auto rows=qwen_gdn_prefill_projection_rows;
-    const auto project=[&](const DenseTensor& input) {
-        const auto option=::tyloi::cuda::options::gdn_packed_qkv();
-        const size_t prefix=w_->qkv_count==3 && (!option || *option)?3:1;
-        auto handles=::tyloi::ops::project_group(input,w_->input_projection,prefix);
-        std::vector<DenseTensor> result;
-        for(const auto& handle:handles)result.push_back(handle.dense());
-        if(w_->qkv_count==3 && prefix==1) {
-            TYLOINFER_RUNTIME_CHECK(result.size()==6,"GDN input projection count mismatch");
-            result={::tyloi::cuda::cat({result[0],result[1],result[2]},-1),result[3],result[4],result[5]};
-        }
-        TYLOINFER_RUNTIME_CHECK(result.size()==4,"GDN input projection count mismatch");
-        return result;
-    };
-    std::vector<DenseTensor> output;
-    const auto slice=[&] {
-        for(int64_t begin=0;begin<source.size(1);begin+=rows) {
-            const auto count=std::min<int64_t>(rows,source.size(1)-begin);
-            auto part=project(source.narrow(1,begin,count));
-            if(output.empty())for(const auto& value:part) {
-                auto shape=value.sizes().vec();shape[1]=source.size(1);
-                output.push_back(::tyloi::cuda::empty(shape,value.options()));
-            }
-            TYLOINFER_RUNTIME_CHECK(part.size()==output.size(),"GDN projection count changed across chunks");
-            for(size_t i=0;i<part.size();++i)output[i].narrow(1,begin,count).copy_(part[i]);
-        }
-    };
-    if(rows<=0 || source.dim()!=3 || source.size(0)!=1 || source.size(1)<=rows) {
-        output=project(source);
-    } else {
-#ifdef TYLOINFER_NATIVE_CUDA
-        const auto parallel_option=::tyloi::cuda::options::gdn_prefill_projection_streams();
-        const int streams=parallel_option?*parallel_option:2;
-        const auto tail=source.size(1)%rows;
-        if(streams>0 && (tail==0 || tail>8)) {
-            const tyloi::cuda::MatmulRowsScope gemm_rows(rows,streams);
-            output=project(source);
-        } else {
-            slice();
-        }
-#else
-        slice();
-#endif
-    }
-    if(window)window->mark_current("gdn_input_end");
-    return output;
-}
-
-DenseTensor Gdn::project_output(const DenseTensor& source) const {
-    auto* window=tyloi::cuda::DecodeWindow::recording();
-    if(window)window->mark_current("gdn_output_begin");
-    auto output=project_weight(w_->output,source);
-    if(window)window->mark_current("gdn_output_end");
-    return output;
-}
-
-
-
-Moe::Moe(std::vector<Linear> gate_up, Linear down, Linear router,
-         Linear shared_gate, Linear sg, Linear su, Linear sd, const Config &c)
-    : config(c), gate_up(std::move(gate_up)), down(std::move(down)), router(std::move(router)),
-      shared_gate(std::move(shared_gate)), shared{std::move(sg), std::move(su), std::move(sd)} {
-    TYLOINFER_RUNTIME_CHECK(shared[0] && shared[1] && shared[2] && this->shared_gate,
-        "Qwen shared expert requires projection weights");
-    auto banks = tq_banks(this->gate_up.empty() ? nullptr : this->gate_up.front(),
-        this->gate_up.empty() ? nullptr : this->gate_up.back(), this->down);
-    if (banks.gate || banks.up || banks.down) {
-        TYLOINFER_RUNTIME_CHECK(this->gate_up.size() == 2 && this->down &&
-            banks.gate && banks.up && banks.down,
-            "TQ MoE requires separate Gate, Up and Down banks");
-        tq = true;
-    }
-}
-
-DenseTensor Moe::forward(const DenseTensor &x) const {
-    const auto& c = config;
-    auto source = x.reshape({-1, c.hidden}).to(::tyloi::kFloat16);
-    const auto routing = c.routing();
-    auto selected = moe_topk_cuda(
-        qwen_prefill_preserve_rows(source,[&](const DenseTensor& part) {
-            return tyloi::ops::project(part, router).dense();
-        }).contiguous(),
-        c.topk, routing.activation == tyloi::ops::RouterActivation::sigmoid,
-        routing.activation == tyloi::ops::RouterActivation::sqrt_softplus,
-        routing.normalize, routing.delayed_softmax, mfq_nullopt, 1e-20, routing.scale);
-    return tyloi::ops::moe(source, selected[0], selected[1], gate_up, down, shared,
-                           shared_gate, c.moe_width, qwen_prefill_reference_rows)
-        .dense().reshape(x.sizes());
-}
-
-
 PredictorState::PredictorState(const Predictor& owner)
     : MtpState(owner), positions(owner.layers.size()), lengths(owner.layers.size(),0) {
     for (const auto& layer : owner.layers)
@@ -326,8 +150,8 @@ DenseTensor Predictor::embed(DenseTensor ids) const {
         return ::tyloi::ops::embedding(normalized,embedding);
     }).dense();
 #else
-    return tyloi::cuda::embed(*embedding, std::move(ids), execution->executor().collectives(),
-                           execution->executor().profiler(), primary);
+    return tyloi::cuda::embed(*embedding, std::move(ids), Executor::current().collectives(),
+                           Executor::current().profiler(), primary);
 #endif
 }
 
@@ -338,8 +162,8 @@ DenseTensor Predictor::logits(DenseTensor hidden) const {
     });
     return ::tyloi::ops::softcap(projected,softcap).dense();
 #else
-    return tyloi::cuda::logits(*output, std::move(hidden), execution->executor().projector(execution->executor().mode().ffn, model_parallel_primary_device(execution->config)),
-                            execution->executor().profiler(), softcap);
+    return tyloi::cuda::logits(*output, std::move(hidden), Executor::current().projector(Executor::current().mode().ffn),
+                            Executor::current().profiler(), softcap);
 #endif
 }
 
@@ -418,25 +242,14 @@ std::pair<DenseTensor, DenseTensor> Predictor::evaluate(tyloi::models::MtpState&
     {
         DenseTensor e;
         {
-#ifdef TYLOINFER_NATIVE_CUDA
             e = ::tyloi::ops::project(rms_norm(embeds, embedding_norm.dense() + 1, config.eps),
                                       embedding_fusion).dense();
-#else
-            e = execution->executor().projector(execution->executor().mode().ffn, model_parallel_primary_device(execution->config)).run(*embedding_fusion,
-                                    rms_norm(embeds, embedding_norm + 1, config.eps));
-#endif
         }
         // Release prior-stage tensors before later projections allocate.
         embeds = {};
         DenseTensor streams;
-#ifdef TYLOINFER_NATIVE_CUDA
         streams = ::tyloi::ops::project(rms_norm(hidden, hidden_norm.dense() + 1, config.eps)
-                                           .reshape({b, t, config.streams, config.hidden}),hidden_fusion).dense();
-#else
-        streams = execution->executor().projector(execution->executor().mode().ffn, model_parallel_primary_device(execution->config)).run(*hidden_fusion,
-                                         rms_norm(hidden, hidden_norm + 1, config.eps)
-                                             .reshape({b, t, config.streams, config.hidden}));
-#endif
+                                           .reshape({b, t, config.streams, config.hidden}), hidden_fusion).dense();
         x = (streams + e.unsqueeze(-2)).reshape({b, t, config.streams * config.hidden});
     }
     DenseTensor multi;
@@ -452,15 +265,15 @@ std::pair<DenseTensor, DenseTensor> Predictor::evaluate(tyloi::models::MtpState&
         } else {
             auto [attention_input,attention_residual,attention_gate]=block.attention_gr.pre(x);
             auto attention_output=block.qsa->forward(*request.layer_states[layer]->qsa,attention_input,pos[0],pos[1],cache);
-            x=block.attention_gr.post(attention_output,attention_residual,attention_gate);
+            x=block.attention_gr.post(attention_output,attention_residual,attention_gate).dense();
             attention_output={};
             auto [ffn_input,ffn_residual,ffn_gate]=block.ffn_gr.pre(x);
-            auto ffn_output=block.ffn.forward(ffn_input);
-            multi = block.ffn_gr.post(ffn_output,ffn_residual,ffn_gate);
+            auto ffn_output=tyloi::ops::ffn(block.ffn,ffn_input);
+            multi = block.ffn_gr.post(ffn_output,ffn_residual,ffn_gate).dense();
         }
     }
     x = {};
-    auto result = history_only?DenseTensor{}:final_mixer->pre(multi).mixed;
+    auto result = history_only?DenseTensor{}:final_mixer->pre(multi).mixed.dense();
     if (cache) {
         request.positions[layer] = pos[1];
         request.batch = b;
@@ -617,12 +430,7 @@ namespace {
 }
 ::tyloi::DenseTensor qwen4_finalize_hidden(const qwen4_exp::Model& model, ::tyloi::DenseTensor hidden,
                                            std::int64_t, std::int64_t) {
-    auto* window=DecodeWindow::recording();
-    GatedResidualMarker marker;
-    if(window && ::tyloi::cuda::options::mhc_timings())marker=[window](const char* phase) {
-        window->mark(-1,(std::string("final_mhc_")+phase).c_str());
-    };
-    return model.final_mixer->pre(hidden,marker).mixed;
+    return model.final_mixer->pre(hidden, tyloi::ops::ResidualRole::final).mixed.dense();
 }
 
 ::tyloi::DenseTensor qwen4_next_token(const qwen4_exp::Model& model, ::tyloi::DenseTensor hidden) {
@@ -644,10 +452,7 @@ void qwen4_validate_forward(const qwen4_exp::Model& model, std::int64_t tokens,
 
 ::tyloi::DenseTensor qwen4_forward(const qwen4_exp::Model& model, qwen4_exp::State& state,
                                    tyloi::models::Input input) {
-#ifndef TYLOINFER_NATIVE_CUDA
-    auto scope = model.execution_scope();
-#endif
-    const auto primary = model.execution->config.layer_placement.primary_device();
+    const auto primary = model.primary_device;
     tyloi::models::require_model(bool(input.ids), "Qwen4 forward requires token ids");
     auto ids = model.device_ids(input.ids.dense());
     auto embeddings = input.embeddings
@@ -694,8 +499,8 @@ void qwen4_validate_forward(const qwen4_exp::Model& model, std::int64_t tokens,
                                      current.size(-1) == T,
                                  "Qwen4 positions require [T], [3,T], [4,T], [3,B,T] or [4,B,T]");
     DenseTensor host_ids, cpu_positions;
-    const bool pinned = model.execution->config.cache.pipeline ||
-                        model.execution->config.dense_cpu_layer_count > 0;
+    const bool pinned = state.cache_pipeline ||
+                        std::any_of(model.layers.begin(), model.layers.end(), [](const auto& layer) { return layer->cpu_offloaded; });
     if (pinned) {
         host_ids = ids.to(::tyloi::kCPU, ::tyloi::kInt64).contiguous();
         cpu_positions = current.to(::tyloi::kCPU, ::tyloi::kInt64).contiguous();
@@ -858,7 +663,7 @@ struct Qwen4DecodeGraph {
     // window. Their snapshots can share stable allocations across graph shapes.
     std::vector<GraphCheckpoint> shared_checkpoints;
     qwen4_exp::State& request;
-    std::vector<std::pair<qwen4_exp::Qsa*,qwen4_exp::Qsa::State*>> qsa;
+    std::vector<std::pair<const tyloi::ops::Qsa*,tyloi::ops::Qsa::State*>> qsa;
     ::tyloi::DenseTensor position_storage;
     int64_t kv_capacity=0;
     bool failed=false;
@@ -893,28 +698,16 @@ struct Qwen4DecodeGraph {
         // a complete set of layer buffers for each output representation.
         const int result_kind=kind;
         if(tokens==1 && kind>=1 && kind<=4)kind=4;
-        model.execution->weights.retire_prefill();
-        const auto required=request.cache_pos+tokens;
-        TYLOINFER_RUNTIME_CHECK(required<=model.max_position_embeddings(),"Qwen4 graph exceeds context capacity");
-        if(!qsa.empty() && qsa.front().first->graph_capacity(*qsa.front().second)) {
-            model.execution->kv->ensure(required);
-            kv_capacity=qsa.front().first->graph_capacity(*qsa.front().second);
-        }
-        if(required>kv_capacity) {
-            model.execution->weights.finish_exchange();
+        request.weights->retire_prefill();
+        tyloi::ops::Qsa::Graph graph({{qsa, request.cache_pos, model.max_position_embeddings(),
+                                      request.decode_reserve_until}}, false);
+        graph.admit(tokens, kv_capacity, raw_hidden != nullptr);
+        if (graph.clear_required()) {
+            request.weights->finish_exchange();
             restore_legacy();
-            // Small growing chunks preserve dynamic KV allocation without
-            // recapturing all MTP batch shapes at every few decode tokens.
-            const int64_t chunk=raw_hidden?2048:256;
-            kv_capacity=std::min<int64_t>(model.max_position_embeddings(),std::max<int64_t>(chunk,kv_capacity));
-            const auto planned=std::max(required,request.decode_reserve_until);
-            while(kv_capacity<planned)
-                kv_capacity=std::min(model.max_position_embeddings(),kv_capacity>model.max_position_embeddings()/2
-                    ? model.max_position_embeddings() : kv_capacity*2);
-            if(const auto* trace=tyloi::cuda::env_lookup("TYLOINFER_RUNTIME_TRACE_CUDA_GRAPH");trace && trace[0]=='1')
-                std::cerr<<"runtime_qwen4_graph_capacity position="<<request.cache_pos
-                    <<" required="<<required<<" planned="<<planned<<" capacity="<<kv_capacity<<'\n';
+            graph.layout();
         }
+        kv_capacity = graph.rows().front().capacity;
         auto& owner=cells[{tokens,kind,confirmed}];
         if(!owner)owner=std::make_unique<Cell>(tokens,model.config.hidden,model.layers,request.layers,stream.stream(),confirmed,shared_checkpoints);
         owner->window.set_profile_geometry(raw_hidden?"mtp_target":"target_decode",tokens);
@@ -939,14 +732,14 @@ struct Qwen4DecodeGraph {
             const auto* early_ple=tyloi::cuda::env_lookup("TYLOINFER_PLE_EARLY_ISSUE");
             if(!early_ple || early_ple[0]!='0')
                 for(const auto& stage:cell.ple)stage->ple->prefetch_tokens(*stage->state,cell.host_ids);
-            model.execution->weights.finish_exchange();
+            request.weights->finish_exchange();
             // Prefix restoration and eager prefill update the same KV/index
             // storage; refresh pooled keys even when this graph is already valid.
-            for(auto [attention,state]:qsa)attention->prepare_graph(*state,request.positions ? request.positions.dense() : DenseTensor{},kv_capacity);
+            graph.prepare(0, request.positions);
             if(!cell.window.valid()) {
-                model.execution->weights.prepare_graph(::tyloi::Device{::tyloi::kCUDA,mfq_current_cuda_device()});
+                request.weights->prepare_graph(::tyloi::Device{::tyloi::kCUDA,mfq_current_cuda_device()});
                 DecodeGraphBranchScope branch_scope(
-                    model.execution->executor().mode().ffn.serial);
+                    Executor::current().mode().ffn.serial);
                 const auto capture_started=std::chrono::steady_clock::now();
                 struct Saved {::tyloi::Tensor* target;::tyloi::DenseTensor saved;const void* address;};
                 std::vector<Saved> states;
@@ -964,7 +757,7 @@ struct Qwen4DecodeGraph {
                     cell.window.mark(-1,"window_begin");
                     auto hidden=model.repeat_hidden(model.embed_tokens(cell.ids),model.metadata.hc_mult);
                     std::size_t ple_index=0;int layer=0;
-                    std::optional<GatedResidual::Result> pending_residual;
+                    std::optional<tyloi::ops::Residual::Result> pending_residual;
                     const auto chain_setting=::tyloi::cuda::options::gr_chain_ffn_post();
                     const bool chain_post=(!chain_setting || *chain_setting) && tokens<=8;
                     for(const auto& block:model.layers) {
@@ -1005,22 +798,22 @@ struct Qwen4DecodeGraph {
                             cell.window.mark(layer,"ple_end");
                         }
                         cell.window.mark(layer,"attention_begin");
-                        std::optional<GatedResidual::Result> next_residual;
+                        std::optional<tyloi::ops::Residual::Result> next_residual;
                         bool defer=false;
                         if(chain_post && size_t(layer+1)<model.layers.size()) {
                             auto& next=*model.layers[layer+1];
-                            defer=!next.ple && next.attention_gr.can_fuse(pending_residual?pending_residual->residual:hidden);
+                            defer=!next.ple && next.attention_gr.can_chain(pending_residual?pending_residual->residual:hidden);
                         }
                         {
                             auto& layer_state=*request.layers[layer];
                             auto ffn_result=graph_attention(b,layer_state,std::move(hidden),cell.ids,cell.positions,
                                 cell.cache_positions,rows,layer,confirmed,confirmed?&cell.checkpoints[layer]:nullptr,pending_residual);
                             const auto& ffn_input=ffn_result.mixed;
-                            auto ffn_output=b.ffn.forward(ffn_input);
+                            auto ffn_output=tyloi::ops::ffn(b.ffn,ffn_input).dense();
                             if(defer) {
                                 next_residual=std::move(ffn_result);
                                 hidden=std::move(ffn_output);
-                            } else hidden=b.ffn_gr.post(ffn_output,ffn_result.residual,ffn_result.gate);
+                            } else hidden=b.ffn_gr.post(ffn_output,ffn_result.residual,ffn_result.gate).dense();
                         }
                         pending_residual=std::move(next_residual);
                         cell.window.mark(layer++,"block_end");
@@ -1096,8 +889,8 @@ struct Qwen4DecodeGraph {
 std::optional<::tyloi::Tensor> qwen4_decode_graph_logits(qwen4_exp::Model& model,qwen4_exp::State& state,::tyloi::Tensor ids_handle,int kind,
         const ::tyloi::Tensor& host_ids) {
     auto ids = ids_handle.dense();
-    if (!streamed_decode_graphs(*model.execution)) return {};
-    const auto decode=model.execution->weights.decode();
+    if (!state.weights || !streamed_decode_graphs()) return {};
+    const auto decode=state.weights->decode();
     const bool tq=decode==::tyloi::weights::Cache::Decode::routed;
     if(decode==::tyloi::weights::Cache::Decode::none ||
             state.cache_pos==0 || state.speculative_start>=0)return {};
@@ -1107,7 +900,7 @@ std::optional<::tyloi::Tensor> qwen4_decode_graph_logits(qwen4_exp::Model& model
         if(!tq_graph_supports_tokens(ids.size(1)))return {};
         for(const auto& block:model.layers) {
             const auto& b=*block;
-            if(!b.ffn.tq || (b.ple && !b.ple->graph_supported()))return {};
+            if(!b.ffn.qwen_tq || (b.ple && !b.ple->graph_supported()))return {};
         }
     }
     TYLOINFER_RUNTIME_CHECK(state.cache_pos+ids.size(1)<=model.max_position_embeddings(),"MFQ window exceeds context");
@@ -1162,9 +955,10 @@ std::optional<::tyloi::Tensor> qwen4_decode_graph_hidden(
         std::vector<int32_t>* greedy_tokens,bool compact_sampling) {
     auto ids = ids_handle.dense();
     if(initialized)*initialized=false;
-    const auto decode=model.execution->weights.decode();
+    if (!state.weights) return {};
+    const auto decode=state.weights->decode();
     const bool tq=decode==::tyloi::weights::Cache::Decode::routed;
-    if(!streamed_decode_graphs(*model.execution) ||
+    if(!streamed_decode_graphs() ||
             decode==::tyloi::weights::Cache::Decode::none ||
             state.speculative_start>=0)return {};
     // Retained windows own initialized, reset recurrent/KV storage. The
@@ -1177,7 +971,7 @@ std::optional<::tyloi::Tensor> qwen4_decode_graph_hidden(
     if(tq && !tq_graph_supports_tokens(ids.size(1)))return {};
     for(const auto& block:model.layers) {
         const auto& b=*block;
-        if(!b.ffn.tq || (b.ple && !b.ple->graph_supported()))return {};
+        if(!b.ffn.qwen_tq || (b.ple && !b.ple->graph_supported()))return {};
     }
     TYLOINFER_RUNTIME_CHECK(state.cache_pos+ids.size(1)<=model.max_position_embeddings(),"MFQ window exceeds context");
     if(!state.graph_registry)state.graph_registry=std::make_unique<Qwen4DecodeGraph>(model,state);
@@ -1191,8 +985,8 @@ std::optional<::tyloi::Tensor> qwen4_decode_graph_hidden(
     return ::tyloi::Tensor(std::move(result));
 }
 
-void qwen4_release_decode_graphs(qwen4_exp::Model& model,qwen4_exp::State& state) {
-    model.execution->weights.finish_exchange();
+void qwen4_release_decode_graphs(const qwen4_exp::Model& model,qwen4_exp::State& state) {
+    if (state.weights) state.weights->finish_exchange();
     if(state.graph_registry)state.graph_registry->restore_legacy();
     state.graph_registry.reset();
     for(auto& layer:state.layers)layer->retain_graph_storage=false;
@@ -1201,28 +995,26 @@ void qwen4_release_decode_graphs(qwen4_exp::Model& model,qwen4_exp::State& state
 void qwen4_warmup_decode_graphs(qwen4_exp::Model& model,qwen4_exp::State& state) {
     const auto* reuse=tyloi::cuda::env_lookup("TYLOINFER_QWEN4_REUSE_GRAPHS");
     state.reuse_decode_graphs=!reuse || reuse[0]!='0';
-    const auto decode=model.execution->weights.decode();
+    if (!state.weights) return;
+    const auto decode=state.weights->decode();
     const bool tq=decode==::tyloi::weights::Cache::Decode::routed;
     const auto* warmup=tyloi::cuda::env_lookup("TYLOINFER_QWEN4_WARMUP_GRAPHS");
     if(!state.reuse_decode_graphs || (warmup && warmup[0]=='0') ||
-        model.max_position_embeddings()<32 || !streamed_decode_graphs(*model.execution) ||
+        model.max_position_embeddings()<32 || !streamed_decode_graphs() ||
         decode==::tyloi::weights::Cache::Decode::none)return;
     for(std::size_t i=0;i<model.layers.size();++i) {
         const auto& b=*model.layers[i];
-        if(!b.ffn.tq || (b.qsa && !b.qsa->graph_capacity(*state.layers[i]->qsa)) || (b.ple && !b.ple->graph_supported()))return;
+        if(!b.ffn.qwen_tq || (b.qsa && !b.qsa->graph_capacity(*state.layers[i]->qsa)) || (b.ple && !b.ple->graph_supported()))return;
     }
     // Startup state contains synthetic tokens and is discarded before serving.
     // Saving every recurrent state during each capture needlessly doubles its
     // transient footprint. Request-time captures still restore their real state.
-    tyloi::weights::Cache::Warmup cache_warmup(model.execution->weights, true);
+    tyloi::weights::Cache::Warmup cache_warmup(*state.weights, true);
     struct StartupWarmup {
         StartupWarmup(){Qwen4DecodeGraph::startup_warmup=true;}
         ~StartupWarmup(){Qwen4DecodeGraph::startup_warmup=false;}
     } startup_scope;
     const auto start=std::chrono::steady_clock::now();
-#ifndef TYLOINFER_NATIVE_CUDA
-    auto scope=model.execution_scope();
-#endif
     const auto options=::tyloi::TensorOptions().device(::tyloi::kCUDA).dtype(::tyloi::kInt64);
     // Diverse synthetic IDs exercise more routed experts than sixteen copies
     // of one token. Only loading uses these rows; all request state is reset.
@@ -1246,7 +1038,7 @@ void qwen4_warmup_decode_graphs(qwen4_exp::Model& model,qwen4_exp::State& state)
     }
     // Bootstrap cells are not the retained whole-model windows. Retire their
     // staging and captured scratch before preparing target windows.
-    cache_warmup.release(tyloi::Device(tyloi::kCUDA, model.execution->config.layer_placement.primary_device()), true);
+    cache_warmup.release(tyloi::Device(tyloi::kCUDA, model.primary_device), true);
     if(tyloi::cuda::env_lookup("TYLOINFER_TRACE_RESIDENCY_MEMORY"))std::cerr<<"warmup_memory phase=target\n";
     (void)qwen4_decode_graph_logits(model,state,ids.narrow(1,0,1),2);
     (void)qwen4_decode_graph_logits(model,state,ids.narrow(1,0,1),1);
@@ -1254,7 +1046,7 @@ void qwen4_warmup_decode_graphs(qwen4_exp::Model& model,qwen4_exp::State& state)
     TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(mfq_current_cuda_stream()));
     std::cerr<<"runtime_qwen4_graph_warmup target_captures="<<state.decode_graph_captures<<" ms="
         <<std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count()<<'\n';
-    cache_warmup.release(tyloi::Device(tyloi::kCUDA, model.execution->config.layer_placement.primary_device()), false);
+    cache_warmup.release(tyloi::Device(tyloi::kCUDA, model.primary_device), false);
 }
 
 std::vector<std::pair<std::string,double>> qwen4_cache_memory_metrics(
@@ -1275,7 +1067,7 @@ std::vector<std::pair<std::string,double>> qwen4_cache_memory_metrics(
     };
 #endif
     const auto block_cache=[&](const qwen4_exp::Layer& block,const qwen4_exp::LayerState& layer) {
-        if(block.qsa)for(const auto& tensor:block.qsa->resident_cache_tensors(*layer.qsa))add(tensor);
+        if(block.qsa)for(const auto& tensor:block.qsa->resident_cache_tensors(*layer.qsa))add(tensor.dense());
         if(block.gdn) { add(layer.gdn.conv.dense()); add(layer.gdn.recurrent.dense()); }
         if(block.ple && layer.ple.conv.defined())add(layer.ple.conv.dense());
     };
@@ -1284,8 +1076,8 @@ std::vector<std::pair<std::string,double>> qwen4_cache_memory_metrics(
     if(state.graph_registry)add(state.graph_registry->position_storage);
     if(state.graph_registry)for(const auto& [key,cell]:state.graph_registry->cells)
         for(const auto& checkpoint:cell->checkpoints) {
-            for(const auto& tensor:checkpoint.gdn_conv)add(tensor);
-            for(const auto& tensor:checkpoint.gdn_state)add(tensor);
+            for(const auto& tensor:checkpoint.gdn_conv)add(tensor.dense());
+            for(const auto& tensor:checkpoint.gdn_state)add(tensor.dense());
             for(const auto& tensor:checkpoint.ple_conv)add(tensor);
         }
     if(const auto* predictor=dynamic_cast<const qwen4_exp::Predictor*>(mtp); predictor && state.predictor && state.predictor->belongs_to(*predictor)) {
@@ -1321,15 +1113,15 @@ namespace tyloi::cuda {
 Model::Model(Model&&) noexcept = default;
 Model& Model::operator=(Model&&) noexcept = default;
 
-static ::tyloi::DenseTensor batch_ffn(const qwen4_exp::Moe& ffn,CudaExecutionContext& execution,
+static ::tyloi::DenseTensor batch_ffn(const tyloi::ops::FfnWeights& ffn,
                                       const ::tyloi::DenseTensor& input) {
-    if(input.size(0)<=8)return ffn.forward(input);
+    if(input.size(0)<=8)return tyloi::ops::ffn(ffn,input).dense();
     const auto option=::tyloi::cuda::options::continuous_ffn_tile();
     const int64_t rows=option?*option:8;
     TYLOINFER_RUNTIME_CHECK(rows==8 || rows==16,"continuous FFN tile must be 8 or 16 rows");
     auto* window=DecodeWindow::recording();
     const int previous_profile_tile=window ? window->set_profile_tile(-1) : -1;
-    auto& mode = execution.executor().mode().ffn;
+    auto& mode = Executor::current().mode().ffn;
     struct TileScope {
         tyloi::cuda::FfnMode& mode;
         int tile,tiles;
@@ -1349,7 +1141,7 @@ static ::tyloi::DenseTensor batch_ffn(const qwen4_exp::Moe& ffn,CudaExecutionCon
         tile_mode.tiles=mode.tiles;
         auto tile_scope=Executor::current().enter(tile_mode);
 #endif
-        outputs.push_back(ffn.forward(input.narrow(0,start,std::min(rows,input.size(0)-start))));
+        outputs.push_back(tyloi::ops::ffn(ffn,input.narrow(0,start,std::min(rows,input.size(0)-start))).dense());
     }
     return ::tyloi::cuda::cat(outputs,0);
 }
@@ -1374,7 +1166,7 @@ struct Qwen4BatchRequestState::Impl {
 
 Qwen4BatchRequestState::Qwen4BatchRequestState(qwen4_exp::Model& model)
     : state_(std::make_unique<Impl>(model)) {
-    const auto primary = model.execution->config.layer_placement.primary_device();
+    const auto primary = model.primary_device;
     for (const auto& block : model.layers) {
         TYLOINFER_RUNTIME_CHECK(!block->cpu_offloaded && block->cuda_device == primary,
                           "Flash-Next continuous batching requires one CUDA device");
@@ -1414,7 +1206,7 @@ std::size_t Qwen4BatchRequestState::resident_bytes() const {
     for (std::size_t i = 0; i < state_->layers.size(); ++i) {
         const auto& weights = *state_->model.layers[i];
         const auto& state = *state_->layers[i];
-        if (weights.qsa) for (const auto& tensor : weights.qsa->resident_cache_tensors(*state.qsa)) add(tensor);
+        if (weights.qsa) for (const auto& tensor : weights.qsa->resident_cache_tensors(*state.qsa)) add(tensor.dense());
         if (weights.gdn) { add(state.gdn.conv.dense()); add(state.gdn.recurrent.dense()); }
         if (weights.ple && state.ple.conv.defined()) add(state.ple.conv.dense());
     }
@@ -1425,6 +1217,7 @@ std::size_t Qwen4BatchRequestState::resident_bytes() const {
 struct Qwen4BatchDecodeGraph::Impl {
     using DenseTensor = ::tyloi::DenseTensor;
     qwen4_exp::Model& model;
+    tyloi::weights::Cache& weights;
     MfqCudaStream stream;
     Event ready;
     std::unique_ptr<Graph> memory_pool;
@@ -1437,10 +1230,11 @@ struct Qwen4BatchDecodeGraph::Impl {
     DenseTensor ids, logits;
     bool greedy = false;
     int64_t captures = 0, replays = 0;
-    explicit Impl(qwen4_exp::Model& owner) : model(owner), stream(mfq_get_current_cuda_stream()) {}
+    Impl(qwen4_exp::Model& owner, tyloi::weights::Cache& cache)
+        : model(owner), weights(cache), stream(mfq_get_current_cuda_stream()) {}
     void clear() {
         if (requests.empty() && !window) return;
-        model.execution->weights.finish_exchange();
+        weights.finish_exchange();
         window.reset();
         memory_pool.reset();
         for (auto* request : requests) {
@@ -1454,8 +1248,8 @@ struct Qwen4BatchDecodeGraph::Impl {
         ids = {}; logits = {};
     }
 };
-Qwen4BatchDecodeGraph::Qwen4BatchDecodeGraph(qwen4_exp::Model& model)
-    : graph_(std::make_unique<Impl>(model)) {}
+Qwen4BatchDecodeGraph::Qwen4BatchDecodeGraph(qwen4_exp::Model& model, tyloi::weights::Cache& weights)
+    : graph_(std::make_unique<Impl>(model, weights)) {}
 Qwen4BatchDecodeGraph::~Qwen4BatchDecodeGraph() = default;
 void Qwen4BatchDecodeGraph::clear() { graph_->clear(); }
 int64_t Qwen4BatchDecodeGraph::captures() const { return graph_->captures; }
@@ -1464,7 +1258,18 @@ std::optional<Qwen4BatchDecodeGraph::Plan> Qwen4BatchDecodeGraph::plan(
         const std::vector<Qwen4BatchRequestState*>& requests, bool greedy) {
     auto& graph = *graph_;
     auto& model = graph.model;
-    if (model.execution->offload || !mfq_cuda_graph_capture_supported()) return {};
+    std::vector<tyloi::ops::Qsa::Graph::Request> rows;
+    for (auto* request : requests) {
+        tyloi::ops::Qsa::Graph::Request row;
+        row.position = request->position();
+        row.maximum = model.max_position_embeddings();
+        for (std::size_t i = 0; i < model.layers.size(); ++i)
+            if (model.layers[i]->qsa)
+                row.layers.emplace_back(model.layers[i]->qsa.get(), request->state_->layers[i]->qsa.get());
+        rows.push_back(std::move(row));
+    }
+    tyloi::ops::Qsa::Graph attention(std::move(rows), true);
+    if (!attention.eligible()) return {};
     for (auto* request : requests) {
         for (std::size_t i = 0; i < request->state_->layers.size(); ++i) {
             const auto& weights = *model.layers[i];
@@ -1474,13 +1279,9 @@ std::optional<Qwen4BatchDecodeGraph::Plan> Qwen4BatchDecodeGraph::plan(
     // Whole-layer prefill snapshots the GPU/RAM expert maps. Adaptive decode
     // can exchange those experts, so retire the snapshots before replay just
     // as the single-request window does.
-    model.execution->weights.retire_prefill();
+    graph.weights.retire_prefill();
     const auto batch = static_cast<int64_t>(requests.size());
-    if(model.execution->kv) {
-        int64_t required=0;
-        for(auto* request:requests)required=std::max(required,request->position()+1);
-        model.execution->kv->ensure(required);
-    }
+    attention.admit();
     graph.ready.record(mfq_get_current_cuda_stream());
     MfqCudaStreamGuard stream_guard(graph.stream);
     TYLOINFER_CUDA_CHECK(cudaStreamWaitEvent(graph.stream.stream(),graph.ready.get(),0));
@@ -1491,39 +1292,19 @@ std::optional<Qwen4BatchDecodeGraph::Plan> Qwen4BatchDecodeGraph::plan(
         graph.clear();
         // Prefill and previous widths leave asynchronously freed pool pages
         // charged to WDDM. Retire transfers and trim before preparing a graph.
-        model.execution->weights.finish_exchange();
-        default_context(model.execution->config.layer_placement.primary_device())->reclaim_idle_memory();
+        graph.weights.finish_exchange();
+        default_context(model.primary_device)->reclaim_idle_memory();
     }
     Plan plan;
     plan.rebuild = !graph.window;
     if (plan.rebuild) {
-        for (auto* request : requests) {
-            const auto maximum = model.max_position_embeddings();
-            const auto required = request->position() + 1;
-            TYLOINFER_RUNTIME_CHECK(required <= maximum,"Flash-Next batch graph exceeds max_context");
-            // Keep the initial capture interval. Large independent batches
-            // subsequently grow by 128 tokens instead of doubling every
-            // request's KV allocation at once under a tight device budget.
-            int64_t capacity = std::min<int64_t>(batch>8 ?
-                ::tyloi::cuda::options::continuous_batch_kv_initial_capacity() : 256,maximum);
-            if(batch>16 && capacity<required) {
-                const auto chunks=1+(required-1)/128;
-                capacity=chunks>maximum/128?maximum:chunks*128;
-            } else while (capacity < required)
-                capacity = std::min(maximum,capacity > maximum/2 ? maximum : capacity*2);
-            for (std::size_t i = 0; i < request->state_->layers.size(); ++i) {
-                const auto& weights = *model.layers[i];
-                const auto& state = *request->state_->layers[i];
-                if (weights.qsa && weights.qsa->graph_capacity(*state.qsa))
-                    capacity = weights.qsa->graph_capacity(*state.qsa);
-            }
-            plan.capacities.push_back(capacity);
-            for (std::size_t i = 0; i < request->state_->layers.size(); ++i) {
-                const auto& weights = *model.layers[i];
-                const auto& state = *request->state_->layers[i];
-                if (weights.qsa) plan.growth += weights.qsa->graph_growth_bytes(*state.qsa,capacity);
-                if (weights.gdn) plan.growth += weights.gdn->request_cache_growth_bytes(state.gdn);
-            }
+        attention.layout();
+        for (std::size_t row = 0; row < requests.size(); ++row) {
+            plan.capacities.push_back(attention.rows()[row].capacity);
+            plan.growth += attention.rows()[row].growth;
+            for (std::size_t i = 0; i < model.layers.size(); ++i)
+                if (model.layers[i]->gdn)
+                    plan.growth += model.layers[i]->gdn->request_cache_growth_bytes(requests[row]->state_->layers[i]->gdn);
         }
     }
     return plan;
@@ -1562,17 +1343,17 @@ std::optional<::tyloi::Tensor> Qwen4BatchDecodeGraph::run(
         graph.gdn_addresses.resize(model.layers.size());
         if(batch>1 && ::tyloi::cuda::options::batch_attention_projections() && ::tyloi::cuda::options::gdn_independent_batch())
             for(std::size_t i=0;i<model.layers.size();++i) {
-                std::vector<std::pair<const qwen4_exp::Gdn*,qwen4_exp::Gdn::State*>> rows;
+                std::vector<std::pair<const tyloi::ops::Gdn*,tyloi::ops::Gdn::State*>> rows;
                 for(auto* request:requests) {
                     const auto& weights = *model.layers[i];
                     auto& state = *request->state_->layers[i];
                     if(weights.gdn) rows.emplace_back(weights.gdn.get(),&state.gdn);
                 }
-                if(rows.size()==requests.size())graph.gdn_addresses[i]=qwen4_exp::Gdn::prepare_independent_batch(rows);
+                if(rows.size()==requests.size())graph.gdn_addresses[i]=tyloi::ops::Gdn::prepare_independent_batch(rows).dense();
             }
         // Cached MFE owns its graph pool and initializes it during preparation.
         // Dense fixtures need a pool owned by this decoder instead.
-        if (!model.execution->weights.prepare_graph(::tyloi::Device{::tyloi::kCUDA,mfq_current_cuda_device()})) {
+        if (!graph.weights.prepare_graph(::tyloi::Device{::tyloi::kCUDA,mfq_current_cuda_device()})) {
             graph.memory_pool = std::make_unique<Graph>();
             graph.memory_pool->prepare_memory();
             default_context(mfq_current_cuda_device())->end_graph_warmup(mfq_current_cuda_stream());
@@ -1614,24 +1395,17 @@ std::optional<::tyloi::Tensor> Qwen4BatchDecodeGraph::run(
                     save(tensor);
             }
         }
-        DecodeGraphBranchScope branch_scope(model.execution->executor().mode().ffn.serial);
+        DecodeGraphBranchScope branch_scope(Executor::current().mode().ffn.serial);
         try { graph.window->capture([&] {
-            auto& execution = *model.execution;
             graph.window->mark(-1,"window_begin");
             auto hidden = model.repeat_hidden(model.embed_tokens(graph.ids),model.metadata.hc_mult);
-            std::optional<GatedResidual::Result> pending_residual;
+            std::optional<tyloi::ops::Residual::Result> pending_residual;
             const auto chain_setting=::tyloi::cuda::options::gr_chain_ffn_post();
             const bool chain_post=(!chain_setting || *chain_setting) && batch<=8;
             for (std::size_t i = 0; i < model.layers.size(); ++i) {
                 graph.window->mark(static_cast<int>(i),"block_begin");
                 const auto& block = *model.layers[i];
                 graph.window->set_profile_layer_kind(static_cast<int>(i),block.gdn?"gdn":"qsa");
-                const auto marker=[&](const char* role)->GatedResidualMarker {
-                    if(!::tyloi::cuda::options::mhc_timings())return {};
-                    return [&,role](const char* phase) {
-                        graph.window->mark(static_cast<int>(i),(std::string(role)+phase).c_str());
-                    };
-                };
                 if (block.ple) {
                     graph.window->mark(static_cast<int>(i),"ple_begin");
                     std::vector<::tyloi::DenseTensor> positional;
@@ -1647,39 +1421,39 @@ std::optional<::tyloi::Tensor> Qwen4BatchDecodeGraph::run(
                     graph.window->mark(static_cast<int>(i),"ple_end");
                 }
                 auto mix = pending_residual
-                    ? block.attention_gr.pre_after(hidden,pending_residual->residual,pending_residual->gate,marker("attention_mhc_"))
-                    : block.attention_gr.pre(hidden,marker("attention_mhc_"));
+                    ? block.attention_gr.pre_after(hidden,pending_residual->residual,pending_residual->gate,tyloi::ops::ResidualRole::attention)
+                    : block.attention_gr.pre(hidden,tyloi::ops::ResidualRole::attention);
                 graph.window->mark(static_cast<int>(i),"attention_core_begin");
                 const bool project_batch=batch>1 && ::tyloi::cuda::options::batch_attention_projections();
                 const auto projections=project_batch ? (block.gdn ? block.gdn->project_inputs(mix.mixed)
-                    : block.qsa->project_inputs(mix.mixed)) : std::vector<::tyloi::DenseTensor>{};
+                    : block.qsa->project_inputs(mix.mixed)) : std::vector<::tyloi::Tensor>{};
                 std::vector<::tyloi::DenseTensor> attended;
                 DenseTensor attention;
                 if(project_batch && block.gdn && graph.gdn_addresses[i].defined())
-                    attention=block.gdn->forward_independent_batch(requests[0]->state_->layers[i]->gdn,mix.mixed,projections,graph.gdn_addresses[i]);
+                    attention=block.gdn->forward_independent_batch(requests[0]->state_->layers[i]->gdn,mix.mixed,projections,graph.gdn_addresses[i]).dense();
                 if(!attention.defined())for (int64_t row = 0; row < batch; ++row) {
                     auto& layer = *requests[row]->state_->layers[i];
-                    auto attention_input = mix.mixed.narrow(0,row,1);
-                    std::vector<::tyloi::DenseTensor> projected;
-                    for(const auto& value:projections)projected.push_back(value.narrow(0,row,1));
-                    attended.push_back(block.gdn ? block.gdn->forward_chunk(layer.gdn,attention_input,true,std::move(projected),!project_batch)
+                    auto attention_input = mix.mixed.dense().narrow(0,row,1);
+                    std::vector<::tyloi::Tensor> projected;
+                    for(const auto& value:projections)projected.push_back(value.dense().narrow(0,row,1));
+                    attended.push_back((block.gdn ? block.gdn->forward_chunk(layer.gdn,attention_input,true,std::move(projected),!project_batch)
                         : block.qsa->forward_graph(*layer.qsa,attention_input,graph.positions[row],graph.cache_positions[row],
-                            std::move(projected),!project_batch));
+                            std::move(projected),!project_batch)).dense());
                 }
                 if(!attention.defined())attention=join_request_outputs(attended,0);
-                if(project_batch)attention=block.gdn ? block.gdn->project_output(attention)
-                    : block.qsa->project_output(attention);
+                if(project_batch)attention=(block.gdn ? block.gdn->project_output(attention)
+                    : block.qsa->project_output(attention)).dense();
                 graph.window->mark(static_cast<int>(i),"attention_core_end");
-                auto ffn_mix = block.ffn_gr.pre_after(std::move(attention),mix.residual,mix.gate,marker("ffn_mhc_"));
+                auto ffn_mix = block.ffn_gr.pre_after(std::move(attention),mix.residual,mix.gate,tyloi::ops::ResidualRole::ffn);
                 graph.window->mark(static_cast<int>(i),"ffn_pre_end");
-                auto ffn_output=batch_ffn(block.ffn,execution,ffn_mix.mixed);
+                auto ffn_output=batch_ffn(block.ffn,ffn_mix.mixed.dense());
                 bool defer=false;
                 if(chain_post && i+1<model.layers.size()) {
                     const auto& next=*model.layers[i+1];
-                    defer=!next.ple && next.attention_gr.can_fuse(ffn_mix.residual);
+                    defer=!next.ple && next.attention_gr.can_chain(ffn_mix.residual);
                 }
                 if(defer){hidden=std::move(ffn_output);pending_residual=std::move(ffn_mix);}
-                else {hidden=block.ffn_gr.post(ffn_output,ffn_mix.residual,ffn_mix.gate);pending_residual.reset();}
+                else {hidden=block.ffn_gr.post(ffn_output,ffn_mix.residual,ffn_mix.gate).dense();pending_residual.reset();}
                 graph.window->mark(static_cast<int>(i),"block_end");
             }
             auto finalized=qwen4_finalize_hidden(model, std::move(hidden),batch,1);
@@ -1719,12 +1493,11 @@ std::optional<::tyloi::Tensor> Qwen4BatchDecodeGraph::run(
 
 std::vector<::tyloi::Tensor> qwen4_batch_prefill(qwen4_exp::Model& model,
         const std::vector<Qwen4BatchRequestState*>& requests,
-        const std::vector<::tyloi::Tensor>& chunk_handles) {
+        const std::vector<::tyloi::Tensor>& chunk_handles, bool cache_pipeline) {
     std::vector<::tyloi::DenseTensor> chunks;
     chunks.reserve(chunk_handles.size());
     for (const auto& chunk : chunk_handles) chunks.push_back(chunk.dense());
     TYLOINFER_RUNTIME_CHECK(!requests.empty() && requests.size()==chunks.size(),"invalid packed prefill rows");
-    auto& execution = *model.execution;
     const bool packed=requests.size()>1;
     std::vector<int64_t> offsets{0};
     std::vector<::tyloi::DenseTensor> current,full;
@@ -1741,7 +1514,7 @@ std::vector<::tyloi::Tensor> qwen4_batch_prefill(qwen4_exp::Model& model,
     auto ids=::tyloi::cuda::cat(chunks,1);
     auto host_ids=ids.to(::tyloi::kCPU);
     const auto tokens=offsets.back();
-    if(!packed && execution.config.cache.pipeline) {
+    if(!packed && cache_pipeline) {
         for(std::size_t row=0;row<requests.size();++row) {
             const auto row_ids=host_ids.narrow(1,offsets[row],chunks[row].size(1));
             for(std::size_t i=0;i<requests[row]->state_->layers.size();++i) {
@@ -1752,8 +1525,11 @@ std::vector<::tyloi::Tensor> qwen4_batch_prefill(qwen4_exp::Model& model,
         }
     }
     auto hidden=model.repeat_hidden(model.embed_tokens(ids),model.metadata.hc_mult);
+    auto work=Executor::current().work();
+    auto work_scope=work->enter();
     for (std::size_t i=0;i<model.layers.size();++i) {
-        NintCache decode_reuse(packed);
+        work->step({tyloi::LayerEvent::Phase::begin,
+            packed ? tyloi::LayerEvent::Mode::packed : tyloi::LayerEvent::Mode::single});
         const auto& block=*model.layers[i];
         if (block.ple) {
             std::vector<::tyloi::DenseTensor> positional;
@@ -1762,7 +1538,7 @@ std::vector<::tyloi::Tensor> qwen4_batch_prefill(qwen4_exp::Model& model,
                 auto& layer=*requests[row]->state_->layers[i];
                 auto ple=packed ? block.ple->forward(layer.ple,x,chunks[row],true,0,
                     host_ids.narrow(1,offsets[row],chunks[row].size(1))) :
-                    execution.executor().profiler().measure("prefill.ple",[&] {
+                    Executor::current().profiler().measure("prefill.ple",[&] {
                         return block.ple->forward(layer.ple,x,chunks[row],true,0,
                             host_ids.narrow(1,offsets[row],chunks[row].size(1)));
                     });
@@ -1771,7 +1547,7 @@ std::vector<::tyloi::Tensor> qwen4_batch_prefill(qwen4_exp::Model& model,
             hidden=join_request_outputs(positional,1);
         }
         auto mix=packed ? block.attention_gr.pre(hidden) :
-            execution.executor().profiler().measure("prefill.gr_attention",[&] { return block.attention_gr.pre(hidden); });
+            Executor::current().profiler().measure("prefill.gr_attention",[&] { return block.attention_gr.pre(hidden); });
         ::tyloi::DenseTensor attention;
         if(packed) {
             const auto projections=block.gdn?block.gdn->project_inputs(mix.mixed)
@@ -1779,35 +1555,38 @@ std::vector<::tyloi::Tensor> qwen4_batch_prefill(qwen4_exp::Model& model,
             std::vector<::tyloi::DenseTensor> attended;
             for (std::size_t row=0;row<requests.size();++row) {
                 auto& layer=*requests[row]->state_->layers[i];
-                auto attention_input=mix.mixed.narrow(1,offsets[row],chunks[row].size(1));
-                std::vector<::tyloi::DenseTensor> projected;
+                auto attention_input=mix.mixed.dense().narrow(1,offsets[row],chunks[row].size(1));
+                std::vector<::tyloi::Tensor> projected;
                 for (const auto& value:projections)
-                    projected.push_back(value.narrow(1,offsets[row],chunks[row].size(1)));
-                attended.push_back(block.gdn?block.gdn->forward_chunk(layer.gdn,attention_input,true,std::move(projected),false)
-                    :block.qsa->forward(*layer.qsa,attention_input,current[row],full[row],true,nullptr,std::move(projected),false));
+                    projected.push_back(value.dense().narrow(1,offsets[row],chunks[row].size(1)));
+                attended.push_back((block.gdn?block.gdn->forward_chunk(layer.gdn,attention_input,true,std::move(projected),false)
+                    :block.qsa->forward(*layer.qsa,attention_input,current[row],full[row],true,nullptr,std::move(projected),false)).dense());
             }
             attention=join_request_outputs(attended,1);
-            attention=block.gdn?block.gdn->project_output(attention):block.qsa->project_output(attention);
+            attention=(block.gdn?block.gdn->project_output(attention):block.qsa->project_output(attention)).dense();
         } else {
             auto& layer=*requests.front()->state_->layers[i];
-            if(block.gdn)attention=execution.executor().profiler().measure("prefill.gdn",[&] {
-                return block.gdn->forward(layer.gdn,mix.mixed,true,0);
+            if(block.gdn)attention=Executor::current().profiler().measure("prefill.gdn",[&] {
+                return block.gdn->forward(layer.gdn,mix.mixed,true,0).dense();
             });
-            else attention=execution.executor().profiler().measure("prefill.qsa",[&] {
-                return block.qsa->forward(*layer.qsa,mix.mixed,current.front(),full.front(),true);
+            else attention=Executor::current().profiler().measure("prefill.qsa",[&] {
+                return block.qsa->forward(*layer.qsa,mix.mixed,current.front(),full.front(),true).dense();
             });
         }
         auto ffn_mix=packed ? block.ffn_gr.pre_after(std::move(attention),mix.residual,mix.gate) :
-            execution.executor().profiler().measure("prefill.gr_ffn_pre",[&] {
+            Executor::current().profiler().measure("prefill.gr_ffn_pre",[&] {
                 return block.ffn_gr.pre_after(std::move(attention),mix.residual,mix.gate);
             });
-        auto ffn_output=packed ? block.ffn.forward(ffn_mix.mixed) :
-            execution.executor().profiler().measure("prefill.ffn",[&] { return block.ffn.forward(ffn_mix.mixed); });
-        hidden=packed ? block.ffn_gr.post(ffn_output,ffn_mix.residual,ffn_mix.gate) :
-            execution.executor().profiler().measure("prefill.gr_ffn_post",[&] {
-                return block.ffn_gr.post(ffn_output,ffn_mix.residual,ffn_mix.gate);
+        auto ffn_output=packed ? tyloi::ops::ffn(block.ffn,ffn_mix.mixed).dense() :
+            Executor::current().profiler().measure("prefill.ffn",[&] { return tyloi::ops::ffn(block.ffn,ffn_mix.mixed).dense(); });
+        hidden=packed ? block.ffn_gr.post(ffn_output,ffn_mix.residual,ffn_mix.gate).dense() :
+            Executor::current().profiler().measure("prefill.gr_ffn_post",[&] {
+                return block.ffn_gr.post(ffn_output,ffn_mix.residual,ffn_mix.gate).dense();
             });
+        work->step({tyloi::LayerEvent::Phase::end});
     }
+    work_scope.reset();
+    work->finish();
     hidden=qwen4_finalize_hidden(model, std::move(hidden),1,tokens);
     std::vector<::tyloi::Tensor> result;
     for (std::size_t row=0;row<requests.size();++row) {
@@ -1834,7 +1613,6 @@ std::vector<::tyloi::Tensor> qwen4_batch_prefill(qwen4_exp::Model& model,
         current.push_back(position);
         full.push_back(state.positions.defined() ? ::tyloi::cuda::cat({state.positions,position},-1) : position);
     }
-    auto& execution = *model.execution;
     auto hidden = model.repeat_hidden(model.embed_tokens(ids),model.metadata.hc_mult);
     for (std::size_t i = 0; i < model.layers.size(); ++i) {
         const auto& block = *model.layers[i];
@@ -1850,21 +1628,21 @@ std::vector<::tyloi::Tensor> qwen4_batch_prefill(qwen4_exp::Model& model,
         }
         auto mix = block.attention_gr.pre(hidden);
         const bool project_batch=batch>1 && block.gdn && ::tyloi::cuda::options::batch_attention_projections();
-        const auto projections=project_batch ? block.gdn->project_inputs(mix.mixed) : std::vector<::tyloi::DenseTensor>{};
+        const auto projections=project_batch ? block.gdn->project_inputs(mix.mixed) : std::vector<::tyloi::Tensor>{};
         std::vector<::tyloi::DenseTensor> attended;
         for (int64_t row = 0; row < batch; ++row) {
             auto& layer = *requests[row]->state_->layers[i];
-            auto attention_input = mix.mixed.narrow(0,row,1);
-            std::vector<::tyloi::DenseTensor> projected;
-            for(const auto& value:projections)projected.push_back(value.narrow(0,row,1));
-            attended.push_back(block.gdn ? block.gdn->forward_chunk(layer.gdn,attention_input,true,std::move(projected),!project_batch)
-                : block.qsa->forward(*layer.qsa,attention_input,current[row],full[row],true));
+            auto attention_input = mix.mixed.dense().narrow(0,row,1);
+            std::vector<::tyloi::Tensor> projected;
+            for(const auto& value:projections)projected.push_back(value.dense().narrow(0,row,1));
+            attended.push_back((block.gdn ? block.gdn->forward_chunk(layer.gdn,attention_input,true,std::move(projected),!project_batch)
+                : block.qsa->forward(*layer.qsa,attention_input,current[row],full[row],true)).dense());
         }
         auto attention=join_request_outputs(attended,0);
-        if(project_batch)attention=block.gdn->project_output(attention);
+        if(project_batch)attention=block.gdn->project_output(attention).dense();
         auto ffn_mix = block.ffn_gr.pre_after(std::move(attention),mix.residual,mix.gate);
         // Tiles share the expert transfer cache across all eligible rows.
-        hidden = block.ffn_gr.post(batch_ffn(block.ffn,execution,ffn_mix.mixed),ffn_mix.residual,ffn_mix.gate);
+        hidden = block.ffn_gr.post(batch_ffn(block.ffn,ffn_mix.mixed.dense()),ffn_mix.residual,ffn_mix.gate).dense();
     }
     auto logits = qwen4_logits_from_hidden(model, qwen4_finalize_hidden(model, std::move(hidden),batch,1)).reshape({batch,-1});
     for (int64_t row = 0; row < batch; ++row) {
@@ -1881,6 +1659,10 @@ qwen4_exp::State::State(const Model& model) : model_(model) {
 
 qwen4_exp::State::~State() = default;
 
+void qwen4_exp::State::release_graphs() {
+    qwen4_release_decode_graphs(model_, *this);
+}
+
 void qwen4_exp::State::reset(int64_t new_batch) {
     cache_pos = decode_position_delta = 0;
     speculative_start = -1;
@@ -1888,7 +1670,7 @@ void qwen4_exp::State::reset(int64_t new_batch) {
     speculative_suffix_forward = false;
     speculative_suffix_journal = false;
     speculative_prefix_retention = false;
-    if(model_.execution)model_.execution->weights.finish_exchange();
+    if(weights)weights->finish_exchange();
     const bool retain=reuse_decode_graphs && new_batch==1 && graph_registry && graph_registry->reusable();
     for(auto& layer:layers)layer->retain_graph_storage=retain;
     if(!retain)graph_registry.reset();
@@ -1922,16 +1704,15 @@ void qwen4_exp::State::finish_forward(const ::tyloi::Tensor &full_positions,
 bool qwen4_layer_major_prefill_eligible(const qwen4_exp::Model& model, const qwen4_exp::State& state, int64_t tokens) {
     const auto enabled=::tyloi::cuda::options::moe_prefill_layer_major();
     const auto whole=::tyloi::cuda::options::moe_prefill_layer();
-    const bool tq=model.execution && model.execution->weights.decode()==
+    const bool tq=state.weights && state.weights->decode()==
         ::tyloi::weights::Cache::Decode::routed;
     // Preserve explicit overrides and the existing expert-cache layout selection.
     if((enabled && *enabled==0) || (whole && *whole==0) || (!tq && !whole) || tokens<=128 ||
-       tokens>16384 || state.speculative_start>=0 || !model.execution ||
-       (!tq && !model.execution->config.cache.pipeline) ||
-       model.execution->weights.transfer()!=::tyloi::weights::Cache::Transfer::coordinated ||
-       model.execution->config.dense_cpu_layer_count || model.execution->config.tensor_parallel.enabled() ||
-       model.execution->config.expert_parallel.enabled())return false;
-    const auto primary=model.execution->config.layer_placement.primary_device();
+       tokens>16384 || state.speculative_start>=0 || !state.weights ||
+       (!tq && !state.cache_pipeline) ||
+       state.weights->transfer()!=::tyloi::weights::Cache::Transfer::coordinated ||
+       state.model_parallel)return false;
+    const auto primary=model.primary_device;
     for(const auto& block:model.layers)
         if(block->cpu_offloaded || block->cuda_device!=primary)return false;
     return true;
@@ -1967,9 +1748,6 @@ std::int64_t prefill_span(const qwen4_exp::Model& model, const qwen4_exp::State&
         qwen4_layer_major_prefill_eligible(model,state,ids.size(1)),
         "layer-major prefill requires a bounded single-device Qwen4 chunk and whole-layer cache");
     TYLOINFER_RUNTIME_CHECK(compute_chunk>8,"layer-major compute chunk must exceed decode width");
-#ifndef TYLOINFER_NATIVE_CUDA
-    auto scope=model.execution_scope();
-#endif
     ids=model.device_ids(std::move(ids));
     const auto tokens=ids.size(1);
     const auto cache_start=state.cache_pos;
@@ -1989,7 +1767,7 @@ std::int64_t prefill_span(const qwen4_exp::Model& model, const qwen4_exp::State&
     };
     const auto resume_profile=[&] { capture.resume(); };
 #else
-    auto& profiler=model.execution->executor().profiler();
+    auto& profiler=Executor::current().profiler();
     const bool previous_profile=profiler.enabled;
     if(collect){profiler.reset();profiler.enabled=true;}
     struct ProfileRestore {
@@ -2008,7 +1786,7 @@ std::int64_t prefill_span(const qwen4_exp::Model& model, const qwen4_exp::State&
     const auto resume_profile=[&] { profiler.enabled=restore.enabled; };
 #endif
     compute_chunk=std::min(compute_chunk,tokens);
-    tyloi::weights::Loan workspace_loan(model.execution->weights);
+    tyloi::weights::Loan workspace_loan(*state.weights);
     bool borrowed_workspace=false;
     {
         // Persistent decode graphs and prefill now coexist. Bound the compute
@@ -2021,7 +1799,7 @@ std::int64_t prefill_span(const qwen4_exp::Model& model, const qwen4_exp::State&
         // Their previous hidden input and the assembled FFN output can overlap
         // them at a layer boundary. Include that third sequence-sized buffer.
         const auto sequence_reserve=std::size_t(tokens)*model.config.hidden*model.config.streams*sizeof(float)*3;
-        const auto budget=model.execution->weights.prefill_budget(true);
+        const auto budget=state.weights->prefill_budget(true);
         const auto planned_fixed=tyloi::engine::prefill_budget_add(reserve+sequence_reserve,budget.transfer_bytes);
         const auto planned_available=tyloi::engine::prefill_budget_add(
             context->available_memory()+context->workspace_available(),budget.lendable_bytes);
@@ -2078,7 +1856,7 @@ std::int64_t prefill_span(const qwen4_exp::Model& model, const qwen4_exp::State&
 #else
     const bool bulk_gdn=bulk_gr && bulk_gdn_option && *bulk_gdn_option;
 #endif
-    const qwen4_exp::QwenPrefillReferenceRowsScope reference_rows(batch_experts?std::min<int64_t>(1024,compute_chunk):0);
+    const auto reference_rows=batch_experts?std::min<int64_t>(1024,compute_chunk):0;
     const auto batch_tokens_option=::tyloi::cuda::options::moe_prefill_expert_batch_tokens();
     const int64_t batch_tokens=batch_tokens_option?*batch_tokens_option:8192;
     const auto append_tail_option=::tyloi::cuda::options::moe_prefill_append_tail();
@@ -2093,14 +1871,15 @@ std::int64_t prefill_span(const qwen4_exp::Model& model, const qwen4_exp::State&
     const auto audit_option=::tyloi::cuda::options::prefill_expert_batch_audit();
     const bool audit_batch=audit_option && *audit_option!=0;
     const auto started=std::chrono::steady_clock::now();
+    auto work=Executor::current().work();
+    auto work_scope=work->enter();
     int layer=0;
     for(auto& block:model.layers) {
         auto& layer_state=*state.layers[layer];
-        const auto decode_reuse_option=::tyloi::cuda::options::nint_prefill_decode_reuse();
-        NintCache decode_reuse(!decode_reuse_option || *decode_reuse_option);
+        work->step({tyloi::LayerEvent::Phase::begin, tyloi::LayerEvent::Mode::tiled});
         DenseTensor next_hidden=hidden;
         DenseTensor ffn_inputs,ffn_gate;
-        GatedResidual::Result attention_result;
+        tyloi::ops::Residual::Result attention_result;
         DenseTensor attention_output;
         if(bulk_gr) {
             auto& qwen_block=*block;
@@ -2123,9 +1902,9 @@ std::int64_t prefill_span(const qwen4_exp::Model& model, const qwen4_exp::State&
             });
             if(bulk_gdn && qwen_block.gdn) {
                 if(cancelled && cancelled())return {};
-                const qwen4_exp::QwenGdnPrefillProjectionRowsScope projection_rows(compute_chunk);
+                const tyloi::ops::Gdn::ProjectionScope projection_rows(compute_chunk);
                 attention_output=profile_measure("prefill.gdn",[&] {
-                    return qwen_block.gdn->forward(layer_state.gdn,attention_result.mixed,true,0);
+                    return qwen_block.gdn->forward(layer_state.gdn,attention_result.mixed,true,0).dense();
                 });
             }
         }
@@ -2145,7 +1924,7 @@ std::int64_t prefill_span(const qwen4_exp::Model& model, const qwen4_exp::State&
             if(bulk_gr) {
                 auto& qwen_block=*block;
                 auto attention_chunk=qwen4_exp::prefill_attention_core(qwen_block,layer_state,
-                    attention_result.mixed.narrow(1,begin,count),positions,full_positions);
+                    attention_result.mixed.dense().narrow(1,begin,count),positions,full_positions);
                 if(!attention_output.defined()) {
                     auto shape=attention_chunk.sizes().vec();shape[1]=tokens;
                     attention_output=::tyloi::cuda::empty(shape,attention_chunk.options());
@@ -2157,13 +1936,13 @@ std::int64_t prefill_span(const qwen4_exp::Model& model, const qwen4_exp::State&
                 auto mix=qwen4_exp::prefill_attention(qwen_block,layer_state,
                     input,chunk_ids,host_ids,positions,full_positions);
                 if(!ffn_inputs.defined()) {
-                    ffn_inputs=::tyloi::cuda::empty({1,tokens,model.hidden_size()},mix.mixed.options().dtype(::tyloi::kFloat16));
-                    ffn_gate=::tyloi::cuda::empty({1,tokens,mix.gate.size(-1)},mix.gate.options());
+                    ffn_inputs=::tyloi::cuda::empty({1,tokens,model.hidden_size()},mix.mixed.dense().options().dtype(::tyloi::kFloat16));
+                    ffn_gate=::tyloi::cuda::empty({1,tokens,mix.gate.size(-1)},mix.gate.dense().options());
                 }
                 // The MoE casts the router/FFN source to half at this boundary.
-                ffn_inputs.narrow(1,begin,count).copy_(mix.mixed.to(::tyloi::kFloat16));
-                ffn_gate.narrow(1,begin,count).copy_(mix.gate);
-                output=std::move(mix.residual);
+                ffn_inputs.narrow(1,begin,count).copy_(mix.mixed.dense().to(::tyloi::kFloat16));
+                ffn_gate.narrow(1,begin,count).copy_(mix.gate.dense());
+                output=mix.residual.dense();
             } else output=qwen4_exp::forward(*block,layer_state,
                 input,chunk_ids,positions,full_positions,0,host_ids);
             // Retain the original rounding at every layer boundary. The next
@@ -2180,17 +1959,17 @@ std::int64_t prefill_span(const qwen4_exp::Model& model, const qwen4_exp::State&
         }
         // Attention's decoded matrices are no longer needed by FFN. Keep
         // reuse within each phase, without retaining both sets at peak memory.
-        if(tokens>9216)decode_reuse.clear();
+        if(tokens>9216)work->step({tyloi::LayerEvent::Phase::clear});
         if(bulk_gr) {
             auto& qwen_block=*block;
             auto mix=profile_measure("prefill.gr_ffn_pre",[&] {
                 return qwen_block.ffn_gr.pre_after(attention_output,attention_result.residual,attention_result.gate);
             });
-            ffn_inputs=mix.mixed.to(::tyloi::kFloat16);ffn_gate=std::move(mix.gate);
-            next_hidden=std::move(mix.residual);
+            ffn_inputs=mix.mixed.dense().to(::tyloi::kFloat16);ffn_gate=mix.gate.dense();
+            next_hidden=mix.residual.dense();
             attention_result={};attention_output={};
         }
-        if(tokens>9216)decode_reuse.clear();
+        if(tokens>9216)work->step({tyloi::LayerEvent::Phase::clear});
         // The new residual owns the next layer's values. Prior hidden readers
         // have already been submitted before this stream-ordered release.
         if(tokens>9216)hidden={};
@@ -2199,7 +1978,7 @@ std::int64_t prefill_span(const qwen4_exp::Model& model, const qwen4_exp::State&
             auto& qwen_block=*block;
             resume_profile();
             auto ffn_output=profile_measure("prefill.ffn",[&] {
-                if(expert_batch_count(tokens)==tokens)return qwen_block.ffn.forward(ffn_inputs);
+                if(expert_batch_count(tokens)==tokens)return tyloi::ops::ffn(qwen_block.ffn,ffn_inputs,{}, {}, reference_rows).dense();
                 DenseTensor result;
                 for(int64_t begin=0;begin<tokens;) {
                     if(cancelled && cancelled())return DenseTensor{};
@@ -2210,7 +1989,7 @@ std::int64_t prefill_span(const qwen4_exp::Model& model, const qwen4_exp::State&
                     // layer. Keep both batches in prefill, including chat inputs
                     // just above the expert-batch boundary.
                     if(tail>0 && tail<=8)count-=16-tail;
-                    auto part=qwen_block.ffn.forward(ffn_inputs.narrow(1,begin,count));
+                    auto part=tyloi::ops::ffn(qwen_block.ffn,ffn_inputs.narrow(1,begin,count),{}, {}, reference_rows).dense();
                     if(!result.defined()) {
                         auto shape=part.sizes().vec();shape[1]=tokens;
                         result=::tyloi::cuda::empty(shape,part.options());
@@ -2226,7 +2005,7 @@ std::int64_t prefill_span(const qwen4_exp::Model& model, const qwen4_exp::State&
                 for(int64_t begin=0;begin<tokens;begin+=compute_chunk) {
                     const auto count=std::min(compute_chunk,tokens-begin);
                     expected.narrow(1,begin,count).copy_(
-                        qwen_block.ffn.forward(ffn_inputs.narrow(1,begin,count)));
+                        tyloi::ops::ffn(qwen_block.ffn,ffn_inputs.narrow(1,begin,count),{}, {}, reference_rows).dense());
                 }
                 auto a=ffn_output.to(::tyloi::kCPU,::tyloi::kFloat32).contiguous();
                 auto b=expected.to(::tyloi::kCPU,::tyloi::kFloat32).contiguous();
@@ -2252,11 +2031,12 @@ std::int64_t prefill_span(const qwen4_exp::Model& model, const qwen4_exp::State&
                     post_hidden=::tyloi::cuda::empty(next_hidden.sizes(),output.options());
                 TYLOINFER_RUNTIME_CHECK(output.scalar_type()==post_hidden.scalar_type(),
                     "expert-batched residual dtype changed");
-                post_hidden.narrow(1,begin,count).copy_(output);
+                post_hidden.narrow(1,begin,count).copy_(output.dense());
             }
             next_hidden=std::move(post_hidden);
         }
         hidden=std::move(next_hidden);
+        work->step({tyloi::LayerEvent::Phase::end});
         ++layer;
         if(trace && (layer%4==0 || layer==int(model.layers.size()))) {
             TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(mfq_get_current_cuda_stream()));
@@ -2277,6 +2057,8 @@ std::int64_t prefill_span(const qwen4_exp::Model& model, const qwen4_exp::State&
                     std::chrono::steady_clock::now()-started).count()<<std::endl;
         }
     }
+    work_scope.reset();
+    work->finish();
     resume_profile();
     if(last_only && !raw_hidden) {
         const auto begin=((tokens-1)/compute_chunk)*compute_chunk;
@@ -2329,20 +2111,23 @@ std::int64_t prefill_span(const qwen4_exp::Model& model, const qwen4_exp::State&
 namespace qwen4_exp {
 
 tyloi::models::Info Model::info() const {
-    return {metadata.vocab_size, config.maximum, "qwen4_exp",
+    auto result = tyloi::models::Info{metadata.vocab_size, config.maximum, "qwen4_exp",
             std::size_t(metadata.hidden_size) * sizeof(float) * 8, true, true};
+    result.streamed_kv = std::any_of(layers.begin(), layers.end(),
+        [](const auto& layer) { return bool(layer->qsa); });
+    return result;
 }
 
 MfqModelCapabilities Model::capabilities() const {
-    const auto state = cuda_component_state(graph, plan, false, false);
-    const auto caps = cuda_runtime_capabilities(graph, plan, state, false, false);
+    const auto state = ::tyloi::models::component_state(graph, plan, false, false);
+    const auto caps = ::tyloi::models::runtime_capabilities(graph, plan, state, false, false);
     return {graph.architecture, caps.text, caps.image_input, caps.video_input,
         caps.audio_input, caps.audio_output, caps.full_duplex, caps.mtp,
         "model-graph+cuda-adapters"};
 }
 
 tyloi::engine::Metrics Model::metrics() const {
-    const auto state = cuda_component_state(graph, plan, false, false);
+    const auto state = ::tyloi::models::component_state(graph, plan, false, false);
     return {{"kv_memory_supported", 0.0},
         {"kv_quantization_supported", 0.0},
         {"kv_quantization_bits", 0.0},
@@ -2364,9 +2149,6 @@ tyloi::StepSequence<tyloi::models::Prepared> Model::prepare(
 }
 
 ::tyloi::Tensor Model::embedding(const ::tyloi::Tensor& ids, int) const {
-#ifndef TYLOINFER_NATIVE_CUDA
-    auto scope = execution_scope();
-#endif
     return std::make_shared<::tyloi::DenseTensor>(embed_tokens(device_ids(ids.dense())));
 }
 
@@ -2384,9 +2166,8 @@ tyloi::StepSequence<tyloi::models::Prepared> Model::prepare(
         return tyloi::ops::project(hidden, lm_head);
     });
 #else
-    return execution->executor().profiler().measure("model.lm_head", [&] {
-        return execution->executor().projector(execution->executor().mode().ffn,
-            model_parallel_primary_device(execution->config)).run(lm_head, hidden.dense());
+    return Executor::current().profiler().measure("model.lm_head", [&] {
+        return Executor::current().projector(Executor::current().mode().ffn).run(lm_head, hidden.dense());
     });
 #endif
 }

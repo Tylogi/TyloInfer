@@ -1,6 +1,3 @@
-#ifndef TYLOINFER_NATIVE_CUDA
-#include "engine/backends/cuda/executor/execution.h"
-#endif
 #include "env.h"
 #include "ops.h"
 #include <cstring>
@@ -44,39 +41,22 @@ DenseTensor forward_layer(Model& model, State& state, const DenseTensor& ids, in
                           DenseTensor hidden, DenseTensor positions, DenseTensor host_ids) {
     const auto* profile_layer=tyloi::cuda::env_lookup("TYLOINFER_PROFILE_DSV41_LAYER");
     const bool selected=profile_layer && layer==std::atoi(profile_layer);
-#ifdef TYLOINFER_NATIVE_CUDA
     tyloi::ops::ProfileCapture capture(selected);
-#else
-    auto& profiler=model.execution->executor().profiler();
-    const bool previous=profiler.enabled;
-    if(selected) {profiler.reset();profiler.enabled=true;}
-    try {
-#endif
-        auto& block=*model.blocks.at(layer);
-        MfqCudaGuard guard(block.cuda_device);
-        auto local_ids = block.cpu_offloaded
-            ? host_ids
-            : tyloi::ops::copy(ids, ::tyloi::Device(::tyloi::kCUDA, block.cuda_device)).dense();
-        auto local_pos = block.cpu_offloaded
-            ? positions
-            : tyloi::ops::copy(positions, ::tyloi::Device(::tyloi::kCUDA, block.cuda_device)).dense();
-        block.set_token_ids(*state.shared, local_ids);
-        hidden = block.cpu_offloaded
-            ? hidden.to(::tyloi::kCPU).contiguous()
-            : tyloi::ops::copy(hidden, ::tyloi::Device(::tyloi::kCUDA, block.cuda_device)).dense();
-        hidden = block.forward(*state.shared,
-#ifndef TYLOINFER_NATIVE_CUDA
-                                       *model.execution,
-#endif
-                                       std::move(hidden), local_pos, state.cache_pos,
-                                       mfq_nullopt, mfq_nullopt, 0);
-#ifdef TYLOINFER_NATIVE_CUDA
-        if(selected)capture.report("deepseek_v41.layer."+std::to_string(layer));
-#else
-        if(selected)profiler.report("deepseek_v41.layer."+std::to_string(layer));
-    } catch(...) {profiler.enabled=previous;throw;}
-    profiler.enabled=previous;
-#endif
+    auto& block=*model.blocks.at(layer);
+    MfqCudaGuard guard(block.cuda_device);
+    auto local_ids = block.cpu_offloaded
+        ? host_ids
+        : tyloi::ops::copy(ids, ::tyloi::Device(::tyloi::kCUDA, block.cuda_device)).dense();
+    auto local_pos = block.cpu_offloaded
+        ? positions
+        : tyloi::ops::copy(positions, ::tyloi::Device(::tyloi::kCUDA, block.cuda_device)).dense();
+    block.set_token_ids(*state.shared, local_ids);
+    hidden = block.cpu_offloaded
+        ? hidden.to(::tyloi::kCPU).contiguous()
+        : tyloi::ops::copy(hidden, ::tyloi::Device(::tyloi::kCUDA, block.cuda_device)).dense();
+    hidden = block.forward(*state.shared, std::move(hidden), local_pos, state.cache_pos,
+                           mfq_nullopt, mfq_nullopt, 0);
+    if(selected)capture.report("deepseek_v41.layer."+std::to_string(layer));
     return hidden;
 }
 }
@@ -93,9 +73,6 @@ std::int64_t prefill_span(const Model&, const State&, std::size_t tokens,
 
 ::tyloi::Tensor deepseek_v41_prefill_input(
     Model& model, State& state, const ::tyloi::Tensor& input_ids, int64_t compute_chunk) {
-#ifndef TYLOINFER_NATIVE_CUDA
-    auto scope = model.execution_scope();
-#endif
     auto ids = model.device_ids(input_ids.dense());
     const auto batch = ids.size(0), tokens = ids.size(1);
     const auto* profile=tyloi::cuda::env_lookup("TYLOINFER_PROFILE_SSD_EXPERTS");
@@ -117,9 +94,6 @@ std::int64_t prefill_span(const Model&, const State&, std::size_t tokens,
 bool deepseek_v41_prefill_encode_chunk(
     Model& model, State& state, CedEncoding& encoded, int64_t offset, int64_t count,
     const std::function<bool()>& stopped, bool capture_raw_hidden) {
-#ifndef TYLOINFER_NATIVE_CUDA
-    auto scope = model.execution_scope();
-#endif
     const auto batch = encoded.batch;
     const auto& config = model.config;
     const auto split = config.causal_encoder_layers;
@@ -182,9 +156,6 @@ bool deepseek_v41_prefill_encode_chunk(
 ::tyloi::Tensor deepseek_v41_prefill_decode(
     Model& model, State& state, CedEncoding encoded, const std::function<bool()>& stopped,
     ::tyloi::Tensor* raw_hidden) {
-#ifndef TYLOINFER_NATIVE_CUDA
-    auto scope = model.execution_scope();
-#endif
     auto& [ids, tail_hidden, tail_pre, tail_ids, tail_hashes, batch, begin, end, tokens, compute_chunk] = encoded;
     const auto& config = model.config;
     const auto split = config.causal_encoder_layers;

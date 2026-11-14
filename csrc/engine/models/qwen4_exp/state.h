@@ -7,9 +7,12 @@
 #include "engine/models/qwen4_exp/layer.h"
 
 #include <memory>
+#include <utility>
 #include <vector>
 
 namespace tyloi::models { struct Mtp; }
+namespace tyloi::weights { class Cache; }
+namespace tyloi::cuda { class KvMemoryManager; class KvOffloadStore; }
 namespace tyloi::cuda { struct Qwen4DecodeGraph; }
 namespace tyloi::cuda::qwen4_exp {
 
@@ -17,8 +20,8 @@ struct Model;
 
 // Per-request recurrent and attention storage for one shared layer.
 struct LayerState {
-    Gdn::State gdn;
-    std::unique_ptr<Qsa::State> qsa;
+    tyloi::ops::Gdn::State gdn;
+    std::unique_ptr<tyloi::ops::Qsa::State> qsa;
     Ple::State ple;
     bool retain_graph_storage = false, retained_prefix = false;
 
@@ -45,8 +48,12 @@ public:
     State& operator=(State&&) = delete;
     ~State() override;
 
+    void bind_resources(tyloi::weights::Cache& cache, bool pipeline, bool parallel) {
+        weights = &cache; cache_pipeline = pipeline; model_parallel = parallel;
+    }
     void preallocate() override {}
     void reset(std::int64_t batch) override;
+    void release_graphs() override;
     std::int64_t position() const noexcept override { return cache_pos; }
     void advance(std::int64_t tokens) noexcept override { cache_pos += tokens; }
     void set_position_delta(std::int64_t delta) noexcept override { decode_position_delta = delta; }
@@ -72,6 +79,8 @@ public:
     void finish_forward(const ::tyloi::Tensor& full_positions, std::int64_t batch,
                         std::int64_t tokens);
 
+    tyloi::weights::Cache* weights = nullptr;
+    bool cache_pipeline = false, model_parallel = false;
     std::int64_t cache_pos = 0;
     std::int64_t decode_position_delta = 0;
     std::int64_t batch = 0;

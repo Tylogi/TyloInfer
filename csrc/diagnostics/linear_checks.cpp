@@ -1,13 +1,15 @@
-#include "engine/models/common/load.h"
+#include "engine/program.h"
+#include "engine/backends/cuda/executor/config.h"
+#include "engine/backends/cuda/executor/executor.h"
+#include "engine/backends/cuda/native/branches.h"
+#include "engine/backends/cuda/ops/projection/projection.h"
 #include "engine/backends/cuda/native/env.h"
 #include "engine/weights/loader.h"
 #include "model_checks.h"
 
 #include "engine/backends/cuda/ops/projection/quant_linear.h"
-#include "engine/backends/cuda/executor/execution.h"
 #include "engine/backends/cuda/kernels/mfq_cuda_activation_ops.h"
 #include "engine/backends/cuda/kernels/mfq_cuda_embedding_ops.h"
-#include "engine/backends/cuda/kernels/mfq_cuda_linear_attention_ops.h"
 #include "engine/backends/cuda/kernels/mfq_cuda_quant_ops.h"
 
 #include <cuda_runtime_api.h>
@@ -17,12 +19,9 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
-#include <filesystem>
-#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
-#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -31,18 +30,19 @@
 using tyloi::cuda::indexing::Slice;
 
 int run_linear_check(
-    CudaExecutionContext& execution,
-    const std::string & model_path,
+    tyloi::cuda::Program& program,
     const std::string & name,
     int M,
     InputGateMode gate_mode,
     int reps) {
-    auto model_source = tyloi::open_model_source(model_path);
-    const auto& mfq = *model_source;
-    auto linear = load_quant_linear(execution, mfq, name);
+    auto& executor = program.executor();
+    auto scope = executor.enter(program.config().layer_placement.primary_device());
+    auto loader = program.loader();
+    auto projector = executor.projector(tyloi::cuda::Executor::current_ffn());
+    auto linear = loader.weight(name);
     TYLOINFER_RUNTIME_CHECK(M >= 1 && M <= 4096, "--check-linear-m must be in [1, 4096]");
     TYLOINFER_RUNTIME_CHECK(reps >= 1, "--check-linear-reps must be positive");
-    int64_t neuron_len = linear.neuron_len();
+    int64_t neuron_len = linear.size(1);
     auto x = tyloi::cuda::arange((int64_t)M * neuron_len,
                            tyloi::TensorOptions().device(tyloi::kCUDA).dtype(tyloi::kFloat32))
                  .reshape({M, neuron_len});
@@ -57,8 +57,8 @@ int run_linear_check(
     }
     auto run = [&]() {
         return gate_mode == InputGateMode::None
-            ? execution.projector().run(linear, xh)
-            : execution.projector().gated(linear, xh, gateh, gate_mode);
+            ? projector.run(linear, xh)
+            : projector.gated(linear, xh, gateh, gate_mode);
     };
     const char * check_bf16_output_env =
         tyloi::cuda::env_lookup("TYLOINFER_CHECK_LINEAR_BF16_OUTPUT");
@@ -68,9 +68,9 @@ int run_linear_check(
             gate_mode == InputGateMode::None,
             "direct BF16 linear check does not support input gating");
         auto bf16_input = x.to(tyloi::kBFloat16).contiguous();
-        auto reference = execution.projector().run(linear, bf16_input)
+        auto reference = projector.run(linear, bf16_input)
             .to(tyloi::kBFloat16).contiguous();
-        auto candidate = execution.projector().run(linear, bf16_input).to(tyloi::kBFloat16).contiguous();
+        auto candidate = projector.run(linear, bf16_input).to(tyloi::kBFloat16).contiguous();
         auto difference =
             (candidate.to(tyloi::kFloat32) -
              reference.to(tyloi::kFloat32)).abs();
@@ -102,16 +102,12 @@ int run_linear_check(
     cudaEventDestroy(stop);
     y_test = y_test.to(tyloi::kFloat32);
 
-    const tyloi::NintTensor * nint = linear.is_nint() ? &linear.nint : nullptr;
-    const tyloi::NvqTensor * nvq = linear.is_nvq() ? &linear.nvq : nullptr;
-    const tyloi::Mxfp4Tensor * mxfp4 = linear.is_mxfp4()
-        ? &linear.mxfp4.weight : nullptr;
-    const tyloi::Mxfp4SqTensor * mxfp4_sq = linear.is_mxfp4_sq()
-        ? &linear.mxfp4_sq.weight : nullptr;
-    const tyloi::Fp8SqTensor * fp8_sq = linear.is_fp8_sq()
-        ? &linear.fp8_sq.weight : nullptr;
-    const tyloi::Mxfp8Tensor * mxfp8 = linear.is_mxfp8()
-        ? &linear.mxfp8.weight : nullptr;
+    const auto* nint = linear.representation<tyloi::NintTensor>();
+    const auto* nvq = linear.representation<tyloi::NvqTensor>();
+    const auto* mxfp4 = linear.representation<tyloi::Mxfp4Tensor>();
+    const auto* mxfp4_sq = linear.representation<tyloi::Mxfp4SqTensor>();
+    const auto* fp8_sq = linear.representation<tyloi::Fp8SqTensor>();
+    const auto* mxfp8 = linear.representation<tyloi::Mxfp8Tensor>();
     auto ww = quant_linear_reference_weight(linear);
     tyloi::DenseTensor ref_input = xh;
     if (gate_mode == InputGateMode::Sigmoid) ref_input = xh * tyloi::cuda::sigmoid(gateh);
@@ -138,7 +134,9 @@ int run_linear_check(
         ? (double)mxfp4_sq->blob.numel()
         : fp8_sq != nullptr
         ? (double)fp8_sq->blob.numel()
-        : (double)mxfp8->values.numel() + (double)mxfp8->scales.numel();
+        : mxfp8 != nullptr
+        ? (double)mxfp8->values.numel() + (double)mxfp8->scales.numel()
+        : (double)linear.nbytes();
     std::cout << "shape=" << y_ref.sizes() << "\n";
     if (nint != nullptr) {
         if (nint->q8_zero) {
@@ -176,8 +174,10 @@ int run_linear_check(
                   << " block=" << fp8_sq->block_rows
                   << "x" << fp8_sq->block_columns
                   << " m=" << M << "\n";
-    } else {
+    } else if (mxfp8 != nullptr) {
         std::cout << "dtype=MXFP8 block=128x128 m=" << M << "\n";
+    } else {
+        std::cout << "dtype=other m=" << M << "\n";
     }
     if (gate_mode != InputGateMode::None) std::cout << "gate=" << (gate_mode == InputGateMode::Sigmoid ? "sigmoid" : "silu") << "\n";
     std::cout << "production_ms=" << per_ms << "\n";
@@ -189,27 +189,21 @@ int run_linear_check(
 }
 
 int run_cpu_linear_check(
-        CudaExecutionContext& execution,
-        const std::string & model_path,
+        tyloi::cuda::Program& program,
         const std::string & name,
         int rows,
         InputGateMode gate_mode,
         int reps) {
     TYLOINFER_RUNTIME_CHECK(rows >= 1 && rows <= 4096, "--check-linear-m must be in [1, 4096]");
     TYLOINFER_RUNTIME_CHECK(reps >= 1, "--check-linear-reps must be positive");
-    auto model_source = tyloi::open_model_source(model_path);
-    const auto& mfq = *model_source;
-    execution.loading_cpu_layer = true;
-    QuantLinear cpu_linear;
-    try {
-        cpu_linear = load_quant_linear(execution, mfq, name);
-    } catch (...) {
-        execution.loading_cpu_layer = false;
-        throw;
-    }
-    execution.loading_cpu_layer = false;
-    auto cuda_linear = load_quant_linear(execution, mfq, name);
-    const int64_t width = cpu_linear.neuron_len();
+    auto& executor = program.executor();
+    auto scope = executor.enter(program.config().layer_placement.primary_device());
+    auto loader = program.loader();
+    auto projector = executor.projector(tyloi::cuda::Executor::current_ffn());
+    auto cpu_loader = loader.for_layer(loader.placement.device, true);
+    auto cpu_linear = cpu_loader.weight(name);
+    auto cuda_linear = loader.weight(name);
+    const int64_t width = cpu_linear.size(1);
     auto x = tyloi::cuda::arange(
         static_cast<int64_t>(rows) * width,
         tyloi::TensorOptions().device(tyloi::kCPU).dtype(tyloi::kFloat32))
@@ -227,8 +221,8 @@ int run_cpu_linear_check(
     }
     auto run_cpu = [&]() {
         return gate_mode == InputGateMode::None
-            ? execution.projector().run(cpu_linear, x)
-            : execution.projector().gated(cpu_linear, x, gate, gate_mode);
+            ? projector.run(cpu_linear, x)
+            : projector.gated(cpu_linear, x, gate, gate_mode);
     };
     tyloi::DenseTensor actual = run_cpu();
     const auto start = std::chrono::steady_clock::now();
@@ -243,8 +237,8 @@ int run_cpu_linear_check(
     tyloi::DenseTensor cuda_gate;
     if (gate_mode != InputGateMode::None) cuda_gate = gate.to(tyloi::kCUDA).contiguous();
     auto reference = gate_mode == InputGateMode::None
-        ? execution.projector().run(cuda_linear, cuda_x)
-        : execution.projector().gated(cuda_linear, cuda_x, cuda_gate, gate_mode);
+        ? projector.run(cuda_linear, cuda_x)
+        : projector.gated(cuda_linear, cuda_x, cuda_gate, gate_mode);
     cudaStreamSynchronize(::tyloi::cuda::current_stream());
     reference = reference.to(tyloi::kCPU, tyloi::kFloat32).contiguous();
     actual = actual.to(tyloi::kFloat32).contiguous();
@@ -260,13 +254,12 @@ int run_cpu_linear_check(
 }
 
 int run_tensor_parallel_linear_check(
-        CudaExecutionContext& execution,
-        const std::string & model_path,
+        tyloi::cuda::Program& program,
         const std::string & name,
         TensorParallelAxis axis,
         int M) {
     TYLOINFER_RUNTIME_CHECK(
-        execution.tensor_parallel.enabled(),
+        program.config().tensor_parallel.enabled(),
         "--check-tp-linear requires --tensor-parallel");
     TYLOINFER_RUNTIME_CHECK(
         axis == TensorParallelAxis::Output ||
@@ -275,27 +268,22 @@ int run_tensor_parallel_linear_check(
     TYLOINFER_RUNTIME_CHECK(
         M >= 1 && M <= 4096,
         "--check-tp-m must be in [1, 4096]");
-    auto model_source = tyloi::open_model_source(model_path);
-    const auto& mfq = *model_source;
-    const ParallelConfig saved = execution.tensor_parallel;
-    execution.tensor_parallel = {};
-    execution.tensor_parallel.devices = {saved.primary_device()};
-    QuantLinear full;
-    try {
-        full = load_quant_linear(execution,
-            mfq, name, TensorParallelAxis::Mirrored);
-    } catch (...) {
-        execution.tensor_parallel = saved;
-        throw;
-    }
-    execution.tensor_parallel = saved;
-    auto sharded = load_quant_linear(execution,
-        mfq, name, axis);
+    auto& executor = program.executor();
+    auto scope = executor.enter(program.config().layer_placement.primary_device());
+    auto loader = program.loader();
+    auto projector = executor.projector(tyloi::cuda::Executor::current_ffn());
+    const ParallelConfig saved = program.config().tensor_parallel;
+    auto full_loader = loader;
+    full_loader.placement.tensor = {};
+    full_loader.placement.tensor.devices = {saved.primary_device()};
+    auto full = full_loader.weight(name, TensorParallelAxis::Mirrored);
+    auto sharded = loader.weight(name, axis);
+    const auto* shards = sharded.representation<tyloi::ShardedTensor>();
     TYLOINFER_RUNTIME_CHECK(
-        sharded.tensor_parallel(),
+        shards != nullptr,
         "tensor-parallel diagnostic did not create shards");
 
-    const int64_t width = full.neuron_len();
+    const int64_t width = full.size(1);
     auto x = tyloi::cuda::arange(
         static_cast<int64_t>(M) * width,
         tyloi::TensorOptions()
@@ -306,8 +294,8 @@ int run_tensor_parallel_linear_check(
         .reshape({M, width});
     x = ((x.remainder(127) - 63) / 384.0)
         .to(tyloi::kFloat16).contiguous();
-    auto reference = execution.projector().run(full, x).to(tyloi::kFloat32);
-    auto test = execution.projector().run(sharded, x).to(tyloi::kFloat32);
+    auto reference = projector.run(full, x).to(tyloi::kFloat32);
+    auto test = projector.run(sharded, x).to(tyloi::kFloat32);
     cudaStreamSynchronize(::tyloi::cuda::current_stream());
     const auto difference = (test - reference).abs();
     const double denominator =
@@ -327,16 +315,16 @@ int run_tensor_parallel_linear_check(
         << " axis="
         << (axis == TensorParallelAxis::Output
             ? "output" : "input")
-        << " logical_shape=[" << full.out()
-        << ',' << full.neuron_len() << ']'
+        << " logical_shape=[" << full.size(0)
+        << ',' << full.size(1) << ']'
         << " shards="
-        << sharded.tensor_parallel_shards.size()
+        << shards->shards.size()
         << " m=" << M
         << " relative=" << relative
         << " mean_abs=" << mean_abs
         << " max_abs=" << max_abs
         << '\n';
-    const double tolerance = full.is_mxfp8()
+    const double tolerance = full.representation<tyloi::Mxfp8Tensor>() != nullptr
         ? 5.0e-4
         : axis == TensorParallelAxis::Output
         ? 1.0e-6 : 5.0e-3;
@@ -367,8 +355,7 @@ std::vector<std::string> parse_tensor_names(const std::string & value) {
 }
 
 int run_linear_group_check(
-        CudaExecutionContext& execution,
-        const std::string & model_path,
+        tyloi::cuda::Program& program,
         const std::string & names_arg,
         int M,
         int reps) {
@@ -376,8 +363,10 @@ int run_linear_group_check(
     TYLOINFER_RUNTIME_CHECK(reps >= 1, "--check-linear-reps must be positive");
     const auto names = parse_tensor_names(names_arg);
     TYLOINFER_RUNTIME_CHECK(names.size() >= 2, "--check-linear-group requires at least two tensors");
-    auto model_source = tyloi::open_model_source(model_path);
-    const auto& mfq = *model_source;
+    auto& executor = program.executor();
+    auto scope = executor.enter(program.config().layer_placement.primary_device());
+    auto loader = program.loader();
+    auto projector = executor.projector(tyloi::cuda::Executor::current_ffn());
     const char * preserve_env =
         tyloi::cuda::env_lookup("TYLOINFER_CHECK_LINEAR_GROUP_PRESERVE");
     const bool preserve_projection_boundaries =
@@ -386,14 +375,14 @@ int run_linear_group_check(
         tyloi::cuda::env_lookup("TYLOINFER_CHECK_LINEAR_GROUP_BF16");
     const bool check_bf16 =
         bf16_env != nullptr && bf16_env[0] == '1';
-    auto group = load_quant_group(execution,
-        mfq, names, names.size(), nullptr,
-        preserve_projection_boundaries);
+    auto group = tyloi::cuda::make_quant_group(
+        loader.group(names, names.size(), nullptr, preserve_projection_boundaries),
+        loader.options.grouped, loader.placement.cpu, preserve_projection_boundaries);
     const int64_t width = group.nint_grouped
         ? (group.nint.split_w.empty()
             ? group.nint.w.neuron_len
             : group.nint.split_w.front().neuron_len)
-        : group.layers.front().neuron_len();
+        : group.layers.front().size(1);
     auto sequence = tyloi::cuda::arange(
         (int64_t)M * width,
         tyloi::TensorOptions().device(tyloi::kCUDA).dtype(tyloi::kFloat32));
@@ -404,7 +393,7 @@ int run_linear_group_check(
                      : tyloi::kFloat16)
                  .reshape({M, width})
                  .contiguous();
-    auto actual = execution.projector().run(group, x);
+    auto actual = projector.run(group, x);
     const char * check_bf16_swiglu_env =
         tyloi::cuda::env_lookup("TYLOINFER_CHECK_BF16_SWIGLU");
     if (check_bf16_swiglu_env != nullptr &&
@@ -434,7 +423,7 @@ int run_linear_group_check(
     cudaStreamSynchronize(::tyloi::cuda::current_stream());
     const auto started = std::chrono::steady_clock::now();
     for (int rep = 0; rep < reps; ++rep) {
-        actual = execution.projector().run(group, x);
+        actual = projector.run(group, x);
     }
     cudaStreamSynchronize(::tyloi::cuda::current_stream());
     const double elapsed_ms = std::chrono::duration<double, std::milli>(
@@ -447,7 +436,7 @@ int run_linear_group_check(
     TYLOINFER_RUNTIME_CHECK(actual.size() == names.size(), "linear group output count mismatch");
     std::vector<tyloi::DenseTensor> graph_actual;
     if (M == 1 && tyloi::cuda::decode_branches(
-                    execution.config.tasks.projection.parallel, execution.decode_graph_serial_branches, M)) {
+                    executor.options().projection.parallel, tyloi::cuda::Executor::current_ffn().serial, M)) {
         cudaStreamSynchronize(::tyloi::cuda::current_stream());
         const auto graph_stream =
             mfq_get_stream_from_pool(false);
@@ -455,11 +444,11 @@ int run_linear_group_check(
             graph_stream);
         MfqCudaGraph graph;
         mfq_prepare_cuda_graph_memory(graph);
-        graph_actual = execution.projector().run(group, x);
+        graph_actual = projector.run(group, x);
         TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(graph_stream.stream()));
         graph_actual.clear();
         graph.capture_begin();
-        graph_actual = execution.projector().run(group, x);
+        graph_actual = projector.run(group, x);
         graph.capture_end();
         graph.replay();
         TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(
@@ -493,11 +482,11 @@ int run_linear_group_check(
     fp32_references.reserve(names.size());
     separate_production.reserve(names.size());
     for (size_t index = 0; index < names.size(); ++index) {
-        auto linear = load_quant_linear(execution, mfq, names[index]);
+        auto linear = loader.weight(names[index]);
         TYLOINFER_RUNTIME_CHECK(
-            linear.is_nint(),
+            linear.representation<tyloi::NintTensor>() != nullptr,
             "--check-linear-group currently requires NINT tensors");
-        const auto & weight = linear.nint;
+        const auto & weight = payload_as<tyloi::NintTensor>(linear);
         auto dense = weight.q8_zero
             ? nint8_zero_dequant_cuda(
                   weight.q_packed, weight.q8_zero_scale, weight.neuron_len)
@@ -506,7 +495,7 @@ int run_linear_group_check(
                   weight.row_q_bit_offsets, weight.sub_scale,
                   weight.sub_min, weight.neuron_scale,
                   weight.neuron_min, weight.neuron_len, weight.gs);
-        auto separate = execution.projector().run(linear, x);
+        auto separate = projector.run(linear, x);
         if (actual[index].scalar_type() == tyloi::kBFloat16) {
             separate = separate.to(tyloi::kBFloat16);
         }
@@ -584,169 +573,17 @@ int run_linear_group_check(
     return 0;
 }
 
-static tyloi::DenseTensor read_f32_tensor(
-        const std::filesystem::path & path,
-        const std::vector<int64_t> & shape) {
-    const int64_t count = std::accumulate(
-        shape.begin(), shape.end(), int64_t{1}, std::multiplies<int64_t>());
-    std::vector<float> values(static_cast<size_t>(count));
-    std::ifstream input(path, std::ios::binary);
-    TYLOINFER_RUNTIME_CHECK(input, "failed to open ", path.string());
-    input.read(
-        reinterpret_cast<char *>(values.data()),
-        static_cast<std::streamsize>(values.size() * sizeof(float)));
-    TYLOINFER_RUNTIME_CHECK(
-        input.gcount() ==
-            static_cast<std::streamsize>(values.size() * sizeof(float)),
-        "short f32 tensor read from ", path.string());
-    return tyloi::cuda::from_blob(
-               values.data(), shape,
-               tyloi::TensorOptions().dtype(tyloi::kFloat32))
-        .clone()
-        .to(tyloi::kCUDA)
-        .contiguous();
-}
-
-static void write_f32_tensor(
-        const std::filesystem::path & path,
-        const tyloi::DenseTensor & tensor) {
-    auto host = tensor.to(tyloi::kCPU).to(tyloi::kFloat32).contiguous();
-    std::ofstream output(path, std::ios::binary);
-    TYLOINFER_RUNTIME_CHECK(output, "failed to create ", path.string());
-    output.write(
-        reinterpret_cast<const char *>(host.data_ptr<float>()),
-        static_cast<std::streamsize>(host.numel() * sizeof(float)));
-    TYLOINFER_RUNTIME_CHECK(output, "failed to write ", path.string());
-}
-
-int run_gdn_operator_check(
-        const std::string & input_dir,
-        const std::string & output_path,
-        const std::string & state_path,
-        int64_t tokens,
-        int64_t q_heads,
-        int64_t v_heads,
-        int64_t head_dim) {
-    TYLOINFER_RUNTIME_CHECK(
-        tokens >= 1 && q_heads >= 1 && v_heads >= q_heads && head_dim >= 1,
-        "invalid GDN diagnostic shape");
-    TYLOINFER_RUNTIME_CHECK(
-        v_heads % q_heads == 0,
-        "GDN diagnostic value heads must be divisible by query heads");
-    const std::filesystem::path root(input_dir);
-    auto q = read_f32_tensor(
-        root / "q.bin", {1, tokens, q_heads, head_dim})
-                 .permute({0, 2, 1, 3})
-                 .contiguous();
-    auto k = read_f32_tensor(
-        root / "k.bin", {1, tokens, q_heads, head_dim})
-                 .permute({0, 2, 1, 3})
-                 .contiguous();
-    auto v = read_f32_tensor(
-        root / "v.bin", {1, tokens, v_heads, head_dim})
-                 .permute({0, 2, 1, 3})
-                 .contiguous();
-    auto g = read_f32_tensor(
-        root / "g.bin", {1, tokens, v_heads})
-                 .permute({0, 2, 1})
-                 .contiguous();
-    auto beta = read_f32_tensor(
-        root / "beta.bin", {1, tokens, v_heads})
-                    .permute({0, 2, 1})
-                    .contiguous();
-    auto state = read_f32_tensor(
-        root / "state.bin", {1, v_heads, head_dim, head_dim});
-    auto result = gdn_inplace_transposed_tiled_cuda(
-        q, k, v, g, beta, state);
-    write_f32_tensor(output_path, result[0]);
-    write_f32_tensor(state_path, result[1]);
-    std::cout << "mfq_gdn_operator"
-              << " t=" << tokens
-              << " hq=" << q_heads
-              << " hv=" << v_heads
-              << " d=" << head_dim
-              << " output=" << output_path
-              << " state=" << state_path << "\n";
-    return 0;
-}
-
-int run_linear_conv_operator_check(
-        const std::string & input_dir,
-        const std::string & output_dir,
-        int64_t tokens,
-        int64_t q_heads,
-        int64_t v_heads,
-        int64_t key_dim,
-        int64_t value_dim,
-        int64_t kernel_size,
-        double eps) {
-    TYLOINFER_RUNTIME_CHECK(
-        tokens >= 2 && q_heads >= 1 && v_heads >= 1 &&
-            key_dim >= 1 && value_dim >= 1 &&
-            kernel_size >= 2 && kernel_size <= 8,
-        "invalid linear-conv diagnostic shape");
-    const int64_t qk_width = 2 * q_heads * key_dim;
-    const int64_t v_width = v_heads * value_dim;
-    const int64_t channels = qk_width + v_width;
-    const std::filesystem::path input_root(input_dir);
-    const std::filesystem::path output_root(output_dir);
-    std::filesystem::create_directories(output_root);
-    auto state = read_f32_tensor(
-        input_root / "state.bin",
-        {1, kernel_size - 1, channels});
-    auto qk = read_f32_tensor(
-                  input_root / "qk.bin",
-                  {1, tokens, qk_width})
-                  .to(tyloi::kHalf)
-                  .contiguous();
-    auto v = read_f32_tensor(
-                 input_root / "v.bin",
-                 {1, tokens, v_width})
-                 .to(tyloi::kHalf)
-                 .contiguous();
-    auto weight = read_f32_tensor(
-        input_root / "weight.bin",
-        {channels, 1, kernel_size});
-    tyloi::DenseTensor bias;
-    if (std::filesystem::exists(input_root / "bias.bin")) {
-        bias = read_f32_tensor(
-            input_root / "bias.bin", {channels});
-    } else {
-        bias = tyloi::cuda::empty(
-            {0},
-            tyloi::TensorOptions()
-                .device(tyloi::kCUDA)
-                .dtype(tyloi::kFloat32));
-    }
-    auto result = linear_conv_qkv_prefill_cuda(
-        state, qk, v, weight, bias,
-        q_heads, v_heads, key_dim, value_dim, eps);
-    write_f32_tensor(output_root / "q.bin", result[0]);
-    write_f32_tensor(output_root / "k.bin", result[1]);
-    write_f32_tensor(output_root / "v.bin", result[2]);
-    write_f32_tensor(output_root / "state.bin", result[3]);
-    std::cout << "mfq_linear_conv_operator"
-              << " t=" << tokens
-              << " hq=" << q_heads
-              << " hv=" << v_heads
-              << " dk=" << key_dim
-              << " dv=" << value_dim
-              << " kernel=" << kernel_size
-              << " output=" << output_dir << "\n";
-    return 0;
-}
-
 int run_q8_embedding_check(
-        CudaExecutionContext& execution,
-        const std::string & model_path,
+        tyloi::cuda::Program& program,
         const std::string & name) {
-    auto model_source = tyloi::open_model_source(model_path);
-    const auto& mfq = *model_source;
-    auto linear = load_quant_linear(execution, mfq, name);
+    auto& executor = program.executor();
+    auto scope = executor.enter(program.config().layer_placement.primary_device());
+    auto loader = program.loader();
+    auto linear = loader.weight(name);
     TYLOINFER_RUNTIME_CHECK(
-        linear.is_nint() && linear.nint.q8_zero,
+        linear.representation<tyloi::NintTensor>() != nullptr && payload_as<tyloi::NintTensor>(linear).q8_zero,
         "--check-q8-embedding requires an NINT8-0 tensor");
-    const int64_t vocab = linear.nint.out;
+    const int64_t vocab = payload_as<tyloi::NintTensor>(linear).out;
     std::vector<int64_t> host_ids = {
         0,
         std::min<int64_t>(1, vocab - 1),
@@ -762,11 +599,11 @@ int run_q8_embedding_check(
                    .to(tyloi::kCUDA)
                    .contiguous();
     auto candidate = nint8_zero_embedding_lookup_cuda(
-        linear.nint.q_packed, linear.nint.q8_zero_scale,
-        ids, linear.nint.neuron_len);
+        payload_as<tyloi::NintTensor>(linear).q_packed, payload_as<tyloi::NintTensor>(linear).q8_zero_scale,
+        ids, payload_as<tyloi::NintTensor>(linear).neuron_len);
     auto dense = nint8_zero_dequant_cuda(
-        linear.nint.q_packed, linear.nint.q8_zero_scale,
-        linear.nint.neuron_len);
+        payload_as<tyloi::NintTensor>(linear).q_packed, payload_as<tyloi::NintTensor>(linear).q8_zero_scale,
+        payload_as<tyloi::NintTensor>(linear).neuron_len);
     auto reference = dense.index_select(0, ids);
     auto difference =
         candidate.to(tyloi::kFloat32) - reference.to(tyloi::kFloat32);
@@ -775,7 +612,7 @@ int run_q8_embedding_check(
               << " tensor=" << name
               << " ids=" << host_ids.size()
               << " vocab=" << vocab
-              << " width=" << linear.nint.neuron_len
+              << " width=" << payload_as<tyloi::NintTensor>(linear).neuron_len
               << " equal=" << (candidate.equal(reference) ? 1 : 0)
               << " rel="
               << (difference.norm() /
@@ -787,31 +624,31 @@ int run_q8_embedding_check(
 }
 
 int run_dsv4_output_a_check(
-        CudaExecutionContext& execution,
-        const std::string & model_path,
+        tyloi::cuda::Program& program,
         const std::string & name,
         int batch,
         int reps) {
 #if TYLOINFER_ENABLE_MFQ_COMPAT
     constexpr int64_t kGroups = 8;
     TYLOINFER_RUNTIME_CHECK(batch > 0 && reps > 0, "DSV4 output_a check requires positive batch and reps");
-    auto model_source = tyloi::open_model_source(model_path);
-    const auto& mfq = *model_source;
-    auto linear = load_quant_linear(execution,
-        mfq, name, TensorParallelAxis::Input);
+    auto& executor = program.executor();
+    auto scope = executor.enter(program.config().layer_placement.primary_device());
+    auto loader = program.loader();
+    auto projector = executor.projector(tyloi::cuda::Executor::current_ffn());
+    auto linear = loader.weight(name, TensorParallelAxis::Input);
     const bool supported_nint =
-        linear.is_nint() &&
-        linear.nint.bits == 8 &&
-        linear.nint.gs == 48;
+        linear.representation<tyloi::NintTensor>() != nullptr &&
+        payload_as<tyloi::NintTensor>(linear).bits == 8 &&
+        payload_as<tyloi::NintTensor>(linear).gs == 48;
     TYLOINFER_RUNTIME_CHECK(
-        supported_nint || linear.is_mxfp8(),
+        supported_nint || linear.representation<tyloi::Mxfp8Tensor>() != nullptr,
         "DSV4 output_a check requires NINT8 gs48 or MXFP8");
     TYLOINFER_RUNTIME_CHECK(
-        linear.out() % kGroups == 0,
+        linear.size(0) % kGroups == 0,
         "DSV4 output_a rows must divide eight groups");
 
-    const int64_t width = linear.neuron_len();
-    const int64_t rows_per_group = linear.out() / kGroups;
+    const int64_t width = linear.size(1);
+    const int64_t rows_per_group = linear.size(0) / kGroups;
     auto sequence = tyloi::cuda::arange(
         (int64_t)batch * kGroups * width,
         tyloi::TensorOptions().device(tyloi::kCUDA).dtype(tyloi::kFloat32));
@@ -823,7 +660,7 @@ int run_dsv4_output_a_check(
         .contiguous();
 
     auto legacy = [&]() {
-        auto expanded = execution.projector().run(linear, grouped.reshape({batch * kGroups, width}))
+        auto expanded = projector.run(linear, grouped.reshape({batch * kGroups, width}))
             .reshape({batch, kGroups, kGroups, rows_per_group});
         std::vector<tyloi::DenseTensor> diagonal;
         diagonal.reserve(kGroups);
@@ -831,13 +668,13 @@ int run_dsv4_output_a_check(
             diagonal.push_back(
                 expanded.index({Slice(), group, group, Slice()}));
         }
-        return tyloi::cuda::stack(diagonal, 1).reshape({batch, linear.out()});
+        return tyloi::cuda::stack(diagonal, 1).reshape({batch, linear.size(0)});
     };
     auto groupwise = [&]() {
-        return linear.is_mxfp8()
-            ? execution.projector().groupwise(linear, grouped, kGroups)
+        return linear.representation<tyloi::Mxfp8Tensor>() != nullptr
+            ? projector.groupwise(linear, grouped, kGroups)
             : nint_matmul_groupwise_u8(
-                execution.profiler, linear.nint, grouped, kGroups);
+                executor.profiler(), payload_as<tyloi::NintTensor>(linear), grouped, kGroups);
     };
     auto time_ms = [&](auto && fn) {
         tyloi::DenseTensor output;
@@ -868,7 +705,7 @@ int run_dsv4_output_a_check(
     std::cout << std::fixed << std::setprecision(9)
               << "dsv4_output_a_check"
               << " tensor=" << name
-              << " format=" << (linear.is_mxfp8() ? "MXFP8" : "NINT8")
+              << " format=" << (linear.representation<tyloi::Mxfp8Tensor>() != nullptr ? "MXFP8" : "NINT8")
               << " batch=" << batch
               << " groups=" << kGroups
               << " rows_per_group=" << rows_per_group
@@ -882,7 +719,7 @@ int run_dsv4_output_a_check(
               << " speedup=" << legacy_result.first / groupwise_result.first
               << " checksum=" << candidate.sum().item<double>()
               << "\n";
-    if (linear.is_mxfp8()) {
+    if (linear.representation<tyloi::Mxfp8Tensor>() != nullptr) {
         TYLOINFER_RUNTIME_CHECK(
             tyloi::cuda::isfinite(candidate).all().item<bool>() &&
                 relative <= 5.0e-4f,
@@ -901,22 +738,23 @@ int run_dsv4_output_a_check(
 }
 
 int run_gemma_geglu_check(
-    CudaExecutionContext& execution,
-    const std::string & model_path,
+    tyloi::cuda::Program& program,
     int layer,
     int reps) {
     if (layer < 0 || reps < 1) {
         throw std::runtime_error("Gemma GeGLU check requires a nonnegative layer and positive reps");
     }
-    auto model_source = tyloi::open_model_source(model_path);
-    const auto& mfq = *model_source;
-    tyloi::cuda::validate_model_source(mfq);
+    auto& executor = program.executor();
+    auto scope = executor.enter(program.config().layer_placement.primary_device());
+    auto loader = program.loader();
+    auto projector = executor.projector(tyloi::cuda::Executor::current_ffn());
     const std::string prefix =
         "model.block." + std::to_string(layer) + ".mlp.";
-    auto gate_up = load_quant_group(execution,
-        mfq, {prefix + "gate.weight", prefix + "up.weight"}, 2);
-    auto down = load_quant_linear(execution, mfq, prefix + "down.weight");
-    if (!gate_up.nint_grouped || !gate_up.nint.split_w.empty() || !down.is_nint() ||
+    auto gate_up = tyloi::cuda::make_quant_group(
+        loader.group({prefix + "gate.weight", prefix + "up.weight"}, 2),
+        loader.options.grouped, loader.placement.cpu);
+    auto down = loader.weight(prefix + "down.weight");
+    if (!gate_up.nint_grouped || !gate_up.nint.split_w.empty() || !down.representation<tyloi::NintTensor>() ||
         gate_up.outs.size() != 2 || gate_up.outs[0] != gate_up.outs[1]) {
         throw std::runtime_error("Gemma GeGLU check requires packed NINT gate/up and NINT down tensors");
     }
@@ -928,28 +766,28 @@ int run_gemma_geglu_check(
               0.125 * tyloi::cuda::sin(xf * 0.03125)).to(tyloi::kFloat16).reshape({1, hidden}).contiguous();
 
     auto materialized_activation = [&]() {
-        auto parts = execution.projector().run(gate_up, x);
+        auto parts = projector.run(gate_up, x);
         return gelu_mul_cuda(parts[0].contiguous(), parts[1].contiguous());
     };
     auto materialized = [&]() {
-        return execution.projector().run(down, materialized_activation());
+        return projector.run(down, materialized_activation());
     };
     auto fused_activation = [&]() {
-        return execution.projector().geglu(gate_up, x);
+        return projector.geglu(gate_up, x);
     };
     auto fused = [&]() {
-        return execution.projector().run(down, fused_activation());
+        return projector.run(down, fused_activation());
     };
 
     auto reference_activation = materialized_activation();
-    auto reference_output = execution.projector().run(down, reference_activation);
+    auto reference_output = projector.run(down, reference_activation);
     std::cout << "gemma_geglu_check layer=" << layer
               << " gate_up_bits=" << gate_up.nint.w.bits
               << " gate_up_gs=" << gate_up.nint.w.gs
               << " gate_out=" << gate_up.outs[0]
               << " up_out=" << gate_up.outs[1]
-              << " down_bits=" << down.nint.bits
-              << " down_gs=" << down.nint.gs << "\n";
+              << " down_bits=" << payload_as<tyloi::NintTensor>(down).bits
+              << " down_gs=" << payload_as<tyloi::NintTensor>(down).gs << "\n";
     auto report = [&](const char * name, tyloi::DenseTensor value, tyloi::DenseTensor reference) {
         auto got = value.to(tyloi::kFloat64);
         auto ref = reference.to(tyloi::kFloat64);
@@ -990,8 +828,8 @@ int run_gemma_geglu_check(
     std::cout << "gemma_geglu_check layer=" << layer
               << " gate_bits=" << gate_up.nint.w.bits
               << " gate_gs=" << gate_up.nint.w.gs
-              << " down_bits=" << down.nint.bits
-              << " down_gs=" << down.nint.gs
+              << " down_bits=" << payload_as<tyloi::NintTensor>(down).bits
+              << " down_gs=" << payload_as<tyloi::NintTensor>(down).gs
               << " materialized_ms=" << materialized_ms
               << " combined_ms=" << combined_ms
               << " pair_ms=" << pair_ms << "\n";

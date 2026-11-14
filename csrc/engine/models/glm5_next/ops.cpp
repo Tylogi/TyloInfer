@@ -1,3 +1,4 @@
+#include "engine/models/plan.h"
 #include "engine/backends/cuda/kernels/mfq_cuda_moe_ops.h"
 #include "model.h"
 #include "mtp.h"
@@ -135,7 +136,7 @@ Model read(std::shared_ptr<const tyloi::ModelSource> source, std::string_view de
     Model model;
     model.source = std::move(source);
     model.graph = tyloi::models::graph(*model.source);
-    model.plan = cuda_model_plan(model.graph);
+    model.plan = ::tyloi::models::model_plan(model.graph);
     tyloi::models::require_model(model.graph.backbone == "glm5_next",
                                "model backbone does not match the requested causal model");
     tyloi::models::glm5_next::load_config(definition, model.config, model.metadata);
@@ -319,13 +320,13 @@ void State::rollback_speculative(std::int64_t accepted) {
 
 tyloi::models::Info Model::info() const { return tyloi::models::model_info(metadata); }
 MfqModelCapabilities Model::capabilities() const {
-    const auto state = cuda_component_state(graph, plan, false, false);
-    const auto caps = cuda_runtime_capabilities(graph, plan, state, false, false);
+    const auto state = ::tyloi::models::component_state(graph, plan, false, false);
+    const auto caps = ::tyloi::models::runtime_capabilities(graph, plan, state, false, false);
     return {graph.architecture, caps.text, caps.image_input, caps.video_input,
         caps.audio_input, caps.audio_output, caps.full_duplex, caps.mtp, "model-graph+cuda-adapters"};
 }
 tyloi::engine::Metrics Model::metrics() const {
-    const auto state = cuda_component_state(graph, plan, false, false);
+    const auto state = ::tyloi::models::component_state(graph, plan, false, false);
     return {{"kv_memory_supported", 0.0}, {"kv_quantization_supported", 0.0},
         {"kv_quantization_bits", 0.0}, {"vision_declared", double(state.vision_declared)},
         {"vision_supported", double(state.vision_supported)}, {"vision_available", double(state.vision_available)},

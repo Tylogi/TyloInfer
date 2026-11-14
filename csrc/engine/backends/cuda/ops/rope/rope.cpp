@@ -371,7 +371,7 @@ RotaryEmbedding::RotaryEmbedding(int64_t dimension, int64_t maximum, double base
 
 bool RotaryEmbedding::fused() const {
     if (const auto* executor = Executor::active())
-        return executor->mode().compute.rotary.value_or(fused_) && !yarn_.enabled();
+        return executor->compute().rotary.value_or(fused_) && !yarn_.enabled();
     return fused_;
 }
 

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "engine/models/plan.h"
 #include "engine/ops.h"
 #include "engine/models/causal_model.h"
 #include "engine/models/metadata.h"
@@ -10,6 +11,7 @@
 #include "engine/models/qwen4_exp/state.h"
 #include "engine/models/qwen4_exp/config.h"
 #include "engine/backends/cuda/ops/projection/quant_linear.h"
+#include "engine/backends/cuda/executor/executor.h"
 
 #include <memory>
 #include <functional>
@@ -18,8 +20,11 @@
 #include <vector>
 
 namespace tyloi::cuda::qwen4_exp { struct Layer; }
-namespace tyloi::cuda { class GatedResidual; }
-namespace tyloi::models { struct Mtp; }
+namespace tyloi::ops { class Residual; }
+namespace tyloi::models { struct Mtp; struct LoadOptions; }
+namespace tyloi::weights { struct Loader; }
+struct LayerPlacementConfig;
+namespace tyloi::cuda { class KvOffloadStore; class KvMemoryManager; }
 
 namespace tyloi::cuda {
 struct Qwen4DecodeGraph;
@@ -42,14 +47,14 @@ class Qwen4BatchRequestState {
     friend class Qwen4BatchDecodeGraph;
     friend std::vector<::tyloi::Tensor> qwen4_batch_prefill(
         qwen4_exp::Model&,const std::vector<Qwen4BatchRequestState*>&,
-        const std::vector<::tyloi::Tensor>&);
+        const std::vector<::tyloi::Tensor>&, bool);
     friend ::tyloi::Tensor qwen4_batch_decode(
         qwen4_exp::Model&, const std::vector<Qwen4BatchRequestState*>&,
         ::tyloi::Tensor, const ::tyloi::Tensor&);
 };
 std::vector<::tyloi::Tensor> qwen4_batch_prefill(
     qwen4_exp::Model&,const std::vector<Qwen4BatchRequestState*>&,
-    const std::vector<::tyloi::Tensor>&);
+    const std::vector<::tyloi::Tensor>&, bool);
 ::tyloi::Tensor qwen4_batch_decode(
     qwen4_exp::Model&, const std::vector<Qwen4BatchRequestState*>&,
     ::tyloi::Tensor ids, const ::tyloi::Tensor& host_ids);
@@ -60,7 +65,7 @@ class Qwen4BatchDecodeGraph {
         std::size_t growth = 0;
         bool rebuild = false;
     };
-    explicit Qwen4BatchDecodeGraph(qwen4_exp::Model&);
+    Qwen4BatchDecodeGraph(qwen4_exp::Model&, tyloi::weights::Cache&);
     ~Qwen4BatchDecodeGraph();
     std::optional<Plan> plan(const std::vector<Qwen4BatchRequestState*>&, bool greedy);
     std::optional<::tyloi::Tensor> run(
@@ -82,7 +87,7 @@ std::optional<::tyloi::Tensor> qwen4_decode_graph_hidden(
 void qwen4_report_decode_graph(const qwen4_exp::Model&,const qwen4_exp::State&,std::ostream&);
 std::vector<std::pair<std::string,double>> qwen4_decode_graph_profile_metrics(const qwen4_exp::Model&,const qwen4_exp::State&);
 ::tyloi::Tensor qwen4_decode_graph_compact_topk(const qwen4_exp::Model&,const qwen4_exp::State&);
-void qwen4_release_decode_graphs(qwen4_exp::Model&,qwen4_exp::State&);
+void qwen4_release_decode_graphs(const qwen4_exp::Model&,qwen4_exp::State&);
 void qwen4_warmup_decode_graphs(qwen4_exp::Model&,qwen4_exp::State&);
 std::vector<std::pair<std::string,double>> qwen4_cache_memory_metrics(const qwen4_exp::Model&,const qwen4_exp::State&,const tyloi::models::Mtp*);
 bool qwen4_layer_major_prefill_eligible(const qwen4_exp::Model&, const qwen4_exp::State&, int64_t tokens);
@@ -129,30 +134,25 @@ struct Model : tyloi::models::CausalModel {
 
     // ---- weights and load-time state
     tyloi::models::CausalLmMetadata metadata;
-    CudaExecutionContext* execution = nullptr;
+    int primary_device = 0;
     std::shared_ptr<const tyloi::ModelSource> source;
     tyloi::ModelGraph graph;
-    CudaModelPlan plan;
+    ::tyloi::models::Plan plan;
     ::tyloi::Tensor embed;
     ::tyloi::Tensor lm_head;
     CausalConfig config;
-    std::unique_ptr<GatedResidual> final_mixer;
+    std::unique_ptr<tyloi::ops::Residual> final_mixer;
     std::vector<std::unique_ptr<qwen4_exp::Layer>> layers;
 
     // ---- helpers absorbed from the retired CausalLm plumbing
-#ifndef TYLOINFER_NATIVE_CUDA
-    auto execution_scope() const {
-        return CudaScope(execution->config.layer_placement.primary_device(), execution->executor().contexts());
-    }
-#endif
     ::tyloi::DenseTensor device_ids(::tyloi::DenseTensor ids) const {
 #ifdef TYLOINFER_NATIVE_CUDA
         return tyloi::ops::contiguous(tyloi::ops::copy(
             tyloi::ops::cast(ids, ::tyloi::kInt64),
-            ::tyloi::Device(::tyloi::kCUDA, execution->config.layer_placement.primary_device()))).dense();
+            ::tyloi::Device(::tyloi::kCUDA, primary_device))).dense();
 #else
-        return execution->executor().collectives()
-            .copy(ids.to(::tyloi::kInt64), execution->config.layer_placement.primary_device())
+        return Executor::current().collectives()
+            .copy(ids.to(::tyloi::kInt64), primary_device)
             .contiguous();
 #endif
     }
@@ -162,7 +162,7 @@ struct Model : tyloi::models::CausalModel {
             return tyloi::ops::embedding(ids, embed);
         }).dense();
 #else
-        return execution->executor().profiler().measure(
+        return Executor::current().profiler().measure(
             "model.embed", [&] { return quant_embedding_lookup(embed, ids); });
 #endif
     }
@@ -183,8 +183,8 @@ struct Model : tyloi::models::CausalModel {
 
 void read(Model& model, std::shared_ptr<const tyloi::ModelSource> source,
           std::string_view definition, std::int64_t context_size);
-void load(Model& model, CudaExecutionContext& execution, std::int64_t context_size,
-          bool defer_moe_cache_finalize, bool load_layers);
+void load(Model& model, const tyloi::weights::Loader& weights, LayerPlacementConfig& placement,
+          const tyloi::models::LoadOptions& options, bool load_layers);
 
 } // namespace tyloi::cuda::qwen4_exp
 

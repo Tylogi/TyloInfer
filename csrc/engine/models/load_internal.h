@@ -1,8 +1,10 @@
 #pragma once
 
+#include "engine/models/plan.h"
 #include "engine/load.h"
 #include "engine/backends/cuda/native/scope.h"
-#include "engine/backends/cuda/executor/execution.h"
+#include "engine/backends/cuda/executor/config.h"
+#include "engine/models/deepseek_v41/load.h"
 #include "engine/models/common/components.h"
 #include "engine/models/qwen4_exp/components.h"
 #include "engine/models/qwen4_exp/ops.h"
@@ -48,11 +50,13 @@ namespace tyloi::cuda {
 
 template <bool IncludeQwen = true>
 inline constexpr auto with_model = []<typename F>(
-        CudaExecutionContext& execution,
+        CudaLoadConfig& config, Executor& root, tyloi::weights::Cache& cache,
+        std::shared_ptr<KvMemoryManager>& kv, std::shared_ptr<KvOffloadStore>& offload,
         const CudaLoadOptions& options,
         bool load_optional_components,
         F&& run) -> auto {
-    CudaScope scope(execution.config.layer_placement.primary_device(), execution.executor().contexts());
+    root.configure_kv(kv, offload);
+    auto scope = root.enter(config.layer_placement.primary_device());
     auto source = tyloi::open_model_source(options.model_path);
     auto finish = [&](auto& owner, auto& state, auto& executor, auto& components, auto started,
                       std::unique_ptr<tyloi::Executor> predictor_execution = {}) {
@@ -66,237 +70,243 @@ inline constexpr auto with_model = []<typename F>(
             else
                 throw std::logic_error("model state has no predictor state");
         }
-        tyloi::cuda::finalize_kv(execution.kv.get(),
-            execution.weights, execution.offload);
+        tyloi::cuda::finalize_kv(kv.get(), cache, offload);
+        root.configure_kv(kv, offload);
+        if constexpr (std::is_same_v<Model, qwen4_exp::Model>)
+            state->bind_resources(cache, config.cache.pipeline, model_parallel_enabled(config));
         const auto loaded_at = tyloi::cuda::finish_load(
-            execution.kv.get(), execution.weights, execution.config.report_cuda_memory);
+            kv.get(), cache, config.report_cuda_memory);
         return run(owner, state, executor, components, started, loaded_at, source, std::move(predictor_execution));
     };
     auto load_tts = [&] {
         auto started = std::chrono::steady_clock::now();
         auto definition = tyloi::models::config_json(*source, options.config_path);
-        definition = configure_yarn(execution.config.yarn, execution.config.yarn_context_extension, std::move(definition),
+        definition = configure_yarn(config.yarn, config.yarn_context_extension, std::move(definition),
             tyloi::models::graph(*source).backbone, options.context_size);
         auto owner = std::make_shared<minicpmo45::Model>(
             minicpmo45::read(source, definition, options.context_size));
         auto& model = *owner;
-        if (execution.config.expert_parallel.enabled())
+        if (config.expert_parallel.enabled())
             throw std::runtime_error("--expert-parallel requires a model with routed experts");
-        execution.config.layer_placement.prepare(model.config.num_hidden_layers);
-        execution.config.dense_cpu_layer_count = execution.config.n_gpu_layers >= 0
-            ? static_cast<int>(std::max<int64_t>(model.config.num_hidden_layers - execution.config.n_gpu_layers, 0)) : 0;
-        if (execution.config.dense_cpu_layer_count > 0) {
-            if (model_parallel_enabled(execution.config) || execution.config.layer_placement.enabled())
+        config.layer_placement.prepare(model.config.num_hidden_layers);
+        config.dense_cpu_layer_count = config.n_gpu_layers >= 0
+            ? static_cast<int>(std::max<int64_t>(model.config.num_hidden_layers - config.n_gpu_layers, 0)) : 0;
+        if (config.dense_cpu_layer_count > 0) {
+            if (model_parallel_enabled(config) || config.layer_placement.enabled())
                 throw std::runtime_error("--n-gpu-layers cannot be combined with tensor/expert/layer parallelism");
-            std::cerr << "dense_layer_placement cpu=0-" << execution.config.dense_cpu_layer_count - 1
-                << " gpu=" << execution.config.dense_cpu_layer_count << '-' << model.config.num_hidden_layers - 1
+            std::cerr << "dense_layer_placement cpu=0-" << config.dense_cpu_layer_count - 1
+                << " gpu=" << config.dense_cpu_layer_count << '-' << model.config.num_hidden_layers - 1
                 << " cpu_threads=" << mfq_get_num_threads() << '\n';
         }
-        auto weights = execution.weights.loader(*source, execution.config.weights,
-            {execution.config.layer_placement.primary_device(), false, execution.config.drop_file_cache,
-             execution.config.tensor_parallel, moe_parallel_config(execution.config)});
-        minicpmo45::load(model, weights, execution.config.layer_placement,
-            execution.config.dense_cpu_layer_count, execution.config.yarn);
+        auto weights = cache.loader(*source, config.weights,
+            {config.layer_placement.primary_device(), false, config.drop_file_cache,
+             config.tensor_parallel, moe_parallel_config(config)});
+        minicpmo45::load(model, weights, config.layer_placement,
+            config.dense_cpu_layer_count, config.yarn);
         minicpmo45::State state(model);
         if (::tyloi::cuda::options::kv_vram_preallocated()) state.preallocate();
         std::unique_ptr<minicpmo45::State> owned_state;
-        auto executor = execution.executor().fork(model_parallel_primary_device(execution.config));
+        auto executor = root.fork(model_parallel_primary_device(config));
         std::monostate components;
         owned_state = std::make_unique<minicpmo45::State>(std::move(state));
         return finish(owner, owned_state, executor, components, started);
     };
 
-    switch (cuda_backbone(tyloi::models::graph(*source).backbone)) {
-        case CudaBackbone::generic_qwen:
+    switch (::tyloi::models::backbone(tyloi::models::graph(*source).backbone)) {
+        case ::tyloi::models::Backbone::generic_qwen:
             if constexpr (IncludeQwen) {
                 auto started = std::chrono::steady_clock::now();
-                auto weights = execution.weights.loader(*source, execution.config.weights,
-                    {execution.config.layer_placement.primary_device(), false, execution.config.drop_file_cache,
-                     execution.config.tensor_parallel, moe_parallel_config(execution.config)});
+                auto weights = cache.loader(*source, config.weights,
+                    {config.layer_placement.primary_device(), false, config.drop_file_cache,
+                     config.tensor_parallel, moe_parallel_config(config)});
                 std::shared_ptr<qwen35::Model> owner;
                 std::unique_ptr<qwen35::State> state;
-                auto executor = execution.executor().fork(model_parallel_primary_device(execution.config));
+                auto executor = root.fork(model_parallel_primary_device(config));
                 const bool preallocate = ::tyloi::cuda::options::kv_vram_preallocated();
                 auto definition = tyloi::models::config_json(*source, options.config_path);
-                definition = configure_yarn(execution.config.yarn, execution.config.yarn_context_extension,
+                definition = configure_yarn(config.yarn, config.yarn_context_extension,
                     std::move(definition), tyloi::models::graph(*source).backbone, options.context_size);
                 owner = qwen35::load(
-                    source, definition, weights, execution.config.layer_placement,
+                    source, definition, weights, config.layer_placement,
                     tyloi::models::LoadOptions{
                         .context = options.context_size,
-                        .gpu_layers = execution.config.n_gpu_layers,
-                        .expert_parallel = execution.config.expert_parallel.enabled(),
-                        .recurrent_transposed = execution.executor().mode().transposed,
-                        .mirror_scalars = execution.config.tensor_parallel_mirror_linear_attention_scalars,
-                        .yarn = execution.config.yarn},
-                    execution.config.dense_cpu_layer_count);
-                state = std::make_unique<qwen35::State>(*owner, execution.executor().mode().transposed);
+                        .gpu_layers = config.n_gpu_layers,
+                        .expert_parallel = config.expert_parallel.enabled(),
+                        .recurrent_transposed = root.mode().transposed,
+                        .mirror_scalars = config.tensor_parallel_mirror_linear_attention_scalars,
+                        .yarn = config.yarn},
+                    config.dense_cpu_layer_count);
+                state = std::make_unique<qwen35::State>(*owner, root.mode().transposed);
                 if (preallocate) state->preallocate();
                 std::unique_ptr<tyloi::Executor> predictor_execution;
                 auto components = qwen35::Components::load(
-                    *owner, weights, execution.config.layer_placement, execution.config.dense_cpu_layer_count,
+                    *owner, weights, config.layer_placement, config.dense_cpu_layer_count,
                     *executor, predictor_execution, load_optional_components,
-                    !execution.config.dsv4_cpu_offload_layers.empty(), preallocate);
+                    !config.dsv4_cpu_offload_layers.empty(), preallocate);
                 return finish(owner, state, executor, components, started, std::move(predictor_execution));
             } else {
                 throw std::runtime_error("unsupported CUDA model backbone");
             }
-        case CudaBackbone::minicpmo45: {
+        case ::tyloi::models::Backbone::minicpmo45: {
             auto started = std::chrono::steady_clock::now();
             auto definition = tyloi::models::config_json(*source, options.config_path);
-            definition = configure_yarn(execution.config.yarn, execution.config.yarn_context_extension,
+            definition = configure_yarn(config.yarn, config.yarn_context_extension,
                 std::move(definition), tyloi::models::graph(*source).backbone, options.context_size);
             auto owner = std::make_shared<minicpmo45::text::Model>(
                 minicpmo45::text::read(source, definition, options.context_size));
-            auto weights = execution.weights.loader(*source, execution.config.weights,
-                {execution.config.layer_placement.primary_device(), false, execution.config.drop_file_cache,
-                 execution.config.tensor_parallel, moe_parallel_config(execution.config)});
-            execution.config.dense_cpu_layer_count = execution.config.n_gpu_layers >= 0
-                ? static_cast<int>(std::max<int64_t>(owner->config.num_hidden_layers - execution.config.n_gpu_layers, 0)) : 0;
-            minicpmo45::text::load(*owner, weights, execution.config.layer_placement,
-                execution.config.n_gpu_layers, execution.config.expert_parallel.enabled(), true, true, execution.config.yarn);
+            auto weights = cache.loader(*source, config.weights,
+                {config.layer_placement.primary_device(), false, config.drop_file_cache,
+                 config.tensor_parallel, moe_parallel_config(config)});
+            config.dense_cpu_layer_count = config.n_gpu_layers >= 0
+                ? static_cast<int>(std::max<int64_t>(owner->config.num_hidden_layers - config.n_gpu_layers, 0)) : 0;
+            minicpmo45::text::load(*owner, weights, config.layer_placement,
+                config.n_gpu_layers, config.expert_parallel.enabled(), true, true, config.yarn);
             auto state = std::make_unique<minicpmo45::text::State>(*owner);
             state->preallocate();
-            auto executor = execution.executor().fork(model_parallel_primary_device(execution.config));
-            auto components = minicpmo45::load_components(*owner,
-#ifndef TYLOINFER_NATIVE_CUDA
-                *executor,
-#endif
-                weights,
-                load_optional_components, execution);
+            auto executor = root.fork(model_parallel_primary_device(config));
+            auto components = minicpmo45::load_components(*owner, *executor, weights,
+                load_optional_components, config.layer_placement.primary_device());
             return finish(owner, state, executor, components, started);
         }
-        case CudaBackbone::minicpmo_tts:
+        case ::tyloi::models::Backbone::minicpmo_tts:
             return load_tts();
-        case CudaBackbone::glm_dsa: {
+        case ::tyloi::models::Backbone::glm_dsa: {
             auto started = std::chrono::steady_clock::now();
             auto definition = tyloi::models::config_json(*source, options.config_path);
-            definition = configure_yarn(execution.config.yarn, execution.config.yarn_context_extension,
+            definition = configure_yarn(config.yarn, config.yarn_context_extension,
                 std::move(definition), tyloi::models::graph(*source).backbone, options.context_size);
             auto owner = std::make_shared<glm_dsa::Model>(
                 glm_dsa::read(source, definition, options.context_size));
-            auto weights = execution.weights.loader(*source, execution.config.weights,
-                {execution.config.layer_placement.primary_device(), false, execution.config.drop_file_cache,
-                 execution.config.tensor_parallel, moe_parallel_config(execution.config)});
-            execution.config.dense_cpu_layer_count = 0;
-            glm_dsa::load(*owner, weights, execution.config.layer_placement,
-                          execution.config.n_gpu_layers, true, true, execution.config.yarn);
+            auto weights = cache.loader(*source, config.weights,
+                {config.layer_placement.primary_device(), false, config.drop_file_cache,
+                 config.tensor_parallel, moe_parallel_config(config)});
+            config.dense_cpu_layer_count = 0;
+            glm_dsa::load(*owner, weights, config.layer_placement,
+                          config.n_gpu_layers, true, true, config.yarn);
             auto state = std::make_unique<glm_dsa::State>(*owner);
             state->preallocate();
-            auto executor = execution.executor().fork(model_parallel_primary_device(execution.config));
-            if (load_optional_components && (owner->plan.vision != CudaVisionAdapter::none ||
-                    owner->plan.predictor != CudaPredictorAdapter::none))
+            auto executor = root.fork(model_parallel_primary_device(config));
+            if (load_optional_components && (owner->plan.vision != ::tyloi::models::VisionAdapter::none ||
+                    owner->plan.predictor != ::tyloi::models::PredictorAdapter::none))
                 throw std::runtime_error("CUDA component adapter is unsupported for this model");
             std::monostate components;
             return finish(owner, state, executor, components, started);
         }
-        case CudaBackbone::glm5_next: {
+        case ::tyloi::models::Backbone::glm5_next: {
             auto started = std::chrono::steady_clock::now();
             auto definition = tyloi::models::config_json(*source, options.config_path);
-            definition = configure_yarn(execution.config.yarn, execution.config.yarn_context_extension,
+            definition = configure_yarn(config.yarn, config.yarn_context_extension,
                 std::move(definition), tyloi::models::graph(*source).backbone, options.context_size);
             auto owner = std::make_shared<glm5_next::Model>(
                 glm5_next::read(source, definition, options.context_size));
-            auto weights = execution.weights.loader(*source, execution.config.weights,
-                {execution.config.layer_placement.primary_device(), false, execution.config.drop_file_cache,
-                 execution.config.tensor_parallel, moe_parallel_config(execution.config)});
-            execution.config.dense_cpu_layer_count = 0;
-            glm5_next::load(*owner, weights, execution.config.layer_placement, execution.config.n_gpu_layers);
+            auto weights = cache.loader(*source, config.weights,
+                {config.layer_placement.primary_device(), false, config.drop_file_cache,
+                 config.tensor_parallel, moe_parallel_config(config)});
+            config.dense_cpu_layer_count = 0;
+            glm5_next::load(*owner, weights, config.layer_placement, config.n_gpu_layers);
             auto state = std::make_unique<glm5_next::State>(*owner);
             state->preallocate();
-            auto executor = execution.executor().fork(model_parallel_primary_device(execution.config));
+            auto executor = root.fork(model_parallel_primary_device(config));
             auto components = glm5_next::load_components(*owner, weights, load_optional_components);
             return finish(owner, state, executor, components, started);
         }
-        case CudaBackbone::qwen4_exp: {
-            auto started = std::chrono::steady_clock::now();
-            auto owner = std::make_shared<qwen4_exp::Model>();
-            qwen4_exp::read(*owner, source, tyloi::models::config_json(*source, options.config_path),
-                            options.context_size);
-            owner->execution = &execution;
-            qwen4_exp::load(*owner, execution, options.context_size, true, true);
-            auto weights = execution.weights.loader(*owner->source, execution.config.weights,
-                {execution.config.layer_placement.primary_device(), false, execution.config.drop_file_cache,
-                 execution.config.tensor_parallel, moe_parallel_config(execution.config)});
-            auto components = qwen4_exp::load_components(*owner, weights, load_optional_components);
-            auto state = std::unique_ptr<qwen4_exp::State>(static_cast<qwen4_exp::State*>(
-                owner->make_state().release()));
-            auto executor = execution.executor().fork(model_parallel_primary_device(execution.config));
-            return finish(owner, state, executor, components, started);
-        }
-        case CudaBackbone::deepseek_v4: {
+        case ::tyloi::models::Backbone::qwen4_exp: {
             auto started = std::chrono::steady_clock::now();
             auto definition = tyloi::models::config_json(*source, options.config_path);
-            definition = configure_yarn(execution.config.yarn, execution.config.yarn_context_extension,
+            definition = configure_yarn(config.yarn, config.yarn_context_extension,
+                std::move(definition), tyloi::models::graph(*source).backbone, options.context_size);
+            auto owner = std::make_shared<qwen4_exp::Model>();
+            qwen4_exp::read(*owner, source, definition, options.context_size);
+            auto weights = cache.loader(*source, config.weights,
+                {config.layer_placement.primary_device(), false, config.drop_file_cache,
+                 config.tensor_parallel, moe_parallel_config(config)});
+            const tyloi::models::LoadOptions policy{
+                .context = options.context_size, .gpu_layers = config.n_gpu_layers,
+                .expert_parallel = config.expert_parallel.enabled(),
+                .recurrent_transposed = root.mode().transposed,
+                .vision_resident = ::tyloi::cuda::options::vision_resident(), .yarn = config.yarn};
+            qwen4_exp::load(*owner, weights, config.layer_placement, policy, true);
+            config.dense_cpu_layer_count = config.n_gpu_layers >= 0
+                ? static_cast<int>(std::max<int64_t>(owner->num_hidden_layers() - config.n_gpu_layers, 0)) : 0;
+            auto components = qwen4_exp::load_components(*owner, weights,
+                load_optional_components, policy);
+            auto state = std::unique_ptr<qwen4_exp::State>(static_cast<qwen4_exp::State*>(
+                owner->make_state().release()));
+            auto executor = root.fork(model_parallel_primary_device(config));
+            return finish(owner, state, executor, components, started);
+        }
+        case ::tyloi::models::Backbone::deepseek_v4: {
+            auto started = std::chrono::steady_clock::now();
+            auto definition = tyloi::models::config_json(*source, options.config_path);
+            definition = configure_yarn(config.yarn, config.yarn_context_extension,
                 std::move(definition), tyloi::models::graph(*source).backbone, options.context_size);
             auto owner = std::make_shared<deepseek_v4::Model>(
                 deepseek_v4::read(source, definition, options.context_size));
-            deepseek_v4::validate_offload(owner->config, execution.config.dsv4_cpu_offload_layers);
-            if (!execution.config.dsv4_cpu_offload_layers.empty()) {
-                execution.config.dsv4_cpu_offload_host_bytes = 0;
-                execution.config.drop_file_cache = true;
+            deepseek_v4::validate_offload(owner->config, config.dsv4_cpu_offload_layers);
+            if (!config.dsv4_cpu_offload_layers.empty()) {
+                config.dsv4_cpu_offload_host_bytes = 0;
+                config.drop_file_cache = true;
             }
-            auto weights = execution.weights.loader(*source, execution.config.weights,
-                {execution.config.layer_placement.primary_device(), false, execution.config.drop_file_cache,
-                 execution.config.tensor_parallel, moe_parallel_config(execution.config)});
-            execution.config.dense_cpu_layer_count = 0;
-            deepseek_v4::load(*owner, weights, execution.config.layer_placement, execution.executor().collectives(),
-                model_parallel_primary_device(execution.config), execution.config.dsv4_cpu_offload_layers,
-                execution.config.dsv4_cpu_offload_host_bytes, execution.config.n_gpu_layers);
+            auto weights = cache.loader(*source, config.weights,
+                {config.layer_placement.primary_device(), false, config.drop_file_cache,
+                 config.tensor_parallel, moe_parallel_config(config)});
+            config.dense_cpu_layer_count = 0;
+            deepseek_v4::load(*owner, weights, config.layer_placement, root.collectives(),
+                model_parallel_primary_device(config), config.dsv4_cpu_offload_layers,
+                config.dsv4_cpu_offload_host_bytes, config.n_gpu_layers);
             auto state = std::make_unique<deepseek_v4::State>(*owner);
             state->preallocate();
-            auto executor = execution.executor().fork(model_parallel_primary_device(execution.config));
-            if (load_optional_components && (owner->plan.vision != CudaVisionAdapter::none ||
-                    owner->plan.predictor != CudaPredictorAdapter::none))
+            auto executor = root.fork(model_parallel_primary_device(config));
+            if (load_optional_components && (owner->plan.vision != ::tyloi::models::VisionAdapter::none ||
+                    owner->plan.predictor != ::tyloi::models::PredictorAdapter::none))
                 throw std::runtime_error("CUDA component adapter is unsupported for this model");
             std::monostate components;
             return finish(owner, state, executor, components, started);
         }
-        case CudaBackbone::deepseek_v41: {
+        case ::tyloi::models::Backbone::deepseek_v41: {
             auto started = std::chrono::steady_clock::now();
             auto definition = tyloi::models::config_json(*source, options.config_path);
-            auto owner = std::make_shared<deepseek_v41::Model>();
-            deepseek_v41::read(*owner, source, definition, options.context_size);
-            auto weights = execution.weights.loader(*owner->source, execution.config.weights,
-                {execution.config.layer_placement.primary_device(), false, execution.config.drop_file_cache,
-                 execution.config.tensor_parallel, moe_parallel_config(execution.config)});
-            deepseek_v41::load(*owner, execution, options.context_size, false, true, false);
-            auto components = deepseek_v41::load_components(*owner, weights, load_optional_components,
-#ifdef TYLOINFER_NATIVE_CUDA
-                execution.weights);
-#else
-                execution);
-#endif
+            definition = configure_yarn(config.yarn, config.yarn_context_extension,
+                std::move(definition), tyloi::models::graph(*source).backbone, options.context_size);
+            auto weights = cache.loader(*source, config.weights,
+                {config.layer_placement.primary_device(), false, config.drop_file_cache,
+                 config.tensor_parallel, moe_parallel_config(config)});
+            std::unique_ptr<tyloi::models::CausalModel> model;
+            deepseek_v41::load(model, source, definition, weights, config.layer_placement,
+                {.context = options.context_size, .gpu_layers = config.n_gpu_layers,
+                 .expert_parallel = config.expert_parallel.enabled(), .yarn = config.yarn,
+                 .cpu_offload_layers = config.dsv4_cpu_offload_layers,
+                 .engram_cache_rows = config.deepseek_v41_engram_cache_rows,
+                 .host_tokens = config.cache.pipeline, .optional_components = false});
+            auto owner = std::shared_ptr<deepseek_v41::Model>(
+                static_cast<deepseek_v41::Model*>(model.release()));
+            config.dense_cpu_layer_count = 0;
+            auto components = deepseek_v41::load_components(*owner, weights, load_optional_components);
             auto state = std::unique_ptr<deepseek_v41::State>(static_cast<deepseek_v41::State*>(
                 owner->make_state().release()));
-            auto executor = execution.executor().fork(model_parallel_primary_device(execution.config));
+            auto executor = root.fork(model_parallel_primary_device(config));
             return finish(owner, state, executor, components, started);
         }
-        case CudaBackbone::nemotron_h: {
+        case ::tyloi::models::Backbone::nemotron_h: {
             auto started = std::chrono::steady_clock::now();
             auto definition = tyloi::models::config_json(*source, options.config_path);
-            definition = configure_yarn(execution.config.yarn, execution.config.yarn_context_extension,
+            definition = configure_yarn(config.yarn, config.yarn_context_extension,
                 std::move(definition), tyloi::models::graph(*source).backbone, options.context_size);
             auto owner = std::make_shared<nemotron_h::Model>(
                 nemotron_h::read(source, definition, options.context_size));
-            auto weights = execution.weights.loader(*source, execution.config.weights,
-                {execution.config.layer_placement.primary_device(), false, execution.config.drop_file_cache,
-                 execution.config.tensor_parallel, moe_parallel_config(execution.config)});
-            execution.config.dense_cpu_layer_count = 0;
-            nemotron_h::load(*owner, weights, execution.config.layer_placement,
-                             execution.config.n_gpu_layers, execution.config.expert_parallel.enabled());
+            auto weights = cache.loader(*source, config.weights,
+                {config.layer_placement.primary_device(), false, config.drop_file_cache,
+                 config.tensor_parallel, moe_parallel_config(config)});
+            config.dense_cpu_layer_count = 0;
+            nemotron_h::load(*owner, weights, config.layer_placement,
+                             config.n_gpu_layers, config.expert_parallel.enabled());
             auto state = std::make_unique<nemotron_h::State>(*owner);
             state->preallocate();
-            auto executor = execution.executor().fork(model_parallel_primary_device(execution.config));
-#ifdef TYLOINFER_NATIVE_CUDA
+            auto executor = root.fork(model_parallel_primary_device(config));
             auto components = nemotron_h::load_components(*owner, weights, load_optional_components);
-#else
-            auto components = nemotron_h::load_components(*owner, weights, load_optional_components,
-                execution);
-#endif
             return finish(owner, state, executor, components, started);
         }
-        case CudaBackbone::unsupported:
+        case ::tyloi::models::Backbone::unsupported:
             throw std::runtime_error("unsupported CUDA model backbone");
     }
     throw std::runtime_error("invalid CUDA model backbone");

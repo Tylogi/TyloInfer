@@ -68,6 +68,12 @@ public:
     void initialize_request_cache(State&, bool allocate_counters = true) const;
     /** Estimate missing recurrent backing. */
     std::size_t growth_bytes(const State&) const;
+    /** Estimate retained and temporary backing for ordinary execution. */
+    std::pair<std::size_t, std::size_t> ordinary_growth_bytes(
+        const State&, std::int64_t batch, std::int64_t tokens) const;
+    /** Estimate speculative checkpoint backing. */
+    std::size_t checkpoint_growth_bytes(
+        const State&, std::int64_t batch, std::int64_t tokens, std::int64_t confirmed) const;
     /** Estimate recurrent backing and persistent workspace. */
     std::size_t request_cache_growth_bytes(const State&) const;
     /** Restore recurrent values into compatible request storage. */

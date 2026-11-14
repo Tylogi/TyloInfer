@@ -9,14 +9,13 @@ namespace tyloi::models::qwen4_exp {
 
 template <class Loader>
 auto load_residual(Loader &ops, const Config &c, const std::string &p, bool combine) {
-    auto norm = std::make_shared<::tyloi::DenseTensor>(
-        ops.dense(p + ".norm.weight").dense()
-            .to(::tyloi::kFloat32).contiguous());
-    auto down = ops.residual_linear(p + ".down.weight"), up = ops.residual_linear(p + ".up.weight");
+    auto norm = ::tyloi::ops::contiguous(::tyloi::ops::cast(
+        ops.dense(p + ".norm.weight"), ::tyloi::kFloat32));
+    auto down = ops.weight(p + ".down.weight"), up = ops.weight(p + ".up.weight");
     decltype(down) injection{};
     if (combine)
-        injection = ops.residual_linear(p.substr(0, p.size() - 4) + ".post.inject.weight");
-    return ops.residual(std::move(norm), std::move(down), std::move(up), std::move(injection), c);
+        injection = ops.weight(p.substr(0, p.size() - 4) + ".post.inject.weight");
+    return ops.residual(std::move(norm), std::move(down), std::move(up), std::move(injection), c, !combine);
 }
 
 template <class Loader>
@@ -29,7 +28,7 @@ auto load_ffn(Loader &ops, const Config &c, int layer, const std::string &p) {
          su = ops.weight(p + ".shared_expert.up.weight"),
          sd = ops.weight(p + ".shared_expert.down.weight");
     return ops.moe(std::move(gate_up), std::move(down), std::move(router), std::move(shared_gate),
-                   std::move(sg), std::move(su), std::move(sd), c);
+                   std::move(sg), std::move(su), std::move(sd), c, layer);
 }
 
 template <class Loader>

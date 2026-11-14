@@ -52,7 +52,11 @@ public:
     virtual std::vector<std::pair<tyloi::Device, std::size_t>> preallocate_growth() const {
         throw std::logic_error("state preallocation planning is not implemented");
     }
+    // Additional allocations performed by reset itself, before forward growth.
+    virtual std::vector<std::pair<tyloi::Device, std::size_t>> reset_growth(std::int64_t) const { return {}; }
     virtual void reset(std::int64_t batch) = 0;
+    // Retire graphs owned by this request; externally owned graphs are retired by their owner.
+    virtual void release_graphs() {}
     virtual std::int64_t position() const noexcept = 0;
     virtual void advance(std::int64_t tokens) noexcept = 0;
     virtual void set_position_delta(std::int64_t delta) noexcept = 0;

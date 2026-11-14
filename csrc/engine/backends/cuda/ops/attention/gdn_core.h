@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdio>
+#include <limits>
 
 namespace tyloi::ops {
 struct Gdn::State::Impl {
@@ -86,6 +87,60 @@ class GdnCore {
     std::size_t growth_bytes(const State& request) const {
         return (request.conv.dense().defined() ? 0 : std::size_t(kernel_-1)*(2*nk_+nv_)*d_*sizeof(float)) +
             (request.recurrent.dense().defined() ? 0 : std::size_t(nv_)*d_*d_*sizeof(float));
+    }
+    std::pair<std::size_t, std::size_t> ordinary_growth_bytes(const State& request, int64_t batch, int64_t tokens) const {
+        TYLOINFER_RUNTIME_CHECK(batch > 0 && tokens > 0 && nk_ > 0 && nv_ > 0 && d_ > 0 && kernel_ > 1 &&
+            nk_ <= (std::numeric_limits<int64_t>::max() - nv_) / 2 &&
+            tokens <= std::numeric_limits<int64_t>::max() - (kernel_ - 1), "invalid GDN growth geometry");
+        if (request.conv.dense().defined())
+            TYLOINFER_RUNTIME_CHECK(request.conv.dense().size(0) == batch, "GDN batch changed");
+        const auto device = w_->norm.device();
+        const auto bytes = [&](const auto& shape) {
+            return ::tyloi::make_contiguous_view(nullptr, shape, ::tyloi::kFloat32, device).nbytes();
+        };
+        std::size_t retained = 0, temporary = 0;
+        const auto add = [](std::size_t& total, std::size_t value) {
+            if (total > std::numeric_limits<std::size_t>::max() - value) throw std::overflow_error("GDN growth overflow");
+            total += value;
+        };
+        const std::array<int64_t,4> joined{batch, kernel_ - 1 + tokens, 2 * nk_ + nv_, d_};
+        const std::array<int64_t,4> conv{batch, kernel_ - 1, 2 * nk_ + nv_, d_};
+        const std::array<int64_t,4> recurrent{batch, nv_, d_, d_};
+        const auto joined_bytes = bytes(joined), conv_bytes = bytes(conv), recurrent_bytes = bytes(recurrent);
+        if (!request.conv.dense().defined() && batch == 1 && !request.impl_->resident) add(retained, joined_bytes);
+        else add(temporary, joined_bytes);
+        if (batch > 1) add(temporary, conv_bytes);
+        if (!request.conv.dense().defined()) {
+            add(temporary, conv_bytes);
+            if (batch > 1 && !request.impl_->resident) { temporary -= conv_bytes; add(retained, conv_bytes); }
+            if (request.impl_->resident) add(retained, conv_bytes);
+        }
+        if (request.recurrent.dense().defined()) add(temporary, recurrent_bytes);
+        else {
+            add(retained, recurrent_bytes);
+            if (request.impl_->resident) add(temporary, recurrent_bytes);
+        }
+        if (tokens == 1 && request.conv.dense().defined() && request.recurrent.dense().defined() &&
+            !request.impl_->core_workspace.dense().defined() && fused_core_ && fused_decode_ &&
+            fused_preparation_ && fused_output_ && transposed_state_) {
+            if (d_ == std::numeric_limits<int64_t>::max()) throw std::overflow_error("GDN workspace overflow");
+            const std::array<int64_t,3> workspace{batch, nv_, d_ + 1}; add(retained, bytes(workspace));
+        }
+        return {retained, temporary};
+    }
+    std::size_t checkpoint_growth_bytes(const State& request, int64_t batch, int64_t tokens, int64_t confirmed) const {
+        if (tokens <= 8)
+            TYLOINFER_RUNTIME_CHECK(request.conv.dense().defined() && request.recurrent.dense().defined(),
+                                    "GDN verification requires committed recurrent state");
+        const auto count = tokens <= 8 ? tokens - confirmed : 1;
+        const std::array<int64_t,4> conv{batch, kernel_ - 1, 2 * nk_ + nv_, d_};
+        const std::array<int64_t,4> recurrent{batch, nv_, d_, d_};
+        const auto a = ::tyloi::make_contiguous_view(nullptr, conv, ::tyloi::kFloat32, w_->norm.device()).nbytes();
+        const auto b = ::tyloi::make_contiguous_view(nullptr, recurrent, ::tyloi::kFloat32, w_->norm.device()).nbytes();
+        if (a > std::numeric_limits<std::size_t>::max() - b ||
+            (a + b && std::size_t(count) > std::numeric_limits<std::size_t>::max() / (a + b)))
+            throw std::overflow_error("GDN checkpoint growth overflow");
+        return (a + b) * std::size_t(count);
     }
     std::size_t request_cache_growth_bytes(const State& request) const {
         return growth_bytes(request) + (fused_core_ && fused_decode_ && fused_preparation_ &&
@@ -178,7 +233,7 @@ class GdnCore {
                          std::vector<DenseTensor>& checkpoint_conv,std::vector<DenseTensor>& checkpoint_state) {
         if(!confirmed)return forward_chunk(request, x,true);
         const auto batch=::tyloi::cuda::options::gdn_batch_projection();
-        const bool grouped=tyloi::cuda::Executor::current().mode().compute.attention_grouped.value_or(grouped_projection_) && ::tyloi::ops::grouped(w_->input_projection) && x.size(1)<=8 && (!batch || *batch);
+        const bool grouped=tyloi::cuda::Executor::current().compute().attention_grouped.value_or(grouped_projection_) && ::tyloi::ops::grouped(w_->input_projection) && x.size(1)<=8 && (!batch || *batch);
         // Only recurrence is split at the confirmation boundary. Both parts
         // share the input projections and one output projection.
         std::vector<DenseTensor> projected;if(grouped)projected=project_inputs(x);
@@ -257,7 +312,7 @@ class GdnCore {
         }
         const auto batch=::tyloi::cuda::options::gdn_batch_projection();
         const bool grouped=cache && confirmed>0 && confirmed<x.size(1) && x.size(1)<=8 &&
-            tyloi::cuda::Executor::current().mode().compute.attention_grouped.value_or(grouped_projection_) && ::tyloi::ops::grouped(w_->input_projection) && (!batch || *batch);
+            tyloi::cuda::Executor::current().compute().attention_grouped.value_or(grouped_projection_) && ::tyloi::ops::grouped(w_->input_projection) && (!batch || *batch);
         std::vector<DenseTensor> projected;
         if(grouped)projected=project_inputs(x);
         const auto run_window = [&](int64_t start, int64_t count) {
@@ -364,7 +419,7 @@ class GdnCore {
                 const auto project = [&] {
                 DenseTensor projected;
                 if(!projections.empty())projected=projections[0];
-                else if(tyloi::cuda::Executor::current().mode().compute.attention_grouped.value_or(grouped_projection_) && ::tyloi::ops::grouped(w_->input_projection)) {
+                else if(tyloi::cuda::Executor::current().compute().attention_grouped.value_or(grouped_projection_) && ::tyloi::ops::grouped(w_->input_projection)) {
                     projections=project_inputs(x);
                     TYLOINFER_RUNTIME_CHECK(projections.size()==4,"GDN input projection count mismatch");
                     projected=projections[0];
@@ -603,7 +658,7 @@ inline DenseTensor GdnCore::project_qkv(const DenseTensor& source) const {
 }
 
 inline std::vector<DenseTensor> GdnCore::project_inputs(const DenseTensor& source) const {
-    if(!(tyloi::cuda::Executor::current().mode().compute.attention_grouped.value_or(grouped_projection_) && ::tyloi::ops::grouped(w_->input_projection)))
+    if(!(tyloi::cuda::Executor::current().compute().attention_grouped.value_or(grouped_projection_) && ::tyloi::ops::grouped(w_->input_projection)))
         return {project_qkv(source),
             project_weight(w_->input_projection[w_->qkv_count],source),
             project_weight(w_->input_projection[w_->qkv_count+1],source),

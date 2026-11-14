@@ -86,7 +86,7 @@ GgufProjectionInput prepare_gguf_group_input(
 std::vector<::tyloi::DenseTensor> project_gguf_group(
     const std::vector<GgufWeight>& weights,::tyloi::DenseTensor input);
 
-struct CudaExecutionContext;
+struct CudaProfiler;
 class GgufExpertCache;
 std::size_t gguf_expert_cache_budget_bytes(const std::shared_ptr<GgufExpertCache>&);
 std::uint64_t gguf_expert_streamed_bytes(const std::shared_ptr<GgufExpertCache>&);
@@ -136,7 +136,9 @@ struct GgufRoutedWeight {
     ggml_type type;
     std::uint64_t source_id, row_bytes, expert_bytes;
     std::int64_t experts, out, input;
-    GgufRoutedWeight(CudaExecutionContext&, const tyloi::ModelSource&, const std::string&);
+    GgufRoutedWeight(std::size_t host_physical_limit, std::size_t device_limit,
+        std::size_t host_limit, std::size_t moe_device_budget, CudaProfiler&,
+        std::shared_ptr<GgufExpertCache>&, const tyloi::ModelSource&, const std::string&);
     GgufWeight resident_expert(std::int64_t expert, int device) const;
     ::tyloi::DenseTensor forward(::tyloi::DenseTensor source,
         ::tyloi::DenseTensor ids) const;

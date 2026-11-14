@@ -5,10 +5,11 @@
 #include "engine/models/common/attention_ops.h"
 #include "engine/models/qwen4_exp/config.h"
 
-struct CudaExecutionContext;
+namespace tyloi::cuda { class KvOffloadStore; class KvMemoryManager; }
 namespace tyloi::weights { struct Loader; }
+namespace tyloi::models { struct LoadOptions; }
 
-namespace tyloi::cuda { class GatedResidual; }
+namespace tyloi::ops { class Residual; }
 
 namespace tyloi::cuda::qwen4_exp {
 using attention_ops::Linear;
@@ -34,25 +35,18 @@ struct Predictor final : tyloi::models::Mtp {
     ::tyloi::Tensor embedding, output;
     double softcap = 0;
     int primary = 0;
-#ifdef TYLOINFER_NATIVE_CUDA
     ::tyloi::Tensor embedding_norm, hidden_norm;
-#else
-    DenseTensor embedding_norm, hidden_norm;
-#endif
-    Linear embedding_fusion, hidden_fusion;
-    std::unique_ptr<GatedResidual> final_mixer;
+    ::tyloi::Tensor embedding_fusion, hidden_fusion;
+    std::unique_ptr<tyloi::ops::Residual> final_mixer;
     std::vector<std::unique_ptr<Layer>> layers;
-#ifndef TYLOINFER_NATIVE_CUDA
-    CudaExecutionContext *execution = nullptr;
-#endif
 
     Predictor();
     ~Predictor() override;
     Predictor(Predictor&&) noexcept;
     Predictor& operator=(Predictor&&) noexcept;
 
-    static std::optional<Predictor> load_if_present(CudaExecutionContext &execution,
-                                                      const tyloi::weights::Loader& weights,
+    static std::optional<Predictor> load_if_present(const tyloi::weights::Loader& weights,
+                                                      const tyloi::models::LoadOptions& options,
                                                       const tyloi::models::qwen4_exp::Config &main,
                                                       ::tyloi::Tensor embedding, ::tyloi::Tensor output,
                                                       double softcap);

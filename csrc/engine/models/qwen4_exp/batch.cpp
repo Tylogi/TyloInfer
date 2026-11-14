@@ -4,7 +4,7 @@
 
 #include "engine/backends/cuda/kernels/mfq_cuda_sampling_ops.h"
 #include "engine/backends/cuda/native/scope.h"
-#include "engine/backends/cuda/executor/execution.h"
+#include "engine/weights/cache.h"
 #include "engine/backends/cuda/executor/options.h"
 #include "engine/budget.h"
 #include "components/error.h"
@@ -42,13 +42,13 @@ class CacheScope {
 
 } // namespace
 
-BatchOps::BatchOps(qwen4_exp::Model& model, CudaExecutionContext& execution,
-                   tyloi::engine::Budget& budget, tyloi::engine::ContinuousBatchConfig config)
-    : model_(model), execution_(execution), budget_(&budget), config_(std::move(config)) {
+BatchOps::BatchOps(qwen4_exp::Model& model, tyloi::weights::Cache& weights,
+                   tyloi::engine::Budget& budget, tyloi::engine::ContinuousBatchConfig config, bool cache_pipeline)
+    : model_(model), weights_(weights), cache_pipeline_(cache_pipeline), budget_(&budget), config_(std::move(config)) {
     TYLOINFER_RUNTIME_CHECK(config_.max_sequences > 0 && config_.max_sequences <= 32,
                             "Flash-Next continuous batching supports 1..32 requests");
     if (config_.cuda_graph)
-        graph_ = std::make_unique<Qwen4BatchDecodeGraph>(model_);
+        graph_ = std::make_unique<Qwen4BatchDecodeGraph>(model_, weights_);
 }
 
 BatchOps::~BatchOps() = default;
@@ -87,10 +87,10 @@ void BatchOps::resume_decode(int64_t) {}
 
 tyloi::engine::PrefillChunk BatchOps::prefill_chunk(
     const std::shared_ptr<Request>& request, tyloi::engine::PrefillChunk chunk) {
-    CudaScope guard(execution_.config.layer_placement.primary_device(), execution_.executor().contexts());
+    CudaScope guard(model_.primary_device, Executor::current().contexts());
     initialize_prefill(request, chunk);
     const auto row_bytes = std::size_t(model_.metadata.hidden_size) * model_.metadata.hc_mult * sizeof(float) * 8;
-    return budget_->batch(tyloi::Device{tyloi::DeviceType::cuda, execution_.config.layer_placement.primary_device()},
+    return budget_->batch(tyloi::Device{tyloi::DeviceType::cuda, model_.primary_device},
         row_bytes, chunk, request->cache->prefill_growth_bytes(chunk.count));
 }
 
@@ -121,14 +121,14 @@ void BatchOps::initialize_prefill(const std::shared_ptr<Request>& request,
             return row && row->cache;
         });
         if (!active) {
-                    execution_.weights.retire_decode();
-            default_context(execution_.config.layer_placement.primary_device())->reclaim_idle_memory();
+                    weights_.retire_decode();
+            default_context(model_.primary_device)->reclaim_idle_memory();
         }
         requests_.push_back(request);
         auto cache = std::make_unique<Qwen4BatchRequestState>(model_);
         const auto fixed = cache->initial_growth_bytes();
         if (fixed)
-            budget_->reserve_kv(::tyloi::Device(::tyloi::kCUDA, execution_.config.layer_placement.primary_device()),
+            budget_->reserve_kv(::tyloi::Device(::tyloi::kCUDA, model_.primary_device),
                                fixed + (std::size_t(64) << 20));
         cache->initialize();
         request->cache = std::move(cache);
@@ -138,11 +138,11 @@ void BatchOps::initialize_prefill(const std::shared_ptr<Request>& request,
                 ::tyloi::TensorOptions()
                     .dtype(::tyloi::kInt64)
                     .device(::tyloi::Device(
-                        ::tyloi::kCUDA, execution_.config.layer_placement.primary_device())))
+                        ::tyloi::kCUDA, model_.primary_device)))
                 .reshape({1, -1});
 #ifdef TYLOINFER_NATIVE_CUDA
         request->sampler.emplace(request->sampling,
-            ::tyloi::Device(::tyloi::kCUDA, execution_.config.layer_placement.primary_device()));
+            ::tyloi::Device(::tyloi::kCUDA, model_.primary_device));
 #else
         request->sampler.emplace(request->sampling);
 #endif
@@ -177,17 +177,17 @@ BatchOps::Sample BatchOps::finish_prefill(const std::shared_ptr<Request>& reques
 BatchOps::Sample BatchOps::prefill(const std::shared_ptr<Request>& request,
                                    tyloi::engine::PrefillChunk chunk) {
     try {
-        CudaScope guard(execution_.config.layer_placement.primary_device(), execution_.executor().contexts());
+        CudaScope guard(model_.primary_device, Executor::current().contexts());
         initialize_prefill(request, chunk);
         auto timer = std::make_unique<PrefillCudaTimer>();
         if (chunk.count > 1024)
-            execution_.weights.workspace(::tyloi::cuda::options::workspace_reserve_bytes());
-        budget_->reserve_kv(::tyloi::Device(::tyloi::kCUDA, execution_.config.layer_placement.primary_device()),
+            weights_.workspace(::tyloi::cuda::options::workspace_reserve_bytes());
+        budget_->reserve_kv(::tyloi::Device(::tyloi::kCUDA, model_.primary_device),
                            request->cache->prefill_growth_bytes(chunk.count) + (std::size_t(256) << 20));
         auto hidden =
             qwen4_batch_prefill(model_, {request->cache.get()},
                                 {request->prefill_ids.narrow(1, chunk.offset, chunk.count)
-                                     .contiguous()})
+                                     .contiguous()}, cache_pipeline_)
                 .front();
         const auto finished =
             chunk.offset + chunk.count == static_cast<int64_t>(request->prompt.size());
@@ -226,8 +226,8 @@ int64_t BatchOps::prefill_batch_token_budget() const {
 
 std::vector<tyloi::engine::PrefillBatchResult<BatchOps::Sample>> BatchOps::prefill_batch(
     const std::vector<std::pair<std::shared_ptr<Request>, tyloi::engine::PrefillChunk>>& items) {
-    CudaScope guard(execution_.config.layer_placement.primary_device(), execution_.executor().contexts());
-    execution_.weights.retire_decode();
+    CudaScope guard(model_.primary_device, Executor::current().contexts());
+    weights_.retire_decode();
     std::vector<tyloi::engine::PrefillBatchResult<Sample>> result(items.size());
     std::vector<std::size_t> ready;
     for (std::size_t row = 0; row < items.size(); ++row) {
@@ -245,7 +245,7 @@ std::vector<tyloi::engine::PrefillBatchResult<BatchOps::Sample>> BatchOps::prefi
         for (const auto row : rows)
             growth += items[row].first->cache->prefill_growth_bytes(items[row].second.count);
         try {
-            budget_->reserve_kv(::tyloi::Device(::tyloi::kCUDA, execution_.config.layer_placement.primary_device()), growth);
+            budget_->reserve_kv(::tyloi::Device(::tyloi::kCUDA, model_.primary_device), growth);
         } catch (const tyloi::engine::InferenceInputError& error) {
             if (error.code != tyloi::engine::InferenceInputErrorCode::ContextLength)
                 throw;
@@ -276,8 +276,8 @@ std::vector<tyloi::engine::PrefillBatchResult<BatchOps::Sample>> BatchOps::prefi
             }
             PrefillCudaTimer timer;
             if (tokens > 1024)
-                execution_.weights.workspace(::tyloi::cuda::options::workspace_reserve_bytes());
-            auto hidden = qwen4_batch_prefill(model_, caches, chunks);
+                weights_.workspace(::tyloi::cuda::options::workspace_reserve_bytes());
+            auto hidden = qwen4_batch_prefill(model_, caches, chunks, cache_pipeline_);
             std::vector<DenseTensor> last;
             std::vector<std::size_t> finished;
             for (std::size_t i = 0; i < rows.size(); ++i) {
@@ -342,7 +342,7 @@ void BatchOps::activate(const std::shared_ptr<Request>& request, const Sample& s
 void BatchOps::discard_prefill(const std::shared_ptr<Request>& request) {
     if (graph_)
         graph_->clear();
-    execution_.weights.finish_exchange();
+    weights_.finish_exchange();
     request->cache.reset();
     request->prefill_ids = {};
     request->prefill_timers.clear();
@@ -359,13 +359,13 @@ void BatchOps::retire(const std::vector<std::shared_ptr<Request>>& retired, int6
     if (!active) {
         // Batch widths have distinct transfer arenas and graph scratch. Return
         // them at idle while preserving resident experts and adaptation heat.
-        execution_.weights.retire_decode();
-        default_context(execution_.config.layer_placement.primary_device())->reclaim_idle_memory();
+        weights_.retire_decode();
+        default_context(model_.primary_device)->reclaim_idle_memory();
     }
 }
 
 BatchOps::Decoded BatchOps::decode(State& state) {
-    CudaScope guard(execution_.config.layer_placement.primary_device(), execution_.executor().contexts());
+    CudaScope guard(model_.primary_device, Executor::current().contexts());
     std::vector<Qwen4BatchRequestState*> caches;
     std::vector<int64_t> tokens;
     for (const auto& request : state.active) {
@@ -384,12 +384,12 @@ BatchOps::Decoded BatchOps::decode(State& state) {
                         ::tyloi::TensorOptions().dtype(::tyloi::kInt64))
                         .reshape({-1, 1});
     auto ids = host_ids.to(::tyloi::Device(
-        ::tyloi::kCUDA, execution_.config.layer_placement.primary_device()));
+        ::tyloi::kCUDA, model_.primary_device));
     CacheScope moe_cache_scope(
-        execution_.executor().mode().ffn.batch_serial, tokens.size() > 8);
+        Executor::current().mode().ffn.batch_serial, tokens.size() > 8);
 #ifdef TYLOINFER_NATIVE_CUDA
     auto policy = Executor::current_ffn();
-    policy.batch_serial = execution_.executor().mode().ffn.batch_serial;
+    policy.batch_serial = Executor::current().mode().ffn.batch_serial;
     auto policy_scope = Executor::current().enter(policy);
 #endif
     const bool greedy =
@@ -406,7 +406,7 @@ BatchOps::Decoded BatchOps::decode(State& state) {
             auto plan = graph_->plan(caches, greedy);
             if (plan) {
                 if (plan->rebuild)
-                    budget_->reserve_kv(::tyloi::Device(::tyloi::kCUDA, execution_.config.layer_placement.primary_device()),
+                    budget_->reserve_kv(::tyloi::Device(::tyloi::kCUDA, model_.primary_device),
                                        plan->growth + (std::size_t(64) << 20));
                 captured = graph_->run(caches, ids, host_ids, greedy, *plan);
             }
@@ -426,7 +426,7 @@ BatchOps::Decoded BatchOps::decode(State& state) {
         std::size_t growth = 0;
         for (const auto* cache : caches) growth += cache->prefill_growth_bytes(1);
         if (growth)
-            budget_->reserve_kv(::tyloi::Device(::tyloi::kCUDA, execution_.config.layer_placement.primary_device()),
+            budget_->reserve_kv(::tyloi::Device(::tyloi::kCUDA, model_.primary_device),
                                growth + (std::size_t(64) << 20));
     }
     auto output = captured ? std::move(*captured)
@@ -490,10 +490,10 @@ void BatchOps::recover(State& state) {
 namespace tyloi::cuda {
 
 std::unique_ptr<tyloi::engine::Batch> make_batch(
-    qwen4_exp::Model& model, CudaExecutionContext& execution, tyloi::engine::Budget& budget,
-    const tyloi::engine::ContinuousBatchConfig& config, std::int64_t chunk_size) {
+    qwen4_exp::Model& model, tyloi::weights::Cache& weights, tyloi::engine::Budget& budget,
+    const tyloi::engine::ContinuousBatchConfig& config, std::int64_t chunk_size, bool cache_pipeline) {
     return std::make_unique<tyloi::engine::ContinuousBatch<qwen4_exp::BatchOps>>(
-        chunk_size, config.prefill_token_budget, model, execution, budget, config);
+        chunk_size, config.prefill_token_budget, model, weights, budget, config, cache_pipeline);
 }
 
 } // namespace tyloi::cuda

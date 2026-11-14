@@ -105,8 +105,7 @@ bool graph_allowed(const CudaLoadConfig&, Executor&, const weights::Cache&, cons
 void configure_generation(engine::Config&, const CudaLoadConfig&, Executor&,
     const weights::Cache&, const models::Info&);
 /** Configure the shared native KV owner and optional offload store. */
-void configure_model_kv(Executor&, std::shared_ptr<KvMemoryManager>&,
-    std::shared_ptr<KvOffloadStore>&);
+void configure_model_kv(std::shared_ptr<KvMemoryManager>&, std::shared_ptr<KvOffloadStore>&);
 /** Assemble a native model with the shared loader and policy. */
 void load_model(std::unique_ptr<models::CausalModel>& owner,
     const CudaLoadOptions&, CudaLoadConfig&, Executor&, weights::Cache&,

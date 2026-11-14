@@ -112,6 +112,14 @@ void State::begin_forward(bool capture_raw_hidden) {
         shared->dspark_target_hiddens.resize(model_.config.dspark_target_layer_ids.size());
 }
 
+std::vector<std::pair<tyloi::Device, std::size_t>> State::reset_growth(std::int64_t batch) const {
+    if (batch <= 0 || batch > std::numeric_limits<int>::max())
+        throw std::invalid_argument("DeepSeek-V4.1 Engram batch must be positive and fit in int");
+    const auto bytes = shared->engram_hash->reset_growth(static_cast<int>(batch));
+    return bytes ? std::vector<std::pair<tyloi::Device, std::size_t>>{{tyloi::Device(tyloi::kCPU), bytes}}
+                 : std::vector<std::pair<tyloi::Device, std::size_t>>{};
+}
+
 void State::reset(std::int64_t next_batch) {
     cache_pos = decode_position_delta = 0;
     speculative_start = -1;

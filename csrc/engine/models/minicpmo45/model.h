@@ -10,7 +10,7 @@
 #include "engine/backends/cuda/ops/rope/rope.h"
 #endif
 #include "engine/models/source/model_graph.h"
-#include "engine/models/common/capabilities.h"
+#include "engine/models/plan.h"
 #include "engine/models/source.h"
 
 #include <memory>
@@ -44,7 +44,7 @@ struct Model
 #endif
     std::shared_ptr<const tyloi::ModelSource> source;
     tyloi::ModelGraph graph;
-    CudaModelPlan plan;
+    ::tyloi::models::Plan plan;
     tyloi::models::ModelConfig config;
     tyloi::models::CausalLmMetadata metadata;
     tyloi::ops::RopeTable rope, cpu_rope;

@@ -1,25 +1,34 @@
 #include "run.h"
-#include "engine/models/common/load.h"
-#include "engine/models/source/model_config.h"
-#include "env.h"
-#include "engine/models/qwen4_exp/predictor.h"
-#include "engine/models/glm5_next/mtp.h"
-#include "engine/weights/loader.h"
 #include "cli.h"
-#include "diagnostics/token_generation.h"
-#include "engine/models/load_internal.h"
+#include "minicpmo45.h"
+#include "engine/program.h"
+#include "engine/models/causal_model.h"
+#include "engine/models/source.h"
+#include "engine/models/source/model_config.h"
 #include "engine/models/prepare.h"
+#include "engine/backends/cuda/executor/executor.h"
+#include "engine/backends/cuda/native/env.h"
+#include "engine/backends/cuda/native/tensor/backend.h"
+#include "engine/backends/cuda/ops/projection/quant_linear.h"
+#include "engine/weights/cache.h"
 #include "diagnostics/backend_checks.h"
 #include "diagnostics/model_checks.h"
-#include "diagnostics/runtime_checks.h"
-#include "diagnostics/flash_next_mtp.h"
-#include "minicpmo45.h"
-#include "engine/backends/cuda/native/scope.h"
-#include "engine/backends/cuda/executor/execution.h"
-#include "engine/backends/cuda/executor/tq.h"
-#include "engine/weights/moe/expert_cache.h"
-#include "engine/backends/cuda/executor/options.h"
-#include "engine/backends/cuda/kernels/deepseek_v41.h"
+#include "diagnostics/operator_checks.h"
+#include "diagnostics/engines.h"
+#include "diagnostics/source.h"
+#include "diagnostics/text.h"
+#include "diagnostics/vision.h"
+#include "diagnostics/mtp.h"
+#include "diagnostics/mtp_bench.h"
+#include "diagnostics/qwen_mtp.h"
+#include "diagnostics/qwen_decode.h"
+#include "diagnostics/qwen_variants.h"
+#include "diagnostics/prefill.h"
+#include "diagnostics/batch.h"
+#include "diagnostics/trace.h"
+#include "diagnostics/policy.h"
+#include "diagnostics/compare.h"
+#include "diagnostics/tokens.h"
 
 #include <algorithm>
 #include <chrono>
@@ -30,7 +39,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
-#include <type_traits>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -217,989 +226,205 @@ using namespace tyloi::cuda::internal;
 using namespace tyloi::cuda::diagnostics;
 
 namespace {
-class ScopedDiagnosticEnvironment {
-    std::string name_;
-    std::string previous_;
-    bool present_;
-public:
-    explicit ScopedDiagnosticEnvironment(const char* name) : name_(name) {
-        const char* previous = tyloi::cuda::env_lookup(name);
-        present_ = previous != nullptr;
-        if (previous) previous_ = previous;
-    }
-    void set(const char* value) {
-        tyloi::cuda::env_set(name_.c_str(), value);
-    }
-    ~ScopedDiagnosticEnvironment() noexcept {
-        try {
-            if (present_) tyloi::cuda::env_set(name_.c_str(), previous_.c_str());
-            else tyloi::cuda::env_clear(name_.c_str());
-        } catch (...) {} // Restoration previously ignored OS errors.
-    }
-};
-
 struct DiagnosticsCommand : tyloi::cuda::DiagnosticsCommandOptions {
     explicit DiagnosticsCommand(tyloi::cuda::DiagnosticsCommandOptions options)
         : tyloi::cuda::DiagnosticsCommandOptions(std::move(options)) {}
     int run() { return with_command_errors([&]() -> int {
         if (check_engine_isolation) {
             tyloi::cuda::CudaEngineOptions options;
-            static_cast<tyloi::cuda::CudaLoadOptions&>(options) =
-                static_cast<const tyloi::cuda::CudaLoadOptions&>(*this);
+            static_cast<tyloi::cuda::CudaLoadOptions&>(options) = *this;
             return run_cuda_engine_isolation_check(std::move(options));
         }
-        auto tq = std::make_shared<TqExec>();
-        std::shared_ptr<tyloi::cuda::KvMemoryManager> kv;
-        tyloi::cuda::RoutedCache weights;
-        std::shared_ptr<tyloi::cuda::KvOffloadStore> offload;
-        tyloi::cuda::ContextSet contexts;
-        CudaExecutionContext execution(contexts, weights, kv, offload, tq);
-        CudaScope scope(execution.layer_placement.primary_device(), execution.contexts);
-        // Operator-only checks do not require loading a model.
-        if (check_backend_bf16_add) return run_backend_bf16_add_check(4096, 10000);
-        if (check_backend_argmax) return run_backend_argmax_check(248320, 2000);
-        TYLOINFER_RUNTIME_CHECK(!comparison_phase_timings || runtime_comparison_modes(),
-            "comparison phase timings require a runtime comparison");
-        if(runtime_comparison_modes()) {
-            TYLOINFER_RUNTIME_CHECK(::tyloi::cuda::options::transfer_cache() &&
-                !::tyloi::cuda::options::mapped_copy(),
-                "runtime comparison requires TYLOINFER_MOE_TRANSFER_CACHE=1 and TYLOINFER_MOE_MAPPED_COPY=0");
-            const bool free_gpu_comparison=decode_inputs.empty() &&
-                (compare_route_spin || compare_moe_plan_reuse || compare_shared_gate_fusion || compare_graph_optimizations || compare_mhc_fixed_formats || compare_mhc_async_normalized || compare_gdn_fixed_geometry || compare_gdn_inplace_state || compare_qsa_fusion) &&
-                execution.config.cache.ram_fraction && *execution.config.cache.ram_fraction==1.0;
-            TYLOINFER_RUNTIME_CHECK(gen>1 && (!decode_inputs.empty() || free_gpu_comparison) && !profile &&
-                runtime_comparison_modes() == 1 && router_lookahead_audit.empty() &&
-                !execution.config.cache.mapped && execution.config.weights.preload &&
-                execution.config.moe_ffn.two_stage && moe_gpu_cache_gb>0,
-                "runtime comparison requires fixed inputs or an eligible GPU-only free-decode comparison, complete preload, two-stage FFN and profiling disabled");
-            TYLOINFER_RUNTIME_CHECK(!compare_attention_grouping ||
-                execution.config.weights.grouped,
-                "attention-grouping comparison requires grouped NINT enabled");
-            TYLOINFER_RUNTIME_CHECK(!compare_mhc_fusion || (execution.config.residual.fused_projections &&
-                execution.config.residual.native_input),
-                "residual fusion comparison requires native packed projections");
-            TYLOINFER_RUNTIME_CHECK(!(compare_gpu_only_cpu_wait || compare_fixed_gpu_timing || compare_graph_optimizations) || (execution.config.cache.ram_fraction &&
-                *execution.config.cache.ram_fraction==1.0),
-                "fixed GPU comparison requires TYLOINFER_MOE_RAM_PCIE_FRACTION=1");
-            execution.config.cache.adapt=false;
-            std::cout<<std::unitbuf;
-        }
-        setup_cuda_load(*this, execution);
-        if(runtime_comparison_modes()) {
-            std::cout<<runtime_comparison_name()<<"_setup\n";
-            print_moe_expert_cache_stats(execution.weights.moe,std::cout);
-        }
-        if (!check_linear_cpu.empty()) {
-            if (model_path.empty()) {
-                throw std::runtime_error("--check-linear-cpu requires --model");
-            }
-            auto gate_mode = InputGateMode::None;
-            if (check_linear_gate == "sigmoid") gate_mode = InputGateMode::Sigmoid;
-            else if (check_linear_gate == "silu") gate_mode = InputGateMode::Silu;
-            else if (!check_linear_gate.empty()) {
-                throw std::runtime_error("--check-linear-gate must be sigmoid or silu");
-            }
-            return run_cpu_linear_check(
-                execution, model_path, check_linear_cpu, check_linear_m,
-                gate_mode, check_linear_reps);
-        }
-        if (!check_linear.empty()) {
-            if (model_path.empty()) throw std::runtime_error("--check-linear requires --model");
-            auto gate_mode = InputGateMode::None;
-            if (check_linear_gate == "sigmoid") gate_mode = InputGateMode::Sigmoid;
-            else if (check_linear_gate == "silu") gate_mode = InputGateMode::Silu;
-            else if (!check_linear_gate.empty()) {
-                throw std::runtime_error("--check-linear-gate must be sigmoid or silu");
-            }
-            return run_linear_check(
-                execution, model_path, check_linear, check_linear_m, gate_mode,
-                check_linear_reps);
-        }
-        if (!check_tp_linear.empty()) {
-            if (model_path.empty()) {
-                throw std::runtime_error(
-                    "--check-tp-linear requires --model");
-            }
-            const TensorParallelAxis axis =
-                check_tp_axis_arg == "output"
-                ? TensorParallelAxis::Output
-                : check_tp_axis_arg == "input"
-                ? TensorParallelAxis::Input
-                : throw std::runtime_error(
-                    "--check-tp-axis must be output or input");
-            return run_tensor_parallel_linear_check(
-                execution, model_path, check_tp_linear,
-                axis, check_tp_m);
-        }
-        if (!check_ep_moe.empty()) {
-            if (model_path.empty()) {
-                throw std::runtime_error(
-                    "--check-ep-moe requires --model");
-            }
-            return run_expert_parallel_moe_check(
-                execution, model_path, check_ep_moe,
-                check_ep_moe_tokens,
-                check_ep_moe_routes);
-        }
-        if (!check_linear_group.empty()) {
-            if (model_path.empty()) {
-                throw std::runtime_error("--check-linear-group requires --model");
-            }
-            return run_linear_group_check(
-                execution, model_path, check_linear_group, check_linear_m,
-                check_linear_reps);
-        }
-        if (!check_q8_embedding.empty()) {
-            if (model_path.empty()) {
-                throw std::runtime_error("--check-q8-embedding requires --model");
-            }
-            return run_q8_embedding_check(
-                execution, model_path, check_q8_embedding);
-        }
-        if (!check_gdn_input.empty()) {
-            if (check_gdn_output.empty() || check_gdn_state.empty()) {
-                throw std::runtime_error(
-                    "--check-gdn-input requires --check-gdn-output and --check-gdn-state");
-            }
-            return run_gdn_operator_check(
-                check_gdn_input, check_gdn_output, check_gdn_state,
-                check_gdn_tokens, check_gdn_q_heads,
-                check_gdn_v_heads, check_gdn_head_dim);
-        }
-        if (!check_linear_conv_input.empty()) {
-            if (check_linear_conv_output.empty()) {
-                throw std::runtime_error(
-                    "--check-linear-conv-input requires --check-linear-conv-output");
-            }
-            return run_linear_conv_operator_check(
-                check_linear_conv_input, check_linear_conv_output,
-                check_linear_conv_tokens, check_linear_conv_q_heads,
-                check_linear_conv_v_heads, check_linear_conv_key_dim,
-                check_linear_conv_value_dim, check_linear_conv_kernel,
-                1.0e-6);
-        }
-        if (check_gemma_geglu_layer >= 0) {
-            if (model_path.empty()) {
-                throw std::runtime_error("--check-gemma-geglu-layer requires --model");
-            }
-            return run_gemma_geglu_check(
-                execution, model_path, check_gemma_geglu_layer,
-                check_gemma_geglu_reps);
-        }
-        if (check_mfq_container) {
-            if (model_path.empty()) {
-                throw std::runtime_error(
-                    "--check-mfq-container requires --model");
-            }
-            auto model_source = tyloi::open_model_source(model_path);
-            const auto& mfq = *model_source;
-            std::cout << "mfq_container_check=ok"
-                      << " shards=" << mfq.source_paths().size()
-                      << " tensors=" << mfq.tensors().size()
-                      << " assets=" << mfq.assets().size()
-                      << "\n";
-            return 0;
-        }
-        if (check_runtime_assets) {
-            if (model_path.empty()) {
-                throw std::runtime_error(
-                    "--check-runtime-assets requires --model");
-            }
-            auto model_source = tyloi::open_model_source(model_path);
-            const auto& mfq = *model_source;
-            const auto config = tyloi::models::ModelConfig::from_json(
-                tyloi::models::config_json(mfq, config_path));
-            if (!mfq.has_asset(tyloi::kTokenizerGgufAsset)) {
-                throw std::runtime_error(
-                    "model source has no tokenizer GGUF");
-            }
-            const auto tokenizer_blob =
-                read_asset(mfq, tyloi::kTokenizerGgufAsset);
-            const auto embedded =
-                probe_mfq_tokenizer(tokenizer_blob, check_tokenizer_text);
-            if (embedded.vocab_size != config.vocab_size) {
-                throw std::runtime_error(
-                    "embedded tokenizer/model vocabulary mismatch: tokenizer=" +
-                    std::to_string(embedded.vocab_size) + " model=" +
-                    std::to_string(config.vocab_size));
-            }
-            std::cout << "runtime_assets_check=ok"
-                      << " config=embedded"
-                      << " tokenizer=embedded"
-                      << " vocab_size=" << embedded.vocab_size
-                      << " chat_template="
-                      << (!embedded.chat_template.empty() ? 1 : 0)
-                      << " bos=" << embedded.bos_token
-                      << " eos=" << embedded.eos_token
-                      << " eot=" << embedded.eot_token
-                      << " pad=" << embedded.pad_token
-                      << " token_count=" << embedded.tokens.size()
-                      << "\n";
-            if (!tokenizer_model.empty()) {
-                const auto external =
-                    probe_mfq_tokenizer(tokenizer_model, check_tokenizer_text);
-                if (external.vocab_size != embedded.vocab_size ||
-                    external.bos_token != embedded.bos_token ||
-                    external.eos_token != embedded.eos_token ||
-                    external.eot_token != embedded.eot_token ||
-                    external.pad_token != embedded.pad_token ||
-                    external.chat_template != embedded.chat_template ||
-                    external.tokens != embedded.tokens) {
-                    throw std::runtime_error(
-                        "embedded tokenizer differs from external GGUF");
-                }
-                std::cout << "runtime_assets_external_match=ok\n";
-            }
-            return 0;
-        }
-        if (check_moe_layer >= 0) {
-            if (model_path.empty()) {
-                throw std::runtime_error("--check-moe-layer requires --model");
-            }
-            return run_moe_check(
-                execution, model_path, config_path, check_moe_layer, parse_ids(check_moe_tokens), check_moe_reps);
-        }
-        if (!check_mfe_tensor.empty()) {
-            if (model_path.empty()) {
-                throw std::runtime_error("--check-mfe-tensor requires --model");
-            }
-            KlMmqScope check_kl_mmq_scope(
-                parse_kl_mmq_mode(kl_mmq_arg), execution.kl_mmq);
-            const auto tensor_names =
-                parse_tensor_names(check_mfe_tensor);
-            if (execution.weights.moe &&
-                    tensor_names.size() != 1) {
-                throw std::runtime_error(
-                    "cached --check-mfe-tensor accepts one tensor "
-                    "per invocation");
-            }
-            for (const auto & tensor_name : tensor_names) {
-                const int result = run_mfe_tensor_check(
-                    execution, model_path, tensor_name, check_mfe_tokens,
-                    check_mfe_routes, check_mfe_reps,
-                    check_mfe_split_width, check_mfe_routed_input,
-                    check_mfe_benchmark_only);
-                if (result != 0) return result;
-            }
-            return 0;
-        }
-        if (!check_dsv4_output_a.empty()) {
-            if (model_path.empty()) {
-                throw std::runtime_error("--check-dsv4-output-a requires --model");
-            }
-            return run_dsv4_output_a_check(
-                execution, model_path, check_dsv4_output_a,
-                check_dsv4_output_a_batch, check_dsv4_output_a_reps);
-        }
-        if (check_attention_decode > 0) {
-            return run_attention_decode_check(
-                check_attention_decode, check_attention_reps,
-                check_attention_head_dim, check_attention_swa_decode,
-                check_attention_window);
-        }
-        if (check_gemma4_swa) {
-            return run_gemma4_swa_check(check_attention_reps);
-        }
-        if (check_glm_dsa) {
-            return run_glm_dsa_check(check_attention_reps);
-        }
-        if (check_dsv4_attention) {
-            return run_dsv4_attention_check(check_attention_reps);
-        }
-        if (check_dsv4_hc) {
-            return run_dsv4_hc_check(check_attention_reps);
-        }
-        if (check_deepseek_v41) {
-            return tyloi::cuda::deepseek_v41_runtime::run_self_check();
-        }
-        if (check_text_session_state) {
-            return run_text_session_state_check();
-        }
-        if (minicpmo_eval_batch) {
-            if (model_path.empty()) {
-                throw std::runtime_error(
-                    "--minicpmo-eval-batch requires --model");
-            }
-            if (!ids_arg.empty() || !ids_file.empty()) {
-                throw std::runtime_error(
-                    "MiniCPM-o eval mode cannot be combined with "
-                    "composite, duplex, token, transport, KL, or prefill modes");
-            }
-            if (minicpmo_eval_vision_batch_size <= 0) {
-                throw std::runtime_error(
-                    "--minicpmo-eval-vision-batch-size must be positive");
-            }
-            return tyloi::cuda::minicpmo45::run_eval_batch(
-                execution, model_path, config_path, context_size,
-                minicpmo_eval_vision_batch_size);
-        }
-        if (model_path.empty()) {
-            std::cerr << "missing model or execution mode (see --help)\n";
-            return 2;
-        }
+        if (runtime_comparison_modes() > 1)
+            throw std::runtime_error("select only one runtime comparison");
+        if (comparison_phase_timings && !runtime_comparison_modes())
+            throw std::runtime_error("comparison phase timings require a runtime comparison");
+        if (compare_ffn_transfer_phases || compare_router_lookahead || compare_mfe_parallel_gu ||
+            compare_mfe_gpu_bundle || compare_mfe_default_math || compare_mfe_e8_narrow ||
+            compare_mfe_shared_first || compare_mfe_early_gu || compare_cpu_transfer_budget ||
+            compare_cpu_background_calibration || compare_early_no_cpu_ready || compare_gpu_only_cpu_wait ||
+            compare_fixed_gpu_timing || compare_moe_plan_reuse || compare_graph_optimizations ||
+            compare_resident_overlap || compare_dma_graph_batch || compare_ram_field_packing)
+            throw std::runtime_error(std::string(runtime_comparison_name()) + " is not available with Program execution");
+        if (!router_lookahead_audit.empty())
+            throw std::runtime_error("--router-lookahead-audit is not available with Program execution");
+        if (compare_nvq_vec4)
+            throw std::runtime_error("--compare-nvq-vec4 is not available with Program execution");
         if (context_size < 0) throw std::runtime_error("--ctx-size must be positive");
-        if (!bench_qwen35_mtp.empty()) {
-            TYLOINFER_RUNTIME_CHECK(bench_qwen35_mtp == "ordinary" || bench_qwen35_mtp == "mtp",
-                "--bench-qwen35-mtp expects ordinary or mtp");
-            TYLOINFER_RUNTIME_CHECK(!check_qwen35_mtp && ids_arg.empty() && ids_file.empty() &&
-                prefill_sweep_arg.empty(), "MTP benchmark cannot combine execution modes");
-            if (context_size == 0) context_size = 512;
-            TYLOINFER_RUNTIME_CHECK(gen >= 2 && context_size >= static_cast<int64_t>(gen) + 17 &&
-                bench_qwen35_mtp_reps > 0 && bench_qwen35_mtp_reps <= 100,
-                "MTP benchmark requires gen>=2, reps1-100 and context>=gen+17");
-            std::cout << std::unitbuf;
-        }
-        if (check_nemotron_h_vision) {
-            if (context_size == 0) context_size = 128;
-            std::cout << std::unitbuf;
-        }
-        if (check_nemotron_h_mtp) {
-            if (context_size == 0) context_size = 128;
-            if (context_size < 64)
-                throw std::runtime_error(
-                    "Nemotron-H MTP correctness gate requires --ctx-size >= 64");
-            std::cout << std::unitbuf;
-        }
-        if (check_qwen35_mtp) {
-            if (context_size == 0) context_size = 512;
-            if (context_size < 64) throw std::runtime_error("MTP correctness gate requires --ctx-size >= 64");
-            std::cout << std::unitbuf;
-        }
         if (check_continuous_batching) {
-            TYLOINFER_RUNTIME_CHECK(
-                !check_qwen35_mtp &&
-                !check_flash_next && !check_flash_next_mtp &&
-                bench_qwen35_mtp.empty() && ids_arg.empty() &&
-                ids_file.empty() &&
-                prefill_sweep_arg.empty(),
+            TYLOINFER_RUNTIME_CHECK(!check_qwen35_mtp && !check_flash_next && !check_flash_next_mtp &&
+                bench_qwen35_mtp.empty() && ids_arg.empty() && ids_file.empty() && prefill_sweep_arg.empty(),
                 "continuous batching check cannot combine execution modes");
             if (context_size == 0) context_size = 512;
-            if (context_size < 32) {
-                throw std::runtime_error(
-                    "continuous batching check requires --ctx-size >= 32");
-            }
-            std::cout << std::unitbuf;
+            TYLOINFER_RUNTIME_CHECK(context_size >= 32, "continuous batching check requires --ctx-size >= 32");
+            return run_continuous_batching_check(*this, check_continuous_batching_requests);
         }
         std::vector<int64_t> prefill_sweep_sizes;
         if (!prefill_sweep_arg.empty()) {
             prefill_sweep_sizes = parse_ids(prefill_sweep_arg);
-            if (std::any_of(prefill_sweep_sizes.begin(), prefill_sweep_sizes.end(),
-                            [](int64_t value) { return value <= 0; })) {
-                throw std::runtime_error("--prefill-sweep values must be positive");
-            }
-            if (context_size == 0) {
-                context_size = *std::max_element(prefill_sweep_sizes.begin(), prefill_sweep_sizes.end());
-            }
-        }
-        if ((!block_trace_reference.empty() || !block_trace_output.empty()) &&
-                context_size == 0) {
-            context_size = (int64_t)(
-                ids_file.empty() ? parse_ids(ids_arg) : load_ids_file(ids_file)).size();
-        }
-        execution.profiler.enabled = false;
-        tyloi::cuda::NoGradGuard no_grad;
-        return tyloi::cuda::with_model<>(execution, *this,
-            check_qwen35_mtp || check_flash_next_mtp || check_nemotron_h_mtp ||
-                check_nemotron_h_vision ||
-                !bench_qwen35_mtp.empty() || (check_qwen4_decode_hidden && profile),
-            [&](auto& owner, auto& owned_state, auto& executor, auto& parts, auto t0, auto t1, auto&) -> int {
-        auto& model = *owner;
-        auto& state = *owned_state;
-        using Model = std::remove_cvref_t<decltype(model)>;
-        if (check_continuous_batching) {
-            if constexpr (std::is_same_v<Model, tyloi::cuda::qwen35::Model> ||
-                          std::is_same_v<Model,tyloi::cuda::Qwen4CausalLm>) {
-                if constexpr (std::is_same_v<Model, tyloi::cuda::qwen35::Model>)
-                    return run_cuda_continuous_batching_check(
-                        model, state, executor.get(), execution,
-                        check_continuous_batching_requests);
-                else
-                    return run_cuda_continuous_batching_check(
-                        model,check_continuous_batching_requests);
-            }
-            throw std::runtime_error(
-                "continuous batching requires Qwen3.5 or Flash-Next");
-        }
-        if (check_qwen4_decode_hidden) {
-            if constexpr(std::is_same_v<Model,tyloi::cuda::Qwen4CausalLm>) {
-                const auto* variants=tyloi::cuda::env_lookup("TYLOINFER_MTP_GENERATION_VARIANTS");
-                if(profile && variants && variants[0]=='1') {
-                    auto* predictor = tyloi::cuda::component_predictor(parts);
-                    TYLOINFER_RUNTIME_CHECK(predictor,"MTP variants require a loaded predictor");
-                    return run_qwen4_mtp_generation_variants(model,*predictor,
-                        ids_file.empty()?parse_ids(ids_arg):load_ids_file(ids_file));
-                }
-            }
-            if constexpr(std::is_same_v<Model,tyloi::cuda::Qwen4CausalLm>)
-                return profile?run_qwen4_mtp_profile(model,ids_file.empty()?parse_ids(ids_arg):load_ids_file(ids_file))
-                    :run_qwen4_decode_hidden_check(model);
-            throw std::runtime_error("hidden graph diagnostic requires Qwen4CausalLm");
-        }
-        if (check_flash_next) {
-            if constexpr (
-                    std::is_same_v<Model, tyloi::cuda::Qwen4CausalLm> ||
-                    std::is_same_v<Model, tyloi::cuda::Glm5CausalLm>) {
-                return run_flash_next_check(model);
-            }
-            throw std::runtime_error(
-                "Flash-Next diagnostic requires a Flash-Next causal LM");
-        }
-        if (check_nemotron_h) {
-            if constexpr (std::is_same_v<Model, tyloi::cuda::NemotronHCausalLm>) {
-                return run_nemotron_h_check(model);
-            }
-            throw std::runtime_error(
-                "--check-nemotron-h requires a Nemotron-H causal LM");
-        }
-        if (check_nemotron_h_vision) {
-            if constexpr (std::is_same_v<Model, tyloi::cuda::NemotronHCausalLm>) {
-                TYLOINFER_RUNTIME_CHECK(parts.radio_vision.has_value(),
-                    "--check-nemotron-h-vision requires a model containing RADIO vision weights");
-                return run_nemotron_h_vision_check(model, *parts.radio_vision);
-            }
-            throw std::runtime_error(
-                "--check-nemotron-h-vision requires a Nemotron-H causal LM");
-        }
-        if (check_nemotron_h_mtp) {
-            if constexpr (std::is_same_v<Model, tyloi::cuda::NemotronHCausalLm>) {
-                auto* predictor = dynamic_cast<tyloi::cuda::nemotron_h::NemotronHMtp*>(
-                    tyloi::cuda::component_predictor(parts));
-                TYLOINFER_RUNTIME_CHECK(predictor != nullptr,
-                    "--check-nemotron-h-mtp requires a model containing MTP weights");
-                return run_nemotron_h_mtp_check(model, *predictor);
-            }
-            throw std::runtime_error(
-                "--check-nemotron-h-mtp requires a Nemotron-H causal LM");
-        }
-        if (check_flash_next_mtp) {
-            if constexpr (
-                    std::is_same_v<Model, tyloi::cuda::Qwen4CausalLm> ||
-                    std::is_same_v<Model, tyloi::cuda::Glm5CausalLm>) {
-                using Predictor=std::conditional_t<
-                    std::is_same_v<Model, tyloi::cuda::Qwen4CausalLm>,
-                    tyloi::cuda::qwen4_exp::Predictor,
-                    tyloi::cuda::glm5_next::Glm5NextMtp>;
-                auto* predictor=dynamic_cast<Predictor*>(tyloi::cuda::component_predictor(parts));
-                TYLOINFER_RUNTIME_CHECK(predictor != nullptr,
-                    "Flash-Next MTP diagnostic requires a loaded predictor component");
-                return run_flash_next_mtp_check(model,*predictor);
-            }
-            throw std::runtime_error(
-                "Flash-Next MTP diagnostic requires a Flash-Next causal LM");
-        }
-        if (check_qwen35_mtp) {
-            if constexpr (std::is_same_v<Model, tyloi::cuda::qwen35::Model>) {
-                auto* predictor = dynamic_cast<tyloi::cuda::qwen35::Mtp*>(
-                    tyloi::cuda::component_predictor(parts));
-                TYLOINFER_RUNTIME_CHECK(predictor != nullptr,
-                    "--check-qwen35-mtp requires a supported model containing MTP weights");
-                return run_qwen35_mtp_check(
-                    model, state, executor.get(), execution, *predictor);
-            }
-            throw std::runtime_error(
-                "--check-qwen35-mtp requires Qwen3.5");
+            TYLOINFER_RUNTIME_CHECK(std::all_of(prefill_sweep_sizes.begin(), prefill_sweep_sizes.end(),
+                [](int64_t value) { return value > 0; }), "--prefill-sweep values must be positive");
+            if (context_size == 0) context_size = *std::max_element(prefill_sweep_sizes.begin(), prefill_sweep_sizes.end());
         }
         if (!bench_qwen35_mtp.empty()) {
-            if constexpr (std::is_same_v<Model, tyloi::cuda::qwen35::Model>) {
-                auto* predictor = dynamic_cast<tyloi::cuda::qwen35::Mtp*>(
-                    tyloi::cuda::component_predictor(parts));
-                TYLOINFER_RUNTIME_CHECK(predictor != nullptr,
-                    "--bench-qwen35-mtp requires a supported model containing MTP weights");
-                return run_qwen35_mtp_bench(
-                    model, state, executor.get(), execution, *predictor,
-                    bench_qwen35_mtp == "mtp", gen,
-                    bench_qwen35_mtp_reps);
+            TYLOINFER_RUNTIME_CHECK(bench_qwen35_mtp == "ordinary" || bench_qwen35_mtp == "mtp",
+                "--bench-qwen35-mtp expects ordinary or mtp");
+            TYLOINFER_RUNTIME_CHECK(!check_qwen35_mtp && ids_arg.empty() && ids_file.empty() && prefill_sweep_arg.empty(),
+                "MTP benchmark cannot combine execution modes");
+            if (context_size == 0) context_size = 512;
+            TYLOINFER_RUNTIME_CHECK(gen >= 2 && context_size >= static_cast<int64_t>(gen) + 17 &&
+                bench_qwen35_mtp_reps > 0 && bench_qwen35_mtp_reps <= 100,
+                "MTP benchmark requires gen>=2, reps1-100 and context>=gen+17");
+        }
+        if (check_nemotron_h_vision || check_nemotron_h_mtp) {
+            if (context_size == 0) context_size = 128;
+            TYLOINFER_RUNTIME_CHECK(!check_nemotron_h_mtp || context_size >= 64,
+                "Nemotron-H MTP correctness gate requires --ctx-size >= 64");
+        }
+        if (check_qwen35_mtp) {
+            if (context_size == 0) context_size = 512;
+            TYLOINFER_RUNTIME_CHECK(context_size >= 64, "MTP correctness gate requires --ctx-size >= 64");
+        }
+        const auto ids_vec = !ids_file.empty() ? load_ids_file(ids_file) :
+            !ids_arg.empty() ? parse_ids(ids_arg) : std::vector<int64_t>{};
+        if ((!block_trace_reference.empty() || !block_trace_output.empty()) && context_size == 0)
+            context_size = static_cast<int64_t>(ids_vec.size());
+        const auto t0 = std::chrono::steady_clock::now();
+        auto program = model_path.empty() ? tyloi::cuda::Program::bare()
+            : tyloi::cuda::Program::open(*this, !runtime_comparison_modes());
+        auto& executor = program->executor();
+        auto scope = executor.enter();
+        if (check_backend_bf16_add) return run_backend_bf16_add_check(*program, 4096, 10000);
+        if (check_backend_argmax) return run_backend_argmax_check(*program, 248320, 2000);
+        if (!check_gdn_input.empty()) {
+            TYLOINFER_RUNTIME_CHECK(!check_gdn_output.empty() && !check_gdn_state.empty(),
+                "--check-gdn-input requires --check-gdn-output and --check-gdn-state");
+            return run_gdn_operator_check(*program, check_gdn_input, check_gdn_output, check_gdn_state,
+                check_gdn_tokens, check_gdn_q_heads, check_gdn_v_heads, check_gdn_head_dim);
+        }
+        if (!check_linear_conv_input.empty()) {
+            TYLOINFER_RUNTIME_CHECK(!check_linear_conv_output.empty(),
+                "--check-linear-conv-input requires --check-linear-conv-output");
+            return run_linear_conv_operator_check(*program, check_linear_conv_input, check_linear_conv_output,
+                check_linear_conv_tokens, check_linear_conv_q_heads, check_linear_conv_v_heads,
+                check_linear_conv_key_dim, check_linear_conv_value_dim, check_linear_conv_kernel, 1.0e-6);
+        }
+        if (check_attention_decode > 0) return run_attention_decode_check(*program, check_attention_decode,
+            check_attention_reps, check_attention_head_dim, check_attention_swa_decode, check_attention_window);
+        if (check_gemma4_swa) return run_gemma4_swa_check(*program, check_attention_reps);
+        if (check_glm_dsa) return run_glm_dsa_check(*program, check_attention_reps);
+        if (check_dsv4_attention) return run_dsv4_attention_check(*program, check_attention_reps);
+        if (check_dsv4_hc) return run_dsv4_hc_check(*program, check_attention_reps);
+        if (check_deepseek_v41) return run_backend_dsv41_check(*program);
+        if (check_text_session_state) return run_text_session_state_check(*program);
+        if (model_path.empty()) throw std::runtime_error("missing model or execution mode (see --help)");
+        auto gate_mode = InputGateMode::None;
+        if (check_linear_gate == "sigmoid") gate_mode = InputGateMode::Sigmoid;
+        else if (check_linear_gate == "silu") gate_mode = InputGateMode::Silu;
+        else if (!check_linear_gate.empty()) throw std::runtime_error("--check-linear-gate must be sigmoid or silu");
+        if (!check_linear_cpu.empty()) return run_cpu_linear_check(*program, check_linear_cpu, check_linear_m, gate_mode, check_linear_reps);
+        if (!check_linear.empty()) return run_linear_check(*program, check_linear, check_linear_m, gate_mode, check_linear_reps);
+        if (!check_tp_linear.empty()) {
+            const auto axis = check_tp_axis_arg == "output" ? TensorParallelAxis::Output :
+                check_tp_axis_arg == "input" ? TensorParallelAxis::Input :
+                throw std::runtime_error("--check-tp-axis must be output or input");
+            return run_tensor_parallel_linear_check(*program, check_tp_linear, axis, check_tp_m);
+        }
+        if (!check_ep_moe.empty()) return run_expert_parallel_moe_check(*program, check_ep_moe, check_ep_moe_tokens, check_ep_moe_routes);
+        if (!check_linear_group.empty()) return run_linear_group_check(*program, check_linear_group, check_linear_m, check_linear_reps);
+        if (!check_q8_embedding.empty()) return run_q8_embedding_check(*program, check_q8_embedding);
+        if (check_gemma_geglu_layer >= 0) return run_gemma_geglu_check(*program, check_gemma_geglu_layer, check_gemma_geglu_reps);
+        if (check_mfq_container) return run_container_check(*program);
+        if (check_runtime_assets) return run_assets_check(*program, config_path, tokenizer_model, check_tokenizer_text);
+        if (check_moe_layer >= 0) return run_moe_check(*program, config_path, check_moe_layer, parse_ids(check_moe_tokens), check_moe_reps);
+        if (!check_mfe_tensor.empty()) {
+            KlMmqScope mmq(parse_kl_mmq_mode(kl_mmq_arg), executor.mmq());
+            const auto names = parse_tensor_names(check_mfe_tensor);
+            if (!program->weights().empty() && names.size() != 1)
+                throw std::runtime_error("cached --check-mfe-tensor accepts one tensor per invocation");
+            for (const auto& name : names) {
+                const int result = run_mfe_tensor_check(*program, name, check_mfe_tokens, check_mfe_routes,
+                    check_mfe_reps, check_mfe_split_width, check_mfe_routed_input, check_mfe_benchmark_only);
+                if (result) return result;
             }
-            throw std::runtime_error(
-                "--bench-qwen35-mtp requires Qwen3.5");
+            return 0;
         }
-        if (!prefill_sweep_sizes.empty()) {
-            execution.profiler.enabled=profile;
-            const int status = [&] {
-                if constexpr (std::is_same_v<Model, tyloi::cuda::qwen35::Model>)
-                    return run_prefill_sweep(model, state, executor.get(), model.metadata,
-                        prefill_sweep_sizes, prefill_sweep_reps, execution);
-                else
-                    return run_prefill_sweep(model, state, executor.get(), model.metadata,
-                        prefill_sweep_sizes, prefill_sweep_reps, execution);
-            }();
-            if (execution.weights.moe) {
-                print_moe_expert_cache_stats(
-                    execution.weights.moe, std::cout);
-            }
-            return status;
+        if (!check_dsv4_output_a.empty()) return run_dsv4_output_a_check(*program, check_dsv4_output_a,
+            check_dsv4_output_a_batch, check_dsv4_output_a_reps);
+        if (minicpmo_eval_batch) {
+            TYLOINFER_RUNTIME_CHECK(ids_arg.empty() && ids_file.empty(), "MiniCPM-o eval mode cannot combine token inputs");
+            TYLOINFER_RUNTIME_CHECK(minicpmo_eval_vision_batch_size > 0, "--minicpmo-eval-vision-batch-size must be positive");
+            return tyloi::cuda::minicpmo45::run_eval_batch(*program, context_size, minicpmo_eval_vision_batch_size);
         }
-        if(!router_lookahead_audit.empty()) {
-            TYLOINFER_RUNTIME_CHECK(!compare_ffn_transfer_phases && !profile && gen>1 && !decode_inputs.empty(),
-                "router lookahead audit requires fixed single-token decode inputs and profiling disabled");
-            if constexpr (std::is_same_v<Model,tyloi::cuda::Qwen4CausalLm>)
-                qwen4_begin_router_lookahead_audit(model,gen-1);
-            else throw std::runtime_error("router lookahead audit requires Qwen4 Flash-Next");
+        program->load();
+        const auto t1 = std::chrono::steady_clock::now();
+        if (check_qwen4_decode_hidden) {
+            const auto* variants = tyloi::cuda::env_lookup("TYLOINFER_MTP_GENERATION_VARIANTS");
+            if (profile && variants && variants[0] == '1') return run_qwen4_generation_variants(*program, ids_vec);
+            return profile ? run_qwen4_mtp_profile(*program, ids_vec) : run_qwen4_decode_hidden_check(*program);
         }
-        auto ids_vec = ids_file.empty() ? parse_ids(ids_arg) : load_ids_file(ids_file);
+        if (check_flash_next) return run_flash_next_check(*program);
+        if (check_nemotron_h) return run_nemotron_h_check(*program);
+        if (check_nemotron_h_vision) return run_nemotron_h_vision_check(*program);
+        if (check_nemotron_h_mtp) return run_nemotron_h_mtp_check(*program);
+        if (check_flash_next_mtp) return run_flash_next_mtp_check(*program);
+        if (check_qwen35_mtp) return run_qwen35_mtp_check(*program);
+        if (!bench_qwen35_mtp.empty()) return run_qwen35_mtp_bench(*program, bench_qwen35_mtp == "mtp", gen, bench_qwen35_mtp_reps);
+        if (!prefill_sweep_sizes.empty()) return run_prefill_sweep(*program, prefill_sweep_sizes, prefill_sweep_reps, profile);
+        TYLOINFER_RUNTIME_CHECK(!ids_vec.empty(), "token ID lists require at least one integer");
         auto ids = tyloi::cuda::tensor(ids_vec, tyloi::TensorOptions().dtype(tyloi::kInt64).device(tyloi::kCUDA)).unsqueeze(0);
-        if (compare_dsv4_hc_ops) {
-            g_dsv4_compare_hc_ops = true;
-            g_dsv4_fused_hc = false;
-            state.reset(1);
-            (void)diagnostic_forward(model, state, executor.get(), execution, ids);
-            cudaStreamSynchronize(::tyloi::cuda::current_stream());
-            return 0;
-        }
-        if (compare_dsv4_hc_model) {
-            return run_dsv4_hc_model_compare(
-                model, state, executor.get(), execution, ids);
-        }
+        if (compare_dsv4_hc_ops || compare_dsv4_hc_model) return run_hc_compare(*program, ids, compare_dsv4_hc_ops);
         if (!block_trace_reference.empty()) {
-            return run_block_trace_compare(
-                model, state, executor.get(), execution, block_trace_reference,
-                config_path, context_size, ids);
+            auto reference = static_cast<tyloi::cuda::CudaLoadOptions>(*this);
+            reference.model_path = block_trace_reference;
+            return run_block_trace_compare(*program, std::move(reference), ids);
         }
-        if (!block_trace_output.empty()) {
-            return run_block_trace_dump(
-                model, state, executor.get(), execution, block_trace_output, ids,
-                block_trace_start, block_trace_count);
-        }
-        if(runtime_comparison_modes()) {
-            if constexpr (!std::is_same_v<Model,tyloi::cuda::Qwen4CausalLm>)
-                throw std::runtime_error("runtime comparison requires Qwen4 Flash-Next");
-            const char* comparison_name = runtime_comparison_name();
-            std::cout<<comparison_name<<"_model_load_sec="
-                <<std::chrono::duration<double>(t1-t0).count()<<"\n";
-            const int rounds=warmup_prefill<0?1:warmup_prefill;
-            const bool compare_dense_mhc=execution.config.residual.dense_injection;
-            ScopedDiagnosticEnvironment topk_cache("TYLOINFER_MOE_TOPK_CACHE");
-            ScopedDiagnosticEnvironment shared_norm("TYLOINFER_GR_SHARE_NORM");
-            ScopedDiagnosticEnvironment dense_fusion("TYLOINFER_GR_DENSE_FUSION");
-            ScopedDiagnosticEnvironment gr_groups("TYLOINFER_GR_FIXED_GROUPS");
-            ScopedDiagnosticEnvironment gr_threads("TYLOINFER_GR_UP_THREADS");
-            ScopedDiagnosticEnvironment gr_formats("TYLOINFER_GR_FIXED_FORMATS");
-            ScopedDiagnosticEnvironment gr_async("TYLOINFER_GR_ASYNC_NORMALIZED");
-            ScopedDiagnosticEnvironment gdn_geometry("TYLOINFER_GDN_FIXED_GEOMETRY");
-            ScopedDiagnosticEnvironment gdn_inplace("TYLOINFER_GDN_INPLACE_STATE");
-            ScopedDiagnosticEnvironment qsa_selection("TYLOINFER_QSA_SELECT_FUSED");
-            ScopedDiagnosticEnvironment qsa_gate("TYLOINFER_QSA_SPARSE_GATE_FUSED");
-            ScopedDiagnosticEnvironment qsa_reduce("TYLOINFER_QSA_PARALLEL_REDUCE");
-            ScopedDiagnosticEnvironment qsa_query("TYLOINFER_QSA_SPARSE_QUERY_FUSED");
-            ScopedDiagnosticEnvironment parallel_gu("TYLOINFER_MFE_PARALLEL_GU");
-            ScopedDiagnosticEnvironment gpu_bundle("TYLOINFER_MFE_GPU_BUNDLE");
-            ScopedDiagnosticEnvironment default_math("TYLOINFER_MFE_DEFAULT_MATH");
-            ScopedDiagnosticEnvironment e8_narrow("TYLOINFER_MFE_E8_NARROW");
-            ScopedDiagnosticEnvironment shared_first("TYLOINFER_MFE_SHARED_FIRST");
-            ScopedDiagnosticEnvironment early_gu("TYLOINFER_MFE_EARLY_GU");
-            ScopedDiagnosticEnvironment cpu_background("TYLOINFER_MOE_CPU_BACKGROUND_CALIBRATION");
-            ScopedDiagnosticEnvironment route_poll("TYLOINFER_MOE_ROUTE_POLL_US");
-            ScopedDiagnosticEnvironment window_flush("TYLOINFER_MOE_SINGLE_WINDOW_FLUSH");
-            ScopedDiagnosticEnvironment early_no_cpu_ready("TYLOINFER_MOE_EARLY_NO_CPU_READY");
-            ScopedDiagnosticEnvironment gpu_only_cpu_wait("TYLOINFER_MOE_SKIP_GPU_ONLY_CPU_WAIT");
-            ScopedDiagnosticEnvironment fixed_gpu_timing("TYLOINFER_MOE_SKIP_FIXED_GPU_TIMING");
-            ScopedDiagnosticEnvironment window_input_views("TYLOINFER_MFE_WINDOW_INPUT_VIEWS");
-            ScopedDiagnosticEnvironment route_spin("TYLOINFER_MOE_ROUTE_SPIN");
-            ScopedDiagnosticEnvironment plan_reuse("TYLOINFER_MOE_PLAN_REUSE");
-            ScopedDiagnosticEnvironment shared_gate_fusion("TYLOINFER_SHARED_GATE_FUSED");
-            ScopedDiagnosticEnvironment layer_timings("TYLOINFER_TRACE_LAYER_TIMINGS");
-            ScopedDiagnosticEnvironment mhc_timings("TYLOINFER_TRACE_MHC_TIMINGS");
-            ScopedDiagnosticEnvironment host_pin("TYLOINFER_MOE_DECODE_HOST_PIN");
-            ScopedDiagnosticEnvironment resident_overlap("TYLOINFER_MFE_RESIDENT_PLAN_OVERLAP");
-            ScopedDiagnosticEnvironment dma_graph_batch("TYLOINFER_MOE_DMA_GRAPH_BATCH");
-            ScopedDiagnosticEnvironment ram_field_packing("TYLOINFER_MOE_RAM_FIELD_PACKING");
-            ScopedDiagnosticEnvironment warp_multi_sum("TYLOINFER_CUDA_WARP_MULTI_SUM");
-            TYLOINFER_RUNTIME_CHECK(!(compare_mfe_e8_narrow || compare_mfe_default_math || compare_mfe_parallel_gu || compare_mfe_gpu_bundle || compare_mfe_shared_first || compare_mfe_early_gu) || execution.config.moe_ffn.two_stage,
-                "MFE parallel Gate/Up comparison requires two-stage FFN");
-            TYLOINFER_RUNTIME_CHECK(!compare_mhc_shared_norm || execution.config.residual.two_stage,
-                "MHC norm comparison requires fused residual projection");
-            TYLOINFER_RUNTIME_CHECK(!compare_mhc_dense_fusion || (execution.config.residual.two_stage && execution.config.residual.dense_injection),
-                "MHC dense fusion comparison requires fused residual BF16 injection");
-            TYLOINFER_RUNTIME_CHECK(!(compare_mhc_packed_groups || compare_mhc_fixed_formats || compare_mhc_async_normalized || compare_graph_optimizations) || execution.config.residual.two_stage,
-                "MHC packed group comparison requires fused residual projection");
-            TYLOINFER_RUNTIME_CHECK(!(compare_gdn_fixed_geometry || compare_gdn_inplace_state) ||
-                (execution.config.gdn_fused_core && execution.config.gdn_fused_preparation &&
-                 execution.config.gdn_fused_output && execution.config.gdn_transposed_state),
-                "GDN comparison requires the complete fused transposed core");
-            const int performance_passes=3*comparison_rounds;
-            for(int pass=0;pass<performance_passes+(comparison_phase_timings?3:0);++pass) {
-                const bool phased=pass%3==1;
-                const bool phase_timings=comparison_phase_timings && pass>=performance_passes;
-                if(comparison_phase_timings) {
-                    layer_timings.set(phase_timings?"2":"0");mhc_timings.set("0");
-                }
-                if (compare_route_poll) route_poll.set(phased ? "0" : "2000");
-                if (compare_window_flush) window_flush.set(phased ? "1" : "0");
-                if (compare_early_no_cpu_ready) early_no_cpu_ready.set(phased ? "1" : "0");
-                if (compare_gpu_only_cpu_wait) gpu_only_cpu_wait.set(phased ? "1" : "0");
-                if (compare_fixed_gpu_timing) fixed_gpu_timing.set(phased ? "1" : "0");
-                if (compare_window_input_views) window_input_views.set(phased ? "1" : "0");
-                if (compare_route_spin) route_spin.set(phased ? "1" : "0");
-                if (compare_moe_plan_reuse) plan_reuse.set(phased ? "1" : "0");
-                if (compare_mfe_default_math) default_math.set(phased ? "1" : "0");
-                if (compare_mfe_e8_narrow) e8_narrow.set(phased ? "1" : "0");
-                if (compare_shared_gate_fusion) shared_gate_fusion.set(phased ? "1" : "0");
-                if (compare_graph_optimizations) {
-                    window_flush.set(phased ? "1" : "0");
-                    early_no_cpu_ready.set(phased ? "1" : "0");
-                    gpu_only_cpu_wait.set(phased ? "1" : "0");
-                    window_input_views.set(phased ? "1" : "0");
-                    route_spin.set(phased ? "1" : "0");
-                    shared_gate_fusion.set(phased ? "1" : "0");
-                    gr_groups.set(phased ? "1" : "0");
-                    gr_threads.set(phased ? "512" : "256");
-                }
-                if (compare_host_pin) host_pin.set(phased ? "1" : "0");
-                if (compare_resident_overlap) resident_overlap.set(phased ? "1" : "0");
-                if (compare_dma_graph_batch) dma_graph_batch.set(phased ? "1" : "0");
-                if (compare_ram_field_packing) ram_field_packing.set(phased ? "1" : "0");
-                if (compare_warp_multi_sum) warp_multi_sum.set(phased ? "1" : "0");
-                if (compare_cpu_background_calibration) cpu_background.set(phased ? "1" : "0");
-                if (compare_router_topk) topk_cache.set(phased ? "1" : "0");
-                if (compare_mhc_shared_norm) shared_norm.set(phased ? "1" : "0");
-                if (compare_mhc_dense_fusion) {shared_norm.set("1");dense_fusion.set(phased ? "1" : "0");}
-                if (compare_mhc_packed_groups) {
-                    gr_groups.set(phased?"1":"0");gr_threads.set(phased?"512":"256");
-                }
-                if (compare_mhc_fixed_formats)gr_formats.set(phased?"1":"0");
-                if (compare_mhc_async_normalized)gr_async.set(phased?"1":"0");
-                if (compare_gdn_fixed_geometry)gdn_geometry.set(phased?"1":"0");
-                if (compare_gdn_inplace_state)gdn_inplace.set(phased?"1":"0");
-                if (compare_qsa_fusion) {
-                    qsa_selection.set(phased?"1":"0");qsa_gate.set(phased?"1":"0");
-                    qsa_reduce.set(phased?"1":"0");
-                    qsa_query.set(phased?"1":"0");
-                }
-                if (compare_mfe_parallel_gu) parallel_gu.set(phased ? "1" : "0");
-                if (compare_mfe_gpu_bundle) {
-                    parallel_gu.set("1");gpu_bundle.set(phased ? "1" : "0");
-                }
-                if (compare_mfe_shared_first) {
-                    parallel_gu.set("1");gpu_bundle.set("1");shared_first.set(phased ? "1" : "0");
-                }
-                if (compare_mfe_early_gu) {
-                    parallel_gu.set("1");gpu_bundle.set("1");early_gu.set(phased ? "1" : "0");
-                }
-                // reset destroys the decoder graphs before each branch is captured.
-                state.reset(1);cudaStreamSynchronize(::tyloi::cuda::current_stream());
-                if(compare_ffn_transfer_phases)execution.config.moe_ffn.transfer_phases=phased;
-                if(compare_mhc_fusion) {
-                    execution.config.residual.two_stage=phased;
-                    execution.config.residual.dense_injection=phased && compare_dense_mhc;
-                }
-                if constexpr (std::is_same_v<Model,tyloi::cuda::Qwen4CausalLm>) {
-                    if(compare_router_lookahead)model.router_lookahead=phased;
-                    if(compare_rotary_fusion)qwen4_set_rotary_fusion(model,phased);
-                    if(compare_attention_grouping) {
-                        qwen4_set_rotary_fusion(model,true);
-                        qwen4_set_attention_grouping(model,phased);
-                    }
-                    if(compare_mhc_fusion) {
-                        qwen4_set_rotary_fusion(model,true);
-                        qwen4_set_attention_grouping(model,true);
-                    }
-                }
-                if(compare_cpu_background_calibration)
-                    prepare_moe_cpu_calibration_comparison(execution.weights.moe,pass>0);
-                else if(compare_cpu_transfer_budget)
-                    prepare_moe_cpu_budget_comparison(execution.weights.moe,pass>0,phased);
-                else prepare_moe_pipeline_comparison(execution.weights.moe,pass>0);
-                std::cout<<comparison_name<<"_pass="<<pass<<" phase="<<phased<<" begin=1";
-                if(comparison_phase_timings)std::cout<<" mfe_phase_timings="<<phase_timings;
-                std::cout<<'\n';
-                const auto warm_start=std::chrono::steady_clock::now();
-                for(int round=0;round<rounds;++round) {
-                    diagnostic_reset(model, state, 1);
-                    (void)diagnostic_next_token(model, state, executor.get(), execution, ids);
-                    cudaStreamSynchronize(::tyloi::cuda::current_stream());
-                }
-                state.reset(1);cudaStreamSynchronize(::tyloi::cuda::current_stream());execution.profiler.reset();
-                std::cout<<"warmup_prefill_rounds="<<rounds<<"\n"
-                    <<"warmup_prefill_tokens="<<rounds*ids_vec.size()<<"\n"
-                    <<"warmup_prefill_sec="<<std::chrono::duration<double>(
-                        std::chrono::steady_clock::now()-warm_start).count()<<"\n";
-                const auto pass_start=std::chrono::steady_clock::now();
-                const int status=generate_diagnostic_tokens(execution,model,state,executor.get(),ids,gen,false,
-                    pass_start,pass_start,decode_inputs);
-                if(status)return status;
-                const auto records=finish_moe_pipeline_comparison(execution.weights.moe);
-                if(compare_moe_plan_reuse || compare_mfe_e8_narrow || compare_mfe_default_math || compare_cpu_transfer_budget || compare_cpu_background_calibration || compare_mfe_shared_first || compare_mhc_dense_fusion || compare_mhc_packed_groups || compare_mhc_fixed_formats || compare_mhc_async_normalized || compare_gdn_fixed_geometry || compare_gdn_inplace_state || compare_qsa_fusion || compare_mfe_early_gu)
-                    print_moe_expert_cache_stats(execution.weights.moe,std::cout);
-                std::cout<<comparison_name<<"_pass="<<pass<<" phase="<<phased
-                    <<" end=1 dispatch_records="<<records<<"\n";
-            }
-            return 0;
-        }
-        const int warmup_rounds = warmup_prefill < 0 ? (profile ? 1 : 0) : warmup_prefill;
-        const auto warmup_start = std::chrono::steady_clock::now();
-        for (int round = 0; round < warmup_rounds; ++round) {
-            state.reset(1);
-            (void)diagnostic_next_token(model, state, executor.get(), execution, ids);
-            cudaStreamSynchronize(::tyloi::cuda::current_stream());
-        }
-        if (warmup_rounds) {
-            state.reset(1);
-            execution.profiler.reset();
-        }
-        std::cout << "warmup_prefill_rounds=" << warmup_rounds << "\n"
-                  << "warmup_prefill_tokens=" << warmup_rounds * ids_vec.size() << "\n"
-                  << "warmup_prefill_sec="
-                  << std::chrono::duration<double>(std::chrono::steady_clock::now() - warmup_start).count()
-                  << "\n";
-        if (profile) {
-            execution.profiler.enabled = true;
-        }
-        if (compare_decode_splitk) {
-            auto run = [&](bool split) {
-                execution.config.tasks.attention.kernels.split_k = split;
-                state.reset(1);
-                (void)diagnostic_hidden(model, state, executor.get(), execution, ids);
-                const int64_t decode_len = state.cache_pos + 1;
-                auto seq_len = tyloi::cuda::tensor({decode_len}, tyloi::TensorOptions().dtype(tyloi::kInt64).device(tyloi::kCUDA));
-                auto decode_id = ids.index({Slice(), -1}).reshape({1, 1});
-                auto hidden = diagnostic_hidden(model, state, executor.get(), execution,
-                                                decode_id, mfq_nullopt, seq_len);
-                auto last = diagnostic_last_hidden(std::move(hidden));
-                auto logits = diagnostic_logits(model, executor.get(), execution,
-                                                std::move(last), false).to(tyloi::kFloat32);
-                cudaStreamSynchronize(::tyloi::cuda::current_stream());
-                return logits;
-            };
-            auto ref = run(false);
-            auto test = run(true);
-            auto ref_logp = tyloi::cuda::log_softmax(ref, -1);
-            auto test_logp = tyloi::cuda::log_softmax(test, -1);
-            auto kl = (ref_logp.exp() * (ref_logp - test_logp)).sum(-1);
-            auto diff = (ref - test).abs();
-            std::cout << "decode_splitk_compare_kl=" << kl.template item<float>() << "\n";
-            std::cout << "decode_splitk_compare_rel=" << ((test - ref).norm() / ref.norm()).template item<float>() << "\n";
-            std::cout << "decode_splitk_compare_mean_abs=" << diff.mean().template item<float>() << "\n";
-            std::cout << "decode_splitk_compare_max_abs=" << diff.max().template item<float>() << "\n";
-            std::cout << "decode_splitk_compare_same_top="
-                      << (ref.argmax(-1).eq(test.argmax(-1)).template item<bool>() ? 1 : 0) << "\n";
-            return 0;
-        }
-        if (compare_mma_decode) {
-            if (compare_mma_decode_steps < 1) {
-                throw std::runtime_error("--compare-mma-decode-steps must be positive");
-            }
-            auto cuda_i64 = tyloi::TensorOptions().dtype(tyloi::kInt64).device(tyloi::kCUDA);
-            std::vector<tyloi::DenseTensor> reference_logits;
-            std::vector<int64_t> teacher_tokens;
-            reference_logits.reserve(compare_mma_decode_steps);
-            teacher_tokens.reserve(compare_mma_decode_steps);
-            execution.config.tasks.attention.kernels.mma_decode = false;
-            state.reset(1);
-            auto input = diagnostic_next_token(model, state, executor.get(), execution, ids)
-                .reshape({1, 1});
-            const int64_t initial_teacher_token = input.template item<int64_t>();
-            for (int step = 0; step < compare_mma_decode_steps; ++step) {
-                const int64_t decode_len = state.cache_pos + 1;
-                auto seq_len = tyloi::cuda::tensor({decode_len}, cuda_i64);
-                auto hidden = diagnostic_hidden(model, state, executor.get(), execution,
-                                                input, mfq_nullopt, seq_len);
-                auto last = diagnostic_last_hidden(std::move(hidden));
-                auto logits = diagnostic_logits(model, executor.get(), execution,
-                                                std::move(last), false).to(tyloi::kFloat32);
-                reference_logits.push_back(logits.clone());
-                const int64_t next = logits.argmax(-1).template item<int64_t>();
-                teacher_tokens.push_back(next);
-                input = tyloi::cuda::tensor({next}, cuda_i64).reshape({1, 1});
-            }
-            execution.config.tasks.attention.kernels.mma_decode = true;
-            const int64_t planned_kv_length =
-                compare_mma_decode_planned_len > 0
-                ? compare_mma_decode_planned_len
-                : ids.size(1) + compare_mma_decode_steps;
-            if (planned_kv_length > diagnostic_max_position_embeddings(model)) {
-                throw std::runtime_error("decode comparison planned length exceeds context capacity");
-            }
-            state.reset(1);
-            (void)diagnostic_next_token(model, state, executor.get(), execution, ids);
-            input = tyloi::cuda::tensor({initial_teacher_token}, cuda_i64).reshape({1, 1});
-            double kl_sum = 0.0;
-            double kl_max = 0.0;
-            double abs_sum = 0.0;
-            double delta_sq_sum = 0.0;
-            double reference_sq_sum = 0.0;
-            double max_abs = 0.0;
-            int same_top = 0;
-            int first_top_difference = -1;
-            int64_t values = 0;
-            for (int step = 0; step < compare_mma_decode_steps; ++step) {
-                const int64_t decode_len = state.cache_pos + 1;
-                auto seq_len = tyloi::cuda::tensor({decode_len}, cuda_i64);
-                auto hidden = diagnostic_hidden(
-                    model, state, executor.get(), execution, input,
-                    mfq_nullopt, seq_len, nullptr, mfq_nullopt, nullptr, 0,
-                    planned_kv_length, 0);
-                auto last = diagnostic_last_hidden(std::move(hidden));
-                auto test = diagnostic_logits(model, executor.get(), execution,
-                                              std::move(last), false).to(tyloi::kFloat32);
-                const auto & ref = reference_logits[(size_t)step];
-                auto ref_logp = tyloi::cuda::log_softmax(ref, -1);
-                auto test_logp = tyloi::cuda::log_softmax(test, -1);
-                const double kl = (ref_logp.exp() * (ref_logp - test_logp)).sum(-1).template item<double>();
-                auto delta = test - ref;
-                kl_sum += kl;
-                kl_max = std::max(kl_max, kl);
-                abs_sum += delta.abs().sum().template item<double>();
-                delta_sq_sum += delta.square().sum().template item<double>();
-                reference_sq_sum += ref.square().sum().template item<double>();
-                max_abs = std::max(max_abs, delta.abs().max().template item<double>());
-                values += delta.numel();
-                const bool top_equal = test.argmax(-1).eq(ref.argmax(-1)).template item<bool>();
-                same_top += top_equal ? 1 : 0;
-                if (!top_equal && first_top_difference < 0) first_top_difference = step;
-                input = tyloi::cuda::tensor({teacher_tokens[(size_t)step]}, cuda_i64).reshape({1, 1});
-            }
-            cudaStreamSynchronize(::tyloi::cuda::current_stream());
-            std::cout << std::setprecision(10)
-                      << "mma_decode_compare_steps=" << compare_mma_decode_steps << "\n"
-                      << "mma_decode_compare_mean_kl=" << kl_sum / compare_mma_decode_steps << "\n"
-                      << "mma_decode_compare_max_kl=" << kl_max << "\n"
-                      << "mma_decode_compare_rel=" << std::sqrt(delta_sq_sum / reference_sq_sum) << "\n"
-                      << "mma_decode_compare_mean_abs=" << abs_sum / values << "\n"
-                      << "mma_decode_compare_max_abs=" << max_abs << "\n"
-                      << "mma_decode_compare_same_top=" << same_top << "\n"
-                      << "mma_decode_compare_first_top_difference=" << first_top_difference << "\n";
-            return 0;
-        }
-        if (compare_nvq_vec4) {
-            auto run = [&](bool) {
-                state.reset(1);
-                auto logits = diagnostic_last_logits(
-                    model, state, executor.get(), execution, ids)
-                    .to(tyloi::kFloat32);
-                cudaStreamSynchronize(::tyloi::cuda::current_stream());
-                return logits;
-            };
-            auto ref = run(false);
-            auto repeat = run(false);
-            auto test = run(true);
-            auto ref_logp = tyloi::cuda::log_softmax(ref, -1);
-            auto repeat_logp = tyloi::cuda::log_softmax(repeat, -1);
-            auto test_logp = tyloi::cuda::log_softmax(test, -1);
-            auto repeat_kl = (ref_logp.exp() * (ref_logp - repeat_logp)).sum(-1);
-            auto kl = (ref_logp.exp() * (ref_logp - test_logp)).sum(-1);
-            auto diff = (ref - test).abs();
-            auto repeat_diff = (ref - repeat).abs();
-            std::cout << "nvq_vec4_repeat_kl=" << repeat_kl.template item<float>() << "\n";
-            std::cout << "nvq_vec4_repeat_max_abs=" << repeat_diff.max().template item<float>() << "\n";
-            std::cout << "nvq_vec4_compare_kl=" << kl.template item<float>() << "\n";
-            std::cout << "nvq_vec4_compare_rel="
-                      << ((test - ref).norm() / ref.norm()).template item<float>() << "\n";
-            std::cout << "nvq_vec4_compare_mean_abs=" << diff.mean().template item<float>() << "\n";
-            std::cout << "nvq_vec4_compare_max_abs=" << diff.max().template item<float>() << "\n";
-            std::cout << "nvq_vec4_compare_same_top="
-                      << (ref.argmax(-1).eq(test.argmax(-1)).template item<bool>() ? 1 : 0) << "\n";
-            return 0;
+        if (!block_trace_output.empty()) return run_block_trace_dump(*program, block_trace_output, ids, block_trace_start, block_trace_count);
+        if (runtime_comparison_modes()) {
+            using tyloi::cuda::diagnostics::Policy;
+            Policy policy;
+            if (compare_route_poll) policy = Policy::route_poll;
+            else if (compare_window_flush) policy = Policy::window_flush;
+            else if (compare_window_input_views) policy = Policy::window_input_views;
+            else if (compare_route_spin) policy = Policy::route_spin;
+            else if (compare_host_pin) policy = Policy::host_pin;
+            else if (compare_shared_gate_fusion) policy = Policy::shared_gate_fusion;
+            else if (compare_router_topk) policy = Policy::router_topk;
+            else if (compare_warp_multi_sum) policy = Policy::warp_multi_sum;
+            else if (compare_mhc_shared_norm) policy = Policy::mhc_shared_norm;
+            else if (compare_mhc_dense_fusion) policy = Policy::mhc_dense_fusion;
+            else if (compare_mhc_packed_groups) policy = Policy::mhc_packed_groups;
+            else if (compare_mhc_fixed_formats) policy = Policy::mhc_fixed_formats;
+            else if (compare_mhc_async_normalized) policy = Policy::mhc_async_normalized;
+            else if (compare_gdn_fixed_geometry) policy = Policy::gdn_fixed_geometry;
+            else if (compare_gdn_inplace_state) policy = Policy::gdn_inplace_state;
+            else if (compare_qsa_fusion) policy = Policy::qsa_fusion;
+            else if (compare_rotary_fusion) policy = Policy::rotary_fusion;
+            else if (compare_attention_grouping) policy = Policy::attention_grouping;
+            else if (compare_mhc_fusion) policy = Policy::mhc_fusion;
+            else throw std::runtime_error("unsupported runtime comparison");
+            return run_policy(*program, ids, {policy, comparison_rounds, warmup_prefill, gen,
+                comparison_phase_timings, decode_inputs, t0, t1});
         }
         if (prefill_repeat > 0) {
-            const char * trace_env = tyloi::cuda::env_lookup("TYLOINFER_CHECK_PREFILL_REPEAT_TRACE");
-            const bool trace_repeat = trace_env != nullptr && std::atoi(trace_env) != 0;
-            std::vector<tyloi::DenseTensor> reference_trace;
-            std::vector<std::pair<std::string, tyloi::DenseTensor>> reference_gemma_trace;
-            for (int i = 0; i < prefill_repeat; ++i) {
-                state.reset(1);
-                auto run_t0 = std::chrono::steady_clock::now();
-                std::vector<tyloi::DenseTensor> trace;
-                std::vector<std::pair<std::string, tyloi::DenseTensor>> gemma_trace;
-                tyloi::DenseTensor logits;
-                if (trace_repeat) {
-                    execution.gemma_trace_layer = 0;
-                    execution.gemma_stage_trace = &gemma_trace;
-                    auto hidden = diagnostic_hidden(
-                        model, state, executor.get(), execution, ids,
-                        mfq_nullopt, mfq_nullopt, &trace);
-                    execution.gemma_stage_trace = nullptr;
-                    execution.gemma_trace_layer = -1;
-                    auto last = diagnostic_last_hidden(
-                        std::move(hidden));
-                    logits = diagnostic_logits(
-                        model, executor.get(), execution, std::move(last), false);
-                } else {
-                    logits = diagnostic_last_logits(
-                        model, state, executor.get(), execution, ids);
-                }
-                cudaStreamSynchronize(::tyloi::cuda::current_stream());
-                auto run_t1 = std::chrono::steady_clock::now();
-                std::cout << "prefill_repeat=" << (i + 1)
-                          << " sec=" << std::chrono::duration<double>(run_t1 - run_t0).count()
-                          << " top=" << logits.argmax(-1).template item<int64_t>() << "\n";
-                if (trace_repeat) {
-                    if (reference_trace.empty()) {
-                        reference_trace = std::move(trace);
-                        reference_gemma_trace = std::move(gemma_trace);
-                    } else {
-                        for (size_t stage = 0; stage < gemma_trace.size(); ++stage) {
-                            auto diff = (gemma_trace[stage].second -
-                                         reference_gemma_trace[stage].second).abs();
-                            const float max_abs = diff.max().template item<float>();
-                            if (max_abs != 0.0f) {
-                                std::cout << "prefill_repeat_first_gemma_stage="
-                                          << gemma_trace[stage].first
-                                          << " max_abs=" << max_abs
-                                          << " mean_abs=" << diff.mean().template item<float>() << "\n";
-                                break;
-                            }
-                        }
-                        for (size_t stage = 0; stage < trace.size(); ++stage) {
-                            auto diff = (trace[stage] - reference_trace[stage]).abs();
-                            const float max_abs = diff.max().template item<float>();
-                            if (max_abs != 0.0f) {
-                                std::cout << "prefill_repeat_first_difference=" << stage
-                                          << " layer=" << static_cast<int64_t>(stage) - 1
-                                          << " max_abs=" << max_abs
-                                          << " mean_abs=" << diff.mean().template item<float>() << "\n";
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            return 0;
+            const auto* trace = tyloi::cuda::env_lookup("TYLOINFER_CHECK_PREFILL_REPEAT_TRACE");
+            return repeat_prefill(*program, ids, prefill_repeat, trace && std::atoi(trace) != 0);
         }
-        if (compare_mma_attention) {
-            execution.config.tasks.attention.kernels.mma_prefill = false;
-            execution.config.tasks.attention.kernels.bf16_flash128 = false;
-            auto ref = diagnostic_last_logits(
-                model, state, executor.get(), execution, ids)
-                .to(tyloi::kFloat32);
-            cudaStreamSynchronize(::tyloi::cuda::current_stream());
-            state.reset(1);
-            execution.config.tasks.attention.kernels.mma_prefill = true;
-            execution.config.tasks.attention.kernels.bf16_flash128 = true;
-            auto test = diagnostic_last_logits(
-                model, state, executor.get(), execution, ids)
-                .to(tyloi::kFloat32);
-            cudaStreamSynchronize(::tyloi::cuda::current_stream());
-            auto ref_logp = tyloi::cuda::log_softmax(ref, -1);
-            auto test_logp = tyloi::cuda::log_softmax(test, -1);
-            auto kl = (ref_logp.exp() * (ref_logp - test_logp)).sum(-1);
-            auto diff = (ref - test).abs();
-            auto same_top = ref.argmax(-1).eq(test.argmax(-1));
-            std::cout << "attention_compare_kl=" << kl.template item<float>() << "\n";
-            std::cout << "attention_compare_max_logit_abs=" << diff.max().template item<float>() << "\n";
-            std::cout << "attention_compare_mean_logit_abs=" << diff.mean().template item<float>() << "\n";
-            std::cout << "attention_compare_same_top=" << (same_top.template item<bool>() ? 1 : 0) << "\n";
-            return 0;
-        }
+        if (compare_decode_splitk) return tyloi::cuda::diagnostics::compare_decode_splitk(*program, ids);
+        if (compare_mma_decode) return tyloi::cuda::diagnostics::compare_mma_decode(*program, ids,
+            compare_mma_decode_steps, compare_mma_decode_planned_len);
+        if (compare_mma_attention) return tyloi::cuda::diagnostics::compare_mma_attention(*program, ids);
         std::unordered_set<int64_t> stop_ids;
         if (!ignore_eos && tokenizer_model.empty() && decode_inputs.empty()) {
-            const auto* source = diagnostic_source(model);
-            if (!source) throw std::runtime_error("diagnostics model source is unavailable");
-            stop_ids = tyloi::models::stop_token_ids(
-                tyloi::models::config_json(*source, config_path),
-                diagnostic_vocab_size(model));
+            auto source = tyloi::open_model_source(model_path);
+            stop_ids = tyloi::models::stop_token_ids(tyloi::models::config_json(*source, config_path),
+                program->model().info().vocab_size);
             if (stop_ids.empty()) std::cerr << "warning: no model EOS token IDs; generation is limited only by --gen\n";
         }
-        const auto status=generate_diagnostic_tokens(
-            execution, model, state, executor.get(), ids, gen, profile, t0, t1,
-            decode_inputs,stop_ids,!router_lookahead_audit.empty());
-        if(!status && !router_lookahead_audit.empty()) {
-            if constexpr (std::is_same_v<Model,tyloi::cuda::Qwen4CausalLm>)
-                qwen4_finish_router_lookahead_audit(model,router_lookahead_audit);
-        }
-        return status;
-            });
+        return generate_diagnostic_tokens(*program, ids, gen, profile, t0, t1, decode_inputs, stop_ids,
+            false, {warmup_prefill, false});
     }); }
-};
+ };
 
 } // namespace
 
