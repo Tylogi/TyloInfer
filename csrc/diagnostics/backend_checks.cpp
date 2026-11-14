@@ -4,6 +4,7 @@
 #include "engine/backends/cuda/kernels/mfq_cuda_sampling_ops.h"
 #include "engine/backends/cuda/executor/executor.h"
 #include "engine/program.h"
+#include "engine/backends/cuda/executor/config.h"
 #include "engine/models/deepseek_v41/engram.h"
 #include "engine/ops/csa.h"
 #include "engine/backends/cuda/native/context.h"
@@ -66,7 +67,7 @@ int run_backend_dsv41_check(tyloi::cuda::Program& program) {
     DrainGuard drain(program, tyloi::cuda::current_stream());
     tyloi::cuda::deepseek_v41_runtime::EngramHashState::self_check();
     const auto options = tyloi::TensorOptions()
-                             .device(program.executor().device())
+                             .device(tyloi::Device(tyloi::kCUDA, program.config().layer_placement.primary_device()))
                              .dtype(tyloi::kInt32);
     blocks = tyloi::cuda::tensor(std::vector<std::int32_t>{0, 2, -1}, options)
                  .reshape({1, 1, 3});

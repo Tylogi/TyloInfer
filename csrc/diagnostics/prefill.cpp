@@ -134,7 +134,7 @@ int tyloi::cuda::diagnostics::run_prefill_sweep(Program& program,const std::vect
     const bool prior_profile=profiler.enabled;
     struct RestoreProfile { CudaProfiler& profiler; bool enabled; ~RestoreProfile(){profiler.enabled=enabled;} } restore{profiler,prior_profile};
     profiler.enabled=profile;
-    auto ids=work.keep(tyloi::ops::reshape(work.keep(tyloi::ops::tensor(tokens,program.executor().device())),{1,maximum}));
+    auto ids=work.keep(tyloi::ops::reshape(work.keep(tyloi::ops::tensor(tokens,tyloi::Device(tyloi::kCUDA, program.config().layer_placement.primary_device()))),{1,maximum}));
     const char* chunks_option=tyloi::cuda::env_lookup("TYLOINFER_PREFILL_SWEEP_CHUNKS");
     reject_retired();
     if(chunks_option && chunks_option[0]) {
@@ -334,7 +334,7 @@ int tyloi::cuda::diagnostics::run_prefill_sweep(Program& program,const std::vect
                             <<" repeat="<<public_repeat<<" mode="<<engine_mode<<std::endl;
                         work.clear(); program.state().reset(1); sync();
                         cudaMemPool_t pool=nullptr;
-                        TYLOINFER_CUDA_CHECK(cudaDeviceGetDefaultMemPool(&pool,program.executor().device().index));
+                        TYLOINFER_CUDA_CHECK(cudaDeviceGetDefaultMemPool(&pool,program.config().layer_placement.primary_device()));
                         TYLOINFER_CUDA_CHECK(cudaMemPoolTrimTo(pool,0));
                 if(exact_sweep) {
                     tyloi::cuda::env_set("TYLOINFER_GR_PREFILL_MATMUL",gdn_batch_pair_sweep?engine_gr.c_str():qsa_score_pair_sweep || gr_batch_pair_sweep?"21":gr_vector_pair_sweep?(engine_mode?"21":"17"):gr_mix_pair_sweep || nvq_k_pair_sweep?"17":gr_tile_pair_sweep?(engine_mode?engine_gr.c_str():"6"):quant_pair_sweep?"6":engine_mode?engine_gr.c_str():"1");

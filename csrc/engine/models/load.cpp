@@ -5,6 +5,7 @@
 #include "engine/models/gemma4/load.h"
 #include "engine/models/nemotron_h/load.h"
 #include "engine/models/qwen35/load.h"
+#include "engine/models/qwen4_exp/load.h"
 #include "engine/models/source.h"
 #include "engine/models/source/model_graph.h"
 
@@ -42,6 +43,10 @@ void load(
     }
     if (model_graph.backbone == "deepseek_v41") {
         ::tyloi::cuda::deepseek_v41::load(owner, std::move(source), definition, weights, placement, options);
+        return;
+    }
+    if (model_graph.backbone == "qwen4_exp") {
+        ::tyloi::cuda::qwen4_exp::load(owner, std::move(source), definition, weights, placement, options);
         return;
     }
     if (model_graph.backbone == "nemotron_h") {

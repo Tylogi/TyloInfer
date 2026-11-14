@@ -11,13 +11,14 @@
 namespace tyloi::models::qwen4_exp {
 namespace {
 constexpr std::array<uint8_t,8> qwen4_magic{'M','F','Q','C','U','D','2',0};
-struct Qwen4PagedHeader { uint32_t start,count,layers;bool exact; };
+struct Qwen4PagedHeader { uint32_t start,count,layers;bool exact; uint32_t version; };
 Qwen4PagedHeader read_qwen4_header(CudaPagedReader& reader) {
     std::array<uint8_t,8> magic{};reader.raw(magic.data(),magic.size(),"magic");
-    if(magic!=qwen4_magic || reader.scalar<uint32_t>("version")!=1)
+    const auto version=reader.scalar<uint32_t>("version");
+    if(magic!=qwen4_magic || (version!=1 && version!=2))
         throw CudaSessionStateError("unsupported Qwen4 prefix cache payload");
     Qwen4PagedHeader header{reader.scalar<uint32_t>("start"),reader.scalar<uint32_t>("count"),
-        reader.scalar<uint32_t>("layers"),reader.scalar<uint32_t>("exact boundary")!=0};
+        reader.scalar<uint32_t>("layers"),reader.scalar<uint32_t>("exact boundary")!=0,version};
     if(!header.count || !header.layers || header.layers>4096)throw CudaSessionStateError("invalid Qwen4 prefix geometry");
     return header;
 }
@@ -88,7 +89,7 @@ CudaPagedPayload encode_block(const TextSessionState& state,size_t block_size,si
         throw std::runtime_error("invalid Qwen4 prefix block boundary");
     const auto start=index*block_size,count=std::min(block_size,state.tokens.size()-start);
     const bool exact=start+count==state.tokens.size();
-    CudaPagedWriter writer;writer.raw(qwen4_magic.data(),qwen4_magic.size());writer.scalar<uint32_t>(1);
+    CudaPagedWriter writer;writer.raw(qwen4_magic.data(),qwen4_magic.size());writer.scalar<uint32_t>(2);
     writer.scalar<uint32_t>(uint32_t(start));writer.scalar<uint32_t>(uint32_t(count));
     writer.scalar<uint32_t>(uint32_t(snapshot->layers.size()));writer.scalar<uint32_t>(exact?1:0);
     for(const auto& layer:snapshot->layers) {
@@ -103,7 +104,8 @@ CudaPagedPayload encode_block(const TextSessionState& state,size_t block_size,si
         if(exact)write_recurrent(writer,layer);
     }
     if(exact) {
-        write_optional(writer,snapshot->positions);writer.scalar<uint32_t>(state.mtp?1:0);
+        write_optional(writer,snapshot->positions);writer.scalar<int64_t>(state.decode_position_delta);
+        writer.scalar<uint32_t>(state.mtp?1:0);
         if(state.mtp)write_qwen4_mtp(writer,*state.mtp);
     }
     return std::move(writer).finish();
@@ -143,6 +145,7 @@ TextSessionState decode_session(const std::vector<CudaPagedPayload>& payloads,
         }
         if(header.exact) {
             snapshot.positions=read_optional(reader);
+            state.decode_position_delta=header.version>=2 ? reader.scalar<int64_t>("position delta") : 0;
             state.mtp.reset();if(reader.scalar<uint32_t>("MTP presence"))state.mtp=read_qwen4_mtp(reader);
         }
         if(i+1==payloads.size() && !header.exact)throw CudaSessionStateError("Qwen4 prefix has no exact recurrent checkpoint");

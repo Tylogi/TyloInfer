@@ -9,6 +9,7 @@
 #include "engine/weights/cache.h"
 #include "engine/weights/workspace.h"
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <exception>
@@ -22,10 +23,32 @@
 
 namespace tyloi::engine {
 
-models::Prefill prefill(models::CausalModel& model, models::State& state, Executor& executor,
+void exit_unmanaged_graph(models::State& state, weights::Cache& weights, Budget& budget) {
+    const auto growth = state.graph_exit_growth();
+    if (growth.empty()) return;
+    budget.reserve(growth);
+    weights.finish_exchange();
+    state.release_graphs();
+}
+
+std::int64_t prefill_span(const models::CausalModel& model, const models::State& state,
+        const weights::Cache& weights, std::int64_t tokens, std::int64_t compute,
+        std::size_t reused, std::size_t stable, bool transformed) {
+    const auto mode = weights.prefill_mode(tokens, state.position() > 0);
+    models::PrefillOptions policy{tokens, compute, 0, 0, transformed,
+        mode == weights::Cache::Prefill::retained, weights.decode() == weights::Cache::Decode::routed,
+        weights.transfer() == weights::Cache::Transfer::coordinated, weights.split_prefill(tokens)};
+    const auto plan = model.prefill_plan(state, policy);
+    if (!reused && (!stable || stable == std::size_t(tokens)) && plan.layered)
+        return tokens;
+    return plan.max_span > 0 ? std::min(compute, plan.max_span) : compute;
+}
+
+models::Prefill prefill(const models::CausalModel& model, models::State& state, Executor& executor,
     weights::Cache& weights, Budget& budget, const models::ForwardOptions& options,
-    models::Input input, std::int64_t compute, InferenceOutput& output) {
-    Capture capture(executor, weights);
+    models::Input input, std::int64_t compute, InferenceOutput& output, bool raw_host) {
+    const auto device = input.ids.device();
+    Capture capture(executor, weights, budget, device);
     std::unique_ptr<weights::Loan> loan;
     auto work = executor.work();
     tyloi::StepSequence<models::Prefill> job;
@@ -37,17 +60,56 @@ models::Prefill prefill(models::CausalModel& model, models::State& state, Execut
     try {
         for (const auto& [device, bytes] : state.reset_growth(input.ids.size(0)))
             if (bytes) budget.reserve_kv(device, prefill_budget_add(bytes, std::size_t(64) << 20));
-        for (const auto& [device, bytes] : state.growth(input.ids.size(0), input.ids.size(1), options, input.confirmed))
+        for (const auto& [device, bytes] : state.growth(input, options))
             if (bytes) budget.reserve_kv(device, prefill_budget_add(bytes, std::size_t(64) << 20));
         const auto tokens = input.ids.size(1);
         const bool transformed = bool(input.embeddings) || bool(input.positions) || bool(input.lengths) ||
             bool(input.cache_positions) || bool(input.image_mask) || input.suffix || input.confirmed != 0;
         const auto mode = weights.prefill_mode(tokens, state.position() > 0);
+        if (!transformed && tokens <= 128 && (weights.split_prefill(tokens) || input.raw_hidden)) {
+            std::vector<Tensor> hidden_rows, raw_rows;
+            for (std::int64_t offset = 0; offset < tokens && !output.stopped();) {
+                const auto rows = state.position() == 0 ? std::int64_t(1) : std::min<std::int64_t>(4, tokens - offset);
+                models::Input part;
+                part.ids = ops::contiguous(ops::slice(input.ids, 1, offset, offset + rows));
+                part.advance = true; part.confirmed = rows > 1 ? 1 : 0;
+                Tensor raw;
+                if (input.raw_hidden) part.raw_hidden = &raw;
+                models::DecodeOptions decode_options;
+                decode_options.enabled = weights.decode() != weights::Cache::Decode::none;
+                decode_options.routed = weights.decode() == weights::Cache::Decode::routed;
+                budget.reserve(state.graph_exit_growth());
+                auto decoded = engine::decode(model, state, executor, weights, budget, options, part, decode_options);
+                if (!decoded && offset == 0) break;
+                Tensor hidden;
+                if (decoded) hidden = ops::clone(decoded->hidden);
+                else {
+                    exit_unmanaged_graph(state, weights, budget);
+                    budget.reserve(state.growth(part, options));
+                    hidden = model.forward(std::move(part), state, options);
+                }
+                hidden_rows.push_back(std::move(hidden));
+                if (input.raw_hidden) raw_rows.push_back(raw_host ? ops::copy(raw, Device(kCPU)) : std::move(raw));
+                if (rows > 1) state.commit_speculative();
+                offset += rows;
+            }
+            if (!hidden_rows.empty()) {
+                if (output.stopped()) { capture.drain(); return {}; }
+                result.hidden = hidden_rows.size() == 1 ? std::move(hidden_rows.front()) : ops::cat(hidden_rows, 1);
+                if (!raw_rows.empty()) result.raw = raw_rows.size() == 1 ? std::move(raw_rows.front()) : ops::cat(raw_rows, 1);
+                result.mode = models::Prefill::Mode::windows;
+                timer->stop({result.hidden, result.raw});
+                result.elapsed_ms = timer->elapsed_ms();
+                return result;
+            }
+        }
+        exit_unmanaged_graph(state, weights, budget);
+        budget.reserve(state.growth(input, options));
         models::PrefillOptions policy{tokens, compute, 0, 0, transformed,
             mode == ::tyloi::weights::Cache::Prefill::retained,
             weights.decode() == ::tyloi::weights::Cache::Decode::routed,
             weights.transfer() == ::tyloi::weights::Cache::Transfer::coordinated,
-            weights.split_prefill(tokens)};
+            weights.split_prefill(tokens), raw_host};
         job = model.prefill(input, state, options, policy);
         while (!output.stopped()) {
             StepResult<models::Prefill> step;
@@ -80,9 +142,9 @@ models::Prefill prefill(models::CausalModel& model, models::State& state, Execut
                         if (!tile.compute || *tile.compute <= 0 || tile.tokens <= 0 || !tile.row_bytes)
                             throw std::invalid_argument("invalid prefill workspace geometry");
                         const auto memory = [&] {
-                            const std::array<Device, 1> devices{executor.device()};
+                            const std::array<Device, 1> devices{device};
                             const auto snapshot = executor.memory(devices).at(0);
-                            return prefill_budget_add(snapshot.usable, snapshot.workspace);
+                            return prefill_budget_add(snapshot.allocatable, snapshot.workspace);
                         };
                         const auto available = weights.prefill_budget(true);
                         const auto fixed = prefill_budget_add(request.bytes, available.transfer_bytes);
@@ -119,8 +181,10 @@ models::Prefill prefill(models::CausalModel& model, models::State& state, Execut
                 work->finish();
                 auto* raw = input.raw_hidden;
                 if (state.position() == 0) weights.finish_exchange();
-                result.hidden = model.forward(std::move(input), state, options);
+                { auto scope = executor.enter(); result.hidden = model.forward(std::move(input), state, options); }
                 if (raw) result.raw = *raw;
+                timer->stop({result.hidden, result.raw});
+                result.elapsed_ms = timer->elapsed_ms();
                 return result;
             }
             observed = true;
@@ -128,13 +192,12 @@ models::Prefill prefill(models::CausalModel& model, models::State& state, Execut
             if (step.value->phase == models::Prefill::Phase::progress) {
                 if (!step.value->progress) throw std::logic_error("prefill progress data is missing");
                 const auto& report = *step.value->progress;
-                executor.synchronize();
+                executor.drain();
                 const std::array<Device, 1> devices{report.device};
-                const auto memory = executor.memory(devices, Executor::MemoryDetail::diagnostic).at(0);
+                const auto memory = executor.memory(devices).at(0);
                 std::cout << "prefill_layer_major_memory tokens=" << report.tokens << " chunk=" << report.chunk
                           << " completed_layers=" << report.completed << " owned_bytes=" << memory.allocated
-                          << " process_local_bytes=" << memory.local << " pool_used_bytes=" << memory.default_pool_used
-                          << " pool_reserved_bytes=" << memory.default_pool_reserved << std::endl;
+                          << " reserved_bytes=" << memory.reserved << std::endl;
                 std::cout << "prefill_layer_major_progress tokens=" << report.tokens << " chunk=" << report.chunk
                           << " completed_layers=" << report.completed << " total_layers=" << report.total
                           << " elapsed_ms=" << std::chrono::duration<double, std::milli>(
@@ -164,7 +227,7 @@ models::Prefill prefill(models::CausalModel& model, models::State& state, Execut
         }
         capture.drain();
         job = {};
-        if (observed) state.release_graphs();
+        if (observed) { budget.reserve(state.graph_exit_growth()); state.release_graphs(); }
         work.reset();
         loan.reset();
         return {};
@@ -172,7 +235,7 @@ models::Prefill prefill(models::CausalModel& model, models::State& state, Execut
         auto failure = std::current_exception();
         try { capture.drain(); } catch (...) {}
         job = {};
-        if (observed) try { state.release_graphs(); } catch (...) {}
+        if (observed) try { budget.reserve(state.graph_exit_growth()); state.release_graphs(); } catch (...) {}
         work.reset();
         loan.reset();
         std::rethrow_exception(failure);

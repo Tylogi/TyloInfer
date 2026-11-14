@@ -67,7 +67,7 @@ int run_qwen4_generation_variants(Program& program,const std::vector<std::int64_
     if(prompt.empty())throw std::runtime_error("MTP generation variants require explicit prompt IDs");
     const auto loader=program.loader();
     const auto* source=dynamic_cast<const ModelSource*>(&loader.source);
-    if(!source || models::graph(*source).backbone!="qwen4_exp" || !program.model().mtp())
+    if(!source || models::graph(*source).backbone!="qwen4_exp" || !program.model().predictor())
         throw std::runtime_error("Qwen4 MTP generation variants require a loaded predictor");
     auto scope=program.executor().enter(program.config().layer_placement.primary_device());
     Environment compact("TYLOINFER_MFE_TOKEN_COMPACT_PLAN"),aligned("TYLOINFER_MFE_TOKEN_ALIGNED_GU"),
@@ -193,7 +193,7 @@ int run_qwen4_generation_variants(Program& program,const std::vector<std::int64_
     }
     if(batch2) {
         std::array<std::vector<std::int64_t>,2> batch_expected;
-        const auto prompt_ids=::tyloi::ops::reshape(::tyloi::ops::tensor(prompt,program.executor().device()),{1,-1});
+        const auto prompt_ids=::tyloi::ops::reshape(::tyloi::ops::tensor(prompt,tyloi::Device(tyloi::kCUDA, program.config().layer_placement.primary_device())),{1,-1});
         for(std::size_t index=0;index<variant_count;++index) {
             const auto& variant=active[index];
             compact.set(variant.compact);aligned.set(variant.aligned);up.set(variant.up);capacity.set(variant.capacity);
@@ -221,7 +221,7 @@ int run_qwen4_generation_variants(Program& program,const std::vector<std::int64_
                 for(int step=1;step<512;++step) {
                     BatchStep step_owner{program};
                     auto host=step_owner.keep(::tyloi::ops::reshape(step_owner.keep(::tyloi::ops::tensor(next,Device(kCPU))),{2,1}));
-                    auto ids=step_owner.keep(::tyloi::ops::copy(host,program.executor().device()));
+                    auto ids=step_owner.keep(::tyloi::ops::copy(host,tyloi::Device(tyloi::kCUDA, program.config().layer_placement.primary_device())));
                     std::vector<models::BatchRow> rows;
                     for(int row=0;row<2;++row)rows.push_back({states[row],next[row],states[row]->position(),512-step,true,true});
                     auto result=driver.capture(rows,ids,host,true);

@@ -5,7 +5,6 @@
 #include "engine/backends/cuda/executor/executor.h"
 #include "engine/backends/cuda/native/env.h"
 #include "engine/backends/cuda/native/profile.h"
-#include "engine/generation/decode.h"
 #include "engine/models/causal_model.h"
 #include "engine/models/source.h"
 #include "engine/models/source/model_graph.h"
@@ -39,7 +38,7 @@ struct Work {
     Tensor keep(Tensor value) { tensors.push_back(value); return value; }
     Tensor ids(std::vector<std::int64_t> value) {
         values.push_back(std::move(value));
-        return keep(::tyloi::ops::reshape(keep(::tyloi::ops::tensor(values.back(), program.executor().device())), {1, -1}));
+        return keep(::tyloi::ops::reshape(keep(::tyloi::ops::tensor(values.back(), tyloi::Device(tyloi::kCUDA, program.config().layer_placement.primary_device()))), {1, -1}));
     }
     Tensor host(const Tensor& value) { return keep(::tyloi::ops::contiguous(keep(::tyloi::ops::copy(value, Device(kCPU))))); }
     void clear() { program.drain(); tensors.clear(); values.clear(); }
@@ -54,7 +53,7 @@ struct Context {
         auto loader = p.loader();
         auto* source = dynamic_cast<const ModelSource*>(&loader.source);
         require(source && models::graph(*source).backbone == "qwen4_exp", "hidden graph diagnostic requires Qwen4");
-        auto mode = p.executor().forward_mode(p.executor().device().index);
+        auto mode = p.executor().forward_mode(p.config().layer_placement.primary_device());
         options = {mode.kv_capacity, mode.trace, mode.trace_layer, mode.primary};
     }
     Tensor forward(const Tensor& ids, Tensor* raw = nullptr, std::int64_t confirmed = 0) {
@@ -68,7 +67,7 @@ struct Context {
         models::DecodeOptions decode;
         decode.projection = project ? models::DecodeOptions::Projection::hidden : models::DecodeOptions::Projection::hidden_only;
         decode.routed = program.weights().decode() == weights::Cache::Decode::routed;
-        return engine::decode(model, state, program.executor(), program.weights(), options, std::move(input), decode);
+        return program.decode(std::move(input), decode);
     }
 };
 
@@ -107,10 +106,9 @@ bool bits(const Tensor& a, const Tensor& b) {
 }
 
 void phases(const models::State& state) {
-    for (const auto& p : state.decode_profile())
-        std::cout << "mtp_graph_phase tokens=" << p.tokens << " confirmed=" << p.confirmed
-            << " layer=" << p.layer << " from=" << p.from << " to=" << p.to
-            << " samples=" << p.samples << " total_ns=" << p.total_ns << '\n';
+    for (const auto& [key, value] : state.metrics())
+        if (key.starts_with("cuda_graph_profile_"))
+            std::cout << "mtp_graph_phase " << key << '=' << value << '\n';
 }
 } // namespace
 
@@ -156,7 +154,7 @@ int run_qwen4_decode_hidden_check(Program& program) {
     }
     for (int step=0; step<20; ++step) compare(retained_raw[step],reference_raw[step]);
     const auto metrics=c.state.metrics(); bool registry=false;
-    if (metrics) for (const auto& [key,value] : *metrics) if (key=="decode_graph_count") registry=value>0;
+    for (const auto& [key,value] : metrics) if (key=="decode_graph_count") registry=value>0;
     require(registry, "hidden graph did not survive KV growth");
     std::cout << "qwen4_decode_hidden_check PASS graph_steps=" << graph_steps
         << " retained_steps=" << retained_raw.size() << " max_abs_error=" << maximum_error << '\n';

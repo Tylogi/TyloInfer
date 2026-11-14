@@ -1,9 +1,104 @@
 #include "engine/generation/decode.h"
+#include "engine/models/causal_model.h"
+#include "engine/budget.h"
 
 #include <algorithm>
+#include <exception>
+#include <stdexcept>
 #include <utility>
 
 namespace tyloi::engine {
+Capture::Capture(Executor& executor, weights::Cache& weights, Budget& budget, Device device)
+    : executor_(executor), weights_(weights), budget_(budget), device_(device) {}
+Capture::~Capture() = default;
+void Capture::step(GraphRequest request) {
+    budget_.reserve(request.growth);
+    switch (request.phase) {
+    case GraphPhase::admit: break;
+    case GraphPhase::prepare: {
+        const bool prepared = weights_.prepare_graph(device_);
+        if (request.prepared) *request.prepared = prepared;
+        break;
+    }
+    case GraphPhase::ready:
+        weights_.retire_prefill(); weights_.finish_exchange(); drain(); break;
+    case GraphPhase::warmup:
+        if (warmup_) throw std::logic_error("graph warmup already started");
+        warmup_ = std::make_unique<weights::Cache::Warmup>(weights_, true);
+        break;
+    case GraphPhase::target:
+        if (!warmup_) throw std::logic_error("graph warmup not started");
+        drain(); warmup_->release(device_, true); target_ = true;
+        break;
+    case GraphPhase::settle:
+        if (!warmup_ || !target_) throw std::logic_error("graph warmup target not reached");
+        drain(); warmup_->release(device_, false); warmup_.reset(); target_ = false;
+        break;
+    }
+}
+void Capture::finish() {
+    if (warmup_) {
+        drain();
+        warmup_->release(device_, target_ ? false : true);
+        warmup_.reset(); target_ = false;
+    }
+}
+void Capture::drain() {
+    std::exception_ptr failure;
+    try { weights_.drain(); } catch (...) { failure = std::current_exception(); }
+    try { executor_.drain(); } catch (...) { if (!failure) failure = std::current_exception(); }
+    if (failure) std::rethrow_exception(failure);
+}
+
+namespace {
+std::optional<models::Decoded> run_decode(StepSequence<models::Decoded> job,
+        models::State& state, Executor& executor, weights::Cache& weights, Budget& budget, Device device,
+        bool require_result) {
+    Capture capture(executor, weights, budget, device);
+    auto work = executor.work();
+    std::optional<models::Decoded> result;
+    bool observed = false;
+    try {
+        for (;;) {
+            StepResult<models::Decoded> step;
+            { auto scope = work->enter(); step = job.next(); }
+            if (step.workspace || step.layer || (step.graph && step.value) ||
+                (!step && (step.graph || step.value)))
+                throw std::logic_error("invalid decode job event");
+            if (!step) break;
+            if (result) throw std::logic_error("decode job continued after its result");
+            if (step.graph) { observed = true; capture.step(*step.graph); }
+            else if (step.value) { observed = true; result = std::move(*step.value); }
+        }
+        if (observed && require_result && !result)
+            throw std::logic_error("decode job ended without a result");
+        capture.finish(); work->finish(); job = {};
+        return result;
+    } catch (...) {
+        auto failure = std::current_exception();
+        try { capture.drain(); } catch (...) {}
+        job = {};
+        if (observed) try { budget.reserve(state.graph_exit_growth()); state.release_graphs(); } catch (...) {}
+        std::rethrow_exception(failure);
+    }
+}
+}
+
+std::optional<models::Decoded> decode(const models::CausalModel& model, models::State& state,
+        Executor& executor, weights::Cache& weights, Budget& budget, const models::ForwardOptions& options,
+        models::Input input, models::DecodeOptions decode_options) {
+    const auto device = input.ids.device();
+    auto* raw = input.raw_hidden;
+    auto result = run_decode(model.decode(std::move(input), state, options, decode_options),
+        state, executor, weights, budget, device, true);
+    if (raw && result && result->raw) *raw = result->raw;
+    return result;
+}
+void warmup(const models::CausalModel& model, models::State& state, Executor& executor,
+        weights::Cache& weights, Budget& budget, Device device, models::DecodeOptions options) {
+    (void)run_decode(model.warmup(state, options), state, executor, weights, budget, device, false);
+}
+
 std::int64_t decode_bucket(std::int64_t planned_len, std::int64_t context_capacity) {
     const std::int64_t quantum = planned_len <= 4096 ? 512 : (planned_len <= 16384 ? 1024 : 2048);
     return std::min(((planned_len + quantum - 1) / quantum) * quantum, context_capacity);

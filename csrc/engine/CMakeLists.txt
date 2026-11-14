@@ -11,8 +11,13 @@ add_library(mfq-engine STATIC
     math_ops.cpp
     engine.cpp
     executor.cpp
+    budget.cpp
+    generation/batch_driver.cpp
+    generation/batch_ops.cpp
     generation/decode.cpp
     generation/generation.cpp
+    generation/prefill.cpp
+    generation/preparation.cpp
     generation/mtp/metrics.cpp
     generation/mtp/generation.cpp
     generation/mtp/sampling.cpp
@@ -55,6 +60,7 @@ add_library(mfq-engine STATIC
     scheduler/request.cpp
     state/session/paged.cpp
     state/session/prefix_cache.cpp
+    state/session/sessions.cpp
     state/qsa_sequence.cpp
     state/recurrent.cpp
     state/recurrent_layout.cpp

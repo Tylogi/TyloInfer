@@ -1,6 +1,7 @@
 #include "diagnostics/mtp_bench.h"
 
 #include "engine/program.h"
+#include "engine/backends/cuda/executor/config.h"
 #include "engine/config.h"
 #include "engine/backends/cuda/executor/executor.h"
 #include "engine/backends/cuda/native/context.h"
@@ -68,7 +69,7 @@ int run_qwen35_mtp_bench(Program& program, bool enable_mtp,
     const auto info = model.info();
     auto loader = program.loader();
     const auto* source = dynamic_cast<const ModelSource*>(&loader.source);
-    if (!source || models::graph(*source).backbone != "qwen3_5" || !model.mtp())
+    if (!source || models::graph(*source).backbone != "qwen3_5" || !model.predictor())
         throw std::runtime_error("MTP benchmark requires a Qwen3.5 model with MTP");
     if (generated_tokens < 2 || repetitions <= 0 || repetitions > 100 ||
         info.max_context < static_cast<std::int64_t>(generated_tokens) + 17)
@@ -90,7 +91,7 @@ int run_qwen35_mtp_bench(Program& program, bool enable_mtp,
         << " full_window_batching=1 runtime_graph=" << (graph_enabled ? 1 : 0)
         << " gen=" << generated_tokens << " reps=" << repetitions
         << " warmup=1 seed=20260907 synthetic_ids=1 eos_stop=0 session_cache=0\n";
-    const auto device = executor.device();
+    const auto device = tyloi::Device(tyloi::kCUDA, program.config().layer_placement.primary_device());
     const auto mode = executor.forward_mode(device.index);
     const models::ForwardOptions options{mode.kv_capacity, mode.trace, mode.trace_layer, device.index};
     for (const auto& prompt : std::vector<std::vector<std::int64_t>>{

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "engine/tensor.h"
 #include <coroutine>
 #include <cstddef>
 #include <cstdint>
@@ -7,6 +8,7 @@
 #include <optional>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 
 namespace tyloi {
 
@@ -15,7 +17,13 @@ class Tensor;
 enum class StepState { waiting, advanced, complete };
 
 /** Report graph allocation, input readiness and synthetic startup boundaries. */
-enum class GraphPhase { prepare, ready, warmup, target, settle };
+enum class GraphPhase { admit, prepare, ready, warmup, target, settle };
+
+struct GraphRequest {
+    GraphPhase phase;
+    bool* prepared = nullptr;
+    std::vector<std::pair<Device, std::size_t>> growth;
+};
 
 /** Describe the lifetime of one numerical prefill layer's working set. */
 struct LayerEvent {
@@ -50,7 +58,7 @@ template <class T> struct StepResult {
     StepState state = StepState::complete;
     std::optional<T> value;
     std::optional<Workspace> workspace;
-    std::optional<GraphPhase> graph = std::nullopt;
+    std::optional<GraphRequest> graph = std::nullopt;
     std::optional<LayerEvent> layer = std::nullopt;
     explicit operator bool() const { return state != StepState::complete; }
 };
@@ -80,7 +88,11 @@ template <class T> class StepSequence {
             return {};
         }
         std::suspend_always yield_value(GraphPhase phase) {
-            step = {StepState::advanced, {}, {}, phase};
+            step = {StepState::advanced, {}, {}, GraphRequest{phase}};
+            return {};
+        }
+        std::suspend_always yield_value(GraphRequest request) {
+            step = {StepState::advanced, {}, {}, request};
             return {};
         }
         std::suspend_always yield_value(LayerEvent event) {

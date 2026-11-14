@@ -1,5 +1,7 @@
 #include "engine/models/plan.h"
 #include "engine/models/qwen4_exp/ops.h"
+#include "engine/models/qwen4_exp/load.h"
+#include "engine/models/qwen4_exp/components.h"
 #include "engine/models/qwen4_exp/layer.h"
 #include "engine/models/qwen4_exp/causal_lm.h"
 #include "engine/backends/cuda/ops/projection/nint.h"
@@ -30,6 +32,7 @@
 
 #include <algorithm>
 #include <iostream>
+#include <stdexcept>
 #include <utility>
 
 namespace tyloi::cuda::qwen4_exp {
@@ -283,6 +286,21 @@ void load(Model& model, const tyloi::weights::Loader& tensors, LayerPlacementCon
             model.layers.push_back(std::move(block));
         }
     }
+}
+
+void load(std::unique_ptr<tyloi::models::CausalModel>& owner,
+          std::shared_ptr<const tyloi::ModelSource> source, std::string_view definition,
+          const tyloi::weights::Loader& weights, LayerPlacementConfig& placement,
+          const tyloi::models::LoadOptions& options) {
+    if (!options.cpu_offload_layers.empty())
+        throw std::invalid_argument("Qwen4 does not support --cpu-offload-layers");
+    owner = std::make_unique<Model>();
+    auto& model = static_cast<Model&>(*owner);
+    model.host_tokens = options.host_tokens;
+    read(model, std::move(source), definition, options.context);
+    load(model, weights, placement, options, true);
+    model.parts = std::make_unique<Components>();
+    load_components(*model.parts, model, weights, options.optional_components, options);
 }
 
 } // namespace tyloi::cuda::qwen4_exp

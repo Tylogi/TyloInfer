@@ -68,13 +68,14 @@ public:
 
     Ops(models::CausalModel& model, std::unique_ptr<models::Batch> batch, Executor& executor,
         weights::Cache& weights, Budget& budget, ContinuousBatchConfig config,
-        std::size_t workspace, bool packed, std::int64_t packed_tokens)
-        : model_(model), batch_(std::move(batch)), executor_(executor), weights_(weights), budget_(budget),
-          config_(std::move(config)), workspace_(workspace), packed_(packed), packed_tokens_(packed_tokens) {
+        Device device, std::size_t workspace, bool packed, std::int64_t packed_tokens)
+        : model_(model), batch_(std::move(batch)), executor_(executor), weights_(weights), budget_(&budget),
+          config_(std::move(config)), device_(device), workspace_(workspace), packed_(packed), packed_tokens_(packed_tokens) {
         if (!batch_ || config_.max_sequences == 0 || config_.max_sequences > 32)
             throw std::invalid_argument("continuous batching supports 1..32 requests");
     }
 
+    void bind(Budget& budget) noexcept { budget_ = &budget; }
     std::int64_t vocab_size() const { return model_.info().vocab_size; }
     std::int64_t max_context() const { return model_.info().max_context; }
     Metrics metrics() const {
@@ -99,6 +100,7 @@ public:
         return result;
     }
     void suspend_decode() {
+        auto scope=executor_.enter();
         std::exception_ptr failure;
         try { weights_.finish_exchange(); } catch (...) { failure=std::current_exception(); }
         try { batch_->clear(); } catch (...) { if (!failure) failure=std::current_exception(); }
@@ -114,10 +116,10 @@ public:
         initialize(request, chunk);
         std::size_t primary=0;
         for (const auto& [device, bytes] : request->state->prefill_growth_bytes(chunk.count)) {
-            if (device==executor_.device()) primary=prefill_budget_add(primary,bytes);
-            else if (bytes) budget_.reserve_kv(device,prefill_budget_add(bytes,std::size_t(64)<<20));
+            if (device==device_) primary=prefill_budget_add(primary,bytes);
+            else if (bytes) budget_->reserve_kv(device,prefill_budget_add(bytes,std::size_t(64)<<20));
         }
-        return budget_.batch(executor_.device(), batch_->prefill_row_bytes(), chunk,
+        return budget_->batch(device_, batch_->prefill_row_bytes(), chunk,
             primary);
     }
     std::size_t prefill_batch_limit() const { return packed_ && batch_->supports_packed() ? config_.max_sequences : 1; }
@@ -244,7 +246,7 @@ public:
         const bool active=std::any_of(requests_.begin(),requests_.end(),[](const auto& weak) {
             const auto request=weak.lock(); return request && request->state;
         });
-        if (!active) { weights_.retire_decode(); executor_.trim(executor_.device()); }
+        if (!active) { weights_.retire_decode(); executor_.reclaim(device_); }
     }
     Decoded decode(State& state) {
         auto scope=executor_.enter();
@@ -262,7 +264,7 @@ public:
             tokens.push_back(request->pending_token);
         }
         auto host=ops::reshape(ops::tensor(tokens,Device(kCPU)), {-1,1});
-        auto ids=ops::copy(host,executor_.device());
+        auto ids=ops::copy(host,device_);
         const bool greedy=config_.greedy && std::all_of(state.active.begin(),state.active.end(),[](const auto& request) {
             return !request->eligible || (request->sampler->greedy() && !request->sampler->has_penalties() && !request->token_constraint);
         });
@@ -274,10 +276,10 @@ public:
                 auto plan=plan_graph(rows,greedy);
                 if (plan) {
                     if (plan->rebuild) {
-                        executor_.trim(executor_.device());
+                        executor_.reclaim(device_);
                         reserve(plan->growth,std::size_t(64)<<20);
                     }
-                    captured=batch_->capture(rows,ids,host,greedy,*plan);
+                    captured=capture_batch(*batch_,executor_,weights_,*budget_,device_,rows,ids,host,greedy,*plan);
                 }
             }
         } catch (const std::exception& error) {
@@ -297,7 +299,7 @@ public:
         auto output=captured ? std::move(*captured) : batch_->decode(rows,std::move(ids),host);
         std::vector<std::int64_t> selected;
         if (greedy) {
-            selected=ops::integers(captured ? output : ops::sample_greedy(ops::contiguous(output)));
+            selected=ops::read_integers(captured ? output : ops::sample_greedy(ops::contiguous(output)));
             ++greedy_batches_;
         }
         ++decode_batches_; decode_tokens_+=tokens.size();
@@ -327,13 +329,13 @@ public:
 
 private:
     void reserve(const models::BatchGrowth& values, std::size_t margin, bool primary=false) {
-        reserve_batch(budget_,executor_,values,margin,primary);
+        reserve_batch(*budget_,device_,values,margin,primary);
     }
     std::vector<Tensor> run_prefill(std::vector<models::BatchState*> states, std::vector<Tensor> ids) {
-        return tyloi::engine::prefill_batch(*batch_,executor_,weights_,std::move(states),std::move(ids));
+        return tyloi::engine::prefill_batch(*batch_,executor_,weights_,*budget_,device_,std::move(states),std::move(ids));
     }
     std::unique_ptr<models::Batch::Plan> plan_graph(const std::vector<models::BatchRow>& rows, bool greedy) {
-        return plan_batch(*batch_,executor_,weights_,rows,greedy);
+        return plan_batch(*batch_,executor_,weights_,*budget_,device_,rows,greedy);
     }
     void initialize(const std::shared_ptr<Request>& request, PrefillChunk chunk) {
         if (!request->state) {
@@ -342,16 +344,16 @@ private:
             const bool active=std::any_of(requests_.begin(),requests_.end(),[](const auto& weak) {
                 const auto row=weak.lock(); return row && row->state;
             });
-            if (!active) { weights_.retire_decode(); executor_.trim(executor_.device()); }
+            if (!active) { weights_.retire_decode(); executor_.reclaim(device_); }
             requests_.push_back(request);
             auto state=batch_->make_state(static_cast<std::int64_t>(request->prompt.size()));
             reserve(state->initial_growth_bytes(),std::size_t(64)<<20);
             request->state=std::move(state);
             request->state->initialize();
-            request->ids=ops::reshape(ops::tensor(request->prompt,executor_.device()),{1,-1});
-            request->sampler.emplace(request->sampling,executor_.device());
+            request->ids=ops::reshape(ops::tensor(request->prompt,device_),{1,-1});
+            request->sampler.emplace(request->sampling,device_);
             if (request->sampler->has_penalties()) {
-                request->counts=ops::zeros({vocab_size()},TensorOptions().device(executor_.device()).dtype(kInt32));
+                request->counts=ops::zeros({vocab_size()},TensorOptions().device(device_).dtype(kInt32));
                 ops::add_token_counts(request->counts,request->ids);
             }
         }
@@ -369,8 +371,9 @@ private:
     std::unique_ptr<models::Batch> batch_;
     Executor& executor_;
     weights::Cache& weights_;
-    Budget& budget_;
+    Budget* budget_;
     ContinuousBatchConfig config_;
+    Device device_;
     std::size_t workspace_;
     bool packed_;
     std::int64_t packed_tokens_;
@@ -380,13 +383,13 @@ private:
 };
 } // namespace
 
-std::unique_ptr<Batch> make_batch(models::CausalModel& model, models::State* serial, Executor& executor,
+std::unique_ptr<Batch> make_batch(models::CausalModel& model, Executor& executor,
     weights::Cache& weights, Budget& budget, const Config& config) {
     const auto& settings=config.continuous_batch;
     auto scope=executor.enter();
-    auto batch = model.batch({settings.max_sequences,settings.paged_kv,settings.preallocate,
+    auto batch = model.make_batch({settings.max_sequences,settings.paged_kv,settings.preallocate,
         settings.cpu_offload,settings.cached_slots,settings.cuda_graph,settings.greedy,
-        settings.cuda_graph_minimum_tokens},serial);
+        settings.cuda_graph_minimum_tokens});
     if (!batch) throw std::invalid_argument("continuous batching is unavailable for this model");
     try {
         for (const auto& [device,bytes] : batch->initial_growth_bytes())
@@ -403,7 +406,7 @@ std::unique_ptr<Batch> make_batch(models::CausalModel& model, models::State* ser
     }
     return std::make_unique<ContinuousBatch<Ops>>(config.generation.prefill_chunk_size,
         config.continuous_batch.prefill_token_budget,model,std::move(batch),executor,weights,budget,
-        config.continuous_batch,config.workspace_reserve,config.continuous_batch.packed_prefill,
+        config.continuous_batch,config.device,config.workspace_reserve,config.continuous_batch.packed_prefill,
         config.continuous_batch.packed_tokens);
 }
 } // namespace tyloi::engine

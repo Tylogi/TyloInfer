@@ -5,13 +5,13 @@
 #include "engine/models/session/size.h"
 #include "engine/models/qwen4_exp/snapshot.h"
 #include "engine/models/qwen4_exp/layer.h"
+#include "engine/state/media.h"
 
 #include <memory>
 #include <utility>
 #include <vector>
 
 namespace tyloi::models { struct Mtp; }
-namespace tyloi::weights { class Cache; }
 namespace tyloi::cuda { class KvMemoryManager; class KvOffloadStore; }
 namespace tyloi::cuda { struct Qwen4DecodeGraph; }
 namespace tyloi::cuda::qwen4_exp {
@@ -37,28 +37,40 @@ tyloi::models::qwen4_exp::LayerSnapshot capture_layer_session(
 void restore_layer_session(
     const Layer& layer, LayerState& state,
     const tyloi::models::qwen4_exp::LayerSnapshot& snapshot, std::int64_t position);
+void validate_layer_session(const Layer&, const LayerState&,
+    const tyloi::models::qwen4_exp::LayerSnapshot&, std::int64_t position);
+void stage_layer_session(const Layer&, LayerState&,
+    const tyloi::models::qwen4_exp::LayerSnapshot&, std::int64_t position);
+std::size_t layer_session_growth(const Layer&, const LayerState&,
+    const tyloi::models::qwen4_exp::LayerSnapshot&, std::int64_t position);
+void stage_session_tensor(::tyloi::Tensor&, const ::tyloi::Tensor&);
+void add_session_growth(std::vector<std::pair<tyloi::Device, std::size_t>>&,
+    tyloi::Device, std::size_t);
 
 // One request owns its layer caches, decode graph, positions and journal.
 class State : public tyloi::models::State {
 public:
-    explicit State(const Model& model);
+    explicit State(const Model& model, bool initialize_layers = true);
     State(const State&) = delete;
     State& operator=(const State&) = delete;
     State(State&&) = delete;
     State& operator=(State&&) = delete;
     ~State() override;
+    bool belongs_to(const Model& model) const noexcept { return &model_ == &model; }
 
-    void bind_resources(tyloi::weights::Cache& cache, bool pipeline, bool parallel) {
-        weights = &cache; cache_pipeline = pipeline; model_parallel = parallel;
-    }
     void preallocate() override {}
+    std::vector<std::pair<tyloi::Device, std::size_t>> preallocate_growth() const override { return {}; }
     void reset(std::int64_t batch) override;
     void release_graphs() override;
     std::int64_t position() const noexcept override { return cache_pos; }
+    bool speculating() const noexcept override { return speculative_start >= 0; }
+    std::int64_t confirmed_prefix() const noexcept override { return speculative_confirmed; }
+    tyloi::engine::Metrics metrics() const override;
     void advance(std::int64_t tokens) noexcept override { cache_pos += tokens; }
     void set_position_delta(std::int64_t delta) noexcept override { decode_position_delta = delta; }
     std::vector<std::pair<tyloi::Device, std::size_t>> growth(
         const tyloi::models::Input&, const tyloi::models::ForwardOptions&) const override;
+    std::vector<std::pair<tyloi::Device, std::size_t>> graph_exit_growth() const override;
     std::vector<::tyloi::Tensor> storage() const override;
     std::vector<tyloi::Tensor*> graph_state() override;
 
@@ -67,6 +79,9 @@ public:
     TextSessionStateKind text_session_state_kind() const;
     TextSessionState capture_text_session_state(const std::vector<std::int64_t>& tokens) const;
     void restore_text_session_state(const TextSessionState& state);
+    std::unique_ptr<tyloi::models::Restore> prepare_restore(
+        const TextSessionState&, const tyloi::models::Mtp* predictor_model = nullptr) override;
+    void publish_restore(State& candidate) noexcept;
 
     // Speculative suffix journal; the layer records hold the checkpoints.
     void begin_speculative_suffix(std::int64_t draft_tokens) override;
@@ -79,8 +94,6 @@ public:
     void finish_forward(const ::tyloi::Tensor& full_positions, std::int64_t batch,
                         std::int64_t tokens);
 
-    tyloi::weights::Cache* weights = nullptr;
-    bool cache_pipeline = false, model_parallel = false;
     std::int64_t cache_pos = 0;
     std::int64_t decode_position_delta = 0;
     std::int64_t batch = 0;
@@ -89,6 +102,7 @@ public:
     bool speculative_suffix_forward = false;
     bool speculative_suffix_journal = false;
     ::tyloi::Tensor positions;
+    tyloi::cache::Media images;
     std::vector<std::unique_ptr<LayerState>> layers;
     std::unique_ptr<Qwen4DecodeGraph> graph_registry;
     bool reuse_decode_graphs = false;

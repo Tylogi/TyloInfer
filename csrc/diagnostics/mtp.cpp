@@ -1,10 +1,13 @@
 #include "diagnostics/mtp.h"
 
 #include "engine/program.h"
+#include "engine/backends/cuda/executor/config.h"
 #include "engine/config.h"
 #include "engine/backends/cuda/executor/executor.h"
 #include "engine/models/causal_model.h"
 #include "engine/models/common/mtp.h"
+#include "engine/models/glm5_next/mtp.h"
+#include "engine/models/qwen4_exp/predictor.h"
 #include "engine/models/session/snapshot.h"
 #include "engine/models/source.h"
 #include "engine/models/source/model_graph.h"
@@ -89,7 +92,7 @@ int run_nemotron_h_mtp_check(Program& program) {
     Work work{program};
     auto& model = program.model();
     auto& state = program.state();
-    auto* mtp = model.mtp();
+    auto* mtp = model.predictor();
     const auto info = model.info();
     auto loader = program.loader();
     const auto* source = dynamic_cast<const ModelSource*>(&loader.source);
@@ -98,7 +101,7 @@ int run_nemotron_h_mtp_check(Program& program) {
     if (info.vocab_size < 8 || info.max_context < 32)
         throw std::runtime_error("Nemotron-H MTP diagnostic requires vocab>=8 and context>=32");
     auto& predictor = *state.predictor;
-    const auto device = executor.device();
+    const auto device = tyloi::Device(tyloi::kCUDA, program.config().layer_placement.primary_device());
     const auto mode = executor.forward_mode(device.index);
     const models::ForwardOptions options{mode.kv_capacity, mode.trace, mode.trace_layer, device.index};
     work.id_values = {1, 2, 3, 4, 5, 6, 7};
@@ -187,7 +190,7 @@ int run_nemotron_h_mtp_check(Program& program) {
     work.snapshot = mtp->capture_session_state(predictor, 4, slice(work, previous, 3, 1));
     const auto expected = head(slice(work, previous, 3, 1), slice(work, ids, 4, 1));
     (void)head(slice(work, previous, 4, 2), slice(work, ids, 5, 2));
-    work.restore = mtp->prepare_restore(predictor, *work.snapshot);
+    work.restore = predictor.prepare_restore(*work.snapshot);
     if (!work.restore) throw std::runtime_error("Nemotron-H MTP session restore is unavailable");
     work.restore->stage();
     program.drain();
@@ -256,7 +259,7 @@ int run_flash_next_mtp_check(Program& program) {
     Work work{program};
     auto& model = program.model();
     auto& state = program.state();
-    auto* mtp = model.mtp();
+    auto* mtp = model.predictor();
     auto loader = program.loader();
     const auto* source = dynamic_cast<const ModelSource*>(&loader.source);
     if (!source || !mtp || !state.predictor)
@@ -267,12 +270,12 @@ int run_flash_next_mtp_check(Program& program) {
     if ((!multi_axis && backbone != "glm5_next") || info.vocab_size < 8 || info.max_context < 24)
         throw std::runtime_error("Flash-Next MTP diagnostic requires vocab>=8 and context>=24");
     auto& predictor = *state.predictor;
-    const auto device = executor.device();
+    const auto device = tyloi::Device(tyloi::kCUDA, program.config().layer_placement.primary_device());
     const auto mode = executor.forward_mode(device.index);
     const models::ForwardOptions options{mode.kv_capacity, mode.trace, mode.trace_layer, device.index};
     work.id_values = {1, 2, 3, 4, 5, 6, 7};
     const auto ids = work.keep(::tyloi::ops::reshape(work.keep(::tyloi::ops::tensor(work.id_values, device)), {1, 7}));
-    const auto width = mtp->width();
+    const auto width = work.keep(model.embedding(ids, device.index)).size(2);
     work.previous_values.resize(static_cast<std::size_t>(7 * width));
     for (std::int64_t i = 0; i < 7 * width; ++i) {
         const volatile float product = static_cast<float>(i % 31) * .01f;
@@ -280,16 +283,29 @@ int run_flash_next_mtp_check(Program& program) {
     }
     const auto previous = work.keep(::tyloi::ops::reshape(work.keep(::tyloi::ops::tensor(work.previous_values, device)), {1, 7, width}));
     const auto reset = [&] { program.drain(); mtp->reset(predictor, 1); };
+    auto* qwen = dynamic_cast<qwen4_exp::Predictor*>(mtp);
+    auto* glm = dynamic_cast<glm5_next::Mtp*>(mtp);
+    auto* qwen_state = dynamic_cast<qwen4_exp::PredictorState*>(&predictor);
+    auto* glm_state = dynamic_cast<glm5_next::PredictorState*>(&predictor);
+    if ((multi_axis && (!qwen || !qwen_state)) || (!multi_axis && (!glm || !glm_state)))
+        throw std::runtime_error("Flash-Next predictor state does not match its model");
+    const auto positions_of = [&]() -> const std::vector<std::int64_t>& {
+        return multi_axis ? qwen_state->lengths : glm_state->lengths;
+    };
     const auto evaluate = [&](const Tensor& hidden, const Tensor& next_ids,
             std::int64_t depth = 0, bool cache = true, const Tensor& positions = Tensor{}) {
-        auto output = mtp->evaluate(predictor, {hidden, next_ids, positions, depth, cache, options});
+        const auto supplied = positions ? positions.dense() : DenseTensor{};
+        const auto values = multi_axis
+            ? qwen->evaluate(predictor, hidden.dense(), next_ids.dense(), depth, cache, supplied)
+            : glm->evaluate(predictor, hidden.dense(), next_ids.dense(), depth, cache, supplied);
+        models::MtpStep output{Tensor(values.first), Tensor(values.second)};
         work.keep(output.sample_hidden); work.keep(output.chain_hidden);
         return output;
     };
     nlohmann::json result;
     result["architecture"] = backbone;
     result["previous"] = json_tensor(previous);
-    const auto heads = predictor.head_positions().size();
+    const auto heads = positions_of().size();
     for (std::size_t i = 0; i < heads; ++i) {
         nlohmann::json row;
         reset();
@@ -297,9 +313,9 @@ int run_flash_next_mtp_check(Program& program) {
         row["full"] = json_tensor(full.sample_hidden);
         row["multi"] = json_tensor(full.chain_hidden);
         row["logits"] = json_tensor(work.keep(model.logits(full.sample_hidden)));
-        const auto saved = predictor.head_positions();
+        const auto saved = positions_of();
         row["uncached"] = json_tensor(evaluate(previous, ids, i, false).sample_hidden);
-        if (saved != predictor.head_positions()) throw std::runtime_error("uncached MTP changed layer positions");
+        if (saved != positions_of()) throw std::runtime_error("uncached MTP changed layer positions");
         reset();
         std::vector<Tensor> pieces;
         for (auto [begin, count] : std::vector<std::pair<std::int64_t, std::int64_t>>{{0, 2}, {2, 1}, {3, 4}})

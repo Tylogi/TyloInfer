@@ -14,6 +14,18 @@
 
 namespace tyloi::cuda::qwen35 {
 
+tyloi::engine::Metrics State::metrics() const {
+    tyloi::engine::Metrics result;
+    for (std::size_t i = 0; i < layers.size(); ++i) {
+        if (const auto* linear = std::get_if<LinearState>(&layers[i])) {
+            const auto prefix = "linear." + std::to_string(i) + ".";
+            result.emplace_back(prefix + "ffn_batches", linear->speculative_ffn_batches);
+            result.emplace_back(prefix + "projection_batches", linear->speculative_projection_batches);
+        }
+    }
+    return result;
+}
+
 namespace {
 
 void require_state(bool condition, const char* message) {
@@ -506,6 +518,36 @@ public:
         }
     }
 
+    std::vector<std::pair<tyloi::Device, std::size_t>> growth() const override {
+        std::vector<std::pair<tyloi::Device, std::size_t>> result;
+        const auto add = [&](tyloi::Device device, std::size_t bytes) {
+            auto it = std::find_if(result.begin(), result.end(), [device](const auto& v) { return v.first == device; });
+            if (it == result.end()) result.emplace_back(device, bytes);
+            else {
+                if (it->second > std::numeric_limits<std::size_t>::max() - bytes)
+                    throw std::overflow_error("Qwen session allocation overflow");
+                it->second += bytes;
+            }
+        };
+        const auto add_kv = [&](const KvSnapshot& kv) {
+            add(kv.k.device(), restore_prefix_bytes({}, kv.k, 2, kv.capacity));
+            add(kv.v.device(), restore_prefix_bytes({}, kv.v, 2, kv.capacity));
+        };
+        if (const auto* blocks = std::get_if<std::vector<KvSnapshot>>(&snapshot_.payload)) {
+            for (const auto& block : *blocks) add_kv(block);
+        } else {
+            for (const auto& block : std::get<std::vector<HybridBlockSessionState>>(snapshot_.payload)) {
+                if (block.kind == HybridBlockSessionStateKind::FullAttention) add_kv(block.full_attention);
+                else {
+                    add(block.convolution.device(), session_tensor_bytes(block.convolution));
+                    add(block.recurrent.device(), session_tensor_bytes(block.recurrent));
+                }
+            }
+        }
+        if (predictor_) for (const auto& [device, bytes] : predictor_->growth()) add(device, bytes);
+        return result;
+    }
+
     void stage() override {
         state_.stage(target_, snapshot_);
         if (predictor_) predictor_->stage();
@@ -545,7 +587,7 @@ void State::stage(Restore& restore, const TextSessionState& state) const {
                                     ? full_layers->at(index)
                                     : hybrid_layers->at(index).full_attention;
             auto& cache = std::get<tyloi::state::KvView>(restore.layers[index]);
-            restore_kv(cache, saved, full->head_dim, full->dtype, full->quantization);
+            stage_kv(cache, saved, full->head_dim, full->dtype, full->quantization);
         } else {
             const auto& saved = hybrid_layers->at(index);
             const auto& current = std::get<LinearState>(layers[index]);

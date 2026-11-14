@@ -2,10 +2,12 @@
 
 #include "engine/load.h"
 #include "engine/generation/sequence.h"
+#include "engine/models/input.h"
 #include "engine/generation/mtp/metrics.h"
 #include "engine/requests/result.h"
 
 #include <memory>
+#include <optional>
 
 namespace tyloi {
 class ModelSource;
@@ -84,6 +86,8 @@ public:
     void end_batch();
     /** Run one controlled prefill; the caller retains its inputs and result until draining. */
     models::Prefill prefill(models::Input input, std::int64_t compute, engine::InferenceOutput& output);
+    /** Run one optional model-owned decode graph with resource admission. */
+    std::optional<models::Decoded> decode(models::Input input, models::DecodeOptions options);
     /** Run one exclusive request in the caller's scope; its owners outlive the sequence and drain after it. */
     StepSequence<engine::EventData> generate(engine::InferenceRequest& request,
         engine::InferenceOutput& output, bool predictor = true, std::string id = "check");

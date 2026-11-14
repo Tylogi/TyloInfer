@@ -58,9 +58,9 @@ template <class Ops> class ContinuousBatch : public Batch {
         bool decode = false, active = false;
     };
     int64_t prefill_chunk_size, prefill_token_budget;
-    Ops operations;
     State state;
     std::unordered_map<std::string, std::shared_ptr<Work>> requests;
+    Ops operations;
     bool decode_next = true;
     int64_t admissions = 0, prefill_chunks = 0, prefill_yields = 0;
 

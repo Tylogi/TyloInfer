@@ -1,6 +1,8 @@
 #include "engine/engine.h"
 #include "engine/budget.h"
 #include "engine/generation/decode.h"
+#include "engine/generation/prefill.h"
+#include "engine/generation/run.h"
 #include "engine/generation/generation.h"
 #include "engine/generation/batch.h"
 #include "engine/generation/mtp/state.h"
@@ -41,6 +43,7 @@ struct Plain {
     Sampler sampler;
     bool penalties;
     Tensor pending;
+    std::int64_t pending_host = 0;
     bool graph_active = false;
     bool graph_prepared = false;
 
@@ -52,7 +55,6 @@ struct Plain {
         budget.reserve(state.growth(input, forward_options));
     }
     double prefill(const PrefillChunk& chunk) {
-        auto timer = executor.timer();
         models::Input model_input;
         model_input.ids = ops::slice(full_ids, 1, chunk.offset, chunk.offset + chunk.count);
         model_input.advance = true;
@@ -60,27 +62,29 @@ struct Plain {
             if (prepared->embeddings) model_input.embeddings = ops::slice(prepared->embeddings, 1, chunk.offset, chunk.offset + chunk.count);
             if (prepared->positions) model_input.positions = ops::slice(prepared->positions, -1, chunk.offset, chunk.offset + chunk.count);
         }
-        // Space is coordinated before this chunk materialises its own activations.
-        reserve(model_input);
         model_input.ids = ops::contiguous(model_input.ids);
         if (model_input.embeddings) model_input.embeddings = ops::contiguous(model_input.embeddings);
         if (model_input.positions) model_input.positions = ops::contiguous(model_input.positions);
-        auto hidden = model.forward(std::move(model_input), state, forward_options);
+        auto result = engine::prefill(model, state, executor, weights, budget, forward_options,
+            std::move(model_input), chunk_size, output);
+        auto hidden = std::move(result.hidden);
         if (prepared && prepared->transformed()) state.set_position_delta(prepared->decode_position_delta);
-        timer->stop({hidden});
         if (!output.stopped() && chunk.offset + chunk.count == int64_t(input.prompt.size()))
             pending = sample_logits(sampler, project(hidden, true), graph.counts, input.token_constraint);
-        const auto ms = timer->elapsed_ms();
+        const auto ms = result.elapsed_ms;
         if (config.decode_graph.trace) std::cerr << "runtime_prefill_chunk offset=" << chunk.offset
-            << " tokens=" << chunk.count << " layer_major=0 short_windows=0 compute_chunk=" << chunk_size
+            << " tokens=" << chunk.count << " layer_major=" << (result.mode == models::Prefill::Mode::layered)
+            << " short_windows=" << (result.mode == models::Prefill::Mode::windows) << " compute_chunk=" << chunk_size
             << " elapsed_ms=" << ms << " timing=before_cache_restore\n";
         return ms;
     }
     int64_t first_token() {
         const auto token = ops::item(pending);
+        pending_host = token;
         weights.prepare(::tyloi::weights::Cache::Stage::decode, config.device, source);
         graph_active = config.decode_graph.enabled &&
             (!prepared || !prepared->transformed()) && !input.token_constraint && info.decode_graph &&
+            info.graph == models::GraphOwner::executor &&
             graph.graph && input.sampling.max_tokens >= config.decode_graph.minimum_generation_tokens &&
             input.sampling.max_tokens <= graph.generated_capacity;
         return token;
@@ -89,10 +93,36 @@ struct Plain {
         if (penalties && !graph_active) ops::add_token_counts(graph.counts, ops::contiguous(pending));
     }
     int64_t advance() {
+        if (!graph_prepared && config.decode_graph.enabled && (!prepared || !prepared->transformed())) {
+            models::Input model_input;
+            model_input.ids = ops::reshape(pending, {1, 1});
+            const std::vector<std::int64_t> host{pending_host};
+            model_input.host_ids = ops::reshape(ops::tensor(host, Device(kCPU)), {1, 1});
+            model_input.advance = true;
+            budget.reserve(state.graph_exit_growth());
+            reserve(model_input);
+            models::DecodeOptions policy;
+            policy.projection = sampler.greedy() && !penalties && !input.token_constraint
+                ? models::DecodeOptions::Projection::greedy : models::DecodeOptions::Projection::logits;
+            policy.routed = weights.decode() == weights::Cache::Decode::routed;
+            policy.enabled = weights.decode() != weights::Cache::Decode::none;
+            policy.reserve_until = std::min<std::int64_t>(info.max_context,
+                std::int64_t(input.prompt.size()) + std::min<std::int64_t>(input.sampling.max_tokens, 256));
+            if (auto result = engine::decode(model, state, executor, weights, budget, forward_options, std::move(model_input), policy)) {
+                if (graph_active && penalties) ops::add_token_counts(graph.counts, ops::contiguous(pending));
+                graph_active = false;
+                pending = policy.projection == models::DecodeOptions::Projection::greedy
+                    ? ops::copy(result->ids, config.device) : sample_logits(sampler,
+                        ops::reshape(ops::contiguous(result->logits), {1, -1}), graph.counts, input.token_constraint);
+                pending_host = ops::item(pending);
+                return pending_host;
+            }
+        }
         if (!graph_active) {
             models::Input model_input;
             model_input.ids = ops::reshape(pending, {1, 1});
             model_input.advance = true;
+            exit_unmanaged_graph(state, weights, budget);
             reserve(model_input);
             auto profile = config.profile_decode ? executor.profile("runtime.decode") : nullptr;
             auto hidden = model.forward(std::move(model_input), state, forward_options);
@@ -100,7 +130,8 @@ struct Plain {
                 project(hidden, !(sampler.greedy() && !penalties && !input.token_constraint)),
                 graph.counts, input.token_constraint);
             if (profile) profile->finish({pending});
-            return ops::item(pending);
+            pending_host = ops::item(pending);
+            return pending_host;
         }
         auto scope = graph.graph->enter();
         if (!graph_prepared) {
@@ -179,7 +210,6 @@ struct Native {
     const models::ForwardOptions& forward_options;
     const ModelSource* source;
     state::Sessions& cache;
-    std::function<void()> drain;
     mtp::State& mtp_state;
     models::Mtp* mtp;
     tyloi::Executor* predictor_execution;
@@ -204,10 +234,15 @@ struct Native {
     }
     void prepare_request(const InferenceRequest&) { trace_expert_cache("begin"); }
     bool batched() const { return false; }
+    Restore restore_best(models::State& value, models::Mtp* predictor, const std::string& session,
+            const std::vector<std::int64_t>& prompt, std::size_t maximum, const std::string& key) {
+        return cache.restore_best(value, executor, weights, budget, predictor, session, prompt, maximum, key);
+    }
     bool has_hidden(const Hidden& hidden) const { return hidden && hidden.defined(); }
     void invalidate_plan() { graph.invalidate(); }
     void set_prefix_boundary(std::size_t tokens) { prefix_boundary = tokens; }
     void reset() {
+        exit_unmanaged_graph(state, weights, budget);
         state.reset(1);
         if (auto* predictor = model.predictor()) {
             if (!state.predictor || !state.predictor->belongs_to(*predictor))
@@ -225,6 +260,8 @@ struct Native {
         const auto& prompt = input.prompt;
         const auto chunk_size = budget.prefill(prompt.size() - reused, config.generation.prefill_chunk_size,
             info.prefill_row_bytes, state.position() > 0, config.prefill_chunk_auto);
+        const auto logical_chunk = prefill_span(model, state, weights, prompt.size(), chunk_size, reused,
+            stable, prepared && prepared->transformed());
         auto full_ids = ops::reshape(ops::tensor(std::span<const int64_t>(prompt),
             config.device), {1, -1});
         graph.ensure_storage(info.vocab_size);
@@ -234,7 +271,7 @@ struct Native {
         Plain plain{model, state, executor, budget, graph, weights, info, config,
                     forward_options, source, input, output, prepared, chunk_size,
                     std::move(full_ids), std::move(sampler), penalties};
-        auto sequence = generate_sequence(std::ref(plain), output, prompt.size(), reused, stable, chunk_size);
+        auto sequence = generate_sequence(std::ref(plain), output, prompt.size(), reused, stable, logical_chunk);
         while (auto step = sequence.next()) co_yield std::move(step);
     }
     Generation speculate(InferenceRequest& input, InferenceOutput& output, std::size_t reused,
@@ -242,9 +279,11 @@ struct Native {
         if (!predictor_execution) throw std::invalid_argument("predictor executor is unavailable");
         const auto chunk_size = budget.prefill(input.prompt.size() - reused, config.generation.prefill_chunk_size,
             info.prefill_row_bytes, state.position() > 0, config.prefill_chunk_auto);
+        const auto logical_chunk = prefill_span(model, state, weights, input.prompt.size(), chunk_size, reused,
+            prefix_boundary, prepared && prepared->transformed());
         return generate_mtp(model, state, executor, *predictor_execution, weights, budget, source,
-            mtp_state, input, output, chunk_size, prepared ? &*prepared : nullptr, reused, restored,
-            last_hidden, prefix_boundary, config.device, forward_options, config.profile_mtp);
+            mtp_state, input, output, logical_chunk, chunk_size, prepared ? &*prepared : nullptr, reused, restored,
+            last_hidden, prefix_boundary, config.device, forward_options, config.profile_mtp, config.decode_graph.enabled);
     }
 };
 
@@ -257,8 +296,17 @@ StepSequence<EventData> Engine::generate(const RequestId& id, Request& request) 
     }
     return generate_prepared(
         Native{*model_, *request.state, *executor_, *budget_, *graph_, *weights_, model_info_,
-               config_, forward_options_, source_.get(), *cache_, [this] { drain(); },
+               config_, forward_options_, source_.get(), *cache_,
                mtp_state_, model_->predictor(), predictor_execution_.get()},
         *request.state, *executor_, request.input, *request.output, id, request.batched);
+}
+
+Generation generate(Run run, InferenceRequest& request, InferenceOutput& output, RequestId id) {
+    auto sequence = generate_prepared(
+        Native{run.model, run.state, run.executor, run.budget, run.graph, run.weights, run.info,
+            run.config, run.forward_options, run.source, run.cache,
+            run.mtp_state, run.mtp, &run.executor},
+        run.state, run.executor, request, output, id, false);
+    while (auto step = sequence.next()) co_yield std::move(step);
 }
 } // namespace tyloi::engine

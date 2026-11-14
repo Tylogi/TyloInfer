@@ -2,11 +2,14 @@
 #include "engine/generation/mtp/sequence.h"
 #include "engine/generation/mtp/sampling.h"
 #include "engine/generation/mtp/state.h"
+#include "engine/generation/decode.h"
+#include "engine/generation/prefill.h"
 #include "engine/generation/sampling.h"
 #include "engine/models/causal_model.h"
 #include "engine/models/common/mtp.h"
 #include "engine/models/source.h"
 #include "engine/weights/cache.h"
+#include "engine/weights/workspace.h"
 #include "engine/budget.h"
 #include "engine/executor.h"
 #include "engine/ops.h"
@@ -38,11 +41,17 @@ struct MtpOps {
     Device device;
     models::ForwardOptions options;
     bool profile;
+    InferenceOutput& output;
+    std::int64_t prefill_chunk_size;
+    bool graph_enabled;
     Tensor input_ids, counts, known_ids_host, known_ids_device;
     Tensor projected_predictor_hidden, projected_predictor_logits;
+    Tensor projected_target_hidden, projected_target_logits, projected_target_compact;
+    std::vector<std::int32_t> projected_target_tokens;
     int32_t projected_predictor_greedy = -1;
     std::optional<Sampler> sampler_;
     bool penalties = false;
+    bool target_maintenance = false;
     std::uint64_t target_graph_captures = 0, target_transfer_bytes = 0;
     std::array<double, 6> target_profile{};
     weights::Cache::Routes target_routes;
@@ -66,8 +75,9 @@ struct MtpOps {
     void resolve_target_routes(int rows, bool cancelled) { target_routes.resolve(rows, cancelled); }
     bool take_target_maintenance() {
         const auto captures = weights.activity().graph_captures;
-        const bool changed = captures != target_graph_captures;
+        const bool changed = target_maintenance || captures != target_graph_captures;
         target_graph_captures = captures;
+        target_maintenance = false;
         return changed;
     }
     bool retains_partial_target_prefix(int accepted) const {
@@ -102,6 +112,7 @@ struct MtpOps {
         return ops::contiguous(ops::cat(values, axis));
     }
     Tensor forward(models::Input input) {
+        exit_unmanaged_graph(state, weights, budget);
         budget.reserve(state.growth(input, options));
         auto scope = executor.enter();
         auto hidden = model.forward(std::move(input), state, options);
@@ -114,7 +125,27 @@ struct MtpOps {
         const auto costs = profile ? target_costs() : std::array<double, 6>{};
         models::Input input;
         input.ids = std::move(ids); input.raw_hidden = raw; input.confirmed = confirmed;
-        auto hidden = forward(std::move(input));
+        if (same_view(input.ids, known_ids_device)) input.host_ids = known_ids_host;
+        Tensor hidden;
+        projected_target_hidden = {}; projected_target_logits = {}; projected_target_compact = {};
+        projected_target_tokens.clear();
+        if (graph_enabled && (!prepared || !prepared->transformed())) {
+            budget.reserve(state.graph_exit_growth());
+            budget.reserve(state.growth(input, options));
+            models::DecodeOptions policy;
+            policy.projection = models::DecodeOptions::Projection::hidden;
+            policy.enabled = weights.decode() != weights::Cache::Decode::none;
+            policy.routed = weights.decode() == weights::Cache::Decode::routed;
+            policy.compact_sampling = sampler_ && !penalties && !sampler().greedy() &&
+                sampler().params().top_k > 0 && sampler().params().top_k <= 64;
+            if (auto result = engine::decode(model, state, executor, weights, budget, options, input, policy)) {
+                hidden = result->hidden;
+                projected_target_hidden = hidden; projected_target_logits = result->logits;
+                projected_target_compact = result->compact; projected_target_tokens = std::move(result->tokens);
+                target_maintenance = target_maintenance || result->initialized;
+            }
+        }
+        if (!hidden) hidden = forward(std::move(input));
         target_transfer_bytes = weights.activity().streamed_bytes - before;
         if (profile) {
             const auto after = target_costs();
@@ -128,6 +159,7 @@ struct MtpOps {
         const auto costs = profile ? target_costs() : std::array<double, 6>{};
         models::Input input;
         input.ids = std::move(ids); input.raw_hidden = raw; input.suffix = true;
+        exit_unmanaged_graph(state, weights, budget);
         budget.reserve(state.growth(input, options));
         state.begin_speculative_suffix(input.shape().second);
         auto scope = executor.enter();
@@ -142,20 +174,21 @@ struct MtpOps {
     }
     struct PrefillResult { Tensor hidden, raw; double elapsed; };
     PrefillResult prefill(PrefillChunk chunk) {
-        auto timer = executor.timer();
         Tensor raw;
         auto ids = slice(input_ids, 1, chunk.offset, chunk.count);
-        Tensor hidden;
+        models::Input input;
+        input.ids = std::move(ids); input.raw_hidden = &raw; input.advance = true;
         if (prepared && prepared->transformed()) {
-            models::Input input;
-            input.ids = std::move(ids);
-            input.embeddings = slice(prepared->embeddings, 1, chunk.offset, chunk.count);
+            if (prepared->embeddings) input.embeddings = slice(prepared->embeddings, 1, chunk.offset, chunk.count);
             if (prepared->positions) input.positions = slice(prepared->positions, -1, chunk.offset, chunk.count);
-            input.raw_hidden = &raw; input.advance = true;
-            hidden = forward(std::move(input));
-        } else hidden = target_forward(std::move(ids), &raw);
-        timer->stop({hidden, raw});
-        return {std::move(hidden), std::move(raw), timer->elapsed_ms()};
+        }
+        const std::array<Device, 1> devices{device};
+        const auto available = executor.memory(devices).front().allocatable;
+        const bool host = mtp.host_prompt_history(chunk.count, available, info.raw_row_bytes);
+        auto result = engine::prefill(model, state, executor, weights, budget, options,
+            std::move(input), prefill_chunk_size, output, host);
+        if (prepared && prepared->transformed()) state.set_position_delta(prepared->decode_position_delta);
+        return {std::move(result.hidden), std::move(result.raw), result.elapsed_ms};
     }
     Tensor ids_for(std::vector<int64_t> tokens) {
         known_ids_host = ops::reshape(ops::tensor(tokens, Device(kCPU)), {1, -1});
@@ -188,14 +221,31 @@ struct MtpOps {
         else projected_predictor_hidden = {};
         return result;
     }
-    int64_t predictor_prefill_chunk_size(int64_t requested) const { return std::min<int64_t>(512, requested); }
+    int64_t predictor_prefill_chunk_size(int64_t requested) const { return mtp.prefill_chunk_size(requested); }
+    bool stream_prompt_history(int64_t tokens) const { return mtp.stream_prompt_history(tokens); }
+    bool bootstrap_before_publication() const { return mtp.bootstrap_before_publication(); }
+    std::size_t predictor_history_merge_limit() const { return mtp.predictor_history_merge_limit(); }
+    std::size_t predictor_history_flush_threshold() const { return mtp.predictor_history_flush_threshold(); }
+    std::size_t predictor_parked_history_flush_threshold() const { return mtp.predictor_parked_history_flush_threshold(); }
     double end_predictor_prefill() { weights.prepare(weights::Cache::Stage::decode, device, source); return 0; }
     double predictor_prefill(Tensor hidden, Tensor ids, Tensor positions) {
         auto timer = executor.timer();
+        weights::Loan workspace(weights);
+        const auto bytes = mtp.prefill_workspace_bytes(ids.size(1));
+        if (bytes) workspace.begin(bytes);
         hidden = ops::copy(hidden, device);
-        const auto result = predictor_step(std::move(hidden), std::move(ids), std::move(positions));
+        auto predictor_options = options;
+        predictor_options.kv_capacity = ops::kv_capacity(device);
+        predictor_options.serial_experts = false;
+        models::MtpStep result;
+        {
+            auto scope = ops::dense_scope(&predictor_execution, device);
+            result = mtp.prefill(predictor, hidden, ids, positions, predictor_options);
+        }
         timer->stop({result.sample_hidden, result.chain_hidden, result.sample_logits});
-        return timer->elapsed_ms();
+        const auto elapsed = timer->elapsed_ms();
+        if (bytes) workspace.finish();
+        return elapsed;
     }
     void trace_prompt_prefill(double target_ms, double predictor_ms, double workspace_ms) const {
         if (!mtp.teacher_forced_prompt_prime()) weights.prepare(weights::Cache::Stage::decode, device, source);
@@ -227,11 +277,14 @@ struct MtpOps {
     int32_t sample_normal(Tensor logits, Tensor token_counts) {
         if (sampler().greedy() && !penalties && projected_predictor_greedy >= 0 && same_data(logits, projected_predictor_logits))
             return projected_predictor_greedy;
+        if (sampler().greedy() && !penalties && projected_target_tokens.size() == 1 &&
+            same_data(logits, projected_target_logits)) return projected_target_tokens.front();
         if (penalties) logits = ops::clone(logits);
         return static_cast<int32_t>(ops::item(sample_logits(sampler(), std::move(logits), token_counts)));
     }
     std::vector<int32_t> greedy_tokens(Tensor logits) {
         if (penalties || !sampler().greedy() || logits.dim() != 2) throw std::runtime_error("batched greedy MTP sampling geometry is invalid");
+        if (same_data(logits, projected_target_logits) && !projected_target_tokens.empty()) return projected_target_tokens;
         const auto tokens = ops::read_integers(ops::sample_greedy(ops::contiguous(logits)));
         return {tokens.begin(), tokens.end()};
     }
@@ -259,10 +312,13 @@ struct MtpOps {
     std::vector<mtp::CompactDistribution> compact_probability_rows(Tensor logits, const MfqSamplingParams& parameters) {
         if (penalties || logits.dim() != 2 || parameters.top_k <= 0 || parameters.top_k > 64 || !(parameters.temperature > 0.0))
             throw std::runtime_error("batched compact MTP sampling geometry is invalid");
+        if (same_data(logits, projected_target_logits) && projected_target_compact)
+            return mtp::compact_rows_from_packed(projected_target_compact, parameters);
         return mtp::compact_rows(ops::contiguous(logits), parameters);
     }
     Tensor logits_for(Tensor normalized) {
         if (same_view(projected_predictor_hidden, normalized)) return projected_predictor_logits;
+        if (same_view(projected_target_hidden, normalized) && projected_target_logits) return projected_target_logits;
         auto input = ops::contiguous(mtp.preserve_output_dtype() ? normalized : ops::cast(normalized, kFloat16));
         auto scope = ops::dense_scope(nullptr, device);
         auto result = model.logits(input, true);
@@ -275,9 +331,9 @@ struct MtpOps {
 Generation generate_mtp(const models::CausalModel& model, models::State& state,
     Executor& executor, Executor& predictor_execution, weights::Cache& weights, Budget& budget,
     const ModelSource* source, mtp::State& mtp_state, InferenceRequest& request, InferenceOutput& output,
-    std::int64_t prefill_chunk_size, const models::Prepared* prepared, std::size_t reused_tokens,
+    std::int64_t prefill_chunk_size, std::int64_t prefill_compute_chunk, const models::Prepared* prepared, std::size_t reused_tokens,
     Tensor restored_last_hidden, Tensor* session_last_hidden, std::size_t stable_prefix_tokens,
-    Device device, models::ForwardOptions options, bool profile) {
+    Device device, models::ForwardOptions options, bool profile, bool graph_enabled) {
     auto* predictor = model.predictor();
     if (!model.supports_speculation() || !predictor) throw std::invalid_argument("this model has no speculative predictor");
     if (!state.predictor || !state.predictor->belongs_to(*predictor))
@@ -285,7 +341,8 @@ Generation generate_mtp(const models::CausalModel& model, models::State& state,
     if (prepared && prepared->image_mask && prepared->image_mask.defined())
         throw std::invalid_argument("MTP image participation masks are unsupported");
     MtpOps ops{model, state, executor, predictor_execution, weights, budget, source, model.info(),
-        *predictor, *state.predictor, mtp_state, prepared, device, options, profile};
+        *predictor, *state.predictor, mtp_state, prepared, device, options, profile, output,
+        prefill_compute_chunk, graph_enabled};
     ops.target_graph_captures = weights.activity().graph_captures;
     return speculative_sequence(std::move(ops), request, output, prefill_chunk_size, reused_tokens,
         std::move(restored_last_hidden), session_last_hidden, stable_prefix_tokens);

@@ -73,11 +73,14 @@ public:
     std::vector<std::pair<tyloi::Device, std::size_t>> growth(
         const tyloi::models::Input&, const tyloi::models::ForwardOptions&) const override;
     void reset(std::int64_t new_batch) override;
+    tyloi::engine::Metrics metrics() const override;
     std::int64_t position() const noexcept override { return cache_pos; }
     void advance(std::int64_t tokens) noexcept override { cache_pos += tokens; }
     void set_position_delta(std::int64_t delta) noexcept override { decode_position_delta = delta; }
     void commit_speculative() override;
     void rollback_speculative(std::int64_t accepted) override;
+    bool speculating() const noexcept override { return speculative_start >= 0; }
+    std::int64_t confirmed_prefix() const noexcept override { return speculative_confirmed; }
     std::int64_t rewind(std::int64_t accepted_suffix);
     void abort_speculative() noexcept;
 

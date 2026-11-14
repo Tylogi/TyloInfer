@@ -115,6 +115,8 @@ public:
     std::size_t allocation_bytes(const State&, std::int64_t batch, std::int64_t tokens, bool reset) const;
     /** Plan temporary copies needed when leaving an unmanaged graph cache. */
     std::size_t exit_growth(const State&, std::int64_t tokens) const;
+    /** Plan copies needed to restore the current unmanaged graph cache. */
+    std::size_t graph_exit_growth_bytes(const State&) const;
     /** Estimate backing needed for the requested graph capacity. */
     std::size_t graph_growth_bytes(const State&, std::int64_t capacity) const;
     /** Report whether this request supports session snapshots. */

@@ -949,9 +949,9 @@ run_mtp_generation(Model &model, State &state, tyloi::cuda::Executor* executor,
         throw std::invalid_argument("predictor execution resources are unavailable");
       return tyloi::engine::generate_mtp(causal, state, tyloi::cuda::Executor::current(),
           *predictor_execution, weights, *budget, source, mtp_state, request, output,
-          logical_chunk, prepared, reused_tokens, std::move(restored_last_hidden), session_last_hidden,
+          logical_chunk, prefill_chunk_size, prepared, reused_tokens, std::move(restored_last_hidden), session_last_hidden,
           stable_prefix_tokens, tyloi::Device(tyloi::kCUDA, mode.primary),
-          tyloi::cuda::forward_options(mode), mtp_detail::CudaMtpOps<Model, State>::profile_target());
+          tyloi::cuda::forward_options(mode), mtp_detail::CudaMtpOps<Model, State>::profile_target(), true);
     }
   }
 #endif

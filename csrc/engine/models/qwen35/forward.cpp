@@ -1,5 +1,6 @@
 #include "engine/models/qwen35/model.h"
 #include "engine/models/qwen35/state.h"
+#include "engine/models/qwen35/layers.h"
 #include "engine/models/common/ffn.h"
 
 #include <algorithm>
@@ -49,6 +50,8 @@ void clear_linear_speculative(LinearState& state) noexcept {
     state.projected = {};
     state.mixer.commit();
 }
+
+} // namespace
 
 Tensor forward_layer(const Layer& layer, LayerState& state, Tensor input,
                      const ::tyloi::models::AttentionStep& step, std::int64_t confirmed_prefix,
@@ -126,8 +129,6 @@ Tensor forward_layer(const Layer& layer, LayerState& state, Tensor input,
         throw;
     }
 }
-
-} // namespace
 
 Tensor Model::forward(models::Input input, models::State& value, const models::ForwardOptions& options) const {
     auto* selected = dynamic_cast<State*>(&value);

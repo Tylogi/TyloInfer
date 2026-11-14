@@ -10,8 +10,7 @@ tyloi::StepSequence<tyloi::models::Prepared> Text<M, S, P>::prepare(InferenceReq
     if constexpr (std::is_same_v<Parts, std::unique_ptr<tyloi::cuda::minicpmo45::Components>>) {
         if (!components) throw std::invalid_argument("model has no multimodal component");
         return components->prepare(input.prompt, *input.vision);
-    } else if constexpr (std::is_same_v<Model, qwen4_exp::Model> ||
-                         std::is_same_v<Model, nemotron_h::Model>) {
+    } else if constexpr (std::is_same_v<Model, nemotron_h::Model>) {
         return components.prepare(language, images,
 #ifndef TYLOINFER_NATIVE_CUDA
         root_executor.projector(root_executor.mode().ffn, model_parallel_primary_device(load_config)),
@@ -55,12 +54,7 @@ template <class M, class S, class P>
 Generation Text<M, S, P>::generate(const RequestId& id, InferenceRequest& input, InferenceOutput& output, bool batched) {
     if (batched) {
         graph.invalidate();
-        if constexpr (std::is_same_v<Model,qwen4_exp::Model>) {
-            // Exclusive MTP generation has ended before a batch starts.
-            // Its graph consumers must retire before idle batch buffers.
-            qwen4_release_decode_graphs(language,state);
-            if (components.mtp) components.mtp->reset(predictor_state(), 1);
-        }
+
     }
     return generate_prepared(std::ref(*this), state, *executor, input, output, id, batched);
 }

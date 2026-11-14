@@ -1,7 +1,7 @@
 #include "engine/models/qwen35/layers.h"
 
-#include "engine/models/qwen35/forward.h"
 #include "engine/models/qwen35/load.h"
+#include "engine/models/load.h"
 #include "engine/models/qwen35/state.h"
 #include "engine/ops.h"
 #include "engine/weights/loader.h"
@@ -37,7 +37,12 @@ public:
 
     void initialize(std::shared_ptr<const tyloi::ModelSource> source, std::string_view definition,
                     const tyloi::models::LoadOptions& options) {
-        load_deferred(*model_, std::move(source), definition, weights_, placement_, options);
+        *model_ = read(std::move(source), definition, options.context);
+        qwen35::load(*model_, weights_, placement_, options.yarn, cpu_layers_,
+            {.gpu_layers = options.gpu_layers, .expert_parallel = options.expert_parallel,
+             .mirror_scalars = options.mirror_scalars,
+             .recurrent_transposed = options.recurrent_transposed,
+             .load_layers = false, .load_input_output = false});
         layers_.resize(model_->config.num_hidden_layers);
     }
 
@@ -83,24 +88,30 @@ public:
         auto* request = dynamic_cast<LayerRequest*>(&state);
         if (!request || !state.belongs_to(*this, index) || request->generation != generation_ || request->used)
             throw std::invalid_argument("Qwen layer state does not belong to this fresh request");
-        if (options.primary != model_->primary_device)
+        if (options.primary != model_->device.index)
             throw std::invalid_argument("Qwen layer primary device differs from its owner");
         if (!hidden.defined() || hidden.scalar_type() != kFloat16 || hidden.dim() != 3 || hidden.size(0) != 1 ||
-            hidden.size(1) < 1 || hidden.size(2) != model_->config.hidden_size ||
+            hidden.size(1) < 1 || hidden.size(1) > model_->config.max_position_embeddings ||
+            hidden.size(2) != model_->config.hidden_size ||
             !positions.defined() || positions.scalar_type() != kInt64 ||
             positions.dim() != 1 || positions.size(0) != hidden.size(1))
             throw std::invalid_argument("Qwen layer input or position geometry is invalid");
+        for (const auto position : ::tyloi::ops::integers(positions))
+            if (position < 0 || position >= model_->config.max_position_embeddings)
+                throw std::out_of_range("Qwen layer position outside context");
         const auto* rope = &model_->rope;
-        if (layer.cpu) rope = &model_->cpu_rope;
+        if (layer.device.is_cpu()) rope = &model_->cpu_rope;
         else if (!model_->device_ropes.empty()) {
-            const auto found = model_->device_ropes.find(layer.device);
+            const auto found = model_->device_ropes.find(layer.device.index);
             if (found == model_->device_ropes.end())
                 throw std::logic_error("Qwen layer has no rope table for its device");
             rope = &found->second;
         }
-        const AttentionStep step{positions, {}, {}, 0, 0, 0};
+        const tyloi::models::AttentionStep step{positions, {}, {}, 0, 0, 0};
         request->used = true;
-        return qwen35::forward_layer(layer, request->state, hidden, step, 0, *rope, options);
+        auto output = qwen35::forward_layer(layer, request->state, hidden, step, 0,
+                                            *rope, options, model_->recurrent_transposed);
+        return ::tyloi::ops::contiguous(::tyloi::ops::copy(output, model_->device));
     }
 
     /** Read token rows individually and return the original F16 embedding. */
@@ -122,26 +133,26 @@ public:
             ::tyloi::ops::copy_into(::tyloi::ops::slice(embedded, 0, position, position + 1), row);
         }
         embedded = ::tyloi::ops::reshape(embedded, {ids.size(0), ids.size(1), model_->config.hidden_size});
-        return ::tyloi::ops::contiguous(::tyloi::ops::copy(embedded, Device(kCUDA, model_->primary_device)));
+        return ::tyloi::ops::contiguous(::tyloi::ops::copy(embedded, model_->device));
     }
 
     /** Apply the model's shared output normalization. */
     Tensor normalize(const Tensor& hidden, std::int64_t batch, std::int64_t tokens) const override {
-        return qwen35::normalize(*model_, hidden, batch, tokens);
+        return model_->normalize(hidden, batch, tokens);
     }
 
     /** Project a bounded vocabulary range with the original F16 source rounding. */
     Tensor head(const Tensor& hidden, std::int64_t first, std::int64_t count) const override {
         if (!hidden.defined() || hidden.dim() != 2 || hidden.size(1) != model_->config.hidden_size ||
-            hidden.scalar_type() != kFloat16 || hidden.device() != Device(kCUDA, model_->primary_device) ||
+            hidden.scalar_type() != kFloat16 || hidden.device() != model_->device ||
             first < 0 || count < 1 ||
             count > model_->config.vocab_size || first > model_->config.vocab_size - count)
             throw std::invalid_argument("Qwen reference head input or row range is invalid");
         const char* name = !model_->config.tie_word_embeddings && weights_.has("model.output.weight")
             ? "model.output.weight" : "model.token_embedding.weight";
         auto weight = tyloi::weights::read_rows(weights_.source, name, first, count);
-        weight = ::tyloi::ops::cast(weight, kFloat16, Device(kCUDA, model_->primary_device));
-        return qwen35::softcap(*model_, ::tyloi::ops::matmul(hidden, ::tyloi::ops::transpose(weight, 0, 1)));
+        weight = ::tyloi::ops::cast(weight, kFloat16, model_->device);
+        return model_->softcap(::tyloi::ops::matmul(hidden, ::tyloi::ops::transpose(weight, 0, 1)));
     }
 
 private:
@@ -162,7 +173,7 @@ private:
 
     void load_one(int index) {
         const int device = placement_.device_for_layer(index);
-        const bool cpu = index < model_->cpu_layers;
+        const bool cpu = index < cpu_layers_;
         auto placed = weights_.for_layer(device, cpu);
         auto& layer = layers_[index].emplace();
         qwen35::load_layer(layer, placed, model_->config, index,
@@ -173,6 +184,7 @@ private:
     tyloi::weights::Loader weights_;
     LayerPlacementConfig& placement_;
     bool mirror_scalars_;
+    int cpu_layers_ = 0;
     std::vector<std::optional<Layer>> layers_;
     std::size_t generation_ = 0;
     bool ready_ = false;
@@ -184,6 +196,12 @@ void load_layers(std::unique_ptr<tyloi::models::Layers>& owner,
     std::shared_ptr<const tyloi::ModelSource> source, std::string_view definition,
     const tyloi::weights::Loader& weights, LayerPlacementConfig& placement,
     const tyloi::models::LoadOptions& options) {
+    if (!source || &weights.source != source.get())
+        throw std::invalid_argument("Qwen source and weight loader must match");
+    if (weights.placement.device != placement.primary_device())
+        throw std::invalid_argument("Qwen weight and layer primary devices differ");
+    if (!options.cpu_offload_layers.empty())
+        throw std::invalid_argument("Qwen layer reference does not support CPU offload layers");
     owner = std::make_unique<QwenLayers>(weights, placement, options.mirror_scalars);
     static_cast<QwenLayers*>(owner.get())->initialize(std::move(source), definition, options);
 }

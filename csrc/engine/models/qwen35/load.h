@@ -46,6 +46,9 @@ void load_components(Model& model, const ::tyloi::weights::Loader& weights,
 Layer load_layer(const ::tyloi::weights::Loader&, const Config&,
                  int index, const std::string& type, bool mirror_scalars = true,
                  std::string_view tensor_root = "model");
+void load_layer(Layer&, const ::tyloi::weights::Loader&, const Config&,
+                int index, const std::string& type, bool mirror_scalars = true,
+                std::string_view tensor_root = "model");
 
 std::optional<tyloi::models::qwen35::Predictor> load_predictor(
     TransformerWeightLoader&, const Model&, tyloi::state::KvQuantization);

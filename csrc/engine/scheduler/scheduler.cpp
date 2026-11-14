@@ -1,5 +1,6 @@
 #include "scheduler.h"
 #include "request.h"
+#include "engine/models/common/mtp.h"
 
 #include <algorithm>
 #include <exception>
@@ -306,8 +307,18 @@ EngineStatus Scheduler::execution_status() const {
 }
 
 void Scheduler::reset_states(std::int64_t batch) {
-    for (auto& [id, request] : requests_)
-        if (request.state) request.state->reset(batch);
+    for (auto& [id, request] : requests_) {
+        if (!request.state) continue;
+        auto& state = *request.state;
+        engine_.budget_->reserve(state.graph_exit_growth());
+        state.release_graphs();
+        engine_.budget_->reserve(state.reset_growth(batch));
+        state.reset(batch);
+        if (auto* predictor = engine_.model_->predictor(); predictor && state.predictor) {
+            engine_.budget_->reserve(predictor->reset_growth(*state.predictor, batch));
+            predictor->reset(*state.predictor, batch);
+        }
+    }
 }
 
 std::pair<bool, std::vector<EngineEvent>> Scheduler::advance(const std::vector<RequestId>& eligible) {

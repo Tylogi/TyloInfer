@@ -1,6 +1,7 @@
 #pragma once
 
 #include "engine/tensor.h"
+#include "engine/metrics.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -21,6 +22,8 @@ struct Mtp;
 class Restore {
 public:
     virtual ~Restore() = default;
+    // Backing allocated by stage, grouped by device.
+    virtual std::vector<std::pair<Device, std::size_t>> growth() const { return {}; }
     virtual void stage() = 0;
     // Publish only after staged copies have completed.
     virtual void publish() noexcept = 0;
@@ -47,6 +50,7 @@ public:
     State(const State&) = delete;
     State& operator=(const State&) = delete;
     virtual ~State() = default;
+    virtual tyloi::engine::Metrics metrics() const { return {}; }
     std::unique_ptr<MtpState> predictor;
     virtual void preallocate() = 0;
     virtual std::vector<std::pair<tyloi::Device, std::size_t>> preallocate_growth() const {
@@ -57,6 +61,7 @@ public:
     virtual void reset(std::int64_t batch) = 0;
     // Retire graphs owned by this request; externally owned graphs are retired by their owner.
     virtual void release_graphs() {}
+    virtual std::vector<std::pair<tyloi::Device, std::size_t>> graph_exit_growth() const { return {}; }
     virtual std::int64_t position() const noexcept = 0;
     virtual void advance(std::int64_t tokens) noexcept = 0;
     virtual void set_position_delta(std::int64_t delta) noexcept = 0;
@@ -69,6 +74,8 @@ public:
     virtual void begin_speculative_suffix(std::int64_t) {
         throw std::logic_error("speculative suffix is not supported");
     }
+    virtual bool speculating() const noexcept { return false; }
+    virtual std::int64_t confirmed_prefix() const noexcept { return 0; }
     virtual void commit_speculative() {
         throw std::logic_error("speculative transactions are not supported");
     }

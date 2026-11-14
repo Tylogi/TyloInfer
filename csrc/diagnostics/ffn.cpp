@@ -1,6 +1,7 @@
 #include "diagnostics/ffn.h"
 #include "diagnostics/gemma_moe.h"
 #include "engine/program.h"
+#include "engine/backends/cuda/executor/config.h"
 #include "engine/models/ffn.h"
 #include "engine/models/common/load.h"
 #include "engine/models/gemma4/config.h"
@@ -90,7 +91,7 @@ int run_moe_check(tyloi::cuda::Program& program, const std::string& config_path,
               << std::fixed << std::setprecision(0) << info.routed_bytes << "\n";
 
     tyloi::cuda::manual_seed(20260720 + layer);
-    const auto primary = executor.device();
+    const auto primary = tyloi::Device(tyloi::kCUDA, program.config().layer_placement.primary_device());
     for (const int64_t tokens : token_sizes) {
         work.input = tyloi::cuda::randn({tokens, info.input_width},
             tyloi::TensorOptions().device(primary).dtype(tyloi::kFloat16));

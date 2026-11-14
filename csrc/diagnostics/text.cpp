@@ -1,5 +1,6 @@
 #include "diagnostics/text.h"
 #include "engine/program.h"
+#include "engine/backends/cuda/executor/config.h"
 #include "engine/backends/cuda/executor/executor.h"
 #include "engine/models/causal_model.h"
 #include "engine/models/session/snapshot.h"
@@ -119,7 +120,7 @@ int run_flash_next_check(tyloi::cuda::Program& program) {
     const bool multi_axis = graph.backbone == "qwen4_exp";
     if ((graph.backbone != "glm5_next" && !multi_axis) || model.info().vocab_size < 8 || model.info().max_context < 16)
         throw std::runtime_error("Flash-Next diagnostic requires a Flash-Next text graph, vocab>=8 and context>=16");
-    const auto device = executor.device();
+    const auto device = tyloi::Device(tyloi::kCUDA, program.config().layer_placement.primary_device());
     const auto mode = executor.forward_mode(device.index);
     const ForwardOptions options{mode.kv_capacity, mode.trace, mode.trace_layer, device.index};
     auto ids = ids_for(work, {1, 2, 3, 4, 5, 6, 7}, device);
@@ -175,7 +176,7 @@ int run_nemotron_h_check(tyloi::cuda::Program& program) {
         throw std::runtime_error("--check-nemotron-h requires a Nemotron-H causal LM");
     if (model.info().vocab_size < 8 || model.info().max_context < 16)
         throw std::runtime_error("Nemotron-H diagnostic requires vocab>=8 and context>=16");
-    const auto device = executor.device();
+    const auto device = tyloi::Device(tyloi::kCUDA, program.config().layer_placement.primary_device());
     const auto mode = executor.forward_mode(device.index);
     const ForwardOptions options{mode.kv_capacity, mode.trace, mode.trace_layer, device.index};
     auto ids = ids_for(work, {1, 2, 3, 4, 5, 6, 7}, device);

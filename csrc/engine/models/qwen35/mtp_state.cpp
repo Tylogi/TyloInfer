@@ -3,6 +3,7 @@
 #include "engine/ops.h"
 
 #include <algorithm>
+#include <limits>
 #include <stdexcept>
 
 namespace tyloi::cuda::qwen35 {
@@ -120,6 +121,23 @@ class SessionRestore final : public tyloi::models::Restore {
 public:
     SessionRestore(MtpState& state, const MtpSessionState& saved)
         : state_(state), saved_(saved), candidate_(state.prepare(saved_)) {}
+    std::vector<std::pair<tyloi::Device, std::size_t>> growth() const override {
+        std::vector<std::pair<tyloi::Device, std::size_t>> result;
+        const auto add = [&](tyloi::Device device, std::size_t bytes) {
+            auto it = std::find_if(result.begin(), result.end(), [device](const auto& v) { return v.first == device; });
+            if (it == result.end()) result.emplace_back(device, bytes);
+            else {
+                if (it->second > std::numeric_limits<std::size_t>::max() - bytes)
+                    throw std::overflow_error("Qwen MTP session allocation overflow");
+                it->second += bytes;
+            }
+        };
+        for (const auto& block : std::get<std::vector<KvSnapshot>>(saved_.payload)) {
+            add(block.k.device(), restore_prefix_bytes({}, block.k, 2, block.capacity));
+            add(block.v.device(), restore_prefix_bytes({}, block.v, 2, block.capacity));
+        }
+        return result;
+    }
     void stage() override { state_.stage(candidate_, saved_); }
     void publish() noexcept override { state_.publish(std::move(candidate_)); }
 
@@ -139,7 +157,7 @@ void MtpState::stage(Restore& restore, const MtpSessionState& saved) const {
     for (size_t index = 0; index < restore.kv.size(); ++index) {
         const auto& layout = layout_[index];
         tyloi::ops::DeviceScope guard(layout.device);
-        restore_kv(restore.kv[index], blocks[index], layout.head_dim,
+        stage_kv(restore.kv[index], blocks[index], layout.head_dim,
             layout.dtype, layout.quantization);
     }
 }

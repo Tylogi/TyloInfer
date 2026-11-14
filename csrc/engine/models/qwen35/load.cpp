@@ -140,7 +140,7 @@ struct LayerLoader : TransformerWeightLoader {
 
 } // namespace
 
-Layer load_layer(const ::tyloi::weights::Loader& weights, const Config& config,
+void load_layer(Layer& result, const ::tyloi::weights::Loader& weights, const Config& config,
                  int index, const std::string& type, bool mirror_scalars,
                  std::string_view tensor_root) {
     if (index < 0 || index >= config.num_hidden_layers)
@@ -149,13 +149,12 @@ Layer load_layer(const ::tyloi::weights::Loader& weights, const Config& config,
         config.layer_types[static_cast<std::size_t>(index)] != type)
         throw std::invalid_argument("Qwen layer type disagrees with model config");
     MfqCudaGuard scope(weights.placement.device);
-    Layer result;
     result.device = weights.placement.cpu
         ? ::tyloi::Device(::tyloi::kCPU)
         : ::tyloi::Device(::tyloi::kCUDA, weights.placement.device);
     LayerLoader loader{{weights}, mirror_scalars};
     if (Config::attention_kind(type) == Config::AttentionKind::full) {
-        Full full;
+        auto& full = result.weights.emplace<Full>();
         full.attention.kv_quantization = cuda_kv_quantization();
         tyloi::models::load_attention_mixer(
             full.attention, loader, config, index,
@@ -167,9 +166,8 @@ Layer load_layer(const ::tyloi::weights::Loader& weights, const Config& config,
         full.ffn_norm = weights.tensor(std::string(tensor_root) + ".block." +
                                        std::to_string(index) + ".mlp.norm.weight");
         full.ffn = tyloi::models::qwen35::load_ffn(loader, config, index, tensor_root);
-        result.weights = std::move(full);
     } else {
-        Linear linear;
+        auto& linear = result.weights.emplace<Linear>();
         linear.attention.key_heads = config.linear_num_key_heads;
         linear.attention.value_heads = config.linear_num_value_heads;
         linear.attention.key_dim = config.linear_key_head_dim;
@@ -183,8 +181,14 @@ Layer load_layer(const ::tyloi::weights::Loader& weights, const Config& config,
         linear.ffn_norm = weights.tensor(prefix + "mlp.norm.weight");
         loader.load_linear_attention(linear.attention, config, index, tensor_root);
         linear.ffn = tyloi::models::qwen35::load_ffn(loader, config, index, tensor_root);
-        result.weights = std::move(linear);
     }
+}
+
+Layer load_layer(const ::tyloi::weights::Loader& weights, const Config& config,
+                 int index, const std::string& type, bool mirror_scalars,
+                 std::string_view tensor_root) {
+    Layer result;
+    load_layer(result, weights, config, index, type, mirror_scalars, tensor_root);
     return result;
 }
 

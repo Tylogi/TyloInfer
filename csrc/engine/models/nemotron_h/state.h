@@ -41,6 +41,8 @@ public:
     void preallocate();
     void commit_speculative();
 #ifdef TYLOINFER_NATIVE_CUDA
+    bool speculating() const noexcept override { return speculative_start >= 0; }
+    std::int64_t confirmed_prefix() const noexcept override { return speculative_confirmed; }
     std::vector<std::pair<tyloi::Device, std::size_t>> growth(
         const tyloi::models::Input& input, const tyloi::models::ForwardOptions& options) const override;
     void rollback_speculative(std::int64_t accepted) override;

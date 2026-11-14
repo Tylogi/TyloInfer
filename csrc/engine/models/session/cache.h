@@ -64,12 +64,13 @@ struct CudaSessionOps {
     }
 
     static void restore(tyloi::models::State& state, const Snapshot& snapshot,
-        const std::function<void()>& drain, tyloi::models::Mtp* mtp);
+        tyloi::models::Mtp* mtp, tyloi::Executor& executor,
+        tyloi::weights::Cache& weights, tyloi::engine::Budget& budget);
 
     template <class State, class Predictor>
     static void restore(
-        State& state, const Snapshot& snapshot, const std::function<void()>& drain,
-        Predictor* mtp) {
+        State& state, const Snapshot& snapshot, Predictor* mtp,
+        const std::function<void()>& drain) {
         // The caller owns the CUDA scope for the entire restore operation.
         if constexpr (requires { restore_session(state, mtp, snapshot, drain); }) {
             restore_session(state, mtp, snapshot, drain);

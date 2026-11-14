@@ -59,6 +59,8 @@ public:
     void set_position_delta(int64_t delta) noexcept { decode_position_delta = delta; }
     void preallocate() {}
 #ifdef TYLOINFER_NATIVE_CUDA
+    bool speculating() const noexcept override { return speculative_start >= 0; }
+    std::int64_t confirmed_prefix() const noexcept override { return speculative_confirmed; }
     void commit_speculative() override;
     std::vector<std::pair<tyloi::Device, std::size_t>> growth(
         const tyloi::models::Input&, const tyloi::models::ForwardOptions&) const override;

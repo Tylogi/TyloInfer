@@ -4,10 +4,7 @@
 #include "engine/backends/cuda/executor/config.h"
 #include "engine/drain.h"
 #include "engine/models/common/components.h"
-#include "engine/models/qwen4_exp/components.h"
-#include "engine/models/qwen4_exp/batch.h"
 #include "engine/models/qwen35/batch_ops.h"
-#include "engine/models/qwen4_exp/ops.h"
 #include "engine/models/nemotron_h/components.h"
 #include "engine/models/common/mtp.h"
 #include "engine/models/common/prompt.h"
@@ -98,14 +95,6 @@ struct Text {
     }
 
     void release_request_resources() noexcept {
-        if constexpr (std::is_same_v<Model, qwen4_exp::Model>) {
-            if (components.mtp) {
-                try {
-                    qwen4_release_decode_graphs(language, state);
-                } catch (...) {
-                }
-            }
-        }
         try {
             graph.invalidate();
         } catch (...) {
@@ -153,37 +142,27 @@ struct Text {
             tyloi::Device(tyloi::kCUDA, load_config.layer_placement.primary_device()));
         if (offload) offload->bind_budget(&*budget);
         if (config.continuous_batch.max_sequences) {
-            if constexpr (std::is_same_v<Model,qwen4_exp::Model>)
-                batching = make_batch(language, weights, *budget, config.continuous_batch,
-                    config.generation.prefill_chunk_size, load_config.cache.pipeline);
-            else {
-                auto batch_config = config.continuous_batch;
-                batch_config.cuda_graph &= model_parallel_cuda_graph_enabled(load_config, root_executor, weights);
-                batching = make_batch(
-                    language, &state, root_executor.fork(model_parallel_primary_device(load_config)),
-                    root_executor.collectives(), root_executor.forward_mode(load_config.layer_placement.primary_device()),
-                    std::move(batch_config),
-                    config.generation.prefill_chunk_size,
-                    ::tyloi::cuda::options::kv_vram_preallocated(),
-                    load_config.dense_cpu_layer_count != 0 ||
-                        !load_config.dsv4_cpu_offload_layers.empty(),
-                    load_config.weights.min_slots);
-            }
+            auto batch_config = config.continuous_batch;
+            batch_config.cuda_graph &= model_parallel_cuda_graph_enabled(load_config, root_executor, weights);
+            batching = make_batch(
+                language, &state, root_executor.fork(model_parallel_primary_device(load_config)),
+                root_executor.collectives(), root_executor.forward_mode(load_config.layer_placement.primary_device()),
+                std::move(batch_config),
+                config.generation.prefill_chunk_size,
+                ::tyloi::cuda::options::kv_vram_preallocated(),
+                load_config.dense_cpu_layer_count != 0 ||
+                    !load_config.dsv4_cpu_offload_layers.empty(),
+                load_config.weights.min_slots);
             batching->bind(*budget);
         }
 #ifdef TYLOINFER_NATIVE_CUDA
         budget->bind(component_predictor(components) != nullptr);
-        if constexpr (std::is_same_v<Model,qwen4_exp::Model>)
-            if(kv)kv->bind_budget(&*budget);
 #endif
         if(const auto bytes=::tyloi::cuda::options::resident_budget_bytes()) {
             SessionCommand command;
             command.kind=SessionCommand::Kind::memory_budget;
             command.bytes=bytes;
             session(command);
-        }
-        if constexpr(std::is_same_v<Model,qwen4_exp::Model>) {
-            qwen4_warmup_decode_graphs(language,state);
         }
         weights.prepare(::tyloi::weights::Cache::Stage::loaded,
             tyloi::Device(tyloi::kCUDA, load_config.layer_placement.primary_device()), source.get());
@@ -201,9 +180,6 @@ struct Text {
         }
     }
     bool can_batch(const EngineRequest& request) const {
-        if constexpr (std::is_same_v<Model,qwen4_exp::Model>)
-            return batching && !request.input.media && request.input.cache_plan.session_id.empty() &&
-                !(request.input.sampling.enable_mtp && components.mtp);
         return batching && batch_compatible(request, cache.persistent_prefix_enabled(), mtp_available());
     }
     void clear_bindings() noexcept {
@@ -222,8 +198,6 @@ struct Text {
         auto change = budget->change(command);
         weights.settle();
         graph.invalidate();
-        if constexpr(std::is_same_v<Model,qwen4_exp::Model>)
-            qwen4_release_decode_graphs(language,state);
         if(batching)batching->release_idle_buffers();
         if(auto* mtp=component_predictor(components))mtp->reset(predictor_state(), 1);
         state.reset(1);

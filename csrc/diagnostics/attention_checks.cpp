@@ -1,5 +1,6 @@
 #include "model_checks.h"
 #include "engine/program.h"
+#include "engine/backends/cuda/executor/config.h"
 #include "engine/backends/cuda/executor/executor.h"
 #include "engine/backends/cuda/native/context.h"
 #include "engine/models/deepseek_v4/model.h"
@@ -126,7 +127,7 @@ int run_attention_decode_check(tyloi::cuda::Program& program, int length, int re
     const int visible_len = sliding ? std::min(length, window) : length;
     const int max_seq = sliding ? window : (length + kv_tile - 1) / kv_tile * kv_tile;
     const int parts = std::min(max_parts, std::max(1, (length + 127) / 128));
-    auto cuda = tyloi::TensorOptions().device(program.executor().device());
+    auto cuda = tyloi::TensorOptions().device(tyloi::Device(tyloi::kCUDA, program.config().layer_placement.primary_device()));
     tyloi::cuda::manual_seed(20260720);
     auto q = tyloi::cuda::randn({B, Hq, 1, D}, cuda.dtype(tyloi::kFloat32));
     work.keep(q);
@@ -226,7 +227,7 @@ int run_gemma4_swa_check(tyloi::cuda::Program& program, int reps) {
     constexpr int Hk = 16;
     constexpr int D = 256;
     const double scale = 1.0 / std::sqrt((double)D);
-    auto cuda = tyloi::TensorOptions().device(program.executor().device());
+    auto cuda = tyloi::TensorOptions().device(tyloi::Device(tyloi::kCUDA, program.config().layer_placement.primary_device()));
     tyloi::cuda::manual_seed(20260721);
 
     struct Shape {
@@ -434,7 +435,7 @@ int run_glm_dsa_check(tyloi::cuda::Program& program, int reps) {
     Work work(program);
     if (reps < 1) throw std::runtime_error("--check-attention-reps must be positive");
     tyloi::cuda::NoGradGuard no_grad;
-    auto cuda = tyloi::TensorOptions().device(program.executor().device());
+    auto cuda = tyloi::TensorOptions().device(tyloi::Device(tyloi::kCUDA, program.config().layer_placement.primary_device()));
     tyloi::cuda::manual_seed(20260722);
 
     {
@@ -735,7 +736,7 @@ int run_dsv4_hc_check(tyloi::cuda::Program& program, int reps) {
         throw std::runtime_error("--check-attention-reps must be positive");
     }
     tyloi::cuda::NoGradGuard no_grad;
-    auto cuda = tyloi::TensorOptions().device(program.executor().device());
+    auto cuda = tyloi::TensorOptions().device(tyloi::Device(tyloi::kCUDA, program.config().layer_placement.primary_device()));
     constexpr int64_t hc = 4;
     constexpr int64_t hidden = 4096;
     constexpr int64_t mix_width = 24;
@@ -885,7 +886,7 @@ int run_dsv4_attention_check(tyloi::cuda::Program& program, int reps) {
         throw std::runtime_error("--check-attention-reps must be positive");
     }
     tyloi::cuda::NoGradGuard no_grad;
-    auto cuda = tyloi::TensorOptions().device(program.executor().device());
+    auto cuda = tyloi::TensorOptions().device(tyloi::Device(tyloi::kCUDA, program.config().layer_placement.primary_device()));
     tyloi::cuda::manual_seed(20260723);
 
     {
@@ -1221,10 +1222,10 @@ int run_dsv4_attention_check(tyloi::cuda::Program& program, int reps) {
         tyloi::cuda::deepseek_v4::PoolState batched, decoded;
         batched.ratio = R; batched.head_dim = ID; batched.overlap = true; batched.cache_quant_mode = 2;
         decoded.ratio = R; decoded.head_dim = ID; decoded.overlap = true; decoded.cache_quant_mode = 2;
-        batched.reset(B, T, program.executor().device().index);
+        batched.reset(B, T, program.config().layer_placement.primary_device());
         work.keep(batched.state_kv); work.keep(batched.state_gate);
         work.keep(batched.previous_kv); work.keep(batched.previous_gate); work.keep(batched.pool);
-        decoded.reset(B, T, program.executor().device().index);
+        decoded.reset(B, T, program.config().layer_placement.primary_device());
         work.keep(decoded.state_kv); work.keep(decoded.state_gate);
         work.keep(decoded.previous_kv); work.keep(decoded.previous_gate); work.keep(decoded.pool);
 

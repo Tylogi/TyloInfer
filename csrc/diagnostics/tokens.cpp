@@ -5,7 +5,6 @@
 #include "engine/backends/cuda/native/env.h"
 #include "engine/backends/cuda/native/profile.h"
 #include "engine/backends/cuda/native/tensor/backend.h"
-#include "engine/generation/decode.h"
 #include "engine/models/causal_model.h"
 #include "engine/models/load.h"
 #include "engine/models/source.h"
@@ -114,10 +113,10 @@ Tensor eager(Step& work,Tensor ids,models::Backbone backbone,bool production_req
         models::DecodeOptions decode;
         decode.projection=models::DecodeOptions::Projection::greedy;
         decode.routed=p.weights().decode()==weights::Cache::Decode::routed;
-        if(auto result=engine::decode(p.model(),p.state(),p.executor(),p.weights(),forward,input,decode)) {
+        if(auto result=p.decode(input,decode)) {
             if(!result->ids)throw std::runtime_error("model decode returned no token IDs");
             auto token=work.keep(std::move(result->ids));
-            return token.device()==p.executor().device() ? token : work.keep(::tyloi::ops::copy(token,p.executor().device()));
+            return token.device()==tyloi::Device(tyloi::kCUDA, p.config().layer_placement.primary_device()) ? token : work.keep(::tyloi::ops::copy(token,tyloi::Device(tyloi::kCUDA, p.config().layer_placement.primary_device())));
         }
     }
     if(backbone==models::Backbone::qwen4_exp && p.state().position()==0 &&
@@ -194,7 +193,7 @@ int generate_diagnostic_tokens(Program& program,Tensor ids,int gen,bool profile,
     auto& profiler=program.executor().profiler();
     struct Restore { CudaProfiler& p; bool enabled,graph; ~Restore(){p.enabled=enabled;p.graph_events=graph;} } restore{profiler,profiler.enabled,profiler.graph_events};
     if(!options.already_warmed)warmup_prefill(program,ids,profile,options.warmup);
-    if(!forced.empty())forced_input=work.keep(::tyloi::ops::tensor(forced,program.executor().device()));
+    if(!forced.empty())forced_input=work.keep(::tyloi::ops::tensor(forced,tyloi::Device(tyloi::kCUDA, program.config().layer_placement.primary_device())));
     std::cout<<"decode_input_mode="<<(forced_input?"forced":"generated")<<"\n";
     profiler.enabled=profile;
     report_source(*source,"prefill_begin"); profiler.reset();
@@ -213,7 +212,7 @@ int generate_diagnostic_tokens(Program& program,Tensor ids,int gen,bool profile,
     if(gen==0)return 0;
     int produced=1;
     bool eos=!stops.empty() && stops.contains(::tyloi::ops::item(next));
-    auto generated=work.keep(::tyloi::ops::empty({gen},TensorOptions().dtype(kInt64).device(program.executor().device())));
+    auto generated=work.keep(::tyloi::ops::empty({gen},TensorOptions().dtype(kInt64).device(tyloi::Device(tyloi::kCUDA, program.config().layer_placement.primary_device()))));
     const auto stream=current_stream().stream();
     TYLOINFER_CUDA_CHECK(cudaMemcpyAsync(generated.dense().data_ptr<std::int64_t>(),next.dense().data_ptr<std::int64_t>(),sizeof(std::int64_t),cudaMemcpyDeviceToDevice,stream));
     const auto* graph_option=env_lookup("TYLOINFER_CUDA_GRAPH");
@@ -238,7 +237,7 @@ int generate_diagnostic_tokens(Program& program,Tensor ids,int gen,bool profile,
     bool measured_first=false,measured_half=false,measured_last=false;
     if(use_graph) {
         auto graph_scope=work.graph->enter();
-        auto options=TensorOptions().dtype(kInt64).device(program.executor().device());
+        auto options=TensorOptions().dtype(kInt64).device(tyloi::Device(tyloi::kCUDA, program.config().layer_placement.primary_device()));
         auto static_input=work.keep(::tyloi::ops::empty({1,1},options));
         auto static_pos=work.keep(::tyloi::ops::empty({1},options));
         auto static_len=work.keep(::tyloi::ops::empty({1},options));
@@ -253,7 +252,7 @@ int generate_diagnostic_tokens(Program& program,Tensor ids,int gen,bool profile,
         auto states=program.state().graph_state();
         work.graph->prepare(states);
         const auto planned=pos+gen;
-        const auto parts=::tyloi::ops::attention_parts(planned,program.executor().device());
+        const auto parts=::tyloi::ops::attention_parts(planned,tyloi::Device(tyloi::kCUDA, program.config().layer_placement.primary_device()));
         auto mode=program.executor().forward_mode(config.layer_placement.primary_device());
         const auto static_forward=[&] {
             models::Input input; input.ids=static_input; input.positions=static_pos; input.lengths=static_len;

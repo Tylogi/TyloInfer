@@ -4,6 +4,7 @@
 #include "engine/metrics.h"
 #include "engine/models/metadata.h"
 #include "engine/models/input.h"
+#include "engine/models/batch.h"
 #include "engine/models/state.h"
 #include "engine/generation/sequence.h"
 
@@ -33,6 +34,11 @@ public:
     virtual bool supports_speculation() const { return false; }
     virtual bool supports_suffix_speculation() const noexcept { return false; }
     virtual Tensor forward(Input input, State& state, const ForwardOptions& options = {}) const = 0;
+    virtual PrefillPlan prefill_plan(const State&, const PrefillOptions&) const { return {}; }
+    virtual StepSequence<Prefill> prefill(Input, State&, const ForwardOptions&, const PrefillOptions&) const { return {}; }
+    virtual StepSequence<Decoded> decode(Input, State&, const ForwardOptions&, const DecodeOptions&) const { return {}; }
+    virtual StepSequence<Decoded> warmup(State&, const DecodeOptions&) const { return {}; }
+    virtual std::unique_ptr<Batch> make_batch(const BatchConfig&) const { return {}; }
 };
 
 } // namespace tyloi::models

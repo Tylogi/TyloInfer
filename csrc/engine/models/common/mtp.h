@@ -8,6 +8,8 @@
 #include "engine/requests/sampling.h"
 
 #include <cstdint>
+#include <algorithm>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 
@@ -43,6 +45,27 @@ struct Mtp {
     virtual bool teacher_forced_prompt_prime() const noexcept = 0;
     virtual bool target_bootstrap_decode() const noexcept = 0;
     virtual bool preserve_output_dtype() const noexcept = 0;
+    virtual std::int64_t prefill_chunk_size(std::int64_t requested) const noexcept {
+        return std::min<std::int64_t>(512, requested);
+    }
+    virtual bool stream_prompt_history(std::int64_t) const { return false; }
+    virtual bool host_prompt_history(std::int64_t tokens, std::size_t available,
+                                     std::size_t raw_row_bytes) const {
+        if (tokens <= 0) return false;
+        const auto rows=std::size_t(tokens);
+        if (raw_row_bytes && rows>std::numeric_limits<std::size_t>::max()/raw_row_bytes) return true;
+        const auto margin=std::size_t(32)<<20;
+        return available<margin || rows*raw_row_bytes>available-margin;
+    }
+    virtual bool bootstrap_before_publication() const { return false; }
+    virtual std::size_t predictor_history_merge_limit() const { return 0; }
+    virtual std::size_t predictor_history_flush_threshold() const { return 512; }
+    virtual std::size_t predictor_parked_history_flush_threshold() const { return 512; }
+    virtual std::size_t prefill_workspace_bytes(std::int64_t) const { return 0; }
+    virtual MtpStep prefill(MtpState& state, const Tensor& hidden, const Tensor& ids,
+                            const Tensor& positions, const ForwardOptions& options) const {
+        return step(state, hidden, ids, positions, options);
+    }
     virtual int maximum_draft_depth() const noexcept {
         return tyloi::engine::mtp::kMaximumDraftDepth;
     }
@@ -59,6 +82,13 @@ struct Mtp {
         return false;
     }
     virtual bool supports_session_state(const MtpState&) const noexcept { return false; }
+    virtual bool session_boundary(std::int64_t target, std::int64_t predictor) const noexcept {
+        return target > 0 && predictor == target - 1;
+    }
+    virtual std::unique_ptr<Restore> prepare_restore(MtpState& state, const MtpSessionState& snapshot) const {
+        if (!state.belongs_to(*this)) throw std::invalid_argument("predictor state belongs to another model");
+        return state.prepare_restore(snapshot);
+    }
     virtual MtpSessionState capture_session_state(
         const MtpState&,
         std::int64_t,

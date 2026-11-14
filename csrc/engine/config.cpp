@@ -162,6 +162,12 @@ ContinuousBatchConfig resolve_batch_config(int capacity, std::int64_t prefill_ch
         throw std::invalid_argument("prefill chunk size must be positive");
     ContinuousBatchConfig config;
     config.max_sequences = static_cast<std::size_t>(capacity);
+    const char* packed = std::getenv("TYLOINFER_BATCH_PACKED_PREFILL");
+    config.packed_prefill = !packed || packed[0] != '0';
+    const auto packed_tokens = environment_uint64("TYLOINFER_BATCH_PACKED_PREFILL_TOKEN_BUDGET", 512);
+    if (packed_tokens < 16 || packed_tokens > 8192)
+        throw std::runtime_error("invalid TYLOINFER_BATCH_PACKED_PREFILL_TOKEN_BUDGET");
+    config.packed_tokens = static_cast<std::int64_t>(packed_tokens);
     config.prefill_token_budget = static_cast<std::int64_t>(std::min<std::uint64_t>(
         environment_uint64("TYLOINFER_CONTINUOUS_BATCH_PREFILL_TOKEN_BUDGET", prefill_chunk_size),
         std::numeric_limits<std::int64_t>::max()));

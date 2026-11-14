@@ -1,6 +1,7 @@
 #include "diagnostics/qwen_mtp.h"
 
 #include "engine/program.h"
+#include "engine/backends/cuda/executor/config.h"
 #include "engine/config.h"
 #include "engine/backends/cuda/executor/executor.h"
 #include "engine/backends/cuda/ops/projection/projection.h"
@@ -85,13 +86,13 @@ int run_qwen35_mtp_check(Program& program) {
     Work w{program};
     auto& model = program.model();
     auto& state = program.state();
-    auto* mtp = model.mtp();
+    auto* mtp = model.predictor();
     auto loader = program.loader();
     const auto* source = dynamic_cast<const ModelSource*>(&loader.source);
     require(source && models::graph(*source).backbone == "qwen3_5" && mtp && state.predictor,
             "Qwen3.5 MTP diagnostic requires a loaded predictor");
     auto& predictor = *state.predictor;
-    const auto device = executor.device();
+    const auto device = tyloi::Device(tyloi::kCUDA, program.config().layer_placement.primary_device());
     const auto mode = executor.forward_mode(device.index);
     models::ForwardOptions options{mode.kv_capacity, mode.trace, mode.trace_layer, device.index};
     auto project = executor.projector(Executor::current_ffn());
@@ -267,15 +268,14 @@ int run_qwen35_mtp_check(Program& program) {
     auto produced = generate(prompt, stochastic, 0); auto stats = program.stats();
     require(produced.size() == 8 && stats.cycles > 0 && total_cycles > 0, "MTP runtime gate did not execute speculative cycles");
     auto counters = state.metrics();
-    require(counters.has_value(), "MTP batching gate found no recurrent layers");
     std::int64_t layers = 0, ffn = 0, projection = 0;
-    for (const auto& [key, value] : *counters) {
+    for (const auto& [key, value] : counters) {
         if (!key.starts_with("linear.") || !key.ends_with(".ffn_batches")) continue;
         const auto projection_key = key.substr(0, key.size() - 11) + "projection_batches";
-        const auto found = std::find_if(counters->begin(), counters->end(), [&](const auto& metric) {
+        const auto found = std::find_if(counters.begin(), counters.end(), [&](const auto& metric) {
             return metric.first == projection_key;
         });
-        require(value > 0 && found != counters->end() && found->second > 0,
+        require(value > 0 && found != counters.end() && found->second > 0,
                 "MTP gate did not exercise full-window recurrent batching");
         ++layers;
         ffn += static_cast<std::int64_t>(value);

@@ -79,6 +79,9 @@ std::size_t Qsa::allocation_bytes(const State& state, std::int64_t batch, std::i
 std::size_t Qsa::exit_growth(const State& state, std::int64_t tokens) const {
     return impl_->core.exit_growth(state.impl_->cache, tokens);
 }
+std::size_t Qsa::graph_exit_growth_bytes(const State& state) const {
+    return impl_->core.graph_exit_growth_bytes(state.impl_->cache);
+}
 std::size_t Qsa::graph_growth_bytes(const State& state, std::int64_t capacity) const {
     return impl_->core.graph_growth_bytes(state.impl_->cache, capacity);
 }

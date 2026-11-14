@@ -87,6 +87,7 @@ set(TYLOINFER_CUDA_ENGINE_SOURCES
     ${PROJECT_SOURCE_DIR}/engine/models/qwen4_exp/session_codec.cpp
     ${PROJECT_SOURCE_DIR}/engine/models/minicpmo45/components.cpp
     ${PROJECT_SOURCE_DIR}/engine/load.cpp
+    ${PROJECT_SOURCE_DIR}/engine/program.cpp
     ${TYLOINFER_CUDA_MODEL_SOURCES}
 )
 add_library(mfq-cuda-engine STATIC

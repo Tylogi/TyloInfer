@@ -1,6 +1,9 @@
 #include "engine/engine.h"
 #include "engine/scheduler/scheduler.h"
 #include "engine/generation/batch.h"
+#include "engine/generation/batch_ops.h"
+#include "engine/state/kv_memory.h"
+#include "engine/state/kv_offload.h"
 #include "engine/generation/generation.h"
 #include "engine/generation/mtp/metrics.h"
 #include "engine/models/common/mtp.h"
@@ -31,10 +34,11 @@ Engine::Engine(std::unique_ptr<models::CausalModel> model, std::unique_ptr<tyloi
         std::unique_ptr<models::State> model_state, std::unique_ptr<state::Sessions> sessions,
         std::unique_ptr<TextProcessor> text, models::ForwardOptions forward,
         std::unique_ptr<tyloi::Executor::Graph> graph, std::unique_ptr<Batch> batch,
-        std::unique_ptr<tyloi::Executor> predictor_execution) {
+        std::unique_ptr<tyloi::Executor> predictor_execution,
+        std::shared_ptr<cuda::KvMemoryManager> kv, std::shared_ptr<cuda::KvOffloadStore> offload) {
     rebind(std::move(model), std::move(executor), std::move(config), std::move(source),
         std::move(memory), std::move(weights), std::move(model_state), std::move(sessions),
-        std::move(text), std::move(forward), std::move(graph), std::move(batch), std::move(predictor_execution));
+        std::move(text), std::move(forward), std::move(graph), std::move(batch), std::move(predictor_execution), std::move(kv), std::move(offload));
     start();
 }
 
@@ -43,8 +47,6 @@ void Engine::install(std::unique_ptr<tyloi::Executor::Graph> graph) {
     // Keep the graph with its Executor even when metadata or scope setup fails.
     graph_.emplace(0, config_.device, std::move(graph));
     try {
-        if (config_.continuous_batch.max_sequences && !batch_)
-            throw std::invalid_argument("continuous batching is unavailable for this model");
         auto* predictor = model_->predictor();
         if (predictor && (!idle_state_ || !idle_state_->predictor || !idle_state_->predictor->belongs_to(*predictor) ||
                           !predictor_execution_ || !model_->supports_speculation()))
@@ -68,6 +70,10 @@ void Engine::install(std::unique_ptr<tyloi::Executor::Graph> graph) {
         tyloi::weights::LoadScope memory_load(*ledger_);
         budget_.emplace(*executor_, *ledger_, *weights_, *cache_, config_.device);
         budget_->bind(predictor != nullptr);
+        if (kv_) kv_->bind_budget(&*budget_);
+        if (offload_) offload_->bind_budget(&*budget_);
+        if (!batch_ && config_.continuous_batch.max_sequences)
+            batch_ = engine::make_batch(*model_, *executor_, *weights_, *budget_, config_);
         if (batch_) batch_->bind(*budget_);
         if (const auto bytes = config_.resident_budget_bytes) {
             engine::SessionCommand command; command.kind = engine::SessionCommand::Kind::memory_budget; command.bytes = bytes;
@@ -77,6 +83,10 @@ void Engine::install(std::unique_ptr<tyloi::Executor::Graph> graph) {
             budget_->reserve(idle_state_->preallocate_growth());
             idle_state_->preallocate();
         }
+        models::DecodeOptions decode;
+        decode.enabled = config_.decode_graph.enabled && weights_->decode() != weights::Cache::Decode::none;
+        decode.routed = weights_->decode() == weights::Cache::Decode::routed;
+        engine::warmup(*model_, *idle_state_, *executor_, *weights_, *budget_, config_.device, decode);
         weights_->prepare(::tyloi::weights::Cache::Stage::loaded, config_.device, source_.get());
         drain();
         ready_ = true;
@@ -95,7 +105,8 @@ void Engine::rebind(std::unique_ptr<models::CausalModel>&& model, std::unique_pt
         std::unique_ptr<models::State>&& model_state, std::unique_ptr<state::Sessions>&& sessions,
         std::unique_ptr<TextProcessor>&& text, models::ForwardOptions forward,
         std::unique_ptr<tyloi::Executor::Graph>&& graph, std::unique_ptr<Batch>&& batch,
-        std::unique_ptr<tyloi::Executor>&& predictor_execution) {
+        std::unique_ptr<tyloi::Executor>&& predictor_execution,
+        std::shared_ptr<cuda::KvMemoryManager>&& kv, std::shared_ptr<cuda::KvOffloadStore>&& offload) {
     if (executor_) unload_model();
     model_ = std::move(model);
     executor_ = std::move(executor);
@@ -105,7 +116,10 @@ void Engine::rebind(std::unique_ptr<models::CausalModel>&& model, std::unique_pt
     source_ = std::move(source);
     ledger_ = std::move(memory);
     weights_ = std::move(weights);
+    kv_ = std::move(kv);
+    offload_ = std::move(offload);
     idle_state_ = std::move(model_state);
+    serial_state_ = idle_state_.get();
     cache_ = std::move(sessions);
     batch_ = std::move(batch);
     text_ = std::move(text);
@@ -171,6 +185,8 @@ void Engine::drain() {
     } catch (...) { failure = std::current_exception(); }
     try { if (weights_) weights_->drain(); }
     catch (...) { if (!failure) failure = std::current_exception(); }
+    try { if (offload_) offload_->flush(); }
+    catch (...) { if (!failure) failure = std::current_exception(); }
     try { executor_->drain(); }
     catch (...) { if (!failure) failure = std::current_exception(); }
     if (failure) std::rethrow_exception(failure);
@@ -188,8 +204,10 @@ void Engine::unload_model() {
         clear_bindings();
         graph_.reset();
         batch_.reset();
+        serial_state_ = nullptr;
         idle_state_.reset();
         if (weights_) weights_->clear_workspace();
+        offload_.reset(); kv_.reset();
         budget_.reset(); cache_.reset();
         model_.reset();
         text_.reset();
@@ -224,8 +242,10 @@ ControlResult Engine::control_command(ControlRequest request) {
         } else if constexpr (std::is_same_v<T, engine::GetMetrics>) {
             Metrics predictor_metrics;
             if (model_->predictor()) mtp::append_generation_metrics(predictor_metrics, mtp_state_.stats);
-            return resource_metrics(model_->metrics(), {}, std::nullopt, false,
-                batch_ ? batch_->metrics() : Metrics{}, {}, std::nullopt, predictor_metrics, source_.get(),
+            return resource_metrics(model_->metrics(), {}, serial_state_ ? std::optional<Metrics>(serial_state_->metrics()) : std::nullopt,
+                model_info_.streamed_kv, batch_ ? batch_->metrics() : Metrics{},
+                kv_ ? kv_->metrics() : Metrics{}, offload_ ? std::optional<Metrics>(offload_->metrics()) : std::nullopt,
+                predictor_metrics, source_.get(),
                 *ledger_, *weights_, *cache_, *budget_,
                 executor_->memory(config_.devices), config_.device, config_.online_budget);
         } else throw std::invalid_argument("model has no duplex component");
@@ -243,6 +263,8 @@ void Engine::execute(const std::vector<RequestId>& eligible) {
 }
 
 void Engine::clear_bindings() noexcept {
+    if (kv_) kv_->bind_budget(nullptr);
+    if (offload_) offload_->bind_budget(nullptr);
     if (budget_) budget_->unbind();
 }
 
@@ -260,8 +282,14 @@ SessionResult Engine::set_budget(const SessionCommand& command) {
     }
     if (ready_) reset_states(1);
     if (idle_state_) {
+        budget_->reserve(idle_state_->graph_exit_growth());
+        idle_state_->release_graphs();
+        budget_->reserve(idle_state_->reset_growth(1));
         idle_state_->reset(1);
-        if (auto* predictor = model_->predictor()) predictor->reset(*idle_state_->predictor, 1);
+        if (auto* predictor = model_->predictor()) {
+            budget_->reserve(predictor->reset_growth(*idle_state_->predictor, 1));
+            predictor->reset(*idle_state_->predictor, 1);
+        }
     }
     return change.apply();
 }

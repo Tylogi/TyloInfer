@@ -166,6 +166,7 @@ public:
     ~ProfileCapture();
     void report(const std::string& name);
     void resume();
+    void suspend();
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

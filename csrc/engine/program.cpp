@@ -187,14 +187,16 @@ struct Program::Impl {
         catch (const std::exception& error) { std::cerr << "program_cleanup error=" << error.what() << '\n'; }
         catch (...) { std::cerr << "program_cleanup error=unknown\n"; }
         batch_driver.reset();
-        budget.reset();
         graph.reset();
-        sessions.reset();
         state.reset();
         layers.reset();
         groups.reset();
         ffn.reset();
         model.reset();
+        if (kv) kv->bind_budget(nullptr);
+        if (offload) offload->bind_budget(nullptr);
+        budget.reset();
+        sessions.reset();
         try { executor->clear(); }
         catch (const std::exception& error) { std::cerr << "program_cleanup error=" << error.what() << '\n'; }
         catch (...) { std::cerr << "program_cleanup error=unknown\n"; }
@@ -329,7 +331,10 @@ void Program::configure(engine::Config config) {
     p.run_ready = false;
     drain();
     auto scope = p.executor->enter(p.config.layer_placement.primary_device());
+    if (p.budget) p.budget->reserve(p.state->graph_exit_growth());
     p.state->release_graphs();
+    if (p.kv) p.kv->bind_budget(nullptr);
+    if (p.offload) p.offload->bind_budget(nullptr);
     p.budget.reset();
     p.graph.reset();
     p.sessions.reset();
@@ -341,14 +346,17 @@ void Program::configure(engine::Config config) {
         (!p.state->predictor || !p.state->predictor->belongs_to(*predictor)))
         throw std::invalid_argument("predictor state is unavailable or belongs to another model");
     internal::configure_generation(runtime, p.config, *p.executor, *p.weights, p.run_info);
+    runtime.device = Device(kCUDA, p.config.layer_placement.primary_device());
     const auto mode = p.executor->forward_mode(p.config.layer_placement.primary_device());
     p.forward = {mode.kv_capacity, mode.trace, mode.trace_layer, mode.primary};
     p.sessions = internal::make_sessions(*p.source, runtime.session_cache, runtime.prefix_cache,
         p.run_info.max_context, p.state->supports_text_session_state(), p.state->supports_paged_text_session_state());
     p.graph.emplace(p.run_info.max_context,
         Device(kCUDA, p.config.layer_placement.primary_device()), p.executor->graph());
-    p.budget.emplace(*p.ledger, *p.weights, *p.sessions, *p.executor);
+    p.budget.emplace(*p.executor, *p.ledger, *p.weights, *p.sessions, runtime.device);
     p.budget->bind(p.model->predictor() != nullptr);
+    if (p.kv) p.kv->bind_budget(&*p.budget);
+    if (p.offload) p.offload->bind_budget(&*p.budget);
     if (runtime.resident_budget_bytes) {
         if (!runtime.online_budget)
             throw std::invalid_argument("online memory budgeting requires a single-device CUDA worker");
@@ -372,6 +380,10 @@ void Program::configure(engine::Config config) {
         }
         (void)change.apply();
     }
+    models::DecodeOptions decode;
+    decode.enabled = runtime.decode_graph.enabled && p.weights->decode() != weights::Cache::Decode::none;
+    decode.routed = p.weights->decode() == weights::Cache::Decode::routed;
+    engine::warmup(*p.model, *p.state, *p.executor, *p.weights, *p.budget, runtime.device, decode);
     p.run_ready = true;
 }
 
@@ -402,8 +414,9 @@ std::unique_ptr<Program::BatchLease> Program::make_batch() {
     p.running = true;
     auto scope = p.executor->enter(p.config.layer_placement.primary_device());
     p.graph->invalidate();
+    p.budget->reserve(p.state->graph_exit_growth());
     p.state->release_graphs();
-    lease->batch_ = engine::make_batch(*p.model, p.state.get(), *p.executor,
+    lease->batch_ = engine::make_batch(*p.model, *p.executor,
         *p.weights, *p.budget, p.run_config);
     return lease;
 }
@@ -416,10 +429,11 @@ engine::BatchDriver& Program::begin_batch(models::BatchConfig config) {
     p.running=true;
     try {
         auto scope=p.executor->enter(p.config.layer_placement.primary_device());
+        p.budget->reserve(p.state->graph_exit_growth());
         p.graph->invalidate();
         p.state->release_graphs();
         p.batch_driver=std::make_unique<engine::BatchDriver>(
-            p.model->batch(config,p.state.get()),*p.executor,*p.weights,*p.budget);
+            p.model->make_batch(config),*p.executor,*p.weights,*p.budget,p.run_config.device);
         p.batch_driver->initialize();
         return *p.batch_driver;
     } catch(...) {
@@ -446,6 +460,7 @@ models::Prefill Program::prefill(models::Input input, std::int64_t compute, engi
     p.running = true;
     models::Prefill result;
     try {
+        auto scope = p.executor->enter(p.config.layer_placement.primary_device());
         result = engine::prefill(*p.model, *p.state, *p.executor, *p.weights,
             *p.budget, p.forward, input, compute, output);
         p.running = false;
@@ -460,6 +475,17 @@ models::Prefill Program::prefill(models::Input input, std::int64_t compute, engi
     }
 }
 
+std::optional<models::Decoded> Program::decode(models::Input input, models::DecodeOptions options) {
+    auto& p = *impl_;
+    if (p.running) throw std::logic_error("program request is already running");
+    if (!p.run_ready) configure(engine::resolve_config());
+    auto scope = p.executor->enter(p.config.layer_placement.primary_device());
+    p.budget->reserve(p.state->graph_exit_growth());
+    options.enabled &= p.weights->decode() != weights::Cache::Decode::none;
+    return engine::decode(*p.model, *p.state, *p.executor, *p.weights, *p.budget,
+        p.forward, std::move(input), options);
+}
+
 StepSequence<engine::EventData> Program::generate(engine::InferenceRequest& request,
         engine::InferenceOutput& output, bool predictor, std::string id) {
     auto& p = *impl_;
@@ -470,7 +496,12 @@ StepSequence<engine::EventData> Program::generate(engine::InferenceRequest& requ
     work.job = engine::generate({*p.model, *p.state, *p.executor, *p.budget, *p.graph, *p.weights,
         *p.sessions, p.run_info, p.run_config, p.forward, p.source.get(), p.mtp_policy,
         predictor ? p.model->predictor() : nullptr}, request, output, std::move(id));
-    while (auto step = work.job.next()) co_yield std::move(step);
+    for (;;) {
+        StepResult<engine::EventData> step;
+        { auto scope = p.executor->enter(p.config.layer_placement.primary_device()); step = work.job.next(); }
+        if (!step) break;
+        co_yield std::move(step);
+    }
     work.complete = true;
 }
 

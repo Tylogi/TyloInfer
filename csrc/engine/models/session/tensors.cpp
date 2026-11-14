@@ -2,6 +2,7 @@
 #include "engine/ops.h"
 
 #include <algorithm>
+#include <limits>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -19,6 +20,34 @@ bool session_tensor_layout_matches(const ::tyloi::Tensor &target,
     for (int64_t i = 0; i < target.dim(); ++i)
         if (target.size(i) != source.size(i)) return false;
     return true;
+}
+
+std::size_t restore_tensor_bytes(const ::tyloi::Tensor& target, const ::tyloi::Tensor& source) {
+    if (!source.defined()) return 0;
+    if (!source.device().is_metal() && session_tensor_layout_matches(target, source)) return 0;
+    return session_tensor_bytes(source);
+}
+
+std::size_t restore_prefix_bytes(const ::tyloi::Tensor& target, const ::tyloi::Tensor& source,
+        std::int64_t dimension, std::int64_t capacity) {
+    if (!source.defined() || source.is_encoded() || dimension < 0 || dimension >= source.dim() ||
+        capacity <= 0 || source.size(dimension) > capacity)
+        throw CudaSessionStateError("session prefix tensor layout is invalid");
+    bool compatible = target.defined() && !source.device().is_metal() &&
+        target.scalar_type() == source.scalar_type() && target.device() == source.device() &&
+        target.dim() == source.dim();
+    std::size_t elements = 1;
+    for (std::int64_t i = 0; i < source.dim(); ++i) {
+        const auto size = i == dimension ? capacity : source.size(i);
+        if (size < 0 || (size && elements > std::numeric_limits<std::size_t>::max() / std::size_t(size)))
+            throw std::overflow_error("session prefix allocation overflow");
+        elements *= std::size_t(size);
+        compatible = compatible && target.size(i) == size;
+    }
+    if (compatible) return 0;
+    if (source.element_size() && elements > std::numeric_limits<std::size_t>::max() / source.element_size())
+        throw std::overflow_error("session prefix allocation overflow");
+    return elements * source.element_size();
 }
 
 ::tyloi::Tensor restore_session_tensor(::tyloi::Tensor target,
@@ -190,4 +219,21 @@ void restore_kv(tyloi::state::KvView &cache, const KvSnapshot &state, int64_t he
     cache.page_table = {};
     cache.page_size = 0;
     cache.pages_per_chunk = 0;
+}
+
+void stage_kv(tyloi::state::KvView& cache, const KvSnapshot& state, int64_t head_dim,
+        ::tyloi::ScalarType dtype, tyloi::state::KvQuantization quantization) {
+    validate_kv(state);
+    if (!state.k.device().is_metal()) {
+        const auto prepare = [&](::tyloi::Tensor& target, const ::tyloi::Tensor& source) {
+            if (!restore_prefix_bytes(target, source, 2, state.capacity)) return;
+            std::vector<std::int64_t> shape;
+            for (std::int64_t i = 0; i < source.dim(); ++i)
+                shape.push_back(i == 2 ? state.capacity : source.size(i));
+            target = tyloi::ops::empty(shape, source.options());
+        };
+        prepare(cache.physical_key, state.k);
+        prepare(cache.physical_value, state.v);
+    }
+    restore_kv(cache, state, head_dim, dtype, quantization);
 }

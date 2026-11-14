@@ -18,10 +18,12 @@ struct LayerState;
 struct Predictor;
 
 struct PredictorState final : tyloi::models::MtpState {
-    explicit PredictorState(const Predictor& owner);
+    explicit PredictorState(const Predictor& owner, bool initialize_layers = true);
     ~PredictorState() override;
     int64_t position() const noexcept override;
+    std::unique_ptr<tyloi::models::Restore> prepare_restore(const MtpSessionState&) override;
 
+    const Predictor& owner;
     std::vector<std::unique_ptr<LayerState>> layer_states;
     std::vector<::tyloi::Tensor> positions;
     std::vector<int64_t> lengths;
@@ -76,6 +78,20 @@ struct Predictor final : tyloi::models::Mtp {
     bool target_bootstrap_decode() const noexcept override;
 
     bool preserve_output_dtype() const noexcept override;
+    std::int64_t prefill_chunk_size(std::int64_t requested) const noexcept override {
+        return std::min<std::int64_t>(1024, requested);
+    }
+    bool stream_prompt_history(std::int64_t tokens) const override;
+    bool host_prompt_history(std::int64_t tokens, std::size_t available,
+                             std::size_t raw_row_bytes) const override;
+    bool bootstrap_before_publication() const override;
+    std::size_t predictor_history_merge_limit() const override { return 128; }
+    std::size_t predictor_history_flush_threshold() const override;
+    std::size_t predictor_parked_history_flush_threshold() const override;
+    std::size_t prefill_workspace_bytes(std::int64_t tokens) const override;
+    tyloi::models::MtpStep prefill(tyloi::models::MtpState&, const tyloi::Tensor& hidden,
+        const tyloi::Tensor& ids, const tyloi::Tensor& positions,
+        const tyloi::models::ForwardOptions& options) const override;
     std::unique_ptr<tyloi::engine::mtp::DepthPolicy> depth_policy(
         int maximum_depth, tyloi::engine::mtp::PolicyState& state) const override;
     bool supports_session_state(const tyloi::models::MtpState&) const noexcept override;

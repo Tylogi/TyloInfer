@@ -21,6 +21,7 @@
 
 namespace tyloi::models { class CausalModel; class State; }
 namespace tyloi { class ModelSource; }
+namespace tyloi::cuda { class KvMemoryManager; class KvOffloadStore; }
 namespace tyloi::weights { class Memory; class Cache; }
 namespace tyloi::state { class Sessions; }
 
@@ -55,7 +56,8 @@ public:
         std::unique_ptr<models::State> model_state, std::unique_ptr<state::Sessions> sessions,
         std::unique_ptr<TextProcessor> text, models::ForwardOptions forward,
         std::unique_ptr<tyloi::Executor::Graph> graph, std::unique_ptr<Batch> batch = {},
-        std::unique_ptr<tyloi::Executor> predictor_execution = {});
+        std::unique_ptr<tyloi::Executor> predictor_execution = {},
+        std::shared_ptr<cuda::KvMemoryManager> kv = {}, std::shared_ptr<cuda::KvOffloadStore> offload = {});
     // Retire active requests first. Failed retirement leaves incoming owners with the caller.
     void rebind(std::unique_ptr<models::CausalModel>&& model, std::unique_ptr<tyloi::Executor>&& executor,
         Config config, std::shared_ptr<const ModelSource>&& source,
@@ -63,7 +65,8 @@ public:
         std::unique_ptr<models::State>&& model_state, std::unique_ptr<state::Sessions>&& sessions,
         std::unique_ptr<TextProcessor>&& text, models::ForwardOptions forward,
         std::unique_ptr<tyloi::Executor::Graph>&& graph, std::unique_ptr<Batch>&& batch = {},
-        std::unique_ptr<tyloi::Executor>&& predictor_execution = {});
+        std::unique_ptr<tyloi::Executor>&& predictor_execution = {},
+        std::shared_ptr<cuda::KvMemoryManager>&& kv = {}, std::shared_ptr<cuda::KvOffloadStore>&& offload = {});
     // Start one consumer before enable_reload(); next_reload() delivers posted work before shutdown.
     // Complete reply only after binding and its execution scopes have exited.
     struct Reload { std::int64_t context; std::promise<void> reply; };
@@ -129,7 +132,11 @@ private:
     std::shared_ptr<const ModelSource> source_;
     std::shared_ptr<weights::Memory> ledger_;
     std::unique_ptr<weights::Cache> weights_;
+    std::shared_ptr<cuda::KvMemoryManager> kv_;
+    std::shared_ptr<cuda::KvOffloadStore> offload_;
     std::unique_ptr<models::State> idle_state_;
+    // Requests temporarily hold idle_state_; this borrow keeps telemetry available during generation.
+    models::State* serial_state_ = nullptr;
     models::ForwardOptions forward_options_{};
     models::Info model_info_{};
     std::optional<Decode> graph_;

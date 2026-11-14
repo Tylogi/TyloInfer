@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -20,6 +21,7 @@ struct MfqModelCapabilities {
 namespace tyloi::models {
 
 enum class GraphWeights { native, resident };
+enum class GraphOwner { executor, model };
 
 struct Info {
     std::int64_t vocab_size;
@@ -31,6 +33,8 @@ struct Info {
     bool separate_projections = false;
     GraphWeights graph_weights = GraphWeights::resident;
     bool streamed_kv = false;
+    GraphOwner graph = GraphOwner::executor;
+    std::size_t raw_row_bytes = 0;
 };
 
 struct CausalLmMetadata {

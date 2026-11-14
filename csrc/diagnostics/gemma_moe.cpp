@@ -1,5 +1,6 @@
 #include "diagnostics/gemma_moe.h"
 #include "engine/program.h"
+#include "engine/backends/cuda/executor/config.h"
 #include "engine/models/gemma4/config.h"
 #include "engine/backends/cuda/executor/executor.h"
 #include "engine/backends/cuda/ops/projection/projection.h"
@@ -142,7 +143,7 @@ int run_gemma_moe_check(tyloi::cuda::Program& program,
             [](int64_t value) { return value < 1 || value > 4096; }))
         throw std::runtime_error("--check-moe-tokens values must be in [1, 4096]");
     auto& executor = program.executor();
-    const auto device = executor.device();
+    const auto device = tyloi::Device(tyloi::kCUDA, program.config().layer_placement.primary_device());
     auto scope = executor.enter();
     const MfqCudaGuard guard(device.index);
     auto loader = program.loader();

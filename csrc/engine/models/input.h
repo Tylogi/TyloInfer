@@ -4,7 +4,9 @@
 #include "engine/ops.h"
 
 #include <cstdint>
+#include <chrono>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -24,6 +26,7 @@ struct Input {
     std::int64_t attention_parts = 0;
     // Draft rows for an already-started speculative suffix transaction.
     bool suffix = false;
+    Tensor host_ids, image_mask;
 
     std::pair<std::int64_t, std::int64_t> shape() const {
         std::int64_t batch = 0, tokens = 0;
@@ -39,6 +42,43 @@ struct Input {
             throw std::invalid_argument("model input batch and token dimensions must agree and be positive");
         return {batch, tokens};
     }
+};
+
+struct PrefillOptions {
+    std::int64_t tokens = 0, compute = 0, first = 0, last = 0;
+    bool transformed = false, retained = false, routed = false, coordinated = false, split = false;
+    bool raw_host = false;
+};
+
+struct PrefillPlan { bool layered = false; std::int64_t max_span = 0; };
+
+struct Prefill {
+    enum class Phase { progress, computed, encode, decode, complete };
+    enum class Mode { ordinary, layered, windows };
+    struct Progress {
+        Device device;
+        std::int64_t tokens = 0, chunk = 0, completed = 0, total = 0;
+        std::chrono::steady_clock::time_point started;
+    };
+    Phase phase = Phase::complete;
+    Mode mode = Mode::ordinary;
+    Tensor hidden, raw;
+    double elapsed_ms = 0;
+    int first = 0, last = 0;
+    std::optional<Progress> progress;
+};
+
+struct DecodeOptions {
+    enum class Projection { hidden_only, hidden, logits, greedy };
+    Projection projection = Projection::hidden_only;
+    bool routed = false, compact_sampling = false, enabled = true;
+    std::int64_t reserve_until = 0;
+};
+
+struct Decoded {
+    Tensor hidden, raw, logits, compact, ids;
+    std::vector<std::int32_t> tokens;
+    bool initialized = false;
 };
 
 struct ForwardOptions {

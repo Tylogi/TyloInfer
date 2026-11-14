@@ -102,7 +102,7 @@ public:
     /** Prepare an eligible graph layout without executing the numerical step. */
     virtual tyloi::StepSequence<std::unique_ptr<Plan>> plan(std::span<const BatchRow> rows, bool greedy) = 0;
     /** Execute an admitted graph, returning no result when ordinary decode is required. */
-    virtual std::optional<Tensor> capture(std::span<const BatchRow> rows,
+    virtual StepSequence<std::optional<Tensor>> capture(std::span<const BatchRow> rows,
         const Tensor& ids, const Tensor& host_ids, bool greedy, const Plan& plan) = 0;
     /** Retire graphs before releasing or changing request backing. */
     virtual void clear() = 0;

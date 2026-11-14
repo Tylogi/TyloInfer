@@ -1,5 +1,6 @@
 #include "model_checks.h"
 #include "engine/program.h"
+#include "engine/backends/cuda/executor/config.h"
 #include "engine/backends/cuda/executor/executor.h"
 #include "engine/backends/cuda/native/tensor/backend.h"
 #include "engine/models/deepseek_v4/model.h"
@@ -41,7 +42,7 @@ bool same(const tyloi::Tensor& value, const tyloi::Tensor& saved) {
 } // namespace
 
 int run_text_session_state_check(tyloi::cuda::Program& program) {
-    const auto device = program.executor().device();
+    const auto device = tyloi::Device(tyloi::kCUDA, program.config().layer_placement.primary_device());
     auto cuda_float = tyloi::TensorOptions().device(device).dtype(tyloi::kFloat32);
     Work work{program};
     const auto values = [&](std::vector<int64_t> shape, tyloi::ScalarType dtype, float offset) {

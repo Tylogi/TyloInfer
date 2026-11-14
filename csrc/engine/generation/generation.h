@@ -92,14 +92,15 @@ Generation generate_session(Ops& ops, InferenceRequest& request, InferenceOutput
     if constexpr(requires { ops.set_prefix_boundary(size_t{}); })
         ops.set_prefix_boundary(prefix_boundary);
     typename Ops::Restore restored;
-    if (caching)
-        restored = session_cache.restore_best(state,
-            ops.drain,
-            use_mtp ? mtp : nullptr,
-            cache_plan.session_id,
-            prompt,
-            plan.stable_prefix_tokens,
-            input_key);
+    if (caching) {
+        if constexpr (requires { ops.restore_best(state, use_mtp ? mtp : nullptr, cache_plan.session_id,
+                                                 prompt, plan.stable_prefix_tokens, input_key); })
+            restored = ops.restore_best(state, use_mtp ? mtp : nullptr, cache_plan.session_id,
+                prompt, plan.stable_prefix_tokens, input_key);
+        else
+            restored = session_cache.restore_best(state, ops.drain, use_mtp ? mtp : nullptr,
+                cache_plan.session_id, prompt, plan.stable_prefix_tokens, input_key);
+    }
     if (restored.tokens || use_mtp)
         ops.invalidate_plan();
     if (!restored.tokens) ops.reset();

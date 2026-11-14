@@ -27,8 +27,6 @@ public:
     /** Plan new KV backing for the next predictor operation. */
     std::vector<std::pair<tyloi::Device, std::size_t>> growth(
         int64_t batch, int64_t tokens, int64_t capacity) const;
-    /** Validate and retain an independent predictor restore candidate. */
-    std::unique_ptr<tyloi::models::Restore> prepare_restore(const MtpSessionState& saved);
     void prepare(int64_t batch, int64_t tokens, int64_t kl_capacity = 0);
     void reset(int64_t batch);
     void advance(int64_t tokens);

@@ -12,7 +12,6 @@
 
 namespace tyloi::weights { struct Loader; }
 namespace tyloi::models { struct LoadOptions; }
-namespace tyloi::cuda { class Projector; class Collectives; class Executor; }
 
 namespace tyloi::cuda::qwen4_exp {
 
@@ -29,20 +28,12 @@ struct Components {
     /** Prepare supported media using the request's cache and model weights. */
     tyloi::StepSequence<tyloi::models::Prepared> prepare(
         const Model& language, tyloi::cache::Media& images,
-#ifndef TYLOINFER_NATIVE_CUDA
-        Projector, Collectives&,
-#endif
         int primary,
-#ifndef TYLOINFER_NATIVE_CUDA
-        Executor*,
-#endif
-        const std::vector<int64_t>& tokens, const MfqMultimodalInput& media)
-        const
-        ;
+        const std::vector<int64_t>& tokens, const MfqMultimodalInput& media) const;
 };
 
 /** Load supported optional components using the model's configuration. */
-Components load_components(Model& model, const tyloi::weights::Loader& weights,
+void load_components(Components& result, Model& model, const tyloi::weights::Loader& weights,
     bool load_optional_components, const tyloi::models::LoadOptions& options);
 
 } // namespace tyloi::cuda::qwen4_exp

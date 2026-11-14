@@ -38,9 +38,10 @@ void restore(models::State& state, const TextSessionState& snapshot, Executor& e
                 throw std::invalid_argument("joint predictor session state is incompatible");
         }
         target = state.prepare_restore(held);
+        if (!target) throw std::invalid_argument("text session restore is unsupported");
         if (mtp) {
             predictor = mtp->prepare_restore(*state.predictor, *held.mtp);
-            if (!target || !predictor)
+            if (!predictor)
                 throw std::invalid_argument("joint predictor session restore is unsupported");
         }
         std::vector<std::pair<Device, std::size_t>> growth;
@@ -56,16 +57,14 @@ void restore(models::State& state, const TextSessionState& snapshot, Executor& e
                 }
             }
         };
-        merge(target ? target->growth() : state.restore_growth(held));
+        merge(target->growth());
         if (predictor) merge(predictor->growth());
-        for (const auto& [device, bytes] : growth)
-            if (bytes) budget.reserve_kv(device, engine::prefill_budget_add(bytes, std::size_t(64) << 20));
+        budget.reserve(growth);
         drain(executor, weights);
-        if (target) target->stage();
-        else state.restore_text_session_state(held);
+        target->stage();
         if (predictor) predictor->stage();
         drain(executor, weights);
-        if (target) target->publish();
+        target->publish();
         if (predictor) predictor->publish();
     } catch (...) {
         const auto error = std::current_exception();

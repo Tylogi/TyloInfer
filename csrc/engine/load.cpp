@@ -1,5 +1,6 @@
 #include "engine/models/plan.h"
 #include "engine/load.h"
+#include "engine/program.h"
 #include "engine/ops.h"
 #include "engine/models/load.h"
 #include "engine/models/load_internal.h"
@@ -54,7 +55,6 @@ using State = std::variant<
     std::unique_ptr<Text<minicpmo45::Model, minicpmo45::State, std::monostate>>,
     std::unique_ptr<Text<glm_dsa::Model, glm_dsa::State, std::monostate>>,
     std::unique_ptr<Text<glm5_next::Model, glm5_next::State, std::unique_ptr<tyloi::models::Mtp>>>,
-    std::unique_ptr<Text<qwen4_exp::Model, qwen4_exp::State, qwen4_exp::Components>>,
     std::unique_ptr<Text<deepseek_v4::Model, deepseek_v4::State, std::monostate>>,
     std::unique_ptr<Text<deepseek_v41::Model, deepseek_v41::State, std::unique_ptr<tyloi::models::Mtp>>>,
     std::unique_ptr<Text<nemotron_h::Model, nemotron_h::State, nemotron_h::Components>>>;
@@ -76,7 +76,7 @@ std::unique_ptr<engine::Engine> load_cuda_engine(CudaEngineOptions options) {
     const auto backbone = ::tyloi::models::backbone(tyloi::models::graph(*source).backbone);
     source.reset();
 #ifdef TYLOINFER_NATIVE_CUDA
-    if (backbone == ::tyloi::models::Backbone::gemma4) {
+    if (backbone == ::tyloi::models::Backbone::gemma4 || backbone == ::tyloi::models::Backbone::qwen4_exp) {
         return load_native_engine(std::move(options), nullptr);
     }
 #endif
@@ -127,38 +127,22 @@ std::unique_ptr<engine::Engine> load_native_engine(CudaEngineOptions options, en
         {
             auto outer_scope = root->enter(load.layer_placement.primary_device());
             internal::setup_cuda_load(options, load, *root, *weights, kv, offload);
-            if (!load.dsv4_cpu_offload_layers.empty())
-                throw std::invalid_argument("Gemma4 does not support --cpu-offload-layers");
             root->set_primary(load.layer_placement.primary_device());
             root->profiler().enabled = false;
             ledger = std::make_shared<tyloi::weights::Memory>();
             tyloi::weights::LoadScope memory_load(*ledger);
             config = internal::resolve_cuda_config(options);
             config.preallocate_kv = ::tyloi::cuda::options::kv_vram_preallocated();
-            if (config.continuous_batch.max_sequences)
-                throw std::invalid_argument("continuous batching is unavailable for this model");
-            const auto kv_options = ::tyloi::cuda::options::qsa_kv_offload();
-            if (kv_options.gpu_budget_bytes)
-                throw std::invalid_argument("CUDA streamed KV requires a QSA model");
-            kv = std::make_shared<KvMemoryManager>();
+            internal::configure_model_kv(kv, offload);
             root->configure_kv(kv, offload);
             {
                 auto scope = root->enter(load.layer_placement.primary_device());
                 source = tyloi::open_model_source(options.model_path);
-                auto definition = models::config_json(*source, options.config_path);
-                definition = configure_yarn(load.yarn, load.yarn_context_extension,
-                    std::move(definition), models::graph(*source).backbone, options.context_size);
-                auto loader = weights->loader(*source, load.weights,
-                    {load.layer_placement.primary_device(), false, load.drop_file_cache,
-                     load.tensor_parallel, moe_parallel_config(load)});
-                load.dense_cpu_layer_count = 0;
-                model = models::load(source, definition, loader, load.layer_placement,
-                    {.context = options.context_size, .gpu_layers = load.n_gpu_layers,
-                     .expert_parallel = load.expert_parallel.enabled(),
-                     .recurrent_transposed = root->mode().transposed,
-                     .vision_resident = ::tyloi::cuda::options::vision_resident(),
-                     .mirror_scalars = load.tensor_parallel_mirror_linear_attention_scalars,
-                     .yarn = load.yarn});
+                internal::load_model(model, options, load, *root, *weights, source, true);
+                load.dense_cpu_layer_count = load.n_gpu_layers >= 0
+                    ? static_cast<int>(std::max<std::int64_t>(models::graph(*source).topology.text_layers - load.n_gpu_layers, 0)) : 0;
+                if (offload && !model->info().streamed_kv)
+                    throw std::invalid_argument("CUDA streamed KV requires a QSA model");
                 if (model->predictor())
                     predictor_execution = root->fork(load.layer_placement.primary_device());
                 state = model->make_state();
@@ -175,7 +159,8 @@ std::unique_ptr<engine::Engine> load_native_engine(CudaEngineOptions options, en
                     }
                 }
                 finish_load(kv.get(), *weights, load.report_cuda_memory, pending_kv);
-                if (offload) throw std::invalid_argument("CUDA streamed KV requires a QSA model");
+                if (offload && !model->info().streamed_kv)
+                    throw std::invalid_argument("CUDA streamed KV requires a QSA model");
             }
             graph = root->graph();
             sessions = internal::make_sessions(*source, config.session_cache, config.prefix_cache,
@@ -188,27 +173,24 @@ std::unique_ptr<engine::Engine> load_native_engine(CudaEngineOptions options, en
         config.devices = cuda_devices(load);
         config.online_budget = load.layer_placement.devices.size() <= 1 &&
             !load.tensor_parallel.enabled() && !load.expert_parallel.enabled();
-        const bool graph_allowed = !root->attention_options().kernels.decode_aten && load.dense_cpu_layer_count == 0 &&
-            model_parallel_cuda_graph_enabled(load, *root, *weights) &&
-            weights->graph_safe(tyloi::weights::Cache::Graph::native, moe_parallel_config(load).enabled());
+        internal::configure_generation(config, load, *root, *weights, model->info());
         const auto model_info = model->info();
         const auto vocab_size = static_cast<std::int32_t>(model_info.vocab_size);
         auto text = engine::TextProcessor::load(*source, options.tokenizer_model, vocab_size, model_info.model_type);
         config.stop_token_ids = models::stop_token_ids(models::config_json(*source, options.config_path), vocab_size);
         config.resident_budget_bytes = ::tyloi::cuda::options::resident_budget_bytes();
-        config.decode_graph.enabled &= graph_allowed;
         models::ForwardOptions forward{mode.kv_capacity, mode.trace, mode.trace_layer, mode.primary, mode.ffn.batch_serial};
         execution = std::move(root);
         if (target) {
             target->rebind(std::move(model), std::move(execution), std::move(config), std::move(source),
                 std::move(ledger), std::move(weights), std::move(state), std::move(sessions),
-                std::move(text), forward, std::move(graph), {}, std::move(predictor_execution));
+                std::move(text), forward, std::move(graph), {}, std::move(predictor_execution), std::move(kv), std::move(offload));
             return {};
         }
         return std::make_unique<engine::Engine>(std::move(model), std::move(execution), std::move(config),
             std::move(source), std::move(ledger), std::move(weights), std::move(state),
             std::move(sessions), std::move(text), forward, std::move(graph),
-            std::unique_ptr<engine::Batch>{}, std::move(predictor_execution));
+            std::unique_ptr<engine::Batch>{}, std::move(predictor_execution), std::move(kv), std::move(offload));
     } catch (...) {
         const auto failure = std::current_exception();
         auto* owner = execution ? execution.get() : root.get();

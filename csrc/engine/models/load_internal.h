@@ -6,8 +6,6 @@
 #include "engine/backends/cuda/executor/config.h"
 #include "engine/models/deepseek_v41/load.h"
 #include "engine/models/common/components.h"
-#include "engine/models/qwen4_exp/components.h"
-#include "engine/models/qwen4_exp/ops.h"
 #include "engine/models/glm5_next/components.h"
 #include "engine/models/deepseek_v41/components.h"
 #include "engine/models/nemotron_h/components.h"
@@ -62,8 +60,6 @@ inline constexpr auto with_model = []<typename F>(
                       std::unique_ptr<tyloi::Executor> predictor_execution = {}) {
         auto& model = *owner;
         using Model = std::remove_cvref_t<decltype(model)>;
-        if constexpr(std::is_same_v<Model,qwen4_exp::Model>)
-            Executor::prepare(model.metadata.vocab_size);
         if (auto* predictor = component_predictor(components)) {
             if constexpr (requires { state->predictor; })
                 state->predictor = predictor->make_state();
@@ -72,8 +68,6 @@ inline constexpr auto with_model = []<typename F>(
         }
         tyloi::cuda::finalize_kv(kv.get(), cache, offload);
         root.configure_kv(kv, offload);
-        if constexpr (std::is_same_v<Model, qwen4_exp::Model>)
-            state->bind_resources(cache, config.cache.pipeline, model_parallel_enabled(config));
         const auto loaded_at = tyloi::cuda::finish_load(
             kv.get(), cache, config.report_cuda_memory);
         return run(owner, state, executor, components, started, loaded_at, source, std::move(predictor_execution));
@@ -210,31 +204,6 @@ inline constexpr auto with_model = []<typename F>(
             auto components = glm5_next::load_components(*owner, weights, load_optional_components);
             return finish(owner, state, executor, components, started);
         }
-        case ::tyloi::models::Backbone::qwen4_exp: {
-            auto started = std::chrono::steady_clock::now();
-            auto definition = tyloi::models::config_json(*source, options.config_path);
-            definition = configure_yarn(config.yarn, config.yarn_context_extension,
-                std::move(definition), tyloi::models::graph(*source).backbone, options.context_size);
-            auto owner = std::make_shared<qwen4_exp::Model>();
-            qwen4_exp::read(*owner, source, definition, options.context_size);
-            auto weights = cache.loader(*source, config.weights,
-                {config.layer_placement.primary_device(), false, config.drop_file_cache,
-                 config.tensor_parallel, moe_parallel_config(config)});
-            const tyloi::models::LoadOptions policy{
-                .context = options.context_size, .gpu_layers = config.n_gpu_layers,
-                .expert_parallel = config.expert_parallel.enabled(),
-                .recurrent_transposed = root.mode().transposed,
-                .vision_resident = ::tyloi::cuda::options::vision_resident(), .yarn = config.yarn};
-            qwen4_exp::load(*owner, weights, config.layer_placement, policy, true);
-            config.dense_cpu_layer_count = config.n_gpu_layers >= 0
-                ? static_cast<int>(std::max<int64_t>(owner->num_hidden_layers() - config.n_gpu_layers, 0)) : 0;
-            auto components = qwen4_exp::load_components(*owner, weights,
-                load_optional_components, policy);
-            auto state = std::unique_ptr<qwen4_exp::State>(static_cast<qwen4_exp::State*>(
-                owner->make_state().release()));
-            auto executor = root.fork(model_parallel_primary_device(config));
-            return finish(owner, state, executor, components, started);
-        }
         case ::tyloi::models::Backbone::deepseek_v4: {
             auto started = std::chrono::steady_clock::now();
             auto definition = tyloi::models::config_json(*source, options.config_path);
@@ -307,6 +276,7 @@ inline constexpr auto with_model = []<typename F>(
             return finish(owner, state, executor, components, started);
         }
         case ::tyloi::models::Backbone::unsupported:
+        default:
             throw std::runtime_error("unsupported CUDA model backbone");
     }
     throw std::runtime_error("invalid CUDA model backbone");

@@ -200,6 +200,20 @@ class QsaCore {
         const auto index = multiply(std::size_t(c_.index_width), request.index.storage().element_size());
         return multiply(multiply(std::size_t(start + tokens), add(kv, index)), 2);
     }
+    std::size_t graph_exit_growth_bytes(const State& request) const {
+        if (!request.graph_keys.defined() || managed_memory(request)) return 0;
+        const auto multiply = [](std::size_t a, std::size_t b) {
+            if (b && a > std::numeric_limits<std::size_t>::max() / b)
+                throw std::overflow_error("QSA graph exit size overflow");
+            return a * b;
+        };
+        const auto key = multiply(std::size_t(key_width()), request.graph_keys.element_size());
+        const auto value = multiply(std::size_t(value_width()), request.graph_values.element_size());
+        if (key > std::numeric_limits<std::size_t>::max() - value)
+            throw std::overflow_error("QSA graph exit size overflow");
+        return multiply(multiply(multiply(std::size_t(request.graph_keys.size(0)),
+            std::size_t(position(request))), std::size_t(c_.kv_heads)), key + value);
+    }
     std::size_t graph_growth_bytes(const State& request,int64_t capacity) const {
         if(managed_memory(request))return request.memory->growth_bytes(capacity);
         if (request.graph_keys.defined()) return 0;

@@ -103,6 +103,94 @@ void restore_layer_session(
     }
 }
 
+void add_session_growth(std::vector<std::pair<tyloi::Device, std::size_t>>& growth,
+        tyloi::Device device, std::size_t bytes) {
+    if (!bytes) return;
+    auto entry = std::find_if(growth.begin(), growth.end(),
+        [device](const auto& value) { return value.first == device; });
+    if (entry == growth.end()) growth.emplace_back(device, bytes);
+    else {
+        if (entry->second > std::numeric_limits<std::size_t>::max() - bytes)
+            throw std::overflow_error("Qwen4 session allocation size overflow");
+        entry->second += bytes;
+    }
+}
+
+void stage_session_tensor(::tyloi::Tensor& target, const ::tyloi::Tensor& source) {
+    target = tyloi::ops::empty(source.dense().sizes(), source.options());
+    tyloi::ops::copy_into(target, source);
+}
+
+void validate_layer_session(const Layer& layer, const LayerState& current,
+        const tyloi::models::qwen4_exp::LayerSnapshot& saved, std::int64_t position) {
+    const auto device = layer.cpu_offloaded ? tyloi::Device(tyloi::kCPU)
+                                           : tyloi::Device(tyloi::kCUDA, layer.cuda_device);
+    const auto& c = layer.config;
+    const auto tensor = [&](const ::tyloi::Tensor& value, const std::vector<int64_t>& shape) {
+        return value.defined() && value.representation<DenseTensor>() && value.device() == device &&
+            value.scalar_type() == tyloi::kFloat32 && value.dense().sizes().vec() == shape;
+    };
+    if (layer.qsa) {
+        try {
+            layer.qsa->validate_session(*current.qsa, {saved.keys, saved.values, saved.index},
+                position, device);
+        } catch (const std::exception&) {
+            throw CudaSessionStateError("incompatible Qwen4 QSA session state");
+        }
+    } else if (saved.keys || saved.values || saved.index) {
+        throw CudaSessionStateError("unexpected Qwen4 QSA session state");
+    }
+    if (layer.gdn) {
+        if (!tensor(saved.convolution, {1, c.kernel - 1, (2 * c.key_heads + c.value_heads) * c.linear_width}) ||
+            !tensor(saved.recurrent, {1, c.value_heads, c.linear_width, c.linear_width}))
+            throw CudaSessionStateError("incompatible Qwen4 GDN session state");
+    } else if (saved.convolution || saved.recurrent) {
+        throw CudaSessionStateError("unexpected Qwen4 GDN session state");
+    }
+    if (layer.ple) {
+        if (!tensor(saved.ple_convolution, {1, (c.ple_kernel - 1) * c.ngram, c.streams * c.hidden}) ||
+            saved.ple_batch != 1 || saved.ple_tokens.size() != std::size_t(c.ngram - 1))
+            throw CudaSessionStateError("incompatible Qwen4 PLE session state");
+    } else if (saved.ple_convolution || saved.ple_batch || !saved.ple_tokens.empty()) {
+        throw CudaSessionStateError("unexpected Qwen4 PLE session state");
+    }
+}
+
+std::size_t layer_session_growth(const Layer& layer, const LayerState& current,
+        const tyloi::models::qwen4_exp::LayerSnapshot& saved, std::int64_t position) {
+    std::size_t bytes = layer.qsa ? layer.qsa->fresh_session_growth(*current.qsa, position) : 0;
+    for (const auto* tensor : {&saved.convolution, &saved.recurrent, &saved.ple_convolution}) {
+        const auto next = session_tensor_bytes(*tensor);
+        if (bytes > std::numeric_limits<std::size_t>::max() - next)
+            throw std::overflow_error("Qwen4 session allocation size overflow");
+        bytes += next;
+    }
+    return bytes;
+}
+
+void stage_layer_session(const Layer& layer, LayerState& target,
+        const tyloi::models::qwen4_exp::LayerSnapshot& saved, std::int64_t position) {
+    const auto device = layer.cpu_offloaded ? tyloi::Device(tyloi::kCPU)
+                                           : tyloi::Device(tyloi::kCUDA, layer.cuda_device);
+    tyloi::ops::DeviceScope scope(device);
+    if (layer.qsa)
+        layer.qsa->stage_session(*target.qsa, {saved.keys, saved.values, saved.index}, position);
+    if (layer.gdn) {
+        stage_session_tensor(target.gdn.conv, saved.convolution);
+        stage_session_tensor(target.gdn.recurrent, saved.recurrent);
+    }
+    if (layer.ple) {
+#ifdef TYLOINFER_NATIVE_CUDA
+        stage_session_tensor(target.ple.conv, saved.ple_convolution);
+#else
+        target.ple.conv = tyloi::ops::empty(saved.ple_convolution.dense().sizes(),
+                                           saved.ple_convolution.options()).dense();
+        tyloi::ops::copy_into(::tyloi::Tensor(target.ple.conv), saved.ple_convolution);
+#endif
+        layer.ple->restore_graph_context(target.ple, {saved.ple_batch, saved.ple_tokens});
+    }
+}
+
 tyloi::models::SnapshotSize snapshot_size(const State& state,const tyloi::models::Mtp* mtp) {
     const auto& model = state.model_;
     std::size_t bytes=session_tensor_bytes(state.positions);
@@ -127,6 +215,26 @@ tyloi::models::SnapshotSize snapshot_size(const State& state,const tyloi::models
     }
     // Transposed graph KV can temporarily require a contiguous copy of the checkpoint.
     return {bytes, bytes * 2};
+}
+
+std::vector<std::pair<tyloi::Device, std::size_t>> State::graph_exit_growth() const {
+    std::vector<std::pair<tyloi::Device, std::size_t>> growth;
+    for (std::size_t i = 0; i < layers.size(); ++i) {
+        const auto& block = *model_.layers[i];
+        if (!block.qsa) continue;
+        const auto bytes = block.qsa->graph_exit_growth_bytes(*layers[i]->qsa);
+        if (!bytes) continue;
+        const auto device = tyloi::Device(tyloi::kCUDA, block.cuda_device);
+        auto entry = std::find_if(growth.begin(), growth.end(),
+            [device](const auto& value) { return value.first == device; });
+        if (entry == growth.end()) growth.emplace_back(device, bytes);
+        else {
+            if (entry->second > std::numeric_limits<std::size_t>::max() - bytes)
+                throw std::overflow_error("Qwen4 graph exit size overflow");
+            entry->second += bytes;
+        }
+    }
+    return growth;
 }
 
 std::vector<std::pair<tyloi::Device, std::size_t>> State::growth(
@@ -348,6 +456,7 @@ TextSessionState State::capture_text_session_state(const std::vector<std::int64_
     TextSessionState state;
     state.tokens = tokens;
     state.cache_pos = cache_pos;
+    state.decode_position_delta = decode_position_delta;
     tyloi::models::qwen4_exp::Snapshot snapshot;
     for (std::size_t i=0; i<model_.layers.size(); ++i)
         snapshot.layers.push_back(capture_layer_session(*model_.layers[i], *layers[i], cache_pos, state.bytes));
@@ -371,6 +480,170 @@ void State::restore_text_session_state(const TextSessionState& state) {
         restore_layer_session(*model_.layers[i], *layers[i], snapshot->layers[i], state.cache_pos);
     this->positions = positions->clone();
     cache_pos = state.cache_pos;
+}
+
+namespace {
+class SessionRestore final : public tyloi::models::Restore {
+public:
+    SessionRestore(State& state, const Model& model, const TextSessionState& snapshot,
+                   const tyloi::models::Mtp* predictor_model)
+        : state_(state), model_(model), snapshot_(snapshot) {
+        const auto* saved = std::get_if<tyloi::models::qwen4_exp::Snapshot>(&snapshot_.payload);
+        const auto* positions = saved ? saved->positions.representation<DenseTensor>() : nullptr;
+        if (!state_.supports_text_session_state() || state_.speculative_start >= 0 ||
+            state_.speculative_suffix_forward || !saved || saved->layers.size() != model_.layers.size() ||
+            snapshot_.cache_pos <= 0 || snapshot_.cache_pos > model_.config.maximum ||
+            snapshot_.tokens.size() != std::size_t(snapshot_.cache_pos) || !positions || !positions->defined() ||
+            saved->positions.device() != tyloi::Device(tyloi::kCUDA, model_.primary_device) ||
+            saved->positions.scalar_type() != tyloi::kInt64 || positions->dim() < 1 || positions->dim() > 3 ||
+            positions->size(-1) != snapshot_.cache_pos ||
+            (positions->dim() > 1 && positions->size(0) != 3) ||
+            (positions->dim() == 3 && positions->size(1) != 1))
+            throw CudaSessionStateError("incompatible Qwen4 text session state");
+        for (std::size_t i = 0; i < saved->layers.size(); ++i)
+            validate_layer_session(*model_.layers[i], *state_.layers[i], saved->layers[i], snapshot_.cache_pos);
+        if (predictor_model) {
+            if (!state_.predictor || !state_.predictor->belongs_to(*predictor_model) ||
+                !snapshot_.mtp || snapshot_.mtp->cache_pos != snapshot_.cache_pos - 1)
+                throw CudaSessionStateError("incompatible Qwen4 predictor session boundary");
+            predictor_ = state_.predictor->prepare_restore(*snapshot_.mtp);
+        }
+    }
+
+    std::vector<std::pair<tyloi::Device, std::size_t>> growth() const override {
+        std::vector<std::pair<tyloi::Device, std::size_t>> result;
+        const auto& saved = std::get<tyloi::models::qwen4_exp::Snapshot>(snapshot_.payload);
+        add_session_growth(result, saved.positions.device(), session_tensor_bytes(saved.positions));
+        for (std::size_t i = 0; i < saved.layers.size(); ++i) {
+            const auto& layer = *model_.layers[i];
+            const auto device = layer.cpu_offloaded ? tyloi::Device(tyloi::kCPU)
+                                                   : tyloi::Device(tyloi::kCUDA, layer.cuda_device);
+            add_session_growth(result, device,
+                layer_session_growth(layer, *state_.layers[i], saved.layers[i], snapshot_.cache_pos));
+            add_session_growth(result, tyloi::Device(tyloi::kCPU), saved.layers[i].ple_tokens.size() * sizeof(int64_t));
+        }
+        if (predictor_) for (const auto& [device, bytes] : predictor_->growth())
+            add_session_growth(result, device, bytes);
+        return result;
+    }
+
+    void stage() override {
+        candidate_ = std::make_unique<State>(model_, false);
+        candidate_->layers.reserve(model_.layers.size());
+        for (const auto& layer : model_.layers)
+            candidate_->layers.push_back(std::make_unique<LayerState>(*layer));
+        const auto& saved = std::get<tyloi::models::qwen4_exp::Snapshot>(snapshot_.payload);
+        for (std::size_t i = 0; i < saved.layers.size(); ++i)
+            stage_layer_session(*model_.layers[i], *candidate_->layers[i], saved.layers[i], snapshot_.cache_pos);
+        stage_session_tensor(candidate_->positions, saved.positions);
+        candidate_->cache_pos = snapshot_.cache_pos;
+        candidate_->decode_position_delta = snapshot_.decode_position_delta;
+        candidate_->batch = 1;
+        if (predictor_) predictor_->stage();
+    }
+
+    void publish() noexcept override {
+        state_.publish_restore(*candidate_);
+        if (predictor_) predictor_->publish();
+    }
+private:
+    State& state_;
+    const Model& model_;
+    TextSessionState snapshot_;
+    std::unique_ptr<State> candidate_;
+    std::unique_ptr<tyloi::models::Restore> predictor_;
+};
+} // namespace
+
+std::unique_ptr<tyloi::models::Restore> State::prepare_restore(
+        const TextSessionState& snapshot, const tyloi::models::Mtp* predictor_model) {
+    return std::make_unique<SessionRestore>(*this, model_, snapshot, predictor_model);
+}
+
+namespace {
+class PredictorRestore final : public tyloi::models::Restore {
+public:
+    PredictorRestore(PredictorState& state, const MtpSessionState& snapshot)
+        : state_(state), model_(state.owner), snapshot_(snapshot) {
+        const auto* saved = std::get_if<tyloi::models::qwen4_exp::MtpSnapshot>(&snapshot_.payload);
+        const auto& hidden = snapshot_.last_target_hidden;
+        if (!model_.supports_session_state(state_) || snapshot_.cache_pos <= 0 ||
+            snapshot_.cache_pos > model_.config.maximum || !saved ||
+            saved->layers.size() != model_.layers.size() || saved->positions.size() != model_.layers.size() ||
+            saved->lengths.size() != model_.layers.size() || saved->lengths.front() != snapshot_.cache_pos ||
+            !hidden.defined() || !hidden.representation<DenseTensor>() || hidden.dim() != 3 ||
+            hidden.size(0) != 1 || hidden.size(1) != 1 || hidden.size(2) != model_.hidden_norm.numel() ||
+            (hidden.scalar_type() != tyloi::kFloat16 && hidden.scalar_type() != tyloi::kBFloat16 &&
+             hidden.scalar_type() != tyloi::kFloat32))
+            throw CudaSessionStateError("incompatible Qwen4 predictor session state");
+        for (std::size_t i = 0; i < saved->layers.size(); ++i) {
+            const auto length = saved->lengths[i];
+            const auto& position = saved->positions[i];
+            if (length < 0 || length > snapshot_.cache_pos ||
+                (length == 0 && position.defined()) ||
+                (length > 0 && (!position.defined() || !position.representation<DenseTensor>() ||
+                    position.device() != tyloi::Device(tyloi::kCUDA, model_.primary) ||
+                    position.scalar_type() != tyloi::kInt32 || position.dim() != 3 ||
+                    position.size(0) != 3 || position.size(1) != 1 || position.size(2) != length)))
+                throw CudaSessionStateError("incompatible Qwen4 predictor position history");
+            if (length)
+                validate_layer_session(*model_.layers[i], *state_.layer_states[i], saved->layers[i], length);
+            else {
+                const auto& layer = saved->layers[i];
+                if (layer.keys || layer.values || layer.index || layer.convolution || layer.recurrent ||
+                    layer.ple_convolution || layer.ple_batch || !layer.ple_tokens.empty())
+                    throw CudaSessionStateError("unexpected empty Qwen4 predictor layer state");
+            }
+        }
+    }
+
+    std::vector<std::pair<tyloi::Device, std::size_t>> growth() const override {
+        std::vector<std::pair<tyloi::Device, std::size_t>> result;
+        const auto& saved = std::get<tyloi::models::qwen4_exp::MtpSnapshot>(snapshot_.payload);
+        for (std::size_t i = 0; i < saved.layers.size(); ++i) {
+            if (!saved.lengths[i]) continue;
+            const auto& layer = *model_.layers[i];
+            const auto device = layer.cpu_offloaded ? tyloi::Device(tyloi::kCPU)
+                                                   : tyloi::Device(tyloi::kCUDA, layer.cuda_device);
+            add_session_growth(result, device,
+                layer_session_growth(layer, *state_.layer_states[i], saved.layers[i], saved.lengths[i]));
+            add_session_growth(result, saved.positions[i].device(), session_tensor_bytes(saved.positions[i]));
+            add_session_growth(result, tyloi::Device(tyloi::kCPU), saved.layers[i].ple_tokens.size() * sizeof(int64_t));
+        }
+        return result;
+    }
+
+    void stage() override {
+        candidate_ = std::make_unique<PredictorState>(model_, false);
+        candidate_->layer_states.reserve(model_.layers.size());
+        for (const auto& layer : model_.layers)
+            candidate_->layer_states.push_back(std::make_unique<LayerState>(*layer));
+        const auto& saved = std::get<tyloi::models::qwen4_exp::MtpSnapshot>(snapshot_.payload);
+        for (std::size_t i = 0; i < saved.layers.size(); ++i) {
+            if (!saved.lengths[i]) continue;
+            stage_layer_session(*model_.layers[i], *candidate_->layer_states[i], saved.layers[i], saved.lengths[i]);
+            stage_session_tensor(candidate_->positions[i], saved.positions[i]);
+            candidate_->lengths[i] = saved.lengths[i];
+        }
+        candidate_->batch = 1;
+    }
+
+    void publish() noexcept override {
+        state_.layer_states.swap(candidate_->layer_states);
+        state_.positions.swap(candidate_->positions);
+        state_.lengths.swap(candidate_->lengths);
+        state_.batch = candidate_->batch;
+    }
+private:
+    PredictorState& state_;
+    const Predictor& model_;
+    MtpSessionState snapshot_;
+    std::unique_ptr<PredictorState> candidate_;
+};
+} // namespace
+
+std::unique_ptr<tyloi::models::Restore> PredictorState::prepare_restore(const MtpSessionState& snapshot) {
+    return std::make_unique<PredictorRestore>(*this, snapshot);
 }
 
 } // namespace tyloi::cuda::qwen4_exp

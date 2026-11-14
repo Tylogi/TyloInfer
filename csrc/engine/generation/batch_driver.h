@@ -8,22 +8,27 @@ namespace tyloi::engine {
 class Budget;
 
 /** Reserve the combined per-device backing for a batch operation. */
-void reserve_batch(Budget& budget, Executor& executor, const models::BatchGrowth& values,
+void reserve_batch(Budget& budget, Device device, const models::BatchGrowth& values,
     std::size_t margin, bool primary = false);
 
 /** Drive model batch prefill events using the executor's working-set owner. */
 std::vector<Tensor> prefill_batch(models::Batch& batch, Executor& executor, weights::Cache& weights,
-    std::vector<models::BatchState*> states, std::vector<Tensor> ids);
+    Budget& budget, Device device, std::vector<models::BatchState*> states, std::vector<Tensor> ids);
 
 /** Drive a batch graph plan through the shared capture coordinator. */
 std::unique_ptr<models::Batch::Plan> plan_batch(models::Batch& batch, Executor& executor,
-    weights::Cache& weights, const std::vector<models::BatchRow>& rows, bool greedy);
+    weights::Cache& weights, Budget& budget, Device device, const std::vector<models::BatchRow>& rows, bool greedy);
+
+/** Drive admitted graph capture and its resource events. */
+std::optional<Tensor> capture_batch(models::Batch& batch, Executor& executor,
+    weights::Cache& weights, Budget& budget, Device device, const std::vector<models::BatchRow>& rows,
+    const Tensor& ids, const Tensor& host_ids, bool greedy, const models::Batch::Plan& plan);
 
 /** Own a controlled numerical batch and its independently admitted request states. */
 class BatchDriver final {
 public:
     BatchDriver(std::unique_ptr<models::Batch> batch, Executor& executor,
-        weights::Cache& weights, Budget& budget);
+        weights::Cache& weights, Budget& budget, Device device);
     ~BatchDriver() noexcept;
     BatchDriver(const BatchDriver&) = delete;
     BatchDriver& operator=(const BatchDriver&) = delete;
@@ -42,6 +47,7 @@ private:
     Executor& executor_;
     weights::Cache& weights_;
     Budget& budget_;
+    Device device_;
     std::unique_ptr<models::Batch> batch_;
     std::vector<std::unique_ptr<models::BatchState>> states_;
 };

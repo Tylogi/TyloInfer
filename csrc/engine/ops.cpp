@@ -435,6 +435,9 @@ void ProfileCapture::report(const std::string& name) {
 void ProfileCapture::resume() {
     if (impl_) impl_->profiler.enabled = impl_->enabled;
 }
+void ProfileCapture::suspend() {
+    if (impl_) impl_->profiler.enabled = impl_->previous;
+}
 SelectedExperts topk(const Tensor& logits_tensor, std::int64_t count, const MoeRouting& routing,
                      const Tensor& bias) {
     const auto& logits = ::tyloi::ops::dense(logits_tensor);
