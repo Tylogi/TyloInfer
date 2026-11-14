@@ -13,7 +13,7 @@
 
 #include <mlx/mlx.h>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 struct MlxQuantizedRowBatch {
     int width = 0;
@@ -79,4 +79,4 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

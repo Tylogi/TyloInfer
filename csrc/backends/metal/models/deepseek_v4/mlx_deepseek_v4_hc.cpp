@@ -10,7 +10,7 @@
 #include <utility>
 #include <vector>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 
 using mlx::core::CompileOptions;
@@ -760,4 +760,4 @@ array deepseek_v4_hc_post_sum_packed(
         true);
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

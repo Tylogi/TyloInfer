@@ -512,9 +512,9 @@ void validate_components(const tyloi::ModelGraph& graph) {
 Layer load_layer(const ::tyloi::weights::Loader& weights,
                  const Config& config, int layer, const std::string& type,
                  std::string_view tensor_root) {
-    MfqCudaGuard guard(weights.placement.device);
+    MfqCudaGuard guard(weights.placement.target.index);
     Layer result;
-    result.device = weights.placement.device;
+    result.device = weights.placement.target.index;
     LayerLoader loader{{weights}};
     switch (Config::mixer_kind(type)) {
         case tyloi::models::nemotron_h::MixerKind::linear_attention: {
@@ -545,7 +545,7 @@ Layer load_layer(const ::tyloi::weights::Loader& weights,
 
 Model read(std::shared_ptr<const tyloi::ModelSource> source, std::string_view definition,
            std::int64_t context) {
-    validate_model_source(*source);
+    ::tyloi::models::validate_model_source(*source);
     Model model;
     model.source = std::move(source);
     model.graph = tyloi::models::graph(*model.source);
@@ -597,7 +597,7 @@ void load(Model& model, const ::tyloi::weights::Loader& weights,
                 MfqCudaGuard layer_guard(device);
                 const auto& type = model.metadata.layer_types.at(static_cast<std::size_t>(index));
                 std::cerr << "loading layer " << index << ' ' << type << " CUDA" << std::endl;
-                model.layers.push_back(load_layer(weights.for_layer(device, false),
+                model.layers.push_back(load_layer(weights.for_layer(::tyloi::Device(::tyloi::kCUDA, device)),
                                                   config, index, type));
             }
         }

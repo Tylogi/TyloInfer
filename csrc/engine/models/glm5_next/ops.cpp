@@ -117,9 +117,9 @@ static DenseTensor execute(const Layer& layer, LayerState& activity,
 }
 
 Layer load_layer(const ::tyloi::weights::Loader& weights, const Config& config, int index) {
-    MfqCudaGuard guard(weights.placement.device);
+    MfqCudaGuard guard(weights.placement.target.index);
     Layer layer;
-    layer.device = weights.placement.device;
+    layer.device = weights.placement.target.index;
     LayerLoader loader{weights};
     loader.role = "glm5_next";
     tyloi::models::glm5_next::load_layer_weights(layer, loader, config, index);
@@ -128,7 +128,7 @@ Layer load_layer(const ::tyloi::weights::Loader& weights, const Config& config, 
 
 Model read(std::shared_ptr<const tyloi::ModelSource> source, std::string_view definition,
            int64_t context) {
-    validate_model_source(*source);
+    ::tyloi::models::validate_model_source(*source);
     Model model;
     model.source = std::move(source);
     model.graph = tyloi::models::graph(*model.source);
@@ -162,7 +162,7 @@ void load(Model& model, const ::tyloi::weights::Loader& weights,
         if (load_layers) {
             model.layers.reserve(static_cast<size_t>(model.config.layers));
             for (int index = 0; index < model.config.layers; ++index)
-                model.layers.push_back(load_layer(weights.for_layer(placement.device_for_layer(index), false),
+                model.layers.push_back(load_layer(weights.for_layer(::tyloi::Device(::tyloi::kCUDA, placement.device_for_layer(index))),
                                                   model.config, index));
         }
     } else {
@@ -405,7 +405,7 @@ Mtp::Mtp(Mtp&&) noexcept = default;
 std::optional<Mtp> Mtp::load_if_present(const ::tyloi::weights::Loader& weights,
                                                       ::tyloi::Tensor embedding,
                                                       const tyloi::models::glm5_next::Config &main) {
-    Mtp result{std::move(embedding), weights.placement.device};
+    Mtp result{std::move(embedding), weights.placement.target.index};
     LayerLoader loader{weights};
     loader.role = "glm5_next";
     if (!tyloi::models::glm5_next::load_predictor(result, loader, main))

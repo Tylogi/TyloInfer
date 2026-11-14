@@ -7,7 +7,7 @@
 #include <optional>
 #include <mlx/mlx.h>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 struct MlxQwen4GatedResidualPre {
     mlx::core::array branch;
@@ -137,4 +137,4 @@ mlx::core::array qwen4_dense_gqa_attention(
     const mlx::core::array& value,
     int query_offset);
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

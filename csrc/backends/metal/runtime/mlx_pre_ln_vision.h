@@ -8,7 +8,7 @@
 
 #include <mlx/mlx.h>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 // Activation used by a pre-LayerNorm vision MLP. RADIO's "gelu" is the exact
 // erf form; SigLIP-style towers use the tanh approximation.
@@ -90,4 +90,4 @@ private:
     MlxVisionActivation activation_;
 };
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

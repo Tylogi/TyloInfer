@@ -12,7 +12,7 @@
 #include <utility>
 #include <vector>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 
 using mlx::core::Shape;
@@ -654,4 +654,4 @@ array MlxQwen35FullAttentionBlock::forward_impl(
     return residual;
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

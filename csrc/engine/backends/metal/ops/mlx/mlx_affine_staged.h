@@ -3,7 +3,7 @@
 #include <mlx/mlx.h>
 #include <optional>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 class MlxAffineWeight;
 class MlxAffineRoutePlan;
 class MlxAffineIndirectWeight;

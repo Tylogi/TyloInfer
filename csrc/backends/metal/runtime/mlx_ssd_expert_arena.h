@@ -12,7 +12,7 @@
 
 #include <mlx/mlx.h>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 struct MlxSsdExpertWeights {
     MlxRoutedLinear gate_up;
@@ -85,4 +85,4 @@ private:
     std::unique_ptr<MlxSsdExpertWeights> slot_weights_;
 };
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

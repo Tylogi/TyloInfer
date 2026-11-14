@@ -9,7 +9,7 @@
 #include <string>
 #include <utility>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 
 using mlx::core::Shape;
@@ -220,4 +220,4 @@ array MlxPreLnVisionBlock::forward(
     return hidden_state + down_(branch);
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

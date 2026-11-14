@@ -3,7 +3,7 @@
 #include <climits>
 #include <stdexcept>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 using namespace mlx::core;
 MlxExpertRouteTiles mlx_expert_route_tiles(const array& ids, int experts, int tile_rows) {
     if (ids.ndim() != 2 || experts < 1 || tile_rows < 1 || tile_rows > 256 || ids.size() == 0 || ids.size() > INT_MAX ||
@@ -38,4 +38,4 @@ MlxExpertRouteTiles mlx_expert_route_tiles(const array& ids, int experts, int ti
     return {std::move(order), std::move(ranges[0]), std::move(offsets),
         int(ids.size() / tile_rows + std::size_t(experts)), tile_rows};
 }
-} // namespace mfq::metal
+} // namespace tyloi::metal

@@ -32,7 +32,7 @@
 #include <utility>
 #include <vector>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 namespace {
 
@@ -5734,4 +5734,4 @@ void MlxMiniCPMO45Runtime::restore_text_session_state(
     implementation_->language.restore_text_session_state(std::move(state));
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

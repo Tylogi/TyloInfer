@@ -21,7 +21,7 @@
 #include <utility>
 #include <vector>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 
 using mlx::core::Dtype;
@@ -894,7 +894,7 @@ MlxDeepseekV4DSpark::draft_impl(
         state.batch(), physical_width, "routed row count");
     bool use_route_transaction =
         impl_->ssd_expert_cache && routed_rows <= 6 &&
-        (mfq::mfq_compat_enabled && mlx_ssd_route_transactions_enabled());
+        (tyloi::mfq_compat_enabled && mlx_ssd_route_transactions_enabled());
     if (use_route_transaction) {
         for (std::size_t stage = 0; stage < impl_->stages.size(); ++stage) {
             if (!impl_->ssd_expert_cache->route_layer_likely_hit(
@@ -1050,4 +1050,4 @@ std::size_t MlxDeepseekV4DSpark::stage_count() const noexcept {
     return impl_->stages.size();
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

@@ -14,7 +14,7 @@
 #include <utility>
 #include <vector>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 class MfqMappedBytes {
 public:
@@ -161,4 +161,4 @@ private:
     mutable std::shared_ptr<LoadProgress> load_progress_;
 };
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

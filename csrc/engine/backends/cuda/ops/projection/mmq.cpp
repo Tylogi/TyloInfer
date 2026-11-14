@@ -15,19 +15,7 @@ KlMmqScope::KlMmqScope(KlMmqMode mode, KlMmqState& current)
 }
 
 KlMmqScope::~KlMmqScope() {
-    const auto kv_cache_capacity = state.kv_cache_capacity;
     state = previous;
-    state.kv_cache_capacity = kv_cache_capacity;
-}
-
-KlKvCacheCapacityScope::KlKvCacheCapacityScope(
-        int64_t capacity, KlMmqState& current)
-    : state(current), previous_capacity(current.kv_cache_capacity) {
-    state.kv_cache_capacity = capacity;
-}
-
-KlKvCacheCapacityScope::~KlKvCacheCapacityScope() {
-    state.kv_cache_capacity = previous_capacity;
 }
 
 const char * kl_mmq_mode_name(KlMmqMode mode) {

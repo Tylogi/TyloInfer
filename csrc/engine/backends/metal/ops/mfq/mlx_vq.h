@@ -11,7 +11,7 @@
 
 #include "engine/backends/metal/native/memory.h"
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 namespace detail {
 std::string_view vq_gemv_metal_header() noexcept;
@@ -334,4 +334,4 @@ private:
     int residual_blocks_per_row_ = 0;
 };
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

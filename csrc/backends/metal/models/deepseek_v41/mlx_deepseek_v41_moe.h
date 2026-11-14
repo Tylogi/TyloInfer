@@ -16,7 +16,7 @@
 
 #include <mlx/mlx.h>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 struct MlxDeepseekV41MoeResult {
     mlx::core::array routed;
@@ -123,4 +123,4 @@ private:
     std::size_t expert_cache_layer_ = 0;
 };
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

@@ -6,7 +6,7 @@
 #include <mutex>
 #include <tuple>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 class MlxAneMatmul : public std::enable_shared_from_this<MlxAneMatmul> {
 public:
@@ -25,4 +25,4 @@ private:
     std::map<std::tuple<int, int, int>, std::shared_ptr<AneMatmul>> kernels_;
 };
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

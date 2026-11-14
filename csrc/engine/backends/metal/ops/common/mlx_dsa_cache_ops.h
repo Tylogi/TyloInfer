@@ -2,7 +2,7 @@
 
 #include <mlx/mlx.h>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 struct MlxDsaCompressedWindow {
     mlx::core::array latent;

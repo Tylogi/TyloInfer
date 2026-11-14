@@ -10,7 +10,7 @@
 #include <variant>
 #include <vector>
 
-namespace tyloi::cuda::qwen35 {
+namespace tyloi::models::qwen35 {
 
 // A copyable snapshot is only needed for paused recurrent decode rows. KV state
 // remains owned by the aggregate state and is copied into its stable slot in place.
@@ -96,4 +96,4 @@ class Batch {
     std::vector<tyloi::state::PagedKv::Sequence> paged_slots_;
 };
 
-} // namespace tyloi::cuda::qwen35
+} // namespace tyloi::models::qwen35

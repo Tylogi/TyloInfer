@@ -14,7 +14,7 @@
 
 #include <mlx/mlx.h>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 mlx::core::array deepseek_v41_engram_gate(
     const mlx::core::array& hidden, const mlx::core::array& key_value,
@@ -136,4 +136,4 @@ private:
     mlx::core::array query_key_weight_;
 };
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

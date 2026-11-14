@@ -113,9 +113,9 @@ struct Tts {
     std::vector<Layer> layers;
     ::tyloi::Tensor output_norm, code_head;
     static Tts load(const tyloi::weights::Loader& weights) {
-        MfqCudaGuard guard(weights.placement.device);
+        MfqCudaGuard guard(weights.placement.target.index);
         Tts result;
-        result.device = weights.placement.device;
+        result.device = weights.placement.target.index;
         result.config = tyloi::models::minicpmo45::tts_decoder_config();
         result.rope = tyloi::ops::rope_table(
             result.config.max_position_embeddings, result.config.rotary_dim,

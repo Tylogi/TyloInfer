@@ -25,7 +25,7 @@
 #include <unordered_map>
 #include <utility>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 
 using mlx::core::CompileOptions;
@@ -4768,4 +4768,4 @@ bool MlxGroupedLinear::has_single_row_mxfp8_fast_path()
     return impl_->has_single_row_mxfp8_fast_path();
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

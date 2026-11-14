@@ -15,7 +15,7 @@
 
 #include <mlx/mlx.h>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 inline constexpr std::string_view kMfqModelConfigAsset =
     "__mfq_asset__/model_config.json";
@@ -125,4 +125,4 @@ MlxRmsNorm load_qwen35_rms_norm(
     double eps,
     double weight_offset = 1.0);
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

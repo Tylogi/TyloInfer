@@ -8,7 +8,7 @@
 #include <string>
 #include <utility>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 
 using mlx::core::Shape;
@@ -18,11 +18,11 @@ int I(std::int64_t value) {
     return static_cast<int>(value);
 }
 
-mfq::models::nemotron_h::RadioPositionInterpolation position_table(
+tyloi::models::nemotron_h::RadioPositionInterpolation position_table(
     std::int64_t rows,
     std::int64_t columns,
     const NemotronHRadioConfig& config) {
-    return mfq::models::nemotron_h::make_radio_position_interpolation(
+    return tyloi::models::nemotron_h::make_radio_position_interpolation(
         static_cast<std::int32_t>(rows),
         static_cast<std::int32_t>(columns),
         static_cast<std::int32_t>(config.position_side()));
@@ -440,4 +440,4 @@ MlxPreparedPrompt MlxNemotronHRadioPromptComponent::prepare(
         token_ids, std::move(embeddings), std::move(positions), 0};
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

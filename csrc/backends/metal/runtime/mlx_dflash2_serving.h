@@ -2,7 +2,7 @@
 
 #include "mlx_server_components.h"
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 bool mlx_dflash2_sampling_supported(const MfqSamplingParams& sampling,
     const MfqTokenConstraintPtr& constraint) noexcept;

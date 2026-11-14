@@ -6,7 +6,7 @@
 #include <unordered_map>
 #include <atomic>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 struct MlxIndirectWeightRegistry {
     struct Entry {
         std::weak_ptr<mlx::core::array::Data> allocation;

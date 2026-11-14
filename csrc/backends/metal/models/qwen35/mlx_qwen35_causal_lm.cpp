@@ -22,7 +22,7 @@
 #include <variant>
 #include <vector>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 
 using mlx::core::Shape;
@@ -1225,7 +1225,7 @@ std::int32_t MlxQwen35CausalLm::generate_prepared_impl(
     tyloi::profiling::Components component_profile;
     const auto profile_started = std::chrono::steady_clock::now();
     auto logits = [&]() {
-        mfq::engine::PrefillActivity prefill_activity;
+        tyloi::engine::PrefillActivity prefill_activity;
         tyloi::profiling::ProfileScope component_scope(
             profile_prefill ? &component_profile : nullptr);
         tyloi::profiling::EvaluationScope timing(
@@ -1848,4 +1848,4 @@ std::int32_t MlxQwen35CausalLm::generate_prepared_impl(
     return generated;
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

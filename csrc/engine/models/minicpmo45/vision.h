@@ -254,7 +254,7 @@ struct MiniCPMO45Resampler {
             throw std::runtime_error("MiniCPM-o Resampler position asset shape is not 70x70x4096");
         }
         {
-            MfqCudaGuard guard(weights.placement.device);
+            MfqCudaGuard guard(weights.placement.target.index);
             auto position =
                 ::tyloi::cuda::from_blob(
                     position_blob.data() + position_offset, std::vector<int64_t>{70, 70, 4096},

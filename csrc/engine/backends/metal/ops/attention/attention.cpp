@@ -6,7 +6,7 @@
 #include <string>
 #include <utility>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 using mlx::core::array;
 array floating(const array& input, mlx::core::Dtype dtype) {
@@ -68,4 +68,4 @@ array scaled_dot_product_attention(
         mask);
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

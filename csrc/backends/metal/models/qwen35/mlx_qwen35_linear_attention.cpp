@@ -15,7 +15,7 @@
 #include <utility>
 #include <vector>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 
 using mlx::core::Shape;
@@ -957,4 +957,4 @@ array MlxQwen35LinearAttentionBlock::forward(
     return forward(input, position_offset, use_cache);
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

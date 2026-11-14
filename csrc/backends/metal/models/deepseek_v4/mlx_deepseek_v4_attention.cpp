@@ -17,7 +17,7 @@
 #include <utility>
 #include <vector>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 
 using mlx::core::CompileOptions;
@@ -2754,4 +2754,4 @@ int MlxDeepseekV4Attention::max_context() const noexcept {
     return impl_->maximum_context;
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

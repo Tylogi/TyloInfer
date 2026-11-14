@@ -41,11 +41,11 @@ struct Loader {
         bool ranges = true;
         bool preload = false;
         bool mapped_embedding = false;
+        bool mirror_attention_kv = true;
         int min_slots = 8;
     };
     struct Placement {
-        int device = 0;
-        bool cpu = false;
+        Device target{};
         bool drop_cache = false;
         ParallelConfig tensor;
         ParallelConfig experts;
@@ -56,10 +56,9 @@ struct Loader {
     Placement placement;
     const char* role = "";
 
-    Loader for_layer(int device, bool cpu) const {
+    Loader for_layer(Device target) const {
         auto result = *this;
-        result.placement.device = device;
-        result.placement.cpu = cpu;
+        result.placement.target = target;
         return result;
     }
     // The cache must outlive users of the returned reference.
@@ -84,7 +83,7 @@ struct Loader {
     ::tyloi::Tensor embedding(const std::string& name, bool independent_output) const;
     ::tyloi::Tensor rows(const std::string& name) const;
     ::tyloi::Tensor experts(const std::string& name, bool cacheable = false,
-        int layer = -1, const std::string& role = {}) const;
+        int layer = -1, const std::string& role = {}, bool cpu_offloaded = false) const;
     ::tyloi::Tensor dense(const std::string& name) const;
     ::tyloi::Tensor routed(const std::string& name, int layer, int64_t experts, int64_t output,
                   int64_t input, const std::string& role = {}) const;

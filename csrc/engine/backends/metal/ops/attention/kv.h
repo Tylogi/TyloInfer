@@ -6,7 +6,7 @@
 #include <optional>
 #include <utility>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 // The caller validates topology and reserves capacity, then publishes both returned physical arrays.
 std::pair<mlx::core::array, mlx::core::array> mlx_kv_append(

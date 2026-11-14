@@ -1,6 +1,6 @@
 #pragma once
 
-#include "tyloinfer/token_constraint.h"
+#include "engine/requests/constraint.h"
 #include "mfq_container.h"
 #include "mlx_sampling.h"
 #include "mlx_transformer.h"
@@ -13,7 +13,7 @@
 
 #include <mlx/mlx.h>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 // Configure MiniCPM-o command-buffer defaults before the Metal device is first
 // created. Explicit environment settings always take precedence.
@@ -241,4 +241,4 @@ void test_minicpmo45_gqa_reduction();
 
 } // namespace detail
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

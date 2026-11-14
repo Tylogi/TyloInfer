@@ -11,7 +11,7 @@
 #include <string>
 #include <vector>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 class MlxMfeMxfp4Unsupported : public std::runtime_error {
 public:
@@ -100,4 +100,4 @@ private:
     std::vector<ExpertRecord> experts_;
 };
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

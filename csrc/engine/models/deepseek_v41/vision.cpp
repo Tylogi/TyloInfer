@@ -121,7 +121,7 @@ tyloi::StepSequence<tyloi::models::Prepared> Vision::prepare(
         const bool aligned=visual && visual.dim()==2 && visual.size(0)==span.rows*span.columns && visual.size(1)==config_.hidden;
         TYLOINFER_RUNTIME_CHECK(aligned,
                           "DeepSeek-V4.1 aligned image shape mismatch");
-        const auto host=weights_.for_layer(weights_.placement.device,true);
+        const auto host=weights_.for_layer(::tyloi::Device(::tyloi::kCPU));
         auto start_weight=vector_weight(host,"vision.special_token.start",config_.hidden);
         auto newline_weight=vector_weight(host,"vision.special_token.newline",config_.hidden);
         auto end_weight=vector_weight(host,"vision.special_token.end",config_.hidden);

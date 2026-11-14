@@ -3,6 +3,8 @@
 #include "engine/backends/metal/native/device.h"
 #include "mlx_transformer.h"
 #include "engine/backends/metal/native/allocation.h"
+#include "engine/backends/metal/native/tensor/tensor.h"
+#include "engine/weights/memory.h"
 
 #include <algorithm>
 #include <array>
@@ -18,7 +20,7 @@
 #include <unordered_map>
 #include <utility>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 
 using mlx::core::CompileOptions;
@@ -1629,6 +1631,8 @@ MlxMxWeight::MlxMxWeight(
                 "unsupported MXFP8 scale block geometry");
         }
     }
+    tyloi::weights::observe_weight(tyloi::metal::tensor(values_));
+    tyloi::weights::observe_weight(tyloi::metal::tensor(scales_));
 }
 
 MlxMxWeight MlxMxWeight::from_blob(
@@ -2550,4 +2554,11 @@ std::size_t MlxMxWeight::packed_nbytes() const noexcept {
     return values_.nbytes() + scales_.nbytes();
 }
 
-} // namespace mfq::metal
+std::vector<std::shared_ptr<tyloi::TensorStorage>> MlxMxWeight::backings() const {
+    auto result = tyloi::metal::backings(values_);
+    auto scales = tyloi::metal::backings(scales_);
+    result.insert(result.end(), scales.begin(), scales.end());
+    return result;
+}
+
+} // namespace tyloi::metal

@@ -4,7 +4,7 @@
 #include <random>
 #include <stdexcept>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 void geometry(int inputs, int outputs, int rank) {
     if (inputs <= 0 || inputs > 8388608 || outputs <= 0 || outputs > 8388608 || rank <= 0 || rank > 32)
@@ -73,4 +73,4 @@ std::shared_ptr<MtpLoraState> mtp_lora_adam(const MtpLoraState& state, std::span
     return candidate;
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

@@ -8,6 +8,7 @@
 #include <climits>
 #include <cstdio>
 #include <map>
+#include <limits>
 #include <stdexcept>
 
 namespace tyloi::metal {
@@ -16,25 +17,25 @@ using namespace mlx::core;
 struct Pool::Impl {
     const std::size_t page = std::size_t(getpagesize());
     struct Buffer {
-        std::shared_ptr<mfq::metal::detail::MlxPinnedPoolStorage> owner;
+        std::shared_ptr<tyloi::metal::detail::MlxPinnedPoolStorage> owner;
         allocator::Buffer value{nullptr};
         ~Buffer() { if (value.ptr()) allocator::release(value); }
     };
-    std::shared_ptr<mfq::metal::detail::MlxPinnedPoolStorage> storage;
+    std::shared_ptr<tyloi::metal::detail::MlxPinnedPoolStorage> storage;
     std::vector<array> chunks;
     std::shared_ptr<tyloi::metal::ResidentAllocations> residency;
     std::map<std::size_t, std::size_t> free, occupied;
     std::size_t limit, chunk_bytes, capacity = 0, generation = 0;
 
-    Impl(std::size_t requested, std::size_t maximum_entry) : limit(requested / page * page) {
+    Impl(std::size_t requested, std::size_t maximum_entry, std::size_t reserve) : limit(requested / page * page) {
         auto* device = mlx::core::metal::device(Device::gpu).mtl_device();
         const auto maximum_buffer = std::size_t(device->maxBufferLength()) / page * page;
         if (!limit || !maximum_entry || maximum_entry > maximum_buffer)
             throw std::invalid_argument("streamed weight pool cannot hold its expert geometry");
         chunk_bytes = std::min(maximum_buffer, std::max(std::size_t{512} << 20,
             (maximum_entry + page - 1) / page * page));
-        storage = std::make_shared<mfq::metal::detail::MlxPinnedPoolStorage>();
-        storage->bytes = std::max(limit, std::size_t(device->recommendedMaxWorkingSetSize())) / page * page;
+        storage = std::make_shared<tyloi::metal::detail::MlxPinnedPoolStorage>();
+        storage->bytes = std::max({limit, reserve, std::size_t(device->recommendedMaxWorkingSetSize())}) / page * page;
         storage->data = mmap(nullptr, storage->bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
         if (storage->data == MAP_FAILED) throw std::bad_alloc();
     }
@@ -84,7 +85,7 @@ struct Pool::Impl {
             auto owner = std::make_shared<Buffer>(); owner->owner = storage;
             owner->value = allocator::make_buffer(static_cast<std::byte*>(storage->data) + part * chunk_bytes, length);
             if (!owner->value.ptr()) throw std::runtime_error("cannot register streamed expert memory with Metal");
-            next.push_back(mfq::metal::mlx_buffer_view(owner->value, Shape{int(length / 4096), 4096}, uint8, owner));
+            next.push_back(tyloi::metal::mlx_buffer_view(owner->value, Shape{int(length / 4096), 4096}, uint8, owner));
         }
         if (residency) residency->update_arrays(next, bytes);
         else if (bytes) residency = tyloi::metal::ResidentAllocations::retain_arrays(next, bytes, true);
@@ -97,8 +98,23 @@ struct Pool::Impl {
     }
 };
 
-Pool::Pool(std::size_t limit, std::size_t maximum_entry)
-    : impl_(std::make_unique<Impl>(limit, maximum_entry)) {}
+std::size_t Pool::capacity_for(std::size_t bytes, std::size_t maximum_entry, std::size_t entries) {
+    const auto page = std::size_t(getpagesize());
+    auto* device = mlx::core::metal::device(Device::gpu).mtl_device();
+    const auto maximum_buffer = std::size_t(device->maxBufferLength()) / page * page;
+    if (!bytes || !entries || !maximum_entry || maximum_entry % page || maximum_entry > maximum_buffer)
+        throw std::invalid_argument("streamed weight pool cannot hold its expert geometry");
+    const auto chunk = std::min(maximum_buffer, std::max(std::size_t{512} << 20, maximum_entry));
+    const auto usable = chunk - maximum_entry + page;
+    const auto gaps = std::min(entries - 1, (bytes - 1) / usable);
+    const auto gap = maximum_entry - page;
+    if (gap && gaps > (std::numeric_limits<std::size_t>::max() - bytes) / gap)
+        throw std::overflow_error("streamed expert capacity is too large");
+    return bytes + gaps * gap;
+}
+
+Pool::Pool(std::size_t limit, std::size_t maximum_entry, std::size_t reserve)
+    : impl_(std::make_unique<Impl>(limit, maximum_entry, reserve)) {}
 Pool::~Pool() = default;
 std::optional<std::size_t> Pool::allocate(std::size_t bytes) {
     if (!bytes || bytes % impl_->page) throw std::invalid_argument("streamed expert allocation is not page aligned");

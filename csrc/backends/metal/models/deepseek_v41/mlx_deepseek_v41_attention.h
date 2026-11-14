@@ -13,7 +13,7 @@
 
 #include <mlx/mlx.h>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 struct MlxDeepseekV41AttentionSpeculation;
 
@@ -133,4 +133,4 @@ private:
     std::pair<mlx::core::array, mlx::core::array> rope_;
 };
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

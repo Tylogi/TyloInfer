@@ -13,6 +13,7 @@
 #include "engine/backends/cuda/kernels/gr_prefill_blas.h"
 #include "engine/backends/cuda/ops/projection/mmq.h"
 #include "engine/state/kv_memory.h"
+#include "engine/state/kv_offload.h"
 #include "diagnostics/route_stats.h"
 
 #include <exception>
@@ -225,7 +226,11 @@ void Executor::reset() {
 
 void Executor::drain() {
     std::exception_ptr failure;
-    try { join(); } catch (...) { failure = std::current_exception(); }
+    if (owned_contexts_) {
+        try { if (auto offload = kv_offload()) offload->flush(); }
+        catch (...) { failure = std::current_exception(); }
+    }
+    try { join(); } catch (...) { if (!failure) failure = std::current_exception(); }
     try { wait(); } catch (...) { if (!failure) failure = std::current_exception(); }
     if (failure) std::rethrow_exception(failure);
 }
@@ -286,8 +291,27 @@ std::unique_ptr<Executor> Executor::fork(int primary) const {
 }
 
 void Executor::configure_kv(std::shared_ptr<KvMemoryManager> memory, std::shared_ptr<KvOffloadStore> offload) {
-    kv_memory_ = std::move(memory);
-    kv_offload_ = std::move(offload);
+    if (owned_contexts_) {
+        owned_kv_memory_ = memory;
+        owned_kv_offload_ = offload;
+    }
+    kv_memory_ = memory;
+    kv_offload_ = offload;
+}
+
+void Executor::bind_budget(tyloi::engine::Budget* budget) {
+    if (auto memory = kv_memory()) memory->bind_budget(budget);
+    if (auto offload = kv_offload()) offload->bind_budget(budget);
+}
+
+tyloi::engine::Metrics Executor::metrics() const {
+    tyloi::engine::Metrics result;
+    if (auto memory = kv_memory()) result = memory->metrics();
+    if (auto offload = kv_offload()) {
+        auto values = offload->metrics();
+        result.insert(result.end(), values.begin(), values.end());
+    }
+    return result;
 }
 
 std::shared_ptr<KvOffloadStore> Executor::kv_offload() const {
@@ -410,7 +434,6 @@ std::unique_ptr<tyloi::Executor::Scope> Executor::enter(int device) {
 Executor::Mode Executor::forward_mode(int primary) const {
     auto snapshot = mode_;
     snapshot.compute = compute();
-    snapshot.kv_capacity = mmq_.kv_cache_capacity;
     snapshot.primary = primary;
     return snapshot;
 }

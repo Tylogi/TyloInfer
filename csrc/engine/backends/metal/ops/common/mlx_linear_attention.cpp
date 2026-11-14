@@ -20,7 +20,7 @@
 #include <mlx/compile.h>
 #include <mlx/primitives.h>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 
 using mlx::core::CompileOptions;
@@ -2290,4 +2290,4 @@ MlxGatedDeltaReplay compile_gated_delta_speculative_replay(
     };
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

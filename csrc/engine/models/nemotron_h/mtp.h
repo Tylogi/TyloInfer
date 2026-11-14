@@ -70,7 +70,7 @@ struct Mtp final : tyloi::models::Mtp {
         Mtp result;
         result.config = main;
         result.embedding = std::move(embedding);
-        result.primary = weights.placement.device;
+        result.primary = weights.placement.target.index;
         result.embedding_norm = weights.tensor("predictor.embedding_norm.weight");
         result.hidden_norm = weights.tensor("predictor.hidden_norm.weight");
         result.output_norm = weights.tensor("predictor.output_norm.weight");

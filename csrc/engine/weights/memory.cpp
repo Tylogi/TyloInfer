@@ -1,6 +1,8 @@
 #include "engine/weights/memory.h"
 
+#if TYLOINFER_HAS_CUDA
 #include "engine/backends/cuda/native/allocation.h"
+#endif
 #include "engine/tensor.h"
 
 #include <limits>
@@ -63,7 +65,11 @@ std::size_t Memory::ple_bytes() const {
 }
 
 LoadScope::LoadScope(Memory& ledger)
-    : previous_(loading_weight_memory), allocation_(std::make_shared<tyloi::cuda::AllocationScope>(ledger.weights_)) {
+    : previous_(loading_weight_memory)
+#if TYLOINFER_HAS_CUDA
+    , allocation_(std::make_shared<tyloi::cuda::AllocationScope>(ledger.weights_))
+#endif
+{
     loading_weight_memory = &ledger;
 }
 

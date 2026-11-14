@@ -1,7 +1,7 @@
 #pragma once
 #include <mlx/mlx.h>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 struct MlxGgufGroupedRoutes {
     mlx::core::array descriptors, count, tile_offsets, grouped_routes, route_rows;
     int tiles, tile_rows;

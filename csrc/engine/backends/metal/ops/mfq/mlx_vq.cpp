@@ -1,4 +1,6 @@
 #include "mlx_vq.h"
+#include "engine/backends/metal/native/tensor/tensor.h"
+#include "engine/weights/memory.h"
 #include "mlx_nvq_decode.h"
 #include "engine/backends/metal/native/allocation.h"
 
@@ -27,7 +29,7 @@
 #include <utility>
 #include <vector>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 
 using mlx::core::CompileOptions;
@@ -3350,7 +3352,10 @@ MlxVqWeight::MlxVqWeight(
       rotation_seed_(rotation_seed),
       residual_position_bits_(residual_position_bits),
       residual_block_vectors_(residual_block_vectors),
-      residual_blocks_per_row_(residual_blocks_per_row) {}
+      residual_blocks_per_row_(residual_blocks_per_row) {
+    for (const auto* value : {&indices_packed_, &state_packed_, &aux_packed_, &anchors_, &codebooks_, &scale_lut_, &state_to_codebank_, &bank_ids_, &rotation_signs_, &parameters_, &residual_codebook_, &residual_first_, &residual_second_})
+        tyloi::weights::observe_weight(tyloi::metal::tensor(*value));
+}
 
 MlxVqWeight MlxVqWeight::from_blob(
     std::string_view dtype,
@@ -4071,4 +4076,4 @@ array MlxVqWeight::matmul(const array& input) const {
         8);
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

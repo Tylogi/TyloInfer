@@ -1,6 +1,8 @@
 #include "mlx_mxfp4_sq.h"
+#include "engine/backends/metal/native/tensor/tensor.h"
+#include "engine/weights/memory.h"
 
-#include "tyloinfer/mxfp4_sq_blob.h"
+#include "engine/weights/encoding/mxfp4_sq_blob.h"
 #include "engine/weights/encoding/legacy.h"
 
 #include <algorithm>
@@ -16,7 +18,7 @@
 #include <utility>
 #include <vector>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 
 using mlx::core::array;
@@ -881,14 +883,17 @@ MlxMxfp4SqWeight::MlxMxfp4SqWeight(
     array row_q,
     array row_symbol_byte_offsets,
     array row_auxiliary,
-    mfq::sq::Layout layout,
+    tyloi::sq::Layout layout,
     Mxfp4SqDescriptor descriptor)
     : blob_(std::move(blob)),
       row_q_(std::move(row_q)),
       row_symbol_byte_offsets_(std::move(row_symbol_byte_offsets)),
       row_auxiliary_(std::move(row_auxiliary)),
       layout_(std::move(layout)),
-      descriptor_(descriptor) {}
+      descriptor_(descriptor) {
+    for (const auto* value : {&blob_, &row_q_, &row_symbol_byte_offsets_, &row_auxiliary_})
+        tyloi::weights::observe_weight(tyloi::metal::tensor(*value));
+}
 
 MlxMxfp4SqWeight MlxMxfp4SqWeight::from_blob(
     const std::vector<std::uint8_t>& blob) {
@@ -897,12 +902,12 @@ MlxMxfp4SqWeight MlxMxfp4SqWeight::from_blob(
 
 MlxMxfp4SqWeight MlxMxfp4SqWeight::from_blob(
     std::span<const std::uint8_t> blob) {
-    const auto layout = mfq::sq::parse(blob.data(), blob.size());
+    const auto layout = tyloi::sq::parse(blob.data(), blob.size());
     if (blob.size() > static_cast<std::size_t>(
             std::numeric_limits<int>::max())) {
         throw std::runtime_error("MXFP4-SQ payload exceeds MLX limits");
     }
-    const auto rows = mfq::sq::row_metadata(blob.data(), layout);
+    const auto rows = tyloi::sq::row_metadata(blob.data(), layout);
     Mxfp4SqDescriptor descriptor;
     descriptor.format_version = layout.version;
     descriptor.aggregate_bpw = static_cast<double>(
@@ -1373,4 +1378,4 @@ array MlxMxfp4SqWeight::backward_input(
         std::move(output_shape));
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

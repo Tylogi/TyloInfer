@@ -22,7 +22,7 @@
 #include <utility>
 #include <vector>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 
 using mlx::core::Shape;
@@ -2664,4 +2664,4 @@ array qwen4_dense_gqa_attention(
     return mlx::core::transpose(output, {0, 2, 1, 3});
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

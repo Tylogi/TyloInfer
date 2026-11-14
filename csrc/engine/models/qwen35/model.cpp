@@ -5,7 +5,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace tyloi::cuda::qwen35 {
+namespace tyloi::models::qwen35 {
 
 tyloi::models::Info Model::info() const {
     auto result = tyloi::models::model_info(metadata);
@@ -90,4 +90,4 @@ tyloi::StepSequence<tyloi::models::Prepared> Model::prepare(
     return capped ? softcap(result) : result;
 }
 
-} // namespace tyloi::cuda::qwen35
+} // namespace tyloi::models::qwen35

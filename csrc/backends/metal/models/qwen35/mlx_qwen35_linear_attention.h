@@ -11,7 +11,7 @@
 
 #include <mlx/mlx.h>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 struct MlxQwen35LinearAttentionCacheSnapshot {
     mlx::core::array convolution_state = mlx::core::array(0.0f);
@@ -162,4 +162,4 @@ private:
     tyloi::models::LinearInputs projected_;
 };
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

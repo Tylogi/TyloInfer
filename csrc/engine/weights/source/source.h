@@ -80,13 +80,15 @@ public:
     virtual TensorReader tensor_reader(std::string_view) const {
         throw TensorReaderUnsupported("model source has no retained tensor range reader");
     }
+    // Like tensor_reader, a nonempty batch reader retains its bounded source
+    // independently of this Source.
     virtual TensorBatchReader tensor_batch_reader(std::string_view) const { return {}; }
 
     // An optional retained, bounded, concurrently readable mapping.
     // An empty reader means this source does not offer mapped access.
     virtual TensorReader mapped_tensor_reader(std::string_view) const { return {}; }
-    // Optional mapped range batch: prefetch only the requested pages before
-    // copying. An empty callback leaves the ordinary row reader available.
+    // Optional retained mapped range batch: prefetch only the requested pages
+    // before copying. An empty callback leaves the ordinary row reader available.
     virtual TensorBatchReader mapped_tensor_batch_reader(std::string_view) const { return {}; }
 
     virtual const std::vector<std::string>& assets() const noexcept = 0;

@@ -6,7 +6,7 @@
 #include <cstring>
 #include <stdexcept>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 using namespace mlx::core;
 constexpr int kTile = 4096;
@@ -127,4 +127,4 @@ std::size_t MlxAneMatmul::bytes() const {
     return size;
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

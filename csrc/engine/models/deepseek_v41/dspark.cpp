@@ -137,7 +137,7 @@ struct DeepseekV41Dspark final : tyloi::models::Mtp {
         result->mlp = load_moe_at(weights, config, prefix + "mlp.",
                                   -1 - stage, config.dspark_top_k);
         result->rope = ::tyloi::ops::tail_rope_table(config.max_position_embeddings,
-            config.rope_theta, 0, ::tyloi::Device(::tyloi::kCUDA, weights.placement.device));
+            config.rope_theta, 0, ::tyloi::Device(::tyloi::kCUDA, weights.placement.target.index));
 
         const auto function_width = config.hc_mult * config.hidden;
         const auto valid_mhc = [&](const Parameter &function, const Parameter &scale, const Parameter &base,
@@ -191,7 +191,7 @@ struct DeepseekV41Dspark final : tyloi::models::Mtp {
         result.embedding = std::move(embedding);
         result.output = std::move(output);
         result.softcap = softcap;
-        result.primary = weights.placement.device;
+        result.primary = weights.placement.target.index;
         result.config = config;
         const auto first = std::string("predictor.stage.0.");
         const auto last = "predictor.stage." + std::to_string(result.config.n_mtp_layers - 1) + ".";

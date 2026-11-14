@@ -1,6 +1,5 @@
 #pragma once
 
-#include "mfq_container.h"
 #include "engine/tensor.h"
 #include "mlx_grouped_linear.h"
 #include "mlx_mx.h"
@@ -18,8 +17,9 @@
 
 #include <mlx/mlx.h>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
+class MfqContainer;
 class MlxRmsNorm;
 
 // Opt-in memory-for-bandwidth mode. When enabled before model loading,
@@ -244,4 +244,4 @@ private:
     std::optional<mlx::core::Dtype> activation_dtype_;
 };
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

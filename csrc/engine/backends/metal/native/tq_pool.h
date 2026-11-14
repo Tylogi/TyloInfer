@@ -26,7 +26,7 @@ struct TqPool {
     mlx::core::array words = mlx::core::array(0, mlx::core::uint32);
     std::byte* data = nullptr;
     std::size_t capacity = 0;
-    std::shared_ptr<mfq::metal::detail::MlxPinnedPoolStorage> storage;
+    std::shared_ptr<tyloi::metal::detail::MlxPinnedPoolStorage> storage;
     std::size_t chunk_bytes = pool_page();
     std::vector<mlx::core::array> chunks;
     std::shared_ptr<TqPoolLifetime> lifetime;

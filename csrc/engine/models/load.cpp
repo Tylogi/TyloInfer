@@ -1,15 +1,18 @@
 #include "engine/models/load.h"
 
 #include "engine/models/causal_model.h"
+#include "engine/models/qwen35/load.h"
+#include "engine/models/source.h"
+#include "engine/models/source/model_graph.h"
+
+#if TYLOINFER_HAS_CUDA
 #include "engine/models/deepseek_v41/load.h"
 #include "engine/models/gemma4/load.h"
 #include "engine/models/nemotron_h/load.h"
 #include "engine/models/minicpmo45/text/load.h"
 #include "engine/models/minicpmo45/model.h"
-#include "engine/models/qwen35/load.h"
 #include "engine/models/qwen4_exp/load.h"
-#include "engine/models/source.h"
-#include "engine/models/source/model_graph.h"
+#endif
 
 #include <stdexcept>
 #include <utility>
@@ -24,6 +27,7 @@ void load(
     LayerPlacementConfig& placement,
     LoadOptions options) {
     const auto model_graph = graph(*source);
+#if TYLOINFER_HAS_CUDA
     if (model_graph.backbone == "gemma4") {
         if (!options.cpu_offload_layers.empty())
             throw std::invalid_argument("Gemma4 does not support --cpu-offload-layers");
@@ -32,17 +36,19 @@ void load(
             options.gpu_layers, options.expert_parallel);
         return;
     }
+#endif
     if (model_graph.backbone == "qwen3_5" || model_graph.backbone == "generic_qwen") {
         int cpu_layers = 0;
-        auto model = ::tyloi::cuda::qwen35::load(
+        auto model = ::tyloi::models::qwen35::load(
             std::move(source), definition, weights, placement, options, cpu_layers);
         owner = std::move(model);
         if (options.optional_components)
-            ::tyloi::cuda::qwen35::load_components(
-                static_cast<::tyloi::cuda::qwen35::Model&>(*owner), weights, placement,
+            ::tyloi::models::qwen35::load_components(
+                static_cast<::tyloi::models::qwen35::Model&>(*owner), weights, placement,
                 cpu_layers, !options.cpu_offload_layers.empty(), options.vision_resident, false);
         return;
     }
+#if TYLOINFER_HAS_CUDA
     if (model_graph.backbone == "deepseek_v41") {
         ::tyloi::cuda::deepseek_v41::load(owner, std::move(source), definition, weights, placement, options);
         return;
@@ -63,6 +69,7 @@ void load(
         ::tyloi::cuda::minicpmo45::load(owner, std::move(source), definition, weights, placement, options);
         return;
     }
+#endif
     throw std::runtime_error(
         "unsupported model backbone: " + model_graph.backbone);
 }

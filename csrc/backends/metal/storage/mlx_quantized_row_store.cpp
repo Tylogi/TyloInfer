@@ -19,7 +19,7 @@
 #include <vector>
 #include <unistd.h>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 
 constexpr std::size_t kMxHeaderBytes = 56;
@@ -89,7 +89,7 @@ float decode_e8m0(std::uint8_t raw) {
 struct MlxQuantizedRowStore::Impl {
     struct CacheEntry {
         std::vector<mlx::core::float16_t> values;
-        mfq::NintRowBatch packed;
+        tyloi::NintRowBatch packed;
         MlxTqRowBatch tq;
     };
 
@@ -97,7 +97,7 @@ struct MlxQuantizedRowStore::Impl {
         std::int64_t row = 0;
         std::vector<mlx::core::float16_t> values;
         bool cold = false;
-        mfq::NintRowBatch packed;
+        tyloi::NintRowBatch packed;
         MlxTqRowBatch tq;
     };
 
@@ -154,12 +154,12 @@ struct MlxQuantizedRowStore::Impl {
             decoded_row_bytes = tq->selected_row_nbytes_bound();
             prepared_names = std::move(names);
         } else if (entry->dtype == "NINT") {
-            nint = std::make_unique<mfq::NintRows>(
+            nint = std::make_unique<tyloi::NintRows>(
                 static_cast<std::size_t>(entry->nbytes),
                 [this](std::size_t offset, std::uint8_t* output, std::size_t count) {
                     model.read_range_into(record, offset, std::as_writable_bytes(
                         std::span(output, count)));
-                }, true, [this](const std::vector<mfq::ReadSpan>& spans) {
+                }, true, [this](const std::vector<tyloi::ReadSpan>& spans) {
                     read_batch(spans);
                 });
             if (nint->rows() != expected_rows || nint->width() != expected_width) {
@@ -262,7 +262,7 @@ struct MlxQuantizedRowStore::Impl {
         }
     }
 
-    void read_batch(const std::vector<mfq::ReadSpan>& spans) const {
+    void read_batch(const std::vector<tyloi::ReadSpan>& spans) const {
         auto sorted = spans;
         const auto source_size = model.record(record).nbytes;
         for (const auto& span : sorted) {
@@ -372,7 +372,7 @@ struct MlxQuantizedRowStore::Impl {
         if (misses.size() > std::numeric_limits<std::size_t>::max() / source_row_bytes)
             throw std::overflow_error("MXFP8 row batch exceeds storage limits");
         std::vector<std::uint8_t> raw(misses.size() * source_row_bytes);
-        std::vector<mfq::ReadSpan> spans;
+        std::vector<tyloi::ReadSpan> spans;
         spans.reserve(misses.size() * 2);
         for (std::size_t item = 0; item < misses.size(); ++item) {
             const auto row = requested[misses[item]].row;
@@ -468,7 +468,7 @@ struct MlxQuantizedRowStore::Impl {
             std::vector<std::int64_t> selected;
             selected.reserve(misses.size());
             for (const auto index : misses) selected.push_back(requested[index].row);
-            mfq::NintRowBatch packed;
+            tyloi::NintRowBatch packed;
             nint->append_rows(selected.data(), selected.size(), packed);
             for (std::size_t item = 0; item < misses.size(); ++item)
                 packed.copy_row(item, requested[misses[item]].packed);
@@ -538,7 +538,7 @@ struct MlxQuantizedRowStore::Impl {
     std::size_t cache_capacity = 0;
     std::size_t index_bytes = 0;
     std::size_t backing_bytes = 0;
-    std::unique_ptr<mfq::NintRows> nint;
+    std::unique_ptr<tyloi::NintRows> nint;
     std::vector<MfqMappedBytes> tq_mappings;
     std::unique_ptr<MlxMappedTqTable> tq;
     std::array<mlx::core::float16_t, 1u << 16u> decode_lut{};
@@ -617,4 +617,4 @@ void MlxQuantizedRowStore::clear() {
     impl_->cache.clear();
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

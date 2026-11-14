@@ -26,7 +26,7 @@ void read(Model& model, std::shared_ptr<const tyloi::ModelSource> model_source,
           std::string_view definition, std::int64_t context_size) {
     model.source = std::move(model_source);
     const auto& source = *model.source;
-    validate_model_source(source);
+    ::tyloi::models::validate_model_source(source);
     model.graph = tyloi::models::graph(source);
     model.plan = ::tyloi::models::model_plan(model.graph);
     require_model(Model::accepts_backbone(model.graph.backbone),
@@ -62,7 +62,7 @@ void load_weights(Model& model, const tyloi::weights::Loader& tensors,
             const bool cpu_offloaded = false;
             std::cerr << "loading layer " << layer << ' ' << type << ' '
                       << (cpu_offloaded ? "CPU" : "CUDA") << std::endl;
-            auto placed = tensors.for_layer(device, cpu_offloaded);
+            auto placed = tensors.for_layer(cpu_offloaded ? ::tyloi::Device(::tyloi::kCPU) : ::tyloi::Device(::tyloi::kCUDA, device));
             TYLOINFER_RUNTIME_CHECK(type == "deepseek_v41" && model.tables.engram_parameters,
                                     "invalid DeepSeek-V4.1 block loader state");
             auto block = deepseek_v41_runtime::load_block(placed,

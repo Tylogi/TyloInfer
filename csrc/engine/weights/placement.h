@@ -34,8 +34,19 @@ struct LayerPlacementConfig {
         return devices.empty() ? 0 : devices.front();
     }
 
-    void prepare(int64_t layers);
-    int device_for_layer(int64_t layer) const;
+    void prepare(int64_t layers) {
+        layer_devices.assign(static_cast<std::size_t>(layers), primary_device());
+        if (!enabled()) return;
+        const auto slices = tyloi::plan_tensor_parallel_slices(layers, 1, devices, split);
+        for (const auto& slice : slices)
+            for (int64_t layer = slice.begin; layer < slice.end; ++layer)
+                layer_devices.at(static_cast<std::size_t>(layer)) = slice.device;
+    }
+    int device_for_layer(int64_t layer) const {
+        if (layer < 0 || layer >= static_cast<int64_t>(layer_devices.size()))
+            throw std::runtime_error("layer-placement index is outside the model");
+        return layer_devices.at(static_cast<std::size_t>(layer));
+    }
 };
 
 namespace tyloi::weights {
@@ -63,11 +74,10 @@ struct Placement {
 };
 
 inline void check_placement(const Placement& placement, Device device) {
-    if (placement.caller && *placement.caller == (device.is_cuda() ? DeviceType::cuda : DeviceType::cpu))
+    if (placement.caller && *placement.caller == device.type)
         return;
     for (const auto& place : placement.devices)
-        if (device == (place.is_cuda() ? Device(DeviceType::cuda, place.index)
-                                      : Device(DeviceType::cpu))) return;
+        if (device == place) return;
     throw std::invalid_argument("projection weight and input devices do not match");
 }
 

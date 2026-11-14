@@ -217,9 +217,9 @@ static void validate_geometry(const Config& config) {
 
 Layer load_layer(const ::tyloi::weights::Loader& weights, const Config& config, int index,
                  const std::string& type) {
-    MfqCudaGuard guard(weights.placement.device);
+    MfqCudaGuard guard(weights.placement.target.index);
     Layer layer;
-    layer.device = weights.placement.device;
+    layer.device = weights.placement.target.index;
     TransformerWeightLoader loader{weights};
     tyloi::models::glm_dsa::load_layer_weights(layer, loader, config, index, type);
     return layer;
@@ -227,7 +227,7 @@ Layer load_layer(const ::tyloi::weights::Loader& weights, const Config& config, 
 
 Model read(std::shared_ptr<const tyloi::ModelSource> source, std::string_view definition,
            int64_t context) {
-    validate_model_source(*source);
+    ::tyloi::models::validate_model_source(*source);
     Model model;
     model.source = std::move(source);
     model.graph = tyloi::models::graph(*model.source);
@@ -289,7 +289,7 @@ void load(Model& model, const ::tyloi::weights::Loader& weights, LayerPlacementC
                 MfqCudaGuard layer_guard(device);
                 const auto& type = model.metadata.layer_types.at(static_cast<size_t>(index));
                 std::cerr << "loading layer " << index << ' ' << type << " CUDA" << std::endl;
-                model.layers.push_back(load_layer(weights.for_layer(device, false), c, index, type));
+                model.layers.push_back(load_layer(weights.for_layer(::tyloi::Device(::tyloi::kCUDA, device)), c, index, type));
             }
         }
     } else {

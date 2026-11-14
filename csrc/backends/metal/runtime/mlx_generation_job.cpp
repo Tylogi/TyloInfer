@@ -1,6 +1,6 @@
 #include "mlx_generation_job.h"
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace { struct CancelledWork {}; }
 
 MlxGenerationJob::MlxGenerationJob(Work work)
@@ -58,11 +58,11 @@ bool MlxGenerationJob::done() const {
 }
 void MlxGenerationJob::join() { if (worker_.joinable()) worker_.join(); }
 
-mfq::engine::Generation consume_mlx_generation(
-    MlxGenerationJob::Work work, mfq::engine::InferenceOutput& output) {
+tyloi::engine::Generation consume_mlx_generation(
+    MlxGenerationJob::Work work, tyloi::engine::InferenceOutput& output) {
     if (output.stopped()) co_return;
     MlxGenerationJob job(std::move(work));
-    mfq::engine::ExecutionCleanup cleanup{output.cleanup_failure, [&] {
+    tyloi::engine::ExecutionCleanup cleanup{output.cleanup_failure, [&] {
         job.cancel();
         job.join();
         (void)job.take();
@@ -71,9 +71,9 @@ mfq::engine::Generation consume_mlx_generation(
         if (auto event = job.take()) {
             if (auto* token = std::get_if<std::int64_t>(&*event))
                 co_yield output.append({*token});
-            else co_yield mfq::engine::PrefillProgress{std::get<MfqPrefillTiming>(*event)};
+            else co_yield tyloi::engine::PrefillProgress{std::get<MfqPrefillTiming>(*event)};
         } else if (job.done()) break;
-        else co_yield mfq::StepState::waiting;
+        else co_yield tyloi::StepState::waiting;
     }
     // Cancellation releases a producer paused by backpressure before joining.
     // Normal completion also joins before reading statistics or model state.
@@ -81,4 +81,4 @@ mfq::engine::Generation consume_mlx_generation(
     output.metrics.mtp = job.mtp;
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

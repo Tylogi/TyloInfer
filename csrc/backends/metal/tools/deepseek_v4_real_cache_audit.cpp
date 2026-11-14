@@ -19,8 +19,8 @@ namespace {
 
 using mlx::core::Shape;
 using mlx::core::array;
-using mfq::metal::MfqContainer;
-using mfq::metal::MlxDeepseekV4CausalLm;
+using tyloi::metal::MfqContainer;
+using tyloi::metal::MlxDeepseekV4CausalLm;
 
 void require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);

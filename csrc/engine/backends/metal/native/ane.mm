@@ -12,7 +12,7 @@
 #include <string>
 #include <tuple>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 
 Class descriptor, model_class, request_class, surface_class;
@@ -190,4 +190,4 @@ std::vector<float> AneMatmul::operator()(std::span<const float> left, std::span<
     }
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

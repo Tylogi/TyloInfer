@@ -3,7 +3,7 @@
 #include "engine/backends/metal/native/kernel.h"
 #include "mlx_tensor.h"
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 using namespace mlx::core;
 constexpr const char* kDot = R"METAL(
@@ -180,4 +180,4 @@ std::optional<std::vector<array>> MlxGgufWeight::gated_residual(const array& nor
     }
     return result;
 }
-} // namespace mfq::metal
+} // namespace tyloi::metal

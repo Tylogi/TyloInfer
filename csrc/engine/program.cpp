@@ -5,6 +5,7 @@
 #include "engine/backends/cuda/executor/options.h"
 #include "engine/backends/cuda/native/env.h"
 #include "engine/backends/cuda/native/profile.h"
+#include "engine/backends/cuda/kernels/mfq_cuda_kv_quantization.h"
 #include "engine/drain.h"
 #include "engine/budget.h"
 #include "engine/config.h"
@@ -70,7 +71,7 @@ struct Assembly {
 /** Apply the owner's placement and cache policy to every tool and model loader. */
 weights::Loader loader(CudaLoadConfig& config, weights::Cache& weights, const ModelSource& source) {
     return weights.loader(source, config.weights,
-        {config.layer_placement.primary_device(), false, config.drop_file_cache,
+        {::tyloi::Device(::tyloi::kCUDA, config.layer_placement.primary_device()), config.drop_file_cache,
          config.tensor_parallel, moe_parallel_config(config)});
 }
 
@@ -93,7 +94,8 @@ Assembly assembly(const CudaLoadOptions& options, CudaLoadConfig& config,
             .cpu_offload_layers = config.dsv4_cpu_offload_layers,
             .engram_cache_rows = config.deepseek_v41_engram_cache_rows,
             .host_tokens = config.cache.pipeline,
-            .optional_components = components}};
+            .optional_components = components,
+            .kv_quantization = cuda_kv_quantization()}};
 }
 } // namespace
 
@@ -193,8 +195,7 @@ struct Program::Impl {
         groups.reset();
         ffn.reset();
         model.reset();
-        if (kv) kv->bind_budget(nullptr);
-        if (offload) offload->bind_budget(nullptr);
+        executor->bind_budget(nullptr);
         budget.reset();
         sessions.reset();
         try { executor->clear(); }
@@ -333,8 +334,7 @@ void Program::configure(engine::Config config) {
     auto scope = p.executor->enter(p.config.layer_placement.primary_device());
     if (p.budget) p.budget->reserve(p.state->graph_exit_growth());
     p.state->release_graphs();
-    if (p.kv) p.kv->bind_budget(nullptr);
-    if (p.offload) p.offload->bind_budget(nullptr);
+    p.executor->bind_budget(nullptr);
     p.budget.reset();
     p.graph.reset();
     p.sessions.reset();
@@ -355,8 +355,7 @@ void Program::configure(engine::Config config) {
         Device(kCUDA, p.config.layer_placement.primary_device()), p.executor->graph());
     p.budget.emplace(*p.executor, *p.ledger, *p.weights, *p.sessions, runtime.device);
     p.budget->bind(p.model->predictor() != nullptr);
-    if (p.kv) p.kv->bind_budget(&*p.budget);
-    if (p.offload) p.offload->bind_budget(&*p.budget);
+    p.executor->bind_budget(&*p.budget);
     if (runtime.resident_budget_bytes) {
         if (!runtime.online_budget)
             throw std::invalid_argument("online memory budgeting requires a single-device CUDA worker");

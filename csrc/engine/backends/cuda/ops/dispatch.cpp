@@ -47,13 +47,6 @@ std::unique_ptr<::tyloi::Executor::Scope> dense_scope(::tyloi::Executor* executo
     return cuda_executor->enter(target.index, cuda::FfnMode{});
 }
 
-std::int64_t kv_capacity(Device target) {
-    if (!target.is_cuda() || target.index < 0)
-        throw std::invalid_argument("KV capacity requires a CUDA device");
-    DeviceScope scope(target);
-    return cuda::Executor::current().mmq().kv_cache_capacity;
-}
-
 namespace {
 const DenseTensor& dense(const Tensor& value) {
     const auto* result = value.representation<DenseTensor>();
@@ -238,6 +231,23 @@ RopeTable rope_table(std::int64_t positions, std::int64_t dimension, double base
         !std::isfinite(base) || base <= 0.0 || active_pairs > dimension / 2)
         throw std::invalid_argument("invalid RoPE table parameters");
     return cuda::ops::rope_table(positions, dimension, base, target, frequency_dim, active_pairs);
+}
+
+RopeTable make_rope(std::int64_t positions, std::int64_t dimension, double base, Device target,
+                    std::span<const std::int64_t> sections, bool interleaved,
+                    bool official_reciprocal_frequencies, YarnScaling yarn) {
+    device(target);
+    if (positions <= 0 || dimension <= 0 || dimension % 2 || !std::isfinite(base) || base <= 0)
+        throw std::invalid_argument("invalid RoPE table parameters");
+    RopeCache cache(positions, dimension, base, 0, -1, target, official_reciprocal_frequencies, yarn);
+    cache.configure_mrope(std::vector<std::int64_t>(sections.begin(), sections.end()),
+                          interleaved, dimension, target);
+    return cache.view();
+}
+
+Tensor log_negative(const Tensor& value) {
+    input(value);
+    return owner(cuda::log(-dense(value)));
 }
 
 Tensor rope(const Tensor& value_tensor, const Tensor& positions_tensor, const RopeTable& table, bool bf16, bool grid) {

@@ -15,7 +15,7 @@
 
 #include <mlx/mlx.h>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 // Committed-only DSpark context.  The released drafter never commits draft
 // K/V: every stage owns one physical sliding-window ring containing target
@@ -183,4 +183,4 @@ private:
     std::shared_ptr<Impl> impl_;
 };
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

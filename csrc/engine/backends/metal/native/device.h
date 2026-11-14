@@ -8,7 +8,7 @@
 #include <sys/sysctl.h>
 #endif
 
-namespace mfq::metal {
+namespace tyloi::metal {
 int metal_apple_gpu_core_count() noexcept;
 
 inline const std::string& mlx_apple_chip_name() noexcept {

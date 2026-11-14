@@ -3,7 +3,7 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 int metal_apple_gpu_core_count() noexcept {
     static const int cores = [] {
         const auto service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AGXAccelerator"));

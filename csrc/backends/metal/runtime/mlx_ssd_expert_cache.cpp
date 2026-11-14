@@ -24,7 +24,7 @@
 #include <utility>
 #include <vector>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 
 tyloi::MoeCacheKey expert_key(std::size_t layer, std::int32_t expert) {
@@ -1631,4 +1631,4 @@ void MlxMoeSsdExpertCache::clear() {
         0);
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

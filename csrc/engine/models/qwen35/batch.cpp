@@ -2,7 +2,7 @@
 #include "engine/ops.h"
 
 #include "engine/weights/moe/experts.h"
-#include "components/error.h"
+#include "engine/models/common/check.h"
 
 #include <algorithm>
 #include <limits>
@@ -10,7 +10,7 @@
 #include <type_traits>
 #include <utility>
 
-namespace tyloi::cuda::qwen35 {
+namespace tyloi::models::qwen35 {
 
 using ::tyloi::Tensor;
 
@@ -77,10 +77,10 @@ tyloi::state::PagedKv::Stats Batch::paged_kv_stats() const noexcept {
 }
 
 void Batch::prepare_prefill(RequestState &request, std::int64_t offset, std::int64_t tokens) {
-    TYLOINFER_RUNTIME_CHECK(request.slot_ < 0 && offset >= 0 && offset < tokens,
+    tyloi::models::require_model(request.slot_ < 0 && offset >= 0 && offset < tokens,
                             "continuous batching prefill state is invalid");
     if (!request.state_) {
-        TYLOINFER_RUNTIME_CHECK(offset == 0, "continuous batching lost prefill state");
+        tyloi::models::require_model(offset == 0, "continuous batching lost prefill state");
         auto state = std::make_unique<State>(weights_, transposed_);
         state->reset(1);
         if (paged_kv_) {
@@ -94,13 +94,13 @@ void Batch::prepare_prefill(RequestState &request, std::int64_t offset, std::int
 }
 
 void Batch::activate(RequestState &request) {
-    TYLOINFER_RUNTIME_CHECK(request.slot_ < 0 && request.state_,
+    tyloi::models::require_model(request.slot_ < 0 && request.state_,
                             "continuous batching request has no prefill state");
     const auto free = std::find(slots_.begin(), slots_.end(), nullptr);
-    TYLOINFER_RUNTIME_CHECK(free != slots_.end(), "continuous batching has no free stable slot");
+    tyloi::models::require_model(free != slots_.end(), "continuous batching has no free stable slot");
     const auto slot = static_cast<int32_t>(free - slots_.begin());
     if (state_->batch != static_cast<std::int64_t>(slots_.size())) {
-        TYLOINFER_RUNTIME_CHECK(
+        tyloi::models::require_model(
             std::none_of(slots_.begin(), slots_.end(), [](auto *owner) { return owner != nullptr; }),
             "continuous batching aggregate state has active slots at the wrong batch size");
         state_->reset(static_cast<std::int64_t>(slots_.size()));
@@ -156,7 +156,7 @@ void Batch::resume_decode(std::int64_t cache_position) {
 void Batch::release(RequestState &request) {
     if (request.slot_ >= 0) {
         const auto slot = static_cast<std::size_t>(request.slot_);
-        TYLOINFER_RUNTIME_CHECK(slot < slots_.size() && slots_[slot] == &request,
+        tyloi::models::require_model(slot < slots_.size() && slots_[slot] == &request,
                                 "continuous batching stable slot ownership changed");
         if (request.state_)
             detach_paged(*request.state_);
@@ -191,7 +191,7 @@ void Batch::finish_retire(std::int64_t cache_position) {
 }
 
 void Batch::ensure_decode_tokens(const RequestState &request, std::int64_t tokens) {
-    TYLOINFER_RUNTIME_CHECK(request.slot_ >= 0 &&
+    tyloi::models::require_model(request.slot_ >= 0 &&
                                 static_cast<std::size_t>(request.slot_) < slots_.size() &&
                                 slots_[request.slot_] == &request,
                             "continuous batching request lost its stable slot");
@@ -215,7 +215,7 @@ void Batch::recover(const std::vector<RequestState *> &requests) {
 }
 
 void Batch::bind_paged(State &state, const std::vector<const tyloi::state::PagedKv::Sequence *> &sequences) {
-    TYLOINFER_RUNTIME_CHECK(paged_kv_, "continuous batching paged KV state is unavailable");
+    tyloi::models::require_model(bool(paged_kv_), "continuous batching paged KV state is unavailable");
     paged_kv_->update(sequences);
     std::size_t state_index = 0;
     std::size_t paged_layer = 0;
@@ -226,7 +226,7 @@ void Batch::bind_paged(State &state, const std::vector<const tyloi::state::Paged
                 if constexpr (std::is_same_v<T, Full>) {
                     tyloi::ops::DeviceScope guard(layer.device);
                     auto *cache = std::get_if<tyloi::state::KvView>(&state.layers[state_index]);
-                    TYLOINFER_RUNTIME_CHECK(cache, "continuous batching full state layout changed");
+                    tyloi::models::require_model(cache, "continuous batching full state layout changed");
                     *cache = paged_kv_->view(paged_layer++, static_cast<int64_t>(sequences.size()));
                 }
                 ++state_index;
@@ -306,7 +306,7 @@ std::string Batch::incompatibility(bool cpu_offload, int cached_slots) const {
 }
 
 void Batch::copy_to_slot(State &target, const State &source, std::int64_t slot) const {
-    TYLOINFER_RUNTIME_CHECK(source.batch == 1 && slot >= 0 && slot < target.batch &&
+    tyloi::models::require_model(source.batch == 1 && slot >= 0 && slot < target.batch &&
                                 target.layers.size() == source.layers.size() &&
                                 source.speculative_start < 0,
                             "continuous batching received an invalid stable slot");
@@ -314,24 +314,24 @@ void Batch::copy_to_slot(State &target, const State &source, std::int64_t slot) 
         tyloi::ops::DeviceScope guard(weights_.layers[index].device);
         auto &destination = target.layers[index];
         const auto &origin = source.layers[index];
-        TYLOINFER_RUNTIME_CHECK(destination.index() == origin.index(),
+        tyloi::models::require_model(destination.index() == origin.index(),
                                 "continuous batching stable slot layout changed");
         if (auto *cache = std::get_if<tyloi::state::KvView>(&destination)) {
             const auto &from = std::get<tyloi::state::KvView>(origin);
-            TYLOINFER_RUNTIME_CHECK(from.defined() && from.batch == 1,
+            tyloi::models::require_model(from.defined() && from.batch == 1,
                                     "continuous batching KV state is unavailable");
-            TYLOINFER_RUNTIME_CHECK(cache->paged() == from.paged(),
+            tyloi::models::require_model(cache->paged() == from.paged(),
                                     "continuous batching stable slot KV layout changed");
             if (!cache->paged()) {
                 const auto& from_key = from.physical_key;
                 const auto& from_value = from.physical_value;
-                TYLOINFER_RUNTIME_CHECK(from_key.dim() == 4 && from_value.dim() == 4 &&
+                tyloi::models::require_model(from_key.dim() == 4 && from_value.dim() == 4 &&
                                             from_key.size(0) == 1 && from_value.size(0) == 1 &&
                                             !from.ring &&
                                             session_kv_geometry_matches(from_key, from_value),
                                         "continuous batching KV cache geometry changed");
                 if (cache->defined())
-                    TYLOINFER_RUNTIME_CHECK(
+                    tyloi::models::require_model(
                         cache->batch == target.batch && !cache->ring &&
                             cache->physical_key.dim() == 4 && cache->physical_value.dim() == 4 &&
                             session_kv_geometry_matches(cache->physical_key, cache->physical_value) &&
@@ -360,7 +360,7 @@ void Batch::copy_to_slot(State &target, const State &source, std::int64_t slot) 
         } else {
             auto &state = std::get<LinearState>(destination);
             const auto &from = std::get<LinearState>(origin);
-            TYLOINFER_RUNTIME_CHECK(
+            tyloi::models::require_model(
                 from.mixer.defined() && !from.mixer.pending() &&
                     from.mixer.view().convolution.size(0) == 1 &&
                     from.mixer.view().recurrent.size(0) == 1,
@@ -378,7 +378,7 @@ void Batch::copy_to_slot(State &target, const State &source, std::int64_t slot) 
                     recurrent_shape, source.recurrent.options());
                 target_view.transposed = source.transposed;
             }
-            TYLOINFER_RUNTIME_CHECK(target_view.transposed == source.transposed,
+            tyloi::models::require_model(target_view.transposed == source.transposed,
                                     "continuous batching recurrent layout changed");
             tyloi::ops::copy_into(tyloi::ops::slice(target_view.convolution, 0, slot, slot + 1), source.convolution);
             tyloi::ops::copy_into(tyloi::ops::slice(target_view.recurrent, 0, slot, slot + 1), source.recurrent);
@@ -414,7 +414,7 @@ void Batch::restore_recurrent_slots(const std::vector<std::int32_t> &slots,
                                     const BatchState &state) {
     if (slots.empty())
         return;
-    TYLOINFER_RUNTIME_CHECK(state.batch == static_cast<int64_t>(slots.size()) &&
+    tyloi::models::require_model(state.batch == static_cast<int64_t>(slots.size()) &&
                                 state.layers.size() == state_->layers.size(),
                             "continuous batching recurrent snapshot layout changed");
     for (std::size_t index = 0; index < state_->layers.size(); ++index) {
@@ -423,7 +423,7 @@ void Batch::restore_recurrent_slots(const std::vector<std::int32_t> &slots,
             continue;
         tyloi::ops::DeviceScope guard(weights_.layers[index].device);
         const auto *saved = std::get_if<tyloi::state::Recurrent::State>(&state.layers[index]);
-        TYLOINFER_RUNTIME_CHECK(saved && saved->defined() &&
+        tyloi::models::require_model(saved && saved->defined() &&
                                     saved->convolution.size(0) == state.batch &&
                                     saved->recurrent.size(0) == state.batch &&
                                     saved->transposed == linear->mixer.view().transposed,
@@ -444,4 +444,4 @@ void Batch::restore_recurrent_slots(const std::vector<std::int32_t> &slots,
     }
 }
 
-} // namespace tyloi::cuda::qwen35
+} // namespace tyloi::models::qwen35

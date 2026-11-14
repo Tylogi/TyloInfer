@@ -16,7 +16,6 @@ struct KlMmqState {
     int64_t dense_calls = 0;
     int64_t moe_calls = 0;
     int64_t fallback_calls = 0;
-    int64_t kv_cache_capacity = 0;
 
     ::tyloi::DenseTensor prepare_activation(
         ::tyloi::DenseTensor input);
@@ -31,13 +30,4 @@ struct KlMmqScope {
 
     KlMmqScope(KlMmqMode mode, KlMmqState& state);
     ~KlMmqScope();
-};
-
-struct KlKvCacheCapacityScope {
-    KlMmqState& state;
-    int64_t previous_capacity;
-
-    KlKvCacheCapacityScope(
-        int64_t capacity, KlMmqState& state);
-    ~KlKvCacheCapacityScope();
 };

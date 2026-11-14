@@ -14,7 +14,7 @@
 
 #include <mlx/mlx.h>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 class MlxDeepseekV41DSparkState {
 public:
@@ -124,4 +124,4 @@ private:
     std::shared_ptr<Impl> impl_;
 };
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

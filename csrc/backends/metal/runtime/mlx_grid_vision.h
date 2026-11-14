@@ -11,7 +11,7 @@
 
 #include <mlx/mlx.h>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 using ::tyloi::GridVisionConfig;
 using ::tyloi::GridVisionLayout;
@@ -109,4 +109,4 @@ private:
   std::unique_ptr<Impl> impl_;
 };
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

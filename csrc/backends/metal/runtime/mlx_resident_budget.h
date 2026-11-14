@@ -6,7 +6,7 @@
 #include "components/error.h"
 #include <utility>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 template <typename Runtime>
 std::size_t mlx_trim_expert_residency(Runtime& runtime, std::size_t bytes) {

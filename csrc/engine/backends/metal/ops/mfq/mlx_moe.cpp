@@ -69,7 +69,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 
 using mlx::core::CompileOptions;
@@ -7154,7 +7154,7 @@ MfeProjectionView inspect_mfe_projection(std::span<const std::uint8_t> blob) {
             if (!is_ascii(raw_dtype)) {
                 throw std::runtime_error("MFE cohort dtype must be ASCII");
             }
-            current.dtype = std::string(mfq::canonical_format_dtype(std::string_view(
+            current.dtype = std::string(tyloi::canonical_format_dtype(std::string_view(
                 reinterpret_cast<const char*>(raw_dtype.data()), raw_dtype.size())));
         }
         current.runtime = cursor.bytes(
@@ -8883,7 +8883,7 @@ struct MlxMfeOffloadCache::Impl {
             || count > limit / output)
             throw std::runtime_error("invalid streamed NINT expert geometry: " + name);
         auto pool = std::make_shared<MfeStreamPool>();
-        pool->dtype = std::string(mfq::canonical_format_dtype(record.dtype));
+        pool->dtype = std::string(tyloi::canonical_format_dtype(record.dtype));
         pool->expert_count = static_cast<int>(count);
         pool->payload_bytes = record.nbytes;
         pool->layout = parse_streamed_nint_layout(model, name, 0, record.nbytes,
@@ -8996,7 +8996,7 @@ struct MlxMfeOffloadCache::Impl {
                 dtype_bytes,
                 "MFE pool dtype");
             const auto canonical = std::string(
-                mfq::canonical_format_dtype(dtype));
+                tyloi::canonical_format_dtype(dtype));
             const auto pool_rows_u64 = checked_range_product(
                 pool_experts,
                 rows_per_expert,
@@ -9035,7 +9035,7 @@ struct MlxMfeOffloadCache::Impl {
                 const auto magic = model.read_range(name, payload_offset, 4);
                 if (std::memcmp(magic.data(), "NQ1S", 4) == 0 ||
                     std::memcmp(magic.data(), "NQ1L", 4) == 0) {
-                    if (canonical != mfq::kNvqDtype || runtime_bytes != 0) {
+                    if (canonical != tyloi::kNvqDtype || runtime_bytes != 0) {
                         throw std::runtime_error("invalid streamed NVQ1 cohort metadata: " + name);
                     }
                     layout = parse_streamed_nvq1_layout(
@@ -15122,4 +15122,4 @@ MlxRoutedSwiGluFfn::forward_from_logits(
     };
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

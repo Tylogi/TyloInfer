@@ -11,7 +11,7 @@
 #include <utility>
 #include <vector>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 
 inline constexpr std::string_view kModelConfigAsset =
@@ -59,4 +59,4 @@ tyloi::ModelGraph effective_model_graph(const MfqContainer& model) {
         });
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

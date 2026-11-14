@@ -16,7 +16,7 @@
 
 #include <mlx/mlx.h>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 // A projection which can participate in the ordinary grouped Q/K/V or
 // gate/up Metal kernel. MlxGroupedLinear retains MLX array handles, so both
@@ -118,4 +118,4 @@ private:
     std::shared_ptr<Impl> impl_;
 };
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

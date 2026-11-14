@@ -67,7 +67,7 @@
 #include <variant>
 #include <vector>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 namespace {
 
@@ -135,10 +135,10 @@ std::string mtp_source_identity(const MfqContainer& model) {
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::filesystem::last_write_time(path).time_since_epoch()).count();
     }
-    return mfq::cache::block_hash_hex(mfq::cache::sha256(identity.str()));
+    return tyloi::cache::block_hash_hex(tyloi::cache::sha256(identity.str()));
 }
 
-bool mtp_ttt_requested() { return mfq::engine::environment_enabled("TYLOINFER_MTP_TTT", false); }
+bool mtp_ttt_requested() { return tyloi::engine::environment_enabled("TYLOINFER_MTP_TTT", false); }
 bool mtp_fp16_requested() {
     const auto* source = std::getenv("TYLOINFER_MTP_SOURCE");
     return mtp_ttt_requested() || (source && *source);
@@ -298,7 +298,7 @@ public:
         if (affine_) return affine_->packed_nbytes() + (affine_up_ ? affine_up_->packed_nbytes() : 0);
         if (gguf_) return gguf_->packed_nbytes() + (gguf_up_ ? gguf_up_->packed_nbytes() : 0);
         if (tq_) return tq_->packed_nbytes() + (tq_up_ ? tq_up_->packed_nbytes() : 0);
-        return mfq::mfq_compat_enabled && packed_ ? packed_->packed_nbytes() : dense_->nbytes();
+        return tyloi::mfq_compat_enabled && packed_ ? packed_->packed_nbytes() : dense_->nbytes();
     }
     static Qwen4RoutedWeight load(
         const MfqContainer& model,
@@ -331,7 +331,7 @@ public:
         if (model.record(name).dtype == "NINT") {
             const auto mapped = model.map_record(name);
             model.record_prepared(name);
-            return Qwen4RoutedWeight(mfq::with_mfq_compat([&] { return MlxMfeWeight::from_nint_blob(mapped.view()); }));
+            return Qwen4RoutedWeight(tyloi::with_mfq_compat([&] { return MlxMfeWeight::from_nint_blob(mapped.view()); }));
         }
         auto values = dense(model, name);
         if (values.ndim() != 3 || values.shape(0) <= 0 ||
@@ -361,7 +361,7 @@ public:
         if (model.record(gate).dtype == "TQ" && model.record(up).dtype == "TQ")
             return Qwen4RoutedWeight(MlxTqWeight::load(model, gate), MlxTqWeight::load(model, up));
         const bool floating_hf = model.is_hf_source() && prefix.starts_with("predictor.") && mtp_fp16_requested();
-        if (mfq::mfq_compat_enabled && model.record(gate).dtype == "MFE" &&
+        if (tyloi::mfq_compat_enabled && model.record(gate).dtype == "MFE" &&
             model.record(up).dtype == "MFE" && !floating_hf) {
             return Qwen4RoutedWeight(
                 load_routed_gate_up_weight(model, prefix));
@@ -386,7 +386,7 @@ public:
         if (gguf_) return gguf_->routed_matmul(input, expert_ids,
             input.size() / gguf_->input_size() == static_cast<std::size_t>(expert_ids.shape(0)));
         if (tq_) return tq_->routed_matmul(input, expert_ids);
-        if (mfq::mfq_compat_enabled && packed_) return packed_->routed_matmul(input, expert_ids, route_groups);
+        if (tyloi::mfq_compat_enabled && packed_) return packed_->routed_matmul(input, expert_ids, route_groups);
         return dense_matmul(input, expert_ids);
     }
 
@@ -403,7 +403,7 @@ public:
         if (gguf_) return gguf_->routed_weighted_matmul(input, expert_ids, route_weights);
         if (affine_) return moe_weighted_reduce(routed_matmul(input, expert_ids), route_weights);
         if (tq_) return tq_->routed_matmul_reduce(input, expert_ids, route_weights);
-        if (mfq::mfq_compat_enabled && packed_) {
+        if (tyloi::mfq_compat_enabled && packed_) {
             return packed_->routed_matmul_reduce(
                 input, expert_ids, route_weights, route_groups);
         }
@@ -432,7 +432,7 @@ public:
             if (!tq_up_) throw std::runtime_error("TQ Gate/Up pair is incomplete");
             return tq_->swiglu(*tq_up_, input, expert_ids);
         }
-        if (mfq::mfq_compat_enabled && packed_) return packed_->routed_swiglu(input, expert_ids, 0.0f, route_groups);
+        if (tyloi::mfq_compat_enabled && packed_) return packed_->routed_swiglu(input, expert_ids, 0.0f, route_groups);
         return moe_swiglu_split(dense_matmul(input, expert_ids));
     }
 
@@ -474,18 +474,18 @@ public:
     }
 
     bool supports_grouped_mmq() const noexcept {
-        return mfq::mfq_compat_enabled && packed_ && packed_->supports_grouped_mmq();
+        return tyloi::mfq_compat_enabled && packed_ && packed_->supports_grouped_mmq();
     }
 
     bool supports_fused_routed_reduce(const array* route_groups = nullptr) const noexcept {
         if (tq_) return tq_->input_size() < 1024;
-        return mfq::mfq_compat_enabled && packed_ && packed_->supports_fused_routed_reduce(route_groups);
+        return tyloi::mfq_compat_enabled && packed_ && packed_->supports_fused_routed_reduce(route_groups);
     }
 
     int recommended_grouped_mmq_block_rows(
         int route_count,
         bool fused_swiglu) const noexcept {
-        return mfq::mfq_compat_enabled && packed_
+        return tyloi::mfq_compat_enabled && packed_
             ? packed_->recommended_grouped_mmq_block_rows(
                   route_count, fused_swiglu)
             : 0;
@@ -537,32 +537,32 @@ public:
         if (affine_) return affine_->expert_count();
         if (gguf_) return gguf_->expert_count();
         if (tq_) return tq_->experts();
-        return mfq::mfq_compat_enabled && packed_ ? packed_->experts() : dense_->shape(0);
+        return tyloi::mfq_compat_enabled && packed_ ? packed_->experts() : dense_->shape(0);
     }
     int out_per_expert() const noexcept {
         if (affine_) return affine_->output_size();
         if (gguf_) return gguf_->output_size();
         if (tq_) return tq_->output_size();
-        return mfq::mfq_compat_enabled && packed_ ? packed_->out_per_expert() : dense_->shape(1);
+        return tyloi::mfq_compat_enabled && packed_ ? packed_->out_per_expert() : dense_->shape(1);
     }
     int neuron_len() const noexcept {
         if (affine_) return affine_->input_size();
         if (gguf_) return gguf_->input_size();
         if (tq_) return tq_->input_size();
-        return mfq::mfq_compat_enabled && packed_ ? packed_->neuron_len() : dense_->shape(2);
+        return tyloi::mfq_compat_enabled && packed_ ? packed_->neuron_len() : dense_->shape(2);
     }
     int projections() const noexcept {
         if (affine_) return affine_up_ ? 2 : 1;
         if (gguf_) return gguf_up_ ? 2 : 1;
         if (tq_) return tq_up_ ? 2 : 1;
-        return mfq::mfq_compat_enabled && packed_ ? packed_->projections() : 1;
+        return tyloi::mfq_compat_enabled && packed_ ? packed_->projections() : 1;
     }
     bool uses_tq() const noexcept { return tq_.has_value(); }
     bool uses_gguf() const noexcept { return gguf_.has_value(); }
     bool uses_affine() const noexcept { return affine_.has_value(); }
 
     const MlxMfeWeight* packed_weight_ref() const noexcept {
-        return mfq::mfq_compat_enabled && packed_ ? &*packed_ : nullptr;
+        return tyloi::mfq_compat_enabled && packed_ ? &*packed_ : nullptr;
     }
 
 private:
@@ -1057,7 +1057,7 @@ public:
             ? std::optional<std::string>(expert_prefix + "up.weight")
             : std::nullopt;
         const auto down_name = expert_prefix + "down.weight";
-        if (mfq::mfq_compat_enabled && mfe_offload_cache) {
+        if (tyloi::mfq_compat_enabled && mfe_offload_cache) {
             for (const auto& name : {gate_name, up_name.value_or(gate_name), down_name}) {
                 if (!mfe_offload_cache->can_group_mfe(name)) {
                     throw std::runtime_error(
@@ -1126,7 +1126,7 @@ public:
     std::optional<MlxSsdPrefetchedExpertLayer> prefetch_routed(
         std::size_t rows) const {
         constexpr std::size_t kFullLayerPrefetchRows = 512;
-        if (mfq::mfq_compat_enabled && ssd_expert_cache_ && rows >= kFullLayerPrefetchRows &&
+        if (tyloi::mfq_compat_enabled && ssd_expert_cache_ && rows >= kFullLayerPrefetchRows &&
             ssd_expert_cache_->prefill_overlap_enabled()) {
             return ssd_expert_cache_->prefetch_layer(
                 expert_cache_layer_);
@@ -1136,7 +1136,7 @@ public:
 
     std::optional<Qwen4CachedRoute> cached_route() const {
 #if TYLOINFER_ENABLE_MFQ_COMPAT
-        if (!mfq::mfq_compat_enabled || !mfe_offload_cache_) return std::nullopt;
+        if (!tyloi::mfq_compat_enabled || !mfe_offload_cache_) return std::nullopt;
         Qwen4CachedRoute route{mfe_offload_cache_, {}, std::nullopt};
         for (const auto& name : {gate_name_, up_name_.value_or(down_name_), down_name_}) {
             if (route.projections.size() == 2 && !up_name_) break;
@@ -1284,7 +1284,7 @@ public:
                 }
                 return output;
             }
-            if (mfq::mfq_compat_enabled && ssd_expert_cache_) {
+            if (tyloi::mfq_compat_enabled && ssd_expert_cache_) {
                 auto prepared = ssd_expert_cache_->prepare_routes(
                     expert_cache_layer_, routes.ids);
                 auto intermediate =
@@ -1309,7 +1309,7 @@ public:
                 }
                 return output;
             }
-            if (mfq::mfq_compat_enabled && mfe_offload_cache_) {
+            if (tyloi::mfq_compat_enabled && mfe_offload_cache_) {
                 if (tokens == 1 && !tyloi::profiling::active()) {
                     auto local_route = deferred_route ? std::nullopt : cached_route();
                     auto* cached = deferred_route ? deferred_route : local_route ? &*local_route : nullptr;
@@ -1441,7 +1441,7 @@ public:
                 return output;
             }
 #endif
-            if (mfq::mfq_compat_enabled && tokens >= 32
+            if (tyloi::mfq_compat_enabled && tokens >= 32
                 && gate_up_->supports_grouped_mmq()
                 && down_->supports_grouped_mmq()) {
                 // Gate/up and down use the same routing. Keep rows in expert
@@ -1467,7 +1467,7 @@ public:
                     routes.ids,
                     route_order,
                     gate_block_rows);
-                std::optional<mfq::metal::MlxGroupedMmqPlan> down_plan;
+                std::optional<tyloi::metal::MlxGroupedMmqPlan> down_plan;
                 if (down_block_rows != gate_block_rows) {
                     down_plan.emplace(
                         down_->build_grouped_mmq_plan(
@@ -1644,7 +1644,7 @@ private:
             down_->out_per_expert() != config_.hidden_size)) {
             throw std::runtime_error("Qwen4 routed expert geometry disagrees");
         }
-        if (mfq::mfq_compat_enabled && mfe_offload_cache_) {
+        if (tyloi::mfq_compat_enabled && mfe_offload_cache_) {
             for (const auto& name : {gate_name_, up_name_.value_or(gate_name_), down_name_})
                 mfe_offload_cache_->activate_record(name);
             mfe_offload_cache_->prepare_projection(gate_name_, true, !up_name_);
@@ -1750,7 +1750,7 @@ public:
             const auto name = prefix + ".ngram.shard." +
                 std::to_string(index) + ".weight";
             const auto& record = model.record(name);
-            const bool nint = mfq::mfq_compat_enabled && record.dtype == "NINT";
+            const bool nint = tyloi::mfq_compat_enabled && record.dtype == "NINT";
             const bool tq = record.dtype == "TQ";
             const bool gguf = is_gguf_dtype(record.dtype);
             const bool affine = record.dtype == "MLX-AFFINE";
@@ -1985,7 +1985,7 @@ private:
         if (shards_.front().floating) return mlx::core::reshape(lookup.floating.decode(dtype), shape);
         if (shards_.front().gguf) return mlx::core::reshape(lookup.gguf.decode(), shape);
         if (shards_.front().tq) return mlx::core::reshape(lookup.tq.decode(), shape);
-        if (mfq::mfq_compat_enabled && shards_.front().nint) {
+        if (tyloi::mfq_compat_enabled && shards_.front().nint) {
             return mlx::core::reshape(lookup.selected.decode(), shape);
         }
         return array(lookup.values.begin(), shape);
@@ -4256,7 +4256,7 @@ private:
     MlxProjectionBatch cache_projections_;
     MlxRmsNorm index_query_norm_;
     MlxRmsNorm index_key_norm_;
-    std::shared_ptr<QsaKvStore> kv_store_ = mlx_qsa_kv_offload_store();
+    std::shared_ptr<tyloi::cache::QsaKvStore> kv_store_ = mlx_qsa_kv_offload_store();
     std::unique_ptr<MlxQsaKvOffload> offloaded_kv_;
     std::unique_ptr<MlxQsaIndexOffload> offloaded_pool_;
     std::unique_ptr<MlxKvCache> cache_;
@@ -4961,7 +4961,7 @@ struct MlxQwen4RequestCache {
     std::optional<array> draft_hidden, draft_ids, draft_result;
     std::vector<std::int32_t> verified_ids;
     MlxMtpHistoryBuffer pending_history;
-    mfq::engine::mtp::PolicyState policy;
+    tyloi::engine::mtp::PolicyState policy;
     std::size_t bytes() const noexcept {
         std::size_t result = 0;
         const auto add_layers = [&](const auto& list) { for (const auto& layer : list) {
@@ -5312,7 +5312,7 @@ struct MlxQwen4CausalLm::Impl {
                 model.record("model.block.0.mlp.experts.gate.weight").dtype == "MLX-AFFINE") {
                 native_expert_cache = std::make_shared<MlxAffineExpertCache>(model, prefixes, *expert_cache_bytes, 8);
             } else try {
-                ssd_expert_cache = mfq::with_mfq_compat([&] { return std::make_shared<MlxMoeSsdExpertCache>(
+                ssd_expert_cache = tyloi::with_mfq_compat([&] { return std::make_shared<MlxMoeSsdExpertCache>(
                     model,
                     prefixes,
                     static_cast<std::size_t>(config.hidden_size),
@@ -5322,7 +5322,7 @@ struct MlxQwen4CausalLm::Impl {
                     8,
                     *expert_cache_bytes >= prefill_buffers_minimum); });
             } catch (const MlxMfeMxfp4Unsupported&) {
-                mfe_offload_cache = mfq::with_mfq_compat([&] { return std::make_shared<MlxMfeOffloadCache>(
+                mfe_offload_cache = tyloi::with_mfq_compat([&] { return std::make_shared<MlxMfeOffloadCache>(
                     model,
                     *expert_cache_bytes,
                     static_cast<int>(config.num_experts)); });
@@ -5701,7 +5701,7 @@ public:
     std::shared_ptr<MlxTqExpertCache> tq_expert_cache;
     std::shared_ptr<MlxPackedExpertCache> native_expert_cache;
     MlxMtpGenerationStats last_mtp_stats;
-    mfq::engine::mtp::PolicyState mtp_policy_state;
+    tyloi::engine::mtp::PolicyState mtp_policy_state;
     int cache_batch = 0;
     int cache_position = 0;
     bool speculative_pending = false;
@@ -6256,7 +6256,7 @@ std::size_t MlxQwen4CausalLm::kv_cache_bytes() const noexcept {
     return bytes;
 }
 
-std::optional<QsaKvStoreStats> MlxQwen4CausalLm::qsa_kv_offload_stats() const {
+std::optional<tyloi::cache::QsaKvStoreStats> MlxQwen4CausalLm::qsa_kv_offload_stats() const {
     if (kv_offload_store_) return kv_offload_store_->stats();
     return std::nullopt;
 }
@@ -6272,7 +6272,7 @@ std::size_t MlxQwen4CausalLm::dynamic_weight_bytes() const noexcept {
     if (impl_->native_expert_cache) return impl_->native_expert_cache->resident_bytes();
     if (impl_->tq_expert_cache) return impl_->tq_expert_cache->resident_bytes();
     // MXFP4 arenas are preallocated and already part of the load baseline.
-    return (mfq::mfq_compat_enabled && impl_->mfe_offload_cache) ? impl_->mfe_offload_cache->resident_packed_bytes() : 0;
+    return (tyloi::mfq_compat_enabled && impl_->mfe_offload_cache) ? impl_->mfe_offload_cache->resident_packed_bytes() : 0;
 }
 
 std::size_t MlxQwen4CausalLm::set_expert_cache_limit(std::size_t bytes) {
@@ -6324,7 +6324,7 @@ std::size_t MlxQwen4CausalLm::set_expert_cache_limit(std::size_t bytes) {
     }
     if (!impl_->mfe_offload_cache) {
         if (!impl_->ssd_expert_cache && resident_full_expert_bytes() <= bytes) return 0;
-        auto cache = mfq::with_mfq_compat([&] { return std::make_shared<MlxMfeOffloadCache>(*impl_->source, bytes,
+        auto cache = tyloi::with_mfq_compat([&] { return std::make_shared<MlxMfeOffloadCache>(*impl_->source, bytes,
             static_cast<int>(impl_->config.num_experts)); });
         for (const auto& layer : impl_->layers) layer.validate_offload(cache);
         if (impl_->mtp && !impl_->mtp_full_precision) impl_->mtp->validate_offload(cache);
@@ -6364,7 +6364,7 @@ std::size_t MlxQwen4CausalLm::reclaimable_expert_bytes() const noexcept {
     if (impl_->native_expert_cache) return impl_->native_expert_cache->resident_bytes();
     if (impl_->tq_expert_cache) return impl_->tq_expert_cache->resident_bytes();
     if (impl_->ssd_expert_cache) return impl_->ssd_expert_cache->cache_limit_bytes();
-    return resident_full_expert_bytes() + ((mfq::mfq_compat_enabled && impl_->mfe_offload_cache) ? impl_->mfe_offload_cache->resident_packed_bytes() : 0);
+    return resident_full_expert_bytes() + ((tyloi::mfq_compat_enabled && impl_->mfe_offload_cache) ? impl_->mfe_offload_cache->resident_packed_bytes() : 0);
 }
 
 std::size_t MlxQwen4CausalLm::resident_full_expert_bytes() const noexcept {
@@ -6381,7 +6381,7 @@ std::size_t MlxQwen4CausalLm::ssd_expert_payload_bytes() const noexcept {
     if (impl_->native_expert_cache) return impl_->native_expert_cache->backing_bytes();
     if (impl_->tq_expert_cache) return impl_->tq_expert_cache->backing_bytes();
     if (impl_->mfe_offload_cache) return impl_->mfe_offload_cache->backing_payload_bytes();
-    return (mfq::mfq_compat_enabled && impl_->ssd_expert_cache) ? impl_->expert_payload_bytes : 0;
+    return (tyloi::mfq_compat_enabled && impl_->ssd_expert_cache) ? impl_->expert_payload_bytes : 0;
 }
 
 std::int32_t MlxQwen4CausalLm::generate(
@@ -6521,7 +6521,7 @@ std::int32_t MlxQwen4CausalLm::generate_prepared_impl(
     tyloi::profiling::Components component_profile;
     const auto profile_started = std::chrono::steady_clock::now();
     auto logits = [&] {
-        mfq::engine::PrefillActivity prefill_activity;
+        tyloi::engine::PrefillActivity prefill_activity;
         tyloi::profiling::ProfileScope component_scope(
             profile_prefill ? &component_profile : nullptr);
         tyloi::profiling::EvaluationScope timing(
@@ -6963,7 +6963,7 @@ std::size_t MlxQwen4CausalLm::expert_cache_limit_bytes() const noexcept {
     if (impl_->ssd_expert_cache) {
         return impl_->ssd_expert_cache->cache_limit_bytes();
     }
-    return (mfq::mfq_compat_enabled && impl_->mfe_offload_cache)
+    return (tyloi::mfq_compat_enabled && impl_->mfe_offload_cache)
         ? impl_->mfe_offload_cache->cache_limit_bytes()
         : 0;
 }
@@ -7043,9 +7043,9 @@ const std::string& MlxQwen4CausalLm::mtp_cache_fingerprint() const noexcept { re
 
 void MlxQwen4CausalLm::prepare_mtp_ttt(const std::filesystem::path& directory) {
     if (!mtp_ttt_requested() || !impl_->mtp_full_precision || impl_->mtp_lora) return;
-    const auto hot = mfq::engine::environment_uint64("TYLOINFER_MTP_TTT_RAM_BYTES", 12ULL << 30);
-    const auto disk = mfq::engine::environment_uint64("TYLOINFER_MTP_TTT_DISK_BYTES", 16ULL << 30);
-    const auto key = mfq::cache::block_hash_hex(mfq::cache::sha256(impl_->mtp_base_key));
+    const auto hot = tyloi::engine::environment_uint64("TYLOINFER_MTP_TTT_RAM_BYTES", 12ULL << 30);
+    const auto disk = tyloi::engine::environment_uint64("TYLOINFER_MTP_TTT_DISK_BYTES", 16ULL << 30);
+    const auto key = tyloi::cache::block_hash_hex(tyloi::cache::sha256(impl_->mtp_base_key));
     const auto& config = impl_->config;
     const int h = config.hidden_size, q = config.num_attention_heads * config.head_dim;
     std::vector<MlxMtpLoraProjection> layout{{"attention.q", h, q}, {"attention.gate", h, q}, {"attention.o", q, h}};
@@ -7102,9 +7102,9 @@ MlxQwen4TextSessionState MlxQwen4CausalLm::capture_text_session_state(
     const auto bytes = [&](const MlxQwen4LayerCacheSnapshot& layer) {
         if (layer.kv) state.bytes += layer.kv->nbytes();
         if (layer.offloaded_kv) state.bytes += layer.offloaded_kv->rows.tail.size() +
-            layer.offloaded_kv->rows.blocks.size() * sizeof(QsaKvStore::BlockPtr);
+            layer.offloaded_kv->rows.blocks.size() * sizeof(tyloi::cache::QsaKvStore::BlockPtr);
         if (layer.offloaded_pooled_keys) state.bytes += layer.offloaded_pooled_keys->rows.tail.size() +
-            layer.offloaded_pooled_keys->rows.blocks.size() * sizeof(QsaKvStore::BlockPtr);
+            layer.offloaded_pooled_keys->rows.blocks.size() * sizeof(tyloi::cache::QsaKvStore::BlockPtr);
         for (const auto* value : {&layer.index_keys, &layer.pooled_keys, &layer.convolution,
             &layer.recurrent, &layer.ple_convolution}) if (*value) state.bytes += (*value)->nbytes();
         state.bytes += layer.ple_context.size() * sizeof(std::int64_t);
@@ -7141,4 +7141,4 @@ void MlxQwen4CausalLm::restore_text_session_state(
     }
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

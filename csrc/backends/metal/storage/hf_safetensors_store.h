@@ -12,7 +12,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 struct HfSafetensorRecord {
     std::string name;
@@ -162,4 +162,4 @@ private:
     std::vector<ExpertRecord> experts_;
 };
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

@@ -206,7 +206,7 @@ void prepare_kernel(mlx::core::Primitive& primitive) {
     const auto state = static_cast<mlx::core::fast::CustomKernel&>(primitive).state();
     auto& device = mlx::core::metal::device(primitive.stream().device);
     auto* library = device.get_library(key, mlx::core::CompileOptions(std::get<10>(state)),
-        [&] { return std::string(mfq::metal::detail::kMlxUtilsSource) + std::get<1>(state); });
+        [&] { return std::string(tyloi::metal::detail::kMlxUtilsSource) + std::get<1>(state); });
     (void)device.get_kernel(std::get<0>(state), library);
 }
 
@@ -292,7 +292,7 @@ struct Description {
         if (auto* ready = pipeline.load(std::memory_order_relaxed)) return ready;
         auto& backend = mlx::core::metal::device(device);
         auto* library = backend.get_library(library_name, CompileOptions(options),
-            [&] { return std::string(mfq::metal::detail::kMlxUtilsSource) + source; });
+            [&] { return std::string(tyloi::metal::detail::kMlxUtilsSource) + source; });
         owner = NS::RetainPtr(backend.get_kernel(name, library));
         pipeline.store(owner.get(), std::memory_order_release);
         return owner.get();

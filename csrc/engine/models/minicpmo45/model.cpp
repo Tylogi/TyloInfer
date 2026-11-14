@@ -33,7 +33,7 @@ tyloi::engine::Metrics Model::metrics() const {
 }
 
 Model read(std::shared_ptr<const tyloi::ModelSource> source, std::string_view definition, int64_t context) {
-    validate_model_source(*source);
+    ::tyloi::models::validate_model_source(*source);
     Model model;
     model.source = std::move(source);
     model.graph = tyloi::models::graph(*model.source);
@@ -72,14 +72,14 @@ Model read(std::shared_ptr<const tyloi::ModelSource> source, std::string_view de
 void load(Model& model, const tyloi::weights::Loader& weights, const LayerPlacementConfig& placement,
           int cpu_layers, const tyloi::ops::YarnScaling& yarn) {
     const auto& config = model.config;
-    MfqCudaGuard guard(weights.placement.device);
+    MfqCudaGuard guard(weights.placement.target.index);
     const auto make_rope = [&](::tyloi::Device device) {
         RopeCache rope(config.max_position_embeddings, config.rotary_dim, config.rope_base,
             0, -1, device, false, yarn);
 
         return rope.view();
     };
-    model.rope = make_rope(::tyloi::Device(::tyloi::kCUDA, weights.placement.device));
+    model.rope = make_rope(::tyloi::Device(::tyloi::kCUDA, weights.placement.target.index));
     if (cpu_layers > 0) model.cpu_rope = make_rope(::tyloi::Device(::tyloi::kCPU));
     if (placement.enabled())
         for (int device : placement.devices) {
@@ -99,7 +99,7 @@ void load(Model& model, const tyloi::weights::Loader& weights, const LayerPlacem
         layer.cpu = index < cpu_layers;
         MfqCudaGuard layer_guard(layer.device);
         std::cerr << "loading layer " << index << " full_attention " << (layer.cpu ? "CPU" : "CUDA") << '\n';
-        const auto placed = weights.for_layer(layer.device, layer.cpu);
+        const auto placed = weights.for_layer(layer.cpu ? ::tyloi::Device(::tyloi::kCPU) : ::tyloi::Device(::tyloi::kCUDA, layer.device));
         TransformerWeightLoader loader{placed};
         const auto prefix = "model.block." + std::to_string(index) + ".";
         tyloi::models::load_attention_mixer(layer.attention, loader, config, index, prefix, 1.0);

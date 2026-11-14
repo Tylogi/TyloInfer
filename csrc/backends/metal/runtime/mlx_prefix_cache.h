@@ -6,7 +6,7 @@
 #include <functional>
 #include <string_view>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 struct MlxPrefixCacheHooks {
     std::size_t block_size = 0;
@@ -56,4 +56,4 @@ inline bool mlx_prefix_nax_architecture(std::string_view architecture) noexcept 
     return result.ec == std::errc{} && generation >= 17;
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

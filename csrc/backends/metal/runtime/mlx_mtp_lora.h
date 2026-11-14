@@ -6,7 +6,7 @@
 #include <optional>
 #include <unordered_map>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 struct MlxMtpLoraProjection {
     std::string name;
@@ -83,4 +83,4 @@ private:
     MlxMtpLora* previous_;
 };
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

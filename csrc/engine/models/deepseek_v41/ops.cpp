@@ -106,7 +106,7 @@ std::unique_ptr<Block> load_block(const tyloi::weights::Loader& weights,
     }
     result->rope = ::tyloi::ops::tail_rope_table(
         config.max_position_embeddings, config.rope_theta, result->ratio,
-        ::tyloi::Device(::tyloi::kCUDA, weights.placement.device),
+        ::tyloi::Device(::tyloi::kCUDA, weights.placement.target.index),
         config.compress_rope_theta, config.rope_scaling.original_max_position_embeddings,
         config.rope_scaling.factor, config.rope_scaling.beta_fast, config.rope_scaling.beta_slow);
 

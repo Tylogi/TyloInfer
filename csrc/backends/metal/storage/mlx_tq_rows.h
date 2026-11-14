@@ -6,7 +6,7 @@
 #include <vector>
 #include <mlx/mlx.h>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 class MlxTqRowBatch {
 public:
@@ -69,4 +69,4 @@ private:
     std::size_t row_bound_ = 0;
 };
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

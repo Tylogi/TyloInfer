@@ -3,7 +3,7 @@
 #include <optional>
 #include <mlx/mlx.h>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 mlx::core::array mlx_csa2_pack(const mlx::core::array& value,
     int bits, int group_size, bool e4m3_scale = false);

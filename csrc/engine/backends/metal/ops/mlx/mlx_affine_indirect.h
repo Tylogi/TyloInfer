@@ -6,7 +6,7 @@
 
 namespace tyloi::metal { class ResidentAllocations; }
 
-namespace mfq::metal {
+namespace tyloi::metal {
 class MlxAffineIndirectWeight {
 public:
     static constexpr int kVectorRows = 6;
@@ -29,4 +29,4 @@ private:
     std::array<mlx::core::array, 3> tables_;
     friend class MlxAffineStaged;
 };
-} // namespace mfq::metal
+} // namespace tyloi::metal

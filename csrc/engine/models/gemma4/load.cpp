@@ -33,13 +33,12 @@ struct LayerLoader {
     }
     auto rope(int64_t capacity, const tyloi::models::gemma4::LayerSpec &spec) {
         return tyloi::ops::rope_table(capacity, spec.head_dim, spec.rope_base,
-            tyloi::Device(tyloi::kCUDA, weights.placement.device),
+            weights.placement.target,
             spec.head_dim, spec.rotary_pairs);
     }
     auto ones(int64_t width) {
         const std::array<int64_t, 1> shape{width};
-        auto value = tyloi::ops::full(shape, 1, tyloi::Device(
-            weights.placement.cpu ? tyloi::kCPU : tyloi::kCUDA, weights.placement.device));
+        auto value = tyloi::ops::full(shape, 1, weights.placement.target);
         return tyloi::ops::cast(value, tyloi::kFloat32);
     }
     auto layer_scale(const std::string &name) {
@@ -78,7 +77,7 @@ struct LayerLoader {
 
 void load_layer(Layer& result, const tyloi::weights::Loader& weights, const Config &config,
                  int layer, const std::string &type) {
-    result.device = weights.placement.device;
+    result.device = weights.placement.target.index;
     LayerLoader loader{weights};
     tyloi::models::gemma4::load_layer(result.attention, result, loader, config, layer, type);
 }
@@ -117,7 +116,7 @@ void load(Model& model, const tyloi::weights::Loader& weights, LayerPlacementCon
                 const auto& type = config.layer_types.at(static_cast<std::size_t>(index));
                 std::cerr << "loading layer " << index << ' ' << type << " CUDA" << std::endl;
                 auto& layer = model.layers.emplace_back();
-                load_layer(layer, weights.for_layer(device, false), config, index, type);
+                load_layer(layer, weights.for_layer(::tyloi::Device(::tyloi::kCUDA, device)), config, index, type);
             }
         }
     } else {

@@ -20,7 +20,7 @@
 
 #include <mlx/mlx.h>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 class MlxNemotronHCausalLm;
 
@@ -235,10 +235,10 @@ private:
     std::optional<MlxNemotronHMtpModule> mtp_;
     std::optional<MlxNemotronHRadioPromptComponent> vision_;
     MlxMtpGenerationStats last_mtp_stats_;
-    mfq::engine::mtp::PolicyState mtp_policy_state_;
+    tyloi::engine::mtp::PolicyState mtp_policy_state_;
     int cache_position_ = 0;
     int cache_batch_ = 0;
     bool speculative_pending_ = false;
 };
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

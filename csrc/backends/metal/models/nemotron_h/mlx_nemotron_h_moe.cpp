@@ -8,7 +8,7 @@
 #include <string>
 #include <utility>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 
 using mlx::core::Shape;
@@ -197,7 +197,7 @@ void MlxNemotronHMoeBlock::validate_components() const {
             tq_up_->input_size() != latent || tq_up_->output_size() != intermediate ||
             tq_down_->input_size() != intermediate || tq_down_->output_size() != latent)
             throw std::runtime_error("Nemotron-H TQ expert bank dimensions are inconsistent");
-    } else if (mfq::mfq_compat_enabled && routed_present) {
+    } else if (tyloi::mfq_compat_enabled && routed_present) {
         if (routed_up_->weight().neuron_len() != latent ||
             routed_up_->weight().out_per_expert() != intermediate ||
             routed_down_->weight().neuron_len() != intermediate ||
@@ -262,7 +262,7 @@ array MlxNemotronHMoeBlock::forward_moe(const array& input) const {
     const auto latent_values = (*latent_in_)(flat);
     const auto experts = [&]() -> array {
         if (tq_up_) return tq_up_->routed_matmul(latent_values, ids);
-        if (mfq::mfq_compat_enabled && routed_up_) {
+        if (tyloi::mfq_compat_enabled && routed_up_) {
             return routed_up_->forward(latent_values, ids);
         }
         const auto selected = mlx::core::take(*dense_up_, ids, 0);
@@ -276,7 +276,7 @@ array MlxNemotronHMoeBlock::forward_moe(const array& input) const {
     const auto activated = relu_squared(experts);
     const auto down = [&]() -> array {
         if (tq_down_) return tq_down_->routed_matmul(activated, ids);
-        if (mfq::mfq_compat_enabled && routed_down_) {
+        if (tyloi::mfq_compat_enabled && routed_down_) {
             return routed_down_->forward(activated, ids);
         }
         const auto selected = mlx::core::take(*dense_down_, ids, 0);
@@ -293,4 +293,4 @@ array MlxNemotronHMoeBlock::forward_moe(const array& input) const {
     return mlx::core::reshape(combined, Shape{batch, tokens, hidden});
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

@@ -51,7 +51,7 @@ public:
 
 private:
     Stream* previous_;
-    std::optional<mlx::core::Stream> previous_default_;
+    mlx::core::Stream previous_default_;
 };
 
 void eval(mlx::core::array& value);

@@ -5,7 +5,7 @@
 
 #include <mlx/mlx.h>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 // A bounded decode-compressor delta.  emitted is [B,1,D] and is valid only
 // when the corresponding int32 emit_rows entry is non-negative.
@@ -196,4 +196,4 @@ mlx::core::array mlx_dsa_sparse_decode_attention(
     int window,
     std::optional<float> scale = std::nullopt);
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

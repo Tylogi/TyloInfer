@@ -14,6 +14,8 @@ public:
     virtual std::optional<ModelGraph> model_graph() const = 0;
 };
 
+namespace models { void validate_model_source(const ModelSource& source); }
+
 std::shared_ptr<const ModelSource> open_model_source(
     const std::filesystem::path& path);
 

@@ -4,7 +4,7 @@
 #include <string>
 #include <vector>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 class MlxGgufRowBatch {
 public:
@@ -33,4 +33,4 @@ private:
     int width_;
     std::size_t row_bytes_;
 };
-} // namespace mfq::metal
+} // namespace tyloi::metal

@@ -21,7 +21,7 @@
 namespace tyloi::cuda::minicpmo45::text {
 
 Model read(std::shared_ptr<const tyloi::ModelSource> source, std::string_view definition, int64_t context) {
-    validate_model_source(*source);
+    ::tyloi::models::validate_model_source(*source);
     Model model;
     model.source = std::move(source);
     model.graph = tyloi::models::graph(*model.source);
@@ -69,8 +69,9 @@ Layer load_layer(const tyloi::weights::Loader& weights, const Config& config, in
     if (type != "full_attention")
         throw std::runtime_error("unsupported MiniCPM layer type: " + type);
     Layer layer;
-    layer.device = weights.placement.device;
-    layer.cpu = weights.placement.cpu;
+    layer.device = weights.placement.target.is_cuda()
+        ? weights.placement.target.index : mfq_current_cuda_device();
+    layer.cpu = weights.placement.target.is_cpu();
     layer.attention.official_bf16 = true;
     TransformerWeightLoader loader{weights};
     loader.preserve_projection_boundaries = true;
@@ -123,7 +124,7 @@ void load(Model& model, const tyloi::weights::Loader& weights, LayerPlacementCon
                 MfqCudaGuard layer_guard(device);
                 const auto& type = model.metadata.layer_types.at(index);
                 std::cerr << "loading layer " << index << ' ' << type << ' ' << (cpu ? "CPU" : "CUDA") << std::endl;
-                model.layers.push_back(load_layer(weights.for_layer(device, cpu), config, index, type));
+                model.layers.push_back(load_layer(weights.for_layer(cpu ? ::tyloi::Device(::tyloi::kCPU) : ::tyloi::Device(::tyloi::kCUDA, device)), config, index, type));
             }
         }
     } else {

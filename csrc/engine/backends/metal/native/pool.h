@@ -11,7 +11,9 @@ namespace tyloi::metal {
 
 class Pool {
 public:
-    Pool(std::size_t limit, std::size_t maximum_entry);
+    // Upper bound for retaining all page-aligned entries despite chunk boundaries.
+    static std::size_t capacity_for(std::size_t bytes, std::size_t maximum_entry, std::size_t entries);
+    Pool(std::size_t limit, std::size_t maximum_entry, std::size_t reserve = 0);
     ~Pool();
     Pool(const Pool&) = delete;
     Pool& operator=(const Pool&) = delete;

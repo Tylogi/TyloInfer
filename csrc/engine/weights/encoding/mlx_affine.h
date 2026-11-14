@@ -5,7 +5,7 @@
 #include <string>
 #include <vector>
 
-namespace mfq {
+namespace tyloi {
 
 struct MlxAffineLayout {
     std::vector<std::int64_t> shape;
@@ -23,4 +23,4 @@ struct MlxAffineLayout {
     std::uint64_t total_bytes() const { return biases_offset() + scales_bytes; }
 };
 
-} // namespace mfq
+} // namespace tyloi

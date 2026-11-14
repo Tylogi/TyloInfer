@@ -3,7 +3,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace mfq {
+namespace tyloi {
 
 MlxAffineBinding mlx_affine_binding(const tyloi::Safetensors& source,
     const nlohmann::json& quantization, const tyloi::TensorMetadata& values) {
@@ -40,4 +40,4 @@ MlxAffineBinding mlx_affine_binding(const tyloi::Safetensors& source,
     return binding;
 }
 
-} // namespace mfq
+} // namespace tyloi

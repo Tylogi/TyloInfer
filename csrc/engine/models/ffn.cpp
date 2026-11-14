@@ -32,13 +32,13 @@ public:
         : source_(std::move(source)), weights_(std::move(weights)),
           offload_(options.cpu_offload_layers.count(layer) != 0), layer_(layer),
           primary_(placement.primary_device()), config_(std::move(config)) {
-        if (weights_.placement.device != primary_) throw std::invalid_argument("FFN primary device mismatch");
+        if (weights_.placement.target != ::tyloi::Device(::tyloi::kCUDA, primary_)) throw std::invalid_argument("FFN primary device mismatch");
     }
 
     void prepare() override {
         if (attempted_) throw std::logic_error("FFN preparation already attempted");
         attempted_ = true;
-        const auto weights = weights_.for_layer(primary_, false);
+        const auto weights = weights_.for_layer(::tyloi::Device(::tyloi::kCUDA, primary_));
         MfqCudaGuard guard(primary_);
         if (const auto* config = std::get_if<Glm>(&config_)) {
             TransformerWeightLoader loader{weights};

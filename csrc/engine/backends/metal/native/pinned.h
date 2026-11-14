@@ -5,7 +5,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-namespace mfq::metal::detail {
+namespace tyloi::metal::detail {
 
 struct MlxPinnedPoolStorage {
     void* data = MAP_FAILED;

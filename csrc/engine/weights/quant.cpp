@@ -17,12 +17,6 @@
 
 using namespace tyloi::cuda::quant_format;
 
-bool is_quant_dtype(const std::string& dtype) {
-    return dtype == "TQ" || dtype == "NINT" || dtype == "NINT8-0" ||
-        dtype == "NVQ" || dtype == "NPQ" || dtype == "MXFP4-SQ" ||
-        tyloi::fp8sq::is_dtype(dtype) || dtype == "MXFP4" || dtype == "MXFP8";
-}
-
 tyloi::mxfp4::Data select_mxfp4_cpu_rows(
         const tyloi::mxfp4::Data & source,
         const std::vector<int64_t> & rows) {

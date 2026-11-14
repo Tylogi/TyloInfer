@@ -8,7 +8,7 @@
 
 #include <mlx/mlx.h>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 struct MlxDeepseekV41HcMetadataResult {
     mlx::core::array post;
@@ -121,4 +121,4 @@ private:
     MlxRmsNorm norm_;
 };
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

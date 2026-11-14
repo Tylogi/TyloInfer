@@ -1,4 +1,6 @@
 #include "mlx_fp8_sq.h"
+#include "engine/backends/metal/native/tensor/tensor.h"
+#include "engine/weights/memory.h"
 
 #include <algorithm>
 #include <array>
@@ -11,7 +13,7 @@
 #include <unordered_map>
 #include <utility>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 
 using mlx::core::array;
@@ -867,7 +869,7 @@ mlx::core::fast::CustomKernelFunction projection_group_kernel(
 } // namespace
 
 bool is_fp8_sq_dtype(std::string_view dtype) noexcept {
-    return mfq::fp8sq::is_dtype(dtype);
+    return tyloi::fp8sq::is_dtype(dtype);
 }
 
 MlxFp8SqWeight::MlxFp8SqWeight(
@@ -878,7 +880,7 @@ MlxFp8SqWeight::MlxFp8SqWeight(
     array palette_values,
     array palette_quads,
     array palette_pairs,
-    mfq::fp8sq::Layout layout,
+    tyloi::fp8sq::Layout layout,
     Fp8SqDescriptor descriptor)
     : dtype_(std::move(dtype)),
       blob_(std::move(blob)),
@@ -888,7 +890,10 @@ MlxFp8SqWeight::MlxFp8SqWeight(
       palette_quads_(std::move(palette_quads)),
       palette_pairs_(std::move(palette_pairs)),
       layout_(std::move(layout)),
-      descriptor_(descriptor) {}
+      descriptor_(descriptor) {
+    for (const auto* value : {&blob_, &row_q_, &row_symbol_byte_offsets_, &palette_values_, &palette_quads_, &palette_pairs_})
+        tyloi::weights::observe_weight(tyloi::metal::tensor(*value));
+}
 
 MlxFp8SqWeight MlxFp8SqWeight::from_blob(
     std::string_view dtype,
@@ -899,16 +904,16 @@ MlxFp8SqWeight MlxFp8SqWeight::from_blob(
 MlxFp8SqWeight MlxFp8SqWeight::from_blob(
     std::string_view dtype,
     std::span<const std::uint8_t> blob) {
-    const auto layout = mfq::fp8sq::parse(dtype, blob.data(), blob.size());
+    const auto layout = tyloi::fp8sq::parse(dtype, blob.data(), blob.size());
     if (blob.size() > static_cast<std::size_t>(
             std::numeric_limits<int>::max())) {
         throw std::runtime_error("FP8-SQ payload exceeds MLX limits");
     }
-    const auto rows = mfq::fp8sq::row_metadata(blob.data(), layout);
-    std::array<float, mfq::fp8sq::kPaletteBytes + 256> palette_values{};
+    const auto rows = tyloi::fp8sq::row_metadata(blob.data(), layout);
+    std::array<float, tyloi::fp8sq::kPaletteBytes + 256> palette_values{};
     for (std::size_t index = 0; index < palette_values.size(); ++index) {
-        const auto code = index < mfq::fp8sq::kPaletteBytes ? blob[layout.palettes + index]
-            : static_cast<std::uint8_t>(index - mfq::fp8sq::kPaletteBytes);
+        const auto code = index < tyloi::fp8sq::kPaletteBytes ? blob[layout.palettes + index]
+            : static_cast<std::uint8_t>(index - tyloi::fp8sq::kPaletteBytes);
         const int exponent = (code & 127u) >> 3u;
         const int mantissa = code & 7u;
         const auto magnitude = exponent == 0 ? float(mantissa) * 0x1p-9f
@@ -918,7 +923,7 @@ MlxFp8SqWeight MlxFp8SqWeight::from_blob(
     Fp8SqDescriptor descriptor;
     descriptor.format_version = layout.version;
     descriptor.aggregate_bpw = static_cast<double>(
-        layout.bytes - mfq::fp8sq::kHeaderBytes) * 8.0 /
+        layout.bytes - tyloi::fp8sq::kHeaderBytes) * 8.0 /
         (static_cast<double>(layout.outputs) * layout.width);
     std::array<std::size_t, 8> q_counts{};
     for (const auto q : rows.q) {
@@ -1284,4 +1289,4 @@ array MlxFp8SqWeight::backward_input(const array& output_gradient) const {
     return mlx::core::reshape(std::move(result), std::move(output_shape));
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

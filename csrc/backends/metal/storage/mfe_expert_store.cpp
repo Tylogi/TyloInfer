@@ -9,7 +9,7 @@
 #include <type_traits>
 #include <utility>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 
 template <typename T>
@@ -475,4 +475,4 @@ MlxNativeMxfp4ExpertView MlxMfeMxfp4ExpertStore::view(
     };
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

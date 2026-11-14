@@ -17,7 +17,7 @@
 #include <string_view>
 #include <utility>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 
 using mlx::core::Dtype;
@@ -882,4 +882,4 @@ void MlxDeepseekV41DSpark::use_tq_offload(const std::shared_ptr<MlxTqExpertCache
     for (auto& stage : impl_->stages) stage.moe.use_tq_offload(cache);
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

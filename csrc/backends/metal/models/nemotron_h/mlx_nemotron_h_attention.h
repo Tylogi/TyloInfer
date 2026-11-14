@@ -10,7 +10,7 @@
 
 #include <mlx/mlx.h>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 // NoPE grouped-query attention mixer. Nemotron-H never rotates queries or
 // keys; positions only address the append-only KV history.
@@ -69,4 +69,4 @@ private:
     int cache_batch_ = 0;
 };
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

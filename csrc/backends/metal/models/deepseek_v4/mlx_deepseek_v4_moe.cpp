@@ -17,7 +17,7 @@
 #include <utility>
 #include <vector>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 
 using mlx::core::Shape;
@@ -276,7 +276,7 @@ MlxDeepseekV4Moe MlxDeepseekV4Moe::load(
             std::move(tq_expert_cache), layer);
     }
 #if TYLOINFER_ENABLE_MFQ_COMPAT
-    if (mfq::mfq_compat_enabled && ssd_expert_cache) {
+    if (tyloi::mfq_compat_enabled && ssd_expert_cache) {
         if (!split_gate_up) {
             throw std::runtime_error(
                 "SSD MXFP4 experts require canonical split Gate/Up records");
@@ -559,7 +559,7 @@ MlxDeepseekV4Moe MlxDeepseekV4Moe::load_named(
             std::nullopt, available, std::move(visual_bias), std::move(tq_expert_cache), expert_cache_layer);
     }
 #if TYLOINFER_ENABLE_MFQ_COMPAT
-    if (mfq::mfq_compat_enabled && ssd_expert_cache) {
+    if (tyloi::mfq_compat_enabled && ssd_expert_cache) {
         if (!split) {
             throw std::runtime_error(
                 "SSD MXFP4 experts require canonical split Gate/Up records");
@@ -872,7 +872,7 @@ MlxDeepseekV4Moe::MlxDeepseekV4Moe(
             tq_->down.input_size() != routed || tq_->down.output_size() != hidden)
             throw std::invalid_argument("DeepSeek-V4 TQ expert bank dimensions mismatch");
         tq_->prepare(int(config_.top_k), float(config_.swiglu_limit));
-    } else if (mfq::mfq_compat_enabled && full_resident) {
+    } else if (tyloi::mfq_compat_enabled && full_resident) {
         const bool gate_up_matches =
             combined_resident
             ? routed_gate_up_->weight().experts()
@@ -909,7 +909,7 @@ MlxDeepseekV4Moe::MlxDeepseekV4Moe(
                 "DeepSeek-V4 MoE routed component "
                 "dimensions mismatch");
         }
-    } else if (mfq::mfq_compat_enabled && mfe_streamed) {
+    } else if (tyloi::mfq_compat_enabled && mfe_streamed) {
         const bool split_streamed =
             !streamed_gate_name_.empty()
             || !streamed_up_name_.empty();
@@ -1196,7 +1196,7 @@ std::optional<MlxSsdPrefetchedExpertLayer>
 MlxDeepseekV4Moe::prefetch_routed(std::size_t rows) const {
 #if TYLOINFER_ENABLE_MFQ_COMPAT
     constexpr std::size_t kFullLayerPrefetchRows = 512;
-    if (mfq::mfq_compat_enabled && ssd_expert_cache_ && rows >= kFullLayerPrefetchRows &&
+    if (tyloi::mfq_compat_enabled && ssd_expert_cache_ && rows >= kFullLayerPrefetchRows &&
         ssd_expert_cache_->prefill_overlap_enabled()) {
         return ssd_expert_cache_->prefetch_layer(layer_);
     }
@@ -1264,7 +1264,7 @@ MlxDeepseekV4Moe::forward_branches(
                     "vocabulary size"),
                 mlx::core::int32));
     }
-    if (mfq::mfq_compat_enabled && prefetched != nullptr && prefetched->layer() != layer_) {
+    if (tyloi::mfq_compat_enabled && prefetched != nullptr && prefetched->layer() != layer_) {
         throw std::invalid_argument(
             "DeepSeek-V4 SSD prefetch layer mismatch");
     }
@@ -1302,13 +1302,13 @@ MlxDeepseekV4Moe::forward_branches(
     std::optional<MlxSsdExpertPageTableSnapshot>
         device_route_snapshot;
     const bool route_transaction =
-        mfq::mfq_compat_enabled && ssd_expert_cache_ &&
+        tyloi::mfq_compat_enabled && ssd_expert_cache_ &&
         ssd_expert_cache_->route_transaction_active();
     const bool transaction_rows_supported =
         route_transaction && rows >= 1 && rows <= 6;
     const bool standalone_device_route =
         rows == 1 && ssd_device_route_enabled();
-    if (mfq::mfq_compat_enabled && ssd_expert_cache_ && prefetched == nullptr &&
+    if (tyloi::mfq_compat_enabled && ssd_expert_cache_ && prefetched == nullptr &&
         (transaction_rows_supported || standalone_device_route) &&
         (use_fused_dense_router || use_fused_hash_router ||
          route_transaction)) {
@@ -1319,7 +1319,7 @@ MlxDeepseekV4Moe::forward_branches(
         source,
         static_cast<float>(config_.swiglu_limit),
         !use_fused_dense_router && !use_fused_hash_router);
-    if (mfq::mfq_compat_enabled && prefetched != nullptr) {
+    if (tyloi::mfq_compat_enabled && prefetched != nullptr) {
         // The SSD workers are already reading the routed bank. Submit the
         // independent shared/router projections while those reads are in
         // flight, then wait only for the residual storage latency below.
@@ -1359,7 +1359,7 @@ MlxDeepseekV4Moe::forward_branches(
         mlx::core::float32);
     bool packed_expert_ids = false;
     if (use_fused_hash_router) {
-        if (mfq::mfq_compat_enabled && device_route_snapshot.has_value()) {
+        if (tyloi::mfq_compat_enabled && device_route_snapshot.has_value()) {
             auto routing = moe_dense_hash_router_packed(
                 source,
                 *dense_router,
@@ -1383,7 +1383,7 @@ MlxDeepseekV4Moe::forward_branches(
             expert_weights = std::move(routing.weights);
         }
     } else if (use_fused_dense_router) {
-        if (mfq::mfq_compat_enabled && device_route_snapshot.has_value()) {
+        if (tyloi::mfq_compat_enabled && device_route_snapshot.has_value()) {
             auto routing = moe_dense_router_topk_packed(
                 source,
                 *dense_router,
@@ -1515,7 +1515,7 @@ MlxDeepseekV4Moe::forward_branches(
                 route_mask, visual.weights, expert_weights);
         }
     }
-    if (mfq::mfq_compat_enabled && device_route_snapshot.has_value() && !packed_expert_ids) {
+    if (tyloi::mfq_compat_enabled && device_route_snapshot.has_value() && !packed_expert_ids) {
         const auto slots = mlx::core::take(
             device_route_snapshot->slot_ids(),
             expert_ids,
@@ -1889,8 +1889,8 @@ MlxDeepseekV4Moe::forward_branches(
             : tq_->routed_ffn(source, expert_ids, expert_weights, static_cast<float>(config_.swiglu_limit));
     }
 #if TYLOINFER_ENABLE_MFQ_COMPAT
-    else if (mfq::mfq_compat_enabled && ssd_expert_cache_) {
-        if (mfq::mfq_compat_enabled && prefetched != nullptr) {
+    else if (tyloi::mfq_compat_enabled && ssd_expert_cache_) {
+        if (tyloi::mfq_compat_enabled && prefetched != nullptr) {
             const auto& weights = prefetched->wait();
             routed = run_resident(
                 &weights.gate_up,
@@ -1902,7 +1902,7 @@ MlxDeepseekV4Moe::forward_branches(
             bool device_route_hit = false;
             std::optional<array> evaluated_host_ids;
             std::optional<std::vector<std::int32_t>> evaluated_active;
-            if (mfq::mfq_compat_enabled && device_route_snapshot.has_value() &&
+            if (tyloi::mfq_compat_enabled && device_route_snapshot.has_value() &&
                 packed_expert_ids && route_transaction) {
                 auto& snapshot = *device_route_snapshot;
                 shared.emplace(build_shared());
@@ -1919,7 +1919,7 @@ MlxDeepseekV4Moe::forward_branches(
                 snapshot.defer_transaction(expert_ids);
                 device_route_hit = true;
             }
-            if (mfq::mfq_compat_enabled && device_route_snapshot.has_value() &&
+            if (tyloi::mfq_compat_enabled && device_route_snapshot.has_value() &&
                 packed_expert_ids && !device_route_hit) {
                 auto& snapshot = *device_route_snapshot;
                 auto host_ids = mlx::core::contiguous(
@@ -2221,7 +2221,7 @@ MlxDeepseekV4Moe::forward_branches(
             }
             }
         }
-    } else if (!mfq::mfq_compat_enabled || !expert_offload_) {
+    } else if (!tyloi::mfq_compat_enabled || !expert_offload_) {
         routed = run_resident(
             routed_gate_up_ ? &*routed_gate_up_ : nullptr,
             routed_gate_ ? &*routed_gate_ : nullptr,
@@ -2418,4 +2418,4 @@ array MlxDeepseekV4Moe::forward(
         token_ids).output;
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

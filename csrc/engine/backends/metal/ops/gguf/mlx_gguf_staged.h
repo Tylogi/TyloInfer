@@ -2,7 +2,7 @@
 #include "mlx_gguf.h"
 #include "mlx_gguf_routes.h"
 
-namespace mfq::metal {
+namespace tyloi::metal {
 struct MlxGgufWorkspace {
     int data_input;
     int counter_input;
@@ -40,4 +40,4 @@ public:
     static mlx::core::array weighted_down(const MlxGgufWeight& weight, const mlx::core::array& input,
         const mlx::core::array& ids, const mlx::core::array& probabilities, mlx::core::Dtype dtype);
 };
-} // namespace mfq::metal
+} // namespace tyloi::metal

@@ -1,8 +1,8 @@
 #include "mlx_engine.h"
 #include "tokenizer.h"
 
-namespace mfq::metal {
-using namespace mfq::engine;
+namespace tyloi::metal {
+using namespace tyloi::engine;
 
 MlxEngine::MlxEngine(std::unique_ptr<MlxEngineModel> model,
     std::unique_ptr<TextProcessor> text, EngineInfo info)
@@ -120,4 +120,4 @@ void MlxEngine::shutdown() {
     if (failure) std::rethrow_exception(failure);
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

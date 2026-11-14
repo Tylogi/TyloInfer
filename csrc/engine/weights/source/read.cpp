@@ -1,6 +1,14 @@
 #include "read.h"
+#include "engine/weights/encoding/fp8_sq_blob.h"
 
 #include <cstring>
+
+bool is_quant_dtype(const std::string& dtype) {
+    return dtype == "TQ" || dtype == "NINT" || dtype == "NINT8-0" ||
+        dtype == "NVQ" || dtype == "NPQ" || dtype == "NEPQ" || dtype == "MXFP4-SQ" ||
+        tyloi::fp8sq::is_dtype(dtype) || dtype == "MXFP4" || dtype == "MXFP8" ||
+        dtype == "MLX-AFFINE" || dtype.compare(0, 5, "GGUF_") == 0;
+}
 
 namespace tyloi {
 

@@ -29,8 +29,8 @@ tyloi::engine::PrefillChunk BatchOps::prefill_chunk(
     return budget_->batch(tyloi::Device{tyloi::DeviceType::cuda, mode_.primary}, row_bytes, chunk);
 }
 
-bool batch_graph_enabled(const Model& model, const tyloi::engine::ContinuousBatchConfig& config) {
-    return config.cuda_graph && !Batch::has_cached_moe(model) &&
+bool batch_graph_enabled(const tyloi::models::qwen35::Model& model, const tyloi::engine::ContinuousBatchConfig& config) {
+    return config.cuda_graph && !tyloi::models::qwen35::Batch::has_cached_moe(model) &&
            mfq_cuda_graph_capture_supported();
 }
 
@@ -40,8 +40,8 @@ static std::unique_ptr<Executor> require_executor(std::unique_ptr<Executor> exec
     return executor;
 }
 
-BatchOps::BatchOps(const Model& model, std::unique_ptr<Executor> executor,
-                   Collectives& collectives, Executor::Mode mode, Batch::Options options,
+BatchOps::BatchOps(const tyloi::models::qwen35::Model& model, std::unique_ptr<Executor> executor,
+                   Collectives& collectives, Executor::Mode mode, tyloi::models::qwen35::Batch::Options options,
                    tyloi::engine::ContinuousBatchConfig config)
     : model_(model), collectives_(collectives), mode_(mode),
       executor_(require_executor(std::move(executor))),
@@ -418,7 +418,7 @@ void BatchOps::accept(const std::shared_ptr<Request>& request, const Sample& sam
 }
 
 void BatchOps::recover(State& state) {
-    std::vector<RequestState*> caches;
+    std::vector<tyloi::models::qwen35::RequestState*> caches;
     for (const auto& request : state.prefilling)
         caches.push_back(&request->cache);
     for (const auto& request : state.active)
@@ -440,7 +440,7 @@ void BatchOps::recover(State& state) {
 namespace tyloi::cuda {
 
 std::unique_ptr<tyloi::engine::Batch> make_batch(
-    const qwen35::Model& model, qwen35::State* serial,
+    const tyloi::models::qwen35::Model& model, tyloi::models::qwen35::State* serial,
     std::unique_ptr<Executor> executor, Collectives& copies, Executor::Mode mode,
     tyloi::engine::ContinuousBatchConfig config,
     std::int64_t chunk_size, bool preallocate, bool cpu_offload, int cached_slots) {
@@ -448,7 +448,7 @@ std::unique_ptr<tyloi::engine::Batch> make_batch(
         for (auto& layer_state : serial->layers)
             if (auto* cache = std::get_if<tyloi::state::KvView>(&layer_state)) *cache = {};
     }
-    const qwen35::Batch::Options options{config.max_sequences, config.paged_kv, preallocate,
+    const tyloi::models::qwen35::Batch::Options options{config.max_sequences, config.paged_kv, preallocate,
                                          cpu_offload, cached_slots};
     const auto token_budget = config.prefill_token_budget;
     return std::make_unique<tyloi::engine::ContinuousBatch<qwen35::BatchOps>>(

@@ -17,8 +17,7 @@ struct LayerState;
 
 struct Layer final {
     // Placement, as the layer loop sets it for CPU-offloaded layers.
-    int cuda_device = 0;
-    bool cpu_offloaded = false;
+    ::tyloi::Device device;
     tyloi::models::qwen4_exp::Config config;
     tyloi::ops::Residual attention_gr, ffn_gr;
     tyloi::ops::FfnWeights ffn;

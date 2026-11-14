@@ -14,7 +14,7 @@
 
 #include <malloc/malloc.h>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 
 mlx::core::Shape checked_shape(
@@ -769,4 +769,4 @@ MlxEngineComponents make_mlx_engine_components(
         std::move(runtime_holder), runtime_executor);
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

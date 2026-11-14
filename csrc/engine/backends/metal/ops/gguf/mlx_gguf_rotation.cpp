@@ -5,13 +5,14 @@
 #include "engine/backends/metal/native/allocation.h"
 #include "engine/backends/metal/native/tensor/tensor.h"
 #include "engine/weights/memory.h"
+#include "engine/weights/source/source.h"
 #include "nlohmann/json.hpp"
 
 #include <cmath>
 #include <climits>
 #include <stdexcept>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 using namespace mlx::core;
 namespace {
 array rotate128(const array& input, const MlxGgufRotation& rotation, int width, bool inverse, Dtype dtype) {
@@ -54,10 +55,34 @@ void MlxGgufWeight::configure_hadamard(const MfqContainer& model, const std::str
     const auto rotations = nlohmann::json::parse(found->second);
     if (!rotations.contains(name)) return;
     const auto& entry = rotations.at(name);
+    set_hadamard(entry.at("block_size").get<std::int64_t>(), entry.at("signs").get<std::vector<float>>());
+}
+
+void MlxGgufWeight::configure_hadamard(const tyloi::source::Source& model, const std::string& name) {
+    if (const auto* transforms = model.hadamard_transforms()) {
+        const auto found = transforms->find(name);
+        if (found == transforms->end()) return;
+        const auto& transform = found->second;
+        set_hadamard(transform.block_size, std::vector<float>(transform.signs.begin(), transform.signs.end()));
+        return;
+    }
+    const auto& metadata = model.metadata();
+    const auto found = metadata.find("gguf_hadamard");
+    if (found == metadata.end()) {
+        if (const auto required = metadata.find("gguf_requires_hadamard");
+            required != metadata.end() && required->second == "true")
+            throw std::invalid_argument("GGUF Hadamard descriptors are missing");
+        return;
+    }
+    const auto rotations = nlohmann::json::parse(found->second);
+    if (!rotations.contains(name)) return;
+    const auto& entry = rotations.at(name);
+    set_hadamard(entry.at("block_size").get<std::int64_t>(), entry.at("signs").get<std::vector<float>>());
+}
+
+void MlxGgufWeight::set_hadamard(std::int64_t block, std::vector<float> pattern) {
     if (planes_ || native_) throw std::invalid_argument("GGUF Hadamard must be configured before layout preparation");
-    const int block = entry.at("block_size").get<int>();
-    const auto pattern = entry.at("signs").get<std::vector<float>>();
-    if (block < 1 || (block & (block - 1)) || input_size() % block ||
+    if (block < 1 || block > INT_MAX || (block & (block - 1)) || input_size() % block ||
         (!pattern.empty() && pattern.size() != std::size_t(input_size())))
         throw std::invalid_argument("invalid GGUF Hadamard geometry");
     for (const auto value : pattern) if (value != -1.f && value != 1.f)
@@ -65,7 +90,7 @@ void MlxGgufWeight::configure_hadamard(const MfqContainer& model, const std::str
     auto signs = pattern.empty() ? array(1.f) : array(pattern.begin(), Shape{input_size()}, float32);
     tyloi::metal::AllocationScope::record(signs);
     tyloi::weights::observe_weight(tyloi::metal::tensor(signs));
-    rotation_ = std::make_shared<MlxGgufRotation>(MlxGgufRotation{block, pattern, std::move(signs)});
+    rotation_ = std::make_shared<MlxGgufRotation>(MlxGgufRotation{int(block), std::move(pattern), std::move(signs)});
 }
 
 bool MlxGgufWeight::same_rotation(const MlxGgufWeight& other) const {

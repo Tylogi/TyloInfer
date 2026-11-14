@@ -10,7 +10,7 @@
 
 #include <mlx/mlx.h>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 // Backend-neutral prompt representation after optional input components have
 // transformed it. Text-only callers fill token_ids alone. Vision/audio
@@ -79,4 +79,4 @@ MlxGridMropePositions build_grid_mrope_positions(
     const std::vector<MlxGridShape>& image_grids,
     const std::vector<MlxGridShape>& video_grids);
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

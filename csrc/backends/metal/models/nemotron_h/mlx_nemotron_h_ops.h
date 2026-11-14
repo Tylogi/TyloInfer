@@ -5,7 +5,7 @@
 
 #include <mlx/mlx.h>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 // Round through float16 at the activation boundaries the CUDA runtime uses
 // (attention operands, MoE entry and the shared-expert output). Keeping this
@@ -49,4 +49,4 @@ mlx::core::array grouped_gated_rms_norm(
     std::int64_t group_width,
     float eps);
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

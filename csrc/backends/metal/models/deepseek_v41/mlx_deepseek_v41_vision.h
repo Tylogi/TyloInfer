@@ -9,7 +9,7 @@
 
 #include <mlx/mlx.h>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 struct MlxDeepseekV41ImageInput {
     mlx::core::array patches;
@@ -56,4 +56,4 @@ private:
     mlx::core::array special_embeddings_;
 };
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

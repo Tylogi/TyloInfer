@@ -10,7 +10,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 
 template <typename T> T load(std::span<const std::uint8_t> bytes, std::size_t offset) {
@@ -289,4 +289,4 @@ template <typename P> struct TqSelectedRowScales {
         {{"K", width_}, {"WIDTH", stored_width_}}, std::nullopt, false, {}).front();
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

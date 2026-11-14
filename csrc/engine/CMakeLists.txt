@@ -3,6 +3,12 @@ add_library(mfq-tensor STATIC tensor.cpp views.cpp dense_tensor.cpp weights/memo
 add_library(mfq::tensor ALIAS mfq-tensor)
 target_include_directories(mfq-tensor PUBLIC ${PROJECT_SOURCE_DIR})
 target_compile_features(mfq-tensor PUBLIC cxx_std_20)
+target_compile_definitions(mfq-tensor PRIVATE
+    TYLOINFER_HAS_CUDA=$<BOOL:${TYLOINFER_BUILD_CUDA_ENGINE}>
+    TYLOINFER_HAS_METAL=$<BOOL:${TYLOINFER_BUILD_METAL_RUNTIME}>)
+if(TYLOINFER_BUILD_METAL_RUNTIME)
+    target_link_libraries(mfq-tensor PRIVATE mfq-mlx)
+endif()
 set_target_properties(mfq-tensor PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 add_library(mfq-engine STATIC
@@ -28,6 +34,7 @@ add_library(mfq-engine STATIC
     models/minicpmo45/input.cpp
     models/deepseek_v41/axial_patch_vision.cpp
     models/common/attention.cpp
+    models/common/loader.cpp
     models/common/ffn.cpp
     models/common/linear.cpp
     models/common/moe.cpp
@@ -70,6 +77,13 @@ add_library(mfq-engine STATIC
     state/kv_sequence.cpp
     state/kv_offload.cpp
 )
+if(TYLOINFER_BUILD_CUDA_ENGINE OR TYLOINFER_BUILD_METAL_RUNTIME)
+    target_sources(mfq-engine PRIVATE
+        models/load.cpp
+        models/layers.cpp
+        models/qwen35/load.cpp
+        models/qwen35/layers.cpp)
+endif()
 target_compile_definitions(mfq-engine PRIVATE
     TYLOINFER_ENABLE_MFQ_COMPAT=$<BOOL:${TYLOINFER_ENABLE_MFQ_COMPAT}>
     TYLOINFER_HAS_CUDA=$<BOOL:${TYLOINFER_BUILD_CUDA_ENGINE}>

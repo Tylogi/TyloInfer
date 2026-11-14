@@ -1,6 +1,7 @@
 #pragma once
 
 #include "engine/tensor.h"
+#include "engine/metrics.h"
 
 #include <memory>
 #include <chrono>
@@ -16,6 +17,7 @@
 namespace tyloi {
 
 struct LayerEvent;
+namespace engine { class Budget; }
 
 class Executor {
 public:
@@ -96,8 +98,11 @@ public:
     // Call within this executor's scope; stop submissions before changing a limit.
     virtual void reclaim(Device device) = 0;
     virtual void set_memory_limit(Device device, std::size_t bytes) = 0;
+    // Budget is borrowed; unbind before destroying it.
+    virtual void bind_budget(engine::Budget*) {}
+    virtual engine::Metrics metrics() const { return {}; }
     // Stop concurrent submissions and call within this executor's scope.
-    // Wait for executor work; owners coordinate weights and offload separately.
+    // Wait for executor work and any backend-owned offload.
     virtual void drain() = 0;
     // After draining and destroying graphs, clear execution caches within the scope.
     virtual void clear() = 0;

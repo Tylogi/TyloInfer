@@ -30,9 +30,9 @@ struct Components {
     tyloi::ModelGraph graph;
     ::tyloi::models::Plan plan;
     bool vision_available = false;
-    Mtp* mtp = nullptr;
+    tyloi::models::qwen35::Mtp* mtp = nullptr;
 
-    static Components load(Model& model, const ::tyloi::weights::Loader& weights,
+    static Components load(tyloi::models::qwen35::Model& model, const ::tyloi::weights::Loader& weights,
         const LayerPlacementConfig& placement, int cpu_layers, Executor& executor,
         std::unique_ptr<tyloi::Executor>& predictor_execution,
         bool optional, bool cpu_offload, bool preallocate);

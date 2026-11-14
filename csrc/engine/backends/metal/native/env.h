@@ -3,7 +3,7 @@
 #include <cstdlib>
 #include <string_view>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 inline bool mlx_metal_nax_disabled() noexcept {
     const auto* value = std::getenv("TYLOINFER_METAL_DISABLE_NAX");
@@ -24,4 +24,4 @@ inline bool mlx_reference_enabled() noexcept {
     return enabled;
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

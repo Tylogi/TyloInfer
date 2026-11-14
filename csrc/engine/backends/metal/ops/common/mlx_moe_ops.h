@@ -6,7 +6,7 @@
 
 #include <mlx/mlx.h>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 struct MlxMoeTopKResult {
     mlx::core::array ids;
@@ -176,4 +176,4 @@ mlx::core::array moe_apply_expert_scale(
     const mlx::core::array& ids,
     const mlx::core::array& scales);
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

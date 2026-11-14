@@ -1,6 +1,7 @@
 #include "source.h"
 
 #include "engine/weights/source/gguf.h"
+#include "engine/weights/source/read.h"
 #include "source/hf_source.h"
 #include "source/gguf_source.h"
 #include "source/mfq_source.h"
@@ -34,5 +35,22 @@ std::shared_ptr<const ModelSource> open_model_source(
     if (is_gguf_file(path)) return std::make_shared<models::GgufSource>(path);
     return std::make_shared<models::MfqSource>(path);
 }
+
+namespace models {
+void validate_model_source(const tyloi::ModelSource& source) {
+    if (source.find_tensor("model.token_embedding.weight") == nullptr) {
+        throw std::runtime_error(
+            "canonical text tensor inventory has no token embedding");
+    }
+    for (const auto& component : tyloi::models::graph(source).components) {
+        if (component.tensor_root != "runtime" &&
+                !has_tensor_prefix(source, component.tensor_root)) {
+            throw std::runtime_error(
+                "model graph declares " + component.kind +
+                " but its canonical tensor inventory is missing");
+        }
+    }
+}
+} // namespace models
 
 } // namespace tyloi

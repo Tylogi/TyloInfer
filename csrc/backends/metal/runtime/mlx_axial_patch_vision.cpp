@@ -12,7 +12,7 @@
 #include <utility>
 #include <vector>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 
 using mlx::core::Shape;
@@ -381,4 +381,4 @@ MlxAxialPatchVisionTower::config() const noexcept {
     return impl_->config;
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

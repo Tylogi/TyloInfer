@@ -104,6 +104,12 @@ public:
         layout_=TqLayout(header_.data(),bytes);
     }
     const TqLayout& layout()const noexcept{return layout_;}
+    // Read descriptors and scales without reading the packed row payload.
+    std::vector<std::uint8_t> metadata() const {
+        std::vector<std::uint8_t> result(layout_.packed);
+        read_(0, reinterpret_cast<std::byte*>(result.data()), result.size());
+        return result;
+    }
     // Write one ordinary TQ row into caller-owned staging storage.
     // This avoids temporary descriptor/payload vectors for sparse CPU tables.
     std::size_t slice_row_into(std::uint64_t row,std::uint8_t* target,std::size_t capacity)const {

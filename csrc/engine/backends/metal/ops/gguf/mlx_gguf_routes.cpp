@@ -4,7 +4,7 @@
 #include <climits>
 #include <stdexcept>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 using namespace mlx::core;
 MlxGgufGroupedRoutes gguf_group_routes(const array& ids, int experts, int tile_rows, bool shared, bool compact) {
     if (ids.ndim() != 2 || ids.size() == 0 || ids.size() > INT_MAX || experts < 1 || experts > 512 ||

@@ -5,7 +5,7 @@
 #include <mlx/version.h>
 #include <memory>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 template <typename Owner>
 mlx::core::array mlx_buffer_view(mlx::core::allocator::Buffer buffer,
@@ -18,4 +18,4 @@ mlx::core::array mlx_buffer_view(mlx::core::allocator::Buffer buffer,
 #endif
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

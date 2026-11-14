@@ -376,6 +376,7 @@ add_library(mfq-metal-runtime STATIC
     ${TYLOINFER_METAL_ROOT}/kernels/source.cpp
     ${PROJECT_SOURCE_DIR}/backends/metal/runtime/mlx_inference_warmup.cpp
     ${PROJECT_SOURCE_DIR}/backends/metal/runtime/mlx_tensor.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/runtime/mlx_tensor_load.cpp
     ${PROJECT_SOURCE_DIR}/backends/metal/runtime/mlx_transformer.cpp
     ${TYLOINFER_METAL_ROOT}/ops/attention/attention.cpp
     ${TYLOINFER_METAL_ROOT}/ops/attention/kv.cpp
@@ -437,7 +438,6 @@ if(TYLOINFER_ENABLE_MFQ_COMPAT)
 else()
     target_sources(mfq-metal-runtime PRIVATE ${TYLOINFER_METAL_ROOT}/ops/common/mlx_grouped_linear.cpp)
 endif()
-add_library(mfq::metal-runtime ALIAS mfq-metal-runtime)
 target_sources(mfq-metal-runtime PRIVATE ${TYLOINFER_METAL_ROOT}/native/device.cpp)
 if(BUILD_TESTING)
 add_executable(tyloinfer-metal-affine-test ${PROJECT_SOURCE_DIR}/backends/metal/tests/mlx_affine_test.cpp)

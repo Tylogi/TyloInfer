@@ -11,7 +11,7 @@
 #include <utility>
 #include <vector>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 
 using mlx::core::CompileOptions;
@@ -932,4 +932,4 @@ array MlxDeepseekV41Mhc::identity_pre(int batch, int tokens) {
     return mlx::core::broadcast_to(first, Shape{batch, tokens, 4});
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

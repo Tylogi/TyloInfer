@@ -8,7 +8,7 @@
 #include <string>
 #include <utility>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 
 using mlx::core::Shape;
@@ -238,4 +238,4 @@ array MlxDeepseekV41Vision::image_mask(
         mlx::core::bool_);
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

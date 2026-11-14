@@ -10,7 +10,7 @@
 #include <string>
 #include <utility>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 
 using mlx::core::Shape;
@@ -412,4 +412,4 @@ array MlxDeepseekV4Vision::embed_prompt(
     return result;
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

@@ -25,6 +25,7 @@
 #include "engine/models/nemotron_h/state.h"
 #include "engine/backends/cuda/executor/options.h"
 #include "engine/backends/cuda/executor/executor.h"
+#include "engine/backends/cuda/kernels/mfq_cuda_kv_quantization.h"
 #include "engine/state/kv_memory.h"
 #include "engine/weights/cache.h"
 #include "engine/models/qwen35/components.h"
@@ -93,7 +94,7 @@ inline constexpr auto with_model = []<typename F>(
                 << " cpu_threads=" << mfq_get_num_threads() << '\n';
         }
         auto weights = cache.loader(*source, config.weights,
-            {config.layer_placement.primary_device(), false, config.drop_file_cache,
+            {::tyloi::Device(::tyloi::kCUDA, config.layer_placement.primary_device()), config.drop_file_cache,
              config.tensor_parallel, moe_parallel_config(config)});
         minicpmo45::load(model, weights, config.layer_placement,
             config.dense_cpu_layer_count, config.yarn);
@@ -111,16 +112,16 @@ inline constexpr auto with_model = []<typename F>(
             if constexpr (IncludeQwen) {
                 auto started = std::chrono::steady_clock::now();
                 auto weights = cache.loader(*source, config.weights,
-                    {config.layer_placement.primary_device(), false, config.drop_file_cache,
+                    {::tyloi::Device(::tyloi::kCUDA, config.layer_placement.primary_device()), config.drop_file_cache,
                      config.tensor_parallel, moe_parallel_config(config)});
-                std::shared_ptr<qwen35::Model> owner;
-                std::unique_ptr<qwen35::State> state;
+                std::shared_ptr<::tyloi::models::qwen35::Model> owner;
+                std::unique_ptr<::tyloi::models::qwen35::State> state;
                 auto executor = root.fork(model_parallel_primary_device(config));
                 const bool preallocate = ::tyloi::cuda::options::kv_vram_preallocated();
                 auto definition = tyloi::models::config_json(*source, options.config_path);
                 definition = configure_yarn(config.yarn, config.yarn_context_extension,
                     std::move(definition), tyloi::models::graph(*source).backbone, options.context_size);
-                owner = qwen35::load(
+                owner = ::tyloi::models::qwen35::load(
                     source, definition, weights, config.layer_placement,
                     tyloi::models::LoadOptions{
                         .context = options.context_size,
@@ -128,9 +129,10 @@ inline constexpr auto with_model = []<typename F>(
                         .expert_parallel = config.expert_parallel.enabled(),
                         .recurrent_transposed = root.mode().transposed,
                         .mirror_scalars = config.tensor_parallel_mirror_linear_attention_scalars,
-                        .yarn = config.yarn},
+                        .yarn = config.yarn,
+                        .kv_quantization = cuda_kv_quantization()},
                     config.dense_cpu_layer_count);
-                state = std::make_unique<qwen35::State>(*owner, root.mode().transposed);
+                state = std::make_unique<::tyloi::models::qwen35::State>(*owner, root.mode().transposed);
                 if (preallocate) state->preallocate();
                 std::unique_ptr<tyloi::Executor> predictor_execution;
                 auto components = qwen35::Components::load(
@@ -149,7 +151,7 @@ inline constexpr auto with_model = []<typename F>(
             auto owner = std::make_shared<minicpmo45::text::Model>(
                 minicpmo45::text::read(source, definition, options.context_size));
             auto weights = cache.loader(*source, config.weights,
-                {config.layer_placement.primary_device(), false, config.drop_file_cache,
+                {::tyloi::Device(::tyloi::kCUDA, config.layer_placement.primary_device()), config.drop_file_cache,
                  config.tensor_parallel, moe_parallel_config(config)});
             config.dense_cpu_layer_count = config.n_gpu_layers >= 0
                 ? static_cast<int>(std::max<int64_t>(owner->config.num_hidden_layers - config.n_gpu_layers, 0)) : 0;
@@ -172,7 +174,7 @@ inline constexpr auto with_model = []<typename F>(
             auto owner = std::make_shared<glm_dsa::Model>(
                 glm_dsa::read(source, definition, options.context_size));
             auto weights = cache.loader(*source, config.weights,
-                {config.layer_placement.primary_device(), false, config.drop_file_cache,
+                {::tyloi::Device(::tyloi::kCUDA, config.layer_placement.primary_device()), config.drop_file_cache,
                  config.tensor_parallel, moe_parallel_config(config)});
             config.dense_cpu_layer_count = 0;
             glm_dsa::load(*owner, weights, config.layer_placement,
@@ -194,7 +196,7 @@ inline constexpr auto with_model = []<typename F>(
             auto owner = std::make_shared<glm5_next::Model>(
                 glm5_next::read(source, definition, options.context_size));
             auto weights = cache.loader(*source, config.weights,
-                {config.layer_placement.primary_device(), false, config.drop_file_cache,
+                {::tyloi::Device(::tyloi::kCUDA, config.layer_placement.primary_device()), config.drop_file_cache,
                  config.tensor_parallel, moe_parallel_config(config)});
             config.dense_cpu_layer_count = 0;
             glm5_next::load(*owner, weights, config.layer_placement, config.n_gpu_layers);
@@ -217,7 +219,7 @@ inline constexpr auto with_model = []<typename F>(
                 config.drop_file_cache = true;
             }
             auto weights = cache.loader(*source, config.weights,
-                {config.layer_placement.primary_device(), false, config.drop_file_cache,
+                {::tyloi::Device(::tyloi::kCUDA, config.layer_placement.primary_device()), config.drop_file_cache,
                  config.tensor_parallel, moe_parallel_config(config)});
             config.dense_cpu_layer_count = 0;
             deepseek_v4::load(*owner, weights, config.layer_placement, root.collectives(),
@@ -238,7 +240,7 @@ inline constexpr auto with_model = []<typename F>(
             definition = configure_yarn(config.yarn, config.yarn_context_extension,
                 std::move(definition), tyloi::models::graph(*source).backbone, options.context_size);
             auto weights = cache.loader(*source, config.weights,
-                {config.layer_placement.primary_device(), false, config.drop_file_cache,
+                {::tyloi::Device(::tyloi::kCUDA, config.layer_placement.primary_device()), config.drop_file_cache,
                  config.tensor_parallel, moe_parallel_config(config)});
             std::unique_ptr<tyloi::models::CausalModel> model;
             deepseek_v41::load(model, source, definition, weights, config.layer_placement,
@@ -264,7 +266,7 @@ inline constexpr auto with_model = []<typename F>(
             auto owner = std::make_shared<nemotron_h::Model>(
                 nemotron_h::read(source, definition, options.context_size));
             auto weights = cache.loader(*source, config.weights,
-                {config.layer_placement.primary_device(), false, config.drop_file_cache,
+                {::tyloi::Device(::tyloi::kCUDA, config.layer_placement.primary_device()), config.drop_file_cache,
                  config.tensor_parallel, moe_parallel_config(config)});
             config.dense_cpu_layer_count = 0;
             nemotron_h::load(*owner, weights, config.layer_placement,

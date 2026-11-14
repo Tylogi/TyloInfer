@@ -71,7 +71,7 @@ int run_moe_check(tyloi::cuda::Program& program, const std::string& config_path,
         throw std::runtime_error("--check-moe-tokens values must be in [1, 4096]");
     const auto loader = program.loader();
     const auto& source = dynamic_cast<const tyloi::ModelSource&>(loader.source);
-    tyloi::cuda::validate_model_source(source);
+    tyloi::models::validate_model_source(source);
     if (tyloi::models::graph(source).backbone == "gemma4") {
         const auto config = tyloi::models::gemma4::Config::from_json(
             tyloi::models::config_json(source, config_path));

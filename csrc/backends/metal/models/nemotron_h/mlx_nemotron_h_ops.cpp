@@ -7,7 +7,7 @@
 #include <string>
 #include <vector>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 
 using mlx::core::Shape;
@@ -268,4 +268,4 @@ array grouped_gated_rms_norm(
         mlx::core::reshape(weight, Shape{1, width});
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

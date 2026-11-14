@@ -5,7 +5,7 @@
 #include <stdexcept>
 #include <unordered_set>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 mlx::core::array replace_multimodal_embedding_span(
     const mlx::core::array& embeddings,
@@ -108,4 +108,4 @@ MlxGridMropePositions build_grid_mrope_positions(
     };
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

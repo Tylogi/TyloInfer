@@ -13,7 +13,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 
 using mlx::core::Shape;
@@ -343,7 +343,7 @@ MlxDeepseekV41CausalLm MlxDeepseekV41CausalLm::load(
         } else if (gguf_model) {
             gguf_expert_cache = std::make_shared<MlxGgufExpertCache>(model, prefixes, *expert_cache_bytes, 8);
         } else try {
-            ssd_expert_cache = mfq::with_mfq_compat([&] { return std::make_shared<MlxMoeSsdExpertCache>(
+            ssd_expert_cache = tyloi::with_mfq_compat([&] { return std::make_shared<MlxMoeSsdExpertCache>(
                 model,
                 std::move(prefixes),
                 static_cast<std::size_t>(config.hidden),
@@ -353,7 +353,7 @@ MlxDeepseekV41CausalLm MlxDeepseekV41CausalLm::load(
                 8,
                 *expert_cache_bytes >= prefill_buffers_minimum); });
         } catch (const MlxMfeMxfp4Unsupported&) {
-            mfe_offload_cache = mfq::with_mfq_compat([&] { return std::make_shared<MlxMfeOffloadCache>(
+            mfe_offload_cache = tyloi::with_mfq_compat([&] { return std::make_shared<MlxMfeOffloadCache>(
                 model, *expert_cache_bytes); });
         }
     }
@@ -541,10 +541,10 @@ std::size_t
 MlxDeepseekV41CausalLm::expert_cache_limit_bytes() const noexcept {
     if (gguf_expert_cache_) return gguf_expert_cache_->limit_bytes();
     if (tq_expert_cache_) return tq_expert_cache_->limit_bytes();
-    if (mfq::mfq_compat_enabled && ssd_expert_cache_) {
+    if (tyloi::mfq_compat_enabled && ssd_expert_cache_) {
         return ssd_expert_cache_->cache_limit_bytes();
     }
-    return (mfq::mfq_compat_enabled && mfe_offload_cache_)
+    return (tyloi::mfq_compat_enabled && mfe_offload_cache_)
         ? mfe_offload_cache_->cache_limit_bytes()
         : 0;
 }
@@ -558,20 +558,20 @@ std::size_t MlxDeepseekV41CausalLm::resident_full_expert_bytes() const noexcept 
 std::size_t MlxDeepseekV41CausalLm::dynamic_weight_bytes() const noexcept {
     if (gguf_expert_cache_) return gguf_expert_cache_->resident_bytes();
     if (tq_expert_cache_) return tq_expert_cache_->resident_bytes();
-    return (mfq::mfq_compat_enabled && mfe_offload_cache_) ? mfe_offload_cache_->resident_packed_bytes() : 0;
+    return (tyloi::mfq_compat_enabled && mfe_offload_cache_) ? mfe_offload_cache_->resident_packed_bytes() : 0;
 }
 
 std::size_t MlxDeepseekV41CausalLm::reclaimable_expert_bytes() const noexcept {
     if (gguf_expert_cache_) return gguf_expert_cache_->resident_bytes();
     if (tq_expert_cache_) return tq_expert_cache_->resident_bytes();
-    return (mfq::mfq_compat_enabled && ssd_expert_cache_) ? ssd_expert_cache_->cache_limit_bytes()
+    return (tyloi::mfq_compat_enabled && ssd_expert_cache_) ? ssd_expert_cache_->cache_limit_bytes()
         : resident_full_expert_bytes() + dynamic_weight_bytes();
 }
 
 std::size_t MlxDeepseekV41CausalLm::ssd_expert_payload_bytes() const noexcept {
     if (gguf_expert_cache_) return gguf_expert_cache_->backing_bytes();
     if (tq_expert_cache_) return tq_expert_cache_->backing_bytes();
-    if (mfq::mfq_compat_enabled && mfe_offload_cache_) return mfe_offload_cache_->backing_payload_bytes();
+    if (tyloi::mfq_compat_enabled && mfe_offload_cache_) return mfe_offload_cache_->backing_payload_bytes();
     if (!ssd_expert_cache_ || !source_) return 0;
     std::size_t bytes = 0;
     for (const auto& [name, record] : source_->records()) {
@@ -633,13 +633,13 @@ std::size_t MlxDeepseekV41CausalLm::set_expert_cache_limit(std::size_t bytes) {
         const auto after = mlx::core::get_active_memory();
         return before > after ? before - after : 0;
     }
-    if (!mfq::mfq_compat_enabled || !mfe_offload_cache_) {
+    if (!tyloi::mfq_compat_enabled || !mfe_offload_cache_) {
         if (!ssd_expert_cache_ && resident_full_expert_bytes() <= bytes) return 0;
         if (!source_) throw std::runtime_error("DeepSeek-V4.1 expert backing is unavailable");
-        auto cache = mfq::with_mfq_compat([&] { return std::make_shared<MlxMfeOffloadCache>(*source_, bytes); });
+        auto cache = tyloi::with_mfq_compat([&] { return std::make_shared<MlxMfeOffloadCache>(*source_, bytes); });
         for (const auto& layer : layers_) layer.validate_offload(cache);
         if (dspark_) dspark_->validate_offload(cache);
-        if (mfq::mfq_compat_enabled && ssd_expert_cache_) {
+        if (tyloi::mfq_compat_enabled && ssd_expert_cache_) {
             ssd_expert_cache_->release_deferred();
             for (auto& layer : layers_) layer.use_offload(cache);
             if (dspark_) dspark_->use_offload(cache);
@@ -671,7 +671,7 @@ std::size_t MlxDeepseekV41CausalLm::set_expert_cache_limit(std::size_t bytes) {
 }
 
 void MlxDeepseekV41CausalLm::update_expert_prefill_priority() {
-    if (!mfq::mfq_compat_enabled || !mfe_offload_cache_) return;
+    if (!tyloi::mfq_compat_enabled || !mfe_offload_cache_) return;
     std::vector<std::string> names;
     if (ced_prefill_active_ && source_) {
         const auto encoder_layers = layers_.size() / 2;
@@ -725,10 +725,10 @@ MlxDeepseekV41CausalLm::ssd_expert_cache_stats() const {
         result.pinned_cache_bytes = cache.pinned_bytes;
         return result;
     }
-    if (mfq::mfq_compat_enabled && ssd_expert_cache_) {
+    if (tyloi::mfq_compat_enabled && ssd_expert_cache_) {
         return ssd_expert_cache_->stats();
     }
-    if (!mfq::mfq_compat_enabled || !mfe_offload_cache_) {
+    if (!tyloi::mfq_compat_enabled || !mfe_offload_cache_) {
         return std::nullopt;
     }
     MlxSsdExpertCacheStats stats;
@@ -779,7 +779,7 @@ MlxDeepseekV41CausalLm::engram_ssd_stats() const {
 }
 
 void MlxDeepseekV41CausalLm::prewarm_ssd_expert_arena() {
-    if (mfq::mfq_compat_enabled && ssd_expert_cache_) {
+    if (tyloi::mfq_compat_enabled && ssd_expert_cache_) {
         ssd_expert_cache_->prewarm_metal();
     }
 }
@@ -787,10 +787,10 @@ void MlxDeepseekV41CausalLm::prewarm_ssd_expert_arena() {
 void MlxDeepseekV41CausalLm::clear_expert_cache() {
     if (gguf_expert_cache_) gguf_expert_cache_->clear();
     if (tq_expert_cache_) tq_expert_cache_->clear();
-    if (mfq::mfq_compat_enabled && ssd_expert_cache_) {
+    if (tyloi::mfq_compat_enabled && ssd_expert_cache_) {
         ssd_expert_cache_->clear();
     }
-    if (mfq::mfq_compat_enabled && mfe_offload_cache_) {
+    if (tyloi::mfq_compat_enabled && mfe_offload_cache_) {
         mfe_offload_cache_->clear();
     }
 }
@@ -921,10 +921,10 @@ array MlxDeepseekV41CausalLm::forward_impl(
     };
     const bool route_transaction = ssd_expert_cache_ && tokens == 1 &&
         !image_mask.has_value() && speculative_cache_start_ < 0 &&
-        (mfq::mfq_compat_enabled && mlx_ssd_route_transactions_enabled());
+        (tyloi::mfq_compat_enabled && mlx_ssd_route_transactions_enabled());
     if (!route_transaction) {
         for (std::size_t index = 0; index < layer_count; ++index) {
-            if (mfq::mfq_compat_enabled && mfe_offload_cache_ && batch == 1 && tokens == 1 && cache_position_ > 0 &&
+            if (tyloi::mfq_compat_enabled && mfe_offload_cache_ && batch == 1 && tokens == 1 && cache_position_ > 0 &&
                 !image_mask && speculative_cache_start_ < 0 && !tyloi::profiling::active()) {
                 std::vector<MlxMfeCachedRoute> routes;
                 for (auto next = index; next < layers_.size() && next < index + 4; ++next) {
@@ -1051,7 +1051,7 @@ array MlxDeepseekV41CausalLm::forward_impl(
         }
     } else {
         const bool force_transactions =
-            (mfq::mfq_compat_enabled && mlx_ssd_force_route_transactions());
+            (tyloi::mfq_compat_enabled && mlx_ssd_force_route_transactions());
         const auto group_layers = static_cast<std::size_t>(
             mlx_ssd_route_transaction_group_layers(
                 static_cast<int>(layers_.size())));
@@ -1361,7 +1361,7 @@ array MlxDeepseekV41CausalLm::prefill(
     const array& raw_token_ids,
     int chunk_size,
     bool full_logits) {
-    mfq::engine::PrefillActivity prefill_activity;
+    tyloi::engine::PrefillActivity prefill_activity;
     auto token_ids = normalized_ids(raw_token_ids);
     if (chunk_size <= 0) {
         throw std::invalid_argument(
@@ -1432,7 +1432,7 @@ array MlxDeepseekV41CausalLm::prefill_multimodal(
         }
         ids.push_back(static_cast<std::int32_t>(token));
     }
-    mfq::engine::PrefillActivity prefill_activity;
+    tyloi::engine::PrefillActivity prefill_activity;
     const auto token_array = array(
         ids.begin(), Shape{1, static_cast<int>(ids.size())});
     auto embeddings = vision_->embed_prompt(
@@ -2055,4 +2055,4 @@ void MlxDeepseekV41CausalLm::restore_text_session_state(
     }
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

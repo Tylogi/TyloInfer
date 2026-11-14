@@ -4,7 +4,7 @@
 #include <span>
 #include <vector>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 class AneMatmul {
 public:
@@ -20,4 +20,4 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

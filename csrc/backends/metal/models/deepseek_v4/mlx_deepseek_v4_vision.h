@@ -9,7 +9,7 @@
 
 #include <mlx/mlx.h>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 struct MlxDeepseekV4ImageInput {
     mlx::core::array patches;
@@ -99,4 +99,4 @@ private:
     mlx::core::array image_parameters_;
 };
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

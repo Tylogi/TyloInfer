@@ -9,7 +9,7 @@
 #include <climits>
 #include <cstring>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 using namespace mlx::core;
 constexpr int kDeviceScratchElements = 64;

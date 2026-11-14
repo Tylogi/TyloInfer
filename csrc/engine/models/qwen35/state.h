@@ -12,7 +12,7 @@
 #include <variant>
 #include <vector>
 
-namespace tyloi::cuda::qwen35 {
+namespace tyloi::models::qwen35 {
 
 inline std::int64_t kv_capacity_for(bool sliding, std::int64_t capacity,
                                     std::int64_t end, std::int64_t requested) noexcept {
@@ -117,4 +117,4 @@ private:
     bool transposed_;
 };
 
-} // namespace tyloi::cuda::qwen35
+} // namespace tyloi::models::qwen35

@@ -8,7 +8,7 @@
 
 #include <mlx/mlx.h>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 // Dense or packed Qwen-style SwiGLU feed-forward network:
 // down(silu(gate(x)) * up(x)).
@@ -169,4 +169,4 @@ private:
     int cache_batch_ = 0;
 };
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

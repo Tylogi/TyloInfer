@@ -45,7 +45,7 @@ public:
                 LayerPlacementConfig& placement)
         : model_(std::move(model)), weights_(weights), placement_(placement),
           primary_(placement.primary_device()) {
-        if (weights.placement.device != primary_)
+        if (weights.placement.target != ::tyloi::Device(::tyloi::kCUDA, primary_))
             throw std::invalid_argument("Gemma4 weight and layer primary devices differ");
     }
 
@@ -165,7 +165,7 @@ private:
     }
     void read_layer(Layer& layer, int index) const {
         const int device = placement_.device_for_layer(index);
-        gemma4::load_layer(layer, weights_.for_layer(device, false), model_.config, index,
+        gemma4::load_layer(layer, weights_.for_layer(::tyloi::Device(::tyloi::kCUDA, device)), model_.config, index,
                                   model_.config.layer_types.at(static_cast<std::size_t>(index)));
     }
     const Layer& selected(int index) const {

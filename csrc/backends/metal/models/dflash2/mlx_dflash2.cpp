@@ -16,7 +16,7 @@
 #include <stdexcept>
 #include <nlohmann/json.hpp>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 using namespace mlx::core;
 
@@ -556,7 +556,7 @@ std::int32_t generate_target(const MlxDFlash2& draft, Target& target,
         if (stats) stats->target_ms += std::chrono::duration<double, std::milli>(Clock::now() - verify_started).count();
         auto features = target.take_hidden_capture();
         if (!features) throw std::runtime_error("DFlash2 target omitted verification features");
-        const auto decision = mfq::engine::mtp::verify_greedy(
+        const auto decision = tyloi::engine::mtp::verify_greedy(
             std::span<const std::int32_t>(proposal.tokens.template data<std::int32_t>(), depth),
             std::span<const std::int32_t>(predictions.template data<std::int32_t>(), depth + 1));
         const int matched = int(decision.accepted_drafts);

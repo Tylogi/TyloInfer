@@ -17,7 +17,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 
 void integer(std::vector<std::uint8_t>& out, std::uint64_t value) {
@@ -41,7 +41,7 @@ std::vector<std::uint8_t> encode_mtp_lora(const MtpLoraState& state, const std::
     integer(bytes, state.rank);
     integer(bytes, state.version);
     integer(bytes, state.optimizer_step);
-    const auto key = mfq::cache::sha256(fingerprint);
+    const auto key = tyloi::cache::sha256(fingerprint);
     bytes.insert(bytes.end(), key.begin(), key.end());
     for (const auto* values : {&state.a, &state.b, &state.first_moment, &state.second_moment}) {
         if constexpr (std::endian::native == std::endian::little) {
@@ -53,7 +53,7 @@ std::vector<std::uint8_t> encode_mtp_lora(const MtpLoraState& state, const std::
             for (int i = 0; i < 4; ++i) bytes.push_back(static_cast<std::uint8_t>(bits >> (i * 8)));
         }
     }
-    const auto hash = mfq::cache::sha256(bytes.data(), bytes.size());
+    const auto hash = tyloi::cache::sha256(bytes.data(), bytes.size());
     bytes.insert(bytes.end(), hash.begin(), hash.end());
     return bytes;
 }
@@ -64,8 +64,8 @@ MtpLoraState decode_mtp_lora(std::span<const std::uint8_t> bytes, const std::str
     if (bytes.size() != expected || std::memcmp(bytes.data(), "MFQTTT1\0", 8) != 0 ||
         integer(bytes, 8) != std::uint64_t(inputs) || integer(bytes, 16) != std::uint64_t(outputs) ||
         integer(bytes, 24) != std::uint64_t(rank)) throw std::runtime_error("incompatible MTP LoRA snapshot");
-    const auto key = mfq::cache::sha256(fingerprint);
-    const auto hash = mfq::cache::sha256(bytes.data(), bytes.size() - 32);
+    const auto key = tyloi::cache::sha256(fingerprint);
+    const auto hash = tyloi::cache::sha256(bytes.data(), bytes.size() - 32);
     if (!std::equal(key.begin(), key.end(), bytes.begin() + 48) ||
         !std::equal(hash.begin(), hash.end(), bytes.end() - 32))
         throw std::runtime_error("MTP LoRA snapshot fingerprint or checksum mismatch");
@@ -120,7 +120,7 @@ struct MtpLoraSessions::Impl {
     std::thread worker;
 
     std::filesystem::path path(const std::string& session) const {
-        return directory / (mfq::cache::block_hash_hex(mfq::cache::sha256(fingerprint + "\n" + session)) + ".lora");
+        return directory / (tyloi::cache::block_hash_hex(tyloi::cache::sha256(fingerprint + "\n" + session)) + ".lora");
     }
     std::string key(const std::string& session) const { return fingerprint + "\n" + session; }
     std::size_t resident() const {
@@ -466,4 +466,4 @@ std::vector<std::pair<std::string, double>> MtpLoraSessions::metrics() const {
         {"mtp_ttt_corrupt_snapshots", double(impl_->corrupt)}, {"mtp_ttt_busy", impl_->busy}};
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

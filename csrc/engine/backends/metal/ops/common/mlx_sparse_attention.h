@@ -5,7 +5,7 @@
 
 #include <mlx/mlx.h>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 mlx::core::array mlx_sparse_indexer_dot_scores(
     const mlx::core::array& query, const mlx::core::array& pooled_keys);
@@ -92,4 +92,4 @@ mlx::core::array mlx_sparse_circular_mla_decode_attention(
     int local_window,
     std::optional<float> scale = std::nullopt);
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

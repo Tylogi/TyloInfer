@@ -17,8 +17,8 @@
 #include <vector>
 
 int main(int argc, char** argv) {
-    using mfq::metal::MlxDeepseekV4CausalLm;
-    using mfq::metal::MfqContainer;
+    using tyloi::metal::MlxDeepseekV4CausalLm;
+    using tyloi::metal::MfqContainer;
     using mlx::core::Shape;
     using mlx::core::array;
 
@@ -48,9 +48,9 @@ int main(int argc, char** argv) {
                 static_cast<std::int32_t>((index * 17 + 3) % 129280);
         }
         const bool profile_components =
-            mfq::metal::detail::component_profile_requested();
-        mfq::metal::detail::ComponentProfile component_profile;
-        mfq::metal::detail::ScopedComponentProfile component_scope(
+            tyloi::metal::detail::component_profile_requested();
+        tyloi::metal::detail::ComponentProfile component_profile;
+        tyloi::metal::detail::ScopedComponentProfile component_scope(
             profile_components ? &component_profile : nullptr);
         const auto started = std::chrono::steady_clock::now();
         auto logits = model.prefill(

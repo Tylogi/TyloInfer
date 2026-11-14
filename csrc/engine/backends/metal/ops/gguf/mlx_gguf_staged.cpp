@@ -10,7 +10,7 @@
 #include <climits>
 #include <stdexcept>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 using namespace mlx::core;
 
@@ -1714,4 +1714,4 @@ array MlxGgufStagedPrefill::weighted_down(const MlxGgufWeight& weight, const arr
 bool MlxGgufStagedPrefill::prefers_weighted_down(const MlxGgufWeight& weight) noexcept {
     return weight.planes_ && (weight.format_ < 144 || (weight.format_ <= 151 && weight.format_ != 150));
 }
-} // namespace mfq::metal
+} // namespace tyloi::metal

@@ -498,7 +498,7 @@ void qwen4_validate_forward(const qwen4_exp::Model& model, std::int64_t tokens,
                                  "Qwen4 positions require [T], [3,T], [4,T], [3,B,T] or [4,B,T]");
     DenseTensor host_ids, cpu_positions;
     const bool pinned = model.host_tokens || std::any_of(model.layers.begin(), model.layers.end(),
-        [](const auto& layer) { return layer->cpu_offloaded; });
+        [](const auto& layer) { return layer->device.is_cpu(); });
     if (pinned) {
         host_ids = ids.to(::tyloi::kCPU, ::tyloi::kInt64).contiguous();
         cpu_positions = current.to(::tyloi::kCPU, ::tyloi::kInt64).contiguous();
@@ -520,18 +520,18 @@ void qwen4_validate_forward(const qwen4_exp::Model& model, std::int64_t tokens,
         input.trace->push_back(std::make_shared<DenseTensor>(hidden.to(::tyloi::kFloat32).clone()));
     for (std::size_t i=0;i<model.layers.size();++i) {
         auto& block = model.layers[i];
-        MfqCudaGuard guard(block->cuda_device);
-        auto local_ids = block->cpu_offloaded
+        ::tyloi::ops::DeviceScope guard(block->device);
+        auto local_ids = block->device.is_cpu()
             ? host_ids
-            : tyloi::ops::copy(ids, ::tyloi::Device(::tyloi::kCUDA, block->cuda_device)).dense();
-        auto local_pos = block->cpu_offloaded
+            : tyloi::ops::copy(ids, block->device).dense();
+        auto local_pos = block->device.is_cpu()
             ? cpu_positions
-            : tyloi::ops::copy(current, ::tyloi::Device(::tyloi::kCUDA, block->cuda_device)).dense();
+            : tyloi::ops::copy(current, block->device).dense();
         auto local_full_positions = tyloi::ops::copy(full_positions,
-            ::tyloi::Device(::tyloi::kCUDA, block->cuda_device)).dense();
-        hidden = block->cpu_offloaded
+            block->device).dense();
+        hidden = block->device.is_cpu()
             ? hidden.to(::tyloi::kCPU).contiguous()
-            : tyloi::ops::copy(hidden, ::tyloi::Device(::tyloi::kCUDA, block->cuda_device)).dense();
+            : tyloi::ops::copy(hidden, block->device).dense();
         hidden = qwen4_exp::forward(*block, *state.layers[i],
                                 std::move(hidden), local_ids, local_pos, local_full_positions,
                                 confirmed, host_ids);
@@ -672,7 +672,7 @@ struct Qwen4DecodeGraph {
                 if(!block.qsa)continue;
                 const auto bytes=block.qsa->graph_growth_bytes(*request.layers[i]->qsa,capacity);
                 if(!bytes)continue;
-                const tyloi::Device device(tyloi::kCUDA,block.cuda_device);
+                const auto device = block.device;
                 auto it=std::find_if(result.begin(),result.end(),[&](const auto& item){return item.first==device;});
                 if(it==result.end())result.emplace_back(device,bytes);
                 else {
@@ -1084,7 +1084,7 @@ Qwen4BatchRequestState::Qwen4BatchRequestState(qwen4_exp::Model& model)
     : state_(std::make_unique<Impl>(model)) {
     const auto primary = model.primary_device;
     for (const auto& block : model.layers) {
-        TYLOINFER_RUNTIME_CHECK(!block->cpu_offloaded && block->cuda_device == primary,
+        TYLOINFER_RUNTIME_CHECK(!block->device.is_cpu() && block->device.index == primary,
                           "Flash-Next continuous batching requires one CUDA device");
         state_->layers.push_back(std::make_unique<qwen4_exp::LayerState>(*block));
     }
@@ -1696,7 +1696,7 @@ tyloi::models::PrefillPlan qwen4_exp::Model::prefill_plan(
         (!policy.routed && !host_tokens) || !policy.coordinated || policy.transformed ||
         policy.compute<=8 || policy.first!=0 || (policy.last!=0 && policy.last!=policy.tokens)) return {false,8192};
     for (const auto& block:layers)
-        if (block->cpu_offloaded || block->cuda_device!=primary_device) return {false,8192};
+        if (block->device.is_cpu() || block->device.index!=primary_device) return {false,8192};
     return {true,8192};
 }
 

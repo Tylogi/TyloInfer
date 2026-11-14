@@ -19,9 +19,8 @@
 #include <variant>
 #include <vector>
 
-namespace tyloi::cuda::qwen35 {
+namespace tyloi::models::qwen35 {
 
-using Config = tyloi::models::qwen35::Config;
 
 struct Full {
     ::tyloi::models::FullAttention attention;
@@ -58,6 +57,7 @@ struct Model : tyloi::models::CausalModel {
     std::unique_ptr<qwen35::Mtp> mtp;
     bool mtp_supported = false;
     bool recurrent_transposed = false;
+    tyloi::state::KvQuantization kv_quantization;
     tyloi::models::Info info() const override;
     MfqModelCapabilities capabilities() const override;
     tyloi::engine::Metrics metrics() const override;
@@ -75,4 +75,4 @@ struct Model : tyloi::models::CausalModel {
     ::tyloi::Tensor softcap(const tyloi::Tensor& logits) const override;
 };
 
-} // namespace tyloi::cuda::qwen35
+} // namespace tyloi::models::qwen35

@@ -12,9 +12,9 @@
 #include <string_view>
 #include <vector>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
-using MlxPagedPayload = mfq::cache::PagedPrefixPayload;
+using MlxPagedPayload = tyloi::cache::PagedPrefixPayload;
 
 template <typename SessionState>
 struct MlxPagedSessionCodec {
@@ -100,4 +100,4 @@ struct MlxPagedSessionCodec<MlxQwen4TextSessionState> {
     static std::size_t token_count(const MlxPagedPayload& payload);
 };
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

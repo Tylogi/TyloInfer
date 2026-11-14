@@ -6,7 +6,7 @@
 #include <iostream>
 #include <stdexcept>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 namespace {
 void warm_sorting() {

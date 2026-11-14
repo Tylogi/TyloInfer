@@ -4,7 +4,7 @@
 #include "engine/weights/source/safetensors.h"
 #include "nlohmann/json.hpp"
 
-namespace mfq {
+namespace tyloi {
 
 struct MlxAffineBinding {
     MlxAffineLayout layout;
@@ -15,4 +15,4 @@ struct MlxAffineBinding {
 MlxAffineBinding mlx_affine_binding(const tyloi::Safetensors& source,
     const nlohmann::json& quantization, const tyloi::TensorMetadata& values);
 
-} // namespace mfq
+} // namespace tyloi

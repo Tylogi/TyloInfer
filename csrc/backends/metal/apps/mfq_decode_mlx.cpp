@@ -470,7 +470,7 @@ bool prefill_autotune_enabled() noexcept {
 }
 
 std::optional<std::size_t> native_hf_source_bytes(
-    const mfq::metal::MfqContainer& container) noexcept {
+    const tyloi::metal::MfqContainer& container) noexcept {
     std::size_t total = 0;
     for (const auto& path : container.source_paths()) {
         std::error_code error;
@@ -505,7 +505,7 @@ bool is_routed_expert_record(std::string_view name) noexcept {
 }
 
 std::size_t record_payload_bytes(
-    const mfq::metal::MfqContainer& container,
+    const tyloi::metal::MfqContainer& container,
     bool (*selected)(std::string_view)) noexcept {
     std::size_t total = 0;
     for (const auto& [name, record] : container.records()) {
@@ -522,7 +522,7 @@ std::size_t record_payload_bytes(
 std::size_t requested_cache_bytes(
     const std::optional<double>& cache_gb,
     bool hf_streaming,
-    const mfq::metal::MfqContainer& container) {
+    const tyloi::metal::MfqContainer& container) {
     constexpr long double bytes_per_gib =
         static_cast<long double>(std::uint64_t{1} << 30);
     if (cache_gb.has_value()) {
@@ -689,10 +689,10 @@ std::filesystem::path default_prefix_cache_directory() {
 }
 
 std::string metal_prefix_cache_compatibility_key(
-    const mfq::metal::MfqContainer& container,
+    const tyloi::metal::MfqContainer& container,
     std::string_view codec,
     std::int64_t context_size) {
-    std::vector<const mfq::metal::MfqRecord*> records;
+    std::vector<const tyloi::metal::MfqRecord*> records;
     records.reserve(container.records().size());
     for (const auto& [name, record] : container.records()) {
         (void)name;
@@ -743,7 +743,7 @@ bool metal_prefix_nax_device() {
         const auto& info = mlx::core::device_info();
         const auto found = info.find("architecture");
         if (found != info.end()) if (const auto* architecture = std::get_if<std::string>(&found->second))
-            return mfq::metal::mlx_prefix_nax_architecture(*architecture);
+            return tyloi::metal::mlx_prefix_nax_architecture(*architecture);
     } catch (const std::exception&) {
     }
     return false;
@@ -753,7 +753,7 @@ std::string metal_media_cache_key(const MfqMultimodalInput& media) {
     std::ostringstream key;
     key << "vision-prefix-v1:" << media.processor_name << ':';
     const auto append = [&](const auto& values) {
-        key << mfq::cache::block_hash_hex(mfq::cache::sha256(values.data(),
+        key << tyloi::cache::block_hash_hex(tyloi::cache::sha256(values.data(),
             values.size() * sizeof(typename std::decay_t<decltype(values)>::value_type))) << ':';
     };
     append(media.pixel_values);
@@ -764,15 +764,15 @@ std::string metal_media_cache_key(const MfqMultimodalInput& media) {
 }
 
 template <typename Runtime>
-std::shared_ptr<mfq::cache::PagedPrefixCache> make_metal_paged_cache(
-    const mfq::metal::MfqContainer& container,
+std::shared_ptr<tyloi::cache::PagedPrefixCache> make_metal_paged_cache(
+    const tyloi::metal::MfqContainer& container,
     std::int64_t context_size,
     int prefill_chunk_size,
     const std::string& predictor_key = {}) {
     using SessionState = decltype(
         std::declval<const Runtime&>().capture_text_session_state(
             std::declval<const std::vector<std::int64_t>&>()));
-    using Codec = mfq::metal::MlxPagedSessionCodec<SessionState>;
+    using Codec = tyloi::metal::MlxPagedSessionCodec<SessionState>;
     if constexpr (!Codec::available) {
         (void)container;
         (void)context_size;
@@ -783,19 +783,19 @@ std::shared_ptr<mfq::cache::PagedPrefixCache> make_metal_paged_cache(
                 std::getenv("TYLOINFER_SERVER_DISABLE_PREFIX_CACHE")) {
             if (disabled[0] == '1') return {};
         }
-        constexpr bool recurrent = std::is_same_v<Runtime, mfq::metal::MlxQwen35CausalLm> ||
-            std::is_same_v<Runtime, mfq::metal::MlxQwen4CausalLm>;
-        const auto default_block = mfq::metal::mlx_prefix_block_size(
-            recurrent || std::is_same_v<Runtime, mfq::metal::MlxDeepseekV41CausalLm>, prefill_chunk_size,
-            physical_memory_bytes(), metal_prefix_nax_device(), std::is_same_v<Runtime, mfq::metal::MlxQwen4CausalLm>);
+        constexpr bool recurrent = std::is_same_v<Runtime, tyloi::metal::MlxQwen35CausalLm> ||
+            std::is_same_v<Runtime, tyloi::metal::MlxQwen4CausalLm>;
+        const auto default_block = tyloi::metal::mlx_prefix_block_size(
+            recurrent || std::is_same_v<Runtime, tyloi::metal::MlxDeepseekV41CausalLm>, prefill_chunk_size,
+            physical_memory_bytes(), metal_prefix_nax_device(), std::is_same_v<Runtime, tyloi::metal::MlxQwen4CausalLm>);
         const auto block_size = cache_bytes_from_environment(
             "TYLOINFER_SERVER_PREFIX_CACHE_BLOCK_TOKENS", default_block);
         if (block_size == 0 || block_size > 65536) {
             throw std::runtime_error(
                 "TYLOINFER_SERVER_PREFIX_CACHE_BLOCK_TOKENS must be in [1, 65536]");
         }
-        mfq::cache::PagedPrefixCacheConfig config;
-        config.reserve_memory = [](std::size_t bytes) { mfq::metal::MlxResidentBudgetScope::reserve(bytes); };
+        tyloi::cache::PagedPrefixCacheConfig config;
+        config.reserve_memory = [](std::size_t bytes) { tyloi::metal::MlxResidentBudgetScope::reserve(bytes); };
         config.cache_dir = default_prefix_cache_directory();
         if (!container.source_paths().empty()) config.model_path = container.source_paths().front();
         config.compatibility_key = metal_prefix_cache_compatibility_key(
@@ -803,9 +803,9 @@ std::shared_ptr<mfq::cache::PagedPrefixCache> make_metal_paged_cache(
         if constexpr (recurrent) config.compatibility_key += tyloi::engine::kv_quantization_tag();
         if constexpr (recurrent) {
             const auto native_context = [&] {
-                if constexpr (std::is_same_v<Runtime, mfq::metal::MlxQwen4CausalLm>)
-                    return mfq::metal::Qwen4Config::from_mfq(container).max_position_embeddings;
-                else return mfq::metal::load_qwen35_config(container).max_position_embeddings;
+                if constexpr (std::is_same_v<Runtime, tyloi::metal::MlxQwen4CausalLm>)
+                    return tyloi::metal::Qwen4Config::from_mfq(container).max_position_embeddings;
+                else return tyloi::metal::load_qwen35_config(container).max_position_embeddings;
             }();
             if (context_size > native_context) config.compatibility_key += "\nqwen-yarn-v1";
         }
@@ -823,7 +823,7 @@ std::shared_ptr<mfq::cache::PagedPrefixCache> make_metal_paged_cache(
         config.max_pending_bytes = cache_bytes_from_environment(
             "TYLOINFER_SERVER_PREFIX_CACHE_PENDING_BYTES",
             512ULL * 1024ULL * 1024ULL);
-        return std::make_shared<mfq::cache::PagedPrefixCache>(
+        return std::make_shared<tyloi::cache::PagedPrefixCache>(
             std::move(config));
     }
 }
@@ -834,7 +834,7 @@ private:
     using SessionState = decltype(
         std::declval<const Runtime&>().capture_text_session_state(
             std::declval<const std::vector<std::int64_t>&>()));
-    using Codec = mfq::metal::MlxPagedSessionCodec<SessionState>;
+    using Codec = tyloi::metal::MlxPagedSessionCodec<SessionState>;
 
     struct Entry {
         SessionState state;
@@ -843,14 +843,14 @@ private:
     };
 
     struct PagedBinding {
-        std::vector<mfq::cache::BlockHash> blocks;
+        std::vector<tyloi::cache::BlockHash> blocks;
         std::size_t tokens = 0;
         std::uint64_t last_used = 0;
     };
 
 public:
     explicit MlxServerTextSessionCache(
-        std::shared_ptr<mfq::cache::PagedPrefixCache> paged_cache = {})
+        std::shared_ptr<tyloi::cache::PagedPrefixCache> paged_cache = {})
         : paged_cache_(std::move(paged_cache)) {
         if (const char* value =
                 std::getenv("TYLOINFER_SERVER_MAX_KV_SESSIONS")) {
@@ -1241,7 +1241,7 @@ public:
     }
 
     void replace_paged_cache(
-        std::shared_ptr<mfq::cache::PagedPrefixCache> cache,
+        std::shared_ptr<tyloi::cache::PagedPrefixCache> cache,
         std::uint64_t disk_budget,
         std::uint64_t hot_budget) {
         clear_live_sessions();
@@ -1291,7 +1291,7 @@ private:
         }
         std::size_t payload_bytes = 0;
         for (const auto& payload : payloads) payload_bytes += payload->size();
-        mfq::metal::MlxResidentBudgetHold payload_budget(payload_bytes);
+        tyloi::metal::MlxResidentBudgetHold payload_budget(payload_bytes);
         if (payloads.size() != match.blocks.size()) {
             match.blocks.resize(payloads.size());
             if constexpr (requires { Codec::token_count(payloads.back()); })
@@ -1404,7 +1404,7 @@ private:
         }
         const auto existing_blocks = existing.blocks.size();
         auto blocks = std::move(existing.blocks);
-        mfq::cache::BlockHash parent{};
+        tyloi::cache::BlockHash parent{};
         if (!blocks.empty()) parent = blocks.back();
         for (std::size_t index = blocks.size(); index < full_blocks; ++index) {
             const auto token_offset = index * block_size;
@@ -1421,7 +1421,7 @@ private:
                 Codec::refresh_final_block;
                 Codec::has_exact_boundary(
                     std::declval<
-                        const mfq::metal::MlxPagedPayload&>());
+                        const tyloi::metal::MlxPagedPayload&>());
             }) {
             if (Codec::refresh_final_block &&
                 existing_blocks == full_blocks && !blocks.empty()) {
@@ -1440,9 +1440,9 @@ private:
                 if (!exact || upgrade_mtp) {
                     const auto index = full_blocks - 1;
                     const auto token_offset = index * block_size;
-                    const mfq::cache::BlockHash checkpoint_parent =
+                    const tyloi::cache::BlockHash checkpoint_parent =
                         index == 0
-                        ? mfq::cache::BlockHash{}
+                        ? tyloi::cache::BlockHash{}
                         : blocks[index - 1];
                     const auto refreshed = paged_cache_->replace(
                         checkpoint_parent,
@@ -1473,7 +1473,7 @@ private:
 
     void bind_paged_session(
         const std::string& session_id,
-        std::vector<mfq::cache::BlockHash> blocks,
+        std::vector<tyloi::cache::BlockHash> blocks,
         std::size_t tokens) {
         close_paged_session(session_id);
         paged_bindings_[session_id] = PagedBinding{
@@ -1622,7 +1622,7 @@ private:
 
     std::unordered_map<std::string, std::vector<Entry>> states_;
     std::unordered_map<std::string, PagedBinding> paged_bindings_;
-    std::shared_ptr<mfq::cache::PagedPrefixCache> paged_cache_;
+    std::shared_ptr<tyloi::cache::PagedPrefixCache> paged_cache_;
     mutable std::mutex paged_control_mutex_;
     std::uint64_t paged_disk_budget_ = 0;
     std::uint64_t paged_hot_budget_ = 0;
@@ -1642,16 +1642,16 @@ private:
 };
 
 std::int32_t generate_with_prefill_metrics(
-    mfq::metal::MlxQwen35CausalLm& runtime,
+    tyloi::metal::MlxQwen35CausalLm& runtime,
     const std::vector<std::int64_t>& prompt,
-    const mfq::metal::MlxSamplingParams& sampling,
+    const tyloi::metal::MlxSamplingParams& sampling,
     std::int32_t max_tokens,
     const std::function<bool(std::int64_t)>& callback,
     const std::function<void(MfqPrefillTiming)>& on_prefill,
     const MfqPromptCachePlan& cache_plan,
     const MfqTokenConstraintPtr& token_constraint,
     int prefill_chunk_size,
-    const mfq::metal::MlxPrefixCacheHooks& prefix_cache = {}) {
+    const tyloi::metal::MlxPrefixCacheHooks& prefix_cache = {}) {
     std::function<void(std::size_t, double)> report_prefill;
     if (on_prefill) {
         report_prefill = [on_prefill](std::size_t tokens, double llm_ms) {
@@ -1674,16 +1674,16 @@ std::int32_t generate_with_prefill_metrics(
 }
 
 std::int32_t generate_with_prefill_metrics(
-    mfq::metal::MlxNemotronHCausalLm& runtime,
+    tyloi::metal::MlxNemotronHCausalLm& runtime,
     const std::vector<std::int64_t>& prompt,
-    const mfq::metal::MlxSamplingParams& sampling,
+    const tyloi::metal::MlxSamplingParams& sampling,
     std::int32_t max_tokens,
     const std::function<bool(std::int64_t)>& callback,
     const std::function<void(MfqPrefillTiming)>& on_prefill,
     const MfqPromptCachePlan& cache_plan,
     const MfqTokenConstraintPtr& token_constraint,
     int prefill_chunk_size,
-    const mfq::metal::MlxPrefixCacheHooks& = {}) {
+    const tyloi::metal::MlxPrefixCacheHooks& = {}) {
     std::function<void(std::size_t, double)> report_prefill;
     if (on_prefill) {
         report_prefill = [on_prefill](std::size_t tokens, double llm_ms) {
@@ -1701,16 +1701,16 @@ std::int32_t generate_with_prefill_metrics(
 }
 
 std::int32_t generate_with_prefill_metrics(
-    mfq::metal::MlxMiniCPMO45Runtime& runtime,
+    tyloi::metal::MlxMiniCPMO45Runtime& runtime,
     const std::vector<std::int64_t>& prompt,
-    const mfq::metal::MlxSamplingParams& sampling,
+    const tyloi::metal::MlxSamplingParams& sampling,
     std::int32_t max_tokens,
     const std::function<bool(std::int64_t)>& callback,
     const std::function<void(MfqPrefillTiming)>& on_prefill,
     const MfqPromptCachePlan& cache_plan,
     const MfqTokenConstraintPtr& token_constraint,
     int prefill_chunk_size,
-    const mfq::metal::MlxPrefixCacheHooks& = {}) {
+    const tyloi::metal::MlxPrefixCacheHooks& = {}) {
     std::function<void(std::size_t, double)> report_prefill;
     if (on_prefill) {
         report_prefill = [on_prefill](std::size_t tokens, double llm_ms) {
@@ -1732,16 +1732,16 @@ std::int32_t generate_with_prefill_metrics(
 }
 
 std::int32_t generate_with_prefill_metrics(
-    mfq::metal::MlxDeepseekV4CausalLm& runtime,
+    tyloi::metal::MlxDeepseekV4CausalLm& runtime,
     const std::vector<std::int64_t>& prompt,
-    const mfq::metal::MlxSamplingParams& sampling,
+    const tyloi::metal::MlxSamplingParams& sampling,
     std::int32_t max_tokens,
     const std::function<bool(std::int64_t)>& callback,
     const std::function<void(MfqPrefillTiming)>& on_prefill,
     const MfqPromptCachePlan& cache_plan,
     const MfqTokenConstraintPtr& token_constraint,
     int prefill_chunk_size,
-    const mfq::metal::MlxPrefixCacheHooks& = {}) {
+    const tyloi::metal::MlxPrefixCacheHooks& = {}) {
     std::function<void(std::size_t, double)> report_prefill;
     if (on_prefill) {
         report_prefill = [on_prefill](std::size_t tokens, double llm_ms) {
@@ -1764,16 +1764,16 @@ std::int32_t generate_with_prefill_metrics(
 }
 
 std::int32_t generate_with_prefill_metrics(
-    mfq::metal::MlxDeepseekV41CausalLm& runtime,
+    tyloi::metal::MlxDeepseekV41CausalLm& runtime,
     const std::vector<std::int64_t>& prompt,
-    const mfq::metal::MlxSamplingParams& sampling,
+    const tyloi::metal::MlxSamplingParams& sampling,
     std::int32_t max_tokens,
     const std::function<bool(std::int64_t)>& callback,
     const std::function<void(MfqPrefillTiming)>& on_prefill,
     const MfqPromptCachePlan& cache_plan,
     const MfqTokenConstraintPtr& token_constraint,
     int prefill_chunk_size,
-    const mfq::metal::MlxPrefixCacheHooks& prefix_cache = {}) {
+    const tyloi::metal::MlxPrefixCacheHooks& prefix_cache = {}) {
     std::function<void(std::size_t, double)> report_prefill;
     if (on_prefill) {
         report_prefill = [on_prefill](std::size_t tokens, double llm_ms) {
@@ -1796,16 +1796,16 @@ std::int32_t generate_with_prefill_metrics(
 }
 
 std::int32_t generate_with_prefill_metrics(
-    mfq::metal::MlxQwen4CausalLm& runtime,
+    tyloi::metal::MlxQwen4CausalLm& runtime,
     const std::vector<std::int64_t>& prompt,
-    const mfq::metal::MlxSamplingParams& sampling,
+    const tyloi::metal::MlxSamplingParams& sampling,
     std::int32_t max_tokens,
     const std::function<bool(std::int64_t)>& callback,
     const std::function<void(MfqPrefillTiming)>& on_prefill,
     const MfqPromptCachePlan& cache_plan,
     const MfqTokenConstraintPtr& token_constraint,
     int prefill_chunk_size,
-    const mfq::metal::MlxPrefixCacheHooks& prefix_cache = {}) {
+    const tyloi::metal::MlxPrefixCacheHooks& prefix_cache = {}) {
     std::function<void(std::size_t, double)> report_prefill;
     if (on_prefill) {
         report_prefill = [on_prefill](std::size_t tokens, double llm_ms) {
@@ -1827,10 +1827,10 @@ std::int32_t generate_with_prefill_metrics(
 }
 
 template <typename Runtime, typename Loader>
-class LoadedMetalModel final : public mfq::metal::MlxEngineModel {
+class LoadedMetalModel final : public tyloi::metal::MlxEngineModel {
 public:
     using Cache = MlxServerTextSessionCache<Runtime>;
-    using PagedCacheFactory = std::function<std::shared_ptr<mfq::cache::PagedPrefixCache>(std::int64_t)>;
+    using PagedCacheFactory = std::function<std::shared_ptr<tyloi::cache::PagedPrefixCache>(std::int64_t)>;
     LoadedMetalModel(std::shared_ptr<std::mutex> mutex,
         std::shared_ptr<std::optional<Runtime>> runtime,
         std::shared_ptr<Cache> cache, Loader loader, PagedCacheFactory factory,
@@ -1838,8 +1838,8 @@ public:
         std::shared_ptr<tyloi::weights::Memory> ledger,
         std::shared_ptr<tyloi::metal::AllocationScope::Log> allocations,
         int chunk_size, std::size_t cache_limit,
-        mfq::metal::MlxEngineComponents components,
-        mfq::metal::MlxSamplingParams prepare_sampling, int prepare_routes, int prepare_vocab,
+        tyloi::metal::MlxEngineComponents components,
+        tyloi::metal::MlxSamplingParams prepare_sampling, int prepare_routes, int prepare_vocab,
         std::vector<std::int64_t> prepare_prompt, int batch_capacity, bool execute_warmup)
         : runtime_mutex(std::move(mutex)), runtime_holder(std::move(runtime)),
           session_cache(std::move(cache)), load_runtime(std::move(loader)),
@@ -1858,9 +1858,9 @@ public:
     }
 
     void configure_batching() {
-        if constexpr (std::is_same_v<Runtime, mfq::metal::MlxQwen4CausalLm>) {
+        if constexpr (std::is_same_v<Runtime, tyloi::metal::MlxQwen4CausalLm>) {
             if (configured_batch_capacity > 1) {
-                mfq::metal::MlxQwen4BatchOperations::Hooks hooks;
+                tyloi::metal::MlxQwen4BatchOperations::Hooks hooks;
                 hooks.block_size = session_cache->block_size_tokens();
                 hooks.restore = [this](auto& request) {
                     request.prefix = session_cache->normalize_stable_prefix_tokens(std::min(
@@ -1885,28 +1885,28 @@ public:
     }
 
     std::size_t request_capacity() const override { return batching_capacity; }
-    bool can_batch(const mfq::engine::EngineRequest& request) const override {
+    bool can_batch(const tyloi::engine::EngineRequest& request) const override {
         return batching && !request.input.media &&
             !(runtime_components.speculative_generate && request.input.sampling.enable_mtp) &&
             !(request.input.sampling.enable_mtp && runtime_components.mtp_available && !batch_mtp_enabled);
     }
-    void execute(const std::vector<mfq::engine::RequestId>& eligible) override {
+    void execute(const std::vector<tyloi::engine::RequestId>& eligible) override {
         if (!batching || batching->empty() || eligible.empty()) return;
         std::lock_guard lock(*runtime_mutex);
         auto execution_scope = runtime_executor->enter();
-        mfq::metal::MlxResidentBudgetScope budget_scope(
+        tyloi::metal::MlxResidentBudgetScope budget_scope(
             [this](std::size_t bytes) { enforce_memory_budget(bytes); },
             [this](std::size_t bytes) { return optional_memory_fits(bytes); });
         batching->step(eligible);
     }
-    mfq::engine::Generation generate_batch(const mfq::engine::RequestId& id,
-        mfq::engine::InferenceRequest& input, mfq::engine::InferenceOutput& output) override {
+    tyloi::engine::Generation generate_batch(const tyloi::engine::RequestId& id,
+        tyloi::engine::InferenceRequest& input, tyloi::engine::InferenceOutput& output) override {
         if (!batching) throw std::logic_error("Metal batch executor is unavailable");
         auto generation = batching->generate(id, input, output);
-        mfq::engine::ExecutionCleanup cleanup{output.cleanup_failure, [&] {
+        tyloi::engine::ExecutionCleanup cleanup{output.cleanup_failure, [&] {
             std::lock_guard lock(*runtime_mutex);
             auto execution_scope = runtime_executor->enter();
-            mfq::metal::MlxResidentBudgetScope budget_scope(
+            tyloi::metal::MlxResidentBudgetScope budget_scope(
                 [this](std::size_t bytes) { enforce_memory_budget(bytes); },
                 [this](std::size_t bytes) { return optional_memory_fits(bytes); });
             generation = {};
@@ -1915,7 +1915,7 @@ public:
             auto step = [&] {
                 std::lock_guard lock(*runtime_mutex);
                 auto execution_scope = runtime_executor->enter();
-                mfq::metal::MlxResidentBudgetScope budget_scope(
+                tyloi::metal::MlxResidentBudgetScope budget_scope(
                     [this](std::size_t bytes) { enforce_memory_budget(bytes); },
                     [this](std::size_t bytes) { return optional_memory_fits(bytes); });
                 auto step = generation.next();
@@ -1927,8 +1927,8 @@ public:
         cleanup.finish();
     }
 
-    void generate(mfq::engine::InferenceRequest& request,
-                  mfq::metal::MlxGenerationJob& job) override {
+    void generate(tyloi::engine::InferenceRequest& request,
+                  tyloi::metal::MlxGenerationJob& job) override {
         const auto& prompt = request.prompt;
         const auto& sampling = request.sampling;
         const auto& cache_plan = request.cache_plan;
@@ -1939,7 +1939,7 @@ public:
             [&job](MfqPrefillTiming timing) { job.prefill(timing); };
         job.mtp.available = runtime_components.mtp_available;
         try {
-            if (request.vision && !std::is_same_v<Runtime, mfq::metal::MlxDeepseekV41CausalLm>) {
+            if (request.vision && !std::is_same_v<Runtime, tyloi::metal::MlxDeepseekV41CausalLm>) {
                 if (!runtime_components.multimodal_generate)
                     throw std::invalid_argument("model has no multimodal component");
                 runtime_components.multimodal_generate(prompt, *request.vision,
@@ -1951,7 +1951,7 @@ public:
                         "model runtime is unavailable after a failed reload");
                 }
                 auto execution_scope = runtime_executor->enter();
-                mfq::metal::MlxSamplingParams parameters;
+                tyloi::metal::MlxSamplingParams parameters;
                 parameters.temperature = sampling.temperature;
                 parameters.top_k = sampling.top_k;
                 parameters.top_p = sampling.top_p;
@@ -1966,15 +1966,15 @@ public:
                     sampling.mtp_max_draft_tokens;
                 parameters.seed = sampling.seed;
                 auto& loaded_runtime = runtime_holder->value();
-                std::vector<mfq::metal::MlxDeepseekV41ImageInput> images;
+                std::vector<tyloi::metal::MlxDeepseekV41ImageInput> images;
                 std::string media_key;
-                if constexpr (std::is_same_v<Runtime, mfq::metal::MlxDeepseekV41CausalLm>) {
+                if constexpr (std::is_same_v<Runtime, tyloi::metal::MlxDeepseekV41CausalLm>) {
                     if (request.vision) {
-                        images = mfq::metal::prepare_deepseek_v41_images(prompt, *request.vision, loaded_runtime.config());
+                        images = tyloi::metal::prepare_deepseek_v41_images(prompt, *request.vision, loaded_runtime.config());
                         media_key = metal_media_cache_key(*request.vision);
                     }
                 }
-                mfq::metal::MlxResidentBudgetScope budget_scope([this](std::size_t bytes) {
+                tyloi::metal::MlxResidentBudgetScope budget_scope([this](std::size_t bytes) {
                     enforce_memory_budget(bytes);
                 }, [this](std::size_t bytes) { return optional_memory_fits(bytes); });
                 enforce_memory_budget(0);
@@ -2007,19 +2007,19 @@ public:
                         prompt,
                         stable_prefix_tokens, parameters.enable_mtp && runtime_components.mtp_available &&
                             sampling.max_tokens > 1, media_key);
-                    if constexpr (std::is_same_v<Runtime, mfq::metal::MlxDeepseekV41CausalLm>)
+                    if constexpr (std::is_same_v<Runtime, tyloi::metal::MlxDeepseekV41CausalLm>)
                         if (request.vision && restored == 0) loaded_runtime.reset_cache(1);
                 }
                 auto effective_cache_plan = cache_plan;
                 effective_cache_plan.stable_prefix_tokens = cache_enabled
                     ? stable_prefix_tokens
                     : 0;
-                mfq::metal::MlxPrefixCacheHooks prefix_hooks;
+                tyloi::metal::MlxPrefixCacheHooks prefix_hooks;
                 auto cache_tokens = prompt;
                 std::size_t last_checkpoint = 0;
-                if constexpr (std::is_same_v<Runtime, mfq::metal::MlxQwen35CausalLm> ||
-                    std::is_same_v<Runtime, mfq::metal::MlxQwen4CausalLm> ||
-                    std::is_same_v<Runtime, mfq::metal::MlxDeepseekV41CausalLm>) {
+                if constexpr (std::is_same_v<Runtime, tyloi::metal::MlxQwen35CausalLm> ||
+                    std::is_same_v<Runtime, tyloi::metal::MlxQwen4CausalLm> ||
+                    std::is_same_v<Runtime, tyloi::metal::MlxDeepseekV41CausalLm>) {
                     if (cache_enabled) {
                         prefix_hooks.block_size = session_cache->block_size_tokens();
                         prefix_hooks.input_tokens = stable_prefix_tokens;
@@ -2031,7 +2031,7 @@ public:
                                     loaded_runtime.capture_text_session_state(
                                         std::vector<std::int64_t>(cache_tokens.begin(),
                                             cache_tokens.begin() + static_cast<std::ptrdiff_t>(position)),
-                                        std::is_same_v<Runtime, mfq::metal::MlxDeepseekV41CausalLm> &&
+                                        std::is_same_v<Runtime, tyloi::metal::MlxDeepseekV41CausalLm> &&
                                             !session_cache->persistent_prefix_enabled()), media_key);
                                 last_checkpoint = position;
                             } catch (const std::exception& error) {
@@ -2047,7 +2047,7 @@ public:
                     return !callback || callback(token);
                 };
                 const auto generated = [&] {
-                    if constexpr (std::is_same_v<Runtime, mfq::metal::MlxDeepseekV41CausalLm>) {
+                    if constexpr (std::is_same_v<Runtime, tyloi::metal::MlxDeepseekV41CausalLm>) {
                         if (request.vision) return loaded_runtime.generate_multimodal(prompt, images, parameters,
                             sampling.max_tokens, cached_callback, [&](std::size_t tokens, double ms) {
                                 on_prefill(MfqPrefillTiming{tokens, ms, 0.0, ms});
@@ -2124,7 +2124,7 @@ public:
             << "Reloading native Metal model with context="
             << requested_context << "..." << std::endl;
         try {
-            mfq::metal::MlxKernelPreparation preparation(static_cast<int>(requested_context), prefill_chunk_size);
+            tyloi::metal::MlxKernelPreparation preparation(static_cast<int>(requested_context), prefill_chunk_size);
             preparation.set_routes(preparation_routes);
             runtime_holder->emplace(
                 load_runtime(requested_context));
@@ -2169,7 +2169,7 @@ public:
                 runtime_holder->reset();
                 release_model_load_staging_memory(runtime_executor);
                 allocation_log->clear();
-                mfq::metal::MlxKernelPreparation preparation(static_cast<int>(previous_context), prefill_chunk_size);
+                tyloi::metal::MlxKernelPreparation preparation(static_cast<int>(previous_context), prefill_chunk_size);
                 preparation.set_routes(preparation_routes);
                 runtime_holder->emplace(
                     load_runtime(previous_context));
@@ -2207,8 +2207,8 @@ public:
         }
     }
 
-    mfq::engine::SessionResult session(const mfq::engine::SessionCommand& command) override {
-        using Kind = mfq::engine::SessionCommand::Kind;
+    tyloi::engine::SessionResult session(const tyloi::engine::SessionCommand& command) override {
+        using Kind = tyloi::engine::SessionCommand::Kind;
         if (command.kind == Kind::metrics) return {0, session_cache->metrics()};
         if (command.kind == Kind::trim) return {session_cache->trim_hot(command.bytes), {}};
         if (command.kind == Kind::budget) {
@@ -2271,20 +2271,20 @@ public:
         throw std::invalid_argument("unknown Metal session command");
     }
 
-    mfq::engine::ControlResult control(mfq::engine::ControlRequest request) override {
-        return std::visit([&](auto value) -> mfq::engine::ControlResult {
+    tyloi::engine::ControlResult control(tyloi::engine::ControlRequest request) override {
+        return std::visit([&](auto value) -> tyloi::engine::ControlResult {
             using T = std::decay_t<decltype(value)>;
-            if constexpr (std::is_same_v<T, mfq::engine::RuntimeMetrics>) return metrics();
-            else if constexpr (std::is_same_v<T, mfq::engine::ScoreTokens>) {
+            if constexpr (std::is_same_v<T, tyloi::engine::RuntimeMetrics>) return metrics();
+            else if constexpr (std::is_same_v<T, tyloi::engine::ScoreTokens>) {
                 if constexpr (requires(Runtime& runtime, mlx::core::array ids) { runtime.score_forward(ids, false); }) {
                     std::lock_guard<std::mutex> lock(*runtime_mutex);
                     if (!runtime_holder->has_value()) throw std::runtime_error("model runtime is unavailable");
                     auto execution_scope = runtime_executor->enter();
-                    mfq::metal::MlxResidentBudgetScope budget_scope(
+                    tyloi::metal::MlxResidentBudgetScope budget_scope(
                         [this](std::size_t bytes) { enforce_memory_budget(bytes); },
                         [this](std::size_t bytes) { return optional_memory_fits(bytes); });
                     auto& runtime = runtime_holder->value();
-                    mfq::engine::LikelihoodResult result{value.prompt_tokens, {}};
+                    tyloi::engine::LikelihoodResult result{value.prompt_tokens, {}};
                     std::optional<mlx::core::array> next_logprobs;
                     for (std::size_t i = 0; i < value.targets.size(); ++i) {
                         const auto& sequence = value.sequences.at(i);
@@ -2310,7 +2310,7 @@ public:
                             mlx::core::array(ids.begin(), mlx::core::Shape{count, 1}, mlx::core::int32), -1);
                         tyloi::metal::eval(selected);
                         const auto* numbers = selected.template data<float>();
-                        mfq::engine::TokenLikelihood output{targets, {}, 0};
+                        tyloi::engine::TokenLikelihood output{targets, {}, 0};
                         for (int token = 0; token < count; ++token) {
                             const double number = numbers[token];
                             if (!std::isfinite(number) || number > 1e-5)
@@ -2328,7 +2328,7 @@ public:
                 if (!duplex) throw std::invalid_argument("model has no duplex component");
                 if constexpr (std::is_same_v<T, MfqDuplexSessionParams>) duplex.start(value);
                 else if constexpr (std::is_same_v<T, MfqDuplexStepInput>) return duplex.step(value);
-                else if constexpr (std::is_same_v<T, mfq::engine::StopDuplex>) duplex.stop();
+                else if constexpr (std::is_same_v<T, tyloi::engine::StopDuplex>) duplex.stop();
                 else throw std::invalid_argument("text control belongs to the engine");
                 return std::monostate{};
             }
@@ -2372,7 +2372,7 @@ private:
     bool optional_memory_fits(std::size_t allocation) const {
         const auto budget = resident_budget.load();
         if (!budget || !runtime_holder->has_value()) return true;
-        const auto used = resident_memory_used() + mfq::metal::MlxResidentBudgetScope::temporary_bytes();
+        const auto used = resident_memory_used() + tyloi::metal::MlxResidentBudgetScope::temporary_bytes();
         const auto reserve = resident_allocator_reserve_bytes(budget);
         const auto cached = tyloi::metal::cache_memory();
         const auto headroom = reserve > cached ? reserve - cached : 0;
@@ -2396,7 +2396,7 @@ private:
             budget ? std::min(server_cache_limit_bytes(), reserve) : server_cache_limit_bytes()};
         if (!budget || !runtime_holder->has_value()) return;
         auto used = [&] {
-            const auto actual = resident_memory_used() + mfq::metal::MlxResidentBudgetScope::temporary_bytes();
+            const auto actual = resident_memory_used() + tyloi::metal::MlxResidentBudgetScope::temporary_bytes();
             const auto cached = tyloi::metal::cache_memory();
             return actual + (reserve > cached ? reserve - cached : 0);
         };
@@ -2425,7 +2425,7 @@ private:
                 if (!available) break;
                 const auto excess = observed - target;
                 const auto full = runtime.resident_full_expert_bytes();
-                mfq::metal::mlx_trim_expert_residency(runtime, available > excess ? available - excess : 0);
+                tyloi::metal::mlx_trim_expert_residency(runtime, available > excess ? available - excess : 0);
                 if (runtime.resident_full_expert_bytes() != full) weight_residency.reset();
                 resident_weight_baseline = resident_dense_weight_baseline + runtime.resident_full_expert_bytes();
                 clear_allocator_excess();
@@ -2439,7 +2439,7 @@ private:
             "; allocation_bytes=" + std::to_string(allocation) + "; budget_bytes=" + std::to_string(budget));
     }
     std::size_t resident_memory_used() const {
-        const auto usage = mfq::metal::MlxResourceTelemetry::snapshot();
+        const auto usage = tyloi::metal::MlxResourceTelemetry::snapshot();
         std::size_t prefix = 0;
         for (const auto& metric : session_cache->metrics()) if (metric.first == "prefix_cache_resident_bytes") prefix = static_cast<std::size_t>(metric.second);
         std::size_t adapters = 0;
@@ -2459,7 +2459,7 @@ private:
         tyloi::metal::refresh_residency();
         weight_residency = tyloi::metal::ResidentAllocations::take(
             *allocation_log, tyloi::metal::wired_limit());
-        const auto usage = mfq::metal::MlxResourceTelemetry::snapshot();
+        const auto usage = tyloi::metal::MlxResourceTelemetry::snapshot();
         const auto other = usage.cache_bytes + usage.dynamic_weight_bytes;
         const auto active = tyloi::metal::active_memory();
         resident_weight_baseline = active > other ? active - other : 0;
@@ -2474,9 +2474,9 @@ private:
         self_test_metal();
     }
 
-    mfq::engine::Metrics metrics() const {
+    tyloi::engine::Metrics metrics() const {
         double qsa_offload_supported = 0;
-        if constexpr (std::is_same_v<Runtime, mfq::metal::MlxQwen4CausalLm>) {
+        if constexpr (std::is_same_v<Runtime, tyloi::metal::MlxQwen4CausalLm>) {
             if (runtime_holder->has_value()) {
                 const auto& config = runtime_holder->value().config();
                 qsa_offload_supported = config.mtp_num_hidden_layers > 0 ||
@@ -2486,29 +2486,29 @@ private:
         std::vector<std::pair<std::string, double>> metrics{
             {"mlx_active_bytes", static_cast<double>(tyloi::metal::active_memory())},
 #if TYLOINFER_ENABLE_MFQ_COMPAT
-            {"mfe_packed_copy_count", static_cast<double>(mfq::metal::MlxMfeWeight::packed_copy_count())},
-            {"ssd_expert_indirect_dispatch_count", static_cast<double>(mfq::metal::MlxMfeWeight::indirect_dispatch_count())},
-            {"mfe_uncached_packed_bytes", static_cast<double>(mfq::metal::MlxMfeWeight::uncached_packed_bytes())},
-            {"ssd_expert_pinned_bytes", static_cast<double>(mfq::metal::MlxMfeWeight::pinned_packed_bytes())},
-            {"ssd_expert_pin_failures", static_cast<double>(mfq::metal::MlxMfeWeight::packed_pin_failures())},
-            {"ssd_expert_pooled_staging_count", static_cast<double>(mfq::metal::MlxMfeWeight::pooled_staging_count())},
+            {"mfe_packed_copy_count", static_cast<double>(tyloi::metal::MlxMfeWeight::packed_copy_count())},
+            {"ssd_expert_indirect_dispatch_count", static_cast<double>(tyloi::metal::MlxMfeWeight::indirect_dispatch_count())},
+            {"mfe_uncached_packed_bytes", static_cast<double>(tyloi::metal::MlxMfeWeight::uncached_packed_bytes())},
+            {"ssd_expert_pinned_bytes", static_cast<double>(tyloi::metal::MlxMfeWeight::pinned_packed_bytes())},
+            {"ssd_expert_pin_failures", static_cast<double>(tyloi::metal::MlxMfeWeight::packed_pin_failures())},
+            {"ssd_expert_pooled_staging_count", static_cast<double>(tyloi::metal::MlxMfeWeight::pooled_staging_count())},
 #endif
             {"qsa_kv_offload_supported", qsa_offload_supported},
-            {"kv_quantization_supported", (std::is_same_v<Runtime, mfq::metal::MlxQwen4CausalLm> ||
-                std::is_same_v<Runtime, mfq::metal::MlxQwen35CausalLm>) ? 1.0 : 0.0},
-            {"kv_quantization_bits", (std::is_same_v<Runtime, mfq::metal::MlxQwen4CausalLm> ||
-                std::is_same_v<Runtime, mfq::metal::MlxQwen35CausalLm>) ? tyloi::engine::kv_quantization().bits : 0.0},
+            {"kv_quantization_supported", (std::is_same_v<Runtime, tyloi::metal::MlxQwen4CausalLm> ||
+                std::is_same_v<Runtime, tyloi::metal::MlxQwen35CausalLm>) ? 1.0 : 0.0},
+            {"kv_quantization_bits", (std::is_same_v<Runtime, tyloi::metal::MlxQwen4CausalLm> ||
+                std::is_same_v<Runtime, tyloi::metal::MlxQwen35CausalLm>) ? tyloi::engine::kv_quantization().bits : 0.0},
             {"mlx_cache_bytes", static_cast<double>(tyloi::metal::cache_memory())},
             {"mlx_cache_limit_bytes", static_cast<double>(allocator_cache_limit)},
             {"mlx_peak_bytes", static_cast<double>(tyloi::metal::peak_memory())},
             {"resident_memory_budget_bytes", static_cast<double>(resident_budget.load())},
             {"resident_weight_budget_bytes", static_cast<double>(resident_weight_budget.load())},
-            {"resident_weight_dynamic_budget", (std::is_same_v<Runtime, mfq::metal::MlxQwen4CausalLm> ||
-                std::is_same_v<Runtime, mfq::metal::MlxQwen35CausalLm> ||
-                std::is_same_v<Runtime, mfq::metal::MlxMiniCPMO45Runtime>) ? 1.0 : 0.0},
-            {"resident_memory_dynamic_budget", (std::is_same_v<Runtime, mfq::metal::MlxQwen4CausalLm> ||
-                std::is_same_v<Runtime, mfq::metal::MlxQwen35CausalLm> ||
-                std::is_same_v<Runtime, mfq::metal::MlxMiniCPMO45Runtime>) ? 1.0 : 0.0},
+            {"resident_weight_dynamic_budget", (std::is_same_v<Runtime, tyloi::metal::MlxQwen4CausalLm> ||
+                std::is_same_v<Runtime, tyloi::metal::MlxQwen35CausalLm> ||
+                std::is_same_v<Runtime, tyloi::metal::MlxMiniCPMO45Runtime>) ? 1.0 : 0.0},
+            {"resident_memory_dynamic_budget", (std::is_same_v<Runtime, tyloi::metal::MlxQwen4CausalLm> ||
+                std::is_same_v<Runtime, tyloi::metal::MlxQwen35CausalLm> ||
+                std::is_same_v<Runtime, tyloi::metal::MlxMiniCPMO45Runtime>) ? 1.0 : 0.0},
             {"metal_wired_limit_bytes", static_cast<double>(
                 tyloi::metal::wired_limit())},
             {"metal_wired_bytes", static_cast<double>(
@@ -2516,7 +2516,7 @@ private:
             {"metal_wired_available",
                 tyloi::metal::wired_limit() > 0 ? 1.0 : 0.0},
             {"ple_source_bytes_read", static_cast<double>(
-                mfq::metal::MlxResourceTelemetry::ple_read_counter().load(std::memory_order_relaxed))},
+                tyloi::metal::MlxResourceTelemetry::ple_read_counter().load(std::memory_order_relaxed))},
         };
         std::unique_lock lock(*runtime_mutex, std::try_to_lock);
         if (lock.owns_lock() && runtime_holder->has_value()) {
@@ -2532,17 +2532,17 @@ private:
                 const auto adapters = runtime_holder->value().mtp_session_metrics();
                 metrics.insert(metrics.end(), adapters.begin(), adapters.end());
             }
-            const auto usage = mfq::metal::MlxResourceTelemetry::snapshot();
+            const auto usage = tyloi::metal::MlxResourceTelemetry::snapshot();
             metrics.emplace_back("resident_weight_bytes", static_cast<double>(
                 resident_weight_baseline + usage.dynamic_weight_bytes));
             if constexpr (requires(Runtime& value) { value.qsa_kv_offload_stats(); })
                 metrics.emplace_back("kv_cache_bytes", static_cast<double>(runtime_holder->value().kv_cache_bytes()));
             else metrics.emplace_back("kv_cache_bytes", static_cast<double>(usage.cache_bytes));
-            if constexpr (std::is_same_v<Runtime, mfq::metal::MlxQwen4CausalLm>)
+            if constexpr (std::is_same_v<Runtime, tyloi::metal::MlxQwen4CausalLm>)
                 metrics.emplace_back("kv_cache_contexts", static_cast<double>(runtime_holder->value().kv_cache_contexts()));
             else metrics.emplace_back("kv_cache_contexts", static_cast<double>(usage.contexts));
             {
-                std::optional<mfq::metal::QsaKvStoreStats> offload;
+                std::optional<tyloi::cache::QsaKvStoreStats> offload;
                 if constexpr (requires(Runtime& value) { value.qsa_kv_offload_stats(); })
                     offload = runtime_holder->value().qsa_kv_offload_stats();
                 metrics.emplace_back("qsa_kv_offload_enabled", offload ? 1.0 : 0.0);
@@ -2776,13 +2776,13 @@ private:
 
     void warm_runtime() {
         if (!generation_warmup) return;
-        mfq::metal::MlxResidentBudgetScope budget_scope([this](std::size_t bytes) {
+        tyloi::metal::MlxResidentBudgetScope budget_scope([this](std::size_t bytes) {
             enforce_memory_budget(bytes);
         }, [this](std::size_t bytes) { return optional_memory_fits(bytes); });
         enforce_memory_budget(0);
         auto& runtime = runtime_holder->value();
         int warmup_chunk = prefill_chunk_size;
-        if constexpr (std::is_same_v<Runtime, mfq::metal::MlxQwen4CausalLm>) {
+        if constexpr (std::is_same_v<Runtime, tyloi::metal::MlxQwen4CausalLm>) {
             if (const auto stats = runtime.qsa_kv_offload_stats()) {
                 const auto& config = runtime.config();
                 const auto layers = std::count(config.layer_types.begin(), config.layer_types.end(), "full_attention") +
@@ -2798,7 +2798,7 @@ private:
         if constexpr (requires { runtime.prepare_mtp_ttt(default_prefix_cache_directory()); })
             runtime.prepare_mtp_ttt(default_prefix_cache_directory());
         const auto generate = [&](const std::vector<std::int64_t>& prompt,
-                                  const mfq::metal::MlxSamplingParams& sampling, int count) {
+                                  const tyloi::metal::MlxSamplingParams& sampling, int count) {
             generate_with_prefill_metrics(runtime, prompt, sampling, count,
                 [](std::int64_t) { return true; }, {}, {}, {}, prefill_chunk_size);
         };
@@ -2806,7 +2806,7 @@ private:
             if constexpr (requires { runtime.reset_generation_state(); }) {
                 runtime.reset_generation_state();
             } else {
-                mfq::metal::MlxSamplingParams sampling;
+                tyloi::metal::MlxSamplingParams sampling;
                 sampling.enable_mtp = false;
                 generate({warmup_prompt.front()}, sampling, 0);
                 if constexpr (requires { runtime.clear_cache(); }) runtime.clear_cache();
@@ -2817,7 +2817,7 @@ private:
         bool warmup_mtp = runtime_components.mtp_available;
         if constexpr (requires { runtime.supports_mtp(); })
             if (runtime_components.speculative_generate) warmup_mtp = runtime.supports_mtp();
-        mfq::metal::warm_mlx_inference(warmup_prompt, static_cast<int>(*loaded_context),
+        tyloi::metal::warm_mlx_inference(warmup_prompt, static_cast<int>(*loaded_context),
             warmup_chunk, preparation_sampling, warmup_mtp, generate, reset);
     }
 
@@ -2832,7 +2832,7 @@ private:
     std::shared_ptr<tyloi::metal::AllocationScope::Log> allocation_log;
     int prefill_chunk_size;
     std::size_t allocator_cache_limit;
-    mfq::metal::MlxSamplingParams preparation_sampling;
+    tyloi::metal::MlxSamplingParams preparation_sampling;
     int preparation_routes;
     int preparation_vocab;
     std::vector<std::int64_t> warmup_prompt;
@@ -2841,9 +2841,9 @@ private:
     std::size_t resident_dense_weight_baseline = 0;
     std::atomic<std::size_t> resident_budget{0};
     std::atomic<std::size_t> resident_weight_budget{0};
-    mfq::metal::MlxEngineComponents runtime_components;
+    tyloi::metal::MlxEngineComponents runtime_components;
     std::unique_ptr<tyloi::metal::ResidentAllocations> weight_residency;
-    using MetalBatch = mfq::engine::ContinuousBatch<mfq::metal::MlxQwen4BatchOperations>;
+    using MetalBatch = tyloi::engine::ContinuousBatch<tyloi::metal::MlxQwen4BatchOperations>;
     int configured_batch_capacity;
     std::size_t batching_capacity = 1;
     bool batch_mtp_enabled = false;
@@ -2853,7 +2853,7 @@ private:
 template <typename Runtime, typename Loader>
 auto make_runtime(
     const Arguments& arguments,
-    const mfq::metal::MfqContainer& container,
+    const tyloi::metal::MfqContainer& container,
     Runtime model,
     Loader load_runtime,
     std::string model_type,
@@ -2875,11 +2875,11 @@ auto make_runtime(
     int prefill_chunk_size = arguments.prefill_chunk_size;
     if (!arguments.prefill_chunk_size_explicit &&
         prefill_autotune_enabled()) {
-        if constexpr (std::is_same_v<Runtime, mfq::metal::MlxQwen35CausalLm> ||
-            std::is_same_v<Runtime, mfq::metal::MlxQwen4CausalLm>) {
-            prefill_chunk_size = static_cast<int>(mfq::metal::mlx_prefix_block_size(true,
+        if constexpr (std::is_same_v<Runtime, tyloi::metal::MlxQwen35CausalLm> ||
+            std::is_same_v<Runtime, tyloi::metal::MlxQwen4CausalLm>) {
+            prefill_chunk_size = static_cast<int>(tyloi::metal::mlx_prefix_block_size(true,
                 prefill_chunk_size, physical_memory_bytes(), metal_prefix_nax_device(),
-                std::is_same_v<Runtime, mfq::metal::MlxQwen4CausalLm>));
+                std::is_same_v<Runtime, tyloi::metal::MlxQwen4CausalLm>));
         }
         if constexpr (requires(const Runtime& value) {
                 value.preferred_prefill_chunk_size(prefill_chunk_size);
@@ -2903,7 +2903,7 @@ auto make_runtime(
         ? arguments.mfq.stem().string()
         : arguments.model_name;
     transport_config.model_type = std::move(model_type);
-    const auto model_graph = mfq::metal::effective_model_graph(container);
+    const auto model_graph = tyloi::metal::effective_model_graph(container);
     transport_config.api_key = arguments.api_key;
     transport_config.max_context = std::min<std::int64_t>(
         arguments.context_size,
@@ -2932,13 +2932,13 @@ auto make_runtime(
         arguments.sampling_profile.string());
     if (!arguments.dflash2_draft.empty()) transport_config.runtime_profile.chat.mtp_max_draft_tokens = 7;
 
-    mfq::metal::MlxSamplingParams preparation_sampling;
+    tyloi::metal::MlxSamplingParams preparation_sampling;
     const auto& chat_profile = transport_config.runtime_profile.chat;
     preparation_sampling.temperature = chat_profile.temperature.value_or(1.0);
     preparation_sampling.top_k = chat_profile.top_k.value_or(0);
     preparation_sampling.top_p = chat_profile.top_p.value_or(1.0);
     int preparation_routes = 0;
-    if (auto* preparation = mfq::metal::MlxKernelPreparation::current()) {
+    if (auto* preparation = tyloi::metal::MlxKernelPreparation::current()) {
         preparation_routes = preparation->routes();
         preparation->collect_sampling(static_cast<int>(vocabulary_size), preparation_sampling);
     }
@@ -2949,7 +2949,7 @@ auto make_runtime(
             std::move(model));
     const auto paged_cache_factory =
         [&container, prefill_chunk_size, runtime_holder](std::int64_t context_size)
-            -> std::shared_ptr<mfq::cache::PagedPrefixCache> {
+            -> std::shared_ptr<tyloi::cache::PagedPrefixCache> {
             std::string predictor_key;
             if constexpr (requires(Runtime& runtime) { runtime.mtp_cache_fingerprint(); })
                 if (runtime_holder->has_value()) predictor_key = runtime_holder->value().mtp_cache_fingerprint();
@@ -2961,21 +2961,21 @@ auto make_runtime(
             paged_cache_factory(transport_config.max_context));
     auto loaded_context =
         std::make_shared<std::int64_t>(transport_config.max_context);
-    auto runtime_components = mfq::metal::make_mlx_engine_components(
+    auto runtime_components = tyloi::metal::make_mlx_engine_components(
         &model_graph,
         runtime_mutex,
         runtime_holder,
         runtime_executor);
     if (!arguments.dflash2_draft.empty()) {
-        if constexpr (std::is_same_v<Runtime, mfq::metal::MlxQwen4CausalLm> ||
-            std::is_same_v<Runtime, mfq::metal::MlxQwen35CausalLm>) {
-            mfq::metal::configure_mlx_dflash2(runtime_components, runtime_holder, arguments.dflash2_draft, preparation_sampling);
+        if constexpr (std::is_same_v<Runtime, tyloi::metal::MlxQwen4CausalLm> ||
+            std::is_same_v<Runtime, tyloi::metal::MlxQwen35CausalLm>) {
+            tyloi::metal::configure_mlx_dflash2(runtime_components, runtime_holder, arguments.dflash2_draft, preparation_sampling);
             runtime_components.prepare_speculative();
             std::cout << "DFlash2 experimental: unconstrained text without penalties; DFlash2 requests bypass prefix reuse and batching"
                       << std::endl;
         } else throw std::invalid_argument("DFlash2 currently requires a supported Qwen target");
     }
-    if (auto* preparation = mfq::metal::MlxKernelPreparation::current()) preparation->finish();
+    if (auto* preparation = tyloi::metal::MlxKernelPreparation::current()) preparation->finish();
     {
         MfqModelCapabilities capabilities;
         capabilities.family = model_graph.architecture;
@@ -2999,14 +2999,14 @@ auto make_runtime(
         transport_config.model_capabilities = std::move(capabilities);
     }
     auto text = container.contains(tokenizer_asset)
-        ? std::make_unique<mfq::engine::TextProcessor>(container.read(tokenizer_asset),
+        ? std::make_unique<tyloi::engine::TextProcessor>(container.read(tokenizer_asset),
               static_cast<std::int32_t>(vocabulary_size), transport_config.model_type)
-        : std::make_unique<mfq::engine::TextProcessor>(arguments.tokenizer_gguf.string(),
+        : std::make_unique<tyloi::engine::TextProcessor>(arguments.tokenizer_gguf.string(),
               static_cast<std::int32_t>(vocabulary_size), transport_config.model_type);
-    mfq::engine::EngineInfo info;
+    tyloi::engine::EngineInfo info;
     info.max_context = transport_config.max_context;
     info.vocab_size = static_cast<std::int32_t>(vocabulary_size);
-    info.stop_token_ids = mfq::engine::model_stop_token_ids(model_config, info.vocab_size);
+    info.stop_token_ids = tyloi::engine::model_stop_token_ids(model_config, info.vocab_size);
     info.model_type = transport_config.model_type;
     info.capabilities = *transport_config.model_capabilities;
     info.multimodal = static_cast<bool>(runtime_components.multimodal_generate);
@@ -3038,7 +3038,7 @@ auto make_runtime(
         text->tokenizer().tokenize("Explain how computers use memory to run language models. "
             "Describe the roles of model weights, attention, and cached context in clear terms.", false),
         arguments.continuous_batching, arguments.generation_warmup);
-    auto inference_engine = std::make_unique<mfq::metal::MlxEngine>(
+    auto inference_engine = std::make_unique<tyloi::metal::MlxEngine>(
         std::move(engine_model), std::move(text), std::move(info));
     auto transport = arguments.stdio
         ? make_mfq_stdio_transport(transport_config)
@@ -3048,7 +3048,7 @@ auto make_runtime(
 
 auto load_runtime(
     const Arguments& arguments,
-    const mfq::metal::MfqContainer& container) {
+    const tyloi::metal::MfqContainer& container) {
     container.observe_load_records([](std::size_t completed, std::size_t total) {
         std::cerr << "mfq_load_progress completed=" << completed
                   << " total=" << total << std::endl;
@@ -3070,11 +3070,11 @@ auto load_runtime(
     auto allocation_log = std::make_shared<tyloi::metal::AllocationScope::Log>();
     tyloi::metal::AllocationScope allocation_scope(
         tyloi::metal::wired_limit() ? allocation_log.get() : nullptr);
-    mfq::metal::MlxKernelPreparation preparation(static_cast<int>(arguments.context_size),
+    tyloi::metal::MlxKernelPreparation preparation(static_cast<int>(arguments.context_size),
         arguments.prefill_chunk_size);
     const auto started =
         std::chrono::steady_clock::now();
-    const auto graph = mfq::metal::effective_model_graph(container);
+    const auto graph = tyloi::metal::effective_model_graph(container);
     const auto& backbone = graph.backbone;
     const bool native_hf =
         container.header().extra_json.count("source.format") != 0 &&
@@ -3082,7 +3082,7 @@ auto load_runtime(
             "hf-safetensors";
     if (backbone == "deepseek_v41") {
         const auto config =
-            mfq::metal::DeepseekV41Config::from_mfq(container, graph);
+            tyloi::metal::DeepseekV41Config::from_mfq(container, graph);
         preparation.set_routes(static_cast<int>(config.top_k));
         const int context = static_cast<int>(
             std::min<std::int64_t>(
@@ -3100,7 +3100,7 @@ auto load_runtime(
             << std::endl;
         auto runtime = [&] {
             tyloi::weights::LoadScope memory_load(*weight_memory);
-            return mfq::metal::MlxDeepseekV41CausalLm::load(
+            return tyloi::metal::MlxDeepseekV41CausalLm::load(
                 container, context, expert_cache_bytes);
         }();
         release_model_load_staging_memory(runtime_executor);
@@ -3124,7 +3124,7 @@ auto load_runtime(
                     throw std::invalid_argument(
                         "Metal runtime context is out of range");
                 }
-                return mfq::metal::MlxDeepseekV41CausalLm::load(
+                return tyloi::metal::MlxDeepseekV41CausalLm::load(
                     container,
                     static_cast<int>(requested_context),
                     expert_cache_bytes);
@@ -3143,7 +3143,7 @@ auto load_runtime(
     }
     if (backbone == "deepseek_v4") {
         const auto config =
-            mfq::metal::DeepseekV4Config::from_mfq(
+            tyloi::metal::DeepseekV4Config::from_mfq(
                 container);
         preparation.set_routes(static_cast<int>(config.top_k));
         const int context = static_cast<int>(
@@ -3162,7 +3162,7 @@ auto load_runtime(
             << std::endl;
         auto runtime = [&] {
             tyloi::weights::LoadScope memory_load(*weight_memory);
-            return mfq::metal::MlxDeepseekV4CausalLm::load(
+            return tyloi::metal::MlxDeepseekV4CausalLm::load(
                 container,
                 context,
                 expert_cache_bytes);
@@ -3194,7 +3194,7 @@ auto load_runtime(
                     throw std::invalid_argument(
                         "Metal runtime context is out of range");
                 }
-                return mfq::metal::
+                return tyloi::metal::
                     MlxDeepseekV4CausalLm::load(
                         container,
                         static_cast<int>(requested_context),
@@ -3214,8 +3214,8 @@ auto load_runtime(
     }
 
     if (backbone == "nemotron_h") {
-        const auto config = mfq::metal::load_nemotron_h_config(container);
-        const auto components = mfq::metal::resolve_nemotron_h_components(container);
+        const auto config = tyloi::metal::load_nemotron_h_config(container);
+        const auto components = tyloi::metal::resolve_nemotron_h_components(container);
         preparation.set_routes(static_cast<int>(config.num_experts_per_tok));
         const int context = static_cast<int>(std::min<std::int64_t>(
             arguments.context_size, config.max_position_embeddings));
@@ -3224,7 +3224,7 @@ auto load_runtime(
             << std::endl;
         auto runtime = [&] {
             tyloi::weights::LoadScope memory_load(*weight_memory);
-            return mfq::metal::MlxNemotronHCausalLm::load(container, context);
+            return tyloi::metal::MlxNemotronHCausalLm::load(container, context);
         }();
         release_model_load_staging_memory(runtime_executor);
         const auto load_seconds = std::chrono::duration<double>(
@@ -3243,7 +3243,7 @@ auto load_runtime(
                     throw std::invalid_argument(
                         "Metal runtime context is out of range");
                 }
-                return mfq::metal::MlxNemotronHCausalLm::load(
+                return tyloi::metal::MlxNemotronHCausalLm::load(
                     container,
                     std::min<std::int64_t>(requested_context, native_context));
             };
@@ -3266,7 +3266,7 @@ auto load_runtime(
             << std::endl;
         auto runtime = [&] {
             tyloi::weights::LoadScope memory_load(*weight_memory);
-            return mfq::metal::MlxMiniCPMO45Runtime::load(
+            return tyloi::metal::MlxMiniCPMO45Runtime::load(
                 container,
                 arguments.context_size,
                 arguments.server);
@@ -3286,7 +3286,7 @@ auto load_runtime(
             [&container,
              load_modalities = arguments.server](
                 std::int64_t requested_context) {
-                return mfq::metal::MlxMiniCPMO45Runtime::load(
+                return tyloi::metal::MlxMiniCPMO45Runtime::load(
                     container,
                     requested_context,
                     load_modalities);
@@ -3304,8 +3304,8 @@ auto load_runtime(
 
     if (backbone == "qwen4_exp") {
         const auto config =
-            mfq::metal::Qwen4Config::from_mfq(container);
-        const auto extended_context = mfq::metal::qwen_yarn_capacity(config.max_position_embeddings, config.yarn_max_factor);
+            tyloi::metal::Qwen4Config::from_mfq(container);
+        const auto extended_context = tyloi::metal::qwen_yarn_capacity(config.max_position_embeddings, config.yarn_max_factor);
         preparation.set_routes(static_cast<int>(config.num_experts_per_tok));
         const int context = static_cast<int>(
             std::min<std::int64_t>(
@@ -3325,7 +3325,7 @@ auto load_runtime(
             << std::endl;
         auto runtime = [&] {
             tyloi::weights::LoadScope memory_load(*weight_memory);
-            return mfq::metal::MlxQwen4CausalLm::load(
+            return tyloi::metal::MlxQwen4CausalLm::load(
                 container, context, expert_cache_bytes);
         }();
         release_model_load_staging_memory(runtime_executor);
@@ -3348,7 +3348,7 @@ auto load_runtime(
                     throw std::invalid_argument(
                         "Metal runtime context is out of range");
                 }
-                return mfq::metal::MlxQwen4CausalLm::load(
+                return tyloi::metal::MlxQwen4CausalLm::load(
                     container,
                     static_cast<int>(requested_context),
                     expert_cache_bytes);
@@ -3372,8 +3372,8 @@ auto load_runtime(
     }
 
     const auto config =
-        mfq::metal::load_qwen35_config(container);
-    const auto extended_context = mfq::metal::qwen_yarn_capacity(config.max_position_embeddings, config.yarn_max_factor);
+        tyloi::metal::load_qwen35_config(container);
+    const auto extended_context = tyloi::metal::qwen_yarn_capacity(config.max_position_embeddings, config.yarn_max_factor);
     const auto context = static_cast<int>(std::min(arguments.context_size,
         arguments.yarn_context_extension ? extended_context : config.max_position_embeddings));
     auto runtime_arguments = arguments;
@@ -3384,7 +3384,7 @@ auto load_runtime(
         << std::endl;
     auto runtime = [&] {
         tyloi::weights::LoadScope memory_load(*weight_memory);
-        return mfq::metal::MlxQwen35CausalLm::load(container, context);
+        return tyloi::metal::MlxQwen35CausalLm::load(container, context);
     }();
     release_model_load_staging_memory(runtime_executor);
     const auto load_seconds = std::chrono::duration<double>(
@@ -3397,7 +3397,7 @@ auto load_runtime(
         << std::endl;
     const auto load_runtime =
         [&container](std::int64_t requested_context) {
-            return mfq::metal::
+            return tyloi::metal::
                 MlxQwen35CausalLm::load(container, static_cast<int>(requested_context));
         };
     return make_runtime(
@@ -3424,7 +3424,7 @@ int main(int argc, char** argv) {
             prepare_mfq_stdio_transport();
         }
 #endif
-        mfq::metal::set_mlx_predequantize_fp16(
+        tyloi::metal::set_mlx_predequantize_fp16(
             arguments.predequantize_fp16);
         if (arguments.help) {
             print_help();
@@ -3441,7 +3441,7 @@ int main(int argc, char** argv) {
             return EXIT_SUCCESS;
         }
 
-        const mfq::metal::MfqContainer model(arguments.mfq, {}, arguments.gguf_companions);
+        const tyloi::metal::MfqContainer model(arguments.mfq, {}, arguments.gguf_companions);
         if (arguments.inspect_model_json) {
             nlohmann::json result{{"architecture", model.header().architecture},
                 {"paths", model.source_paths()}, {"tensors", nlohmann::json::object()}};
@@ -3487,20 +3487,20 @@ int main(int argc, char** argv) {
             tyloi::metal::AllocationScope allocation_scope(
                 tyloi::metal::wired_limit() ? &allocation_log : nullptr);
             const auto& record = model.record(arguments.tensor);
-            if (mfq::mfq_compat_enabled && record.dtype == "MFE") {
+            if (tyloi::mfq_compat_enabled && record.dtype == "MFE") {
                 auto weight =
-                    mfq::metal::MlxMfeWeight::from_blob(
+                    tyloi::metal::MlxMfeWeight::from_blob(
                         model.read(arguments.tensor));
                 if (!arguments.benchmark_concat_tensors.empty()) {
-                    std::vector<mfq::metal::MlxMfeWeight> projections{weight};
+                    std::vector<tyloi::metal::MlxMfeWeight> projections{weight};
                     for (const auto& name : arguments.benchmark_concat_tensors) {
                         if (model.record(name).dtype != "MFE") {
                             usage_error("--benchmark-concat-tensor requires MFE records");
                         }
-                        projections.push_back(mfq::metal::MlxMfeWeight::from_blob(
+                        projections.push_back(tyloi::metal::MlxMfeWeight::from_blob(
                             model.read(name)));
                     }
-                    weight = mfq::metal::MlxMfeWeight::concatenate_projections(projections)
+                    weight = tyloi::metal::MlxMfeWeight::concatenate_projections(projections)
                         .materialize_packed_projections();
                 }
                 if (arguments.benchmark_distributed_routes > 0
@@ -3660,7 +3660,7 @@ int main(int argc, char** argv) {
                 arguments.benchmark_routed_input || arguments.benchmark_batch_size != 1) {
                 usage_error("MFE benchmark options require an MFE --tensor record");
             }
-            const auto weight = mfq::metal::MlxLinear::load(
+            const auto weight = tyloi::metal::MlxLinear::load(
                 model,
                 arguments.tensor);
             std::vector<float> input_values(

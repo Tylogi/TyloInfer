@@ -9,7 +9,7 @@
 #include <thread>
 #include <variant>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 // The native MLX pipeline runs on one device-owning thread. Only owned token
 // and timing values cross into the scheduler; no response writer runs there.
@@ -29,7 +29,7 @@ public:
     std::optional<Event> take();
     bool done() const;
     void join();
-    mfq::engine::mtp::GenerationStats mtp;
+    tyloi::engine::mtp::GenerationStats mtp;
 
 private:
     bool push(Event event);
@@ -42,7 +42,7 @@ private:
     static constexpr std::size_t capacity_ = 4;
 };
 
-mfq::engine::Generation consume_mlx_generation(
-    MlxGenerationJob::Work work, mfq::engine::InferenceOutput& output);
+tyloi::engine::Generation consume_mlx_generation(
+    MlxGenerationJob::Work work, tyloi::engine::InferenceOutput& output);
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

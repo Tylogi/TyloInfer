@@ -6,7 +6,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace mfq {
+namespace tyloi {
 namespace {
 constexpr char magic[] = "MLXA";
 std::uint64_t product(std::uint64_t left, std::uint64_t right) {
@@ -68,4 +68,4 @@ MlxAffineLayout MlxAffineLayout::parse(const std::byte* bytes, std::size_t size)
     return result;
 }
 
-} // namespace mfq
+} // namespace tyloi

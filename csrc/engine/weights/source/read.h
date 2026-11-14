@@ -2,6 +2,8 @@
 
 #include "source.h"
 
+bool is_quant_dtype(const std::string& dtype);
+
 namespace tyloi {
 
 const TensorMetadata& require_tensor(const source::Source& source, std::string_view name);

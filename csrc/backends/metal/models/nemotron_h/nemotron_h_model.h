@@ -13,13 +13,13 @@
 
 #include <mlx/mlx.h>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 // Nemotron-H reuses the backend-neutral text contract and the RADIO geometry
 // from models/nemotron_h, so the Metal adapter parses exactly the same model
 // config as the CUDA runtime.
-using NemotronHConfig = mfq::models::nemotron_h::Config;
-using NemotronHRadioConfig = mfq::models::nemotron_h::RadioVisionConfig;
+using NemotronHConfig = tyloi::models::nemotron_h::Config;
+using NemotronHRadioConfig = tyloi::models::nemotron_h::RadioVisionConfig;
 
 inline constexpr std::string_view kNemotronHConfigAsset =
     "__mfq_asset__/model_config.json";
@@ -51,6 +51,6 @@ MlxRmsNorm load_nemotron_h_rms_norm(
     double eps);
 
 // Layer kinds the Metal block schedule dispatches to.
-using NemotronHMixer = mfq::models::nemotron_h::MixerKind;
+using NemotronHMixer = tyloi::models::nemotron_h::MixerKind;
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

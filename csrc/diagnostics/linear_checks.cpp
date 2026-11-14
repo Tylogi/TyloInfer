@@ -200,7 +200,7 @@ int run_cpu_linear_check(
     auto scope = executor.enter(program.config().layer_placement.primary_device());
     auto loader = program.loader();
     auto projector = executor.projector(tyloi::cuda::Executor::current_ffn());
-    auto cpu_loader = loader.for_layer(loader.placement.device, true);
+    auto cpu_loader = loader.for_layer(::tyloi::Device(::tyloi::kCPU));
     auto cpu_linear = cpu_loader.weight(name);
     auto cuda_linear = loader.weight(name);
     const int64_t width = cpu_linear.size(1);
@@ -377,7 +377,7 @@ int run_linear_group_check(
         bf16_env != nullptr && bf16_env[0] == '1';
     auto group = tyloi::cuda::make_quant_group(
         loader.group(names, names.size(), nullptr, preserve_projection_boundaries),
-        loader.options.grouped, loader.placement.cpu, preserve_projection_boundaries);
+        loader.options.grouped, loader.placement.target.is_cpu(), preserve_projection_boundaries);
     const int64_t width = group.nint_grouped
         ? (group.nint.split_w.empty()
             ? group.nint.w.neuron_len
@@ -752,7 +752,7 @@ int run_gemma_geglu_check(
         "model.block." + std::to_string(layer) + ".mlp.";
     auto gate_up = tyloi::cuda::make_quant_group(
         loader.group({prefix + "gate.weight", prefix + "up.weight"}, 2),
-        loader.options.grouped, loader.placement.cpu);
+        loader.options.grouped, loader.placement.target.is_cpu());
     auto down = loader.weight(prefix + "down.weight");
     if (!gate_up.nint_grouped || !gate_up.nint.split_w.empty() || !down.representation<tyloi::NintTensor>() ||
         gate_up.outs.size() != 2 || gate_up.outs[0] != gate_up.outs[1]) {

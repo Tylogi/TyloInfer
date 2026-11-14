@@ -2,21 +2,17 @@
 #include "engine/ops.h"
 #include "engine/models/qwen35/load.h"
 
-#include "backend.h"
 #include "engine/models/qwen35/metadata.h"
 #include "engine/models/qwen35/mtp.h"
 #include "engine/models/qwen35/weights.h"
 
 #include "engine/models/common/load.h"
+#include "engine/models/common/check.h"
 #include "engine/models/plan.h"
 #include "engine/models/load.h"
 #include "engine/models/source/model_graph.h"
 #include "engine/weights/loader.h"
 #include "engine/weights/cache.h"
-#include "engine/backends/cuda/ops/projection/projection.h"
-#include "engine/backends/cuda/ops/rope/rope.h"
-#include "engine/backends/cuda/kernels/mfq_cuda_kv_quantization.h"
-#include "engine/weights/quant.h"
 #include "engine/weights/source/read.h"
 
 #include <algorithm>
@@ -25,16 +21,11 @@
 #include <stdexcept>
 #include <utility>
 
-namespace tyloi::cuda::qwen35 {
+namespace tyloi::models::qwen35 {
 namespace {
 
 struct LayerLoader : TransformerWeightLoader {
     bool mirror_scalars = true;
-    using DenseTensor = ::tyloi::DenseTensor;
-
-    static DenseTensor log_negative(DenseTensor value) {
-        return ::tyloi::cuda::log(-value);
-    }
 
     void linear_projections(::tyloi::models::LinearAttention& attention,
                             const tyloi::models::qwen35::LinearWeightNames& names,
@@ -132,30 +123,30 @@ struct LayerLoader : TransformerWeightLoader {
         attention.dt_bias = weights.tensor(linear + "dt_bias");
         auto a = weights.tensor(linear + "a");
         attention.a_log = config.legacy_tensor_layout.linear_attention_a_is_log
-            ? a : ::tyloi::Tensor(log_negative(a.dense()));
+            ? a : ::tyloi::ops::log_negative(a);
         attention.linear_norm = weights.tensor(linear + "norm.weight");
         linear_output(attention, linear + "output.weight");
     }
 };
 
+std::optional<Predictor> load_predictor(LayerLoader&, const Model&, tyloi::state::KvQuantization);
+
 } // namespace
 
 void load_layer(Layer& result, const ::tyloi::weights::Loader& weights, const Config& config,
                  int index, const std::string& type, bool mirror_scalars,
-                 std::string_view tensor_root) {
+                 std::string_view tensor_root, tyloi::state::KvQuantization quantization) {
     if (index < 0 || index >= config.num_hidden_layers)
         throw std::out_of_range("Qwen layer index is outside the configured model");
     if (static_cast<std::size_t>(index) < config.layer_types.size() &&
         config.layer_types[static_cast<std::size_t>(index)] != type)
         throw std::invalid_argument("Qwen layer type disagrees with model config");
-    MfqCudaGuard scope(weights.placement.device);
-    result.device = weights.placement.cpu
-        ? ::tyloi::Device(::tyloi::kCPU)
-        : ::tyloi::Device(::tyloi::kCUDA, weights.placement.device);
+    tyloi::ops::DeviceScope scope(weights.placement.target);
+    result.device = weights.placement.target;
     LayerLoader loader{{weights}, mirror_scalars};
     if (Config::attention_kind(type) == Config::AttentionKind::full) {
         auto& full = result.weights.emplace<Full>();
-        full.attention.kv_quantization = cuda_kv_quantization();
+        full.attention.kv_quantization = quantization;
         tyloi::models::load_attention_mixer(
             full.attention, loader, config, index,
             std::string(tensor_root) + ".block." + std::to_string(index) + ".",
@@ -186,15 +177,15 @@ void load_layer(Layer& result, const ::tyloi::weights::Loader& weights, const Co
 
 Layer load_layer(const ::tyloi::weights::Loader& weights, const Config& config,
                  int index, const std::string& type, bool mirror_scalars,
-                 std::string_view tensor_root) {
+                 std::string_view tensor_root, tyloi::state::KvQuantization quantization) {
     Layer result;
-    load_layer(result, weights, config, index, type, mirror_scalars, tensor_root);
+    load_layer(result, weights, config, index, type, mirror_scalars, tensor_root, quantization);
     return result;
 }
 
 Model read(std::shared_ptr<const tyloi::ModelSource> source,
            std::string_view definition, std::int64_t context) {
-    tyloi::cuda::validate_model_source(*source);
+    tyloi::models::validate_model_source(*source);
     Model model;
     model.source = std::move(source);
     const auto& source_ref = *model.source;
@@ -202,7 +193,7 @@ Model read(std::shared_ptr<const tyloi::ModelSource> source,
     const auto plan = ::tyloi::models::model_plan(model.graph);
     if (model.graph.component("vision") != nullptr &&
         plan.vision != ::tyloi::models::VisionAdapter::grid_vit)
-        throw std::runtime_error("Qwen CUDA vision requires grid_vit/grid_vision.v1/grid_mrope");
+        throw std::runtime_error("Qwen vision requires grid_vit/grid_vision.v1/grid_mrope");
     if (model.graph.backbone != "qwen3_5" && model.graph.backbone != "generic_qwen")
         throw std::runtime_error("Qwen3.5 loading requires a Qwen-compatible model graph");
     model.config = Config::from_json(definition, model.graph);
@@ -226,15 +217,17 @@ std::unique_ptr<Model> load(std::shared_ptr<const tyloi::ModelSource> source,
     load(*model, weights, placement, options.yarn, cpu_layers,
          {.gpu_layers = options.gpu_layers, .expert_parallel = options.expert_parallel,
           .mirror_scalars = options.mirror_scalars,
-          .recurrent_transposed = options.recurrent_transposed});
+          .recurrent_transposed = options.recurrent_transposed,
+          .kv_quantization = options.kv_quantization});
     return model;
 }
 
 void load(Model& model, const ::tyloi::weights::Loader& weights,
           LayerPlacementConfig& placement, const tyloi::ops::YarnScaling& yarn,
           int& cpu_layers, const LoadOptions& options) {
-    model.device = ::tyloi::Device(::tyloi::kCUDA, weights.placement.device);
+    model.device = weights.placement.target;
     model.recurrent_transposed = options.recurrent_transposed;
+    model.kv_quantization = options.kv_quantization;
     if (options.expert_parallel && model.config.num_experts <= 0)
         throw std::runtime_error("--expert-parallel requires a model with routed experts");
 
@@ -255,34 +248,25 @@ void load(Model& model, const ::tyloi::weights::Loader& weights,
                 "--n-gpu-layers currently supports dense Qwen-style blocks only");
         std::cerr << "dense_layer_placement cpu=0-" << placed_cpu_layers - 1
                   << " gpu=" << placed_cpu_layers << '-' << model.config.num_hidden_layers - 1
-                  << " cpu_threads=" << mfq_get_num_threads() << std::endl;
+                  << std::endl;
     }
     if (::tyloi::models::model_plan(model.graph).vision == ::tyloi::models::VisionAdapter::grid_vit && placed_cpu_layers > 0)
         throw std::runtime_error("CUDA grid-Vision currently requires GPU-resident text layers");
 
     cpu_layers = placed_cpu_layers;
     const auto& config = model.config;
-    MfqCudaGuard scope(weights.placement.device);
+    tyloi::ops::DeviceScope scope(model.device);
     if (config.positional_encoding != tyloi::models::PositionalEncoding::none) {
         const auto make_rope = [&](::tyloi::Device device) {
-            RopeCache rope(config.max_position_embeddings, config.rotary_dim,
-                           config.rope_base, 0, -1, device,
-                           model.metadata.rope_interleaved, yarn);
-            rope.configure_mrope(config.mrope_sections, config.mrope_interleaved,
-                                 config.rotary_dim, device);
-            return rope.view();
+            return tyloi::ops::make_rope(config.max_position_embeddings, config.rotary_dim,
+                config.rope_base, device, config.mrope_sections, config.mrope_interleaved,
+                model.metadata.rope_interleaved, yarn);
         };
-        const auto primary = ::tyloi::Device(
-            ::tyloi::kCUDA, weights.placement.device);
-        model.rope = make_rope(primary);
-        if (cpu_layers > 0)
-            model.cpu_rope = make_rope(::tyloi::Device(::tyloi::kCPU));
+        model.rope = make_rope(model.device);
+        if (cpu_layers > 0) model.cpu_rope = make_rope(::tyloi::Device(::tyloi::kCPU));
         if (placement.enabled()) {
-            for (int device : placement.devices) {
-                MfqCudaGuard rope_guard(device);
-                model.device_ropes.emplace(
-                    device, make_rope(::tyloi::Device(::tyloi::kCUDA, device)));
-            }
+            for (int device : placement.devices)
+                model.device_ropes.emplace(device, make_rope(::tyloi::Device(model.device.type, device)));
         }
     }
 
@@ -305,10 +289,12 @@ void load(Model& model, const ::tyloi::weights::Loader& weights,
                 const bool cpu = index < cpu_layers;
                 std::cerr << "loading layer " << index << ' '
                           << config.layer_types.at(static_cast<std::size_t>(index)) << ' '
-                          << (cpu ? "CPU" : "CUDA") << std::endl;
+                          << (cpu ? "CPU" : "device") << std::endl;
+                const auto target = cpu ? ::tyloi::Device(::tyloi::kCPU) : ::tyloi::Device(model.device.type, device);
                 model.layers.push_back(load_layer(
-                    weights.for_layer(device, cpu), config, index,
-                    config.layer_types.at(static_cast<std::size_t>(index)), options.mirror_scalars));
+                    weights.for_layer(target), config, index,
+                    config.layer_types.at(static_cast<std::size_t>(index)), options.mirror_scalars,
+                    "model", model.kv_quantization));
             }
         }
     } else {
@@ -325,13 +311,13 @@ void load_vision(Model& model, const ::tyloi::weights::Loader& weights, bool res
         const auto& config = model.config;
         if (component == nullptr || !config.grid_vision ||
             !config.image_token_id || !config.video_token_id)
-            throw std::runtime_error("CUDA grid-Vision configuration is incomplete");
+            throw std::runtime_error("grid-Vision configuration is incomplete");
         model.vision.emplace(tyloi::models::grid::Vision::load(
             weights, weights.cache(), *config.grid_vision,
             *config.image_token_id, *config.video_token_id,
             component->input_contract, component->position_policy, resident));
     } else if (plan.vision != ::tyloi::models::VisionAdapter::none) {
-        throw std::runtime_error("CUDA vision adapter is unsupported for Qwen");
+        throw std::runtime_error("vision adapter is unsupported for Qwen");
     }
 }
 
@@ -347,19 +333,20 @@ void load_components(Model& model, const ::tyloi::weights::Loader& weights,
     load_vision(model, weights, resident);
     if (plan.predictor == ::tyloi::models::PredictorAdapter::qwen35) {
         if (mtp_allowed && model.metadata.num_experts == 0 && model.supports_speculation()) {
-            TransformerWeightLoader loader{weights};
-            auto predictor = load_predictor(loader, model, cuda_kv_quantization());
+            LayerLoader loader{{weights}};
+            auto predictor = load_predictor(loader, model, model.kv_quantization);
             if (predictor) model.mtp = std::make_unique<Mtp>(std::move(*predictor), preallocate);
         } else {
             std::cerr
-                << "qwen_mtp unavailable: CUDA adapter requires dense GPU-resident Qwen blocks\n";
+                << "qwen_mtp unavailable: requires dense device-resident Qwen blocks\n";
         }
     } else if (plan.predictor != ::tyloi::models::PredictorAdapter::none) {
-        throw std::runtime_error("CUDA predictor adapter is unsupported for Qwen");
+        throw std::runtime_error("predictor adapter is unsupported for Qwen");
     }
 }
 
-std::optional<tyloi::models::qwen35::Predictor> load_predictor(TransformerWeightLoader& loader,
+namespace {
+std::optional<tyloi::models::qwen35::Predictor> load_predictor(LayerLoader& loader,
                                          const Model& target,
                                          tyloi::state::KvQuantization quantization) {
     const auto& config = target.config;
@@ -369,10 +356,10 @@ std::optional<tyloi::models::qwen35::Predictor> load_predictor(TransformerWeight
         loader.has("predictor.output_norm.weight") ||
         loader.has("predictor.block.0.attention.query.weight");
     if (!fusion_present) {
-        TYLOINFER_RUNTIME_CHECK(!any, "Qwen model source contains an incomplete MTP head");
+        tyloi::models::require_model(!any, "Qwen model source contains an incomplete MTP head");
         return {};
     }
-    TYLOINFER_RUNTIME_CHECK(config.mtp_num_hidden_layers > 0 && !config.mtp_use_dedicated_embeddings,
+    tyloi::models::require_model(config.mtp_num_hidden_layers > 0 && !config.mtp_use_dedicated_embeddings,
         "Qwen MTP requires declared predictor layers and shared embeddings");
     tyloi::models::qwen35::Predictor model;
     model.config = config;
@@ -383,7 +370,7 @@ std::optional<tyloi::models::qwen35::Predictor> load_predictor(TransformerWeight
     model.embedding_norm = loader.weights.tensor("predictor.embedding_norm.weight");
     model.output_norm = loader.weights.tensor("predictor.output_norm.weight");
     model.fusion = loader.linear("predictor.fusion.weight");
-    TYLOINFER_RUNTIME_CHECK(model.fusion.size(1) == 2 * config.hidden_size &&
+    tyloi::models::require_model(model.fusion.size(1) == 2 * config.hidden_size &&
         model.fusion.size(0) == config.hidden_size &&
         model.hidden_norm.numel() == config.hidden_size &&
         model.embedding_norm.numel() == config.hidden_size &&
@@ -407,4 +394,5 @@ std::optional<tyloi::models::qwen35::Predictor> load_predictor(TransformerWeight
     return model;
 }
 
-} // namespace tyloi::cuda::qwen35
+} // namespace
+} // namespace tyloi::models::qwen35

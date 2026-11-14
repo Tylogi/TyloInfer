@@ -3,7 +3,7 @@
 #include <optional>
 #include <stdexcept>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 
 constexpr const char* kRowDecodeHeader = R"METAL(
@@ -64,4 +64,4 @@ mlx::core::array MlxNintRowBatch::decode(mlx::core::Dtype dtype) const {
         std::nullopt, false, {}).front();
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

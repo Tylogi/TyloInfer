@@ -26,7 +26,7 @@
 #include <sys/uio.h>
 #include <unistd.h>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 
 constexpr std::uint32_t kMaxRecordEntries =
@@ -655,4 +655,4 @@ void MfqContainer::install_legacy_aliases(
 }
 
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

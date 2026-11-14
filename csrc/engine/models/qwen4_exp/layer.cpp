@@ -10,7 +10,7 @@ DenseTensor forward(const Layer& weights, LayerState& request,
                     const DenseTensor& positions, const DenseTensor& full_positions,
                     int64_t confirmed, const DenseTensor& host_ids) {
     request.retained_prefix = confirmed > 0 && ids.size(1) <= 8;
-    const auto device = ::tyloi::Device(::tyloi::kCUDA, weights.cuda_device);
+    const auto device = weights.device;
     if (weights.ple) {
         ::tyloi::ops::ProfileRange range("prefill.ple", device);
         auto ple = weights.ple->forward(request.ple, x, ids, true, confirmed, host_ids,
@@ -55,7 +55,7 @@ DenseTensor forward(const Layer& weights, LayerState& request,
 DenseTensor prefill_ple(const Layer& weights, LayerState& request,
                         DenseTensor x, const DenseTensor& ids, const DenseTensor& host_ids) {
     if (weights.ple) {
-        ::tyloi::ops::ProfileRange range("prefill.ple", ::tyloi::Device(::tyloi::kCUDA, weights.cuda_device));
+        ::tyloi::ops::ProfileRange range("prefill.ple", weights.device);
         auto ple = weights.ple->forward(request.ple, x, ids, true, 0, host_ids);
         range.finish();
         x = x.is_cuda() ? tyloi::ops::add(x, ple).dense() : x + ple;
@@ -67,7 +67,7 @@ DenseTensor prefill_attention_core(const Layer& weights, LayerState& request,
                                    const DenseTensor& input, const DenseTensor& positions,
                                    const DenseTensor& full_positions) {
     ::tyloi::ops::ProfileRange range(weights.gdn ? "prefill.gdn" : "prefill.qsa",
-                                     ::tyloi::Device(::tyloi::kCUDA, weights.cuda_device));
+                                     weights.device);
     auto output = weights.gdn
         ? weights.gdn->forward(request.gdn, input, true, 0).dense()
         : weights.qsa->forward(*request.qsa, input, positions, full_positions, true).dense();
@@ -79,7 +79,7 @@ tyloi::ops::Residual::Result prefill_attention(const Layer& weights, LayerState&
                                         DenseTensor x, const DenseTensor& ids,
                                         const DenseTensor& host_ids, const DenseTensor& positions,
                                         const DenseTensor& full_positions) {
-    const auto device = ::tyloi::Device(::tyloi::kCUDA, weights.cuda_device);
+    const auto device = weights.device;
     x = prefill_ple(weights, request, std::move(x), ids, host_ids);
     tyloi::ops::Residual::Result mix;
     {

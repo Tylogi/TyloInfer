@@ -9,7 +9,8 @@
 #include <mlx/mlx.h>
 #include "engine/tensor.h"
 
-namespace mfq::metal {
+namespace tyloi::source { class Source; }
+namespace tyloi::metal {
 class MfqContainer;
 class MlxTqExpertCache;
 class MlxMappedTqRows;
@@ -32,6 +33,9 @@ public:
     static MlxTqWeight from_pool(std::span<const std::uint8_t> blob,
         const mlx::core::array& words, std::span<const std::uint64_t> expert_offsets,
         int input_columns = 0);
+    static MlxTqWeight from_source(const tyloi::source::Source& source,
+        const std::string& name, const mlx::core::array& words,
+        std::span<const std::uint64_t> expert_offsets);
     static MlxTqWeight load(const MfqContainer& model, const std::string& name);
     bool can_concatenate_rows(const MlxTqWeight& other) const;
     static MlxTqWeight concatenate_projections(const std::vector<MlxTqWeight>& weights);
@@ -108,4 +112,4 @@ private:
     bool pooled_;
     std::size_t nbytes_;
 };
-} // namespace mfq::metal
+} // namespace tyloi::metal

@@ -9,7 +9,7 @@
 #include <utility>
 #include <vector>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 struct MlxResourceUsage {
     std::size_t cache_bytes = 0;

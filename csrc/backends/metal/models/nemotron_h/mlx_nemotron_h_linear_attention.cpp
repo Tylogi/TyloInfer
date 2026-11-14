@@ -10,7 +10,7 @@
 #include <string>
 #include <utility>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 
 using mlx::core::Shape;
@@ -494,4 +494,4 @@ void MlxNemotronHLinearAttentionBlock::replay_recurrent(int retained_tokens) {
     cache_position_ = speculative_start_ + retained_tokens;
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

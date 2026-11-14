@@ -1,7 +1,7 @@
 #pragma once
 
 #include "mlx_moe_ops.h"
-#include "tyloinfer/format_features.h"
+#include "engine/weights/encoding/format_features.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -14,7 +14,7 @@
 
 #include <mlx/mlx.h>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 class MfqContainer;
 class MlxMfeWeight;
@@ -631,4 +631,4 @@ private:
     MlxMoeWeight down_;
 };
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

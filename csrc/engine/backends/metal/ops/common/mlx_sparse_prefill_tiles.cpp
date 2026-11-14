@@ -5,7 +5,7 @@
 #include <cmath>
 #include <stdexcept>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 using namespace mlx::core;
 #include "../../kernels/common/mfq_sparse_block_nax.inc"
@@ -280,4 +280,4 @@ array mlx_sparse_block_gqa_prefill_tiles(const array& query, const array& key, c
         {{1, rows, 24, 256}}, {output_dtype}, {rows * 24 * 32, 1, 1}, {256, 1, 1},
         {{"T", output_dtype}, {"FALLBACK", fallback_enabled}}, std::nullopt, false, {}).front();
 }
-} // namespace mfq::metal
+} // namespace tyloi::metal

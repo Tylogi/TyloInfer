@@ -6,7 +6,6 @@
 #include "engine/models/qwen35/load.h"
 #include "engine/models/qwen35/mtp.h"
 #include "engine/models/qwen35/state.h"
-#include "engine/models/session/cache.h"
 #include "engine/backends/cuda/kernels/mfq_cuda_kv_quantization.h"
 
 #include "engine/backends/cuda/executor/executor.h"
@@ -43,7 +42,7 @@ void Components::describe(tyloi::engine::EngineInfo& info) const {
 }
 
 Components Components::load(
-    Model& model,
+    tyloi::models::qwen35::Model& model,
     const ::tyloi::weights::Loader& weights,
     const LayerPlacementConfig& placement,
     int cpu_layers,
@@ -54,7 +53,7 @@ Components Components::load(
     bool preallocate) {
     Components components{model.graph, ::tyloi::models::model_plan(model.graph)};
     if (!optional) return components;
-    load_components(model, weights, placement, cpu_layers, cpu_offload,
+    tyloi::models::qwen35::load_components(model, weights, placement, cpu_layers, cpu_offload,
         options::vision_resident(), preallocate);
     components.vision_available = model.vision.has_value();
     components.mtp = model.mtp.get();
@@ -62,12 +61,6 @@ Components Components::load(
         predictor_execution = executor.fork(model.device.index);
     }
     return components;
-}
-
-void restore_session(State& state, tyloi::models::Mtp* mtp, const TextSessionState& snapshot,
-        const std::function<void()>& drain) {
-    tyloi::cuda::internal::CudaSessionOps::restore(
-        static_cast<tyloi::models::State&>(state), snapshot, drain, mtp);
 }
 
 } // namespace tyloi::cuda::qwen35

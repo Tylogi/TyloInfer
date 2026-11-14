@@ -2,7 +2,7 @@
 
 #include <mlx/fast.h>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 using namespace mlx::core;
 
@@ -149,4 +149,4 @@ std::optional<std::vector<array>> MlxAffineWeight::gated_residual(const array& n
     }
     return result;
 }
-} // namespace mfq::metal
+} // namespace tyloi::metal

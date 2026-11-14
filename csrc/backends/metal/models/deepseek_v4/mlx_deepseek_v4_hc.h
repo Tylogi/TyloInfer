@@ -4,7 +4,7 @@
 
 #include <mlx/mlx.h>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 struct MlxDeepseekV4HcPreResult {
     mlx::core::array reduced;
@@ -66,4 +66,4 @@ mlx::core::array deepseek_v4_hc_post_sum_packed(
     const mlx::core::array& residual,
     const mlx::core::array& metadata);
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

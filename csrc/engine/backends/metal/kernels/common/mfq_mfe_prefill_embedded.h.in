@@ -1,6 +1,6 @@
 #pragma once
 
-namespace mfq::metal::detail {
+namespace tyloi::metal::detail {
 
 inline constexpr char kSteelMmaSource[] = R"TI_STEEL(
 @TYLOINFER_STEEL_MMA_SOURCE@
@@ -34,4 +34,4 @@ inline constexpr char kCsa2PrefillSource[] = R"TYLOINFER_CSA2(
 @TYLOINFER_CSA2_PREFILL_SOURCE@
 )TYLOINFER_CSA2";
 
-} // namespace mfq::metal::detail
+} // namespace tyloi::metal::detail

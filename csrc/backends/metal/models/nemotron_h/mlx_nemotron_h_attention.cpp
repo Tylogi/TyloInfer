@@ -10,7 +10,7 @@
 #include <utility>
 #include <vector>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 
 using mlx::core::Shape;
@@ -227,4 +227,4 @@ array MlxNemotronHAttentionBlock::forward_impl(
     return output_(attention_operand(std::move(flat)));
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

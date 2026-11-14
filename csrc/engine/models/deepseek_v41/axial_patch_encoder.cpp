@@ -76,7 +76,7 @@ struct CudaAxialPatchVisionTower::Impl {
         if (patches.dim() == 4) patches = tyloi::ops::reshape(patches, {count, config.patch_width()});
         if (patches.dim() != 2 || patches.size(0) != count || patches.size(1) != config.patch_width())
             throw std::invalid_argument("axial patch vision patch geometry mismatch");
-        const auto host = loader.for_layer(loader.placement.device, true);
+        const auto host = loader.for_layer(::tyloi::Device(::tyloi::kCPU));
         patches = tyloi::ops::cast(patches, ::tyloi::kFloat16);
         const auto activations = std::size_t(count) * std::size_t(std::max(6 * hidden, 2 * config.intermediate)) * sizeof(float)
             + (std::size_t(32) << 20);

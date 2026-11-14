@@ -214,7 +214,7 @@ Vision Vision::load(
     }
     vision.validate();
     const bool host = !resident && !weights.placement.tensor.enabled();
-    const auto placed = weights.for_layer(weights.placement.device, host);
+    const auto placed = weights.for_layer(host ? ::tyloi::Device(::tyloi::kCPU) : weights.placement.target);
     const int64_t unit = vision.spatial_merge_size * vision.spatial_merge_size;
     auto merger_norm = load_norm(
         placed, GridVisionTensorRole::merger_norm_weight,

@@ -14,7 +14,7 @@
 #include <cmath>
 #include <stdexcept>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 using namespace mlx::core;
 
@@ -736,4 +736,4 @@ array MlxGgufPrefillPlan::down(const MlxGgufWeight& weight, const array& hidden,
         {float_accumulation ? float32 : dtype_}, {int((elements + 127) / 128 * 128), 1, 1}, {128, 1, 1},
         {{"T", float_accumulation ? float32 : dtype_}}, std::nullopt, false, {}).front();
 }
-} // namespace mfq::metal
+} // namespace tyloi::metal

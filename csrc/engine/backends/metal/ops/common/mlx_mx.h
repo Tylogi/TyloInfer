@@ -1,5 +1,7 @@
 #pragma once
 
+#include "engine/tensor.h"
+
 #include <cstdint>
 #include <span>
 #include <string_view>
@@ -7,7 +9,7 @@
 
 #include <mlx/mlx.h>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 bool is_mx_dtype(std::string_view dtype) noexcept;
 
@@ -90,6 +92,7 @@ public:
         return mxfp8_scale_column_block_size_;
     }
     std::size_t packed_nbytes() const noexcept;
+    std::vector<std::shared_ptr<tyloi::TensorStorage>> backings() const;
 
     // Read-only packed storage used by fused/grouped Metal kernels.
     const mlx::core::array& packed_values() const noexcept {
@@ -116,4 +119,4 @@ private:
     int output_size_ = 0;
 };
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

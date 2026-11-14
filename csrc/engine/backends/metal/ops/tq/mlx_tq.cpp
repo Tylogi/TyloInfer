@@ -11,7 +11,8 @@
 #include "engine/backends/metal/native/env.h"
 #include "engine/backends/metal/native/profile.h"
 #include "mlx_tq_rows.h"
-#include "tyloinfer/tq_rows.h"
+#include "engine/weights/encoding/tq_rows.h"
+#include "engine/weights/tq/source.h"
 
 #include <mlx/allocator.h>
 #include <nlohmann/json.hpp>
@@ -27,7 +28,7 @@
 #include <tuple>
 #include <utility>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 using namespace mlx::core;
 
@@ -1373,6 +1374,141 @@ MlxTqWeight MlxTqWeight::from_pool(std::span<const std::uint8_t> blob, const arr
     return from_blob_impl(blob, input_columns, int(expert_offsets.size()), &words, expert_offsets);
 }
 
+MlxTqWeight MlxTqWeight::from_source(const tyloi::source::Source& source,
+        const std::string& name, const array& words,
+        std::span<const std::uint64_t> expert_offsets) {
+    const auto shape = tyloi::tq_shape(source, name);
+    if (shape.size() != 3 || shape[0] != static_cast<std::int64_t>(expert_offsets.size()) ||
+        shape[0] > INT_MAX || shape[1] > INT_MAX || shape[2] > INT_MAX ||
+        words.dtype() != uint32 || !words.flags().row_contiguous || words.size() == 0)
+        throw std::invalid_argument("invalid TQ expert source or word pool");
+    auto table = tyloi::tq_table(source, name);
+    const auto experts = static_cast<int>(shape[0]);
+    const auto out = static_cast<int>(shape[1]);
+    const auto rows64 = shape[0] * shape[1];
+    if (rows64 > INT_MAX - experts) throw std::overflow_error("TQ descriptors exceed backend limits");
+    const auto rows = static_cast<int>(rows64);
+    const auto& first = table->segment(0).layout();
+    if (first.width > INT_MAX) throw std::overflow_error("TQ width exceeds backend limits");
+    const int width = static_cast<int>(first.width);
+    const bool columns = first.columns;
+    std::array<std::byte, 8> magic{};
+    if (source.find_tensor(name)) source.tensor_reader(name)(0, magic.data(), magic.size());
+    const bool flat = table->segment_count() == 1 &&
+        std::memcmp(magic.data(), "RTQEXP01", magic.size()) != 0;
+    if (flat) {
+        const auto metadata = table->segment(0).metadata();
+        std::vector<std::uint64_t> descriptors(std::size_t(rows) + experts);
+        std::uint64_t expected = 0, base = 0;
+        for (int row = 0; row < rows; ++row) {
+            const auto d = tyloi::TqLayout::integer(metadata.data() + 64 + std::size_t(row) * 8, 8);
+            const auto row_words = std::uint64_t(width) * (((d >> 32) & 7) + 1) / 32;
+            if (!first.valid_descriptor(d) || first.offset(d) != expected)
+                throw std::invalid_argument("invalid TQ expert row descriptor");
+            const auto expert = row / out;
+            if (row % out == 0) base = expected;
+            const auto relative_offset = expected - base;
+            if (expert_offsets[expert] > words.size() ||
+                relative_offset + row_words > words.size() - expert_offsets[expert])
+                throw std::out_of_range("TQ expert exceeds the word pool");
+            descriptors[row] = first.rebase(d, relative_offset);
+            expected += row_words;
+        }
+        if (expected * 4 != first.packed_bytes)
+            throw std::invalid_argument("TQ expert payload offsets differ");
+        for (int expert = 0; expert < experts; ++expert)
+            descriptors[rows + expert] = expert_offsets[expert];
+        if (columns) for (int col = 0; col < width; ++col) {
+            const auto value = tyloi::TqLayout::integer(metadata.data() + first.scales + col * 2, 2);
+            if (!value || (value & 0x8000) || (value & 0x7c00) == 0x7c00)
+                throw std::invalid_argument("invalid TQ expert column scale");
+        }
+        auto scales = !columns && first.gs >= 256
+            ? prepare_scales(metadata, first.scales, rows, first.groups)
+            : copy_array(metadata.data() + first.scales, columns ? width : first.scale_bytes,
+                         columns ? float16 : uint8);
+        auto descriptor_array = copy_array(reinterpret_cast<const std::uint8_t*>(descriptors.data()),
+                                            descriptors.size(), uint64);
+        const auto resident_bytes = first.bytes - first.scale_bytes + scales.nbytes() + experts * 8;
+        return MlxTqWeight(words, std::move(descriptor_array), std::move(scales), rows, width,
+            static_cast<int>(shape[2]), experts, columns ? 512 : first.gs,
+            columns ? 1 : 0, resident_bytes, true);
+    }
+    int gs = static_cast<int>(first.gs);
+    for (std::size_t i = 0; i < table->segment_count(); ++i) {
+        const auto& layout = table->segment(i).layout();
+        if (layout.width != first.width || layout.columns != columns)
+            throw std::invalid_argument("TQ expert segment layouts differ");
+        if (!columns) gs = std::min(gs, static_cast<int>(layout.gs));
+    }
+    const std::size_t groups = columns ? 0 : (std::size_t(width) + gs - 1) / gs;
+    const std::size_t factors = columns ? std::size_t(experts) * width : std::size_t(rows) * groups;
+    if (factors > INT_MAX) throw std::overflow_error("TQ expert scales exceed backend limits");
+    auto descriptors = array(allocator::malloc(std::size_t(rows + experts) * 8),
+        Shape{rows + experts}, uint64);
+    auto scales = array(allocator::malloc(factors * (columns ? 2 : 4)),
+        Shape{static_cast<int>(factors)}, columns ? float16 : float32);
+    std::vector<std::uint64_t> expert_words(experts, 0);
+    std::vector<bool> column_written(experts, false);
+    const auto* relative = relative_table().data<float16_t>();
+    std::uint64_t global_row = 0;
+    for (std::size_t segment = 0; segment < table->segment_count(); ++segment) {
+        const auto& part = table->segment(segment);
+        const auto& layout = part.layout();
+        const auto metadata = part.metadata();
+        std::uint64_t expected = 0;
+        for (std::uint64_t row = 0; row < layout.rows; ++row, ++global_row) {
+            const auto descriptor = tyloi::TqLayout::integer(metadata.data() + 64 + row * 8, 8);
+            const auto bits = ((descriptor >> 32) & 7) + 1;
+            if (!layout.valid_descriptor(descriptor) || layout.offset(descriptor) != expected)
+                throw std::invalid_argument("invalid TQ expert row descriptor");
+            const auto expert = global_row / out;
+            const auto row_words = std::uint64_t(width) * bits / 32;
+            if (expert >= expert_offsets.size() || expert_offsets[expert] > words.size() ||
+                expert_words[expert] + row_words > words.size() - expert_offsets[expert])
+                throw std::out_of_range("TQ expert exceeds the word pool");
+            auto& target = descriptors.data<std::uint64_t>()[global_row];
+            target = layout.rebase(descriptor, expert_words[expert]);
+            expert_words[expert] += row_words;
+            expected += row_words;
+            if (columns) {
+                auto* destination = scales.data<float16_t>() + expert * width;
+                const auto* input = metadata.data() + layout.scales;
+                if (!column_written[expert]) {
+                    for (int col = 0; col < width; ++col) {
+                        const auto value = tyloi::TqLayout::integer(input + col * 2, 2);
+                        if (!value || (value & 0x8000) || (value & 0x7c00) == 0x7c00)
+                            throw std::invalid_argument("invalid TQ expert column scale");
+                    }
+                    std::memcpy(destination, input, std::size_t(width) * 2);
+                    column_written[expert] = true;
+                } else if (std::memcmp(destination, input, std::size_t(width) * 2) != 0) {
+                    throw std::invalid_argument("TQ expert column scales differ across segments");
+                }
+            } else {
+                const auto anchor = float(std::bit_cast<float16_t>(std::uint16_t(descriptor >> 40)));
+                for (std::size_t group = 0; group < groups; ++group) {
+                    const auto index = row * layout.groups + group * gs / layout.gs;
+                    const auto code = (metadata[layout.scales + index / 2] >> ((index & 1) * 4)) & 15;
+                    scales.data<float>()[global_row * groups + group] = anchor * float(relative[code]);
+                }
+            }
+        }
+        if (expected * 4 != layout.packed_bytes)
+            throw std::invalid_argument("TQ expert payload offsets differ");
+    }
+    if (global_row != static_cast<std::uint64_t>(rows))
+        throw std::invalid_argument("TQ expert row count differs");
+    for (int expert = 0; expert < experts; ++expert)
+        descriptors.data<std::uint64_t>()[rows + expert] = expert_offsets[expert];
+    tyloi::metal::AllocationScope::record(descriptors);
+    tyloi::metal::AllocationScope::record(scales);
+    const auto resident_bytes = descriptors.nbytes() + scales.nbytes() + words.nbytes();
+    return MlxTqWeight(words, std::move(descriptors), std::move(scales), rows, width,
+        static_cast<int>(shape[2]), experts, columns ? out : gs, columns ? 2 : 0,
+        resident_bytes, true);
+}
+
 MlxTqWeight MlxTqWeight::from_expert_blob(std::span<const std::uint8_t> blob,
         int input_columns, int experts, const array* word_pool, std::span<const std::uint64_t> expert_offsets) {
     const MlxMappedTqRows table(blob, input_columns);
@@ -1451,7 +1587,7 @@ MlxTqWeight MlxTqWeight::from_blob_impl(std::span<const std::uint8_t> blob,
         int input_columns, int experts, const array* word_pool, std::span<const std::uint64_t> expert_offsets) {
     if (blob.size() >= 8 && !std::memcmp(blob.data(), "RTQEXP01", 8))
         return from_expert_blob(blob, input_columns, experts, word_pool, expert_offsets);
-    const mfq::TqLayout layout(blob.data(), blob.size());
+    const tyloi::TqLayout layout(blob.data(), blob.size());
     auto rows = load_le<std::uint32_t>(blob, 12), width = load_le<std::uint32_t>(blob, 16);
     auto columns = load_le<std::uint32_t>(blob, 20), gs = load_le<std::uint32_t>(blob, 24);
     auto packed = load_le<std::uint32_t>(blob, 28);
@@ -1561,7 +1697,7 @@ MlxTqWeight MlxTqWeight::concatenate(const std::vector<MlxTqWeight>& weights, bo
     auto descriptors = array(allocator::malloc(rows * 8), Shape{int(rows)}, uint64);
     auto scales = first.columns_ ? tyloi::metal::array(first.scales_)
         : array(allocator::malloc(scale_bytes), Shape{int(scale_count)}, tyloi::metal::array(first.scales_).dtype());
-    mfq::TqLayout layout; layout.compact = first.width_ % 256 != 0;
+    tyloi::TqLayout layout; layout.compact = first.width_ % 256 != 0;
     auto* target_desc = descriptors.data<std::uint64_t>();
     std::size_t word_base = 0, row_base = 0, projection_base = 0;
     for (std::size_t p = 0; p < weights.size(); ++p) {
@@ -2354,4 +2490,4 @@ void MlxTqWeight::set_expert_word_offset(int expert, std::uint64_t word_offset) 
         throw std::out_of_range("TQ expert exceeds the word pool");
     descriptors[rows_ + expert] = word_offset;
 }
-} // namespace mfq::metal
+} // namespace tyloi::metal

@@ -8,7 +8,7 @@
 #include <string_view>
 #include <vector>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 struct DeepseekV4RopeScaling {
     bool enabled = false;
@@ -170,4 +170,4 @@ void validate_deepseek_v4_model_bindings(
 using MlxDeepseekV4Config = DeepseekV4Config;
 using MlxDeepseekV4Names = DeepseekV4TensorNames;
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

@@ -13,7 +13,7 @@
 #include <string>
 #include <utility>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 
 using mlx::core::array;
@@ -559,7 +559,7 @@ MlxPreparedPrompt MlxGridVisionPromptComponent::prepare(
   auto embeddings = replace_multimodal_token_embeddings(
       text_embeddings, visual.merged_features, token_ids,
       {impl_->image_token_id, impl_->video_token_id});
-  auto positions = ::mfq::metal::build_grid_mrope_positions(
+  auto positions = ::tyloi::metal::build_grid_mrope_positions(
       token_ids, impl_->image_token_id, impl_->video_token_id,
       static_cast<int>(impl_->tower.config().spatial_merge_size), images,
       videos);
@@ -579,4 +579,4 @@ const std::string &MlxGridVisionPromptComponent::position_policy() const noexcep
   return impl_->position_policy;
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

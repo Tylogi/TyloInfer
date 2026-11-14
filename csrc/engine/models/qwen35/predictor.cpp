@@ -8,7 +8,7 @@
 namespace tyloi::models::qwen35 {
 
 Tensor Predictor::step(const Tensor& hidden, const Tensor& next_ids, const Tensor& positions,
-                       tyloi::cuda::qwen35::MtpState& state, const ForwardOptions& options) const {
+                       tyloi::models::qwen35::MtpState& state, const ForwardOptions& options) const {
     hidden.require_dense();
     next_ids.require_dense();
     if (positions.defined()) positions.require_dense();

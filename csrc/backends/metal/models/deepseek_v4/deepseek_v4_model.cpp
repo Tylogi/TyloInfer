@@ -1,6 +1,6 @@
 #include "deepseek_v4_model.h"
 
-#include "tyloinfer/nint_blob.h"
+#include "engine/weights/encoding/quant/nint_blob.h"
 
 #include "nlohmann/json.hpp"
 
@@ -14,7 +14,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 
 using json = nlohmann::json;
@@ -593,7 +593,7 @@ DeepseekV4Config DeepseekV4Config::from_json(
     config.rope_theta =
         optional_number(object, {"rope_theta"}, 10'000.0);
     config.rope_scaling =
-        ::mfq::metal::rope_scaling(object);
+        ::tyloi::metal::rope_scaling(object);
     config.eos_token_id = eos_tokens(object);
     config.index_n_heads =
         optional_integer(object, {"index_n_heads"}, 64);
@@ -1336,7 +1336,7 @@ inspect_deepseek_v4_tensor_metadata(
 
     if (is_nint_dtype(record.dtype)) {
         result.packed = true;
-        const auto bits = mfq::nint_logical_bits(
+        const auto bits = tyloi::nint_logical_bits(
             cursor.scalar<std::uint8_t>("NINT bits"));
         const auto raw_sub_bits =
             cursor.scalar<std::uint8_t>("NINT sub bits");
@@ -1548,4 +1548,4 @@ void validate_deepseek_v4_model_bindings(
     }
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

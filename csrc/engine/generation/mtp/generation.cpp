@@ -207,7 +207,6 @@ struct MtpOps {
     }
     models::MtpStep predictor_step(Tensor hidden, Tensor ids, Tensor positions) {
         auto predictor_options = options;
-        predictor_options.kv_capacity = ops::kv_capacity(device);
         predictor_options.serial_experts = false;
         models::MtpStep result;
         {
@@ -235,7 +234,6 @@ struct MtpOps {
         if (bytes) workspace.begin(bytes);
         hidden = ops::copy(hidden, device);
         auto predictor_options = options;
-        predictor_options.kv_capacity = ops::kv_capacity(device);
         predictor_options.serial_experts = false;
         models::MtpStep result;
         {

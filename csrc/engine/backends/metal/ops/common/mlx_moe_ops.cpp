@@ -9,7 +9,7 @@
 #include <utility>
 #include <vector>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 
 using mlx::core::CompileOptions;
@@ -2222,4 +2222,4 @@ array moe_apply_expert_scale(
     return std::move(outputs.front());
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

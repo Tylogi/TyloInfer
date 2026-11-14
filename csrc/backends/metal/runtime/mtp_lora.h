@@ -5,7 +5,7 @@
 #include <span>
 #include <vector>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 struct MtpLoraState {
     int inputs = 0, outputs = 0, rank = 0;
@@ -36,4 +36,4 @@ struct MtpLoraUpdate {
 
 std::shared_ptr<MtpLoraState> mtp_lora_adam(const MtpLoraState&, std::span<const float> gradients);
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

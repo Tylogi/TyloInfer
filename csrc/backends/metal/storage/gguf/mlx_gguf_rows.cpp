@@ -4,7 +4,7 @@
 #include <climits>
 #include <stdexcept>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 void MlxGgufRowBatch::append(std::string_view dtype, int width, std::span<const std::uint8_t> bytes) {
     const auto stride = gguf_packed_row_bytes(dtype, width);
@@ -50,4 +50,4 @@ void MlxMappedGgufRows::append_row(std::int64_t row, MlxGgufRowBatch& batch) con
     if (row < 0 || row >= rows_) throw std::out_of_range("GGUF selected row is outside the table");
     batch.append(dtype_, width_, bytes_.subspan(std::size_t(row) * row_bytes_, row_bytes_));
 }
-} // namespace mfq::metal
+} // namespace tyloi::metal

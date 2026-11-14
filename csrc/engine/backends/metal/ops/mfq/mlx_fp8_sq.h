@@ -9,9 +9,9 @@
 
 #include <mlx/mlx.h>
 
-#include "tyloinfer/fp8_sq_blob.h"
+#include "engine/weights/encoding/fp8_sq_blob.h"
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 bool is_fp8_sq_dtype(std::string_view dtype) noexcept;
 
@@ -60,7 +60,7 @@ public:
     int output_size() const noexcept { return layout_.outputs; }
     int block_rows() const noexcept { return layout_.block_rows; }
     int block_columns() const noexcept { return layout_.block_columns; }
-    const mfq::fp8sq::Layout& wire_layout() const noexcept { return layout_; }
+    const tyloi::fp8sq::Layout& wire_layout() const noexcept { return layout_; }
     const Fp8SqDescriptor& descriptor() const noexcept { return descriptor_; }
     bool has_uniform_q() const noexcept {
         return descriptor_.distribution_entropy == 0.0;
@@ -76,7 +76,7 @@ private:
         mlx::core::array palette_values,
         mlx::core::array palette_quads,
         mlx::core::array palette_pairs,
-        mfq::fp8sq::Layout layout,
+        tyloi::fp8sq::Layout layout,
         Fp8SqDescriptor descriptor);
 
     std::string dtype_;
@@ -86,8 +86,8 @@ private:
     mlx::core::array palette_values_;
     mlx::core::array palette_quads_;
     mlx::core::array palette_pairs_;
-    mfq::fp8sq::Layout layout_;
+    tyloi::fp8sq::Layout layout_;
     Fp8SqDescriptor descriptor_;
 };
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

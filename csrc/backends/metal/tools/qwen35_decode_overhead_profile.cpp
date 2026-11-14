@@ -32,12 +32,12 @@ namespace {
 using Clock = std::chrono::steady_clock;
 using mlx::core::Shape;
 using mlx::core::array;
-using mfq::metal::MfqContainer;
-using mfq::metal::MlxKvCache;
-using mfq::metal::MlxQwen35CausalLm;
-using mfq::metal::MlxRmsNorm;
-using mfq::metal::MlxSampler;
-using mfq::metal::MlxSamplingParams;
+using tyloi::metal::MfqContainer;
+using tyloi::metal::MlxKvCache;
+using tyloi::metal::MlxQwen35CausalLm;
+using tyloi::metal::MlxRmsNorm;
+using tyloi::metal::MlxSampler;
+using tyloi::metal::MlxSamplingParams;
 
 struct GraphStats {
     std::size_t arrays = 0;
@@ -157,7 +157,7 @@ std::int32_t prefill(
     model.reset_cache(1);
     return evaluated_token(
         sampler.sample(
-            mfq::metal::mlx_last_token_logits(
+            tyloi::metal::mlx_last_token_logits(
                 model.forward(ids, true),
                 vocab)));
 }
@@ -185,7 +185,7 @@ void run_decode_steps(
             mlx::core::int32);
         auto logits = model.forward(ids, true);
         auto sampled = sampler.sample(
-            mfq::metal::mlx_last_token_logits(logits, vocab));
+            tyloi::metal::mlx_last_token_logits(logits, vocab));
         if (timings != nullptr) {
             timings->build_ms +=
                 milliseconds_since(build_start);
@@ -268,7 +268,7 @@ array evaluated_zeros(
 }
 
 double benchmark_linear_attention_state(
-    const mfq::metal::Qwen35Config& config,
+    const tyloi::metal::Qwen35Config& config,
     int repetitions) {
     const int layer_count = static_cast<int>(
         std::count(
@@ -360,7 +360,7 @@ double benchmark_linear_attention_state(
                 const auto beta =
                     mlx::core::sigmoid(beta_source);
                 auto convolved =
-                    mfq::metal::linear_conv_qkv(
+                    tyloi::metal::linear_conv_qkv(
                         convolution_states[
                             static_cast<std::size_t>(index)],
                         qk,
@@ -374,7 +374,7 @@ double benchmark_linear_attention_state(
                         static_cast<float>(
                             config.rms_norm_eps));
                 auto recurrent =
-                    mfq::metal::gated_delta_net(
+                    tyloi::metal::gated_delta_net(
                         convolved.query,
                         convolved.key,
                         convolved.value,
@@ -419,7 +419,7 @@ double benchmark_linear_attention_state(
 }
 
 double benchmark_full_attention_state(
-    const mfq::metal::Qwen35Config& config,
+    const tyloi::metal::Qwen35Config& config,
     int repetitions) {
     const int layer_count = static_cast<int>(
         std::count(
@@ -487,7 +487,7 @@ double benchmark_full_attention_state(
                 maximum_context,
                 mlx::core::float16));
         caches.back()->append_only(initial_key, initial_value);
-        auto views = mfq::metal::mlx_kv_view(caches.back()->storage(), caches.back()->position());
+        auto views = tyloi::metal::mlx_kv_view(caches.back()->storage(), caches.back()->position());
         initial_outputs.push_back(
             std::move(views.first));
         initial_outputs.push_back(
@@ -507,21 +507,21 @@ double benchmark_full_attention_state(
                     caches[
                         static_cast<std::size_t>(index)]
                         ->position();
-                query = mfq::metal::apply_rope(
+                query = tyloi::metal::apply_rope(
                     query,
                     static_cast<int>(config.rotary_dim),
                     static_cast<float>(config.rope_base),
                     offset);
-                key = mfq::metal::apply_rope(
+                key = tyloi::metal::apply_rope(
                     key,
                     static_cast<int>(config.rotary_dim),
                     static_cast<float>(config.rope_base),
                     offset);
                 auto& cache = *caches[static_cast<std::size_t>(index)];
                 cache.append_only(key, value);
-                auto views = mfq::metal::mlx_kv_view(cache.storage(), cache.position());
+                auto views = tyloi::metal::mlx_kv_view(cache.storage(), cache.position());
                 auto attended =
-                    mfq::metal::scaled_dot_product_attention(
+                    tyloi::metal::scaled_dot_product_attention(
                         query,
                         views.first,
                         views.second,
@@ -543,7 +543,7 @@ double benchmark_full_attention_state(
 }
 
 double benchmark_norm_residual_graph(
-    const mfq::metal::Qwen35Config& config,
+    const tyloi::metal::Qwen35Config& config,
     int repetitions) {
     const int hidden =
         static_cast<int>(config.hidden_size);
@@ -592,7 +592,7 @@ void profile_unused_count_graph(
     const auto build_start = Clock::now();
     for (int index = 0; index < tokens; ++index) {
         *counts =
-            mfq::metal::sample_token_counts_add(
+            tyloi::metal::sample_token_counts_add(
                 *counts,
                 token_ids);
     }
@@ -656,7 +656,7 @@ int main(int argc, char** argv) {
         const auto load_start = Clock::now();
         const MfqContainer container(argv[1]);
         const auto config =
-            mfq::metal::Qwen35Config::from_mfq(container);
+            tyloi::metal::Qwen35Config::from_mfq(container);
         auto model = MlxQwen35CausalLm::load(container);
         std::cout
             << "load_ms=" << milliseconds_since(load_start)

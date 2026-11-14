@@ -10,7 +10,7 @@
 #include "engine/backends/metal/native/kernel.h"
 #include "mlx_sampling.h"
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 class MlxKernelPreparation {
 public:
@@ -50,4 +50,4 @@ private:
     std::vector<std::function<void()>> compiled_jobs_;
 };
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

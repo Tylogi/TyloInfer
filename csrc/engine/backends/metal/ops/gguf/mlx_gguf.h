@@ -10,8 +10,9 @@
 #include "mlx_expert_route_tiles.h"
 
 namespace tyloi::metal { class ResidentAllocations; }
+namespace tyloi::source { class Source; }
 
-namespace mfq::metal {
+namespace tyloi::metal {
 class MfqContainer;
 class MlxGgufPrefillPlan;
 class MlxGgufStagedPrefill;
@@ -34,6 +35,9 @@ public:
     const MlxNativeGgufWeight* native_weight_ref() const noexcept { return native_.get(); }
     static MlxGgufWeight from_bytes(std::string_view dtype,
         std::span<const std::uint8_t> bytes, mlx::core::Shape shape);
+    static MlxGgufWeight from_bytes(std::string_view dtype,
+        std::span<const std::uint8_t> bytes, mlx::core::Shape shape,
+        const tyloi::source::Source& source, const std::string& name);
     static MlxGgufWeight from_experts(std::string_view dtype, mlx::core::Shape shape,
         const std::vector<std::int32_t>& ids, const std::vector<mlx::core::array>& packed,
         std::shared_ptr<tyloi::metal::ResidentAllocations> residency = {});
@@ -71,9 +75,14 @@ public:
     bool has_hadamard() const noexcept { return bool(rotation_); }
     bool same_rotation(const MlxGgufWeight& other) const;
     void configure_hadamard(const MfqContainer& model, const std::string& name);
+    void configure_hadamard(const tyloi::source::Source& model, const std::string& name);
+    void set_hadamard(std::int64_t block, std::vector<float> pattern);
     void prepare_grouped();
     std::size_t packed_nbytes() const noexcept;
 private:
+    static MlxGgufWeight from_bytes_impl(std::string_view dtype,
+        std::span<const std::uint8_t> bytes, mlx::core::Shape shape,
+        const tyloi::source::Source* source, const std::string& name);
     friend class MlxGgufPrefillPlan;
     friend class MlxGgufStagedPrefill;
     static MlxGgufWeight allocate_packed(std::string_view dtype, mlx::core::Shape shape,
@@ -100,4 +109,4 @@ private:
     std::size_t mixed_payload_bytes_ = 0;
     std::shared_ptr<const MlxGgufRotation> rotation_;
 };
-} // namespace mfq::metal
+} // namespace tyloi::metal

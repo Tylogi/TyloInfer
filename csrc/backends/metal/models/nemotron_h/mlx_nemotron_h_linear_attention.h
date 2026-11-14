@@ -8,7 +8,7 @@
 
 #include <mlx/mlx.h>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 struct MlxNemotronHRecurrentSnapshot {
     mlx::core::array convolution_state = mlx::core::array(0.0f);
@@ -114,4 +114,4 @@ private:
     bool speculative_pending_ = false;
 };
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

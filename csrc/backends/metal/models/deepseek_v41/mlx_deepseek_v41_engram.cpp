@@ -12,7 +12,7 @@
 #include <thread>
 #include <utility>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 
 using mlx::core::Shape;
@@ -756,4 +756,4 @@ MlxQuantizedRowStoreStats MlxDeepseekV41Engram::ssd_stats() const {
     return table_->stats();
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

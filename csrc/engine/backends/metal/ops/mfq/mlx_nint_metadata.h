@@ -1,6 +1,6 @@
 #pragma once
 
-namespace mfq::metal::detail {
+namespace tyloi::metal::detail {
 
 inline constexpr char kNintMetadataSource[] = R"METAL(
 struct MfqNintRow {

@@ -108,8 +108,7 @@ static bool session_device_matches(const ::tyloi::Tensor& value, int original, t
 
 void validate_layer_session(const Layer& layer, const LayerState& current,
         const tyloi::models::qwen4_exp::LayerSnapshot& saved, std::int64_t position) {
-    const auto device = layer.cpu_offloaded ? tyloi::Device(tyloi::kCPU)
-                                           : tyloi::Device(tyloi::kCUDA, layer.cuda_device);
+    const auto device = layer.device;
     const auto& c = layer.config;
     const auto tensor = [&](const ::tyloi::Tensor& value, int original, const std::vector<int64_t>& shape) {
         return value.defined() && value.representation<DenseTensor>() && session_device_matches(value, original, device) &&
@@ -160,8 +159,7 @@ std::size_t layer_session_growth(const Layer& layer, const LayerState& current,
 
 void stage_layer_session(const Layer& layer, LayerState& target,
         const tyloi::models::qwen4_exp::LayerSnapshot& saved, std::int64_t position) {
-    const auto device = layer.cpu_offloaded ? tyloi::Device(tyloi::kCPU)
-                                           : tyloi::Device(tyloi::kCUDA, layer.cuda_device);
+    const auto device = layer.device;
     tyloi::ops::DeviceScope scope(device);
     if (layer.qsa)
         layer.qsa->stage_session(*target.qsa, {saved.keys, saved.values, saved.index}, position, device);
@@ -208,7 +206,7 @@ std::vector<std::pair<tyloi::Device, std::size_t>> State::graph_exit_growth() co
         if (!block.qsa) continue;
         const auto bytes = block.qsa->graph_exit_growth_bytes(*layers[i]->qsa);
         if (!bytes) continue;
-        const auto device = tyloi::Device(tyloi::kCUDA, block.cuda_device);
+        const auto device = block.device;
         auto entry = std::find_if(growth.begin(), growth.end(),
             [device](const auto& value) { return value.first == device; });
         if (entry == growth.end()) growth.emplace_back(device, bytes);
@@ -252,7 +250,7 @@ std::vector<std::pair<tyloi::Device, std::size_t>> State::growth(
         for (std::size_t i = 0; i < layers.size(); ++i) {
             const auto& block = *model_.layers[i];
             const auto& layer = *layers[i];
-            const auto device = block.cpu_offloaded ? tyloi::Device(tyloi::kCPU) : tyloi::Device(tyloi::kCUDA, block.cuda_device);
+            const auto device = block.device;
             if (block.gdn) {
                 TYLOINFER_RUNTIME_CHECK(!layer.gdn.saved_conv.defined() && layer.gdn.conv.dense().defined() &&
                     layer.gdn.recurrent.dense().defined(), "GDN suffix requires committed recurrent state");
@@ -300,7 +298,7 @@ std::vector<std::pair<tyloi::Device, std::size_t>> State::growth(
         const auto& state = *layers[i];
         if ((block.gdn && state.gdn.saved_conv.defined()) || (block.ple && state.ple.saved))
             throw std::invalid_argument("pending Qwen4 speculative state");
-        const auto device = block.cpu_offloaded ? tyloi::Device(tyloi::kCPU) : tyloi::Device(tyloi::kCUDA, block.cuda_device);
+        const auto device = block.device;
         if (block.ple) {
             if (input.suffix) {
                 const auto [retained, temporary] = block.ple->context_growth_bytes(state.ple, batch, tokens);
@@ -364,7 +362,7 @@ void State::begin_speculative_suffix(std::int64_t draft_tokens) {
     for (std::size_t i = 0; i < layers.size(); ++i) {
         const auto& block = *model_.layers[i];
         const auto& layer = *layers[i];
-        MfqCudaGuard guard(block.cuda_device);
+        ::tyloi::ops::DeviceScope guard(block.device);
         if (block.gdn) {
             TYLOINFER_RUNTIME_CHECK(!layer.gdn.saved_conv.defined() && layer.gdn.conv.dense().defined() &&
                 layer.gdn.recurrent.dense().defined(), "GDN suffix requires committed recurrent state");
@@ -476,8 +474,7 @@ public:
         add_session_growth(result, tyloi::Device(tyloi::kCUDA, model_.primary_device), session_tensor_bytes(saved.positions));
         for (std::size_t i = 0; i < saved.layers.size(); ++i) {
             const auto& layer = *model_.layers[i];
-            const auto device = layer.cpu_offloaded ? tyloi::Device(tyloi::kCPU)
-                                                   : tyloi::Device(tyloi::kCUDA, layer.cuda_device);
+            const auto device = layer.device;
             add_session_growth(result, device,
                 layer_session_growth(layer, *state_.layers[i], saved.layers[i], snapshot_.cache_pos));
             add_session_growth(result, tyloi::Device(tyloi::kCPU), saved.layers[i].ple_tokens.size() * sizeof(int64_t));
@@ -568,8 +565,7 @@ public:
         for (std::size_t i = 0; i < saved.layers.size(); ++i) {
             if (!saved.lengths[i]) continue;
             const auto& layer = *model_.layers[i];
-            const auto device = layer.cpu_offloaded ? tyloi::Device(tyloi::kCPU)
-                                                   : tyloi::Device(tyloi::kCUDA, layer.cuda_device);
+            const auto device = layer.device;
             add_session_growth(result, device,
                 layer_session_growth(layer, *state_.layer_states[i], saved.layers[i], saved.lengths[i]));
             add_session_growth(result, tyloi::Device(tyloi::kCUDA, model_.primary), session_tensor_bytes(saved.positions[i]));

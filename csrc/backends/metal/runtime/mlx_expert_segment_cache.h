@@ -8,13 +8,33 @@
 #include <vector>
 
 namespace tyloi::metal { class ResidentAllocations; }
+namespace tyloi::source { class Source; }
 
-namespace mfq::metal {
+namespace tyloi::metal {
 class MfqContainer;
 
 class MlxExpertSegmentCache {
 public:
+    class Plan {
+    public:
+        struct Impl;
+        Plan(Plan&&) noexcept;
+        Plan& operator=(Plan&&) noexcept;
+        ~Plan();
+        Plan(const Plan&) = delete;
+        Plan& operator=(const Plan&) = delete;
+        std::size_t minimum() const noexcept;
+        std::size_t capacity() const noexcept;
+    private:
+        explicit Plan(std::unique_ptr<Impl>);
+        std::unique_ptr<Impl> impl_;
+        friend class MlxExpertSegmentCache;
+    };
+    static Plan plan(const tyloi::source::Source& source, std::vector<tyloi::weights::Segments> layers);
+    MlxExpertSegmentCache(Plan plan, std::size_t budget, int workers = 8, bool prefill_read_ahead = false);
     MlxExpertSegmentCache(const MfqContainer& model, std::vector<tyloi::weights::Segments> layers,
+        std::size_t budget, int workers = 8, bool prefill_read_ahead = false);
+    MlxExpertSegmentCache(const tyloi::source::Source& source, std::vector<tyloi::weights::Segments> layers,
         std::size_t budget, int workers = 8, bool prefill_read_ahead = false);
     mlx::core::array apply(std::size_t layer, const mlx::core::array& ids,
         std::size_t first_stage_fields, const std::function<mlx::core::array()>& first_stage,
@@ -22,6 +42,7 @@ public:
         const mlx::core::array* parallel = nullptr);
     const std::vector<mlx::core::array>& address_tables(std::size_t layer) const;
     const std::shared_ptr<tyloi::metal::ResidentAllocations>& residency() const noexcept;
+    void preload();
     void set_prefill_next_rows(std::size_t layer, std::size_t rows);
     std::size_t limit_bytes() const noexcept;
     std::size_t backing_bytes() const noexcept;
@@ -33,4 +54,4 @@ private:
     struct Impl;
     std::shared_ptr<Impl> impl_;
 };
-} // namespace mfq::metal
+} // namespace tyloi::metal

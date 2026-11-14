@@ -6,8 +6,8 @@
 #include <cstring>
 #include <stdexcept>
 
-namespace mfq::metal {
-void MlxAffineRowBatch::append(const mfq::MlxAffineLayout& layout, std::span<const std::uint8_t> values,
+namespace tyloi::metal {
+void MlxAffineRowBatch::append(const tyloi::MlxAffineLayout& layout, std::span<const std::uint8_t> values,
     std::span<const std::uint8_t> scales, std::span<const std::uint8_t> biases) {
     if (values_.empty()) layout_ = layout;
     if (layout_.bits != layout.bits || layout_.group_size != layout.group_size ||
@@ -48,8 +48,8 @@ mlx::core::array MlxAffineRowBatch::decode(mlx::core::Dtype output_dtype) const 
 MlxMappedAffineRows::MlxMappedAffineRows(const MfqContainer& model, const std::string& name) {
     auto prefix = model.read_range(name, 0, 8);
     prefix = model.read_range(name, 0,
-        mfq::MlxAffineLayout::prefix_size(reinterpret_cast<const std::byte*>(prefix.data()), prefix.size()));
-    layout_ = mfq::MlxAffineLayout::parse(reinterpret_cast<const std::byte*>(prefix.data()), prefix.size());
+        tyloi::MlxAffineLayout::prefix_size(reinterpret_cast<const std::byte*>(prefix.data()), prefix.size()));
+    layout_ = tyloi::MlxAffineLayout::parse(reinterpret_cast<const std::byte*>(prefix.data()), prefix.size());
     if (layout_.shape.size() != 2 || layout_.shape.back() > INT_MAX || layout_.total_bytes() != model.record(name).nbytes)
         throw std::invalid_argument("MLX mapped row geometry differs");
     values_ = model.map_record_range(name, layout_.prefix_bytes, layout_.values_bytes, true);
@@ -63,4 +63,4 @@ void MlxMappedAffineRows::append_row(std::int64_t row, MlxAffineRowBatch& batch)
         scales_.view().subspan(row * scale_stride_, scale_stride_), biases_.view().subspan(row * scale_stride_, scale_stride_));
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

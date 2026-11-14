@@ -12,7 +12,7 @@
 
 #include <mlx/primitives.h>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 
 mlx::core::array preparation_view_input(const mlx::core::array& input, std::string& key, int depth = 0) {
@@ -235,4 +235,4 @@ void MlxKernelPreparation::finish() {
     active_ = previous_;
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

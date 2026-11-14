@@ -140,14 +140,14 @@ void load_attention_mixer(Block& block, Loader& ops, const ModelConfig& config, 
     block.attention_output_gate = output_gate;
     if constexpr (requires { block.no_rope = false; })
         block.no_rope = config.positional_encoding == PositionalEncoding::none;
-    block.attn_norm = std::make_shared<tyloi::DenseTensor>(ops.dense(prefix + "attention.norm.weight"));
+    block.attn_norm = ::tyloi::Tensor(ops.dense(prefix + "attention.norm.weight"));
     const auto attention = prefix + "attention.";
     ops.qkv(block, {attention + "query.weight", attention + "key.weight", attention + "value.weight"});
     ops.output(block, attention + "output.weight");
     if (ops.has(attention + "query_norm.weight"))
-        block.q_norm = std::make_shared<tyloi::DenseTensor>(ops.dense(attention + "query_norm.weight"));
+        block.q_norm = ::tyloi::Tensor(ops.dense(attention + "query_norm.weight"));
     if (ops.has(attention + "key_norm.weight"))
-        block.k_norm = std::make_shared<tyloi::DenseTensor>(ops.dense(attention + "key_norm.weight"));
+        block.k_norm = ::tyloi::Tensor(ops.dense(attention + "key_norm.weight"));
 }
 
 template <class Block, class Loader>
@@ -174,7 +174,7 @@ struct TransformerWeightLoader {
     bool keep_quantized_router = false;
 
     bool has(const std::string& name) const;
-    ::tyloi::DenseTensor dense(const std::string& name) const;
+    ::tyloi::Tensor dense(const std::string& name) const;
     ::tyloi::Tensor router_parameter(const std::string& name) const;
     ::tyloi::Tensor linear(const std::string& name) const;
     std::vector<::tyloi::Tensor> projections(const std::vector<std::string>& names) const;
@@ -228,6 +228,5 @@ namespace tyloi::cuda {
 std::string configure_yarn(tyloi::ops::YarnScaling& yarn, bool extend, std::string definition,
                            std::string_view backbone, int64_t context);
 
-void validate_model_source(const tyloi::ModelSource& source);
 
 } // namespace tyloi::cuda

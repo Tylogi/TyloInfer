@@ -13,11 +13,10 @@
 #include <string_view>
 
 struct LayerPlacementConfig;
-struct TransformerWeightLoader;
 namespace tyloi::weights { struct Loader; }
 namespace tyloi::models { struct LoadOptions; }
 
-namespace tyloi::cuda::qwen35 {
+namespace tyloi::models::qwen35 {
 
 struct LoadOptions {
     int gpu_layers = -1;
@@ -26,6 +25,7 @@ struct LoadOptions {
     bool recurrent_transposed = false;
     bool load_layers = true;
     bool load_input_output = true;
+    tyloi::state::KvQuantization kv_quantization;
 };
 
 Model read(std::shared_ptr<const tyloi::ModelSource> source,
@@ -45,12 +45,9 @@ void load_components(Model& model, const ::tyloi::weights::Loader& weights,
 
 Layer load_layer(const ::tyloi::weights::Loader&, const Config&,
                  int index, const std::string& type, bool mirror_scalars = true,
-                 std::string_view tensor_root = "model");
+                 std::string_view tensor_root = "model", tyloi::state::KvQuantization quantization = {});
 void load_layer(Layer&, const ::tyloi::weights::Loader&, const Config&,
                 int index, const std::string& type, bool mirror_scalars = true,
-                std::string_view tensor_root = "model");
+                std::string_view tensor_root = "model", tyloi::state::KvQuantization quantization = {});
 
-std::optional<tyloi::models::qwen35::Predictor> load_predictor(
-    TransformerWeightLoader&, const Model&, tyloi::state::KvQuantization);
-
-} // namespace tyloi::cuda::qwen35
+} // namespace tyloi::models::qwen35

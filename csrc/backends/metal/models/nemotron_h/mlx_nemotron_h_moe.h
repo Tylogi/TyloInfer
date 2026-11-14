@@ -12,7 +12,7 @@
 
 #include <mlx/mlx.h>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 // One pre-normed Nemotron-H MLP block: either the latent non-gated relu-squared
 // MoE (router with e_score_correction_bias, sigmoid scores, latent in/out and
@@ -84,4 +84,4 @@ private:
     std::optional<MlxLinear> shared_down_;
 };
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "engine/ops.h"
+#include "engine/state/kv_layout.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -29,6 +30,7 @@ struct LoadOptions {
     std::size_t engram_cache_rows = 16'384;
     bool host_tokens = false;
     bool optional_components = true;
+    tyloi::state::KvQuantization kv_quantization;
 };
 
 /** Assemble the model into an owner retained by the caller. */

@@ -5,7 +5,7 @@
 #include <numeric>
 #include <stdexcept>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 using namespace mlx::core;
 thread_local MlxMtpLora* current_lora = nullptr;
@@ -296,4 +296,4 @@ std::vector<std::pair<std::string, double>> MlxMtpLora::metrics() const {
     return result;
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

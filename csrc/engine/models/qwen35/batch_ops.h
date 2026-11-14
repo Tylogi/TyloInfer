@@ -19,7 +19,7 @@
 namespace tyloi::engine { class Budget; }
 namespace tyloi::cuda::qwen35 {
 
-bool batch_graph_enabled(const Model&, const tyloi::engine::ContinuousBatchConfig&);
+bool batch_graph_enabled(const tyloi::models::qwen35::Model&, const tyloi::engine::ContinuousBatchConfig&);
 
 struct BatchRequest : tyloi::engine::BatchRequest {
     using tyloi::engine::BatchRequest::BatchRequest;
@@ -29,7 +29,7 @@ struct BatchRequest : tyloi::engine::BatchRequest {
     ::tyloi::DenseTensor prefill_ids;
     std::vector<std::unique_ptr<internal::PrefillCudaTimer>> prefill_timers;
     std::unique_ptr<Executor> executor;
-    RequestState cache;
+    tyloi::models::qwen35::RequestState cache;
 };
 
 class BatchOps {
@@ -44,8 +44,8 @@ class BatchOps {
 
     // Calls run inside the owner's CUDA device/context scope.
     // The model must outlive the operations.
-    BatchOps(const Model&, std::unique_ptr<Executor>, Collectives&,
-             Executor::Mode, Batch::Options,
+    BatchOps(const tyloi::models::qwen35::Model&, std::unique_ptr<Executor>, Collectives&,
+             Executor::Mode, tyloi::models::qwen35::Batch::Options,
              tyloi::engine::ContinuousBatchConfig);
     ~BatchOps();
     BatchOps(const BatchOps&) = delete;
@@ -74,11 +74,11 @@ class BatchOps {
     std::vector<const void*> decode_state_addresses();
     ::tyloi::Tensor logits_from_last_hidden(::tyloi::Tensor hidden, const Executor::Mode& mode);
 
-    const Model& model_;
+    const tyloi::models::qwen35::Model& model_;
     Collectives& collectives_;
     const Executor::Mode mode_;
     std::unique_ptr<Executor> executor_;
-    Batch state_;
+    tyloi::models::qwen35::Batch state_;
     tyloi::engine::Budget* budget_ = nullptr;
     const tyloi::engine::ContinuousBatchConfig config_;
     int32_t max_sequences_ = 0;
@@ -101,7 +101,7 @@ namespace tyloi::cuda {
 
 // serial is startup-only: release idle preallocated KV; running independent serial state is omitted.
 std::unique_ptr<tyloi::engine::Batch> make_batch(
-    const qwen35::Model& model, qwen35::State* serial,
+    const tyloi::models::qwen35::Model& model, tyloi::models::qwen35::State* serial,
     std::unique_ptr<Executor> executor, Collectives& copies, Executor::Mode mode,
     tyloi::engine::ContinuousBatchConfig config,
     std::int64_t chunk_size, bool preallocate, bool cpu_offload, int cached_slots);

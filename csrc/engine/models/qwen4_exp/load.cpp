@@ -39,7 +39,7 @@ struct LayerLoader : tyloi::weights::Loader {
                   ::tyloi::Tensor injection, const Config& c, bool final) const {
         return tyloi::ops::Residual(
             {std::move(norm), std::move(down), std::move(up), std::move(injection)},
-            {c.hidden, c.streams, c.eps, final, tyloi::Device(tyloi::kCUDA, placement.device)});
+            {c.hidden, c.streams, c.eps, final, placement.target});
     }
     static auto final_mixer(tyloi::ops::Residual value) {
         return std::make_unique<tyloi::ops::Residual>(std::move(value));
@@ -80,18 +80,18 @@ struct LayerLoader : tyloi::weights::Loader {
     }
     auto gdn(tyloi::ops::GdnWeights weights, const Config& c) const {
         weights.input_projection = tyloi::weights::pack_projections(
-            std::move(weights.input_projection), options.grouped, placement.cpu);
+            std::move(weights.input_projection), options.grouped, placement.target.is_cpu());
         return std::make_unique<tyloi::ops::Gdn>(std::move(weights), c.key_heads, c.value_heads,
-            c.linear_width, c.kernel, c.eps, c.silu_gate, tyloi::Device(tyloi::kCUDA, placement.device));
+            c.linear_width, c.kernel, c.eps, c.silu_gate, placement.target);
     }
     auto qsa(tyloi::ops::QsaWeights weights, const Config& c) const {
         weights.input_projection = tyloi::weights::pack_projections(
-            std::move(weights.input_projection), options.grouped, placement.cpu);
+            std::move(weights.input_projection), options.grouped, placement.target.is_cpu());
         for (auto* norm : {&weights.query_norm, &weights.key_norm, &weights.index_query_norm, &weights.index_key_norm})
             if (norm->defined()) *norm = tyloi::ops::contiguous(tyloi::ops::cast(*norm, tyloi::kFloat32));
         tyloi::ops::QsaConfig geometry{c.heads, c.kv_heads, c.width, c.index_heads, c.index_width,
             c.pool, c.budget, c.maximum, c.eps, c.rotary, c.rope_base, c.sections, c.interleaved,
-            yarn, tyloi::Device(tyloi::kCUDA, placement.device)};
+            yarn, placement.target};
         return std::make_unique<tyloi::ops::Qsa>(std::move(weights), std::move(geometry));
     }
     auto moe(std::vector<tyloi::Tensor> gate_up, tyloi::Tensor down, tyloi::Tensor router,
@@ -116,7 +116,7 @@ struct LayerLoader : tyloi::weights::Loader {
         f.moe_layer = layer;
         f.qwen_hidden = c.hidden;
         f.qwen_moe_width = c.moe_width;
-        f.target = tyloi::Device(tyloi::kCUDA, placement.device);
+        f.target = placement.target;
         return tyloi::ops::qwen4_ffn_weights(std::move(f));
     }
     auto embedding(const std::string &name) const {
@@ -145,8 +145,7 @@ struct LayerLoader : tyloi::weights::Loader {
 
 std::unique_ptr<Layer> LayerLoader::layer(const Config &c, int layer, bool predictor) {
     auto result = std::make_unique<Layer>();
-    result->cuda_device = placement.device;
-    result->cpu_offloaded = placement.cpu;
+    result->device = placement.target;
     LayerLoader loader{*this, yarn};
     loader.role = "qwen4_exp";
     tyloi::models::qwen4_exp::load_layer(*result, loader, c, layer, predictor);
@@ -162,7 +161,7 @@ std::optional<Predictor> Predictor::load_if_present(const tyloi::weights::Loader
     result.embedding = std::move(embedding);
     result.output = std::move(output);
     result.softcap = softcap;
-    result.primary = weights.placement.device;
+    result.primary = weights.placement.target.index;
     LayerLoader loader{weights, options.yarn};
     loader.role = "qwen4_exp";
     if (!tyloi::models::qwen4_exp::load_predictor(result, loader, main))
@@ -176,7 +175,7 @@ void read(Model& model, std::shared_ptr<const tyloi::ModelSource> model_source,
           std::string_view definition, std::int64_t context_size) {
     model.source = std::move(model_source);
     const auto& source = *model.source;
-    validate_model_source(source);
+    ::tyloi::models::validate_model_source(source);
     model.graph = tyloi::models::graph(source);
     model.plan = ::tyloi::models::model_plan(model.graph);
     require_model(Model::accepts_backbone(model.graph.backbone),
@@ -231,7 +230,7 @@ void load(Model& model, const tyloi::weights::Loader& tensors, LayerPlacementCon
             std::cerr << "loading layer " << layer << ' '
                       << model.metadata.layer_types.at(static_cast<std::size_t>(layer)) << ' '
                       << (cpu ? "CPU" : "CUDA") << std::endl;
-            LayerLoader placed{tensors.for_layer(device, cpu), options.yarn};
+            LayerLoader placed{tensors.for_layer(cpu ? ::tyloi::Device(::tyloi::kCPU) : ::tyloi::Device(::tyloi::kCUDA, device)), options.yarn};
             auto block = placed.layer(model.config, layer, false);
             model.layers.push_back(std::move(block));
         }

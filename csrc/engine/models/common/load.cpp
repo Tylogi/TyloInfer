@@ -1,11 +1,11 @@
 #include "engine/models/source.h"
 #include "engine/ops.h"
 #include "engine/models/common/load.h"
+#include "engine/models/common/important_neurons.h"
 #include "engine/models/common/mlp.h"
 #include "engine/models/common/attention.h"
 #include "engine/backends/cuda/ops/ffn/ffn.h"
 #include "engine/models/source/model_graph.h"
-#include "engine/backends/cuda/native/env.h"
 #include "engine/weights/moe/load.h"
 #include "engine/weights/loader.h"
 #include "engine/weights/quant.h"
@@ -19,156 +19,17 @@
 std::vector<std::int64_t> TransformerWeightLoader::shape(const ::tyloi::DenseTensor& value) { return value.sizes().vec(); }
 int64_t TransformerWeightLoader::elements(const ::tyloi::DenseTensor& value) { return value.numel(); }
 
-namespace {
-
-void copy_important_neuron_settings(const tyloi::cuda::Ffn& low, tyloi::cuda::Ffn& high) {
-    high.geglu = low.geglu;
-    high.swiglu_limit = low.swiglu_limit;
-}
-
-void copy_important_neuron_settings(const tyloi::models::Mlp& low, tyloi::models::Mlp& high) {
-    high.swiglu_limit = low.swiglu_limit;
-}
-
-template <class Ffn>
-void load_important_branch(const tyloi::weights::Loader& weights,
-    int64_t hidden_size, int64_t intermediate_size, Ffn& f,
-    bool routed, const std::string& down_name,
-    const std::string& gate_name, const std::string& up_name) {
-    const std::string down_high = down_name + ".in_high";
-    const std::string gate_high = gate_name + ".in_high";
-    const std::string up_high = up_name + ".in_high";
-    const bool has_down = tyloi::has_tensor(weights.source, down_high);
-    const bool has_gate = tyloi::has_tensor(weights.source, gate_high);
-    const bool has_up = tyloi::has_tensor(weights.source, up_high);
-    if (!has_down && !has_gate && !has_up) {
-        return;
-    }
-    if (!has_down || !has_gate || !has_up) {
-        throw std::runtime_error(
-            "important-neuron FFN requires matching gate/up/down .in_high records");
-    }
-    if (routed) {
-        throw std::runtime_error("important-neuron records are unsupported on routed MoE FFNs");
-    }
-
-    auto high = std::make_unique<Ffn>();
-    high->down = weights.weight(down_high, TensorParallelAxis::Input);
-    high->gate_up = weights.gate_up({gate_high, up_high}, high->down);
-    copy_important_neuron_settings(f, *high);
-
-    if (f.gate_up.size() != 2 || high->gate_up.size() != 2 ||
-        f.gate_up[0].size(0) != f.gate_up[1].size(0) || high->gate_up[0].size(0) != high->gate_up[1].size(0) ||
-        f.down.size(0) != hidden_size || high->down.size(0) != hidden_size ||
-        f.down.size(1) != f.gate_up[0].size(0) ||
-        high->down.size(1) != high->gate_up[0].size(0) ||
-        f.down.size(1) + high->down.size(1) != intermediate_size) {
-        throw std::runtime_error("important-neuron FFN tensor shapes disagree with model config");
-    }
-    f.important_neurons = std::move(high);
-}
-
-} // namespace
-
 void load_important_neuron_branch(const tyloi::weights::Loader& weights,
                                   int64_t hidden_size, int64_t intermediate_size, tyloi::cuda::Ffn& f,
                                   const std::string& down_name, const std::string& gate_name,
                                   const std::string& up_name) {
-    load_important_branch(weights, hidden_size, intermediate_size, f, f.is_moe,
+    tyloi::models::load_important_branch(weights, hidden_size, intermediate_size, f, f.is_moe,
         down_name, gate_name, up_name);
 }
 
-::tyloi::DenseTensor TransformerWeightLoader::dense(const std::string& name) const {
-    return weights.tensor(name).dense();
-}
-::tyloi::Tensor TransformerWeightLoader::linear(const std::string& name) const {
-    return weights.weight(name);
-}
-bool TransformerWeightLoader::has(const std::string& name) const { return tyloi::has_tensor(weights.source, name); }
-::tyloi::Tensor TransformerWeightLoader::router_parameter(const std::string& name) const {
-    if(keep_quantized_router && name.ends_with("router.weight") && tyloi::require_tensor(weights.source,name).dtype=="TQ")
-        return linear(name);
-    auto value = weights.tensor(name);
-    auto converted = tyloi::ops::cast(value, ::tyloi::kFloat32);
-    return tyloi::ops::contiguous(converted);
-}
-std::vector<::tyloi::Tensor> TransformerWeightLoader::projections(const std::vector<std::string>& names) const {
-    return weights.group(names);
-}
-std::vector<::tyloi::Tensor> TransformerWeightLoader::gate_up(const std::vector<std::string>& names,
-                                                 const ::tyloi::Tensor& down) const {
-    return weights.gate_up(names, down, shared_gate_up_compatible_prefix,
-                              preserve_projection_boundaries);
-}
-void TransformerWeightLoader::qkv(tyloi::models::FullAttention& block, const std::vector<std::string>& names) const {
-    const bool mirror_kv = block.attention_output_gate &&
-        tyloi::cuda::env_flag("TYLOINFER_TP_MIRROR_QWEN35_ATTENTION_KV", true) &&
-        is_quant_dtype(tyloi::require_tensor(weights.source, names[1]).dtype) &&
-        is_quant_dtype(tyloi::require_tensor(weights.source, names[2]).dtype);
-    if (mirror_kv) {
-        block.split_q_kv_projections = true;
-        block.q_projection = weights.weight(names[0]);
-        block.k_projection = weights.weight(names[1], TensorParallelAxis::Mirrored);
-        block.v_projection = weights.weight(names[2], TensorParallelAxis::Mirrored);
-    } else {
-        block.qkv = weights.group(names, 2, nullptr, preserve_projection_boundaries);
-    }
-}
-void TransformerWeightLoader::output(tyloi::models::FullAttention& block, const std::string& name) const {
-    block.o = weights.weight(name);
-}
 void TransformerWeightLoader::important_neurons(int64_t hidden, int64_t intermediate, tyloi::cuda::Ffn& ffn,
     const std::string& down, const std::string& gate, const std::string& up) const {
     load_important_neuron_branch(weights, hidden, intermediate, ffn, down, gate, up);
-}
-void TransformerWeightLoader::important_neurons(int64_t hidden, int64_t intermediate,
-    tyloi::models::Mlp& ffn, const std::string& down,
-    const std::string& gate, const std::string& up) const {
-    load_important_branch(weights, hidden, intermediate, ffn, false,
-        down, gate, up);
-}
-::tyloi::Tensor TransformerWeightLoader::expert(tyloi::models::ExpertProjection projection,
-                                     const std::string& name, int layer) const {
-    using Role = tyloi::models::ExpertProjection;
-    const auto& record = tyloi::require_tensor(weights.source, name);
-    const char* role = nullptr;
-    switch (projection) {
-        case Role::gate: role = "gate"; break;
-        case Role::up: role = "up"; break;
-        case Role::gate_up: role = "gate_up"; break;
-        case Role::down: role = "down"; break;
-    }
-    if(record.dtype=="TQ") {
-        if(projection==Role::gate_up)
-            throw std::invalid_argument("TQ MoE stores separate Gate, Up and Down tensors: "+name);
-        return weights.experts(name, true, layer, role);
-    }
-    if (record.dtype == "F32" || record.dtype == "F16" || record.dtype == "BF16") {
-        // Source-precision banks stay dense instead of entering an MFE cohort.
-        if (cpu_offloaded)
-            throw std::runtime_error(
-                "CPU-offloaded MoE cannot materialize a dense expert bank at layer " +
-                std::to_string(layer));
-        if (projection == Role::gate_up)
-            throw std::runtime_error(
-                "dense fused Gate/Up expert banks require separate Gate and Up records at layer " +
-                std::to_string(layer));
-        auto bank = weights.native(name);
-        if (bank.dim() != 3)
-            throw std::runtime_error(
-                "dense routed expert tensor must be [experts,out,in]: " + name);
-        return bank;
-    }
-
-#if TYLOINFER_ENABLE_MFQ_COMPAT
-    if (cpu_offloaded)
-        return load_mfe_cpu_offloaded(weights.source, name);
-    else
-        return weights.experts(name, true, layer, role);
-
-#else
-    throw std::runtime_error("Legacy MFQ inference requires a compatibility build");
-#endif
 }
 void TransformerWeightLoader::experts(tyloi::cuda::Ffn& ffn, tyloi::models::ExpertProjection projection,
                                      const std::string& name, int layer) const {
@@ -179,15 +40,6 @@ void TransformerWeightLoader::experts(tyloi::cuda::Ffn& ffn, tyloi::models::Expe
         case tyloi::models::ExpertProjection::gate_up: ffn.moe_gate_up = std::move(weight); break;
         case tyloi::models::ExpertProjection::down: ffn.moe_down = std::move(weight); break;
     }
-}
-::tyloi::Tensor TransformerWeightLoader::headwise(const std::string& name) const {
-#if TYLOINFER_ENABLE_MFQ_COMPAT
-
-    return weights.experts(name);
-
-#else
-    throw std::runtime_error("Legacy MFQ inference requires a compatibility build");
-#endif
 }
 tyloi::cuda::Ffn load_moe_weights(const tyloi::weights::Loader& weights,
                      std::string_view prefix, const MoeWeightLoadOptions& options) {
@@ -241,20 +93,7 @@ std::string configure_yarn(tyloi::ops::YarnScaling& yarn, bool extend, std::stri
     return definition;
 }
 
-void validate_model_source(const tyloi::ModelSource& source) {
-    if (source.find_tensor("model.token_embedding.weight") == nullptr) {
-        throw std::runtime_error(
-            "canonical text tensor inventory has no token embedding");
-    }
-    for (const auto& component : tyloi::models::graph(source).components) {
-        if (component.tensor_root != "runtime" &&
-                !has_tensor_prefix(source, component.tensor_root)) {
-            throw std::runtime_error(
-                "model graph declares " + component.kind +
-                " but its canonical tensor inventory is missing");
-        }
-    }
-}
+
 
 } // namespace tyloi::cuda
 

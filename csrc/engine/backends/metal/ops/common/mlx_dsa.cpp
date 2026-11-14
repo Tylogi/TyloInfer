@@ -17,7 +17,7 @@
 #include <utility>
 #include <vector>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 
 using mlx::core::CompileOptions;
@@ -1390,4 +1390,4 @@ array mlx_dsa_sparse_decode_attention(
         scale);
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

@@ -343,7 +343,7 @@ function(mfq_configure_cuda_backend_target target)
 endfunction()
 
 set(TYLOINFER_CUDA_OP_SOURCES
-    ${PROJECT_SOURCE_DIR}/engine/ops.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/dispatch.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/tensor.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/profile.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/compact.cpp

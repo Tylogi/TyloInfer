@@ -2,7 +2,7 @@
 
 #include "engine/models/source/model_graph.h"
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 class MfqContainer;
 
@@ -17,4 +17,4 @@ void install_legacy_tensor_compatibility(MfqContainer& model);
 // legacy architecture strings never leak into backend dispatch.
 tyloi::ModelGraph effective_model_graph(const MfqContainer& model);
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

@@ -26,7 +26,7 @@
 #include <utility>
 #include <vector>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 
 using mlx::core::CompileOptions;
@@ -1690,4 +1690,4 @@ array mlx_sparse_circular_mla_decode_attention(
     return std::move(outputs.front());
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

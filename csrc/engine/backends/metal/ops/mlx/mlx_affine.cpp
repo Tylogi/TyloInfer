@@ -11,7 +11,7 @@
 #include <climits>
 #include <stdexcept>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 using namespace mlx::core;
 std::string dtype_name(Dtype dtype) {
@@ -25,11 +25,11 @@ void check_input(const array& input, int width) {
         (input.dtype() != float16 && input.dtype() != bfloat16 && input.dtype() != float32))
         throw std::invalid_argument("MLX affine projection input mismatch");
 }
-mfq::MlxAffineLayout read_layout(const MfqContainer& model, const std::string& name) {
+tyloi::MlxAffineLayout read_layout(const MfqContainer& model, const std::string& name) {
     auto prefix = model.read_range(name, 0, 8);
-    const auto size = mfq::MlxAffineLayout::prefix_size(reinterpret_cast<const std::byte*>(prefix.data()), prefix.size());
+    const auto size = tyloi::MlxAffineLayout::prefix_size(reinterpret_cast<const std::byte*>(prefix.data()), prefix.size());
     prefix = model.read_range(name, 0, size);
-    const auto layout = mfq::MlxAffineLayout::parse(reinterpret_cast<const std::byte*>(prefix.data()), prefix.size());
+    const auto layout = tyloi::MlxAffineLayout::parse(reinterpret_cast<const std::byte*>(prefix.data()), prefix.size());
     if (layout.total_bytes() != model.record(name).nbytes)
         throw std::invalid_argument("MLX affine tensor payload length mismatch");
     return layout;
@@ -49,7 +49,7 @@ MlxAffineWeight MlxAffineWeight::from_arrays(array values, array scales, array b
     if (values.dtype() != uint32 || (values.ndim() != 2 && values.ndim() != 3) || bits < 1 ||
         std::int64_t(values.shape(-1)) * 32 % bits || biases.dtype() != scales.dtype())
         throw std::invalid_argument("invalid MLX affine packed/scales/biases arrays");
-    mfq::MlxAffineLayout layout;
+    tyloi::MlxAffineLayout layout;
     layout.shape.assign(values.shape().begin(), values.shape().end());
     layout.shape.back() = layout.shape.back() * 32 / bits;
     layout.bits = bits; layout.group_size = group_size; layout.scale_dtype = dtype_name(scales.dtype());
@@ -210,4 +210,4 @@ array MlxAffineWeight::routed_matmul(const array& input, const MlxAffineRoutePla
     return reshape(result, plan.order_ ? Shape{plan.tokens_ * plan.routes_, 1, output_size()} : shape);
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

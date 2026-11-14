@@ -22,7 +22,7 @@ std::size_t pool_page() {
 
 namespace {
 struct PoolBuffer {
-    std::shared_ptr<mfq::metal::detail::MlxPinnedPoolStorage> storage;
+    std::shared_ptr<tyloi::metal::detail::MlxPinnedPoolStorage> storage;
     allocator::Buffer buffer{nullptr};
     ~PoolBuffer() { if (buffer.ptr()) allocator::release(buffer); }
 };
@@ -60,7 +60,7 @@ void TqPool::allocate_storage(std::size_t bytes) {
     capacity = bytes / pool_page() * pool_page();
     if (!capacity || capacity / 4096 > std::size_t(INT_MAX))
         throw std::invalid_argument("invalid TQ expert pool capacity");
-    storage = std::make_shared<mfq::metal::detail::MlxPinnedPoolStorage>();
+    storage = std::make_shared<tyloi::metal::detail::MlxPinnedPoolStorage>();
     storage->bytes = capacity;
     storage->data = mmap(nullptr, capacity, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (storage->data == MAP_FAILED) throw std::bad_alloc();
@@ -81,12 +81,12 @@ void TqPool::bind_storage(std::size_t bytes) {
         auto view=std::make_shared<PoolBuffer>();view->storage=storage;
         view->buffer=allocator::make_buffer(static_cast<std::byte*>(storage->data)+part*chunk_bytes,length);
         if(!view->buffer.ptr())throw std::runtime_error("cannot register TQ expert chunk with Metal");
-        chunks.push_back(mfq::metal::mlx_buffer_view(view->buffer,Shape{int(length/4096),1024},uint32,view));
+        chunks.push_back(tyloi::metal::mlx_buffer_view(view->buffer,Shape{int(length/4096),1024},uint32,view));
     }
     lifetime=std::make_shared<TqPoolLifetime>();lifetime->chunks=chunks;
     const std::array<std::uint64_t, 8> handle{};
     lifetime->handle = array(handle.data(), Shape{8}, uint64);
-    words = mfq::metal::mlx_buffer_view(lifetime->handle.buffer(), lifetime->handle.shape(), uint64, lifetime);
+    words = tyloi::metal::mlx_buffer_view(lifetime->handle.buffer(), lifetime->handle.shape(), uint64, lifetime);
     if (!storage->pin_prefix(bytes)) {
         if (storage->locked_bytes > bytes)
             throw std::runtime_error("cannot release TQ expert page locks");

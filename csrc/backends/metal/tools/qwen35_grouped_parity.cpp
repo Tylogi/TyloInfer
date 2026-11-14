@@ -20,10 +20,10 @@ namespace {
 
 using mlx::core::Shape;
 using mlx::core::array;
-using mfq::metal::MfqContainer;
-using mfq::metal::MlxGroupedLinear;
-using mfq::metal::MlxGroupedLinearWeightRef;
-using mfq::metal::MlxLinear;
+using tyloi::metal::MfqContainer;
+using tyloi::metal::MlxGroupedLinear;
+using tyloi::metal::MlxGroupedLinearWeightRef;
+using tyloi::metal::MlxLinear;
 
 array make_input(int width, int rows, float scale) {
     std::vector<float> values(
@@ -146,7 +146,7 @@ int main(int argc, char** argv) {
     }
     try {
         MfqContainer model(argv[1]);
-        mfq::metal::install_legacy_tensor_compatibility(model);
+        tyloi::metal::install_legacy_tensor_compatibility(model);
         const int block = argc >= 3 ? std::stoi(argv[2]) : 11;
         const int hidden = 1024;
         const std::vector<int> rows_list{1, 2, 3, 4, 6, 8};

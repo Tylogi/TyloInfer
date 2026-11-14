@@ -9,7 +9,7 @@
 #include <string>
 #include <utility>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 class MfqContainer;
 struct MlxNativeGgufWeight;
 
@@ -62,4 +62,4 @@ private:
     friend class MlxAffineStaged;
 };
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

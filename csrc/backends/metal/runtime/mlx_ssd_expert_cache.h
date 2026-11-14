@@ -12,7 +12,7 @@
 #include <string>
 #include <vector>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 // Shared policy switch for exact device-side expert route transactions.
 // Callers still apply shape and route-confidence eligibility themselves.
@@ -316,4 +316,4 @@ private:
     friend class MlxSsdExpertPageTableSnapshot;
 };
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

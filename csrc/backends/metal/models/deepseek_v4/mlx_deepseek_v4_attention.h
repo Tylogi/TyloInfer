@@ -14,7 +14,7 @@
 
 #include <mlx/mlx.h>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 mlx::core::array deepseek_v4_unweighted_rms(
     const mlx::core::array& value,
@@ -310,4 +310,4 @@ private:
     std::shared_ptr<Impl> impl_;
 };
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

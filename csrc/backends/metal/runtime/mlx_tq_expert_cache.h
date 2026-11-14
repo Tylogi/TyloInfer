@@ -10,7 +10,8 @@
 #include <string>
 #include <vector>
 
-namespace mfq::metal {
+namespace tyloi::source { class Source; }
+namespace tyloi::metal {
 
 struct MlxTqExpertWeights {
     MlxTqWeight gate, up, down;
@@ -34,7 +35,27 @@ struct MlxTqExpertCacheStats {
 
 class MlxTqExpertCache {
 public:
+    class Plan {
+    public:
+        ~Plan();
+        Plan(Plan&&) noexcept;
+        Plan& operator=(Plan&&) noexcept;
+        Plan(const Plan&) = delete;
+        Plan& operator=(const Plan&) = delete;
+        std::size_t minimum() const noexcept;
+        std::size_t maximum() const noexcept;
+    private:
+        friend class MlxTqExpertCache;
+        struct Data;
+        explicit Plan(std::unique_ptr<Data> data);
+        std::unique_ptr<Data> data_;
+    };
+    static Plan plan(const source::Source& source, const std::vector<std::string>& prefixes,
+        int io_workers = 8);
+    MlxTqExpertCache(Plan plan, std::size_t budget);
     MlxTqExpertCache(const MfqContainer& model, const std::vector<std::string>& prefixes,
+        std::size_t budget, int io_workers = 8);
+    MlxTqExpertCache(const source::Source& model, const std::vector<std::string>& prefixes,
         std::size_t budget, int io_workers = 8);
     mlx::core::array apply(std::size_t layer, const mlx::core::array& ids,
         const std::function<mlx::core::array(const MlxTqExpertWeights&)>& operation);
@@ -66,4 +87,4 @@ private:
     std::shared_ptr<Impl> impl_;
 };
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

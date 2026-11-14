@@ -165,7 +165,7 @@ array compact_values(
 
 } // namespace
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 void MlxMtpHistoryBuffer::append(
     const array& hidden, std::span<const std::int32_t> token_ids) {
@@ -567,7 +567,7 @@ array mtp_sampling_row(
 }
 
 using MtpDraftStep = std::variant<MlxMtpTargetRequest, PreparedMtpDraft>;
-mfq::StepSequence<MtpDraftStep> prepare_mtp_draft(
+tyloi::StepSequence<MtpDraftStep> prepare_mtp_draft(
     const MlxMtpDraftContext& context,
     const MlxMtpEngineRequest& request,
     const MlxMtpEngineCallbacks& callbacks,
@@ -902,7 +902,7 @@ MlxMtpGeneration mlx_mtp_generation(
         : std::min(
               callbacks.predictor.maximum_depth,
               std::clamp(request.sampling.mtp_max_draft_tokens, 1, 5));
-    mfq::engine::mtp::GenerationPolicy<MlxDsparkDepthController> depth_controller(
+    tyloi::engine::mtp::GenerationPolicy<MlxDsparkDepthController> depth_controller(
         maximum_depth, callbacks.predictor.dspark, callbacks.policy_state);
     const auto desired_depth = [&] {
         return callbacks.draft_depth ? std::clamp(callbacks.draft_depth(), 0, maximum_depth)
@@ -1508,4 +1508,4 @@ array verify_stochastic_mtp_top_k_chain_device(
     return outputs.front();
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

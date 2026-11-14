@@ -17,8 +17,8 @@
 #include <stdexcept>
 
 int main(int argc, char** argv) {
-    using mfq::metal::MlxDeepseekV4CausalLm;
-    using mfq::metal::MfqContainer;
+    using tyloi::metal::MlxDeepseekV4CausalLm;
+    using tyloi::metal::MfqContainer;
     using mlx::core::Shape;
     using mlx::core::array;
 
@@ -59,21 +59,21 @@ int main(int argc, char** argv) {
             const std::array<std::int32_t, 1> ids{current};
             const auto before_stats = model.ssd_expert_cache_stats();
             const int profile_skip =
-                mfq::metal::detail::component_profile_skip_steps();
+                tyloi::metal::detail::component_profile_skip_steps();
             const bool profile_components =
-                mfq::metal::detail::component_profile_requested() &&
+                tyloi::metal::detail::component_profile_requested() &&
                 step >= profile_skip &&
                 step - profile_skip <
-                    mfq::metal::detail::component_profile_steps();
-            mfq::metal::detail::ComponentProfile component_profile;
-            mfq::metal::detail::ScopedComponentProfile profile_scope(
+                    tyloi::metal::detail::component_profile_steps();
+            tyloi::metal::detail::ComponentProfile component_profile;
+            tyloi::metal::detail::ScopedComponentProfile profile_scope(
                 profile_components ? &component_profile : nullptr);
             const auto forward_begin = std::chrono::steady_clock::now();
             auto logits = step == 0
                 ? model.forward(array(ids.data(), Shape{1, 1}), false)
                 : model.decode(array(ids.data(), Shape{1, 1}));
             if (profile_components) {
-                mfq::metal::detail::profile_eval("model.output", logits);
+                tyloi::metal::detail::profile_eval("model.output", logits);
             } else {
                 mlx::core::eval(logits);
             }
@@ -253,21 +253,21 @@ int main(int argc, char** argv) {
                 const std::array<std::int32_t, 1> ids{
                     replay_inputs[static_cast<std::size_t>(step)]};
                 const int profile_skip =
-                    mfq::metal::detail::component_profile_skip_steps();
+                    tyloi::metal::detail::component_profile_skip_steps();
                 const bool profile_components =
-                    mfq::metal::detail::component_profile_requested() &&
+                    tyloi::metal::detail::component_profile_requested() &&
                     step >= profile_skip &&
                     step - profile_skip <
-                        mfq::metal::detail::component_profile_steps();
-                mfq::metal::detail::ComponentProfile component_profile;
-                mfq::metal::detail::ScopedComponentProfile profile_scope(
+                        tyloi::metal::detail::component_profile_steps();
+                tyloi::metal::detail::ComponentProfile component_profile;
+                tyloi::metal::detail::ScopedComponentProfile profile_scope(
                     profile_components ? &component_profile : nullptr);
                 const auto started = std::chrono::steady_clock::now();
                 auto logits = step == 0
                     ? model.forward(array(ids.data(), Shape{1, 1}), false)
                     : model.decode(array(ids.data(), Shape{1, 1}));
                 if (profile_components) {
-                    mfq::metal::detail::profile_eval(
+                    tyloi::metal::detail::profile_eval(
                         "model.output",
                         logits);
                 } else {

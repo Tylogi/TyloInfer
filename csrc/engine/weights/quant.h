@@ -4,6 +4,7 @@
 #include "engine/weights/encoding/mx_blob.h"
 #include "engine/weights/mx.h"
 #include "engine/weights/tensor_parallel.h"
+#include "engine/weights/source/read.h"
 
 #if TYLOINFER_ENABLE_MFQ_COMPAT
 #include "engine/weights/encoding/quant/nint_blob.h"
@@ -17,8 +18,6 @@
 #include <string>
 #include <string_view>
 #include <vector>
-
-bool is_quant_dtype(const std::string& dtype);
 
 tyloi::mxfp4::Data select_mxfp4_cpu_rows(
     const tyloi::mxfp4::Data& source, const std::vector<int64_t>& rows);

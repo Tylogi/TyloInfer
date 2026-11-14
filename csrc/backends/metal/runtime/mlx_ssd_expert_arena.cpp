@@ -11,7 +11,7 @@
 #include <string>
 #include <utility>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 
 using mlx::core::Shape;
@@ -362,4 +362,4 @@ MlxMxWeight MlxMxfp4SsdExpertArena::expert_weight(
     throw std::invalid_argument("MXFP4 projection must be '1', '2', or '3'");
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

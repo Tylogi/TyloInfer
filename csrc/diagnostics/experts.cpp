@@ -67,7 +67,7 @@ int run_expert_parallel_moe_check(
         tensor_name.find("gate_up") != std::string::npos
         ? "gate_up" : "diagnostic";
     auto full_loader = loader;
-    full_loader.placement.device = saved.primary_device();
+    full_loader.placement.target = tyloi::Device(tyloi::kCUDA, saved.primary_device());
     full_loader.placement.tensor = {};
     full_loader.placement.experts = {};
     full_loader.placement.experts.devices = {saved.primary_device()};

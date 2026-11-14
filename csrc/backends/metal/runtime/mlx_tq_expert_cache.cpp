@@ -1,8 +1,11 @@
 #include "engine/weights/lru.h"
+#include "engine/weights/encoding/tq_rows.h"
+#include "engine/weights/tq/source.h"
 #include "engine/backends/metal/native/memory.h"
 #include "engine/backends/metal/native/indirect.h"
 #include "mlx_tq_expert_cache.h"
 #include "engine/backends/metal/native/tensor/tensor.h"
+#include "engine/backends/metal/native/allocation.h"
 #include "mlx_tq_rows.h"
 #include "mlx_moe_ops.h"
 #include "mfq_container.h"
@@ -17,8 +20,10 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <climits>
+#include <cmath>
 #include <cstring>
 #include <future>
 #include <mutex>
@@ -27,7 +32,7 @@
 #include <stdexcept>
 #include <unordered_set>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 using namespace mlx::core;
 using Clock = std::chrono::steady_clock;
@@ -35,6 +40,160 @@ using Clock = std::chrono::steady_clock;
 std::size_t aligned(std::size_t size) {
     if (size > SIZE_MAX - 255) throw std::overflow_error("TQ cache allocation is too large");
     return (size + 255) / 256 * 256;
+}
+
+std::size_t add_bytes(std::size_t left, std::size_t right) {
+    if (left > SIZE_MAX - right) throw std::overflow_error("TQ cache allocation is too large");
+    return left + right;
+}
+
+std::size_t round_page(std::size_t bytes, std::size_t page) {
+    return add_bytes(bytes, page - 1) / page * page;
+}
+
+struct SourceBank {
+    std::string name;
+    source::Source::TensorReader reader;
+    source::Source::TensorBatchReader batch_reader;
+    std::vector<MlxMappedTqRows::PackedRows> ranges;
+    std::vector<std::uint64_t> descriptors;
+    std::vector<std::uint8_t> scales;
+    int rows = 0, width = 0, input = 0, experts = 0, group_size = 0, columns = 0;
+    Dtype scale_dtype = uint8;
+    std::size_t nbytes = 0;
+};
+
+void source_metadata(SourceBank& bank,
+        const source::Source::TensorReader& read, std::size_t size,
+        const std::vector<std::int64_t>& shape) {
+    if (shape.size() != 3 || std::any_of(shape.begin(), shape.end(),
+            [](auto value) { return value <= 0 || value > INT_MAX; }) ||
+        shape[0] > INT_MAX / shape[1])
+        throw std::invalid_argument("invalid TQ expert bank geometry");
+    if (size < 64) throw std::invalid_argument("truncated TQ expert bank");
+    std::array<std::uint8_t, 64> header{};
+    read(0, reinterpret_cast<std::byte*>(header.data()), header.size());
+    const bool container = !std::memcmp(header.data(), "RTQEXP01", 8);
+    std::vector<std::pair<std::size_t, std::size_t>> segments;
+    if (container) {
+        const auto count = TqLayout::integer(header.data() + 12, 4);
+        const auto outputs = TqLayout::integer(header.data() + 16, 4);
+        const auto width = TqLayout::integer(header.data() + 20, 4);
+        if (TqLayout::integer(header.data() + 8, 4) != 1 || count != std::uint64_t(shape[0]) ||
+            outputs != std::uint64_t(shape[1]) || width != std::uint64_t(shape[2]) ||
+            count > (size - 64) / 16 || TqLayout::integer(header.data() + 24, 4) != 16 ||
+            TqLayout::integer(header.data() + 28, 4) ||
+            std::any_of(header.begin() + 32, header.end(), [](auto value) { return value != 0; }))
+            throw std::invalid_argument("invalid TQ expert container header");
+        std::vector<std::uint8_t> directory(std::size_t(count) * 16);
+        read(64, reinterpret_cast<std::byte*>(directory.data()), directory.size());
+        std::size_t end = 64 + directory.size();
+        for (std::size_t i = 0; i < count; ++i) {
+            const auto offset = TqLayout::integer(directory.data() + i * 16, 8);
+            const auto bytes = TqLayout::integer(directory.data() + i * 16 + 8, 8);
+            if (offset != end || offset > size || bytes < 64 || bytes > size - offset)
+                throw std::invalid_argument("invalid TQ expert container span");
+            segments.emplace_back(std::size_t(offset), std::size_t(bytes));
+            end = std::size_t(offset + bytes);
+        }
+        if (end != size) throw std::invalid_argument("TQ expert container length differs");
+    } else segments.emplace_back(0, size);
+
+    struct Segment { TqLayout layout; std::vector<std::uint8_t> metadata; };
+    std::vector<Segment> parsed;
+    bank.experts = int(shape[0]); bank.input = int(shape[2]);
+    bank.rows = int(shape[0] * shape[1]);
+    if (bank.rows > INT_MAX - bank.experts)
+        throw std::overflow_error("TQ expert descriptors exceed backend limits");
+    bank.descriptors.reserve(std::size_t(bank.rows) + bank.experts);
+    int stored_width = 0;
+    int group_size = INT_MAX;
+    std::optional<bool> columns;
+    std::size_t payload_bytes = 0;
+    for (const auto& [offset, bytes] : segments) {
+        read(offset, reinterpret_cast<std::byte*>(header.data()), header.size());
+        const TqLayout layout(header.data(), bytes);
+        const auto experts = container ? std::int64_t(1) : shape[0];
+        if (layout.width > INT_MAX || layout.rows > INT_MAX || layout.width < std::uint64_t(shape[2]) ||
+            layout.rows != std::uint64_t(experts) * std::uint64_t(shape[1]) ||
+            (stored_width && stored_width != int(layout.width)))
+            throw std::invalid_argument("TQ expert bank row count differs");
+        stored_width = int(layout.width);
+        if (columns && *columns != layout.columns)
+            throw std::invalid_argument("TQ expert scale layouts differ");
+        columns = layout.columns;
+        if (!layout.columns) group_size = std::min(group_size, int(layout.gs));
+        std::vector<std::uint8_t> metadata(layout.packed);
+        std::memcpy(metadata.data(), header.data(), header.size());
+        read(offset + 64, reinterpret_cast<std::byte*>(metadata.data() + 64), metadata.size() - 64);
+        std::uint64_t next = 0;
+        for (std::int64_t expert = 0; expert < experts; ++expert) {
+            const auto begin = next;
+            for (std::int64_t row = 0; row < shape[1]; ++row) {
+                const auto d = TqLayout::integer(metadata.data() + 64 + std::size_t(expert * shape[1] + row) * 8, 8);
+                if (!layout.valid_descriptor(d) || layout.offset(d) != next)
+                    throw std::invalid_argument("invalid TQ expert row descriptor");
+                bank.descriptors.push_back(layout.rebase(d, next - begin));
+                next += std::uint64_t(layout.width) * (((d >> 32) & 7) + 1) / 32;
+            }
+            if (next > layout.packed_bytes / 4 || offset + layout.packed > SIZE_MAX - begin * 4)
+                throw std::invalid_argument("TQ expert payload range differs");
+            bank.ranges.push_back({offset + layout.packed + std::size_t(begin * 4), std::size_t((next - begin) * 4)});
+        }
+        if (next * 4 != layout.packed_bytes)
+            throw std::invalid_argument("TQ expert payload length differs");
+        payload_bytes = add_bytes(payload_bytes, layout.packed_bytes);
+        parsed.push_back({layout, std::move(metadata)});
+    }
+    bank.width = stored_width;
+    const bool flat = !container;
+    bank.columns = *columns ? (flat ? 1 : 2) : 0;
+    bank.group_size = *columns ? (flat ? 512 : int(shape[1])) : group_size;
+    const auto groups = *columns ? std::size_t(0) : (std::size_t(stored_width) + group_size - 1) / group_size;
+    const bool expanded = !*columns && (!flat || group_size >= 256);
+    const auto factors = *columns ? std::size_t(stored_width) * (flat ? 1 : std::size_t(shape[0]))
+                                 : expanded ? std::size_t(bank.rows) * groups : parsed.front().layout.scale_bytes;
+    if (factors > INT_MAX) throw std::overflow_error("TQ expert scales exceed backend limits");
+    bank.scale_dtype = *columns ? float16 : expanded ? float32 : uint8;
+    const auto element_bytes = *columns ? std::size_t(2) : expanded ? std::size_t(4) : std::size_t(1);
+    bank.scales.resize(factors * element_bytes);
+    static const auto relative = [] {
+        std::array<float, 16> values{};
+        for (int i = 0; i < 16; ++i) values[i] = float(float16_t(std::exp2(-2.f + 4.f * i / 15.f)));
+        return values;
+    }();
+    std::size_t destination_row = 0, destination_scale = 0;
+    for (const auto& segment : parsed) {
+        const auto& layout = segment.layout;
+        const auto* source = segment.metadata.data() + layout.scales;
+        if (*columns) {
+            for (int col = 0; col < stored_width; ++col) {
+                const auto value = TqLayout::integer(source + col * 2, 2);
+                if (!value || (value & 0x8000) || (value & 0x7c00) == 0x7c00)
+                    throw std::invalid_argument("invalid TQ expert column scale");
+            }
+            std::memcpy(bank.scales.data() + destination_scale, source, std::size_t(stored_width) * 2);
+            destination_scale += std::size_t(stored_width) * 2;
+        } else if (!expanded) {
+            std::memcpy(bank.scales.data(), source, layout.scale_bytes);
+        } else {
+            for (std::size_t row = 0; row < layout.rows; ++row) {
+                const auto descriptor = TqLayout::integer(segment.metadata.data() + 64 + row * 8, 8);
+                const float anchor = float(std::bit_cast<float16_t>(std::uint16_t(descriptor >> 40)));
+                for (std::size_t group = 0; group < groups; ++group) {
+                    const auto index = row * layout.groups + group * group_size / layout.gs;
+                    const auto code = (source[index / 2] >> ((index & 1) * 4)) & 15;
+                    const float value = anchor * relative[code];
+                    std::memcpy(bank.scales.data() + ((destination_row + row) * groups + group) * 4,
+                        &value, sizeof(value));
+                }
+            }
+        }
+        destination_row += layout.rows;
+    }
+    bank.descriptors.resize(std::size_t(bank.rows) + bank.experts, 0);
+    bank.nbytes = flat ? add_bytes(add_bytes(size - parsed.front().layout.scale_bytes, bank.scales.size()), std::size_t(bank.experts) * 8)
+        : add_bytes(add_bytes(add_bytes(64, payload_bytes), bank.descriptors.size() * 8), bank.scales.size());
 }
 
 std::vector<array> resident_routes(const array& resident, const array& ids, int experts) {
@@ -121,10 +280,101 @@ array MlxTqExpertWeights::routed_ffn(const array& input, const array& ids,
         ids, weights, reuse);
 }
 
+struct MlxTqExpertCache::Plan::Data {
+    struct Layer { std::array<SourceBank, 3> banks; int experts = 0; };
+    std::vector<Layer> layers;
+    std::array<std::size_t, 3> largest{}, capacity{}, chunk{};
+    std::size_t metadata = 0, backing = 0, minimum = 0, maximum = 0;
+    int io_workers = 0;
+    bool parallel_reads = false;
+};
+
+MlxTqExpertCache::Plan::Plan(std::unique_ptr<Data> data) : data_(std::move(data)) {}
+MlxTqExpertCache::Plan::~Plan() = default;
+MlxTqExpertCache::Plan::Plan(Plan&&) noexcept = default;
+MlxTqExpertCache::Plan& MlxTqExpertCache::Plan::operator=(Plan&&) noexcept = default;
+std::size_t MlxTqExpertCache::Plan::minimum() const noexcept { return data_ ? data_->minimum : 0; }
+std::size_t MlxTqExpertCache::Plan::maximum() const noexcept { return data_ ? data_->maximum : 0; }
+
+MlxTqExpertCache::Plan MlxTqExpertCache::plan(const source::Source& source,
+        const std::vector<std::string>& prefixes, int io_workers) {
+    if (prefixes.empty() || prefixes.size() > std::size_t(UINT32_MAX) || io_workers < 1)
+        throw std::invalid_argument("invalid TQ expert cache configuration");
+    auto data = std::make_unique<Plan::Data>();
+    data->io_workers = io_workers;
+    data->parallel_reads = source.supports_parallel_tensor_reads();
+    std::array<nlohmann::json, 2> manifests{nlohmann::json::object(), nlohmann::json::object()};
+    const std::array<const char*, 2> keys{"tq_row_shards", "tq.segments"};
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+        const auto found = source.metadata().find(keys[i]);
+        if (found == source.metadata().end()) continue;
+        manifests[i] = nlohmann::json::parse(found->second);
+        if (!manifests[i].is_object()) throw std::invalid_argument("invalid TQ row-shard manifest");
+    }
+    data->layers.resize(prefixes.size());
+    for (std::size_t i = 0; i < prefixes.size(); ++i) {
+        auto& layer = data->layers[i];
+        for (int p = 0; p < 3; ++p) {
+            auto& bank = layer.banks[p];
+            bank.name = prefixes[i] + ".mlp.experts." + std::array<const char*, 3>{"gate", "up", "down"}[p] + ".weight";
+            for (const auto& manifest : manifests)
+                if (manifest.contains(bank.name))
+                    throw std::invalid_argument("TQ expert cache requires one physical bank per projection");
+            const auto* record = source.find_tensor(bank.name);
+            if (!record || record->dtype != "TQ" || record->nbytes > SIZE_MAX)
+                throw std::invalid_argument("TQ expert cache requires three TQ banks per layer");
+            const auto shape = tyloi::tq_shape(source, bank.name);
+            bank.reader = source.tensor_reader(bank.name);
+            if (!bank.reader) throw TensorReaderUnsupported("TQ expert bank has no retained reader");
+            bank.batch_reader = source.tensor_batch_reader(bank.name);
+            source_metadata(bank, bank.reader, std::size_t(record->nbytes), shape);
+            if (p && layer.experts != bank.experts)
+                throw std::invalid_argument("invalid TQ expert bank geometry");
+            layer.experts = bank.experts;
+            data->metadata = add_bytes(data->metadata,
+                add_bytes(bank.descriptors.size() * sizeof(std::uint64_t), bank.scales.size()));
+            data->backing = add_bytes(data->backing, std::size_t(record->nbytes));
+            for (const auto& range : bank.ranges)
+                data->largest[p] = std::max(data->largest[p], aligned(range.bytes));
+        }
+        const auto& gate = layer.banks[0]; const auto& up = layer.banks[1]; const auto& down = layer.banks[2];
+        if (gate.input != up.input || gate.rows != up.rows || down.input != gate.rows / gate.experts ||
+            down.rows / down.experts != gate.input)
+            throw std::invalid_argument("TQ expert Gate/Up/Down dimensions differ");
+    }
+    const auto page = tyloi::metal::pool_page();
+    const auto device_limit = std::size_t(mlx::core::metal::device(Device::gpu).mtl_device()->maxBufferLength()) / page * page;
+    for (int p = 0; p < 3; ++p) {
+        std::size_t layer_max = 0;
+        for (const auto& layer : data->layers) {
+            std::size_t bytes = 0;
+            for (const auto& range : layer.banks[p].ranges) bytes = add_bytes(bytes, aligned(range.bytes));
+            layer_max = std::max(layer_max, bytes);
+        }
+        data->chunk[p] = std::min(device_limit, std::max(page, round_page(layer_max, page)));
+        std::size_t packed = 0;
+        for (const auto& layer : data->layers) for (const auto& range : layer.banks[p].ranges) {
+            const auto size = aligned(range.bytes);
+            if (size > data->chunk[p]) throw std::invalid_argument("TQ expert exceeds the Metal chunk size");
+            if (size > data->chunk[p] - packed % data->chunk[p])
+                packed = add_bytes(packed, data->chunk[p] - packed % data->chunk[p]);
+            packed = add_bytes(packed, size);
+        }
+        data->capacity[p] = round_page(packed, page);
+        data->minimum = add_bytes(data->minimum, round_page(data->largest[p], page));
+        data->maximum = add_bytes(data->maximum, data->capacity[p]);
+    }
+    data->minimum = add_bytes(data->minimum, data->metadata);
+    data->maximum = add_bytes(data->maximum, data->metadata);
+    return Plan(std::move(data));
+}
+
 struct MlxTqExpertCache::Impl {
     struct Bank {
         std::string name;
         MfqMappedBytes mapping;
+        source::Source::TensorReader reader;
+        source::Source::TensorBatchReader batch_reader;
         std::unique_ptr<MlxMappedTqRows> rows;
         std::vector<MlxMappedTqRows::PackedRows> ranges;
         std::optional<MlxTqWeight> weight;
@@ -141,6 +391,7 @@ struct MlxTqExpertCache::Impl {
         bool prefetched = false;
     };
     struct Read {
+        Bank* bank;
         std::string record;
         std::size_t offset;
         std::vector<std::span<std::byte>> destinations;
@@ -152,9 +403,10 @@ struct MlxTqExpertCache::Impl {
     struct ResidentWork { array values, routes; bool has_misses = true; };
 
     Impl(const MfqContainer& source, const std::vector<std::string>& prefixes,
-            std::size_t budget, int io_workers) : source(source), io_workers(io_workers) {
+            std::size_t budget, int io_workers) : io_workers(io_workers) {
         if (prefixes.empty() || prefixes.size() > std::size_t(UINT32_MAX) || io_workers < 1)
             throw std::invalid_argument("invalid TQ expert cache configuration");
+        legacy_source.emplace(source);
         const auto meta = source.header().extra_json.find("tq_shapes");
         const auto shapes = meta == source.header().extra_json.end() ? nlohmann::json::object()
             : nlohmann::json::parse(meta->second);
@@ -166,10 +418,10 @@ struct MlxTqExpertCache::Impl {
                 auto& bank = layer.banks[projection];
                 bank.name = prefixes[index] + ".mlp.experts."
                     + std::array<const char*, 3>{"gate", "up", "down"}[projection] + ".weight";
+                std::vector<int> shape;
                 if (source.record(bank.name).dtype != "TQ")
                     throw std::invalid_argument("TQ expert cache requires three TQ banks per layer");
                 bank.mapping = source.map_record(bank.name, true);
-                std::vector<int> shape;
                 if (shapes.contains(bank.name)) shape = shapes.at(bank.name).get<std::vector<int>>();
                 else {
                     bank.rows = std::make_unique<MlxMappedTqRows>(bank.mapping.view());
@@ -177,6 +429,7 @@ struct MlxTqExpertCache::Impl {
                     if (!rows.expert_container()) throw std::invalid_argument("TQ expert bank lacks logical shape");
                     shape = {int(rows.expert_count()), int(rows.rows() / rows.expert_count()), rows.width()};
                 }
+                backing += source.record(bank.name).nbytes;
                 if (shape.size() != 3 || std::any_of(shape.begin(), shape.end(), [](int x) { return x < 1; })
                     || (projection && layer.experts != shape[0]))
                     throw std::invalid_argument("invalid TQ expert bank geometry");
@@ -186,12 +439,11 @@ struct MlxTqExpertCache::Impl {
                     || (bank.rows->expert_container() && bank.rows->expert_count() != std::size_t(shape[0])))
                     throw std::invalid_argument("TQ expert bank row count differs");
                 for (int expert = 0; expert < layer.experts; ++expert) {
-                    const auto span = bank.rows->packed_rows(std::int64_t(expert) * shape[1], shape[1]);
-                    bank.ranges.push_back(span);
+                    bank.ranges.push_back(bank.rows->packed_rows(std::int64_t(expert) * shape[1], shape[1]));
+                    const auto span = bank.ranges.at(expert);
                     bank_capacity[projection] += aligned(span.bytes);
                     largest[projection] = std::max(largest[projection], aligned(span.bytes));
                 }
-                backing += source.record(bank.name).nbytes;
             }
         }
         metadata = 0;
@@ -244,6 +496,56 @@ struct MlxTqExpertCache::Impl {
                 || weights.down.input_size() != weights.gate.output_size()
                 || weights.down.output_size() != weights.gate.input_size())
                 throw std::invalid_argument("TQ expert Gate/Up/Down dimensions differ");
+        }
+        retain_pools(allocated);
+        requested_limit = budget;
+        resources.set({0, 0, allocated.load(), backing, 0});
+        preload_complete();
+    }
+
+    Impl(Plan::Data data, std::size_t budget)
+        : parallel_reads(data.parallel_reads), io_workers(data.io_workers) {
+        if (budget < data.minimum)
+            throw std::invalid_argument("TQ expert cache budget cannot hold its metadata and one expert");
+        metadata = data.metadata;
+        backing = data.backing;
+        bank_largest = data.largest;
+        bank_capacity = data.capacity;
+        for (int p = 0; p < 3; ++p) pools[p].chunk_bytes = data.chunk[p];
+        const auto capacities = pool_capacities(budget);
+        allocated = metadata;
+        for (int p = 0; p < 3; ++p) {
+            pools[p].allocate_storage(capacities[p]);
+            allocated += pools[p].capacity;
+        }
+        auto temporary = array(allocator::malloc(4), Shape{1}, uint32);
+        layers.resize(data.layers.size());
+        for (std::size_t i = 0; i < layers.size(); ++i) {
+            auto& layer = layers[i];
+            layer.experts = data.layers[i].experts;
+            for (int p = 0; p < 3; ++p) {
+                auto& bank = layer.banks[p];
+                auto& prepared = data.layers[i].banks[p];
+                bank.name = std::move(prepared.name);
+                bank.reader = std::move(prepared.reader);
+                bank.batch_reader = std::move(prepared.batch_reader);
+                bank.ranges = std::move(prepared.ranges);
+                auto descriptors = array(allocator::malloc(prepared.descriptors.size() * 8),
+                    Shape{int(prepared.descriptors.size())}, uint64);
+                std::memcpy(descriptors.data<std::uint64_t>(), prepared.descriptors.data(), prepared.descriptors.size() * 8);
+                const auto scale_bytes = prepared.scale_dtype == float32 ? 4U : prepared.scale_dtype == float16 ? 2U : 1U;
+                auto scales = array(allocator::malloc(prepared.scales.size()),
+                    Shape{int(prepared.scales.size() / scale_bytes)}, prepared.scale_dtype);
+                std::memcpy(scales.data<std::uint8_t>(), prepared.scales.data(), prepared.scales.size());
+                tyloi::metal::AllocationScope::record(descriptors);
+                tyloi::metal::AllocationScope::record(scales);
+                bank.weight = MlxTqWeight(temporary, std::move(descriptors), std::move(scales),
+                    prepared.rows, prepared.width, prepared.input, prepared.experts, prepared.group_size,
+                    prepared.columns, prepared.nbytes, true);
+                bank.weight->words_ = tyloi::metal::tensor(pools[p].words);
+            }
+            layer.weights = std::make_unique<MlxTqExpertWeights>(MlxTqExpertWeights{
+                *layer.banks[0].weight, *layer.banks[1].weight, *layer.banks[2].weight});
         }
         retain_pools(allocated);
         requested_limit = budget;
@@ -640,7 +942,7 @@ struct MlxTqExpertCache::Impl {
             const auto& entry = entries.at(key);
             for (int p = 0; p < 3; ++p) {
                 const auto range = layer.banks[p].ranges[entry.expert];
-                pending[p].push_back({layer.banks[p].name, range.offset,
+                pending[p].push_back({&layer.banks[p], layer.banks[p].name, range.offset,
                     {{pools[p].data + entry.allocations[p].offset, range.bytes}}, range.bytes, track ? std::vector<int>{entry.expert} : std::vector<int>{}, p});
             }
         }
@@ -655,6 +957,33 @@ struct MlxTqExpertCache::Impl {
             } else reads.push_back(std::move(read));
         }
         return reads;
+    }
+
+    std::size_t read_packed(const Read& read) {
+        if (legacy_source) {
+            legacy_source->readv_range(read.record, read.offset, read.destinations);
+            return 1;
+        }
+        const auto transfer = [&] {
+            std::uint64_t offset = read.offset;
+            if (read.bank->batch_reader) {
+                std::vector<ReadSpan> spans;
+                spans.reserve(read.destinations.size());
+                for (const auto destination : read.destinations) {
+                    spans.push_back({offset, destination.data(), destination.size()});
+                    offset += destination.size();
+                }
+                read.bank->batch_reader(spans);
+            } else {
+                for (const auto destination : read.destinations) {
+                    read.bank->reader(offset, destination.data(), destination.size());
+                    offset += destination.size();
+                }
+            }
+        };
+        if (parallel_reads) transfer();
+        else { std::lock_guard lock(reader_mutex); transfer(); }
+        return read.bank->batch_reader ? 1 : read.destinations.size();
     }
 
     void finish_prefill(std::size_t current = SIZE_MAX, const std::vector<int>* active = nullptr) {
@@ -715,11 +1044,11 @@ struct MlxTqExpertCache::Impl {
                         if (demand->known.load(std::memory_order_acquire)
                             && std::none_of(read.experts.begin(), read.experts.end(),
                                 [&](int expert) { return demand->wanted[expert] != 0; })) continue;
-                        source.readv_range(read.record, read.offset, read.destinations);
+                        const auto calls = read_packed(read);
                         for (const auto expert : read.experts) demand->loaded[expert*3+read.projection] = 1;
                         bytes_read.fetch_add(read.bytes, std::memory_order_relaxed);
                         prefill_bytes_read.fetch_add(read.bytes, std::memory_order_relaxed);
-                        read_calls.fetch_add(1, std::memory_order_relaxed);
+                        read_calls.fetch_add(calls, std::memory_order_relaxed);
                     }
                 });
                 io_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-started).count());
@@ -808,9 +1137,9 @@ struct MlxTqExpertCache::Impl {
             const auto read_range = [&](std::int64_t first, std::int64_t last) {
                 for (auto r = first; r < last; ++r) {
                     const auto& read = reads[r];
-                    source.readv_range(read.record, read.offset, read.destinations);
+                    const auto calls = read_packed(read);
                     bytes_read.fetch_add(read.bytes, std::memory_order_relaxed);
-                    read_calls.fetch_add(1, std::memory_order_relaxed);
+                    read_calls.fetch_add(calls, std::memory_order_relaxed);
                 }
             };
             const auto publish_offsets = [&](int first, int last) {
@@ -953,7 +1282,9 @@ struct MlxTqExpertCache::Impl {
 
     std::optional<PrefillRead> prefill_read;
     std::optional<std::pair<std::size_t, std::size_t>> lookahead;
-    MfqContainer source;
+    std::optional<MfqContainer> legacy_source;
+    bool parallel_reads = true;
+    std::mutex reader_mutex;
     int io_workers;
     tyloi::HostParallelPool workers{{}, false};
     std::mutex execution;
@@ -978,6 +1309,14 @@ struct MlxTqExpertCache::Impl {
 
 MlxTqExpertCache::MlxTqExpertCache(const MfqContainer& source, const std::vector<std::string>& prefixes,
         std::size_t budget, int io_workers) : impl_(std::make_shared<Impl>(source, prefixes, budget, io_workers)) {}
+
+MlxTqExpertCache::MlxTqExpertCache(Plan plan, std::size_t budget) {
+    if (!plan.data_) throw std::invalid_argument("TQ expert cache plan is empty");
+    impl_ = std::make_shared<Impl>(std::move(*plan.data_), budget);
+}
+
+MlxTqExpertCache::MlxTqExpertCache(const source::Source& source, const std::vector<std::string>& prefixes,
+        std::size_t budget, int io_workers) : MlxTqExpertCache(plan(source, prefixes, io_workers), budget) {}
 
 array MlxTqExpertCache::apply(std::size_t layer, const array& ids,
         const std::function<array(const MlxTqExpertWeights&)>& operation) {
@@ -1054,4 +1393,4 @@ void MlxTqExpertCache::prefill_lookahead(std::size_t layer, std::optional<std::s
         ? std::optional(std::pair{layer, *next}) : std::nullopt;
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

@@ -8,11 +8,13 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <exception>
+#include <functional>
 #include <limits>
 #include <stdexcept>
 #include <utility>
 
-namespace tyloi::cuda::qwen35 {
+namespace tyloi::models::qwen35 {
 
 tyloi::engine::Metrics State::metrics() const {
     tyloi::engine::Metrics result;
@@ -570,6 +572,20 @@ std::unique_ptr<tyloi::models::Restore> State::prepare_restore(
     return std::make_unique<SessionRestore>(*this, state, predictor_model);
 }
 
+void restore_session(State& state, tyloi::models::Mtp* mtp, const TextSessionState& snapshot,
+                     const std::function<void()>& drain) {
+    auto candidate = state.prepare_restore(snapshot, mtp);
+    try {
+        candidate->stage();
+        drain();
+        candidate->publish();
+    } catch (...) {
+        const auto failure = std::current_exception();
+        try { drain(); } catch (...) {}
+        std::rethrow_exception(failure);
+    }
+}
+
 void State::stage(Restore& restore, const TextSessionState& state) const {
     const auto kind = text_session_state_kind();
     const auto* full_layers = kind == TextSessionStateKind::FullAttention
@@ -617,4 +633,4 @@ void State::publish(Restore&& restore) noexcept {
     batch = 1;
 }
 
-} // namespace tyloi::cuda::qwen35
+} // namespace tyloi::models::qwen35

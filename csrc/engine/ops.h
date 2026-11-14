@@ -31,8 +31,6 @@ using Trace = std::vector<std::pair<std::string, Tensor>>;
 // Neutral dense projection/FFN policy; null borrows the active executor, otherwise binds its device.
 // The scope does not wait and must end before suspending generation.
 std::unique_ptr<::tyloi::Executor::Scope> dense_scope(::tyloi::Executor* executor, Device device);
-// Live capacity override in the active execution resources.
-std::int64_t kv_capacity(Device device);
 
 // Query, key and value are [B,H,T,D]; KV may use fewer heads.
 struct AttentionInput {
@@ -68,6 +66,12 @@ std::pair<Tensor, Tensor> append_kv(state::KvView kv, const Tensor& key, const T
                                     const Tensor& positions, std::int64_t start,
                                     bool contiguous_prefill_prefix = false);
 
+struct YarnScaling {
+    double factor=1, beta_fast=32, beta_slow=1;
+    std::int64_t original_context=0;
+    bool enabled() const { return factor>1; }
+};
+
 struct RopeTable {
     Tensor cos, sin, sections, empty_sections, interleaved_order, interleaved_inverse;
     std::int64_t rotary_dim = 0;
@@ -87,6 +91,10 @@ Tensor tail_rope(const Tensor& input, const Tensor& positions,
 // Nonpositive frequency_dim uses dimension; negative active_pairs uses all pairs.
 RopeTable rope_table(std::int64_t positions, std::int64_t dimension, double base, Device device,
                      std::int64_t frequency_dim = 0, std::int64_t active_pairs = -1);
+RopeTable make_rope(std::int64_t positions, std::int64_t dimension, double base, Device device,
+                    std::span<const std::int64_t> sections, bool interleaved,
+                    bool official_reciprocal_frequencies, YarnScaling yarn = {});
+Tensor log_negative(const Tensor& input);
 Tensor rope(const Tensor& input, const Tensor& positions, const RopeTable& table, bool bf16 = false,
             bool grid_mrope_positions = false);
 // Unsupported fusions return nullptr without writing; success writes the original KV and returns query.
@@ -399,10 +407,5 @@ RoutedGeglu routed_geglu(const Tensor& input, const Tensor& ids,
                          const Tensor& gate_up, const Tensor& down,
                          bool trace);
 
-struct YarnScaling {
-    double factor=1, beta_fast=32, beta_slow=1;
-    std::int64_t original_context=0;
-    bool enabled() const { return factor>1; }
-};
 
 } // namespace tyloi::ops

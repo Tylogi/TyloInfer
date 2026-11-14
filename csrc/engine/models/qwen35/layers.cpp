@@ -12,7 +12,7 @@
 #include <utility>
 #include <vector>
 
-namespace tyloi::cuda::qwen35 {
+namespace tyloi::models::qwen35 {
 namespace {
 
 class LayerRequest final : public tyloi::models::Layers::State {
@@ -42,7 +42,8 @@ public:
             {.gpu_layers = options.gpu_layers, .expert_parallel = options.expert_parallel,
              .mirror_scalars = options.mirror_scalars,
              .recurrent_transposed = options.recurrent_transposed,
-             .load_layers = false, .load_input_output = false});
+             .load_layers = false, .load_input_output = false,
+             .kv_quantization = options.kv_quantization});
         layers_.resize(model_->config.num_hidden_layers);
     }
 
@@ -174,10 +175,12 @@ private:
     void load_one(int index) {
         const int device = placement_.device_for_layer(index);
         const bool cpu = index < cpu_layers_;
-        auto placed = weights_.for_layer(device, cpu);
+        auto target = cpu ? Device(kCPU) : Device(model_->device.type, device);
+        auto placed = weights_.for_layer(target);
         auto& layer = layers_[index].emplace();
         qwen35::load_layer(layer, placed, model_->config, index,
-            model_->config.layer_types.at(static_cast<std::size_t>(index)), mirror_scalars_);
+            model_->config.layer_types.at(static_cast<std::size_t>(index)), mirror_scalars_,
+            "model", model_->kv_quantization);
     }
 
     std::unique_ptr<Model> model_;
@@ -198,7 +201,7 @@ void load_layers(std::unique_ptr<tyloi::models::Layers>& owner,
     const tyloi::models::LoadOptions& options) {
     if (!source || &weights.source != source.get())
         throw std::invalid_argument("Qwen source and weight loader must match");
-    if (weights.placement.device != placement.primary_device())
+    if (weights.placement.target.index != placement.primary_device())
         throw std::invalid_argument("Qwen weight and layer primary devices differ");
     if (!options.cpu_offload_layers.empty())
         throw std::invalid_argument("Qwen layer reference does not support CPU offload layers");
@@ -206,4 +209,4 @@ void load_layers(std::unique_ptr<tyloi::models::Layers>& owner,
     static_cast<QwenLayers*>(owner.get())->initialize(std::move(source), definition, options);
 }
 
-} // namespace tyloi::cuda::qwen35
+} // namespace tyloi::models::qwen35

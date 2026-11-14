@@ -18,7 +18,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 
 using mlx::core::array;
@@ -390,7 +390,7 @@ Qwen35TensorMetadata inspect_qwen35_tensor_metadata(
 
     if (is_nint_dtype(record.dtype)) {
         metadata.packed = true;
-        metadata.bits = mfq::nint_logical_bits(
+        metadata.bits = tyloi::nint_logical_bits(
             cursor.scalar<std::uint8_t>("NINT bits"));
         metadata.sub_bits = static_cast<std::int32_t>(
             cursor.scalar<std::uint8_t>("NINT sub bits") & 0x7fu);
@@ -640,4 +640,4 @@ MlxRmsNorm load_qwen35_rms_norm(
         static_cast<float>(weight_offset));
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

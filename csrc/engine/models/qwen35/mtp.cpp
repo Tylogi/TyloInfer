@@ -1,7 +1,7 @@
 #include "engine/models/qwen35/mtp.h"
 #include "engine/ops.h"
 
-namespace tyloi::cuda::qwen35 {
+namespace tyloi::models::qwen35 {
 
 namespace {
 
@@ -48,4 +48,4 @@ MtpSessionState Mtp::capture_session_state(const tyloi::models::MtpState& value,
     return state<MtpState>(value).capture(position, hidden);
 }
 
-} // namespace tyloi::cuda::qwen35
+} // namespace tyloi::models::qwen35

@@ -19,7 +19,7 @@
 
 namespace tyloi::metal { class Executor; }
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 // Native payload translation is private to the Metal engine. The scheduler
 // receives owned values from the generation job, never these device functions.
@@ -80,4 +80,4 @@ MlxEngineComponents make_mlx_engine_components(
     std::shared_ptr<std::optional<MlxNemotronHCausalLm>> runtime,
     std::shared_ptr<tyloi::metal::Executor> runtime_executor);
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

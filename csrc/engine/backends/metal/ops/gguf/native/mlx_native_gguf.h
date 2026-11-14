@@ -6,7 +6,7 @@
 #include <span>
 #include <vector>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 class MfqContainer;
 
 struct MlxNativeGgufWeight {

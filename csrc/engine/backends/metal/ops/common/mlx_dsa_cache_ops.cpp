@@ -10,7 +10,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 using namespace mlx::core;
 

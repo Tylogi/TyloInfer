@@ -8,7 +8,7 @@
 
 #include <mlx/mlx.h>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 struct MlxSamplingParams {
     double temperature = 0.0;
@@ -146,4 +146,4 @@ private:
     std::mt19937_64 rng_;
 };
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

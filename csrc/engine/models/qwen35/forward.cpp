@@ -8,7 +8,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace tyloi::cuda::qwen35 {
+namespace tyloi::models::qwen35 {
 namespace {
 
 void require_forward(bool condition, const char* message) {
@@ -243,4 +243,4 @@ void Model::replay(State& state, std::int64_t accepted) const {
     }
 }
 
-} // namespace tyloi::cuda::qwen35
+} // namespace tyloi::models::qwen35

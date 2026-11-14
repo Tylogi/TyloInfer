@@ -10,7 +10,7 @@
 #include <string>
 #include <unordered_map>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 using mlx::core::array;
 using mlx::core::Shape;

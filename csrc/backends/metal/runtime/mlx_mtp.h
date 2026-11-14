@@ -15,7 +15,7 @@
 
 #include <mlx/mlx.h>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 // Storage/statistics capacity of the common engine, not a model capability.
 // Each predictor adapter supplies its own maximum depth in the request.
@@ -176,7 +176,7 @@ struct MlxMtpEngineCallbacks {
 
     std::function<int(int position, int requested)> draft_limit;
     std::function<void(const MlxMtpDraftContext&)> committed_target;
-    mfq::engine::mtp::PolicyState* policy_state = nullptr;
+    tyloi::engine::mtp::PolicyState* policy_state = nullptr;
     std::function<MlxMtpTargetBatch(std::int32_t)> decode_target;
     std::function<void(const mlx::core::array&, int, double)> verified_round;
     std::function<int()> draft_depth;
@@ -210,7 +210,7 @@ struct MlxMtpTargetRequest {
     int draft_count;
     Kind kind = Kind::target;
 };
-using MlxMtpGeneration = mfq::StepSequence<MlxMtpTargetRequest>;
+using MlxMtpGeneration = tyloi::StepSequence<MlxMtpTargetRequest>;
 MlxMtpGeneration mlx_mtp_generation(MlxMtpEngineRequest request,
     MlxMtpEngineCallbacks callbacks, MlxMtpGenerationStats& stats);
 
@@ -319,4 +319,4 @@ mlx::core::array verify_stochastic_mtp_top_k_chain_device(
     int drafts,
     int top_k);
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

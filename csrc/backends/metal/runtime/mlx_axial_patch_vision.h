@@ -7,7 +7,7 @@
 
 #include <mlx/mlx.h>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 // Shared contract for patch-linear ViTs that use bidirectional attention,
 // two-axis RoPE, RMSNorm and a strided spatial aligner. Architecture adapters
@@ -56,4 +56,4 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

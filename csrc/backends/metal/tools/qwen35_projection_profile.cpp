@@ -25,10 +25,10 @@ namespace {
 using Clock = std::chrono::steady_clock;
 using mlx::core::Shape;
 using mlx::core::array;
-using mfq::metal::MfqContainer;
-using mfq::metal::MlxGroupedLinear;
-using mfq::metal::MlxGroupedLinearWeightRef;
-using mfq::metal::MlxLinear;
+using tyloi::metal::MfqContainer;
+using tyloi::metal::MlxGroupedLinear;
+using tyloi::metal::MlxGroupedLinearWeightRef;
+using tyloi::metal::MlxLinear;
 
 using Projection = std::function<std::vector<array>(const array&)>;
 
@@ -494,7 +494,7 @@ int main(int argc, char** argv) {
         constexpr int warmup = 4;
 
         MfqContainer model(argv[1]);
-        mfq::metal::install_legacy_tensor_compatibility(model);
+        tyloi::metal::install_legacy_tensor_compatibility(model);
         std::cout
             << "case\tpacked_bytes\tdispatches\tms\tGB/s\n";
         if (argc >= 5 && std::string(argv[4]) == "parity") {

@@ -14,7 +14,7 @@
 #include <variant>
 #include <vector>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 
 using mlx::core::Shape;
@@ -878,4 +878,4 @@ std::int32_t MlxNemotronHCausalLm::generate_mtp(
     return result;
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

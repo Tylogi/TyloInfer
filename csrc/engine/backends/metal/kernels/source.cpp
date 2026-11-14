@@ -6,7 +6,7 @@
 #include <utility>
 #include <stdexcept>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 #include "engine/backends/metal/kernels/common/mfq_qsa_prefill.inc"
 #include "engine/backends/metal/kernels/common/mfq_sdpa_decode.inc"

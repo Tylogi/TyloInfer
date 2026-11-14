@@ -1,6 +1,6 @@
 #pragma once
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 inline constexpr const char* kNvqVectorInputHeader = R"METAL(
 template <typename T> struct MfqNvqVectorInput {

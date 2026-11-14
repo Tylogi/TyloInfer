@@ -5,7 +5,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 
 using mlx::core::array;
@@ -118,4 +118,4 @@ MlxRmsNorm load_nemotron_h_rms_norm(
         0.0f);
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

@@ -9,9 +9,9 @@
 
 #include <mlx/mlx.h>
 
-#include "tyloinfer/mxfp4_sq_blob.h"
+#include "engine/weights/encoding/mxfp4_sq_blob.h"
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 bool is_mxfp4_sq_dtype(std::string_view dtype) noexcept;
 
@@ -115,7 +115,7 @@ public:
     bool has_uniform_q() const noexcept {
         return descriptor_.distribution_entropy == 0.0;
     }
-    const mfq::sq::Layout& wire_layout() const noexcept {
+    const tyloi::sq::Layout& wire_layout() const noexcept {
         return layout_;
     }
     std::size_t packed_nbytes() const noexcept {
@@ -128,15 +128,15 @@ private:
         mlx::core::array row_q,
         mlx::core::array row_symbol_byte_offsets,
         mlx::core::array row_auxiliary,
-        mfq::sq::Layout layout,
+        tyloi::sq::Layout layout,
         Mxfp4SqDescriptor descriptor);
 
     mlx::core::array blob_;
     mlx::core::array row_q_;
     mlx::core::array row_symbol_byte_offsets_;
     mlx::core::array row_auxiliary_;
-    mfq::sq::Layout layout_;
+    tyloi::sq::Layout layout_;
     Mxfp4SqDescriptor descriptor_;
 };
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

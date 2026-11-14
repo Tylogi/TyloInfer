@@ -1,11 +1,13 @@
 #include "mlx_nint.h"
+#include "engine/backends/metal/native/tensor/tensor.h"
+#include "engine/weights/memory.h"
 #include "mlx_nint_metadata.h"
 #include "engine/backends/metal/native/kernel.h"
 #include "engine/backends/metal/native/memory.h"
 #include "mlx_resident_budget.h"
 #include "engine/backends/metal/native/allocation.h"
 
-#include "tyloinfer/nint_blob.h"
+#include "engine/weights/encoding/quant/nint_blob.h"
 #include "mfq_mfe_prefill_embedded.h"
 #include "engine/backends/metal/native/device.h"
 #include "engine/backends/metal/native/env.h"
@@ -31,7 +33,7 @@
 #include <utility>
 #include <vector>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 
 using mlx::core::CompileOptions;
@@ -1627,14 +1629,17 @@ MlxNintWeight::MlxNintWeight(
       input_size_(input_size),
       output_size_(output_size),
       descriptor_(descriptor),
-      uniform_q_bits_(uniform_q_bits) {}
+      uniform_q_bits_(uniform_q_bits) {
+    for (const auto* value : {&q_packed_, &sub_scale_, &sub_min_, &row_metadata_})
+        tyloi::weights::observe_weight(tyloi::metal::tensor(*value));
+}
 
 detail::ParsedNintStorage detail::parse_nint_blob(
     std::span<const std::uint8_t> blob, bool borrow_streams) {
     BlobCursor cursor(blob);
     const auto raw_bits = cursor.scalar<std::uint8_t>("bits");
-    const bool adaptive_storage = mfq::nint_has_adaptive_storage(raw_bits);
-    const int bits = mfq::nint_logical_bits(raw_bits);
+    const bool adaptive_storage = tyloi::nint_has_adaptive_storage(raw_bits);
+    const int bits = tyloi::nint_logical_bits(raw_bits);
     const int sub_bits = cursor.scalar<std::uint8_t>("sub bits");
     const int group_size = cursor.scalar<std::int32_t>("group size");
     const int axis = cursor.scalar<std::int32_t>("axis");
@@ -2581,4 +2586,4 @@ std::size_t MlxNintWeight::packed_nbytes() const noexcept {
         row_metadata_.nbytes();
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

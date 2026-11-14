@@ -8,7 +8,7 @@
 #include <string>
 #include <vector>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 std::vector<std::uint8_t> encode_mtp_lora(const MtpLoraState&, const std::string& fingerprint);
 MtpLoraState decode_mtp_lora(std::span<const std::uint8_t>, const std::string& fingerprint,
@@ -44,4 +44,4 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

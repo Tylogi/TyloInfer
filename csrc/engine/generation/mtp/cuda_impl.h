@@ -493,7 +493,6 @@ template <class Model, class State> struct CudaMtpOps {
     tyloi::models::ForwardOptions predictor_options;
     auto scope = tyloi::cuda::Executor::current().enter(mode.ffn);
     predictor_options = tyloi::cuda::forward_options(mode);
-    predictor_options.kv_capacity = tyloi::ops::kv_capacity(tyloi::Device(tyloi::kCUDA,mode.primary));
     if (predictor_execution) predictor_options.serial_experts = false;
     tyloi::models::MtpStep result;
     {

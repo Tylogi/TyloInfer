@@ -5,14 +5,36 @@
 #include "engine/weights/source/mapped.h"
 
 #include "engine/models/source/legacy_names.h"
+#include "nlohmann/json.hpp"
 
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace tyloi::models {
+
+namespace {
+using json = nlohmann::json;
+
+std::vector<std::int64_t> metadata_shape(const json& value, const std::string& name) {
+    if (!value.is_array()) throw std::runtime_error("MFQ tensor shape is not an array: " + name);
+    std::vector<std::int64_t> shape;
+    shape.reserve(value.size());
+    for (const auto& dimension : value) {
+        if (!dimension.is_number_integer() ||
+            (dimension.is_number_unsigned() &&
+             dimension.get<std::uint64_t>() > std::uint64_t(std::numeric_limits<std::int64_t>::max())))
+            throw std::runtime_error("invalid MFQ tensor dimension: " + name);
+        const auto size = dimension.get<std::int64_t>();
+        if (size < 0) throw std::runtime_error("negative MFQ tensor dimension: " + name);
+        shape.push_back(size);
+    }
+    return shape;
+}
+} // namespace
 
 struct MfqSource::Impl {
     std::unique_ptr<source::Files> files;
@@ -20,6 +42,7 @@ struct MfqSource::Impl {
     std::vector<TensorMetadata> tensors;
     std::vector<std::string> assets;
     TensorLayout layout;
+    std::unordered_map<std::string, std::string> metadata;
     std::unordered_map<std::string, std::size_t> tensors_by_name;
 };
 
@@ -68,6 +91,29 @@ MfqSource::MfqSource(std::filesystem::path requested, FileReadMode mode)
     }
     std::sort(impl_->assets.begin(), impl_->assets.end());
 
+    impl_->metadata = impl_->index.header.metadata;
+    std::unordered_map<std::string, json> tensor_metadata;
+    std::unordered_set<std::string> logical_names;
+    for (const auto* key : {"tensor_shapes", "tq_shapes", "gguf_mixed_experts", "gguf_hadamard",
+                            "tq_row_shards", "tq.segments"}) {
+        const auto found = impl_->metadata.find(key);
+        if (found == impl_->metadata.end()) continue;
+        auto values = json::parse(found->second);
+        if (!values.is_object()) throw std::runtime_error(std::string("invalid MFQ tensor metadata: ") + key);
+        if (std::string_view(key) == "tq_row_shards" || std::string_view(key) == "tq.segments") {
+            for (const auto& [name, parts] : values.items()) {
+                if (!parts.is_array() || parts.empty() ||
+                    std::any_of(parts.begin(), parts.end(), [](const auto& part) { return !part.is_string(); }))
+                    throw std::runtime_error("invalid MFQ TQ row-shard manifest: " + name);
+                if (!impl_->index.names.count(name)) {
+                    logical_names.insert(name);
+                    stored_names.push_back(name);
+                }
+            }
+        }
+        tensor_metadata.emplace(key, std::move(values));
+    }
+
     std::unordered_map<std::string, std::string> stored_to_canonical;
     Names aliases;
     if (!has_asset(kModelGraphAsset) && has_asset(kModelConfigAsset)) {
@@ -80,8 +126,8 @@ MfqSource::MfqSource(std::filesystem::path requested, FileReadMode mode)
         for (const auto& [canonical, stored] :
              aliases.canonical_to_stored) {
             const auto record = impl_->index.names.find(stored);
-            if (record == impl_->index.names.end() ||
-                    impl_->index.records[record->second].asset ||
+            if ((record == impl_->index.names.end() && !logical_names.count(stored)) ||
+                    (record != impl_->index.names.end() && impl_->index.records[record->second].asset) ||
                     impl_->index.names.find(canonical) !=
                         impl_->index.names.end()) {
                 throw std::runtime_error(
@@ -97,12 +143,42 @@ MfqSource::MfqSource(std::filesystem::path requested, FileReadMode mode)
         }
     }
 
+    for (auto& [key, values] : tensor_metadata) {
+        auto normalized = json::object();
+        for (const auto& [stored, entry] : values.items()) {
+            const auto alias = stored_to_canonical.find(stored);
+            const auto& name = alias == stored_to_canonical.end() ? stored : alias->second;
+            auto value = entry;
+            if (key == "tensor_shapes" || key == "tq_shapes") (void)metadata_shape(value, name);
+            if (key == "tq_row_shards" || key == "tq.segments") {
+                for (auto& part : value) {
+                    const auto stored_part = part.get<std::string>();
+                    if (const auto found = stored_to_canonical.find(stored_part); found != stored_to_canonical.end())
+                        part = found->second;
+                }
+            }
+            if (normalized.contains(name) && normalized.at(name) != value)
+                throw std::runtime_error("conflicting canonical MFQ tensor metadata: " + name);
+            normalized[name] = std::move(value);
+        }
+        values = std::move(normalized);
+        impl_->metadata[key] = values.dump();
+    }
+
     for (const auto& record : impl_->index.records) {
         if (record.asset) continue;
         auto tensor = record.tensor;
         if (const auto found = stored_to_canonical.find(tensor.name);
             found != stored_to_canonical.end()) {
             tensor.name = found->second;
+        }
+        for (const auto* key : {"tq_shapes", "tensor_shapes"}) {
+            if (std::string_view(key) == "tq_shapes" && tensor.dtype != "TQ") continue;
+            const auto found = tensor_metadata.find(key);
+            if (found != tensor_metadata.end() && found->second.contains(tensor.name)) {
+                tensor.shape = metadata_shape(found->second.at(tensor.name), tensor.name);
+                break;
+            }
         }
         if (!impl_->tensors_by_name.emplace(
                 tensor.name, impl_->tensors.size()).second) {
@@ -113,7 +189,8 @@ MfqSource::MfqSource(std::filesystem::path requested, FileReadMode mode)
         impl_->tensors.push_back(std::move(tensor));
     }
     for (const auto& [stored, canonical] : stored_to_canonical) {
-        impl_->index.names.emplace(canonical, impl_->index.names.at(stored));
+        if (const auto found = impl_->index.names.find(stored); found != impl_->index.names.end())
+            impl_->index.names.emplace(canonical, found->second);
     }
     impl_->layout = aliases.layout;
 }
@@ -134,7 +211,7 @@ std::string_view MfqSource::architecture() const noexcept {
 }
 const std::unordered_map<std::string, std::string>&
 MfqSource::metadata() const noexcept {
-    return impl_->index.header.metadata;
+    return impl_->metadata;
 }
 const std::vector<TensorMetadata>& MfqSource::tensors() const noexcept {
     return impl_->tensors;

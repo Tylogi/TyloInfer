@@ -11,7 +11,7 @@
 
 #include "engine/backends/metal/native/memory.h"
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 bool is_nint_dtype(std::string_view dtype) noexcept;
 
@@ -239,4 +239,4 @@ private:
 
 mlx::core::array pack_nint_single_row(const MlxNintWeight& weight);
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

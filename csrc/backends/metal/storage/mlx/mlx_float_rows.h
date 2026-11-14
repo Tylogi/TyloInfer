@@ -10,7 +10,7 @@
 #include <string_view>
 #include <vector>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 class MlxFloatRowBatch {
 public:

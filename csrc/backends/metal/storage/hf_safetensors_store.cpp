@@ -15,7 +15,7 @@
 #include <unistd.h>
 #include <utility>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 
 std::uint64_t checked_add(std::uint64_t left, std::uint64_t right) {
@@ -193,7 +193,7 @@ HfSafetensorStore::HfSafetensorStore(
     std::filesystem::path root,
     bool bypass_file_cache)
     : impl_(std::make_unique<Impl>()) {
-    const mfq::Safetensors source(std::move(root));
+    const tyloi::Safetensors source(std::move(root));
     impl_->root = source.root();
     for (const auto& path : source.paths()) {
         auto shard = std::make_unique<Impl::Shard>();
@@ -666,4 +666,4 @@ MlxNativeMxfp4ExpertView MlxNativeMxfp4ExpertStore::view(
     };
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

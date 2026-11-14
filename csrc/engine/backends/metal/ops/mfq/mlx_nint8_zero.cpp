@@ -1,4 +1,6 @@
 #include "mlx_nint8_zero.h"
+#include "engine/backends/metal/native/tensor/tensor.h"
+#include "engine/weights/memory.h"
 
 #include "engine/backends/metal/native/memory.h"
 
@@ -17,7 +19,7 @@
 #include <tuple>
 #include <utility>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 
 using mlx::core::CompileOptions;
@@ -597,7 +599,10 @@ MlxNint8ZeroWeight::MlxNint8ZeroWeight(
       scales_(std::move(scales)),
       input_size_(input_size),
       output_size_(output_size),
-      groups_(groups) {}
+      groups_(groups) {
+    for (const auto* value : {&q_, &scales_})
+        tyloi::weights::observe_weight(tyloi::metal::tensor(*value));
+}
 
 MlxNint8ZeroWeight MlxNint8ZeroWeight::from_blob(
     std::span<const std::uint8_t> blob) {
@@ -1085,4 +1090,4 @@ std::size_t MlxNint8ZeroWeight::packed_nbytes() const noexcept {
     return q_.nbytes() + scales_.nbytes();
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

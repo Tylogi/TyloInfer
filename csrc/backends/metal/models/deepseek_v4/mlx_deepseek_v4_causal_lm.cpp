@@ -23,7 +23,7 @@
 #include <utility>
 #include <vector>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 
 using mlx::core::Dtype;
@@ -791,7 +791,7 @@ MlxDeepseekV4CausalLm::load(
         } else try {
             constexpr std::size_t prefill_buffers_minimum =
                 std::size_t{7} << 30;
-            ssd_expert_cache = mfq::with_mfq_compat([&] { return std::make_shared<MlxMoeSsdExpertCache>(
+            ssd_expert_cache = tyloi::with_mfq_compat([&] { return std::make_shared<MlxMoeSsdExpertCache>(
                 model,
                 std::move(expert_prefixes),
                 static_cast<std::size_t>(config.hidden),
@@ -802,7 +802,7 @@ MlxDeepseekV4CausalLm::load(
                 *expert_cache_bytes >= prefill_buffers_minimum); });
         } catch (const MlxMfeMxfp4Unsupported&) {
             expert_offload =
-                mfq::with_mfq_compat([&] { return std::make_shared<MlxMfeOffloadCache>(
+                tyloi::with_mfq_compat([&] { return std::make_shared<MlxMfeOffloadCache>(
                     model,
                     *expert_cache_bytes,
                     checked_int(
@@ -1170,7 +1170,7 @@ array MlxDeepseekV4CausalLm::forward_streaming_layers(
         ssd_expert_cache_
         && routed_rows >= 1
         && routed_rows <= 6
-        && (mfq::mfq_compat_enabled && mlx_ssd_route_transactions_enabled());
+        && (tyloi::mfq_compat_enabled && mlx_ssd_route_transactions_enabled());
 
     std::array<
         std::optional<MlxSsdPrefetchedExpertLayer>,
@@ -1212,7 +1212,7 @@ array MlxDeepseekV4CausalLm::forward_streaming_layers(
         return hidden;
     }
 
-    const bool force_transactions = (mfq::mfq_compat_enabled && mlx_ssd_force_route_transactions());
+    const bool force_transactions = (tyloi::mfq_compat_enabled && mlx_ssd_force_route_transactions());
     const auto group_layers = static_cast<std::size_t>(
         mlx_ssd_route_transaction_group_layers(
             static_cast<int>(layers_.size())));
@@ -1591,7 +1591,7 @@ array MlxDeepseekV4CausalLm::forward_chunk(
             tyloi::metal::eval_with_timing(
                 std::move(outputs));
         }
-        if (mfq::mfq_compat_enabled && ssd_expert_cache_ &&
+        if (tyloi::mfq_compat_enabled && ssd_expert_cache_ &&
             !ssd_expert_cache_->route_transaction_active()) {
             ssd_expert_cache_->release_deferred();
         }
@@ -1773,10 +1773,10 @@ std::size_t
 MlxDeepseekV4CausalLm::expert_cache_limit_bytes()
     const noexcept {
     if (tq_expert_cache_) return tq_expert_cache_->limit_bytes();
-    if (mfq::mfq_compat_enabled && expert_offload_) {
+    if (tyloi::mfq_compat_enabled && expert_offload_) {
         return expert_offload_->cache_limit_bytes();
     }
-    return (mfq::mfq_compat_enabled && ssd_expert_cache_)
+    return (tyloi::mfq_compat_enabled && ssd_expert_cache_)
         ? ssd_expert_cache_->cache_limit_bytes()
         : 0;
 }
@@ -1785,10 +1785,10 @@ std::size_t
 MlxDeepseekV4CausalLm::expert_resident_packed_bytes()
     const {
     if (tq_expert_cache_) return tq_expert_cache_->resident_bytes();
-    if (mfq::mfq_compat_enabled && expert_offload_) {
+    if (tyloi::mfq_compat_enabled && expert_offload_) {
         return expert_offload_->resident_packed_bytes();
     }
-    return (mfq::mfq_compat_enabled && ssd_expert_cache_)
+    return (tyloi::mfq_compat_enabled && ssd_expert_cache_)
         ? ssd_expert_cache_->stats().resident_bytes
         : 0;
 }
@@ -1796,10 +1796,10 @@ MlxDeepseekV4CausalLm::expert_resident_packed_bytes()
 std::size_t
 MlxDeepseekV4CausalLm::cached_expert_count() const {
     if (tq_expert_cache_) return tq_expert_cache_->stats().cached_experts;
-    if (mfq::mfq_compat_enabled && expert_offload_) {
+    if (tyloi::mfq_compat_enabled && expert_offload_) {
         return expert_offload_->cached_expert_count();
     }
-    return (mfq::mfq_compat_enabled && ssd_expert_cache_)
+    return (tyloi::mfq_compat_enabled && ssd_expert_cache_)
         ? ssd_expert_cache_->stats().resident_experts
         : 0;
 }
@@ -1826,24 +1826,24 @@ MlxDeepseekV4CausalLm::ssd_expert_cache_stats() const {
         result.pinned_cache_bytes = cache.pinned_bytes;
         return result;
     }
-    return (mfq::mfq_compat_enabled && ssd_expert_cache_)
+    return (tyloi::mfq_compat_enabled && ssd_expert_cache_)
         ? std::optional<MlxSsdExpertCacheStats>(
               ssd_expert_cache_->stats())
         : std::nullopt;
 }
 
 void MlxDeepseekV4CausalLm::prewarm_ssd_expert_arena() {
-    if (mfq::mfq_compat_enabled && ssd_expert_cache_) {
+    if (tyloi::mfq_compat_enabled && ssd_expert_cache_) {
         ssd_expert_cache_->prewarm_metal();
     }
 }
 
 void MlxDeepseekV4CausalLm::clear_expert_cache() {
     if (tq_expert_cache_) tq_expert_cache_->clear();
-    if (mfq::mfq_compat_enabled && expert_offload_) {
+    if (tyloi::mfq_compat_enabled && expert_offload_) {
         expert_offload_->clear();
     }
-    if (mfq::mfq_compat_enabled && ssd_expert_cache_) {
+    if (tyloi::mfq_compat_enabled && ssd_expert_cache_) {
         ssd_expert_cache_->clear();
     }
 }
@@ -2276,7 +2276,7 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
     const auto prefill_component_started =
         std::chrono::steady_clock::now();
     auto logits = [&]() {
-        mfq::engine::PrefillActivity prefill_activity;
+        tyloi::engine::PrefillActivity prefill_activity;
         tyloi::profiling::ProfileScope component_scope(
             profile_prefill
                 ? &prefill_component_profile
@@ -2715,4 +2715,4 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
     return generated;
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

@@ -11,7 +11,7 @@
 #include <algorithm>
 #include <climits>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 using namespace mlx::core;
 

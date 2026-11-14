@@ -2,7 +2,7 @@
 
 #include "mlx_ssd_expert_cache.h"
 
-namespace mfq::metal {
+namespace tyloi::metal {
 class MlxPackedExpertCache {
 public:
     virtual ~MlxPackedExpertCache() = default;
@@ -11,6 +11,7 @@ public:
         const mlx::core::array* parallel = nullptr) = 0;
     virtual void validate_layer(std::size_t layer, int experts, int input, int intermediate) const = 0;
     virtual void prepare_layer(std::size_t layer, int top_k) const = 0;
+    virtual void preload() = 0;
     virtual bool preserves_activation_dtype() const noexcept { return false; }
     virtual std::size_t limit_bytes() const noexcept = 0;
     virtual std::size_t backing_bytes() const noexcept = 0;
@@ -20,4 +21,4 @@ public:
     virtual MlxSsdExpertCacheStats stats() const = 0;
     virtual void clear() = 0;
 };
-} // namespace mfq::metal
+} // namespace tyloi::metal

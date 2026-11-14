@@ -11,7 +11,7 @@
 
 #include <climits>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 using namespace mlx::core;
 
@@ -207,7 +207,7 @@ MlxAffineIndirectWeight::MlxAffineIndirectWeight(Shape shape, int bits, int grou
 
 MlxAffineIndirectWeight MlxAffineIndirectWeight::from_address_tables(Shape shape, int bits, int group,
     Dtype dtype, std::array<array, 3> tables, std::shared_ptr<tyloi::metal::ResidentAllocations> residency) {
-    mfq::MlxAffineLayout layout;
+    tyloi::MlxAffineLayout layout;
     layout.shape.assign(shape.begin(), shape.end()); layout.bits = bits; layout.group_size = group;
     layout.scale_dtype = dtype == bfloat16 ? "BF16" : dtype == float16 ? "F16" : dtype == float32 ? "F32" : "";
     layout.validate();
@@ -269,4 +269,4 @@ array MlxAffineIndirectWeight::routed_swiglu(const MlxAffineIndirectWeight& up, 
         {((output_size() + 15) / 16) * 128, int(ids.size()), 1}, {128, 1, 1},
         {{"T", input.dtype()}, {"S", dtype_}, {"Q", bits_}, {"GS", group_size_}}, std::nullopt, false, {}).front();
 }
-} // namespace mfq::metal
+} // namespace tyloi::metal

@@ -48,29 +48,16 @@ tyloi::weights::Loader::Loader(const tyloi::source::Source& source, Options opti
 
 tyloi::weights::Loader tyloi::weights::Cache::loader(const source::Source& source,
         Loader::Options options, Loader::Placement placement) {
+    options.mirror_attention_kv = tyloi::cuda::env_flag(
+        "TYLOINFER_TP_MIRROR_QWEN35_ATTENTION_KV", true);
     auto impl = std::make_shared<Loader::Impl>(Loader::Impl{*this, data_->moe});
     return Loader(source, std::move(options), std::move(placement), std::move(impl));
 }
 
 tyloi::weights::Cache& tyloi::weights::Loader::cache() const noexcept { return impl_->cache; }
 
-void LayerPlacementConfig::prepare(int64_t layers) {
-    layer_devices.assign(static_cast<size_t>(layers), primary_device());
-    if (!enabled()) return;
-    const auto slices = tyloi::plan_tensor_parallel_slices(
-        layers, 1, devices, split);
-    for (const auto& slice : slices) {
-        for (int64_t layer = slice.begin; layer < slice.end; ++layer) {
-            layer_devices.at(static_cast<size_t>(layer)) = slice.device;
-        }
-    }
-}
-
-int LayerPlacementConfig::device_for_layer(int64_t layer) const {
-    if (layer < 0 || layer >= static_cast<int64_t>(layer_devices.size())) {
-        throw std::runtime_error("layer-placement index is outside the model");
-    }
-    return layer_devices.at(static_cast<size_t>(layer));
+static int cuda_device(const tyloi::weights::Loader::Placement& placement) {
+    return placement.target.is_cuda() ? placement.target.index : mfq_current_cuda_device();
 }
 
 static std::vector<std::uint8_t> read_weight(
@@ -85,13 +72,13 @@ static std::vector<std::uint8_t> read_weight(
 ::tyloi::Tensor tyloi::weights::Loader::tensor(const std::string& name) const {
     const auto& mfq = source;
     const tyloi::cuda::AllocationScope weight_memory;
-    const bool cpu_layer = placement.cpu;
-    MfqCudaGuard guard(placement.device);
+    const bool cpu_layer = placement.target.is_cpu();
+    MfqCudaGuard guard(cuda_device(placement));
     const auto* record = mfq.find_tensor(name);
     if (record ? record->dtype == "TQ" : tyloi::is_tq_table(mfq, name)) {
         // This entry is for parameters explicitly consumed as dense tensors
         // (norm/function tables), not ordinary quantized projections.
-        const auto weight=load_tq_weight(mfq,name,placement.device);
+        const auto weight=load_tq_weight(mfq,name,cuda_device(placement));
         auto ids=::tyloi::cuda::arange(weight.size(0),::tyloi::TensorOptions()
             .device(weight.device()).dtype(::tyloi::kInt64));
         auto value=tyloi::cuda::tq::embedding(weight,ids).to(::tyloi::kFloat32).contiguous();
@@ -100,7 +87,7 @@ static std::vector<std::uint8_t> read_weight(
     const auto & rec = tyloi::require_tensor(mfq, name);
 #if TYLOINFER_ENABLE_MFQ_COMPAT
     if (rec.dtype == "MFE") {
-        auto dense = materialize_mfe_dense(mfq, name, placement.device)
+        auto dense = materialize_mfe_dense(mfq, name, cuda_device(placement))
             .to(::tyloi::kFloat32)
             .contiguous();
         return std::make_shared<::tyloi::DenseTensor>(cpu_layer ? dense.cpu().contiguous() : dense);
@@ -109,7 +96,7 @@ static std::vector<std::uint8_t> read_weight(
         auto value = host_value(name);
         if (rec.dtype == "BF16" || rec.dtype == "F16")
             value = value.to(::tyloi::kFloat32);
-        return std::make_shared<::tyloi::DenseTensor>(cpu_layer ? value : value.to(::tyloi::Device(::tyloi::kCUDA, placement.device)).contiguous());
+        return std::make_shared<::tyloi::DenseTensor>(cpu_layer ? value : value.to(::tyloi::Device(::tyloi::kCUDA, cuda_device(placement))).contiguous());
     }
     auto blob = read_weight(placement.drop_cache, mfq, name);
     if (rec.dtype == "NINT8-0") {
@@ -139,7 +126,7 @@ static std::vector<std::uint8_t> read_weight(
 #else
     auto value = host_value(name);
     if (rec.dtype == "BF16" || rec.dtype == "F16") value = value.to(::tyloi::kFloat32);
-    return std::make_shared<::tyloi::DenseTensor>(cpu_layer ? value : value.to(::tyloi::Device(::tyloi::kCUDA, placement.device)).contiguous());
+    return std::make_shared<::tyloi::DenseTensor>(cpu_layer ? value : value.to(::tyloi::Device(::tyloi::kCUDA, cuda_device(placement))).contiguous());
 #endif
 }
 
@@ -197,7 +184,7 @@ static TensorParallelAxis infer_tensor_parallel_axis(
             slices_override) const {
     const auto& mfq = source;
     const tyloi::cuda::AllocationScope weight_memory;
-    const bool cpu_layer = placement.cpu;
+    const bool cpu_layer = placement.target.is_cpu();
     const bool logical_tq = !mfq.find_tensor(name) && tyloi::is_tq_table(mfq, name);
     const std::string dtype = logical_tq ? "TQ" : tyloi::require_tensor(mfq, name).dtype;
     ::tyloi::Tensor weight;
@@ -259,7 +246,7 @@ static TensorParallelAxis infer_tensor_parallel_axis(
                 shard.weight = std::make_shared<tyloi::encoding::TqTensor>(to_device_tq(image,shard.input_end-shard.input_begin,slice.device));
                 shards.push_back(std::move(shard));
             }
-        } else weight = std::make_shared<tyloi::encoding::TqTensor>(load_tq_weight(mfq,name,placement.device,!cpu_layer));
+        } else weight = std::make_shared<tyloi::encoding::TqTensor>(load_tq_weight(mfq,name,cuda_device(placement),!cpu_layer));
     } else
 #if TYLOINFER_ENABLE_MFQ_COMPAT
     if (is_nint_linear_dtype(dtype)) {
@@ -311,7 +298,7 @@ static TensorParallelAxis infer_tensor_parallel_axis(
             } else {
                 weight = std::make_shared<tyloi::NintTensor>(to_device_nint8_zero(
                     cpu, !cpu_layer,
-                    cpu_layer ? -1 : placement.device));
+                    cpu_layer ? -1 : cuda_device(placement)));
             }
         } else {
             const auto cpu = tyloi::nint::unpack(blob);
@@ -360,7 +347,7 @@ static TensorParallelAxis infer_tensor_parallel_axis(
             } else {
                 weight = std::make_shared<tyloi::NintTensor>(to_device_nint(
                     cpu, !cpu_layer,
-                    cpu_layer ? -1 : placement.device));
+                    cpu_layer ? -1 : cuda_device(placement)));
             }
         }
     } else if (is_nvq_linear_dtype(dtype)) {
@@ -408,7 +395,7 @@ static TensorParallelAxis infer_tensor_parallel_axis(
             weight = std::make_shared<tyloi::NvqTensor>(to_device_nvq(
                 cpu, !cpu_layer, options.quant.nvq2,
                 options.quant.nvq_groups,
-                cpu_layer ? -1 : placement.device));
+                cpu_layer ? -1 : cuda_device(placement)));
         }
     } else if (dtype == "MXFP4-SQ") {
         const auto payload = read_weight(placement.drop_cache, mfq, name);
@@ -439,7 +426,7 @@ static TensorParallelAxis infer_tensor_parallel_axis(
         } else {
             weight = std::make_shared<tyloi::Mxfp4SqTensor>(to_device_mxfp4_sq(
                 payload, !cpu_layer,
-                cpu_layer ? -1 : placement.device));
+                cpu_layer ? -1 : cuda_device(placement)));
         }
     } else if (tyloi::fp8sq::is_dtype(dtype)) {
         const auto payload = read_weight(placement.drop_cache, mfq, name);
@@ -471,7 +458,7 @@ static TensorParallelAxis infer_tensor_parallel_axis(
         } else {
             weight = std::make_shared<tyloi::Fp8SqTensor>(to_device_fp8_sq(
                 dtype, payload, !cpu_layer,
-                cpu_layer ? -1 : placement.device));
+                cpu_layer ? -1 : cuda_device(placement)));
         }
     } else
 #endif
@@ -506,7 +493,7 @@ static TensorParallelAxis infer_tensor_parallel_axis(
         } else {
             weight = std::make_shared<tyloi::Mxfp4Tensor>(to_device_mxfp4(
                 cpu, !cpu_layer,
-                cpu_layer ? -1 : placement.device));
+                cpu_layer ? -1 : cuda_device(placement)));
         }
     } else if (dtype == "MXFP8") {
         const auto cpu = tyloi::mxfp8::unpack(
@@ -539,7 +526,7 @@ static TensorParallelAxis infer_tensor_parallel_axis(
             weight = std::make_shared<tyloi::Mxfp8Tensor>(to_device_mxfp8(cpu, false));
         } else {
             weight = std::make_shared<tyloi::Mxfp8Tensor>(to_device_mxfp8(
-                cpu, true, placement.device));
+                cpu, true, cuda_device(placement)));
         }
     } else if (dtype == "BF16" || dtype == "F16" || dtype == "F32") {
         auto cpu = host_value(name);
@@ -582,8 +569,8 @@ static TensorParallelAxis infer_tensor_parallel_axis(
         } else if (cpu_layer) {
             weight = std::make_shared<::tyloi::DenseTensor>(cpu.contiguous());
         } else {
-            MfqCudaGuard guard(placement.device);
-            weight = std::make_shared<::tyloi::DenseTensor>(cpu.to(::tyloi::Device(::tyloi::kCUDA, placement.device)).contiguous());
+            MfqCudaGuard guard(cuda_device(placement));
+            weight = std::make_shared<::tyloi::DenseTensor>(cpu.to(::tyloi::Device(::tyloi::kCUDA, cuda_device(placement))).contiguous());
         }
     } else {
         throw std::runtime_error(
@@ -630,7 +617,7 @@ std::shared_ptr<const tyloi::MfeTensor> tyloi::weights::Loader::Impl::experts(co
     const auto& options = loader.options;
 #if TYLOINFER_ENABLE_MFQ_COMPAT
 
-    MfqCudaGuard guard(placement.device);
+    MfqCudaGuard guard(cuda_device(placement));
     const auto& quant = options.quant;
     const tyloi::cuda::AllocationScope weight_memory;
     const auto& cache = moe;
@@ -788,8 +775,8 @@ std::vector<::tyloi::Tensor> Loader::group(const std::vector<std::string>& names
         const auto* nint = layer.representation<tyloi::NintTensor>();
         return nint && nint->q_packed.is_cuda();
     });
-    if (all_nint && options.grouped && !placement.cpu && !preserve_boundaries) {
-        MfqCudaGuard guard(placement.device);
+    if (all_nint && options.grouped && !placement.target.is_cpu() && !preserve_boundaries) {
+        MfqCudaGuard guard(cuda_device(placement));
         return pack_nint(std::move(layers));
     }
 #endif
@@ -802,9 +789,10 @@ std::vector<::tyloi::Tensor> Loader::gate_up(const std::vector<std::string>& nam
                  preserve_boundaries);
 }
 ::tyloi::Tensor Loader::experts(const std::string& name, bool cacheable,
-    int layer, const std::string& role) const {
+    int layer, const std::string& role, bool cpu_offloaded) const {
+    if (cpu_offloaded) return load_mfe_cpu_offloaded(source, name);
     if (tyloi::is_tq_table(source, name)) {
-        MfqCudaGuard guard(placement.device);
+        MfqCudaGuard guard(cuda_device(placement));
         return impl_->cache.routed_tq(source, name, placement.experts);
     }
     const auto& dtype = tyloi::require_tensor(source, name).dtype;
@@ -828,7 +816,7 @@ std::vector<::tyloi::Tensor> Loader::gate_up(const std::vector<std::string>& nam
     auto value=tensor(name);
     if (!dense_storage) return value;
     std::optional<MfqCudaGuard> guard;
-    if (value.device().is_cuda()) guard.emplace(placement.device);
+    if (value.device().is_cuda()) guard.emplace(cuda_device(placement));
     return std::make_shared<::tyloi::DenseTensor>(value.dense().to(
         dtype=="F16" ? ::tyloi::kFloat16 : dtype=="BF16" ? ::tyloi::kBFloat16 : ::tyloi::kFloat32));
 }
@@ -838,7 +826,7 @@ std::vector<::tyloi::Tensor> Loader::gate_up(const std::vector<std::string>& nam
     const auto& file = source;
     const auto& dtype=tyloi::require_tensor(file, name).dtype;
     if(dtype=="TQ") {
-        MfqCudaGuard guard(placement.device);
+        MfqCudaGuard guard(cuda_device(placement));
         return impl_->cache.routed_tq(file, name, placement.experts, experts, output, input);
     }
     if (dtype=="F32" || dtype=="F16" || dtype=="BF16") {
@@ -909,8 +897,10 @@ std::vector<::tyloi::Tensor> Loader::routed_gate_up(const std::string& mlp_prefi
 
 ::tyloi::Tensor tyloi::weights::Loader::native(const std::string &name) const {
     const tyloi::cuda::AllocationScope weight_memory;
-    MfqCudaGuard guard(placement.device);
-    return std::make_shared<::tyloi::DenseTensor>(host_value(name).to(::tyloi::Device(::tyloi::kCUDA, placement.device)).contiguous());
+    auto value = host_value(name);
+    if (placement.target.is_cpu()) return std::make_shared<::tyloi::DenseTensor>(std::move(value));
+    MfqCudaGuard guard(cuda_device(placement));
+    return std::make_shared<::tyloi::DenseTensor>(value.to(placement.target).contiguous());
 }
 
 ::tyloi::Tensor tyloi::weights::Loader::embedding(const std::string& name, bool independent_output) const {
@@ -922,20 +912,20 @@ std::vector<::tyloi::Tensor> Loader::routed_gate_up(const std::string& mlp_prefi
     const auto& dtype=tyloi::require_tensor(source,name).dtype;
     const bool nint=tyloi::mfq_compat_enabled && dtype=="NINT";
     if(use_mapped && independent_output &&
-            !placement.tensor.enabled() && !placement.cpu &&
+            !placement.tensor.enabled() && !placement.target.is_cpu() &&
             (dtype=="BF16" || dtype=="F16" || dtype=="F32" || nint)) {
-        MfqCudaGuard guard(placement.device);
+        MfqCudaGuard guard(cuda_device(placement));
         try {
             const tyloi::cuda::AllocationScope weight_memory;
             if(nint) {
-                auto cpu = for_layer(placement.device, true).weight(name);
-                auto result=map_nint_embedding(cpu,placement.device,mapped_control);
+                auto cpu = for_layer(::tyloi::Device(::tyloi::kCPU)).weight(name);
+                auto result=map_nint_embedding(cpu,cuda_device(placement),mapped_control);
                 std::cerr<<"mapped_token_embedding rows="<<result.size(0)<<" width="<<result.size(1)
                          <<" dtype="<<dtype<<" read="<<(mapped_control?"device_control":"mapped_host")<<std::endl;
                 return result;
             }
             auto cpu=host_value(name);
-            auto result=map_dense_embedding(cpu,placement.device,mapped_control);
+            auto result=map_dense_embedding(cpu,cuda_device(placement),mapped_control);
             std::cerr<<"mapped_token_embedding bytes="<<cpu.numel()*cpu.element_size()
                      <<" rows="<<cpu.size(0)<<" width="<<cpu.size(1)<<" dtype="<<dtype
                      <<" read="<<(mapped_control?"device_control":"mapped_host")<<std::endl;
@@ -1004,7 +994,7 @@ BiasWeight Loader::affine(const std::string& weight_name,
 ::tyloi::Tensor Loader::norm(const std::string& name, std::int64_t width) const {
     auto value = tensor(name);
     std::optional<MfqCudaGuard> guard;
-    if (value.device().is_cuda()) guard.emplace(placement.device);
+    if (value.device().is_cuda()) guard.emplace(cuda_device(placement));
     auto weight = value.dense().to(::tyloi::kFloat32).contiguous();
     if (weight.dim() != 1 || weight.size(0) != width) {
         throw std::runtime_error("vision RMSNorm width mismatch: " + name);

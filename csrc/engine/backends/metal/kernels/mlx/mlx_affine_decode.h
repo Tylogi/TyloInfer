@@ -1,6 +1,6 @@
 #pragma once
 
-namespace mfq::metal::detail {
+namespace tyloi::metal::detail {
 inline constexpr const char* kMlxAffineDecode = R"METAL(
 template <int Q, typename W>
 inline uint tinfer_affine_code(W values, uint row, uint column, uint width) {
@@ -26,4 +26,4 @@ inline float tinfer_affine_value(W values, S scales, B biases, uint row, uint co
     return fma(float(scales[group]), float(tinfer_affine_code<Q>(values, row, column, width)), float(biases[group]));
 }
 )METAL";
-} // namespace mfq::metal::detail
+} // namespace tyloi::metal::detail

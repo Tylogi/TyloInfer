@@ -23,7 +23,7 @@ public:
     bool is_contiguous() const noexcept override { return false; }
     bool is_encoded() const noexcept override { return true; }
     std::vector<const DenseTensor*> buffers() const override { return {}; }
-    void record_stream(std::uintptr_t) const override {}
+    void record_stream(std::uintptr_t, std::shared_ptr<void> = {}) const override {}
     /** Retain the source on CPU; reject relocating an unread table to a device. */
     std::shared_ptr<TensorImpl> relocated(Device device) const override;
     /** Borrow the TQ reader, if this table uses TQ encoding. */

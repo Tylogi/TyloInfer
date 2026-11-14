@@ -11,7 +11,7 @@
 #include <vector>
 #include <mlx/mlx.h>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 class MlxQwen4CausalLm;
 class MlxQwen35CausalLm;

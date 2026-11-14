@@ -6,7 +6,7 @@
 
 #include <mlx/mlx.h>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 struct MlxGatedDeltaNetResult {
     mlx::core::array output;
@@ -189,4 +189,4 @@ MlxGatedDeltaCacheState replay_gated_delta_speculative_prefix(
     bool transposed_state = false,
     bool tiled_heads = false);
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

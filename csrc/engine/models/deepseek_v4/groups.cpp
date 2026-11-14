@@ -35,7 +35,7 @@ public:
         : model_(std::move(model)), weights_(weights), placement_(placement),
           offload_(options.cpu_offload_layers), primary_(placement.primary_device()),
           gpu_layers_(options.gpu_layers) {
-        if (weights_.placement.device != primary_)
+        if (weights_.placement.target != ::tyloi::Device(::tyloi::kCUDA, primary_))
             throw std::invalid_argument("DeepSeek V4 weight and layer primary devices differ");
         validate_offload(model_.config, offload_);
     }
@@ -65,7 +65,7 @@ public:
             std::cerr << "stream loading layer " << index << ' '
                 << model_.metadata.layer_types.at(static_cast<std::size_t>(index)) << std::endl;
             model_.layers.emplace_back();
-            load_layer(model_.layers.back(), weights_.for_layer(device, false), model_.config, index,
+            load_layer(model_.layers.back(), weights_.for_layer(::tyloi::Device(::tyloi::kCUDA, device)), model_.config, index,
                 model_.metadata.layer_types.at(static_cast<std::size_t>(index)),
                 executor.collectives(), primary_, offload_, host_bytes_);
         }

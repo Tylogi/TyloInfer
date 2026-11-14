@@ -76,20 +76,20 @@ int main(int argc, char** argv) {
         if (layer < 0 || layer >= 43 || expert < 0 || expert >= 256) {
             throw std::runtime_error("layer/expert is out of range");
         }
-        mfq::metal::MfqContainer model(argv[1]);
+        tyloi::metal::MfqContainer model(argv[1]);
         std::vector<std::string> layer_prefixes;
         layer_prefixes.reserve(43);
         for (std::size_t index = 0; index < 43; ++index) {
             layer_prefixes.push_back(
                 "model.block." + std::to_string(index));
         }
-        mfq::metal::MlxMfeMxfp4ExpertStore store(
+        tyloi::metal::MlxMfeMxfp4ExpertStore store(
             model,
             layer_prefixes,
             std::vector<std::size_t>(43, 256),
             4096,
             2048);
-        mfq::metal::MlxMxfp4SsdExpertArena arena(1, 4096, 2048);
+        tyloi::metal::MlxMxfp4SsdExpertArena arena(1, 4096, 2048);
         model.drop_source_file_cache();
         const auto begin = std::chrono::steady_clock::now();
         const auto stats = store.load_scatter(
@@ -116,7 +116,7 @@ int main(int argc, char** argv) {
             1);
         const auto gate_up_error = maximum_error(
             weights.gate_up.swiglu(hidden, ids, 0.0f),
-            mfq::metal::moe_limited_swiglu_split(
+            tyloi::metal::moe_limited_swiglu_split(
                 mlx::core::concatenate(
                     {gate_reference, up_reference},
                     -1),
@@ -142,7 +142,7 @@ int main(int argc, char** argv) {
             throw std::runtime_error("official MXFP4 routed validation failed");
         }
 
-        mfq::metal::MlxMoeSsdExpertCache cache(
+        tyloi::metal::MlxMoeSsdExpertCache cache(
             model,
             layer_prefixes,
             4096,
@@ -187,7 +187,7 @@ int main(int argc, char** argv) {
             throw std::runtime_error("SSD expert cache validation failed");
         }
 
-        mfq::metal::MlxMoeSsdExpertCache prefill_cache(
+        tyloi::metal::MlxMoeSsdExpertCache prefill_cache(
             model,
             layer_prefixes,
             4096,
@@ -206,7 +206,7 @@ int main(int argc, char** argv) {
             std::chrono::steady_clock::now() - prefill_begin).count();
         const auto prefill_error = maximum_error(
             current_weights.gate_up.swiglu(hidden, ids, 0.0f),
-            mfq::metal::moe_limited_swiglu_split(
+            tyloi::metal::moe_limited_swiglu_split(
                 mlx::core::concatenate(
                     {gate_reference, up_reference},
                     -1),

@@ -2,7 +2,7 @@
 #include "mlx_gguf.h"
 #include "mlx_gguf_routes.h"
 
-namespace mfq::metal {
+namespace tyloi::metal {
 bool gguf_expert_prefill_available(const mlx::core::array& input);
 bool gguf_short_sparse_routes(const mlx::core::array& ids, int experts);
 mlx::core::array gguf_dense_prefill(const mlx::core::array& input, const mlx::core::array& weight);
@@ -48,4 +48,4 @@ private:
     mlx::core::Dtype dtype_;
     int tokens_, selected_, padded_rows_;
 };
-} // namespace mfq::metal
+} // namespace tyloi::metal

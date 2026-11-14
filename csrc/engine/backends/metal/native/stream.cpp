@@ -20,6 +20,13 @@ thread_local Stream* active_stream = nullptr;
 Stream::Stream(mlx::core::Stream stream) : stream_(stream) {
     if (stream.device != mlx::core::Device(mlx::core::Device::gpu, 0))
         throw std::invalid_argument("Metal stream requires GPU device 0");
+    // MLX's default device is process-wide, whereas its default streams are
+    // thread-local. Select Metal once, before executor scopes start work.
+    static std::once_flag initialized;
+    std::call_once(initialized, [device = stream.device] {
+        if (mlx::core::default_device() != device)
+            mlx::core::set_default_device(device);
+    });
 }
 
 Stream::~Stream() {
@@ -33,14 +40,14 @@ Stream::~Stream() {
 
 StreamGuard::StreamGuard(Stream& stream)
     : previous_(active_stream),
-      previous_default_(mlx::core::peek_default_stream(stream.get().device)) {
+      previous_default_(mlx::core::default_stream(stream.get().device)) {
     mlx::core::set_default_stream(stream.get());
     active_stream = &stream;
 }
 
 StreamGuard::~StreamGuard() {
     active_stream = previous_;
-    if (previous_default_) mlx::core::set_default_stream(*previous_default_);
+    mlx::core::set_default_stream(previous_default_);
 }
 
 void Stream::record(const std::vector<mlx::core::array>& values) {

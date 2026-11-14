@@ -8,7 +8,7 @@
 #include <functional>
 #include <memory>
 
-namespace tyloi::cuda::qwen35 {
+namespace tyloi::models::qwen35 {
 
 class State;
 class Mtp;
@@ -41,4 +41,4 @@ private:
     bool preallocate_;
 };
 
-} // namespace tyloi::cuda::qwen35
+} // namespace tyloi::models::qwen35

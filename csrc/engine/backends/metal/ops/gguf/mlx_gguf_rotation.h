@@ -2,7 +2,7 @@
 #include <mlx/mlx.h>
 #include <vector>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 struct MlxGgufRotation {
     int block;
     std::vector<float> pattern;

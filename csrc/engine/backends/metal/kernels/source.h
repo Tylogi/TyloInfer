@@ -2,7 +2,7 @@
 
 #include <string>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 std::string qsa_prefill_indexer_source();
 std::string sparse_attention_source();

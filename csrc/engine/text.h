@@ -140,7 +140,7 @@ struct Text {
         auto scope = executor->enter();
         budget.emplace(*executor, *weight_memory, weights, cache,
             tyloi::Device(tyloi::kCUDA, load_config.layer_placement.primary_device()));
-        if (offload) offload->bind_budget(&*budget);
+        root_executor.bind_budget(&*budget);
         if (config.continuous_batch.max_sequences) {
             auto batch_config = config.continuous_batch;
             batch_config.cuda_graph &= model_parallel_cuda_graph_enabled(load_config, root_executor, weights);
@@ -181,9 +181,8 @@ struct Text {
         return batching && batch_compatible(request, cache.persistent_prefix_enabled(), mtp_available());
     }
     void clear_bindings() noexcept {
-        if(kv)kv->bind_budget(nullptr);
+        root_executor.bind_budget(nullptr);
         if (budget) budget->unbind();
-        if (offload) offload->bind_budget(nullptr);
     }
     ~Text() {
         clear_bindings();
@@ -228,14 +227,13 @@ struct Text {
             }();
             const auto* mtp = component_predictor(parts);
             const auto batch_metrics = batching ? batching->metrics() : Metrics{};
-            const auto kv_metrics = kv ? kv->metrics() : Metrics{};
-            const auto offload_metrics = offload ? std::optional<Metrics>{offload->metrics()} : std::nullopt;
+            const auto execution_metrics = root_executor.metrics();
             Metrics predictor_metrics;
             if (mtp) {
                 tyloi::engine::mtp::append_generation_metrics(predictor_metrics, mtp_state.stats);
             }
             return tyloi::engine::resource_metrics(component_values,profile_metrics,std::move(memory),streamed_kv,
-                batch_metrics,kv_metrics,offload_metrics,predictor_metrics,source.get(),
+                batch_metrics,execution_metrics,predictor_metrics,source.get(),
                 *weight_memory,weights,cache,*budget,
                 executor->memory(cuda_devices(load_config)),
                 tyloi::Device(tyloi::kCUDA, load_config.layer_placement.primary_device()),

@@ -12,7 +12,7 @@
 #include <utility>
 #include <vector>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 
 using mlx::core::Shape;
@@ -86,7 +86,7 @@ MlxDeepseekV41Moe MlxDeepseekV41Moe::load(
         ? std::optional<std::string>(expert_prefix + "up.weight")
         : std::nullopt;
     const auto down_name = expert_prefix + "down.weight";
-    if (mfq::mfq_compat_enabled && mfe_offload_cache &&
+    if (tyloi::mfq_compat_enabled && mfe_offload_cache &&
         (!mfe_offload_cache->can_group_mfe(gate_up_name)
          || (up_name && !mfe_offload_cache->can_group_mfe(*up_name))
          || !mfe_offload_cache->can_group_mfe(down_name))) {
@@ -125,7 +125,7 @@ MlxDeepseekV41Moe MlxDeepseekV41Moe::load(
             tq.emplace(TqWeights{MlxTqWeight::load(model, gate_up_name),
                 MlxTqWeight::load(model, *up_name), MlxTqWeight::load(model, down_name)});
         }
-    } else if (mfq::mfq_compat_enabled && !ssd_expert_cache && !mfe_offload_cache) {
+    } else if (tyloi::mfq_compat_enabled && !ssd_expert_cache && !mfe_offload_cache) {
         if (tq_expert_cache) throw std::invalid_argument("TQ cache cannot load non-TQ experts");
         if (split_gate_up) {
             gate.emplace(moe_weight(model, gate_up_name));
@@ -228,7 +228,7 @@ MlxDeepseekV41Moe::MlxDeepseekV41Moe(
     const bool split_resident = routed_gate_.has_value()
         && routed_up_.has_value();
     const bool combined_resident = routed_gate_up_.has_value();
-    const bool routed_geometry = !mfq::mfq_compat_enabled || (combined_resident
+    const bool routed_geometry = !tyloi::mfq_compat_enabled || (combined_resident
         ? routed_gate_up_->experts() == experts_
             && routed_gate_up_->neuron_len() == hidden_
             && ((routed_gate_up_->projections() == 2
@@ -259,7 +259,7 @@ MlxDeepseekV41Moe::MlxDeepseekV41Moe(
         (combined_resident || split_resident || tq_.has_value() || gguf_.has_value()) == cached ||
         (int(bool(ssd_expert_cache_)) + int(bool(mfe_offload_cache_)) + int(bool(tq_expert_cache_)) + int(bool(gguf_expert_cache_)) > 1) ||
         !routed_geometry ||
-        (mfq::mfq_compat_enabled && routed_down_ && (
+        (tyloi::mfq_compat_enabled && routed_down_ && (
         routed_down_->weight().experts() != experts_ ||
         routed_down_->weight().neuron_len() != intermediate_ ||
         routed_down_->weight().out_per_expert() != hidden_))) {
@@ -297,7 +297,7 @@ MlxDeepseekV41Moe::MlxDeepseekV41Moe(
         }
     }
     if (gguf_expert_cache_) gguf_expert_cache_->prepare_layer(expert_cache_layer_, top_k_, swiglu_limit_);
-    if (mfq::mfq_compat_enabled && mfe_offload_cache_) {
+    if (tyloi::mfq_compat_enabled && mfe_offload_cache_) {
         const auto gate = mfe_offload_cache_->projection_info(
             streamed_gate_up_name_);
         const auto down = mfe_offload_cache_->projection_info(
@@ -432,7 +432,7 @@ void MlxDeepseekV41Moe::use_gguf_offload(const std::shared_ptr<MlxGgufExpertCach
 
 std::optional<MlxMfeCachedRoute> MlxDeepseekV41Moe::cached_route() const {
 #if TYLOINFER_ENABLE_MFQ_COMPAT
-    if (!mfq::mfq_compat_enabled || !mfe_offload_cache_) return std::nullopt;
+    if (!tyloi::mfq_compat_enabled || !mfe_offload_cache_) return std::nullopt;
     MlxMfeCachedRoute route{mfe_offload_cache_, {}, std::nullopt};
     std::vector<std::string> names{streamed_gate_up_name_};
     if (streamed_up_name_) names.push_back(*streamed_up_name_);
@@ -452,7 +452,7 @@ std::optional<MlxSsdPrefetchedExpertLayer>
 MlxDeepseekV41Moe::prefetch_routed(std::size_t rows) const {
 #if TYLOINFER_ENABLE_MFQ_COMPAT
     constexpr std::size_t kFullLayerPrefetchRows = 512;
-    if (mfq::mfq_compat_enabled && ssd_expert_cache_ && rows >= kFullLayerPrefetchRows &&
+    if (tyloi::mfq_compat_enabled && ssd_expert_cache_ && rows >= kFullLayerPrefetchRows &&
         ssd_expert_cache_->prefill_overlap_enabled()) {
         return ssd_expert_cache_->prefetch_layer(expert_cache_layer_);
     }
@@ -591,7 +591,7 @@ MlxDeepseekV41MoeResult MlxDeepseekV41Moe::forward(
             resident_ids,
             routes.weights);
         snapshot.defer_transaction_global(routes.ids);
-    } else if (mfq::mfq_compat_enabled && ssd_expert_cache_) {
+    } else if (tyloi::mfq_compat_enabled && ssd_expert_cache_) {
         auto prepared = ssd_expert_cache_->prepare_routes(
             expert_cache_layer_, routes.ids);
         auto routed_hidden = prepared.weights().gate_up.swiglu(
@@ -600,7 +600,7 @@ MlxDeepseekV41MoeResult MlxDeepseekV41Moe::forward(
             routed_hidden,
             prepared.expert_ids(),
             routes.weights);
-    } else if (mfq::mfq_compat_enabled && mfe_offload_cache_) {
+    } else if (tyloi::mfq_compat_enabled && mfe_offload_cache_) {
         if (deferred_route) {
             auto output = deferred_route->forward(source, routes.ids, swiglu_limit_, &routes.weights);
             return {mlx::core::reshape(std::move(output), input.shape()),
@@ -772,4 +772,4 @@ MlxDeepseekV41MoeResult MlxDeepseekV41Moe::forward(
     };
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

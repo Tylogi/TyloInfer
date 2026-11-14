@@ -20,7 +20,7 @@
 #include <utility>
 #include <vector>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 
 using mlx::core::Shape;
@@ -1188,4 +1188,4 @@ array MlxDeepseekV41Attention::forward(
     return output;
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

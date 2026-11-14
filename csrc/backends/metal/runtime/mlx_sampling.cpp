@@ -13,7 +13,7 @@
 #include <utility>
 #include <vector>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 
 using mlx::core::CompileOptions;
@@ -1530,9 +1530,9 @@ array MlxSampler::next_random(const array& logits) {
 
 array MlxSampler::sample(const array& logits) {
     if (params_.greedy()) {
-        return mfq::metal::sample(logits, params_);
+        return tyloi::metal::sample(logits, params_);
     }
-    return mfq::metal::sample(
+    return tyloi::metal::sample(
         logits,
         params_,
         next_random(logits));
@@ -1562,4 +1562,4 @@ double MlxSampler::next_uniform() {
     return std::generate_canonical<double, 53>(rng_);
 }
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

@@ -47,6 +47,11 @@ if(TYLOINFER_BUILD_CUDA_ENGINE AND TYLOINFER_BUILD_HIP_RUNTIME)
         "Select either TYLOINFER_BUILD_CUDA_ENGINE or TYLOINFER_BUILD_HIP_RUNTIME; use separate build directories for both backends")
 endif()
 
+if(TYLOINFER_BUILD_CUDA_ENGINE AND TYLOINFER_BUILD_METAL_RUNTIME)
+    message(FATAL_ERROR
+        "Select either TYLOINFER_BUILD_CUDA_ENGINE or TYLOINFER_BUILD_METAL_RUNTIME; use separate build directories for both backends")
+endif()
+
 if(APPLE)
     set(_TYLOINFER_BUILD_TRANSPORT_DEFAULT OFF)
 else()

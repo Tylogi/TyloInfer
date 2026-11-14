@@ -5,17 +5,17 @@
 #include <mlx/mlx.h>
 #include <array>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 class MlxAffineRowBatch {
 public:
-    void append(const mfq::MlxAffineLayout& layout, std::span<const std::uint8_t> values,
+    void append(const tyloi::MlxAffineLayout& layout, std::span<const std::uint8_t> values,
         std::span<const std::uint8_t> scales, std::span<const std::uint8_t> biases);
     void append_batch(const MlxAffineRowBatch& batch);
     mlx::core::array decode(mlx::core::Dtype dtype = mlx::core::float16) const;
     std::size_t source_bytes_read() const noexcept { return values_.size() + scales_.size() + biases_.size(); }
 private:
-    mfq::MlxAffineLayout layout_;
+    tyloi::MlxAffineLayout layout_;
     std::vector<std::uint8_t> values_, scales_, biases_;
 };
 
@@ -30,9 +30,9 @@ public:
         return {values_.file_identity(), scales_.file_identity(), biases_.file_identity()};
     }
 private:
-    mfq::MlxAffineLayout layout_;
+    tyloi::MlxAffineLayout layout_;
     MfqMappedBytes values_, scales_, biases_;
     std::size_t value_stride_, scale_stride_;
 };
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

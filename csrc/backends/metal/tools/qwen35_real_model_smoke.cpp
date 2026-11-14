@@ -21,9 +21,9 @@ namespace {
 using Clock = std::chrono::steady_clock;
 using mlx::core::Shape;
 using mlx::core::array;
-using mfq::metal::MfqContainer;
-using mfq::metal::MlxQwen35CausalLm;
-using mfq::metal::Qwen35Config;
+using tyloi::metal::MfqContainer;
+using tyloi::metal::MlxQwen35CausalLm;
+using tyloi::metal::Qwen35Config;
 
 void require(bool condition, const std::string& message) {
     if (!condition) {
@@ -305,7 +305,7 @@ int main(int argc, char** argv) {
         print_memory("after decode");
 
         constexpr std::int32_t benchmark_tokens = 64;
-        mfq::metal::MlxSamplingParams greedy;
+        tyloi::metal::MlxSamplingParams greedy;
         const auto benchmark_start = Clock::now();
         const auto generated = model.generate(
             {1},

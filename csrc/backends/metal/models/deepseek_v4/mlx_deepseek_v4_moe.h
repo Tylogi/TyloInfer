@@ -16,7 +16,7 @@
 
 #include <mlx/mlx.h>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 struct MlxDeepseekV4MoeResult {
     mlx::core::array output;
@@ -199,4 +199,4 @@ private:
     int available_count_ = 0;
 };
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

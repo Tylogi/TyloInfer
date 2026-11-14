@@ -38,6 +38,8 @@ public:
     std::vector<tyloi::Executor::Memory> memory(std::span<const tyloi::Device> devices) const override;
     void reclaim(tyloi::Device device) override;
     void set_memory_limit(tyloi::Device device, std::size_t bytes) override;
+    void bind_budget(tyloi::engine::Budget* budget) override;
+    tyloi::engine::Metrics metrics() const override;
     void drain() override;
     void clear() override;
     // Set the default device during loading, before publication or concurrent submissions.
@@ -159,6 +161,8 @@ private:
     RouteStats& routes_;
     std::weak_ptr<KvMemoryManager> kv_memory_;
     std::weak_ptr<KvOffloadStore> kv_offload_;
+    std::shared_ptr<KvMemoryManager> owned_kv_memory_;
+    std::shared_ptr<KvOffloadStore> owned_kv_offload_;
     int primary_;
     std::vector<AttentionScratch> scratch_;
     MfeScratch mfe_scratch_;

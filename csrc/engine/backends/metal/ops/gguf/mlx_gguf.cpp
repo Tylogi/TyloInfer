@@ -30,7 +30,7 @@
 #include <cstring>
 #include <stdexcept>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 using namespace mlx::core;
 struct Format { const char* name; int id, block, bytes; };
@@ -831,10 +831,21 @@ MlxGgufWeight MlxGgufWeight::allocate_packed(std::string_view dtype, Shape shape
 }
 MlxGgufWeight MlxGgufWeight::from_bytes(std::string_view dtype,
     std::span<const std::uint8_t> bytes, Shape shape) {
+    return from_bytes_impl(dtype, bytes, std::move(shape), nullptr, {});
+}
+MlxGgufWeight MlxGgufWeight::from_bytes(std::string_view dtype,
+    std::span<const std::uint8_t> bytes, Shape shape,
+    const tyloi::source::Source& source, const std::string& name) {
+    return from_bytes_impl(dtype, bytes, std::move(shape), &source, name);
+}
+MlxGgufWeight MlxGgufWeight::from_bytes_impl(std::string_view dtype,
+    std::span<const std::uint8_t> bytes, Shape shape,
+    const tyloi::source::Source* source, const std::string& name) {
     const auto geometry = packed_geometry(dtype, shape, bytes.size());
     const std::int64_t packed_shape[]{geometry.rows, geometry.row_bytes};
     const auto tensor = tyloi::metal::copy_from_host(bytes.data(), packed_shape, tyloi::metal::scalar_type(uint8));
     auto result = MlxGgufWeight(tyloi::metal::array(tensor), std::move(shape), geometry.format, geometry.row_bytes);
+    if (source) result.configure_hadamard(*source, name);
     if (use_nax() && result.expert_count() <= 512)
         MlxGgufStagedPrefill::prepare(result);
     tyloi::metal::AllocationScope::record(tyloi::metal::array(result.bytes_));
@@ -1204,4 +1215,4 @@ array MlxGgufWeight::routed_swiglu_inputs(const MlxGgufWeight& up, const array& 
         std::vector<array>{tyloi::metal::array(first.bytes_), tyloi::metal::array(second.bytes_), contiguous(reverse ? up_input : input),
             contiguous(astype(expert_ids, int32)), contiguous(reverse ? input : up_input)});
 }
-} // namespace mfq::metal
+} // namespace tyloi::metal

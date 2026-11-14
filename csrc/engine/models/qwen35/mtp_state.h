@@ -6,7 +6,7 @@
 
 #include <vector>
 
-namespace tyloi::cuda::qwen35 {
+namespace tyloi::models::qwen35 {
 
 class MtpState final : public tyloi::models::MtpState {
 public:
@@ -46,4 +46,4 @@ private:
     int64_t position_ = 0;
 };
 
-} // namespace tyloi::cuda::qwen35
+} // namespace tyloi::models::qwen35

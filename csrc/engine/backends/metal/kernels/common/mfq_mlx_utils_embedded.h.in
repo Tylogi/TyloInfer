@@ -1,6 +1,6 @@
 #pragma once
 
-namespace mfq::metal::detail {
+namespace tyloi::metal::detail {
 inline constexpr char kMlxUtilsSource[] = R"MFQMLX(
 #include <metal_stdlib>
 #include <metal_math>

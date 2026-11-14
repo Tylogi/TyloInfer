@@ -21,12 +21,12 @@ namespace {
 
 using mlx::core::Shape;
 using mlx::core::array;
-using mfq::metal::MfqContainer;
-using mfq::metal::MlxQwen35FullAttentionBlock;
-using mfq::metal::MlxQwen35LinearAttentionBlock;
-using mfq::metal::Qwen35Config;
-using mfq::metal::Qwen35ResolvedLayerNames;
-using mfq::metal::Qwen35TensorNames;
+using tyloi::metal::MfqContainer;
+using tyloi::metal::MlxQwen35FullAttentionBlock;
+using tyloi::metal::MlxQwen35LinearAttentionBlock;
+using tyloi::metal::Qwen35Config;
+using tyloi::metal::Qwen35ResolvedLayerNames;
+using tyloi::metal::Qwen35TensorNames;
 
 constexpr std::size_t kLinearLayer = 0;
 constexpr std::size_t kFullLayer = 3;
@@ -113,7 +113,7 @@ void print_tensor(
     const MfqContainer& model,
     const std::string& name) {
     const auto metadata =
-        mfq::metal::inspect_qwen35_tensor_metadata(model, name);
+        tyloi::metal::inspect_qwen35_tensor_metadata(model, name);
     std::cout << "  " << name << ": " << metadata.dtype << " [";
     for (std::size_t index = 0;
          index < metadata.shape.size();
@@ -319,7 +319,7 @@ int main(int argc, char** argv) {
         const MfqContainer model(argv[1]);
         const auto names = Qwen35TensorNames::canonical();
         const auto config =
-            mfq::metal::adapt_qwen35_config_for_storage(
+            tyloi::metal::adapt_qwen35_config_for_storage(
                 Qwen35Config::from_mfq(model),
                 model.legacy_tensor_layout().qwen_gdn_gguf_layout);
         require(

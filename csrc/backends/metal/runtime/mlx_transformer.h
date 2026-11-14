@@ -7,7 +7,7 @@
 
 #include <mlx/mlx.h>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 struct MlxYarnScaling {
     bool enabled = false;
@@ -72,4 +72,4 @@ mlx::core::array mlx_circular_cache_history(
     const mlx::core::array& cache,
     int position);
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

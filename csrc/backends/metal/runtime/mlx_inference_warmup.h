@@ -6,7 +6,7 @@
 #include <functional>
 #include <vector>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 using MlxWarmupGenerate = std::function<void(const std::vector<std::int64_t>&,
     const MlxSamplingParams&, int)>;

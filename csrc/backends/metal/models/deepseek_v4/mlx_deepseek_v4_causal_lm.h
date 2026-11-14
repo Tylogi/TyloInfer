@@ -1,6 +1,6 @@
 #pragma once
 
-#include "tyloinfer/token_constraint.h"
+#include "engine/requests/constraint.h"
 #include "deepseek_v4_model.h"
 #include "mlx_deepseek_v4_attention.h"
 #include "mlx_deepseek_v4_dspark.h"
@@ -21,7 +21,7 @@
 
 #include <mlx/mlx.h>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 using MlxDeepseekV4PrefillCallback = std::function<void(
     std::size_t prompt_tokens,
@@ -414,4 +414,4 @@ private:
     std::optional<MlxDeepseekV4DSparkState> stable_dspark_state_;
 };
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

@@ -2,8 +2,6 @@
 #include "engine/scheduler/scheduler.h"
 #include "engine/generation/batch.h"
 #include "engine/generation/batch_ops.h"
-#include "engine/state/kv_memory.h"
-#include "engine/state/kv_offload.h"
 #include "engine/generation/generation.h"
 #include "engine/generation/mtp/metrics.h"
 #include "engine/models/common/mtp.h"
@@ -34,11 +32,10 @@ Engine::Engine(std::unique_ptr<models::CausalModel> model, std::unique_ptr<tyloi
         std::unique_ptr<models::State> model_state, std::unique_ptr<state::Sessions> sessions,
         std::unique_ptr<TextProcessor> text, models::ForwardOptions forward,
         std::unique_ptr<tyloi::Executor::Graph> graph, std::unique_ptr<Batch> batch,
-        std::unique_ptr<tyloi::Executor> predictor_execution,
-        std::shared_ptr<cuda::KvMemoryManager> kv, std::shared_ptr<cuda::KvOffloadStore> offload) {
+        std::unique_ptr<tyloi::Executor> predictor_execution) {
     rebind(std::move(model), std::move(executor), std::move(config), std::move(source),
         std::move(memory), std::move(weights), std::move(model_state), std::move(sessions),
-        std::move(text), std::move(forward), std::move(graph), std::move(batch), std::move(predictor_execution), std::move(kv), std::move(offload));
+        std::move(text), std::move(forward), std::move(graph), std::move(batch), std::move(predictor_execution));
     start();
 }
 
@@ -70,8 +67,7 @@ void Engine::install(std::unique_ptr<tyloi::Executor::Graph> graph) {
         tyloi::weights::LoadScope memory_load(*ledger_);
         budget_.emplace(*executor_, *ledger_, *weights_, *cache_, config_.device);
         budget_->bind(predictor != nullptr);
-        if (kv_) kv_->bind_budget(&*budget_);
-        if (offload_) offload_->bind_budget(&*budget_);
+        executor_->bind_budget(&*budget_);
         if (!batch_ && config_.continuous_batch.max_sequences)
             batch_ = engine::make_batch(*model_, *executor_, *weights_, *budget_, config_);
         if (batch_) batch_->bind(*budget_);
@@ -105,8 +101,7 @@ void Engine::rebind(std::unique_ptr<models::CausalModel>&& model, std::unique_pt
         std::unique_ptr<models::State>&& model_state, std::unique_ptr<state::Sessions>&& sessions,
         std::unique_ptr<TextProcessor>&& text, models::ForwardOptions forward,
         std::unique_ptr<tyloi::Executor::Graph>&& graph, std::unique_ptr<Batch>&& batch,
-        std::unique_ptr<tyloi::Executor>&& predictor_execution,
-        std::shared_ptr<cuda::KvMemoryManager>&& kv, std::shared_ptr<cuda::KvOffloadStore>&& offload) {
+        std::unique_ptr<tyloi::Executor>&& predictor_execution) {
     if (executor_) unload_model();
     model_ = std::move(model);
     executor_ = std::move(executor);
@@ -116,8 +111,6 @@ void Engine::rebind(std::unique_ptr<models::CausalModel>&& model, std::unique_pt
     source_ = std::move(source);
     ledger_ = std::move(memory);
     weights_ = std::move(weights);
-    kv_ = std::move(kv);
-    offload_ = std::move(offload);
     idle_state_ = std::move(model_state);
     serial_state_ = idle_state_.get();
     cache_ = std::move(sessions);
@@ -185,8 +178,6 @@ void Engine::drain() {
     } catch (...) { failure = std::current_exception(); }
     try { if (weights_) weights_->drain(); }
     catch (...) { if (!failure) failure = std::current_exception(); }
-    try { if (offload_) offload_->flush(); }
-    catch (...) { if (!failure) failure = std::current_exception(); }
     try { executor_->drain(); }
     catch (...) { if (!failure) failure = std::current_exception(); }
     if (failure) std::rethrow_exception(failure);
@@ -207,7 +198,6 @@ void Engine::unload_model() {
         serial_state_ = nullptr;
         idle_state_.reset();
         if (weights_) weights_->clear_workspace();
-        offload_.reset(); kv_.reset();
         budget_.reset(); cache_.reset();
         model_.reset();
         text_.reset();
@@ -217,7 +207,7 @@ void Engine::unload_model() {
             predictor_execution_->clear();
         }
         predictor_execution_.reset();
-        // Execution resources retire last: state and weight backing free first.
+        // Retire execution-owned KV after state, while its weight cache is alive.
         executor_->clear();
         weights_.reset();
         scope.reset();
@@ -244,7 +234,7 @@ ControlResult Engine::control_command(ControlRequest request) {
             if (model_->predictor()) mtp::append_generation_metrics(predictor_metrics, mtp_state_.stats);
             return resource_metrics(model_->metrics(), {}, serial_state_ ? std::optional<Metrics>(serial_state_->metrics()) : std::nullopt,
                 model_info_.streamed_kv, batch_ ? batch_->metrics() : Metrics{},
-                kv_ ? kv_->metrics() : Metrics{}, offload_ ? std::optional<Metrics>(offload_->metrics()) : std::nullopt,
+                executor_->metrics(),
                 predictor_metrics, source_.get(),
                 *ledger_, *weights_, *cache_, *budget_,
                 executor_->memory(config_.devices), config_.device, config_.online_budget);
@@ -263,8 +253,7 @@ void Engine::execute(const std::vector<RequestId>& eligible) {
 }
 
 void Engine::clear_bindings() noexcept {
-    if (kv_) kv_->bind_budget(nullptr);
-    if (offload_) offload_->bind_budget(nullptr);
+    if (executor_) executor_->bind_budget(nullptr);
     if (budget_) budget_->unbind();
 }
 

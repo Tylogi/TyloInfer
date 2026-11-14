@@ -12,7 +12,7 @@
 #include "mlx_tensor.h"
 #include "mlx_transformer.h"
 
-#include "tyloinfer/token_constraint.h"
+#include "engine/requests/constraint.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -24,7 +24,7 @@
 
 #include <mlx/mlx.h>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 struct MlxDeepseekV41LayerState {
     MlxDeepseekV41AttentionState attention;
@@ -323,4 +323,4 @@ private:
     MlxMtpGenerationStats last_mtp_stats_;
 };
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

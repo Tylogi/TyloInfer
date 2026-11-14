@@ -50,7 +50,7 @@
 namespace tyloi::cuda::engine_detail {
 
 using State = std::variant<
-    std::unique_ptr<Text<qwen35::Model, qwen35::State, qwen35::Components>>,
+    std::unique_ptr<Text<::tyloi::models::qwen35::Model, ::tyloi::models::qwen35::State, qwen35::Components>>,
     std::unique_ptr<Text<minicpmo45::text::Model, minicpmo45::text::State, std::unique_ptr<minicpmo45::Components>>>,
     std::unique_ptr<Text<minicpmo45::Model, minicpmo45::State, std::monostate>>,
     std::unique_ptr<Text<glm_dsa::Model, glm_dsa::State, std::monostate>>,
@@ -173,17 +173,20 @@ std::unique_ptr<engine::Engine> load_native_engine(CudaEngineOptions options, en
         config.stop_token_ids = models::stop_token_ids(models::config_json(*source, options.config_path), vocab_size);
         config.resident_budget_bytes = ::tyloi::cuda::options::resident_budget_bytes();
         models::ForwardOptions forward{mode.kv_capacity, mode.trace, mode.trace_layer, mode.primary, mode.ffn.batch_serial};
+        // The root executor owns KV before Engine takes over, including failed installation.
+        offload.reset();
+        kv.reset();
         execution = std::move(root);
         if (target) {
             target->rebind(std::move(model), std::move(execution), std::move(config), std::move(source),
                 std::move(ledger), std::move(weights), std::move(state), std::move(sessions),
-                std::move(text), forward, std::move(graph), {}, std::move(predictor_execution), std::move(kv), std::move(offload));
+                std::move(text), forward, std::move(graph), {}, std::move(predictor_execution));
             return {};
         }
         return std::make_unique<engine::Engine>(std::move(model), std::move(execution), std::move(config),
             std::move(source), std::move(ledger), std::move(weights), std::move(state),
             std::move(sessions), std::move(text), forward, std::move(graph),
-            std::unique_ptr<engine::Batch>{}, std::move(predictor_execution), std::move(kv), std::move(offload));
+            std::unique_ptr<engine::Batch>{}, std::move(predictor_execution));
     } catch (...) {
         const auto failure = std::current_exception();
         auto* owner = execution ? execution.get() : root.get();
@@ -196,7 +199,6 @@ std::unique_ptr<engine::Engine> load_native_engine(CudaEngineOptions options, en
                 };
                 if (graph) graph->invalidate();
                 finish([&] { if (weights) weights->drain(); });
-                finish([&] { if (offload) offload->flush(); });
                 finish([&] {
                     if (predictor_execution) {
                         auto predictor_scope = predictor_execution->enter();
@@ -307,6 +309,7 @@ void setup_cuda_load(
     config.weights.min_slots = 8;
     offload.reset();
     kv.reset();
+    executor.configure_kv({}, {});
     weights.begin_load();
     if (options.n_gpu_layers_set) config.n_gpu_layers = options.n_gpu_layers;
     if (options.cpu_threads_set && options.cpu_threads <= 0) {

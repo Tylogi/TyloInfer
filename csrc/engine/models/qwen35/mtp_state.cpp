@@ -6,7 +6,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace tyloi::cuda::qwen35 {
+namespace tyloi::models::qwen35 {
 
 namespace {
 void require_state(bool condition, const char* message) {
@@ -167,4 +167,4 @@ void MtpState::publish(Restore&& restore) noexcept {
     position_ = restore.position;
 }
 
-} // namespace tyloi::cuda::qwen35
+} // namespace tyloi::models::qwen35

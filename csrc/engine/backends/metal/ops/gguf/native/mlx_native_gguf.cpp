@@ -26,7 +26,7 @@
 #include <stdexcept>
 #include <unordered_map>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 namespace {
 using namespace mlx::core;
 using splash::metal::MetalBuffer;

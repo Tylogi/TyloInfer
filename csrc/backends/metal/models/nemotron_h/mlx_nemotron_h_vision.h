@@ -14,7 +14,7 @@
 
 #include <mlx/mlx.h>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 // RADIO patch generator + pre-LayerNorm ViT encoder. `encode` accepts
 // normalized [patch_count, patch_width] pixels and returns the tower's
@@ -165,4 +165,4 @@ private:
     std::string input_contract_;
 };
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

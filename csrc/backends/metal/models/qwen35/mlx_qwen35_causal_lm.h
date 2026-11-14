@@ -1,6 +1,6 @@
 #pragma once
 
-#include "tyloinfer/token_constraint.h"
+#include "engine/requests/constraint.h"
 #include "mlx_qwen35_full_attention.h"
 #include "mlx_qwen35_linear_attention.h"
 #include "mlx_mtp.h"
@@ -19,7 +19,7 @@
 
 #include <mlx/mlx.h>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 using MlxQwen35Layer = std::variant<
     MlxQwen35FullAttentionBlock,
@@ -302,7 +302,7 @@ private:
     std::optional<MlxQwen35MtpModule> mtp_;
     std::optional<MlxGridVisionPromptComponent> vision_;
     MlxMtpGenerationStats last_mtp_stats_;
-    mfq::engine::mtp::PolicyState mtp_policy_state_;
+    tyloi::engine::mtp::PolicyState mtp_policy_state_;
     std::vector<std::size_t> last_prefill_chunk_sizes_;
     int cache_position_ = 0;
     int cache_batch_ = 0;
@@ -313,4 +313,4 @@ private:
     std::optional<mlx::core::array> hidden_capture_;
 };
 
-} // namespace mfq::metal
+} // namespace tyloi::metal

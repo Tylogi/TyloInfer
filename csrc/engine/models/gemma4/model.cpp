@@ -40,7 +40,7 @@ tyloi::engine::Metrics Model::metrics() const {
 
 Model read(std::shared_ptr<const tyloi::ModelSource> source, std::string_view definition,
            std::int64_t context) {
-    validate_model_source(*source);
+    ::tyloi::models::validate_model_source(*source);
     Model model;
     model.source = std::move(source);
     model.graph = tyloi::models::graph(*model.source);

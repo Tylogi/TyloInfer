@@ -9,13 +9,13 @@
 #include <iostream>
 #include <unordered_map>
 
-namespace mfq::metal {
+namespace tyloi::metal {
 
 struct MlxMtpBatchRound {
-    std::shared_ptr<mfq::engine::mtp::BatchDepthPolicy> policy;
-    mfq::engine::mtp::BatchDepthPolicy::Clock::time_point started;
-    mfq::engine::mtp::BatchDepthPolicy::Clock::time_point finished;
-    std::vector<mfq::engine::mtp::BatchAcceptance> accepted;
+    std::shared_ptr<tyloi::engine::mtp::BatchDepthPolicy> policy;
+    tyloi::engine::mtp::BatchDepthPolicy::Clock::time_point started;
+    tyloi::engine::mtp::BatchDepthPolicy::Clock::time_point finished;
+    std::vector<tyloi::engine::mtp::BatchAcceptance> accepted;
     std::size_t expected;
     std::uint64_t prefill_epoch;
     int depth;
@@ -36,8 +36,8 @@ inline MlxSamplingParams mlx_batch_sampling(const MfqSamplingParams& input) {
     return result;
 }
 
-struct MlxQwen4BatchRequest : mfq::engine::BatchRequest {
-    MlxQwen4BatchRequest(std::string id, const mfq::engine::InferenceRequest& input)
+struct MlxQwen4BatchRequest : tyloi::engine::BatchRequest {
+    MlxQwen4BatchRequest(std::string id, const tyloi::engine::InferenceRequest& input)
         : BatchRequest(std::move(id), input), sampler(mlx_batch_sampling(input.sampling)),
           cache_plan(input.cache_plan), history(input.prompt) {}
     MlxSampler sampler;
@@ -68,7 +68,7 @@ struct MlxQwen4BatchRequest : mfq::engine::BatchRequest {
 class MlxQwen4BatchOperations {
 public:
     using Request = MlxQwen4BatchRequest;
-    using State = mfq::engine::BatchState<Request>;
+    using State = tyloi::engine::BatchState<Request>;
     struct Sample {
         std::int64_t token = 0;
         MfqPrefillTiming timing;
@@ -102,8 +102,8 @@ public:
         return restored;
     }
     std::int64_t prefix_tokens(const std::shared_ptr<Request>& request) { return request->prefix; }
-    mfq::engine::PrefillChunk prefill_chunk(const std::shared_ptr<Request>& request,
-        mfq::engine::PrefillChunk chunk) {
+    tyloi::engine::PrefillChunk prefill_chunk(const std::shared_ptr<Request>& request,
+        tyloi::engine::PrefillChunk chunk) {
         if (request->prefix && hooks_.block_size) {
             const auto end = std::min<std::int64_t>(chunk.offset + chunk.count,
                 (chunk.offset / hooks_.block_size + 1) * hooks_.block_size);
@@ -112,11 +112,11 @@ public:
         }
         return chunk;
     }
-    Sample prefill(const std::shared_ptr<Request>& request, mfq::engine::PrefillChunk chunk) {
+    Sample prefill(const std::shared_ptr<Request>& request, tyloi::engine::PrefillChunk chunk) {
         return prefill_batch({{request, chunk}}).front();
     }
     std::vector<Sample> prefill_batch(
-        const std::vector<std::pair<std::shared_ptr<Request>, mfq::engine::PrefillChunk>>& pending) {
+        const std::vector<std::pair<std::shared_ptr<Request>, tyloi::engine::PrefillChunk>>& pending) {
         ++prefill_epoch_;
         if (policy_) policy_->interrupt();
         const auto started = std::chrono::steady_clock::now();
@@ -182,7 +182,7 @@ public:
             if (policy_) park_memory_.retired(*policy_);
             policy_.reset();
             if (!ids.empty()) {
-                policy_ = std::make_shared<mfq::engine::mtp::BatchDepthPolicy>(std::move(ids), maximum, ordinary.size());
+                policy_ = std::make_shared<tyloi::engine::mtp::BatchDepthPolicy>(std::move(ids), maximum, ordinary.size());
                 park_memory_.seed(*policy_);
             }
             ordinary_cohort_ = std::move(ordinary);
@@ -210,8 +210,8 @@ public:
     std::int64_t cache_length(const std::shared_ptr<Request>& request) const {
         return runtime_.request_cache_position(*request->cache);
     }
-    std::optional<mfq::engine::Generation> generate_decode(const std::shared_ptr<Request>& request,
-        mfq::engine::InferenceOutput& output, std::function<void()> schedule,
+    std::optional<tyloi::engine::Generation> generate_decode(const std::shared_ptr<Request>& request,
+        tyloi::engine::InferenceOutput& output, std::function<void()> schedule,
         std::function<bool()> ready, std::function<void()> check) {
         if (!request->mtp) return std::nullopt;
         return generate_mtp(request, output, std::move(schedule), std::move(ready), std::move(check));
@@ -301,8 +301,8 @@ public:
         catch (const MfqResourceExhausted&) { return true; }
         catch (...) { return false; }
     }
-    mfq::engine::Metrics metrics() const {
-        mfq::engine::Metrics result{{"continuous_batching_decode_batches", double(decode_batches_)},
+    tyloi::engine::Metrics metrics() const {
+        tyloi::engine::Metrics result{{"continuous_batching_decode_batches", double(decode_batches_)},
             {"continuous_batching_decode_rows", double(decode_rows_)},
             {"continuous_batching_maximum_batch", double(maximum_batch_)},
             {"continuous_batching_mtp_batches", double(mtp_batches_)},
@@ -327,10 +327,10 @@ public:
     }
 
 private:
-    mfq::engine::Generation generate_mtp(std::shared_ptr<Request> request,
-        mfq::engine::InferenceOutput& output, std::function<void()> schedule,
+    tyloi::engine::Generation generate_mtp(std::shared_ptr<Request> request,
+        tyloi::engine::InferenceOutput& output, std::function<void()> schedule,
         std::function<bool()> ready, std::function<void()> check) {
-        std::deque<mfq::engine::OutputDelta> deltas;
+        std::deque<tyloi::engine::OutputDelta> deltas;
         const std::array<std::int64_t, 1> eos{runtime_.config().eos_token_id};
         auto callbacks = runtime_.request_mtp_callbacks(request->cache, true);
         callbacks.draft_depth = [this, request] {
@@ -423,7 +423,7 @@ private:
                 stats.measured_depth_ms, stats.selected_depth, stats.standard_tokens, stats.park_count,
                 stats.reentry_probes};
             if (!deltas.empty()) {
-                mfq::engine::OutputDelta value;
+                tyloi::engine::OutputDelta value;
                 while (!deltas.empty()) {
                     auto& part = deltas.front();
                     value.token_ids.insert(value.token_ids.end(), part.token_ids.begin(), part.token_ids.end());
@@ -431,9 +431,9 @@ private:
                     deltas.pop_front();
                 }
                 co_yield std::move(value);
-            } else if (step.value) co_yield mfq::StepState::advanced;
+            } else if (step.value) co_yield tyloi::StepState::advanced;
             if (!step || output.stopped()) break;
-            while (!ready() && !output.stopped()) co_yield mfq::StepState::waiting;
+            while (!ready() && !output.stopped()) co_yield tyloi::StepState::waiting;
             if (output.stopped()) break;
             check();
             request->target_work.reset();
@@ -610,11 +610,11 @@ private:
     double prefill_compute_ms_ = 0, prefill_checkpoint_ms_ = 0, prefill_maximum_ms_ = 0;
     std::array<std::uint64_t, 6> mtp_cycle_counts_{};
     std::array<double, 6> mtp_cycle_totals_{}, mtp_cycle_maxima_{};
-    std::shared_ptr<mfq::engine::mtp::BatchDepthPolicy> policy_;
-    mfq::engine::mtp::BatchParkMemory park_memory_;
+    std::shared_ptr<tyloi::engine::mtp::BatchDepthPolicy> policy_;
+    tyloi::engine::mtp::BatchParkMemory park_memory_;
     std::uint64_t prefill_epoch_ = 0;
     std::vector<std::shared_ptr<MlxMtpBatchRound>> completed_rounds_;
     std::vector<std::string> ordinary_cohort_;
 };
 
-} // namespace mfq::metal
+} // namespace tyloi::metal
