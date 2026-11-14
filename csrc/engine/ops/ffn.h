@@ -34,4 +34,6 @@ FfnWeights qwen4_ffn_weights(FfnWeights weights);
 /** Execute the FFN using active backend scheduling and optional routing inputs. */
 Tensor ffn(const FfnWeights& weights, const Tensor& input, const Tensor& ids = {},
            const Tensor& router_bias = {}, std::int64_t projection_rows = 0);
+/** Execute a batch with backend-selected tiling and routed-cache policy. */
+Tensor batch_ffn(const FfnWeights& weights, const Tensor& input);
 } // namespace tyloi::ops

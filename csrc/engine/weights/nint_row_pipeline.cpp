@@ -299,12 +299,14 @@ void NintRowPipeline::issue(const std::vector<int64_t>& ids,const std::vector<in
         result.queue_ns/1e6,result.gather_ns/1e6,result.read_ns/1e6,row_elapsed(started)/1e6);
     return std::make_shared<::tyloi::DenseTensor>(nint_selected_rows_cuda(packed,descriptors,s.width).index_select(0,::tyloi::cuda::tensor(result.inverse).to(device)).reshape(out_shape));
 }
-std::pair<std::size_t, bool> NintRowPipeline::stage_layout(const std::vector<int64_t>& shape,const ::tyloi::Device& device) const {
-    const auto& s=*impl_;const auto n=shape_rows(shape);
-    if(!device.is_cuda() || device.index<0 || n<=0 || n>INT_MAX/6 || uint64_t(n)*s.width>UINT32_MAX)
+namespace {
+std::pair<std::size_t, bool> nint_stage_layout(const std::vector<std::shared_ptr<tyloi::NintRows>>& tables,
+        int width,const std::vector<int64_t>& shape,const ::tyloi::Device& device) {
+    const auto n=shape_rows(shape);
+    if(!device.is_cuda() || device.index<0 || n<=0 || n>INT_MAX/6 || uint64_t(n)*width>UINT32_MAX)
         throw std::invalid_argument("PLE graph stage shape/device exceeds bounds");
     std::size_t row_bytes=0;
-    for(const auto& table:s.tables)row_bytes=std::max(row_bytes,table->selected_row_nbytes_bound());
+    for(const auto& table:tables)row_bytes=std::max(row_bytes,table->selected_row_nbytes_bound());
     if(row_bytes>std::size_t(INT_MAX)/n)throw std::overflow_error("PLE graph payload exceeds bounds");
     const auto capacity=(row_bytes*n+7)&~std::size_t(7);
     const auto* setting=tyloi::cuda::env_lookup("TYLOINFER_PLE_MAPPED_ROWS");
@@ -317,14 +319,27 @@ std::pair<std::size_t, bool> NintRowPipeline::stage_layout(const std::vector<int
     const bool mapped=setting?setting[0]=='1':small_decode;
     return {capacity, mapped};
 }
-std::size_t NintRowPipeline::stage_bytes(const std::vector<int64_t>& shape,const ::tyloi::Device& device) const {
-    const auto [capacity, mapped]=stage_layout(shape,device);
-    const auto& s=*impl_;const auto n=shape_rows(shape);
-    const auto output=std::size_t(n)*std::size_t(s.width)*sizeof(std::uint16_t);
-    const auto packet=mapped ? 0 : capacity+std::size_t(n)*32;
+std::pair<std::size_t, std::size_t> nint_stage_growth(const std::vector<std::shared_ptr<tyloi::NintRows>>& tables,
+        int width,const std::vector<int64_t>& shape,const ::tyloi::Device& device) {
+    const auto [capacity, mapped]=nint_stage_layout(tables,width,shape,device);
+    const auto n=shape_rows(shape);
+    const auto host=capacity+std::size_t(n)*32;
+    const auto output=std::size_t(n)*std::size_t(width)*sizeof(std::uint16_t);
+    const auto packet=mapped ? 0 : host;
     if(output>std::numeric_limits<std::size_t>::max()-packet)
         throw std::overflow_error("PLE graph stage bytes exceed bounds");
-    return output+packet;
+    return {host,output+packet};
+}
+}
+std::pair<std::size_t, bool> NintRowPipeline::stage_layout(const std::vector<int64_t>& shape,const ::tyloi::Device& device) const {
+    return nint_stage_layout(impl_->tables,impl_->width,shape,device);
+}
+std::pair<std::size_t, std::size_t> NintRowPipeline::stage_growth(const NintRowSource& source,
+        const std::vector<int64_t>& shape,const ::tyloi::Device& device) {
+    return nint_stage_growth(source.tables,source.tables.front()->width(),shape,device);
+}
+std::size_t NintRowPipeline::stage_bytes(const std::vector<int64_t>& shape,const ::tyloi::Device& device) const {
+    return nint_stage_growth(impl_->tables,impl_->width,shape,device).second;
 }
 std::shared_ptr<NintRowStage> NintRowPipeline::make_stage(const std::vector<int64_t>& shape,const ::tyloi::Device& device) {
     const auto& s=*impl_;const auto n=shape_rows(shape);

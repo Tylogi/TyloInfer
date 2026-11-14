@@ -15,7 +15,7 @@ namespace text { struct Model; }
 
 class Components {
   public:
-    Components(const text::Model& language,
+    Components(text::Model& language,
                Executor& language_executor,
                const tyloi::weights::Loader& weights, int primary);
     ~Components();

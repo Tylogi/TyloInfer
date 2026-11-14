@@ -32,6 +32,8 @@ public:
     std::shared_ptr<NintRowStage> make_stage(const std::vector<int64_t>& shape,
         const ::tyloi::Device& device);
     std::size_t stage_bytes(const std::vector<int64_t>& shape, const ::tyloi::Device& device) const;
+    static std::pair<std::size_t, std::size_t> stage_growth(const NintRowSource&,
+        const std::vector<int64_t>& shape, const ::tyloi::Device& device);
     void upload(NintRowStage&,const std::vector<int64_t>& ids,const std::vector<int64_t>& shape);
 private:
     std::pair<std::size_t, bool> stage_layout(const std::vector<int64_t>& shape,

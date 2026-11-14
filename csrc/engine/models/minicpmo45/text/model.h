@@ -14,6 +14,11 @@
 #include <unordered_map>
 #include <vector>
 
+struct MiniCPMO45VisionEncoder;
+struct MiniCPMO45Resampler;
+struct MiniCPMO45AudioEncoder;
+namespace tyloi::cuda::minicpmo45 { struct Tts; }
+
 namespace tyloi::cuda::minicpmo45::text {
 using Config = tyloi::models::minicpmo45::Config;
 
@@ -41,6 +46,7 @@ struct Model
     ::tyloi::models::Plan plan;
     Config config;
     tyloi::models::CausalLmMetadata metadata;
+    int primary = 0;
     ::tyloi::Tensor embed, lm_head;
 #ifdef TYLOINFER_NATIVE_CUDA
     ::tyloi::Tensor output_norm;
@@ -50,5 +56,9 @@ struct Model
     tyloi::ops::RopeTable rope, cpu_rope;
     std::unordered_map<int, tyloi::ops::RopeTable> device_ropes;
     std::vector<Layer> layers;
+    std::shared_ptr<MiniCPMO45VisionEncoder> vision;
+    std::shared_ptr<MiniCPMO45Resampler> resampler;
+    std::shared_ptr<MiniCPMO45AudioEncoder> audio;
+    std::shared_ptr<Tts> tts;
 };
 } // namespace tyloi::cuda::minicpmo45::text

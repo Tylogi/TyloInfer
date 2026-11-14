@@ -197,6 +197,40 @@ std::size_t segment_for(const tyloi::TqTable& table, std::uint64_t row) {
 
 namespace {
 
+struct TqStageLayout {
+    std::int64_t count = 1, columns = 0;
+    std::size_t image_stride = 0, images_offset = 0, bytes = 0;
+};
+
+TqStageLayout tq_stage_layout(const std::vector<std::shared_ptr<tyloi::TqTable>>& tables,
+        std::int64_t rows_per_shard, const std::vector<std::int64_t>& shape,
+        const ::tyloi::Device& device) {
+    if (tables.empty() || !tables[0] || rows_per_shard < 1 || !device.is_cuda())
+        throw std::invalid_argument("invalid TQ row stage geometry");
+    TqStageLayout layout;
+    for (const auto size : shape) {
+        if (size < 1 || layout.count > INT_MAX / size)
+            throw std::overflow_error("TQ row stage shape exceeds bounds");
+        layout.count *= size;
+    }
+    layout.columns = tables[0]->width();
+    for (const auto& table : tables) {
+        if (!table || table->width() != layout.columns)
+            throw std::invalid_argument("TQ row stage table widths differ");
+        layout.image_stride = std::max(layout.image_stride, table->row_image_bytes_bound());
+    }
+    if (layout.columns > INT_MAX ||
+        std::uint64_t(layout.count) > (SIZE_MAX - 7) / sizeof(TrellisProjectionView))
+        throw std::overflow_error("TQ row stage metadata exceeds bounds");
+    layout.images_offset = (std::size_t(layout.count) * sizeof(TrellisProjectionView) + 7) & ~std::size_t(7);
+    if (std::uint64_t(layout.count) > (SIZE_MAX - layout.images_offset) / layout.image_stride)
+        throw std::overflow_error("TQ row stage packet exceeds bounds");
+    layout.bytes = layout.images_offset + std::size_t(layout.count) * layout.image_stride;
+    if (layout.bytes > INT64_MAX)
+        throw std::overflow_error("TQ row stage packet exceeds tensor limits");
+    return layout;
+}
+
 class TqRowStage final : public RowStage {
     std::vector<std::shared_ptr<tyloi::TqTable>> tables_;
     std::vector<std::int64_t> shape_;
@@ -246,35 +280,12 @@ public:
                const ::tyloi::Device& device)
         : tables_(std::move(tables)), shape_(std::move(shape)),
           rows_per_shard_(rows_per_shard), device_(device) {
-        if (tables_.empty() || !tables_[0] || rows_per_shard_ < 1 || !device.is_cuda()) {
-            throw std::invalid_argument("invalid TQ row stage geometry");
-        }
-        for (const auto size : shape_) {
-            if (size < 1 || count_ > INT_MAX / size) {
-                throw std::overflow_error("TQ row stage shape exceeds bounds");
-            }
-            count_ *= size;
-        }
-        columns_ = tables_[0]->width();
-        for (const auto& table : tables_) {
-            if (!table || table->width() != columns_) {
-                throw std::invalid_argument("TQ row stage table widths differ");
-            }
-            image_stride_ = std::max(image_stride_, table->row_image_bytes_bound());
-        }
-        if (columns_ > INT_MAX ||
-            std::uint64_t(count_) > (SIZE_MAX - 7) / sizeof(TrellisProjectionView)) {
-            throw std::overflow_error("TQ row stage metadata exceeds bounds");
-        }
-        images_offset_ = (std::size_t(count_) * sizeof(TrellisProjectionView) + 7) &
-                         ~std::size_t(7);
-        if (std::uint64_t(count_) > (SIZE_MAX - images_offset_) / image_stride_) {
-            throw std::overflow_error("TQ row stage packet exceeds bounds");
-        }
-        bytes_ = images_offset_ + std::size_t(count_) * image_stride_;
-        if (bytes_ > INT64_MAX) {
-            throw std::overflow_error("TQ row stage packet exceeds tensor limits");
-        }
+        const auto layout = tq_stage_layout(tables_, rows_per_shard_, shape_, device_);
+        count_ = layout.count;
+        columns_ = layout.columns;
+        image_stride_ = layout.image_stride;
+        images_offset_ = layout.images_offset;
+        bytes_ = layout.bytes;
         const MfqCudaGuard guard(device);
         retain_stream();
         int can_map = 0;
@@ -387,6 +398,20 @@ public:
 };
 
 } // namespace
+
+std::pair<std::size_t, std::size_t> tq_row_stage_growth(
+        const std::vector<std::shared_ptr<tyloi::TqTable>>& tables,
+        std::int64_t rows_per_shard, const std::vector<std::int64_t>& shape,
+        const ::tyloi::Device& device) {
+    const auto layout = tq_stage_layout(tables, rows_per_shard, shape, device);
+    if (std::uint64_t(layout.count) > SIZE_MAX / std::uint64_t(layout.columns) / sizeof(std::uint16_t))
+        throw std::overflow_error("TQ row stage output exceeds bounds");
+    const auto output = std::size_t(layout.count) * std::size_t(layout.columns) * sizeof(std::uint16_t);
+    if (output > SIZE_MAX - layout.bytes)
+        throw std::overflow_error("TQ row stage bytes exceed bounds");
+    // Mapping can fail after the host allocation and requires a device packet.
+    return {layout.bytes, output + layout.bytes};
+}
 
 std::shared_ptr<RowStage> make_tq_row_stage(
         const std::vector<std::shared_ptr<tyloi::TqTable>>& tables,

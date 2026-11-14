@@ -2,6 +2,7 @@
 #include "engine/tensor.h"
 #include <cstdint>
 #include <memory>
+#include <utility>
 #include <vector>
 
 // A prepared table-row transfer. Encodings stay in their own loader; graph
@@ -26,6 +27,8 @@ class RowPipeline {
 public:
     struct Source;
     static std::shared_ptr<const Source> source(std::vector<Tensor> tables, std::int64_t rows_per_shard);
+    static std::vector<std::pair<Device, std::size_t>> stage_growth(
+        const std::shared_ptr<const Source>&, const std::vector<std::int64_t>& shape, const Device& device);
     explicit RowPipeline(std::shared_ptr<const Source> source);
     ~RowPipeline();
     bool prefetch(const std::vector<std::int64_t>& ids, const std::vector<std::int64_t>& shape, bool early_prefix);

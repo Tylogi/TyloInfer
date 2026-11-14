@@ -4,6 +4,8 @@
 #include "engine/models/deepseek_v41/load.h"
 #include "engine/models/gemma4/load.h"
 #include "engine/models/nemotron_h/load.h"
+#include "engine/models/minicpmo45/text/load.h"
+#include "engine/models/minicpmo45/model.h"
 #include "engine/models/qwen35/load.h"
 #include "engine/models/qwen4_exp/load.h"
 #include "engine/models/source.h"
@@ -51,6 +53,14 @@ void load(
     }
     if (model_graph.backbone == "nemotron_h") {
         ::tyloi::cuda::nemotron_h::load(owner, std::move(source), definition, weights, placement, options);
+        return;
+    }
+    if (model_graph.backbone == "minicpmo45") {
+        ::tyloi::cuda::minicpmo45::text::load(owner, std::move(source), definition, weights, placement, options);
+        return;
+    }
+    if (model_graph.backbone == "minicpmo_tts") {
+        ::tyloi::cuda::minicpmo45::load(owner, std::move(source), definition, weights, placement, options);
         return;
     }
     throw std::runtime_error(

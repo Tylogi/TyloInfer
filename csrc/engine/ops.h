@@ -161,6 +161,8 @@ private:
 class ProfileCapture {
 public:
     explicit ProfileCapture(bool selected);
+    // Select the configured prefill request and report its timings at scope exit.
+    static ProfileCapture prefill_once(std::int64_t tokens);
     // Report on normal exit; unselected scopes still restore external profiling state.
     ProfileCapture(bool selected, const std::string& report_name);
     ~ProfileCapture();

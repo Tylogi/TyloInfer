@@ -1,6 +1,8 @@
 #include "ffn.h"
 #include "engine/ops/ffn.h"
 #include "engine/backends/cuda/executor/executor.h"
+#include "engine/backends/cuda/executor/decode_window.h"
+#include "engine/backends/cuda/executor/options.h"
 #include "engine/backends/cuda/native/branches.h"
 #include "engine/backends/cuda/native/collectives.h"
 #include "engine/backends/cuda/native/profile.h"
@@ -798,5 +800,40 @@ Tensor ffn(const FfnWeights& weights, const Tensor& input, const Tensor& ids,
             optional_dense(ids),optional_dense(router_bias));
     }
     return result;
+}
+Tensor batch_ffn(const FfnWeights& weights, const Tensor& input) {
+    const auto& source = input.dense();
+    auto& executor = cuda::Executor::current();
+    if (source.size(0) <= 8) return ffn(weights, input);
+    const auto option = cuda::options::continuous_ffn_tile();
+    const std::int64_t rows = option ? *option : 8;
+    TYLOINFER_RUNTIME_CHECK(rows == 8 || rows == 16, "continuous FFN tile must be 8 or 16 rows");
+    auto* window = cuda::DecodeWindow::recording();
+    const int previous_profile_tile = window ? window->set_profile_tile(-1) : -1;
+    auto& mode = executor.mode().ffn;
+    struct TileScope {
+        cuda::FfnMode& mode;
+        int tile, tiles;
+        cuda::DecodeWindow* window;
+        int profile_tile;
+        ~TileScope() {
+            mode.tile = tile; mode.tiles = tiles;
+            if (window) window->set_profile_tile(profile_tile);
+        }
+    } scope{mode, mode.tile, mode.tiles, window, previous_profile_tile};
+    mode.tiles = int((source.size(0) + rows - 1) / rows);
+    std::vector<DenseTensor> outputs;
+    for (std::int64_t start = 0; start < source.size(0); start += rows) {
+        mode.tile = int(start / rows);
+        if (window) window->set_profile_tile(mode.tile);
+#ifdef TYLOINFER_NATIVE_CUDA
+        auto tile_mode = cuda::Executor::current_ffn();
+        tile_mode.tile = mode.tile;
+        tile_mode.tiles = mode.tiles;
+        auto tile_scope = executor.enter(tile_mode);
+#endif
+        outputs.push_back(ffn(weights, source.narrow(0, start, std::min(rows, source.size(0) - start))).dense());
+    }
+    return cuda::cat(outputs, 0);
 }
 } // namespace tyloi::ops

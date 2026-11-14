@@ -91,13 +91,21 @@ public:
         if (layout.rebuild) co_yield GraphRequest{GraphPhase::prepare, &prepared};
         auto requests = active(rows);
         std::optional<Tensor> result;
-        {
+        auto job = graph_->run(requests, ids, host_ids, greedy, layout, prepared);
+        for (;;) {
+            StepResult<Tensor> step;
+            {
 #ifdef TYLOINFER_NATIVE_CUDA
-            auto policy = Executor::current_ffn();
-            policy.batch_serial = requests.size() > 8;
-            auto scope = Executor::current().enter(policy);
+                auto policy = Executor::current_ffn();
+                policy.batch_serial = requests.size() > 8;
+                auto scope = Executor::current().enter(policy);
 #endif
-            result = graph_->run(requests, ids, host_ids, greedy, layout, prepared);
+                step = job.next();
+            }
+            if (!step) break;
+            if (step.graph) co_yield *step.graph;
+            else if (step.value) result = std::move(*step.value);
+            else co_yield step.state;
         }
         co_yield std::move(result);
     }

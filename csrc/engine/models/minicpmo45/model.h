@@ -19,6 +19,7 @@
 
 struct LayerPlacementConfig;
 namespace tyloi::weights { struct Loader; }
+namespace tyloi::models { struct LoadOptions; }
 
 namespace tyloi::cuda::minicpmo45 {
 
@@ -61,5 +62,10 @@ struct Model
 Model read(std::shared_ptr<const tyloi::ModelSource>, std::string_view definition, int64_t context);
 void load(Model&, const tyloi::weights::Loader&, const LayerPlacementConfig&, int cpu_layers,
           const tyloi::ops::YarnScaling&);
+#ifdef TYLOINFER_NATIVE_CUDA
+void load(std::unique_ptr<tyloi::models::CausalModel>&, std::shared_ptr<const tyloi::ModelSource>,
+          std::string_view definition, const tyloi::weights::Loader&, LayerPlacementConfig&,
+          const tyloi::models::LoadOptions&);
+#endif
 
 } // namespace tyloi::cuda::minicpmo45

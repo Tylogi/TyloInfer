@@ -73,6 +73,17 @@ std::shared_ptr<const RowPipeline::Source> RowPipeline::source(std::vector<Tenso
 #endif
     return result;
 }
+std::vector<std::pair<Device, std::size_t>> RowPipeline::stage_growth(
+        const std::shared_ptr<const Source>& source, const std::vector<std::int64_t>& shape, const Device& device) {
+    if (!source) throw std::invalid_argument("row pipeline requires a source");
+    std::pair<std::size_t, std::size_t> bytes;
+#if TYLOINFER_ENABLE_MFQ_COMPAT
+    if (source->nint) bytes = NintRowPipeline::stage_growth(*source->nint, shape, device);
+    else
+#endif
+    bytes = tq_row_stage_growth(source->tq, source->rows, shape, device);
+    return {{Device(kCPU), bytes.first}, {device, bytes.second}};
+}
 RowPipeline::RowPipeline(std::shared_ptr<const Source> source) : impl_(std::make_unique<Impl>()) {
     if (!source) throw std::invalid_argument("row pipeline requires a source");
     impl_->source = std::move(source);

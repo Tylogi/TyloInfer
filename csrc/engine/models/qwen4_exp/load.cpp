@@ -13,9 +13,7 @@
 #include "engine/ops/qsa.h"
 #include "engine/ops/residual.h"
 
-#include "engine/backends/cuda/executor/executor.h"
 #include "engine/models/load.h"
-#include "engine/backends/cuda/native/scope.h"
 #include "engine/models/common/check.h"
 #include "engine/models/common/load.h"
 #include "engine/models/source/model_config.h"
@@ -209,7 +207,7 @@ void load(Model& model, const tyloi::weights::Loader& tensors, LayerPlacementCon
                   << " gpu=" << dense_cpu_layer_count << '-' << (model.num_hidden_layers() - 1)
                   << " cpu_threads=" << mfq_get_num_threads() << std::endl;
     }
-    CudaScope model_guard(placement.primary_device(), Executor::current().contexts());
+    tyloi::ops::DeviceScope model_guard(tyloi::Device(tyloi::kCUDA, placement.primary_device()));
     if (model.plan.vision == ::tyloi::models::VisionAdapter::grid_vit && dense_cpu_layer_count > 0)
         throw std::runtime_error("CUDA grid-Vision currently requires GPU-resident text layers");
     model.primary_device = placement.primary_device();

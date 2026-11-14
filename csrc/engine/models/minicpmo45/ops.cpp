@@ -1,6 +1,9 @@
 #include "engine/models/plan.h"
 #include "engine/models/minicpmo45/text/load.h"
 #include "engine/models/minicpmo45/text/forward.h"
+#include "engine/models/minicpmo45/vision.h"
+#include "engine/models/minicpmo45/audio.h"
+#include "engine/models/minicpmo45/tts.h"
 #include "engine/models/common/ffn.h"
 #include "engine/models/common/mlp.h"
 #include "engine/models/common/load.h"
@@ -8,6 +11,7 @@
 #include "engine/models/common/check.h"
 #include "engine/models/session/state.h"
 #include "engine/models/source/model_graph.h"
+#include "engine/requests/media.h"
 #ifndef TYLOINFER_NATIVE_CUDA
 #include "engine/backends/cuda/native/collectives.h"
 #endif
@@ -144,24 +148,63 @@ void load(Model& model, const tyloi::weights::Loader& weights, LayerPlacementCon
 }
 
 #ifdef TYLOINFER_NATIVE_CUDA
+void load_media(Model& model, const tyloi::weights::Loader& weights) {
+    model.vision = std::make_shared<MiniCPMO45VisionEncoder>(MiniCPMO45VisionEncoder::load(weights));
+    model.resampler = std::make_shared<MiniCPMO45Resampler>(MiniCPMO45Resampler::load(weights));
+    model.audio = std::make_shared<MiniCPMO45AudioEncoder>(MiniCPMO45AudioEncoder::load(weights));
+    model.tts = std::make_shared<Tts>(Tts::load(weights));
+}
+
+void load(std::unique_ptr<tyloi::models::CausalModel>& owner,
+        std::shared_ptr<const tyloi::ModelSource> source, std::string_view definition,
+        const tyloi::weights::Loader& weights, LayerPlacementConfig& placement,
+        const tyloi::models::LoadOptions& options) {
+    owner = std::make_unique<Model>(read(std::move(source), definition, options.context));
+    auto* model = static_cast<Model*>(owner.get());
+    load(*model, weights, placement, options.gpu_layers, options.expert_parallel, true, true, options.yarn);
+    model->primary = placement.primary_device();
+    if (options.optional_components && model->plan.vision == tyloi::models::VisionAdapter::minicpmo45) {
+        load_media(*model, weights);
+    }
+}
+
 tyloi::models::Info Model::info() const {
     auto result = tyloi::models::model_info(metadata);
     result.separate_projections = true;
     return result;
 }
 MfqModelCapabilities Model::capabilities() const {
-    return {graph.architecture, graph.has_component("text"), false, false,
-            false, false, false, false, "model-graph"};
+    return {graph.architecture, graph.has_component("text"), bool(vision), false,
+            bool(audio), false, false, false, "model-graph"};
 }
 tyloi::engine::Metrics Model::metrics() const {
     return {{"kv_memory_supported", 0.0}, {"kv_quantization_supported", 0.0},
             {"kv_quantization_bits", 0.0}, {"vision_declared", double(graph.has_component("vision"))},
-            {"vision_supported", 0.0}, {"vision_available", 0.0},
+            {"vision_supported", double(graph.has_component("vision"))}, {"vision_available", double(bool(vision))},
             {"mtp_declared", double(graph.has_component("predictor"))},
             {"mtp_supported", 0.0}, {"mtp_available", 0.0}};
 }
 std::unique_ptr<tyloi::models::State> Model::make_state() const {
     return std::make_unique<State>(*this);
+}
+std::vector<std::pair<tyloi::Device, std::size_t>> State::preallocate_growth() const {
+    std::vector<std::pair<tyloi::Device, std::size_t>> result;
+    if (!::tyloi::cuda::options::kv_vram_preallocated()) return result;
+    for (std::size_t i = 0; i < layers.size(); ++i) {
+        const auto& l = layout_[i];
+        if (l.cpu || layers[i].defined()) continue;
+        const tyloi::Device device(tyloi::kCUDA, l.device);
+        const auto bytes = tyloi::state::kv_bytes(1, l.heads, l.capacity, l.head_dim,
+            l.sliding, tyloi::kBFloat16, l.quantization);
+        auto entry = std::find_if(result.begin(), result.end(), [device](const auto& v) { return v.first == device; });
+        if (entry == result.end()) result.emplace_back(device, bytes);
+        else {
+            if (entry->second > std::numeric_limits<std::size_t>::max() - bytes)
+                throw std::overflow_error("MiniCPM text KV planning byte count overflow");
+            entry->second += bytes;
+        }
+    }
+    return result;
 }
 std::vector<std::pair<tyloi::Device, std::size_t>> State::growth(
         const tyloi::models::Input& input, const tyloi::models::ForwardOptions& options) const {
@@ -179,7 +222,7 @@ std::vector<std::pair<tyloi::Device, std::size_t>> State::growth(
             (options.kv_capacity > 0 ? std::max(end, options.kv_capacity) : layout.capacity);
         const auto bytes = tyloi::state::kv_bytes(batch, layout.heads, capacity, layout.head_dim,
             layout.sliding, tyloi::kBFloat16, layout.quantization);
-        const tyloi::Device device(layout.cpu ? tyloi::kCPU : tyloi::kCUDA, layout.cpu ? -1 : layout.device);
+        const tyloi::Device device(layout.cpu ? tyloi::kCPU : tyloi::kCUDA, layout.cpu ? 0 : layout.device);
         auto entry = std::find_if(result.begin(), result.end(),
                                   [device](const auto& item) { return item.first == device; });
         if (entry == result.end()) result.emplace_back(device, bytes);
@@ -214,6 +257,7 @@ void State::preallocate() {
 }
 void State::reset(int64_t next_batch) {
     cache_pos = decode_position_delta = 0;
+    attention_mask = {};
     batch = next_batch;
     for (size_t i = 0; i < layers.size(); ++i)
         if (layers[i].defined() && layers[i].batch != batch) {
@@ -259,19 +303,69 @@ TextSessionState State::capture_text_session_state(const std::vector<int64_t>& t
     }
     return state;
 }
-void State::restore_text_session_state(const TextSessionState& state) {
+#ifdef TYLOINFER_NATIVE_CUDA
+std::unique_ptr<tyloi::models::Restore> State::prepare_restore(
+        const TextSessionState& state, const tyloi::models::Mtp* predictor_model) {
+    if (predictor_model) throw CudaSessionStateError("MiniCPM text does not support a predictor");
     const auto* saved = std::get_if<std::vector<KvSnapshot>>(&state.payload);
     if (layers.empty() || !saved || state.cache_pos <= 0 ||
         static_cast<size_t>(state.cache_pos) != state.tokens.size() || saved->size() != layers.size())
         throw CudaSessionStateError("full-attention text session state is incompatible");
     for (size_t i = 0; i < layers.size(); ++i) {
-        MfqCudaGuard guard(layout_[i].device);
-        restore_kv(layers[i], (*saved)[i], layout_[i].head_dim, ::tyloi::kBFloat16, layout_[i].quantization);
+        const auto& l = layout_[i];
+        const auto& kv = (*saved)[i];
+        validate_kv(kv);
+        const auto expected = tyloi::state::kv_layout(1, l.heads, kv.capacity, l.head_dim,
+            l.sliding, tyloi::kBFloat16, l.quantization);
+        const auto device = tyloi::Device(l.cpu ? tyloi::kCPU : tyloi::kCUDA, l.cpu ? 0 : l.device);
+        const auto dtype = expected.storage_dtype;
+        if (kv.k.device() != device || kv.v.device() != device || kv.ring != l.sliding ||
+            kv.k.scalar_type() != dtype || kv.v.scalar_type() != dtype || kv.k.size(1) != l.heads ||
+            kv.k.size(3) != expected.key_width || kv.v.size(3) != expected.value_width ||
+            kv.k.size(2) != (kv.ring ? kv.capacity : state.cache_pos) ||
+            (!kv.ring && state.cache_pos > l.capacity))
+            throw CudaSessionStateError("MiniCPM text session cache geometry changed");
     }
-    cache_pos = state.cache_pos;
-    decode_position_delta = state.decode_position_delta;
-    batch = 1;
+    struct Candidate final : tyloi::models::Restore {
+        State& owner;
+        TextSessionState snapshot;
+        std::vector<tyloi::state::KvView> prepared;
+        Candidate(State& value, const TextSessionState& source)
+            : owner(value), snapshot(source), prepared(value.layers.size()) {}
+        std::vector<std::pair<tyloi::Device, std::size_t>> growth() const override {
+            std::vector<std::pair<tyloi::Device, std::size_t>> result;
+            for (const auto& kv : std::get<std::vector<KvSnapshot>>(snapshot.payload)) {
+                for (const auto& tensor : {kv.k, kv.v}) {
+                    const auto bytes = restore_prefix_bytes({}, tensor, 2, kv.capacity);
+                    auto it = std::find_if(result.begin(), result.end(), [&](const auto& v) { return v.first == tensor.device(); });
+                    if (it == result.end()) result.emplace_back(tensor.device(), bytes);
+                    else {
+                        if (it->second > std::numeric_limits<std::size_t>::max() - bytes)
+                            throw std::overflow_error("MiniCPM text session allocation overflow");
+                        it->second += bytes;
+                    }
+                }
+            }
+            return result;
+        }
+        void stage() override {
+            const auto& values = std::get<std::vector<KvSnapshot>>(snapshot.payload);
+            for (size_t i = 0; i < prepared.size(); ++i) {
+                const auto& l = owner.layout_[i];
+                MfqCudaGuard guard(l.device);
+                stage_kv(prepared[i], values[i], l.head_dim, tyloi::kBFloat16, l.quantization);
+            }
+        }
+        void publish() noexcept override {
+            owner.layers.swap(prepared);
+            owner.cache_pos = snapshot.cache_pos;
+            owner.decode_position_delta = snapshot.decode_position_delta;
+            owner.batch = 1;
+        }
+    };
+    return std::make_unique<Candidate>(*this, state);
 }
+#endif
 
 namespace {
 Tensor token_ids(int primary, const Tensor& ids) {
@@ -304,8 +398,68 @@ Tensor Model::logits(const Tensor& hidden, bool) const {
     return tyloi::ops::contiguous(tyloi::ops::cast(result, tyloi::kBFloat16));
 }
 tyloi::StepSequence<tyloi::models::Prepared> Model::prepare(
-        const std::vector<std::int64_t>&, const MfqMultimodalInput&, tyloi::models::State&) const {
-    throw std::invalid_argument("model has no multimodal component");
+        const std::vector<std::int64_t>& tokens, const MfqMultimodalInput& media,
+        tyloi::models::State& state) const {
+    if (!dynamic_cast<State*>(&state)) throw std::invalid_argument("MiniCPM text state has the wrong type");
+    if (!vision || !resampler || !audio) throw std::invalid_argument("model has no multimodal component");
+    const auto gpu = tyloi::TensorOptions().device(tyloi::Device(tyloi::kCUDA, primary));
+    auto ids = tyloi::cuda::tensor(tokens, gpu.dtype(tyloi::kInt64)).reshape({1, static_cast<int64_t>(tokens.size())});
+    auto embeddings = embedding(Tensor(ids), primary);
+    std::vector<Tensor> retained{Tensor(ids), embeddings};
+    std::optional<MiniCPMO45AudioEncoder::State> audio_state;
+    tyloi::StepSequence<Tensor> vision_steps, audio_steps;
+    const auto scatter = [&](const Tensor& encoded, const tyloi::models::minicpmo45::MediaBound& bound, int64_t length) {
+        tyloi::models::require_model(bound.batch == 0 && bound.source >= 0 && bound.source < encoded.size(0) &&
+            bound.begin >= 0 && bound.end <= ids.size(1) && bound.end - bound.begin == length,
+            "MiniCPM-o media bound does not match encoded length");
+        auto& target = embeddings.dense();
+        target.index({0, Slice(bound.begin, bound.end), Slice()}).copy_(
+            encoded.dense().index({bound.source, Slice(0, length), Slice()}).to(target.scalar_type()));
+    };
+    const auto images = tyloi::models::minicpmo45::media_bounds(media.image_bounds);
+    if (!images.empty()) {
+        auto pixels = tyloi::cuda::tensor(media.pixel_values, gpu.dtype(tyloi::kFloat32)).reshape(media.pixel_shape);
+        auto mask = tyloi::cuda::tensor(media.patch_mask).reshape(media.patch_mask_shape).to(tyloi::kBool);
+        auto sizes = tyloi::cuda::tensor(media.target_sizes).reshape(media.target_sizes_shape);
+        retained.insert(retained.end(), {Tensor(pixels), Tensor(mask), Tensor(sizes)});
+        vision_steps = vision->forward_steps(Tensor(pixels), Tensor(mask), Tensor(sizes));
+        Tensor states;
+        while (auto step = vision_steps.next()) {
+            if (step.value) states = std::move(*step.value);
+            else co_yield step.state;
+        }
+        auto encoded = resampler->forward(states, Tensor(sizes));
+        retained.push_back(states);
+        retained.push_back(encoded);
+        for (const auto& bound : images) scatter(encoded, bound, encoded.size(1));
+        co_yield tyloi::StepState::advanced;
+    }
+    const auto audios = tyloi::models::minicpmo45::media_bounds(media.audio_bounds);
+    if (!audios.empty()) {
+        auto features = tyloi::cuda::tensor(media.audio_features, gpu.dtype(tyloi::kFloat32)).reshape(media.audio_features_shape);
+        auto lengths = tyloi::cuda::tensor(media.audio_lengths);
+        retained.insert(retained.end(), {Tensor(features), Tensor(lengths)});
+        audio_state.emplace(*audio);
+        audio_steps = audio->forward_steps(Tensor(features), Tensor(lengths), *audio_state, false);
+        Tensor encoded;
+        while (auto step = audio_steps.next()) {
+            if (step.value) encoded = std::move(*step.value);
+            else co_yield step.state;
+        }
+        retained.push_back(encoded);
+        const auto pooled = MiniCPMO45AudioEncoder::pooled_lengths(lengths);
+        for (const auto& bound : audios) {
+            tyloi::models::require_model(bound.source >= 0 && static_cast<size_t>(bound.source) < pooled.size(),
+                "MiniCPM-o audio bound source is out of range");
+            scatter(encoded, bound, pooled[bound.source]);
+        }
+        co_yield tyloi::StepState::advanced;
+    }
+    tyloi::models::Prepared prepared;
+    prepared.token_ids = tokens;
+    prepared.embeddings = std::move(embeddings);
+    prepared.positions = tyloi::ops::arange(0, static_cast<int64_t>(tokens.size()), tyloi::Device(tyloi::kCUDA, primary));
+    co_yield std::move(prepared);
 }
 Tensor Model::forward(tyloi::models::Input input, tyloi::models::State& state_value,
                       const tyloi::models::ForwardOptions& mode) const {
@@ -317,7 +471,11 @@ Tensor Model::forward(tyloi::models::Input input, tyloi::models::State& state_va
     tyloi::models::require_model(hidden.dim() == 3 && hidden.size(0) == B && hidden.size(1) == T &&
         hidden.size(2) == metadata.hidden_size, "inputs_embeds shape must match [batch,tokens,hidden_size]");
     tyloi::models::require_model(input.confirmed == 0, "unsupported speculative backbone geometry");
-    if (state.cache_pos == 0) state.reset(B);
+    if (state.cache_pos == 0) {
+        auto mask = state.attention_mask;
+        state.reset(B);
+        state.attention_mask = std::move(mask);
+    }
     const tyloi::Device primary(tyloi::kCUDA, mode.primary);
     const auto copy_position = [&](const Tensor& value) {
         return tyloi::ops::contiguous(tyloi::ops::copy(tyloi::ops::cast(value, tyloi::kInt64), primary));
@@ -349,6 +507,7 @@ Tensor Model::forward(tyloi::models::Input input, tyloi::models::State& state_va
         ::tyloi::models::AttentionStep step{local(positions), {}, local(physical), state.cache_pos,
                            input.kv_length, input.attention_parts};
         if (input.lengths) step.sequence_lengths = local(input.lengths);
+        if (state.attention_mask) step.attention_mask = local(state.attention_mask);
         auto& cache = state.layers[i];
         const auto capacity = attention.sliding ? attention.attention_window :
             (mode.kv_capacity > 0 ? std::max(state.cache_pos + T, mode.kv_capacity)

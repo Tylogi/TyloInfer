@@ -571,6 +571,160 @@ std::vector<std::pair<void*,std::size_t>> Context::workspace_touched_regions() c
     return result;
 }
 
+namespace {
+thread_local GraphAllocationPlan* graph_allocation_plan=nullptr;
+thread_local GraphAllocationPlan* graph_warmup_plan=nullptr;
+std::size_t graph_size_class(std::size_t bytes) {
+    if(bytes<4096)return bytes;
+    std::size_t capacity=4096;
+    while(capacity<bytes) {
+        if(capacity>SIZE_MAX/2)throw Error("CUDA graph workspace size overflows");
+        capacity*=2;
+    }
+    return capacity;
+}
+}
+GraphAllocationPlan* GraphAllocationPlan::current() noexcept {return graph_allocation_plan;}
+GraphAllocationPlan* GraphAllocationPlan::warming() noexcept {return graph_warmup_plan;}
+GraphAllocationPlan::~GraphAllocationPlan() {
+    end();end_warmup();
+    for(const auto& [key,context]:owned_pools_) {
+        internal::on_device_noexcept(key.first,[&] {(void)cudaStreamSynchronize(key.second);});
+        context->end_graph_pool(key.second);
+    }
+}
+void GraphAllocationPlan::ensure_pool(const std::shared_ptr<Context>& context,cudaStream_t stream) {
+    if(context->has_graph_pool(stream))return;
+    context->begin_graph_pool(stream);
+    try {owned_pools_.emplace(std::make_pair(context->device(),stream),context);}
+    catch(...) {context->end_graph_pool(stream);throw;}
+}
+void GraphAllocationPlan::begin_warmup() {
+    if(graph_warmup_plan)throw Error("nested CUDA graph warmup plan");
+    graph_warmup_plan=this;
+}
+void GraphAllocationPlan::end_warmup() noexcept {
+    if(graph_warmup_plan==this)graph_warmup_plan=nullptr;
+}
+std::vector<std::pair<std::shared_ptr<Context>,StreamHandle>> GraphAllocationPlan::participants() const {
+    std::vector<std::pair<std::shared_ptr<Context>,StreamHandle>> result;
+    for(const auto& [key,bucket]:buckets_) {
+        const auto [device,stream,size]=key;
+        if(std::none_of(result.begin(),result.end(),[&](const auto& value) {
+            return value.second.device_index()==device && value.second.stream()==stream;
+        }))result.emplace_back(bucket.context,StreamHandle(device,stream));
+    }
+    return result;
+}
+void GraphAllocationPlan::begin() {
+    if(graph_allocation_plan)throw Error("nested CUDA graph allocation observation");
+    graph_allocation_plan=this;
+}
+void GraphAllocationPlan::end() noexcept {
+    if(graph_allocation_plan==this)graph_allocation_plan=nullptr;
+}
+void GraphAllocationPlan::freeze() {
+    if(conservative_) {
+        live_.clear();events_.clear();
+        for(auto& [key,bucket]:buckets_)bucket.live=0;
+        return;
+    }
+    for(const auto& [pointer,lifetime]:live_)events_[lifetime.event].persistent=true;
+    for(auto& [key,bucket]:buckets_)bucket.live=bucket.peak=0;
+    for(const auto& event:events_) {
+        if(events_[event.first].persistent)continue;
+        auto& bucket=buckets_.at(event.key);
+        if(event.allocate) {++bucket.live;bucket.peak=std::max(bucket.peak,bucket.live);}
+        else --bucket.live;
+    }
+    live_.clear();events_.clear();
+    for(auto& [key,bucket]:buckets_)bucket.live=0;
+}
+void GraphAllocationPlan::observe(Context& context,cudaStream_t stream,void* pointer,std::size_t bytes) {
+    if(!pointer)return;
+    ensure_pool(context.shared_from_this(),stream);
+    Key key{context.device(),stream,graph_size_class(bytes)};
+    auto& bucket=buckets_[key];
+    if(!bucket.context)bucket.context=context.shared_from_this();
+    const auto first=events_.size();
+    events_.push_back({key,first,true});
+    try {
+        if(!live_.emplace(std::make_pair(context.device(),reinterpret_cast<std::uintptr_t>(pointer)),Lifetime{key,first}).second)
+            throw Error("CUDA graph preparation reused a live allocation");
+    } catch(...) {events_.pop_back();throw;}
+    ++bucket.live;bucket.peak=std::max(bucket.peak,bucket.live);
+}
+void GraphAllocationPlan::release(int device,void* pointer) noexcept {
+    const auto it=live_.find({device,reinterpret_cast<std::uintptr_t>(pointer)});
+    if(it==live_.end())return;
+    const auto lifetime=it->second;
+    try {events_.push_back({lifetime.key,lifetime.event,false});}
+    catch(...) {conservative_=true;}
+    auto bucket=buckets_.find(lifetime.key);
+    if(bucket!=buckets_.end() && bucket->second.live)--bucket->second.live;
+    live_.erase(it);
+}
+bool GraphAllocationPlan::release_pool(int device,cudaStream_t stream) noexcept {
+    return owned_pools_.erase({device,stream})!=0;
+}
+void GraphAllocationPlan::add(const Miss& miss) {
+    Key key{miss.device,miss.stream,miss.bytes};
+    auto& bucket=buckets_[key];
+    if(!bucket.context)bucket.context=default_context(miss.device);
+    ensure_pool(bucket.context,miss.stream);
+    bucket.peak=std::max(bucket.peak,miss.required);
+}
+std::vector<std::pair<tyloi::Device,std::size_t>> GraphAllocationPlan::growth() const {
+    std::map<int,std::size_t> bytes;
+    for(const auto& [key,bucket]:buckets_) {
+        const auto [device,stream,size]=key;
+        const auto available=bucket.context->graph_available(stream,size);
+        const auto count=bucket.peak>available?bucket.peak-available:0;
+        if(count && (size>SIZE_MAX/count || bytes[device]>SIZE_MAX-size*count))
+            throw Error("CUDA graph workspace growth overflows");
+        bytes[device]+=size*count;
+    }
+    std::vector<std::pair<tyloi::Device,std::size_t>> result;
+    for(const auto& [device,size]:bytes)if(size)result.emplace_back(tyloi::Device{tyloi::kCUDA,device},size);
+    return result;
+}
+void GraphAllocationPlan::materialize() {
+    for(const auto& [key,bucket]:buckets_) {
+        const auto [device,stream,size]=key;
+        const auto available=bucket.context->graph_available(stream,size);
+        if(available>=bucket.peak)continue;
+        const auto count=bucket.peak;
+        std::vector<void*> blocks;blocks.reserve(count);
+        try {
+            bucket.context->graph_strict_warmup(stream,false);
+            bucket.context->begin_graph_warmup(stream);
+            try {for(std::size_t i=0;i<count;++i)blocks.push_back(bucket.context->allocate(size,stream));}
+            catch(...) {bucket.context->end_graph_warmup(stream);throw;}
+            bucket.context->end_graph_warmup(stream);
+            for(auto* block:blocks)bucket.context->release(block,size,stream);
+        } catch(...) {
+            for(auto* block:blocks)bucket.context->release(block,size,stream);
+            throw;
+        }
+    }
+}
+std::size_t Context::graph_available(cudaStream_t stream,std::size_t bytes) const {
+    std::lock_guard lock(graph_pool_mutex_);
+    const auto pool=graph_pools_.find(stream);
+    if(pool==graph_pools_.end())throw Error("CUDA graph allocation plan lost its pool");
+    const auto it=pool->second.available.find(bytes);
+    return it==pool->second.available.end()?0:it->second.size();
+}
+void Context::graph_strict_warmup(cudaStream_t stream,bool enabled) {
+    std::lock_guard lock(graph_pool_mutex_);
+    const auto pool=graph_pools_.find(stream);
+    if(pool==graph_pools_.end()) {
+        if(enabled)throw Error("CUDA graph allocation plan lost its pool");
+        return;
+    }
+    pool->second.strict_warmup=enabled;
+}
+
 void* Context::allocate(std::size_t bytes, cudaStream_t stream) {
     if (bytes == 0) {
         return nullptr;
@@ -578,7 +732,10 @@ void* Context::allocate(std::size_t bytes, cudaStream_t stream) {
     DeviceGuard guard(device_);
     const auto allocation_stream =
         stream != nullptr ? stream : stream_.get();
-    bool capture_pool_miss = false,pooled_allocation=false;
+    bool capture_pool_miss = false,strict_warmup_miss=false,pooled_allocation=false;
+    void* reused=nullptr;
+    std::size_t required_blocks=0;
+    const auto requested_bytes=bytes;
     cudaMemPool_t allocation_pool=pool_;
     {
         std::lock_guard lock(graph_pool_mutex_);
@@ -590,24 +747,26 @@ void* Context::allocate(std::size_t bytes, cudaStream_t stream) {
             // Stable size classes let serial graph shapes share scratch. The
             // same request must use the same class in warmup and capture; a
             // free-form best-fit choice can consume a later operation's slot.
-            if(bytes>=4096) {
-                std::size_t capacity=4096;
-                while(capacity<bytes) {
-                    if(capacity>SIZE_MAX/2)throw Error("CUDA graph workspace size overflows");
-                    capacity*=2;
-                }
-                bytes=capacity;
-            }
+            bytes=graph_size_class(bytes);
             auto available = pool->second.available.find(bytes);
             if (available != pool->second.available.end() &&
                     !available->second.empty()) {
-                void* pointer = available->second.back();
+                reused = available->second.back();
                 available->second.pop_back();
-                return pointer;
+            } else {
+                capture_pool_miss = pool->second.capturing;
+                strict_warmup_miss = pool->second.warming && pool->second.strict_warmup;
+                if(strict_warmup_miss) {
+                    for(const auto pointer:pool->second.owned) {
+                        const auto found=graph_allocation_sizes_.find(pointer);
+                        if(found!=graph_allocation_sizes_.end() && found->second==bytes)++required_blocks;
+                    }
+                    if(required_blocks==SIZE_MAX)throw Error("CUDA graph workspace count overflows");
+                    ++required_blocks;
+                }
             }
-            capture_pool_miss = pool->second.capturing;
         }
-        if(!pooled_allocation && !resident_allocations && workspace_loan_ &&
+        if(!pooled_allocation && !resident_allocations && !GraphAllocationPlan::warming() && workspace_loan_ &&
                 workspace_loan_->enabled && workspace_loan_->stream==allocation_stream &&
                 workspace_loan_->thread==std::this_thread::get_id() && bytes<=SIZE_MAX-255) {
             auto& loan=*workspace_loan_;
@@ -625,15 +784,21 @@ void* Context::allocate(std::size_t bytes, cudaStream_t stream) {
                 loan.live.emplace(result,aligned);
                 loan.free.erase(best);
                 if(size>aligned)loan.free.emplace(base+aligned,size-aligned);
-                return result;
+                reused=result;
             }
         }
     }
-    if (capture_pool_miss) {
-        throw Error(
-            "CUDA graph capture requested an un-warmed allocation of " +
-            std::to_string(bytes) + " bytes");
+    if(reused) {
+        try {
+            if(auto* plan=GraphAllocationPlan::current();plan && !resident_allocations)
+                plan->observe(*this,allocation_stream,reused,requested_bytes);
+        } catch(...) {release(reused,bytes,allocation_stream);throw;}
+        return reused;
     }
+    if(capture_pool_miss)throw Error("CUDA graph capture requested an un-warmed allocation of " + std::to_string(bytes) + " bytes");
+    if(strict_warmup_miss)throw GraphAllocationPlan::Miss(device_,allocation_stream,bytes,required_blocks);
+    if(GraphAllocationPlan::warming() && !resident_allocations && !pooled_allocation)
+        throw GraphAllocationPlan::Miss(device_,allocation_stream,graph_size_class(bytes),1);
     void* pointer = nullptr;
     const bool async=async_allocations_;
     if(async && resident_allocations && !pooled_allocation) {
@@ -708,6 +873,10 @@ void* Context::allocate(std::size_t bytes, cudaStream_t stream) {
     if(const auto* trace=tyloi::cuda::env_lookup("TYLOINFER_TRACE_LARGE_ALLOCATIONS");trace && trace[0]=='1' && bytes>=(std::size_t(1)<<20))
         std::cerr<<"cuda_large_allocate pointer="<<pointer<<" bytes="<<bytes
             <<" graph="<<pooled_allocation<<" resident="<<resident_allocations<<'\n';
+    try {
+        if(auto* plan=GraphAllocationPlan::current();plan && !resident_allocations)
+            plan->observe(*this,allocation_stream,pointer,requested_bytes);
+    } catch(...) {release(pointer,bytes,allocation_stream);throw;}
     return pointer;
 }
 
@@ -718,6 +887,7 @@ void Context::release(
     if (pointer == nullptr) {
         return;
     }
+    if(auto* plan=GraphAllocationPlan::current())plan->release(device_,pointer);
     const auto allocation_stream =
         stream != nullptr ? stream : stream_.get();
     try {

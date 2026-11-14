@@ -385,59 +385,6 @@ Tensor merge_norms(const Tensor& dense_tensor, const Tensor& experts_tensor, con
     return owner(cuda::ops::merge_norms(dense, experts, residual,
                                   dense_weight, expert_weight, output_weight, scale, eps));
 }
-struct ProfileRange::Impl {
-    std::optional<cuda::DeviceGuard> guard;
-    std::optional<CudaProfiler::Range> range;
-    Impl(CudaProfiler& profiler, const char* name, std::optional<Device> device) {
-        if (device && device->is_cuda()) guard.emplace(device->index);
-        range.emplace(profiler, name);
-    }
-};
-ProfileRange::ProfileRange(const char* name, std::optional<Device> device) {
-    auto& profiler = cuda::Executor::current().profiler();
-    if (profiler.enabled && profiler.selected(name))
-        impl_ = std::make_unique<Impl>(profiler, name, device);
-}
-ProfileRange::~ProfileRange() = default;
-void ProfileRange::finish() { if (impl_) impl_->range->finish(); }
-struct ProfileCapture::Impl {
-    CudaProfiler& profiler;
-    bool previous, enabled, selected;
-    std::string report_name;
-    Impl(CudaProfiler& profiler, bool selected, std::string report_name)
-        : profiler(profiler), previous(profiler.enabled), enabled(selected || profiler.enabled),
-          selected(selected), report_name(std::move(report_name)) {
-        if (selected) {
-            profiler.reset();
-            profiler.enabled = true;
-        }
-    }
-    ~Impl() {
-        if (selected && !report_name.empty() && std::uncaught_exceptions() == 0) {
-            try {
-                profiler.report(report_name);
-                profiler.reset();
-            } catch (const std::exception& error) {
-                std::cerr << "prefill_profile_error " << error.what() << '\n';
-            }
-        }
-        profiler.enabled = previous;
-    }
-};
-ProfileCapture::ProfileCapture(bool selected)
-    : impl_(selected ? std::make_unique<Impl>(cuda::Executor::current().profiler(), true, std::string{}) : nullptr) {}
-ProfileCapture::ProfileCapture(bool selected, const std::string& report_name)
-    : impl_(std::make_unique<Impl>(cuda::Executor::current().profiler(), selected, report_name)) {}
-ProfileCapture::~ProfileCapture() = default;
-void ProfileCapture::report(const std::string& name) {
-    if (impl_ && impl_->selected) impl_->profiler.report(name);
-}
-void ProfileCapture::resume() {
-    if (impl_) impl_->profiler.enabled = impl_->enabled;
-}
-void ProfileCapture::suspend() {
-    if (impl_) impl_->profiler.enabled = impl_->previous;
-}
 SelectedExperts topk(const Tensor& logits_tensor, std::int64_t count, const MoeRouting& routing,
                      const Tensor& bias) {
     const auto& logits = ::tyloi::ops::dense(logits_tensor);

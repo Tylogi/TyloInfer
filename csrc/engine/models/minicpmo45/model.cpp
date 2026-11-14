@@ -110,52 +110,20 @@ void load(Model& model, const tyloi::weights::Loader& weights, const LayerPlacem
     }
 }
 
-Model::Model() = default;
-Model::~Model() = default;
-Model::Model(Model&&) noexcept = default;
-Model& Model::operator=(Model&&) noexcept = default;
-
-tyloi::models::Info Model::info() const {
-    auto result = tyloi::models::model_info(metadata);
-    result.decode_graph = result.decode_graph && cpu_layers == 0;
-    return result;
-}
-MfqModelCapabilities Model::capabilities() const {
-    return {graph.architecture, true, false, false, false, false, false, false, "model-graph+cuda-adapters"};
-}
-tyloi::engine::Metrics Model::metrics() const {
-    return {{"kv_memory_supported", 0.0}, {"kv_quantization_supported", 0.0}};
-}
-std::unique_ptr<tyloi::models::State> Model::make_state() const { return std::make_unique<State>(*this); }
-tyloi::StepSequence<tyloi::models::Prepared> Model::prepare(const std::vector<std::int64_t>&,
-        const MfqMultimodalInput&, tyloi::models::State&) const {
-    throw std::invalid_argument("standalone MiniCPM TTS has no multimodal component");
-}
-Tensor Model::embedding(const Tensor& ids, int primary) const { return minicpmo45::embed(*this, primary, ids); }
-Tensor Model::normalize(const Tensor& hidden, std::int64_t batch, std::int64_t tokens) const {
-    return minicpmo45::normalize(*this, hidden, batch, tokens);
-}
-Tensor Model::softcap(const Tensor& value) const { return ::tyloi::ops::softcap(value, metadata.final_logit_softcapping); }
-Tensor Model::logits(const Tensor& hidden, bool capped) const { return minicpmo45::logits(*this, hidden, capped); }
-Tensor Model::forward(tyloi::models::Input input, tyloi::models::State& value,
-                      const tyloi::models::ForwardOptions& options) const {
-    auto* state = dynamic_cast<State*>(&value);
-    if (!state || !state->belongs_to(*this)) throw std::invalid_argument("MiniCPM TTS state belongs to another model");
-    if (input.suffix || input.host_raw) throw std::invalid_argument("unsupported MiniCPM TTS input mode");
-    return minicpmo45::forward(*this, *state, std::move(input), options);
-}
-void load(std::unique_ptr<tyloi::models::CausalModel>& owner, std::shared_ptr<const tyloi::ModelSource> source, std::string_view definition,
-        const tyloi::weights::Loader& weights, LayerPlacementConfig& placement,
-        const tyloi::models::LoadOptions& options) {
+#ifdef TYLOINFER_NATIVE_CUDA
+void load(std::unique_ptr<tyloi::models::CausalModel>& owner, std::shared_ptr<const tyloi::ModelSource> source,
+        std::string_view definition, const tyloi::weights::Loader& weights,
+        LayerPlacementConfig& placement, const tyloi::models::LoadOptions& options) {
     owner = std::make_unique<Model>(read(std::move(source), definition, options.context));
-    auto* result = static_cast<Model*>(owner.get());
+    auto* model = static_cast<Model*>(owner.get());
     if (options.expert_parallel) throw std::runtime_error("--expert-parallel requires a model with routed experts");
-    placement.prepare(result->config.num_hidden_layers);
-    result->primary_device = placement.primary_device();
-    result->cpu_layers = options.gpu_layers < 0 ? 0 : static_cast<int>(std::max<int64_t>(result->config.num_hidden_layers-options.gpu_layers,0));
-    if (result->cpu_layers > 0 && (weights.placement.tensor.enabled() || placement.enabled()))
+    placement.prepare(model->config.num_hidden_layers);
+    const int cpu_layers = options.gpu_layers < 0 ? 0 :
+        static_cast<int>(std::max<int64_t>(model->config.num_hidden_layers - options.gpu_layers, 0));
+    if (cpu_layers > 0 && (weights.placement.tensor.enabled() || placement.enabled()))
         throw std::runtime_error("--n-gpu-layers cannot be combined with tensor/expert/layer parallelism");
-    load(*result, weights, placement, result->cpu_layers, options.yarn);
+    load(*model, weights, placement, cpu_layers, options.yarn);
 }
+#endif
 
 } // namespace tyloi::cuda::minicpmo45

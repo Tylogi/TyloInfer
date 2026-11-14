@@ -4,9 +4,12 @@
 #include "engine/backends/cuda/executor/config.h"
 #include "engine/backends/cuda/native/tensor/backend.h"
 #include "engine/models/causal_model.h"
-#include "engine/models/media.h"
-#include "engine/models/speech.h"
 #include "engine/models/minicpmo45/media.h"
+#include "engine/models/minicpmo45/text/model.h"
+#include "engine/models/minicpmo45/text/state.h"
+#include "engine/models/minicpmo45/vision.h"
+#include "engine/models/minicpmo45/audio.h"
+#include "engine/models/minicpmo45/tts.h"
 #include "engine/ops.h"
 
 #include <nlohmann/json.hpp>
@@ -24,8 +27,9 @@ namespace {
 struct Work {
     cuda::Program& program;
     std::vector<Tensor> tensors;
-    std::vector<std::unique_ptr<models::Media::Request>> media;
-    std::vector<std::unique_ptr<models::Speech::Request>> speech;
+    std::vector<std::unique_ptr<MiniCPMO45AudioEncoder::State>> audio;
+    std::vector<std::unique_ptr<cuda::minicpmo45::Tts::State>> speech;
+    std::vector<StepSequence<Tensor>> steps;
     std::vector<std::unique_ptr<std::mt19937>> rng;
     Tensor keep(Tensor value) {
         if (value.defined()) tensors.push_back(value);
@@ -39,8 +43,9 @@ struct Work {
     void clear_completed_tensors() { tensors.clear(); }
     void retire() {
         program.drain();
+        steps.clear();
         speech.clear();
-        media.clear();
+        audio.clear();
         rng.clear();
         tensors.clear();
     }
@@ -48,40 +53,44 @@ struct Work {
         try { program.drain(); }
         catch (const std::exception& error) { std::cerr << "minicpmo_cleanup error=" << error.what() << '\n'; }
         catch (...) { std::cerr << "minicpmo_cleanup error=unknown\n"; }
+        steps.clear();
         speech.clear();
-        media.clear();
+        audio.clear();
         rng.clear();
         tensors.clear();
     }
 };
 
-models::MediaResult media_result(Work& work, std::unique_ptr<models::Media::Request> request) {
-    work.media.push_back(std::move(request));
-    auto& media = work.media.back();
-    models::MediaResult result;
-    bool found = false;
-    while (auto step = media->next()) {
+Tensor finish_media(Work& work, StepSequence<Tensor> sequence) {
+    work.steps.push_back(std::move(sequence));
+    Tensor result;
+    while (auto step = work.steps.back().next()) {
         if (step.layer || step.graph || step.workspace) throw std::logic_error("unsupported media resource event");
-        if (step.value) { result = std::move(*step.value); found = true; }
+        if (step.value) result = std::move(*step.value);
     }
-    if (!found) throw std::runtime_error("MiniCPM-o media request produced no result");
-    work.keep(result.vision_states);
-    work.keep(result.image_embeddings);
-    work.keep(result.audio_embeddings);
-    work.keep(result.input_embeddings);
-    return result;
+    if (!result) throw std::runtime_error("MiniCPM-o media encoding produced no result");
+    return work.keep(std::move(result));
 }
 
 DenseTensor forward(Work& work, DenseTensor ids, DenseTensor embeddings = {}, DenseTensor mask = {}) {
     models::Input input;
     input.ids = work.keep(Tensor(std::move(ids)));
     if (embeddings.defined()) input.embeddings = work.keep(Tensor(std::move(embeddings)));
-    if (mask.defined()) input.attention_mask = work.keep(Tensor(std::move(mask)));
     auto& program = work.program;
+    auto& state = dynamic_cast<cuda::minicpmo45::text::State&>(program.state());
+    if (mask.defined()) state.attention_mask = work.keep(Tensor(std::move(mask)));
+    else if (state.attention_mask) {
+        const auto end = state.position() + input.ids.size(input.ids.dim() - 1);
+        if (state.attention_mask.size(1) < end) {
+            auto existing = state.attention_mask.dense();
+            auto extra = work.keep(tyloi::cuda::ones({existing.size(0), end - existing.size(1)}, existing.options()));
+            state.attention_mask = work.keep(tyloi::cuda::cat({existing, extra}, 1));
+        }
+    }
     const int primary = program.config().layer_placement.primary_device();
     const auto mode = program.executor().forward_mode(primary);
     const models::ForwardOptions options{mode.kv_capacity, mode.trace, mode.trace_layer, primary};
-    return work.keep(program.model().forward(input, program.state(), options)).dense();
+    return work.keep(program.model().forward(input, state, options)).dense();
 }
 
 DenseTensor model_logits(Work& work, DenseTensor hidden) {
@@ -259,10 +268,13 @@ int minicpmo45_batch(cuda::Program& program,
         vision_batch_size = 16;
     auto scope = program.executor().enter(program.config().layer_placement.primary_device());
     program.load(true);
-    auto& model = program.model();
-    auto& state = program.state();
-    auto* media = model.media();
-    if (!media) throw std::runtime_error("MiniCPM-o model has no media capability");
+    auto& model = dynamic_cast<cuda::minicpmo45::text::Model&>(program.model());
+    auto& state = dynamic_cast<cuda::minicpmo45::text::State&>(program.state());
+    auto policy = cuda::Executor::current_ffn();
+    policy.independent |= model.info().separate_projections;
+    auto model_scope = program.executor().enter(policy);
+    if (!model.vision || !model.resampler || !model.audio || !model.tts)
+        throw std::runtime_error("MiniCPM-o media weights are unavailable");
     if (model.info().max_context < context_size)
         throw std::invalid_argument("MiniCPM-o eval context exceeds the loaded model context");
     const int primary = program.config().layer_placement.primary_device();
@@ -362,9 +374,11 @@ int minicpmo45_batch(cuda::Program& program,
                 auto device_pixels = work.keep(host_pixels.to(device));
                 auto batch_mask = work.keep(patch_mask.narrow(0, begin, count));
                 auto batch_sizes = work.keep(target_sizes.narrow(0, begin, count));
-                auto result = media_result(work, media->images(Tensor(device_pixels), Tensor(batch_mask), Tensor(batch_sizes)));
-                vision_parts.push_back(result.vision_states.dense());
-                image_embedding_parts.push_back(result.image_embeddings.dense());
+                auto vision = finish_media(work, model.vision->forward_steps(
+                    Tensor(device_pixels), Tensor(batch_mask), Tensor(batch_sizes)));
+                auto image = work.keep(model.resampler->forward(vision, Tensor(batch_sizes)));
+                vision_parts.push_back(vision.dense());
+                image_embedding_parts.push_back(image.dense());
             }
             image_embeddings = work.keep(tyloi::cuda::cat(image_embedding_parts, 0).contiguous());
         }
@@ -393,7 +407,9 @@ int minicpmo45_batch(cuda::Program& program,
                 auto part_length = work.keep(tyloi::cuda::tensor(
                     std::vector<int64_t>{raw_lengths[index]},
                     tyloi::TensorOptions().dtype(tyloi::kInt64)));
-                auto part = media_result(work, media->audios(Tensor(part_features), Tensor(part_length))).audio_embeddings.dense();
+                work.audio.push_back(std::make_unique<MiniCPMO45AudioEncoder::State>(*model.audio));
+                auto part = finish_media(work, model.audio->forward_steps(
+                    Tensor(part_features), Tensor(part_length), *work.audio.back(), false)).dense();
                 if (part.size(1) != valid_length_values[static_cast<size_t>(index)]) {
                     throw std::runtime_error("MiniCPM-o per-segment Whisper length mismatch");
                 }
@@ -428,6 +444,10 @@ int minicpmo45_batch(cuda::Program& program,
         auto first_ids = work.keep(first_host_ids.to(device, tyloi::kInt64).contiguous());
         if (first_ids.dim() == 1)
             first_ids = first_ids.unsqueeze(0);
+        auto first_mask = work.keep(read_tensor(first_prefix + ".attention_mask.pt", true).to(device, tyloi::kBool).contiguous());
+        if (first_mask.dim() == 1) first_mask = first_mask.unsqueeze(0);
+        if (first_ids.dim() != 2 || first_ids.size(0) != 1 || first_mask.sizes() != first_ids.sizes())
+            throw std::runtime_error("MiniCPM-o first prompt mask has incompatible shape");
         auto first_bounds = read_tensor(first_prefix + ".image_bounds.pt", false);
         auto first_audio_bounds = read_tensor(first_prefix + ".audio_bounds.pt", false);
         auto first_prefill_splits =
@@ -440,14 +460,13 @@ int minicpmo45_batch(cuda::Program& program,
         }
         double prefix_seconds = 0.0;
         int64_t prefix_prefill_calls = 0;
+        TextSessionState prefix_snapshot;
         if (reuse_prefix_cache) {
             state.reset(1);
+            state.attention_mask = {};
             auto prefix_ids = first_ids.narrow(1, 0, prefix_length);
             auto prefix_embeddings = first_embeddings.narrow(1, 0, prefix_length);
-            auto prefix_mask =
-                tyloi::cuda::ones({1, prefix_length}, tyloi::TensorOptions()
-                                                                 .device(device)
-                                                                 .dtype(tyloi::kBool));
+            auto prefix_mask = first_mask.narrow(1, 0, prefix_length);
             work.retire();
             const auto prefix_started = std::chrono::steady_clock::now();
             tyloi::DenseTensor prefix_hidden;
@@ -459,7 +478,8 @@ int minicpmo45_batch(cuda::Program& program,
                     const int64_t segment_end = segment.second;
                     prefix_hidden = forward(work,
                         prefix_ids.narrow(1, segment_begin, segment_end - segment_begin),
-                        prefix_embeddings.narrow(1, segment_begin, segment_end - segment_begin));
+                        prefix_embeddings.narrow(1, segment_begin, segment_end - segment_begin),
+                        prefix_mask.narrow(1, 0, segment_end));
                     ++prefix_prefill_calls;
                 }
             } else {
@@ -473,6 +493,10 @@ int minicpmo45_batch(cuda::Program& program,
             if (state.position() != prefix_length) {
                 throw std::runtime_error("MiniCPM-o prefix cache length mismatch");
             }
+            auto host_prefix = first_host_ids.to(tyloi::kCPU, tyloi::kInt64).contiguous().reshape({-1});
+            const auto* ids = host_prefix.data_ptr<int64_t>();
+            prefix_snapshot = state.capture_text_session_state(std::vector<int64_t>(ids, ids + prefix_length));
+            work.retire();
         }
 
         nlohmann::json results = nlohmann::json::array();
@@ -506,15 +530,20 @@ int minicpmo45_batch(cuda::Program& program,
                 input_ids.size(1) + max_new_tokens > context_size) {
                 throw std::runtime_error("MiniCPM-o eval prompt exceeds the configured context");
             }
+            if (reuse_prefix_cache &&
+                (!input_ids.narrow(1, 0, prefix_length).eq(first_ids.narrow(1, 0, prefix_length)).all().item<bool>() ||
+                 !attention_mask.narrow(1, 0, prefix_length).eq(first_mask.narrow(1, 0, prefix_length)).all().item<bool>()))
+                throw std::runtime_error("MiniCPM-o shared prefix tokens or mask differ");
             auto input_embeddings =
                 question == 0 ? first_embeddings
                               : minicpmo45_eval_embeddings(work, model, primary, input_ids, image_embeddings,
                                                            image_bounds, audio_embeddings,
                                                            audio_bounds, audio_valid_lengths);
             if (reuse_prefix_cache) {
-                state.rewind(prefix_length);
+                program.restore(prefix_snapshot);
             } else {
                 state.reset(1);
+                state.attention_mask = {};
             }
             const int64_t evaluated_prefix_length = reuse_prefix_cache ? prefix_length : 0;
             const int64_t suffix_length = input_ids.size(1) - evaluated_prefix_length;
@@ -553,7 +582,8 @@ int minicpmo45_batch(cuda::Program& program,
                     const int64_t segment_end = segment.second;
                     auto segment_hidden = forward(work,
                         input_ids.narrow(1, segment_begin, segment_end - segment_begin),
-                        input_embeddings.narrow(1, segment_begin, segment_end - segment_begin));
+                        input_embeddings.narrow(1, segment_begin, segment_end - segment_begin),
+                        attention_mask.narrow(1, 0, segment_end));
                     if (segment_begin == text_begin && segment_end == text_end) {
                         teacher_text_hidden = segment_hidden;
                         found_text = true;
@@ -573,7 +603,8 @@ int minicpmo45_batch(cuda::Program& program,
                     const int64_t segment_end = segment.second;
                     hidden = forward(work,
                         input_ids.narrow(1, segment_begin, segment_end - segment_begin),
-                        input_embeddings.narrow(1, segment_begin, segment_end - segment_begin));
+                        input_embeddings.narrow(1, segment_begin, segment_end - segment_begin),
+                        attention_mask.narrow(1, 0, segment_end));
                     ++suffix_prefill_calls;
                 }
                 logits = model_logits(work, hidden.index({Slice(), -1, Slice()}));
@@ -668,34 +699,17 @@ int minicpmo45_batch(cuda::Program& program,
                     auto combined = work.keep(tyloi::cuda::cat(generated_hidden, 1));
                     text_hidden = work.keep(combined.narrow(1, 0, text_length).contiguous());
                 }
-                const auto* speech = model.speech();
-                if (!speech) throw std::runtime_error("MiniCPM-o model has no speech capability");
                 work.keep(text_ids);
                 work.keep(text_hidden);
-                auto condition = work.keep(speech->condition(Tensor(text_ids), Tensor(text_hidden)));
+                auto condition = work.keep(model.tts->condition(Tensor(text_ids), Tensor(text_hidden)));
                 work.rng.push_back(std::make_unique<std::mt19937>(static_cast<std::mt19937::result_type>(seed)));
-                models::SpeechOptions speech_options;
-                speech_options.steps = tts_max_steps;
-                speech_options.minimum_steps = tts_minimum_steps;
-                speech_options.temperature = tts_temperature;
-                speech_options.top_p = tts_top_p;
-                speech_options.top_k = tts_top_k;
-                speech_options.repetition_penalty = tts_repetition_penalty;
-                speech_options.min_p = tts_min_p;
-                speech_options.minimum_keep = tts_min_tokens_to_keep;
-                work.speech.push_back(speech->generate(condition, speech_options, false, work.rng.back().get()));
-                models::SpeechResult result;
-                bool found = false;
-                while (auto step = work.speech.back()->next()) {
-                    if (step.layer || step.graph || step.workspace)
-                        throw std::logic_error("unsupported speech resource event");
-                    if (step.value) { result = std::move(*step.value); found = true; }
-                }
-                if (!found) throw std::runtime_error("MiniCPM-o speech request produced no result");
-                work.keep(result.condition);
-                work.keep(result.codes);
-                work.keep(result.logits);
-                tts_codes = work.keep(result.codes.dense().to(tyloi::kCPU, tyloi::kInt64).reshape({-1}));
+                work.speech.push_back(std::make_unique<cuda::minicpmo45::Tts::State>(*model.tts));
+                const auto mode = program.executor().forward_mode(primary);
+                const models::ForwardOptions options{mode.kv_capacity, mode.trace, mode.trace_layer, primary};
+                auto codes = work.keep(model.tts->generate_official(*work.speech.back(), options, condition,
+                    tts_max_steps, 6561, tts_minimum_steps, tts_temperature, tts_top_p, tts_top_k,
+                    tts_repetition_penalty, nullptr, tts_min_p, work.rng.back().get(), tts_min_tokens_to_keep));
+                tts_codes = work.keep(codes.dense().to(tyloi::kCPU, tyloi::kInt64).reshape({-1}));
                 if (!output_prefix.empty()) {
                     std::ostringstream path;
                     path << output_prefix << ".q" << std::setw(3) << std::setfill('0') << question

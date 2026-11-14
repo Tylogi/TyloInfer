@@ -236,10 +236,12 @@ std::vector<DecodeWindow::GpuPhase> DecodeWindow::gpu_phases() const {
 struct DecodeWindow::BranchPool {
     StreamHandle stream;
     std::shared_ptr<Context> context;
-    explicit BranchPool(StreamHandle value):stream(std::move(value)),context(default_context(stream.device_index())) {
-        context->begin_graph_pool(stream.stream());
+    bool owned=false;
+    BranchPool(StreamHandle value,GraphAllocationPlan* plan):stream(std::move(value)),context(default_context(stream.device_index())) {
+        if(!context->has_graph_pool(stream.stream())) {context->begin_graph_pool(stream.stream());owned=true;}
+        else if(plan)owned=plan->release_pool(stream.device_index(),stream.stream());
     }
-    ~BranchPool(){context->end_graph_pool(stream.stream());}
+    ~BranchPool(){if(owned)context->end_graph_pool(stream.stream());}
 };
 void DecodeWindow::prepare_branch_stream(const StreamHandle& stream,std::shared_ptr<void>& owner) {
     if(active!=this)throw std::logic_error("parallel stream outside window recording");
@@ -249,36 +251,59 @@ void DecodeWindow::prepare_branch_stream(const StreamHandle& stream,std::shared_
         throw std::logic_error("parallel stream pool owner changed");
     if(pool && std::find(branch_pools_.begin(),branch_pools_.end(),pool)!=branch_pools_.end())return;
     if(recording_segments_)throw std::logic_error("parallel stream was not prepared before graph capture");
-    if(!pool){pool=std::make_shared<BranchPool>(stream);owner=pool;}
+    if(!pool){pool=std::make_shared<BranchPool>(stream,allocation_plan_.get());owner=pool;}
     branch_pools_.push_back(std::move(pool));
+    prepare_recording_branch(branch_pools_.back()->context,branch_pools_.back()->stream);
 }
 struct DecodeWindow::Signal::Impl {
     DecodeWindow& window;
     HostBuffer flags{128,true};
     uint32_t* device=nullptr;
+    bool profile=false,mapped_rows=false;
+    uint64_t calls=0,route_wait_ns=0,upload_ns=0,notify_ns=0;
+    std::chrono::steady_clock::time_point point;
     explicit Impl(DecodeWindow& value):window(value) {
+        const auto timing=options::trace_ple_timings();profile=timing && *timing;
         charge_tensor_host_bytes(128);
         TYLOINFER_NATIVE_CUDA_CHECK(cudaHostGetDevicePointer(reinterpret_cast<void**>(&device),flags.data(),0));
         std::memset(flags.data(),0,128);publish_mapped_flag(host()+16);
     }
-    ~Impl() {tensor_host_bytes.fetch_sub(128);}
+    ~Impl() {
+        if(profile)std::cerr<<"ple_stage_host mapped_rows="<<mapped_rows<<" calls="<<calls
+            <<" route_wait_ns="<<route_wait_ns<<" upload_ns="<<upload_ns<<" notify_ns="<<notify_ns<<'\n';
+        tensor_host_bytes.fetch_sub(128);
+    }
+    void sample(uint64_t& total) {
+        if(!profile)return;
+        const auto now=std::chrono::steady_clock::now();
+        total+=std::chrono::duration_cast<std::chrono::nanoseconds>(now-point).count();point=now;
+    }
     uint32_t* host() {return static_cast<uint32_t*>(flags.data());}
 };
 DecodeWindow::Signal::Signal(DecodeWindow& window):impl_(std::make_unique<Impl>(window)) {}
 DecodeWindow::Signal::~Signal() = default;
 void DecodeWindow::Signal::reset() {std::memset(impl_->flags.data(),0,128);}
-void DecodeWindow::Signal::wait_route() {wait_route_publication(impl_->host(),impl_->window.stream_);}
+void DecodeWindow::Signal::wait_route() {
+    if(impl_->profile)impl_->point=std::chrono::steady_clock::now();
+    wait_route_publication(impl_->host(),impl_->window.stream_);
+    impl_->sample(impl_->route_wait_ns);
+}
 void DecodeWindow::Signal::wait_device() {
     signal_mapped_flag(impl_->device,impl_->window.stream_);
     wait_mapped_flag(impl_->device+16,impl_->window.stream_);
 }
+void DecodeWindow::Signal::set_mapped_rows(bool mapped) noexcept {impl_->mapped_rows=mapped;}
+void DecodeWindow::Signal::cancel() noexcept {publish_mapped_flag(impl_->host()+16);}
 void DecodeWindow::Signal::publish(bool mapped) {
+    impl_->sample(impl_->upload_ns);
     if(mapped)publish_mapped_flag(impl_->host()+16);
     else {
         const auto stream=impl_->window.transfer_->get();
         TYLOINFER_NATIVE_CUDA_CHECK(cudaLaunchHostFunc(stream,[](void* p){publish_mapped_flag(static_cast<uint32_t*>(p));},impl_->host()+16));
         check_stream_progress(stream);
     }
+    impl_->sample(impl_->notify_ns);
+    if(impl_->profile)++impl_->calls;
 }
 std::unique_ptr<DecodeWindow::Signal> DecodeWindow::signal() {
     if(!transfer_) {
@@ -353,16 +378,37 @@ void DecodeWindow::host_barrier(std::function<void()> serve) {
 }
 struct DecodeWindow::Capture::Impl {
     DecodeWindow& window;
-    HostRegistrationBlock registration;
+    std::unique_ptr<HostRegistrationBlock> registration;
+    GraphAllocationPlan& plan;
+    StreamHandle stream=current_stream();
+    std::shared_ptr<Context> primary=default_context(stream.device_index());
     std::chrono::steady_clock::time_point started=std::chrono::steady_clock::now();
     std::vector<std::unique_ptr<GraphWarmupScope>> warmup;
+    std::unique_ptr<tyloi::Executor::Scope> ffn_scope;
+    bool* ffn_serial=nullptr;
+    bool previous_ffn_serial=false;
     std::size_t branch_captures=0, warm_tasks=0, warm_barriers=0;
     int pass=-1;
-    bool finished=false, complete=false;
+    bool finished=false, complete=false, paused=false, retrying=false;
 
-    explicit Impl(DecodeWindow& owner):window(owner) {
+    explicit Impl(DecodeWindow& owner):window(owner),plan(*owner.allocation_plan_) {
         if(active)throw std::logic_error("nested MFQ window capture");
+        registration=std::make_unique<HostRegistrationBlock>();
         active=&window;
+    }
+    void release_ffn() noexcept {
+        if (ffn_serial) *ffn_serial = previous_ffn_serial;
+        ffn_serial = nullptr;
+        ffn_scope.reset();
+    }
+    void synchronize() {
+        const auto wait=[](const StreamHandle& participant) {
+            DeviceGuard guard(participant.device_index());
+            TYLOINFER_NATIVE_CUDA_CHECK(cudaStreamSynchronize(participant.stream()));
+        };
+        wait(stream);
+        for(const auto& pool:window.branch_pools_)wait(pool->stream);
+        for(const auto& [context,participant]:plan.participants())wait(participant);
     }
     void end_branches() noexcept {
         while(branch_captures) {
@@ -371,7 +417,11 @@ struct DecodeWindow::Capture::Impl {
         }
     }
     ~Impl() {
-        warmup.clear();end_branches();
+        release_ffn();
+        plan.end();plan.end_warmup();warmup.clear();end_branches();
+        primary->graph_strict_warmup(stream.stream(),false);
+        for(const auto& pool:window.branch_pools_)pool->context->graph_strict_warmup(pool->stream.stream(),false);
+        for(const auto& [context,participant]:plan.participants())context->graph_strict_warmup(participant.stream(),false);
         if(!complete) {
             window.recording_segments_=false;
             for(auto& task:window.tasks_)if(task.cancel)task.cancel();
@@ -380,11 +430,40 @@ struct DecodeWindow::Capture::Impl {
             if(window.transfer_)(void)cudaStreamSynchronize(window.transfer_->get());
             window.failed_=true;
         }
-        active=nullptr;
+        if(active==&window)active=nullptr;
     }
 };
-DecodeWindow::Capture::Capture(DecodeWindow& window):impl_(std::make_unique<Impl>(window)) {}
-DecodeWindow::Capture::~Capture() = default;
+void DecodeWindow::prepare_recording_branch(const std::shared_ptr<Context>& context,const StreamHandle& stream) {
+    if(!capture_)return;
+    auto& state=*capture_->impl_;
+    if(state.pass!=1 && state.pass!=2)return;
+    for(const auto& [planned,participant]:state.plan.participants())
+        if(participant.device_index()==stream.device_index() && participant.stream()==stream.stream())return;
+    context->graph_strict_warmup(stream.stream(),true);
+    state.warmup.push_back(std::make_unique<GraphWarmupScope>(context,stream.stream()));
+}
+DecodeWindow::Capture::Capture(DecodeWindow& window):impl_(std::make_unique<Impl>(window)) {window.capture_=this;}
+DecodeWindow::Capture::~Capture() {impl_->window.capture_=nullptr;}
+std::vector<std::pair<Device,std::size_t>> DecodeWindow::fixed_growth(
+        Device device,bool layer_profile,bool compact_sampling,std::size_t signals) {
+    std::size_t gpu=compact_sampling?sizeof(int32_t):0;
+    if(signals>SIZE_MAX/128)throw std::overflow_error("CUDA graph signal growth overflows");
+    std::size_t host=signals*128;
+    if(compact_sampling) {
+        if(host>SIZE_MAX-128)throw std::overflow_error("CUDA graph signal growth overflows");
+        host+=128;
+    }
+    const auto* option=env_lookup("TYLOINFER_TRACE_LAYER_TIMINGS_CLOCK");
+    if(layer_profile && (!option || option[0]!='0')) {
+        constexpr std::size_t clock_bytes=ProfileClock::capacity*sizeof(uint64_t);
+        if(host>SIZE_MAX-clock_bytes)throw std::overflow_error("CUDA graph profiling growth overflows");
+        gpu+=clock_bytes;host+=clock_bytes;
+    }
+    std::vector<std::pair<Device,std::size_t>> result;
+    if(gpu)result.emplace_back(device,gpu);
+    if(host)result.emplace_back(Device{kCPU,0},host);
+    return result;
+}
 void DecodeWindow::set_compact_sampling(bool enabled,const char* role,int rows) {
     if(!sampling_)sampling_=std::make_unique<Sampling>();
     auto& state=*sampling_;
@@ -441,34 +520,75 @@ void DecodeWindow::prepare_pool() {
 }
 std::unique_ptr<DecodeWindow::Capture> DecodeWindow::begin_capture() {
     if(valid())throw std::logic_error("MFQ window is already captured");
+    if(!allocation_plan_)allocation_plan_=std::make_unique<GraphAllocationPlan>();
+    if(!default_context(current_stream().device_index())->has_graph_pool(stream_))prepare_pool();
     return std::unique_ptr<Capture>(new Capture(*this));
 }
 bool DecodeWindow::Capture::next() {
     auto& state=*impl_;auto& window=state.window;
+    if(state.paused)throw std::logic_error("paused MFQ capture");
     if(state.pass>=0 && !state.finished)throw std::logic_error("unfinished MFQ capture pass");
     if(state.pass==3)return false;
-    if(state.pass==0 || state.pass==1) {window.tasks_.clear();window.barriers_.clear();}
-    if(state.pass==2) {
-        state.warm_tasks=window.tasks_.size();state.warm_barriers=window.barriers_.size();
-        window.tasks_.clear();window.barriers_.clear();
+    if(state.retrying) {
+        window.tasks_.clear();window.barriers_.clear();state.retrying=false;
+    } else {
+        if(state.pass==0 || state.pass==1) {window.tasks_.clear();window.barriers_.clear();}
+        if(state.pass==2) {
+            state.warm_tasks=window.tasks_.size();state.warm_barriers=window.barriers_.size();
+            window.tasks_.clear();window.barriers_.clear();
+        }
+        ++state.pass;
     }
-    ++state.pass;state.finished=false;
+    state.finished=false;
+    if(state.pass==0)state.plan.begin();
     if(state.pass==1 || state.pass==2) {
         int device=0;TYLOINFER_NATIVE_CUDA_CHECK(cudaGetDevice(&device));
-        state.warmup.push_back(std::make_unique<GraphWarmupScope>(default_context(device),window.stream_));
-        for(const auto& pool:window.branch_pools_)
+        auto primary=default_context(device);
+        primary->graph_strict_warmup(window.stream_,true);
+        state.warmup.push_back(std::make_unique<GraphWarmupScope>(primary,window.stream_));
+        for(const auto& pool:window.branch_pools_) {
+            pool->context->graph_strict_warmup(pool->stream.stream(),true);
             state.warmup.push_back(std::make_unique<GraphWarmupScope>(pool->context,pool->stream.stream()));
+        }
+        for(const auto& [context,stream]:state.plan.participants()) {
+            if(stream.device_index()==state.stream.device_index() && stream.stream()==state.stream.stream())continue;
+            if(std::any_of(window.branch_pools_.begin(),window.branch_pools_.end(),[&](const auto& pool) {
+                return pool->stream.device_index()==stream.device_index() && pool->stream.stream()==stream.stream();
+            }))continue;
+            context->graph_strict_warmup(stream.stream(),true);
+            state.warmup.push_back(std::make_unique<GraphWarmupScope>(context,stream.stream()));
+        }
+        state.plan.begin_warmup();
     } else if(state.pass==3) {
+        std::vector<StreamHandle> participants;
+        for(const auto& [context,stream]:state.plan.participants()) {
+            if(stream.device_index()==state.stream.device_index() && stream.stream()==state.stream.stream())continue;
+            if(std::any_of(window.branch_pools_.begin(),window.branch_pools_.end(),[&](const auto& pool) {
+                return pool->stream.device_index()==stream.device_index() && pool->stream.stream()==stream.stream();
+            }))continue;
+            participants.push_back(stream);
+        }
+        window.graphs_.participants(std::move(participants));
         for(const auto& pool:window.branch_pools_) {
             pool->context->begin_graph_capture(pool->stream.stream());++state.branch_captures;
         }
         window.recording_segments_=true;window.graphs_.begin(0,1);
     }
+    auto& executor = Executor::current();
+#ifdef TYLOINFER_NATIVE_CUDA
+    auto mode = Executor::current_ffn();
+    mode.serial = true;
+    state.ffn_scope = executor.enter(mode);
+#endif
+    state.ffn_serial = &executor.mode().ffn.serial;
+    state.previous_ffn_serial = *state.ffn_serial;
+    *state.ffn_serial = true;
     return true;
 }
 bool DecodeWindow::Capture::finish() {
     auto& state=*impl_;auto& window=state.window;
     if(state.pass<0 || state.finished)throw std::logic_error("invalid MFQ capture pass");
+    state.release_ffn();
     if(state.pass==3) {
         window.graphs_.end_segment(window.barriers_.size(),1);
         window.recording_segments_=false;state.end_branches();
@@ -476,11 +596,51 @@ bool DecodeWindow::Capture::finish() {
         if(window.tasks_.size()!=state.warm_tasks || window.barriers_.size()!=state.warm_barriers)
             throw std::logic_error("MFQ window task order changed during capture");
     } else {
-        state.warmup.clear();
-        TYLOINFER_NATIVE_CUDA_CHECK(cudaStreamSynchronize(window.stream_));
+        state.plan.end_warmup();state.warmup.clear();
+        state.synchronize();
     }
     state.finished=true;
     return state.pass!=3;
+}
+bool DecodeWindow::Capture::retry(std::exception_ptr failure) {
+    auto& state=*impl_;auto& window=state.window;
+    state.release_ffn();
+    try {if(failure)std::rethrow_exception(failure);return false;}
+    catch(const GraphAllocationPlan::Miss& miss) {
+        if(state.pass!=1 && state.pass!=2)return false;
+        state.plan.end_warmup();state.warmup.clear();
+        for(auto& task:window.tasks_)if(task.cancel)task.cancel();
+        state.synchronize();
+        if(window.transfer_)window.transfer_->synchronize();
+        state.plan.add(miss);
+        state.finished=true;state.retrying=true;
+        return true;
+    } catch(...) {return false;}
+}
+void DecodeWindow::Capture::pause() {
+    auto& state=*impl_;
+    if(state.paused || !state.finished || active!=&state.window)
+        throw std::logic_error("invalid MFQ capture pause");
+    state.release_ffn();
+    state.plan.end();
+    if(state.pass==0)state.plan.freeze();
+    state.primary->graph_strict_warmup(state.stream.stream(),false);
+    for(const auto& pool:state.window.branch_pools_)pool->context->graph_strict_warmup(pool->stream.stream(),false);
+    for(const auto& [context,stream]:state.plan.participants())context->graph_strict_warmup(stream.stream(),false);
+    active=nullptr;state.registration.reset();state.paused=true;
+}
+std::vector<std::pair<Device,std::size_t>> DecodeWindow::Capture::growth() const {
+    if(!impl_->paused)throw std::logic_error("MFQ capture growth requires pause");
+    return impl_->plan.growth();
+}
+void DecodeWindow::Capture::resume() {
+    auto& state=*impl_;
+    if(!state.paused || active)throw std::logic_error("invalid MFQ capture resume");
+    const auto current=current_stream();
+    if(current.device_index()!=state.stream.device_index() || current.stream()!=state.stream.stream())
+        throw std::logic_error("MFQ capture resumed on a different stream");
+    state.plan.materialize();
+    state.registration=std::make_unique<HostRegistrationBlock>();active=&state.window;state.paused=false;
 }
 void DecodeWindow::Capture::release_warm_outputs() {
     for(auto& task:impl_->window.tasks_)if(task.release_warm_output)task.release_warm_output();
@@ -488,7 +648,7 @@ void DecodeWindow::Capture::release_warm_outputs() {
 void DecodeWindow::Capture::complete() {
     auto& state=*impl_;auto& window=state.window;
     if(state.pass!=3 || !state.finished)throw std::logic_error("incomplete MFQ window capture");
-    TYLOINFER_NATIVE_CUDA_CHECK(cudaStreamSynchronize(window.stream_));
+    state.synchronize();
     window.capture_ns_=std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now()-state.started).count();
     state.complete=true;

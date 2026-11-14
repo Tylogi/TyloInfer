@@ -486,6 +486,18 @@ std::optional<models::Decoded> Program::decode(models::Input input, models::Deco
         p.forward, std::move(input), options);
 }
 
+Tensor Program::restore(const TextSessionState& snapshot) {
+    auto& p = *impl_;
+    if (p.running) throw std::logic_error("program request is already running");
+    if (!p.run_ready) configure(engine::resolve_config());
+    auto scope = p.executor->enter(p.config.layer_placement.primary_device());
+    auto* predictor = snapshot.mtp ? p.model->predictor() : nullptr;
+    if (snapshot.mtp && !predictor)
+        throw std::invalid_argument("session predictor is unavailable");
+    p.graph->invalidate();
+    return tyloi::state::restore(*p.state, snapshot, *p.executor, *p.weights, *p.budget, predictor);
+}
+
 StepSequence<engine::EventData> Program::generate(engine::InferenceRequest& request,
         engine::InferenceOutput& output, bool predictor, std::string id) {
     auto& p = *impl_;

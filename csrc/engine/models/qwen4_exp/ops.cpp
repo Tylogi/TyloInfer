@@ -25,9 +25,9 @@
 #include "engine/weights/tq/source.h"
 #include "engine/weights/tq/rows.h"
 #include "engine/backends/cuda/executor/decode_window.h"
+#include "engine/backends/cuda/ops/profile.h"
 #include "engine/backends/cuda/kernels/moe/pipeline.h"
 #include <iostream>
-#include <atomic>
 #include "engine/ops.h"
 #include "engine/ops/residual.h"
 #include "engine/ops/ffn.h"
@@ -40,9 +40,9 @@
 #endif
 #include <algorithm>
 #include <cstdlib>
-#include <cstdio>
 #include <cstring>
 #include <chrono>
+#include <exception>
 #include <limits>
 
 namespace tyloi::cuda {
@@ -52,6 +52,22 @@ struct GraphCheckpoint {
     std::vector<::tyloi::Tensor> gdn_conv, gdn_state;
     std::vector<::tyloi::DenseTensor> ple_conv;
 };
+
+void add_growth(std::vector<std::pair<Device, std::size_t>>& growth, Device device,
+        std::size_t bytes, std::size_t count = 1) {
+    if (count && bytes > std::numeric_limits<std::size_t>::max() / count)
+        throw std::overflow_error("Qwen4 graph growth overflow");
+    bytes *= count;
+    if (!bytes) return;
+    auto found = std::find_if(growth.begin(), growth.end(),
+        [device](const auto& entry) { return entry.first == device; });
+    if (found == growth.end()) growth.emplace_back(device, bytes);
+    else {
+        if (found->second > std::numeric_limits<std::size_t>::max() - bytes)
+            throw std::overflow_error("Qwen4 graph growth overflow");
+        found->second += bytes;
+    }
+}
 
 tyloi::ops::Residual::Result graph_attention(const qwen4_exp::Layer& weights, qwen4_exp::LayerState& state,
         ::tyloi::DenseTensor x, const ::tyloi::DenseTensor& ids, const ::tyloi::DenseTensor& positions,
@@ -142,28 +158,19 @@ Predictor::Predictor(Predictor&&) noexcept = default;
 Predictor& Predictor::operator=(Predictor&&) noexcept = default;
 
 DenseTensor Predictor::embed(DenseTensor ids) const {
-#ifdef TYLOINFER_NATIVE_CUDA
-    auto normalized=::tyloi::ops::contiguous(::tyloi::ops::copy(
-        ::tyloi::ops::cast(ids,::tyloi::kInt64),::tyloi::Device(::tyloi::kCUDA,primary)));
-    return ::tyloi::ops::measure("model.embed",normalized.device(),[&] {
-        return ::tyloi::ops::embedding(normalized,embedding);
-    }).dense();
-#else
-    return tyloi::cuda::embed(*embedding, std::move(ids), Executor::current().collectives(),
-                           Executor::current().profiler(), primary);
-#endif
+    auto normalized = ::tyloi::ops::contiguous(::tyloi::ops::copy(
+        ::tyloi::ops::cast(ids, ::tyloi::kInt64), ::tyloi::Device(::tyloi::kCUDA, primary)));
+    ::tyloi::ops::ProfileRange range("model.embed", normalized.device());
+    auto output = ::tyloi::ops::embedding(normalized, embedding);
+    range.finish();
+    return output.dense();
 }
 
 DenseTensor Predictor::logits(DenseTensor hidden) const {
-#ifdef TYLOINFER_NATIVE_CUDA
-    auto projected=::tyloi::ops::measure("model.lm_head",hidden.device(),[&] {
-        return ::tyloi::ops::project(hidden,output);
-    });
-    return ::tyloi::ops::softcap(projected,softcap).dense();
-#else
-    return tyloi::cuda::logits(*output, std::move(hidden), Executor::current().projector(Executor::current().mode().ffn),
-                            Executor::current().profiler(), softcap);
-#endif
+    ::tyloi::ops::ProfileRange range("model.lm_head", hidden.device());
+    auto projected = ::tyloi::ops::project(hidden, output);
+    range.finish();
+    return ::tyloi::ops::softcap(projected, softcap).dense();
 }
 
 void Predictor::reset(tyloi::models::MtpState& value, int64_t next_batch) const {
@@ -577,17 +584,11 @@ struct Qwen4DecodeGraph {
         std::shared_ptr<RowStage> transfer;
         std::vector<qwen4_exp::NgramEmbedding::Context> prefix_context;
         std::unique_ptr<DecodeWindow::Signal> signal;
-        bool profile=false;
-        uint64_t calls=0,route_wait_ns=0,upload_ns=0,notify_ns=0;
         PleStage(qwen4_exp::Ple* p,qwen4_exp::Ple::State& request,int tokens,int hidden,DecodeWindow& window)
             :ple(p),state(&request),signal(window.signal()) {
-            const auto timing=::tyloi::cuda::options::trace_ple_timings();profile=timing && *timing;
             transfer=ple->graph_stage(*state,tokens,::tyloi::Device{::tyloi::kCUDA,mfq_current_cuda_device()});
+            signal->set_mapped_rows(transfer->mapped_rows());
             rows=transfer->output().dense().reshape({1,tokens,hidden});
-        }
-        ~PleStage(){
-            if(profile)std::cerr<<"ple_stage_host mapped_rows="<<transfer->mapped_rows()<<" calls="<<calls
-                <<" route_wait_ns="<<route_wait_ns<<" upload_ns="<<upload_ns<<" notify_ns="<<notify_ns<<'\n';
         }
     };
     struct Cell {
@@ -721,7 +722,36 @@ struct Qwen4DecodeGraph {
         };
         auto& owner=cells[{tokens,kind,confirmed}];
         if(owner && owner->window.valid() && !owner->window.matches(observed()))owner.reset();
-        if(!owner)owner=std::make_unique<Cell>(tokens,model.config.hidden,model.layers,request.layers,confirmed,shared_checkpoints);
+        if(!owner) {
+            const Device device(kCUDA, model.primary_device);
+            const auto ple_count = std::count_if(model.layers.begin(), model.layers.end(),
+                [](const auto& layer) { return bool(layer->ple); });
+            auto fixed = DecodeWindow::fixed_growth(device, ::tyloi::cuda::options::layer_timings(), kind == 4 && tokens > 1, ple_count);
+            add_growth(fixed, device, std::size_t(tokens) * sizeof(int64_t), 3);
+            add_growth(fixed, Device(kCPU), std::size_t(tokens) * sizeof(int64_t), 66);
+            for (std::size_t i = 0; i < model.layers.size(); ++i) {
+                const auto& layer = *model.layers[i];
+                if (layer.ple) for (const auto& [target, bytes] : layer.ple->graph_stage_growth(tokens, device))
+                    add_growth(fixed, target, bytes);
+                if (!confirmed) continue;
+                const GraphCheckpoint empty;
+                const auto& shared = i < shared_checkpoints.size() ? shared_checkpoints[i] : empty;
+                const auto count = std::size_t(tokens - confirmed);
+                if (layer.gdn) {
+                    const auto tensors = layer.gdn->graph_state(request.layers[i]->gdn);
+                    if (shared.gdn_conv.size() < count)
+                        add_growth(fixed, tensors[0]->device(), tensors[0]->nbytes(), count - shared.gdn_conv.size());
+                    if (shared.gdn_state.size() < count)
+                        add_growth(fixed, tensors[1]->device(), tensors[1]->nbytes(), count - shared.gdn_state.size());
+                }
+                if (layer.ple && shared.ple_conv.size() < count) {
+                    const auto& tensor = layer.ple->conv_state(request.layers[i]->ple);
+                    add_growth(fixed, tensor.device(), tensor.nbytes(), count - shared.ple_conv.size());
+                }
+            }
+            co_yield tyloi::GraphRequest{tyloi::GraphPhase::admit, nullptr, std::move(fixed)};
+            owner=std::make_unique<Cell>(tokens,model.config.hidden,model.layers,request.layers,confirmed,shared_checkpoints);
+        }
         owner->window.set_profile_geometry(want_raw?"mtp_target":"target_decode",tokens);
         auto& cell=*owner;
         if(kind==4 && tokens>1)cell.window.set_compact_sampling(options.compact_sampling,"target",tokens);
@@ -750,10 +780,14 @@ struct Qwen4DecodeGraph {
             graph.prepare(0, request.positions);
             if(!cell.window.valid()) {
                 co_yield tyloi::GraphPhase::prepare;
-                DecodeGraphBranchScope branch_scope(
-                    Executor::current().mode().ffn.serial);
                 struct Saved {::tyloi::Tensor* target;::tyloi::DenseTensor saved;const void* address;};
                 std::vector<Saved> states;
+                std::vector<std::pair<Device, std::size_t>> copy_growth;
+                if (!startup_warmup) for (std::size_t i = 0; i < model.layers.size(); ++i)
+                    for (auto* value : request.layers[i]->graph_state(*model.layers[i]))
+                        add_growth(copy_growth, value->device(), value->nbytes());
+                if (!copy_growth.empty())
+                    co_yield tyloi::GraphRequest{tyloi::GraphPhase::admit, nullptr, std::move(copy_growth)};
                 if(!startup_warmup) for(std::size_t i=0;i<model.layers.size();++i)
                         for(auto* value:request.layers[i]->graph_state(*model.layers[i]))
                             states.push_back({value,value->dense().clone(),value->dense().data_ptr()});
@@ -765,6 +799,9 @@ struct Qwen4DecodeGraph {
                 };
                 auto recording=cell.window.begin_capture();
                 try { while(recording->next()) {
+                    std::exception_ptr failure;
+                    bool warm = false;
+                    try {
                     cell.window.mark(-1,"window_begin");
                     auto hidden=model.repeat_hidden(model.embed_tokens(cell.ids),model.metadata.hc_mult);
                     std::size_t ple_index=0;int layer=0;
@@ -780,15 +817,7 @@ struct Qwen4DecodeGraph {
                             cell.window.enroll({stage,
                                 [&cell,stage] {stage->signal->reset();stage->ple->prefetch_tokens(*stage->state,cell.host_ids);},
                                 [this,&cell,stage,confirmed] {
-                                    using Clock=std::chrono::steady_clock;
-                                    auto point=stage->profile?Clock::now():Clock::time_point{};
-                                    const auto sample=[&](uint64_t& total) {
-                                        if(!stage->profile)return;
-                                        const auto now=Clock::now();
-                                        total+=std::chrono::duration_cast<std::chrono::nanoseconds>(now-point).count();point=now;
-                                    };
                                     stage->signal->wait_route();
-                                    sample(stage->route_wait_ns);
                                     auto guard=cell.window.transfer_scope();
                                     if(confirmed) {
                                         stage->prefix_context.clear();
@@ -796,10 +825,8 @@ struct Qwen4DecodeGraph {
                                             stage->prefix_context.push_back(stage->ple->graph_prefix_context(*stage->state,cell.host_ids,i));
                                     }
                                     stage->ple->upload_graph(*stage->state,cell.host_ids,*stage->transfer);
-                                    sample(stage->upload_ns);
                                     stage->signal->publish(stage->transfer->mapped_rows());
-                                    sample(stage->notify_ns);if(stage->profile)++stage->calls;
-                                },{},[stage]{stage->signal->publish(true);}});
+                                },{},[stage]{stage->signal->cancel();}});
                             stage->signal->wait_device();
                             stage->transfer->decode();
                             cell.window.mark(layer,"ple_end");
@@ -838,11 +865,19 @@ struct Qwen4DecodeGraph {
                     else if(kind==1)cell.output=model.logits(qwen4_last_hidden(std::move(hidden))).dense();
                     else cell.output=qwen4_logits_from_hidden(model, std::move(hidden));
                     cell.window.mark(-1,"window_end");
-                    const bool warm=recording->finish();
+                    warm=recording->finish();
+                    } catch (...) { failure = std::current_exception(); }
+                    if (failure) {
+                        if (!recording->retry(failure)) std::rethrow_exception(failure);
+                        warm = true;
+                    }
                     restore();
                     if(warm) {
                         cell.output={};cell.raw_hidden={};cell.logits={};
                         recording->release_warm_outputs();
+                        recording->pause();
+                        co_yield tyloi::GraphRequest{tyloi::GraphPhase::admit, nullptr, recording->growth()};
+                        recording->resume();
                     }
                 }
                 recording->complete();
@@ -895,43 +930,15 @@ struct Qwen4DecodeGraph {
         } catch(...) {failed=true;throw;}
     }
 };
-void qwen4_report_decode_graph(const qwen4_exp::Model& model,const qwen4_exp::State& state,std::ostream& output) {
-    if(!state.graph_registry)return;
-    for(const auto& [key,cell]:state.graph_registry->cells)
-        for(const auto& phase:cell->window.gpu_phases())if(phase.samples)
-            output<<"mtp_graph_phase tokens="<<std::get<0>(key)<<" confirmed="<<std::get<2>(key)
-                <<" layer="<<phase.layer<<" from="<<phase.from<<" to="<<phase.to
-                <<" samples="<<phase.samples<<" total_ns="<<phase.total_ns<<'\n';
-}
-
 std::vector<std::pair<std::string,double>> qwen4_decode_graph_profile_metrics(
-        const qwen4_exp::Model& model,const qwen4_exp::State& state) {
+        const qwen4_exp::Model&, const qwen4_exp::State& state) {
     std::vector<std::pair<std::string,double>> result;
-    if(!::tyloi::cuda::options::layer_timings())return result;
-    const auto append=[&](const auto& cells,const char* role,const char* attribute,const char* state) {
-        for(const auto& [key,cell]:cells) {
-            auto prefix=std::string("cuda_graph_profile_")+role+"_rows_"+
-                std::to_string(std::get<0>(key))+"_"+attribute+"_"+std::to_string(std::get<1>(key))+
-                "_"+state+"_"+std::to_string(std::get<2>(key))+"_";
-            struct Sample {int64_t total_ns=0,max_ns=0;uint64_t samples=0;};
-            std::map<std::string,Sample> phases;
-            uint64_t windows=0;
-            for(const auto& phase:cell->window.gpu_phases())if(phase.samples) {
-                auto& sample=phases[phase.from+"_to_"+phase.to];
-                sample.total_ns+=phase.total_ns;sample.samples+=phase.samples;
-                sample.max_ns=std::max(sample.max_ns,phase.max_ns);
-                windows=std::max(windows,phase.samples);
-            }
-            if(!windows)continue;
-            result.emplace_back(prefix+"windows",double(windows));
-            for(const auto& [name,sample]:phases) {
-                result.emplace_back(prefix+name+"_ms",sample.total_ns/1e6);
-                result.emplace_back(prefix+name+"_samples",double(sample.samples));
-                result.emplace_back(prefix+name+"_max_ms",sample.max_ns/1e6);
-            }
-        }
-    };
-    if(state.graph_registry)append(state.graph_registry->cells,"target","kind","confirmed");
+    if (state.graph_registry) for (const auto& [key,cell] : state.graph_registry->cells) {
+        const auto prefix = std::string("cuda_graph_profile_target_rows_") +
+            std::to_string(std::get<0>(key)) + "_kind_" + std::to_string(std::get<1>(key)) +
+            "_confirmed_" + std::to_string(std::get<2>(key)) + "_";
+        append_graph_profile_metrics(cell->window, prefix, result);
+    }
     return result;
 }
 
@@ -1084,39 +1091,6 @@ std::vector<std::pair<std::string,double>> qwen4_cache_memory_metrics(
 } // namespace tyloi::cuda
 
 namespace tyloi::cuda {
-static ::tyloi::DenseTensor batch_ffn(const tyloi::ops::FfnWeights& ffn,
-                                      const ::tyloi::DenseTensor& input) {
-    if(input.size(0)<=8)return tyloi::ops::ffn(ffn,input).dense();
-    const auto option=::tyloi::cuda::options::continuous_ffn_tile();
-    const int64_t rows=option?*option:8;
-    TYLOINFER_RUNTIME_CHECK(rows==8 || rows==16,"continuous FFN tile must be 8 or 16 rows");
-    auto* window=DecodeWindow::recording();
-    const int previous_profile_tile=window ? window->set_profile_tile(-1) : -1;
-    auto& mode = Executor::current().mode().ffn;
-    struct TileScope {
-        tyloi::cuda::FfnMode& mode;
-        int tile,tiles;
-        DecodeWindow* window;
-        int profile_tile;
-        ~TileScope() {mode.tile=tile;mode.tiles=tiles;
-            if(window)window->set_profile_tile(profile_tile);}
-    } scope{mode,mode.tile,mode.tiles,window,previous_profile_tile};
-    mode.tiles=int((input.size(0)+rows-1)/rows);
-    std::vector<::tyloi::DenseTensor> outputs;
-    for(int64_t start=0;start<input.size(0);start+=rows) {
-        mode.tile=int(start/rows);
-        if(window)window->set_profile_tile(int(start/rows));
-#ifdef TYLOINFER_NATIVE_CUDA
-        auto tile_mode=Executor::current_ffn();
-        tile_mode.tile=mode.tile;
-        tile_mode.tiles=mode.tiles;
-        auto tile_scope=Executor::current().enter(tile_mode);
-#endif
-        outputs.push_back(tyloi::ops::ffn(ffn,input.narrow(0,start,std::min(rows,input.size(0)-start))).dense());
-    }
-    return ::tyloi::cuda::cat(outputs,0);
-}
-
 struct Qwen4BatchRequestState::Impl {
     const qwen4_exp::Model& model;
     std::vector<std::unique_ptr<qwen4_exp::LayerState>> layers;
@@ -1275,7 +1249,7 @@ std::optional<Qwen4BatchDecodeGraph::Plan> Qwen4BatchDecodeGraph::plan(
     return plan;
 }
 
-std::optional<::tyloi::Tensor> Qwen4BatchDecodeGraph::run(
+tyloi::StepSequence<::tyloi::Tensor> Qwen4BatchDecodeGraph::run(
         const std::vector<Qwen4BatchRequestState*>& requests,
         const ::tyloi::Tensor& ids_handle,const ::tyloi::Tensor& host_ids_handle,bool greedy,const Plan& plan,bool prepared) {
     const auto& ids = ids_handle.dense();
@@ -1286,6 +1260,21 @@ std::optional<::tyloi::Tensor> Qwen4BatchDecodeGraph::run(
     auto stream_scope=graph.stream.enter();
     graph.greedy = greedy;
     if (plan.rebuild) {
+        auto fixed = DecodeWindow::fixed_growth(ids.device(), ::tyloi::cuda::options::layer_timings(), false, 0);
+        add_growth(fixed, ids.device(), std::size_t(batch) * sizeof(int64_t), 3);
+        for (std::size_t i = 0; i < model.layers.size(); ++i) {
+            const auto& layer = *model.layers[i];
+            if (layer.ple) for (const auto& [device, bytes] : layer.ple->graph_stage_growth(1, ids.device()))
+                add_growth(fixed, device, bytes, std::size_t(batch));
+            if (layer.gdn && batch > 1 && ::tyloi::cuda::options::batch_attention_projections() &&
+                    ::tyloi::cuda::options::gdn_independent_batch()) {
+                add_growth(fixed, ids.device(), std::size_t(batch) * sizeof(int64_t), 3);
+                add_growth(fixed, Device(kCPU), std::size_t(batch) * sizeof(int64_t), 3);
+            }
+        }
+        stream_scope.reset();
+        co_yield tyloi::GraphRequest{tyloi::GraphPhase::admit, nullptr, std::move(fixed)};
+        stream_scope = graph.stream.enter();
         graph.requests = requests;
         graph.capacities = plan.capacities;
         graph.window = std::make_unique<DecodeWindow>(::tyloi::cuda::options::layer_timings(),true);
@@ -1337,25 +1326,28 @@ std::optional<::tyloi::Tensor> Qwen4BatchDecodeGraph::run(
     if (!graph.window->valid()) {
         struct Saved { ::tyloi::Tensor* tensor; ::tyloi::DenseTensor snapshot; };
         std::vector<Saved> recurrent;
+        std::vector<::tyloi::Tensor*> tensors;
+        std::vector<std::pair<Device, std::size_t>> copy_growth;
+        for (auto* request : requests) for (std::size_t i = 0; i < model.layers.size(); ++i)
+            for (auto* tensor : request->state_->layers[i]->graph_state(*model.layers[i])) {
+                tensors.push_back(tensor);
+                add_growth(copy_growth, batch > 8 ? Device(kCPU) : tensor->device(), tensor->nbytes());
+            }
+        stream_scope.reset();
+        co_yield tyloi::GraphRequest{tyloi::GraphPhase::admit, nullptr, std::move(copy_growth)};
+        stream_scope = graph.stream.enter();
         const auto save=[&](::tyloi::Tensor* tensor) {
             // Capture restores these values after warmup. They are never read
             // by replay, so large batches can keep this temporary copy in RAM.
             if(tensor->defined())recurrent.push_back({tensor,batch>8 ? tensor->dense().to(::tyloi::kCPU) : tensor->dense().clone()});
         };
-        for (auto* request : requests) {
-            for (std::size_t i = 0; i < request->state_->layers.size(); ++i) {
-                const auto& weights = *model.layers[i];
-                auto& state = *request->state_->layers[i];
-                if (weights.gdn) for (auto* tensor : weights.gdn->graph_state(state.gdn))
-                    save(tensor);
-                if (weights.ple) for (auto* tensor : weights.ple->graph_state(state.ple))
-                    save(tensor);
-            }
-        }
-        DecodeGraphBranchScope branch_scope(Executor::current().mode().ffn.serial);
+        for (auto* tensor : tensors) save(tensor);
         try {
             auto recording=graph.window->begin_capture();
             while(recording->next()) {
+            std::exception_ptr failure;
+            bool warm = false;
+            try {
             graph.window->mark(-1,"window_begin");
             auto hidden = model.repeat_hidden(model.embed_tokens(graph.ids),model.metadata.hc_mult);
             std::optional<tyloi::ops::Residual::Result> pending_residual;
@@ -1405,7 +1397,7 @@ std::optional<::tyloi::Tensor> Qwen4BatchDecodeGraph::run(
                 graph.window->mark(static_cast<int>(i),"attention_core_end");
                 auto ffn_mix = block.ffn_gr.pre_after(std::move(attention),mix.residual,mix.gate,tyloi::ops::ResidualRole::ffn);
                 graph.window->mark(static_cast<int>(i),"ffn_pre_end");
-                auto ffn_output=batch_ffn(block.ffn,ffn_mix.mixed.dense());
+                auto ffn_output=tyloi::ops::batch_ffn(block.ffn,ffn_mix.mixed).dense();
                 bool defer=false;
                 if(chain_post && i+1<model.layers.size()) {
                     const auto& next=*model.layers[i+1];
@@ -1419,9 +1411,22 @@ std::optional<::tyloi::Tensor> Qwen4BatchDecodeGraph::run(
             graph.logits = greedy ? qwen4_next_token(model,qwen4_last_hidden(std::move(finalized)))
                 .reshape({batch,1}) : qwen4_logits_from_hidden(model, std::move(finalized)).reshape({batch,-1});
             graph.window->mark(-1,"window_end");
-            const bool warm=recording->finish();
+            warm=recording->finish();
+            } catch (...) { failure = std::current_exception(); }
+            if (failure) {
+                if (!recording->retry(failure)) std::rethrow_exception(failure);
+                warm = true;
+            }
             for (const auto& saved : recurrent) saved.tensor->dense().copy_(saved.snapshot);
-            if(warm) {graph.logits={};recording->release_warm_outputs();}
+            if(warm) {
+                graph.logits={};
+                recording->release_warm_outputs();
+                recording->pause();
+                stream_scope.reset();
+                co_yield tyloi::GraphRequest{tyloi::GraphPhase::admit, nullptr, recording->growth()};
+                stream_scope=graph.stream.enter();
+                recording->resume();
+            }
             }
             recording->complete();
             std::vector<::tyloi::Tensor> owners;
@@ -1461,7 +1466,8 @@ std::optional<::tyloi::Tensor> Qwen4BatchDecodeGraph::run(
             state.position_storage,model.max_position_embeddings());
         ++state.cache_position;
     }
-    return ::tyloi::Tensor(graph.logits);
+    stream_scope.reset();
+    co_yield ::tyloi::Tensor(graph.logits);
 }
 
 tyloi::StepSequence<std::vector<::tyloi::Tensor>> qwen4_batch_prefill(qwen4_exp::Model& model,
@@ -1507,18 +1513,22 @@ tyloi::StepSequence<std::vector<::tyloi::Tensor>> qwen4_batch_prefill(qwen4_exp:
             for (std::size_t row=0;row<requests.size();++row) {
                 auto x=hidden.narrow(1,offsets[row],chunks[row].size(1));
                 auto& layer=*requests[row]->state_->layers[i];
-                auto ple=packed ? block.ple->forward(layer.ple,x,chunks[row],true,0,
-                    host_ids.narrow(1,offsets[row],chunks[row].size(1))) :
-                    Executor::current().profiler().measure("prefill.ple",[&] {
-                        return block.ple->forward(layer.ple,x,chunks[row],true,0,
-                            host_ids.narrow(1,offsets[row],chunks[row].size(1)));
-                    });
+                std::optional<tyloi::ops::ProfileRange> range;
+                if (!packed) range.emplace("prefill.ple");
+                auto ple = block.ple->forward(layer.ple,x,chunks[row],true,0,
+                    host_ids.narrow(1,offsets[row],chunks[row].size(1)));
+                if (range) range->finish();
                 positional.push_back(x+ple);
             }
             hidden=join_request_outputs(positional,1);
         }
-        auto mix=packed ? block.attention_gr.pre(hidden) :
-            Executor::current().profiler().measure("prefill.gr_attention",[&] { return block.attention_gr.pre(hidden); });
+        tyloi::ops::Residual::Result mix;
+        {
+            std::optional<tyloi::ops::ProfileRange> range;
+            if (!packed) range.emplace("prefill.gr_attention");
+            mix = block.attention_gr.pre(hidden);
+            if (range) range->finish();
+        }
         ::tyloi::DenseTensor attention;
         if(packed) {
             const auto projections=block.gdn?block.gdn->project_inputs(mix.mixed)
@@ -1537,23 +1547,31 @@ tyloi::StepSequence<std::vector<::tyloi::Tensor>> qwen4_batch_prefill(qwen4_exp:
             attention=(block.gdn?block.gdn->project_output(attention):block.qsa->project_output(attention)).dense();
         } else {
             auto& layer=*requests.front()->state_->layers[i];
-            if(block.gdn)attention=Executor::current().profiler().measure("prefill.gdn",[&] {
-                return block.gdn->forward(layer.gdn,mix.mixed,true,0).dense();
-            });
-            else attention=Executor::current().profiler().measure("prefill.qsa",[&] {
-                return block.qsa->forward(*layer.qsa,mix.mixed,current.front(),full.front(),true).dense();
-            });
+            tyloi::ops::ProfileRange range(block.gdn ? "prefill.gdn" : "prefill.qsa");
+            attention = block.gdn ? block.gdn->forward(layer.gdn,mix.mixed,true,0).dense()
+                : block.qsa->forward(*layer.qsa,mix.mixed,current.front(),full.front(),true).dense();
+            range.finish();
         }
-        auto ffn_mix=packed ? block.ffn_gr.pre_after(std::move(attention),mix.residual,mix.gate) :
-            Executor::current().profiler().measure("prefill.gr_ffn_pre",[&] {
-                return block.ffn_gr.pre_after(std::move(attention),mix.residual,mix.gate);
-            });
-        auto ffn_output=packed ? tyloi::ops::ffn(block.ffn,ffn_mix.mixed).dense() :
-            Executor::current().profiler().measure("prefill.ffn",[&] { return tyloi::ops::ffn(block.ffn,ffn_mix.mixed).dense(); });
-        hidden=packed ? block.ffn_gr.post(ffn_output,ffn_mix.residual,ffn_mix.gate).dense() :
-            Executor::current().profiler().measure("prefill.gr_ffn_post",[&] {
-                return block.ffn_gr.post(ffn_output,ffn_mix.residual,ffn_mix.gate).dense();
-            });
+        tyloi::ops::Residual::Result ffn_mix;
+        {
+            std::optional<tyloi::ops::ProfileRange> range;
+            if (!packed) range.emplace("prefill.gr_ffn_pre");
+            ffn_mix = block.ffn_gr.pre_after(std::move(attention),mix.residual,mix.gate);
+            if (range) range->finish();
+        }
+        ::tyloi::DenseTensor ffn_output;
+        {
+            std::optional<tyloi::ops::ProfileRange> range;
+            if (!packed) range.emplace("prefill.ffn");
+            ffn_output = tyloi::ops::ffn(block.ffn,ffn_mix.mixed).dense();
+            if (range) range->finish();
+        }
+        {
+            std::optional<tyloi::ops::ProfileRange> range;
+            if (!packed) range.emplace("prefill.gr_ffn_post");
+            hidden = block.ffn_gr.post(ffn_output,ffn_mix.residual,ffn_mix.gate).dense();
+            if (range) range->finish();
+        }
         co_yield tyloi::LayerEvent{tyloi::LayerEvent::Phase::end};
     }
     hidden=qwen4_finalize_hidden(model, std::move(hidden),1,tokens);
@@ -1611,7 +1629,7 @@ tyloi::StepSequence<std::vector<::tyloi::Tensor>> qwen4_batch_prefill(qwen4_exp:
         if(project_batch)attention=block.gdn->project_output(attention).dense();
         auto ffn_mix = block.ffn_gr.pre_after(std::move(attention),mix.residual,mix.gate);
         // Tiles share the expert transfer cache across all eligible rows.
-        hidden = block.ffn_gr.post(batch_ffn(block.ffn,ffn_mix.mixed.dense()),ffn_mix.residual,ffn_mix.gate).dense();
+        hidden = block.ffn_gr.post(tyloi::ops::batch_ffn(block.ffn,ffn_mix.mixed),ffn_mix.residual,ffn_mix.gate).dense();
     }
     auto logits = qwen4_logits_from_hidden(model, qwen4_finalize_hidden(model, std::move(hidden),batch,1)).reshape({batch,-1});
     for (int64_t row = 0; row < batch; ++row) {
@@ -1730,50 +1748,15 @@ tyloi::StepSequence<tyloi::models::Prefill> qwen4_exp::Model::prefill(
     ids=model.device_ids(std::move(ids));
     const auto tokens=ids.size(1);
     const auto cache_start=state.cache_pos;
-    const auto* profile_once=tyloi::cuda::env_lookup("TYLOINFER_PROFILE_PREFILL_ONCE");
-    static std::atomic<uint64_t> profile_requests{0};
-    const bool profile_enabled=profile_once && profile_once[0]=='1';
-    const auto* profile_skip=tyloi::cuda::env_lookup("TYLOINFER_PROFILE_PREFILL_SKIP");
-    const auto skipped=profile_skip?std::max<long long>(0,std::atoll(profile_skip)):0;
-    const auto profile_request=profile_enabled?profile_requests.fetch_add(1):0;
-    const bool collect=profile_enabled && profile_request==uint64_t(skipped);
-    if(profile_enabled)std::cerr<<"prefill_profile_request index="<<profile_request
-        <<" tokens="<<tokens<<" collect="<<int(collect)<<'\n';
-#ifdef TYLOINFER_NATIVE_CUDA
-    tyloi::ops::ProfileCapture capture(collect,"prefill_regression_once");
-    const auto profile_measure=[&](const char* name, const auto& operation) {
-        return tyloi::ops::measure(name, operation);
-    };
-    const auto resume_profile=[&] { capture.resume(); };
-    const auto suspend_profile=[&] { capture.suspend(); };
-#else
-    auto& profiler=Executor::current().profiler();
-    const bool previous_profile=profiler.enabled;
-    if(collect){profiler.reset();profiler.enabled=true;}
-    struct ProfileRestore {
-        CudaProfiler& profiler;bool enabled,previous,collect;
-        ~ProfileRestore() {
-            if(collect && std::uncaught_exceptions()==0) {
-                try {profiler.report("prefill_regression_once");profiler.reset();}
-                catch(const std::exception& error){std::cerr<<"prefill_profile_error "<<error.what()<<'\n';}
-            }
-            profiler.enabled=previous;
-        }
-    } restore{profiler,profiler.enabled,previous_profile,collect};
-    const auto profile_measure=[&](const char* name, const auto& operation) {
-        return profiler.measure(name, operation);
-    };
-    const auto resume_profile=[&] { profiler.enabled=restore.enabled; };
-    const auto suspend_profile=[&] { profiler.enabled=restore.previous; };
-#endif
+    auto capture = tyloi::ops::ProfileCapture::prefill_once(tokens);
     compute_chunk=std::min(compute_chunk,tokens);
     const auto reserve=std::size_t(1)<<30;
     const auto row_bytes=std::size_t(model.config.hidden)*model.config.streams*sizeof(float)*8;
     const auto sequence_reserve=std::size_t(tokens)*model.config.hidden*model.config.streams*sizeof(float)*3;
-    suspend_profile();
+    capture.suspend();
     co_yield tyloi::Workspace{reserve+sequence_reserve, nullptr,
         tyloi::Workspace::Tile{tokens,row_bytes,&compute_chunk}};
-    resume_profile();
+    capture.resume();
     tyloi::cuda::ResidentAllocationScope persistent_preamble;
     qwen4_validate_forward(model,tokens,cache_start,false);
     if(cache_start==0)state.reset(1);
@@ -1793,7 +1776,7 @@ tyloi::StepSequence<tyloi::models::Prefill> qwen4_exp::Model::prefill(
     DenseTensor hidden=::tyloi::cuda::empty({1,tokens,model.metadata.hidden_size*model.metadata.hc_mult},
                            ids.options().dtype(::tyloi::kFloat16));
     for(int64_t begin=0;begin<tokens;begin+=compute_chunk) {
-        suspend_profile(); co_yield tyloi::StepState::advanced; resume_profile();
+        capture.suspend(); co_yield tyloi::StepState::advanced; capture.resume();
         const auto count=std::min(compute_chunk,tokens-begin);
         auto input=model.repeat_hidden(model.embed_tokens(ids.narrow(1,begin,count)),model.metadata.hc_mult);
         TYLOINFER_RUNTIME_CHECK(input.scalar_type()==hidden.scalar_type() &&
@@ -1834,7 +1817,7 @@ tyloi::StepSequence<tyloi::models::Prefill> qwen4_exp::Model::prefill(
     int layer=0;
     for(auto& block:model.layers) {
         auto& layer_state=*state.layers[layer];
-        suspend_profile(); co_yield tyloi::LayerEvent{tyloi::LayerEvent::Phase::begin, tyloi::LayerEvent::Mode::tiled}; resume_profile();
+        capture.suspend(); co_yield tyloi::LayerEvent{tyloi::LayerEvent::Phase::begin, tyloi::LayerEvent::Mode::tiled}; capture.resume();
         DenseTensor next_hidden=hidden;
         DenseTensor ffn_inputs,ffn_gate;
         tyloi::ops::Residual::Result attention_result;
@@ -1844,7 +1827,7 @@ tyloi::StepSequence<tyloi::models::Prefill> qwen4_exp::Model::prefill(
             DenseTensor source=hidden;
             if(qwen_block.ple) {
                 for(int64_t begin=0;begin<tokens;begin+=compute_chunk) {
-                    suspend_profile(); co_yield tyloi::StepState::advanced; resume_profile();
+                    capture.suspend(); co_yield tyloi::StepState::advanced; capture.resume();
                     const auto count=std::min(compute_chunk,tokens-begin);
                     auto chunk_ids=ids.narrow(1,begin,count);
                     auto host_ids=cpu_ids.narrow(1,begin,count);
@@ -1855,22 +1838,24 @@ tyloi::StepSequence<tyloi::models::Prefill> qwen4_exp::Model::prefill(
                     source.narrow(1,begin,count).copy_(input);
                 }
             }
-            attention_result=profile_measure("prefill.gr_attention",[&] {
-                return qwen_block.attention_gr.pre(source);
-            });
+            {
+                tyloi::ops::ProfileRange range("prefill.gr_attention");
+                attention_result = qwen_block.attention_gr.pre(source);
+                range.finish();
+            }
             if(bulk_gdn && qwen_block.gdn) {
-                suspend_profile(); co_yield tyloi::StepState::advanced; resume_profile();
+                capture.suspend(); co_yield tyloi::StepState::advanced; capture.resume();
                 const tyloi::ops::Gdn::ProjectionScope projection_rows(compute_chunk);
-                attention_output=profile_measure("prefill.gdn",[&] {
-                    return qwen_block.gdn->forward(layer_state.gdn,attention_result.mixed,true,0).dense();
-                });
+                tyloi::ops::ProfileRange range("prefill.gdn");
+                attention_output = qwen_block.gdn->forward(layer_state.gdn,attention_result.mixed,true,0).dense();
+                range.finish();
             }
         }
         for(int64_t begin=0;begin<tokens;begin+=compute_chunk) {
-            suspend_profile(); co_yield tyloi::StepState::advanced; resume_profile();
+            capture.suspend(); co_yield tyloi::StepState::advanced; capture.resume();
             if(bulk_gdn && block->gdn)continue;
             const auto count=std::min(compute_chunk,tokens-begin);
-            resume_profile();
+            capture.resume();
             auto chunk_ids=ids.narrow(1,begin,count);
             auto host_ids=cpu_ids.narrow(1,begin,count);
             auto positions=prepared.narrow(-1,begin,count);
@@ -1917,45 +1902,49 @@ tyloi::StepSequence<tyloi::models::Prefill> qwen4_exp::Model::prefill(
         }
         // Attention's decoded matrices are no longer needed by FFN. Keep
         // reuse within each phase, without retaining both sets at peak memory.
-        if(tokens>9216) { suspend_profile(); co_yield tyloi::LayerEvent{tyloi::LayerEvent::Phase::clear}; resume_profile(); }
+        if(tokens>9216) { capture.suspend(); co_yield tyloi::LayerEvent{tyloi::LayerEvent::Phase::clear}; capture.resume(); }
         if(bulk_gr) {
             auto& qwen_block=*block;
-            auto mix=profile_measure("prefill.gr_ffn_pre",[&] {
-                return qwen_block.ffn_gr.pre_after(attention_output,attention_result.residual,attention_result.gate);
-            });
+            tyloi::ops::Residual::Result mix;
+            {
+                tyloi::ops::ProfileRange range("prefill.gr_ffn_pre");
+                mix = qwen_block.ffn_gr.pre_after(attention_output,attention_result.residual,attention_result.gate);
+                range.finish();
+            }
             ffn_inputs=mix.mixed.dense().to(::tyloi::kFloat16);ffn_gate=mix.gate.dense();
             next_hidden=mix.residual.dense();
             attention_result={};attention_output={};
         }
-        if(tokens>9216) { suspend_profile(); co_yield tyloi::LayerEvent{tyloi::LayerEvent::Phase::clear}; resume_profile(); }
+        if(tokens>9216) { capture.suspend(); co_yield tyloi::LayerEvent{tyloi::LayerEvent::Phase::clear}; capture.resume(); }
         // The new residual owns the next layer's values. Prior hidden readers
         // have already been submitted before this stream-ordered release.
         if(tokens>9216)hidden={};
         if(batch_experts) {
-            suspend_profile(); co_yield tyloi::StepState::advanced; resume_profile();
+            capture.suspend(); co_yield tyloi::StepState::advanced; capture.resume();
             auto& qwen_block=*block;
-            resume_profile();
-            auto ffn_output=profile_measure("prefill.ffn",[&] {
-                if(expert_batch_count(tokens)==tokens)return tyloi::ops::ffn(qwen_block.ffn,ffn_inputs,{}, {}, reference_rows).dense();
-                DenseTensor result;
-                for(int64_t begin=0;begin<tokens;) {
-                    auto count=expert_batch_count(tokens-begin);
-                    const auto tail=tokens-begin-count;
-                    // A tiny final batch would enter the decode FFN path and
-                    // release the shared prefill images halfway through every
-                    // layer. Keep both batches in prefill, including chat inputs
-                    // just above the expert-batch boundary.
-                    if(tail>0 && tail<=8)count-=16-tail;
-                    auto part=tyloi::ops::ffn(qwen_block.ffn,ffn_inputs.narrow(1,begin,count),{}, {}, reference_rows).dense();
-                    if(!result.defined()) {
-                        auto shape=part.sizes().vec();shape[1]=tokens;
-                        result=::tyloi::cuda::empty(shape,part.options());
+            capture.resume();
+            DenseTensor ffn_output;
+            {
+                tyloi::ops::ProfileRange range("prefill.ffn");
+                if(expert_batch_count(tokens)==tokens) {
+                    ffn_output=tyloi::ops::ffn(qwen_block.ffn,ffn_inputs,{}, {}, reference_rows).dense();
+                } else {
+                    for(int64_t begin=0;begin<tokens;) {
+                        auto count=expert_batch_count(tokens-begin);
+                        const auto tail=tokens-begin-count;
+                        // Keep tiny tails in the prefill path to retain shared prefill images.
+                        if(tail>0 && tail<=8)count-=16-tail;
+                        auto part=tyloi::ops::ffn(qwen_block.ffn,ffn_inputs.narrow(1,begin,count),{}, {}, reference_rows).dense();
+                        if(!ffn_output.defined()) {
+                            auto shape=part.sizes().vec();shape[1]=tokens;
+                            ffn_output=::tyloi::cuda::empty(shape,part.options());
+                        }
+                        ffn_output.narrow(1,begin,count).copy_(part);
+                        begin+=count;
                     }
-                    result.narrow(1,begin,count).copy_(part);
-                    begin+=count;
                 }
-                return result;
-            });
+                range.finish();
+            }
             TYLOINFER_RUNTIME_CHECK(ffn_output.defined(),"expert prefill produced no output");
             if(audit_batch) {
                 auto expected=::tyloi::cuda::empty(ffn_output.sizes(),ffn_output.options());
@@ -1993,7 +1982,7 @@ tyloi::StepSequence<tyloi::models::Prefill> qwen4_exp::Model::prefill(
             next_hidden=std::move(post_hidden);
         }
         hidden=std::move(next_hidden);
-        suspend_profile(); co_yield tyloi::LayerEvent{tyloi::LayerEvent::Phase::end}; resume_profile();
+        capture.suspend(); co_yield tyloi::LayerEvent{tyloi::LayerEvent::Phase::end}; capture.resume();
         ++layer;
         if(trace && (layer%4==0 || layer==int(model.layers.size()))) {
             tyloi::models::Prefill report;
@@ -2001,10 +1990,10 @@ tyloi::StepSequence<tyloi::models::Prefill> qwen4_exp::Model::prefill(
             report.progress=tyloi::models::Prefill::Progress{
                 ::tyloi::Device{::tyloi::kCUDA,model.primary_device},tokens,compute_chunk,
                 layer,static_cast<std::int64_t>(model.layers.size()),started};
-            suspend_profile(); co_yield std::move(report); resume_profile();
+            capture.suspend(); co_yield std::move(report); capture.resume();
         }
     }
-    resume_profile();
+    capture.resume();
     const auto begin=((tokens-1)/compute_chunk)*compute_chunk;
     auto finalized=qwen4_finalize_hidden(model, hidden.narrow(1,begin,tokens-begin),1,tokens-begin);
     finalized=qwen4_last_hidden(std::move(finalized)).unsqueeze(1);
@@ -2012,17 +2001,17 @@ tyloi::StepSequence<tyloi::models::Prefill> qwen4_exp::Model::prefill(
     tyloi::models::Prefill result;
     result.mode=tyloi::models::Prefill::Mode::layered;
     result.phase=tyloi::models::Prefill::Phase::computed;
-    suspend_profile(); co_yield result; resume_profile();
+    capture.suspend(); co_yield result; capture.resume();
     result.hidden=std::move(finalized);
     if(raw_hidden)result.raw=std::move(hidden);
     else hidden={};
-    suspend_profile();
+    capture.suspend();
     co_yield tyloi::Workspace{0,&result.hidden,std::nullopt,raw_hidden && !raw_hidden_host ? &result.raw : nullptr};
-    resume_profile();
+    capture.resume();
     state.finish_forward(prepared_full,1,tokens);
     state.cache_pos=cache_start+tokens;
     result.phase=tyloi::models::Prefill::Phase::complete;
-    suspend_profile(); co_yield std::move(result); resume_profile();
+    capture.suspend(); co_yield std::move(result); capture.resume();
 }
 
 namespace qwen4_exp {
@@ -2040,15 +2029,10 @@ namespace qwen4_exp {
 }
 
 ::tyloi::Tensor Model::logits(const ::tyloi::Tensor& hidden, bool) const {
-#ifdef TYLOINFER_NATIVE_CUDA
-    return tyloi::ops::measure("model.lm_head", hidden.device(), [&] {
-        return tyloi::ops::project(hidden, lm_head);
-    });
-#else
-    return Executor::current().profiler().measure("model.lm_head", [&] {
-        return Executor::current().projector(Executor::current().mode().ffn).run(lm_head, hidden.dense());
-    });
-#endif
+    tyloi::ops::ProfileRange range("model.lm_head", hidden.device());
+    auto output = tyloi::ops::project(hidden, lm_head);
+    range.finish();
+    return output;
 }
 
 ::tyloi::Tensor Model::forward(tyloi::models::Input input, tyloi::models::State& state_value,

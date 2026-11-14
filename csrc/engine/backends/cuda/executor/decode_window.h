@@ -5,6 +5,7 @@
 #include <span>
 #include <cuda_runtime_api.h>
 #include <functional>
+#include <exception>
 #include <memory>
 #include <map>
 #include <string>
@@ -13,7 +14,9 @@
 
 namespace tyloi::cuda {
 class StreamHandle;
+class Context;
 class Graph;
+class GraphAllocationPlan;
 void wait_route_publication(const uint32_t* flag,cudaStream_t stream,int timeout_ms=60000);
 void publish_mapped_flag(uint32_t* flag) noexcept;
 void check_stream_progress(cudaStream_t stream);
@@ -61,6 +64,10 @@ public:
         ~Capture();
         bool next();
         bool finish();
+        bool retry(std::exception_ptr failure);
+        void pause();
+        std::vector<std::pair<Device,std::size_t>> growth() const;
+        void resume();
         void release_warm_outputs();
         void complete();
     private:
@@ -70,6 +77,8 @@ public:
         std::unique_ptr<Impl> impl_;
     };
     std::unique_ptr<Capture> begin_capture();
+    static std::vector<std::pair<Device,std::size_t>> fixed_growth(
+        Device device,bool layer_profile,bool compact_sampling,std::size_t signals);
     void prepare_pool();
     Tensor buffer(const std::vector<int64_t>& shape,const TensorOptions& options,bool zero=false);
     void retain(std::span<const Tensor> owners);
@@ -83,7 +92,9 @@ public:
         void reset();
         void wait_route();
         void wait_device();
+        void set_mapped_rows(bool mapped) noexcept;
         void publish(bool mapped);
+        void cancel() noexcept;
     private:
         friend class DecodeWindow;
         explicit Signal(DecodeWindow& window);
@@ -125,9 +136,12 @@ public:
     static DecodeWindow* recording() noexcept;
 private:
     cudaStream_t stream_;
+    Capture* capture_=nullptr;
+    void prepare_recording_branch(const std::shared_ptr<Context>& context,const StreamHandle& stream);
     struct BranchPool;
     std::vector<std::shared_ptr<BranchPool>> branch_pools_;
     GraphRegistry graphs_;
+    std::unique_ptr<GraphAllocationPlan> allocation_plan_;
     std::unique_ptr<Graph> pool_;
     struct Ownership;
     std::unique_ptr<Ownership> ownership_;

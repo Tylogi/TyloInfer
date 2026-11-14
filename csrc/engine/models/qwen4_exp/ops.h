@@ -65,7 +65,7 @@ class Qwen4BatchDecodeGraph {
     explicit Qwen4BatchDecodeGraph(qwen4_exp::Model&);
     ~Qwen4BatchDecodeGraph();
     std::optional<Plan> plan(const std::vector<Qwen4BatchRequestState*>&, bool greedy);
-    std::optional<::tyloi::Tensor> run(
+    tyloi::StepSequence<::tyloi::Tensor> run(
         const std::vector<Qwen4BatchRequestState*>&,
         const ::tyloi::Tensor&,const ::tyloi::Tensor&,bool greedy,const Plan&,bool prepared);
     void clear();
@@ -75,7 +75,6 @@ class Qwen4BatchDecodeGraph {
     struct Impl;
     std::unique_ptr<Impl> graph_;
 };
-void qwen4_report_decode_graph(const qwen4_exp::Model&,const qwen4_exp::State&,std::ostream&);
 std::vector<std::pair<std::string,double>> qwen4_decode_graph_profile_metrics(const qwen4_exp::Model&,const qwen4_exp::State&);
 void qwen4_release_decode_graphs(const qwen4_exp::Model&,qwen4_exp::State&);
 std::vector<std::pair<std::string,double>> qwen4_cache_memory_metrics(const qwen4_exp::Model&,const qwen4_exp::State&,const tyloi::models::Mtp*);
@@ -142,9 +141,10 @@ struct Model : tyloi::models::CausalModel {
             ::tyloi::Device(::tyloi::kCUDA, primary_device))).dense();
     }
     ::tyloi::DenseTensor embed_tokens(::tyloi::DenseTensor ids) const {
-        return tyloi::ops::measure("model.embed", ids.device(), [&] {
-            return tyloi::ops::embedding(ids, embed);
-        }).dense();
+        tyloi::ops::ProfileRange range("model.embed", ids.device());
+        auto result = tyloi::ops::embedding(ids, embed);
+        range.finish();
+        return result.dense();
     }
     std::int64_t hidden_size() const noexcept { return metadata.hidden_size; }
     std::int64_t max_position_embeddings() const noexcept { return config.maximum; }

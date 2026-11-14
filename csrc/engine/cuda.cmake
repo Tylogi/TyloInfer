@@ -186,6 +186,7 @@ if(TYLOINFER_BUILD_CLI_TOOLS)
             CUDA_STANDARD_REQUIRED ON
         )
     endif()
+    include(${PROJECT_SOURCE_DIR}/eval/cuda.cmake)
     include(${PROJECT_SOURCE_DIR}/diagnostics/cuda.cmake)
     include(${PROJECT_SOURCE_DIR}/apps/cuda.cmake)
 endif()

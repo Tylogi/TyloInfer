@@ -11,6 +11,7 @@ namespace tyloi::cuda::minicpmo45::text {
 void load(std::unique_ptr<tyloi::models::CausalModel>& owner, std::shared_ptr<const tyloi::ModelSource>, std::string_view definition,
     const tyloi::weights::Loader&, LayerPlacementConfig&, const tyloi::models::LoadOptions&);
 Model read(std::shared_ptr<const tyloi::ModelSource>, std::string_view definition, int64_t context);
+void load_media(Model&, const tyloi::weights::Loader&);
 void load(Model&, const tyloi::weights::Loader&, LayerPlacementConfig&, int gpu_layers = -1,
           bool expert_parallel = false, bool load_layers = true, bool load_input_output = true,
           const tyloi::ops::YarnScaling& yarn = {});

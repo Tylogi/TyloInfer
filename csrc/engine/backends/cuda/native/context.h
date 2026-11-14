@@ -4,6 +4,7 @@
 #include <cuda_runtime_api.h>
 
 #include "stream.h"
+#include "engine/tensor.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -13,6 +14,8 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <tuple>
+#include <exception>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -67,6 +70,46 @@ struct DeviceMemoryStats {
 struct PhysicalDeviceMemoryStats { std::size_t total=0, free=0, used=0; };
 std::optional<PhysicalDeviceMemoryStats> physical_device_memory_stats(int device);
 
+class Context;
+
+// Records the ordinary preparation pass; materialization happens only after admission.
+class GraphAllocationPlan {
+public:
+    ~GraphAllocationPlan();
+    struct Miss final : std::exception {
+        int device;
+        cudaStream_t stream;
+        std::size_t bytes, required;
+        Miss(int d,cudaStream_t s,std::size_t b,std::size_t n):device(d),stream(s),bytes(b),required(n) {}
+        const char* what() const noexcept override {return "CUDA graph scratch plan is incomplete";}
+    };
+    void begin();
+    void end() noexcept;
+    void begin_warmup();
+    void end_warmup() noexcept;
+    std::vector<std::pair<std::shared_ptr<Context>,StreamHandle>> participants() const;
+    void freeze();
+    void observe(Context& context,cudaStream_t stream,void* pointer,std::size_t bytes);
+    void release(int device,void* pointer) noexcept;
+    void add(const Miss& miss);
+    bool release_pool(int device,cudaStream_t stream) noexcept;
+    std::vector<std::pair<tyloi::Device,std::size_t>> growth() const;
+    void materialize();
+    static GraphAllocationPlan* current() noexcept;
+    static GraphAllocationPlan* warming() noexcept;
+private:
+    using Key=std::tuple<int,cudaStream_t,std::size_t>;
+    struct Bucket {std::shared_ptr<Context> context;std::size_t live=0,peak=0;};
+    struct Lifetime {Key key;std::size_t event;};
+    struct Event {Key key;std::size_t first;bool allocate,persistent=false;};
+    std::map<Key,Bucket> buckets_;
+    std::map<std::pair<int,cudaStream_t>,std::shared_ptr<Context>> owned_pools_;
+    void ensure_pool(const std::shared_ptr<Context>& context,cudaStream_t stream);
+    std::map<std::pair<int,std::uintptr_t>,Lifetime> live_;
+    std::vector<Event> events_;
+    bool conservative_=false;
+};
+
 class Context final : public std::enable_shared_from_this<Context> {
 public:
     explicit Context(int device);
@@ -79,6 +122,8 @@ public:
     BlasHandle& blas(cudaStream_t stream);
     std::size_t reusable_workspace_bytes() const;
     bool has_graph_pool(cudaStream_t stream) const;
+    std::size_t graph_available(cudaStream_t stream,std::size_t bytes) const;
+    void graph_strict_warmup(cudaStream_t stream,bool enabled);
     std::shared_ptr<ParallelBatchMatmulContext> parallel_blas;
     cudaMemPool_t memory_pool() const noexcept { return pool_; }
     bool supports_async_allocations() const noexcept { return async_allocations_; }
@@ -118,6 +163,7 @@ private:
         cudaMemPool_t memory = nullptr;
         bool capturing = false;
         bool warming = false;
+        bool strict_warmup = false;
         std::map<std::size_t, std::vector<void*>> available;
         std::unordered_set<void*> owned;
     };

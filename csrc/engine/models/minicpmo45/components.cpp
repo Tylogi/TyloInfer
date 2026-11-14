@@ -1,8 +1,10 @@
 #include "engine/models/plan.h"
 #include "components.h"
-#include "runtime.h"
+#include "duplex.h"
+#include "text/load.h"
 
 #include "engine/backends/cuda/executor/sampling.h"
+#include "engine/backends/cuda/executor/executor.h"
 #include "backend.h"
 
 #include <algorithm>
@@ -14,30 +16,6 @@
 #include <utility>
 #include <vector>
 
-MiniCPMO45Runtime MiniCPMO45Runtime::load(
-        const tyloi::cuda::minicpmo45::text::Model& language,
-        tyloi::cuda::Executor& language_executor,
-        const tyloi::weights::Loader& weights, int primary) {
-    MfqCudaGuard guard(primary);
-#ifndef TYLOINFER_NATIVE_CUDA
-    auto projector = language_executor.projector(language_executor.mode().ffn);
-#endif
-    return {language,
-#ifndef TYLOINFER_NATIVE_CUDA
-            language_executor,
-#endif
-            primary,
-            MiniCPMO45VisionEncoder::load(weights),
-            MiniCPMO45Resampler::load(weights),
-            MiniCPMO45AudioEncoder::load(weights),
-            tyloi::cuda::minicpmo45::Tts::load(weights),
-            language_executor.fork(), language_executor.forward_mode(primary)
-#ifndef TYLOINFER_NATIVE_CUDA
-            , projector
-#endif
-    };
-}
-
 namespace tyloi::cuda::minicpmo45 {
 
 std::unique_ptr<Components> load_components(text::Model& model,
@@ -47,105 +25,36 @@ std::unique_ptr<Components> load_components(text::Model& model,
         return nullptr;
     if (model.plan.vision != ::tyloi::models::VisionAdapter::minicpmo45)
         throw std::runtime_error("unsupported MiniCPM-o CUDA vision adapter");
+    model.primary = primary;
+    text::load_media(model, weights);
     return std::make_unique<Components>(model, executor, weights, primary);
 }
 
 struct Components::State {
-    MiniCPMO45Runtime runtime;
+    text::Model& language;
+    Executor& executor;
+    text::State prepare_state;
     std::optional<MiniCPMO45DuplexSession> duplex_session;
 
-    State(const text::Model& language,
-          Executor& language_executor,
-          const tyloi::weights::Loader& weights, int primary)
-        : runtime(MiniCPMO45Runtime::load(language, language_executor, weights, primary)) {}
+    State(text::Model& model, Executor& execution)
+        : language(model), executor(execution), prepare_state(model) {}
 };
 
-Components::Components(const text::Model& language,
-                       Executor& language_executor,
-                       const tyloi::weights::Loader& weights, int primary)
-    : state_(std::make_unique<State>(language, language_executor, weights, primary)) {}
+Components::Components(text::Model& language, Executor& executor,
+                       const tyloi::weights::Loader&, int)
+    : state_(std::make_unique<State>(language, executor)) {}
 
 Components::~Components() = default;
 
 tyloi::StepSequence<tyloi::models::Prepared> Components::prepare(
-        const std::vector<int64_t>& prompt, const MfqMultimodalInput& vision) {
-    const auto cpu_i64 =
-        ::tyloi::TensorOptions().dtype(::tyloi::kInt64).device(::tyloi::kCPU);
-    const auto cuda_i64 =
-        ::tyloi::TensorOptions().dtype(::tyloi::kInt64).device(::tyloi::kCUDA);
-    auto input_ids = ::tyloi::cuda::tensor(prompt, cuda_i64)
-        .reshape({1, -1}).contiguous();
-    ::tyloi::DenseTensor pixels;
-    ::tyloi::DenseTensor patch_mask;
-    ::tyloi::DenseTensor target_sizes;
-    ::tyloi::DenseTensor image_bounds;
-    if (!vision.image_bounds.empty()) {
-        pixels = ::tyloi::cuda::from_blob(
-            const_cast<float *>(vision.pixel_values.data()),
-            vision.pixel_shape,
-            ::tyloi::TensorOptions().dtype(::tyloi::kFloat32).device(::tyloi::kCPU))
-            .clone();
-        patch_mask = ::tyloi::cuda::from_blob(
-            const_cast<uint8_t *>(vision.patch_mask.data()),
-            vision.patch_mask_shape,
-            ::tyloi::TensorOptions().dtype(::tyloi::kUInt8).device(::tyloi::kCPU))
-            .clone().to(::tyloi::kBool);
-        target_sizes = ::tyloi::cuda::from_blob(
-            const_cast<int32_t *>(vision.target_sizes.data()),
-            vision.target_sizes_shape,
-            ::tyloi::TensorOptions().dtype(::tyloi::kInt32).device(::tyloi::kCPU))
-            .clone();
-        image_bounds = ::tyloi::cuda::from_blob(
-            const_cast<int64_t *>(vision.image_bounds.data()),
-            std::vector<int64_t>{
-                static_cast<int64_t>(vision.image_bounds.size() / 4), 4},
-            cpu_i64).clone();
-    }
-    ::tyloi::DenseTensor audio_features;
-    ::tyloi::DenseTensor audio_lengths;
-    ::tyloi::DenseTensor audio_bounds;
-    if (!vision.audio_bounds.empty()) {
-        audio_features = ::tyloi::cuda::from_blob(
-            const_cast<float *>(vision.audio_features.data()),
-            vision.audio_features_shape,
-            ::tyloi::TensorOptions().dtype(::tyloi::kFloat32).device(::tyloi::kCPU))
-            .clone();
-        audio_lengths = ::tyloi::cuda::tensor(
-            vision.audio_lengths, cpu_i64).contiguous();
-        audio_bounds = ::tyloi::cuda::from_blob(
-            const_cast<int64_t *>(vision.audio_bounds.data()),
-            std::vector<int64_t>{
-                static_cast<int64_t>(vision.audio_bounds.size() / 4), 4},
-            cpu_i64).clone();
-    }
-
-
-    co_yield tyloi::StepState::advanced;
-    auto encoding = state_->runtime.encode(input_ids, pixels, patch_mask,
-        target_sizes, image_bounds, audio_features, audio_lengths, audio_bounds);
-#ifdef TYLOINFER_NATIVE_CUDA
-    tyloi::models::minicpmo45::MultimodalResult<::tyloi::Tensor> result;
-#else
-    tyloi::models::minicpmo45::MultimodalResult<::tyloi::DenseTensor> result;
-#endif
-    while (auto step = encoding.next()) {
-        if (step.value) result = std::move(*step.value);
-        else co_yield step.state;
-    }
-    tyloi::models::Prepared prepared;
-    prepared.token_ids = prompt;
-#ifdef TYLOINFER_NATIVE_CUDA
-    prepared.embeddings = std::move(result.input_embeddings);
-    prepared.positions = std::make_shared<::tyloi::DenseTensor>(
-        ::tyloi::cuda::arange(static_cast<int64_t>(prompt.size()), cuda_i64));
-#else
-    prepared.embeddings = std::move(result.input_embeddings);
-    prepared.positions = ::tyloi::cuda::arange(static_cast<int64_t>(prompt.size()), cuda_i64);
-#endif
-    co_yield std::move(prepared);
+        const std::vector<int64_t>& prompt, const MfqMultimodalInput& media) {
+    return state_->language.prepare(prompt, media, state_->prepare_state);
 }
 
 void Components::start(const MfqDuplexSessionParams& parameters) {
+        auto policy = Executor::current_ffn();
+        policy.independent |= state_->language.info().separate_projections;
+        auto model_scope = state_->executor.enter(policy);
         if (parameters.special_ids.size() != 15) {
             throw std::invalid_argument(
                 "MiniCPM-o duplex requires 15 special token IDs");
@@ -156,7 +65,7 @@ void Components::start(const MfqDuplexSessionParams& parameters) {
                 parameters.top_k < 0 ||
                 parameters.top_k >
                     std::min<int64_t>(
-                        state_->runtime.language.metadata.vocab_size, 1024) ||
+                        state_->language.metadata.vocab_size, 1024) ||
                 !std::isfinite(parameters.top_p) ||
                 parameters.top_p <= 0.0 || parameters.top_p > 1.0 ||
                 !std::isfinite(parameters.listen_probability_scale) ||
@@ -180,14 +89,14 @@ void Components::start(const MfqDuplexSessionParams& parameters) {
                     parameters.special_ids.end() - 1,
                     [&](int64_t token) {
                         return token < 0 ||
-                            token >= state_->runtime.language.metadata.vocab_size;
+                            token >= state_->language.metadata.vocab_size;
                     }) ||
                 std::any_of(
                     parameters.forbidden_ids.begin(),
                     parameters.forbidden_ids.end(),
                     [&](int64_t token) {
                         return token < 0 ||
-                            token >= state_->runtime.language.metadata.vocab_size;
+                            token >= state_->language.metadata.vocab_size;
                     })) {
             throw std::invalid_argument(
                 "MiniCPM-o duplex token ID is out of range");
@@ -204,7 +113,7 @@ void Components::start(const MfqDuplexSessionParams& parameters) {
                 "MiniCPM-o reference Mel geometry is invalid");
         }
 
-        MfqCudaGuard guard(state_->runtime.primary);
+        MfqCudaGuard guard(state_->language.primary);
         ::tyloi::cuda::manual_seed(static_cast<int64_t>(parameters.seed));
         mfq_cuda_manual_seed_all(parameters.seed);
         auto special_ids = MiniCPMO45DuplexSpecialIds::from_tensor(
@@ -213,9 +122,10 @@ void Components::start(const MfqDuplexSessionParams& parameters) {
                 ::tyloi::TensorOptions().dtype(::tyloi::kInt64)));
         if (state_->duplex_session) mfq_cuda_synchronize();
         state_->duplex_session.reset();
+        const auto mode = state_->executor.forward_mode(state_->language.primary);
         state_->duplex_session.emplace(
-            state_->runtime, special_ids, parameters.forbidden_ids,
-            parameters.greedy);
+            state_->language, tyloi::models::ForwardOptions{mode.kv_capacity, mode.trace, mode.trace_layer, mode.primary},
+            special_ids, parameters.forbidden_ids, parameters.greedy);
         state_->duplex_session->temperature = parameters.temperature;
         state_->duplex_session->top_k = parameters.top_k;
         state_->duplex_session->top_p = parameters.top_p;
@@ -250,6 +160,9 @@ void Components::start(const MfqDuplexSessionParams& parameters) {
 }
 
 MfqDuplexStepResult Components::step(const MfqDuplexStepInput& input) {
+        auto policy = Executor::current_ffn();
+        policy.independent |= state_->language.info().separate_projections;
+        auto model_scope = state_->executor.enter(policy);
         const bool has_audio = input.audio_frames > 0;
         const bool has_text = !input.text_tokens.empty();
         if (has_audio && input.audio_features.size() !=
@@ -266,7 +179,7 @@ MfqDuplexStepResult Components::step(const MfqDuplexStepInput& input) {
                 "MiniCPM-o duplex generation requires at least two token slots");
         }
 
-        MfqCudaGuard guard(state_->runtime.primary);
+        MfqCudaGuard guard(state_->language.primary);
         if (!state_->duplex_session) {
             throw std::runtime_error(
                 "MiniCPM-o duplex session is not prepared");
@@ -326,7 +239,7 @@ MfqDuplexStepResult Components::step(const MfqDuplexStepInput& input) {
 }
 
 void Components::stop() {
-        MfqCudaGuard guard(state_->runtime.primary);
+        MfqCudaGuard guard(state_->language.primary);
         mfq_cuda_synchronize();
         state_->duplex_session.reset();
         mfq_cuda_synchronize();

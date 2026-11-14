@@ -14,7 +14,6 @@
 #include <array>
 #include <cstdlib>
 #include <cstring>
-#include <cstdio>
 #include <limits>
 #include <memory>
 #include <stdexcept>
@@ -41,7 +40,7 @@ class NgramEmbedding {
         State& operator=(State&&) = default;
         Context context;
         std::shared_ptr<tyloi::weights::RowPipeline> pipeline;
-        bool hash_ready=false,hash_reported=false;
+        bool hash_ready=false;
         int cached_tokens=0;
         std::array<int64_t,8> cached_ids{};
         tyloi::models::qwen4_exp::NgramHashes cached_hashes;
@@ -102,6 +101,11 @@ class NgramEmbedding {
         TYLOINFER_RUNTIME_CHECK(bool(source_),"PLE graph requires prepared range rows");
         if(!state.pipeline)state.pipeline=std::make_shared<tyloi::weights::RowPipeline>(source_);
         return state.pipeline->stage({b,t,(ngram_-1)*heads_},device);
+    }
+    std::vector<std::pair<::tyloi::Device, std::size_t>> graph_stage_growth(
+            int64_t b,int64_t t,const ::tyloi::Device& device) const {
+        TYLOINFER_RUNTIME_CHECK(bool(source_),"PLE graph requires prepared range rows");
+        return tyloi::weights::RowPipeline::stage_growth(source_,{b,t,(ngram_-1)*heads_},device);
     }
     void upload_graph(State& state,const DenseTensor& host_ids,RowStage& stage) const {
         TYLOINFER_RUNTIME_CHECK(graph_supported() && host_ids.is_cpu() && host_ids.dim()==2,"PLE graph requires host token IDs");
@@ -171,13 +175,8 @@ class NgramEmbedding {
     bool cacheable_hashes(int64_t b,int64_t t) const {return reuse_hashes_ && b==1 && t>0 && t<=8;}
     tyloi::models::qwen4_exp::NgramHashes& graph_hashes(State& state,const DenseTensor& host) const {
         const auto tokens=host.size(1);const auto* ids=host.data_ptr<int64_t>();
-        if(state.hash_ready && state.cached_tokens==tokens && std::equal(ids,ids+tokens,state.cached_ids.begin())) {
-            if(!state.hash_reported) {
-                state.hash_reported=true;
-                std::fprintf(stderr,"ple_ngram_hash_reuse enabled=1 tokens=%lld\n",static_cast<long long>(tokens));
-            }
+        if(state.hash_ready && state.cached_tokens==tokens && std::equal(ids,ids+tokens,state.cached_ids.begin()))
             return state.cached_hashes;
-        }
         state.cached_hashes=tyloi::models::qwen4_exp::ngram_hashes(ids,1,tokens,ngram_,heads_,eos_,
             multipliers_,offsets_,vocab_,state.context,true);
         std::copy_n(ids,tokens,state.cached_ids.begin());state.cached_tokens=int(tokens);state.hash_ready=true;
@@ -301,6 +300,10 @@ class Ple {
     }
     std::shared_ptr<RowStage> graph_stage(State& state,int64_t tokens,const ::tyloi::Device& device) const {
         return embedding_.graph_stage(state.embedding,1,tokens,device);
+    }
+    std::vector<std::pair<::tyloi::Device, std::size_t>> graph_stage_growth(
+            int64_t tokens,const ::tyloi::Device& device) const {
+        return embedding_.graph_stage_growth(1,tokens,device);
     }
     void upload_graph(State& state,const DenseTensor& host_ids,RowStage& stage) const {embedding_.upload_graph(state.embedding,host_ids,stage);}
     NgramEmbedding::Context graph_prefix_context(const State& state,const DenseTensor& host_ids,int64_t count) const {

@@ -9,6 +9,8 @@
 #include <memory>
 #include <optional>
 
+struct TextSessionState;
+
 namespace tyloi {
 class ModelSource;
 namespace models { class CausalModel; class State; class Layers; class Groups; class Ffn; struct Info; struct Input; struct Prefill; struct BatchConfig; }
@@ -88,6 +90,8 @@ public:
     models::Prefill prefill(models::Input input, std::int64_t compute, engine::InferenceOutput& output);
     /** Run one optional model-owned decode graph with resource admission. */
     std::optional<models::Decoded> decode(models::Input input, models::DecodeOptions options);
+    /** Admit and publish a session restore; return its predictor hidden data, if present. */
+    Tensor restore(const TextSessionState& snapshot);
     /** Run one exclusive request in the caller's scope; its owners outlive the sequence and drain after it. */
     StepSequence<engine::EventData> generate(engine::InferenceRequest& request,
         engine::InferenceOutput& output, bool predictor = true, std::string id = "check");

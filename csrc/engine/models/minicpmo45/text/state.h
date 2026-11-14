@@ -29,8 +29,11 @@ public:
     void advance(int64_t tokens) noexcept { cache_pos += tokens; }
     void set_position_delta(int64_t delta) noexcept { decode_position_delta = delta; }
 #ifdef TYLOINFER_NATIVE_CUDA
+    std::vector<std::pair<tyloi::Device, std::size_t>> preallocate_growth() const override;
     std::vector<std::pair<tyloi::Device, std::size_t>> growth(
         const tyloi::models::Input& input, const tyloi::models::ForwardOptions& options) const override;
+    std::unique_ptr<tyloi::models::Restore> prepare_restore(
+        const TextSessionState&, const tyloi::models::Mtp* predictor_model = nullptr) override;
 #endif
     std::vector<::tyloi::Tensor> storage() const;
     std::vector<::tyloi::Tensor*> graph_state() { return {}; }
@@ -38,9 +41,9 @@ public:
     bool supports_text_session_state() const;
     bool supports_paged_text_session_state() const;
     TextSessionState capture_text_session_state(const std::vector<int64_t>&) const;
-    void restore_text_session_state(const TextSessionState&);
 
     std::vector<tyloi::state::KvView> layers;
+    ::tyloi::Tensor attention_mask;
     int64_t cache_pos = 0, decode_position_delta = 0, batch = 0;
 
 private:
