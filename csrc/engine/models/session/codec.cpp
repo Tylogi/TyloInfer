@@ -4,7 +4,6 @@
 #include "engine/models/deepseek_v41/session_codec.h"
 #include "engine/models/qwen4_exp/session_codec.h"
 #include "engine/models/source.h"
-#include "engine/backends/cuda/kernels/mfq_cuda_kv_quantization.h"
 
 #include <array>
 #include <chrono>
@@ -12,18 +11,21 @@
 #include <sstream>
 #include <stdexcept>
 
-namespace tyloi::cuda::internal {
+namespace tyloi::models {
 
-std::string cuda_prefix_cache_compatibility_key(
-    const tyloi::ModelSource &source, int64_t max_position_embeddings) {
+std::string prefix_cache_compatibility_key(
+    const tyloi::ModelSource &source, int64_t max_position_embeddings,
+    tyloi::Device device, std::string_view kv_fingerprint) {
+    if (!device.is_cuda() && !device.is_metal())
+        throw std::invalid_argument("prefix cache requires a supported device");
     std::ostringstream key;
-    key << "mfq-cuda-prefix-v1\n"
-        << "codec=" << (source.architecture()=="qwen4_exp" ? "cuda-qwen4-session-v1" :
-            source.architecture()=="deepseek_v41" ? "cuda-deepseek-v41-session-v1" : "cuda-full-attention-kv-v1") << '\n'
+    const auto backend = device.is_cuda() ? "cuda" : "metal";
+    key << "mfq-" << backend << "-prefix-v1\n"
+        << "codec=" << backend << '-' << (source.architecture()=="qwen4_exp" ? "qwen4-session-v1" :
+            source.architecture()=="deepseek_v41" ? "deepseek-v41-session-v1" : "full-attention-kv-v1") << '\n'
         << "context=" << max_position_embeddings << '\n'
         << "architecture=" << source.architecture() << '\n';
-    const auto quantization=tyloi::cuda::cuda_kv_quantization_tag();
-    if(!quantization.empty())key<<"kv="<<quantization<<'\n';
+    if(!kv_fingerprint.empty())key<<"kv="<<kv_fingerprint<<'\n';
     for (std::size_t index = 0; index < source.source_paths().size(); ++index) {
         const auto &path = source.source_paths()[index];
         std::error_code error;
@@ -48,70 +50,72 @@ std::string cuda_prefix_cache_compatibility_key(
     return key.str();
 }
 
-TextSessionState CudaSessionOps::decode(
-    const std::vector<CudaPagedPayload>& payloads,
+TextSessionState SessionOps::decode(
+    const std::vector<SessionBlockPayload>& payloads,
     const std::vector<std::int64_t>& tokens,
     std::size_t block_size) {
-    if (payloads.front() && payloads.front()->size() > 6 && (*payloads.front())[6] == '2')
+    if (!payloads.empty() && payloads.front() && payloads.front()->size() > 6 && (*payloads.front())[6] == '2')
         return tyloi::models::qwen4_exp::decode_session(payloads, tokens, block_size);
-    if (payloads.front() && payloads.front()->size() > 6 && (*payloads.front())[6] == '3')
+    if (!payloads.empty() && payloads.front() && payloads.front()->size() > 6 && (*payloads.front())[6] == '3')
         return tyloi::models::deepseek_v41::decode_session(payloads, tokens, block_size);
-    return decode_cuda_paged_session(payloads, tokens, block_size);
+    return decode_paged_session(payloads, tokens, block_size);
 }
 
-CudaPagedPayload CudaSessionOps::encode(
+SessionBlockPayload SessionOps::encode(
     const Snapshot& state, std::size_t block_size, std::size_t index) {
     if (state.kind() == TextSessionStateKind::Qwen4)
         return tyloi::models::qwen4_exp::encode_block(state, block_size, index);
     if (state.kind() == TextSessionStateKind::DeepseekV41)
         return tyloi::models::deepseek_v41::encode_block(state, block_size, index);
-    return encode_cuda_paged_block(state, block_size, index);
+    return encode_paged_block(state, block_size, index);
 }
 
-bool CudaSessionOps::paged_mtp(const Snapshot& state) {
+bool SessionOps::paged_mtp(const Snapshot& state) {
     return state.kind() == TextSessionStateKind::Qwen4 ||
         state.kind() == TextSessionStateKind::DeepseekV41;
 }
 
-bool CudaSessionOps::partial_blocks(const Snapshot& state) {
+bool SessionOps::partial_blocks(const Snapshot& state) {
     return paged_mtp(state);
 }
 
-bool CudaSessionOps::paged_media(const Snapshot& state) {
+bool SessionOps::paged_media(const Snapshot& state) {
     return state.kind() == TextSessionStateKind::DeepseekV41;
 }
 
-bool CudaSessionOps::checkpoint_needs_update(
-    const CudaPagedPayload& payload, const Snapshot& state) {
+bool SessionOps::checkpoint_needs_update(
+    const SessionBlockPayload& payload, const Snapshot& state) {
     if (state.kind() != TextSessionStateKind::DeepseekV41) return false;
     return tyloi::models::deepseek_v41::checkpoint_needs_update(payload, state);
 }
 
-std::size_t CudaSessionOps::decodable_blocks(
-    const std::vector<CudaPagedPayload>& payloads) {
-    return cuda_paged_decodable_blocks(payloads);
+std::size_t SessionOps::decodable_blocks(
+    const std::vector<SessionBlockPayload>& payloads) {
+    return paged_decodable_blocks(payloads);
 }
 
-std::size_t CudaSessionOps::token_count(const CudaPagedPayload& payload) {
-    return cuda_paged_payload_tokens(payload);
+std::size_t SessionOps::token_count(const SessionBlockPayload& payload) {
+    return paged_payload_tokens(payload);
 }
 
-} // namespace tyloi::cuda::internal
+} // namespace tyloi::models
 
-size_t cuda_paged_payload_tokens(const CudaPagedPayload& payload) {
+size_t paged_payload_tokens(const SessionBlockPayload& payload) {
     if(!payload)throw CudaSessionStateError("null CUDA prefix block");
-    CudaPagedReader reader(*payload);std::array<uint8_t,8> magic{};reader.raw(magic.data(),magic.size(),"magic");
+    SessionBlockReader reader(*payload);std::array<uint8_t,8> magic{};reader.raw(magic.data(),magic.size(),"magic");
     constexpr std::array<uint8_t,8> qwen4_magic{'M','F','Q','C','U','D','2',0};
     constexpr std::array<uint8_t,8> full_magic{'M','F','Q','C','U','D','1',0};
     constexpr std::array<uint8_t,8> deepseek_magic{'M','F','Q','C','U','D','3',0};
-    if((magic!=qwen4_magic && magic!=full_magic && magic!=deepseek_magic) || reader.scalar<uint32_t>("version")!=1)
+    const auto version=reader.scalar<uint32_t>("version");
+    if((magic!=qwen4_magic && magic!=full_magic && magic!=deepseek_magic) ||
+        (version!=1 && !(magic==qwen4_magic && version==2)))
         throw CudaSessionStateError("invalid CUDA prefix block header");
     (void)reader.scalar<uint32_t>("start");return reader.scalar<uint32_t>("count");
 }
-size_t cuda_paged_decodable_blocks(const std::vector<CudaPagedPayload>& payloads) {
+size_t paged_decodable_blocks(const std::vector<SessionBlockPayload>& payloads) {
     for(size_t count=payloads.size();count>0;--count) {
         const auto& payload=payloads[count-1];
-        (void)cuda_paged_payload_tokens(payload);
+        (void)paged_payload_tokens(payload);
         if((*payload)[6]=='1')return count;
         if((*payload)[6]=='3') {
             if(tyloi::models::deepseek_v41::exact(payload))return count;

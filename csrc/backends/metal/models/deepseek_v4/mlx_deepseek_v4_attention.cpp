@@ -1,3 +1,4 @@
+#include "mlx_projection_batch.h"
 #include "mlx_deepseek_v4_attention.h"
 #include "engine/backends/metal/native/profile.h"
 

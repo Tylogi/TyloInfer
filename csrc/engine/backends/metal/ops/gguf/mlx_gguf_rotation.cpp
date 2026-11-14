@@ -1,7 +1,6 @@
 #include "mlx_gguf.h"
 #include "mlx_gguf_rotation.h"
 #include "engine/backends/metal/native/kernel.h"
-#include "mfq_container.h"
 #include "engine/backends/metal/native/allocation.h"
 #include "engine/backends/metal/native/tensor/tensor.h"
 #include "engine/weights/memory.h"
@@ -49,14 +48,6 @@ float4 gguf_rotation_signs(S signs, uint col) {
 }
 }
 
-void MlxGgufWeight::configure_hadamard(const MfqContainer& model, const std::string& name) {
-    const auto found = model.header().extra_json.find("gguf_hadamard");
-    if (found == model.header().extra_json.end()) return;
-    const auto rotations = nlohmann::json::parse(found->second);
-    if (!rotations.contains(name)) return;
-    const auto& entry = rotations.at(name);
-    set_hadamard(entry.at("block_size").get<std::int64_t>(), entry.at("signs").get<std::vector<float>>());
-}
 
 void MlxGgufWeight::configure_hadamard(const tyloi::source::Source& model, const std::string& name) {
     if (const auto* transforms = model.hadamard_transforms()) {
@@ -89,7 +80,7 @@ void MlxGgufWeight::set_hadamard(std::int64_t block, std::vector<float> pattern)
         throw std::invalid_argument("invalid GGUF Hadamard sign");
     auto signs = pattern.empty() ? array(1.f) : array(pattern.begin(), Shape{input_size()}, float32);
     tyloi::metal::AllocationScope::record(signs);
-    tyloi::weights::observe_weight(tyloi::metal::tensor(signs));
+    if (observe_weight_) tyloi::weights::observe_weight(tyloi::metal::tensor(signs));
     rotation_ = std::make_shared<MlxGgufRotation>(MlxGgufRotation{int(block), std::move(pattern), std::move(signs)});
 }
 

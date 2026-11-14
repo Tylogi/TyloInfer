@@ -3,12 +3,12 @@
 #include "engine/weights/tq/source.h"
 #include "engine/backends/metal/native/memory.h"
 #include "engine/backends/metal/native/indirect.h"
-#include "mlx_tq_expert_cache.h"
+#include "mlx_tq_expert_cache_internal.h"
+#include "mlx_expert_segment_cache_internal.h"
 #include "engine/backends/metal/native/tensor/tensor.h"
 #include "engine/backends/metal/native/allocation.h"
 #include "mlx_tq_rows.h"
 #include "mlx_moe_ops.h"
-#include "mfq_container.h"
 #include "engine/backends/metal/native/resident_allocations.h"
 #include "mlx_resource_telemetry.h"
 #include "mlx_kernel_prepare.h"
@@ -37,10 +37,7 @@ namespace {
 using namespace mlx::core;
 using Clock = std::chrono::steady_clock;
 
-std::size_t aligned(std::size_t size) {
-    if (size > SIZE_MAX - 255) throw std::overflow_error("TQ cache allocation is too large");
-    return (size + 255) / 256 * 256;
-}
+using tq_cache_detail::aligned;
 
 std::size_t add_bytes(std::size_t left, std::size_t right) {
     if (left > SIZE_MAX - right) throw std::overflow_error("TQ cache allocation is too large");
@@ -196,6 +193,7 @@ void source_metadata(SourceBank& bank,
         : add_bytes(add_bytes(add_bytes(64, payload_bytes), bank.descriptors.size() * 8), bank.scales.size());
 }
 
+
 std::vector<array> resident_routes(const array& resident, const array& ids, int experts) {
     static const auto kernel = fast::metal_kernel("tyloinfer_tq_resident_routes",
         {"resident", "ids"}, {"hit", "present", "missing"}, R"METAL(
@@ -280,6 +278,8 @@ array MlxTqExpertWeights::routed_ffn(const array& input, const array& ids,
         ids, weights, reuse);
 }
 
+
+
 struct MlxTqExpertCache::Plan::Data {
     struct Layer { std::array<SourceBank, 3> banks; int experts = 0; };
     std::vector<Layer> layers;
@@ -331,8 +331,11 @@ MlxTqExpertCache::Plan MlxTqExpertCache::plan(const source::Source& source,
             if (p && layer.experts != bank.experts)
                 throw std::invalid_argument("invalid TQ expert bank geometry");
             layer.experts = bank.experts;
+            // Reserve MLX's cached-buffer upper bound, then measure actual
+            // backing before admitting the expert pools.
             data->metadata = add_bytes(data->metadata,
-                add_bytes(bank.descriptors.size() * sizeof(std::uint64_t), bank.scales.size()));
+                add_bytes(segment_metadata_reservation(bank.descriptors.size() * sizeof(std::uint64_t)),
+                          segment_metadata_reservation(bank.scales.size())));
             data->backing = add_bytes(data->backing, std::size_t(record->nbytes));
             for (const auto& range : bank.ranges)
                 data->largest[p] = std::max(data->largest[p], aligned(range.bytes));
@@ -369,13 +372,15 @@ MlxTqExpertCache::Plan MlxTqExpertCache::plan(const source::Source& source,
     return Plan(std::move(data));
 }
 
+
+
+
+
 struct MlxTqExpertCache::Impl {
     struct Bank {
         std::string name;
-        MfqMappedBytes mapping;
         source::Source::TensorReader reader;
         source::Source::TensorBatchReader batch_reader;
-        std::unique_ptr<MlxMappedTqRows> rows;
         std::vector<MlxMappedTqRows::PackedRows> ranges;
         std::optional<MlxTqWeight> weight;
     };
@@ -402,106 +407,50 @@ struct MlxTqExpertCache::Impl {
     struct HotRoute { std::size_t layer; array ids; };
     struct ResidentWork { array values, routes; bool has_misses = true; };
 
-    Impl(const MfqContainer& source, const std::vector<std::string>& prefixes,
-            std::size_t budget, int io_workers) : io_workers(io_workers) {
-        if (prefixes.empty() || prefixes.size() > std::size_t(UINT32_MAX) || io_workers < 1)
-            throw std::invalid_argument("invalid TQ expert cache configuration");
-        legacy_source.emplace(source);
-        const auto meta = source.header().extra_json.find("tq_shapes");
-        const auto shapes = meta == source.header().extra_json.end() ? nlohmann::json::object()
-            : nlohmann::json::parse(meta->second);
-        std::array<std::size_t, 3> largest{};
-        layers.resize(prefixes.size());
-        for (std::size_t index = 0; index < layers.size(); ++index) {
-            auto& layer = layers[index];
-            for (int projection = 0; projection < 3; ++projection) {
-                auto& bank = layer.banks[projection];
-                bank.name = prefixes[index] + ".mlp.experts."
-                    + std::array<const char*, 3>{"gate", "up", "down"}[projection] + ".weight";
-                std::vector<int> shape;
-                if (source.record(bank.name).dtype != "TQ")
-                    throw std::invalid_argument("TQ expert cache requires three TQ banks per layer");
-                bank.mapping = source.map_record(bank.name, true);
-                if (shapes.contains(bank.name)) shape = shapes.at(bank.name).get<std::vector<int>>();
-                else {
-                    bank.rows = std::make_unique<MlxMappedTqRows>(bank.mapping.view());
-                    const auto& rows = *bank.rows;
-                    if (!rows.expert_container()) throw std::invalid_argument("TQ expert bank lacks logical shape");
-                    shape = {int(rows.expert_count()), int(rows.rows() / rows.expert_count()), rows.width()};
-                }
-                backing += source.record(bank.name).nbytes;
-                if (shape.size() != 3 || std::any_of(shape.begin(), shape.end(), [](int x) { return x < 1; })
-                    || (projection && layer.experts != shape[0]))
-                    throw std::invalid_argument("invalid TQ expert bank geometry");
-                layer.experts = shape[0];
-                if (!bank.rows) bank.rows = std::make_unique<MlxMappedTqRows>(bank.mapping.view(), shape[2]);
-                if (bank.rows->rows() != std::int64_t(shape[0]) * shape[1]
-                    || (bank.rows->expert_container() && bank.rows->expert_count() != std::size_t(shape[0])))
-                    throw std::invalid_argument("TQ expert bank row count differs");
-                for (int expert = 0; expert < layer.experts; ++expert) {
-                    bank.ranges.push_back(bank.rows->packed_rows(std::int64_t(expert) * shape[1], shape[1]));
-                    const auto span = bank.ranges.at(expert);
-                    bank_capacity[projection] += aligned(span.bytes);
-                    largest[projection] = std::max(largest[projection], aligned(span.bytes));
-                }
+    Impl(tq_cache_detail::LegacyPlan data, std::size_t budget)
+        : parallel_reads(true), io_workers(data.io_workers) {
+        backing = data.backing;
+        bank_largest = data.largest;
+        bank_capacity = data.capacity;
+        for (int p = 0; p < 3; ++p) pools[p].chunk_bytes = data.chunk[p];
+        layers.resize(data.layers.size());
+        for (std::size_t i = 0; i < layers.size(); ++i) {
+            auto& layer = layers[i];
+            layer.experts = data.layers[i].experts;
+            for (int p = 0; p < 3; ++p) {
+                auto& bank = layer.banks[p];
+                auto& prepared = data.layers[i].banks[p];
+                bank.name = std::move(prepared.name);
+                bank.batch_reader = std::move(prepared.reader);
+                bank.ranges = std::move(prepared.ranges);
+                bank.weight = std::move(prepared.weight);
             }
         }
-        metadata = 0;
-        for (int projection = 0; projection < 3; ++projection) {
-            const auto words = (largest[projection] + 3) / 4;
-            auto temporary = array(allocator::malloc(words * 4), Shape{int(words)}, uint32);
-            for (auto& layer : layers) {
-                auto& bank = layer.banks[projection];
-                const std::vector<std::uint64_t> offsets(layer.experts, 0);
-                bank.weight.emplace(bank.rows->expert_container()
-                    ? MlxTqWeight::from_expert_rows(*bank.rows, layer.experts, &temporary, offsets)
-                    : MlxTqWeight::from_pool(bank.mapping.view(), temporary, offsets, bank.rows->width()));
-                metadata += bank.weight->descriptors_.nbytes() + bank.weight->scales_.nbytes();
-            }
-        }
-        bank_largest = largest;
-        for(int projection=0;projection<3;++projection) {
-            auto& pool=pools[projection];
-            std::size_t layer_max=0;
-            for(const auto& layer:layers) {
-                std::size_t bytes=0;
-                for(const auto& range:layer.banks[projection].ranges)bytes+=aligned(range.bytes);
-                layer_max=std::max(layer_max,bytes);
-            }
-            const auto device_limit=std::size_t(mlx::core::metal::device(Device::gpu).mtl_device()->maxBufferLength())/tyloi::metal::pool_page()*tyloi::metal::pool_page();
-            pool.chunk_bytes=std::min(device_limit,std::max(pool.chunk_bytes,(layer_max+tyloi::metal::pool_page()-1)/tyloi::metal::pool_page()*tyloi::metal::pool_page()));
-            std::size_t packed=0;
-            for(const auto& layer:layers)for(const auto& range:layer.banks[projection].ranges) {
-                const auto size=aligned(range.bytes);
-                if(size>pool.chunk_bytes)throw std::invalid_argument("TQ expert exceeds the Metal chunk size");
-                if(size>pool.chunk_bytes-packed%pool.chunk_bytes)packed=(packed/pool.chunk_bytes+1)*pool.chunk_bytes;
-                packed+=size;
-            }
-            bank_capacity[projection]=packed;
-        }
-        for (auto& capacity : bank_capacity) capacity = (capacity + tyloi::metal::pool_page() - 1) / tyloi::metal::pool_page() * tyloi::metal::pool_page();
+        measure_metadata();
+        metadata = physical_metadata;
         const auto capacities = pool_capacities(budget);
         allocated = metadata;
-        for (int projection = 0; projection < 3; ++projection) {
-            pools[projection].allocate_storage(capacities[projection]);
-            allocated += pools[projection].capacity;
-            for (auto& layer : layers) layer.banks[projection].weight->words_ = tyloi::metal::tensor(pools[projection].words);
+        for (int p = 0; p < 3; ++p) {
+            pools[p].allocate_storage(capacities[p]);
+            allocated += pools[p].capacity;
+            for (auto& layer : layers)
+                layer.banks[p].weight->words_ = tyloi::metal::tensor(pools[p].words);
         }
         for (auto& layer : layers) {
             layer.weights = std::make_unique<MlxTqExpertWeights>(MlxTqExpertWeights{
                 *layer.banks[0].weight, *layer.banks[1].weight, *layer.banks[2].weight});
             const auto& weights = *layer.weights;
-            if (weights.gate.input_size() != weights.up.input_size()
-                || weights.gate.output_size() != weights.up.output_size()
-                || weights.down.input_size() != weights.gate.output_size()
-                || weights.down.output_size() != weights.gate.input_size())
+            if (weights.gate.input_size() != weights.up.input_size() ||
+                weights.gate.output_size() != weights.up.output_size() ||
+                weights.down.input_size() != weights.gate.output_size() ||
+                weights.down.output_size() != weights.gate.input_size())
                 throw std::invalid_argument("TQ expert Gate/Up/Down dimensions differ");
         }
         retain_pools(allocated);
         requested_limit = budget;
         resources.set({0, 0, allocated.load(), backing, 0});
-        preload_complete();
     }
+
 
     Impl(Plan::Data data, std::size_t budget)
         : parallel_reads(data.parallel_reads), io_workers(data.io_workers) {
@@ -512,13 +461,6 @@ struct MlxTqExpertCache::Impl {
         bank_largest = data.largest;
         bank_capacity = data.capacity;
         for (int p = 0; p < 3; ++p) pools[p].chunk_bytes = data.chunk[p];
-        const auto capacities = pool_capacities(budget);
-        allocated = metadata;
-        for (int p = 0; p < 3; ++p) {
-            pools[p].allocate_storage(capacities[p]);
-            allocated += pools[p].capacity;
-        }
-        auto temporary = array(allocator::malloc(4), Shape{1}, uint32);
         layers.resize(data.layers.size());
         for (std::size_t i = 0; i < layers.size(); ++i) {
             auto& layer = layers[i];
@@ -539,18 +481,31 @@ struct MlxTqExpertCache::Impl {
                 std::memcpy(scales.data<std::uint8_t>(), prepared.scales.data(), prepared.scales.size());
                 tyloi::metal::AllocationScope::record(descriptors);
                 tyloi::metal::AllocationScope::record(scales);
-                bank.weight = MlxTqWeight(temporary, std::move(descriptors), std::move(scales),
+                auto placeholder = descriptors;
+                bank.weight = MlxTqWeight(std::move(placeholder), std::move(descriptors), std::move(scales),
                     prepared.rows, prepared.width, prepared.input, prepared.experts, prepared.group_size,
                     prepared.columns, prepared.nbytes, true);
-                bank.weight->words_ = tyloi::metal::tensor(pools[p].words);
             }
+        }
+        measure_metadata();
+        if (physical_metadata > metadata)
+            throw std::runtime_error("TQ metadata backing exceeds its planned reservation");
+        metadata = physical_metadata;
+        const auto capacities = pool_capacities(budget);
+        allocated = metadata;
+        for (int p = 0; p < 3; ++p) {
+            pools[p].allocate_storage(capacities[p]);
+            allocated += pools[p].capacity;
+            for (auto& layer : layers)
+                layer.banks[p].weight->words_ = tyloi::metal::tensor(pools[p].words);
+        }
+        for (auto& layer : layers) {
             layer.weights = std::make_unique<MlxTqExpertWeights>(MlxTqExpertWeights{
                 *layer.banks[0].weight, *layer.banks[1].weight, *layer.banks[2].weight});
         }
         retain_pools(allocated);
         requested_limit = budget;
         resources.set({0, 0, allocated.load(), backing, 0});
-        preload_complete();
     }
 
     std::array<std::size_t, 3> pool_capacities(std::size_t budget) const {
@@ -795,7 +750,8 @@ struct MlxTqExpertCache::Impl {
         } }
         catch (...) {
             const auto failure = std::current_exception();
-            try { synchronize(default_stream(Device::gpu)); } catch (...) {}
+            try { synchronize(default_stream(Device::gpu)); }
+            catch (...) { std::rethrow_exception(failure); }
             pending_output.reset(); hot_outputs.clear(); hot_routes.clear();
             std::rethrow_exception(failure);
         }
@@ -814,8 +770,11 @@ struct MlxTqExpertCache::Impl {
             }
             finish_pending();
         } catch (...) {
+            const auto failure = std::current_exception();
+            try { finish_pending(); }
+            catch (...) { std::rethrow_exception(failure); }
             while (!entries.empty()) erase(*entries.oldest());
-            throw;
+            std::rethrow_exception(failure);
         }
     }
 
@@ -960,10 +919,6 @@ struct MlxTqExpertCache::Impl {
     }
 
     std::size_t read_packed(const Read& read) {
-        if (legacy_source) {
-            legacy_source->readv_range(read.record, read.offset, read.destinations);
-            return 1;
-        }
         const auto transfer = [&] {
             std::uint64_t offset = read.offset;
             if (read.bank->batch_reader) {
@@ -1282,7 +1237,6 @@ struct MlxTqExpertCache::Impl {
 
     std::optional<PrefillRead> prefill_read;
     std::optional<std::pair<std::size_t, std::size_t>> lookahead;
-    std::optional<MfqContainer> legacy_source;
     bool parallel_reads = true;
     std::mutex reader_mutex;
     int io_workers;
@@ -1295,7 +1249,14 @@ struct MlxTqExpertCache::Impl {
     std::optional<ResidentWork> resident_work;
     std::vector<array> hot_outputs;
     std::vector<HotRoute> hot_routes;
-    std::size_t metadata = 0, backing = 0;
+    void measure_metadata() {
+        physical_metadata = 0;
+        for (const auto& layer : layers) for (const auto& bank : layer.banks) {
+            physical_metadata = add_bytes(physical_metadata, bank.weight->descriptors_.backing_nbytes());
+            physical_metadata = add_bytes(physical_metadata, bank.weight->scales_.backing_nbytes());
+        }
+    }
+    std::size_t metadata = 0, physical_metadata = 0, backing = 0;
     std::array<std::size_t, 3> bank_largest{}, bank_capacity{};
     std::shared_ptr<tyloi::metal::ResidentAllocations> pool_residency;
     std::atomic<std::size_t> allocated{0}, requested_limit{0};
@@ -1307,8 +1268,15 @@ struct MlxTqExpertCache::Impl {
     MlxResourceTelemetry resources;
 };
 
-MlxTqExpertCache::MlxTqExpertCache(const MfqContainer& source, const std::vector<std::string>& prefixes,
-        std::size_t budget, int io_workers) : impl_(std::make_shared<Impl>(source, prefixes, budget, io_workers)) {}
+void MlxTqExpertCache::load_legacy(tq_cache_detail::LegacyPlan data, std::size_t budget) {
+    impl_ = std::make_shared<Impl>(std::move(data), budget);
+    try { impl_->preload_complete(); }
+    catch (...) {
+        const auto failure = std::current_exception();
+        try { drain(); } catch (...) { std::terminate(); }
+        std::rethrow_exception(failure);
+    }
+}
 
 MlxTqExpertCache::MlxTqExpertCache(Plan plan, std::size_t budget) {
     if (!plan.data_) throw std::invalid_argument("TQ expert cache plan is empty");
@@ -1316,7 +1284,14 @@ MlxTqExpertCache::MlxTqExpertCache(Plan plan, std::size_t budget) {
 }
 
 MlxTqExpertCache::MlxTqExpertCache(const source::Source& source, const std::vector<std::string>& prefixes,
-        std::size_t budget, int io_workers) : MlxTqExpertCache(plan(source, prefixes, io_workers), budget) {}
+        std::size_t budget, int io_workers) : MlxTqExpertCache(plan(source, prefixes, io_workers), budget) {
+    try { impl_->preload_complete(); }
+    catch (...) {
+        const auto failure = std::current_exception();
+        try { drain(); } catch (...) { std::terminate(); }
+        std::rethrow_exception(failure);
+    }
+}
 
 array MlxTqExpertCache::apply(std::size_t layer, const array& ids,
         const std::function<array(const MlxTqExpertWeights&)>& operation) {
@@ -1355,14 +1330,28 @@ MlxTqExpertCacheStats MlxTqExpertCache::stats() const {
     for (const auto& pool : impl_->pools) if (pool.storage) pinned += pool.storage->locked_bytes;
     return {impl_->requests.load(), impl_->hits.load(), impl_->misses.load(), impl_->evictions.load(),
         impl_->bytes_read.load(), impl_->read_calls.load(), impl_->cached.load(), impl_->used.load(),
-        impl_->allocated.load(), impl_->io_ns.load() * 1e-9, impl_->route_ns.load() * 1e-9,
-        impl_->prepare_ns.load() * 1e-9, impl_->graph_ns.load() * 1e-9, impl_->metadata,
+        impl_->allocated.load() - impl_->metadata + impl_->physical_metadata,
+        impl_->io_ns.load() * 1e-9, impl_->route_ns.load() * 1e-9,
+        impl_->prepare_ns.load() * 1e-9, impl_->graph_ns.load() * 1e-9, impl_->physical_metadata,
         impl_->overlapped_read_batches.load(), pinned,
         impl_->prefill_read_batches.load(), impl_->prefill_bytes_read.load()};
 }
 std::size_t MlxTqExpertCache::limit_bytes() const noexcept { return impl_->requested_limit.load(); }
+std::size_t MlxTqExpertCache::minimum() const {
+    auto bytes = impl_->metadata;
+    for (const auto size : impl_->bank_largest)
+        bytes = add_bytes(bytes, round_page(size, tyloi::metal::pool_page()));
+    return bytes;
+}
+std::size_t MlxTqExpertCache::maximum() const {
+    auto bytes = impl_->metadata;
+    for (const auto size : impl_->bank_capacity) bytes = add_bytes(bytes, size);
+    return bytes;
+}
 std::size_t MlxTqExpertCache::backing_bytes() const noexcept { return impl_->backing; }
-std::size_t MlxTqExpertCache::resident_bytes() const noexcept { return impl_->allocated; }
+std::size_t MlxTqExpertCache::resident_bytes() const noexcept {
+    return impl_->allocated.load() - impl_->metadata + impl_->physical_metadata;
+}
 std::size_t MlxTqExpertCache::set_limit(std::size_t bytes) { return impl_->set_limit(bytes); }
 std::size_t MlxTqExpertCache::trim(std::size_t bytes) { return impl_->trim(bytes); }
 void MlxTqExpertCache::validate_layer(std::size_t layer, int experts, int input, int intermediate) const {
@@ -1376,6 +1365,18 @@ void MlxTqExpertCache::prepare_layer(std::size_t layer, int top_k, float limit, 
     std::lock_guard lock(impl_->execution);
     if (layer >= impl_->layers.size()) throw std::invalid_argument("invalid TQ cache layer");
     impl_->layers[layer].weights->prepare(top_k, limit, gelu);
+}
+void MlxTqExpertCache::preload() {
+    std::lock_guard lock(impl_->execution);
+    for (int p = 0; p < 3; ++p)
+        if (impl_->pools[p].capacity < impl_->bank_capacity[p])
+            throw std::invalid_argument("TQ preload requires the complete cache budget");
+    impl_->preload_complete();
+}
+void MlxTqExpertCache::drain() {
+    std::lock_guard lock(impl_->execution);
+    impl_->finish_prefill();
+    impl_->finish_pending();
 }
 void MlxTqExpertCache::clear() {
     std::lock_guard lock(impl_->execution);

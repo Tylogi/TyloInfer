@@ -12,20 +12,20 @@ namespace {
 void require(bool condition,const char* message) {
     if(!condition)throw CudaSessionStateError(message);
 }
-size_t length(CudaPagedReader& r,const char* name) {
+size_t length(SessionBlockReader& r,const char* name) {
     const auto n=r.scalar<uint64_t>(name);
     require(n<=std::numeric_limits<size_t>::max(),"QSA prefix size overflow");return size_t(n);
 }
-std::vector<uint8_t> range(const CudaPagedPayload& p,size_t at,size_t n) {
+std::vector<uint8_t> range(const SessionBlockPayload& p,size_t at,size_t n) {
     require(at<=p->size() && n<=p->size()-at,"invalid QSA prefix extent");
     return {p->begin()+at,p->begin()+at+n};
 }
-void write_tail(CudaPagedWriter& w,const ::tyloi::DenseTensor& t) {
+void write_tail(SessionBlockWriter& w,const ::tyloi::DenseTensor& t) {
     if(!t.defined()){w.scalar<uint64_t>(0);return;}
     const auto cpu=t.to(::tyloi::kCPU,::tyloi::kFloat32).contiguous();
     const auto bytes=size_t(cpu.numel())*sizeof(float);w.scalar<uint64_t>(bytes);w.raw(cpu.data_ptr(),bytes);
 }
-::tyloi::DenseTensor read_tail(CudaPagedReader& r,const std::vector<int64_t>& shape,bool discard) {
+::tyloi::DenseTensor read_tail(SessionBlockReader& r,const std::vector<int64_t>& shape,bool discard) {
     size_t expected=sizeof(float);for(auto dim:shape)expected*=size_t(dim);
     const auto bytes=length(r,"QSA raw tail size");
     require(bytes==expected && bytes<=r.remaining(),"incompatible QSA raw tail size");
@@ -55,7 +55,7 @@ bool reuse_ram_qsa_page(QsaTqSession& state,size_t start,size_t count,
     if(release_readers)state.durable_prefix=state.borrow_prefix=true;
     return true;
 }
-void write_ram_qsa_page(CudaPagedWriter& w,const QsaTqSession& s,size_t start,size_t count,bool exact) {
+void write_ram_qsa_page(SessionBlockWriter& w,const QsaTqSession& s,size_t start,size_t count,bool exact) {
     require(s.tokens>0 && s.kv && s.index.size()==s.kv->blocks.size() &&
         s.kv->blocks.size()==size_t(s.tokens/4) && start<=size_t(s.tokens) && count<=size_t(s.tokens)-start,
         "invalid compressed QSA prefix boundary");
@@ -75,7 +75,7 @@ void write_ram_qsa_page(CudaPagedWriter& w,const QsaTqSession& s,size_t start,si
     if(exact && s.tokens%4) {write_tail(w,s.tail_keys);write_tail(w,s.tail_values);write_tail(w,s.tail_index);}
 }
 
-void read_ram_qsa_page(CudaPagedReader& r,const CudaPagedPayload& payload,
+void read_ram_qsa_page(SessionBlockReader& r,const SessionBlockPayload& payload,
         const std::shared_ptr<const cache::PagedPrefixReadLease>& lease,
         size_t start,size_t count,bool exact,std::shared_ptr<QsaTqSession>& state,bool bind) {
     std::array<uint32_t,6> geometry{};for(auto& n:geometry)n=r.scalar<uint32_t>("QSA geometry");

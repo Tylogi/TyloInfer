@@ -41,7 +41,7 @@ std::vector<std::int64_t> tokens(tyloi::engine::Engine& engine,
 }
 }
 
-int run_cuda_engine_isolation_check(CudaEngineOptions options) {
+int run_cuda_engine_isolation_check(tyloi::engine::EngineOptions options) {
     if (options.model_path.empty()) throw std::runtime_error("engine isolation check requires --model");
     if (options.context_size == 0) options.context_size = 64;
     options.continuous_batching = 0;
@@ -56,7 +56,7 @@ int run_cuda_engine_isolation_check(CudaEngineOptions options) {
             ready.count_down();
             start.wait();
             if (cancelled.load()) return;
-            try { engine = load_cuda_engine(options); }
+            try { engine = tyloi::engine::load(options); }
             catch (...) { error = std::current_exception(); }
         };
         std::jthread first_worker, second_worker;

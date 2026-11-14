@@ -28,13 +28,13 @@ namespace {
 
 class Reload {
 public:
-    Reload(const CudaEngineOptions& options, engine::Engine& engine)
+    Reload(const tyloi::engine::EngineOptions& options, engine::Engine& engine)
         : options_(options), engine_(engine), worker_([this] {
             while (auto job = engine_.next_reload()) {
                 try {
                     auto options = options_;
                     options.context_size = job->context;
-                    reload_cuda_engine(engine_, std::move(options));
+                    tyloi::engine::reload(engine_, std::move(options));
                     job->reply.set_value();
                 } catch (...) { job->reply.set_exception(std::current_exception()); }
             }
@@ -50,7 +50,7 @@ private:
         catch (const std::exception& error) { std::cerr << "runtime_unload_cleanup error=" << error.what() << '\n'; }
         catch (...) { std::cerr << "runtime_unload_cleanup error=unknown\n"; }
     }
-    const CudaEngineOptions options_;
+    const tyloi::engine::EngineOptions options_;
     engine::Engine& engine_;
     std::jthread worker_;
 };
@@ -93,7 +93,7 @@ void print_help() {
         << "  -h, --help                      show this help\n";
 }
 
-struct RuntimeOptions : CudaEngineOptions {
+struct RuntimeOptions : tyloi::engine::EngineOptions {
     std::string transport_host = "127.0.0.1";
     std::string runtime_model_name = "mfq-model", transport_api_key;
     std::string runtime_sampling_profile;
@@ -109,6 +109,7 @@ struct RuntimeCommandOptions
 
 RuntimeCommandOptions parse_runtime(ArgCursor& args) {
     RuntimeCommandOptions result;
+    result.device = tyloi::Device(tyloi::DeviceType::cuda);
     bool transport_option = false;
     while (!args.empty()) {
         const std::string_view option = args.next();
@@ -217,7 +218,7 @@ int run_transport_runtime(RuntimeOptions& options) {
             "model runtime requires model config and tokenizer GGUF");
     }
 
-    auto engine = load_cuda_engine(options);
+    auto engine = tyloi::engine::load(options);
     const auto info = engine->info();
     if (options.transport_api_key.empty()) {
         const char* env_key = tyloi::cuda::env_lookup("TYLOINFER_API_KEY");

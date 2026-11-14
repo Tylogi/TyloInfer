@@ -28,7 +28,7 @@ std::optional<Tensor> capture_batch(models::Batch& batch, Executor& executor,
 class BatchDriver final {
 public:
     BatchDriver(std::unique_ptr<models::Batch> batch, Executor& executor,
-        weights::Cache& weights, Budget& budget, Device device);
+        weights::Cache& weights, Budget& budget, Device device, std::size_t workspace_reserve);
     ~BatchDriver() noexcept;
     BatchDriver(const BatchDriver&) = delete;
     BatchDriver& operator=(const BatchDriver&) = delete;
@@ -48,6 +48,7 @@ private:
     weights::Cache& weights_;
     Budget& budget_;
     Device device_;
+    std::size_t workspace_reserve_;
     std::unique_ptr<models::Batch> batch_;
     std::vector<std::unique_ptr<models::BatchState>> states_;
 };

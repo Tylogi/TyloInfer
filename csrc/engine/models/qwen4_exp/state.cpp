@@ -499,6 +499,15 @@ public:
         if (predictor_) predictor_->stage();
     }
 
+    std::vector<::tyloi::Tensor> storage() const override {
+        auto result = candidate_ ? candidate_->storage() : std::vector<::tyloi::Tensor>{};
+        if (predictor_) {
+            auto more = predictor_->storage();
+            result.insert(result.end(), more.begin(), more.end());
+        }
+        return result;
+    }
+
     void publish() noexcept override {
         state_.publish_restore(*candidate_);
         if (predictor_) predictor_->publish();
@@ -590,6 +599,26 @@ public:
             candidate_->lengths[i] = saved.lengths[i];
         }
         candidate_->batch = 1;
+    }
+
+    std::vector<::tyloi::Tensor> storage() const override {
+        std::vector<::tyloi::Tensor> result;
+        const auto add = [&](const ::tyloi::Tensor& value) { if (value) result.push_back(value); };
+        add(hidden_);
+        if (!candidate_) return result;
+        for (const auto& value : candidate_->positions) add(value);
+        for (std::size_t i = 0; i < candidate_->layer_states.size(); ++i) {
+            const auto& block = *model_.layers[i];
+            const auto& layer = *candidate_->layer_states[i];
+            if (block.gdn) for (const auto& value : block.gdn->storage(layer.gdn)) add(value);
+            if (block.ple) {
+                add(layer.ple.conv);
+                add(layer.ple.saved_conv);
+                for (const auto& value : layer.ple.saved_prefix_conv) add(value);
+            }
+            if (block.qsa) for (const auto& value : block.qsa->storage(*layer.qsa)) add(value);
+        }
+        return result;
     }
 
     void publish() noexcept override {

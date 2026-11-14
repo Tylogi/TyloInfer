@@ -17,7 +17,7 @@
 namespace tyloi::engine { class Budget; }
 
 namespace tyloi::weights {
-// The owner drains consumers and enters the CUDA scope before workspace operations.
+// The owner drains consumers and enters the target device scope before workspace operations.
 class Cache {
 public:
     enum class Graph { native, legacy, model_parallel };
@@ -143,6 +143,8 @@ private:
     std::unique_ptr<Resources> data_;
     friend struct Loader;
     friend class Loan;
+    Tensor experts(const source::Source& source, const std::string& name,
+        int layer, const std::string& role);
     /** Prepare an expert loan for the requesting owner. */
     void lend(Loan& loan);
     /** Load routed TQ weights using the cache's resources. */
@@ -155,5 +157,6 @@ private:
     void restore_workspace(std::size_t reserve_bytes, const source::Source* source);
     std::size_t prefill_workspace_capacity() const noexcept;
     void append_workspace_metrics(std::vector<std::pair<std::string, double>>& metrics) const;
+    void retire();
 };
 } // namespace tyloi::weights

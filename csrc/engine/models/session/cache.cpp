@@ -1,5 +1,4 @@
 #include "engine/models/session/cache.h"
-#include <cstring>
 
 #include "engine/backends/cpu/native/host_memory.h"
 #include "engine/config.h"
@@ -23,17 +22,12 @@
 #include <sys/sysinfo.h>
 #endif
 
-namespace tyloi::cuda::internal {
+namespace tyloi::models {
 
-bool cuda_has_separate_memory() {
-    cudaDeviceProp properties{};
-    TYLOINFER_CUDA_CHECK(cudaGetDeviceProperties(&properties, mfq_current_cuda_device()));
-    return !properties.integrated && std::strstr(properties.name, "GB10") == nullptr;
-}
-
-std::shared_ptr<tyloi::cache::PagedPrefixCache> make_cuda_paged_prefix_cache(
+std::shared_ptr<tyloi::cache::PagedPrefixCache> make_paged_prefix_cache(
     const tyloi::ModelSource &source, int64_t max_position_embeddings,
-    bool supports_paged_text_session_state, const tyloi::engine::PrefixCacheConfig &config) {
+    bool supports_paged_text_session_state, const tyloi::engine::PrefixCacheConfig &config,
+    tyloi::Device device, bool separate, std::string_view kv_fingerprint) {
     const auto format = source.metadata().find("source.format");
     // ponytail: HF source fingerprints exclude config sidecars for now.
     if (!config.enabled ||
@@ -44,13 +38,12 @@ std::shared_ptr<tyloi::cache::PagedPrefixCache> make_cuda_paged_prefix_cache(
     tyloi::cache::PrefixBlockStoreConfig cache;
     cache.cache_dir = config.directory;
     if (!source.source_paths().empty()) cache.model_path = source.source_paths().front();
-    cache.compatibility_key = cuda_prefix_cache_compatibility_key(source, max_position_embeddings);
+    cache.compatibility_key = prefix_cache_compatibility_key(source, max_position_embeddings, device, kv_fingerprint);
     cache.block_size_tokens = static_cast<size_t>(config.block_tokens);
     // A longer block may lack the local/rolling state of a shorter exact
     // checkpoint. Retain those boundaries under the existing byte-budget LRU.
     cache.retain_tail_versions = 0;
     cache.max_disk_bytes = config.disk_bytes;
-    const bool separate = cuda_has_separate_memory();
     cache.max_hot_bytes = separate ? config.ram_bytes : config.hot_bytes;
     cache.spill_hot_on_eviction = separate;
     if (separate) cache.available_ram_bytes = []() -> std::uint64_t {
@@ -71,13 +64,13 @@ std::shared_ptr<tyloi::cache::PagedPrefixCache> make_cuda_paged_prefix_cache(
     return std::make_shared<tyloi::cache::PagedPrefixCache>(std::move(cache));
 }
 
-tyloi::Tensor CudaSessionOps::restore(tyloi::models::State& state, const Snapshot& snapshot,
+tyloi::Tensor SessionOps::restore(tyloi::models::State& state, const Snapshot& snapshot,
         tyloi::models::Mtp* mtp, tyloi::Executor& executor,
         tyloi::weights::Cache& weights, tyloi::engine::Budget& budget) {
     return tyloi::state::restore(state, snapshot, executor, weights, budget, mtp);
 }
 
-void CudaSessionOps::release_host_cache() {
+void SessionOps::release_host_cache() {
     tyloi::trim_host_cache();
 }
 
@@ -85,11 +78,12 @@ std::unique_ptr<tyloi::state::Sessions> make_sessions(
         const tyloi::ModelSource& source,
         const tyloi::engine::SessionCacheConfig& session_config,
         const tyloi::engine::PrefixCacheConfig& prefix_config,
-        std::int64_t maximum_context, bool supported, bool paged) {
-    return std::make_unique<tyloi::engine::SessionCache<CudaSessionOps>>(
+        std::int64_t maximum_context, bool supported, bool paged,
+        tyloi::Device device, bool separate_memory, std::string_view kv_fingerprint) {
+    return std::make_unique<tyloi::engine::SessionCache<SessionOps>>(
         session_config, prefix_config,
-        make_cuda_paged_prefix_cache(source, maximum_context, paged, prefix_config),
-        supported, supported ? 0 : 1, cuda_has_separate_memory());
+        make_paged_prefix_cache(source, maximum_context, paged, prefix_config, device, separate_memory, kv_fingerprint),
+        supported, supported ? 0 : 1, separate_memory);
 }
 
-} // namespace tyloi::cuda::internal
+} // namespace tyloi::models

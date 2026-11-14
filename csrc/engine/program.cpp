@@ -76,7 +76,7 @@ weights::Loader loader(CudaLoadConfig& config, weights::Cache& weights, const Mo
 }
 
 /** Resolve the shared definition, weight loader, and native model policy. */
-Assembly assembly(const CudaLoadOptions& options, CudaLoadConfig& config,
+Assembly assembly(const tyloi::engine::LoadOptions& options, CudaLoadConfig& config,
         Executor& executor, weights::Cache& weights, const ModelSource& source,
         bool components) {
     auto definition = models::config_json(source, options.config_path);
@@ -138,7 +138,7 @@ void configure_model_kv(std::shared_ptr<KvMemoryManager>& kv,
     }
 }
 
-void load_model(std::unique_ptr<models::CausalModel>& owner, const CudaLoadOptions& options,
+void load_model(std::unique_ptr<models::CausalModel>& owner, const tyloi::engine::LoadOptions& options,
         CudaLoadConfig& config, Executor& executor, weights::Cache& weights,
         const std::shared_ptr<const ModelSource>& source, bool components) {
     auto input = assembly(options, config, executor, weights, *source, components);
@@ -147,7 +147,7 @@ void load_model(std::unique_ptr<models::CausalModel>& owner, const CudaLoadOptio
 } // namespace internal
 
 struct Program::Impl {
-    CudaLoadOptions options;
+    tyloi::engine::LoadOptions options;
     CudaLoadConfig config;
     std::unique_ptr<Executor> executor;
     std::unique_ptr<::tyloi::weights::Cache> weights;
@@ -213,6 +213,7 @@ Program::~Program() noexcept { impl_->cleanup(); }
 std::unique_ptr<Program> Program::bare() {
     auto program = std::unique_ptr<Program>(new Program());
     auto& p = *program->impl_;
+    p.options.device = Device(DeviceType::cuda);
     const bool dump_env = env_flag("TYLOINFER_CUDA_ENV_DUMP", false);
     if (dump_env) std::cerr << "cuda knobs at load:\n" << env_dump();
     auto [config, numeric] = load_cuda_execution_config();
@@ -224,7 +225,8 @@ std::unique_ptr<Program> Program::bare() {
     return program;
 }
 
-std::unique_ptr<Program> Program::open(CudaLoadOptions options, bool adapt) {
+std::unique_ptr<Program> Program::open(tyloi::engine::LoadOptions options, bool adapt) {
+    if (!options.device.is_cuda()) throw std::invalid_argument("CUDA Program requires a CUDA device");
     auto program = bare();
     auto& p = *program->impl_;
     p.options = std::move(options);
@@ -349,8 +351,9 @@ void Program::configure(engine::Config config) {
     runtime.device = Device(kCUDA, p.config.layer_placement.primary_device());
     const auto mode = p.executor->forward_mode(p.config.layer_placement.primary_device());
     p.forward = {mode.kv_capacity, mode.trace, mode.trace_layer, mode.primary};
-    p.sessions = internal::make_sessions(*p.source, runtime.session_cache, runtime.prefix_cache,
-        p.run_info.max_context, p.state->supports_text_session_state(), p.state->supports_paged_text_session_state());
+    p.sessions = models::make_sessions(*p.source, runtime.session_cache, runtime.prefix_cache,
+        p.run_info.max_context, p.state->supports_text_session_state(), p.state->supports_paged_text_session_state(),
+        runtime.device, internal::cuda_has_separate_memory(), cuda_kv_quantization_tag());
     p.graph.emplace(p.run_info.max_context,
         Device(kCUDA, p.config.layer_placement.primary_device()), p.executor->graph());
     p.budget.emplace(*p.executor, *p.ledger, *p.weights, *p.sessions, runtime.device);
@@ -432,7 +435,8 @@ engine::BatchDriver& Program::begin_batch(models::BatchConfig config) {
         p.graph->invalidate();
         p.state->release_graphs();
         p.batch_driver=std::make_unique<engine::BatchDriver>(
-            p.model->make_batch(config),*p.executor,*p.weights,*p.budget,p.run_config.device);
+            p.model->make_batch(config),*p.executor,*p.weights,*p.budget,p.run_config.device,
+            p.run_config.workspace_reserve);
         p.batch_driver->initialize();
         return *p.batch_driver;
     } catch(...) {

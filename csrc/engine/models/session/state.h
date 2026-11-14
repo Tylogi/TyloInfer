@@ -8,6 +8,8 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <optional>
+#include <span>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -20,6 +22,10 @@ struct KvSnapshot {
     ::tyloi::Tensor v;
     int64_t capacity = 0;
     bool ring = false;
+    // Disk snapshots retain their destination while their tensors stay on the host.
+    std::optional<::tyloi::Device> destination;
+
+    ::tyloi::Device target_device() const { return destination.value_or(k.device()); }
 
     template <class Visit>
     void tensors(const Visit& visit) const {
@@ -34,7 +40,7 @@ inline bool session_kv_geometry_matches(const ::tyloi::Tensor& k,
     if(!k.defined()||!v.defined()||k.dim()!=4||v.dim()!=4||k.scalar_type()!=v.scalar_type())return false;
     for(int axis=0;axis<3;++axis)if(k.size(axis)!=v.size(axis))return false;
     return k.scalar_type()==::tyloi::kInt32 ||
-        (k.is_metal() && k.scalar_type()==::tyloi::ScalarType::uint32) || k.size(3)==v.size(3);
+        k.scalar_type()==::tyloi::ScalarType::uint32 || k.size(3)==v.size(3);
 }
 
 enum class HybridBlockSessionStateKind {
@@ -60,39 +66,42 @@ struct HybridBlockSessionState {
     }
 };
 
-struct CudaDecodedPagedLayer {
+struct DecodedSessionBlockLayer {
     int64_t capacity = 0;
-    int device = -1;
+    ::tyloi::Device device{::tyloi::DeviceType::cpu, 0};
     ::tyloi::Tensor k;
     ::tyloi::Tensor v;
 };
 
-struct CudaDecodedPagedBlock {
+struct DecodedSessionBlock {
     uint32_t start = 0;
     uint32_t count = 0;
-    std::vector<CudaDecodedPagedLayer> layers;
+    std::vector<DecodedSessionBlockLayer> layers;
 };
 
+/** Join host snapshot fragments without allocating accelerator storage. */
+::tyloi::Tensor concatenate_session_tensors(std::span<const ::tyloi::Tensor> tensors, std::int64_t dimension);
+
 /** Encode a bounded range of complete blocks from a text session. */
-std::vector<CudaPagedPayload> encode_cuda_paged_session(
+std::vector<SessionBlockPayload> encode_paged_session(
     const TextSessionState& state,
     size_t block_size,
     size_t first_block,
     size_t maximum_blocks = std::numeric_limits<size_t>::max());
 
 /** Encode one complete text session block. */
-CudaPagedPayload encode_cuda_paged_block(
+SessionBlockPayload encode_paged_block(
     const TextSessionState& state,
     size_t block_size,
     size_t block_index);
 
 /** Decode and validate one paged session payload. */
-CudaDecodedPagedBlock decode_cuda_paged_block(
+DecodedSessionBlock decode_paged_block(
     const std::vector<uint8_t>& payload);
 
 /** Reconstruct a text session from a validated sequence of paged payloads. */
-TextSessionState decode_cuda_paged_session(
-    const std::vector<CudaPagedPayload>& payloads,
+TextSessionState decode_paged_session(
+    const std::vector<SessionBlockPayload>& payloads,
     const std::vector<int64_t>& tokens,
     size_t block_size);
 
@@ -109,6 +118,10 @@ std::size_t restore_tensor_bytes(const ::tyloi::Tensor& target, const ::tyloi::T
 /** Return the new backing bytes needed to restore a prefix at the given capacity. */
 std::size_t restore_prefix_bytes(const ::tyloi::Tensor& target, const ::tyloi::Tensor& source,
     std::int64_t dimension, std::int64_t capacity);
+
+/** Add the device backing and any host staging needed by a fresh KV restore. */
+void add_kv_restore_growth(std::vector<std::pair<::tyloi::Device, std::size_t>>& growth,
+                           const KvSnapshot& state);
 
 /** Restore a tensor into compatible backing or newly allocated storage. */
 ::tyloi::Tensor restore_session_tensor(

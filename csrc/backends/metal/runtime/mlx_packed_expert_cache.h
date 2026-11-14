@@ -12,6 +12,7 @@ public:
     virtual void validate_layer(std::size_t layer, int experts, int input, int intermediate) const = 0;
     virtual void prepare_layer(std::size_t layer, int top_k) const = 0;
     virtual void preload() = 0;
+    virtual void drain() = 0;
     virtual bool preserves_activation_dtype() const noexcept { return false; }
     virtual std::size_t limit_bytes() const noexcept = 0;
     virtual std::size_t backing_bytes() const noexcept = 0;

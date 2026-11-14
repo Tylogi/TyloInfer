@@ -45,7 +45,7 @@
 
 namespace tyloi::cuda {
 
-struct DiagnosticsCommandOptions : CudaLoadOptions, TokenInputOptions {
+struct DiagnosticsCommandOptions : tyloi::engine::LoadOptions, TokenInputOptions {
     std::string check_linear, check_linear_cpu, check_linear_gate;
     std::string check_tp_linear, check_ep_moe;
     std::string check_tp_axis_arg = "output";
@@ -231,8 +231,8 @@ struct DiagnosticsCommand : tyloi::cuda::DiagnosticsCommandOptions {
         : tyloi::cuda::DiagnosticsCommandOptions(std::move(options)) {}
     int run() { return with_command_errors([&]() -> int {
         if (check_engine_isolation) {
-            tyloi::cuda::CudaEngineOptions options;
-            static_cast<tyloi::cuda::CudaLoadOptions&>(options) = *this;
+            tyloi::engine::EngineOptions options;
+            static_cast<tyloi::engine::LoadOptions&>(options) = *this;
             return run_cuda_engine_isolation_check(std::move(options));
         }
         if (runtime_comparison_modes() > 1)
@@ -375,7 +375,7 @@ struct DiagnosticsCommand : tyloi::cuda::DiagnosticsCommandOptions {
         auto ids = tyloi::cuda::tensor(ids_vec, tyloi::TensorOptions().dtype(tyloi::kInt64).device(tyloi::kCUDA)).unsqueeze(0);
         if (compare_dsv4_hc_ops || compare_dsv4_hc_model) return run_hc_compare(*program, ids, compare_dsv4_hc_ops);
         if (!block_trace_reference.empty()) {
-            auto reference = static_cast<tyloi::cuda::CudaLoadOptions>(*this);
+            auto reference = static_cast<tyloi::engine::LoadOptions>(*this);
             reference.model_path = block_trace_reference;
             return run_block_trace_compare(*program, std::move(reference), ids);
         }
@@ -657,6 +657,7 @@ bool parse_diagnostic_switch(std::string_view option, DiagnosticsCommandOptions&
 
 DiagnosticsCommandOptions parse_diagnostics(ArgCursor& args) {
     DiagnosticsCommandOptions result;
+    result.device = tyloi::Device(tyloi::DeviceType::cuda);
     while (!args.empty()) {
         const std::string_view option = args.next();
         if (option == "--help" || option == "-h") {

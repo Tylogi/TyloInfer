@@ -15,7 +15,7 @@
 #include <utility>
 
 namespace tyloi::engine { class Budget; template <class Backend> class SessionCache; }
-namespace tyloi::cuda::internal { struct CudaSessionOps; }
+namespace tyloi::models { struct SessionOps; }
 
 namespace tyloi::cuda {
 class Collectives;
@@ -38,7 +38,7 @@ tyloi::engine::Generation generate(
     bool& serial_branches, bool report_memory, bool graph_allowed,
     std::function<void()> drain,
     const tyloi::models::Info& info, const tyloi::ModelSource* source,
-    DecodeGraphCache& graph, tyloi::engine::SessionCache<CudaSessionOps>& cache,
+    DecodeGraphCache& graph, tyloi::engine::SessionCache<tyloi::models::SessionOps>& cache,
     const tyloi::engine::Config& config, tyloi::engine::InferenceRequest& request,
     tyloi::engine::InferenceOutput& output, tyloi::engine::mtp::State& mtp_state,
     Predictor* mtp = nullptr,

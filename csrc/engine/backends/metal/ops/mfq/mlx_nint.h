@@ -1,5 +1,10 @@
 #pragma once
 
+#include <memory>
+#include <vector>
+
+namespace tyloi { struct TensorStorage; }
+
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -51,6 +56,7 @@ ParsedNintStorage parse_nint_blob(std::span<const std::uint8_t> blob,
 
 class MlxNintWeight {
 public:
+    std::vector<std::shared_ptr<tyloi::TensorStorage>> backings() const;
     static MlxNintWeight from_blob(
         std::span<const std::uint8_t> blob);
 

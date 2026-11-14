@@ -1,3 +1,4 @@
+#include "mlx_projection_batch.h"
 #include "mlx_deepseek_v4_dspark.h"
 
 #include "engine/backends/metal/ops/tensor.h"

@@ -88,6 +88,7 @@ models::Prefill prefill(const models::CausalModel& model, models::State& state, 
                     budget.reserve(state.growth(part, options));
                     hidden = model.forward(std::move(part), state, options);
                 }
+                executor.submit(state.storage());
                 hidden_rows.push_back(std::move(hidden));
                 if (input.raw_hidden) raw_rows.push_back(raw_host ? ops::copy(raw, Device(kCPU)) : std::move(raw));
                 if (rows > 1) state.commit_speculative();
@@ -183,6 +184,7 @@ models::Prefill prefill(const models::CausalModel& model, models::State& state, 
                 if (state.position() == 0) weights.finish_exchange();
                 { auto scope = executor.enter(); result.hidden = model.forward(std::move(input), state, options); }
                 if (raw) result.raw = *raw;
+                executor.submit(state.storage());
                 timer->stop({result.hidden, result.raw});
                 result.elapsed_ms = timer->elapsed_ms();
                 return result;
@@ -206,7 +208,8 @@ models::Prefill prefill(const models::CausalModel& model, models::State& state, 
             }
             result = std::move(*step.value);
             if (result.phase == models::Prefill::Phase::computed) {
-                timer->stop();
+                executor.submit(state.storage());
+                timer->stop({result.hidden, result.raw});
                 computed = true;
             } else if (result.phase == models::Prefill::Phase::encode) {
                 if (result.first < result.last) {
@@ -218,9 +221,11 @@ models::Prefill prefill(const models::CausalModel& model, models::State& state, 
                 if (priority) { priority->finish(); priority.reset(); }
                 if (result.phase == models::Prefill::Phase::complete) {
                     if (loan) throw std::logic_error("prefill completed while workspace is borrowed");
+                    executor.submit(state.storage());
+                    if (!computed) timer->stop({result.hidden, result.raw});
                     capture.finish();
                     work->finish();
-                    if (computed) result.elapsed_ms = timer->elapsed_ms();
+                    result.elapsed_ms = timer->elapsed_ms();
                     return result;
                 }
             } else throw std::logic_error("unknown prefill job phase");

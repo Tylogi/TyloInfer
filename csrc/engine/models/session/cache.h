@@ -1,6 +1,5 @@
 #pragma once
 
-#include "backend.h"
 #include "engine/models/session/snapshot.h"
 #include "engine/state/session/cache.h"
 
@@ -11,6 +10,7 @@
 #include <memory>
 #include <map>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -26,29 +26,27 @@ struct PrefixCacheConfig;
 struct SessionCacheConfig;
 }
 
-namespace tyloi::cuda::internal {
+namespace tyloi::models {
 
-bool cuda_has_separate_memory();
-
-struct CudaSessionOps {
+struct SessionOps {
     using Snapshot = TextSessionState;
     using Restore = tyloi::state::SessionRestore;
     using StateError = CudaSessionStateError;
 
     static TextSessionState decode(
-        const std::vector<CudaPagedPayload>& payloads,
+        const std::vector<SessionBlockPayload>& payloads,
         const std::vector<std::int64_t>& tokens,
         std::size_t block_size);
-    static CudaPagedPayload encode(
+    static SessionBlockPayload encode(
         const Snapshot& state, std::size_t block_size, std::size_t index);
     static bool paged_mtp(const Snapshot& state);
     static bool partial_blocks(const Snapshot& state);
     static bool paged_media(const Snapshot& state);
     static bool checkpoint_needs_update(
-        const CudaPagedPayload& payload, const Snapshot& state);
+        const SessionBlockPayload& payload, const Snapshot& state);
     static std::size_t decodable_blocks(
-        const std::vector<CudaPagedPayload>& payloads);
-    static std::size_t token_count(const CudaPagedPayload& payload);
+        const std::vector<SessionBlockPayload>& payloads);
+    static std::size_t token_count(const SessionBlockPayload& payload);
     static void release_host_cache();
 
     template <class State, class Predictor>
@@ -71,7 +69,7 @@ struct CudaSessionOps {
     static tyloi::Tensor restore(
         State& state, const Snapshot& snapshot, Predictor* mtp,
         const std::function<void()>& drain) {
-        // The caller owns the CUDA scope for the entire restore operation.
+        // The caller owns the execution scope for the entire restore operation.
         if constexpr (requires { restore_session(state, mtp, snapshot, drain); }) {
             restore_session(state, mtp, snapshot, drain);
         } else {
@@ -109,16 +107,18 @@ struct CudaSessionOps {
 };
 
 std::shared_ptr<tyloi::cache::PagedPrefixCache>
-make_cuda_paged_prefix_cache(
+make_paged_prefix_cache(
     const tyloi::ModelSource& source,
     std::int64_t max_position_embeddings,
     bool supports_paged_text_session_state,
-    const tyloi::engine::PrefixCacheConfig& config);
+    const tyloi::engine::PrefixCacheConfig& config,
+    tyloi::Device device, bool separate_memory, std::string_view kv_fingerprint);
 
 std::unique_ptr<tyloi::state::Sessions> make_sessions(
     const tyloi::ModelSource& source,
     const tyloi::engine::SessionCacheConfig& session_config,
     const tyloi::engine::PrefixCacheConfig& prefix_config,
-    std::int64_t maximum_context, bool supported, bool paged);
+    std::int64_t maximum_context, bool supported, bool paged,
+    tyloi::Device device, bool separate_memory, std::string_view kv_fingerprint);
 
-} // namespace tyloi::cuda::internal
+} // namespace tyloi::models

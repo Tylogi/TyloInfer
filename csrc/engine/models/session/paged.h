@@ -16,10 +16,10 @@ public:
     using std::runtime_error::runtime_error;
 };
 
-using CudaPagedPayload =
+using SessionBlockPayload =
     std::shared_ptr<const std::vector<uint8_t>>;
 
-class CudaPagedWriter {
+class SessionBlockWriter {
 public:
     template <typename T>
     void scalar(T value) {
@@ -34,15 +34,16 @@ public:
     void raw(const void* data, size_t size);
     /** Append tensor metadata and host bytes, preserving a decoded tensor's original device. */
     void tensor(const ::tyloi::Tensor& source, int original_device = -1);
-    CudaPagedPayload finish() &&;
+    void tensor(const ::tyloi::Tensor& source, ::tyloi::Device original_device);
+    SessionBlockPayload finish() &&;
 
 private:
     std::vector<uint8_t> bytes_;
 };
 
-class CudaPagedReader {
+class SessionBlockReader {
 public:
-    explicit CudaPagedReader(const std::vector<uint8_t>& bytes)
+    explicit SessionBlockReader(const std::vector<uint8_t>& bytes)
         : cursor_(bytes.data()), end_(bytes.data() + bytes.size()) {}
 
     template <typename T>
@@ -61,8 +62,9 @@ public:
     }
 
     void raw(void* destination, size_t size, const char* name);
-    /** Read a host tensor and its original CUDA device index. */
+    /** Read a host tensor and its original accelerator index. */
     std::pair<::tyloi::Tensor, int> tensor();
+    ::tyloi::Device tensor_device() const noexcept { return tensor_device_; }
     void expect_end() const;
 
 private:
@@ -70,4 +72,5 @@ private:
 
     const uint8_t* cursor_;
     const uint8_t* end_;
+    ::tyloi::Device tensor_device_{::tyloi::DeviceType::cpu, 0};
 };

@@ -1,5 +1,10 @@
 #pragma once
 
+#include <memory>
+#include <vector>
+
+namespace tyloi { struct TensorStorage; }
+
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -27,6 +32,7 @@ struct Fp8SqDescriptor {
 // dispatches separate Metal kernel entry points for the two scale families.
 class MlxFp8SqWeight {
 public:
+    std::vector<std::shared_ptr<tyloi::TensorStorage>> backings() const;
     static MlxFp8SqWeight from_blob(
         std::string_view dtype,
         const std::vector<std::uint8_t>& blob);

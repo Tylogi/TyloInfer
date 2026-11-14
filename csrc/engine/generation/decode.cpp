@@ -3,6 +3,7 @@
 #include "engine/budget.h"
 
 #include <algorithm>
+#include <array>
 #include <exception>
 #include <stdexcept>
 #include <utility>
@@ -72,6 +73,11 @@ std::optional<models::Decoded> run_decode(StepSequence<models::Decoded> job,
         }
         if (observed && require_result && !result)
             throw std::logic_error("decode job ended without a result");
+        if (result) {
+            executor.submit(state.storage());
+            const std::array<Tensor, 5> outputs{result->hidden, result->raw, result->logits, result->compact, result->ids};
+            executor.submit(outputs);
+        }
         capture.finish(); work->finish(); job = {};
         return result;
     } catch (...) {

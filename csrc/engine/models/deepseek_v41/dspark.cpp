@@ -412,7 +412,7 @@ struct DeepseekV41Dspark final : tyloi::models::Mtp {
             std::vector<::tyloi::Tensor> rings;
 
             Candidate(const DeepseekV41Dspark& model, DsState& state, const MtpSessionState& snapshot)
-                : model(model), state(state), saved(snapshot), rings(state.rings) {
+                : model(model), state(state), saved(snapshot) {
                 const auto* payload = std::get_if<tyloi::models::deepseek_v41::MtpSnapshot>(&saved.payload);
                 const auto* hidden = saved.last_target_hidden.representation<DenseTensor>();
                 const auto width = model.config.hidden * std::int64_t(model.config.dspark_target_layer_ids.size());
@@ -450,6 +450,11 @@ struct DeepseekV41Dspark final : tyloi::models::Mtp {
                         rings[i] = tyloi::ops::empty(source[i].dense().sizes(), source[i].options());
                     tyloi::ops::copy_into(rings[i], source[i]);
                 }
+            }
+            std::vector<::tyloi::Tensor> storage() const override {
+                auto result = rings;
+                if (saved.last_target_hidden) result.push_back(saved.last_target_hidden);
+                return result;
             }
             void publish() noexcept override {
                 state.rings.swap(rings);

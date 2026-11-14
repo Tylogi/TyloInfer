@@ -22,10 +22,10 @@ struct QsaPrefixRangeReader {
 // second pass releases snapshot RAM only when its encoding matches that file.
 bool reuse_ram_qsa_page(QsaTqSession&,size_t start,size_t count,
     const std::shared_ptr<const cache::PagedPrefixReadLease>&,bool release_readers);
-void write_ram_qsa_page(CudaPagedWriter&,const QsaTqSession&,size_t,size_t,bool);
+void write_ram_qsa_page(SessionBlockWriter&,const QsaTqSession&,size_t,size_t,bool);
 // A file lease keeps only the referenced extent alive. Without one, the
 // standalone codec owns the compressed bytes copied from this single page.
-void read_ram_qsa_page(CudaPagedReader&,const CudaPagedPayload&,
+void read_ram_qsa_page(SessionBlockReader&,const SessionBlockPayload&,
     const std::shared_ptr<const cache::PagedPrefixReadLease>&,
     size_t,size_t,bool,std::shared_ptr<QsaTqSession>&,bool bind_existing=false);
 } // namespace tyloi::cuda::internal

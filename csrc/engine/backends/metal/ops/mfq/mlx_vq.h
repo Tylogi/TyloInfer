@@ -1,5 +1,10 @@
 #pragma once
 
+#include <memory>
+#include <vector>
+
+namespace tyloi { struct TensorStorage; }
+
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -98,6 +103,7 @@ VqTensorMetadata inspect_vq_blob(
 // stored alongside their tensor payload in a MFE v2 pool.
 class MlxVqWeight {
 public:
+    std::vector<std::shared_ptr<tyloi::TensorStorage>> backings() const;
     static MlxVqWeight from_blob(
         std::string_view dtype,
         std::span<const std::uint8_t> blob,

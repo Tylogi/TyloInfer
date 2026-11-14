@@ -1,0 +1,438 @@
+#include "engine/models/plan.h"
+#include "engine/backends/cuda/load.h"
+#include "engine/program.h"
+#include "engine/ops.h"
+#include "engine/models/load.h"
+#include "engine/models/load_internal.h"
+#include "engine/models/deepseek_v41/vision.h"
+#include "engine/models/qwen35/model.h"
+#include "engine/models/qwen35/state.h"
+#include "engine/models/minicpmo45/forward.h"
+#include "engine/models/minicpmo45/text/model.h"
+#include "engine/models/minicpmo45/text/state.h"
+#include "engine/models/glm_dsa/model.h"
+#include "engine/models/glm_dsa/state.h"
+#include "engine/models/deepseek_v4/forward.h"
+#include "engine/models/glm5_next/forward.h"
+#include "engine/models/nemotron_h/forward.h"
+#include "engine/models/source/model_graph.h"
+#include "engine/instance_impl.h"
+#include "engine/drain.h"
+#include "engine/models/causal_model.h"
+#include "engine/models/source/model_config.h"
+#include "engine/models/session/cache.h"
+#include "engine/models/input.h"
+#include "engine/requests/processor.h"
+#include "engine/state/session/sessions.h"
+
+#include "engine/backends/cuda/native/env.h"
+#include "engine/backends/cuda/native/collectives.h"
+#include "engine/backends/cuda/executor/executor.h"
+#include "engine/backends/cuda/executor/options.h"
+#include "engine/backends/cuda/kernels/mfq_cuda_kv_quantization.h"
+#include "engine/weights/cache.h"
+#include "engine/state/kv_memory.h"
+#include "engine/backends/cuda/native/profile.h"
+#include "engine/backends/cuda/native/tensor/backend.h"
+#include "engine/weights/moe/profile.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <iostream>
+#include <limits>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <typeinfo>
+#include <utility>
+#include <variant>
+#include <vector>
+
+namespace tyloi::cuda::engine_detail {
+
+using State = std::variant<
+    std::unique_ptr<Text<::tyloi::models::qwen35::Model, ::tyloi::models::qwen35::State, qwen35::Components>>,
+    std::unique_ptr<Text<minicpmo45::text::Model, minicpmo45::text::State, std::unique_ptr<minicpmo45::Components>>>,
+    std::unique_ptr<Text<minicpmo45::Model, minicpmo45::State, std::monostate>>,
+    std::unique_ptr<Text<glm_dsa::Model, glm_dsa::State, std::monostate>>,
+    std::unique_ptr<Text<glm5_next::Model, glm5_next::State, std::unique_ptr<tyloi::models::Mtp>>>,
+    std::unique_ptr<Text<deepseek_v4::Model, deepseek_v4::State, std::monostate>>,
+    std::unique_ptr<Text<deepseek_v41::Model, deepseek_v41::State, std::unique_ptr<tyloi::models::Mtp>>>,
+    std::unique_ptr<Text<nemotron_h::Model, nemotron_h::State, nemotron_h::Components>>>;
+
+} // namespace tyloi::cuda::engine_detail
+
+namespace tyloi::cuda {
+
+namespace {
+
+std::unique_ptr<engine::Engine> load_native_engine(tyloi::engine::EngineOptions options, engine::Engine* target);
+
+} // namespace
+
+std::unique_ptr<engine::Engine> load(tyloi::engine::EngineOptions options) {
+    auto source = tyloi::open_model_source(options.model_path);
+    const auto backbone = ::tyloi::models::backbone(tyloi::models::graph(*source).backbone);
+    source.reset();
+    if (backbone == ::tyloi::models::Backbone::gemma4 || backbone == ::tyloi::models::Backbone::qwen4_exp) {
+        return load_native_engine(std::move(options), nullptr);
+    }
+    return std::make_unique<engine_detail::EngineInstance<
+        engine_detail::State, with_model<>>>(std::move(options));
+}
+
+void reload(engine::Engine& engine, tyloi::engine::EngineOptions options) {
+    if (auto* target = dynamic_cast<engine_detail::EngineInstance<engine_detail::State, with_model<>>*>(&engine)) {
+        target->options = std::move(options);
+        target->load();
+        return;
+    }
+    if (typeid(engine) == typeid(tyloi::engine::Engine)) {
+        load_native_engine(std::move(options), &engine);
+        return;
+    }
+    throw std::invalid_argument("unsupported CUDA engine for reload");
+}
+
+namespace {
+std::unique_ptr<engine::Engine> load_native_engine(tyloi::engine::EngineOptions options, engine::Engine* target) {
+    std::shared_ptr<const ModelSource> source;
+    std::shared_ptr<tyloi::weights::Memory> ledger;
+    auto weights = std::make_unique<tyloi::weights::Cache>();
+    std::shared_ptr<KvMemoryManager> kv;
+    std::shared_ptr<KvOffloadStore> offload;
+    CudaLoadConfig load;
+    tyloi::engine::Config config;
+    std::unique_ptr<Executor> root;
+    std::unique_ptr<tyloi::Executor> execution;
+    std::unique_ptr<tyloi::Executor> predictor_execution;
+    std::unique_ptr<models::CausalModel> model;
+    std::unique_ptr<models::State> state;
+    std::unique_ptr<tyloi::state::Sessions> sessions;
+    std::unique_ptr<tyloi::Executor::Graph> graph;
+    try {
+        const bool dump_env = env_flag("TYLOINFER_CUDA_ENV_DUMP", false);
+        env_freeze();
+        if (dump_env) std::cerr << "cuda knobs at load:\n" << env_dump();
+        if (!options.context_size) options.context_size = 32768;
+        auto [execution_config, numeric_options] = load_cuda_execution_config();
+        load = std::move(execution_config);
+        root = std::make_unique<Executor>(std::move(numeric_options), 0);
+        {
+            auto outer_scope = root->enter(load.layer_placement.primary_device());
+            internal::setup_cuda_load(options, load, *root, *weights, kv, offload);
+            root->set_primary(load.layer_placement.primary_device());
+            root->profiler().enabled = false;
+            ledger = std::make_shared<tyloi::weights::Memory>();
+            tyloi::weights::LoadScope memory_load(*ledger);
+            config = internal::resolve_cuda_config(options);
+            config.preallocate_kv = ::tyloi::cuda::options::kv_vram_preallocated();
+            internal::configure_model_kv(kv, offload);
+            root->configure_kv(kv, offload);
+            {
+                auto scope = root->enter(load.layer_placement.primary_device());
+                source = tyloi::open_model_source(options.model_path);
+                internal::load_model(model, options, load, *root, *weights, source, true);
+                load.dense_cpu_layer_count = load.n_gpu_layers >= 0
+                    ? static_cast<int>(std::max<std::int64_t>(models::graph(*source).topology.text_layers - load.n_gpu_layers, 0)) : 0;
+                if (offload && !model->info().streamed_kv)
+                    throw std::invalid_argument("CUDA streamed KV requires a QSA model");
+                if (model->predictor())
+                    predictor_execution = root->fork(load.layer_placement.primary_device());
+                state = model->make_state();
+                finalize_kv(kv.get(), *weights, offload);
+                root->configure_kv(kv, offload);
+                std::size_t pending_kv = 0;
+                if (config.preallocate_kv) {
+                    const Device primary(kCUDA, load.layer_placement.primary_device());
+                    for (const auto& [device, bytes] : state->preallocate_growth()) {
+                        if (device != primary) continue;
+                        if (pending_kv > std::numeric_limits<std::size_t>::max() - bytes)
+                            throw std::overflow_error("pending KV reserve overflow");
+                        pending_kv += bytes;
+                    }
+                }
+                finish_load(kv.get(), *weights, load.report_cuda_memory, pending_kv);
+                if (offload && !model->info().streamed_kv)
+                    throw std::invalid_argument("CUDA streamed KV requires a QSA model");
+            }
+            graph = root->graph();
+            sessions = models::make_sessions(*source, config.session_cache, config.prefix_cache,
+                model->info().max_context, state->supports_text_session_state(),
+                state->supports_paged_text_session_state(),
+                Device(kCUDA, load.layer_placement.primary_device()),
+                internal::cuda_has_separate_memory(), cuda_kv_quantization_tag());
+        }
+        root->mode().ffn.independent |= model->info().separate_projections;
+        const auto mode = root->forward_mode(load.layer_placement.primary_device());
+        config.device = Device(kCUDA, load.layer_placement.primary_device());
+        config.devices = cuda_devices(load);
+        config.online_budget = load.layer_placement.devices.size() <= 1 &&
+            !load.tensor_parallel.enabled() && !load.expert_parallel.enabled();
+        internal::configure_generation(config, load, *root, *weights, model->info());
+        const auto model_info = model->info();
+        const auto vocab_size = static_cast<std::int32_t>(model_info.vocab_size);
+        auto text = engine::TextProcessor::load(*source, options.tokenizer_model, vocab_size, model_info.model_type);
+        config.stop_token_ids = models::stop_token_ids(models::config_json(*source, options.config_path), vocab_size);
+        config.resident_budget_bytes = ::tyloi::cuda::options::resident_budget_bytes();
+        models::ForwardOptions forward{mode.kv_capacity, mode.trace, mode.trace_layer, mode.primary, mode.ffn.batch_serial};
+        // The root executor owns KV before Engine takes over, including failed installation.
+        offload.reset();
+        kv.reset();
+        execution = std::move(root);
+        if (target) {
+            target->rebind(std::move(model), std::move(execution), std::move(config), std::move(source),
+                std::move(ledger), std::move(weights), std::move(state), std::move(sessions),
+                std::move(text), forward, std::move(graph), {}, std::move(predictor_execution));
+            return {};
+        }
+        return std::make_unique<engine::Engine>(std::move(model), std::move(execution), std::move(config),
+            std::move(source), std::move(ledger), std::move(weights), std::move(state),
+            std::move(sessions), std::move(text), forward, std::move(graph),
+            std::unique_ptr<engine::Batch>{}, std::move(predictor_execution));
+    } catch (...) {
+        const auto failure = std::current_exception();
+        auto* owner = execution ? execution.get() : root.get();
+        if (owner) {
+            try {
+                auto scope = owner->enter();
+                std::exception_ptr cleanup;
+                const auto finish = [&](auto&& work) {
+                    try { work(); } catch (...) { if (!cleanup) cleanup = std::current_exception(); }
+                };
+                if (graph) graph->invalidate();
+                finish([&] { if (weights) weights->drain(); });
+                finish([&] {
+                    if (predictor_execution) {
+                        auto predictor_scope = predictor_execution->enter();
+                        predictor_execution->drain();
+                    }
+                });
+                finish([&] { owner->drain(); });
+                if (cleanup) std::rethrow_exception(cleanup);
+                if (weights) weights->release_workspace();
+                owner->drain();
+                graph.reset();
+                state.reset(); sessions.reset();
+                if (weights) weights->clear_workspace();
+                model.reset(); offload.reset(); kv.reset();
+                if (predictor_execution) {
+                    auto predictor_scope = predictor_execution->enter();
+                    predictor_execution->clear();
+                }
+                predictor_execution.reset();
+                owner->clear();
+                weights.reset();
+            } catch (const std::exception& error) {
+                std::cerr << "runtime_load_cleanup error=" << error.what() << std::endl;
+                std::terminate();
+            } catch (...) {
+                std::cerr << "runtime_load_cleanup error=unknown" << std::endl;
+                std::terminate();
+            }
+            execution.reset();
+            root.reset();
+        }
+        std::rethrow_exception(failure);
+    }
+}
+} // namespace
+
+} // namespace tyloi::cuda
+
+namespace tyloi::cuda::internal {
+bool cuda_has_separate_memory() {
+    cudaDeviceProp properties{};
+    TYLOINFER_CUDA_CHECK(cudaGetDeviceProperties(&properties, mfq_current_cuda_device()));
+    return !properties.integrated && std::strstr(properties.name, "GB10") == nullptr;
+}
+
+using tyloi::engine::environment_uint64;
+using tyloi::engine::environment_enabled;
+namespace {
+
+std::int32_t graph_minimum(const char* name) {
+    const auto value = std::max<std::uint64_t>(
+        2, environment_uint64(name, 16));
+    if (value > static_cast<std::uint64_t>(
+            std::numeric_limits<std::int32_t>::max())) {
+        throw std::runtime_error(std::string(name) + " exceeds int32");
+    }
+    return static_cast<std::int32_t>(value);
+}
+
+} // namespace
+
+tyloi::engine::Config resolve_cuda_config(
+        const tyloi::engine::EngineOptions& options) {
+    const auto* profile_decode = env_lookup("TYLOINFER_PROFILE_DECODE");
+    const bool profile_decode_enabled = profile_decode && profile_decode[0] == '1';
+    const auto* profile_mtp = env_lookup("TYLOINFER_PROFILE_MTP");
+    const auto* trace_moe = env_lookup("TYLOINFER_TRACE_MOE_SUMMARY");
+    const bool trace_moe_enabled = trace_moe && trace_moe[0] && trace_moe[0] != '0';
+    if(options.prefill_chunk_size < 0 || options.prefill_chunk_size > 8192)
+        throw std::invalid_argument("prefill chunk size must be Auto (0) or in [1, 8192]");
+    const bool prefill_chunk_auto = options.prefill_chunk_size == 0;
+    const auto chunk_limit = prefill_chunk_auto ? int64_t(8192) : options.prefill_chunk_size;
+    auto config = tyloi::engine::resolve_config(chunk_limit);
+    config.prefill_chunk_auto = prefill_chunk_auto;
+    config.profile_decode = profile_decode_enabled;
+    config.profile_mtp = profile_mtp && profile_mtp[0] == '1';
+    config.trace_moe = trace_moe_enabled;
+    config.continuous_batch =
+        tyloi::engine::resolve_batch_config(options.continuous_batching, chunk_limit);
+    config.decode_graph.enabled = environment_enabled(
+        "TYLOINFER_RUNTIME_CUDA_GRAPH", true);
+    config.decode_graph.trace = environment_enabled(
+        "TYLOINFER_RUNTIME_TRACE_CUDA_GRAPH", false);
+    config.decode_graph.minimum_generation_tokens = graph_minimum(
+        "TYLOINFER_RUNTIME_CUDA_GRAPH_MIN_TOKENS");
+
+    config.continuous_batch.greedy = environment_enabled(
+        "TYLOINFER_CONTINUOUS_BATCH_GREEDY", true);
+    config.continuous_batch.cuda_graph =
+        config.decode_graph.enabled && environment_enabled(
+            "TYLOINFER_CONTINUOUS_BATCH_CUDA_GRAPH", true);
+    config.continuous_batch.paged_kv = environment_enabled(
+        "TYLOINFER_CONTINUOUS_PAGED_KV", true);
+    config.continuous_batch.cuda_graph_minimum_tokens = graph_minimum(
+        "TYLOINFER_CONTINUOUS_BATCH_CUDA_GRAPH_MIN_TOKENS");
+    return config;
+}
+
+void setup_cuda_load(
+        const tyloi::engine::LoadOptions& options,
+        CudaLoadConfig& config, Executor& executor, tyloi::weights::Cache& weights,
+        std::shared_ptr<KvMemoryManager>& kv, std::shared_ptr<KvOffloadStore>& offload) {
+    drain_cuda(executor, weights, offload.get(),
+               config.layer_placement, config.tensor_parallel, config.expert_parallel);
+    executor.reset();
+    config.tensor_parallel = {};
+    config.expert_parallel = {};
+    config.layer_placement = {};
+    config.dsv4_cpu_offload_layers.clear();
+    config.dsv4_cpu_offload_host_bytes = 0;
+    config.n_gpu_layers = -1;
+    config.dense_cpu_layer_count = 0;
+    config.drop_file_cache = false;
+    config.weights.min_slots = 8;
+    offload.reset();
+    kv.reset();
+    executor.configure_kv({}, {});
+    weights.begin_load();
+    if (options.n_gpu_layers_set) config.n_gpu_layers = options.n_gpu_layers;
+    if (options.cpu_threads_set && options.cpu_threads <= 0) {
+        throw std::runtime_error("--threads must be positive");
+    }
+    if (options.cpu_threads > 0) {
+        mfq_set_num_threads(options.cpu_threads);
+    }
+    config.yarn_context_extension=options.yarn_context_extension;
+    config.tensor_parallel = options.tensor_parallel;
+    config.expert_parallel = options.expert_parallel;
+    config.layer_placement = options.layer_placement;
+    if (options.device.index < 0) throw std::invalid_argument("CUDA device index must be non-negative");
+    if (config.layer_placement.devices.empty() && options.device.index != 0)
+        config.layer_placement.devices.push_back(options.device.index);
+    configure_placement(config, executor.collectives());
+    executor.set_primary(model_parallel_primary_device(config));
+    if (!options.cpu_offload_layers.empty()) {
+        config.dsv4_cpu_offload_layers = options.cpu_offload_layers;
+        std::vector<int> ordered(
+            config.dsv4_cpu_offload_layers.begin(),
+            config.dsv4_cpu_offload_layers.end());
+        std::sort(ordered.begin(), ordered.end());
+        if (ordered.front() < 0)
+            throw std::runtime_error("--cpu-offload-layers must be non-negative");
+        std::cerr << "cpu_offload_layers=";
+        for (size_t index = 0; index < ordered.size(); ++index) {
+            if (index) std::cerr << ',';
+            std::cerr << ordered[index];
+        }
+        std::cerr << std::endl;
+    }
+    if (options.n_gpu_layers_set && config.n_gpu_layers < 0) {
+        throw std::runtime_error("--n-gpu-layers must be non-negative");
+    }
+    if (options.n_gpu_layers_set && !options.cpu_offload_layers.empty()) {
+        throw std::runtime_error(
+            "--n-gpu-layers cannot be combined with --cpu-offload-layers");
+    }
+    if (options.moe_gpu_cache_gb < 0.0 ||
+            !std::isfinite(options.moe_gpu_cache_gb)) {
+        throw std::runtime_error(
+            "--moe-gpu-cache-gb must be finite and non-negative");
+    }
+    if (options.moe_gpu_cache_gb > 0.0 &&
+            !options.cpu_offload_layers.empty()) {
+        throw std::runtime_error(
+            "--moe-gpu-cache-gb cannot be combined with "
+            "--cpu-offload-layers");
+    }
+    if (options.moe_gpu_cache_gb > 0.0 &&
+            (config.tensor_parallel.enabled() ||
+             config.expert_parallel.enabled())) {
+        throw std::runtime_error(
+            "--moe-gpu-cache-gb cannot be combined with "
+            "tensor/expert parallelism");
+    }
+    const auto* auto_profile=tyloi::cuda::env_lookup("TYLOINFER_MOE_AUTO_CACHE_PROFILE");
+    const auto profile_path=tyloi::resolve_moe_cache_profile_path(options.moe_cache_profile_path,
+        options.moe_gpu_cache_gb>0.0?options.model_path:std::string{},!auto_profile || auto_profile[0]!='0');
+    if (!profile_path.empty() &&
+            options.moe_gpu_cache_gb <= 0.0) {
+        throw std::runtime_error(
+            "--moe-cache-profile requires --moe-gpu-cache-gb");
+    }
+    if (options.moe_gpu_cache_gb > 0.0) {
+        constexpr double gib =
+            1024.0 * 1024.0 * 1024.0;
+        const double bytes = options.moe_gpu_cache_gb * gib;
+        if (bytes < 1.0 ||
+                bytes >
+                    static_cast<double>(
+                        std::numeric_limits<int64_t>::max())) {
+            throw std::runtime_error(
+                "--moe-gpu-cache-gb is outside the supported range");
+        }
+        weights.configure(static_cast<std::size_t>(bytes), config.cache, config.weights.preload, profile_path);
+        if (!profile_path.empty() && !weights.empty()) {
+            std::cerr<<"moe_cache_profile source="<<(options.moe_cache_profile_path.empty()?"sidecar":"explicit")
+                <<" path="<<profile_path<<std::endl;
+        }
+        config.drop_file_cache = true;
+    }
+}
+
+} // namespace tyloi::cuda::internal
+
+namespace tyloi::cuda {
+
+void finalize_kv(KvMemoryManager* kv, tyloi::weights::Cache& weights,
+        std::shared_ptr<KvOffloadStore>& offload) {
+    if (kv) {
+        kv->finalize(weights, weights.minimum());
+        weights.commit_kv();
+        if (auto store = kv->offload()) offload = std::move(store);
+    }
+}
+
+std::chrono::steady_clock::time_point finish_load(
+        KvMemoryManager* kv, tyloi::weights::Cache& weights, bool report_memory,
+        std::size_t pending_kv) {
+    if (weights.needs_finalize()) {
+        const auto reserve = kv ? kv->growth_reserve() : 0;
+        if (reserve > std::numeric_limits<std::size_t>::max() - pending_kv)
+            throw std::overflow_error("KV reserve overflow");
+        weights.finalize(
+            reserve + pending_kv,
+            kv ? kv->expert_budget_charge() : 0);
+    }
+    mfq_cuda_synchronize();
+    const auto loaded = std::chrono::steady_clock::now();
+    report_cuda_memory(report_memory, "loaded");
+    return loaded;
+}
+
+} // namespace tyloi::cuda

@@ -79,14 +79,9 @@ add_subdirectory(${PROJECT_SOURCE_DIR}/engine/models ${CMAKE_CURRENT_BINARY_DIR}
 set(TYLOINFER_CUDA_ENGINE_SOURCES
     ${PROJECT_SOURCE_DIR}/engine/generation/cuda.cpp
     ${PROJECT_SOURCE_DIR}/engine/generation/mtp/cuda.cpp
-    ${PROJECT_SOURCE_DIR}/engine/models/session/cache.cpp
-    ${PROJECT_SOURCE_DIR}/engine/models/session/paged.cpp
-    ${PROJECT_SOURCE_DIR}/engine/models/session/state.cpp
-    ${PROJECT_SOURCE_DIR}/engine/models/session/codec.cpp
-    ${PROJECT_SOURCE_DIR}/engine/models/deepseek_v41/session_codec.cpp
-    ${PROJECT_SOURCE_DIR}/engine/models/qwen4_exp/session_codec.cpp
     ${PROJECT_SOURCE_DIR}/engine/models/minicpmo45/components.cpp
     ${PROJECT_SOURCE_DIR}/engine/load.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/load.cpp
     ${PROJECT_SOURCE_DIR}/engine/program.cpp
     ${TYLOINFER_CUDA_MODEL_SOURCES}
 )
@@ -107,7 +102,7 @@ target_link_libraries(mfq-cuda-engine PRIVATE
     mfq-cuda-native-kernels
     mfq-cuda-storage
 )
-target_compile_definitions(mfq-cuda-engine PRIVATE NOMINMAX)
+target_compile_definitions(mfq-cuda-engine PRIVATE NOMINMAX TYLOINFER_HAS_CUDA=1 TYLOINFER_HAS_METAL=0)
 if(MSVC)
     foreach(target mfq-cuda-ops mfq-cuda-execution mfq-cuda-loading mfq-cuda-models mfq-cuda-engine)
         target_compile_options(${target} PRIVATE

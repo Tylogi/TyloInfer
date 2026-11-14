@@ -6,9 +6,9 @@ struct TextSessionState;
 
 namespace tyloi::models::qwen4_exp {
 
-CudaPagedPayload encode_block(const TextSessionState&, std::size_t, std::size_t);
-TextSessionState decode_session(const std::vector<CudaPagedPayload>&,
+SessionBlockPayload encode_block(const TextSessionState&, std::size_t, std::size_t);
+TextSessionState decode_session(const std::vector<SessionBlockPayload>&,
                                 const std::vector<int64_t>&, std::size_t);
-bool exact(const CudaPagedPayload&);
+bool exact(const SessionBlockPayload&);
 
 } // namespace tyloi::models::qwen4_exp

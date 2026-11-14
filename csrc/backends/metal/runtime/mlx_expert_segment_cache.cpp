@@ -1,15 +1,17 @@
 #include "mlx_expert_segment_cache.h"
-#include "mfq_container.h"
+#include "mlx_expert_segment_cache_internal.h"
 #include "mlx_resource_telemetry.h"
 #include "engine/backends/metal/native/pool.h"
 #include "engine/backends/metal/native/resident_allocations.h"
 #include "engine/backends/metal/native/allocation.h"
+#include "engine/backends/metal/native/tensor/tensor.h"
 #include "engine/backends/cpu/native/host_parallel.h"
 #include "engine/weights/lru.h"
 #include "engine/weights/source/source.h"
 #include "engine/weights/source/read.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <future>
 #include <list>
@@ -24,27 +26,22 @@ namespace {
 using namespace mlx::core;
 using Clock = std::chrono::steady_clock;
 }
-struct MlxExpertSegmentCache::Plan::Impl {
-    struct Reader {
-        std::uint64_t extent;
-        std::function<void(std::uint64_t, std::span<const std::span<std::byte>>)> read;
-    };
-    struct Layer {
-        tyloi::weights::Segments source;
-        tyloi::weights::SegmentLayout layout;
-        std::vector<array> tables;
-        Layer(tyloi::weights::Segments definition, std::span<const std::size_t> extents, std::size_t page)
-            : source(std::move(definition)), layout(source, extents, page) {}
-    };
-    std::unordered_map<std::string, Reader> readers;
-    std::vector<Layer> layers;
-    std::size_t backing = 0, maximum_entry = 0, capacity = 0;
-    long double total_entry_bytes = 0, maximum_layer_bytes = 0;
-};
 
-namespace {
+
 using SegmentPlan = MlxExpertSegmentCache::Plan::Impl;
-std::unique_ptr<SegmentPlan> make_plan(std::vector<tyloi::weights::Segments> definitions,
+std::size_t segment_metadata_reservation(std::size_t bytes) {
+    const auto page = std::size_t(getpagesize());
+    if (!bytes || bytes > SIZE_MAX - (page - 1)) throw std::overflow_error("expert metadata extent is too large");
+    // MLX rounds requests above a page, then may reuse a cached buffer shorter
+    // than min(2 * request, request + 2 * page). Reserve the aligned bound.
+    const auto request = bytes > page ? (bytes + page - 1) / page * page : bytes;
+    const auto doubled = request > SIZE_MAX / 2 ? SIZE_MAX : request * 2;
+    const auto with_pages = request > SIZE_MAX - 2 * page ? SIZE_MAX : request + 2 * page;
+    const auto bound = std::min(doubled, with_pages);
+    if (bound > SIZE_MAX - (page - 1)) throw std::overflow_error("expert metadata extent is too large");
+    return (bound + page - 1) / page * page;
+}
+std::unique_ptr<SegmentPlan> segment_make_plan(std::vector<tyloi::weights::Segments> definitions,
         const std::function<SegmentPlan::Reader(const std::string&)>& open) {
     if (definitions.empty()) throw std::invalid_argument("expert segment cache requires layers");
     auto plan = std::make_unique<SegmentPlan>();
@@ -61,6 +58,10 @@ std::unique_ptr<SegmentPlan> make_plan(std::vector<tyloi::weights::Segments> def
             if (found->second.extent > SIZE_MAX) throw std::overflow_error("expert tensor extent is too large");
             extents.push_back(static_cast<std::size_t>(found->second.extent));
         }
+        const auto table_bytes = segment_metadata_reservation(std::size_t(definition.experts) * sizeof(std::uint64_t));
+        if (definition.fields.size() > (SIZE_MAX - plan->table_reserve) / table_bytes)
+            throw std::overflow_error("expert metadata extent is too large");
+        plan->table_reserve += definition.fields.size() * table_bytes;
         SegmentPlan::Layer layer(std::move(definition), extents, page);
         if (layer.layout.backing() > SIZE_MAX - plan->backing)
             throw std::overflow_error("expert segment cache extent is too large");
@@ -79,9 +80,13 @@ std::unique_ptr<SegmentPlan> make_plan(std::vector<tyloi::weights::Segments> def
         plan->layers.push_back(std::move(layer));
     }
     plan->capacity = tyloi::metal::Pool::capacity_for(plan->capacity, plan->maximum_entry, entries);
+    plan->metadata_reserve = plan->table_reserve;
+    if (plan->capacity > SIZE_MAX - plan->metadata_reserve)
+        throw std::overflow_error("expert cache capacity is too large");
     return plan;
 }
 
+namespace {
 std::function<SegmentPlan::Reader(const std::string&)> source_reader(const tyloi::source::Source& source) {
     return [&source, serial = source.supports_parallel_tensor_reads() ? std::shared_ptr<std::mutex>{} : std::make_shared<std::mutex>()]
         (const std::string& name) {
@@ -122,7 +127,10 @@ struct MlxExpertSegmentCache::Impl {
     std::unordered_map<std::string, Reader> readers;
     std::vector<Layer> layers;
     std::vector<std::size_t> prefill_next_rows;
-    std::size_t budget, backing = 0, resident = 0, maximum_entry = 0, full_capacity = 0;
+    std::size_t budget, total_limit, metadata_reserve;
+    std::atomic<std::size_t> metadata_bytes{0};
+    std::size_t backing = 0, resident = 0, maximum_entry = 0, full_capacity = 0;
+    std::unordered_set<const void*> metadata_owners;
     int workers;
     bool prefill_read_ahead;
     tyloi::HostParallelPool io;
@@ -147,9 +155,26 @@ struct MlxExpertSegmentCache::Impl {
         if (pending) { pending->eval(); pending.reset(); }
     }
 
+    void record_metadata(const std::vector<std::shared_ptr<tyloi::TensorStorage>>& storage) {
+        auto owners = metadata_owners;
+        auto bytes = metadata_bytes.load(std::memory_order_relaxed);
+        for (const auto& item : storage) {
+            if (!item || !item->owner) continue;
+            if (owners.insert(item->owner.get()).second) {
+                if (item->bytes > metadata_reserve - bytes)
+                    throw std::runtime_error("expert metadata exceeds its admitted reservation");
+                bytes += item->bytes;
+            }
+        }
+        metadata_owners = std::move(owners);
+        metadata_bytes.store(bytes, std::memory_order_relaxed);
+        if (pool) resources.set({0, 0, pool->capacity() + bytes, backing, 0});
+    }
+
     Impl(std::unique_ptr<Plan::Impl> plan, std::size_t limit, int threads, bool read_ahead, bool reserve_capacity)
-        : readers(std::move(plan->readers)), layers(std::move(plan->layers)), budget(limit),
-          backing(plan->backing), maximum_entry(plan->maximum_entry), full_capacity(plan->capacity),
+        : readers(std::move(plan->readers)), layers(std::move(plan->layers)),
+          budget(limit >= plan->metadata_reserve ? limit - plan->metadata_reserve : 0),
+          total_limit(limit), metadata_reserve(plan->metadata_reserve), backing(plan->backing), maximum_entry(plan->maximum_entry), full_capacity(plan->capacity),
           workers(threads), prefill_read_ahead(read_ahead),
           total_entry_bytes(plan->total_entry_bytes), maximum_layer_bytes(plan->maximum_layer_bytes) {
         if (!budget || workers < 1 || layers.empty())
@@ -159,12 +184,16 @@ struct MlxExpertSegmentCache::Impl {
             const std::vector<std::uint64_t> empty(layer.source.experts, 0);
             for (std::size_t i = 0; i < layer.source.fields.size(); ++i) {
                 layer.tables.emplace_back(empty.begin(), Shape{layer.source.experts}, uint64);
+                layer.tables.back().eval();
                 tyloi::metal::AllocationScope::record(layer.tables.back());
+                record_metadata(tyloi::metal::backings(layer.tables.back()));
             }
         }
+        if (metadata_bytes > plan->table_reserve)
+            throw std::runtime_error("expert address tables exceed their admitted metadata reservation");
         prefill_next_rows.assign(layers.size(), SIZE_MAX);
         pool = std::make_unique<tyloi::metal::Pool>(budget, maximum_entry, reserve_capacity ? plan->capacity : 0);
-        resources.set({0, 0, 0, backing, 0});
+        resources.set({0, 0, metadata_bytes.load(std::memory_order_relaxed), backing, 0});
     }
 
     void end_prefill_priority() noexcept {
@@ -245,7 +274,7 @@ struct MlxExpertSegmentCache::Impl {
         while ((resident > budget || incoming > budget - resident) && evict_one(protected_keys)) {}
         if (resident > budget || incoming > budget - resident)
             throw std::runtime_error("expert cache budget cannot hold this batch");
-        resources.set({0, 0, pool->capacity(), backing, 0});
+        resources.set({0, 0, pool->capacity() + metadata_bytes.load(std::memory_order_relaxed), backing, 0});
     }
 
     void finish_prefetch(std::size_t layer_index = SIZE_MAX, std::span<const std::int32_t> selected = {}) {
@@ -312,7 +341,7 @@ struct MlxExpertSegmentCache::Impl {
                 const auto offset = pool->allocate(bytes);
                 if (!offset) {
                     for (const auto& item : state.entries) pool->release(item.second.offset, item.second.bytes);
-                    resources.set({0, 0, pool->capacity(), backing, 0});
+                    resources.set({0, 0, pool->capacity() + metadata_bytes.load(std::memory_order_relaxed), backing, 0});
                     return;
                 }
                 state.entries.push_back({key, Entry{*offset, bytes, {}}});
@@ -348,11 +377,11 @@ struct MlxExpertSegmentCache::Impl {
             for (const auto& item : state.entries) resident += item.second.bytes;
             prefetched.emplace(std::move(state));
             ++counters.overlapped_read_submissions;
-            resources.set({0, 0, pool->capacity(), backing, 0});
+            resources.set({0, 0, pool->capacity() + metadata_bytes.load(std::memory_order_relaxed), backing, 0});
         } catch (...) {
             if (state.read.valid()) state.read.wait();
             for (const auto& item : state.entries) pool->release(item.second.offset, item.second.bytes);
-            resources.set({0, 0, pool->capacity(), backing, 0});
+            resources.set({0, 0, pool->capacity() + metadata_bytes.load(std::memory_order_relaxed), backing, 0});
             throw;
         }
     }
@@ -372,7 +401,7 @@ struct MlxExpertSegmentCache::Impl {
                     [](const auto& item) { return item.second.offset != SIZE_MAX; })) synchronize();
                 for (const auto& item : pending) if (item.second.offset != SIZE_MAX)
                     cache.pool->release(item.second.offset, item.second.bytes);
-                cache.resources.set({0, 0, cache.pool->capacity(), cache.backing, 0});
+                cache.resources.set({0, 0, cache.pool->capacity() + cache.metadata_bytes.load(std::memory_order_relaxed), cache.backing, 0});
             }
         } cleanup{*this, pending, staged};
         std::unordered_set<std::uint64_t> protected_keys;
@@ -469,26 +498,26 @@ MlxExpertSegmentCache::Plan::Plan(std::unique_ptr<Impl> impl) : impl_(std::move(
 MlxExpertSegmentCache::Plan::Plan(Plan&&) noexcept = default;
 MlxExpertSegmentCache::Plan& MlxExpertSegmentCache::Plan::operator=(Plan&&) noexcept = default;
 MlxExpertSegmentCache::Plan::~Plan() = default;
-std::size_t MlxExpertSegmentCache::Plan::minimum() const noexcept { return impl_->maximum_entry; }
-std::size_t MlxExpertSegmentCache::Plan::capacity() const noexcept { return impl_->capacity; }
+std::size_t MlxExpertSegmentCache::Plan::minimum() const noexcept { return impl_->maximum_entry + impl_->metadata_reserve; }
+std::size_t MlxExpertSegmentCache::Plan::capacity() const noexcept { return impl_->capacity + impl_->metadata_reserve; }
+void MlxExpertSegmentCache::Plan::reserve_metadata(std::size_t bytes) {
+    if (bytes > SIZE_MAX - impl_->metadata_reserve || impl_->capacity > SIZE_MAX - impl_->metadata_reserve - bytes)
+        throw std::overflow_error("expert metadata extent is too large");
+    impl_->metadata_reserve += bytes;
+}
 
 MlxExpertSegmentCache::Plan MlxExpertSegmentCache::plan(
         const tyloi::source::Source& source, std::vector<tyloi::weights::Segments> layers) {
-    return Plan(make_plan(std::move(layers), source_reader(source)));
+    return Plan(segment_make_plan(std::move(layers), source_reader(source)));
 }
 MlxExpertSegmentCache::MlxExpertSegmentCache(Plan plan, std::size_t budget, int workers, bool read_ahead)
-    : impl_(std::make_shared<Impl>(std::move(plan.impl_), budget, workers, read_ahead, true)) {}
-MlxExpertSegmentCache::MlxExpertSegmentCache(const MfqContainer& model, std::vector<tyloi::weights::Segments> layers,
-    std::size_t budget, int workers, bool read_ahead)
-    : impl_(std::make_shared<Impl>(make_plan(std::move(layers),
-        [source = std::make_shared<MfqContainer>(model)](const std::string& name) {
-            return SegmentPlan::Reader{source->record(name).nbytes, [source, name](auto offset, auto targets) {
-                source->readv_range(name, offset, targets);
-            }};
-        }), budget, workers, read_ahead, false)) {}
+    : impl_(std::make_shared<Impl>(std::move(plan.impl_), budget, workers, read_ahead, plan.reserve_capacity_)) {}
 MlxExpertSegmentCache::MlxExpertSegmentCache(const tyloi::source::Source& source,
     std::vector<tyloi::weights::Segments> layers, std::size_t budget, int workers, bool read_ahead)
     : MlxExpertSegmentCache(plan(source, std::move(layers)), budget, workers, read_ahead) {}
+void MlxExpertSegmentCache::record_metadata(const std::vector<std::shared_ptr<tyloi::TensorStorage>>& storage) {
+    impl_->record_metadata(storage);
+}
 const std::vector<array>& MlxExpertSegmentCache::address_tables(std::size_t layer) const { return impl_->layers.at(layer).tables; }
 const std::shared_ptr<tyloi::metal::ResidentAllocations>& MlxExpertSegmentCache::residency() const noexcept { return impl_->pool->residency(); }
 void MlxExpertSegmentCache::preload() {
@@ -586,15 +615,22 @@ array MlxExpertSegmentCache::apply(std::size_t index, const array& ids, std::siz
     return output->dtype() == dtype ? *output : astype(*output, dtype);
 }
 
-std::size_t MlxExpertSegmentCache::limit_bytes() const noexcept { return impl_->budget; }
+std::size_t MlxExpertSegmentCache::limit_bytes() const noexcept { return impl_->total_limit; }
+void MlxExpertSegmentCache::drain() {
+    std::lock_guard lock(impl_->mutex);
+    impl_->wait_pending();
+    impl_->finish_prefetch();
+}
 std::size_t MlxExpertSegmentCache::backing_bytes() const noexcept { return impl_->backing; }
-std::size_t MlxExpertSegmentCache::resident_bytes() const noexcept { return impl_->pool->capacity(); }
+std::size_t MlxExpertSegmentCache::resident_bytes() const noexcept { return impl_->pool->capacity() + impl_->metadata_bytes; }
 std::size_t MlxExpertSegmentCache::set_limit(std::size_t bytes) {
     if (!bytes) throw std::invalid_argument("expert cache budget must be nonzero");
     std::lock_guard lock(impl_->mutex);
     impl_->wait_pending();
     impl_->finish_prefetch();
-    const auto before = impl_->pool->capacity(), target = bytes / std::size_t(getpagesize()) * std::size_t(getpagesize());
+    if (bytes < impl_->metadata_reserve) throw std::invalid_argument("expert cache budget cannot hold metadata");
+    const auto pool_budget = bytes - impl_->metadata_reserve;
+    const auto before = impl_->pool->capacity(), target = pool_budget / std::size_t(getpagesize()) * std::size_t(getpagesize());
     if (!target) throw std::invalid_argument("expert cache budget is smaller than a page");
     if (target < impl_->maximum_entry) throw std::invalid_argument("expert cache budget cannot hold one expert");
     impl_->end_prefill_priority();
@@ -603,17 +639,16 @@ std::size_t MlxExpertSegmentCache::set_limit(std::size_t bytes) {
         const auto& entry = current->second.value;
         if (entry.offset > target || entry.bytes > target - entry.offset) impl_->erase(current->first);
     }
-    impl_->pool->set_limit(bytes); impl_->budget = bytes; impl_->evict(0);
+    impl_->pool->set_limit(pool_budget); impl_->budget = pool_budget; impl_->total_limit = bytes; impl_->evict(0);
     return before - impl_->pool->capacity();
 }
 MlxSsdExpertCacheStats MlxExpertSegmentCache::stats() const {
     std::lock_guard lock(impl_->mutex);
     auto result = impl_->counters;
-    result.resident_experts = impl_->entries.entries().size(); result.resident_bytes = impl_->pool->capacity();
-    std::size_t payload = 0, metadata = 0;
+    result.resident_experts = impl_->entries.entries().size(); result.resident_bytes = impl_->pool->capacity() + impl_->metadata_bytes;
+    std::size_t payload = 0;
     for (const auto& [key, entry] : impl_->entries.entries()) payload += impl_->layers.at(std::size_t(key >> 32)).layout.payload_size(std::int32_t(key));
-    for (const auto& layer : impl_->layers) for (const auto& table : layer.tables) metadata += table.buffer_size();
-    result.cached_payload_bytes = payload; result.cache_metadata_bytes = metadata;
+    result.cached_payload_bytes = payload; result.cache_metadata_bytes = impl_->metadata_bytes;
     result.pinned_cache_bytes = impl_->pool->pinned_bytes();
     return result;
 }
@@ -625,6 +660,6 @@ void MlxExpertSegmentCache::clear() {
     impl_->entries.clear(); impl_->resident = 0;
     for (auto& layer : impl_->layers) for (auto& table : layer.tables)
         std::fill_n(table.data<std::uint64_t>(), layer.source.experts, std::uint64_t{0});
-    impl_->pool->clear(); impl_->resources.set({0, 0, 0, impl_->backing, 0});
+    impl_->pool->clear(); impl_->resources.set({0, 0, impl_->metadata_bytes.load(std::memory_order_relaxed), impl_->backing, 0});
 }
 } // namespace tyloi::metal

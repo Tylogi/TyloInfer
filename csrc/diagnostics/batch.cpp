@@ -136,7 +136,7 @@ std::shared_ptr<Output> submit(Engine& engine, std::string id, const std::vector
 }
 } // namespace
 
-int run_continuous_batching_check(CudaLoadOptions options, int requests) {
+int run_continuous_batching_check(tyloi::engine::LoadOptions options, int requests) {
     check(requests >= 2 && requests <= 32, "batching check supports 2..32 requests");
     if (!options.context_size) options.context_size = 512;
     check(options.context_size >= (requests > 2 ? 273 : 213), "batching check requires a larger context");
@@ -265,11 +265,11 @@ int run_continuous_batching_check(CudaLoadOptions options, int requests) {
         check(fresh == restored, "session restore differs from serial oracle");
     }
     {
-        CudaEngineOptions engine_options;
-        static_cast<CudaLoadOptions&>(engine_options) = options;
+        tyloi::engine::EngineOptions engine_options;
+        static_cast<tyloi::engine::LoadOptions&>(engine_options) = options;
         engine_options.continuous_batching = std::max(4, requests);
         engine_options.prefill_chunk_size = 64;
-        auto engine = load_cuda_engine(engine_options);
+        auto engine = tyloi::engine::load(engine_options);
         auto serial_first = collect(submit(*engine, "scheduler-serial-first", first, sampling));
         auto serial_second = collect(submit(*engine, "scheduler-serial-second", second, sampling));
         check(serial_first.terminal == 1 && serial_first.completed == 1 &&

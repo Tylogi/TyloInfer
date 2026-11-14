@@ -63,6 +63,12 @@ Tensor restore(models::State& state, const TextSessionState& snapshot, Executor&
         drain(executor, weights);
         target->stage();
         if (predictor) predictor->stage();
+        auto roots = target->storage();
+        if (predictor) {
+            auto more = predictor->storage();
+            roots.insert(roots.end(), more.begin(), more.end());
+        }
+        executor.submit(roots);
         drain(executor, weights);
         auto hidden = predictor ? predictor->target_hidden() : Tensor{};
         if (mtp && !hidden) hidden = held.mtp->last_target_hidden;

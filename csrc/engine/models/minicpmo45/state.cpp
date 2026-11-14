@@ -133,7 +133,7 @@ State::Restore State::prepare(const TextSessionState& state) const {
         validate_kv(cache);
         const auto device = ::tyloi::Device(layout.cpu ? ::tyloi::kCPU : ::tyloi::kCUDA,
                                        layout.cpu ? 0 : layout.device);
-        if (cache.ring || cache.k.device() != device || cache.v.device() != device ||
+        if (cache.ring || cache.target_device() != device ||
             cache.k.scalar_type() != ::tyloi::kFloat16 ||
             cache.v.scalar_type() != ::tyloi::kFloat16 ||
             cache.k.size(1) != layout.heads || cache.v.size(1) != layout.heads ||
@@ -169,12 +169,19 @@ std::unique_ptr<tyloi::models::Restore> State::prepare_restore(
         std::vector<std::pair<Device,std::size_t>> growth() const override {
             std::vector<std::pair<Device,std::size_t>> result;
             for (const auto& kv:std::get<std::vector<KvSnapshot>>(snapshot.payload)) {
-                add_growth(result,kv.k.device(),restore_prefix_bytes({},kv.k,2,kv.capacity));
-                add_growth(result,kv.v.device(),restore_prefix_bytes({},kv.v,2,kv.capacity));
+                add_kv_restore_growth(result, kv);
             }
             return result;
         }
         void stage() override { owner.stage(candidate,snapshot); }
+        std::vector<::tyloi::Tensor> storage() const override {
+            std::vector<::tyloi::Tensor> result;
+            for (const auto& kv : candidate.layers) {
+                if (kv.physical_key) result.push_back(kv.physical_key);
+                if (kv.physical_value) result.push_back(kv.physical_value);
+            }
+            return result;
+        }
         void publish() noexcept override { owner.publish(std::move(candidate)); }
     };
     return std::make_unique<Candidate>(*this,snapshot);

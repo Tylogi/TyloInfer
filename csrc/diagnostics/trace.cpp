@@ -113,7 +113,7 @@ std::string stage_name(std::size_t index) {
 } // namespace
 
 int run_block_trace_compare(tyloi::cuda::Program& test,
-        tyloi::cuda::CudaLoadOptions options, tyloi::Tensor ids) {
+        tyloi::engine::LoadOptions options, tyloi::Tensor ids) {
     if (!ids || ids.dim() != 2 || ids.scalar_type() != tyloi::kInt64)
         throw std::invalid_argument("block trace IDs must be int64 [batch,tokens]");
     options.n_gpu_layers = -1;

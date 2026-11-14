@@ -12,6 +12,7 @@
 
 namespace tyloi::source { class Source; }
 namespace tyloi::metal {
+namespace tq_cache_detail { struct LegacyPlan; }
 
 struct MlxTqExpertWeights {
     MlxTqWeight gate, up, down;
@@ -57,6 +58,8 @@ public:
         std::size_t budget, int io_workers = 8);
     MlxTqExpertCache(const source::Source& model, const std::vector<std::string>& prefixes,
         std::size_t budget, int io_workers = 8);
+    std::size_t minimum() const;
+    std::size_t maximum() const;
     mlx::core::array apply(std::size_t layer, const mlx::core::array& ids,
         const std::function<mlx::core::array(const MlxTqExpertWeights&)>& operation);
     mlx::core::array apply(std::size_t layer, const mlx::core::array& ids,
@@ -79,11 +82,14 @@ public:
     std::size_t trim(std::size_t bytes);
     void validate_layer(std::size_t layer, int experts, int input, int intermediate) const;
     void prepare_layer(std::size_t layer, int top_k, float limit = 0.f, bool gelu = false) const;
+    void preload();
+    void drain();
     void clear();
     void prefill_lookahead(std::size_t layer, std::optional<std::size_t> next);
 
 private:
     struct Impl;
+    void load_legacy(tq_cache_detail::LegacyPlan plan, std::size_t budget);
     std::shared_ptr<Impl> impl_;
 };
 

@@ -1,3 +1,4 @@
+#include "mlx_projection_batch.h"
 #include "mlx_qwen4_causal_lm.h"
 #include "engine/backends/metal/ops/attention/attention.h"
 #include "engine/backends/metal/ops/attention/kv.h"
@@ -30,7 +31,7 @@
 #include "engine/config.h"
 #include "engine/state/sequence.h"
 #include "mlx_resident_budget.h"
-#include "backends/cpu/storage/prefix_blocks.h"
+#include "engine/state/session/prefix_blocks.h"
 #include "mlx_transformer.h"
 #include "engine/backends/cpu/native/host_parallel.h"
 

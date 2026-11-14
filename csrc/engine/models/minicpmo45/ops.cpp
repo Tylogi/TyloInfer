@@ -302,7 +302,7 @@ std::unique_ptr<tyloi::models::Restore> State::prepare_restore(
             l.sliding, tyloi::kBFloat16, l.quantization);
         const auto device = tyloi::Device(l.cpu ? tyloi::kCPU : tyloi::kCUDA, l.cpu ? 0 : l.device);
         const auto dtype = expected.storage_dtype;
-        if (kv.k.device() != device || kv.v.device() != device || kv.ring != l.sliding ||
+        if (kv.target_device() != device || kv.ring != l.sliding ||
             kv.k.scalar_type() != dtype || kv.v.scalar_type() != dtype || kv.k.size(1) != l.heads ||
             kv.k.size(3) != expected.key_width || kv.v.size(3) != expected.value_width ||
             kv.k.size(2) != (kv.ring ? kv.capacity : state.cache_pos) ||
@@ -318,16 +318,7 @@ std::unique_ptr<tyloi::models::Restore> State::prepare_restore(
         std::vector<std::pair<tyloi::Device, std::size_t>> growth() const override {
             std::vector<std::pair<tyloi::Device, std::size_t>> result;
             for (const auto& kv : std::get<std::vector<KvSnapshot>>(snapshot.payload)) {
-                for (const auto& tensor : {kv.k, kv.v}) {
-                    const auto bytes = restore_prefix_bytes({}, tensor, 2, kv.capacity);
-                    auto it = std::find_if(result.begin(), result.end(), [&](const auto& v) { return v.first == tensor.device(); });
-                    if (it == result.end()) result.emplace_back(tensor.device(), bytes);
-                    else {
-                        if (it->second > std::numeric_limits<std::size_t>::max() - bytes)
-                            throw std::overflow_error("MiniCPM text session allocation overflow");
-                        it->second += bytes;
-                    }
-                }
+                add_kv_restore_growth(result, kv);
             }
             return result;
         }
@@ -338,6 +329,14 @@ std::unique_ptr<tyloi::models::Restore> State::prepare_restore(
                 MfqCudaGuard guard(l.device);
                 stage_kv(prepared[i], values[i], l.head_dim, tyloi::kBFloat16, l.quantization);
             }
+        }
+        std::vector<::tyloi::Tensor> storage() const override {
+            std::vector<::tyloi::Tensor> result;
+            for (const auto& kv : prepared) {
+                if (kv.physical_key) result.push_back(kv.physical_key);
+                if (kv.physical_value) result.push_back(kv.physical_value);
+            }
+            return result;
         }
         void publish() noexcept override {
             owner.layers.swap(prepared);

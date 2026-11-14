@@ -127,7 +127,7 @@ inline double number(const std::string& text, std::string_view option) {
 bool parse_cuda_load_option(
     std::string_view option,
     ArgCursor& args,
-    CudaLoadOptions& result);
+    tyloi::engine::LoadOptions& result);
 
 inline bool parse_token_input_option(
         std::string_view option,

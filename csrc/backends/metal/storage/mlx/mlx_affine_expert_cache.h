@@ -37,6 +37,7 @@ public:
     void validate_layer(std::size_t layer, int experts, int input, int intermediate) const override;
     void prepare_layer(std::size_t layer, int top_k) const override;
     void preload() override;
+    void drain() override;
     bool preserves_activation_dtype() const noexcept override { return true; }
     std::size_t limit_bytes() const noexcept override;
     std::size_t backing_bytes() const noexcept override;
@@ -45,6 +46,7 @@ public:
     MlxSsdExpertCacheStats stats() const override;
     void clear() override;
 private:
+    static Plan plan_legacy(const MfqContainer& model, const std::vector<std::string>& prefixes);
     struct Impl;
     std::shared_ptr<Impl> impl_;
 };

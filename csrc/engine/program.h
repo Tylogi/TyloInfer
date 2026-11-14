@@ -1,6 +1,6 @@
 #pragma once
 
-#include "engine/load.h"
+#include "engine/backends/cuda/load.h"
 #include "engine/generation/sequence.h"
 #include "engine/models/input.h"
 #include "engine/generation/mtp/metrics.h"
@@ -45,7 +45,7 @@ public:
     /** Prepare operator execution without applying model or weight-loading options. */
     static std::unique_ptr<Program> bare();
     /** Prepare execution resources without loading model weights. */
-    static std::unique_ptr<Program> open(CudaLoadOptions options, bool adapt = true);
+    static std::unique_ptr<Program> open(tyloi::engine::LoadOptions options, bool adapt = true);
     ~Program() noexcept;
     Program(const Program&) = delete;
     Program& operator=(const Program&) = delete;
@@ -116,7 +116,7 @@ void configure_generation(engine::Config&, const CudaLoadConfig&, Executor&,
 void configure_model_kv(std::shared_ptr<KvMemoryManager>&, std::shared_ptr<KvOffloadStore>&);
 /** Assemble a native model with the shared loader and policy. */
 void load_model(std::unique_ptr<models::CausalModel>& owner,
-    const CudaLoadOptions&, CudaLoadConfig&, Executor&, weights::Cache&,
+    const tyloi::engine::LoadOptions&, CudaLoadConfig&, Executor&, weights::Cache&,
     const std::shared_ptr<const ModelSource>&, bool components);
 }
 } // namespace tyloi::cuda

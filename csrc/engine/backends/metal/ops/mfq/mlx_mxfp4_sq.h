@@ -1,5 +1,10 @@
 #pragma once
 
+#include <memory>
+#include <vector>
+
+namespace tyloi { struct TensorStorage; }
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -63,6 +68,7 @@ inline constexpr std::array<std::uint8_t, 256> kMxfp4Sq3PaletteNibbles{
 // execute through the same metadata-driven Metal matmul kernel.
 class MlxMxfp4SqWeight {
 public:
+    std::vector<std::shared_ptr<tyloi::TensorStorage>> backings() const;
     static MlxMxfp4SqWeight from_blob(
         const std::vector<std::uint8_t>& blob);
     static MlxMxfp4SqWeight from_blob(

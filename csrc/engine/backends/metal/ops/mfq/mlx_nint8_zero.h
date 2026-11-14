@@ -1,5 +1,10 @@
 #pragma once
 
+#include <memory>
+#include <vector>
+
+namespace tyloi { struct TensorStorage; }
+
 #include <cstdint>
 #include <span>
 #include <string_view>
@@ -13,6 +18,7 @@ bool is_nint8_zero_dtype(std::string_view dtype) noexcept;
 
 class MlxNint8ZeroWeight {
 public:
+    std::vector<std::shared_ptr<tyloi::TensorStorage>> backings() const;
     static MlxNint8ZeroWeight from_blob(
         std::span<const std::uint8_t> blob);
 

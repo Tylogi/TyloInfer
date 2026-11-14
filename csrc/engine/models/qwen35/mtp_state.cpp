@@ -13,9 +13,6 @@ void require_state(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
 }
 
-bool on_device(const ::tyloi::Tensor& tensor, tyloi::Device device) {
-    return device.is_cpu() ? tensor.is_cpu() : tensor.device() == device;
-}
 } // namespace
 MtpState::MtpState(const tyloi::models::Mtp& owner, std::vector<Layout> layout, int64_t hidden)
     : tyloi::models::MtpState(owner), layout_(std::move(layout)), kv_(layout_.size()), hidden_(hidden) {}
@@ -105,12 +102,12 @@ MtpState::Restore MtpState::prepare(const MtpSessionState& saved) const {
             ? tyloi::state::kv_packed_width(int(layout.head_dim), layout.quantization.key_bits()) : layout.head_dim;
         const auto value_width = layout.quantization.enabled()
             ? tyloi::state::kv_packed_width(int(layout.head_dim), layout.quantization.value_bits()) : layout.head_dim;
-        const auto dtype = layout.quantization.enabled() ? ::tyloi::kInt32 : layout.dtype;
+        const auto dtype = layout.quantization.enabled()
+            ? (layout.device.is_metal() ? ::tyloi::ScalarType::uint32 : ::tyloi::kInt32) : layout.dtype;
         if (block.capacity > layout.capacity || block.ring ||
             block.k.size(1) != layout.heads || block.k.size(2) != saved.cache_pos ||
             block.k.size(3) != key_width || block.v.size(3) != value_width ||
-            block.k.scalar_type() != dtype || !on_device(block.k, layout.device) ||
-            !on_device(block.v, layout.device))
+            block.k.scalar_type() != dtype || block.target_device() != layout.device)
             throw CudaSessionStateError("Qwen MTP session KV topology changed");
     }
     return {std::vector<tyloi::state::KvView>(kv_.size()), saved.cache_pos};
@@ -123,22 +120,21 @@ public:
         : state_(state), saved_(saved), candidate_(state.prepare(saved_)) {}
     std::vector<std::pair<tyloi::Device, std::size_t>> growth() const override {
         std::vector<std::pair<tyloi::Device, std::size_t>> result;
-        const auto add = [&](tyloi::Device device, std::size_t bytes) {
-            auto it = std::find_if(result.begin(), result.end(), [device](const auto& v) { return v.first == device; });
-            if (it == result.end()) result.emplace_back(device, bytes);
-            else {
-                if (it->second > std::numeric_limits<std::size_t>::max() - bytes)
-                    throw std::overflow_error("Qwen MTP session allocation overflow");
-                it->second += bytes;
-            }
-        };
         for (const auto& block : std::get<std::vector<KvSnapshot>>(saved_.payload)) {
-            add(block.k.device(), restore_prefix_bytes({}, block.k, 2, block.capacity));
-            add(block.v.device(), restore_prefix_bytes({}, block.v, 2, block.capacity));
+            add_kv_restore_growth(result, block);
         }
         return result;
     }
     void stage() override { state_.stage(candidate_, saved_); }
+    std::vector<::tyloi::Tensor> storage() const override {
+        std::vector<::tyloi::Tensor> result;
+        if (saved_.last_target_hidden) result.push_back(saved_.last_target_hidden);
+        for (const auto& kv : candidate_.kv) {
+            if (kv.physical_key) result.push_back(kv.physical_key);
+            if (kv.physical_value) result.push_back(kv.physical_value);
+        }
+        return result;
+    }
     void publish() noexcept override { state_.publish(std::move(candidate_)); }
 
 private:

@@ -1,6 +1,5 @@
 #include "engine/generation/batch_driver.h"
 #include "engine/budget.h"
-#include "engine/backends/cuda/executor/options.h"
 #include "engine/executor.h"
 #include "engine/generation/decode.h"
 #include "engine/generation/prefill_budget.h"
@@ -87,6 +86,7 @@ std::vector<Tensor> prefill_batch(models::Batch& batch, Executor& executor, weig
         }
         if(!result)throw std::runtime_error("batch prefill ended without a result");
         if(loan)throw std::logic_error("batch prefill ended while workspace is borrowed");
+        executor.submit(*result);
         capture.finish(); work->finish(); job={}; return std::move(*result);
     } catch(...) {
         auto failure=std::current_exception();
@@ -150,8 +150,9 @@ std::optional<Tensor> capture_batch(models::Batch& batch, Executor& executor,
 }
 
 BatchDriver::BatchDriver(std::unique_ptr<models::Batch> batch, Executor& executor,
-        weights::Cache& weights, Budget& budget, Device device)
-    : executor_(executor), weights_(weights), budget_(budget), device_(device), batch_(std::move(batch)) {
+        weights::Cache& weights, Budget& budget, Device device, std::size_t workspace_reserve)
+    : executor_(executor), weights_(weights), budget_(budget), device_(device),
+      workspace_reserve_(workspace_reserve), batch_(std::move(batch)) {
     if(!batch_)throw std::invalid_argument("model does not provide numerical batching");
 }
 
@@ -196,7 +197,7 @@ Tensor BatchDriver::prefill(models::BatchState& state, Tensor ids) {
     }
     const auto chunk=budget_.batch(device_,batch_->prefill_row_bytes(),{0,count,true},primary);
     if(chunk.count!=count)throw std::runtime_error("batch prefill admission cannot preserve the full prompt");
-    if(count>1024)weights_.workspace(cuda::options::workspace_reserve_bytes());
+    if(count>1024)weights_.workspace(workspace_reserve_);
     reserve_batch(budget_,device_,growth,std::size_t(256)<<20,true);
     auto outputs=prefill_batch(*batch_,executor_,weights_,budget_,device_,{&state},{std::move(ids)});
     if(outputs.size()!=1)throw std::runtime_error("invalid batch prefill output count");

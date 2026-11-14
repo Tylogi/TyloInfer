@@ -1,5 +1,6 @@
 #pragma once
 
+#include "mlx_projection_batch.h"
 #include "nemotron_h_model.h"
 
 #include <cstddef>

@@ -115,8 +115,12 @@ struct MtpOps {
         exit_unmanaged_graph(state, weights, budget);
         budget.reserve(state.growth(input, options));
         auto scope = executor.enter();
+        auto* raw = input.raw_hidden;
         auto hidden = model.forward(std::move(input), state, options);
         if (!hidden.defined()) throw std::runtime_error("model forward returned no hidden tensor");
+        executor.submit(state.storage());
+        const std::array<Tensor, 2> outputs{hidden, raw ? *raw : Tensor{}};
+        executor.submit(outputs);
         return hidden;
     }
     Tensor target_forward(Tensor ids, Tensor* raw = nullptr, int64_t confirmed = 0) {
@@ -165,6 +169,9 @@ struct MtpOps {
         auto scope = executor.enter();
         auto hidden = model.forward(std::move(input), state, options);
         if (!hidden.defined()) throw std::runtime_error("model forward returned no hidden tensor");
+        executor.submit(state.storage());
+        const std::array<Tensor, 2> outputs{hidden, raw ? *raw : Tensor{}};
+        executor.submit(outputs);
         target_transfer_bytes += weights.activity().streamed_bytes - before;
         if (profile) {
             const auto after = target_costs();
@@ -212,6 +219,8 @@ struct MtpOps {
         {
             auto scope = ops::dense_scope(&predictor_execution, device);
             result = mtp.step(predictor, hidden, ids, positions, predictor_options);
+            const std::array<Tensor, 3> outputs{result.sample_hidden, result.chain_hidden, result.sample_logits};
+            predictor_execution.submit(outputs);
         }
         projected_predictor_logits = result.sample_logits;
         projected_predictor_greedy = result.greedy_token;
@@ -228,7 +237,8 @@ struct MtpOps {
     std::size_t predictor_parked_history_flush_threshold() const { return mtp.predictor_parked_history_flush_threshold(); }
     double end_predictor_prefill() { weights.prepare(weights::Cache::Stage::decode, device, source); return 0; }
     double predictor_prefill(Tensor hidden, Tensor ids, Tensor positions) {
-        auto timer = executor.timer();
+        auto scope = ops::dense_scope(&predictor_execution, device);
+        auto timer = predictor_execution.timer();
         weights::Loan workspace(weights);
         const auto bytes = mtp.prefill_workspace_bytes(ids.size(1));
         if (bytes) workspace.begin(bytes);
@@ -236,10 +246,7 @@ struct MtpOps {
         auto predictor_options = options;
         predictor_options.serial_experts = false;
         models::MtpStep result;
-        {
-            auto scope = ops::dense_scope(&predictor_execution, device);
-            result = mtp.prefill(predictor, hidden, ids, positions, predictor_options);
-        }
+        result = mtp.prefill(predictor, hidden, ids, positions, predictor_options);
         timer->stop({result.sample_hidden, result.chain_hidden, result.sample_logits});
         const auto elapsed = timer->elapsed_ms();
         if (bytes) workspace.finish();

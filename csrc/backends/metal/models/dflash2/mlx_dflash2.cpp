@@ -1,3 +1,4 @@
+#include "mlx_projection_batch.h"
 #include "mlx_dflash2.h"
 #include "hf_safetensors_store.h"
 #include "engine/backends/metal/native/kernel.h"

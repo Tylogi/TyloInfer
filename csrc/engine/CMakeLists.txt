@@ -30,6 +30,12 @@ add_library(mfq-engine STATIC
     models/prepare.cpp
     models/state.cpp
     models/session/tensors.cpp
+    models/session/cache.cpp
+    models/session/codec.cpp
+    models/session/paged.cpp
+    models/session/state.cpp
+    models/qwen4_exp/session_codec.cpp
+    models/deepseek_v41/session_codec.cpp
     models/deepseek_v4/input.cpp
     models/minicpmo45/input.cpp
     models/deepseek_v41/axial_patch_vision.cpp

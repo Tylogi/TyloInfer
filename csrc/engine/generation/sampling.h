@@ -77,7 +77,7 @@ public:
 
     explicit Sampler(Params params, Device device)
         : params_(std::move(params)), rng_(params_.seed),
-          random_host_(ops::empty({1}, TensorOptions().dtype(kFloat32).device(kCPU).pinned_memory(true))),
+          random_host_(ops::empty({1}, TensorOptions().dtype(kFloat32).device(kCPU).pinned_memory(device.is_cuda()))),
           random_cuda_(ops::empty({1}, TensorOptions().dtype(kFloat32).device(device))) {
         if (params_.top_k < 0)
             throw std::invalid_argument("top_k must be non-negative");
@@ -106,7 +106,9 @@ public:
     }
     Tensor sample(const Tensor& logits) {
         if (greedy()) return ops::sample_greedy(logits);
-        ops::copy_into(random_cuda_, next_random());
+        const auto& random = next_random();
+        if (random_cuda_.device().is_metal()) random_cuda_ = ops::copy(random, random_cuda_.device());
+        else ops::copy_into(random_cuda_, random);
         return ops::sample_stochastic(logits, random_cuda_, params_.temperature, params_.top_k, params_.top_p);
     }
     Tensor sample(Tensor& logits, const Tensor& counts) {

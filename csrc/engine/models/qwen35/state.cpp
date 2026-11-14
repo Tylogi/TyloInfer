@@ -90,10 +90,10 @@ void validate_full_snapshot(const Layout& model_layer, const FullLayout& layer,
                             const KvSnapshot& state) {
     validate_kv(state);
     const bool quantized = layer.quantization.enabled();
-    const auto dtype = quantized ? ::tyloi::kInt32 : layer.dtype;
+    const auto dtype = quantized ? (model_layer.device.is_metal() ? ::tyloi::ScalarType::uint32 : ::tyloi::kInt32) : layer.dtype;
     if (!(state.ring == layer.sliding && state.k.scalar_type() == dtype &&
-          state.v.scalar_type() == dtype && on_layer_device(state.k, model_layer) &&
-          on_layer_device(state.v, model_layer) && state.k.size(1) == layer.kv_heads &&
+          state.v.scalar_type() == dtype && state.target_device() == model_layer.device &&
+          state.k.size(1) == layer.kv_heads &&
           state.v.size(1) == layer.kv_heads))
         throw CudaSessionStateError("Qwen full-attention session topology changed");
     const auto key_width = quantized
@@ -532,8 +532,7 @@ public:
             }
         };
         const auto add_kv = [&](const KvSnapshot& kv) {
-            add(kv.k.device(), restore_prefix_bytes({}, kv.k, 2, kv.capacity));
-            add(kv.v.device(), restore_prefix_bytes({}, kv.v, 2, kv.capacity));
+            add_kv_restore_growth(result, kv);
         };
         if (const auto* blocks = std::get_if<std::vector<KvSnapshot>>(&snapshot_.payload)) {
             for (const auto& block : *blocks) add_kv(block);
@@ -553,6 +552,25 @@ public:
     void stage() override {
         state_.stage(target_, snapshot_);
         if (predictor_) predictor_->stage();
+    }
+    std::vector<::tyloi::Tensor> storage() const override {
+        std::vector<::tyloi::Tensor> result;
+        const auto add = [&](const ::tyloi::Tensor& value) { if (value) result.push_back(value); };
+        for (const auto& layer : target_.layers) {
+            if (const auto* kv = std::get_if<tyloi::state::KvView>(&layer)) {
+                add(kv->physical_key);
+                add(kv->physical_value);
+            } else {
+                const auto& mixer = std::get<LinearState>(layer).mixer.view();
+                add(mixer.convolution);
+                add(mixer.recurrent);
+            }
+        }
+        if (predictor_) {
+            auto more = predictor_->storage();
+            result.insert(result.end(), more.begin(), more.end());
+        }
+        return result;
     }
     void publish() noexcept override {
         state_.publish(std::move(target_));

@@ -140,7 +140,7 @@ public:
                 next = sample_logits(*request->sampler,
                     ops::reshape(model_.logits(ops::select(hidden,1,-1)), {1,-1}),
                     request->counts, request->token_constraint);
-            timer->stop();
+            timer->stop({hidden, next});
             request->timers.push_back(std::move(timer));
             return finish(request, std::move(next));
         } catch (...) { std::rethrow_exception(prefill_failure(std::current_exception())); }
@@ -205,6 +205,8 @@ public:
                             request->counts,request->token_constraint);
                     }
                 }
+                executor_.submit(hidden);
+                executor_.submit(next);
                 timer->stop();
                 const auto milliseconds=timer->elapsed_ms();
                 for (auto row : rows) {

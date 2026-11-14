@@ -247,7 +247,7 @@ std::unordered_set<int> parse_layer_ranges(const std::string& value) {
 bool parse_cuda_load_option(
         std::string_view option,
         ArgCursor& args,
-        CudaLoadOptions& result) {
+        tyloi::engine::LoadOptions& result) {
     if (option == "--model") result.model_path = args.value(option);
     else if (option == "--config") result.config_path = args.value(option);
     else if (option == "--yarn-context-extension") result.yarn_context_extension = true;

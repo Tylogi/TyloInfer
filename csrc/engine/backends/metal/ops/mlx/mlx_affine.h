@@ -1,5 +1,10 @@
 #pragma once
 
+#include <memory>
+#include <vector>
+
+namespace tyloi { struct TensorStorage; }
+
 #include "engine/backends/metal/native/tensor/tensor.h"
 
 #include <mlx/mlx.h>
@@ -30,6 +35,7 @@ private:
 
 class MlxAffineWeight {
 public:
+    std::vector<std::shared_ptr<tyloi::TensorStorage>> backings() const;
     void prepare_native();
     const MlxNativeGgufWeight* native_weight_ref() const noexcept { return native_.get(); }
     static bool supports_native(const MfqContainer& model, const std::string& name);

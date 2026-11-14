@@ -50,6 +50,31 @@ std::size_t restore_prefix_bytes(const ::tyloi::Tensor& target, const ::tyloi::T
     return elements * source.element_size();
 }
 
+void add_kv_restore_growth(std::vector<std::pair<::tyloi::Device, std::size_t>>& growth,
+                           const KvSnapshot& state) {
+    const auto add = [&](::tyloi::Device device, std::size_t bytes) {
+        auto it = std::find_if(growth.begin(), growth.end(), [device](const auto& entry) {
+            return entry.first == device;
+        });
+        if (it == growth.end()) growth.emplace_back(device, bytes);
+        else {
+            if (it->second > std::numeric_limits<std::size_t>::max() - bytes)
+                throw std::overflow_error("session KV allocation overflow");
+            it->second += bytes;
+        }
+    };
+    for (const auto& tensor : {state.k, state.v}) {
+        const auto bytes = restore_prefix_bytes({}, tensor, 2, state.capacity);
+        add(state.target_device(), bytes);
+        // Metal copies a padded host buffer into its destination synchronously.
+        if (state.target_device().is_metal() && tensor.device().is_cpu())
+            add(tensor.device(), bytes);
+        // A Metal slice update can retain both its initialized input and output.
+        else if (state.target_device().is_metal())
+            add(state.target_device(), bytes);
+    }
+}
+
 ::tyloi::Tensor restore_session_tensor(::tyloi::Tensor target,
                                        const ::tyloi::Tensor &source) {
     if (!source.defined()) {
@@ -82,7 +107,7 @@ std::size_t restore_prefix_bytes(const ::tyloi::Tensor& target, const ::tyloi::T
         shape[static_cast<size_t>(dimension)] = capacity;
         auto result = tyloi::ops::zeros(shape, tensor.options());
         if (tensor.size(dimension) > 0)
-            result = tyloi::ops::update_slice(result, tyloi::ops::clone(tensor), dimension, 0);
+            result = tyloi::ops::update_slice(result, tensor, dimension, 0);
         return result;
     }
     const auto* dense = tensor.representation<::tyloi::DenseTensor>();
@@ -156,11 +181,14 @@ KvSnapshot capture_kv(const tyloi::state::KvView &cache, int64_t cache_pos, size
 }
 
 void validate_kv(const KvSnapshot& state) {
-    if (state.k.device().is_metal() || state.v.device().is_metal()) {
+    if (!state.k.defined() || !state.v.defined() || state.k.device() != state.v.device() ||
+        (state.destination && state.k.device() != *state.destination && !state.k.device().is_cpu()))
+        throw CudaSessionStateError("full-attention session KV device is invalid");
+    if (state.target_device().is_metal()) {
         const tyloi::Device device{tyloi::DeviceType::metal, 0};
         const auto dtype = state.k.scalar_type();
         if (!state.k.defined() || !state.v.defined() || state.k.is_encoded() || state.v.is_encoded() ||
-            state.k.device() != device || state.v.device() != device ||
+            state.target_device() != device ||
             !session_kv_geometry_matches(state.k, state.v) || state.k.size(0) <= 0 ||
             state.k.size(1) <= 0 || state.k.size(3) <= 0 || state.v.size(3) <= 0 ||
             state.capacity <= 0 || state.k.size(2) <= 0 || state.k.size(2) > state.capacity ||
@@ -182,7 +210,7 @@ void validate_kv(const KvSnapshot& state) {
 void restore_kv(tyloi::state::KvView &cache, const KvSnapshot &state, int64_t head_dim,
                 ::tyloi::ScalarType dtype, tyloi::state::KvQuantization quantization) {
     validate_kv(state);
-    if (state.k.device().is_metal()) {
+    if (state.target_device().is_metal()) {
         const auto layout = tyloi::state::kv_layout(state.k.size(0), state.k.size(1), state.capacity,
                                                     head_dim, state.ring, dtype, quantization);
         const auto physical_dtype = quantization.enabled() ? tyloi::ScalarType::uint32 : layout.storage_dtype;
@@ -190,8 +218,14 @@ void restore_kv(tyloi::state::KvView &cache, const KvSnapshot &state, int64_t he
             state.k.scalar_type() != physical_dtype || state.v.scalar_type() != physical_dtype ||
             state.k.size(3) != layout.key_width || state.v.size(3) != layout.value_width)
             throw CudaSessionStateError("full-attention session KV layout is invalid");
-        auto key = restore_session_prefix_tensor({}, state.k, 2, state.capacity);
-        auto value = restore_session_prefix_tensor({}, state.v, 2, state.capacity);
+        const auto restore = [&](const ::tyloi::Tensor& source) {
+            if (!source.device().is_cpu())
+                return restore_session_prefix_tensor({}, source, 2, state.capacity);
+            auto padded = restore_session_prefix_tensor({}, source, 2, state.capacity);
+            return tyloi::ops::copy(padded, state.target_device());
+        };
+        auto key = restore(state.k);
+        auto value = restore(state.v);
         tyloi::state::KvView restored;
         restored.physical_key = std::move(key);
         restored.physical_value = std::move(value);
@@ -204,8 +238,23 @@ void restore_kv(tyloi::state::KvView &cache, const KvSnapshot &state, int64_t he
         cache = std::move(restored);
         return;
     }
-    cache.physical_key = restore_session_prefix_tensor(cache.physical_key, state.k, 2, state.capacity);
-    cache.physical_value = restore_session_prefix_tensor(cache.physical_value, state.v, 2, state.capacity);
+    const auto restore = [&](::tyloi::Tensor target, const ::tyloi::Tensor& source) {
+        if (source.device() == state.target_device())
+            return restore_session_prefix_tensor(std::move(target), source, 2, state.capacity);
+        std::vector<std::int64_t> shape;
+        for (std::int64_t i = 0; i < source.dim(); ++i)
+            shape.push_back(i == 2 ? state.capacity : source.size(i));
+        bool compatible = target.defined() && target.device() == state.target_device() &&
+            target.scalar_type() == source.scalar_type() && target.dim() == source.dim();
+        for (std::int64_t i = 0; compatible && i < source.dim(); ++i)
+            compatible = target.size(i) == shape[static_cast<std::size_t>(i)];
+        if (!compatible)
+            target = tyloi::ops::empty(shape, ::tyloi::TensorOptions().dtype(source.scalar_type()).device(state.target_device()));
+        tyloi::ops::copy_into(tyloi::ops::slice(target, 2, 0, source.size(2)), source);
+        return target;
+    };
+    cache.physical_key = restore(cache.physical_key, state.k);
+    cache.physical_value = restore(cache.physical_value, state.v);
     cache.visible_key = {};
     cache.visible_value = {};
     cache.ring = state.ring;
@@ -224,13 +273,14 @@ void restore_kv(tyloi::state::KvView &cache, const KvSnapshot &state, int64_t he
 void stage_kv(tyloi::state::KvView& cache, const KvSnapshot& state, int64_t head_dim,
         ::tyloi::ScalarType dtype, tyloi::state::KvQuantization quantization) {
     validate_kv(state);
-    if (!state.k.device().is_metal()) {
+    if (!state.target_device().is_metal()) {
         const auto prepare = [&](::tyloi::Tensor& target, const ::tyloi::Tensor& source) {
-            if (!restore_prefix_bytes(target, source, 2, state.capacity)) return;
+            if (source.device() == state.target_device() &&
+                !restore_prefix_bytes(target, source, 2, state.capacity)) return;
             std::vector<std::int64_t> shape;
             for (std::int64_t i = 0; i < source.dim(); ++i)
                 shape.push_back(i == 2 ? state.capacity : source.size(i));
-            target = tyloi::ops::empty(shape, source.options());
+            target = tyloi::ops::empty(shape, ::tyloi::TensorOptions().dtype(source.scalar_type()).device(state.target_device()));
         };
         prepare(cache.physical_key, state.k);
         prepare(cache.physical_value, state.v);

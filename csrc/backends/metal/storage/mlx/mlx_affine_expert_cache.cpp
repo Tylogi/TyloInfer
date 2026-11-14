@@ -1,6 +1,6 @@
 #include "mlx_affine_expert_cache.h"
 #include "mlx_affine_indirect.h"
-#include "mfq_container.h"
+#include "mlx_affine_expert_cache_internal.h"
 #include "mlx_expert_segment_cache.h"
 #include "mlx_kernel_prepare.h"
 #include "mlx_moe_ops.h"
@@ -13,24 +13,21 @@
 #include <algorithm>
 
 namespace tyloi::metal {
-namespace {
-using namespace mlx::core;
-using Layer = std::array<tyloi::MlxAffineLayout, 3>;
-
-const std::string& dtype(const MfqContainer& source, const std::string& name) { return source.record(name).dtype; }
+namespace affine_cache_detail {
 const std::string& dtype(const tyloi::source::Source& source, const std::string& name) { return tyloi::require_tensor(source, name).dtype; }
-std::uint64_t extent(const MfqContainer& source, const std::string& name) { return source.record(name).nbytes; }
 std::uint64_t extent(const tyloi::source::Source& source, const std::string& name) { return tyloi::require_tensor(source, name).nbytes; }
-std::vector<std::byte> read_prefix(const MfqContainer& source, const std::string& name, std::size_t size) {
-    std::vector<std::byte> bytes(size);
-    source.read_range_into(name, 0, bytes);
-    return bytes;
-}
 std::vector<std::byte> read_prefix(const tyloi::source::Source& source, const std::string& name, std::size_t size) {
     return source.read(name, 0, size);
 }
-void prepared(const MfqContainer& source, const std::string& name) { source.record_prepared(name); }
 void prepared(const tyloi::source::Source&, const std::string&) {}
+
+} // namespace affine_cache_detail
+using affine_cache_detail::Layer;
+using affine_cache_detail::describe;
+
+namespace {
+using namespace mlx::core;
+using namespace affine_cache_detail;
 
 array ffn(const std::array<MlxAffineIndirectWeight, 3>& weights, const array& input,
     const array& ids, const array& scores, bool partial = false) {
@@ -55,47 +52,8 @@ std::array<MlxAffineIndirectWeight, 3> bind_affine_layer(const Layer& layer, con
 }
 }
 
-namespace {
-struct Description { std::vector<Layer> layers; std::vector<tyloi::weights::Segments> segments; };
-template<class Source>
-Description describe(const Source& model, const std::vector<std::string>& prefixes) {
-        Description result;
-        for (const auto& prefix : prefixes) {
-            Layer layer;
-            tyloi::weights::Segments definition;
-            for (int p = 0; p < 3; ++p) {
-                const auto name = prefix + ".mlp.experts." + std::array{"gate", "up", "down"}[p] + ".weight";
-                if (dtype(model, name) != "MLX-AFFINE")
-                    throw std::invalid_argument("MLX expert cache requires native affine tensors");
-                auto bytes = read_prefix(model, name, 8);
-                const auto length = tyloi::MlxAffineLayout::prefix_size(bytes.data(), bytes.size());
-                bytes = read_prefix(model, name, length);
-                auto& layout = layer[p];
-                layout = tyloi::MlxAffineLayout::parse(bytes.data(), bytes.size());
-                if (layout.shape.size() != 3 || layout.total_bytes() != extent(model, name) ||
-                    std::any_of(layout.shape.begin(), layout.shape.end(), [](auto dim) { return dim < 1 || dim > INT_MAX; }))
-                    throw std::invalid_argument("invalid MLX expert tensor geometry");
-                definition.experts = int(layout.shape[0]);
-                definition.fields.push_back({name, layout.prefix_bytes, std::size_t(layout.values_bytes / definition.experts)});
-                definition.fields.push_back({name, layout.scales_offset(), std::size_t(layout.scales_bytes / definition.experts)});
-                definition.fields.push_back({name, layout.biases_offset(), std::size_t(layout.scales_bytes / definition.experts)});
-                prepared(model, name);
-            }
-            if (layer[0].shape != layer[1].shape || layer[2].shape !=
-                std::vector<std::int64_t>{layer[0].shape[0], layer[0].shape[2], layer[0].shape[1]})
-                throw std::invalid_argument("MLX expert Gate/Up/Down geometry differs");
-            result.layers.push_back(std::move(layer)); result.segments.push_back(std::move(definition));
-        }
-        return result;
-}
-} // namespace
 
-struct MlxAffineExpertCache::Plan::Impl {
-    std::vector<Layer> layers;
-    MlxExpertSegmentCache::Plan segments;
-    Impl(std::vector<Layer> value, MlxExpertSegmentCache::Plan plan)
-        : layers(std::move(value)), segments(std::move(plan)) {}
-};
+
 
 struct MlxAffineExpertCache::Impl {
     std::vector<Layer> layers;
@@ -104,12 +62,6 @@ struct MlxAffineExpertCache::Impl {
 
     Impl(std::vector<Layer> value, MlxExpertSegmentCache::Plan plan, std::size_t budget, int workers)
         : layers(std::move(value)), cache(std::make_unique<MlxExpertSegmentCache>(std::move(plan), budget, workers)) {
-        weights.resize(layers.size());
-    }
-    Impl(const MfqContainer& model, const std::vector<std::string>& prefixes, std::size_t budget, int workers) {
-        auto description = describe(model, prefixes);
-        layers = std::move(description.layers);
-        cache = std::make_unique<MlxExpertSegmentCache>(model, std::move(description.segments), budget, workers);
         weights.resize(layers.size());
     }
     const std::array<MlxAffineIndirectWeight, 3>& layer_weights(std::size_t index) {
@@ -132,8 +84,6 @@ MlxAffineExpertCache::Plan MlxAffineExpertCache::plan(
 }
 MlxAffineExpertCache::MlxAffineExpertCache(Plan plan, std::size_t budget, int workers)
     : impl_(std::make_shared<Impl>(std::move(plan.impl_->layers), std::move(plan.impl_->segments), budget, workers)) {}
-MlxAffineExpertCache::MlxAffineExpertCache(const MfqContainer& model, const std::vector<std::string>& prefixes,
-    std::size_t budget, int workers) : impl_(std::make_shared<Impl>(model, prefixes, budget, workers)) {}
 MlxAffineExpertCache::MlxAffineExpertCache(const tyloi::source::Source& source, const std::vector<std::string>& prefixes,
     std::size_t budget, int workers) : MlxAffineExpertCache(plan(source, prefixes), budget, workers) {}
 void MlxAffineExpertCache::validate_layer(std::size_t index, int experts, int input, int intermediate) const {
@@ -177,6 +127,7 @@ array MlxAffineExpertCache::apply_ffn(std::size_t index, const array& input, con
 }
 std::size_t MlxAffineExpertCache::limit_bytes() const noexcept { return impl_->cache->limit_bytes(); }
 void MlxAffineExpertCache::preload() { impl_->cache->preload(); }
+void MlxAffineExpertCache::drain() { impl_->cache->drain(); }
 std::size_t MlxAffineExpertCache::backing_bytes() const noexcept { return impl_->cache->backing_bytes(); }
 std::size_t MlxAffineExpertCache::resident_bytes() const noexcept { return impl_->cache->resident_bytes(); }
 std::size_t MlxAffineExpertCache::set_limit(std::size_t bytes) { return impl_->cache->set_limit(bytes); }

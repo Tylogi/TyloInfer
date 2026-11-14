@@ -126,6 +126,7 @@ struct Plain {
             reserve(model_input);
             auto profile = config.profile_decode ? executor.profile("runtime.decode") : nullptr;
             auto hidden = model.forward(std::move(model_input), state, forward_options);
+            executor.submit(state.storage());
             pending = sample_logits(sampler,
                 project(hidden, !(sampler.greedy() && !penalties && !input.token_constraint)),
                 graph.counts, input.token_constraint);

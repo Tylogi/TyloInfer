@@ -1,5 +1,6 @@
 #pragma once
 
+#include "mlx_projection_batch.h"
 #include "mlx_linear_attention.h"
 #include "engine/state/recurrent.h"
 #include "engine/models/common/linear.h"

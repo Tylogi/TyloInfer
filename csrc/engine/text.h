@@ -2,6 +2,8 @@
 
 #include "env.h"
 #include "engine/backends/cuda/executor/config.h"
+#include "engine/backends/cuda/load.h"
+#include "engine/backends/cuda/kernels/mfq_cuda_kv_quantization.h"
 #include "engine/drain.h"
 #include "engine/models/common/components.h"
 #include "engine/models/qwen35/batch_ops.h"
@@ -79,7 +81,7 @@ struct Text {
     State& state;
     const tyloi::models::Info info;
     DecodeGraphCache graph;
-    tyloi::engine::SessionCache<CudaSessionOps> cache;
+    tyloi::engine::SessionCache<tyloi::models::SessionOps> cache;
     std::optional<tyloi::engine::Budget> budget;
     tyloi::engine::mtp::State mtp_state;
     std::unique_ptr<tyloi::engine::Batch> batching;
@@ -132,8 +134,10 @@ struct Text {
           info(tyloi::models::model_info(language)),
           graph(info.max_context),
           cache(config.session_cache, config.prefix_cache,
-              make_cuda_paged_prefix_cache(*source, info.max_context,
-                  state.supports_paged_text_session_state(), config.prefix_cache),
+              tyloi::models::make_paged_prefix_cache(*source, info.max_context,
+                  state.supports_paged_text_session_state(), config.prefix_cache,
+                  tyloi::Device(tyloi::kCUDA, load_config.layer_placement.primary_device()),
+                  cuda_has_separate_memory(), cuda_kv_quantization_tag()),
                 state.supports_text_session_state(), state.supports_text_session_state() ? 0 : 1,
                 cuda_has_separate_memory()) {
         try {

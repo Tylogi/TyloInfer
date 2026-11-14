@@ -2,23 +2,17 @@
 
 #include "engine/weights/placement.h"
 
-#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <string>
 #include <unordered_set>
 
 namespace tyloi::engine { class Engine; }
-namespace tyloi::weights { class Cache; }
 
-namespace tyloi::cuda {
+namespace tyloi::engine {
 
-class Executor;
-struct CudaLoadConfig;
-class KvMemoryManager;
-class KvOffloadStore;
-
-struct CudaLoadOptions {
+struct LoadOptions {
+    Device device{};
     std::string model_path, config_path, tokenizer_model;
     std::string moe_cache_profile_path;
     std::unordered_set<int> cpu_offload_layers;
@@ -33,34 +27,15 @@ struct CudaLoadOptions {
     int n_gpu_layers = -1;
 };
 
-struct CudaEngineOptions : CudaLoadOptions {
+struct EngineOptions : LoadOptions {
     int continuous_batching = 0;
     // Zero selects Auto; the resolved runtime limit is always positive.
     int64_t prefill_chunk_size = 0;
 };
 
 /** Load and publish an engine after model, cache and execution preparation succeeds. */
-std::unique_ptr<tyloi::engine::Engine> load_cuda_engine(CudaEngineOptions options);
+std::unique_ptr<Engine> load(EngineOptions options);
 /** Replace dependencies while the engine's reload owner holds the scheduler quiescent. */
-void reload_cuda_engine(tyloi::engine::Engine& engine, CudaEngineOptions options);
+void reload(Engine& engine, EngineOptions options);
 
-} // namespace tyloi::cuda
-
-namespace tyloi::cuda::internal {
-
-void setup_cuda_load(
-    const CudaLoadOptions& options,
-    CudaLoadConfig& config, Executor& executor, tyloi::weights::Cache& weights,
-    std::shared_ptr<KvMemoryManager>& kv, std::shared_ptr<KvOffloadStore>& offload);
-
-} // namespace tyloi::cuda::internal
-
-namespace tyloi::cuda {
-
-void finalize_kv(KvMemoryManager* kv, tyloi::weights::Cache& weights,
-    std::shared_ptr<KvOffloadStore>& offload);
-std::chrono::steady_clock::time_point finish_load(
-    KvMemoryManager* kv, tyloi::weights::Cache& weights, bool report_memory,
-    std::size_t pending_kv = 0);
-
-} // namespace tyloi::cuda
+} // namespace tyloi::engine

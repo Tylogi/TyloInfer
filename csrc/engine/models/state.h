@@ -25,6 +25,8 @@ public:
     // Backing allocated by stage, grouped by device.
     virtual std::vector<std::pair<Device, std::size_t>> growth() const { return {}; }
     virtual void stage() = 0;
+    // Roots of the staged candidate; submit before draining and publishing.
+    virtual std::vector<Tensor> storage() const = 0;
     virtual Tensor target_hidden() const { return {}; }
     // Publish only after staged copies have completed.
     virtual void publish() noexcept = 0;

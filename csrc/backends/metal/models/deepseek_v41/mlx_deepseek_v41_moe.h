@@ -1,5 +1,6 @@
 #pragma once
 
+#include "mlx_projection_batch.h"
 #include "deepseek_v41_model.h"
 #include "mlx_grouped_linear.h"
 #include "mlx_moe.h"

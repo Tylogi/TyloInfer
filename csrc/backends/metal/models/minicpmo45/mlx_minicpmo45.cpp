@@ -1,3 +1,4 @@
+#include "mlx_projection_batch.h"
 #include "mlx_minicpmo45.h"
 #include "engine/backends/metal/ops/attention/attention.h"
 #include "engine/backends/metal/ops/attention/kv.h"

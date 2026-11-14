@@ -1,7 +1,8 @@
 #include "mlx_gguf_expert_cache.h"
 #include "mlx_gguf_prefill.h"
-#include "mfq_container.h"
+#include "mlx_gguf_expert_cache_internal.h"
 #include "mlx_expert_segment_cache.h"
+#include "mlx_expert_segment_cache_internal.h"
 #include "mlx_kernel_prepare.h"
 #include "mlx_moe_ops.h"
 #include "engine/backends/metal/native/resident_allocations.h"
@@ -15,27 +16,24 @@
 #include <cmath>
 
 namespace tyloi::metal {
-namespace {
-using namespace mlx::core;
-struct Projection {
-    struct Rotation { std::int64_t block; std::vector<float> signs; };
-    std::string dtype;
-    Shape shape;
-    int stride = 0;
-    std::vector<std::string> expert_dtypes;
-    std::optional<Rotation> rotation;
-};
-using Layer = std::array<Projection, 3>;
-
-const auto& metadata(const MfqContainer& source) { return source.header().extra_json; }
-const auto& metadata(const tyloi::source::Source& source) { return source.metadata(); }
-const std::string& dtype(const MfqContainer& source, const std::string& name) { return source.record(name).dtype; }
-const std::string& dtype(const tyloi::source::Source& source, const std::string& name) { return tyloi::require_tensor(source, name).dtype; }
-std::uint64_t extent(const MfqContainer& source, const std::string& name) { return source.record(name).nbytes; }
-std::uint64_t extent(const tyloi::source::Source& source, const std::string& name) { return tyloi::require_tensor(source, name).nbytes; }
-std::vector<std::int64_t> shape(const MfqContainer& source, const std::string& name, nlohmann::json&) {
-    return source.tensor_shape(name);
+namespace gguf_cache_detail {
+std::size_t metadata_reservation(const std::vector<Layer>& layers) {
+    std::size_t total = 0;
+    const auto add = [&](std::size_t bytes) {
+        const auto reserved = segment_metadata_reservation(bytes);
+        if (reserved > SIZE_MAX - total) throw std::overflow_error("GGUF metadata extent is too large");
+        total += reserved;
+    };
+    for (const auto& layer : layers) for (const auto& projection : layer) {
+        if (!projection.expert_dtypes.empty()) add(std::size_t(projection.shape[0]) * 2 * sizeof(std::uint32_t));
+        if (projection.rotation) add(projection.rotation->signs.empty() ? sizeof(float) :
+                                      projection.rotation->signs.size() * sizeof(float));
+    }
+    return total;
 }
+const std::unordered_map<std::string, std::string>& metadata(const tyloi::source::Source& source) { return source.metadata(); }
+const std::string& dtype(const tyloi::source::Source& source, const std::string& name) { return tyloi::require_tensor(source, name).dtype; }
+std::uint64_t extent(const tyloi::source::Source& source, const std::string& name) { return tyloi::require_tensor(source, name).nbytes; }
 std::vector<std::int64_t> shape(const tyloi::source::Source& source, const std::string& name, nlohmann::json& shapes) {
     const auto& tensor = tyloi::require_tensor(source, name);
     if (tensor.shape) return *tensor.shape;
@@ -47,14 +45,8 @@ std::vector<std::int64_t> shape(const tyloi::source::Source& source, const std::
     if (!shapes.contains(name)) throw std::runtime_error("missing tensor shape: " + name);
     return shapes.at(name).get<std::vector<std::int64_t>>();
 }
-void prepared(const MfqContainer& source, const std::string& name) { source.record_prepared(name); }
 void prepared(const tyloi::source::Source&, const std::string&) {}
 
-std::optional<Projection::Rotation> rotation(const MfqContainer&, const nlohmann::json& layouts, const std::string& name) {
-    if (!layouts.contains(name)) return std::nullopt;
-    const auto& entry = layouts.at(name);
-    return Projection::Rotation{entry.at("block_size").get<std::int64_t>(), entry.at("signs").get<std::vector<float>>()};
-}
 std::optional<Projection::Rotation> rotation(const tyloi::source::Source& source,
         const nlohmann::json& layouts, const std::string& name) {
     if (const auto* transforms = source.hadamard_transforms()) {
@@ -72,8 +64,15 @@ std::optional<Projection::Rotation> rotation(const tyloi::source::Source& source
     const auto& entry = layouts.at(name);
     return Projection::Rotation{entry.at("block_size").get<std::int64_t>(), entry.at("signs").get<std::vector<float>>()};
 }
-bool normalized_rotations(const MfqContainer&) { return false; }
 bool normalized_rotations(const tyloi::source::Source& source) { return source.hadamard_transforms() != nullptr; }
+} // namespace gguf_cache_detail
+using gguf_cache_detail::Layer;
+using gguf_cache_detail::describe;
+
+namespace {
+using namespace mlx::core;
+using namespace gguf_cache_detail;
+
 void configure(MlxGgufWeight& weight, const Projection& projection) {
     if (projection.rotation) weight.set_hadamard(projection.rotation->block, projection.rotation->signs);
 }
@@ -103,79 +102,8 @@ array ffn(const std::array<MlxGgufWeight, 3>& w, const array& input,
 }
 }
 
-namespace {
-struct Description { std::vector<Layer> layers; std::vector<tyloi::weights::Segments> segments; };
-template<class Source>
-Description describe(const Source& model, const std::vector<std::string>& prefixes) {
-        Description result;
-        const auto& meta = metadata(model);
-        const auto mixed = meta.find("gguf_mixed_experts");
-        const auto mixed_layouts = mixed == meta.end() ? nlohmann::json::object()
-            : nlohmann::json::parse(mixed->second);
-        const auto rotations = meta.find("gguf_hadamard");
-        const auto rotation_layouts = rotations == meta.end() || normalized_rotations(model) ? nlohmann::json::object()
-            : nlohmann::json::parse(rotations->second);
-        nlohmann::json shapes;
-        for (const auto& prefix : prefixes) {
-            Layer layer;
-            tyloi::weights::Segments definition;
-            for (int p = 0; p < 3; ++p) {
-                const auto name = prefix + ".mlp.experts." + std::array{"gate", "up", "down"}[p] + ".weight";
-                auto& projection = layer[p];
-                projection.dtype = dtype(model, name);
-                const auto shape = ::tyloi::metal::shape(model, name, shapes);
-                projection.rotation = rotation(model, rotation_layouts, name);
-                if (!is_gguf_dtype(projection.dtype) || shape.size() != 3 ||
-                    std::any_of(shape.begin(), shape.end(), [](auto d) { return d < 1 || d > INT_MAX; }))
-                    throw std::invalid_argument("GGUF expert cache requires native rank-three tensors");
-                for (const auto d : shape) projection.shape.push_back(int(d));
-                if (projection.dtype == "GGUF_MIXED") {
-                    const auto& entries = mixed_layouts.at(name);
-                    if (!entries.is_array() || entries.size() != std::size_t(shape[0]))
-                        throw std::invalid_argument("GGUF mixed cache expert count differs");
-                    tyloi::weights::Segment field{name};
-                    std::size_t next = 0;
-                    for (const auto& entry : entries) {
-                        const auto dtype = entry.at("dtype").get<std::string>();
-                        const auto offset = entry.at("offset").get<std::uint64_t>();
-                        const auto bytes = entry.at("nbytes").get<std::size_t>();
-                        const auto stride = gguf_packed_row_bytes(dtype, projection.shape[2]);
-                        if (offset != next || offset > extent(model, name) || bytes > extent(model, name) - offset ||
-                            stride > INT_MAX || bytes != std::size_t(shape[1]) * stride)
-                            throw std::invalid_argument("GGUF mixed cache expert byte range differs");
-                        field.expert_offsets.push_back(offset); field.expert_sizes.push_back(bytes);
-                        projection.expert_dtypes.push_back(dtype); next += bytes;
-                    }
-                    if (next != extent(model, name)) throw std::invalid_argument("GGUF mixed cache has trailing bytes");
-                    definition.experts = int(shape[0]); definition.fields.push_back(std::move(field));
-                    prepared(model, name);
-                    continue;
-                }
-                const auto stride = gguf_packed_row_bytes(projection.dtype, projection.shape[2]);
-                if (stride > INT_MAX || std::size_t(shape[1]) > SIZE_MAX / stride)
-                    throw std::overflow_error("GGUF expert extent is too large");
-                projection.stride = int(stride);
-                const auto bytes = std::size_t(shape[1]) * stride;
-                if (bytes > SIZE_MAX / shape[0] || bytes * shape[0] != extent(model, name))
-                    throw std::invalid_argument("GGUF expert extent differs from tensor geometry");
-                definition.experts = int(shape[0]); definition.fields.push_back({name, 0, bytes});
-                prepared(model, name);
-            }
-            if (layer[0].shape != layer[1].shape || layer[2].shape !=
-                Shape{layer[0].shape[0], layer[0].shape[2], layer[0].shape[1]})
-                throw std::invalid_argument("GGUF expert Gate/Up/Down geometry differs");
-            result.layers.push_back(std::move(layer)); result.segments.push_back(std::move(definition));
-        }
-        return result;
-}
-} // namespace
 
-struct MlxGgufExpertCache::Plan::Impl {
-    std::vector<Layer> layers;
-    MlxExpertSegmentCache::Plan segments;
-    Impl(std::vector<Layer> value, MlxExpertSegmentCache::Plan plan)
-        : layers(std::move(value)), segments(std::move(plan)) {}
-};
+
 
 struct MlxGgufExpertCache::Impl {
     std::vector<Layer> layers;
@@ -184,12 +112,6 @@ struct MlxGgufExpertCache::Impl {
 
     Impl(std::vector<Layer> value, MlxExpertSegmentCache::Plan plan, std::size_t budget, int workers)
         : layers(std::move(value)), cache(std::make_unique<MlxExpertSegmentCache>(std::move(plan), budget, workers, true)) {
-        weights.resize(layers.size());
-    }
-    Impl(const MfqContainer& model, const std::vector<std::string>& prefixes, std::size_t budget, int workers) {
-        auto description = describe(model, prefixes);
-        layers = std::move(description.layers);
-        cache = std::make_unique<MlxExpertSegmentCache>(model, std::move(description.segments), budget, workers, true);
         weights.resize(layers.size());
     }
     const std::array<MlxGgufWeight, 3>& layer_weights(std::size_t index) {
@@ -202,8 +124,14 @@ struct MlxGgufExpertCache::Impl {
                 configure(weight, layer[p]);
                 return weight;
             };
-            weights[index] = std::array{
-                load(0), load(1), load(2)};
+            auto loaded = std::array{load(0), load(1), load(2)};
+            std::vector<std::shared_ptr<tyloi::TensorStorage>> storage;
+            for (const auto& weight : loaded) {
+                auto backing = weight.backings();
+                storage.insert(storage.end(), backing.begin(), backing.end());
+            }
+            cache->record_metadata(storage);
+            weights[index] = std::move(loaded);
         }
         return *weights[index];
     }
@@ -219,13 +147,11 @@ MlxGgufExpertCache::Plan MlxGgufExpertCache::plan(
         const tyloi::source::Source& source, const std::vector<std::string>& prefixes) {
     auto description = describe(source, prefixes);
     auto segments = MlxExpertSegmentCache::plan(source, std::move(description.segments));
+    segments.reserve_metadata(gguf_cache_detail::metadata_reservation(description.layers));
     return Plan(std::make_unique<Plan::Impl>(std::move(description.layers), std::move(segments)));
 }
 MlxGgufExpertCache::MlxGgufExpertCache(Plan plan, std::size_t budget, int workers)
     : impl_(std::make_shared<Impl>(std::move(plan.impl_->layers), std::move(plan.impl_->segments), budget, workers)) {}
-MlxGgufExpertCache::MlxGgufExpertCache(const MfqContainer& model,
-    const std::vector<std::string>& prefixes, std::size_t budget, int workers)
-    : impl_(std::make_shared<Impl>(model, prefixes, budget, workers)) {}
 MlxGgufExpertCache::MlxGgufExpertCache(const tyloi::source::Source& source,
     const std::vector<std::string>& prefixes, std::size_t budget, int workers)
     : MlxGgufExpertCache(plan(source, prefixes), budget, workers) {}
@@ -313,6 +239,7 @@ array MlxGgufExpertCache::apply_ffn(std::size_t layer_index, const array& input,
 }
 void MlxGgufExpertCache::set_prefill_next_rows(std::size_t layer, std::size_t rows) { impl_->cache->set_prefill_next_rows(layer, rows); }
 void MlxGgufExpertCache::preload() { impl_->cache->preload(); }
+void MlxGgufExpertCache::drain() { impl_->cache->drain(); }
 std::size_t MlxGgufExpertCache::limit_bytes() const noexcept { return impl_->cache->limit_bytes(); }
 std::size_t MlxGgufExpertCache::backing_bytes() const noexcept { return impl_->cache->backing_bytes(); }
 std::size_t MlxGgufExpertCache::resident_bytes() const noexcept { return impl_->cache->resident_bytes(); }

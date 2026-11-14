@@ -1,6 +1,7 @@
 #include "engine/backends/metal/native/tensor/tensor.h"
 #include "engine/weights/memory.h"
 #include "mlx_gguf.h"
+#include "mlx_gguf_internal.h"
 #include "engine/backends/metal/native/kernel.h"
 #include "mfq_mlx_utils_embedded.h"
 #include "mlx_gguf_prefill.h"
@@ -8,7 +9,6 @@
 #include "mlx_gguf_rotation.h"
 #include "native/mlx_native_gguf.h"
 
-#include "mfq_container.h"
 #include "gguf_embedded.h"
 #include "engine/backends/metal/native/resident_allocations.h"
 #include "engine/backends/metal/native/allocation.h"
@@ -17,7 +17,6 @@
 #include "engine/backends/metal/native/device.h"
 #include "engine/backends/metal/native/env.h"
 #include "mlx_moe_ops.h"
-#include "nlohmann/json.hpp"
 
 #include <mlx/allocator.h>
 #include <mlx/backend/metal/utils.h>
@@ -793,6 +792,13 @@ std::pair<int, int> swiglu_geometry(int gate, int up, int width, int outputs) {
 }
 } // namespace
 
+int gguf_format_id(std::string_view dtype) noexcept {
+    const auto found = std::find_if(std::begin(formats), std::end(formats),
+        [&](const Format& f) { return dtype == f.name; });
+    return found == std::end(formats) ? -1 : found->id;
+}
+bool gguf_staged_enabled() { return use_nax(); }
+
 bool is_gguf_dtype(std::string_view dtype) noexcept { return dtype.substr(0, 5) == "GGUF_"; }
 std::size_t gguf_packed_row_bytes(std::string_view dtype, int width) {
     const auto format = std::find_if(std::begin(formats), std::end(formats),
@@ -807,9 +813,10 @@ MlxGgufRoutePlan gguf_route_plan(const array& ids, int experts, bool wide_mixed)
     return mlx_expert_route_tiles(ids, experts,
         use_nax() && experts > 0 && ids.size() / experts >= 32 ? 32 : 16);
 }
-MlxGgufWeight::MlxGgufWeight(array bytes, Shape shape, int format, int row_bytes, bool indirect)
-    : bytes_(tyloi::metal::tensor(std::move(bytes))), shape_(std::move(shape)), format_(format), row_bytes_(row_bytes), indirect_(indirect) {
-    tyloi::weights::observe_weight(bytes_);
+MlxGgufWeight::MlxGgufWeight(array bytes, Shape shape, int format, int row_bytes, bool indirect, bool observe_weight)
+    : bytes_(tyloi::metal::tensor(std::move(bytes))), shape_(std::move(shape)), format_(format), row_bytes_(row_bytes),
+      indirect_(indirect), observe_weight_(observe_weight) {
+    if (observe_weight_) tyloi::weights::observe_weight(bytes_);
 }
 
 void MlxGgufWeight::prepare_grouped() {
@@ -886,76 +893,6 @@ MlxGgufWeight MlxGgufWeight::from_experts(std::string_view dtype, Shape shape,
         [&](const Format& f) { return dtype == f.name; });
     return MlxGgufWeight(std::move(table), std::move(shape), format->id, checked_int(stride), true);
 }
-bool MlxGgufWeight::supports_native(const MfqContainer& model, const std::string& name) {
-    const auto rotations = model.header().extra_json.find("gguf_hadamard");
-    if (rotations != model.header().extra_json.end() && nlohmann::json::parse(rotations->second).contains(name)) return false;
-    const auto& dtype = model.record(name).dtype;
-    const auto format = std::find_if(std::begin(formats), std::end(formats), [&](const Format& f) { return dtype == f.name; });
-    if (format == std::end(formats)) return false;
-    const auto shape = model.tensor_shape(name);
-    if ((shape.size() != 2 && shape.size() != 3) ||
-        std::any_of(shape.begin(), shape.end(), [](auto d) { return d < 1 || d > INT_MAX; })) return false;
-    return mlx_native_gguf_supported(format->id, int(shape[shape.size() - 2]), int(shape.back()));
-}
-
-MlxGgufWeight MlxGgufWeight::load(const MfqContainer& model, const std::string& name, bool native_projection) {
-    Shape shape;
-    for (const auto d : model.tensor_shape(name)) {
-        if (d <= 0 || d > INT_MAX) throw std::invalid_argument("invalid GGUF tensor dimension");
-        shape.push_back(static_cast<int>(d));
-    }
-    const auto& record = model.record(name);
-    if (record.dtype == "GGUF_MIXED") {
-        if (shape.size() != 3) throw std::invalid_argument("mixed GGUF weights require an expert bank");
-        const auto layouts = nlohmann::json::parse(model.header().extra_json.at("gguf_mixed_experts"));
-        const auto& entries = layouts.at(name);
-        if (!entries.is_array() || entries.size() != std::size_t(shape[0]))
-            throw std::invalid_argument("mixed GGUF expert layout length mismatch");
-        std::vector<std::int32_t> ids;
-        std::vector<std::string> dtypes;
-        std::vector<array> storage;
-        std::size_t next = 0;
-        for (const auto& entry : entries) {
-            const auto dtype = entry.at("dtype").get<std::string>();
-            const auto offset = entry.at("offset").get<std::size_t>();
-            const auto bytes = entry.at("nbytes").get<std::size_t>();
-            if (offset != next || offset > record.nbytes || bytes > record.nbytes - offset ||
-                bytes != std::size_t(shape[1]) * gguf_packed_row_bytes(dtype, shape[2]))
-                throw std::invalid_argument("mixed GGUF expert byte ranges disagree");
-            auto value = array(allocator::malloc(bytes), Shape{checked_int(bytes)}, uint8);
-            model.read_range_into(name, offset, {reinterpret_cast<std::byte*>(value.data<std::uint8_t>()), bytes});
-            ids.push_back(int(ids.size())); dtypes.push_back(dtype); storage.push_back(std::move(value));
-            next += bytes;
-        }
-        if (next != record.nbytes) throw std::invalid_argument("mixed GGUF expert payload has trailing bytes");
-        auto result = from_mixed_experts(std::move(shape), ids, dtypes, storage);
-        result.configure_hadamard(model, name);
-        model.record_prepared(name);
-        return result;
-    }
-    auto result = allocate_packed(record.dtype, std::move(shape), record.nbytes);
-    result.configure_hadamard(model, name);
-    auto packed = tyloi::metal::array(result.bytes_);
-    model.read_range_into(name, 0, {reinterpret_cast<std::byte*>(packed.data<std::uint8_t>()), record.nbytes});
-    if (native_projection && result.shape_.size() == 2 && supports_native(model, name)) {
-        auto prepared = mlx_native_gguf_pack(tyloi::metal::array(result.bytes_), result.format_, result.output_size(), result.input_size(), result.row_bytes_);
-        eval(std::vector<array>(prepared.planes.begin(), prepared.planes.end()));
-        for (const auto& plane : prepared.planes) {
-            tyloi::metal::AllocationScope::record(plane);
-            tyloi::weights::observe_weight(tyloi::metal::tensor(plane));
-        }
-        result.native_ = std::make_shared<MlxNativeGgufWeight>(std::move(prepared));
-    }
-    if (!result.native_ && use_nax() && result.expert_count() <= 512)
-        MlxGgufStagedPrefill::prepare(result);
-    tyloi::metal::AllocationScope::record(tyloi::metal::array(result.bytes_));
-    if (result.planes_) for (const auto& plane : *result.planes_) {
-        tyloi::metal::AllocationScope::record(tyloi::metal::array(plane));
-        tyloi::weights::observe_weight(plane);
-    }
-    model.record_prepared(name);
-    return result;
-}
 MlxGgufWeight MlxGgufWeight::from_address_table(std::string_view dtype, Shape shape,
     array table, std::shared_ptr<tyloi::metal::ResidentAllocations> residency) {
     if (shape.size() != 3 || shape[0] <= 0 || shape[1] <= 0 || table.dtype() != uint64 ||
@@ -969,7 +906,7 @@ MlxGgufWeight MlxGgufWeight::from_address_table(std::string_view dtype, Shape sh
     register_indirect_weight_pool(handle, owner->residency);
     const auto format = std::find_if(std::begin(formats), std::end(formats),
         [&](const Format& f) { return dtype == f.name; });
-    return MlxGgufWeight(std::move(handle), std::move(shape), format->id, checked_int(stride), true);
+    return MlxGgufWeight(std::move(handle), std::move(shape), format->id, checked_int(stride), true, false);
 }
 std::size_t MlxGgufWeight::packed_nbytes() const noexcept {
     const auto transform_bytes = rotation_ ? rotation_->signs.nbytes() : 0;

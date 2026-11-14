@@ -1,4 +1,5 @@
 #include "engine/ops.h"
+#include "engine/backends/cpu/ops/tensor.h"
 
 #if TYLOINFER_HAS_CUDA
 #include "engine/backends/cuda/executor/executor.h"
@@ -7,8 +8,6 @@
 #include "engine/backends/cuda/native/device.h"
 #include <algorithm>
 #include <cstring>
-#else
-#include "engine/backends/cpu/ops/tensor.h"
 #endif
 #if TYLOINFER_HAS_METAL
 #include "engine/backends/metal/ops/tensor.h"
@@ -225,6 +224,7 @@ void fill(Tensor& value_tensor, double fill_value) {
 
 
 Tensor cast(const Tensor& value_tensor, ScalarType type) {
+    if (value_tensor.defined() && value_tensor.device().is_cpu()) return cpu::ops::cast(value_tensor, type);
 #if TYLOINFER_HAS_METAL
     if (value_tensor.defined() && value_tensor.device().is_metal()) return metal::ops::cast(value_tensor, type);
 #endif
@@ -285,6 +285,8 @@ Tensor update_slice(const Tensor& destination, const Tensor& source, std::int64_
 }
 
 Tensor cat(std::span<const Tensor> values, std::int64_t dim) {
+    if (!values.empty() && values.front().defined() && values.front().device().is_cpu())
+        return cpu::ops::cat(values, dim);
 #if TYLOINFER_HAS_METAL
     for (const auto& value : values)
         if (value.defined() && value.device().is_metal()) return metal::ops::cat(values, dim);

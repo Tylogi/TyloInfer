@@ -3,7 +3,7 @@
 #include "engine/models/common/load.h"
 #include "engine/models/source/model_config.h"
 #include "env.h"
-#include "engine/load.h"
+#include "engine/backends/cuda/load.h"
 #include "engine/drain.h"
 #include "engine/backends/cuda/native/scope.h"
 #include "engine/backends/cuda/executor/config.h"
@@ -47,7 +47,7 @@ class EngineInstance final : public Engine {
     }
 
   public:
-    explicit EngineInstance(CudaEngineOptions options) : options{std::move(options)} {
+    explicit EngineInstance(tyloi::engine::EngineOptions options) : options{std::move(options)} {
         load();
         start();
     }
@@ -112,8 +112,8 @@ class EngineInstance final : public Engine {
     }
 
   private:
-    friend void ::tyloi::cuda::reload_cuda_engine(engine::Engine&, CudaEngineOptions);
-    CudaEngineOptions options;
+    friend void ::tyloi::cuda::reload(engine::Engine&, tyloi::engine::EngineOptions);
+    tyloi::engine::EngineOptions options;
     std::shared_ptr<KvMemoryManager> kv;
     ::tyloi::weights::Cache weights;
     std::shared_ptr<KvOffloadStore> offload;

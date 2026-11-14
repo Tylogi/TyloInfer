@@ -1,7 +1,7 @@
 #pragma once
 
 #include "engine/models/plan.h"
-#include "engine/load.h"
+#include "engine/backends/cuda/load.h"
 #include "engine/backends/cuda/native/scope.h"
 #include "engine/backends/cuda/executor/config.h"
 #include "engine/models/deepseek_v41/load.h"
@@ -51,7 +51,7 @@ template <bool IncludeQwen = true>
 inline constexpr auto with_model = []<typename F>(
         CudaLoadConfig& config, Executor& root, tyloi::weights::Cache& cache,
         std::shared_ptr<KvMemoryManager>& kv, std::shared_ptr<KvOffloadStore>& offload,
-        const CudaLoadOptions& options,
+        const tyloi::engine::LoadOptions& options,
         bool load_optional_components,
         F&& run) -> auto {
     root.configure_kv(kv, offload);

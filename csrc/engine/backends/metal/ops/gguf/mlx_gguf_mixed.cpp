@@ -538,7 +538,7 @@ MlxGgufWeight MlxGgufWeight::from_mixed_address_table(Shape shape, const std::ve
     auto owner = std::make_shared<Lifetime>(Lifetime{table, std::move(residency)});
     auto handle = mlx_buffer_view(table.buffer(), table.shape(), uint64, owner);
     register_indirect_weight_pool(handle, owner->residency);
-    MlxGgufWeight result(std::move(handle), std::move(shape), -1, 0, true);
+    MlxGgufWeight result(std::move(handle), std::move(shape), -1, 0, true, false);
     result.mixed_layout_ = tyloi::metal::tensor(array(layout.begin(), Shape{result.expert_count(), 2}, uint32));
     result.mixed_mask_ = mask;
     return result;

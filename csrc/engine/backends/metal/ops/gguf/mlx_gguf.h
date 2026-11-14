@@ -1,5 +1,10 @@
 #pragma once
 
+#include <memory>
+#include <vector>
+
+namespace tyloi { struct TensorStorage; }
+
 #include <mlx/mlx.h>
 #include "engine/tensor.h"
 #include <array>
@@ -30,6 +35,7 @@ MlxGgufRoutePlan gguf_route_plan(const mlx::core::array& ids, int experts, bool 
 
 class MlxGgufWeight {
 public:
+    std::vector<std::shared_ptr<tyloi::TensorStorage>> backings() const;
     static MlxGgufWeight load(const MfqContainer& model, const std::string& name, bool native_projection = false);
     static bool supports_native(const MfqContainer& model, const std::string& name);
     const MlxNativeGgufWeight* native_weight_ref() const noexcept { return native_.get(); }
@@ -88,7 +94,7 @@ private:
     static MlxGgufWeight allocate_packed(std::string_view dtype, mlx::core::Shape shape,
         std::size_t bytes);
     MlxGgufWeight(mlx::core::array bytes, mlx::core::Shape shape, int format, int row_bytes,
-        bool indirect = false);
+        bool indirect = false, bool observe_weight = true);
     mlx::core::array mixed_matmul(const mlx::core::array& input, const mlx::core::array& ids,
         bool shared_input, const MlxGgufRoutePlan* plan, const mlx::core::array* gathered_input = nullptr) const;
     mlx::core::array mixed_swiglu(const MlxGgufWeight& up, const mlx::core::array& input,
@@ -101,7 +107,7 @@ private:
     mlx::core::Shape shape_;
     int format_;
     int row_bytes_;
-    bool indirect_;
+    bool indirect_, observe_weight_;
     std::optional<std::array<tyloi::Tensor, 2>> planes_;
     std::shared_ptr<const MlxNativeGgufWeight> native_;
     std::optional<tyloi::Tensor> mixed_layout_;
