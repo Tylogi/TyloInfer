@@ -18,9 +18,6 @@ struct NintStage final : RowStage {
     const Tensor& output() const override { return stage->output(); }
     bool mapped_rows() const override { return stage->mapped_rows(); }
     void decode() override { stage->decode(); }
-    void prefetch_rows(const std::vector<std::int64_t>& ids, const std::vector<std::int64_t>& shape) override {
-        pipeline->issue(ids, shape, false);
-    }
     void upload(const std::vector<std::int64_t>& ids, const std::vector<std::int64_t>& shape) override {
         pipeline->upload(*stage, ids, shape);
     }

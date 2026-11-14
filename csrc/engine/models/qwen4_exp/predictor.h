@@ -96,7 +96,6 @@ struct Predictor final : tyloi::models::Mtp {
         int maximum_depth, tyloi::engine::mtp::PolicyState& state) const override;
     bool supports_session_state(const tyloi::models::MtpState&) const noexcept override;
     MtpSessionState capture_session_state(const tyloi::models::MtpState&, int64_t,const tyloi::Tensor&) const override;
-    void restore_session_state(tyloi::models::MtpState&, const MtpSessionState&) const override;
 };
 
 } // namespace tyloi::cuda::qwen4_exp

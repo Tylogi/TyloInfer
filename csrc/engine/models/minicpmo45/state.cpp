@@ -11,17 +11,39 @@
 namespace tyloi::cuda::minicpmo45 {
 
 #ifdef TYLOINFER_NATIVE_CUDA
+namespace {
+void add_growth(std::vector<std::pair<Device, std::size_t>>& values, Device device, std::size_t bytes) {
+    auto it = std::find_if(values.begin(), values.end(), [device](const auto& item) { return item.first == device; });
+    if (it == values.end()) values.emplace_back(device, bytes);
+    else {
+        if (it->second > std::numeric_limits<std::size_t>::max() - bytes)
+            throw std::overflow_error("MiniCPM state growth overflow");
+        it->second += bytes;
+    }
+}
+}
+
 std::unique_ptr<tyloi::models::State> Model::make_state() const {
     return std::make_unique<State>(*this);
+}
+
+std::vector<std::pair<tyloi::Device, std::size_t>> State::preallocate_growth() const {
+    std::vector<std::pair<tyloi::Device, std::size_t>> result;
+    for (std::size_t index = 0; index < layers.size(); ++index) {
+        const auto& layout = layout_[index];
+        if (layout.cpu || layers[index].defined()) continue;
+        add_growth(result, Device(kCUDA, layout.device),
+            tyloi::state::kv_bytes(1, layout.heads, layout.capacity, layout.head_dim, false, kFloat16, {}));
+    }
+    return result;
 }
 
 std::vector<std::pair<tyloi::Device, std::size_t>> State::growth(
         const tyloi::models::Input& input, const tyloi::models::ForwardOptions& options) const {
     const auto [next_batch, tokens] = input.shape();
-    if (batch <= 0 || next_batch != batch || cache_pos < 0 || input.confirmed != 0 || input.suffix)
+    if (batch <= 0 || next_batch != batch || cache_pos < 0 || input.confirmed != 0 || input.suffix ||
+        tokens > maximum_ || cache_pos > maximum_ - tokens)
         throw std::invalid_argument("MiniCPM TTS KV planning requires positive batch and tokens and a nonnegative position");
-    if (cache_pos > std::numeric_limits<std::int64_t>::max() - tokens)
-        throw std::overflow_error("MiniCPM TTS KV planning position overflow");
     const auto end = cache_pos + tokens;
     std::vector<std::pair<tyloi::Device, std::size_t>> result;
     for (std::size_t index = 0; index < layers.size(); ++index) {
@@ -30,15 +52,8 @@ std::vector<std::pair<tyloi::Device, std::size_t>> State::growth(
         const auto capacity = options.kv_capacity > 0 ? std::max(end, options.kv_capacity) : layout.capacity;
         const auto bytes = tyloi::state::kv_bytes(batch, layout.heads, capacity, layout.head_dim,
                                                    false, tyloi::kFloat16, {});
-        const tyloi::Device device(layout.cpu ? tyloi::kCPU : tyloi::kCUDA, layout.cpu ? -1 : layout.device);
-        auto entry = std::find_if(result.begin(), result.end(),
-                                  [device](const auto& item) { return item.first == device; });
-        if (entry == result.end()) result.emplace_back(device, bytes);
-        else {
-            if (entry->second > std::numeric_limits<std::size_t>::max() - bytes)
-                throw std::overflow_error("MiniCPM TTS KV planning byte count overflow");
-            entry->second += bytes;
-        }
+        const tyloi::Device device(layout.cpu ? tyloi::kCPU : tyloi::kCUDA, layout.cpu ? 0 : layout.device);
+        add_growth(result, device, bytes);
     }
     return result;
 }
@@ -46,7 +61,6 @@ std::vector<std::pair<tyloi::Device, std::size_t>> State::growth(
 
 State::State(const Model& model)
     : layers(model.layers.size())
-    , model_(&model)
     , maximum_(model.metadata.max_position_embeddings)
 {
     for (const auto& layer : model.layers)
@@ -148,34 +162,10 @@ void State::publish(Restore&& restore) noexcept {
     batch = 1;
 }
 
-namespace {
-void add_growth(std::vector<std::pair<Device,std::size_t>>& values,Device device,std::size_t bytes) {
-    if (!device.is_cuda() || !bytes) return;
-    auto it=std::find_if(values.begin(),values.end(),[&](const auto& item){return item.first==device;});
-    if (it==values.end()) values.emplace_back(device,bytes);
-    else { if (it->second>std::numeric_limits<std::size_t>::max()-bytes) throw std::overflow_error("MiniCPM state growth overflow"); it->second+=bytes; }
-}
-}
-std::vector<std::pair<Device,std::size_t>> State::reset_growth(std::int64_t batch) const {
-    if (batch<=0) throw std::invalid_argument("MiniCPM batch must be positive");
-    return {};
-}
-std::vector<std::pair<Device,std::size_t>> State::growth(std::int64_t next_batch,std::int64_t tokens,
-        const tyloi::models::ForwardOptions& options,std::int64_t confirmed) const {
-    if (next_batch<=0 || tokens<=0 || confirmed!=0 || cache_pos<0 ||
-        tokens>maximum_ || cache_pos>maximum_-tokens || (cache_pos>0 && batch!=next_batch))
-        throw std::invalid_argument("invalid MiniCPM forward geometry");
-    std::vector<std::pair<Device,std::size_t>> result;
-    for (std::size_t i=0;i<layers.size();++i) {
-        const auto& l=layout_[i];
-        if (layers[i].defined() && (cache_pos!=0 || layers[i].batch==next_batch)) continue;
-        const auto capacity=false ? l.capacity : (options.kv_capacity>0 ? std::max(cache_pos+tokens,options.kv_capacity) : l.capacity);
-        const Device device(l.cpu?kCPU:kCUDA,l.cpu?0:l.device);
-        add_growth(result,device,tyloi::state::kv_bytes(next_batch,l.heads,capacity,l.head_dim,false,kFloat16,{}));
-    }
-    return result;
-}
-std::unique_ptr<tyloi::models::Restore> State::prepare_restore(const TextSessionState& snapshot) {
+#ifdef TYLOINFER_NATIVE_CUDA
+std::unique_ptr<tyloi::models::Restore> State::prepare_restore(
+        const TextSessionState& snapshot, const tyloi::models::Mtp* predictor_model) {
+    if (predictor_model) throw CudaSessionStateError("MiniCPM TTS does not support a predictor");
     struct Candidate final : tyloi::models::Restore {
         State& owner; TextSessionState snapshot; State::Restore candidate;
         Candidate(State& state,const TextSessionState& value) : owner(state),snapshot(value),candidate(state.prepare(snapshot)) {}
@@ -192,5 +182,6 @@ std::unique_ptr<tyloi::models::Restore> State::prepare_restore(const TextSession
     };
     return std::make_unique<Candidate>(*this,snapshot);
 }
+#endif
 
 } // namespace tyloi::cuda::minicpmo45

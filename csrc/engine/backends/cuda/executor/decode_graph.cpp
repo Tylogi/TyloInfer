@@ -8,8 +8,8 @@
 #include <exception>
 #include <iostream>
 
-DecodeGraphBranchScope::DecodeGraphBranchScope()
-    : setting(tyloi::cuda::Executor::current().mode().ffn.serial), previous(setting) {
+DecodeGraphBranchScope::DecodeGraphBranchScope(bool& value)
+    : setting(value), previous(value) {
     auto mode = tyloi::cuda::Executor::current_ffn();
     mode.serial = true;
     scope_ = tyloi::cuda::Executor::current().enter(mode);

@@ -126,9 +126,7 @@ template <class Backend> class SessionCache : public tyloi::state::Sessions {
             if constexpr(requires { Backend::prepare_restore(*match->state,bool{}); })
                 Backend::prepare_restore(*match->state,paged_cache_ && paged_disk_budget_>0);
             Restore restored{match->tokens(), {}};
-            if (mtp != nullptr)
-                restored.mtp_last_target_hidden = match->state->mtp->last_target_hidden;
-            Backend::restore(state, *match->state, mtp, resources...);
+            restored.mtp_last_target_hidden = Backend::restore(state, *match->state, mtp, resources...);
             snapshots_.record_hit(*match);
             if (paged_cache_ && native_hot_snapshots_) paged_cache_->record_match(match->tokens());
             if (trace_) {
@@ -437,9 +435,7 @@ template <class Backend> class SessionCache : public tyloi::state::Sessions {
             if constexpr(requires { Backend::prepare_restore(snapshot,bool{}); })
                 Backend::prepare_restore(snapshot,paged_disk_budget_>0);
             Restore restored{match.matched_tokens,{}};
-            if(mtp)
-                restored.mtp_last_target_hidden=snapshot.mtp->last_target_hidden;
-            Backend::restore(state, snapshot, mtp, resources...);
+            restored.mtp_last_target_hidden = Backend::restore(state, snapshot, mtp, resources...);
             if (native_hot_snapshots_)
                 snapshots_.store(requested_session.empty() ? "\x01prefix-" + std::to_string(++anonymous_snapshots_) : requested_session,
                     std::move(snapshot), [](const Snapshot &saved, const Snapshot &candidate) {

@@ -32,8 +32,8 @@ public:
     }
 
     void raw(const void* data, size_t size);
-    /** Append tensor metadata and contiguous host bytes to the payload. */
-    void tensor(const ::tyloi::Tensor& source);
+    /** Append tensor metadata and host bytes, preserving a decoded tensor's original device. */
+    void tensor(const ::tyloi::Tensor& source, int original_device = -1);
     CudaPagedPayload finish() &&;
 
 private:

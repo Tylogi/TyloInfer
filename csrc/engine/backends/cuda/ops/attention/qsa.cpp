@@ -92,10 +92,10 @@ void Qsa::validate_session(const State& state, const Snapshot& snapshot, std::in
 std::size_t Qsa::fresh_session_growth(const State& state, std::int64_t count) const {
     return impl_->core.fresh_session_growth(state.impl_->cache, count);
 }
-void Qsa::stage_session(State& state, const Snapshot& snapshot, std::int64_t count) const {
+void Qsa::stage_session(State& state, const Snapshot& snapshot, std::int64_t count, Device device) const {
     std::optional<MfqCudaGuard> guard;
     if (impl_->device.is_cuda()) guard.emplace(impl_->device);
-    impl_->core.stage_session(state.impl_->cache, snapshot, count);
+    impl_->core.stage_session(state.impl_->cache, snapshot, count, device);
 }
 std::size_t Qsa::session_bytes(const State& state, std::int64_t count) const {
     return impl_->core.session_bytes(state.impl_->cache, count);

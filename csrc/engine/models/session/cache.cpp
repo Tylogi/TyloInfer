@@ -71,10 +71,10 @@ std::shared_ptr<tyloi::cache::PagedPrefixCache> make_cuda_paged_prefix_cache(
     return std::make_shared<tyloi::cache::PagedPrefixCache>(std::move(cache));
 }
 
-void CudaSessionOps::restore(tyloi::models::State& state, const Snapshot& snapshot,
+tyloi::Tensor CudaSessionOps::restore(tyloi::models::State& state, const Snapshot& snapshot,
         tyloi::models::Mtp* mtp, tyloi::Executor& executor,
         tyloi::weights::Cache& weights, tyloi::engine::Budget& budget) {
-    tyloi::state::restore(state, snapshot, executor, weights, budget, mtp);
+    return tyloi::state::restore(state, snapshot, executor, weights, budget, mtp);
 }
 
 void CudaSessionOps::release_host_cache() {

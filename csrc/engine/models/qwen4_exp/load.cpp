@@ -4,16 +4,9 @@
 #include "engine/models/qwen4_exp/components.h"
 #include "engine/models/qwen4_exp/layer.h"
 #include "engine/models/qwen4_exp/causal_lm.h"
-#include "engine/backends/cuda/ops/projection/nint.h"
-#include "engine/backends/cuda/ops/projection/quant_linear.h"
 #include "engine/weights/loader.h"
 #include "engine/weights/source/read.h"
 #include "engine/weights/group.h"
-#include "engine/weights/encoding/quant/nint_rows.h"
-#include "engine/weights/encoding/tq.h"
-#include "engine/weights/tq/source.h"
-#include "engine/weights/tq/rows.h"
-#include "engine/weights/nint_row_pipeline.h"
 #include "engine/models/qwen4_exp/predictor.h"
 #include "engine/ops/ffn.h"
 #include "engine/ops/gdn.h"
@@ -42,12 +35,7 @@ using Config = tyloi::models::qwen4_exp::Config;
 struct LayerLoader : tyloi::weights::Loader {
     using PleWeights = qwen4_exp::PleWeights;
     const tyloi::ops::YarnScaling& yarn;
-    struct Embedding {
-        attention_ops::Embedding function;
-        std::shared_ptr<tyloi::NintRows> range;
-        std::shared_ptr<tyloi::TqTable> tq;
-        DenseTensor operator()(const DenseTensor& ids) const { return function(ids); }
-    };
+    using Embedding = ::tyloi::Tensor;
 
     auto residual(::tyloi::Tensor norm, ::tyloi::Tensor down, ::tyloi::Tensor up,
                   ::tyloi::Tensor injection, const Config& c, bool final) const {
@@ -134,27 +122,9 @@ struct LayerLoader : tyloi::weights::Loader {
         return tyloi::ops::qwen4_ffn_weights(std::move(f));
     }
     auto embedding(const std::string &name) const {
-        if(tyloi::is_tq_table(source,name)) {
-            auto table=tyloi::tq_table(source,name);
-            Embedding lookup{[table](const DenseTensor& ids){
-                auto result=lookup_tq_table(*table,ids);
-                return result.dense();
-            },{},table};
-            return std::pair{std::move(lookup),std::array<int64_t,2>{static_cast<int64_t>(table->rows()),table->width()}};
-        }
-#if TYLOINFER_ENABLE_MFQ_COMPAT
-        if (require_tensor(source, name).dtype == "NINT") {
-            auto table = load_nint_row_table(source, name);
-            Embedding lookup{[table](const DenseTensor &ids) {
-                return nint_row_embedding_lookup(*table, ids);
-            },table};
-            return std::pair{std::move(lookup), std::array<int64_t, 2>{table->rows(), table->width()}};
-        }
-#endif
-
-        auto weight = this->weight(name);
-        Embedding lookup{[weight](const DenseTensor &ids) { return quant_embedding_lookup(weight, ids); },{}};
-        return std::pair{std::move(lookup), std::array<int64_t, 2>{weight.size(0), weight.size(1)}};
+        auto table = rows(name);
+        const std::array<int64_t,2> shape{table.size(0), table.size(1)};
+        return std::pair{std::move(table), shape};
     }
     std::vector<int64_t> integers(const std::string &name) const {
         const auto &type = require_tensor(source, name).dtype;
@@ -167,26 +137,8 @@ struct LayerLoader : tyloi::weights::Loader {
     static auto ple(std::vector<Embedding> shards, int64_t rows, int64_t width, const Config &c,
                     std::vector<int64_t> multipliers, std::vector<int64_t> offsets,
                     std::vector<int64_t> sizes, PleWeights weights) {
-        std::vector<attention_ops::Embedding> functions;std::vector<std::shared_ptr<tyloi::NintRows>> ranges;
-        std::vector<std::shared_ptr<tyloi::TqTable>> tq;
-        for(auto& shard:shards){functions.push_back(std::move(shard.function));ranges.push_back(std::move(shard.range));tq.push_back(std::move(shard.tq));}
-#if TYLOINFER_ENABLE_MFQ_COMPAT
-        if(!std::all_of(ranges.begin(),ranges.end(),[](const auto& p){return bool(p);})) ranges.clear();
-#else
-        ranges.clear();
-#endif
-        NgramEmbedding::RowLookup row_lookup;
-        NgramEmbedding::StageFactory stage_factory;
-        if(std::all_of(tq.begin(),tq.end(),[](const auto& p){return bool(p);})) {
-            row_lookup=[tq,rows](const auto& ids,const auto& device) {
-                return lookup_tq_shards(tq,rows,ids,device);
-            };
-            stage_factory=[tq=std::move(tq),rows](const auto& shape,const auto& device) {
-                return make_tq_row_stage(tq,rows,shape,device);
-            };
-        }
-        NgramEmbedding embedding(std::move(functions), rows, width, c.ngram, c.ngram_heads, c.eos,
-                                 std::move(multipliers), std::move(offsets), std::move(sizes),std::move(ranges),std::move(row_lookup),std::move(stage_factory));
+        NgramEmbedding embedding(std::move(shards), rows, width, c.ngram, c.ngram_heads, c.eos,
+                                 std::move(multipliers), std::move(offsets), std::move(sizes));
         return std::make_unique<Ple>(std::move(embedding), std::move(weights), c.hidden, c.streams,
                                      c.ngram, c.eps);
     }

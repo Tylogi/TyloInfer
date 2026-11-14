@@ -22,22 +22,23 @@ Qwen4PagedHeader read_qwen4_header(CudaPagedReader& reader) {
     if(!header.count || !header.layers || header.layers>4096)throw CudaSessionStateError("invalid Qwen4 prefix geometry");
     return header;
 }
-void write_optional(CudaPagedWriter& writer,const ::tyloi::Tensor& tensor) {
+void write_optional(CudaPagedWriter& writer,const ::tyloi::Tensor& tensor,int device = -1) {
     if(tensor.defined() && !tensor.representation<::tyloi::DenseTensor>())throw CudaSessionStateError("incompatible Qwen4 session tensor");
-    writer.scalar<uint32_t>(tensor.defined()?1:0);if(tensor.defined())writer.tensor(tensor);
+    writer.scalar<uint32_t>(tensor.defined()?1:0);if(tensor.defined())writer.tensor(tensor,device);
 }
-::tyloi::Tensor read_optional(CudaPagedReader& reader) {
+::tyloi::Tensor read_optional(CudaPagedReader& reader,int& device) {
     if(!reader.scalar<uint32_t>("tensor presence"))return {};
-    auto [tensor,device]=reader.tensor();
-    return tensor.relocated(::tyloi::Device{::tyloi::DeviceType::cuda,device});
+    auto value=reader.tensor();
+    device=value.second;
+    return std::move(value.first);
 }
 void write_recurrent(CudaPagedWriter& writer,const tyloi::models::qwen4_exp::LayerSnapshot& layer) {
-    write_optional(writer,layer.convolution);write_optional(writer,layer.recurrent);write_optional(writer,layer.ple_convolution);
+    write_optional(writer,layer.convolution,layer.devices[3]);write_optional(writer,layer.recurrent,layer.devices[4]);write_optional(writer,layer.ple_convolution,layer.devices[5]);
     writer.scalar<int64_t>(layer.ple_batch);writer.scalar<uint32_t>(uint32_t(layer.ple_tokens.size()));
     for(auto token:layer.ple_tokens)writer.scalar<int64_t>(token);
 }
 void read_recurrent(CudaPagedReader& reader,tyloi::models::qwen4_exp::LayerSnapshot& layer) {
-    layer.convolution=read_optional(reader);layer.recurrent=read_optional(reader);layer.ple_convolution=read_optional(reader);
+    layer.convolution=read_optional(reader,layer.devices[3]);layer.recurrent=read_optional(reader,layer.devices[4]);layer.ple_convolution=read_optional(reader,layer.devices[5]);
     layer.ple_batch=reader.scalar<int64_t>("PLE batch");
     const auto count=reader.scalar<uint32_t>("PLE history length");
     if(count>65536)throw CudaSessionStateError("invalid Qwen4 PLE history");
@@ -45,16 +46,19 @@ void read_recurrent(CudaPagedReader& reader,tyloi::models::qwen4_exp::LayerSnaps
 }
 void write_qwen4_mtp(CudaPagedWriter& writer,const MtpSessionState& state) {
     const auto* snapshot=std::get_if<tyloi::models::qwen4_exp::MtpSnapshot>(&state.payload);
-    if(!snapshot)throw CudaSessionStateError("incompatible Qwen4 MTP session state");
+    if(!snapshot || snapshot->positions.size()!=snapshot->layers.size() ||
+        snapshot->lengths.size()!=snapshot->layers.size() ||
+        (!snapshot->positions_devices.empty() && snapshot->positions_devices.size()!=snapshot->layers.size()))
+        throw CudaSessionStateError("incompatible Qwen4 MTP session state");
     const auto* hidden=state.last_target_hidden.representation<::tyloi::DenseTensor>();
     if(state.last_target_hidden.defined() && !hidden)throw CudaSessionStateError("incompatible Qwen4 MTP session state");
     writer.scalar<int64_t>(state.cache_pos);
-    write_optional(writer,state.last_target_hidden);
+    write_optional(writer,state.last_target_hidden,snapshot->hidden_device);
     writer.scalar<uint32_t>(uint32_t(snapshot->layers.size()));
     for(std::size_t i=0;i<snapshot->layers.size();++i) {
         const auto& layer=snapshot->layers[i];
-        write_optional(writer,layer.keys);write_optional(writer,layer.values);write_optional(writer,layer.index);
-        write_recurrent(writer,layer);write_optional(writer,snapshot->positions[i]);
+        write_optional(writer,layer.keys,layer.devices[0]);write_optional(writer,layer.values,layer.devices[1]);write_optional(writer,layer.index,layer.devices[2]);
+        write_recurrent(writer,layer);write_optional(writer,snapshot->positions[i],snapshot->positions_devices.empty() ? -1 : snapshot->positions_devices[i]);
         writer.scalar<int64_t>(snapshot->lengths[i]);
     }
 }
@@ -66,16 +70,16 @@ std::size_t qwen4_layer_bytes(const tyloi::models::qwen4_exp::LayerSnapshot& lay
 }
 MtpSessionState read_qwen4_mtp(CudaPagedReader& reader) {
     MtpSessionState state;state.cache_pos=reader.scalar<int64_t>("MTP position");
-    auto hidden=read_optional(reader);
+    int hidden_device=-1; auto hidden=read_optional(reader,hidden_device);
     if(hidden)state.bytes=session_tensor_bytes(hidden);
     state.last_target_hidden=std::move(hidden);
     const auto count=reader.scalar<uint32_t>("MTP layers");
     if(!count || count>64)throw CudaSessionStateError("invalid Qwen4 MTP layers");
-    auto& snapshot=state.payload.emplace<tyloi::models::qwen4_exp::MtpSnapshot>();
+    auto& snapshot=state.payload.emplace<tyloi::models::qwen4_exp::MtpSnapshot>();snapshot.hidden_device=hidden_device;
     for(uint32_t i=0;i<count;++i) {
-        tyloi::models::qwen4_exp::LayerSnapshot layer;layer.keys=read_optional(reader);layer.values=read_optional(reader);layer.index=read_optional(reader);
+        tyloi::models::qwen4_exp::LayerSnapshot layer;layer.keys=read_optional(reader,layer.devices[0]);layer.values=read_optional(reader,layer.devices[1]);layer.index=read_optional(reader,layer.devices[2]);
         read_recurrent(reader,layer);state.bytes+=qwen4_layer_bytes(layer);snapshot.layers.push_back(std::move(layer));
-        auto positions=read_optional(reader);if(positions)state.bytes+=session_tensor_bytes(positions);snapshot.positions.push_back(std::move(positions));
+        int device=-1; auto positions=read_optional(reader,device);if(positions)state.bytes+=session_tensor_bytes(positions);snapshot.positions.push_back(std::move(positions));snapshot.positions_devices.push_back(device);
         snapshot.lengths.push_back(reader.scalar<int64_t>("MTP layer position"));
     }
     return state;
@@ -93,18 +97,20 @@ CudaPagedPayload encode_block(const TextSessionState& state,size_t block_size,si
     writer.scalar<uint32_t>(uint32_t(start));writer.scalar<uint32_t>(uint32_t(count));
     writer.scalar<uint32_t>(uint32_t(snapshot->layers.size()));writer.scalar<uint32_t>(exact?1:0);
     for(const auto& layer:snapshot->layers) {
-        for(const auto& tensor:{layer.keys,layer.values,layer.index}) {
+        const std::array<::tyloi::Tensor,3> tensors{layer.keys,layer.values,layer.index};
+        for(size_t field=0;field<tensors.size();++field) {
+            const auto& tensor=tensors[field];
             const auto* dense=tensor.representation<::tyloi::DenseTensor>();
             if(tensor.defined() && !dense)throw CudaSessionStateError("incompatible Qwen4 session tensor");
             if(dense && dense->defined()) {
                 auto slice=dense->narrow(1,int64_t(start),int64_t(count));
-                write_optional(writer,slice);
+                write_optional(writer,slice,layer.devices[field]);
             } else write_optional(writer,::tyloi::Tensor{});
         }
         if(exact)write_recurrent(writer,layer);
     }
     if(exact) {
-        write_optional(writer,snapshot->positions);writer.scalar<int64_t>(state.decode_position_delta);
+        write_optional(writer,snapshot->positions,snapshot->positions_device);writer.scalar<int64_t>(state.decode_position_delta);
         writer.scalar<uint32_t>(state.mtp?1:0);
         if(state.mtp)write_qwen4_mtp(writer,*state.mtp);
     }
@@ -131,20 +137,25 @@ TextSessionState decode_session(const std::vector<CudaPagedPayload>& payloads,
         position+=header.count;
         for(size_t layer=0;layer<layers.size();++layer) {
             for(size_t field=0;field<3;++field) {
-                auto tensor=read_optional(reader);
+                int device=-1; auto tensor=read_optional(reader,device);
                 if(tensor && tensor.defined()) {
                     if(tensor.dim()!=3 || tensor.size(0)!=1 || tensor.size(1)!=header.count)
                         throw CudaSessionStateError("invalid Qwen4 QSA prefix geometry");
+                    if(!fragments[layer][field].empty() &&
+                        (layers[layer].devices[field]!=device || fragments[layer][field].front().scalar_type()!=tensor.scalar_type()))
+                        throw CudaSessionStateError("inconsistent Qwen4 QSA prefix tensor");
+                    layers[layer].devices[field]=device;
                     fragments[layer][field].push_back(tensor.dense());
                 }
             }
             if(header.exact) {
                 layers[layer].convolution={};layers[layer].recurrent={};layers[layer].ple_convolution={};layers[layer].ple_tokens.clear();
+                layers[layer].devices[3]=layers[layer].devices[4]=layers[layer].devices[5]=-1;
                 read_recurrent(reader,layers[layer]);
             }
         }
         if(header.exact) {
-            snapshot.positions=read_optional(reader);
+            snapshot.positions_device=-1; snapshot.positions=read_optional(reader,snapshot.positions_device);
             state.decode_position_delta=header.version>=2 ? reader.scalar<int64_t>("position delta") : 0;
             state.mtp.reset();if(reader.scalar<uint32_t>("MTP presence"))state.mtp=read_qwen4_mtp(reader);
         }

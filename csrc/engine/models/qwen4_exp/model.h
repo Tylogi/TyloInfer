@@ -1,17 +1,12 @@
 #pragma once
 #include "env.h"
-#include "engine/backends/cuda/executor/options.h"
 #include "resident_allocations.h"
-#include "engine/backends/cuda/kernels/mfq_cuda_linear_attention_ops.h"
-#include "engine/backends/cuda/kernels/mfq_cuda_norm_ops.h"
 #include "engine/models/qwen4_exp/causal_lm.h"
 #include "engine/models/qwen4_exp/ngram.h"
 #include "engine/models/common/attention_ops.h"
 #include "engine/ops.h"
+#include "engine/ops/ple.h"
 #include "engine/backends/cuda/ops/rope/rope.h"
-#include "engine/backends/cuda/kernels/qwen4_exp.h"
-#include "engine/backends/cuda/kernels/ple_fused.h"
-#include "engine/weights/nint_row_pipeline.h"
 #include "engine/weights/row_stage.h"
 #include "engine/backends/cuda/executor/decode_window.h"
 #include "engine/models/session/snapshot.h"
@@ -38,8 +33,6 @@ using attention_ops::rms_norm;
 class NgramEmbedding {
   public:
     using Context = tyloi::models::qwen4_exp::NgramContext;
-    using RowLookup = std::function<::tyloi::Tensor(const std::vector<int64_t>&,const ::tyloi::Device&)>;
-    using StageFactory = std::function<std::shared_ptr<RowStage>(const std::vector<int64_t>&,const ::tyloi::Device&)>;
     struct State {
         State() = default;
         State(const State&) = delete;
@@ -47,24 +40,19 @@ class NgramEmbedding {
         State(State&&) = default;
         State& operator=(State&&) = default;
         Context context;
-        std::shared_ptr<NintRowPipeline> pipeline;
+        std::shared_ptr<tyloi::weights::RowPipeline> pipeline;
         bool hash_ready=false,hash_reported=false;
         int cached_tokens=0;
         std::array<int64_t,8> cached_ids{};
         tyloi::models::qwen4_exp::NgramHashes cached_hashes;
     };
-    NgramEmbedding(std::vector<Embedding> shards, int64_t rows, int64_t dimension, int64_t ngram,
+    NgramEmbedding(std::vector<::tyloi::Tensor> shards, int64_t rows, int64_t dimension, int64_t ngram,
                    int64_t heads_per_ngram, int64_t eos, std::vector<int64_t> multipliers,
-                   std::vector<int64_t> offsets, std::vector<int64_t> vocab,std::vector<std::shared_ptr<tyloi::NintRows>> ranges = {},
-                   RowLookup row_lookup = {},StageFactory stage_factory = {})
+                   std::vector<int64_t> offsets, std::vector<int64_t> vocab)
         : shards_(std::move(shards)), rows_(rows), dimension_(dimension), ngram_(ngram),
           heads_(heads_per_ngram), eos_(eos), multipliers_(std::move(multipliers)),
-          offsets_(std::move(offsets)), vocab_(std::move(vocab)),row_lookup_(std::move(row_lookup)),stage_factory_(std::move(stage_factory)) {
-#if TYLOINFER_ENABLE_MFQ_COMPAT
-        if(!ranges.empty())source_=std::make_shared<NintRowSource>(std::move(ranges));
-#else
-        (void)ranges;
-#endif
+          offsets_(std::move(offsets)), vocab_(std::move(vocab)),
+          source_(tyloi::weights::RowPipeline::source(shards_, rows)) {
         TYLOINFER_RUNTIME_CHECK(!shards_.empty() && rows_ > 0 && dimension_ > 0 && ngram_ > 1 &&
                               heads_ > 0 && multipliers_.size() == size_t(ngram_) &&
                               offsets_.size() == size_t((ngram_ - 1) * heads_) &&
@@ -76,7 +64,7 @@ class NgramEmbedding {
                               "Qwen4 ngram vocabulary lies outside embedding shards");
     }
     void reset(State& state) const { state.context = {};state.hash_ready=false; }
-    bool graph_supported() const { return bool(source_) || bool(stage_factory_); }
+    bool graph_supported() const { return bool(source_); }
     std::pair<std::size_t, std::size_t> context_growth_bytes(const State& state, int64_t batch, int64_t tokens) const {
         TYLOINFER_RUNTIME_CHECK(batch > 0 && tokens > 0 && ngram_ > 1 &&
             tokens <= std::numeric_limits<int64_t>::max() - (ngram_ - 1), "invalid ngram growth geometry");
@@ -97,35 +85,23 @@ class NgramEmbedding {
             ngram_,heads_,eos_,multipliers_,offsets_,vocab_,state.context,true).next;
     }
     void prefetch(State& state,const DenseTensor& host_ids,bool early_prefix=false) const {
-#if TYLOINFER_ENABLE_MFQ_COMPAT
-
         if(!source_)return;
-        if(!state.pipeline)state.pipeline=std::make_shared<NintRowPipeline>(source_);
+        if(!state.pipeline)state.pipeline=std::make_shared<tyloi::weights::RowPipeline>(source_);
         TYLOINFER_RUNTIME_CHECK(host_ids.is_cpu() && host_ids.dim()==2,"PLE prefetch requires host token IDs");
         auto host=host_ids.to(::tyloi::kInt64).contiguous();const auto b=host.size(0),t=host.size(1);
         if(cacheable_hashes(b,t)) {
             const auto& hashes=graph_hashes(state,host);
-            state.pipeline->issue(hashes.ids,{b,t,(ngram_-1)*heads_},early_prefix);
+            state.pipeline->prefetch(hashes.ids,{b,t,(ngram_-1)*heads_},early_prefix);
             return;
         }
         auto hashes=tyloi::models::qwen4_exp::ngram_hashes(host.data_ptr<int64_t>(),b,t,ngram_,heads_,eos_,
             multipliers_,offsets_,vocab_,state.context,true);
-        state.pipeline->issue(hashes.ids,{b,t,(ngram_-1)*heads_},early_prefix);
-
-#else
-    (void)state; (void)host_ids; (void)early_prefix;
-#endif
-}
+        state.pipeline->prefetch(hashes.ids,{b,t,(ngram_-1)*heads_},early_prefix);
+    }
     std::shared_ptr<RowStage> graph_stage(State& state,int64_t b,int64_t t,const ::tyloi::Device& device) const {
-        const std::vector<int64_t> shape{b,t,(ngram_-1)*heads_};
-        if(stage_factory_)return stage_factory_(shape,device);
         TYLOINFER_RUNTIME_CHECK(bool(source_),"PLE graph requires prepared range rows");
-#if TYLOINFER_ENABLE_MFQ_COMPAT
-        if(!state.pipeline)state.pipeline=std::make_shared<NintRowPipeline>(source_);
-        return std::make_shared<NintStage>(state.pipeline,shape,device);
-#else
-        throw std::runtime_error("PLE graph requires TQ row stages");
-#endif
+        if(!state.pipeline)state.pipeline=std::make_shared<tyloi::weights::RowPipeline>(source_);
+        return state.pipeline->stage({b,t,(ngram_-1)*heads_},device);
     }
     void upload_graph(State& state,const DenseTensor& host_ids,RowStage& stage) const {
         TYLOINFER_RUNTIME_CHECK(graph_supported() && host_ids.is_cpu() && host_ids.dim()==2,"PLE graph requires host token IDs");
@@ -151,21 +127,13 @@ class NgramEmbedding {
         auto hashes = tyloi::models::qwen4_exp::ngram_hashes(
             source, b, t, ngram_, heads_, eos_, multipliers_, offsets_, vocab_, state.context, cache);
         auto &global = hashes.ids;
-        if(row_lookup_) {
-            auto result=row_lookup_(global,ids.device());
-            if(hashed_ids)*hashed_ids=::tyloi::cuda::tensor(global).reshape({b,t,nh}).to(ids.device());
-            if(cache)restore(state,std::move(hashes.next));
-            return result.dense().reshape({b,t,nh*dimension_});
-        }
-#if TYLOINFER_ENABLE_MFQ_COMPAT
-        if(bool(source_)) {
-            if(!state.pipeline)state.pipeline=std::make_shared<NintRowPipeline>(source_);
+        if(source_) {
+            if(!state.pipeline)state.pipeline=std::make_shared<tyloi::weights::RowPipeline>(source_);
             auto result=state.pipeline->collect(global,{b,t,nh},ids.device());
             if(hashed_ids)*hashed_ids=::tyloi::cuda::tensor(global).reshape({b,t,nh}).to(ids.device());
             if(cache)restore(state,std::move(hashes.next));
             return result.dense().reshape({b,t,nh*dimension_});
         }
-#endif
 
         auto global_tensor =
             ::tyloi::cuda::from_blob(global.data(), {b, t, nh}, ::tyloi::TensorOptions().dtype(::tyloi::kInt64))
@@ -181,7 +149,7 @@ class NgramEmbedding {
             auto mask = (global_tensor >= shard * rows_) & (global_tensor < (shard + 1) * rows_);
             auto local =
                 ::tyloi::cuda::where(mask, global_tensor - shard * rows_, ::tyloi::cuda::zeros_like(global_tensor));
-            auto values = shards_.at(shard)(local);
+            auto values = ::tyloi::ops::embedding(local,shards_.at(shard)).dense();
             TYLOINFER_RUNTIME_CHECK(values.sizes().vec() == std::vector<int64_t>({b, t, nh, dimension_}),
                               "Qwen4 ngram embedding shape mismatch");
             values = values * mask.unsqueeze(-1).to(values.scalar_type());
@@ -193,27 +161,10 @@ class NgramEmbedding {
     }
 
   private:
-#if TYLOINFER_ENABLE_MFQ_COMPAT
-    struct NintStage final:RowStage {
-        std::shared_ptr<NintRowPipeline> pipeline;
-        std::shared_ptr<NintRowStage> stage;
-        NintStage(std::shared_ptr<NintRowPipeline> p,const std::vector<int64_t>& shape,const ::tyloi::Device& device)
-            :pipeline(std::move(p)),stage(pipeline->make_stage(shape,device)) {}
-        const ::tyloi::Tensor& output()const override{return stage->output();}
-        bool mapped_rows()const override{return stage->mapped_rows();}
-        void decode()override{stage->decode();}
-        void upload(const std::vector<int64_t>& ids,const std::vector<int64_t>& shape)override {
-            pipeline->upload(*stage,ids,shape);
-        }
-    };
-#endif
-
-    std::vector<Embedding> shards_;
+    std::vector<::tyloi::Tensor> shards_;
     int64_t rows_, dimension_, ngram_, heads_, eos_;
     std::vector<int64_t> multipliers_, offsets_, vocab_;
-    std::shared_ptr<const NintRowSource> source_;
-    RowLookup row_lookup_;
-    StageFactory stage_factory_;
+    std::shared_ptr<const tyloi::weights::RowPipeline::Source> source_;
     bool reuse_hashes_=[] {
         const auto* option=tyloi::cuda::env_lookup("TYLOINFER_PLE_HASH_REUSE");return !option || option[0]!='0';
     }();
@@ -234,14 +185,7 @@ class NgramEmbedding {
     }
 };
 
-struct PleWeights {
-    Linear key, value;
-#ifdef TYLOINFER_NATIVE_CUDA
-    ::tyloi::Tensor key_norm, query_norm, conv_norm, conv;
-#else
-    DenseTensor key_norm, query_norm, conv_norm, conv;
-#endif
-};
+using PleWeights = ::tyloi::ops::PleWeights;
 class Ple {
   public:
     struct State {
@@ -432,113 +376,29 @@ class Ple {
                          bool cache,const DenseTensor& host_ids = {},const DenseTensor& graph_embeddings = {},
                          std::vector<DenseTensor>* checkpoints=nullptr,std::size_t checkpoint_offset=0) const {
         auto context = embedding_.context(state.embedding);
-#ifdef TYLOINFER_NATIVE_CUDA
-        auto conv = state.conv.defined() ? state.conv.dense() : DenseTensor{};
-#else
-        auto conv = state.conv;
-#endif
-        const auto b = x.size(0), t = x.size(1);
-        const auto save_prefixes=[&](const DenseTensor& normalized) {
-            if(!checkpoints)return;
-            TYLOINFER_RUNTIME_CHECK(cache && conv.defined(),"PLE prefix history is unavailable");
-            const auto lookback=conv.size(1);
-            // The FIR state is a tail of normalized inputs. Recover every
-            // intermediate tail while keeping key/value projections batched.
-            for(int64_t count=1;count<t;++count) {
-                auto& saved=checkpoints->at(checkpoint_offset+std::size_t(count-1));
-                if(count>=lookback)saved.copy_(normalized.narrow(1,count-lookback,lookback));
-                else {
-                    saved.narrow(1,0,lookback-count).copy_(conv.narrow(1,count,lookback-count));
-                    saved.narrow(1,lookback-count,count).copy_(normalized.narrow(1,0,count));
-                }
+        try {
+            auto rows = graph_embeddings.defined() ? graph_embeddings :
+                embedding_.forward(state.embedding, ids, cache, nullptr, host_ids);
+            std::vector<::tyloi::Tensor> prefix;
+            if (checkpoints) {
+                prefix.reserve(checkpoints->size());
+                for (const auto& value : *checkpoints) prefix.emplace_back(value);
             }
-        };
 #ifdef TYLOINFER_NATIVE_CUDA
-        const auto native=::tyloi::cuda::options::ple_native_fusion();
-        if((!native || *native) && x.is_contiguous() && t<=32 && hidden_>128 && hidden_<=8192 &&
-            (x.scalar_type()==::tyloi::kFloat16 || x.scalar_type()==::tyloi::kFloat32)) {
-            try {
-                auto embeddings=graph_embeddings.defined()?graph_embeddings:
-                    embedding_.forward(state.embedding,ids,cache,nullptr,host_ids);
-#ifdef TYLOINFER_NATIVE_CUDA
-                auto key=mfq_qwen4_exp::grouped_rms_norm(::tyloi::ops::project(embeddings,w_.key).dense(),w_.key_norm.dense(),hidden_,eps_);
-                auto query=mfq_qwen4_exp::grouped_rms_norm(x,w_.query_norm.dense(),hidden_,eps_);
+            auto& conv = state.conv;
 #else
-                auto key=mfq_qwen4_exp::grouped_rms_norm(::tyloi::ops::project(embeddings,w_.key).dense(),w_.key_norm,hidden_,eps_);
-                auto query=mfq_qwen4_exp::grouped_rms_norm(x,w_.query_norm,hidden_,eps_);
+            ::tyloi::Tensor conv(state.conv);
 #endif
-                auto value=::tyloi::ops::project(embeddings,w_.value).dense();
-                auto prepared=mfq_qwen4_exp::ple_gate_norm_cuda(key,query,value,
-#ifdef TYLOINFER_NATIVE_CUDA
-                    w_.conv_norm.dense().to(::tyloi::kFloat32).contiguous(),hidden_,streams_,eps_);
-#else
-                    w_.conv_norm.to(::tyloi::kFloat32).contiguous(),hidden_,streams_,eps_);
+            auto result = ::tyloi::ops::ple(x, rows, w_, conv, cache, hidden_, streams_, dilation_, eps_,
+                checkpoints ? &prefix : nullptr, checkpoint_offset);
+#ifndef TYLOINFER_NATIVE_CUDA
+            if (conv.defined()) state.conv = conv.dense();
 #endif
-                save_prefixes(prepared[1]);
-#ifdef TYLOINFER_NATIVE_CUDA
-                auto output=mfq_qwen4_exp::ple_conv_add_cuda(prepared[1],w_.conv.dense(),
-#else
-                auto output=mfq_qwen4_exp::ple_conv_add_cuda(prepared[1],w_.conv,
-#endif
-                    cache && conv.defined()?std::optional<DenseTensor>(conv):std::nullopt,dilation_,prepared[0],
-                    x.scalar_type()==::tyloi::kFloat16);
-                if(cache) {if(conv.defined())conv.copy_(output[1]);else state.conv=output[1];}
-                return output[0];
-            }catch(...) {embedding_.restore(state.embedding,std::move(context));throw;}
+            return result.dense();
+        } catch (...) {
+            embedding_.restore(state.embedding, std::move(context));
+            throw;
         }
-#endif
-        return tyloi::models::qwen4_exp::position_embedding(
-            cache, [&] { return graph_embeddings.defined() ? graph_embeddings : embedding_.forward(state.embedding,ids, cache,nullptr,host_ids); },
-            [&](const DenseTensor &embeddings) {
-                auto key = mfq_qwen4_exp::grouped_rms_norm(::tyloi::ops::project(embeddings,w_.key).dense(),
-#ifdef TYLOINFER_NATIVE_CUDA
-                                                           w_.key_norm.dense(), hidden_, eps_)
-#else
-                                                           w_.key_norm, hidden_, eps_)
-#endif
-                               .reshape({b, t, streams_, hidden_});
-                return key;
-            },
-            [&] {
-#ifdef TYLOINFER_NATIVE_CUDA
-                auto query = mfq_qwen4_exp::grouped_rms_norm(x, w_.query_norm.dense(), hidden_, eps_)
-#else
-                auto query = mfq_qwen4_exp::grouped_rms_norm(x, w_.query_norm, hidden_, eps_)
-#endif
-                                 .reshape({b, t, streams_, hidden_});
-                return query;
-            },
-            [&](const DenseTensor &key, const DenseTensor &query, const DenseTensor &embeddings) {
-                auto score = (key.to(::tyloi::kFloat32) * query.to(::tyloi::kFloat32)).sum(-1) /
-                             std::sqrt(double(hidden_));
-                auto sign = (score > 0).to(::tyloi::kFloat32) - (score < 0).to(::tyloi::kFloat32);
-                auto root = sign * ::tyloi::cuda::clamp_min(score.abs(), 1e-6).sqrt();
-                auto gated = (::tyloi::cuda::sigmoid(root).unsqueeze(-1) *
-                              ::tyloi::ops::project(embeddings,w_.value).dense().to(::tyloi::kFloat32).unsqueeze(-2))
-                                 .reshape({b, t, streams_ * hidden_});
-                return gated;
-            },
-            [&](const DenseTensor &gated) {
-#ifdef TYLOINFER_NATIVE_CUDA
-                return mfq_qwen4_exp::grouped_rms_norm(gated, w_.conv_norm.dense(), hidden_, eps_);
-#else
-                return mfq_qwen4_exp::grouped_rms_norm(gated, w_.conv_norm, hidden_, eps_);
-#endif
-            },
-            [&](DenseTensor normalized) {
-                save_prefixes(normalized);
-                return mfq_qwen4_exp::ple_dilated_conv_silu(
-#ifdef TYLOINFER_NATIVE_CUDA
-                    normalized, w_.conv.dense(),
-#else
-                    normalized, w_.conv,
-#endif
-                    cache && conv.defined() ? std::optional<DenseTensor>(conv) : std::nullopt,
-                    dilation_);
-            },
-            [&](DenseTensor gated, DenseTensor convolved) { return (gated + convolved).to(x.scalar_type()); },
-            [&](DenseTensor next) { if(conv.defined())conv.copy_(next);else state.conv=std::move(next); },
-            [&] { embedding_.restore(state.embedding,std::move(context)); });
     }
 
   private:

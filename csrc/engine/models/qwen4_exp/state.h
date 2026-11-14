@@ -34,16 +34,13 @@ struct LayerState {
 
 tyloi::models::qwen4_exp::LayerSnapshot capture_layer_session(
     const Layer& layer, const LayerState& state, std::int64_t position, std::size_t& bytes);
-void restore_layer_session(
-    const Layer& layer, LayerState& state,
-    const tyloi::models::qwen4_exp::LayerSnapshot& snapshot, std::int64_t position);
 void validate_layer_session(const Layer&, const LayerState&,
     const tyloi::models::qwen4_exp::LayerSnapshot&, std::int64_t position);
 void stage_layer_session(const Layer&, LayerState&,
     const tyloi::models::qwen4_exp::LayerSnapshot&, std::int64_t position);
 std::size_t layer_session_growth(const Layer&, const LayerState&,
     const tyloi::models::qwen4_exp::LayerSnapshot&, std::int64_t position);
-void stage_session_tensor(::tyloi::Tensor&, const ::tyloi::Tensor&);
+void stage_session_tensor(::tyloi::Tensor&, const ::tyloi::Tensor&, tyloi::Device);
 void add_session_growth(std::vector<std::pair<tyloi::Device, std::size_t>>&,
     tyloi::Device, std::size_t);
 
@@ -78,7 +75,6 @@ public:
     bool supports_paged_text_session_state() const override;
     TextSessionStateKind text_session_state_kind() const;
     TextSessionState capture_text_session_state(const std::vector<std::int64_t>& tokens) const;
-    void restore_text_session_state(const TextSessionState& state);
     std::unique_ptr<tyloi::models::Restore> prepare_restore(
         const TextSessionState&, const tyloi::models::Mtp* predictor_model = nullptr) override;
     void publish_restore(State& candidate) noexcept;

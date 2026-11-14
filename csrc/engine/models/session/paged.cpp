@@ -10,9 +10,9 @@ void CudaPagedWriter::raw(const void *data, size_t size) {
     bytes_.insert(bytes_.end(), begin, begin + size);
 }
 
-void CudaPagedWriter::tensor(const ::tyloi::Tensor &tensor) {
+void CudaPagedWriter::tensor(const ::tyloi::Tensor &tensor, int original_device) {
     const auto& source = tensor;
-    if (!source.defined() || !source.is_cuda() || source.dim() <= 0 || source.dim() > 8) {
+    if (!source.defined() || (original_device < 0 ? !source.is_cuda() : !source.device().is_cpu()) || source.dim() <= 0 || source.dim() > 8) {
         throw std::runtime_error("invalid CUDA paged cache tensor");
     }
     const auto dtype = source.scalar_type();
@@ -22,7 +22,7 @@ void CudaPagedWriter::tensor(const ::tyloi::Tensor &tensor) {
     }
     const auto data = ::tyloi::ops::bytes(source);
     scalar<int32_t>(static_cast<int32_t>(dtype));
-    scalar<int32_t>(source.device().index);
+    scalar<int32_t>(original_device < 0 ? source.device().index : original_device);
     scalar<uint32_t>(static_cast<uint32_t>(source.dim()));
     scalar<uint32_t>(0);
     for (int64_t axis = 0; axis < source.dim(); ++axis)

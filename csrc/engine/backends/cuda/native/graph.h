@@ -45,6 +45,7 @@ private:
     cudaGraph_t graph_ = nullptr;
     cudaGraphExec_t executable_ = nullptr;
     bool shared_pool_ = false;
+    bool shared_capture_active_ = false;
 };
 
 class GraphWarmupScope {

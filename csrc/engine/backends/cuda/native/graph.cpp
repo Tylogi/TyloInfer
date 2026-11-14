@@ -40,9 +40,12 @@ Graph::Graph(Graph&& other) noexcept
       context_(std::move(other.context_)),
       pool_streams_(std::move(other.pool_streams_)),
       pool_contexts_(std::move(other.pool_contexts_)),
+      shared_streams_(std::move(other.shared_streams_)),
+      shared_contexts_(std::move(other.shared_contexts_)),
       graph_(std::exchange(other.graph_, nullptr)),
       executable_(std::exchange(other.executable_, nullptr)),
-      shared_pool_(std::exchange(other.shared_pool_, false)) {}
+      shared_pool_(std::exchange(other.shared_pool_, false)),
+      shared_capture_active_(std::exchange(other.shared_capture_active_, false)) {}
 
 Graph& Graph::operator=(Graph&& other) noexcept {
     if (this != &other) {
@@ -59,9 +62,12 @@ Graph& Graph::operator=(Graph&& other) noexcept {
         context_ = std::move(other.context_);
         pool_streams_ = std::move(other.pool_streams_);
         pool_contexts_ = std::move(other.pool_contexts_);
+        shared_streams_ = std::move(other.shared_streams_);
+        shared_contexts_ = std::move(other.shared_contexts_);
         graph_ = std::exchange(other.graph_, nullptr);
         executable_ = std::exchange(other.executable_, nullptr);
         shared_pool_ = std::exchange(other.shared_pool_, false);
+        shared_capture_active_ = std::exchange(other.shared_capture_active_, false);
     }
     return *this;
 }
@@ -136,7 +142,7 @@ void Graph::capture_begin() {
     }
 }
 
-void Graph::capture_begin_shared() {
+void Graph::capture_begin_shared(const std::vector<StreamHandle>& participants) {
     if (stream_ || graph_ || executable_) throw Error("graph already owns a capture");
     stream_ = current_stream();
     device_ = stream_.device_index();
@@ -144,9 +150,25 @@ void Graph::capture_begin_shared() {
     shared_pool_ = true;
     context_->begin_graph_capture(stream_.stream());
     try {
+        shared_streams_.reserve(participants.size());
+        shared_contexts_.reserve(participants.size());
+        for(const auto& participant:participants) {
+            if(!participant || (participant.device_index()==device_ && participant.stream()==stream_.stream()))continue;
+            if(std::any_of(shared_streams_.begin(),shared_streams_.end(),[&](const auto& existing) {
+                return existing.device_index()==participant.device_index() && existing.stream()==participant.stream();
+            }))continue;
+            auto context=default_context(participant.device_index());
+            context->begin_graph_capture(participant.stream());
+            shared_streams_.push_back(participant);
+            shared_contexts_.push_back(std::move(context));
+        }
         TYLOINFER_NATIVE_CUDA_CHECK(cudaStreamBeginCapture(
             stream_.stream(), cudaStreamCaptureModeThreadLocal));
+        shared_capture_active_=true;
     } catch (...) {
+        for(std::size_t i=0;i<shared_streams_.size();++i)
+            shared_contexts_[i]->end_graph_capture(shared_streams_[i].stream());
+        shared_streams_.clear();shared_contexts_.clear();
         context_->end_graph_capture(stream_.stream());
         throw;
     }
@@ -167,7 +189,12 @@ void Graph::capture_end() {
     DeviceGuard guard(device_);
     const auto capture_status =
         cudaStreamEndCapture(stream_.stream(), &graph_);
-    if (shared_pool_) context_->end_graph_capture(stream_.stream());
+    if (shared_capture_active_) {
+        context_->end_graph_capture(stream_.stream());
+        for(std::size_t i=0;i<shared_streams_.size();++i)
+            shared_contexts_[i]->end_graph_capture(shared_streams_[i].stream());
+        shared_capture_active_=false;
+    }
     for (std::size_t index = 0; index < pool_streams_.size(); ++index) {
         pool_contexts_[index]->end_graph_capture(
             pool_streams_[index].stream());
@@ -293,6 +320,7 @@ void Graph::reset() {
     wait(stream_);
     for (const auto& stream : pool_streams_)
         if (stream.device_index() != stream_.device_index() || stream.stream() != stream_.stream()) wait(stream);
+    for (const auto& stream : shared_streams_) wait(stream);
     if (failure) std::rethrow_exception(failure);
     if (stream_ || executable_ || graph_ || !pool_streams_.empty()) {
         DeviceGuard guard(device_);
@@ -308,10 +336,17 @@ void Graph::reset() {
             pool_contexts_[index]->end_graph_capture(pool_streams_[index].stream());
             pool_contexts_[index]->end_graph_pool(pool_streams_[index].stream());
         }
-        if (shared_pool_ && context_) context_->end_graph_capture(stream_.stream());
+        if (shared_capture_active_ && context_) {
+            context_->end_graph_capture(stream_.stream());
+            for(std::size_t i=0;i<shared_streams_.size();++i)
+                shared_contexts_[i]->end_graph_capture(shared_streams_[i].stream());
+            shared_capture_active_=false;
+        }
     }
     pool_contexts_.clear();
     pool_streams_.clear();
+    shared_contexts_.clear();
+    shared_streams_.clear();
     context_.reset();
     stream_ = {};
     shared_pool_ = false;

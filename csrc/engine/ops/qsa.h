@@ -126,7 +126,7 @@ public:
     /** Estimate fresh backing needed by a staged session restore. */
     std::size_t fresh_session_growth(const State&, std::int64_t count) const;
     /** Stage a validated snapshot into an independent request state. */
-    void stage_session(State&, const Snapshot&, std::int64_t count) const;
+    void stage_session(State&, const Snapshot&, std::int64_t count, Device device) const;
     /** Return the logical snapshot bytes for the given prefix. */
     std::size_t session_bytes(const State&, std::int64_t count) const;
     /** Capture a committed prefix and add its bytes to the caller's total. */

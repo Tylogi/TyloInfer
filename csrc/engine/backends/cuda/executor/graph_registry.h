@@ -42,7 +42,6 @@ public:
     void set_kernel_rows(cudaGraphNode_t node,unsigned rows)const;
 private:
     friend class GraphRegistry;
-    CapturedGraph(void* stream, const std::vector<StreamHandle>& participants, const std::function<void()>& body);
     CapturedGraph(void* stream, const std::vector<StreamHandle>& participants);
     void finish();
     void finish(bool allow_empty);
@@ -55,8 +54,6 @@ public:
     explicit GraphRegistry(void* stream) : stream_(stream) {}
     /** Retain the streams participating in each shared-pool capture. */
     void participants(std::vector<StreamHandle> streams) { participants_ = std::move(streams); }
-    bool record(std::uint64_t identity, int tokens,
-                const std::function<void()>& body, std::string& error);
     const CapturedGraph* find(std::uint64_t identity, int tokens) const;
     bool launch(std::uint64_t identity, int tokens, int timeout_ms, std::string& error) const;
     std::size_t size() const { return graphs_.size(); }

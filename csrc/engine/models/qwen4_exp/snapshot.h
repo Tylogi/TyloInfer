@@ -3,6 +3,7 @@
 #include "engine/tensor.h"
 
 #include <cstdint>
+#include <array>
 #include <memory>
 #include <vector>
 
@@ -11,6 +12,8 @@ namespace tyloi::models::qwen4_exp {
 struct LayerSnapshot {
     ::tyloi::Tensor keys, values, index;
     ::tyloi::Tensor convolution, recurrent, ple_convolution;
+    // Nonnegative indices identify host tensors decoded from paged CUDA data.
+    std::array<int, 6> devices{-1, -1, -1, -1, -1, -1};
     int64_t ple_batch = 0;
     std::vector<int64_t> ple_tokens;
 
@@ -28,6 +31,7 @@ struct LayerSnapshot {
 struct Snapshot {
     std::vector<LayerSnapshot> layers;
     ::tyloi::Tensor positions;
+    int positions_device = -1;
 
     template <class Visit>
     void tensors(const Visit& visit) const {
@@ -40,6 +44,8 @@ struct MtpSnapshot {
     std::vector<LayerSnapshot> layers;
     std::vector<::tyloi::Tensor> positions;
     std::vector<int64_t> lengths;
+    std::vector<int> positions_devices;
+    int hidden_device = -1;
 
     template <class Visit>
     void tensors(const Visit& visit) const {

@@ -253,14 +253,14 @@ class QsaCore {
     }
     /** Stage a snapshot into independently owned sequence or managed KV storage. */
     void stage_session(State& request, const ::tyloi::ops::Qsa::Snapshot& saved,
-                       int64_t count) {
+                       int64_t count, tyloi::Device device) {
         if (managed_memory(request)) { restore_session(request,saved,count); return; }
         const auto stage = [&](SequenceCache& cache, const ::tyloi::Tensor& source) {
             int64_t capacity=std::min<int64_t>(16,c_.maximum);
             while(capacity<count)
                 capacity=std::min(c_.maximum,capacity>c_.maximum/2?c_.maximum:capacity*2);
             auto shape=source.dense().sizes().vec(); shape[1]=capacity;
-            cache.replace_storage(tyloi::ops::empty(shape,source.options()));
+            cache.replace_storage(tyloi::ops::empty(shape,source.options().device(device)));
             auto view=tyloi::ops::slice(cache.storage(),1,0,count);
             tyloi::ops::copy_into(view,source);
             cache.advance_fixed(count);

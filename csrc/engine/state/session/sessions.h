@@ -40,7 +40,7 @@ public:
     virtual void reserve_ram(std::uint64_t bytes) = 0;
 };
 
-void restore(models::State& state, const TextSessionState& snapshot, Executor& executor,
+Tensor restore(models::State& state, const TextSessionState& snapshot, Executor& executor,
     weights::Cache& weights, engine::Budget& budget, models::Mtp* mtp);
 
 } // namespace tyloi::state

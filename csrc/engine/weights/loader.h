@@ -82,6 +82,7 @@ struct Loader {
     std::vector<::tyloi::Tensor> gate_up(const std::vector<std::string>& names,
         const ::tyloi::Tensor& down, size_t prefix = 2, bool preserve_boundaries = false) const;
     ::tyloi::Tensor embedding(const std::string& name, bool independent_output) const;
+    ::tyloi::Tensor rows(const std::string& name) const;
     ::tyloi::Tensor experts(const std::string& name, bool cacheable = false,
         int layer = -1, const std::string& role = {}) const;
     ::tyloi::Tensor dense(const std::string& name) const;
@@ -93,7 +94,7 @@ private:
     struct Impl;
     std::shared_ptr<Impl> impl_;
     Loader(const tyloi::source::Source& source, Options options, Placement placement,
-           Cache& cache);
+           std::shared_ptr<Impl> impl);
     friend class Cache;
     ::tyloi::DenseTensor host_value(const std::string& name) const;
     std::shared_ptr<const ::tyloi::MfeTensor> build_experts(

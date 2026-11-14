@@ -65,17 +65,15 @@ struct CapturedGraph::Impl {
     StreamHandle stream;
     struct KernelLaunch {cudaKernelNodeParams params{};bool enabled=true;};
     std::unordered_map<cudaGraphNode_t,KernelLaunch> kernels;
-    explicit Impl(void* native):registration(std::make_unique<HostRegistrationBlock>()) {
+    explicit Impl(void* native, const std::vector<StreamHandle>& participants):registration(std::make_unique<HostRegistrationBlock>()) {
         int device = 0;
         TYLOINFER_NATIVE_CUDA_CHECK(cudaGetDevice(&device));
         stream = StreamHandle(device, static_cast<cudaStream_t>(native));
         StreamGuard selected(stream);
-        graph.capture_begin_shared();
+        graph.capture_begin_shared(participants);
     }
 };
-CapturedGraph::CapturedGraph(void* stream, const std::function<void()>& body)
-    : CapturedGraph(stream) { body(); finish(); }
-CapturedGraph::CapturedGraph(void* stream) : impl_(std::make_unique<Impl>(stream)) {}
+CapturedGraph::CapturedGraph(void* stream, const std::vector<StreamHandle>& participants) : impl_(std::make_unique<Impl>(stream, participants)) {}
 void CapturedGraph::finish() { finish(false); }
 void CapturedGraph::finish(bool allow_empty) {
     StreamGuard selected(impl_->stream);
@@ -135,19 +133,9 @@ bool CapturedGraph::wait_ms(int timeout_ms) const {
     } while (std::chrono::steady_clock::now() < deadline);
     return false;
 }
-bool GraphRegistry::record(std::uint64_t identity, int tokens,
-        const std::function<void()>& body, std::string& error) {
-    if (find(identity, tokens)) return true;
-    try {
-        CapturedGraph graph(stream_, body);
-        graphs_.emplace(std::make_pair(identity, tokens), std::move(graph));
-        ++captures_;
-        return true;
-    } catch (const std::exception& failure) { error = failure.what(); return false; }
-}
 void GraphRegistry::begin(std::uint64_t identity,int tokens) {
     if(find(identity,tokens))throw Error("CUDA graph segment already exists");
-    graphs_.emplace(std::make_pair(identity,tokens),CapturedGraph(stream_));
+    graphs_.emplace(std::make_pair(identity,tokens),CapturedGraph(stream_, participants_));
 }
 void GraphRegistry::end(std::uint64_t identity,int tokens) {
     graphs_.at({identity,tokens}).finish();++captures_;

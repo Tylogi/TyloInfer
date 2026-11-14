@@ -1,6 +1,7 @@
 #pragma once
 #include "engine/tensor.h"
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 // A prepared table-row transfer. Encodings stay in their own loader; graph
@@ -19,3 +20,19 @@ public:
         upload(ids,shape);
     }
 };
+
+namespace tyloi::weights {
+class RowPipeline {
+public:
+    struct Source;
+    static std::shared_ptr<const Source> source(std::vector<Tensor> tables, std::int64_t rows_per_shard);
+    explicit RowPipeline(std::shared_ptr<const Source> source);
+    ~RowPipeline();
+    bool prefetch(const std::vector<std::int64_t>& ids, const std::vector<std::int64_t>& shape, bool early_prefix);
+    Tensor collect(const std::vector<std::int64_t>& ids, const std::vector<std::int64_t>& shape, const Device& device);
+    std::shared_ptr<RowStage> stage(const std::vector<std::int64_t>& shape, const Device& device);
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+}

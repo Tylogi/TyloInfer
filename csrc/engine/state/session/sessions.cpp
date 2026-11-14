@@ -26,7 +26,7 @@ void drain(Executor& executor, weights::Cache& weights) {
 
 } // namespace
 
-void restore(models::State& state, const TextSessionState& snapshot, Executor& executor,
+Tensor restore(models::State& state, const TextSessionState& snapshot, Executor& executor,
         weights::Cache& weights, engine::Budget& budget, models::Mtp* mtp) {
     const TextSessionState held = snapshot;
     std::unique_ptr<models::Restore> target, predictor;
@@ -64,8 +64,11 @@ void restore(models::State& state, const TextSessionState& snapshot, Executor& e
         target->stage();
         if (predictor) predictor->stage();
         drain(executor, weights);
+        auto hidden = predictor ? predictor->target_hidden() : Tensor{};
+        if (mtp && !hidden) hidden = held.mtp->last_target_hidden;
         target->publish();
         if (predictor) predictor->publish();
+        return hidden;
     } catch (...) {
         const auto error = std::current_exception();
         try { drain(executor, weights); } catch (...) {}

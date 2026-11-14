@@ -63,12 +63,12 @@ struct CudaSessionOps {
         }
     }
 
-    static void restore(tyloi::models::State& state, const Snapshot& snapshot,
+    static tyloi::Tensor restore(tyloi::models::State& state, const Snapshot& snapshot,
         tyloi::models::Mtp* mtp, tyloi::Executor& executor,
         tyloi::weights::Cache& weights, tyloi::engine::Budget& budget);
 
     template <class State, class Predictor>
-    static void restore(
+    static tyloi::Tensor restore(
         State& state, const Snapshot& snapshot, Predictor* mtp,
         const std::function<void()>& drain) {
         // The caller owns the CUDA scope for the entire restore operation.
@@ -104,6 +104,7 @@ struct CudaSessionOps {
                     throw CudaSessionStateError("model state has no predictor state");
             }
         }
+        return mtp && snapshot.mtp ? snapshot.mtp->last_target_hidden : tyloi::Tensor{};
     }
 };
 
