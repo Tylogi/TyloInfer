@@ -3,7 +3,7 @@
 #include "engine/budget.h"
 #include "engine/executor.h"
 #include "engine/ops.h"
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
 #include "backend.h"
 #include "engine/weights/cache.h"
 #include "engine/weights/workspace.h"
@@ -26,7 +26,7 @@
 namespace tyloi::cuda {
 namespace {
 constexpr auto no_offset = std::numeric_limits<std::size_t>::max();
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
 struct Slots {
     std::map<std::size_t,std::size_t> free;
     explicit Slots(std::size_t bytes=0) {if(bytes)free[0]=bytes;}
@@ -68,15 +68,15 @@ struct KvOffloadStore::Impl {
             throw std::invalid_argument("KV offload requires CUDA or Metal 0");
         if (config.device.is_metal() && (!executor || config.preallocate))
             throw std::invalid_argument("Metal KV offload requires an executor and non-preallocated storage");
-#ifndef TYLOINFER_NATIVE_CUDA
+#if !TYLOINFER_HAS_CUDA
         if (config.device.is_cuda()) throw std::invalid_argument("CUDA KV offload is unavailable");
 #endif
-#ifndef TYLOINFER_NATIVE_MLX_RUNTIME
+#if !TYLOINFER_HAS_METAL
         if (config.device.is_metal()) throw std::invalid_argument("Metal KV offload is unavailable");
 #endif
         if (config.buffer_bytes < 4096 || config.gpu_budget_bytes < config.buffer_bytes)
             throw std::invalid_argument("CUDA KV budget cannot hold its I/O staging buffer");
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
         if(config.preallocate) {
             ResidentAllocationScope resident;
             gpu_arena=::tyloi::cuda::empty({int64_t(hot_limit())},::tyloi::TensorOptions().device(::tyloi::kCUDA).dtype(::tyloi::kUInt8));
@@ -92,7 +92,7 @@ struct KvOffloadStore::Impl {
             initialize_disk();
     }
     ~Impl() {
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
         if(config.preallocate)tensor_host_bytes.fetch_sub(ram_arena.size());
 #endif
     }
@@ -106,7 +106,7 @@ struct KvOffloadStore::Impl {
         ram = std::make_shared<cache::QsaKvStore>(std::move(cold));
     }
     std::size_t hot_limit() const { return config.gpu_hot_bytes(); }
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
     void spill_ram() {
         while(!ram_lru.empty()) {
             auto weak=ram_lru.back();auto block=weak.lock();
@@ -141,7 +141,7 @@ struct KvOffloadStore::Impl {
         d2h_bytes+=block->bytes;
     }
 #endif
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
     bool evict_one() {
         while(!lru.empty()) {
             auto found=hot.find(lru.back());auto block=found->second.block.lock();
@@ -178,7 +178,7 @@ struct KvOffloadStore::Impl {
         }
     }
     void evict() {
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
         if(config.preallocate){while(gpu_bytes>hot_limit())if(!evict_one())break;return;}
 #endif
         while (gpu_bytes > hot_limit() && !lru.empty()) {
@@ -191,7 +191,7 @@ struct KvOffloadStore::Impl {
                     Tensor cpu;
                     if (config.device.is_metal())
                         cpu = block->gpu.relocated(Device{DeviceType::cpu, 0});
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
                     else cpu = block->gpu.dense().to(::tyloi::kCPU).contiguous();
 #endif
                     std::vector<std::uint8_t> payload(block->bytes);
@@ -213,7 +213,7 @@ struct KvOffloadStore::Impl {
             gpu_bytes -= block->bytes;
             lru.erase(found->second.order); hot.erase(found);
         }
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
         if(config.preallocate) {
             gpu_slots.give(block->gpu_offset,block->bytes);
             if(block->ram_offset!=no_offset){ram_slots.give(block->ram_offset,block->bytes);ram_bytes-=block->bytes;}
@@ -224,7 +224,7 @@ struct KvOffloadStore::Impl {
     KvOffloadConfig config;
     ::tyloi::Executor* executor = nullptr;
     std::shared_ptr<cache::QsaKvStore> ram;
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
     ::tyloi::DenseTensor gpu_arena;
     ::tyloi::weights::KvRegion loan_region;
     std::vector<std::uint8_t> ram_arena;
@@ -253,7 +253,7 @@ std::size_t KvOffloadStore::GatherLayout::gpu_bytes() const {
 }
 std::shared_ptr<KvOffloadStore::GatherWorkspace> KvOffloadStore::gather_workspace(int64_t rows,int64_t width,::tyloi::ScalarType dtype,int64_t heads,int64_t key_width) {
     if (impl_->config.device.is_metal()) throw std::runtime_error("Metal KV fixed gather is unsupported");
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
     const auto plan=gather_layout(rows,width,dtype,heads,key_width);
     std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
     auto& workspace=impl_->gather_workspaces[{rows,width,int(dtype),heads,key_width}];
@@ -309,7 +309,7 @@ KvOffloadStore::BlockPtr KvOffloadStore::write(const ::tyloi::Tensor& input) {
         block->gpu = ::tyloi::ops::clone(input);
         impl_->executor->submit(std::span<const Tensor>(&block->gpu, 1));
     } else {
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
         const auto& rows = input.dense();
         if(impl_->config.preallocate && bytes>impl_->hot_limit()) {
             block->gpu=rows.contiguous();impl_->store_cold(block);block->gpu={};++impl_->evictions;
@@ -329,13 +329,13 @@ KvOffloadStore::BlockPtr KvOffloadStore::write(const ::tyloi::Tensor& input) {
     std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
     if (block->gpu.defined()) {
         ++impl_->hits; impl_->touch(block);
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
         if (!impl_->config.device.is_metal())
             return std::make_shared<DenseTensor>(block->gpu.dense());
 #endif
         return block->gpu;
     }
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
     if(impl_->config.preallocate) {
         auto result=::tyloi::cuda::empty({block->rows,block->width},block->options);
         if(block->ram_offset!=no_offset) {
@@ -362,7 +362,7 @@ KvOffloadStore::BlockPtr KvOffloadStore::write(const ::tyloi::Tensor& input) {
         std::memcpy(cpu.dense().data_ptr(), payload->data(), block->bytes);
         gpu = cpu.relocated(impl_->config.device);
     } else {
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
         auto cpu = ::tyloi::cuda::empty({block->rows, block->width}, block->options.device(::tyloi::kCPU));
         std::memcpy(cpu.data_ptr(), payload->data(), block->bytes);
         gpu = cpu.to(block->options);
@@ -370,7 +370,7 @@ KvOffloadStore::BlockPtr KvOffloadStore::write(const ::tyloi::Tensor& input) {
     }
     impl_->h2d_bytes += block->bytes;
     if (block->bytes <= impl_->hot_limit()) {
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
         if (!impl_->config.device.is_metal()) block->gpu = std::make_shared<DenseTensor>(gpu.dense());
         else
 #endif
@@ -385,7 +385,7 @@ void KvOffloadStore::bind_budget(tyloi::engine::Budget* budget) {
     impl_->budget = budget;
 }
 void KvOffloadStore::lend(tyloi::weights::Cache& cache) {
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
     std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
     impl_->loan_region.reset();
     if(!impl_->gpu_arena.defined() || !impl_->gpu_arena.nbytes())return;
@@ -395,7 +395,7 @@ void KvOffloadStore::lend(tyloi::weights::Cache& cache) {
 #endif
 }
 std::size_t KvOffloadStore::lent_bytes() const {
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
     std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
     return impl_->loan_region.bytes();
 #else
@@ -406,7 +406,7 @@ std::vector<std::pair<std::string, double>> KvOffloadStore::metrics() const {
     std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
     const auto cold = impl_->ram ? impl_->ram->stats() : cache::QsaKvStoreStats{};
     auto ram_bytes = cold.hot_bytes;
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
     if (impl_->config.preallocate && impl_->config.ram_preallocated) ram_bytes = impl_->ram_arena.size();
 #endif
     return {{"qsa_kv_offload_enabled", 1.0}, {"qsa_kv_ssd_enabled",impl_->config.ssd_enabled?1.0:0.0},
@@ -425,7 +425,7 @@ std::vector<std::pair<std::string, double>> KvOffloadStore::metrics() const {
 
 void KvOffloadSequence::gather_into(const std::vector<int64_t>& rows,const KvOffloadStore::GatherWorkspace& work) const {
     if (store_->config().device.is_metal()) throw std::runtime_error("Metal KV fixed gather is unsupported");
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
     if(rows.empty() || int64_t(rows.size())>work.rows.size(0) || work.rows.size(1)!=width_ || work.rows.scalar_type()!=dtype_)
         throw std::invalid_argument("invalid fixed CUDA KV gather workspace");
     auto& impl=*store_->impl_;

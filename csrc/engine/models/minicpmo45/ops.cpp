@@ -1,6 +1,6 @@
 #include "engine/models/plan.h"
 #include "engine/models/minicpmo45/text/load.h"
-#include "engine/models/minicpmo45/text/forward.h"
+#include "engine/models/minicpmo45/text/state.h"
 #include "engine/models/minicpmo45/vision.h"
 #include "engine/models/minicpmo45/audio.h"
 #include "engine/models/minicpmo45/tts.h"
@@ -12,14 +12,7 @@
 #include "engine/models/session/state.h"
 #include "engine/models/source/model_graph.h"
 #include "engine/requests/media.h"
-#ifndef TYLOINFER_NATIVE_CUDA
-#include "engine/backends/cuda/native/collectives.h"
-#endif
 #include "engine/backends/cuda/executor/options.h"
-#ifndef TYLOINFER_NATIVE_CUDA
-#include "engine/backends/cuda/ops/norm/rms.h"
-#include "engine/backends/cuda/ops/projection/projection.h"
-#endif
 
 #include <algorithm>
 #include <iostream>
@@ -118,11 +111,7 @@ void load(Model& model, const tyloi::weights::Loader& weights, LayerPlacementCon
     if (load_input_output) {
         const bool separate = !config.tie_word_embeddings && weights.has("model.output.weight");
         model.embed = weights.embedding("model.token_embedding.weight", separate);
-#ifdef TYLOINFER_NATIVE_CUDA
         model.output_norm = weights.tensor("model.output_norm.weight");
-#else
-        model.output_norm = weights.tensor("model.output_norm.weight").dense();
-#endif
         model.lm_head = separate ? weights.weight("model.output.weight", TensorParallelAxis::Output)
             : weights.placement.tensor.enabled()
                 ? weights.weight("model.token_embedding.weight", TensorParallelAxis::Output) : model.embed;
@@ -139,15 +128,10 @@ void load(Model& model, const tyloi::weights::Loader& weights, LayerPlacementCon
         }
     } else {
         if (load_layers) throw std::invalid_argument("streamed model setup requires deferred blocks");
-#ifdef TYLOINFER_NATIVE_CUDA
         model.output_norm = weights.tensor("model.output_norm.weight");
-#else
-        model.output_norm = weights.tensor("model.output_norm.weight").dense();
-#endif
     }
 }
 
-#ifdef TYLOINFER_NATIVE_CUDA
 void load_media(Model& model, const tyloi::weights::Loader& weights) {
     model.vision = std::make_shared<MiniCPMO45VisionEncoder>(MiniCPMO45VisionEncoder::load(weights));
     model.resampler = std::make_shared<MiniCPMO45Resampler>(MiniCPMO45Resampler::load(weights));
@@ -234,7 +218,6 @@ std::vector<std::pair<tyloi::Device, std::size_t>> State::growth(
     }
     return result;
 }
-#endif
 
 State::State(const Model& model) : layers(model.layers.size()) {
     for (const auto& layer : model.layers) {
@@ -303,7 +286,6 @@ TextSessionState State::capture_text_session_state(const std::vector<int64_t>& t
     }
     return state;
 }
-#ifdef TYLOINFER_NATIVE_CUDA
 std::unique_ptr<tyloi::models::Restore> State::prepare_restore(
         const TextSessionState& state, const tyloi::models::Mtp* predictor_model) {
     if (predictor_model) throw CudaSessionStateError("MiniCPM text does not support a predictor");
@@ -365,7 +347,6 @@ std::unique_ptr<tyloi::models::Restore> State::prepare_restore(
     };
     return std::make_unique<Candidate>(*this, state);
 }
-#endif
 
 namespace {
 Tensor token_ids(int primary, const Tensor& ids) {

@@ -48,11 +48,7 @@ struct Mtp final : tyloi::models::Mtp {
     ::tyloi::Tensor embedding;
     int primary = 0;
     ::tyloi::Tensor fusion;
-#ifdef TYLOINFER_NATIVE_CUDA
     ::tyloi::Tensor embedding_norm, hidden_norm, output_norm;
-#else
-    DenseTensor embedding_norm, hidden_norm, output_norm;
-#endif
     std::vector<Layer> layers;
 
     // The predictor history shares the backbone context limit, which the
@@ -75,31 +71,16 @@ struct Mtp final : tyloi::models::Mtp {
         result.config = main;
         result.embedding = std::move(embedding);
         result.primary = weights.placement.device;
-#ifdef TYLOINFER_NATIVE_CUDA
         result.embedding_norm = weights.tensor("predictor.embedding_norm.weight");
         result.hidden_norm = weights.tensor("predictor.hidden_norm.weight");
         result.output_norm = weights.tensor("predictor.output_norm.weight");
-#else
-        result.embedding_norm = weights.tensor("predictor.embedding_norm.weight").dense();
-        result.hidden_norm = weights.tensor("predictor.hidden_norm.weight").dense();
-        result.output_norm = weights.tensor("predictor.output_norm.weight").dense();
-#endif
         result.fusion = weights.weight("predictor.fusion.weight");
-#ifdef TYLOINFER_NATIVE_CUDA
         TYLOINFER_RUNTIME_CHECK(result.fusion.size(1) == 2 * main.hidden_size &&
                               result.fusion.size(0) == main.hidden_size &&
                               result.embedding_norm.numel() == main.hidden_size &&
                               result.hidden_norm.numel() == main.hidden_size &&
                               result.output_norm.numel() == main.hidden_size,
                           "Nemotron-H MTP fusion/norm dimensions disagree with the backbone");
-#else
-        TYLOINFER_RUNTIME_CHECK(result.fusion->size(1) == 2 * main.hidden_size &&
-                              result.fusion->size(0) == main.hidden_size &&
-                              result.embedding_norm.numel() == main.hidden_size &&
-                              result.hidden_norm.numel() == main.hidden_size &&
-                              result.output_norm.numel() == main.hidden_size,
-                          "Nemotron-H MTP fusion/norm dimensions disagree with the backbone");
-#endif
         for (std::size_t index = 0; index < main.mtp_mixers.size(); ++index) {
             const auto type =
                 std::string(tyloi::models::nemotron_h::Config::mixer_name(main.mtp_mixers[index]));
@@ -153,80 +134,43 @@ struct Mtp final : tyloi::models::Mtp {
             using DenseTensor = ::tyloi::DenseTensor;
             const Mtp &model;
             PredictorState& state;
-#ifdef TYLOINFER_NATIVE_CUDA
             tyloi::models::ForwardOptions mode;
-#else
-            Executor::Mode mode;
-#endif
             static int rank(const DenseTensor &x) { return x.dim(); }
             static int64_t size(const DenseTensor &x, int axis) { return x.size(axis); }
             static int64_t elements(const DenseTensor &x) { return x.numel(); }
             static bool defined(const DenseTensor &x) { return x.defined(); }
             DenseTensor embed(DenseTensor ids, const DenseTensor &like) {
-#ifdef TYLOINFER_NATIVE_CUDA
                 auto embedded = tyloi::ops::embedding(::tyloi::Tensor(std::move(ids)), model.embedding);
                 return tyloi::ops::contiguous(tyloi::ops::cast(
                     embedded, like.scalar_type())).dense();
-#else
-                return tyloi::cuda::embed(model.embedding, std::move(ids),
-                    Executor::current().collectives(), Executor::current().profiler(), model.primary)
-                    .to(like.scalar_type());
-#endif
             }
             DenseTensor normalize(const DenseTensor &x, tyloi::models::nemotron_h::PredictorNorm role) {
                 using Norm = tyloi::models::nemotron_h::PredictorNorm;
                 const auto &weight = role == Norm::embedding ? model.embedding_norm
                                      : role == Norm::hidden  ? model.hidden_norm
                                                              : model.output_norm;
-#ifdef TYLOINFER_NATIVE_CUDA
                 auto normalized = tyloi::ops::rms_norm(
                     ::tyloi::Tensor(x.reshape({-1, model.config.hidden_size})), weight,
                     model.config.rms_norm_eps, 0.0);
                 return tyloi::ops::reshape(normalized, x.sizes()).dense();
-#else
-                auto normalized = qwen_rms_norm(x.reshape({-1, model.config.hidden_size})
-                                         .to(::tyloi::kFloat32),
-                                     weight, model.config.rms_norm_eps, 0.0);
-                return normalized.reshape(x.sizes());
-#endif
             }
             DenseTensor positions(DenseTensor explicit_positions, int64_t start, int64_t tokens) {
                 if (explicit_positions.defined())
-#ifdef TYLOINFER_NATIVE_CUDA
                     return tyloi::ops::contiguous(tyloi::ops::cast(
                         ::tyloi::Tensor(std::move(explicit_positions)),
                         tyloi::ScalarType::int64)).dense();
-#else
-                    return explicit_positions.to(::tyloi::kInt64).contiguous();
-#endif
                 // NoPE: positions only address the predictor's KV history.
-#ifdef TYLOINFER_NATIVE_CUDA
                 return tyloi::ops::arange(start, start + tokens,
                     tyloi::Device{tyloi::DeviceType::cuda, model.primary}).dense();
-#else
-                return ::tyloi::cuda::arange(start, start + tokens,
-                                                  ::tyloi::TensorOptions()
-                                                      .device(::tyloi::kCUDA)
-                                                      .dtype(::tyloi::kInt64));
-#endif
             }
             DenseTensor fuse(DenseTensor e, DenseTensor h) {
-#ifdef TYLOINFER_NATIVE_CUDA
                 auto joined = tyloi::ops::cat(std::array<::tyloi::Tensor, 2>{
                     ::tyloi::Tensor(std::move(e)), ::tyloi::Tensor(std::move(h))}, -1);
                 return tyloi::ops::project(joined, model.fusion).dense();
-#else
-                return Executor::current().projector(mode.ffn).run(
-                    model.fusion, ::tyloi::cuda::cat({e, h}, -1));
-#endif
             }
             static DenseTensor lengths(int64_t batch, int64_t end, const DenseTensor &positions) {
-#ifdef TYLOINFER_NATIVE_CUDA
                 const std::array<int64_t, 1> shape{batch};
                 return tyloi::ops::full(shape, end, positions.device()).dense();
-#else
-                return ::tyloi::cuda::full({batch}, end, positions.options());
-#endif
             }
             // One predictor stage: every declared sub-block adds its own
             // pre-normed mixer branch to the same residual stream.
@@ -243,13 +187,8 @@ struct Mtp final : tyloi::models::Mtp {
                                       std::move(x), step, 0, mode);
                 return x;
             }
-#ifdef TYLOINFER_NATIVE_CUDA
         } ops{*this, state,
               tyloi::models::ForwardOptions{config.max_position_embeddings, nullptr, -1, primary}};
-#else
-        } ops{*this, state,
-              Executor::current().forward_mode(primary)};
-#endif
         return tyloi::models::nemotron_h::mtp_predictor(ops, hidden, ids, supplied_positions, depth,
                                                      true);
     }

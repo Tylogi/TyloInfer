@@ -34,10 +34,8 @@
 #include "engine/ops/gdn.h"
 #include "engine/ops/qsa.h"
 #include "engine/generation/sequence.h"
-#ifdef TYLOINFER_NATIVE_CUDA
 #include "matmul_rows.h"
 #include "engine/backends/cuda/native/graph.h"
-#endif
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -191,19 +189,11 @@ std::pair<DenseTensor, DenseTensor> Predictor::evaluate(tyloi::models::MtpState&
     auto& request=state<PredictorState>(value);
     TYLOINFER_RUNTIME_CHECK(!history_only || (cache && layers.size()==1),
         "cache-only MTP priming requires a single predictor layer");
-#ifdef TYLOINFER_NATIVE_CUDA
     TYLOINFER_RUNTIME_CHECK(ids.dim() == 2 && ids.size(0) > 0 && ids.size(1) > 0 &&
                           hidden.dim() == 3 && hidden.size(0) == ids.size(0) &&
                           hidden.size(1) == ids.size(1) &&
                           hidden.size(2) == hidden_norm.numel(),
                       "Qwen4-Exp MTP input geometry mismatch");
-#else
-    TYLOINFER_RUNTIME_CHECK(ids.dim() == 2 && ids.size(0) > 0 && ids.size(1) > 0 &&
-                          hidden.dim() == 3 && hidden.size(0) == ids.size(0) &&
-                          hidden.size(1) == ids.size(1) &&
-                          hidden.size(2) == hidden_norm.numel(),
-                      "Qwen4-Exp MTP input geometry mismatch");
-#endif
     const auto b = ids.size(0), t = ids.size(1);
     const auto capacity = config.maximum;
     const auto count = int64_t(request.lengths.size());
@@ -401,15 +391,9 @@ MtpSessionState Predictor::capture_session_state(const tyloi::models::MtpState& 
     const auto& request=this->state<PredictorState>(value);
     const auto& hidden=input_hidden.dense();
     const auto position=target_position-1;
-#ifdef TYLOINFER_NATIVE_CUDA
     TYLOINFER_RUNTIME_CHECK(supports_session_state(value) && position>0 && position<=request.position() &&
         hidden.defined() && hidden.dim()==3 && hidden.size(0)==1 && hidden.size(1)==1 && hidden.size(2)==hidden_norm.numel(),
         "Qwen4 MTP session boundary is unavailable");
-#else
-    TYLOINFER_RUNTIME_CHECK(supports_session_state(value) && position>0 && position<=request.position() &&
-        hidden.defined() && hidden.dim()==3 && hidden.size(0)==1 && hidden.size(1)==1 && hidden.size(2)==hidden_norm.numel(),
-        "Qwen4 MTP session boundary is unavailable");
-#endif
     MtpSessionState state;state.cache_pos=position;
     auto& snapshot=state.payload.emplace<tyloi::models::qwen4_exp::MtpSnapshot>();
     for(std::size_t i=0;i<layers.size();++i) {
@@ -1037,19 +1021,10 @@ std::vector<std::pair<std::string,double>> qwen4_cache_memory_metrics(
         const qwen4_exp::Model& model,const qwen4_exp::State& state,const tyloi::models::Mtp* mtp) {
     // Shared checkpoint views and recurrent state aliases count once. These
     // are existing cache tensors; collecting telemetry never copies GPU data.
-#ifdef TYLOINFER_NATIVE_CUDA
     std::map<int,std::vector<::tyloi::DenseTensor>> allocations;
     const auto add=[&](const ::tyloi::DenseTensor& tensor) {
         if(tensor.defined() && tensor.is_cuda()) allocations[tensor.get_device()].push_back(tensor);
     };
-#else
-    std::map<std::pair<int,std::uintptr_t>,std::size_t> allocations;
-    const auto add=[&](const ::tyloi::DenseTensor& tensor) {
-        if(!tensor.defined() || !tensor.is_cuda())return;
-        auto& bytes=allocations[{tensor.get_device(),reinterpret_cast<std::uintptr_t>(tensor.data_ptr())}];
-        bytes=std::max(bytes,std::size_t(tensor.numel())*tensor.element_size());
-    };
-#endif
     const auto block_cache=[&](const qwen4_exp::Layer& block,const qwen4_exp::LayerState& layer) {
         if(block.qsa)for(const auto& tensor:block.qsa->resident_cache_tensors(*layer.qsa))add(tensor.dense());
         if(block.gdn) { add(layer.gdn.conv.dense()); add(layer.gdn.recurrent.dense()); }
@@ -1072,16 +1047,12 @@ std::vector<std::pair<std::string,double>> qwen4_cache_memory_metrics(
     }
     std::size_t bytes=0;
     std::map<int,std::size_t> devices;
-#ifdef TYLOINFER_NATIVE_CUDA
     for(const auto& [device,tensors]:allocations) {
         std::vector<const ::tyloi::DenseTensor*> buffers;
         for(const auto& tensor:tensors) buffers.push_back(&tensor);
         const auto size=::tyloi::backing_bytes(buffers);
         bytes+=size; devices[device]=size;
     }
-#else
-    for(const auto& [address,size]:allocations) { bytes+=size; devices[address.first]+=size; }
-#endif
     std::vector<std::pair<std::string,double>> result{{"kv_cache_bytes",double(bytes)},
         {"kv_cache_contexts",state.cache_pos>0?double(state.batch):0.0}};
     for(const auto& [device,size]:devices)result.emplace_back("gpu_"+std::to_string(device)+"_live_kv_bytes",double(size));
@@ -1792,13 +1763,9 @@ tyloi::StepSequence<tyloi::models::Prefill> qwen4_exp::Model::prefill(
     // requested; the combined residual tensors have been verified to 16k.
     const bool bulk_gr=batch_experts && (bulk_gr_option?*bulk_gr_option:tokens<=16384);
     const auto bulk_gdn_option=::tyloi::cuda::options::gdn_prefill_layer_batch();
-#ifdef TYLOINFER_NATIVE_CUDA
     // Allow 8k chat framing while keeping the extra whole-sequence QKV and
     // gate tensors out of the 16k service path, which also retains MTP weights.
     const bool bulk_gdn=bulk_gr && (bulk_gdn_option?*bulk_gdn_option:tokens<=9216);
-#else
-    const bool bulk_gdn=bulk_gr && bulk_gdn_option && *bulk_gdn_option;
-#endif
     const auto reference_rows=batch_experts?std::min<int64_t>(1024,compute_chunk):0;
     const auto batch_tokens_option=::tyloi::cuda::options::moe_prefill_expert_batch_tokens();
     const int64_t batch_tokens=batch_tokens_option?*batch_tokens_option:8192;

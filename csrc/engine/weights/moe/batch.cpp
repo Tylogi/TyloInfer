@@ -8,7 +8,6 @@
 #include <stdexcept>
 #include <utility>
 
-#ifdef TYLOINFER_NATIVE_CUDA
 namespace tyloi::weights {
 namespace {
 
@@ -152,4 +151,3 @@ std::shared_ptr<const MfeTensor> ExpertBatch::Impl::stage(
 }
 
 } // namespace tyloi::weights
-#endif

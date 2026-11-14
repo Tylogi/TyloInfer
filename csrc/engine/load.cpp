@@ -8,22 +8,22 @@
 #include "engine/models/qwen35/model.h"
 #include "engine/models/qwen35/state.h"
 #include "engine/models/minicpmo45/forward.h"
-#include "engine/models/minicpmo45/text/forward.h"
-#include "engine/models/glm_dsa/forward.h"
+#include "engine/models/minicpmo45/text/model.h"
+#include "engine/models/minicpmo45/text/state.h"
+#include "engine/models/glm_dsa/model.h"
+#include "engine/models/glm_dsa/state.h"
 #include "engine/models/deepseek_v4/forward.h"
 #include "engine/models/glm5_next/forward.h"
 #include "engine/models/nemotron_h/forward.h"
 #include "engine/models/source/model_graph.h"
 #include "engine/instance_impl.h"
 #include "engine/drain.h"
-#ifdef TYLOINFER_NATIVE_CUDA
 #include "engine/models/causal_model.h"
 #include "engine/models/source/model_config.h"
 #include "engine/models/session/cache.h"
 #include "engine/models/input.h"
 #include "engine/requests/processor.h"
 #include "engine/state/session/sessions.h"
-#endif
 
 #include "engine/backends/cuda/native/env.h"
 #include "engine/backends/cuda/native/collectives.h"
@@ -65,9 +65,7 @@ namespace tyloi::cuda {
 
 namespace {
 
-#ifdef TYLOINFER_NATIVE_CUDA
 std::unique_ptr<engine::Engine> load_native_engine(CudaEngineOptions options, engine::Engine* target);
-#endif
 
 } // namespace
 
@@ -75,11 +73,9 @@ std::unique_ptr<engine::Engine> load_cuda_engine(CudaEngineOptions options) {
     auto source = tyloi::open_model_source(options.model_path);
     const auto backbone = ::tyloi::models::backbone(tyloi::models::graph(*source).backbone);
     source.reset();
-#ifdef TYLOINFER_NATIVE_CUDA
     if (backbone == ::tyloi::models::Backbone::gemma4 || backbone == ::tyloi::models::Backbone::qwen4_exp) {
         return load_native_engine(std::move(options), nullptr);
     }
-#endif
     return std::make_unique<engine_detail::EngineInstance<
         engine_detail::State, with_model<>>>(std::move(options));
 }
@@ -90,16 +86,13 @@ void reload_cuda_engine(engine::Engine& engine, CudaEngineOptions options) {
         target->load();
         return;
     }
-#ifdef TYLOINFER_NATIVE_CUDA
     if (typeid(engine) == typeid(tyloi::engine::Engine)) {
         load_native_engine(std::move(options), &engine);
         return;
     }
-#endif
     throw std::invalid_argument("unsupported CUDA engine for reload");
 }
 
-#ifdef TYLOINFER_NATIVE_CUDA
 namespace {
 std::unique_ptr<engine::Engine> load_native_engine(CudaEngineOptions options, engine::Engine* target) {
     std::shared_ptr<const ModelSource> source;
@@ -239,7 +232,6 @@ std::unique_ptr<engine::Engine> load_native_engine(CudaEngineOptions options, en
     }
 }
 } // namespace
-#endif
 
 } // namespace tyloi::cuda
 
@@ -328,9 +320,7 @@ void setup_cuda_load(
     config.expert_parallel = options.expert_parallel;
     config.layer_placement = options.layer_placement;
     configure_placement(config, executor.collectives());
-#ifdef TYLOINFER_NATIVE_CUDA
     executor.set_primary(model_parallel_primary_device(config));
-#endif
     if (!options.cpu_offload_layers.empty()) {
         config.dsv4_cpu_offload_layers = options.cpu_offload_layers;
         std::vector<int> ordered(

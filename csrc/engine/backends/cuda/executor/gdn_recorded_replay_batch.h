@@ -31,9 +31,7 @@ private:
     int maximum_heads_ = 0, maximum_channels_ = 0, tokens_ = 0;
     cudaStream_t recorded_stream_ = nullptr;
     bool stream_recorded_ = false;
-#ifdef TYLOINFER_NATIVE_CUDA_RUNTIME
     std::vector<DmaCopy> copies_;
-#endif
 
     static bool overlaps(Span a, Span b) {
         const auto x = reinterpret_cast<std::uintptr_t>(a.pointer);
@@ -152,11 +150,9 @@ public:
             batch->maximum_heads_ = std::max(batch->maximum_heads_, descriptor.value_heads);
             batch->maximum_channels_ = std::max(batch->maximum_channels_, descriptor.channels);
             metadata.push_back(descriptor);
-#ifdef TYLOINFER_NATIVE_CUDA_RUNTIME
             if (layer.convolution.data_ptr() != layer.initial_convolution.data_ptr())
                 batch->copies_.push_back({layer.convolution.data_ptr(), layer.initial_convolution.data_ptr(),
                     std::size_t(layer.convolution.nbytes())});
-#endif
         }
         const auto& example = batch->layers_.front().qkv;
         batch->host_ = ::tyloi::cuda::empty({int64_t(metadata.size() * sizeof(GdnReplayLayer))},
@@ -183,7 +179,6 @@ public:
             recorded_stream_ = stream.stream();
             stream_recorded_ = true;
         }
-#ifdef TYLOINFER_NATIVE_CUDA_RUNTIME
         const auto* copy_batch = tyloi::cuda::env_lookup("TYLOINFER_RECURRENT_COPY_BATCH");
         if (!copy_batch || copy_batch[0] != '0') {
             if (!copies_.empty()) copy_recurrent_states(copies_.data(), copies_.size(), stream.stream());
@@ -192,9 +187,6 @@ public:
                 if (layer.convolution.data_ptr() != layer.initial_convolution.data_ptr())
                     layer.convolution.copy_(layer.initial_convolution);
         }
-#else
-        for (auto& layer : layers_) layer.convolution.copy_(layer.initial_convolution);
-#endif
         gdn_replay_commit_layers_cuda(descriptors_, int(layers_.size()), maximum_heads_,
             maximum_channels_, int(retained_tokens), true);
     }

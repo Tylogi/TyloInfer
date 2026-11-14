@@ -156,6 +156,7 @@ if(TYLOINFER_ENABLE_MFQ_COMPAT)
     )
 endif()
 target_compile_definitions(mfq-hip-native-kernels PRIVATE
+    TYLOINFER_ENABLE_MFQ_COMPAT=$<BOOL:${TYLOINFER_ENABLE_MFQ_COMPAT}>
     TYLOINFER_NATIVE_CUDA_RUNTIME=1
 )
 target_include_directories(mfq-hip-native-kernels PRIVATE
@@ -186,6 +187,8 @@ set_target_properties(mfq-hip-native-kernels PROPERTIES
 find_package(OpenMP QUIET)
 
 function(mfq_configure_hip_backend_target target)
+    target_compile_definitions(${target} PRIVATE
+        TYLOINFER_ENABLE_MFQ_COMPAT=$<BOOL:${TYLOINFER_ENABLE_MFQ_COMPAT}>)
     target_include_directories(${target} PRIVATE
         ${TYLOINFER_REPOSITORY_ROOT}
         ${PROJECT_SOURCE_DIR}
@@ -356,6 +359,8 @@ add_executable(mfq-runtime
     ${TYLOINFER_HIP_ROOT}/apps/runtime_main.cpp
     ${TYLOINFER_HIP_ROOT}/commands/runtime.cpp
 )
+target_compile_definitions(mfq-runtime PRIVATE
+    TYLOINFER_ENABLE_MFQ_COMPAT=$<BOOL:${TYLOINFER_ENABLE_MFQ_COMPAT}>)
 target_link_libraries(mfq-runtime PRIVATE
     mfq-hip-runtime mfq-runtime-communication)
 target_include_directories(mfq-runtime PRIVATE

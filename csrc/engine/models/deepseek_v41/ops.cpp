@@ -42,7 +42,6 @@ std::unique_ptr<Block> load_block(const tyloi::weights::Loader& weights,
                                       engram_cache_rows);
         tables.engram_prefetch.push_back(result->engram.get());
     }
-#ifdef TYLOINFER_NATIVE_CUDA
     result->attention_norm = std::make_shared<DenseTensor>(weights.tensor(prefix + "attention.norm.weight").dense()
                                  .to(::tyloi::kFloat32).contiguous());
     result->mlp_norm = std::make_shared<DenseTensor>(weights.tensor(prefix + "mlp.norm.weight").dense()
@@ -74,39 +73,6 @@ std::unique_ptr<Block> load_block(const tyloi::weights::Loader& weights,
     result->mlp_mhc_base = std::make_shared<DenseTensor>(weights.tensor(prefix + "mlp.mhc.pre.base").dense()
                                .to(::tyloi::kFloat32)
                                .contiguous());
-#else
-    result->attention_norm = weights.tensor(prefix + "attention.norm.weight").dense()
-                                 .to(::tyloi::kFloat32).contiguous();
-    result->mlp_norm = weights.tensor(prefix + "mlp.norm.weight").dense()
-                           .to(::tyloi::kFloat32).contiguous();
-    result->query_a_norm =
-        weights.tensor(prefix + "attention.query_a_norm.weight").dense();
-    result->key_value_norm =
-        weights.tensor(prefix + "attention.key_value_norm.weight").dense();
-    result->sinks = weights.tensor(prefix + "attention.sink").dense()
-                        .to(::tyloi::kFloat32)
-                        .contiguous();
-    result->attention_mhc_function =
-        weights.tensor(prefix + "attention.mhc.pre.function").dense()
-            .to(::tyloi::kFloat32)
-            .contiguous();
-    result->attention_mhc_scale =
-        weights.tensor(prefix + "attention.mhc.pre.scale").dense()
-            .to(::tyloi::kFloat32)
-            .contiguous();
-    result->attention_mhc_base = weights.tensor(prefix + "attention.mhc.pre.base").dense()
-                                     .to(::tyloi::kFloat32)
-                                     .contiguous();
-    result->mlp_mhc_function = weights.tensor(prefix + "mlp.mhc.pre.function").dense()
-                                   .to(::tyloi::kFloat32)
-                                   .contiguous();
-    result->mlp_mhc_scale = weights.tensor(prefix + "mlp.mhc.pre.scale").dense()
-                                .to(::tyloi::kFloat32)
-                                .contiguous();
-    result->mlp_mhc_base = weights.tensor(prefix + "mlp.mhc.pre.base").dense()
-                               .to(::tyloi::kFloat32)
-                               .contiguous();
-#endif
     result->query_a = weights.weight(prefix + "attention.query_a.weight");
     result->query_b = weights.weight(prefix + "attention.query_b.weight");
     result->key_value = weights.weight(prefix + "attention.key_value.weight");
@@ -115,20 +81,10 @@ std::unique_ptr<Block> load_block(const tyloi::weights::Loader& weights,
     if (result->kv_source()) {
         result->compressor_key_value =
             weights.weight(prefix + "attention.compressor.key_value.weight");
-#ifdef TYLOINFER_NATIVE_CUDA
         result->compressor_norm = weights.tensor(prefix + "attention.compressor.norm.weight");
-#else
-        result->compressor_norm =
-            weights.tensor(prefix + "attention.compressor.norm.weight").dense();
-#endif
         result->index_key =
             weights.weight(prefix + "attention.indexer.key.weight");
-#ifdef TYLOINFER_NATIVE_CUDA
         result->index_key_norm = weights.tensor(prefix + "attention.indexer.key_norm.weight");
-#else
-        result->index_key_norm =
-            weights.tensor(prefix + "attention.indexer.key_norm.weight").dense();
-#endif
         if (result->ratio > 1) {
             result->compressor_gate =
                 weights.weight(prefix + "attention.compressor.gate.weight");
@@ -142,49 +98,25 @@ std::unique_ptr<Block> load_block(const tyloi::weights::Loader& weights,
     }
     result->mlp = load_moe_at(weights, config, prefix + "mlp.", layer, config.top_k);
     if(weights.has(prefix+"mlp.router.vision_bias")) {
-#ifdef TYLOINFER_NATIVE_CUDA
         result->vision_router_bias=std::make_shared<DenseTensor>(
             weights.tensor(prefix+"mlp.router.vision_bias").dense()
                 .to(::tyloi::kFloat32).contiguous());
         TYLOINFER_RUNTIME_CHECK(result->vision_router_bias.dim()==1 && result->vision_router_bias.size(0)==config.n_experts,
                           "DeepSeek-V4.1 vision router bias shape mismatch");
-#else
-        result->vision_router_bias=weights.tensor(prefix+"mlp.router.vision_bias").dense()
-            .to(::tyloi::kFloat32).contiguous();
-        TYLOINFER_RUNTIME_CHECK(result->vision_router_bias.dim()==1 && result->vision_router_bias.size(0)==config.n_experts,
-                          "DeepSeek-V4.1 vision router bias shape mismatch");
-#endif
     }
-#ifdef TYLOINFER_NATIVE_CUDA
     result->rope = ::tyloi::ops::tail_rope_table(
         config.max_position_embeddings, config.rope_theta, result->ratio,
         ::tyloi::Device(::tyloi::kCUDA, weights.placement.device),
         config.compress_rope_theta, config.rope_scaling.original_max_position_embeddings,
         config.rope_scaling.factor, config.rope_scaling.beta_fast, config.rope_scaling.beta_slow);
-#else
-    result->rope = TailRope(
-        config.max_position_embeddings, config.rope_theta, result->ratio,
-        config.compress_rope_theta, config.rope_scaling.original_max_position_embeddings,
-        config.rope_scaling.factor, config.rope_scaling.beta_fast, config.rope_scaling.beta_slow);
-#endif
 
     const auto function_width = config.hc_mult * config.hidden;
-#ifdef TYLOINFER_NATIVE_CUDA
     const auto valid_mhc = [&](const Parameter &function, const Parameter &scale, const Parameter &base,
                                const Parameter &norm) {
         return function.dim() == 2 && function.size(0) == 24 &&
                function.size(1) == function_width && scale.numel() == 3 && base.numel() == 24 &&
                norm.numel() == config.hidden;
     };
-#else
-    const auto valid_mhc = [&](const DenseTensor &function, const DenseTensor &scale, const DenseTensor &base,
-                               const DenseTensor &norm) {
-        return function.dim() == 2 && function.size(0) == 24 &&
-               function.size(1) == function_width && scale.numel() == 3 && base.numel() == 24 &&
-               norm.numel() == config.hidden;
-    };
-#endif
-#ifdef TYLOINFER_NATIVE_CUDA
     const bool base_shapes =
         valid_mhc(result->attention_mhc_function, result->attention_mhc_scale,
                   result->attention_mhc_base, result->attention_norm) &&
@@ -212,35 +144,6 @@ std::unique_ptr<Block> load_block(const tyloi::weights::Loader& weights,
          result->index_key_norm.numel() == config.index_head_dim &&
          (result->ratio == 1 || (result->compressor_gate.size(1) == config.hidden &&
                                  result->compressor_gate.size(0) == config.head_dim)));
-#else
-    const bool base_shapes =
-        valid_mhc(result->attention_mhc_function, result->attention_mhc_scale,
-                  result->attention_mhc_base, result->attention_norm) &&
-        valid_mhc(result->mlp_mhc_function, result->mlp_mhc_scale, result->mlp_mhc_base,
-                  result->mlp_norm) &&
-        result->query_a_norm.numel() == config.q_lora_rank &&
-        result->key_value_norm.numel() == config.head_dim &&
-        result->sinks.numel() == config.n_heads && result->query_a->size(1) == config.hidden &&
-        result->query_a->size(0) == config.q_lora_rank &&
-        result->query_b->size(1) == config.q_lora_rank &&
-        result->query_b->size(0) == config.n_heads * config.head_dim &&
-        result->key_value->size(1) == config.hidden &&
-        result->key_value->size(0) == config.head_dim &&
-        result->output_a->size(1) == config.n_heads * config.head_dim / config.o_groups &&
-        result->output_a->size(0) == config.o_groups * config.o_lora_rank &&
-        result->output_b->size(1) == config.o_groups * config.o_lora_rank &&
-        result->output_b->size(0) == config.hidden;
-    const bool source_shapes =
-        !result->kv_source() ||
-        (result->compressor_key_value->size(1) == config.hidden &&
-         result->compressor_key_value->size(0) == config.head_dim &&
-         result->compressor_norm.numel() == config.head_dim &&
-         result->index_key->size(1) == config.head_dim &&
-         result->index_key->size(0) == config.index_head_dim &&
-         result->index_key_norm.numel() == config.index_head_dim &&
-         (result->ratio == 1 || (result->compressor_gate->size(1) == config.hidden &&
-                                 result->compressor_gate->size(0) == config.head_dim)));
-#endif
     const bool index_shapes =
         !result->index_source() ||
         (result->index_query.size(1) == config.q_lora_rank &&
@@ -364,11 +267,7 @@ bool Model::prefetch_token_rows(State& state, const ::tyloi::Tensor& input_ids) 
 }
 
 ::tyloi::DenseTensor Model::normalize_hidden(::tyloi::DenseTensor hidden,
-#ifdef TYLOINFER_NATIVE_CUDA
                                              const ::tyloi::Tensor& output_norm,
-#else
-                                             const ::tyloi::DenseTensor& output_norm,
-#endif
                                              std::int64_t batch, std::int64_t tokens) const {
     return tyloi::ops::measure("model.output_norm", [&]() {
         return qwen_rms_norm(hidden.reshape({batch * tokens, metadata.hidden_size})
@@ -390,11 +289,7 @@ bool Model::prefetch_token_rows(State& state, const ::tyloi::Tensor& input_ids) 
 ::tyloi::DenseTensor Model::finalize_hidden(State& state, ::tyloi::DenseTensor hidden,
                                                     std::int64_t batch, std::int64_t tokens) const {
     auto collapsed = deepseek_v41_runtime::finalize_hidden(*state.shared, hidden);
-#ifdef TYLOINFER_NATIVE_CUDA
     return normalize_hidden(std::move(collapsed), output_norm, batch, tokens);
-#else
-    return normalize_hidden(std::move(collapsed), output_norm, batch, tokens);
-#endif
 }
 
 void Model::validate_forward(std::int64_t, std::int64_t tokens, std::int64_t cache_position,

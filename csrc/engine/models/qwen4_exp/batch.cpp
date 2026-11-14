@@ -66,11 +66,9 @@ public:
     }
     Tensor decode(std::span<const models::BatchRow> rows, Tensor ids, const Tensor& host_ids) override {
         auto requests = active(rows);
-#ifdef TYLOINFER_NATIVE_CUDA
         auto policy = Executor::current_ffn();
         policy.batch_serial = requests.size() > 8;
         auto scope = Executor::current().enter(policy);
-#endif
         return qwen4_batch_decode(model_, requests, std::move(ids), host_ids);
     }
     StepSequence<std::unique_ptr<Plan>> plan(std::span<const models::BatchRow> rows, bool greedy) override {
@@ -95,11 +93,9 @@ public:
         for (;;) {
             StepResult<Tensor> step;
             {
-#ifdef TYLOINFER_NATIVE_CUDA
                 auto policy = Executor::current_ffn();
                 policy.batch_serial = requests.size() > 8;
                 auto scope = Executor::current().enter(policy);
-#endif
                 step = job.next();
             }
             if (!step) break;

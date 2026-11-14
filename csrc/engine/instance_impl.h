@@ -64,11 +64,7 @@ class EngineInstance final : public Engine {
     }
     std::unique_ptr<tyloi::Executor::Scope> enter() override {
         return std::visit([](auto& ops) -> std::unique_ptr<tyloi::Executor::Scope> {
-#ifdef TYLOINFER_NATIVE_CUDA
             return ops->executor->enter();
-#else
-            return ops->executor->enter(ops->load_config.layer_placement.primary_device());
-#endif
         }, *state);
     }
     void prepare_request(Request& request, bool batched) override {

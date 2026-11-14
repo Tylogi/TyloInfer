@@ -575,11 +575,9 @@ bool DecodeWindow::Capture::next() {
         window.recording_segments_=true;window.graphs_.begin(0,1);
     }
     auto& executor = Executor::current();
-#ifdef TYLOINFER_NATIVE_CUDA
     auto mode = Executor::current_ffn();
     mode.serial = true;
     state.ffn_scope = executor.enter(mode);
-#endif
     state.ffn_serial = &executor.mode().ffn.serial;
     state.previous_ffn_serial = *state.ffn_serial;
     *state.ffn_serial = true;

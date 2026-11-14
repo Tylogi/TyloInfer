@@ -4,9 +4,7 @@
 #include "engine/models/minicpmo45/config.h"
 #include "engine/backends/cuda/ops/rope/rope.h"
 #include "engine/models/metadata.h"
-#ifdef TYLOINFER_NATIVE_CUDA
 #include "engine/models/causal_model.h"
-#endif
 #include "engine/models/plan.h"
 #include "engine/models/source.h"
 
@@ -23,11 +21,8 @@ namespace tyloi::cuda::minicpmo45::text {
 using Config = tyloi::models::minicpmo45::Config;
 
 struct Model
-#ifdef TYLOINFER_NATIVE_CUDA
     : tyloi::models::CausalModel
-#endif
 {
-#ifdef TYLOINFER_NATIVE_CUDA
     tyloi::models::Info info() const override;
     MfqModelCapabilities capabilities() const override;
     tyloi::engine::Metrics metrics() const override;
@@ -40,7 +35,6 @@ struct Model
     Tensor logits(const Tensor&, bool capped = true) const override;
     Tensor forward(tyloi::models::Input, tyloi::models::State&,
                    const tyloi::models::ForwardOptions& = {}) const override;
-#endif
     std::shared_ptr<const tyloi::ModelSource> source;
     tyloi::ModelGraph graph;
     ::tyloi::models::Plan plan;
@@ -48,11 +42,7 @@ struct Model
     tyloi::models::CausalLmMetadata metadata;
     int primary = 0;
     ::tyloi::Tensor embed, lm_head;
-#ifdef TYLOINFER_NATIVE_CUDA
     ::tyloi::Tensor output_norm;
-#else
-    DenseTensor output_norm;
-#endif
     tyloi::ops::RopeTable rope, cpu_rope;
     std::unordered_map<int, tyloi::ops::RopeTable> device_ropes;
     std::vector<Layer> layers;

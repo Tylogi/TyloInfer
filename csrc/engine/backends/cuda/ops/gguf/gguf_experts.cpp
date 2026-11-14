@@ -733,7 +733,7 @@ class GgufExpertCache {
     }
 
     std::size_t reusable_resident_memory(int device) const {
-#if defined(TYLOINFER_NATIVE_CUDA_RUNTIME) && CUDA_VERSION >= 11030
+#if CUDA_VERSION >= 11030
         for(const auto& [key,entry]:device_)if(key.device==device) {
             CUmemoryPool pool=nullptr;
             if(cuPointerGetAttribute(&pool,CU_POINTER_ATTRIBUTE_MEMPOOL_HANDLE,
@@ -4844,9 +4844,7 @@ std::optional<::tyloi::DenseTensor> try_shared_branch(CudaIndependentBranchExecu
     if(branch.stream()==parent.stream() || branch.stream()==transfer)return std::nullopt;
     cudaStreamCaptureStatus capture=cudaStreamCaptureStatusNone;
     TYLOINFER_CUDA_CHECK(cudaStreamIsCapturing(parent.stream(),&capture));
-#ifdef TYLOINFER_NATIVE_CUDA_RUNTIME
     if(window)window->prepare_branch_stream(branch,executor->graph_pools[0]);
-#endif
     TYLOINFER_CUDA_CHECK(cudaEventRecord(executor->ready,parent.stream()));
     TYLOINFER_CUDA_CHECK(cudaStreamWaitEvent(branch.stream(),executor->ready,0));
     const char* phase="shared";

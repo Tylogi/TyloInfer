@@ -29,7 +29,6 @@ Tensor ple(const Tensor& input, const Tensor& embeddings, const PleWeights& w,
             }
         }
     };
-#ifdef TYLOINFER_NATIVE_CUDA
     const auto native = cuda::options::ple_native_fusion();
     if ((!native || *native) && x.is_contiguous() && t <= 32 && hidden > 128 && hidden <= 8192 &&
         (x.scalar_type() == kFloat16 || x.scalar_type() == kFloat32)) {
@@ -45,7 +44,6 @@ Tensor ple(const Tensor& input, const Tensor& embeddings, const PleWeights& w,
         if (cache) { if (conv.defined()) conv.copy_(output[1]); else convolution = output[1]; }
         return output[0];
     }
-#endif
     auto key = mfq_qwen4_exp::grouped_rms_norm(project(rows, w.key).dense(), w.key_norm.dense(), hidden, eps)
         .reshape({b, t, streams, hidden});
     auto query = mfq_qwen4_exp::grouped_rms_norm(x, w.query_norm.dense(), hidden, eps)

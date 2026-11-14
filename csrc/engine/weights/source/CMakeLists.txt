@@ -35,6 +35,8 @@ target_include_directories(mfq-weight-source PUBLIC ${PROJECT_SOURCE_DIR})
 target_link_libraries(mfq-weight-source PUBLIC mfq-formats mfq-io mfq-quant-readers
     PRIVATE mfq-json mfq-ggml)
 target_compile_features(mfq-weight-source PUBLIC cxx_std_17)
+target_compile_definitions(mfq-weight-source PRIVATE
+    TYLOINFER_ENABLE_MFQ_COMPAT=$<BOOL:${TYLOINFER_ENABLE_MFQ_COMPAT}>)
 set_target_properties(mfq-weight-source PROPERTIES POSITION_INDEPENDENT_CODE ON)
 if(MSVC)
     target_compile_options(mfq-weight-source PRIVATE /EHsc)

@@ -70,8 +70,11 @@ add_library(mfq-engine STATIC
     state/kv_sequence.cpp
     state/kv_offload.cpp
 )
+target_compile_definitions(mfq-engine PRIVATE
+    TYLOINFER_ENABLE_MFQ_COMPAT=$<BOOL:${TYLOINFER_ENABLE_MFQ_COMPAT}>
+    TYLOINFER_HAS_CUDA=$<BOOL:${TYLOINFER_BUILD_CUDA_ENGINE}>
+    TYLOINFER_HAS_METAL=$<BOOL:${TYLOINFER_BUILD_METAL_RUNTIME}>)
 if(TYLOINFER_BUILD_CUDA_ENGINE)
-    target_compile_definitions(mfq-engine PUBLIC TYLOINFER_NATIVE_CUDA=1)
     target_include_directories(mfq-engine PRIVATE
         ${TYLOINFER_REPOSITORY_ROOT}
         ${PROJECT_SOURCE_DIR}/engine/backends/cuda/native
@@ -81,7 +84,6 @@ if(TYLOINFER_BUILD_CUDA_ENGINE)
         CUDA::cudart CUDA::cublas mfq-cuda-core mfq-ggml-internal-headers)
 endif()
 if(TYLOINFER_BUILD_METAL_RUNTIME)
-    target_compile_definitions(mfq-engine PUBLIC TYLOINFER_NATIVE_MLX_RUNTIME=1)
     target_link_libraries(mfq-engine PRIVATE mfq-metal-ops)
 endif()
 add_library(mfq::engine ALIAS mfq-engine)

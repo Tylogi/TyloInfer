@@ -18,24 +18,7 @@ add_executable(mfq-diagnostics
 target_link_libraries(mfq-diagnostics PRIVATE mfq-cuda-diagnostics mfq-cuda-eval)
 
 
-if(TARGET mfq-cuda-torch-engine)
-    add_executable(mfq-runtime-torch
-        ${PROJECT_SOURCE_DIR}/apps/runtime_main.cpp
-        ${PROJECT_SOURCE_DIR}/commands/runtime.cpp
-        ${PROJECT_SOURCE_DIR}/commands/cli.cpp
-        ${PROJECT_SOURCE_DIR}/commands/minicpmo45.cpp
-    )
-    target_link_libraries(mfq-runtime-torch PRIVATE
-        mfq-cuda-torch-engine mfq-transport)
-    set_target_properties(mfq-runtime-torch PROPERTIES
-        CUDA_ARCHITECTURES "${TYLOINFER_CUDA_ARCHITECTURES}"
-        CUDA_RUNTIME_LIBRARY Shared
-        CUDA_STANDARD 20
-        CUDA_STANDARD_REQUIRED ON
-    )
-endif()
-
-foreach(target mfq-runtime mfq-diagnostics mfq-runtime-torch)
+foreach(target mfq-runtime mfq-diagnostics)
     if(TARGET ${target})
         mfq_configure_cuda_engine_target(${target})
         target_compile_definitions(${target} PRIVATE NOMINMAX)

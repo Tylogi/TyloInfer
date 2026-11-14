@@ -1,19 +1,19 @@
 #include "engine/ops.h"
 
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
 #include "engine/backends/cuda/executor/executor.h"
 #include "engine/backends/cuda/ops/tensor.h"
 #include "engine/backends/cuda/ops/norm/rms.h"
 #include "engine/backends/cuda/ops/norm/layer.h"
 #endif
-#ifdef TYLOINFER_NATIVE_MLX_RUNTIME
+#if TYLOINFER_HAS_METAL
 #include "engine/backends/metal/ops/tensor.h"
 #include "engine/backends/metal/ops/norm/rms.h"
 #include "engine/backends/metal/ops/norm/layer.h"
 #endif
 
 namespace tyloi::ops {
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
 namespace {
 const DenseTensor& dense(const Tensor& value) {
     const auto* result = value.representation<DenseTensor>();
@@ -50,12 +50,12 @@ void require_cuda(const Tensor& value_tensor) {
 #endif
 
 Tensor add(const Tensor& left_tensor, const Tensor& right_tensor) {
-#ifdef TYLOINFER_NATIVE_MLX_RUNTIME
+#if TYLOINFER_HAS_METAL
     if ((left_tensor.defined() && left_tensor.device().is_metal()) ||
         (right_tensor.defined() && right_tensor.device().is_metal()))
         return metal::ops::add(left_tensor, right_tensor);
 #endif
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
     const auto& left = ::tyloi::ops::dense(left_tensor);
     const auto& right = ::tyloi::ops::dense(right_tensor);
     compatible(left, right);
@@ -67,12 +67,12 @@ Tensor add(const Tensor& left_tensor, const Tensor& right_tensor) {
 }
 
 Tensor multiply(const Tensor& left_tensor, const Tensor& right_tensor) {
-#ifdef TYLOINFER_NATIVE_MLX_RUNTIME
+#if TYLOINFER_HAS_METAL
     if ((left_tensor.defined() && left_tensor.device().is_metal()) ||
         (right_tensor.defined() && right_tensor.device().is_metal()))
         return metal::ops::multiply(left_tensor, right_tensor);
 #endif
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
     const auto& left = ::tyloi::ops::dense(left_tensor);
     const auto& right = ::tyloi::ops::dense(right_tensor);
     compatible(left, right);
@@ -84,12 +84,12 @@ Tensor multiply(const Tensor& left_tensor, const Tensor& right_tensor) {
 }
 
 Tensor matmul(const Tensor& left_tensor, const Tensor& right_tensor) {
-#ifdef TYLOINFER_NATIVE_MLX_RUNTIME
+#if TYLOINFER_HAS_METAL
     if ((left_tensor.defined() && left_tensor.device().is_metal()) ||
         (right_tensor.defined() && right_tensor.device().is_metal()))
         return metal::ops::matmul(left_tensor, right_tensor);
 #endif
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
     const auto& left = ::tyloi::ops::dense(left_tensor);
     const auto& right = ::tyloi::ops::dense(right_tensor);
     compatible(left, right);
@@ -101,12 +101,12 @@ Tensor matmul(const Tensor& left_tensor, const Tensor& right_tensor) {
 }
 
 Tensor rms_norm(const Tensor& value_tensor, const Tensor& weight_tensor, double eps, double offset, ScalarType output_type) {
-#ifdef TYLOINFER_NATIVE_MLX_RUNTIME
+#if TYLOINFER_HAS_METAL
     if ((value_tensor.defined() && value_tensor.device().is_metal()) ||
         (weight_tensor.defined() && weight_tensor.device().is_metal()))
         return metal::ops::rms_norm(value_tensor, weight_tensor, eps, offset, output_type);
 #endif
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
     const auto& value = ::tyloi::ops::dense(value_tensor);
     const auto& weight = ::tyloi::ops::dense(weight_tensor);
     input(value);
@@ -130,13 +130,13 @@ Tensor rms_norm(const Tensor& value_tensor, const Tensor& weight_tensor, double 
 }
 
 Tensor layer_norm(const Tensor& value_tensor, const Tensor& weight_tensor, const Tensor& bias_tensor, double epsilon) {
-#ifdef TYLOINFER_NATIVE_MLX_RUNTIME
+#if TYLOINFER_HAS_METAL
     if ((value_tensor.defined() && value_tensor.device().is_metal()) ||
         (weight_tensor.defined() && weight_tensor.device().is_metal()) ||
         (bias_tensor.defined() && bias_tensor.device().is_metal()))
         return metal::ops::layer_norm(value_tensor, weight_tensor, bias_tensor, epsilon);
 #endif
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
     const auto& value = ::tyloi::ops::dense(value_tensor);
     const auto& weight = ::tyloi::ops::dense(weight_tensor);
     const auto& bias = ::tyloi::ops::dense(bias_tensor);
@@ -153,11 +153,11 @@ Tensor layer_norm(const Tensor& value_tensor, const Tensor& weight_tensor, const
 }
 
 Tensor gelu(const Tensor& value_tensor, bool approximate) {
-#ifdef TYLOINFER_NATIVE_MLX_RUNTIME
+#if TYLOINFER_HAS_METAL
     if ((value_tensor.defined() && value_tensor.device().is_metal()))
         return metal::ops::gelu(value_tensor, approximate);
 #endif
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
     const auto& value = ::tyloi::ops::dense(value_tensor);
     input(value);
     require_cuda(value);
@@ -168,11 +168,11 @@ Tensor gelu(const Tensor& value_tensor, bool approximate) {
 }
 
 Tensor silu(const Tensor& value_tensor) {
-#ifdef TYLOINFER_NATIVE_MLX_RUNTIME
+#if TYLOINFER_HAS_METAL
     if ((value_tensor.defined() && value_tensor.device().is_metal()))
         return metal::ops::silu(value_tensor);
 #endif
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
     const auto& value = ::tyloi::ops::dense(value_tensor);
     input(value);
     require_cuda(value);
@@ -183,11 +183,11 @@ Tensor silu(const Tensor& value_tensor) {
 }
 
 Tensor relu_squared(const Tensor& value_tensor) {
-#ifdef TYLOINFER_NATIVE_MLX_RUNTIME
+#if TYLOINFER_HAS_METAL
     if ((value_tensor.defined() && value_tensor.device().is_metal()))
         return metal::ops::relu_squared(value_tensor);
 #endif
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
     const auto& value = ::tyloi::ops::dense(value_tensor);
     input(value);
     require_cuda(value);
@@ -198,11 +198,11 @@ Tensor relu_squared(const Tensor& value_tensor) {
 }
 
 Tensor softcap(const Tensor& value_tensor, double cap) {
-#ifdef TYLOINFER_NATIVE_MLX_RUNTIME
+#if TYLOINFER_HAS_METAL
     if ((value_tensor.defined() && value_tensor.device().is_metal()))
         return metal::ops::softcap(value_tensor, cap);
 #endif
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
     const auto& value = ::tyloi::ops::dense(value_tensor);
     input(value);
     if (cap > 0.0) require_cuda(value);
@@ -213,11 +213,11 @@ Tensor softcap(const Tensor& value_tensor, double cap) {
 }
 
 Tensor scale(const Tensor& value_tensor, double factor) {
-#ifdef TYLOINFER_NATIVE_MLX_RUNTIME
+#if TYLOINFER_HAS_METAL
     if ((value_tensor.defined() && value_tensor.device().is_metal()))
         return metal::ops::scale(value_tensor, factor);
 #endif
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
     const auto& value = ::tyloi::ops::dense(value_tensor);
     input(value);
     require_cuda(value);
@@ -228,11 +228,11 @@ Tensor scale(const Tensor& value_tensor, double factor) {
 }
 
 Tensor divide(const Tensor& value_tensor, double divisor) {
-#ifdef TYLOINFER_NATIVE_MLX_RUNTIME
+#if TYLOINFER_HAS_METAL
     if ((value_tensor.defined() && value_tensor.device().is_metal()))
         return metal::ops::divide(value_tensor, divisor);
 #endif
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
     const auto& value = ::tyloi::ops::dense(value_tensor);
     input(value);
     return owner(cuda::ops::divide(value, divisor));
@@ -242,11 +242,11 @@ Tensor divide(const Tensor& value_tensor, double divisor) {
 }
 
 Tensor sum(const Tensor& value_tensor, std::int64_t dim, bool keepdim) {
-#ifdef TYLOINFER_NATIVE_MLX_RUNTIME
+#if TYLOINFER_HAS_METAL
     if ((value_tensor.defined() && value_tensor.device().is_metal()))
         return metal::ops::sum(value_tensor, dim, keepdim);
 #endif
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
     const auto& value = ::tyloi::ops::dense(value_tensor);
     input(value);
     require_cuda(value);
@@ -257,11 +257,11 @@ Tensor sum(const Tensor& value_tensor, std::int64_t dim, bool keepdim) {
 }
 
 Tensor add(const Tensor& value_tensor, std::int64_t offset) {
-#ifdef TYLOINFER_NATIVE_MLX_RUNTIME
+#if TYLOINFER_HAS_METAL
     if ((value_tensor.defined() && value_tensor.device().is_metal()))
         return metal::ops::add(value_tensor, offset);
 #endif
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
     const auto& value = ::tyloi::ops::dense(value_tensor);
     input(value);
     require_cuda(value);
@@ -272,11 +272,11 @@ Tensor add(const Tensor& value_tensor, std::int64_t offset) {
 }
 
 Tensor mean(const Tensor& value_tensor, std::int64_t dim, bool keepdim) {
-#ifdef TYLOINFER_NATIVE_MLX_RUNTIME
+#if TYLOINFER_HAS_METAL
     if ((value_tensor.defined() && value_tensor.device().is_metal()))
         return metal::ops::mean(value_tensor, dim, keepdim);
 #endif
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
     const auto& value = ::tyloi::ops::dense(value_tensor);
     input(value);
     require_cuda(value);
@@ -287,11 +287,11 @@ Tensor mean(const Tensor& value_tensor, std::int64_t dim, bool keepdim) {
 }
 
 Tensor amax(const Tensor& value_tensor, std::int64_t dim, bool keepdim) {
-#ifdef TYLOINFER_NATIVE_MLX_RUNTIME
+#if TYLOINFER_HAS_METAL
     if ((value_tensor.defined() && value_tensor.device().is_metal()))
         return metal::ops::amax(value_tensor, dim, keepdim);
 #endif
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
     const auto& value = ::tyloi::ops::dense(value_tensor);
     input(value);
     require_cuda(value);
@@ -302,11 +302,11 @@ Tensor amax(const Tensor& value_tensor, std::int64_t dim, bool keepdim) {
 }
 
 Tensor argmax(const Tensor& value_tensor, std::int64_t dim, bool keepdim) {
-#ifdef TYLOINFER_NATIVE_MLX_RUNTIME
+#if TYLOINFER_HAS_METAL
     if ((value_tensor.defined() && value_tensor.device().is_metal()))
         return metal::ops::argmax(value_tensor, dim, keepdim);
 #endif
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
     const auto& value = ::tyloi::ops::dense(value_tensor);
     input(value);
     require_cuda(value);
@@ -317,11 +317,11 @@ Tensor argmax(const Tensor& value_tensor, std::int64_t dim, bool keepdim) {
 }
 
 Tensor all(const Tensor& value_tensor, std::int64_t dim, bool keepdim) {
-#ifdef TYLOINFER_NATIVE_MLX_RUNTIME
+#if TYLOINFER_HAS_METAL
     if ((value_tensor.defined() && value_tensor.device().is_metal()))
         return metal::ops::all(value_tensor, dim, keepdim);
 #endif
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
     const auto& value = ::tyloi::ops::dense(value_tensor);
     input(value);
     require_cuda(value);
@@ -332,11 +332,11 @@ Tensor all(const Tensor& value_tensor, std::int64_t dim, bool keepdim) {
 }
 
 Tensor any(const Tensor& value_tensor, std::int64_t dim, bool keepdim) {
-#ifdef TYLOINFER_NATIVE_MLX_RUNTIME
+#if TYLOINFER_HAS_METAL
     if ((value_tensor.defined() && value_tensor.device().is_metal()))
         return metal::ops::any(value_tensor, dim, keepdim);
 #endif
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
     const auto& value = ::tyloi::ops::dense(value_tensor);
     input(value);
     require_cuda(value);
@@ -347,11 +347,11 @@ Tensor any(const Tensor& value_tensor, std::int64_t dim, bool keepdim) {
 }
 
 Tensor abs(const Tensor& value_tensor) {
-#ifdef TYLOINFER_NATIVE_MLX_RUNTIME
+#if TYLOINFER_HAS_METAL
     if ((value_tensor.defined() && value_tensor.device().is_metal()))
         return metal::ops::abs(value_tensor);
 #endif
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
     const auto& value = ::tyloi::ops::dense(value_tensor);
     input(value);
     require_cuda(value);
@@ -362,11 +362,11 @@ Tensor abs(const Tensor& value_tensor) {
 }
 
 Tensor square(const Tensor& value_tensor) {
-#ifdef TYLOINFER_NATIVE_MLX_RUNTIME
+#if TYLOINFER_HAS_METAL
     if ((value_tensor.defined() && value_tensor.device().is_metal()))
         return metal::ops::square(value_tensor);
 #endif
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
     const auto& value = ::tyloi::ops::dense(value_tensor);
     input(value);
     require_cuda(value);
@@ -377,11 +377,11 @@ Tensor square(const Tensor& value_tensor) {
 }
 
 Tensor exp(const Tensor& value_tensor) {
-#ifdef TYLOINFER_NATIVE_MLX_RUNTIME
+#if TYLOINFER_HAS_METAL
     if ((value_tensor.defined() && value_tensor.device().is_metal()))
         return metal::ops::exp(value_tensor);
 #endif
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
     const auto& value = ::tyloi::ops::dense(value_tensor);
     input(value);
     require_cuda(value);
@@ -392,11 +392,11 @@ Tensor exp(const Tensor& value_tensor) {
 }
 
 Tensor sqrt(const Tensor& value_tensor) {
-#ifdef TYLOINFER_NATIVE_MLX_RUNTIME
+#if TYLOINFER_HAS_METAL
     if ((value_tensor.defined() && value_tensor.device().is_metal()))
         return metal::ops::sqrt(value_tensor);
 #endif
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
     const auto& value = ::tyloi::ops::dense(value_tensor);
     input(value);
     require_cuda(value);
@@ -407,11 +407,11 @@ Tensor sqrt(const Tensor& value_tensor) {
 }
 
 Tensor logical_not(const Tensor& value_tensor) {
-#ifdef TYLOINFER_NATIVE_MLX_RUNTIME
+#if TYLOINFER_HAS_METAL
     if ((value_tensor.defined() && value_tensor.device().is_metal()))
         return metal::ops::logical_not(value_tensor);
 #endif
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
     const auto& value = ::tyloi::ops::dense(value_tensor);
     input(value);
     require_cuda(value);
@@ -422,11 +422,11 @@ Tensor logical_not(const Tensor& value_tensor) {
 }
 
 Tensor clamp(const Tensor& value_tensor, double minimum, double maximum) {
-#ifdef TYLOINFER_NATIVE_MLX_RUNTIME
+#if TYLOINFER_HAS_METAL
     if ((value_tensor.defined() && value_tensor.device().is_metal()))
         return metal::ops::clamp(value_tensor, minimum, maximum);
 #endif
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
     const auto& value = ::tyloi::ops::dense(value_tensor);
     input(value);
     require_cuda(value);

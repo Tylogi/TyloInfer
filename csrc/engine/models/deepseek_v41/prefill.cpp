@@ -133,11 +133,7 @@ bool deepseek_v41_prefill_encode_chunk(
         auto& block = *model.blocks.at(layer);
         if (!block.kv_source()) continue;
         auto source = deepseek_v41_hc_input_cuda(hidden, state.shared->previous_pre,
-#ifdef TYLOINFER_NATIVE_CUDA
                                                  block.attention_norm.dense(), config.rms_eps);
-#else
-                                                 block.attention_norm, config.rms_eps);
-#endif
         tyloi::ops::measure("deepseek_v41.ced.global_kv", [&] {
             block.publish_compressed_source(*state.shared, source, state.cache_pos);
             return source;

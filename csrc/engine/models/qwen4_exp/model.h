@@ -189,11 +189,7 @@ class Ple {
   public:
     struct State {
         NgramEmbedding::State embedding;
-#ifdef TYLOINFER_NATIVE_CUDA
         ::tyloi::Tensor conv;
-#else
-        DenseTensor conv;
-#endif
         DenseTensor saved_conv;
         NgramEmbedding::Context saved_context;
         std::vector<DenseTensor> saved_prefix_conv;
@@ -207,11 +203,7 @@ class Ple {
           streams_(streams), dilation_(dilation), eps_(eps) {}
     void reset(State& state,bool retain_storage=false) const {
         embedding_.reset(state.embedding);
-#ifdef TYLOINFER_NATIVE_CUDA
         if(retain_storage && state.conv.defined())state.conv.dense().zero_();else state.conv = {};
-#else
-        if(retain_storage && state.conv.defined())state.conv.zero_();else state.conv = DenseTensor();
-#endif
         commit(state);
     }
     void commit(State& state) const {
@@ -228,21 +220,12 @@ class Ple {
                 "Qwen4 PLE prefix checkpoint is out of range");
             state.saved_conv=state.saved_prefix_conv[index];state.saved_context=state.saved_prefix_context[index];
         }
-#ifdef TYLOINFER_NATIVE_CUDA
         if(state.conv.defined())state.conv.dense().copy_(state.saved_conv);else state.conv=state.saved_conv;
-#else
-        if(state.conv.defined())state.conv.copy_(state.saved_conv);else state.conv=state.saved_conv;
-#endif
         embedding_.restore(state.embedding,state.saved_context);
         commit(state);
     }
-#ifdef TYLOINFER_NATIVE_CUDA
     const ::tyloi::Tensor &conv_state(const State& state) const { return state.conv; }
     std::vector<::tyloi::Tensor*> graph_state(State& state) const { return {&state.conv}; }
-#else
-    const DenseTensor &conv_state(const State& state) const { return state.conv; }
-    std::vector<DenseTensor*> graph_state(State& state) const { return {&state.conv}; }
-#endif
     std::pair<std::size_t, std::size_t> ordinary_growth_bytes(const State& state, int64_t batch, int64_t tokens) const {
         if (state.conv.defined()) TYLOINFER_RUNTIME_CHECK(state.conv.size(0) == batch, "PLE batch changed");
         const auto kernel = w_.conv.size(-1);
@@ -283,18 +266,10 @@ class Ple {
     void restore_session(State& state,const DenseTensor& convolution,NgramEmbedding::Context context,bool retain_storage=false) const {
         TYLOINFER_RUNTIME_CHECK(convolution.defined(),"missing Qwen4 PLE session state");
         if(retain_storage) {
-#ifdef TYLOINFER_NATIVE_CUDA
             TYLOINFER_RUNTIME_CHECK(state.conv.defined() && state.conv.dense().sizes()==convolution.sizes(),
-#else
-            TYLOINFER_RUNTIME_CHECK(state.conv.defined() && state.conv.sizes()==convolution.sizes(),
-#endif
                 "Qwen4 PLE graph session geometry changed");
             commit(state);
-#ifdef TYLOINFER_NATIVE_CUDA
             state.conv.dense().copy_(convolution);
-#else
-            state.conv.copy_(convolution);
-#endif
         } else {reset(state);state.conv=convolution.clone();}
         embedding_.restore(state.embedding,std::move(context));
     }
@@ -321,11 +296,7 @@ class Ple {
         if(!confirmed)return forward_chunk(state,x,ids,true,{},rows);
         auto prefix=forward_chunk(state,x.narrow(1,0,confirmed),ids.narrow(1,0,confirmed),
             true,{},rows.narrow(1,0,confirmed));
-#ifdef TYLOINFER_NATIVE_CUDA
         checkpoint_conv.front().copy_(state.conv.dense());
-#else
-        checkpoint_conv.front().copy_(state.conv);
-#endif
         auto suffix=forward_chunk(state,x.narrow(1,confirmed,x.size(1)-confirmed),
             ids.narrow(1,confirmed,x.size(1)-confirmed),true,{},
             rows.narrow(1,confirmed,x.size(1)-confirmed),&checkpoint_conv,1);
@@ -344,11 +315,7 @@ class Ple {
             std::vector<DenseTensor> conv;
             std::vector<NgramEmbedding::Context> context;
             for(int64_t i=confirmed;i<x.size(1);++i) {
-#ifdef TYLOINFER_NATIVE_CUDA
                 conv.push_back(::tyloi::cuda::empty_like(state.conv.dense()));
-#else
-                conv.push_back(::tyloi::cuda::empty_like(state.conv));
-#endif
                 context.push_back(embedding_.prefix_context(state.embedding,host,i));
             }
             auto rows=embedding_.forward(state.embedding,ids,true,nullptr,host);
@@ -365,11 +332,7 @@ class Ple {
             },
             [&] {
                 state.saved = true;
-#ifdef TYLOINFER_NATIVE_CUDA
                 state.saved_conv = state.conv.dense().clone();
-#else
-                state.saved_conv = state.conv.clone();
-#endif
                 state.saved_context = embedding_.context(state.embedding);
             },
             [&] { rollback(state); },
@@ -387,16 +350,9 @@ class Ple {
                 prefix.reserve(checkpoints->size());
                 for (const auto& value : *checkpoints) prefix.emplace_back(value);
             }
-#ifdef TYLOINFER_NATIVE_CUDA
             auto& conv = state.conv;
-#else
-            ::tyloi::Tensor conv(state.conv);
-#endif
             auto result = ::tyloi::ops::ple(x, rows, w_, conv, cache, hidden_, streams_, dilation_, eps_,
                 checkpoints ? &prefix : nullptr, checkpoint_offset);
-#ifndef TYLOINFER_NATIVE_CUDA
-            if (conv.defined()) state.conv = conv.dense();
-#endif
             return result.dense();
         } catch (...) {
             embedding_.restore(state.embedding, std::move(context));

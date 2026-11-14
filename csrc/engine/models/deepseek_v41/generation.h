@@ -21,9 +21,7 @@ template<class Ops>
     auto input = deepseek_v41_prefill_input(model, ops.state, ids, ops.prefill_compute_chunk);
     const auto batch = input.size(0), tokens = input.size(1);
     if (old_batch != batch || old_position == 0) {
-#ifdef TYLOINFER_NATIVE_CUDA
         if (ops.budget) ops.budget->reserve(ops.state.allocation_growth());
-#endif
         ops.state.allocate();
     }
     const auto split = model.config.causal_encoder_layers;
@@ -37,9 +35,7 @@ template<class Ops>
     for (int64_t offset = 0; offset < tokens; offset += compute_chunk) {
         if (stopped()) { ops.state.reset(batch); return {}; }
         const auto count = std::min(compute_chunk, tokens - offset);
-#ifdef TYLOINFER_NATIVE_CUDA
         if (ops.budget) ops.budget->reserve(ops.state.ced_growth(ops.state.cache_pos, count, 0, split));
-#endif
         if (!deepseek_v41_prefill_encode_chunk(model, ops.state, encoded, offset, count,
                                                stopped, capture_raw_hidden)) return {};
     }
@@ -47,32 +43,19 @@ template<class Ops>
     priority.reset();
     if (stopped()) { ops.state.reset(batch); return {}; }
     const auto replay_tokens = encoded.tail_ids.size(1);
-#ifdef TYLOINFER_NATIVE_CUDA
     if (ops.budget) ops.budget->reserve(ops.state.ced_growth(
         encoded.end - replay_tokens, replay_tokens, split, model.num_hidden_layers()));
-#endif
     return deepseek_v41_prefill_decode(model, ops.state, std::move(encoded), stopped, raw_hidden);
 }
 
 template<class Ops, class Finish>
-#ifdef TYLOINFER_NATIVE_CUDA
 std::tuple<::tyloi::Tensor, bool, bool> generation_prefill(
         Model& model, Ops& ops, const tyloi::engine::PrefillChunk&,
         ::tyloi::Tensor& ids, const Finish&) {
     ::tyloi::Tensor hidden;
-#else
-std::tuple<::tyloi::DenseTensor, bool, bool> generation_prefill(
-        Model& model, Ops& ops, const tyloi::engine::PrefillChunk&,
-        ::tyloi::DenseTensor& ids, const Finish&) {
-    ::tyloi::DenseTensor hidden;
-#endif
     if(!ops.prepared || !ops.prepared->transformed()) {
         auto result = ced_prefill(model, ops, ids, false);
-#ifdef TYLOINFER_NATIVE_CUDA
         if(result) hidden=std::move(result);
-#else
-        if(result) hidden=result.dense();
-#endif
     }
     return {std::move(hidden),false,false};
 }

@@ -1,20 +1,42 @@
 #include "engine/ops.h"
 
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
 #include "engine/backends/cuda/executor/executor.h"
 #include "engine/backends/cuda/ops/tensor.h"
 #include "engine/backends/cuda/native/tensor/tensor.h"
+#include "engine/backends/cuda/native/device.h"
 #include <algorithm>
 #include <cstring>
 #else
 #include "engine/backends/cpu/ops/tensor.h"
 #endif
-#ifdef TYLOINFER_NATIVE_MLX_RUNTIME
+#if TYLOINFER_HAS_METAL
 #include "engine/backends/metal/ops/tensor.h"
 #endif
 
 namespace tyloi::ops {
-#ifndef TYLOINFER_NATIVE_CUDA
+struct DeviceScope::Impl {
+#if TYLOINFER_HAS_CUDA
+    std::optional<cuda::DeviceGuard> guard;
+#endif
+    explicit Impl(Device target) {
+        if (target.is_cpu() && target.index == 0) return;
+#if TYLOINFER_HAS_CUDA
+        if (target.is_cuda() && target.index >= 0) {
+            guard.emplace(target.index);
+            return;
+        }
+#endif
+#if TYLOINFER_HAS_METAL
+        if (target.is_metal() && target.index == 0) return;
+#endif
+        throw std::invalid_argument("unsupported execution device");
+    }
+};
+DeviceScope::DeviceScope(Device target) : impl_(std::make_unique<Impl>(target)) {}
+DeviceScope::~DeviceScope() = default;
+
+#if !TYLOINFER_HAS_CUDA
 namespace {
 const DenseTensor& cpu_view(const Tensor& tensor) {
     const auto* value = tensor.representation<DenseTensor>();
@@ -24,17 +46,6 @@ const DenseTensor& cpu_view(const Tensor& tensor) {
     return *value;
 }
 } // namespace
-struct DeviceScope::Impl {
-    explicit Impl(Device target) {
-        if (!(target.is_cpu() && target.index == 0)
-#ifdef TYLOINFER_NATIVE_MLX_RUNTIME
-            && !(target.is_metal() && target.index == 0)
-#endif
-        ) throw std::invalid_argument("unsupported execution device");
-    }
-};
-DeviceScope::DeviceScope(Device target) : impl_(std::make_unique<Impl>(target)) {}
-DeviceScope::~DeviceScope() = default;
 #else
 namespace {
 const DenseTensor& dense(const Tensor& value) {
@@ -77,11 +88,11 @@ void require_cuda(const Tensor& value_tensor) {
 #endif
 
 Tensor copy(const Tensor& value_tensor, Device target) {
-#ifdef TYLOINFER_NATIVE_MLX_RUNTIME
+#if TYLOINFER_HAS_METAL
     if (target.is_metal() || (value_tensor.defined() && value_tensor.device().is_metal()))
         return metal::ops::copy(value_tensor, target);
 #endif
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
     const auto& value = ::tyloi::ops::dense(value_tensor);
     input(value);
     device(target);
@@ -96,7 +107,7 @@ Tensor copy(const Tensor& value_tensor, Device target) {
 }
 
 void copy_into(Tensor destination_tensor, const Tensor& source_tensor) {
-#ifdef TYLOINFER_NATIVE_MLX_RUNTIME
+#if TYLOINFER_HAS_METAL
     if ((destination_tensor.defined() && destination_tensor.device().is_metal()) ||
         (source_tensor.defined() && source_tensor.device().is_metal())) {
         if (!destination_tensor.defined() || !source_tensor.defined() || destination_tensor.device() != source_tensor.device())
@@ -105,7 +116,7 @@ void copy_into(Tensor destination_tensor, const Tensor& source_tensor) {
         return;
     }
 #endif
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
     auto& destination = ::tyloi::ops::dense(destination_tensor);
     const auto& source = ::tyloi::ops::dense(source_tensor);
     input(destination);
@@ -117,10 +128,10 @@ void copy_into(Tensor destination_tensor, const Tensor& source_tensor) {
 }
 
 Tensor clone(const Tensor& value_tensor) {
-#ifdef TYLOINFER_NATIVE_MLX_RUNTIME
+#if TYLOINFER_HAS_METAL
     if (value_tensor.defined() && value_tensor.device().is_metal()) return metal::ops::clone(value_tensor);
 #endif
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
     const auto& value = ::tyloi::ops::dense(value_tensor);
     input(value);
     return owner(cuda::ops::clone(value));
@@ -130,10 +141,10 @@ Tensor clone(const Tensor& value_tensor) {
 }
 
 Tensor zeros(std::span<const std::int64_t> shape, const TensorOptions& options) {
-#ifdef TYLOINFER_NATIVE_MLX_RUNTIME
+#if TYLOINFER_HAS_METAL
     if (options.target_device().is_metal()) return metal::ops::zeros(shape, options);
 #endif
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
     DeviceScope scope(options.target_device());
     return owner(cuda::ops::zeros(shape, options));
 #else
@@ -142,10 +153,10 @@ Tensor zeros(std::span<const std::int64_t> shape, const TensorOptions& options) 
 }
 
 Tensor empty(std::span<const std::int64_t> shape, const TensorOptions& options) {
-#ifdef TYLOINFER_NATIVE_MLX_RUNTIME
+#if TYLOINFER_HAS_METAL
     if (options.target_device().is_metal()) return metal::ops::empty(shape, options);
 #endif
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
     DeviceScope scope(options.target_device());
     return owner(cuda::empty(shape, options));
 #else
@@ -154,10 +165,10 @@ Tensor empty(std::span<const std::int64_t> shape, const TensorOptions& options) 
 }
 
 void fill(Tensor& value_tensor, double fill_value) {
-#ifdef TYLOINFER_NATIVE_MLX_RUNTIME
+#if TYLOINFER_HAS_METAL
     if (value_tensor.defined() && value_tensor.device().is_metal()) { metal::ops::fill(value_tensor, fill_value); return; }
 #endif
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
     auto& value = ::tyloi::ops::dense(value_tensor);
     if (!value.defined()) throw std::invalid_argument("undefined tensor");
     DeviceScope scope(value.device());
@@ -214,10 +225,10 @@ void fill(Tensor& value_tensor, double fill_value) {
 
 
 Tensor cast(const Tensor& value_tensor, ScalarType type) {
-#ifdef TYLOINFER_NATIVE_MLX_RUNTIME
+#if TYLOINFER_HAS_METAL
     if (value_tensor.defined() && value_tensor.device().is_metal()) return metal::ops::cast(value_tensor, type);
 #endif
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
     const auto& value = ::tyloi::ops::dense(value_tensor);
     input(value);
     return owner(cuda::ops::cast(value, type));
@@ -233,10 +244,10 @@ Tensor cast(const Tensor& value_tensor, ScalarType type) {
 }
 
 Tensor slice(const Tensor& value_tensor, std::int64_t dim, std::int64_t start, std::int64_t end, std::int64_t step) {
-#ifdef TYLOINFER_NATIVE_MLX_RUNTIME
+#if TYLOINFER_HAS_METAL
     if (value_tensor.defined() && value_tensor.device().is_metal()) return metal::ops::slice(value_tensor, dim, start, end, step);
 #endif
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
     const auto& value = ::tyloi::ops::dense(value_tensor);
     input(value);
     return owner(tyloi::slice(value, dim, start, end, step));
@@ -265,7 +276,7 @@ Tensor update_slice(const Tensor& destination, const Tensor& source, std::int64_
     const auto extent = source.size(dim), size = destination.size(dim);
     if (start < 0 || start > size || extent < 0 || extent > size - start)
         throw std::invalid_argument("slice update exceeds destination");
-#ifdef TYLOINFER_NATIVE_MLX_RUNTIME
+#if TYLOINFER_HAS_METAL
     if (destination.device().is_metal()) return metal::ops::update_slice(destination, source, dim, start);
 #endif
     auto target = slice(destination, dim, start, start + extent, 1);
@@ -274,11 +285,11 @@ Tensor update_slice(const Tensor& destination, const Tensor& source, std::int64_
 }
 
 Tensor cat(std::span<const Tensor> values, std::int64_t dim) {
-#ifdef TYLOINFER_NATIVE_MLX_RUNTIME
+#if TYLOINFER_HAS_METAL
     for (const auto& value : values)
         if (value.defined() && value.device().is_metal()) return metal::ops::cat(values, dim);
 #endif
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
     if (values.empty()) throw std::invalid_argument("cat requires at least one tensor");
     std::vector<DenseTensor> dense_values;
     dense_values.reserve(values.size());
@@ -295,12 +306,12 @@ Tensor cat(std::span<const Tensor> values, std::int64_t dim) {
 }
 
 Tensor index_select(const Tensor& value_tensor, std::int64_t dim, const Tensor& indices_tensor) {
-#ifdef TYLOINFER_NATIVE_MLX_RUNTIME
+#if TYLOINFER_HAS_METAL
     if ((value_tensor.defined() && value_tensor.device().is_metal()) ||
         (indices_tensor.defined() && indices_tensor.device().is_metal()))
         return metal::ops::index_select(value_tensor, dim, indices_tensor);
 #endif
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
     const auto& value = ::tyloi::ops::dense(value_tensor);
     const auto& indices = ::tyloi::ops::dense(indices_tensor);
     compatible(value, indices);
@@ -312,13 +323,13 @@ Tensor index_select(const Tensor& value_tensor, std::int64_t dim, const Tensor& 
 }
 
 void index_copy(Tensor& value_tensor, std::int64_t dim, const Tensor& indices_tensor, const Tensor& source_tensor) {
-#ifdef TYLOINFER_NATIVE_MLX_RUNTIME
+#if TYLOINFER_HAS_METAL
     if (value_tensor.defined() && value_tensor.device().is_metal()) {
         metal::ops::index_copy(value_tensor, dim, indices_tensor, source_tensor);
         return;
     }
 #endif
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
     auto& value = ::tyloi::ops::dense(value_tensor);
     const auto& indices = ::tyloi::ops::dense(indices_tensor);
     const auto& source = ::tyloi::ops::dense(source_tensor);
@@ -332,11 +343,11 @@ void index_copy(Tensor& value_tensor, std::int64_t dim, const Tensor& indices_te
 }
 
 Tensor transpose(const Tensor& value_tensor, std::int64_t first, std::int64_t second) {
-#ifdef TYLOINFER_NATIVE_MLX_RUNTIME
+#if TYLOINFER_HAS_METAL
     if (value_tensor.defined() && value_tensor.device().is_metal())
         return metal::ops::transpose(value_tensor, first, second);
 #endif
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
     const auto& value = ::tyloi::ops::dense(value_tensor);
     input(value);
     return owner(tyloi::transpose(value, first, second));
@@ -346,11 +357,11 @@ Tensor transpose(const Tensor& value_tensor, std::int64_t first, std::int64_t se
 }
 
 Tensor contiguous(const Tensor& value_tensor) {
-#ifdef TYLOINFER_NATIVE_MLX_RUNTIME
+#if TYLOINFER_HAS_METAL
     if (value_tensor.defined() && value_tensor.device().is_metal())
         return metal::ops::contiguous(value_tensor);
 #endif
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
     const auto& value = ::tyloi::ops::dense(value_tensor);
     input(value);
     return owner(cuda::ops::contiguous(value));
@@ -361,11 +372,11 @@ Tensor contiguous(const Tensor& value_tensor) {
 }
 
 Tensor reshape(const Tensor& value_tensor, std::span<const std::int64_t> shape) {
-#ifdef TYLOINFER_NATIVE_MLX_RUNTIME
+#if TYLOINFER_HAS_METAL
     if (value_tensor.defined() && value_tensor.device().is_metal())
         return metal::ops::reshape(value_tensor, shape);
 #endif
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
     const auto& value = ::tyloi::ops::dense(value_tensor);
     input(value);
     return owner(tyloi::reshape(value, shape));
@@ -375,11 +386,11 @@ Tensor reshape(const Tensor& value_tensor, std::span<const std::int64_t> shape) 
 }
 
 Tensor expand(const Tensor& value_tensor, std::span<const std::int64_t> shape) {
-#ifdef TYLOINFER_NATIVE_MLX_RUNTIME
+#if TYLOINFER_HAS_METAL
     if (value_tensor.defined() && value_tensor.device().is_metal())
         return metal::ops::expand(value_tensor, shape);
 #endif
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
     const auto& value = ::tyloi::ops::dense(value_tensor);
     input(value);
     return owner(tyloi::expand(value, shape));
@@ -389,11 +400,11 @@ Tensor expand(const Tensor& value_tensor, std::span<const std::int64_t> shape) {
 }
 
 Tensor select(const Tensor& value_tensor, std::int64_t dim, std::int64_t index) {
-#ifdef TYLOINFER_NATIVE_MLX_RUNTIME
+#if TYLOINFER_HAS_METAL
     if (value_tensor.defined() && value_tensor.device().is_metal())
         return metal::ops::select(value_tensor, dim, index);
 #endif
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
     const auto& value = ::tyloi::ops::dense(value_tensor);
     input(value);
     return owner(tyloi::select(value, dim, index));
@@ -403,11 +414,11 @@ Tensor select(const Tensor& value_tensor, std::int64_t dim, std::int64_t index) 
 }
 
 Tensor unsqueeze(const Tensor& value_tensor, std::int64_t dim) {
-#ifdef TYLOINFER_NATIVE_MLX_RUNTIME
+#if TYLOINFER_HAS_METAL
     if (value_tensor.defined() && value_tensor.device().is_metal())
         return metal::ops::unsqueeze(value_tensor, dim);
 #endif
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
     const auto& value = ::tyloi::ops::dense(value_tensor);
     input(value);
     return owner(tyloi::unsqueeze(value, dim));

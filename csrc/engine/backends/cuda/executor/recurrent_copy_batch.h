@@ -1,6 +1,5 @@
 #pragma once
 #include "engine/backends/cuda/native/tensor/backend.h"
-#ifdef TYLOINFER_NATIVE_CUDA_RUNTIME
 #include "recurrent_copy_kernel.h"
 
 namespace tyloi::cuda {
@@ -78,9 +77,3 @@ inline void copy_recurrent_state(Tensor& destination,const Tensor& source) {
     RecurrentCopyBatch::copy(destination,source);
 }
 }
-#else
-namespace tyloi::cuda {
-inline void copy_recurrent_state(::tyloi::DenseTensor& destination,
-        const ::tyloi::DenseTensor& source) {destination.copy_(source);}
-}
-#endif

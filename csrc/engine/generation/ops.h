@@ -4,10 +4,8 @@
 #include "engine/requests/policy.h"
 #include "engine/requests/request.h"
 #include "engine/weights/workspace.h"
-#ifdef TYLOINFER_NATIVE_CUDA
 #include "engine/backends/cuda/executor/executor.h"
 #include "engine/models/input.h"
-#endif
 
 #include <cstddef>
 #include <cstdint>
@@ -18,11 +16,9 @@ struct DecodeGraphCache;
 
 namespace tyloi::cuda {
 
-#ifdef TYLOINFER_NATIVE_CUDA
 inline tyloi::models::ForwardOptions forward_options(const Executor::Mode& mode) {
     return {mode.kv_capacity, mode.trace, mode.trace_layer, mode.primary, mode.ffn.batch_serial};
 }
-#endif
 
 template<class Model, class Ops, class Tensor, class Finish>
 std::tuple<Tensor, bool, bool> generation_prefill(

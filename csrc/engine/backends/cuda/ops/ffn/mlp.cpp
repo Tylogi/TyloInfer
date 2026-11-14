@@ -187,6 +187,7 @@ bool Mlp::parallel() const {
                                 [&]() { return project.run(down, hidden); });
     }
     const double limit = geglu ? 0.0 : swiglu_limit;
+#if TYLOINFER_ENABLE_MFQ_COMPAT
     const auto* gate0 = gate_up.layers[0].representation<tyloi::NvqTensor>();
     const auto* gate1 = gate_up.layers.size() == 2
         ? gate_up.layers[1].representation<tyloi::NvqTensor>() : nullptr;
@@ -203,6 +204,7 @@ bool Mlp::parallel() const {
                                    *down_nvq, xh.reshape({-1, xh.size(-1)}))
             .reshape(shape);
     }
+#endif
     std::optional<DenseTensor> fused_hidden;
     if (limit <= 0.0 && !geglu && gate_up.tq.defined() &&
         gate_up.outs.size() == 2 && gate_up.outs[0] == gate_up.outs[1])

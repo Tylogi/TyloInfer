@@ -49,7 +49,6 @@ Layer load_layer(const tyloi::weights::Loader& weights, const Config &c, int i,
     layer.eps = c.rms_norm_eps;
     layer.hc_eps = c.hc_eps;
 
-#ifdef TYLOINFER_NATIVE_CUDA
     layer.attn_norm = weights.tensor(p + "attention.norm.weight");
     layer.ffn_norm = weights.tensor(p + "mlp.norm.weight");
     layer.q_a_norm = weights.tensor(p + "attention.query_a_norm.weight");
@@ -61,49 +60,15 @@ Layer load_layer(const tyloi::weights::Loader& weights, const Config &c, int i,
     layer.hc_ffn_fn = std::make_shared<DenseTensor>(weights.tensor(p + "mlp.mhc.pre.function").dense().to(::tyloi::kFloat32).contiguous());
     layer.hc_ffn_scale = std::make_shared<DenseTensor>(weights.tensor(p + "mlp.mhc.pre.scale").dense().to(::tyloi::kFloat32).contiguous());
     layer.hc_ffn_base = std::make_shared<DenseTensor>(weights.tensor(p + "mlp.mhc.pre.base").dense().to(::tyloi::kFloat32).contiguous());
-#else
-    layer.attn_norm = weights.tensor(p + "attention.norm.weight").dense();
-    layer.ffn_norm = weights.tensor(p + "mlp.norm.weight").dense();
-    layer.q_a_norm = weights.tensor(p + "attention.query_a_norm.weight").dense();
-    layer.kv_norm = weights.tensor(p + "attention.key_value_a_norm.weight").dense();
-    layer.sinks = weights.tensor(p + "attention.sink").dense()
-                   .to(::tyloi::kFloat32)
-                   .contiguous();
-    layer.hc_attn_fn = weights.tensor(p + "attention.mhc.pre.function").dense()
-                        .to(::tyloi::kFloat32)
-                        .contiguous();
-    layer.hc_attn_scale = weights.tensor(p + "attention.mhc.pre.scale").dense()
-                           .to(::tyloi::kFloat32)
-                           .contiguous();
-    layer.hc_attn_base = weights.tensor(p + "attention.mhc.pre.base").dense()
-                          .to(::tyloi::kFloat32)
-                          .contiguous();
-    layer.hc_ffn_fn = weights.tensor(p + "mlp.mhc.pre.function").dense()
-                       .to(::tyloi::kFloat32)
-                       .contiguous();
-    layer.hc_ffn_scale = weights.tensor(p + "mlp.mhc.pre.scale").dense()
-                          .to(::tyloi::kFloat32)
-                          .contiguous();
-    layer.hc_ffn_base = weights.tensor(p + "mlp.mhc.pre.base").dense()
-                         .to(::tyloi::kFloat32)
-                         .contiguous();
-#endif
     layer.q_a = weights.weight(p + "attention.query_a.weight");
     layer.q_b = weights.weight(p + "attention.query_b.weight");
     layer.kv = weights.weight(p + "attention.key_value_a.weight");
     layer.output_a = weights.weight(p + "attention.output_a.weight");
     layer.output_b = weights.weight(p + "attention.output_b.weight");
-#ifdef TYLOINFER_NATIVE_CUDA
     layer.attention_rope = tyloi::ops::tail_rope_table(
         c.max_position_embeddings, c.rope_base, layer.compress_ratio,
         tyloi::Device(tyloi::kCUDA, weights.placement.device), config.compress_rope_base,
         config.rope_original_positions, config.rope_factor, config.rope_beta_fast, config.rope_beta_slow);
-#else
-    layer.attention_rope =
-        TailRope(c.max_position_embeddings, c.rope_base, layer.compress_ratio,
-                      config.compress_rope_base, config.rope_original_positions, config.rope_factor,
-                      config.rope_beta_fast, config.rope_beta_slow);
-#endif
 
     if (layer.compress_ratio > 0) {
         layer.compressor.ratio = layer.compress_ratio;
@@ -114,17 +79,8 @@ Layer load_layer(const tyloi::weights::Loader& weights, const Config &c, int i,
             collectives, primary,
             weights.group({p + "attention.compressor.key_value.weight",
                                          p + "attention.compressor.gate.weight"}));
-#ifdef TYLOINFER_NATIVE_CUDA
         layer.compressor.ape = std::make_shared<DenseTensor>(weights.tensor(p + "attention.compressor.position").dense().to(::tyloi::kFloat32).contiguous());
         layer.compressor.norm = std::make_shared<DenseTensor>(weights.tensor(p + "attention.compressor.norm.weight").dense().to(::tyloi::kFloat32).contiguous());
-#else
-        layer.compressor.ape = weights.tensor(p + "attention.compressor.position").dense()
-                                .to(::tyloi::kFloat32)
-                                .contiguous();
-        layer.compressor.norm = weights.tensor(p + "attention.compressor.norm.weight").dense()
-                                 .to(::tyloi::kFloat32)
-                                 .contiguous();
-#endif
     }
     if (layer.compress_ratio == 4) {
         layer.indexer_compressor.ratio = 4;
@@ -135,27 +91,10 @@ Layer load_layer(const tyloi::weights::Loader& weights, const Config &c, int i,
             collectives, primary,
             weights.group({p + "attention.indexer.compressor.key_value.weight",
                                          p + "attention.indexer.compressor.gate.weight"}));
-#ifdef TYLOINFER_NATIVE_CUDA
         layer.indexer_compressor.ape = std::make_shared<DenseTensor>(weights.tensor(p + "attention.indexer.compressor.position").dense().to(::tyloi::kFloat32).contiguous());
         layer.indexer_compressor.norm = std::make_shared<DenseTensor>(weights.tensor(p + "attention.indexer.compressor.norm.weight").dense().to(::tyloi::kFloat32).contiguous());
-#else
-        layer.indexer_compressor.ape =
-            weights.tensor(p + "attention.indexer.compressor.position").dense()
-                .to(::tyloi::kFloat32)
-                .contiguous();
-        layer.indexer_compressor.norm =
-            weights.tensor(p + "attention.indexer.compressor.norm.weight").dense()
-                .to(::tyloi::kFloat32)
-                .contiguous();
-#endif
         layer.indexer_q = weights.weight(p + "attention.indexer.query.weight");
-#ifdef TYLOINFER_NATIVE_CUDA
         layer.indexer_weight = std::make_shared<DenseTensor>(weights.tensor(p + "attention.indexer.score.weight").dense().to(::tyloi::kFloat32).contiguous());
-#else
-        layer.indexer_weight = weights.tensor(p + "attention.indexer.score.weight").dense()
-                                .to(::tyloi::kFloat32)
-                                .contiguous();
-#endif
     }
 
     const bool cpu_offload = offload.count(i) != 0;
@@ -188,15 +127,9 @@ Layer load_layer(const tyloi::weights::Loader& weights, const Config &c, int i,
     layer.ffn.shared->swiglu_limit = c.swiglu_limit;
 
     const bool base_shapes =
-#ifdef TYLOINFER_NATIVE_CUDA
         layer.attn_norm.numel() == c.hidden_size && layer.ffn_norm.numel() == c.hidden_size &&
         layer.q_a_norm.numel() == c.q_lora_rank && layer.kv_norm.numel() == c.head_dim &&
         layer.sinks.numel() == c.num_attention_heads && layer.q_a.size(1) == c.hidden_size &&
-#else
-        layer.attn_norm.numel() == c.hidden_size && layer.ffn_norm.numel() == c.hidden_size &&
-        layer.q_a_norm.numel() == c.q_lora_rank && layer.kv_norm.numel() == c.head_dim &&
-        layer.sinks.numel() == c.num_attention_heads && layer.q_a->size(1) == c.hidden_size &&
-#endif
         layer.q_a.size(0) == c.q_lora_rank && layer.q_b.size(1) == c.q_lora_rank &&
         layer.q_b.size(0) == c.num_attention_heads * c.head_dim && layer.kv.size(1) == c.hidden_size &&
         layer.kv.size(0) == c.head_dim &&
@@ -249,21 +182,9 @@ void validate_offload(const Config &config, const std::unordered_set<int>& offlo
 
 OutputHeadWeights load_output_head(const tyloi::weights::Loader& weights) {
     return {
-#ifdef TYLOINFER_NATIVE_CUDA
         std::make_shared<DenseTensor>(weights.tensor("model.mhc.output.function").dense().to(::tyloi::kFloat32).contiguous()),
         std::make_shared<DenseTensor>(weights.tensor("model.mhc.output.scale").dense().to(::tyloi::kFloat32).contiguous()),
         std::make_shared<DenseTensor>(weights.tensor("model.mhc.output.base").dense().to(::tyloi::kFloat32).contiguous()),
-#else
-        weights.tensor("model.mhc.output.function").dense()
-            .to(::tyloi::kFloat32)
-            .contiguous(),
-        weights.tensor("model.mhc.output.scale").dense()
-            .to(::tyloi::kFloat32)
-            .contiguous(),
-        weights.tensor("model.mhc.output.base").dense()
-            .to(::tyloi::kFloat32)
-            .contiguous(),
-#endif
     };
 }
 
@@ -275,15 +196,9 @@ OutputHeadWeights load_output_head(const tyloi::weights::Loader& weights) {
         auto flat = hidden.flatten(2).to(::tyloi::kFloat32);
         auto inverse_rms =
             ::tyloi::cuda::rsqrt(flat.square().mean(-1, true) + config.rms_norm_eps);
-#ifdef TYLOINFER_NATIVE_CUDA
         const auto& function = output_head.function.dense();
         const auto& scale = output_head.scale.dense();
         const auto& base = output_head.base.dense();
-#else
-        const auto& function = output_head.function;
-        const auto& scale = output_head.scale;
-        const auto& base = output_head.base;
-#endif
         auto mixes =
             ::tyloi::cuda::matmul(flat, function.transpose(0, 1)) * inverse_rms;
         auto pre = ::tyloi::cuda::sigmoid(mixes * scale + base) +
@@ -350,11 +265,7 @@ void load(Model& model, const tyloi::weights::Loader& weights, LayerPlacementCon
     MfqCudaGuard guard(placement.primary_device());
     const bool separate = !c.tie_word_embeddings && weights.has("model.output.weight");
     model.embed = weights.embedding("model.token_embedding.weight", separate);
-#ifdef TYLOINFER_NATIVE_CUDA
     model.output_norm = weights.tensor("model.output_norm.weight");
-#else
-    model.output_norm = weights.tensor("model.output_norm.weight").dense();
-#endif
     model.output_head = load_output_head(weights);
     model.lm_head = separate ? weights.weight("model.output.weight", TensorParallelAxis::Output)
         : weights.placement.tensor.enabled()
@@ -381,7 +292,6 @@ DenseTensor normalize_ids(Collectives& collectives, int primary, DenseTensor ids
 }
 } // namespace
 
-#ifdef TYLOINFER_NATIVE_CUDA
 ::tyloi::Tensor embed(const Model& model, Executor& executor, Collectives& collectives, int primary,
              ::tyloi::Tensor input_ids, const Executor::Mode& mode) {
     auto ids = normalize_ids(collectives, primary, std::move(input_ids).dense());
@@ -389,49 +299,25 @@ DenseTensor normalize_ids(Collectives& collectives, int primary, DenseTensor ids
     return ::tyloi::ops::measure("model.embed", ids.device(), [&] {
         return ::tyloi::ops::embedding(ids, model.embed);
     });
-#else
-DenseTensor embed(const Model& model, Executor& executor, Collectives& collectives, int primary,
-             DenseTensor ids, const Executor::Mode& mode) {
-    auto normalized = normalize_ids(collectives, primary, std::move(ids));
-    return executor.profiler().measure("model.embed", [&] {
-        return quant_embedding_lookup(model.embed, std::move(normalized));
-    });
-#endif
 }
 
-#ifdef TYLOINFER_NATIVE_CUDA
 ::tyloi::Tensor normalize(const Model& model, Executor& executor, ::tyloi::Tensor input_hidden, int64_t batch, int64_t tokens) {
     auto hidden = input_hidden.dense();
-#else
-DenseTensor normalize(const Model& model, Executor& executor, DenseTensor hidden, int64_t batch, int64_t tokens) {
-#endif
     return executor.profiler().measure("model.output_norm", [&]() {
         return qwen_rms_norm(hidden.reshape({batch * tokens, model.metadata.hidden_size})
                                  .to(::tyloi::kFloat32),
-#ifdef TYLOINFER_NATIVE_CUDA
                              model.output_norm, model.metadata.rms_norm_eps,
-#else
-                             model.output_norm, model.metadata.rms_norm_eps,
-#endif
                              model.metadata.norm_weight_offset)
             .reshape({batch, tokens, model.metadata.hidden_size});
     });
 }
 
-#ifdef TYLOINFER_NATIVE_CUDA
 ::tyloi::Tensor softcap(const Model& model, Executor&, ::tyloi::Tensor value) {
     const double cap = model.metadata.final_logit_softcapping;
     if (cap > 0.0) return ::tyloi::cuda::tanh(value.dense() / cap) * cap;
     return value;
 }
-#else
-DenseTensor softcap(const Model& model, Executor&, DenseTensor value) {
-    const double cap = model.metadata.final_logit_softcapping;
-    return cap > 0.0 ? ::tyloi::cuda::tanh(value / cap) * cap : value;
-}
-#endif
 
-#ifdef TYLOINFER_NATIVE_CUDA
 ::tyloi::Tensor logits(const Model& model, Executor& executor, ::tyloi::Tensor input_hidden, bool capped,
               const Executor::Mode& mode) {
     auto scope = executor.enter(mfq_current_cuda_device(), mode.ffn);
@@ -439,32 +325,14 @@ DenseTensor softcap(const Model& model, Executor&, DenseTensor value) {
         return ::tyloi::ops::project(input_hidden, model.lm_head);
     });
     return capped ? softcap(model, executor, std::move(value)) : value;
-#else
-DenseTensor logits(const Model& model, Executor& executor, DenseTensor hidden, bool capped,
-              const Executor::Mode& mode) {
-    auto value = executor.profiler().measure("model.lm_head", [&] {
-        return executor.projector(mode.ffn).run(model.lm_head, std::move(hidden));
-    });
-    if (capped) return softcap(model, executor, std::move(value));
-    return value;
-#endif
 }
 
-#ifdef TYLOINFER_NATIVE_CUDA
 ::tyloi::Tensor forward(const Model& model, State& state, Executor& executor, Collectives& collectives,
                const Executor::Mode& mode, tyloi::models::Input input) {
-#else
-DenseTensor forward(const Model& model, State& state, Executor& executor, Collectives& collectives,
-               const Executor::Mode& mode, tyloi::models::Input input) {
-#endif
     MfqCudaGuard guard(mode.primary);
     auto ids = normalize_ids(collectives, mode.primary, std::move(input.ids).dense());
     auto embeddings = input.embeddings.defined() ? std::move(input.embeddings).dense()
-#ifdef TYLOINFER_NATIVE_CUDA
         : embed(model, executor, collectives, mode.primary, ids, mode).dense();
-#else
-        : embed(model, executor, collectives, mode.primary, ids, mode);
-#endif
     const auto B = ids.size(0), T = ids.size(1);
     tyloi::models::require_model(embeddings.dim() == 3 && embeddings.size(0) == B &&
                                    embeddings.size(1) == T && embeddings.size(2) == model.metadata.hidden_size,
@@ -734,31 +602,18 @@ std::vector<::tyloi::DenseTensor> Compressor::project(::tyloi::DenseTensor x, in
 }
 
 void Compressor::update(PoolState& state, ::tyloi::DenseTensor kv, ::tyloi::DenseTensor gate,
-#ifdef TYLOINFER_NATIVE_CUDA
             ::tyloi::DenseTensor length, const tyloi::ops::TailRopeTable &rope) const {
-#else
-            ::tyloi::DenseTensor length, const tyloi::cuda::TailRope &rope) const {
-#endif
-#ifdef TYLOINFER_NATIVE_CUDA
     const auto& ape = this->ape.dense();
     const auto& norm = this->norm.dense();
     const auto& cos = rope.cos.dense();
     const auto& sin = rope.sin.dense();
-#else
-    const auto& cos = rope.cos();
-    const auto& sin = rope.sin();
-#endif
     dsv4_decode_pool_update_cuda(kv, gate, ape, norm, state.state_kv, state.state_gate, state.previous_kv,
                                  state.previous_gate, state.pool, length, cos, sin, ratio,
                                  overlap, cache_quant_mode, 1e-6);
 }
 
 int64_t Compressor::prefill(PoolState& state, const ::tyloi::DenseTensor &kv, const ::tyloi::DenseTensor &gate,
-#ifdef TYLOINFER_NATIVE_CUDA
                 const tyloi::ops::TailRopeTable &rope) const {
-#else
-                const tyloi::cuda::TailRope &rope) const {
-#endif
     if (ratio <= 0)
         return 0;
     if (kv.dim() != 3 || gate.sizes() != kv.sizes()) {
@@ -786,15 +641,10 @@ int64_t Compressor::prefill(PoolState& state, const ::tyloi::DenseTensor &kv, co
                 .expand({batch, windows})
                 .contiguous();
         auto empty = ::tyloi::cuda::empty({0}, kv.options());
-#ifdef TYLOINFER_NATIVE_CUDA
         const auto& ape = this->ape.dense();
         const auto& norm = this->norm.dense();
         const auto& cos = rope.cos.dense();
         const auto& sin = rope.sin.dense();
-#else
-        const auto& cos = rope.cos();
-        const auto& sin = rope.sin();
-#endif
         auto compressed =
             dsv4_compress_cuda(grouped_kv, grouped_gate, ape, norm, empty, empty, positions,
                                cos, sin, ratio, overlap, cache_quant_mode, 1e-6);
@@ -847,13 +697,8 @@ void State::reset(int64_t next_batch) {
     }
 }
 
-#ifdef TYLOINFER_NATIVE_CUDA
 std::vector<::tyloi::Tensor> State::storage() const {
     std::vector<::tyloi::Tensor> result;
-#else
-std::vector<DenseTensor> State::storage() const {
-    std::vector<DenseTensor> result;
-#endif
     const auto append = [&](const DenseTensor& tensor) { if (tensor.defined()) result.push_back(tensor); };
     const auto pool = [&](const PoolState& state) {
         append(state.state_kv); append(state.state_gate); append(state.previous_kv);
@@ -921,15 +766,9 @@ void State::restore_text_session_state(const TextSessionState& state) {
 }
 
 static std::vector<::tyloi::DenseTensor> hc_pre(const Layer& w, ::tyloi::DenseTensor x,
-#ifdef TYLOINFER_NATIVE_CUDA
                                                const ::tyloi::Tensor& function_value,
                                                const ::tyloi::Tensor& scale_value,
                                                const ::tyloi::Tensor& base_value,
-#else
-                                               ::tyloi::DenseTensor function,
-                                               ::tyloi::DenseTensor scale,
-                                               ::tyloi::DenseTensor base,
-#endif
                                                const char *stage) {
     const auto& eps = w.eps;
     const auto& hc_iterations = w.hc_iterations;
@@ -939,11 +778,9 @@ static std::vector<::tyloi::DenseTensor> hc_pre(const Layer& w, ::tyloi::DenseTe
 
     auto flat = x.flatten(2).to(::tyloi::kFloat32);
     auto inverse_rms = ::tyloi::cuda::rsqrt(flat.square().mean(-1, true) + eps);
-#ifdef TYLOINFER_NATIVE_CUDA
     const auto& function = function_value.dense();
     const auto& scale = scale_value.dense();
     const auto& base = base_value.dense();
-#endif
     auto mixes = ::tyloi::cuda::matmul(flat, function.transpose(0, 1)) * inverse_rms;
     std::vector<::tyloi::DenseTensor> candidate;
     if (g_dsv4_fused_hc || g_dsv4_compare_hc_ops) {
@@ -1014,22 +851,12 @@ attention_forward(const Layer& w, LayerState& state, Executor& executor,
     const auto& head_dim = w.head_dim;
     const auto& eps = w.eps;
     const auto& q_a = w.q_a;
-#ifndef TYLOINFER_NATIVE_CUDA
-    const auto& q_a_norm = w.q_a_norm;
-#endif
     const auto& q_b = w.q_b;
     const auto& attention_rope = w.attention_rope;
     const auto& kv = w.kv;
-#ifndef TYLOINFER_NATIVE_CUDA
-    const auto& kv_norm = w.kv_norm;
-#endif
     const auto& compressor = w.compressor;
     const auto& indexer_compressor = w.indexer_compressor;
     const auto& indexer_q = w.indexer_q;
-#ifndef TYLOINFER_NATIVE_CUDA
-    const auto& indexer_weight = w.indexer_weight;
-    const auto& sinks = w.sinks;
-#endif
     const auto& output_a = w.output_a;
     const auto& output_b = w.output_b;
     const auto& groups = w.groups;
@@ -1046,9 +873,7 @@ attention_forward(const Layer& w, LayerState& state, Executor& executor,
             auto qr =
                 profiler.measure("dsv4.q_a", [&]() { return project.run(q_a, flat); });
             qr = profiler.measure("dsv4.q_a_norm", [&]() {
-#ifdef TYLOINFER_NATIVE_CUDA
                 const auto& q_a_norm = w.q_a_norm.dense();
-#endif
                 return rms_norm_cuda(
                            qr.reshape({-1, qr.size(-1)}).to(::tyloi::kFloat32),
                            q_a_norm, eps)
@@ -1065,12 +890,8 @@ attention_forward(const Layer& w, LayerState& state, Executor& executor,
             queries = profiler.measure("dsv4.q_norm_rope", [&]() {
                 auto normalized =
                     queries * ::tyloi::cuda::rsqrt(queries.square().mean(-1, true) + eps);
-#ifdef TYLOINFER_NATIVE_CUDA
                 auto rotated = tyloi::ops::tail_rope(normalized, positions, attention_rope, false);
                 return rotated.dense();
-#else
-                return attention_rope.forward(normalized, positions, false);
-#endif
             });
 
             return std::array<DenseTensor, 2>{qr, queries};
@@ -1080,9 +901,7 @@ attention_forward(const Layer& w, LayerState& state, Executor& executor,
                 return project.run(kv, flat).reshape({batch, tokens, head_dim});
             });
             values = profiler.measure("dsv4.kv_norm_rope", [&]() {
-#ifdef TYLOINFER_NATIVE_CUDA
                 const auto& kv_norm = w.kv_norm.dense();
-#endif
                 auto normalized =
                     rms_norm_cuda(
                         values.reshape({-1, head_dim}).to(::tyloi::kFloat32),
@@ -1090,13 +909,8 @@ attention_forward(const Layer& w, LayerState& state, Executor& executor,
                         .reshape({batch, tokens, head_dim})
                         .to(::tyloi::kFloat16);
                 auto values_heads = normalized.unsqueeze(1).contiguous();
-#ifdef TYLOINFER_NATIVE_CUDA
                 auto rotated = tyloi::ops::tail_rope(values_heads, positions, attention_rope, false);
                 values_heads = rotated.dense();
-#else
-                values_heads =
-                    attention_rope.forward(values_heads, positions, false);
-#endif
                 return values_heads.squeeze(1).contiguous();
             });
 
@@ -1157,16 +971,10 @@ attention_forward(const Layer& w, LayerState& state, Executor& executor,
                                         .transpose(1, 2)
                                         .contiguous();
                                 });
-#ifdef TYLOINFER_NATIVE_CUDA
                             auto rotated = tyloi::ops::tail_rope(index_query, positions, attention_rope, false);
                             index_query = rotated.dense()
                                               .transpose(1, 2)
                                               .contiguous();
-#else
-                            index_query = attention_rope.forward(index_query, positions, false)
-                                              .transpose(1, 2)
-                                              .contiguous();
-#endif
                             index_query = nepq_hadamard_input_cuda(
                                               index_query.reshape({batch * tokens * heads, 128})
                                                   .to(::tyloi::kFloat16)
@@ -1176,9 +984,7 @@ attention_forward(const Layer& w, LayerState& state, Executor& executor,
                             index_query = dsv4_fp4_sim_cuda(index_query.contiguous());
                             auto weights =
                                 profiler.measure("dsv4.indexer_weight_prefill", [&]() {
-#ifdef TYLOINFER_NATIVE_CUDA
                                     const auto& indexer_weight = w.indexer_weight.dense();
-#endif
                                     return ::tyloi::cuda::matmul(
                                                x.reshape({batch * tokens, hidden_size})
                                                    .to(::tyloi::kFloat32),
@@ -1227,9 +1033,7 @@ attention_forward(const Layer& w, LayerState& state, Executor& executor,
                 },
                 [&](DenseTensor cache, const auto &plan) {
                     return profiler.measure("dsv4.sparse_attention_prefill", [&]() {
-#ifdef TYLOINFER_NATIVE_CUDA
                         const auto& sinks = w.sinks.dense();
-#endif
                         return attention_dsv4_sparse_cuda(
                             queries, cache, plan.at(0), plan.at(1), sinks,
                             scratch.attention_meta,
@@ -1239,13 +1043,8 @@ attention_forward(const Layer& w, LayerState& state, Executor& executor,
                 [&](DenseTensor attention) {
                     return profiler.measure("dsv4.attention_inverse_rope_prefill", [&]() {
                         auto transposed = attention.transpose(1, 2).contiguous();
-#ifdef TYLOINFER_NATIVE_CUDA
                         auto rotated = tyloi::ops::tail_rope(transposed, positions, attention_rope, true);
                         transposed = rotated.dense();
-#else
-                        transposed =
-                            attention_rope.forward(transposed, positions, true);
-#endif
                         return transposed.transpose(1, 2).contiguous();
                     });
                 },
@@ -1314,16 +1113,10 @@ attention_forward(const Layer& w, LayerState& state, Executor& executor,
                                     .transpose(1, 2)
                                     .contiguous();
                             });
-#ifdef TYLOINFER_NATIVE_CUDA
                             auto rotated = tyloi::ops::tail_rope(index_query, position, attention_rope, false);
                             index_query = rotated.dense()
                                               .transpose(1, 2)
                                               .contiguous();
-#else
-                            index_query = attention_rope.forward(index_query, position, false)
-                                              .transpose(1, 2)
-                                              .contiguous();
-#endif
                             index_query = nepq_hadamard_input_cuda(
                                               index_query.reshape({batch * heads, 128})
                                                   .to(::tyloi::kFloat16)
@@ -1332,9 +1125,7 @@ attention_forward(const Layer& w, LayerState& state, Executor& executor,
                                               .reshape({batch, 1, heads, 128});
                             index_query = dsv4_fp4_sim_cuda(index_query.contiguous());
                             auto weights = profiler.measure("dsv4.indexer_weight", [&]() {
-#ifdef TYLOINFER_NATIVE_CUDA
                                 const auto& indexer_weight = w.indexer_weight.dense();
-#endif
                                 return ::tyloi::cuda::matmul(
                                            x.narrow(1, token, 1)
                                                .reshape({batch, hidden_size})
@@ -1387,9 +1178,7 @@ attention_forward(const Layer& w, LayerState& state, Executor& executor,
                 [&](DenseTensor cache, const auto &plan) {
                     auto query = queries.narrow(2, token, 1).contiguous();
                     return profiler.measure("dsv4.sparse_attention", [&]() {
-#ifdef TYLOINFER_NATIVE_CUDA
                         const auto& sinks = w.sinks.dense();
-#endif
                         return attention_dsv4_sparse_cuda(
                             query, cache, plan.at(0), plan.at(1), sinks,
                             scratch.attention_meta,
@@ -1399,13 +1188,8 @@ attention_forward(const Layer& w, LayerState& state, Executor& executor,
                 [&](DenseTensor attention) {
                     return profiler.measure("dsv4.attention_inverse_rope", [&]() {
                         auto transposed = attention.transpose(1, 2).contiguous();
-#ifdef TYLOINFER_NATIVE_CUDA
                         auto rotated = tyloi::ops::tail_rope(transposed, position, attention_rope, true);
                         transposed = rotated.dense();
-#else
-                        transposed =
-                            attention_rope.forward(transposed, position, true);
-#endif
                         return transposed.transpose(1, 2).contiguous();
                     });
                 },
@@ -1419,10 +1203,6 @@ DenseTensor forward_layer(const Layer& w, LayerState& state, Executor& executor,
     auto& profiler = executor.profiler();
     const auto& hidden_size = w.hidden_size;
     const auto& eps = w.eps;
-#ifndef TYLOINFER_NATIVE_CUDA
-    const auto& attn_norm = w.attn_norm;
-    const auto& ffn_norm = w.ffn_norm;
-#endif
     const auto& hc_attn_fn = w.hc_attn_fn;
     const auto& hc_attn_scale = w.hc_attn_scale;
     const auto& hc_attn_base = w.hc_attn_base;
@@ -1439,9 +1219,7 @@ DenseTensor forward_layer(const Layer& w, LayerState& state, Executor& executor,
         return hc_pre(w, x, hc_attn_fn, hc_attn_scale, hc_attn_base, "attn_pre");
     });
     auto normalized = profiler.measure("dsv4.attn_norm", [&]() {
-#ifdef TYLOINFER_NATIVE_CUDA
         const auto& attn_norm = w.attn_norm.dense();
-#endif
         return rms_norm_cuda(attention_mix.at(0).reshape({batch * tokens, hidden_size})
                                  .to(::tyloi::kFloat32), attn_norm, eps)
             .reshape({batch, tokens, hidden_size}).to(::tyloi::kFloat16);
@@ -1454,20 +1232,13 @@ DenseTensor forward_layer(const Layer& w, LayerState& state, Executor& executor,
         return hc_pre(w, x, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, "ffn_pre");
     });
     normalized = profiler.measure("dsv4.ffn_norm", [&]() {
-#ifdef TYLOINFER_NATIVE_CUDA
         const auto& ffn_norm = w.ffn_norm.dense();
-#endif
         return rms_norm_cuda(ffn_mix.at(0).reshape({batch * tokens, hidden_size})
                                  .to(::tyloi::kFloat32), ffn_norm, eps)
             .reshape({batch, tokens, hidden_size}).to(::tyloi::kFloat16);
     });
-#ifdef TYLOINFER_NATIVE_CUDA
     auto feed_forward = ffn.forward(
         normalized.reshape({batch * tokens, hidden_size}), current_ids);
-#else
-    auto feed_forward = ffn.forward(
-        normalized.reshape({batch * tokens, hidden_size}), executor, mode.ffn, current_ids);
-#endif
     feed_forward = feed_forward.reshape({batch, tokens, hidden_size});
     return profiler.measure("dsv4.hc_ffn_post", [&]() {
         return hc_post(w, feed_forward, x, ffn_mix.at(1), ffn_mix.at(2), "ffn_post");

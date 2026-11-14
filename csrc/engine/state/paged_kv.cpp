@@ -1,6 +1,6 @@
 #include "engine/state/paged_kv.h"
 
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
 #include "engine/backends/cuda/native/tensor/backend.h"
 #include <cuda_runtime_api.h>
 #endif
@@ -50,7 +50,7 @@ PagedKv::PagedKv(const std::vector<Layout>& layouts, int64_t context,
         const auto device = layout.device;
         if ((!device.is_cuda() || device.index < 0) && (!device.is_metal() || device.index != 0))
             throw std::invalid_argument("Paged KV requires CUDA or Metal 0");
-#ifndef TYLOINFER_NATIVE_CUDA
+#if !TYLOINFER_HAS_CUDA
         if (device.is_cuda()) throw std::invalid_argument("Paged KV CUDA support is unavailable");
 #endif
         const auto device_key = std::pair{device.type, device.index};
@@ -58,7 +58,7 @@ PagedKv::PagedKv(const std::vector<Layout>& layouts, int64_t context,
             if (device.is_metal()) {
                 device_page_tables_.emplace(device_key, metal_table(host_page_table_, maximum_sequences_, logical_pages_per_sequence_));
             } else {
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
                 MfqCudaGuard guard(device.index);
                 auto page_table = ::tyloi::cuda::empty({maximum_sequences_, logical_pages_per_sequence_},
                     TensorOptions().device(device).dtype(kInt32));
@@ -75,7 +75,7 @@ PagedKv::PagedKv(const std::vector<Layout>& layouts, int64_t context,
             ? kv_packed_width(int(head_dim), layout.quantization.value_bits()) : head_dim;
         pool.dtype = layout.quantization.enabled()
             ? (device.is_metal() ? ScalarType::uint32 : kInt32) : kFloat16;
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
         if (device.is_cuda()) {
             MfqCudaGuard guard(device.index);
             auto options = TensorOptions().device(device).dtype(kInt64);
@@ -176,7 +176,7 @@ void PagedKv::update(const std::vector<const Sequence*>& sequences) {
         if (device.first == DeviceType::metal) {
             table = metal_table(host_page_table_, maximum_sequences_, logical_pages_per_sequence_);
         } else {
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
             MfqCudaGuard guard(device.second);
             const auto stream = mfq_get_current_cuda_stream();
             TYLOINFER_CUDA_CHECK(cudaMemcpyAsync(
@@ -285,7 +285,7 @@ void PagedKv::ensure_storage(size_t required_pages) {
                     chunk.storage = allocate_kv(1, layer.layout.heads, capacity, layer.layout.head_dim,
                         false, layer.layout.device, kFloat16, layer.layout.quantization);
             } else {
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
                 MfqCudaGuard guard(layer.layout.device.index);
                 auto options = TensorOptions().device(layer.layout.device).dtype(layer.dtype);
                 chunk.k = ::tyloi::cuda::empty(
@@ -301,7 +301,7 @@ void PagedKv::ensure_storage(size_t required_pages) {
             auto & layer = layers_[index];
             auto & chunk = pending[index];
             if (layer.layout.device.is_cuda()) {
-#ifdef TYLOINFER_NATIVE_CUDA
+#if TYLOINFER_HAS_CUDA
                 const int64_t k_pointer = reinterpret_cast<int64_t>(chunk.k.dense().data_ptr());
                 const int64_t v_pointer = reinterpret_cast<int64_t>(chunk.v.dense().data_ptr());
                 MfqCudaGuard guard(layer.layout.device.index);

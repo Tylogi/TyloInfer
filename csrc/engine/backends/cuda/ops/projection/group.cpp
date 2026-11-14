@@ -179,6 +179,7 @@ QuantLinearGroup make_quant_group(
 #endif
     } else {
         result.layers = std::move(layers);
+#if TYLOINFER_ENABLE_MFQ_COMPAT
         const auto* nvq0 = result.layers.size() >= 2
             ? result.layers[0].representation<tyloi::NvqTensor>() : nullptr;
         const auto* nvq1 = result.layers.size() >= 2
@@ -186,6 +187,7 @@ QuantLinearGroup make_quant_group(
         result.nvq_prefix2 = !cpu_layer && result.layers.size() >= 2 &&
             !any_tensor_parallel && tyloi::mfq_compat_enabled && nvq0 && nvq1 &&
             nvq_pair_compatible(*nvq0, *nvq1);
+#endif
     }
     return result;
 }

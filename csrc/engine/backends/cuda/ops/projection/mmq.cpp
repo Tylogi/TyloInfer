@@ -57,6 +57,7 @@ void KlMmqState::reset() noexcept {
     *this = {};
 }
 
+#if TYLOINFER_ENABLE_MFQ_COMPAT
 ::tyloi::DenseTensor nint_kld(
         CudaProfiler& profiler, KlMmqState& mmq, const ::tyloi::Tensor& weight,
         ::tyloi::DenseTensor x,
@@ -77,3 +78,4 @@ void KlMmqState::reset() noexcept {
     shape.back() = y.size(-1);
     return y.reshape(shape);
 }
+#endif

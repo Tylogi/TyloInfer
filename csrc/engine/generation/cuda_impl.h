@@ -38,11 +38,7 @@ using ::tyloi::indexing::Slice;
 
 template <typename Model>
 constexpr bool causal =
-#ifdef TYLOINFER_NATIVE_CUDA
     std::is_base_of_v<tyloi::models::CausalModel, Model>;
-#else
-    false;
-#endif
 
 template <typename Model, typename State>
 constexpr bool has_forward =
@@ -59,11 +55,7 @@ constexpr bool has_logits =
     causal<Model> ||
     requires(
     Model& model, tyloi::cuda::Executor& executor,
-#ifdef TYLOINFER_NATIVE_CUDA
     const ::tyloi::Tensor& hidden) {
-#else
-    DenseTensor hidden) {
-#endif
     logits(model, executor, std::move(hidden), true);
 };
 
@@ -73,7 +65,6 @@ auto hidden(Model& model, State& state, tyloi::cuda::Executor* executor,
     static_assert(has_forward<Model, State>);
     TYLOINFER_RUNTIME_CHECK(executor != nullptr,
                             "CUDA model forward requires an executor");
-#ifdef TYLOINFER_NATIVE_CUDA
     auto policy = mode.ffn;
     if constexpr (causal<Model>) policy.independent |= model.info().separate_projections;
     auto scope = Executor::current().enter(policy);
@@ -82,9 +73,6 @@ auto hidden(Model& model, State& state, tyloi::cuda::Executor* executor,
     } else {
         return forward(model, state, *executor, collectives, mode, std::move(input));
     }
-#else
-    return forward(model, state, *executor, collectives, mode, std::move(input));
-#endif
 }
 
 template <typename Model, typename Value>
@@ -93,16 +81,12 @@ auto project(Model& model, tyloi::cuda::Executor* executor,
     static_assert(has_logits<Model>);
     TYLOINFER_RUNTIME_CHECK(executor != nullptr,
                             "CUDA model logits requires an executor");
-#ifdef TYLOINFER_NATIVE_CUDA
     auto scope = Executor::current().enter(mode.ffn);
     if constexpr (causal<Model>) {
         return model.logits(value, capped);
     } else {
         return logits(model, *executor, value, capped, mode);
     }
-#else
-    return logits(model, *executor, std::move(value), capped, mode);
-#endif
 }
 
 template <typename Model, typename State, typename Value>
@@ -110,14 +94,9 @@ auto last_logits(Model& model, State& state, tyloi::cuda::Executor* executor,
                    Collectives& collectives, const Executor::Mode& mode, Value ids, bool capped) {
     auto value = hidden(model, state, executor, collectives, mode,
                         tyloi::models::Input{std::move(ids)});
-#ifdef TYLOINFER_NATIVE_CUDA
     return project(model, executor, mode,
                    tyloi::ops::contiguous(tyloi::ops::cast(tyloi::ops::select(value, 1, -1),
                                                             ::tyloi::kFloat16)), capped);
-#else
-    return project(model, executor, mode,
-                   value.index({Slice(), -1, Slice()}).to(::tyloi::kFloat16).contiguous(), capped);
-#endif
 }
 
 template <typename Model, typename State, typename Value>
@@ -127,23 +106,12 @@ auto sample_token(Model &model, State& state, tyloi::cuda::Executor* executor,
     const MfqTokenConstraintPtr &token_constraint) {
     const auto run = [&]() {
         if (sampler.greedy() && !sampler.has_penalties() && !token_constraint) {
-#ifdef TYLOINFER_NATIVE_CUDA
             auto logits = tyloi::ops::reshape(tyloi::ops::contiguous(last_logits(
                 model, state, executor, collectives, mode, std::move(ids), false)), {1, -1});
             return tyloi::ops::sample_greedy(logits);
-#else
-            auto logits = last_logits(model, state, executor, collectives, mode,
-                                      std::move(ids), false).contiguous().view({1, -1});
-            return sampler.ops().sample_greedy(std::move(logits));
-#endif
         }
-#ifdef TYLOINFER_NATIVE_CUDA
         auto logits = tyloi::ops::reshape(tyloi::ops::contiguous(last_logits(
             model, state, executor, collectives, mode, std::move(ids), true)), {1, -1});
-#else
-        auto logits = last_logits(model, state, executor, collectives, mode,
-                                  std::move(ids), true).contiguous().view({1, -1});
-#endif
         return tyloi::engine::sample_logits(sampler, std::move(logits), counts, token_constraint);
     };
     const auto* setting = tyloi::cuda::env_lookup("TYLOINFER_PROFILE_DECODE");
@@ -175,20 +143,12 @@ template <typename Model, typename State> struct CudaGenerationOps {
     const tyloi::models::Info &info;
     DecodeGraphCache &graph;
     const MfqTokenConstraintPtr &constraint;
-#ifdef TYLOINFER_NATIVE_CUDA
     ::tyloi::Tensor pending, counts, known_token_host;
-#else
-    ::tyloi::DenseTensor pending, counts, known_token_host;
-#endif
     tyloi::cuda::Sampler sampler;
     bool has_penalties;
     const tyloi::models::Prepared *prepared;
     const tyloi::engine::GraphConfig graph_config;
-#ifdef TYLOINFER_NATIVE_CUDA
     ::tyloi::Tensor full_ids;
-#else
-    ::tyloi::DenseTensor full_ids;
-#endif
     std::int32_t generation_limit = 0;
     bool graph_active = false;
     bool graph_prepared = false;
@@ -208,50 +168,29 @@ template <typename Model, typename State> struct CudaGenerationOps {
         : model(model), state(state), executor(executor), collectives(collectives), mode(mode), profiler(profiler),
           weights(weights), serial_branches(serial_branches), report_memory(report_memory),
           info(info), graph(graph), constraint(request.token_constraint),
-#ifdef TYLOINFER_NATIVE_CUDA
           sampler(request.sampling, tyloi::Device(tyloi::kCUDA, mode.primary)),
-#else
-          sampler(request.sampling),
-#endif
           has_penalties(sampler.has_penalties()), prepared(prepared), graph_config(graph_config),
           prefill_compute_chunk(compute_chunk),output(inference_output),budget(budget),source(source) {
-#ifdef TYLOINFER_NATIVE_CUDA
         full_ids = tyloi::ops::contiguous(tyloi::ops::reshape(
             tyloi::ops::tensor(request.prompt, tyloi::Device(tyloi::kCUDA, mode.primary)), {1, -1}));
-#else
-        full_ids = ::tyloi::cuda::tensor(request.prompt,
-            ::tyloi::TensorOptions()
-                .dtype(::tyloi::kInt64)
-                .device(::tyloi::kCUDA))
-                       .reshape({1, -1})
-                       .contiguous();
-#endif
         graph.ensure_storage(info.vocab_size);
         if (has_penalties) {
-#ifdef TYLOINFER_NATIVE_CUDA
             counts = graph.counts;
             tyloi::ops::fill(counts, 0);
             tyloi::ops::add_token_counts(counts, full_ids);
-#else
-            counts = tyloi::cuda::SamplingOps::token_counts(full_ids, info.vocab_size, graph.counts);
-#endif
         }
         generation_limit = request.sampling.max_tokens;
         graph_active = graph_eligible();
     }
 
     void reserve(const tyloi::models::Input& input) {
-#ifdef TYLOINFER_NATIVE_CUDA
         if constexpr (causal<Model>) {
             if (budget) budget->reserve(state.growth(input, forward_options(mode)));
         }
-#endif
     }
 
     double prefill(const tyloi::engine::PrefillChunk &chunk) {
-#ifdef TYLOINFER_NATIVE_CUDA
         auto scope = Executor::current().enter(mode.ffn);
-#endif
         PrefillCudaTimer timer;
         bool prefill_finished=false;
         const auto finish_prefill=[&] {
@@ -259,11 +198,7 @@ template <typename Model, typename State> struct CudaGenerationOps {
             TYLOINFER_CUDA_CHECK(cudaEventRecord(timer.finished_event(),mfq_get_current_cuda_stream()));
             prefill_finished=true;
         };
-#ifdef TYLOINFER_NATIVE_CUDA
         auto ids = tyloi::ops::contiguous(tyloi::ops::slice(full_ids, 1, chunk.offset, chunk.offset + chunk.count));
-#else
-        auto ids = full_ids.narrow(1, chunk.offset, chunk.count).contiguous();
-#endif
         ImageMaskScope image_scope(state,prepared,chunk.offset,chunk.count);
         auto [hidden,layer_major,short_windows]=generation_prefill(model,*this,chunk,ids,finish_prefill);
         if(output && output->stopped()) {
@@ -274,7 +209,6 @@ template <typename Model, typename State> struct CudaGenerationOps {
             // The layer-major path has already advanced every physical cache.
         } else if (prepared && prepared->transformed()) {
             tyloi::models::Input input;
-#ifdef TYLOINFER_NATIVE_CUDA
             input.ids = ids;
             if (prepared->embeddings)
                 input.embeddings = tyloi::ops::contiguous(tyloi::ops::slice(prepared->embeddings, 1,
@@ -282,14 +216,6 @@ template <typename Model, typename State> struct CudaGenerationOps {
             if (prepared->positions)
                 input.positions = tyloi::ops::contiguous(tyloi::ops::slice(prepared->positions, -1,
                     chunk.offset, chunk.offset + chunk.count));
-#else
-            input.ids = ids;
-            input.embeddings = prepared->embeddings.dense().narrow(1, chunk.offset, chunk.count)
-                                    .contiguous();
-            if (prepared->positions.defined())
-                input.positions = prepared->positions.dense().narrow(-1, chunk.offset, chunk.count)
-                                       .contiguous();
-#endif
             input.advance = true;
             reserve(input);
             tyloi::weights::Loan workspace(weights);
@@ -299,11 +225,7 @@ template <typename Model, typename State> struct CudaGenerationOps {
             finish_prefill();
             if(borrowed) {
                 workspace.suspend();
-#ifdef TYLOINFER_NATIVE_CUDA
                 hidden=tyloi::ops::clone(tyloi::ops::slice(hidden,1,hidden.size(1)-1,hidden.size(1)));
-#else
-                hidden=hidden.narrow(1,hidden.size(1)-1,1).clone();
-#endif
                 workspace.finish();
             }
             state.set_position_delta(prepared->decode_position_delta);
@@ -317,17 +239,9 @@ template <typename Model, typename State> struct CudaGenerationOps {
         // restoration remain in TTFT, outside reported prefill throughput.
         finish_prefill();
         if (chunk.offset + chunk.count == full_ids.size(1)) {
-#ifdef TYLOINFER_NATIVE_CUDA
             auto input = tyloi::ops::contiguous(tyloi::ops::cast(tyloi::ops::select(hidden, 1, -1),
                                                                ::tyloi::kFloat16));
-#else
-            auto input = hidden.index({Slice(), -1, Slice()}).to(::tyloi::kFloat16).contiguous();
-#endif
-#ifdef TYLOINFER_NATIVE_CUDA
             auto logits = tyloi::ops::reshape(project(model, executor, mode, std::move(input), true), {1, -1});
-#else
-            auto logits = project(model, executor, mode, std::move(input), true).reshape({1, -1});
-#endif
             pending = tyloi::engine::sample_logits(sampler, std::move(logits), counts, constraint);
         }
         const auto elapsed=timer.elapsed_ms();
@@ -339,11 +253,7 @@ template <typename Model, typename State> struct CudaGenerationOps {
         return elapsed;
     }
     std::int64_t first_token() {
-#ifdef TYLOINFER_NATIVE_CUDA
         const auto token=tyloi::ops::item(pending);
-#else
-        const auto token=pending.template item<int64_t>();
-#endif
         // Prefill temporaries have retired; expert-cache maintenance remains
         // before token publication, inside TTFT for every CUDA model family.
         if (budget) weights.prepare(::tyloi::weights::Cache::Stage::decode, tyloi::Device(tyloi::kCUDA, mode.primary), source);
@@ -362,14 +272,8 @@ template <typename Model, typename State> struct CudaGenerationOps {
         graph.ensure_compute_streams(collectives);
         MfqCudaGuard graph_device_guard(graph.stream.device_index());
         auto graph_stream_guards = activate_cuda_graph_compute_streams(graph.compute_streams);
-#ifdef TYLOINFER_NATIVE_CUDA
         if (has_penalties) tyloi::ops::add_token_counts(counts, tyloi::ops::contiguous(pending));
         graph.initialize_inputs(pending, state.position(), sampler.random_host());
-#else
-        if (has_penalties) sample_token_counts_add_cuda(counts, pending.contiguous());
-        auto random_host = sampler.ops().random_host();
-        graph.initialize_inputs(pending, state.position(), random_host);
-#endif
 
         const std::int64_t requested = state.position() + generation_limit;
         const std::int64_t planned =
@@ -389,7 +293,6 @@ template <typename Model, typename State> struct CudaGenerationOps {
             input.attention_parts = parts;
             auto value = ::tyloi::cuda::internal::generation_detail::hidden(
                 model, state, executor, collectives, graph_mode, std::move(input));
-#ifdef TYLOINFER_NATIVE_CUDA
             auto logits = tyloi::ops::reshape(tyloi::ops::contiguous(project(
                 model, executor, graph_mode,
                 tyloi::ops::contiguous(tyloi::ops::cast(tyloi::ops::select(value, 1, -1), ::tyloi::kFloat16)),
@@ -398,28 +301,12 @@ template <typename Model, typename State> struct CudaGenerationOps {
             if (greedy) return tyloi::ops::sample_greedy(logits);
             return tyloi::ops::sample_stochastic(logits, graph.random, sampler.params().temperature,
                                                  sampler.params().top_k, sampler.params().top_p);
-#else
-            auto logits = project(
-                model, executor, graph_mode,
-                value.index({Slice(), -1, Slice()}).to(::tyloi::kFloat16).contiguous(),
-                !(greedy && !has_penalties)).contiguous().view({1, -1});
-            if (has_penalties) logits = sampler.apply_penalties(std::move(logits), counts);
-            if (greedy) return sampler.ops().sample_greedy(std::move(logits));
-            return sampler.ops().sample_stochastic(std::move(logits), graph.random, sampler.params());
-#endif
         };
         const auto current_graph_storage = [&]() {
-#ifdef TYLOINFER_NATIVE_CUDA
             std::vector<::tyloi::Tensor> result;
             const auto append = [&result](const auto& tensor) {
                 if (tensor.defined()) result.emplace_back(tensor);
             };
-#else
-            std::vector<DenseTensor> result;
-            const auto append = [&result](const auto& tensor) {
-                if (tensor.defined()) result.emplace_back(tensor);
-            };
-#endif
             if constexpr (requires(const State& value) { value.storage(); }) {
                 for (const auto& tensor : state.storage()) append(tensor);
             }
@@ -444,22 +331,9 @@ template <typename Model, typename State> struct CudaGenerationOps {
                     double_warmup, *graph.graph, sample_static,
                     graph.graph_participant_streams(collectives));
                 graph.graph->capture_begin();
-#ifdef TYLOINFER_NATIVE_CUDA
                 auto next = sample_static();
                 if (has_penalties) tyloi::ops::add_token_counts(counts, tyloi::ops::contiguous(next));
                 graph.capture_next(std::move(next));
-#else
-                graph.static_next = sample_static();
-                if (has_penalties) {
-                    sample_token_counts_add_cuda(counts, graph.static_next.contiguous());
-                }
-                decode_graph_commit_cuda(graph.static_next,
-                    graph.generated,
-                    graph.static_step,
-                    graph.static_input,
-                    graph.static_pos,
-                    graph.static_len);
-#endif
                 graph.graph->capture_end();
                 captured_storage = current_graph_storage();
                 graph.set_key(planned, sampler.params(), greedy, captured_storage);
@@ -480,18 +354,12 @@ template <typename Model, typename State> struct CudaGenerationOps {
     std::int64_t advance() {
         if (!graph_active) {
             if(auto result=generation_decode(model,*this))return *result;
-#ifdef TYLOINFER_NATIVE_CUDA
             tyloi::models::Input input;
             input.ids = tyloi::ops::reshape(pending, {1, 1});
             reserve(input);
             pending = sample_token(model, state, executor, collectives, mode, profiler,
                                    std::move(input.ids), sampler, counts, constraint);
             return tyloi::ops::item(pending);
-#else
-            pending = sample_token(model, state, executor, collectives, mode, profiler,
-                                   pending.reshape({1, 1}), sampler, counts, constraint);
-            return pending.template item<int64_t>();
-#endif
         }
 
         if (!graph_prepared) {
@@ -501,43 +369,24 @@ template <typename Model, typename State> struct CudaGenerationOps {
         MfqCudaGuard graph_device_guard(graph.stream.device_index());
         auto graph_stream_guards = activate_cuda_graph_compute_streams(graph.compute_streams);
         if (!sampler.greedy()) {
-#ifdef TYLOINFER_NATIVE_CUDA
             graph.upload_random(sampler.next_random());
-#else
-            *sampler.ops().random_host().template data_ptr<float>() = sampler.next_uniform_float();
-            graph.upload_random(sampler.ops().random_host());
-#endif
         }
         graph.graph->replay();
-#ifdef TYLOINFER_NATIVE_CUDA
         const auto token = tyloi::ops::item(graph.static_next);
-#else
-        const auto token = graph.static_next.template item<int64_t>();
-#endif
         state.advance(1);
         return token;
     }
     void accept(std::int64_t token) {
         if (has_penalties && !graph_active) {
-#ifdef TYLOINFER_NATIVE_CUDA
             tyloi::ops::add_token_counts(counts, tyloi::ops::contiguous(pending));
-#else
-            sample_token_counts_add_cuda(counts, pending.contiguous());
-#endif
         }
         if constexpr(requires {model.prefetch_token_rows(state,known_token_host);}) {
             const auto* option=tyloi::cuda::env_lookup("TYLOINFER_DECODE_EARLY_PLE");
             if((option && option[0]=='0') || (prepared && prepared->transformed()) ||
                (output && output->stopped()))return;
-#ifdef TYLOINFER_NATIVE_CUDA
             if(!known_token_host.defined())known_token_host=tyloi::ops::empty({1,1},
                 ::tyloi::TensorOptions().device(::tyloi::kCPU).dtype(::tyloi::kInt64));
             tyloi::ops::fill(known_token_host, token);
-#else
-            if(!known_token_host.defined())known_token_host=::tyloi::cuda::empty({1,1},
-                ::tyloi::TensorOptions().device(::tyloi::kCPU).dtype(::tyloi::kInt64));
-            known_token_host.template data_ptr<int64_t>()[0]=token;
-#endif
             if(model.prefetch_token_rows(state,known_token_host)) {
                 static bool reported=false;
                 if(!reported) {
@@ -605,9 +454,7 @@ template <class Model, class State, class Predictor> struct RequestOps {
     }
     void prepare_request(const tyloi::engine::InferenceRequest& input) {
         trace_expert_cache("begin");
-#ifdef TYLOINFER_NATIVE_CUDA
         generation_request(model,*this,input);
-#endif
     }
     int64_t prefill_chunk(std::size_t tokens) {
         // Reuse ordinary/MTP widths before allocating wider temporary graphs
@@ -616,13 +463,9 @@ template <class Model, class State, class Predictor> struct RequestOps {
         if(weights.prefill_mode(tokens, state.position() > 0) == ::tyloi::weights::Cache::Prefill::retained)
             return std::min<int64_t>(4,limit);
         if(tokens<=128)return std::min<int64_t>(std::max<std::size_t>(1,tokens),limit);
-#ifdef TYLOINFER_NATIVE_CUDA
         return budget.chunk(tyloi::Device(tyloi::kCUDA, mfq_current_cuda_device()),
             tokens, limit, info.prefill_row_bytes, state.position() > 0,
             config.prefill_chunk_auto, generation_borrow(model, state, tokens, prepared ? &*prepared : nullptr));
-#else
-        return std::min<int64_t>(tokens,limit);
-#endif
     }
     void prepare_prefill_workspace(std::size_t tokens) {
         const auto mode = weights.prefill_mode(tokens, state.position() > 0);
@@ -631,22 +474,18 @@ template <class Model, class State, class Predictor> struct RequestOps {
             budget.prepare_prefill(tyloi::Device(tyloi::kCUDA, mfq_current_cuda_device()), tokens, limit, mode);
             return;
         }
-#ifdef TYLOINFER_NATIVE_CUDA
         const bool streamed = mode == ::tyloi::weights::Cache::Prefill::streamed;
         const bool retire_decode = generation_prefill_begin(model, graph, streamed);
         budget.prepare_prefill(tyloi::Device(tyloi::kCUDA, mfq_current_cuda_device()),
             tokens, limit, mode, retire_decode);
-#endif
     }
     bool prepare_snapshot() {
-#ifdef TYLOINFER_NATIVE_CUDA
         if constexpr(requires { snapshot_size(state, mtp); }) {
             weights.prepare(::tyloi::weights::Cache::Stage::snapshot, tyloi::Device(tyloi::kCUDA, mode.primary), nullptr);
             const auto size=snapshot_size(state,mtp);
             return budget.snapshot(tyloi::Device(tyloi::kCUDA, mfq_current_cuda_device()),
                 size.bytes, size.peak);
         }
-#endif
         return true;
     }
     void invalidate_plan() { graph.invalidate(); }
@@ -690,15 +529,11 @@ template <class Model, class State, class Predictor> struct RequestOps {
     Generation speculate(tyloi::engine::InferenceRequest &input, tyloi::engine::InferenceOutput &output,
         size_t reused, const ::tyloi::Tensor& restored, Hidden *committed) {
         if constexpr (
-#ifdef TYLOINFER_NATIVE_CUDA
             (causal<Model> && std::is_base_of_v<tyloi::models::State, State>) ||
-#endif
             requires { replay(model, state, *executor, int64_t{}); }) {
-#ifdef TYLOINFER_NATIVE_CUDA
             if constexpr (causal<Model>)
                 if (!static_cast<const tyloi::models::CausalModel&>(model).supports_speculation())
                     throw std::invalid_argument("this CUDA model has no speculative predictor");
-#endif
             prepare_prefill_workspace(input.prompt.size()-reused);
             return ::run_mtp_generation(model, state, executor, collectives,
                 mode, weights, info, source,

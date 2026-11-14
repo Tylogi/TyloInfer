@@ -1,11 +1,6 @@
 #include "engine/models/minicpmo45/forward.h"
 #include "engine/models/common/ffn.h"
 #include "engine/models/common/check.h"
-#ifndef TYLOINFER_NATIVE_CUDA
-#include "engine/backends/cuda/native/collectives.h"
-#include "engine/backends/cuda/ops/norm/rms.h"
-#include "engine/backends/cuda/ops/projection/projection.h"
-#endif
 
 #include <algorithm>
 #include <array>

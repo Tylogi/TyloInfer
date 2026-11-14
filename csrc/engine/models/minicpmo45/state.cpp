@@ -10,7 +10,6 @@
 
 namespace tyloi::cuda::minicpmo45 {
 
-#ifdef TYLOINFER_NATIVE_CUDA
 namespace {
 void add_growth(std::vector<std::pair<Device, std::size_t>>& values, Device device, std::size_t bytes) {
     auto it = std::find_if(values.begin(), values.end(), [device](const auto& item) { return item.first == device; });
@@ -57,7 +56,6 @@ std::vector<std::pair<tyloi::Device, std::size_t>> State::growth(
     }
     return result;
 }
-#endif
 
 State::State(const Model& model)
     : layers(model.layers.size())
@@ -162,7 +160,6 @@ void State::publish(Restore&& restore) noexcept {
     batch = 1;
 }
 
-#ifdef TYLOINFER_NATIVE_CUDA
 std::unique_ptr<tyloi::models::Restore> State::prepare_restore(
         const TextSessionState& snapshot, const tyloi::models::Mtp* predictor_model) {
     if (predictor_model) throw CudaSessionStateError("MiniCPM TTS does not support a predictor");
@@ -182,6 +179,5 @@ std::unique_ptr<tyloi::models::Restore> State::prepare_restore(
     };
     return std::make_unique<Candidate>(*this,snapshot);
 }
-#endif
 
 } // namespace tyloi::cuda::minicpmo45

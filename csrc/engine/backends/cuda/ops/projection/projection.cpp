@@ -92,11 +92,11 @@ QuantLinearGroup tyloi::cuda::Projector::group(
         else tq_weights.push_back(*tq);
     }
     if (all_tq) result.tq = *tq_.get(tq_weights.front().get_device())->group(std::move(tq_weights));
+#if TYLOINFER_ENABLE_MFQ_COMPAT
     const auto* nvq0 = weights.size() >= 2 ? weights[0].representation<tyloi::NvqTensor>() : nullptr;
     const auto* nvq1 = weights.size() >= 2 ? weights[1].representation<tyloi::NvqTensor>() : nullptr;
     result.nvq_prefix2 = tyloi::mfq_compat_enabled && nvq0 && nvq1 &&
         nvq0->is_cuda() && nvq_pair_compatible(*nvq0, *nvq1);
-#if TYLOINFER_ENABLE_MFQ_COMPAT
     if (options_.nint_grouped && !independent_ && tyloi::mfq_compat_enabled) {
         std::vector<tyloi::NintTensor> segments;
         std::vector<std::vector<int64_t>> sizes;
@@ -286,6 +286,7 @@ tyloi::DenseTensor tyloi::cuda::ops::sigmoid_project(tyloi::DenseTensor input, t
             return tyloi::cuda::tq::project(*tq_weight, &resources->blas(), std::move(x));
         });
     }
+#if TYLOINFER_ENABLE_MFQ_COMPAT
     if (const auto* sq4 = weight.representation<tyloi::Mxfp4SqTensor>()) {
         TYLOINFER_RUNTIME_CHECK(tyloi::mfq_compat_enabled, "MXFP4-SQ linear requires a compatibility build");
         if (gate.has_value()) gated(InputGateMode::Sigmoid, InputGateMode::Silu);
@@ -316,6 +317,7 @@ tyloi::DenseTensor tyloi::cuda::ops::sigmoid_project(tyloi::DenseTensor input, t
             check_device(*nvq, x);
         return run_nvq_linear(profiler, kl_mmq, *nvq, x, gate, gate_mode);
     }
+#endif
     if (const auto* mx4 = weight.representation<tyloi::Mxfp4Tensor>()) {
         TYLOINFER_RUNTIME_CHECK(!gate.has_value(),
             "MXFP4 tensor-parallel linear does not support input gating");
@@ -615,6 +617,7 @@ Projector::grouped(
             const auto resources = tq_.get(x.get_device());
             return tyloi::cuda::tq::project(*tq, &resources->blas(), std::move(x));
         });
+#if TYLOINFER_ENABLE_MFQ_COMPAT
     if (const auto* nint = local_format<tyloi::NintTensor>(weight); nint != nullptr) {
         TYLOINFER_RUNTIME_CHECK(tyloi::mfq_compat_enabled, "NINT linear requires a compatibility build");
         auto shape = x.sizes().vec();
@@ -631,6 +634,7 @@ Projector::grouped(
         shape.back() = y.size(-1);
         return y.reshape(shape);
     }
+#endif
     if (const auto* sharded_weight = weight.representation<tyloi::ShardedTensor>()) {
         auto shape = x.sizes().vec();
         auto y = sharded(*sharded_weight, x.reshape({-1, x.size(-1)}), mfq_nullopt, InputGateMode::None);
@@ -643,6 +647,7 @@ Projector::grouped(
         shape.back() = y.size(-1);
         return y.reshape(shape);
     }
+#if TYLOINFER_ENABLE_MFQ_COMPAT
     if (const auto* sq4 = local_format<tyloi::Mxfp4SqTensor>(weight); sq4 != nullptr) {
         TYLOINFER_RUNTIME_CHECK(tyloi::mfq_compat_enabled, "MXFP4-SQ linear requires a compatibility build");
         return sq_matmul(*sq4, x);
@@ -651,6 +656,7 @@ Projector::grouped(
         TYLOINFER_RUNTIME_CHECK(tyloi::mfq_compat_enabled, "FP8-SQ linear requires a compatibility build");
         return sq_matmul(*sq8, x);
     }
+#endif
     if (const auto* dense = local_format<::tyloi::DenseTensor>(weight); dense != nullptr)
         return dense_projection(x, *dense);
     const auto& mx8 = payload_as<tyloi::Mxfp8Tensor>(weight);
@@ -850,6 +856,7 @@ std::vector<::tyloi::DenseTensor> Projector::run(
         gate.defined() && gate.dim() > 0 && width == 1)
         width = gate.size(-1);
     check_projection_width(weight, width);
+#if TYLOINFER_ENABLE_MFQ_COMPAT
     if (const auto* nint = local_format<tyloi::NintTensor>(weight); nint != nullptr) {
         TYLOINFER_RUNTIME_CHECK(tyloi::mfq_compat_enabled, "NINT linear requires a compatibility build");
         auto shape = x.sizes().vec();
@@ -866,6 +873,7 @@ std::vector<::tyloi::DenseTensor> Projector::run(
         shape.back() = y.size(-1);
         return y.reshape(shape);
     }
+#endif
     if (const auto* sharded_weight = weight.representation<tyloi::ShardedTensor>()) {
         auto shape = x.sizes().vec();
         auto y = sharded(*sharded_weight, x.reshape({-1, x.size(-1)}),
@@ -918,10 +926,10 @@ std::vector<::tyloi::DenseTensor> Projector::run(
             group.tensor_parallel_output_compatible()) {
         return grouped(group.tensor_parallel_output_projections(), x);
     }
+#if TYLOINFER_ENABLE_MFQ_COMPAT
     if (tyloi::mfq_compat_enabled && group.nint_grouped) {
         return run(group.nint, x);
     }
-#if TYLOINFER_ENABLE_MFQ_COMPAT
     if (tyloi::mfq_compat_enabled && default_mmq && group.nvq_prefix2 && options_.nvq_fusion) {
         const auto* nvq0 = local_format<tyloi::NvqTensor>(group.layers[0]);
         const auto* nvq1 = local_format<tyloi::NvqTensor>(group.layers[1]);
@@ -999,6 +1007,7 @@ std::vector<::tyloi::DenseTensor> Projector::run(
         });
     const bool default_mmq =
         mmq_.mode == KlMmqMode::Default;
+#if TYLOINFER_ENABLE_MFQ_COMPAT
     if (tyloi::mfq_compat_enabled && default_mmq && group.nint_grouped && group.nint.split_w.empty() &&
             x.numel() / x.size(-1) >= 1 && x.numel() / x.size(-1) <= 6) {
         return swiglu(group.nint, x);
@@ -1012,6 +1021,7 @@ std::vector<::tyloi::DenseTensor> Projector::run(
         shape.back() = y.size(-1);
         return y.reshape(shape);
     }
+#endif
     if (group.outs.size() != 2 || group.outs[0] != group.outs[1]) {
         throw std::runtime_error("SwiGLU requires equal gate/up output widths");
     }

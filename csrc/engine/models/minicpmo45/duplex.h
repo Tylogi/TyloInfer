@@ -1,6 +1,7 @@
 #pragma once
 
-#include "engine/models/minicpmo45/text/forward.h"
+#include "engine/models/minicpmo45/text/model.h"
+#include "engine/models/minicpmo45/text/state.h"
 #include "engine/models/minicpmo45/audio.h"
 #include "engine/models/minicpmo45/tts.h"
 

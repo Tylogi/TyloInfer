@@ -27,12 +27,9 @@ class KvMemoryManager;
 class KvOffloadStore;
 
 class Executor
-#ifdef TYLOINFER_NATIVE_CUDA
     : public tyloi::Executor
-#endif
 {
 public:
-#ifdef TYLOINFER_NATIVE_CUDA
     std::unique_ptr<tyloi::Executor::Scope> enter() override;
     std::unique_ptr<tyloi::Executor::Work> work() override;
     std::unique_ptr<tyloi::Executor::Timer> timer() override;
@@ -45,12 +42,6 @@ public:
     void clear() override;
     // Set the default device during loading, before publication or concurrent submissions.
     void set_primary(int primary) noexcept { primary_ = primary; }
-#else
-    std::unique_ptr<tyloi::Executor::Scope> enter();
-    std::vector<tyloi::Executor::Memory> memory(std::span<const tyloi::Device> devices) const;
-    void reclaim(tyloi::Device device);
-    void set_memory_limit(tyloi::Device device, std::size_t bytes);
-#endif
     std::unique_ptr<tyloi::Executor::Scope> enter(int device);
     void reset();
     void join();
@@ -59,16 +50,12 @@ public:
     void configure_kv(std::shared_ptr<KvMemoryManager> memory, std::shared_ptr<KvOffloadStore> offload);
     std::shared_ptr<KvMemoryManager> kv_memory() const noexcept { return kv_memory_.lock(); }
     std::shared_ptr<KvOffloadStore> kv_offload() const;
-#ifdef TYLOINFER_NATIVE_CUDA
     void wait();
     static const FfnMode& current_ffn();
     std::unique_ptr<tyloi::Executor::Scope> enter(int device, const FfnMode& mode);
     // Override only the policy on this active executor; retain its device and stream.
     // Nested policy scopes retain an outer serial-branch requirement.
     std::unique_ptr<tyloi::Executor::Scope> enter(const FfnMode& mode);
-#else
-    void wait(const std::unordered_set<int>& devices);
-#endif
     Collectives& collectives() noexcept { return collectives_; }
     const Collectives& collectives() const noexcept { return collectives_; }
     struct Compute {
@@ -123,11 +110,7 @@ public:
     ContextSet& contexts() noexcept { return contexts_; }
     const ContextSet& contexts() const noexcept { return contexts_; }
 
-#ifdef TYLOINFER_NATIVE_CUDA
     std::vector<::tyloi::Tensor> storage() const;
-#else
-    std::vector<::tyloi::DenseTensor> storage() const;
-#endif
     Projector projector(const FfnMode& mode);
     Projector projector(const FfnMode& mode, int primary);
     CudaProfiler& profiler() noexcept { return profiler_; }
@@ -148,12 +131,8 @@ public:
     std::unique_ptr<tyloi::Executor::Scope> enter(const AttentionKernels& kernels);
     bool fp32_residual() const noexcept { return options_.dense.fp32_residual; }
     AttentionScratch& attention_scratch(std::size_t index);
-#ifdef TYLOINFER_NATIVE_CUDA
     using AttentionGeometry = std::tuple<std::int64_t, std::int64_t, std::int64_t, std::int64_t>;
     AttentionScratch& attention_scratch(tyloi::Device device, AttentionGeometry geometry);
-#else
-    std::unordered_map<const void*, AttentionScratch>& attention_scratch() noexcept { return attention_scratch_; }
-#endif
     MlaScratch& mla_scratch(int device) { return mla_scratch_[device]; }
 
 private:
@@ -184,12 +163,8 @@ private:
     std::vector<AttentionScratch> scratch_;
     MfeScratch mfe_scratch_;
     MoeScratchCache moe_scratch_;
-#ifdef TYLOINFER_NATIVE_CUDA
     mutable std::mutex attention_scratch_mutex_;
     std::map<std::pair<int, std::uintptr_t>, std::map<AttentionGeometry, AttentionScratch>> attention_scratch_;
-#else
-    std::unordered_map<const void*, AttentionScratch> attention_scratch_;
-#endif
     std::map<int, MlaScratch> mla_scratch_;
 };
 

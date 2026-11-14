@@ -272,14 +272,10 @@ struct QsaTqCache::Impl {
         auto image=std::make_shared<QsaIndexArchive>();
         if(ssd_cache){image->store=raw_index_store;image->block=raw_index_store->write(std::move(bytes));}
         else {
-#ifdef TYLOINFER_NATIVE_CUDA_RUNTIME
             auto resident=std::make_unique<const std::vector<std::uint8_t>>(std::move(bytes));
             const auto capacity=resident->capacity();charge_tensor_host_bytes(capacity);
             image->resident=std::shared_ptr<const std::vector<std::uint8_t>>(resident.release(),
                 [capacity](const std::vector<std::uint8_t>* value){delete value;tensor_host_bytes.fetch_sub(capacity);});
-#else
-            image->resident=std::make_shared<const std::vector<std::uint8_t>>(std::move(bytes));
-#endif
         }
         index_archive.push_back(std::move(image));
     }

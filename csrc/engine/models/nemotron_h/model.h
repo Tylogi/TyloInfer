@@ -7,9 +7,7 @@
 #include "engine/models/metadata.h"
 #include "engine/models/plan.h"
 #include "engine/models/source.h"
-#ifdef TYLOINFER_NATIVE_CUDA
 #include "engine/models/causal_model.h"
-#endif
 
 #include <array>
 #include <cstdint>
@@ -29,28 +27,16 @@ struct Mamba {
     int64_t mamba_heads = 0, mamba_head_dim = 0, ssm_state_size = 0;
     int64_t mamba_groups = 0, conv_kernel = 0;
     double rms_norm_eps = 1e-6, time_step_limit_lo = 0.0, time_step_limit_hi = 0.0;
-#ifdef TYLOINFER_NATIVE_CUDA
     ::tyloi::Tensor mixer_norm;
-#else
-    DenseTensor mixer_norm;
-#endif
     ::tyloi::Tensor in_proj;
-#ifdef TYLOINFER_NATIVE_CUDA
     ::tyloi::Tensor conv_weight, conv_bias, a_log, d, dt_bias, scan_norm;
-#else
-    DenseTensor conv_weight, conv_bias, a_log, d, dt_bias, scan_norm;
-#endif
     ::tyloi::Tensor out_proj;
 };
 
 struct Moe {
     int layer = -1;
     double rms_norm_eps = 1e-6;
-#ifdef TYLOINFER_NATIVE_CUDA
     ::tyloi::Tensor ffn_norm;
-#else
-    DenseTensor ffn_norm;
-#endif
     Ffn ffn;
 };
 
@@ -60,9 +46,7 @@ struct Layer {
 };
 
 struct Model
-#ifdef TYLOINFER_NATIVE_CUDA
     : tyloi::models::CausalModel
-#endif
 {
     std::shared_ptr<const tyloi::ModelSource> source;
     tyloi::ModelGraph graph;
@@ -70,11 +54,7 @@ struct Model
     Config config;
     tyloi::models::CausalLmMetadata metadata;
     ::tyloi::Tensor embed, lm_head;
-#ifdef TYLOINFER_NATIVE_CUDA
     ::tyloi::Tensor output_norm;
-#else
-    DenseTensor output_norm;
-#endif
     std::vector<Layer> layers;
     int primary = 0;
     std::unique_ptr<Components> parts;
@@ -83,7 +63,6 @@ struct Model
     ~Model();
     Model(Model&&) noexcept;
     Model& operator=(Model&&) noexcept;
-#ifdef TYLOINFER_NATIVE_CUDA
     tyloi::models::Mtp* predictor() const noexcept override;
     tyloi::models::Info info() const override;
     bool supports_speculation() const noexcept override;
@@ -98,7 +77,6 @@ struct Model
     ::tyloi::Tensor logits(const tyloi::Tensor&, bool capped = true) const override;
     ::tyloi::Tensor forward(tyloi::models::Input, tyloi::models::State&,
         const tyloi::models::ForwardOptions& = {}) const override;
-#endif
 };
 
 

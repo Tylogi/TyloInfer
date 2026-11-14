@@ -3,6 +3,7 @@ target_include_directories(mfq-formats INTERFACE
     ${PROJECT_SOURCE_DIR})
 
 add_library(mfq-quant-readers STATIC
+    features.cpp
     bytes.h
     legacy.h
     dense_blob.cpp
@@ -40,6 +41,8 @@ target_include_directories(mfq-quant-readers PRIVATE
 target_link_libraries(mfq-quant-readers PUBLIC mfq-formats mfq-io
     PRIVATE mfq-host-parallel mfq-json)
 target_compile_features(mfq-quant-readers PUBLIC cxx_std_17 PRIVATE cxx_std_20)
+target_compile_definitions(mfq-quant-readers PRIVATE
+    TYLOINFER_ENABLE_MFQ_COMPAT=$<BOOL:${TYLOINFER_ENABLE_MFQ_COMPAT}>)
 set_target_properties(mfq-quant-readers PROPERTIES POSITION_INDEPENDENT_CODE ON)
 if(MSVC)
     target_compile_options(mfq-quant-readers PRIVATE /EHsc)

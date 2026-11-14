@@ -826,12 +826,10 @@ Tensor batch_ffn(const FfnWeights& weights, const Tensor& input) {
     for (std::int64_t start = 0; start < source.size(0); start += rows) {
         mode.tile = int(start / rows);
         if (window) window->set_profile_tile(mode.tile);
-#ifdef TYLOINFER_NATIVE_CUDA
         auto tile_mode = cuda::Executor::current_ffn();
         tile_mode.tile = mode.tile;
         tile_mode.tiles = mode.tiles;
         auto tile_scope = executor.enter(tile_mode);
-#endif
         outputs.push_back(ffn(weights, source.narrow(0, start, std::min(rows, source.size(0) - start))).dense());
     }
     return cuda::cat(outputs, 0);

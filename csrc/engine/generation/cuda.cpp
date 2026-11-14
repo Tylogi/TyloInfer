@@ -5,8 +5,10 @@
 
 #include "engine/models/deepseek_v4/forward.h"
 #include "engine/models/glm5_next/forward.h"
-#include "engine/models/glm_dsa/forward.h"
-#include "engine/models/minicpmo45/text/forward.h"
+#include "engine/models/glm_dsa/model.h"
+#include "engine/models/glm_dsa/state.h"
+#include "engine/models/minicpmo45/text/model.h"
+#include "engine/models/minicpmo45/text/state.h"
 #include "engine/models/minicpmo45/forward.h"
 #include "engine/models/nemotron_h/forward.h"
 #include "engine/models/deepseek_v41/generation.h"

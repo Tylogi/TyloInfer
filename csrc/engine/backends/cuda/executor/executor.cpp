@@ -104,17 +104,11 @@ void MlaScratch::ensure_decode_workspace(int64_t B, int64_t planned_len) {
     ensure_meta();
 }
 
-#ifdef TYLOINFER_NATIVE_CUDA
 std::vector<::tyloi::Tensor> Executor::storage() const {
     std::vector<::tyloi::Tensor> result;
     const auto append = [&](const DenseTensor& tensor) {
         if (tensor.defined()) result.push_back(std::make_shared<DenseTensor>(tensor));
     };
-#else
-std::vector<DenseTensor> Executor::storage() const {
-    std::vector<DenseTensor> result;
-    const auto append = [&](const DenseTensor& tensor) { if (tensor.defined()) result.push_back(tensor); };
-#endif
     const auto route = [&](const MoeRoutePlan& value) {
         append(value.ids); append(value.ids_dst); append(value.expert_bounds);
         append(value.tile_bounds); append(value.tile_experts);
@@ -164,7 +158,6 @@ std::vector<DenseTensor> Executor::storage() const {
             }
         }
     }
-#ifdef TYLOINFER_NATIVE_CUDA
     if (tq_) for (const auto& tensor : tq_->storage()) append(tensor);
     std::lock_guard lock(attention_scratch_mutex_);
     for (const auto& [key, geometries] : attention_scratch_) {
@@ -175,7 +168,6 @@ std::vector<DenseTensor> Executor::storage() const {
             append(value.mask); append(value.kv_max); append(value.meta);
         }
     }
-#endif
     for (const auto& [device, value] : mla_scratch_) {
         (void)device;
         append(value.dense_mask); append(value.decode_mask); append(value.kv_max);
@@ -217,9 +209,6 @@ Executor::Executor(ContextSet& contexts, CudaProfiler& profiler, KlMmqState& mmq
 Executor::~Executor() = default;
 
 void Executor::reset() {
-#ifndef TYLOINFER_NATIVE_CUDA
-    attention_scratch_.clear();
-#endif
     branches_.clear();
     profiler_.reset();
     collectives_.reset();
@@ -234,7 +223,6 @@ void Executor::reset() {
     mode_.trace = nullptr;
 }
 
-#ifdef TYLOINFER_NATIVE_CUDA
 void Executor::drain() {
     std::exception_ptr failure;
     try { join(); } catch (...) { failure = std::current_exception(); }
@@ -263,7 +251,6 @@ void Executor::clear() {
     branches_.clear();
     configure_kv({}, {});
 }
-#endif
 
 void Executor::join() {
     std::exception_ptr failure;
@@ -274,21 +261,13 @@ void Executor::join() {
     if (failure) std::rethrow_exception(failure);
 }
 
-#ifdef TYLOINFER_NATIVE_CUDA
 void Executor::wait() {
-#else
-void Executor::wait(const std::unordered_set<int>& devices) {
-#endif
     std::exception_ptr failure;
     const auto finish = [&](auto&& work) {
         try { work(); } catch (...) { if (!failure) failure = std::current_exception(); }
     };
     // shortcut: retirement fences the whole device; use events when every consumer has a completion handle.
-#ifdef TYLOINFER_NATIVE_CUDA
     for (const auto& [device, context] : contexts_) finish([&] {
-#else
-    for (int device : devices) finish([&] {
-#endif
         MfqCudaGuard guard(device);
         TYLOINFER_CUDA_CHECK(cudaDeviceSynchronize());
     });
@@ -331,17 +310,14 @@ AttentionScratch& Executor::attention_scratch(std::size_t index) {
     return scratch_[index];
 }
 
-#ifdef TYLOINFER_NATIVE_CUDA
 AttentionScratch& Executor::attention_scratch(tyloi::Device device, AttentionGeometry geometry) {
     const auto stream = device.is_cuda()
         ? reinterpret_cast<std::uintptr_t>(current_stream(device.index).stream()) : 0;
     std::lock_guard lock(attention_scratch_mutex_);
     return attention_scratch_[{device.is_cuda() ? device.index : -1, stream}][geometry];
 }
-#endif
 
 namespace {
-#ifdef TYLOINFER_NATIVE_CUDA
 class ExecutorProfile final : public tyloi::Executor::Profile {
 public:
     ExecutorProfile(CudaProfiler& profiler, const char* name)
@@ -371,7 +347,6 @@ private:
     std::string name_;
     std::optional<CudaProfiler::Range> range_;
 };
-#endif
 
 class ExecutorScope;
 thread_local ExecutorScope* active_scope = nullptr;
@@ -429,11 +404,7 @@ std::unique_ptr<tyloi::Executor::Scope> Executor::enter() {
 }
 
 std::unique_ptr<tyloi::Executor::Scope> Executor::enter(int device) {
-#ifdef TYLOINFER_NATIVE_CUDA
     return enter(device, active_scope && &active_scope->owner == this ? active_scope->ffn : mode_.ffn);
-#else
-    return std::make_unique<ExecutorScope>(*this, device, contexts_, mode_.ffn);
-#endif
 }
 
 Executor::Mode Executor::forward_mode(int primary) const {
@@ -468,7 +439,6 @@ std::unique_ptr<tyloi::Executor::Scope> Executor::enter(const AttentionKernels& 
     return std::make_unique<ExecutorScope>(*this, nullptr, &kernels);
 }
 
-#ifdef TYLOINFER_NATIVE_CUDA
 std::unique_ptr<tyloi::Executor::Work> Executor::work() {
     return make_working_set(*this);
 }
@@ -493,7 +463,6 @@ const FfnMode& Executor::current_ffn() {
     if (!active_scope) throw std::runtime_error("no active CUDA executor scope");
     return active_scope->ffn;
 }
-#endif
 
 Executor& Executor::current() {
     if (!active_scope) throw std::runtime_error("no active CUDA executor scope");

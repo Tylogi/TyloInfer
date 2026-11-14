@@ -1,6 +1,5 @@
 #include "engine/ops.h"
 
-#ifdef TYLOINFER_NATIVE_CUDA
 #include "engine/backends/cuda/executor/executor.h"
 #include "engine/weights/moe/batch_internal.h"
 #include "engine/weights/moe/experts.h"
@@ -37,27 +36,8 @@
 #include <exception>
 #include <iostream>
 #include <limits>
-#endif
 
 namespace tyloi::ops {
-#ifdef TYLOINFER_NATIVE_CUDA
-struct DeviceScope::Impl {
-    std::optional<MfqCudaGuard> guard;
-
-    explicit Impl(Device target) {
-        if ((!target.is_cpu() && !target.is_cuda()
-#ifdef TYLOINFER_NATIVE_MLX_RUNTIME
-             && !(target.is_metal() && target.index == 0)
-#endif
-             ) || (target.is_cuda() && target.index < 0))
-            throw std::invalid_argument("unsupported execution device");
-        if (target.is_cuda()) guard.emplace(target.index);
-    }
-};
-
-DeviceScope::DeviceScope(Device target) : impl_(std::make_unique<Impl>(target)) {}
-DeviceScope::~DeviceScope() = default;
-
 std::unique_ptr<::tyloi::Executor::Scope> dense_scope(::tyloi::Executor* executor, Device target) {
     if (!executor) return cuda::Executor::current().enter(cuda::FfnMode{});
     if (!target.is_cuda() || target.index < 0)
@@ -1238,5 +1218,4 @@ void index_fill(Tensor& value_tensor, std::int64_t dim, const Tensor& indices_te
     require_cuda(value);
     cuda::ops::index_fill(value, dim, indices, fill_value);
 }
-#endif
 } // namespace tyloi::ops

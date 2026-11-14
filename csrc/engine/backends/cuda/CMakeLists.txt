@@ -52,7 +52,7 @@ add_library(mfq-cuda-core STATIC
 add_library(mfq::cuda-core ALIAS mfq-cuda-core)
 # The native context/tensor units only need their own headers plus the CUDA SDK;
 # the kernel declarations stay out of the interface.
-target_include_directories(mfq-cuda-core PUBLIC
+target_include_directories(mfq-cuda-core PRIVATE
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/native
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/native/tensor
     ${CUDAToolkit_INCLUDE_DIRS}
@@ -60,10 +60,10 @@ target_include_directories(mfq-cuda-core PUBLIC
 target_include_directories(mfq-cuda-core PRIVATE
     ${PROJECT_SOURCE_DIR}
 )
-target_link_libraries(mfq-cuda-core PUBLIC CUDA::cudart CUDA::cublas CUDA::cublasLt CUDA::cuda_driver mfq-host-parallel)
+target_link_libraries(mfq-cuda-core PRIVATE CUDA::cudart CUDA::cublas CUDA::cublasLt CUDA::cuda_driver mfq-host-parallel)
 target_link_libraries(mfq-cuda-core PUBLIC mfq-tensor)
 if(WIN32)
-    target_link_libraries(mfq-cuda-core PUBLIC dxgi)
+    target_link_libraries(mfq-cuda-core PRIVATE dxgi)
 endif()
 target_compile_features(mfq-cuda-core PUBLIC cxx_std_20)
 target_compile_options(mfq-cuda-core PRIVATE
@@ -189,6 +189,8 @@ add_library(mfq-cuda-native-kernels STATIC
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/native/ggml.cu
 )
 add_library(mfq::cuda-native-kernels ALIAS mfq-cuda-native-kernels)
+target_compile_definitions(mfq-cuda-native-kernels PRIVATE
+    TYLOINFER_ENABLE_MFQ_COMPAT=$<BOOL:${TYLOINFER_ENABLE_MFQ_COMPAT}>)
 set(_tyloinfer_ggml_cuda ${PROJECT_SOURCE_DIR}/components/ggml/src/ggml-cuda)
 target_sources(mfq-cuda-native-kernels PRIVATE ${_tyloinfer_ggml_cuda}/quantize.cu)
 # One format list keeps contiguous and pointer-table MMQ instantiations aligned.
@@ -271,8 +273,7 @@ target_include_directories(mfq-cuda-native-kernels PRIVATE
     ${CUDAToolkit_INCLUDE_DIRS}
 )
 target_link_libraries(mfq-cuda-native-kernels
-    PUBLIC mfq-cuda-core CUDA::cuda_driver
-    PRIVATE mfq-formats mfq-ggml-internal-headers mfq-ggml
+    PRIVATE mfq-cuda-core CUDA::cuda_driver mfq-formats mfq-ggml-internal-headers mfq-ggml
 )
 target_compile_options(mfq-cuda-native-kernels PRIVATE
     "$<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>"
@@ -314,6 +315,8 @@ endif()
 find_package(OpenMP QUIET)
 
 function(mfq_configure_cuda_backend_target target)
+    target_compile_definitions(${target} PRIVATE
+        TYLOINFER_ENABLE_MFQ_COMPAT=$<BOOL:${TYLOINFER_ENABLE_MFQ_COMPAT}>)
     target_include_directories(${target} PRIVATE
         ${PROJECT_SOURCE_DIR}
         ${TYLOINFER_REPOSITORY_ROOT}

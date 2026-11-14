@@ -134,7 +134,6 @@ void State::allocate() {
     for (auto& block : model_.blocks) block->reset(*shared, batch);
 }
 
-#ifdef TYLOINFER_NATIVE_CUDA
 namespace {
 std::size_t block_allocation_bytes(const Block& block, std::int64_t batch, tyloi::Device device) {
     const auto bytes = [&](std::int64_t rows, std::int64_t width, tyloi::ScalarType dtype) {
@@ -287,7 +286,6 @@ std::vector<std::pair<tyloi::Device, std::size_t>> State::growth(
     for (const auto& value : growth) result.emplace_back(value.device, value.peak);
     return result;
 }
-#endif
 
 std::vector<::tyloi::Tensor> State::storage() const {
     std::vector<::tyloi::Tensor> result;
@@ -311,9 +309,6 @@ std::vector<::tyloi::Tensor> State::storage() const {
     if (shared->topk.defined()) result.push_back(shared->topk);
     if (shared->candidate_blocks.defined()) result.push_back(shared->candidate_blocks);
     if (shared->previous_pre.defined()) result.push_back(shared->previous_pre);
-#ifndef TYLOINFER_NATIVE_CUDA
-    if (shared->attention_meta.defined()) result.push_back(shared->attention_meta);
-#endif
     if (shared->image_mask.defined()) result.push_back(shared->image_mask);
     if (shared->text_rows.defined()) result.push_back(shared->text_rows);
     if (shared->routing_mask.defined()) result.push_back(shared->routing_mask);

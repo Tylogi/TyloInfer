@@ -170,13 +170,7 @@ void stage_layer_session(const Layer& layer, LayerState& target,
         stage_session_tensor(target.gdn.recurrent, saved.recurrent, device);
     }
     if (layer.ple) {
-#ifdef TYLOINFER_NATIVE_CUDA
         stage_session_tensor(target.ple.conv, saved.ple_convolution, device);
-#else
-        target.ple.conv = tyloi::ops::empty(saved.ple_convolution.dense().sizes(),
-                                           saved.ple_convolution.options().device(device)).dense();
-        tyloi::ops::copy_into(::tyloi::Tensor(target.ple.conv), saved.ple_convolution);
-#endif
         layer.ple->restore_graph_context(target.ple, {saved.ple_batch, saved.ple_tokens});
     }
 }
@@ -267,11 +261,7 @@ std::vector<std::pair<tyloi::Device, std::size_t>> State::growth(
             }
             if (block.ple) {
                 TYLOINFER_RUNTIME_CHECK(!layer.ple.saved && layer.ple.conv.defined(), "PLE suffix requires committed convolution state");
-#ifdef TYLOINFER_NATIVE_CUDA
                 add(device, layer.ple.conv.dense().nbytes());
-#else
-                add(device, layer.ple.conv.nbytes());
-#endif
                 const auto& context = block.ple->session_context(layer.ple);
                 if (context.tokens.size() > std::numeric_limits<std::size_t>::max() / sizeof(int64_t))
                     throw std::overflow_error("PLE suffix context overflow");
@@ -383,11 +373,7 @@ void State::begin_speculative_suffix(std::int64_t draft_tokens) {
         }
         if (block.ple) {
             TYLOINFER_RUNTIME_CHECK(!layer.ple.saved && layer.ple.conv.defined(), "PLE suffix requires committed convolution state");
-#ifdef TYLOINFER_NATIVE_CUDA
             saved[i].ple_conv = layer.ple.conv.dense().clone();
-#else
-            saved[i].ple_conv = layer.ple.conv.clone();
-#endif
             saved[i].context = block.ple->session_context(layer.ple);
         }
     }

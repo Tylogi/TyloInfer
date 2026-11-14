@@ -155,9 +155,7 @@ struct Text {
                 load_config.weights.min_slots);
             batching->bind(*budget);
         }
-#ifdef TYLOINFER_NATIVE_CUDA
         budget->bind(component_predictor(components) != nullptr);
-#endif
         if(const auto bytes=::tyloi::cuda::options::resident_budget_bytes()) {
             SessionCommand command;
             command.kind=SessionCommand::Kind::memory_budget;

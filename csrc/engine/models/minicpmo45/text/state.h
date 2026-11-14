@@ -2,9 +2,7 @@
 
 #include "engine/models/session/snapshot.h"
 #include "engine/state/kv_view.h"
-#ifdef TYLOINFER_NATIVE_CUDA
 #include "engine/models/state.h"
-#endif
 
 #include <vector>
 
@@ -12,9 +10,7 @@ namespace tyloi::cuda::minicpmo45::text {
 struct Model;
 
 class State
-#ifdef TYLOINFER_NATIVE_CUDA
     : public tyloi::models::State
-#endif
 {
 public:
     explicit State(const Model&);
@@ -28,13 +24,11 @@ public:
     int64_t position() const noexcept { return cache_pos; }
     void advance(int64_t tokens) noexcept { cache_pos += tokens; }
     void set_position_delta(int64_t delta) noexcept { decode_position_delta = delta; }
-#ifdef TYLOINFER_NATIVE_CUDA
     std::vector<std::pair<tyloi::Device, std::size_t>> preallocate_growth() const override;
     std::vector<std::pair<tyloi::Device, std::size_t>> growth(
         const tyloi::models::Input& input, const tyloi::models::ForwardOptions& options) const override;
     std::unique_ptr<tyloi::models::Restore> prepare_restore(
         const TextSessionState&, const tyloi::models::Mtp* predictor_model = nullptr) override;
-#endif
     std::vector<::tyloi::Tensor> storage() const;
     std::vector<::tyloi::Tensor*> graph_state() { return {}; }
     TextSessionStateKind text_session_state_kind() const;

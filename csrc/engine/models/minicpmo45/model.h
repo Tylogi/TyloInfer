@@ -4,11 +4,7 @@
 #include "engine/models/source/model_config.h"
 #include "engine/ops.h"
 #include "engine/models/metadata.h"
-#ifdef TYLOINFER_NATIVE_CUDA
 #include "engine/models/causal_model.h"
-#else
-#include "engine/backends/cuda/ops/rope/rope.h"
-#endif
 #include "engine/models/source/model_graph.h"
 #include "engine/models/plan.h"
 #include "engine/models/source.h"
@@ -25,11 +21,8 @@ namespace tyloi::cuda::minicpmo45 {
 
 // The standalone TTS checkpoint uses offset RMS weights, unlike composite Tts.
 struct Model
-#ifdef TYLOINFER_NATIVE_CUDA
     : tyloi::models::CausalModel
-#endif
 {
-#ifdef TYLOINFER_NATIVE_CUDA
     tyloi::models::Info info() const override;
     MfqModelCapabilities capabilities() const override;
     tyloi::engine::Metrics metrics() const override;
@@ -42,7 +35,6 @@ struct Model
     Tensor logits(const Tensor&, bool capped = true) const override;
     Tensor forward(tyloi::models::Input, tyloi::models::State&,
                    const tyloi::models::ForwardOptions& = {}) const override;
-#endif
     std::shared_ptr<const tyloi::ModelSource> source;
     tyloi::ModelGraph graph;
     ::tyloi::models::Plan plan;
@@ -51,21 +43,15 @@ struct Model
     tyloi::ops::RopeTable rope, cpu_rope;
     std::unordered_map<int, tyloi::ops::RopeTable> device_ropes;
     ::tyloi::Tensor embed, lm_head;
-#ifdef TYLOINFER_NATIVE_CUDA
     ::tyloi::Tensor output_norm;
-#else
-    DenseTensor output_norm;
-#endif
     std::vector<Layer> layers;
 };
 
 Model read(std::shared_ptr<const tyloi::ModelSource>, std::string_view definition, int64_t context);
 void load(Model&, const tyloi::weights::Loader&, const LayerPlacementConfig&, int cpu_layers,
           const tyloi::ops::YarnScaling&);
-#ifdef TYLOINFER_NATIVE_CUDA
 void load(std::unique_ptr<tyloi::models::CausalModel>&, std::shared_ptr<const tyloi::ModelSource>,
           std::string_view definition, const tyloi::weights::Loader&, LayerPlacementConfig&,
           const tyloi::models::LoadOptions&);
-#endif
 
 } // namespace tyloi::cuda::minicpmo45

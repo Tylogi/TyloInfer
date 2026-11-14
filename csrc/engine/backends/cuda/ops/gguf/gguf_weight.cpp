@@ -15,9 +15,7 @@
 #include "../../kernels/gguf_quad_matvec.h"
 #include "../../kernels/gguf_quad_small_m.h"
 #include "../../kernels/gguf_quad_decode.h"
-#ifdef TYLOINFER_NATIVE_CUDA_RUNTIME
 #include "gguf_dense_schedule.h"
-#endif
 #include "components/ggml/src/ggml-quants.h"
 
 #include <algorithm>
@@ -36,7 +34,6 @@
 
 namespace {
 std::int64_t prefill_weight_rows(std::int64_t,std::uint64_t,std::int64_t,int,bool);
-#ifdef TYLOINFER_NATIVE_CUDA_RUNTIME
 // Only row exponents are retained. Weak ownership prevents either model
 // retention or reuse after an allocator gives another weight the same address.
 struct PrefillRowScale {
@@ -84,9 +81,6 @@ struct PrefillRowScale {
     }
     entry->ready.record(stream.stream());auto result=entry->exponents;cache.push_back(std::move(entry));return result;
 }
-#else
-::tyloi::DenseTensor prefill_cached_exponents(const GgufWeight&) { return {}; }
-#endif
 std::int64_t prefill_weight_rows(std::int64_t rows,std::uint64_t bytes_per_row,
         std::int64_t alignment,int device,bool double_buffer=false) {
     const auto context=tyloi::cuda::default_context(device);
@@ -719,13 +713,11 @@ std::vector<::tyloi::DenseTensor> GgufProjectionInput::project_all(const std::ve
                 layouts.data(),tokens,result_type==::tyloi::kFloat16,stream);
         };
         std::size_t selected=0;
-#ifdef TYLOINFER_NATIVE_CUDA_RUNTIME
         if(tokens>=3 && quad.size()==2)
             selected=mfq_gguf_dense_schedule::choose_group(descriptors,weights.front().packed.get_device(),
                 weights.front().neuron_len,tokens,result_type==::tyloi::kFloat16,stream,separate,batch,pair);
         else selected=mfq_gguf_dense_schedule::choose_batch(descriptors,weights.front().packed.get_device(),
                 weights.front().neuron_len,tokens,result_type==::tyloi::kFloat16,stream,separate,batch)?1:0;
-#endif
         if(selected==2)pair();else if(selected)batch();else separate();
         if(const auto* trace=tyloi::cuda::env_lookup("TYLOINFER_TRACE_KERNEL_DISPATCH");trace && trace[0]=='1') {
             cudaStreamCaptureStatus capture=cudaStreamCaptureStatusNone;
@@ -827,10 +819,8 @@ std::vector<::tyloi::DenseTensor> GgufProjectionInput::project_all(const std::ve
             tokens,result_type==::tyloi::kFloat16,stream.stream());
     };
     bool selected=false;
-#ifdef TYLOINFER_NATIVE_CUDA_RUNTIME
     selected=mfq_gguf_dense_schedule::choose_batch(projections,weights.front().packed.get_device(),
         weights.front().neuron_len,tokens,result_type==::tyloi::kFloat16,stream.stream(),separate,batch,aligned_m1);
-#endif
     if(selected)batch();else separate();
     if(const auto* trace=tyloi::cuda::env_lookup("TYLOINFER_TRACE_KERNEL_DISPATCH");trace && trace[0]=='1') {
         cudaStreamCaptureStatus status=cudaStreamCaptureStatusNone;

@@ -1,15 +1,8 @@
 #pragma once
-#ifndef TYLOINFER_NATIVE_CUDA
-#include "engine/weights/cache.h"
-#include "engine/state/media.h"
-#endif
 #include "engine/backends/cuda/kernels/mfq_cuda_norm_ops.h"
 #include "engine/backends/cuda/ops/norm/rms.h"
 #include "engine/backends/cuda/ops/ffn/ffn.h"
 #include "engine/ops.h"
-#ifndef TYLOINFER_NATIVE_CUDA
-#include "engine/backends/cuda/ops/rope/tail.h"
-#endif
 #include "engine/models/deepseek_v41/causal_lm.h"
 
 #include "engine/models/plan.h"
@@ -46,11 +39,7 @@ class Vision;
 
 using DenseTensor = ::tyloi::DenseTensor;
 using CommonConfig = tyloi::models::deepseek_v41::Config;
-#ifdef TYLOINFER_NATIVE_CUDA
 using Parameter = ::tyloi::Tensor;
-#else
-using Parameter = DenseTensor;
-#endif
 
 // Per-request, per-layer runtime: the KV ring, checkpoints and layer flags.
 struct LayerState {
@@ -93,9 +82,6 @@ struct SharedState {
     DenseTensor topk;
     DenseTensor candidate_blocks;
     DenseTensor previous_pre;
-#ifndef TYLOINFER_NATIVE_CUDA
-    DenseTensor attention_meta;
-#endif
     std::unique_ptr<EngramHashState> engram_hash;
     std::vector<std::unique_ptr<Engram::State>> engram_states;
     EngramHashBatch engram_hashes;
@@ -203,13 +189,6 @@ struct SharedState {
             if(++issued==2)break;
         }
         ++next_layer;
-#ifndef TYLOINFER_NATIVE_CUDA
-        if (!attention_meta.defined() || attention_meta.device() != device) {
-            attention_meta = ::tyloi::cuda::empty(
-                {8 * 1024 * 1024}, ::tyloi::TensorOptions().device(device).dtype(
-                                       ::tyloi::kFloat32));
-        }
-#endif
     }
 
     DenseTensor final_collapse(const DenseTensor &hidden, std::int64_t layer_count) const {
@@ -237,20 +216,12 @@ struct AttentionState {
 };
 
 inline DenseTensor weighted_rms(const DenseTensor &input,
-#ifdef TYLOINFER_NATIVE_CUDA
                                 const ::tyloi::Tensor &weight, double epsilon) {
-#else
-                                const DenseTensor &weight, double epsilon) {
-#endif
     const auto shape = input.sizes().vec();
     TYLOINFER_RUNTIME_CHECK(!shape.empty() && weight.numel() == shape.back(),
                       "DeepSeek-V4.1 weighted RMS geometry mismatch");
     return rms_norm_cuda(input.reshape({-1, shape.back()}).to(::tyloi::kFloat32),
-#ifdef TYLOINFER_NATIVE_CUDA
                          weight.dense(),
-#else
-                         weight,
-#endif
                          epsilon)
         .reshape(shape)
         .to(::tyloi::kFloat16)
@@ -258,21 +229,11 @@ inline DenseTensor weighted_rms(const DenseTensor &input,
 }
 
 inline DenseTensor rotate_token_major_tail(DenseTensor input, const DenseTensor &positions,
-#ifdef TYLOINFER_NATIVE_CUDA
                                       const ::tyloi::ops::TailRopeTable &rope, bool inverse = false) {
-#else
-                                      const TailRope &rope, bool inverse = false) {
-#endif
     TYLOINFER_RUNTIME_CHECK(input.dim() == 3, "DeepSeek-V4.1 RoPE input must be [B,T,D]");
-#ifdef TYLOINFER_NATIVE_CUDA
     auto value = input.unsqueeze(1).contiguous();
     auto rotated = ::tyloi::ops::tail_rope(value, positions, rope, inverse);
     return rotated.dense().squeeze(1).contiguous();
-#else
-    return rope.forward(input.unsqueeze(1).contiguous(), positions, inverse)
-        .squeeze(1)
-        .contiguous();
-#endif
 }
 
 inline DenseTensor empty_topk(std::int64_t batch, std::int64_t tokens,
@@ -417,11 +378,7 @@ struct Block final {
     ::tyloi::Tensor index_score;
     tyloi::cuda::Ffn mlp;
     Parameter vision_router_bias;
-#ifdef TYLOINFER_NATIVE_CUDA
     ::tyloi::ops::TailRopeTable rope;
-#else
-    TailRope rope;
-#endif
     std::unique_ptr<Engram> engram;
 
     bool kv_source() const noexcept { return config.is_kv_source(layer); }
@@ -544,20 +501,13 @@ struct Block final {
     std::vector<DenseTensor*> graph_warmup_state() { return {}; }
 
     MhcResult collapse(const DenseTensor &residual, const DenseTensor &previous_pre,
-#ifdef TYLOINFER_NATIVE_CUDA
                        const ::tyloi::Tensor &function_tensor, const ::tyloi::Tensor &scale_tensor,
                        const ::tyloi::Tensor &base_tensor, const ::tyloi::Tensor &norm_tensor, const char *profile) const {
-#else
-                       const DenseTensor &function, const DenseTensor &scale, const DenseTensor &base,
-                       const DenseTensor &norm, const char *profile) const {
-#endif
         return tyloi::ops::measure(profile, [&]() {
-#ifdef TYLOINFER_NATIVE_CUDA
             const auto& function = function_tensor.dense();
             const auto& scale = scale_tensor.dense();
             const auto& base = base_tensor.dense();
             const auto& norm = norm_tensor.dense();
-#endif
             if(residual.size(0)*residual.size(1)<=8) {
                 auto partials=deepseek_v41_hc_project_cuda(residual,previous_pre,function);
                 auto result=deepseek_v41_hc_finalize_cuda(residual,previous_pre,norm,partials,scale,base,
@@ -595,11 +545,7 @@ struct Block final {
             layer_state, tokens, position, ratio,
             [&] {
                 return weighted_rms(tyloi::ops::project(input, compressor_key_value).dense(),
-#ifdef TYLOINFER_NATIVE_CUDA
                                     compressor_norm,
-#else
-                                    compressor_norm,
-#endif
                                     config.rms_eps);
             },
             [&] {
@@ -621,11 +567,7 @@ struct Block final {
                                         .reshape({batch, complete, ratio, config.head_dim});
                 auto pooled = (kv_groups * ::tyloi::cuda::softmax(score_groups, 2)).sum(2);
                 return weighted_rms(pooled.to(::tyloi::kFloat16),
-#ifdef TYLOINFER_NATIVE_CUDA
                                     compressor_norm,
-#else
-                                    compressor_norm,
-#endif
                                     config.rms_eps);
             },
             [&](int64_t cutoff, int64_t remainder) {
@@ -643,11 +585,7 @@ struct Block final {
                     (layer_state.partial_kv * ::tyloi::cuda::softmax(layer_state.partial_score, 1))
                         .sum(1, true);
                 return weighted_rms(pooled.to(::tyloi::kFloat16),
-#ifdef TYLOINFER_NATIVE_CUDA
                                     compressor_norm,
-#else
-                                    compressor_norm,
-#endif
                                     config.rms_eps);
             },
             [](const auto &emitted) { return ::tyloi::cuda::cat(emitted, 1).contiguous(); });
@@ -669,11 +607,7 @@ struct Block final {
                                            latent->options().dtype(::tyloi::kInt64));
             auto index_values =
                 weighted_rms(tyloi::ops::project(*latent, index_key).dense(),
-#ifdef TYLOINFER_NATIVE_CUDA
                              index_key_norm, config.rms_eps);
-#else
-                             index_key_norm, config.rms_eps);
-#endif
             index_values = rotate_token_major_tail(index_values, group_positions, rope);
             index_values = dsv4_fp4_sim_cuda(index_values.contiguous());
             auto compressed = rotate_token_major_tail(*latent, group_positions, rope);
@@ -713,12 +647,8 @@ struct Block final {
                         .reshape({batch, tokens, config.index_n_heads, config.index_head_dim})
                         .transpose(1, 2)
                         .contiguous();
-#ifdef TYLOINFER_NATIVE_CUDA
                 auto rotated = ::tyloi::ops::tail_rope(query, positions, rope);
                 query = rotated.dense()
-#else
-                query = rope.forward(query, positions, false)
-#endif
                             .transpose(1, 2)
                             .contiguous();
                 query = dsv4_fp4_sim_cuda(query.to(::tyloi::kFloat16).contiguous());
@@ -767,11 +697,7 @@ struct Block final {
             kv_source(), ratio,
             [&] {
                 return weighted_rms(tyloi::ops::project(input, query_a).dense(),
-#ifdef TYLOINFER_NATIVE_CUDA
                                     query_a_norm,
-#else
-                                    query_a_norm,
-#endif
                                     config.rms_eps);
             },
             [&](DenseTensor q_rank) {
@@ -780,22 +706,14 @@ struct Block final {
                                  .transpose(1, 2)
                                  .contiguous()
                                  .to(::tyloi::kFloat32);
-#ifdef TYLOINFER_NATIVE_CUDA
                 auto rotated = ::tyloi::ops::tail_rope(query, positions, rope);
                 query = rotated.dense();
-#else
-                query = rope.forward(query, positions, false);
-#endif
 
                 return query;
             },
             [&] {
                 auto local = weighted_rms(tyloi::ops::project(input, key_value).dense(),
-#ifdef TYLOINFER_NATIVE_CUDA
                                           key_value_norm,
-#else
-                                          key_value_norm,
-#endif
                                           config.rms_eps)
                                  .reshape({batch, tokens, config.head_dim});
                 local = rotate_token_major_tail(local, positions, rope);
@@ -883,26 +801,15 @@ struct Block final {
                 return plan;
             },
             [&](DenseTensor query, DenseTensor cache, const auto &plan) {
-#ifdef TYLOINFER_NATIVE_CUDA
                 return tyloi::ops::sparse_attention(
                            query, cache, plan.at(0), plan.at(1), sinks,
                            1.0 / std::sqrt(static_cast<double>(config.head_dim)))
                     .dense();
-#else
-                return attention_dsv4_sparse_cuda(
-                    query, cache, plan.at(0), plan.at(1),
-                    sinks, shared.attention_meta,
-                    1.0 / std::sqrt(static_cast<double>(config.head_dim)));
-#endif
             },
             [&](DenseTensor attended) {
-#ifdef TYLOINFER_NATIVE_CUDA
                 auto value = attended.transpose(1, 2).contiguous();
                 auto rotated = ::tyloi::ops::tail_rope(value, positions, rope, true);
                 return rotated.dense()
-#else
-                return rope.forward(attended.transpose(1, 2).contiguous(), positions, true)
-#endif
                     .transpose(1, 2)
                     .contiguous();
             },
@@ -959,17 +866,9 @@ struct Block final {
         auto output = tyloi::ops::measure("deepseek_v41.mlp", [&] {
             const auto& value = ffn_mix.branch;
             if(shared.image_mask.defined()) {
-#ifdef TYLOINFER_NATIVE_CUDA
                 TYLOINFER_RUNTIME_CHECK(vision_router_bias && vision_router_bias.defined(),"DeepSeek-V4.1 visual router bias is missing");
-#else
-                TYLOINFER_RUNTIME_CHECK(vision_router_bias.defined(),"DeepSeek-V4.1 visual router bias is missing");
-#endif
                 TYLOINFER_RUNTIME_CHECK(mlp.moe_router_bias, "DeepSeek-V4.1 router bias is missing");
-#ifdef TYLOINFER_NATIVE_CUDA
                 auto bias=::tyloi::cuda::where(shared.routing_mask,vision_router_bias.dense(),mlp.moe_router_bias.dense()).contiguous();
-#else
-                auto bias=::tyloi::cuda::where(shared.routing_mask,vision_router_bias,mlp.moe_router_bias.dense()).contiguous();
-#endif
                 return mlp.forward(
                     value.reshape({-1,config.hidden}), layer_state.current_ids, bias)
                     .reshape({batch,tokens,config.hidden});
@@ -1053,11 +952,7 @@ struct Model : tyloi::models::CausalModel {
     tyloi::ModelGraph graph;
     ::tyloi::models::Plan plan;
     ::tyloi::Tensor embed;
-#ifdef TYLOINFER_NATIVE_CUDA
     ::tyloi::Tensor output_norm;
-#else
-    ::tyloi::DenseTensor output_norm;
-#endif
     ::tyloi::Tensor lm_head;
     CausalConfig config;
     std::vector<std::unique_ptr<deepseek_v41_runtime::Block>> blocks;
@@ -1085,11 +980,7 @@ struct Model : tyloi::models::CausalModel {
 
     // ---- family adapters (implementations in ops.cpp)
     ::tyloi::DenseTensor normalize_hidden(::tyloi::DenseTensor hidden,
-#ifdef TYLOINFER_NATIVE_CUDA
                                           const ::tyloi::Tensor& output_norm, std::int64_t batch,
-#else
-                                          const ::tyloi::DenseTensor& output_norm, std::int64_t batch,
-#endif
                                           std::int64_t tokens) const;
     ::tyloi::DenseTensor prepare_hidden(::tyloi::DenseTensor hidden, std::int64_t batch,
                                                 std::int64_t tokens) const;

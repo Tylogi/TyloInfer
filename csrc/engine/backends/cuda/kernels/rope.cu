@@ -18,9 +18,7 @@
 #include <mutex>
 #include <tuple>
 #include <type_traits>
-#ifdef TYLOINFER_NATIVE_CUDA_RUNTIME
 #include "kernel_dispatch_trace.h"
-#endif
 
 constexpr int ROPE_BD = 256;
 
@@ -40,11 +38,7 @@ __device__ float2 normalized_rotary_angles(const void* positions,bool wide_posit
     if(axis>=axes)axis=0;
     const int64_t index=(int64_t(axis)*batches+(batches==1?0:batch))*tokens+token;
     const int64_t raw_position=rotary_position(positions,wide_positions,index);
-#ifdef TYLOINFER_NATIVE_CUDA_RUNTIME
     int position=wide_positions?__double2int_rz(double(raw_position)):int(raw_position);
-#else
-    int position=static_cast<int32_t>(raw_position);
-#endif
     position=max(0,min(maximum-1,position));
     const float angle=__fmul_rn(float(position),frequencies[column]);
     double sine,cosine;
@@ -126,11 +120,7 @@ __global__ void qsa_pool_rotary_cache_kernel(const Value* index,const float* wei
     int64_t raw=rotary_position(positions,wide_positions,int64_t(axis)*tokens+token);
     if constexpr(!Compact)raw+=start-cache[token];
     int position;
-#ifdef TYLOINFER_NATIVE_CUDA
     position=wide_positions?__double2int_rz(double(raw)):int(raw);
-#else
-    position=int(raw);
-#endif
     position=max(0,min(rotary_maximum-1,position));
     const float angle=__fmul_rn(float(position),frequencies[column]);
     double wide_sine,wide_cosine;
@@ -397,11 +387,9 @@ bool shared_rotary_angles_enabled(const void* function,int threads,int64_t rows)
     rotary_shared_angles_kernel<<<blocks,32,0,mfq_current_cuda_stream()>>>(p,
         reinterpret_cast<float2*>(angles.data_ptr<float>()),count);
     TYLOINFER_CUDA_KERNEL_LAUNCH_CHECK();
-#ifdef TYLOINFER_NATIVE_CUDA_RUNTIME
     if(tyloi::cuda::dispatch_trace::enabled())tyloi::cuda::dispatch_trace::record(mfq_current_cuda_stream(),
         "rotary_shared_angles",reinterpret_cast<const void*>(rotary_shared_angles_kernel),
         "tokens="+std::to_string(p.tokens)+" batches="+std::to_string(p.batches)+" pairs="+std::to_string(p.pairs));
-#endif
     return angles;
 }
 
@@ -434,11 +422,9 @@ void launch_rotary_normalized(const RotaryNormalizedProjection& p) {
         p.axes,p.batches,p.maximum,p.eps,p.layout,p.key_cache,p.cache_positions,p.wide_cache_positions,
         p.capacity,p.projected_value,p.float_value,p.value_layout,p.value_cache,p.rotations,p.attention_factor);
         TYLOINFER_CUDA_KERNEL_LAUNCH_CHECK();
-#ifdef TYLOINFER_NATIVE_CUDA_RUNTIME
         if(tyloi::cuda::dispatch_trace::enabled())tyloi::cuda::dispatch_trace::record(mfq_current_cuda_stream(),
             "rotary_normalized_cached",reinterpret_cast<const void*>(function),
             "fused_reduction="+std::to_string(Fused)+" width="+std::to_string(p.width)+" attention_factor="+std::to_string(p.attention_factor));
-#endif
     };
     if(fused_rotary_reduction_enabled())launch(std::true_type{});else launch(std::false_type{});
 }
@@ -450,11 +436,9 @@ void launch_rotary_normalized_grouped(const RotaryNormalizedGroup& group,unsigne
         const auto function=rotary_normalized_grouped_kernel<Value,Fused>;
         function<<<rows,threads,0,mfq_current_cuda_stream()>>>(group);
         TYLOINFER_CUDA_KERNEL_LAUNCH_CHECK();
-#ifdef TYLOINFER_NATIVE_CUDA_RUNTIME
         if(tyloi::cuda::dispatch_trace::enabled())tyloi::cuda::dispatch_trace::record(mfq_current_cuda_stream(),
             "rotary_normalized_grouped",reinterpret_cast<const void*>(function),
             "fused_reduction="+std::to_string(Fused)+" rows="+std::to_string(rows)+" attention_factor="+std::to_string(group.entries[0].attention_factor));
-#endif
     };
     if(fused_rotary_reduction_enabled())launch(std::true_type{});else launch(std::false_type{});
 }

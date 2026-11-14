@@ -17,7 +17,6 @@
 
 namespace tyloi::cuda::minicpmo45 {
 
-#ifdef TYLOINFER_NATIVE_CUDA
 tyloi::models::Info Model::info() const {
     return tyloi::models::model_info(metadata);
 }
@@ -32,7 +31,6 @@ tyloi::engine::Metrics Model::metrics() const {
             {"mtp_declared", double(graph.has_component("predictor"))},
             {"mtp_supported", 0.0}, {"mtp_available", 0.0}};
 }
-#endif
 
 Model read(std::shared_ptr<const tyloi::ModelSource> source, std::string_view definition, int64_t context) {
     validate_model_source(*source);
@@ -110,7 +108,6 @@ void load(Model& model, const tyloi::weights::Loader& weights, const LayerPlacem
     }
 }
 
-#ifdef TYLOINFER_NATIVE_CUDA
 void load(std::unique_ptr<tyloi::models::CausalModel>& owner, std::shared_ptr<const tyloi::ModelSource> source,
         std::string_view definition, const tyloi::weights::Loader& weights,
         LayerPlacementConfig& placement, const tyloi::models::LoadOptions& options) {
@@ -124,6 +121,5 @@ void load(std::unique_ptr<tyloi::models::CausalModel>& owner, std::shared_ptr<co
         throw std::runtime_error("--n-gpu-layers cannot be combined with tensor/expert/layer parallelism");
     load(*model, weights, placement, cpu_layers, options.yarn);
 }
-#endif
 
 } // namespace tyloi::cuda::minicpmo45

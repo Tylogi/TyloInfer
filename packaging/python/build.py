@@ -65,6 +65,15 @@ def collect_cuda_sources(repository: Path, project: Path, files: tuple[Path, ...
         shutil.copy2(source, destination)
 
 
+def collect_tq_sources(repository: Path, project: Path) -> None:
+    kernels = repository / 'csrc/engine/backends/cuda/kernels'
+    resources = project / 'tyloinfer/kernels/cuda'
+    resources.mkdir(parents=True, exist_ok=True)
+    for source in (kernels / 'tq_ops.cu', kernels / 'tq_ops.h',
+                   *sorted(kernels.glob('tq_*.cuh'))):
+        shutil.copy2(source, resources / source.name)
+
+
 def build_wheel(output_dir: Path) -> Path:
     """Build a wheel after staging the shared CUDA source closure."""
     repository = Path(__file__).resolve().parents[2]
@@ -80,13 +89,19 @@ def build_wheel(output_dir: Path) -> Path:
             ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
         )
 
-        kernels = repository / "csrc/engine/backends/cuda/kernels"
-        resources = project / "tyloinfer/kernels/cuda"
-        for source in (kernels / "tq_ops.cu", kernels / "tq_ops.h",
-                       *sorted(kernels.glob("tq_*.cuh"))):
-            shutil.copy2(source, resources / source.name)
-
+        collect_tq_sources(repository, project)
         collect_cuda_sources(repository, project, files)
+        package = repository / 'tyloinfer/kernels/cuda'
+        resources = project / 'tyloinfer/kernels/cuda'
+        included = {
+            source.relative_to(repository) if source.is_relative_to(package) else
+            Path('tyloinfer/kernels/cuda/_src') / source.relative_to(repository)
+            for source in files
+        }
+        included.update(source.relative_to(project) for source in (
+            resources / 'tq_ops.cu', resources / 'tq_ops.h', *resources.glob('tq_*.cuh')))
+        (project / 'MANIFEST.in').write_text(
+            ''.join(f'include {path.as_posix()}\n' for path in sorted(included)), encoding='utf-8')
 
         artifacts = Path(temporary) / "dist"
         subprocess.run(

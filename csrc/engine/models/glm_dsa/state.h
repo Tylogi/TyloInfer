@@ -1,9 +1,7 @@
 #pragma once
 
 #include "engine/models/session/snapshot.h"
-#ifdef TYLOINFER_NATIVE_CUDA
 #include "engine/models/state.h"
-#endif
 #include <cstdint>
 #include <map>
 #include <vector>
@@ -16,9 +14,7 @@ struct LayerState { DenseTensor kv_cache, index_cache; };
 struct Selection { DenseTensor topk_indices; int64_t dense_prefix_rows = 0; };
 
 class State
-#ifdef TYLOINFER_NATIVE_CUDA
     : public tyloi::models::State
-#endif
 {
 public:
     explicit State(const Model&);
@@ -31,16 +27,11 @@ public:
     void advance(int64_t tokens) noexcept { cache_pos += tokens; }
     void set_position_delta(int64_t delta) noexcept { decode_position_delta = delta; }
     void preallocate() {}
-#ifdef TYLOINFER_NATIVE_CUDA
     // Plans ordinary forward allocations; other execution paths plan separately.
     std::vector<std::pair<tyloi::Device, std::size_t>> growth(
         const tyloi::models::Input& input, const tyloi::models::ForwardOptions& options) const override;
     std::vector<::tyloi::Tensor> storage() const;
     std::vector<::tyloi::Tensor*> graph_state() { return {}; }
-#else
-    std::vector<DenseTensor> storage() const;
-    std::vector<DenseTensor*> graph_state() { return {}; }
-#endif
     TextSessionStateKind text_session_state_kind() const;
     bool supports_text_session_state() const;
     bool supports_paged_text_session_state() const { return false; }

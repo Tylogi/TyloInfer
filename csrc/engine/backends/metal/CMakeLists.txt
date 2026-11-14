@@ -546,13 +546,13 @@ target_compile_features(tyloinfer-metal-cached-kernel-test PRIVATE cxx_std_20)
 set_target_properties(tyloinfer-metal-cached-kernel-test PROPERTIES BUILD_RPATH "${TYLOINFER_MLX_ROOT}/lib")
 add_test(NAME tyloinfer-metal-cached-kernel-test COMMAND tyloinfer-metal-cached-kernel-test)
 endif()
-target_include_directories(mfq-metal-runtime PUBLIC
+target_include_directories(mfq-metal-runtime PRIVATE
     ${TYLOINFER_METAL_INCLUDE_DIRS}
 )
 target_include_directories(mfq-metal-runtime PRIVATE
     ${CMAKE_CURRENT_BINARY_DIR}
 )
-target_link_libraries(mfq-metal-runtime PUBLIC
+target_link_libraries(mfq-metal-runtime PRIVATE
     mfq-metal-ops
     mfq-core
     mfq-models
@@ -569,10 +569,8 @@ target_link_libraries(mfq-metal-runtime PUBLIC
 )
 target_link_libraries(mfq-metal-runtime PRIVATE mfq-json)
 target_compile_features(mfq-metal-runtime PUBLIC cxx_std_20)
-target_compile_definitions(mfq-metal-runtime PUBLIC
-    TYLOINFER_NATIVE_MLX_RUNTIME=1
-    TYLOINFER_MLX_METALLIB_DEFAULT="${TYLOINFER_MLX_METALLIB_DEFAULT}"
-)
+target_compile_definitions(mfq-metal-runtime PRIVATE
+    TYLOINFER_ENABLE_MFQ_COMPAT=$<BOOL:${TYLOINFER_ENABLE_MFQ_COMPAT}>)
 
 function(tyloinfer_add_metal_format target)
     add_library(${target} OBJECT ${ARGN})
@@ -580,7 +578,8 @@ function(tyloinfer_add_metal_format target)
         ${TYLOINFER_METAL_INCLUDE_DIRS} ${CMAKE_CURRENT_BINARY_DIR})
     target_link_libraries(${target} PRIVATE mfq-core mfq-models mfq-engine mfq-mlx mfq-json)
     target_compile_features(${target} PRIVATE cxx_std_20)
-    target_compile_definitions(${target} PRIVATE TYLOINFER_NATIVE_MLX_RUNTIME=1)
+    target_compile_definitions(${target} PRIVATE
+        TYLOINFER_ENABLE_MFQ_COMPAT=$<BOOL:${TYLOINFER_ENABLE_MFQ_COMPAT}>)
     target_sources(mfq-metal-runtime PRIVATE $<TARGET_OBJECTS:${target}>)
 endfunction()
 
@@ -658,6 +657,10 @@ add_library(mfq-metal-engine STATIC
     ${PROJECT_SOURCE_DIR}/backends/metal/runtime/mlx_dflash2_serving.cpp
 )
 target_link_libraries(mfq-metal-engine PUBLIC mfq-metal-runtime mfq-engine)
+target_include_directories(mfq-metal-engine PRIVATE ${TYLOINFER_METAL_INCLUDE_DIRS})
+target_link_libraries(mfq-metal-engine PRIVATE mfq-mlx)
+target_compile_definitions(mfq-metal-engine PRIVATE
+    TYLOINFER_ENABLE_MFQ_COMPAT=$<BOOL:${TYLOINFER_ENABLE_MFQ_COMPAT}>)
 target_compile_features(mfq-metal-engine PUBLIC cxx_std_20)
 
 add_executable(mfq-metal-engine-test ${PROJECT_SOURCE_DIR}/backends/metal/tests/mlx_engine_test.cpp)
@@ -676,7 +679,12 @@ add_executable(mfq-decode-metal
 add_dependencies(mfq-decode-metal mfq-avfoundation-video)
 target_link_libraries(mfq-decode-metal PRIVATE
     mfq-metal-runtime
+    mfq-mlx
 )
+target_include_directories(mfq-decode-metal PRIVATE ${TYLOINFER_METAL_INCLUDE_DIRS})
+target_compile_definitions(mfq-decode-metal PRIVATE
+    TYLOINFER_ENABLE_MFQ_COMPAT=$<BOOL:${TYLOINFER_ENABLE_MFQ_COMPAT}>
+    TYLOINFER_MLX_METALLIB_DEFAULT="${TYLOINFER_MLX_METALLIB_DEFAULT}")
 target_compile_features(mfq-decode-metal PRIVATE cxx_std_20)
 target_link_options(mfq-decode-metal PRIVATE -Wl,-dead_strip)
 
@@ -720,6 +728,8 @@ target_include_directories(mfq-metal-source-export PRIVATE
     "${CMAKE_CURRENT_BINARY_DIR}/ops/gguf/native"
     "${PROJECT_SOURCE_DIR}/backends/metal/runtime" "${TYLOINFER_METAL_ROOT}/ops/common" "${TYLOINFER_METAL_ROOT}/ops/tq" "${TYLOINFER_METAL_ROOT}/ops/mfq" "${CMAKE_CURRENT_BINARY_DIR}")
 target_compile_features(mfq-metal-source-export PRIVATE cxx_std_20)
+target_compile_definitions(mfq-metal-source-export PRIVATE
+    TYLOINFER_ENABLE_MFQ_COMPAT=$<BOOL:${TYLOINFER_ENABLE_MFQ_COMPAT}>)
 if(TYLOINFER_BUILD_PRECOMPILED_METAL)
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
     execute_process(COMMAND xcrun --find metal OUTPUT_VARIABLE _TYLOINFER_METAL_COMPILER
@@ -1063,8 +1073,11 @@ add_executable(mfq-metal-qwen35-projection-profile
 )
 target_link_libraries(
     mfq-metal-qwen35-projection-profile PRIVATE
-    mfq-metal-runtime
+    mfq-metal-runtime mfq-mlx
 )
+target_include_directories(mfq-metal-qwen35-projection-profile PRIVATE ${TYLOINFER_METAL_INCLUDE_DIRS})
+target_compile_definitions(mfq-metal-qwen35-projection-profile PRIVATE
+    TYLOINFER_ENABLE_MFQ_COMPAT=$<BOOL:${TYLOINFER_ENABLE_MFQ_COMPAT}>)
 target_compile_features(
     mfq-metal-qwen35-projection-profile PRIVATE cxx_std_20
 )
@@ -1080,8 +1093,12 @@ add_executable(mfq-metal-qwen35-decode-overhead-profile
 )
 target_link_libraries(
     mfq-metal-qwen35-decode-overhead-profile PRIVATE
-    mfq-metal-runtime
+    mfq-metal-runtime mfq-mlx
 )
+target_include_directories(mfq-metal-qwen35-decode-overhead-profile PRIVATE ${TYLOINFER_METAL_INCLUDE_DIRS})
+target_compile_definitions(mfq-metal-qwen35-decode-overhead-profile PRIVATE
+    TYLOINFER_ENABLE_MFQ_COMPAT=$<BOOL:${TYLOINFER_ENABLE_MFQ_COMPAT}>
+    TYLOINFER_MLX_METALLIB_DEFAULT="${TYLOINFER_MLX_METALLIB_DEFAULT}")
 target_compile_features(
     mfq-metal-qwen35-decode-overhead-profile PRIVATE cxx_std_20
 )
@@ -1269,8 +1286,11 @@ add_executable(mfq-metal-ssd-expert-real-smoke
 )
 target_link_libraries(
     mfq-metal-ssd-expert-real-smoke PRIVATE
-    mfq-metal-runtime
+    mfq-metal-runtime mfq-mlx
 )
+target_include_directories(mfq-metal-ssd-expert-real-smoke PRIVATE ${TYLOINFER_METAL_INCLUDE_DIRS})
+target_compile_definitions(mfq-metal-ssd-expert-real-smoke PRIVATE
+    TYLOINFER_ENABLE_MFQ_COMPAT=$<BOOL:${TYLOINFER_ENABLE_MFQ_COMPAT}>)
 target_compile_features(
     mfq-metal-ssd-expert-real-smoke PRIVATE cxx_std_20)
 set_target_properties(
@@ -1285,8 +1305,11 @@ add_executable(mfq-metal-ssd-hf-model-smoke
 )
 target_link_libraries(
     mfq-metal-ssd-hf-model-smoke PRIVATE
-    mfq-metal-runtime
+    mfq-metal-runtime mfq-mlx
 )
+target_include_directories(mfq-metal-ssd-hf-model-smoke PRIVATE ${TYLOINFER_METAL_INCLUDE_DIRS})
+target_compile_definitions(mfq-metal-ssd-hf-model-smoke PRIVATE
+    TYLOINFER_ENABLE_MFQ_COMPAT=$<BOOL:${TYLOINFER_ENABLE_MFQ_COMPAT}>)
 target_compile_features(
     mfq-metal-ssd-hf-model-smoke PRIVATE cxx_std_20)
 set_target_properties(
@@ -1299,8 +1322,11 @@ add_executable(mfq-metal-ssd-hf-prefill-smoke
 )
 target_link_libraries(
     mfq-metal-ssd-hf-prefill-smoke PRIVATE
-    mfq-metal-runtime
+    mfq-metal-runtime mfq-mlx
 )
+target_include_directories(mfq-metal-ssd-hf-prefill-smoke PRIVATE ${TYLOINFER_METAL_INCLUDE_DIRS})
+target_compile_definitions(mfq-metal-ssd-hf-prefill-smoke PRIVATE
+    TYLOINFER_ENABLE_MFQ_COMPAT=$<BOOL:${TYLOINFER_ENABLE_MFQ_COMPAT}>)
 target_compile_features(
     mfq-metal-ssd-hf-prefill-smoke PRIVATE cxx_std_20)
 set_target_properties(

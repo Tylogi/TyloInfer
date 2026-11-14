@@ -9,12 +9,6 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(TYLOINFER_REPOSITORY_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/..")
 
 option(TYLOINFER_ENABLE_MFQ_COMPAT "Include legacy MFQ inference formats" OFF)
-if(TYLOINFER_ENABLE_MFQ_COMPAT)
-    add_compile_definitions(TYLOINFER_ENABLE_MFQ_COMPAT=1)
-else()
-    add_compile_definitions(TYLOINFER_ENABLE_MFQ_COMPAT=0)
-endif()
-
 option(
     TYLOINFER_BUILD_METAL_RUNTIME
     "Build the native MLX/Metal runtime on Apple Silicon"

@@ -12,22 +12,13 @@ tyloi::StepSequence<tyloi::models::Prepared> Text<M, S, P>::prepare(InferenceReq
         return components->prepare(input.prompt, *input.vision);
     } else if constexpr (std::is_same_v<Model, nemotron_h::Model>) {
         return components.prepare(language, images,
-#ifndef TYLOINFER_NATIVE_CUDA
-        root_executor.projector(root_executor.mode().ffn, model_parallel_primary_device(load_config)),
-        root_executor.collectives(),
-#endif
         load_config.layer_placement.primary_device(),
-#ifndef TYLOINFER_NATIVE_CUDA
-        executor.get(),
-#endif
         input.prompt, *input.vision);
     }
-#ifdef TYLOINFER_NATIVE_CUDA
     else if constexpr (requires { static_cast<const tyloi::models::CausalModel&>(language); }) {
         const tyloi::models::CausalModel& causal = language;
         return causal.prepare(input.prompt, *input.vision, state);
     }
-#endif
     else throw std::invalid_argument("model has no multimodal component");
 }
 
