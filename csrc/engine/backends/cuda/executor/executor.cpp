@@ -206,7 +206,7 @@ Executor::Executor(Options options, int primary)
 Executor::Executor(ContextSet& contexts, CudaProfiler& profiler, KlMmqState& mmq, const std::shared_ptr<TqExec>& tq,
         Branches& branches, Collectives& collectives, RouteStats& routes,
         const Options& options, Mode& mode, int primary,
-        std::weak_ptr<KvMemoryManager> kv_memory, std::weak_ptr<KvOffloadStore> kv_offload)
+        std::weak_ptr<KvMemoryManager> kv_memory, std::weak_ptr<state::KvOffloadStore> kv_offload)
     : contexts_(contexts), options_(options), mode_(mode), profiler_(profiler), mmq_(mmq), tq_(tq), branches_(branches),
       collectives_(collectives), routes_(routes), kv_memory_(std::move(kv_memory)),
       kv_offload_(std::move(kv_offload)), primary_(primary) {}
@@ -294,7 +294,7 @@ std::unique_ptr<Executor> Executor::fork(int primary) const {
         collectives_, routes_, options_, mode_, primary, kv_memory_, kv_offload_));
 }
 
-void Executor::configure_kv(std::shared_ptr<KvMemoryManager> memory, std::shared_ptr<KvOffloadStore> offload) {
+void Executor::configure_kv(std::shared_ptr<KvMemoryManager> memory, std::shared_ptr<state::KvOffloadStore> offload) {
     if (owned_contexts_) {
         owned_kv_memory_ = memory;
         owned_kv_offload_ = offload;
@@ -316,7 +316,7 @@ void Executor::init_kv() {
     config.buffer_bytes = std::min<std::size_t>(config.buffer_bytes, config.gpu_budget_bytes / 4);
     config.directory = options.directory;
     config.device = Device(kCUDA, primary_);
-    configure_kv({}, std::make_shared<KvOffloadStore>(std::move(config)));
+    configure_kv({}, std::make_shared<state::KvOffloadStore>(std::move(config)));
 }
 
 void Executor::finalize_kv(tyloi::weights::Cache& weights) {
@@ -342,7 +342,7 @@ tyloi::engine::Metrics Executor::metrics() const {
     return result;
 }
 
-std::shared_ptr<KvOffloadStore> Executor::kv_offload() const {
+std::shared_ptr<state::KvOffloadStore> Executor::kv_offload() const {
     if (auto offload = kv_offload_.lock()) return offload;
     if (auto memory = kv_memory_.lock()) return memory->offload();
     return {};

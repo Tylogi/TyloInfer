@@ -53,9 +53,9 @@ class QsaCore {
                     model.c_.maximum<=model.c_.budget?model.c_.maximum:model.c_.budget+model.c_.pool-1);
             else offload = executor.kv_offload();
             if(offload) {
-                offloaded_kv=std::make_unique<KvOffloadSequence>(offload,model.c_.kv_heads*(model.key_width()+model.value_width()),model.c_.pool,model.cache_dtype());
-                offloaded_index=std::make_unique<KvOffloadSequence>(offload,model.c_.index_width,model.c_.pool);
-                offloaded_pooled=std::make_unique<KvOffloadSequence>(offload,model.c_.index_width,16);
+                offloaded_kv=std::make_unique<state::KvOffloadSequence>(offload,model.c_.kv_heads*(model.key_width()+model.value_width()),model.c_.pool,model.cache_dtype());
+                offloaded_index=std::make_unique<state::KvOffloadSequence>(offload,model.c_.index_width,model.c_.pool);
+                offloaded_pooled=std::make_unique<state::KvOffloadSequence>(offload,model.c_.index_width,16);
             }
         }
         State(const State&) = delete;
@@ -63,8 +63,8 @@ class QsaCore {
         State(State&&) = default;
         State& operator=(State&&) = default;
         SequenceCache keys,values,index;
-        std::shared_ptr<KvOffloadStore> offload;
-        std::unique_ptr<KvOffloadSequence> offloaded_kv,offloaded_index,offloaded_pooled;
+        std::shared_ptr<state::KvOffloadStore> offload;
+        std::unique_ptr<state::KvOffloadSequence> offloaded_kv,offloaded_index,offloaded_pooled;
         ::tyloi::Tensor graph_keys,graph_values,graph_pooled,graph_index;
         std::shared_ptr<KvMemoryAllocation> memory;
         bool graph_prepared=false;
@@ -91,7 +91,7 @@ class QsaCore {
         request.graph_pooled=request.memory->pooled;
         if(request.memory->offload) {
             request.offload=request.memory->offload;
-            if(!request.offloaded_kv)request.offloaded_kv=std::make_unique<KvOffloadSequence>(request.offload,
+            if(!request.offloaded_kv)request.offloaded_kv=std::make_unique<state::KvOffloadSequence>(request.offload,
                 c_.kv_heads*(key_width()+value_width()),c_.pool,cache_dtype());
         } else {request.graph_keys=request.memory->keys;request.graph_values=request.memory->values;}
     }
@@ -774,7 +774,7 @@ class QsaCore {
         TYLOINFER_RUNTIME_CHECK(window && selected.size(1)<=8,"streamed QSA requires a decode window of at most eight rows");
         struct Stage {
             DenseTensor raw,host_ids,ids;
-            std::shared_ptr<KvOffloadStore::GatherWorkspace> gather;
+            std::shared_ptr<::tyloi::ops::KvGatherWorkspace> gather;
         };
         const auto tokens=selected.size(1),columns=selected.size(2);
         const auto key_row=c_.kv_heads*key_width(),value_row=c_.kv_heads*value_width();

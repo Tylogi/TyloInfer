@@ -163,7 +163,7 @@ void KvMemoryManager::finalize(tyloi::weights::Cache& cache, std::size_t minimum
                 const auto rows=8*a->selected_columns,width=a->layout.heads*(a->layout.key_width+a->layout.value_width);
                 const auto key=std::make_tuple(rows,width,int(a->options.scalar_type()),a->layout.heads,a->layout.key_width);
                 if(gather_layouts.insert(key).second)
-                    add(device,KvOffloadStore::gather_layout(rows,width,
+                    add(device,state::KvOffloadStore::gather_layout(rows,width,
                         a->options.scalar_type(),a->layout.heads,a->layout.key_width).gpu_bytes());
             }
         }
@@ -201,7 +201,7 @@ void KvMemoryManager::finalize(tyloi::weights::Cache& cache, std::size_t minimum
         <<" message=KV may spill to SSD; long-context latency and disk usage will increase\n";
     if(offload_config) {
         offload_config->device=device;
-        offload_=std::make_shared<KvOffloadStore>(std::move(*offload_config));
+        offload_=std::make_shared<state::KvOffloadStore>(std::move(*offload_config));
     }
     ResidentAllocationScope resident;
     if(tiered_budget && !options_.additional_request && !options_.dynamic && setting("TYLOINFER_KV_EXPERT_LOAN",1)) {

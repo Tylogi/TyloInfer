@@ -133,7 +133,7 @@ void KvMemoryAllocation::ensure(int64_t tokens) {
 }
 
 void KvMemoryAllocation::materialize(const engine::KvOptions& policy, const engine::KvPlacement& placement,
-        std::shared_ptr<KvOffloadStore> store, weights::Cache* lending) {
+        std::shared_ptr<state::KvOffloadStore> store, weights::Cache* lending) {
     const auto cells = placement.cells;
     const auto shape=[&](int64_t w){return std::vector<int64_t>{1,layout.heads,layout.maximum,w};};
     auto index_options=options;index_options.dtype(::tyloi::kFloat16);

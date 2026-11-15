@@ -4,6 +4,7 @@
 #include "engine/executor.h"
 #include "engine/requests/constraint.h"
 #include "engine/state/kv_view.h"
+#include "engine/ops/kv_storage.h"
 
 #include <cstdint>
 #include <array>

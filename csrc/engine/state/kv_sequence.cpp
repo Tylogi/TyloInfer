@@ -8,7 +8,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace tyloi::cuda {
+namespace tyloi::state {
 namespace {
 Tensor indices(const std::vector<int64_t>& values, Device device) {
     auto host = ::tyloi::ops::empty({static_cast<int64_t>(values.size())},
@@ -40,7 +40,7 @@ void KvOffloadSequence::reset() { blocks_.clear(); position_ = 0; options_ = {};
 
 void KvOffloadSequence::append(const Tensor& source) {
     const auto device = store_->config().device;
-    if (!(device.is_metal() ? source.device() == device : source.is_cuda()) || source.is_encoded() ||
+    if (source.device() != device || source.is_encoded() ||
         source.dim() != 2 || source.size(1) != width_ || source.size(0) <= 0)
         throw std::invalid_argument("invalid CUDA KV rows");
     const auto offset = position_;
@@ -110,4 +110,4 @@ Tensor KvOffloadSequence::range(int64_t start, int64_t count) const {
     }
     return result;
 }
-} // namespace tyloi::cuda
+} // namespace tyloi::state

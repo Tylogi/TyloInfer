@@ -1,9 +1,7 @@
 #include "engine/state/paged_kv.h"
 
-#if TYLOINFER_HAS_CUDA
-#include "engine/backends/cuda/native/tensor/backend.h"
-#include <cuda_runtime_api.h>
-#endif
+#include "engine/ops.h"
+#include "engine/ops/kv_storage.h"
 
 #include <algorithm>
 #include <array>
@@ -33,16 +31,14 @@ void add_growth(PagedKv::Growth& growth, Device device, std::size_t bytes) {
         found->second += bytes;
     }
 }
-Tensor metal_table(std::vector<std::int32_t>& data, std::int64_t rows, std::int64_t columns) {
+Tensor host_table(std::vector<std::int32_t>& data, std::int64_t rows, std::int64_t columns) {
     const std::array<std::int64_t, 2> shape{rows, columns};
     const Device cpu{DeviceType::cpu, 0};
     auto storage = std::make_shared<TensorStorage>();
     storage->base = data.data();
     storage->bytes = data.size() * sizeof(std::int32_t);
     storage->device = cpu;
-    Tensor host{DenseTensor(std::move(storage), make_contiguous_view(data.data(), shape, kInt32, cpu))};
-    // Relocation copies the borrowed host bytes before this view is released.
-    return host.relocated(Device{DeviceType::metal, 0});
+    return Tensor{DenseTensor(std::move(storage), make_contiguous_view(data.data(), shape, kInt32, cpu))};
 }
 }
 
@@ -161,15 +157,12 @@ PagedKv::PagedKv(const std::vector<Layout>& layouts, int64_t context,
         const auto device_key = std::pair{device.type, device.index};
         if (!device_page_tables_.contains(device_key)) {
             if (device.is_metal()) {
-                device_page_tables_.emplace(device_key, metal_table(host_page_table_, maximum_sequences_, logical_pages_per_sequence_));
+                device_page_tables_.emplace(device_key, host_table(host_page_table_, maximum_sequences_, logical_pages_per_sequence_).relocated(Device{DeviceType::metal, 0}));
             } else {
-#if TYLOINFER_HAS_CUDA
-                MfqCudaGuard guard(device.index);
-                auto page_table = ::tyloi::cuda::empty({maximum_sequences_, logical_pages_per_sequence_},
+                auto page_table = ops::empty({maximum_sequences_, logical_pages_per_sequence_},
                     TensorOptions().device(device).dtype(kInt32));
-                page_table.fill_(-1);
+                ops::fill(page_table, -1);
                 device_page_tables_.emplace(device_key, std::move(page_table));
-#endif
             }
         }
         Pool pool;
@@ -180,14 +173,11 @@ PagedKv::PagedKv(const std::vector<Layout>& layouts, int64_t context,
             ? kv_packed_width(int(head_dim), layout.quantization.value_bits()) : head_dim;
         pool.dtype = layout.quantization.enabled()
             ? (device.is_metal() ? ScalarType::uint32 : kInt32) : kFloat16;
-#if TYLOINFER_HAS_CUDA
         if (device.is_cuda()) {
-            MfqCudaGuard guard(device.index);
             auto options = TensorOptions().device(device).dtype(kInt64);
-            pool.k_chunk_ptrs = ::tyloi::cuda::zeros({maximum_chunks}, options);
-            pool.v_chunk_ptrs = ::tyloi::cuda::zeros({maximum_chunks}, options);
+            pool.k_chunk_ptrs = ops::zeros({maximum_chunks}, options);
+            pool.v_chunk_ptrs = ops::zeros({maximum_chunks}, options);
         }
-#endif
         layers_.push_back(std::move(pool));
     }
     require(!layers_.empty(),
@@ -276,19 +266,12 @@ void PagedKv::update(const std::vector<const Sequence*>& sequences) {
             host_page_table_[row * row_width + logical_page] = physical;
         }
     }
-    const size_t bytes = rows * row_width * sizeof(std::int32_t);
     for (auto & [device, table] : device_page_tables_) {
         if (device.first == DeviceType::metal) {
-            table = metal_table(host_page_table_, maximum_sequences_, logical_pages_per_sequence_);
+            table = host_table(host_page_table_, maximum_sequences_, logical_pages_per_sequence_).relocated(Device{DeviceType::metal, 0});
         } else {
-#if TYLOINFER_HAS_CUDA
-            MfqCudaGuard guard(device.second);
-            const auto stream = mfq_get_current_cuda_stream();
-            TYLOINFER_CUDA_CHECK(cudaMemcpyAsync(
-                table.dense().data_ptr<std::int32_t>(), host_page_table_.data(),
-                bytes, cudaMemcpyHostToDevice, stream));
-            TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(stream));
-#endif
+            auto target = Tensor{table.dense().narrow(0, 0, static_cast<int64_t>(rows))};
+            ops::copy_into(target, host_table(host_page_table_, static_cast<int64_t>(rows), logical_pages_per_sequence_));
         }
     }
     page_table_updates_metric_.fetch_add(1, std::memory_order_relaxed);
@@ -390,14 +373,11 @@ void PagedKv::ensure_storage(size_t required_pages) {
                     chunk.storage = allocate_kv(1, layer.layout.heads, capacity, layer.layout.head_dim,
                         false, layer.layout.device, kFloat16, layer.layout.quantization);
             } else {
-#if TYLOINFER_HAS_CUDA
-                MfqCudaGuard guard(layer.layout.device.index);
                 auto options = TensorOptions().device(layer.layout.device).dtype(layer.dtype);
-                chunk.k = ::tyloi::cuda::empty(
+                chunk.k = ops::empty(
                     {static_cast<int64_t>(chunk_pages), layer.layout.heads, kPageSize, layer.key_width}, options);
-                chunk.v = ::tyloi::cuda::empty(
+                chunk.v = ops::empty(
                     {static_cast<int64_t>(chunk_pages), layer.layout.heads, kPageSize, layer.value_width}, options);
-#endif
             }
             pending.push_back(std::move(chunk));
         }
@@ -406,19 +386,8 @@ void PagedKv::ensure_storage(size_t required_pages) {
             auto & layer = layers_[index];
             auto & chunk = pending[index];
             if (layer.layout.device.is_cuda()) {
-#if TYLOINFER_HAS_CUDA
-                const int64_t k_pointer = reinterpret_cast<int64_t>(chunk.k.dense().data_ptr());
-                const int64_t v_pointer = reinterpret_cast<int64_t>(chunk.v.dense().data_ptr());
-                MfqCudaGuard guard(layer.layout.device.index);
-                const auto stream = mfq_get_current_cuda_stream();
-                TYLOINFER_CUDA_CHECK(cudaMemcpyAsync(
-                    layer.k_chunk_ptrs.dense().data_ptr<int64_t>() + chunk_index,
-                    &k_pointer, sizeof(k_pointer), cudaMemcpyHostToDevice, stream));
-                TYLOINFER_CUDA_CHECK(cudaMemcpyAsync(
-                    layer.v_chunk_ptrs.dense().data_ptr<int64_t>() + chunk_index,
-                    &v_pointer, sizeof(v_pointer), cudaMemcpyHostToDevice, stream));
-                TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(stream));
-#endif
+                ops::bind_kv_chunk(layer.k_chunk_ptrs, layer.v_chunk_ptrs,
+                    chunk_index, chunk.k, chunk.v);
             }
         }
         for (size_t index = 0; index < layers_.size(); ++index) {

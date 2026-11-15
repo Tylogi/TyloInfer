@@ -24,7 +24,7 @@ struct KvMemoryAllocation {
     state::QsaLayout layout;
     Tensor keys, values, index, pooled;
     TensorOptions options;
-    std::shared_ptr<KvOffloadStore> offload;
+    std::shared_ptr<state::KvOffloadStore> offload;
     HotKvCache hot;
     std::int64_t selected_columns = 0;
     bool host = false, ready = false;
@@ -40,7 +40,7 @@ private:
     std::vector<weights::KvRegion> expert_regions_;
     std::size_t initial_bytes() const;
     void materialize(const engine::KvOptions&, const engine::KvPlacement&,
-        std::shared_ptr<KvOffloadStore>, weights::Cache* lending);
+        std::shared_ptr<state::KvOffloadStore>, weights::Cache* lending);
     friend class KvMemoryManager;
 };
 
@@ -56,7 +56,7 @@ public:
     std::vector<std::pair<Device, std::size_t>> growth(std::int64_t tokens) const;
     void ensure(std::int64_t tokens);
     void bind_budget(engine::Budget* budget) { budget_ = budget; }
-    std::shared_ptr<KvOffloadStore> offload() const { return offload_; }
+    std::shared_ptr<state::KvOffloadStore> offload() const { return offload_; }
     bool dynamic() const { return options_.dynamic; }
     bool ssd_enabled() const { return options_.placement == "auto_ssd"; }
     std::size_t growth_reserve() const;
@@ -66,7 +66,7 @@ public:
 private:
     engine::KvOptions options_;
     std::vector<std::weak_ptr<KvMemoryAllocation>> allocations_;
-    std::shared_ptr<KvOffloadStore> offload_;
+    std::shared_ptr<state::KvOffloadStore> offload_;
     engine::Budget* budget_ = nullptr;
     bool ready_ = false, automatic_ram_ = false;
     weights::Cache* cache_ = nullptr;

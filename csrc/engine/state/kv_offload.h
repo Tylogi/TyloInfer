@@ -1,6 +1,6 @@
 #pragma once
 
-#include "engine/tensor.h"
+#include "engine/ops/kv_storage.h"
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -23,26 +23,20 @@ struct KvOffloadConfig {
     ::tyloi::Device device{::tyloi::DeviceType::cuda, 0};
     std::size_t gpu_hot_bytes() const { return gpu_budget_bytes-buffer_bytes; }
 };
-} // namespace tyloi::state
 
-namespace tyloi::cuda {
 // Immutable microblocks have one native GPU hot copy. Eviction transfers to
 // the shared RAM LRU; only RAM eviction writes the session-owned SSD file.
 class KvOffloadStore {
 public:
     struct Block;
     using BlockPtr = std::shared_ptr<Block>;
-    struct GatherWorkspace {
-        ::tyloi::Tensor rows, upload, host, descriptors, device_descriptors;
-        int64_t heads=1,key_width=0;
-    };
     struct GatherLayout {
         int64_t rows, width, descriptors;
         ::tyloi::ScalarType dtype;
         std::size_t gpu_bytes() const;
     };
     static GatherLayout gather_layout(int64_t rows,int64_t width,::tyloi::ScalarType dtype,int64_t heads=1,int64_t key_width=0);
-    std::shared_ptr<GatherWorkspace> gather_workspace(int64_t rows,int64_t width,::tyloi::ScalarType dtype,int64_t heads=1,int64_t key_width=0);
+    std::shared_ptr<ops::KvGatherWorkspace> gather_workspace(int64_t rows,int64_t width,::tyloi::ScalarType dtype,int64_t heads=1,int64_t key_width=0);
     std::size_t graph_workspace_bytes() const;
     // Metal borrows this executor; it outlives the store and is active during device operations.
     explicit KvOffloadStore(state::KvOffloadConfig config, ::tyloi::Executor* executor = nullptr);
@@ -72,8 +66,8 @@ public:
     ::tyloi::Tensor gather(const std::vector<int64_t>& rows) const;
     // Shared staging is reused between completed decode graph segments. The
     // prior consumer must finish before the next call overwrites these buffers.
-    void gather_into(const std::vector<int64_t>& rows,const KvOffloadStore::GatherWorkspace& workspace) const;
-    std::shared_ptr<KvOffloadStore::GatherWorkspace> gather_workspace(int64_t rows,int64_t heads=1,int64_t key_width=0) const {
+    void gather_into(const std::vector<int64_t>& rows,const ops::KvGatherWorkspace& workspace) const;
+    std::shared_ptr<ops::KvGatherWorkspace> gather_workspace(int64_t rows,int64_t heads=1,int64_t key_width=0) const {
         return store_->gather_workspace(rows,width_,dtype_,heads,key_width);
     }
     ::tyloi::Tensor range(int64_t start, int64_t count) const;

@@ -359,6 +359,8 @@ set(TYLOINFER_CUDA_OP_SOURCES
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/native/collectives.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/attention/attention.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/attention/kv.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/attention/kv_storage.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/attention/kv_gather.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/attention/linear.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/attention/gdn.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/attention/qsa.cpp

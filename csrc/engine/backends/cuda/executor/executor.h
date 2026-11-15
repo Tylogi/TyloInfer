@@ -18,6 +18,7 @@
 
 class TqExec;
 namespace tyloi::weights { class Cache; }
+namespace tyloi::state { class KvOffloadStore; }
 
 namespace tyloi::cuda {
 
@@ -25,7 +26,6 @@ class Branches;
 class Collectives;
 class RouteStats;
 class KvMemoryManager;
-class KvOffloadStore;
 
 class Executor
     : public tyloi::Executor
@@ -55,7 +55,7 @@ public:
     /** Finalize KV mappings after model loading and publish them to the weight cache. */
     void finalize_kv(tyloi::weights::Cache& weights);
     std::shared_ptr<KvMemoryManager> kv_memory() const noexcept { return kv_memory_.lock(); }
-    std::shared_ptr<KvOffloadStore> kv_offload() const;
+    std::shared_ptr<state::KvOffloadStore> kv_offload() const;
     void wait();
     static const FfnMode& current_ffn();
     std::unique_ptr<tyloi::Executor::Scope> enter(int device, const FfnMode& mode);
@@ -142,11 +142,11 @@ public:
     MlaScratch& mla_scratch(int device) { return mla_scratch_[device]; }
 
 private:
-    void configure_kv(std::shared_ptr<KvMemoryManager> memory, std::shared_ptr<KvOffloadStore> offload);
+    void configure_kv(std::shared_ptr<KvMemoryManager> memory, std::shared_ptr<state::KvOffloadStore> offload);
     Executor(ContextSet& contexts, CudaProfiler& profiler, KlMmqState& mmq, const std::shared_ptr<TqExec>& tq,
              Branches& branches, Collectives& collectives, RouteStats& routes,
              const Options& options, Mode& mode, int primary,
-             std::weak_ptr<KvMemoryManager>, std::weak_ptr<KvOffloadStore>);
+             std::weak_ptr<KvMemoryManager>, std::weak_ptr<state::KvOffloadStore>);
     std::unique_ptr<ContextSet> owned_contexts_;
     ContextSet& contexts_;
     std::unique_ptr<Options> owned_options_;
@@ -165,9 +165,9 @@ private:
     std::unique_ptr<RouteStats> owned_routes_;
     RouteStats& routes_;
     std::weak_ptr<KvMemoryManager> kv_memory_;
-    std::weak_ptr<KvOffloadStore> kv_offload_;
+    std::weak_ptr<state::KvOffloadStore> kv_offload_;
     std::shared_ptr<KvMemoryManager> owned_kv_memory_;
-    std::shared_ptr<KvOffloadStore> owned_kv_offload_;
+    std::shared_ptr<state::KvOffloadStore> owned_kv_offload_;
     int primary_;
     std::vector<AttentionScratch> scratch_;
     MfeScratch mfe_scratch_;
