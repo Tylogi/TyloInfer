@@ -50,7 +50,11 @@ struct PrefillOptions {
     bool raw_host = false;
 };
 
-struct PrefillPlan { bool layered = false; std::int64_t max_span = 0; };
+struct PrefillPlan {
+    bool layered = false;
+    // Bound the logical advance, independently of each compute chunk.
+    std::int64_t max_span = 0;
+};
 
 struct Prefill {
     enum class Phase { progress, computed, encode, decode, complete };

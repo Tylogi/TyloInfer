@@ -1,6 +1,6 @@
 #pragma once
 #include "engine/generation/sequence.h"
-#include "engine/models/common/prompt.h"
+#include "engine/models/input.h"
 #include "engine/ops.h"
 
 #include "engine/backends/cuda/ops/norm/rms.h"

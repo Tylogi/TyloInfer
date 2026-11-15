@@ -38,6 +38,7 @@ public:
     virtual bool supports_suffix_speculation() const noexcept { return false; }
     virtual Tensor forward(Input input, State& state, const ForwardOptions& options = {}) const = 0;
     virtual PrefillPlan prefill_plan(const State&, const PrefillOptions&) const { return {}; }
+    // Layered jobs admit their state growth before allocating each phase.
     virtual StepSequence<Prefill> prefill(Input, State&, const ForwardOptions&, const PrefillOptions&) const { return {}; }
     virtual StepSequence<Decoded> decode(Input, State&, const ForwardOptions&, const DecodeOptions&) const { return {}; }
     virtual StepSequence<Decoded> warmup(State&, const DecodeOptions&) const { return {}; }

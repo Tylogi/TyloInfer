@@ -3,13 +3,13 @@
 #include "engine/generation/decode.h"
 #include "engine/generation/prefill.h"
 #include "engine/generation/run.h"
-#include "engine/generation/generation.h"
 #include "engine/generation/batch.h"
 #include "engine/generation/mtp/state.h"
 #include "engine/generation/mtp/generation.h"
 #include "engine/generation/sampling.h"
 #include "engine/models/causal_model.h"
 #include "engine/models/common/mtp.h"
+#include "engine/models/input.h"
 #include "engine/models/session/snapshot.h"
 #include "engine/scheduler/request.h"
 #include "engine/models/source.h"
@@ -199,7 +199,6 @@ struct Plain {
 struct Native {
     using Prepared = models::Prepared;
     using Hidden = Tensor;
-    using Restore = state::SessionRestore;
     models::CausalModel& model;
     models::State& state;
     tyloi::Executor& executor;
@@ -217,31 +216,10 @@ struct Native {
     std::size_t prefix_boundary = 0;
     std::optional<Prepared> prepared;
 
-    StepSequence<Prepared> prepare(InferenceRequest& input, models::State& target) {
-        return model.prepare(input.prompt, *input.vision, target);
-    }
-    void validate_prepared() const {
-        if (prepared && prepared->image_mask && prepared->image_mask.defined())
-            throw std::invalid_argument("model cannot apply an image participation mask");
-    }
-    Generation generate_text(InferenceRequest& input, InferenceOutput& output, models::State&,
-                             std::optional<Prepared> value, const RequestId&, bool) {
-        prepared = std::move(value);
-        return generate_request(std::ref(*this), input, output);
-    }
     void trace_expert_cache(const char* boundary, bool wait = true) {
         if (!config.trace_moe || std::uncaught_exceptions()) return;
         weights.trace(boundary, wait, source);
     }
-    void prepare_request(const InferenceRequest&) { trace_expert_cache("begin"); }
-    bool batched() const { return false; }
-    Restore restore_best(models::State& value, models::Mtp* predictor, const std::string& session,
-            const std::vector<std::int64_t>& prompt, std::size_t maximum, const std::string& key) {
-        return cache.restore_best(value, executor, weights, budget, predictor, session, prompt, maximum, key);
-    }
-    bool has_hidden(const Hidden& hidden) const { return hidden && hidden.defined(); }
-    void invalidate_plan() { graph.invalidate(); }
-    void set_prefix_boundary(std::size_t tokens) { prefix_boundary = tokens; }
     void reset() {
         exit_unmanaged_graph(state, weights, budget);
         budget.reserve(state.reset_growth(1));
@@ -274,8 +252,28 @@ struct Native {
         Plain plain{model, state, executor, budget, graph, weights, info, config,
                     forward_options, source, input, output, prepared, chunk_size,
                     std::move(full_ids), std::move(sampler), penalties};
-        auto sequence = generate_sequence(std::ref(plain), output, prompt.size(), reused, stable, logical_chunk);
-        while (auto step = sequence.next()) co_yield std::move(step);
+        double elapsed = 0.0;
+        auto offset = static_cast<std::int64_t>(reused);
+        const auto prompt_tokens = static_cast<std::int64_t>(prompt.size());
+        const auto stable_tokens = static_cast<std::int64_t>(stable);
+        while (offset < prompt_tokens && !output.stopped()) {
+            const auto end = offset < stable_tokens ? std::min(prompt_tokens, stable_tokens) : prompt_tokens;
+            const auto chunk = next_prefill_chunk(end, offset, logical_chunk);
+            {
+                PrefillActivity activity;
+                elapsed += plain.prefill(chunk);
+            }
+            offset += chunk.count;
+            co_yield PrefillProgress{{static_cast<std::size_t>(offset - reused), elapsed, 0.0, elapsed}};
+        }
+        if (output.stopped()) co_return;
+        auto token = plain.first_token();
+        while (!output.stopped()) {
+            auto delta = output.append(std::vector<std::int64_t>{token});
+            plain.accept(token);
+            co_yield std::move(delta);
+            if (!output.stopped()) token = plain.advance();
+        }
     }
     Generation speculate(InferenceRequest& input, InferenceOutput& output, std::size_t reused,
                          const Tensor& restored, Hidden* last_hidden) {
@@ -290,6 +288,176 @@ struct Native {
     }
 };
 
+Generation generate_session(Native& ops, InferenceRequest& request, InferenceOutput& output,
+                            const GenerationPlan& plan) {
+    auto& state = ops.state;
+    auto& session_cache = ops.cache;
+    auto* mtp = ops.mtp;
+    const auto& prepared = ops.prepared;
+    const auto& prompt = request.prompt;
+    const auto& sampling = request.sampling;
+    const auto& cache_plan = request.cache_plan;
+    const std::string input_key = prepared ? prepared->cache_key : std::string{};
+    const bool caching =
+        state.supports_text_session_state() &&
+        (!prepared || !prepared->transformed() || !input_key.empty()) &&
+        plan.stable_prefix_tokens > 0 &&
+        (!cache_plan.session_id.empty() || session_cache.persistent_prefix_enabled());
+    const bool use_mtp = mtp && sampling.enable_mtp && sampling.max_tokens > 1;
+    // Prefix restore leaves one prompt token to recover the next logits.
+    // Recurrent models therefore need a checkpoint at that same boundary.
+    const auto prefix_boundary=caching?std::min(plan.stable_prefix_tokens,prompt.size()-1):0;
+    ops.prefix_boundary = prefix_boundary;
+    state::SessionRestore restored;
+    if (caching) {
+        restored = session_cache.restore_best(state, ops.executor, ops.weights, ops.budget,
+            use_mtp ? mtp : nullptr, cache_plan.session_id, prompt, plan.stable_prefix_tokens, input_key);
+    }
+    if (restored.tokens || use_mtp)
+        ops.graph.invalidate();
+    if (!restored.tokens) ops.reset();
+    std::vector<int64_t> history = prompt;
+    Tensor last_target_hidden;
+    std::size_t last_snapshot = 0;
+    bool initial_snapshot_attempted = false;
+    const auto snapshot = [&] {
+        const auto position = state.position();
+        if (!caching || output.result.cancelled || position <= 0 ||
+            static_cast<std::size_t>(position) > history.size() ||
+            static_cast<std::size_t>(position) == last_snapshot)
+            return;
+        try {
+            std::vector<int64_t> tokens(history.begin(), history.begin() + position);
+            auto saved = state.capture_text_session_state(tokens);
+            saved.input_key = input_key;
+            if (use_mtp) {
+                if (!last_target_hidden || !last_target_hidden.defined() || position <= 1)
+                    return;
+                saved.mtp = mtp->capture_session_state(*state.predictor, position, last_target_hidden);
+                saved.bytes += saved.mtp->bytes;
+            }
+            session_cache.store(cache_plan.session_id, std::move(saved));
+            last_snapshot = static_cast<std::size_t>(position);
+        } catch (const std::exception &error) {
+            std::cerr << "runtime_session_cache action=skip error=" << error.what() << '\n';
+        }
+    };
+    auto sequence = use_mtp
+        ? ops.speculate(request, output, restored.tokens, restored.mtp_last_target_hidden,
+                        &last_target_hidden)
+        : ops.plain(request, output, restored.tokens, prefix_boundary);
+    bool traced_decode_boundary = false;
+    while (auto step = sequence.next()) {
+        auto& event = step.value;
+        if (auto *progress = event ? std::get_if<PrefillProgress>(&*event) : nullptr;
+            progress && !use_mtp && caching &&
+            progress->timing.prompt_tokens + restored.tokens == prefix_boundary)
+            snapshot();
+        if (auto *progress = event ? std::get_if<PrefillProgress>(&*event) : nullptr;
+            progress && progress->session_boundary && use_mtp && caching &&
+            !initial_snapshot_attempted) {
+            initial_snapshot_attempted = true;
+            snapshot();
+        }
+        if (auto *delta = event ? std::get_if<OutputDelta>(&*event) : nullptr) {
+            if (!traced_decode_boundary && !delta->token_ids.empty()) {
+                ops.trace_expert_cache("decode_begin", false);
+                traced_decode_boundary = true;
+            }
+            history.insert(history.end(), delta->token_ids.begin(), delta->token_ids.end());
+        }
+        co_yield std::move(step);
+    }
+    if(traced_decode_boundary) {
+        ops.trace_expert_cache("decode_end", false);
+    }
+    // Flush parser-held text before a final session snapshot can copy or evict
+    // a large cache. The scheduler's terminal finish remains idempotent and
+    // still reports cleanup/cache completion after this final text event.
+    if(caching) {
+        auto tail=output.finish();
+        if(!tail.diffs.empty())co_yield std::move(tail);
+    }
+    snapshot();
+}
+
+Generation generate_request(Native& ops, InferenceRequest& request, InferenceOutput& output) {
+    const auto& info = ops.info;
+    const auto& config = ops.config;
+    const auto& prepared = ops.prepared;
+    const auto& prompt = request.prompt;
+    auto& sampling = request.sampling;
+    const auto& cache_plan = request.cache_plan;
+    if (config.generation.prefill_chunk_size <= 0)
+        throw std::invalid_argument("prefill chunk size must be positive");
+    if (prepared && prepared->token_ids != prompt)
+        throw std::invalid_argument("prepared prompt token IDs disagree");
+    if (prepared && prepared->image_mask && prepared->image_mask.defined())
+        throw std::invalid_argument("model cannot apply an image participation mask");
+    const auto occupied =
+        static_cast<int64_t>(prompt.size()) +
+        (prepared && prepared->transformed() ? prepared->decode_position_delta : 0);
+    const auto plan = plan_generation(prompt,
+        info.vocab_size,
+        info.max_context,
+        sampling.max_tokens,
+        cache_plan.stable_prefix_tokens,
+        std::max<int64_t>(prompt.size(), occupied));
+    sampling.max_tokens = plan.generation_tokens;
+    if (output.stopped())
+        co_return;
+    if (ops.mtp) {
+        ops.mtp_state.stats = {};
+        ops.mtp_state.stats.available = true;
+    }
+    ExecutionCleanup cleanup{output.cleanup_failure, [&] { ops.release(); }};
+    ops.trace_expert_cache("begin");
+    {
+        auto sequence = generate_session(ops, request, output, plan);
+        while (auto step = sequence.next()) co_yield std::move(step);
+    }
+    cleanup.finish();
+}
+
+Generation generate_prepared(Native ops, InferenceRequest& input, InferenceOutput& output) {
+    auto& executor = ops.executor;
+    std::optional<models::Prepared> prepared;
+    if (input.vision && !output.stopped()) {
+        auto preparation = ops.model.prepare(input.prompt, *input.vision, ops.state);
+        while (!output.stopped()) {
+            StepResult<models::Prepared> step;
+            {
+                auto timer = executor.timer();
+                step = preparation.next();
+                if (step.value)
+                    timer->stop({step.value->embeddings, step.value->positions, step.value->image_mask});
+                else timer->stop();
+                output.metrics.multimodal_ms += timer->elapsed_ms();
+            }
+            if (step.value) {
+                prepared = std::move(*step.value);
+                break;
+            }
+            if (!step) throw std::runtime_error("media preparation returned no prompt");
+            co_yield step.state;
+        }
+        if (output.stopped()) co_return;
+        const auto elapsed = output.metrics.multimodal_ms;
+        co_yield PrefillProgress{{0, 0.0, elapsed, elapsed}};
+    }
+    if (output.stopped()) co_return;
+    ops.prepared = std::move(prepared);
+    auto sequence = generate_request(ops, input, output);
+    while (auto step = sequence.next()) {
+        auto& event = step.value;
+        if (auto *progress = event ? std::get_if<PrefillProgress>(&*event) : nullptr) {
+            progress->timing.multimodal_ms = output.metrics.multimodal_ms;
+            progress->timing.model_ms += progress->timing.multimodal_ms;
+        }
+        co_yield std::move(step);
+    }
+}
+
 } // namespace
 
 StepSequence<EventData> Engine::generate(const RequestId& id, Request& request) {
@@ -301,15 +469,15 @@ StepSequence<EventData> Engine::generate(const RequestId& id, Request& request) 
         Native{*model_, *request.state, *executor_, *budget_, *graph_, *weights_, model_info_,
                config_, forward_options_, source_.get(), *cache_,
                mtp_state_, model_->predictor(), predictor_execution_.get()},
-        *request.state, *executor_, request.input, *request.output, id, request.batched);
+        request.input, *request.output);
 }
 
-Generation generate(Run run, InferenceRequest& request, InferenceOutput& output, RequestId id) {
+Generation generate(Run run, InferenceRequest& request, InferenceOutput& output, RequestId) {
     auto sequence = generate_prepared(
         Native{run.model, run.state, run.executor, run.budget, run.graph, run.weights, run.info,
             run.config, run.forward_options, run.source, run.cache,
             run.mtp_state, run.mtp, &run.executor},
-        run.state, run.executor, request, output, id, false);
+        request, output);
     while (auto step = sequence.next()) co_yield std::move(step);
 }
 } // namespace tyloi::engine

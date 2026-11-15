@@ -18,6 +18,7 @@ struct InferenceRequest;
 namespace tyloi::models {
 
 std::unordered_set<std::int64_t> stop_token_ids(std::string_view config, std::int64_t vocabulary);
+std::int64_t special_token(const engine::MfqTokenizer& tokenizer, const std::string& marker);
 
 void prepare_prefix(const std::string& model_type, const engine::MfqTokenizer& tokenizer,
     const engine::InferenceInput& input, engine::InferenceRequest& work);

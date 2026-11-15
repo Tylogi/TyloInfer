@@ -25,6 +25,7 @@ public:
     State(State&&) = delete;
     State& operator=(State&&) = delete;
     ~State() override;
+    bool belongs_to(const Model& model) const noexcept { return &model_ == &model; }
 
     void preallocate() override {}
     // This family allocates its request cache during reset or forward.

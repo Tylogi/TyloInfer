@@ -2,7 +2,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -70,12 +69,6 @@ inline Info model_info(const CausalLmMetadata& metadata) {
     return {metadata.vocab_size, metadata.max_position_embeddings, metadata.model_type,
         std::size_t(metadata.hidden_size) * metadata.hc_mult * sizeof(float) * 8,
         !metadata.flash_next, metadata.decode_graph_double_warmup};
-}
-
-template <class Model>
-Info model_info(const Model& model) {
-    if constexpr (requires { model.info(); }) return model.info();
-    else return model_info(model.metadata);
 }
 
 } // namespace tyloi::models

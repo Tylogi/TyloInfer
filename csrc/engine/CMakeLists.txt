@@ -72,6 +72,7 @@ add_library(mfq-engine STATIC
     scheduler/scheduler.cpp
     scheduler/request.cpp
     state/session/paged.cpp
+    state/session/cache.cpp
     state/session/prefix_cache.cpp
     state/session/sessions.cpp
     state/qsa_sequence.cpp

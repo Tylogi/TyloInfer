@@ -64,12 +64,6 @@ std::shared_ptr<tyloi::cache::PagedPrefixCache> make_paged_prefix_cache(
     return std::make_shared<tyloi::cache::PagedPrefixCache>(std::move(cache));
 }
 
-tyloi::Tensor SessionOps::restore(tyloi::models::State& state, const Snapshot& snapshot,
-        tyloi::models::Mtp* mtp, tyloi::Executor& executor,
-        tyloi::weights::Cache& weights, tyloi::engine::Budget& budget) {
-    return tyloi::state::restore(state, snapshot, executor, weights, budget, mtp);
-}
-
 void SessionOps::release_host_cache() {
     tyloi::trim_host_cache();
 }
@@ -80,7 +74,7 @@ std::unique_ptr<tyloi::state::Sessions> make_sessions(
         const tyloi::engine::PrefixCacheConfig& prefix_config,
         std::int64_t maximum_context, bool supported, bool paged,
         tyloi::Device device, bool separate_memory, std::string_view kv_fingerprint) {
-    return std::make_unique<tyloi::engine::SessionCache<SessionOps>>(
+    return std::make_unique<tyloi::engine::SessionCache>(
         session_config, prefix_config,
         make_paged_prefix_cache(source, maximum_context, paged, prefix_config, device, separate_memory, kv_fingerprint),
         supported, supported ? 0 : 1, separate_memory);

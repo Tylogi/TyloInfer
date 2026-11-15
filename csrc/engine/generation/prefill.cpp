@@ -40,7 +40,7 @@ std::int64_t prefill_span(const models::CausalModel& model, const models::State&
         weights.transfer() == weights::Cache::Transfer::coordinated, weights.split_prefill(tokens)};
     const auto plan = model.prefill_plan(state, policy);
     if (!reused && (!stable || stable == std::size_t(tokens)) && plan.layered)
-        return tokens;
+        return plan.max_span > 0 ? std::min(tokens, plan.max_span) : tokens;
     return plan.max_span > 0 ? std::min(compute, plan.max_span) : compute;
 }
 
@@ -58,14 +58,22 @@ models::Prefill prefill(const models::CausalModel& model, models::State& state, 
     bool computed = false;
     auto timer = executor.timer();
     try {
-        for (const auto& [device, bytes] : state.reset_growth(input.ids.size(0)))
-            if (bytes) budget.reserve_kv(device, prefill_budget_add(bytes, std::size_t(64) << 20));
-        for (const auto& [device, bytes] : state.growth(input, options))
-            if (bytes) budget.reserve_kv(device, prefill_budget_add(bytes, std::size_t(64) << 20));
         const auto tokens = input.ids.size(1);
         const bool transformed = bool(input.embeddings) || bool(input.positions) || bool(input.lengths) ||
-            bool(input.cache_positions) || bool(input.image_mask) || input.suffix || input.confirmed != 0;
+            bool(input.cache_positions) || bool(input.image_mask) || bool(input.trace) ||
+            input.suffix || input.confirmed != 0;
         const auto mode = weights.prefill_mode(tokens, state.position() > 0);
+        models::PrefillOptions policy{tokens, compute, 0, 0, transformed,
+            mode == ::tyloi::weights::Cache::Prefill::retained,
+            weights.decode() == ::tyloi::weights::Cache::Decode::routed,
+            weights.transfer() == ::tyloi::weights::Cache::Transfer::coordinated,
+            weights.split_prefill(tokens), raw_host};
+        const auto plan = model.prefill_plan(state, policy);
+        for (const auto& [device, bytes] : state.reset_growth(input.ids.size(0)))
+            if (bytes) budget.reserve_kv(device, prefill_budget_add(bytes, std::size_t(64) << 20));
+        if (!plan.layered)
+            for (const auto& [device, bytes] : state.growth(input, options))
+                if (bytes) budget.reserve_kv(device, prefill_budget_add(bytes, std::size_t(64) << 20));
         if (!transformed && tokens <= 128 && (weights.split_prefill(tokens) || input.raw_hidden)) {
             std::vector<Tensor> hidden_rows, raw_rows;
             for (std::int64_t offset = 0; offset < tokens && !output.stopped();) {
@@ -105,12 +113,7 @@ models::Prefill prefill(const models::CausalModel& model, models::State& state, 
             }
         }
         exit_unmanaged_graph(state, weights, budget);
-        budget.reserve(state.growth(input, options));
-        models::PrefillOptions policy{tokens, compute, 0, 0, transformed,
-            mode == ::tyloi::weights::Cache::Prefill::retained,
-            weights.decode() == ::tyloi::weights::Cache::Decode::routed,
-            weights.transfer() == ::tyloi::weights::Cache::Transfer::coordinated,
-            weights.split_prefill(tokens), raw_host};
+        if (!plan.layered) budget.reserve(state.growth(input, options));
         job = model.prefill(input, state, options, policy);
         while (!output.stopped()) {
             StepResult<models::Prefill> step;
@@ -177,7 +180,7 @@ models::Prefill prefill(const models::CausalModel& model, models::State& state, 
             if (!step) {
                 if (step.value) throw std::logic_error("invalid prefill completion event");
                 if (loan) throw std::logic_error("prefill job ended while workspace is borrowed");
-                if (observed) throw std::runtime_error("prefill job ended without a result");
+                if (observed || plan.layered) throw std::runtime_error("prefill job ended without a result");
                 capture.finish();
                 work->finish();
                 auto* raw = input.raw_hidden;

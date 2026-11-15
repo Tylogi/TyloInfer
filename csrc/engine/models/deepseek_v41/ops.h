@@ -9,7 +9,7 @@
 #include "engine/models/plan.h"
 #include "engine/models/causal_model.h"
 #include "engine/models/common/mtp.h"
-#include "engine/models/common/prompt.h"
+#include "engine/models/input.h"
 #include "engine/models/metadata.h"
 #include "engine/metrics.h"
 #include "engine/models/session/size.h"
@@ -26,7 +26,6 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
-#include <functional>
 #include <iostream>
 #include <memory>
 #include <optional>
@@ -968,6 +967,11 @@ struct Model : tyloi::models::CausalModel {
     ::tyloi::Tensor logits(const tyloi::Tensor& hidden, bool capped = true, tyloi::models::LogitPrecision precision = tyloi::models::LogitPrecision::model) const override;
     ::tyloi::Tensor forward(tyloi::models::Input input, tyloi::models::State& state,
                                  const tyloi::models::ForwardOptions& options = {}) const override;
+    tyloi::models::PrefillPlan prefill_plan(const tyloi::models::State&,
+        const tyloi::models::PrefillOptions&) const override;
+    tyloi::StepSequence<tyloi::models::Prefill> prefill(tyloi::models::Input,
+        tyloi::models::State&, const tyloi::models::ForwardOptions&,
+        const tyloi::models::PrefillOptions&) const override;
 
     // ---- speculative contract used by the MTP sequence
     bool supports_speculation() const override;
@@ -1022,22 +1026,5 @@ struct Model : tyloi::models::CausalModel {
 
 void read(Model& model, std::shared_ptr<const tyloi::ModelSource> source,
          std::string_view definition, std::int64_t context_size);
-struct CedEncoding {
-    ::tyloi::DenseTensor ids, tail_hidden, tail_pre, tail_ids;
-    tyloi::models::deepseek_v41::EngramHashBatch tail_hashes;
-    std::int64_t batch, begin, end, tokens, compute_chunk;
-};
-::tyloi::Tensor deepseek_v41_prefill_input(
-    Model& model, State& state, const ::tyloi::Tensor& ids, std::int64_t compute_chunk);
-bool deepseek_v41_prefill_encode_chunk(
-    Model& model, State& state, CedEncoding& encoded, std::int64_t offset, std::int64_t count,
-    const std::function<bool()>& stopped, bool capture_raw_hidden);
-::tyloi::Tensor deepseek_v41_prefill_decode(
-    Model& model, State& state, CedEncoding encoded, const std::function<bool()>& stopped,
-    ::tyloi::Tensor* raw_hidden = nullptr);
-std::int64_t prefill_span(const Model&, const State&, std::size_t tokens,
-                          std::int64_t chunk, std::size_t, std::size_t,
-                          bool transformed, bool retained);
-
 } // namespace deepseek_v41
 } // namespace tyloi::cuda

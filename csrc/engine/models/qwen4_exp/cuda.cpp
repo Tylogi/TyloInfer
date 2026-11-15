@@ -1090,14 +1090,15 @@ tyloi::models::PrefillPlan qwen4_exp::Model::prefill_plan(
         policy.compute<=8 || policy.first!=0 || (policy.last!=0 && policy.last!=policy.tokens)) return {false,8192};
     for (const auto& block:layers)
         if (block->device.is_cpu() || block->device.index!=device.index) return {false,8192};
-    return {true,8192};
+    return {true,policy.tokens};
 }
 
 tyloi::StepSequence<tyloi::models::Prefill> qwen4_exp::Model::prefill(
         tyloi::models::Input input, tyloi::models::State& value,
-        const tyloi::models::ForwardOptions&, const tyloi::models::PrefillOptions& policy) const {
+        const tyloi::models::ForwardOptions& options, const tyloi::models::PrefillOptions& policy) const {
     if (!prefill_plan(value, policy).layered) co_return;
     auto& state=dynamic_cast<qwen4_exp::State&>(value);
+    co_yield tyloi::GraphRequest{tyloi::GraphPhase::admit, nullptr, state.growth(input, options)};
     const auto& model=*this;
     auto ids_handle=input.ids;
     auto compute_chunk=policy.compute;

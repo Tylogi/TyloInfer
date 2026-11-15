@@ -5,7 +5,7 @@
 #include "engine/models/causal_model.h"
 #include "engine/models/metadata.h"
 #include "engine/metrics.h"
-#include "engine/models/common/prompt.h"
+#include "engine/models/input.h"
 #include "engine/models/qwen4_exp/layer.h"
 #include "engine/models/session/size.h"
 #include "engine/models/qwen4_exp/state.h"
