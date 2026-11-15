@@ -287,40 +287,6 @@ constexpr const char* kSoftmaxTopKRowSource = R"METAL(
 #endif
 )METAL";
 
-// Adapted from oMLX's Qwen router GEMV topology (Apache-2.0): spread one
-// router row over each SIMD group instead of packing a narrow 512-row GEMV
-// into the stock matmul schedule. MFQ supplies ordinary dense FP16/BF16
-// weights here; no external quantized layout is part of this ABI.
-constexpr const char* kDenseRouterLogitsSource = R"METAL(
-    constexpr uint SIMD_GROUPS = 4u;
-    uint lane = thread_index_in_simdgroup;
-    uint row = threadgroup_position_in_grid.y * SIMD_GROUPS
-        + simdgroup_index_in_threadgroup;
-    if (row >= uint(EXPERTS)) {
-        return;
-    }
-
-    float accumulator = 0.0f;
-    device const activation_t* row_weight =
-        weight + row * uint(K);
-    for (uint column = lane * 4u;
-         column < uint(K);
-         column += 128u) {
-        activation4_t activation =
-            *(device const activation4_t*)(input + column);
-        activation4_t values =
-            *(device const activation4_t*)(row_weight + column);
-        accumulator = fma(float(values[0]), float(activation[0]), accumulator);
-        accumulator = fma(float(values[1]), float(activation[1]), accumulator);
-        accumulator = fma(float(values[2]), float(activation[2]), accumulator);
-        accumulator = fma(float(values[3]), float(activation[3]), accumulator);
-    }
-    accumulator = simd_sum(accumulator);
-    if (lane == 0u) {
-        output[row] = activation_t(accumulator);
-    }
-)METAL";
-
 constexpr const char* kDenseRouterTopKSource = R"METAL(
     constexpr uint EXPERTS = uint(N_EXPERTS);
     constexpr uint TOP_K = 6u;
@@ -883,27 +849,6 @@ softmax_top_k_large_group_kernel(mlx::core::Dtype dtype) {
 }
 
 const mlx::core::fast::CustomKernelFunction&
-dense_router_logits_kernel(mlx::core::Dtype dtype) {
-    static const auto fp16_kernel = make_kernel(
-        "mfq_cpp_moe_dense_router_logits_f16",
-        {"input", "weight"},
-        {"output"},
-        std::string(
-            "using activation_t = half;\n"
-            "using activation4_t = half4;\n") +
-            kDenseRouterLogitsSource);
-    static const auto bf16_kernel = make_kernel(
-        "mfq_cpp_moe_dense_router_logits_bf16",
-        {"input", "weight"},
-        {"output"},
-        std::string(
-            "using activation_t = bfloat;\n"
-            "using activation4_t = bfloat4;\n") +
-            kDenseRouterLogitsSource);
-    return dtype == mlx::core::bfloat16 ? bf16_kernel : fp16_kernel;
-}
-
-const mlx::core::fast::CustomKernelFunction&
 dense_router_top_k_kernel(mlx::core::Dtype dtype, bool mapped) {
     static const auto fp16_kernel = make_kernel(
         "mfq_cpp_moe_dense_router_topk_f16",
@@ -1394,53 +1339,6 @@ MlxMoeTopKResult moe_topk(
         std::move(outputs.at(0)),
         std::move(outputs.at(1)),
     };
-}
-
-bool moe_dense_router_logits_supported(
-    const array& input,
-    const array& weight) noexcept {
-    const bool dense16 = weight.dtype() == mlx::core::float16 ||
-        weight.dtype() == mlx::core::bfloat16;
-    if (!dense16 || weight.ndim() != 2 ||
-        !weight.flags().row_contiguous || input.ndim() == 0) {
-        return false;
-    }
-    const int experts = weight.shape(0);
-    const int width = weight.shape(1);
-    return (experts == 256 || experts == 384 || experts == 512) &&
-        width > 64 && width < 16 * experts && width % 128 == 0 &&
-        input.shape(-1) == width &&
-        input.size() == static_cast<std::size_t>(width);
-}
-
-array moe_dense_router_logits(
-    const array& input,
-    const array& weight) {
-    if (!moe_dense_router_logits_supported(input, weight)) {
-        throw std::invalid_argument(
-            "dense router GEMV requires one row, 256/384/512 experts, "
-            "and contiguous FP16/BF16 weights");
-    }
-    auto source = mlx::core::contiguous(mlx::core::reshape(
-        input.dtype() == weight.dtype()
-            ? input
-            : mlx::core::astype(input, weight.dtype()),
-        Shape{weight.shape(1)}));
-    const int experts = weight.shape(0);
-    auto outputs = dense_router_logits_kernel(weight.dtype())(
-        {std::move(source), weight},
-        {Shape{1, experts}},
-        {weight.dtype()},
-        {32, experts, 1},
-        {32, 4, 1},
-        {
-            {"K", weight.shape(1)},
-            {"EXPERTS", experts},
-        },
-        std::nullopt,
-        false,
-        {});
-    return std::move(outputs.front());
 }
 
 bool moe_dense_router_topk_supported(

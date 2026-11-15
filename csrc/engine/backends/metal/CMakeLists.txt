@@ -82,6 +82,8 @@ add_library(mfq-metal-ops STATIC
     ${TYLOINFER_METAL_ROOT}/ops/tensor.cpp
     ${TYLOINFER_METAL_ROOT}/ops/norm/rms.cpp
     ${TYLOINFER_METAL_ROOT}/ops/norm/layer.cpp
+    ${TYLOINFER_METAL_ROOT}/ops/projection/dense.cpp
+    ${TYLOINFER_METAL_ROOT}/ops/projection/projection.cpp
     ${TYLOINFER_METAL_ROOT}/ops/rope/rope.cpp
     ${TYLOINFER_METAL_ROOT}/ops/rope/tail.cpp
     ${TYLOINFER_METAL_ROOT}/ops/sampling.cpp

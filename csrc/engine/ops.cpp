@@ -699,49 +699,12 @@ Tensor segmented_attention(const Tensor& query_tensor, const Tensor& key_tensor,
     require_cuda(query);
     return owner(cuda::ops::segmented_attention(query, key, value, lengths));
 }
-Tensor embedding(const Tensor& ids_tensor, const ::tyloi::Tensor& weight) {
-    const auto& ids = ::tyloi::ops::dense(ids_tensor);
-    input(ids);
-    return owner(cuda::ops::embedding(ids, weight));
-}
-Tensor project(const Tensor& value_tensor, const ::tyloi::Tensor& weight) {
-    const auto& value = ::tyloi::ops::dense(value_tensor);
-    input(value);
-    return owner(cuda::ops::project(value, weight));
-}
-Tensor head_project(const Tensor& value, const Tensor& weight) {
-    input(value);
-    require_cuda(value);
-    if (!weight || !weight.defined() || value.dim() != 4 || weight.dim() != 3 ||
-        value.numel() <= 0 || value.size(2) <= 0 || value.size(2) > std::numeric_limits<int>::max() ||
-        value.size(3) <= 0 || value.size(2) != weight.size(0) || value.size(3) != weight.size(2))
-        throw std::invalid_argument("head-wise projection geometry is incompatible");
-    return owner(cuda::ops::head_project(dense(value), weight));
-}
 
-Tensor project(const Tensor& value, const Tensor& weight, const Tensor& ids) {
-    compatible(value, ids);
-    return owner(cuda::ops::project(dense(value), weight, dense(ids)));
-}
 Tensor low_rank(const Tensor& value_tensor, const Tensor& output_a, const Tensor& output_b,
                 std::int64_t groups, bool groupwise, bool profile) {
     const auto& value = ::tyloi::ops::dense(value_tensor);
     input(value);
     return owner(cuda::ops::low_rank(value, output_a, output_b, groups, groupwise, profile));
-}
-Tensor linear(const Tensor& value_tensor, const ::tyloi::Tensor& weight, const Tensor& bias) {
-    const auto& value = ::tyloi::ops::dense(value_tensor);
-    input(value);
-    const auto* bias_dense = bias.defined() ? &::tyloi::ops::dense(bias) : nullptr;
-    if (bias_dense) input(*bias_dense);
-    return owner(cuda::ops::linear(value, weight, bias_dense));
-}
-Tensor affine(const Tensor& value_tensor, const ::tyloi::Tensor& weight, const Tensor& bias) {
-    const auto& value = ::tyloi::ops::dense(value_tensor);
-    input(value);
-    const auto* bias_dense = bias.defined() ? &::tyloi::ops::dense(bias) : nullptr;
-    if (bias_dense) input(*bias_dense);
-    return owner(cuda::ops::affine(value, weight, bias_dense));
 }
 Tensor mlp(const Tensor& value_tensor, std::span<const Tensor> gate_up, const ::tyloi::Tensor& down,
            MlpActivation activation, double swiglu_limit) {
@@ -772,20 +735,6 @@ std::optional<Tensor> mlp_residual(const Tensor& value, const Tensor& residual,
         activation, swiglu_limit, recurrent);
     if (!result) return std::nullopt;
     return owner(std::move(*result));
-}
-std::vector<Tensor> project_group(const Tensor& value_tensor, std::span<const Tensor> group) {
-    const auto& value = ::tyloi::ops::dense(value_tensor);
-    input(value);
-    return owners(cuda::ops::project_group(value, group));
-}
-bool grouped(std::span<const Tensor> weights) {
-    return cuda::ops::grouped(weights);
-}
-std::vector<Tensor> project_group(const Tensor& value_tensor, std::span<const Tensor> weights,
-                                  std::size_t prefix) {
-    const auto& value = ::tyloi::ops::dense(value_tensor);
-    input(value);
-    return owners(cuda::ops::project_group(value, weights, prefix));
 }
 std::array<Tensor, 2> linear_gates(const Tensor& alpha, const Tensor& beta, const Tensor& dt_bias, const Tensor& a_log) {
     compatible(alpha, beta); compatible(alpha, dt_bias); compatible(alpha, a_log);
