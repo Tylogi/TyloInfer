@@ -1,6 +1,9 @@
 #pragma once
 #include "step.h"
+#include "prefill_activity.h"
+#include "../requests/policy.h"
 #include <deque>
+#include <functional>
 #include <memory>
 #include <unordered_map>
 
@@ -44,8 +47,7 @@ template <class Sample> struct PrefillBatchResult {
     std::exception_ptr failure;
 };
 
-// Groups pending numerical operations. All rows run generate_sequence(), also
-// used by B=1 execution; this component never accepts tokens or publishes events.
+// Groups pending numerical operations and publishes each request's progress.
 template <class Ops> class ContinuousBatch : public Batch {
     using Request = typename Ops::Request;
     using Sample = typename Ops::Sample;
@@ -56,6 +58,13 @@ template <class Ops> class ContinuousBatch : public Batch {
         std::optional<Sample> result;
         std::exception_ptr failure;
         bool decode = false, active = false;
+        void schedule_prefill(PrefillChunk chunk) { result.reset(); prefill = chunk; }
+        void schedule_decode() { result.reset(); decode = true; }
+        bool ready() const { return result.has_value() || failure; }
+        const Sample& sample() const {
+            if (failure) std::rethrow_exception(failure);
+            return result.value();
+        }
     };
     int64_t prefill_chunk_size, prefill_token_budget;
     State state;
@@ -100,43 +109,6 @@ template <class Ops> class ContinuousBatch : public Batch {
         }
         requests.erase(work.request->id);
     }
-    struct SequenceOps {
-        ContinuousBatch& batch;
-        Work& work;
-        /** Retire this request from the batch. */
-        void release() { batch.release(work); }
-        PrefillChunk prefill_chunk(PrefillChunk chunk) {
-            if constexpr (requires { batch.operations.prefill_chunk(work.request, chunk); })
-                return batch.operations.prefill_chunk(work.request, chunk);
-            return chunk;
-        }
-        void schedule_prefill(PrefillChunk chunk) { work.result.reset(); work.prefill = chunk; }
-        void schedule_decode() { work.result.reset(); work.decode = true; }
-        bool ready() const { return work.result.has_value() || work.failure; }
-        const Sample& sample() const {
-            if (work.failure) std::rethrow_exception(work.failure);
-            return work.result.value();
-        }
-        double prefill(PrefillChunk) { return sample().timing.llm_ms; }
-        int64_t first_token() { return sample().token; }
-        int64_t advance() { return sample().token; }
-        std::optional<Generation> generate_decode(InferenceOutput& output) {
-            if constexpr (requires { batch.operations.generate_decode(work.request, output,
-                    std::function<void()>{}, std::function<bool()>{}, std::function<void()>{}); })
-                return batch.operations.generate_decode(work.request, output,
-                    [this] { schedule_decode(); }, [this] { return ready(); },
-                    [this] { (void)sample(); });
-            return std::nullopt;
-        }
-        void accept(int64_t token) {
-            auto& request = *work.request;
-            // activate() initializes counts for the first sample.
-            if (request.produced) batch.operations.accept(work.request, sample());
-            request.pending_token = token;
-            ++request.produced;
-        }
-    };
-
   public:
     void bind(Budget& budget) override { operations.bind(budget); }
     bool empty() const noexcept { return requests.empty(); }
@@ -162,16 +134,60 @@ template <class Ops> class ContinuousBatch : public Batch {
         work->request = std::make_shared<Request>(std::move(id), input);
         if (!requests.emplace(work->request->id, work).second)
             throw std::invalid_argument("duplicate batch request id");
-        SequenceOps ops{*this, *work};
-        ExecutionCleanup cleanup{output.cleanup_failure, [&] { ops.release(); }};
+        ExecutionCleanup cleanup{output.cleanup_failure, [&] { release(*work); }};
         int64_t reused = 0, prefix = 0;
         if constexpr (requires { operations.prepare(work->request); })
             reused = operations.prepare(work->request);
         if constexpr (requires { operations.prefix_tokens(work->request); })
             prefix = operations.prefix_tokens(work->request);
-        {
-            auto sequence = generate_sequence(ops, output, input.prompt.size(), reused, prefix, prefill_chunk_size);
-            while (auto step = sequence.next()) co_yield std::move(step);
+        const auto prompt_tokens = static_cast<int64_t>(input.prompt.size());
+        double elapsed = 0.0;
+        auto offset = reused;
+        while (offset < prompt_tokens && !output.stopped()) {
+            const auto end = offset < prefix ? std::min(prompt_tokens, prefix) : prompt_tokens;
+            auto chunk = operations.prefill_chunk(work->request, next_prefill_chunk(end, offset, prefill_chunk_size));
+            work->schedule_prefill(chunk);
+            co_yield StepState::advanced;
+            while (!work->ready() && !output.stopped()) co_yield StepState::waiting;
+            if (output.stopped()) break;
+            {
+                PrefillActivity activity;
+                elapsed += work->sample().timing.llm_ms;
+            }
+            offset += chunk.count;
+            co_yield PrefillProgress{
+                {static_cast<std::size_t>(offset - reused), elapsed, 0.0, elapsed}};
+        }
+        if (!output.stopped()) {
+            bool generated = false;
+            if constexpr (requires { operations.generate_decode(work->request, output,
+                    std::function<void()>{}, std::function<bool()>{}, std::function<void()>{}); }) {
+                auto generation = operations.generate_decode(work->request, output,
+                    [&work] { work->schedule_decode(); }, [&work] { return work->ready(); },
+                    [&work] { (void)work->sample(); });
+                if (generation) {
+                    generated = true;
+                    while (auto step = generation->next()) co_yield std::move(step);
+                }
+            }
+            if (!generated) {
+                auto token = work->sample().token;
+                while (!output.stopped()) {
+                    auto delta = output.append(std::vector<std::int64_t>{token});
+                    auto& request = *work->request;
+                    // activate() initializes counts for the first sample.
+                    if (request.produced) operations.accept(work->request, work->sample());
+                    request.pending_token = token;
+                    ++request.produced;
+                    if (!output.stopped()) work->schedule_decode();
+                    co_yield std::move(delta);
+                    if (!output.stopped()) {
+                        while (!work->ready() && !output.stopped()) co_yield StepState::waiting;
+                        if (output.stopped()) break;
+                        token = work->sample().token;
+                    }
+                }
+            }
         }
         cleanup.finish();
     }
@@ -212,48 +228,42 @@ template <class Ops> class ContinuousBatch : public Batch {
                 for (const auto& request : state.active) if (request->eligible) {
                     auto& work = *requests.at(request->id);
                     work.result = operations.sample(request, decoded);
-                    if constexpr (requires { operations.cache_length(request); })
-                        request->cache_length = operations.cache_length(request);
-                    else ++request->cache_length;
+                    request->cache_length = operations.cache_length(request);
                     work.decode = false;
                 }
             } else if (prefill != requests.end()) {
                 prefill_work.push_back(prefill->second);
                 using Item = std::pair<std::shared_ptr<Request>, PrefillChunk>;
                 std::vector<Item> items{{prefill->second->request, *prefill->second->prefill}};
-                if constexpr (requires { operations.prefill_batch(items); }) {
-                    auto budget=prefill_chunk_size;
-                    if constexpr (requires { operations.prefill_batch_limit(); }) budget=prefill_token_budget;
-                    if constexpr(requires {operations.prefill_batch_token_budget();})
-                        budget=std::min(budget,operations.prefill_batch_token_budget());
-                    auto remaining = budget - items.front().second.count;
-                    const auto limit = [&] {
-                        if constexpr (requires { operations.prefill_batch_limit(); }) return operations.prefill_batch_limit();
-                        else return eligible.size();
-                    }();
-                    for (const auto& id : eligible) {
-                        auto it = requests.find(id);
-                        if (it == requests.end() || !it->second->prefill ||
-                            std::find(prefill_work.begin(),prefill_work.end(),it->second) != prefill_work.end()) continue;
-                        const auto chunk = *it->second->prefill;
-                        if (items.size() >= limit || chunk.count > remaining) continue;
-                        remaining -= chunk.count;
-                        prefill_work.push_back(it->second);
-                        items.emplace_back(it->second->request,chunk);
-                    }
+                auto budget=prefill_chunk_size;
+                if constexpr (requires { operations.prefill_batch_limit(); }) budget=prefill_token_budget;
+                if constexpr(requires {operations.prefill_batch_token_budget();})
+                    budget=std::min(budget,operations.prefill_batch_token_budget());
+                auto remaining = budget - items.front().second.count;
+                const auto limit = [&] {
+                    if constexpr (requires { operations.prefill_batch_limit(); }) return operations.prefill_batch_limit();
+                    else return eligible.size();
+                }();
+                for (const auto& id : eligible) {
+                    auto it = requests.find(id);
+                    if (it == requests.end() || !it->second->prefill ||
+                        std::find(prefill_work.begin(),prefill_work.end(),it->second) != prefill_work.end()) continue;
+                    const auto chunk = *it->second->prefill;
+                    if (items.size() >= limit || chunk.count > remaining) continue;
+                    remaining -= chunk.count;
+                    prefill_work.push_back(it->second);
+                    items.emplace_back(it->second->request,chunk);
                 }
                 operations.suspend_decode();
                 PrefillActivity prefill_activity;
                 prefilling_operation = true;
                 std::vector<PrefillBatchResult<Sample>> samples;
-                if constexpr (requires { operations.prefill_batch(items); }) {
-                    const bool use_batch = items.size() > 1 || !requires { operations.prefill_batch_limit(); };
-                    if (use_batch) {
-                        auto results = operations.prefill_batch(items);
-                        for (auto& result : results) {
-                            if constexpr (requires { result.failure; result.sample; }) samples.push_back(std::move(result));
-                            else samples.push_back({std::move(result), {}});
-                        }
+                const bool use_batch = items.size() > 1 || !requires { operations.prefill_batch_limit(); };
+                if (use_batch) {
+                    auto results = operations.prefill_batch(items);
+                    for (auto& result : results) {
+                        if constexpr (requires { result.failure; result.sample; }) samples.push_back(std::move(result));
+                        else samples.push_back({std::move(result), {}});
                     }
                 }
                 if (samples.empty()) {

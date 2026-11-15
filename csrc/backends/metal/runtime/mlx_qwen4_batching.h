@@ -7,6 +7,7 @@
 
 #include <chrono>
 #include <iostream>
+#include <stdexcept>
 #include <unordered_map>
 
 namespace tyloi::metal {
@@ -86,6 +87,10 @@ public:
 
     MlxQwen4BatchOperations(MlxQwen4CausalLm& runtime, Hooks hooks)
         : runtime_(runtime), hooks_(std::move(hooks)) {}
+
+    void bind(tyloi::engine::Budget&) {
+        throw std::invalid_argument("legacy Metal batching cannot bind the shared Engine budget");
+    }
 
     std::int64_t prepare(const std::shared_ptr<Request>& request) {
         request->mtp = request->sampling.enable_mtp && runtime_.supports_mtp();

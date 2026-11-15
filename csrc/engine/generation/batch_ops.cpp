@@ -87,6 +87,7 @@ public:
     }
 
     void bind(Budget& budget) noexcept { budget_ = &budget; }
+    std::int64_t cache_length(const std::shared_ptr<Request>& request) const { return request->state->position(); }
     std::int64_t vocab_size() const { return model_.info().vocab_size; }
     std::int64_t max_context() const { return model_.info().max_context; }
     Metrics metrics() const {
