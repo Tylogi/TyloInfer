@@ -16,7 +16,7 @@ public:
     mlx::core::array routed_matmul(const mlx::core::array& input, const mlx::core::array& ids,
         bool shared_input, const MlxExpertRouteTiles* plan = nullptr) const;
     mlx::core::array routed_swiglu(const MlxAffineIndirectWeight& up, const mlx::core::array& input,
-        const mlx::core::array& ids, const MlxExpertRouteTiles* plan = nullptr) const;
+        const mlx::core::array& ids, const MlxExpertRouteTiles* plan = nullptr, float limit = 0.f) const;
     int input_size() const noexcept { return shape_[2]; }
     int output_size() const noexcept { return shape_[1]; }
     int expert_count() const noexcept { return shape_[0]; }

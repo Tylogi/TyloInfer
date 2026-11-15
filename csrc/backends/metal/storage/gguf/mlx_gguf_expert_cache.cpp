@@ -160,9 +160,6 @@ void MlxGgufExpertCache::validate_layer(std::size_t layer, int experts, int inpu
     if (impl_->layers.at(layer)[0].shape != Shape{experts, intermediate, input})
         throw std::invalid_argument("GGUF expert cache layer does not match model geometry");
 }
-void MlxGgufExpertCache::prepare_layer(std::size_t index, int top_k) const {
-    prepare_layer(index, top_k, 0.f);
-}
 void MlxGgufExpertCache::prepare_layer(std::size_t index, int top_k, float limit) const {
     if (!std::isfinite(limit) || limit < 0.f) throw std::invalid_argument("invalid GGUF SwiGLU limit");
     auto* preparation = MlxKernelPreparation::current();
@@ -205,10 +202,6 @@ void MlxGgufExpertCache::prepare_layer(std::size_t index, int top_k, float limit
                 preparation->add(ffn(weights, zeros({rows, layer[0].shape[2]}, float16),
                     zeros({rows, top_k}, int32), zeros({rows, top_k}, float32), partial, limit));
     });
-}
-array MlxGgufExpertCache::apply_ffn(std::size_t layer_index, const array& input,
-    const array& ids, const array& route_weights, const array* parallel) {
-    return apply_ffn(layer_index, input, ids, route_weights, parallel, 0.f);
 }
 array MlxGgufExpertCache::apply_ffn(std::size_t layer_index, const array& input,
     const array& ids, const array& route_weights, const array* parallel, float limit) {

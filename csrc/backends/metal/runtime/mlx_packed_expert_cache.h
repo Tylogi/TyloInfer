@@ -8,9 +8,9 @@ public:
     virtual ~MlxPackedExpertCache() = default;
     virtual mlx::core::array apply_ffn(std::size_t layer, const mlx::core::array& input,
         const mlx::core::array& ids, const mlx::core::array& weights,
-        const mlx::core::array* parallel = nullptr) = 0;
+        const mlx::core::array* parallel = nullptr, float swiglu_limit = 0.f) = 0;
     virtual void validate_layer(std::size_t layer, int experts, int input, int intermediate) const = 0;
-    virtual void prepare_layer(std::size_t layer, int top_k) const = 0;
+    virtual void prepare_layer(std::size_t layer, int top_k, float swiglu_limit = 0.f) const = 0;
     virtual void preload() = 0;
     virtual void drain() = 0;
     virtual bool preserves_activation_dtype() const noexcept { return false; }

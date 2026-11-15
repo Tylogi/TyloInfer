@@ -11,6 +11,7 @@
 
 #include <climits>
 #include <algorithm>
+#include <cmath>
 
 namespace tyloi::metal {
 namespace affine_cache_detail {
@@ -30,11 +31,11 @@ using namespace mlx::core;
 using namespace affine_cache_detail;
 
 array ffn(const std::array<MlxAffineIndirectWeight, 3>& weights, const array& input,
-    const array& ids, const array& scores, bool partial = false) {
+    const array& ids, const array& scores, float limit, bool partial = false) {
     std::optional<MlxExpertRouteTiles> plan;
     if (ids.shape(0) > MlxAffineIndirectWeight::kVectorRows) plan = mlx_expert_route_tiles(ids, weights[0].expert_count());
     const auto* routes = plan ? &*plan : nullptr;
-    auto intermediate = weights[0].routed_swiglu(weights[1], input, ids, routes);
+    auto intermediate = weights[0].routed_swiglu(weights[1], input, ids, routes, limit);
     auto pairs = weights[2].routed_matmul(intermediate, ids, false, routes);
     return moe_weighted_reduce(partial ? astype(pairs, float32) : pairs, scores);
 }
@@ -90,7 +91,8 @@ void MlxAffineExpertCache::validate_layer(std::size_t index, int experts, int in
     if (impl_->layers.at(index)[0].shape != std::vector<std::int64_t>{experts, intermediate, input})
         throw std::invalid_argument("MLX expert cache layer differs from model geometry");
 }
-void MlxAffineExpertCache::prepare_layer(std::size_t index, int top_k) const {
+void MlxAffineExpertCache::prepare_layer(std::size_t index, int top_k, float limit) const {
+    if (!std::isfinite(limit) || limit < 0.f) throw std::invalid_argument("invalid MLX SwiGLU limit");
     auto* preparation = MlxKernelPreparation::current();
     if (!preparation) return;
     const auto& layer = impl_->layers.at(index);
@@ -105,11 +107,12 @@ void MlxAffineExpertCache::prepare_layer(std::size_t index, int top_k) const {
     preparation->collect([&] {
         for (const auto rows : preparation->row_buckets())
             preparation->add(ffn(weights, zeros({rows, int(layer[0].shape[2])}, preparation->activation_dtype()),
-                zeros({rows, top_k}, int32), zeros({rows, top_k}, float32)));
+                zeros({rows, top_k}, int32), zeros({rows, top_k}, float32), limit));
     });
 }
 array MlxAffineExpertCache::apply_ffn(std::size_t index, const array& input, const array& ids, const array& weights,
-    const array* parallel) {
+    const array* parallel, float swiglu_limit) {
+    if (!std::isfinite(swiglu_limit) || swiglu_limit < 0.f) throw std::invalid_argument("invalid MLX SwiGLU limit");
     const auto& shape = impl_->layers.at(index)[0].shape;
     if (ids.ndim() != 2 || weights.shape() != ids.shape() || input.ndim() < 1 || input.shape(-1) != shape[2] ||
         input.size() / shape[2] != std::size_t(ids.shape(0)))
@@ -118,7 +121,7 @@ array MlxAffineExpertCache::apply_ffn(std::size_t index, const array& input, con
     auto result = impl_->cache->apply(index, ids, 6, [&] {
         const auto& layer = impl_->layer_weights(index);
         if (ids.shape(0) > MlxAffineIndirectWeight::kVectorRows && !plan) plan = mlx_expert_route_tiles(ids, layer[0].expert_count());
-        return layer[0].routed_swiglu(layer[1], input, ids, plan ? &*plan : nullptr);
+        return layer[0].routed_swiglu(layer[1], input, ids, plan ? &*plan : nullptr, swiglu_limit);
     }, [&](const array& hidden, bool partial) {
         auto pairs = impl_->layer_weights(index)[2].routed_matmul(hidden, ids, false, plan ? &*plan : nullptr);
         return moe_weighted_reduce(partial ? astype(pairs, float32) : pairs, weights);

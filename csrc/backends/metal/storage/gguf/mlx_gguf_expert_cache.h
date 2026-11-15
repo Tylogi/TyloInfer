@@ -36,13 +36,9 @@ public:
         std::size_t budget, int workers = 8);
     mlx::core::array apply_ffn(std::size_t layer, const mlx::core::array& input,
         const mlx::core::array& ids, const mlx::core::array& weights,
-        const mlx::core::array* parallel = nullptr) override;
-    mlx::core::array apply_ffn(std::size_t layer, const mlx::core::array& input,
-        const mlx::core::array& ids, const mlx::core::array& weights,
-        const mlx::core::array* parallel, float swiglu_limit);
+        const mlx::core::array* parallel = nullptr, float swiglu_limit = 0.f) override;
     void validate_layer(std::size_t layer, int experts, int input, int intermediate) const override;
-    void prepare_layer(std::size_t layer, int top_k) const override;
-    void prepare_layer(std::size_t layer, int top_k, float swiglu_limit) const;
+    void prepare_layer(std::size_t layer, int top_k, float swiglu_limit = 0.f) const override;
     void preload() override;
     void drain() override;
     void set_prefill_next_rows(std::size_t layer, std::size_t rows);

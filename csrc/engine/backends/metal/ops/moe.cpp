@@ -6,7 +6,6 @@
 #include "engine/weights/moe/experts.h"
 #include "backends/metal/runtime/mlx_packed_expert_cache.h"
 #include "backends/metal/runtime/mlx_tq_expert_cache.h"
-#include "backends/metal/storage/gguf/mlx_gguf_expert_cache.h"
 
 #include <algorithm>
 #include <cmath>
@@ -141,13 +140,8 @@ RoutedExperts routed(const Tensor& input, const Tensor& input_f32, const Tensor&
                 return cache->apply_ffn(gate->layer(), metal::array(x), ids, weights,
                                         static_cast<float>(spec.swiglu_limit));
             } else {
-                if (spec.swiglu_limit > 0) {
-                    auto* gguf = dynamic_cast<metal::MlxGgufExpertCache*>(cache.get());
-                    if (!gguf) throw std::runtime_error("Metal affine expert cache does not support limited SwiGLU");
-                    return gguf->apply_ffn(gate->layer(), metal::array(x), ids, weights, nullptr,
-                                           static_cast<float>(spec.swiglu_limit));
-                }
-                return cache->apply_ffn(gate->layer(), metal::array(x), ids, weights);
+                return cache->apply_ffn(gate->layer(), metal::array(x), ids, weights, nullptr,
+                                        static_cast<float>(spec.swiglu_limit));
             }
         }, gate->cache());
         result = metal::tensor(std::move(value));

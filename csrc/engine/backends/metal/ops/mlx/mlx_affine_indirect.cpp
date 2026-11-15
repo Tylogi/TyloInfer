@@ -10,6 +10,7 @@
 #include "../../kernels/mlx/mlx_affine_decode.h"
 
 #include <climits>
+#include <cmath>
 
 namespace tyloi::metal {
 namespace {
@@ -250,8 +251,9 @@ array MlxAffineIndirectWeight::routed_matmul(const array& input, const array& id
 }
 
 array MlxAffineIndirectWeight::routed_swiglu(const MlxAffineIndirectWeight& up, const array& input,
-    const array& ids, const MlxExpertRouteTiles* plan) const {
+    const array& ids, const MlxExpertRouteTiles* plan, float limit) const {
     if (shape_ != up.shape_) throw std::invalid_argument("indirect MLX Gate/Up geometry differs");
+    if (!std::isfinite(limit) || limit < 0.f) throw std::invalid_argument("invalid MLX SwiGLU limit");
     if (input.ndim() < 1 || input.shape(-1) != input_size() ||
         (input.dtype() != float16 && input.dtype() != bfloat16 && input.dtype() != float32) ||
         ids.ndim() != 2 || (ids.dtype() != int32 && ids.dtype() != uint32) || ids.shape(1) < 1 ||
@@ -259,6 +261,11 @@ array MlxAffineIndirectWeight::routed_swiglu(const MlxAffineIndirectWeight& up, 
         throw std::invalid_argument("indirect MLX Gate/Up inputs disagree");
     std::optional<MlxExpertRouteTiles> owned;
     if (ids.shape(0) > kVectorRows && !plan) { owned = mlx_expert_route_tiles(ids, expert_count()); plan = &*owned; }
+    if (limit > 0.f) {
+        if (!ids.size()) return zeros(Shape{ids.shape(0), ids.shape(1), output_size()}, input.dtype());
+        return moe_limited_swiglu_pair(routed_matmul(input, ids, true, plan),
+            up.routed_matmul(input, ids, true, plan), limit);
+    }
     if (ids.shape(0) > kVectorRows || bits_ != up.bits_ || group_size_ != up.group_size_ || dtype_ != up.dtype_)
         return moe_swiglu_pair(routed_matmul(input, ids, true, plan), up.routed_matmul(input, ids, true, plan));
     const Shape shape{ids.shape(0), ids.shape(1), output_size()};

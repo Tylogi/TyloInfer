@@ -6,11 +6,9 @@
 #include "backends/metal/runtime/mlx_packed_expert_cache.h"
 #include "backends/metal/runtime/mlx_projection_batch.h"
 #include "backends/metal/runtime/mlx_tq_expert_cache.h"
-#include "backends/metal/storage/gguf/mlx_gguf_expert_cache.h"
 
 #include <algorithm>
 #include <stdexcept>
-#include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -105,12 +103,7 @@ FfnWeights qwen4_ffn_weights(FfnWeights weights) {
         std::visit([&](const auto& cache) {
             cache->validate_layer(gate->layer(), static_cast<int>(weights.moe_router.size(0)),
                                   static_cast<int>(width), static_cast<int>(weights.qwen_moe_width));
-            using Cache = typename std::decay_t<decltype(cache)>::element_type;
-            if constexpr (std::is_same_v<Cache, metal::MlxTqExpertCache>)
-                cache->prepare_layer(gate->layer(), weights.moe_top_k, weights.swiglu_limit);
-            else if (auto* gguf = dynamic_cast<metal::MlxGgufExpertCache*>(cache.get()))
-                gguf->prepare_layer(gate->layer(), weights.moe_top_k, weights.swiglu_limit);
-            else cache->prepare_layer(gate->layer(), weights.moe_top_k);
+            cache->prepare_layer(gate->layer(), weights.moe_top_k, static_cast<float>(weights.swiglu_limit));
         }, gate->cache());
     }
     weights.qwen_tq = false;
