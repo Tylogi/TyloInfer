@@ -8,6 +8,7 @@
 #include <mlx/primitives.h>
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <stdexcept>
 
@@ -33,6 +34,9 @@ int dimension(std::int64_t dim, std::size_t rank) {
 mlx::core::Stream gpu_stream() {
     return mlx::core::default_stream(mlx::core::Device::gpu);
 }
+
+mlx::core::array arithmetic_scalar(const mlx::core::array& value, double number);
+void write_result(Tensor& value, mlx::core::array result);
 
 mlx::core::Shape checked_shape(std::span<const std::int64_t> shape, const TensorOptions& options) {
     if (!options.has_device() || options.target_device() != Device{DeviceType::metal, 0} || options.pinned())
@@ -156,6 +160,33 @@ Tensor empty(std::span<const std::int64_t> shape, const TensorOptions& options) 
     return metal::allocate(shape, options.scalar_type());
 }
 
+template<class T>
+Tensor tensor_values(std::span<const T> values, Device target, ScalarType type) {
+    if (target != Device{DeviceType::metal, 0}) throw std::invalid_argument("expected Metal 0 target");
+    if (values.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+        throw std::overflow_error("Metal tensor extent exceeds int32 limit");
+    const std::int64_t shape[]{static_cast<std::int64_t>(values.size())};
+    return metal::copy_from_host(values.data(), shape, type);
+}
+Tensor tensor(std::span<const float> values, Device target) { return tensor_values(values, target, kFloat32); }
+Tensor tensor(std::span<const std::int32_t> values, Device target) { return tensor_values(values, target, kInt32); }
+Tensor tensor(std::span<const std::int64_t> values, Device target) { return tensor_values(values, target, kInt64); }
+Tensor tensor(std::span<const std::uint8_t> values, Device target) { return tensor_values(values, target, kUInt8); }
+
+Tensor arange(std::int64_t first, std::int64_t last, Device target) {
+    if (target != Device{DeviceType::metal, 0}) throw std::invalid_argument("expected Metal 0 target");
+    const auto count = last > first ? static_cast<__int128>(last) - first : 0;
+    if (count > std::numeric_limits<int>::max()) throw std::overflow_error("Metal arange extent exceeds int32 limit");
+    const auto stream = gpu_stream();
+    auto offsets = mlx::core::arange(static_cast<int>(count), mlx::core::int64, stream);
+    return metal::tensor(mlx::core::add(offsets, mlx::core::array(first, mlx::core::int64), stream));
+}
+
+Tensor full(std::span<const std::int64_t> shape, std::int64_t value, Device target) {
+    auto sizes = checked_shape(shape, TensorOptions().dtype(kInt64).device(target));
+    return metal::tensor(mlx::core::full(std::move(sizes), mlx::core::array(value, mlx::core::int64), mlx::core::int64, gpu_stream()));
+}
+
 Tensor zeros(std::span<const std::int64_t> shape, const TensorOptions& options) {
     (void)checked_shape(shape, options);
     auto result = metal::allocate(shape, options.scalar_type());
@@ -163,11 +194,23 @@ Tensor zeros(std::span<const std::int64_t> shape, const TensorOptions& options) 
     return result;
 }
 
-void copy_into(Tensor destination, const Tensor& source) { write(destination, &source); }
+void copy_into(Tensor destination, const Tensor& source) {
+    if (source.device() == Device{DeviceType::cpu, 0}) {
+        auto staging = metal::copy(source, Device{DeviceType::metal, 0});
+        write(destination, &staging);
+    } else {
+        write(destination, &source);
+    }
+}
 
 void fill(Tensor& value, double number) {
-    if (number != 0) throw std::invalid_argument("Metal tensor fill currently supports zero only");
-    write(value, nullptr);
+    if (number == 0) {
+        write(value, nullptr);
+        return;
+    }
+    const auto& target = input(value); const auto stream = gpu_stream();
+    auto result = mlx::core::full(target.shape(), arithmetic_scalar(target, number), target.dtype(), stream);
+    write_result(value, std::move(result));
 }
 
 Tensor copy(const Tensor& value, Device target) {
@@ -301,6 +344,7 @@ void index_copy(Tensor& value, std::int64_t dim, const Tensor& indices, const Te
     const auto& target = input(value);
     const auto& selected = input(indices);
     const auto& updates = input(source);
+    if (!value.is_contiguous()) throw std::invalid_argument("Metal in-place update requires contiguous destination");
     const auto axis = dimension(dim, target.ndim());
     if (selected.ndim() != 1 || (selected.dtype() != mlx::core::int32 && selected.dtype() != mlx::core::int64))
         throw std::invalid_argument("Metal indices must be a one-dimensional integer tensor");
@@ -316,7 +360,7 @@ void index_copy(Tensor& value, std::int64_t dim, const Tensor& indices, const Te
     auto expanded = mlx::core::broadcast_to(
         mlx::core::reshape(selected, index_shape, gpu_stream()), updates.shape(), gpu_stream());
     auto result = mlx::core::put_along_axis(target, expanded, updates, axis, gpu_stream());
-    metal::replace(value, std::move(result));
+    write_result(value, std::move(result));
 }
 
 
@@ -460,6 +504,191 @@ Tensor select(const Tensor& value, std::int64_t dim, std::int64_t index) {
     mlx::core::Shape begin(x.ndim(), 0), end = x.shape();
     begin[axis] = static_cast<int>(index); end[axis] = static_cast<int>(index + 1);
     return metal::tensor(mlx::core::squeeze(mlx::core::slice(x, begin, end, gpu_stream()), axis, gpu_stream()));
+}
+
+namespace {
+mlx::core::array scalar(double number) {
+    return mlx::core::array(static_cast<float>(number));
+}
+
+mlx::core::array arithmetic_scalar(const mlx::core::array& value, double number) {
+    const auto type = value.dtype();
+    if (type == mlx::core::float16 || type == mlx::core::bfloat16 || type == mlx::core::float32)
+        return scalar(number);
+    if (!std::isfinite(number) || std::trunc(number) != number)
+        throw std::invalid_argument("Metal integer scalar must be finite and integral");
+    const auto n = static_cast<long double>(number);
+    if (type == mlx::core::uint8 || type == mlx::core::uint16 || type == mlx::core::uint32 || type == mlx::core::uint64) {
+        if (type == mlx::core::uint64 && (number < 0 || number >= 0x1p64))
+            throw std::invalid_argument("Metal integer scalar is out of range");
+        const long double maximum = type == mlx::core::uint8 ? UINT8_MAX : type == mlx::core::uint16 ? UINT16_MAX :
+            type == mlx::core::uint32 ? UINT32_MAX : static_cast<long double>(UINT64_MAX);
+        if (n < 0 || n > maximum) throw std::invalid_argument("Metal integer scalar is out of range");
+        return mlx::core::array(static_cast<std::uint64_t>(number), mlx::core::uint64);
+    }
+    const long double minimum = type == mlx::core::bool_ ? 0 : type == mlx::core::int8 ? INT8_MIN :
+        type == mlx::core::int16 ? INT16_MIN : type == mlx::core::int32 ? INT32_MIN : static_cast<long double>(INT64_MIN);
+    const long double maximum = type == mlx::core::bool_ ? 1 : type == mlx::core::int8 ? INT8_MAX :
+        type == mlx::core::int16 ? INT16_MAX : type == mlx::core::int32 ? INT32_MAX : static_cast<long double>(INT64_MAX);
+    if (type == mlx::core::int64 && (number < -0x1p63 || number >= 0x1p63))
+        throw std::invalid_argument("Metal integer scalar is out of range");
+    if (n < minimum || n > maximum) throw std::invalid_argument("Metal integer scalar is out of range");
+    return mlx::core::array(static_cast<std::int64_t>(number), mlx::core::int64);
+}
+
+void index_type(const mlx::core::array& indices) {
+    if (indices.dtype() != mlx::core::int32 && indices.dtype() != mlx::core::int64)
+        throw std::invalid_argument("Metal indices must be int32 or int64");
+}
+
+void write_result(Tensor& value, mlx::core::array result) {
+    if (!value.is_contiguous()) throw std::invalid_argument("Metal in-place update requires contiguous destination");
+    auto independent = clone(metal::tensor(std::move(result)));
+    copy_into(value, independent);
+}
+
+void scatter_impl(Tensor& value, std::int64_t dim, const Tensor& indices, const Tensor& source, bool add) {
+    const auto& target = input(value); const auto& selected = input(indices); const auto& updates = input(source);
+    const auto axis = dimension(dim, target.ndim());
+    index_type(selected);
+    if (selected.ndim() != target.ndim() || selected.shape() != updates.shape() || target.dtype() != updates.dtype())
+        throw std::invalid_argument("Metal scatter requires matching index and source shapes, rank and dtype");
+    auto end = target.shape();
+    for (int i = 0; i < target.ndim(); ++i) {
+        if (i != axis && selected.shape(i) > target.shape(i))
+            throw std::invalid_argument("Metal scatter index exceeds destination extent");
+        if (i != axis) end[i] = selected.shape(i);
+    }
+    if (add && target.dtype() != mlx::core::int32 && target.dtype() != mlx::core::int64 &&
+        target.dtype() != mlx::core::float16 && target.dtype() != mlx::core::bfloat16 && target.dtype() != mlx::core::float32)
+        throw std::invalid_argument("unsupported Metal scatter_add dtype");
+    const auto stream = gpu_stream();
+    mlx::core::Shape begin(target.ndim(), 0);
+    auto region = mlx::core::slice(target, begin, end, stream);
+    auto updated = add ? mlx::core::scatter_add_axis(region, selected, updates, axis, stream)
+                       : mlx::core::put_along_axis(region, selected, updates, axis, stream);
+    auto result = mlx::core::slice_update(target, updated, begin, end, stream);
+    write_result(value, std::move(result));
+}
+}  // namespace
+
+Tensor clamp_min(const Tensor& value, double minimum) {
+    const auto& x = input(value); const auto stream = gpu_stream();
+    auto bound = arithmetic_scalar(x, minimum);
+    if (std::isnan(minimum)) return value;
+    return metal::tensor(mlx::core::astype(mlx::core::where(mlx::core::isnan(x, stream), bound,
+        mlx::core::maximum(x, bound, stream), stream), x.dtype(), stream));
+}
+Tensor clamp_max(const Tensor& value, double maximum) {
+    const auto& x = input(value); const auto stream = gpu_stream();
+    auto bound = arithmetic_scalar(x, maximum);
+    if (std::isnan(maximum)) return value;
+    return metal::tensor(mlx::core::astype(mlx::core::where(mlx::core::isnan(x, stream), bound,
+        mlx::core::minimum(x, bound, stream), stream), x.dtype(), stream));
+}
+Tensor remainder(const Tensor& value, double divisor) {
+    const auto& x = input(value); const auto stream = gpu_stream();
+    return metal::tensor(mlx::core::astype(mlx::core::remainder(x, arithmetic_scalar(x, divisor), stream), x.dtype(), stream));
+}
+Tensor eq(const Tensor& left, const Tensor& right) {
+    const auto& x = input(left); const auto& y = input(right);
+    if (x.dtype() != y.dtype()) throw std::invalid_argument("Metal comparison requires matching dtypes");
+    return metal::tensor(mlx::core::equal(x, y, gpu_stream()));
+}
+Tensor ne(const Tensor& left, const Tensor& right) {
+    const auto& x = input(left); const auto& y = input(right);
+    if (x.dtype() != y.dtype()) throw std::invalid_argument("Metal comparison requires matching dtypes");
+    return metal::tensor(mlx::core::not_equal(x, y, gpu_stream()));
+}
+Tensor eq(const Tensor& value, double other) {
+    const auto& x = input(value);
+    return metal::tensor(mlx::core::equal(x, arithmetic_scalar(x, other), gpu_stream()));
+}
+Tensor ne(const Tensor& value, double other) {
+    const auto& x = input(value);
+    return metal::tensor(mlx::core::not_equal(x, arithmetic_scalar(x, other), gpu_stream()));
+}
+bool equal(const Tensor& left, const Tensor& right) {
+    const auto& x = input(left); const auto& y = input(right);
+    if (x.shape() != y.shape() || x.dtype() != y.dtype()) return false;
+    if (!x.size()) return true;
+    auto result = mlx::core::array_equal(x, y, gpu_stream());
+    metal::eval(result);
+    return result.item<bool>();
+}
+Tensor masked_select(const Tensor& value, const Tensor& mask) {
+    (void)input(value); (void)input(mask);
+    throw std::invalid_argument("Metal masked_select with dynamic output size is unsupported");
+}
+Tensor gather(const Tensor& value, std::int64_t dim, const Tensor& indices) {
+    const auto& x = input(value); const auto& selected = input(indices); const auto axis = dimension(dim, x.ndim());
+    index_type(selected);
+    if (selected.ndim() != x.ndim()) throw std::invalid_argument("Metal gather requires matching ranks");
+    auto end = x.shape();
+    for (int i = 0; i < x.ndim(); ++i) {
+        if (i != axis && selected.shape(i) > x.shape(i))
+            throw std::invalid_argument("Metal gather index exceeds source extent");
+        if (i != axis) end[i] = selected.shape(i);
+    }
+    const auto stream = gpu_stream();
+    auto region = mlx::core::slice(x, mlx::core::Shape(x.ndim(), 0), end, stream);
+    return metal::tensor(mlx::core::take_along_axis(region, selected, axis, stream));
+}
+Tensor repeat(const Tensor& value, std::span<const std::int64_t> repeats) {
+    const auto& x = input(value);
+    if (repeats.size() < static_cast<std::size_t>(x.ndim()) || repeats.size() > kMaximumTensorRank)
+        throw std::invalid_argument("invalid Metal repeat rank");
+    std::vector<int> counts; counts.reserve(repeats.size());
+    const auto offset = repeats.size() - x.ndim();
+    for (std::size_t i = 0; i < repeats.size(); ++i) {
+        const auto extent = i < offset ? 1 : x.shape(static_cast<int>(i - offset));
+        if (repeats[i] < 0 || repeats[i] > std::numeric_limits<int>::max() ||
+            (extent && repeats[i] > std::numeric_limits<int>::max() / extent))
+            throw std::invalid_argument("invalid Metal repeat extent");
+        counts.push_back(static_cast<int>(repeats[i]));
+    }
+    return metal::tensor(mlx::core::tile(x, std::move(counts), gpu_stream()));
+}
+Tensor repeat_interleave(const Tensor& value, std::int64_t repeats, std::int64_t dim) {
+    const auto& x = input(value); const auto axis = dimension(dim, x.ndim());
+    if (repeats < 0 || repeats > std::numeric_limits<int>::max() ||
+        (x.shape(axis) && repeats > std::numeric_limits<int>::max() / x.shape(axis)))
+        throw std::invalid_argument("invalid Metal repeat extent");
+    return metal::tensor(mlx::core::repeat(x, static_cast<int>(repeats), axis, gpu_stream()));
+}
+Tensor tril(const Tensor& value, std::int64_t diagonal) {
+    const auto& x = input(value);
+    if (x.ndim() < 2 || diagonal < std::numeric_limits<int>::min() || diagonal > std::numeric_limits<int>::max())
+        throw std::invalid_argument("invalid Metal tril geometry");
+    return metal::tensor(mlx::core::tril(x, static_cast<int>(diagonal), gpu_stream()));
+}
+Tensor masked_fill(const Tensor& value, const Tensor& mask, double number) {
+    const auto& x = input(value); const auto& flags = input(mask); const auto stream = gpu_stream();
+    auto condition = mlx::core::broadcast_to(mlx::core::astype(flags, mlx::core::bool_, stream), x.shape(), stream);
+    auto fill = mlx::core::astype(scalar(number), x.dtype(), stream);
+    return metal::tensor(mlx::core::where(condition, fill, x, stream));
+}
+void masked_fill_inplace(Tensor& value, const Tensor& mask, double number) {
+    write_result(value, input(masked_fill(value, mask, number)));
+}
+void scatter_add(Tensor& value, std::int64_t dim, const Tensor& indices, const Tensor& source) {
+    scatter_impl(value, dim, indices, source, true);
+}
+void scatter(Tensor& value, std::int64_t dim, const Tensor& indices, const Tensor& source) {
+    scatter_impl(value, dim, indices, source, false);
+}
+void index_fill(Tensor& value, std::int64_t dim, const Tensor& indices, double number) {
+    const auto& x = input(value); const auto& selected = input(indices); const auto axis = dimension(dim, x.ndim());
+    index_type(selected);
+    if (selected.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+        throw std::overflow_error("Metal index extent exceeds int32 limit");
+    const auto stream = gpu_stream();
+    mlx::core::Shape shape(x.ndim(), 1); shape[axis] = static_cast<int>(selected.size());
+    auto output_shape = x.shape(); output_shape[axis] = shape[axis];
+    auto expanded = mlx::core::broadcast_to(mlx::core::reshape(selected, shape, stream), output_shape, stream);
+    auto fill = mlx::core::astype(scalar(number), x.dtype(), stream);
+    auto updates = mlx::core::broadcast_to(fill, output_shape, stream);
+    write_result(value, mlx::core::put_along_axis(x, expanded, updates, axis, stream));
 }
 
 }  // namespace tyloi::metal::ops

@@ -77,8 +77,8 @@ public:
 
     explicit Sampler(Params params, Device device)
         : params_(std::move(params)), rng_(params_.seed),
-          random_host_(ops::empty({1}, TensorOptions().dtype(kFloat32).device(kCPU).pinned_memory(true))),
-          random_cuda_(ops::empty({1}, TensorOptions().dtype(kFloat32).device(device))) {
+          random_host_(ops::empty({1}, TensorOptions().dtype(kFloat32).device(kCPU).pinned_memory(!device.is_metal()))),
+          random_device_(ops::empty({1}, TensorOptions().dtype(kFloat32).device(device))) {
         if (params_.top_k < 0)
             throw std::invalid_argument("top_k must be non-negative");
     }
@@ -106,8 +106,8 @@ public:
     }
     Tensor sample(const Tensor& logits) {
         if (greedy()) return ops::sample_greedy(logits);
-        ops::copy_into(random_cuda_, next_random());
-        return ops::sample_stochastic(logits, random_cuda_, params_.temperature, params_.top_k, params_.top_p);
+        ops::copy_into(random_device_, next_random());
+        return ops::sample_stochastic(logits, random_device_, params_.temperature, params_.top_k, params_.top_p);
     }
     Tensor sample(Tensor& logits, const Tensor& counts) {
         if (has_penalties()) apply_penalties(logits, counts);
@@ -121,7 +121,7 @@ public:
 private:
     Params params_;
     std::mt19937_64 rng_;
-    Tensor random_host_, random_cuda_;
+    Tensor random_host_, random_device_;
 };
 
 inline Tensor sample_logits(Sampler& sampler, Tensor logits, const Tensor& counts,
@@ -135,7 +135,7 @@ inline Tensor sample_logits(Sampler& sampler, Tensor logits, const Tensor& count
         auto masked = ops::constrain(logits, token_constraint);
         next = sampler.sample(ops::contiguous(ops::copy(masked, logits.device())));
         if (!token_constraint->allows(ops::item(next)))
-            throw std::runtime_error("CUDA constrained sampler returned an invalid token");
+            throw std::runtime_error("constrained sampler returned an invalid token");
     }
     if (token_constraint)
         token_constraint->accept(ops::item(next));

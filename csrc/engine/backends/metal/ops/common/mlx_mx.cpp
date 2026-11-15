@@ -1,7 +1,7 @@
 #include "mlx_mx.h"
 
 #include "engine/backends/metal/native/device.h"
-#include "mlx_transformer.h"
+#include "engine/backends/metal/ops/rope/adjacent.h"
 #include "engine/backends/metal/native/allocation.h"
 
 #include <algorithm>
@@ -1529,7 +1529,7 @@ array mlx_weighted_rms_rope_mxfp8_sim(
     }
     const auto reference = [&] {
         auto result = mlx_weighted_rms(input, norm_weight, eps);
-        result = mlx_rope_adjacent(
+        result = tyloi::metal::ops::adjacent_rope(
             result,
             rotary_dimension,
             cosine,

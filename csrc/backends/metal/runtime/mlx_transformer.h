@@ -23,26 +23,11 @@ MlxYarnScaling qwen_yarn_scaling(const MlxYarnScaling& settings,
     std::int64_t native_context, std::int64_t requested_context, double maximum_factor);
 double yarn_frequency(int pair, int dimension, double theta, const MlxYarnScaling& scaling);
 
-// Model-neutral adjacent-pair RoPE primitives. Architecture adapters provide
-// the configured YaRN parameters but do not own the table builder or kernel.
 std::pair<mlx::core::array, mlx::core::array> mlx_yarn_tables(
     int dimension,
     int length,
     float theta,
     const MlxYarnScaling& scaling = {});
-
-mlx::core::array mlx_rope_adjacent(
-    const mlx::core::array& value,
-    int rotary_dimension,
-    const mlx::core::array& cosine,
-    const mlx::core::array& sine,
-    bool inverse = false);
-
-mlx::core::array mlx_rope_adjacent(
-    const mlx::core::array& value,
-    const mlx::core::array& cosine,
-    const mlx::core::array& sine,
-    bool inverse = false);
 
 mlx::core::array apply_rope(
     const mlx::core::array& input,
