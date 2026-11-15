@@ -26,7 +26,8 @@ public:
     int64_t position() const noexcept override { return position_; }
     /** Plan new KV backing for the next predictor operation. */
     std::vector<std::pair<tyloi::Device, std::size_t>> growth(
-        int64_t batch, int64_t tokens, int64_t capacity) const;
+        int64_t batch, int64_t tokens, int64_t capacity, bool resetting = false) const;
+    std::vector<Tensor> storage() const override;
     void prepare(int64_t batch, int64_t tokens, int64_t kl_capacity = 0);
     void reset(int64_t batch);
     void advance(int64_t tokens);

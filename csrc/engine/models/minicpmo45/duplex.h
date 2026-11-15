@@ -4,6 +4,10 @@
 #include "engine/models/minicpmo45/text/state.h"
 #include "engine/models/minicpmo45/audio.h"
 #include "engine/models/minicpmo45/tts.h"
+#include "engine/requests/media.h"
+#include "engine/requests/result.h"
+
+#include <optional>
 
 struct MiniCPMO45DuplexSpecialIds {
     int64_t unit_start = -1;
@@ -502,3 +506,39 @@ struct MiniCPMO45DuplexSession {
         return result;
     }
 };
+
+namespace tyloi::cuda::minicpmo45 {
+
+// Own one MiniCPM duplex session while borrowing the immutable model.
+class Duplex {
+public:
+    struct StepInput {
+        std::int64_t audio_prefix_extra_frames = 0, audio_suffix_extra_frames = 0;
+        std::int64_t max_new_speak_tokens = 20;
+        bool force_listen = false, force_speak = false;
+        Tensor pixels, patch_mask, target_sizes, image_slice_counts, audio_features, text_ids;
+    };
+    struct StepOutput {
+        MfqDuplexStepResult result;
+        Tensor decision_logits, audio_embeddings, generated_ids, tts_codes;
+    };
+
+    explicit Duplex(const text::Model& model);
+    std::vector<std::pair<Device, std::size_t>> growth(
+        const MfqDuplexSessionParams&, const models::ForwardOptions&) const;
+    std::vector<std::pair<Device, std::size_t>> growth(
+        const MfqDuplexStepInput&, const models::ForwardOptions&) const;
+    void start(const MfqDuplexSessionParams&, const models::ForwardOptions&);
+    MfqDuplexStepResult step(const MfqDuplexStepInput&, const models::ForwardOptions&);
+    StepOutput step(StepInput, const models::ForwardOptions&);
+    void reset(const models::ForwardOptions&);
+    void stop();
+
+private:
+    void prepare();
+    const text::Model& model_;
+    std::optional<MiniCPMO45DuplexSession> session_;
+    std::optional<MfqDuplexSessionParams> parameters_;
+};
+
+} // namespace tyloi::cuda::minicpmo45

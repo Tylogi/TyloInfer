@@ -23,9 +23,9 @@ Header header(SessionBlockReader& reader) {
         throw CudaSessionStateError("invalid DeepSeek-V4.1 prefix header");
     return result;
 }
-void optional(SessionBlockWriter& writer,const ::tyloi::Tensor& value) {
+void optional(SessionBlockWriter& writer,const ::tyloi::Tensor& value,int device = -1) {
     writer.scalar<uint32_t>(value.defined()?1:0);
-    if(value.defined())writer.tensor(value);
+    if(value.defined())writer.tensor(value,device);
 }
 ::tyloi::Tensor optional(SessionBlockReader& reader,int expected_device) {
     const auto present=reader.scalar<uint32_t>("tensor presence");
@@ -67,25 +67,28 @@ SessionBlockPayload encode_block(
         const int64_t ratio=compressed && compressed->defined()?(layer.partial_kv && layer.partial_kv.defined()?layer.partial_kv.size(1):1):0;
         const int64_t kv_width=ratio?compressed->size(2):0;
         const int64_t index_width=ratio && index && index->defined()?index->size(2):0;
+        if (!layer.local_kv || !layer.local_kv.defined())
+            throw std::runtime_error("inconsistent DeepSeek-V4.1 compression checkpoint");
+        const auto device = layer.original_device >= 0 ? layer.original_device : layer.local_kv.device().index;
         if((layer.compressed_kv && !compressed) || (layer.index_k && !index) ||
-                !layer.local_kv || !layer.local_kv.is_cuda() || (ratio && (!index_width ||
+                !layer.local_kv || (layer.original_device >= 0 ? !layer.local_kv.is_cpu() : !layer.local_kv.is_cuda()) || (ratio && (!index_width ||
                 layer.compressed_length!=state.cache_pos/ratio ||
                 layer.partial_length!=state.cache_pos%ratio ||
                 !shape(*compressed,layer.compressed_length,kv_width,::tyloi::kFloat16) ||
                 !shape(*index,layer.compressed_length,index_width,::tyloi::kFloat16))))
             throw std::runtime_error("inconsistent DeepSeek-V4.1 compression checkpoint");
         writer.scalar<int64_t>(ratio);writer.scalar<int64_t>(kv_width);writer.scalar<int64_t>(index_width);
-        writer.scalar<int32_t>(layer.local_kv.get_device());
+        writer.scalar<int32_t>(device);
         const auto range=[&](const ::tyloi::DenseTensor* value) {
             if(ratio && value && end/ratio>start/ratio) {
                 auto part=value->narrow(1,int64_t(start)/ratio,int64_t(end/ratio-start/ratio));
-                optional(writer,part);
+                optional(writer,part,layer.original_device);
             } else optional(writer,::tyloi::Tensor{});
         };
         range(compressed);range(index);
-        optional(writer,exact?layer.local_kv:tyloi::Tensor{});
-        optional(writer,exact?layer.partial_kv:tyloi::Tensor{});
-        optional(writer,exact?layer.partial_score:tyloi::Tensor{});
+        optional(writer,exact?layer.local_kv:tyloi::Tensor{},layer.original_device);
+        optional(writer,exact?layer.partial_kv:tyloi::Tensor{},layer.original_device);
+        optional(writer,exact?layer.partial_score:tyloi::Tensor{},layer.original_device);
     }
     if(exact) {
         const auto& context=snapshot->engram->context;
@@ -96,14 +99,16 @@ SessionBlockPayload encode_block(
             const auto* rings=std::get_if<tyloi::models::deepseek_v41::MtpSnapshot>(&mtp.payload);
             const auto& hidden=mtp.last_target_hidden;
             if(mtp.cache_pos!=state.cache_pos || !rings || rings->rings.empty() ||
+                    (!rings->ring_devices.empty() && rings->ring_devices.size()!=rings->rings.size()) ||
                     !hidden.defined())
                 throw std::runtime_error("incompatible DeepSeek-V4.1 DSpark checkpoint");
-            writer.tensor(hidden);
+            writer.tensor(hidden,rings->hidden_device);
             writer.scalar<uint32_t>(uint32_t(rings->rings.size()));
-            for(const auto& ring:rings->rings) {
+            for(size_t i=0;i<rings->rings.size();++i) {
+                const auto& ring=rings->rings[i];
                 if(!ring || !ring.defined())
                     throw std::runtime_error("incompatible DeepSeek-V4.1 DSpark checkpoint");
-                writer.tensor(ring);
+                writer.tensor(ring,rings->ring_devices.empty() ? -1 : rings->ring_devices[i]);
             }
         }
     }
@@ -199,8 +204,7 @@ TextSessionState decode_session(
     }
     for(size_t j=0;j<layers.size();++j) {
         auto& layer=layers[j];const auto& layout=layouts[j];
-        const auto device=::tyloi::Device{::tyloi::DeviceType::cuda,layout.device};
-        layer.local_kv=layer.local_kv.relocated(device);
+        layer.original_device=layout.device;
         if(layout.ratio) {
             layer.compressed_length=state.cache_pos/layout.ratio;layer.partial_length=state.cache_pos%layout.ratio;
             std::array<::tyloi::Tensor*,2> destination{&layer.compressed_kv,&layer.index_k};
@@ -211,10 +215,7 @@ TextSessionState decode_session(
                     parts.size()==1?parts.front(): concatenate_session_tensors(parts,1);
                 if(!shape(value,layer.compressed_length,width,::tyloi::kFloat16))
                     throw CudaSessionStateError("incomplete DeepSeek-V4.1 compressed prefix");
-                *destination[field]=tyloi::ops::copy(value,device);
-            }
-            if(layout.ratio>1) {
-                layer.partial_kv=layer.partial_kv.relocated(device);layer.partial_score=layer.partial_score.relocated(device);
+                *destination[field]=std::move(value);
             }
         }
         for(const auto* tensor:{&layer.local_kv,&layer.compressed_kv,&layer.index_k,&layer.partial_kv,&layer.partial_score})
@@ -222,12 +223,12 @@ TextSessionState decode_session(
     }
     if(!predictor.empty()) {
         auto& mtp=state.mtp.emplace();mtp.cache_pos=state.cache_pos;
-        auto& rings=mtp.payload.emplace<tyloi::models::deepseek_v41::MtpSnapshot>().rings;
+        auto& saved=mtp.payload.emplace<tyloi::models::deepseek_v41::MtpSnapshot>();
         for(size_t i=0;i<predictor.size();++i) {
             auto& [value,device]=predictor[i];
-            auto target=value.relocated(::tyloi::Device{::tyloi::DeviceType::cuda,device});mtp.bytes+=session_tensor_bytes(target);
-            if(!i)mtp.last_target_hidden=std::move(target);
-            else rings.push_back(std::move(target));
+            mtp.bytes+=session_tensor_bytes(value);
+            if(!i) { mtp.last_target_hidden=std::move(value); saved.hidden_device=device; }
+            else { saved.rings.push_back(std::move(value)); saved.ring_devices.push_back(device); }
         }
         state.bytes+=mtp.bytes;
     }

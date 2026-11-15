@@ -198,7 +198,7 @@ tyloi::models::Info Model::info() const {
 }
 
 MfqModelCapabilities Model::capabilities() const {
-    const auto state = ::tyloi::models::component_state(graph, plan, bool(vision), false);
+    const auto state = ::tyloi::models::component_state(graph, plan, bool(vision), bool(predictor()));
     const auto caps = ::tyloi::models::runtime_capabilities(graph, plan, state, bool(vision), false);
     return {graph.architecture, caps.text, caps.image_input, caps.video_input,
         caps.audio_input, caps.audio_output, caps.full_duplex, caps.mtp,
@@ -206,7 +206,7 @@ MfqModelCapabilities Model::capabilities() const {
 }
 
 tyloi::engine::Metrics Model::metrics() const {
-    const auto state = ::tyloi::models::component_state(graph, plan, bool(vision), false);
+    const auto state = ::tyloi::models::component_state(graph, plan, bool(vision), bool(predictor()));
     return {{"kv_memory_supported", 0.0},
         {"kv_quantization_supported", 0.0},
         {"kv_quantization_bits", 0.0},
@@ -219,7 +219,9 @@ tyloi::engine::Metrics Model::metrics() const {
 }
 
 std::unique_ptr<tyloi::models::State> Model::make_state() const {
-    return std::make_unique<State>(const_cast<Model&>(*this));
+    auto state = std::make_unique<State>(const_cast<Model&>(*this));
+    if (auto* draft = predictor()) state->predictor = draft->make_state();
+    return state;
 }
 
 tyloi::StepSequence<tyloi::models::Prepared> Model::prepare(
@@ -242,9 +244,11 @@ tyloi::StepSequence<tyloi::models::Prepared> Model::prepare(
     return std::make_shared<DenseTensor>(logits.dense());
 }
 
-::tyloi::Tensor Model::logits(const tyloi::Tensor& hidden, bool) const {
+::tyloi::Tensor Model::logits(const tyloi::Tensor& hidden, bool, tyloi::models::LogitPrecision precision) const {
+    auto projection_input = precision == tyloi::models::LogitPrecision::model
+        ? tyloi::ops::contiguous(tyloi::ops::cast(hidden, tyloi::kFloat16)) : hidden;
     return tyloi::ops::measure("model.lm_head", [&] {
-        return tyloi::ops::project(hidden, lm_head);
+        return tyloi::ops::project(projection_input, lm_head);
     });
 }
 

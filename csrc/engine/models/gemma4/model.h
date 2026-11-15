@@ -52,7 +52,7 @@ struct Model : public tyloi::models::CausalModel {
     /** Apply the configured final logit soft cap. */
     ::tyloi::Tensor softcap(const tyloi::Tensor& logits) const override;
     /** Project hidden states to optionally capped logits. */
-    ::tyloi::Tensor logits(const tyloi::Tensor& hidden, bool capped = true) const override;
+    ::tyloi::Tensor logits(const tyloi::Tensor& hidden, bool capped = true, tyloi::models::LogitPrecision precision = tyloi::models::LogitPrecision::model) const override;
     /** Run the model with its creating request State, rejecting a foreign State before mutation. */
     ::tyloi::Tensor forward(tyloi::models::Input input, tyloi::models::State& state,
                         const Options& options = {}) const override;

@@ -4,6 +4,7 @@
 #include "engine/requests/result.h"
 #include "engine/metrics.h"
 #include "engine/generation/sequence.h"
+#include "engine/models/input.h"
 
 #include <cstdint>
 #include <memory>
@@ -24,6 +25,7 @@ struct BatchConfig {
     int cached_slots = 0;
     bool graph = false, greedy = false;
     std::int64_t minimum = 0;
+    ForwardOptions forward;
 };
 
 struct BatchSample {

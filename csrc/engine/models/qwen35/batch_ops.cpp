@@ -1,459 +1,362 @@
-#include "engine/models/qwen35/batch_ops.h"
-#include "engine/models/batch.h"
-#include "engine/models/input.h"
-
-#include "engine/backends/cuda/kernels/mfq_cuda_sampling_ops.h"
+#include "engine/models/qwen35/batch.h"
+#include "engine/models/common/check.h"
+#include "engine/ops.h"
+#include "engine/backends/cuda/executor/decode_window.h"
 #include "engine/backends/cuda/executor/decode_graph.h"
+#include "engine/backends/cuda/executor/executor.h"
 #include "engine/backends/cuda/ops/attention/scratch.h"
-#include "engine/budget.h"
-#include "components/error.h"
 
 #include <algorithm>
+#include <array>
 #include <exception>
-#include <memory>
-#include <optional>
+#include <limits>
 #include <stdexcept>
-#include <string>
 #include <utility>
-#include <vector>
 
-namespace tyloi::cuda::qwen35 {
+namespace tyloi::models::qwen35 {
+namespace {
 
-using tyloi::cuda::internal::PrefillCudaTimer;
-using DenseTensor = ::tyloi::DenseTensor;
-
-tyloi::engine::PrefillChunk BatchOps::prefill_chunk(
-        const std::shared_ptr<Request>&, tyloi::engine::PrefillChunk chunk) {
-    TYLOINFER_RUNTIME_CHECK(budget_, "continuous batching budget is not bound");
-    const auto row_bytes = std::size_t(model_.metadata.hidden_size) * model_.metadata.hc_mult * sizeof(float) * 8;
-    return budget_->batch(tyloi::Device{tyloi::DeviceType::cuda, mode_.primary}, row_bytes, chunk);
-}
-
-bool batch_graph_enabled(const tyloi::models::qwen35::Model& model, const tyloi::engine::ContinuousBatchConfig& config) {
-    return config.cuda_graph && !tyloi::models::qwen35::Batch::has_cached_moe(model) &&
-           mfq_cuda_graph_capture_supported();
-}
-
-static std::unique_ptr<Executor> require_executor(std::unique_ptr<Executor> executor) {
-    if (!executor)
-        throw std::invalid_argument("continuous batching requires an executor");
-    return executor;
-}
-
-BatchOps::BatchOps(const tyloi::models::qwen35::Model& model, std::unique_ptr<Executor> executor,
-                   Collectives& collectives, Executor::Mode mode, tyloi::models::qwen35::Batch::Options options,
-                   tyloi::engine::ContinuousBatchConfig config)
-    : model_(model), collectives_(collectives), mode_(mode),
-      executor_(require_executor(std::move(executor))),
-      state_(model_, mode_.transposed, options),
-      config_(std::move(config)),
-      max_sequences_(static_cast<int32_t>(config_.max_sequences)),
-      moe_enabled_(state_.has_moe()),
-      cached_moe_enabled_(state_.has_cached_moe()) {}
-
-BatchOps::~BatchOps() = default;
-
-int64_t BatchOps::vocab_size() const { return model_.metadata.vocab_size; }
-
-int64_t BatchOps::max_context() const { return model_.metadata.max_position_embeddings; }
-
-std::vector<std::pair<std::string, double>> BatchOps::metrics() const {
-    const auto paged = state_.paged_kv_stats();
-    return {
-        {"continuous_batching_decode_batches", static_cast<double>(decode_batches_)},
-        {"continuous_batching_decode_tokens", static_cast<double>(decode_tokens_)},
-        {"continuous_batching_compactions", 0.0},
-        {"continuous_batching_stable_slot_releases",
-         static_cast<double>(state_.slot_releases())},
-        {"continuous_batching_batched_greedy_batches",
-         static_cast<double>(batched_greedy_batches_)},
-        {"continuous_batching_packed_metadata_batches",
-         static_cast<double>(packed_metadata_batches_)},
-        {"continuous_batching_cuda_graph_captures", static_cast<double>(cuda_graph_captures_)},
-        {"continuous_batching_cuda_graph_replays", static_cast<double>(cuda_graph_replays_)},
-        {"continuous_batching_moe", moe_enabled_ ? 1.0 : 0.0},
-        {"continuous_batching_moe_cached_row_serial", cached_moe_enabled_ ? 1.0 : 0.0},
-        {"continuous_batching_paged_kv", state_.paged_kv_enabled() ? 1.0 : 0.0},
-        {"paged_kv_page_size", static_cast<double>(paged.page_size)},
-        {"paged_kv_live_pages", static_cast<double>(paged.live_pages)},
-        {"paged_kv_peak_live_pages", static_cast<double>(paged.peak_live_pages)},
-        {"paged_kv_capacity_pages", static_cast<double>(paged.capacity_pages)},
-        {"paged_kv_reserved_bytes", static_cast<double>(paged.reserved_bytes)},
-        {"paged_kv_page_allocations", static_cast<double>(paged.allocations)},
-        {"paged_kv_page_reuses", static_cast<double>(paged.reuses)},
-        {"paged_kv_page_releases", static_cast<double>(paged.releases)},
-        {"paged_kv_table_updates", static_cast<double>(paged.table_updates)},
-    };
-}
-
-void BatchOps::initialize_sampling(Request& request, const DenseTensor& prompt_ids) {
-    request.sampler.emplace(request.sampling, ::tyloi::Device(::tyloi::kCUDA, mode_.primary));
-    if (request.sampler->has_penalties())
-        request.counts = SamplingOps::token_counts(prompt_ids, vocab_size());
-}
-
-void BatchOps::suspend_decode() { invalidate_decode_graph(); }
-
-BatchOps::Sample BatchOps::prefill(const std::shared_ptr<Request>& request,
-                                   tyloi::engine::PrefillChunk chunk) {
-    const int primary = mode_.primary;
-    if (chunk.offset == 0 && !request->executor)
-        request->executor = executor_->fork();
-    state_.prepare_prefill(request->cache, chunk.offset, request->prompt.size());
-    if (chunk.offset == 0) {
-        request->prefill_ids =
-            ::tyloi::cuda::tensor(
-                request->prompt,
-                ::tyloi::TensorOptions()
-                    .dtype(::tyloi::kInt64)
-                    .device(::tyloi::Device(::tyloi::kCUDA, primary)))
-                .reshape({1, -1})
-                .contiguous();
-        initialize_sampling(*request, request->prefill_ids);
+void add(BatchGrowth& result, const BatchGrowth& value) {
+    for (const auto& [device, bytes] : value) {
+        auto it = std::find_if(result.begin(), result.end(), [&](const auto& item) { return item.first == device; });
+        if (it == result.end()) result.emplace_back(device, bytes);
+        else {
+            if (it->second > std::numeric_limits<std::size_t>::max() - bytes)
+                throw std::overflow_error("Qwen batch growth overflow");
+            it->second += bytes;
+        }
     }
-    ::tyloi::Tensor hidden;
-    std::unique_ptr<PrefillCudaTimer> final_timer;
-    auto chunk_timer = std::make_unique<PrefillCudaTimer>();
-    MfqOptional<DenseTensor> length = mfq_nullopt;
-    if (chunk.offset > 0 && chunk.count == 1)
-        length =
-            ::tyloi::cuda::full({1}, chunk.offset + 1, request->prefill_ids.options());
-    tyloi::models::Input input;
-    input.ids = request->prefill_ids.narrow(1, chunk.offset, chunk.count).contiguous();
-    input.lengths = length.value_or(::tyloi::DenseTensor());
-    {
-        auto scope = request->executor->enter(mfq_current_cuda_device(), mode_.ffn);
-        hidden = model_.forward(std::move(input), request->cache.state(),
-            {mode_.kv_capacity, mode_.trace, mode_.trace_layer, mode_.primary, mode_.ffn.batch_serial});
-    }
-    const auto end = chunk.offset + chunk.count;
-    if (end < request->prefill_ids.size(1)) {
-        TYLOINFER_CUDA_CHECK(
-            cudaEventRecord(chunk_timer->finished_event(), mfq_get_current_cuda_stream()));
-        request->prefill_timers.push_back(std::move(chunk_timer));
-    } else {
-        final_timer = std::move(chunk_timer);
-    }
-    if (end < static_cast<int64_t>(request->prompt.size()))
-        return {};
-    auto logits = logits_from_last_hidden(std::move(hidden), mode_);
-    TYLOINFER_RUNTIME_CHECK(final_timer != nullptr, "continuous batching lost the prefill timer");
-    TYLOINFER_CUDA_CHECK(
-        cudaEventRecord(final_timer->finished_event(), mfq_get_current_cuda_stream()));
-    request->prefill_timers.push_back(std::move(final_timer));
-    auto next = tyloi::engine::sample_logits(*request->sampler, std::move(logits), request->counts,
-                                         request->token_constraint);
-    const int64_t token = tyloi::ops::item(next);
-    double prefill_ms = 0.0;
-    for (const auto& timer : request->prefill_timers)
-        prefill_ms += timer->elapsed_ms();
-    request->prefill_timers.clear();
-    request->prefill_ids = DenseTensor();
-    return {std::move(next), token, {request->prompt.size(), prefill_ms, 0.0, prefill_ms}};
 }
 
-void BatchOps::activate(const std::shared_ptr<Request>& request, const Sample& sample) {
-    if (request->counts.defined())
-        tyloi::ops::add_token_counts(request->counts, tyloi::ops::contiguous(sample.next));
-    TYLOINFER_RUNTIME_CHECK(request->executor,
-                            "continuous batching request has no prefill state");
-    state_.activate(request->cache);
-    request->executor.reset();
-}
+class PublicBatch;
 
-void BatchOps::resume_decode(int64_t cache_position) {
-    state_.resume_decode(cache_position);
-}
+class Request final : public models::BatchState {
+public:
+    Request(PublicBatch& owner, std::int64_t prompt) : owner_(owner), prompt_(prompt) {}
+    std::int64_t position() const override { return position_; }
+    std::size_t resident_bytes() const override;
+    BatchGrowth initial_growth_bytes() const override;
+    void initialize() override;
+    BatchGrowth prefill_growth_bytes(std::int64_t tokens) const override;
+    std::vector<Tensor> storage() const override;
+    PublicBatch& owner_;
+    std::int64_t prompt_, position_ = 0;
+    RequestState cache_;
+};
 
-void BatchOps::discard_prefill(const std::shared_ptr<Request>& request) {
-    mfq_cuda_synchronize();
-    state_.release(request->cache);
-    request->executor.reset();
-    request->prefill_timers.clear();
-    request->prefill_ids = DenseTensor();
-}
-
-void BatchOps::retire(const std::vector<std::shared_ptr<Request>>& retired,
-                      int64_t cache_position) {
-    for (const auto& request : retired) {
-        state_.release(request->cache);
-        request->executor.reset();
+class PublicBatch final : public models::Batch {
+    struct GraphPlan final : Plan { std::int64_t length = 0; };
+public:
+    PublicBatch(const Model& model, BatchConfig config)
+        : model_(model), config_(std::move(config)), options_{config_.slots, config_.paged,
+            config_.preallocate, config_.cpu_offload, config_.cached_slots} {
+        require_model(config_.slots > 0 && config_.slots <= 32,
+            "Qwen continuous batching supports 1..32 requests");
     }
-    if (cache_position == 0)
-        invalidate_decode_graph();
-    state_.finish_retire(cache_position);
+    BatchGrowth initial_growth_bytes() const override { return Batch::construction_growth(model_, options_); }
+    void initialize() override { state_ = std::make_unique<Batch>(model_, model_.recurrent_transposed, options_); }
+    std::unique_ptr<models::BatchState> make_state(std::int64_t prompt) override {
+        require_model(state_ && prompt > 0, "invalid Qwen batch prompt");
+        return std::make_unique<Request>(*this, prompt);
+    }
+    BatchGrowth activate_growth(const models::BatchState& value) const override {
+        return state_->activate_growth(request(value).cache_, config_.forward);
+    }
+    void activate(models::BatchState& value) override { state_->activate(request(value).cache_); }
+    void release(models::BatchState& value) override { clear(); state_->release(request(value).cache_); }
+    void resume(std::int64_t position) override { state_->resume_decode(position); }
+    void retire(std::int64_t position) override { state_->finish_retire(position); }
+    void recover() override { state_->finish_retire(0); }
+    BatchGrowth decode_growth(std::span<const BatchRow> rows) const override;
+    void prepare_decode(std::span<const BatchRow> rows) override;
+    std::size_t prefill_row_bytes() const override {
+        return std::size_t(model_.metadata.hidden_size) * model_.metadata.hc_mult * sizeof(float) * 8;
+    }
+    StepSequence<std::vector<Tensor>> prefill(std::vector<models::BatchState*> states,
+        std::vector<Tensor> ids) override;
+    Tensor decode(std::span<const BatchRow> rows, Tensor ids, const Tensor& host_ids) override;
+    StepSequence<std::unique_ptr<Plan>> plan(std::span<const BatchRow>, bool) override;
+    StepSequence<std::optional<Tensor>> capture(std::span<const BatchRow>, const Tensor&,
+        const Tensor&, bool, const Plan&) override;
+    void clear() override;
+    engine::Metrics metrics() const override;
+
+    Request& request(models::BatchState& value) const {
+        auto* result = dynamic_cast<Request*>(&value);
+        require_model(result && &result->owner_ == this, "Qwen batch state belongs to another batch");
+        return *result;
+    }
+    const Request& request(const models::BatchState& value) const {
+        auto* result = dynamic_cast<const Request*>(&value);
+        require_model(result && &result->owner_ == this, "Qwen batch state belongs to another batch");
+        return *result;
+    }
+    const Model& model_;
+    BatchConfig config_;
+    Batch::Options options_;
+    std::unique_ptr<Batch> state_;
+    std::unique_ptr<cuda::DecodeStream> stream_;
+    std::unique_ptr<cuda::DecodeWindow> window_;
+    Tensor graph_metadata_, graph_output_;
+    std::int64_t graph_length_ = 0;
+    std::int64_t captures_ = 0, replays_ = 0;
+};
+
+std::size_t Request::resident_bytes() const {
+    std::size_t result = 0;
+    if (cache_.initialized()) for (const auto& tensor : cache_.state().storage()) {
+        const auto bytes = std::size_t(tensor.numel()) * tensor.element_size();
+        if (result > std::numeric_limits<std::size_t>::max() - bytes)
+            throw std::overflow_error("Qwen batch resident size overflow");
+        result += bytes;
+    }
+    return result;
+}
+BatchGrowth Request::initial_growth_bytes() const { return owner_.state_->request_growth(cache_, prompt_); }
+void Request::initialize() { owner_.state_->prepare_prefill(cache_, 0, prompt_); }
+BatchGrowth Request::prefill_growth_bytes(std::int64_t tokens) const {
+    if (!cache_.initialized()) return {};
+    auto result = cache_.state().growth_for(1, tokens, owner_.config_.forward, owner_.options_.paged);
+    add(result, owner_.state_->request_growth(cache_, prompt_));
+    return result;
+}
+std::vector<Tensor> Request::storage() const {
+    return cache_.initialized() ? cache_.state().storage() : owner_.state_->state().storage();
 }
 
-void BatchOps::ensure_decode_metadata_buffers(int primary) {
-    if (decode_metadata_host_.defined())
-        return;
-    const int64_t capacity = 3 * static_cast<int64_t>(max_sequences_);
-    decode_metadata_host_ =
-        ::tyloi::cuda::empty({capacity}, ::tyloi::TensorOptions()
-                                                  .dtype(::tyloi::kInt64)
-                                                  .device(::tyloi::kCPU)
-                                                  .pinned_memory(true));
-    decode_metadata_cuda_ = ::tyloi::cuda::empty(
-        {capacity}, ::tyloi::TensorOptions()
-                        .dtype(::tyloi::kInt64)
-                        .device(::tyloi::Device(::tyloi::kCUDA, primary)));
+BatchGrowth PublicBatch::decode_growth(std::span<const BatchRow> rows) const {
+    std::vector<std::pair<const RequestState*, std::int64_t>> requests;
+    std::size_t paused = 0;
+    for (const auto& row : rows) {
+        const auto& item = request(*row.state);
+        requests.emplace_back(&item.cache_, row.position + 1);
+        if (!row.eligible) ++paused;
+    }
+    auto result = state_->decode_growth(requests);
+    if (paused) for (const auto& layer : state_->state().layers) {
+        if (const auto* linear = std::get_if<LinearState>(&layer); linear && linear->mixer.defined()) {
+            for (const auto& tensor : {linear->mixer.view().convolution, linear->mixer.view().recurrent}) {
+                const auto bytes = std::size_t(tensor.numel()) / config_.slots * paused * tensor.element_size();
+                add(result, {{tensor.device(), bytes * 2}});
+            }
+        }
+    }
+    return result;
 }
 
-void BatchOps::invalidate_decode_graph() {
-    for (auto& graph : decode_graphs_)
-        graph->invalidate();
-    decode_graphs_.clear();
+void PublicBatch::prepare_decode(std::span<const BatchRow> rows) {
+    std::int64_t maximum = 0;
+    for (const auto& row : rows) {
+        auto& item = request(*row.state);
+        require_model(item.position_ == row.position, "Qwen batch position mismatch");
+        state_->ensure_decode_tokens(item.cache_, row.position + 1);
+        maximum = std::max(maximum, row.position);
+    }
+    state_->prepare_decode(maximum);
 }
 
-std::vector<const void*> BatchOps::decode_state_addresses() {
-    std::vector<const void*> addresses;
-    const auto storage = state_.state().storage();
-    addresses.reserve(storage.size());
-    for (const auto& tensor : storage)
-        addresses.push_back(tensor.dense().data_ptr());
-    return addresses;
+StepSequence<std::vector<Tensor>> PublicBatch::prefill(std::vector<models::BatchState*> states,
+        std::vector<Tensor> ids) {
+    require_model(states.size() == 1 && ids.size() == 1, "Qwen batch prefill requires one request");
+    auto& item = request(*states.front());
+    require_model(item.cache_.initialized() && item.position_ == item.cache_.state().position(),
+        "Qwen batch prefill state mismatch");
+    state_->prepare_prefill(item.cache_, item.position_, item.prompt_);
+    models::Input input;
+    input.ids = std::move(ids.front());
+    auto output = model_.forward(std::move(input), item.cache_.state(), config_.forward);
+    item.position_ = item.cache_.state().position();
+    co_yield std::vector<Tensor>{std::move(output)};
 }
 
-::tyloi::Tensor BatchOps::logits_from_last_hidden(::tyloi::Tensor hidden, const Executor::Mode& mode) {
-    auto last = tyloi::ops::contiguous(tyloi::ops::cast(tyloi::ops::select(hidden, 1, -1), ::tyloi::kFloat16));
-    auto scope = executor_->enter(mfq_current_cuda_device(), mode.ffn);
-    return model_.logits(last, true);
+Tensor PublicBatch::decode(std::span<const BatchRow> rows, Tensor, const Tensor&) {
+    const auto count = std::int64_t(config_.slots);
+    std::vector<std::int64_t> values(std::size_t(3 * count), 0);
+    std::fill(values.begin() + 2 * count, values.end(), 1);
+    std::vector<std::int32_t> paused;
+    std::int64_t maximum = 0;
+    for (const auto& row : rows) {
+        auto& item = request(*row.state);
+        const auto slot = item.cache_.slot();
+        require_model(slot >= 0 && slot < count, "Qwen batch lost its stable slot");
+        values[slot] = row.token;
+        values[count + slot] = row.position;
+        values[2 * count + slot] = row.position + 1;
+        maximum = std::max(maximum, row.position + 1);
+        if (!row.eligible) paused.push_back(slot);
+    }
+    auto metadata = ops::reshape(ops::tensor(values, model_.device), {3, count});
+    models::Input input;
+    input.ids = ops::reshape(ops::slice(metadata, 0, 0, 1), {count, 1});
+    input.positions = ops::reshape(ops::slice(metadata, 0, 1, 2), {count, 1});
+    input.cache_positions = input.positions;
+    input.lengths = ops::reshape(ops::slice(metadata, 0, 2, 3), {count});
+    auto saved = state_->capture_recurrent_slots(paused);
+    auto forward = config_.forward;
+    forward.serial_experts = state_->has_cached_moe() && count > 1;
+    auto hidden = model_.forward(std::move(input), state_->state(), forward);
+    auto logits = model_.logits(ops::contiguous(ops::select(hidden, 1, -1)));
+    state_->finish_decode(maximum);
+    state_->restore_recurrent_slots(paused, saved);
+    std::vector<Tensor> selected;
+    for (const auto& row : rows) if (row.eligible) {
+        auto& item = request(*row.state);
+        selected.push_back(ops::slice(logits, 0, item.cache_.slot(), item.cache_.slot() + 1));
+        ++item.position_;
+    }
+    return ops::cat(selected, 0);
 }
 
-BatchOps::Decoded BatchOps::decode(State& state) {
-    const int primary = mode_.primary;
-    for (const auto& request : state.active)
-        state_.ensure_decode_tokens(request->cache, request->cache_length + 1);
-    int64_t max_position = 0;
-    for (const auto& request : state.active)
-        max_position = std::max(max_position, request->cache_length);
-    state_.prepare_decode(max_position);
-    const int64_t batch = max_sequences_;
-    const bool batch_greedy = std::all_of(
-        state.active.begin(), state.active.end(), [](const std::shared_ptr<Request>& request) {
-            return request->sampler->greedy() && !request->sampler->has_penalties() &&
-                   !request->token_constraint;
-        });
-    int64_t requested_len = 0;
-    int64_t minimum_remaining =
-        state.active.front()->generation_limit - state.active.front()->produced;
-    for (const auto& request : state.active) {
-        const int64_t remaining = request->generation_limit - request->produced;
-        minimum_remaining = std::min(minimum_remaining, remaining);
-        requested_len = std::max(requested_len, request->cache_length + remaining);
+StepSequence<std::unique_ptr<models::Batch::Plan>> PublicBatch::plan(
+        std::span<const BatchRow> rows, bool greedy) {
+    if (!config_.graph || !greedy || config_.slots < 2 || state_->has_cached_moe() || rows.empty() ||
+        !mfq_cuda_graph_capture_supported()) co_return;
+    std::int64_t requested = 0, remaining = std::numeric_limits<std::int64_t>::max();
+    for (const auto& row : rows) {
+        requested = std::max(requested, row.position + row.remaining);
+        remaining = std::min(remaining, row.remaining);
     }
-    const int64_t planned_len = decode_graph_bucket(requested_len, max_context());
-    const int64_t graph_attention_parts =
-        decode_graph_attention_parts(planned_len, AttentionScratch::kMaxParts);
-    std::vector<const void*> graph_state_addresses;
-    bool graph_cache_hit = false;
-    bool graph_decode = false;
-    if (batch >= 2 && batch_greedy && config_.greedy &&
-        batch_graph_enabled(model_, config_)) {
-        graph_state_addresses = decode_state_addresses();
-        const auto found =
-            std::find_if(decode_graphs_.begin(), decode_graphs_.end(), [&](const auto& graph) {
-                return graph->matches(batch, planned_len, graph_state_addresses);
-            });
-        graph_cache_hit = found != decode_graphs_.end();
-        graph_decode = graph_cache_hit || minimum_remaining >= config_.cuda_graph_minimum_tokens;
+    const auto length = ::decode_graph_bucket(requested, model_.metadata.max_position_embeddings);
+    const auto owners = state_->state().storage();
+    const bool reuse = window_ && graph_length_ == length && window_->matches(owners);
+    if (!reuse && remaining < config_.minimum) co_return;
+    co_yield GraphPhase::ready;
+    auto result = std::make_unique<GraphPlan>();
+    result->length = length;
+    result->rebuild = !reuse;
+    if (!reuse) {
+        result->growth = cuda::DecodeWindow::fixed_growth(model_.device, false, false, 0);
+        add(result->growth, {{model_.device, 3 * config_.slots * sizeof(std::int64_t)}});
+        add(result->growth, {{Device(kCPU), 3 * config_.slots * sizeof(std::int64_t)}});
+        for (const auto* tensor : state_->state().graph_state())
+            add(result->growth, {{tensor->device(), tensor->nbytes()}});
     }
-    tyloi::cuda::BatchGraph* decode_graph = nullptr;
-    if (graph_cache_hit) {
-        decode_graph =
-            std::find_if(decode_graphs_.begin(), decode_graphs_.end(), [&](const auto& graph) {
-                return graph->matches(batch, planned_len, graph_state_addresses);
-            })->get();
-    } else if (graph_decode) {
-        if (decode_graphs_.size() >= 8)
-            invalidate_decode_graph();
-        decode_graphs_.push_back(std::make_unique<tyloi::cuda::BatchGraph>());
-        decode_graph = decode_graphs_.back().get();
+    co_yield std::unique_ptr<models::Batch::Plan>(std::move(result));
+}
+
+StepSequence<std::optional<Tensor>> PublicBatch::capture(std::span<const BatchRow> rows,
+        const Tensor&, const Tensor&, bool, const models::Batch::Plan& value) {
+    const auto& plan = static_cast<const GraphPlan&>(value);
+    bool prepared = false;
+    if (plan.rebuild) co_yield GraphRequest{GraphPhase::prepare, &prepared};
+    if (!stream_) stream_ = std::make_unique<cuda::DecodeStream>();
+    auto stream_scope = stream_->enter();
+    const auto count = std::int64_t(config_.slots);
+    if (plan.rebuild) {
+        window_.reset();
+        graph_metadata_ = {}; graph_output_ = {};
+        window_ = std::make_unique<cuda::DecodeWindow>(false, true);
+        if (!prepared) window_->prepare_pool();
+        graph_metadata_ = window_->buffer({3, count}, TensorOptions().device(model_.device).dtype(kInt64));
+        graph_length_ = plan.length;
     }
-    std::unique_ptr<MfqCudaStreamGuard> graph_stream_guard;
-    std::vector<std::unique_ptr<MfqCudaStreamGuard>> graph_compute_stream_guards;
-    if (graph_decode) {
-        decode_graph->ensure_compute_streams(collectives_);
-        graph_stream_guard = std::make_unique<MfqCudaStreamGuard>(decode_graph->stream);
-        graph_compute_stream_guards =
-            activate_cuda_graph_compute_streams(decode_graph->compute_streams);
+    std::vector<std::int64_t> values(std::size_t(3 * count), 0);
+    std::fill(values.begin() + 2 * count, values.end(), 1);
+    std::vector<std::int32_t> paused;
+    std::int64_t maximum = 0;
+    for (const auto& row : rows) {
+        const auto& item = request(*row.state);
+        const auto slot = item.cache_.slot();
+        require_model(slot >= 0 && slot < count, "Qwen batch lost its stable slot");
+        values[slot] = row.token;
+        values[count + slot] = row.position;
+        values[2 * count + slot] = row.position + 1;
+        maximum = std::max(maximum, row.position + 1);
+        if (!row.eligible) paused.push_back(slot);
     }
-    ensure_decode_metadata_buffers(primary);
-    auto* packed_metadata_data = decode_metadata_host_.data_ptr<int64_t>();
-    std::fill_n(packed_metadata_data, batch, int64_t{0});
-    std::fill_n(packed_metadata_data + batch, batch, int64_t{0});
-    std::fill_n(packed_metadata_data + 2 * batch, batch, int64_t{1});
-    int64_t max_sequence_length = 0;
-    for (const auto& request : state.active) {
-        const auto slot = static_cast<int64_t>(request->cache.slot());
-        TYLOINFER_RUNTIME_CHECK(slot >= 0 && slot < batch,
-                                "continuous batching request lost its stable slot");
-        packed_metadata_data[slot] = request->pending_token;
-        packed_metadata_data[batch + slot] = request->cache_length;
-        packed_metadata_data[2 * batch + slot] = request->cache_length + 1;
-        max_sequence_length = std::max(max_sequence_length, request->cache_length + 1);
-    }
-    const int64_t values = 3 * batch;
-    auto metadata_host = decode_metadata_host_.narrow(0, 0, values);
-    auto metadata_cuda = decode_metadata_cuda_.narrow(0, 0, values);
-    metadata_cuda.copy_(metadata_host);
-    auto matrix = metadata_cuda.reshape({3, batch});
-    DenseTensor ids = matrix.narrow(0, 0, 1).reshape({batch, 1});
-    DenseTensor pos = matrix.narrow(0, 1, 1).reshape({batch, 1});
-    DenseTensor lengths = matrix.narrow(0, 2, 1).reshape({batch});
-    ++packed_metadata_batches_;
-    std::vector<int32_t> paused_slots;
-    for (const auto& request : state.active)
-        if (!request->eligible)
-            paused_slots.push_back(request->cache.slot());
-    // ponytail: masked slots still occupy GPU rows; restore recurrent state
-    // and overwrite the uncommitted KV position when they become eligible.
-    const auto paused_state = state_.capture_recurrent_slots(paused_slots);
-    ::tyloi::Tensor logits;
-    DenseTensor graph_tokens;
-    auto mode = mode_;
-    mode.ffn.batch_serial = cached_moe_enabled_ && batch > 1;
-    if (graph_decode) {
-        mode.ffn.serial = true;
-        mode.ffn.projection_major = true;
-    }
-    try {
-        if (graph_decode) {
-            const auto invoke = [&]() {
-                tyloi::models::Input input;
-                input.ids = ids;
-                input.positions = pos;
-                input.lengths = lengths;
-                input.cache_positions = pos;
-                input.kv_length = planned_len;
-                input.attention_parts = graph_attention_parts;
-                auto scope = executor_->enter(mfq_current_cuda_device(), mode.ffn);
-                auto hidden = model_.forward(std::move(input), state_.state(),
-                    {mode.kv_capacity, mode.trace, mode.trace_layer, mode.primary, mode.ffn.batch_serial});
-                auto current_logits = logits_from_last_hidden(std::move(hidden), mode);
-                return sample_greedy_cuda(current_logits.dense().contiguous().view({batch, -1}));
-            };
-            if (!graph_cache_hit) {
-                decode_graph->invalidate();
+    auto host = ops::reshape(ops::tensor(values, Device(kCPU)), {3, count});
+    ops::copy_into(graph_metadata_, host);
+    auto paused_state = state_->capture_recurrent_slots(paused);
+    if (!window_->valid()) {
+        struct Saved { Tensor* target; Tensor copy; };
+        std::vector<Saved> saved;
+        for (auto* tensor : state_->state().graph_state()) saved.push_back({tensor, ops::clone(*tensor)});
+        try {
+            auto recording = window_->begin_capture();
+            while (recording->next()) {
+                std::exception_ptr failure;
+                bool warm = false;
                 try {
-                    decode_graph->graph = std::make_unique<MfqCudaGraph>();
-                    auto graph_warmup_states = state_.state().graph_state();
-                    prepare_decode_graph_memory(
-                        graph_warmup_states, state_.state(),
-                        model_.metadata.decode_graph_double_warmup, *decode_graph->graph,
-                        [&]() { (void)invoke(); },
-                        decode_graph->participant_streams(collectives_));
-                    decode_graph->graph->capture_begin();
-                    decode_graph->static_next = invoke();
-                    decode_graph->graph->capture_end();
-                    decode_graph->set_key(batch, planned_len, decode_state_addresses());
-                    ++cuda_graph_captures_;
-                } catch (...) {
-                    decode_graph->invalidate();
-                    throw;
+                    auto policy = cuda::Executor::current_ffn();
+                    policy.serial = true; policy.projection_major = true;
+                    auto execution = cuda::Executor::current().enter(policy);
+                    models::Input input;
+                    input.ids = ops::reshape(ops::slice(graph_metadata_, 0, 0, 1), {count, 1});
+                    input.positions = ops::reshape(ops::slice(graph_metadata_, 0, 1, 2), {count, 1});
+                    input.cache_positions = input.positions;
+                    input.lengths = ops::reshape(ops::slice(graph_metadata_, 0, 2, 3), {count});
+                    input.kv_length = plan.length;
+                    input.attention_parts = ::decode_graph_attention_parts(plan.length, cuda::AttentionScratch::kMaxParts);
+                    auto hidden = model_.forward(std::move(input), state_->state(), config_.forward);
+                    auto logits = model_.logits(ops::contiguous(ops::select(hidden, 1, -1)));
+                    graph_output_ = ops::reshape(ops::sample_greedy(ops::contiguous(logits)), {count, 1});
+                    warm = recording->finish();
+                } catch (...) { failure = std::current_exception(); }
+                if (failure) {
+                    if (!recording->retry(failure)) std::rethrow_exception(failure);
+                    warm = true;
+                }
+                for (const auto& item : saved) ops::copy_into(*item.target, item.copy);
+                if (warm) {
+                    graph_output_ = {};
+                    recording->release_warm_outputs();
+                    recording->pause();
+                    stream_scope.reset();
+                    co_yield GraphRequest{GraphPhase::admit, nullptr, recording->growth()};
+                    stream_scope = stream_->enter();
+                    recording->resume();
                 }
             }
-            decode_graph->graph->replay();
-            graph_tokens = decode_graph->static_next;
-            ++cuda_graph_replays_;
-        } else {
-            tyloi::models::Input input;
-            input.ids = ids;
-            input.positions = pos;
-            input.lengths = lengths;
-            input.cache_positions = pos;
-            auto scope = executor_->enter(mfq_current_cuda_device(), mode.ffn);
-            auto hidden = model_.forward(std::move(input), state_.state(),
-                {mode.kv_capacity, mode.trace, mode.trace_layer, mode.primary, mode.ffn.batch_serial});
-            logits = logits_from_last_hidden(std::move(hidden), mode);
+            recording->complete();
+            window_->retain_result(graph_output_);
+            window_->retain(state_->state().storage());
+            ++captures_;
+        } catch (...) {
+            for (const auto& item : saved) ops::copy_into(*item.target, item.copy);
+            clear();
+            throw;
         }
-        state_.finish_decode(max_sequence_length);
-    } catch (...) {
-        invalidate_decode_graph();
-        throw;
     }
-    state_.restore_recurrent_slots(paused_slots, paused_state);
-    ++decode_batches_;
-    decode_tokens_ += std::count_if(state.active.begin(), state.active.end(),
-                                    [](const auto& request) { return request->eligible; });
-    DenseTensor batched_greedy_tokens;
-    if (graph_tokens.defined()) {
-        batched_greedy_tokens = graph_tokens.to(::tyloi::kCPU).contiguous();
-        TYLOINFER_RUNTIME_CHECK(
-            batched_greedy_tokens.scalar_type() == ::tyloi::kInt64 &&
-                batched_greedy_tokens.numel() == batch,
-            "continuous batching CUDA Graph sampler returned the wrong shape");
-        ++batched_greedy_batches_;
-    } else if (config_.greedy && batch_greedy) {
-        batched_greedy_tokens =
-            sample_greedy_cuda(logits.dense().contiguous().view({batch, -1}))
-                .to(::tyloi::kCPU)
-                .contiguous();
-        TYLOINFER_RUNTIME_CHECK(
-            batched_greedy_tokens.scalar_type() == ::tyloi::kInt64 &&
-                batched_greedy_tokens.numel() == batch,
-            "continuous batching greedy sampler returned the wrong shape");
-        ++batched_greedy_batches_;
+    window_->run();
+    ++replays_;
+    state_->finish_decode(maximum);
+    state_->restore_recurrent_slots(paused, paused_state);
+    std::vector<Tensor> selected;
+    for (const auto& row : rows) if (row.eligible) {
+        auto& item = request(*row.state);
+        selected.push_back(ops::slice(graph_output_, 0, item.cache_.slot(), item.cache_.slot() + 1));
+        ++item.position_;
     }
-    return {std::move(logits), std::move(batched_greedy_tokens)};
+    auto result = ops::cat(selected, 0);
+    TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(mfq_get_current_cuda_stream()));
+    stream_scope.reset();
+    co_yield std::optional<Tensor>(std::move(result));
 }
 
-BatchOps::Sample BatchOps::sample(const std::shared_ptr<Request>& request,
-                                  const Decoded& decoded) {
-    const auto slot = static_cast<int64_t>(request->cache.slot());
-    if (decoded.greedy_tokens.defined())
-        return {{}, decoded.greedy_tokens.dense().data_ptr<int64_t>()[slot], {}};
-    auto next = tyloi::engine::sample_logits(*request->sampler, tyloi::ops::slice(decoded.logits, 0, slot, slot + 1),
-                                         request->counts, request->token_constraint);
-    const auto token = tyloi::ops::item(next);
-    return {std::move(next), token, {}};
+void PublicBatch::clear() {
+    window_.reset();
+    graph_metadata_ = {}; graph_output_ = {}; graph_length_ = 0;
 }
 
-void BatchOps::accept(const std::shared_ptr<Request>& request, const Sample& sample) {
-    if (request->counts.defined()) {
-        TYLOINFER_RUNTIME_CHECK(sample.next.defined(),
-                                "batched greedy sampling cannot update token penalties");
-        tyloi::ops::add_token_counts(request->counts, tyloi::ops::contiguous(sample.next));
-    }
+engine::Metrics PublicBatch::metrics() const {
+    const auto stats = state_->paged_kv_stats();
+    return {{"continuous_batching_stable_slot_releases", double(state_->slot_releases())},
+        {"continuous_batching_cuda_graph_captures", double(captures_)},
+        {"continuous_batching_cuda_graph_replays", double(replays_)},
+        {"continuous_batching_moe", double(state_->has_moe())},
+        {"continuous_batching_moe_cached_row_serial", double(state_->has_cached_moe())},
+        {"continuous_batching_paged_kv", double(state_->paged_kv_enabled())},
+        {"paged_kv_page_size", double(stats.page_size)}, {"paged_kv_live_pages", double(stats.live_pages)},
+        {"paged_kv_peak_live_pages", double(stats.peak_live_pages)},
+        {"paged_kv_capacity_pages", double(stats.capacity_pages)},
+        {"paged_kv_reserved_bytes", double(stats.reserved_bytes)},
+        {"paged_kv_page_allocations", double(stats.allocations)}, {"paged_kv_page_reuses", double(stats.reuses)},
+        {"paged_kv_page_releases", double(stats.releases)}, {"paged_kv_table_updates", double(stats.table_updates)}};
 }
 
-void BatchOps::recover(State& state) {
-    std::vector<tyloi::models::qwen35::RequestState*> caches;
-    for (const auto& request : state.prefilling)
-        caches.push_back(&request->cache);
-    for (const auto& request : state.active)
-        caches.push_back(&request->cache);
-    try {
-        mfq_cuda_synchronize();
-    } catch (...) {
-    }
-    state_.recover(caches);
-    for (const auto& request : state.prefilling)
-        request->executor.reset();
-    for (const auto& request : state.active)
-        request->executor.reset();
-    invalidate_decode_graph();
+} // namespace
+
+std::unique_ptr<models::Batch> Model::make_batch(const BatchConfig& config) const {
+    return std::make_unique<PublicBatch>(*this, config);
 }
-
-} // namespace tyloi::cuda::qwen35
-
-namespace tyloi::cuda {
-
-std::unique_ptr<tyloi::engine::Batch> make_batch(
-    const tyloi::models::qwen35::Model& model, tyloi::models::qwen35::State* serial,
-    std::unique_ptr<Executor> executor, Collectives& copies, Executor::Mode mode,
-    tyloi::engine::ContinuousBatchConfig config,
-    std::int64_t chunk_size, bool preallocate, bool cpu_offload, int cached_slots) {
-    if (serial && preallocate) {
-        for (auto& layer_state : serial->layers)
-            if (auto* cache = std::get_if<tyloi::state::KvView>(&layer_state)) *cache = {};
-    }
-    const tyloi::models::qwen35::Batch::Options options{config.max_sequences, config.paged_kv, preallocate,
-                                         cpu_offload, cached_slots};
-    const auto token_budget = config.prefill_token_budget;
-    return std::make_unique<tyloi::engine::ContinuousBatch<qwen35::BatchOps>>(
-        chunk_size, token_budget, model, std::move(executor), copies, mode, options,
-        std::move(config));
-}
-
-} // namespace tyloi::cuda
+} // namespace tyloi::models::qwen35

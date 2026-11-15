@@ -34,7 +34,7 @@ Tensor Model::normalize(const Tensor& hidden, int64_t batch, int64_t tokens) con
     });
 }
 Tensor Model::softcap(const Tensor& value) const { return value; }
-Tensor Model::logits(const Tensor& hidden, bool) const {
+Tensor Model::logits(const Tensor& hidden, bool, tyloi::models::LogitPrecision) const {
     return tyloi::ops::measure("model.lm_head", hidden.device(), [&] {
         return tyloi::ops::project(hidden, lm_head);
     });

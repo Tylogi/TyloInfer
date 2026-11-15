@@ -16,7 +16,7 @@ Tensor Model::embedding(const Tensor& ids, int) const {
 Tensor Model::normalize(const Tensor& hidden, std::int64_t, std::int64_t) const { return hidden; }
 Tensor Model::softcap(const Tensor& logits) const { return logits; }
 
-Tensor Model::logits(const Tensor& hidden, bool) const {
+Tensor Model::logits(const Tensor& hidden, bool, tyloi::models::LogitPrecision) const {
     ops::ProfileRange range("model.lm_head", hidden.device());
     auto output = ops::project(hidden, lm_head);
     range.finish();

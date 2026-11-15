@@ -46,6 +46,12 @@ public:
     PagedKv(const PagedKv&) = delete;
     PagedKv& operator=(const PagedKv&) = delete;
 
+    using Growth = std::vector<std::pair<Device, std::size_t>>;
+    static Growth construction_growth(const std::vector<Layout>& layers, int64_t context,
+                                      int32_t sequences, bool preallocate);
+    Growth ensure_growth(const std::vector<std::pair<const Sequence*, int64_t>>& sequences) const;
+    Growth update_growth() const;
+
     bool ensure_tokens(Sequence& sequence, int64_t tokens);
     void release(Sequence& sequence);
     void update(const std::vector<const Sequence*>& sequences);
@@ -73,6 +79,8 @@ private:
     };
 
     static size_t checked_maximum_pages(int32_t sequences, int64_t pages_per_sequence);
+    static Growth storage_growth(const std::vector<Layout>& layers, size_t maximum_pages,
+                                 size_t current_pages, size_t required_pages);
     bool validate(const Sequence& sequence) const noexcept;
     void publish_allocator_metrics() noexcept;
     void ensure_storage(size_t required_pages);

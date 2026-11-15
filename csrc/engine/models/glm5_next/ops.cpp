@@ -1,4 +1,6 @@
 #include "engine/models/plan.h"
+#include "engine/models/load.h"
+#include "engine/models/glm5_next/components.h"
 #include "engine/backends/cuda/kernels/mfq_cuda_moe_ops.h"
 #include "model.h"
 #include "mtp.h"
@@ -116,14 +118,12 @@ static DenseTensor execute(const Layer& layer, LayerState& activity,
     return mfq_glm5_next::mhc_post(branch, hidden, ffn_mix[0], ffn_mix[1]);
 }
 
-Layer load_layer(const ::tyloi::weights::Loader& weights, const Config& config, int index) {
+void load_layer(Layer& layer, const ::tyloi::weights::Loader& weights, const Config& config, int index) {
     MfqCudaGuard guard(weights.placement.target.index);
-    Layer layer;
     layer.device = weights.placement.target.index;
     LayerLoader loader{weights};
     loader.role = "glm5_next";
     tyloi::models::glm5_next::load_layer_weights(layer, loader, config, index);
-    return layer;
 }
 
 Model read(std::shared_ptr<const tyloi::ModelSource> source, std::string_view definition,
@@ -147,6 +147,25 @@ Model read(std::shared_ptr<const tyloi::ModelSource> source, std::string_view de
     return model;
 }
 
+void load(std::unique_ptr<tyloi::models::CausalModel>& owner,
+          std::shared_ptr<const tyloi::ModelSource> source, std::string_view definition,
+          const tyloi::weights::Loader& weights, LayerPlacementConfig& placement,
+          const tyloi::models::LoadOptions& options) {
+    if (!options.cpu_offload_layers.empty())
+        throw std::invalid_argument("GLM5-Next does not support --cpu-offload-layers");
+    owner = std::make_unique<Model>(read(std::move(source), definition, options.context));
+    auto& model = static_cast<Model&>(*owner);
+    if (!weights.placement.target.is_cuda() || weights.placement.target.index < 0)
+        throw std::invalid_argument("GLM5-Next requires a CUDA target");
+    if (placement.devices.empty()) placement.devices = {weights.placement.target.index};
+    if (placement.primary_device() != weights.placement.target.index)
+        throw std::invalid_argument("GLM5-Next weight and layer primary devices differ");
+    if (options.expert_parallel && model.config.experts <= 0)
+        throw std::invalid_argument("--expert-parallel requires a model with routed experts");
+    load(model, weights, placement, options.gpu_layers);
+    load_components(model, weights, options.optional_components);
+}
+
 void load(Model& model, const ::tyloi::weights::Loader& weights,
           LayerPlacementConfig& placement, int gpu_layers, bool load_layers,
           bool load_input_output) {
@@ -161,9 +180,11 @@ void load(Model& model, const ::tyloi::weights::Loader& weights,
                                  : model.embed;
         if (load_layers) {
             model.layers.reserve(static_cast<size_t>(model.config.layers));
-            for (int index = 0; index < model.config.layers; ++index)
-                model.layers.push_back(load_layer(weights.for_layer(::tyloi::Device(::tyloi::kCUDA, placement.device_for_layer(index))),
-                                                  model.config, index));
+            for (int index = 0; index < model.config.layers; ++index) {
+                model.layers.emplace_back();
+                load_layer(model.layers.back(), weights.for_layer(::tyloi::Device(::tyloi::kCUDA, placement.device_for_layer(index))),
+                           model.config, index);
+            }
         }
     } else {
         if (load_layers) throw std::invalid_argument("streamed model setup requires deferred blocks");
@@ -303,20 +324,24 @@ void State::rollback_speculative(std::int64_t accepted) {
 
 tyloi::models::Info Model::info() const { return tyloi::models::model_info(metadata); }
 MfqModelCapabilities Model::capabilities() const {
-    const auto state = ::tyloi::models::component_state(graph, plan, false, false);
+    const auto state = ::tyloi::models::component_state(graph, plan, false, bool(mtp));
     const auto caps = ::tyloi::models::runtime_capabilities(graph, plan, state, false, false);
     return {graph.architecture, caps.text, caps.image_input, caps.video_input,
         caps.audio_input, caps.audio_output, caps.full_duplex, caps.mtp, "model-graph+cuda-adapters"};
 }
 tyloi::engine::Metrics Model::metrics() const {
-    const auto state = ::tyloi::models::component_state(graph, plan, false, false);
+    const auto state = ::tyloi::models::component_state(graph, plan, false, bool(mtp));
     return {{"kv_memory_supported", 0.0}, {"kv_quantization_supported", 0.0},
         {"kv_quantization_bits", 0.0}, {"vision_declared", double(state.vision_declared)},
         {"vision_supported", double(state.vision_supported)}, {"vision_available", double(state.vision_available)},
         {"mtp_declared", double(state.mtp_declared)}, {"mtp_supported", double(state.mtp_supported)},
         {"mtp_available", double(state.mtp_available)}};
 }
-std::unique_ptr<tyloi::models::State> Model::make_state() const { return std::make_unique<State>(*this); }
+std::unique_ptr<tyloi::models::State> Model::make_state() const {
+    auto state = std::make_unique<State>(*this);
+    if (mtp) state->predictor = mtp->make_state();
+    return state;
+}
 tyloi::StepSequence<tyloi::models::Prepared> Model::prepare(
         const std::vector<std::int64_t>&, const MfqMultimodalInput&, tyloi::models::State&) const {
     throw std::invalid_argument("model has no multimodal component");
@@ -337,7 +362,7 @@ tyloi::StepSequence<tyloi::models::Prepared> Model::prepare(
     return rms_norm(hidden.dense().mean(2), output_norm, metadata.rms_norm_eps);
 }
 ::tyloi::Tensor Model::softcap(const ::tyloi::Tensor& value) const { return value; }
-::tyloi::Tensor Model::logits(const ::tyloi::Tensor& hidden, bool) const {
+::tyloi::Tensor Model::logits(const ::tyloi::Tensor& hidden, bool, tyloi::models::LogitPrecision) const {
     return tyloi::ops::project(hidden, lm_head);
 }
 
@@ -402,15 +427,11 @@ Mtp::Mtp(::tyloi::Tensor embedding, int primary)
 Mtp::~Mtp() = default;
 Mtp::Mtp(Mtp&&) noexcept = default;
 
-std::optional<Mtp> Mtp::load_if_present(const ::tyloi::weights::Loader& weights,
-                                                      ::tyloi::Tensor embedding,
-                                                      const tyloi::models::glm5_next::Config &main) {
-    Mtp result{std::move(embedding), weights.placement.target.index};
+bool Mtp::load_weights(const ::tyloi::weights::Loader& weights,
+                       const tyloi::models::glm5_next::Config &main) {
     LayerLoader loader{weights};
     loader.role = "glm5_next";
-    if (!tyloi::models::glm5_next::load_predictor(result, loader, main))
-        return std::nullopt;
-    return result;
+    return tyloi::models::glm5_next::load_predictor(*this, loader, main);
 }
 
 void Mtp::reset(tyloi::models::MtpState& value, int64_t next_batch) const {

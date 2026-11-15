@@ -23,6 +23,7 @@ struct LoadOptions {
     int gpu_layers = -1;
     bool expert_parallel = false;
     bool recurrent_transposed = false;
+    bool preallocate = false;
     bool vision_resident = false;
     bool mirror_scalars = true;
     tyloi::ops::YarnScaling yarn;

@@ -69,15 +69,21 @@ void Engine::install(std::unique_ptr<tyloi::Executor::Graph> graph) {
         budget_->bind(predictor != nullptr);
         executor_->bind_budget(&*budget_);
         if (!batch_ && config_.continuous_batch.max_sequences)
-            batch_ = engine::make_batch(*model_, *executor_, *weights_, *budget_, config_);
+            batch_ = engine::make_batch(*model_, *executor_, *weights_, *budget_, config_, forward_options_);
         if (batch_) batch_->bind(*budget_);
         if (const auto bytes = config_.resident_budget_bytes) {
             engine::SessionCommand command; command.kind = engine::SessionCommand::Kind::memory_budget; command.bytes = bytes;
             set_budget(command);
         }
         if (config_.preallocate_kv) {
-            budget_->reserve(idle_state_->preallocate_growth());
-            idle_state_->preallocate();
+            if (!batch_) {
+                budget_->reserve(idle_state_->preallocate_growth());
+                idle_state_->preallocate();
+            }
+            if (predictor) {
+                budget_->reserve(predictor->reset_growth(*idle_state_->predictor, 1));
+                predictor->reset(*idle_state_->predictor, 1);
+            }
         }
         models::DecodeOptions decode;
         decode.enabled = config_.decode_graph.enabled && weights_->decode() != weights::Cache::Decode::none;
@@ -152,7 +158,21 @@ void Engine::retire_request(Request& request) noexcept {
     request.generation = {};
     if (!request.state) return;
     idle_state_ = std::move(request.state);
-    try { drain(); }
+    try {
+        drain();
+        if (batch_ && config_.preallocate_kv) {
+            auto scope = executor_->enter();
+            graph_->invalidate();
+            budget_->reserve(idle_state_->graph_exit_growth());
+            idle_state_->release_graphs();
+            serial_state_ = nullptr;
+            idle_state_.reset();
+            idle_state_ = model_->make_state();
+            serial_state_ = idle_state_.get();
+            if (auto* predictor = model_->predictor(); predictor && !idle_state_->predictor)
+                idle_state_->predictor = predictor->make_state();
+        }
+    }
     catch (...) {
         ready_ = false;
         if (request.output && !request.output->cleanup_failure)

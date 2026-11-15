@@ -2,6 +2,7 @@
 
 #include "engine/models/qwen35/model.h"
 #include "engine/models/qwen35/state.h"
+#include "engine/models/batch.h"
 #include "engine/state/paged_kv.h"
 
 #include <cstdint>
@@ -29,6 +30,7 @@ class RequestState {
     std::int32_t slot() const noexcept { return slot_; }
     qwen35::State &state() noexcept { return *state_; }
     const qwen35::State &state() const noexcept { return *state_; }
+    bool initialized() const noexcept { return bool(state_); }
 
   private:
     friend class Batch;
@@ -53,6 +55,11 @@ class Batch {
     Batch &operator=(const Batch &) = delete;
     ~Batch();
 
+    static BatchGrowth construction_growth(const Model&, Options);
+    BatchGrowth request_growth(const RequestState&, std::int64_t tokens) const;
+    BatchGrowth activate_growth(const RequestState&, const ForwardOptions&) const;
+    BatchGrowth decode_growth(std::span<const std::pair<const RequestState*, std::int64_t>>) const;
+
     bool has_moe() const;
     bool has_cached_moe() const;
     static bool has_cached_moe(const Model &model);
@@ -68,7 +75,6 @@ class Batch {
     void ensure_decode_tokens(const RequestState &request, std::int64_t tokens);
     void prepare_decode(std::int64_t cache_position);
     void finish_decode(std::int64_t cache_position);
-    void recover(const std::vector<RequestState *> &requests);
 
     BatchState capture_recurrent_slots(const std::vector<std::int32_t> &slots) const;
     void restore_recurrent_slots(const std::vector<std::int32_t> &slots,

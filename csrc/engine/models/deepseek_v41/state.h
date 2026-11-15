@@ -27,6 +27,8 @@ public:
     ~State() override;
 
     void preallocate() override {}
+    // This family allocates its request cache during reset or forward.
+    std::vector<std::pair<tyloi::Device, std::size_t>> preallocate_growth() const override { return {}; }
     void reset(std::int64_t batch) override;
     std::vector<std::pair<tyloi::Device, std::size_t>> reset_growth(std::int64_t batch) const override;
     void allocate();
@@ -47,7 +49,8 @@ public:
     bool supports_paged_text_session_state() const override;
     TextSessionStateKind text_session_state_kind() const;
     TextSessionState capture_text_session_state(const std::vector<std::int64_t>& tokens) const;
-    void restore_text_session_state(const TextSessionState& state);
+    std::unique_ptr<tyloi::models::Restore> prepare_restore(
+        const TextSessionState&, const tyloi::models::Mtp* = nullptr) override;
 
     // Speculative suffix journal; the block records hold the checkpoints.
     void begin_speculative_suffix(std::int64_t draft_tokens) override;

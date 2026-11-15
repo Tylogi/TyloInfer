@@ -159,8 +159,11 @@ tyloi::models::Info Model::info() const {
     return result;
 }
 MfqModelCapabilities Model::capabilities() const {
-    return {graph.architecture, graph.has_component("text"), bool(vision), false,
-            bool(audio), false, false, false, "model-graph"};
+    const auto parts = tyloi::models::component_state(graph, plan, bool(vision && resampler), false);
+    const auto caps = tyloi::models::runtime_capabilities(graph, plan, parts,
+        bool(vision && resampler && audio), bool(vision && resampler && audio && tts));
+    return {graph.architecture, caps.text, caps.image_input, caps.video_input,
+            caps.audio_input, caps.audio_output, caps.full_duplex, caps.mtp, "model-graph+cuda-adapters"};
 }
 tyloi::engine::Metrics Model::metrics() const {
     return {{"kv_memory_supported", 0.0}, {"kv_quantization_supported", 0.0},
@@ -372,9 +375,11 @@ Tensor Model::normalize(const Tensor& hidden, int64_t batch, int64_t tokens) con
     });
 }
 Tensor Model::softcap(const Tensor& value) const { return value; }
-Tensor Model::logits(const Tensor& hidden, bool) const {
+Tensor Model::logits(const Tensor& hidden, bool, tyloi::models::LogitPrecision precision) const {
+    auto projection_input = precision == tyloi::models::LogitPrecision::model
+        ? tyloi::ops::contiguous(tyloi::ops::cast(hidden, tyloi::kBFloat16)) : hidden;
     auto result = tyloi::ops::measure("model.lm_head", hidden.device(), [&] {
-        return tyloi::ops::project(hidden, lm_head);
+        return tyloi::ops::project(projection_input, lm_head);
     });
     return tyloi::ops::contiguous(tyloi::ops::cast(result, tyloi::kBFloat16));
 }

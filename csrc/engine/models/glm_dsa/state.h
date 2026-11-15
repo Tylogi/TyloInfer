@@ -27,6 +27,8 @@ public:
     void advance(int64_t tokens) noexcept { cache_pos += tokens; }
     void set_position_delta(int64_t delta) noexcept { decode_position_delta = delta; }
     void preallocate() {}
+    // This family allocates its request cache during reset or forward.
+    std::vector<std::pair<tyloi::Device, std::size_t>> preallocate_growth() const override { return {}; }
     // Plans ordinary forward allocations; other execution paths plan separately.
     std::vector<std::pair<tyloi::Device, std::size_t>> growth(
         const tyloi::models::Input& input, const tyloi::models::ForwardOptions& options) const override;
@@ -37,12 +39,16 @@ public:
     bool supports_paged_text_session_state() const { return false; }
     TextSessionState capture_text_session_state(const std::vector<int64_t>&) const;
     void restore_text_session_state(const TextSessionState&);
+    std::unique_ptr<tyloi::models::Restore> prepare_restore(
+        const TextSessionState&, const tyloi::models::Mtp* predictor_model = nullptr) override;
 
     std::vector<LayerState> layers;
     std::map<int, Selection> selections;
     int64_t cache_pos = 0, decode_position_delta = 0, batch = 0;
 
 private:
+    class SessionRestore;
+    const Model* model_;
     struct Layout {
         int device;
         bool full_indexer;

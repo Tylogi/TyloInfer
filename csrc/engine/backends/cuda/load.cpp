@@ -3,22 +3,12 @@
 #include "engine/program.h"
 #include "engine/ops.h"
 #include "engine/models/load.h"
-#include "engine/models/load_internal.h"
-#include "engine/models/deepseek_v41/vision.h"
-#include "engine/models/qwen35/model.h"
-#include "engine/models/qwen35/state.h"
-#include "engine/models/minicpmo45/forward.h"
-#include "engine/models/minicpmo45/text/model.h"
-#include "engine/models/minicpmo45/text/state.h"
-#include "engine/models/glm_dsa/model.h"
-#include "engine/models/glm_dsa/state.h"
-#include "engine/models/deepseek_v4/forward.h"
-#include "engine/models/glm5_next/forward.h"
-#include "engine/models/nemotron_h/forward.h"
 #include "engine/models/source/model_graph.h"
-#include "engine/instance_impl.h"
 #include "engine/drain.h"
 #include "engine/models/causal_model.h"
+#include "engine/models/common/mtp.h"
+#include "engine/models/minicpmo45/engine.h"
+#include "engine/models/minicpmo45/text/model.h"
 #include "engine/models/source/model_config.h"
 #include "engine/models/session/cache.h"
 #include "engine/models/input.h"
@@ -46,22 +36,7 @@
 #include <string>
 #include <typeinfo>
 #include <utility>
-#include <variant>
 #include <vector>
-
-namespace tyloi::cuda::engine_detail {
-
-using State = std::variant<
-    std::unique_ptr<Text<::tyloi::models::qwen35::Model, ::tyloi::models::qwen35::State, qwen35::Components>>,
-    std::unique_ptr<Text<minicpmo45::text::Model, minicpmo45::text::State, std::unique_ptr<minicpmo45::Components>>>,
-    std::unique_ptr<Text<minicpmo45::Model, minicpmo45::State, std::monostate>>,
-    std::unique_ptr<Text<glm_dsa::Model, glm_dsa::State, std::monostate>>,
-    std::unique_ptr<Text<glm5_next::Model, glm5_next::State, std::unique_ptr<tyloi::models::Mtp>>>,
-    std::unique_ptr<Text<deepseek_v4::Model, deepseek_v4::State, std::monostate>>,
-    std::unique_ptr<Text<deepseek_v41::Model, deepseek_v41::State, std::unique_ptr<tyloi::models::Mtp>>>,
-    std::unique_ptr<Text<nemotron_h::Model, nemotron_h::State, nemotron_h::Components>>>;
-
-} // namespace tyloi::cuda::engine_detail
 
 namespace tyloi::cuda {
 
@@ -72,23 +47,12 @@ std::unique_ptr<engine::Engine> load_native_engine(tyloi::engine::EngineOptions 
 } // namespace
 
 std::unique_ptr<engine::Engine> load(tyloi::engine::EngineOptions options) {
-    auto source = tyloi::open_model_source(options.model_path);
-    const auto backbone = ::tyloi::models::backbone(tyloi::models::graph(*source).backbone);
-    source.reset();
-    if (backbone == ::tyloi::models::Backbone::gemma4 || backbone == ::tyloi::models::Backbone::qwen4_exp) {
-        return load_native_engine(std::move(options), nullptr);
-    }
-    return std::make_unique<engine_detail::EngineInstance<
-        engine_detail::State, with_model<>>>(std::move(options));
+    return load_native_engine(std::move(options), nullptr);
 }
 
 void reload(engine::Engine& engine, tyloi::engine::EngineOptions options) {
-    if (auto* target = dynamic_cast<engine_detail::EngineInstance<engine_detail::State, with_model<>>*>(&engine)) {
-        target->options = std::move(options);
-        target->load();
-        return;
-    }
-    if (typeid(engine) == typeid(tyloi::engine::Engine)) {
+    if (typeid(engine) == typeid(tyloi::engine::Engine) ||
+        typeid(engine) == typeid(minicpmo45::Engine)) {
         load_native_engine(std::move(options), &engine);
         return;
     }
@@ -141,6 +105,8 @@ std::unique_ptr<engine::Engine> load_native_engine(tyloi::engine::EngineOptions 
                 if (model->predictor())
                     predictor_execution = root->fork(load.layer_placement.primary_device());
                 state = model->make_state();
+                if (auto* predictor = model->predictor(); predictor && !state->predictor)
+                    state->predictor = predictor->make_state();
                 finalize_kv(kv.get(), *weights, offload);
                 root->configure_kv(kv, offload);
                 std::size_t pending_kv = 0;
@@ -177,6 +143,9 @@ std::unique_ptr<engine::Engine> load_native_engine(tyloi::engine::EngineOptions 
         config.stop_token_ids = models::stop_token_ids(models::config_json(*source, options.config_path), vocab_size);
         config.resident_budget_bytes = ::tyloi::cuda::options::resident_budget_bytes();
         models::ForwardOptions forward{mode.kv_capacity, mode.trace, mode.trace_layer, mode.primary, mode.ffn.batch_serial};
+        const bool mini = dynamic_cast<minicpmo45::text::Model*>(model.get()) != nullptr;
+        if (target && (dynamic_cast<minicpmo45::Engine*>(target) != nullptr) != mini)
+            throw std::invalid_argument("CUDA reload cannot change the engine model family");
         // The root executor owns KV before Engine takes over, including failed installation.
         offload.reset();
         kv.reset();
@@ -187,6 +156,11 @@ std::unique_ptr<engine::Engine> load_native_engine(tyloi::engine::EngineOptions 
                 std::move(text), forward, std::move(graph), {}, std::move(predictor_execution));
             return {};
         }
+        if (mini)
+            return std::make_unique<minicpmo45::Engine>(std::move(model), std::move(execution), std::move(config),
+                std::move(source), std::move(ledger), std::move(weights), std::move(state),
+                std::move(sessions), std::move(text), forward, std::move(graph),
+                std::unique_ptr<engine::Batch>{}, std::move(predictor_execution));
         return std::make_unique<engine::Engine>(std::move(model), std::move(execution), std::move(config),
             std::move(source), std::move(ledger), std::move(weights), std::move(state),
             std::move(sessions), std::move(text), forward, std::move(graph),

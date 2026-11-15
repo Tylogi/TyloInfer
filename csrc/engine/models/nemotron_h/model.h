@@ -74,7 +74,7 @@ struct Model
     ::tyloi::Tensor embedding(const tyloi::Tensor& ids, int primary = 0) const override;
     ::tyloi::Tensor normalize(const tyloi::Tensor&, std::int64_t, std::int64_t) const override;
     ::tyloi::Tensor softcap(const tyloi::Tensor&) const override;
-    ::tyloi::Tensor logits(const tyloi::Tensor&, bool capped = true) const override;
+    ::tyloi::Tensor logits(const tyloi::Tensor&, bool capped = true, tyloi::models::LogitPrecision precision = tyloi::models::LogitPrecision::model) const override;
     ::tyloi::Tensor forward(tyloi::models::Input, tyloi::models::State&,
         const tyloi::models::ForwardOptions& = {}) const override;
 };

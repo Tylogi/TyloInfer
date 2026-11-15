@@ -48,7 +48,7 @@ struct Plain {
     bool graph_prepared = false;
 
     Tensor project(const Tensor& hidden, bool capped) {
-        auto last = ops::contiguous(ops::cast(ops::select(hidden, 1, -1), kFloat16));
+        auto last = ops::contiguous(ops::select(hidden, 1, -1));
         return model.logits(last, capped);
     }
     void reserve(const models::Input& input) {
@@ -244,10 +244,12 @@ struct Native {
     void set_prefix_boundary(std::size_t tokens) { prefix_boundary = tokens; }
     void reset() {
         exit_unmanaged_graph(state, weights, budget);
+        budget.reserve(state.reset_growth(1));
         state.reset(1);
         if (auto* predictor = model.predictor()) {
             if (!state.predictor || !state.predictor->belongs_to(*predictor))
                 throw std::invalid_argument("predictor state is unavailable or belongs to another model");
+            budget.reserve(predictor->reset_growth(*state.predictor, 1));
             predictor->reset(*state.predictor, 1);
         }
     }

@@ -408,6 +408,7 @@ add_library(mfq-metal-engine STATIC
     ${PROJECT_SOURCE_DIR}/engine/load.cpp
     ${TYLOINFER_METAL_ROOT}/load.cpp
     ${PROJECT_SOURCE_DIR}/engine/models/qwen4_exp/metal.cpp
+    ${PROJECT_SOURCE_DIR}/engine/models/qwen35/metal_batch.cpp
     ${PROJECT_SOURCE_DIR}/engine/weights/cache_metal.cpp
     ${PROJECT_SOURCE_DIR}/engine/weights/loader_metal.cpp
     ${PROJECT_SOURCE_DIR}/engine/weights/encoding/metal.cpp

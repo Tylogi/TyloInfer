@@ -7,6 +7,9 @@
 #include "engine/models/source/model_graph.h"
 
 #if TYLOINFER_HAS_CUDA
+#include "engine/models/glm_dsa/load.h"
+#include "engine/models/glm5_next/load.h"
+#include "engine/models/deepseek_v4/load.h"
 #include "engine/models/deepseek_v41/load.h"
 #include "engine/models/gemma4/load.h"
 #include "engine/models/nemotron_h/load.h"
@@ -28,6 +31,18 @@ void load(
     LoadOptions options) {
     const auto model_graph = graph(*source);
 #if TYLOINFER_HAS_CUDA
+    if (model_graph.backbone == "glm_dsa") {
+        ::tyloi::cuda::glm_dsa::load(owner, std::move(source), definition, weights, placement, options);
+        return;
+    }
+    if (model_graph.backbone == "glm5_next") {
+        ::tyloi::cuda::glm5_next::load(owner, std::move(source), definition, weights, placement, options);
+        return;
+    }
+    if (model_graph.backbone == "deepseek_v4") {
+        ::tyloi::cuda::deepseek_v4::load(owner, std::move(source), definition, weights, placement, options);
+        return;
+    }
     if (model_graph.backbone == "gemma4") {
         if (!options.cpu_offload_layers.empty())
             throw std::invalid_argument("Gemma4 does not support --cpu-offload-layers");
@@ -45,7 +60,7 @@ void load(
         if (options.optional_components)
             ::tyloi::models::qwen35::load_components(
                 static_cast<::tyloi::models::qwen35::Model&>(*owner), weights, placement,
-                cpu_layers, !options.cpu_offload_layers.empty(), options.vision_resident, false);
+                cpu_layers, !options.cpu_offload_layers.empty(), options.vision_resident, options.preallocate);
         return;
     }
     if (model_graph.backbone == "qwen4_exp") {

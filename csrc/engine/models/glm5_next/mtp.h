@@ -41,9 +41,8 @@ struct Mtp final : tyloi::models::Mtp {
     ~Mtp() override;
     Mtp(Mtp&&) noexcept;
 
-    static std::optional<Mtp> load_if_present(const ::tyloi::weights::Loader& weights,
-                                                      ::tyloi::Tensor embedding,
-                                                      const tyloi::models::glm5_next::Config &main);
+    bool load_weights(const ::tyloi::weights::Loader& weights,
+                      const tyloi::models::glm5_next::Config& main);
 
     std::unique_ptr<tyloi::models::MtpState> make_state() const override {
         auto result = std::make_unique<PredictorState>(*this);

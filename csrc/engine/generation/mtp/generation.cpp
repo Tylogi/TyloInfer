@@ -331,7 +331,7 @@ struct MtpOps {
         if (same_view(projected_target_hidden, normalized) && projected_target_logits) return projected_target_logits;
         auto input = ops::contiguous(mtp.preserve_output_dtype() ? normalized : ops::cast(normalized, kFloat16));
         auto scope = ops::dense_scope(nullptr, device);
-        auto result = model.logits(input, true);
+        auto result = model.logits(input, true, models::LogitPrecision::input);
         if (!result.defined()) throw std::runtime_error("model logits returned no tensor");
         return result;
     }

@@ -21,13 +21,27 @@ Mtp::Mtp(tyloi::models::qwen35::Predictor model, bool preallocate)
     : model_(std::move(model)), preallocate_(preallocate) {}
 
 std::unique_ptr<tyloi::models::MtpState> Mtp::make_state() const {
-    auto result = std::make_unique<MtpState>(*this, layout(model_, model_.device), model_.config.hidden_size);
-    if (preallocate_) result->prepare(1, 1);
-    return result;
+    return std::make_unique<MtpState>(*this, layout(model_, model_.device), model_.config.hidden_size);
+}
+
+std::vector<std::pair<Device, std::size_t>> Mtp::reset_growth(
+        const tyloi::models::MtpState& value, int64_t batch) const {
+    const auto& request = state<MtpState>(value);
+    return preallocate_ ? request.growth(batch, 1, 0, true) : std::vector<std::pair<Device, std::size_t>>{};
 }
 
 void Mtp::reset(tyloi::models::MtpState& value, int64_t batch) const {
-    state<MtpState>(value).reset(batch);
+    auto& request = state<MtpState>(value);
+    request.reset(batch);
+    if (preallocate_) request.prepare(batch, 1);
+}
+
+std::vector<std::pair<Device, std::size_t>> Mtp::growth(const tyloi::models::MtpState& value,
+        const Tensor& hidden, const Tensor& ids, const Tensor&, const ForwardOptions& options) const {
+    if (!hidden || !ids || hidden.dim() != 3 || ids.dim() != 2 ||
+        hidden.size(0) != ids.size(0) || hidden.size(1) != ids.size(1))
+        throw std::invalid_argument("invalid Qwen MTP input dimensions");
+    return state<MtpState>(value).growth(hidden.size(0), hidden.size(1), options.kv_capacity);
 }
 
 tyloi::models::MtpStep Mtp::step(tyloi::models::MtpState& value, const ::tyloi::Tensor& hidden,

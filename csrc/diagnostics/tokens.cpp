@@ -6,8 +6,6 @@
 #include "engine/backends/cuda/native/profile.h"
 #include "engine/backends/cuda/native/tensor/backend.h"
 #include "engine/models/causal_model.h"
-#include "engine/models/plan.h"
-#include "engine/models/load.h"
 #include "engine/models/source.h"
 #include "engine/ops.h"
 #include "engine/requests/output.h"
@@ -91,26 +89,21 @@ void finish_activity() noexcept {
 #endif
 }
 
-/** Project the last hidden row with the original family-specific rounding and sampling. */
+/** Project the last hidden row using the model's output precision. */
 template<class Owner>
-Tensor next_token(Owner& work, Tensor hidden, models::Backbone backbone) {
+Tensor next_token(Owner& work, Tensor hidden) {
     auto last=work.keep(hidden.dense().select(1,hidden.size(1)-1));
-    const bool mini=backbone==models::Backbone::minicpmo45;
-    const bool direct=backbone==models::Backbone::qwen4_exp || backbone==models::Backbone::glm5_next;
-    if(mini)last=work.keep(last.dense().to(kBFloat16).contiguous());
-    else if(!direct)last=work.keep(last.dense().to(kFloat16).contiguous());
     auto logits=work.keep(work.program.model().logits(last,false));
-    if(direct || mini)return work.keep(::tyloi::ops::argmax(logits,-1));
-    return work.keep(::tyloi::ops::sample_greedy(work.keep(::tyloi::ops::reshape(::tyloi::ops::contiguous(logits),{logits.size(0),-1}))));
+    return work.keep(::tyloi::ops::argmax(logits,-1));
 }
 
 /** Follow the family's prefill and model-owned decode dispatch before eager fallback. */
-Tensor eager(Step& work,Tensor ids,models::Backbone backbone,bool production_required = false) {
+Tensor eager(Step& work,Tensor ids,bool production_required = false) {
     auto& p=work.program;
     auto mode=p.executor().forward_mode(p.config().layer_placement.primary_device());
     models::Input input; input.ids=work.keep(std::move(ids)); input.advance=true;
     const models::ForwardOptions forward{mode.kv_capacity,mode.trace,mode.trace_layer,mode.primary};
-    if(backbone==models::Backbone::qwen4_exp && p.state().position()>0) {
+    if(p.model().info().graph==models::GraphOwner::model && p.model().info().decode_graph && p.state().position()>0) {
         models::DecodeOptions decode;
         decode.projection=models::DecodeOptions::Projection::greedy;
         decode.routed=p.weights().decode()==weights::Cache::Decode::routed;
@@ -120,8 +113,7 @@ Tensor eager(Step& work,Tensor ids,models::Backbone backbone,bool production_req
             return token.device()==tyloi::Device(tyloi::kCUDA, p.config().layer_placement.primary_device()) ? token : work.keep(::tyloi::ops::copy(token,tyloi::Device(tyloi::kCUDA, p.config().layer_placement.primary_device())));
         }
     }
-    if(backbone==models::Backbone::qwen4_exp && p.state().position()==0 &&
-       input.ids.size(1)>128 && input.ids.size(1)<=16384) {
+    if(p.state().position()==0) {
         const auto count=input.ids.size(1);
         const auto cache_mode=p.weights().prefill_mode(count,false);
         const models::PrefillOptions plan{count,1024,0,0,false,
@@ -130,10 +122,10 @@ Tensor eager(Step& work,Tensor ids,models::Backbone backbone,bool production_req
             p.weights().transfer()==weights::Cache::Transfer::coordinated,
             p.weights().split_prefill(count)};
         if(!p.model().prefill_plan(p.state(),plan).layered) {
-            if(production_required)
+            if(production_required && count>128)
                 throw std::invalid_argument("router audit requires production prefill; enable TYLOINFER_MOE_PIPELINE and TYLOINFER_MOE_PREFILL_LAYER");
             auto hidden=work.keep(p.model().forward(std::move(input),p.state(),forward));
-            return next_token(work,hidden,backbone);
+            return next_token(work,hidden);
         }
         engine::InferenceRequest request;
         engine::InferenceOutput output(request,nullptr,"diagnostic-prefill");
@@ -142,22 +134,18 @@ Tensor eager(Step& work,Tensor ids,models::Backbone backbone,bool production_req
         if(production_required && result.mode!=models::Prefill::Mode::layered)
             throw std::invalid_argument("router audit requires production prefill; enable TYLOINFER_MOE_PIPELINE and TYLOINFER_MOE_PREFILL_LAYER");
         if(production_required)std::cout<<"diagnostic_prefill path=production_layer_major tokens="<<input.ids.size(1)<<std::endl;
-        return next_token(work,hidden,backbone);
+        return next_token(work,hidden);
     }
-    if(production_required && backbone==models::Backbone::qwen4_exp && input.ids.size(1)>128)
+    if(production_required && input.ids.size(1)>128)
         throw std::invalid_argument("router audit requires production prefill; enable TYLOINFER_MOE_PIPELINE and TYLOINFER_MOE_PREFILL_LAYER");
     auto hidden=work.keep(p.model().forward(std::move(input),p.state(),
         forward));
-    return next_token(work,hidden,backbone);
+    return next_token(work,hidden);
 }
 }
 
 void warmup_prefill(Program& program,const Tensor& ids,bool profile,int rounds,bool final_sync) {
     auto scope=program.executor().enter(program.config().layer_placement.primary_device());
-    auto loader=program.loader();
-    const auto* source=dynamic_cast<const ModelSource*>(&loader.source);
-    if(!source)throw std::runtime_error("diagnostics model source is unavailable");
-    const auto backbone=models::model_plan(models::graph(*source)).backbone;
     auto& profiler=program.executor().profiler();
     struct Restore { CudaProfiler& p; bool enabled; ~Restore(){p.enabled=enabled;} } restore{profiler,profiler.enabled};
     profiler.enabled=false;
@@ -166,7 +154,7 @@ void warmup_prefill(Program& program,const Tensor& ids,bool profile,int rounds,b
     for(int round=0;round<rounds;++round) {
         Step step{program};
         program.state().reset(1);
-        (void)eager(step,ids,backbone);
+        (void)eager(step,ids);
         TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(current_stream()));
     }
     if(rounds || final_sync) { program.state().reset(1); if(final_sync) TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(current_stream())); profiler.reset(); }
@@ -183,10 +171,8 @@ int generate_diagnostic_tokens(Program& program,Tensor ids,int gen,bool profile,
     const auto loader=program.loader();
     const auto* source=dynamic_cast<const ModelSource*>(&loader.source);
     if(!source)throw std::runtime_error("diagnostics model source is unavailable");
-    const auto plan=models::model_plan(models::graph(*source));
-    const bool flash=plan.backbone==models::Backbone::qwen4_exp ||
-        plan.backbone==models::Backbone::glm5_next;
     const auto info=program.model().info();
+    const bool timed_eager=info.graph==models::GraphOwner::model || !info.decode_graph;
     auto scope=program.executor().enter(program.config().layer_placement.primary_device());
     Work work{program};
     ids=work.keep(std::move(ids));
@@ -201,7 +187,7 @@ int generate_diagnostic_tokens(Program& program,Tensor ids,int gen,bool profile,
     Tensor next;
     {
     Step step{program};
-    next=eager(step,ids,plan.backbone,production_prefill);
+    next=eager(step,ids,production_prefill);
     }
     TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(current_stream()));
     const auto t2=Clock::now();
@@ -221,7 +207,7 @@ int generate_diagnostic_tokens(Program& program,Tensor ids,int gen,bool profile,
     const bool profile_graph=profile && profile_option && std::atoi(profile_option)!=0;
     const auto& config=program.config();
     const bool graph_requested=!graph_option || graph_option[0]!='0';
-    const bool graph_eligible=graph_requested && !forced_input && plan.backbone!=models::Backbone::generic_qwen && !flash &&
+    const bool graph_eligible=graph_requested && !forced_input && info.decode_graph &&
         mfq_cuda_graph_capture_supported() &&
         config.dsv4_cpu_offload_layers.empty() && config.dense_cpu_layer_count==0 &&
         program.weights().transfer()!=weights::Cache::Transfer::coordinated &&
@@ -259,7 +245,7 @@ int generate_diagnostic_tokens(Program& program,Tensor ids,int gen,bool profile,
             models::Input input; input.ids=static_input; input.positions=static_pos; input.lengths=static_len;
             input.cache_positions=static_pos; input.kv_length=planned; input.attention_parts=parts;
             return next_token(work,work.keep(program.model().forward(std::move(input),program.state(),
-                {mode.kv_capacity,mode.trace,mode.trace_layer,mode.primary})),plan.backbone);
+                {mode.kv_capacity,mode.trace,mode.trace_layer,mode.primary})));
         };
         const auto warmup_checkpoint=work.values.size();
         if(!states.empty() || info.double_warmup)for(int pass=0;pass<2;++pass) {
@@ -284,15 +270,15 @@ int generate_diagnostic_tokens(Program& program,Tensor ids,int gen,bool profile,
         for(int i=1;i<gen;++i) {
             Step step{program};
             auto input=step.keep(::tyloi::ops::reshape(forced_input?step.keep(::tyloi::ops::slice(forced_input,0,i-1,i)):next,{1,1}));
-            next=profiler.measure("decode.eager_model",[&]{return eager(step,input,plan.backbone);});
+            next=profiler.measure("decode.eager_model",[&]{return eager(step,input);});
             profiler.measure("decode.eager_commit",[&]{
                 TYLOINFER_CUDA_CHECK(cudaMemcpyAsync(generated.dense().data_ptr<std::int64_t>()+i,
                     next.dense().data_ptr<std::int64_t>(),sizeof(std::int64_t),cudaMemcpyDeviceToDevice,stream)); return 0;});
             produced=i+1;
             if(!stops.empty() && stops.contains(::tyloi::ops::item(next))) { eos=true; break; }
-            if(i==1 && flash && stops.empty()) { TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(current_stream())); first=Clock::now(); measured_first=true; }
-            if(gen>=4 && i==gen/2 && flash && stops.empty()) { TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(current_stream())); halfway=Clock::now(); measured_half=true; }
-            if(gen>256 && i==gen-1-128 && flash && stops.empty()) { TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(current_stream())); last_window=Clock::now(); measured_last=true; }
+            if(i==1 && timed_eager && stops.empty()) { TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(current_stream())); first=Clock::now(); measured_first=true; }
+            if(gen>=4 && i==gen/2 && timed_eager && stops.empty()) { TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(current_stream())); halfway=Clock::now(); measured_half=true; }
+            if(gen>256 && i==gen-1-128 && timed_eager && stops.empty()) { TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(current_stream())); last_window=Clock::now(); measured_last=true; }
         }
     }
     std::cout<<"diagnostic_cuda_graph requested="<<int(graph_requested)

@@ -70,7 +70,7 @@ struct Model
     /** Apply the configured logit soft cap. */
     ::tyloi::Tensor softcap(const ::tyloi::Tensor& logits) const override;
     /** Project hidden states to optionally capped logits. */
-    ::tyloi::Tensor logits(const ::tyloi::Tensor& hidden, bool capped = true) const override;
+    ::tyloi::Tensor logits(const ::tyloi::Tensor& hidden, bool capped = true, tyloi::models::LogitPrecision precision = tyloi::models::LogitPrecision::model) const override;
     /** Execute using a request state created by this model. */
     ::tyloi::Tensor forward(tyloi::models::Input input, tyloi::models::State& state,
         const tyloi::models::ForwardOptions& options = {}) const override;

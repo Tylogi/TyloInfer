@@ -62,6 +62,7 @@ struct Model : tyloi::models::CausalModel {
     MfqModelCapabilities capabilities() const override;
     tyloi::engine::Metrics metrics() const override;
     std::unique_ptr<tyloi::models::State> make_state() const override;
+    std::unique_ptr<tyloi::models::Batch> make_batch(const tyloi::models::BatchConfig&) const override;
     tyloi::models::Mtp* predictor() const noexcept override { return mtp.get(); }
     tyloi::StepSequence<tyloi::models::Prepared> prepare(
         const std::vector<std::int64_t>& tokens, const MfqMultimodalInput& media,
@@ -71,7 +72,7 @@ struct Model : tyloi::models::CausalModel {
     bool supports_speculation() const noexcept override;
     ::tyloi::Tensor embedding(const tyloi::Tensor& ids, int primary = 0) const override;
     ::tyloi::Tensor normalize(const tyloi::Tensor& hidden, std::int64_t batch, std::int64_t tokens) const override;
-    ::tyloi::Tensor logits(const tyloi::Tensor& hidden, bool capped = true) const override;
+    ::tyloi::Tensor logits(const tyloi::Tensor& hidden, bool capped = true, tyloi::models::LogitPrecision precision = tyloi::models::LogitPrecision::model) const override;
     ::tyloi::Tensor softcap(const tyloi::Tensor& logits) const override;
 };
 

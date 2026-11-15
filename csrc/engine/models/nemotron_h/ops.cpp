@@ -1,5 +1,6 @@
 #include "engine/models/plan.h"
 #include "engine/models/common/check.h"
+#include "engine/models/common/mtp.h"
 #include "engine/backends/cuda/native/collectives.h"
 #include "engine/backends/cuda/native/scope.h"
 #include "engine/models/session/snapshot.h"
@@ -348,9 +349,11 @@ static DenseTensor normalize_ids(Collectives& collectives, int primary, DenseTen
 ::tyloi::Tensor Model::softcap(const ::tyloi::Tensor& value) const {
     return tyloi::ops::softcap(value, metadata.final_logit_softcapping);
 }
-::tyloi::Tensor Model::logits(const ::tyloi::Tensor& hidden, bool capped) const {
+::tyloi::Tensor Model::logits(const ::tyloi::Tensor& hidden, bool capped, tyloi::models::LogitPrecision precision) const {
+    auto projection_input = precision == tyloi::models::LogitPrecision::model
+        ? tyloi::ops::contiguous(tyloi::ops::cast(hidden, tyloi::kFloat16)) : hidden;
     auto value = tyloi::ops::measure("model.lm_head", hidden.device(), [&] {
-        return tyloi::ops::project(hidden, lm_head);
+        return tyloi::ops::project(projection_input, lm_head);
     });
     return capped ? softcap(value) : value;
 }
@@ -645,6 +648,29 @@ void State::preallocate() {
     }
 }
 
+std::vector<std::pair<tyloi::Device, std::size_t>> State::preallocate_growth() const {
+    if (!::tyloi::cuda::options::kv_vram_preallocated()) return {};
+    std::vector<std::pair<tyloi::Device, std::size_t>> result;
+    for (std::size_t index = 0; index < layers.size(); ++index) {
+        const auto* cache = std::get_if<tyloi::state::KvView>(&layers[index]);
+        if (!cache || cache->defined()) continue;
+        const auto& layer = layout_[index];
+        const auto& full = std::get<FullLayout>(layer.mixer);
+        const tyloi::Device device(tyloi::kCUDA, layer.device);
+        const auto bytes = tyloi::state::kv_bytes(1, full.heads, full.capacity,
+            full.head_dim, full.sliding, full.dtype, full.quantization);
+        auto entry = std::find_if(result.begin(), result.end(),
+            [device](const auto& value) { return value.first == device; });
+        if (entry == result.end()) result.emplace_back(device, bytes);
+        else {
+            if (entry->second > std::numeric_limits<std::size_t>::max() - bytes)
+                throw std::overflow_error("Nemotron-H preallocation byte count overflow");
+            entry->second += bytes;
+        }
+    }
+    return result;
+}
+
 void State::reset(std::int64_t next_batch) {
     cache_pos = decode_position_delta = 0;
     speculative_start = -1;
@@ -935,6 +961,135 @@ void State::restore_text_session_state(const TextSessionState& saved) {
     cache_pos = saved.cache_pos;
     decode_position_delta = saved.decode_position_delta;
     batch = 1;
+}
+
+
+class State::SessionRestore final : public tyloi::models::Restore {
+public:
+    SessionRestore(State& state, const TextSessionState& saved, const tyloi::models::Mtp* predictor)
+        : state_(state), saved_(saved) {
+        const auto kind = state_.text_session_state_kind();
+        if (kind == TextSessionStateKind::Unsupported || saved_.kind() != kind || saved_.cache_pos <= 0 ||
+            saved_.tokens.size() != static_cast<std::size_t>(saved_.cache_pos) ||
+            saved_.cache_pos > state_.model_->metadata.max_position_embeddings || state_.speculative_start >= 0)
+            throw CudaSessionStateError("Nemotron-H session state is incompatible");
+        const auto* full = std::get_if<std::vector<KvSnapshot>>(&saved_.payload);
+        const auto* hybrid = std::get_if<std::vector<HybridBlockSessionState>>(&saved_.payload);
+        if ((kind == TextSessionStateKind::FullAttention && (!full || full->size() != state_.layers.size())) ||
+            (kind == TextSessionStateKind::HybridAttention && (!hybrid || hybrid->size() != state_.layers.size())))
+            throw CudaSessionStateError("Nemotron-H session layer count differs");
+        for (std::size_t i = 0; i < state_.layers.size(); ++i) {
+            const auto& layout = state_.layout_[i];
+            if (const auto* attention = std::get_if<FullLayout>(&layout.mixer)) {
+                if (hybrid && (*hybrid)[i].kind != HybridBlockSessionStateKind::FullAttention)
+                    throw CudaSessionStateError("Nemotron-H full-attention layer changed");
+                const auto& kv = full ? (*full)[i] : (*hybrid)[i].full_attention;
+                validate_kv(kv);
+                const auto expected = tyloi::state::kv_layout(1, attention->heads, kv.capacity,
+                    attention->head_dim, attention->sliding, attention->dtype, attention->quantization);
+                const auto dtype = expected.storage_dtype;
+                if (kv.target_device() != tyloi::Device(tyloi::kCUDA, layout.device) ||
+                    kv.ring != attention->sliding || kv.k.size(0) != 1 || kv.k.size(1) != attention->heads ||
+                    kv.k.scalar_type() != dtype || kv.k.size(3) != expected.key_width ||
+                    kv.v.size(3) != expected.value_width ||
+                    (attention->sliding ? (kv.capacity != attention->capacity || kv.k.size(2) != kv.capacity) :
+                        (kv.capacity > attention->capacity || kv.capacity < saved_.cache_pos || kv.k.size(2) != saved_.cache_pos)))
+                    throw CudaSessionStateError("Nemotron-H attention session geometry changed");
+            } else if (const auto* mamba = std::get_if<MambaLayout>(&layout.mixer)) {
+                if (!hybrid || (*hybrid)[i].kind != HybridBlockSessionStateKind::Recurrent)
+                    throw CudaSessionStateError("Nemotron-H recurrent layer changed");
+                const auto& item = (*hybrid)[i];
+                const auto [inner, width] = mamba_widths(mamba->heads, mamba->head_dim,
+                    mamba->groups, mamba->state_size, mamba->conv_kernel);
+                (void)inner;
+                const auto device = tyloi::Device(tyloi::kCUDA, layout.device);
+                if (!item.convolution.defined() || !item.recurrent.defined() ||
+                    !item.convolution.representation<DenseTensor>() || !item.recurrent.representation<DenseTensor>() ||
+                    item.convolution.device() != device || item.recurrent.device() != device ||
+                    item.convolution.scalar_type() != tyloi::kFloat32 || item.recurrent.scalar_type() != tyloi::kFloat32 ||
+                    item.convolution.dim() != 3 || item.convolution.size(0) != 1 ||
+                    item.convolution.size(1) != mamba->conv_kernel - 1 || item.convolution.size(2) != width ||
+                    item.recurrent.dim() != 4 || item.recurrent.size(0) != 1 || item.recurrent.size(1) != mamba->heads ||
+                    item.recurrent.size(2) != mamba->head_dim || item.recurrent.size(3) != mamba->state_size)
+                    throw CudaSessionStateError("Nemotron-H recurrent session geometry changed");
+            } else if (!hybrid || (*hybrid)[i].kind != HybridBlockSessionStateKind::Stateless)
+                throw CudaSessionStateError("Nemotron-H stateless layer changed");
+        }
+        if (predictor) {
+            if (!state_.predictor || !state_.predictor->belongs_to(*predictor) || !saved_.mtp ||
+                !predictor->supports_session_state(*state_.predictor) ||
+                !predictor->session_boundary(saved_.cache_pos, saved_.mtp->cache_pos))
+                throw CudaSessionStateError("Nemotron-H predictor session boundary changed");
+            predictor_ = predictor->prepare_restore(*state_.predictor, *saved_.mtp);
+            if (!predictor_) throw CudaSessionStateError("Nemotron-H predictor session is unsupported");
+        }
+    }
+    std::vector<std::pair<tyloi::Device, std::size_t>> growth() const override {
+        std::vector<std::pair<tyloi::Device, std::size_t>> result;
+        const auto* full = std::get_if<std::vector<KvSnapshot>>(&saved_.payload);
+        const auto* hybrid = std::get_if<std::vector<HybridBlockSessionState>>(&saved_.payload);
+        for (std::size_t i = 0; i < state_.layers.size(); ++i) {
+            if (std::holds_alternative<FullLayout>(state_.layout_[i].mixer)) {
+                add_kv_restore_growth(result, full ? (*full)[i] : (*hybrid)[i].full_attention);
+            } else if (std::holds_alternative<MambaLayout>(state_.layout_[i].mixer)) {
+                const auto device = tyloi::Device(tyloi::kCUDA, state_.layout_[i].device);
+                const auto& item = (*hybrid)[i];
+                for (const auto& tensor : {item.convolution, item.recurrent}) {
+                    const auto bytes = restore_tensor_bytes({}, tensor);
+                    auto it = std::find_if(result.begin(), result.end(), [device](const auto& value) { return value.first == device; });
+                    if (it == result.end()) result.emplace_back(device, bytes);
+                    else {
+                        if (it->second > std::numeric_limits<std::size_t>::max() - bytes)
+                            throw std::overflow_error("Nemotron-H session growth overflow");
+                        it->second += bytes;
+                    }
+                }
+            }
+        }
+        if (predictor_) for (const auto& [device, bytes] : predictor_->growth()) {
+            auto it = std::find_if(result.begin(), result.end(), [device](const auto& value) { return value.first == device; });
+            if (it == result.end()) result.emplace_back(device, bytes);
+            else {
+                if (it->second > std::numeric_limits<std::size_t>::max() - bytes)
+                    throw std::overflow_error("Nemotron-H session growth overflow");
+                it->second += bytes;
+            }
+        }
+        return result;
+    }
+    void stage() override {
+        candidate_ = std::make_unique<State>(*state_.model_);
+        candidate_->restore_text_session_state(saved_);
+        if (predictor_) predictor_->stage();
+    }
+    std::vector<tyloi::Tensor> storage() const override {
+        auto result = candidate_ ? candidate_->storage() : std::vector<tyloi::Tensor>{};
+        if (predictor_) {
+            auto extra = predictor_->storage();
+            result.insert(result.end(), extra.begin(), extra.end());
+        }
+        return result;
+    }
+    tyloi::Tensor target_hidden() const override { return predictor_ ? predictor_->target_hidden() : tyloi::Tensor{}; }
+    void publish() noexcept override {
+        state_.layers.swap(candidate_->layers);
+        std::swap(state_.cache_pos, candidate_->cache_pos);
+        std::swap(state_.decode_position_delta, candidate_->decode_position_delta);
+        std::swap(state_.batch, candidate_->batch);
+        std::swap(state_.speculative_start, candidate_->speculative_start);
+        std::swap(state_.speculative_confirmed, candidate_->speculative_confirmed);
+        if (predictor_) predictor_->publish();
+    }
+private:
+    State& state_;
+    TextSessionState saved_;
+    std::unique_ptr<State> candidate_;
+    std::unique_ptr<tyloi::models::Restore> predictor_;
+};
+
+std::unique_ptr<tyloi::models::Restore> State::prepare_restore(
+        const TextSessionState& saved, const tyloi::models::Mtp* predictor_model) {
+    return std::make_unique<SessionRestore>(*this, saved, predictor_model);
 }
 
 } // namespace tyloi::cuda::nemotron_h

@@ -88,6 +88,7 @@ Assembly assembly(const tyloi::engine::LoadOptions& options, CudaLoadConfig& con
         models::LoadOptions{.context = options.context_size, .gpu_layers = config.n_gpu_layers,
             .expert_parallel = config.expert_parallel.enabled(),
             .recurrent_transposed = executor.mode().transposed,
+            .preallocate = cuda::options::kv_vram_preallocated(),
             .vision_resident = cuda::options::vision_resident(),
             .mirror_scalars = config.tensor_parallel_mirror_linear_attention_scalars,
             .yarn = config.yarn,
@@ -104,7 +105,8 @@ bool graph_allowed(const CudaLoadConfig& load, Executor& executor,
         const weights::Cache& weights, const models::Info& info) {
     const auto graph_weights = info.graph_weights == models::GraphWeights::resident
         ? ::tyloi::weights::Cache::Graph::legacy : ::tyloi::weights::Cache::Graph::native;
-    return info.decode_graph && !executor.attention_options().kernels.decode_aten &&
+    return info.decode_graph && load.dense_cpu_layer_count == 0 && load.dsv4_cpu_offload_layers.empty() &&
+        !executor.attention_options().kernels.decode_aten &&
         model_parallel_cuda_graph_enabled(load, executor, weights) &&
         weights.graph_safe(graph_weights, moe_parallel_config(load).enabled());
 }
@@ -118,6 +120,10 @@ void configure_generation(engine::Config& runtime, const CudaLoadConfig& load,
     runtime.devices = cuda_devices(load);
     runtime.online_budget = load.layer_placement.devices.size() <= 1 &&
         !load.tensor_parallel.enabled() && !load.expert_parallel.enabled();
+    runtime.continuous_batch.preallocate = cuda::options::kv_vram_preallocated();
+    runtime.continuous_batch.cpu_offload = load.dense_cpu_layer_count != 0 ||
+        !load.dsv4_cpu_offload_layers.empty();
+    runtime.continuous_batch.cached_slots = load.weights.min_slots;
     const bool allowed = graph_allowed(load, executor, weights, info);
     runtime.decode_graph.enabled &= allowed;
     runtime.continuous_batch.cuda_graph &= allowed;
@@ -248,6 +254,8 @@ void Program::load(bool components) {
         auto scope = p.executor->enter(p.config.layer_placement.primary_device());
         ::tyloi::weights::LoadScope memory(*p.ledger);
         internal::load_model(p.model, p.options, p.config, *p.executor, *p.weights, p.source, components);
+        p.config.dense_cpu_layer_count = p.config.n_gpu_layers >= 0
+            ? static_cast<int>(std::max<std::int64_t>(models::graph(*p.source).topology.text_layers - p.config.n_gpu_layers, 0)) : 0;
         if (p.offload && !p.model->info().streamed_kv)
             throw std::invalid_argument("CUDA streamed KV requires a QSA model");
         p.state = p.model->make_state();
@@ -419,7 +427,7 @@ std::unique_ptr<Program::BatchLease> Program::make_batch() {
     p.budget->reserve(p.state->graph_exit_growth());
     p.state->release_graphs();
     lease->batch_ = engine::make_batch(*p.model, *p.executor,
-        *p.weights, *p.budget, p.run_config);
+        *p.weights, *p.budget, p.run_config, p.forward);
     return lease;
 }
 
@@ -434,6 +442,7 @@ engine::BatchDriver& Program::begin_batch(models::BatchConfig config) {
         p.budget->reserve(p.state->graph_exit_growth());
         p.graph->invalidate();
         p.state->release_graphs();
+        config.forward=p.forward;
         p.batch_driver=std::make_unique<engine::BatchDriver>(
             p.model->make_batch(config),*p.executor,*p.weights,*p.budget,p.run_config.device,
             p.run_config.workspace_reserve);

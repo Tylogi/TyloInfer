@@ -8,21 +8,6 @@
 
 namespace tyloi::models {
 
-// Resolve semantic implementation IDs from the model graph.
-enum class Backbone {
-    generic_qwen,
-    minicpmo45,
-    minicpmo_tts,
-    gemma4,
-    glm_dsa,
-    glm5_next,
-    qwen4_exp,
-    deepseek_v4,
-    deepseek_v41,
-    nemotron_h,
-    unsupported,
-};
-
 enum class VisionAdapter {
     none,
     grid_vit,
@@ -40,13 +25,12 @@ enum class PredictorAdapter {
 };
 
 struct Plan {
-    Backbone backbone = Backbone::unsupported;
     VisionAdapter vision = VisionAdapter::none;
     PredictorAdapter predictor = PredictorAdapter::none;
 };
 
 struct CapabilityMatrix {
-    bool text = false;
+    bool text = true;
     bool image_input = false;
     bool video_input = false;
     bool audio_input = false;
@@ -66,38 +50,9 @@ struct ComponentState {
     bool mtp_enabled = false;
 };
 
-inline constexpr Backbone backbone(
-        std::string_view implementation) noexcept {
-    if (implementation == "qwen3_5" ||
-        implementation == "generic_qwen") {
-        return Backbone::generic_qwen;
-    }
-    if (implementation == "minicpmo45") {
-        return Backbone::minicpmo45;
-    }
-    if (implementation == "minicpmo_tts") {
-        return Backbone::minicpmo_tts;
-    }
-    if (implementation == "gemma4") return Backbone::gemma4;
-    if (implementation == "glm_dsa") return Backbone::glm_dsa;
-    if (implementation == "glm5_next") return Backbone::glm5_next;
-    if (implementation == "qwen4_exp") return Backbone::qwen4_exp;
-    if (implementation == "deepseek_v4") {
-        return Backbone::deepseek_v4;
-    }
-    if (implementation == "deepseek_v41") {
-        return Backbone::deepseek_v41;
-    }
-    if (implementation == "nemotron_h") {
-        return Backbone::nemotron_h;
-    }
-    return Backbone::unsupported;
-}
-
 inline Plan model_plan(
         const ModelGraph& graph) noexcept {
     Plan result;
-    result.backbone = backbone(graph.backbone);
     const auto* vision = graph.component("vision");
     if ((graph.backbone == "qwen3_5" || graph.backbone == "qwen4_exp") && vision != nullptr &&
         vision->tensor_root == "vision" &&
@@ -107,7 +62,7 @@ inline Plan model_plan(
         result.vision = VisionAdapter::grid_vit;
     }
     const auto* audio = graph.component("audio_input");
-    if(result.backbone==Backbone::deepseek_v41 && vision && vision->tensor_root=="vision" &&
+    if(graph.backbone=="deepseek_v41" && vision && vision->tensor_root=="vision" &&
             vision->implementation=="deepseek_v41_vision" &&
             vision->input_contract=="deepseek_v41_vision.v1" &&
             vision->position_policy=="deepseek_v41_positions")result.vision=VisionAdapter::deepseek_v41;
@@ -115,7 +70,7 @@ inline Plan model_plan(
     // The MiniCPM adapter is one composite implementation.  Do
     // not advertise a partially declared graph as supported until those
     // weighted components have independent adapters.
-    if (result.backbone == Backbone::minicpmo45 &&
+    if (graph.backbone == "minicpmo45" &&
         vision != nullptr && audio != nullptr && tts != nullptr &&
         vision->implementation == "minicpmo45_vision" &&
         audio->implementation == "minicpmo45_audio" &&
@@ -157,8 +112,6 @@ inline Plan model_plan(
 inline constexpr CapabilityMatrix capabilities(
         const Plan& plan) noexcept {
     CapabilityMatrix result;
-    result.text = plan.backbone != Backbone::unsupported;
-    if (!result.text) return result;
     result.image_input =
         plan.vision == VisionAdapter::grid_vit ||
         plan.vision == VisionAdapter::minicpmo45 ||

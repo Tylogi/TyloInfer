@@ -26,8 +26,19 @@ void reserve_batch(Budget& budget, Device primary_device, const models::BatchGro
     }
     if(primary && std::none_of(growth.begin(),growth.end(),[&](const auto& value){return value.first==primary_device;}))
         growth.emplace_back(primary_device,0);
-    for(const auto& [device,bytes]:growth)
-        if(bytes || (primary && device==primary_device))budget.reserve_kv(device,prefill_budget_add(bytes,margin));
+    models::BatchGrowth admission;
+    constexpr auto budget_margin = std::size_t(64) << 20;
+    for(const auto& [device,bytes]:growth) {
+        if (!bytes && !(primary && device==primary_device)) continue;
+        if (device.is_cpu()) admission.emplace_back(device, bytes);
+        else {
+            const auto extra = margin > budget_margin ? margin - budget_margin : 0;
+            auto requested = prefill_budget_add(bytes, extra);
+            if (!requested) requested = 1;
+            admission.emplace_back(device, requested);
+        }
+    }
+    budget.reserve(admission);
 }
 
 void submit_batch(Executor& executor, std::span<const Tensor> outputs,
@@ -208,6 +219,7 @@ Tensor BatchDriver::prefill(models::BatchState& state, Tensor ids) {
     std::size_t primary=0;
     for(const auto& [device,bytes]:growth) {
         if(device==device_)primary=prefill_budget_add(primary,bytes);
+        else if(bytes && device.is_cpu())budget_.reserve_ram(bytes);
         else if(bytes)budget_.reserve_kv(device,prefill_budget_add(bytes,std::size_t(64)<<20));
     }
     const auto chunk=budget_.batch(device_,batch_->prefill_row_bytes(),{0,count,true},primary);

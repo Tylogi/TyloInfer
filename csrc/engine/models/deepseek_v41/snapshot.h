@@ -13,6 +13,8 @@ struct EngramHashSnapshot;
 struct BlockSnapshot {
     ::tyloi::Tensor local_kv, compressed_kv, index_k, partial_kv, partial_score;
     int64_t compressed_length = 0, partial_length = 0;
+    // Nonnegative for CPU tensors decoded from a paged CUDA block.
+    int original_device = -1;
 
     template <class Visit>
     void tensors(const Visit& visit) const {
@@ -36,6 +38,8 @@ struct Snapshot {
 
 struct MtpSnapshot {
     std::vector<::tyloi::Tensor> rings;
+    int hidden_device = -1;
+    std::vector<int> ring_devices;
 
     template <class Visit>
     void tensors(const Visit& visit) const {

@@ -4,6 +4,7 @@
 #include "engine/models/glm5_next/state.h"
 #include "engine/models/metadata.h"
 #include "engine/models/causal_model.h"
+#include "engine/models/common/mtp.h"
 #include "engine/models/plan.h"
 #include "engine/models/source.h"
 #include "engine/backends/cuda/ops/projection/quant_linear.h"
@@ -314,6 +315,7 @@ struct Model
     : tyloi::models::CausalModel
 {
     tyloi::models::Info info() const override;
+    tyloi::models::Mtp* predictor() const noexcept override { return mtp.get(); }
     bool supports_speculation() const noexcept override;
     MfqModelCapabilities capabilities() const override;
     tyloi::engine::Metrics metrics() const override;
@@ -322,7 +324,7 @@ struct Model
     ::tyloi::Tensor embedding(const ::tyloi::Tensor&, int primary = 0) const override;
     ::tyloi::Tensor normalize(const ::tyloi::Tensor&, std::int64_t, std::int64_t) const override;
     ::tyloi::Tensor softcap(const ::tyloi::Tensor&) const override;
-    ::tyloi::Tensor logits(const ::tyloi::Tensor&, bool capped = true) const override;
+    ::tyloi::Tensor logits(const ::tyloi::Tensor&, bool capped = true, tyloi::models::LogitPrecision precision = tyloi::models::LogitPrecision::model) const override;
     ::tyloi::Tensor forward(tyloi::models::Input, tyloi::models::State&, const tyloi::models::ForwardOptions& = {}) const override;
     std::shared_ptr<const tyloi::ModelSource> source;
     tyloi::ModelGraph graph;
@@ -332,5 +334,6 @@ struct Model
     ::tyloi::Tensor embed, lm_head;
     Parameter output_norm;
     std::vector<Layer> layers;
+    std::unique_ptr<tyloi::models::Mtp> mtp;
 };
 } // namespace tyloi::cuda::glm5_next

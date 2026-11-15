@@ -113,16 +113,18 @@ protected:
     virtual SessionResult session_command(const SessionCommand& command);
     virtual void unload_model();
     virtual ControlResult control_command(ControlRequest request);
+    void drain();
+    std::unique_ptr<models::CausalModel> model_;
+    std::unique_ptr<tyloi::Executor> executor_;
+    models::ForwardOptions forward_options_{};
+    std::optional<Budget> budget_;
 
 private:
     friend class Scheduler;
     void install(std::unique_ptr<tyloi::Executor::Graph> graph);
 
     SessionResult set_budget(const SessionCommand&);
-    void drain();
     void clear_bindings() noexcept;
-    std::unique_ptr<models::CausalModel> model_;
-    std::unique_ptr<tyloi::Executor> executor_;
     std::unique_ptr<tyloi::Executor> predictor_execution_;
     mtp::State mtp_state_;
     Config config_;
@@ -132,11 +134,9 @@ private:
     std::unique_ptr<models::State> idle_state_;
     // Requests temporarily hold idle_state_; this borrow keeps telemetry available during generation.
     models::State* serial_state_ = nullptr;
-    models::ForwardOptions forward_options_{};
     models::Info model_info_{};
     std::optional<Decode> graph_;
     std::unique_ptr<state::Sessions> cache_;
-    std::optional<Budget> budget_;
     std::unique_ptr<Batch> batch_;
     std::unique_ptr<TextProcessor> text_;
     EngineInfo info_;

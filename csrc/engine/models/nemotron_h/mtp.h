@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <array>
 #include <optional>
+#include <limits>
 #include <string>
 #include <utility>
 
@@ -253,6 +254,87 @@ struct Mtp final : tyloi::models::Mtp {
         result.bytes += session_tensor_bytes(hidden);
         result.last_target_hidden = std::make_shared<::tyloi::DenseTensor>(std::move(hidden));
         return result;
+    }
+
+    std::unique_ptr<tyloi::models::Restore> prepare_restore(
+            tyloi::models::MtpState& value, const MtpSessionState& snapshot) const override {
+        auto& state = this->state<PredictorState>(value);
+        struct Candidate final : tyloi::models::Restore {
+            const Mtp& model;
+            PredictorState& state;
+            MtpSessionState saved;
+            std::vector<LayerState> states;
+            std::vector<std::int64_t> lengths;
+            std::vector<std::size_t> indices;
+
+            Candidate(const Mtp& model, PredictorState& state, const MtpSessionState& snapshot)
+                : model(model), state(state), saved(snapshot), states(model.layers.size()), lengths{snapshot.cache_pos} {
+                for (std::size_t i = 0; i < model.layers.size(); ++i)
+                    if (std::holds_alternative<::tyloi::models::FullAttention>(model.layers[i].weights)) {
+                        indices.push_back(i);
+                        states[i].emplace<tyloi::state::KvView>();
+                    }
+                const auto* blocks = std::get_if<std::vector<KvSnapshot>>(&saved.payload);
+                const auto& hidden = saved.last_target_hidden;
+                if (saved.cache_pos <= 0 || saved.cache_pos > model.predictor_capacity() || !blocks ||
+                    blocks->size() != indices.size() || !hidden.defined() || !hidden.representation<DenseTensor>() || hidden.dim() != 3 ||
+                    hidden.size(0) != 1 || hidden.size(1) != 1 || hidden.size(2) != model.config.hidden_size ||
+                    hidden.device() != tyloi::Device(tyloi::kCUDA, model.primary) ||
+                    (hidden.scalar_type() != tyloi::kFloat16 && hidden.scalar_type() != tyloi::kBFloat16 &&
+                     hidden.scalar_type() != tyloi::kFloat32))
+                    throw CudaSessionStateError("Nemotron-H predictor session is incompatible");
+                for (std::size_t i = 0; i < indices.size(); ++i) {
+                    const auto& layer = model.layers[indices[i]];
+                    const auto& attention = std::get<::tyloi::models::FullAttention>(layer.weights);
+                    const auto& kv = (*blocks)[i];
+                    validate_kv(kv);
+                    const auto dtype = attention.official_bf16 ? tyloi::kBFloat16 : tyloi::kFloat16;
+                    const auto layout = tyloi::state::kv_layout(1, attention.kv_heads, kv.capacity,
+                        attention.attention_head_dim, attention.sliding, dtype, attention.kv_quantization);
+                    if (kv.target_device() != tyloi::Device(tyloi::kCUDA, layer.device) ||
+                        kv.ring != attention.sliding || kv.k.size(0) != 1 || kv.k.size(1) != attention.kv_heads ||
+                        kv.k.scalar_type() != layout.storage_dtype || kv.k.size(3) != layout.key_width ||
+                        kv.v.size(3) != layout.value_width ||
+                        (kv.ring ? (kv.capacity != attention.attention_window || kv.k.size(2) != kv.capacity) :
+                            (kv.capacity > model.predictor_capacity() || kv.capacity < saved.cache_pos || kv.k.size(2) != saved.cache_pos)))
+                        throw CudaSessionStateError("Nemotron-H predictor KV geometry changed");
+                }
+            }
+            std::vector<std::pair<tyloi::Device, std::size_t>> growth() const override {
+                std::vector<std::pair<tyloi::Device, std::size_t>> result;
+                for (const auto& block : std::get<std::vector<KvSnapshot>>(saved.payload))
+                    add_kv_restore_growth(result, block);
+                return result;
+            }
+            void stage() override {
+                const auto& blocks = std::get<std::vector<KvSnapshot>>(saved.payload);
+                for (std::size_t i = 0; i < indices.size(); ++i) {
+                    const auto& layer = model.layers[indices[i]];
+                    const auto& attention = std::get<::tyloi::models::FullAttention>(layer.weights);
+                    MfqCudaGuard guard(layer.device);
+                    stage_kv(std::get<tyloi::state::KvView>(states[indices[i]]), blocks[i],
+                        attention.attention_head_dim, attention.official_bf16 ? tyloi::kBFloat16 : tyloi::kFloat16,
+                        attention.kv_quantization);
+                }
+            }
+            std::vector<tyloi::Tensor> storage() const override {
+                std::vector<tyloi::Tensor> result;
+                if (saved.last_target_hidden) result.push_back(saved.last_target_hidden);
+                for (const auto index : indices) {
+                    const auto& kv = std::get<tyloi::state::KvView>(states[index]);
+                    if (kv.physical_key) result.push_back(kv.physical_key);
+                    if (kv.physical_value) result.push_back(kv.physical_value);
+                }
+                return result;
+            }
+            tyloi::Tensor target_hidden() const override { return saved.last_target_hidden; }
+            void publish() noexcept override {
+                state.states.swap(states);
+                state.lengths.swap(lengths);
+                state.batch = 1;
+            }
+        };
+        return std::make_unique<Candidate>(*this, state, snapshot);
     }
 
     void restore_session_state(tyloi::models::MtpState& value,

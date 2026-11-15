@@ -17,6 +17,43 @@ void require_state(bool condition, const char* message) {
 MtpState::MtpState(const tyloi::models::Mtp& owner, std::vector<Layout> layout, int64_t hidden)
     : tyloi::models::MtpState(owner), layout_(std::move(layout)), kv_(layout_.size()), hidden_(hidden) {}
 
+std::vector<std::pair<Device, std::size_t>> MtpState::growth(
+        int64_t batch, int64_t tokens, int64_t requested, bool resetting) const {
+    require_state(batch > 0 && tokens > 0, "invalid MTP state dimensions");
+    const auto position = resetting ? 0 : position_;
+    std::vector<std::pair<Device, std::size_t>> result;
+    for (std::size_t i = 0; i < layout_.size(); ++i) {
+        const auto& item = layout_[i];
+        require_state(position <= item.capacity - tokens, "Qwen MTP history exceeds context capacity");
+        const auto& cache = kv_[i];
+        if (!resetting && cache.defined())
+            require_state(cache.batch == batch, "MTP batch changed without resetting state");
+        if (cache.defined() && cache.batch == batch && cache.physical_key.size(2) >= position + tokens)
+            continue;
+        const auto capacity = requested > 0
+            ? std::min(item.capacity, std::max(position + tokens, requested)) : item.capacity;
+        const auto bytes = state::kv_bytes(batch, item.heads, capacity, item.head_dim, false,
+            item.dtype, item.quantization);
+        auto it = std::find_if(result.begin(), result.end(), [&](const auto& entry) { return entry.first == item.device; });
+        if (it == result.end()) result.emplace_back(item.device, bytes);
+        else {
+            if (it->second > std::numeric_limits<std::size_t>::max() - bytes)
+                throw std::overflow_error("Qwen MTP growth overflow");
+            it->second += bytes;
+        }
+    }
+    return result;
+}
+
+std::vector<Tensor> MtpState::storage() const {
+    std::vector<Tensor> result;
+    for (const auto& cache : kv_) if (cache.defined()) {
+        result.push_back(cache.physical_key);
+        result.push_back(cache.physical_value);
+    }
+    return result;
+}
+
 void MtpState::prepare(int64_t batch, int64_t tokens, int64_t kl_capacity) {
     require_state(batch > 0 && tokens > 0, "invalid MTP state dimensions");
     for (size_t index = 0; index < kv_.size(); ++index) {

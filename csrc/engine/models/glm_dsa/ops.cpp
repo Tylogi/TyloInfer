@@ -1,4 +1,5 @@
 #include "engine/models/plan.h"
+#include "engine/models/load.h"
 #include "engine/models/common/check.h"
 #include "engine/models/session/snapshot.h"
 #include "engine/models/common/load.h"
@@ -20,6 +21,7 @@
 #include <cmath>
 #include <iostream>
 #include <limits>
+#include <utility>
 
 using ::tyloi::indexing::Slice;
 
@@ -39,7 +41,7 @@ tyloi::engine::Metrics Model::metrics() const {
 }
 std::unique_ptr<tyloi::models::State> Model::make_state() const { return std::make_unique<State>(*this); }
 
-State::State(const Model& model) : layers(model.layers.size()) {
+State::State(const Model& model) : layers(model.layers.size()), model_(&model) {
     layout_.reserve(model.layers.size());
     for (const auto& layer : model.layers) {
         layout_.push_back({layer.device, layer.full_indexer, layer.config.max_position_embeddings,
@@ -197,6 +199,83 @@ void State::restore_text_session_state(const TextSessionState& state) {
     batch = 1;
 }
 
+
+class State::SessionRestore final : public tyloi::models::Restore {
+public:
+    SessionRestore(State& state, const TextSessionState& saved) : state_(state), saved_(saved) {
+        const auto* blocks = std::get_if<std::vector<tyloi::models::glm_dsa::BlockSnapshot>>(&saved_.payload);
+        if (!state_.supports_text_session_state() || saved_.kind() != TextSessionStateKind::GlmDsa ||
+            saved_.cache_pos <= 0 || static_cast<std::size_t>(saved_.cache_pos) != saved_.tokens.size() ||
+            !blocks || blocks->size() != state_.layers.size())
+            throw CudaSessionStateError("GLM DSA text session state is incompatible");
+        for (std::size_t i = 0; i < blocks->size(); ++i) {
+            const auto& block = (*blocks)[i];
+            const auto& layout = state_.layout_[i];
+            const tyloi::Device device(tyloi::kCUDA, layout.device);
+            if (saved_.cache_pos > layout.capacity || block.full_indexer != layout.full_indexer ||
+                block.kv_capacity != layout.capacity || !block.kv_cache.defined() ||
+                !block.kv_cache.representation<DenseTensor>() ||
+                block.kv_cache.device() != device || block.kv_cache.scalar_type() != tyloi::kFloat16 ||
+                block.kv_cache.dim() != 4 || block.kv_cache.size(0) != 1 || block.kv_cache.size(1) != 1 ||
+                block.kv_cache.size(2) != saved_.cache_pos || block.kv_cache.size(3) != 576 ||
+                (block.full_indexer && (!block.index_cache.defined() || !block.index_cache.representation<DenseTensor>() ||
+                    block.index_cache.device() != device ||
+                    block.index_cache.scalar_type() != tyloi::kFloat16 || block.index_cache.dim() != 3 ||
+                    block.index_cache.size(0) != 1 || block.index_cache.size(1) != saved_.cache_pos ||
+                    block.index_cache.size(2) != layout.index_head_dim || block.index_capacity != layout.capacity)))
+                throw CudaSessionStateError("GLM DSA saved cache geometry is incompatible");
+        }
+    }
+    std::vector<std::pair<tyloi::Device, std::size_t>> growth() const override {
+        std::vector<std::pair<tyloi::Device, std::size_t>> result;
+        const auto& blocks = std::get<std::vector<tyloi::models::glm_dsa::BlockSnapshot>>(saved_.payload);
+        for (std::size_t i = 0; i < blocks.size(); ++i) {
+            const auto& block = blocks[i];
+            const tyloi::Device device(tyloi::kCUDA, state_.layout_[i].device);
+            auto bytes = restore_prefix_bytes({}, block.kv_cache, 2, block.kv_capacity);
+            if (block.full_indexer) {
+                const auto extra = restore_prefix_bytes({}, block.index_cache, 1, block.index_capacity);
+                if (bytes > std::numeric_limits<std::size_t>::max() - extra)
+                    throw std::overflow_error("GLM DSA session growth overflow");
+                bytes += extra;
+            }
+            auto entry = std::find_if(result.begin(), result.end(),
+                [device](const auto& value) { return value.first == device; });
+            if (entry == result.end()) result.emplace_back(device, bytes);
+            else {
+                if (entry->second > std::numeric_limits<std::size_t>::max() - bytes)
+                    throw std::overflow_error("GLM DSA session growth overflow");
+                entry->second += bytes;
+            }
+        }
+        return result;
+    }
+    void stage() override {
+        candidate_ = std::make_unique<State>(*state_.model_);
+        candidate_->restore_text_session_state(saved_);
+    }
+    std::vector<tyloi::Tensor> storage() const override {
+        return candidate_ ? candidate_->storage() : std::vector<tyloi::Tensor>{};
+    }
+    void publish() noexcept override {
+        state_.layers.swap(candidate_->layers);
+        state_.selections.swap(candidate_->selections);
+        std::swap(state_.cache_pos, candidate_->cache_pos);
+        std::swap(state_.decode_position_delta, candidate_->decode_position_delta);
+        std::swap(state_.batch, candidate_->batch);
+    }
+private:
+    State& state_;
+    TextSessionState saved_;
+    std::unique_ptr<State> candidate_;
+};
+
+std::unique_ptr<tyloi::models::Restore> State::prepare_restore(
+        const TextSessionState& snapshot, const tyloi::models::Mtp* predictor_model) {
+    if (predictor_model) throw CudaSessionStateError("GLM DSA predictor session is unsupported");
+    return std::make_unique<SessionRestore>(*this, snapshot);
+}
+
 static void validate_geometry(const Config& config) {
     if (config.q_lora_rank <= 0 || config.kv_lora_rank <= 0 || config.qk_nope_head_dim <= 0 ||
         config.qk_rope_head_dim <= 0 || config.v_head_dim <= 0 || config.index_head_dim <= 0 ||
@@ -216,14 +295,12 @@ static void validate_geometry(const Config& config) {
 }
 
 
-Layer load_layer(const ::tyloi::weights::Loader& weights, const Config& config, int index,
+void load_layer(Layer& layer, const ::tyloi::weights::Loader& weights, const Config& config, int index,
                  const std::string& type) {
     MfqCudaGuard guard(weights.placement.target.index);
-    Layer layer;
     layer.device = weights.placement.target.index;
     TransformerWeightLoader loader{weights};
     tyloi::models::glm_dsa::load_layer_weights(layer, loader, config, index, type);
-    return layer;
 }
 
 Model read(std::shared_ptr<const tyloi::ModelSource> source, std::string_view definition,
@@ -247,6 +324,27 @@ Model read(std::shared_ptr<const tyloi::ModelSource> source, std::string_view de
         c.max_position_embeddings = m.max_position_embeddings = context;
     }
     return model;
+}
+
+void load(std::unique_ptr<tyloi::models::CausalModel>& owner,
+          std::shared_ptr<const tyloi::ModelSource> source, std::string_view definition,
+          const tyloi::weights::Loader& weights, LayerPlacementConfig& placement,
+          const tyloi::models::LoadOptions& options) {
+    if (!options.cpu_offload_layers.empty())
+        throw std::invalid_argument("GLM-DSA does not support --cpu-offload-layers");
+    owner = std::make_unique<Model>(read(std::move(source), definition, options.context));
+    auto& model = static_cast<Model&>(*owner);
+    if (!weights.placement.target.is_cuda() || weights.placement.target.index < 0)
+        throw std::invalid_argument("GLM-DSA requires a CUDA target");
+    if (placement.devices.empty()) placement.devices = {weights.placement.target.index};
+    if (placement.primary_device() != weights.placement.target.index)
+        throw std::invalid_argument("GLM-DSA weight and layer primary devices differ");
+    if (options.expert_parallel && model.config.num_experts <= 0)
+        throw std::invalid_argument("--expert-parallel requires a model with routed experts");
+    load(model, weights, placement, options.gpu_layers, true, true, options.yarn);
+    if (options.optional_components && (model.plan.vision != tyloi::models::VisionAdapter::none ||
+        model.plan.predictor != tyloi::models::PredictorAdapter::none))
+        throw std::runtime_error("CUDA component adapter is unsupported for this model");
 }
 
 void load(Model& model, const ::tyloi::weights::Loader& weights, LayerPlacementConfig& placement,
@@ -290,7 +388,8 @@ void load(Model& model, const ::tyloi::weights::Loader& weights, LayerPlacementC
                 MfqCudaGuard layer_guard(device);
                 const auto& type = model.metadata.layer_types.at(static_cast<size_t>(index));
                 std::cerr << "loading layer " << index << ' ' << type << " CUDA" << std::endl;
-                model.layers.push_back(load_layer(weights.for_layer(::tyloi::Device(::tyloi::kCUDA, device)), c, index, type));
+                model.layers.emplace_back();
+                load_layer(model.layers.back(), weights.for_layer(::tyloi::Device(::tyloi::kCUDA, device)), c, index, type);
             }
         }
     } else {
@@ -326,9 +425,11 @@ Tensor Model::normalize(const Tensor& hidden, int64_t batch, int64_t tokens) con
 Tensor Model::softcap(const Tensor& value) const {
     return tyloi::ops::softcap(value, metadata.final_logit_softcapping);
 }
-Tensor Model::logits(const Tensor& hidden, bool capped) const {
+Tensor Model::logits(const Tensor& hidden, bool capped, tyloi::models::LogitPrecision precision) const {
+    auto projection_input = precision == tyloi::models::LogitPrecision::model
+        ? tyloi::ops::contiguous(tyloi::ops::cast(hidden, tyloi::kFloat16)) : hidden;
     auto value = tyloi::ops::measure("model.lm_head", hidden.device(), [&] {
-        return tyloi::ops::project(hidden, lm_head);
+        return tyloi::ops::project(projection_input, lm_head);
     });
     return capped ? softcap(value) : value;
 }

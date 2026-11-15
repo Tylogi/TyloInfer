@@ -186,10 +186,12 @@ namespace {
     return tyloi::ops::softcap(logits, config.final_logit_softcapping);
 }
 
-::tyloi::Tensor Model::logits(const tyloi::Tensor& hidden, bool capped) const {
+::tyloi::Tensor Model::logits(const tyloi::Tensor& hidden, bool capped, tyloi::models::LogitPrecision precision) const {
+    auto projection_input = precision == tyloi::models::LogitPrecision::model
+        ? tyloi::ops::contiguous(tyloi::ops::cast(hidden, tyloi::kFloat16)) : hidden;
     const auto& model = *this;
     auto result = tyloi::ops::measure("model.lm_head", hidden.device(), [&] {
-        return tyloi::ops::project(hidden, model.lm_head);
+        return tyloi::ops::project(projection_input, model.lm_head);
     });
     return capped ? tyloi::ops::softcap(result, model.config.final_logit_softcapping)
                   : std::move(result);

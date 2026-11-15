@@ -322,6 +322,7 @@ struct DeepseekV41Dspark final : tyloi::models::Mtp {
             DsState& state;
             MtpSessionState saved;
             std::vector<::tyloi::Tensor> rings;
+            ::tyloi::Tensor hidden;
 
             Candidate(const DeepseekV41Dspark& model, DsState& state, const MtpSessionState& snapshot)
                 : model(model), state(state), saved(snapshot) {
@@ -329,45 +330,66 @@ struct DeepseekV41Dspark final : tyloi::models::Mtp {
                 const auto* hidden = saved.last_target_hidden.representation<DenseTensor>();
                 const auto width = model.config.hidden * std::int64_t(model.config.dspark_target_layer_ids.size());
                 const auto device = ::tyloi::Device(::tyloi::kCUDA, model.primary);
+                const auto on_source_device = [&](const ::tyloi::Tensor& tensor, int original) {
+                    return original == -1 ? tensor.device() == device :
+                        original == model.primary && tensor.device() == ::tyloi::Device(::tyloi::kCPU);
+                };
                 if (saved.cache_pos <= 0 || saved.cache_pos > model.config.max_position_embeddings ||
                     !payload || payload->rings.size() != model.stages.size() || !hidden || !hidden->defined() ||
+                    saved.last_target_hidden.is_encoded() ||
+                    (payload->hidden_device >= 0 && !saved.last_target_hidden.is_contiguous()) ||
+                    (!payload->ring_devices.empty() && payload->ring_devices.size() != payload->rings.size()) ||
                     hidden->dim() != 3 || hidden->size(0) != 1 || hidden->size(1) <= 0 ||
-                    hidden->size(2) != width || hidden->device() != device ||
+                    hidden->size(2) != width || !on_source_device(saved.last_target_hidden, payload->hidden_device) ||
                     (hidden->scalar_type() != ::tyloi::kFloat16 && hidden->scalar_type() != ::tyloi::kBFloat16 &&
                      hidden->scalar_type() != ::tyloi::kFloat32))
                     throw CudaSessionStateError("DeepSeek-V4.1 DSpark session state is incompatible");
-                for (const auto& ring : payload->rings) {
-                    if (!model.compatible_ring(ring, 1))
+                for (std::size_t i = 0; i < payload->rings.size(); ++i) {
+                    const auto& ring = payload->rings[i];
+                    const auto original = payload->ring_devices.empty() ? -1 : payload->ring_devices[i];
+                    if (!ring.defined() || ring.is_encoded() || !ring.representation<DenseTensor>() || ring.dim() != 3 ||
+                        ring.size(0) != 1 || ring.size(1) != model.config.sliding_window ||
+                        ring.size(2) != model.config.head_dim || ring.scalar_type() != ::tyloi::kFloat16 ||
+                        !ring.is_contiguous() || !on_source_device(ring, original))
                         throw CudaSessionStateError("DeepSeek-V4.1 DSpark saved ring geometry is incompatible");
                 }
-                rings.resize(model.stages.size());
             }
             std::vector<std::pair<::tyloi::Device, std::size_t>> growth() const override {
-                const auto& source = std::get<tyloi::models::deepseek_v41::MtpSnapshot>(saved.payload).rings;
+                const auto& payload = std::get<tyloi::models::deepseek_v41::MtpSnapshot>(saved.payload);
                 std::size_t bytes = 0;
-                for (std::size_t i = 0; i < rings.size(); ++i) {
-                    const auto added = restore_tensor_bytes(rings[i], source[i]);
+                const auto add = [&](std::size_t added) {
                     if (bytes > std::numeric_limits<std::size_t>::max() - added)
                         throw std::overflow_error("DeepSeek-V4.1 DSpark session allocation overflow");
                     bytes += added;
-                }
+                };
+                for (const auto& source : payload.rings) add(session_tensor_bytes(source));
+                if (payload.hidden_device >= 0) add(session_tensor_bytes(saved.last_target_hidden));
                 return bytes ? std::vector<std::pair<::tyloi::Device, std::size_t>>{
                     {::tyloi::Device(::tyloi::kCUDA, model.primary), bytes}} :
                     std::vector<std::pair<::tyloi::Device, std::size_t>>{};
             }
             void stage() override {
-                const auto& source = std::get<tyloi::models::deepseek_v41::MtpSnapshot>(saved.payload).rings;
+                const auto& payload = std::get<tyloi::models::deepseek_v41::MtpSnapshot>(saved.payload);
+                const auto& source = payload.rings;
+                const auto device = ::tyloi::Device(::tyloi::kCUDA, model.primary);
+                rings.resize(source.size());
                 for (std::size_t i = 0; i < rings.size(); ++i) {
-                    if (restore_tensor_bytes(rings[i], source[i]))
-                        rings[i] = tyloi::ops::empty(source[i].dense().sizes(), source[i].options());
+                    rings[i] = tyloi::ops::empty(source[i].dense().sizes(),
+                        ::tyloi::TensorOptions().device(device).dtype(source[i].scalar_type()));
                     tyloi::ops::copy_into(rings[i], source[i]);
                 }
+                if (payload.hidden_device >= 0) {
+                    hidden = tyloi::ops::empty(saved.last_target_hidden.dense().sizes(),
+                        ::tyloi::TensorOptions().device(device).dtype(saved.last_target_hidden.scalar_type()));
+                    tyloi::ops::copy_into(hidden, saved.last_target_hidden);
+                } else hidden = saved.last_target_hidden;
             }
             std::vector<::tyloi::Tensor> storage() const override {
                 auto result = rings;
-                if (saved.last_target_hidden) result.push_back(saved.last_target_hidden);
+                if (hidden) result.push_back(hidden);
                 return result;
             }
+            ::tyloi::Tensor target_hidden() const override { return hidden; }
             void publish() noexcept override {
                 state.rings.swap(rings);
                 state.position_ = saved.cache_pos;

@@ -199,7 +199,19 @@ std::vector<std::pair<tyloi::Device, std::size_t>> State::preallocate_growth() c
 std::vector<std::pair<tyloi::Device, std::size_t>> State::growth(
         const tyloi::models::Input& input, const tyloi::models::ForwardOptions& options) const {
     const auto [next_batch, tokens] = input.shape();
-    if (batch <= 0 || next_batch != batch || cache_pos < 0 ||
+    return growth_for(next_batch, tokens, input, options, false);
+}
+
+std::vector<std::pair<tyloi::Device, std::size_t>> State::growth_for(
+        std::int64_t next_batch, std::int64_t tokens, const tyloi::models::ForwardOptions& options,
+        bool paged) const {
+    return growth_for(next_batch, tokens, tyloi::models::Input{}, options, paged);
+}
+
+std::vector<std::pair<tyloi::Device, std::size_t>> State::growth_for(
+        std::int64_t next_batch, std::int64_t tokens, const tyloi::models::Input& input,
+        const tyloi::models::ForwardOptions& options, bool paged) const {
+    if (batch <= 0 || tokens <= 0 || next_batch != batch || cache_pos < 0 ||
         cache_pos > max_position_embeddings_ || tokens > max_position_embeddings_ - cache_pos ||
         input.suffix || input.confirmed < 0 || speculative_start >= 0 || options.primary < 0 ||
         (input.confirmed > 0 && (input.confirmed >= tokens || batch != 1 || cache_pos == 0 ||
@@ -225,6 +237,7 @@ std::vector<std::pair<tyloi::Device, std::size_t>> State::growth(
         const auto& layout = layout_[i];
         const tyloi::Device device = layout.device;
         if (const auto* full = std::get_if<FullLayout>(&layout.attention)) {
+            if (paged) continue;
             const auto& cache = std::get<tyloi::state::KvView>(layers[i]);
             if (input.confirmed > 0 && full->sliding)
                 throw std::invalid_argument("Qwen3.5 speculation does not support sliding attention");

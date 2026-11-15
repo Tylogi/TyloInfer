@@ -85,9 +85,8 @@ set_target_properties(mfq-cuda-models PROPERTIES POSITION_INDEPENDENT_CODE ON)
 # composition target rather than the generic Engine.
 set(TYLOINFER_CUDA_ENGINE_SOURCES
     ${TYLOINFER_MODEL_ASSEMBLY_SOURCES}
-    ${PROJECT_SOURCE_DIR}/engine/generation/cuda.cpp
-    ${PROJECT_SOURCE_DIR}/engine/generation/mtp/cuda.cpp
-    ${PROJECT_SOURCE_DIR}/engine/models/minicpmo45/components.cpp
+    ${PROJECT_SOURCE_DIR}/engine/models/minicpmo45/duplex.cpp
+    ${PROJECT_SOURCE_DIR}/engine/models/minicpmo45/engine.cpp
     ${PROJECT_SOURCE_DIR}/engine/load.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/load.cpp
     ${PROJECT_SOURCE_DIR}/engine/program.cpp

@@ -26,8 +26,12 @@ using deepseek_v41_runtime::Block;
 
 namespace {
 bool session_tensor(const ::tyloi::Tensor& value,int64_t tokens,int64_t width,
-                    ::tyloi::ScalarType dtype) {
-    return value && value.defined() && value.is_cuda() && value.dim()==3 && value.size(0)==1 &&
+                    ::tyloi::ScalarType dtype,int original,int target) {
+    if (!value || !value.defined()) return false;
+    const bool device = original == -1 ? value.device() == ::tyloi::Device(::tyloi::kCUDA,target) :
+        original == target && value.device() == ::tyloi::Device(::tyloi::kCPU);
+    return device && !value.is_encoded() && (original == -1 || value.is_contiguous()) &&
+        value.dim()==3 && value.size(0)==1 &&
         value.size(1)==tokens && value.size(2)==width && value.scalar_type()==dtype &&
         value.representation<DenseTensor>();
 }
@@ -35,22 +39,21 @@ bool session_tensor(const ::tyloi::Tensor& value,int64_t tokens,int64_t width,
 void validate_layer(const Block& block,const tyloi::models::deepseek_v41::BlockSnapshot& saved,
                     int64_t position) {
     const auto& config=block.config;
-    const bool local=session_tensor(saved.local_kv,config.sliding_window,config.head_dim,
-                                     ::tyloi::kFloat16);
+    const auto tensor=[&](const Tensor& value,int64_t rows,int64_t width,ScalarType dtype) {
+        return session_tensor(value,rows,width,dtype,saved.original_device,block.cuda_device);
+    };
+    const bool local=tensor(saved.local_kv,config.sliding_window,config.head_dim,::tyloi::kFloat16);
     bool global=saved.compressed_length==0 && saved.partial_length==0 &&
         !saved.compressed_kv && !saved.index_k && !saved.partial_kv && !saved.partial_score;
     if(block.kv_source()) {
         global=block.ratio>0 && saved.compressed_length==position/block.ratio &&
+            saved.compressed_length<=std::max<int64_t>(1,block.max_context/block.ratio) &&
             saved.partial_length==(block.ratio>1?position%block.ratio:0) &&
-            session_tensor(saved.compressed_kv,saved.compressed_length,config.head_dim,
-                           ::tyloi::kFloat16) &&
-            session_tensor(saved.index_k,saved.compressed_length,config.index_head_dim,
-                           ::tyloi::kFloat16);
+            tensor(saved.compressed_kv,saved.compressed_length,config.head_dim,::tyloi::kFloat16) &&
+            tensor(saved.index_k,saved.compressed_length,config.index_head_dim,::tyloi::kFloat16);
         if(block.ratio>1)
-            global=global && session_tensor(saved.partial_kv,block.ratio,config.head_dim,
-                                            ::tyloi::kFloat32) &&
-                session_tensor(saved.partial_score,block.ratio,config.head_dim,
-                               ::tyloi::kFloat32);
+            global=global && tensor(saved.partial_kv,block.ratio,config.head_dim,::tyloi::kFloat32) &&
+                tensor(saved.partial_score,block.ratio,config.head_dim,::tyloi::kFloat32);
         else global=global && !saved.partial_kv && !saved.partial_score;
     }
     if(!local || !global)throw CudaSessionStateError("DeepSeek-V4.1 session layer geometry is incompatible");
@@ -432,45 +435,123 @@ TextSessionState State::capture_text_session_state(const std::vector<std::int64_
     return state;
 }
 
-void State::restore_text_session_state(const TextSessionState& state) {
-    const auto* snapshot=std::get_if<tyloi::models::deepseek_v41::Snapshot>(&state.payload);
-    if(text_session_state_kind()!=TextSessionStateKind::DeepseekV41 || !snapshot ||
-            snapshot->blocks.size()!=model_.blocks.size() ||
-            state.cache_pos<=0 || state.cache_pos>model_.max_position_embeddings() ||
-            std::size_t(state.cache_pos)!=state.tokens.size() || state.decode_position_delta!=0 ||
-            !snapshot->engram || snapshot->engram->batch!=1 ||
-            snapshot->engram->position!=state.cache_pos)
-        throw CudaSessionStateError("DeepSeek-V4.1 text session state is incompatible");
-    // Validate every layer and rolling n-gram before changing the active cache.
-    auto hash=*shared->engram_hash;
-    hash.restore(*snapshot->engram);
-    for(std::size_t i=0;i<snapshot->blocks.size();++i)
-        validate_layer(*model_.blocks[i],snapshot->blocks[i],state.cache_pos);
-    reset(1);
-    for(std::size_t i=0;i<snapshot->blocks.size();++i) {
-        Block& block=*model_.blocks[i];
-        MfqCudaGuard guard(block.cuda_device);
-        const auto& saved=snapshot->blocks[i];auto& target=shared->layers.at(i);
-        auto local_kv=restore_session_tensor(target.local_kv,saved.local_kv);
-        target.local_kv=local_kv.defined()?local_kv.dense():DenseTensor{};
-        if(block.kv_source()) {
-            target.compressed_kv=restore_session_prefix_tensor(target.compressed_kv,saved.compressed_kv,1,
-                                          std::max<int64_t>(1,block.max_context/block.ratio)).dense();
-            target.index_k=restore_session_prefix_tensor(target.index_k,saved.index_k,1,
-                                          std::max<int64_t>(1,block.max_context/block.ratio)).dense();
-            if(block.ratio>1) {
-                auto partial_kv=restore_session_tensor(target.partial_kv,saved.partial_kv);
-                target.partial_kv=partial_kv.defined()?partial_kv.dense():DenseTensor{};
-                auto partial_score=restore_session_tensor(target.partial_score,saved.partial_score);
-                target.partial_score=partial_score.defined()?partial_score.dense():DenseTensor{};
-            }
+namespace {
+class SessionRestore final : public tyloi::models::Restore {
+public:
+    SessionRestore(State& state, Model& model, const TextSessionState& snapshot)
+        : state_(state), model_(model), snapshot_(snapshot) {
+        const auto* saved = std::get_if<tyloi::models::deepseek_v41::Snapshot>(&snapshot_.payload);
+        if (!state_.supports_text_session_state() || state_.speculative_start >= 0 || !saved ||
+            saved->blocks.size() != model_.blocks.size() || snapshot_.cache_pos <= 0 ||
+            snapshot_.cache_pos > model_.max_position_embeddings() ||
+            std::size_t(snapshot_.cache_pos) != snapshot_.tokens.size() || snapshot_.decode_position_delta != 0 ||
+            !saved->engram || saved->engram->batch != 1 || saved->engram->position != snapshot_.cache_pos)
+            throw CudaSessionStateError("DeepSeek-V4.1 text session state is incompatible");
+        state_.shared->engram_hash->validate_snapshot(*saved->engram);
+        for (std::size_t i = 0; i < saved->blocks.size(); ++i) {
+            const auto& block = *model_.blocks[i];
+            if (block.layer < 0 || std::size_t(block.layer) >= state_.shared->layers.size())
+                throw CudaSessionStateError("DeepSeek-V4.1 session layer index is invalid");
+            validate_layer(block, saved->blocks[i], snapshot_.cache_pos);
         }
-        target.position=state.cache_pos;target.compressed_length=saved.compressed_length;
-        target.partial_length=saved.partial_length;
     }
-    *shared->engram_hash=std::move(hash);
-    set_image_mask({});
-    cache_pos=state.cache_pos;
+
+    std::vector<std::pair<Device, std::size_t>> growth() const override {
+        std::vector<std::pair<Device, std::size_t>> result;
+        const auto add = [&](Device device, std::size_t bytes) {
+            if (!bytes) return;
+            auto it = std::find_if(result.begin(), result.end(), [device](const auto& x) { return x.first == device; });
+            if (it == result.end()) result.emplace_back(device, bytes);
+            else {
+                if (it->second > std::numeric_limits<std::size_t>::max() - bytes)
+                    throw std::overflow_error("DeepSeek-V4.1 session growth overflow");
+                it->second += bytes;
+            }
+        };
+        for (const auto& block : model_.blocks) {
+            const Device device(kCUDA, block->cuda_device);
+            add(device, block_allocation_bytes(*block, 1, device));
+        }
+        const auto& hash = *std::get<tyloi::models::deepseek_v41::Snapshot>(snapshot_.payload).engram;
+        if (hash.context.size() > std::numeric_limits<std::size_t>::max() / sizeof(std::int64_t) ||
+            state_.shared->layers.size() > std::numeric_limits<std::size_t>::max() / sizeof(deepseek_v41_runtime::LayerState))
+            throw std::overflow_error("DeepSeek-V4.1 session metadata overflow");
+        add(Device(kCPU), hash.context.size() * sizeof(std::int64_t));
+        add(Device(kCPU), state_.shared->layers.size() * sizeof(deepseek_v41_runtime::LayerState));
+        return result;
+    }
+
+    void stage() override {
+        const auto& saved = std::get<tyloi::models::deepseek_v41::Snapshot>(snapshot_.payload);
+        layers_.resize(state_.shared->layers.size());
+        hash_ = std::make_unique<deepseek_v41_runtime::EngramHashState>(model_.tables.engram_parameters);
+        hash_->restore(*saved.engram);
+        for (std::size_t i = 0; i < saved.blocks.size(); ++i) {
+            const auto& block = *model_.blocks[i];
+            const auto& source = saved.blocks[i];
+            auto& target = layers_.at(static_cast<std::size_t>(block.layer));
+            const Device device(kCUDA, block.cuda_device);
+            MfqCudaGuard guard(block.cuda_device);
+            const auto copy = [&](DenseTensor& destination, const Tensor& input, std::int64_t capacity = -1) {
+                if (!input.defined()) return;
+                auto shape = input.dense().sizes().vec();
+                if (capacity >= 0) shape.at(1) = capacity;
+                destination = tyloi::ops::empty(shape, TensorOptions().device(device).dtype(input.scalar_type())).dense();
+                if (input.numel()) {
+                    Tensor view = capacity >= 0 ? tyloi::ops::slice(destination, 1, 0, input.size(1)) : Tensor(destination);
+                    tyloi::ops::copy_into(view, input);
+                }
+            };
+            copy(target.local_kv, source.local_kv);
+            if (block.kv_source()) {
+                const auto capacity = std::max<std::int64_t>(1, block.max_context / block.ratio);
+                copy(target.compressed_kv, source.compressed_kv, capacity);
+                copy(target.index_k, source.index_k, capacity);
+                if (block.ratio > 1) {
+                    copy(target.partial_kv, source.partial_kv);
+                    copy(target.partial_score, source.partial_score);
+                }
+            }
+            target.position = snapshot_.cache_pos;
+            target.compressed_length = source.compressed_length;
+            target.partial_length = source.partial_length;
+        }
+    }
+
+    std::vector<Tensor> storage() const override {
+        std::vector<Tensor> result;
+        for (const auto& layer : layers_)
+            for (const auto* value : {&layer.local_kv, &layer.compressed_kv, &layer.index_k,
+                                      &layer.partial_kv, &layer.partial_score})
+                if (value->defined()) result.emplace_back(*value);
+        return result;
+    }
+
+    void publish() noexcept override {
+        auto& shared = *state_.shared;
+        shared.layers.swap(layers_);
+        shared.engram_hash.swap(hash_);
+        shared.compressed_kv = {}; shared.index_k = {}; shared.topk = {}; shared.candidate_blocks = {};
+        shared.previous_pre = {}; shared.engram_hashes = {}; shared.dspark_target_hiddens.clear();
+        shared.capture_dspark_targets = false;
+        shared.image_mask = {}; shared.text_rows = {}; shared.routing_mask = {}; shared.text_row_ids.clear();
+        shared.compressed_length = 0; shared.ratio = 0; shared.cache_position = -1;
+        shared.batch = 0; shared.tokens = 0; shared.next_layer = 0;
+        state_.cache_pos = snapshot_.cache_pos; state_.batch = 1; state_.decode_position_delta = 0;
+        state_.speculative_start = -1; state_.speculative_confirmed = 0; state_.speculative_suffix_forward = false;
+    }
+private:
+    State& state_;
+    Model& model_;
+    TextSessionState snapshot_;
+    std::vector<deepseek_v41_runtime::LayerState> layers_;
+    std::unique_ptr<deepseek_v41_runtime::EngramHashState> hash_;
+};
+}
+
+std::unique_ptr<tyloi::models::Restore> State::prepare_restore(
+        const TextSessionState& snapshot, const tyloi::models::Mtp*) {
+    return std::make_unique<SessionRestore>(*this, model_, snapshot);
 }
 
 } // namespace tyloi::cuda::deepseek_v41

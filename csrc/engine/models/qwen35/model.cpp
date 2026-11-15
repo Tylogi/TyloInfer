@@ -83,9 +83,11 @@ tyloi::StepSequence<tyloi::models::Prepared> Model::prepare(
     return tyloi::ops::softcap(logits, metadata.final_logit_softcapping);
 }
 
-::tyloi::Tensor Model::logits(const tyloi::Tensor& hidden, bool capped) const {
+::tyloi::Tensor Model::logits(const tyloi::Tensor& hidden, bool capped, tyloi::models::LogitPrecision precision) const {
+    auto projection_input = precision == tyloi::models::LogitPrecision::model
+        ? tyloi::ops::contiguous(tyloi::ops::cast(hidden, tyloi::kFloat16)) : hidden;
     auto result = tyloi::ops::measure("model.lm_head", hidden.device(), [&] {
-        return tyloi::ops::project(hidden, lm_head);
+        return tyloi::ops::project(projection_input, lm_head);
     });
     return capped ? softcap(result) : result;
 }

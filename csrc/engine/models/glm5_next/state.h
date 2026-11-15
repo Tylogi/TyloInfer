@@ -56,6 +56,8 @@ public:
     void advance(int64_t tokens) noexcept { cache_pos += tokens; }
     void set_position_delta(int64_t delta) noexcept { decode_position_delta = delta; }
     void preallocate() {}
+    // This family allocates its request cache during reset or forward.
+    std::vector<std::pair<tyloi::Device, std::size_t>> preallocate_growth() const override { return {}; }
     bool speculating() const noexcept override { return speculative_start >= 0; }
     std::int64_t confirmed_prefix() const noexcept override { return speculative_confirmed; }
     void commit_speculative() override;

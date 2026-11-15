@@ -43,7 +43,7 @@ struct Model : tyloi::models::CausalModel {
     ::tyloi::Tensor normalize(const ::tyloi::Tensor& hidden, std::int64_t batch,
         std::int64_t tokens) const override;
     ::tyloi::Tensor softcap(const ::tyloi::Tensor& logits) const override;
-    ::tyloi::Tensor logits(const ::tyloi::Tensor& hidden, bool capped = true) const override;
+    ::tyloi::Tensor logits(const ::tyloi::Tensor& hidden, bool capped = true, tyloi::models::LogitPrecision precision = tyloi::models::LogitPrecision::model) const override;
     ::tyloi::Tensor forward(tyloi::models::Input input, tyloi::models::State& state,
                                  const tyloi::models::ForwardOptions& options = {}) const override;
     tyloi::models::PrefillPlan prefill_plan(const tyloi::models::State&,

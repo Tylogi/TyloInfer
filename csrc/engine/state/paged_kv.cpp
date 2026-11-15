@@ -9,12 +9,29 @@
 #include <array>
 #include <limits>
 #include <stdexcept>
+#include <unordered_set>
 #include <utility>
 
 namespace tyloi::state {
 namespace {
 void require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
+}
+std::size_t multiply(std::size_t a, std::size_t b) {
+    if (b && a > std::numeric_limits<std::size_t>::max() / b)
+        throw std::overflow_error("Paged KV growth overflow");
+    return a * b;
+}
+void add_growth(PagedKv::Growth& growth, Device device, std::size_t bytes) {
+    if (!bytes) return;
+    auto found = std::find_if(growth.begin(), growth.end(),
+        [device](const auto& entry) { return entry.first == device; });
+    if (found == growth.end()) growth.emplace_back(device, bytes);
+    else {
+        if (found->second > std::numeric_limits<std::size_t>::max() - bytes)
+            throw std::overflow_error("Paged KV growth overflow");
+        found->second += bytes;
+    }
 }
 Tensor metal_table(std::vector<std::int32_t>& data, std::int64_t rows, std::int64_t columns) {
     const std::array<std::int64_t, 2> shape{rows, columns};
@@ -27,6 +44,94 @@ Tensor metal_table(std::vector<std::int32_t>& data, std::int64_t rows, std::int6
     // Relocation copies the borrowed host bytes before this view is released.
     return host.relocated(Device{DeviceType::metal, 0});
 }
+}
+
+PagedKv::Growth PagedKv::storage_growth(const std::vector<Layout>& layers,
+        size_t maximum_pages, size_t current_pages, size_t required_pages) {
+    require(required_pages <= maximum_pages, "Paged KV physical storage exhausted");
+    Growth growth;
+    while (current_pages < required_pages) {
+        const auto chunk = std::min<size_t>(kPagesPerChunk, maximum_pages - current_pages);
+        for (const auto& layer : layers) {
+            const auto pages = layer.device.is_metal() ? current_pages + chunk : chunk;
+            const auto capacity = static_cast<int64_t>(multiply(pages, kPageSize));
+            auto bytes = kv_bytes(1, layer.heads, capacity, layer.head_dim, false,
+                                  kFloat16, layer.quantization);
+            // Metal grow_kv creates a new zero-filled target and functional slice updates.
+            // Both can be live in its lazy graph until the replacement is submitted.
+            if (layer.device.is_metal() && current_pages) bytes = multiply(bytes, 2);
+            add_growth(growth, layer.device, bytes);
+        }
+        current_pages += chunk;
+    }
+    return growth;
+}
+
+PagedKv::Growth PagedKv::construction_growth(const std::vector<Layout>& layouts,
+        int64_t context, int32_t sequences, bool preallocate) {
+    require(context > 0 && sequences > 0, "Paged KV requires positive sequence and context limits");
+    const auto pages = context / kPageSize + (context % kPageSize != 0);
+    const auto maximum = checked_maximum_pages(sequences, pages);
+    require(!layouts.empty(), "Paged KV requires at least one full-attention layer");
+    const auto table_bytes = multiply(multiply(static_cast<size_t>(sequences),
+        static_cast<size_t>(pages)), sizeof(std::int32_t));
+    const auto chunks = (maximum + kPagesPerChunk - 1) / kPagesPerChunk;
+    Growth growth;
+    add_growth(growth, Device(DeviceType::cpu, 0), table_bytes);
+    std::unordered_set<std::int64_t> table_devices;
+    for (const auto& layout : layouts) {
+        const auto device = layout.device;
+        require(layout.heads > 0 && layout.head_dim > 0,
+            "Paged KV encountered invalid full-attention geometry");
+        if ((!device.is_cuda() || device.index < 0) && (!device.is_metal() || device.index != 0))
+            throw std::invalid_argument("Paged KV requires CUDA or Metal 0");
+#if !TYLOINFER_HAS_CUDA
+        if (device.is_cuda()) throw std::invalid_argument("Paged KV CUDA support is unavailable");
+#endif
+        // Also validate quantization before any device allocation.
+        (void)kv_layout(1, layout.heads, 1, layout.head_dim, false, kFloat16, layout.quantization);
+        const auto key = (static_cast<std::int64_t>(device.type) << 32) | static_cast<std::uint32_t>(device.index);
+        if (table_devices.insert(key).second) add_growth(growth, device, table_bytes);
+        if (device.is_cuda()) add_growth(growth, device, multiply(chunks, 2 * sizeof(std::int64_t)));
+    }
+    if (preallocate)
+        for (const auto& [device, bytes] : storage_growth(layouts, maximum, 0, static_cast<size_t>(pages)))
+            add_growth(growth, device, bytes);
+    return growth;
+}
+
+PagedKv::Growth PagedKv::ensure_growth(
+        const std::vector<std::pair<const Sequence*, int64_t>>& sequences) const {
+    size_t additional = 0;
+    std::unordered_set<const Sequence*> seen;
+    for (const auto& [sequence, tokens] : sequences) {
+        require(sequence && seen.insert(sequence).second && validate(*sequence),
+            "Paged KV sequence handle is invalid");
+        require(tokens >= 0 && tokens <= logical_pages_per_sequence_ * kPageSize,
+            "Paged KV sequence length exceeds the configured context");
+        const auto pages = static_cast<size_t>(tokens / kPageSize + (tokens % kPageSize != 0));
+        if (pages > sequence->physical_pages_.size()) {
+            const auto count = pages - sequence->physical_pages_.size();
+            require(count <= maximum_physical_pages_ - allocator_.live_pages() - additional,
+                "Paged KV physical storage exhausted");
+            additional += count;
+        }
+    }
+    if (additional) require(generation_ != std::numeric_limits<std::uint64_t>::max(),
+        "Paged KV allocation generation exhausted");
+    const auto required = std::max(allocator_.high_watermark(), allocator_.live_pages() + additional);
+    std::vector<Layout> layouts;
+    layouts.reserve(layers_.size());
+    for (const auto& pool : layers_) layouts.push_back(pool.layout);
+    return storage_growth(layouts, maximum_physical_pages_, storage_pages_, required);
+}
+
+PagedKv::Growth PagedKv::update_growth() const {
+    Growth growth;
+    const auto bytes = multiply(host_page_table_.size(), sizeof(std::int32_t));
+    for (const auto& [device, table] : device_page_tables_)
+        if (device.first == DeviceType::metal) add_growth(growth, Device(device.first, device.second), bytes);
+    return growth;
 }
 
 PagedKv::PagedKv(const std::vector<Layout>& layouts, int64_t context,

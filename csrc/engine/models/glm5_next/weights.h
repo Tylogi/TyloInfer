@@ -104,12 +104,12 @@ bool load_predictor(Predictor &result, Loader &ops, const Config &c) {
     result.fusion = ops.weight("predictor.fusion.weight");
     for (int64_t i = 0; i < count; ++i) {
         const auto p = "predictor.block." + std::to_string(i);
-        typename Predictor::Layer layer;
+        result.layers.emplace_back();
+        auto& layer = result.layers.back();
         layer.attention_norm = ops.dense(p + ".attention.norm.weight");
         layer.ffn_norm = ops.dense(p + ".mlp.norm.weight");
         layer.ffn = load_ffn(ops, c, int(i), p + ".mlp", true);
         layer.attention = load_mla(ops, c, int(i), p + ".attention");
-        result.layers.push_back(std::move(layer));
     }
     require_model(result.embedding_norm.dim() == 1 && result.embedding_norm.size(0) == c.hidden &&
                       result.hidden_norm.dim() == 1 && result.hidden_norm.size(0) == c.hidden &&

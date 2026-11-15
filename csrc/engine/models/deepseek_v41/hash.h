@@ -96,13 +96,17 @@ class EngramHashState {
         return {batch_,position_,context_};
     }
 
-    void restore(const EngramHashSnapshot& state) {
+    void validate_snapshot(const EngramHashSnapshot& state) const {
         if(state.batch<=0 || state.position<0 ||
                 state.context.size()!=std::size_t(state.batch)*
                     std::size_t(parameters_->max_ngram_size-1) ||
                 std::any_of(state.context.begin(),state.context.end(),[&](auto value) {
                     return value<kDeadToken || value>=parameters_->vocabulary;
                 }))throw std::invalid_argument("Engram session history is incompatible");
+    }
+
+    void restore(const EngramHashSnapshot& state) {
+        validate_snapshot(state);
         auto context=state.context;
         commit_speculative();
         batch_=state.batch;position_=state.position;context_.swap(context);

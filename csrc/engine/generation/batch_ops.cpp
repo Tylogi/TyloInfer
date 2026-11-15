@@ -117,6 +117,7 @@ public:
         std::size_t primary=0;
         for (const auto& [device, bytes] : request->state->prefill_growth_bytes(chunk.count)) {
             if (device==device_) primary=prefill_budget_add(primary,bytes);
+            else if (bytes && device.is_cpu()) budget_->reserve_ram(bytes);
             else if (bytes) budget_->reserve_kv(device,prefill_budget_add(bytes,std::size_t(64)<<20));
         }
         return budget_->batch(device_, batch_->prefill_row_bytes(), chunk,
@@ -391,16 +392,15 @@ private:
 } // namespace
 
 std::unique_ptr<Batch> make_batch(models::CausalModel& model, Executor& executor,
-    weights::Cache& weights, Budget& budget, const Config& config) {
+    weights::Cache& weights, Budget& budget, const Config& config, const models::ForwardOptions& forward) {
     const auto& settings=config.continuous_batch;
     auto scope=executor.enter();
     auto batch = model.make_batch({settings.max_sequences,settings.paged_kv,settings.preallocate,
         settings.cpu_offload,settings.cached_slots,settings.cuda_graph,settings.greedy,
-        settings.cuda_graph_minimum_tokens});
+        settings.cuda_graph_minimum_tokens,forward});
     if (!batch) throw std::invalid_argument("continuous batching is unavailable for this model");
     try {
-        for (const auto& [device,bytes] : batch->initial_growth_bytes())
-            if (bytes) budget.reserve_kv(device,prefill_budget_add(bytes,std::size_t(64)<<20));
+        reserve_batch(budget, config.device, batch->initial_growth_bytes(), std::size_t(64)<<20);
         batch->initialize();
         weights.finish_exchange();
         executor.drain();

@@ -72,6 +72,9 @@ public:
     std::vector<std::pair<tyloi::Device, std::size_t>> preallocate_growth() const override;
     std::vector<std::pair<tyloi::Device, std::size_t>> growth(
         const tyloi::models::Input&, const tyloi::models::ForwardOptions&) const override;
+    std::vector<std::pair<tyloi::Device, std::size_t>> growth_for(
+        std::int64_t batch, std::int64_t tokens, const tyloi::models::ForwardOptions&,
+        bool paged = false) const;
     void reset(std::int64_t new_batch) override;
     tyloi::engine::Metrics metrics() const override;
     std::int64_t position() const noexcept override { return cache_pos; }
@@ -111,6 +114,9 @@ public:
     std::int64_t batch = 0;
 
 private:
+    std::vector<std::pair<tyloi::Device, std::size_t>> growth_for(
+        std::int64_t batch, std::int64_t tokens, const tyloi::models::Input&,
+        const tyloi::models::ForwardOptions&, bool paged) const;
     const Model* owner_;
     std::vector<Layout> layout_;
     std::int64_t max_position_embeddings_;

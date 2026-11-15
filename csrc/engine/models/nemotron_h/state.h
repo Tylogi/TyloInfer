@@ -37,6 +37,7 @@ public:
     void advance(std::int64_t tokens) noexcept { cache_pos += tokens; }
     void set_position_delta(std::int64_t delta) noexcept { decode_position_delta = delta; }
     void preallocate();
+    std::vector<std::pair<tyloi::Device, std::size_t>> preallocate_growth() const override;
     void commit_speculative();
     bool speculating() const noexcept override { return speculative_start >= 0; }
     std::int64_t confirmed_prefix() const noexcept override { return speculative_confirmed; }
@@ -50,6 +51,8 @@ public:
     bool supports_paged_text_session_state() const;
     TextSessionState capture_text_session_state(const std::vector<std::int64_t>&) const;
     void restore_text_session_state(const TextSessionState&);
+    std::unique_ptr<tyloi::models::Restore> prepare_restore(
+        const TextSessionState&, const tyloi::models::Mtp* predictor_model = nullptr) override;
 
     struct MambaLayout {
         std::int64_t heads, head_dim, state_size, groups, conv_kernel;
@@ -72,6 +75,7 @@ public:
     std::int64_t speculative_start = -1, speculative_confirmed = 0;
 
 private:
+    class SessionRestore;
     const Model* model_;
     std::vector<Layout> layout_;
 };

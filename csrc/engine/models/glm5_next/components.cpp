@@ -10,12 +10,11 @@
 
 namespace tyloi::cuda::glm5_next {
 
-std::unique_ptr<tyloi::models::Mtp> load_components(
+void load_components(
         tyloi::cuda::glm5_next::Model& model,
         const tyloi::weights::Loader& weights,
         bool load_optional_components) {
-    std::unique_ptr<tyloi::models::Mtp> result;
-    if (!load_optional_components) return result;
+    if (!load_optional_components) return;
     if (model.plan.vision != ::tyloi::models::VisionAdapter::none ||
             (model.plan.predictor != ::tyloi::models::PredictorAdapter::none &&
              model.plan.predictor !=
@@ -24,18 +23,15 @@ std::unique_ptr<tyloi::models::Mtp> load_components(
             "unsupported GLM5 CUDA component adapter");
     }
     if (model.plan.predictor ==
-            ::tyloi::models::PredictorAdapter::none) return result;
+            ::tyloi::models::PredictorAdapter::none) return;
     TYLOINFER_RUNTIME_CHECK(
         tyloi::cuda::glm5_next::supports_speculation(model),
         "invalid Flash-Next predictor model");
-    auto predictor = tyloi::cuda::glm5_next::Mtp::load_if_present(
-        weights, model.embed, model.config);
-    if (predictor) {
-        result =
-            std::make_unique<tyloi::cuda::glm5_next::Mtp>(
-                std::move(*predictor));
-    }
-    return result;
+    auto predictor = std::make_unique<tyloi::cuda::glm5_next::Mtp>(
+        model.embed, weights.placement.target.index);
+    auto* candidate = predictor.get();
+    model.mtp = std::move(predictor);
+    if (!candidate->load_weights(weights, model.config)) model.mtp.reset();
 }
 
 } // namespace tyloi::cuda::glm5_next

@@ -1,4 +1,6 @@
 #include "engine/models/plan.h"
+#include "engine/models/load.h"
+#include "engine/backends/cuda/executor/executor.h"
 #include "engine/backends/cuda/native/collectives.h"
 #include "engine/backends/cuda/native/scope.h"
 #include "engine/backends/cuda/ops/norm/rms.h"
@@ -17,8 +19,10 @@
 #include "engine/backends/cuda/kernels/mfq_cuda_quant_ops.h"
 #include "engine/backends/cuda/kernels/deepseek_v4_attention.h"
 #include "engine/backends/cuda/kernels/deepseek_v4_hc.h"
+#include <array>
 #include <iomanip>
 #include <limits>
+#include <utility>
 #include <algorithm>
 #include <cmath>
 #include <iostream>
@@ -258,6 +262,29 @@ Model read(std::shared_ptr<const tyloi::ModelSource> source, std::string_view de
     return model;
 }
 
+void load(std::unique_ptr<tyloi::models::CausalModel>& owner,
+          std::shared_ptr<const tyloi::ModelSource> source, std::string_view definition,
+          const tyloi::weights::Loader& weights, LayerPlacementConfig& placement,
+          const tyloi::models::LoadOptions& options) {
+    owner = std::make_unique<Model>(read(std::move(source), definition, options.context));
+    auto& model = static_cast<Model&>(*owner);
+    if (!weights.placement.target.is_cuda() || weights.placement.target.index < 0)
+        throw std::invalid_argument("DeepSeek V4 requires a CUDA target");
+    if (placement.devices.empty()) placement.devices = {weights.placement.target.index};
+    if (placement.primary_device() != weights.placement.target.index)
+        throw std::invalid_argument("DeepSeek V4 weight and layer primary devices differ");
+    validate_offload(model.config, options.cpu_offload_layers);
+    if (options.expert_parallel && model.config.num_experts <= 0)
+        throw std::invalid_argument("--expert-parallel requires a model with routed experts");
+    std::int64_t host_bytes = 0;
+    auto& executor = tyloi::cuda::Executor::current();
+    load(model, weights, placement, executor.collectives(), placement.primary_device(),
+         options.cpu_offload_layers, host_bytes, options.gpu_layers);
+    if (options.optional_components && (model.plan.vision != tyloi::models::VisionAdapter::none ||
+        model.plan.predictor != tyloi::models::PredictorAdapter::none))
+        throw std::runtime_error("CUDA component adapter is unsupported for this model");
+}
+
 void load_deferred(Model& model, const tyloi::weights::Loader& weights,
                    LayerPlacementConfig& placement, int gpu_layers) {
     const auto& c = model.config;
@@ -349,9 +376,11 @@ tyloi::StepSequence<tyloi::models::Prepared> Model::prepare(
     return tyloi::ops::softcap(value, metadata.final_logit_softcapping);
 }
 
-::tyloi::Tensor Model::logits(const ::tyloi::Tensor& hidden, bool capped) const {
+::tyloi::Tensor Model::logits(const ::tyloi::Tensor& hidden, bool capped, tyloi::models::LogitPrecision precision) const {
+    auto projection_input = precision == tyloi::models::LogitPrecision::model
+        ? tyloi::ops::contiguous(tyloi::ops::cast(hidden, tyloi::kFloat16)) : hidden;
     auto value = tyloi::ops::measure("model.lm_head", hidden.device(), [&] {
-        return tyloi::ops::project(hidden, lm_head);
+        return tyloi::ops::project(projection_input, lm_head);
     });
     return capped ? softcap(value) : value;
 }
@@ -700,7 +729,7 @@ int64_t Compressor::prefill(PoolState& state, const ::tyloi::DenseTensor &kv, co
     return windows;
 }
 
-State::State(const Model& model) : layers(model.layers.size()) {
+State::State(const Model& model) : layers(model.layers.size()), model_(&model) {
     layout_.reserve(model.layers.size());
     for (size_t i = 0; i < layers.size(); ++i) {
         const auto& layer = model.layers[i];
@@ -714,6 +743,72 @@ State::State(const Model& model) : layers(model.layers.size()) {
         init(layers[i].compressor, layer.compressor);
         init(layers[i].indexer_compressor, layer.indexer_compressor);
     }
+}
+
+std::vector<std::pair<tyloi::Device, std::size_t>> State::reset_growth(int64_t next_batch) const {
+    if (next_batch <= 0 || layers.size() != layout_.size())
+        throw std::invalid_argument("invalid DeepSeek V4 reset geometry");
+    std::vector<std::pair<tyloi::Device, std::size_t>> result;
+    const auto add = [&](tyloi::Device device, std::size_t bytes) {
+        if (!bytes) return;
+        auto entry = std::find_if(result.begin(), result.end(),
+            [device](const auto& value) { return value.first == device; });
+        if (entry == result.end()) result.emplace_back(device, bytes);
+        else {
+            if (entry->second > std::numeric_limits<std::size_t>::max() - bytes)
+                throw std::overflow_error("DeepSeek V4 reset byte count overflow");
+            entry->second += bytes;
+        }
+    };
+    for (std::size_t index = 0; index < layers.size(); ++index) {
+        const auto& layout = layout_[index];
+        if (layout.device < 0 || layout.head_dim <= 0 || layout.max_positions <= 0)
+            throw std::invalid_argument("invalid DeepSeek V4 reset layout");
+        const tyloi::Device device(tyloi::kCUDA, layout.device);
+        const auto bytes = [&](int64_t rows, int64_t width, tyloi::ScalarType dtype) {
+            const std::array<int64_t, 3> shape{next_batch, rows, width};
+            return tyloi::make_contiguous_view(nullptr, shape, dtype, device).nbytes();
+        };
+        const auto& layer = layers[index];
+        if (!layer.local_cache.defined() || layer.local_cache.size(0) != next_batch)
+            add(device, bytes(128, layout.head_dim, tyloi::kFloat16));
+        const auto pool = [&](const PoolState& state) {
+            if (state.ratio <= 0 || state.head_dim <= 0) return;
+            if (layout.max_positions > std::numeric_limits<int64_t>::max() - (state.ratio - 1) ||
+                (state.overlap && state.head_dim > std::numeric_limits<int64_t>::max() / 2))
+                throw std::overflow_error("DeepSeek V4 pool geometry overflow");
+            const auto capacity = std::max<int64_t>(1, (layout.max_positions + state.ratio - 1) / state.ratio);
+            if (state.state_kv.defined() && state.state_kv.size(0) == next_batch && state.pool.size(1) == capacity)
+                return;
+            const auto width = state.overlap ? 2 * state.head_dim : state.head_dim;
+            const auto current = bytes(state.ratio, width, tyloi::kFloat32);
+            add(device, current); add(device, current);
+            if (state.overlap) {
+                const auto previous = bytes(state.ratio, state.head_dim, tyloi::kFloat32);
+                add(device, previous); add(device, previous);
+            }
+            add(device, bytes(capacity, state.head_dim, tyloi::kFloat16));
+        };
+        pool(layer.compressor);
+        pool(layer.indexer_compressor);
+    }
+    return result;
+}
+
+std::vector<std::pair<tyloi::Device, std::size_t>> State::growth(
+        const tyloi::models::Input& input, const tyloi::models::ForwardOptions&) const {
+    const auto [input_batch, tokens] = input.shape();
+    if (batch <= 0 || input_batch != batch || tokens <= 0 || cache_pos < 0 ||
+        input.confirmed != 0 || input.suffix ||
+        cache_pos > std::numeric_limits<int64_t>::max() - tokens)
+        throw std::invalid_argument("invalid DeepSeek V4 state allocation request");
+    for (const auto& layout : layout_)
+        if (cache_pos + tokens > layout.max_positions)
+            throw std::invalid_argument("DeepSeek V4 state exceeds context capacity");
+    // The first forward resets the fixed local and compressed caches. Later
+    // forwards update that storage in place and retain no additional state.
+    if (cache_pos == 0) return reset_growth(batch);
+    return {};
 }
 
 void State::reset(int64_t next_batch) {
@@ -798,6 +893,102 @@ void State::restore_text_session_state(const TextSessionState& state) {
     cache_pos = state.cache_pos;
     decode_position_delta = state.decode_position_delta;
     batch = 1;
+}
+
+
+class State::SessionRestore final : public tyloi::models::Restore {
+public:
+    SessionRestore(State& state, const TextSessionState& saved) : state_(state), saved_(saved) {
+        const auto* blocks = std::get_if<std::vector<tyloi::models::deepseek_v4::BlockSnapshot>>(&saved_.payload);
+        if (!state_.supports_text_session_state() || saved_.kind() != TextSessionStateKind::DeepseekV4 ||
+            saved_.cache_pos <= 0 || saved_.tokens.size() != static_cast<std::size_t>(saved_.cache_pos) ||
+            !blocks || blocks->size() != state_.layers.size())
+            throw CudaSessionStateError("DeepSeek V4 session is incompatible");
+        for (std::size_t i = 0; i < blocks->size(); ++i) {
+            const auto& layer = state_.layers[i];
+            const auto& layout = state_.layout_[i];
+            const auto& block = (*blocks)[i];
+            const tyloi::Device device(tyloi::kCUDA, layout.device);
+            if (saved_.cache_pos > layout.max_positions || !tensor(block.local_cache, device, 128, layout.head_dim, tyloi::kFloat16))
+                throw CudaSessionStateError("DeepSeek V4 local session cache is incompatible");
+            validate_pool(layer.compressor, block.compressor, device, layout.max_positions);
+            validate_pool(layer.indexer_compressor, block.indexer_compressor, device, layout.max_positions);
+        }
+    }
+    std::vector<std::pair<tyloi::Device, std::size_t>> growth() const override {
+        std::vector<std::pair<tyloi::Device, std::size_t>> result;
+        const auto& blocks = std::get<std::vector<tyloi::models::deepseek_v4::BlockSnapshot>>(saved_.payload);
+        const auto add = [&](tyloi::Device device, std::size_t bytes) {
+            auto it = std::find_if(result.begin(), result.end(), [device](const auto& value) { return value.first == device; });
+            if (it == result.end()) result.emplace_back(device, bytes);
+            else {
+                if (it->second > std::numeric_limits<std::size_t>::max() - bytes)
+                    throw std::overflow_error("DeepSeek V4 session growth overflow");
+                it->second += bytes;
+            }
+        };
+        for (std::size_t i = 0; i < blocks.size(); ++i) {
+            const auto device = tyloi::Device(tyloi::kCUDA, state_.layout_[i].device);
+            const auto& block = blocks[i];
+            add(device, restore_tensor_bytes({}, block.local_cache));
+            for (const auto* pool : {&block.compressor, &block.indexer_compressor}) {
+                if (pool->ratio <= 0) continue;
+                for (const auto* value : {&pool->state_kv, &pool->state_gate, &pool->previous_kv, &pool->previous_gate})
+                    add(device, restore_tensor_bytes({}, *value));
+                add(device, restore_prefix_bytes({}, pool->pool, 1, pool->capacity));
+            }
+        }
+        return result;
+    }
+    void stage() override {
+        candidate_ = std::make_unique<State>(*state_.model_);
+        candidate_->restore_text_session_state(saved_);
+    }
+    std::vector<tyloi::Tensor> storage() const override {
+        return candidate_ ? candidate_->storage() : std::vector<tyloi::Tensor>{};
+    }
+    void publish() noexcept override {
+        state_.layers.swap(candidate_->layers);
+        std::swap(state_.cache_pos, candidate_->cache_pos);
+        std::swap(state_.decode_position_delta, candidate_->decode_position_delta);
+        std::swap(state_.batch, candidate_->batch);
+    }
+private:
+    static bool tensor(const tyloi::Tensor& value, tyloi::Device device, int64_t rows,
+                       int64_t width, tyloi::ScalarType dtype) {
+        return value.defined() && value.representation<DenseTensor>() && value.device() == device &&
+            value.scalar_type() == dtype && value.dim() == 3 && value.size(0) == 1 && value.size(1) == rows && value.size(2) == width;
+    }
+    void validate_pool(const PoolState& current, const PoolSnapshot& saved,
+                       tyloi::Device device, int64_t maximum) const {
+        if (current.ratio != saved.ratio || current.head_dim != saved.head_dim ||
+            current.cache_quant_mode != saved.cache_quant_mode || current.overlap != saved.overlap)
+            throw CudaSessionStateError("DeepSeek V4 compressor configuration changed");
+        if (saved.ratio <= 0) return;
+        if (saved.head_dim <= 0 || maximum <= 0 ||
+            maximum > std::numeric_limits<int64_t>::max() - (saved.ratio - 1) ||
+            (saved.overlap && saved.head_dim > std::numeric_limits<int64_t>::max() / 2))
+            throw CudaSessionStateError("DeepSeek V4 compressor geometry is invalid");
+        const auto capacity = std::max<int64_t>(1, (maximum + saved.ratio - 1) / saved.ratio);
+        const auto width = saved.overlap ? 2 * saved.head_dim : saved.head_dim;
+        const auto visible = std::min(saved_.cache_pos / saved.ratio, capacity);
+        if (saved.capacity != capacity ||
+            !tensor(saved.state_kv, device, saved.ratio, width, tyloi::kFloat32) ||
+            !tensor(saved.state_gate, device, saved.ratio, width, tyloi::kFloat32) ||
+            !tensor(saved.pool, device, visible, saved.head_dim, tyloi::kFloat16) ||
+            (saved.overlap && (!tensor(saved.previous_kv, device, saved.ratio, saved.head_dim, tyloi::kFloat32) ||
+                               !tensor(saved.previous_gate, device, saved.ratio, saved.head_dim, tyloi::kFloat32))))
+            throw CudaSessionStateError("DeepSeek V4 compressor session is incompatible");
+    }
+    State& state_;
+    TextSessionState saved_;
+    std::unique_ptr<State> candidate_;
+};
+
+std::unique_ptr<tyloi::models::Restore> State::prepare_restore(
+        const TextSessionState& snapshot, const tyloi::models::Mtp* predictor_model) {
+    if (predictor_model) throw CudaSessionStateError("DeepSeek V4 predictor session is unsupported");
+    return std::make_unique<SessionRestore>(*this, snapshot);
 }
 
 static std::vector<::tyloi::DenseTensor> hc_pre(const Layer& w, ::tyloi::DenseTensor x,

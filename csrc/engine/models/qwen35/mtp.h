@@ -20,7 +20,12 @@ public:
     Mtp(tyloi::models::qwen35::Predictor model, bool preallocate);
 
     std::unique_ptr<tyloi::models::MtpState> make_state() const override;
+    std::vector<std::pair<Device, std::size_t>> reset_growth(
+        const tyloi::models::MtpState&, int64_t batch) const override;
     void reset(tyloi::models::MtpState& state, int64_t batch = 1) const override;
+    std::vector<std::pair<Device, std::size_t>> growth(const tyloi::models::MtpState&,
+        const Tensor& hidden, const Tensor& ids, const Tensor& positions,
+        const tyloi::models::ForwardOptions&) const override;
     // The caller owns the predictor execution scope.
     tyloi::models::MtpStep step(tyloi::models::MtpState& state, const ::tyloi::Tensor& hidden,
         const ::tyloi::Tensor& next_ids, const ::tyloi::Tensor& positions = {},
