@@ -211,7 +211,7 @@ torch::Tensor mxfp4_moe_grouped_matmul_pool_f16_cuda(
     torch::Tensor output, torch::Tensor ids_dst,
     torch::Tensor expert_bounds, torch::Tensor tile_bounds,
     torch::Tensor tile_experts);
-// nvq_matmul.cu
+// nvq.cpp
 // nepq.cu
 torch::Tensor nepq_hadamard_input_cuda(
     torch::Tensor input, torch::Tensor signs, int64_t block_size);
@@ -379,8 +379,8 @@ torch::Tensor nvq_embedding_lookup_cuda(
     int64_t neuron_len, int64_t gs, int64_t sub_bits, int64_t format, int64_t sign_mode);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    namespace qwen = mfq_qwen4_exp;
-    namespace glm = mfq_glm5_next;
+    namespace qwen = mfq_qwen4_jit;
+    namespace glm = mfq_glm5_jit;
     using pybind11::arg;
     m.def("qwen4_grouped_rms_norm", &qwen::grouped_rms_norm,
         arg("value"), arg("weight"), arg("group_size"), arg("eps") = 1e-6);
@@ -404,10 +404,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         arg("keys"), arg("gate_scores"), arg("ape"), arg("pool_size") = 4);
     m.def("qwen4_ple_dilated_conv_silu", &qwen::ple_dilated_conv_silu,
         arg("value"), arg("weight"), arg("state"), arg("dilation"));
-    m.def("qwen4_dense_gqa_attention", [](const qwen::Tensor& q,const qwen::Tensor& k,const qwen::Tensor& v,int64_t offset) {
+    m.def("qwen4_dense_gqa_attention", [](const torch::Tensor& q,const torch::Tensor& k,const torch::Tensor& v,int64_t offset) {
         return qwen::dense_gqa_attention(q,k,v,offset); },
         arg("query"), arg("key"), arg("value"), arg("query_offset"));
-    m.def("qwen4_sparse_gqa_attention", [](const qwen::Tensor& q,const qwen::Tensor& k,const qwen::Tensor& v,const qwen::Tensor& indices) {
+    m.def("qwen4_sparse_gqa_attention", [](const torch::Tensor& q,const torch::Tensor& k,const torch::Tensor& v,const torch::Tensor& indices) {
         return qwen::sparse_gqa_attention(q,k,v,indices); },
         arg("query"), arg("key"), arg("value"), arg("indices"));
     m.def("glm5_dense_mla_attention", &glm::dense_mla_attention,

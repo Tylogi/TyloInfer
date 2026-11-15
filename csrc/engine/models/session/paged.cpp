@@ -1,5 +1,6 @@
 #include "engine/models/session/paged.h"
-#include "backend.h"
+#include "engine/ops.h"
+#include <span>
 
 #include <cstring>
 #include <limits>
@@ -10,9 +11,7 @@ void CudaPagedWriter::raw(const void *data, size_t size) {
 }
 
 void CudaPagedWriter::tensor(const ::tyloi::Tensor &tensor) {
-    const auto* dense = tensor.representation<::tyloi::DenseTensor>();
-    if (!dense) throw std::runtime_error("invalid CUDA paged cache tensor");
-    const auto& source = *dense;
+    const auto& source = tensor;
     if (!source.defined() || !source.is_cuda() || source.dim() <= 0 || source.dim() > 8) {
         throw std::runtime_error("invalid CUDA paged cache tensor");
     }
@@ -21,16 +20,15 @@ void CudaPagedWriter::tensor(const ::tyloi::Tensor &tensor) {
         dtype != ::tyloi::kFloat32 && dtype != ::tyloi::kInt32 && dtype != ::tyloi::kInt64) {
         throw std::runtime_error("unsupported CUDA paged cache tensor dtype");
     }
-    const auto cpu = source.contiguous().to(::tyloi::kCPU);
+    const auto data = ::tyloi::ops::bytes(source);
     scalar<int32_t>(static_cast<int32_t>(dtype));
-    scalar<int32_t>(source.get_device());
-    scalar<uint32_t>(static_cast<uint32_t>(cpu.dim()));
+    scalar<int32_t>(source.device().index);
+    scalar<uint32_t>(static_cast<uint32_t>(source.dim()));
     scalar<uint32_t>(0);
-    for (const auto dimension : cpu.sizes())
-        scalar<int64_t>(dimension);
-    const auto bytes = static_cast<uint64_t>(cpu.numel() * cpu.element_size());
-    scalar<uint64_t>(bytes);
-    raw(cpu.data_ptr(), static_cast<size_t>(bytes));
+    for (int64_t axis = 0; axis < source.dim(); ++axis)
+        scalar<int64_t>(source.size(axis));
+    scalar<uint64_t>(static_cast<uint64_t>(data.size()));
+    raw(data.data(), data.size());
 }
 
 CudaPagedPayload CudaPagedWriter::finish() && {
@@ -77,10 +75,12 @@ std::pair<::tyloi::Tensor, int> CudaPagedReader::tensor() {
         bytes != elements * element_size || bytes > remaining()) {
         throw CudaSessionStateError("invalid CUDA paged cache tensor size");
     }
-    auto cpu = ::tyloi::cuda::empty(
-        shape, ::tyloi::TensorOptions().device(::tyloi::kCPU).dtype(dtype));
-    raw(cpu.data_ptr(), static_cast<size_t>(bytes), "tensor");
-    return {std::make_shared<::tyloi::DenseTensor>(std::move(cpu)), device};
+    const auto data = std::span<const std::byte>(reinterpret_cast<const std::byte*>(cursor_),
+                                                  static_cast<size_t>(bytes));
+    auto cpu = ::tyloi::ops::tensor(data, shape,
+        ::tyloi::TensorOptions().device(::tyloi::kCPU).dtype(dtype));
+    cursor_ += static_cast<size_t>(bytes);
+    return {std::move(cpu), device};
 }
 
 void CudaPagedReader::expect_end() const {

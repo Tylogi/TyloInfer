@@ -1,11 +1,10 @@
 #include "engine/backends/cuda/native/env.h"
-#include "engine/backends/cuda/executor/execution.h"
-#include "engine/backends/cuda/native/scope.h"
 #include "cli.h"
 #include "run.h"
 #include "engine/engine.h"
 #include "engine/load.h"
 #include "minicpmo45.h"
+#include "engine/program.h"
 #include "engine/models/source.h"
 #include "transport/include/transport.h"
 #include "engine/generation/mtp/limits.h"
@@ -285,17 +284,10 @@ int execute_runtime(RuntimeCommandOptions options) {
                 options.input_prefix.empty()) {
             return run_transport_runtime(options);
         }
-        std::shared_ptr<tyloi::cuda::KvMemoryManager> kv;
-        tyloi::cuda::RoutedCache weights;
-        std::shared_ptr<tyloi::cuda::KvOffloadStore> offload;
-        auto [execution_config, numeric_options] = tyloi::cuda::load_cuda_execution_config();
-        auto executor = std::make_unique<tyloi::cuda::Executor>(std::move(numeric_options), 0);
-        CudaExecutionContext execution(*executor, std::move(execution_config), weights, kv, offload);
-        CudaScope scope(execution.config.layer_placement.primary_device(), execution.executor().contexts());
-        tyloi::cuda::internal::setup_cuda_load(options, execution.config, *executor, weights, kv, offload);
+        auto program = tyloi::cuda::Program::open(options);
         return !options.duplex_input_prefix.empty()
-            ? tyloi::cuda::minicpmo45::run_duplex(execution, options, options)
-            : tyloi::cuda::minicpmo45::run_composite(execution, options, options);
+            ? tyloi::cuda::minicpmo45::run_duplex(*program, options)
+            : tyloi::cuda::minicpmo45::run_composite(*program, options);
     });
 }
 

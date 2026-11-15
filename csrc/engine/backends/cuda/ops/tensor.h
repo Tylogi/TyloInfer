@@ -2,8 +2,15 @@
 
 #include "engine/tensor.h"
 
+namespace tyloi::ops { struct TopK; }
 namespace tyloi::cuda::ops {
 
+/** Read contiguous host float values from a dense tensor. */
+std::vector<float> floats(const tyloi::DenseTensor& input);
+/** Read contiguous host integer values from a dense tensor. */
+std::vector<std::int64_t> integers(const tyloi::DenseTensor& input);
+/** Select sorted top-k values and indices on the input device. */
+::tyloi::ops::TopK top_k(const tyloi::DenseTensor& input, std::int64_t k, bool force_radix);
 void decode_commit(tyloi::DenseTensor next, tyloi::DenseTensor generated, tyloi::DenseTensor step,
                    tyloi::DenseTensor input, tyloi::DenseTensor position, tyloi::DenseTensor length);
 tyloi::DenseTensor tensor(std::span<const float> values, Device target);
@@ -18,7 +25,7 @@ tyloi::DenseTensor softcap(tyloi::DenseTensor input, double cap);
 tyloi::DenseTensor scale(tyloi::DenseTensor input, double factor);
 tyloi::DenseTensor divide(tyloi::DenseTensor input, double divisor);
 tyloi::DenseTensor copy(tyloi::DenseTensor input, Device target);
-void copy_into(tyloi::DenseTensor destination, tyloi::DenseTensor source);
+void copy_into(tyloi::DenseTensor destination, tyloi::DenseTensor source, bool non_blocking = false);
 tyloi::DenseTensor cast(tyloi::DenseTensor input, ScalarType type);
 tyloi::DenseTensor cast(tyloi::DenseTensor input, ScalarType type, Device target);
 tyloi::DenseTensor contiguous(tyloi::DenseTensor input);
@@ -26,6 +33,9 @@ tyloi::DenseTensor clone(tyloi::DenseTensor input);
 tyloi::DenseTensor cat(std::span<const tyloi::DenseTensor> inputs, std::int64_t dim);
 tyloi::DenseTensor zeros(std::span<const std::int64_t> shape, const TensorOptions& options);
 tyloi::DenseTensor index_select(tyloi::DenseTensor input, std::int64_t dim, tyloi::DenseTensor indices);
+tyloi::DenseTensor where(tyloi::DenseTensor condition, tyloi::DenseTensor yes, tyloi::DenseTensor no);
+tyloi::DenseTensor sharded_embedding(std::span<const Tensor> shards, tyloi::DenseTensor global_ids,
+                                     std::span<const std::int64_t> used_shards, std::int64_t rows);
 tyloi::DenseTensor sum(tyloi::DenseTensor input, std::int64_t dim, bool keepdim);
 void index_copy(tyloi::DenseTensor input, std::int64_t dim, tyloi::DenseTensor indices, tyloi::DenseTensor source);
 tyloi::DenseTensor arange(std::int64_t first, std::int64_t last, Device device);

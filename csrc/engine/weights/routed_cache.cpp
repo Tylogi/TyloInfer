@@ -1,10 +1,13 @@
-#include "engine/weights/cache_internal.h"
+#include "engine/weights/cache_resources.h"
 
 #include "engine/backends/cuda/native/context.h"
 #include "engine/backends/cuda/executor/executor.h"
 #include "engine/backends/cuda/executor/options.h"
 #include "engine/backends/cuda/executor/tq.h"
 #include "engine/weights/moe/expert_cache.h"
+#if TYLOINFER_ENABLE_MFQ_COMPAT
+#include "engine/weights/moe/expert_cache_internal.h"
+#endif
 #include "engine/weights/source/source.h"
 #include "engine/weights/tq/cache.h"
 #include "env.h"
@@ -27,7 +30,7 @@ Cache::Routes::~Routes() {
 
 void Cache::Routes::begin(Cache& owner, int rows) {
     if (!impl_) impl_ = std::make_unique<Impl>();
-    auto cache = detail::cache(owner).moe;
+    auto cache = owner.data_->moe;
     begin_moe_speculative_routes(cache, rows);
     impl_->cache = std::move(cache);
 }
@@ -47,7 +50,7 @@ struct Cache::Warmup::Impl {
 };
 
 Cache::Warmup::Warmup(Cache& owner, bool suspend_residency) : impl_(std::make_unique<Impl>()) {
-    impl_->cache = detail::cache(owner).moe;
+    impl_->cache = owner.data_->moe;
     impl_->suspended = suspend_residency;
     if (suspend_residency) impl_->previous_residency = suspend_moe_residency(impl_->cache, true);
     impl_->previous_learning = set_moe_reuse_learning(impl_->cache, false);
@@ -70,14 +73,10 @@ void Cache::Warmup::release(Device device, bool decode) {
     cuda::default_context(device.index)->reclaim_idle_memory();
 }
 
-Loader Cache::loader(const source::Source& source, Loader::Options options,
-        Loader::Placement placement) {
-    return Loader(source, std::move(options), std::move(placement), *this);
-}
-
 void Cache::begin_load() {
     reset();
     auto& executor = cuda::Executor::current();
+    executor.weights_ = this;
     data_->exec = executor.tq();
     data_->host_bytes = cuda::env_size("TYLOINFER_MOE_HOST_CACHE_BYTES", 0);
     data_->host_limit = cuda::env_size("TYLOINFER_MOE_HOST_PHYSICAL_BYTES", 0);
@@ -101,6 +100,10 @@ std::vector<std::pair<std::string, double>> Cache::metrics() const {
     auto result = data_->tq ? data_->tq->metrics() : moe_expert_memory_metrics(data_->moe);
     append_workspace_metrics(result);
     return result;
+}
+
+void Cache::report(std::ostream& output) const {
+    if (data_->moe) print_moe_expert_cache_stats(data_->moe, output);
 }
 
 Cache::Activity Cache::activity() const {
@@ -130,6 +133,16 @@ Cache::Transfer Cache::transfer() const {
 
 Cache::Decode Cache::decode() const {
     return data_->tq ? Decode::routed : Decode::none;
+}
+
+bool Cache::legacy_experts_resident() const {
+#if TYLOINFER_ENABLE_MFQ_COMPAT
+    const auto& cache = data_->moe;
+    return cache && cache->has_sources() && cache->finalized() &&
+        cache->complete_residency() && cache->budget_bytes() > 0;
+#else
+    return false;
+#endif
 }
 
 bool Cache::split_prefill(std::int64_t rows) const {

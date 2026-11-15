@@ -8,14 +8,12 @@
 #include <unordered_map>
 #include <vector>
 
-#ifdef TYLOINFER_NATIVE_CUDA
 namespace tyloi::cuda::ops {
 tyloi::ops::RopeTable rope_table(int64_t positions, int64_t dimension, double base, Device device,
                                  int64_t frequency_dim, int64_t active_pairs);
 tyloi::DenseTensor rope(tyloi::DenseTensor input, tyloi::DenseTensor positions, const tyloi::ops::RopeTable& table,
                  bool bf16, bool grid_mrope_positions);
 }
-#endif
 
 struct RopeCache {
     ::tyloi::DenseTensor cos;
@@ -43,9 +41,7 @@ struct RopeCache {
         bool interleaved,
         int64_t configured_rotary_dim,
         ::tyloi::Device device);
-#ifdef TYLOINFER_NATIVE_CUDA
     tyloi::ops::RopeTable view() const;
-#endif
     ::tyloi::DenseTensor apply(
         ::tyloi::DenseTensor x,
         ::tyloi::DenseTensor pos,
@@ -69,7 +65,7 @@ public:
                                        const ::tyloi::DenseTensor& positions) const;
     // Switch only after execution and captured graphs using this module finish.
     void set_fused(bool enabled) { fused_ = enabled && !yarn_.enabled(); }
-    bool fused() const { return fused_; }
+    bool fused() const;
     bool pool_normalized_into(const ::tyloi::DenseTensor& index,
         const ::tyloi::DenseTensor& weight,const ::tyloi::DenseTensor& positions,
         const ::tyloi::DenseTensor& cache_positions,const ::tyloi::DenseTensor& output,

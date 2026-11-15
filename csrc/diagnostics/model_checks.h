@@ -1,29 +1,39 @@
 #pragma once
 
+#include "diagnostics/experts.h"
+#include "diagnostics/ffn.h"
 #include <cstdint>
 #include <string>
 #include <vector>
 
 enum class TensorParallelAxis;
 enum class InputGateMode : int;
-struct CudaExecutionContext;
+namespace tyloi::cuda { class Program; }
 
-int run_linear_check(CudaExecutionContext& execution, const std::string& model_path, const std::string& name, int rows, InputGateMode gate_mode, int repetitions);
-int run_cpu_linear_check(CudaExecutionContext& execution, const std::string& model_path, const std::string& name, int rows, InputGateMode gate_mode, int repetitions);
-int run_tensor_parallel_linear_check(CudaExecutionContext& execution, const std::string& model_path, const std::string& name, TensorParallelAxis axis, int rows);
+/** Compare a native projection with its decoded dense reference. */
+int run_linear_check(tyloi::cuda::Program& program, const std::string& name, int rows, InputGateMode gate_mode, int repetitions);
+/** Compare CPU and CUDA execution of the same projection. */
+int run_cpu_linear_check(tyloi::cuda::Program& program, const std::string& name, int rows, InputGateMode gate_mode, int repetitions);
+/** Compare a tensor-parallel projection with its unsharded result. */
+int run_tensor_parallel_linear_check(tyloi::cuda::Program& program, const std::string& name, TensorParallelAxis axis, int rows);
 std::vector<std::string> parse_tensor_names(const std::string& value);
-int run_linear_group_check(CudaExecutionContext& execution, const std::string& model_path, const std::string& names, int rows, int repetitions);
-int run_gdn_operator_check(const std::string& input_dir, const std::string& output_path, const std::string& state_path, std::int64_t tokens, std::int64_t query_heads, std::int64_t value_heads, std::int64_t head_dim);
-int run_linear_conv_operator_check(const std::string& input_dir, const std::string& output_dir, std::int64_t tokens, std::int64_t query_heads, std::int64_t value_heads, std::int64_t key_dim, std::int64_t value_dim, std::int64_t kernel_size, double eps);
-int run_q8_embedding_check(CudaExecutionContext& execution, const std::string& model_path, const std::string& name);
-int run_dsv4_output_a_check(CudaExecutionContext& execution, const std::string& model_path, const std::string& name, int batch, int repetitions);
-int run_gemma_geglu_check(CudaExecutionContext& execution, const std::string& model_path, int layer, int repetitions);
-int run_expert_parallel_moe_check(CudaExecutionContext& execution, const std::string& model_path, const std::string& tensor_name, int tokens, int routes);
-int run_mfe_tensor_check(CudaExecutionContext& execution, const std::string& model_path, const std::string& tensor_name, int tokens, int routes, int repetitions, int split_width, bool routed_input, bool benchmark_only);
-int run_moe_check(CudaExecutionContext& execution, const std::string& model_path, const std::string& config_path, int layer, const std::vector<std::int64_t>& token_sizes, int repetitions);
-int run_attention_decode_check(int length, int repetitions, int dimension, bool sliding, int window);
-int run_gemma4_swa_check(int repetitions);
-int run_glm_dsa_check(int repetitions);
-int run_dsv4_hc_check(int repetitions);
-int run_dsv4_attention_check(int repetitions);
-int run_text_session_state_check();
+/** Compare grouped projections, graph replay and decoded dense outputs. */
+int run_linear_group_check(tyloi::cuda::Program& program, const std::string& names, int rows, int repetitions);
+/** Compare NINT8-zero embedding lookup with decoded rows. */
+int run_q8_embedding_check(tyloi::cuda::Program& program, const std::string& name);
+/** Compare DeepSeek output-A groupwise and full projection paths. */
+int run_dsv4_output_a_check(tyloi::cuda::Program& program, const std::string& name, int batch, int repetitions);
+/** Compare Gemma GeGLU activation and output paths. */
+int run_gemma_geglu_check(tyloi::cuda::Program& program, int layer, int repetitions);
+/** Compare native full or sliding-window decode attention. */
+int run_attention_decode_check(tyloi::cuda::Program& program, int length, int repetitions, int dimension, bool sliding, int window);
+/** Check native Gemma sliding-window and full attention paths. */
+int run_gemma4_swa_check(tyloi::cuda::Program& program, int repetitions);
+/** Check native GLM DSA attention and routing paths. */
+int run_glm_dsa_check(tyloi::cuda::Program& program, int repetitions);
+/** Compare DeepSeek V4 hyper-connection operations. */
+int run_dsv4_hc_check(tyloi::cuda::Program& program, int repetitions);
+/** Check DeepSeek V4 attention, compression and routing paths. */
+int run_dsv4_attention_check(tyloi::cuda::Program& program, int repetitions);
+/** Exercise exact synthetic snapshot restoration through the production request states. */
+int run_text_session_state_check(tyloi::cuda::Program& program);

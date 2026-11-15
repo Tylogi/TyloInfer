@@ -1,6 +1,6 @@
 #pragma once
 #include "engine/weights/nint.h"
-#include <functional>
+#include "residual_trace.h"
 #include <vector>
 
 // Replace the existing F32 [column, stream] buffer with an equal-size
@@ -23,5 +23,5 @@ std::vector<::tyloi::DenseTensor> gated_residual_two_stage_cuda(
     int64_t streams,double eps,bool after,
     const ::tyloi::DenseTensor& dense_injection={},
     const ::tyloi::DenseTensor& prepared_injection_right={},
-    const std::function<void(const char*)>& marker={},
+    ResidualTraceData* trace=nullptr,
     const ::tyloi::DenseTensor& up_group_coefficients={});

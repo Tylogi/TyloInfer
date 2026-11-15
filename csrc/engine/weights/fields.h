@@ -10,7 +10,7 @@
 
 namespace tyloi::weights::fields {
 
-// Read-only enumeration of the owning tensor handles a record needs.
+/** Enumerate owning tensor handles and reject unsupported sharded streaming. */
 template <class Visitor>
 void tensors(const ::tyloi::Tensor& weight, Visitor visit) {
     if (weight.representation<::tyloi::ShardedTensor>() != nullptr)

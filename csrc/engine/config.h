@@ -38,6 +38,14 @@ struct ContinuousBatchConfig {
     bool greedy = true;
     bool cuda_graph = true;
     bool paged_kv = true;
+    /** Preserve the configured storage policy when creating model-owned batches. */
+    bool preallocate = false, cpu_offload = false;
+    /** Minimum routed expert slots available to one numerical row. */
+    int cached_slots = 0;
+    /** Pack independent prompt spans into one numerical operation when supported. */
+    bool packed_prefill = true;
+    /** Maximum tokens admitted to one packed numerical operation. */
+    std::int64_t packed_tokens = 512;
     std::int32_t cuda_graph_minimum_tokens = 16;
 };
 
@@ -45,6 +53,14 @@ struct GraphConfig {
     bool enabled = true;
     bool trace = false;
     std::int32_t minimum_generation_tokens = 16;
+};
+
+/** Control early host-token row prefetch during generation. */
+struct PrefetchConfig {
+    bool decode = true;
+    bool mtp = true;
+    bool draft = true;
+    bool publication = true;
 };
 
 struct Config {
@@ -61,13 +77,17 @@ struct Config {
     bool profile_decode = false;
     bool profile_mtp = false;
     bool trace_moe = false;
+    /** Expert workspace requested before large batched prompt operations. */
+    std::size_t workspace_reserve = std::size_t(4) << 30;
+    PrefetchConfig prefetch;
     GraphConfig decode_graph;
     ContinuousBatchConfig continuous_batch;
 };
 
 std::uint64_t environment_uint64(const char* name, std::uint64_t fallback);
 bool environment_enabled(const char* name, bool fallback = true);
-Config resolve_config(std::int64_t prefill_chunk_size);
+/** Resolve runtime settings; zero prefill size selects automatic chunking. */
+Config resolve_config(std::int64_t prefill_chunk_size = 0, int continuous_batching = 0);
 ContinuousBatchConfig resolve_batch_config(int capacity, std::int64_t prefill_chunk_size);
 
 } // namespace tyloi::engine

@@ -3,9 +3,9 @@
 // Read-only weights and configuration shared by one Qwen4 layer.
 
 #include "engine/models/qwen4_exp/model.h"
-#include "engine/models/qwen4_exp/moe.h"
+#include "engine/ops/ffn.h"
+#include "engine/ops/residual.h"
 #include "engine/models/qwen4_exp/config.h"
-#include "engine/backends/cuda/ops/ffn/gated.h"
 
 #include <cstdint>
 #include <memory>
@@ -18,10 +18,10 @@ struct Layer final {
     int cuda_device = 0;
     bool cpu_offloaded = false;
     tyloi::models::qwen4_exp::Config config;
-    GatedResidual attention_gr, ffn_gr;
-    Moe ffn;
-    std::unique_ptr<Gdn> gdn;
-    std::unique_ptr<Qsa> qsa;
+    tyloi::ops::Residual attention_gr, ffn_gr;
+    tyloi::ops::FfnWeights ffn;
+    std::unique_ptr<tyloi::ops::Gdn> gdn;
+    std::unique_ptr<tyloi::ops::Qsa> qsa;
     std::unique_ptr<Ple> ple;
 };
 
@@ -37,7 +37,8 @@ DenseTensor prefill_attention_core(const Layer& weights, LayerState& request,
                                    const DenseTensor& input, const DenseTensor& positions,
                                    const DenseTensor& full_positions);
 
-GatedResidual::Result prefill_attention(const Layer& weights, LayerState& request,
+/** Prepare the attention and residual inputs used by layer-major prefill. */
+tyloi::ops::Residual::Result prefill_attention(const Layer& weights, LayerState& request,
                                         DenseTensor x, const DenseTensor& ids,
                                         const DenseTensor& host_ids, const DenseTensor& positions,
                                         const DenseTensor& full_positions);
