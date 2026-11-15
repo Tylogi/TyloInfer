@@ -1,9 +1,8 @@
 #include "memory.h"
+#include "components/host_memory.h"
 
 #include <algorithm>
 #include <atomic>
-#include <mach/mach.h>
-#include <sys/sysctl.h>
 
 #include <mlx/backend/metal/device.h>
 #include <mlx/memory.h>
@@ -37,48 +36,16 @@ static std::size_t allocated_bytes(Device& device) {
 }  // namespace
 
 Memory memory() {
-    std::uint64_t total = 0;
-    std::size_t size = sizeof(total);
-    if (sysctlbyname("hw.memsize", &total, &size, nullptr, 0) != 0 ||
-        size != sizeof(total) || total == 0 ||
-        total > std::numeric_limits<std::size_t>::max()) {
-        throw std::runtime_error("cannot determine physical memory size");
-    }
-
-    const auto host = mach_host_self();
-    if (host == MACH_PORT_NULL) {
-        throw std::runtime_error("cannot obtain Mach host port");
-    }
-    vm_size_t page_size = 0;
-    vm_statistics64_data_t statistics{};
-    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
-    const bool success = host_page_size(host, &page_size) == KERN_SUCCESS &&
-        host_statistics64(host, HOST_VM_INFO64,
-            reinterpret_cast<host_info64_t>(&statistics), &count) == KERN_SUCCESS;
-    const auto deallocated = mach_port_deallocate(mach_task_self(), host);
-    if (!success || deallocated != KERN_SUCCESS || page_size == 0 ||
-        count < HOST_VM_INFO64_COUNT) {
-        throw std::runtime_error("cannot determine available physical memory");
-    }
-    const auto pages = static_cast<std::uint64_t>(statistics.free_count) +
-        static_cast<std::uint64_t>(statistics.inactive_count);
-    if (pages > std::numeric_limits<std::size_t>::max() / page_size) {
-        throw std::overflow_error("available physical memory exceeds size_t");
-    }
-    task_vm_info_data_t task_info_data{};
-    mach_msg_type_number_t task_count = TASK_VM_INFO_COUNT;
-    if (task_info(mach_task_self(), TASK_VM_INFO,
-            reinterpret_cast<task_info_t>(&task_info_data), &task_count) != KERN_SUCCESS ||
-        task_count < TASK_VM_INFO_REV1_COUNT) {
-        throw std::runtime_error("cannot determine process physical footprint");
-    }
-    if (task_info_data.phys_footprint > std::numeric_limits<std::size_t>::max()) {
-        throw std::overflow_error("process physical footprint exceeds size_t");
+    const auto host = tyloi::sample_host_memory();
+    const auto footprint = host.footprint_bytes.value();
+    if (host.total_bytes > std::numeric_limits<std::size_t>::max() ||
+        host.available_host_bytes() > std::numeric_limits<std::size_t>::max() ||
+        footprint > std::numeric_limits<std::size_t>::max()) {
+        throw std::overflow_error("host memory measurement exceeds size_t");
     }
     return {active_memory(), cache_memory(), wired_memory(), memory_limit(),
-        std::min(static_cast<std::size_t>(pages) * page_size,
-                 static_cast<std::size_t>(total)),
-        static_cast<std::size_t>(total), static_cast<std::size_t>(task_info_data.phys_footprint)};
+        static_cast<std::size_t>(host.available_host_bytes()),
+        static_cast<std::size_t>(host.total_bytes), static_cast<std::size_t>(footprint)};
 }
 
 std::size_t memory_limit() { return mlx::core::get_memory_limit(); }

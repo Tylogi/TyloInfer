@@ -392,7 +392,7 @@ endif()
 
 add_library(mfq-cuda-ops OBJECT ${TYLOINFER_CUDA_OP_SOURCES})
 mfq_configure_cuda_backend_target(mfq-cuda-ops)
-target_link_libraries(mfq-cuda-ops PRIVATE mfq-quant-readers)
+target_link_libraries(mfq-cuda-ops PRIVATE mfq-quant-readers mfq-host-memory)
 target_compile_definitions(mfq-cuda-ops PRIVATE NOMINMAX)
 set_target_properties(mfq-cuda-ops PROPERTIES POSITION_INDEPENDENT_CODE ON)
 

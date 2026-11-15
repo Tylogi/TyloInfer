@@ -426,7 +426,7 @@ mfq_configure_metal(mfq-metal-engine)
 target_compile_definitions(mfq-metal-engine PRIVATE
     TYLOINFER_MLX_METALLIB_DEFAULT="${TYLOINFER_MLX_METALLIB_DEFAULT}")
 target_link_libraries(mfq-metal-engine PUBLIC mfq-engine mfq-metal-ops
-    PRIVATE mfq-jaccl
+    PRIVATE mfq-jaccl mfq-host-memory
     ${TYLOINFER_METAL_FRAMEWORK} ${TYLOINFER_FOUNDATION_FRAMEWORK}
     ${TYLOINFER_QUARTZCORE_FRAMEWORK} ${TYLOINFER_ACCELERATE_FRAMEWORK}
     ${TYLOINFER_IOKIT_FRAMEWORK})

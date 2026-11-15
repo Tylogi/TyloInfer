@@ -5,8 +5,6 @@ add_library(mfq-host-parallel STATIC
     native/host_parallel.h
     native/host_copy.cpp
     native/host_copy.h
-    native/host_memory.cpp
-    native/host_memory.h
     native/topology.cpp
     native/topology.h
     native/cpu_affinity_win.h

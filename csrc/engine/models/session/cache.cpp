@@ -1,6 +1,6 @@
 #include "engine/models/session/cache.h"
 
-#include "engine/backends/cpu/native/host_memory.h"
+#include "components/host_memory.h"
 #include "engine/config.h"
 #include "engine/models/session/codec.h"
 #include "engine/state/session/prefix_cache.h"
@@ -12,15 +12,6 @@
 #include <exception>
 #include <iostream>
 #include <stdexcept>
-#include <fstream>
-#ifdef _WIN32
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#elif defined(__linux__)
-#include <sys/sysinfo.h>
-#endif
 
 namespace tyloi::models {
 
@@ -47,17 +38,9 @@ std::shared_ptr<tyloi::cache::PagedPrefixCache> make_paged_prefix_cache(
     cache.max_hot_bytes = separate ? config.ram_bytes : config.hot_bytes;
     cache.spill_hot_on_eviction = separate;
     if (separate) cache.available_ram_bytes = []() -> std::uint64_t {
-#ifdef _WIN32
-        MEMORYSTATUSEX state{};
-        state.dwLength = sizeof(state);
-        if (GlobalMemoryStatusEx(&state)) return state.ullAvailPhys;
-#elif defined(__linux__)
-        std::ifstream input("/proc/meminfo");
-        std::string name, unit;
-        std::uint64_t kib = 0;
-        while (input >> name >> kib >> unit) if (name == "MemAvailable:") return kib * 1024;
-#endif
-        return UINT64_MAX;
+        // The background writer must trim conservatively if sampling fails.
+        try { return tyloi::sample_host_memory().available_host_bytes(); }
+        catch (const std::runtime_error&) { return 0; }
     };
     cache.max_pending_writes = config.pending_writes;
     cache.max_pending_bytes = config.pending_bytes;

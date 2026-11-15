@@ -12,7 +12,7 @@
 #include "engine/backends/cuda/native/tensor/backend.h"
 #include "engine/backends/cuda/executor/graph_registry.h"
 #include "env.h"
-#include "engine/backends/cpu/native/host_memory.h"
+#include "components/host_memory.h"
 
 #include <algorithm>
 #include <chrono>

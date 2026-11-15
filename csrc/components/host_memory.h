@@ -8,6 +8,8 @@ struct HostMemorySample {
     std::uint64_t resident_bytes = 0;
     std::uint64_t available_bytes = 0;
     std::optional<std::uint64_t> commit_available_bytes;
+    std::uint64_t total_bytes = 0;
+    std::optional<std::uint64_t> footprint_bytes;
     std::uint64_t available_host_bytes() const noexcept {
         return commit_available_bytes && *commit_available_bytes < available_bytes
             ? *commit_available_bytes : available_bytes;
@@ -15,4 +17,4 @@ struct HostMemorySample {
 };
 HostMemorySample sample_host_memory();
 void trim_host_cache() noexcept;
-}
+} // namespace tyloi

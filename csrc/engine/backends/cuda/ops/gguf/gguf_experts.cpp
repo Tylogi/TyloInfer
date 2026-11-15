@@ -19,7 +19,7 @@
 #include "engine/backends/cuda/kernels/moe/pipeline.h"
 #include "engine/backends/cuda/native/dma_batch.h"
 #include "engine/backends/cuda/kernels/moe/pipeline.h"
-#include "engine/backends/cpu/native/host_memory.h"
+#include "components/host_memory.h"
 #include "engine/models/source/hf_source.h"
 #include "engine/backends/cpu/native/topology.h"
 #include "engine/backends/cuda/native/tensor/backend.h"

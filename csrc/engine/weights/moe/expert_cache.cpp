@@ -73,7 +73,7 @@ std::optional<std::size_t> MoeExpertCache::available_host_ram() const {
             available=std::min(available,memory.resident_bytes>=options_.host_limit
                 ?std::size_t(0):std::size_t(options_.host_limit-memory.resident_bytes));
         return available;
-    } catch(const std::runtime_error&) {return std::nullopt;}
+    } catch(const std::runtime_error&) {return 0;}
 }
 
 std::size_t MoeExpertCache::reclaim_optional_host(std::size_t allocation_bytes) {

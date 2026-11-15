@@ -1,5 +1,5 @@
 #pragma once
-#include "engine/backends/cpu/native/host_memory.h"
+#include "components/host_memory.h"
 #include <cstdint>
 #include <memory>
 #include <optional>

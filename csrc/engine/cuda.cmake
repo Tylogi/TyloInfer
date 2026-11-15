@@ -26,6 +26,7 @@ function(mfq_configure_cuda_engine_target target)
         mfq-model-source
         mfq-quant-readers
         mfq-engine
+        mfq-host-memory
         mfq-prefix-blocks
         mfq-qsa-kv-store
         mfq-cpu-execution

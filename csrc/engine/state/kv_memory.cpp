@@ -4,7 +4,7 @@
 #include "engine/backends/cuda/kernels/mfq_cuda_kv_hot_cache.h"
 #include "engine/weights/workspace.h"
 #include "engine/budget.h"
-#include "engine/backends/cpu/native/host_memory.h"
+#include "components/host_memory.h"
 #include "engine/generation/prefill_budget.h"
 #include "engine/backends/cuda/native/vmm.h"
 #include "engine/state/kv_budget.h"
@@ -22,12 +22,6 @@
 #include <tuple>
 #include <set>
 #include <filesystem>
-#ifdef _WIN32
-#define NOMINMAX
-#include <windows.h>
-#else
-#include <unistd.h>
-#endif
 
 namespace tyloi::cuda {
 namespace {
@@ -41,15 +35,8 @@ std::size_t setting(const char* name, std::size_t fallback) {
     return std::size_t(result);
 }
 std::size_t host_available() {
-#ifdef _WIN32
-    MEMORYSTATUSEX status{}; status.dwLength = sizeof(status);
-    return GlobalMemoryStatusEx(&status) ? std::size_t(status.ullAvailPhys) : 0;
-#elif defined(__linux__)
-    return tyloi::sample_host_memory().available_host_bytes();
-#else
-    const long pages = sysconf(_SC_AVPHYS_PAGES), size = sysconf(_SC_PAGESIZE);
-    return pages > 0 && size > 0 ? std::size_t(pages) * size : 0;
-#endif
+    return static_cast<std::size_t>(std::min<std::uint64_t>(
+        tyloi::sample_host_memory().available_host_bytes(), std::numeric_limits<std::size_t>::max()));
 }
 std::size_t width_bytes(const ::tyloi::TensorOptions& options) { return options.scalar_type() == ::tyloi::kInt32 ? 4 : 2; }
 bool discrete_device() {

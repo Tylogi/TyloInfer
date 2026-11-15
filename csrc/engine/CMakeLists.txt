@@ -116,6 +116,7 @@ target_include_directories(mfq-engine
         ${PROJECT_SOURCE_DIR}/components/tokenizer/src
 )
 target_compile_features(mfq-engine PUBLIC cxx_std_20)
+target_link_libraries(mfq-engine PRIVATE mfq-host-memory)
 target_link_libraries(mfq-engine PUBLIC
     mfq-tensor
     mfq-model-source

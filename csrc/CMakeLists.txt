@@ -71,6 +71,16 @@ endif()
 # Common code is split by responsibility. JSON is defined first because the
 # canonical model graph and several public policy headers consume it.
 add_subdirectory(components/json)
+add_library(mfq-host-memory STATIC components/host_memory.cpp)
+target_include_directories(mfq-host-memory PUBLIC ${PROJECT_SOURCE_DIR})
+target_compile_features(mfq-host-memory PUBLIC cxx_std_17)
+set_target_properties(mfq-host-memory PROPERTIES POSITION_INDEPENDENT_CODE ON)
+if(WIN32)
+    target_link_libraries(mfq-host-memory PRIVATE psapi)
+endif()
+if(MSVC)
+    target_compile_options(mfq-host-memory PRIVATE /EHsc)
+endif()
 add_subdirectory(engine/weights/encoding)
 add_subdirectory(engine/models/source)
 add_subdirectory(engine/backends/cpu)
@@ -116,6 +126,7 @@ target_include_directories(mfq-core INTERFACE
     ${PROJECT_SOURCE_DIR}/engine
 )
 target_link_libraries(mfq-core INTERFACE
+    mfq-host-memory
     mfq-host-parallel
     mfq-model-graph
     mfq-model-source
