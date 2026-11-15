@@ -299,6 +299,11 @@ public:
             reserve(growth,std::size_t(64)<<20);
         }
         auto output=captured ? std::move(*captured) : batch_->decode(rows,std::move(ids),host);
+        if (!captured) {
+            std::vector<models::BatchState*> states;
+            for (const auto& row:rows) if (row.eligible) states.push_back(row.state);
+            submit_batch(executor_,std::span<const Tensor>{&output,1},states);
+        }
         std::vector<std::int64_t> selected;
         if (greedy) {
             selected=ops::read_integers(captured ? output : ops::sample_greedy(ops::contiguous(output)));

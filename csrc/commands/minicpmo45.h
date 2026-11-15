@@ -4,9 +4,9 @@
 #include <string>
 #include <string_view>
 
+namespace tyloi::commands { class ArgCursor; }
 namespace tyloi::cuda {
 class Program;
-namespace commands { class ArgCursor; }
 
 namespace minicpmo45 {
 
@@ -22,7 +22,7 @@ struct CommandOptions {
 
 bool parse_command_option(
     std::string_view option,
-    commands::ArgCursor& args,
+    tyloi::commands::ArgCursor& args,
     CommandOptions& result);
 void validate_command_options(const CommandOptions& options);
 

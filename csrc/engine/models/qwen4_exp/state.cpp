@@ -331,6 +331,18 @@ std::vector<std::pair<tyloi::Device, std::size_t>> State::graph_exit_growth() co
 std::vector<std::pair<tyloi::Device, std::size_t>> State::growth(
         const tyloi::models::Input& input, const tyloi::models::ForwardOptions& options) const {
     const auto [input_batch, tokens] = input.shape();
+    return plan_growth(input_batch, tokens, input, options);
+}
+
+std::vector<std::pair<Device, std::size_t>> State::batch_growth(std::int64_t tokens) const {
+    tyloi::models::ForwardOptions options;
+    options.primary = model_.device.index;
+    return plan_growth(1, tokens, {}, options);
+}
+
+std::vector<std::pair<Device, std::size_t>> State::plan_growth(std::int64_t input_batch,
+        std::int64_t tokens, const tyloi::models::Input& input,
+        const tyloi::models::ForwardOptions& options) const {
     if (batch <= 0 || input_batch != batch || input.cache_positions ||
         (input.suffix && (input.confirmed != 0 || batch != 1 || cache_pos <= 0 ||
                           !model_.supports_suffix_speculation())) ||

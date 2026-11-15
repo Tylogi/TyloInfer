@@ -11,6 +11,10 @@ class Budget;
 void reserve_batch(Budget& budget, Device device, const models::BatchGrowth& values,
     std::size_t margin, bool primary = false);
 
+/** Submit numerical outputs together with request state retained for later steps. */
+void submit_batch(Executor& executor, std::span<const Tensor> outputs,
+    std::span<models::BatchState* const> states);
+
 /** Drive model batch prefill events using the executor's working-set owner. */
 std::vector<Tensor> prefill_batch(models::Batch& batch, Executor& executor, weights::Cache& weights,
     Budget& budget, Device device, std::vector<models::BatchState*> states, std::vector<Tensor> ids);

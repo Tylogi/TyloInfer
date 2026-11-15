@@ -417,6 +417,8 @@ add_library(mfq-metal-engine STATIC
     ${TYLOINFER_METAL_ROOT}/native/device.cpp
 )
 mfq_configure_metal(mfq-metal-engine)
+target_compile_definitions(mfq-metal-engine PRIVATE
+    TYLOINFER_MLX_METALLIB_DEFAULT="${TYLOINFER_MLX_METALLIB_DEFAULT}")
 target_link_libraries(mfq-metal-engine PUBLIC mfq-engine mfq-metal-ops
     PRIVATE mfq-jaccl
     ${TYLOINFER_METAL_FRAMEWORK} ${TYLOINFER_FOUNDATION_FRAMEWORK}
@@ -721,6 +723,23 @@ add_test(NAME mfq-qsa-kv-offload-test COMMAND mfq-qsa-kv-offload-test)
 add_executable(mfq-decode-metal
     ${PROJECT_SOURCE_DIR}/backends/metal/apps/mfq_decode_mlx.cpp
 )
+if(TARGET mfq-transport)
+    add_executable(tyloi-engine
+        ${PROJECT_SOURCE_DIR}/apps/runtime_main.cpp
+        ${PROJECT_SOURCE_DIR}/commands/runtime.cpp
+        ${PROJECT_SOURCE_DIR}/commands/cli.cpp
+    )
+    target_link_libraries(tyloi-engine PRIVATE mfq-metal-engine mfq-transport)
+    target_include_directories(tyloi-engine PRIVATE ${PROJECT_SOURCE_DIR})
+    target_compile_definitions(tyloi-engine PRIVATE
+        TYLOINFER_CLI_CUDA=0 TYLOINFER_CLI_METAL=1)
+    target_compile_features(tyloi-engine PRIVATE cxx_std_20)
+    target_link_options(tyloi-engine PRIVATE -Wl,-dead_strip)
+    set_target_properties(tyloi-engine PROPERTIES
+        BUILD_RPATH "@executable_path/lib"
+        BUILD_WITH_INSTALL_RPATH ON
+        INSTALL_RPATH "@executable_path/lib")
+endif()
 add_dependencies(mfq-decode-metal mfq-avfoundation-video)
 target_link_libraries(mfq-decode-metal PRIVATE
     mfq-metal-runtime
@@ -728,8 +747,7 @@ target_link_libraries(mfq-decode-metal PRIVATE
 )
 target_include_directories(mfq-decode-metal PRIVATE ${TYLOINFER_METAL_INCLUDE_DIRS})
 target_compile_definitions(mfq-decode-metal PRIVATE
-    TYLOINFER_ENABLE_MFQ_COMPAT=$<BOOL:${TYLOINFER_ENABLE_MFQ_COMPAT}>
-    TYLOINFER_MLX_METALLIB_DEFAULT="${TYLOINFER_MLX_METALLIB_DEFAULT}")
+    TYLOINFER_ENABLE_MFQ_COMPAT=$<BOOL:${TYLOINFER_ENABLE_MFQ_COMPAT}>)
 target_compile_features(mfq-decode-metal PRIVATE cxx_std_20)
 target_link_options(mfq-decode-metal PRIVATE -Wl,-dead_strip)
 
@@ -760,7 +778,7 @@ set_target_properties(mfq-decode-metal PROPERTIES
     INSTALL_RPATH "@executable_path/lib"
 )
 
-# Both native executables live in this binary directory and use the same
+# Native executables live in this binary directory and use the same
 # relocatable MLX runtime bundle. A single dependency target prevents parallel
 # links from copying the same runtime files at once.
 set(_TYLOINFER_METAL_RUNTIME_BUNDLE_DIR
@@ -797,6 +815,9 @@ if(TYLOINFER_BUILD_PRECOMPILED_METAL)
         VERBATIM)
     add_custom_target(mfq-metal-precompiled DEPENDS "${_TYLOINFER_AOT_ROOT}/manifest.json")
     add_dependencies(mfq-decode-metal mfq-metal-precompiled)
+    if(TARGET tyloi-engine)
+        add_dependencies(tyloi-engine mfq-metal-precompiled)
+    endif()
 endif()
 set(_TYLOINFER_METAL_RUNTIME_BUNDLE_STAMP
     "${_TYLOINFER_METAL_RUNTIME_BUNDLE_DIR}/.mfq-runtime-bundle.stamp")
@@ -837,6 +858,9 @@ add_custom_command(
 add_custom_target(mfq-metal-runtime-bundle
     DEPENDS "${_TYLOINFER_METAL_RUNTIME_BUNDLE_STAMP}")
 add_dependencies(mfq-decode-metal mfq-metal-runtime-bundle)
+if(TARGET tyloi-engine)
+    add_dependencies(tyloi-engine mfq-metal-runtime-bundle)
+endif()
 
 add_executable(tyloinfer-metal-native-projection-test ${PROJECT_SOURCE_DIR}/backends/metal/tests/mlx_mx_test.cpp)
 target_link_libraries(tyloinfer-metal-native-projection-test PRIVATE mfq-metal-runtime)

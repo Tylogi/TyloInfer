@@ -30,6 +30,16 @@ void reserve_batch(Budget& budget, Device primary_device, const models::BatchGro
         if(bytes || (primary && device==primary_device))budget.reserve_kv(device,prefill_budget_add(bytes,margin));
 }
 
+void submit_batch(Executor& executor, std::span<const Tensor> outputs,
+        std::span<models::BatchState* const> states) {
+    std::vector<Tensor> retained(outputs.begin(),outputs.end());
+    for(const auto* state:states) {
+        auto storage=state->storage();
+        retained.insert(retained.end(),storage.begin(),storage.end());
+    }
+    executor.submit(retained);
+}
+
 std::vector<Tensor> prefill_batch(models::Batch& batch, Executor& executor, weights::Cache& weights,
         Budget& budget, Device device, std::vector<models::BatchState*> states, std::vector<Tensor> ids) {
     Capture capture(executor,weights,budget,device);
@@ -38,7 +48,7 @@ std::vector<Tensor> prefill_batch(models::Batch& batch, Executor& executor, weig
     StepSequence<std::vector<Tensor>> job;
     std::optional<std::vector<Tensor>> result;
     try {
-        job=batch.prefill(std::move(states),std::move(ids));
+        job=batch.prefill(states,std::move(ids));
         for(;;) {
             StepResult<std::vector<Tensor>> step;
             { auto scope=work->enter(); step=job.next(); }
@@ -86,7 +96,7 @@ std::vector<Tensor> prefill_batch(models::Batch& batch, Executor& executor, weig
         }
         if(!result)throw std::runtime_error("batch prefill ended without a result");
         if(loan)throw std::logic_error("batch prefill ended while workspace is borrowed");
-        executor.submit(*result);
+        submit_batch(executor,*result,states);
         capture.finish(); work->finish(); job={}; return std::move(*result);
     } catch(...) {
         auto failure=std::current_exception();
@@ -141,6 +151,11 @@ std::optional<Tensor> capture_batch(models::Batch& batch, Executor& executor,
             else if (step.value) result.emplace(std::move(*step.value));
         }
         if (!result) throw std::runtime_error("batch capture ended without a result");
+        if (*result) {
+            std::vector<models::BatchState*> states;
+            for (const auto& row:rows) if (row.eligible) states.push_back(row.state);
+            submit_batch(executor,std::span<const Tensor>{&**result,1},states);
+        }
         capture.finish(); job={}; return std::move(*result);
     } catch (...) {
         auto failure=std::current_exception();

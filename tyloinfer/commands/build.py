@@ -141,6 +141,11 @@ def load_managed_build(backend: str) -> ManagedBuild | None:
     source_dir = Path(record["source_dir"]).expanduser().resolve()
     if source_dir != (root / "csrc").resolve():
         return None
+    if backend in {"cuda", "metal"} and (
+        record["target"] != "tyloi-engine"
+        or Path(record["executable"]).name != "tyloi-engine" + (".exe" if os.name == "nt" else "")
+    ):
+        return None
     return ManagedBuild(
         backend=backend,
         source_dir=source_dir,
@@ -241,7 +246,7 @@ def _mlx_root() -> Path:
 
 def runtime_executable(build_dir: Path, backend: str) -> Path:
     if backend == "metal":
-        return build_dir / "metal" / "mfq-decode-metal"
+        return build_dir / "metal" / "tyloi-engine"
     suffix = ".exe" if os.name == "nt" else ""
     return build_dir / f"tyloi-engine{suffix}"
 
@@ -274,7 +279,7 @@ def create_build_plan(
         raise BuildError("cmake was not found; install CMake 3.26 or newer")
     output = (build_dir or root / "build" / "csrc").expanduser().resolve()
     source = root / "csrc"
-    target = "mfq-decode-metal" if selected == "metal" else "tyloi-engine"
+    target = "tyloi-engine"
     configure = [
         cmake,
         "-S",

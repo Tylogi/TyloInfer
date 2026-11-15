@@ -1,14 +1,15 @@
-#include "engine/backends/cuda/native/env.h"
 #include "cli.h"
 #include "run.h"
+#include "engine/config.h"
 #include "engine/engine.h"
 #include "engine/load.h"
+#if TYLOINFER_CLI_CUDA
 #include "minicpmo45.h"
 #include "engine/program.h"
+#endif
 #include "engine/models/source.h"
 #include "engine/models/source/model_config.h"
 #include "transport/include/transport.h"
-#include "engine/generation/mtp/limits.h"
 #include "nlohmann/json.hpp"
 
 #include <cstddef>
@@ -24,7 +25,7 @@
 #include <utility>
 #include <vector>
 
-namespace tyloi::cuda::commands {
+namespace tyloi::commands {
 namespace {
 
 class Reload {
@@ -58,13 +59,16 @@ private:
 
 void print_help() {
     std::cout
-        << "MFQ native CUDA runtime\n\n"
+        << "TyloInfer runtime\n\n"
         << "Usage:\n"
         << "  tyloi-engine --model MODEL --transport stdio|http [OPTIONS]\n"
+#if TYLOINFER_CLI_CUDA
         << "  tyloi-engine --model MODEL --minicpmo-input-prefix PREFIX "
            "--minicpmo-output-prefix PREFIX [OPTIONS]\n"
         << "  tyloi-engine --model MODEL --minicpmo-duplex-input-prefix PREFIX "
-           "--minicpmo-duplex-output-prefix PREFIX [OPTIONS]\n\n"
+           "--minicpmo-duplex-output-prefix PREFIX [OPTIONS]\n"
+#endif
+        << '\n'
         << "Runtime options:\n"
         << "  --model PATH                    model or split-model shard\n"
         << "  --inspect-model-json            inspect metadata without loading GPU weights\n"
@@ -79,10 +83,11 @@ void print_help() {
         << "  --prefill-chunk-size auto|N     compute chunk limit (default auto, max 8192)\n"
         << "  --tokenizer PATH                external tokenizer GGUF\n"
         << "  --ctx-size N                    context size; 0 selects a default\n"
+        << "  --moe-gpu-cache-gb N            bounded MoE GPU cache\n"
+#if TYLOINFER_CLI_CUDA
         << "  -t, --threads N                 positive CPU thread count\n"
         << "  -ngl, --n-gpu-layers N          non-negative GPU layer count\n"
         << "  --cpu-offload-layers RANGES     explicit CPU-offloaded layers\n"
-        << "  --moe-gpu-cache-gb N            bounded MoE GPU cache\n"
         << "  --moe-cache-profile PATH        MoE cache profile\n"
         << "  --tensor-parallel DEVICES       device count or comma-separated IDs\n"
         << "  --tensor-split WEIGHTS          tensor-parallel weights\n"
@@ -90,6 +95,7 @@ void print_help() {
         << "  --expert-split WEIGHTS          expert-parallel weights\n"
         << "  --layer-parallel DEVICES        layer-placement devices\n"
         << "  --layer-split WEIGHTS           layer-placement weights\n"
+#endif
         << "  -h, --help                      show this help\n";
 }
 
@@ -104,12 +110,21 @@ struct RuntimeOptions : tyloi::engine::EngineOptions {
 };
 
 struct RuntimeCommandOptions
-    : RuntimeOptions,
-      tyloi::cuda::minicpmo45::CommandOptions {};
+    : RuntimeOptions
+#if TYLOINFER_CLI_CUDA
+    , tyloi::cuda::minicpmo45::CommandOptions
+#endif
+{};
 
 RuntimeCommandOptions parse_runtime(ArgCursor& args) {
     RuntimeCommandOptions result;
+#if TYLOINFER_CLI_CUDA
     result.device = tyloi::Device(tyloi::DeviceType::cuda);
+#elif TYLOINFER_CLI_METAL
+    result.device = tyloi::Device(tyloi::DeviceType::metal);
+#else
+#error "tyloi-engine requires a selected runtime backend"
+#endif
     bool transport_option = false;
     while (!args.empty()) {
         const std::string_view option = args.next();
@@ -117,11 +132,13 @@ RuntimeCommandOptions parse_runtime(ArgCursor& args) {
             print_help();
             throw HelpRequested{};
         }
-        if (parse_cuda_load_option(option, args, result)) continue;
+        if (parse_load_option(option, args, result)) continue;
+#if TYLOINFER_CLI_CUDA
         if (tyloi::cuda::minicpmo45::parse_command_option(
                 option, args, result)) {
             continue;
         }
+#endif
         if (option == "--inspect-model-json") {
             result.inspect_model_json = true;
         }
@@ -178,14 +195,20 @@ RuntimeCommandOptions parse_runtime(ArgCursor& args) {
     }
 
     if (result.model_path.empty()) usage_error("--model is required");
+    int modes = static_cast<int>(result.transport_mode) +
+        static_cast<int>(result.inspect_model_json);
+#if TYLOINFER_CLI_CUDA
     tyloi::cuda::minicpmo45::validate_command_options(result);
-    const int modes = static_cast<int>(result.transport_mode) +
-        static_cast<int>(result.inspect_model_json) +
+    modes +=
         static_cast<int>(!result.input_prefix.empty()) +
         static_cast<int>(!result.duplex_input_prefix.empty());
+#endif
     if (modes != 1) {
-        usage_error("select exactly one execution mode: --inspect-model-json, --transport, "
-                    "MiniCPM-o composite, or MiniCPM-o duplex");
+        usage_error("select exactly one execution mode: --inspect-model-json or --transport"
+#if TYLOINFER_CLI_CUDA
+                    ", MiniCPM-o composite, or MiniCPM-o duplex"
+#endif
+        );
     }
     if (transport_option && !result.transport_mode) {
         usage_error("transport options require --transport");
@@ -221,7 +244,7 @@ int run_transport_runtime(RuntimeOptions& options) {
     auto engine = tyloi::engine::load(options);
     const auto info = engine->info();
     if (options.transport_api_key.empty()) {
-        const char* env_key = tyloi::cuda::env_lookup("TYLOINFER_API_KEY");
+        const char* env_key = tyloi::engine::environment_value("TYLOINFER_API_KEY");
         if (env_key != nullptr) options.transport_api_key = env_key;
     }
 
@@ -256,7 +279,7 @@ int run_transport_runtime(RuntimeOptions& options) {
 }
 
 int execute_runtime(RuntimeCommandOptions options) {
-    return tyloi::cuda::internal::with_command_errors([&]() -> int {
+    return with_command_errors([&]() -> int {
         if (options.inspect_model_json) {
             const auto source = tyloi::open_model_source(options.model_path);
             nlohmann::json result{{"architecture", source->architecture()},
@@ -276,14 +299,15 @@ int execute_runtime(RuntimeCommandOptions options) {
             return 0;
         }
         if (options.stdio_mode) prepare_mfq_stdio_transport();
-        if (options.duplex_input_prefix.empty() &&
-                options.input_prefix.empty()) {
-            return run_transport_runtime(options);
+#if TYLOINFER_CLI_CUDA
+        if (!options.duplex_input_prefix.empty() || !options.input_prefix.empty()) {
+            auto program = tyloi::cuda::Program::open(options);
+            return !options.duplex_input_prefix.empty()
+                ? tyloi::cuda::minicpmo45::run_duplex(*program, options)
+                : tyloi::cuda::minicpmo45::run_composite(*program, options);
         }
-        auto program = tyloi::cuda::Program::open(options);
-        return !options.duplex_input_prefix.empty()
-            ? tyloi::cuda::minicpmo45::run_duplex(*program, options)
-            : tyloi::cuda::minicpmo45::run_composite(*program, options);
+#endif
+        return run_transport_runtime(options);
     });
 }
 
@@ -301,4 +325,4 @@ int run_runtime(int argc, char** argv) {
     }
 }
 
-} // namespace tyloi::cuda::commands
+} // namespace tyloi::commands

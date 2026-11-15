@@ -77,7 +77,7 @@ inline constexpr auto with_model = []<typename F>(
     auto load_tts = [&] {
         auto started = std::chrono::steady_clock::now();
         auto definition = tyloi::models::config_json(*source, options.config_path);
-        definition = configure_yarn(config.yarn, config.yarn_context_extension, std::move(definition),
+        definition = tyloi::models::configure_yarn(config.yarn, config.yarn_context_extension, std::move(definition),
             tyloi::models::graph(*source).backbone, options.context_size);
         auto owner = std::make_shared<minicpmo45::Model>(
             minicpmo45::read(source, definition, options.context_size));
@@ -120,7 +120,7 @@ inline constexpr auto with_model = []<typename F>(
                 auto executor = root.fork(model_parallel_primary_device(config));
                 const bool preallocate = ::tyloi::cuda::options::kv_vram_preallocated();
                 auto definition = tyloi::models::config_json(*source, options.config_path);
-                definition = configure_yarn(config.yarn, config.yarn_context_extension,
+                definition = tyloi::models::configure_yarn(config.yarn, config.yarn_context_extension,
                     std::move(definition), tyloi::models::graph(*source).backbone, options.context_size);
                 owner = ::tyloi::models::qwen35::load(
                     source, definition, weights, config.layer_placement,
@@ -147,7 +147,7 @@ inline constexpr auto with_model = []<typename F>(
         case ::tyloi::models::Backbone::minicpmo45: {
             auto started = std::chrono::steady_clock::now();
             auto definition = tyloi::models::config_json(*source, options.config_path);
-            definition = configure_yarn(config.yarn, config.yarn_context_extension,
+            definition = tyloi::models::configure_yarn(config.yarn, config.yarn_context_extension,
                 std::move(definition), tyloi::models::graph(*source).backbone, options.context_size);
             auto owner = std::make_shared<minicpmo45::text::Model>(
                 minicpmo45::text::read(source, definition, options.context_size));
@@ -170,7 +170,7 @@ inline constexpr auto with_model = []<typename F>(
         case ::tyloi::models::Backbone::glm_dsa: {
             auto started = std::chrono::steady_clock::now();
             auto definition = tyloi::models::config_json(*source, options.config_path);
-            definition = configure_yarn(config.yarn, config.yarn_context_extension,
+            definition = tyloi::models::configure_yarn(config.yarn, config.yarn_context_extension,
                 std::move(definition), tyloi::models::graph(*source).backbone, options.context_size);
             auto owner = std::make_shared<glm_dsa::Model>(
                 glm_dsa::read(source, definition, options.context_size));
@@ -192,7 +192,7 @@ inline constexpr auto with_model = []<typename F>(
         case ::tyloi::models::Backbone::glm5_next: {
             auto started = std::chrono::steady_clock::now();
             auto definition = tyloi::models::config_json(*source, options.config_path);
-            definition = configure_yarn(config.yarn, config.yarn_context_extension,
+            definition = tyloi::models::configure_yarn(config.yarn, config.yarn_context_extension,
                 std::move(definition), tyloi::models::graph(*source).backbone, options.context_size);
             auto owner = std::make_shared<glm5_next::Model>(
                 glm5_next::read(source, definition, options.context_size));
@@ -210,7 +210,7 @@ inline constexpr auto with_model = []<typename F>(
         case ::tyloi::models::Backbone::deepseek_v4: {
             auto started = std::chrono::steady_clock::now();
             auto definition = tyloi::models::config_json(*source, options.config_path);
-            definition = configure_yarn(config.yarn, config.yarn_context_extension,
+            definition = tyloi::models::configure_yarn(config.yarn, config.yarn_context_extension,
                 std::move(definition), tyloi::models::graph(*source).backbone, options.context_size);
             auto owner = std::make_shared<deepseek_v4::Model>(
                 deepseek_v4::read(source, definition, options.context_size));
@@ -238,7 +238,7 @@ inline constexpr auto with_model = []<typename F>(
         case ::tyloi::models::Backbone::deepseek_v41: {
             auto started = std::chrono::steady_clock::now();
             auto definition = tyloi::models::config_json(*source, options.config_path);
-            definition = configure_yarn(config.yarn, config.yarn_context_extension,
+            definition = tyloi::models::configure_yarn(config.yarn, config.yarn_context_extension,
                 std::move(definition), tyloi::models::graph(*source).backbone, options.context_size);
             auto weights = cache.loader(*source, config.weights,
                 {::tyloi::Device(::tyloi::kCUDA, config.layer_placement.primary_device()), config.drop_file_cache,
@@ -262,7 +262,7 @@ inline constexpr auto with_model = []<typename F>(
         case ::tyloi::models::Backbone::nemotron_h: {
             auto started = std::chrono::steady_clock::now();
             auto definition = tyloi::models::config_json(*source, options.config_path);
-            definition = configure_yarn(config.yarn, config.yarn_context_extension,
+            definition = tyloi::models::configure_yarn(config.yarn, config.yarn_context_extension,
                 std::move(definition), tyloi::models::graph(*source).backbone, options.context_size);
             auto owner = std::make_shared<nemotron_h::Model>(
                 nemotron_h::read(source, definition, options.context_size));

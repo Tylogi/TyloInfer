@@ -3,13 +3,16 @@
 #include "engine/config.h"
 #include "engine/backends/metal/executor/executor.h"
 #include "engine/backends/metal/native/stream.h"
+#include "engine/backends/metal/native/device.h"
 #include "engine/models/causal_model.h"
+#include "engine/models/common/load.h"
 #include "engine/models/state.h"
 #include "engine/models/load.h"
 #include "engine/models/prepare.h"
 #include "engine/models/session/cache.h"
 #include "engine/models/source.h"
 #include "engine/models/source/model_config.h"
+#include "engine/models/source/model_graph.h"
 #include "engine/requests/processor.h"
 #include "engine/state/session/sessions.h"
 #include "engine/weights/cache.h"
@@ -28,6 +31,7 @@ namespace tyloi::metal {
 using namespace tyloi::engine;
 namespace {
 std::unique_ptr<tyloi::Executor> executor() {
+    metal::initialize();
     return std::make_unique<metal::Executor>(std::make_shared<metal::Stream>(
         mlx::core::new_thread_unsafe_stream(mlx::core::Device::gpu)));
 }
@@ -41,14 +45,12 @@ void validate(const EngineOptions& options) {
         !options.tensor_parallel.devices.empty() || !options.expert_parallel.devices.empty() ||
         !options.layer_placement.devices.empty() || !options.layer_placement.split.empty())
         throw std::invalid_argument("Metal does not support CPU layer offload or parallel placement");
-    if (options.cpu_threads_set || options.cpu_threads || options.yarn_context_extension)
-        throw std::invalid_argument("Metal does not support thread or YaRN load options");
+    if (options.cpu_threads_set || options.cpu_threads)
+        throw std::invalid_argument("Metal does not support thread load options");
     if (!std::isfinite(options.moe_gpu_cache_gb) || options.moe_gpu_cache_gb < 0)
         throw std::invalid_argument("expert cache budget must be finite and non-negative");
     if (!options.moe_cache_profile_path.empty())
         throw std::invalid_argument("Metal expert cache profiles are not supported");
-    if (options.continuous_batching)
-        throw std::invalid_argument("Metal continuous batching is not supported");
 }
 
 std::unique_ptr<Engine> assemble(EngineOptions options, Engine* target) {
@@ -91,6 +93,8 @@ std::unique_ptr<Engine> assemble(EngineOptions options, Engine* target) {
             models::LoadOptions policy;
             policy.context = options.context_size;
             policy.kv_quantization = quantization;
+            definition = models::configure_yarn(policy.yarn, options.yarn_context_extension,
+                std::move(definition), models::graph(*source).backbone, options.context_size);
             models::load(model, source, definition, loader, placement, policy);
             state = model->make_state();
             if (model->predictor()) predictor_execution = executor();

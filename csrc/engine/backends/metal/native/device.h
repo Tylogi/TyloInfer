@@ -9,6 +9,8 @@
 #endif
 
 namespace tyloi::metal {
+// Configure the process-wide MLX runtime before creating streams or loading weights.
+void initialize();
 int metal_apple_gpu_core_count() noexcept;
 
 inline const std::string& mlx_apple_chip_name() noexcept {

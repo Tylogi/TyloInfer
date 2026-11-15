@@ -7,6 +7,7 @@ if(TARGET mfq-transport)
     )
     target_link_libraries(tyloi-engine PRIVATE
         mfq-cuda-eval mfq-transport)
+    target_compile_definitions(tyloi-engine PRIVATE TYLOINFER_CLI_CUDA=1 TYLOINFER_CLI_METAL=0)
 endif()
 
 if(TYLOINFER_BUILD_DIAGNOSTICS)
@@ -14,6 +15,7 @@ if(TYLOINFER_BUILD_DIAGNOSTICS)
         ${PROJECT_SOURCE_DIR}/apps/diagnostics_main.cpp
         ${PROJECT_SOURCE_DIR}/commands/diagnostics.cpp
         ${PROJECT_SOURCE_DIR}/commands/cli.cpp
+        ${PROJECT_SOURCE_DIR}/commands/cli_cuda.cpp
         ${PROJECT_SOURCE_DIR}/commands/minicpmo45.cpp
     )
     target_link_libraries(mfq-diagnostics PRIVATE mfq-cuda-diagnostics mfq-cuda-eval)

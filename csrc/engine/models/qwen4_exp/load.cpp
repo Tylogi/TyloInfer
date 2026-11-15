@@ -196,7 +196,7 @@ void read(Model& model, std::shared_ptr<const tyloi::ModelSource> model_source,
 
 void load(Model& model, const tyloi::weights::Loader& tensors, LayerPlacementConfig& placement,
           const tyloi::models::LoadOptions& options, bool load_layers) {
-    validate_native_placement(tensors.placement.tensor, placement, options.gpu_layers);
+    tyloi::models::validate_native_placement(tensors.placement.tensor, placement, options.gpu_layers);
     if (placement.devices.empty()) placement.devices = {tensors.placement.target.index};
     if (placement.primary_device() != tensors.placement.target.index)
         throw std::invalid_argument("Qwen4 weight and layer primary devices differ");

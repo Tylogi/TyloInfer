@@ -150,7 +150,7 @@ Model read(std::shared_ptr<const tyloi::ModelSource> source, std::string_view de
 void load(Model& model, const ::tyloi::weights::Loader& weights,
           LayerPlacementConfig& placement, int gpu_layers, bool load_layers,
           bool load_input_output) {
-    validate_native_placement(weights.placement.tensor, placement, gpu_layers);
+    tyloi::models::validate_native_placement(weights.placement.tensor, placement, gpu_layers);
     placement.prepare(model.config.layers);
     MfqCudaGuard guard(placement.primary_device());
     if (load_input_output) {

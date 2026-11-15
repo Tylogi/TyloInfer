@@ -4,6 +4,7 @@
 #include "engine/backends/metal/native/resident_allocations.h"
 #include "engine/weights/memory.h"
 #include "engine/backends/metal/native/memory.h"
+#include "engine/backends/metal/native/device.h"
 #include "mfq_container.h"
 #include "mlx_deepseek_v4_causal_lm.h"
 #include "mlx_deepseek_v41_causal_lm.h"
@@ -22,7 +23,7 @@
 #include "nlohmann/json.hpp"
 
 #ifdef TYLOINFER_METAL_RUNTIME_COMMUNICATION
-#include "backends/cpu/storage/prefix_blocks.h"
+#include "engine/state/session/prefix_blocks.h"
 #include "transport.h"
 #include "mlx_paged_session_codec.h"
 #include "mlx_server_components.h"
@@ -58,7 +59,6 @@
 #include <mlx/mlx.h>
 
 #include <mach/mach.h>
-#include <mach-o/dyld.h>
 #include <malloc/malloc.h>
 #include <sys/sysctl.h>
 
@@ -580,66 +580,6 @@ std::size_t requested_cache_bytes(
         std::min(available_bytes, physical_memory_bytes() * 2 / 3));
 }
 
-std::filesystem::path executable_path() {
-    std::uint32_t size = 0;
-    (void)_NSGetExecutablePath(nullptr, &size);
-    std::vector<char> buffer(size + 1, '\0');
-    if (_NSGetExecutablePath(buffer.data(), &size) != 0) {
-        throw std::runtime_error("failed to resolve executable path");
-    }
-    std::error_code error;
-    const auto resolved =
-        std::filesystem::weakly_canonical(buffer.data(), error);
-    return error ? std::filesystem::path(buffer.data()) : resolved;
-}
-
-void configure_mlx_metal() {
-    if (std::getenv("MLX_MAX_MB_PER_BUFFER") == nullptr) {
-        ::setenv("MLX_MAX_MB_PER_BUFFER", "512", 0);
-    }
-    std::vector<std::filesystem::path> candidates;
-    if (const char* configured = std::getenv("TYLOINFER_MLX_METALLIB")) {
-        if (*configured != '\0') {
-            candidates.emplace_back(configured);
-        }
-    }
-    candidates.push_back(
-        executable_path().parent_path() / "lib" / "mlx.metallib");
-#ifdef TYLOINFER_MLX_METALLIB_DEFAULT
-    candidates.emplace_back(TYLOINFER_MLX_METALLIB_DEFAULT);
-#endif
-    for (const auto& candidate : candidates) {
-        std::error_code error;
-        if (std::filesystem::is_regular_file(candidate, error) && !error) {
-            mlx::core::metal::set_metallib_path(candidate.string());
-            mlx::core::set_default_device(mlx::core::Device::gpu);
-            // Set residency before loading weights: otherwise macOS can
-            // compress early layers while later layers are being loaded.
-            // This is a ceiling, not an allocation or a system-wide change.
-            try {
-                const auto& info = mlx::core::device_info();
-                const auto limit = std::get<std::size_t>(
-                    info.at("max_recommended_working_set_size"));
-                if (limit == 0) {
-                    throw std::runtime_error("device returned a zero limit");
-                }
-                tyloi::metal::set_wired_limit(limit);
-                std::cerr << "Metal wired memory limit: " << limit
-                          << " bytes (device recommendation)\n";
-            } catch (const std::exception& error) {
-                if (__builtin_available(macOS 15, *)) {
-                    throw;
-                }
-                std::cerr << "Warning: Metal memory residency unavailable: "
-                          << error.what() << "\n";
-            }
-            return;
-        }
-    }
-    throw std::runtime_error(
-        "cannot locate mlx.metallib; set TYLOINFER_MLX_METALLIB or keep "
-        "lib/mlx.metallib beside mfq-decode-metal");
-}
 
 void self_test_metal() {
     using namespace mlx::core;
@@ -3431,7 +3371,7 @@ int main(int argc, char** argv) {
             return EXIT_SUCCESS;
         }
         if (arguments.self_test_metal) {
-            configure_mlx_metal();
+            tyloi::metal::initialize();
             self_test_metal();
         }
         if (arguments.mfq.empty()) {
@@ -3482,7 +3422,7 @@ int main(int argc, char** argv) {
         }
 
         if (!arguments.tensor.empty()) {
-            configure_mlx_metal();
+            tyloi::metal::initialize();
             tyloi::metal::AllocationScope::Log allocation_log;
             tyloi::metal::AllocationScope allocation_scope(
                 tyloi::metal::wired_limit() ? &allocation_log : nullptr);
@@ -3728,7 +3668,7 @@ int main(int argc, char** argv) {
                 << "\n";
         }
         if (arguments.server) {
-            configure_mlx_metal();
+            tyloi::metal::initialize();
 #ifdef TYLOINFER_METAL_RUNTIME_COMMUNICATION
             auto [inference_engine, transport] = load_runtime(arguments, model);
             MfqRuntime runtime(std::move(inference_engine), std::move(transport));

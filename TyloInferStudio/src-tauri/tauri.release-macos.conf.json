@@ -4,6 +4,7 @@
       "dmg"
     ],
     "externalBin": [
+      "../../packaging/sidecars/tyloi-engine",
       "../../packaging/sidecars/mfq-decode-metal"
     ],
     "resources": {

@@ -406,10 +406,10 @@ def _run_locked(args: argparse.Namespace, identity: dict[str, str | int]) -> int
             ),
             huggingface=(binary_dir / "hf") if (binary_dir / "hf").is_file() else None,
             runtime=executable,
-            diagnostics=(
-                executable.with_name("mfq-diagnostics" + executable.suffix)
-                if selected_backend == "cuda" else executable
-            ),
+            diagnostics=executable.with_name({
+                "cuda": "mfq-diagnostics" + executable.suffix,
+                "metal": "mfq-decode-metal",
+            }.get(selected_backend, executable.name)),
             standalone_cli=bool(getattr(sys, "frozen", False)),
             internal_modelscope=importlib.util.find_spec("modelscope_hub") is not None,
             internal_huggingface=importlib.util.find_spec("huggingface_hub") is not None,

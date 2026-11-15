@@ -14,29 +14,15 @@
 #include <type_traits>
 #include <vector>
 
-enum class KlMmqMode;
-
-namespace tyloi::cuda {
+namespace tyloi::commands {
 
 struct TokenInputOptions {
     std::string ids_arg, ids_file;
     int gen = 16;
 };
 
-} // namespace tyloi::cuda
-
-namespace tyloi::cuda::internal {
-
-std::vector<int64_t> parse_ids(const std::string& value);
-KlMmqMode parse_kl_mmq_mode(const std::string& value);
-std::vector<KlMmqMode> parse_kl_mmq_sequence(const std::string& value);
-std::vector<int64_t> load_ids_file(const std::string& path);
-
 int with_command_errors(const std::function<int()>& fn);
-
-} // namespace tyloi::cuda::internal
-
-namespace tyloi::cuda::commands {
+std::vector<std::string> split_csv_values(const std::string& value, const char* option);
 
 struct HelpRequested {};
 
@@ -124,7 +110,7 @@ inline double number(const std::string& text, std::string_view option) {
     return result;
 }
 
-bool parse_cuda_load_option(
+bool parse_load_option(
     std::string_view option,
     ArgCursor& args,
     tyloi::engine::LoadOptions& result);
@@ -151,4 +137,4 @@ inline int print_usage_error(const UsageError& error) {
     return 2;
 }
 
-} // namespace tyloi::cuda::commands
+} // namespace tyloi::commands

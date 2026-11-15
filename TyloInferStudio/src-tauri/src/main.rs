@@ -421,11 +421,9 @@ fn mfq_program(app: &AppHandle) -> Result<(PathBuf, bool), String> {
 }
 
 fn packaged_runtime(app: &AppHandle) -> Option<PathBuf> {
-    #[cfg(target_os = "macos")]
-    let names = ["mfq-decode-metal"];
     #[cfg(target_os = "windows")]
     let names = ["tyloi-engine.exe"];
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(unix)]
     let names = ["tyloi-engine"];
     packaged_executable(app, &names)
 }

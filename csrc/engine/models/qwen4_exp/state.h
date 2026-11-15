@@ -76,6 +76,7 @@ public:
     void set_position_delta(std::int64_t delta) noexcept override { decode_position_delta = delta; }
     std::vector<std::pair<tyloi::Device, std::size_t>> growth(
         const tyloi::models::Input&, const tyloi::models::ForwardOptions&) const override;
+    std::vector<std::pair<Device, std::size_t>> batch_growth(std::int64_t tokens) const;
     std::vector<std::pair<tyloi::Device, std::size_t>> graph_exit_growth() const override;
     std::vector<::tyloi::Tensor> storage() const override;
     std::vector<tyloi::Tensor*> graph_state() override;
@@ -116,6 +117,8 @@ public:
     bool speculative_prefix_retention = false;
 
 private:
+    std::vector<std::pair<Device, std::size_t>> plan_growth(std::int64_t input_batch,
+        std::int64_t tokens, const tyloi::models::Input&, const tyloi::models::ForwardOptions&) const;
     friend tyloi::models::SnapshotSize snapshot_size(const State&, const tyloi::models::Mtp*);
     const Model& model_;
 };

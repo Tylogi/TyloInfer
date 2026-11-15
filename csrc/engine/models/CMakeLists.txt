@@ -9,6 +9,7 @@ set(TYLOINFER_MODEL_ASSEMBLY_SOURCES
     ${PROJECT_SOURCE_DIR}/engine/models/qwen4_exp/components.cpp
     ${PROJECT_SOURCE_DIR}/engine/models/qwen4_exp/load.cpp
     ${PROJECT_SOURCE_DIR}/engine/models/qwen4_exp/predictor.cpp
+    ${PROJECT_SOURCE_DIR}/engine/models/qwen4_exp/batch.cpp
 )
 set(TYLOINFER_MODEL_ASSEMBLY_SOURCES "${TYLOINFER_MODEL_ASSEMBLY_SOURCES}" PARENT_SCOPE)
 
@@ -47,6 +48,5 @@ set(TYLOINFER_MODELS_CUDA_SOURCES
     ${PROJECT_SOURCE_DIR}/engine/models/qwen35/components.cpp
     ${PROJECT_SOURCE_DIR}/engine/models/groups.cpp
     ${PROJECT_SOURCE_DIR}/engine/models/ffn.cpp
-    ${PROJECT_SOURCE_DIR}/engine/models/qwen4_exp/batch.cpp
 )
 set(TYLOINFER_MODELS_CUDA_SOURCES "${TYLOINFER_MODELS_CUDA_SOURCES}" PARENT_SCOPE)

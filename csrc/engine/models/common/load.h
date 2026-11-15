@@ -221,12 +221,11 @@ void load_important_neuron_branch(
     const std::string& gate_name,
     const std::string& up_name);
 
-void validate_native_placement(const ParallelConfig&, const LayerPlacementConfig&, int gpu_layers);
-
-namespace tyloi::cuda {
+namespace tyloi::models {
 
 std::string configure_yarn(tyloi::ops::YarnScaling& yarn, bool extend, std::string definition,
                            std::string_view backbone, int64_t context);
 
+void validate_native_placement(const ParallelConfig&, const LayerPlacementConfig&, int gpu_layers);
 
-} // namespace tyloi::cuda
+} // namespace tyloi::models

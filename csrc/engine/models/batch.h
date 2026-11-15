@@ -40,6 +40,8 @@ public:
     virtual std::int64_t position() const = 0;
     /** Return resident bytes owned by this request. */
     virtual std::size_t resident_bytes() const = 0;
+    /** Return state tensors that must be submitted after numerical execution. */
+    virtual std::vector<Tensor> storage() const { return {}; }
     /** Return backing required before initializing this request. */
     virtual BatchGrowth initial_growth_bytes() const = 0;
     /** Initialize request backing after runtime admission. */

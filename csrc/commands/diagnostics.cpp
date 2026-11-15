@@ -1,5 +1,6 @@
 #include "run.h"
 #include "cli.h"
+#include "cli_cuda.h"
 #include "minicpmo45.h"
 #include "engine/program.h"
 #include "engine/models/causal_model.h"
@@ -45,7 +46,7 @@
 
 namespace tyloi::cuda {
 
-struct DiagnosticsCommandOptions : tyloi::engine::LoadOptions, TokenInputOptions {
+struct DiagnosticsCommandOptions : tyloi::engine::LoadOptions, tyloi::commands::TokenInputOptions {
     std::string check_linear, check_linear_cpu, check_linear_gate;
     std::string check_tp_linear, check_ep_moe;
     std::string check_tp_axis_arg = "output";
@@ -222,6 +223,7 @@ struct DiagnosticsCommandOptions : tyloi::engine::LoadOptions, TokenInputOptions
 } // namespace tyloi::cuda
 
 using namespace tyloi::cuda::internal;
+using tyloi::commands::with_command_errors;
 
 using namespace tyloi::cuda::diagnostics;
 
@@ -435,6 +437,7 @@ int execute_diagnostics_command(DiagnosticsCommandOptions options) {
 } // namespace tyloi::cuda
 
 namespace tyloi::cuda::commands {
+using namespace tyloi::commands;
 namespace {
 
 void print_diagnostics_help() {
@@ -664,7 +667,7 @@ DiagnosticsCommandOptions parse_diagnostics(ArgCursor& args) {
             print_diagnostics_help();
             throw HelpRequested{};
         }
-        if (parse_cuda_load_option(option, args, result) ||
+        if (parse_load_option(option, args, result) ||
                 parse_token_input_option(option, args, result) ||
                 parse_diagnostic_switch(option, result)) {
             continue;

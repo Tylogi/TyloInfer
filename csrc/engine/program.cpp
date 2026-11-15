@@ -80,7 +80,7 @@ Assembly assembly(const tyloi::engine::LoadOptions& options, CudaLoadConfig& con
         Executor& executor, weights::Cache& weights, const ModelSource& source,
         bool components) {
     auto definition = models::config_json(source, options.config_path);
-    definition = configure_yarn(config.yarn, config.yarn_context_extension,
+    definition = tyloi::models::configure_yarn(config.yarn, config.yarn_context_extension,
         std::move(definition), models::graph(source).backbone, options.context_size);
     if (!config.dsv4_cpu_offload_layers.empty()) config.drop_file_cache = true;
     auto weights_loader = loader(config, weights, source);

@@ -13,8 +13,6 @@
 #include "engine/backends/cuda/ops/ffn/moe.h"
 
 #include <cstdio>
-#include <cmath>
-#include <nlohmann/json.hpp>
 
 std::vector<std::int64_t> TransformerWeightLoader::shape(const ::tyloi::DenseTensor& value) { return value.sizes().vec(); }
 int64_t TransformerWeightLoader::elements(const ::tyloi::DenseTensor& value) { return value.numel(); }
@@ -63,44 +61,4 @@ tyloi::cuda::Ffn load_moe_weights(const tyloi::weights::Loader& weights,
             "TQ Gate/Up/Down expert dimensions disagree");
     }
     return result;
-}
-
-namespace tyloi::cuda {
-
-std::string configure_yarn(tyloi::ops::YarnScaling& yarn, bool extend, std::string definition,
-                           std::string_view backbone, int64_t context) {
-    yarn = {};
-    if(extend) {
-        if(backbone!="qwen3_5" && backbone!="qwen4_exp")
-            throw std::invalid_argument("YaRN extension requires a Qwen model");
-        auto config=nlohmann::json::parse(definition);
-        auto& text=config.contains("text_config") ? config["text_config"] : config.contains("language_config") ? config["language_config"] : config;
-        auto rope=text.value("rope_parameters",text.value("rope_scaling",nlohmann::json::object()));
-        if(rope.contains("full_attention"))rope=rope["full_attention"];
-        auto native=text.value("max_position_embeddings",int64_t(0));
-        const auto kind=rope.value("rope_type",rope.value("type",std::string("default")));
-        if(kind=="yarn")native=rope.value("original_max_position_embeddings",native);
-        const auto maximum=rope.value("factor",4.0);
-        if((kind!="default" && kind!="yarn") || native<=0 || !std::isfinite(maximum) || maximum<1 ||
-            context>std::floor(native*maximum))throw std::invalid_argument("context exceeds Qwen YaRN limit");
-        yarn.original_context=native;
-        yarn.factor=std::max(1.0,double(context)/native);
-        yarn.beta_fast=rope.value("beta_fast",32.0);
-        yarn.beta_slow=rope.value("beta_slow",1.0);
-        if(yarn.enabled())text["max_position_embeddings"]=context;
-        definition=config.dump();
-    }
-    return definition;
-}
-
-
-
-} // namespace tyloi::cuda
-
-void validate_native_placement(const ParallelConfig& tensor, const LayerPlacementConfig& layers,
-                               int gpu_layers) {
-    if (tensor.enabled() || layers.enabled() || gpu_layers >= 0)
-        throw std::runtime_error(
-            "native attention adapter supports expert parallelism, but "
-            "tensor/layer parallelism and offload require a different placement path");
 }

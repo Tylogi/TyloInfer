@@ -36,10 +36,10 @@ namespace tyloi::cuda::minicpmo45 {
 
 bool parse_command_option(
         std::string_view option,
-        commands::ArgCursor& args,
+        tyloi::commands::ArgCursor& args,
         CommandOptions& result) {
-    using commands::integer;
-    using commands::usage_error;
+    using tyloi::commands::integer;
+    using tyloi::commands::usage_error;
     if (option == "--minicpmo-input-prefix") {
         result.input_prefix = args.value(option);
     } else if (option == "--minicpmo-output-prefix") {
@@ -77,12 +77,12 @@ bool parse_command_option(
 
 void validate_command_options(const CommandOptions& options) {
     if (!options.output_prefix.empty() && options.input_prefix.empty()) {
-        commands::usage_error(
+        tyloi::commands::usage_error(
             "--minicpmo-output-prefix requires --minicpmo-input-prefix");
     }
     if (!options.duplex_output_prefix.empty() &&
             options.duplex_input_prefix.empty()) {
-        commands::usage_error(
+        tyloi::commands::usage_error(
             "--minicpmo-duplex-output-prefix requires "
             "--minicpmo-duplex-input-prefix");
     }
