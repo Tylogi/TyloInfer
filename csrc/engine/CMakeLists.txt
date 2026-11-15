@@ -15,6 +15,10 @@ add_library(mfq-engine STATIC
     config.cpp
     storage_ops.cpp
     math_ops.cpp
+    projection_ops.cpp
+    rope_ops.cpp
+    sampling_ops.cpp
+    read_ops.cpp
     engine.cpp
     executor.cpp
     budget.cpp

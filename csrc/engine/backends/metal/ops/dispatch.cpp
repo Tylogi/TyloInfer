@@ -29,43 +29,6 @@ mx::array narrow_last(const mx::array& x, int first, int count) {
 }
 }
 
-Tensor embedding(const Tensor& ids, const Tensor& weight) {
-    if (const auto* encoded = weight.representation<encoding::MetalTensor>())
-        return tensor(encoded->embedding()(array(ids), mx::float16));
-    return tensor(metal::MlxEmbedding(array(weight))(array(ids), mx::float16));
-}
-Tensor project(const Tensor& value, const Tensor& weight) {
-    if (const auto* encoded = weight.representation<encoding::MetalTensor>())
-        return tensor(encoded->linear()(array(value)));
-    return tensor(metal::MlxLinear(array(weight))(array(value)));
-}
-Tensor linear(const Tensor& value, const Tensor& weight, const Tensor& bias) {
-    auto input = weight.is_encoded() ? value : cast(value, weight.scalar_type());
-    auto output = project(input, weight);
-    if (bias.defined()) output = add(output, cast(bias, output.scalar_type()));
-    return contiguous(cast(output, value.scalar_type()));
-}
-Tensor affine(const Tensor& value, const Tensor& weight, const Tensor& bias) {
-    auto output = project(value, weight);
-    return bias.defined() ? add(output, cast(bias, output.scalar_type())) : output;
-}
-std::vector<Tensor> project_group(const Tensor& value, std::span<const Tensor> weights) {
-    std::vector<Tensor> result;
-    result.reserve(weights.size());
-    for (const auto& weight : weights) result.push_back(project(value, weight));
-    return result;
-}
-bool grouped(std::span<const Tensor>) { return false; }
-std::vector<Tensor> project_group(const Tensor& value, std::span<const Tensor> weights, std::size_t prefix) {
-    if (prefix == 0 || prefix > weights.size()) throw std::invalid_argument("invalid projection prefix");
-    auto result = project_group(value, weights);
-    if (prefix > 1) {
-        auto joined = cat(std::span<const Tensor>(result.data(), prefix), -1);
-        result.erase(result.begin(), result.begin() + prefix);
-        result.insert(result.begin(), std::move(joined));
-    }
-    return result;
-}
 static Tensor mlp_impl(const Tensor& input, std::span<const Tensor> weights, const Tensor& down,
                        MlpActivation activation, double limit) {
     if (weights.empty() || (activation != MlpActivation::relu_squared && weights.size() != 2))
@@ -111,7 +74,6 @@ Tensor silu_project(const Tensor& input, const Tensor& gate, const Tensor& weigh
 Tensor sigmoid_project(const Tensor& input, const Tensor& gate, const Tensor& weight) {
     return project(tensor(array(input) * mx::sigmoid(array(gate))), weight);
 }
-Tensor log_negative(const Tensor& input) { return tensor(mx::log(-array(input))); }
 
 Tensor axial_rope(const Tensor& input, const std::vector<std::int32_t>& positions, double theta) {
     if (input.dim() != 3 || input.size(0) <= 0 || input.size(2) <= 0 ||
@@ -305,132 +267,5 @@ AttentionResult attention(const AttentionInput& request, const state::KvView& kv
 std::int64_t attention_parts(std::int64_t, Device) { return 1; }
 
 
-namespace {
-RopeTable build_rope(std::int64_t positions, std::int64_t dimension, double base, Device device,
-                     std::int64_t frequency_dim, std::int64_t active_pairs,
-                     bool official, YarnScaling yarn) {
-    if (!device.is_metal() || positions <= 0 || dimension <= 0 || dimension % 2 ||
-        !std::isfinite(base) || base <= 0 || active_pairs > dimension / 2)
-        throw std::invalid_argument("invalid Metal RoPE table parameters");
-    const auto denominator = frequency_dim > 0 ? frequency_dim : dimension;
-    const auto half = dimension / 2;
-    if (active_pairs < 0) active_pairs = half;
-    if (yarn.enabled() && (yarn.original_context <= 0 || !std::isfinite(yarn.factor) ||
-        !std::isfinite(yarn.beta_fast) || !std::isfinite(yarn.beta_slow) || yarn.beta_slow <= 0 ||
-        yarn.beta_fast <= yarn.beta_slow || base <= 1))
-        throw std::invalid_argument("invalid Qwen YaRN scaling");
-    double low = 0, high = 1;
-    if (yarn.enabled()) {
-        const auto correction = [&](double rotations) {
-            return denominator * std::log(yarn.original_context / (rotations * 2 * std::acos(-1.0))) /
-                   (2 * std::log(base));
-        };
-        low = std::max(0.0, std::floor(correction(yarn.beta_fast)));
-        high = std::min(double(denominator - 1), std::ceil(correction(yarn.beta_slow)));
-        if (low == high) high += 0.001;
-    }
-    std::vector<float> frequencies(static_cast<size_t>(half));
-    for (std::int64_t i = 0; i < half; ++i) {
-        double f = official ? 1.0f / std::pow(float(base), float(2 * i) / float(denominator))
-                            : std::pow(base, -2.0 * i / denominator);
-        if (yarn.enabled()) {
-            auto ramp = std::clamp((i - low) / (high - low), 0.0, 1.0);
-            f = std::pow(base, -2.0 * i / denominator) * (1 - ramp + ramp / yarn.factor);
-        }
-        frequencies[static_cast<size_t>(i)] = i < active_pairs ? float(f) : 0.0f;
-    }
-    auto freq = metal::copy_from_host(frequencies.data(), std::array<std::int64_t, 1>{half}, kFloat32);
-    auto pos = mx::arange(0, static_cast<int>(positions), 1, mx::float32);
-    auto angle = mx::expand_dims(pos, 1) * mx::expand_dims(array(freq), 0);
-    const float factor = yarn.enabled() ? float(1 + 0.1 * std::log(yarn.factor)) : 1.0f;
-    RopeTable result;
-    result.cos = tensor(mx::cos(angle) * factor);
-    result.sin = tensor(mx::sin(angle) * factor);
-    result.rotary_dim = dimension;
-    return result;
-}
-}
-RopeTable rope_table(std::int64_t positions, std::int64_t dimension, double base, Device device,
-                     std::int64_t frequency_dim, std::int64_t active_pairs) {
-    return build_rope(positions, dimension, base, device, frequency_dim, active_pairs, false, {});
-}
-RopeTable make_rope(std::int64_t positions, std::int64_t dimension, double base, Device device,
-                    std::span<const std::int64_t> sections, bool interleaved,
-                    bool official, YarnScaling yarn) {
-    auto result = build_rope(positions, dimension, base, device, 0, -1, official, yarn);
-    if (sections.empty()) return result;
-    if (sections.size() != 3 || std::accumulate(sections.begin(), sections.end(), std::int64_t{}) != dimension / 2 ||
-        std::any_of(sections.begin(), sections.end(), [](auto n) { return n < 0; }))
-        throw std::invalid_argument("invalid multi-axis RoPE sections");
-    std::vector<std::int64_t> execution(sections.begin(), sections.end());
-    if (interleaved) {
-        std::array<std::vector<std::int64_t>, 3> pairs;
-        for (std::int64_t pair = 0; pair < dimension / 2; ++pair) {
-            const auto residue = pair % 3;
-            const int axis = residue == 1 && pair < sections[1] * 3 ? 1 :
-                             residue == 2 && pair < sections[2] * 3 ? 2 : 0;
-            pairs[axis].push_back(pair);
-        }
-        std::vector<std::int64_t> order;
-        for (size_t i = 0; i < pairs.size(); ++i) {
-            execution[i] = pairs[i].size();
-            order.insert(order.end(), pairs[i].begin(), pairs[i].end());
-        }
-        std::vector<std::int64_t> inverse(order.size());
-        for (size_t i = 0; i < order.size(); ++i) inverse[order[i]] = i;
-        result.interleaved_order = ops::tensor(std::span<const std::int64_t>(order), device);
-        result.interleaved_inverse = ops::tensor(std::span<const std::int64_t>(inverse), device);
-    }
-    result.sections = ops::tensor(std::span<const std::int64_t>(execution), Device{DeviceType::cpu});
-    return result;
-}
-Tensor rope(const Tensor& input, const Tensor& position, const RopeTable& table, bool bf16, bool grid) {
-    if (!table.cos || !table.sin || table.rotary_dim <= 0 || table.rotary_dim % 2 ||
-        table.rotary_dim > input.size(-1)) throw std::invalid_argument("invalid Metal RoPE table");
-    auto pos = position.device() == input.device() ? position : copy(position, input.device());
-    pos = clamp(cast(pos, kInt32), 0, table.cos.size(0) - 1);
-    auto source = cast(input, bf16 ? kBFloat16 : kFloat32);
-    auto half = table.rotary_dim / 2;
-    auto first = slice(source, -1, 0, half), second = slice(source, -1, half, table.rotary_dim);
-    auto cos_table = table.cos, sin_table = table.sin;
-    if (grid && table.interleaved_order) {
-        first = index_select(first, -1, table.interleaved_order);
-        second = index_select(second, -1, table.interleaved_order);
-        cos_table = index_select(cos_table, 1, table.interleaved_order);
-        sin_table = index_select(sin_table, 1, table.interleaved_order);
-    }
-    Tensor selected_cos, selected_sin;
-    if (grid) {
-        auto sections = read_integers(table.sections);
-        if (sections.size() != 3 || pos.dim() != 2 || pos.size(0) != 3)
-            throw std::invalid_argument("multi-axis RoPE requires three position sections");
-        std::vector<Tensor> cs, ss;
-        std::int64_t offset = 0;
-        for (int i = 0; i < 3; ++i) {
-            auto indices = select(pos, 0, i);
-            cs.push_back(slice(index_select(cos_table, 0, indices), 1, offset, offset + sections[i]));
-            ss.push_back(slice(index_select(sin_table, 0, indices), 1, offset, offset + sections[i]));
-            offset += sections[i];
-        }
-        selected_cos = cat(cs, 1); selected_sin = cat(ss, 1);
-    } else if (pos.dim() == 1) {
-        selected_cos = index_select(cos_table, 0, pos);
-        selected_sin = index_select(sin_table, 0, pos);
-    } else if (pos.dim() == 2) {
-        auto flat = reshape(pos, {-1});
-        selected_cos = reshape(index_select(cos_table, 0, flat), {pos.size(0), 1, pos.size(1), half});
-        selected_sin = reshape(index_select(sin_table, 0, flat), {pos.size(0), 1, pos.size(1), half});
-    } else throw std::invalid_argument("RoPE positions must have rank one or two");
-    auto c = cast(selected_cos, source.scalar_type()), s = cast(selected_sin, source.scalar_type());
-    auto a = tensor(array(first) * array(c) - array(second) * array(s));
-    auto b = tensor(array(second) * array(c) + array(first) * array(s));
-    if (grid && table.interleaved_inverse) {
-        a = index_select(a, -1, table.interleaved_inverse);
-        b = index_select(b, -1, table.interleaved_inverse);
-    }
-    std::vector<Tensor> result{a, b};
-    if (input.size(-1) > table.rotary_dim) result.push_back(slice(source, -1, table.rotary_dim, input.size(-1)));
-    return cat(result, -1);
-}
 
 } // namespace tyloi::ops

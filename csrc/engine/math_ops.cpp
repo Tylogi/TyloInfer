@@ -20,6 +20,11 @@ const DenseTensor& dense(const Tensor& value) {
     if (!result || result->is_encoded()) throw std::invalid_argument("operation requires a dense tensor");
     return *result;
 }
+DenseTensor& dense(Tensor& value) {
+    auto* result = value.representation<DenseTensor>();
+    if (!result || result->is_encoded()) throw std::invalid_argument("operation requires a dense tensor");
+    return *result;
+}
 Tensor owner(DenseTensor value) {
     return std::make_shared<DenseTensor>(std::move(value));
 }
@@ -436,4 +441,371 @@ Tensor clamp(const Tensor& value_tensor, double minimum, double maximum) {
 #endif
 }
 
+Tensor clamp_min(const Tensor& value_tensor, double minimum) {
+#if TYLOINFER_HAS_METAL
+    if ((value_tensor.defined() && value_tensor.device().is_metal()))
+        return metal::ops::clamp_min(value_tensor, minimum);
+#endif
+#if TYLOINFER_HAS_CUDA
+    const auto& value = ::tyloi::ops::dense(value_tensor);
+    input(value);
+    require_cuda(value);
+    return owner(cuda::ops::clamp_min(value, minimum));
+#else
+    throw std::invalid_argument("clamp_min is not supported on this device");
+#endif
+}
+
+Tensor clamp_max(const Tensor& value_tensor, double maximum) {
+#if TYLOINFER_HAS_METAL
+    if ((value_tensor.defined() && value_tensor.device().is_metal()))
+        return metal::ops::clamp_max(value_tensor, maximum);
+#endif
+#if TYLOINFER_HAS_CUDA
+    const auto& value = ::tyloi::ops::dense(value_tensor);
+    input(value);
+    require_cuda(value);
+    return owner(cuda::ops::clamp_max(value, maximum));
+#else
+    throw std::invalid_argument("clamp_max is not supported on this device");
+#endif
+}
+
+Tensor remainder(const Tensor& value_tensor, double divisor) {
+#if TYLOINFER_HAS_METAL
+    if ((value_tensor.defined() && value_tensor.device().is_metal()))
+        return metal::ops::remainder(value_tensor, divisor);
+#endif
+#if TYLOINFER_HAS_CUDA
+    const auto& value = ::tyloi::ops::dense(value_tensor);
+    input(value);
+    require_cuda(value);
+    return owner(cuda::ops::remainder(value, divisor));
+#else
+    throw std::invalid_argument("remainder is not supported on this device");
+#endif
+}
+
+Tensor eq(const Tensor& left_tensor, const Tensor& right_tensor) {
+#if TYLOINFER_HAS_METAL
+    if ((left_tensor.defined() && left_tensor.device().is_metal()) ||
+        (right_tensor.defined() && right_tensor.device().is_metal()))
+        return metal::ops::eq(left_tensor, right_tensor);
+#endif
+#if TYLOINFER_HAS_CUDA
+    const auto& left = ::tyloi::ops::dense(left_tensor);
+    const auto& right = ::tyloi::ops::dense(right_tensor);
+    compatible(left, right);
+    require_cuda(left);
+    return owner(cuda::ops::eq(left, right));
+#else
+    throw std::invalid_argument("eq is not supported on this device");
+#endif
+}
+
+Tensor eq(const Tensor& value_tensor, double other) {
+#if TYLOINFER_HAS_METAL
+    if ((value_tensor.defined() && value_tensor.device().is_metal()))
+        return metal::ops::eq(value_tensor, other);
+#endif
+#if TYLOINFER_HAS_CUDA
+    const auto& value = ::tyloi::ops::dense(value_tensor);
+    input(value);
+    require_cuda(value);
+    return owner(cuda::ops::eq(value, other));
+#else
+    throw std::invalid_argument("eq is not supported on this device");
+#endif
+}
+
+Tensor ne(const Tensor& left_tensor, const Tensor& right_tensor) {
+#if TYLOINFER_HAS_METAL
+    if ((left_tensor.defined() && left_tensor.device().is_metal()) ||
+        (right_tensor.defined() && right_tensor.device().is_metal()))
+        return metal::ops::ne(left_tensor, right_tensor);
+#endif
+#if TYLOINFER_HAS_CUDA
+    const auto& left = ::tyloi::ops::dense(left_tensor);
+    const auto& right = ::tyloi::ops::dense(right_tensor);
+    compatible(left, right);
+    require_cuda(left);
+    return owner(cuda::ops::ne(left, right));
+#else
+    throw std::invalid_argument("ne is not supported on this device");
+#endif
+}
+
+Tensor ne(const Tensor& value_tensor, double other) {
+#if TYLOINFER_HAS_METAL
+    if ((value_tensor.defined() && value_tensor.device().is_metal()))
+        return metal::ops::ne(value_tensor, other);
+#endif
+#if TYLOINFER_HAS_CUDA
+    const auto& value = ::tyloi::ops::dense(value_tensor);
+    input(value);
+    require_cuda(value);
+    return owner(cuda::ops::ne(value, other));
+#else
+    throw std::invalid_argument("ne is not supported on this device");
+#endif
+}
+
+bool equal(const Tensor& left_tensor, const Tensor& right_tensor) {
+#if TYLOINFER_HAS_METAL
+    if ((left_tensor.defined() && left_tensor.device().is_metal()) ||
+        (right_tensor.defined() && right_tensor.device().is_metal()))
+        return metal::ops::equal(left_tensor, right_tensor);
+#endif
+#if TYLOINFER_HAS_CUDA
+    const auto& left = ::tyloi::ops::dense(left_tensor);
+    const auto& right = ::tyloi::ops::dense(right_tensor);
+    compatible(left, right);
+    require_cuda(left);
+    return cuda::ops::equal(left, right);
+#else
+    throw std::invalid_argument("equal is not supported on this device");
+#endif
+}
+
+Tensor masked_select(const Tensor& value_tensor, const Tensor& mask_tensor) {
+#if TYLOINFER_HAS_METAL
+    if ((value_tensor.defined() && value_tensor.device().is_metal()) ||
+        (mask_tensor.defined() && mask_tensor.device().is_metal()))
+        return metal::ops::masked_select(value_tensor, mask_tensor);
+#endif
+#if TYLOINFER_HAS_CUDA
+    const auto& value = ::tyloi::ops::dense(value_tensor);
+    const auto& mask = ::tyloi::ops::dense(mask_tensor);
+    compatible(value, mask);
+    require_cuda(value);
+    return owner(cuda::ops::masked_select(value, mask));
+#else
+    throw std::invalid_argument("masked_select is not supported on this device");
+#endif
+}
+
+Tensor gather(const Tensor& value_tensor, std::int64_t dim, const Tensor& indices_tensor) {
+#if TYLOINFER_HAS_METAL
+    if ((value_tensor.defined() && value_tensor.device().is_metal()) ||
+        (indices_tensor.defined() && indices_tensor.device().is_metal()))
+        return metal::ops::gather(value_tensor, dim, indices_tensor);
+#endif
+#if TYLOINFER_HAS_CUDA
+    const auto& value = ::tyloi::ops::dense(value_tensor);
+    const auto& indices = ::tyloi::ops::dense(indices_tensor);
+    compatible(value, indices);
+    require_cuda(value);
+    return owner(cuda::ops::gather(value, dim, indices));
+#else
+    throw std::invalid_argument("gather is not supported on this device");
+#endif
+}
+
+Tensor repeat(const Tensor& value_tensor, std::span<const std::int64_t> repeats) {
+#if TYLOINFER_HAS_METAL
+    if ((value_tensor.defined() && value_tensor.device().is_metal()))
+        return metal::ops::repeat(value_tensor, repeats);
+#endif
+#if TYLOINFER_HAS_CUDA
+    const auto& value = ::tyloi::ops::dense(value_tensor);
+    input(value);
+    require_cuda(value);
+    return owner(cuda::ops::repeat(value, repeats));
+#else
+    throw std::invalid_argument("repeat is not supported on this device");
+#endif
+}
+
+Tensor repeat_interleave(const Tensor& value_tensor, std::int64_t repeats, std::int64_t dim) {
+#if TYLOINFER_HAS_METAL
+    if ((value_tensor.defined() && value_tensor.device().is_metal()))
+        return metal::ops::repeat_interleave(value_tensor, repeats, dim);
+#endif
+#if TYLOINFER_HAS_CUDA
+    const auto& value = ::tyloi::ops::dense(value_tensor);
+    input(value);
+    require_cuda(value);
+    return owner(cuda::ops::repeat_interleave(value, repeats, dim));
+#else
+    throw std::invalid_argument("repeat_interleave is not supported on this device");
+#endif
+}
+
+Tensor tril(const Tensor& value_tensor, std::int64_t diagonal) {
+#if TYLOINFER_HAS_METAL
+    if ((value_tensor.defined() && value_tensor.device().is_metal()))
+        return metal::ops::tril(value_tensor, diagonal);
+#endif
+#if TYLOINFER_HAS_CUDA
+    const auto& value = ::tyloi::ops::dense(value_tensor);
+    input(value);
+    require_cuda(value);
+    return owner(cuda::ops::tril(value, diagonal));
+#else
+    throw std::invalid_argument("tril is not supported on this device");
+#endif
+}
+
+Tensor masked_fill(const Tensor& value_tensor, const Tensor& mask_tensor, double fill_value) {
+#if TYLOINFER_HAS_METAL
+    if ((value_tensor.defined() && value_tensor.device().is_metal()) ||
+        (mask_tensor.defined() && mask_tensor.device().is_metal()))
+        return metal::ops::masked_fill(value_tensor, mask_tensor, fill_value);
+#endif
+#if TYLOINFER_HAS_CUDA
+    const auto& value = ::tyloi::ops::dense(value_tensor);
+    const auto& mask = ::tyloi::ops::dense(mask_tensor);
+    compatible(value, mask);
+    require_cuda(value);
+    return owner(cuda::ops::masked_fill(value, mask, fill_value));
+#else
+    throw std::invalid_argument("masked_fill is not supported on this device");
+#endif
+}
+
+void masked_fill_inplace(Tensor& value_tensor, const Tensor& mask_tensor, double fill_value) {
+#if TYLOINFER_HAS_METAL
+    if ((value_tensor.defined() && value_tensor.device().is_metal()) ||
+        (mask_tensor.defined() && mask_tensor.device().is_metal())) {
+        metal::ops::masked_fill_inplace(value_tensor, mask_tensor, fill_value);
+        return;
+    }
+#endif
+#if TYLOINFER_HAS_CUDA
+    auto& value = ::tyloi::ops::dense(value_tensor);
+    const auto& mask = ::tyloi::ops::dense(mask_tensor);
+    compatible(value, mask);
+    require_cuda(value);
+    cuda::ops::masked_fill_inplace(value, mask, fill_value);
+#else
+    throw std::invalid_argument("masked_fill_inplace is not supported on this device");
+#endif
+}
+
+void scatter_add(Tensor& value_tensor, std::int64_t dim, const Tensor& indices_tensor, const Tensor& source_tensor) {
+#if TYLOINFER_HAS_METAL
+    if ((value_tensor.defined() && value_tensor.device().is_metal()) ||
+        (indices_tensor.defined() && indices_tensor.device().is_metal()) ||
+        (source_tensor.defined() && source_tensor.device().is_metal())) {
+        metal::ops::scatter_add(value_tensor, dim, indices_tensor, source_tensor);
+        return;
+    }
+#endif
+#if TYLOINFER_HAS_CUDA
+    auto& value = ::tyloi::ops::dense(value_tensor);
+    const auto& indices = ::tyloi::ops::dense(indices_tensor);
+    const auto& source = ::tyloi::ops::dense(source_tensor);
+    compatible(value, indices);
+    compatible(value, source);
+    require_cuda(value);
+    cuda::ops::scatter_add(value, dim, indices, source);
+#else
+    throw std::invalid_argument("scatter_add is not supported on this device");
+#endif
+}
+
+void scatter(Tensor& value_tensor, std::int64_t dim, const Tensor& indices_tensor, const Tensor& source_tensor) {
+#if TYLOINFER_HAS_METAL
+    if ((value_tensor.defined() && value_tensor.device().is_metal()) ||
+        (indices_tensor.defined() && indices_tensor.device().is_metal()) ||
+        (source_tensor.defined() && source_tensor.device().is_metal())) {
+        metal::ops::scatter(value_tensor, dim, indices_tensor, source_tensor);
+        return;
+    }
+#endif
+#if TYLOINFER_HAS_CUDA
+    auto& value = ::tyloi::ops::dense(value_tensor);
+    const auto& indices = ::tyloi::ops::dense(indices_tensor);
+    const auto& source = ::tyloi::ops::dense(source_tensor);
+    compatible(value, indices);
+    compatible(value, source);
+    require_cuda(value);
+    cuda::ops::scatter(value, dim, indices, source);
+#else
+    throw std::invalid_argument("scatter is not supported on this device");
+#endif
+}
+
+void index_fill(Tensor& value_tensor, std::int64_t dim, const Tensor& indices_tensor, double fill_value) {
+#if TYLOINFER_HAS_METAL
+    if ((value_tensor.defined() && value_tensor.device().is_metal()) ||
+        (indices_tensor.defined() && indices_tensor.device().is_metal())) {
+        metal::ops::index_fill(value_tensor, dim, indices_tensor, fill_value);
+        return;
+    }
+#endif
+#if TYLOINFER_HAS_CUDA
+    auto& value = ::tyloi::ops::dense(value_tensor);
+    const auto& indices = ::tyloi::ops::dense(indices_tensor);
+    compatible(value, indices);
+    require_cuda(value);
+    cuda::ops::index_fill(value, dim, indices, fill_value);
+#else
+    throw std::invalid_argument("index_fill is not supported on this device");
+#endif
+}
+
+std::array<Tensor, 3> qkv_norm(std::array<Tensor, 3> values, std::array<Tensor, 3> weights,
+                               double eps, double offset, ScalarType output_type) {
+#if TYLOINFER_HAS_METAL
+    bool on_metal = false;
+    for (std::size_t i = 0; i < values.size(); ++i)
+        on_metal |= (values[i].defined() && values[i].device().is_metal()) ||
+                    (weights[i].defined() && weights[i].device().is_metal());
+    if (on_metal) {
+        if (output_type != ScalarType::float32 && output_type != ScalarType::bfloat16)
+            throw std::invalid_argument("unsupported qkv_norm output type");
+        for (std::size_t i = 0; i < values.size(); ++i) {
+            if (!values[i].defined() || values[i].is_encoded())
+                throw std::invalid_argument("qkv_norm requires all values to be unencoded");
+            if (!weights[i].defined()) continue;
+            if (values[i].dim() == 0 || weights[i].dim() == 0 || weights[i].is_encoded() ||
+                values[i].size(-1) <= 0 || weights[i].numel() != values[i].size(-1))
+                throw std::invalid_argument("qkv_norm input and weight are incompatible");
+            auto weight = metal::ops::reshape(weights[i], std::array{values[i].size(-1)});
+            values[i] = metal::ops::rms_norm(values[i], weight, eps, offset, output_type);
+        }
+        return values;
+    }
+#endif
+#if TYLOINFER_HAS_CUDA
+    if (output_type != ScalarType::float32 && output_type != ScalarType::bfloat16)
+        throw std::invalid_argument("unsupported qkv_norm output type");
+    std::array<const DenseTensor*, 3> dense_weights{};
+    for (std::size_t i = 0; i < values.size(); ++i) {
+        if (!values[i].defined()) throw std::invalid_argument("qkv_norm requires all values");
+        input(values[i]);
+        if (weights[i].defined()) {
+            dense_weights[i] = &dense(weights[i]);
+            compatible(values[i], weights[i]);
+            if (values[i].dim() == 0 || weights[i].dim() == 0 ||
+                values[i].size(-1) <= 0 || weights[i].numel() != values[i].size(-1))
+                throw std::invalid_argument("qkv_norm input and weight are incompatible");
+        }
+    }
+    for (std::size_t i = 0; i < values.size(); ++i)
+        if (weights[i].defined()) require_cuda(values[i]);
+    (void)cuda::Executor::current();
+    std::array<DenseTensor, 3> dense_values{dense(values[0]), dense(values[1]), dense(values[2])};
+    auto result = cuda::ops::qkv_norm(std::move(dense_values), dense_weights, eps, offset, output_type);
+    return {owner(std::move(result[0])), owner(std::move(result[1])), owner(std::move(result[2]))};
+#else
+    throw std::invalid_argument("qkv_norm is not supported on this device");
+#endif
+}
+
+} // namespace tyloi::ops
+
+namespace tyloi::ops {
+Tensor log_negative(const Tensor& value) {
+#if TYLOINFER_HAS_METAL
+    if (value.defined() && value.is_metal()) return metal::ops::log_negative(value);
+#endif
+#if TYLOINFER_HAS_CUDA
+    input(value);
+    return owner(cuda::log(-dense(value)));
+#else
+    throw std::invalid_argument("log_negative requires a compiled device");
+#endif
+}
 } // namespace tyloi::ops

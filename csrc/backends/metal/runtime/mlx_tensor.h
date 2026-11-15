@@ -61,7 +61,6 @@ public:
     explicit MlxLinear(MlxMxfp4SqWeight weight);
 #endif
     explicit MlxLinear(mlx::core::array weight);
-
     mlx::core::array operator()(const mlx::core::array& input) const;
 
     // Project one shared-expert activation and combine it with routed MoE
@@ -157,16 +156,9 @@ public:
     explicit MlxEmbedding(MlxMxfp4SqWeight weight);
 #endif
     explicit MlxEmbedding(mlx::core::array weight);
-
-    mlx::core::array operator()(
-        const mlx::core::array& token_ids,
+    mlx::core::array operator()(const mlx::core::array& token_ids,
         mlx::core::Dtype dtype = mlx::core::float16) const;
-
-    // Apply the embedding table as an LM-head projection. This executes
-    // directly against this embedding's dense or packed storage, so tied
-    // embeddings do not require a second weight object or dequantized copy.
-    mlx::core::array project(
-        const mlx::core::array& input) const;
+    mlx::core::array project(const mlx::core::array& input) const;
 
     int vocabulary_size() const noexcept {
         return vocabulary_size_;

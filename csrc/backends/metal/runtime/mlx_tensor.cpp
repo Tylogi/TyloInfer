@@ -2,9 +2,10 @@
 #include "mlx_kernel_prepare.h"
 #include "mlx_moe_ops.h"
 #include "engine/backends/metal/native/env.h"
-#include "mlx_transformer.h"
 #include "engine/backends/metal/native/tensor/tensor.h"
 #include "engine/backends/metal/ops/tensor.h"
+#include "engine/backends/metal/ops/projection/dense.h"
+#include "engine/backends/metal/ops/rope/adjacent.h"
 #include "engine/weights/memory.h"
 #include "engine/backends/metal/ops/gguf/native/mlx_native_gguf.h"
 #include "engine/backends/metal/ops/gguf/mlx_gguf_rotation.h"
@@ -29,284 +30,11 @@ namespace tyloi::metal {
 namespace {
 
 using mlx::core::Dtype;
-using mlx::core::CompileOptions;
-using mlx::core::MathMode;
 using mlx::core::Shape;
 using mlx::core::array;
 
 std::atomic_bool g_predequantize_fp16{false};
 thread_local unsigned int g_fp16_weight_scopes = 0;
-
-// Decode verification presents two through six hidden states at once.  MLX's
-// general GEMM path does not reuse a dense weight row efficiently at this M,
-// so one SIMD group owns an output and accumulates every input row while the
-// weight vector is resident in registers.
-constexpr const char* kDenseSmallM = R"METAL(
-    constexpr uint K_LANES_VALUE = uint(K_LANES);
-    constexpr uint SIMD_GROUPS_VALUE = uint(SIMD_GROUPS);
-    constexpr uint OUTPUTS_PER_SIMD = 32u / K_LANES_VALUE;
-    constexpr uint OUTPUTS_PER_TG =
-        SIMD_GROUPS_VALUE * OUTPUTS_PER_SIMD;
-
-    uint lane = thread_index_in_simdgroup;
-    uint simd_group = simdgroup_index_in_threadgroup;
-    uint k_lane = lane & (K_LANES_VALUE - 1u);
-    uint simd_output = lane / K_LANES_VALUE;
-    uint output_index =
-        threadgroup_position_in_grid.y * OUTPUTS_PER_TG
-        + simd_group * OUTPUTS_PER_SIMD + simd_output;
-    uint output = min(output_index, uint(OUT) - 1u);
-
-    float accumulators[M];
-    for (uint row = 0u; row < uint(M); ++row) {
-        accumulators[row] = 0.0f;
-    }
-
-    uint weight_base = output * uint(K);
-    for (uint vector = k_lane;
-         vector < uint(K) / 4u;
-         vector += K_LANES_VALUE) {
-        uint column = vector * 4u;
-        vec<T, 4> packed_weight = *(device const vec<T, 4>*)(
-            weight + weight_base + column);
-        float4 weight_values = float4(packed_weight);
-        for (uint row = 0u; row < uint(M); ++row) {
-            vec<T, 4> packed_input = *(device const vec<T, 4>*)(
-                x + row * uint(K) + column);
-            accumulators[row] += dot(float4(packed_input), weight_values);
-        }
-    }
-
-    for (uint row = 0u; row < uint(M); ++row) {
-        if (K_LANES_VALUE >= 32u) {
-            accumulators[row] += simd_shuffle_down(accumulators[row], 16u);
-        }
-        if (K_LANES_VALUE >= 16u) {
-            accumulators[row] += simd_shuffle_down(accumulators[row], 8u);
-        }
-        if (K_LANES_VALUE >= 8u) {
-            accumulators[row] += simd_shuffle_down(accumulators[row], 4u);
-        }
-        accumulators[row] += simd_shuffle_down(accumulators[row], 2u);
-        accumulators[row] += simd_shuffle_down(accumulators[row], 1u);
-        if (k_lane == 0u && output_index < uint(OUT)) {
-            y[row * uint(OUT) + output_index] = T(accumulators[row]);
-        }
-    }
-)METAL";
-
-// M=2..6 verifier GEMV with the same 32-lane reduction geometry as MLX's
-// one-token large-output GEMV. Four output rows share every activation load
-// inside each SIMD group, while each weight is reused across all M inputs.
-//
-// Scheduling derived from oMLX 0.6.4 verify_qmv.py.
-// Copyright © 2026 Apple Inc.  Licensed under Apache-2.0.
-constexpr const char* kDenseSmallMExact = R"METAL(
-    constexpr uint OUTPUTS_PER_SIMD = 4u;
-    constexpr uint SIMD_GROUPS = 8u;
-    constexpr uint OUTPUTS_PER_TG = OUTPUTS_PER_SIMD * SIMD_GROUPS;
-    constexpr uint VALUES_PER_LANE = 4u;
-    constexpr uint K_BLOCK = VALUES_PER_LANE * 32u;
-
-    uint simd_group = simdgroup_index_in_threadgroup;
-    uint lane = thread_index_in_simdgroup;
-    uint output_base =
-        threadgroup_position_in_grid.x * OUTPUTS_PER_TG
-        + simd_group * OUTPUTS_PER_SIMD;
-    if (output_base >= uint(OUT)) {
-        return;
-    }
-
-    uint k_base = lane * VALUES_PER_LANE;
-    float accum[M][OUTPUTS_PER_SIMD] = {{0.0f}};
-    for (uint block = 0u; block < uint(K); block += K_BLOCK) {
-        float input_values[M][VALUES_PER_LANE];
-        for (uint row = 0u; row < uint(M); ++row) {
-            for (uint column = 0u;
-                 column < VALUES_PER_LANE;
-                 ++column) {
-                input_values[row][column] =
-                    float(x[row * uint(K) + k_base + column]);
-            }
-        }
-        for (uint result = 0u;
-             result < OUTPUTS_PER_SIMD;
-             ++result) {
-            device const T* row_weight =
-                weight + (output_base + result) * uint(K) + k_base;
-            float weight_values[VALUES_PER_LANE];
-            for (uint column = 0u;
-                 column < VALUES_PER_LANE;
-                 ++column) {
-                weight_values[column] = float(row_weight[column]);
-            }
-            for (uint row = 0u; row < uint(M); ++row) {
-                for (uint column = 0u;
-                     column < VALUES_PER_LANE;
-                     ++column) {
-                    accum[row][result] +=
-                        weight_values[column] * input_values[row][column];
-                }
-            }
-        }
-        k_base += K_BLOCK;
-    }
-
-    for (uint row = 0u; row < uint(M); ++row) {
-        for (uint result = 0u;
-             result < OUTPUTS_PER_SIMD;
-             ++result) {
-            for (ushort step = 16u; step >= 1u; step >>= 1u) {
-                accum[row][result] +=
-                    simd_shuffle_down(accum[row][result], step);
-            }
-            if (lane == 0u) {
-                y[row * uint(OUT) + output_base + result] =
-                    T(accum[row][result]);
-            }
-        }
-    }
-)METAL";
-
-const mlx::core::fast::CustomKernelFunction& dense_small_m_kernel() {
-    static const auto kernel = [] {
-        CompileOptions options;
-        options.math_mode = MathMode::Fast;
-        return mlx::core::fast::metal_kernel(
-            "mfq_dense_small_m_m2_6",
-            {"weight", "x"},
-            {"y"},
-            kDenseSmallM,
-            "",
-            true,
-            false,
-            options);
-    }();
-    return kernel;
-}
-
-const mlx::core::fast::CustomKernelFunction&
-dense_small_m_exact_kernel() {
-    static const auto kernel = [] {
-        CompileOptions options;
-        options.math_mode = MathMode::Fast;
-        return mlx::core::fast::metal_kernel(
-            "mfq_dense_small_m_exact_m2_6",
-            {"weight", "x"},
-            {"y"},
-            kDenseSmallMExact,
-            "",
-            true,
-            false,
-            options);
-    }();
-    return kernel;
-}
-
-array dense_small_m_matmul(
-    const array& weight,
-    const array& input,
-    int rows,
-    int input_size,
-    int output_size) {
-    const auto* layout = std::getenv(
-        "TYLOINFER_METAL_DENSE_SMALL_M_LAYOUT");
-    const bool exact =
-        input_size % 128 == 0 &&
-        output_size >= 4096 &&
-        output_size % 32 == 0 &&
-        (layout == nullptr || std::strcmp(layout, "legacy") != 0);
-    if (exact) {
-        auto source = mlx::core::reshape(
-            input.flags().row_contiguous
-                ? input
-                : mlx::core::contiguous(input),
-            Shape{rows, input_size});
-        auto outputs = dense_small_m_exact_kernel()(
-            {weight, std::move(source)},
-            {Shape{rows, output_size}},
-            {weight.dtype()},
-            {
-                ((output_size + 31) / 32) * 256,
-                1,
-                1,
-            },
-            {256, 1, 1},
-            {
-                {"T", weight.dtype()},
-                {"M", rows},
-                {"K", input_size},
-                {"OUT", output_size},
-            },
-            std::nullopt,
-            false,
-            {});
-        Shape output_shape = input.shape();
-        output_shape.back() = output_size;
-        return mlx::core::reshape(
-            std::move(outputs.front()),
-            std::move(output_shape));
-    }
-    constexpr int simd_groups = 4;
-    const int k_lanes = input_size >= 16384 ? 16 : 32;
-    const int outputs_per_threadgroup = simd_groups * 32 / k_lanes;
-    auto source = mlx::core::reshape(
-        input.flags().row_contiguous ? input : mlx::core::contiguous(input),
-        Shape{rows, input_size});
-    auto outputs = dense_small_m_kernel()(
-        {weight, std::move(source)},
-        {Shape{rows, output_size}},
-        {weight.dtype()},
-        {
-            simd_groups * 32,
-            (output_size + outputs_per_threadgroup - 1) /
-                outputs_per_threadgroup,
-            1,
-        },
-        {simd_groups * 32, 1, 1},
-        {
-            {"T", weight.dtype()},
-            {"M", rows},
-            {"K", input_size},
-            {"OUT", output_size},
-            {"K_LANES", k_lanes},
-            {"SIMD_GROUPS", simd_groups},
-        },
-        std::nullopt,
-        false,
-        {});
-    Shape output_shape = input.shape();
-    output_shape.back() = output_size;
-    return mlx::core::reshape(
-        std::move(outputs.front()),
-        std::move(output_shape));
-}
-
-array dense_decode_consistent_matmul(
-    const array& weight,
-    const array& input,
-    int rows,
-    int input_size,
-    int output_size) {
-    // This is the same fallback used by oMLX's decode-consistency patch:
-    // express M independent projections as a batch of matrix-vector
-    // products. MLX consequently keeps its M=1 GEMV reduction for every row
-    // instead of selecting a width-M GEMM kernel.
-    auto source = mlx::core::reshape(
-        input.flags().row_contiguous
-            ? input
-            : mlx::core::contiguous(input),
-        Shape{rows, input_size});
-    auto projected = mlx::core::matmul(
-        weight,
-        mlx::core::expand_dims(std::move(source), -1));
-    projected = mlx::core::squeeze(std::move(projected), -1);
-    Shape output_shape = input.shape();
-    output_shape.back() = output_size;
-    return mlx::core::reshape(
-        std::move(projected),
-        std::move(output_shape));
-}
 
 template <typename Variant>
 array materialize_weight_fp16(
@@ -362,9 +90,7 @@ array dense_reference_matmul(
         : mlx::core::astype(
               input,
               mlx::core::float16);
-    return mlx::core::matmul(
-        source,
-        mlx::core::transpose(dense));
+    return mlx::core::matmul(source, mlx::core::transpose(dense));
 }
 
 
@@ -501,9 +227,8 @@ std::optional<array> MlxLinear::greedy_argmax(
 }
 
 array MlxLinear::operator()(const array& input) const {
-    if (input.ndim() == 0 || input.shape(-1) != input_size_) {
+    if (input.ndim() == 0 || input.shape(-1) != input_size_)
         throw std::runtime_error("linear input width mismatch");
-    }
 #if TYLOINFER_ENABLE_MFQ_COMPAT
     if (const auto* weight = std::get_if<MlxNintWeight>(&weight_)) return weight->matmul(input);
     if (const auto* weight = std::get_if<MlxNint8ZeroWeight>(&weight_)) return weight->matmul(input);
@@ -511,67 +236,19 @@ array MlxLinear::operator()(const array& input) const {
     if (const auto* weight = std::get_if<MlxFp8SqWeight>(&weight_)) return weight->matmul(input);
     if (const auto* weight = std::get_if<MlxMxfp4SqWeight>(&weight_)) return weight->matmul(input);
 #endif
-    if (const auto* tq = std::get_if<MlxTqWeight>(&weight_)) return tq->matmul(input);
-    if (const auto* gguf = std::get_if<MlxGgufWeight>(&weight_)) return gguf->matmul(input);
-    if (const auto* affine = std::get_if<MlxAffineWeight>(&weight_)) return affine->matmul(input);
-    if (mlx_reference_enabled()) {
-        if (auto dense = unpack_quantized_weight(
-                weight_, output_size_)) {
+    if (const auto* weight = std::get_if<MlxTqWeight>(&weight_)) return weight->matmul(input);
+    if (const auto* weight = std::get_if<MlxGgufWeight>(&weight_)) return weight->matmul(input);
+    if (const auto* weight = std::get_if<MlxAffineWeight>(&weight_)) return weight->matmul(input);
+    if (mlx_reference_enabled())
+        if (auto dense = unpack_quantized_weight(weight_, output_size_))
             return dense_reference_matmul(*dense, input);
-        }
+    if (const auto* weight = std::get_if<MlxMxWeight>(&weight_)) {
+        auto result = weight->matmul(input);
+        return input.dtype() == mlx::core::bfloat16 && result.dtype() != input.dtype()
+            ? mlx::core::astype(result, input.dtype()) : result;
     }
-    const auto preserve_input_dtype = [&](array result) {
-        return input.dtype() == mlx::core::bfloat16 &&
-                result.dtype() != input.dtype()
-            ? mlx::core::astype(result, input.dtype())
-            : result;
-    };
-    if (const auto* packed = std::get_if<MlxMxWeight>(&weight_)) {
-        return preserve_input_dtype(packed->matmul(input));
-    }
-    const auto& dense = tyloi::metal::array(std::get<tyloi::Tensor>(weight_));
-    auto source = input;
-    if (source.dtype() != dense.dtype()) {
-        source = mlx::core::astype(source, dense.dtype());
-    }
-    const auto rows = source.size() / static_cast<std::size_t>(input_size_);
-    if (rows == 1 &&
-        moe_dense_router_logits_supported(source, dense)) {
-        auto output_shape = input.shape();
-        output_shape.back() = output_size_;
-        return mlx::core::reshape(
-            moe_dense_router_logits(source, dense),
-            std::move(output_shape));
-    }
-    if (rows >= 2 && rows <= 6 &&
-        input_size_ % 4 == 0 &&
-        dense.size() >= 65536 &&
-        dense.flags().row_contiguous) {
-        const auto* layout = std::getenv(
-            "TYLOINFER_METAL_DENSE_SMALL_M_LAYOUT");
-        const bool legacy = layout != nullptr &&
-            std::strcmp(layout, "legacy") == 0;
-        if (!legacy &&
-            output_size_ < 4096) {
-            return dense_decode_consistent_matmul(
-                dense,
-                source,
-                static_cast<int>(rows),
-                input_size_,
-                output_size_);
-        }
-        if (dense.dtype() == mlx::core::float16 ||
-            dense.dtype() == mlx::core::bfloat16) {
-            return dense_small_m_matmul(
-                dense,
-                source,
-                static_cast<int>(rows),
-                input_size_,
-                output_size_);
-        }
-    }
-    const auto transposed = tyloi::metal::ops::transpose(std::get<tyloi::Tensor>(weight_), 0, 1);
-    return mlx::core::matmul(source, tyloi::metal::array(transposed));
+    return tyloi::metal::array(tyloi::metal::ops::dense_project(
+        tyloi::metal::tensor(input), std::get<tyloi::Tensor>(weight_)));
 }
 
 array MlxLinear::moe_shared(
@@ -742,10 +419,10 @@ array MlxLinear::grouped_row_matmul_inverse_rope(
         }
     }
 
-    // mlx_rope_adjacent treats rotary_dimension as a suffix width, matching
+    // Adjacent RoPE treats rotary_dimension as a suffix width, matching
     // DeepSeek's decoupled-RoPE layout while preserving the leading content
     // channels in the same kernel dispatch.
-    auto unrotated = mlx_rope_adjacent(
+    auto unrotated = tyloi::metal::ops::adjacent_rope(
         value,
         rotary_dimension,
         cosine,
@@ -903,23 +580,6 @@ array MlxEmbedding::operator()(
     if (const auto* tq = std::get_if<MlxTqWeight>(&weight_)) return tq->embedding(token_ids, dtype);
     if (const auto* gguf = std::get_if<MlxGgufWeight>(&weight_)) return gguf->embedding(token_ids, dtype);
     if (const auto* affine = std::get_if<MlxAffineWeight>(&weight_)) return affine->embedding(token_ids, dtype);
-    const bool reference = mlx_reference_enabled();
-    const auto finish_quantized = [&](const auto& packed) {
-        auto result = reference
-            ? mlx::core::astype(
-                  packed.embedding(
-                      token_ids,
-                      mlx::core::float32),
-                  mlx::core::float16)
-            : packed.embedding(
-                  token_ids,
-                  dtype == mlx::core::bfloat16
-                      ? mlx::core::float16
-                      : dtype);
-        return result.dtype() == dtype
-            ? result
-            : mlx::core::astype(result, dtype);
-    };
     if (const auto* packed = std::get_if<MlxMxWeight>(&weight_)) {
         auto result = packed->embedding(
             token_ids,
@@ -931,14 +591,11 @@ array MlxEmbedding::operator()(
             : mlx::core::astype(result, dtype);
     }
     auto ids = token_ids;
-    if (ids.dtype() != mlx::core::int32 &&
-        ids.dtype() != mlx::core::uint32) {
+    if (ids.dtype() != mlx::core::int32 && ids.dtype() != mlx::core::int64) {
         ids = mlx::core::astype(ids, mlx::core::int32);
     }
-    auto result = mlx::core::take(
-        tyloi::metal::array(std::get<tyloi::Tensor>(weight_)),
-        ids,
-        0);
+    auto result = tyloi::metal::array(tyloi::metal::ops::dense_embedding(
+        tyloi::metal::tensor(std::move(ids)), std::get<tyloi::Tensor>(weight_)));
     return result.dtype() == dtype
         ? result
         : mlx::core::astype(result, dtype);
@@ -968,15 +625,8 @@ array MlxEmbedding::project(const array& input) const {
     if (const auto* packed = std::get_if<MlxMxWeight>(&weight_)) {
         return packed->matmul(input);
     }
-    const auto& dense = tyloi::metal::array(std::get<tyloi::Tensor>(weight_));
-    auto source = input;
-    if (source.dtype() != dense.dtype()) {
-        source = mlx::core::astype(source, dense.dtype());
-    }
-    const auto transposed = tyloi::metal::ops::transpose(std::get<tyloi::Tensor>(weight_), 0, 1);
-    return mlx::core::matmul(
-        source,
-        tyloi::metal::array(transposed));
+    return tyloi::metal::array(tyloi::metal::ops::dense_project(
+        tyloi::metal::tensor(input), std::get<tyloi::Tensor>(weight_)));
 }
 
 } // namespace tyloi::metal

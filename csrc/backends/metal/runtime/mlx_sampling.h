@@ -1,5 +1,7 @@
 #pragma once
 
+#include "engine/backends/metal/ops/sampling_raw.h"
+
 #include <cstdint>
 #include <optional>
 #include <random>
@@ -33,12 +35,6 @@ struct MlxSamplingParams {
     }
 };
 
-struct MlxTopKDistribution {
-    mlx::core::array sampled;
-    mlx::core::array indices;
-    mlx::core::array probabilities;
-};
-
 // Select the final time step from [batch,tokens,vocab] logits and return
 // [batch,vocab]. Generation adapters must not carry private copies of this
 // shape policy.
@@ -54,50 +50,10 @@ bool mlx_token_in_set(
     std::span<const std::int64_t> token_ids,
     std::int64_t token) noexcept;
 
-mlx::core::array sample_greedy(const mlx::core::array& logits);
-
-mlx::core::array sample_softmax(
-    const mlx::core::array& logits,
-    const mlx::core::array& random,
-    double temperature = 1.0);
-
-mlx::core::array sample_top_k_top_p(
-    const mlx::core::array& logits,
-    const mlx::core::array& random,
-    double temperature,
-    int top_k,
-    double top_p = 1.0);
-
-// Return the sampled token and the compact, filtered top-k distribution in a
-// GPU-resident pass. The final dimension of indices/probabilities is top_k;
-// entries removed by top-p have zero probability. Values up to 64 use the
-// direct kernel and values up to 128 use exact hierarchical selection. This
-// is used by speculative verification to avoid materializing a full
-// vocabulary on CPU.
-MlxTopKDistribution sample_top_k_distribution(
-    const mlx::core::array& logits,
-    const mlx::core::array& random,
-    double temperature,
-    int top_k,
-    double top_p = 1.0);
-
-// Stateless sampling. When random is omitted, the first random values produced
-// by params.seed are used. Use MlxSampler for a generation-length RNG stream.
-mlx::core::array sample(
-    const mlx::core::array& logits,
+// Stateless policy; an omitted random input starts a fresh stream at params.seed.
+mlx::core::array sample(const mlx::core::array& logits,
     const MlxSamplingParams& params = {},
     const std::optional<mlx::core::array>& random = std::nullopt);
-
-mlx::core::array sample_token_counts_add(
-    const mlx::core::array& counts,
-    const mlx::core::array& tokens);
-
-mlx::core::array sample_apply_penalties(
-    const mlx::core::array& logits,
-    const mlx::core::array& counts,
-    double presence_penalty = 0.0,
-    double frequency_penalty = 0.0,
-    double repetition_penalty = 1.0);
 
 // Exact host-visible distribution used by stochastic speculative decoding.
 // It applies the same temperature/top-k/top-p policy as ordinary sampling.

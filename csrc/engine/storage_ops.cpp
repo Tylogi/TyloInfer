@@ -1,13 +1,16 @@
 #include "engine/ops.h"
 #include "engine/backends/cpu/ops/tensor.h"
 
+#include <algorithm>
+#include <cstring>
+#include <limits>
+#include <numeric>
+
 #if TYLOINFER_HAS_CUDA
 #include "engine/backends/cuda/executor/executor.h"
 #include "engine/backends/cuda/ops/tensor.h"
 #include "engine/backends/cuda/native/tensor/tensor.h"
 #include "engine/backends/cuda/native/device.h"
-#include <algorithm>
-#include <cstring>
 #endif
 #if TYLOINFER_HAS_METAL
 #include "engine/backends/metal/ops/tensor.h"
@@ -60,6 +63,12 @@ DenseTensor& dense(Tensor& value) {
 Tensor owner(DenseTensor value) {
     return std::make_shared<DenseTensor>(std::move(value));
 }
+std::vector<Tensor> owners(std::vector<DenseTensor> values) {
+    std::vector<Tensor> result;
+    result.reserve(values.size());
+    for (auto& value : values) result.push_back(owner(std::move(value)));
+    return result;
+}
 void device(Device value) {
     if (!value.is_cpu() && !value.is_cuda())
         throw std::invalid_argument("unsupported tensor device");
@@ -109,8 +118,6 @@ void copy_into(Tensor destination_tensor, const Tensor& source_tensor) {
 #if TYLOINFER_HAS_METAL
     if ((destination_tensor.defined() && destination_tensor.device().is_metal()) ||
         (source_tensor.defined() && source_tensor.device().is_metal())) {
-        if (!destination_tensor.defined() || !source_tensor.defined() || destination_tensor.device() != source_tensor.device())
-            throw std::invalid_argument("tensor devices do not match");
         metal::ops::copy_into(destination_tensor, source_tensor);
         return;
     }
@@ -427,6 +434,188 @@ Tensor unsqueeze(const Tensor& value_tensor, std::int64_t dim) {
 #else
     return std::make_shared<DenseTensor>(tyloi::unsqueeze(cpu_view(value_tensor), dim));
 #endif
+}
+
+Tensor tensor(std::span<const float> values, Device target) {
+#if TYLOINFER_HAS_METAL
+    if (target.is_metal())
+        return metal::ops::tensor(values, target);
+#endif
+#if TYLOINFER_HAS_CUDA
+    device(target);
+    return owner(cuda::ops::tensor(values, target));
+#else
+    if (target != Device{DeviceType::cpu, 0}) throw std::invalid_argument("tensor requires CPU:0 or a compiled device");
+    if (values.size() > static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max()))
+        throw std::overflow_error("tensor extent exceeds int64 limit");
+    auto result = cpu::ops::empty(std::array{static_cast<std::int64_t>(values.size())},
+        TensorOptions().dtype(kFloat32).device(target));
+    if (!values.empty()) std::memcpy(result.dense().data_ptr(), values.data(), result.nbytes());
+    return result;
+#endif
+}
+
+Tensor tensor(std::span<const std::int32_t> values, Device target) {
+#if TYLOINFER_HAS_METAL
+    if (target.is_metal())
+        return metal::ops::tensor(values, target);
+#endif
+#if TYLOINFER_HAS_CUDA
+    device(target);
+    return owner(cuda::ops::tensor(values, target));
+#else
+    if (target != Device{DeviceType::cpu, 0}) throw std::invalid_argument("tensor requires CPU:0 or a compiled device");
+    if (values.size() > static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max()))
+        throw std::overflow_error("tensor extent exceeds int64 limit");
+    auto result = cpu::ops::empty(std::array{static_cast<std::int64_t>(values.size())},
+        TensorOptions().dtype(kInt32).device(target));
+    if (!values.empty()) std::memcpy(result.dense().data_ptr(), values.data(), result.nbytes());
+    return result;
+#endif
+}
+
+Tensor tensor(std::span<const std::int64_t> values, Device target) {
+#if TYLOINFER_HAS_METAL
+    if (target.is_metal())
+        return metal::ops::tensor(values, target);
+#endif
+#if TYLOINFER_HAS_CUDA
+    device(target);
+    return owner(cuda::ops::tensor(values, target));
+#else
+    if (target != Device{DeviceType::cpu, 0}) throw std::invalid_argument("tensor requires CPU:0 or a compiled device");
+    if (values.size() > static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max()))
+        throw std::overflow_error("tensor extent exceeds int64 limit");
+    auto result = cpu::ops::empty(std::array{static_cast<std::int64_t>(values.size())},
+        TensorOptions().dtype(kInt64).device(target));
+    if (!values.empty()) std::memcpy(result.dense().data_ptr(), values.data(), result.nbytes());
+    return result;
+#endif
+}
+
+Tensor tensor(std::span<const std::uint8_t> values, Device target) {
+#if TYLOINFER_HAS_METAL
+    if (target.is_metal())
+        return metal::ops::tensor(values, target);
+#endif
+#if TYLOINFER_HAS_CUDA
+    device(target);
+    return owner(cuda::ops::tensor(values, target));
+#else
+    if (target != Device{DeviceType::cpu, 0}) throw std::invalid_argument("tensor requires CPU:0 or a compiled device");
+    if (values.size() > static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max()))
+        throw std::overflow_error("tensor extent exceeds int64 limit");
+    auto result = cpu::ops::empty(std::array{static_cast<std::int64_t>(values.size())},
+        TensorOptions().dtype(kUInt8).device(target));
+    if (!values.empty()) std::memcpy(result.dense().data_ptr(), values.data(), result.nbytes());
+    return result;
+#endif
+}
+
+Tensor arange(std::int64_t first, std::int64_t last, Device target) {
+#if TYLOINFER_HAS_METAL
+    if (target.is_metal())
+        return metal::ops::arange(first, last, target);
+#endif
+#if TYLOINFER_HAS_CUDA
+    device(target);
+    return owner(cuda::ops::arange(first, last, target));
+#else
+    if (target != Device{DeviceType::cpu, 0}) throw std::invalid_argument("arange requires CPU:0 or a compiled device");
+    const auto count = last > first ? static_cast<std::uint64_t>(last) - static_cast<std::uint64_t>(first) : 0;
+    if (count > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()))
+        throw std::overflow_error("arange extent exceeds int64 limit");
+    auto result = cpu::ops::empty(std::array{static_cast<std::int64_t>(count)}, TensorOptions().dtype(kInt64).device(target));
+    if (count) std::iota(result.dense().data_ptr<std::int64_t>(), result.dense().data_ptr<std::int64_t>() + count, first);
+    return result;
+#endif
+}
+
+Tensor full(std::span<const std::int64_t> shape, std::int64_t value, Device target) {
+#if TYLOINFER_HAS_METAL
+    if (target.is_metal())
+        return metal::ops::full(shape, value, target);
+#endif
+#if TYLOINFER_HAS_CUDA
+    device(target);
+    return owner(cuda::ops::full(shape, value, target));
+#else
+    if (target != Device{DeviceType::cpu, 0}) throw std::invalid_argument("full requires CPU:0 or a compiled device");
+    auto result = cpu::ops::empty(shape, TensorOptions().dtype(kInt64).device(target));
+    if (result.numel()) std::fill_n(result.dense().data_ptr<std::int64_t>(), result.numel(), value);
+    return result;
+#endif
+}
+
+Tensor from_blob(void* data, std::span<const std::int64_t> shape, const TensorOptions& options) {
+#if TYLOINFER_HAS_METAL
+    if (options.target_device().is_metal())
+        throw std::invalid_argument("Metal from_blob cannot borrow external storage; use tensor or copy");
+#endif
+#if TYLOINFER_HAS_CUDA
+    device(options.target_device());
+    return owner(cuda::ops::from_blob(data, shape, options));
+#else
+    if (options.target_device() != Device{DeviceType::cpu, 0})
+        throw std::invalid_argument("from_blob requires CPU:0 or a compiled device");
+    auto view = make_contiguous_view(data, shape, options.scalar_type(), options.target_device());
+    const auto bytes = view.nbytes();
+    if (bytes && !data) throw std::invalid_argument("from_blob requires data for a nonempty view");
+    auto storage = std::make_shared<TensorStorage>();
+    storage->base = data;
+    storage->bytes = bytes;
+    storage->device = options.target_device();
+    storage->pinned = options.pinned();
+    return Tensor{DenseTensor(std::move(storage), view)};
+#endif
+}
+
+Tensor cast(const Tensor& value_tensor, ScalarType type, Device target) {
+#if TYLOINFER_HAS_METAL
+    if ((value_tensor.defined() && value_tensor.device().is_metal()) || target.is_metal()) {
+        if (!value_tensor.defined() || value_tensor.is_encoded())
+            throw std::invalid_argument("targeted Metal cast requires an unencoded tensor");
+        // Convert on Metal so a CPU target does not require an extra host numeric implementation.
+        auto device_value = value_tensor.device().is_metal() ? value_tensor : metal::ops::copy(value_tensor, target);
+        return metal::ops::copy(metal::ops::cast(device_value, type), target);
+    }
+#endif
+#if TYLOINFER_HAS_CUDA
+    const auto& value = ::tyloi::ops::dense(value_tensor);
+    input(value);
+    device(target);
+    return owner(cuda::ops::cast(value, type, target));
+#else
+    return copy(cast(value_tensor, type), target);
+#endif
+}
+
+std::vector<Tensor> chunk(const Tensor& value_tensor, std::int64_t count, std::int64_t dim) {
+#if TYLOINFER_HAS_CUDA
+#if TYLOINFER_HAS_METAL
+    if (!(value_tensor.defined() && value_tensor.device().is_metal())) {
+#endif
+    const auto& value = ::tyloi::ops::dense(value_tensor);
+    input(value);
+    return owners(tyloi::chunk(value, count, dim));
+#if TYLOINFER_HAS_METAL
+    }
+#endif
+#endif
+    if (!value_tensor.defined() || value_tensor.is_encoded()) throw std::invalid_argument("chunk requires an unencoded tensor");
+    if (count <= 0) throw std::invalid_argument("chunk count must be positive");
+    const auto rank = value_tensor.dim();
+    if (dim < 0) dim += rank;
+    if (dim < 0 || dim >= rank) throw std::out_of_range("tensor dimension is out of range");
+    const auto extent = value_tensor.size(dim);
+    const auto width = extent / count + (extent % count != 0);
+    std::vector<Tensor> result;
+    for (std::int64_t first = 0; first < extent;) {
+        const auto last = first + std::min(width, extent - first);
+        result.push_back(slice(value_tensor, dim, first, last));
+        first = last;
+    }
+    return result;
 }
 
 } // namespace tyloi::ops

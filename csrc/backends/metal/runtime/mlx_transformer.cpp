@@ -95,54 +95,6 @@ const mlx::core::fast::CustomKernelFunction& mrope_kernel() {
     return kernel;
 }
 
-constexpr const char* kAdjacentRopeSource = R"METAL(
-    const uint TOKENS = uint(cos_values_shape[0]);
-    const uint SIZE = uint(x_shape[0]) * uint(DIM);
-    uint index = thread_position_in_grid.x;
-    if (index >= uint(SIZE)) {
-        return;
-    }
-    uint column = index % uint(DIM);
-    uint row = index / uint(DIM);
-    constexpr uint PREFIX = uint(DIM - ROTARY);
-    if (column < PREFIX) {
-        y[index] = x[index];
-        return;
-    }
-
-    uint rotary_column = column - PREFIX;
-    uint pair = rotary_column >> 1u;
-    uint token = (row / uint(HEADS)) % uint(TOKENS);
-    float cosine = float(cos_values[token * uint(PAIRS) + pair]);
-    float sine = float(sin_values[token * uint(PAIRS) + pair]);
-    if (INVERSE != 0) {
-        sine = -sine;
-    }
-    uint pair_base = row * uint(DIM) + PREFIX + (pair << 1u);
-    float first = float(x[pair_base]);
-    float second = float(x[pair_base + 1u]);
-    float result = (rotary_column & 1u) == 0u
-        ? first * cosine - second * sine
-        : first * sine + second * cosine;
-    y[index] = T(result);
-)METAL";
-
-const mlx::core::fast::CustomKernelFunction& adjacent_rope_kernel() {
-    static const auto kernel = [] {
-        CompileOptions options;
-        options.math_mode = MathMode::Fast;
-        return mlx::core::fast::metal_kernel(
-            "mfq_cpp_adjacent_rope",
-            {"x", "cos_values", "sin_values"},
-            {"y"},
-            kAdjacentRopeSource,
-            "",
-            true,
-            false,
-            options);
-    }();
-    return kernel;
-}
 
 } // namespace
 
@@ -257,79 +209,6 @@ std::pair<array, array> mlx_yarn_tables(
     };
 }
 
-array mlx_rope_adjacent(
-    const array& value,
-    int rotary_dimension,
-    const array& cosine,
-    const array& sine,
-    bool inverse) {
-    if (value.ndim() < 2 || value.ndim() > 4 || value.shape(-1) <= 0 ||
-        rotary_dimension <= 0 || rotary_dimension > value.shape(-1) ||
-        rotary_dimension % 2 != 0 || cosine.shape() != sine.shape() ||
-        cosine.shape(-1) != rotary_dimension / 2) {
-        throw std::invalid_argument("invalid adjacent RoPE input");
-    }
-
-    auto source = value;
-    if (source.dtype() != mlx::core::float16 &&
-        source.dtype() != mlx::core::bfloat16 &&
-        source.dtype() != mlx::core::float32) {
-        source = mlx::core::astype(source, mlx::core::float16);
-    }
-    source = mlx::core::contiguous(source);
-    const int dimension = source.shape(-1);
-    const int tokens = source.ndim() == 2 ? source.shape(0) : source.shape(1);
-    const int heads = source.ndim() == 4 ? source.shape(2) : 1;
-    const int pairs = rotary_dimension / 2;
-    if (tokens <= 0 || heads <= 0 ||
-        cosine.size() != static_cast<std::size_t>(tokens) * pairs) {
-        throw std::invalid_argument(
-            "adjacent RoPE table is not token-broadcastable");
-    }
-    auto cos_values = mlx::core::contiguous(
-        mlx::core::astype(cosine, mlx::core::float32));
-    auto sin_values = mlx::core::contiguous(
-        mlx::core::astype(sine, mlx::core::float32));
-    if (source.size() >
-        static_cast<std::size_t>(std::numeric_limits<int>::max())) {
-        throw std::invalid_argument("adjacent RoPE tensor exceeds Metal limits");
-    }
-    const int grid = static_cast<int>(source.size());
-    auto outputs = adjacent_rope_kernel()(
-        {
-            mlx::core::reshape(source, Shape{grid / dimension, dimension}),
-            mlx::core::reshape(cos_values, Shape{tokens, pairs}),
-            mlx::core::reshape(sin_values, Shape{tokens, pairs}),
-        },
-        {source.shape()},
-        {source.dtype()},
-        {grid, 1, 1},
-        {std::min(256, grid), 1, 1},
-        {
-            {"T", source.dtype()},
-            {"DIM", dimension},
-            {"ROTARY", rotary_dimension},
-            {"PAIRS", pairs},
-            {"HEADS", heads},
-            {"INVERSE", inverse ? 1 : 0},
-        },
-        std::nullopt,
-        false,
-        {});
-    return std::move(outputs.front());
-}
-
-array mlx_rope_adjacent(
-    const array& value,
-    const array& cosine,
-    const array& sine,
-    bool inverse) {
-    if (value.ndim() == 0) {
-        throw std::invalid_argument("invalid adjacent RoPE input");
-    }
-    return mlx_rope_adjacent(
-        value, value.shape(-1), cosine, sine, inverse);
-}
 
 array apply_rope(
     const array& input,

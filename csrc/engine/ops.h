@@ -87,7 +87,7 @@ TailRopeTable tail_rope_table(std::int64_t max_positions, double base, std::int6
 Tensor tail_rope(const Tensor& input, const Tensor& positions,
     const TailRopeTable& table, bool inverse = false);
 
-// CUDA table with [positions, dimension / 2] FP32 cosine and sine tensors.
+// Device table with [positions, dimension / 2] FP32 cosine and sine tensors.
 // Nonpositive frequency_dim uses dimension; negative active_pairs uses all pairs.
 RopeTable rope_table(std::int64_t positions, std::int64_t dimension, double base, Device device,
                      std::int64_t frequency_dim = 0, std::int64_t active_pairs = -1);
@@ -283,7 +283,8 @@ inline Tensor from_blob(void* data, std::initializer_list<std::int64_t> shape, c
 }
 Tensor copy(const Tensor& input, Device target);
 // Writes destination's existing backing; source and destination may use different devices.
-// Metal requires matching contiguous tensors on the same device; partial overlap is rejected.
+// Metal accepts matching contiguous Metal tensors or a CPU source copied into owned staging.
+// Partial overlap and Metal-to-CPU writes are rejected; use copy for a completed host result.
 void copy_into(Tensor destination, const Tensor& source);
 Tensor cast(const Tensor& input, ScalarType type);
 // Targeted cast uses native tensor conversion; CUDA copy uses execution collectives.
@@ -313,7 +314,7 @@ Tensor sample_greedy(const Tensor& logits);
 std::vector<float> read_floats(const Tensor& input);
 std::vector<std::int64_t> read_integers(const Tensor& input);
 // [rows,vocab], count 1..64; returns flattened [rows,count] values and IDs.
-// force_compact selects the compact kernel for verification regardless of the environment.
+// force_compact selects the CUDA compact kernel for verification regardless of the environment.
 std::pair<std::vector<float>, std::vector<std::int64_t>> read_topk(
     const Tensor& logits, std::int64_t count, bool force_compact = false);
 // I64 [rows,stride>=count] packets: F32 bits in the high 32 bits, token ID in the low 32.
@@ -335,7 +336,7 @@ Tensor update_slice(const Tensor& destination, const Tensor& source, std::int64_
 // Index selection and updates dispatch to CUDA or Metal; indices share the input device.
 Tensor index_select(const Tensor& input, std::int64_t dim, const Tensor& indices);
 Tensor sum(const Tensor& input, std::int64_t dim, bool keepdim = false);
-// Modifies the input backing storage; Metal indexed update is not supported.
+// Modifies backing storage; Metal requires a contiguous destination.
 void index_copy(Tensor& input, std::int64_t dim, const Tensor& indices, const Tensor& source);
 std::vector<Tensor> chunk(const Tensor& input, std::int64_t count, std::int64_t dim);
 // Position tensors are I64.
