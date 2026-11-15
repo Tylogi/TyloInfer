@@ -37,7 +37,7 @@ public:
 
     void initialize(std::shared_ptr<const tyloi::ModelSource> source, std::string_view definition,
                     const tyloi::models::LoadOptions& options) {
-        *model_ = read(std::move(source), definition, options.context);
+        model_ = std::make_unique<Model>(read(std::move(source), definition, options.context));
         qwen35::load(*model_, weights_, placement_, options.yarn, cpu_layers_,
             {.gpu_layers = options.gpu_layers, .expert_parallel = options.expert_parallel,
              .mirror_scalars = options.mirror_scalars,
@@ -97,7 +97,7 @@ public:
             !positions.defined() || positions.scalar_type() != kInt64 ||
             positions.dim() != 1 || positions.size(0) != hidden.size(1))
             throw std::invalid_argument("Qwen layer input or position geometry is invalid");
-        for (const auto position : ::tyloi::ops::integers(positions))
+        for (const auto position : ::tyloi::ops::read_integers(positions))
             if (position < 0 || position >= model_->config.max_position_embeddings)
                 throw std::out_of_range("Qwen layer position outside context");
         const auto* rope = &model_->rope;
@@ -120,7 +120,7 @@ public:
         if (!ids.defined() || ids.dim() != 2 || ids.size(0) < 1 || ids.size(1) < 1 ||
             (ids.scalar_type() != kInt64 && ids.scalar_type() != kInt32))
             throw std::invalid_argument("Qwen reference token IDs require [batch,tokens] integers");
-        const auto indices = ::tyloi::ops::integers(ids);
+        const auto indices = ::tyloi::ops::read_integers(ids);
         auto embedded = ::tyloi::ops::empty(
             {static_cast<std::int64_t>(indices.size()), model_->config.hidden_size},
             TensorOptions().device(kCPU).dtype(kFloat16));

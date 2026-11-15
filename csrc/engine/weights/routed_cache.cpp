@@ -76,7 +76,6 @@ void Cache::Warmup::release(Device device, bool decode) {
 void Cache::begin_load() {
     reset();
     auto& executor = cuda::Executor::current();
-    executor.weights_ = this;
     data_->exec = executor.tq();
     data_->host_bytes = cuda::env_size("TYLOINFER_MOE_HOST_CACHE_BYTES", 0);
     data_->host_limit = cuda::env_size("TYLOINFER_MOE_HOST_PHYSICAL_BYTES", 0);
@@ -107,6 +106,7 @@ void Cache::report(std::ostream& output) const {
 }
 
 Cache::Activity Cache::activity() const {
+    if (data_->tq) return {data_->tq->streamed_bytes(), 0};
     return {moe_expert_streamed_bytes(data_->moe), moe_expert_graph_captures(data_->moe)};
 }
 
@@ -173,6 +173,12 @@ Cache::PrefillBudget Cache::prefill_budget(bool allow_borrow) const {
 }
 
 void Cache::workspace(std::size_t bytes) {
+    if (data_->tq) {
+        int device = 0;
+        TYLOINFER_CUDA_CHECK(cudaGetDevice(&device));
+        data_->tq->reclaim(device, bytes);
+        return;
+    }
     reserve_moe_workspace(data_->moe, bytes);
 }
 
@@ -208,7 +214,14 @@ void Cache::prepare(Stage stage, Device device, const source::Source* source) {
         retire_prefill();
         return;
     }
-    if (data_->tq || (stage == Stage::decode && !data_->moe)) return;
+    if (data_->tq) {
+        if (stage == Stage::loaded)
+            data_->tq->preload(device.index, cuda::options::workspace_reserve_bytes());
+        else if (stage == Stage::decode)
+            data_->tq->prepare_decode(device.index, cuda::options::workspace_reserve_bytes());
+        return;
+    }
+    if (stage == Stage::decode && !data_->moe) return;
     if (!device.is_cuda() || device.index < 0)
         throw std::invalid_argument("budget requires a CUDA device");
     prepare_moe_decode_residency(data_->moe);

@@ -221,10 +221,10 @@ static ::tyloi::DenseTensor dequant_quant_linear_f32(
         if (const auto* nint = linear.representation<tyloi::NintTensor>();
             nint != nullptr && tyloi::mfq_compat_enabled)
             return dequant_nint_dense_f32(*nint);
-#endif
         if (const auto* nvq = linear.representation<tyloi::NvqTensor>();
             nvq != nullptr && tyloi::mfq_compat_enabled)
             return nvq_dequant(*nvq).to(::tyloi::kFloat32).contiguous();
+#endif
         if (const auto* mx8 = linear.representation<tyloi::Mxfp8Tensor>();
             mx8 != nullptr)
             return mxfp8_dequant_cuda(mx8->values, mx8->scales).to(::tyloi::kFloat32).contiguous();

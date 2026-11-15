@@ -69,7 +69,7 @@ public:
 
     struct Mode {
         FfnMode ffn;
-        LinearAttention::Options linear;
+        LinearCore::Options linear;
         Compute compute;
         std::int64_t kv_capacity = 0;
         bool transposed = true;

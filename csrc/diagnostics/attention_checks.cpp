@@ -1222,10 +1222,10 @@ int run_dsv4_attention_check(tyloi::cuda::Program& program, int reps) {
         tyloi::cuda::deepseek_v4::PoolState batched, decoded;
         batched.ratio = R; batched.head_dim = ID; batched.overlap = true; batched.cache_quant_mode = 2;
         decoded.ratio = R; decoded.head_dim = ID; decoded.overlap = true; decoded.cache_quant_mode = 2;
-        batched.reset(B, T, program.config().layer_placement.primary_device());
+        batched.reset(B, T);
         work.keep(batched.state_kv); work.keep(batched.state_gate);
         work.keep(batched.previous_kv); work.keep(batched.previous_gate); work.keep(batched.pool);
-        decoded.reset(B, T, program.config().layer_placement.primary_device());
+        decoded.reset(B, T);
         work.keep(decoded.state_kv); work.keep(decoded.state_gate);
         work.keep(decoded.previous_kv); work.keep(decoded.previous_gate); work.keep(decoded.pool);
 

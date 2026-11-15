@@ -1,3 +1,4 @@
+#include "sparse_mma_raw.h"
 #include "mfq_sparse_attn_mma_f16.cuh"
 
 #include <algorithm>
@@ -86,9 +87,11 @@ void run(const Plan& p, const void* q, const void* k, const void* v,
     const int64_t strides[4], bool half_query, bool query_contiguous, bool wide_positions, int causal_columns,
     Hot cache, float scale, float* out, void* workspace, bool gated, cudaStream_t stream) {
     constexpr int ncols1 = 1, ncols2 = 16;
+    const tyloi::cuda::HotKvView hot_view{cache.keys, cache.values, cache.mapping, cache.cells,
+                                          cache.cold_mapping, cache.cold_cells};
     const mfq_sparse_attn_mma::RuntimeInput input{positions, strides[0], strides[1], strides[2], strides[3], causal_columns,
         half_query, positions && wide_positions,
-        positions || half_query || !query_contiguous, cache};
+        positions || half_query || !query_contiguous, hot_view};
     mfq_sparse_attn_mma::sparse_attention_kernel<DKQ, DV, ncols1, ncols2, view, hot>
         <<<p.blocks, dim3(32, p.threads / 32, 1), p.shared_bytes, stream>>>(
             q, static_cast<const half*>(k), static_cast<const half*>(v), indices,

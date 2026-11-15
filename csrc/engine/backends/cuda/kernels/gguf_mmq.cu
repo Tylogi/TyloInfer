@@ -2,6 +2,7 @@
 // ../../../third_party/strata.LICENSE). The kernels/quantizer are llama.cpp's
 // matching vendored sources. Scratch uses the runtime's budgeted allocator.
 #include "gguf_mmq.h"
+#include "engine/backends/cuda/native/env.h"
 #include "gguf_mmq_tab.h"
 #include "common.cuh"
 #include "components/ggml/src/ggml-cuda/mmq.cuh"

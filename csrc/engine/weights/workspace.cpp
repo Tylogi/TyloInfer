@@ -4,6 +4,7 @@
 #include "engine/weights/moe/expert_cache.h"
 #include "engine/weights/moe/kv_expert_loan.h"
 #include "engine/weights/cache_resources.h"
+#include "engine/weights/tq/cache.h"
 #include "env.h"
 #include "resident_allocations.h"
 #include "engine/weights/source/source.h"
@@ -182,6 +183,11 @@ std::size_t Cache::prefill_workspace_capacity() const noexcept {
 }
 
 void Cache::release_workspace(std::size_t required_available, const char* reason) {
+    if (data_->tq && required_available != std::numeric_limits<std::size_t>::max()) {
+        int device = 0;
+        TYLOINFER_CUDA_CHECK(cudaGetDevice(&device));
+        data_->tq->reclaim(device, required_available);
+    }
     if (!data_->workspace || data_->workspace->prefill_regions.empty()) return;
     auto& w = *data_->workspace;
     auto& loan = *data_->kv->loan;

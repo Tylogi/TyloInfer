@@ -53,7 +53,7 @@ code signatures, then copies the DMG to `packaging/dist/`.
 ## Windows
 
 The Windows release packages `mfq serve`, TyloInfer, and the native CUDA
-`mfq-runtime` sidecar into a single x64 NSIS installer. Service and model management are included. The package
+`tyloi-engine` sidecar into a single x64 NSIS installer. Service and model management are included. The package
 excludes PyTorch and the training, calibration, quantization, and MiniCPM-o
 dependency groups. The CUDA, cuBLAS, MSVC, and optional OpenMP runtime DLLs are
 bundled with the sidecar, so end users do not need Python, the CUDA Toolkit, or a

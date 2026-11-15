@@ -30,6 +30,7 @@
 #include "engine/weights/cache.h"
 #include "engine/models/qwen35/components.h"
 #include "engine/models/qwen35/state.h"
+#include "engine/models/minicpmo45/model.h"
 #include "engine/models/minicpmo45/state.h"
 #include "engine/models/minicpmo45/text/load.h"
 #include "engine/models/minicpmo45/text/state.h"

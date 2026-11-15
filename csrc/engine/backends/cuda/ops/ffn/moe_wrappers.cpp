@@ -23,8 +23,8 @@ std::vector<::tyloi::DenseTensor> moe_topk_cuda(
         double scale) {
     TYLOINFER_RUNTIME_CHECK(logits.is_cuda() && logits.is_contiguous() && logits.dim() == 2,
         "logits must be contiguous CUDA [tokens, experts]");
-    TYLOINFER_RUNTIME_CHECK(logits.scalar_type() == ::tyloi::kFloat32 || logits.scalar_type() == ::tyloi::kFloat16,
-        "logits must be float16 or float32");
+    TYLOINFER_RUNTIME_CHECK(logits.scalar_type() == ::tyloi::kFloat32 || logits.scalar_type() == ::tyloi::kFloat16 ||
+        logits.scalar_type() == ::tyloi::kBFloat16, "logits must be float16, bfloat16 or float32");
     const int rows = static_cast<int>(logits.size(0));
     const int experts = static_cast<int>(logits.size(1));
     TYLOINFER_RUNTIME_CHECK(rows > 0 && experts > 0, "logits dimensions must be nonzero");
@@ -83,7 +83,8 @@ std::vector<::tyloi::DenseTensor> moe_topk_cuda(
     }
     tyloi::cuda::moe_raw::Router args{logits.data_ptr(),bias_ptr,ids.data_ptr<int32_t>(),weights.data_ptr<float>(),
         rows,experts,bias_stride,int(top_k),use_sigmoid,use_sqrt_softplus,normalize,delayed_softmax,
-        float(norm_floor),float(scale),logits.scalar_type()==::tyloi::kFloat16 ? tyloi::cuda::NumericType::f16 : tyloi::cuda::NumericType::f32,kernel};
+        float(norm_floor),float(scale),logits.scalar_type()==::tyloi::kFloat16 ? tyloi::cuda::NumericType::f16 :
+        logits.scalar_type()==::tyloi::kBFloat16 ? tyloi::cuda::NumericType::bf16 : tyloi::cuda::NumericType::f32,kernel};
     tyloi::cuda::moe_raw::topk(args,stream);
     TYLOINFER_CUDA_KERNEL_LAUNCH_CHECK();
     return {ids,weights};
@@ -96,8 +97,8 @@ std::vector<::tyloi::DenseTensor> moe_topk_cuda(
         double scale) {
     TYLOINFER_RUNTIME_CHECK(logits.is_cuda() && logits.is_contiguous() && logits.dim() == 2,
         "logits must be contiguous CUDA [tokens, experts]");
-    TYLOINFER_RUNTIME_CHECK(logits.scalar_type() == ::tyloi::kFloat32 || logits.scalar_type() == ::tyloi::kFloat16,
-        "logits must be float16 or float32");
+    TYLOINFER_RUNTIME_CHECK(logits.scalar_type() == ::tyloi::kFloat32 || logits.scalar_type() == ::tyloi::kFloat16 ||
+        logits.scalar_type() == ::tyloi::kBFloat16, "logits must be float16, bfloat16 or float32");
     TYLOINFER_RUNTIME_CHECK(ids.is_cuda() && ids.is_contiguous() && ids.dim() == 2 &&
         ids.scalar_type() == ::tyloi::kInt32, "ids must be contiguous CUDA int32 [tokens, top_k]");
     check_same_device(logits, ids, "ids");
@@ -111,7 +112,8 @@ std::vector<::tyloi::DenseTensor> moe_topk_cuda(
 
     auto weights = ::tyloi::cuda::empty(ids.sizes(), logits.options().dtype(::tyloi::kFloat32));
     tyloi::cuda::moe_raw::sqrt_weights(logits.data_ptr(),ids.data_ptr<int32_t>(),weights.data_ptr<float>(),rows,experts,top_k,
-        float(norm_floor),float(scale),logits.scalar_type()==::tyloi::kFloat16 ? tyloi::cuda::NumericType::f16 : tyloi::cuda::NumericType::f32,mfq_current_cuda_stream());
+        float(norm_floor),float(scale),logits.scalar_type()==::tyloi::kFloat16 ? tyloi::cuda::NumericType::f16 :
+        logits.scalar_type()==::tyloi::kBFloat16 ? tyloi::cuda::NumericType::bf16 : tyloi::cuda::NumericType::f32,mfq_current_cuda_stream());
     TYLOINFER_CUDA_KERNEL_LAUNCH_CHECK();
     return weights;
 }

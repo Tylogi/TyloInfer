@@ -31,6 +31,10 @@ public:
                                       const std::vector<::tyloi::encoding::TqTensor>& weights, int device);
     std::size_t budget();
     void resize(std::size_t bytes);
+    void preload(int device, std::size_t workspace_reserve);
+    void reclaim(int device, std::size_t available_bytes);
+    void prepare_decode(int device, std::size_t workspace_reserve);
+    std::uint64_t streamed_bytes();
     std::size_t reserve(std::size_t bytes);
     std::vector<std::pair<std::string, double>> metrics();
 
@@ -72,6 +76,7 @@ private:
     std::shared_ptr<TqExec> tq_;
     tyloi::weights::Lru<std::uint64_t, std::shared_ptr<HostImage>> host_;
     tyloi::weights::Lru<DeviceKey, DeviceEntry, DeviceKeyHash> device_;
+    std::optional<std::size_t> device_budget_;
     std::unordered_map<std::uint64_t, std::vector<ViewTable>> view_tables_;
     std::size_t payload_bytes_ = 0, process_host_limit_ = 0;
     std::uint64_t source_reads_ = 0;

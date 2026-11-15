@@ -1,5 +1,6 @@
 #pragma once
 #include <cuda_runtime.h>
+#include "engine/backends/cuda/native/env.h"
 #include <cuda_fp16.h>
 #include <math_constants.h>
 #include <atomic>

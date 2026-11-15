@@ -52,6 +52,7 @@ private:
     std::pair<bool, std::vector<EngineEvent>> advance(const std::vector<RequestId>& eligible);
     void retire_failed() noexcept;
     void refresh_snapshot(bool healthy, bool blocked, bool metrics);
+    void reset_states(std::int64_t batch);
 
     Engine& engine_;
     Limits limits_;

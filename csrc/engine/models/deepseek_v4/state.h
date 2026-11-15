@@ -1,6 +1,7 @@
 #pragma once
 
 #include "engine/models/session/snapshot.h"
+#include "engine/models/state.h"
 #include <cstdint>
 #include <vector>
 
@@ -17,7 +18,7 @@ struct PoolState {
 
 struct LayerState { DenseTensor local_cache; PoolState compressor, indexer_compressor; };
 
-class State {
+class State : public tyloi::models::State {
 public:
     explicit State(const Model&);
     State(const State&) = delete;

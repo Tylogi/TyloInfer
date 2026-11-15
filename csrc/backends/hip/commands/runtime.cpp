@@ -22,10 +22,10 @@ void print_help() {
     std::cout
         << "MFQ native CUDA runtime\n\n"
         << "Usage:\n"
-        << "  mfq-runtime --model MODEL --transport stdio|http [OPTIONS]\n"
-        << "  mfq-runtime --model MODEL --minicpmo-input-prefix PREFIX "
+        << "  tyloi-engine --model MODEL --transport stdio|http [OPTIONS]\n"
+        << "  tyloi-engine --model MODEL --minicpmo-input-prefix PREFIX "
            "--minicpmo-output-prefix PREFIX [OPTIONS]\n"
-        << "  mfq-runtime --model MODEL --minicpmo-duplex-input-prefix PREFIX "
+        << "  tyloi-engine --model MODEL --minicpmo-duplex-input-prefix PREFIX "
            "--minicpmo-duplex-output-prefix PREFIX [OPTIONS]\n\n"
         << "Runtime options:\n"
         << "  --model PATH                    model or split-model shard\n"

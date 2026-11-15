@@ -19,6 +19,7 @@
 #include <cmath>
 #include <limits>
 #include "engine/backends/cuda/native/tensor/backend.h"
+#include "mfq_cuda_linear_attention_ops.h"
 #include <vector>
 #include <cstdlib>
 #include <cstdio>
@@ -323,7 +324,38 @@ __global__ void gdn_warp_column_kernel(
         }                                                                              \
     } while (0)
 
+static void gdn_check(cudaError_t status) { TYLOINFER_CUDA_CHECK(status); }
+
 #include "gdn_prefill_columns.inc"
+
+// The native path picks the launch strategy from the environment; the raw
+// adapter passes its own choice instead.
+template<bool TRANSPOSED_STATE, bool TILED_HEADS>
+void launch_gdn_prefill_columns(int columns, int B, int Hq, int Hv, int T,
+    const float* q, const float* k, const float* v, const float* g, const float* beta,
+    const float* state, float* out, float* next_state, cudaStream_t stream,bool prepared_decay=false) {
+    const auto* pipeline_option=tyloi::cuda::env_lookup("TYLOINFER_GDN_PREFILL_PIPELINED");
+    // Register prefetch is independent of batch size and head count.
+    const bool pipelined=pipeline_option?std::atoi(pipeline_option)!=0:true;
+    const auto* staged_option=tyloi::cuda::env_lookup("TYLOINFER_GDN_PREFILL_STAGED");
+    bool staged=false;
+    if(columns==4 && T>8) {
+        if(staged_option)staged=std::atoi(staged_option)!=0;
+        else if(pipelined && T>=128) {
+            static thread_local int cached_device=-1,cached_major=0;
+            const int device=mfq_current_cuda_device();
+            if(device!=cached_device) {
+                TYLOINFER_CUDA_CHECK(cudaDeviceGetAttribute(&cached_major,cudaDevAttrComputeCapabilityMajor,device));
+                cached_device=device;
+            }
+            staged=cached_major>=8;
+        }
+    }
+    launch_gdn_prefill_columns_selected<TRANSPOSED_STATE,TILED_HEADS>(columns,B,Hq,Hv,T,q,k,v,g,beta,
+        state,out,next_state,stream,prepared_decay,pipelined,staged);
+}
+
+
 
 static std::vector<::tyloi::DenseTensor> gdn_cuda_impl(
     ::tyloi::DenseTensor q, ::tyloi::DenseTensor k, ::tyloi::DenseTensor v,

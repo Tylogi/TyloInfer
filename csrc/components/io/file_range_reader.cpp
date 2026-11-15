@@ -459,6 +459,9 @@ void FileRangeReader::read(std::uint64_t offset, std::byte* destination, std::si
         const auto alignment = impl_->alignment;
 #if defined(_WIN32)
         const auto limit = std::size_t(std::numeric_limits<DWORD>::max()) / alignment * alignment;
+#elif defined(__linux__)
+        // Linux caps a single read below 2 GiB, even with a 64-bit size_t.
+        const auto limit = (std::size_t(1) << 30) / alignment * alignment;
 #else
         const auto limit = std::size_t(std::numeric_limits<ssize_t>::max()) / alignment * alignment;
 #endif

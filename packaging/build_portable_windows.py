@@ -40,7 +40,7 @@ def payload(project: Path, executable: Path) -> dict[str, Path]:
     for source in bundle["externalBin"]:
         path = (tauri / f"{source}-x86_64-pc-windows-msvc.exe").resolve()
         add(path, Path(source).name + ".exe")
-    for required in ("mfq-runtime.exe", "mfq-diagnostics.exe", "tyloinfer-cli/tyloinfer-cli.exe", "web-ui/index.html"):
+    for required in ("tyloi-engine.exe", "mfq-diagnostics.exe", "tyloinfer-cli/tyloinfer-cli.exe", "web-ui/index.html"):
         if required not in files:
             raise FileNotFoundError(f"Missing portable resource: {required}")
     return files

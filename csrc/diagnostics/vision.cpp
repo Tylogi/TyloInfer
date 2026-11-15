@@ -54,7 +54,7 @@ float pixel(std::int64_t index) {
 nlohmann::json json_tensor(const tyloi::Tensor& value) {
     std::vector<std::int64_t> shape;
     for (std::int64_t dim = 0; dim < value.dim(); ++dim) shape.push_back(value.size(dim));
-    return {{"shape", shape}, {"data", tyloi::ops::floats(value)}};
+    return {{"shape", shape}, {"data", tyloi::ops::read_floats(value)}};
 }
 }
 

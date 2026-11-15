@@ -27,7 +27,7 @@
 
 namespace tyloi::cuda::deepseek_v4 {
 
-Layer load_layer(const tyloi::weights::Loader& weights, const Config &c, int i,
+void load_layer(Layer& layer, const tyloi::weights::Loader& weights, const Config &c, int i,
                  const std::string &type, Collectives& collectives, int primary,
                  const std::unordered_set<int>& offload, int64_t& host_bytes) {
     const auto &config = c;
@@ -35,7 +35,6 @@ Layer load_layer(const tyloi::weights::Loader& weights, const Config &c, int i,
         throw std::runtime_error("invalid DeepSeek V4 layer type");
     MfqCudaGuard guard(weights.placement.target.index);
     const std::string p = "model.block." + std::to_string(i) + ".";
-    Layer layer;
     layer.device = weights.placement.target.index;
     layer.layer = i;
     layer.max_positions = c.max_position_embeddings;
@@ -98,9 +97,7 @@ Layer load_layer(const tyloi::weights::Loader& weights, const Config &c, int i,
     }
 
     const bool cpu_offload = offload.count(i) != 0;
-    layer.ffn = load_moe_weights(
-        weights, p + "mlp.",
-        {.layer = i, .cpu_offloaded = cpu_offload, .shared_gate_up_compatible_prefix = 0});
+    load_ffn(layer.ffn, weights, c, i, cpu_offload);
     if (cpu_offload) {
         const int64_t gate_up_bytes =
             layer.ffn.moe_split_gate_up
@@ -112,20 +109,6 @@ Layer load_layer(const tyloi::weights::Loader& weights, const Config &c, int i,
                   << " down_bytes=" << down_bytes
                   << " total_host_bytes=" << host_bytes << std::endl;
     }
-    if (i < config.hash_layer_count) {
-        layer.ffn.moe_hash_ids = std::make_shared<::tyloi::DenseTensor>(weights.tensor(p + "mlp.router.token_to_expert").dense()
-                                  .to(::tyloi::kInt32)
-                                  .contiguous());
-    }
-    layer.ffn.moe_top_k = static_cast<int>(c.num_experts_per_tok);
-    layer.ffn.moe_use_sqrt_softplus = true;
-    layer.ffn.moe_normalize = c.norm_topk_prob;
-    layer.ffn.moe_delayed_softmax = false;
-    layer.ffn.moe_shared_ungated = true;
-    layer.ffn.moe_router_scale = c.routed_scaling_factor;
-    layer.ffn.swiglu_limit = c.swiglu_limit;
-    layer.ffn.shared->swiglu_limit = c.swiglu_limit;
-
     const bool base_shapes =
         layer.attn_norm.numel() == c.hidden_size && layer.ffn_norm.numel() == c.hidden_size &&
         layer.q_a_norm.numel() == c.q_lora_rank && layer.kv_norm.numel() == c.head_dim &&
@@ -137,27 +120,52 @@ Layer load_layer(const tyloi::weights::Loader& weights, const Config &c, int i,
         layer.output_a.size(0) == c.o_groups * c.o_lora_rank &&
         layer.output_b.size(1) == c.o_groups * c.o_lora_rank &&
         layer.output_b.size(0) == c.hidden_size;
-    const bool gate_up_shapes =
-        layer.ffn.moe_split_gate_up
-            ? layer.ffn.moe_gate && layer.ffn.moe_up && layer.ffn.moe_gate.size(0) == c.num_experts &&
-                  layer.ffn.moe_up.size(0) == c.num_experts &&
-                  layer.ffn.moe_gate.size(2) == c.hidden_size &&
-                  layer.ffn.moe_up.size(2) == c.hidden_size &&
-                  layer.ffn.moe_gate.size(1) == c.moe_intermediate_size &&
-                  layer.ffn.moe_up.size(1) == c.moe_intermediate_size
-            : layer.ffn.moe_gate_up && layer.ffn.moe_gate_up.size(0) == c.num_experts &&
-                  layer.ffn.moe_gate_up.size(2) == c.hidden_size &&
-                  layer.ffn.moe_gate_up.size(1) == 2 * c.moe_intermediate_size;
-    const bool moe_shapes = gate_up_shapes && layer.ffn.moe_down && layer.ffn.moe_down.size(0) == c.num_experts &&
-                            layer.ffn.moe_down.size(2) == c.moe_intermediate_size &&
-                            layer.ffn.moe_down.size(1) == c.hidden_size &&
-                            layer.ffn.moe_router && layer.ffn.moe_router.size(0) == c.num_experts &&
-                            layer.ffn.moe_router.size(1) == c.hidden_size;
-    if (!base_shapes || !moe_shapes) {
+    if (!base_shapes) {
         throw std::runtime_error("DeepSeek V4 tensor shapes disagree with config at layer " +
                                  std::to_string(i));
     }
-    return layer;
+}
+
+void load_ffn(Ffn& ffn, const tyloi::weights::Loader& weights, const Config& c,
+              int i, bool cpu_offload) {
+    const std::string p = "model.block." + std::to_string(i) + ".";
+    ffn = load_moe_weights(
+        weights, p + "mlp.",
+        {.layer = i, .cpu_offloaded = cpu_offload, .shared_gate_up_compatible_prefix = 0});
+    if (i < c.hash_layer_count) {
+        ffn.moe_hash_ids = std::make_shared<::tyloi::DenseTensor>(weights.tensor(p + "mlp.router.token_to_expert").dense()
+                                  .to(::tyloi::kInt32)
+                                  .contiguous());
+    }
+    ffn.moe_top_k = static_cast<int>(c.num_experts_per_tok);
+    ffn.moe_use_sqrt_softplus = true;
+    ffn.moe_normalize = c.norm_topk_prob;
+    ffn.moe_delayed_softmax = false;
+    ffn.moe_shared_ungated = true;
+    ffn.moe_router_scale = c.routed_scaling_factor;
+    ffn.swiglu_limit = c.swiglu_limit;
+    ffn.shared->swiglu_limit = c.swiglu_limit;
+
+    const bool gate_up_shapes =
+        ffn.moe_split_gate_up
+            ? ffn.moe_gate && ffn.moe_up && ffn.moe_gate.size(0) == c.num_experts &&
+                  ffn.moe_up.size(0) == c.num_experts &&
+                  ffn.moe_gate.size(2) == c.hidden_size &&
+                  ffn.moe_up.size(2) == c.hidden_size &&
+                  ffn.moe_gate.size(1) == c.moe_intermediate_size &&
+                  ffn.moe_up.size(1) == c.moe_intermediate_size
+            : ffn.moe_gate_up && ffn.moe_gate_up.size(0) == c.num_experts &&
+                  ffn.moe_gate_up.size(2) == c.hidden_size &&
+                  ffn.moe_gate_up.size(1) == 2 * c.moe_intermediate_size;
+    const bool moe_shapes = gate_up_shapes && ffn.moe_down && ffn.moe_down.size(0) == c.num_experts &&
+                            ffn.moe_down.size(2) == c.moe_intermediate_size &&
+                            ffn.moe_down.size(1) == c.hidden_size &&
+                            ffn.moe_router && ffn.moe_router.size(0) == c.num_experts &&
+                            ffn.moe_router.size(1) == c.hidden_size;
+    if (!moe_shapes) {
+        throw std::runtime_error("DeepSeek V4 MoE tensor shapes disagree with config at layer " +
+                                 std::to_string(i));
+    }
 }
 
 void validate_offload(const Config &config, const std::unordered_set<int>& offload) {
@@ -190,9 +198,9 @@ OutputHeadWeights load_output_head(const tyloi::weights::Loader& weights) {
 
 ::tyloi::DenseTensor finalize_hidden(::tyloi::DenseTensor hidden,
                                            const OutputHeadWeights &output_head,
-                                           const Config &config, CudaProfiler &profiler,
+                                           const Config &config,
                                            int64_t batch, int64_t tokens) {
-    return profiler.measure("model.dsv4_hc_head", [&]() {
+    return tyloi::ops::measure("model.dsv4_hc_head", hidden.device(), [&]() {
         auto flat = hidden.flatten(2).to(::tyloi::kFloat32);
         auto inverse_rms =
             ::tyloi::cuda::rsqrt(flat.square().mean(-1, true) + config.rms_norm_eps);
@@ -250,9 +258,8 @@ Model read(std::shared_ptr<const tyloi::ModelSource> source, std::string_view de
     return model;
 }
 
-void load(Model& model, const tyloi::weights::Loader& weights, LayerPlacementConfig& placement,
-          Collectives& collectives, int primary, const std::unordered_set<int>& offload,
-          int64_t& host_bytes, int gpu_layers) {
+void load_deferred(Model& model, const tyloi::weights::Loader& weights,
+                   LayerPlacementConfig& placement, int gpu_layers) {
     const auto& c = model.config;
     placement.prepare(c.num_hidden_layers);
     const int cpu_layers = gpu_layers < 0 ? 0 :
@@ -271,13 +278,21 @@ void load(Model& model, const tyloi::weights::Loader& weights, LayerPlacementCon
         : weights.placement.tensor.enabled()
             ? weights.weight("model.token_embedding.weight", TensorParallelAxis::Output)
             : model.embed;
+}
+
+void load(Model& model, const tyloi::weights::Loader& weights, LayerPlacementConfig& placement,
+          Collectives& collectives, int primary, const std::unordered_set<int>& offload,
+          int64_t& host_bytes, int gpu_layers) {
+    load_deferred(model, weights, placement, gpu_layers);
+    const auto& c = model.config;
     model.layers.reserve(static_cast<size_t>(c.num_hidden_layers));
     for (int index = 0; index < c.num_hidden_layers; ++index) {
         const int device = placement.device_for_layer(index);
         const auto& type = model.metadata.layer_types.at(static_cast<size_t>(index));
         std::cerr << "loading layer " << index << ' ' << type << " CUDA" << std::endl;
-        model.layers.push_back(load_layer(weights.for_layer(::tyloi::Device(::tyloi::kCUDA, device)), c, index, type,
-                                          collectives, primary, offload, host_bytes));
+        model.layers.emplace_back();
+        load_layer(model.layers.back(), weights.for_layer(::tyloi::Device(::tyloi::kCUDA, device)), c, index, type,
+                   collectives, primary, offload, host_bytes);
     }
 }
 
@@ -292,47 +307,68 @@ DenseTensor normalize_ids(Collectives& collectives, int primary, DenseTensor ids
 }
 } // namespace
 
-::tyloi::Tensor embed(const Model& model, Executor& executor, Collectives& collectives, int primary,
-             ::tyloi::Tensor input_ids, const Executor::Mode& mode) {
-    auto ids = normalize_ids(collectives, primary, std::move(input_ids).dense());
-    auto scope = executor.enter(mfq_current_cuda_device(), mode.ffn);
-    return ::tyloi::ops::measure("model.embed", ids.device(), [&] {
-        return ::tyloi::ops::embedding(ids, model.embed);
+tyloi::models::Info Model::info() const { return tyloi::models::model_info(metadata); }
+MfqModelCapabilities Model::capabilities() const {
+    return {graph.architecture, graph.has_component("text"), false, false,
+            false, false, false, false, "model-graph"};
+}
+tyloi::engine::Metrics Model::metrics() const {
+    return {{"kv_memory_supported", 0.0}, {"kv_quantization_supported", 0.0},
+            {"vision_declared", double(graph.has_component("vision"))},
+            {"vision_supported", 0.0}, {"vision_available", 0.0},
+            {"mtp_declared", double(graph.has_component("predictor"))},
+            {"mtp_supported", 0.0}, {"mtp_available", 0.0}};
+}
+std::unique_ptr<tyloi::models::State> Model::make_state() const { return std::make_unique<State>(*this); }
+tyloi::StepSequence<tyloi::models::Prepared> Model::prepare(
+        const std::vector<std::int64_t>&, const MfqMultimodalInput&, tyloi::models::State&) const {
+    throw std::invalid_argument("model has no multimodal component");
+}
+
+::tyloi::Tensor Model::embedding(const ::tyloi::Tensor& input_ids, int primary) const {
+    tyloi::models::require_model(input_ids.dim() == 1 || input_ids.dim() == 2,
+                               "token IDs must have shape [tokens] or [batch,tokens]");
+    auto ids = tyloi::ops::cast(input_ids, tyloi::kInt64);
+    if (ids.dim() == 1) ids = tyloi::ops::unsqueeze(ids, 0);
+    tyloi::models::require_model(ids.size(0) > 0 && ids.size(1) > 0, "token IDs must not be empty");
+    ids = tyloi::ops::contiguous(tyloi::ops::copy(ids, tyloi::Device(tyloi::kCUDA, primary)));
+    return tyloi::ops::measure("model.embed", ids.device(), [&] { return tyloi::ops::embedding(ids, embed); });
+}
+
+::tyloi::Tensor Model::normalize(const ::tyloi::Tensor& input_hidden, int64_t batch, int64_t tokens) const {
+    auto hidden = input_hidden.dim() == 4
+        ? finalize_hidden(input_hidden.dense(), output_head, config, batch, tokens) : input_hidden.dense();
+    return tyloi::ops::measure("model.output_norm", hidden.device(), [&] {
+        return tyloi::ops::rms_norm(tyloi::ops::cast(tyloi::ops::reshape(hidden,
+            {batch, tokens, metadata.hidden_size}), tyloi::kFloat32), output_norm,
+            metadata.rms_norm_eps, metadata.norm_weight_offset);
     });
 }
 
-::tyloi::Tensor normalize(const Model& model, Executor& executor, ::tyloi::Tensor input_hidden, int64_t batch, int64_t tokens) {
-    auto hidden = input_hidden.dense();
-    return executor.profiler().measure("model.output_norm", [&]() {
-        return qwen_rms_norm(hidden.reshape({batch * tokens, model.metadata.hidden_size})
-                                 .to(::tyloi::kFloat32),
-                             model.output_norm, model.metadata.rms_norm_eps,
-                             model.metadata.norm_weight_offset)
-            .reshape({batch, tokens, model.metadata.hidden_size});
+::tyloi::Tensor Model::softcap(const ::tyloi::Tensor& value) const {
+    return tyloi::ops::softcap(value, metadata.final_logit_softcapping);
+}
+
+::tyloi::Tensor Model::logits(const ::tyloi::Tensor& hidden, bool capped) const {
+    auto value = tyloi::ops::measure("model.lm_head", hidden.device(), [&] {
+        return tyloi::ops::project(hidden, lm_head);
     });
+    return capped ? softcap(value) : value;
 }
 
-::tyloi::Tensor softcap(const Model& model, Executor&, ::tyloi::Tensor value) {
-    const double cap = model.metadata.final_logit_softcapping;
-    if (cap > 0.0) return ::tyloi::cuda::tanh(value.dense() / cap) * cap;
-    return value;
-}
-
-::tyloi::Tensor logits(const Model& model, Executor& executor, ::tyloi::Tensor input_hidden, bool capped,
-              const Executor::Mode& mode) {
-    auto scope = executor.enter(mfq_current_cuda_device(), mode.ffn);
-    auto value = ::tyloi::ops::measure("model.lm_head", input_hidden.device(), [&] {
-        return ::tyloi::ops::project(input_hidden, model.lm_head);
-    });
-    return capped ? softcap(model, executor, std::move(value)) : value;
-}
-
-::tyloi::Tensor forward(const Model& model, State& state, Executor& executor, Collectives& collectives,
-               const Executor::Mode& mode, tyloi::models::Input input) {
+::tyloi::Tensor Model::forward(tyloi::models::Input input, tyloi::models::State& state_value,
+                             const tyloi::models::ForwardOptions& forward_options) const {
+    if (input.suffix) throw std::invalid_argument("DeepSeek V4 does not support speculative suffix forwarding");
+    auto& state = dynamic_cast<State&>(state_value);
+    auto& executor = Executor::current();
+    auto& collectives = executor.collectives();
+    auto mode = executor.mode();
+    mode.primary = forward_options.primary;
+    const auto& model = *this;
     MfqCudaGuard guard(mode.primary);
     auto ids = normalize_ids(collectives, mode.primary, std::move(input.ids).dense());
     auto embeddings = input.embeddings.defined() ? std::move(input.embeddings).dense()
-        : embed(model, executor, collectives, mode.primary, ids, mode).dense();
+        : embedding(ids, mode.primary).dense();
     const auto B = ids.size(0), T = ids.size(1);
     tyloi::models::require_model(embeddings.dim() == 3 && embeddings.size(0) == B &&
                                    embeddings.size(1) == T && embeddings.size(2) == model.metadata.hidden_size,
@@ -379,8 +415,7 @@ DenseTensor normalize_ids(Collectives& collectives, int primary, DenseTensor ids
     }
     if (!input.positions.defined() || input.advance) state.cache_pos += T;
     hidden = collectives.copy(std::move(hidden), mode.primary);
-    auto collapsed = finalize_hidden(hidden, model.output_head, model.config, executor.profiler(), B, T);
-    auto finalized = normalize(model, executor, std::move(collapsed), B, T);
+    auto finalized = normalize(hidden, B, T);
     if (input.raw_hidden) *input.raw_hidden = std::move(hidden);
     return finalized;
 }

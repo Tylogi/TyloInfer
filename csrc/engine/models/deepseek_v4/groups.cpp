@@ -1,4 +1,5 @@
 #include "engine/models/deepseek_v4/groups.h"
+#include "engine/models/common/attention.h"
 
 #include "engine/backends/cuda/native/tensor/backend.h"
 #include "engine/models/deepseek_v4/forward.h"
@@ -119,9 +120,9 @@ public:
             const auto& layer = model_.layers[index];
             MfqCudaGuard guard(layer.device);
             const Device device(kCUDA, layer.device);
-            const AttentionStep step{::tyloi::ops::copy(positions, device), {}, {}, 0, 0, 0};
-            result = forward_layer(layer, request->state.layers[index],
-                ::tyloi::ops::copy(result, device), ::tyloi::ops::copy(ids, device), step, options);
+            const ::tyloi::models::AttentionStep step{::tyloi::ops::copy(positions, device), {}, {}, 0, 0, 0};
+            result = forward_layer(layer, request->state.layers[index], Executor::current(),
+                ::tyloi::ops::copy(result, device).dense(), ::tyloi::ops::copy(ids, device).dense(), step, Executor::Mode{});
         }
         return ::tyloi::ops::copy(result, Device(kCUDA, primary_));
     }
@@ -132,7 +133,7 @@ public:
             batch <= 0 || tokens <= 0 || hidden.size(0) != batch || hidden.size(1) != tokens ||
             hidden.size(2) != info().streams || hidden.size(3) != info().width)
             throw std::invalid_argument("DeepSeek V4 finalize hidden geometry differs");
-        return deepseek_v4::finalize(model_, hidden, batch, tokens);
+        return model_.normalize(hidden, batch, tokens);
     }
 
     Tensor logits(const Tensor& hidden) const override { require_prepared(); return model_.logits(hidden); }
@@ -161,8 +162,8 @@ std::unique_ptr<tyloi::models::Groups> load_groups(
     if (!source || &weights.source != source.get())
         throw std::invalid_argument("DeepSeek V4 source and weight loader must match");
     auto model = read(std::move(source), definition, options.context);
-    if (model.plan.vision != ::tyloi::models::Vision::none ||
-        model.plan.predictor != ::tyloi::models::Predictor::none)
+    if (model.plan.vision != ::tyloi::models::VisionAdapter::none ||
+        model.plan.predictor != ::tyloi::models::PredictorAdapter::none)
         throw std::runtime_error("CUDA component adapter is unsupported for this model");
     return std::make_unique<DeepseekGroups>(std::move(model), weights, placement, options);
 }

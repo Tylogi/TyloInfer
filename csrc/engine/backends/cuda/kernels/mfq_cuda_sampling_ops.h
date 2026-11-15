@@ -16,7 +16,7 @@ void decode_graph_commit_cuda(::tyloi::DenseTensor next, ::tyloi::DenseTensor ge
 // A stable device flag selects work at replay time without another graph
 // shape. The owner must publish it before launch and retain it through replay.
 ::tyloi::DenseTensor sample_top_k_compact_if_cuda(
-    ::tyloi::DenseTensor logits,int64_t top_k,const volatile int32_t* enabled);
+    ::tyloi::DenseTensor logits,int64_t top_k,const volatile int32_t* enabled,::tyloi::DenseTensor output = {});
 void sample_token_counts_add_cuda(::tyloi::DenseTensor counts, ::tyloi::DenseTensor tokens);
 ::tyloi::DenseTensor sample_apply_penalties_cuda(
     ::tyloi::DenseTensor logits, ::tyloi::DenseTensor counts,

@@ -50,7 +50,7 @@ and arguments used by the official repository.
 
 ## Native C++ composite graph
 
-`mfq-runtime` has a CUDA-native tensor interface for SigLIP, the Resampler,
+`tyloi-engine` has a CUDA-native tensor interface for SigLIP, the Resampler,
 Whisper, the audio projector, Qwen3, and the TTS code decoder. The same graph is
 available on Apple platforms through `MlxMiniCPMO45Runtime`; the Metal HTTP
 server loads the full visual graph for MiniCPM-o models.
@@ -92,7 +92,7 @@ work only with the optional `mfq-runtime-torch` A/B runtime. Normal MFQd image,
 audio, and video requests do not use this diagnostic interface.
 
 ```bash
-mfq-runtime \
+tyloi-engine \
   --model /models/MiniCPM-o-4_5-Q4KM-table.mfq \
   --minicpmo-input-prefix /data/request \
   --minicpmo-output-prefix /data/result \
@@ -131,7 +131,7 @@ official defaults. A `reset_session` scalar clears the Whisper, Qwen3, TTS,
 sampling, and turn state before processing that unit.
 
 ```bash
-mfq-runtime \
+tyloi-engine \
   --model models/MiniCPM-o-4_5-Q4KM-table.mfq \
   --minicpmo-duplex-input-prefix fixtures/session \
   --minicpmo-duplex-output-prefix outputs/result \
@@ -156,7 +156,7 @@ Start the native CUDA or Apple worker. MiniCPM-o models expose their realtime
 duplex capability automatically; it is not a server launch option:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 mfq-runtime \
+CUDA_VISIBLE_DEVICES=0 tyloi-engine \
   --model /models/MiniCPM-o-4_5.mfq \
   --transport http \
   --host 127.0.0.1 \

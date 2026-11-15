@@ -187,7 +187,7 @@ function Copy-VisualCppRuntimeDlls {
     }
     Copy-RuntimeDlls $crtDirectory.FullName $DestinationDirectory
 
-    # CMake may enable OpenMP for mfq-runtime when the VS workload provides it.
+    # CMake may enable OpenMP for tyloi-engine when the VS workload provides it.
     # Staging the runtime when present is harmless if OpenMP was not selected.
     Get-ChildItem -LiteralPath $x64Directory -Directory |
         Where-Object { $_.Name -match '^Microsoft\.VC\d+\.OpenMP$' } |
@@ -248,7 +248,7 @@ function New-BuildContext {
         TargetTriple = $targetTriple
         CliName = $cliName
         CliArtifact = Join-Path (Join-Path $resourceDirectory $cliName) "$cliName.exe"
-        NativeArtifact = Join-Path $sidecarDirectory "mfq-runtime-$targetTriple.exe"
+        NativeArtifact = Join-Path $sidecarDirectory "tyloi-engine-$targetTriple.exe"
         VenvDirectory = $Venv
         OutputDirectory = $Output
         CudaRoot = $null
@@ -486,24 +486,24 @@ function Build-NativeSidecar {
         "-DBUILD_TESTING=OFF",
         "-DTYLOINFER_BUILD_CUDA_ENGINE=ON",
         "-DTYLOINFER_BUILD_HIP_RUNTIME=OFF",
-        "-DTYLOINFER_BUILD_CLI_TOOLS=ON",
+        "-DTYLOINFER_BUILD_DIAGNOSTICS=ON",
         "-DTYLOINFER_BUILD_TRANSPORT=ON",
         "-DTYLOINFER_BUILD_METAL_RUNTIME=OFF",
         "-DTYLOINFER_ENABLE_MFQ_COMPAT=$(if ($env:TYLOINFER_ENABLE_MFQ_COMPAT) { $env:TYLOINFER_ENABLE_MFQ_COMPAT } else { 'OFF' })"
     )
     Invoke-Checked $Context.Tools.CMake @(
         "--build", $Context.NativeBuildDirectory,
-        "--target", "mfq-runtime", "mfq-diagnostics",
+        "--target", "tyloi-engine", "mfq-diagnostics",
         "--config", "Release",
         "--parallel", $ParallelJobs
     )
 
     $Context.NativeOutput = Get-ChildItem -LiteralPath $Context.NativeBuildDirectory `
-        -Recurse -File -Filter "mfq-runtime.exe" |
+        -Recurse -File -Filter "tyloi-engine.exe" |
         Sort-Object -Property LastWriteTimeUtc -Descending |
         Select-Object -First 1
     if ($null -eq $Context.NativeOutput) {
-        Fail "native build did not create mfq-runtime.exe"
+        Fail "native build did not create tyloi-engine.exe"
     }
     Copy-Item -LiteralPath $Context.NativeOutput.FullName -Destination $Context.NativeArtifact -Force
     $diagnostics = Get-ChildItem -LiteralPath $Context.NativeBuildDirectory `

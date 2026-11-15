@@ -9,18 +9,19 @@ void qsa_pool_rotary_cache_cuda(
     const ::tyloi::DenseTensor& index, const ::tyloi::DenseTensor& weight,
     const ::tyloi::DenseTensor& positions, const ::tyloi::DenseTensor& cache_positions,
     const ::tyloi::DenseTensor& frequencies, const ::tyloi::DenseTensor& axes,
-    const ::tyloi::DenseTensor& output, int64_t pool, int64_t maximum, int64_t rotary_maximum, double eps);
+    const ::tyloi::DenseTensor& output, int64_t pool, int64_t maximum, int64_t rotary_maximum,
+    double eps, double attention_factor = 1.0);
 
 ::tyloi::DenseTensor rotary_embedding_cached_cuda(
     ::tyloi::DenseTensor input, ::tyloi::DenseTensor positions,
     ::tyloi::DenseTensor frequencies, ::tyloi::DenseTensor axes,
-    int64_t maximum);
+    int64_t maximum, double attention_factor = 1.0);
 ::tyloi::DenseTensor rotary_normalized_cached_cuda(
     ::tyloi::DenseTensor input, ::tyloi::DenseTensor weight,
     ::tyloi::DenseTensor positions, ::tyloi::DenseTensor frequencies,
     ::tyloi::DenseTensor axes, int64_t maximum, double eps,
     ::tyloi::DenseTensor key_cache, ::tyloi::DenseTensor cache_positions,
-    ::tyloi::DenseTensor projected_value, ::tyloi::DenseTensor value_cache);
+    ::tyloi::DenseTensor projected_value, ::tyloi::DenseTensor value_cache, double attention_factor = 1.0);
 
 std::vector<::tyloi::DenseTensor> rotary_normalized_grouped_cuda(
     const std::vector<::tyloi::DenseTensor>& inputs,
@@ -28,7 +29,8 @@ std::vector<::tyloi::DenseTensor> rotary_normalized_grouped_cuda(
     ::tyloi::DenseTensor positions,::tyloi::DenseTensor frequencies,
     ::tyloi::DenseTensor axes,int64_t maximum,double eps,int cache_entry,
     ::tyloi::DenseTensor key_cache,::tyloi::DenseTensor cache_positions,
-    ::tyloi::DenseTensor projected_value,::tyloi::DenseTensor value_cache);
+    ::tyloi::DenseTensor projected_value,::tyloi::DenseTensor value_cache,
+    const std::vector<::tyloi::DenseTensor>& entry_positions = {}, double attention_factor = 1.0);
 
 ::tyloi::DenseTensor minicpm_qk_norm_rope_cache_write_bf16_cuda(
     ::tyloi::DenseTensor q, ::tyloi::DenseTensor k, ::tyloi::DenseTensor v,

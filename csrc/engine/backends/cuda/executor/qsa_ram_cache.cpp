@@ -3,7 +3,7 @@
 #include "engine/backends/cuda/native/context.h"
 #include "engine/backends/cuda/native/resident_allocations.h"
 #include "decode_window.h"
-#include "moe_pipeline.h"
+#include "engine/backends/cuda/kernels/moe/pipeline.h"
 #include "engine/backends/cpu/native/host_memory.h"
 #include "engine/backends/cpu/native/host_parallel.h"
 #include "engine/weights/encoding/qsa_tq_cpu.h"

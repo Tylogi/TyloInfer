@@ -1,5 +1,5 @@
 #include "../kernels/gguf.h"
-#include "../runtime/moe_pipeline.h"
+#include "engine/backends/cuda/kernels/moe/pipeline.h"
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <atomic>

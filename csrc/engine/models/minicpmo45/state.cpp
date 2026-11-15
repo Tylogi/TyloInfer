@@ -2,6 +2,7 @@
 #include "engine/models/session/snapshot.h"
 #include "engine/models/session/state.h"
 #include "engine/models/minicpmo45/model.h"
+#include "engine/backends/cuda/native/tensor/backend.h"
 
 #include <algorithm>
 #include <limits>

@@ -103,7 +103,7 @@ def test_build_plan_selects_only_the_metal_server_target_and_forwards_cmake_args
 
     assert plan.backend == "metal"
     assert plan.target == "mfq-decode-metal"
-    assert "-DTYLOINFER_BUILD_RUNTIME_COMMUNICATION=ON" in plan.configure_command
+    assert "-DTYLOINFER_BUILD_TRANSPORT=ON" in plan.configure_command
     assert "-DTYLOINFER_BUILD_METAL_RUNTIME=ON" in plan.configure_command
     assert "-DTYLOINFER_EXPERIMENTAL_KERNEL=ON" in plan.configure_command
     assert plan.build_command[-2:] == ("-j", "3")
@@ -130,11 +130,12 @@ def test_cuda_build_plan_is_native_and_does_not_import_or_configure_torch(
     )
 
     command = " ".join(plan.configure_command)
-    assert plan.target == "mfq-runtime"
+    assert plan.target == "tyloi-engine"
     assert plan.build_command[plan.build_command.index("--target") + 1 : -2] == (
-        "mfq-runtime", "mfq-diagnostics"
+        "tyloi-engine",
     )
-    assert "TYLOINFER_BUILD_TORCH_REFERENCE_RUNTIME=OFF" in command
+    assert "-DTYLOINFER_BUILD_CUDA_ENGINE=ON" in command
+    assert plan.executable == tmp_path / "output" / "tyloi-engine"
     assert "CMAKE_PREFIX_PATH" not in command
     assert "Python_EXECUTABLE" not in command
     source = (ROOT / "tyloinfer" / "commands" / "build.py").read_text(encoding="utf-8")
@@ -152,42 +153,38 @@ def test_build_plan_disables_unselected_accelerators(tmp_path, monkeypatch, back
     plan = build.create_build_plan(backend=backend, build_dir=tmp_path)
     for name in ("CUDA", "HIP", "METAL"):
         expected = "ON" if name.lower() == backend else "OFF"
-        assert f"-DTYLOINFER_BUILD_{name}_RUNTIME={expected}" in plan.configure_command
+        assert f"-DTYLOINFER_BUILD_{name}_{'ENGINE' if name == 'CUDA' else 'RUNTIME'}={expected}" in plan.configure_command
 
 
 def test_default_cuda_cmake_target_has_no_python_or_libtorch_dependency() -> None:
-    cmake = (ROOT / "csrc" / "backends" / "cuda" / "CMakeLists.txt").read_text(
+    cmake = (ROOT / "csrc" / "engine" / "backends" / "cuda" / "CMakeLists.txt").read_text(
         encoding="utf-8"
     )
-    native_start = cmake.index("add_library(mfq-cuda-runtime STATIC\n")
-    reference_start = cmake.index("option(TYLOINFER_BUILD_TORCH_REFERENCE_RUNTIME")
-    native_target = cmake[native_start:reference_start]
-
-    assert "TYLOINFER_NATIVE_CUDA_RUNTIME=1" in native_target
-    assert "mfq-cuda-core" in native_target
-    assert "mfq-cuda-native-kernels" in native_target
-    assert "TORCH_LIBRARIES" not in native_target
-    assert "Python::Python" not in native_target
-    assert "find_package(Torch" not in native_target
-    assert "find_package(Python" not in native_target
-
-    assert "TYLOINFER_BUILD_TORCH_REFERENCE_RUNTIME" in cmake
-    assert "find_package(Torch REQUIRED)" in cmake[reference_start:]
-    assert "add_executable(mfq-runtime-torch" in cmake[reference_start:]
+    assembly = (ROOT / "csrc" / "engine" / "cuda.cmake").read_text(encoding="utf-8")
+    apps = (ROOT / "csrc" / "apps" / "cuda.cmake").read_text(encoding="utf-8")
+    assert "add_library(mfq-cuda-engine STATIC" in assembly
+    assert "mfq-cuda-core" in assembly
+    assert "mfq-cuda-native-kernels" in assembly
+    assert "add_executable(tyloi-engine" in apps
+    for source in (cmake, assembly, apps):
+        assert "TORCH_LIBRARIES" not in source
+        assert "Python::Python" not in source
+        assert "find_package(Torch" not in source
+        assert "find_package(Python" not in source
 
 
 def test_native_cuda_runtime_compilation_units_do_not_include_torch() -> None:
-    cmake = (ROOT / "csrc" / "backends" / "cuda" / "CMakeLists.txt").read_text(
+    cmake = (ROOT / "csrc" / "engine" / "backends" / "cuda" / "CMakeLists.txt").read_text(
         encoding="utf-8"
     )
     source_block = cmake.split("set(TYLOINFER_CUDA_KERNEL_SOURCES", 1)[1].split("\n)", 1)[0]
-    cuda_kernels = ROOT / "csrc" / "backends" / "cuda" / "kernels"
+    cuda_kernels = ROOT / "csrc" / "engine" / "backends" / "cuda" / "kernels"
     tq_kernels = ROOT / "tyloinfer" / "kernels" / "cuda"
     sources = [
-        ROOT / "csrc" / "backends" / "cuda" / "apps" / "runtime_main.cpp",
-        ROOT / "csrc" / "backends" / "cuda" / "commands" / "runtime.cpp",
-        ROOT / "csrc" / "backends" / "cuda" / "models" / "minicpmo45" / "ops.h",
-        ROOT / "csrc" / "backends" / "cuda" / "models" / "minicpmo45" / "ops.cpp",
+        ROOT / "csrc" / "apps" / "runtime_main.cpp",
+        ROOT / "csrc" / "commands" / "runtime.cpp",
+        ROOT / "csrc" / "engine" / "models" / "minicpmo45" / "model.h",
+        ROOT / "csrc" / "engine" / "models" / "minicpmo45" / "ops.cpp",
         *(cuda_kernels / name for name in re.findall(r"TYLOINFER_CUDA_KERNEL_ROOT}/([^\s]+\.cu)", source_block)),
         *(tq_kernels / name for name in re.findall(r"TYLOINFER_CUDA_TQ_ROOT}/([^\s]+\.cu)", source_block)),
     ]
@@ -198,13 +195,14 @@ def test_native_cuda_runtime_compilation_units_do_not_include_torch() -> None:
         source = source_path.read_text(encoding="utf-8")
         assert not any(token in source for token in forbidden), source_path
 
-    native_start = cmake.index("add_executable(mfq-runtime\n")
-    reference_start = cmake.index("option(TYLOINFER_BUILD_TORCH_REFERENCE_RUNTIME")
-    assert "mfq_cuda.cpp" not in cmake[native_start:reference_start]
+    assert "mfq_cuda.cpp" not in source_block
+    assert "rope_jit.cu" not in source_block
+    assert "sampling_jit.cu" not in source_block
+    assert "gated_delta_net_jit.cu" not in source_block
 
 
 def test_native_cuda_cmake_uses_consistent_windows_cuda_settings() -> None:
-    cmake = (ROOT / "csrc" / "backends" / "cuda" / "CMakeLists.txt").read_text(
+    cmake = (ROOT / "csrc" / "engine" / "backends" / "cuda" / "CMakeLists.txt").read_text(
         encoding="utf-8"
     )
 
@@ -222,24 +220,31 @@ def test_native_cuda_cmake_uses_consistent_windows_cuda_settings() -> None:
 
 
 def test_native_cuda_buffer_retains_its_selected_stream() -> None:
-    header = (ROOT / "csrc" / "backends" / "cuda" / "native" / "context.h").read_text(
-        encoding="utf-8"
-    )
-    source = (ROOT / "csrc" / "backends" / "cuda" / "native" / "context.cu").read_text(
-        encoding="utf-8"
-    )
+    native = ROOT / "csrc" / "engine" / "backends" / "cuda" / "native"
+    header = (native / "stream.h").read_text(encoding="utf-8")
+    memory = (native / "memory.h").read_text(encoding="utf-8")
+    source = (native / "memory.cpp").read_text(encoding="utf-8")
 
     stream_class = header[
         header.index("class Stream final") : header.index("class StreamHandle final")
     ]
-    buffer_class = header[
-        header.index("class Buffer final") : header.index("class HostBuffer final")
+    buffer_class = memory[
+        memory.index("class Buffer final") : memory.index("class HostBuffer final")
     ]
     assert "cudaStream_t stream_ = nullptr;" in stream_class
     assert "StreamHandle stream_;" in buffer_class
-    assert "std::shared_ptr<Stream>(context, stream)" in source
+    assert "std::shared_ptr<Stream> owner_" in header
     assert "stream_ = current_stream(context_->device());" in source
     assert "context_->release(data_, bytes_, stream_.stream());" in source
+
+
+def test_cuda_jit_package_closure_excludes_native_tensor() -> None:
+    import runpy
+
+    cuda_files = runpy.run_path(str(ROOT / "packaging" / "python" / "build.py"))["cuda_files"]
+    sources = cuda_files(ROOT)
+    assert any(path.name == "gated_delta_net_jit.cu" for path in sources)
+    assert not any("native/tensor" in path.as_posix() for path in sources)
 
 
 def test_double_dash_arguments_are_forwarded_without_the_separator(monkeypatch) -> None:
@@ -286,7 +291,7 @@ def test_custom_build_is_recorded_and_loaded_for_serve(tmp_path: Path, monkeypat
     manifest = build.record_managed_build(plan, executable)
     managed = build.load_managed_build("metal")
 
-    assert manifest == root / "build" / "mfq-runtime.json"
+    assert manifest == root / "build" / "tyloi-engine.json"
     assert managed is not None
     assert managed.executable == executable.resolve()
     assert managed.build_dir == custom_build.resolve()

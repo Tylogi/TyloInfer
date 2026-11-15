@@ -1,6 +1,8 @@
 #include "engine/weights/row_source.h"
 #include "engine/weights/source/read.h"
 #include "engine/weights/memory.h"
+#include "engine/weights/encoding/rows.h"
+#include "engine/weights/encoding/dense_blob.h"
 #if TYLOINFER_HAS_CUDA
 #include "engine/backends/cuda/native/env.h"
 #else
@@ -16,6 +18,42 @@
 #include <limits>
 #include <stdexcept>
 #include <utility>
+
+std::shared_ptr<tyloi::weights::Rows> tyloi::weights::load_dense_rows(
+        const source::Source& source, const std::string& name) {
+    const auto& record = tyloi::require_tensor(source, name);
+    ScalarType dtype;
+    if (record.dtype == "BF16") dtype = kBFloat16;
+    else if (record.dtype == "F16") dtype = kFloat16;
+    else if (record.dtype == "F32") dtype = kFloat32;
+    else throw std::invalid_argument("dense row table requires floating storage: " + name);
+    if (record.nbytes > std::numeric_limits<std::size_t>::max())
+        throw std::overflow_error("dense row table byte count overflows");
+    const auto header = source.read(name, 0, sizeof(std::uint32_t) + 2 * sizeof(std::int64_t));
+    std::uint32_t rank;
+    std::memcpy(&rank, header.data(), sizeof(rank));
+    if (rank != 2) throw std::invalid_argument("dense row table must be a matrix: " + name);
+    const auto layout = dense::parse(
+        std::vector<std::uint8_t>(reinterpret_cast<const std::uint8_t*>(header.data()),
+            reinterpret_cast<const std::uint8_t*>(header.data()) + header.size()),
+        scalar_size(dtype), record.shape, static_cast<std::size_t>(record.nbytes));
+    auto batch = source.tensor_batch_reader(name);
+    if (!batch) {
+        auto read = source.tensor_reader(name);
+        if (!read) throw std::invalid_argument("dense row table has no retained reader: " + name);
+        batch = [read = std::move(read)](const std::vector<ReadSpan>& ranges) {
+            for (const auto& range : ranges) read(range.offset, range.destination, range.size);
+        };
+    }
+    auto table = std::make_shared<Rows>(layout.shape[0], layout.shape[1], dtype,
+        [batch = std::move(batch), offset = layout.offset](const std::vector<ReadSpan>& ranges) {
+            auto source_ranges = ranges;
+            for (auto& range : source_ranges) range.offset += offset;
+            batch(source_ranges);
+        });
+    observe_streamed_ple(table, table->nbytes());
+    return table;
+}
 
 namespace {
 const char* row_option(const char* name) {

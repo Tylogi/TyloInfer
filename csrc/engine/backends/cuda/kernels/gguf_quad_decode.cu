@@ -1,4 +1,5 @@
 #include "gguf_quad_decode.h"
+#include "engine/backends/cuda/native/env.h"
 #include "gguf_quad_storage.h"
 #include "ggml-cuda/common.cuh"
 #include "gguf_decode.cuh"

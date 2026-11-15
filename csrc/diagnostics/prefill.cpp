@@ -64,7 +64,7 @@ Tensor forward(Work& work, const Tensor& ids) {
 }
 
 /** Synchronize the primary stream at the original timing boundary. */
-void sync() {
+void sync_stream() {
     TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(tyloi::cuda::current_stream()));
 }
 
@@ -76,7 +76,7 @@ struct Checked {
 
 Checked checked(const Tensor& logits) {
     Checked result;
-    result.values=tyloi::ops::floats(logits);
+    result.values=tyloi::ops::read_floats(logits);
     for(std::int64_t i=0;i<logits.dim();++i)result.shape.push_back(logits.size(i));
     for(std::size_t i=0;i<result.values.size();++i)
         if(!std::isfinite(result.values[i]))throw std::runtime_error("nonfinite prefill logits at index "+std::to_string(i));
@@ -259,7 +259,7 @@ int tyloi::cuda::diagnostics::run_prefill_sweep(Program& program,const std::vect
                 }
                 if(layer_major_sweep || layer_major_requested)
                     std::cout<<"prefill_layer_major_m="<<m<<" chunk="<<chunk<<" repeat="<<repeat<<" layer_major="<<int(layer_major)<<std::endl;
-                work.clear(); program.state().reset(1); sync(); profiler.reset();
+                work.clear(); program.state().reset(1); sync_stream(); profiler.reset();
                 const auto started=Clock::now();
                 Tensor logits;
                 if(layer_major) {
@@ -271,7 +271,7 @@ int tyloi::cuda::diagnostics::run_prefill_sweep(Program& program,const std::vect
                     if(result.raw)work.keep(result.raw);
                     if(result.mode!=tyloi::models::Prefill::Mode::layered)
                         throw std::runtime_error("requested layer-major prefill was not executed");
-                    logits=project(work,hidden); sync();
+                    logits=project(work,hidden); sync_stream();
                     if(profile) { profiler.report("prefill_layer_major_m="+std::to_string(m)+" chunk="+std::to_string(chunk)+" repeat="+std::to_string(repeat)); profiler.reset(); }
                 } else for(std::int64_t offset=0;offset<m;offset+=chunk) {
                     profiler.enabled=profile && offset==0;
@@ -279,7 +279,7 @@ int tyloi::cuda::diagnostics::run_prefill_sweep(Program& program,const std::vect
                     auto part=work.keep(ids.dense().narrow(1,offset,count));
                     auto hidden=forward(work,part);
                     if(offset+count==m)logits=project(work,hidden);
-                    sync();
+                    sync_stream();
                     if(profiler.enabled) { profiler.report("prefill_m="+std::to_string(m)+" chunk="+std::to_string(chunk)+" repeat="+std::to_string(repeat)); profiler.reset(); }
                     std::cout<<"prefill_progress_m="<<m<<" chunk="<<chunk<<" repeat="<<repeat<<" completed="<<offset+count
                         <<" elapsed_ms="<<std::chrono::duration<double,std::milli>(Clock::now()-started).count()<<std::endl;
@@ -332,7 +332,7 @@ int tyloi::cuda::diagnostics::run_prefill_sweep(Program& program,const std::vect
                         if(variant_sweep)reject_retired();
                         std::cout<<"prefill_public_pair_repeat prompt="<<sizes.front()<<" chunk="<<engine_chunk
                             <<" repeat="<<public_repeat<<" mode="<<engine_mode<<std::endl;
-                        work.clear(); program.state().reset(1); sync();
+                        work.clear(); program.state().reset(1); sync_stream();
                         cudaMemPool_t pool=nullptr;
                         TYLOINFER_CUDA_CHECK(cudaDeviceGetDefaultMemPool(&pool,program.config().layer_placement.primary_device()));
                         TYLOINFER_CUDA_CHECK(cudaMemPoolTrimTo(pool,0));
@@ -371,7 +371,7 @@ int tyloi::cuda::diagnostics::run_prefill_sweep(Program& program,const std::vect
                             if(const auto* progress=std::get_if<tyloi::engine::PrefillProgress>(&event)) prefill_ms=progress->timing.model_ms;
                         }
                         if(output.cleanup_failure)std::rethrow_exception(output.cleanup_failure);
-                        sync();
+                        sync_stream();
                         const auto ms=std::chrono::duration<double,std::milli>(Clock::now()-started).count();
                         std::cout<<"prefill_ordinary_generation_timing prompt="<<sizes.front()<<" chunk="<<engine_chunk<<" mode="<<engine_mode
                             <<" generated_tokens="<<generated.size()<<" elapsed_ms="<<ms<<" tok_per_s="<<1000.0*sizes.front()/ms<<std::endl;
@@ -403,7 +403,7 @@ int tyloi::cuda::diagnostics::run_prefill_sweep(Program& program,const std::vect
                 auto hidden=work.keep(result.hidden);
                 if(result.raw)work.keep(result.raw);
                 if(result.mode!=tyloi::models::Prefill::Mode::layered)throw std::runtime_error("requested layer-major prefill was not executed");
-                (void)project(work,hidden); sync();
+                (void)project(work,hidden); sync_stream();
                 profiler.report("prefill_optimized_tail_profile_m="+std::to_string(sizes.front()));
                 profiler.enabled=false; profiler.reset();
             }
@@ -429,7 +429,7 @@ int tyloi::cuda::diagnostics::run_prefill_sweep(Program& program,const std::vect
     for(auto m:sizes) {
         auto part=work.keep(ids.dense().narrow(1,0,m));
         for(int i=0;i<2;++i) {
-            program.state().reset(1); (void)project(work,forward(work,part)); sync();
+            program.state().reset(1); (void)project(work,forward(work,part)); sync_stream();
             program.drain(); work.values.resize(2);
         }
         std::vector<double> times;
@@ -437,7 +437,7 @@ int tyloi::cuda::diagnostics::run_prefill_sweep(Program& program,const std::vect
         for(int i=0;i<repeats;++i) {
             program.state().reset(1);
             const auto started=Clock::now();
-            auto logits=project(work,forward(work,part)); sync();
+            auto logits=project(work,forward(work,part)); sync_stream();
             const auto elapsed=std::chrono::duration<double,std::milli>(Clock::now()-started).count();
             times.push_back(elapsed);
             if(i==0)best=logits.dense().argmax(-1).item<std::int64_t>();

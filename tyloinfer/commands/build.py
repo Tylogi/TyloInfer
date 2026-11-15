@@ -59,7 +59,7 @@ def repository_root() -> Path:
 def build_manifest_path() -> Path:
     """Return the CLI-owned native build manifest for this source checkout."""
 
-    return repository_root() / "build" / "mfq-runtime.json"
+    return repository_root() / "build" / "tyloi-engine.json"
 
 
 def _empty_manifest() -> dict[str, object]:
@@ -243,7 +243,7 @@ def runtime_executable(build_dir: Path, backend: str) -> Path:
     if backend == "metal":
         return build_dir / "metal" / "mfq-decode-metal"
     suffix = ".exe" if os.name == "nt" else ""
-    return build_dir / f"mfq-runtime{suffix}"
+    return build_dir / f"tyloi-engine{suffix}"
 
 
 def _find_built_executable(plan: BuildPlan) -> Path | None:
@@ -274,7 +274,7 @@ def create_build_plan(
         raise BuildError("cmake was not found; install CMake 3.26 or newer")
     output = (build_dir or root / "build" / "csrc").expanduser().resolve()
     source = root / "csrc"
-    target = "mfq-decode-metal" if selected == "metal" else "mfq-runtime"
+    target = "mfq-decode-metal" if selected == "metal" else "tyloi-engine"
     configure = [
         cmake,
         "-S",
@@ -334,7 +334,6 @@ def create_build_plan(
         build_type,
         "--target",
         target,
-        *([] if selected == "metal" else ["mfq-diagnostics"]),
         "-j",
         str(parallelism),
     ]

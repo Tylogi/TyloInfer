@@ -63,7 +63,7 @@ struct Work {
 nlohmann::json json_tensor(const Tensor& value) {
     std::vector<std::int64_t> shape;
     for (std::int64_t i = 0; i < value.dim(); ++i) shape.push_back(value.size(i));
-    return {{"shape", shape}, {"data", ::tyloi::ops::floats(value)}};
+    return {{"shape", shape}, {"data", ::tyloi::ops::read_floats(value)}};
 }
 
 void close(const Tensor& actual, const Tensor& expected, const char* label) {
@@ -72,7 +72,7 @@ void close(const Tensor& actual, const Tensor& expected, const char* label) {
     for (std::int64_t i = 0; i < actual.dim(); ++i)
         if (actual.size(i) != expected.size(i))
             throw std::runtime_error(std::string("Nemotron-H MTP ") + label + " changed its shape");
-    const auto a = ::tyloi::ops::floats(actual), b = ::tyloi::ops::floats(expected);
+    const auto a = ::tyloi::ops::read_floats(actual), b = ::tyloi::ops::read_floats(expected);
     double worst = 0.;
     for (std::size_t i = 0; i < a.size(); ++i)
         worst = std::max(worst, std::abs(double(a[i]) - b[i]) / (.003 + .003 * std::abs(b[i])));

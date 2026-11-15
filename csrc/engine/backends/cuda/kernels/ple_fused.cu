@@ -1,5 +1,6 @@
 #include "ple_fused.h"
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <algorithm>
 #include <cmath>
 #include <type_traits>
@@ -80,7 +81,8 @@ __global__ void ple_conv_add_kernel(const float* input,const float* weight,const
 std::vector<DenseTensor> ple_gate_norm_cuda(const DenseTensor& key,const DenseTensor& query,const DenseTensor& value,
         const DenseTensor& norm,int64_t hidden,int64_t streams,double eps) {
     const auto valid=[](const DenseTensor& x) {return x.is_cuda() && x.is_contiguous() &&
-        (x.scalar_type()==::tyloi::kFloat16 || x.scalar_type()==::tyloi::kFloat32);};
+        (x.scalar_type()==::tyloi::kFloat16 || x.scalar_type()==::tyloi::kBFloat16 ||
+         x.scalar_type()==::tyloi::kFloat32);};
     TYLOINFER_RUNTIME_CHECK(valid(key) && valid(query) && valid(value) && key.sizes()==query.sizes() &&
         hidden>0 && hidden<=8192 && streams>0 && key.numel()==value.numel()*streams &&
         value.numel()%hidden==0 && key.device()==query.device() && key.device()==value.device() &&
@@ -98,11 +100,17 @@ std::vector<DenseTensor> ple_gate_norm_cuda(const DenseTensor& key,const DenseTe
                 reinterpret_cast<const V*>(value.data_ptr()),norm.data_ptr<float>(),gated.data_ptr<float>(),
                 normalized.data_ptr<float>(),int(hidden),int(streams),std::sqrt(double(hidden)),float(eps));
         };
-        if(value.scalar_type()==::tyloi::kFloat16)launch_value(__half{});else launch_value(float{});
+        if(value.scalar_type()==::tyloi::kFloat16)launch_value(__half{});
+        else if(value.scalar_type()==::tyloi::kBFloat16)launch_value(__nv_bfloat16{});
+        else launch_value(float{});
       };
-      if(query.scalar_type()==::tyloi::kFloat16)launch_query(__half{});else launch_query(float{});
+      if(query.scalar_type()==::tyloi::kFloat16)launch_query(__half{});
+      else if(query.scalar_type()==::tyloi::kBFloat16)launch_query(__nv_bfloat16{});
+      else launch_query(float{});
     };
-    if(key.scalar_type()==::tyloi::kFloat16)launch(__half{});else launch(float{});
+    if(key.scalar_type()==::tyloi::kFloat16)launch(__half{});
+    else if(key.scalar_type()==::tyloi::kBFloat16)launch(__nv_bfloat16{});
+    else launch(float{});
     TYLOINFER_CUDA_CHECK(cudaGetLastError());
     return {gated,normalized};
 }

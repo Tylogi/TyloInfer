@@ -1,4 +1,5 @@
 #include "engine/models/gemma4/layers.h"
+#include "engine/models/common/attention.h"
 
 #include "engine/backends/cuda/native/tensor/backend.h"
 #include "engine/models/gemma4/forward.h"
@@ -106,13 +107,13 @@ public:
         if (!positions || positions.scalar_type() != kInt64 || positions.dim() != 1 ||
             positions.size(0) != hidden.size(1))
             throw std::invalid_argument("Gemma4 positions must be int64 [tokens]");
-        for (const auto position : ::tyloi::ops::integers(positions))
+        for (const auto position : ::tyloi::ops::read_integers(positions))
             if (position < 0 || position >= model_.config.max_position_embeddings)
                 throw std::out_of_range("Gemma4 position outside context");
         request->used = true;
         MfqCudaGuard guard(layer.device);
         const Device device(kCUDA, layer.device);
-        const AttentionStep step{::tyloi::ops::copy(positions, device), {}, {}, 0, 0, 0};
+        const ::tyloi::models::AttentionStep step{::tyloi::ops::copy(positions, device), {}, {}, 0, 0, 0};
         auto result = forward_layer(layer, request->cache, ::tyloi::ops::copy(hidden, device), step, options);
         return ::tyloi::ops::copy(result, Device(kCUDA, primary_));
     }
@@ -123,7 +124,7 @@ public:
         const auto batch = ids.dim() == 1 ? 1 : ids.size(0);
         const auto tokens = ids.dim() == 1 ? ids.size(0) : ids.size(1);
         if (batch <= 0 || tokens <= 0) throw std::invalid_argument("Gemma4 embedding IDs are empty");
-        const auto values = ::tyloi::ops::integers(ids);
+        const auto values = ::tyloi::ops::read_integers(ids);
         auto host = ::tyloi::ops::empty({batch * tokens, info().width},
                                TensorOptions().device(kCPU).dtype(kFloat16));
         for (std::int64_t row = 0; row < batch * tokens; ++row) {

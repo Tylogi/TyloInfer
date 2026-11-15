@@ -131,7 +131,7 @@ int run_qwen4_decode_hidden_check(Program& program) {
     const auto compare = [&](const Tensor& value, const Tensor& reference) {
         require(value.dim()==reference.dim(), "hidden graph shape mismatch");
         for (std::int64_t i=0; i<value.dim(); ++i) require(value.size(i)==reference.size(i), "hidden graph shape mismatch");
-        const auto a=::tyloi::ops::floats(value), b=::tyloi::ops::floats(reference);
+        const auto a=::tyloi::ops::read_floats(value), b=::tyloi::ops::read_floats(reference);
         for (std::size_t i=0; i<a.size(); ++i) {
             const double error=std::abs(double(a[i])-b[i]); maximum_error=std::max(maximum_error,error);
             require(std::isfinite(a[i]) && error<=.015+.015*std::abs(b[i]), "hidden graph differs from eager execution");
@@ -190,7 +190,7 @@ int run_qwen4_decode_hidden_check(Program& program) {
             compare(decoded->hidden,expected[i]); compare(raw,expected_raw[i]);
             if (project) {
                 auto logits=w.keep(c.model.logits(decoded->hidden)); compare(decoded->logits,logits);
-                auto values_cpu=::tyloi::ops::floats(decoded->logits);
+                auto values_cpu=::tyloi::ops::read_floats(decoded->logits);
                 const auto width=decoded->logits.size(decoded->logits.dim()-1);
                 require(decoded->tokens.size()==static_cast<std::size_t>(tokens), "graph greedy row count changed");
                 for (int row=0;row<tokens;++row) {

@@ -57,7 +57,7 @@ runtimes do not need CMake, `nvcc`, or a source tree.
 A manifest must match the source checkout, operating system, machine
 architecture, and backend. Mismatched manifests are ignored.
 
-The manifest is always read from `<repo>/build/mfq-runtime.json`, where
+The manifest is always read from `<repo>/build/tyloi-engine.json`, where
 `<repo>` is the checkout supplying the running `mfq` command. A default build
 uses `<repo>/csrc` as its source and `<repo>/build/csrc` as its
 build directory. `--build-dir` changes only the CMake build tree; the manifest

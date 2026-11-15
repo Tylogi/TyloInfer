@@ -355,21 +355,21 @@ target_compile_definitions(mfq-hip-diagnostics PRIVATE
     TYLOINFER_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
 target_link_libraries(mfq-hip-diagnostics PUBLIC mfq-hip-runtime)
 
-add_executable(mfq-runtime
+add_executable(tyloi-engine
     ${TYLOINFER_HIP_ROOT}/apps/runtime_main.cpp
     ${TYLOINFER_HIP_ROOT}/commands/runtime.cpp
 )
-target_compile_definitions(mfq-runtime PRIVATE
+target_compile_definitions(tyloi-engine PRIVATE
     TYLOINFER_ENABLE_MFQ_COMPAT=$<BOOL:${TYLOINFER_ENABLE_MFQ_COMPAT}>)
-target_link_libraries(mfq-runtime PRIVATE
+target_link_libraries(tyloi-engine PRIVATE
     mfq-hip-runtime mfq-runtime-communication)
-target_include_directories(mfq-runtime PRIVATE
+target_include_directories(tyloi-engine PRIVATE
     ${TYLOINFER_HIP_ROOT}
     ${TYLOINFER_HIP_ROOT}/include
     ${TYLOINFER_HIP_ROOT}/engine
 )
-target_compile_features(mfq-runtime PRIVATE cxx_std_20)
-set_target_properties(mfq-runtime PROPERTIES
+target_compile_features(tyloi-engine PRIVATE cxx_std_20)
+set_target_properties(tyloi-engine PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}"
 )
 
@@ -501,7 +501,7 @@ endif()
 set(TYLOINFER_SYSTEM_RUNTIME_DIR
     "/usr/lib/${CMAKE_LIBRARY_ARCHITECTURE}" CACHE PATH
     "directory containing the host libstdc++ runtime")
-set_property(TARGET mfq-runtime PROPERTY
+set_property(TARGET tyloi-engine PROPERTY
     BUILD_RPATH "${TYLOINFER_SYSTEM_RUNTIME_DIR}")
 
 if(BUILD_TESTING)

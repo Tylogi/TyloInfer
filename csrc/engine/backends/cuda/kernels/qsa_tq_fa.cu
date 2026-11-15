@@ -4,6 +4,7 @@
 // Native additions preserve four-token groups, packed H4 KV, and QSA history.
 // See LICENSES/llama.cpp-MIT.txt.
 #include "qsa_tq_fa_mma.cuh"
+#include "engine/backends/cuda/native/env.h"
 #include "qsa_tq_fa.h"
 #include "qsa_tq_fa_sparse.cuh"
 #include <cstdio>

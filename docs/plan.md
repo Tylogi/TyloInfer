@@ -1,178 +1,184 @@
 # TyloInfer Refactoring Plan
 
-The target architecture is authoritative in [architecture.md](architecture.md). This document lists only the
-remaining work, deferred items and acceptance conditions; it keeps no completed tasks and no per-commit progress.
-**Close the Gemma4 production call chain first — load, prefill, decode, cancel, reload and unload — then finish
-Phase 1; after that remove execution dependencies and live State bindings from models, then extend Qwen35 and
-verify it end to end.**
-Production CMake wiring required by Gemma4 is kept in sync with the source. File consolidation for CUDA and the
-necessary common code is handled item by item in section 4; Metal/HIP and its old-directory cleanup, tool wiring,
-test migration, and build and runtime acceptance remain deferred.
-Nothing is compiled, run, or changed in tests right now; only static cross-checking is done. Phase 1 source is not
-complete; interface inheritance and constructor injection do not mean callers have finished migrating. Source,
-build, numerical and full-chain acceptance are judged separately.
+The target architecture is authoritative in [architecture.md](architecture.md). This plan records the remaining work,
+its order and acceptance conditions, not a per-commit history.
 
-## 1. Converge the public Tensor/weight interfaces and the Engine execution contract
+**Priority: finish Qwen4 exp on the shared CUDA execution chain → completely isolate LibTorch builds → connect Metal
+and CUDA through the same public interfaces.** CUDA restructuring is substantially implemented; do not restart the
+Tensor, Executor, Engine or Gemma4/Qwen35 migrations as new prerequisite phases. Remaining CUDA work accompanies the
+stage that actually needs it. Necessary build, test and consumer wiring is active work, not indefinitely deferred.
 
-Gemma4 keeps its current support scope: no new media, MTP, session or batch capability. Migrating other families
-is not a precondition for converging their public interfaces.
+## Current baseline and verification limits
 
-1. **Connect the public data consumers.** Converge the remaining cross-module interfaces that still pass media and
-   state payloads in and out as DenseTensor values. Local activation computation inside models and backends does not
-   become a public contract, and Tensor gains no computational responsibilities. Weight and position-table placement,
-   expert projection and mixed representations still require runtime acceptance.
-2. **Complete the Engine execution contract.** Connect the generation, MTP and batch consumers that still depend on
-   family types or private execution interfaces to the public model and execution contracts. CUDA resource
-   acquisition and operations belong to the backend implementation. Real session restore for the old families is kept
-   together with the consumer migration in item 1. Model computation stays in models; no resource bundle, callback
-   shell or per-item forwarding interface is added.
-3. **Make ownership and failure paths consistent end to end.** Keep view, encoding helper buffers, shard and
-   on-demand expert keep-alive in sync; keep backing de-duplication accounting, device placement validation, failure
-   cleanup and cancel/reload/unload draining. Unsupported view/cast combinations are rejected before modification or
-   commit, with no implicit whole-model dequantization. KV allocation reservation, expert borrow-region return, Graph
-   warmup restoration and last-consumer keep-alive still require runtime acceptance.
+Public Tensor ownership, Executor and shared model/state contracts already exist. Qwen4 is selected by `models::load`
+and runs through the common Engine and generation path; its Text/EngineInstance variant, `with_model` branch and old
+generation callback headers have been removed. Optional weights and predictor belong to the model; request State owns
+media, positions, recurrent/KV state and speculative checkpoints.
 
-**Source completion criteria:** Gemma4 and its public production call chain use data through Tensor references and
-owning handles; the public weight interface has no old wrappers or CUDA private types; the Engine organises assembly,
-generation and release through the public model and execution contracts, with no downcast to a concrete executor;
-models do not depend on Executor, and generic runtime code does not access family-private layouts. Build, numerical
-and lifecycle runtime acceptance must still be completed once the deferral is lifted.
+Prefill, decode, warmup and numerical batch jobs report workspace, layer and Graph events. Runtime coordinates `Loan`,
+Graph preparation and allocation admission; the root CUDA Executor owns its KV resources and forked Executors borrow
+them weakly. Shared Engine holds no CUDA KV types. Shared session restoration
+admits and stages separate target/predictor candidates, drains, then publishes them. The affected source lists and native
+diagnostic callers are connected, including the existing Qwen3.5 layer reference path.
 
-## 2. Remove model execution dependencies and live State bindings
+PLE math and profiling use public ops; row loading uses Rows/RowPipeline. The CUDA backend holds capture resources,
+FFN tile scheduling, profiling policy and replay backing. Fixed buffers, row stages and state-copy backing report growth
+before construction. The ordinary preparation pass observes temporary allocation lifetimes by device, stream and size
+class; Budget admits graph-pool growth before materialisation. Warmup expands an incomplete plan through another
+admission event before retrying that pass. Coroutine suspension releases execution and registration scopes. This is a
+measured capture-pool plan, not a static estimate of the ordinary discovery pass or an independent codec-worker arena.
 
-Qwen4Exp and DeepSeek V4.1 keep their request caches in their own State. Qwen4Exp's layer weights, forward math,
-LayerState and Graph scheduling are separated by responsibility, and MoE executes through public numeric ops; the
-remaining work is weight/KV coordination in the graph driver, the rest of the profiling wiring and execution resource
-assembly, then removing the execution context from the top level and from the predictor.
+Qwen paged decoding retains CPU tensors and encoded device identity; admitted restore stages target/predictor data and
+returns the uploaded hidden handle. MiniCPM-o evaluation and CLI use the family-owned encoders/TTS and explicit duplex
+state; prefix restoration uses Program's admitted restore entry. Their affected source lists are connected.
 
-- Remove the remaining dependencies on CudaExecutionContext and Executor from models and compute units; concrete
-  models organise Attention/MLP and other compute units and call them through public ops, with execution resources
-  obtained by the backend inside the scope. Keep the math, dtype, CPU/layer placement, projection order and error
-  propagation.
-- Move the remaining execution scratch in request State and MtpState into the backend, and keep resource accounting
-  and Graph storage dependencies in sync; keep the separation of predictor weights from request state, and the
-  existing lifecycle of the Engine's adaptive policy. A standalone MtpState is not a condition for declaring
-  execution-dependency cleanup complete.
-- As execution dependencies are removed, synchronise the allocation planning, predictor, prefill, batch, streamed KV,
-  session and Graph consumers; capture and restore use the owning State, keeping Qwen35's joint-restore
-  stage/drain/publish transaction, storage identity and last-consumer keep-alive, without switching the current
-  request through a shared model.
-- Adopt the Phase 1 public Engine/ops contracts and delete the remaining family assembly-selection adapters,
-  execution borrow shells and forwarding entry points according to their real responsibilities, not just renaming
-  them; the backend Ffn weights and MoE routing composition in the remaining models converge with the model weight
-  contract; converge the remaining Transform/compute-graph callbacks, with concrete models interpreting layer order.
-  Internal per-layer records inside a model may stay; no general Block inheritance tree or unified layer union type is
-  reintroduced.
+Production CMake no longer composes a LibTorch engine/CLI or discovers Torch/Python development libraries. Native CUDA
+model/backend declarations have one fixed implementation; shared dispatch uses private 0/1 availability definitions.
+SDK usage requirements are private. Python CUDA JIT uses independent raw launchers and a checked source/include closure
+for checkout, sdist and wheel resources; it does not compile the native Tensor runtime.
 
-**Source completion criteria:** the models and compute units above do not store an executor, an execution context or
-live State; shared models do not carry request state through mutable aliases, and forward and its related consumers
-use the owning State explicitly; the CUDA production path of the models above has no old execution adapter
-dependencies. Deferred tools, tests and Metal/HIP consumers are not required to keep the old implementation.
+Only source references, calls, include/package closure and whitespace were reviewed. Builds and tests were neither run
+nor changed. Stage-1/2 runtime and distribution acceptance below remains unverified; the next main source stage is
+shared Metal execution. Other families retain
+their live legacy paths, including unresolved shared Program batching for Qwen3.5. Qwen's batch adapter still selects
+the whole-step FFN serial policy for residual and expert scheduling; it must move together with shared batch execution.
+Legacy diagnostic comparison modes without a current implementation explicitly reject invocation. Metal still has a
+separate inference runtime.
 
-## 3. Extend Qwen35 and verify the full chain
+## 1. Finish Qwen4 exp restructuring
 
-After the first two phases are complete, connect Qwen35's embedding, forward, logits, replay and existing
-predictor/batch/session/Graph adapters to the public model, state and ops contracts, and remove the per-layer
-Executor/Collectives parameters.
-Once build wiring and test work resume, verify the real path from load and input preparation to output and release;
-reference, eval, diagnostics, service and the affected distribution consumers are accepted together.
+The immediate deliverable is Qwen4 exp loading, executing and retiring through the existing public model/Engine chain.
+Keep its currently supported math, formats, placement, MTP, batch, session and media capabilities; do not expand its
+support scope or require every other family to migrate first.
 
-| Check area | Behaviour that must be covered |
+The model/state, public-op, Graph-resource and native consumer source paths are connected. Remaining acceptance is
+listed below; any source inconsistency exposed by those checks belongs to this stage. Preserve the existing plain MoE
+and TQ target-Graph design and ordinary predictor path. Do not restore an execution context, resource bundle, callback
+dispatch or adjacent-layer Pipeline. Reuse existing Qwen4 TQ fixtures and independent references, including
+`tests/numerics/qwen4_fixture.py` and the relevant cases in `flash_ref.py`; generated native output is not its own oracle.
+Gemma4/Qwen35 are regression baselines, not new migration milestones. Test execution and edits remain excluded by the
+current user instruction.
+
+| Acceptance area | Required behaviour |
 | --- | --- |
-| Load and weights | Default TQ, explicit MFQ compatibility, source/config/YaRN/placement validation, RoPE/weight order, CPU layer count and the conditions actually supported or rejected; logical/physical bytes, layout, aliasing and grouped output of encoded Tensors |
-| Forward and generation | Full/Linear mixed layers, normal/chunked prefill, decode, MRoPE, internal mask, explicit positions, output norm, lm_head; compare logits, valid state and committed positions |
-| Batch and isolation | Request/slot two-way ownership, page generation, batch changes, independent scratch, cancellation and storage reuse; model batch state is interpreted only on the model side |
-| MTP | Accept/reject, partial replay, position commit, target/predictor and recursive/conv state consistency; unsupported suffixes stay explicitly rejected |
-| Session/prefix | Text and media identity, candidate prepare/stage/drain/publish, hit accounting, failure fallback/reset, cache budget and isolation of unrelated requests |
-| Graph | Capture matches direct execution, warmup isolation, state/scratch address and storage identity matching, invalidation synchronisation, last-consumer keep-alive |
-| Execution and lifecycle | Backend dispatch and device validation, nested scope and exception recovery, coroutine suspend/resume, parallel workspace isolation, async keep-alive, load failure, cancellation, backpressure, draining, reload, unload, a single terminal state, multi-Engine isolation and budget return |
-| Input and output | The supported text and multimodal paths, template/tokenizer, stop conditions, incremental text and structured results |
-| Tools and distribution | reference per-layer low-memory loading, standalone State/Executor and execution scope; real eval/diagnostics entry points; loading after JIT/wheel installation |
+| Build/load | Fresh native CUDA build; Qwen4 selected by the unified factory; source/config/YaRN/format/placement validation, supported optional components, partial-load failure cleanup |
+| Numeric/state | Fixed-input GDN, QSA, PLE, residual, routed/shared experts, embedding and logits; ordinary/chunked/layer-major prefill and decode; compare state and positions as well as output with existing dtype-specific criteria |
+| MTP/batch/session | Accept/reject and partial replay, predictor and target state consistency, request/slot isolation, cancellation and storage reuse; session/prefix restore follows prepare/stage/drain/publish and preserves supported media identity |
+| Graph/resources | Direct execution versus capture/replay, warmup isolation, state/scratch storage identity, invalidation, cache/KV budget return, borrowed backing kept alive until the final consumer |
+| Lifecycle/consumers | Nested scope and exception restoration, coroutine suspend/resume, load failure, cancel/reload/unload, one terminal result and multi-Engine isolation; affected runtime/diagnostic/evaluation callers use the public path |
+| Regression | Existing Gemma4/Qwen35 and shared Tensor/ops/state behaviour affected by the change; no changed math, tolerances, ownership or supported placement conditions |
 
-Keep fixed inputs, dtype, sampling settings and the original numerical error criteria; do not change error
-propagation, recovery or release order.
-Cover communication on/off, default TQ and explicit MFQ for the affected targets; TP/EP and CPU/layer placement use
-the existing support conditions, with no widened capability claims.
+**Completion:** Qwen4 exp no longer holds an execution context or executor in its model/compute units, live request state
+is explicit, and its supported production consumers use the unified factory and execution contracts. Required build,
+numeric and lifecycle checks pass separately; missing weights/hardware or skipped cases remain outstanding acceptance.
 
-## Qwen35 phase completion criteria
+### Production executable and build-command wiring
 
-- The CUDA production consumers have completed the public contract migration; Qwen35's math, state and
-  batch/MTP/session/Graph and media semantics all belong to models, and generic runtime modules have no
-  family-private dependencies.
-- The deferred build, test, tool and distribution adapters are restored and completed; production, batch, reference,
-  eval, diagnostics and service paths all have real verification.
-- The numerical, state, lifecycle and failure paths in the table above pass acceptance. Static checks, skips,
-  returning 77 or model_branch=skipped do not count as a runtime pass; while required verification is unfinished the
-  phase stays incomplete.
+Complete the production CLI wiring as part of the current execution-chain work. Rename the `mfq-runtime` executable
+and CMake target to `tyloi-engine`, with `tyloi-engine.exe` on Windows; do not rename the inference library merely to satisfy this
+executable naming requirement. The default `uv run tyloinfer build` must produce `tyloi-engine` and must not build diagnostics.
 
-## 4. Consolidate csrc files and module ownership
+- Update `apps/cuda.cmake` and the relevant CMake entry-point conditions so the production executable exists when the
+  Python build command requests it. Diagnostics remains an independent explicit target, with no dependency from
+  `tyloi-engine` that causes diagnostic compilation. Keep libraries actually needed by the production commands.
+- Update `tyloinfer/commands/build.py` to request the `tyloi-engine` target only, removing `mfq-diagnostics` from its default
+  target list. Synchronise executable lookup, managed-build records, service launch and affected packaging/distribution
+  references with the new name. Do not accept a stale `mfq-runtime` binary as evidence that the new build succeeded.
+- Complete the production command consumers of public load/reload, Engine and Transport. Keep model construction and
+  device resource management in their owning library modules. Independent diagnostic migration remains tracked, but is
+  not a prerequisite for producing the production executable.
 
-The files below still need consolidation for CUDA and the necessary common code. They are listed item by item and
-interleaved with the earlier phases according to dependencies, without changing the Gemma4-first order.
-When implementing each item, revise the corresponding target responsibilities and file ownership in architecture.md
-at the same time; no second complete directory table is created.
-Generic generation source is centralised in engine/generation; the public Engine and the transitional CUDA entry
-share media preparation, request validation and cleanup, and normal generation and batch share the advance loop. The
-focus stays on the public execution contract; its test and distribution references are still restored as deferred
-items.
-Whether files are merged is decided by responsibility and actual consumers; line count is not a reason for deletion,
-and no family is required to have the same file list.
+**Acceptance:** from a clean build directory, `uv run tyloinfer build` configures, compiles and locates `tyloi-engine` without
+requesting or compiling a diagnostic executable. Verify its help/startup, managed executable selection and the supported
+load/generate/cancel/reload path. Explicit diagnostic builds have separate acceptance; their omission from the default
+build does not count as diagnostic migration or verification.
 
-Capability decisions, the model factory and the Text instance responsibilities depend on the model/Engine contract
-migration described above; moving files alone is not completion.
+## 2. Completely isolate LibTorch builds and clean macro propagation
 
-1. **Consolidate capability decisions and component descriptions.** Scope: common/capabilities.h, components.h and
-   each family/components.*.
-   Public capability data is provided by models/metadata.h; implementation selection belongs to the model factory, and
-   the concrete vision, MTP and duplex capabilities and their accounting are provided by the actual family. Remove the
-   branches in common helper code that read family-private members.
-   Completion criteria: the public model contract provides capabilities and accounting; common no longer assembles the
-   same description by family type special-casing or member probing; no registry or callback table is added.
+The native/LibTorch source and target split is implemented. Public declarations do not depend on native/legacy
+selectors, and production SDK dependencies remain private. Useful PyTorch conversion/JIT tools and offline numerics
+remain separate consumers; no same-source C++ reference engine is retained. Format compatibility belongs to private
+consuming-target configuration and library-owned format queries.
 
-2. **Unify the model factory and instance assembly entry points.** Scope: engine/load.*, models/load.h and the
-   with_model selection and callback assembly inside them.
-   Model selection and model assembly are centralised in models/load.* and return CausalModel; library-level load and
-   reload coordination belongs to engine/load.*, CLI parsing belongs to commands, device resource initialisation
-   belongs to backend, reusing the Engine lifecycle and draining mechanism; apps keeps only main.
-   Completion criteria: Engine does not parse model paths or include every family; the model factory does not maintain
-   a second instance lifecycle; the old callback-style assembly entry is deleted once its consumers are connected.
+Remaining acceptance covers fresh host/CUDA builds, exported compile/link requirements, public-header consumers and
+both sdist-to-wheel and release-wheel resources. The CUDA JIT raw launchers and their MMA dependencies have only static
+interface/include review; their compilation and device behaviour are unverified. No tests were run or edited under the
+current instruction. SDK-private test dependencies and old source-layout assertions remain unmodified.
 
-3. **Converge the transitional instance responsibilities in engine/text.h.** Scope: execution context, weight and KV
-   holding, budget and model adapters.
-   Resource holding and coordination belong to Engine, generation advance reuses engine/generation, and model
-   computation, state and optional components belong to the corresponding family; the transitional Text assembly shell
-   is removed as the model factory converges.
-   Completion criteria: the transitional Text assembly shell is deleted, Engine holds resources through the public
-   model and execution contracts, and does not duplicate the generation flow that has already converged.
+**Completion:** fresh host and native CUDA builds succeed without Torch; a consumer compiles the public headers without
+backend macros or SDK include paths. Enabling/building the separate reference does not change native compile commands,
+public declarations or link/package dependencies. Production and tests use the same implementation definitions. Fixed
+numeric regression runs without Torch, and the independent reference can still regenerate its cases. Check the Metal
+target's exported requirements here; device build/runtime acceptance is completed in stage 3.
 
-Each source consolidation synchronises the CUDA production callers, includes, the required CMake source lists and
-target dependencies; no copy of the old path, forwarding header or duplicate definition is kept.
-Affected test and fixture references, reference/eval/diagnostics, JIT, wheel, source archives and Metal/HIP
-references are registered item by item as deferred items; they are synchronised and accepted once restored, and
-deferred consumers are not a reason to keep the old implementation.
-Delete an entry once its source consolidation is complete; build, numerical and lifecycle verification are still kept
-according to their own status — putting directories in place is not runtime acceptance.
+## 3. Connect Metal and CUDA through the shared public interfaces
 
-## Deferred items
+Reuse the existing Metal Tensor representation, Executor and basic ops. Connect the missing execution chain rather
+than adding another Engine facade, universal Backend object or parallel public tensor/model hierarchy. CUDA remains the
+regression baseline while the supported Metal paths move to the same contracts.
 
-| Item | What to do when restored |
+Library load/reload and Loader placement now use Device. Qwen3.5 Model/State/loading use the shared model namespace;
+the Metal assembly, public ops and Source-backed TQ/GGUF/Affine caches are registered in an independent backend target.
+Sessions share host codecs and submit staged candidates before drain/publication; full-KV disk restore uploads only
+after admission. CPU cast/cat and Metal lazy generation use the shared contracts. Only static source/call review has
+been performed, so the shared Metal path is not runtime-verified.
+
+Remaining source work includes other model families and their production CLI/service consumers, Metal batch/KV
+quantization/YaRN, CPU encoded offload, legacy MFQ expert formats and Affine SwiGLU limits. The old model runtime still
+contains obsolete norm/coordinator dependencies. DeepSeek-V4.1's separate legacy codec still uploads before admission.
+Cache metadata planning uses a checked MLX allocator bound; other SDK versions can reject a larger actual backing.
+
+1. **Complete device-neutral loading and weight placement.** Use public Device values and typed load options instead
+   of CUDA-only load types or an integer device plus CPU flag. Keep execution placement distinct from CPU-backed
+   weight storage. The same library load/reload contract selects backend resources and the model factory; models and
+   weights own their semantics, while allocation, copies and readiness belong to the backend.
+2. **Complete public-op wiring.** Move CUDA bodies out of generic dispatch into existing backend modules and connect
+   the Metal implementations required by the supported models, including projection, attention/KV, recurrent updates,
+   FFN/MoE, rope and sampling. Share numeric and mutation contracts, compile each public entry point once, and check
+   device/shape/dtype/aliasing consistently. Keep CPU operations available in CUDA builds. Optional fusion may use the
+   unfused same-device computation; unsupported combinations fail explicitly without silent CPU transfer.
+3. **Connect shared model/state and generation consumers.** Move the remaining Metal family semantics to the owning
+   `models/<family>` implementation and connect CausalModel, State, Mtp, Loader/Cache and the unified factory. Replace
+   `MlxEngineModel`, the separate Metal request/generation driver and backend-specific instance assembly as their real
+   consumers move to Engine/Scheduler/generation. Preserve model-specific media, batching and session behaviour; a
+   wrapper around the old complete runtime does not count as shared wiring.
+4. **Preserve execution differences behind Executor.** MLX outputs remain lazy until submission/evaluation requires
+   execution; timing measures evaluated work, scope exit does not imply completion, and reads/retirement wait for
+   dependencies. CUDA retains stream ordering and capture/replay. Metal may use the shared ordinary execution path
+   without Graph support. Shared-memory accounting must not double-count CPU/Metal residency. Do not force raw-pointer
+   materialisation or CUDA scheduling assumptions into the public Tensor contract.
+5. **Finish build and consumer convergence.** Remove SDK dependencies from the shared core and compile device support
+   in its own targets. Update affected runtime, test, diagnostic and distribution consumers and remove migrated old
+   Metal paths; do not mirror engine/models/state/weights under device directories. No macro compatibility aliases or
+   copied upper runtime are retained to keep an old consumer alive.
+
+**Completion:** native CUDA and native Metal build on their supported platforms without Torch and expose the same
+public headers and load/Engine/model/ops contracts. Run shared cases for the model/operation combinations supported on
+both devices, with recorded dtype-specific criteria and independent fixtures. Verify load, prefill/decode, supported
+MTP/batch/session, cancellation, reload/unload and resource retirement on the shared chain. Exercise Metal lazy-output
+timing, no-Graph execution and shared-memory budgeting, plus CUDA capture/replay and asynchronous leases. Neither
+identical kernels nor both devices in a single platform build are required; matching signatures alone is insufficient.
+
+## Retained follow-up and scope limits
+
+| Item | Remaining scope |
 | --- | --- |
-| CMake and old build entry points | Converge the remaining include roots, target dependencies and native/Torch wiring, and handle the build entry points of old tools and deferred backends; verify the combination of apps entry points, the eval/diagnostics libraries and the optional Torch reference library, keeping numeric options and output paths |
-| Metal/HIP and its old-directory cleanup | Adapt to the tyloi namespace and the Tensor abstraction interface, and to pointer/reference contracts; synchronise the Gemma4 MLP and shared Attention loading interfaces, the grid encoder embedding adaptation and the old path references involved in section 4; keep no compatibility aliases and do not block the CUDA mainline |
-| Tool wiring | Synchronise the model/State, request output, loading and execution resource interfaces and the Torch edge conversions in reference, eval, KL, diagnostics and the minicpmo45 command, including reference's old KVCache consumers, Gemma4 public layer loading and forward, public Loader creation and the header that owns the MFE helper declarations; include them in full-chain acceptance |
-| Test migration, changes and runs | Synchronise the public Tensor, unified KvView and quantization contracts, media cache and field traversal, Loader/Loan, model State/MtpState and ops interfaces, model-exclusive ownership, typed placement options and placement.h validation, and the generation, models/source/session, weights/moe paths; migrate Gemma4's single forward and state interfaces, Layer/LayerState/LayerSnapshot, the old Task, Qwen35 and explicit layer forward/prefill parameters, expert projection and biased routing, sparse attention, native FFN/residual, the FfnMode/FfnOptions policies and routed ops, DSpark and staged prefill and their other consumers; delete the old tests and targets for the removed Pipeline and restore acceptance for the plain MoE and TQ target Graph interfaces that are actually kept; keep the numerical criteria, and restore the Graph, budget, profiling-range restoration, lifecycle, shared_execution_test, kernel package and source archive checks |
-| JIT, packaging and build/runtime acceptance | Synchronise source, resource declarations and post-install loading, and verify the real production path |
+| Other CUDA families, including DeepSeek V4.1 | Continue unresolved execution dependencies, State/scratch ownership, capability probing and old Text/loading adapters after the priorities above; fix shared regressions when encountered, without making all-family migration a prerequisite for Qwen4 |
+| Remaining generic consolidation | Retire Backbone family dispatch, common capability/member probing, obsolete loading stages and transitional instance ownership as their consumers migrate; preserve the previously specified budget, lifetime and failure semantics |
+| HIP and its old directories | Device migration and platform acceptance remain deferred; old HIP JIT checkout-relative includes and missing wheel source resources still need migration |
+| Unrelated legacy tools and broad packaging cleanup | Keep outstanding tasks visible, but migrate and verify any consumer actually affected by an active stage in that stage; do not defer its necessary acceptance |
 
-Deferred items are not recorded as complete, and are not bypassed with old interfaces, forwarding headers or source
-copies; independent features and full-chain acceptance for other CUDA families come later.
-Namespace migration covers TyloInfer's own code and the necessary consumers; MFQ file format/encoding identifiers and
-third-party namespaces keep their own semantics.
+Metal wiring, LibTorch isolation and the verification needed by each active stage are no longer blanket deferred items.
+No complete CUDA rewrite or second Gemma4/Qwen35 implementation is scheduled. Unsupported new model features remain
+outside this refactor. TyloInfer namespace migration does not rename MFQ file-format identifiers or third-party APIs.
 
 ## Plan maintenance
 
-- Completed source tasks are deleted from the plan; unfinished build and runtime acceptance is kept. Stable
-  responsibilities live in the architecture document, and Git records the process.
-- Restore the necessary verification according to the actual changes, without lowering the original criteria;
-  unverified items must not be recorded as a runtime pass.
-- The machine has 32 GB of memory; avoid keeping several models or several heavy verification runs resident at once,
-  and do not pin -j.
+- Delete completed source tasks from the remaining-work list; retain unfinished build, numeric and lifecycle checks
+  under their actual status. Stable responsibilities live in architecture.md, and Git records the implementation history.
+- Distinguish source completion, build success and runtime acceptance. Static inspection, skipped cases, exit 77 and
+  `model_branch=skipped` are not runtime passes; keep original error criteria and record unavailable fixtures/hardware.
+- Keep source, callers, includes and required CMake wiring consistent in each change. Do not preserve duplicate
+  definitions, forwarding headers or old runtime copies as a substitute for migration.
+- The machine has 32 GB of memory; avoid several resident models or concurrent heavy verification runs, and do not
+  pin `-j`.

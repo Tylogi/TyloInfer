@@ -3,7 +3,9 @@
 #include "engine/weights/tq/image.h"
 #include "engine/backends/cuda/ops/projection/tq.h"
 #include "engine/backends/cuda/native/device.h"
+#include "engine/backends/cuda/native/context.h"
 #include "engine/backends/cuda/native/memory.h"
+#include "engine/backends/cuda/native/resident_allocations.h"
 #include "engine/backends/cuda/native/stream.h"
 #include "engine/weights/encoding/tq_table.h"
 #include "engine/backends/cuda/executor/tq.h"
@@ -109,8 +111,15 @@ TqCache::HostTransfer::~HostTransfer() noexcept { try { ready->event.synchronize
 
 std::size_t TqCache::reserve_host_locked(std::size_t bytes) {
     if(!bytes || host_.empty())return 0;
-    const auto available=available_host_bytes(process_host_limit_);
-    return available>=bytes?0:host_.trim(bytes-available);
+    std::size_t released = 0;
+    while (!host_.empty()) {
+        const auto available = available_host_bytes(process_host_limit_);
+        if (available >= bytes) break;
+        released += host_.trim(bytes - available);
+        // Freed expert images may remain in the host allocator's arenas.
+        tyloi::trim_host_cache();
+    }
+    return released;
 }
 
 void TqCache::report()const {
@@ -154,6 +163,7 @@ TqCache::TqCache(std::size_t budget,std::size_t host_budget,std::size_t process_
     :tq_(std::move(tq)),
      host_(host_budget?host_budget:available_host_bytes(process_limit)/5*4),
      device_(retain_all?std::nullopt:std::optional<std::size_t>(budget)),
+     device_budget_(device_.limit()),
      process_host_limit_(process_limit),
      profile_(tyloi::cuda::env_lookup("TYLOINFER_TQ_PROFILE_CACHE")!=nullptr) {
     if(!tq_)throw std::invalid_argument("TQ expert cache requires its execution pool");
@@ -181,12 +191,114 @@ std::uint64_t TqCache::add(std::shared_ptr<const tyloi::TqTable> table, std::int
 
 std::size_t TqCache::budget() {
     std::lock_guard<std::mutex> guard(mutex_);
-    return device_.limit().value_or(std::max(payload_bytes_,device_.used()));
+    return device_budget_.value_or(std::max(payload_bytes_,device_.used()));
 }
 
 void TqCache::resize(std::size_t bytes) {
     std::lock_guard<std::mutex> guard(mutex_);
+    device_budget_ = bytes;
     device_.limit(bytes);
+}
+
+std::uint64_t TqCache::streamed_bytes() {
+    std::lock_guard<std::mutex> guard(mutex_);
+    return transfer_bytes_;
+}
+
+void TqCache::prepare_decode(int device, std::size_t workspace_reserve) {
+    const MfqCudaGuard device_guard(device);
+    std::lock_guard<std::mutex> guard(mutex_);
+    const auto context = tyloi::cuda::default_context(device);
+    context->reclaim_idle_memory();
+    const auto available = context->available_memory();
+    const auto headroom = available > workspace_reserve ? available - workspace_reserve : 0;
+    // Temporary workspace eviction must not permanently lower the configured budget.
+    device_.limit(std::min(device_budget_.value_or(SIZE_MAX), device_.used() + headroom));
+}
+
+void TqCache::reclaim(int device, std::size_t available_bytes) {
+    const MfqCudaGuard device_guard(device);
+    std::lock_guard<std::mutex> guard(mutex_);
+    const auto context = tyloi::cuda::default_context(device);
+    context->reclaim_idle_memory();
+    while (!device_.empty()) {
+        const auto available = context->available_memory();
+        if (available >= available_bytes) break;
+        device_.trim(available_bytes - available);
+        device_.limit(device_.used());
+        context->reclaim_idle_memory();
+    }
+}
+
+void TqCache::preload(int device, std::size_t workspace_reserve) {
+    const tyloi::cuda::RoutedWeightAllocationScope resident;
+    const MfqCudaGuard device_guard(device);
+    std::lock_guard<std::mutex> guard(mutex_);
+    const auto context = tyloi::cuda::default_context(device);
+    const auto stream = mfq_current_cuda_stream();
+    TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(stream));
+    context->reclaim_idle_memory();
+    // Request KV and pinned prefill buffers need RAM after startup residency.
+    const auto host_reserve = std::max(workspace_reserve,
+        available_host_bytes(process_host_limit_) / 2);
+    // Fill GPU first, then RAM, distributing initial experts across all layers.
+    for (const bool gpu : {true, false}) {
+        bool exhausted = false;
+        for (std::uint64_t expert = 0; !exhausted; ++expert) {
+            bool found = false;
+            for (std::size_t s = 0; s < sources_.size(); ++s) {
+                const auto& source = sources_[s];
+                if (expert >= source.table->rows() / source.rows) continue;
+                found = true;
+                const auto key = (std::uint64_t(s + 1) << 32) | expert;
+                const DeviceKey device_key{key, device};
+                if (device_.find(device_key)) {
+                    host_.erase(key);
+                    continue;
+                }
+                if (!gpu && host_.find(key)) continue;
+                const auto row_bound = source.table->row_image_bytes_bound();
+                if (std::uint64_t(source.rows) > SIZE_MAX / row_bound)
+                    throw std::overflow_error("TQ preload image size overflow");
+                const auto bound = row_bound * source.rows;
+                const auto available = gpu ? context->available_memory()
+                    : available_host_bytes(process_host_limit_);
+                const auto reserve = gpu ? workspace_reserve : host_reserve;
+                const auto remaining = gpu ? device_.limit().value_or(SIZE_MAX) - device_.used()
+                    : *host_.limit() - host_.used();
+                if (bound > remaining || available <= reserve || bound > available - reserve) {
+                    exhausted = true;
+                    break;
+                }
+                std::shared_ptr<HostImage> image;
+                if (const auto* cached = host_.find(key)) image = *cached;
+                else {
+                    const auto wire = source.table->slice_rows(expert * source.rows, (expert + 1) * source.rows);
+                    source_bytes_ += wire.size();
+                    ++source_reads_;
+                    image = HostImage::create(wire);
+                }
+                if (gpu) {
+                    auto storage = ::tyloi::cuda::empty({static_cast<std::int64_t>(image->bytes.size())},
+                        ::tyloi::TensorOptions().device(::tyloi::Device(::tyloi::kCUDA, device)).dtype(::tyloi::kUInt8));
+                    auto weight = tq_view(storage, image->layout, source.table->width());
+                    auto ready = std::make_shared<Upload>(stream);
+                    upload(storage, image->bytes);
+                    ready->event.record(stream);
+                    device_.put(device_key, DeviceEntry{std::move(weight), std::move(ready), image->source_bytes}, image->bytes.size(), true);
+                    host_.erase(key);
+                } else {
+                    host_.put(key, image, image->bytes.size(), true);
+                }
+            }
+            if (!found) break;
+        }
+        // Later cache misses must preserve the same workspace headroom.
+        if (gpu) device_.limit(device_.used());
+    }
+    TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(stream));
+    std::fprintf(stderr, "tq_cache_preload gpu_bytes=%zu host_bytes=%zu workspace_reserve_bytes=%zu\n",
+        device_.used(), host_.used(), workspace_reserve);
 }
 
 std::size_t TqCache::reserve(std::size_t bytes) {
@@ -270,6 +382,7 @@ std::vector<std::pair<std::string,double>> TqCache::metrics() {
 }
 
 std::vector<::tyloi::encoding::TqTensor> TqCache::get(std::uint64_t source,const std::int64_t* ids,std::size_t count,int device) {
+    const tyloi::cuda::RoutedWeightAllocationScope resident;
     const MfqCudaGuard device_guard(device);
     std::lock_guard<std::mutex> guard(mutex_);
     if (!source || source > sources_.size()) throw std::out_of_range("unknown TQ source");

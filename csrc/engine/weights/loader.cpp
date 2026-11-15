@@ -175,6 +175,10 @@ static TensorParallelAxis infer_tensor_parallel_axis(
     if (tyloi::require_tensor(source, name).dtype == "NINT")
         return std::make_shared<Rows>(load_nint_rows(source, name));
 #endif
+    const auto& dtype = tyloi::require_tensor(source, name).dtype;
+    if (dtype == "BF16" || dtype == "F16" || dtype == "F32") {
+        return load_dense_rows(source, name);
+    }
     return weight(name);
 }
 

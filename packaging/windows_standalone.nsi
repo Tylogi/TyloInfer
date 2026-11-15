@@ -50,7 +50,7 @@ Section
 
   IfFileExists "$CachePath\.ready" 0 extract
   IfFileExists "$CachePath\tyloinfer.exe" 0 extract
-  IfFileExists "$CachePath\mfq-runtime.exe" 0 extract
+  IfFileExists "$CachePath\tyloi-engine.exe" 0 extract
   IfFileExists "$CachePath\tyloinfer-cli\tyloinfer-cli.exe" 0 extract
   IfFileExists "$CachePath\web-ui\index.html" cached extract
 

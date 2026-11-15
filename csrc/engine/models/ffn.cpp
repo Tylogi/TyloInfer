@@ -24,7 +24,7 @@ using Glm = glm_dsa::Config;
 using V4 = deepseek_v4::Config;
 using V41 = deepseek_v41::Config;
 
-class LayerFfn final : public Ffn {
+class LayerFfn final : public RoutedFfn {
 public:
     LayerFfn(std::shared_ptr<const ModelSource> source, weights::Loader weights,
              LayerPlacementConfig& placement, const LoadOptions& options, int layer,
@@ -49,12 +49,11 @@ public:
             hidden_ = config->hidden_size;
         } else {
             const auto& config41 = std::get<V41>(config_);
-            cuda::deepseek_v41_runtime::load_moe_at_into(ops_, weights, config41,
+            native_ = cuda::deepseek_v41_runtime::load_moe_at(weights, config41,
                 "model.block." + std::to_string(layer_) + ".mlp.", layer_, config41.top_k);
             hidden_ = config41.hidden;
         }
-        if (std::holds_alternative<V41>(config_)) inspect(ops_);
-        else inspect(native_);
+        inspect(native_);
         prepared_ = true;
     }
 
@@ -68,7 +67,6 @@ public:
         if (!input || input.dim() != 2 || input.size(1) != hidden_ ||
             input.device() != Device(kCUDA, primary_))
             throw std::invalid_argument("FFN input must have shape [tokens,hidden] on the primary device");
-        if (std::holds_alternative<V41>(config_)) return ops::ffn(ops_, input, ids);
         std::optional<DenseTensor> token_ids;
         if (ids) token_ids = ids.dense();
         return std::make_shared<DenseTensor>(native_.forward(input.dense(), token_ids));
@@ -95,14 +93,13 @@ private:
     int layer_, primary_;
     std::variant<Glm, V4, V41> config_;
     cuda::Ffn native_;
-    ops::FfnWeights ops_;
     std::int64_t hidden_ = 0;
     Info info_{};
     bool attempted_ = false, prepared_ = false;
 };
 }
 
-std::unique_ptr<Ffn> load_ffn(std::shared_ptr<const ModelSource> source,
+std::unique_ptr<RoutedFfn> load_ffn(std::shared_ptr<const ModelSource> source,
     std::string_view definition, const weights::Loader& weights,
     LayerPlacementConfig& placement, const LoadOptions& options, int layer) {
     if (!source || &weights.source != source.get()) throw std::invalid_argument("FFN source and loader must match");

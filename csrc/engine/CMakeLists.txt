@@ -83,13 +83,6 @@ add_library(mfq-engine STATIC
     state/kv_sequence.cpp
     state/kv_offload.cpp
 )
-if(TYLOINFER_BUILD_CUDA_ENGINE OR TYLOINFER_BUILD_METAL_RUNTIME)
-    target_sources(mfq-engine PRIVATE
-        models/load.cpp
-        models/layers.cpp
-        models/qwen35/load.cpp
-        models/qwen35/layers.cpp)
-endif()
 target_compile_definitions(mfq-engine PRIVATE
     TYLOINFER_ENABLE_MFQ_COMPAT=$<BOOL:${TYLOINFER_ENABLE_MFQ_COMPAT}>
     TYLOINFER_HAS_CUDA=$<BOOL:${TYLOINFER_BUILD_CUDA_ENGINE}>

@@ -49,7 +49,7 @@ struct Work {
 nlohmann::json json_tensor(const Tensor& tensor) {
     std::vector<std::int64_t> shape;
     for (std::int64_t i = 0; i < tensor.dim(); ++i) shape.push_back(tensor.size(i));
-    return {{"shape", shape}, {"data", ops::floats(tensor)}};
+    return {{"shape", shape}, {"data", ops::read_floats(tensor)}};
 }
 
 const tyloi::ModelSource& source(tyloi::cuda::Program& program) {

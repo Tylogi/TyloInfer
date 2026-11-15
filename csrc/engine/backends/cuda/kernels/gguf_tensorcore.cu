@@ -1,4 +1,5 @@
 #include "gguf.h"
+#include "engine/backends/cuda/native/env.h"
 #include <cublas_v2.h>
 #include <cublasLt.h>
 #include <cuda_fp16.h>

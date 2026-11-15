@@ -3,7 +3,6 @@
 #include <cublas_v2.h>
 #include "engine/weights/nint.h"
 #include "qwen4_exp.h"
-#include "../ops/common/include/gated_residual.h"
 
 #include <limits>
 #include <climits>
@@ -26,7 +25,6 @@
 #endif
 #include "kernel_dispatch_trace.h"
 #include "gr_bf16_prefill_mix.cuh"
-#include "gr_bf16_prefill_read.cuh"
 
 namespace {
 template<bool Vectorized,int Rows=1>

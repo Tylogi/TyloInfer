@@ -1,24 +1,26 @@
 if(TARGET mfq-transport)
-    add_executable(mfq-runtime
+    add_executable(tyloi-engine
         ${PROJECT_SOURCE_DIR}/apps/runtime_main.cpp
         ${PROJECT_SOURCE_DIR}/commands/runtime.cpp
         ${PROJECT_SOURCE_DIR}/commands/cli.cpp
         ${PROJECT_SOURCE_DIR}/commands/minicpmo45.cpp
     )
-    target_link_libraries(mfq-runtime PRIVATE
+    target_link_libraries(tyloi-engine PRIVATE
         mfq-cuda-eval mfq-transport)
 endif()
 
-add_executable(mfq-diagnostics
-    ${PROJECT_SOURCE_DIR}/apps/diagnostics_main.cpp
-    ${PROJECT_SOURCE_DIR}/commands/diagnostics.cpp
-    ${PROJECT_SOURCE_DIR}/commands/cli.cpp
-    ${PROJECT_SOURCE_DIR}/commands/minicpmo45.cpp
-)
-target_link_libraries(mfq-diagnostics PRIVATE mfq-cuda-diagnostics mfq-cuda-eval)
+if(TYLOINFER_BUILD_DIAGNOSTICS)
+    add_executable(mfq-diagnostics
+        ${PROJECT_SOURCE_DIR}/apps/diagnostics_main.cpp
+        ${PROJECT_SOURCE_DIR}/commands/diagnostics.cpp
+        ${PROJECT_SOURCE_DIR}/commands/cli.cpp
+        ${PROJECT_SOURCE_DIR}/commands/minicpmo45.cpp
+    )
+    target_link_libraries(mfq-diagnostics PRIVATE mfq-cuda-diagnostics mfq-cuda-eval)
+endif()
 
 
-foreach(target mfq-runtime mfq-diagnostics)
+foreach(target tyloi-engine mfq-diagnostics)
     if(TARGET ${target})
         mfq_configure_cuda_engine_target(${target})
         target_compile_definitions(${target} PRIVATE NOMINMAX)
@@ -31,10 +33,10 @@ foreach(target mfq-runtime mfq-diagnostics)
     endif()
 endforeach()
 
-if(NOT WIN32 AND TARGET mfq-runtime)
+if(NOT WIN32 AND TARGET tyloi-engine)
     set(TYLOINFER_SYSTEM_RUNTIME_DIR
         "/usr/lib/${CMAKE_LIBRARY_ARCHITECTURE}" CACHE PATH
         "directory containing the host libstdc++ runtime")
-    set_property(TARGET mfq-runtime PROPERTY
+    set_property(TARGET tyloi-engine PROPERTY
         BUILD_RPATH "${TYLOINFER_SYSTEM_RUNTIME_DIR}")
 endif()

@@ -85,7 +85,7 @@ PowerShell 使用 `curl.exe`。加载返回 `202` 和操作 ID，通过
 服务会选择专家缓存、RAM 锁页、两阶段 FFN、传输复用、整层 prefill 和异步上传；
 CUDA Graph、主要融合算子默认开启。通常不需要复制一长串环境变量。
 
-直接执行 `mfq-runtime` 不会经过 Python 服务的缓存和内存规划，部分原生默认值不同。
+直接执行 `tyloi-engine` 不会经过 Python 服务的缓存和内存规划，部分原生默认值不同。
 部署应使用 `mfq serve`；`--running-executable` 仅在明确需要使用匹配的预编译运行时
 时指定，避免误用另一份旧二进制。
 

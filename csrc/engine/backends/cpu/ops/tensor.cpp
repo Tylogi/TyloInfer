@@ -19,7 +19,7 @@ const DenseTensor& checked(const Tensor& tensor) {
     const auto& view = dense->view_descriptor();
     const auto width = scalar_size(view.scalar_type);
     if (!width || view.rank > kMaximumTensorRank || !dense->storage() ||
-        dense->storage()->device != view.device || dense->storage()->pinned != tensor.is_pinned())
+        dense->storage()->device != view.device)
         throw std::invalid_argument("invalid CPU tensor storage");
     const auto count = view.numel();
     std::size_t max_offset = 0;

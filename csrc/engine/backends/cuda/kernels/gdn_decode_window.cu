@@ -5,7 +5,7 @@
 #define GGML_COMMON_DECL_CUDA
 #include "components/ggml/src/ggml-common.h"
 #include "engine/backends/cuda/kernels/gguf_quantize.cuh"
-#include "../../../cpp_runtime/backends/cuda/kernels/gguf.h"
+#include "gguf.h"
 #include "engine/backends/cuda/kernels/warp_sums.cuh"
 #include <cuda_fp16.h>
 #include <cmath>

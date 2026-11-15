@@ -389,6 +389,7 @@ add_library(mfq-metal-compute OBJECT
 mfq_configure_metal(mfq-metal-compute)
 
 add_library(mfq-metal-engine STATIC
+    ${TYLOINFER_MODEL_ASSEMBLY_SOURCES}
     $<TARGET_OBJECTS:mfq-metal-compute>
     ${PROJECT_SOURCE_DIR}/engine/backends/metal/native/profile.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/metal/native/memory.cpp

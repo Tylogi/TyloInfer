@@ -159,7 +159,7 @@ struct Program::Impl {
     std::unique_ptr<models::State> state;
     std::unique_ptr<models::Layers> layers;
     std::unique_ptr<models::Groups> groups;
-    std::unique_ptr<models::Ffn> ffn;
+    std::unique_ptr<models::RoutedFfn> ffn;
     engine::Config run_config;
     models::Info run_info{};
     models::ForwardOptions forward{};
@@ -323,7 +323,7 @@ models::CausalModel& Program::model() { if (!impl_->model) throw std::logic_erro
 models::State& Program::state() { if (!impl_->state) throw std::logic_error("state not loaded"); return *impl_->state; }
 models::Layers& Program::layers() { if (!impl_->layers) throw std::logic_error("layers not loaded"); return *impl_->layers; }
 models::Groups& Program::groups() { if (!impl_->groups) throw std::logic_error("groups not loaded"); return *impl_->groups; }
-models::Ffn& Program::ffn() { if (!impl_->ffn) throw std::logic_error("FFN not loaded"); return *impl_->ffn; }
+models::RoutedFfn& Program::ffn() { if (!impl_->ffn) throw std::logic_error("FFN not loaded"); return *impl_->ffn; }
 
 void Program::configure(engine::Config config) {
     auto& p = *impl_;

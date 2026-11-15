@@ -5,6 +5,8 @@
 #include "engine/models/glm5_next/forward.h"
 #include "engine/models/nemotron_h/forward.h"
 #include "engine/models/deepseek_v41/mtp_ops.h"
+#include "engine/models/deepseek_v4/model.h"
+#include "engine/models/deepseek_v4/state.h"
 #include "engine/models/minicpmo45/forward.h"
 #include "engine/models/minicpmo45/text/model.h"
 #include "engine/models/minicpmo45/text/state.h"
@@ -28,6 +30,7 @@ TYLOINFER_INSTANTIATE_MTP(tyloi::cuda::minicpmo45::text::Model, tyloi::cuda::min
 TYLOINFER_INSTANTIATE_MTP(tyloi::cuda::glm_dsa::Model, tyloi::cuda::glm_dsa::State);
 TYLOINFER_INSTANTIATE_MTP(tyloi::cuda::glm5_next::Model, tyloi::cuda::glm5_next::State);
 TYLOINFER_INSTANTIATE_MTP(tyloi::cuda::deepseek_v41::Model, tyloi::cuda::deepseek_v41::State);
+TYLOINFER_INSTANTIATE_MTP(tyloi::cuda::deepseek_v4::Model, tyloi::cuda::deepseek_v4::State);
 TYLOINFER_INSTANTIATE_MTP(tyloi::cuda::nemotron_h::Model, tyloi::cuda::nemotron_h::State);
 TYLOINFER_INSTANTIATE_MTP(tyloi::models::qwen35::Model, tyloi::models::qwen35::State);
 #undef TYLOINFER_INSTANTIATE_MTP

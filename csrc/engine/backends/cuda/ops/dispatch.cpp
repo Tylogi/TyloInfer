@@ -88,7 +88,8 @@ void compatible(const Tensor& left_tensor, const Tensor& right_tensor) {
 }
 void residual_inputs(const Tensor& residual, const Tensor& value) {
     compatible(residual, value);
-    if (residual.dim() != 3 || residual.sizes() != value.sizes())
+    if (residual.dim() != 3 || value.dim() != 3 || residual.size(0) != value.size(0) ||
+        residual.size(1) != value.size(1) || residual.size(2) != value.size(2))
         throw std::invalid_argument("residual inputs must have matching [batch,tokens,width] shapes");
 }
 void require_cuda(const Tensor& value_tensor) {
@@ -774,7 +775,7 @@ std::optional<Tensor> mlp_residual(const Tensor& value, const Tensor& residual,
         std::span<const Tensor> gate_up, const Tensor& down, MlpActivation activation,
         double swiglu_limit, bool recurrent) {
     compatible(value, residual);
-    if (value.dim() != 2 || value.sizes() != residual.sizes())
+    if (value.dim() != 2 || dense(value).sizes() != dense(residual).sizes())
         throw std::invalid_argument("fused MLP residual inputs must have matching [rows,width] shapes");
     auto result = cuda::ops::mlp_residual(dense(value), dense(residual), gate_up, down,
         activation, swiglu_limit, recurrent);

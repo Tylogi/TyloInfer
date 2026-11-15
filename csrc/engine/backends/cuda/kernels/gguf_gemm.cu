@@ -1,4 +1,5 @@
 #include "gguf.h"
+#include "engine/backends/cuda/native/env.h"
 #include "engine/weights/encoding/gguf_quant.h"
 #include "ggml-cuda/common.cuh"
 #include "gguf_decode.cuh"

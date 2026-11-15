@@ -42,6 +42,7 @@ set(TYLOINFER_CUDA_LOADING_SOURCES
     ${PROJECT_SOURCE_DIR}/engine/weights/encoding/rows.cpp
     ${PROJECT_SOURCE_DIR}/engine/weights/row_source.cpp
     ${PROJECT_SOURCE_DIR}/engine/weights/row_stage.cpp
+    ${PROJECT_SOURCE_DIR}/engine/weights/rows.cpp
     ${PROJECT_SOURCE_DIR}/engine/weights/loader.cpp
     ${PROJECT_SOURCE_DIR}/engine/weights/routed_cache.cpp
     ${PROJECT_SOURCE_DIR}/engine/weights/workspace.cpp
@@ -73,10 +74,17 @@ mfq_configure_cuda_engine_target(mfq-cuda-loading)
 target_compile_definitions(mfq-cuda-loading PRIVATE NOMINMAX TYLOINFER_HAS_CUDA=1 TYLOINFER_HAS_METAL=0)
 set_target_properties(mfq-cuda-loading PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
-add_subdirectory(${PROJECT_SOURCE_DIR}/engine/models ${CMAKE_CURRENT_BINARY_DIR}/models)
+add_library(mfq-cuda-models OBJECT ${TYLOINFER_MODELS_CUDA_SOURCES})
+mfq_configure_cuda_backend_target(mfq-cuda-models)
+target_link_libraries(mfq-cuda-models PRIVATE mfq-engine)
+target_compile_definitions(mfq-cuda-models PRIVATE NOMINMAX)
+set_target_properties(mfq-cuda-models PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # Library loading calls the model factory and prepares execution resources.
+# The unified model factory names concrete families, so it belongs to the CUDA
+# composition target rather than the generic Engine.
 set(TYLOINFER_CUDA_ENGINE_SOURCES
+    ${TYLOINFER_MODEL_ASSEMBLY_SOURCES}
     ${PROJECT_SOURCE_DIR}/engine/generation/cuda.cpp
     ${PROJECT_SOURCE_DIR}/engine/generation/mtp/cuda.cpp
     ${PROJECT_SOURCE_DIR}/engine/models/minicpmo45/components.cpp
@@ -120,12 +128,12 @@ set_target_properties(mfq-cuda-engine PROPERTIES
     POSITION_INDEPENDENT_CODE ON
 )
 
-# The CLI tools carry legacy code that still targets the pre-Tensor-unification
-# APIs; keep them out of library and test builds until they are ported.
-option(TYLOINFER_BUILD_CLI_TOOLS
-    "Build the native CLI tools (mfq-runtime, mfq-diagnostics)" OFF)
-if(TYLOINFER_BUILD_CLI_TOOLS)
-    include(${PROJECT_SOURCE_DIR}/eval/cuda.cmake)
+# The production entry point is part of the CUDA engine build: `tyloinfer build`
+# must produce it. Diagnostics stays an explicitly requested target.
+option(TYLOINFER_BUILD_DIAGNOSTICS
+    "Build the native diagnostics executable (mfq-diagnostics)" OFF)
+include(${PROJECT_SOURCE_DIR}/eval/cuda.cmake)
+if(TYLOINFER_BUILD_DIAGNOSTICS)
     include(${PROJECT_SOURCE_DIR}/diagnostics/cuda.cmake)
-    include(${PROJECT_SOURCE_DIR}/apps/cuda.cmake)
 endif()
+include(${PROJECT_SOURCE_DIR}/apps/cuda.cmake)

@@ -609,11 +609,11 @@ void recurrence(const Recurrence& a,cudaStream_t stream) {
             gd=a.decay;
         }
         if(transposed_state) {
-            if(tiled_heads)launch_gdn_prefill_columns<true,true>(a.columns,B,Hq,Hv,T,qd,kd,vd,gd,bd,sd,od,sod,stream,a.prepared_decay,a.pipelined,a.staged);
-            else launch_gdn_prefill_columns<true,false>(a.columns,B,Hq,Hv,T,qd,kd,vd,gd,bd,sd,od,sod,stream,a.prepared_decay,a.pipelined,a.staged);
+            if(tiled_heads)launch_gdn_prefill_columns_selected<true,true>(a.columns,B,Hq,Hv,T,qd,kd,vd,gd,bd,sd,od,sod,stream,a.prepared_decay,a.pipelined,a.staged);
+            else launch_gdn_prefill_columns_selected<true,false>(a.columns,B,Hq,Hv,T,qd,kd,vd,gd,bd,sd,od,sod,stream,a.prepared_decay,a.pipelined,a.staged);
         } else {
-            if(tiled_heads)launch_gdn_prefill_columns<false,true>(a.columns,B,Hq,Hv,T,qd,kd,vd,gd,bd,sd,od,sod,stream,a.prepared_decay,a.pipelined,a.staged);
-            else launch_gdn_prefill_columns<false,false>(a.columns,B,Hq,Hv,T,qd,kd,vd,gd,bd,sd,od,sod,stream,a.prepared_decay,a.pipelined,a.staged);
+            if(tiled_heads)launch_gdn_prefill_columns_selected<false,true>(a.columns,B,Hq,Hv,T,qd,kd,vd,gd,bd,sd,od,sod,stream,a.prepared_decay,a.pipelined,a.staged);
+            else launch_gdn_prefill_columns_selected<false,false>(a.columns,B,Hq,Hv,T,qd,kd,vd,gd,bd,sd,od,sod,stream,a.prepared_decay,a.pipelined,a.staged);
         }
     } else if(a.warp) {
         if(tiled_heads){DISPATCH_GDN_WARP(true);}else{DISPATCH_GDN_WARP(false);}

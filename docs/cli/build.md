@@ -107,20 +107,22 @@ paths:
 | Backend | Executable |
 | --- | --- |
 | Metal | `<repo>/build/csrc/metal/mfq-decode-metal` |
-| CUDA | `<repo>/build/csrc/mfq-runtime`, `mfq-diagnostics` |
-| CUDA on Windows | Usually `<repo>\build\csrc\mfq-runtime.exe` (plus `mfq-diagnostics.exe`); multi-configuration generators may add `Release\` |
+| CUDA | `<repo>/build/csrc/tyloi-engine` |
+| CUDA on Windows | Usually `<repo>\build\csrc\tyloi-engine.exe`; multi-configuration generators may add `Release\` |
 
-`mfq-runtime` runs inference and service mode; CUDA checks and benchmarks use
-`mfq-diagnostics`:
+`tyloi-engine` runs inference and service mode; CUDA checks and benchmarks use
+`mfq-diagnostics`, which is built separately:
 
 ```shell
-mfq-diagnostics --check-deepseek-v41
+uv run tyloinfer build -- -DTYLOINFER_BUILD_DIAGNOSTICS=ON
+cmake --build build/csrc --target mfq-diagnostics
+build/csrc/mfq-diagnostics --check-deepseek-v41
 ```
 
 MFQ searches the build tree after compilation, so generators may place the
 executable in a configuration subdirectory.
 
-A successful build writes `<repo>/build/mfq-runtime.json`. This location is
+A successful build writes `<repo>/build/tyloi-engine.json`. This location is
 fixed relative to the source checkout even when `--build-dir` points elsewhere.
 The manifest stores the backend, source directory, build directory, build type,
 generator, forwarded CMake arguments, target, and the actual absolute
@@ -131,7 +133,7 @@ To inspect a generator-dependent path, read the `executable` field for the
 selected backend in the manifest:
 
 ```shell
-uv run -m json.tool build/mfq-runtime.json
+uv run -m json.tool build/tyloi-engine.json
 ```
 
 `mfq serve` reads this manifest automatically. If the executable exists, it is

@@ -128,7 +128,9 @@ tyloi::StepSequence<::tyloi::Tensor> Encoder::encode(
         tyloi::weights::Loan loan(weights_,
                    patch_weight_.nbytes() + patch_bias_.nbytes() +
                    std::size_t(count * config_.hidden_size) * 16);
-        return loan.finish(run());
+        auto output = run();
+        loan.finish(output);
+        return output;
     };
     auto hidden = patch(std::move(pixels));
     auto position = [&] {
@@ -148,7 +150,9 @@ tyloi::StepSequence<::tyloi::Tensor> Encoder::encode(
         tyloi::weights::Loan loan(weights_,
                    position_weight_.nbytes() +
                    std::size_t(interpolation.patch_count * config_.hidden_size) * 48);
-        return loan.finish(run());
+        auto output = run();
+        loan.finish(output);
+        return output;
     };
     {
         auto learned = position();
@@ -176,7 +180,8 @@ tyloi::StepSequence<::tyloi::Tensor> Encoder::encode(
                     output = resident(
                         value, layout.positions, layout.segment_lengths);
                 }
-                hidden = loan.finish(std::move(output));
+                loan.finish(output);
+                hidden = std::move(output);
             } else {
                 hidden = block(
                     std::move(value), layout.positions, layout.segment_lengths);

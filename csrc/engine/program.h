@@ -13,7 +13,7 @@ struct TextSessionState;
 
 namespace tyloi {
 class ModelSource;
-namespace models { class CausalModel; class State; class Layers; class Groups; class Ffn; struct Info; struct Input; struct Prefill; struct BatchConfig; }
+namespace models { class CausalModel; class State; class Layers; class Groups; class RoutedFfn; struct Info; struct Input; struct Prefill; struct BatchConfig; }
 namespace weights { class Cache; struct Loader; }
 namespace engine { struct Config; class InferenceOutput; class Batch; class BatchDriver; }
 }
@@ -77,7 +77,7 @@ public:
     /** Borrow the loaded grouped model view. */
     models::Groups& groups();
     /** Borrow the prepared routed FFN view. */
-    models::Ffn& ffn();
+    models::RoutedFfn& ffn();
     /** Configure a quiescent loaded model, replacing its request graph and session owners. */
     void configure(engine::Config config);
     /** Create an exclusive numerical batch; this program must outlive the lease. */

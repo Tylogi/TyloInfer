@@ -123,7 +123,7 @@ std::vector<Tensor> Qsa::storage(const State& state) const {
     add(cache.graph_keys); add(cache.graph_values); add(cache.graph_pooled); add(cache.graph_index);
     if (cache.memory) {
         add(cache.memory->keys); add(cache.memory->values); add(cache.memory->index); add(cache.memory->pooled);
-        const auto& hot = cache.memory->hot;
+        const auto& hot = kv_hot(*cache.memory);
         add(hot.keys); add(hot.values); add(hot.mapping); add(hot.slot_ids); add(hot.requested);
         add(hot.epochs); add(hot.queue); add(hot.control); add(hot.cold_keys); add(hot.cold_values);
         add(hot.cold_mapping); add(hot.free_cold); add(hot.free_gpu); add(hot.cold_control);

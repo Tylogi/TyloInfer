@@ -1,6 +1,6 @@
 #include "mfq_cuda_linear_attention_ops.h"
 #include "gdn_update.cuh"
-#include "mfq_cuda_context.h"
+#include "engine/backends/cuda/native/tensor/backend.h"
 #include "reduce.cuh"
 #include <type_traits>
 

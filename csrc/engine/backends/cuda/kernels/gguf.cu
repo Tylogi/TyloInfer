@@ -17,7 +17,7 @@
 #include "gguf_dense_rows.cuh"
 #include "gguf_dense_streamed_q5.cuh"
 #include "gguf_dense_interleaved.cuh"
-#include "../runtime/moe_pipeline.h"
+#include "engine/backends/cuda/kernels/moe/pipeline.h"
 #include "kernel_dispatch_trace.h"
 #include <algorithm>
 #include <numeric>

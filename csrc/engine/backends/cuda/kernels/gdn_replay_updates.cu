@@ -1,5 +1,5 @@
 #include "mfq_cuda_gdn_replay_ops.h"
-#include "mfq_cuda_context.h"
+#include "engine/backends/cuda/native/tensor/backend.h"
 #include "gdn_update.cuh"
 #include "gdn_input.cuh"
 #include <algorithm>

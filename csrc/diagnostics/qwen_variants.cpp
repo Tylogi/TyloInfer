@@ -226,7 +226,7 @@ int run_qwen4_generation_variants(Program& program,const std::vector<std::int64_
                     for(int row=0;row<2;++row)rows.push_back({states[row],next[row],states[row]->position(),512-step,true,true});
                     auto result=driver.capture(rows,ids,host,true);
                     if(!result)throw std::runtime_error("short-batch variant must use a CUDA graph");
-                    next=::tyloi::ops::integers(step_owner.keep(*result));
+                    next=::tyloi::ops::read_integers(step_owner.keep(*result));
                     if(next.size()!=2)throw std::runtime_error("short-batch graph returned invalid output");
                     for(int row=0;row<2;++row)generated[row].push_back(next[row]);
                 }

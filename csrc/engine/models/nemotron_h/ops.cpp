@@ -1,4 +1,5 @@
 #include "engine/models/plan.h"
+#include "engine/models/common/check.h"
 #include "engine/backends/cuda/native/collectives.h"
 #include "engine/backends/cuda/native/scope.h"
 #include "engine/models/session/snapshot.h"

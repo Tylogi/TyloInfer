@@ -163,7 +163,7 @@ template <class Ops> class ContinuousBatch : public Batch {
         if (!requests.emplace(work->request->id, work).second)
             throw std::invalid_argument("duplicate batch request id");
         SequenceOps ops{*this, *work};
-        ExecutionCleanup cleanup{output.cleanup_failure, ops};
+        ExecutionCleanup cleanup{output.cleanup_failure, [&] { ops.release(); }};
         int64_t reused = 0, prefix = 0;
         if constexpr (requires { operations.prepare(work->request); })
             reused = operations.prepare(work->request);

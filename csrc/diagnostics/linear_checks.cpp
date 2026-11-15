@@ -27,7 +27,7 @@
 #include <utility>
 #include <vector>
 
-using tyloi::cuda::indexing::Slice;
+using tyloi::indexing::Slice;
 
 int run_linear_check(
     tyloi::cuda::Program& program,
@@ -287,7 +287,7 @@ int run_tensor_parallel_linear_check(
     auto x = tyloi::cuda::arange(
         static_cast<int64_t>(M) * width,
         tyloi::TensorOptions()
-            .device(tyloi::cuda::Device(
+            .device(tyloi::Device(
                 tyloi::kCUDA,
                 saved.primary_device()))
             .dtype(tyloi::kFloat32))

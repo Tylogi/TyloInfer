@@ -13,7 +13,7 @@ namespace tyloi::models {
 struct LoadOptions;
 
 /** Own one model layer's routed FFN for controlled diagnostics. */
-class Ffn {
+class RoutedFfn {
 public:
     struct Info {
         /** Routed projection width used by the original diagnostic log. */
@@ -25,7 +25,7 @@ public:
         std::size_t gate_pools, down_pools;
         double routed_bytes;
     };
-    virtual ~Ffn() = default;
+    virtual ~RoutedFfn() = default;
     /** Load weights after the caller has retained this owner for failure cleanup. */
     virtual void prepare() = 0;
     /** Return the geometry and original logical byte metric after preparation. */
@@ -35,7 +35,7 @@ public:
 };
 
 /** Construct an unloaded routed FFN view borrowing the loader's cache owner. */
-std::unique_ptr<Ffn> load_ffn(std::shared_ptr<const ModelSource> source,
+std::unique_ptr<RoutedFfn> load_ffn(std::shared_ptr<const ModelSource> source,
     std::string_view definition, const weights::Loader& weights,
     LayerPlacementConfig& placement, const LoadOptions& options, int layer);
 }

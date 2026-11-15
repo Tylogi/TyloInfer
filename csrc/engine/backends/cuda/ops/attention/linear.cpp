@@ -697,7 +697,7 @@ void TYLOI_LINEAR_IMPL::replay(
 #undef TYLOI_LINEAR_IMPL
 namespace tyloi::ops {
 struct Linear::State::Impl {
-    cuda::Recurrent mixer;
+    ::tyloi::state::Recurrent mixer;
     cuda::LinearInputs projected;
 };
 Linear::State::State() : impl_(std::make_unique<Impl>()) {}
@@ -784,7 +784,8 @@ std::vector<Tensor*> Linear::State::graph_state() {
     return {&v.convolution, &v.recurrent};
 }
 std::vector<Tensor> Linear::State::storage() const {
-    auto result = impl_->mixer.storage();
+    auto& state = impl_->mixer.view();
+    std::vector<Tensor> result{state.convolution, state.recurrent};
     const auto& p = impl_->projected;
     for (const auto* value : {&p.qk, &p.value, &p.qkv, &p.gate, &p.beta})
         if (value->defined()) result.emplace_back(*value);
@@ -882,7 +883,7 @@ std::array<Tensor, 2> Linear::forward(State& state, const Tensor& input,
         mixer.begin(position,confirmed,x.size(1));
     }
     auto& v=mixer.view();
-    cuda::LinearView view{v.convolution.dense(),v.recurrent.dense(),v.transposed};
+    cuda::LinearView view{v.convolution,v.recurrent,v.transposed};
     try {
         auto output=impl_->core.forward(executor.projector(cuda::Executor::current_ffn()),executor.profiler(),
             executor.mode().linear,x,view,confirmed>0 ? &state.impl_->projected : nullptr);
@@ -898,6 +899,6 @@ void Linear::replay(State& state, std::int64_t retained) const {
     std::optional<MfqCudaGuard> guard;
     if (impl_->target.is_cuda()) guard.emplace(impl_->target);
     auto& v=state.impl_->mixer.view();
-    impl_->core.replay({v.convolution.dense(),v.recurrent.dense(),v.transposed},state.impl_->projected,retained);
+    impl_->core.replay({v.convolution,v.recurrent,v.transposed},state.impl_->projected,retained);
 }
 }

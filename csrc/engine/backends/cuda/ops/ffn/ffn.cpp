@@ -322,7 +322,7 @@ DenseTensor ffn_forward_impl(const Weights& f, DenseTensor x, Executor& executor
         std::vector<::tyloi::DenseTensor> selected;
         {
             auto router_logits = profiler.measure("moe.router", [&]() {
-                const auto* router = f.moe_router.representation<DenseTensor>();
+                const auto* router = f.moe_router.template representation<DenseTensor>();
                 return router ? ::tyloi::cuda::matmul(xf32, router->transpose(0, 1)) :
                     project_.run(f.moe_router, xf32);
             });

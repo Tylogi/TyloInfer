@@ -39,7 +39,7 @@ class NgramEmbedding {
         State(State&&) = default;
         State& operator=(State&&) = default;
         Context context;
-        std::shared_ptr<tyloi::weights::RowPipeline> pipeline;
+        std::shared_ptr<tyloi::weights::RowReader> reader;
         bool hash_ready=false;
         int cached_tokens=0;
         std::array<int64_t,8> cached_ids{};
@@ -51,7 +51,7 @@ class NgramEmbedding {
         : shards_(std::move(shards)), rows_(rows), dimension_(dimension), ngram_(ngram),
           heads_(heads_per_ngram), eos_(eos), multipliers_(std::move(multipliers)),
           offsets_(std::move(offsets)), vocab_(std::move(vocab)),
-          source_(tyloi::weights::RowPipeline::source(shards_, rows)) {
+          source_(tyloi::weights::RowReader::source(shards_, rows)) {
         TYLOINFER_RUNTIME_CHECK(!shards_.empty() && rows_ > 0 && dimension_ > 0 && ngram_ > 1 &&
                               heads_ > 0 && multipliers_.size() == size_t(ngram_) &&
                               offsets_.size() == size_t((ngram_ - 1) * heads_) &&
@@ -85,27 +85,27 @@ class NgramEmbedding {
     }
     void prefetch(State& state,const DenseTensor& host_ids,bool early_prefix=false) const {
         if(!source_)return;
-        if(!state.pipeline)state.pipeline=std::make_shared<tyloi::weights::RowPipeline>(source_);
+        if(!state.reader)state.reader=std::make_shared<tyloi::weights::RowReader>(source_);
         TYLOINFER_RUNTIME_CHECK(host_ids.is_cpu() && host_ids.dim()==2,"PLE prefetch requires host token IDs");
         auto host=host_ids.to(::tyloi::kInt64).contiguous();const auto b=host.size(0),t=host.size(1);
         if(cacheable_hashes(b,t)) {
             const auto& hashes=graph_hashes(state,host);
-            state.pipeline->prefetch(hashes.ids,{b,t,(ngram_-1)*heads_},early_prefix);
+            state.reader->prefetch(hashes.ids,{b,t,(ngram_-1)*heads_},early_prefix);
             return;
         }
         auto hashes=tyloi::models::qwen4_exp::ngram_hashes(host.data_ptr<int64_t>(),b,t,ngram_,heads_,eos_,
             multipliers_,offsets_,vocab_,state.context,true);
-        state.pipeline->prefetch(hashes.ids,{b,t,(ngram_-1)*heads_},early_prefix);
+        state.reader->prefetch(hashes.ids,{b,t,(ngram_-1)*heads_},early_prefix);
     }
     std::shared_ptr<RowStage> graph_stage(State& state,int64_t b,int64_t t,const ::tyloi::Device& device) const {
         TYLOINFER_RUNTIME_CHECK(bool(source_),"PLE graph requires prepared range rows");
-        if(!state.pipeline)state.pipeline=std::make_shared<tyloi::weights::RowPipeline>(source_);
-        return state.pipeline->stage({b,t,(ngram_-1)*heads_},device);
+        if(!state.reader)state.reader=std::make_shared<tyloi::weights::RowReader>(source_);
+        return state.reader->stage({b,t,(ngram_-1)*heads_},device);
     }
     std::vector<std::pair<::tyloi::Device, std::size_t>> graph_stage_growth(
             int64_t b,int64_t t,const ::tyloi::Device& device) const {
         TYLOINFER_RUNTIME_CHECK(bool(source_),"PLE graph requires prepared range rows");
-        return tyloi::weights::RowPipeline::stage_growth(source_,{b,t,(ngram_-1)*heads_},device);
+        return tyloi::weights::RowReader::stage_growth(source_,{b,t,(ngram_-1)*heads_},device);
     }
     void upload_graph(State& state,const DenseTensor& host_ids,RowStage& stage) const {
         TYLOINFER_RUNTIME_CHECK(graph_supported() && host_ids.is_cpu() && host_ids.dim()==2,"PLE graph requires host token IDs");
@@ -132,8 +132,8 @@ class NgramEmbedding {
             source, b, t, ngram_, heads_, eos_, multipliers_, offsets_, vocab_, state.context, cache);
         auto &global = hashes.ids;
         if(source_) {
-            if(!state.pipeline)state.pipeline=std::make_shared<tyloi::weights::RowPipeline>(source_);
-            auto result=state.pipeline->collect(global,{b,t,nh},ids.device());
+            if(!state.reader)state.reader=std::make_shared<tyloi::weights::RowReader>(source_);
+            auto result=state.reader->collect(global,{b,t,nh},ids.device());
             if(hashed_ids)*hashed_ids=::tyloi::cuda::tensor(global).reshape({b,t,nh}).to(ids.device());
             if(cache)restore(state,std::move(hashes.next));
             return result.dense().reshape({b,t,nh*dimension_});
@@ -168,7 +168,7 @@ class NgramEmbedding {
     std::vector<::tyloi::Tensor> shards_;
     int64_t rows_, dimension_, ngram_, heads_, eos_;
     std::vector<int64_t> multipliers_, offsets_, vocab_;
-    std::shared_ptr<const tyloi::weights::RowPipeline::Source> source_;
+    std::shared_ptr<const tyloi::weights::RowReader::Source> source_;
     bool reuse_hashes_=[] {
         const auto* option=tyloi::cuda::env_lookup("TYLOINFER_PLE_HASH_REUSE");return !option || option[0]!='0';
     }();

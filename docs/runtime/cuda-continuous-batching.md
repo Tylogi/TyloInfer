@@ -1,7 +1,7 @@
 # Flash-Next CUDA continuous batching
 
 Enable an explicit request capacity with `mfq serve --max-requests-per-runtime N`
-or native `mfq-runtime --continuous-batching N`. Flash-Next supports capacities
+or native `tyloi-engine --continuous-batching N`. Flash-Next supports capacities
 from 1 to 32 on one CUDA device. The managed server's default remains one request.
 
 Each request owns its GDN recurrent state, PLE convolution and ngram history,

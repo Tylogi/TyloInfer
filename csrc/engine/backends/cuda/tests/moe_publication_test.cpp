@@ -1,4 +1,4 @@
-#include "../runtime/moe_pipeline.h"
+#include "engine/backends/cuda/kernels/moe/pipeline.h"
 #include <cuda_fp16.h>
 #include <algorithm>
 #include <atomic>

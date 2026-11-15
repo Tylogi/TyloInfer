@@ -4,6 +4,7 @@
 #include "engine/backends/cuda/kernels/mfq_cuda_kv_hot_cache.h"
 #include "engine/weights/workspace.h"
 #include "engine/budget.h"
+#include "engine/backends/cpu/native/host_memory.h"
 #include "engine/generation/prefill_budget.h"
 #include "engine/backends/cuda/native/vmm.h"
 #include "engine/state/kv_budget.h"
@@ -43,6 +44,8 @@ std::size_t host_available() {
 #ifdef _WIN32
     MEMORYSTATUSEX status{}; status.dwLength = sizeof(status);
     return GlobalMemoryStatusEx(&status) ? std::size_t(status.ullAvailPhys) : 0;
+#elif defined(__linux__)
+    return tyloi::sample_host_memory().available_host_bytes();
 #else
     const long pages = sysconf(_SC_AVPHYS_PAGES), size = sysconf(_SC_PAGESIZE);
     return pages > 0 && size > 0 ? std::size_t(pages) * size : 0;
@@ -249,8 +252,6 @@ void KvMemoryManager::finalize(tyloi::weights::Cache& cache, std::size_t minimum
     if(admission)for(const auto& weak:allocations_)if(auto a=weak.lock()) {device=a->options.target_device();break;}
     auto context=default_context(device.index);context->reclaim_idle_memory();
     const auto reserve=(options_.additional_request?std::size_t(256)<<20 : ::tyloi::cuda::options::workspace_reserve_bytes())+minimum_experts;
-    const auto initial_free=context->available_memory();
-    if(!admission && (initial_free<reserve || index>initial_free-reserve))throw std::runtime_error(insufficient);
     // Long discrete-memory sessions keep canonical raw KV in RAM. The GPU
     // cache is bounded by resident cells; selected rows are resolved on-device
     // and the same fixed addresses remain valid in decode/MTP CUDA Graphs.
@@ -263,6 +264,8 @@ void KvMemoryManager::finalize(tyloi::weights::Cache& cache, std::size_t minimum
     }
     const bool automatic=options_.placement=="auto" || options_.placement=="auto_ssd";
     const bool tiered_budget=options_.budget_policy && discrete_device();
+    const auto initial_free=context->available_memory();
+    if(!admission && (initial_free<reserve || index>initial_free-reserve))throw std::runtime_error(insufficient);
     std::size_t initial_mapped=0;
     if(admission && options_.dynamic) {
         if(tiered_budget && options_.gpu_budget && options_.gpu_budget<index)
@@ -293,7 +296,7 @@ void KvMemoryManager::finalize(tyloi::weights::Cache& cache, std::size_t minimum
         if(options_.gpu_limit)plan.gpu=std::min(plan.gpu,options_.gpu_limit);
         plan.cells=maximum_cells;
         const auto available=host_available();
-        auto ram=available>(1ULL<<30)?available-(1ULL<<30):0;
+        auto ram=available>(std::size_t(1)<<30)?available-(std::size_t(1)<<30):0;
         if(options_.ram_limit_set)ram=std::min(ram,options_.ram_limit);
         auto& gpu=plan.gpu;
         auto& cells=plan.cells;
@@ -312,6 +315,12 @@ void KvMemoryManager::finalize(tyloi::weights::Cache& cache, std::size_t minimum
                 cells=std::min<int64_t>(maximum,gpu/per_cell);
                 gpu=std::size_t(cells)*per_cell;
                 const auto required=raw-gpu;
+                if (required > ram) {
+                    cache.reserve(engine::prefill_budget_add(required, std::size_t(1) << 30));
+                    const auto available = host_available();
+                    ram = available > (std::size_t(1) << 30) ? available - (std::size_t(1) << 30) : 0;
+                    if (options_.ram_limit_set) ram = std::min(ram, options_.ram_limit);
+                }
                 if(options_.placement!="auto_ssd" && required>ram)throw std::runtime_error(insufficient);
                 if(options_.ram_preallocated && required<=ram) {
                     exclusive=cells>0;raw_host_only=cells==0;

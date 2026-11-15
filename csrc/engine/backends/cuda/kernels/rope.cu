@@ -7,6 +7,7 @@
 
 #include <cuda_runtime.h>
 #include "engine/backends/cuda/native/tensor/backend.h"
+#include "mfq_cuda_attention_ops.h"
 #include <cuda_bf16.h>
 #include <cmath>
 #include <algorithm>

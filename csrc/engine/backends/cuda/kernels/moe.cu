@@ -1613,6 +1613,7 @@ void topk(const Router& a, cudaStream_t stream) {
         moe_topk_1x256_6_sqrtsoftplus_kernel<<<1, 256, 0, stream>>>(
             static_cast<const float*>(a.logits), a.bias, a.ids, a.weights, a.norm_floor, a.scale);
     else if (a.type == NumericType::f16) general_topk<__half>(a, stream);
+    else if (a.type == NumericType::bf16) general_topk<__nv_bfloat16>(a, stream);
     else general_topk<float>(a, stream);
 }
 
@@ -1623,6 +1624,9 @@ void sqrt_weights(const void* logits, const int32_t* ids, float* weights,
     if (type == NumericType::f16)
         moe_sqrtsoftplus_weights_kernel<__half><<<grid, block, 0, stream>>>(
             static_cast<const __half*>(logits), ids, weights, rows, experts, top_k, floor, scale);
+    else if (type == NumericType::bf16)
+        moe_sqrtsoftplus_weights_kernel<__nv_bfloat16><<<grid, block, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(logits), ids, weights, rows, experts, top_k, floor, scale);
     else
         moe_sqrtsoftplus_weights_kernel<float><<<grid, block, 0, stream>>>(
             static_cast<const float*>(logits), ids, weights, rows, experts, top_k, floor, scale);

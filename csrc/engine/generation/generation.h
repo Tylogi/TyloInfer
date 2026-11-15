@@ -27,7 +27,7 @@ template <class Operations, class State>
 Generation generate_prepared(Operations operations, State &state, tyloi::Executor& executor,
                              InferenceRequest &input, InferenceOutput &output,
                              const RequestId& id, bool batched) {
-    using Ops = std::unwrap_reference_t<Operations>;
+    using Ops = std::remove_reference_t<std::unwrap_reference_t<Operations>>;
     Ops& ops = operations;
     std::optional<typename Ops::Prepared> prepared;
     if (input.vision && !output.stopped()) {

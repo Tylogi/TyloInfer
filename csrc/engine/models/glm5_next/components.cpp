@@ -16,15 +16,15 @@ std::unique_ptr<tyloi::models::Mtp> load_components(
         bool load_optional_components) {
     std::unique_ptr<tyloi::models::Mtp> result;
     if (!load_optional_components) return result;
-    if (model.plan.vision != ::tyloi::models::Vision::none ||
-            (model.plan.predictor != ::tyloi::models::Predictor::none &&
+    if (model.plan.vision != ::tyloi::models::VisionAdapter::none ||
+            (model.plan.predictor != ::tyloi::models::PredictorAdapter::none &&
              model.plan.predictor !=
-                 ::tyloi::models::Predictor::flash_next)) {
+                 ::tyloi::models::PredictorAdapter::flash_next)) {
         throw std::runtime_error(
             "unsupported GLM5 CUDA component adapter");
     }
     if (model.plan.predictor ==
-            ::tyloi::models::Predictor::none) return result;
+            ::tyloi::models::PredictorAdapter::none) return result;
     TYLOINFER_RUNTIME_CHECK(
         tyloi::cuda::glm5_next::supports_speculation(model),
         "invalid Flash-Next predictor model");

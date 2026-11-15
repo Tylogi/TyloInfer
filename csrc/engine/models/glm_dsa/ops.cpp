@@ -1,4 +1,5 @@
 #include "engine/models/plan.h"
+#include "engine/models/common/check.h"
 #include "engine/models/session/snapshot.h"
 #include "engine/models/common/load.h"
 #include "engine/weights/loader.h"

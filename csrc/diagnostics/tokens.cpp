@@ -6,6 +6,7 @@
 #include "engine/backends/cuda/native/profile.h"
 #include "engine/backends/cuda/native/tensor/backend.h"
 #include "engine/models/causal_model.h"
+#include "engine/models/plan.h"
 #include "engine/models/load.h"
 #include "engine/models/source.h"
 #include "engine/ops.h"

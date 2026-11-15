@@ -18,7 +18,8 @@ struct Layout {
 };
 
 inline Layout parse(const std::vector<std::uint8_t>& blob, std::size_t item_size,
-                    const std::optional<std::vector<std::int64_t>>& expected) {
+                    const std::optional<std::vector<std::int64_t>>& expected,
+                    std::optional<std::size_t> storage_bytes = std::nullopt) {
     if (!item_size) throw std::invalid_argument("dense tensor item size must be positive");
     if (blob.size() < sizeof(std::uint32_t))
         throw std::runtime_error("truncated dense tensor header");
@@ -39,7 +40,9 @@ inline Layout parse(const std::vector<std::uint8_t>& blob, std::size_t item_size
     }
     if (expected && *expected != result.shape)
         throw std::runtime_error("dense tensor metadata shape mismatch");
-    const auto payload = blob.size() - result.offset;
+    const auto bytes = storage_bytes.value_or(blob.size());
+    if (bytes < result.offset) throw std::runtime_error("truncated dense tensor payload");
+    const auto payload = bytes - result.offset;
     if (payload % item_size || std::uint64_t(elements) != payload / item_size)
         throw std::runtime_error("dense tensor payload size mismatch");
     return result;

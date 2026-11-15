@@ -3,6 +3,7 @@
 #include "engine/backends/cuda/ops/norm/rms.h"
 #include "engine/backends/cuda/ops/ffn/ffn.h"
 #include "engine/ops.h"
+#include "engine/state/media.h"
 #include "engine/models/deepseek_v41/causal_lm.h"
 
 #include "engine/models/plan.h"
@@ -541,54 +542,72 @@ struct Block final {
         const auto batch = input.size(0);
         const auto tokens = input.size(1);
         DenseTensor projected_kv, projected_score;
-        return tyloi::models::deepseek_v41::compress(
-            layer_state, tokens, position, ratio,
-            [&] {
-                return weighted_rms(tyloi::ops::project(input, compressor_key_value).dense(),
-                                    compressor_norm,
-                                    config.rms_eps);
-            },
-            [&] {
-                projected_kv = tyloi::ops::project(input, compressor_key_value).dense()
-                                   .to(::tyloi::kFloat32)
-                                   .contiguous();
-                projected_score = tyloi::ops::project(input, compressor_gate).dense()
-                                      .to(::tyloi::kFloat32)
-                                      .contiguous();
-                if(layer_state.speculative_pending) {
-                    layer_state.speculative_projected_kv=projected_kv;
-                    layer_state.speculative_projected_score=projected_score;
-                }
-            },
-            [&](int64_t complete, int64_t cutoff) {
-                auto kv_groups = projected_kv.narrow(1, 0, cutoff)
-                                     .reshape({batch, complete, ratio, config.head_dim});
-                auto score_groups = projected_score.narrow(1, 0, cutoff)
-                                        .reshape({batch, complete, ratio, config.head_dim});
-                auto pooled = (kv_groups * ::tyloi::cuda::softmax(score_groups, 2)).sum(2);
-                return weighted_rms(pooled.to(::tyloi::kFloat16),
-                                    compressor_norm,
-                                    config.rms_eps);
-            },
-            [&](int64_t cutoff, int64_t remainder) {
-                layer_state.partial_kv.narrow(1, 0, remainder)
-                    .copy_(projected_kv.narrow(1, cutoff, remainder));
-                layer_state.partial_score.narrow(1, 0, remainder)
-                    .copy_(projected_score.narrow(1, cutoff, remainder));
-            },
-            [&](int64_t token, int64_t slot) {
-                layer_state.partial_kv.narrow(1, slot, 1).copy_(projected_kv.narrow(1, token, 1));
-                layer_state.partial_score.narrow(1, slot, 1).copy_(projected_score.narrow(1, token, 1));
-            },
-            [&] {
-                auto pooled =
-                    (layer_state.partial_kv * ::tyloi::cuda::softmax(layer_state.partial_score, 1))
-                        .sum(1, true);
-                return weighted_rms(pooled.to(::tyloi::kFloat16),
-                                    compressor_norm,
-                                    config.rms_eps);
-            },
-            [](const auto &emitted) { return ::tyloi::cuda::cat(emitted, 1).contiguous(); });
+        const auto direct = [&] {
+            return weighted_rms(tyloi::ops::project(input, compressor_key_value).dense(),
+                                compressor_norm,
+                                config.rms_eps);
+        };
+        const auto project = [&] {
+            projected_kv = tyloi::ops::project(input, compressor_key_value).dense()
+                               .to(::tyloi::kFloat32)
+                               .contiguous();
+            projected_score = tyloi::ops::project(input, compressor_gate).dense()
+                                  .to(::tyloi::kFloat32)
+                                  .contiguous();
+            if(layer_state.speculative_pending) {
+                layer_state.speculative_projected_kv=projected_kv;
+                layer_state.speculative_projected_score=projected_score;
+            }
+        };
+        const auto pool = [&](int64_t complete, int64_t cutoff) {
+            auto kv_groups = projected_kv.narrow(1, 0, cutoff)
+                                 .reshape({batch, complete, ratio, config.head_dim});
+            auto score_groups = projected_score.narrow(1, 0, cutoff)
+                                    .reshape({batch, complete, ratio, config.head_dim});
+            auto pooled = (kv_groups * ::tyloi::cuda::softmax(score_groups, 2)).sum(2);
+            return weighted_rms(pooled.to(::tyloi::kFloat16),
+                                compressor_norm,
+                                config.rms_eps);
+        };
+        const auto save = [&](int64_t cutoff, int64_t remainder) {
+            layer_state.partial_kv.narrow(1, 0, remainder)
+                .copy_(projected_kv.narrow(1, cutoff, remainder));
+            layer_state.partial_score.narrow(1, 0, remainder)
+                .copy_(projected_score.narrow(1, cutoff, remainder));
+        };
+        const auto write = [&](int64_t token, int64_t slot) {
+            layer_state.partial_kv.narrow(1, slot, 1).copy_(projected_kv.narrow(1, token, 1));
+            layer_state.partial_score.narrow(1, slot, 1).copy_(projected_score.narrow(1, token, 1));
+        };
+        const auto partial_pool = [&] {
+            auto pooled =
+                (layer_state.partial_kv * ::tyloi::cuda::softmax(layer_state.partial_score, 1))
+                    .sum(1, true);
+            return weighted_rms(pooled.to(::tyloi::kFloat16),
+                                compressor_norm,
+                                config.rms_eps);
+        };
+        const auto concat = [](const auto &emitted) { return ::tyloi::cuda::cat(emitted, 1).contiguous(); };
+        TYLOINFER_RUNTIME_CHECK(ratio > 0, "invalid compression ratio");
+        if (ratio == 1) return std::optional<DenseTensor>(direct());
+        project();
+        std::vector<DenseTensor> emitted;
+        if (layer_state.partial_length == 0 && position % ratio == 0) {
+            const auto complete=tokens/ratio, cutoff=complete*ratio;
+            if(complete>0)emitted.push_back(pool(complete,cutoff));
+            const auto remainder=tokens-cutoff;
+            if(remainder>0)save(cutoff,remainder);
+            layer_state.partial_length=remainder;
+        } else {
+            for(int64_t token=0;token<tokens;++token) {
+                const auto slot=(position+token)%ratio;
+                write(token,slot);
+                if(slot+1==ratio)emitted.push_back(partial_pool());
+            }
+            layer_state.partial_length=(position+tokens)%ratio;
+        }
+        if(emitted.empty())return std::optional<DenseTensor>{};
+        return std::optional<DenseTensor>(emitted.size()==1?std::move(emitted.front()):concat(emitted));
     }
 
     void publish_compressed_source(SharedState& shared, const DenseTensor &input,
@@ -633,56 +652,64 @@ struct Block final {
         // Restrict scoring only when the candidate budget excludes some KV.
         // An all-inclusive list adds scattered loads without reducing work.
         const bool restricted = pool_length > config.candidate_topk_blocks * config.candidate_block_size;
-        return tyloi::models::deepseek_v41::hierarchical_index(
-            ratio, index_source(), layer, config.candidate_source_layer, pool_length,
-            [&] { return empty_topk(batch, tokens, input.device()); },
-            [&] {
-                TYLOINFER_RUNTIME_CHECK(shared.topk.defined(),
-                                  "DeepSeek-V4.1 CSA2 consumer has no published index plan");
-                return shared.topk;
-            },
-            [&] {
-                auto query =
-                    tyloi::ops::project(q_rank, index_query).dense()
-                        .reshape({batch, tokens, config.index_n_heads, config.index_head_dim})
+        const auto empty = [&] { return empty_topk(batch, tokens, input.device()); };
+        const auto reuse = [&] {
+            TYLOINFER_RUNTIME_CHECK(shared.topk.defined(),
+                              "DeepSeek-V4.1 CSA2 consumer has no published index plan");
+            return shared.topk;
+        };
+        const auto score = [&] {
+            auto query =
+                tyloi::ops::project(q_rank, index_query).dense()
+                    .reshape({batch, tokens, config.index_n_heads, config.index_head_dim})
+                    .transpose(1, 2)
+                    .contiguous();
+            auto rotated = ::tyloi::ops::tail_rope(query, positions, rope);
+            query = rotated.dense()
                         .transpose(1, 2)
                         .contiguous();
-                auto rotated = ::tyloi::ops::tail_rope(query, positions, rope);
-                query = rotated.dense()
-                            .transpose(1, 2)
-                            .contiguous();
-                query = dsv4_fp4_sim_cuda(query.to(::tyloi::kFloat16).contiguous());
-                auto weights = tyloi::ops::project(input, index_score).dense()
-                                   .reshape({batch, tokens, config.index_n_heads})
-                                   .to(::tyloi::kFloat16)
-                                   .contiguous();
-                auto keys = shared.index_k.narrow(1, 0, pool_length).contiguous();
-                if (layer > config.candidate_source_layer && restricted) {
-                    TYLOINFER_RUNTIME_CHECK(shared.candidate_blocks.defined(),
-                                      "DeepSeek-V4.1 hierarchical indexer has no candidates");
-                    candidates = candidate_positions(shared.candidate_blocks,
-                                                     config.candidate_block_size, pool_length);
-                    return tyloi::ops::measure("deepseek_v41.indexer.candidate_scores", [&] {
-                        return dsv4_indexer_candidate_scores_cuda(query, keys, weights, candidates,
-                                                                  position, ratio);
-                    });
-                }
-                return tyloi::ops::measure("deepseek_v41.indexer.full_scores", [&] {
-                    return dsv4_indexer_scores_cuda(query, keys, weights, position, ratio);
+            query = dsv4_fp4_sim_cuda(query.to(::tyloi::kFloat16).contiguous());
+            auto weights = tyloi::ops::project(input, index_score).dense()
+                               .reshape({batch, tokens, config.index_n_heads})
+                               .to(::tyloi::kFloat16)
+                               .contiguous();
+            auto keys = shared.index_k.narrow(1, 0, pool_length).contiguous();
+            if (layer > config.candidate_source_layer && restricted) {
+                TYLOINFER_RUNTIME_CHECK(shared.candidate_blocks.defined(),
+                                  "DeepSeek-V4.1 hierarchical indexer has no candidates");
+                candidates = candidate_positions(shared.candidate_blocks,
+                                                 config.candidate_block_size, pool_length);
+                return tyloi::ops::measure("deepseek_v41.indexer.candidate_scores", [&] {
+                    return dsv4_indexer_candidate_scores_cuda(query, keys, weights, candidates,
+                                                              position, ratio);
                 });
-            },
-            [&](DenseTensor scores) {
-                if (restricted) shared.candidate_blocks = candidate_blocks_from_scores(
-                    scores, ratio, position, config.candidate_topk_blocks,
-                    config.candidate_block_size);
-            },
-            [&](DenseTensor scores) {
-                if (!restricted) return select_topk(scores, config.index_topk, pool_length);
-                TYLOINFER_RUNTIME_CHECK(candidates.defined(), "DeepSeek-V4.1 candidate scores are unavailable");
-                return select_topk(scores, config.index_topk, pool_length, candidates);
-            },
-            [&](DenseTensor scores) { return select_topk(scores, config.index_topk, pool_length); },
-            [&](DenseTensor topk) { shared.topk = std::move(topk); });
+            }
+            return tyloi::ops::measure("deepseek_v41.indexer.full_scores", [&] {
+                return dsv4_indexer_scores_cuda(query, keys, weights, position, ratio);
+            });
+        };
+        const auto candidates_stage = [&](DenseTensor scores) {
+            if (restricted) shared.candidate_blocks = candidate_blocks_from_scores(
+                scores, ratio, position, config.candidate_topk_blocks,
+                config.candidate_block_size);
+        };
+        const auto select_candidates = [&](DenseTensor scores) {
+            if (!restricted) return select_topk(scores, config.index_topk, pool_length);
+            TYLOINFER_RUNTIME_CHECK(candidates.defined(), "DeepSeek-V4.1 candidate scores are unavailable");
+            return select_topk(scores, config.index_topk, pool_length, candidates);
+        };
+        const auto select = [&](DenseTensor scores) { return select_topk(scores, config.index_topk, pool_length); };
+        const auto publish = [&](DenseTensor topk) { shared.topk = std::move(topk); };
+        if(ratio==0)return empty();
+        if(!index_source())return reuse();
+        auto selected=empty();
+        if(pool_length>0) {
+            auto scores=score();
+            if(layer==config.candidate_source_layer)candidates_stage(scores);
+            selected=layer>config.candidate_source_layer?select_candidates(scores):select(scores);
+        }
+        publish(selected);
+        return selected;
     }
 
     DenseTensor attention_forward(SharedState& shared, const DenseTensor &input,
@@ -693,128 +720,131 @@ struct Block final {
         const auto batch = input.size(0);
         const auto tokens = input.size(1);
         const auto local_history = truncated_local ? 0 : std::min(position, config.sliding_window);
-        return tyloi::models::deepseek_v41::attention(
-            kv_source(), ratio,
-            [&] {
-                return weighted_rms(tyloi::ops::project(input, query_a).dense(),
-                                    query_a_norm,
-                                    config.rms_eps);
-            },
-            [&](DenseTensor q_rank) {
-                auto query = tyloi::ops::project(q_rank, query_b).dense()
-                                 .reshape({batch, tokens, config.n_heads, config.head_dim})
-                                 .transpose(1, 2)
-                                 .contiguous()
-                                 .to(::tyloi::kFloat32);
-                auto rotated = ::tyloi::ops::tail_rope(query, positions, rope);
-                query = rotated.dense();
-
-                return query;
-            },
-            [&] {
-                auto local = weighted_rms(tyloi::ops::project(input, key_value).dense(),
-                                          key_value_norm,
-                                          config.rms_eps)
-                                 .reshape({batch, tokens, config.head_dim});
-                local = rotate_token_major_tail(local, positions, rope);
-                local = deepseek_v41_mxfp8_e4m3_sim_cuda(local.contiguous());
-
-                return local;
-            },
-            [&] { publish_compressed_source(shared, input, position); },
-            [&] {
-                TYLOINFER_RUNTIME_CHECK(shared.compressed_kv.defined() && shared.index_k.defined() &&
-                                      shared.ratio == ratio,
-                                  "DeepSeek-V4.1 CSA2 consumer ran before its source layer");
-            },
-            [&](DenseTensor q_rank) {
-                return compute_topk(shared, input, q_rank, positions, position);
-            },
-            [&](DenseTensor local) {
-                DenseTensor local_for_attention;
-                if (tokens == 1) {
-                    auto slot = ::tyloi::cuda::full(
-                        {1}, position % config.sliding_window,
-                        positions.options().dtype(::tyloi::kInt64));
-                    layer_state.local_kv.index_copy_(1, slot, local);
-                    local_for_attention = layer_state.local_kv;
-                } else {
-                    const auto history = local_history;
-                    std::vector<DenseTensor> local_parts;
-                    if (history > 0) {
-                        auto slots = ::tyloi::cuda::arange(
-                                         position - history, position,
-                                         positions.options().dtype(::tyloi::kInt64))
-                                         .remainder(static_cast<double>(config.sliding_window))
-                                         .to(::tyloi::kInt64)
-                                         .contiguous();
-                        local_parts.push_back(layer_state.local_kv.index_select(1, slots));
-                    }
-                    local_parts.push_back(local);
-                    local_for_attention =
-                        local_parts.size() == 1
-                            ? local_parts.front()
-                            : ::tyloi::cuda::cat(local_parts, 1).contiguous();
-                    const auto recent = std::min(tokens, config.sliding_window);
-                    auto recent_slots = ::tyloi::cuda::arange(
-                                            position + tokens - recent, position + tokens,
-                                            positions.options().dtype(::tyloi::kInt64))
-                                            .remainder(static_cast<double>(config.sliding_window))
-                                            .to(::tyloi::kInt64)
-                                            .contiguous();
-                    layer_state.local_kv.index_copy_(1, recent_slots,
-                                               local.narrow(1, tokens - recent, recent));
+        const auto rank = [&] {
+            return weighted_rms(tyloi::ops::project(input, query_a).dense(),
+                                query_a_norm,
+                                config.rms_eps);
+        };
+        const auto query_stage = [&](DenseTensor q_rank) {
+            auto query = tyloi::ops::project(q_rank, query_b).dense()
+                             .reshape({batch, tokens, config.n_heads, config.head_dim})
+                             .transpose(1, 2)
+                             .contiguous()
+                             .to(::tyloi::kFloat32);
+            auto rotated = ::tyloi::ops::tail_rope(query, positions, rope);
+            return rotated.dense();
+        };
+        const auto local_stage = [&] {
+            auto local = weighted_rms(tyloi::ops::project(input, key_value).dense(),
+                                      key_value_norm,
+                                      config.rms_eps)
+                             .reshape({batch, tokens, config.head_dim});
+            local = rotate_token_major_tail(local, positions, rope);
+            return deepseek_v41_mxfp8_e4m3_sim_cuda(local.contiguous());
+        };
+        const auto publish = [&] { publish_compressed_source(shared, input, position); };
+        const auto validate = [&] {
+            TYLOINFER_RUNTIME_CHECK(shared.compressed_kv.defined() && shared.index_k.defined() &&
+                                  shared.ratio == ratio,
+                              "DeepSeek-V4.1 CSA2 consumer ran before its source layer");
+        };
+        const auto index_stage = [&](DenseTensor q_rank) {
+            return compute_topk(shared, input, q_rank, positions, position);
+        };
+        const auto cache_stage = [&](DenseTensor local) {
+            DenseTensor local_for_attention;
+            if (tokens == 1) {
+                auto slot = ::tyloi::cuda::full(
+                    {1}, position % config.sliding_window,
+                    positions.options().dtype(::tyloi::kInt64));
+                layer_state.local_kv.index_copy_(1, slot, local);
+                local_for_attention = layer_state.local_kv;
+            } else {
+                const auto history = local_history;
+                std::vector<DenseTensor> local_parts;
+                if (history > 0) {
+                    auto slots = ::tyloi::cuda::arange(
+                                     position - history, position,
+                                     positions.options().dtype(::tyloi::kInt64))
+                                     .remainder(static_cast<double>(config.sliding_window))
+                                     .to(::tyloi::kInt64)
+                                     .contiguous();
+                    local_parts.push_back(layer_state.local_kv.index_select(1, slots));
                 }
+                local_parts.push_back(local);
+                local_for_attention =
+                    local_parts.size() == 1
+                        ? local_parts.front()
+                        : ::tyloi::cuda::cat(local_parts, 1).contiguous();
+                const auto recent = std::min(tokens, config.sliding_window);
+                auto recent_slots = ::tyloi::cuda::arange(
+                                        position + tokens - recent, position + tokens,
+                                        positions.options().dtype(::tyloi::kInt64))
+                                        .remainder(static_cast<double>(config.sliding_window))
+                                        .to(::tyloi::kInt64)
+                                        .contiguous();
+                layer_state.local_kv.index_copy_(1, recent_slots,
+                                           local.narrow(1, tokens - recent, recent));
+            }
 
-                const auto pool_length = ratio > 0 ? shared.compressed_length : 0;
-                auto cache =
-                    pool_length > 0
-                        ? ::tyloi::cuda::cat({local_for_attention,
-                                                   shared.compressed_kv.narrow(1, 0, pool_length)},
-                                                  1)
-                              .contiguous()
-                        : local_for_attention.contiguous();
-                return cache;
-            },
-            [&](DenseTensor topk) {
-                const auto pool_length = ratio > 0 ? shared.compressed_length : 0;
-                std::vector<DenseTensor> plan;
-                if (tokens == 1) {
-                    auto lengths = sequence_lengths.has_value()
-                                       ? sequence_lengths.value()
-                                             .to(input.device(), ::tyloi::kInt64)
-                                             .contiguous()
-                                       : ::tyloi::cuda::full(
-                                             {batch}, position + 1,
-                                             positions.options().dtype(::tyloi::kInt64));
-                    plan = dsv4_build_decode_plan_cuda(
-                        topk, lengths, pool_length, ratio > 0 ? ratio : 1, config.sliding_window);
-                } else {
-                    TYLOINFER_RUNTIME_CHECK(
-                        !sequence_lengths.has_value(),
-                        "DeepSeek-V4.1 chunked prefill does not accept per-row lengths");
-                    const auto history = local_history;
-                    plan =
-                        dsv4_build_prefill_plan_cuda(topk, position, history, pool_length,
-                                                     ratio > 0 ? ratio : 1, config.sliding_window);
-                }
-                return plan;
-            },
-            [&](DenseTensor query, DenseTensor cache, const auto &plan) {
-                return tyloi::ops::sparse_attention(
-                           query, cache, plan.at(0), plan.at(1), sinks,
-                           1.0 / std::sqrt(static_cast<double>(config.head_dim)))
-                    .dense();
-            },
-            [&](DenseTensor attended) {
-                auto value = attended.transpose(1, 2).contiguous();
-                auto rotated = ::tyloi::ops::tail_rope(value, positions, rope, true);
-                return rotated.dense()
-                    .transpose(1, 2)
-                    .contiguous();
-            },
-            [&] { layer_state.position += tokens; },
-            [&](DenseTensor attended) { return output_projection(attended); });
+            const auto pool_length = ratio > 0 ? shared.compressed_length : 0;
+            return pool_length > 0
+                ? ::tyloi::cuda::cat({local_for_attention,
+                                           shared.compressed_kv.narrow(1, 0, pool_length)},
+                                          1)
+                      .contiguous()
+                : local_for_attention.contiguous();
+        };
+        const auto plan_stage = [&](DenseTensor topk) {
+            const auto pool_length = ratio > 0 ? shared.compressed_length : 0;
+            std::vector<DenseTensor> plan;
+            if (tokens == 1) {
+                auto lengths = sequence_lengths.has_value()
+                                   ? sequence_lengths.value()
+                                         .to(input.device(), ::tyloi::kInt64)
+                                         .contiguous()
+                                   : ::tyloi::cuda::full(
+                                         {batch}, position + 1,
+                                         positions.options().dtype(::tyloi::kInt64));
+                plan = dsv4_build_decode_plan_cuda(
+                    topk, lengths, pool_length, ratio > 0 ? ratio : 1, config.sliding_window);
+            } else {
+                TYLOINFER_RUNTIME_CHECK(
+                    !sequence_lengths.has_value(),
+                    "DeepSeek-V4.1 chunked prefill does not accept per-row lengths");
+                const auto history = local_history;
+                plan =
+                    dsv4_build_prefill_plan_cuda(topk, position, history, pool_length,
+                                                 ratio > 0 ? ratio : 1, config.sliding_window);
+            }
+            return plan;
+        };
+        const auto attend = [&](DenseTensor query, DenseTensor cache, const auto &plan) {
+            return tyloi::ops::sparse_attention(
+                       query, cache, plan.at(0), plan.at(1), sinks,
+                       1.0 / std::sqrt(static_cast<double>(config.head_dim)))
+                .dense();
+        };
+        const auto inverse = [&](DenseTensor attended) {
+            auto value = attended.transpose(1, 2).contiguous();
+            auto rotated = ::tyloi::ops::tail_rope(value, positions, rope, true);
+            return rotated.dense()
+                .transpose(1, 2)
+                .contiguous();
+        };
+        const auto commit = [&] { layer_state.position += tokens; };
+        auto q_rank=rank();
+        auto q=query_stage(q_rank);
+        auto kv=local_stage();
+        if(kv_source())publish();
+        else if(ratio>0)validate();
+        auto topk=index_stage(q_rank);
+        auto values=cache_stage(std::move(kv));
+        auto indices=plan_stage(std::move(topk));
+        auto attended=attend(std::move(q),std::move(values),indices);
+        auto hidden=inverse(std::move(attended));
+        commit();
+        return output_projection(std::move(hidden));
     }
 
     DenseTensor forward(SharedState& shared,

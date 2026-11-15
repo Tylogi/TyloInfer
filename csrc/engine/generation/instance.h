@@ -11,9 +11,9 @@ tyloi::StepSequence<tyloi::models::Prepared> Text<M, S, P>::prepare(InferenceReq
         if (!components) throw std::invalid_argument("model has no multimodal component");
         return components->prepare(input.prompt, *input.vision);
     } else if constexpr (std::is_same_v<Model, nemotron_h::Model>) {
-        return components.prepare(language, images,
-        load_config.layer_placement.primary_device(),
-        input.prompt, *input.vision);
+        if (!components.radio_vision) throw std::invalid_argument("model has no multimodal component");
+        return components.radio_vision->prepare(language,
+            load_config.layer_placement.primary_device(), input.prompt, *input.vision);
     }
     else if constexpr (requires { static_cast<const tyloi::models::CausalModel&>(language); }) {
         const tyloi::models::CausalModel& causal = language;

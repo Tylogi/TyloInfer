@@ -10,6 +10,7 @@
 #include "engine/backends/cuda/kernels/mfq_cuda_moe_ops.h"
 #include "engine/backends/cuda/kernels/mfq_cuda_shared_gate.h"
 #include "engine/backends/cuda/kernels/mfq_cuda_sampling_ops.h"
+#include "engine/backends/cuda/kernels/qwen4_exp.h"
 #include "components/error.h"
 #include "context.h"
 #include "engine/backends/cuda/native/memory.h"
@@ -308,10 +309,9 @@ void Predictor::history_step(tyloi::models::MtpState& value,DenseTensor hidden,D
     if(scalar_chain && ids.size(1)>1) {
         for(int64_t row=0;row<ids.size(1);++row) {
             auto row_positions=positions.defined()?positions.narrow(-1,row,1):DenseTensor{};
-            (void)step(value,hidden.narrow(1,row,1),ids.narrow(1,row,1),
-                       row_positions.defined()?&row_positions:nullptr);
+            (void)step(value,hidden.narrow(1,row,1),ids.narrow(1,row,1),row_positions);
         }
-    } else (void)step(value,hidden,ids,positions.defined()?&positions:nullptr);
+    } else (void)step(value,hidden,ids,positions);
 }
 
 void Predictor::trim_cache_to(tyloi::models::MtpState& value, int64_t position) const {
@@ -1693,7 +1693,7 @@ tyloi::models::PrefillPlan qwen4_exp::Model::prefill_plan(
     const auto whole=::tyloi::cuda::options::moe_prefill_layer();
     if ((enabled && *enabled==0) || (whole && *whole==0) || (!policy.routed && !whole) ||
         policy.tokens<=128 || policy.tokens>16384 || state.speculative_start>=0 ||
-        (!policy.routed && !host_tokens) || !policy.coordinated || policy.transformed ||
+        (!policy.routed && (!host_tokens || !policy.coordinated)) || policy.transformed ||
         policy.compute<=8 || policy.first!=0 || (policy.last!=0 && policy.last!=policy.tokens)) return {false,8192};
     for (const auto& block:layers)
         if (block->device.is_cpu() || block->device.index!=primary_device) return {false,8192};

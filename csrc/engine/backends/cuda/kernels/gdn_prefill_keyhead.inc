@@ -99,10 +99,10 @@ bool launch_gdn_prefill_keyhead(int B,int Hq,int Hv,int T,const float* q,const f
     const auto* setting=std::getenv("TYLOINFER_GDN_PREFILL_KEYHEAD");
     if((setting && setting[0]=='0') || T<128)return false;
     static thread_local int cached_device=-1,cached_major=0,cached_sms=0;
-    const int device=mfq_current_cuda_device();
+    int device;gdn_check(cudaGetDevice(&device));
     if(cached_device!=device) {
-        TYLOINFER_CUDA_CHECK(cudaDeviceGetAttribute(&cached_major,cudaDevAttrComputeCapabilityMajor,device));
-        TYLOINFER_CUDA_CHECK(cudaDeviceGetAttribute(&cached_sms,cudaDevAttrMultiProcessorCount,device));
+        gdn_check(cudaDeviceGetAttribute(&cached_major,cudaDevAttrComputeCapabilityMajor,device));
+        gdn_check(cudaDeviceGetAttribute(&cached_sms,cudaDevAttrMultiProcessorCount,device));
         cached_device=device;
     }
     if(cached_major<8)return false; // cp.async begins at compute capability 8.0.
@@ -113,13 +113,13 @@ bool launch_gdn_prefill_keyhead(int B,int Hq,int Hv,int T,const float* q,const f
         auto kernel=(Hv/Hq)%Values==0
             ?gdn_prefill_keyhead_kernel<Values,Transposed,Tiled,Prepared,true>
             :gdn_prefill_keyhead_kernel<Values,Transposed,Tiled,Prepared,false>;
-        int resident=0;TYLOINFER_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&resident,kernel,128,0));
+        int resident=0;gdn_check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&resident,kernel,128,0));
         if(resident<=0)return false;
         kernel<<<dim3(B*Hq*groups,4),dim3(32,4),0,stream>>>(q,k,v,g,beta,state,out,next,Hq,Hv,T);
         if(const auto* trace=std::getenv("TYLOINFER_TRACE_KERNEL_DISPATCH");trace && trace[0]=='1') {
             static std::atomic<bool> reported{false};
             if(!reported.exchange(true)) {
-                cudaFuncAttributes attributes{};TYLOINFER_CUDA_CHECK(cudaFuncGetAttributes(&attributes,kernel));
+                cudaFuncAttributes attributes{};gdn_check(cudaFuncGetAttributes(&attributes,kernel));
                 std::fprintf(stderr,"native_gdn_prefill_keyhead actual_match=1 values_per_block=%d heads=%d tokens=%d registers=%d local_bytes=%zu blocks=%lld sms=%d\n",
                     Values,Hv,T,attributes.numRegs,attributes.localSizeBytes,4ll*B*Hq*groups,cached_sms);
             }

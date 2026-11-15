@@ -8,6 +8,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include "engine/backends/cuda/native/tensor/backend.h"
+#include "mfq_cuda_sampling_ops.h"
 #include "engine/backends/cuda/kernels/kernel_dispatch_trace.h"
 #include <cub/block/block_radix_sort.cuh>
 #include <float.h>

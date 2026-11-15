@@ -23,14 +23,16 @@ public:
 };
 
 namespace tyloi::weights {
-class RowPipeline {
+std::shared_ptr<RowStage> make_dense_row_stage(const std::vector<Tensor>& tables,
+    std::int64_t rows_per_shard, const std::vector<std::int64_t>& shape, Device device);
+class RowReader {
 public:
     struct Source;
     static std::shared_ptr<const Source> source(std::vector<Tensor> tables, std::int64_t rows_per_shard);
     static std::vector<std::pair<Device, std::size_t>> stage_growth(
         const std::shared_ptr<const Source>&, const std::vector<std::int64_t>& shape, const Device& device);
-    explicit RowPipeline(std::shared_ptr<const Source> source);
-    ~RowPipeline();
+    explicit RowReader(std::shared_ptr<const Source> source);
+    ~RowReader();
     bool prefetch(const std::vector<std::int64_t>& ids, const std::vector<std::int64_t>& shape, bool early_prefix);
     Tensor collect(const std::vector<std::int64_t>& ids, const std::vector<std::int64_t>& shape, const Device& device);
     std::shared_ptr<RowStage> stage(const std::vector<std::int64_t>& shape, const Device& device);

@@ -16,7 +16,7 @@
       }
     },
     "externalBin": [
-      "../../packaging/sidecars/mfq-runtime",
+      "../../packaging/sidecars/tyloi-engine",
       "../../packaging/sidecars/mfq-diagnostics"
     ],
     "resources": {

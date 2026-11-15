@@ -6,6 +6,7 @@
 #include "minicpmo45.h"
 #include "engine/program.h"
 #include "engine/models/source.h"
+#include "engine/models/source/model_config.h"
 #include "transport/include/transport.h"
 #include "engine/generation/mtp/limits.h"
 #include "nlohmann/json.hpp"
@@ -59,14 +60,13 @@ void print_help() {
     std::cout
         << "MFQ native CUDA runtime\n\n"
         << "Usage:\n"
-        << "  mfq-runtime --model MODEL --transport stdio|http [OPTIONS]\n"
-        << "  mfq-runtime --model MODEL --minicpmo-input-prefix PREFIX "
+        << "  tyloi-engine --model MODEL --transport stdio|http [OPTIONS]\n"
+        << "  tyloi-engine --model MODEL --minicpmo-input-prefix PREFIX "
            "--minicpmo-output-prefix PREFIX [OPTIONS]\n"
-        << "  mfq-runtime --model MODEL --minicpmo-duplex-input-prefix PREFIX "
+        << "  tyloi-engine --model MODEL --minicpmo-duplex-input-prefix PREFIX "
            "--minicpmo-duplex-output-prefix PREFIX [OPTIONS]\n\n"
         << "Runtime options:\n"
         << "  --model PATH                    model or split-model shard\n"
-        << "  --dflash2-draft PATH            DFlash2 checkpoint for compatible Qwen text\n"
         << "  --inspect-model-json            inspect metadata without loading GPU weights\n"
         << "  --config PATH                   external model config\n"
         << "  --transport TYPE                stdio or http\n"
@@ -248,11 +248,6 @@ int run_transport_runtime(RuntimeOptions& options) {
         read_runtime_asset_text(runtime_assets, tyloi::kModelConfigAsset),
         options.runtime_sampling_profile);
 
-    const auto* dflash2_environment=std::getenv("TYLOINFER_DFLASH2_DRAFT");
-    if (!options.dflash2_draft_path.empty() || (dflash2_environment && *dflash2_environment))
-        transport_config.runtime_profile.chat.mtp_max_draft_tokens =
-            tyloi::engine::mtp::kMaximumBlockwiseDraftDepth;
-
     auto transport = options.stdio_mode
         ? make_mfq_stdio_transport(transport_config)
         : make_mfq_http_transport(transport_config);
@@ -265,7 +260,7 @@ int execute_runtime(RuntimeCommandOptions options) {
         if (options.inspect_model_json) {
             const auto source = tyloi::open_model_source(options.model_path);
             nlohmann::json result{{"architecture", source->architecture()},
-                {"config", nlohmann::json::parse(source->model_config_json())},
+                {"config", nlohmann::json::parse(tyloi::models::config_json(*source, options.config_path))},
                 {"paths", nlohmann::json::array()}, {"tensors", nlohmann::json::object()}};
             for (const auto& path : source->source_paths()) {
                 const auto value = path.generic_u8string();

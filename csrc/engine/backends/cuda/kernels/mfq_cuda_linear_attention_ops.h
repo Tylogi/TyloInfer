@@ -59,7 +59,7 @@ std::vector<::tyloi::DenseTensor> gdn_decode_core_cuda(
     double convolution_eps, double norm_eps, bool silu_gate, bool output_half,
     bool transposed_state,
     ::tyloi::DenseTensor workspace={},bool inplace_state=false,
-    ::tyloi::DenseTensor state_addresses={});
+    ::tyloi::DenseTensor state_addresses={},bool tiled_heads=false,bool quantize_output=false);
 // Write speculative prefix snapshots with the producing core; no state-copy launches.
 // Batch one speculative sequence (2..8 rows, width128/taps4). The recurrence
 // stays in registers; prefix snapshots retain the existing rollback contract.
@@ -74,7 +74,8 @@ std::vector<::tyloi::DenseTensor> gdn_decode_window_cuda(
     int key_heads,int value_heads,int confirmed,double convolution_eps,double norm_eps,
     bool silu_gate,bool output_half,bool transposed_state,
     const std::vector<::tyloi::DenseTensor>& checkpoint_convolution,
-    const std::vector<::tyloi::DenseTensor>& checkpoint_recurrent);
+    const std::vector<::tyloi::DenseTensor>& checkpoint_recurrent,
+    bool tiled_heads=false,bool quantize_output=false,bool position_major=false);
 
 std::vector<::tyloi::DenseTensor> gdn_decode_core_checkpoint_cuda(
     ::tyloi::DenseTensor qkv, ::tyloi::DenseTensor output_gate,
@@ -87,4 +88,4 @@ std::vector<::tyloi::DenseTensor> gdn_decode_core_checkpoint_cuda(
     bool transposed_state,
     ::tyloi::DenseTensor workspace,bool inplace_state,
     ::tyloi::DenseTensor checkpoint_convolution,
-    ::tyloi::DenseTensor checkpoint_recurrent);
+    ::tyloi::DenseTensor checkpoint_recurrent,bool tiled_heads=false,bool quantize_output=false);

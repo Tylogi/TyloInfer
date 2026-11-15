@@ -67,7 +67,7 @@ void compare(const Tensor& actual, const Tensor& reference, double tolerance,
     require(actual.dim() == reference.dim(), "MTP gate tensor shape mismatch");
     for (std::int64_t i = 0; i < actual.dim(); ++i)
         require(actual.size(i) == reference.size(i), "MTP gate tensor shape mismatch");
-    const auto a = ::tyloi::ops::floats(actual), r = ::tyloi::ops::floats(reference);
+    const auto a = ::tyloi::ops::read_floats(actual), r = ::tyloi::ops::read_floats(reference);
     double squared = 0., norm = 0.;
     for (std::size_t i = 0; i < a.size(); ++i) {
         require(std::isfinite(a[i]) && std::isfinite(r[i]), "nonfinite MTP gate value");
@@ -113,7 +113,7 @@ int run_qwen35_mtp_check(Program& program) {
         for (int m = 1; m <= 6; ++m) for (auto activation : {InputGateMode::Sigmoid, InputGateMode::Silu}) {
             auto actual = w.keep(project.gated(weight, rows(w, x, 0, m).dense(), rows(w, g, 0, m).dense(), activation));
             require(actual.scalar_type() == dtype && actual.size(1) == m, "dense gate output dtype or shape mismatch");
-            auto values = ::tyloi::ops::floats(actual);
+            auto values = ::tyloi::ops::read_floats(actual);
             for (int i = 0; i < m * 33; ++i) {
                 const double activated = (activation == InputGateMode::Sigmoid ? 1. : gate[i]) / (1. + std::exp(-double(gate[i])));
                 const double reference = double(input[i]) * activated;

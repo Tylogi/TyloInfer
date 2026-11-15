@@ -212,7 +212,8 @@ class Vision {
                     ::tyloi::weights::fields::to_device(down, target);
                     output = merge(norm, up, down);
                 }
-                merged = loan.finish(std::move(output));
+                loan.finish(output);
+                merged = std::move(output);
             } else {
                 merged = merge(merger_norm_, merger_up_, merger_down_);
             }

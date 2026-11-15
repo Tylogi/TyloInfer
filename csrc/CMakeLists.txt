@@ -68,6 +68,12 @@ if(TYLOINFER_BUILD_METAL_RUNTIME AND NOT APPLE)
     message(FATAL_ERROR "TYLOINFER_BUILD_METAL_RUNTIME requires macOS")
 endif()
 
+# engine/ links CUDA::cudart and CUDA::cublas, so the toolkit targets must exist
+# before the shared Engine directory is processed.
+if(TYLOINFER_BUILD_CUDA_ENGINE)
+    find_package(CUDAToolkit REQUIRED)
+endif()
+
 # Common code is split by responsibility. JSON is defined first because the
 # canonical model graph and several public policy headers consume it.
 add_subdirectory(components/json)
@@ -88,6 +94,7 @@ if(TYLOINFER_BUILD_TRANSPORT)
 endif()
 
 add_subdirectory(engine)
+add_subdirectory(engine/models)
 
 if(TYLOINFER_BUILD_TRANSPORT)
     add_subdirectory(transport)
