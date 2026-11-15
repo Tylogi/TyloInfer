@@ -62,7 +62,7 @@ struct KvOffloadStore::Block {
 
 struct KvOffloadStore::Impl {
     tyloi::engine::Budget* budget = nullptr;
-    explicit Impl(KvOffloadConfig value, ::tyloi::Executor* owner) : config(std::move(value)), executor(owner) {
+    explicit Impl(state::KvOffloadConfig value, ::tyloi::Executor* owner) : config(std::move(value)), executor(owner) {
         if ((!config.device.is_cuda() || config.device.index < 0) &&
             (!config.device.is_metal() || config.device.index != 0))
             throw std::invalid_argument("KV offload requires CUDA or Metal 0");
@@ -79,7 +79,7 @@ struct KvOffloadStore::Impl {
 #if TYLOINFER_HAS_CUDA
         if(config.preallocate) {
             ResidentAllocationScope resident;
-            gpu_arena=::tyloi::cuda::empty({int64_t(hot_limit())},::tyloi::TensorOptions().device(::tyloi::kCUDA).dtype(::tyloi::kUInt8));
+            gpu_arena=::tyloi::cuda::empty({int64_t(hot_limit())},::tyloi::TensorOptions().device(config.device).dtype(::tyloi::kUInt8));
             gpu_slots=Slots(hot_limit());
             if(config.ram_preallocated && config.ram_budget_bytes) {
                 ram_arena.resize(config.ram_budget_bytes);
@@ -221,7 +221,7 @@ struct KvOffloadStore::Impl {
 #endif
     }
     struct Hot { std::weak_ptr<Block> block; std::list<std::uint64_t>::iterator order; };
-    KvOffloadConfig config;
+    state::KvOffloadConfig config;
     ::tyloi::Executor* executor = nullptr;
     std::shared_ptr<cache::QsaKvStore> ram;
 #if TYLOINFER_HAS_CUDA
@@ -241,7 +241,7 @@ struct KvOffloadStore::Impl {
     std::uint64_t next_id = 0, hits = 0, h2d_bytes = 0, d2h_bytes = 0, evictions = 0;
 };
 
-KvOffloadStore::KvOffloadStore(KvOffloadConfig config, ::tyloi::Executor* executor) : impl_(std::make_shared<Impl>(std::move(config), executor)) {}
+KvOffloadStore::KvOffloadStore(state::KvOffloadConfig config, ::tyloi::Executor* executor) : impl_(std::make_shared<Impl>(std::move(config), executor)) {}
 KvOffloadStore::~KvOffloadStore() = default;
 KvOffloadStore::GatherLayout KvOffloadStore::gather_layout(int64_t rows,int64_t width,::tyloi::ScalarType dtype,int64_t heads,int64_t key_width) {
     if(rows<=0 || width<=0 || heads<=0 || width%heads || key_width<0 || (key_width && key_width>=width/heads))
@@ -261,7 +261,7 @@ std::shared_ptr<KvOffloadStore::GatherWorkspace> KvOffloadStore::gather_workspac
         ResidentAllocationScope resident;
         auto fresh=std::make_shared<GatherWorkspace>();
         fresh->heads=heads;fresh->key_width=key_width;
-        const auto options=::tyloi::TensorOptions().device(::tyloi::kCUDA).dtype(dtype);
+        const auto options=::tyloi::TensorOptions().device(impl_->config.device).dtype(dtype);
         fresh->rows=std::make_shared<::tyloi::DenseTensor>(::tyloi::cuda::zeros({plan.rows,plan.width},options));
         fresh->upload=std::make_shared<::tyloi::DenseTensor>(::tyloi::cuda::empty({plan.rows,plan.width},options));
         fresh->host=std::make_shared<::tyloi::DenseTensor>(::tyloi::cuda::empty({plan.rows,plan.width},options.device(::tyloi::kCPU).pinned_memory(true)));
@@ -281,7 +281,7 @@ std::size_t KvOffloadStore::graph_workspace_bytes() const {
     for(const auto& [key,work]:impl_->gather_workspaces)bytes+=work->rows.nbytes()+work->upload.nbytes()+work->device_descriptors.nbytes();
     return bytes;
 }
-const KvOffloadConfig& KvOffloadStore::config() const { return impl_->config; }
+const state::KvOffloadConfig& KvOffloadStore::config() const { return impl_->config; }
 
 KvOffloadStore::BlockPtr KvOffloadStore::write(const ::tyloi::Tensor& input) {
     const bool metal = impl_->config.device.is_metal();

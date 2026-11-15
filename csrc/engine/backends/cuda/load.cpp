@@ -24,7 +24,7 @@
 #include "engine/backends/cuda/kernels/mfq_cuda_kv_quantization.h"
 #include "engine/weights/cache.h"
 #include "engine/weights/memory.h"
-#include "engine/state/kv_memory.h"
+#include "engine/backends/cuda/executor/kv_memory.h"
 #include "engine/backends/cuda/native/profile.h"
 #include "engine/backends/cuda/native/tensor/backend.h"
 

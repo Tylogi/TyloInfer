@@ -14,7 +14,7 @@
 #include "engine/backends/cuda/kernels/mfq_cuda_sampling_ops.h"
 #include "engine/backends/cuda/kernels/gr_prefill_blas.h"
 #include "engine/backends/cuda/ops/projection/mmq.h"
-#include "engine/state/kv_memory.h"
+#include "engine/backends/cuda/executor/kv_memory.h"
 #include "engine/state/kv_offload.h"
 #include "engine/weights/cache.h"
 #include "diagnostics/route_stats.h"
@@ -310,7 +310,7 @@ void Executor::init_kv() {
         configure_kv(std::make_shared<KvMemoryManager>(), {});
         return;
     }
-    KvOffloadConfig config;
+    state::KvOffloadConfig config;
     config.gpu_budget_bytes = options.gpu_budget_bytes;
     config.ram_budget_bytes = separate_memory(primary_) ? options.ram_budget_bytes : 0;
     config.buffer_bytes = std::min<std::size_t>(config.buffer_bytes, config.gpu_budget_bytes / 4);

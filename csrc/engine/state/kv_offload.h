@@ -11,7 +11,7 @@
 namespace tyloi { class Executor; }
 namespace tyloi::engine { class Budget; }
 namespace tyloi::weights { class Cache; }
-namespace tyloi::cuda {
+namespace tyloi::state {
 struct KvOffloadConfig {
     std::size_t gpu_budget_bytes = 0;
     std::size_t ram_budget_bytes = 0;
@@ -23,7 +23,9 @@ struct KvOffloadConfig {
     ::tyloi::Device device{::tyloi::DeviceType::cuda, 0};
     std::size_t gpu_hot_bytes() const { return gpu_budget_bytes-buffer_bytes; }
 };
+} // namespace tyloi::state
 
+namespace tyloi::cuda {
 // Immutable microblocks have one native GPU hot copy. Eviction transfers to
 // the shared RAM LRU; only RAM eviction writes the session-owned SSD file.
 class KvOffloadStore {
@@ -43,11 +45,11 @@ public:
     std::shared_ptr<GatherWorkspace> gather_workspace(int64_t rows,int64_t width,::tyloi::ScalarType dtype,int64_t heads=1,int64_t key_width=0);
     std::size_t graph_workspace_bytes() const;
     // Metal borrows this executor; it outlives the store and is active during device operations.
-    explicit KvOffloadStore(KvOffloadConfig config, ::tyloi::Executor* executor = nullptr);
+    explicit KvOffloadStore(state::KvOffloadConfig config, ::tyloi::Executor* executor = nullptr);
     ~KvOffloadStore();
     BlockPtr write(const ::tyloi::Tensor& rows);
     ::tyloi::Tensor read(const BlockPtr& block);
-    const KvOffloadConfig& config() const;
+    const state::KvOffloadConfig& config() const;
     std::vector<std::pair<std::string, double>> metrics() const;
     void flush();
     void bind_budget(tyloi::engine::Budget* budget);

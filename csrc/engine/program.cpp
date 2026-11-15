@@ -28,7 +28,7 @@
 #include "engine/models/source.h"
 #include "engine/models/source/model_config.h"
 #include "engine/models/source/model_graph.h"
-#include "engine/state/kv_memory.h"
+#include "engine/backends/cuda/executor/kv_memory.h"
 #include "engine/state/session/sessions.h"
 #include "engine/weights/cache.h"
 #include "engine/weights/memory.h"

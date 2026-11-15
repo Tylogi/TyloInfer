@@ -22,6 +22,7 @@ add_library(mfq-engine STATIC
     engine.cpp
     executor.cpp
     budget.cpp
+    kv_budget.cpp
     generation/batch_driver.cpp
     generation/batch_ops.cpp
     generation/decode.cpp

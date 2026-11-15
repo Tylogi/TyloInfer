@@ -10,7 +10,42 @@ std::size_t checked_multiply(std::size_t a, std::size_t b) {
     return a * b;
 }
 
+std::size_t positive_size(std::int64_t value) {
+    if (value <= 0) throw std::invalid_argument("invalid QSA KV dimensions");
+    if (static_cast<std::uint64_t>(value) > std::numeric_limits<std::size_t>::max())
+        throw std::overflow_error("KV tensor size overflow");
+    return static_cast<std::size_t>(value);
+}
+
 } // namespace
+
+std::size_t QsaLayout::row_bytes() const {
+    const auto head_count = positive_size(heads);
+    const auto keys = positive_size(key_width);
+    const auto values = positive_size(value_width);
+    if (dtype != kFloat16 && dtype != kBFloat16 && dtype != kInt32)
+        throw std::invalid_argument("invalid QSA KV dtype");
+    if (keys > std::numeric_limits<std::size_t>::max() - values)
+        throw std::overflow_error("KV tensor size overflow");
+    return checked_multiply(checked_multiply(head_count, keys + values), scalar_size(dtype));
+}
+
+std::size_t QsaLayout::raw_bytes() const {
+    return checked_multiply(positive_size(maximum), row_bytes());
+}
+
+std::int64_t QsaLayout::pooled_rows() const {
+    if (maximum <= 0 || pool <= 0) throw std::invalid_argument("invalid QSA KV dimensions");
+    return maximum / pool + (maximum % pool != 0);
+}
+
+std::size_t QsaLayout::index_bytes() const {
+    const auto rows = positive_size(maximum);
+    const auto pooled = positive_size(pooled_rows());
+    if (rows > std::numeric_limits<std::size_t>::max() - pooled)
+        throw std::overflow_error("KV tensor size overflow");
+    return checked_multiply(checked_multiply(rows + pooled, positive_size(index_width)), 2);
+}
 
 std::int64_t kv_capacity(std::int64_t current, std::int64_t required, std::int64_t maximum) {
     if (maximum <= 0 || current < 0 || current > maximum || required < 0 || required > maximum)

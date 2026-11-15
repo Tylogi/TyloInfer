@@ -2,6 +2,7 @@
 
 #include "engine/requests/policy.h"
 #include "engine/executor.h"
+#include "engine/kv_budget.h"
 #include "engine/weights/cache.h"
 
 #include <cstddef>
@@ -17,6 +18,8 @@ struct SessionResult;
 
 class Budget {
 public:
+    static KvPlacement place_kv(const KvOptions& options, const KvDemand& demand,
+                                std::size_t available, ::tyloi::weights::Cache& cache);
     Budget(::tyloi::Executor& executor,
         ::tyloi::weights::Memory& weight_memory, ::tyloi::weights::Cache& weights,
         state::Sessions& cache, Device primary);

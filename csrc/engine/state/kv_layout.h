@@ -32,6 +32,17 @@ inline bool kv_bits_valid(double bits) noexcept {
     return bits == 0 || bits == 2 || bits == 2.5 || bits == 3 || bits == 3.5 || bits == 4 || bits == 6 || bits == 8;
 }
 
+// QSA index rows are stored as FP16 independently of raw KV dtype.
+struct QsaLayout {
+    std::int64_t maximum = 0, heads = 0, key_width = 0, value_width = 0, index_width = 0, pool = 0;
+    ScalarType dtype = kFloat16;
+
+    std::size_t row_bytes() const;
+    std::size_t raw_bytes() const;
+    std::size_t index_bytes() const;
+    std::int64_t pooled_rows() const;
+};
+
 struct KvLayout {
     std::int64_t key_width, value_width;
     ScalarType storage_dtype;
