@@ -1,4 +1,3 @@
-#include "engine/models/plan.h"
 #include "engine/models/session/snapshot.h"
 #include "engine/backends/cuda/native/env.h"
 #include "engine/backends/cuda/executor/executor.h"

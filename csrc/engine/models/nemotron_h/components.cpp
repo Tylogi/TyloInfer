@@ -1,4 +1,3 @@
-#include "engine/models/plan.h"
 #include "engine/models/nemotron_h/components.h"
 
 #include "engine/models/source/model_config.h"
@@ -23,20 +22,19 @@ tyloi::models::Info Model::info() const {
 
 MfqModelCapabilities Model::capabilities() const {
     const bool vision = parts && parts->radio_vision.has_value();
-    const auto state = ::tyloi::models::component_state(graph, plan, vision, predictor() != nullptr);
-    const auto caps = ::tyloi::models::runtime_capabilities(graph, plan, state, vision, false);
-    return {graph.architecture, caps.text, caps.image_input, caps.video_input,
-        caps.audio_input, caps.audio_output, caps.full_duplex, caps.mtp, "model-graph+cuda-adapters"};
+    return {graph.architecture, graph.has_component("text"), vision, false,
+        false, false, false, predictor() != nullptr, "model"};
 }
 
 tyloi::engine::Metrics Model::metrics() const {
     const bool vision = parts && parts->radio_vision.has_value();
-    const auto state = ::tyloi::models::component_state(graph, plan, vision, predictor() != nullptr);
+    const bool vision_declared = graph.has_component("vision");
+    const bool mtp_declared = graph.has_component("predictor");
     return {{"kv_memory_supported", 0.0}, {"kv_quantization_supported", 0.0},
-        {"kv_quantization_bits", 0.0}, {"vision_declared", double(state.vision_declared)},
-        {"vision_supported", double(state.vision_supported)}, {"vision_available", double(state.vision_available)},
-        {"mtp_declared", double(state.mtp_declared)}, {"mtp_supported", double(state.mtp_supported)},
-        {"mtp_available", double(state.mtp_available)}};
+        {"kv_quantization_bits", 0.0}, {"vision_declared", double(vision_declared)},
+        {"vision_supported", double(vision_declared)}, {"vision_available", double(vision)},
+        {"mtp_declared", double(mtp_declared)}, {"mtp_supported", double(mtp_declared)},
+        {"mtp_available", double(predictor() != nullptr)}};
 }
 
 tyloi::models::Mtp* Model::predictor() const noexcept { return parts ? parts->mtp.get() : nullptr; }
@@ -63,22 +61,13 @@ Components load_components(Model& model, const tyloi::weights::Loader& weights,
         ) {
     Components result;
     if (!load_optional_components) return result;
-    if ((model.plan.vision != ::tyloi::models::VisionAdapter::none &&
-         model.plan.vision != ::tyloi::models::VisionAdapter::radio) ||
-            (model.plan.predictor != ::tyloi::models::PredictorAdapter::none &&
-             model.plan.predictor != ::tyloi::models::PredictorAdapter::nemotron_h)) {
-        throw std::runtime_error("unsupported Nemotron-H CUDA component adapter");
-    }
-    if (model.plan.vision == ::tyloi::models::VisionAdapter::radio) {
-        const auto* component = model.graph.component("vision");
-        TYLOINFER_RUNTIME_CHECK(component != nullptr,
-            "Nemotron-H graph declares a RADIO adapter without a vision component");
+    if (const auto* component = model.graph.component("vision")) {
         const auto vision = tyloi::models::nemotron_h::RadioVisionConfig::from_json(
             tyloi::models::config_json(*model.source));
         result.radio_vision.emplace(CudaRadioPromptComponent::load(
             weights, vision, component->input_contract, component->position_policy));
     }
-    if (model.plan.predictor == ::tyloi::models::PredictorAdapter::none) return result;
+    if (!model.graph.has_component("predictor")) return result;
     TYLOINFER_RUNTIME_CHECK(supports_speculation(model), "invalid Nemotron-H predictor model");
     auto predictor = Mtp::load_if_present(
         weights, model.config, model.embed);

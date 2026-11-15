@@ -1,6 +1,6 @@
 #pragma once
 
-#include "engine/models/plan.h"
+#include "engine/models/source/model_graph.h"
 #include "engine/ops.h"
 #include "engine/models/causal_model.h"
 #include "engine/models/metadata.h"
@@ -70,7 +70,6 @@ struct Model : tyloi::models::CausalModel {
     bool host_tokens = false;
     std::shared_ptr<const tyloi::ModelSource> source;
     tyloi::ModelGraph graph;
-    ::tyloi::models::Plan plan;
     ::tyloi::Tensor embed;
     ::tyloi::Tensor lm_head;
     CausalConfig config;

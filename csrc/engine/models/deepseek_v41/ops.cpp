@@ -1,4 +1,3 @@
-#include "engine/models/plan.h"
 #include "engine/models/session/snapshot.h"
 #include "engine/models/common/load.h"
 #include "engine/weights/loader.h"
@@ -198,24 +197,23 @@ tyloi::models::Info Model::info() const {
 }
 
 MfqModelCapabilities Model::capabilities() const {
-    const auto state = ::tyloi::models::component_state(graph, plan, bool(vision), bool(predictor()));
-    const auto caps = ::tyloi::models::runtime_capabilities(graph, plan, state, bool(vision), false);
-    return {graph.architecture, caps.text, caps.image_input, caps.video_input,
-        caps.audio_input, caps.audio_output, caps.full_duplex, caps.mtp,
-        "model-graph+cuda-adapters"};
+    return {graph.architecture, graph.has_component("text"), bool(vision), false,
+        false, false, false, bool(predictor()),
+        "model"};
 }
 
 tyloi::engine::Metrics Model::metrics() const {
-    const auto state = ::tyloi::models::component_state(graph, plan, bool(vision), bool(predictor()));
+    const bool vision_declared = graph.has_component("vision");
+    const bool mtp_declared = graph.has_component("predictor");
     return {{"kv_memory_supported", 0.0},
         {"kv_quantization_supported", 0.0},
         {"kv_quantization_bits", 0.0},
-        {"vision_declared", double(state.vision_declared)},
-        {"vision_supported", double(state.vision_supported)},
-        {"vision_available", double(state.vision_available)},
-        {"mtp_declared", double(state.mtp_declared)},
-        {"mtp_supported", double(state.mtp_supported)},
-        {"mtp_available", double(state.mtp_available)}};
+        {"vision_declared", double(vision_declared)},
+        {"vision_supported", double(vision_declared)},
+        {"vision_available", double(bool(vision))},
+        {"mtp_declared", double(mtp_declared)},
+        {"mtp_supported", double(mtp_declared)},
+        {"mtp_available", double(bool(predictor()))}};
 }
 
 std::unique_ptr<tyloi::models::State> Model::make_state() const {

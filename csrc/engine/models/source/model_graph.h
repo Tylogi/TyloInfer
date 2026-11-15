@@ -33,8 +33,8 @@ struct ModelGraphTopology {
 };
 
 // A component describes one composable part of the inference graph. The
-// implementation and policies are stable semantic IDs resolved by each
-// backend's component registry; they are not source-model class names.
+// implementation and policies are stable semantic IDs validated by the
+// family's loader; they are not source-model class names.
 struct ModelGraphComponent {
     std::string kind;
     std::string tensor_root;

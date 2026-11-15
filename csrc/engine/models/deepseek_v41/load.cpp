@@ -1,4 +1,3 @@
-#include "engine/models/plan.h"
 #include "engine/models/deepseek_v41/ops.h"
 #include "engine/models/deepseek_v41/load.h"
 #include "engine/models/deepseek_v41/vision.h"
@@ -28,9 +27,19 @@ void read(Model& model, std::shared_ptr<const tyloi::ModelSource> model_source,
     const auto& source = *model.source;
     ::tyloi::models::validate_model_source(source);
     model.graph = tyloi::models::graph(source);
-    model.plan = ::tyloi::models::model_plan(model.graph);
     require_model(Model::accepts_backbone(model.graph.backbone),
                   "model backbone does not match the requested causal model");
+    if (const auto* vision = model.graph.component("vision")) {
+        require_model(vision->tensor_root == "vision" && vision->implementation == "deepseek_v41_vision" &&
+                      vision->input_contract == "deepseek_v41_vision.v1" &&
+                      vision->position_policy == "deepseek_v41_positions",
+                      "unsupported DeepSeek-V4.1 vision component declaration");
+    }
+    if (const auto* predictor = model.graph.component("predictor")) {
+        require_model(predictor->tensor_root == "predictor" && predictor->implementation == "deepseek_v41_dspark" &&
+                      predictor->input_contract.empty() && predictor->position_policy.empty(),
+                      "unsupported DeepSeek-V4.1 predictor component declaration");
+    }
     model.load_config(definition);
     require_model(model.num_hidden_layers() == model.graph.topology.text_layers,
                   "model graph/config text-layer topology mismatch");

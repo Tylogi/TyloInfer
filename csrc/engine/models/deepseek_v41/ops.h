@@ -6,7 +6,7 @@
 #include "engine/state/media.h"
 #include "engine/models/deepseek_v41/causal_lm.h"
 
-#include "engine/models/plan.h"
+#include "engine/models/source/model_graph.h"
 #include "engine/models/causal_model.h"
 #include "engine/models/common/mtp.h"
 #include "engine/models/input.h"
@@ -984,7 +984,6 @@ struct Model : tyloi::models::CausalModel {
     bool needs_host_tokens = false;
     std::shared_ptr<const tyloi::ModelSource> source;
     tyloi::ModelGraph graph;
-    ::tyloi::models::Plan plan;
     ::tyloi::Tensor embed;
     ::tyloi::Tensor output_norm;
     ::tyloi::Tensor lm_head;

@@ -1,4 +1,3 @@
-#include "engine/models/plan.h"
 #include "engine/models/load.h"
 #include "engine/backends/cuda/executor/executor.h"
 #include "engine/backends/cuda/native/collectives.h"
@@ -229,7 +228,6 @@ Model read(std::shared_ptr<const tyloi::ModelSource> source, std::string_view de
     Model model;
     model.source = std::move(source);
     model.graph = tyloi::models::graph(*model.source);
-    model.plan = ::tyloi::models::model_plan(model.graph);
     tyloi::models::require_model(model.graph.backbone == "deepseek_v4",
                                "model backbone does not match the requested causal model");
     auto& c = model.config;
@@ -280,9 +278,10 @@ void load(std::unique_ptr<tyloi::models::CausalModel>& owner,
     auto& executor = tyloi::cuda::Executor::current();
     load(model, weights, placement, executor.collectives(), placement.primary_device(),
          options.cpu_offload_layers, host_bytes, options.gpu_layers);
-    if (options.optional_components && (model.plan.vision != tyloi::models::VisionAdapter::none ||
-        model.plan.predictor != tyloi::models::PredictorAdapter::none))
-        throw std::runtime_error("CUDA component adapter is unsupported for this model");
+    if (options.optional_components)
+        for (const auto& component : model.graph.components)
+            if (component.kind != "text")
+                throw std::runtime_error("DeepSeek V4 component is unsupported: " + component.kind);
 }
 
 void load_deferred(Model& model, const tyloi::weights::Loader& weights,

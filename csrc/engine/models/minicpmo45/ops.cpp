@@ -1,4 +1,3 @@
-#include "engine/models/plan.h"
 #include "engine/models/minicpmo45/text/load.h"
 #include "engine/models/minicpmo45/text/state.h"
 #include "engine/models/minicpmo45/vision.h"
@@ -25,9 +24,27 @@ Model read(std::shared_ptr<const tyloi::ModelSource> source, std::string_view de
     Model model;
     model.source = std::move(source);
     model.graph = tyloi::models::graph(*model.source);
-    model.plan = ::tyloi::models::model_plan(model.graph);
     tyloi::models::require_model(model.graph.backbone == "minicpmo45",
         "model backbone does not match the requested causal model");
+    const auto* vision = model.graph.component("vision");
+    const auto* audio = model.graph.component("audio_input");
+    const auto* tts = model.graph.component("audio_output");
+    if (vision || audio || tts) {
+        if (!vision || !audio || !tts ||
+                vision->implementation != "minicpmo45_vision" || vision->tensor_root != "vision" ||
+                vision->input_contract != "minicpmo45.v1" ||
+                vision->position_policy != "minicpmo45_positions" ||
+                audio->implementation != "minicpmo45_audio" || audio->tensor_root != "audio" ||
+                tts->implementation != "minicpmo45_tts" || tts->tensor_root != "tts")
+            throw std::runtime_error("MiniCPM-o requires its vision, audio and TTS components together");
+    }
+    if (const auto* duplex = model.graph.component("duplex")) {
+        if (!vision || !audio || !tts || duplex->implementation != "minicpmo45_duplex" ||
+                duplex->tensor_root != "runtime")
+            throw std::runtime_error("MiniCPM-o duplex requires its media components");
+    }
+    if (model.graph.has_component("predictor"))
+        throw std::runtime_error("MiniCPM-o does not support a predictor component");
     auto& config = model.config;
     config = Config::from_json(definition);
     if (config.model_type.empty()) config.model_type = model.graph.architecture;
@@ -93,8 +110,6 @@ void load(Model& model, const tyloi::weights::Loader& weights, LayerPlacementCon
         static_cast<int>(std::max<int64_t>(config.num_hidden_layers - gpu_layers, 0));
     if (cpu_layers > 0 && (weights.placement.tensor.enabled() || placement.enabled()))
         throw std::runtime_error("--n-gpu-layers cannot be combined with tensor/expert/layer parallelism");
-    if (model.plan.vision == ::tyloi::models::VisionAdapter::grid_vit && cpu_layers > 0)
-        throw std::runtime_error("CUDA grid-Vision currently requires GPU-resident text layers");
     MfqCudaGuard guard(placement.primary_device());
     const auto make_rope = [&](::tyloi::Device device) {
         RopeCache rope(config.max_position_embeddings, config.rotary_dim, config.rope_base,
@@ -148,7 +163,7 @@ void load(std::unique_ptr<tyloi::models::CausalModel>& owner,
     auto* model = static_cast<Model*>(owner.get());
     load(*model, weights, placement, options.gpu_layers, options.expert_parallel, true, true, options.yarn);
     model->primary = placement.primary_device();
-    if (options.optional_components && model->plan.vision == tyloi::models::VisionAdapter::minicpmo45) {
+    if (options.optional_components && model->graph.has_component("vision")) {
         load_media(*model, weights);
     }
 }
@@ -159,16 +174,14 @@ tyloi::models::Info Model::info() const {
     return result;
 }
 MfqModelCapabilities Model::capabilities() const {
-    const auto parts = tyloi::models::component_state(graph, plan, bool(vision && resampler), false);
-    const auto caps = tyloi::models::runtime_capabilities(graph, plan, parts,
-        bool(vision && resampler && audio), bool(vision && resampler && audio && tts));
-    return {graph.architecture, caps.text, caps.image_input, caps.video_input,
-            caps.audio_input, caps.audio_output, caps.full_duplex, caps.mtp, "model-graph+cuda-adapters"};
+    const bool media = vision && resampler && audio;
+    return {graph.architecture, graph.has_component("text"), media, media,
+            media, media && tts, media && tts && graph.has_component("duplex"), false, "model"};
 }
 tyloi::engine::Metrics Model::metrics() const {
     return {{"kv_memory_supported", 0.0}, {"kv_quantization_supported", 0.0},
             {"kv_quantization_bits", 0.0}, {"vision_declared", double(graph.has_component("vision"))},
-            {"vision_supported", double(graph.has_component("vision"))}, {"vision_available", double(bool(vision))},
+            {"vision_supported", double(graph.has_component("vision"))}, {"vision_available", double(bool(vision && resampler))},
             {"mtp_declared", double(graph.has_component("predictor"))},
             {"mtp_supported", 0.0}, {"mtp_available", 0.0}};
 }

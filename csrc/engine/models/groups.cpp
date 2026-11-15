@@ -1,7 +1,6 @@
 #include "engine/models/groups.h"
 #include "engine/models/load.h"
 #include "engine/models/source/model_graph.h"
-#include "engine/models/plan.h"
 #include "engine/models/deepseek_v4/groups.h"
 
 #include <stdexcept>

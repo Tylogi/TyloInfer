@@ -1,6 +1,6 @@
 #pragma once
 
-#include "engine/models/plan.h"
+#include "engine/models/source/model_graph.h"
 #include "engine/backends/cuda/ops/ffn/ffn.h"
 #include "engine/backends/cuda/ops/projection/quant_linear.h"
 #include "engine/ops.h"
@@ -76,7 +76,6 @@ struct Model
         const tyloi::models::ForwardOptions& options = {}) const override;
     std::shared_ptr<const tyloi::ModelSource> source;
     tyloi::ModelGraph graph;
-    ::tyloi::models::Plan plan;
     Config config;
     tyloi::models::CausalLmMetadata metadata;
     ::tyloi::Tensor embed, lm_head;

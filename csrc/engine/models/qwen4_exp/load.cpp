@@ -1,4 +1,3 @@
-#include "engine/models/plan.h"
 #include "engine/models/qwen4_exp/ops.h"
 #include "engine/models/qwen4_exp/load.h"
 #include "engine/models/qwen4_exp/components.h"
@@ -180,9 +179,20 @@ void read(Model& model, std::shared_ptr<const tyloi::ModelSource> model_source,
     const auto& source = *model.source;
     ::tyloi::models::validate_model_source(source);
     model.graph = tyloi::models::graph(source);
-    model.plan = ::tyloi::models::model_plan(model.graph);
     require_model(Model::accepts_backbone(model.graph.backbone),
                   "model backbone does not match the requested causal model");
+    for (const auto& component : model.graph.components)
+        if (component.kind != "text" && component.kind != "vision" && component.kind != "predictor")
+            throw std::runtime_error("unsupported Qwen4 component: " + component.kind);
+    if (const auto* vision = model.graph.component("vision"); vision &&
+        (vision->tensor_root != "vision" || vision->implementation != "grid_vit" ||
+         vision->input_contract != kGridVisionInputContract ||
+         vision->position_policy != kGridMropePositionPolicy))
+        throw std::runtime_error("Qwen4 vision requires grid_vit/grid_vision.v1/grid_mrope");
+    if (const auto* predictor = model.graph.component("predictor"); predictor &&
+        (predictor->tensor_root != "predictor" || predictor->implementation != "next_token_prediction" ||
+         !predictor->input_contract.empty() || !predictor->position_policy.empty()))
+        throw std::runtime_error("unsupported Qwen4 predictor declaration");
     model.load_config(definition);
     require_model(model.num_hidden_layers() == model.graph.topology.text_layers,
                   "model graph/config text-layer topology mismatch");
@@ -213,7 +223,7 @@ void load(Model& model, const tyloi::weights::Loader& tensors, LayerPlacementCon
                   << std::endl;
     }
     tyloi::ops::DeviceScope model_guard(tensors.placement.target);
-    if (model.plan.vision == ::tyloi::models::VisionAdapter::grid_vit && dense_cpu_layer_count > 0)
+    if (model.graph.has_component("vision") && dense_cpu_layer_count > 0)
         throw std::runtime_error("CUDA grid-Vision currently requires GPU-resident text layers");
     model.device = tensors.placement.target;
     constexpr auto embedding = "model.token_embedding.weight";

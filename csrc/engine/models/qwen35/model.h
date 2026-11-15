@@ -55,7 +55,6 @@ struct Model : tyloi::models::CausalModel {
     std::vector<Layer> layers;
     std::optional<tyloi::models::grid::Vision> vision;
     std::unique_ptr<qwen35::Mtp> mtp;
-    bool mtp_supported = false;
     bool recurrent_transposed = false;
     tyloi::state::KvQuantization kv_quantization;
     tyloi::models::Info info() const override;

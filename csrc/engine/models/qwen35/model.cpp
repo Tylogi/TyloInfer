@@ -36,7 +36,7 @@ tyloi::engine::Metrics Model::metrics() const {
             {"vision_supported", double(graph.has_component("vision"))},
             {"vision_available", double(vision.has_value())},
             {"mtp_declared", double(graph.has_component("predictor"))},
-            {"mtp_supported", double(mtp_supported)}, {"mtp_available", double(bool(mtp))}};
+            {"mtp_supported", double(graph.has_component("predictor"))}, {"mtp_available", double(bool(mtp))}};
 }
 
 std::unique_ptr<tyloi::models::State> Model::make_state() const {

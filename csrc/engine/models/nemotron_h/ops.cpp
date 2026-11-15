@@ -1,4 +1,3 @@
-#include "engine/models/plan.h"
 #include "engine/models/common/check.h"
 #include "engine/models/common/mtp.h"
 #include "engine/backends/cuda/native/collectives.h"
@@ -502,12 +501,16 @@ template <class MambaWeights> void convert_mamba_weights(MambaWeights& block) {
 }
 
 void validate_components(const tyloi::ModelGraph& graph) {
-    if (graph.component("vision") != nullptr &&
-        ::tyloi::models::model_plan(graph).vision != ::tyloi::models::VisionAdapter::radio)
+    for (const auto& component : graph.components)
+        if (component.kind != "text" && component.kind != "vision" && component.kind != "predictor")
+            throw std::runtime_error("Nemotron-H CUDA does not support component: " + component.kind);
+    if (const auto* vision = graph.component("vision"); vision &&
+        (vision->tensor_root != "vision" || vision->implementation != "radio" ||
+         vision->input_contract != tyloi::kRadioCpeInputContract || !vision->position_policy.empty()))
         throw std::runtime_error(
             "Nemotron-H CUDA vision requires the radio/radio_cpe.v1 vision component");
-    if (graph.component("predictor") != nullptr &&
-        ::tyloi::models::model_plan(graph).predictor != ::tyloi::models::PredictorAdapter::nemotron_h)
+    if (const auto* predictor = graph.component("predictor"); predictor &&
+        (predictor->tensor_root != "predictor" || predictor->implementation != "nemotron_h_mtp"))
         throw std::runtime_error(
             "Nemotron-H CUDA multi-token prediction requires the nemotron_h_mtp predictor "
             "implementation under the predictor tensor root");
@@ -553,7 +556,6 @@ Model read(std::shared_ptr<const tyloi::ModelSource> source, std::string_view de
     Model model;
     model.source = std::move(source);
     model.graph = tyloi::models::graph(*model.source);
-    model.plan = ::tyloi::models::model_plan(model.graph);
     tyloi::models::require_model(model.graph.backbone == "nemotron_h",
                                "model backbone does not match the requested causal model");
     tyloi::models::nemotron_h::load_config(definition, model.graph, model.config, model.metadata);

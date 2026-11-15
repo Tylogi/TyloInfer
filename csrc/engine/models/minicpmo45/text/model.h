@@ -5,7 +5,7 @@
 #include "engine/backends/cuda/ops/rope/rope.h"
 #include "engine/models/metadata.h"
 #include "engine/models/causal_model.h"
-#include "engine/models/plan.h"
+#include "engine/models/source/model_graph.h"
 #include "engine/models/source.h"
 
 #include <memory>
@@ -37,7 +37,6 @@ struct Model
                    const tyloi::models::ForwardOptions& = {}) const override;
     std::shared_ptr<const tyloi::ModelSource> source;
     tyloi::ModelGraph graph;
-    ::tyloi::models::Plan plan;
     Config config;
     tyloi::models::CausalLmMetadata metadata;
     int primary = 0;

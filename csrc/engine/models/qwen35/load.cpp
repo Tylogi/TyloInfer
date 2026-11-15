@@ -8,7 +8,6 @@
 
 #include "engine/models/common/load.h"
 #include "engine/models/common/check.h"
-#include "engine/models/plan.h"
 #include "engine/models/load.h"
 #include "engine/models/source/model_graph.h"
 #include "engine/weights/loader.h"
@@ -190,12 +189,23 @@ Model read(std::shared_ptr<const tyloi::ModelSource> source,
     model.source = std::move(source);
     const auto& source_ref = *model.source;
     model.graph = tyloi::models::graph(source_ref);
-    const auto plan = ::tyloi::models::model_plan(model.graph);
-    if (model.graph.component("vision") != nullptr &&
-        plan.vision != ::tyloi::models::VisionAdapter::grid_vit)
+    for (const auto& component : model.graph.components)
+        if (component.kind != "text" && component.kind != "vision" && component.kind != "predictor")
+            throw std::runtime_error("unsupported Qwen component: " + component.kind);
+    if (const auto* vision = model.graph.component("vision"); vision &&
+        (vision->tensor_root != "vision" || vision->implementation != "grid_vit" ||
+         vision->input_contract != kGridVisionInputContract ||
+         vision->position_policy != kGridMropePositionPolicy))
         throw std::runtime_error("Qwen vision requires grid_vit/grid_vision.v1/grid_mrope");
+    if (const auto* predictor = model.graph.component("predictor"); predictor &&
+        (predictor->tensor_root != "predictor" || predictor->implementation != "next_token_prediction" ||
+         !predictor->input_contract.empty() || !predictor->position_policy.empty()))
+        throw std::runtime_error("unsupported Qwen predictor declaration");
     if (model.graph.backbone != "qwen3_5" && model.graph.backbone != "generic_qwen")
         throw std::runtime_error("Qwen3.5 loading requires a Qwen-compatible model graph");
+    if (model.graph.backbone != "qwen3_5" &&
+            (model.graph.has_component("vision") || model.graph.has_component("predictor")))
+        throw std::runtime_error("generic Qwen does not support vision or predictor components");
     model.config = Config::from_json(definition, model.graph);
     model.config.legacy_tensor_layout = source_ref.tensor_layout();
     if (context > 0) {
@@ -250,7 +260,7 @@ void load(Model& model, const ::tyloi::weights::Loader& weights,
                   << " gpu=" << placed_cpu_layers << '-' << model.config.num_hidden_layers - 1
                   << std::endl;
     }
-    if (::tyloi::models::model_plan(model.graph).vision == ::tyloi::models::VisionAdapter::grid_vit && placed_cpu_layers > 0)
+    if (model.graph.has_component("vision") && placed_cpu_layers > 0)
         throw std::runtime_error("CUDA grid-Vision currently requires GPU-resident text layers");
 
     cpu_layers = placed_cpu_layers;
@@ -305,33 +315,26 @@ void load(Model& model, const ::tyloi::weights::Loader& weights,
 }
 
 void load_vision(Model& model, const ::tyloi::weights::Loader& weights, bool resident) {
-    const auto plan = ::tyloi::models::model_plan(model.graph);
-    if (plan.vision == ::tyloi::models::VisionAdapter::grid_vit) {
-        const auto* component = model.graph.component("vision");
+    if (const auto* component = model.graph.component("vision")) {
         const auto& config = model.config;
-        if (component == nullptr || !config.grid_vision ||
-            !config.image_token_id || !config.video_token_id)
+        if (!config.grid_vision || !config.image_token_id || !config.video_token_id)
             throw std::runtime_error("grid-Vision configuration is incomplete");
         model.vision.emplace(tyloi::models::grid::Vision::load(
             weights, weights.cache(), *config.grid_vision,
             *config.image_token_id, *config.video_token_id,
             component->input_contract, component->position_policy, resident));
-    } else if (plan.vision != ::tyloi::models::VisionAdapter::none) {
-        throw std::runtime_error("vision adapter is unsupported for Qwen");
     }
 }
 
 void load_components(Model& model, const ::tyloi::weights::Loader& weights,
         const LayerPlacementConfig& placement, int cpu_layers, bool cpu_offload,
         bool resident, bool preallocate) {
-    const auto plan = ::tyloi::models::model_plan(model.graph);
-    model.mtp_supported = plan.predictor == ::tyloi::models::PredictorAdapter::qwen35;
     const bool mtp_allowed =
         !placement.enabled() && cpu_layers == 0 && !cpu_offload &&
         weights.cache().transfer() == ::tyloi::weights::Cache::Transfer::automatic;
 
     load_vision(model, weights, resident);
-    if (plan.predictor == ::tyloi::models::PredictorAdapter::qwen35) {
+    if (model.graph.has_component("predictor")) {
         if (mtp_allowed && model.metadata.num_experts == 0 && model.supports_speculation()) {
             LayerLoader loader{{weights}};
             auto predictor = load_predictor(loader, model, model.kv_quantization);
@@ -340,8 +343,6 @@ void load_components(Model& model, const ::tyloi::weights::Loader& weights,
             std::cerr
                 << "qwen_mtp unavailable: requires dense device-resident Qwen blocks\n";
         }
-    } else if (plan.predictor != ::tyloi::models::PredictorAdapter::none) {
-        throw std::runtime_error("predictor adapter is unsupported for Qwen");
     }
 }
 

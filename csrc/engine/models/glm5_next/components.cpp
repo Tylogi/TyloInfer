@@ -15,15 +15,7 @@ void load_components(
         const tyloi::weights::Loader& weights,
         bool load_optional_components) {
     if (!load_optional_components) return;
-    if (model.plan.vision != ::tyloi::models::VisionAdapter::none ||
-            (model.plan.predictor != ::tyloi::models::PredictorAdapter::none &&
-             model.plan.predictor !=
-                 ::tyloi::models::PredictorAdapter::flash_next)) {
-        throw std::runtime_error(
-            "unsupported GLM5 CUDA component adapter");
-    }
-    if (model.plan.predictor ==
-            ::tyloi::models::PredictorAdapter::none) return;
+    if (!model.graph.has_component("predictor")) return;
     TYLOINFER_RUNTIME_CHECK(
         tyloi::cuda::glm5_next::supports_speculation(model),
         "invalid Flash-Next predictor model");

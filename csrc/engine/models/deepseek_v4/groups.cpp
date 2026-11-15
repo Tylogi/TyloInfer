@@ -162,9 +162,10 @@ std::unique_ptr<tyloi::models::Groups> load_groups(
     if (!source || &weights.source != source.get())
         throw std::invalid_argument("DeepSeek V4 source and weight loader must match");
     auto model = read(std::move(source), definition, options.context);
-    if (model.plan.vision != ::tyloi::models::VisionAdapter::none ||
-        model.plan.predictor != ::tyloi::models::PredictorAdapter::none)
-        throw std::runtime_error("CUDA component adapter is unsupported for this model");
+    if (options.optional_components)
+        for (const auto& component : model.graph.components)
+            if (component.kind != "text")
+                throw std::runtime_error("DeepSeek V4 component is unsupported: " + component.kind);
     return std::make_unique<DeepseekGroups>(std::move(model), weights, placement, options);
 }
 

@@ -1,4 +1,3 @@
-#include "engine/models/plan.h"
 #include "engine/models/source.h"
 #include "engine/models/load.h"
 #include "engine/ops.h"
@@ -39,7 +38,6 @@ Model read(std::shared_ptr<const tyloi::ModelSource> source, std::string_view de
     model.graph = tyloi::models::graph(*model.source);
     if (model.graph.backbone != "minicpmo_tts")
         throw std::runtime_error("MiniCPM TTS loading requires the minicpmo_tts backbone");
-    model.plan = ::tyloi::models::model_plan(model.graph);
     auto& config = model.config;
     config = tyloi::models::ModelConfig::from_json(definition);
     if (config.num_hidden_layers != model.graph.topology.text_layers)

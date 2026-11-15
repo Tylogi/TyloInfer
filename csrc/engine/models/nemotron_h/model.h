@@ -5,7 +5,6 @@
 #include "engine/backends/cuda/ops/projection/quant_linear.h"
 #include "engine/models/nemotron_h/config.h"
 #include "engine/models/metadata.h"
-#include "engine/models/plan.h"
 #include "engine/models/source.h"
 #include "engine/models/causal_model.h"
 
@@ -50,7 +49,6 @@ struct Model
 {
     std::shared_ptr<const tyloi::ModelSource> source;
     tyloi::ModelGraph graph;
-    ::tyloi::models::Plan plan;
     Config config;
     tyloi::models::CausalLmMetadata metadata;
     ::tyloi::Tensor embed, lm_head;

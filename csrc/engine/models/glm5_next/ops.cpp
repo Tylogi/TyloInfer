@@ -1,4 +1,3 @@
-#include "engine/models/plan.h"
 #include "engine/models/load.h"
 #include "engine/models/glm5_next/components.h"
 #include "engine/backends/cuda/kernels/mfq_cuda_moe_ops.h"
@@ -132,9 +131,14 @@ Model read(std::shared_ptr<const tyloi::ModelSource> source, std::string_view de
     Model model;
     model.source = std::move(source);
     model.graph = tyloi::models::graph(*model.source);
-    model.plan = ::tyloi::models::model_plan(model.graph);
     tyloi::models::require_model(model.graph.backbone == "glm5_next",
                                "model backbone does not match the requested causal model");
+    for (const auto& component : model.graph.components)
+        if (component.kind != "text" && component.kind != "predictor")
+            throw std::runtime_error("GLM5-Next CUDA does not support component: " + component.kind);
+    if (const auto* predictor = model.graph.component("predictor"); predictor &&
+        (predictor->tensor_root != "predictor" || predictor->implementation != "next_token_prediction"))
+        throw std::runtime_error("GLM5-Next CUDA requires a next_token_prediction predictor under the predictor tensor root");
     tyloi::models::glm5_next::load_config(definition, model.config, model.metadata);
     tyloi::models::require_model(model.config.layers == model.graph.topology.text_layers,
                                "model graph/config text-layer topology mismatch");
@@ -324,18 +328,16 @@ void State::rollback_speculative(std::int64_t accepted) {
 
 tyloi::models::Info Model::info() const { return tyloi::models::model_info(metadata); }
 MfqModelCapabilities Model::capabilities() const {
-    const auto state = ::tyloi::models::component_state(graph, plan, false, bool(mtp));
-    const auto caps = ::tyloi::models::runtime_capabilities(graph, plan, state, false, false);
-    return {graph.architecture, caps.text, caps.image_input, caps.video_input,
-        caps.audio_input, caps.audio_output, caps.full_duplex, caps.mtp, "model-graph+cuda-adapters"};
+    return {graph.architecture, graph.has_component("text"), false, false,
+        false, false, false, bool(mtp), "model"};
 }
 tyloi::engine::Metrics Model::metrics() const {
-    const auto state = ::tyloi::models::component_state(graph, plan, false, bool(mtp));
+    const bool mtp_declared = graph.has_component("predictor");
     return {{"kv_memory_supported", 0.0}, {"kv_quantization_supported", 0.0},
-        {"kv_quantization_bits", 0.0}, {"vision_declared", double(state.vision_declared)},
-        {"vision_supported", double(state.vision_supported)}, {"vision_available", double(state.vision_available)},
-        {"mtp_declared", double(state.mtp_declared)}, {"mtp_supported", double(state.mtp_supported)},
-        {"mtp_available", double(state.mtp_available)}};
+        {"kv_quantization_bits", 0.0}, {"vision_declared", double(graph.has_component("vision"))},
+        {"vision_supported", 0.0}, {"vision_available", 0.0},
+        {"mtp_declared", double(mtp_declared)}, {"mtp_supported", double(mtp_declared)},
+        {"mtp_available", double(bool(mtp))}};
 }
 std::unique_ptr<tyloi::models::State> Model::make_state() const {
     auto state = std::make_unique<State>(*this);

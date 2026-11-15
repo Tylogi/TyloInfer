@@ -5,7 +5,6 @@
 #include "engine/models/metadata.h"
 #include "engine/models/causal_model.h"
 #include "engine/models/common/mtp.h"
-#include "engine/models/plan.h"
 #include "engine/models/source.h"
 #include "engine/backends/cuda/ops/projection/quant_linear.h"
 #include "engine/models/common/attention_ops.h"
@@ -328,7 +327,6 @@ struct Model
     ::tyloi::Tensor forward(tyloi::models::Input, tyloi::models::State&, const tyloi::models::ForwardOptions& = {}) const override;
     std::shared_ptr<const tyloi::ModelSource> source;
     tyloi::ModelGraph graph;
-    ::tyloi::models::Plan plan;
     tyloi::models::glm5_next::Config config;
     tyloi::models::CausalLmMetadata metadata;
     ::tyloi::Tensor embed, lm_head;

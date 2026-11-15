@@ -1,4 +1,3 @@
-#include "engine/models/plan.h"
 #include "engine/models/qwen4_exp/components.h"
 
 #include "engine/models/load.h"
@@ -31,20 +30,19 @@ tyloi::models::Info Model::info() const {
 
 MfqModelCapabilities Model::capabilities() const {
     const bool vision = parts && parts->grid_vision.has_value();
-    const auto state = ::tyloi::models::component_state(graph, plan, vision, predictor() != nullptr);
-    const auto caps = ::tyloi::models::runtime_capabilities(graph, plan, state, vision, false);
-    return {graph.architecture, caps.text, caps.image_input, caps.video_input,
-        caps.audio_input, caps.audio_output, caps.full_duplex, caps.mtp, "model-graph+adapters"};
+    return {graph.architecture, graph.has_component("text"), vision, false,
+        false, false, false, predictor() != nullptr, "model"};
 }
 
 tyloi::engine::Metrics Model::metrics() const {
     const bool vision = parts && parts->grid_vision.has_value();
-    const auto state = ::tyloi::models::component_state(graph, plan, vision, predictor() != nullptr);
+    const bool vision_declared = graph.has_component("vision");
+    const bool mtp_declared = graph.has_component("predictor");
     return {{"kv_memory_supported", 0.0}, {"kv_quantization_supported", 0.0},
-        {"kv_quantization_bits", 0.0}, {"vision_declared", double(state.vision_declared)},
-        {"vision_supported", double(state.vision_supported)}, {"vision_available", double(state.vision_available)},
-        {"mtp_declared", double(state.mtp_declared)}, {"mtp_supported", double(state.mtp_supported)},
-        {"mtp_available", double(state.mtp_available)}};
+        {"kv_quantization_bits", 0.0}, {"vision_declared", double(vision_declared)},
+        {"vision_supported", double(vision_declared)}, {"vision_available", double(vision)},
+        {"mtp_declared", double(mtp_declared)}, {"mtp_supported", double(mtp_declared)},
+        {"mtp_available", double(predictor() != nullptr)}};
 }
 
 tyloi::models::Mtp* Model::predictor() const noexcept { return parts ? parts->mtp.get() : nullptr; }
@@ -92,7 +90,7 @@ void load_components(
         const tyloi::weights::Loader& weights,
         bool load_optional_components, const tyloi::models::LoadOptions& load_options) {
     if (!load_optional_components) return;
-    if (model.plan.vision == ::tyloi::models::VisionAdapter::grid_vit) {
+    if (const auto* component = model.graph.component("vision")) {
         const auto document = nlohmann::json::parse(
             tyloi::models::config_json(*model.source));
         const auto& vision = document.at("vision_config");
@@ -120,22 +118,12 @@ void load_components(
         if (config.out_hidden_size != model.config.hidden || model.config.sections.size() != 3 ||
                 image < 0 || video < 0 || image >= model.config.vocab || video >= model.config.vocab || image == video)
             throw std::runtime_error("invalid Qwen4 grid-ViT text geometry or placeholder IDs");
-        const auto* component = model.graph.component("vision");
         result.grid_vision.emplace(
             tyloi::models::grid::Vision::load(
                 weights, weights.cache(), config, image, video,
                 component->input_contract, component->position_policy, load_options.vision_resident));
-    } else if (model.plan.vision != ::tyloi::models::VisionAdapter::none) {
-        throw std::runtime_error("unsupported Qwen4 CUDA vision adapter");
     }
-    if (model.plan.predictor != ::tyloi::models::PredictorAdapter::none &&
-             model.plan.predictor !=
-                 ::tyloi::models::PredictorAdapter::flash_next) {
-        throw std::runtime_error(
-            "unsupported Qwen4 CUDA component adapter");
-    }
-    if (model.plan.predictor ==
-            ::tyloi::models::PredictorAdapter::none) return;
+    if (!model.graph.has_component("predictor")) return;
     TYLOINFER_RUNTIME_CHECK(
         model.supports_speculation(),
         "invalid Flash-Next predictor model");
