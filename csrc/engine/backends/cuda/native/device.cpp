@@ -2,6 +2,7 @@
 
 #include <sstream>
 #include <string>
+#include <cstring>
 
 namespace tyloi::cuda {
 namespace {
@@ -48,6 +49,12 @@ void check(cublasStatus_t status, const char* expression, const char* file, int 
         throw Error(location_message(
             "cuBLAS", cublas_status_name(status), expression, file, line));
     }
+}
+
+bool separate_memory(int device) {
+    cudaDeviceProp properties{};
+    TYLOINFER_NATIVE_CUDA_CHECK(cudaGetDeviceProperties(&properties, device));
+    return !properties.integrated && std::strstr(properties.name, "GB10") == nullptr;
 }
 
 DeviceGuard::DeviceGuard(int device) {

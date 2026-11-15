@@ -17,6 +17,7 @@
 #include <unordered_set>
 
 class TqExec;
+namespace tyloi::weights { class Cache; }
 
 namespace tyloi::cuda {
 
@@ -49,7 +50,10 @@ public:
     void join();
     static Executor& current();
     static Executor* active() noexcept;
-    void configure_kv(std::shared_ptr<KvMemoryManager> memory, std::shared_ptr<KvOffloadStore> offload);
+    /** Create the root executor's KV owner before model loading. */
+    void init_kv();
+    /** Finalize KV mappings after model loading and publish them to the weight cache. */
+    void finalize_kv(tyloi::weights::Cache& weights);
     std::shared_ptr<KvMemoryManager> kv_memory() const noexcept { return kv_memory_.lock(); }
     std::shared_ptr<KvOffloadStore> kv_offload() const;
     void wait();
@@ -138,6 +142,7 @@ public:
     MlaScratch& mla_scratch(int device) { return mla_scratch_[device]; }
 
 private:
+    void configure_kv(std::shared_ptr<KvMemoryManager> memory, std::shared_ptr<KvOffloadStore> offload);
     Executor(ContextSet& contexts, CudaProfiler& profiler, KlMmqState& mmq, const std::shared_ptr<TqExec>& tq,
              Branches& branches, Collectives& collectives, RouteStats& routes,
              const Options& options, Mode& mode, int primary,

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "engine/backends/cuda/load.h"
+#include "engine/load.h"
 #include "engine/generation/sequence.h"
 #include "engine/models/input.h"
 #include "engine/generation/mtp/metrics.h"
@@ -19,6 +19,9 @@ namespace engine { struct Config; class InferenceOutput; class Batch; class Batc
 }
 
 namespace tyloi::cuda {
+
+class Executor;
+struct CudaLoadConfig;
 
 /** Own native execution resources and one independently loaded model or layer view. */
 class Program final {
@@ -106,17 +109,4 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-namespace internal {
-/** Check the existing runtime eligibility for CUDA decode graph execution. */
-bool graph_allowed(const CudaLoadConfig&, Executor&, const weights::Cache&, const models::Info&);
-/** Apply the owner's runtime options and actual graph eligibility to generation. */
-void configure_generation(engine::Config&, const CudaLoadConfig&, Executor&,
-    const weights::Cache&, const models::Info&);
-/** Configure the shared native KV owner and optional offload store. */
-void configure_model_kv(std::shared_ptr<KvMemoryManager>&, std::shared_ptr<KvOffloadStore>&);
-/** Assemble a native model with the shared loader and policy. */
-void load_model(std::unique_ptr<models::CausalModel>& owner,
-    const tyloi::engine::LoadOptions&, CudaLoadConfig&, Executor&, weights::Cache&,
-    const std::shared_ptr<const ModelSource>&, bool components);
-}
 } // namespace tyloi::cuda

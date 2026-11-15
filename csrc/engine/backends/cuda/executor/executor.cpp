@@ -1,10 +1,12 @@
 #include "executor.h"
 
 #include "engine/backends/cuda/executor/tq.h"
+#include "engine/backends/cuda/executor/options.h"
 #include "engine/backends/cuda/executor/working_set.h"
 #include "engine/backends/cuda/native/branches.h"
 #include "engine/backends/cuda/native/collectives.h"
 #include "engine/backends/cuda/native/context.h"
+#include "engine/backends/cuda/native/device.h"
 #include "engine/backends/cuda/native/env.h"
 #include "engine/backends/cuda/native/profile.h"
 #include "engine/backends/cuda/native/scope.h"
@@ -14,8 +16,10 @@
 #include "engine/backends/cuda/ops/projection/mmq.h"
 #include "engine/state/kv_memory.h"
 #include "engine/state/kv_offload.h"
+#include "engine/weights/cache.h"
 #include "diagnostics/route_stats.h"
 
+#include <algorithm>
 #include <exception>
 #include <iostream>
 #include <optional>
@@ -297,6 +301,30 @@ void Executor::configure_kv(std::shared_ptr<KvMemoryManager> memory, std::shared
     }
     kv_memory_ = memory;
     kv_offload_ = offload;
+}
+
+void Executor::init_kv() {
+    if (!owned_contexts_) throw std::logic_error("KV initialization requires the root CUDA executor");
+    const auto options = cuda::options::qsa_kv_offload();
+    if (!options.gpu_budget_bytes) {
+        configure_kv(std::make_shared<KvMemoryManager>(), {});
+        return;
+    }
+    KvOffloadConfig config;
+    config.gpu_budget_bytes = options.gpu_budget_bytes;
+    config.ram_budget_bytes = separate_memory(primary_) ? options.ram_budget_bytes : 0;
+    config.buffer_bytes = std::min<std::size_t>(config.buffer_bytes, config.gpu_budget_bytes / 4);
+    config.directory = options.directory;
+    config.device = Device(kCUDA, primary_);
+    configure_kv({}, std::make_shared<KvOffloadStore>(std::move(config)));
+}
+
+void Executor::finalize_kv(tyloi::weights::Cache& weights) {
+    if (!owned_contexts_) throw std::logic_error("KV finalization requires the root CUDA executor");
+    if (auto memory = kv_memory()) {
+        memory->finalize(weights, weights.minimum());
+        weights.commit_kv();
+    }
 }
 
 void Executor::bind_budget(tyloi::engine::Budget* budget) {

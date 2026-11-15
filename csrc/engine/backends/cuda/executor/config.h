@@ -9,11 +9,14 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
 namespace tyloi::weights { class Cache; }
+namespace tyloi::engine { struct LoadOptions; }
+namespace tyloi::models { struct Info; struct LoadOptions; }
 
 namespace tyloi::cuda {
 
@@ -37,6 +40,8 @@ struct CudaLoadConfig {
     bool tensor_parallel_mirror_linear_attention_scalars = true;
     std::size_t deepseek_v41_engram_cache_rows = 16'384;
     tyloi::weights::CachePolicy cache;
+    std::size_t cache_bytes = 0;
+    std::string cache_profile;
     bool yarn_context_extension = false;
     tyloi::ops::YarnScaling yarn;
     std::unordered_set<int> dsv4_cpu_offload_layers;
@@ -49,7 +54,15 @@ struct CudaLoadConfig {
     LayerPlacementConfig layer_placement;
 };
 
-void configure_placement(CudaLoadConfig& config, Collectives& collectives);
+void configure_placement(CudaLoadConfig& config, Collectives& collectives, int primary = 0);
+void configure_load(CudaLoadConfig& config, const tyloi::engine::LoadOptions& options);
+tyloi::models::LoadOptions model_options(const CudaLoadConfig& config, std::int64_t context,
+                                        bool components, bool transposed);
+bool graph_allowed(const CudaLoadConfig& config, Executor& executor,
+                   const tyloi::weights::Cache& weights, const tyloi::models::Info& info);
+void configure_generation(tyloi::engine::Config& runtime, const CudaLoadConfig& config,
+                          Executor& executor, const tyloi::weights::Cache& weights,
+                          const tyloi::models::Info& info);
 
 std::pair<CudaLoadConfig, Executor::Options> load_cuda_execution_config();
 std::vector<tyloi::Device> cuda_devices(const CudaLoadConfig& config);

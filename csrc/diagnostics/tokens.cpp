@@ -212,7 +212,7 @@ int generate_diagnostic_tokens(Program& program,Tensor ids,int gen,bool profile,
         config.dsv4_cpu_offload_layers.empty() && config.dense_cpu_layer_count==0 &&
         program.weights().transfer()!=weights::Cache::Transfer::coordinated &&
         info.graph==models::GraphOwner::executor &&
-        ::tyloi::cuda::internal::graph_allowed(config,program.executor(),program.weights(),info) &&
+        ::tyloi::cuda::graph_allowed(config,program.executor(),program.weights(),info) &&
         (!profile || profile_graph) && gen>1;
     if(graph_requested && graph_eligible && !eos)work.graph=program.executor().graph();
     const bool use_graph=bool(work.graph);

@@ -14,6 +14,8 @@ public:
 
 void check(cudaError_t status, const char* expression, const char* file, int line);
 void check(cublasStatus_t status, const char* expression, const char* file, int line);
+/** Return whether this device has separate GPU memory. */
+bool separate_memory(int device);
 
 #define TYLOINFER_NATIVE_CUDA_CHECK(expression) \
     ::tyloi::cuda::check((expression), #expression, __FILE__, __LINE__)
