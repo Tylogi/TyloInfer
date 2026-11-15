@@ -1015,7 +1015,7 @@ class QsaCore {
     }
     std::shared_ptr<const QsaWeights> w_;
     QsaConfig c_;
-    tyloi::state::KvQuantization quantization_=cuda_kv_quantization();
+    tyloi::state::KvQuantization quantization_=c_.quantization;
     std::shared_ptr<RotaryEmbedding> rotary_;
     const bool fused_projection_;
     const bool grouped_projection_;

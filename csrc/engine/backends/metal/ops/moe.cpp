@@ -103,7 +103,8 @@ RoutedExperts routed(const Tensor& input, const Tensor& input_f32, const Tensor&
                      weights::ExpertBatch& batch, const ExpertSpec& spec) {
     if (!batch.impl_) throw std::invalid_argument("expert batch has been moved");
     const auto& b = *batch.impl_;
-    if (!input.is_metal() || input.dim() != 2 || input.scalar_type() != kFloat16 ||
+    if (!input.is_metal() || input.dim() != 2 ||
+        (input.scalar_type() != kFloat16 && input.scalar_type() != kBFloat16 && input.scalar_type() != kFloat32) ||
         !input_f32.is_metal() || input_f32.dim() != 2 || input_f32.scalar_type() != kFloat32 ||
         input.size(0) <= 0 || input.size(1) <= 0 || input_f32.size(0) != input.size(0) ||
         input_f32.size(1) != input.size(1) || !b.ids.is_metal() || b.ids.dim() != 2 ||
@@ -121,7 +122,7 @@ RoutedExperts routed(const Tensor& input, const Tensor& input_f32, const Tensor&
     auto x = spec.latent_in ? project(input, spec.latent_in) : input;
     const auto output_width = spec.latent_out ? spec.latent_out.size(1) : input.size(1);
     check_banks(b.gate_up, b.down, x.size(1), output_width);
-    auto logits = project(input_f32, spec.shared_gate);
+    auto logits = project(spec.source_precision_gate ? input : input_f32, spec.shared_gate);
     const auto* gate = b.gate_up[0].representation<metal::ExpertBank>();
     const auto* down = b.down.representation<metal::ExpertBank>();
     Tensor result;
@@ -168,7 +169,7 @@ RoutedExperts routed(const Tensor& input, const Tensor& input_f32, const Tensor&
         result = metal::tensor(metal::moe_weighted_reduce(pairs, metal::array(route_weights)));
     }
     if (spec.latent_out) result = project(result, spec.latent_out);
-    return {cast(result, kFloat16), cast(logits, kFloat32), true};
+    return {cast(result, input.scalar_type()), cast(logits, kFloat32), true};
 }
 
 Tensor combine_experts(const RoutedExperts& experts, const Tensor& route_weights, const Tensor& shared) {

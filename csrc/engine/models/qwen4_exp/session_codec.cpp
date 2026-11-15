@@ -21,15 +21,13 @@ Qwen4PagedHeader read_qwen4_header(SessionBlockReader& reader) {
     if(!header.count || !header.layers || header.layers>4096)throw CudaSessionStateError("invalid Qwen4 prefix geometry");
     return header;
 }
-void write_optional(SessionBlockWriter& writer,const ::tyloi::Tensor& tensor,int device = -1) {
-    if(tensor.defined() && !tensor.representation<::tyloi::DenseTensor>())throw CudaSessionStateError("incompatible Qwen4 session tensor");
-    writer.scalar<uint32_t>(tensor.defined()?1:0);if(tensor.defined())writer.tensor(tensor,device);
+void write_optional(SessionBlockWriter& writer,const ::tyloi::Tensor& tensor,std::optional<::tyloi::Device> device = {}) {
+    writer.scalar<uint32_t>(tensor.defined()?1:0);if(tensor.defined())writer.tensor(tensor,device.value_or(tensor.device()));
 }
-::tyloi::Tensor read_optional(SessionBlockReader& reader,int& device) {
+::tyloi::Tensor read_optional(SessionBlockReader& reader,std::optional<::tyloi::Device>& device) {
     if(!reader.scalar<uint32_t>("tensor presence"))return {};
     auto value=reader.tensor();
-    if (!reader.tensor_device().is_cuda()) throw CudaSessionStateError("incompatible Qwen4 session device");
-    device=value.second;
+    device=reader.tensor_device();
     return std::move(value.first);
 }
 void write_recurrent(SessionBlockWriter& writer,const tyloi::models::qwen4_exp::LayerSnapshot& layer) {
@@ -50,15 +48,13 @@ void write_qwen4_mtp(SessionBlockWriter& writer,const MtpSessionState& state) {
         snapshot->lengths.size()!=snapshot->layers.size() ||
         (!snapshot->positions_devices.empty() && snapshot->positions_devices.size()!=snapshot->layers.size()))
         throw CudaSessionStateError("incompatible Qwen4 MTP session state");
-    const auto* hidden=state.last_target_hidden.representation<::tyloi::DenseTensor>();
-    if(state.last_target_hidden.defined() && !hidden)throw CudaSessionStateError("incompatible Qwen4 MTP session state");
     writer.scalar<int64_t>(state.cache_pos);
     write_optional(writer,state.last_target_hidden,snapshot->hidden_device);
     writer.scalar<uint32_t>(uint32_t(snapshot->layers.size()));
     for(std::size_t i=0;i<snapshot->layers.size();++i) {
         const auto& layer=snapshot->layers[i];
         write_optional(writer,layer.keys,layer.devices[0]);write_optional(writer,layer.values,layer.devices[1]);write_optional(writer,layer.index,layer.devices[2]);
-        write_recurrent(writer,layer);write_optional(writer,snapshot->positions[i],snapshot->positions_devices.empty() ? -1 : snapshot->positions_devices[i]);
+        write_recurrent(writer,layer);write_optional(writer,snapshot->positions[i],snapshot->positions_devices.empty() ? std::nullopt : snapshot->positions_devices[i]);
         writer.scalar<int64_t>(snapshot->lengths[i]);
     }
 }
@@ -70,7 +66,7 @@ std::size_t qwen4_layer_bytes(const tyloi::models::qwen4_exp::LayerSnapshot& lay
 }
 MtpSessionState read_qwen4_mtp(SessionBlockReader& reader) {
     MtpSessionState state;state.cache_pos=reader.scalar<int64_t>("MTP position");
-    int hidden_device=-1; auto hidden=read_optional(reader,hidden_device);
+    std::optional<::tyloi::Device> hidden_device; auto hidden=read_optional(reader,hidden_device);
     if(hidden)state.bytes=session_tensor_bytes(hidden);
     state.last_target_hidden=std::move(hidden);
     const auto count=reader.scalar<uint32_t>("MTP layers");
@@ -79,7 +75,7 @@ MtpSessionState read_qwen4_mtp(SessionBlockReader& reader) {
     for(uint32_t i=0;i<count;++i) {
         tyloi::models::qwen4_exp::LayerSnapshot layer;layer.keys=read_optional(reader,layer.devices[0]);layer.values=read_optional(reader,layer.devices[1]);layer.index=read_optional(reader,layer.devices[2]);
         read_recurrent(reader,layer);state.bytes+=qwen4_layer_bytes(layer);snapshot.layers.push_back(std::move(layer));
-        int device=-1; auto positions=read_optional(reader,device);if(positions)state.bytes+=session_tensor_bytes(positions);snapshot.positions.push_back(std::move(positions));snapshot.positions_devices.push_back(device);
+        std::optional<::tyloi::Device> device; auto positions=read_optional(reader,device);if(positions)state.bytes+=session_tensor_bytes(positions);snapshot.positions.push_back(std::move(positions));snapshot.positions_devices.push_back(device);
         snapshot.lengths.push_back(reader.scalar<int64_t>("MTP layer position"));
     }
     return state;
@@ -100,10 +96,8 @@ SessionBlockPayload encode_block(const TextSessionState& state,size_t block_size
         const std::array<::tyloi::Tensor,3> tensors{layer.keys,layer.values,layer.index};
         for(size_t field=0;field<tensors.size();++field) {
             const auto& tensor=tensors[field];
-            const auto* dense=tensor.representation<::tyloi::DenseTensor>();
-            if(tensor.defined() && !dense)throw CudaSessionStateError("incompatible Qwen4 session tensor");
-            if(dense && dense->defined()) {
-                auto slice=dense->narrow(1,int64_t(start),int64_t(count));
+            if(tensor.defined()) {
+                auto slice=ops::slice(tensor,1,int64_t(start),int64_t(start + count));
                 write_optional(writer,slice,layer.devices[field]);
             } else write_optional(writer,::tyloi::Tensor{});
         }
@@ -137,7 +131,7 @@ TextSessionState decode_session(const std::vector<SessionBlockPayload>& payloads
         position+=header.count;
         for(size_t layer=0;layer<layers.size();++layer) {
             for(size_t field=0;field<3;++field) {
-                int device=-1; auto tensor=read_optional(reader,device);
+                std::optional<::tyloi::Device> device; auto tensor=read_optional(reader,device);
                 if(tensor && tensor.defined()) {
                     if(tensor.dim()!=3 || tensor.size(0)!=1 || tensor.size(1)!=header.count)
                         throw CudaSessionStateError("invalid Qwen4 QSA prefix geometry");
@@ -150,12 +144,12 @@ TextSessionState decode_session(const std::vector<SessionBlockPayload>& payloads
             }
             if(header.exact) {
                 layers[layer].convolution={};layers[layer].recurrent={};layers[layer].ple_convolution={};layers[layer].ple_tokens.clear();
-                layers[layer].devices[3]=layers[layer].devices[4]=layers[layer].devices[5]=-1;
+                layers[layer].devices[3].reset();layers[layer].devices[4].reset();layers[layer].devices[5].reset();
                 read_recurrent(reader,layers[layer]);
             }
         }
         if(header.exact) {
-            snapshot.positions_device=-1; snapshot.positions=read_optional(reader,snapshot.positions_device);
+            snapshot.positions_device.reset(); snapshot.positions=read_optional(reader,snapshot.positions_device);
             state.decode_position_delta=header.version>=2 ? reader.scalar<int64_t>("position delta") : 0;
             state.mtp.reset();if(reader.scalar<uint32_t>("MTP presence"))state.mtp=read_qwen4_mtp(reader);
         }

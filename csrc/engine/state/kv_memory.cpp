@@ -501,20 +501,26 @@ void KvMemoryManager::finalize(tyloi::weights::Cache& cache, std::size_t minimum
     if(tiered_budget)std::cerr<<"runtime_kv_tier_budget gpu_bytes="<<index+gpu<<" raw_ram_required="<<raw-std::min(raw,gpu)
         <<" ram_preallocated="<<options_.ram_preallocated<<" exclusive="<<exclusive<<"\n";
 }
-void KvMemoryManager::ensure(int64_t tokens) {
-    if(lending_)cache_->protect_kv(tokens);
-    std::vector<std::pair<tyloi::Device, std::size_t>> growth;
-    for(auto& weak:allocations_)if(auto a=weak.lock()) {
-        const auto bytes=a->growth_bytes(std::min(a->maximum,tokens));
-        if(!bytes)continue;
-        const auto device=a->options.target_device();
-        auto entry=std::find_if(growth.begin(),growth.end(),[&](const auto& item){return item.first==device;});
-        if(entry==growth.end())growth.emplace_back(device,bytes);
-        else entry->second=engine::prefill_budget_add(entry->second,bytes);
+std::vector<std::pair<tyloi::Device, std::size_t>> KvMemoryManager::growth(int64_t tokens) const {
+    if (tokens < 0) throw std::invalid_argument("KV growth position must be nonnegative");
+    std::vector<std::pair<tyloi::Device, std::size_t>> result;
+    for (const auto& weak : allocations_) if (auto allocation = weak.lock()) {
+        const auto bytes = allocation->growth_bytes(std::min(allocation->maximum, tokens));
+        if (!bytes) continue;
+        const auto device = allocation->options.target_device();
+        auto entry = std::find_if(result.begin(), result.end(), [&](const auto& item) { return item.first == device; });
+        if (entry == result.end()) result.emplace_back(device, bytes);
+        else entry->second = engine::prefill_budget_add(entry->second, bytes);
     }
-    if(budget_)for(const auto& [device,bytes]:growth)
-        budget_->reserve_kv(device,engine::prefill_budget_add(bytes,64ULL<<20));
-    for(auto& weak:allocations_)if(auto a=weak.lock())a->ensure(std::min(a->maximum,tokens));
+    return result;
+}
+void KvMemoryManager::ensure(int64_t tokens) {
+    if (lending_) cache_->protect_kv(tokens);
+    const auto required = growth(tokens);
+    if (budget_) for (const auto& [device, bytes] : required)
+        budget_->reserve_kv(device, engine::prefill_budget_add(bytes, 64ULL << 20));
+    for (auto& weak : allocations_) if (auto allocation = weak.lock())
+        allocation->ensure(std::min(allocation->maximum, tokens));
 }
 std::size_t KvMemoryManager::growth_reserve() const {
     std::size_t result=0;

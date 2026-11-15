@@ -1,4 +1,5 @@
 #include "engine/weights/row_stage.h"
+#include "engine/backends/cuda/ops/row_stage.h"
 #include "engine/weights/encoding/rows.h"
 #include "engine/weights/tq/rows.h"
 #if TYLOINFER_ENABLE_MFQ_COMPAT
@@ -142,7 +143,7 @@ Tensor RowReader::collect(const std::vector<std::int64_t>& ids, const std::vecto
 }
 std::shared_ptr<RowStage> RowReader::stage(const std::vector<std::int64_t>& shape, const Device& device) {
     if (!impl_->source->dense.empty())
-        return make_dense_row_stage(impl_->source->dense, impl_->source->rows, shape, device);
+        return cuda::make_dense_row_stage(impl_->source->dense, impl_->source->rows, shape, device);
     std::shared_ptr<RowStage> result;
 #if TYLOINFER_ENABLE_MFQ_COMPAT
     if (impl_->nint) result = std::make_shared<NintStage>(impl_->nint, shape, device);

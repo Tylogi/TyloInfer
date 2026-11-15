@@ -13,6 +13,8 @@ struct ResidualConfig {
     bool final = false;
     /** Execution device, independent of weight residency. */
     Device target = Device(kCUDA, 0);
+    /** Preserve the native GGUF/Affine hyper-connection precision policy. */
+    bool native_hyper = false;
 };
 /** Identify the numerical stage in graph profiling. */
 enum class ResidualRole { none, attention, ffn, final };

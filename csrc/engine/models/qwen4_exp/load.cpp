@@ -26,20 +26,22 @@
 #include <stdexcept>
 #include <utility>
 
-namespace tyloi::cuda::qwen4_exp {
+namespace tyloi::models::qwen4_exp {
 
 using Config = tyloi::models::qwen4_exp::Config;
 
 struct LayerLoader : tyloi::weights::Loader {
     using PleWeights = qwen4_exp::PleWeights;
     const tyloi::ops::YarnScaling& yarn;
+    const tyloi::state::KvQuantization& kv_quantization;
     using Embedding = ::tyloi::Tensor;
 
     auto residual(::tyloi::Tensor norm, ::tyloi::Tensor down, ::tyloi::Tensor up,
                   ::tyloi::Tensor injection, const Config& c, bool final) const {
         return tyloi::ops::Residual(
             {std::move(norm), std::move(down), std::move(up), std::move(injection)},
-            {c.hidden, c.streams, c.eps, final, placement.target});
+            {c.hidden, c.streams, c.eps, final, placement.target,
+                placement.target.is_metal() && source.metadata().contains("gguf_metadata")});
     }
     static auto final_mixer(tyloi::ops::Residual value) {
         return std::make_unique<tyloi::ops::Residual>(std::move(value));
@@ -79,6 +81,7 @@ struct LayerLoader : tyloi::weights::Loader {
         return w;
     }
     auto gdn(tyloi::ops::GdnWeights weights, const Config& c) const {
+        weights.tiled_heads = c.linear_tiled_heads;
         weights.input_projection = tyloi::weights::pack_projections(
             std::move(weights.input_projection), options.grouped, placement.target.is_cpu());
         return std::make_unique<tyloi::ops::Gdn>(std::move(weights), c.key_heads, c.value_heads,
@@ -91,7 +94,7 @@ struct LayerLoader : tyloi::weights::Loader {
             if (norm->defined()) *norm = tyloi::ops::contiguous(tyloi::ops::cast(*norm, tyloi::kFloat32));
         tyloi::ops::QsaConfig geometry{c.heads, c.kv_heads, c.width, c.index_heads, c.index_width,
             c.pool, c.budget, c.maximum, c.eps, c.rotary, c.rope_base, c.sections, c.interleaved,
-            yarn, placement.target};
+            yarn, placement.target, kv_quantization};
         return std::make_unique<tyloi::ops::Qsa>(std::move(weights), std::move(geometry));
     }
     auto moe(std::vector<tyloi::Tensor> gate_up, tyloi::Tensor down, tyloi::Tensor router,
@@ -128,9 +131,9 @@ struct LayerLoader : tyloi::weights::Loader {
         const auto &type = require_tensor(source, name).dtype;
         TYLOINFER_RUNTIME_CHECK(type == "I64" || type == "I32",
                           "Qwen4 PLE metadata must be a dense integer array: ", name);
-        auto host = tensor(name).dense().to(::tyloi::kInt64).contiguous().cpu();
-        TYLOINFER_RUNTIME_CHECK(host.dim() == 1, "Qwen4 PLE metadata must be a vector");
-        return {host.data_ptr<int64_t>(), host.data_ptr<int64_t>() + host.numel()};
+        auto value = host(name);
+        TYLOINFER_RUNTIME_CHECK(value.dim() == 1, "Qwen4 PLE metadata must be a vector");
+        return tyloi::ops::read_integers(value);
     }
     static auto ple(std::vector<Embedding> shards, int64_t rows, int64_t width, const Config &c,
                     std::vector<int64_t> multipliers, std::vector<int64_t> offsets,
@@ -146,7 +149,7 @@ struct LayerLoader : tyloi::weights::Loader {
 std::unique_ptr<Layer> LayerLoader::layer(const Config &c, int layer, bool predictor) {
     auto result = std::make_unique<Layer>();
     result->device = placement.target;
-    LayerLoader loader{*this, yarn};
+    LayerLoader loader{*this, yarn, kv_quantization};
     loader.role = "qwen4_exp";
     tyloi::models::qwen4_exp::load_layer(*result, loader, c, layer, predictor);
     return result;
@@ -161,8 +164,8 @@ std::optional<Predictor> Predictor::load_if_present(const tyloi::weights::Loader
     result.embedding = std::move(embedding);
     result.output = std::move(output);
     result.softcap = softcap;
-    result.primary = weights.placement.target.index;
-    LayerLoader loader{weights, options.yarn};
+    result.device = weights.placement.target;
+    LayerLoader loader{weights, options.yarn, options.kv_quantization};
     loader.role = "qwen4_exp";
     if (!tyloi::models::qwen4_exp::load_predictor(result, loader, main))
         return std::nullopt;
@@ -194,6 +197,9 @@ void read(Model& model, std::shared_ptr<const tyloi::ModelSource> model_source,
 void load(Model& model, const tyloi::weights::Loader& tensors, LayerPlacementConfig& placement,
           const tyloi::models::LoadOptions& options, bool load_layers) {
     validate_native_placement(tensors.placement.tensor, placement, options.gpu_layers);
+    if (placement.devices.empty()) placement.devices = {tensors.placement.target.index};
+    if (placement.primary_device() != tensors.placement.target.index)
+        throw std::invalid_argument("Qwen4 weight and layer primary devices differ");
     if (options.expert_parallel && model.metadata.num_experts <= 0)
         throw std::runtime_error("--expert-parallel requires a model with routed experts");
     placement.prepare(model.num_hidden_layers());
@@ -204,17 +210,17 @@ void load(Model& model, const tyloi::weights::Loader& tensors, LayerPlacementCon
             throw std::runtime_error("--n-gpu-layers cannot be combined with tensor/expert/layer parallelism");
         std::cerr << "dense_layer_placement cpu=0-" << (dense_cpu_layer_count - 1)
                   << " gpu=" << dense_cpu_layer_count << '-' << (model.num_hidden_layers() - 1)
-                  << " cpu_threads=" << mfq_get_num_threads() << std::endl;
+                  << std::endl;
     }
-    tyloi::ops::DeviceScope model_guard(tyloi::Device(tyloi::kCUDA, placement.primary_device()));
+    tyloi::ops::DeviceScope model_guard(tensors.placement.target);
     if (model.plan.vision == ::tyloi::models::VisionAdapter::grid_vit && dense_cpu_layer_count > 0)
         throw std::runtime_error("CUDA grid-Vision currently requires GPU-resident text layers");
-    model.primary_device = placement.primary_device();
+    model.device = tensors.placement.target;
     constexpr auto embedding = "model.token_embedding.weight";
     constexpr auto output = "model.output.weight";
     const bool independent = !model.tie_word_embeddings() && tensors.has(output);
     model.embed = tensors.embedding(embedding, independent);
-    LayerLoader loader{tensors, options.yarn};
+    LayerLoader loader{tensors, options.yarn, options.kv_quantization};
     loader.role = "qwen4_exp";
     model.final_mixer = loader.final_mixer(
         tyloi::models::qwen4_exp::load_residual(loader, model.config, "model.mhc.pre", false));
@@ -224,13 +230,13 @@ void load(Model& model, const tyloi::weights::Loader& tensors, LayerPlacementCon
     if (load_layers) {
         model.layers.reserve(static_cast<std::size_t>(model.num_hidden_layers()));
         for (int layer = 0; layer < model.num_hidden_layers(); ++layer) {
-            const int device = placement.device_for_layer(layer);
+            const Device device(tensors.placement.target.type, placement.device_for_layer(layer));
             const bool cpu = layer < dense_cpu_layer_count;
-            MfqCudaGuard layer_guard(device);
+            tyloi::ops::DeviceScope layer_guard(cpu ? Device(kCPU) : device);
             std::cerr << "loading layer " << layer << ' '
                       << model.metadata.layer_types.at(static_cast<std::size_t>(layer)) << ' '
-                      << (cpu ? "CPU" : "CUDA") << std::endl;
-            LayerLoader placed{tensors.for_layer(cpu ? ::tyloi::Device(::tyloi::kCPU) : ::tyloi::Device(::tyloi::kCUDA, device)), options.yarn};
+                      << (cpu ? "CPU" : device.is_cuda() ? "CUDA" : "Metal") << std::endl;
+            LayerLoader placed{tensors.for_layer(cpu ? Device(kCPU) : device), options.yarn, options.kv_quantization};
             auto block = placed.layer(model.config, layer, false);
             model.layers.push_back(std::move(block));
         }
@@ -252,4 +258,4 @@ void load(std::unique_ptr<tyloi::models::CausalModel>& owner,
     load_components(*model.parts, model, weights, options.optional_components, options);
 }
 
-} // namespace tyloi::cuda::qwen4_exp
+} // namespace tyloi::models::qwen4_exp

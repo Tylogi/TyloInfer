@@ -206,7 +206,7 @@ Tensor cat(std::span<const Tensor> values, std::int64_t dim) {
     const auto rank = first.dim();
     if (dim < 0) dim += rank;
     if (dim < 0 || dim >= rank) throw std::invalid_argument("cat dimension is invalid");
-    std::vector<std::int64_t> shape(first.sizes().begin(), first.sizes().end());
+    std::vector<std::int64_t> shape = first.sizes().vec();
     shape[dim] = 0;
     for (const auto& value : values) {
         const auto& input = checked(value);

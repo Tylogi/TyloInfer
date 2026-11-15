@@ -12,7 +12,7 @@
 #include <cstdint>
 #include <memory>
 
-namespace tyloi::cuda::qwen4_exp {
+namespace tyloi::models::qwen4_exp {
 struct LayerState;
 
 struct Layer final {
@@ -26,22 +26,22 @@ struct Layer final {
     std::unique_ptr<Ple> ple;
 };
 
-DenseTensor forward(const Layer& weights, LayerState& request,
-                    DenseTensor x, const DenseTensor& ids,
-                    const DenseTensor& positions, const DenseTensor& full_positions,
-                    int64_t confirmed = 0, const DenseTensor& host_ids = {});
+Tensor forward(const Layer& weights, LayerState& request,
+                    Tensor x, const Tensor& ids,
+                    const Tensor& positions, const Tensor& full_positions,
+                    int64_t confirmed = 0, const Tensor& host_ids = {});
 
-DenseTensor prefill_ple(const Layer& weights, LayerState& request,
-                        DenseTensor x, const DenseTensor& ids, const DenseTensor& host_ids);
+Tensor prefill_ple(const Layer& weights, LayerState& request,
+                        Tensor x, const Tensor& ids, const Tensor& host_ids);
 
-DenseTensor prefill_attention_core(const Layer& weights, LayerState& request,
-                                   const DenseTensor& input, const DenseTensor& positions,
-                                   const DenseTensor& full_positions);
+Tensor prefill_attention_core(const Layer& weights, LayerState& request,
+                                   const Tensor& input, const Tensor& positions,
+                                   const Tensor& full_positions);
 
 /** Prepare the attention and residual inputs used by layer-major prefill. */
 tyloi::ops::Residual::Result prefill_attention(const Layer& weights, LayerState& request,
-                                        DenseTensor x, const DenseTensor& ids,
-                                        const DenseTensor& host_ids, const DenseTensor& positions,
-                                        const DenseTensor& full_positions);
+                                        Tensor x, const Tensor& ids,
+                                        const Tensor& host_ids, const Tensor& positions,
+                                        const Tensor& full_positions);
 
-} // namespace tyloi::cuda::qwen4_exp
+} // namespace tyloi::models::qwen4_exp

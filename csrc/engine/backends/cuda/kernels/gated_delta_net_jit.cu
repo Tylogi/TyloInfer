@@ -316,7 +316,7 @@ __global__ void gdn_decode_core_kernel(const __half* qkv,const Gate* output_gate
     Output* output,float* convolution_out,float* recurrent_out,int key_heads,int value_heads,
     int width,int taps,int layout,float convolution_eps,double norm_eps,bool silu_gate,
     bool transposed_state,int64_t as0,int64_t as2,int64_t bs0,int64_t bs2,
-    float* workspace,const int64_t* state_addresses,int64_t qkv_stride,int64_t gate_stride,bool warp_reductions,float* checkpoint_convolution,float* checkpoint_recurrent) {
+    float* workspace,const int64_t* state_addresses,int64_t qkv_stride,int64_t gate_stride,bool warp_reductions,float* checkpoint_convolution,float* checkpoint_recurrent,bool tiled_heads) {
     if constexpr(FixedWidth>0)width=FixedWidth;
     if constexpr(FixedTaps>0)taps=FixedTaps;
     const int bh=blockIdx.x/tiles,tile=blockIdx.x%tiles;
@@ -329,7 +329,10 @@ __global__ void gdn_decode_core_kernel(const __half* qkv,const Gate* output_gate
         workspace=reinterpret_cast<float*>(state_addresses[3*batch+2]);
     }
     const int workspace_head=state_addresses?head:bh;
-    const int key_head=head/(value_heads/key_heads),tid=threadIdx.x;
+    const int group_size=value_heads/key_heads;
+    const int head_group=head/key_heads;
+    const int key_head=tiled_heads?head%key_heads:head/group_size,tid=threadIdx.x;
+    const bool first_value_head=tiled_heads?head<key_heads:head%group_size==0;
     const int qk_width=2*key_heads*width,channels=qk_width+value_heads*width;
     __shared__ float query[128],key[128],value[128],attended[128];
     __shared__ float qsum[256],ksum[256],norm_sum[128],decay_value,beta_value;
@@ -364,13 +367,13 @@ __global__ void gdn_decode_core_kernel(const __half* qkv,const Gate* output_gate
         query[tid]=q;key[tid]=k;value[tid]=v;
         if constexpr(!InplaceConv) {
         for(int tap=0;tap<taps-2;++tap) {
-            if(tile==0 && head%(value_heads/key_heads)==0) {
+            if(tile==0 && first_value_head) {
                 store_conv(state_base+size_t(tap)*channels+qc,convolution_state[input_base+size_t(tap+1)*channels+qc]);
                 store_conv(state_base+size_t(tap)*channels+kc,convolution_state[input_base+size_t(tap+1)*channels+kc]);
             }
             if(tile==0)store_conv(state_base+size_t(tap)*channels+vc,convolution_state[input_base+size_t(tap+1)*channels+vc]);
         }
-        if(tile==0 && head%(value_heads/key_heads)==0) {
+        if(tile==0 && first_value_head) {
             store_conv(state_base+size_t(taps-2)*channels+qc,q_current);
             store_conv(state_base+size_t(taps-2)*channels+kc,k_current);
         }
@@ -493,11 +496,11 @@ __global__ void gdn_decode_core_kernel(const __half* qkv,const Gate* output_gate
         if constexpr(InplaceConv)if(tid==0) {
             // The existing tile publication already follows every history
             // read. Publish group readiness before the output epilogue.
-            const int group_size=value_heads/key_heads,first_head=key_head*group_size;
+            const int group_size=value_heads/key_heads,first_head=tiled_heads?key_head:key_head*group_size;
             auto* counter=reinterpret_cast<uint32_t*>(workspace+
-                (size_t(batch)*value_heads+first_head)*(width+1)+width);
+                (size_t(state_batch)*value_heads+first_head)*(width+1)+width);
             cuda::atomic_ref<uint32_t,cuda::thread_scope_device> progress(*counter);
-            const uint32_t bit=1u<<(8+head-first_head),mask=((1u<<group_size)-1u)<<8;
+            const uint32_t bit=1u<<(8+(tiled_heads?head_group:head-first_head)),mask=((1u<<group_size)-1u)<<8;
             const uint32_t previous=progress.fetch_or(bit,cuda::std::memory_order_acq_rel);
             final_key_group=((previous|bit)&mask)==mask;
         }
@@ -571,10 +574,10 @@ __global__ void gdn_decode_core_kernel(const __half* qkv,const Gate* output_gate
     if constexpr(InplaceConv) {
         // A subsequent replay starts only after this kernel completes. All
         // group heads have published readiness, so no counters remain in use.
-        const int group_size=value_heads/key_heads,first_head=key_head*group_size;
+        const int group_size=value_heads/key_heads,first_head=tiled_heads?key_head:key_head*group_size;
         if(final_key_group && tid<group_size) {
                 auto* counter=reinterpret_cast<uint32_t*>(workspace+
-                    (size_t(batch)*value_heads+first_head+tid)*(width+1)+width);
+                    (size_t(state_batch)*value_heads+first_head+tid*(tiled_heads?key_heads:1))*(width+1)+width);
                 cuda::atomic_ref<uint32_t,cuda::thread_scope_device> progress(*counter);
                 progress.store(0u,cuda::std::memory_order_release);
         }
@@ -643,7 +646,7 @@ void decode(const Decode& a,cudaStream_t stream) {
                         a.conv_state,a.state,a.weight,a.dt_bias,a.a_log,a.norm,static_cast<Output*>(a.output),a.conv_out,a.state_out,
                         a.key_heads,a.value_heads,a.width,a.taps,a.layout,a.conv_eps,a.norm_eps,a.silu,a.transposed,
                         a.alpha_stride0,a.alpha_stride2,a.beta_stride0,a.beta_stride2,a.workspace,a.state_addresses,
-                        a.qkv_stride0,a.gate_stride0,a.warp_reductions,a.checkpoint_conv,a.checkpoint_state);
+                        a.qkv_stride0,a.gate_stride0,a.warp_reductions,a.checkpoint_conv,a.checkpoint_state,a.tiled);
                 };
                 if(a.checkpoint_conv)dispatch.template operator()<true>();else dispatch.template operator()<false>();
             };

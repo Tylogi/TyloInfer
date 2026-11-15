@@ -13,6 +13,12 @@ std::vector<::tyloi::DenseTensor> gdn_cuda(::tyloi::DenseTensor q, ::tyloi::Dens
 std::vector<::tyloi::DenseTensor> gdn_transposed_cuda(
     ::tyloi::DenseTensor q, ::tyloi::DenseTensor k, ::tyloi::DenseTensor v,
     ::tyloi::DenseTensor g, ::tyloi::DenseTensor beta, MfqOptional<::tyloi::DenseTensor> state);
+std::vector<::tyloi::DenseTensor> gdn_tiled_cuda(
+    ::tyloi::DenseTensor q, ::tyloi::DenseTensor k, ::tyloi::DenseTensor v,
+    ::tyloi::DenseTensor g, ::tyloi::DenseTensor beta, MfqOptional<::tyloi::DenseTensor> state);
+std::vector<::tyloi::DenseTensor> gdn_transposed_tiled_cuda(
+    ::tyloi::DenseTensor q, ::tyloi::DenseTensor k, ::tyloi::DenseTensor v,
+    ::tyloi::DenseTensor g, ::tyloi::DenseTensor beta, MfqOptional<::tyloi::DenseTensor> state);
 std::vector<::tyloi::DenseTensor> linear_conv_qkv_gate_short_cuda(
     ::tyloi::DenseTensor state,::tyloi::DenseTensor qkv,
     ::tyloi::DenseTensor weight,::tyloi::DenseTensor alpha,

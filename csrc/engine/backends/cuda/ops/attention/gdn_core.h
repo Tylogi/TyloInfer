@@ -190,6 +190,7 @@ class GdnCore {
         if(!eligible(rows.front()))return {};
         for(const auto& row:rows)if(!eligible(row) || row.first->nk_!=first.nk_ || row.first->nv_!=first.nv_ ||
             row.first->d_!=first.d_ || row.first->kernel_!=first.kernel_ || row.first->eps_!=first.eps_ ||
+            row.first->w_->tiled_heads!=first.w_->tiled_heads ||
             row.first->silu_gate_!=first.silu_gate_ || row.second->recurrent.dense().device()!=first_state.recurrent.dense().device() ||
             row.second->conv.dense().device()!=first_state.recurrent.dense().device() || row.second->impl_->core_workspace.dense().device()!=first_state.recurrent.dense().device() ||
             row.first->w_->conv.dense().data_ptr()!=first.w_->conv.dense().data_ptr() || row.first->w_->norm.dense().data_ptr()!=first.w_->norm.dense().data_ptr() ||
@@ -226,7 +227,7 @@ class GdnCore {
             projections[2].reshape({x.size(0),1,nv_}),projections[3].reshape({x.size(0),1,nv_}),
             request.conv.dense(),request.recurrent.dense(),weight,w_->dt_bias.dense().to(::tyloi::kFloat32).contiguous(),w_->a_log.dense().to(::tyloi::kFloat32).contiguous(),
             w_->norm.dense().to(::tyloi::kFloat32).contiguous(),nk_,nv_,d_,1e-6,eps_,silu_gate_,
-            x.scalar_type()==::tyloi::kFloat16,true,request.impl_->core_workspace.dense(),true,addresses);
+            x.scalar_type()==::tyloi::kFloat16,true,request.impl_->core_workspace.dense(),true,addresses,w_->tiled_heads);
         return result[0];
     }
     DenseTensor forward_graph(State& request, const DenseTensor& x,int64_t confirmed,
@@ -257,7 +258,7 @@ class GdnCore {
             auto decoded=gdn_decode_window_cuda(projected[0],projected[1],projected[2].reshape({1,x.size(1),nv_}),
                 projected[3].reshape({1,x.size(1),nv_}),request.conv.dense(),request.recurrent.dense(),weight,w_->dt_bias.dense().to(::tyloi::kFloat32).contiguous(),
                 w_->a_log.dense().to(::tyloi::kFloat32).contiguous(),w_->norm.dense().to(::tyloi::kFloat32).contiguous(),int(nk_),int(nv_),int(confirmed),
-                1e-6,eps_,silu_gate_,x.scalar_type()==::tyloi::kFloat16,true,checkpoint_conv,checkpoint_state);
+                1e-6,eps_,silu_gate_,x.scalar_type()==::tyloi::kFloat16,true,checkpoint_conv,checkpoint_state,w_->tiled_heads);
             request.conv.dense().copy_(decoded[1]);
             return project_output(decoded[0]);
         }
@@ -388,13 +389,13 @@ class GdnCore {
                   if(checkpoint)return gdn_decode_core_checkpoint_cuda(qkv,gate,alpha,beta,previous,request.recurrent.dense(),
                     weight,w_->dt_bias.dense().to(::tyloi::kFloat32).contiguous(),w_->a_log.dense().to(::tyloi::kFloat32).contiguous(),
                     w_->norm.dense().to(::tyloi::kFloat32).contiguous(),nk_,nv_,d_,1e-6,eps_,silu_gate_,
-                    x.scalar_type()==::tyloi::kFloat16,true,request.impl_->core_workspace.dense(),true,checkpoint_conv,checkpoint_state);
+                    x.scalar_type()==::tyloi::kFloat16,true,request.impl_->core_workspace.dense(),true,checkpoint_conv,checkpoint_state,w_->tiled_heads);
                   return gdn_decode_core_cuda(qkv,gate,
                     projections[2].reshape({b,t,nv_}),projections[3].reshape({b,t,nv_}),previous,request.recurrent.dense(),
                     weight,w_->dt_bias.dense().to(::tyloi::kFloat32).contiguous(),w_->a_log.dense().to(::tyloi::kFloat32).contiguous(),
                     w_->norm.dense().to(::tyloi::kFloat32).contiguous(),nk_,nv_,d_,1e-6,eps_,silu_gate_,
                     x.scalar_type()==::tyloi::kFloat16,true,request.impl_->core_workspace.dense(),
-                    [] {const auto value=::tyloi::cuda::options::gdn_inplace_state();return !value || *value;}());
+                    [] {const auto value=::tyloi::cuda::options::gdn_inplace_state();return !value || *value;}(), {}, w_->tiled_heads);
                 };
                 const auto* checkpoint_option=tyloi::cuda::env_lookup("TYLOINFER_MTP_GDN_FUSED_CHECKPOINT");
                 const bool fused_snapshot=checkpoint_conv.defined() && checkpoint_state.defined() &&
@@ -530,15 +531,21 @@ class GdnCore {
                     auto result = ::tyloi::ops::measure("prefill.gdn_recurrence",[&] {
                         const auto short_option=::tyloi::cuda::options::gdn_short_inplace();
                         const auto inplace=::tyloi::cuda::options::gdn_inplace_state();
-                        if(cache && initial.defined() && t<=8 && (!short_option || *short_option) && (!inplace || *inplace))
-                            return (transposed_state_?gdn_inplace_transposed_cuda:gdn_inplace_cuda)(q,k,v,decay,beta,initial);
-                        return (transposed_state_ ? gdn_transposed_cuda : gdn_cuda)(
-                            q, k, v, decay, beta,initial.defined() ? MfqOptional<DenseTensor>(initial) : mfq_nullopt);
+                        if(cache && initial.defined() && t<=8 && (!short_option || *short_option) && (!inplace || *inplace)) {
+                            if (w_->tiled_heads)
+                                return (transposed_state_ ? gdn_inplace_transposed_tiled_cuda : gdn_inplace_tiled_cuda)(q,k,v,decay,beta,initial);
+                            return (transposed_state_ ? gdn_inplace_transposed_cuda : gdn_inplace_cuda)(q,k,v,decay,beta,initial);
+                        }
+                        const auto saved = initial.defined() ? MfqOptional<DenseTensor>(initial) : mfq_nullopt;
+                        if (w_->tiled_heads)
+                            return (transposed_state_ ? gdn_transposed_tiled_cuda : gdn_tiled_cuda)(q,k,v,decay,beta,saved);
+                        return (transposed_state_ ? gdn_transposed_cuda : gdn_cuda)(q,k,v,decay,beta,saved);
                     });
                     attended = result[0];
                     next_state = result[1];
                 } else {
-                    auto ids = ::tyloi::cuda::arange(nv_, options.dtype(::tyloi::kInt64)) / (nv_ / nk_);
+                    auto head_ids = ::tyloi::cuda::arange(nv_, options.dtype(::tyloi::kInt64));
+                    auto ids = w_->tiled_heads ? head_ids.remainder(nk_) : head_ids / (nv_ / nk_);
                     q = q.index_select(1, ids.to(::tyloi::kInt64));
                     k = k.index_select(1, ids.to(::tyloi::kInt64));
                     next_state = initial.defined() ? initial : ::tyloi::cuda::zeros({b, nv_, d_, d_}, options);

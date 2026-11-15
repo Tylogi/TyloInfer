@@ -49,12 +49,15 @@ void validate(const EngineOptions& options) {
         throw std::invalid_argument("Metal expert cache profiles are not supported");
     if (options.continuous_batching)
         throw std::invalid_argument("Metal continuous batching is not supported");
-    if (kv_quantization().enabled())
-        throw std::invalid_argument("Metal KV quantization is not supported");
 }
 
 std::unique_ptr<Engine> assemble(EngineOptions options, Engine* target) {
     validate(options);
+    const auto quantization = kv_quantization();
+    const auto kv_fingerprint = quantization.enabled()
+        ? "tq-v1-k" + std::to_string(quantization.key_bits()) +
+            "v" + std::to_string(quantization.value_bits())
+        : std::string{};
     if (!options.context_size) options.context_size = 32768;
     auto config = resolve_config(options.prefill_chunk_size, options.continuous_batching);
     config.device = options.device;
@@ -87,13 +90,14 @@ std::unique_ptr<Engine> assemble(EngineOptions options, Engine* target) {
             LayerPlacementConfig placement;
             models::LoadOptions policy;
             policy.context = options.context_size;
+            policy.kv_quantization = quantization;
             models::load(model, source, definition, loader, placement, policy);
             state = model->make_state();
             if (model->predictor()) predictor_execution = executor();
             const auto info = model->info();
             sessions = models::make_sessions(*source, config.session_cache, config.prefix_cache,
                 info.max_context, state->supports_text_session_state(),
-                state->supports_paged_text_session_state(), options.device, false, "");
+                state->supports_paged_text_session_state(), options.device, false, kv_fingerprint);
             text = TextProcessor::load(*source, options.tokenizer_model,
                 static_cast<std::int32_t>(info.vocab_size), info.model_type);
             config.stop_token_ids = models::stop_token_ids(definition, info.vocab_size);

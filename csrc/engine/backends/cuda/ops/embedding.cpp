@@ -1,6 +1,6 @@
 #include "backend.h"
 #include "embedding_raw.h"
-#include "engine/weights/row_stage.h"
+#include "engine/backends/cuda/ops/row_stage.h"
 #include "engine/weights/encoding/rows.h"
 #include "engine/backends/cuda/native/memory.h"
 #include <cstdint>
@@ -75,7 +75,7 @@ private:
 };
 }
 
-std::shared_ptr<RowStage> tyloi::weights::make_dense_row_stage(const std::vector<Tensor>& tables,
+std::shared_ptr<RowStage> tyloi::cuda::make_dense_row_stage(const std::vector<Tensor>& tables,
         std::int64_t rows_per_shard, const std::vector<std::int64_t>& shape, Device device) {
     return std::make_shared<DenseRowStage>(tables, rows_per_shard, shape, device);
 }

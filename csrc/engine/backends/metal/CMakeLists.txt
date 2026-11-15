@@ -367,6 +367,8 @@ add_library(mfq-metal-compute OBJECT
     ${PROJECT_SOURCE_DIR}/engine/backends/metal/native/kernel.cpp
     ${TYLOINFER_METAL_ROOT}/kernels/source.cpp
     ${PROJECT_SOURCE_DIR}/backends/metal/runtime/mlx_tensor.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/runtime/mlx_projection_batch.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/models/flash_next/qwen4_ops.cpp
     ${PROJECT_SOURCE_DIR}/backends/metal/runtime/mlx_transformer.cpp
     ${PROJECT_SOURCE_DIR}/backends/metal/storage/mlx_tq_rows.cpp
     ${TYLOINFER_METAL_ROOT}/ops/attention/attention.cpp
@@ -385,6 +387,11 @@ add_library(mfq-metal-compute OBJECT
     ${TYLOINFER_METAL_ROOT}/ops/core.cpp
     ${TYLOINFER_METAL_ROOT}/ops/dispatch.cpp
     ${TYLOINFER_METAL_ROOT}/ops/moe.cpp
+    ${TYLOINFER_METAL_ROOT}/ops/attention/gdn.cpp
+    ${TYLOINFER_METAL_ROOT}/ops/attention/qsa.cpp
+    ${TYLOINFER_METAL_ROOT}/ops/ffn/mixer.cpp
+    ${TYLOINFER_METAL_ROOT}/ops/ffn/ffn.cpp
+    ${TYLOINFER_METAL_ROOT}/ops/ple.cpp
 )
 mfq_configure_metal(mfq-metal-compute)
 
@@ -400,11 +407,13 @@ add_library(mfq-metal-engine STATIC
     ${PROJECT_SOURCE_DIR}/backends/metal/runtime/mlx_expert_segment_cache.cpp
     ${PROJECT_SOURCE_DIR}/engine/load.cpp
     ${TYLOINFER_METAL_ROOT}/load.cpp
+    ${PROJECT_SOURCE_DIR}/engine/models/qwen4_exp/metal.cpp
     ${PROJECT_SOURCE_DIR}/engine/weights/cache_metal.cpp
     ${PROJECT_SOURCE_DIR}/engine/weights/loader_metal.cpp
     ${PROJECT_SOURCE_DIR}/engine/weights/encoding/metal.cpp
     ${PROJECT_SOURCE_DIR}/engine/weights/encoding/rows.cpp
     ${PROJECT_SOURCE_DIR}/engine/weights/row_source.cpp
+    ${PROJECT_SOURCE_DIR}/engine/weights/row_stage_metal.cpp
     ${TYLOINFER_METAL_ROOT}/native/device.cpp
 )
 mfq_configure_metal(mfq-metal-engine)
@@ -447,7 +456,6 @@ add_library(mfq-metal-runtime STATIC
     ${PROJECT_SOURCE_DIR}/backends/metal/models/deepseek_v41/mlx_deepseek_v41_moe.cpp
     ${PROJECT_SOURCE_DIR}/backends/metal/models/deepseek_v41/mlx_deepseek_v41_vision.cpp
     ${PROJECT_SOURCE_DIR}/backends/metal/models/flash_next/mlx_qwen4_causal_lm.cpp
-    ${PROJECT_SOURCE_DIR}/backends/metal/models/flash_next/qwen4_ops.cpp
     ${PROJECT_SOURCE_DIR}/backends/metal/models/minicpmo45/mlx_minicpmo45.cpp
     ${PROJECT_SOURCE_DIR}/backends/metal/models/qwen35/mlx_qwen35_causal_lm.cpp
     ${PROJECT_SOURCE_DIR}/backends/metal/models/qwen35/mlx_qwen35_full_attention.cpp
@@ -460,7 +468,7 @@ add_library(mfq-metal-runtime STATIC
     ${PROJECT_SOURCE_DIR}/backends/metal/models/nemotron_h/mlx_nemotron_h_ops.cpp
     ${PROJECT_SOURCE_DIR}/backends/metal/models/nemotron_h/mlx_nemotron_h_vision.cpp
     ${PROJECT_SOURCE_DIR}/backends/metal/models/nemotron_h/nemotron_h_model.cpp
-    ${PROJECT_SOURCE_DIR}/backends/metal/runtime/mlx_projection_batch.cpp
+    ${PROJECT_SOURCE_DIR}/backends/metal/runtime/mlx_projection_batch_norm.cpp
     ${PROJECT_SOURCE_DIR}/backends/metal/runtime/mlx_tq_expert_cache_load.cpp
     ${PROJECT_SOURCE_DIR}/backends/metal/runtime/mlx_expert_segment_cache_load.cpp
     ${TYLOINFER_METAL_ROOT}/ops/tq/mlx_tq_load.cpp

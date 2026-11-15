@@ -84,6 +84,8 @@ struct Config {
     ContinuousBatchConfig continuous_batch;
 };
 
+/** Read a runtime option using the active backend's configuration lifetime. */
+const char* environment_value(const char* name);
 std::uint64_t environment_uint64(const char* name, std::uint64_t fallback);
 bool environment_enabled(const char* name, bool fallback = true);
 /** Resolve runtime settings; zero prefill size selects automatic chunking. */

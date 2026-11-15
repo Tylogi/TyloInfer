@@ -1,6 +1,5 @@
 #include "mlx_projection_batch.h"
 #include "mlx_kernel_prepare.h"
-#include "mlx_transformer.h"
 #include "mlx_moe_ops.h"
 #include "mlx_gguf_staged.h"
 #include "engine/backends/metal/ops/gguf/native/mlx_native_gguf.h"
@@ -209,14 +208,7 @@ std::vector<array> MlxProjectionBatch::operator()(
     return project(input, std::nullopt);
 }
 
-std::vector<array> MlxProjectionBatch::forward_normalized(
-    const array& input, const MlxRmsNorm& norm) const {
-    const bool bfloat_consumers = input.dtype() == mlx::core::float16 && input.ndim() >= 2 &&
-        input.shape(-1) == norm.width() && input.size() / std::size_t(norm.width()) <= 8 &&
-        impl_->bfloat_input;
-    if (bfloat_consumers) return project(norm(input, mlx::core::bfloat16), input.dtype());
-    return (*this)(norm(input));
-}
+bool MlxProjectionBatch::bfloat_input() const noexcept { return impl_->bfloat_input; }
 
 std::vector<array> MlxProjectionBatch::project(
     const array& input, std::optional<Dtype> native_output_dtype) const {

@@ -2,6 +2,7 @@
 
 #include "engine/models/causal_model.h"
 #include "engine/models/qwen35/load.h"
+#include "engine/models/qwen4_exp/load.h"
 #include "engine/models/source.h"
 #include "engine/models/source/model_graph.h"
 
@@ -11,7 +12,6 @@
 #include "engine/models/nemotron_h/load.h"
 #include "engine/models/minicpmo45/text/load.h"
 #include "engine/models/minicpmo45/model.h"
-#include "engine/models/qwen4_exp/load.h"
 #endif
 
 #include <stdexcept>
@@ -48,13 +48,13 @@ void load(
                 cpu_layers, !options.cpu_offload_layers.empty(), options.vision_resident, false);
         return;
     }
+    if (model_graph.backbone == "qwen4_exp") {
+        qwen4_exp::load(owner, std::move(source), definition, weights, placement, options);
+        return;
+    }
 #if TYLOINFER_HAS_CUDA
     if (model_graph.backbone == "deepseek_v41") {
         ::tyloi::cuda::deepseek_v41::load(owner, std::move(source), definition, weights, placement, options);
-        return;
-    }
-    if (model_graph.backbone == "qwen4_exp") {
-        ::tyloi::cuda::qwen4_exp::load(owner, std::move(source), definition, weights, placement, options);
         return;
     }
     if (model_graph.backbone == "nemotron_h") {

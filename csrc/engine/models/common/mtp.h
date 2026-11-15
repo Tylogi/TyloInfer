@@ -35,6 +35,11 @@ struct Mtp {
         return {};
     }
     virtual void reset(MtpState& state, int64_t batch = 1) const = 0;
+    // Additional predictor state backing required by the next step or prefill.
+    virtual std::vector<std::pair<Device, std::size_t>> growth(
+            const MtpState&, const Tensor&, const Tensor&, const Tensor&, const ForwardOptions&) const {
+        return {};
+    }
     virtual MtpStep step(
         MtpState& state,
         const Tensor& previous_hidden,

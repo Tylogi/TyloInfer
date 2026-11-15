@@ -283,9 +283,9 @@ int run_flash_next_mtp_check(Program& program) {
     }
     const auto previous = work.keep(::tyloi::ops::reshape(work.keep(::tyloi::ops::tensor(work.previous_values, device)), {1, 7, width}));
     const auto reset = [&] { program.drain(); mtp->reset(predictor, 1); };
-    auto* qwen = dynamic_cast<qwen4_exp::Predictor*>(mtp);
+    auto* qwen = dynamic_cast<::tyloi::models::qwen4_exp::Predictor*>(mtp);
     auto* glm = dynamic_cast<glm5_next::Mtp*>(mtp);
-    auto* qwen_state = dynamic_cast<qwen4_exp::PredictorState*>(&predictor);
+    auto* qwen_state = dynamic_cast<::tyloi::models::qwen4_exp::PredictorState*>(&predictor);
     auto* glm_state = dynamic_cast<glm5_next::PredictorState*>(&predictor);
     if ((multi_axis && (!qwen || !qwen_state)) || (!multi_axis && (!glm || !glm_state)))
         throw std::runtime_error("Flash-Next predictor state does not match its model");

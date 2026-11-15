@@ -10,6 +10,18 @@
 namespace tyloi::weights {
 class Cache;
 
+// Keep allocations made in this scope outside borrowed expert workspace.
+class Resident {
+public:
+    Resident();
+    ~Resident();
+    Resident(const Resident&) = delete;
+    Resident& operator=(const Resident&) = delete;
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
 class KvRegion {
 public:
     KvRegion() noexcept;

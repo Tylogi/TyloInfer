@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <optional>
 #include <utility>
@@ -202,8 +203,10 @@ Tensor Qsa::forward_graph(State& state, const Tensor& hidden, const Tensor& posi
 struct Qsa::Graph::Impl {
     std::vector<Request> requests;
     std::vector<Row> rows;
-    bool independent, admitted = false, clear = false, hidden = false, laid_out = false;
-    std::int64_t tokens = 0;
+    bool independent, admitted = false, materialized = false, clear = false, hidden = false, laid_out = false;
+    std::int64_t tokens = 0, required = 0;
+    std::shared_ptr<cuda::KvMemoryManager> manager;
+    std::vector<std::pair<Device, std::size_t>> unmanaged_growth;
     Impl(std::vector<Request> values, bool batch)
         : requests(std::move(values)), rows(requests.size()), independent(batch) {}
 };
@@ -242,31 +245,56 @@ void Qsa::Graph::admit(std::int64_t tokens, std::int64_t previous_capacity, bool
     if (plan.admitted) throw std::logic_error("QSA graph plan was already admitted");
     if (plan.independent) {
         if (tokens != 1) throw std::invalid_argument("independent QSA graph requires one token");
-        std::int64_t required = 0;
-        for (const auto& request : plan.requests) required = std::max(required, request.position + 1);
-        if (auto manager = cuda::Executor::current().kv_memory()) manager->ensure(required);
+        for (const auto& request : plan.requests) {
+            TYLOINFER_RUNTIME_CHECK(request.position >= 0 && request.maximum > 0 && request.position < request.maximum,
+                "Flash-Next batch graph exceeds max_context");
+            plan.required = std::max(plan.required, request.position + 1);
+        }
+        plan.manager = cuda::Executor::current().kv_memory();
     } else {
         if (plan.requests.size() != 1) throw std::invalid_argument("single QSA graph requires one request");
         const auto& request = plan.requests.front();
         TYLOINFER_RUNTIME_CHECK(tokens > 0 && request.position >= 0 && request.maximum > 0 &&
             request.position <= request.maximum && tokens <= request.maximum - request.position,
             "Qwen4 graph exceeds context capacity");
-        const auto required = request.position + tokens;
+        plan.required = request.position + tokens;
         auto capacity = previous_capacity;
         if (!request.layers.empty()) {
             const auto& first = request.layers.front();
             if (first.first->graph_capacity(*first.second)) {
-                if (auto manager = cuda::Executor::current().kv_memory()) manager->ensure(required);
+                plan.manager = cuda::Executor::current().kv_memory();
                 capacity = first.first->graph_capacity(*first.second);
             }
         }
         plan.rows.front().capacity = capacity;
-        plan.clear = required > capacity;
+        plan.clear = plan.required > capacity;
     }
     plan.tokens = tokens;
     plan.hidden = hidden;
     plan.admitted = true;
     plan.laid_out = !plan.independent && !plan.clear;
+}
+std::vector<std::pair<Device, std::size_t>> Qsa::Graph::growth() const {
+    const auto& plan = *impl_;
+    if (!plan.admitted) throw std::logic_error("QSA graph plan is not admitted");
+    auto result = plan.manager ? plan.manager->growth(plan.required) : std::vector<std::pair<Device, std::size_t>>{};
+    for (const auto& [device, bytes] : plan.unmanaged_growth) {
+        auto entry = std::find_if(result.begin(), result.end(), [&](const auto& item) { return item.first == device; });
+        if (entry == result.end()) result.emplace_back(device, bytes);
+        else {
+            if (bytes > std::numeric_limits<std::size_t>::max() - entry->second)
+                throw std::overflow_error("QSA graph growth overflow");
+            entry->second += bytes;
+        }
+    }
+    return result;
+}
+void Qsa::Graph::materialize() {
+    auto& plan = *impl_;
+    if (!plan.admitted) throw std::logic_error("QSA graph plan is not admitted");
+    if (plan.materialized) throw std::logic_error("QSA graph plan was already materialized");
+    if (plan.manager) plan.manager->ensure(plan.required);
+    plan.materialized = true;
 }
 bool Qsa::Graph::clear_required() const {
     if (!impl_->admitted) throw std::logic_error("QSA graph plan is not admitted");
@@ -292,6 +320,7 @@ void Qsa::Graph::layout() {
         return;
     }
     const auto batch = static_cast<std::int64_t>(plan.requests.size());
+    plan.unmanaged_growth.clear();
     for (std::size_t i = 0; i < plan.requests.size(); ++i) {
         const auto& request = plan.requests[i];
         const auto required = request.position + 1;
@@ -308,7 +337,25 @@ void Qsa::Graph::layout() {
         auto& row = plan.rows[i];
         row.capacity = capacity;
         row.growth = 0;
-        for (const auto& layer : request.layers) row.growth += layer.first->graph_growth_bytes(*layer.second, capacity);
+        for (const auto& layer : request.layers) {
+            // Managed mappings are planned once through the manager, which can
+            // also own allocations outside this batch.
+            if (layer.first->managed_memory(*layer.second)) continue;
+            const auto bytes = layer.first->graph_growth_bytes(*layer.second, capacity);
+            if (bytes > std::numeric_limits<std::size_t>::max() - row.growth)
+                throw std::overflow_error("QSA graph row growth overflow");
+            row.growth += bytes;
+            if (!bytes) continue;
+            const auto device = layer.first->impl_->device;
+            auto entry = std::find_if(plan.unmanaged_growth.begin(), plan.unmanaged_growth.end(),
+                                      [&](const auto& item) { return item.first == device; });
+            if (entry == plan.unmanaged_growth.end()) plan.unmanaged_growth.emplace_back(device, bytes);
+            else {
+                if (bytes > std::numeric_limits<std::size_t>::max() - entry->second)
+                    throw std::overflow_error("QSA graph growth overflow");
+                entry->second += bytes;
+            }
+        }
     }
     plan.laid_out = true;
 }
@@ -317,7 +364,8 @@ const std::vector<Qsa::Graph::Row>& Qsa::Graph::rows() const {
     return impl_->rows;
 }
 void Qsa::Graph::prepare(std::size_t request_index, std::size_t qsa_index, const Tensor& positions) const {
-    if (!impl_->admitted || !impl_->laid_out) throw std::logic_error("QSA graph layout is not ready");
+    if (!impl_->admitted || !impl_->laid_out || !impl_->materialized)
+        throw std::logic_error("QSA graph layout is not materialized");
     const auto& request = impl_->requests.at(request_index);
     const auto& layer = request.layers.at(qsa_index);
     layer.first->prepare_graph(*layer.second, positions, impl_->rows.at(request_index).capacity);

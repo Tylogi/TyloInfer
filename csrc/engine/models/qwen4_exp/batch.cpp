@@ -1,5 +1,6 @@
 #include "engine/models/qwen4_exp/batch.h"
 #include "engine/models/qwen4_exp/ops.h"
+#include "engine/models/qwen4_exp/cuda.h"
 #include "engine/backends/cuda/executor/executor.h"
 #include "components/error.h"
 
@@ -7,12 +8,12 @@
 #include <stdexcept>
 #include <utility>
 
-namespace tyloi::cuda::qwen4_exp {
+namespace tyloi::models::qwen4_exp {
 namespace {
 
 class Request final : public models::BatchState {
 public:
-    explicit Request(Model& model) : state(model), device(kCUDA, model.primary_device) {}
+    explicit Request(Model& model) : state(model), device(model.device) {}
     std::int64_t position() const override { return state.position(); }
     std::size_t resident_bytes() const override { return state.resident_bytes(); }
     models::BatchGrowth initial_growth_bytes() const override { return {{device, state.initial_growth_bytes()}}; }
@@ -38,7 +39,7 @@ class Batch final : public models::Batch {
     struct GraphPlan final : Plan { Qwen4BatchDecodeGraph::Plan layout; };
 public:
     Batch(Model& model, const models::BatchConfig& config)
-        : model_(model), device_(kCUDA, model.primary_device) {
+        : model_(model), device_(model.device) {
         TYLOINFER_RUNTIME_CHECK(config.slots > 0 && config.slots <= 32,
             "Flash-Next continuous batching supports 1..32 requests");
         if (config.graph) graph_ = std::make_unique<Qwen4BatchDecodeGraph>(model_);
@@ -66,18 +67,24 @@ public:
     }
     Tensor decode(std::span<const models::BatchRow> rows, Tensor ids, const Tensor& host_ids) override {
         auto requests = active(rows);
-        auto policy = Executor::current_ffn();
+        auto policy = cuda::Executor::current_ffn();
         policy.batch_serial = requests.size() > 8;
-        auto scope = Executor::current().enter(policy);
+        auto scope = cuda::Executor::current().enter(policy);
         return qwen4_batch_decode(model_, requests, std::move(ids), host_ids);
     }
     StepSequence<std::unique_ptr<Plan>> plan(std::span<const models::BatchRow> rows, bool greedy) override {
         if (!graph_) co_return;
         co_yield GraphPhase::ready;
-        auto layout = graph_->plan(active(rows), greedy);
+        auto job = graph_->plan(active(rows), greedy);
+        std::optional<Qwen4BatchDecodeGraph::Plan> layout;
+        while (auto step = job.next()) {
+            if (step.graph) co_yield *step.graph;
+            else if (step.value) layout = std::move(*step.value);
+            else co_yield step.state;
+        }
         if (!layout) co_return;
         auto plan = std::make_unique<GraphPlan>();
-        plan->growth = {{device_, layout->growth}};
+        plan->growth = layout->growth;
         plan->rebuild = layout->rebuild;
         plan->layout = std::move(*layout);
         co_yield std::unique_ptr<Plan>(std::move(plan));
@@ -93,9 +100,9 @@ public:
         for (;;) {
             StepResult<Tensor> step;
             {
-                auto policy = Executor::current_ffn();
+                auto policy = cuda::Executor::current_ffn();
                 policy.batch_serial = requests.size() > 8;
-                auto scope = Executor::current().enter(policy);
+                auto scope = cuda::Executor::current().enter(policy);
                 step = job.next();
             }
             if (!step) break;

@@ -215,10 +215,13 @@ struct MtpOps {
     models::MtpStep predictor_step(Tensor hidden, Tensor ids, Tensor positions) {
         auto predictor_options = options;
         predictor_options.serial_experts = false;
+        budget.reserve(mtp.growth(predictor, hidden, ids, positions, predictor_options));
         models::MtpStep result;
         {
             auto scope = ops::dense_scope(&predictor_execution, device);
+            hidden = ops::copy(hidden, device);
             result = mtp.step(predictor, hidden, ids, positions, predictor_options);
+            predictor_execution.submit(predictor.storage());
             const std::array<Tensor, 3> outputs{result.sample_hidden, result.chain_hidden, result.sample_logits};
             predictor_execution.submit(outputs);
         }
@@ -237,16 +240,18 @@ struct MtpOps {
     std::size_t predictor_parked_history_flush_threshold() const { return mtp.predictor_parked_history_flush_threshold(); }
     double end_predictor_prefill() { weights.prepare(weights::Cache::Stage::decode, device, source); return 0; }
     double predictor_prefill(Tensor hidden, Tensor ids, Tensor positions) {
+        auto predictor_options = options;
+        predictor_options.serial_experts = false;
+        budget.reserve(mtp.growth(predictor, hidden, ids, positions, predictor_options));
         auto scope = ops::dense_scope(&predictor_execution, device);
         auto timer = predictor_execution.timer();
         weights::Loan workspace(weights);
         const auto bytes = mtp.prefill_workspace_bytes(ids.size(1));
         if (bytes) workspace.begin(bytes);
         hidden = ops::copy(hidden, device);
-        auto predictor_options = options;
-        predictor_options.serial_experts = false;
         models::MtpStep result;
         result = mtp.prefill(predictor, hidden, ids, positions, predictor_options);
+        predictor_execution.submit(predictor.storage());
         timer->stop({result.sample_hidden, result.chain_hidden, result.sample_logits});
         const auto elapsed = timer->elapsed_ms();
         if (bytes) workspace.finish();

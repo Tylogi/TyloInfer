@@ -375,6 +375,7 @@ struct ExpertSpec {
     Tensor shared_gate, latent_in, latent_out;
     double swiglu_limit = 0;
     int layer = -1;
+    bool source_precision_gate = false;
 };
 struct RoutedExperts { Tensor values, shared_logits; bool reduced = false; };
 // Flat F16 input and matching F32 input; the batch owns selected bank/route preparation.

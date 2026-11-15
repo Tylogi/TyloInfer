@@ -4,6 +4,7 @@
 #include "engine/state/kv_offload.h"
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace tyloi::engine { class Budget; }
@@ -57,6 +58,8 @@ public:
         const ::tyloi::TensorOptions& options,int64_t selected_columns=0);
     // Cache outlives the manager and its allocations; call before expert arenas.
     void finalize(tyloi::weights::Cache& cache, std::size_t minimum_experts = 0);
+    // Report the missing mappings for all live allocations without changing them.
+    std::vector<std::pair<tyloi::Device, std::size_t>> growth(int64_t tokens) const;
     void ensure(int64_t tokens);
     void bind_budget(tyloi::engine::Budget* budget) { budget_ = budget; }
     std::shared_ptr<KvOffloadStore> offload() const { return offload_; }

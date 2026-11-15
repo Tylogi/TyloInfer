@@ -54,7 +54,7 @@ static std::vector<::tyloi::DenseTensor> gdn_cuda_impl(
         ? state->contiguous() : ::tyloi::DenseTensor{};
     const auto* col_env=tyloi::cuda::env_lookup("TYLOINFER_GDN_COLUMN");
     const auto* warp_env=tyloi::cuda::env_lookup("TYLOINFER_GDN_WARP");
-    const bool warp=transposed_state || !(warp_env && warp_env[0]=='0');
+    const bool warp=tiled_heads || transposed_state || !(warp_env && warp_env[0]=='0');
     const auto* columns_env=tyloi::cuda::env_lookup("TYLOINFER_GDN_PREFILL_COLUMNS");
     const int columns=columns_env?std::atoi(columns_env):(B*Hv>=16?(T==2?2:4):0);
     const auto* short_option=tyloi::cuda::env_lookup("TYLOINFER_GDN_SHORT_COLUMNS");
@@ -132,6 +132,18 @@ std::vector<::tyloi::DenseTensor> gdn_inplace_transposed_tiled_cuda(
     return gdn_cuda_impl(q, k, v, g, beta, state, true, true, true);
 }
 
+std::vector<::tyloi::DenseTensor> gdn_tiled_cuda(
+    ::tyloi::DenseTensor q, ::tyloi::DenseTensor k, ::tyloi::DenseTensor v,
+    ::tyloi::DenseTensor g, ::tyloi::DenseTensor beta, MfqOptional<::tyloi::DenseTensor> state) {
+    return gdn_cuda_impl(q, k, v, g, beta, state, false, false, true);
+}
+
+std::vector<::tyloi::DenseTensor> gdn_transposed_tiled_cuda(
+    ::tyloi::DenseTensor q, ::tyloi::DenseTensor k, ::tyloi::DenseTensor v,
+    ::tyloi::DenseTensor g, ::tyloi::DenseTensor beta, MfqOptional<::tyloi::DenseTensor> state) {
+    return gdn_cuda_impl(q, k, v, g, beta, state, false, true, true);
+}
+
 static std::vector<::tyloi::DenseTensor> gdn_decode_core_impl(
     ::tyloi::DenseTensor qkv,::tyloi::DenseTensor output_gate,
     ::tyloi::DenseTensor alpha,::tyloi::DenseTensor beta,
@@ -142,7 +154,7 @@ static std::vector<::tyloi::DenseTensor> gdn_decode_core_impl(
     double convolution_eps,double norm_eps,bool silu_gate,bool output_half,
     bool transposed_state,::tyloi::DenseTensor workspace,bool inplace_state,
     ::tyloi::DenseTensor state_addresses,
-    ::tyloi::DenseTensor checkpoint_convolution={},::tyloi::DenseTensor checkpoint_recurrent={}) {
+    ::tyloi::DenseTensor checkpoint_convolution={},::tyloi::DenseTensor checkpoint_recurrent={},bool tiled_heads=false) {
     constexpr int threads=256;
     const int tiles=[] {
         const char* value=tyloi::cuda::env_lookup("TYLOINFER_GDN_DECODE_TILES");
@@ -230,6 +242,7 @@ static std::vector<::tyloi::DenseTensor> gdn_decode_core_impl(
     args.gate_half=alpha.scalar_type()==::tyloi::kFloat16;args.transposed=transposed_state;args.inplace_conv=inplace_conv;
     args.fixed_geometry=!fixed || fixed[0]!='0';args.warp_reductions=!reductions || reductions[0]!='0';
     args.probe=tyloi::cuda::env_lookup("TYLOINFER_GDN_PROBE_RESOURCES")!=nullptr;
+    args.tiled=tiled_heads;
     args.alpha_stride0=alpha.stride(0);args.alpha_stride2=alpha.stride(2);
     args.beta_stride0=beta.stride(0);args.beta_stride2=beta.stride(2);
     args.qkv_stride0=qkv.stride(0);args.gate_stride0=output_gate.stride(0);
@@ -247,9 +260,10 @@ std::vector<::tyloi::DenseTensor> gdn_decode_core_cuda(
     double convolution_eps, double norm_eps, bool silu_gate, bool output_half,
     bool transposed_state,
     ::tyloi::DenseTensor workspace,bool inplace_state,
-    ::tyloi::DenseTensor state_addresses) {
+    ::tyloi::DenseTensor state_addresses,bool tiled_heads,bool quantize_output) {
+    TYLOINFER_RUNTIME_CHECK(!quantize_output, "JIT GDN quantized output is unsupported");
     return gdn_decode_core_impl(qkv,output_gate,alpha,beta,convolution_state,recurrent_state,convolution_weight,dt_bias,a_log,norm_weight,
-        key_heads,value_heads,width,convolution_eps,norm_eps,silu_gate,output_half,transposed_state,workspace,inplace_state,state_addresses);
+        key_heads,value_heads,width,convolution_eps,norm_eps,silu_gate,output_half,transposed_state,workspace,inplace_state,state_addresses,{}, {},tiled_heads);
 }
 
 std::vector<::tyloi::DenseTensor> gdn_decode_core_checkpoint_cuda(
@@ -263,7 +277,8 @@ std::vector<::tyloi::DenseTensor> gdn_decode_core_checkpoint_cuda(
     bool transposed_state,
     ::tyloi::DenseTensor workspace,bool inplace_state,
     ::tyloi::DenseTensor checkpoint_convolution,
-    ::tyloi::DenseTensor checkpoint_recurrent) {
+    ::tyloi::DenseTensor checkpoint_recurrent,bool tiled_heads,bool quantize_output) {
+    TYLOINFER_RUNTIME_CHECK(!quantize_output, "JIT GDN quantized output is unsupported");
     return gdn_decode_core_impl(qkv,output_gate,alpha,beta,convolution_state,recurrent_state,convolution_weight,dt_bias,a_log,norm_weight,
-        key_heads,value_heads,width,convolution_eps,norm_eps,silu_gate,output_half,transposed_state,workspace,inplace_state,{},checkpoint_convolution,checkpoint_recurrent);
+        key_heads,value_heads,width,convolution_eps,norm_eps,silu_gate,output_half,transposed_state,workspace,inplace_state,{},checkpoint_convolution,checkpoint_recurrent,tiled_heads);
 }

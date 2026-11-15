@@ -15,6 +15,7 @@ struct GdnWeights {
     std::vector<Tensor> input_projection;
     Tensor output, conv, dt_bias, a_log, norm;
     std::size_t qkv_count = 1;
+    bool tiled_heads = false;
 };
 
 /** Own gated delta network numerical policy and execute against request state. */
@@ -52,7 +53,7 @@ public:
     /** Freeze numerical policy for the supplied weights, recurrence geometry and execution target. */
     Gdn(GdnWeights weights, std::int64_t key_heads, std::int64_t value_heads,
         std::int64_t width, std::int64_t kernel, double eps, bool silu_gate,
-        Device target = Device(kCUDA, 0));
+        Device target);
     ~Gdn();
     Gdn(Gdn&&) noexcept;
     Gdn& operator=(Gdn&&) noexcept;

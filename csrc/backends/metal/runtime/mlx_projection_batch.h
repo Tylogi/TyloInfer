@@ -44,6 +44,7 @@ public:
         std::size_t count) const noexcept;
 
 private:
+    bool bfloat_input() const noexcept;
     std::vector<mlx::core::array> project(
         const mlx::core::array& input,
         std::optional<mlx::core::Dtype> native_output_dtype) const;

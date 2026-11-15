@@ -40,6 +40,8 @@ public:
     MtpState& operator=(const MtpState&) = delete;
     bool belongs_to(const Mtp& model) const noexcept { return model_ == &model; }
     virtual std::int64_t position() const noexcept = 0;
+    // Retained lazy state roots to submit before releasing the execution scope.
+    virtual std::vector<Tensor> storage() const { return {}; }
     virtual std::unique_ptr<Restore> prepare_restore(const ::MtpSessionState& snapshot);
 private:
     const Mtp* model_;

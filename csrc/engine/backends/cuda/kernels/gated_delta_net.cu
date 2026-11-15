@@ -412,7 +412,7 @@ static std::vector<::tyloi::DenseTensor> gdn_cuda_impl(
 
     const char* col_env = tyloi::cuda::env_lookup("TYLOINFER_GDN_COLUMN");
     const char* warp_env = tyloi::cuda::env_lookup("TYLOINFER_GDN_WARP");
-    bool use_warp = transposed_state || !(warp_env && warp_env[0] == '0');
+    bool use_warp = tiled_heads || transposed_state || !(warp_env && warp_env[0] == '0');
     const char* columns_env = tyloi::cuda::env_lookup("TYLOINFER_GDN_PREFILL_COLUMNS");
     const int columns = columns_env ? std::atoi(columns_env) : (B * Hv >= 16 ? (T==2?2:4) : 0);
     const auto* short_option=tyloi::cuda::env_lookup("TYLOINFER_GDN_SHORT_COLUMNS");

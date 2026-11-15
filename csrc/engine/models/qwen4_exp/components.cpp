@@ -2,7 +2,6 @@
 #include "engine/models/qwen4_exp/components.h"
 
 #include "engine/models/load.h"
-#include "engine/backends/cuda/executor/executor.h"
 #include "engine/models/source/model_config.h"
 #include "engine/models/qwen4_exp/ops.h"
 #include "engine/models/qwen4_exp/predictor.h"
@@ -12,7 +11,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace tyloi::cuda::qwen4_exp {
+namespace tyloi::models::qwen4_exp {
 
 Model::Model() = default;
 Model::~Model() = default;
@@ -21,10 +20,10 @@ Model& Model::operator=(Model&&) noexcept = default;
 
 tyloi::models::Info Model::info() const {
     auto result = tyloi::models::Info{metadata.vocab_size, config.maximum, "qwen4_exp",
-        std::size_t(metadata.hidden_size) * sizeof(float) * 8, true, true};
-    result.streamed_kv = std::any_of(layers.begin(), layers.end(),
+        std::size_t(metadata.hidden_size) * sizeof(float) * 8, device.is_cuda(), device.is_cuda()};
+    result.streamed_kv = device.is_cuda() && std::any_of(layers.begin(), layers.end(),
         [](const auto& layer) { return bool(layer->qsa); });
-    result.graph = tyloi::models::GraphOwner::model;
+    result.graph = device.is_cuda() ? tyloi::models::GraphOwner::model : tyloi::models::GraphOwner::executor;
     result.graph_weights = tyloi::models::GraphWeights::native;
     result.raw_row_bytes = std::size_t(metadata.hidden_size) * metadata.hc_mult * sizeof(std::uint16_t);
     return result;
@@ -35,7 +34,7 @@ MfqModelCapabilities Model::capabilities() const {
     const auto state = ::tyloi::models::component_state(graph, plan, vision, predictor() != nullptr);
     const auto caps = ::tyloi::models::runtime_capabilities(graph, plan, state, vision, false);
     return {graph.architecture, caps.text, caps.image_input, caps.video_input,
-        caps.audio_input, caps.audio_output, caps.full_duplex, caps.mtp, "model-graph+cuda-adapters"};
+        caps.audio_input, caps.audio_output, caps.full_duplex, caps.mtp, "model-graph+adapters"};
 }
 
 tyloi::engine::Metrics Model::metrics() const {
@@ -63,29 +62,33 @@ tyloi::StepSequence<tyloi::models::Prepared> Model::prepare(
     if (!state || !state->belongs_to(*this))
         throw std::invalid_argument("Qwen4 state belongs to a different model");
     if (!parts) throw std::invalid_argument("model has no multimodal component");
-    return parts->prepare(*this, state->images, primary_device, tokens, media);
+    return parts->prepare(*this, state->images, device, tokens, media);
 }
 
-tyloi::engine::Metrics Components::profile_metrics(const Model& language, const State& state) const {
-    return qwen4_decode_graph_profile_metrics(language, state);
+tyloi::engine::Metrics Components::profile_metrics(const Model&, const State& state) const {
+    return state.graph_registry ? state.graph_registry->metrics() : tyloi::engine::Metrics{};
 }
 
-std::optional<tyloi::engine::Metrics> Components::memory_metrics(const Model& language, const State& state) const {
-    return qwen4_cache_memory_metrics(language, state, mtp.get());
+std::optional<tyloi::engine::Metrics> Components::memory_metrics(const Model&, const State& state) const {
+    auto result = state.metrics();
+    std::erase_if(result, [](const auto& entry) {
+        return entry.first == "decode_graph_count" || entry.first.starts_with("cuda_graph_profile_");
+    });
+    return result;
 }
 
 tyloi::StepSequence<tyloi::models::Prepared> Components::prepare(
         const Model& language, tyloi::cache::Media& images,
-        int primary,
+        Device device,
         const std::vector<int64_t>& tokens, const MfqMultimodalInput& media) const {
     if (grid_vision) return grid_vision->prepare(
-        language, images, tyloi::Device(tyloi::kCUDA, primary), tokens, media);
+        language, images, device, tokens, media);
     throw std::invalid_argument("model has no multimodal component");
 }
 
 void load_components(
         Components& result,
-        tyloi::cuda::qwen4_exp::Model& model,
+        Model& model,
         const tyloi::weights::Loader& weights,
         bool load_optional_components, const tyloi::models::LoadOptions& load_options) {
     if (!load_optional_components) return;
@@ -136,14 +139,14 @@ void load_components(
     TYLOINFER_RUNTIME_CHECK(
         model.supports_speculation(),
         "invalid Flash-Next predictor model");
-    auto predictor = tyloi::cuda::qwen4_exp::Predictor::load_if_present(
+    auto predictor = Predictor::load_if_present(
         weights, load_options, model.config, model.embed, model.lm_head,
         model.metadata.final_logit_softcapping);
     if (predictor) {
         result.mtp =
-            std::make_unique<tyloi::cuda::qwen4_exp::Predictor>(
+            std::make_unique<Predictor>(
                 std::move(*predictor));
     }
 }
 
-} // namespace tyloi::cuda::qwen4_exp
+} // namespace tyloi::models::qwen4_exp

@@ -13,7 +13,7 @@
 namespace tyloi::weights { struct Loader; }
 namespace tyloi::models { struct LoadOptions; }
 
-namespace tyloi::cuda::qwen4_exp {
+namespace tyloi::models::qwen4_exp {
 
 struct Model;
 class State;
@@ -28,7 +28,7 @@ struct Components {
     /** Prepare supported media using the request's cache and model weights. */
     tyloi::StepSequence<tyloi::models::Prepared> prepare(
         const Model& language, tyloi::cache::Media& images,
-        int primary,
+        Device device,
         const std::vector<int64_t>& tokens, const MfqMultimodalInput& media) const;
 };
 
@@ -36,4 +36,4 @@ struct Components {
 void load_components(Components& result, Model& model, const tyloi::weights::Loader& weights,
     bool load_optional_components, const tyloi::models::LoadOptions& options);
 
-} // namespace tyloi::cuda::qwen4_exp
+} // namespace tyloi::models::qwen4_exp

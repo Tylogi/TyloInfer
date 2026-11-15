@@ -1,4 +1,5 @@
 #include "engine/weights/cache.h"
+#include "engine/weights/workspace.h"
 #include "engine/budget.h"
 #include "engine/backends/metal/ops/moe.h"
 #include "engine/weights/encoding/mlx_affine.h"
@@ -21,6 +22,10 @@
 #include <utility>
 
 namespace tyloi::weights {
+
+struct Resident::Impl {};
+Resident::Resident() : impl_(std::make_unique<Impl>()) {}
+Resident::~Resident() = default;
 
 struct Cache::Resources {
     struct Group {

@@ -167,6 +167,9 @@ Tensor Loader::rows(const std::string& name) const {
     if (require_tensor(source, name).dtype == "NINT")
         return std::make_shared<Rows>(load_nint_rows(source, name));
 #endif
+    const auto& dtype = require_tensor(source, name).dtype;
+    if (dtype == "F32" || dtype == "F16" || dtype == "BF16")
+        return load_dense_rows(source, name);
     return weight(name);
 }
 Tensor Loader::dense(const std::string& name) const {

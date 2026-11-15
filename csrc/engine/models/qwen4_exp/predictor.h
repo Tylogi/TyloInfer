@@ -2,17 +2,14 @@
 
 #include "engine/models/common/mtp.h"
 #include "engine/models/session/snapshot.h"
-#include "engine/models/common/attention_ops.h"
 #include "engine/models/qwen4_exp/config.h"
 
-namespace tyloi::cuda { class KvOffloadStore; class KvMemoryManager; }
 namespace tyloi::weights { struct Loader; }
 namespace tyloi::models { struct LoadOptions; }
 
 namespace tyloi::ops { class Residual; }
 
-namespace tyloi::cuda::qwen4_exp {
-using attention_ops::Linear;
+namespace tyloi::models::qwen4_exp {
 struct Layer;
 struct LayerState;
 struct Predictor;
@@ -21,6 +18,7 @@ struct PredictorState final : tyloi::models::MtpState {
     explicit PredictorState(const Predictor& owner, bool initialize_layers = true);
     ~PredictorState() override;
     int64_t position() const noexcept override;
+    std::vector<Tensor> storage() const override;
     std::unique_ptr<tyloi::models::Restore> prepare_restore(const MtpSessionState&) override;
 
     const Predictor& owner;
@@ -31,12 +29,10 @@ struct PredictorState final : tyloi::models::MtpState {
 };
 
 struct Predictor final : tyloi::models::Mtp {
-    using DenseTensor = ::tyloi::DenseTensor;
-
     tyloi::models::qwen4_exp::Config config;
     ::tyloi::Tensor embedding, output;
     double softcap = 0;
-    int primary = 0;
+    ::tyloi::Device device;
     ::tyloi::Tensor embedding_norm, hidden_norm;
     ::tyloi::Tensor embedding_fusion, hidden_fusion;
     std::unique_ptr<tyloi::ops::Residual> final_mixer;
@@ -53,22 +49,25 @@ struct Predictor final : tyloi::models::Mtp {
                                                       ::tyloi::Tensor embedding, ::tyloi::Tensor output,
                                                       double softcap);
 
-    DenseTensor embed(DenseTensor ids) const;
-    DenseTensor logits(DenseTensor hidden) const;
+    Tensor embed(Tensor ids) const;
+    Tensor logits(Tensor hidden) const;
 
     std::unique_ptr<tyloi::models::MtpState> make_state() const override;
     void reset(tyloi::models::MtpState&, int64_t next_batch = 1) const override;
+    std::vector<std::pair<Device, std::size_t>> growth(const tyloi::models::MtpState&,
+        const Tensor& hidden, const Tensor& ids, const Tensor& positions,
+        const tyloi::models::ForwardOptions&) const override;
 
-    std::pair<DenseTensor, DenseTensor> evaluate(tyloi::models::MtpState&, const DenseTensor &hidden,
-                                       const DenseTensor &ids, int64_t depth = 0, bool cache = true,
-                                       const DenseTensor &supplied_positions = {},
-                                       const DenseTensor &supplied_embeddings = {},
+    std::pair<Tensor, Tensor> evaluate(tyloi::models::MtpState&, const Tensor &hidden,
+                                       const Tensor &ids, int64_t depth = 0, bool cache = true,
+                                       const Tensor &supplied_positions = {},
+                                       const Tensor &supplied_embeddings = {},
                                        bool history_only = false) const;
 
     tyloi::models::MtpStep step(tyloi::models::MtpState&, const tyloi::Tensor& hidden, const tyloi::Tensor& ids,
                                 const tyloi::Tensor& positions = {},
                                 const tyloi::models::ForwardOptions& = {}) const override;
-    void history_step(tyloi::models::MtpState&, DenseTensor hidden, DenseTensor ids, DenseTensor positions = {},
+    void history_step(tyloi::models::MtpState&, Tensor hidden, Tensor ids, Tensor positions = {},
                       bool scalar_chain = false) const;
 
     void trim_cache_to(tyloi::models::MtpState&, int64_t position) const override;
@@ -98,4 +97,4 @@ struct Predictor final : tyloi::models::Mtp {
     MtpSessionState capture_session_state(const tyloi::models::MtpState&, int64_t,const tyloi::Tensor&) const override;
 };
 
-} // namespace tyloi::cuda::qwen4_exp
+} // namespace tyloi::models::qwen4_exp

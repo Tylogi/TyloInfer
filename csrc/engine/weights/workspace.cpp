@@ -22,6 +22,9 @@
 
 namespace tyloi::weights {
 using namespace tyloi::cuda;
+struct Resident::Impl { tyloi::cuda::ResidentAllocationScope scope; };
+Resident::Resident() : impl_(std::make_unique<Impl>()) {}
+Resident::~Resident() = default;
 namespace {
 
 bool is_memory_pressure(const std::exception& error) {

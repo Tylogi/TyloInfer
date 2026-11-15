@@ -28,6 +28,7 @@ struct QsaConfig {
     YarnScaling yarn;
     /** Execution target, independent of host-resident projection weights. */
     Device device = Device(kCUDA, 0);
+    state::KvQuantization quantization{};
 };
 
 /** Execute pooled sparse attention using an independently owned request state. */
@@ -56,7 +57,7 @@ public:
             std::vector<std::pair<const Qsa*, State*>> layers;
             std::int64_t position = 0, maximum = 0, reserve = 0;
         };
-        /** Describe the planned cache capacity and admission growth for a request. */
+        /** Describe a request's capacity and unmanaged growth; managed growth is in growth(). */
         struct Row { std::int64_t capacity = 0; std::size_t growth = 0; };
         /** Borrow the supplied operators and states for this plan's lifetime. */
         Graph(std::vector<Request> requests, bool independent);
@@ -71,8 +72,12 @@ public:
         bool reusable() const;
         /** Report whether startup warmup has eligible managed attention backing. */
         bool warmup_supported() const;
-        /** Admit the window and provision shared backing at the execution boundary. */
+        /** Plan the window without allocating backend backing. */
         void admit(std::int64_t tokens = 1, std::int64_t previous_capacity = 0, bool hidden = false);
+        /** Report per-device backing required by this plan without allocating it. */
+        std::vector<std::pair<Device, std::size_t>> growth() const;
+        /** Materialize the managed backing after its growth has been admitted. */
+        void materialize();
         /** Report whether single-request graph storage must be retired. */
         bool clear_required() const;
         /** Complete the numeric layout after any previous graph is retired. */

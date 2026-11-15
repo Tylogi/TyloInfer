@@ -12,11 +12,20 @@
 #include <vector>
 
 namespace tyloi::models { struct Mtp; }
-namespace tyloi::cuda { class KvMemoryManager; class KvOffloadStore; }
-namespace tyloi::cuda { struct Qwen4DecodeGraph; }
-namespace tyloi::cuda::qwen4_exp {
+namespace tyloi::models::qwen4_exp {
 
 struct Model;
+
+// Optional request graph implemented by backends that support capture.
+class DecodeGraph {
+public:
+    virtual ~DecodeGraph() = default;
+    virtual bool reset(std::int64_t batch, bool reuse) = 0;
+    virtual bool begin_forward(bool reuse) = 0;
+    virtual void release() = 0;
+    virtual tyloi::engine::Metrics metrics() const = 0;
+    virtual std::vector<Tensor> storage() const = 0;
+};
 
 // Per-request recurrent and attention storage for one shared layer.
 struct LayerState {
@@ -100,7 +109,7 @@ public:
     ::tyloi::Tensor positions;
     tyloi::cache::Media images;
     std::vector<std::unique_ptr<LayerState>> layers;
-    std::unique_ptr<Qwen4DecodeGraph> graph_registry;
+    std::unique_ptr<DecodeGraph> graph_registry;
     bool reuse_decode_graphs = false;
     std::uint64_t decode_graph_captures = 0;
     std::int64_t decode_reserve_until = 0;
@@ -113,4 +122,4 @@ private:
 
 tyloi::models::SnapshotSize snapshot_size(const State&, const tyloi::models::Mtp*);
 
-} // namespace tyloi::cuda::qwen4_exp
+} // namespace tyloi::models::qwen4_exp

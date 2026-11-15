@@ -7,10 +7,22 @@
 #include <stdexcept>
 #include <string>
 
+#if TYLOINFER_HAS_CUDA
+#include "engine/backends/cuda/native/env.h"
+#endif
+
 namespace tyloi::engine {
 
+const char* environment_value(const char* name) {
+#if TYLOINFER_HAS_CUDA
+    return tyloi::cuda::env_lookup(name);
+#else
+    return std::getenv(name);
+#endif
+}
+
 state::KvQuantization kv_quantization() {
-    const char* text = std::getenv("TYLOINFER_KV_TURBOQUANT_BITS");
+    const char* text = environment_value("TYLOINFER_KV_TURBOQUANT_BITS");
     if (!text || !*text) return {};
     std::size_t consumed = 0;
     const double bits = std::stod(text, &consumed);
@@ -26,7 +38,7 @@ std::string kv_quantization_tag() {
 
 std::uint64_t environment_uint64(
         const char* name, std::uint64_t fallback) {
-    const char* value = std::getenv(name);
+    const char* value = environment_value(name);
     if (value == nullptr || value[0] == '\0') return fallback;
     std::uint64_t result = 0;
     const auto length = std::char_traits<char>::length(value);
@@ -38,7 +50,7 @@ std::uint64_t environment_uint64(
 }
 
 bool environment_enabled(const char* name, bool fallback) {
-    const char* value = std::getenv(name);
+    const char* value = environment_value(name);
     if (value == nullptr || value[0] == '\0') return fallback;
     int parsed = 0;
     const auto end = value + std::char_traits<char>::length(value);

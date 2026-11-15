@@ -3,6 +3,12 @@ set(TYLOINFER_MODEL_ASSEMBLY_SOURCES
     ${PROJECT_SOURCE_DIR}/engine/models/layers.cpp
     ${PROJECT_SOURCE_DIR}/engine/models/qwen35/load.cpp
     ${PROJECT_SOURCE_DIR}/engine/models/qwen35/layers.cpp
+    ${PROJECT_SOURCE_DIR}/engine/models/qwen4_exp/ops.cpp
+    ${PROJECT_SOURCE_DIR}/engine/models/qwen4_exp/layer.cpp
+    ${PROJECT_SOURCE_DIR}/engine/models/qwen4_exp/state.cpp
+    ${PROJECT_SOURCE_DIR}/engine/models/qwen4_exp/components.cpp
+    ${PROJECT_SOURCE_DIR}/engine/models/qwen4_exp/load.cpp
+    ${PROJECT_SOURCE_DIR}/engine/models/qwen4_exp/predictor.cpp
 )
 set(TYLOINFER_MODEL_ASSEMBLY_SOURCES "${TYLOINFER_MODEL_ASSEMBLY_SOURCES}" PARENT_SCOPE)
 
@@ -18,11 +24,7 @@ set(TYLOINFER_CUDA_MODEL_SOURCES
     ${PROJECT_SOURCE_DIR}/engine/models/deepseek_v41/prefill.cpp
     ${PROJECT_SOURCE_DIR}/engine/models/deepseek_v41/dspark.cpp
     ${PROJECT_SOURCE_DIR}/engine/models/deepseek_v41/vision.cpp
-    ${PROJECT_SOURCE_DIR}/engine/models/qwen4_exp/ops.cpp
-    ${PROJECT_SOURCE_DIR}/engine/models/qwen4_exp/layer.cpp
-    ${PROJECT_SOURCE_DIR}/engine/models/qwen4_exp/state.cpp
-    ${PROJECT_SOURCE_DIR}/engine/models/qwen4_exp/components.cpp
-    ${PROJECT_SOURCE_DIR}/engine/models/qwen4_exp/load.cpp
+    ${PROJECT_SOURCE_DIR}/engine/models/qwen4_exp/cuda.cpp
     ${PROJECT_SOURCE_DIR}/engine/models/glm5_next/ops.cpp
     ${PROJECT_SOURCE_DIR}/engine/models/glm5_next/components.cpp
     ${PROJECT_SOURCE_DIR}/engine/models/gemma4/forward.cpp

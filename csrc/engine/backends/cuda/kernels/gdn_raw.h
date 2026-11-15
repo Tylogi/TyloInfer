@@ -19,7 +19,7 @@ struct Decode {
     const int64_t* state_addresses;
     int batch,key_heads,value_heads,width,taps,tiles,layout,mode;
     float conv_eps; double norm_eps;
-    bool silu,output_half,gate_half,transposed,inplace_conv,fixed_geometry,warp_reductions,probe;
+    bool silu,output_half,gate_half,transposed,inplace_conv,fixed_geometry,warp_reductions,probe,tiled;
     int64_t alpha_stride0,alpha_stride2,beta_stride0,beta_stride2,qkv_stride0,gate_stride0;
 };
 /** Launch recurrence with optional caller-owned prepared-decay workspace. */
