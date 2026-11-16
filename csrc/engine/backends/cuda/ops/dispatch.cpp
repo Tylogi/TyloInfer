@@ -10,7 +10,7 @@
 #include "engine/backends/cuda/ops/projection/parallel.h"
 #include "engine/backends/cuda/ops/ffn/experts/launch.h"
 #include "engine/backends/cuda/ops/activation.h"
-#include "diagnostics/profiling/route_stats.h"
+#include "engine/backends/cuda/executor/route_stats.h"
 #include "engine/backends/cuda/ops/norm/rms.h"
 #include "engine/backends/cuda/ops/norm/layer.h"
 #include "engine/backends/cuda/ops/vision/attention.h"

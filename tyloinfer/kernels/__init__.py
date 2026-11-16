@@ -1,28 +1,5 @@
-"""Hardware-backend kernels.
+"""Python kernel references and Metal implementations.
 
-Mirrors the ggml convention of one file per op. Shared CUDA kernel implementations
-live in ``csrc/engine/backends/cuda/kernels`` and are compiled into a single extension
-``mfq_cuda`` (the llama.cpp analog of one libggml-cuda); this package keeps the
-thin Python wrappers and the installed TQ kernel resources. Paths below are
-relative to ``csrc/engine/backends/cuda/kernels/``:
-
-- ``norm.cu``            - rms_norm / l2_norm
-- ``rope.cu``            - RoPE
-- ``attention.cu``       - full / GQA attention (online softmax; fattn.cu)
-- ``acc.cu``             - residual add
-- ``gated_delta_net.cu`` - GDN linear-attention recurrence (most Qwen3.5 layers)
-- ``kv_cache.cu``        - KV cache write
-- ``embedding.cu``       - token embedding lookup / selected-row NINT dequant
-- ``sampling.cu``        - logits sampling
-- ``nint_matmul.cu``     - NINT INT-fused-GEMM (weight path, dequant-during-GEMM)
-
-This level keeps pure Python/numpy reference implementations for correctness checks and for
-testing without CUDA:
-
-- ``gated_delta_net`` - GDN recurrence reference (vs ``gated_delta_net.cu``)
-- ``torch_backend``   - NINT dequant + decomposed matmul (materialize path, vs fused kernel)
-
-The Apple-silicon backend in ``metal/`` provides MLX custom Metal kernels for
-packed NINT/NVQ/NPQ/NEPQ GEMV, MMQ, and GEMM, packed embedding, GDN/SSM, plus reusable
-norm, RoPE, activation, and residual operations.
+``gated_delta_net`` provides a NumPy recurrence reference. The ``metal`` package
+provides MLX custom kernels for quantized operations, attention and sampling.
 """

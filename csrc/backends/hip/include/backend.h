@@ -16,8 +16,6 @@
 #include <vector>
 #include <utility>
 
-#ifdef TYLOINFER_NATIVE_CUDA_RUNTIME
-
 #include "backends/cpu/native/host_parallel.h"
 #include "../../hip/include/mfq_hip_context.h"
 #include "../../hip/include/mfq_native_tensor.h"
@@ -207,153 +205,6 @@ inline void mfq_hip_manual_seed_all(std::uint64_t seed) {
     ::mfq::cuda::manual_seed(static_cast<std::int64_t>(seed));
 }
 
-#else
-
-#include <ATen/Parallel.h>
-#include <ATen/ops/scaled_dot_product_attention.h>
-#include <ATen/hip/HIPGraph.h>
-#include <ATen/hip/HIPContext.h>
-#include <c10/hip/HIPCachingAllocator.h>
-#include <c10/hip/HIPGuard.h>
-#include <torch/extension.h>
-
-namespace mfq_tensor_backend = ::torch;
-using mfq_half = ::at::Half;
-using mfq_bfloat16 = ::at::BFloat16;
-using MfqBackendError = ::c10::Error;
-inline constexpr auto mfq_float8_e4m3fn = ::at::kFloat8_e4m3fn;
-inline constexpr auto mfq_dispatch_half = ::at::ScalarType::Half;
-inline constexpr auto mfq_dispatch_bfloat16 = ::at::ScalarType::BFloat16;
-
-inline hipStream_t mfq_current_cuda_stream() {
-    return ::at::cuda::getCurrentCUDAStream();
-}
-
-inline hipblasHandle_t mfq_current_cublas_handle() {
-    return ::at::cuda::getCurrentCUDABlasHandle();
-}
-
-inline void mfq_hip_synchronize() {
-    ::torch::cuda::synchronize();
-}
-
-#define TYLOINFER_RUNTIME_CHECK TORCH_CHECK
-#define TYLOINFER_CUDA_KERNEL_LAUNCH_CHECK C10_CUDA_KERNEL_LAUNCH_CHECK
-#define TYLOINFER_CUDA_CHECK C10_CUDA_CHECK
-#define TYLOINFER_DISPATCH_FLOATING_TYPES_AND_HALF AT_DISPATCH_FLOATING_TYPES_AND_HALF
-#define TYLOINFER_DISPATCH_FLOATING_TYPES_AND2 AT_DISPATCH_FLOATING_TYPES_AND2
-using MfqCudaGuard = ::c10::cuda::CUDAGuard;
-using MfqCudaStream = ::at::cuda::CUDAStream;
-using MfqCudaStreamGuard = ::c10::cuda::CUDAStreamGuard;
-using MfqCudaGraph = ::at::cuda::CUDAGraph;
-
-inline void mfq_prepare_cuda_graph_memory(MfqCudaGraph& graph) {
-    const char* debug_path = std::getenv("TYLOINFER_TORCH_CUDA_GRAPH_DUMP");
-    if (debug_path != nullptr && debug_path[0] != '\0') {
-        graph.enable_debug_mode();
-    }
-}
-
-inline void mfq_prepare_cuda_graph_memory(
-        MfqCudaGraph& graph,
-        const std::vector<MfqCudaStream>&) {
-    mfq_prepare_cuda_graph_memory(graph);
-}
-
-inline void mfq_debug_dump_cuda_graph(MfqCudaGraph& graph) {
-    const char* debug_path = std::getenv("TYLOINFER_TORCH_CUDA_GRAPH_DUMP");
-    if (debug_path != nullptr && debug_path[0] != '\0') {
-        graph.debug_dump(debug_path);
-    }
-}
-
-inline MfqCudaStream mfq_get_current_cuda_stream(int device = -1) {
-    return device < 0
-        ? ::at::cuda::getCurrentCUDAStream()
-        : ::at::cuda::getCurrentCUDAStream(device);
-}
-
-inline MfqCudaStream mfq_get_stream_from_pool(
-    bool high_priority = false,
-    int device = -1) {
-    return device < 0
-        ? ::at::cuda::getStreamFromPool(high_priority)
-        : ::at::cuda::getStreamFromPool(high_priority, device);
-}
-
-inline int mfq_current_cuda_device() {
-    return ::c10::cuda::current_device();
-}
-
-inline void mfq_hip_empty_cache() {
-    ::c10::cuda::CUDACachingAllocator::emptyCache();
-}
-
-inline bool mfq_hip_graph_capture_supported() { return true; }
-
-inline void mfq_hip_record_stream(
-    const ::torch::Tensor& tensor,
-    const MfqCudaStream& stream) {
-    ::c10::cuda::CUDACachingAllocator::recordStream(
-        tensor.storage().data_ptr(), stream);
-}
-
-struct MfqCudaMemoryStats {
-    std::uint64_t allocated_bytes = 0;
-    std::uint64_t active_bytes = 0;
-    std::uint64_t reserved_bytes = 0;
-    std::uint64_t inactive_split_bytes = 0;
-    std::uint64_t requested_bytes = 0;
-    std::uint64_t peak_allocated_bytes = 0;
-    std::uint64_t peak_reserved_bytes = 0;
-    std::uint64_t allocations = 0;
-    std::uint64_t segments = 0;
-    std::uint64_t retries = 0;
-    std::uint64_t ooms = 0;
-};
-
-inline MfqCudaMemoryStats mfq_hip_memory_stats(int device) {
-    const auto source = ::c10::cuda::CUDACachingAllocator::getDeviceStats(device);
-    constexpr auto aggregate = static_cast<std::size_t>(
-        ::c10::CachingDeviceAllocator::StatType::AGGREGATE);
-    return {
-        static_cast<std::uint64_t>(source.allocated_bytes[aggregate].current),
-        static_cast<std::uint64_t>(source.active_bytes[aggregate].current),
-        static_cast<std::uint64_t>(source.reserved_bytes[aggregate].current),
-        static_cast<std::uint64_t>(source.inactive_split_bytes[aggregate].current),
-        static_cast<std::uint64_t>(source.requested_bytes[aggregate].current),
-        static_cast<std::uint64_t>(source.allocated_bytes[aggregate].peak),
-        static_cast<std::uint64_t>(source.reserved_bytes[aggregate].peak),
-        static_cast<std::uint64_t>(source.allocation[aggregate].current),
-        static_cast<std::uint64_t>(source.segment[aggregate].current),
-        static_cast<std::uint64_t>(source.num_alloc_retries),
-        static_cast<std::uint64_t>(source.num_ooms),
-    };
-}
-
-inline int mfq_get_num_threads() { return ::at::get_num_threads(); }
-inline void mfq_set_num_threads(int count) { ::at::set_num_threads(count); }
-
-template <typename Function>
-void mfq_parallel_for(
-    std::int64_t begin,
-    std::int64_t end,
-    std::int64_t grain,
-    Function&& function) {
-    ::at::parallel_for(begin, end, grain, std::forward<Function>(function));
-}
-
-inline void mfq_disable_tf32_cublas() {
-    ::at::globalContext().setAllowTF32CuBLAS(false);
-}
-
-
-inline void mfq_hip_manual_seed_all(std::uint64_t seed) {
-    ::torch::cuda::manual_seed_all(seed);
-}
-
-#endif
-
 template <typename Value>
 using MfqOptional = std::optional<Value>;
 
@@ -363,11 +214,7 @@ inline mfq_tensor_backend::Tensor mfq_linear(
     const mfq_tensor_backend::Tensor& input,
     const mfq_tensor_backend::Tensor& weight,
     const std::optional<mfq_tensor_backend::Tensor>& bias = std::nullopt) {
-#ifdef TYLOINFER_NATIVE_CUDA_RUNTIME
     return ::mfq::cuda::linear(input, weight, bias);
-#else
-    return ::at::linear(input, weight, bias);
-#endif
 }
 
 inline mfq_tensor_backend::Tensor mfq_linear(
@@ -387,13 +234,7 @@ inline mfq_tensor_backend::Tensor mfq_scaled_dot_product_attention(
     bool causal,
     const std::optional<double>& scale,
     bool enable_grouped_query_attention) {
-#ifdef TYLOINFER_NATIVE_CUDA_RUNTIME
     return ::mfq::cuda::scaled_dot_product_attention(
         query, key, value, mask, dropout, causal, scale,
         enable_grouped_query_attention);
-#else
-    return ::at::scaled_dot_product_attention(
-        query, key, value, mask, dropout, causal, scale,
-        enable_grouped_query_attention);
-#endif
 }

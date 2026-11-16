@@ -341,20 +341,6 @@ set_target_properties(mfq-hip-runtime PROPERTIES
 
 
 
-add_library(mfq-hip-diagnostics STATIC
-    ${TYLOINFER_HIP_ROOT}/diagnostics/attention_checks.cpp
-    ${TYLOINFER_HIP_ROOT}/diagnostics/backend_checks.cpp
-    ${TYLOINFER_HIP_ROOT}/diagnostics/linear_checks.cpp
-    ${TYLOINFER_HIP_ROOT}/diagnostics/moe_checks.cpp
-    ${TYLOINFER_HIP_ROOT}/diagnostics/runtime_checks.cpp
-    ${TYLOINFER_HIP_ROOT}/diagnostics/session_checks.cpp
-)
-mfq_configure_hip_runtime_target(mfq-hip-diagnostics)
-target_include_directories(mfq-hip-diagnostics PRIVATE ${TYLOINFER_HIP_ROOT}/storage)
-target_compile_definitions(mfq-hip-diagnostics PRIVATE
-    TYLOINFER_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
-target_link_libraries(mfq-hip-diagnostics PUBLIC mfq-hip-runtime)
-
 add_executable(tyloi-engine
     ${TYLOINFER_HIP_ROOT}/apps/runtime_main.cpp
     ${TYLOINFER_HIP_ROOT}/commands/runtime.cpp
@@ -372,20 +358,6 @@ target_compile_features(tyloi-engine PRIVATE cxx_std_20)
 set_target_properties(tyloi-engine PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}"
 )
-
-add_executable(mfq-diagnostics
-    ${TYLOINFER_HIP_ROOT}/apps/diagnostics_main.cpp
-    ${TYLOINFER_HIP_ROOT}/commands/diagnostics.cpp
-)
-mfq_configure_hip_runtime_target(mfq-diagnostics)
-target_include_directories(mfq-diagnostics PRIVATE ${TYLOINFER_HIP_ROOT}/storage)
-target_compile_definitions(mfq-diagnostics PRIVATE TYLOINFER_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
-target_link_libraries(mfq-diagnostics PRIVATE mfq-hip-diagnostics)
-target_compile_features(mfq-diagnostics PRIVATE cxx_std_20)
-set_target_properties(mfq-diagnostics PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}"
-)
-
 
 if(BUILD_TESTING)
     add_executable(mfq-hip-decode-test ${TYLOINFER_HIP_ROOT}/tests/decode_hotspots_test.cpp)

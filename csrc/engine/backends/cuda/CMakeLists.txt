@@ -355,7 +355,6 @@ set(TYLOINFER_CUDA_OP_SOURCES
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/ffn/residual.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/native/profile.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/native/vmm.cpp
-    ${PROJECT_SOURCE_DIR}/diagnostics/profiling/route_stats.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/native/collectives.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/attention/attention.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/attention/kv/cache.cpp
@@ -404,6 +403,7 @@ set(TYLOINFER_CUDA_EXECUTION_SOURCES
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/executor/options.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/executor/config.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/executor/executor.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/executor/route_stats.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/executor/kv/memory.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/executor/kv/allocation.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/executor/working_set.cpp

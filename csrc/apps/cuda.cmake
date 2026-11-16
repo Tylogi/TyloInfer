@@ -10,30 +10,16 @@ if(TARGET mfq-transport)
     target_compile_definitions(tyloi-engine PRIVATE TYLOINFER_CLI_CUDA=1 TYLOINFER_CLI_METAL=0)
 endif()
 
-if(TYLOINFER_BUILD_DIAGNOSTICS)
-    add_executable(mfq-diagnostics
-        ${PROJECT_SOURCE_DIR}/apps/diagnostics_main.cpp
-        ${PROJECT_SOURCE_DIR}/commands/diagnostics.cpp
-        ${PROJECT_SOURCE_DIR}/commands/cli.cpp
-        ${PROJECT_SOURCE_DIR}/commands/cli_cuda.cpp
-        ${PROJECT_SOURCE_DIR}/commands/minicpmo45.cpp
-    )
-    target_link_libraries(mfq-diagnostics PRIVATE mfq-cuda-diagnostics mfq-cuda-eval)
-endif()
-
-
-foreach(target tyloi-engine mfq-diagnostics)
-    if(TARGET ${target})
-        mfq_configure_cuda_engine_target(${target})
-        target_compile_definitions(${target} PRIVATE NOMINMAX)
-        if(MSVC)
-            target_compile_options(${target} PRIVATE /utf-8 /EHsc /bigobj)
-        endif()
-        set_target_properties(${target} PROPERTIES
-            RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}"
-        )
+if(TARGET tyloi-engine)
+    mfq_configure_cuda_engine_target(tyloi-engine)
+    target_compile_definitions(tyloi-engine PRIVATE NOMINMAX)
+    if(MSVC)
+        target_compile_options(tyloi-engine PRIVATE /utf-8 /EHsc /bigobj)
     endif()
-endforeach()
+    set_target_properties(tyloi-engine PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}"
+    )
+endif()
 
 if(NOT WIN32 AND TARGET tyloi-engine)
     set(TYLOINFER_SYSTEM_RUNTIME_DIR

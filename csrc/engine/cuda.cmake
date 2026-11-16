@@ -127,12 +127,6 @@ set_target_properties(mfq-cuda-engine PROPERTIES
     POSITION_INDEPENDENT_CODE ON
 )
 
-# The production entry point is part of the CUDA engine build: `tyloinfer build`
-# must produce it. Diagnostics stays an explicitly requested target.
-option(TYLOINFER_BUILD_DIAGNOSTICS
-    "Build the native diagnostics executable (mfq-diagnostics)" OFF)
+# The production entry point is part of the CUDA engine build.
 include(${PROJECT_SOURCE_DIR}/eval/cuda.cmake)
-if(TYLOINFER_BUILD_DIAGNOSTICS)
-    include(${PROJECT_SOURCE_DIR}/diagnostics/cuda.cmake)
-endif()
 include(${PROJECT_SOURCE_DIR}/apps/cuda.cmake)

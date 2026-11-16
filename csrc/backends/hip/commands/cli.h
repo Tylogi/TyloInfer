@@ -15,23 +15,7 @@
 #include <type_traits>
 #include <vector>
 
-enum class KlMmqMode;
-
-namespace mfq::cuda {
-
-struct TokenInputOptions {
-    std::string ids_arg, ids_file;
-    int gen = 16;
-};
-
-} // namespace mfq::cuda
-
 namespace mfq::cuda::internal {
-
-std::vector<int64_t> parse_ids(const std::string& value);
-KlMmqMode parse_kl_mmq_mode(const std::string& value);
-std::vector<KlMmqMode> parse_kl_mmq_sequence(const std::string& value);
-std::vector<int64_t> load_ids_file(const std::string& path);
 
 int with_command_errors(const std::function<int()>& fn);
 
@@ -89,28 +73,6 @@ T integer(const std::string& text, std::string_view option) {
         usage_error(std::string(option) + " requires an integer");
     }
     return result;
-}
-
-inline void validate_integer_list(
-        const std::string& text,
-        std::string_view option) {
-    std::size_t begin = 0;
-    while (begin < text.size()) {
-        const std::size_t comma = text.find(',', begin);
-        std::string item = text.substr(
-            begin,
-            comma == std::string::npos ? std::string::npos : comma - begin);
-        const auto first = item.find_first_not_of(" \t\r\n");
-        const auto last = item.find_last_not_of(" \t\r\n");
-        if (first == std::string::npos) {
-            usage_error(std::string(option) + " contains an empty item");
-        }
-        item = item.substr(first, last - first + 1);
-        (void)integer<int64_t>(item, option);
-        if (comma == std::string::npos) return;
-        begin = comma + 1;
-    }
-    usage_error(std::string(option) + " requires comma-separated integers");
 }
 
 inline double number(const std::string& text, std::string_view option) {
@@ -185,23 +147,6 @@ inline bool parse_cuda_load_option(
     }
     else if (option == "--tokenizer") {
         result.tokenizer_model = args.value(option);
-    }
-    else return false;
-    return true;
-}
-
-inline bool parse_token_input_option(
-        std::string_view option,
-        ArgCursor& args,
-        TokenInputOptions& result) {
-    if (option == "--ids") {
-        result.ids_arg = args.value(option);
-        validate_integer_list(result.ids_arg, option);
-    }
-    else if (option == "--ids-file") result.ids_file = args.value(option);
-    else if (option == "--gen") {
-        result.gen = integer<int>(args.value(option), option);
-        if (result.gen < 0) usage_error("--gen must be non-negative");
     }
     else return false;
     return true;

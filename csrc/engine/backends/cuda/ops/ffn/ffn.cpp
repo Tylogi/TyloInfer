@@ -6,7 +6,7 @@
 #include "engine/backends/cuda/native/branches.h"
 #include "engine/backends/cuda/native/collectives.h"
 #include "engine/backends/cuda/native/profile.h"
-#include "diagnostics/profiling/route_stats.h"
+#include "engine/backends/cuda/executor/route_stats.h"
 #include "engine/backends/cuda/ops/ffn/experts/moe.h"
 #include "engine/weights/moe/experts.h"
 #include "engine/weights/encoding/mfe.h"

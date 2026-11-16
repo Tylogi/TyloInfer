@@ -31,4 +31,4 @@ private:
     std::unordered_map<int, Layer> layers_;
 };
 
-} // namespace mfq::cuda
+} // namespace tyloi::cuda

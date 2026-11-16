@@ -17,7 +17,7 @@
 #include "engine/backends/cuda/executor/kv/memory.h"
 #include "engine/state/kv/offload.h"
 #include "engine/weights/cache/cache.h"
-#include "diagnostics/profiling/route_stats.h"
+#include "engine/backends/cuda/executor/route_stats.h"
 
 #include <algorithm>
 #include <exception>

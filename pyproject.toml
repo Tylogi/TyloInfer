@@ -100,8 +100,6 @@ include = ["tyloinfer*"]
 
 [tool.setuptools.package-data]
 "tyloinfer._gyro" = ["*.h", "*.inc", "*.c", "*.bin", "LICENSE", "NOTICE"]
-"tyloinfer.kernels.hip" = ["*.hip", "*.h"]
-"tyloinfer.kernels.cuda" = ["_src/**/*"]
 "tyloinfer.kernels.metal" = ["tq_decode.h", "tq_matmul.h"]
 "tyloinfer.server" = [
     "state/*.sql",
