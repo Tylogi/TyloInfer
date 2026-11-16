@@ -20,25 +20,27 @@ tyloi::cuda::NumericType raw_type(tyloi::ScalarType type) {
 
 ::tyloi::DenseTensor rms_norm_cuda(::tyloi::DenseTensor x, ::tyloi::DenseTensor weight, double eps)
 {
-    TYLOINFER_RUNTIME_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == ::tyloi::kFloat32,
-                "rms_norm: x must be cuda contiguous f32");
+    TYLOINFER_RUNTIME_CHECK(x.is_cuda() && x.is_contiguous() && (x.scalar_type() == ::tyloi::kFloat32 ||
+                    x.scalar_type() == ::tyloi::kFloat16 || x.scalar_type() == ::tyloi::kBFloat16),
+                "rms_norm: x must be cuda contiguous f32/f16/bf16");
     TYLOINFER_RUNTIME_CHECK(weight.is_cuda() && weight.scalar_type() == ::tyloi::kFloat32, "weight must be cuda f32");
     int D = (int)x.size(-1);
     int N = (int)(x.numel() / D);
-    auto out = ::tyloi::cuda::empty_like(x);
-    tyloi::cuda::norm_raw::rms(x.data_ptr(), weight.data_ptr<float>(), out.data_ptr(), N, D, float(eps), 0.0f, raw_type(x.scalar_type()), mfq_current_cuda_stream());
+    auto out = ::tyloi::cuda::empty(x.sizes(), x.options().dtype(::tyloi::kFloat32));
+    tyloi::cuda::norm_raw::rms(x.data_ptr(), weight.data_ptr<float>(), out.data_ptr(), N, D, float(eps), 0.0f, raw_type(x.scalar_type()), tyloi::cuda::NumericType::f32, mfq_current_cuda_stream());
     return out;
 }
 
 ::tyloi::DenseTensor rms_norm_offset_cuda(::tyloi::DenseTensor x, ::tyloi::DenseTensor weight, double eps, double weight_offset)
 {
-    TYLOINFER_RUNTIME_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == ::tyloi::kFloat32,
-                "rms_norm_offset: x must be cuda contiguous f32");
+    TYLOINFER_RUNTIME_CHECK(x.is_cuda() && x.is_contiguous() && (x.scalar_type() == ::tyloi::kFloat32 ||
+                    x.scalar_type() == ::tyloi::kFloat16 || x.scalar_type() == ::tyloi::kBFloat16),
+                "rms_norm_offset: x must be cuda contiguous f32/f16/bf16");
     TYLOINFER_RUNTIME_CHECK(weight.is_cuda() && weight.scalar_type() == ::tyloi::kFloat32, "weight must be cuda f32");
     int D = (int)x.size(-1);
     int N = (int)(x.numel() / D);
-    auto out = ::tyloi::cuda::empty_like(x);
-    tyloi::cuda::norm_raw::rms(x.data_ptr(), weight.data_ptr<float>(), out.data_ptr(), N, D, float(eps), float(weight_offset), raw_type(x.scalar_type()), mfq_current_cuda_stream());
+    auto out = ::tyloi::cuda::empty(x.sizes(), x.options().dtype(::tyloi::kFloat32));
+    tyloi::cuda::norm_raw::rms(x.data_ptr(), weight.data_ptr<float>(), out.data_ptr(), N, D, float(eps), float(weight_offset), raw_type(x.scalar_type()), tyloi::cuda::NumericType::f32, mfq_current_cuda_stream());
     return out;
 }
 
@@ -54,7 +56,7 @@ tyloi::cuda::NumericType raw_type(tyloi::ScalarType type) {
     int N = (int)(x.numel() / D);
     TYLOINFER_RUNTIME_CHECK(weight.numel() == D, "rms_norm_f16: weight length mismatch");
     auto out = ::tyloi::cuda::empty_like(x);
-    tyloi::cuda::norm_raw::rms(x.data_ptr(), weight.data_ptr<float>(), out.data_ptr(), N, D, float(eps), float(weight_offset), raw_type(x.scalar_type()), mfq_current_cuda_stream());
+    tyloi::cuda::norm_raw::rms(x.data_ptr(), weight.data_ptr<float>(), out.data_ptr(), N, D, float(eps), float(weight_offset), raw_type(x.scalar_type()), tyloi::cuda::NumericType::f16, mfq_current_cuda_stream());
     return out;
 }
 
@@ -81,11 +83,9 @@ tyloi::cuda::NumericType raw_type(tyloi::ScalarType type) {
         "gdn_rms_norm_gate: expected CUDA f32 width-vector weight");
     MfqCudaGuard guard(attended.device());
     auto output=::tyloi::cuda::empty({batch,tokens,heads*width},attended.options().dtype(output_half?::tyloi::kFloat16: ::tyloi::kFloat32));
-    // Match the arithmetic selected after the old mandatory contiguous copy.
-    const bool double_sigmoid=gate.scalar_type()==::tyloi::kFloat32 && tokens>1 && heads>1;
     const auto* warp_setting=tyloi::cuda::env_lookup("TYLOINFER_GDN_NORM_WARP_REDUCTION");
     const bool warp_tail=warp_setting?warp_setting[0]=='1':width==128 && tokens>=2 && tokens<=8;
-    tyloi::cuda::norm_raw::gdn_gate(attended.data_ptr<float>(), gate.data_ptr(), weight.data_ptr<float>(), output.data_ptr(), int(rows), int(heads), int(tokens), int(width), eps, silu_gate, double_sigmoid, warp_tail, gate.stride(0), gate.stride(1), raw_type(gate.scalar_type()), output_half ? tyloi::cuda::NumericType::f16 : tyloi::cuda::NumericType::f32, mfq_current_cuda_stream());
+    tyloi::cuda::norm_raw::gdn_gate(attended.data_ptr<float>(), gate.data_ptr(), weight.data_ptr<float>(), output.data_ptr(), int(rows), int(heads), int(tokens), int(width), eps, silu_gate, warp_tail, gate.stride(0), gate.stride(1), raw_type(gate.scalar_type()), output_half ? tyloi::cuda::NumericType::f16 : tyloi::cuda::NumericType::f32, mfq_current_cuda_stream());
     TYLOINFER_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
 }

@@ -20,4 +20,9 @@ void counts(int32_t*, const int64_t*, int64_t count, int vocab, cudaStream_t);
 /** Apply penalties to logits in place. */
 void penalties(void*, const int32_t*, int vocab, float presence, float frequency,
     float repetition, NumericType, cudaStream_t);
+void publish_packets(const int64_t*, int64_t*, int64_t, cudaStream_t);
+void export_greedy_ids(const int64_t*, int64_t*, int32_t*, int64_t, cudaStream_t);
+void greedy_probability(const void*, int64_t*, int64_t*, int, int, int,
+    const volatile int32_t*, NumericType, cudaStream_t);
+
 }

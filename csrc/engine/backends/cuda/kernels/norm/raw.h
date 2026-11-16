@@ -6,14 +6,14 @@
 
 namespace tyloi::cuda::norm_raw {
 
-/** Normalize contiguous F32 or F16 rows. */
+/** Normalize contiguous rows to F32 or F16. */
 void rms(const void*, const float*, void*, int rows, int width, float eps, float offset,
-    NumericType, cudaStream_t);
+    NumericType input_type, NumericType output_type, cudaStream_t);
 /** Normalize contiguous F32 rows by their L2 norm. */
 void l2(const float*, float*, int rows, int width, float eps, cudaStream_t);
 /** Normalize GDN output and apply a row-strided gate. */
 void gdn_gate(const float*, const void*, const float*, void*, int rows, int heads, int tokens,
-    int width, double eps, bool silu, bool double_sigmoid, bool warp_tail,
+    int width, double eps, bool silu, bool warp_tail,
     std::int64_t batch_stride, std::int64_t token_stride, NumericType gate_type,
     NumericType output_type, cudaStream_t);
 /** Normalize groups after applying a SiLU gate. */

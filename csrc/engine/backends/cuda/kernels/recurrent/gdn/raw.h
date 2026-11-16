@@ -8,7 +8,7 @@ struct Recurrence {
     const float *q,*k,*v,*g,*beta,*state;
     float *output,*next,*decay;
     int batch,query_heads,value_heads,tokens,width,columns;
-    bool kda,transposed,tiled,warp,column,short_columns,prepared_decay,pipelined,staged;
+    bool kda,transposed,tiled,warp,column,short_columns,prepared_decay;
 };
 /** Describe fused decode inputs, output and optional state storage. */
 struct Decode {
@@ -17,9 +17,9 @@ struct Decode {
     void* output;
     float *conv_out,*state_out,*workspace,*checkpoint_conv,*checkpoint_state;
     const int64_t* state_addresses;
-    int batch,key_heads,value_heads,width,taps,tiles,layout,mode;
+    int batch,key_heads,value_heads,width,taps,tiles,layout;
     float conv_eps; double norm_eps;
-    bool silu,output_half,gate_half,transposed,inplace_conv,fixed_geometry,warp_reductions,probe,tiled;
+    bool silu,output_half,gate_half,transposed,inplace_conv,warp_reductions,probe,tiled,qkv_float,quantize_output;
     int64_t alpha_stride0,alpha_stride2,beta_stride0,beta_stride2,qkv_stride0,gate_stride0;
 };
 /** Launch recurrence with optional caller-owned prepared-decay workspace. */

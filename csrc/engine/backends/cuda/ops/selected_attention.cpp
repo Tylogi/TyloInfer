@@ -14,7 +14,6 @@ namespace mma = ::tyloi::cuda::sparse_mma_raw;
 using AttentionLayout = raw::Layout;
 using AttentionEpilogue = raw::Epilogue;
 static mma::Hot hot_view(tyloi::cuda::HotKvView h) { return {h.keys,h.values,h.mapping,h.cells,h.cold_mapping,h.cold_cells}; }
-static raw::Sigmoid sigmoid(bool high_precision) { return high_precision ? raw::Sigmoid::native_double : raw::Sigmoid::native_float; }
 static DenseTensor run_mma(const DenseTensor& q,const DenseTensor& k,const DenseTensor& v,
     const DenseTensor& indices,const DenseTensor& mask,const DenseTensor& sinks,DenseTensor meta,
     double scale,const char* name,const DenseTensor& gate={},bool half_output=false,
@@ -23,8 +22,11 @@ static DenseTensor run_mma(const DenseTensor& q,const DenseTensor& k,const Dense
     TYLOINFER_RUNTIME_CHECK(q.size(3)==256 || q.size(3)==512,name,": tensor shapes disagree");
     const int B=int(q.size(0)),heads=int(q.size(1)),M=int(q.size(2)),kv_heads=int(k.size(1)),max_seq=int(k.size(2)),width=int(q.size(3));
     const bool causal=positions.defined();
-    TYLOINFER_RUNTIME_CHECK(!causal || (causal_columns>0 && causal_columns<=INT_MAX-32),name,": causal selection exceeds 32-bit indexing");
-    const int selected=causal ? int(((causal_columns+31)/32)*32) : int(indices.size(2));
+    TYLOINFER_RUNTIME_CHECK(!causal || (causal_columns>0 && causal_columns<=INT_MAX),name,": causal selection exceeds 32-bit indexing");
+    const int alignment=mma::selection_alignment(width,width,q.get_device());
+    const int64_t padded=causal ? ((causal_columns+alignment-1)/alignment)*alignment : indices.size(2);
+    TYLOINFER_RUNTIME_CHECK(padded<=INT_MAX && padded%alignment==0,name,": selected indices and mask must cover complete MMA key tiles");
+    const int selected=int(padded);
     TYLOINFER_RUNTIME_CHECK(B>0 && M>0 && heads>0 && kv_heads>0 && heads%kv_heads==0 && max_seq>0 && selected>0,name,": invalid attention geometry");
     TYLOINFER_RUNTIME_CHECK((width==256 || width==512) && k.size(0)==B && k.size(3)==width && v.size(0)==B && v.size(1)==kv_heads && v.size(2)==max_seq && v.size(3)==width && (causal || (indices.dim()==3 && indices.size(0)==B && indices.size(1)==M)),name,": tensor shapes disagree");
     TYLOINFER_RUNTIME_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda() && (causal || indices.is_cuda()) && q.device()==k.device() && q.device()==v.device() && (causal || q.device()==indices.device()),name,": tensors must share one CUDA device");
@@ -34,7 +36,8 @@ static DenseTensor run_mma(const DenseTensor& q,const DenseTensor& k,const Dense
     if(mask.defined()) TYLOINFER_RUNTIME_CHECK(mask.is_cuda() && mask.device()==q.device() && mask.is_contiguous() && mask.scalar_type()==::tyloi::kFloat16 && mask.sizes()==indices.sizes(),name,": invalid mask");
     if(sinks.defined()) TYLOINFER_RUNTIME_CHECK(sinks.is_cuda() && sinks.device()==q.device() && sinks.is_contiguous() && sinks.scalar_type()==::tyloi::kFloat32 && sinks.numel()==heads,name,": invalid sinks");
     const MfqCudaGuard guard(q.device());
-    auto plan=mma::plan(B,M,heads,kv_heads,max_seq,selected,width,width,hot.mapping!=nullptr);
+    auto plan=mma::plan(B,M,heads,kv_heads,max_seq,selected,width,width,hot.mapping!=nullptr,
+                        true,hot.mapping && !causal);
     const size_t meta_elements=plan.workspace_bytes/sizeof(float);
     TYLOINFER_RUNTIME_CHECK(meta_elements<=size_t(std::numeric_limits<int64_t>::max()),name,": meta workspace is too large");
     if(!meta.defined()) meta=::tyloi::cuda::empty({int64_t(meta_elements)},q.options().dtype(::tyloi::kFloat32));
@@ -42,7 +45,7 @@ static DenseTensor run_mma(const DenseTensor& q,const DenseTensor& k,const Dense
     auto out=::tyloi::cuda::empty({B,M,heads,width},q.options().dtype(::tyloi::kFloat32));
     const int64_t strides[]={q.stride(0),q.stride(1),q.stride(2),q.stride(3)};
     mma::launch(plan,q.data_ptr(),k.data_ptr(),v.data_ptr(),indices.defined()?indices.data_ptr<int32_t>():nullptr,mask.defined()?mask.data_ptr():nullptr,sinks.defined()?sinks.data_ptr<float>():nullptr,causal?positions.data_ptr():nullptr,strides,q.scalar_type()==::tyloi::kFloat16,q.is_contiguous(),causal && positions.scalar_type()==::tyloi::kInt64,int(causal_columns),hot_view(hot),float(scale),out.data_ptr<float>(),meta.data_ptr(),size_t(meta.numel())*sizeof(float),gate.defined(),mfq_current_cuda_stream());
-    if(gate.defined()) return mma_reduce_gated(out,meta,gate,half_output,kv_heads,plan.blocks,plan.parts,1,16);
+    if(gate.defined()) return mma_reduce_gated(out,meta,gate,half_output,kv_heads,plan.blocks,plan.parts,1,plan.head_columns);
     return out;
 }
 void values(std::initializer_list<const DenseTensor*> tensors) {
@@ -101,7 +104,6 @@ static DenseTensor sparse_impl(const DenseTensor& q, const DenseTensor& k, const
     TYLOINFER_RUNTIME_CHECK(std::isfinite(scale), "attention scale must be finite");
     MfqCudaGuard guard(q.device());
     const bool direct_query = fused_query && !v_is_k_view && q.size(3) == 256 &&
-        (q.size(1) == 24 || selected.size(2) <= 512) &&
         (q.scalar_type() == ::tyloi::kFloat16 || q.scalar_type() == ::tyloi::kFloat32);
     auto query = direct_query ? q : q.to(::tyloi::kFloat32).contiguous();
     auto key = k.to(::tyloi::kFloat16).contiguous();
@@ -119,7 +121,7 @@ static DenseTensor sparse_impl(const DenseTensor& q, const DenseTensor& k, const
     const bool use_qsa_mma = !v_is_k_view && q.size(3) == 256;
     const bool use_mla_mma = v_is_k_view && q.size(3) == 512;
     if (use_qsa_mma || use_mla_mma) {
-        constexpr int index_tile = 32;
+        const int index_tile=mma::selection_alignment(use_qsa_mma?256:512,use_qsa_mma?256:512,q.get_device());
         const int64_t source_count = indices.size(2);
         TYLOINFER_RUNTIME_CHECK(
             source_count <= std::numeric_limits<int>::max() - index_tile &&
@@ -139,7 +141,7 @@ static DenseTensor sparse_impl(const DenseTensor& q, const DenseTensor& k, const
         TYLOINFER_RUNTIME_CHECK(
             rows <= std::numeric_limits<int64_t>::max() / padded_count,
             "sparse attention index workspace is too large");
-        raw::prepare_indices(indices.data_ptr<int32_t>(),safe_indices.data_ptr<int32_t>(),mask.data_ptr(),rows,int(source_count),int(padded_count),int(key.size(2)),mfq_current_cuda_stream());
+        raw::prepare_indices(indices.data_ptr<int32_t>(),safe_indices.data_ptr<int32_t>(),mask.data_ptr(),rows,int(source_count),int(padded_count),int(key.size(2)),hot_view(use_qsa_mma?hot:tyloi::cuda::HotKvView{}),mfq_current_cuda_stream());
         TYLOINFER_CUDA_KERNEL_LAUNCH_CHECK();
         if (use_qsa_mma) {
             if(hot.mapping)return run_mma(
@@ -191,7 +193,7 @@ DenseTensor gated(const DenseTensor& attended, const DenseTensor& gate, bool hal
     if (!output.numel()) return output;
     const AttentionEpilogue epilogue{gate.data_ptr(), output.data_ptr(),
         gate.scalar_type() == ::tyloi::kFloat32, half_output,
-        sigmoid(gate.scalar_type() == ::tyloi::kFloat32 && !gate.is_contiguous()), attention_layout(gate)};
+        attention_layout(gate)};
     raw::gated(attended.data_ptr(),attended.scalar_type()==::tyloi::kFloat16,attention_layout(attended),epilogue,output.numel(),output.size(2),output.size(1),output.size(3),mfq_current_cuda_stream());
     TYLOINFER_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
@@ -254,8 +256,9 @@ DenseTensor mma_reduce_gated(const DenseTensor& partial,const DenseTensor& metad
     MfqCudaGuard guard(partial.device());
     auto output=::tyloi::cuda::empty(partial.sizes(),partial.options().dtype(half_output?::tyloi::kFloat16: ::tyloi::kFloat32));
     const char* parallel=tyloi::cuda::env_lookup("TYLOINFER_QSA_PARALLEL_REDUCE");
-    const bool parallel_reduce=!parallel || parallel[0]!='0';
-    if(output.numel())raw::reduce_gated(partial.data_ptr<float>(),metadata.data_ptr(),gate.data_ptr(),output.data_ptr(),attention_layout(gate),output.numel()/width,int(tokens),int(heads),kv_heads,int(width),total_blocks,parts,query_columns,head_columns,gate.scalar_type()==::tyloi::kFloat32,half_output,sigmoid(gate.scalar_type()==::tyloi::kFloat32 && !gate.is_contiguous()),parallel_reduce,mfq_current_cuda_stream());
+    const size_t parallel_shared=size_t(parts)*4*sizeof(float);
+    const bool parallel_reduce=(!parallel || parallel[0]!='0') && parallel_shared+sizeof(float)<=48*1024;
+    if(output.numel())raw::reduce_gated(partial.data_ptr<float>(),metadata.data_ptr(),gate.data_ptr(),output.data_ptr(),attention_layout(gate),output.numel()/width,int(tokens),int(heads),kv_heads,int(width),total_blocks,parts,query_columns,head_columns,gate.scalar_type()==::tyloi::kFloat32,half_output,parallel_reduce,mfq_current_cuda_stream());
     TYLOINFER_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
 }
@@ -295,8 +298,9 @@ DenseTensor causal_gated(const DenseTensor& q, const DenseTensor& k, const Dense
             return fused_mma_gate ? attended : gated(attended, gate, half_output);
         }
         // Prepare the original MMA query, safe indices and validity mask together.
-        TYLOINFER_RUNTIME_CHECK(columns <= INT_MAX - 32, "causal MMA index geometry exceeds 32 bits");
-        const int64_t padded_columns = ((columns + 31) / 32) * 32;
+        const int tile=mma::selection_alignment(256,256,q.get_device());
+        const int64_t padded_columns=((columns+tile-1)/tile)*tile;
+        TYLOINFER_RUNTIME_CHECK(padded_columns<=INT_MAX,"causal MMA index geometry exceeds 32 bits");
         auto query = ::tyloi::cuda::empty(q.sizes(), q.options().dtype(::tyloi::kFloat32));
         auto indices = ::tyloi::cuda::empty({q.size(0), q.size(2), padded_columns}, q.options().dtype(::tyloi::kInt32));
         auto mask = ::tyloi::cuda::empty(indices.sizes(), q.options().dtype(::tyloi::kFloat16));
@@ -322,7 +326,7 @@ DenseTensor causal_gated(const DenseTensor& q, const DenseTensor& k, const Dense
     TYLOINFER_RUNTIME_CHECK(blocks <= INT_MAX, "causal attention exceeds CUDA grid size");
     const AttentionEpilogue epilogue{gate.data_ptr(), output.data_ptr(),
         gate.scalar_type() == ::tyloi::kFloat32, half_output,
-        sigmoid(gate.scalar_type() == ::tyloi::kFloat32 && !gate.is_contiguous()), attention_layout(gate)};
+        attention_layout(gate)};
     raw::sparse(query.data_ptr(),key.data_ptr(),value.data_ptr(),nullptr,scratch.defined()?scratch.data_ptr<float>():nullptr,q.size(0),q.size(1),k.size(1),q.size(2),q.size(3),k.size(2),columns,float(scale),q.scalar_type()==::tyloi::kFloat16,cache_positions.data_ptr(),cache_positions.scalar_type()==::tyloi::kInt64,epilogue,hot_view(hot),mfq_current_cuda_stream());
     TYLOINFER_CUDA_KERNEL_LAUNCH_CHECK();
     return output;

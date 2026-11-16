@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <utility>
+#include <algorithm>
 
 constexpr int SAMPLE_BD = 256;
 constexpr int SAMPLE_GREEDY_CHUNK = 4096;
@@ -62,7 +63,7 @@ static tyloi::cuda::NumericType sample_type(const ::tyloi::DenseTensor& x) {
 
 template<bool Conditional>
 static ::tyloi::DenseTensor sample_top_k_compact_impl(
-    ::tyloi::DenseTensor logits,int64_t top_k,const volatile int32_t* enabled) {
+    ::tyloi::DenseTensor logits,int64_t top_k,const volatile int32_t* enabled, ::tyloi::DenseTensor out = {}) {
     TYLOINFER_RUNTIME_CHECK(logits.is_cuda() && logits.is_contiguous() && logits.dim()==2,
         "sample_top_k_compact: logits must be contiguous CUDA [B,V]");
     TYLOINFER_RUNTIME_CHECK(logits.scalar_type()==::tyloi::kFloat32 ||
@@ -74,7 +75,10 @@ static ::tyloi::DenseTensor sample_top_k_compact_impl(
     const int items=V<=8192?1:V<=65536?4:8;
     const int blocks=(V+SAMPLE_BD*items-1)/(SAMPLE_BD*items);
     // Explicit types keep these non-dependent for nvcc's MSVC-mode front end.
-    ::tyloi::DenseTensor out=::tyloi::cuda::empty({B,top_k},logits.options().dtype(::tyloi::kInt64));
+    if(!out.defined())out=::tyloi::cuda::empty({B,top_k},logits.options().dtype(::tyloi::kInt64));
+    TYLOINFER_RUNTIME_CHECK(out.is_cuda() && out.device()==logits.device() && out.is_contiguous() &&
+        out.scalar_type()==::tyloi::kInt64 && out.dim()==2 && out.size(0)==B && out.size(1)==top_k,
+        "sample_top_k_compact: output must be contiguous int64 CUDA [B,K] on the logit device");
     ::tyloi::DenseTensor a=::tyloi::cuda::empty({int64_t(B)*blocks*top_k},out.options());
     ::tyloi::DenseTensor b=::tyloi::cuda::empty(a.sizes(),a.options());
     tyloi::cuda::sampling_raw::compact(logits.data_ptr(), out.data_ptr<int64_t>(), a.data_ptr<int64_t>(),
@@ -87,9 +91,9 @@ static ::tyloi::DenseTensor sample_top_k_compact_impl(
     return sample_top_k_compact_impl<false>(std::move(logits),top_k,nullptr);
 }
 ::tyloi::DenseTensor sample_top_k_compact_if_cuda(
-        ::tyloi::DenseTensor logits,int64_t top_k,const volatile int32_t* enabled) {
+        ::tyloi::DenseTensor logits,int64_t top_k,const volatile int32_t* enabled,::tyloi::DenseTensor output) {
     TYLOINFER_RUNTIME_CHECK(enabled,"sample_top_k_compact_if: null replay flag");
-    return sample_top_k_compact_impl<true>(std::move(logits),top_k,enabled);
+    return sample_top_k_compact_impl<true>(std::move(logits),top_k,enabled,std::move(output));
 }
 
 ::tyloi::DenseTensor sample_top_k_top_p_cuda(
@@ -180,4 +184,56 @@ void sample_token_counts_add_cuda(::tyloi::DenseTensor counts, ::tyloi::DenseTen
     tyloi::cuda::sampling_raw::penalties(logits.data_ptr(), counts.data_ptr<int32_t>(), vocab_size,
         float(presence_penalty), float(frequency_penalty), float(repetition_penalty), sample_type(logits), mfq_current_cuda_stream());
     return logits;
+}
+
+void sample_publish_packets_cuda(::tyloi::DenseTensor packets,int64_t* mapped_packets) {
+
+    TYLOINFER_RUNTIME_CHECK(packets.is_cuda() && packets.scalar_type()==::tyloi::kInt64 && packets.is_contiguous(),
+        "packet publication requires contiguous int64 CUDA packets");
+    const auto count=packets.numel();if(!count)return;
+    TYLOINFER_RUNTIME_CHECK(mapped_packets && reinterpret_cast<std::uintptr_t>(mapped_packets)%alignof(int64_t)==0,
+        "packet publication requires an aligned mapped output alias");
+    const MfqCudaGuard guard(packets.get_device());
+    const auto stream=mfq_current_cuda_stream();packets.record_stream(reinterpret_cast<std::uintptr_t>(stream));
+    tyloi::cuda::sampling_raw::publish_packets(packets.data_ptr<int64_t>(),mapped_packets,count,stream);
+    TYLOINFER_CUDA_CHECK(cudaGetLastError());
+}
+
+void sample_export_greedy_ids_cuda(::tyloi::DenseTensor packets,::tyloi::DenseTensor ids,int32_t* mapped) {
+
+    TYLOINFER_RUNTIME_CHECK(packets.is_cuda() && ids.is_cuda() && packets.device()==ids.device() &&
+        packets.scalar_type()==::tyloi::kInt64 && ids.scalar_type()==::tyloi::kInt64 &&
+        packets.is_contiguous() && ids.is_contiguous() && packets.numel()==ids.numel(),
+        "greedy packet export requires contiguous int64 packets and IDs on one CUDA device");
+    const auto count=packets.numel();if(!count)return;
+    const MfqCudaGuard guard(packets.get_device());
+    const auto stream=mfq_current_cuda_stream();
+    for(const auto& tensor:{packets,ids})tensor.record_stream(reinterpret_cast<std::uintptr_t>(stream));
+    tyloi::cuda::sampling_raw::export_greedy_ids(packets.data_ptr<int64_t>(),ids.data_ptr<int64_t>(),mapped,count,stream);
+    TYLOINFER_CUDA_CHECK(cudaGetLastError());
+}
+
+::tyloi::DenseTensor sample_greedy_probability_cuda(::tyloi::DenseTensor logits,::tyloi::DenseTensor output,
+        const volatile int32_t* probability_enabled) {
+
+    TYLOINFER_RUNTIME_CHECK(logits.is_cuda() && logits.is_contiguous() && logits.dim()==2 &&
+        logits.size(0)<=INT_MAX && logits.size(1)>0 && logits.size(1)<=INT_MAX,
+        "greedy probability requires contiguous CUDA [B,V] logits within launch limits");
+    TYLOINFER_RUNTIME_CHECK(logits.scalar_type()==::tyloi::kFloat32 || logits.scalar_type()==::tyloi::kFloat16 ||
+        logits.scalar_type()==::tyloi::kBFloat16,"greedy probability requires f32, f16 or bf16 logits");
+    const int batch=int(logits.size(0)),vocabulary=int(logits.size(1)),chunks=(vocabulary-1)/4096+1;
+    TYLOINFER_RUNTIME_CHECK(batch<=INT_MAX/chunks,"greedy probability grid exceeds CUDA launch limits");
+    const MfqCudaGuard guard(logits.get_device());
+    if(!output.defined())output=::tyloi::cuda::empty({batch},logits.options().dtype(::tyloi::kInt64));
+    TYLOINFER_RUNTIME_CHECK(output.is_cuda() && output.device()==logits.device() && output.is_contiguous() &&
+        output.scalar_type()==::tyloi::kInt64 && output.dim()==1 && output.size(0)==batch,
+        "greedy probability output must be contiguous int64 CUDA [B] on the logit device");
+    if(!batch)return output;
+    auto partial=::tyloi::cuda::empty({batch,chunks,2},logits.options().dtype(::tyloi::kInt64));
+    const auto stream=mfq_current_cuda_stream();
+    for(const auto& tensor:{logits,partial,output})tensor.record_stream(reinterpret_cast<std::uintptr_t>(stream));
+    tyloi::cuda::sampling_raw::greedy_probability(logits.data_ptr(),partial.data_ptr<int64_t>(),
+        output.data_ptr<int64_t>(),batch,vocabulary,chunks,probability_enabled,sample_type(logits),stream);
+    TYLOINFER_CUDA_CHECK(cudaGetLastError());
+    return output;
 }

@@ -17,7 +17,7 @@ void activation(const void*, void*, std::int64_t, float, NumericType, bool, cuda
 /** Mix normalized residual streams. */
 void mix(const void*, const void*, void*, std::int64_t, int, int, NumericType, NumericType, cudaStream_t);
 /** Apply the residual update. */
-void post(const void*, const void*, const void*, void*, std::int64_t, int, int, NumericType, cudaStream_t);
+void post(const void*, const void*, const void*, void*, std::int64_t, int, int, NumericType, NumericType, NumericType, cudaStream_t);
 /** Apply the residual update and grouped RMS normalization. */
 void post_norm(const void*, const void*, const void*, const float*, void*, void*,
     std::int64_t, int, int, float, NumericType, NumericType, NumericType, cudaStream_t);
@@ -29,5 +29,8 @@ void live_scores(const void*, const void*, const std::int64_t*, float*, int, int
 cudaError_t prepare_live_topk();
 /** Launch one stage of live top-k reduction. */
 void live_topk(const float*, const std::int64_t*, float*, std::int64_t*, const std::int64_t*,
-    int, int, int, int, int, int, bool, cudaStream_t);
+    int, int, int, int, int, int, bool, std::int32_t*, int, bool, cudaStream_t);
+/** Expand selected block IDs when top-k falls back to the ordinary operation. */
+void selected_blocks(const std::int64_t*, const std::int64_t*, std::int32_t*,
+    int, int, int, int, cudaStream_t);
 }

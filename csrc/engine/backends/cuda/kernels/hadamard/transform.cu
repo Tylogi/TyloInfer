@@ -1,7 +1,6 @@
 
 
 #include <cuda.h>
-#include "engine/backends/cuda/native/tensor/backend.h"
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include "transform.h"
@@ -136,32 +135,4 @@ void apply_f32(const float* input, const std::int8_t* signs, float* output,
         std::int64_t rows, std::int64_t width, int block, bool adjoint, cudaStream_t stream) {
     apply(input, signs, output, rows, width, block, adjoint, stream);
 }
-}
-
-namespace {
-::tyloi::DenseTensor transform_tensor(::tyloi::DenseTensor input,
-        ::tyloi::DenseTensor signs, int64_t block, bool adjoint) {
-    TYLOINFER_RUNTIME_CHECK(input.is_cuda() && input.scalar_type() == ::tyloi::kFloat16 &&
-        input.is_contiguous() && input.dim() == 2, "NEPQ Hadamard input must be CUDA contiguous fp16 rank-2");
-    TYLOINFER_RUNTIME_CHECK(signs.is_cuda() && signs.scalar_type() == ::tyloi::kInt8 &&
-        signs.is_contiguous() && signs.dim() == 1, "NEPQ Hadamard signs must be CUDA contiguous int8 rank-1");
-    TYLOINFER_RUNTIME_CHECK(input.device() == signs.device(), "NEPQ Hadamard tensors must share one CUDA device");
-    TYLOINFER_RUNTIME_CHECK(signs.numel() == input.size(1), "NEPQ Hadamard sign width mismatch");
-    TYLOINFER_RUNTIME_CHECK(block >= 2 && block <= 2048 && (block & (block - 1)) == 0,
-        "NEPQ Hadamard block must be a power of two in [2,2048]");
-    MfqCudaGuard guard(input.device());
-    auto output = ::tyloi::cuda::empty_like(input);
-    tyloi::cuda::hadamard::apply_f16(input.data_ptr<mfq_half>(), signs.data_ptr<int8_t>(),
-        output.data_ptr<mfq_half>(), input.size(0), input.size(1), int(block), adjoint, mfq_current_cuda_stream());
-    return output;
-}
-}
-
-::tyloi::DenseTensor nepq_hadamard_input_cuda(::tyloi::DenseTensor input,
-        ::tyloi::DenseTensor signs, int64_t block) {
-    return transform_tensor(input, signs, block, false);
-}
-::tyloi::DenseTensor nepq_hadamard_adjoint_cuda(::tyloi::DenseTensor input,
-        ::tyloi::DenseTensor signs, int64_t block) {
-    return transform_tensor(input, signs, block, true);
 }

@@ -48,7 +48,7 @@ std::vector<::tyloi::DenseTensor> acc_rms_norm_cuda(::tyloi::DenseTensor a, ::ty
 
     auto sum = ::tyloi::cuda::empty_like(a);
     auto norm = ::tyloi::cuda::empty(a.sizes(), a.options().dtype(::tyloi::kFloat32));
-    tyloi::cuda::acc_raw::rms(a.data_ptr(), b.data_ptr(), weight.data_ptr<float>(), sum.data_ptr(), norm.data_ptr(), N, D, float(eps), float(weight_offset), raw_type(a.scalar_type()), tyloi::cuda::NumericType::f32, mfq_current_cuda_stream());
+    tyloi::cuda::acc_raw::rms(a.data_ptr(), b.data_ptr(), weight.data_ptr<float>(), sum.data_ptr(), norm.data_ptr(), N, D, float(eps), float(weight_offset), raw_type(a.scalar_type()), raw_type(b.scalar_type()), tyloi::cuda::NumericType::f32, mfq_current_cuda_stream());
     return {sum, norm};
 }
 
@@ -60,8 +60,11 @@ std::vector<::tyloi::DenseTensor> acc_rms_norm_f16_cuda(::tyloi::DenseTensor a, 
     TYLOINFER_RUNTIME_CHECK(b.is_cuda() && b.is_contiguous(), "acc_rms_norm_f16: b must be cuda contiguous");
     TYLOINFER_RUNTIME_CHECK(weight.is_cuda() && weight.is_contiguous() && weight.scalar_type() == ::tyloi::kFloat32,
                 "acc_rms_norm_f16: weight must be cuda contiguous f32");
-    TYLOINFER_RUNTIME_CHECK(a.scalar_type() == ::tyloi::kFloat16 && b.scalar_type() == ::tyloi::kFloat16,
-                "acc_rms_norm_f16: a/b must be f16");
+    TYLOINFER_RUNTIME_CHECK(a.scalar_type() == ::tyloi::kFloat16 &&
+                (b.scalar_type() == ::tyloi::kFloat16 || b.scalar_type() == ::tyloi::kFloat32),
+                "acc_rms_norm_f16: a must be f16; b must be f16 or f32");
+    TYLOINFER_RUNTIME_CHECK(a.device() == b.device() && a.device() == weight.device(),
+                "acc_rms_norm_f16: inputs must share a device");
     TYLOINFER_RUNTIME_CHECK(a.sizes() == b.sizes(), "acc_rms_norm_f16: a/b shape mismatch");
     TYLOINFER_RUNTIME_CHECK(a.dim() >= 1, "acc_rms_norm_f16: a must have at least one dim");
     int D = (int)a.size(-1);
@@ -70,7 +73,7 @@ std::vector<::tyloi::DenseTensor> acc_rms_norm_f16_cuda(::tyloi::DenseTensor a, 
 
     auto sum = ::tyloi::cuda::empty_like(a);
     auto norm = ::tyloi::cuda::empty_like(a);
-    tyloi::cuda::acc_raw::rms(a.data_ptr(), b.data_ptr(), weight.data_ptr<float>(), sum.data_ptr(), norm.data_ptr(), N, D, float(eps), float(weight_offset), raw_type(a.scalar_type()), tyloi::cuda::NumericType::f16, mfq_current_cuda_stream());
+    tyloi::cuda::acc_raw::rms(a.data_ptr(), b.data_ptr(), weight.data_ptr<float>(), sum.data_ptr(), norm.data_ptr(), N, D, float(eps), float(weight_offset), raw_type(a.scalar_type()), raw_type(b.scalar_type()), tyloi::cuda::NumericType::f16, mfq_current_cuda_stream());
     return {sum, norm};
 }
 
@@ -95,7 +98,7 @@ std::vector<::tyloi::DenseTensor> acc_rms_norm_bf16_cuda(
                 "acc_rms_norm_bf16: weight length mismatch");
     auto sum = ::tyloi::cuda::empty_like(a);
     auto norm = ::tyloi::cuda::empty_like(a);
-    tyloi::cuda::acc_raw::rms(a.data_ptr(), b.data_ptr(), weight.data_ptr<float>(), sum.data_ptr(), norm.data_ptr(), N, D, float(eps), float(weight_offset), raw_type(a.scalar_type()), tyloi::cuda::NumericType::bf16, mfq_current_cuda_stream());
+    tyloi::cuda::acc_raw::rms(a.data_ptr(), b.data_ptr(), weight.data_ptr<float>(), sum.data_ptr(), norm.data_ptr(), N, D, float(eps), float(weight_offset), raw_type(a.scalar_type()), raw_type(b.scalar_type()), tyloi::cuda::NumericType::bf16, mfq_current_cuda_stream());
     return {sum, norm};
 }
 

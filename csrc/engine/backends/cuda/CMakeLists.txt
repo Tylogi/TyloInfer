@@ -131,8 +131,6 @@ set(TYLOINFER_CUDA_KERNEL_SOURCES
     ${TYLOINFER_CUDA_KERNEL_ROOT}/kv/paged.cu
     ${TYLOINFER_CUDA_KERNEL_ROOT}/moe/routing.cu
     ${TYLOINFER_CUDA_KERNEL_ROOT}/projection/mx/matmul.cu
-    # Generic Hadamard transforms are also used by the default model path.
-    ${TYLOINFER_CUDA_KERNEL_ROOT}/hadamard/transform.cu
     ${TYLOINFER_CUDA_KERNEL_ROOT}/projection/tq/ops.cu
     ${TYLOINFER_CUDA_KERNEL_ROOT}/norm/norm.cu
     ${TYLOINFER_CUDA_KERNEL_ROOT}/rope/rotary.cu
@@ -173,6 +171,9 @@ add_library(mfq-cuda-native-kernels STATIC
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/embedding.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/kv_cache.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/ssm_conv.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/attention/gdn/recurrence.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/rope/rotary.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/sampling/launch.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/glm5_next.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/attention/dense.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/ffn/experts/launch.cpp

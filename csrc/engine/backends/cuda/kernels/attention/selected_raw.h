@@ -7,9 +7,6 @@
 
 namespace tyloi::cuda::selected_raw {
 
-/** Select the original Torch or native sigmoid arithmetic. */
-enum class Sigmoid { torch_float, native_float, native_double };
-
 /** Describe four tensor strides in elements. */
 struct Layout { int64_t batch, token, head, column; };
 
@@ -19,13 +16,13 @@ struct Epilogue {
     void* output = nullptr;
     bool float_gate = false;
     bool half_output = false;
-    Sigmoid sigmoid = Sigmoid::native_float;
     Layout layout{};
 };
 
 /** Pad and validate selected indices for the MMA kernel. */
 void prepare_indices(const int32_t* source, int32_t* indices, void* mask,
-    int64_t rows, int source_count, int padded_count, int cache_length, cudaStream_t stream);
+    int64_t rows, int source_count, int padded_count, int cache_length,
+    sparse_mma_raw::Hot hot, cudaStream_t stream);
 
 /** Run the original generic selected or causal attention kernel. */
 void sparse(const void* query, const void* key, const void* value, const int32_t* indices,
@@ -54,6 +51,6 @@ void prepare_causal(const void* query, bool half_query, Layout layout, float* co
 void reduce_gated(const float* partial, const void* metadata, const void* gate,
     void* output, Layout gate_layout, int64_t rows, int tokens, int heads, int kv_heads,
     int width, int total_blocks, int parts, int query_columns, int head_columns,
-    bool float_gate, bool half_output, Sigmoid sigmoid, bool parallel, cudaStream_t stream);
+    bool float_gate, bool half_output, bool parallel, cudaStream_t stream);
 
 } // namespace tyloi::cuda::selected_raw

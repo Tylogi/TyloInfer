@@ -21,10 +21,11 @@ struct Args {
     float* next = nullptr;
     float* decay = nullptr;
     float* beta_out = nullptr;
+    const int32_t *row_exponents = nullptr, *column_exponents = nullptr;
     int batch = 0, tokens = 0, channels = 0, kernel = 0;
     int nk = 0, nv = 0, dk = 0, dv = 0, layout = 0, has_bias = 0;
     float eps = 0;
-    bool half_gate = false;
+    bool half_gate = false, input_float = false, stable_softplus = true;
     int64_t q_stride0 = 0, q_stride1 = 0;
     int64_t a_stride0 = 0, a_stride1 = 0, b_stride0 = 0, b_stride1 = 0;
 };
@@ -32,6 +33,8 @@ struct Args {
 void prefill(const Args&, cudaStream_t);
 /** Run the F32 decode convolution and update state in place. */
 void decode(const Args&, cudaStream_t);
+/** Run fused F32 QKV decode and update state in place. */
+void qkv_decode_f32(const Args&, cudaStream_t);
 /** Run fused QKV decode and update state in place. */
 void qkv_decode(const Args&, cudaStream_t);
 /** Run fused QKV and gate decode and update state in place. */

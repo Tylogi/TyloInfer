@@ -8,6 +8,8 @@
 #include <cstdlib>
 #include <limits>
 #include <type_traits>
+#include <atomic>
+#include <cstdio>
 #include "qwen4_raw.h"
 
 namespace mfq_qwen4_exp {
@@ -132,6 +134,44 @@ std::vector<DenseTensor> gated_residual_pre(
     return {mixed, input, injection};
 }
 
+bool try_gated_residual_post_out(const DenseTensor& branch,const DenseTensor& residual,
+        const DenseTensor& injection,const DenseTensor& output,int64_t streams) {
+    const auto supported=[](const DenseTensor& t){return t.defined() && t.is_cuda() && t.is_contiguous() &&
+        (t.scalar_type()==::tyloi::kFloat16 || t.scalar_type()==::tyloi::kFloat32);};
+    if(streams<1 || streams>INT_MAX || !supported(branch) || !supported(residual) || !supported(injection) ||
+            !supported(output) || branch.device()!=residual.device() || injection.device()!=residual.device() ||
+            output.device()!=residual.device() || branch.dim()<1 || branch.size(-1)<1 || branch.size(-1)>INT_MAX ||
+            branch.dim()!=residual.dim() || branch.dim()!=injection.dim() || output.sizes()!=residual.sizes())return false;
+    auto shape=branch.sizes().vec();shape.back()*=streams;
+    if(shape!=residual.sizes().vec())return false;
+    shape.back()=streams;if(shape!=injection.sizes().vec())return false;
+    const int mode=(branch.scalar_type()==::tyloi::kFloat32?4:0) |
+        (residual.scalar_type()==::tyloi::kFloat32?2:0) | (injection.scalar_type()==::tyloi::kFloat32?1:0);
+    if(output.scalar_type()!=(mode?::tyloi::kFloat32: ::tyloi::kFloat16))return false;
+    if(!output.numel())return true;
+    const auto overlap=[](const DenseTensor& a,const DenseTensor& b) {
+        const auto x=reinterpret_cast<std::uintptr_t>(a.data_ptr()),y=reinterpret_cast<std::uintptr_t>(b.data_ptr());
+        return x<=y?y-x<a.nbytes():x-y<b.nbytes();
+    };
+    if(overlap(output,branch) || overlap(output,injection) ||
+            (overlap(output,residual) && output.data_ptr()!=residual.data_ptr()))return false;
+    const MfqCudaGuard guard(residual.device());
+    const auto count=output.numel();const int hidden=int(branch.size(-1));
+    const auto stream=mfq_current_cuda_stream();
+    raw::post(branch.data_ptr(),residual.data_ptr(),injection.data_ptr(),output.data_ptr(),
+        count,hidden,int(streams),raw_type(branch),raw_type(residual),raw_type(injection),stream);
+    TYLOINFER_CUDA_KERNEL_LAUNCH_CHECK();
+    for(const auto& t:{branch,residual,injection,output})t.record_stream(reinterpret_cast<std::uintptr_t>(stream));
+    if(const auto* trace=tyloi::cuda::env_lookup("TYLOINFER_TRACE_KERNEL_DISPATCH");trace && trace[0]=='1' && branch.numel()/hidden>32) {
+        static std::atomic<unsigned> reported{0};
+        const bool inplace=output.data_ptr()==residual.data_ptr();const unsigned bit=inplace?1:2;
+        if(!(reported.fetch_or(bit,std::memory_order_relaxed)&bit))std::fprintf(stderr,
+            "native_gr_prefill_post actual_match=1 M=%lld hidden=%d streams=%lld type_flags=%d inplace=%d\n",
+            static_cast<long long>(branch.numel()/hidden),hidden,static_cast<long long>(streams),mode,int(inplace));
+    }
+    return true;
+}
+
 DenseTensor gated_residual_post(const DenseTensor& branch, const DenseTensor& residual,
                            const DenseTensor& injection, int64_t streams) {
     mfq_selected_attention::values({&branch, &residual, &injection});
@@ -143,13 +183,13 @@ DenseTensor gated_residual_post(const DenseTensor& branch, const DenseTensor& re
     shape.back() = streams;
     TYLOINFER_RUNTIME_CHECK(injection.sizes().vec() == shape, "Qwen4 injection shape disagrees");
     MfqCudaGuard guard(branch.device());
+    const auto value=[](const DenseTensor& t){return t.scalar_type()==::tyloi::kFloat16 || t.scalar_type()==::tyloi::kFloat32;};
     if(branch.is_contiguous() && residual.is_contiguous() && injection.is_contiguous() &&
-        branch.scalar_type()==residual.scalar_type() && branch.scalar_type()==injection.scalar_type() &&
-        (branch.scalar_type()==::tyloi::kFloat16 || branch.scalar_type()==::tyloi::kFloat32)) {
-        auto output=::tyloi::cuda::empty_like(residual);const auto count=output.numel();
-        if(count==0)return output;
-        raw::post(branch.data_ptr(),residual.data_ptr(),injection.data_ptr(),output.data_ptr(),count,int(branch.size(-1)),int(streams),raw_type(branch),mfq_current_cuda_stream());
-        return output;
+            value(branch) && value(residual) && value(injection)) {
+        const auto dtype=branch.scalar_type()==::tyloi::kFloat32 || residual.scalar_type()==::tyloi::kFloat32 ||
+            injection.scalar_type()==::tyloi::kFloat32?::tyloi::kFloat32: ::tyloi::kFloat16;
+        auto output=::tyloi::cuda::empty(residual.sizes(),residual.options().dtype(dtype));
+        if(try_gated_residual_post_out(branch,residual,injection,output,streams))return output;
     }
     return residual + (branch.unsqueeze(-2) * injection.unsqueeze(-1)).reshape(residual.sizes());
 }
@@ -221,29 +261,66 @@ DenseTensor live_block_scores(const DenseTensor& query,const DenseTensor& pooled
     TYLOINFER_CUDA_KERNEL_LAUNCH_CHECK();return out;
 }
 
-DenseTensor live_topk_blocks(const DenseTensor& scores,const DenseTensor& positions,int64_t pool,int64_t count) {
+static DenseTensor live_topk_impl(const DenseTensor& scores,const DenseTensor& positions,int64_t pool,int64_t count,int64_t budget,bool emit_blocks=false) {
+    TYLOINFER_RUNTIME_CHECK(!budget || (pool>0 && pool<=INT_MAX && budget>0 &&
+        budget<=INT_MAX-pool && count<=budget/pool),"invalid live QSA token selection geometry");
     const auto* option=tyloi::cuda::env_lookup("TYLOINFER_QSA_LIVE_TOPK");
-    if((option && option[0]=='0') || count>1024)
-        return std::get<1>(::tyloi::cuda::topk(scores,count,-1,true,false));
+    if((option && option[0]=='0') || count>1024) {
+        auto ids=std::get<1>(::tyloi::cuda::topk(scores,count,-1,true,false));
+        if(emit_blocks) {
+            auto selected=::tyloi::cuda::empty({1,scores.size(1),(budget+2*pool-2)/pool,2},scores.options().dtype(::tyloi::kInt32));
+            raw::selected_blocks(ids.data_ptr<int64_t>(),positions.data_ptr<int64_t>(),selected.data_ptr<int32_t>(),
+                int(scores.size(1)),int(pool),int(count),int(budget),mfq_current_cuda_stream());
+            TYLOINFER_CUDA_KERNEL_LAUNCH_CHECK();return selected;
+        }
+        return budget?mfq_selected_attention::block_indices_to_tokens(ids,positions,pool,budget):ids;
+    }
     TYLOINFER_RUNTIME_CHECK(scores.is_cuda() && scores.is_contiguous() && scores.dim()==3 && scores.size(0)==1 &&
         scores.scalar_type()==::tyloi::kFloat32 && positions.is_cuda() && positions.is_contiguous() &&
         positions.scalar_type()==::tyloi::kInt64 && positions.numel()==scores.size(1) && pool>0 &&
-        count>0 && count<=scores.size(2),"invalid live QSA top-k geometry");
+        count>0 && count<=scores.size(2) && scores.size(1)<=INT_MAX && scores.size(2)<=INT_MAX,
+        "invalid live QSA top-k geometry");
     MfqCudaGuard guard(scores.device());
     const int rows=int(scores.size(1)),pools=int(scores.size(2));
     const auto* compact_option=tyloi::cuda::env_lookup("TYLOINFER_QSA_TOPK_LIVE_TILE");
     const bool compact=!compact_option || compact_option[0]!='0';
     int columns=pools,stage=0;
     auto keys=scores;DenseTensor ids;
+    DenseTensor selected;
+    if(budget)selected=emit_blocks?
+        ::tyloi::cuda::empty({1,rows,(budget+2*pool-2)/pool,2},scores.options().dtype(::tyloi::kInt32)):
+        ::tyloi::cuda::empty({1,rows,budget+pool-1},scores.options().dtype(::tyloi::kInt32));
     TYLOINFER_CUDA_CHECK(raw::prepare_live_topk());
     do {
-        const int tiles=(columns+4095)/4096;
+        const int tiles=int((int64_t(columns)+4095)/4096);
         auto next=::tyloi::cuda::empty({1,rows,tiles*count},scores.options());
         auto next_ids=::tyloi::cuda::empty(next.sizes(),scores.options().dtype(::tyloi::kInt64));
-        raw::live_topk(keys.data_ptr<float>(),ids.defined()?ids.data_ptr<int64_t>():nullptr,next.data_ptr<float>(),next_ids.data_ptr<int64_t>(),positions.data_ptr<int64_t>(),rows,columns,pools,int(pool),int(count),stage++,compact,mfq_current_cuda_stream());
+        raw::live_topk(keys.data_ptr<float>(),ids.defined()?ids.data_ptr<int64_t>():nullptr,
+            next.data_ptr<float>(),next_ids.data_ptr<int64_t>(),positions.data_ptr<int64_t>(),rows,columns,pools,
+            int(pool),int(count),stage,compact,selected.defined()?selected.data_ptr<int32_t>():nullptr,
+            int(budget),emit_blocks,mfq_current_cuda_stream());
+        ++stage;
         TYLOINFER_CUDA_KERNEL_LAUNCH_CHECK();keys=std::move(next);ids=std::move(next_ids);columns=tiles*int(count);
     } while(columns>count);
-    return ids;
+    return budget?selected:ids;
+}
+
+DenseTensor live_topk_blocks(const DenseTensor& scores,const DenseTensor& positions,int64_t pool,int64_t count) {
+    return live_topk_impl(scores,positions,pool,count,0);
+}
+
+DenseTensor live_topk_selected_tokens(const DenseTensor& scores,const DenseTensor& positions,int64_t pool,int64_t count,int64_t budget) {
+    return live_topk_impl(scores,positions,pool,count,budget);
+}
+
+DenseTensor live_topk_selected_blocks(const DenseTensor& scores,const DenseTensor& positions,int64_t pool,int64_t count,int64_t budget) {
+    TYLOINFER_RUNTIME_CHECK(scores.is_cuda() && scores.is_contiguous() && scores.dim()==3 && scores.size(0)==1 &&
+        scores.scalar_type()==::tyloi::kFloat32 && positions.is_cuda() && positions.is_contiguous() &&
+        positions.scalar_type()==::tyloi::kInt64 && positions.numel()==scores.size(1) && count<=scores.size(2) &&
+        scores.size(1)<=INT_MAX && scores.size(2)<=INT_MAX && pool>0 && pool<=32 && budget>0 && budget%pool==0 &&
+        budget<=INT_MAX-2*pool && count>0 && count<=budget/pool,
+        "invalid live QSA block-mask geometry");
+    return live_topk_impl(scores,positions,pool,count,budget,true);
 }
 
 std::vector<DenseTensor> ple_dilated_conv_silu(const DenseTensor& input,

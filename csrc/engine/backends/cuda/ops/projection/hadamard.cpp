@@ -1,5 +1,5 @@
 #include "backend.h"
-#include "engine/backends/cuda/kernels/projection/nepq/raw.h"
+#include "engine/backends/cuda/kernels/hadamard/transform.h"
 
 /** Apply the signed block Hadamard transform to CUDA activations. */
 ::tyloi::DenseTensor nepq_hadamard_input_cuda(
@@ -20,13 +20,15 @@
         "NEPQ Hadamard block must be a power of two in [2,2048]");
     const int rows = static_cast<int>(input.size(0));
     const int width = static_cast<int>(input.size(1));
+    TYLOINFER_RUNTIME_CHECK(input.device() == signs.device(),
+        "NEPQ Hadamard tensors must share one CUDA device");
     TYLOINFER_RUNTIME_CHECK(signs.numel() == width, "NEPQ Hadamard sign width mismatch");
     TYLOINFER_RUNTIME_CHECK(width % block_size == 0, "NEPQ Hadamard block must divide K");
     MfqCudaGuard guard(input.device());
     auto output = ::tyloi::cuda::empty_like(input);
     cudaStream_t stream = mfq_current_cuda_stream();
-    tyloi::cuda::nepq_raw::input(input.data_ptr(), signs.data_ptr<int8_t>(),
-        output.data_ptr(), rows, width, static_cast<int>(block_size), stream);
+    tyloi::cuda::hadamard::apply_f16(input.data_ptr(), signs.data_ptr<int8_t>(),
+        output.data_ptr(), rows, width, static_cast<int>(block_size), false, stream);
     TYLOINFER_RUNTIME_CHECK(cudaGetLastError() == cudaSuccess,
                 "NEPQ Hadamard input kernel launch failed");
     return output;
@@ -63,8 +65,8 @@
     if (rows == 0) {
         return output;
     }
-    tyloi::cuda::nepq_raw::adjoint(input.data_ptr(), signs.data_ptr<int8_t>(),
-        output.data_ptr(), rows, width, static_cast<int>(block_size),
+    tyloi::cuda::hadamard::apply_f16(input.data_ptr(), signs.data_ptr<int8_t>(),
+        output.data_ptr(), rows, width, static_cast<int>(block_size), true,
         mfq_current_cuda_stream());
     TYLOINFER_CUDA_KERNEL_LAUNCH_CHECK();
     return output;

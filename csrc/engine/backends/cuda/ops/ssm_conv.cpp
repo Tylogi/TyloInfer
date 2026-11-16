@@ -1,6 +1,7 @@
 #include "backend.h"
 #include "engine/backends/cuda/kernels/recurrent/convolution_raw.h"
 #include <cstdint>
+#include <climits>
 #include <vector>
 
 ::tyloi::DenseTensor ssm_conv_silu_cuda(::tyloi::DenseTensor conv_input, ::tyloi::DenseTensor weight, ::tyloi::DenseTensor bias, int64_t n_tokens)
@@ -197,10 +198,10 @@ std::vector<::tyloi::DenseTensor> linear_conv_qkv_prefill_cuda(
 {
     TYLOINFER_RUNTIME_CHECK(state.is_cuda() && state.is_contiguous() && state.scalar_type() == ::tyloi::kFloat32,
                 "linear_conv_qkv_prefill: state must be contiguous CUDA f32");
-    TYLOINFER_RUNTIME_CHECK(qk.is_cuda() && qk.is_contiguous() && qk.scalar_type() == ::tyloi::kHalf,
-                "linear_conv_qkv_prefill: qk must be contiguous CUDA f16");
-    TYLOINFER_RUNTIME_CHECK(v.is_cuda() && v.is_contiguous() && v.scalar_type() == ::tyloi::kHalf,
-                "linear_conv_qkv_prefill: v must be contiguous CUDA f16");
+    TYLOINFER_RUNTIME_CHECK(qk.is_cuda() && qk.is_contiguous() && (qk.scalar_type() == ::tyloi::kHalf || qk.scalar_type() == ::tyloi::kFloat32),
+                "linear_conv_qkv_prefill: qk must be contiguous CUDA f16/f32");
+    TYLOINFER_RUNTIME_CHECK(v.is_cuda() && v.is_contiguous() && v.scalar_type() == qk.scalar_type(),
+                "linear_conv_qkv_prefill: v must match contiguous CUDA qk dtype");
     TYLOINFER_RUNTIME_CHECK(weight.is_cuda() && weight.is_contiguous() && weight.scalar_type() == ::tyloi::kFloat32,
                 "linear_conv_qkv_prefill: weight must be contiguous CUDA f32");
     TYLOINFER_RUNTIME_CHECK(bias.is_cuda() && bias.is_contiguous() && bias.scalar_type() == ::tyloi::kFloat32,
@@ -238,21 +239,24 @@ std::vector<::tyloi::DenseTensor> linear_conv_qkv_prefill_cuda(
     a.state=state.data_ptr<float>(); a.qk=qk.data_ptr(); a.v=v.data_ptr(); a.weight=weight.data_ptr<float>(); a.bias=bias.data_ptr<float>();
     a.q=qo.data_ptr<float>(); a.k=ko.data_ptr<float>(); a.output=vo.data_ptr<float>(); a.next=new_state.data_ptr<float>();
     a.batch=B; a.tokens=T; a.channels=C; a.nk=int(nk); a.nv=int(nv); a.dk=int(dk); a.dv=int(dv); a.kernel=K; a.layout=layout; a.has_bias=has_bias; a.eps=float(eps);
+    a.input_float=qk.scalar_type()==::tyloi::kFloat32;
     tyloi::cuda::ssm_conv_raw::qkv_prefill(a, mfq_current_cuda_stream());
     return {qo,ko,vo,new_state};
 }
 
-std::vector<::tyloi::DenseTensor> linear_conv_qkv_gate_short_cuda(
+static std::vector<::tyloi::DenseTensor> linear_conv_qkv_gate_prefill_impl(
     ::tyloi::DenseTensor state,::tyloi::DenseTensor qkv,
     ::tyloi::DenseTensor weight,::tyloi::DenseTensor alpha,
     ::tyloi::DenseTensor beta,::tyloi::DenseTensor dt_bias,
-    ::tyloi::DenseTensor a_log,int64_t nk,int64_t nv,int64_t width,double eps)
+    ::tyloi::DenseTensor a_log,int64_t nk,int64_t nv,int64_t width,double eps,
+    bool stable_softplus,::tyloi::DenseTensor row_exponents,::tyloi::DenseTensor column_exponents)
 {
-    TYLOINFER_RUNTIME_CHECK(qkv.is_cuda() && qkv.scalar_type()==::tyloi::kFloat16 &&
-        qkv.dim()==3 && qkv.size(1)>=2 && qkv.size(1)<=8 && nk>0 && nv>0 && nv%nk==0 &&
+
+    TYLOINFER_RUNTIME_CHECK(qkv.is_cuda() && (qkv.scalar_type()==::tyloi::kFloat16 || qkv.scalar_type()==::tyloi::kFloat32) &&
+        qkv.dim()==3 && qkv.size(1)>=2 && qkv.size(1)<=INT_MAX && nk>0 && nv>0 && nv%nk==0 &&
         width>0 && width<=256 && qkv.stride(2)==1 && qkv.stride(1)>=qkv.size(2) &&
         (qkv.size(0)==1 || qkv.stride(0)>=qkv.size(1)*qkv.stride(1)),
-        "short GDN requires row-strided half QKV and 2-8 tokens");
+        "GDN fused preparation requires row-strided f16/f32 QKV and at least 2 tokens");
     const int B=int(qkv.size(0)),T=int(qkv.size(1)),K=int(state.size(1))+1;
     const int qkC=int(2*nk*width),vsz=int(nv*width),C=qkC+vsz;
     TYLOINFER_RUNTIME_CHECK(state.is_cuda() && state.is_contiguous() && state.scalar_type()==::tyloi::kFloat32 &&
@@ -269,6 +273,15 @@ std::vector<::tyloi::DenseTensor> linear_conv_qkv_gate_short_cuda(
         beta.scalar_type()==alpha.scalar_type() &&
         (alpha.scalar_type()==::tyloi::kFloat16 || alpha.scalar_type()==::tyloi::kFloat32) &&
         dt_bias.numel()==nv && a_log.numel()==nv,"short GDN gate geometry disagrees");
+    const bool scaled=row_exponents.defined();
+    TYLOINFER_RUNTIME_CHECK(scaled==column_exponents.defined(),"scaled convolution requires both exponent vectors");
+    if(scaled)for(const auto* tensor:{&row_exponents,&column_exponents})
+        TYLOINFER_RUNTIME_CHECK(tensor->is_cuda() && tensor->device()==qkv.device() && tensor->is_contiguous() &&
+            tensor->scalar_type()==::tyloi::kInt32,"scaled convolution exponents must be contiguous device int32");
+    TYLOINFER_RUNTIME_CHECK(!scaled || (qkv.scalar_type()==::tyloi::kFloat16 && row_exponents.numel()==int64_t(B)*T &&
+        column_exponents.numel()==C),"scaled convolution exponent geometry disagrees");
+    const auto* re=scaled?row_exponents.data_ptr<int32_t>():nullptr;
+    const auto* ce=scaled?column_exponents.data_ptr<int32_t>():nullptr;
     const int layout=weight.dim()==2?1:0;
     TYLOINFER_RUNTIME_CHECK(layout?weight.sizes().vec()==std::vector<int64_t>({K,C}):
         weight.sizes().vec()==std::vector<int64_t>({C,1,K}),"short GDN convolution weight geometry disagrees");
@@ -276,10 +289,75 @@ std::vector<::tyloi::DenseTensor> linear_conv_qkv_gate_short_cuda(
     auto q=::tyloi::cuda::empty({B,nk,T,width},options),k=::tyloi::cuda::empty_like(q),v=::tyloi::cuda::empty({B,nv,T,width},options);
     auto next=::tyloi::cuda::empty_like(state),decay=::tyloi::cuda::empty({B,nv,T},options),bt=::tyloi::cuda::empty_like(decay);
     tyloi::cuda::ssm_conv_raw::Args a;
-    a.state=state.data_ptr<float>(); a.qk=qkv.data_ptr(); a.weight=weight.data_ptr<float>(); a.alpha=alpha.data_ptr(); a.beta=beta.data_ptr();
-    a.dt_bias=dt_bias.data_ptr<float>(); a.a_log=a_log.data_ptr<float>(); a.q=q.data_ptr<float>(); a.k=k.data_ptr<float>(); a.output=v.data_ptr<float>(); a.next=next.data_ptr<float>(); a.decay=decay.data_ptr<float>(); a.beta_out=bt.data_ptr<float>();
-    a.batch=B; a.tokens=T; a.channels=C; a.nk=int(nk); a.nv=int(nv); a.dk=int(width); a.dv=int(width); a.kernel=K; a.layout=layout; a.eps=float(eps);
-    a.half_gate=alpha.scalar_type()==::tyloi::kFloat16; a.q_stride0=qkv.stride(0); a.q_stride1=qkv.stride(1); a.a_stride0=alpha.stride(0); a.a_stride1=alpha.stride(1); a.b_stride0=beta.stride(0); a.b_stride1=beta.stride(1);
-    tyloi::cuda::ssm_conv_raw::qkv_gate_short(a, mfq_current_cuda_stream());
+    a.state=state.data_ptr<float>();a.qk=qkv.data_ptr();a.weight=weight.data_ptr<float>();a.alpha=alpha.data_ptr();a.beta=beta.data_ptr();
+    a.dt_bias=dt_bias.data_ptr<float>();a.a_log=a_log.data_ptr<float>();a.q=q.data_ptr<float>();a.k=k.data_ptr<float>();a.output=v.data_ptr<float>();
+    a.next=next.data_ptr<float>();a.decay=decay.data_ptr<float>();a.beta_out=bt.data_ptr<float>();a.row_exponents=re;a.column_exponents=ce;
+    a.batch=B;a.tokens=T;a.channels=C;a.nk=int(nk);a.nv=int(nv);a.dk=int(width);a.dv=int(width);a.kernel=K;a.layout=layout;a.eps=float(eps);
+    a.input_float=qkv.scalar_type()==::tyloi::kFloat32;a.half_gate=alpha.scalar_type()==::tyloi::kFloat16;a.stable_softplus=stable_softplus;
+    a.q_stride0=qkv.stride(0);a.q_stride1=qkv.stride(1);a.a_stride0=alpha.stride(0);a.a_stride1=alpha.stride(1);a.b_stride0=beta.stride(0);a.b_stride1=beta.stride(1);
+    tyloi::cuda::ssm_conv_raw::qkv_gate_short(a,mfq_current_cuda_stream());
     return {q,k,v,next,decay,bt};
+}
+
+std::vector<::tyloi::DenseTensor> linear_conv_qkv_gate_prefill_cuda(
+    ::tyloi::DenseTensor state,::tyloi::DenseTensor qkv,
+    ::tyloi::DenseTensor weight,::tyloi::DenseTensor alpha,::tyloi::DenseTensor beta,
+    ::tyloi::DenseTensor dt_bias,::tyloi::DenseTensor a_log,int64_t nk,int64_t nv,int64_t width,
+    double eps,bool stable_softplus) {
+    return linear_conv_qkv_gate_prefill_impl(state,qkv,weight,alpha,beta,dt_bias,a_log,nk,nv,width,eps,stable_softplus,{},{});
+}
+
+std::vector<::tyloi::DenseTensor> linear_conv_qkv_gate_scaled_prefill_cuda(
+    ::tyloi::DenseTensor state,::tyloi::DenseTensor product,
+    ::tyloi::DenseTensor row_exponents,::tyloi::DenseTensor column_exponents,
+    ::tyloi::DenseTensor weight,::tyloi::DenseTensor alpha,::tyloi::DenseTensor beta,
+    ::tyloi::DenseTensor dt_bias,::tyloi::DenseTensor a_log,int64_t nk,int64_t nv,int64_t width,
+    double eps,bool stable_softplus) {
+    return linear_conv_qkv_gate_prefill_impl(state,product,weight,alpha,beta,dt_bias,a_log,nk,nv,width,eps,stable_softplus,
+        row_exponents,column_exponents);
+}
+
+std::vector<::tyloi::DenseTensor> linear_conv_qkv_gate_prefill_cuda(
+    ::tyloi::DenseTensor state,::tyloi::DenseTensor qkv,
+    ::tyloi::DenseTensor weight,::tyloi::DenseTensor alpha,::tyloi::DenseTensor beta,
+    ::tyloi::DenseTensor dt_bias,::tyloi::DenseTensor a_log,int64_t nk,int64_t nv,int64_t width,double eps) {
+    return linear_conv_qkv_gate_prefill_cuda(state,qkv,weight,alpha,beta,dt_bias,a_log,nk,nv,width,eps,true);
+}
+
+std::vector<::tyloi::DenseTensor> linear_conv_qkv_gate_short_cuda(
+    ::tyloi::DenseTensor state,::tyloi::DenseTensor qkv,
+    ::tyloi::DenseTensor weight,::tyloi::DenseTensor alpha,::tyloi::DenseTensor beta,
+    ::tyloi::DenseTensor dt_bias,::tyloi::DenseTensor a_log,int64_t nk,int64_t nv,int64_t width,double eps) {
+    return linear_conv_qkv_gate_prefill_cuda(state,qkv,weight,alpha,beta,dt_bias,a_log,nk,nv,width,eps);
+}
+
+std::vector<::tyloi::DenseTensor> linear_conv_qkv_decode_f32_cuda(
+        ::tyloi::DenseTensor state,::tyloi::DenseTensor input,
+        ::tyloi::DenseTensor weight,::tyloi::DenseTensor bias,
+        int64_t nk,int64_t nv,int64_t dk,int64_t dv,double eps) {
+
+    TYLOINFER_RUNTIME_CHECK(state.is_cuda() && state.is_contiguous() && state.scalar_type()==::tyloi::kFloat32 &&
+        state.dim()==3 && state.size(0)>0 && state.size(1)>0 && nk>0 && nv>0 && nv%nk==0 && dk>0 && dk<=256 && dv>0,
+        "F32 convolution decode state/geometry disagrees");
+    const auto batch=state.size(0),taps=state.size(1)+1,width=2*nk*dk+nv*dv;
+    TYLOINFER_RUNTIME_CHECK(batch<=65535 && width<=INT_MAX && taps<=INT_MAX &&
+        2*nk+(nv*dv+255)/256<=INT_MAX,"F32 convolution decode exceeds CUDA grid bounds");
+    const auto same=[&](const ::tyloi::DenseTensor& x){return x.is_cuda() && x.device()==state.device() &&
+        x.is_contiguous() && x.scalar_type()==::tyloi::kFloat32;};
+    TYLOINFER_RUNTIME_CHECK(same(input) && input.sizes().vec()==std::vector<int64_t>({batch,1,width}) &&
+        state.size(2)==width,"F32 convolution decode projection disagrees");
+    TYLOINFER_RUNTIME_CHECK(same(weight) && same(bias) &&
+        (bias.numel()==0 || (bias.dim()==1 && bias.numel()==width)),"F32 convolution decode parameters disagree");
+    const bool channels_first=weight.sizes().vec()==std::vector<int64_t>({width,1,taps}) ||
+        weight.sizes().vec()==std::vector<int64_t>({width,taps});
+    TYLOINFER_RUNTIME_CHECK(channels_first || weight.sizes().vec()==std::vector<int64_t>({taps,width}),
+        "F32 convolution decode weight geometry disagrees");
+    MfqCudaGuard guard(state.device());
+    auto q=::tyloi::cuda::empty({batch,nk,1,dk},state.options()),k=::tyloi::cuda::empty_like(q),v=::tyloi::cuda::empty({batch,nv,1,dv},state.options());
+    tyloi::cuda::ssm_conv_raw::Args a;
+    a.state=state.data_ptr<float>();a.input=input.data_ptr<float>();a.weight=weight.data_ptr<float>();
+    a.bias=bias.numel()?bias.data_ptr<float>():nullptr;a.q=q.data_ptr<float>();a.k=k.data_ptr<float>();a.output=v.data_ptr<float>();
+    a.batch=int(batch);a.nk=int(nk);a.nv=int(nv);a.dk=int(dk);a.dv=int(dv);a.kernel=int(taps);a.layout=channels_first?0:1;a.eps=float(eps);
+    tyloi::cuda::ssm_conv_raw::qkv_decode_f32(a,mfq_current_cuda_stream());
+    return {q,k,v};
 }
