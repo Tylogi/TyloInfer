@@ -1,3 +1,4 @@
+#include "engine/weights/cache/metal_mfe.h"
 #include "mlx_deepseek_v4_causal_lm.h"
 
 #include "mfe_expert_store.h"

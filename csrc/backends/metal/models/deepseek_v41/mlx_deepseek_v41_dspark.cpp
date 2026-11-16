@@ -1,3 +1,4 @@
+#include "engine/weights/cache/metal_mfe.h"
 #include "mlx_projection_batch.h"
 #include "mlx_deepseek_v41_dspark.h"
 

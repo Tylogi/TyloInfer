@@ -1,5 +1,6 @@
 #pragma once
 
+#include "engine/weights/cache/metal_mfe.h"
 #include "deepseek_v41_model.h"
 #include "mlx_deepseek_v41_mhc.h"
 #include "mlx_deepseek_v41_moe.h"

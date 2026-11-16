@@ -1,3 +1,4 @@
+#include "engine/weights/cache/metal_mfe.h"
 #include "mlx_deepseek_v4_moe.h"
 
 #include "engine/backends/metal/native/profile.h"

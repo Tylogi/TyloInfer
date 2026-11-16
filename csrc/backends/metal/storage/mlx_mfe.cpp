@@ -1,3 +1,4 @@
+#include "engine/weights/cache/metal_mfe.h"
 #include "engine/backends/metal/ops/mfq/mlx_moe.h"
 #include "engine/weights/source/source.h"
 #include "mfq_container.h"

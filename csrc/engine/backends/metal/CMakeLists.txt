@@ -506,6 +506,7 @@ if(TYLOINFER_ENABLE_MFQ_COMPAT)
     )
     target_sources(mfq-metal-engine PRIVATE
         ${PROJECT_SOURCE_DIR}/engine/tensor/encoding/metal_experts.cpp
+        ${PROJECT_SOURCE_DIR}/engine/weights/cache/metal_mfe.cpp
     )
     target_sources(mfq-metal-runtime PRIVATE
         ${PROJECT_SOURCE_DIR}/backends/metal/storage/mlx_mfe.cpp

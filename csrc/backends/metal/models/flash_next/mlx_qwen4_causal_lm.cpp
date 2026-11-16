@@ -1,3 +1,4 @@
+#include "engine/weights/cache/metal_mfe.h"
 #include "mlx_projection_batch.h"
 #include "mlx_qwen4_causal_lm.h"
 #include "engine/backends/metal/ops/attention/attention.h"
