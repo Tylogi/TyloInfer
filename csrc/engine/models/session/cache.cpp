@@ -1,6 +1,6 @@
 #include "engine/models/session/cache.h"
 
-#include "components/host_memory.h"
+#include "engine/memory/host.h"
 #include "engine/config.h"
 #include "engine/models/session/codec.h"
 #include "engine/state/session/prefix_cache.h"

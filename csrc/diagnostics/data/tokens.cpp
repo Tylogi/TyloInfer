@@ -11,7 +11,7 @@
 #include "engine/requests/output.h"
 #include "engine/weights/cache/cache.h"
 #include "engine/weights/loader.h"
-#include "components/io/file_range_reader.h"
+#include "engine/io/file_range_reader.h"
 
 #include <cuda_profiler_api.h>
 #include <algorithm>

@@ -1,5 +1,5 @@
 #include "engine/memory/budget.h"
-#include "components/host_memory.h"
+#include "engine/memory/host.h"
 #include "engine/generation/prefill/budget.h"
 
 #include <algorithm>

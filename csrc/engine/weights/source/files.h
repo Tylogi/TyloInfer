@@ -1,7 +1,7 @@
 #pragma once
 
-#include "components/io/file_range_reader.h"
-#include "components/io/read_span.h"
+#include "engine/io/file_range_reader.h"
+#include "engine/io/read_span.h"
 
 #include <cstddef>
 #include <cstdint>

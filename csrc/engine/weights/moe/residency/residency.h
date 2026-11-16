@@ -1,5 +1,5 @@
 #pragma once
-#include "components/host_memory.h"
+#include "engine/memory/host.h"
 #include <cstdint>
 #include <memory>
 #include <optional>

@@ -1,7 +1,7 @@
 #include "prefix_blocks.h"
 #include "../disk_budget.h"
 #include "engine/weights/encoding/readers/window.h"
-#include "components/io/file_range_reader.h"
+#include "engine/io/file_range_reader.h"
 
 #include <algorithm>
 #include <atomic>

@@ -12,7 +12,7 @@ def stage_sources(repository: Path, build_directory: Path) -> Path:
         "tyloinfer/kernels/hip",
         "csrc/backends/hip/include",
         "csrc/engine/weights/encoding",
-        "csrc/components/io",
+        "csrc/engine/io",
         "csrc/backends/cpu/native",
         "csrc/components/ggml/include",
         "csrc/components/ggml/src/ggml-hip",

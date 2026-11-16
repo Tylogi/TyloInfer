@@ -1,7 +1,7 @@
 #include "engine/weights/prepare/gguf.h"
 
 #include "components/ggml/include/ggml.h"
-#include "components/io/file_range_reader.h"
+#include "engine/io/file_range_reader.h"
 #include "engine/weights/encoding/dense/blob.h"
 
 #include <algorithm>

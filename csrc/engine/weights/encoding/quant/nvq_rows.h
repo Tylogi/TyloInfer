@@ -6,7 +6,7 @@
 #include <functional>
 #include <optional>
 #include <vector>
-#include "components/io/read_span.h"
+#include "engine/io/read_span.h"
 
 namespace tyloi {
 // Index over a canonical NVQ/NPQ tensor. Only its compact header and

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "components/io/read_span.h"
+#include "engine/io/read_span.h"
 #include "engine/weights/source/tensor.h"
 
 #include <nlohmann/json_fwd.hpp>

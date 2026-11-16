@@ -4,7 +4,7 @@
 #include "engine/backends/cuda/native/resident_allocations.h"
 #include "engine/backends/cuda/executor/graph/window.h"
 #include "engine/backends/cuda/kernels/moe/pipeline.h"
-#include "components/host_memory.h"
+#include "engine/memory/host.h"
 #include "engine/backends/cpu/native/host_parallel.h"
 #include "engine/weights/encoding/qsa/tq_cpu.h"
 #include <algorithm>

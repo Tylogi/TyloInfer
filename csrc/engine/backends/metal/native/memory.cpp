@@ -1,5 +1,5 @@
 #include "memory.h"
-#include "components/host_memory.h"
+#include "engine/memory/host.h"
 
 #include <algorithm>
 #include <atomic>

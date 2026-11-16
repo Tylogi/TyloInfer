@@ -1,8 +1,8 @@
 #pragma once
 #include "engine/weights/encoding/qsa/adaptive_cache.h"
 #include "engine/weights/encoding/qsa/ram_policy.h"
-#include "components/io/read_span.h"
-#include "components/io/file_range_reader.h"
+#include "engine/io/read_span.h"
+#include "engine/io/file_range_reader.h"
 #include <functional>
 #include <memory>
 #include <vector>

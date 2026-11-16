@@ -1,7 +1,7 @@
 #include "engine/weights/source/gguf.h"
 
 #include "components/ggml/include/gguf.h"
-#include "components/io/file_range_reader.h"
+#include "engine/io/file_range_reader.h"
 #include "nlohmann/json.hpp"
 
 #include <algorithm>

@@ -35,7 +35,7 @@ add_library(tyloinfer-server-core STATIC server.cpp instance.cpp routes.cpp api/
     jobs/jobs.cpp api/jobs.cpp sessions/sessions.cpp api/sessions.cpp media/media.cpp api/media.cpp hub/hub.cpp hub/fetch.cpp api/hub.cpp api/runtime.cpp api/runtime_config.cpp api/runtime_cache.cpp api/runtime_control.cpp)
 target_include_directories(tyloinfer-server-core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
 target_link_libraries(tyloinfer-server-core PUBLIC mfq-http mfq-protocol mfq-prefix-blocks mfq-engine mfq-model-source SQLite::SQLite3)
-target_link_libraries(tyloinfer-server-core PRIVATE CURL::libcurl OpenSSL::Crypto)
+target_link_libraries(tyloinfer-server-core PRIVATE CURL::libcurl OpenSSL::Crypto mfq-host-memory)
 add_executable(tyloinfer-server ../apps/server_main.cpp)
 target_link_libraries(tyloinfer-server PRIVATE tyloinfer-server-core)
 if(TARGET mfq-cuda-engine)

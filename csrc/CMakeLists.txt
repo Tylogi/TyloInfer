@@ -73,7 +73,7 @@ endif()
 # Common code is split by responsibility. JSON is defined first because the
 # canonical model graph and several public policy headers consume it.
 add_subdirectory(components/json)
-add_library(mfq-host-memory STATIC components/host_memory.cpp)
+add_library(mfq-host-memory STATIC engine/memory/host.cpp)
 target_include_directories(mfq-host-memory PUBLIC ${PROJECT_SOURCE_DIR})
 target_compile_features(mfq-host-memory PUBLIC cxx_std_17)
 set_target_properties(mfq-host-memory PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -87,7 +87,7 @@ add_subdirectory(engine/weights/encoding)
 add_subdirectory(engine/models/source)
 add_subdirectory(engine/backends/cpu)
 add_subdirectory(engine/state)
-add_subdirectory(components/io)
+add_subdirectory(engine/io)
 add_subdirectory(engine/weights/source)
 # Engine request/text headers include the tokenizer chat API even for
 # communication-free CUDA/CPU consumers. Keep that real dependency available

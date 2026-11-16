@@ -1,7 +1,7 @@
 #pragma once
 
 #include "engine/tensor/tensor.h"
-#include "components/io/read_span.h"
+#include "engine/io/read_span.h"
 #include <functional>
 #include <memory>
 

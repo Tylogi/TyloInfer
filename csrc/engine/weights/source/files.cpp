@@ -1,6 +1,6 @@
 #include "engine/weights/source/files.h"
 
-#include "components/io/async_range_reader.h"
+#include "engine/io/async_range_reader.h"
 #include "engine/weights/source/buffered.h"
 
 #include <stdexcept>

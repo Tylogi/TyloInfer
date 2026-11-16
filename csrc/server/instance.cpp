@@ -1,9 +1,11 @@
 #include "instance.h"
 
 #include "engine/state/session/prefix_blocks.h"
+#include "engine/memory/host.h"
 
 #include <cerrno>
 #include <cstdlib>
+#include <limits>
 #include <random>
 #include <stdexcept>
 #include <system_error>
@@ -96,21 +98,15 @@ std::filesystem::path resolved_path(const std::filesystem::path& path) {
 }
 
 std::pair<std::int64_t, std::int64_t> host_memory_bytes() {
-#ifdef _WIN32
-    MEMORYSTATUSEX state{};
-    state.dwLength = sizeof(state);
-    if (!GlobalMemoryStatusEx(&state)) return {};
-    return {static_cast<std::int64_t>(state.ullTotalPhys), static_cast<std::int64_t>(state.ullAvailPhys)};
-#else
-    const auto pages = sysconf(_SC_PHYS_PAGES), block = sysconf(_SC_PAGESIZE);
-    std::int64_t total = 0, available = 0;
-    if (pages > 0 && block > 0) total = static_cast<std::int64_t>(pages) * static_cast<std::int64_t>(block);
-#ifdef _SC_AVPHYS_PAGES
-    const auto free_pages = sysconf(_SC_AVPHYS_PAGES);
-    if (free_pages > 0 && block > 0) available = static_cast<std::int64_t>(free_pages) * static_cast<std::int64_t>(block);
-#endif
-    return {total, available};
-#endif
+    try {
+        const auto sample = tyloi::sample_host_memory();
+        constexpr auto maximum = static_cast<std::uint64_t>((std::numeric_limits<std::int64_t>::max)());
+        if (sample.total_bytes > maximum || sample.available_bytes > maximum) return {};
+        return {static_cast<std::int64_t>(sample.total_bytes),
+                static_cast<std::int64_t>(sample.available_bytes)};
+    } catch (const std::runtime_error&) {
+        return {};
+    }
 }
 
 InstanceLock::InstanceLock(const std::filesystem::path& data_dir, std::string instance_id, bool studio_owned) {
