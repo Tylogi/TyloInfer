@@ -3,6 +3,7 @@ import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { runtimeApi } from '../shared/api/resources/runtime';
 import { jobsApi } from '../shared/api/resources/jobs';
+import { modelsApi } from '../shared/api/resources/models';
 import { ApiError } from '../shared/api/client';
 import type { JobEventResource, JobResource, RuntimeStatus, RuntimeInstance } from '../shared/api/types';
 import { connectExistingStudio, startLocalStudio, studioCredential, studioStatus } from '../studio';
@@ -57,8 +58,17 @@ describe('RuntimeProvider 故障状态', () => {
     vi.mocked(studioCredential).mockResolvedValue('');
     vi.spyOn(runtimeApi, 'runtimeInstances').mockResolvedValue([]);
     vi.spyOn(jobsApi, 'jobs').mockResolvedValue([]);
-    vi.spyOn(runtimeApi, 'runtimeStatus').mockResolvedValue({ runtime_state: 'idle' } as RuntimeStatus);
+    vi.spyOn(modelsApi, 'modelArtifacts').mockResolvedValue([]);
     vi.spyOn(runtimeApi, 'voiceOutputComponent').mockResolvedValue({} as Awaited<ReturnType<typeof runtimeApi.voiceOutputComponent>>);
+  });
+
+  it('connects an empty native server as idle without requesting legacy summary or capability routes', async () => {
+    render(<RuntimeProvider><RuntimeFixture /></RuntimeProvider>);
+    await waitFor(() => expect(capturedRuntime.ready).toBe(true));
+    expect(capturedRuntime.runtime).toEqual({ source: 'native-instances', runtime_state: 'idle' });
+    expect(capturedRuntime.models).toEqual([]);
+    expect(capturedRuntime.realtime).toBeNull();
+    expect(runtimeApi.voiceOutputComponent).not.toHaveBeenCalled();
   });
 
   it('首次刷新失败保持未就绪，重连成功后清除错误', async () => {
@@ -194,7 +204,6 @@ describe('RuntimeProvider 故障状态', () => {
       active_sessions: 0, queued_requests: 0 } as RuntimeInstance;
     vi.mocked(jobsApi.jobs).mockResolvedValue([activeJob]);
     vi.mocked(runtimeApi.runtimeInstances).mockResolvedValue([loading]);
-    vi.mocked(runtimeApi.runtimeStatus).mockResolvedValue({ runtime_state: 'loading', model: 'test-model' } as RuntimeStatus);
     vi.spyOn(jobsApi, 'streamJobEvents').mockImplementation(() => new Promise<void>(() => {}));
     const view = render(<RuntimeProvider><RuntimeFixture /></RuntimeProvider>);
     try {
@@ -206,7 +215,6 @@ describe('RuntimeProvider 故障状态', () => {
       expect(capturedRuntime.runtime?.runtime_state).toBe('loading');
       const calls = vi.mocked(runtimeApi.runtimeInstances).mock.calls.length;
       vi.mocked(runtimeApi.runtimeInstances).mockResolvedValue([]);
-      vi.mocked(runtimeApi.runtimeStatus).mockResolvedValue({ runtime_state: 'idle' } as RuntimeStatus);
       await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
       expect(runtimeApi.runtimeInstances).toHaveBeenCalledTimes(calls + 1);
       expect(capturedRuntime.runtime?.runtime_state).toBe('idle');

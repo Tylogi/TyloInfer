@@ -21,6 +21,7 @@ struct Request {
     std::exception_ptr error;
     bool started = false, batched = false, done = false;
     bool cancelling = false, finished = false;
+    std::size_t input_bytes = 0;
     std::optional<Failed> failure;
     // At most one engine quantum waits here; it prevents further execution.
     std::deque<EngineEvent> pending;

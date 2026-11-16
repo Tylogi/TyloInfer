@@ -37,13 +37,6 @@ vi.mock('../src/features/runtime/useServingStatistics', () => ({
       ttft_ms: 200, cache_hit_rate: 0 } } }),
 }));
 
-it('概览预填充卡片展示累计统计，而非最后请求的 TTFT 或媒体准备总时间', () => {
-  render(<TooltipProvider><MemoryRouter><OverviewPage /></MemoryRouter></TooltipProvider>);
-  const prefill = screen.getByText('Prefill').closest('.metric-tile');
-  expect(prefill?.querySelector('strong')).toHaveTextContent(/^999 tok\/s$/);
-  expect(screen.getByText('Prompt processing')).toBeInTheDocument();
-  expect(prefill).not.toHaveTextContent('200 tok/s');
-});
 
 it('历史响应使用同一预填充速度，并单独显示媒体准备耗时', () => {
   const message: Message = { id: 'answer', role: 'assistant', parts: [], parent_id: null, created_at: '2026-09-24T00:00:00Z' };

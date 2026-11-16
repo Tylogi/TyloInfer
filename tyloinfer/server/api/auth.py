@@ -128,8 +128,6 @@ class AuthenticationPolicy:
 
 
 def required_scope(method: str, path: str) -> ApiKeyScope:
-    if path.startswith('/api/v1/agent'):
-        return 'admin'
     if path == "/api/v1/hub/download-directory":
         return "models"
     if path.startswith("/api/v1/runtime/cache/entries") or path == "/api/v1/runtime/cache/purge":

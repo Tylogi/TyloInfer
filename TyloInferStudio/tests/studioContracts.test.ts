@@ -53,8 +53,8 @@ describe('Studio 过渡源码与静态样式契约（非行为测试）', () => 
     expect(sessions).toContain('sessionsApi.createSession(undefined, mode)');
     expect(sessions).toContain('modelAvailable');
     expect(sessions).toContain('historyLoadedId === activeId');
-    expect(runtime).toContain('isRuntimeReady(status.runtime_state)');
-    expect(runtime).toContain('Promise.resolve<RuntimeModel[]>([])');
+    expect(runtime).toContain('projectNativeRuntime(nextInstances, selectedRef.current)');
+    expect(runtime).not.toContain('runtimeApi.runtimeStatus(');
     expect(APP).toContain('No model loaded');
   });
 
@@ -222,12 +222,9 @@ describe('Studio 过渡源码与静态样式契约（非行为测试）', () => 
     expect(APP).toContain('const storageKey = `${page}:${id}`');
     expect(APP).toContain('localStorage.setItem(PANEL_COLLAPSED_KEY, JSON.stringify(updated))');
     expect(shell).toContain('<Outlet />');
-    expect(APP_ENTRY).not.toContain('path="agent"');
+    expect(APP_ENTRY).toContain('path="chat"');
     expect(APP_ENTRY).not.toContain('path="settings"');
     expect(APP_ENTRY).not.toContain('path="quantization"');
-    const jobs = readSources('features/jobs/useJobRecordActions.ts');
-    expect(jobs).toContain('jobsApi.clearCompletedJobs()');
-    expect(jobs).toContain('jobsApi.deleteJob(id)');
     expect(APP).not.toContain('className="drawer-scrim"');
   });
 
@@ -237,8 +234,9 @@ describe('Studio 过渡源码与静态样式契约（非行为测试）', () => 
     expect(runtime).toContain('.watchActiveJobs(');
     expect(jobs).toContain('get().streamJobEvents(id,');
     expect(jobs).toContain('.streamJobEvents(');
-    expect(API).toContain('/api/v1/jobs/${id}/events/stream');
-    expect(API).toContain('readEventStream(response, onEvent, signal)');
+    expect(API).toContain('/api/jobs/${id}/events/stream');
+    expect(API).toContain('readEventStream<JobEventResource | ApiErrorBody>');
+    expect(API).toContain("if ('error' in event) throw new ApiError(502, event)");
     expect(APP).not.toContain('window.setInterval(() => void refreshRuntime(true), 2500)');
   });
 

@@ -52,7 +52,6 @@ function escapeHtml(text: string): string {
   return text.replace(/[&<>"']/g, (char) => ESCAPE_HTML_MAP[char] || char);
 }
 
-/** 常用代码语言别名映射。 */
 const LANGUAGE_ALIASES: Record<string, string> = {
   js: 'javascript',
   ts: 'typescript',
@@ -93,7 +92,6 @@ function resolveLanguage(lang?: string): {
   };
 }
 
-/** 配置了 Prism 语法高亮和标准代码块结构的 Marked 解析器实例。 */
 const customMarked = new Marked({
   breaks: true,
   gfm: true,
@@ -116,7 +114,6 @@ const customMarked = new Marked({
   },
 });
 
-/** 限制长回答的全量 Markdown 解析频率，并在结束生成时立即展示最终文本。 */
 function useStreamingText(text: string, live: boolean): string {
   const [displayed, setDisplayed] = useState(text);
   const latest = useRef(text);
@@ -167,7 +164,6 @@ export const Markdown = memo(function Markdown({
     () => DOMPurify.sanitize(customMarked.parse(markdown) as string),
     [markdown],
   );
-  // 保持相同 HTML 的对象引用，避免限频状态更新覆盖公式和复制按钮的 DOM 增强。
   const markup = useMemo(() => ({ __html: html }), [html]);
 
   useEffect(() => {
@@ -187,7 +183,7 @@ export const Markdown = memo(function Markdown({
         trust: false,
       });
     } catch {
-      // 容错处理：不破坏 React DOM 挂载生命周期
+      // Ignore math-rendering failures.
     }
     const buttons: HTMLButtonElement[] = [];
     const timers = new Set<ReturnType<typeof setTimeout>>();

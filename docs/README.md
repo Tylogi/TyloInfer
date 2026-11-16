@@ -6,9 +6,12 @@ TyloInfer provides TQ inference, CUDA/Metal runtimes, and local serving.
 
 - [Deploy a service and check performance (中文)](deployment.zh-CN.md)
 - [Build the C++ runtime](cli/build.md)
-- [Run MFQ Server and Studio](cli/serve.md)
+- [Run TyloInfer Server and Studio](cli/serve.md)
+- [Complete the first API request](cli/serve.md#first-api-request)
+- [Measure inference performance](benchmarking.md)
 - [Create a self-contained release](packaging.md)
 - [Check model and backend support](runtime/support.md)
+- [Native server migration baseline and remaining work](backend-plan.md)
 
 ## Models and runtimes
 
@@ -20,10 +23,19 @@ TyloInfer provides TQ inference, CUDA/Metal runtimes, and local serving.
 - [Flash-Next continuous batching](runtime/cuda-continuous-batching.md)
 - [MiniCPM-o 4.5 multimodal runtime](runtime/minicpmo45.md)
 
+## Documentation checks
+
+From the repository root, run `python3 -B scripts/check_docs.py`. This
+read-only standard-library check covers public command names, local Markdown
+links/anchors, JSON/JSONL examples, the HTTP API table against checked-in
+OpenAPI, and selected CLI defaults/options.
+
 ## APIs
 
 MFQ provides OpenAI-compatible `/v1/models` and `/v1/chat/completions`,
-Anthropic-compatible `/v1/messages`, and an HTTP control API under `/api/v1`.
+Anthropic-compatible `/v1/messages`, and an HTTP control API under `/api`.
+That root is the native server contract documented in [HTTP API](api/http.md);
+the Python legacy backend keeps the `/api/v1` prefix.
 Token and job updates stream over SSE; audio and realtime sessions use
 WebSocket. Function tools are executed by the client and their results returned
 through the inference API.

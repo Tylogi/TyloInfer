@@ -8,16 +8,16 @@ for (const language of ['zh-CN', 'en'] as const) {
     const GiB = 2 ** 30;
     const gpu_devices = [0, 2, 3].map(id => ({ id: String(id), name: 'NVIDIA RTX test GPU',
       memory_total_bytes: 24 * GiB, memory_available_bytes: 8 * GiB, unified_memory: false }));
-    await page.route('**/api/v1/runtime/status*', route => route.fulfill({ json: {
+    await page.route('**/api/runtime/status*', route => route.fulfill({ json: {
       runtime_state: 'ready', backend: 'cuda', memory_architecture: 'discrete', gpu_devices,
       host_memory_total_bytes: 64 * GiB, host_memory_available_bytes: 32 * GiB, sampling_defaults: {},
     } }));
-    await page.route(/\/api\/v1\/models(?:\?.*)?$/, route => route.fulfill({ json: { data: [{
+    await page.route(/\/api\/models(?:\?.*)?$/, route => route.fulfill({ json: { data: [{
       id: 'unloaded', name: 'Device selection model', architecture: 'qwen35', format: 'tq',
       shard_count: 1, total_bytes: GiB, estimated_resident_weight_bytes: GiB, tensor_count: 1,
       record_count: 1, dtypes: [], complete: true, loadable: true, modified_at: '',
     }] } }));
-    await page.route('**/api/v1/runtime/instances', route => route.fulfill({ json: { data: [{
+    await page.route('**/api/runtime/instances', route => route.fulfill({ json: { data: [{
       id: 'split', model: 'Qwen-Flash-Next', state: 'ready', devices: ['cuda:0', 'cuda:2'],
       active_sessions: 1, queued_requests: 0, started_at: '2026-10-13T00:00:00Z', memory: {
         resident_weight_bytes: 18 * GiB, resident_buffer_bytes: 2 * GiB, kv_bytes: 2 * GiB,

@@ -5,6 +5,38 @@ import { modelsApi } from '../../shared/api/resources/models';
 import { jobsApi } from '../../shared/api/resources/jobs';
 import { ModelBrowser } from './ModelBrowser';
 import { useJobStore } from '../../stores/jobStore';
+import { serverCapabilities } from '../../app/serverCapabilities';
+
+it('resolves a native repository and submits a download without keyword search requests', async () => {
+  // Use the minimal native repository fields without assuming recommendation or memory analysis support.
+  const info = {
+    provider: 'huggingface', repo_id: 'owner/native', revision: 'main', source_url: 'https://huggingface.co/owner/native',
+    downloads: null, likes: null, total_bytes: 42, files: [{ name: 'Engram/native.tq', byte_size: 42 }],
+    tags: [], architectures: [], modalities: [], gated: null, runtime_compatible: null,
+    variants: [{ id: 'native', label: 'native', format: 'tq', files: ['Engram/native.tq'], byte_size: 42,
+      configuration: { status: 'unknown', recommendation: 'unknown', reasons: [] } }],
+  } as unknown as HubModelInfo;
+  vi.mocked(modelsApi.resolveHubModel).mockResolvedValue(info);
+  vi.mocked(modelsApi.officialHubModels).mockResolvedValue({ refreshing: false, system: { platform: 'test', machine: 'test', backend: 'unknown' }, data: [] });
+  const created = { id: 'native-download', kind: 'download.huggingface', status: 'queued' as const,
+    progress: 0, cancel_requested: false, payload: {}, created_at: '', updated_at: '' };
+  vi.mocked(jobsApi.createJob).mockResolvedValue(created);
+  const onJobCreated = vi.fn();
+  const onError = vi.fn();
+  render(<ModelBrowser capabilities={serverCapabilities()}
+    tab="community" onTabChange={vi.fn()} jobKinds={[{ kind: 'download.huggingface' }]}
+    onError={onError} onJobCreated={onJobCreated} tr={(_, en) => en} />);
+  fireEvent.change(screen.getByRole('textbox', { name: 'Search models' }), { target: { value: 'https://huggingface.co/owner/native/tree/main' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Search' }));
+  await waitFor(() => expect(modelsApi.resolveHubModel).toHaveBeenCalledWith('https://huggingface.co/owner/native/tree/main', 'huggingface', expect.any(AbortSignal)));
+  expect(await screen.findByRole('tab', { name: 'Model card' })).toBeEnabled();
+  fireEvent.click(await screen.findByRole('button', { name: 'Download' }));
+  await waitFor(() => expect(onJobCreated).toHaveBeenCalledWith(created, expect.any(Object)));
+  expect(jobsApi.createJob).toHaveBeenCalledWith('download.huggingface', expect.objectContaining({ repo_id: 'owner/native', revision: 'main', include: expect.arrayContaining(['Engram/native.tq']) }));
+  expect(modelsApi.browseHubModels).not.toHaveBeenCalled();
+  expect(modelsApi.downloadReuse).toHaveBeenCalledOnce();
+  expect(onError).not.toHaveBeenCalled();
+});
 
 vi.mock('../../shared/api/resources/models', () => ({
   modelsApi: { officialHubModels: vi.fn(), hubModelInfo: vi.fn(), resolveHubModel: vi.fn(), browseHubModels: vi.fn().mockResolvedValue({ data: [] }), probeDownloadSources: vi.fn().mockResolvedValue({ data: [] }), downloadReuse: vi.fn().mockResolvedValue({ reusable_files: {} }) },
@@ -25,7 +57,7 @@ it.each([3, 60])('downloads all shared Engram dependencies into one repository d
   vi.mocked(jobsApi.createJob).mockResolvedValue({ id: 'engram-download', kind: 'download.modelscope',
     status: 'queued', progress: 0, cancel_requested: false, payload: {}, created_at: '', updated_at: '' });
   render(<ModelBrowser tab="official" onTabChange={vi.fn()}
-    jobKinds={[{ kind: 'download.modelscope', payload_schema: {} }]}
+    jobKinds={[{ kind: 'download.modelscope' }]}
     onError={vi.fn()} onJobCreated={vi.fn()} tr={(_, en) => en} />);
   const button = await screen.findByRole('button', { name: 'Download' });
   await waitFor(() => expect(button).toBeEnabled());

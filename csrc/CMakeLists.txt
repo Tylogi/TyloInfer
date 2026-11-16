@@ -8,6 +8,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(TYLOINFER_REPOSITORY_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/..")
 
+option(TYLOINFER_BUILD_SERVER "Build the native public server" OFF)
+
 option(TYLOINFER_ENABLE_MFQ_COMPAT "Include legacy MFQ inference formats" OFF)
 option(
     TYLOINFER_BUILD_METAL_RUNTIME
@@ -93,12 +95,16 @@ add_subdirectory(engine/weights/source)
 add_subdirectory(components/ggml)
 add_subdirectory(components/tokenizer)
 
-if(TYLOINFER_BUILD_TRANSPORT)
+if(TYLOINFER_BUILD_TRANSPORT OR TYLOINFER_BUILD_SERVER)
     add_subdirectory(components/http)
 endif()
 
 add_subdirectory(engine)
 add_subdirectory(engine/models)
+
+if(TYLOINFER_BUILD_TRANSPORT OR TYLOINFER_BUILD_SERVER)
+    add_subdirectory(components/protocol)
+endif()
 
 if(TYLOINFER_BUILD_TRANSPORT)
     add_subdirectory(transport)
@@ -136,4 +142,8 @@ target_link_libraries(mfq-core INTERFACE
 
 if(BUILD_TESTING)
     add_subdirectory(tests)
+endif()
+
+if(TYLOINFER_BUILD_SERVER)
+    add_subdirectory(server)
 endif()

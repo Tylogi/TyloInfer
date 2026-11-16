@@ -11,16 +11,16 @@ for (const language of ['zh-CN', 'en'] as const) {
     const policy = { max_context_size: null, model_overrides: { [models[0].model]: 678920 } as Record<string, number>,
       model_yarn_enabled: { [models[0].model]: true } as Record<string, boolean>,
       model_qsa_kv_offload: {} as Record<string, { enabled: boolean; budget_bytes: number }>, fallback_context_size: 32768 };
-    await page.route('**/api/v1/runtime/instances', route => route.fulfill({ json: { data: models } }));
-    await page.route('**/api/v1/runtime/context-policy', route => route.fulfill({ json: policy }));
-    await page.route('**/api/v1/runtime/yarn/*', route => {
+    await page.route('**/api/runtime/instances', route => route.fulfill({ json: { data: models } }));
+    await page.route('**/api/runtime/context-policy', route => route.fulfill({ json: policy }));
+    await page.route('**/api/runtime/yarn/*', route => {
       const supported = route.request().url().endsWith('/qsa');
       return route.fulfill({ json: { supported, native_context: supported ? 262144 : 32768,
         maximum_context: supported ? 1048576 : 32768, maximum_factor: supported ? 4 : null,
         enabled: supported, effective_factor: supported ? 678920 / 262144 : 1 } });
     });
-    await page.route(/\/api\/v1\/models(?:\?.*)?$/, route => route.fulfill({ json: { data: models.map(model => ({ id: `artifact-${model.id}`, name: model.model })) } }));
-    await page.route('**/api/v1/models/*/cache-profile', route => route.fulfill({ json: {
+    await page.route(/\/api\/models(?:\?.*)?$/, route => route.fulfill({ json: { data: models.map(model => ({ id: `artifact-${model.id}`, name: model.model })) } }));
+    await page.route('**/api/models/*/cache-profile', route => route.fulfill({ json: {
       max_context: 262144, fixed_bytes: 29978, fixed_components: [{ group: 'QSA', name: 'indexer_tail', bytes: 29978 }], components: [
         { group: 'QSA', name: 'raw_kv', layers: 13, bytes_per_row: 26624, tokens_per_row: 1, allocation: 'power_of_two', minimum_rows: 16, max_read_rows_per_token: 2048 },
         { group: 'QSA', name: 'indexer_pooled', subgroup: 'indexer', bytes_per_row: 6656, tokens_per_row: 4,
@@ -32,7 +32,7 @@ for (const language of ['zh-CN', 'en'] as const) {
     page.on('request', request => {
       if (['POST', 'PUT', 'DELETE'].includes(request.method())) writePaths.push(new URL(request.url()).pathname);
     });
-    await page.route('**/api/v1/runtime/context', route => {
+    await page.route('**/api/runtime/context', route => {
       const payload = route.request().postDataJSON();
       writes.push(payload);
       const model = models.find(item => item.id === payload.instance_id)!;
@@ -91,7 +91,7 @@ for (const language of ['zh-CN', 'en'] as const) {
     await expect.poll(() => writes).toEqual([{ instance_id: 'qsa', context_size: 524288, yarn_enabled: true,
       qsa_kv_offload: { enabled: true, budget_bytes: 2 ** 30 } }]);
     await expect(save).toBeEnabled();
-    expect(writePaths).toEqual(['/api/v1/runtime/context']);
+    expect(writePaths).toEqual(['/api/runtime/context']);
     await toggle.uncheck();
     await expect(summary).not.toContainText('SSD');
     await expect(summary).not.toContainText(language === 'zh-CN' ? '最大读取量/token' : 'Maximum reads/token');

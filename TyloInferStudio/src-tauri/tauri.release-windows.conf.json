@@ -15,14 +15,9 @@
         "uninstallerIcon": "icons/icon.ico"
       }
     },
-    "externalBin": [
-      "../../packaging/sidecars/tyloi-engine",
-      "../../packaging/sidecars/mfq-diagnostics"
-    ],
     "resources": {
       "../dist": "web-ui",
-      "../../packaging/windows-runtime/": "",
-      "../../packaging/Resources/tyloinfer-cli": "tyloinfer-cli",
+      "../../packaging/Resources/tyloinfer-server": "tyloinfer-server",
       "../../packaging/Resources/licenses": "licenses"
     }
   }

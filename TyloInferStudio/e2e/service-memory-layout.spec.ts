@@ -5,7 +5,7 @@ for (const language of ['zh-CN', 'en'] as const) {
   test(`prefix RAM budget keeps compact controls and a separate action row (${language})`, async ({ page }, testInfo) => {
     await mockStudioServer(page, { language });
     const updates: unknown[] = [];
-    await page.route('**/api/v1/runtime/memory-policy', route => {
+    await page.route('**/api/runtime/memory-policy', route => {
       if (route.request().method() === 'PUT') {
         updates.push(route.request().postDataJSON());
         return route.fulfill({ json: { operation_id: 'memory-layout-job' } });
@@ -13,7 +13,7 @@ for (const language of ['zh-CN', 'en'] as const) {
       return route.fulfill({ json: { total_limit_bytes: null, effective_total_limit_bytes: 107.5 * 2 ** 30,
         model_limit_bytes: null, prefix_limit_bytes: null } });
     });
-    await page.route('**/api/v1/jobs/memory-layout-job', route => route.fulfill({ json: {
+    await page.route('**/api/jobs/memory-layout-job', route => route.fulfill({ json: {
       id: 'memory-layout-job', kind: 'runtime.memory.configure', status: 'succeeded', payload: {},
       progress: 1, created_at: '2026-10-09T00:00:00Z', updated_at: '2026-10-09T00:00:00Z', cancel_requested: false,
     } }));

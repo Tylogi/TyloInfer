@@ -7,13 +7,13 @@ for (const theme of ['light', 'dark'] as const) {
     await page.addInitScript(value => {
       localStorage.setItem('tyloinfer.studio.generation.v1', JSON.stringify({ language: 'en', theme: value }));
     }, theme);
-    await page.route(/\/api\/v1\/models(?:\?.*)?$/, route => route.fulfill({ json: { data: [25, 75, 150].map((size, index) => ({
+    await page.route(/\/api\/models(?:\?.*)?$/, route => route.fulfill({ json: { data: [25, 75, 150].map((size, index) => ({
       id: `pressure-${index}`, name: index === 0 ? 'Studio Test Model' : `Qwen pressure ${index}`,
       architecture: 'qwen3', format: 'mfq', shard_count: 2, total_bytes: size * 2 ** 30,
       estimated_resident_weight_bytes: size * 2 ** 30, tensor_count: 20, record_count: 20,
       dtypes: ['NINTv2'], complete: true, loadable: true, modified_at: '2026-10-10T00:00:00Z',
     })) } }));
-    await page.route('**/api/v1/runtime/status*', route => route.fulfill({ json: {
+    await page.route('**/api/runtime/status*', route => route.fulfill({ json: {
       runtime_state: 'ready', model: 'Studio Test Model', model_type: 'Test', max_context: 8192,
       runtime_memory_headroom_bytes: 100 * 2 ** 30, total_requests: 0, active_requests: 0, sampling_defaults: {},
     } }));

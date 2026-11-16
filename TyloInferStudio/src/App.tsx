@@ -2,12 +2,17 @@ import { lazy, Suspense } from 'react';
 import { Route, Routes } from 'react-router';
 import { StudioUpdateProvider } from './features/settings/UpdateManager';
 import { RuntimeProvider } from './app/RuntimeProvider';
+import { ChatProvider } from './features/chat/ChatProvider';
 import { StudioShell } from './app/StudioShell';
 import { LabLayout } from './app/LabLayout';
 import { LoadingPage } from './app/LoadingPage';
 import { NotFoundPage } from './app/NotFoundPage';
+import { ServerFeature } from './app/ServerFeature';
 import './shared/ui/primitives.css';
 
+const ChatPage = lazy(() =>
+  import('./features/chat/ChatPage').then((module) => ({ default: module.ChatPage })),
+);
 const OverviewPage = lazy(() =>
   import('./features/runtime/OverviewPage').then((module) => ({ default: module.OverviewPage })),
 );
@@ -35,33 +40,31 @@ const VersionsPage = lazy(() =>
   import('./features/settings/VersionsPage').then((module) => ({ default: module.VersionsPage })),
 );
 
+/** Keep conversation providers mounted across routes and render the requested Studio page. */
 export default function App() {
   return (
     <StudioUpdateProvider>
       <RuntimeProvider>
-        <Suspense
-          fallback={
-            <main className="fatal-workspace">
-              <LoadingPage />
-            </main>
-          }
-        >
-          <Routes>
-            <Route element={<StudioShell />}>
-              <Route index element={<OverviewPage />} />
-              <Route path="models" element={<ModelsPage />} />
-              <Route path="runtime" element={<ConnectionsPage />} />
-              <Route path="resources" element={<CachePage />} />
-              <Route path="logs" element={<LogsPage />} />
-              <Route path="versions" element={<VersionsPage />} />
-              <Route element={<LabLayout />}>
-                <Route path="analysis" element={<AnalysisPage />} />
-                <Route path="model-hub" element={<ModelHubPage />} />
+        <ChatProvider>
+          <Suspense fallback={<main className="fatal-workspace"><LoadingPage /></main>}>
+            <Routes>
+              <Route element={<StudioShell />}>
+                <Route index element={<OverviewPage />} />
+                <Route path="chat" element={<ChatPage />} />
+                <Route path="models" element={<ModelsPage />} />
+                <Route path="runtime" element={<ConnectionsPage />} />
+                <Route path="resources" element={<ServerFeature feature="resources"><CachePage /></ServerFeature>} />
+                <Route path="logs" element={<LogsPage />} />
+                <Route path="versions" element={<VersionsPage />} />
+                <Route element={<LabLayout />}>
+                  <Route path="analysis" element={<ServerFeature feature="analysis"><AnalysisPage /></ServerFeature>} />
+                  <Route path="model-hub" element={<ModelHubPage />} />
+                </Route>
+                <Route path="*" element={<NotFoundPage />} />
               </Route>
-              <Route path="*" element={<NotFoundPage />} />
-            </Route>
-          </Routes>
-        </Suspense>
+            </Routes>
+          </Suspense>
+        </ChatProvider>
       </RuntimeProvider>
     </StudioUpdateProvider>
   );

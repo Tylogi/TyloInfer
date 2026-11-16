@@ -104,7 +104,7 @@ include = ["tyloinfer*"]
 "tyloinfer.kernels.cuda" = ["_src/**/*"]
 "tyloinfer.kernels.metal" = ["tq_decode.h", "tq_matmul.h"]
 "tyloinfer.server" = [
-    "protocol/*.json",
+    "state/*.sql",
 ]
 
 [tool.uv]

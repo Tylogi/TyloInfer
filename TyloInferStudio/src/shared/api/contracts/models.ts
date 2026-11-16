@@ -22,6 +22,7 @@ export interface ModelArtifact {
   loadable: boolean;
   modified_at: string;
   error?: string | null;
+  support_error?: string | null;
 }
 
 export interface ModelDeletionPlan {
@@ -347,17 +348,4 @@ export interface OfficialModelList {
   system: HubSystemProfile;
   data: OfficialModelInfo[];
   refreshing?: boolean;
-}
-
-export interface ArtifactLineage {
-  id: string;
-  artifact_uri: string;
-  artifact_name: string;
-  producer_job_id: string;
-  producer_kind: string;
-  source_uris: string[];
-  parameters: Record<string, unknown>;
-  metadata: Record<string, unknown>;
-  validation_job_ids: string[];
-  created_at: string;
 }

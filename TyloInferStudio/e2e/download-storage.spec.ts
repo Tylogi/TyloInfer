@@ -4,7 +4,7 @@ import { mockStudioServer } from './mockServer';
 for (const language of ['zh-CN', 'en'] as const) {
   test(`download storage and weight-budget explanation fit the page (${language})`, async ({ page }, testInfo) => {
     const state = await mockStudioServer(page, { language });
-    await page.route('**/api/v1/hub/download-directory', route => route.fulfill({ json: {
+    await page.route('**/api/hub/download-directory', route => route.fulfill({ json: {
       directory: null, actual_directory: '/downloads/models', default_directory: '/downloads/models',
       disk_total_bytes: 2048 * 2 ** 30, disk_free_bytes: 200 * 2 ** 30,
     } }));

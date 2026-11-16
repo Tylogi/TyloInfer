@@ -11,6 +11,6 @@ test('quantization has no navigation entry, model shortcut or reachable workspac
   await page.goto('/quantization');
   await expect(page.getByRole('heading', { name: 'Page not found' })).toBeVisible();
   await expect(page.getByRole('region', { name: 'Quantization workspace' })).toHaveCount(0);
-  expect(state.requests.filter(request => request.includes('/api/v1/quantization/'))).toEqual([]);
+  expect(state.requests.filter(request => request.includes('/api/quantization/'))).toEqual([]);
   expect(state.unexpected).toEqual([]);
 });

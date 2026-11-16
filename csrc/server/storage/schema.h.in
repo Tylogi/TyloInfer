@@ -1,0 +1,7 @@
+#pragma once
+
+namespace tyloi::server {
+inline constexpr char schema_sql[] = {
+@TYLOINFER_SERVER_SCHEMA@'\0'
+};
+}

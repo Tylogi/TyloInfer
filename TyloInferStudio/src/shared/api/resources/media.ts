@@ -9,7 +9,7 @@ export const mediaApi = {
     const sha256 = Array.from(new Uint8Array(digest), (value) =>
       value.toString(16).padStart(2, '0'),
     ).join('');
-    const response = await fetch(apiUrl('/api/v1/media'), {
+    const response = await fetch(apiUrl('/api/media'), {
       method: 'POST',
       headers: authorizedHeaders({
         'Content-Type': mimeType || file.type || 'application/octet-stream',
@@ -23,12 +23,12 @@ export const mediaApi = {
 
 
   mediaUrl(id: string): string {
-    return apiUrl(`/api/v1/media/${id}`);
+    return apiUrl(`/api/media/${id}`);
   },
 
 
   async fetchMedia(id: string, signal?: AbortSignal): Promise<Blob> {
-    const response = await fetch(apiUrl(`/api/v1/media/${id}`), {
+    const response = await fetch(apiUrl(`/api/media/${id}`), {
       headers: authorizedHeaders(),
       signal,
     });
@@ -38,7 +38,7 @@ export const mediaApi = {
 
 
   createDocument(mediaId: string, name: string): Promise<DocumentResource> {
-    return request('/api/v1/documents', {
+    return request('/api/documents', {
       method: 'POST',
       body: JSON.stringify({ media_id: mediaId, name }),
     });

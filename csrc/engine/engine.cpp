@@ -467,4 +467,21 @@ SessionResult Engine::set_budget(const SessionCommand& command) {
     return change.apply();
 }
 
+void Engine::reset_states(std::int64_t batch) { scheduler_->reset_states(batch); }
+
+void Scheduler::reset_states(std::int64_t batch) {
+    for (auto& [id, request] : requests_) {
+        if (!request.state) continue;
+        auto& state = *request.state;
+        engine_.budget_->reserve(state.graph_exit_growth());
+        state.release_graphs();
+        engine_.budget_->reserve(state.reset_growth(batch));
+        state.reset(batch);
+        if (auto* predictor = engine_.model_->predictor(); predictor && state.predictor) {
+            engine_.budget_->reserve(predictor->reset_growth(*state.predictor, batch));
+            predictor->reset(*state.predictor, batch);
+        }
+    }
+}
+
 } // namespace tyloi::engine

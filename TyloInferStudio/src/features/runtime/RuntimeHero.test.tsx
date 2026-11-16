@@ -33,9 +33,11 @@ it('retains the normal Models action when a model is running', () => {
   expect(screen.getByTestId('location').textContent).toBe('/models');
 });
 
-it('does not expose the removed agent action', () => {
+it('opens text chat from the model hero', () => {
+  state.runtime = { source: 'native-instances', model: 'model-a', runtime_state: 'ready' };
   render(<MemoryRouter><RuntimeHero /><Location /></MemoryRouter>);
-  expect(screen.queryByRole('button', { name: 'Agent' })).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole('button', { name: 'Chat' }));
+  expect(screen.getByTestId('location').textContent).toBe('/chat');
 });
 
 it('shows an interrupted load after runtime cleanup and lets a new retry show its progress', () => {

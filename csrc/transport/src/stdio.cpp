@@ -1,4 +1,5 @@
-#include "common.h"
+#include "protocol.h"
+#include "transport.h"
 #include "components/error.h"
 
 #include <algorithm>
@@ -28,7 +29,7 @@
 
 namespace {
 
-using namespace tyloi::transport_detail;
+using namespace tyloi::protocol;
 
 std::mutex stdio_protocol_mutex;
 int stdio_protocol_fd = -1;
@@ -81,7 +82,7 @@ public:
                 "prepare_mfq_stdio_transport must be called before model loading");
         }
         const MfqSamplingParams sampling_defaults =
-            default_sampling_params(config_);
+            default_sampling_params(config_.runtime_profile);
         const json duplex_sampling_defaults =
             duplex_profile_json(config_.runtime_profile.duplex);
         const json tts_sampling_defaults =

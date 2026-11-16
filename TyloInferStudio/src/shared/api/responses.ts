@@ -12,7 +12,7 @@ export async function streamResponse(
   signal: AbortSignal,
   onAccepted?: () => void,
 ): Promise<void> {
-  const response = await fetch(apiUrl(`/api/v1/sessions/${sessionId}/responses`), {
+  const response = await fetch(apiUrl(`/api/sessions/${sessionId}/responses`), {
     method: 'POST',
     headers: authorizedHeaders({
       Accept: 'text/event-stream',

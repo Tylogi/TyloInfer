@@ -1,17 +1,11 @@
 {
   "bundle": {
-    "targets": [
-      "dmg"
-    ],
-    "externalBin": [
-      "../../packaging/sidecars/tyloi-engine",
-      "../../packaging/sidecars/mfq-decode-metal"
-    ],
+    "targets": ["dmg"],
     "resources": {
       "../dist": "web-ui",
       "../../packaging/Resources/mlx.metallib": "mlx.metallib",
       "../../packaging/Resources/mfq-metal": "mfq-metal",
-      "../../packaging/Resources/tyloinfer-cli": "tyloinfer-cli",
+      "../../packaging/Resources/tyloinfer-server": "tyloinfer-server",
       "../../packaging/Resources/licenses": "licenses"
     },
     "macOS": {

@@ -20,7 +20,7 @@ it('binds requests to the confirmed server instance and reports a replacement', 
     code: 'server_instance_changed', message: 'Reconnect', retryable: false, details: {},
   } }), { status: 409 }));
   vi.stubGlobal('fetch', fetchMock);
-  await expect(request('/api/v1/runtime/status')).rejects.toMatchObject({ code: 'server_instance_changed' });
+  await expect(request('/api/runtime/status')).rejects.toMatchObject({ code: 'server_instance_changed' });
   expect(fetchMock.mock.calls[0][1].headers.get('X-TyloInfer-Instance-ID')).toBe('confirmed-instance');
   expect(changed).toHaveBeenCalledOnce();
   stop();
@@ -33,11 +33,11 @@ it('支持 Headers 实例和 AbortSignal，保留业务头并添加鉴权', asyn
   setApiToken('test-token');
   const headers = new Headers({ 'X-Request-ID': 'request-a' });
   const controller = new AbortController();
-  await expect(request('/api/v1/status', { headers, signal: controller.signal })).resolves.toEqual({
+  await expect(request('/api/status', { headers, signal: controller.signal })).resolves.toEqual({
     ok: true,
   });
   const [url, init] = fetchMock.mock.calls[0];
-  expect(url).toBe('https://test.invalid/api/v1/status');
+  expect(url).toBe('https://test.invalid/api/status');
   expect(init.signal).toBe(controller.signal);
   expect(init.headers.get('X-Request-ID')).toBe('request-a');
   expect(init.headers.get('Authorization')).toBe('Bearer test-token');
@@ -51,7 +51,7 @@ it.each(['endpoint', 'credential', 'aborted'])('ignores stale 401 responses afte
   let finish!: (response: Response) => void;
   vi.stubGlobal('fetch', vi.fn(() => new Promise<Response>((resolve) => { finish = resolve; })));
   const controller = new AbortController();
-  const pending = request('/api/v1/runtime/status', { signal: controller.signal });
+  const pending = request('/api/runtime/status', { signal: controller.signal });
   if (change === 'endpoint') setApiBaseUrl('https://new.invalid');
   else if (change === 'credential') setApiToken('new-fixture-key');
   else controller.abort();
@@ -105,6 +105,6 @@ it('requests the latest bounded job-event window without changing forward SSE re
   expect(await jobsApi.jobEvents('job-a', controller.signal)).toEqual([
     { sequence: 1005, level: 'info', message: 'Latest output', fields: { phase: 'ready' }, created_at: '2026-10-06T00:00:01Z' },
   ]);
-  expect(fetchMock.mock.calls[0][0]).toBe('https://test.invalid/api/v1/jobs/job-a/events?limit=1000&tail=true');
+  expect(fetchMock.mock.calls[0][0]).toBe('https://test.invalid/api/jobs/job-a/events?limit=1000&tail=true');
   expect(fetchMock.mock.calls[0][1].signal).toBe(controller.signal);
 });

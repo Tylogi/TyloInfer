@@ -12,7 +12,7 @@ import tyloInferMark from '../assets/tylogi-ai-lab-mark.svg';
 import { formatNumber } from './formatters';
 import { studioBuild } from '../features/settings/releases';
 import { dashboardPath, labPath, resolveStudioLocation, isStudioPath,
-  type DashboardPage, type LabPage } from '../navigation';
+  STUDIO_PATHS, type DashboardPage, type LabPage } from '../navigation';
 
 type NavItem = {
   label: [string, string];
@@ -23,6 +23,7 @@ type NavItem = {
   count?: number;
 };
 
+/** Render the fixed Studio navigation for every supported service. */
 export function StudioSidebar() {
   const location = useLocation();
   const navigate = useNavigate();
@@ -63,6 +64,8 @@ export function StudioSidebar() {
         active: view === 'dashboard' && dashboardPage === 'connections', current: true },
       { label: ['资源', 'Resources'], icon: 'droplet', path: dashboard('cache'),
         active: view === 'dashboard' && dashboardPage === 'cache', current: true },
+      { label: ['聊天', 'Chat'], icon: 'chat', path: STUDIO_PATHS.chat,
+        active: view === 'chat', current: true },
     ] },
     { label: ['工具', 'Tools'], items: [
       { label: ['分析', 'Analysis'], icon: 'search', path: lab('analysis'),
@@ -95,19 +98,19 @@ export function StudioSidebar() {
                   <span>{tr(...group.label)}</span><CaretRightIcon size={10} weight="fill" />
                 </button> : <div className="sidebar-group-label sidebar-section-heading">{tr(...group.label)}</div>}
                 <div id={group.label[1] === 'Tools' ? 'sidebar-tools' : undefined} className="sidebar-nav-items" hidden={group.label[1] === 'Tools' && !toolsOpen}>
-                {group.items.map((item) => (
-                  <button
-                    aria-current={item.active ? 'page' : undefined}
-                    className={item.active ? 'active' : ''}
-                    key={item.path}
-                    onClick={() => open(item.path)}
-                    type="button"
-                  >
-                    <Icon name={item.icon} />
-                    {tr(...item.label)}
-                    {item.count != null && <span>{formatNumber(item.count)}</span>}
-                  </button>
-                ))}
+                  {group.items.map((item) => (
+                    <button
+                      aria-current={item.active ? 'page' : undefined}
+                      className={item.active ? 'active' : ''}
+                      key={item.path}
+                      onClick={() => open(item.path)}
+                      type="button"
+                    >
+                      <Icon name={item.icon} />
+                      {tr(...item.label)}
+                      {item.count != null && <span>{formatNumber(item.count)}</span>}
+                    </button>
+                  ))}
                 </div>
               </section>
             ))}
@@ -121,8 +124,8 @@ export function StudioSidebar() {
             <strong title={version}>v{version.split('+')[0]}</strong>
             <small>{studioUpdates.busy?.startsWith('download:') ? tr('正在下载更新', 'Downloading update')
               : studioUpdates.status?.update_available ? tr('有新 Release', 'New Release available')
-              : releaseBuild ? tr('Release · 版本管理', 'Release · Versions')
-                : `${tr('开发版', 'Dev')} · ${revision || tr('版本管理', 'Versions')}`}</small>
+                : releaseBuild ? tr('Release · 版本管理', 'Release · Versions')
+                  : `${tr('开发版', 'Dev')} · ${revision || tr('版本管理', 'Versions')}`}</small>
           </span>
         </button>
       </aside>

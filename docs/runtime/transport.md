@@ -1,6 +1,6 @@
 # Native runtime transport
 
-`mfq serve` owns the public API. Each managed C++ inference runtime only exposes
+`tyloinfer serve` owns the public API. Each managed C++ inference runtime only exposes
 its private runtime control surface through one selected communication module:
 
 ```text
@@ -46,8 +46,8 @@ the engine unhealthy, including errors encountered during explicit shutdown.
 Select it with:
 
 ```bash
-mfq serve --transport stdio   # default
-mfq serve --transport http
+tyloinfer serve --transport stdio   # default
+tyloinfer serve --transport http
 ```
 
 CUDA runtime tuning uses `TYLOINFER_RUNTIME_*` environment variables.
@@ -57,14 +57,14 @@ CUDA runtime tuning uses `TYLOINFER_RUNTIME_*` environment variables.
 stdin and stdout carry UTF-8 NDJSON protocol version 1. stderr carries all
 runtime logs. Every request has a string `id`, an `op`, and an object `params`:
 
-```json
+```jsonl
 {"v":1,"id":"1","op":"health","params":{}}
 {"v":1,"id":"2","op":"generate","params":{"model":"...","input":{"messages":[{"role":"user","content":"hi"}]},"sampling":{"max_new_tokens":128},"stream":true,"include_usage":true}}
 ```
 
 Responses use the same ID:
 
-```json
+```jsonl
 {"v":1,"type":"ready"}
 {"v":1,"id":"1","type":"result","data":{"status":"ok"}}
 {"v":1,"id":"2","type":"event","data":{"event":"delta","request_id":"run-...","delta":{"content":"hello"}}}

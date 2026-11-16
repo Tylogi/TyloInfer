@@ -87,7 +87,6 @@ def test_standalone_cli_jobs_reinvoke_the_unified_mfq_binary(tmp_path: Path) -> 
             None,
             None,
             None,
-            None,
             standalone_cli=True,
         ),
     )
@@ -423,7 +422,7 @@ def test_download_passes_selected_route_to_sdk_and_external_cli(tmp_path, monkey
             root.mkdir(parents=True, exist_ok=True)
             (root / 'config.json').write_text('{}')
             """)
-        paths = ToolJobPaths(tmp_path, executable, executable, executable, None, None,
+        paths = ToolJobPaths(tmp_path, executable, executable, executable, None,
             standalone_cli=internal, internal_modelscope=internal, internal_huggingface=internal)
         handlers = ToolJobHandlers(ModelCatalog([]), paths)
         store = SessionStore(tmp_path / "jobs.sqlite3")

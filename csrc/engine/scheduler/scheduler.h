@@ -15,7 +15,10 @@ namespace tyloi::engine {
 
 class Scheduler {
 public:
-    struct Limits { std::size_t events = 64, bytes = 1024 * 1024; };
+    struct Limits {
+        std::size_t events = 64, bytes = 1024 * 1024;
+        std::size_t requests = 64, input_bytes = 16 * 1024 * 1024, commands = 128;
+    };
     explicit Scheduler(Engine& engine);
     Scheduler(Engine& engine, Limits limits);
     ~Scheduler();
@@ -35,7 +38,7 @@ public:
 
 private:
     friend class Engine;
-    struct Submit { EngineRequest input; std::shared_ptr<Output> outbox; std::promise<void> reply; };
+    struct Submit { EngineRequest input; std::shared_ptr<Output> outbox; std::promise<void> reply; std::size_t input_bytes = 0; };
     struct Cancel { std::string id; bool session = false, all = false; std::promise<bool> reply; };
     struct Control { ControlRequest request; std::promise<ControlResult> reply; };
     struct Session { SessionCommand request; std::promise<SessionResult> reply; };
@@ -61,6 +64,7 @@ private:
     std::condition_variable reload_wake_;
     std::optional<Engine::Reload> reload_job_;
     mutable std::deque<Command> mailbox_;
+    mutable std::size_t input_bytes_ = 0, request_count_ = 0;
     EngineInfo info_;
     Engine::Snapshot snapshot_;
     mutable bool snapshot_requested_ = false;

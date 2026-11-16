@@ -1,6 +1,6 @@
 import { type CSSProperties, useEffect, useRef, useState } from 'react';
 import { jobsApi } from '../../shared/api/resources/jobs';
-import type { JobKindResource, JobResource } from '../../shared/api/types';
+import type { JobResource } from '../../shared/api/types';
 import { useRuntime } from '../../app/RuntimeProvider';
 import { useConnectionScope } from '../../app/useConnectionScope';
 import { errorMessage } from '../../app/formatters';
@@ -11,36 +11,24 @@ import { useJobStore } from '../../stores/jobStore';
 import { ModelBrowser, type DownloadOrigin, type ModelBrowserTab } from './ModelBrowser';
 import { DownloadQueue, downloadProgress, isActiveDownload, isModelDownload } from './DownloadQueue';
 import { DownloadDirectoryControl } from './DownloadDirectoryControl';
+import { serverCapabilities } from '../../app/serverCapabilities';
 
+/** Keep repository downloads available while disabling native catalog and search resources. */
 export function ModelHubPage() {
   const { tr } = useSettings();
   const { addJob } = useRuntime();
+  const capabilities = serverCapabilities();
   const connectionScope = useConnectionScope();
   const jobs = useJobStore((state) => state.jobs);
   const downloads = jobs.filter(isModelDownload);
   const active = downloads.filter(isActiveDownload);
   const progress = active.length ? active.reduce((sum, job) => sum + downloadProgress(job), 0) / active.length : 0;
-  const [tab, setTab] = useState<ModelBrowserTab>('official');
+  const [tab, setTab] = useState<ModelBrowserTab>(() => capabilities.officialCatalog ? 'official' : 'community');
   const [downloadDirectory, setDownloadDirectory] = useState<string | undefined>();
   const circle = useRef<HTMLButtonElement>(null);
   const page = useRef<HTMLDivElement>(null);
   const [flight, setFlight] = useState<{ id: string; origin: DownloadOrigin; dx: number; dy: number } | null>(null);
-  const [jobKinds, setJobKinds] = useState<JobKindResource[]>([]);
 
-  useEffect(() => {
-    let active = true;
-    void jobsApi
-      .jobKinds()
-      .then((items) => {
-        if (active) setJobKinds(items);
-      })
-      .catch((cause) => {
-        if (active) toast.error(errorMessage(cause, tr));
-      });
-    return () => {
-      active = false;
-    };
-  }, []);
 
   useEffect(() => {
     if (!flight) return;
@@ -48,6 +36,7 @@ export function ModelHubPage() {
     return () => clearTimeout(timer);
   }, [flight]);
 
+  /** Track a submitted download and animate its entry into the current connection's queue. */
   function trackDownload(job: JobResource, origin: DownloadOrigin) {
     if (!connectionScope()()) return;
     const existing = useJobStore.getState().jobs.some(item => item.id === job.id);
@@ -61,7 +50,7 @@ export function ModelHubPage() {
   return (
     <div className="model-download-page" ref={page}>
       <ModelBrowser
-        jobKinds={jobKinds}
+        capabilities={capabilities}
         onError={(message) => toast.error(message)}
         onJobCreated={trackDownload}
         tab={tab}

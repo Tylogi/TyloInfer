@@ -6,7 +6,6 @@ import type {
   HubModelSummary,
   HubModelVariant,
   HubSystemProfile,
-  JobKindResource,
   JobResource,
   ModelConfigurationStatus,
   ModelParameterBreakdown,
@@ -29,6 +28,10 @@ import { estimateCacheBytes, KvCachePlanner, plannedConfiguration, withCacheMemo
 import { useJobStore } from '../../stores/jobStore';
 import { useDownloadReuse, type DownloadReuse } from './useDownloadReuse';
 import { downloadPatterns, isSharedEngram } from './downloadPatterns';
+import type { ServerCapabilities } from '../../app/serverCapabilities';
+
+/** The download sources this build can submit jobs for; mirrors the server's submittable kinds. */
+const DOWNLOAD_PROVIDERS = ['huggingface', 'modelscope'] as const;
 
 type Translate = (chinese: string, english: string) => string;
 function attentionLabel(profile: ModelAttentionProfile | null | undefined, tr: Translate): string {
@@ -41,7 +44,8 @@ export type ModelBrowserTab = 'official' | 'community' | 'downloads';
 export type DownloadOrigin = { x: number; y: number };
 
 interface ModelBrowserProps {
-  jobKinds: JobKindResource[];
+  /** Limits optional browsing resources to those implemented by the connected service. */
+  capabilities?: ServerCapabilities;
   onError(message: string): void;
   onJobCreated(job: JobResource, origin: DownloadOrigin): void;
   tab: ModelBrowserTab;
@@ -64,8 +68,8 @@ function formatBytes(value?: number | null): string {
   return `${amount.toFixed(unit < 2 ? 0 : 1)} ${units[unit]}`;
 }
 
-function formatCount(value: number): string {
-  return new Intl.NumberFormat(undefined, { notation: "compact" }).format(value);
+function formatCount(value: number | null | undefined): string {
+  return value == null ? '—' : new Intl.NumberFormat(undefined, { notation: "compact" }).format(value);
 }
 
 function formatParameters(value: number): string {
@@ -267,7 +271,8 @@ function VariantList({
   );
 }
 
-export function ModelBrowser({ jobKinds, onError, onJobCreated, tab, onTabChange, downloadQueue, downloadDirectory, downloadDirectoryControl, tr }: ModelBrowserProps) {
+/** Browse supported repositories and submit downloads using the service's available capabilities. */
+export function ModelBrowser({ capabilities, onError, onJobCreated, tab, onTabChange, downloadQueue, downloadDirectory, downloadDirectoryControl, tr }: ModelBrowserProps) {
   const [official, setOfficial] = useState<OfficialModelList | null>(null);
   const [officialSelection, setOfficialSelection] = useState<string | null>(null);
   const [officialSource, setOfficialSource] = useState<OfficialModelSource | null>(null);
@@ -338,14 +343,14 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tab, onTabChange
     ? estimateCacheBytes(communityModel.cache_profile, communityContext) : 0;
   const applyPlan = (key: string, context: number | undefined) => setPlannedContexts((current) => ({ ...current, [key]: context }));
   const canDownload = (targetProvider: HubModelSummary["provider"]) =>
-    (!downloadDirectoryControl || downloadDirectory !== undefined) && jobKinds.some((item) => item.kind === `download.${targetProvider}`);
+    (!downloadDirectoryControl || downloadDirectory !== undefined) && DOWNLOAD_PROVIDERS.includes(targetProvider);
   const downloadRevision = useJobStore(state => state.jobs.filter(job => job.kind.startsWith('download.'))
     .map(job => `${job.id}:${job.status}`).join('|'));
   const directoryReady = !downloadDirectoryControl || downloadDirectory !== undefined;
-  const officialReuse = useDownloadReuse(directoryReady && selectedSource && officialVariants.some(variant => variant.files.some(isSharedEngram))
+  const officialReuse = useDownloadReuse(capabilities?.downloadReuse !== false && directoryReady && selectedSource && officialVariants.some(variant => variant.files.some(isSharedEngram))
     ? { provider: selectedSource.provider, repo_id: selectedSource.repo_id, revision: selectedSource.revision,
         destination: repositoryDownloadPath(selectedSource), download_directory: downloadDirectory } : null, downloadRevision);
-  const communityReuse = useDownloadReuse(directoryReady && communityModel && communityModel.variants.some(variant => variant.files.some(isSharedEngram))
+  const communityReuse = useDownloadReuse(capabilities?.downloadReuse !== false && directoryReady && communityModel && communityModel.variants.some(variant => variant.files.some(isSharedEngram))
     ? { provider: communityModel.provider, repo_id: communityModel.repo_id, revision: communityModel.revision,
         destination: repositoryDownloadPath(communityModel), download_directory: downloadDirectory } : null, downloadRevision);
 
@@ -378,14 +383,14 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tab, onTabChange
   }
 
   useEffect(() => {
-    void loadOfficial(false);
+    if (capabilities?.officialCatalog !== false) void loadOfficial(false);
     return () => {
       catalogRequest.current += 1;
       officialRequest.current += 1;
       catalogController.current?.abort();
       if (catalogTimer.current !== null) clearTimeout(catalogTimer.current);
     };
-  }, []);
+  }, [capabilities?.officialCatalog]);
 
   function chooseOfficial(item: OfficialModelInfo) {
     officialRequest.current += 1;
@@ -475,7 +480,9 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tab, onTabChange
         </div>
       </header>
 
-      {tab === "official" ? (
+      {tab === 'official' && capabilities?.officialCatalog === false ? (
+        <p className="model-browser-empty" role="status">{tr('当前原生服务暂不提供推荐目录。可在模型浏览器中输入 owner/repo 或仓库链接并下载。', 'The native server does not provide recommendations. Enter owner/repo or a repository URL in Model browser to download.')}</p>
+      ) : tab === "official" ? (
         <>
           <div className="detected-configuration">
             <div><span>{tr("检测到的配置", "Detected configuration")}</span><div className="detected-hardware-summary"><strong>{system ? hardwareSummary(system, tr) : tr("正在检测", "Detecting")}</strong>{system && <BackendBadge backend={system.backend} />}</div></div>
@@ -533,13 +540,14 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tab, onTabChange
         </>
       ) : tab === 'community' ? (
         <CommunityModelBrowser model={communityModel} onSelect={setCommunityModel} tr={tr} backend={system?.backend}
+          searchAvailable={capabilities?.hubSearch} readmeAvailable={capabilities?.hubReadme}
           variants={communityModel ? withCacheMemory(communityModel.variants, communityCacheBytes) : []}
           details={communityModel && <>
                 <dl className="model-metadata-grid">
                   <div><dt>{tr("架构", "Architecture")}</dt><dd>{communityModel.architectures.join(", ") || tr("未声明", "Not declared")}</dd></div>
                   <div className="model-parameter-row"><dt>{tr("参数", "Parameters")}</dt><dd><ParameterValue parameters={communityModel.parameter_breakdown} label={communityModel.parameter_count ? formatParameters(communityModel.parameter_count) : null} tr={tr} /></dd></div>
                   <div><dt>{tr('激活参数', 'Active parameters')}</dt><dd>{communityModel.parameter_breakdown?.active != null ? formatParameters(communityModel.parameter_breakdown.active) : '—'}</dd></div>
-                  <div><dt>{tr("模态", "Modalities")}</dt><dd>{modalityLabels(communityModel.modalities.length ? communityModel.modalities : ['text'], tr)}</dd></div>
+                  <div><dt>{tr("模态", "Modalities")}</dt><dd>{modalityLabels(communityModel.modalities, tr) || tr('未声明', 'Not declared')}</dd></div>
                   <MtpSupport supported={communityModel.mtp_supported} tr={tr} />
                   <div><dt>{tr("注意力类型", "Attention type")}</dt><dd>{attentionLabel(communityModel.attention_profile, tr)}</dd></div>
                   <div><dt>{tr("下载", "Downloads")}</dt><dd>{formatCount(communityModel.downloads)}</dd></div>

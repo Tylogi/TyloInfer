@@ -7,7 +7,7 @@ for (const architecture of ['discrete', 'unified'] as const) {
     await mockStudioServer(page, { language: 'zh-CN' });
     const separate = architecture === 'discrete';
     const GiB = 2 ** 30;
-    await page.route('**/api/v1/runtime/status*', route => route.fulfill({ json: {
+    await page.route('**/api/runtime/status*', route => route.fulfill({ json: {
       runtime_state: 'ready', backend: 'cuda', memory_architecture: architecture, unified_memory: !separate,
       device_memory_total_bytes: separate ? 24 * GiB : null, host_memory_total_bytes: 128 * GiB,
       device_free_bytes: separate ? 3 * GiB : undefined, host_memory_available_bytes: 10 * GiB,
@@ -16,7 +16,7 @@ for (const architecture of ['discrete', 'unified'] as const) {
       prefix_cache_hot_blocks: 1, prefix_cache_disk_blocks: 1, prefix_cache_queries: 2, prefix_cache_hits: 1,
       prefix_cache_total_ram_bytes: separate ? GiB : 0, prefix_cache_total_ram_max_bytes: separate ? 2 * GiB : 0,
     } }));
-    await page.route('**/api/v1/runtime/instances', route => route.fulfill({ json: { data: [{
+    await page.route('**/api/runtime/instances', route => route.fulfill({ json: { data: [{
       id: 'instance-1', model: 'Studio Test Model', state: 'ready', devices: ['cuda:0'], active_sessions: 1,
       queued_requests: 0, context_size: 32768, context_capacity: 262144, qsa_kv_offload_supported: true,
       memory: { resident_weight_bytes: 10 * GiB, resident_buffer_bytes: separate ? 3 * GiB : null,
@@ -28,7 +28,7 @@ for (const architecture of ['discrete', 'unified'] as const) {
         prefix_cache_ram_blocks: separate ? 4 : 0,
         ssd_ple: true, ssd_ple_bytes: 2 * GiB, ssd_kv: true, ssd_kv_bytes: GiB },
     }] } }));
-    await page.route('**/api/v1/runtime/memory-policy', route => route.fulfill({ json: {
+    await page.route('**/api/runtime/memory-policy', route => route.fulfill({ json: {
       total_limit_bytes: null, model_limit_bytes: null, prefix_limit_bytes: null, effective_total_limit_bytes: null,
     } }));
     await page.goto('/');

@@ -118,6 +118,7 @@ def main(argv: list[str] | None = None) -> int:
         import multiprocessing
 
         multiprocessing.freeze_support()
+    arguments = sys.argv[1:] if argv is None else argv
     parser = _build_parser()
     args = parser.parse_args(argv)
     if not getattr(args, "command", None):

@@ -34,11 +34,7 @@ from tyloinfer.server.state.catalog import (
     ModelRegistrationError,
 )
 from tyloinfer.server.services.checkpoint_analysis import analyze_checkpoint
-from tyloinfer.server.services.model_deletion import (
-    ModelDeletionError,
-    delete_model_files,
-    model_deletion_plan,
-)
+from tyloinfer.server.services.model_deletion import ModelDeletionError, delete_model_files, model_deletion_plan
 from tyloinfer.server.services.model_memory import checkpoint_cache_profile
 from tyloinfer.server.services.documents import DocumentExtractionError, extract_document
 from tyloinfer.server.services.desktop import FileManagerUnavailableError, open_directory

@@ -24,29 +24,29 @@ for (const mode of ['light', 'dark', 'system-light', 'system-dark'] as const) {
     await page.emulateMedia({ colorScheme: dark ? 'dark' : 'light' });
     await page.addInitScript(value => localStorage.setItem('tyloinfer.studio.generation.v1',
       JSON.stringify({ language: 'en', theme: value })), theme);
-    await page.route(/\/api\/v1\/models(?:\?.*)?$/, route => route.fulfill({ json: { data: analysisArtifacts } }));
-    await page.route('**/api/v1/models/*/analysis', route => route.fulfill({ json: analysisFixture() }));
-    await page.route('**/api/v1/runtime/instances', route => route.fulfill({ json: { data: [0, 1, 2, 3].map(index => ({
+    await page.route(/\/api\/models(?:\?.*)?$/, route => route.fulfill({ json: { data: analysisArtifacts } }));
+    await page.route('**/api/models/*/analysis', route => route.fulfill({ json: analysisFixture() }));
+    await page.route('**/api/runtime/instances', route => route.fulfill({ json: { data: [0, 1, 2, 3].map(index => ({
       id: `instance-${index + 1}`, model: index ? `Model ${index + 1}` : 'Studio Test Model', state: 'ready',
       devices: ['metal'], active_sessions: 0, queued_requests: 0, started_at: `2026-10-10T00:00:0${index}Z`,
       memory: { resident_weight_bytes: 2 ** 30, kv_bytes: 2 ** 28, context_count: 1, prefix_cache_blocks: 0,
         ssd_experts: true, ssd_expert_bytes: 2 ** 30, ssd_ple: true, ssd_ple_bytes: 2 ** 30,
         ssd_kv: true, ssd_kv_bytes: 2 ** 28 },
     })) } }));
-    await page.route('**/api/v1/runtime/status*', route => route.fulfill({ json: {
+    await page.route('**/api/runtime/status*', route => route.fulfill({ json: {
       runtime_state: 'ready', model: 'Studio Test Model', model_type: 'Test', max_context: 8192,
       runtime_memory_effective_budget_bytes: 64 * 2 ** 30, active_requests: 0, sampling_defaults: {},
     } }));
-    await page.route('**/api/v1/runtime/resources', route => route.fulfill({ json: {
+    await page.route('**/api/runtime/resources', route => route.fulfill({ json: {
       sampled_at: 1, interval_seconds: 2, cpu_name: 'Apple M5 Max', cpu_cores: 18, cpu_utilization_percent: 36,
       gpus: [{ name: 'Apple M5 Max', core_count: 40, utilization_percent: 24 }], disks: [], weights: [],
     } }));
     const download = { id: 'theme-download', kind: 'download.modelscope', status: 'running', progress: 0.5,
       payload: { repo_id: 'example/theme-model', destination: '/models' }, cancel_requested: false,
       created_at: '2026-10-10T00:00:00Z', updated_at: '2026-10-10T00:00:00Z' };
-    await page.route(/\/api\/v1\/jobs(?:\?.*)?$/, route => route.fulfill({ json: { data: [download] } }));
-    await page.route('**/api/v1/jobs/theme-download', route => route.fulfill({ json: download }));
-    await page.route('**/api/v1/jobs/theme-download/events/stream*', route => route.fulfill({ status: 503, json: { error: 'offline' } }));
+    await page.route(/\/api\/jobs(?:\?.*)?$/, route => route.fulfill({ json: { data: [download] } }));
+    await page.route('**/api/jobs/theme-download', route => route.fulfill({ json: download }));
+    await page.route('**/api/jobs/theme-download/events/stream*', route => route.fulfill({ status: 503, json: { error: 'offline' } }));
     const errors: string[] = [];
     page.on('pageerror', error => errors.push(error.message));
 

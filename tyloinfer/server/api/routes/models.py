@@ -11,7 +11,33 @@ from fastapi import APIRouter, Path, Query, Response
 from tyloinfer.server.api.dependencies import ServiceDependency
 from tyloinfer.server.api.routes import ERROR_RESPONSES
 from tyloinfer.server.protocol.analysis import CheckpointAnalysis
-from tyloinfer.server.protocol.models import (ArtifactLineageList, CreateRemoteNodeRequest, DeleteWorkspaceArtifactRequest, DeleteModelRequest, ModelDeletionPlan, HubModelInfo, HubModelSearchResult, HubReferenceRequest, HubDownloadProbeRequest, HubDownloadReuseRequest, HubDownloadReuseResponse, ModelArtifactList, ModelCacheProfile, ModelDirectoryList, ModelLoadRequest, ModelUnloadRequest, OfficialModelList, OpenModelDirectoryRequest, OpenModelDirectoryResult, OperationAccepted, RegisterModelDirectoryRequest, ConfigureDownloadDirectoryRequest, RemoteNodeList, RemoteNodeResource, UpdateRemoteNodeRequest)
+from tyloinfer.server.protocol.models import (
+    ArtifactLineageList,
+    CreateRemoteNodeRequest,
+    DeleteWorkspaceArtifactRequest,
+    DeleteModelRequest,
+    ModelDeletionPlan,
+    HubModelInfo,
+    HubModelSearchResult,
+    HubReferenceRequest,
+    HubDownloadProbeRequest,
+    HubDownloadReuseRequest,
+    HubDownloadReuseResponse,
+    ModelArtifactList,
+    ModelCacheProfile,
+    ModelDirectoryList,
+    ModelLoadRequest,
+    ModelUnloadRequest,
+    OfficialModelList,
+    OpenModelDirectoryRequest,
+    OpenModelDirectoryResult,
+    OperationAccepted,
+    RegisterModelDirectoryRequest,
+    ConfigureDownloadDirectoryRequest,
+    RemoteNodeList,
+    RemoteNodeResource,
+    UpdateRemoteNodeRequest,
+)
 from tyloinfer.server.services.service import ServiceError
 
 hub_router = APIRouter()
@@ -265,22 +291,6 @@ async def delete_workspace_artifact(
     body: DeleteWorkspaceArtifactRequest,
 ) -> dict[str, Any]:
     return await service.delete_workspace_artifact(body)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 @router.post(

@@ -1,4 +1,5 @@
 #include "scheduler.h"
+#include "components/error.h"
 #include "request.h"
 #include "engine/models/common/mtp.h"
 
@@ -12,6 +13,38 @@ namespace tyloi::engine {
 
 namespace {
 constexpr std::size_t terminal_reserve = sizeof(EngineEvent) + 128 + 64 + 512;
+std::size_t request_bytes(const EngineRequest& request) {
+    const auto& input = request.input;
+    std::size_t bytes = sizeof(request) + request.id.size() + input.prompt.size() +
+        input.cache_plan.session_id.size() + request.token_ids.size() * sizeof(std::int64_t);
+    for (const auto& stop : input.stops) bytes += sizeof(stop) + stop.size();
+    if (input.chat_input) {
+        const auto& chat = *input.chat_input;
+        const auto& value = chat.template_inputs;
+        bytes += sizeof(chat) + value.grammar.size() + value.json_schema.size();
+        if (chat.preformatted_prompt) bytes += chat.preformatted_prompt->size();
+        for (const auto& message : value.messages) {
+            bytes += sizeof(message) + message.role.size() + message.content.size() +
+                message.reasoning_content.size() + message.tool_name.size() + message.tool_call_id.size();
+            for (const auto& part : message.content_parts) bytes += sizeof(part) + part.type.size() + part.text.size();
+            for (const auto& call : message.tool_calls) bytes += sizeof(call) + call.id.size() + call.name.size() + call.arguments.size();
+            for (const auto& [key, field] : message.extra_fields) bytes += sizeof(key) + sizeof(field) + key.size() + field.size();
+        }
+        for (const auto& tool : value.tools) bytes += sizeof(tool) + tool.name.size() + tool.description.size() + tool.parameters.size();
+        for (const auto& [key, field] : value.chat_template_kwargs) bytes += sizeof(key) + sizeof(field) + key.size() + field.size();
+    }
+    if (input.media) {
+        const auto& m = *input.media;
+        const auto count = [](const auto& values) { return values.size() * sizeof(typename std::decay_t<decltype(values)>::value_type); };
+        bytes += sizeof(m) + m.processor_name.size() + count(m.pixel_values) + count(m.pixel_shape) +
+            count(m.patch_mask) + count(m.patch_mask_shape) + count(m.target_sizes) + count(m.target_sizes_shape) +
+            count(m.vision_grid) + count(m.vision_grid_shape) + count(m.vision_types) + count(m.image_grid) +
+            count(m.image_grid_shape) + count(m.video_grid) + count(m.video_grid_shape) + count(m.image_bounds) +
+            count(m.image_permutation) + count(m.image_permutation_offsets) + count(m.audio_features) +
+            count(m.audio_features_shape) + count(m.audio_lengths) + count(m.audio_bounds);
+    }
+    return bytes;
+}
 std::size_t event_bytes(const EventData& data) {
     return std::visit([](const auto& value) -> std::size_t {
         using T = std::decay_t<decltype(value)>;
@@ -32,7 +65,6 @@ std::size_t event_bytes(const EventData& data) {
 }
 }
 
-void Engine::reset_states(std::int64_t batch) { scheduler_->reset_states(batch); }
 void Engine::start() {
     try { scheduler_ = std::make_unique<Scheduler>(*this); }
     catch (...) {
@@ -67,8 +99,13 @@ std::string Engine::decode_tokens(const std::vector<std::int64_t>& tokens,
 }
 
 std::vector<EngineEvent> Output::wait() {
+    return wait_for(std::chrono::milliseconds::max());
+}
+std::vector<EngineEvent> Output::wait_for(std::chrono::milliseconds timeout) {
     std::unique_lock lock(mutex_);
-    ready_.wait(lock, [&] { return terminal_ || !events_.empty(); });
+    const auto ready = [&] { return terminal_ || !events_.empty(); };
+    if (timeout == std::chrono::milliseconds::max()) ready_.wait(lock, ready);
+    else ready_.wait_for(lock, timeout, ready);
     std::vector<EngineEvent> result;
     while (!events_.empty()) {
         result.push_back(std::move(events_.front()));
@@ -88,7 +125,7 @@ bool Output::done() const {
 Scheduler::Scheduler(Engine& engine) : Scheduler(engine, Limits{}) {}
 Scheduler::Scheduler(Engine& engine, Limits limits)
     : engine_(engine), limits_(limits), info_(engine.describe()) {
-    if (limits.events < 4 || limits.bytes < 4096)
+    if (limits.events < 4 || limits.bytes < 4096 || !limits.requests || !limits.input_bytes || !limits.commands)
         throw std::invalid_argument("outbox requires at least 4 events and 4096 bytes");
     std::promise<void> ready;
     auto initialized = ready.get_future();
@@ -120,7 +157,16 @@ void Scheduler::shutdown() {
 void Scheduler::enqueue(Command command) const {
     std::lock_guard lock(mutex_);
     if (stopping_) throw std::runtime_error("scheduler is stopping");
+    if (mailbox_.size() >= limits_.commands) throw MfqResourceExhausted("scheduler command queue is full");
+    if (const auto* submit = std::get_if<Submit>(&command)) {
+        if (request_count_ >= limits_.requests || submit->input_bytes > limits_.input_bytes - input_bytes_)
+            throw MfqResourceExhausted("scheduler request or input budget is exhausted");
+    }
     mailbox_.push_back(std::move(command));
+    if (const auto* submit = std::get_if<Submit>(&mailbox_.back())) {
+        ++request_count_;
+        input_bytes_ += submit->input_bytes;
+    }
     wake_->notify_one();
 }
 EngineInfo Scheduler::info() const {
@@ -153,7 +199,10 @@ Engine::Snapshot Scheduler::snapshot() const {
         snapshot_requested_ = true;
         wake_->notify_one();
     }
-    return snapshot_;
+    auto result = snapshot_;
+    result.requests = request_count_;
+    result.input_bytes = input_bytes_;
+    return result;
 }
 void Scheduler::refresh_snapshot(bool healthy, bool blocked, bool metrics) {
     auto status = execution_status();
@@ -185,7 +234,8 @@ std::shared_ptr<Output> Scheduler::submit(EngineRequest input) const {
         throw std::invalid_argument("request ID must contain 1-128 bytes");
     auto outbox = std::make_shared<Output>();
     outbox->wake_ = wake_;
-    Submit command{std::move(input), outbox, {}};
+    const auto bytes = request_bytes(input);
+    Submit command{std::move(input), outbox, {}, bytes};
     auto result = command.reply.get_future();
     enqueue(std::move(command));
     result.get();
@@ -218,6 +268,7 @@ std::int64_t Scheduler::reload(std::int64_t context) const {
         std::lock_guard lock(mutex_);
         if (stopping_) throw std::runtime_error("scheduler is stopping");
         if (!reload_enabled_ || !info_.reload) throw std::runtime_error("reload is unavailable");
+        if (mailbox_.size() >= limits_.commands) throw MfqResourceExhausted("scheduler command queue is full");
         mailbox_.push_back(std::move(command));
     }
     wake_->notify_one();
@@ -306,20 +357,6 @@ EngineStatus Scheduler::execution_status() const {
     return {info_.max_requests - active, true};
 }
 
-void Scheduler::reset_states(std::int64_t batch) {
-    for (auto& [id, request] : requests_) {
-        if (!request.state) continue;
-        auto& state = *request.state;
-        engine_.budget_->reserve(state.graph_exit_growth());
-        state.release_graphs();
-        engine_.budget_->reserve(state.reset_growth(batch));
-        state.reset(batch);
-        if (auto* predictor = engine_.model_->predictor(); predictor && state.predictor) {
-            engine_.budget_->reserve(predictor->reset_growth(*state.predictor, batch));
-            predictor->reset(*state.predictor, batch);
-        }
-    }
-}
 
 std::pair<bool, std::vector<EngineEvent>> Scheduler::advance(const std::vector<RequestId>& eligible) {
     auto scope = engine_.enter();
@@ -419,6 +456,7 @@ void Scheduler::loop() noexcept {
                         if (other.submitted.input.cache_plan.session_id == session)
                             throw std::invalid_argument("session already has an active request");
                     requests_.try_emplace(id, std::move(input), std::move(value.outbox));
+                    requests_.at(id).input_bytes = value.input_bytes;
                     try { order_.push_back(id); }
                     catch (...) { requests_.erase(id); throw; }
                     value.reply.set_value();
@@ -476,7 +514,14 @@ void Scheduler::loop() noexcept {
                     for (auto& [id, request] : requests_) cancel(request);
                     reload.emplace(std::move(value));
                 }
-            } catch (...) { value.reply.set_exception(std::current_exception()); }
+            } catch (...) {
+                if constexpr (std::is_same_v<T, Submit>) {
+                    std::lock_guard lock(mutex_);
+                    --request_count_;
+                    input_bytes_ -= value.input_bytes;
+                }
+                value.reply.set_exception(std::current_exception());
+            }
         }, command);
         bool executable = false;
         auto wake_at = Clock::time_point::max();
@@ -560,7 +605,10 @@ void Scheduler::loop() noexcept {
         for (auto it = order_.begin(); it != order_.end();) {
             auto box = requests_.at(*it).outbox;
             std::lock_guard lock(box->mutex_);
-            if (box->terminal_) { requests_.erase(*it); it = order_.erase(it); }
+            if (box->terminal_) {
+                { std::lock_guard lock(mutex_); --request_count_; input_bytes_ -= requests_.at(*it).input_bytes; }
+                requests_.erase(*it); it = order_.erase(it);
+            }
             else ++it;
         }
         if (reload && requests_.empty()) {

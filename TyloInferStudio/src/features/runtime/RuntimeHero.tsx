@@ -10,13 +10,16 @@ import { openAIEndpoint } from './endpoint';
 import { getApiBaseUrl } from '../../shared/api/client';
 import { ModelVendorMark } from '../../app/ModelVendorMark';
 import { ModelLoadProgress } from '../models/ModelLoadProgress';
+import { modelLoadJobName } from './modelSelection';
 
+/** Present the selected native instance and active lifecycle job without synthetic telemetry. */
 export function RuntimeHero() {
-  const { runtime, instances, studio } = useRuntime();
+  const { runtime, instances, studio, artifactNames } = useRuntime();
   const jobs = useJobStore((state) => state.jobs);
   const { tr } = useSettings();
   const navigate = useNavigate();
   const openStudioPage = (localCheckpoints = false) => navigate(`${STUDIO_PATHS.models}${localCheckpoints ? '#local-checkpoints' : ''}`);
+  const openConversationPage = () => navigate(STUDIO_PATHS.chat);
   const runtimeModelName = runtime?.model || 'Empty';
   const modelHero = useMemo(() => {
     const activeLoadJob = jobs.find(
@@ -40,8 +43,7 @@ export function RuntimeHero() {
       currentInstance?.state === 'failed'
         ? currentInstance
         : [...instances].reverse().find((instance) => instance.state === 'failed');
-    const jobModel =
-      typeof activeLoadJob?.payload.model === 'string' ? activeLoadJob.payload.model : '';
+    const jobModel = activeLoadJob ? modelLoadJobName(activeLoadJob, artifactNames) : '';
     const runtimeState = String(runtime?.runtime_state || '').toLowerCase();
 
     if (runtime?.reloading || runtimeState === 'loading' || loadingInstance || activeLoadJob) {
@@ -69,10 +71,7 @@ export function RuntimeHero() {
       };
     }
     if (latestLifecycleJob?.kind === 'model.load' && ['failed', 'interrupted'].includes(latestLifecycleJob.status)) {
-      const failedJobModel =
-        typeof latestLifecycleJob.payload.model === 'string'
-          ? latestLifecycleJob.payload.model
-          : '';
+      const failedJobModel = modelLoadJobName(latestLifecycleJob, artifactNames);
       return {
         name: failedJobModel || runtimeModelName,
         state: 'failed' as const,
@@ -80,7 +79,7 @@ export function RuntimeHero() {
       };
     }
     return { name: runtimeModelName, state: 'idle' as const };
-  }, [instances, jobs, runtime, runtimeModelName]);
+  }, [instances, jobs, runtime, runtimeModelName, artifactNames]);
   const modelHeroStatus =
     modelHero.state === 'loading'
       ? tr('加载中', 'Loading')
@@ -101,13 +100,14 @@ export function RuntimeHero() {
             {modelHeroStatus}
           </span>
         </div>
-        <p className="runtime-endpoint">{openAIEndpoint(studio?.service_url || getApiBaseUrl())}</p>
+        <p className="runtime-endpoint">{openAIEndpoint(studio?.service_url || getApiBaseUrl()) ?? tr('API 端点暂不可用', 'API endpoint unavailable')}</p>
         <small>
           {runtime?.model
-            ? `${runtime?.model_type || 'TQ'} · ${formatNumber(runtime?.max_context)} ${tr('上下文', 'context')} · ${formatDuration(runtime?.uptime_seconds)}`
+            ? [runtime.model_type, `${formatNumber(runtime.max_context)} ${tr('上下文', 'context')}`,
+              runtime.uptime_seconds == null ? null : formatDuration(runtime.uptime_seconds)].filter(Boolean).join(' · ')
             : tr('加载本地模型后即可开始推理。', 'Load a local model to begin inference.')}
         </small>
-        {modelHero.state === 'loading' && <ModelLoadProgress model={modelHero.name} />}
+        {modelHero.state === 'loading' && <ModelLoadProgress model={modelHero.name} artifactNames={artifactNames} />}
       </div>
       <div className="runtime-hero-actions">
         <ModelVendorMark name={modelHero.name} size={34}
@@ -115,6 +115,10 @@ export function RuntimeHero() {
         <button className={modelHero.state === 'ready' ? undefined : 'primary'} onClick={() => openStudioPage(modelHero.state === 'idle')} type="button">
           <Icon name="folder" size={15} />
           {modelHero.state === 'idle' ? tr('加载', 'Load') : tr('模型', 'Models')}
+        </button>
+        <button className={modelHero.state === 'ready' ? 'primary runtime-hero-chat' : undefined} onClick={openConversationPage} type="button">
+          <Icon name="chat" size={15} />
+          {tr('聊天', 'Chat')}
         </button>
       </div>
     </TMPanel>

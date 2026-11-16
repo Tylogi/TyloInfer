@@ -93,6 +93,7 @@ class Scheduler;
 class Output {
 public:
     std::vector<EngineEvent> wait();
+    std::vector<EngineEvent> wait_for(std::chrono::milliseconds timeout);
     bool done() const;
 
 private:

@@ -13,7 +13,7 @@ import { request, apiUrl, errorFromResponse, authorizedHeaders } from '../client
 export const sessionsApi = {
 
   async listSessions(offset = 0): Promise<Session[]> {
-    return (await request<{ data: Session[] }>('/api/v1/sessions?limit=200' + (offset ? `&offset=${offset}` : ''))).data;
+    return (await request<{ data: Session[] }>('/api/sessions?limit=200' + (offset ? `&offset=${offset}` : ''))).data;
   },
 
 
@@ -23,7 +23,7 @@ export const sessionsApi = {
     title?: string,
     metadata?: Record<string, unknown>,
   ): Promise<Session> {
-    return request('/api/v1/sessions', {
+    return request('/api/sessions', {
       method: 'POST',
       body: JSON.stringify({ model, mode, title, metadata: metadata ?? {} }),
     });
@@ -31,7 +31,7 @@ export const sessionsApi = {
 
 
   getSession(id: string, signal?: AbortSignal): Promise<Session> {
-    return request(`/api/v1/sessions/${id}`, { signal });
+    return request(`/api/sessions/${id}`, { signal });
   },
 
 
@@ -39,7 +39,7 @@ export const sessionsApi = {
     id: string,
     update: { title?: string | null; mode?: SessionMode; metadata?: Record<string, unknown> },
   ): Promise<Session> {
-    return request(`/api/v1/sessions/${id}`, {
+    return request(`/api/sessions/${id}`, {
       method: 'PATCH',
       body: JSON.stringify(update),
     });
@@ -47,13 +47,13 @@ export const sessionsApi = {
 
 
   async listMessages(id: string, signal?: AbortSignal): Promise<Message[]> {
-    return (await request<{ data: Message[] }>(`/api/v1/sessions/${id}/messages`, { signal })).data;
+    return (await request<{ data: Message[] }>(`/api/sessions/${id}/messages`, { signal })).data;
   },
 
 
   async listResponses(id: string, signal?: AbortSignal): Promise<ResponseResource[]> {
     return (
-      await request<{ data: ResponseResource[] }>(`/api/v1/sessions/${id}/responses?limit=1000`, {
+      await request<{ data: ResponseResource[] }>(`/api/sessions/${id}/responses?limit=1000`, {
         signal,
       })
     ).data;
@@ -61,7 +61,7 @@ export const sessionsApi = {
 
 
   cancelResponse(id: string, signal?: AbortSignal): Promise<ResponseResource> {
-    return request(`/api/v1/sessions/${id}/responses/cancel`, { method: 'POST', signal });
+    return request(`/api/sessions/${id}/responses/cancel`, { method: 'POST', signal });
   },
 
 
@@ -71,7 +71,7 @@ export const sessionsApi = {
     role: MessageRole,
     parts: ContentPart[],
   ): Promise<{ session: Session; message: Message }> {
-    return request(`/api/v1/sessions/${id}/messages`, {
+    return request(`/api/sessions/${id}/messages`, {
       method: 'POST',
       body: JSON.stringify({ expected_revision: expectedRevision, role, parts }),
     });
@@ -85,7 +85,7 @@ export const sessionsApi = {
     title?: string | null,
     model?: string,
   ): Promise<Session> {
-    return request(`/api/v1/sessions/${id}/fork`, {
+    return request(`/api/sessions/${id}/fork`, {
       method: 'POST',
       body: JSON.stringify({
         at_message_id: atMessageId,
@@ -103,7 +103,7 @@ export const sessionsApi = {
     atMessageId: string,
     includeMessage = true,
   ): Promise<Session> {
-    return request(`/api/v1/sessions/${id}/rewind`, {
+    return request(`/api/sessions/${id}/rewind`, {
       method: 'POST',
       body: JSON.stringify({
         expected_revision: expectedRevision,
@@ -115,7 +115,7 @@ export const sessionsApi = {
 
 
   async deleteSession(id: string): Promise<void> {
-    const response = await fetch(apiUrl(`/api/v1/sessions/${id}`), {
+    const response = await fetch(apiUrl(`/api/sessions/${id}`), {
       method: 'DELETE',
       headers: authorizedHeaders(),
     });
@@ -124,7 +124,7 @@ export const sessionsApi = {
 
 
   exportSession(id: string): Promise<SessionArchive> {
-    return request(`/api/v1/sessions/${id}/export`);
+    return request(`/api/sessions/${id}/export`);
   },
 
 
@@ -133,7 +133,7 @@ export const sessionsApi = {
     messages_imported: number;
     media_imported: number;
   }> {
-    return request('/api/v1/sessions/import', {
+    return request('/api/sessions/import', {
       method: 'POST',
       body: JSON.stringify(archive),
     });

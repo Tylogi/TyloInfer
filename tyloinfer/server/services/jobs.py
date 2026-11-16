@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -184,6 +185,7 @@ class JobManager:
             raise RuntimeError("job handlers must be registered before the manager starts")
         if kind in self.handlers:
             raise ValueError(f"job kind is already registered: {kind}")
+
         self.handlers[kind] = handler
 
     def kinds(self) -> JobKindList:

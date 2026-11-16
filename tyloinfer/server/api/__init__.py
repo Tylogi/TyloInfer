@@ -65,9 +65,7 @@ def create_app(
     )
     app.openapi_version = "3.1.0"
     app.state.service = service
-    app.state.server_identity = (
-        server_identity if server_identity is not None else make_server_identity()
-    )
+    app.state.server_identity = server_identity if server_identity is not None else make_server_identity()
     app.state.api_key = api_key
     app.state.api_keys = api_keys
     app.state.auth_policy = AuthenticationPolicy(

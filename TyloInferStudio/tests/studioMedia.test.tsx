@@ -63,7 +63,7 @@ describe('test_studio_loads_message_media_through_authenticated_blob_urls（行�
     expect(screen.getByLabelText('Loading media')).toBeInTheDocument();
     const image = await screen.findByAltText('Attached image');
     const [url, options] = fetchMock.mock.calls[0];
-    expect(url).toBe('https://studio.example/api/v1/media/protected-media');
+    expect(url).toBe('https://studio.example/api/media/protected-media');
     expect(options.headers.get('Authorization')).toBe('Bearer private-token');
     expect(options.signal.aborted).toBe(false);
     expect(createObjectURL).toHaveBeenCalledWith(blob);
@@ -200,7 +200,7 @@ describe('test_studio_fetches_protected_message_media_and_documents（行为）'
     fireEvent.click(button);
     expect(button).toBeDisabled();
     await act(async () => { await Promise.resolve(); });
-    expect(fetchMock.mock.calls[0][0]).toBe('https://studio.example/api/v1/media/protected-media');
+    expect(fetchMock.mock.calls[0][0]).toBe('https://studio.example/api/media/protected-media');
     expect(fetchMock.mock.calls[0][1].headers.get('Authorization')).toBe('Bearer private-token');
     expect(anchor).toBeDefined();
     expect(document.body.contains(anchor!)).toBe(false);

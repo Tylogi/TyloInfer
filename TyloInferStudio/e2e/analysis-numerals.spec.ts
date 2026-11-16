@@ -12,8 +12,8 @@ for (const language of ['zh-CN', 'en'] as const) {
     await expect(downloadValue).toBeVisible();
     const downloadFamily = await downloadValue.evaluate(node => getComputedStyle(node).fontFamily);
     expect(downloadFamily).toContain('MFQ Small Numerals');
-    await page.route(/\/api\/v1\/models(?:\?.*)?$/, route => route.fulfill({ json: { data: analysisArtifacts } }));
-    await page.route('**/api/v1/models/*/analysis', route => route.fulfill({ json: analysisFixture() }));
+    await page.route(/\/api\/models(?:\?.*)?$/, route => route.fulfill({ json: { data: analysisArtifacts } }));
+    await page.route('**/api/models/*/analysis', route => route.fulfill({ json: analysisFixture() }));
     await page.goto('/analysis');
     const fact = page.locator('.analysis-facts dd').nth(1);
     await expect(fact).toBeVisible();

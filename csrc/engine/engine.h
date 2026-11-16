@@ -71,6 +71,7 @@ public:
         EngineStatus status;
         Metrics engine, session;
         Clock::time_point captured;
+        std::size_t requests = 0, input_bytes = 0;
     };
     virtual ~Engine();
     std::shared_ptr<Output> submit(EngineRequest request) const;

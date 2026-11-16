@@ -1,5 +1,6 @@
 
 import type { MediaRef } from './media';
+import type { ApiErrorBody } from './protocol';
 
 export type SessionMode = 'text' | 'voice' | 'full_duplex';
 
@@ -137,6 +138,8 @@ export interface ResponseResource {
   request_id: string;
   session_id: string;
   status: 'running' | 'completed' | 'failed' | 'cancelled';
+  /** Persisted native failure details, also available after an interrupted SSE connection. */
+  error?: ApiErrorBody['error'] | null;
   output_message_id?: string | null;
   output: ContentPart[];
   finish_reason?: string | null;

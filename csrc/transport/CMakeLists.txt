@@ -4,8 +4,6 @@ find_package(Threads REQUIRED)
 
 add_library(mfq-transport STATIC
     include/transport.h
-    src/common.cpp
-    src/common.h
     src/http.cpp
     src/stdio.cpp
 )
@@ -13,7 +11,7 @@ add_library(mfq::transport ALIAS mfq-transport)
 target_include_directories(mfq-transport PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_include_directories(mfq-transport PRIVATE ${PROJECT_SOURCE_DIR})
 target_link_libraries(mfq-transport
-    PUBLIC mfq-engine
+    PUBLIC mfq-engine mfq-protocol
     PRIVATE mfq-http mfq-json Threads::Threads
 )
 target_compile_definitions(mfq-transport PRIVATE NOMINMAX)

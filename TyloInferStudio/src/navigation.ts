@@ -1,8 +1,5 @@
 
-
-
-
-export type ViewName = 'dashboard' | 'lab' | 'versions';
+export type ViewName = 'chat' | 'dashboard' | 'lab' | 'versions';
 export type DashboardPage = 'overview' | 'models' | 'connections' | 'cache' | 'logs';
 export type LabPage = 'models' | 'analysis';
 
@@ -14,6 +11,7 @@ export interface StudioLocation {
 
 export const STUDIO_PATHS = {
   overview: '/',
+  chat: '/chat',
   models: '/models',
   server: '/runtime',
   resources: '/resources',
@@ -51,6 +49,9 @@ export function resolveStudioLocation(pathname: string): StudioLocation {
   const normalizedPath = normalizeStudioPath(pathname);
   if (normalizedPath === STUDIO_PATHS.versions) {
     return { view: 'versions', dashboardPage: 'overview', labPage: 'models' };
+  }
+  if (normalizedPath === STUDIO_PATHS.chat) {
+    return { view: 'chat', dashboardPage: 'overview', labPage: 'models' };
   }
 
   const dashboardPage = (Object.entries(DASHBOARD_PATHS).find(([, path]) => path === normalizedPath)?.[0]

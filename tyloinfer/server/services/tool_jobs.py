@@ -586,25 +586,6 @@ class ToolJobHandlers:
             await stop()
             raise
 
-    @staticmethod
-    def _read_json(path: Path) -> dict[str, Any]:
-        try:
-            document = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return {}
-        return document if isinstance(document, dict) else {}
-
-    @staticmethod
-    def _last_json_event(lines: list[str], event: str) -> dict[str, Any] | None:
-        for line in reversed(lines):
-            try:
-                document = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(document, dict) and document.get("event") == event:
-                return document
-        return None
-
     async def _download_result(
         self,
         context: JobContext,
@@ -871,7 +852,24 @@ class ToolJobHandlers:
         target.unlink()
         return {"files": 1, "total_bytes": total}
 
+    def workspace_file_manifest(self, artifact_uri: str) -> dict[str, Any]:
+        if not artifact_uri.startswith("workspace://"):
+            raise self._failure("invalid_artifact_uri", "artifact must use workspace://")
+        path = self._input(artifact_uri.removeprefix("workspace://"))
+        if not path.is_file():
+            raise self._failure("dataset_not_file", "dataset artifact must be a file")
+        return self._file_manifest(path)
 
+    @staticmethod
+    def _file_manifest(path: Path) -> dict[str, Any]:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return {
+            "sha256": digest.hexdigest(),
+            "byte_size": path.stat().st_size,
+        }
 
     @staticmethod
     def _required_executable(value: Path | None, name: str) -> Path:

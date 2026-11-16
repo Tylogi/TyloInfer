@@ -7,7 +7,7 @@ export const connectionsApi = {
   async remoteNodes(refresh = false): Promise<RemoteNode[]> {
     return (
       await request<{ data: RemoteNode[] }>(
-        `/api/v1/cluster/nodes${refresh ? '?refresh=true' : ''}`,
+        `/api/cluster/nodes${refresh ? '?refresh=true' : ''}`,
       )
     ).data;
   },
@@ -19,7 +19,7 @@ export const connectionsApi = {
     api_key_env?: string | null;
     enabled: boolean;
   }): Promise<RemoteNode> {
-    return request('/api/v1/cluster/nodes', {
+    return request('/api/cluster/nodes', {
       method: 'POST',
       body: JSON.stringify(body),
     });
@@ -27,7 +27,7 @@ export const connectionsApi = {
 
 
   async deleteRemoteNode(id: string): Promise<void> {
-    const response = await fetch(apiUrl(`/api/v1/cluster/nodes/${id}`), {
+    const response = await fetch(apiUrl(`/api/cluster/nodes/${id}`), {
       method: 'DELETE',
       headers: authorizedHeaders(),
     });

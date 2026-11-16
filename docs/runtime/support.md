@@ -37,8 +37,13 @@ the backbone from loading.
 
 ## Model storage
 
-- A backend-neutral model-source contract exposes direct MFQ and native HF
-  Safetensors loading to CUDA and Metal. CUDA directly consumes native MXFP8
+- GGUF and TQ checkpoints are public model-file inputs; `.mfq` remains a
+  recognized suffix for the shared `MFQ1` container. File recognition does not
+  imply support for every tensor type or graph. Legacy NINT/NVQ/MFE/SQ operators
+  require an explicit [compatibility build](../cli/build.md#native-format-profiles)
+  and must not be assumed present in the default runtime.
+- A backend-neutral model-source contract exposes direct TQ/MFQ-container and
+  native HF Safetensors loading to CUDA and Metal. CUDA directly consumes native MXFP8
   and lossless `FP8-128SQ/SQ8` views of block-scaled HF `F8_E4M3` weights.
   The native Metal path is production-validated for DeepSeek V4/V4.1; other
   architecture/backend combinations still require exact-artifact validation.
@@ -49,8 +54,9 @@ the backbone from loading.
 
 ## Shared runtime capabilities
 
-- Descriptor-driven NINTv2 and MFE execution keeps heterogeneous per-neuron,
-  per-projection, and per-expert precision inside unified logical containers.
+- Compatibility builds retain descriptor-driven NINTv2 and MFE execution for
+  heterogeneous per-neuron, per-projection, and per-expert precision. These
+  legacy operators are not included in the default build.
 - The server provides OpenAI-compatible chat and completion APIs, streaming
   responses, model-pool lifecycle management, and per-model capability
   reporting.
@@ -97,5 +103,5 @@ stubbed.
 MiniCPM-o setup and modality details are in the
 [MiniCPM-o 4.5 runtime guide](minicpmo45.md).
 
-Build requirements and backend selection: [`mfq build`](../cli/build.md).
-Serving and model-pool configuration: [`mfq serve`](../cli/serve.md).
+Build requirements and backend selection: [`tyloinfer build`](../cli/build.md).
+Serving and model-pool configuration: [`tyloinfer serve`](../cli/serve.md).
