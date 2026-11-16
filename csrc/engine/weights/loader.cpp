@@ -14,12 +14,12 @@
 #include "engine/weights/encoding/dense/blob.h"
 #include "engine/backends/cuda/ops/projection/quant.h"
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <numeric>
 #include "engine/weights/moe/residency/expert_cache.h"
 #if TYLOINFER_ENABLE_MFQ_COMPAT
 #include "engine/weights/encoding/sq/fp8_blob.h"
-#include "engine/weights/moe/residency/cached_source_internal.h"
 #endif
 #include "engine/weights/moe/prepare/expert_store.h"
 #include "engine/weights/moe/prepare/quant_range_source.h"

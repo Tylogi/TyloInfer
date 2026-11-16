@@ -2,6 +2,7 @@
 #include "engine/weights/encoding/mfe.h"
 #include "engine/weights/moe/prepare/dispatch.h"
 #include "engine/weights/moe/prepare/prepare.h"
+#include "engine/weights/moe/prepare/projection.h"
 #include "engine/weights/encoding/format_features.h"
 
 #if TYLOINFER_ENABLE_MFQ_COMPAT
@@ -13,6 +14,7 @@
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
+#include <utility>
 
 bool tyloi::MfeTensor::nint_only() const {
     return !pools.empty() && std::all_of(pools.begin(), pools.end(),
@@ -83,6 +85,126 @@ const tyloi::Device& tyloi::MfeTensor::device() const noexcept {
     static const Device unprepared{};
     return unprepared;
 }
+
+#if TYLOINFER_ENABLE_MFQ_COMPAT
+namespace {
+
+std::vector<std::int32_t> host_route_ids(const MoeRoutePlan& route) {
+    auto ids = route.ids.to(::tyloi::kCPU).to(::tyloi::kInt32).contiguous();
+    const auto count = static_cast<std::size_t>(ids.numel());
+    return std::vector<std::int32_t>(
+        ids.data_ptr<std::int32_t>(), ids.data_ptr<std::int32_t>() + count);
+}
+
+} // namespace
+
+tyloi::weights::PreparedExperts MoeCachedSource::prepare(
+        const MoeRoutePlan& route, ::tyloi::Device input_device,
+        tyloi::weights::ExpertProjection projection, bool heterogeneous) {
+    using tyloi::MoeDispatchKind;
+    using tyloi::weights::ExpertProjection;
+    using tyloi::weights::PreparedExperts;
+
+    PreparedExperts result;
+    result.complete = cache_->complete_residency();
+    result.quantized = bool(quant_source_);
+    result.device = cache_->device();
+
+    const auto requested_projection = projection;
+    if (projection == ExpertProjection::clamp && quant_source_)
+        projection = ExpertProjection::project;
+
+    const auto stage = [&] {
+        result.mode = PreparedExperts::Mode::staged;
+        result.weight = requested_projection == ExpertProjection::clamp
+            ? stage_cpu_mixed_moe(cpu_, heterogeneous)
+            : stage_fallback_runtime(heterogeneous);
+        return std::move(result);
+    };
+
+    if (use_full_projection(route)) {
+        if (projection == ExpertProjection::prequantized)
+            throw std::runtime_error(
+                "cached prequantized activation reuse only supports decode-sized routes");
+        cache_->count_full_projection_fallback();
+        return stage();
+    }
+
+    const bool complete = result.complete;
+    const bool hybrid_projection = projection == ExpertProjection::project ||
+        (complete && (projection == ExpertProjection::prequantized ||
+                      projection == ExpertProjection::glu));
+    const bool can_hybrid = quant_source_ && quant_source_->host_cache() &&
+        input_device.is_cuda() &&
+        (complete || cache_->options_.policy.hybrid_cpu) &&
+        hybrid_projection && (complete || route.ids.size(0) == 1);
+    if (can_hybrid) {
+        const auto ids = host_route_ids(route);
+        auto dispatch = tyloi::plan_moe_dispatch(
+            ids, cpu_->n_experts,
+            complete && route.ids.size(0) != 1 ? 0 : ids.size(),
+            [&](int expert) { return quant_source_->gpu_resident(expert); },
+            [&](int expert) {
+                return !quant_source_->host_cache()->contains(
+                    quant_source_->host_key(expert));
+            });
+        std::vector<int> gpu_experts;
+        for (const auto& group : dispatch.groups) {
+            if (group.kind == MoeDispatchKind::Cpu)
+                result.cpu.emplace(
+                    group.expert, quant_source_->acquire_expert(group.expert));
+            else
+                gpu_experts.push_back(group.expert);
+        }
+        if (!result.cpu.empty()) {
+            result.dispatch = std::move(dispatch);
+            if (gpu_experts.empty()) {
+                result.mode = PreparedExperts::Mode::hybrid;
+                return std::move(result);
+            }
+            if (input_device != cache_->device())
+                throw std::runtime_error(
+                    "cached MoE input device differs from cache owner");
+            if (cache_->prepare(*this, gpu_experts, false)) {
+                result.mode = PreparedExperts::Mode::hybrid;
+                result.weight = active_;
+                return std::move(result);
+            }
+            if (complete)
+                throw std::logic_error(
+                    "resident GPU subset does not fit its arena");
+            result.cpu.clear();
+            result.dispatch = {};
+        }
+    }
+
+    const auto experts = route_experts(route);
+    if (cache_->prepare(*this, experts, false)) {
+        if (input_device.is_cuda() && input_device != cache_->device())
+            throw std::runtime_error(
+                "cached MoE input device differs from cache owner");
+        result.mode = PreparedExperts::Mode::gpu;
+        result.weight = active_;
+        return std::move(result);
+    }
+
+    if (quant_source_) {
+        const auto ids = host_route_ids(route);
+        auto dispatch = tyloi::plan_moe_dispatch(
+            ids, cpu_->n_experts, 0,
+            [](int) { return false; }, [](int) { return false; });
+        for (const auto& group : dispatch.groups)
+            result.cpu.emplace(
+                group.expert, quant_source_->acquire_expert(group.expert));
+        result.mode = PreparedExperts::Mode::cpu;
+        result.dispatch = std::move(dispatch);
+        return std::move(result);
+    }
+
+    cache_->count_full_projection_fallback();
+    return stage();
+}
+#endif
 
 std::vector<const tyloi::DenseTensor*> tyloi::MfeTensor::buffers() const {
     std::vector<const DenseTensor*> result;
@@ -157,6 +279,56 @@ std::shared_ptr<::tyloi::TensorImpl> tyloi::MfeTensor::relocated(Device target) 
 }
 
 namespace tyloi::weights {
+
+void PreparedExperts::retire() {
+    if (retired_) return;
+#if TYLOINFER_ENABLE_MFQ_COMPAT
+    if (source_ && weight &&
+            (mode == Mode::gpu || mode == Mode::hybrid))
+        source_->cache_->record_compute_use();
+#endif
+    retired_ = true;
+}
+
+void PreparedExperts::record_cpu(std::size_t projections) {
+#if TYLOINFER_ENABLE_MFQ_COMPAT
+    if (source_ && source_->quant_source_)
+        source_->quant_source_->record_cpu_projections(projections);
+#else
+    (void)projections;
+#endif
+}
+
+void PreparedExperts::record_hybrid() {
+#if TYLOINFER_ENABLE_MFQ_COMPAT
+    if (!source_ || mode != Mode::hybrid) return;
+    std::size_t gpu = 0;
+    for (const auto& group : dispatch.groups)
+        if (group.kind != tyloi::MoeDispatchKind::Cpu) ++gpu;
+    source_->cache_->record_hybrid(
+        static_cast<int>(cpu.size()), static_cast<int>(gpu));
+#endif
+}
+
+PreparedExperts prepare_cached_projection(
+        const MfeTensor& weight, const MoeRoutePlan& route, Device input_device,
+        ExpertProjection projection, bool heterogeneous) {
+#if TYLOINFER_ENABLE_MFQ_COMPAT
+    if (!weight.cached_source)
+        throw std::invalid_argument("MFE weight has no cached source");
+    auto result = weight.cached_source->prepare(
+        route, input_device, projection, heterogeneous);
+    result.source_ = weight.cached_source;
+    return result;
+#else
+    (void)weight;
+    (void)route;
+    (void)input_device;
+    (void)projection;
+    (void)heterogeneous;
+    throw std::runtime_error("Legacy MFQ inference requires a compatibility build");
+#endif
+}
 
 bool cached(const ::tyloi::Tensor& bank) {
 #if TYLOINFER_ENABLE_MFQ_COMPAT

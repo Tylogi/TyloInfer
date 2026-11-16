@@ -9,14 +9,12 @@
 #include <atomic>
 #include <array>
 #include <memory>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
 namespace tyloi { class MfeTensor; }
-struct MoeRoutePlan;
 
-// Shared source for GPU cache misses and original-FP32 CPU cold projections.
+// Shared source for GPU cache misses and CPU cold expert leases.
 // Only one prototype per format cohort is read at registration. Its codebook
 // is shared by all experts; fields are released after arena registration.
 class MoePinnedExpertArena;
@@ -44,9 +42,6 @@ public:
     std::size_t expert_field_bytes(int expert) const;
     const std::shared_ptr<MoeHostExpertCache>& host_cache() const { return host_cache_; }
     tyloi::MoeCacheKey host_key(int expert) const;
-    ::tyloi::DenseTensor forward_cpu(
-        ::tyloi::DenseTensor input,const MoeRoutePlan& route,
-        const std::unordered_map<int,MoeHostExpertCache::Lease>* prepared = nullptr) const;
     std::uint64_t cpu_projections() const { return cpu_projections_.load(); }
     void record_cpu_projections(std::size_t experts) const { cpu_projections_.fetch_add(experts); }
     std::uint64_t materializations() const { return materializations_.load(); }

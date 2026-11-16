@@ -4,10 +4,7 @@
 #include "engine/backends/cuda/ops/ffn/experts/moe.h"
 #include "engine/weights/moe/host/arena.h"
 #include "engine/weights/prepare/quant.h"
-#include "engine/backends/cuda/ops/projection/cpu_rows.h"
-#include "engine/backends/cpu/executor/expert_pool.h"
 #include "engine/backends/cpu/native/host_copy.h"
-#include "engine/backends/cuda/ops/projection/quant_linear.h"
 #include "engine/weights/format.h"
 
 #include <algorithm>
@@ -18,7 +15,6 @@
 #include <limits>
 #include <stdexcept>
 
-using tyloi::cuda::quant_format::cpu_u8_tensor;
 using tyloi::cuda::quant_format::cpu_f16_to_f32_tensor;
 
 namespace {
@@ -478,68 +474,4 @@ void MoeQuantRangeSource::mark_gpu_resident(int expert,bool resident) {
     (void)store_->expert_pool(expert);
     gpu_resident_[expert].store(resident);
     if (resident && host_cache_) host_cache_->promote(host_key(expert));
-}
-
-::tyloi::DenseTensor MoeQuantRangeSource::forward_cpu(::tyloi::DenseTensor input,
-        const MoeRoutePlan& route,const std::unordered_map<int,MoeHostExpertCache::Lease>* prepared) const {
-    const int tokens=static_cast<int>(route.ids.size(0)),routes=static_cast<int>(route.ids.size(1));
-    if (route.n_experts!=store_->num_experts() || input.size(0)!=tokens || input.size(-1)!=store_->neuron_len() ||
-        (input.dim()!=2 && input.dim()!=3) || (input.dim()==3 && input.size(1)!=routes))
-        throw std::runtime_error("CPU cold expert input/route shape mismatch");
-    const auto device=input.device();
-    auto ids=route.ids.to(::tyloi::kCPU).to(::tyloi::kInt32).contiguous();
-    auto x=input.to(::tyloi::kCPU).to(::tyloi::kFloat32).contiguous();
-    const int width=store_->neuron_len(),output=store_->out_per_expert();
-    auto result=::tyloi::cuda::empty({tokens,routes,output},::tyloi::TensorOptions().dtype(::tyloi::kFloat16));
-    std::vector<std::vector<int>> selected(store_->num_experts());
-    for (int position=0; position<tokens*routes; ++position) {
-        const auto expert=ids.data_ptr<std::int32_t>()[position];
-        if (expert<0 || expert>=store_->num_experts()) throw std::out_of_range("CPU cold expert route ID");
-        selected[expert].push_back(position);
-    }
-    struct Job {
-        MoeHostExpertCache::Lease lease;
-        CpuProjectionRows projection;
-        int expert=0, offset=0, count=0;
-    };
-    std::vector<Job> jobs;
-    auto packed=::tyloi::cuda::empty({tokens*routes,width},::tyloi::TensorOptions().dtype(::tyloi::kFloat32));
-    auto values=::tyloi::cuda::empty({tokens*routes,output},::tyloi::TensorOptions().dtype(::tyloi::kFloat32));
-    int offset=0;
-    for (int expert=0; expert<store_->num_experts(); ++expert) {
-        const auto& positions=selected[expert];
-        if(positions.empty()) continue;
-        auto lease=prepared ? prepared->at(expert) : acquire_expert(expert);
-        const auto& pool=lease->weights;
-        auto projection=pool.family==MixedMoeFamily::Nint ? make_cpu_projection_rows(pool.nint) :
-            pool.family==MixedMoeFamily::Mxfp4 ? make_cpu_projection_rows(pool.mxfp4) : make_cpu_projection_rows(pool.nvq);
-        for(std::size_t row=0;row<positions.size();++row) {
-            const int source=input.dim()==2 ? positions[row]/routes : positions[row];
-            std::memcpy(packed.data_ptr<float>()+std::size_t(offset+row)*width,
-                x.data_ptr<float>()+std::size_t(source)*width,width*sizeof(float));
-        }
-        jobs.push_back({std::move(lease),std::move(projection),expert,offset,static_cast<int>(positions.size())});
-        offset+=static_cast<int>(positions.size());
-    }
-    tyloi::cpu::expert_pool().rows(static_cast<int64_t>(jobs.size())*output,[&](int64_t begin,int64_t end) {
-        while(begin<end) {
-            const auto index=begin/output;
-            const int first=static_cast<int>(begin%output);
-            const int last=static_cast<int>(std::min<int64_t>(output,first+end-begin));
-            const auto& job=jobs[static_cast<std::size_t>(index)];
-            job.projection.run(packed.data_ptr<float>()+std::size_t(job.offset)*width,job.count,width,
-                values.data_ptr<float>()+std::size_t(job.offset)*output,output,first,last);
-            begin+=last-first;
-        }
-    });
-    for(const auto& job:jobs) {
-        const auto& positions=selected[job.expert];
-        for(int row=0;row<job.count;++row) {
-            auto* dst=result.data_ptr<mfq_half>()+std::size_t(positions[row])*output;
-            const auto* src=values.data_ptr<float>()+std::size_t(job.offset+row)*output;
-            for(int column=0;column<output;++column) dst[column]=mfq_half(src[column]);
-        }
-    }
-    cpu_projections_.fetch_add(jobs.size());
-    return result.to(device);
 }

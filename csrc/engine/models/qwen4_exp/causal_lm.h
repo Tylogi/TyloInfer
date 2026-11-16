@@ -82,6 +82,8 @@ bool load_predictor(Predictor &result, Loader &ops, const Config &c) {
                       "Qwen4-Exp model source contains an incomplete or undeclared MTP head");
         return false;
     }
+    require_model(!c.dedicated_predictor_embeddings,
+                  "Qwen4 dedicated predictor embeddings are not supported");
     result.config = c;
     result.embedding_norm = ::tyloi::ops::contiguous(::tyloi::ops::cast(
         ops.dense("predictor.embedding_norm.weight"), ::tyloi::kFloat32));

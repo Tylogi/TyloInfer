@@ -126,15 +126,14 @@ void load_components(
     if (!model.graph.has_component("predictor")) return;
     TYLOINFER_RUNTIME_CHECK(
         model.supports_speculation(),
-        "invalid Flash-Next predictor model");
+        "invalid Qwen4 predictor model");
     auto predictor = Predictor::load_if_present(
         weights, load_options, model.config, model.embed, model.lm_head,
         model.metadata.final_logit_softcapping);
-    if (predictor) {
-        result.mtp =
-            std::make_unique<Predictor>(
-                std::move(*predictor));
-    }
+    TYLOINFER_RUNTIME_CHECK(
+        predictor,
+        "Qwen4 graph declares the predictor component but the source has no MTP weights");
+    result.mtp = std::make_unique<Predictor>(std::move(*predictor));
 }
 
 } // namespace tyloi::models::qwen4_exp
