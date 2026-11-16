@@ -1,7 +1,7 @@
 #pragma once
 
-#include "engine/weights/encoding/tq.h"
-#include "engine/weights/lru.h"
+#include "engine/weights/encoding/tq/tensor.h"
+#include "engine/weights/cache/lru.h"
 
 #include <array>
 #include <cstdint>
@@ -30,6 +30,7 @@ public:
     ::tyloi::DenseTensor views(std::uint64_t source, const std::int64_t* ids,
                                       const std::vector<::tyloi::encoding::TqTensor>& weights, int device);
     std::size_t budget();
+    std::size_t resident_bytes();
     void resize(std::size_t bytes);
     void preload(int device, std::size_t workspace_reserve);
     void reclaim(int device, std::size_t available_bytes);
@@ -90,6 +91,8 @@ private:
     bool profile_;
 
     std::size_t reserve_host_locked(std::size_t bytes);
+    std::size_t trim_device(std::size_t bytes);
+    void reserve_device(std::size_t bytes);
     void report() const;
     void upload(const ::tyloi::DenseTensor&, const std::vector<std::uint8_t>&);
 };

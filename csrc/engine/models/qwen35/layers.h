@@ -1,6 +1,6 @@
 #pragma once
 
-#include "engine/models/layers.h"
+#include "engine/models/views/layers.h"
 #include "engine/models/qwen35/model.h"
 #include "engine/models/qwen35/state.h"
 

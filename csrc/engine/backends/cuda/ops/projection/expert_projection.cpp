@@ -1,16 +1,16 @@
 #include "projection.h"
 #include "engine/weights/encoding/mfe.h"
-#include "engine/backends/cuda/executor/tq_moe.h"
+#include "engine/backends/cuda/ops/ffn/tq/banks.h"
 #include "engine/backends/cuda/executor/options.h"
 #include "engine/backends/cuda/native/collectives.h"
 #include "engine/backends/cuda/executor/executor.h"
 #include "engine/backends/cuda/native/profile.h"
-#include "engine/backends/cuda/ops/ffn/moe.h"
-#include "engine/ops.h"
+#include "engine/backends/cuda/ops/ffn/experts/moe.h"
+#include "engine/ops/ops.h"
 
 #if TYLOINFER_ENABLE_MFQ_COMPAT
-#include "engine/backends/cuda/ops/ffn/mfe.h"
-#include "engine/weights/moe/cached_source_internal.h"
+#include "engine/backends/cuda/ops/ffn/mfe/projection.h"
+#include "engine/weights/moe/residency/cached_source_internal.h"
 #endif
 
 #include <stdexcept>

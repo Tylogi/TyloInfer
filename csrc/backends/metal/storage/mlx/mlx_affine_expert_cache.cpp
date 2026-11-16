@@ -5,7 +5,7 @@
 #include "mlx_kernel_prepare.h"
 #include "mlx_moe_ops.h"
 #include "engine/backends/metal/native/resident_allocations.h"
-#include "engine/weights/encoding/mlx_affine.h"
+#include "engine/weights/encoding/mx/affine.h"
 #include "engine/weights/source/source.h"
 #include "engine/weights/source/read.h"
 

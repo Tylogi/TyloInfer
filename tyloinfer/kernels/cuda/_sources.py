@@ -2,37 +2,75 @@
 
 from pathlib import Path
 
-KERNELS = (
-    'kv_cache.cu', 'activation.cu', 'embedding.cu',
-    'moe.cu', 'mx_matmul.cu', 'fp8_sq.cu', 'mxfp4_sq.cu', 'nint_matmul.cu',
-    'nint_short_decode.cu', 'nint_q8_decode.cu', 'nvq_matmul.cu',
-    'nvq_decode.cu', 'nvq_routed_reuse.cu',
-    'nepq_residual.cu',
-    'rope_jit.cu', 'sampling_jit.cu', 'gated_delta_net_jit.cu',
-)
-
-ADAPTERS = (
-    'mfq_cuda.cpp', 'acc.cpp', 'norm.cpp', 'activation.cpp', 'qwen4_exp.cpp',
-    'selected_attention.cpp', 'rope.cpp', 'sampling.cpp', 'embedding.cpp',
-    'norm_jit.cu', 'acc_jit.cu', 'attention_jit.cu',
-    'ssm_conv_jit.cu', 'nepq_jit.cu',
-    'qwen4_exp_jit.cu', 'selected_attention_jit.cu',
-    'sparse_mma_raw_jit.cu',
-    'kv_cache.cpp', 'ssm_conv.cpp', 'glm5_next.cpp', 'attention.cpp',
-    'gated_delta_net.cpp', 'moe.cpp', 'mx_matmul.cpp',
-    'packed_backward.cpp', 'packed_backward.cu', 'mx_backward.cpp', 'mx_backward.cu',
-    'nint_matmul.cpp', 'nint_backward.cpp', 'nint_backward.cu',
-    'nvq.cpp', 'nvq_backward.cpp', 'nvq_backward.cu',
-    'nepq.cpp', 'nepq_residual.cpp', 'nepq_residual_backward.cpp', 'nepq_residual_backward.cu',
-    'fp8_sq.cpp', 'fp8_sq_backward.cpp', 'mxfp4_sq.cpp',
-    'mxfp4_sq_backward.cpp', 'mxfp4_sq_backward.cu',
+SOURCES = (
+    'engine/backends/cuda/kernels/kv/cache.cu',
+    'engine/backends/cuda/kernels/elementwise/activation.cu',
+    'engine/backends/cuda/kernels/embedding/lookup.cu',
+    'engine/backends/cuda/kernels/moe/routing.cu',
+    'engine/backends/cuda/kernels/projection/mx/matmul.cu',
+    'engine/backends/cuda/kernels/projection/sq/fp8.cu',
+    'engine/backends/cuda/kernels/projection/sq/mxfp4.cu',
+    'engine/backends/cuda/kernels/projection/nint/matmul.cu',
+    'engine/backends/cuda/kernels/projection/nint/short_decode.cu',
+    'engine/backends/cuda/kernels/projection/nint/q8_decode.cu',
+    'engine/backends/cuda/kernels/projection/nvq/matmul.cu',
+    'engine/backends/cuda/kernels/projection/nvq/decode.cu',
+    'engine/backends/cuda/kernels/projection/nvq/routed_reuse.cu',
+    'engine/backends/cuda/kernels/projection/nepq/residual.cu',
+    'engine/backends/cuda/kernels/rope/jit.cu',
+    'engine/backends/cuda/kernels/sampling/jit.cu',
+    'engine/backends/cuda/kernels/recurrent/gdn/jit.cu',
+    'bindings/cuda/module.cpp',
+    'bindings/cuda/elementwise/acc.cpp',
+    'bindings/cuda/norm.cpp',
+    'bindings/cuda/elementwise/activation.cpp',
+    'bindings/cuda/models/qwen4_exp.cpp',
+    'bindings/cuda/attention/selected.cpp',
+    'bindings/cuda/rope.cpp',
+    'bindings/cuda/sampling.cpp',
+    'bindings/cuda/embedding.cpp',
+    'engine/backends/cuda/kernels/norm/jit.cu',
+    'engine/backends/cuda/kernels/elementwise/acc_jit.cu',
+    'engine/backends/cuda/kernels/attention/jit.cu',
+    'engine/backends/cuda/kernels/recurrent/convolution_jit.cu',
+    'engine/backends/cuda/kernels/projection/nepq/jit.cu',
+    'engine/backends/cuda/kernels/qwen4_jit.cu',
+    'engine/backends/cuda/kernels/attention/selected_jit.cu',
+    'engine/backends/cuda/kernels/attention/sparse_mma_jit.cu',
+    'bindings/cuda/kv.cpp',
+    'bindings/cuda/recurrent/convolution.cpp',
+    'bindings/cuda/models/glm5_next.cpp',
+    'bindings/cuda/attention/dense.cpp',
+    'bindings/cuda/recurrent/gdn.cpp',
+    'bindings/cuda/moe.cpp',
+    'bindings/cuda/projection/mx/forward.cpp',
+    'bindings/cuda/projection/packed/backward.cpp',
+    'engine/backends/cuda/kernels/projection/packed/backward.cu',
+    'bindings/cuda/projection/mx/backward.cpp',
+    'engine/backends/cuda/kernels/projection/mx/backward.cu',
+    'bindings/cuda/projection/nint/forward.cpp',
+    'bindings/cuda/projection/nint/backward.cpp',
+    'engine/backends/cuda/kernels/projection/nint/backward.cu',
+    'bindings/cuda/projection/nvq/forward.cpp',
+    'bindings/cuda/projection/nvq/backward.cpp',
+    'engine/backends/cuda/kernels/projection/nvq/backward.cu',
+    'bindings/cuda/projection/nepq/forward.cpp',
+    'bindings/cuda/projection/nepq/residual.cpp',
+    'bindings/cuda/projection/nepq/residual_backward.cpp',
+    'engine/backends/cuda/kernels/projection/nepq/residual_backward.cu',
+    'bindings/cuda/projection/sq/fp8.cpp',
+    'bindings/cuda/projection/sq/fp8_backward.cpp',
+    'bindings/cuda/projection/sq/mxfp4.cpp',
+    'bindings/cuda/projection/sq/mxfp4_backward.cpp',
+    'engine/backends/cuda/kernels/projection/sq/mxfp4_backward.cu',
+    'engine/backends/cuda/native/env.cpp',
 )
 
 
 def source_root(package: Path) -> Path:
     """Prefer a checkout's canonical sources and otherwise use wheel resources."""
     checkout = package.resolve().parents[2]
-    if (checkout / 'csrc/engine/backends/cuda/kernels/activation.cu').is_file():
+    if (checkout / 'csrc/bindings/cuda/module.cpp').is_file():
         return checkout
     return package / '_src'
 
@@ -48,11 +86,7 @@ def include_roots(root: Path) -> tuple[Path, ...]:
     )
 
 
-def sources(root: Path, package: Path) -> tuple[Path, ...]:
-    """Return raw CUDA, Torch adapter and environment provider source paths."""
-    cuda = root / 'csrc/engine/backends/cuda'
-    return (
-        *(cuda / 'kernels' / name for name in KERNELS),
-        *(package / name for name in ADAPTERS),
-        cuda / 'native/env.cpp',
-    )
+def sources(root: Path) -> tuple[Path, ...]:
+    """Return canonical CUDA JIT sources, including Torch bindings."""
+    csrc = root / 'csrc'
+    return tuple(csrc / name for name in SOURCES)

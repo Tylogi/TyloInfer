@@ -1,6 +1,6 @@
 #pragma once
 
-#include "engine/tensor.h"
+#include "engine/tensor/tensor.h"
 #include "mlx_grouped_linear.h"
 #include "mlx_mx.h"
 #include "mlx_tq.h"

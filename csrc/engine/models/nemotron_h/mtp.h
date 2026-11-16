@@ -10,7 +10,7 @@
 #include "engine/models/nemotron_h/forward.h"
 #include "engine/models/nemotron_h/load.h"
 #include "engine/models/nemotron_h/predictor.h"
-#include "engine/state/kv_view.h"
+#include "engine/state/kv/view.h"
 
 #include <algorithm>
 #include <array>

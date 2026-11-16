@@ -1,6 +1,6 @@
 #pragma once
 
-#include "engine/models/source.h"
+#include "engine/models/source/model.h"
 #include "engine/weights/source/mfq.h"
 
 #include <filesystem>

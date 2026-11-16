@@ -1,7 +1,7 @@
 #pragma once
 
-#include "engine/tensor.h"
-#include "engine/weights/moe/pool.h"
+#include "engine/tensor/tensor.h"
+#include "engine/weights/moe/prepare/pool.h"
 
 #include <memory>
 #include <vector>

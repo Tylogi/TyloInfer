@@ -15,7 +15,7 @@ ctest --test-dir /tmp/mfq-try -R <test-name> --output-on-failure   # 运行
 
 | 旧 | 新 |
 |---|---|
-| `mfq_tensor_backend::Tensor` | `tyloi::DenseTensor`（engine/tensor.h） |
+| `mfq_tensor_backend::Tensor` | `tyloi::DenseTensor`（engine/tensor/tensor.h） |
 | `mfq_tensor_backend::TensorOptions` | `tyloi::TensorOptions` |
 | `mfq_tensor_backend::kFloat32 / kCUDA / kCPU 等` | `tyloi::kFloat32` 等（tyloi 层，不是 tyloi::cuda） |
 | `mfq_tensor_backend::zeros/ones/randn/arange/cat/matmul/where/topk/softmax/...` | `tyloi::cuda::`（engine/backends/cuda/native/tensor/tensor.h） |
@@ -37,7 +37,7 @@ using Tensor = ::tyloi::DenseTensor;
 | 旧 include | 新 |
 |---|---|
 | `tyloinfer/runtime.h` | `engine/backends/cuda/native/context.h`（按实际用到的类选 native/*.h） |
-| `tyloinfer/model_source.h` | `engine/models/source.h` |
+| `tyloinfer/model_source.h` | `engine/models/source/model.h` |
 | `execution/execution.h`、`execution/options.h` | `engine/backends/cuda/executor/execution.h`、`.../options.h` |
 | `storage/session/state.h` | `engine/models/common/session/state.h` |
 | `storage/session/text_cache.h` | **已删除**（TextCache 不存在了） |
@@ -45,9 +45,12 @@ using Tensor = ::tyloi::DenseTensor;
 | `storage/weights/moe/dma_copy_batch.h` | `engine/backends/cuda/native/copy_batch.h` |
 | `storage/weights/moe/native_dma_batch.h` | `engine/backends/cuda/native/dma_batch.h` |
 | `mfq_cuda_kernels.h` 等裸内核名 | `engine/backends/cuda/kernels/<同名>` |
-| `mx.h` | `engine/weights/mx.h` |
+| `mx.h` | `engine/weights/prepare/mx.h` |
+| `engine/backends/cpu/native/host_memory.h` | `components/host_memory.h`（独立的 `mfq-host-memory` target；现有两处 CUDA 测试引用尚未修改） |
+| `engine/state/kv_memory.h` / `state/kv_budget.h` | CUDA 存储用 `engine/backends/cuda/executor/kv/memory.h`；几何用 `state::QsaLayout`；预算策略用 `engine::KvOptions` / `Budget::place_kv`；offload 配置用 `state::KvOffloadConfig`（测试尚未修改） |
+| `cuda::KvOffloadStore` / `cuda::KvOffloadSequence` / `KvOffloadStore::GatherWorkspace` | `state::KvOffloadStore` / `state::KvOffloadSequence` / `ops::KvGatherWorkspace`（测试尚未修改） |
 | `models/common/axial_patch_vision_ops.h` | `engine/models/common/vision/axial_patch_vision.h` |
-| `cuda_model_plan.h` | `engine/models/common/capabilities.h` |
+| `cuda_model_plan.h` | **已删除**（模型直接校验声明，并通过 `CausalModel::capabilities()` 报告实际能力） |
 | `runtime_config.h` / `cuda_runtime_config.h` | `engine/load.h` |
 | `env.h`（kernels 头文件内） | `engine/backends/cuda/native/env.h` |
 

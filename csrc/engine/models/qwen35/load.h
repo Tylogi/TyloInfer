@@ -1,10 +1,10 @@
 #pragma once
-#include "engine/models/source.h"
+#include "engine/models/source/model.h"
 
 #include "engine/models/qwen35/model.h"
 #include "engine/models/qwen35/predictor.h"
-#include "engine/ops.h"
-#include "engine/state/kv_view.h"
+#include "engine/ops/ops.h"
+#include "engine/state/kv/view.h"
 
 #include <cstdint>
 #include <memory>

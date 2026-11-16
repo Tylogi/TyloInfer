@@ -17,8 +17,8 @@
 #include "engine/models/common/load.h"
 #include "engine/models/source/model_config.h"
 #include "engine/models/source/model_graph.h"
-#include "engine/models/source.h"
-#include "engine/weights/cache.h"
+#include "engine/models/source/model.h"
+#include "engine/weights/cache/cache.h"
 
 #include <algorithm>
 #include <iostream>

@@ -1,7 +1,7 @@
 #pragma once
 
 #include "mlx_ssd_expert_cache.h"
-#include "engine/weights/moe/segments.h"
+#include "engine/weights/moe/residency/segments.h"
 #include <functional>
 #include <memory>
 #include <string>

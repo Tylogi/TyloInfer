@@ -1,7 +1,7 @@
 #pragma once
 
 #include "engine/requests/result.h"
-#include "engine/tensor.h"
+#include "engine/tensor/tensor.h"
 
 #include <cstddef>
 #include <cstdint>

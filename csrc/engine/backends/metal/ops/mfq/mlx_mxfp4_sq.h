@@ -14,7 +14,7 @@ namespace tyloi { struct TensorStorage; }
 
 #include <mlx/mlx.h>
 
-#include "engine/weights/encoding/mxfp4_sq_blob.h"
+#include "engine/weights/encoding/sq/mxfp4_blob.h"
 
 namespace tyloi::metal {
 

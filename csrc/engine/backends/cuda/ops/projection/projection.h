@@ -1,7 +1,7 @@
 #pragma once
 
 #include "quant_linear.h"
-#include "engine/backends/cuda/ops/ffn/moe.h"
+#include "engine/backends/cuda/ops/ffn/experts/moe.h"
 
 namespace tyloi::cuda::ops {
 tyloi::DenseTensor embedding(tyloi::DenseTensor ids, const ::tyloi::Tensor& weight);

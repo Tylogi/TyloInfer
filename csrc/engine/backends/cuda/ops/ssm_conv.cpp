@@ -1,5 +1,5 @@
 #include "backend.h"
-#include "ssm_conv_raw.h"
+#include "engine/backends/cuda/kernels/recurrent/convolution_raw.h"
 #include <cstdint>
 #include <vector>
 

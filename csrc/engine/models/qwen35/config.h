@@ -4,7 +4,7 @@
 #include "engine/models/source/legacy_names.h"
 #include "engine/models/source/model_graph.h"
 #include "engine/models/source/model_config.h"
-#include "engine/ops.h"
+#include "engine/ops/ops.h"
 
 #include <cstdint>
 #include <optional>

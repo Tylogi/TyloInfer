@@ -2,7 +2,7 @@
 #include "backend.h"
 
 #include "env.h"
-#include "engine/backends/cuda/ops/projection/tq.h"
+#include "engine/backends/cuda/ops/projection/tq/tensor.h"
 #include "engine/weights/tq/image.h"
 #include "engine/backends/cuda/native/memory.h"
 

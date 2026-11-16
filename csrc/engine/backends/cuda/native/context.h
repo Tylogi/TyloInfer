@@ -4,7 +4,7 @@
 #include <cuda_runtime_api.h>
 
 #include "stream.h"
-#include "engine/tensor.h"
+#include "engine/tensor/tensor.h"
 
 #include <cstddef>
 #include <cstdint>

@@ -1,8 +1,8 @@
 #pragma once
-#include "engine/backends/cuda/kernels/mfq_cuda_norm_ops.h"
+#include "engine/backends/cuda/ops/norm/launch.h"
 #include "engine/backends/cuda/ops/norm/rms.h"
 #include "engine/backends/cuda/ops/ffn/ffn.h"
-#include "engine/ops.h"
+#include "engine/ops/ops.h"
 #include "engine/state/media.h"
 #include "engine/models/deepseek_v41/causal_lm.h"
 
@@ -16,9 +16,9 @@
 #include "engine/backends/cuda/ops/projection/projection.h"
 #include "dspark.h"
 #include "engram.h"
-#include "engine/backends/cuda/kernels/deepseek_v41.h"
-#include "engine/backends/cuda/kernels/deepseek_v4_attention.h"
-#include "engine/backends/cuda/kernels/deepseek_v4_hc.h"
+#include "engine/backends/cuda/kernels/attention/deepseek_v41.h"
+#include "engine/backends/cuda/kernels/attention/deepseek_v4.h"
+#include "engine/backends/cuda/kernels/ffn/hyperconnection.h"
 #include "engine/models/deepseek_v41/config.h"
 #include "engine/models/deepseek_v41/state.h"
 

@@ -10,7 +10,7 @@
 #include "engine/models/minicpmo45/vision.h"
 #include "engine/models/minicpmo45/audio.h"
 #include "engine/models/minicpmo45/tts.h"
-#include "engine/ops.h"
+#include "engine/ops/ops.h"
 
 #include <nlohmann/json.hpp>
 #include <algorithm>

@@ -2,8 +2,8 @@
 #include "engine/backends/cuda/executor/config.h"
 
 #include "engine/backends/cuda/native/env.h"
-#include "engine/backends/cuda/ops/ffn/moe.h"
-#include "engine/backends/cuda/kernels/mfe_ffn_token_groups.h"
+#include "engine/backends/cuda/ops/ffn/experts/moe.h"
+#include "engine/backends/cuda/kernels/ffn/mfe/token_groups.h"
 
 #include <charconv>
 #include <climits>

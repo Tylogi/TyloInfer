@@ -2,8 +2,8 @@
 
 #include "requests/policy.h"
 #include "state/session/snapshot.h"
-#include "tensor.h"
-#include "state/kv_layout.h"
+#include "tensor/tensor.h"
+#include "state/kv/layout.h"
 
 #include <cstdint>
 #include <filesystem>

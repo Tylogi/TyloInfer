@@ -1,6 +1,6 @@
 #include "engine/models/qwen35/model.h"
 #include "engine/models/qwen35/state.h"
-#include "engine/ops.h"
+#include "engine/ops/ops.h"
 
 #include <stdexcept>
 #include <utility>

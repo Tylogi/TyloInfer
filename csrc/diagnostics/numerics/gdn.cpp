@@ -1,6 +1,6 @@
 #include "gdn.h"
 #include "tensor.h"
-#include "engine/backends/cuda/kernels/mfq_cuda_linear_attention_ops.h"
+#include "engine/backends/cuda/ops/attention/gdn/launch.h"
 #include "engine/backends/cuda/native/env.h"
 
 #include <algorithm>

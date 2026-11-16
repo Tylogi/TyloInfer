@@ -17,7 +17,7 @@
 #include "mfq_format_compat.h"
 #include "mfe_expert_store.h"
 #include "nvq_codebooks.generated.h"
-#include "engine/weights/encoding/mxfp4_sq_decode.h"
+#include "engine/weights/encoding/sq/mxfp4_decode.h"
 
 #include <algorithm>
 #include <array>

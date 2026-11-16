@@ -6,7 +6,7 @@
 #include "engine/state/session/prefix_cache.h"
 #include "engine/state/session/paged.h"
 #include "engine/state/session/cache.h"
-#include "engine/models/source.h"
+#include "engine/models/source/model.h"
 
 #include <algorithm>
 #include <exception>

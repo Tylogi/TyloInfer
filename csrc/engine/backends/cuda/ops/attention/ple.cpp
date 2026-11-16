@@ -1,8 +1,8 @@
 #include "engine/ops/ple.h"
-#include "engine/ops.h"
+#include "engine/ops/ops.h"
 #include "engine/backends/cuda/executor/options.h"
-#include "engine/backends/cuda/kernels/qwen4_exp.h"
-#include "engine/backends/cuda/kernels/ple_fused.h"
+#include "engine/backends/cuda/ops/qwen4_exp.h"
+#include "engine/backends/cuda/kernels/embedding/ple.h"
 #include "engine/backends/cuda/native/tensor/backend.h"
 #include <cmath>
 #include <optional>

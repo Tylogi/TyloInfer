@@ -2,7 +2,7 @@
 #include "engine/models/session/snapshot.h"
 #include "engine/models/deepseek_v41/snapshot.h"
 #include "engine/models/deepseek_v41/hash.h"
-#include "engine/ops.h"
+#include "engine/ops/ops.h"
 
 #include <algorithm>
 #include <array>

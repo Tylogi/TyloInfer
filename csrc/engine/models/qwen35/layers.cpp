@@ -3,9 +3,9 @@
 #include "engine/models/qwen35/load.h"
 #include "engine/models/load.h"
 #include "engine/models/qwen35/state.h"
-#include "engine/ops.h"
+#include "engine/ops/ops.h"
 #include "engine/weights/loader.h"
-#include "engine/weights/rows.h"
+#include "engine/weights/rows/rows.h"
 
 #include <optional>
 #include <stdexcept>

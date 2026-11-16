@@ -5,10 +5,10 @@
 #include "requests/result.h"
 #include "executor.h"
 #include "generation/sequence.h"
-#include "generation/batch.h"
+#include "generation/batch/batch.h"
 #include "generation/mtp/state.h"
 #include "config.h"
-#include "budget.h"
+#include "memory/budget.h"
 #include "generation/decode.h"
 #include "models/causal_model.h"
 

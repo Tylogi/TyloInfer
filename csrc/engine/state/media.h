@@ -1,6 +1,6 @@
 #pragma once
 
-#include "engine/tensor.h"
+#include "engine/tensor/tensor.h"
 
 #include <string>
 #include <string_view>

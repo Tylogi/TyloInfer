@@ -1,7 +1,7 @@
 #pragma once
 
-#include "engine/ops.h"
-#include "engine/state/kv_layout.h"
+#include "engine/ops/ops.h"
+#include "engine/state/kv/layout.h"
 
 #include <cstddef>
 #include <cstdint>

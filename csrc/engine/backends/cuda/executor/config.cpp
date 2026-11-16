@@ -4,11 +4,11 @@
 #include "engine/backends/cuda/native/env.h"
 #include "engine/backends/cuda/native/tensor/backend.h"
 #include "engine/backends/cuda/executor/options.h"
-#include "engine/backends/cuda/kernels/mfq_cuda_kv_quantization.h"
+#include "engine/backends/cuda/ops/attention/kv/quantization.h"
 #include "engine/load.h"
 #include "engine/models/load.h"
 #include "engine/models/metadata.h"
-#include "engine/weights/cache.h"
+#include "engine/weights/cache/cache.h"
 #include "engine/weights/moe/profile.h"
 
 #include <algorithm>

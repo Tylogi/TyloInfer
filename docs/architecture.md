@@ -36,9 +36,13 @@ App / Transport → Engine: submit, cancel, read output, management operations
 ```
 
 requests, scheduler, generation, state and weights are the five runtime modules.
+These describe runtime responsibilities, not a limit of five source directories. Tensor, public ops, memory and IO
+provide shared facilities; models and backends own model semantics and device execution. Text and media preparation
+belong inside requests, rather than becoming additional peer runtime modules. Being shared does not place a facility
+outside the inference library or require it to depend on the Engine object.
 generation owns generation advance; models compose compute units and call public ops, and neither receive nor store an
 Executor.
-`engine/ops.*` defines the public numeric interface and dispatches to backends; `engine/executor.h` defines the
+`engine/ops/` defines the public numeric interface and dispatches to backends; `engine/executor.h` defines the
 execution scope and lifecycle contract, and device implementations live in `engine/backends/<device>/executor/`.
 Executor does not forward model forward calls or relay individual op calls.
 Backend execution resources may own device-specific KV allocation and offload facilities. Their Executor binds the
@@ -59,12 +63,15 @@ csrc/
 │   ├── engine.*            # inference instance interface and lifecycle coordination
 │   ├── load.*              # library-level load/reload assembly; calls the unified model factory and backend resource entry points
 │   ├── executor.h          # execution scope, completion tracking and lifecycle contract
-│   ├── tensor.*            # Tensor handle, TensorImpl representation interface and ownership contract
-│   ├── dense_tensor.*      # dense Tensor and view implementation
-│   ├── ops.*               # public numeric interface, parameters and backend dispatch
 │   ├── config.h            # instance-level configuration
-│   ├── budget.*            # cross-module resource budget coordination
+│   ├── error.h             # public engine resource-exhaustion error contract
+│   ├── tensor/             # Tensor handle, representations, views and encoding/
+│   ├── ops/                # public numeric interface, parameters and backend dispatch
+│   ├── memory/             # cross-module budgets, KV placement and host memory sampling
+│   ├── io/                 # shared byte-range and asynchronous file reading
 │   ├── requests/           # request/result contract, input preparation, output interpretation
+│   │   ├── text/           # tokenize, templates, grammar constraints and text result parsing
+│   │   └── media/          # image/audio/video codecs and input frame sampling
 │   ├── scheduler/          # request lifecycle, scheduling, backpressure and batching
 │   ├── generation/         # prefill/decode, sampling and MTP policy
 │   ├── state/              # generic state payload, pages, snapshots and session
@@ -75,7 +82,7 @@ csrc/
 │       ├── metal/
 │       ├── hip/
 │       └── cpu/
-├── components/             # generic exceptions, IO, JSON, tokenizer, media codecs
+├── dependencies/           # bundled dependency sources, licences and upstream version records
 ├── transport/              # external protocol parsing and result transport
 ├── apps/                   # main and process startup, no model dispatch or runtime implementation
 ├── commands/               # argument parsing and command behaviour, calling library-level load and lifecycle interfaces
@@ -85,7 +92,7 @@ csrc/
 ```
 
 In the text below, the runtime modules, models and backends paths are all relative to `csrc/engine/`.
-source means `weights/source/`; public ops live in the root `ops.*`, and device ops, kernels and native live in the
+source means `weights/source/`; public ops live in `ops/ops.h` and the corresponding `ops/*.cpp`, and device ops, kernels and native live in the
 corresponding backend.
 All devices share the strategy and lifecycle of the runtime modules; device computation and primitives are centralised
 in backends.
@@ -100,6 +107,39 @@ per file.
 Shared implementation is justified by actual reuse, and other models and backends organise files by their own
 capabilities.
 
+### Directory Grouping and Ownership
+
+The target removes `csrc/components`; it is not renamed to `engine/components`, `common` or `utils`.
+Project-maintained inference facilities belong to their engine owners. Bundled dependency sources live under
+`csrc/dependencies/<name>`; integration with Tensor, execution streams, requests or transport stays with the consuming
+module. This source-origin grouping is not another runtime module and does not imply a single dependency target.
+Preserve upstream licences, notices and version records when moving imported sources. The maintained text runtime
+contains adapted code but belongs to requests; its provenance is retained without classifying the whole runtime as
+an external dependency.
+
+The following is target ownership; the current paths remain until their consumers and build lists migrate together:
+
+| Current location | Target ownership |
+| --- | --- |
+| `components/io/` | `engine/io/`, shared by weight sources and state storage without depending on either |
+| `components/host_memory.*` | `engine/memory/host.*`, retaining its independent host-memory target |
+| `components/tokenizer/` | `engine/requests/text/`, including tokenization, templates, grammar and text parsing |
+| `components/video/` | `engine/requests/media/video/`, for decoding and input frame sampling |
+| `components/error.h` | `engine/error.h`, the resource-exhaustion contract also consumed by transport |
+| Bundled JSON, httplib, GGML, Splash and other imported dependency sources | `dependencies/<name>/`; project integration remains with its owner |
+
+No peer `engine/text`, `engine/media` or `engine/platform` directory is introduced for these responsibilities.
+Model-specific media preprocessing and neural encoders remain in models, with numeric execution in backends.
+
+The reorganised `tensor/`, `ops/`, `memory/`, nested state/weight directories and backend execution directories are
+accepted as responsibility-oriented source groupings. A directory does not require a new class, namespace, public
+interface or CMake target. Public contracts remain at their existing seams; internal folder names do not become
+requirements for model or application callers. Grouping by subsystem does not make a mixed-responsibility file correct.
+Keep the dependency direction model/state policy → public numeric/resource contract → backend implementation.
+Backend execution subdirectories such as `executor/kv` and `executor/qsa` own device resources, not a second shared
+state or model runtime. File moves must update explicit build lists and JIT/package resources together; moving a file
+does not establish build or runtime acceptance.
+
 ### Private Implementation and Naming
 
 File names express responsibility, and privacy is decided by the owning module and the allowed consumers. Own business
@@ -107,7 +147,7 @@ files do not use `internal`, `detail` or `impl` in place of a responsibility nam
 dependency into a private one by changing a suffix.
 Helper functions, types and non-template implementation used by a single source file go into that `.cpp`, in an
 anonymous namespace or as private class members; only implementation genuinely shared by several source files keeps a
-private header with a clear responsibility, for example `weights/cache_resources.h`.
+private header with a clear responsibility, for example `weights/cache/resources.h`.
 A private header is for the implementation of its own module only; it is not include-propagated by public headers and
 is not a call entry point for other modules. Behaviour genuinely needed across modules is provided through the owning
 module's interface, and callers do not extract internal state and then perform its lifecycle operations themselves.
@@ -123,34 +163,42 @@ Existing files converge to the responsibilities below. The table states target o
 
 | Current file | Target location and naming |
 | --- | --- |
-| `generation/cuda_impl.h`, `generation/mtp/cuda_impl.h` | Generation advance is merged into the respective `generation.cpp`; model computation and state semantics belong to the family, CUDA execution belongs to the backend; after the split the mixed-responsibility header is deleted, with no wholesale rename or move |
-| `models/prepare_internal.h` | The `special_token` declaration joins the existing `models/prepare.h`, implementation stays in `prepare.cpp`; no extra header for a single declaration |
-| `weights/cache_resources.h`, `weights/workspace.cpp` | Private cache resources, prefill workspace and KV loan state; no whole-state access entry point or replacement helper namespace |
-| `weights/moe/expert_cache_internal.h` | Cache class declarations and the necessary private data belong to `moe/expert_cache.h`, non-template implementation to `expert_cache.cpp`; this header is an implementation contract inside the weights module and is not included by backends |
-| `weights/moe/cache_types_internal.h` | Expert pool fields and layout belong to the existing `pool.h`, preparation and transfer records to `prepare.*`, slots and swap transactions to the cache/residency implementation; types used by a single file stay in the `.cpp`, with no rebuilt `types` miscellaneous header |
-| `weights/moe/cached_source_internal.h` | Source, preparation and lease belong to the private implementation of `moe/cached_source.*`; the actual projection and GLU computation move into the existing backend projection/ffn implementation; backends consume the data through the preparation contract and do not include this private header |
-| `with_model` in `models/load_internal.h` (previously `models/load.h`) | Family dispatch belongs to `models/load.cpp`, and the configuration, weights and optional component construction of each branch belong to the corresponding `<family>/load.*`; remove the old templates that expose concrete types to callers; moving them into a private-sounding header does not complete migration |
+| `weights/cache/resources.h`, `weights/cache/workspace.cpp` | Private cache resources, prefill workspace and KV loan state; no whole-state access entry point or replacement helper namespace |
+| `weights/moe/residency/expert_cache_internal.h` | Cache class declarations and the necessary private data belong to `moe/residency/expert_cache.h`, non-template implementation to `expert_cache.cpp`; this header is an implementation contract inside the weights module and is not included by backends |
+| `weights/moe/residency/cache_types_internal.h` | Expert pool fields and layout belong to `moe/prepare/pool.h`, preparation and transfer records to `moe/prepare/prepare.*`, slots and swap transactions to the cache/residency implementation; types used by a single file stay in the `.cpp`, with no rebuilt `types` miscellaneous header |
+| `weights/moe/residency/cached_source_internal.h` | Source, preparation and lease belong to the private implementation of `moe/residency/cached_source.*`; the actual projection and GLU computation move into the existing backend projection/ffn implementation; backends consume the data through the preparation contract and do not include this private header |
 | Mixed assembly in `engine/load.*` | Keep the generic load/reload coordination, CLI string parsing belongs to commands, device resource initialisation belongs to backend; model special-casing belongs to the family, without moving the whole file |
-| `engine/instance_impl.h`, `cuda::engine_detail` | Runtime lifecycle belongs to Engine, generation advance to generation, concrete model behaviour to the family; delete the family-enumerated `State` variant and the `EngineInstance` templates, and do not create a `detail` container to take them over |
 
 Template definitions in headers may stay where instantiation requires it; files are still named by behaviour. Whether
 convergence is done is judged by actual include and call relationships, never only by a reduced count of `_internal`
 files.
 
-### Engine Root
+### Engine Root and Shared Facilities
 
 | File | Responsibility |
 | --- | --- |
 | engine.* | Submit, cancel, output access, status query, session control, unload and dependency re-binding |
 | load.* | Library-level load/reload entry point: consumes typed placement options, combines ModelSource, weight cache, model factory, backend executor and Engine, and handles failure wrap-up and ownership transfer; does not parse CLI strings and does not implement family dispatch or model math |
 | executor.h | Execution scope, work completion and draining contract; contains no numeric interface such as project, norm or attention |
-| tensor.*, dense_tensor.* | Tensor owning handle, TensorImpl representation interface and DenseTensor implementation; logical metadata, storage enumeration and handle semantics are in [Unified Tensor contract](#unified-tensor-contract) |
-| ops.* | Public numeric contract, parameters and device dispatch; the interface exposes no device-private type, and the implementation is selected among the backends allowed by the build |
+| tensor/tensor.*, tensor/dense.cpp, tensor/views.cpp | Tensor owning handle, TensorImpl representation interface and DenseTensor implementation; logical metadata, storage enumeration and handle semantics are in [Unified Tensor contract](#unified-tensor-contract) |
+| tensor/encoding/ | EncodedTensor and concrete encoded representations, layout validation and pure codecs; no weight residency or mutable KV policy |
+| io/ | File and retained byte-range readers, including asynchronous and mirrored reading; no model container interpretation or session policy |
+| error.h | Engine resource-exhaustion error contract; consumers such as transport translate it into their own result format |
+| ops/ops.h, ops/*.cpp | Public numeric contract, parameters and device dispatch; the interface exposes no device-private type, and the implementation is selected among the backends allowed by the build |
 | config.* | Engine's Config and runtime option validation: instance, session, batch and Graph policy, plus the device, stop token and budget configuration provided by the assembly entry point; does not depend on the whole CUDA load options type |
-| budget.* | The public `Budget` coordinates state, weights and workspace budgets and handles request, normal/batch prefill and snapshot space reservation; models provide byte requirements and planning receives the device explicitly; it manages budget attach and detach, and each module manages its own resources and phase policy |
-| metrics.h, resource_metrics.h | Public counter formats and Engine resource aggregation; producers read batch, KV, offload and predictor counters, and aggregation consumes only counters and the public resource contract |
+| memory/budget.*, memory/kv.* | The public `Budget` coordinates state, weights and workspace budgets and handles request, normal/batch prefill and snapshot space reservation; models provide byte requirements and planning receives the device explicitly; it manages budget attach and detach, and each module manages its own resources and phase policy |
+| memory/host.* | OS host-memory sampling and allocator trimming, independent of Budget, Engine objects and CPU numeric/backend targets |
+| metrics.h, aggregation inside engine.cpp | Public counter formats and Engine resource aggregation; producers read batch, KV, offload and predictor counters, and aggregation consumes only counters and the public resource contract |
 | CMakeLists.txt | Organises the compile targets of the runtime core, models and device support according to real dependencies |
 | cuda.cmake | CUDA instance assembly and compile target composition |
+
+### Shared Memory Policy
+
+`memory/` owns cross-resource admission and placement decisions through Budget and its concrete demand/result types.
+It does not replace TensorStorage, allocate device buffers itself, or take ownership of model/request state. `state/kv`
+describes logical state and geometry; `weights/cache` owns weight residency and leases; backend executor/native owns
+physical device allocations and completion; `memory/host.*` samples the host. Keep one authority for each
+reservation and charge. The new directory is not a second allocator or a place to collect all memory-related code.
 
 ### requests
 
@@ -159,10 +207,10 @@ files.
 | request.h, result.h | External request, incremental result, usage, terminal state and error contract |
 | media.h | Data contract and ordering information for image, audio and video input |
 | processor.* | Organisation of input validation, template application, tokenize, constraint preparation and model input preparation |
-| tokenizer.* | Inference-side adapter for the generic tokenizer, shared by input and output |
-| constraint.*, sampling.h | Grammar constraint construction and state, sampling parameter definition |
-| output.* | Token to text, structured result parsing, final result |
-| emitter.* | UTF-8 incremental concatenation, stop string and text fragment handling |
+| text/ | Tokenizer implementation and inference adapter, template execution, grammar constraint construction/state, token-to-text and structured result parsing, UTF-8 concatenation and stop-string handling |
+| media/ | Image/audio/video byte codecs and input frame sampling; model-specific transforms and neural encoders remain in models |
+| sampling.h | Sampling parameter definition |
+| output.* | Assembly of final and incremental result contracts, using text parsing where required |
 
 requests obtain input rules, tokenizer assets and protocol semantics through the model's public contract and produce
 owned output results.
@@ -186,14 +234,14 @@ Batches reference the same active requests and do not decide request terminal st
 
 | File | Responsibility |
 | --- | --- |
-| generation.h, generation.cpp | Shared media preparation, request validation and cleanup; organises normal, session and MTP generation through the public model, state and execution interfaces |
+| run.h, generation.cpp | Shared media preparation, request validation and cleanup; concrete normal and session generation through the public model, state and execution interfaces |
 | decode.* | Fixed decode input, sampling buffers and sampling key; Graph execution uses the public Executor |
-| sequence.*, step.* | Generation coroutines; normal and batch generation share prefill/decode advance, progress and cancellation interrupt points |
-| prefill_activity.* | Prefill activity counters and recent-activity records |
-| batch.* | Generic batch generation advance, calling model batch capability |
-| prefill_budget.h | Pure prefill budget computation and batch selection helpers |
+| sequence.h, step.h | Coroutine events and ownership; Generation result type and cleanup failure propagation |
+| prefill/activity.h | Prefill activity counters and recent-activity records |
+| batch/batch.h, batch/driver.*, batch/ops.* | Generic batch generation advance, calling model batch capability |
+| prefill/prefill.*, prefill/preparation.* | Prefill execution and input preparation |
+| prefill/budget.h | Pure prefill budget computation and batch selection helpers |
 | sampling.* | Sampling policy, penalties and constraint advance, with device computation handed to the backend |
-| mtp/sequence.* | Generic MTP advance, verification and acceptance flow, and it carries execution condition checks |
 | mtp/generation.* | Organises draft, target verification, acceptance and rollback through the public model, Mtp and MtpState interfaces, without instantiating the generation flow per family |
 | mtp/policy.*, mtp/depth_controller.* | Speculation policy and depth selection |
 | mtp/metrics.* | Generic MTP metrics |
@@ -216,14 +264,11 @@ CUDA Graph, timing, transfer and scratch are used through the public Executor/op
 left in the backend; model-specific positions, predictor history and forward variants are implemented by the family.
 Missing capability is added to the interface that actually owns that behaviour, and the whole old execution context or
 generation object is not passed in.
-`cuda.h`, the two `cuda_impl.h`, `generation/ops.h`, `mtp/ops.h`, `instance.h` and `engine/instance_impl.h` are
-existing transitional assembly and adaptation, not the target structure. They are deleted once their live capability
-has been moved: generic flow belongs to generation, model adaptation and model construction to the family, library-level
-resource assembly to `engine/load.*`, and device execution to the backend. Moving them to `apps/instance.h` or
-`apps/model.h` does not count as responsibility convergence.
-Qwen35 and other transitional models reuse the same instance entry point and do not maintain their own Engine loading,
-generation, reload and release implementations; the transitional instance shell and the resource holding in
-engine/text.h converge into Engine's single lifecycle.
+Normal and MTP flows are concrete implementations in their existing `.cpp` files. They do not expose a second
+operations template, callback restoration path or synthetic adapter protocol. Batch owns its scheduled request
+coroutine directly, including readiness, cancellation and publication; it has no separate generic sequence adapter.
+The batch loop retains the real variation between its active implementations; it does not determine model math or
+session layout. Cache positions come from the request's actual numerical state after decode.
 Normal generation and batch share the prefill/decode, pause and publish loop; Graph preparation and replay stay inside
 single-step computation. A generation coroutine holds its own computation objects or borrows the instance explicitly;
 child coroutine borrows end first, then request resources are cleaned up.
@@ -249,11 +294,11 @@ restore and Graph replay; converging declarations and includes is not a substitu
 
 | File | Responsibility |
 | --- | --- |
-| kv_view.*, recurrent.* | KvView holding a Tensor, shared by plain and paged KV, with quantization and geometry metadata in state; recurrent and conv state payloads and operations |
-| pages.h, paged_kv.* | Page identity, references, allocation generation, paged management and KV binding |
-| kv_memory.*, kv_budget.h | KV capacity, budget, allocation and reclamation; allocators and reservation reuse the hot cache, VMM and streaming staging layouts, reserving on the actual device before allocating |
-| kv_offload.* | Device/RAM/SSD transfer; input borrows Tensors, read results keep their allocation alive but do not monopolise hot block slots, and fixed gather buffers are reused per consumer barrier; KV page mapping policy stays in state |
-| qsa_blocks.*, disk_budget.h | RAM/SSD storage of opaque KV byte blocks and disk reservation coordination |
+| kv/view.*, recurrent/state.*, recurrent/layout.* | KvView holding a Tensor, shared by plain and paged KV, with quantization and geometry metadata in state; recurrent and conv state payloads and operations |
+| kv/pages.h, kv/paged.* | Page identity, references, allocation generation, paged management and KV binding |
+| kv/layout.* and generic KV metadata | Plain/paged/QSA logical geometry, capacity and byte requirements; no device allocation or placement policy |
+| kv/offload.*, kv/sequence.cpp | Shared state namespace owns immutable blocks, RAM/SSD LRU, byte arenas, leases and sequence positions; public storage/copy ops and backend fixed gather execute transfers, with workspace reuse after the consumer barrier |
+| kv/qsa_blocks.*, disk_budget.h | RAM/SSD storage of opaque KV byte blocks and disk reservation coordination |
 | session/sessions.h, session/cache.* | `Sessions` public control, accounting and budget operations; the shared cache implements matching, storage and eviction directly, and snapshot types stay in the concrete instance |
 | session/prefix_cache.* | Prefix matching, sharing and reuse |
 | session/prefix_blocks.*, session/paged.* | Prefix byte block storage and session ownership |
@@ -264,32 +309,95 @@ duplicate KVCache or CUDA view type is added. Model snapshot layout, encoding an
 decision, joint restore and position semantics are defined by the corresponding family. Caches consume only the shared
 metadata and Tensor enumeration, and count by actual backing identity with de-duplication.
 
+### Host Memory Facilities and KV Allocation
+
+OS host-memory sampling and allocator-cache trimming belong to `csrc/engine/memory/host.*`, shared by state,
+session, weights and device backends. HostMemorySample and its platform implementation have an independent build
+target; CPU SIMD, expert execution and device-specific allocation remain in their backends.
+Shared consumers include the actual host-memory contract, not a wrapper forwarding to `backends/cpu/native`.
+
+Use one implementation of each host-memory metric. Total physical RAM, process residency, OS-available physical RAM,
+optional commit headroom and macOS process physical footprint are distinct quantities. Effective host allocation
+headroom is bounded by both physical availability and commit headroom when reported; an absent commit metric does not
+mean zero. Linux physical availability uses
+`MemAvailable`; an absent metric fails explicitly, without a `freeram + bufferram` fallback. Windows retains the
+commit constraint. macOS samples free/inactive physical pages and reports residency separately from physical footprint.
+Metal combines that footprint with allocator residency by maximum, without adding the shared pool twice. Sampling
+failure throws; background session trimming and optional host-cache retention conservatively use zero headroom.
+Allocator trimming is best-effort, frees no live state and promises no amount of recovered space; callers resample
+when they need to make an admission decision.
+
+`models/session/cache.cpp` uses this contract for host headroom and trimming without separate platform sampling.
+TQ/MoE caches and CUDA host-backed execution consume the same metric definitions. A memory sample describes current
+resources, not a reservation: Budget and the owning caches still enforce limits and account for admitted work. Backend
+allocator/device accounting continues through the existing Executor::memory contract.
+
+`state/kv/layout.*` owns QSA geometry and byte requirements. `engine/memory/kv.*` holds the concrete placement inputs
+and results; `Budget::place_kv` applies GPU/RAM/SSD policy at loading and runtime without requiring an active Budget
+object for initial loading. CUDA allocation and registrations live in `backends/cuda/executor/kv/memory.*` and
+`backends/cuda/executor/kv/allocation.cpp`, rather than a mixed generic-state module:
+
+| Responsibility | Owner |
+| --- | --- |
+| KV geometry, logical capacity, positions, page identity and state payload | state and the owning model State |
+| Cross-resource admission, KV/expert reservations and RAM/SSD placement policy | Budget::place_kv and owning caches, using geometry and device resource facts; host pressure reclaims and resamples before placement |
+| CUDA KV allocation, hot-cache backing, VMM mappings, stream submission and completion | `backends/cuda/executor/kv/{memory.*,allocation.cpp}`; low-level mapping and device primitives stay in CUDA native |
+| OS host-memory measurement and allocator trim | memory/host.*, independent of CPU numeric/backend targets |
+
+Growth accounting and admission precede materialization. Each CUDA allocation directly retains its hot cache, VMM
+backing and expert-region leases; returned Tensor backing keeps the virtual range alive. Offload configuration,
+admission and fixed gather allocations use the actual request device. Generic state does not include backend-private
+headers or call device APIs to implement these operations. `kv_offload` uses public Tensor allocation, copies and
+backing-preserving arena views; CPU arena allocation supplies its own host-memory accounting. `paged_kv` publishes
+CUDA chunk pointers through a public mutation op and retains page identity and growth policy. CUDA fixed gather keeps
+the existing pinned staging and mapped-copy kernel in backend ops; shared state supplies row metadata and retains
+SSD payloads until the CPU staging copies finish. No second generic KVCache hierarchy is introduced.
+
 ### weights
 
 | File or directory | Responsibility |
 | --- | --- |
 | loader.* | Raw asset reading and concrete Tensor preparation; `Loader` is created by `Cache`, publishes the data contract, and keeps backend resource borrowing in the private implementation; weights return Tensor handles, grouped returns an ordered Tensor list, and published weights are read-only by convention |
 | placement.h, group.* | Execution placement using public Device values, its validation, sharding and ordered Tensor group preparation; concrete shard layouts stay inside the implementation, backend group construction belongs to projection, and public weight groups expose no CUDA execution type |
-| cache.*, workspace.* | `Cache` manages residency, budget, accounting, Graph policy and cache storage preparation, plus the load/prefill/decode phase policy; `Routes` holds routing transactions, `Warmup` restores warmup policy, `Priority` restores layer priority at scope end, and `Loan` moves Tensor outputs out before storage is returned; concrete cache, load and transfer details stay in the private implementation |
+| cache/cache.h, cache/routed.cpp, cache/workspace.* | `Cache` manages residency, budget, accounting, Graph policy and cache storage preparation, plus the load/prefill/decode phase policy; `Routes` holds routing transactions, `Warmup` restores warmup policy, `Priority` restores layer priority at scope end, and `Loan` moves Tensor outputs out before storage is returned; concrete cache, load and transfer details stay in the private implementation |
 | memory.* | `Memory` records weight residency and PLE statistics; `LoadScope` manages the load accounting scope, and backend recording facilities stay inside the implementation |
 | source/source.h, source/read.* | The read-only Source contract and tensor/asset reading helpers, containing no model architecture, layout or graph |
 | source/gguf.*, safetensors.*, hf.*, mfq.* | Containers, shard indexes and byte-range reading |
-| encoding/ | TqTensor, NintTensor, NvqTensor, MxTensor and other encoding implementations with layout validation; reuses bit layout, scale/codebook, row/block decode and packing logic |
-| mx.h, sq.h, nint.h, vq.h | Preparation and format helpers for the corresponding encoded Tensor; reuse the encoding implementation, numeric computation belongs to backend ops |
-| nint_cache.h, nint_row_cache.h, nint_row_pipeline.* | Single-layer prefill expansion cache, raw encoded rows and borrow leases; read-only row sources and cache identity are shared, and async read and upload stage are held by the request |
-| row_stage.h | Upload, decode and stable output borrow contract for prepared table rows; consumers keep the stage alive until async computation and graph replay end, and ordinary queries return a Tensor owner |
+| Current encoding/ | Split by responsibility: encoded Tensor representations and pure codecs move to `tensor/encoding/`, mutable KV policy to `state/kv`, generic byte readers to `io`; weight-specific container and expert-store logic stays with weight source/preparation |
+| prepare/mx.h, prepare/sq.h, prepare/nint.h, prepare/vq.h | Preparation and format helpers for the corresponding encoded Tensor; reuse the encoding implementation, numeric computation belongs to backend ops |
+| rows/nint_cache.h, rows/nint_pipeline.* | Single-layer prefill expansion cache, raw encoded rows and borrow leases; read-only row sources and cache identity are shared, and async read and upload stage are held by the request |
+| rows/stage.h, rows/source.*, rows/rows.* | Upload, decode and stable output borrow contract for prepared table rows; consumers keep the stage alive until async computation and graph replay end, and ordinary queries return a Tensor owner |
 | bias.h | Projection weights/bias data without computation methods, and dense row slice preparation; reading and validation are provided by Loader |
 | fields.h | Enumerates Tensor owners in weights, prepares transfers and counts bytes; backing is expanded only inside accounting, de-duplicated by actual storage identity |
 | moe/, tq/ | Runtime representation, preparation, transfer and cache implementation for the corresponding weights |
 | moe/experts.* | Queries expert cache and shard attributes through Tensor, and provides placement, format capability, prefetch and CPU staging contracts; it does not receive a whole-layer Ffn, and backends do not access cache-private objects to rebuild this behaviour |
-| moe/pool.h, dispatch.h, prepare.* | Expert pool, activation geometry, mixed-encoding dispatch metadata and async upload backing lifecycle |
-| moe/cpu_cost_model.h, cpu_calibration.h, dispatch_plan.h | Expert CPU cost, real hardware calibration, CPU/GPU work split and transfer quota |
-| moe/cache_policy.h, ranker.h, routes.h, residency.* | Expert slots, replacement, routing history and residency policy |
+| moe/prepare/ | Expert loading, pool, activation geometry, mixed-encoding dispatch metadata and async upload backing lifecycle |
+| moe/host/ | Host expert cache, pinned storage, CPU cost, real hardware calibration, CPU/GPU work split and transfer quota |
+| moe/residency/ | Expert slots, replacement, routing history and residency policy |
 | moe/profile.h | Expert profile data, field validation and explicit path/sidecar selection |
 
 Weight preparation, residency, transfer and cache policy belong to the shared `engine/weights`; computation scratch and
 device transfer primitives belong to the backend Executor/native. Backends do not create mirror directories per weight
 or upper module.
+
+Keep the name `weights` for model-weight loading, preparation and residency. Encoded Tensor representation belongs to
+`tensor/encoding`, even when weights are its main consumer; the current encoding directory is not moved wholesale.
+Within weights, `prepare/` assembles executable weight representations; `rows/` owns row access/staging;
+`cache/` coordinates weight lifetime and residency. MoE's
+prepare/host/residency subdirectories refine those responsibilities without creating another public loading protocol.
+Expert-cache storage lending may stay with the weight owner. It does not transfer ownership of the whole prefill
+phase, KV lifecycle or cross-resource budget into Cache; those remain with generation, state and Budget respectively.
+
+The current `weights/encoding/qsa/adaptive_cache.*` and `ram_store.*` contain mutable KV history, precision-tier transitions,
+RAM/SSD retention and publication, not just encoding. Those policies belong in shared `state/kv`; CUDA/Metal backing
+and upload remain in their backend executor QSA facilities. Keep pure QSA image/layout types and encode/decode logic
+in `tensor/encoding/qsa`, with no dependency on the complete cache. In particular, `tq_cpu.h` must not include the adaptive cache
+just to obtain an image type. Update target ownership with this split: codec targets must not depend back on the
+state store that already consumes them. Preserve re-encoding, publication ordering, prior readers and SSD originals.
+CUDA QSA session backing integration currently in `weights/moe/qsa_ram_session.*` belongs to the CUDA executor QSA
+facility; shared session semantics remain with state and the owning model.
+Likewise, mirrored byte-range reading is IO/source behaviour: keep its generic reader with `engine/io` and its
+model-replica discovery policy with `weights/source`, rather than classifying it as a numeric encoding.
 CachePolicy defines the cache policy; the CUDA load configuration and the cache use the same type internally, while load
 options and executor options are still provided by their own owners.
 The load owner enters its Executor's scope, Cache takes the actual resources at the load-initialisation and
@@ -303,9 +411,9 @@ plus C++ access control limit the consumers.
 
 | Current name | Target name and location | Responsibility and consumers |
 | --- | --- | --- |
-| `detail::CacheData` | Private nested type `Cache::Resources`, defined in `weights/cache_resources.h` | Holds MoE/TQ caches, budget configuration, load execution resources and workspace; accessed only by Cache members and their transaction implementation |
-| `detail::Workspace` | `PrefillWorkspace`, definition stays in `workspace.cpp` | Prefill backing, region records and reclamation accounting; owned exclusively by Cache, and the private resource header keeps only the needed forward declarations |
-| `detail::KvOwner` | `KvLoanState`, definition stays in `workspace.cpp` | KV borrow registration and expert cache association; kept alive by Cache, `KvRegion`'s private implementation keeps a weak reference, and lease operations keep protecting and retiring the region |
+| `detail::CacheData` | Private nested type `Cache::Resources`, defined in `weights/cache/resources.h` | Holds MoE/TQ caches, budget configuration, load execution resources and workspace; accessed only by Cache members and their transaction implementation |
+| `detail::Workspace` | `PrefillWorkspace`, definition stays in `cache/workspace.cpp` | Prefill backing, region records and reclamation accounting; owned exclusively by Cache, and the private resource header keeps only the needed forward declarations |
+| `detail::KvOwner` | `KvLoanState`, definition stays in `cache/workspace.cpp` | KV borrow registration and expert cache association; kept alive by Cache, `KvRegion`'s private implementation keeps a weak reference, and lease operations keep protecting and retiring the region |
 | `detail::cache(Cache&)` | Deleted, no replacement whole-state accessor | Member implementation works on private resources directly, and collaborators such as Loader obtain the results they need through load/prepare behaviour |
 
 `Cache::Resources` replaces the existing aggregate record; no new resource management class or per-field forwarding is
@@ -369,8 +477,8 @@ accessing cache-private members is not used as a cross-module test contract.
 ```text
 models/
 ├── CMakeLists.txt     # model implementation targets and source lists
-├── source.*           # ModelSource's model-semantics contract and file format selection factory
 ├── source/            # format interpretation, canonical model view and their compile targets
+│   ├── model.*        # ModelSource's model-semantics contract and file format selection factory
 │   ├── model_config.*, model_graph.* # configuration, structure and semantics description
 │   ├── hf.*, hf_source.*, gguf.*, gguf_source.*, mfq.*, mfq_source.*
 │   ├── legacy_graph.*, legacy_names.*, mlx_names.h # old names and layout interpretation
@@ -382,15 +490,13 @@ models/
 ├── batch.h            # shared batch results; concrete batch factory declarations belong to each family
 ├── prepare.*          # shared preparation entry point, stop token parsing and family dispatch
 ├── load.*             # unified model factory and family dispatch, returning unique_ptr<CausalModel>
+├── views/             # controlled partial-model views: layers.*, groups.* and ffn.*
 ├── session/
 │   ├── snapshot.h, state.* # model session composition, shared snapshot and Tensor enumeration
 │   ├── codec.*, paged.* # codec selection, prefix identity and snapshot byte read/write
 │   └── cache.*, size.h # model-side restore adaptation and snapshot capacity computation
 ├── common/
-│   ├── capabilities.h # capability decisions for model implementations and optional components
 │   ├── load.*         # shared weight assembly; the public header uses forward declarations to isolate device implementation
-│   ├── components.h   # capability and accounting of assembled components, holding no cross-family resource
-│   ├── prompt.h       # shared input preparation; row prefetch is executed by the model together with its State
 │   ├── mlp.h          # model-held dense MLP weights and important-neuron branch; uses only the public Tensor
 │   ├── ffn.*          # shared FFN composition of residual, normalization, MLP/MoE and trace; holds no execution resource
 │   ├── mtp.h          # predictor behaviour contract; the generation entry point and advance implementation belong to generation
@@ -422,8 +528,13 @@ Models compose Layer, Attention, MLP and Encoder per family; compute units hold 
 forward. Gemma4's model, forward, loading and State use the same set of public contracts, and no old computation path
 with an Executor parameter is kept; capability is declared by the family's actual implementation, and optional
 component declarations in the graph are used for validation and accounting.
-The unified factory selects a family from the model graph; execution and capability consumers use the model interface
-instead of repeating family dispatch through a Backbone enum.
+The unified factory selects a family from the model graph; execution, capability and diagnostic consumers use the
+actual model interface. There is no parallel Backbone enum, model Plan, component-adapter classification or family list
+in execution adapters. Each family validates its graph declarations and constructs its supported optional objects
+directly. Capabilities report those loaded objects; diagnostics distinguish accepted declarations from availability
+without a second capability matrix or assembly plan.
+Duplex sessions belong only to MiniCPM. Its own runtime controls the concrete session and scheduler exclusivity;
+CausalModel has no duplex interface, and the shared Engine holds no duplex session.
 No unified base class, generic layer union type or one-file-per-unit rule is forced; only parts whose structure and
 contract are genuinely identical belong to common.
 Layer weight records do not carry request reset, speculation commit or Graph scheduling; forward and prefill math
@@ -440,6 +551,13 @@ all-family attention by a flag.
 Qwen4 PLE keeps token hashing, EOS history and speculative checkpoints in its family implementation; public ops compute
 projection, gating, normalization and convolution from prepared rows and request-owned history. Encoded row loading and
 staging use weights::Rows and RowReader rather than model-provided lookup callbacks.
+Qwen4's ordinary and independent-request batch forward, loading, State, predictor and session data use public
+Tensor/Device on both CUDA and Metal. Batch projects and computes the FFN across requests while attention and PLE
+mutate each request's State separately. Its family-private CUDA source owns Graph and layer-major execution; Metal
+exposes no Graph implementation. Metal PLE stages selected encoded rows and decodes them on device. Predictor and
+batch state growth are admitted before execution, and retained lazy storage is submitted with outputs.
+The production `tyloi-engine` command uses the same load/reload and Transport contracts for CUDA and Metal. Backend
+initialization configures MLX before streams and weights; command code does not own device initialization policy.
 KV, recurrent/conv, position and speculation state are held per request or batch; neither models nor compute units store
 an Executor, live State or scratch. Layer forward and prefill receive the required input, position and commit
 parameters directly, without a shared layer context or an unpacking forwarding entry point.
@@ -455,12 +573,20 @@ Models compute snapshot data volume and copy peak; the instance coordinates cach
 generic generation code does not read family-private cache layouts.
 The model decides the logical advance range of prefill; compute block size and space reservation are still bound by the
 instance budget.
+PrefillPlan's maximum span bounds that logical advance. A layered job reports each phase's state growth before it
+allocates, while ordinary forward uses the request State's growth plan at the driver. Qwen4 retains its full-span
+layer-major plan; DeepSeek V4.1 CED uses bounded encoder chunks and decoder replay through the same prefill contract.
 Cross-phase prefill exposes the actual encode and decode phases; the outer layer ends the weight cache policy at phase
 boundaries, and the model is not given the cache manager through a callback.
 The model estimates snapshot bytes and peak from the explicit request State; Cache releases prefill buffers before the
 estimate, and Budget coordinates cache eviction and workspace reservation before the copy.
 The shared scope, input/output and resource contract of the vision encoder is in
 [Vision encoder design](#vision-encoder-design).
+
+`models/views/` contains the existing partial-model interfaces for layer/group/FFN evaluation and diagnostics. They
+reuse family loading, math and explicit State while allowing limited weight residency. These are model-level views,
+not Tensor views or a new production execution hierarchy. Ordinary generation continues through CausalModel; view
+consumers obey their explicit load/drain/release contract and do not make shared runtime code inspect family fields.
 
 ### backends
 
@@ -472,11 +598,13 @@ backends/
 │   │   ├── executor.*     # execution scope, resource reuse, completion tracking and draining
 │   │   ├── config.*       # CUDA execution configuration, device availability and parallel placement initialisation
 │   │   ├── options.*      # dynamic CUDA execution options and reading of that configuration
-│   │   ├── batch_graph.*  # batch graph state, keys and invalidation
-│   │   ├── decode_graph.* # capture, input transfer, buffers, reuse and invalidation
-│   │   └── graph_registry.* # captured graph registration and execution lifecycle
+│   │   ├── working_set.*  # per-job decoded projection reuse
+│   │   ├── graph/         # decode capture, execution windows, graph registry and retained resources
+│   │   ├── kv/            # device KV allocation, registration and memory management
+│   │   ├── qsa/           # compressed KV caches and session backing
+│   │   └── tq/            # per-device TQ GEMM, route readback and graph resources
 │   ├── ops/               # attention, ffn, projection, norm, rope, vision, sampling numeric implementation
-│   ├── kernels/           # .cu/.cuh kernels organised by op family
+│   ├── kernels/           # attention/, projection/, ffn/, recurrent/, kv/, norm/, rope/, sampling/, embedding/, elementwise/, hadamard/
 │   └── native/            # Tensor storage and device primitives, memory, stream/event, communication
 ├── metal/
 ├── hip/
@@ -499,16 +627,16 @@ call site of a device API does not change the upper business ownership.
 | File or directory | Responsibility |
 | --- | --- |
 | ops/attention/ | Numeric contracts and fused implementation of softmax, sparse attention over shared KV, recurrent update and similar; it does not organise a model's whole-layer Attention |
-| ops/ffn/ | dense.* implements the MLP numeric path, routed.* implements route selection, expert scaling, reduction and routed GEGLU; the remaining activation, residual and workspace layout are organised by numeric responsibility, and storage reuse and keep-alive belong to the execution facility |
+| ops/ffn/ | dense.* implements the MLP numeric path; experts/ holds routing, shared experts, scaling and reduction; tq/ holds TQ routed projections and expert banks; mfe/ holds mixed-expert projections and numeric batches; the remaining activation, residual and workspace layout are organised by numeric responsibility, and storage reuse and keep-alive belong to the execution facility |
 | ops/ffn/options.h | FFN numeric policy and per-execution policy override; not attached to whole-layer weights or a computation object |
 | ops/projection/ | Projection of ordinary and id-selected weight banks, bias, embedding and encoding implementation; reading, slicing and weight preparation belong to weights |
 | ops/norm/, ops/rope/ | Normalization, position table preparation, positional encoding and YaRN numeric implementation; the model holds the public Tensor table, position tables are prepared on an explicit device, and rotation position and input are co-located |
 | ops/vision/attention.h | Numeric helpers for non-causal/segmented attention and axial RoPE; contains no complete encoder or Transformer layer definition |
-| ops/sampling.* | Sampling, penalties, constraints and MTP probability computation; generation strategy belongs to generation |
-| kernels/ | Kernels and prepack entry points; the required GGML host helper symbols are provided by native/ggml.cu |
+| ops/sampling/ | Sampling, penalties, constraints and MTP probability computation; generation strategy belongs to generation |
+| kernels/ | Kernels and prepack entry points, grouped by attention, projection, FFN, recurrent state, KV, sampling, RoPE and elementwise operation; projection/ groups encoding-specific implementations; the required GGML host helper symbols are provided by native/ggml.cu |
 | native/device.*, scope.h | Error checking, device/context selection and scope restoration; contains no model or instance management |
 | native/tensor/, memory.*, allocation.h | Device memory, temporary kernel view, allocation and mapping primitives reused by each Tensor implementation; no device-specific copy of the Tensor inheritance tree and no residency budget handling |
-| native/stream.*, graph.* | stream/event ownership and Graph capture, upload, replay and destruction primitives |
+| native/stream.*, stream_signal.h, graph.* | stream/event ownership, driver stream completion signals and Graph capture, upload, replay and destruction primitives |
 | native/copy_batch.h, dma_batch.h, vmm.* | DMA, virtual address and physical page mapping; weight cache, upper batch and KV mapping policy belong to their own modules |
 | native/collectives.*, native/branches.*, native/profile.* | Peer access and communication, device execution branches and profiling |
 
@@ -518,7 +646,9 @@ Projection grouping capability and merged prefixes are expressed by the public o
 profiler. Residual addition distinguishes clearly between keeping the input type and adopting the execution
 configuration, and the serial branch policy captured by Graph is kept down to the internal nested numeric scope.
 id-based projection keeps the route axis; the routing selection bias is passed in through the public topk, and the model
-explicitly organises clamping, activation and reduction. Encoding format and parallel submission stay in the backend;
+explicitly organises clamping, activation and reduction. Preparation and execution receive the same activation options,
+including SwiGLU limits; callers do not select a concrete cache format to pass those options.
+Encoding format and parallel submission stay in the backend;
 starting/stopping, reporting and exception recovery of temporary profiling are held by the backend scope; automatic
 collection scope saves external state, reports on normal exit, and repeated compute segments restore the same collection
 state.
@@ -688,18 +818,16 @@ resources, and transfers ownership to Engine. Device resource creation and devic
 corresponding backend; model resource requirements are provided through the public model/state contracts. The model
 factory creates no executor, and the assembly implementation reads no family-private layout.
 
-The current `engine/load.h` publishes `internal::resolve_cuda_config`, `internal::setup_cuda_load`, `finalize_kv` and
-`finish_load`. Runtime, evaluation and diagnostics call individual preparation steps from it, and the old model loading
-templates also handle KV commit and cache wrap-up, so callers must understand the load order. The target load interface
-encapsulates the complete flow, ownership transfer and failure cleanup; the responsibilities converge as in the table
-below, and load phases are not kept public by renaming the namespace.
-
-| Current behaviour | Target ownership and call contract |
-| --- | --- |
-| `resolve_cuda_config` | Runtime option validation and Config construction belong to the existing `engine/config.*` and receive the typed options they need; CUDA environment options are interpreted by the backend and then handed to assembly, so the generic configuration module does not depend on the whole `CudaEngineOptions` |
-| `setup_cuda_load` | Draining and execution resource initialisation belong to the backend, weight cache initialisation belongs to Cache, and model-specific option validation belongs to the family; `engine/load.cpp` coordinates, and commands no longer clear executor fields or schedule these steps themselves |
-| `finalize_kv` | KV space preparation and borrow registration follow the state, Budget and weights contracts, with the library-level assembly coordinating the commit; the family provides only the required state and resource requirements and does not finish global KV/expert budget wrap-up |
-| `finish_load` | Cache finalize belongs to Cache, device work completion is guaranteed by the owning Executor contract, and load timing and reporting stay in the assembly implementation; keep the existing cache commit and wait semantics — the timing code alone is not moved out and the synchronisation is not deleted |
+The load headers expose complete load and reload, without public preparation or finish steps. Shared runtime settings
+are resolved once by `engine/config.*`; backend configuration interprets device, placement, cache and model options
+without resetting execution resources or loading weights. The CUDA root Executor creates and finalizes its KV owner;
+forks borrow it, including an offload store created during finalization. Cache owns initialization, expert-arena
+finalization and KV borrow registration. Assembly preserves the reserve and charge calculation, cache commit and
+completion wait before publishing the instance. Production State preallocation happens after Budget takes ownership, and its
+pending growth is reserved when finalizing the cache.
+Production assembly does not depend on the diagnostic Program or export helpers through its header. Program owns its
+independent model/layer/FFN loading and cleanup, using the same typed configuration, Cache, model factory and Executor
+contracts. Loading failure is handled by the owning entry point, not a generic phase framework.
 
 Complete load and reload publish to the caller only an instance for which the necessary preparation has finished; on
 failure the assembly module performs the wrap-up, and the caller is not responsible for calling some finish function.
@@ -754,9 +882,10 @@ modules whose shared semantics genuinely change; adding a family adds its own im
 `models/load.cpp` and its models build list, and does not change apps, generic runtime commands or an Engine type list.
 New product commands or new public model capabilities are changed according to their real responsibility, and no
 universal option table is designed to hide necessary changes.
-The unified factory includes the shared Qwen35 loader and the migrated CUDA family loaders. Remaining legacy CUDA
-consumers use `models/load_internal.h`; the Metal library assembly calls the same factory, while its other families and
-production CLI/service consumers still use the old runtime.
+The unified factory includes Qwen35, Qwen4 and the supported CUDA family loaders. CUDA load/reload uses the shared
+Engine; family construction, optional weights and predictor state are not exposed through application templates.
+MiniCPM adds only its own duplex control and retirement behaviour to that Engine. Metal calls the same model factory
+and production command; unmigrated Metal families retain their old implementations.
 The migration must keep those families' configuration, placement, warmup, MTP and multimodal capability, have them
 implement the same public model contract, and only then delete the old template path. "Unified factory" must not be
 implemented as a reduction of the support scope, and the choice between old and new paths does not move into apps.
@@ -972,8 +1101,8 @@ fixed to one output token.
 | Stage | Owner |
 | --- | --- |
 | External messages, media fields and order parsing | transport; requests/media.h keeps the input correspondence |
-| JPEG/PNG, audio and video byte codecs | Generic tools in components |
-| Template execution, tokenize, generic grammar constraints, incremental result parsing | requests, reusing components/tokenizer |
+| JPEG/PNG, audio and video byte codecs and input frame sampling | requests/media; imported codec sources remain in dependencies |
+| Template execution, tokenize, generic grammar constraints, incremental result parsing | requests/text |
 | Scaling, cropping, normalization, patch/grid, audio features and time/position rules | models/<family>; genuinely shared parts go to models/common |
 | Media placeholders, special tokens, vision/audio encoding, projection and text fusion | models/<family>, computation completed through public ops |
 | Model-specific output decoding and protocol semantics | provided by models; requests organises results, transport encodes and transmits |
@@ -1061,7 +1190,7 @@ owners and coordinates dependency order.
 | Current session composition and codec selection | models/session/snapshot.h, models/session/codec.* |
 | Family snapshot layout, encoding and validation, complete-boundary decision, target/predictor joint restore, position semantics, and enumeration of held Tensors | models/<family> |
 | MTP draft/verification/acceptance policy and generation advance | generation/mtp |
-| CUDA Graph capture, cache, replay, invalidation and resource keep-alive | backends/cuda/executor/ |
+| CUDA Graph capture, cache, replay, invalidation and resource keep-alive | backends/cuda/executor/graph/ |
 | Model capture conditions, state access and restore | models/<family> |
 | CUDA Graph low-level handle operations | backends/cuda/native/graph.* |
 
@@ -1102,6 +1231,21 @@ slot/page reuse, batch changes and state restore trigger the corresponding synch
 coordinates when a graph is used and released.
 A Graph result handle keeps the fixed output buffer alive but does not freeze its content; a result that must survive
 later replay is cloned by the consumer that actually needs it.
+
+## Diagnostic Source Organisation
+
+The subdivisions of `csrc/diagnostics` describe diagnostic consumers: `checks/` for op/backend checks, `runtime/` for
+generation and lifecycle exercises, `models/` for family-specific cases, `data/` for input/comparison support,
+`profiling/` for diagnostic collection/reporting workflows, and `numerics/` for fixed-case execution and export.
+They remain outside the production inference library, and the default production executable does not require their
+compilation. Their directory names do not create new runtime interfaces or duplicate model computation.
+
+The current CUDA production target still compiles `diagnostics/profiling/route_stats.cpp`, and executor/ops include
+its header. Move the production RouteStats accumulation, buffers and execution lifetime into the CUDA execution
+facility, with numeric reductions in existing backend ops where needed. Preserve its production reporting option
+and output behaviour; reusable reporting belongs with that feature, while diagnostic scenarios stay in diagnostics.
+Diagnostics consumes production observations, never the reverse. Do not solve the dependency by linking the
+diagnostics target into the production executable or disabling existing production statistics.
 
 ## Numerical Correctness Verification
 
@@ -1260,6 +1404,10 @@ diagnostics and entry points are defined by eval/cuda.cmake, diagnostics/cuda.cm
 Any retained LibTorch reference build is isolated from the production project and exchanges numeric fixtures/results;
 production apps do not link a Torch reference engine. See [Build and Macro Isolation](#build-and-macro-isolation).
 The single source root of CUDA kernels is `csrc/engine/backends/cuda/kernels`, shared by native/JIT/wheel.
+PyTorch C++ bindings live in `csrc/bindings/cuda`, outside the native engine; `tyloinfer/kernels/cuda` contains only Python
+interfaces and loaders. Wheels stage the required canonical source tree under `tyloinfer/kernels/cuda/_src/csrc`.
+The JIT loader uses unique compilation entries in Torch's build cache so sources with the same basename in different
+operation directories do not produce conflicting object files.
 The Python package and CLI are `tyloinfer`; the service entry point is in [pyproject.toml](../pyproject.toml).
 Architecture changes keep the model math, dtype and numeric validation requirements; offline quantization and
 calibration product entry points are outside this architecture.

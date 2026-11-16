@@ -1,7 +1,7 @@
 #include "engine/backends/metal/ops/moe.h"
 #include "engine/backends/metal/native/tensor/tensor.h"
 #include "engine/backends/metal/ops/common/mlx_moe_ops.h"
-#include "engine/ops.h"
+#include "engine/ops/ops.h"
 #include "engine/weights/moe/batch.h"
 #include "engine/weights/moe/experts.h"
 #include "backends/metal/runtime/mlx_packed_expert_cache.h"

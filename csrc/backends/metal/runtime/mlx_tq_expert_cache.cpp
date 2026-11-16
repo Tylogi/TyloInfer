@@ -1,5 +1,5 @@
-#include "engine/weights/lru.h"
-#include "engine/weights/encoding/tq_rows.h"
+#include "engine/weights/cache/lru.h"
+#include "engine/weights/encoding/tq/rows.h"
 #include "engine/weights/tq/source.h"
 #include "engine/backends/metal/native/memory.h"
 #include "engine/backends/metal/native/indirect.h"

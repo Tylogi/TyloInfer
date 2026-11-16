@@ -6,7 +6,7 @@
 #include "engine/backends/metal/native/env.h"
 #include "mlx_moe_ops.h"
 #include "mlx_affine_nax.h"
-#include "engine/weights/encoding/mlx_affine.h"
+#include "engine/weights/encoding/mx/affine.h"
 #include "../../kernels/mlx/mlx_affine_decode.h"
 
 #include <climits>

@@ -20,7 +20,7 @@ from ._sources import include_roots, source_root, sources
 _DIR = os.path.dirname(__file__)
 _PACKAGE = Path(_DIR)
 _SOURCE_ROOT = source_root(_PACKAGE)
-_SOURCES = [str(path) for path in sources(_SOURCE_ROOT, _PACKAGE)]
+_SOURCES = [str(path) for path in sources(_SOURCE_ROOT)]
 _INCLUDE_ROOTS = [str(path) for path in include_roots(_SOURCE_ROOT)]
 _module = None
 
@@ -70,11 +70,16 @@ def ext():
             return _module
         _ensure_msvc()
         import torch  # noqa: F401  ensure torch imported (cpp_extension depends on it)
-        from torch.utils.cpp_extension import load
+        from torch.utils.cpp_extension import _get_build_directory, load
+
+        from ._build import stage_sources
+
+        build_directory = Path(_get_build_directory("mfq_cuda", verbose=False))
 
         _module = load(
             name="mfq_cuda",
-            sources=_SOURCES,
+            sources=stage_sources(_SOURCES, build_directory),
+            build_directory=str(build_directory),
             extra_include_paths=_INCLUDE_ROOTS,
             # CUDA 13 CCCL headers reject MSVC's traditional preprocessor.
             extra_cflags=(

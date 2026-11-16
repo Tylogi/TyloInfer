@@ -2,7 +2,7 @@
 
 #include "engine/backends/cuda/native/tensor/backend.h"
 #include "engine/executor.h"
-#include "engine/ops.h"
+#include "engine/ops/ops.h"
 
 #include <chrono>
 #include <cstdint>

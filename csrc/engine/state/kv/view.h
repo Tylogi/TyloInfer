@@ -1,0 +1,48 @@
+#pragma once
+
+#include "engine/state/kv/layout.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <stdexcept>
+
+namespace tyloi::state {
+
+struct KvView {
+    Tensor visible_key, visible_value;
+    Tensor physical_key, physical_value;
+    Tensor key_chunk_ptrs, value_chunk_ptrs, page_table;
+    KvQuantization quantization;
+    std::int64_t page_size = 0;
+    std::int64_t pages_per_chunk = 0;
+    std::int64_t heads = 0;
+    bool ring = false;
+    std::int64_t batch = 0;
+    std::int64_t head_dim = 0;
+    ScalarType dtype = ScalarType::float16;
+
+    bool paged() const noexcept { return page_size > 0; }
+    bool defined() const noexcept {
+        // Metal indexes physical rows; CUDA indexes chunks through pointer tables.
+        if (paged() && physical_key.is_metal())
+            return physical_value.is_metal() && page_table.defined();
+        return paged()
+            ? key_chunk_ptrs.defined() && value_chunk_ptrs.defined() && page_table.defined()
+            : physical_key.defined() && physical_value.defined();
+    }
+};
+
+std::size_t kv_bytes(std::int64_t batch, std::int64_t heads, std::int64_t capacity,
+                     std::int64_t head_dim, bool ring, ScalarType dtype,
+                     KvQuantization settings = {});
+
+// Metal accepts zero capacity for an initially empty cache.
+KvView allocate_kv(std::int64_t batch, std::int64_t heads, std::int64_t capacity,
+                   std::int64_t head_dim, bool ring, Device device, ScalarType dtype,
+                   KvQuantization settings = {});
+
+// Returns independent larger storage with the first keep rows; the source is unchanged.
+KvView grow_kv(const KvView& cache, std::int64_t capacity, std::int64_t keep);
+
+} // namespace tyloi::state

@@ -1,5 +1,5 @@
 #include "engine/models/common/linear.h"
-#include "engine/ops.h"
+#include "engine/ops/ops.h"
 
 #include <stdexcept>
 

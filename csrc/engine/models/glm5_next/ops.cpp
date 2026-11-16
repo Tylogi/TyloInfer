@@ -1,6 +1,6 @@
 #include "engine/models/load.h"
 #include "engine/models/glm5_next/components.h"
-#include "engine/backends/cuda/kernels/mfq_cuda_moe_ops.h"
+#include "engine/backends/cuda/ops/ffn/experts/launch.h"
 #include "model.h"
 #include "mtp.h"
 #include "load.h"
@@ -14,7 +14,7 @@
 #include "engine/models/common/load.h"
 #include "engine/weights/loader.h"
 #include "engine/models/session/paged.h"
-#include "engine/ops.h"
+#include "engine/ops/ops.h"
 
 namespace tyloi::cuda::glm5_next {
 using Config = tyloi::models::glm5_next::Config;

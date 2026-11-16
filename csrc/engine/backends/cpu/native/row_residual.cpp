@@ -1,5 +1,5 @@
 #include "engine/weights/encoding/row_residual.h"
-#include "engine/models/source.h"
+#include "engine/models/source/model.h"
 #include "engine/weights/encoding/gguf_quant.h"
 #include "engine/models/source/hf_source.h"
 #include "nlohmann/json.hpp"

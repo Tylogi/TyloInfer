@@ -1,6 +1,6 @@
 set(TYLOINFER_MODEL_ASSEMBLY_SOURCES
     ${PROJECT_SOURCE_DIR}/engine/models/load.cpp
-    ${PROJECT_SOURCE_DIR}/engine/models/layers.cpp
+    ${PROJECT_SOURCE_DIR}/engine/models/views/layers.cpp
     ${PROJECT_SOURCE_DIR}/engine/models/qwen35/load.cpp
     ${PROJECT_SOURCE_DIR}/engine/models/qwen35/layers.cpp
     ${PROJECT_SOURCE_DIR}/engine/models/qwen4_exp/ops.cpp
@@ -45,7 +45,7 @@ set(TYLOINFER_MODELS_CUDA_SOURCES
     ${PROJECT_SOURCE_DIR}/engine/models/minicpmo45/state.cpp
     ${PROJECT_SOURCE_DIR}/engine/models/minicpmo45/forward.cpp
     ${PROJECT_SOURCE_DIR}/engine/models/qwen35/batch_ops.cpp
-    ${PROJECT_SOURCE_DIR}/engine/models/groups.cpp
-    ${PROJECT_SOURCE_DIR}/engine/models/ffn.cpp
+    ${PROJECT_SOURCE_DIR}/engine/models/views/groups.cpp
+    ${PROJECT_SOURCE_DIR}/engine/models/views/ffn.cpp
 )
 set(TYLOINFER_MODELS_CUDA_SOURCES "${TYLOINFER_MODELS_CUDA_SOURCES}" PARENT_SCOPE)

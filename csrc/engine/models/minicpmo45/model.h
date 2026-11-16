@@ -2,11 +2,11 @@
 
 #include "engine/models/minicpmo45/layer.h"
 #include "engine/models/source/model_config.h"
-#include "engine/ops.h"
+#include "engine/ops/ops.h"
 #include "engine/models/metadata.h"
 #include "engine/models/causal_model.h"
 #include "engine/models/source/model_graph.h"
-#include "engine/models/source.h"
+#include "engine/models/source/model.h"
 
 #include <memory>
 #include <unordered_map>

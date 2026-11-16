@@ -1,6 +1,6 @@
-#include "engine/weights/workspace.h"
-#include "engine/weights/cache_resources.h"
-#include "engine/weights/moe/expert_cache.h"
+#include "engine/weights/cache/workspace.h"
+#include "engine/weights/cache/resources.h"
+#include "engine/weights/moe/residency/expert_cache.h"
 
 MoePrefillWorkspaceBudget moe_prefill_workspace_budget(const std::shared_ptr<MoeExpertCache>& cache, bool allow_borrow) { return {}; }
 
@@ -76,12 +76,12 @@ void print_moe_expert_cache_stats(const std::shared_ptr<MoeExpertCache>& cache, 
 
 void set_moe_expert_cache_profile(MoeExpertCache& cache, tyloi::MoeCacheProfile profile) {}
 
-struct tyloi::weights::Loan::Impl {};
+struct tyloi::weights::Loan::Impl { Cache& cache; };
 tyloi::weights::Loan::Loan(Cache& cache) { cache.lend(*this); }
-void tyloi::weights::Cache::lend(Loan& loan) { loan.impl_ = std::make_unique<Loan::Impl>(); }
+void tyloi::weights::Cache::lend(Loan& loan) { loan.impl_ = std::make_unique<Loan::Impl>(Loan::Impl{*this}); }
 tyloi::weights::Loan::~Loan() = default;
-std::size_t tyloi::weights::Loan::begin(std::size_t) { return 0; }
-std::size_t tyloi::weights::Loan::predictor(std::size_t) { return 0; }
+std::size_t tyloi::weights::Loan::begin(std::size_t bytes) { impl_->cache.workspace(bytes); return 0; }
+std::size_t tyloi::weights::Loan::predictor(std::size_t bytes) { return begin(bytes); }
 std::size_t tyloi::weights::Loan::transfer_bytes() const { return 0; }
 void tyloi::weights::Loan::suspend() {}
 void tyloi::weights::Loan::finish() {}

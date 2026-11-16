@@ -6,7 +6,7 @@
 #include "engine/backends/metal/native/allocation.h"
 #include "engine/backends/metal/native/tensor/tensor.h"
 #include "engine/backends/cpu/native/host_parallel.h"
-#include "engine/weights/lru.h"
+#include "engine/weights/cache/lru.h"
 #include "engine/weights/source/source.h"
 #include "engine/weights/source/read.h"
 

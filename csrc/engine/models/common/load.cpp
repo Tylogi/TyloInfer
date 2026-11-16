@@ -1,16 +1,16 @@
-#include "engine/models/source.h"
-#include "engine/ops.h"
+#include "engine/models/source/model.h"
+#include "engine/ops/ops.h"
 #include "engine/models/common/load.h"
 #include "engine/models/common/important_neurons.h"
 #include "engine/models/common/mlp.h"
 #include "engine/models/common/attention.h"
 #include "engine/backends/cuda/ops/ffn/ffn.h"
 #include "engine/models/source/model_graph.h"
-#include "engine/weights/moe/load.h"
+#include "engine/weights/moe/prepare/load.h"
 #include "engine/weights/loader.h"
-#include "engine/weights/quant.h"
+#include "engine/weights/prepare/quant.h"
 #include "engine/weights/tq/routed.h"
-#include "engine/backends/cuda/ops/ffn/moe.h"
+#include "engine/backends/cuda/ops/ffn/experts/moe.h"
 
 #include <cstdio>
 

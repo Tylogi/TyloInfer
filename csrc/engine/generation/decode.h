@@ -1,11 +1,11 @@
 #pragma once
 
 #include "engine/executor.h"
-#include "engine/ops.h"
+#include "engine/ops/ops.h"
 #include "engine/requests/sampling.h"
 #include "engine/models/input.h"
 #include "engine/generation/sequence.h"
-#include "engine/weights/cache.h"
+#include "engine/weights/cache/cache.h"
 #include <optional>
 
 namespace tyloi::weights { class Cache; }

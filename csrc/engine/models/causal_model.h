@@ -1,6 +1,6 @@
 #pragma once
 
-#include "engine/tensor.h"
+#include "engine/tensor/tensor.h"
 #include "engine/metrics.h"
 #include "engine/models/metadata.h"
 #include "engine/models/input.h"

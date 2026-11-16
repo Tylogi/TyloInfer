@@ -6,7 +6,7 @@
 namespace tyloi { struct TensorStorage; }
 
 #include <mlx/mlx.h>
-#include "engine/tensor.h"
+#include "engine/tensor/tensor.h"
 #include <array>
 #include <memory>
 #include <optional>

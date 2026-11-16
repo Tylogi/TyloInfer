@@ -2,7 +2,7 @@
 
 #include "engine/generation/mtp/policy.h"
 #include "engine/requests/sampling.h"
-#include "engine/tensor.h"
+#include "engine/tensor/tensor.h"
 
 #include <vector>
 

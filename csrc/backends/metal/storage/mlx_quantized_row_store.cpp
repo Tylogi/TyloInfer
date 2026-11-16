@@ -2,7 +2,7 @@
 #include "mlx_resource_telemetry.h"
 #include "mlx_nint_rows.h"
 #include "engine/backends/cpu/native/host_parallel.h"
-#include "engine/weights/lru.h"
+#include "engine/weights/cache/lru.h"
 #include <nlohmann/json.hpp>
 
 #include <algorithm>

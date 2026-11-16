@@ -1,5 +1,5 @@
 #include "engine/models/qwen35/mtp.h"
-#include "engine/ops.h"
+#include "engine/ops/ops.h"
 
 namespace tyloi::models::qwen35 {
 

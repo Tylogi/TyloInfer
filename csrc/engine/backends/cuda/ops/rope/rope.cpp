@@ -1,9 +1,9 @@
 #include "rope.h"
 #include "tail.h"
-#include "engine/ops.h"
+#include "engine/ops/ops.h"
 #include "yarn.h"
 
-#include "engine/backends/cuda/kernels/mfq_cuda_attention_ops.h"
+#include "engine/backends/cuda/ops/attention/launch.h"
 
 #include <algorithm>
 #include <array>

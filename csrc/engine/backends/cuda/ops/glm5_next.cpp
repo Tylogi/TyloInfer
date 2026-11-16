@@ -1,6 +1,6 @@
-#include "glm5_next.h"
+#include "engine/backends/cuda/ops/glm5_next.h"
 
-#include "selected_attention.h"
+#include "engine/backends/cuda/kernels/attention/selected.h"
 
 #include <cmath>
 

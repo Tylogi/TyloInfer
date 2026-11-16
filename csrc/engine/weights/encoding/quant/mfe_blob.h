@@ -1,7 +1,7 @@
 #pragma once
 
 #include "nint_blob.h"
-#include "../mx_blob.h"
+#include "../mx/blob.h"
 
 #include <cstddef>
 #include <cstdint>

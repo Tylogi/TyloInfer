@@ -4,9 +4,9 @@
 #include "engine/backends/cuda/native/tensor/backend.h"
 #include "engine/models/deepseek_v4/forward.h"
 #include "engine/models/deepseek_v4/load.h"
-#include "engine/models/groups.h"
+#include "engine/models/views/groups.h"
 #include "engine/models/load.h"
-#include "engine/ops.h"
+#include "engine/ops/ops.h"
 #include "engine/weights/loader.h"
 
 #include <cstdint>

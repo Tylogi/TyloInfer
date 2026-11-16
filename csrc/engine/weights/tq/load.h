@@ -1,7 +1,7 @@
 #pragma once
 
 #include "engine/weights/source/source.h"
-#include "engine/weights/encoding/tq.h"
+#include "engine/weights/encoding/tq/tensor.h"
 #include "engine/weights/tq/routed.h"
 
 #include <cstddef>

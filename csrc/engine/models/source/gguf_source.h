@@ -1,6 +1,6 @@
 #pragma once
 
-#include "engine/models/source.h"
+#include "engine/models/source/model.h"
 
 namespace tyloi::models {
 

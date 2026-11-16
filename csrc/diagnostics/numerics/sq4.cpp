@@ -12,12 +12,12 @@
 #include <vector>
 
 #if TYLOINFER_ENABLE_MFQ_COMPAT
-#include "engine/backends/cuda/kernels/mxfp4_sq.h"
+#include "engine/backends/cuda/kernels/projection/sq/mxfp4.h"
 #include "engine/backends/cuda/native/context.h"
 #include "engine/backends/cuda/native/env.h"
 #include "engine/backends/cuda/native/graph.h"
-#include "engine/weights/encoding/mxfp4_sq_blob.h"
-#include "engine/weights/encoding/mxfp4_sq_decode.h"
+#include "engine/weights/encoding/sq/mxfp4_blob.h"
+#include "engine/weights/encoding/sq/mxfp4_decode.h"
 #endif
 
 namespace tyloi::diagnostics::numerics {

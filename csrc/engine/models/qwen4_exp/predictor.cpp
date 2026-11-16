@@ -3,11 +3,11 @@
 #include "engine/models/qwen4_exp/layer.h"
 #include "engine/models/common/check.h"
 #include "engine/config.h"
-#include "engine/ops.h"
+#include "engine/ops/ops.h"
 #include "engine/ops/residual.h"
 #include "engine/ops/ffn.h"
 #include "engine/ops/qsa.h"
-#include "engine/weights/workspace.h"
+#include "engine/weights/cache/workspace.h"
 #include <algorithm>
 #include <array>
 #include <limits>

@@ -1,8 +1,8 @@
 #include "engine/weights/tq/load.h"
 
 #include "engine/weights/tq/source.h"
-#include "engine/weights/cache_resources.h"
-#include "engine/weights/moe/expert_cache.h"
+#include "engine/weights/cache/resources.h"
+#include "engine/weights/moe/residency/expert_cache.h"
 #include "engine/weights/tq/cache.h"
 #include "engine/weights/tq/image.h"
 

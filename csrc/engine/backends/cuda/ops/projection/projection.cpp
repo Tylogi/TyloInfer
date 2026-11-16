@@ -2,17 +2,17 @@
 #include "engine/backends/cuda/executor/options.h"
 #include "engine/backends/cuda/native/branches.h"
 #include "engine/backends/cuda/native/collectives.h"
-#include "engine/backends/cuda/executor/tq.h"
-#include "engine/backends/cuda/ops/ffn/tq.h"
+#include "engine/backends/cuda/executor/tq/resources.h"
+#include "engine/backends/cuda/ops/ffn/tq/routed.h"
 #include "engine/backends/cuda/native/tensor/tensor.h"
-#include "engine/backends/cuda/kernels/mfq_cuda_activation_ops.h"
-#include "engine/backends/cuda/kernels/mfq_cuda_quant_ops.h"
-#include "engine/backends/cuda/kernels/mfq_cuda_nint_route_hint.h"
+#include "engine/backends/cuda/ops/activation.h"
+#include "engine/backends/cuda/ops/projection/quant.h"
+#include "engine/backends/cuda/ops/projection/nint/input.h"
 #include "engine/weights/tq/routed.h"
 #include "engine/weights/encoding/rows.h"
 #include "engine/weights/tq/rows.h"
 #if TYLOINFER_ENABLE_MFQ_COMPAT
-#include "engine/backends/cuda/ops/projection/nint.h"
+#include "engine/backends/cuda/ops/projection/nint/tensor.h"
 #endif
 
 #include <algorithm>
@@ -22,7 +22,7 @@
 
 #include "engine/backends/cuda/executor/executor.h"
 #include "engine/backends/cuda/ops/projection/bias.h"
-#include "engine/ops.h"
+#include "engine/ops/ops.h"
 
 namespace {
 #if TYLOINFER_ENABLE_MFQ_COMPAT

@@ -5,7 +5,7 @@
 #include "engine/backends/cuda/ops/projection/quant_linear.h"
 #include "engine/models/nemotron_h/config.h"
 #include "engine/models/metadata.h"
-#include "engine/models/source.h"
+#include "engine/models/source/model.h"
 #include "engine/models/causal_model.h"
 
 #include <array>

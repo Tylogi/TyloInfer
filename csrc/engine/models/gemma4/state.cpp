@@ -1,6 +1,6 @@
 #include "engine/models/gemma4/state.h"
 #include "engine/models/gemma4/model.h"
-#include "engine/ops.h"
+#include "engine/ops/ops.h"
 
 #include <algorithm>
 #include <limits>

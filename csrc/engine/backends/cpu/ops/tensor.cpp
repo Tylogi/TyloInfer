@@ -1,5 +1,5 @@
 #include "tensor.h"
-#include "engine/ops.h"
+#include "engine/ops/ops.h"
 
 #include <algorithm>
 #include <bit>

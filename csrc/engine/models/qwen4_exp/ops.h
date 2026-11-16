@@ -1,7 +1,7 @@
 #pragma once
 
 #include "engine/models/source/model_graph.h"
-#include "engine/ops.h"
+#include "engine/ops/ops.h"
 #include "engine/models/causal_model.h"
 #include "engine/models/metadata.h"
 #include "engine/metrics.h"

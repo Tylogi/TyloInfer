@@ -2,9 +2,9 @@
 
 #include "engine/models/common/recurrent_attention.h"
 #include "engine/models/qwen4_exp/ngram.h"
-#include "engine/ops.h"
+#include "engine/ops/ops.h"
 #include "engine/ops/ple.h"
-#include "engine/weights/row_stage.h"
+#include "engine/weights/rows/stage.h"
 
 #include <algorithm>
 #include <array>

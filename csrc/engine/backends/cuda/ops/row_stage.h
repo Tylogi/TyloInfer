@@ -1,6 +1,6 @@
 #pragma once
 
-#include "engine/weights/row_stage.h"
+#include "engine/weights/rows/stage.h"
 
 namespace tyloi::cuda {
 

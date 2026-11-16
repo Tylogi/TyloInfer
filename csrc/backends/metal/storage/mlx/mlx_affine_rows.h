@@ -1,7 +1,7 @@
 #pragma once
 
 #include "mfq_container.h"
-#include "engine/weights/encoding/mlx_affine.h"
+#include "engine/weights/encoding/mx/affine.h"
 #include <mlx/mlx.h>
 #include <array>
 

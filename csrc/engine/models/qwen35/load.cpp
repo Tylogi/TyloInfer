@@ -1,5 +1,5 @@
-#include "engine/models/source.h"
-#include "engine/ops.h"
+#include "engine/models/source/model.h"
+#include "engine/ops/ops.h"
 #include "engine/models/qwen35/load.h"
 
 #include "engine/models/qwen35/metadata.h"
@@ -11,7 +11,7 @@
 #include "engine/models/load.h"
 #include "engine/models/source/model_graph.h"
 #include "engine/weights/loader.h"
-#include "engine/weights/cache.h"
+#include "engine/weights/cache/cache.h"
 #include "engine/weights/source/read.h"
 
 #include <algorithm>

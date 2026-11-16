@@ -1,11 +1,11 @@
 #include "engine/models/session/snapshot.h"
 #include "engine/weights/loader.h"
-#include "engine/backends/cuda/executor/tq_moe.h"
+#include "engine/backends/cuda/ops/ffn/tq/banks.h"
 #include "dspark.h"
 #include "engine/models/deepseek_v41/policy.h"
 
 #include "engine/models/common/mtp.h"
-#include "engine/ops.h"
+#include "engine/ops/ops.h"
 #include "engine/backends/cuda/ops/ffn/ffn.h"
 #include "engine/ops/mhc.h"
 #include "ops.h"

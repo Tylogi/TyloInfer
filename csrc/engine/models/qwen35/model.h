@@ -10,7 +10,7 @@
 #include "engine/models/source/model_graph.h"
 #include "engine/models/common/attention.h"
 #include "engine/models/common/linear.h"
-#include "engine/models/source.h"
+#include "engine/models/source/model.h"
 
 #include <cstdint>
 #include <memory>

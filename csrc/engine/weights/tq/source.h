@@ -1,6 +1,6 @@
 #pragma once
 
-#include "engine/weights/encoding/tq_table.h"
+#include "engine/weights/encoding/tq/table.h"
 #include "engine/weights/source/source.h"
 
 #include <array>

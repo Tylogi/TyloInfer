@@ -1,7 +1,7 @@
 #pragma once
 
 #include "engine/generation/sequence.h"
-#include "engine/tensor.h"
+#include "engine/tensor/tensor.h"
 
 #include <cstdint>
 #include <memory>

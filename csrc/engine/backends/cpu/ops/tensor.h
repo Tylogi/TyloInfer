@@ -1,6 +1,6 @@
 #pragma once
 
-#include "engine/tensor.h"
+#include "engine/tensor/tensor.h"
 
 namespace tyloi::cpu::ops {
 Tensor empty(std::span<const std::int64_t> shape, const TensorOptions& options);

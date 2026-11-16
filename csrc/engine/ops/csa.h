@@ -1,5 +1,5 @@
 #pragma once
-#include "engine/tensor.h"
+#include "engine/tensor/tensor.h"
 #include <cstddef>
 #include <cstdint>
 #include <memory>

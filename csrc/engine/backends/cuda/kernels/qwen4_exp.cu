@@ -1,11 +1,11 @@
 #include "engine/backends/cuda/native/env.h"
 #include <cub/block/block_scan.cuh>
 #include <math_constants.h>
-#include "qwen4_exp.h"
-#include "mfq_cuda_norm_ops.h"
+#include "../ops/qwen4_exp.h"
+#include "../ops/norm/launch.h"
 #include "engine/backends/cuda/kernels/kernel_dispatch_trace.h"
 
-#include "selected_attention.h"
+#include "attention/selected.h"
 
 #include <cmath>
 #include <cstdlib>
@@ -514,7 +514,7 @@ __global__ void selected_blocks_from_ids(const int64_t* ids,const int64_t* posit
     const int row=blockIdx.x;
     emit_selected_blocks(ids+int64_t(row)*count,selected,positions[row],pool,count,budget,row);
 }
-#include "qsa_topk_threshold.cuh"
+#include "attention/qsa/topk_threshold.cuh"
 
 template<int Items>
 __device__ void live_topk_sort(const float* source,const int64_t* ids,float* output,int64_t* out_ids,

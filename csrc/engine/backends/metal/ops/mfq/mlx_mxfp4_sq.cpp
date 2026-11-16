@@ -2,7 +2,7 @@
 #include "engine/backends/metal/native/tensor/tensor.h"
 #include "engine/weights/memory.h"
 
-#include "engine/weights/encoding/mxfp4_sq_blob.h"
+#include "engine/weights/encoding/sq/mxfp4_blob.h"
 #include "engine/weights/encoding/legacy.h"
 
 #include <algorithm>

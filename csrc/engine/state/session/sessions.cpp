@@ -1,12 +1,12 @@
 #include "engine/state/session/sessions.h"
 
-#include "engine/budget.h"
+#include "engine/memory/budget.h"
 #include "engine/executor.h"
-#include "engine/generation/prefill_budget.h"
+#include "engine/generation/prefill/budget.h"
 #include "engine/models/common/mtp.h"
 #include "engine/models/session/snapshot.h"
 #include "engine/models/state.h"
-#include "engine/weights/cache.h"
+#include "engine/weights/cache/cache.h"
 
 #include <algorithm>
 #include <exception>

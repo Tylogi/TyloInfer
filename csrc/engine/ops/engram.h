@@ -1,5 +1,5 @@
 #pragma once
-#include "engine/tensor.h"
+#include "engine/tensor/tensor.h"
 
 namespace tyloi::ops {
 /** Immutable embedding projection and prepared gating weights. */

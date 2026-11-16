@@ -3,7 +3,7 @@
 #if TYLOINFER_HAS_CUDA
 #include "engine/backends/cuda/native/allocation.h"
 #endif
-#include "engine/tensor.h"
+#include "engine/tensor/tensor.h"
 
 #include <limits>
 #include <stdexcept>

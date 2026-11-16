@@ -1,13 +1,13 @@
 #include "experts.h"
 #include "engine/weights/encoding/mfe.h"
-#include "engine/weights/moe/dispatch.h"
-#include "engine/weights/moe/prepare.h"
+#include "engine/weights/moe/prepare/dispatch.h"
+#include "engine/weights/moe/prepare/prepare.h"
 #include "engine/weights/encoding/format_features.h"
 
 #if TYLOINFER_ENABLE_MFQ_COMPAT
-#include "cached_source_internal.h"
-#include "engine/weights/moe/load.h"
-#include "engine/backends/cuda/ops/ffn/moe.h"
+#include "residency/cached_source_internal.h"
+#include "engine/weights/moe/prepare/load.h"
+#include "engine/backends/cuda/ops/ffn/experts/moe.h"
 #endif
 
 #include <algorithm>

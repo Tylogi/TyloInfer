@@ -1,7 +1,7 @@
 #pragma once
 
-#include "engine/weights/row_stage.h"
-#include "engine/weights/encoding/tq_table.h"
+#include "engine/weights/rows/stage.h"
+#include "engine/weights/encoding/tq/table.h"
 
 #include <cstddef>
 #include <cstdint>

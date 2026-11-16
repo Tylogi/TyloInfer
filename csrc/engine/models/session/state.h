@@ -1,8 +1,8 @@
 #pragma once
 
-#include "engine/tensor.h"
+#include "engine/tensor/tensor.h"
 #include "engine/models/session/paged.h"
-#include "engine/state/kv_view.h"
+#include "engine/state/kv/view.h"
 
 #include <cstddef>
 #include <cstdint>

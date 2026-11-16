@@ -1,12 +1,12 @@
 #include "mlx_qwen35_linear_attention.h"
 
-#include "engine/ops.h"
+#include "engine/ops/ops.h"
 #include "engine/backends/metal/native/tensor/tensor.h"
 #include "mlx_gguf.h"
 #include "engine/backends/metal/native/profile.h"
 #include "mlx_kernel_prepare.h"
 #include "mlx_resident_budget.h"
-#include "engine/state/recurrent_layout.h"
+#include "engine/state/recurrent/layout.h"
 
 #include <cmath>
 #include <limits>

@@ -1,9 +1,9 @@
-#include "engine/models/source.h"
+#include "engine/models/source/model.h"
 #include "vision.h"
 #include "engine/models/deepseek_v41/axial_patch_encoder.h"
 #include "engine/state/session/prefix_cache.h"
 #include <stdexcept>
-#include "engine/ops.h"
+#include "engine/ops/ops.h"
 
 namespace tyloi::cuda::deepseek_v41_runtime {
 namespace {

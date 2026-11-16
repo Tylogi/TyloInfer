@@ -3,7 +3,7 @@
 #include "engine/models/session/snapshot.h"
 #include "engine/models/deepseek_v41/session_codec.h"
 #include "engine/models/qwen4_exp/session_codec.h"
-#include "engine/models/source.h"
+#include "engine/models/source/model.h"
 
 #include <array>
 #include <chrono>

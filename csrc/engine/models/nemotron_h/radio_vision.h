@@ -1,7 +1,7 @@
 #pragma once
 #include "engine/generation/sequence.h"
 #include "engine/models/input.h"
-#include "engine/ops.h"
+#include "engine/ops/ops.h"
 
 #include "engine/backends/cuda/ops/norm/rms.h"
 #include "engine/backends/cuda/ops/vision/attention.h"
@@ -12,7 +12,7 @@
 #include "engine/weights/loader.h"
 
 #include "engine/requests/media.h"
-#include "engine/backends/cuda/kernels/mfq_cuda_activation_ops.h"
+#include "engine/backends/cuda/ops/activation.h"
 #include "engine/models/source/model_graph.h"
 #include "engine/state/session/prefix_cache.h"
 

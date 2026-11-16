@@ -1,6 +1,6 @@
 #include "backend.h"
-#include "mfq_cuda_kernels.h"
-#include "activation_raw.h"
+#include "engine/backends/cuda/kernels/elementwise.h"
+#include "engine/backends/cuda/kernels/elementwise/activation_raw.h"
 #include <array>
 #include <stdexcept>
 #include <vector>

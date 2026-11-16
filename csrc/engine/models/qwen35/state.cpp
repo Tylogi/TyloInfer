@@ -3,8 +3,8 @@
 
 #include "engine/models/qwen35/model.h"
 #include "engine/models/input.h"
-#include "engine/ops.h"
-#include "engine/state/recurrent_layout.h"
+#include "engine/ops/ops.h"
+#include "engine/state/recurrent/layout.h"
 
 #include <algorithm>
 #include <cstddef>

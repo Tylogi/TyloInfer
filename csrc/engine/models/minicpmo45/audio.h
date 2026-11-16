@@ -1,7 +1,7 @@
 #pragma once
 
 #include "engine/models/minicpmo45/media.h"
-#include "engine/ops.h"
+#include "engine/ops/ops.h"
 #include "vision.h"
 
 struct MiniCPMO45WhisperAttention {

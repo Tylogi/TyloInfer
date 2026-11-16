@@ -1,13 +1,13 @@
 #pragma once
 
-#include "engine/backends/cuda/ops/projection/fp8_sq.h"
-#include "engine/backends/cuda/ops/projection/mx.h"
-#include "engine/backends/cuda/ops/projection/mxfp4_sq.h"
-#include "engine/backends/cuda/ops/projection/nint.h"
-#include "engine/backends/cuda/ops/projection/vq.h"
-#include "engine/backends/cuda/ops/projection/tq.h"
+#include "engine/backends/cuda/ops/projection/fp8_sq/tensor.h"
+#include "engine/backends/cuda/ops/projection/mx/tensor.h"
+#include "engine/backends/cuda/ops/projection/mxfp4_sq/tensor.h"
+#include "engine/backends/cuda/ops/projection/nint/tensor.h"
+#include "engine/backends/cuda/ops/projection/vq/tensor.h"
+#include "engine/backends/cuda/ops/projection/tq/tensor.h"
 #include "engine/weights/encoding/format_features.h"
-#include "engine/weights/encoding/tq.h"
+#include "engine/weights/encoding/tq/tensor.h"
 #include "engine/weights/placement.h"
 #include "engine/weights/sharded.h"
 

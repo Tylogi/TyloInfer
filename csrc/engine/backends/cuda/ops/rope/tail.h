@@ -4,7 +4,7 @@
 
 #include <cstdint>
 
-#include "engine/ops.h"
+#include "engine/ops/ops.h"
 namespace tyloi::cuda::ops {
 tyloi::ops::TailRopeTable tail_rope_table(std::int64_t max_positions, double base,
     std::int64_t compress_ratio, Device device, double compress_base,

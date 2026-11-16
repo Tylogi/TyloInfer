@@ -4,8 +4,8 @@
 #include "engine/generation/sequence.h"
 
 #include "engine/weights/fields.h"
-#include "engine/weights/workspace.h"
-#include "engine/ops.h"
+#include "engine/weights/cache/workspace.h"
+#include "engine/ops/ops.h"
 #include "engine/models/common/vision/grid_vision.h"
 #include "engine/requests/media.h"
 #include "engine/state/session/prefix_cache.h"

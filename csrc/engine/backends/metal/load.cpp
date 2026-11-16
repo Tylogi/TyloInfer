@@ -10,12 +10,12 @@
 #include "engine/models/load.h"
 #include "engine/models/prepare.h"
 #include "engine/models/session/cache.h"
-#include "engine/models/source.h"
+#include "engine/models/source/model.h"
 #include "engine/models/source/model_config.h"
 #include "engine/models/source/model_graph.h"
 #include "engine/requests/processor.h"
 #include "engine/state/session/sessions.h"
-#include "engine/weights/cache.h"
+#include "engine/weights/cache/cache.h"
 #include "engine/weights/memory.h"
 
 #include <mlx/mlx.h>

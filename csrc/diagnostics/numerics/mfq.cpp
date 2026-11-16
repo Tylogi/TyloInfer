@@ -10,17 +10,17 @@
 #include <vector>
 
 #if TYLOINFER_ENABLE_MFQ_COMPAT
-#include "engine/backends/cuda/kernels/float_projection.h"
+#include "engine/backends/cuda/kernels/projection/dense.h"
 #include "engine/backends/cuda/native/profile.h"
-#include "engine/backends/cuda/ops/projection/nint.h"
-#include "engine/backends/cuda/ops/projection/vq.h"
-#include "engine/models/source.h"
+#include "engine/backends/cuda/ops/projection/nint/tensor.h"
+#include "engine/backends/cuda/ops/projection/vq/tensor.h"
+#include "engine/models/source/model.h"
 #include "engine/weights/encoding/quant/mfe_blob.h"
 #include "engine/weights/encoding/quant/mfe_quant_expert_store.h"
 #include "engine/weights/encoding/quant/nint_rows.h"
 #include "engine/weights/encoding/quant/nvq_rows.h"
-#include "engine/weights/encoding/nint.h"
-#include "engine/weights/quant.h"
+#include "engine/weights/encoding/quant/nint_tensor.h"
+#include "engine/weights/prepare/quant.h"
 #include "engine/weights/source/read.h"
 #endif
 

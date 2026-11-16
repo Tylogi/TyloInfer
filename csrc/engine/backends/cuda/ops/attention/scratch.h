@@ -1,7 +1,7 @@
 #pragma once
 
 #include "backend.h"
-#include "engine/backends/cuda/ops/ffn/routes.h"
+#include "engine/backends/cuda/ops/ffn/experts/routes.h"
 
 #include <cstdint>
 #include <map>

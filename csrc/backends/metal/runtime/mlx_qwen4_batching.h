@@ -1,6 +1,6 @@
 #pragma once
 
-#include "engine/generation/batch.h"
+#include "engine/generation/batch/batch.h"
 #include "mlx_qwen4_causal_lm.h"
 #include "mlx_resident_budget.h"
 #include "engine/generation/mtp/batch_policy.h"

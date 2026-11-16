@@ -58,7 +58,7 @@ def library():
     directory = tq_source_directory()
     path = load(
         name="mfq_tq_ops",
-        sources=[str(directory / "tq_ops.cu")],
+        sources=[str(directory / "ops.cu")],
         extra_cuda_cflags=["-O3", "--fmad=false"],
         extra_ldflags=["cublas.lib"] if os.name == "nt" else ["-lcublas"],
         is_python_module=False,

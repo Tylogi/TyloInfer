@@ -1,8 +1,8 @@
 #pragma once
 
 #include "engine/weights/moe/batch.h"
-#include "engine/backends/cuda/executor/tq_moe.h"
-#include "engine/backends/cuda/ops/ffn/routes.h"
+#include "engine/backends/cuda/ops/ffn/tq/banks.h"
+#include "engine/backends/cuda/ops/ffn/experts/routes.h"
 #include "engine/weights/encoding/mfe.h"
 
 namespace tyloi::weights {

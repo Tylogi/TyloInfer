@@ -4,7 +4,7 @@
 #include <memory>
 #include <vector>
 
-#include "engine/tensor.h"
+#include "engine/tensor/tensor.h"
 
 namespace tyloi::weights {
 

@@ -414,12 +414,12 @@ add_library(mfq-metal-engine STATIC
     ${TYLOINFER_METAL_ROOT}/load.cpp
     ${PROJECT_SOURCE_DIR}/engine/models/qwen4_exp/metal.cpp
     ${PROJECT_SOURCE_DIR}/engine/models/qwen35/metal_batch.cpp
-    ${PROJECT_SOURCE_DIR}/engine/weights/cache_metal.cpp
+    ${PROJECT_SOURCE_DIR}/engine/weights/cache/metal.cpp
     ${PROJECT_SOURCE_DIR}/engine/weights/loader_metal.cpp
     ${PROJECT_SOURCE_DIR}/engine/weights/encoding/metal.cpp
     ${PROJECT_SOURCE_DIR}/engine/weights/encoding/rows.cpp
-    ${PROJECT_SOURCE_DIR}/engine/weights/row_source.cpp
-    ${PROJECT_SOURCE_DIR}/engine/weights/row_stage_metal.cpp
+    ${PROJECT_SOURCE_DIR}/engine/weights/rows/source.cpp
+    ${PROJECT_SOURCE_DIR}/engine/weights/rows/stage_metal.cpp
     ${TYLOINFER_METAL_ROOT}/native/device.cpp
 )
 mfq_configure_metal(mfq-metal-engine)

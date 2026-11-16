@@ -1,9 +1,9 @@
 #include "attn.h"
 #include "tensor.h"
-#include "engine/backends/cuda/kernels/mfq_cuda_attention_ops.h"
-#include "engine/backends/cuda/kernels/mfq_cuda_cache_ops.h"
-#include "engine/backends/cuda/ops/attention/kv.h"
-#include "engine/state/kv_view.h"
+#include "engine/backends/cuda/ops/attention/launch.h"
+#include "engine/backends/cuda/ops/attention/kv/launch.h"
+#include "engine/backends/cuda/ops/attention/kv/cache.h"
+#include "engine/state/kv/view.h"
 
 #include <cmath>
 #include <stdexcept>

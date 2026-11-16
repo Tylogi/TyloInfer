@@ -1,7 +1,7 @@
 #include "flash_reject.h"
 #include "tensor.h"
-#include "engine/backends/cuda/kernels/glm5_next.h"
-#include "engine/backends/cuda/kernels/qwen4_exp.h"
+#include "engine/backends/cuda/ops/glm5_next.h"
+#include "engine/backends/cuda/ops/qwen4_exp.h"
 #include "engine/backends/cuda/native/device.h"
 
 #include <cstdint>

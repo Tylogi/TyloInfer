@@ -1,6 +1,6 @@
 #pragma once
 #include "engine/models/session/state.h"
-#include "engine/backends/cuda/executor/qsa_tq_session.h"
+#include "engine/backends/cuda/executor/qsa/session.h"
 #include "engine/state/session/prefix_cache.h"
 #include <cstring>
 

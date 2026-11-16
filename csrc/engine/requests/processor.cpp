@@ -1,5 +1,5 @@
 #include "processor.h"
-#include "engine/models/source.h"
+#include "engine/models/source/model.h"
 #include "engine/models/prepare.h"
 
 #include "constraint.h"

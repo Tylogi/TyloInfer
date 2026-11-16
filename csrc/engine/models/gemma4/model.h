@@ -3,7 +3,7 @@
 #include "engine/models/gemma4/config.h"
 #include "engine/models/common/attention.h"
 #include "engine/models/common/mlp.h"
-#include "engine/models/source.h"
+#include "engine/models/source/model.h"
 #include "engine/models/input.h"
 #include "engine/models/causal_model.h"
 

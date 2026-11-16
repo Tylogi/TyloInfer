@@ -10,18 +10,30 @@ stage that actually needs it. Necessary build, test and consumer wiring is activ
 
 ## Current baseline and verification limits
 
-Public Tensor ownership, Executor and shared model/state contracts already exist. Qwen4 is selected by `models::load`
-and runs through the common Engine and generation path; its Text/EngineInstance variant, `with_model` branch and old
-generation callback headers have been removed. Optional weights and predictor belong to the model; request State owns
-media, positions, recurrent/KV state and speculative checkpoints.
+Public Tensor ownership, Executor and shared model/state contracts already exist. Qwen4's loading, ordinary and batch
+forward, State, predictor and session codec use public Tensor/Device on the common Engine and generation path. CUDA
+Graph and layer-major execution stay in family-private CUDA sources; Metal executes without Graph.
+The factory covers the supported CUDA families. Ordinary and MTP generation are concrete shared implementations;
+batch generation directly coordinates its scheduled requests without a second sequence adapter. Session matching
+uses the actual State/Restore contract without callback fallbacks or adapter probes. Optional weights
+and predictor belong to the model; request State owns media, positions, recurrent/KV state and checkpoints. Diagnostics
+use actual prefill/decode and graph contracts.
+MiniCPM keeps duplex state and control in its own runtime, without a duplex contract on CausalModel.
+Optional component declarations are validated by each family and loaded directly. Capabilities report the loaded
+objects; no model Plan, adapter enum or parallel capability matrix remains in the shared execution chain.
 
 Prefill, decode, warmup and numerical batch jobs report workspace, layer and Graph events. Runtime coordinates `Loan`,
 Graph preparation and allocation admission; the root CUDA Executor owns its KV resources and forked Executors borrow
 them weakly. Shared Engine holds no CUDA KV types. Shared session restoration
-admits and stages separate target/predictor candidates, drains, then publishes them. The affected source lists and native
-diagnostic callers are connected, including the existing Qwen3.5 layer reference path.
+admits and stages separate target/predictor candidates, drains, then publishes them. DeepSeek V4.1 CED is connected to
+model prefill with phase admission and raw target history; Qwen4 retains its existing layer-major span and growth plan.
+The affected source lists and native diagnostic callers are connected, including the Qwen3.5 layer reference path.
 
-PLE math and profiling use public ops; row loading uses Rows/RowPipeline. The CUDA backend holds capture resources,
+PLE math and profiling use public ops; row loading uses Rows/RowReader with bounded Metal row reads and device decode.
+Metal implementations cover GDN, QSA, residual and routed/shared FFN. TQ, GGUF and Affine expert caches receive the same
+SwiGLU limit during preparation and execution; typed KV quantization reaches QSA and sessions.
+Predictor and independent batch state growth are admitted before execution; retained lazy storage is submitted with
+outputs. The CUDA backend holds capture resources,
 FFN tile scheduling, profiling policy and replay backing. Fixed buffers, row stages and state-copy backing report growth
 before construction. The ordinary preparation pass observes temporary allocation lifetimes by device, stream and size
 class; Budget admits graph-pool growth before materialisation. Warmup expands an incomplete plan through another
@@ -37,13 +49,21 @@ model/backend declarations have one fixed implementation; shared dispatch uses p
 SDK usage requirements are private. Python CUDA JIT uses independent raw launchers and a checked source/include closure
 for checkout, sdist and wheel resources; it does not compile the native Tensor runtime.
 
-Only source references, calls, include/package closure and whitespace were reviewed. Builds and tests were neither run
-nor changed. Stage-1/2 runtime and distribution acceptance below remains unverified; the next main source stage is
-shared Metal execution. Other families retain
-their live legacy paths, including unresolved shared Program batching for Qwen3.5. Qwen's batch adapter still selects
-the whole-step FFN serial policy for residual and expert scheduling; it must move together with shared batch execution.
-Legacy diagnostic comparison modes without a current implementation explicitly reject invocation. Metal still has a
-separate inference runtime.
+Load headers expose only complete load/reload. Production and diagnostic loading use typed configuration, Cache and
+the model factory directly; the root Executor creates and finalizes KV while forks borrow it. Cache completion retains
+pending State growth, budget charges and the owner drain, without public load-phase functions.
+Production CUDA and Metal commands share `tyloi-engine`, Engine load/reload and Transport. Python builds, managed-build
+selection and Studio/macOS packaging select this entry; diagnostics remain separate. Metal initialization and Qwen
+YaRN/placement policy belong to library loading, not the old application. The shared batch owns independent request
+State; its CUDA subclass retains Graph and FFN scheduling policy.
+
+This refactoring round reviewed source references, calls, include/package closure and whitespace without building,
+running or editing tests. Runtime and distribution acceptance below remains unverified. Other Metal families retain
+their legacy implementations; Nemotron-H migration and Program restructuring are postponed at the user's direction. Qwen4's Metal DFlash2,
+MTP TTT/LoRA, QSA SSD offload and old paged-cache extensions are
+skipped at the user's direction. Qwen3.5 CUDA batching uses the shared batch contract; its Metal batching remains
+unsupported. Shared batch admission still excludes MTP and session/prefix requests; those use ordinary execution.
+Legacy diagnostic comparison modes without an implementation explicitly reject invocation.
 
 ## 1. Finish Qwen4 exp restructuring
 
@@ -117,15 +137,16 @@ Reuse the existing Metal Tensor representation, Executor and basic ops. Connect 
 than adding another Engine facade, universal Backend object or parallel public tensor/model hierarchy. CUDA remains the
 regression baseline while the supported Metal paths move to the same contracts.
 
-Library load/reload and Loader placement now use Device. Qwen3.5 Model/State/loading use the shared model namespace;
+Library load/reload and Loader placement now use Device. Qwen3.5 and Qwen4 Model/State/loading use the shared model namespace;
 the Metal assembly, public ops and Source-backed TQ/GGUF/Affine caches are registered in an independent backend target.
 Sessions share host codecs and submit staged candidates before drain/publication; full-KV disk restore uploads only
 after admission. CPU cast/cat and Metal lazy generation use the shared contracts. Only static source/call review has
 been performed, so the shared Metal path is not runtime-verified.
 
-Remaining source work includes other model families and their production CLI/service consumers, Metal batch/KV
-quantization/YaRN, CPU encoded offload, legacy MFQ expert formats and Affine SwiGLU limits. The old model runtime still
-contains obsolete norm/coordinator dependencies. DeepSeek-V4.1's separate legacy codec still uploads before admission.
+Remaining source work includes other model families, Qwen4's retained legacy features and paged-cache compatibility,
+shared MTP/session batching, CPU encoded offload and legacy MFQ expert formats. The old model runtime still
+contains obsolete norm/coordinator dependencies. CUDA family session restoration uses independent admitted candidates;
+DeepSeek-V4.1's codec retains host tensors and their destination devices until staging.
 Cache metadata planning uses a checked MLX allocator bound; other SDK versions can reject a larger actual backing.
 
 1. **Complete device-neutral loading and weight placement.** Use public Device values and typed load options instead
@@ -159,13 +180,72 @@ MTP/batch/session, cancellation, reload/unload and resource retirement on the sh
 timing, no-Graph execution and shared-memory budgeting, plus CUDA capture/replay and asynchronous leases. Neither
 identical kernels nor both devices in a single platform build are required; matching signatures alone is insufficient.
 
+### Host memory and state/backend dependency cleanup
+
+Host-memory sampling and allocator trimming now live in `components/host_memory.*` under an independent build
+target; the agreed target location is `engine/memory/host.*`, and that path migration remains pending.
+Session, TQ/MoE, KV and CUDA consumers include that contract directly; the duplicate session/KV platform
+queries are removed. Linux uses `MemAvailable`, Windows retains commit headroom, and macOS supplies physical totals,
+available pages, process residency and independent footprint. Metal reuses that sample without adding its shared pool
+twice. Sampling failure throws or conservatively yields zero headroom in background/optional-cache consumers.
+
+QSA geometry now lives in `state/kv/layout.*`. `Budget::place_kv` owns GPU/RAM/SSD quota selection, host pressure
+reclaim and resampling; initial loading does not require a runtime Budget object. CUDA Executor registrations,
+allocation, VMM, hot cache and expert-region retention use their own backend sources. The mixed `state/kv_memory.*`
+and its placement-ratio header are removed. Offload and fixed gather admission/allocation use the request device.
+
+KV offload/sequence types now belong to shared state. RAM/SSD policy, page identity and arena leases remain with
+state/cache owners; allocation, copies and pointer publication use public ops. CUDA pointer upload and fixed gather
+execute in backend ops, preserving pinned staging, the mapped-copy kernel and consumer barriers. Shared state no longer
+includes backend-private headers or directly calls device APIs for these operations. CPU arena backing accounts for
+host allocation without a second manual charge. Source ownership and production consumers are connected; device
+execution and lifetime acceptance below remains outstanding.
+
+**Acceptance:** shared state/session/weights use the common host-memory contract without backend-private includes for
+that facility; generic state has no direct device API dependency. Check sampling success/failure, absent and exhausted
+commit headroom, session/cache budget decisions and CPU/Metal shared-pool accounting. Reuse affected KV growth,
+offload, borrowing, Graph and cancel/reload tests to verify admission before allocation and last-reader retirement.
+Only static source/link review is complete. Platform builds, metric failure paths and runtime lifetime checks remain
+unverified. Unchanged CUDA tests retain removed host/KV header references and old KV options/configuration names;
+test migration and execution remain excluded by the user instruction.
+
+### Align source ownership with the five runtime modules
+
+Status: design agreed; source migration and acceptance remain pending. Apply this ownership cleanup to affected work
+without adding a prerequisite phase ahead of Qwen4 exp, LibTorch isolation or Metal/CUDA convergence.
+
+- Remove `components` as a source grouping. Move maintained text processing to `engine/requests/text`, media codecs
+  and frame sampling to `engine/requests/media`, host-memory sampling to `engine/memory/host.*`, and the public
+  resource-exhaustion exception to `engine/error.h`. Preserve current text interfaces and host-memory semantics;
+  host sampling stays independently buildable without Budget or CPU numeric targets.
+- Place shared file/range/async readers in `engine/io`. Weight-container and model-replica discovery policy stays in
+  `weights/source`; KV/session persistence policy stays in state. Do not make state depend on weight loading just to
+  read bytes. Do not add peer text, media or platform runtime modules.
+- Put bundled dependency sources in `csrc/dependencies/<name>`, preserving licences, notices and upstream version
+  records. Project-maintained adapters stay with their engine or transport owner; adapted text-runtime code stays
+  in requests with its attribution.
+- Keep `weights` for weight loading, preparation and residency. Separate encoded Tensor representations and pure
+  codecs into `tensor/encoding`; move QSA mutable cache policies into `state/kv` and CUDA QSA session backing
+  integration into the backend executor. Split mixed files rather than moving the entire encoding directory.
+  Weight-specific stores/preparation and expert-storage leases remain with their owners. Codec targets must not
+  depend back on the state stores that consume them.
+- Update affected includes, CMake ownership, JIT source/include manifests, distribution resources and documentation
+  together. Track affected test references under the existing test-migration restriction; do not claim acceptance
+  while those references or platform builds remain unchecked. No forwarding directory or duplicate source copy is
+  introduced to retain the old layout.
+
+Acceptance requires consistent source/build/package references, preserved text/media behaviour, encoded layouts,
+async reader and lease lifetimes, and independent host-memory sampling. Directory moves alone are not implementation
+or runtime acceptance. The five runtime modules remain requests, scheduler, generation, state and weights; shared
+Tensor/ops/memory/IO facilities, models and backends retain their distinct roles.
+
 ## Retained follow-up and scope limits
 
 | Item | Remaining scope |
 | --- | --- |
-| Other CUDA families, including DeepSeek V4.1 | Continue unresolved execution dependencies, State/scratch ownership, capability probing and old Text/loading adapters after the priorities above; fix shared regressions when encountered, without making all-family migration a prerequisite for Qwen4 |
-| Remaining generic consolidation | Retire Backbone family dispatch, common capability/member probing, obsolete loading stages and transitional instance ownership as their consumers migrate; preserve the previously specified budget, lifetime and failure semantics |
-| HIP and its old directories | Device migration and platform acceptance remain deferred; old HIP JIT checkout-relative includes and missing wheel source resources still need migration |
+| Other CUDA families, including DeepSeek V4.1 | Continue device-neutral numeric work, State/scratch ownership and remaining capability probing through the unified factory and Engine; preserve supported family semantics |
+| Remaining generic consolidation | Remove remaining member probing as its consumers migrate; preserve the previously specified budget, lifetime and failure semantics |
+| HIP and its old directories | Device migration and platform acceptance remain deferred; old Engine/generation/MTP consumers still reference removed shared template headers and the old namespace; JIT checkout-relative includes and wheel source resources also need migration |
 | Unrelated legacy tools and broad packaging cleanup | Keep outstanding tasks visible, but migrate and verify any consumer actually affected by an active stage in that stage; do not defer its necessary acceptance |
 
 Metal wiring, LibTorch isolation and the verification needed by each active stage are no longer blanket deferred items.

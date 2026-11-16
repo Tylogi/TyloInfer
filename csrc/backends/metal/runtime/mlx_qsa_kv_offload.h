@@ -1,7 +1,7 @@
 #pragma once
 
 #include "mlx_transformer.h"
-#include "engine/state/qsa_sequence.h"
+#include "engine/state/kv/qsa_sequence.h"
 
 #include <memory>
 #include <optional>

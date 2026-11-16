@@ -1,5 +1,5 @@
 #pragma once
-#include "engine/models/source.h"
+#include "engine/models/source/model.h"
 
 namespace tyloi {
 // Explicit synthetic benchmark input. No normal model load creates this source.

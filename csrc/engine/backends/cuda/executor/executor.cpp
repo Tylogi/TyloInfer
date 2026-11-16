@@ -1,6 +1,6 @@
 #include "executor.h"
 
-#include "engine/backends/cuda/executor/tq.h"
+#include "engine/backends/cuda/executor/tq/resources.h"
 #include "engine/backends/cuda/executor/options.h"
 #include "engine/backends/cuda/executor/working_set.h"
 #include "engine/backends/cuda/native/branches.h"
@@ -11,13 +11,13 @@
 #include "engine/backends/cuda/native/profile.h"
 #include "engine/backends/cuda/native/scope.h"
 #include "engine/backends/cuda/native/tensor/backend.h"
-#include "engine/backends/cuda/kernels/mfq_cuda_sampling_ops.h"
-#include "engine/backends/cuda/kernels/gr_prefill_blas.h"
+#include "engine/backends/cuda/ops/sampling/launch.h"
+#include "engine/backends/cuda/kernels/ffn/residual/prefill_blas.h"
 #include "engine/backends/cuda/ops/projection/mmq.h"
-#include "engine/backends/cuda/executor/kv_memory.h"
-#include "engine/state/kv_offload.h"
-#include "engine/weights/cache.h"
-#include "diagnostics/route_stats.h"
+#include "engine/backends/cuda/executor/kv/memory.h"
+#include "engine/state/kv/offload.h"
+#include "engine/weights/cache/cache.h"
+#include "diagnostics/profiling/route_stats.h"
 
 #include <algorithm>
 #include <exception>

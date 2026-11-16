@@ -1,8 +1,8 @@
 #include "env.h"
-#include "qwen4_exp.h"
-#include "mfq_cuda_norm_ops.h"
+#include "engine/backends/cuda/ops/qwen4_exp.h"
+#include "engine/backends/cuda/ops/norm/launch.h"
 
-#include "selected_attention.h"
+#include "engine/backends/cuda/kernels/attention/selected.h"
 
 #include <cmath>
 #include <cstdlib>

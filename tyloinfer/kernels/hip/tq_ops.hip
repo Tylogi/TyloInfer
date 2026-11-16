@@ -3,8 +3,8 @@
 #define TRELLIS_FIXED_BOOK 1
 #define TRELLIS_NORMALIZED_WINDOW 1
 #define TRELLIS_PAIR_BOOK 1
-#include "tq_decode.cuh"
-#include "tq_ops.h"
+#include "engine/backends/cuda/kernels/projection/tq/decode.cuh"
+#include "engine/backends/cuda/kernels/projection/tq/ops.h"
 #include <hip/hip_bf16.h>
 #include <hipblas/hipblas.h>
 #include <type_traits>
@@ -355,16 +355,16 @@ extern "C" int mfq_tq_swiglu_batch(const TrellisProjectionView* gate,const Trell
     return batch_projection<true>(gate,up,x,h,count,rows,xs,ys,dtype,w,r,s);
 }
 
-#include "tq_float_tokens.cuh"
-#include "tq_matmul.cuh"
-#include "tq_prefill_float.cuh"
-#include "tq_parallel_tokens.cuh"
-#include "tq_q8_tokens.cuh"
-#include "tq_routed_views.cuh"
-#include "tq_indexed.cuh"
-#include "tq_indexed_mma.cuh"
-#include "tq_prefill_moe.cuh"
-#include "tq_prefill_gemm.cuh"
+#include "engine/backends/cuda/kernels/projection/tq/float_tokens.cuh"
+#include "engine/backends/cuda/kernels/projection/tq/matmul.cuh"
+#include "engine/backends/cuda/kernels/projection/tq/prefill_float.cuh"
+#include "engine/backends/cuda/kernels/projection/tq/parallel_tokens.cuh"
+#include "engine/backends/cuda/kernels/projection/tq/q8_tokens.cuh"
+#include "engine/backends/cuda/kernels/projection/tq/routed_views.cuh"
+#include "engine/backends/cuda/kernels/projection/tq/indexed.cuh"
+#include "engine/backends/cuda/kernels/projection/tq/indexed_mma.cuh"
+#include "engine/backends/cuda/kernels/projection/tq/prefill_moe.cuh"
+#include "engine/backends/cuda/kernels/projection/tq/prefill_gemm.cuh"
 
 extern "C" int mfq_tq_gemv_tokens(TrellisProjectionView g,const void* x,void* y,int tokens,int dtype,hipStream_t s) {
     if(tokens<1 || tokens>65535)return -1;

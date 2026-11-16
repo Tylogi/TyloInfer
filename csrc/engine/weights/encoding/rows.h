@@ -1,6 +1,6 @@
 #pragma once
 
-#include "engine/tensor.h"
+#include "engine/tensor/tensor.h"
 #include "components/io/read_span.h"
 #include <functional>
 #include <memory>

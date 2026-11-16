@@ -1,5 +1,5 @@
 #include "engine/models/qwen35/batch.h"
-#include "engine/ops.h"
+#include "engine/ops/ops.h"
 
 #include "engine/weights/moe/experts.h"
 #include "engine/models/common/check.h"

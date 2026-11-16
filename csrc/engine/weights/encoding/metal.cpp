@@ -1,6 +1,6 @@
 #include "engine/weights/encoding/metal.h"
 
-#include "engine/weights/encoding/mlx_affine.h"
+#include "engine/weights/encoding/mx/affine.h"
 #include "engine/weights/source/read.h"
 #include "engine/weights/tq/source.h"
 #include "mlx_tensor.h"

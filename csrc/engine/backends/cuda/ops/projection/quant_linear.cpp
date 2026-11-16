@@ -1,7 +1,7 @@
 #include "quant_linear.h"
-#include "engine/backends/cuda/kernels/mfq_cuda_embedding_ops.h"
-#include "engine/backends/cuda/kernels/mfq_cuda_quant_ops.h"
-#include "engine/weights/encoding/mxfp4_sq_decode.h"
+#include "engine/backends/cuda/ops/embedding.h"
+#include "engine/backends/cuda/ops/projection/quant.h"
+#include "engine/weights/encoding/sq/mxfp4_decode.h"
 
 #include <algorithm>
 #include <cmath>

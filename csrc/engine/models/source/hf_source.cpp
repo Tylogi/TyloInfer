@@ -7,7 +7,7 @@
 
 #include "engine/models/source/hf.h"
 #include "engine/models/source/mlx_names.h"
-#include "engine/weights/hf.h"
+#include "engine/weights/prepare/hf.h"
 #include "nlohmann/json.hpp"
 
 #include <algorithm>

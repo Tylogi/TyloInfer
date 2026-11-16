@@ -4,10 +4,10 @@
 #include "engine/backends/cuda/executor/executor.h"
 #include "engine/backends/cuda/native/collectives.h"
 #include "engine/backends/cuda/native/env.h"
-#include "engine/ops.h"
-#include "engine/backends/cuda/kernels/mfq_cuda_norm_ops.h"
-#include "engine/backends/cuda/kernels/mfq_cuda_activation_ops.h"
-#include "engine/backends/cuda/kernels/mfq_cuda_sampling_ops.h"
+#include "engine/ops/ops.h"
+#include "engine/backends/cuda/ops/norm/launch.h"
+#include "engine/backends/cuda/ops/activation.h"
+#include "engine/backends/cuda/ops/sampling/launch.h"
 
 #include <optional>
 #include <cstring>

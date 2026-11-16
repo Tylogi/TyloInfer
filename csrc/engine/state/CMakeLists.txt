@@ -1,8 +1,8 @@
 find_package(Threads REQUIRED)
 
 add_library(mfq-qsa-kv-store STATIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/qsa_blocks.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/qsa_blocks.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/kv/qsa_blocks.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/kv/qsa_blocks.h
 )
 target_include_directories(mfq-qsa-kv-store PUBLIC
     ${PROJECT_SOURCE_DIR}

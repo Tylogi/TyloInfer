@@ -3,8 +3,8 @@
 #include "engine/backends/cuda/native/collectives.h"
 #include "engine/backends/cuda/native/scope.h"
 #include "engine/models/session/snapshot.h"
-#include "engine/ops.h"
-#include "engine/backends/cuda/executor/tq_moe.h"
+#include "engine/ops/ops.h"
+#include "engine/backends/cuda/ops/ffn/tq/banks.h"
 #include "engine/models/common/load.h"
 #include "engine/backends/cuda/ops/ffn/ffn.h"
 #include "engine/backends/cuda/ops/norm/rms.h"
@@ -16,9 +16,9 @@
 #include "forward.h"
 #include "engine/backends/cuda/executor/options.h"
 
-#include "engine/backends/cuda/kernels/mfq_cuda_linear_attention_ops.h"
-#include "engine/backends/cuda/kernels/mfq_cuda_norm_ops.h"
-#include "engine/backends/cuda/kernels/mfq_cuda_selective_state_scan_ops.h"
+#include "engine/backends/cuda/ops/attention/gdn/launch.h"
+#include "engine/backends/cuda/ops/norm/launch.h"
+#include "engine/backends/cuda/ops/attention/scan.h"
 
 #include <algorithm>
 #include <array>

@@ -1,7 +1,7 @@
 #include "engine/models/gemma4/load.h"
 #include "engine/models/gemma4/model.h"
 #include "engine/models/gemma4/weights.h"
-#include "engine/ops.h"
+#include "engine/ops/ops.h"
 #include "engine/weights/loader.h"
 #include "engine/weights/tq/source.h"
 

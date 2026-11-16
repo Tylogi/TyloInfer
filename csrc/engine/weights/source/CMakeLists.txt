@@ -8,15 +8,15 @@ add_library(mfq-weight-source STATIC
     ${PROJECT_SOURCE_DIR}/engine/weights/source/files.cpp
     ${PROJECT_SOURCE_DIR}/engine/weights/source/json.cpp
     ${PROJECT_SOURCE_DIR}/engine/weights/source/safetensors.cpp
-    ${PROJECT_SOURCE_DIR}/engine/weights/hf.cpp
-    ${PROJECT_SOURCE_DIR}/engine/weights/hf.h
+    ${PROJECT_SOURCE_DIR}/engine/weights/prepare/hf.cpp
+    ${PROJECT_SOURCE_DIR}/engine/weights/prepare/hf.h
     ${PROJECT_SOURCE_DIR}/engine/weights/source/tensor.h
     ${PROJECT_SOURCE_DIR}/engine/weights/source/assets.cpp
-    ${PROJECT_SOURCE_DIR}/engine/weights/mlx.cpp
+    ${PROJECT_SOURCE_DIR}/engine/weights/prepare/mlx.cpp
     ${PROJECT_SOURCE_DIR}/engine/weights/source/gguf.cpp
-    ${PROJECT_SOURCE_DIR}/engine/weights/gguf.cpp
-    ${PROJECT_SOURCE_DIR}/engine/weights/gguf.h
-    ${PROJECT_SOURCE_DIR}/engine/weights/mlx.h
+    ${PROJECT_SOURCE_DIR}/engine/weights/prepare/gguf.cpp
+    ${PROJECT_SOURCE_DIR}/engine/weights/prepare/gguf.h
+    ${PROJECT_SOURCE_DIR}/engine/weights/prepare/mlx.h
     ${PROJECT_SOURCE_DIR}/engine/weights/source/gguf.h
     ${PROJECT_SOURCE_DIR}/engine/weights/source/mfq.h
     ${PROJECT_SOURCE_DIR}/engine/weights/source/json.h

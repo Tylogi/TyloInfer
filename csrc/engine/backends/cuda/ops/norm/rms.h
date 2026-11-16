@@ -2,8 +2,8 @@
 
 #include "backend.h"
 
-#include "engine/tensor.h"
-#include "engine/ops.h"
+#include "engine/tensor/tensor.h"
+#include "engine/ops/ops.h"
 namespace tyloi::cuda::ops {
 tyloi::DenseTensor rms_norm(tyloi::DenseTensor input, const tyloi::DenseTensor& weight, double eps, double offset,
                      tyloi::ScalarType output_type);

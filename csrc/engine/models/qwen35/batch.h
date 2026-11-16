@@ -3,7 +3,7 @@
 #include "engine/models/qwen35/model.h"
 #include "engine/models/qwen35/state.h"
 #include "engine/models/batch.h"
-#include "engine/state/paged_kv.h"
+#include "engine/state/kv/paged.h"
 
 #include <cstdint>
 #include <memory>

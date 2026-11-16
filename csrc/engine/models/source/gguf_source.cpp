@@ -2,7 +2,7 @@
 
 #include "engine/models/source/gguf.h"
 #include "engine/models/source/legacy_names.h"
-#include "engine/weights/gguf.h"
+#include "engine/weights/prepare/gguf.h"
 
 #include "nlohmann/json.hpp"
 

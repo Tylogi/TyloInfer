@@ -1,10 +1,10 @@
 #include "eval/reference.h"
 #include "components/error.h"
 #include "engine/program.h"
-#include "engine/models/layers.h"
+#include "engine/models/views/layers.h"
 #include "engine/backends/cuda/executor/config.h"
 #include "engine/backends/cuda/executor/executor.h"
-#include "engine/ops.h"
+#include "engine/ops/ops.h"
 
 #include <algorithm>
 #include <cstdio>

@@ -1,6 +1,6 @@
 #include "prefix_blocks.h"
 #include "../disk_budget.h"
-#include "engine/weights/encoding/file_read_window.h"
+#include "engine/weights/encoding/readers/window.h"
 #include "components/io/file_range_reader.h"
 
 #include <algorithm>

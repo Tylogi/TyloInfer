@@ -1,6 +1,6 @@
-#include "selected_attention.h"
-#include "selected_raw.h"
-#include "sparse_mma_raw.h"
+#include "engine/backends/cuda/kernels/attention/selected.h"
+#include "engine/backends/cuda/kernels/attention/selected_raw.h"
+#include "engine/backends/cuda/kernels/attention/sparse_mma_raw.h"
 #include "env.h"
 #include <algorithm>
 #include <climits>

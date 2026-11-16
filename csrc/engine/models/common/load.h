@@ -1,7 +1,7 @@
 #pragma once
 
 #include "engine/models/source/model_config.h"
-#include "engine/ops.h"
+#include "engine/ops/ops.h"
 
 #include <memory>
 #include <string>

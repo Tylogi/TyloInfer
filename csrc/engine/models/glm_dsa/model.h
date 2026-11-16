@@ -4,7 +4,7 @@
 #include "engine/models/metadata.h"
 #include "engine/models/causal_model.h"
 #include "engine/models/source/model_graph.h"
-#include "engine/models/source.h"
+#include "engine/models/source/model.h"
 #include "engine/backends/cuda/ops/rope/rope.h"
 #include "engine/backends/cuda/ops/ffn/ffn.h"
 #include "engine/weights/moe/experts.h"

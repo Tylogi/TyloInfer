@@ -6,7 +6,7 @@
 #include "engine/weights/format.h"
 #include "engine/weights/loader.h"
 #include "engine/models/minicpmo45/media.h"
-#include "engine/ops.h"
+#include "engine/ops/ops.h"
 
 #include "engine/generation/sequence.h"
 #include "backend.h"

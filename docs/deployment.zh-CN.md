@@ -56,7 +56,7 @@ Linux 用 `export TYLOINFER_SERVER_API_KEY='replace-with-your-secret'`。
 | 上下文 `--context-size` | `0`：采用已保存的模型策略，或模型声明的上下文上限；并非固定 32K | 从 `32768` 开始，按实际需求增大。过大的 KV 预算会减少专家缓存、增加 RAM 压力 |
 | PP 分块 `--prefill-chunk-size` | 默认 `auto`；CUDA 按待处理输入和当前工作区预算选择，最大 `8192` | 通常省略。需要限制峰值时可设 `4096` 等较小上限；预算不足时仍会缩小 |
 | GPU 专家缓存 `--moe-gpu-cache-gb` | 在受支持路径上按显存和模型自动规划 | 通常省略。`0` 表示专家全部常驻，并非关闭专家缓存；不要直接填显卡总容量 |
-| 专家 RAM / SSD | RAM 能容纳完整专家集时预加载；不足时自动使用有界 RAM 缓存和 SSD 专家流式 | SSD 模式优先使用本机 NVMe。它能运行更大的模型，速度受磁盘读取影响 |
+| 专家 RAM / SSD | CUDA TQ 专家优先进入显存，其余进入有界 RAM 缓存；两级都放不下的专家从 SSD 读取 | 通常保留自动预算。GPU / RAM 不长期保存同一专家的重复副本；SSD 模式优先使用本机 NVMe |
 | KV | CUDA 默认预分配，KV 量化和 SSD KV 默认关闭 | 保持默认作为起点；需要长上下文时再配置[KV 内存策略](runtime/cuda-kv-memory.md) |
 | 并发 | CUDA 每个模型默认 1 个请求 | 有并发需求再加 `--max-requests-per-runtime 2`；更多并发会增加 KV 和工作区需求 |
 | 前缀缓存 | 默认开启 | 多轮对话保留它；SSD 前缀缓存与 SSD KV 是不同功能 |
@@ -64,6 +64,15 @@ Linux 用 `export TYLOINFER_SERVER_API_KEY='replace-with-your-secret'`。
 Auto 会保留专家传输缓冲区，并在支持的整层路径中临时借用可归还的专家缓存。
 8192 是单次计算块的上限，**不要求整段长输入一次放进显存**。Flash-Next 可以在内部按层
 处理一个逻辑段，因此日志里的逻辑段长度可能更大。普通 decode 和 MTP 使用同一分块选择。
+
+CUDA TQ 缓存将显存淘汰的专家优先移入 RAM；RAM 预算或物理内存不足时才丢弃缓存，
+后续按需从 SSD 重读。RAM 预加载保留工作区和系统余量，不再固定空出一半可用内存。
+TQ prefill 根据实际工作区请求回收专家缓存。加载和 decode 的空闲显存余量由
+`TYLOINFER_CUDA_WORKSPACE_RESERVE_GIB` 控制，默认 4 GiB；它不是已经分配的计算缓冲区。
+直接设为 0 虽可提高加载时的权重驻留量，但可能增加后续换入换出和分配器碎片。
+`TYLOINFER_MOE_HOST_CACHE_BYTES` 和 `TYLOINFER_MOE_HOST_PHYSICAL_BYTES` 的旧手工限制
+可能阻止剩余专家进入 RAM；通常省略它们。不要用 `--moe-gpu-cache-gb 0` 表示
+“显存 + 内存放全”：这个值要求专家全部进入显存。
 
 以上 CLI 参数应用于 `--model` 的启动加载。如果先启动空服务、稍后通过 API 加载模型，
 也要在加载请求中填写上下文；分块可省略，默认 Auto，例如保存为 `load.json`：
@@ -136,9 +145,11 @@ decode 不包含首 token 出来前的等待。
 
 1. **是否使用当前源码的 Release 运行时**，启动日志会打印选中的二进制路径。
 2. **实际上下文和分块**是否为预期值，尤其是空服务后续加载时是否仍用了默认参数。
-3. **专家是否转入 SSD 模式**：`moe_ssd_experts_ready` 表示 SSD 专家流式；
-   `moe_residency_ready` 中的 `ram_registered_bytes` 可查看 RAM 锁页量，
-   `disk_reads_sealed=1` 表示完整预加载后的专家读取已封存，PLE 等独立流式表仍可读 SSD。
+3. **专家是否转入 SSD 模式**：CUDA TQ 路径查看 `/api/v1/runtime/status` 中的
+   `ssd_expert_payload_bytes`，为 `0` 表示当前所有专家均由 GPU / RAM 缓存覆盖；
+   请求前后比较 `ssd_expert_bytes_read`，判断推理是否重读专家。预加载本身也计入累计读取量。
+   旧专家路径使用 `moe_ssd_experts_ready` / `moe_residency_ready` 日志，
+   `disk_reads_sealed=1` 表示该路径已封存专家读取。PLE 等独立流式表仍可读 SSD。
 4. **显存 / RAM 是否紧张**：过大的上下文、固定专家缓存、额外模型和其他进程都会占用预算。
    `runtime_prefill_plan` 显示 Auto 实际选择的计算块和传输预算；
    `runtime_prefill_chunk_budget` 表示借用专家缓存后仍需进一步缩小；先查看资源占用。

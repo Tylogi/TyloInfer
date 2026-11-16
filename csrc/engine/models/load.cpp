@@ -3,7 +3,7 @@
 #include "engine/models/causal_model.h"
 #include "engine/models/qwen35/load.h"
 #include "engine/models/qwen4_exp/load.h"
-#include "engine/models/source.h"
+#include "engine/models/source/model.h"
 #include "engine/models/source/model_graph.h"
 
 #if TYLOINFER_HAS_CUDA

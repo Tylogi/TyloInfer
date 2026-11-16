@@ -1,5 +1,5 @@
 # Keep storage and load accounting separate from DenseTensor numerical operations.
-add_library(mfq-tensor STATIC tensor.cpp views.cpp dense_tensor.cpp weights/memory.cpp)
+add_library(mfq-tensor STATIC tensor/tensor.cpp tensor/views.cpp tensor/dense.cpp weights/memory.cpp)
 add_library(mfq::tensor ALIAS mfq-tensor)
 target_include_directories(mfq-tensor PUBLIC ${PROJECT_SOURCE_DIR})
 target_compile_features(mfq-tensor PUBLIC cxx_std_20)
@@ -13,23 +13,23 @@ set_target_properties(mfq-tensor PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 add_library(mfq-engine STATIC
     config.cpp
-    storage_ops.cpp
-    math_ops.cpp
-    projection_ops.cpp
-    rope_ops.cpp
-    sampling_ops.cpp
-    read_ops.cpp
+    ops/storage.cpp
+    ops/math.cpp
+    ops/projection.cpp
+    ops/rope.cpp
+    ops/sampling.cpp
+    ops/read.cpp
     engine.cpp
     executor.cpp
-    budget.cpp
-    kv_budget.cpp
-    kv_ops.cpp
-    generation/batch_driver.cpp
-    generation/batch_ops.cpp
+    memory/budget.cpp
+    memory/kv.cpp
+    ops/kv.cpp
+    generation/batch/driver.cpp
+    generation/batch/ops.cpp
     generation/decode.cpp
     generation/generation.cpp
-    generation/prefill.cpp
-    generation/preparation.cpp
+    generation/prefill/prefill.cpp
+    generation/prefill/preparation.cpp
     generation/mtp/metrics.cpp
     generation/mtp/generation.cpp
     generation/mtp/sampling.cpp
@@ -81,14 +81,14 @@ add_library(mfq-engine STATIC
     state/session/cache.cpp
     state/session/prefix_cache.cpp
     state/session/sessions.cpp
-    state/qsa_sequence.cpp
-    state/recurrent.cpp
-    state/recurrent_layout.cpp
-    state/kv_view.cpp
-    state/kv_layout.cpp
-    state/paged_kv.cpp
-    state/kv_sequence.cpp
-    state/kv_offload.cpp
+    state/kv/qsa_sequence.cpp
+    state/recurrent/state.cpp
+    state/recurrent/layout.cpp
+    state/kv/view.cpp
+    state/kv/layout.cpp
+    state/kv/paged.cpp
+    state/kv/sequence.cpp
+    state/kv/offload.cpp
 )
 target_compile_definitions(mfq-engine PRIVATE
     TYLOINFER_ENABLE_MFQ_COMPAT=$<BOOL:${TYLOINFER_ENABLE_MFQ_COMPAT}>

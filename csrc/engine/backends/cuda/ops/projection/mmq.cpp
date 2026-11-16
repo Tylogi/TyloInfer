@@ -1,7 +1,7 @@
 #include "mmq.h"
 #include "quant_linear.h"
 #include "engine/weights/encoding/format_features.h"
-#include "engine/backends/cuda/kernels/mfq_cuda_quant_ops.h"
+#include "engine/backends/cuda/ops/projection/quant.h"
 
 #include <stdexcept>
 

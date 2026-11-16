@@ -1,8 +1,8 @@
 #include "engine/backends/cuda/ops/attention/attention.h"
 
-#include "engine/backends/cuda/kernels/mfq_cuda_attention_ops.h"
-#include "engine/backends/cuda/kernels/mfq_cuda_paged_kv.h"
-#include "engine/backends/cuda/kernels/deepseek_v4_attention.h"
+#include "engine/backends/cuda/ops/attention/launch.h"
+#include "engine/backends/cuda/ops/attention/kv/paged.h"
+#include "engine/backends/cuda/kernels/attention/deepseek_v4.h"
 #include "engine/backends/cuda/executor/executor.h"
 #include "engine/backends/cuda/ops/attention/scratch.h"
 

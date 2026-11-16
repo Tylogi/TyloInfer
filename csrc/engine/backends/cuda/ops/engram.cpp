@@ -1,6 +1,6 @@
 #include "engine/ops/engram.h"
-#include "engine/ops.h"
-#include "engine/backends/cuda/kernels/deepseek_v41.h"
+#include "engine/ops/ops.h"
+#include "engine/backends/cuda/kernels/attention/deepseek_v41.h"
 #include "backend.h"
 #include <utility>
 

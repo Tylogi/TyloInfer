@@ -1,6 +1,6 @@
 #pragma once
 
-#include "engine/tensor.h"
+#include "engine/tensor/tensor.h"
 #include "engine/weights/bias.h"
 #include "engine/weights/moe/options.h"
 #include "engine/weights/placement.h"

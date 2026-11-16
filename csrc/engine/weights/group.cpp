@@ -1,7 +1,7 @@
 #include "engine/weights/group.h"
 
 #include "engine/backends/cuda/ops/projection/projection.h"
-#include "engine/weights/encoding/tq.h"
+#include "engine/weights/encoding/tq/tensor.h"
 
 #include <stdexcept>
 #include <utility>

@@ -12,7 +12,7 @@ namespace tyloi { struct TensorStorage; }
 #include <string>
 #include <vector>
 #include <mlx/mlx.h>
-#include "engine/tensor.h"
+#include "engine/tensor/tensor.h"
 
 namespace tyloi::metal {
 class MfqContainer;

@@ -1,7 +1,7 @@
 #pragma once
 
 #include "engine/backends/cuda/ops/ffn/options.h"
-#include "engine/ops.h"
+#include "engine/ops/ops.h"
 
 #include <memory>
 #include <optional>

@@ -1,14 +1,14 @@
 #pragma once
-#include "engine/backends/cuda/kernels/mfq_cuda_linear_attention_ops.h"
+#include "engine/backends/cuda/ops/attention/gdn/launch.h"
 #include "engine/models/glm5_next/weights.h"
 #include "engine/models/glm5_next/state.h"
 #include "engine/models/metadata.h"
 #include "engine/models/causal_model.h"
 #include "engine/models/common/mtp.h"
-#include "engine/models/source.h"
+#include "engine/models/source/model.h"
 #include "engine/backends/cuda/ops/projection/quant_linear.h"
 #include "engine/models/common/attention_ops.h"
-#include "engine/backends/cuda/kernels/glm5_next.h"
+#include "engine/backends/cuda/ops/glm5_next.h"
 #include <array>
 
 namespace tyloi::cuda::glm5_next {

@@ -1,13 +1,13 @@
 #include "linear.h"
 #include "engine/ops/linear.h"
-#include "engine/state/recurrent.h"
+#include "engine/state/recurrent/state.h"
 #include "engine/backends/cuda/executor/executor.h"
 #define TYLOI_LINEAR_IMPL LinearCore
-#include "engine/ops.h"
+#include "engine/ops/ops.h"
 #include "engine/backends/cuda/ops/attention/attention.h"
 #include "engine/backends/cuda/ops/norm/rms.h"
-#include "engine/backends/cuda/kernels/mfq_cuda_linear_attention_ops.h"
-#include "engine/backends/cuda/kernels/mfq_cuda_norm_ops.h"
+#include "engine/backends/cuda/ops/attention/gdn/launch.h"
+#include "engine/backends/cuda/ops/norm/launch.h"
 #include "engine/backends/cuda/ops/projection/projection.h"
 
 #include <algorithm>

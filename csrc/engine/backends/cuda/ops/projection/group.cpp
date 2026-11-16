@@ -1,7 +1,7 @@
 #include "projection.h"
 
 #include "engine/backends/cuda/native/collectives.h"
-#include "engine/backends/cuda/kernels/mfq_cuda_quant_ops.h"
+#include "engine/backends/cuda/ops/projection/quant.h"
 #include "engine/backends/cuda/native/allocation.h"
 
 #include <algorithm>

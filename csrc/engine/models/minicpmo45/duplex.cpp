@@ -1,9 +1,9 @@
 #include "engine/models/minicpmo45/duplex.h"
 #include "engine/backends/cuda/executor/executor.h"
 #include "engine/backends/cuda/executor/options.h"
-#include "engine/backends/cuda/executor/sampling.h"
+#include "engine/backends/cuda/ops/sampling/sampler.h"
 #include "engine/backends/cuda/native/tensor/shape.h"
-#include "engine/state/kv_view.h"
+#include "engine/state/kv/view.h"
 #include "backend.h"
 
 #include <algorithm>

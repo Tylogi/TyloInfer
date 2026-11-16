@@ -6,7 +6,7 @@
 #include "engine/backends/cuda/native/tensor/backend.h"
 #include "engine/models/causal_model.h"
 #include "engine/models/minicpmo45/duplex.h"
-#include "engine/ops.h"
+#include "engine/ops/ops.h"
 #include "eval/tensors.h"
 #include "eval/minicpmo45.h"
 

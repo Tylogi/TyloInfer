@@ -1,6 +1,6 @@
 #include "engine/models/gemma4/forward.h"
 #include "engine/models/common/check.h"
-#include "engine/ops.h"
+#include "engine/ops/ops.h"
 
 #include <algorithm>
 #include <array>

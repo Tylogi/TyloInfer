@@ -1,5 +1,5 @@
 #include "engine/weights/encoding/rows.h"
-#include "engine/weights/encoding/tq_table.h"
+#include "engine/weights/encoding/tq/table.h"
 #if TYLOINFER_ENABLE_MFQ_COMPAT
 #include "engine/weights/encoding/quant/nint_rows.h"
 #endif

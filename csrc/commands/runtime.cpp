@@ -7,7 +7,7 @@
 #include "minicpmo45.h"
 #include "engine/program.h"
 #endif
-#include "engine/models/source.h"
+#include "engine/models/source/model.h"
 #include "engine/models/source/model_config.h"
 #include "transport/include/transport.h"
 #include "nlohmann/json.hpp"

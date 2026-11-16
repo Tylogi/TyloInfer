@@ -1,8 +1,8 @@
 #include "engine/models/qwen35/batch.h"
 #include "engine/models/common/check.h"
-#include "engine/ops.h"
-#include "engine/backends/cuda/executor/decode_window.h"
-#include "engine/backends/cuda/executor/decode_graph.h"
+#include "engine/ops/ops.h"
+#include "engine/backends/cuda/executor/graph/window.h"
+#include "engine/backends/cuda/executor/graph/decode.h"
 #include "engine/backends/cuda/executor/executor.h"
 #include "engine/backends/cuda/ops/attention/scratch.h"
 

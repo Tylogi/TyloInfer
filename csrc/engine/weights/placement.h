@@ -1,6 +1,6 @@
 #pragma once
 
-#include "engine/tensor.h"
+#include "engine/tensor/tensor.h"
 #include "engine/weights/tensor_parallel.h"
 
 #include <cstdint>

@@ -19,8 +19,8 @@ target_compile_features(mfq-model-graph PUBLIC cxx_std_17)
 set_target_properties(mfq-model-graph PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 add_library(mfq-model-source STATIC
-    ../source.cpp
-    ../source.h
+    model.cpp
+    model.h
     tq_fixture_source.cpp
     tq_fixture_source.h
     mfq_source.cpp

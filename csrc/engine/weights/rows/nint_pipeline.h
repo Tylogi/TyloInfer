@@ -1,0 +1,42 @@
+#pragma once
+#include "engine/tensor/tensor.h"
+#include "engine/weights/encoding/quant/nint_rows.h"
+#include <memory>
+#include <utility>
+namespace tyloi {class NintRowCache;}
+struct NintRowSource {
+    explicit NintRowSource(std::vector<std::shared_ptr<tyloi::NintRows>>);
+    const std::vector<std::shared_ptr<tyloi::NintRows>> tables;
+    const uint64_t identity;
+};
+class NintRowStage {
+public:
+    ~NintRowStage();
+    const ::tyloi::Tensor& output() const;
+    bool mapped_rows() const;
+    void decode();
+private:
+    friend class NintRowPipeline;
+    struct Impl;
+    explicit NintRowStage(std::unique_ptr<Impl>);
+    std::unique_ptr<Impl> impl_;
+};
+class NintRowPipeline {
+public:
+    explicit NintRowPipeline(std::shared_ptr<const NintRowSource>,
+        std::shared_ptr<tyloi::NintRowCache> cache={});
+    ~NintRowPipeline();
+    void issue(const std::vector<int64_t>& ids,const std::vector<int64_t>& shape,bool early_prefix=false);
+    ::tyloi::Tensor collect(const std::vector<int64_t>& ids,const std::vector<int64_t>& shape,
+        const ::tyloi::Device& device);
+    std::shared_ptr<NintRowStage> make_stage(const std::vector<int64_t>& shape,
+        const ::tyloi::Device& device);
+    std::size_t stage_bytes(const std::vector<int64_t>& shape, const ::tyloi::Device& device) const;
+    static std::pair<std::size_t, std::size_t> stage_growth(const NintRowSource&,
+        const std::vector<int64_t>& shape, const ::tyloi::Device& device);
+    void upload(NintRowStage&,const std::vector<int64_t>& ids,const std::vector<int64_t>& shape);
+private:
+    std::pair<std::size_t, bool> stage_layout(const std::vector<int64_t>& shape,
+        const ::tyloi::Device& device) const;
+    struct Impl;std::unique_ptr<Impl> impl_;
+};

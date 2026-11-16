@@ -3,7 +3,7 @@
 #include "engine/backends/cuda/ops/projection/projection.h"
 #include "engine/backends/cuda/ops/norm/layer.h"
 #include "engine/backends/cuda/ops/vision/attention.h"
-#include "engine/ops.h"
+#include "engine/ops/ops.h"
 #include "engine/weights/fields.h"
 #include "engine/weights/loader.h"
 #include "engine/generation/sequence.h"

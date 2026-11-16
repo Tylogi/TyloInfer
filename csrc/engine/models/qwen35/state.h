@@ -2,8 +2,8 @@
 
 #include "engine/models/session/snapshot.h"
 #include "engine/models/state.h"
-#include "engine/state/kv_view.h"
-#include "engine/state/recurrent.h"
+#include "engine/state/kv/view.h"
+#include "engine/state/recurrent/state.h"
 #include "engine/state/media.h"
 #include "engine/models/common/linear.h"
 

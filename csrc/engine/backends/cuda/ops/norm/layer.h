@@ -1,8 +1,8 @@
 #pragma once
 
 #include "backend.h"
-#include "engine/backends/cuda/kernels/mfq_cuda_norm_ops.h"
-#include "engine/ops.h"
+#include "engine/backends/cuda/ops/norm/launch.h"
+#include "engine/ops/ops.h"
 #include "engine/weights/fields.h"
 
 #include <memory>

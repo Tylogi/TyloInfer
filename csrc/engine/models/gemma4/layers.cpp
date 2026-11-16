@@ -4,10 +4,10 @@
 #include "engine/backends/cuda/native/tensor/backend.h"
 #include "engine/models/gemma4/forward.h"
 #include "engine/models/gemma4/load.h"
-#include "engine/models/layers.h"
+#include "engine/models/views/layers.h"
 #include "engine/models/load.h"
 #include "engine/weights/loader.h"
-#include "engine/weights/rows.h"
+#include "engine/weights/rows/rows.h"
 
 #include "nlohmann/json.hpp"
 

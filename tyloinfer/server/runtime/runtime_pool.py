@@ -4533,14 +4533,6 @@ class RuntimePool:
     def _cuda_expert_host_budget(self, artifact: DiscoveredModel, request: ModelLoadRequest) -> int:
         return self._cuda_expert_host_budget_plan(artifact, request).bytes
 
-    @staticmethod
-    def _cuda_expert_preload_bytes(artifact: DiscoveredModel) -> int:
-        """Host bytes held by the complete preload of the routed expert set."""
-        # Preload keeps a host image of every routed expert, including the ones
-        # uploaded to the GPU cache, so the requirement is not the cold subset.
-        # The native guard is moe_preload_fits_host() on the same definition.
-        return max(0, artifact.routed_expert_bytes)
-
     def _cuda_expert_host_budget_plan(
         self, artifact: DiscoveredModel, request: ModelLoadRequest
     ) -> _ExpertHostBudget:
@@ -4612,10 +4604,6 @@ class RuntimePool:
                     and supports_cuda_ram_expert_pipeline(artifact.path)):
                 budget = self._cuda_expert_host_budget(artifact, request)
                 host_experts = min(host_experts, budget)
-                if budget >= self._cuda_expert_preload_bytes(artifact):
-                    # Preload keeps the complete routed set in host memory,
-                    # including experts mirrored in the GPU cache.
-                    host_experts = self._cuda_expert_preload_bytes(artifact)
             available = max(0, available - host_experts - (2 << 30))
             limit = available if limit is None else min(limit, available)
         return limit
@@ -4702,11 +4690,11 @@ class RuntimePool:
                     host_budget, budget.physical_bytes, budget.commit_bytes,
                     budget.commit_available_bytes, budget.commit_footprint_bytes,
                 )
-            preload_bytes = self._cuda_expert_preload_bytes(artifact)
+            preload_bytes = max(0, artifact.routed_expert_bytes)
             if supports_cuda_ram_expert_pipeline(artifact.path):
-                # Preload needs room for the complete routed set, not only for
-                # the experts missing from the GPU cache; otherwise Windows
-                # commit (and physical RAM on Linux) is exhausted after load.
+                # TQ tiers own disjoint images. Native workspace and allocator
+                # headroom can still reduce the planned GPU coverage at load.
+                preload_bytes = max(0, preload_bytes - int(request.moe_gpu_cache_gb * (1 << 30)))
                 streaming = (
                     host_budget < preload_bytes
                     or process_environment.get("TYLOINFER_MOE_PRELOAD_ALL") == "0"
@@ -4743,10 +4731,10 @@ class RuntimePool:
                 if streaming:
                     process_environment["TYLOINFER_MOE_PRELOAD_ALL"] = "0"
                     process_environment["TYLOINFER_MOE_ASSERT_RESIDENT"] = "0"
-                    # Bulk expert images bypass the OS cache; sparse PLE rows
-                    # retain batched mapped reads. Native LRUs own copied data.
-                    if process_environment.setdefault("TYLOINFER_MODEL_FILE_IO", "direct") == "direct":
-                        process_environment.setdefault("TYLOINFER_PLE_FILE_MAP", "1")
+                # Bulk expert images bypass the OS cache even when all fit in
+                # GPU + RAM; sparse PLE rows retain batched mapped reads.
+                if process_environment.setdefault("TYLOINFER_MODEL_FILE_IO", "direct") == "direct":
+                    process_environment.setdefault("TYLOINFER_PLE_FILE_MAP", "1")
             else:
                 if host_budget < preload_bytes:
                     raise _job_error("runtime_ram_expert_budget_exceeded",

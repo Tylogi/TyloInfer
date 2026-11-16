@@ -1,10 +1,10 @@
 #pragma once
 
 #include "backend.h"
-#include "engine/backends/cuda/kernels/mfq_cuda_kv_quantization.h"
+#include "engine/backends/cuda/ops/attention/kv/quantization.h"
 #include "engine/backends/cuda/native/profile.h"
 #include "scratch.h"
-#include "engine/ops.h"
+#include "engine/ops/ops.h"
 
 #include <cstdint>
 #include <stdexcept>

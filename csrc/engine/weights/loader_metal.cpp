@@ -1,14 +1,14 @@
 #include "engine/weights/loader.h"
-#include "engine/weights/cache.h"
-#include "engine/weights/encoding/dense_blob.h"
+#include "engine/weights/cache/cache.h"
+#include "engine/weights/encoding/dense/blob.h"
 #include "engine/weights/encoding/metal.h"
 #include "engine/weights/encoding/rows.h"
 #include "engine/weights/memory.h"
-#include "engine/weights/row_source.h"
+#include "engine/weights/rows/source.h"
 #include "engine/weights/tq/source.h"
 #include "engine/backends/metal/native/tensor/tensor.h"
 #include "engine/backends/metal/native/stream.h"
-#include "engine/ops.h"
+#include "engine/ops/ops.h"
 
 #include <algorithm>
 #include <cstring>

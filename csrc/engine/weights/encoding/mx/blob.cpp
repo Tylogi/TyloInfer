@@ -1,0 +1,207 @@
+#include "blob.h"
+
+#include "../bytes.h"
+
+#include <algorithm>
+#include <cstddef>
+#include <cstring>
+#include <limits>
+#include <stdexcept>
+#include <string>
+
+namespace tyloi {
+namespace {
+
+static std::uint64_t u64(const std::vector<std::uint8_t>& data, std::size_t& offset) {
+    std::uint64_t result;
+    std::memcpy(&result, data.data() + offset, sizeof(result));
+    offset += sizeof(result);
+    return result;
+}
+
+static size_t checked_size(
+        uint64_t left, uint64_t right,
+        const char * label) {
+    if (left == 0 || right == 0 ||
+            left > std::numeric_limits<size_t>::max() / right) {
+        throw std::runtime_error(
+            std::string("invalid MXFP8 ") + label);
+    }
+    return static_cast<size_t>(left * right);
+}
+
+} // namespace
+
+namespace mx {
+
+std::vector<std::byte> prefix(
+    std::string_view dtype,
+    const std::vector<std::int64_t>& logical_shape,
+    const std::vector<std::int64_t>& storage_shape,
+    const std::vector<std::int64_t>& scale_shape,
+    const std::string& name) {
+    if (logical_shape.size() != 2 || storage_shape.size() != 2 ||
+        scale_shape.size() != 2) {
+        throw std::runtime_error("native MX tensor must be rank two: " + name);
+    }
+    const auto rows = logical_shape[0];
+    const auto columns = logical_shape[1];
+    if (rows <= 0 || columns <= 0 || columns % 32 != 0) {
+        throw std::runtime_error("invalid native MX tensor shape: " + name);
+    }
+    const std::vector<std::int64_t> expected_storage = dtype == "MXFP4"
+        ? std::vector<std::int64_t>{rows, columns / 2}
+        : std::vector<std::int64_t>{rows, columns};
+    bool valid_scales = false;
+    if (dtype == "MXFP4") {
+        valid_scales = scale_shape ==
+            std::vector<std::int64_t>{rows, columns / 32};
+    } else {
+        valid_scales =
+            scale_shape == std::vector<std::int64_t>{rows, columns / 32} ||
+            scale_shape == std::vector<std::int64_t>{
+                (rows + 31) / 32, columns / 32} ||
+            (columns % 128 == 0 &&
+             scale_shape == std::vector<std::int64_t>{
+                 (rows + 127) / 128, columns / 128});
+    }
+    if (storage_shape != expected_storage || !valid_scales) {
+        throw std::runtime_error("invalid native MX storage geometry: " + name);
+    }
+    constexpr std::uint64_t kMxHeaderBytes = 56;
+    std::vector<std::byte> result;
+    result.reserve(kMxHeaderBytes);
+    for (const char value : std::string_view("MXT1")) {
+        result.push_back(static_cast<std::byte>(value));
+    }
+    result.push_back(std::byte{1});
+    result.push_back(dtype == "MXFP4" ? std::byte{4} : std::byte{8});
+    encoding::append_little<std::uint16_t>(result, 0);
+    for (const auto dimension : logical_shape) {
+        encoding::append_little<std::uint64_t>(
+            result, static_cast<std::uint64_t>(dimension));
+    }
+    for (const auto dimension : storage_shape) {
+        encoding::append_little<std::uint64_t>(
+            result, static_cast<std::uint64_t>(dimension));
+    }
+    for (const auto dimension : scale_shape) {
+        encoding::append_little<std::uint64_t>(
+            result, static_cast<std::uint64_t>(dimension));
+    }
+    return result;
+}
+
+} // namespace mx
+
+namespace mxfp8 {
+
+Data unpack(
+        const std::vector<uint8_t> & blob) {
+    constexpr size_t kHeaderBytes = 56;
+    if (blob.size() < kHeaderBytes ||
+            std::memcmp(blob.data(), "MXT1", 4) != 0 ||
+            blob[4] != 1 || blob[5] != 8 ||
+            blob[6] != 0 || blob[7] != 0) {
+        throw std::runtime_error("invalid MXFP8 payload header");
+    }
+    size_t offset = 8;
+    const uint64_t rows = u64(blob, offset);
+    const uint64_t columns = u64(blob, offset);
+    const uint64_t storage_rows = u64(blob, offset);
+    const uint64_t storage_columns = u64(blob, offset);
+    const uint64_t scale_rows = u64(blob, offset);
+    const uint64_t scale_columns = u64(blob, offset);
+    const bool block128=columns%128==0 && scale_rows==(rows+127)/128 && scale_columns==columns/128;
+    const bool block32=columns%32==0 && scale_rows==(rows+31)/32 && scale_columns==columns/32;
+    const bool row32=columns%32==0 && scale_rows==rows && scale_columns==columns/32;
+    if (!rows || !columns || rows > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
+            columns > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
+            storage_rows != rows || storage_columns != columns || !(block128 || block32 || row32)) {
+        throw std::runtime_error("invalid MXFP8 payload geometry");
+    }
+    const size_t value_bytes = checked_size(
+        storage_rows, storage_columns, "value size");
+    const size_t scale_bytes = checked_size(
+        scale_rows, scale_columns, "scale size");
+    if (value_bytes > blob.size() - offset ||
+            scale_bytes != blob.size() - offset - value_bytes) {
+        throw std::runtime_error("invalid MXFP8 payload length");
+    }
+    Data result;
+    result.block_columns=block128?128:32;
+    result.block_rows=block128?128:row32?1:32;
+    result.out = static_cast<int64_t>(rows);
+    result.neuron_len = static_cast<int64_t>(columns);
+    result.values.assign(
+        blob.begin() + static_cast<ptrdiff_t>(offset),
+        blob.begin() + static_cast<ptrdiff_t>(offset + value_bytes));
+    offset += value_bytes;
+    result.scales.assign(
+        blob.begin() + static_cast<ptrdiff_t>(offset),
+        blob.end());
+    if (std::any_of(
+            result.values.begin(), result.values.end(),
+            [](uint8_t value) { return (value & 0x7fu) == 0x7fu; })) {
+        throw std::runtime_error("MXFP8 payload contains an E4M3 NaN code");
+    }
+    if (std::find(result.scales.begin(), result.scales.end(), 255u) !=
+            result.scales.end()) {
+        throw std::runtime_error("MXFP8 payload contains an E8M0 NaN scale");
+    }
+    return result;
+}
+
+} // namespace mxfp8
+
+namespace mxfp4 {
+
+Data unpack(
+        const std::vector<uint8_t> & blob) {
+    constexpr size_t kHeaderBytes = 56;
+    if (blob.size() < kHeaderBytes ||
+            std::memcmp(blob.data(), "MXT1", 4) != 0 ||
+            blob[4] != 1 || blob[5] != 4 ||
+            blob[6] != 0 || blob[7] != 0) {
+        throw std::runtime_error("invalid MXFP4 payload header");
+    }
+    size_t offset = 8;
+    const uint64_t rows = u64(blob, offset);
+    const uint64_t columns = u64(blob, offset);
+    const uint64_t storage_rows = u64(blob, offset);
+    const uint64_t storage_columns = u64(blob, offset);
+    const uint64_t scale_rows = u64(blob, offset);
+    const uint64_t scale_columns = u64(blob, offset);
+    if (rows > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
+            columns > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
+            columns % 32 != 0 || storage_rows != rows ||
+            storage_columns != columns / 2 || scale_rows != rows ||
+            scale_columns != columns / 32) {
+        throw std::runtime_error("invalid MXFP4 payload geometry");
+    }
+    const size_t value_bytes = checked_size(
+        storage_rows, storage_columns, "MXFP4 value size");
+    const size_t scale_bytes = checked_size(
+        scale_rows, scale_columns, "MXFP4 scale size");
+    if (value_bytes > blob.size() - offset ||
+            scale_bytes != blob.size() - offset - value_bytes) {
+        throw std::runtime_error("invalid MXFP4 payload length");
+    }
+    Data result;
+    result.out = static_cast<int64_t>(rows);
+    result.neuron_len = static_cast<int64_t>(columns);
+    result.values.assign(
+        blob.begin() + static_cast<ptrdiff_t>(offset),
+        blob.begin() + static_cast<ptrdiff_t>(offset + value_bytes));
+    offset += value_bytes;
+    result.scales.assign(
+        blob.begin() + static_cast<ptrdiff_t>(offset), blob.end());
+    if (std::find(result.scales.begin(), result.scales.end(), 255u) !=
+            result.scales.end()) {
+        throw std::runtime_error("MXFP4 payload contains an E8M0 NaN scale");
+    }
+    return result;
+}
+
+} // namespace mxfp4
+} // namespace tyloi

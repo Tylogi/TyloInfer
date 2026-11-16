@@ -1,6 +1,6 @@
 if(TYLOINFER_ENABLE_MFQ_COMPAT)
 add_library(mfq-cuda-storage STATIC
-    ${PROJECT_SOURCE_DIR}/engine/weights/moe/expert_store.cpp
+    ${PROJECT_SOURCE_DIR}/engine/weights/moe/prepare/expert_store.cpp
 )
 add_library(mfq::cuda-storage ALIAS mfq-cuda-storage)
 target_include_directories(mfq-cuda-storage PUBLIC ${PROJECT_SOURCE_DIR})
@@ -40,30 +40,30 @@ set(TYLOINFER_CUDA_LOADING_SOURCES
     ${PROJECT_SOURCE_DIR}/engine/weights/tq/routed.cpp
     ${PROJECT_SOURCE_DIR}/engine/weights/tq/rows.cpp
     ${PROJECT_SOURCE_DIR}/engine/weights/encoding/rows.cpp
-    ${PROJECT_SOURCE_DIR}/engine/weights/row_source.cpp
-    ${PROJECT_SOURCE_DIR}/engine/weights/row_stage.cpp
-    ${PROJECT_SOURCE_DIR}/engine/weights/rows.cpp
+    ${PROJECT_SOURCE_DIR}/engine/weights/rows/source.cpp
+    ${PROJECT_SOURCE_DIR}/engine/weights/rows/stage.cpp
+    ${PROJECT_SOURCE_DIR}/engine/weights/rows/rows.cpp
     ${PROJECT_SOURCE_DIR}/engine/weights/loader.cpp
-    ${PROJECT_SOURCE_DIR}/engine/weights/routed_cache.cpp
-    ${PROJECT_SOURCE_DIR}/engine/weights/workspace.cpp
+    ${PROJECT_SOURCE_DIR}/engine/weights/cache/routed.cpp
+    ${PROJECT_SOURCE_DIR}/engine/weights/cache/workspace.cpp
     ${PROJECT_SOURCE_DIR}/engine/weights/group.cpp
     ${PROJECT_SOURCE_DIR}/engine/weights/format.cpp
-    ${PROJECT_SOURCE_DIR}/engine/weights/quant.cpp
+    ${PROJECT_SOURCE_DIR}/engine/weights/prepare/quant.cpp
     ${PROJECT_SOURCE_DIR}/engine/weights/moe/experts.cpp
     ${PROJECT_SOURCE_DIR}/engine/weights/moe/batch.cpp
     ${PROJECT_SOURCE_DIR}/engine/models/common/load.cpp
 )
 if(TYLOINFER_ENABLE_MFQ_COMPAT)
     list(APPEND TYLOINFER_CUDA_LOADING_SOURCES
-    ${PROJECT_SOURCE_DIR}/engine/weights/moe/expert_cache.cpp
-    ${PROJECT_SOURCE_DIR}/engine/weights/moe/load.cpp
-    ${PROJECT_SOURCE_DIR}/engine/weights/moe/prepare.cpp
-    ${PROJECT_SOURCE_DIR}/engine/weights/moe/quant_range_source.cpp
-    ${PROJECT_SOURCE_DIR}/engine/weights/moe/host_expert_cache.cpp
-    ${PROJECT_SOURCE_DIR}/engine/weights/moe/residency.cpp
-    ${PROJECT_SOURCE_DIR}/engine/weights/nint_row_pipeline.cpp
-    ${PROJECT_SOURCE_DIR}/engine/weights/nint.cpp
-    ${PROJECT_SOURCE_DIR}/engine/weights/vq.cpp
+    ${PROJECT_SOURCE_DIR}/engine/weights/moe/residency/expert_cache.cpp
+    ${PROJECT_SOURCE_DIR}/engine/weights/moe/prepare/load.cpp
+    ${PROJECT_SOURCE_DIR}/engine/weights/moe/prepare/prepare.cpp
+    ${PROJECT_SOURCE_DIR}/engine/weights/moe/prepare/quant_range_source.cpp
+    ${PROJECT_SOURCE_DIR}/engine/weights/moe/host/cache.cpp
+    ${PROJECT_SOURCE_DIR}/engine/weights/moe/residency/residency.cpp
+    ${PROJECT_SOURCE_DIR}/engine/weights/rows/nint_pipeline.cpp
+    ${PROJECT_SOURCE_DIR}/engine/weights/prepare/nint.cpp
+    ${PROJECT_SOURCE_DIR}/engine/weights/prepare/vq.cpp
     )
 else()
     list(APPEND TYLOINFER_CUDA_LOADING_SOURCES

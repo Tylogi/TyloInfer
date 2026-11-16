@@ -1,7 +1,7 @@
 #pragma once
 
 #include "engine/models/qwen35/config.h"
-#include "engine/ops.h"
+#include "engine/ops/ops.h"
 #include "engine/models/common/load.h"
 #include "engine/models/common/ffn.h"
 

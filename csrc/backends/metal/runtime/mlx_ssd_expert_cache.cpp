@@ -1,4 +1,4 @@
-#include "engine/weights/moe/cache_policy.h"
+#include "engine/weights/moe/residency/cache_policy.h"
 #include "mlx_ssd_expert_cache.h"
 #include "mlx_resource_telemetry.h"
 

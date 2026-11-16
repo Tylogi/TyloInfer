@@ -1,7 +1,7 @@
 #pragma once
 
 #include "engine/models/session/snapshot.h"
-#include "engine/tensor.h"
+#include "engine/tensor/tensor.h"
 #include "engine/models/state.h"
 #include "engine/models/input.h"
 #include "engine/generation/mtp/policy.h"

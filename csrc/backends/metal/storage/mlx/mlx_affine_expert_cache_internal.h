@@ -1,7 +1,7 @@
 #pragma once
 #include "mlx_affine_expert_cache.h"
 #include "mlx_expert_segment_cache.h"
-#include "engine/weights/encoding/mlx_affine.h"
+#include "engine/weights/encoding/mx/affine.h"
 #include <algorithm>
 #include <array>
 #include <climits>

@@ -1,9 +1,9 @@
 #pragma once
 #include "engine/backends/cpu/ops/projection/packed_nint.h"
 #include "engine/backends/cpu/ops/projection/nvq_group.h"
-#include "engine/weights/nint.h"
-#include "engine/weights/vq.h"
-#include "engine/weights/mx.h"
+#include "engine/weights/prepare/nint.h"
+#include "engine/weights/prepare/vq.h"
+#include "engine/weights/prepare/mx.h"
 #include <functional>
 
 // The plan borrows an immutable expert lease. It never converts activations

@@ -3,7 +3,7 @@
 #include "engine/executor.h"
 #include "engine/weights/encoding/format_features.h"
 #if TYLOINFER_ENABLE_MFQ_COMPAT
-#include "engine/weights/nint.h"
+#include "engine/weights/prepare/nint.h"
 #endif
 
 namespace tyloi::cuda {

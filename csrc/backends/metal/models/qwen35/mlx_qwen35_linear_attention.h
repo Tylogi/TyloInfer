@@ -2,7 +2,7 @@
 
 #include "mlx_projection_batch.h"
 #include "mlx_linear_attention.h"
-#include "engine/state/recurrent.h"
+#include "engine/state/recurrent/state.h"
 #include "engine/models/common/linear.h"
 #include "mlx_qwen35_full_attention.h"
 #include "qwen35_model.h"

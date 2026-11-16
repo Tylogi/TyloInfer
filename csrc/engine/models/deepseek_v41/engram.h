@@ -2,13 +2,13 @@
 
 #include "engine/weights/loader.h"
 
-#include "engine/weights/moe/expert_store.h"
+#include "engine/weights/moe/prepare/expert_store.h"
 #include "engine/models/deepseek_v41/config.h"
 #include "engine/models/deepseek_v41/hash.h"
 #include "engine/models/deepseek_v41/causal_lm.h"
 #include "engine/backends/cuda/ops/projection/quant_linear.h"
-#include "engine/ops.h"
-#include "engine/backends/cuda/kernels/deepseek_v41.h"
+#include "engine/ops/ops.h"
+#include "engine/backends/cuda/kernels/attention/deepseek_v41.h"
 
 #include <algorithm>
 #include <array>

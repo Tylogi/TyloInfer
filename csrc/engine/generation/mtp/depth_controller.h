@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../prefill_activity.h"
+#include "../prefill/activity.h"
 #include "engine/generation/mtp/limits.h"
 #include "batch_policy.h"
 #include "batch_policy_v1.h"

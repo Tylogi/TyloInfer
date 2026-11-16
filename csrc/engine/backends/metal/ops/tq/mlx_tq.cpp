@@ -10,7 +10,7 @@
 #include "engine/backends/metal/native/env.h"
 #include "engine/backends/metal/native/profile.h"
 #include "mlx_tq_rows.h"
-#include "engine/weights/encoding/tq_rows.h"
+#include "engine/weights/encoding/tq/rows.h"
 
 #include <mlx/allocator.h>
 #include <nlohmann/json.hpp>

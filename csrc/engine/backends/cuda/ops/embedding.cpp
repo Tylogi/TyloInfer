@@ -1,5 +1,5 @@
 #include "backend.h"
-#include "embedding_raw.h"
+#include "engine/backends/cuda/kernels/embedding/raw.h"
 #include "engine/backends/cuda/ops/row_stage.h"
 #include "engine/weights/encoding/rows.h"
 #include "engine/backends/cuda/native/memory.h"

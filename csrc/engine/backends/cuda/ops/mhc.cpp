@@ -1,6 +1,6 @@
 #include "engine/ops/mhc.h"
-#include "engine/backends/cuda/kernels/deepseek_v41.h"
-#include "engine/backends/cuda/kernels/deepseek_v4_hc.h"
+#include "engine/backends/cuda/kernels/attention/deepseek_v41.h"
+#include "engine/backends/cuda/kernels/ffn/hyperconnection.h"
 #include "backend.h"
 #include <utility>
 

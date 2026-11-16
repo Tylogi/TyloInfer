@@ -78,95 +78,95 @@ set_target_properties(mfq-cuda-core PROPERTIES
 )
 
 set(TYLOINFER_CUDA_KERNEL_SOURCES
-    ${TYLOINFER_CUDA_ROOT}/kernels/qsa_ram.cu
-    ${TYLOINFER_CUDA_ROOT}/kernels/qsa_tq.cu
-    ${TYLOINFER_CUDA_ROOT}/kernels/qsa_tq_fa.cu
-    ${TYLOINFER_CUDA_ROOT}/kernels/qsa_tq_encode.cu
-    ${TYLOINFER_CUDA_ROOT}/kernels/qsa_tq_fit.cu
-    ${TYLOINFER_CUDA_ROOT}/kernels/gguf.cu
-    ${TYLOINFER_CUDA_ROOT}/kernels/gguf_stream_plan.cu
-    ${TYLOINFER_CUDA_ROOT}/kernels/gguf_activation.cu
-    ${TYLOINFER_CUDA_ROOT}/kernels/gguf_dense_m1_aligned.cu
-    ${TYLOINFER_CUDA_ROOT}/kernels/gguf_m1_residual.cu
-    ${TYLOINFER_CUDA_ROOT}/kernels/gguf_quad_storage.cu
-    ${TYLOINFER_CUDA_ROOT}/kernels/gguf_quad_matvec.cu
-    ${TYLOINFER_CUDA_ROOT}/kernels/gguf_quad_small_m.cu
-    ${TYLOINFER_CUDA_ROOT}/kernels/gguf_quad_decode.cu
-    ${TYLOINFER_CUDA_ROOT}/kernels/qk_prepare.cu
-    ${TYLOINFER_CUDA_ROOT}/kernels/gguf_input.cu
-    ${TYLOINFER_CUDA_ROOT}/kernels/gguf_compact.cu
-    ${TYLOINFER_CUDA_ROOT}/kernels/gguf_compact_async.cu
-    ${TYLOINFER_CUDA_ROOT}/kernels/gguf_row_residual.cu
-    ${TYLOINFER_CUDA_ROOT}/kernels/gguf_residual.cu
-    ${TYLOINFER_CUDA_ROOT}/kernels/gguf_residual_prepare.cu
-    ${TYLOINFER_CUDA_ROOT}/kernels/gguf_q6_group.cu
-    ${TYLOINFER_CUDA_ROOT}/kernels/gguf_gemm.cu
-    ${TYLOINFER_CUDA_ROOT}/kernels/gguf_tensorcore.cu
-    ${TYLOINFER_CUDA_ROOT}/kernels/gguf_prefill_scale.cu
-    ${TYLOINFER_CUDA_ROOT}/kernels/gguf_mmq.cu
-    ${TYLOINFER_CUDA_ROOT}/kernels/gguf_window.cu
-    ${TYLOINFER_CUDA_ROOT}/kernels/dflash2.cu
-    ${TYLOINFER_CUDA_ROOT}/kernels/dflash2_gemm.cu
-    ${TYLOINFER_CUDA_ROOT}/kernels/dflash2_q4.cu
+    ${TYLOINFER_CUDA_ROOT}/kernels/attention/qsa/ram.cu
+    ${TYLOINFER_CUDA_ROOT}/kernels/attention/qsa/tq.cu
+    ${TYLOINFER_CUDA_ROOT}/kernels/attention/qsa/tq_fa.cu
+    ${TYLOINFER_CUDA_ROOT}/kernels/attention/qsa/tq_encode.cu
+    ${TYLOINFER_CUDA_ROOT}/kernels/attention/qsa/tq_fit.cu
+    ${TYLOINFER_CUDA_ROOT}/kernels/projection/gguf/linear.cu
+    ${TYLOINFER_CUDA_ROOT}/kernels/projection/gguf/routes/stream_plan.cu
+    ${TYLOINFER_CUDA_ROOT}/kernels/projection/gguf/activation.cu
+    ${TYLOINFER_CUDA_ROOT}/kernels/projection/gguf/dense/m1_aligned.cu
+    ${TYLOINFER_CUDA_ROOT}/kernels/projection/gguf/residual/m1_residual.cu
+    ${TYLOINFER_CUDA_ROOT}/kernels/projection/gguf/quad/storage.cu
+    ${TYLOINFER_CUDA_ROOT}/kernels/projection/gguf/quad/matvec.cu
+    ${TYLOINFER_CUDA_ROOT}/kernels/projection/gguf/quad/small_m.cu
+    ${TYLOINFER_CUDA_ROOT}/kernels/projection/gguf/quad/decode.cu
+    ${TYLOINFER_CUDA_ROOT}/kernels/norm/qk.cu
+    ${TYLOINFER_CUDA_ROOT}/kernels/projection/gguf/input.cu
+    ${TYLOINFER_CUDA_ROOT}/kernels/projection/gguf/compact/compact.cu
+    ${TYLOINFER_CUDA_ROOT}/kernels/projection/gguf/compact/async.cu
+    ${TYLOINFER_CUDA_ROOT}/kernels/projection/gguf/residual/row_residual.cu
+    ${TYLOINFER_CUDA_ROOT}/kernels/projection/gguf/residual/residual.cu
+    ${TYLOINFER_CUDA_ROOT}/kernels/projection/gguf/residual/residual_prepare.cu
+    ${TYLOINFER_CUDA_ROOT}/kernels/projection/gguf/q6_group.cu
+    ${TYLOINFER_CUDA_ROOT}/kernels/projection/gguf/gemm.cu
+    ${TYLOINFER_CUDA_ROOT}/kernels/projection/gguf/tensorcore.cu
+    ${TYLOINFER_CUDA_ROOT}/kernels/projection/gguf/prefill/scale.cu
+    ${TYLOINFER_CUDA_ROOT}/kernels/projection/gguf/mmq/mmq.cu
+    ${TYLOINFER_CUDA_ROOT}/kernels/projection/gguf/window.cu
+    ${TYLOINFER_CUDA_ROOT}/kernels/attention/dflash2/attention.cu
+    ${TYLOINFER_CUDA_ROOT}/kernels/attention/dflash2/gemm.cu
+    ${TYLOINFER_CUDA_ROOT}/kernels/attention/dflash2/q4.cu
     # DeepSeek indexers use this signed Hadamard transform in native TQ/GGUF too.
-    ${TYLOINFER_CUDA_KERNEL_ROOT}/nepq.cu
-    ${TYLOINFER_CUDA_KERNEL_ROOT}/acc.cu
-    ${TYLOINFER_CUDA_KERNEL_ROOT}/activation.cu
-    ${TYLOINFER_CUDA_KERNEL_ROOT}/attention.cu
-    ${TYLOINFER_CUDA_KERNEL_ROOT}/attention_mma.cu
-    ${TYLOINFER_CUDA_KERNEL_ROOT}/deepseek_v4_attention.cu
-    ${TYLOINFER_CUDA_KERNEL_ROOT}/deepseek_v4_hc.cu
-    ${TYLOINFER_CUDA_KERNEL_ROOT}/deepseek_v41.cu
-    ${TYLOINFER_CUDA_KERNEL_ROOT}/embedding.cu
-    ${TYLOINFER_CUDA_KERNEL_ROOT}/selected_attention.cu
-    ${TYLOINFER_CUDA_KERNEL_ROOT}/sparse_mma_raw.cu
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/hadamard/transform.cu
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/elementwise/acc.cu
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/elementwise/activation.cu
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/attention/dense.cu
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/attention/mma.cu
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/attention/deepseek_v4.cu
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/ffn/hyperconnection.cu
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/attention/deepseek_v41.cu
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/embedding/lookup.cu
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/attention/selected.cu
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/attention/sparse_mma_raw.cu
     ${TYLOINFER_CUDA_KERNEL_ROOT}/qwen4_exp.cu
-    ${TYLOINFER_CUDA_KERNEL_ROOT}/ple_fused.cu
-    ${TYLOINFER_CUDA_KERNEL_ROOT}/gated_delta_net.cu
-    ${TYLOINFER_CUDA_KERNEL_ROOT}/gdn_replay.cu
-    ${TYLOINFER_CUDA_KERNEL_ROOT}/gdn_replay_updates.cu
-    ${TYLOINFER_CUDA_KERNEL_ROOT}/gdn_decode_window.cu
-    ${TYLOINFER_CUDA_KERNEL_ROOT}/glm_dsa.cu
-    ${TYLOINFER_CUDA_KERNEL_ROOT}/kv_cache.cu
-    ${TYLOINFER_CUDA_KERNEL_ROOT}/paged_kv.cu
-    ${TYLOINFER_CUDA_KERNEL_ROOT}/moe.cu
-    ${TYLOINFER_CUDA_KERNEL_ROOT}/mx_matmul.cu
-    # nepq.cu is only the generic Hadamard transform pair; the default model path calls it.
-    ${TYLOINFER_CUDA_KERNEL_ROOT}/nepq.cu
-    ${TYLOINFER_CUDA_KERNEL_ROOT}/tq_ops.cu
-    ${TYLOINFER_CUDA_KERNEL_ROOT}/norm.cu
-    ${TYLOINFER_CUDA_KERNEL_ROOT}/rope.cu
-    ${TYLOINFER_CUDA_KERNEL_ROOT}/sampling.cu
-    ${TYLOINFER_CUDA_KERNEL_ROOT}/selective_state_scan.cu
-    ${TYLOINFER_CUDA_KERNEL_ROOT}/ssm_conv.cu
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/embedding/ple.cu
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/recurrent/gdn/delta.cu
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/recurrent/gdn/replay.cu
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/recurrent/gdn/replay_updates.cu
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/recurrent/gdn/decode_window.cu
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/attention/dsa.cu
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/kv/cache.cu
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/kv/paged.cu
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/moe/routing.cu
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/projection/mx/matmul.cu
+    # Generic Hadamard transforms are also used by the default model path.
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/hadamard/transform.cu
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/projection/tq/ops.cu
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/norm/norm.cu
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/rope/rotary.cu
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/sampling/sample.cu
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/recurrent/scan.cu
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/recurrent/convolution.cu
 )
 if(TYLOINFER_ENABLE_MFQ_COMPAT)
     list(APPEND TYLOINFER_CUDA_KERNEL_SOURCES
-    ${TYLOINFER_CUDA_KERNEL_ROOT}/mfe_ffn.cu
-    ${TYLOINFER_CUDA_KERNEL_ROOT}/mfe_ffn_compact.cu
-    ${TYLOINFER_CUDA_KERNEL_ROOT}/mfe_ffn_parity_read.cu
-    ${TYLOINFER_CUDA_KERNEL_ROOT}/mfe_ffn_cached_reduce.cu
-    ${TYLOINFER_CUDA_KERNEL_ROOT}/mfe_ffn_shared.cu
-    ${TYLOINFER_CUDA_KERNEL_ROOT}/mfe_ffn_token_groups.cu
-    ${TYLOINFER_CUDA_KERNEL_ROOT}/mfe_ffn_prepare.cu
-    ${TYLOINFER_CUDA_KERNEL_ROOT}/mfe_ffn_launch.cpp
-    ${TYLOINFER_CUDA_KERNEL_ROOT}/fp8_sq.cu
-    ${TYLOINFER_CUDA_KERNEL_ROOT}/mxfp4_sq.cu
-    ${TYLOINFER_CUDA_KERNEL_ROOT}/nepq_residual.cu
-    ${TYLOINFER_CUDA_KERNEL_ROOT}/nint_matmul.cu
-    ${TYLOINFER_CUDA_KERNEL_ROOT}/nint_short_decode.cu
-    ${TYLOINFER_CUDA_KERNEL_ROOT}/nint_q8_decode.cu
-    ${TYLOINFER_CUDA_KERNEL_ROOT}/nvq_matmul.cu
-    ${TYLOINFER_CUDA_KERNEL_ROOT}/nvq_decode.cu
-    ${TYLOINFER_CUDA_KERNEL_ROOT}/nvq_routed_reuse.cu
-    ${TYLOINFER_CUDA_KERNEL_ROOT}/nvq1_decode.cu
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/ffn/mfe/ffn.cu
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/ffn/mfe/compact.cu
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/ffn/mfe/parity_read.cu
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/ffn/mfe/cached_reduce.cu
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/ffn/mfe/shared.cu
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/ffn/mfe/token_groups.cu
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/ffn/mfe/prepare.cu
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/ffn/mfe/launch.cpp
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/projection/sq/fp8.cu
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/projection/sq/mxfp4.cu
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/projection/nepq/residual.cu
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/projection/nint/matmul.cu
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/projection/nint/short_decode.cu
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/projection/nint/q8_decode.cu
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/projection/nvq/matmul.cu
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/projection/nvq/decode.cu
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/projection/nvq/routed_reuse.cu
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/projection/nvq/nvq1.cu
     )
 endif()
 
 add_library(mfq-cuda-native-kernels STATIC
     ${TYLOINFER_CUDA_KERNEL_SOURCES}
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/acc.cpp
-    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/norm/wrappers.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/norm/rms.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/activation.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/qwen4_exp.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/selected_attention.cpp
@@ -174,14 +174,14 @@ add_library(mfq-cuda-native-kernels STATIC
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/kv_cache.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/ssm_conv.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/glm5_next.cpp
-    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/attention/wrappers.cpp
-    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/ffn/moe_wrappers.cpp
-    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/projection/mx_wrappers.cpp
-    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/projection/nepq_wrappers.cpp
-    ${TYLOINFER_CUDA_KERNEL_ROOT}/float_projection.cu
-    ${TYLOINFER_CUDA_KERNEL_ROOT}/kv_quantization.cu
-    ${TYLOINFER_CUDA_KERNEL_ROOT}/kv_hot_cache.cu
-    ${TYLOINFER_CUDA_KERNEL_ROOT}/shared_gate_fused.cu
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/attention/dense.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/ffn/experts/launch.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/projection/mx/launch.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/projection/hadamard.cpp
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/projection/dense.cu
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/kv/quantization.cu
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/kv/hot_cache.cu
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/ffn/shared_gate.cu
     ${TYLOINFER_CUDA_KERNEL_ROOT}/moe/pipeline.cu
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/native/ggml.cu
 )
@@ -195,10 +195,10 @@ set(_tyloinfer_mmq_types Q2_0 Q2_K IQ1_S IQ2_XXS IQ2_XS IQ2_S IQ3_XXS IQ3_S IQ4_
 foreach(_type IN LISTS _tyloinfer_mmq_types)
     set(_tyloinfer_mmq_hook "")
     if(_type STREQUAL "Q2_K")
-        set(_tyloinfer_mmq_hook "#include \"${TYLOINFER_CUDA_ROOT}/kernels/gguf_mmq_q2_k.cuh\"")
+        set(_tyloinfer_mmq_hook "#include \"${TYLOINFER_CUDA_ROOT}/kernels/projection/gguf/mmq/q2_k.cuh\"")
     endif()
     set(_mmq_instance ${CMAKE_CURRENT_BINARY_DIR}/gguf-mmq-${_type}.cu)
-    configure_file(${TYLOINFER_CUDA_ROOT}/kernels/gguf_mmq_instance.cu.in ${_mmq_instance} @ONLY)
+    configure_file(${TYLOINFER_CUDA_ROOT}/kernels/projection/gguf/mmq/instance.cu.in ${_mmq_instance} @ONLY)
     target_sources(mfq-cuda-native-kernels PRIVATE ${_mmq_instance})
 endforeach()
 # llama.cpp 51fe42c5d14bfb9adf0612ff98a9ab79e0e7275c (MIT).
@@ -208,57 +208,57 @@ file(READ ${_tyloinfer_ggml_cuda}/mmq.cuh _tyloinfer_mmq_source)
 string(REPLACE "\r\n" "\n" _tyloinfer_mmq_source "${_tyloinfer_mmq_source}")
 string(SHA256 _tyloinfer_mmq_hash "${_tyloinfer_mmq_source}")
 if(NOT _tyloinfer_mmq_hash STREQUAL "724a24512bace8b23924ed76a667c4259199cbb5d144a9494dd7aded376cf74f")
-    message(FATAL_ERROR "Vendored MMQ changed: synchronize kernels/gguf_mmq_tab.cuh and run the direct-MMQ parity tests")
+    message(FATAL_ERROR "Vendored MMQ changed: synchronize kernels/projection/gguf/mmq/tab.cuh and run the direct-MMQ parity tests")
 endif()
-set(_tyloinfer_tab_header ${TYLOINFER_CUDA_ROOT}/kernels/gguf_mmq_tab.cuh)
+set(_tyloinfer_tab_header ${TYLOINFER_CUDA_ROOT}/kernels/projection/gguf/mmq/tab.cuh)
 foreach(_type IN LISTS _tyloinfer_mmq_types)
     set(_tyloinfer_mmq_hook "")
     if(_type STREQUAL "Q2_K")
-        set(_tyloinfer_mmq_hook "#include \"${TYLOINFER_CUDA_ROOT}/kernels/gguf_mmq_q2_k.cuh\"")
+        set(_tyloinfer_mmq_hook "#include \"${TYLOINFER_CUDA_ROOT}/kernels/projection/gguf/mmq/q2_k.cuh\"")
     endif()
     set(_tab_instance ${CMAKE_CURRENT_BINARY_DIR}/gguf-mmq-tab-${_type}.cu)
-    configure_file(${TYLOINFER_CUDA_ROOT}/kernels/gguf_mmq_tab_instance.cu.in ${_tab_instance} @ONLY)
+    configure_file(${TYLOINFER_CUDA_ROOT}/kernels/projection/gguf/mmq/tab_instance.cu.in ${_tab_instance} @ONLY)
     target_sources(mfq-cuda-native-kernels PRIVATE ${_tab_instance})
 endforeach()
 if(TYLOINFER_ENABLE_MFQ_COMPAT)
     target_sources(mfq-cuda-native-kernels PRIVATE
-        ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/projection/nint_wrappers.cpp
-        ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/projection/nvq_wrappers.cpp
-        ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/projection/nvq_check.cu
-        ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/projection/nepq_residual_wrappers.cpp
-        ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/projection/fp8_sq_wrappers.cpp
-        ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/projection/mxfp4_sq_wrappers.cpp
-        ${TYLOINFER_CUDA_KERNEL_ROOT}/gr_prefill_blas.cu
-        ${TYLOINFER_CUDA_KERNEL_ROOT}/gated_residual_fused.cu
+        ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/projection/nint/launch.cpp
+        ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/projection/vq/launch.cpp
+        ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/projection/vq/check.cu
+        ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/projection/vq/residual.cpp
+        ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/projection/fp8_sq/launch.cpp
+        ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/projection/mxfp4_sq/launch.cpp
+        ${TYLOINFER_CUDA_KERNEL_ROOT}/ffn/residual/prefill_blas.cu
+        ${TYLOINFER_CUDA_KERNEL_ROOT}/ffn/residual/fused.cu
     )
 endif()
 
 # Keep the shared packed math in incremental builds even when nvcc's depfile
 # omits headers from a heavily inlined translation unit on Windows.
-set_source_files_properties(${TYLOINFER_CUDA_KERNEL_ROOT}/mfe_ffn.cu PROPERTIES
-    OBJECT_DEPENDS "${TYLOINFER_CUDA_KERNEL_ROOT}/mfe_ffn_device.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/packed_nint.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/packed_nvq.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/mfe_ffn.h;${TYLOINFER_CUDA_KERNEL_ROOT}/mfe_ffn_launch.h;${TYLOINFER_CUDA_KERNEL_ROOT}/mfe_ffn_compact.h;${TYLOINFER_CUDA_KERNEL_ROOT}/glu.cuh")
-set_source_files_properties(${TYLOINFER_CUDA_KERNEL_ROOT}/mfe_ffn_compact.cu PROPERTIES
-    OBJECT_DEPENDS "${TYLOINFER_CUDA_KERNEL_ROOT}/mfe_ffn_device.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/mfe_nvq_compact_dot.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/nvq_jsc_bank_map.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/nvq_dense_window32.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/packed_nint.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/packed_nvq.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/mfe_ffn.h;${TYLOINFER_CUDA_KERNEL_ROOT}/mfe_ffn_launch.h;${TYLOINFER_CUDA_KERNEL_ROOT}/mfe_ffn_compact.h")
-set_source_files_properties(${TYLOINFER_CUDA_KERNEL_ROOT}/mfe_ffn_parity_read.cu PROPERTIES
-    OBJECT_DEPENDS "${TYLOINFER_CUDA_KERNEL_ROOT}/mfe_ffn_device.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/mfe_ffn_gu_prequantized.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/mfe_ffn_gu_group_quant.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/mfe_ffn_gu_transfer_routes.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/mfe_nvq_compact_dot.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/mfe_nvq_parity_read.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/nvq_jsc_bank_map.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/nvq_dense_window32.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/packed_nint.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/packed_nvq.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/mfe_ffn.h;${TYLOINFER_CUDA_KERNEL_ROOT}/mfe_ffn_launch.h")
-set_source_files_properties(${TYLOINFER_CUDA_KERNEL_ROOT}/mfe_ffn_token_groups.cu PROPERTIES
-    OBJECT_DEPENDS "${TYLOINFER_CUDA_KERNEL_ROOT}/mfe_ffn_device.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/mfe_ffn.h;${TYLOINFER_CUDA_KERNEL_ROOT}/mfe_ffn_token_groups.h;${TYLOINFER_CUDA_KERNEL_ROOT}/mfe_nint_tokens.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/packed_nint.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/packed_nvq.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/nvq_e8_dense_group.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/nvq_d4_dense_group.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/nvq_dense_window32.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/nvq_jsc_bank_map.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/nint_route_group.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/mfe_nint_whole.cuh")
-set_source_files_properties(${TYLOINFER_CUDA_KERNEL_ROOT}/nint_matmul.cu PROPERTIES
-    OBJECT_DEPENDS "${TYLOINFER_CUDA_KERNEL_ROOT}/packed_nint.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/nint_route_group.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/glu.cuh")
-set_source_files_properties(${TYLOINFER_CUDA_KERNEL_ROOT}/nvq_matmul.cu PROPERTIES
-    OBJECT_DEPENDS "${TYLOINFER_CUDA_KERNEL_ROOT}/packed_nvq.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/glu.cuh")
+set_source_files_properties(${TYLOINFER_CUDA_KERNEL_ROOT}/ffn/mfe/ffn.cu PROPERTIES
+    OBJECT_DEPENDS "${TYLOINFER_CUDA_KERNEL_ROOT}/ffn/mfe/device.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/projection/packed/nint.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/projection/packed/nvq.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/ffn/mfe/ffn.h;${TYLOINFER_CUDA_KERNEL_ROOT}/ffn/mfe/launch.h;${TYLOINFER_CUDA_KERNEL_ROOT}/ffn/mfe/compact.h;${TYLOINFER_CUDA_KERNEL_ROOT}/elementwise/glu.cuh")
+set_source_files_properties(${TYLOINFER_CUDA_KERNEL_ROOT}/ffn/mfe/compact.cu PROPERTIES
+    OBJECT_DEPENDS "${TYLOINFER_CUDA_KERNEL_ROOT}/ffn/mfe/device.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/ffn/mfe/nvq_compact_dot.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/projection/nvq/jsc_bank_map.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/projection/nvq/dense_window32.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/projection/packed/nint.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/projection/packed/nvq.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/ffn/mfe/ffn.h;${TYLOINFER_CUDA_KERNEL_ROOT}/ffn/mfe/launch.h;${TYLOINFER_CUDA_KERNEL_ROOT}/ffn/mfe/compact.h")
+set_source_files_properties(${TYLOINFER_CUDA_KERNEL_ROOT}/ffn/mfe/parity_read.cu PROPERTIES
+    OBJECT_DEPENDS "${TYLOINFER_CUDA_KERNEL_ROOT}/ffn/mfe/device.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/ffn/mfe/gu_prequantized.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/ffn/mfe/gu_group_quant.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/ffn/mfe/gu_transfer_routes.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/ffn/mfe/nvq_compact_dot.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/ffn/mfe/nvq_parity_read.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/projection/nvq/jsc_bank_map.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/projection/nvq/dense_window32.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/projection/packed/nint.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/projection/packed/nvq.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/ffn/mfe/ffn.h;${TYLOINFER_CUDA_KERNEL_ROOT}/ffn/mfe/launch.h")
+set_source_files_properties(${TYLOINFER_CUDA_KERNEL_ROOT}/ffn/mfe/token_groups.cu PROPERTIES
+    OBJECT_DEPENDS "${TYLOINFER_CUDA_KERNEL_ROOT}/ffn/mfe/device.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/ffn/mfe/ffn.h;${TYLOINFER_CUDA_KERNEL_ROOT}/ffn/mfe/token_groups.h;${TYLOINFER_CUDA_KERNEL_ROOT}/ffn/mfe/nint_tokens.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/projection/packed/nint.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/projection/packed/nvq.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/projection/nvq/e8_dense_group.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/projection/nvq/d4_dense_group.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/projection/nvq/dense_window32.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/projection/nvq/jsc_bank_map.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/projection/nint/route_group.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/ffn/mfe/nint_whole.cuh")
+set_source_files_properties(${TYLOINFER_CUDA_KERNEL_ROOT}/projection/nint/matmul.cu PROPERTIES
+    OBJECT_DEPENDS "${TYLOINFER_CUDA_KERNEL_ROOT}/projection/packed/nint.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/projection/nint/route_group.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/elementwise/glu.cuh")
+set_source_files_properties(${TYLOINFER_CUDA_KERNEL_ROOT}/projection/nvq/matmul.cu PROPERTIES
+    OBJECT_DEPENDS "${TYLOINFER_CUDA_KERNEL_ROOT}/projection/packed/nvq.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/elementwise/glu.cuh")
 set_property(SOURCE
-    ${TYLOINFER_CUDA_KERNEL_ROOT}/mfe_ffn.cu
-    ${TYLOINFER_CUDA_KERNEL_ROOT}/mfe_ffn_compact.cu
-    ${TYLOINFER_CUDA_KERNEL_ROOT}/mfe_ffn_parity_read.cu
-    ${TYLOINFER_CUDA_KERNEL_ROOT}/mfe_ffn_shared.cu
-    ${TYLOINFER_CUDA_KERNEL_ROOT}/mfe_ffn_token_groups.cu
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/ffn/mfe/ffn.cu
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/ffn/mfe/compact.cu
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/ffn/mfe/parity_read.cu
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/ffn/mfe/shared.cu
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/ffn/mfe/token_groups.cu
     ${TYLOINFER_CUDA_KERNEL_ROOT}/moe/pipeline.cu
     APPEND PROPERTY OBJECT_DEPENDS "${TYLOINFER_CUDA_KERNEL_ROOT}/shared_storage.cuh")
-set_source_files_properties(${TYLOINFER_CUDA_KERNEL_ROOT}/gated_residual_fused.cu PROPERTIES
+set_source_files_properties(${TYLOINFER_CUDA_KERNEL_ROOT}/ffn/residual/fused.cu PROPERTIES
     COMPILE_OPTIONS "--maxrregcount=80")
 if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13.0)
-    set_property(SOURCE ${TYLOINFER_CUDA_KERNEL_ROOT}/gated_residual_fused.cu APPEND
+    set_property(SOURCE ${TYLOINFER_CUDA_KERNEL_ROOT}/ffn/residual/fused.cu APPEND
         PROPERTY COMPILE_OPTIONS "--split-compile=0")
 endif()
 target_include_directories(mfq-cuda-native-kernels PRIVATE
@@ -266,7 +266,7 @@ target_include_directories(mfq-cuda-native-kernels PRIVATE
     ${TYLOINFER_REPOSITORY_ROOT}
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/native
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/native/tensor
-    # kernels/gguf.h shadows ggml's public gguf.h; ggml-impl.h must resolve its own.
+    # GGML public headers precede backend-private kernel headers.
     ${PROJECT_SOURCE_DIR}/components/ggml/include
     ${TYLOINFER_CUDA_KERNEL_ROOT}
     ${CUDAToolkit_INCLUDE_DIRS}
@@ -351,30 +351,31 @@ set(TYLOINFER_CUDA_OP_SOURCES
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/ffn/ffn.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/ffn/mlp.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/ffn/dense.cpp
-    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/ffn/routed.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/ffn/experts/routed.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/ffn/residual.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/native/profile.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/native/vmm.cpp
-    ${PROJECT_SOURCE_DIR}/diagnostics/route_stats.cpp
+    ${PROJECT_SOURCE_DIR}/diagnostics/profiling/route_stats.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/native/collectives.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/attention/attention.cpp
-    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/attention/kv.cpp
-    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/attention/kv_storage.cpp
-    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/attention/kv_gather.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/attention/kv/cache.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/attention/kv/storage.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/attention/kv/gather.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/attention/linear.cpp
-    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/attention/gdn.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/attention/gdn/attention.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/attention/qsa.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/attention/ple.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/attention/csa.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/rope/positions.cpp
-    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/norm/rms.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/norm/dispatch.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/rope/rope.cpp
-    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/ffn/routes.cpp
-    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/ffn/shared.cpp
-    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/ffn/mixer.cpp
-    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/projection/tq.cpp
-    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/ffn/tq.cpp
-    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/projection/mx.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/ffn/experts/routes.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/ffn/experts/shared.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/ffn/gated_residual.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/projection/tq/tensor.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/ffn/tq/routed.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/ffn/tq/banks.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/projection/mx/tensor.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/projection/quant_linear.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/projection/projection.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/projection/expert_projection.cpp
@@ -383,12 +384,13 @@ set(TYLOINFER_CUDA_OP_SOURCES
 )
 if(TYLOINFER_ENABLE_MFQ_COMPAT)
     list(APPEND TYLOINFER_CUDA_OP_SOURCES
-    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/projection/fp8_sq.cpp
-    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/projection/mxfp4_sq.cpp
-    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/ffn/moe.cpp
-    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/ffn/mfe.cpp
-    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/projection/nint.cpp
-    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/projection/vq.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/projection/fp8_sq/tensor.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/projection/mxfp4_sq/tensor.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/ffn/experts/moe.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/ffn/mfe/batch.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/ffn/mfe/projection.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/projection/nint/tensor.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/projection/vq/tensor.cpp
     )
 endif()
 
@@ -402,19 +404,14 @@ set(TYLOINFER_CUDA_EXECUTION_SOURCES
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/executor/options.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/executor/config.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/executor/executor.cpp
-    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/executor/kv_memory.cpp
-    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/executor/kv_allocation.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/executor/kv/memory.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/executor/kv/allocation.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/executor/working_set.cpp
-    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/executor/decode_graph.cpp
-    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/executor/tq.cpp
-    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/executor/tq_moe.cpp
-    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/executor/decode_window.cpp
-    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/executor/graph_registry.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/executor/graph/decode.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/executor/tq/resources.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/executor/graph/window.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/executor/graph/registry.cpp
 )
-if(TYLOINFER_ENABLE_MFQ_COMPAT)
-    list(APPEND TYLOINFER_CUDA_EXECUTION_SOURCES
-        ${PROJECT_SOURCE_DIR}/engine/backends/cuda/executor/moe_batch.cpp)
-endif()
 add_library(mfq-cuda-execution OBJECT ${TYLOINFER_CUDA_EXECUTION_SOURCES})
 mfq_configure_cuda_backend_target(mfq-cuda-execution)
 target_link_libraries(mfq-cuda-execution PRIVATE mfq-cpu-execution mfq-engine)
@@ -422,20 +419,20 @@ target_compile_definitions(mfq-cuda-execution PRIVATE NOMINMAX)
 set_target_properties(mfq-cuda-execution PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 set_source_files_properties(
-    ${TYLOINFER_CUDA_KERNEL_ROOT}/attention_mma.cu
-    ${TYLOINFER_CUDA_KERNEL_ROOT}/deepseek_v4_attention.cu
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/attention/mma.cu
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/attention/deepseek_v4.cu
     PROPERTIES COMPILE_OPTIONS "--use_fast_math;--extended-lambda"
 )
 set_source_files_properties(
-    ${TYLOINFER_CUDA_KERNEL_ROOT}/deepseek_v4_hc.cu
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/ffn/hyperconnection.cu
     PROPERTIES COMPILE_OPTIONS "--extended-lambda"
 )
 
-set_source_files_properties(${TYLOINFER_CUDA_KERNEL_ROOT}/mfe_ffn_shared.cu PROPERTIES
-    OBJECT_DEPENDS "${TYLOINFER_CUDA_KERNEL_ROOT}/mfe_ffn_device.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/mfe_nint_tokens.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/mfe_ffn_shared.h;${TYLOINFER_CUDA_KERNEL_ROOT}/mfe_ffn_shared_short.cuh")
+set_source_files_properties(${TYLOINFER_CUDA_KERNEL_ROOT}/ffn/mfe/shared.cu PROPERTIES
+    OBJECT_DEPENDS "${TYLOINFER_CUDA_KERNEL_ROOT}/ffn/mfe/device.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/ffn/mfe/nint_tokens.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/ffn/mfe/shared.h;${TYLOINFER_CUDA_KERNEL_ROOT}/ffn/mfe/shared_short.cuh")
 
-set_source_files_properties(${TYLOINFER_CUDA_KERNEL_ROOT}/mfe_ffn_cached_reduce.cu PROPERTIES
-    OBJECT_DEPENDS "${TYLOINFER_CUDA_KERNEL_ROOT}/mfe_ffn_device.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/mfe_ffn_cached_reduce.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/mfe_nvq_compact_dot.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/mfe_nvq_parity_read.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/mfe_ffn.h;${TYLOINFER_CUDA_KERNEL_ROOT}/mfe_ffn_launch.h")
+set_source_files_properties(${TYLOINFER_CUDA_KERNEL_ROOT}/ffn/mfe/cached_reduce.cu PROPERTIES
+    OBJECT_DEPENDS "${TYLOINFER_CUDA_KERNEL_ROOT}/ffn/mfe/device.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/ffn/mfe/cached_reduce.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/ffn/mfe/nvq_compact_dot.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/ffn/mfe/nvq_parity_read.cuh;${TYLOINFER_CUDA_KERNEL_ROOT}/ffn/mfe/ffn.h;${TYLOINFER_CUDA_KERNEL_ROOT}/ffn/mfe/launch.h")
 
 include(${PROJECT_SOURCE_DIR}/engine/cuda.cmake)
 
@@ -983,6 +980,13 @@ endif()
     target_link_libraries(tyloinfer-cuda-qsa-tq-prefill-test PRIVATE mfq-cuda-engine)
     add_test(NAME tyloinfer-cuda-qsa-tq-prefill-test COMMAND tyloinfer-cuda-qsa-tq-prefill-test)
     set_tests_properties(tyloinfer-cuda-qsa-tq-prefill-test PROPERTIES SKIP_RETURN_CODE 77)
+
+    mfq_add_cuda_test(tyloinfer-cuda-tq-cache-test
+        ${TYLOINFER_CUDA_ROOT}/tests/tq_cache_test.cpp mfq-cuda-engine mfq-engine)
+    if(CMAKE_LINK_GROUP_USING_RESCAN_SUPPORTED)
+        target_link_libraries(tyloinfer-cuda-tq-cache-test PRIVATE
+            "$<LINK_GROUP:RESCAN,mfq-cuda-engine,mfq-engine,mfq-tensor>")
+    endif()
 
     add_executable(tyloinfer-cuda-qsa-tq-fa-test ${TYLOINFER_CUDA_ROOT}/tests/qsa_tq_fa_test.cpp)
     mfq_configure_cuda_engine_target(tyloinfer-cuda-qsa-tq-fa-test)

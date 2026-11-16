@@ -6,10 +6,10 @@ add_library(mfq-quant-readers STATIC
     features.cpp
     bytes.h
     legacy.h
-    dense_blob.cpp
-    dense_blob.h
-    fp8_sq_blob.cpp
-    fp8_sq_blob.h
+    dense/blob.cpp
+    dense/blob.h
+    sq/fp8_blob.cpp
+    sq/fp8_blob.h
     quant/nint_rows.cpp
     quant/nint_blob.cpp
     quant/nint_blob.h
@@ -22,19 +22,19 @@ add_library(mfq-quant-readers STATIC
     quant/mfe_index.h
     quant/mfe_blob.cpp
     quant/mfe_blob.h
-    mlx_affine.cpp
-    mlx_affine.h
-    mx_blob.cpp
-    mx_blob.h
-    tq_table.cpp
-    tq_table.h
-    # Host codec implementations; their headers live in this directory.
+    mx/affine.cpp
+    mx/affine.h
+    mx/blob.cpp
+    mx/blob.h
+    tq/table.cpp
+    tq/table.h
+    # Host codecs live with their headers in qsa/ and readers/.
     # native/row_residual.cpp is deliberately absent: it still uses the removed
     # GgufModelSource and legacy tensor alias API and does not compile.
-    ${PROJECT_SOURCE_DIR}/engine/backends/cpu/native/mirrored_file_reader.cpp
-    ${PROJECT_SOURCE_DIR}/engine/backends/cpu/native/qsa_adaptive_cache.cpp
-    ${PROJECT_SOURCE_DIR}/engine/backends/cpu/native/qsa_ram_store.cpp
-    ${PROJECT_SOURCE_DIR}/engine/backends/cpu/native/qsa_tq_cpu.cpp
+    ${PROJECT_SOURCE_DIR}/engine/weights/encoding/readers/mirrored.cpp
+    ${PROJECT_SOURCE_DIR}/engine/weights/encoding/qsa/adaptive_cache.cpp
+    ${PROJECT_SOURCE_DIR}/engine/weights/encoding/qsa/ram_store.cpp
+    ${PROJECT_SOURCE_DIR}/engine/weights/encoding/qsa/tq_cpu.cpp
 )
 target_include_directories(mfq-quant-readers PRIVATE
     ${PROJECT_SOURCE_DIR})

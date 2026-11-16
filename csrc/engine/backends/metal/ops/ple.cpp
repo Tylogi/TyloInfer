@@ -1,5 +1,5 @@
 #include "engine/ops/ple.h"
-#include "engine/ops.h"
+#include "engine/ops/ops.h"
 #include "engine/backends/metal/native/tensor/tensor.h"
 #include "engine/backends/metal/ops/common/mlx_linear_attention.h"
 #include "backends/metal/models/flash_next/qwen4_ops.h"

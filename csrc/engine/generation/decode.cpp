@@ -1,6 +1,6 @@
 #include "engine/generation/decode.h"
 #include "engine/models/causal_model.h"
-#include "engine/budget.h"
+#include "engine/memory/budget.h"
 
 #include <algorithm>
 #include <array>

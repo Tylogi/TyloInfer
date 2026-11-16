@@ -1,5 +1,5 @@
 #include "mlx_moe.h"
-#include "engine/weights/lru.h"
+#include "engine/weights/cache/lru.h"
 #include "mlx_moe_ops.h"
 
 #include <coroutine>

@@ -3,7 +3,7 @@
 #include "mlx_moe_ops.h"
 #include "engine/backends/metal/native/allocation.h"
 #include "../gguf/native/mlx_native_gguf.h"
-#include "engine/weights/encoding/mlx_affine.h"
+#include "engine/weights/encoding/mx/affine.h"
 #include "engine/weights/memory.h"
 
 #include <mlx/allocator.h>

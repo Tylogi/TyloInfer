@@ -4,10 +4,10 @@
 #include "engine/backends/cpu/native/host_parallel.h"
 #include "engine/weights/source/mapped.h"
 #include "engine/weights/source/read.h"
-#include "engine/weights/row_source.h"
+#include "engine/weights/rows/source.h"
 #include "engine/weights/encoding/quant/nint_rows.h"
-#include "engine/weights/nint_row_cache.h"
-#include "engine/weights/nint_row_pipeline.h"
+#include "engine/weights/rows/nint_cache.h"
+#include "engine/weights/rows/nint_pipeline.h"
 #include "engine/weights/tq/source.h"
 #include "engine/weights/tq/rows.h"
 

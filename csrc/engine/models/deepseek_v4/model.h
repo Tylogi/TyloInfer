@@ -3,12 +3,12 @@
 #include "engine/models/source/model_graph.h"
 #include "engine/backends/cuda/ops/ffn/ffn.h"
 #include "engine/backends/cuda/ops/projection/quant_linear.h"
-#include "engine/ops.h"
+#include "engine/ops/ops.h"
 #include "engine/models/metadata.h"
 #include "engine/models/causal_model.h"
 #include "engine/models/metadata.h"
 #include "engine/models/deepseek_v4/config.h"
-#include "engine/models/source.h"
+#include "engine/models/source/model.h"
 
 #include <memory>
 #include <vector>

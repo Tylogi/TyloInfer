@@ -1,9 +1,9 @@
 #include "basic.h"
 #include "tensor.h"
-#include "engine/backends/cuda/kernels/mfq_cuda_activation_ops.h"
-#include "engine/backends/cuda/kernels/mfq_cuda_attention_ops.h"
-#include "engine/backends/cuda/kernels/mfq_cuda_linear_attention_ops.h"
-#include "engine/backends/cuda/kernels/mfq_cuda_norm_ops.h"
+#include "engine/backends/cuda/ops/activation.h"
+#include "engine/backends/cuda/ops/attention/launch.h"
+#include "engine/backends/cuda/ops/attention/gdn/launch.h"
+#include "engine/backends/cuda/ops/norm/launch.h"
 #include "engine/backends/cuda/native/env.h"
 
 #include <algorithm>
@@ -12,7 +12,7 @@
 #include <utility>
 #include <vector>
 
-// Native RoPE adapter entry points are implemented by ops/rope/wrappers.cpp.
+// Native RoPE adapter entry points are implemented by ops/rope/rotary.cpp.
 ::tyloi::DenseTensor rope_cuda(::tyloi::DenseTensor, ::tyloi::DenseTensor, double);
 ::tyloi::DenseTensor rope_ext_cuda(::tyloi::DenseTensor, ::tyloi::DenseTensor, double, std::int64_t,
                                    ::tyloi::DenseTensor);

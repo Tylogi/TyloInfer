@@ -1,7 +1,7 @@
 #pragma once
 
-#include "engine/tensor.h"
-#include "engine/ops.h"
+#include "engine/tensor/tensor.h"
+#include "engine/ops/ops.h"
 
 #include <cstdint>
 #include <chrono>

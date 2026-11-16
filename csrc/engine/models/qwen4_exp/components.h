@@ -1,7 +1,7 @@
 #pragma once
 
 #include "engine/metrics.h"
-#include "engine/ops.h"
+#include "engine/ops/ops.h"
 #include "engine/models/common/mtp.h"
 #include "engine/models/common/vision/grid_encoder.h"
 #include "engine/state/media.h"

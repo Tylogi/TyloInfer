@@ -1,6 +1,6 @@
-#include "engine/models/source.h"
+#include "engine/models/source/model.h"
 #include "engine/models/load.h"
-#include "engine/ops.h"
+#include "engine/ops/ops.h"
 #include "engine/models/minicpmo45/model.h"
 #include "engine/backends/cuda/ops/rope/rope.h"
 #include "engine/models/common/load.h"

@@ -1,10 +1,10 @@
 #include "engine/engine.h"
-#include "engine/budget.h"
+#include "engine/memory/budget.h"
 #include "engine/generation/decode.h"
-#include "engine/generation/prefill.h"
-#include "engine/generation/prefill_activity.h"
+#include "engine/generation/prefill/prefill.h"
+#include "engine/generation/prefill/activity.h"
 #include "engine/generation/run.h"
-#include "engine/generation/batch.h"
+#include "engine/generation/batch/batch.h"
 #include "engine/generation/mtp/state.h"
 #include "engine/generation/mtp/generation.h"
 #include "engine/generation/sampling.h"
@@ -14,9 +14,9 @@
 #include "engine/models/session/snapshot.h"
 #include "engine/requests/policy.h"
 #include "engine/scheduler/request.h"
-#include "engine/models/source.h"
+#include "engine/models/source/model.h"
 #include "engine/state/session/sessions.h"
-#include "engine/weights/cache.h"
+#include "engine/weights/cache/cache.h"
 
 #include <algorithm>
 #include <exception>

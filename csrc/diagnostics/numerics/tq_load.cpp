@@ -1,6 +1,6 @@
 #include "tq_load.h"
 #include "tensor.h"
-#include "engine/models/source.h"
+#include "engine/models/source/model.h"
 #include "engine/weights/tq/load.h"
 #include "engine/weights/tq/source.h"
 

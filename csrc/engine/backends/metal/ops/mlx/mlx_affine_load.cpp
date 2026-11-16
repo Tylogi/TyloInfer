@@ -1,7 +1,7 @@
 #include "mlx_affine.h"
 #include "mfq_container.h"
 #include "engine/backends/metal/ops/gguf/native/mlx_native_gguf.h"
-#include "engine/weights/encoding/mlx_affine.h"
+#include "engine/weights/encoding/mx/affine.h"
 #include <mlx/allocator.h>
 #include <climits>
 #include <stdexcept>

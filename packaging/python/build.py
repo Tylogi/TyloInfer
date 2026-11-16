@@ -16,9 +16,11 @@ def cuda_files(repository: Path) -> tuple[Path, ...]:
     package = repository / 'tyloinfer/kernels/cuda'
     manifest = runpy.run_path(str(package / '_sources.py'))
     roots = manifest['include_roots'](repository)
-    pending = list(manifest['sources'](repository, package))
+    pending = list(manifest['sources'](repository))
+    entrypoints = set(pending)
     visited: set[Path] = set()
     kernel_root = repository / 'csrc/engine/backends/cuda/kernels'
+    binding_root = repository / 'csrc/bindings/cuda'
     native_root = repository / 'csrc/engine/backends/cuda/native'
     encoding_root = repository / 'csrc/engine/weights/encoding'
     ggml_root = repository / 'csrc/components/ggml'
@@ -29,12 +31,11 @@ def cuda_files(repository: Path) -> tuple[Path, ...]:
             continue
         if not source.is_file():
             raise RuntimeError(f'CUDA JIT source is missing: {source}')
-        local = source.is_relative_to(package)
         allowed = (
-            local
+            source in entrypoints
             or (source.is_relative_to(kernel_root) and source.suffix in {'.h', '.cuh', '.inc'})
-            or source in {kernel_root / name for name in manifest['KERNELS']}
-            or source in {native_root / 'env.h', native_root / 'env.cpp'}
+            or (source.is_relative_to(binding_root) and source.suffix in {'.h', '.cuh'})
+            or source == native_root / 'env.h'
             or (source.is_relative_to(encoding_root) and source.suffix == '.h')
             or (source.is_relative_to(ggml_root) and source.suffix in {'.h', '.cuh', '.inc'})
         )
@@ -54,24 +55,18 @@ def cuda_files(repository: Path) -> tuple[Path, ...]:
 
 
 def collect_cuda_sources(repository: Path, project: Path, files: tuple[Path, ...]) -> None:
-    """Stage validated shared sources; package-local adapters are copied separately."""
+    """Stage the validated CUDA sources with their canonical csrc paths."""
     repository = repository.resolve()
-    package = repository / 'tyloinfer/kernels/cuda'
     for source in files:
-        if source.is_relative_to(package):
-            continue
         destination = project / 'tyloinfer/kernels/cuda/_src' / source.relative_to(repository)
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, destination)
 
 
 def collect_tq_sources(repository: Path, project: Path) -> None:
-    kernels = repository / 'csrc/engine/backends/cuda/kernels'
-    resources = project / 'tyloinfer/kernels/cuda'
-    resources.mkdir(parents=True, exist_ok=True)
-    for source in (kernels / 'tq_ops.cu', kernels / 'tq_ops.h',
-                   *sorted(kernels.glob('tq_*.cuh'))):
-        shutil.copy2(source, resources / source.name)
+    kernels = Path('csrc/engine/backends/cuda/kernels/projection/tq')
+    resources = project / 'tyloinfer/kernels/cuda/_src' / kernels
+    shutil.copytree(repository / kernels, resources, dirs_exist_ok=True)
 
 
 def build_wheel(output_dir: Path) -> Path:
@@ -91,15 +86,12 @@ def build_wheel(output_dir: Path) -> Path:
 
         collect_tq_sources(repository, project)
         collect_cuda_sources(repository, project, files)
-        package = repository / 'tyloinfer/kernels/cuda'
-        resources = project / 'tyloinfer/kernels/cuda'
+        resources = project / 'tyloinfer/kernels/cuda/_src/csrc/engine/backends/cuda/kernels/projection/tq'
         included = {
-            source.relative_to(repository) if source.is_relative_to(package) else
             Path('tyloinfer/kernels/cuda/_src') / source.relative_to(repository)
             for source in files
         }
-        included.update(source.relative_to(project) for source in (
-            resources / 'tq_ops.cu', resources / 'tq_ops.h', *resources.glob('tq_*.cuh')))
+        included.update(source.relative_to(project) for source in resources.iterdir())
         (project / 'MANIFEST.in').write_text(
             ''.join(f'include {path.as_posix()}\n' for path in sorted(included)), encoding='utf-8')
 

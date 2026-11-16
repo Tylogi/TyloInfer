@@ -1,7 +1,7 @@
 #pragma once
 
 #include "engine/models/session/snapshot.h"
-#include "engine/state/kv_view.h"
+#include "engine/state/kv/view.h"
 #include "engine/models/state.h"
 
 #include <vector>

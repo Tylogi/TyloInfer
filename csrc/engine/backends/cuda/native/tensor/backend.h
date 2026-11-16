@@ -1,6 +1,6 @@
 #pragma once
 #include "env.h"
-#include "engine/tensor.h"
+#include "engine/tensor/tensor.h"
 
 #include <cublas_v2.h>
 #include <cuda_bf16.h>

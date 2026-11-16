@@ -1,6 +1,6 @@
 #include "tq.h"
-#include "engine/backends/cuda/kernels/tq_ops.h"
-#include "engine/weights/encoding/tq_rows.h"
+#include "engine/backends/cuda/kernels/projection/tq/ops.h"
+#include "engine/weights/encoding/tq/rows.h"
 #include "engine/weights/tq/image.h"
 
 #include <cublas_v2.h>

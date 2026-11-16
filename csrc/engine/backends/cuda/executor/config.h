@@ -2,7 +2,7 @@
 
 #include "engine/backends/cuda/executor/executor.h"
 #include "engine/config.h"
-#include "engine/ops.h"
+#include "engine/ops/ops.h"
 #include "engine/weights/loader.h"
 #include "engine/weights/moe/options.h"
 #include "engine/weights/placement.h"
