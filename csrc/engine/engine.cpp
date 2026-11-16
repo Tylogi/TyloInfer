@@ -290,12 +290,25 @@ void Engine::rebind(std::unique_ptr<models::CausalModel>&& model, std::unique_pt
     install(std::move(graph));
 }
 Engine::~Engine() {
+    try { shutdown(); }
+    catch (const std::exception& error) {
+        std::cerr << "runtime_unload_cleanup error=" << error.what() << std::endl;
+        std::terminate();
+    }
+    catch (...) {
+        std::cerr << "runtime_unload_cleanup error=unknown" << std::endl;
+        std::terminate();
+    }
     scheduler_.reset();
     if (executor_) {
         try { unload_model(); }
         catch (const std::exception& error) { std::cerr << "runtime_unload_cleanup error=" << error.what() << std::endl; std::terminate(); }
         catch (...) { std::cerr << "runtime_unload_cleanup error=unknown" << std::endl; std::terminate(); }
     }
+}
+
+void Engine::stop_reload() noexcept {
+    if (reload_worker_.joinable()) reload_worker_.join();
 }
 
 EngineInfo Engine::describe() const { return info_; }

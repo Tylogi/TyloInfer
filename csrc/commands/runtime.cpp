@@ -21,41 +21,11 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <utility>
 #include <vector>
 
 namespace tyloi::commands {
 namespace {
-
-class Reload {
-public:
-    Reload(const tyloi::engine::EngineOptions& options, engine::Engine& engine)
-        : options_(options), engine_(engine), worker_([this] {
-            while (auto job = engine_.next_reload()) {
-                try {
-                    auto options = options_;
-                    options.context_size = job->context;
-                    tyloi::engine::reload(engine_, std::move(options));
-                    job->reply.set_value();
-                } catch (...) { job->reply.set_exception(std::current_exception()); }
-            }
-        }) {
-        try { engine_.enable_reload(); }
-        catch (...) { stop(); worker_.join(); throw; }
-    }
-    ~Reload() { stop(); }
-
-private:
-    void stop() noexcept {
-        try { engine_.shutdown(); }
-        catch (const std::exception& error) { std::cerr << "runtime_unload_cleanup error=" << error.what() << '\n'; }
-        catch (...) { std::cerr << "runtime_unload_cleanup error=unknown\n"; }
-    }
-    const tyloi::engine::EngineOptions options_;
-    engine::Engine& engine_;
-    std::jthread worker_;
-};
 
 void print_help() {
     std::cout
@@ -274,7 +244,6 @@ int run_transport_runtime(RuntimeOptions& options) {
     auto transport = options.stdio_mode
         ? make_mfq_stdio_transport(transport_config)
         : make_mfq_http_transport(transport_config);
-    Reload reload(options, *engine);
     return transport->run(*engine);
 }
 

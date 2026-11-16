@@ -16,6 +16,7 @@
 #include <future>
 #include <memory>
 #include <optional>
+#include <thread>
 #include <utility>
 #include <variant>
 
@@ -30,6 +31,7 @@ class Scheduler;
 class InferenceOutput;
 class TextProcessor;
 struct Request;
+struct EngineOptions;
 
 struct EngineInfo {
     std::size_t max_requests = 1;
@@ -122,7 +124,10 @@ protected:
 
 private:
     friend class Scheduler;
+    friend std::unique_ptr<Engine> load(EngineOptions options);
     void install(std::unique_ptr<tyloi::Executor::Graph> graph);
+    void start_reload(EngineOptions options);
+    void stop_reload() noexcept;
 
     SessionResult set_budget(const SessionCommand&);
     void clear_bindings() noexcept;
@@ -143,6 +148,7 @@ private:
     EngineInfo info_;
     bool ready_ = false;
     std::unique_ptr<Scheduler> scheduler_;
+    std::jthread reload_worker_;
 };
 
 } // namespace tyloi::engine

@@ -86,7 +86,15 @@ SessionResult Engine::session(SessionCommand command) const { return scheduler_-
 std::int64_t Engine::reload(std::int64_t context) const { return scheduler_->reload(context); }
 void Engine::enable_reload() { scheduler_->enable_reload(); }
 std::optional<Engine::Reload> Engine::next_reload() { return scheduler_->next_reload(); }
-void Engine::shutdown() { if (scheduler_) scheduler_->shutdown(); else unload_model(); }
+void Engine::shutdown() {
+    std::exception_ptr failure;
+    try {
+        if (scheduler_) scheduler_->shutdown();
+        else unload_model();
+    } catch (...) { failure = std::current_exception(); }
+    stop_reload();
+    if (failure) std::rethrow_exception(failure);
+}
 void Engine::prepare_duplex_session(const std::string& prompt, MfqDuplexSessionParams& params) const {
     params = std::get<MfqDuplexSessionParams>(control(PrepareDuplex{prompt, params}));
 }
