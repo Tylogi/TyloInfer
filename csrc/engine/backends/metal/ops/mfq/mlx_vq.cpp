@@ -4076,4 +4076,13 @@ array MlxVqWeight::matmul(const array& input) const {
         8);
 }
 
+std::vector<std::shared_ptr<tyloi::TensorStorage>> MlxVqWeight::backings() const {
+    std::vector<std::shared_ptr<tyloi::TensorStorage>> result;
+    for (const auto* value : {&indices_packed_, &state_packed_, &aux_packed_, &anchors_, &codebooks_, &scale_lut_, &state_to_codebank_, &bank_ids_, &rotation_signs_, &parameters_, &residual_codebook_, &residual_first_, &residual_second_}) {
+        auto storages = tyloi::metal::backings(*value);
+        result.insert(result.end(), storages.begin(), storages.end());
+    }
+    return result;
+}
+
 } // namespace tyloi::metal

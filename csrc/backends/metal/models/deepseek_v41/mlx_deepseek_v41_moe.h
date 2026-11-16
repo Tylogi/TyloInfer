@@ -75,7 +75,7 @@ private:
         MlxLinear shared_gate,
         MlxLinear shared_up,
         MlxLinear shared_down,
-        std::optional<MlxMoeWeight> routed_gate_up,
+        std::optional<MlxMfeWeight> routed_gate_up,
         std::optional<MlxRoutedLinear> routed_gate,
         std::optional<MlxRoutedLinear> routed_up,
         std::optional<MlxRoutedLinear> routed_down,
@@ -108,7 +108,7 @@ private:
     // Canonical split Gate/Up records keep their original storage pools;
     // routed_swiglu_pair provides the common zero-copy execution path. The
     // legacy fused gate_up record remains a read-only compatibility input.
-    std::optional<MlxMoeWeight> routed_gate_up_;
+    std::optional<MlxMfeWeight> routed_gate_up_;
     std::optional<MlxRoutedLinear> routed_gate_;
     std::optional<MlxRoutedLinear> routed_up_;
     std::optional<MlxRoutedLinear> routed_down_;

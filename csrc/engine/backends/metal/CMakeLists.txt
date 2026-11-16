@@ -495,6 +495,7 @@ add_library(mfq-metal-runtime STATIC
 )
 if(TYLOINFER_ENABLE_MFQ_COMPAT)
     target_sources(mfq-metal-compute PRIVATE
+        ${TYLOINFER_METAL_ROOT}/ops/mfq/mlx_moe.cpp
         ${TYLOINFER_METAL_ROOT}/ops/mfq/mlx_fp8_sq.cpp
         ${TYLOINFER_METAL_ROOT}/ops/mfq/mlx_mxfp4_sq.cpp
         ${TYLOINFER_METAL_ROOT}/ops/mfq/mlx_nint.cpp
@@ -503,8 +504,11 @@ if(TYLOINFER_ENABLE_MFQ_COMPAT)
         ${TYLOINFER_METAL_ROOT}/ops/mfq/mlx_vq.cpp
         ${TYLOINFER_METAL_ROOT}/ops/mfq/mlx_grouped_linear_mfq.cpp
     )
+    target_sources(mfq-metal-engine PRIVATE
+        ${PROJECT_SOURCE_DIR}/engine/tensor/encoding/metal_experts.cpp
+    )
     target_sources(mfq-metal-runtime PRIVATE
-        ${TYLOINFER_METAL_ROOT}/ops/mfq/mlx_moe.cpp
+        ${PROJECT_SOURCE_DIR}/backends/metal/storage/mlx_mfe.cpp
         ${PROJECT_SOURCE_DIR}/backends/metal/runtime/mlx_ssd_expert_arena.cpp
         ${PROJECT_SOURCE_DIR}/backends/metal/runtime/mlx_ssd_expert_cache.cpp
     )

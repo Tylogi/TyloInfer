@@ -14,6 +14,10 @@
 
 #include <mlx/mlx.h>
 
+namespace tyloi { struct TensorStorage; }
+
+namespace tyloi::source { class Source; }
+
 namespace tyloi::metal {
 
 class MfqContainer;
@@ -67,6 +71,10 @@ struct MlxMfeCacheReuseStats {
 // staged in unified memory for active dispatches.
 class MlxMfeOffloadCache {
 public:
+    MlxMfeOffloadCache(
+        const tyloi::source::Source& source,
+        std::size_t cache_limit_bytes,
+        int experts = 0);
     MlxMfeOffloadCache(
         const MfqContainer& model,
         std::size_t cache_limit_bytes,
@@ -138,6 +146,9 @@ public:
     virtual void clear();
 
 private:
+    MlxMfeOffloadCache(const tyloi::source::Source& source, std::size_t limit, int experts,
+        std::function<void(const std::string&)> prepared);
+    MlxMfeOffloadCache(std::shared_ptr<MfqContainer> model, std::size_t limit, int experts);
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
@@ -153,10 +164,6 @@ struct MlxGroupedMmqPlan {
     int route_count = 0;
     int experts = 0;
 };
-
-// Temporary source-compatibility alias; new code uses the family-neutral
-// name because the same plan serves NINT, VQ, MX, and dense expert cohorts.
-using MlxGroupedVqMmqPlan = MlxGroupedMmqPlan;
 
 // Native packed MFE routed-expert weight.
 //
@@ -287,9 +294,6 @@ public:
         const mlx::core::array& packed_expert_ids,
         const mlx::core::array& route_weights) const;
     bool supports_grouped_mmq() const noexcept;
-    bool supports_grouped_vq_mmq() const noexcept {
-        return supports_grouped_mmq();
-    }
     bool prefers_mxfp4_smallm_nax(
         const mlx::core::array& expert_ids) const noexcept;
     bool prefers_mxfp4_nax_prefill(int route_count) const noexcept;
@@ -316,11 +320,6 @@ public:
         const mlx::core::array& expert_ids,
         const mlx::core::array& route_order,
         int block_rows = 32) const;
-    MlxGroupedMmqPlan build_grouped_vq_mmq_plan(
-        const mlx::core::array& expert_ids,
-        const mlx::core::array& route_order) const {
-        return build_grouped_mmq_plan(expert_ids, route_order);
-    }
     mlx::core::array routed_matmul_sorted(
         const mlx::core::array& input,
         const mlx::core::array& expert_ids,
@@ -341,6 +340,7 @@ public:
     int neuron_len() const noexcept;
     int projections() const noexcept;
     std::size_t packed_nbytes() const noexcept;
+    std::vector<std::shared_ptr<tyloi::TensorStorage>> backings() const;
     static std::size_t packed_copy_count() noexcept;
     static std::size_t indirect_dispatch_count() noexcept;
     static std::size_t uncached_packed_bytes() noexcept;
@@ -389,8 +389,6 @@ private:
     std::shared_ptr<const Impl> impl_;
 };
 
-using MlxMoeWeight = MlxMfeWeight;
-
 struct MlxMfeCachedProjection {
     MlxMfeWeight weight;
     mlx::core::array expert_map;
@@ -414,14 +412,14 @@ struct MlxMfeCachedRoute {
 
 // Resolve canonical split Gate/Up projections into one packed dispatch.
 // Legacy fused ``gate_up.weight`` remains a read-only compatibility input.
-MlxMoeWeight load_routed_gate_up_weight(
+MlxMfeWeight load_routed_gate_up_weight(
     const MfqContainer& model,
     const std::string& mlp_prefix);
 
 // One explicit-[tokens,routes] routed projection.
 class MlxRoutedLinear {
 public:
-    explicit MlxRoutedLinear(MlxMoeWeight weight);
+    explicit MlxRoutedLinear(MlxMfeWeight weight);
 
     static MlxRoutedLinear from_blob(
         std::span<const std::uint8_t> blob);
@@ -469,9 +467,6 @@ public:
         const mlx::core::array& route_weights) const;
     bool supports_grouped_mmq() const noexcept {
         return weight_.supports_grouped_mmq();
-    }
-    bool supports_grouped_vq_mmq() const noexcept {
-        return supports_grouped_mmq();
     }
     bool prefers_mxfp4_smallm_nax(
         const mlx::core::array& expert_ids) const noexcept {
@@ -521,11 +516,6 @@ public:
             route_order,
             block_rows);
     }
-    MlxGroupedMmqPlan build_grouped_vq_mmq_plan(
-        const mlx::core::array& expert_ids,
-        const mlx::core::array& route_order) const {
-        return build_grouped_mmq_plan(expert_ids, route_order);
-    }
     mlx::core::array forward_sorted(
         const mlx::core::array& input,
         const mlx::core::array& expert_ids,
@@ -565,12 +555,12 @@ public:
         return forward(input, expert_ids);
     }
 
-    const MlxMoeWeight& weight() const noexcept {
+    const MlxMfeWeight& weight() const noexcept {
         return weight_;
     }
 
 private:
-    MlxMoeWeight weight_;
+    MlxMfeWeight weight_;
 };
 
 struct MlxRoutedFfnResult {
@@ -585,9 +575,9 @@ struct MlxRoutedFfnResult {
 class MlxRoutedSwiGluFfn {
 public:
     MlxRoutedSwiGluFfn(
-        MlxMoeWeight gate,
-        MlxMoeWeight up,
-        MlxMoeWeight down);
+        MlxMfeWeight gate,
+        MlxMfeWeight up,
+        MlxMfeWeight down);
 
     static MlxRoutedSwiGluFfn from_blobs(
         std::span<const std::uint8_t> gate,
@@ -619,16 +609,16 @@ public:
         return forward(input, expert_ids, route_weights);
     }
 
-    const MlxMoeWeight& gate_up_weight() const noexcept {
+    const MlxMfeWeight& gate_up_weight() const noexcept {
         return gate_up_;
     }
-    const MlxMoeWeight& down_weight() const noexcept {
+    const MlxMfeWeight& down_weight() const noexcept {
         return down_;
     }
 
 private:
-    MlxMoeWeight gate_up_;
-    MlxMoeWeight down_;
+    MlxMfeWeight gate_up_;
+    MlxMfeWeight down_;
 };
 
 } // namespace tyloi::metal

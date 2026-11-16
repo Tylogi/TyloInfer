@@ -100,7 +100,7 @@ MlxRoutedLinear load_routed(
             + name);
     }
     const auto mapped = model.map_record(name);
-    auto weight = MlxMoeWeight::from_blob(mapped.view());
+    auto weight = MlxMfeWeight::from_blob(mapped.view());
     if (!allow_automatic_mxfp4_nax_prefill) {
         weight = weight.with_automatic_mxfp4_nax_prefill(false);
     }

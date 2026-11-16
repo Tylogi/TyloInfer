@@ -1090,4 +1090,13 @@ std::size_t MlxNint8ZeroWeight::packed_nbytes() const noexcept {
     return q_.nbytes() + scales_.nbytes();
 }
 
+std::vector<std::shared_ptr<tyloi::TensorStorage>> MlxNint8ZeroWeight::backings() const {
+    std::vector<std::shared_ptr<tyloi::TensorStorage>> result;
+    for (const auto* value : {&q_, &scales_}) {
+        auto storages = tyloi::metal::backings(*value);
+        result.insert(result.end(), storages.begin(), storages.end());
+    }
+    return result;
+}
+
 } // namespace tyloi::metal

@@ -26,7 +26,7 @@ int checked_int(std::int64_t value, const char* name) {
     return static_cast<int>(value);
 }
 
-MlxMoeWeight moe_weight(
+MlxMfeWeight moe_weight(
     const MfqContainer& model,
     const std::string& name) {
 #if TYLOINFER_ENABLE_MFQ_COMPAT
@@ -35,7 +35,7 @@ MlxMoeWeight moe_weight(
             "DeepSeek-V4.1 routed expert tensor must use MFE: " + name);
     }
     const auto mapped = model.map_record(name);
-    return MlxMoeWeight::from_blob(mapped.view());
+    return MlxMfeWeight::from_blob(mapped.view());
 #else
     throw std::runtime_error("Legacy MFQ inference requires a compatibility build");
 #endif
@@ -94,7 +94,7 @@ MlxDeepseekV41Moe MlxDeepseekV41Moe::load(
             "DeepSeek-V4.1 expert projection cannot be offloaded; "
             "refusing to bypass the configured cache budget: " + prefix);
     }
-    std::optional<MlxMoeWeight> gate_up;
+    std::optional<MlxMfeWeight> gate_up;
     std::optional<MlxRoutedLinear> gate;
     std::optional<MlxRoutedLinear> up;
     std::optional<MlxRoutedLinear> down;
@@ -181,7 +181,7 @@ MlxDeepseekV41Moe::MlxDeepseekV41Moe(
     MlxLinear shared_gate,
     MlxLinear shared_up,
     MlxLinear shared_down,
-    std::optional<MlxMoeWeight> routed_gate_up,
+    std::optional<MlxMfeWeight> routed_gate_up,
     std::optional<MlxRoutedLinear> routed_gate,
     std::optional<MlxRoutedLinear> routed_up,
     std::optional<MlxRoutedLinear> routed_down,

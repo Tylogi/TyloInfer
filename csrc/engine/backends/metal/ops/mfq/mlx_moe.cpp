@@ -11,7 +11,7 @@
 #include "mlx_resource_telemetry.h"
 #include "mlx_resident_budget.h"
 
-#include "mfq_container.h"
+#include "engine/weights/source/source.h"
 #include "engine/backends/cpu/native/host_parallel.h"
 #include "mfq_mfe_prefill_embedded.h"
 #include "mlx_nint.h"
@@ -24,6 +24,7 @@
 #include "engine/backends/metal/native/device.h"
 #include "engine/backends/metal/native/env.h"
 #include "engine/backends/metal/native/memory.h"
+#include "engine/backends/metal/native/tensor/tensor.h"
 #include "mlx_vq.h"
 
 #include <mlx/allocator.h>
@@ -7547,7 +7548,45 @@ void record_mfe_read(std::size_t bytes, std::chrono::steady_clock::time_point st
         std::chrono::steady_clock::now() - started).count();
 }
 
-void read_mfe_direct_targets(const MfqContainer& model, const std::string& name,
+struct MfeRecord {
+    TensorMetadata metadata;
+    source::Source::TensorReader reader;
+    source::Source::TensorBatchReader batch;
+    std::shared_ptr<std::mutex> serial;
+
+    void read_range_into(const std::string&, std::uint64_t offset, std::span<std::byte> destination) const {
+        if (offset > metadata.nbytes || destination.size() > metadata.nbytes - offset)
+            throw std::out_of_range("MFE record range is out of bounds: " + metadata.name);
+        std::unique_lock<std::mutex> lock;
+        if (serial) lock = std::unique_lock<std::mutex>(*serial);
+        if (reader) reader(offset, destination.data(), destination.size());
+        else if (batch) batch({{offset, destination.data(), destination.size()}});
+        else throw TensorReaderUnsupported("MFE record has no retained reader: " + metadata.name);
+    }
+    std::vector<std::uint8_t> read_range(const std::string& name, std::uint64_t offset, std::uint64_t size) const {
+        if (size > std::numeric_limits<std::size_t>::max()) throw std::overflow_error("MFE record range is too large");
+        std::vector<std::uint8_t> result(static_cast<std::size_t>(size));
+        read_range_into(name, offset, std::as_writable_bytes(std::span(result)));
+        return result;
+    }
+    void readv_range(const std::string&, std::uint64_t offset, std::span<const std::span<std::byte>> destinations) const {
+        std::vector<ReadSpan> spans;
+        spans.reserve(destinations.size());
+        for (auto destination : destinations) {
+            if (offset > metadata.nbytes || destination.size() > metadata.nbytes - offset)
+                throw std::out_of_range("MFE record range is out of bounds: " + metadata.name);
+            spans.push_back({offset, destination.data(), destination.size()});
+            offset += destination.size();
+        }
+        std::unique_lock<std::mutex> lock;
+        if (serial) lock = std::unique_lock<std::mutex>(*serial);
+        if (batch) batch(spans);
+        else if (reader) for (const auto& span : spans) reader(span.offset, span.destination, span.size);
+        else throw TensorReaderUnsupported("MFE record has no retained reader: " + metadata.name);
+    }
+};
+
+void read_mfe_direct_targets(const MfeRecord& model, const std::string& name,
     std::span<const MfeDirectReadTarget> targets, bool complete, std::size_t missing) {
     if (missing > kMfeDirectRangeMaxExperts || targets.size() < 2) {
         for (const auto& range : targets) {
@@ -7560,7 +7599,7 @@ void read_mfe_direct_targets(const MfqContainer& model, const std::string& name,
         return;
     }
     struct Context {
-        const MfqContainer& model;
+        const MfeRecord& model;
         const std::string& name;
         std::span<const MfeDirectReadTarget> targets;
         bool complete;
@@ -7596,7 +7635,7 @@ void read_mfe_direct_targets(const MfqContainer& model, const std::string& name,
 template <typename Bytes>
 void append_record_range(
     Bytes& target,
-    const MfqContainer& model,
+    const MfeRecord& model,
     const std::string& name,
     std::uint64_t offset,
     std::uint64_t nbytes) {
@@ -7613,7 +7652,7 @@ void append_record_range(
     record_mfe_read(nbytes, started);
 }
 
-void read_mfe_batch(const MfqContainer& model, const std::string& name,
+void read_mfe_batch(const MfeRecord& model, const std::string& name,
     std::span<MfeReadBytes> blobs, std::span<const MfeReadPlan> plans) {
     struct Range {
         std::uint64_t source;
@@ -7665,7 +7704,7 @@ void read_mfe_batch(const MfqContainer& model, const std::string& name,
 template <typename Bytes>
 void append_packed_value_slice(
     Bytes& target,
-    const MfqContainer& model,
+    const MfeRecord& model,
     const std::string& name,
     std::uint64_t stream_offset,
     std::size_t first_value,
@@ -7891,7 +7930,7 @@ std::size_t streamed_expert_storage_bound(
 }
 
 MfeNintStreamLayout parse_streamed_nint_layout(
-    const MfqContainer& model,
+    const MfeRecord& model,
     const std::string& name,
     std::uint64_t payload_offset,
     std::uint64_t payload_bytes,
@@ -8085,7 +8124,7 @@ MfeNintStreamLayout parse_streamed_nint_layout(
 }
 
 MfeNvqJscStreamLayout parse_streamed_nvq_jsc_layout(
-    const MfqContainer& model,
+    const MfeRecord& model,
     const std::string& name,
     std::uint64_t payload_offset,
     std::uint64_t payload_bytes,
@@ -8215,7 +8254,7 @@ MfeNvqJscStreamLayout parse_streamed_nvq_jsc_layout(
 // planar JSC, but use a one-bit delta per group instead of seven-bit signs.
 // Keep the codebook prefix intact and slice packed streams at bit boundaries.
 MfeNvqJscStreamLayout parse_streamed_nvq1_layout(
-    const MfqContainer& model,
+    const MfeRecord& model,
     const std::string& name,
     std::uint64_t payload_offset,
     std::uint64_t payload_bytes,
@@ -8283,7 +8322,7 @@ MfeNvqJscStreamLayout parse_streamed_nvq1_layout(
 }
 
 MfeMxStreamLayout parse_streamed_mx_layout(
-    const MfqContainer& model,
+    const MfeRecord& model,
     const std::string& name,
     std::uint64_t payload_offset,
     std::uint64_t payload_bytes,
@@ -8352,7 +8391,7 @@ MfeMxStreamLayout parse_streamed_mx_layout(
 template <typename Bytes>
 void append_streamed_nint_expert(
     Bytes& result,
-    const MfqContainer& model,
+    const MfeRecord& model,
     const std::string& name,
     const MfeNintStreamLayout& layout,
     int local_expert,
@@ -8477,7 +8516,7 @@ void append_streamed_nint_expert(
 template <typename Bytes>
 void append_streamed_nvq_expert(
     Bytes& result,
-    const MfqContainer& model,
+    const MfeRecord& model,
     const std::string& name,
     const MfeNvqJscStreamLayout& layout,
     int local_expert,
@@ -8537,7 +8576,7 @@ void append_streamed_nvq_expert(
 template <typename Bytes>
 void append_streamed_mx_expert(
     Bytes& result,
-    const MfqContainer& model,
+    const MfeRecord& model,
     const std::string& name,
     const MfeMxStreamLayout& layout,
     int local_expert,
@@ -8599,7 +8638,7 @@ void append_streamed_mx_expert(
 template <typename Bytes>
 void append_streamed_mfe_expert_payload(
     Bytes& result,
-    const MfqContainer& model,
+    const MfeRecord& model,
     const std::string& name,
     const MfeStreamPool& pool,
     int local_expert,
@@ -8739,15 +8778,27 @@ struct MlxMfeOffloadCache::Impl {
         std::shared_ptr<const MfeStreamProjection>>;
 
     Impl(
-        const MfqContainer& source,
+        const source::Source& source,
         std::size_t limit,
-        int expert_count)
-        : model(source),
-          cache_limit(limit),
-          experts(expert_count) {
+        int expert_count,
+        std::function<void(const std::string&)> observer)
+        : cache_limit(limit),
+          experts(expert_count), prepared(std::move(observer)) {
         if (experts < 0) {
             throw std::invalid_argument(
                 "MFE offload expert count cannot be negative");
+        }
+        auto serial = source.supports_parallel_tensor_reads() ? std::shared_ptr<std::mutex>{} : std::make_shared<std::mutex>();
+        for (const auto& metadata : source.tensors()) {
+            MfeRecord record{metadata, {}, {}, serial};
+            if (metadata.dtype == "MFE" || is_nint_dtype(metadata.dtype)) {
+                // Unsupported readers fail when that record is used.
+                try { record.batch = source.tensor_batch_reader(metadata.name); }
+                catch (const TensorReaderUnsupported&) {}
+                try { record.reader = source.tensor_reader(metadata.name); }
+                catch (const TensorReaderUnsupported&) {}
+            }
+            records.emplace(metadata.name, std::move(record));
         }
         PackedCopyPrimitive(mlx::core::default_stream(mlx::core::Device::gpu), Shape{1}, {}).prepare_gpu();
         resources.bind([this] {
@@ -8869,7 +8920,8 @@ struct MlxMfeOffloadCache::Impl {
     }
 
     std::shared_ptr<const MfeStreamProjection> parse_nint_projection(const std::string& name) {
-        const auto& record = model.record(name);
+        const auto& model = record(name);
+        const auto& record = model.metadata;
         if (record.nbytes < 50)
             throw std::runtime_error("truncated streamed NINT expert header: " + name);
         const auto header = model.read_range(name, 0, 50);
@@ -8899,7 +8951,8 @@ struct MlxMfeOffloadCache::Impl {
     std::shared_ptr<const MfeStreamProjection>
     parse_mfe_projection(
         const std::string& name) {
-        const auto& record = model.record(name);
+        const auto& model = record(name);
+        const auto& record = model.metadata;
         if (is_nint_dtype(record.dtype)) return parse_nint_projection(name);
         if (record.dtype != "MFE") {
             throw MfeStreamUnsupported(
@@ -9099,7 +9152,7 @@ struct MlxMfeOffloadCache::Impl {
         }
         auto result = parse_mfe_projection(name);
         mfe_projections.emplace(name, result);
-        model.record_prepared(name);
+        if (prepared) prepared(name);
         return result;
     }
 
@@ -9147,18 +9200,22 @@ struct MlxMfeOffloadCache::Impl {
             location.pool->dtype.end());
         blob.insert(blob.end(), runtime.begin(), runtime.end());
         const auto payload_begin = blob.size();
-        append_streamed_mfe_expert_payload(blob, model, name, *location.pool,
+        append_streamed_mfe_expert_payload(blob, record(name), name, *location.pool,
             location.local_expert, projection.out_per_expert);
         patch_scalar_bytes<std::uint64_t>(blob, 28, blob.size() - payload_begin,
             "streamed MFE payload size");
         return blob;
     }
 
-    // Own the record table and source paths.  Streamed layers frequently
-    // outlive the MfqContainer object used by their load call.
-    MfqContainer model;
+    const MfeRecord& record(const std::string& name) const {
+        const auto found = records.find(name);
+        if (found == records.end()) throw std::runtime_error("missing MFE record: " + name);
+        return found->second;
+    }
+    std::unordered_map<std::string, MfeRecord> records;
     std::size_t cache_limit = 0;
     const int experts = 0;
+    std::function<void(const std::string&)> prepared;
     mutable std::mutex mutex;
     std::unordered_map<
         std::string,
@@ -9223,13 +9280,13 @@ struct MlxMfeOffloadCache::Impl {
 };
 
 MlxMfeOffloadCache::MlxMfeOffloadCache(
-    const MfqContainer& model,
-    std::size_t cache_limit_bytes,
-    int experts)
-    : impl_(std::make_unique<Impl>(
-          model,
-          cache_limit_bytes,
-          experts)) {}
+    const source::Source& model, std::size_t limit, int experts)
+    : MlxMfeOffloadCache(model, limit, experts, {}) {}
+
+MlxMfeOffloadCache::MlxMfeOffloadCache(
+    const source::Source& model, std::size_t limit, int experts,
+    std::function<void(const std::string&)> prepared)
+    : impl_(std::make_unique<Impl>(model, limit, experts, std::move(prepared))) {}
 
 MlxMfeOffloadCache::~MlxMfeOffloadCache() =
     default;
@@ -9259,7 +9316,7 @@ bool MlxMfeOffloadCache::can_group_mfe(
 void MlxMfeOffloadCache::activate_record(const std::string& name) {
     std::lock_guard lock(impl_->mutex);
     (void)impl_->mfe_projection_locked(name);
-    impl_->backing_records.emplace(name, impl_->model.record(name).nbytes);
+    impl_->backing_records.emplace(name, impl_->record(name).metadata.nbytes);
 }
 
 void MlxMfeOffloadCache::prepare_projection(
@@ -9446,7 +9503,7 @@ std::optional<std::vector<MlxMfeWeight>> MlxMfeOffloadCache::layer_mfe(
         std::lock_guard lock(impl_->mutex);
         for (const auto& name : names) {
             const auto projection = impl_->mfe_projection_locked(name);
-            bytes = checked_add(bytes, impl_->model.record(name).nbytes, "MFE layer bytes");
+            bytes = checked_add(bytes, impl_->record(name).metadata.nbytes, "MFE layer bytes");
             const auto elements = checked_product(checked_product(projection->experts,
                 projection->out_per_expert, "MFE layer rows"), projection->neuron_len,
                 "MFE layer elements");
@@ -9488,7 +9545,7 @@ std::optional<std::vector<MlxMfeWeight>> MlxMfeOffloadCache::layer_mfe(
                 for (auto index = begin; index < end; ++index) {
                     const auto offset = static_cast<std::size_t>(index) * chunk;
                     const auto started = std::chrono::steady_clock::now();
-                    impl_->model.read_range_into(name, offset, std::as_writable_bytes(
+                    impl_->record(name).read_range_into(name, offset, std::as_writable_bytes(
                         std::span(blob.data() + offset, std::min(chunk, blob.size() - offset))));
                     durations[index] = std::chrono::duration<double>(
                         std::chrono::steady_clock::now() - started).count();
@@ -9501,18 +9558,18 @@ std::optional<std::vector<MlxMfeWeight>> MlxMfeOffloadCache::layer_mfe(
         return storage;
     };
     auto storage = read_record(names.front(), allocate_wire_array(
-        static_cast<std::size_t>(impl_->model.record(names.front()).nbytes)));
+        static_cast<std::size_t>(impl_->record(names.front()).metadata.nbytes)));
     for (std::size_t index = 0; index < names.size(); ++index) {
         std::future<decltype(storage)> next;
         if (index + 1 < names.size()) {
             auto pending = allocate_wire_array(
-                static_cast<std::size_t>(impl_->model.record(names[index + 1]).nbytes));
+                static_cast<std::size_t>(impl_->record(names[index + 1]).metadata.nbytes));
             next = std::async(std::launch::async,
                 [&read_record, &names, index, pending = std::move(pending)]() mutable {
                 return read_record(names[index + 1], std::move(pending));
             });
         }
-        result.push_back(is_nint_dtype(impl_->model.record(names[index]).dtype)
+        result.push_back(is_nint_dtype(impl_->record(names[index]).metadata.dtype)
             ? MlxMfeWeight::from_nint_blob(storage) : MlxMfeWeight::from_blob(storage));
         if (next.valid()) storage = next.get();
     }
@@ -9520,7 +9577,7 @@ std::optional<std::vector<MlxMfeWeight>> MlxMfeOffloadCache::layer_mfe(
         std::lock_guard lock(impl_->mutex);
         if (epoch == impl_->epoch)
             for (const auto& name : names)
-                impl_->backing_records.emplace(name, impl_->model.record(name).nbytes);
+                impl_->backing_records.emplace(name, impl_->record(name).metadata.nbytes);
     }
     return result;
 }
@@ -9624,7 +9681,7 @@ MfeGroupTask MlxMfeOffloadCache::Impl::prepare_grouped(
             + (activation_counts.empty() ? 1 : activation_counts[index]));
     }
 
-    impl_->backing_records.emplace(name, impl_->model.record(name).nbytes);
+    impl_->backing_records.emplace(name, impl_->record(name).metadata.nbytes);
 
     const bool priority_scan = prefill_scan && impl_->prefill_priority.contains(name);
     const auto touch = [&](const Impl::Key& key, bool hit) {
@@ -9812,7 +9869,7 @@ MfeGroupTask MlxMfeOffloadCache::Impl::prepare_grouped(
                     }
                     if (batch.size() > 1) {
                         MfeReadScope observation(&reads);
-                        read_mfe_batch(impl_->model, name, wire, plans);
+                        read_mfe_batch(impl_->record(name), name, wire, plans);
                     }
                     for (std::size_t index = 0; index < batch.size(); ++index) {
                         auto& request = pending[batch[index]];
@@ -9875,7 +9932,7 @@ MfeGroupTask MlxMfeOffloadCache::Impl::prepare_grouped(
                     [](const auto& range) { return range.destination != nullptr; });
                 {
                     MfeReadScope observation(&request.reads);
-                    read_mfe_direct_targets(impl_->model, name, targets, complete, pending.size());
+                    read_mfe_direct_targets(impl_->record(name), name, targets, complete, pending.size());
                 }
                 if (deferred_scales && complete) {
                     const auto scale_offset = mx->scales_offset
@@ -12535,37 +12592,6 @@ MlxMfeWeight MlxMfeWeight::with_automatic_mxfp4_nax_prefill(
     return MlxMfeWeight(std::move(impl));
 }
 
-MlxMoeWeight load_routed_gate_up_weight(
-    const MfqContainer& model,
-    const std::string& mlp_prefix) {
-    const auto base = mlp_prefix + ".experts";
-    const auto gate_name = base + ".gate.weight";
-    const auto up_name = base + ".up.weight";
-    const bool has_gate = model.contains(gate_name);
-    const bool has_up = model.contains(up_name);
-    if (has_gate != has_up) {
-        throw std::runtime_error(
-            "incomplete routed Gate/Up pair under " + base);
-    }
-    const auto load = [&model](const std::string& name) {
-        if (model.record(name).dtype != "MFE") {
-            throw std::runtime_error(
-                "routed expert tensor must use MFE: " + name);
-        }
-        const auto mapped = model.map_record(name);
-        return MlxMoeWeight::from_blob(mapped.view());
-    };
-    if (has_gate) {
-        if (model.record(gate_name).dtype != "MFE" || model.record(up_name).dtype != "MFE") {
-            throw std::runtime_error("routed expert tensors must use MFE under " + base);
-        }
-        const auto gate = model.map_record(gate_name);
-        const auto up = model.map_record(up_name);
-        const std::array blobs{gate.view(), up.view()};
-        return MlxMoeWeight::from_projection_blobs(blobs);
-    }
-    return load(base + ".gate_up.weight");
-}
 
 array MlxMfeWeight::routed_matmul(
     const array& input,
@@ -14922,8 +14948,64 @@ std::size_t MlxMfeWeight::packed_nbytes() const noexcept {
     return impl_->packed_bytes;
 }
 
+std::vector<std::shared_ptr<tyloi::TensorStorage>> MlxMfeWeight::backings() const {
+    std::vector<std::shared_ptr<tyloi::TensorStorage>> result;
+    std::unordered_set<const void*> seen;
+    const auto append = [&](std::vector<std::shared_ptr<tyloi::TensorStorage>> storages) {
+        for (auto& storage : storages) {
+            if (!storage) continue;
+            const void* identity = storage->owner ? storage->owner.get() : storage->base;
+            if (identity && seen.insert(identity).second) result.push_back(std::move(storage));
+        }
+    };
+    const auto append_array = [&](const array& value) { append(tyloi::metal::backings(value)); };
+    std::vector<const Impl*> pending{impl_.get()};
+    std::unordered_set<const Impl*> visited;
+    while (!pending.empty()) {
+        const auto* impl = pending.back();
+        pending.pop_back();
+        if (!visited.insert(impl).second) continue;
+        for (const auto* value : {&impl->descriptors, &impl->nint_q, &impl->nint_sub_scale,
+                &impl->nint_sub_min, &impl->nint_anchor_scale, &impl->nint_anchor_min,
+                &impl->q8_q, &impl->q8_scales, &impl->vq_indices, &impl->vq_state,
+                &impl->vq_aux, &impl->vq_anchors, &impl->vq_codebooks, &impl->vq_scales,
+                &impl->vq_state_to_codebank, &impl->vq_banks, &impl->vq_parameters,
+                &impl->vq_residual_codebooks, &impl->vq_residual_first, &impl->vq_residual_second,
+                &impl->mx_values, &impl->mx_scales}) append_array(*value);
+        for (const auto* value : {&impl->indirect_addresses, &impl->packed_arena,
+                &impl->expert_order, &impl->standalone_owner, &impl->mxfp4_slot_ids})
+            if (*value) append_array(**value);
+        for (const auto& value : impl->indirect_owners) append_array(value);
+        if (impl->page_resources)
+            for (const auto& value : impl->page_resources->owners) append_array(value);
+        for (const auto& value : impl->narrow_bindings) append_array(value);
+        for (const auto& rotation : impl->rotations) append_array(rotation.signs);
+        for (const auto& cohort : impl->reference_cohorts) {
+            std::visit([&](const auto& weight) {
+                using Weight = std::decay_t<decltype(weight)>;
+                if constexpr (std::is_same_v<Weight, DenseReferenceMoeWeight>)
+                    append_array(weight.values);
+                else
+                    append(weight.backings());
+            }, cohort.weight);
+        }
+        for (const auto& cohort : impl->mxfp4_sq_cohorts) {
+            append_array(cohort.expert_map);
+            append(cohort.weight.backings());
+        }
+        for (const auto& cohort : impl->fp8_sq_cohorts) {
+            append_array(cohort.expert_map);
+            append(cohort.weight.backings());
+        }
+        for (const auto& view : impl->projection_views) pending.push_back(view.get());
+        if (impl->indirect_sources)
+            for (const auto& source : *impl->indirect_sources) pending.push_back(source.impl_.get());
+    }
+    return result;
+}
+
 MlxRoutedLinear::MlxRoutedLinear(
-    MlxMoeWeight weight)
+    MlxMfeWeight weight)
     : weight_(std::move(weight)) {
     if (weight_.projections() != 1) {
         throw std::invalid_argument(
@@ -14934,7 +15016,7 @@ MlxRoutedLinear::MlxRoutedLinear(
 MlxRoutedLinear MlxRoutedLinear::from_blob(
     std::span<const std::uint8_t> blob) {
     return MlxRoutedLinear(
-        MlxMoeWeight::from_blob(blob));
+        MlxMfeWeight::from_blob(blob));
 }
 
 array MlxRoutedLinear::forward(
@@ -15036,11 +15118,11 @@ array MlxRoutedLinear::combine_packed(
 }
 
 MlxRoutedSwiGluFfn::MlxRoutedSwiGluFfn(
-    MlxMoeWeight gate,
-    MlxMoeWeight up,
-    MlxMoeWeight down)
+    MlxMfeWeight gate,
+    MlxMfeWeight up,
+    MlxMfeWeight down)
     : gate_up_(
-          MlxMoeWeight::concatenate_projections(
+          MlxMfeWeight::concatenate_projections(
               {std::move(gate), std::move(up)})),
       down_(std::move(down)) {
     if (
@@ -15063,9 +15145,9 @@ MlxRoutedSwiGluFfn::from_blobs(
     std::span<const std::uint8_t> up,
     std::span<const std::uint8_t> down) {
     return MlxRoutedSwiGluFfn(
-        MlxMoeWeight::from_blob(gate),
-        MlxMoeWeight::from_blob(up),
-        MlxMoeWeight::from_blob(down));
+        MlxMfeWeight::from_blob(gate),
+        MlxMfeWeight::from_blob(up),
+        MlxMfeWeight::from_blob(down));
 }
 
 array MlxRoutedSwiGluFfn::forward(

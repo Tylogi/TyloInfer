@@ -187,7 +187,9 @@ Tensor Loader::experts(const std::string& name, bool, int layer, const std::stri
         throw std::invalid_argument("Metal CPU-offloaded expert banks are not available");
     const auto& dtype = require_tensor(source, name).dtype;
     if (dtype == "F32" || dtype == "F16" || dtype == "BF16") return native(name);
-    return impl_->cache.experts(source, name, layer, role);
+    auto value = impl_->cache.experts(source, name, layer, role);
+    if (placement.drop_cache) source.drop_file_cache();
+    return value;
 }
 Tensor Loader::routed(const std::string& name, int layer, std::int64_t experts,
         std::int64_t output, std::int64_t input, const std::string& role) const {

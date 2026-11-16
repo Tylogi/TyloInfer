@@ -1289,4 +1289,13 @@ array MlxFp8SqWeight::backward_input(const array& output_gradient) const {
     return mlx::core::reshape(std::move(result), std::move(output_shape));
 }
 
+std::vector<std::shared_ptr<tyloi::TensorStorage>> MlxFp8SqWeight::backings() const {
+    std::vector<std::shared_ptr<tyloi::TensorStorage>> result;
+    for (const auto* value : {&blob_, &row_q_, &row_symbol_byte_offsets_, &palette_values_, &palette_quads_, &palette_pairs_}) {
+        auto storages = tyloi::metal::backings(*value);
+        result.insert(result.end(), storages.begin(), storages.end());
+    }
+    return result;
+}
+
 } // namespace tyloi::metal

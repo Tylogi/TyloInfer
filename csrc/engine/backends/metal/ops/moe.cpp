@@ -6,6 +6,10 @@
 #include "engine/weights/moe/experts.h"
 #include "backends/metal/runtime/mlx_packed_expert_cache.h"
 #include "backends/metal/runtime/mlx_tq_expert_cache.h"
+#if TYLOINFER_ENABLE_MFQ_COMPAT
+#include "engine/tensor/encoding/metal_experts.h"
+#include "engine/backends/metal/ops/mfq/mlx_moe.h"
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -125,6 +129,24 @@ RoutedExperts routed(const Tensor& input, const Tensor& input_f32, const Tensor&
     const auto* gate = b.gate_up[0].representation<metal::ExpertBank>();
     const auto* down = b.down.representation<metal::ExpertBank>();
     Tensor result;
+#if TYLOINFER_ENABLE_MFQ_COMPAT
+    const auto* resident_gate = b.gate_up[0].representation<encoding::MetalExperts>();
+    const auto* resident_up = b.gate_up.size() == 2
+        ? b.gate_up[1].representation<encoding::MetalExperts>() : nullptr;
+    const auto* resident_down = b.down.representation<encoding::MetalExperts>();
+    if (resident_gate || resident_up || resident_down) {
+        if (!resident_gate || !resident_down || (b.gate_up.size() == 2 && !resident_up))
+            throw std::invalid_argument("incompatible resident Metal expert banks");
+        const auto& ids = metal::array(b.ids);
+        const auto& source = metal::array(x);
+        const auto limit = static_cast<float>(spec.swiglu_limit);
+        auto hidden = resident_up
+            ? resident_gate->weight().routed_swiglu_pair(resident_up->weight(), source, ids, limit)
+            : resident_gate->weight().routed_swiglu(source, ids, limit);
+        result = metal::tensor(resident_down->weight().routed_matmul_reduce(
+            hidden, ids, metal::array(route_weights)));
+    } else
+#endif
     if (gate || down || (b.gate_up.size() == 2 && b.gate_up[1].representation<metal::ExpertBank>())) {
         const auto* up = b.gate_up.size() == 2 ? b.gate_up[1].representation<metal::ExpertBank>() : nullptr;
         if (!gate || !up || !down || gate->role() != metal::ExpertRole::gate ||

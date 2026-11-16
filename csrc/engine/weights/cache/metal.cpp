@@ -6,6 +6,11 @@
 #include "engine/weights/memory.h"
 #include "engine/weights/source/read.h"
 #include "engine/weights/tq/source.h"
+#if TYLOINFER_ENABLE_MFQ_COMPAT
+#include "engine/tensor/encoding/metal_experts.h"
+#include "engine/backends/metal/ops/mfq/mlx_moe.h"
+#include "engine/backends/metal/ops/mfq/mlx_nint.h"
+#endif
 #include "mlx_tq_expert_cache.h"
 #include "mlx_gguf_expert_cache.h"
 #include "mlx_affine_expert_cache.h"
@@ -285,6 +290,22 @@ void Cache::Priority::finish() {}
 
 Tensor Cache::experts(const source::Source& source, const std::string& name,
                             int, const std::string& role) {
+#if TYLOINFER_ENABLE_MFQ_COMPAT
+    const auto& resident_record = require_tensor(source, name);
+    if (resident_record.dtype == "MFE" || metal::is_nint_dtype(resident_record.dtype)) {
+        // shortcut: MFE/NINT is fully resident; allow limits after partial-cache admission and retirement are connected.
+        if (data_->configured)
+            throw std::invalid_argument("bounded MFE/NINT expert cache is not supported");
+        const auto blob = read_tensor(source, name);
+        auto weight = resident_record.dtype == "MFE" ? metal::MlxMfeWeight::from_blob(blob)
+                                             : metal::MlxMfeWeight::from_nint_blob(blob);
+        auto value = std::make_shared<encoding::MetalExperts>(std::move(weight));
+        if (resident_record.shape && (*resident_record.shape != std::vector<std::int64_t>{value->size(0), value->size(1), value->size(2)}))
+            throw std::invalid_argument("Metal expert bank shape differs from payload: " + name);
+        observe_weight(value);
+        return value;
+    }
+#endif
     using metal::ExpertRole;
     ExpertRole kind;
     if (role == "gate") kind = ExpertRole::gate;

@@ -2586,4 +2586,13 @@ std::size_t MlxNintWeight::packed_nbytes() const noexcept {
         row_metadata_.nbytes();
 }
 
+std::vector<std::shared_ptr<tyloi::TensorStorage>> MlxNintWeight::backings() const {
+    std::vector<std::shared_ptr<tyloi::TensorStorage>> result;
+    for (const auto* value : {&q_packed_, &sub_scale_, &sub_min_, &row_metadata_}) {
+        auto storages = tyloi::metal::backings(*value);
+        result.insert(result.end(), storages.begin(), storages.end());
+    }
+    return result;
+}
+
 } // namespace tyloi::metal
