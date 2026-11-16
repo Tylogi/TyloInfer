@@ -1,9 +1,9 @@
-/** 组织业务面板网格，并按页面持久化每个面板的折叠状态。 */
+
 import { Children, isValidElement, ReactNode, useState } from 'react';
 
 export const PANEL_COLLAPSED_KEY = 'tyloinfer.studio.panel-collapsed.v2';
 
-/** 读取本地面板折叠状态，数据异常时返回空配置。 */
+
 export function loadCollapsedPanels(): Record<string, boolean> {
   try {
     const value = JSON.parse(localStorage.getItem(PANEL_COLLAPSED_KEY) || '{}');
@@ -19,13 +19,13 @@ export interface PanelDeckProps {
   labels: { collapse: string; expand: string };
 }
 
-/** 将 React 子元素键转换为稳定的面板持久化键。 */
+
 export function panelKey(panel: React.ReactElement, index: number): string {
   const value = String(panel.key ?? `panel-${index}`);
   return value.startsWith('.$') ? value.slice(2) : value.startsWith('.') ? value.slice(1) : value;
 }
 
-/** 按页面组织业务面板，并持久化每个面板的折叠状态。 */
+
 export function PanelDeck({ page, children, labels }: PanelDeckProps) {
   const panels = Children.toArray(children).filter(isValidElement);
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>(loadCollapsedPanels);

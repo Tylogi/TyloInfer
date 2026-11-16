@@ -1,4 +1,4 @@
-/** 提供 Studio 现有图标、页面标题、业务面板与指标展示组件。 */
+
 import { ReactNode } from 'react';
 import { formatNumber } from './formatters';
 import tyloInferMark from '../assets/tylogi-ai-lab-mark.svg';
@@ -49,7 +49,7 @@ export type IconName =
   | "volume-off"
   | "waveform";
 
-/** 渲染现有界面的命名图标，统一尺寸及无障碍装饰属性。 */
+
 export function Icon({ name, size = 16 }: { name: IconName; size?: number }) {
   return (
     <svg
@@ -106,7 +106,7 @@ export function Icon({ name, size = 16 }: { name: IconName; size?: number }) {
   );
 }
 
-/** 组合页面标题、副标题及可选页面操作。 */
+
 export function ScreenHeader({
   title,
   subtitle,
@@ -127,7 +127,7 @@ export function ScreenHeader({
   );
 }
 
-/** 展示业务分区标题及可选辅助文字。 */
+
 export function SectionLabel({ title, subtitle }: { title: string; subtitle?: string }) {
   return (
     <div className="section-label">
@@ -137,7 +137,7 @@ export function SectionLabel({ title, subtitle }: { title: string; subtitle?: st
   );
 }
 
-/** 提供现有业务面板的统一容器样式。 */
+
 export function TMPanel({
   children,
   className = "",
@@ -148,7 +148,7 @@ export function TMPanel({
   return <section className={`tm-panel ${className}`.trim()}>{children}</section>;
 }
 
-/** 根据模型名称及加载状态展示模型标记。 */
+
 export function ModelMonogram({
   name,
   state,
@@ -164,7 +164,7 @@ export function ModelMonogram({
   );
 }
 
-/** 展示单个运行指标及其解释信息。 */
+
 export function MetricTile({
   label,
   value,
@@ -187,7 +187,7 @@ export function MetricTile({
   );
 }
 
-/** 排列设置项的标题、说明和尾部控件。 */
+
 export function SettingRow({
   title,
   titleHint,
@@ -207,7 +207,7 @@ export function SettingRow({
   );
 }
 
-/** 展示已用容量与总容量，并限制进度条范围。 */
+
 export function UsageBar({
   label,
   used,
@@ -226,7 +226,7 @@ export function UsageBar({
   );
 }
 
-/** 呈现业务空状态及可选恢复操作。 */
+
 export function EmptyPanel({
   icon,
   title,

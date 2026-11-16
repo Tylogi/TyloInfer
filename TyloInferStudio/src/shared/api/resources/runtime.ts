@@ -1,4 +1,4 @@
-/** 封装 runtime 领域资源请求，不保存组件状态。 */
+
 import type {
   RuntimeCapabilities,
   RuntimeStatus,
@@ -195,22 +195,22 @@ export const runtimeApi = {
 
 
 
-  /** 读取语音通道可用性与默认音频参数。 */
+
   realtimeCapabilities(): Promise<RealtimeCapabilities> {
     return request('/api/runtime/realtime/capabilities');
   },
 
-  /** 查询语音输出组件的下载和激活状态。 */
+
   voiceOutputComponent(): Promise<VoiceOutputComponentStatus> {
     return request('/api/components/voice-output');
   },
 
-  /** 提交语音输出组件安装任务，不自动触发下载之外的页面操作。 */
+
   installVoiceOutputComponent(): Promise<{ operation_id: string; status: 'accepted' }> {
     return request('/api/components/voice-output/install', { method: 'POST' });
   },
 
-  /** 激活已经安装的语音输出组件。 */
+
   activateVoiceOutputComponent(): Promise<{ active: boolean; reason?: string; error?: string }> {
     return request('/api/components/voice-output/activate', { method: 'POST' });
   },
@@ -237,7 +237,7 @@ export const runtimeApi = {
     });
   },
 
-  /** 清理实例前缀缓存并返回释放后的运行状态。 */
+
   clearRuntimeCache(instanceId?: string): Promise<RuntimeStatus & { released_snapshots: number }> {
     return request('/api/runtime/cache/clear', {
       method: 'POST',
@@ -245,7 +245,7 @@ export const runtimeApi = {
     });
   },
 
-  /** 将缓存回收到目标容量，返回实际释放的字节数。 */
+
   trimRuntimeCache(
     targetBytes = 0,
     instanceId?: string,

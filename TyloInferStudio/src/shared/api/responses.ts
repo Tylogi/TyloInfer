@@ -1,10 +1,10 @@
-/** 消费并校验生成 SSE，验证事件归属、顺序与业务终态。 */
+
 import type { RealtimeFrame, StreamRequest } from './types';
 import { ApiError, apiUrl, authorizedHeaders, errorFromResponse } from './client';
 import { readEventStream } from './eventStream';
 import { validateResponseFrame, type ResponseFrame } from './responseProtocol';
 
-/** 发起一次生成并校验会话、序号与业务终态；不会自动重放生成请求。 */
+
 export async function streamResponse(
   sessionId: string,
   body: StreamRequest,

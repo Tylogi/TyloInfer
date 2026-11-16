@@ -1,4 +1,4 @@
-/** 验证全屏加载页以统一文案呈现等待状态。 */
+
 import { render, screen } from '@testing-library/react';
 import { expect, it, vi } from 'vitest';
 import { LoadingPage } from './LoadingPage';

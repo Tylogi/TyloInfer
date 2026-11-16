@@ -1,4 +1,4 @@
-/** 验证真实浏览器中的发送、恢复、取消、输入法与弹窗交互，并检查响应式布局。 */
+
 import { expect, test, type Page } from '@playwright/test';
 import { mockStudioServer, officialCatalog } from './mockServer';
 import { openModelSettings } from './modelSettings';
@@ -62,7 +62,7 @@ declare global {
   }
 }
 
-/** 在浏览器路由内切页，保持根 Provider 与进行中的请求不被整页刷新卸载。 */
+
 async function navigateClient(page: Page, path: string) {
   await page.evaluate((next) => {
     window.history.pushState(null, '', next);

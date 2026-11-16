@@ -1,11 +1,11 @@
-/** 展示模型目录浏览和注册弹窗，复用目录控制器的操作状态。 */
+
 import { Dialog } from '../../shared/ui/Dialog';
 import { Icon } from '../../app/display';
 import { useSettings } from '../settings/SettingsProvider';
 import type { useModelCatalog } from './useModelCatalog';
 import { formatBytes } from '../../app/formatters';
 
-/** 渲染服务器文件夹选择器，并在关闭时恢复触发器焦点。 */
+
 type DirectoryDialogState = Pick<ReturnType<typeof useModelCatalog>, 'modelBrowser' | 'modelBrowserOpen' | 'modelBrowserError' | 'modelBrowserLoading' | 'modelFilesMode' | 'setModelBrowserOpen' | 'modelBrowserTriggerRef' | 'busy' | 'jumpToModelDirectory' | 'openModelDirectory' | 'modelDirectoryPath' | 'setModelDirectoryPath' | 'registerCurrentModelDirectory' | 'openCurrentDirectory'>;
 
 export function ModelDirectoryDialog({ catalog, title }: { catalog: DirectoryDialogState; title?: string }) {

@@ -1,4 +1,4 @@
-/** 验证传输层保留标准 HeadersInit 并仅在内存中注入当前服务凭据。 */
+
 import { afterEach, expect, it, vi } from 'vitest';
 import { browserServiceUrl, getApiToken, onAuthenticationRequired, onServerInstanceChanged, request, runtimeRealtimeUrl, setApiBaseUrl, setApiToken, setApiServerInstance, setBrowserServiceUrl, verifyApiToken } from '../src/shared/api/client';
 import { jobsApi } from '../src/shared/api/resources/jobs';

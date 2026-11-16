@@ -1,6 +1,6 @@
-/**
- * 验证流式 Markdown 限频、Prism 语法高亮与类名生成、代码块复制交互和不可信 HTML 净化。
- */
+
+
+
 import { act, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Markdown } from './Markdown';
@@ -78,7 +78,7 @@ describe('Markdown', () => {
 
     const view = render(<Markdown text={sample} />);
 
-    // 检查 TypeScript 代码块结构与高亮
+
     const tsPre = view.container.querySelector('pre[data-language="typescript"]');
     expect(tsPre).not.toBeNull();
     expect(tsPre?.className).toContain('code-block');
@@ -88,32 +88,32 @@ describe('Markdown', () => {
     expect(tsPre?.querySelector('.token.builtin')?.textContent).toBe('number');
     expect(tsPre?.querySelector('.token.number')?.textContent).toBe('42');
 
-    // 检查 Python 代码块结构与高亮
+
     const pyPre = view.container.querySelector('pre[data-language="python"]');
     expect(pyPre).not.toBeNull();
     expect(pyPre?.querySelector('.code-lang')?.textContent).toBe('python');
     expect(pyPre?.querySelector('.token.keyword')?.textContent).toBe('def');
     expect(pyPre?.querySelector('.token.function')?.textContent).toBe('greet');
 
-    // 检查 Bash 代码块
+
     const bashPre = view.container.querySelector('pre[data-language="bash"]');
     expect(bashPre).not.toBeNull();
     expect(bashPre?.querySelector('.code-lang')?.textContent).toBe('bash');
     expect(bashPre?.querySelector('.token.string')?.textContent).toBe('"status ok"');
 
-    // 检查 JSON 代码块结构与高亮
+
     const jsonPre = view.container.querySelector('pre[data-language="json"]');
     expect(jsonPre).not.toBeNull();
     expect(jsonPre?.querySelector('.code-lang')?.textContent).toBe('json');
     expect(jsonPre?.querySelector('.token.property')?.textContent).toBe('"status"');
     expect(jsonPre?.querySelector('.token.number')?.textContent).toBe('200');
 
-    // 检查 Rust 代码块
+
     const rustPre = view.container.querySelector('pre[data-language="rust"]');
     expect(rustPre).not.toBeNull();
     expect(rustPre?.querySelector('.token.keyword')?.textContent).toBe('fn');
 
-    // 检查 C++ 代码块
+
     const cppPre = view.container.querySelector('pre[data-language="cpp"]');
     expect(cppPre).not.toBeNull();
     expect(cppPre?.querySelector('.token.keyword')?.textContent).toBe('int');
@@ -133,14 +133,14 @@ describe('Markdown', () => {
 
     const view = render(<Markdown text={rawMarkdown} />);
 
-    // 未提供语言时降级为 text 标签并安全转义
+
     const textPre = view.container.querySelector('pre[data-language="text"]');
     expect(textPre).not.toBeNull();
     expect(textPre?.querySelector('.code-lang')?.textContent).toBe('text');
     expect(textPre?.querySelector('script')).toBeNull();
     expect(textPre?.textContent).toContain('<script>alert(1)</script>');
 
-    // 未知语言时保留原始语言名且安全转义内部 HTML
+
     const unknownPre = view.container.querySelector('pre[data-language="unknownlang"]');
     expect(unknownPre).not.toBeNull();
     expect(unknownPre?.className).toContain('language-unknownlang');

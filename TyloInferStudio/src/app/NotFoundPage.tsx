@@ -1,10 +1,10 @@
-/** 未注册地址的 404 页面，保留工作区导航并提供明确的返回入口。 */
+
 import { ArrowLeftIcon, HouseIcon } from '@phosphor-icons/react';
 import { useNavigate } from 'react-router';
 import { useSettings } from '../features/settings/SettingsProvider';
 import tyloInferMark from '../assets/tylogi-ai-lab-mark.svg';
 
-/** 在未知路由展示独立页面，不重定向或改写用户输入的地址。 */
+
 export function NotFoundPage() {
   const navigate = useNavigate();
   const { tr } = useSettings();

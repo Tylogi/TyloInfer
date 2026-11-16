@@ -1,4 +1,4 @@
-/** 验证旧 Studio 契约中的 Markdown 修复、模型链接下载及面板持久化行为；少量接线检查单独标为过渡源码。 */
+
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';

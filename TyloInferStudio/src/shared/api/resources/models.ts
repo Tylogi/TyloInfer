@@ -1,4 +1,4 @@
-/** 封装 models 领域资源请求，不保存组件状态。 */
+
 import type {
   ModelArtifact,
   ModelDeletionPlan,
@@ -62,14 +62,14 @@ export const modelsApi = {
   }> {
     return request('/api/hub/download-sources/probe', { method: 'POST', body: JSON.stringify({ sources }), signal });
   },
-  /** 列出模型资产；refresh 为真时要求服务重新扫描。 */
+
   async modelArtifacts(refresh = false, includeComponents = false): Promise<ModelArtifact[]> {
     return (
       await request<{ data: ModelArtifact[] }>(`/api/models${refresh || includeComponents ? `?${new URLSearchParams({ ...(refresh ? { refresh: 'true' } : {}), ...(includeComponents ? { include_components: 'true' } : {}) })}` : ''}`)
     ).data;
   },
 
-  /** 浏览服务端模型目录，优先使用目录标识，其次使用完整路径。 */
+
   modelDirectories(directoryId?: string | null, path?: string | null, signal?: AbortSignal): Promise<ModelDirectoryList> {
     const query = new URLSearchParams();
     if (directoryId) query.set('directory_id', directoryId);
@@ -106,7 +106,7 @@ export const modelsApi = {
     });
   },
 
-  /** 注册目录内的模型资产，返回新增或更新的模型记录。 */
+
   async registerModelDirectory(directoryId: string): Promise<ModelArtifact[]> {
     return (
       await request<{ data: ModelArtifact[] }>('/api/models/directories/register', {
@@ -140,7 +140,7 @@ export const modelsApi = {
     });
   },
 
-  /** 提交实例卸载任务；强制卸载需调用方先确认用户意图。 */
+
   unloadModel(
     instanceId: string,
     force = false,
@@ -151,7 +151,7 @@ export const modelsApi = {
     });
   },
 
-  /** 在指定模型仓库搜索远程模型条目。 */
+
   async searchHubModels(
     provider: HubModelSummary['provider'],
     query: string,
@@ -166,12 +166,12 @@ export const modelsApi = {
     return request(`/api/hub/models/${model.provider}/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/readme?${new URLSearchParams({ revision: model.revision })}`, { signal });
   },
 
-  /** 读取内置官方目录以及服务端评估的设备适配建议。 */
+
   officialHubModels(refresh = false, signal?: AbortSignal): Promise<OfficialModelList> {
     return request(`/api/hub/official${refresh ? '?refresh=true' : ''}`, { signal });
   },
 
-  /** 解析 owner/repo 或受信任的 Hugging Face、ModelScope 仓库链接。 */
+
   resolveHubModel(
     reference: string,
     fallbackProvider: HubModelSummary['provider'],
@@ -187,7 +187,7 @@ export const modelsApi = {
     });
   },
 
-  /** 读取远程模型的版本、文件列表与容量信息。 */
+
   hubModelInfo(
     provider: HubModelSummary['provider'],
     repoId: string,

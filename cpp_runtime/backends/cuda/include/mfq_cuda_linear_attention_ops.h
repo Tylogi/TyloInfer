@@ -5,6 +5,18 @@
 #include <cstdint>
 #include <vector>
 
+// Restore a speculative prefix using retained K/V and the pre-window states.
+// Accepts strided token prefixes, omits readout, and commits convolution history
+// in the same launch. Returns false without modifying output for unsupported layouts.
+bool try_gdn_replay_state_cuda(
+    const mfq_tensor_backend::Tensor& key, const mfq_tensor_backend::Tensor& value,
+    const mfq_tensor_backend::Tensor& gate, const mfq_tensor_backend::Tensor& beta,
+    const mfq_tensor_backend::Tensor& qkv,
+    const mfq_tensor_backend::Tensor& initial_convolution,
+    const mfq_tensor_backend::Tensor& initial_recurrent,
+    mfq_tensor_backend::Tensor& convolution, mfq_tensor_backend::Tensor& recurrent,
+    int64_t retained_tokens, bool transposed, bool tiled_heads);
+
 std::vector<mfq_tensor_backend::Tensor> linear_gate_beta_cuda(
     mfq_tensor_backend::Tensor alpha, mfq_tensor_backend::Tensor beta, mfq_tensor_backend::Tensor dt_bias, mfq_tensor_backend::Tensor a_log,
     bool stable_softplus = false);
@@ -24,6 +36,20 @@ std::vector<mfq_tensor_backend::Tensor> linear_conv_qkv_gate_prefill_cuda(
     mfq_tensor_backend::Tensor weight,mfq_tensor_backend::Tensor alpha,
     mfq_tensor_backend::Tensor beta,mfq_tensor_backend::Tensor dt_bias,
     mfq_tensor_backend::Tensor a_log,int64_t nk,int64_t nv,int64_t width,double eps);
+// Preserve the model's softplus arithmetic when fusing gate preparation.
+std::vector<mfq_tensor_backend::Tensor> linear_conv_qkv_gate_prefill_cuda(
+    mfq_tensor_backend::Tensor state,mfq_tensor_backend::Tensor qkv,
+    mfq_tensor_backend::Tensor weight,mfq_tensor_backend::Tensor alpha,
+    mfq_tensor_backend::Tensor beta,mfq_tensor_backend::Tensor dt_bias,
+    mfq_tensor_backend::Tensor a_log,int64_t nk,int64_t nv,int64_t width,double eps,
+    bool stable_softplus);
+// Restore the exact separable GEMM scales while reading each convolution tap.
+std::vector<mfq_tensor_backend::Tensor> linear_conv_qkv_gate_scaled_prefill_cuda(
+    mfq_tensor_backend::Tensor state,mfq_tensor_backend::Tensor product,
+    mfq_tensor_backend::Tensor row_exponents,mfq_tensor_backend::Tensor column_exponents,
+    mfq_tensor_backend::Tensor weight,mfq_tensor_backend::Tensor alpha,mfq_tensor_backend::Tensor beta,
+    mfq_tensor_backend::Tensor dt_bias,mfq_tensor_backend::Tensor a_log,int64_t nk,int64_t nv,int64_t width,
+    double eps,bool stable_softplus);
 std::vector<mfq_tensor_backend::Tensor> linear_conv_qkv_gate_short_cuda(
     mfq_tensor_backend::Tensor state,mfq_tensor_backend::Tensor qkv,
     mfq_tensor_backend::Tensor weight,mfq_tensor_backend::Tensor alpha,
@@ -42,6 +68,10 @@ std::vector<mfq_tensor_backend::Tensor> gdn_inplace_transposed_tiled_cuda(
     mfq_tensor_backend::Tensor g, mfq_tensor_backend::Tensor beta, mfq_tensor_backend::Tensor state);
 mfq_tensor_backend::Tensor ssm_conv_silu_cuda(mfq_tensor_backend::Tensor conv_input, mfq_tensor_backend::Tensor weight, mfq_tensor_backend::Tensor bias, int64_t n_tokens);
 mfq_tensor_backend::Tensor ssm_conv_silu_decode_cuda(mfq_tensor_backend::Tensor state, mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor weight, mfq_tensor_backend::Tensor bias);
+std::vector<mfq_tensor_backend::Tensor> linear_conv_qkv_decode_f32_cuda(
+    mfq_tensor_backend::Tensor state,mfq_tensor_backend::Tensor input,
+    mfq_tensor_backend::Tensor weight,mfq_tensor_backend::Tensor bias,
+    int64_t nk,int64_t nv,int64_t dk,int64_t dv,double eps);
 std::vector<mfq_tensor_backend::Tensor> linear_conv_qkv_decode_cuda(
     mfq_tensor_backend::Tensor state, mfq_tensor_backend::Tensor qk, mfq_tensor_backend::Tensor v, mfq_tensor_backend::Tensor weight, mfq_tensor_backend::Tensor bias,
     int64_t nk, int64_t nv, int64_t dk, int64_t dv, double eps);
@@ -58,8 +88,9 @@ std::vector<mfq_tensor_backend::Tensor> linear_conv_qkv_gate_decode_cuda(
 // With inplace_state, every CTA owns disjoint recurrent columns and returns the
 // updated input storage. The caller must exclusively own that recurrent state.
 // Optional CUDA int64 [B,3] addresses select independently owned convolution,
-// recurrent states and counters. This requires inplace_state; convolution is committed
-// after every core CTA completes, and the returned state aliases row zero.
+// recurrent states and counters. This requires inplace_state; in-place convolution
+// is committed after every reader in its key-head group finishes. The returned
+// convolution remains contiguous [B,taps-1,channels]; state aliases row zero.
 std::vector<mfq_tensor_backend::Tensor> gdn_decode_core_cuda(
     mfq_tensor_backend::Tensor qkv, mfq_tensor_backend::Tensor output_gate,
     mfq_tensor_backend::Tensor alpha, mfq_tensor_backend::Tensor beta,

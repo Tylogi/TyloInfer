@@ -1,4 +1,4 @@
-/** 管理界面与推理设置的默认值、本地读取及模型模式继承规则。 */
+
 import { RealtimeCapabilities, RuntimeStatus, SessionMode } from '../../shared/api/types';
 
 export type UiLanguage = "system" | "zh-CN" | "en";
@@ -61,7 +61,7 @@ export const PRESETS: Record<Exclude<PresetName, "custom">, Partial<GenerationSe
   creative: { temperature: 1, topP: 0.95, topK: 50, repetitionPenalty: 1 },
 };
 
-/** 根据会话模式和服务默认值生成推理设置，不修改输入对象。 */
+
 export function modeTemplateSettings(
   current: GenerationSettings,
   mode: SessionMode,
@@ -108,7 +108,7 @@ export function modeTemplateSettings(
   };
 }
 
-/** 读取本地界面及推理设置，损坏或缺失时使用默认值。 */
+
 export function loadSettings(): GenerationSettings {
   try {
     const raw: unknown = JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}");

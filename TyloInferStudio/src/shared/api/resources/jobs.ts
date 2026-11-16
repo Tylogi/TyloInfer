@@ -8,12 +8,12 @@ export const jobsApi = {
   getJob(id: string): Promise<JobResource> {
     return request(`/api/jobs/${id}`);
   },
-  /** 获取最近的后台任务。 */
+
   async jobs(limit = 100): Promise<JobResource[]> {
     return (await request<{ data: JobResource[] }>(`/api/jobs?limit=${limit}`)).data;
   },
 
-  /** 提交后台任务并返回初始任务记录。 */
+
   createJob(kind: string, payload: Record<string, unknown>): Promise<JobResource> {
     return request('/api/jobs', {
       method: 'POST',
@@ -21,17 +21,17 @@ export const jobsApi = {
     });
   },
 
-  /** 请求取消指定后台任务。 */
+
   cancelJob(id: string): Promise<JobResource> {
     return request(`/api/jobs/${id}/cancel`, { method: 'POST' });
   },
 
-  /** 根据已有任务重新创建执行尝试。 */
+
   retryJob(id: string): Promise<JobResource> {
     return request(`/api/jobs/${id}/retry`, { method: 'POST' });
   },
 
-  /** 移除指定任务历史记录。 */
+
   async deleteJob(id: string): Promise<void> {
     const response = await fetch(apiUrl(`/api/jobs/${id}`), {
       method: 'DELETE',
@@ -40,7 +40,7 @@ export const jobsApi = {
     if (!response.ok) throw await errorFromResponse(response);
   },
 
-  /** 清理已经完成的任务记录，不删除对应模型产物。 */
+
   async clearCompletedJobs(): Promise<void> {
     const response = await fetch(apiUrl('/api/jobs/completed'), {
       method: 'DELETE',
@@ -49,7 +49,7 @@ export const jobsApi = {
     if (!response.ok) throw await errorFromResponse(response);
   },
 
-  /** 读取任务历史事件并转换为日志展示条目。 */
+
   async jobEvents(id: string, signal?: AbortSignal): Promise<RuntimeLogEntry[]> {
     const response = await request<{
       data: Array<{

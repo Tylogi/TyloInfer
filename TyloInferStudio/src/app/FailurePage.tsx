@@ -1,4 +1,4 @@
-/** 统一展示工作区阻断性故障，并提供重试及离开当前页面的操作。 */
+
 import { ArrowLeftIcon, ArrowClockwiseIcon, PlugsIcon, WarningCircleIcon } from '@phosphor-icons/react';
 import { useNavigate } from 'react-router';
 import { useSettings } from '../features/settings/SettingsProvider';
@@ -23,7 +23,7 @@ interface FailureViewProps {
   onLeave: () => void;
 }
 
-/** 不依赖应用上下文地渲染失败页，使顶层异常边界也能安全使用。 */
+
 export function FailureView({ kind, code, title, description, retryLabel, leaveLabel, detailLabel, detail, onRetry, onLeave }: FailureViewProps) {
   return (
     <section aria-labelledby="failure-title" className="failure-page" role="alert">
@@ -65,7 +65,7 @@ export function FailureView({ kind, code, title, description, retryLabel, leaveL
   );
 }
 
-/** 在主工作区显示可恢复的失败页面，连接故障允许前往服务器设置。 */
+
 export function FailurePage({ kind, detail, onRetry }: FailurePageProps) {
   const { tr } = useSettings();
   const navigate = useNavigate();

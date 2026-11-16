@@ -24,6 +24,14 @@ from tyloinfer.server.state.storage import SessionStore
 
 
 @pytest.fixture(autouse=True)
+def _download_disk_capacity(monkeypatch):
+    import shutil
+
+    capacity = shutil._ntuple_diskusage(4 << 30, 1 << 30, 3 << 30)
+    monkeypatch.setattr("tyloinfer.server.runtime.disk_budget.shutil.disk_usage", lambda _: capacity)
+
+
+@pytest.fixture(autouse=True)
 def _python_script_executables_on_windows(tmp_path, monkeypatch):
     if os.name != 'nt':
         return
@@ -83,9 +91,9 @@ def test_standalone_cli_jobs_reinvoke_the_unified_mfq_binary(tmp_path: Path) -> 
         ),
     )
 
-    assert handlers._mfq_command("wt2-reference", "input", "output") == [
+    assert handlers._mfq_command("_hub-download", "input", "output") == [
         str(executable),
-        "wt2-reference",
+        "_hub-download",
         "input",
         "output",
     ]

@@ -1,4 +1,4 @@
-/** 验证输入草稿隔离、父级渲染边界以及业务未接受时保留输入。 */
+
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, expect, it, vi } from 'vitest';

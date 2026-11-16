@@ -6,6 +6,14 @@
 #include "core/full_block.h"
 #include "models/qwen35/causal_lm.h"
 #include "ops.h"
+#include "runtime/decode_window.h"
+#include "mfq_cuda_context.h"
+#include "mfq_cuda_sampling_ops.h"
+#include "runtime/graph_pool_lease.h"
+#include "models/qwen35/mtp_graph.h"
+#include <map>
+#include <tuple>
+#include <iostream>
 
 // Qwen3.5's predictor shares the main embedding/output head and owns only
 // its fusion/norm/attention/FFN weights and an independent attention history.
@@ -16,6 +24,37 @@ struct Qwen35Mtp final : MtpModule {
     std::vector<std::unique_ptr<Block>> blocks;
     CudaExecutionContext *execution = nullptr;
     int64_t cache_pos = 0;
+    struct PredictorGraphs {
+        using Tensor=mfq_tensor_backend::Tensor;
+        struct Cell {
+            mfq::cuda::DecodeWindow graph;
+            Tensor hidden,ids,positions,physical_positions,lengths,output,logits;
+            explicit Cell(cudaStream_t stream):graph(stream){}
+        };
+        struct GreedyCell {
+            mfq::cuda::DecodeWindow graph;
+            Tensor hidden,ids,positions,physical_positions,lengths,proposals,verification_ids;
+            explicit GreedyCell(cudaStream_t stream):graph(stream){}
+        };
+        std::shared_ptr<mfq::cuda::Context> context;
+        cudaStream_t stream;
+        std::shared_ptr<mfq::cuda::GraphPoolLease> pool;
+        const void* target_identity=nullptr;
+        std::vector<std::pair<const void*,const void*>> cache_addresses;
+        std::map<std::tuple<int,int64_t,int>,std::unique_ptr<Cell>> cells;
+        std::map<std::tuple<int,int64_t,int>,std::unique_ptr<GreedyCell>> greedy_cells;
+        uint64_t captures=0,replays=0;
+        PredictorGraphs():context(mfq::cuda::default_context(mfq_current_cuda_device())),
+            stream(mfq_current_cuda_stream()),pool(mfq::cuda::GraphPoolLease::acquire(context,stream)) {}
+        ~PredictorGraphs() {
+            greedy_cells.clear();
+            cells.clear();
+            std::cerr<<"runtime_qwen35_predictor_graph captures="<<captures<<" replays="<<replays<<'\n';
+        }
+    };
+    std::unique_ptr<PredictorGraphs> predictor_graphs;
+    bool graph_initialized=false;
+    std::shared_ptr<mfq::cuda::qwen35::MtpTargetGraphs> target_graphs;
 
     static std::optional<Qwen35Mtp> load_if_present(const mfq::ModelSource &file,
                                                     const mfq::cuda::qwen35::Config &main,
@@ -55,6 +94,7 @@ struct Qwen35Mtp final : MtpModule {
     }
 
     void reset(int64_t batch = 1) override {
+        if(batch!=1){predictor_graphs.reset();target_graphs.reset();}
         cache_pos = 0;
         for (auto &block : blocks)
             block->reset(batch);
@@ -65,9 +105,193 @@ struct Qwen35Mtp final : MtpModule {
         return evaluate(target, std::move(hidden), std::move(next_ids), {});
     }
 
+    bool take_graph_initialization() noexcept override {return std::exchange(graph_initialized,false);}
+    uint64_t graph_replay_count() const noexcept override {return predictor_graphs?predictor_graphs->replays:0;}
+
+    MtpStep step(const MtpTarget& target,mfq_tensor_backend::Tensor hidden,
+                 mfq_tensor_backend::Tensor ids) override {
+        return step_positioned(target,std::move(hidden),std::move(ids),{});
+    }
+
+    PredictorGraphs* graph_registry(const MtpTarget& target,
+            const mfq_tensor_backend::Tensor& hidden,const mfq_tensor_backend::Tensor& ids,
+            const mfq_tensor_backend::Tensor& positions) {
+        namespace tb=mfq_tensor_backend;
+        if(cache_pos<=0 || hidden.dim()!=3 || ids.dim()!=2 || ids.size(0)!=1 || ids.size(1)<1 ||
+                ids.size(1)>1+mfq::engine::mtp::kMaximumReportedDraftDepth ||
+                hidden.size(0)!=1 || hidden.size(1)!=ids.size(1) || !hidden.is_cuda() || ids.device()!=hidden.device() ||
+                target.rope->sections.numel()!=0 || execution->layer_placement.enabled() ||
+                execution->dense_cpu_layer_count || (positions.defined() && positions.numel()!=ids.size(1)))return {};
+        std::vector<std::pair<const void*,const void*>> addresses;
+        for(const auto& block:blocks) {
+            auto* full=dynamic_cast<FullBlock*>(block.get());
+            if(!full || full->cpu_offloaded || full->cuda_device!=hidden.get_device() ||
+                    !full->cache.defined() || full->cache.is_paged() || full->cache.quantization.enabled())return {};
+            addresses.emplace_back(full->cache.k.data_ptr(),full->cache.v.data_ptr());
+        }
+        const auto identity=std::visit([](const auto* p){return static_cast<const void*>(p);},target.model);
+        if(predictor_graphs && predictor_graphs->stream!=mfq_current_cuda_stream())predictor_graphs.reset();
+        if(!predictor_graphs)predictor_graphs=std::make_unique<PredictorGraphs>();
+        auto& registry=*predictor_graphs;
+        if(registry.target_identity!=identity || registry.cache_addresses!=addresses) {
+            registry.greedy_cells.clear();registry.cells.clear();
+            registry.target_identity=identity;registry.cache_addresses=std::move(addresses);
+        }
+        return &registry;
+    }
+
+    std::optional<MtpStep> graph_step(const MtpTarget& target,
+            const mfq_tensor_backend::Tensor& hidden,const mfq_tensor_backend::Tensor& ids,
+            const mfq_tensor_backend::Tensor& positions, int history_mode = 0) {
+        namespace tb=mfq_tensor_backend;
+        auto* graphs=graph_registry(target,hidden,ids,positions);
+        if(!graphs)return {};
+        auto& registry=*graphs;
+        const auto tokens=ids.size(1);
+        auto& owner=registry.cells[{int(hidden.scalar_type()),tokens,history_mode}];
+        if(!owner)owner=std::make_unique<PredictorGraphs::Cell>(registry.stream);
+        auto& cell=*owner;const auto start=cache_pos;
+        auto physical=tb::arange(start,start+tokens,ids.options());
+        auto pos=positions.defined()?positions.reshape({tokens}).to(ids.device(),tb::kInt64).contiguous():physical;
+        if(!cell.ids.defined()) {
+            cell.hidden=hidden.contiguous().clone();cell.ids=ids.clone();cell.positions=pos.clone();
+            cell.physical_positions=physical.clone();cell.lengths=tb::full({1},start+tokens,ids.options());
+        } else {
+            cell.hidden.copy_(hidden);cell.ids.copy_(ids);cell.positions.copy_(pos);
+            cell.physical_positions.copy_(physical);cell.lengths.fill_(start+tokens);
+        }
+        if(!cell.graph.valid()) {
+            cell.graph.capture([&] {
+                if(history_mode==2 && tokens>1) {
+                    (void)evaluate(target,cell.hidden.narrow(1,0,tokens-1),cell.ids.narrow(1,0,tokens-1),
+                        cell.positions.narrow(0,0,tokens-1),cell.physical_positions.narrow(0,0,tokens-1),{},true);
+                    cell.output=evaluate(target,cell.hidden.narrow(1,tokens-1,1),cell.ids.narrow(1,tokens-1,1),
+                        cell.positions.narrow(0,tokens-1,1),cell.physical_positions.narrow(0,tokens-1,1),cell.lengths);
+                } else cell.output=evaluate(target,cell.hidden,cell.ids,cell.positions,
+                    cell.physical_positions,cell.lengths,history_mode==1);
+                if(history_mode!=1)cell.logits=target.logits(cell.output.narrow(1,cell.output.size(1)-1,1)
+                    .to(tb::kFloat16).contiguous()).reshape({1,-1});
+            },[&]{cache_pos=start;},[&]{cell.output={};cell.logits={};});
+            ++registry.captures;graph_initialized=true;
+            std::cerr<<"runtime_qwen35_predictor_graph_capture rows="<<tokens<<" history_mode="<<history_mode
+                <<" nodes="<<cell.graph.nodes()<<'\n';
+        }
+        // Input copies, sampling and the next predictor step use this stream.
+        // Keep them ordered without waiting for each device-only graph on the
+        // host. Graphs with CPU work or I/O retain their synchronous replay.
+        if(!cell.graph.enqueue_if_device_only())cell.graph.run();
+        ++registry.replays;cache_pos=start+tokens;
+        if(history_mode==1)return MtpStep{};
+        auto output=cell.output.clone();
+        return MtpStep{output,output,cell.logits};
+    }
+
+    bool cache_only_history_supported() const noexcept {
+        // With several predictor layers, earlier outputs feed the next layer.
+        return blocks.size()==1 && dynamic_cast<const FullBlock*>(blocks.front().get());
+    }
+
+    void history_step(const MtpTarget& target, mfq_tensor_backend::Tensor hidden,
+                      mfq_tensor_backend::Tensor ids, mfq_tensor_backend::Tensor positions = {}) {
+        if(!cache_only_history_supported()) {
+            (void)step_positioned(target,std::move(hidden),std::move(ids),std::move(positions));return;
+        }
+        if(graph_step(target,hidden,ids,positions,1))return;
+        (void)evaluate(target,std::move(hidden),std::move(ids),std::move(positions),{},{},true);
+    }
+
+    std::optional<MtpStep> history_tail_step(const MtpTarget& target,
+            const mfq_tensor_backend::Tensor& hidden,const mfq_tensor_backend::Tensor& ids,
+            const mfq_tensor_backend::Tensor& positions = {}) {
+        if(!cache_only_history_supported() || ids.size(1)<=1)return {};
+        return graph_step(target,hidden,ids,positions,2);
+    }
+
+    // Keep proposals on the ordered device stream so target verification can
+    // consume them before the host needs either set of sampled token IDs.
+    std::optional<mfq_tensor_backend::Tensor> enqueue_greedy_chain(const MtpTarget& target,
+            mfq_tensor_backend::Tensor hidden,mfq_tensor_backend::Tensor ids,
+            mfq_tensor_backend::Tensor positions,int depth,
+            mfq_tensor_backend::Tensor* verification_ids=nullptr) {
+        namespace tb=mfq_tensor_backend;
+        if(depth<2 || depth>mfq::engine::mtp::kMaximumReportedDraftDepth || cache_pos<=0 ||
+                hidden.dim()!=3 || ids.dim()!=2 || ids.size(0)!=1 || ids.size(1)<1 ||
+                hidden.size(0)!=1 || hidden.size(1)!=ids.size(1) || !hidden.is_cuda() ||
+                !ids.is_cuda() || ids.scalar_type()!=tb::kInt64 || !cache_only_history_supported())return {};
+        // Check the entire chain before advancing any predictor history.
+        const auto end=cache_pos+ids.size(1)+depth-1;
+        for(const auto& block:blocks) {
+            const auto* full=dynamic_cast<const FullBlock*>(block.get());
+            if(!full || !full->cache.k.defined() || full->cache.k.dim()<3 ||
+                    end>full->cache.k.size(2))return {};
+        }
+        auto* graphs=graph_registry(target,hidden,ids,positions);
+        if(!graphs)return {};
+        auto& registry=*graphs;
+        const auto tokens=ids.size(1),start=cache_pos;
+        auto& owner=registry.greedy_cells[{int(hidden.scalar_type()),tokens,depth}];
+        if(!owner)owner=std::make_unique<PredictorGraphs::GreedyCell>(registry.stream);
+        auto& cell=*owner;
+        auto physical=tb::arange(start,start+tokens,ids.options());
+        auto pos=positions.defined()?positions.reshape({tokens}).to(ids.device(),tb::kInt64).contiguous():physical;
+        if(!cell.ids.defined()) {
+            cell.hidden=hidden.contiguous().clone();cell.ids=ids.clone();cell.positions=pos.clone();
+            cell.physical_positions=physical.clone();cell.lengths=tb::full({1},start+tokens,ids.options());
+        } else {
+            cell.hidden.copy_(hidden);cell.ids.copy_(ids);cell.positions.copy_(pos);
+            cell.physical_positions.copy_(physical);cell.lengths.fill_(start+tokens);
+        }
+        if(!cell.graph.valid()) {
+            cell.graph.capture([&] {
+                tb::Tensor output;
+                if(tokens>1) {
+                    (void)evaluate(target,cell.hidden.narrow(1,0,tokens-1),cell.ids.narrow(1,0,tokens-1),
+                        cell.positions.narrow(0,0,tokens-1),cell.physical_positions.narrow(0,0,tokens-1),{},true);
+                    output=evaluate(target,cell.hidden.narrow(1,tokens-1,1),cell.ids.narrow(1,tokens-1,1),
+                        cell.positions.narrow(0,tokens-1,1),cell.physical_positions.narrow(0,tokens-1,1),cell.lengths);
+                } else output=evaluate(target,cell.hidden,cell.ids,cell.positions,cell.physical_positions,cell.lengths);
+                std::vector<tb::Tensor> proposals;
+                proposals.reserve(depth);
+                for(int i=0;i<depth;++i) {
+                    auto last=output.narrow(1,output.size(1)-1,1);
+                    auto logits=target.logits(last.to(tb::kFloat16).contiguous()).reshape({1,-1});
+                    auto token=sample_greedy_cuda(logits.contiguous()).reshape({1});
+                    proposals.push_back(token);
+                    if(i+1<depth) {
+                        auto next_position=cell.positions.narrow(0,tokens-1,1)+(i+1);
+                        auto next_physical=cell.physical_positions.narrow(0,tokens-1,1)+(i+1);
+                        auto next_length=cell.lengths+(i+1);
+                        output=evaluate(target,last,token.reshape({1,1}),next_position,next_physical,next_length);
+                    }
+                }
+                cell.proposals=tb::cat(proposals,0);
+                cell.verification_ids=tb::cat({cell.ids.narrow(1,tokens-1,1).reshape({1}),
+                    cell.proposals},0).reshape({1,depth+1});
+            },[&]{cache_pos=start;},[&]{cell.proposals={};cell.verification_ids={};});
+            ++registry.captures;graph_initialized=true;
+            std::cerr<<"runtime_qwen35_predictor_chain_capture rows="<<tokens<<" depth="<<depth
+                <<" nodes="<<cell.graph.nodes()<<'\n';
+        }
+        if(!cell.graph.enqueue_if_device_only())cell.graph.run();
+        ++registry.replays;cache_pos=end;
+        if(verification_ids)*verification_ids=cell.verification_ids;
+        return cell.proposals;
+    }
+
+    std::optional<std::vector<int32_t>> queued_greedy_chain(const MtpTarget& target,
+            mfq_tensor_backend::Tensor hidden,mfq_tensor_backend::Tensor ids,
+            mfq_tensor_backend::Tensor positions,int depth) {
+        auto proposals=enqueue_greedy_chain(target,std::move(hidden),std::move(ids),std::move(positions),depth);
+        if(!proposals)return {};
+        const auto host=proposals->cpu().contiguous();
+        const auto* values=host.data_ptr<int64_t>();
+        return std::vector<int32_t>(values,values+depth);
+    }
+
     MtpStep step_positioned(const MtpTarget &target, mfq_tensor_backend::Tensor hidden,
                             mfq_tensor_backend::Tensor next_ids,
                             mfq_tensor_backend::Tensor positions) override {
+        if(auto graph=graph_step(target,hidden,next_ids,positions))return std::move(*graph);
         auto output =
             evaluate(target, std::move(hidden), std::move(next_ids), std::move(positions));
         return {output, output};
@@ -75,11 +299,18 @@ struct Qwen35Mtp final : MtpModule {
 
     mfq_tensor_backend::Tensor evaluate(const MtpTarget &target, mfq_tensor_backend::Tensor hidden,
                                         mfq_tensor_backend::Tensor next_ids,
-                                        mfq_tensor_backend::Tensor positions) {
+                                        mfq_tensor_backend::Tensor positions,
+                                        mfq_tensor_backend::Tensor physical_positions={},
+                                        mfq_tensor_backend::Tensor dynamic_lengths={}, bool history_only=false) {
+        TYLOINFER_RUNTIME_CHECK(!history_only || cache_only_history_supported(),
+                              "cache-only Qwen predictor history requires one attention layer");
         struct Ops {
             using Tensor = mfq_tensor_backend::Tensor;
             Qwen35Mtp &model;
             const MtpTarget &target;
+            const Tensor& physical_positions;
+            const Tensor& dynamic_lengths;
+            bool history_only;
             static int rank(const Tensor &x) { return x.dim(); }
             static int64_t size(const Tensor &x, int axis) { return x.size(axis); }
             static int64_t elements(const Tensor &x) { return x.numel(); }
@@ -89,6 +320,7 @@ struct Qwen35Mtp final : MtpModule {
             }
             Tensor normalize(Tensor x, mfq::models::qwen35::PredictorNorm role) {
                 using Norm = mfq::models::qwen35::PredictorNorm;
+                if(history_only && role==Norm::output)return {};
                 const auto &weight = role == Norm::embedding ? model.embedding_norm
                                      : role == Norm::hidden  ? model.hidden_norm
                                                              : model.output_norm;
@@ -99,7 +331,7 @@ struct Qwen35Mtp final : MtpModule {
                     .reshape(x.sizes());
             }
             void trace(const char *stage, const Tensor &x) {
-                trace_gemma_stage(*model.execution, 0, stage, x);
+                if(x.defined())trace_gemma_stage(*model.execution, 0, stage, x);
             }
             Tensor fuse(Tensor e, Tensor h) {
                 return model.fusion.forward(*model.execution, mfq_tensor_backend::cat({e, h}, -1));
@@ -116,19 +348,31 @@ struct Qwen35Mtp final : MtpModule {
                                                             .device(mfq_tensor_backend::kCUDA)
                                                             .dtype(mfq_tensor_backend::kInt64));
             }
-            static Tensor lengths(int64_t batch, int64_t end, const Tensor &positions) {
-                return mfq_tensor_backend::full({batch}, end, positions.options());
+            Tensor lengths(int64_t batch, int64_t end, const Tensor &positions) {
+                return dynamic_lengths.defined()?dynamic_lengths:
+                    mfq_tensor_backend::full({batch}, end, positions.options());
             }
-            static Tensor cache_positions(const Tensor &positions, int64_t start, int64_t tokens) {
-                return mfq_tensor_backend::arange(start, start + tokens, positions.options());
+            Tensor cache_positions(const Tensor &positions, int64_t start, int64_t tokens) {
+                return physical_positions.defined()?physical_positions:
+                    mfq_tensor_backend::arange(start, start + tokens, positions.options());
             }
             Tensor layer(std::unique_ptr<Block> &block, Tensor hidden, const Tensor &pos,
                          const std::optional<Tensor> &lengths,
                          const std::optional<Tensor> &cache_positions) {
-                return block->forward(*model.execution, hidden, pos, model.cache_pos, lengths,
-                                      *target.rope, cache_positions);
+                Block::Context context;
+                context.positions=pos;context.full_positions=pos;context.cache_position=model.cache_pos;
+                context.sequence_lengths=dynamic_lengths.defined()?std::optional<Tensor>(dynamic_lengths):lengths;
+                context.cache_positions=cache_positions;
+                if(const auto* full=dynamic_cast<const FullBlock*>(block.get());full && full->cache.k.defined() &&
+                        !full->cache.is_paged() && !full->cache.quantization.enabled() && full->cache.k.dim()>=3)
+                    context.planned_kv_length=full->cache.k.size(2);
+                if(history_only) {
+                    static_cast<FullBlock*>(block.get())->append_history(*model.execution,std::move(hidden),context,*target.rope);
+                    return {};
+                }
+                return block->forward_context(*model.execution,std::move(hidden),context,*target.rope);
             }
-        } ops{*this, target};
+        } ops{*this, target,physical_positions,dynamic_lengths,history_only};
         return mfq::models::qwen35::mtp_predictor(ops, std::move(hidden), std::move(next_ids),
                                                   std::move(positions));
     }

@@ -1,4 +1,4 @@
-/** 验证原生预填充指标的优先级、回退和缺失值，不依赖实现字符串。 */
+
 import { expect, it } from 'vitest';
 import { displayPrefillMetric, preferPositiveMetric } from '../src/features/runtime/metrics';
 import { textParts } from '../src/features/chat/messageParts';

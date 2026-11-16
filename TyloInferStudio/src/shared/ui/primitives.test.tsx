@@ -1,4 +1,4 @@
-/** 验证模态弹窗、工具提示和即时设置开关的键盘及读屏行为。 */
+
 import { useRef, useState } from 'react';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -10,7 +10,7 @@ import { ToastContainer } from './Toast';
 import { toast, useToastStore } from '../../stores/toastStore';
 
 beforeEach(() => {
-  // jsdom 无布局观测器；本组仅验证焦点、键盘和无障碍语义。
+
   vi.stubGlobal(
     'ResizeObserver',
     class {
@@ -21,7 +21,7 @@ beforeEach(() => {
   );
 });
 
-/** 模拟两个业务入口共享一个受控弹窗，并支持显式指定焦点返回位置。 */
+
 function DialogFixture({ explicitTarget = false }: { explicitTarget?: boolean }) {
   const [open, setOpen] = useState(false);
   const returnFocusRef = useRef<HTMLButtonElement | null>(null);

@@ -1,6 +1,6 @@
-/**
- * ChatProvider 领域状态缓存与 Context 重渲染拦截测试。
- */
+
+
+
 
 import { act, render, renderHook, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -322,10 +322,10 @@ describe('ChatProvider Context 重渲染拦截与缓存', () => {
     const initialSelectMode = result.current.selectInteractionMode;
     const initialToggleVoice = result.current.toggleVoice;
 
-    // 重新渲染 Provider 外层
+
     rerender();
 
-    // 动作方法引用应当保持一致，避免子组件非必要重渲染
+
     expect(result.current.send).toBe(initialSend);
     expect(result.current.clearActiveConversation).toBe(initialClear);
     expect(result.current.selectInteractionMode).toBe(initialSelectMode);

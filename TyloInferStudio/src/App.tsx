@@ -1,4 +1,3 @@
-/** 组合应用级 Provider 与业务路由，页面状态和请求由对应领域拥有。 */
 import { lazy, Suspense } from 'react';
 import { Route, Routes } from 'react-router';
 import { StudioUpdateProvider } from './features/settings/UpdateManager';
@@ -38,7 +37,7 @@ const AnalysisPage = lazy(() =>
   import('./features/analysis/AnalysisPage').then((module) => ({ default: module.AnalysisPage })),
 );
 const VersionsPage = lazy(() =>
-  import('./features/settings/VersionsPage').then(module => ({ default: module.VersionsPage })),
+  import('./features/settings/VersionsPage').then((module) => ({ default: module.VersionsPage })),
 );
 
 /** Keep conversation providers mounted across routes and render the requested Studio page. */

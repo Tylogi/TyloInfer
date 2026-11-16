@@ -71,13 +71,6 @@ class HuggingFaceDownloadPayload(_Payload):
     expected_bytes: int | None = Field(default=None, ge=0)
 
 
-
-
-
-
-
-
-
 class ContainerValidationPayload(_Payload):
     model: str = Field(min_length=1, max_length=255)
 
@@ -114,7 +107,6 @@ class ToolJobHandlers:
         self.voice_component = voice_component
         self.activate_voice_output = activate_voice_output
         self.runtime_manager = runtime_manager
-        self._reference_lock = asyncio.Lock()
 
     def _download_prefix_bytes(self, directory: Path) -> int:
         if self.runtime_manager is None:
@@ -123,16 +115,24 @@ class ToolJobHandlers:
         if volume(cache) != volume(directory):
             return 0
         from tyloinfer.server.runtime.prefix_disk_budget import _scan_blocks
+
         return sum(block.size for block in _scan_blocks(cache))
 
     def download_directory_status(self) -> dict[str, str | int | bool | None]:
         status = self.download_directories.status()
-        directory = Path(status['actual_directory'])
-        if status['disk_free_bytes'] is not None:
+        directory = Path(status["actual_directory"])
+        if status["disk_free_bytes"] is not None:
             reserved = DiskBudget().reserved(directory)
-            prefix = self._download_prefix_bytes(directory) if self.download_directories.evict_prefix_cache else 0
-            status.update(download_reserved_bytes=reserved, reclaimable_prefix_bytes=prefix,
-                disk_available_bytes=max(0, status['disk_free_bytes'] + prefix - reserved))
+            prefix = (
+                self._download_prefix_bytes(directory)
+                if self.download_directories.evict_prefix_cache
+                else 0
+            )
+            status.update(
+                download_reserved_bytes=reserved,
+                reclaimable_prefix_bytes=prefix,
+                disk_available_bytes=max(0, status["disk_free_bytes"] + prefix - reserved),
+            )
         return status
 
     def _mfq_command(self, *arguments: str) -> list[str]:
@@ -191,16 +191,18 @@ class ToolJobHandlers:
         else:
             executable = self._required_executable(self.paths.modelscope, "ModelScope")
             argv = [str(executable), "download", request.repo_id]
-        argv.extend([
-            "--repo-type",
-            request.repo_type,
-            "--revision",
-            request.revision,
-            "--local-dir",
-            str(destination),
-            "--max-workers",
-            str(request.max_workers),
-        ])
+        argv.extend(
+            [
+                "--repo-type",
+                request.repo_type,
+                "--revision",
+                request.revision,
+                "--local-dir",
+                str(destination),
+                "--max-workers",
+                str(request.max_workers),
+            ]
+        )
         if request.include:
             if self.paths.internal_modelscope:
                 for pattern in request.include:
@@ -213,10 +215,12 @@ class ToolJobHandlers:
                     argv.extend(["--exclude", pattern])
             else:
                 argv.extend(["--exclude", *request.exclude])
-        env, proxy = await self._download_environment('modelscope', request)
+        env, proxy = await self._download_environment("modelscope", request)
         await context.log("Download connection: proxy" if proxy else "Download connection: direct")
         await context.progress(0.01, message="Starting ModelScope download")
-        return await self._download_and_register(context, argv, env, destination, request, 'modelscope')
+        return await self._download_and_register(
+            context, argv, env, destination, request, "modelscope"
+        )
 
     async def download_huggingface(
         self, context: JobContext, payload: dict[str, Any]
@@ -234,42 +238,62 @@ class ToolJobHandlers:
         else:
             executable = self._required_executable(self.paths.huggingface, "Hugging Face")
             argv = [str(executable), "download", request.repo_id]
-        argv.extend([
-            "--repo-type",
-            request.repo_type,
-            "--revision",
-            request.revision,
-            "--local-dir",
-            str(destination),
-            "--max-workers",
-            str(request.max_workers),
-        ])
+        argv.extend(
+            [
+                "--repo-type",
+                request.repo_type,
+                "--revision",
+                request.revision,
+                "--local-dir",
+                str(destination),
+                "--max-workers",
+                str(request.max_workers),
+            ]
+        )
         for pattern in request.include:
             argv.extend(["--include", pattern])
         for pattern in request.exclude:
             argv.extend(["--exclude", pattern])
         await context.progress(0.01, message="Starting Hugging Face download")
-        env, proxy = await self._download_environment('huggingface', request)
+        env, proxy = await self._download_environment("huggingface", request)
         await context.log("Download connection: proxy" if proxy else "Download connection: direct")
-        return await self._download_and_register(context, argv, env, destination, request, 'huggingface')
+        return await self._download_and_register(
+            context, argv, env, destination, request, "huggingface"
+        )
 
     async def _download_and_register(
-        self, context: JobContext, argv: list[str], env: dict[str, str], destination: Path,
+        self,
+        context: JobContext,
+        argv: list[str],
+        env: dict[str, str],
+        destination: Path,
         request: ModelScopeDownloadPayload | HuggingFaceDownloadPayload,
-        provider: Literal['modelscope', 'huggingface'],
+        provider: Literal["modelscope", "huggingface"],
     ) -> dict[str, Any]:
         lock = self._download_locks.setdefault(destination, asyncio.Lock())
         if lock.locked():
-            await context.log('Waiting for the other model download in this folder')
+            await context.log("Waiting for the other model download in this folder")
         async with lock:
-            await self._run_download(context, argv, env, destination, request.expected_bytes, selection=request)
+            await self._run_download(
+                context, argv, env, destination, request.expected_bytes, selection=request
+            )
             return await self._download_result(
-                context, destination, request.repo_id, provider=provider,
-                revision=request.revision, parameters=request.model_dump(mode='json'))
+                context,
+                destination,
+                request.repo_id,
+                provider=provider,
+                revision=request.revision,
+                parameters=request.model_dump(mode="json"),
+            )
 
     async def _run_download(
-        self, context: JobContext, argv: list[str], env: dict[str, str], destination: Path,
-        expected_bytes: int | None, *,
+        self,
+        context: JobContext,
+        argv: list[str],
+        env: dict[str, str],
+        destination: Path,
+        expected_bytes: int | None,
+        *,
         selection: ModelScopeDownloadPayload | HuggingFaceDownloadPayload | None = None,
     ) -> None:
         def selected(path: Path) -> bool:
@@ -279,25 +303,44 @@ class ToolJobHandlers:
             name = relative.as_posix()
             # Both SDKs keep resumable files under hidden download directories;
             # HF appends the content hash and .incomplete after the filename.
-            if any(part.startswith('.') for part in relative.parts) or path.suffix in {'.partial', '.incomplete'}:
-                match = re.search(r'\.(?:tq|safetensors|gguf(?:\.part-[0-9]{1,5}-of-[0-9]{1,5})?|bin)(?=\.|$)', name, re.IGNORECASE)
+            if any(part.startswith(".") for part in relative.parts) or path.suffix in {
+                ".partial",
+                ".incomplete",
+            }:
+                match = re.search(
+                    r"\.(?:tq|safetensors|gguf(?:\.part-[0-9]{1,5}-of-[0-9]{1,5})?|bin)(?=\.|$)",
+                    name,
+                    re.IGNORECASE,
+                )
                 if match:
-                    name = name[:match.end()]
+                    name = name[: match.end()]
                 else:
-                    name = name.removesuffix('.partial').removesuffix('.incomplete')
-                candidates = [name, *(name[index + 1:] for index, char in enumerate(name) if char == '/')]
+                    name = name.removesuffix(".partial").removesuffix(".incomplete")
+                candidates = [
+                    name,
+                    *(name[index + 1 :] for index, char in enumerate(name) if char == "/"),
+                ]
             else:
                 candidates = [name]
-            return any((not selection.include or any(fnmatch.fnmatchcase(value, pattern) for pattern in selection.include))
-                       and not any(fnmatch.fnmatchcase(value, pattern) for pattern in selection.exclude)
-                       for value in candidates)
+            return any(
+                (
+                    not selection.include
+                    or any(fnmatch.fnmatchcase(value, pattern) for pattern in selection.include)
+                )
+                and not any(fnmatch.fnmatchcase(value, pattern) for pattern in selection.exclude)
+                for value in candidates
+            )
 
         def observed() -> tuple[int, int, int]:
             size = files = allocated = 0
             seen = set()
             for path in destination.rglob("*"):
                 try:
-                    if path.is_symlink() or not path.is_file() or path.suffix in {".lock", ".metadata"}:
+                    if (
+                        path.is_symlink()
+                        or not path.is_file()
+                        or path.suffix in {".lock", ".metadata"}
+                    ):
                         continue
                     if not selected(path):
                         continue
@@ -307,18 +350,21 @@ class ToolJobHandlers:
                         continue
                     seen.add(identity)
                     size += status.st_size
-                    if hasattr(status, 'st_blocks'):
+                    if hasattr(status, "st_blocks"):
                         allocated += min(status.st_size, status.st_blocks * 512)
-                    elif os.name == 'nt':
+                    elif os.name == "nt":
                         import ctypes
+
                         high = ctypes.c_ulong()
                         measure = ctypes.windll.kernel32.GetCompressedFileSizeW
                         measure.argtypes = [ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_ulong)]
                         measure.restype = ctypes.c_ulong
                         low = measure(str(path), ctypes.byref(high))
-                        if low != 0xffffffff or ctypes.windll.kernel32.GetLastError() == 0:
+                        if low != 0xFFFFFFFF or ctypes.windll.kernel32.GetLastError() == 0:
                             allocated += min(status.st_size, (high.value << 32) | low)
-                    if path.suffix not in {".incomplete", ".partial"} and not any(part.startswith(".") for part in path.relative_to(destination).parts):
+                    if path.suffix not in {".incomplete", ".partial"} and not any(
+                        part.startswith(".") for part in path.relative_to(destination).parts
+                    ):
                         files += 1
                 except FileNotFoundError:
                     continue
@@ -326,13 +372,27 @@ class ToolJobHandlers:
 
         _, _, initial = await asyncio.to_thread(observed)
         if expected_bytes is None or expected_bytes <= 0:
-            raise self._failure("download_size_unknown", "Resolve the model files before downloading so disk space can be reserved")
+            raise self._failure(
+                "download_size_unknown",
+                "Resolve the model files before downloading so disk space can be reserved",
+            )
         margin = max(512 << 20, expected_bytes // 100)
         required = max(0, expected_bytes - initial)
-        reclaimable = await asyncio.to_thread(self._download_prefix_bytes, destination) if self.download_directories.evict_prefix_cache else 0
+        reclaimable = (
+            await asyncio.to_thread(self._download_prefix_bytes, destination)
+            if self.download_directories.evict_prefix_cache
+            else 0
+        )
         budget = DiskBudget()
-        pending_reservation = asyncio.create_task(asyncio.to_thread(budget.reserve, destination,
-            required + margin, reclaimable=reclaimable, exclusive=True))
+        pending_reservation = asyncio.create_task(
+            asyncio.to_thread(
+                budget.reserve,
+                destination,
+                required + margin,
+                reclaimable=reclaimable,
+                exclusive=True,
+            )
+        )
         try:
             reservation = await asyncio.shield(pending_reservation)
         except asyncio.CancelledError:
@@ -341,9 +401,13 @@ class ToolJobHandlers:
                 await asyncio.to_thread(abandoned.close)
             raise
         except OSError as error:
-            raise self._failure("insufficient_disk_space", "Not enough unreserved disk space for this download") from error
+            raise self._failure(
+                "insufficient_disk_space", "Not enough unreserved disk space for this download"
+            ) from error
         except ValueError as error:
-            raise self._failure("download_destination_busy", "This destination already has an active download") from error
+            raise self._failure(
+                "download_destination_busy", "This destination already has an active download"
+            ) from error
 
         async def monitor() -> None:
             previous, _, _ = await asyncio.to_thread(observed)
@@ -357,23 +421,38 @@ class ToolJobHandlers:
                 speed = current_speed if speed == 0 else speed * 0.5 + current_speed * 0.5
                 previous, previous_time = size, now
                 try:
-                    await asyncio.to_thread(reservation.update, max(0, expected_bytes - allocated) + margin)
+                    await asyncio.to_thread(
+                        reservation.update, max(0, expected_bytes - allocated) + margin
+                    )
                 except OSError as error:
-                    raise self._failure('insufficient_disk_space', 'Not enough disk space to continue this download') from error
-                await context.progress(min(0.98, size / expected_bytes) if expected_bytes else 0.01,
-                    data={"downloaded_bytes": size, "total_bytes": expected_bytes,
-                          "bytes_per_second": speed, "files_completed": files})
+                    raise self._failure(
+                        "insufficient_disk_space", "Not enough disk space to continue this download"
+                    ) from error
+                await context.progress(
+                    min(0.98, size / expected_bytes) if expected_bytes else 0.01,
+                    data={
+                        "downloaded_bytes": size,
+                        "total_bytes": expected_bytes,
+                        "bytes_per_second": speed,
+                        "files_completed": files,
+                    },
+                )
 
         task = transfer = None
         try:
             if reclaimable and self.runtime_manager is not None:
                 await self.runtime_manager.reclaim_prefix_disk_for_download(destination)
-            if await asyncio.to_thread(lambda: shutil.disk_usage(destination).free < budget.reserved(destination)):
-                raise self._failure("insufficient_disk_space", "Prefix cache could not release enough disk space for this download")
+            if await asyncio.to_thread(
+                lambda: shutil.disk_usage(destination).free < budget.reserved(destination)
+            ):
+                raise self._failure(
+                    "insufficient_disk_space",
+                    "Prefix cache could not release enough disk space for this download",
+                )
             task = asyncio.create_task(monitor())
             child_env = {**env, "TYLOINFER_DISK_BUDGET_DIR": str(budget.root)}
-            if os.name != 'nt':
-                child_env['TYLOINFER_DOWNLOAD_RESERVATION_FD'] = str(reservation.stream.fileno())
+            if os.name != "nt":
+                child_env["TYLOINFER_DOWNLOAD_RESERVATION_FD"] = str(reservation.stream.fileno())
             transfer = asyncio.create_task(self._run(context, argv, env=child_env))
             finished, _ = await asyncio.wait((task, transfer), return_when=asyncio.FIRST_COMPLETED)
             for completed in finished:
@@ -383,12 +462,14 @@ class ToolJobHandlers:
                 for pending in (task, transfer):
                     if pending is not None:
                         pending.cancel()
-                await asyncio.gather(*(pending for pending in (task, transfer) if pending is not None), return_exceptions=True)
+                await asyncio.gather(
+                    *(pending for pending in (task, transfer) if pending is not None),
+                    return_exceptions=True,
+                )
             finally:
                 await asyncio.to_thread(reservation.close)
                 if self.runtime_manager is not None:
                     self.runtime_manager._prefix_disk_checked_at = 0.0
-
 
     async def validate_container(
         self, context: JobContext, payload: dict[str, Any]
@@ -418,45 +499,48 @@ class ToolJobHandlers:
         env: dict[str, str] | None = None,
         progress_pattern: re.Pattern[str] | None = None,
         progress_total: int | None = None,
-        progress_parser: Callable[[str], tuple[float, str] | tuple[float, str, dict[str, Any]] | None] | None = None,
+        progress_parser: Callable[
+            [str], tuple[float, str] | tuple[float, str, dict[str, Any]] | None
+        ]
+        | None = None,
         final_progress: float = 0.99,
         final_message: str = "Finalizing output",
     ) -> list[str]:
-        inherited = (int(env['TYLOINFER_DOWNLOAD_RESERVATION_FD']),) if env and os.name != 'nt' and 'TYLOINFER_DOWNLOAD_RESERVATION_FD' in env else ()
+        inherited = (
+            (int(env["TYLOINFER_DOWNLOAD_RESERVATION_FD"]),)
+            if env and os.name != "nt" and "TYLOINFER_DOWNLOAD_RESERVATION_FD" in env
+            else ()
+        )
         process = await asyncio.create_subprocess_exec(
             *argv,
-            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0) if os.name == "nt" else 0,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0,
             cwd=self.root,
             env=env,
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             start_new_session=True,
-            **({'pass_fds': inherited} if inherited else {}),
+            **({"pass_fds": inherited} if inherited else {}),
         )
 
         async def stop() -> None:
             if process.returncode is not None:
                 return
             with suppress(ProcessLookupError):
-                if os.name == 'nt':
+                if os.name == "nt":
                     process.terminate()
                 else:
                     os.killpg(process.pid, signal.SIGTERM)
             try:
-                await asyncio.wait_for(
-                    process.wait(), timeout=_TOOL_TERMINATE_TIMEOUT_SECONDS
-                )
+                await asyncio.wait_for(process.wait(), timeout=_TOOL_TERMINATE_TIMEOUT_SECONDS)
             except asyncio.TimeoutError:
                 with suppress(ProcessLookupError):
-                    if os.name == 'nt':
+                    if os.name == "nt":
                         process.kill()
                     else:
                         os.killpg(process.pid, signal.SIGKILL)
                 with suppress(asyncio.TimeoutError):
-                    await asyncio.wait_for(
-                        process.wait(), timeout=_TOOL_KILL_TIMEOUT_SECONDS
-                    )
+                    await asyncio.wait_for(process.wait(), timeout=_TOOL_KILL_TIMEOUT_SECONDS)
 
         context.add_cleanup(stop)
         lines: deque[str] = deque(maxlen=_TOOL_OUTPUT_TAIL_LINES)
@@ -476,7 +560,11 @@ class ToolJobHandlers:
                     parsed = progress_parser(line)
                     if parsed is not None:
                         progress, message = parsed[:2]
-                        await context.progress(min(0.99, max(0.01, progress)), message=message[:200], data=parsed[2] if len(parsed) == 3 else None)
+                        await context.progress(
+                            min(0.99, max(0.01, progress)),
+                            message=message[:200],
+                            data=parsed[2] if len(parsed) == 3 else None,
+                        )
                 if progress_pattern is not None:
                     match = progress_pattern.search(line)
                     if match:
@@ -526,8 +614,11 @@ class ToolJobHandlers:
                 f"downloaded {total} bytes, expected at least {expected}",
                 retryable=True,
             )
-        if not destination.is_relative_to(self.model_root) and any(destination.is_relative_to(root) for root in self.download_directories.roots.values()):
+        if not destination.is_relative_to(self.model_root) and any(
+            destination.is_relative_to(root) for root in self.download_directories.roots.values()
+        ):
             from tyloinfer.server.state.catalog import ModelRegistrationError
+
             try:
                 await self.catalog.register_directory(path=destination)
             except ModelRegistrationError:
@@ -560,39 +651,74 @@ class ToolJobHandlers:
         return path
 
     async def _download_environment(self, provider: str, request) -> tuple[dict[str, str], bool]:
-        endpoint = os.environ.get('HF_ENDPOINT', 'https://huggingface.co') if provider == 'huggingface' else os.environ.get('MODELSCOPE_ENDPOINT', 'https://modelscope.cn')
-        filename = next((name for name in request.include if not any(char in name for char in '*?[')
-            and (name.lower().endswith((*TYLOINFER_SUFFIXES, '.safetensors', '.bin')) or is_gguf_path(name))), None)
-        options = {'direct': True} if request.direct else {}
+        endpoint = (
+            os.environ.get("HF_ENDPOINT", "https://huggingface.co")
+            if provider == "huggingface"
+            else os.environ.get("MODELSCOPE_ENDPOINT", "https://modelscope.cn")
+        )
+        filename = next(
+            (
+                name
+                for name in request.include
+                if not any(char in name for char in "*?[")
+                and (
+                    name.lower().endswith((*TYLOINFER_SUFFIXES, ".safetensors", ".bin"))
+                    or is_gguf_path(name)
+                )
+            ),
+            None,
+        )
+        options = {"direct": True} if request.direct else {}
         if filename and not request.direct:
-            options['sample_url'] = hub_download_url(provider, request.repo_id, request.revision, filename)
+            options["sample_url"] = hub_download_url(
+                provider, request.repo_id, request.revision, filename
+            )
         return await download_environment(endpoint, **options)
 
     def download_request(self, kind: str, payload: dict[str, Any]):
-        model = HuggingFaceDownloadPayload if kind == 'download.huggingface' else ModelScopeDownloadPayload
+        model = (
+            HuggingFaceDownloadPayload
+            if kind == "download.huggingface"
+            else ModelScopeDownloadPayload
+        )
         request = model.model_validate(payload)
-        destination = self._download_output(request.destination, request.download_directory, create=False)
+        destination = self._download_output(
+            request.destination, request.download_directory, create=False
+        )
         return request, destination
 
     def download_destinations(self, kind: str, request) -> list[Path]:
-        destinations = [self._download_output(request.destination, request.download_directory, create=False)]
-        provider = kind.split('.')[1]
+        destinations = [
+            self._download_output(request.destination, request.download_directory, create=False)
+        ]
+        provider = kind.split(".")[1]
         parts = Path(request.destination).parts
-        prefix = ('models', provider, *request.repo_id.split('/'))
-        if parts[:len(prefix)] == prefix:
-            mirror = 'modelscope' if provider == 'huggingface' else 'huggingface'
-            relative = str(Path('models', mirror, *parts[2:]))
-            destinations.append(self._download_output(relative, request.download_directory, create=False))
+        prefix = ("models", provider, *request.repo_id.split("/"))
+        if parts[: len(prefix)] == prefix:
+            mirror = "modelscope" if provider == "huggingface" else "huggingface"
+            relative = str(Path("models", mirror, *parts[2:]))
+            destinations.append(
+                self._download_output(relative, request.download_directory, create=False)
+            )
         return destinations
 
     @staticmethod
     def selected_download_files(request, files):
-        selected = [item for item in files if (not request.include or any(fnmatch.fnmatchcase(item.name, pattern) for pattern in request.include))
-            and not any(fnmatch.fnmatchcase(item.name, pattern) for pattern in request.exclude)]
+        selected = [
+            item
+            for item in files
+            if (
+                not request.include
+                or any(fnmatch.fnmatchcase(item.name, pattern) for pattern in request.include)
+            )
+            and not any(fnmatch.fnmatchcase(item.name, pattern) for pattern in request.exclude)
+        ]
         by_name = {item.name: item for item in files}
         names = with_engram_shards([item.name for item in selected], list(by_name))
-        if any(any(fnmatch.fnmatchcase(name, pattern) for pattern in request.exclude) for name in names):
-            raise ValueError('Required Engram tables cannot be excluded from the model download.')
+        if any(
+            any(fnmatch.fnmatchcase(name, pattern) for pattern in request.exclude) for name in names
+        ):
+            raise ValueError("Required Engram tables cannot be excluded from the model download.")
         return [by_name[name] for name in names]
 
     @staticmethod
@@ -603,7 +729,11 @@ class ToolJobHandlers:
                 continue
             try:
                 path = (destination / item.name).resolve()
-                if path.is_relative_to(destination) and path.is_file() and path.stat().st_size == item.byte_size:
+                if (
+                    path.is_relative_to(destination)
+                    and path.is_file()
+                    and path.stat().st_size == item.byte_size
+                ):
                     result[item.name] = item.byte_size
             except OSError:
                 continue
@@ -614,10 +744,16 @@ class ToolJobHandlers:
         return self.reusable_download_files(path, files)
 
     @staticmethod
-    def download_files_present(destination: Path, request, files, *, mfq_only: bool = False) -> bool:
+    def download_files_present(
+        destination: Path, request, files, *, mfq_only: bool = False
+    ) -> bool:
         selected = ToolJobHandlers.selected_download_files(request, files)
         if mfq_only:
-            weights = [item for item in selected if item.name.lower().endswith(TYLOINFER_SUFFIXES) or is_gguf_path(item.name)]
+            weights = [
+                item
+                for item in selected
+                if item.name.lower().endswith(TYLOINFER_SUFFIXES) or is_gguf_path(item.name)
+            ]
             if weights:
                 selected = weights
         if not selected:
@@ -625,7 +761,11 @@ class ToolJobHandlers:
         for item in selected:
             path = (destination / item.name).resolve()
             try:
-                complete = path.is_relative_to(destination) and path.is_file() and path.stat().st_size == item.byte_size
+                complete = (
+                    path.is_relative_to(destination)
+                    and path.is_file()
+                    and path.stat().st_size == item.byte_size
+                )
             except OSError:
                 complete = False
             if not complete:
@@ -644,21 +784,20 @@ class ToolJobHandlers:
             raise self._failure("invalid_download_directory", str(error)) from error
         relative = Path(value)
         if relative.is_absolute():
-            raise self._failure("absolute_path_not_allowed", "download destinations must be relative")
+            raise self._failure(
+                "absolute_path_not_allowed", "download destinations must be relative"
+            )
         if relative.parts[:1] == ("models",):
             relative = Path(*relative.parts[1:])
         destination = (root / relative).resolve()
         if destination == root or not destination.is_relative_to(root):
-            raise self._failure("path_outside_workspace", "download destination must stay inside its folder")
+            raise self._failure(
+                "path_outside_workspace", "download destination must stay inside its folder"
+            )
         if create:
             destination.mkdir(parents=True, exist_ok=True)
         return destination
 
-    def _output(self, value: str, *, directory: bool = False) -> Path:
-        path = self._resolve(value)
-        if directory:
-            path.mkdir(parents=True, exist_ok=True)
-        return path
 
     def _resolve(self, value: str) -> Path:
         path = Path(value).expanduser()

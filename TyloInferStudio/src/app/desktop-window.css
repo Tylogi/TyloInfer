@@ -1,4 +1,4 @@
-/* Windows 自绘标题栏沿用面板配色，不影响浏览器或 macOS 的窗口。 */
+
 .desktop-window-browser,
 .desktop-window-browser > .desktop-window-content { display: contents; }
 .desktop-window {

@@ -1,4 +1,4 @@
-/** 将原 Python 会话检查迁为真实 Provider、附件转换和生成控制器的行为测试。 */
+
 import { act, renderHook, waitFor } from '@testing-library/react';
 import type { ReactNode } from 'react';
 import { MemoryRouter } from 'react-router';
@@ -29,14 +29,14 @@ vi.mock('../src/studio', () => ({ studioConfirm: vi.fn().mockResolvedValue(true)
 const session = { id: 'session-a', model: 'model-a', mode: 'text', revision: 7 } as Session;
 const previous = { id: 'previous', role: 'assistant', parts: [{ type: 'text', text: 'old answer' }], parent_id: null, created_at: '' } as Message;
 
-/** 控制异步边界，验证完成前的状态与调用顺序。 */
+
 function deferred<T>() {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>((done) => { resolve = done; });
   return { promise, resolve };
 }
 
-/** 挂载真实聊天领域并等待历史就绪。 */
+
 async function mountChat() {
   const wrapper = ({ children }: { children: ReactNode }) => <MemoryRouter initialEntries={['/chat']}><ChatProvider>{children}</ChatProvider></MemoryRouter>;
   const hook = renderHook(() => ({ chat: useChat(), attachments: useChatAttachmentActions() }), { wrapper });

@@ -1,4 +1,4 @@
-/** 应用外壳组织导航、路由出口及连接状态，不持有业务表单。 */
+
 import { Component, Suspense, useEffect, type ReactNode } from 'react';
 import { useLocation, Outlet } from 'react-router';
 import * as TooltipPrimitive from '@radix-ui/react-tooltip';
@@ -14,7 +14,7 @@ import { ServerConnectionPage } from './ServerConnectionPage';
 import { resolveStudioLocation, isStudioPath } from '../navigation';
 import { isAssetLoadError } from './assetRecovery';
 
-/** 隔离单个业务路由的渲染错误，切换路径后恢复其他页面。 */
+
 class PageErrorBoundary extends Component<{ children: ReactNode }, { detail: string | null }> {
   state = { detail: null as string | null };
   static getDerivedStateFromError(error: unknown) {
@@ -33,7 +33,7 @@ class PageErrorBoundary extends Component<{ children: ReactNode }, { detail: str
   }
 }
 
-/** 渲染固定导航及嵌套路由，保留未就绪时的直达页和 404 行为。 */
+
 export function StudioShell() {
   const location = useLocation();
   const { tr } = useSettings();
@@ -62,7 +62,7 @@ export function StudioShell() {
           {tr('跳到主要内容', 'Skip to main content')}
         </a>
         <StudioSidebar />
-        <main className={`${view === 'chat' ? 'workspace chat-workspace' : 'workspace'}${hasAlerts ? ' has-runtime-alerts' : ''}`}
+        <main className={`${'workspace'}${hasAlerts ? ' has-runtime-alerts' : ''}`}
           id="studio-main" tabIndex={-1}>
           {hasAlerts && <RuntimeAlerts connectionProblem={connectionProblem} />}
           {pageAvailable ? (

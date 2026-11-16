@@ -4,7 +4,6 @@
 
 #include <algorithm>
 #include <chrono>
-#include <algorithm>
 #include <array>
 #include <cstdlib>
 #include <cmath>
@@ -17,6 +16,44 @@
 
 namespace {
 void require(bool ok, const char* message) { if (!ok) throw std::runtime_error(message); }
+void grouped_source_reads(const mfq::GgufModelSource& source) {
+    const auto reader=source.tensor_group_reader();
+    require(reader==source.tensor_group_reader(),"grouped tensor readers do not share a source identity");
+    std::vector<std::vector<std::byte>> expected,actual;
+    expected.reserve(source.tensors().size());actual.reserve(source.tensors().size());
+    for(const auto& tensor:source.tensors()) {
+        expected.push_back(source.read(tensor.name));actual.emplace_back(expected.back().size(),std::byte{0x5a});
+    }
+    std::vector<mfq::GgufModelSource::NamedReadSpan> spans;
+    for(std::size_t i=source.tensors().size();i-->0;) {
+        const auto& tensor=source.tensors()[i];const auto half=actual[i].size()/2;
+        spans.push_back({tensor.name,{half,actual[i].empty()?nullptr:actual[i].data()+half,actual[i].size()-half}});
+        spans.push_back({tensor.name,{0,actual[i].data(),half}});
+        spans.push_back({tensor.name,{tensor.nbytes,nullptr,0}});
+    }
+    (*reader)(spans);
+    require(actual==expected,"grouped cross-tensor reads changed bytes");
+    (*reader)({});
+    if(source.tensors().empty())return;
+    const auto& first=source.tensors().front();
+    std::array<std::byte,32> aliased{},reference{};
+    for(const auto& tensor:source.tensors())if(tensor.nbytes>=32 && first.nbytes>=32) {
+        const auto a=source.tensor_reader(first.name),b=source.tensor_reader(tensor.name);
+        a(1,reference.data(),19);b(3,reference.data()+7,15);
+        (*reader)({{first.name,{1,aliased.data(),19}},{tensor.name,{3,aliased.data()+7,15}}});
+        require(aliased==reference,"grouped reads changed overlapping destination order");break;
+    }
+    const auto rejects=[&](mfq::GgufModelSource::NamedReadSpan bad) {
+        std::byte unchanged{0x5a};bool rejected=false;
+        try{(*reader)({{first.name,{0,&unchanged,1}},bad});}catch(const std::exception&){rejected=true;}
+        require(rejected && unchanged==std::byte{0x5a},"grouped read failed to validate all ranges before writing");
+    };
+    rejects({"missing-group-tensor",{0,nullptr,0}});
+    rejects({first.name,{first.nbytes,nullptr,1}});
+    rejects({first.name,{0,nullptr,1}});
+    if(first.nbytes>=2)rejects({first.name,{0,reinterpret_cast<std::byte*>(UINTPTR_MAX),2}});
+}
+#include "gguf_qwen35_mtp_test.h"
 struct MirrorSetting {
     std::string previous;bool present=false;
     explicit MirrorSetting(const std::filesystem::path& directory) {
@@ -39,6 +76,7 @@ void raw_part_source(const std::filesystem::path& path, const std::vector<std::f
     std::ifstream input(path, std::ios::binary);
     const std::vector<char> bytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
     const mfq::GgufModelSource complete(path, companions);
+    grouped_source_reads(complete);
     std::vector<std::size_t> cuts{0, first_cut, bytes.size() / 2 + 3, bytes.size() - 7, bytes.size()};
     if (count != 4) {
         cuts = {0, first_cut};
@@ -61,6 +99,7 @@ void raw_part_source(const std::filesystem::path& path, const std::vector<std::f
         require(source->architecture() == complete.architecture() && source->metadata() == complete.metadata() &&
             source->tensors().size() == complete.tensors().size(), "raw parts changed model metadata");
         require(source->source_paths().size() == parts.size() + companions.size(), "raw parts source paths missing");
+        grouped_source_reads(dynamic_cast<const mfq::GgufModelSource&>(*source));
         for (const auto& tensor : complete.tensors()) {
             const auto expected = complete.read(tensor.name);
             require(source->read(tensor.name) == expected, "raw part tensor bytes changed");
@@ -76,12 +115,15 @@ void raw_part_source(const std::filesystem::path& path, const std::vector<std::f
             require(source->read_asset(asset) == complete.read_asset(asset), "raw parts changed tokenizer or assets");
     }
     mfq::ModelSource::TensorReader retained;
+    std::shared_ptr<const mfq::GgufModelSource::TensorGroupReader> retained_group;
+    std::string retained_name;
     std::vector<std::byte> expected;
     {
         const mfq::GgufModelSource source(parts.back(), companions);
         const auto name = source.tensors().front().name;
         expected = source.read(name);
         retained = source.tensor_reader(name);
+        retained_name=name;retained_group=source.tensor_group_reader();
     }
     std::vector<std::byte> actual(expected.size());
     retained(0, actual.data(), actual.size());
@@ -90,6 +132,9 @@ void raw_part_source(const std::filesystem::path& path, const std::vector<std::f
     std::filesystem::rename(parts[1], hidden);
     retained(0, actual.data(), actual.size());
     require(actual == expected, "retained raw part reader changed after rename");
+    std::fill(actual.begin(),actual.end(),std::byte{0});
+    (*retained_group)({{retained_name,{0,actual.data(),actual.size()}}});
+    require(actual==expected,"grouped reader expired or reopened a renamed source");
     bool missing = false;
     try { mfq::GgufModelSource invalid(parts.front(), companions); } catch (const std::runtime_error&) { missing = true; }
     require(missing, "incomplete raw GGUF parts accepted");
@@ -667,6 +712,78 @@ void compact_formats(const std::filesystem::path& directory) {
 }
 }
 
+namespace {
+void qwen35_nextn_source(const std::filesystem::path& directory) {
+    auto* tensors = ggml_init({1 << 20, nullptr, false});
+    auto* header = gguf_init_empty();
+    gguf_set_val_str(header, "general.architecture", "qwen35");
+    gguf_set_val_u32(header, "qwen35.embedding_length", 128);
+    gguf_set_val_u32(header, "qwen35.block_count", 3);
+    gguf_set_val_u32(header, "qwen35.attention.head_count", 1);
+    for (const auto* name : {"blk.0.attn_qkv.weight", "blk.1.attn_q.weight", "blk.2.attn_q.weight"}) {
+        auto* tensor = ggml_new_tensor_2d(tensors, GGML_TYPE_F16, 128, 128);
+        ggml_set_name(tensor, name);
+        std::memset(tensor->data, 0, ggml_nbytes(tensor));
+        gguf_add_tensor(header, tensor);
+    }
+    const auto path = directory / "qwen35-nextn.gguf";
+    for (const int predictors : {0, 1, 2}) {
+        gguf_set_val_u32(header, "qwen35.nextn_predict_layers", predictors);
+        require(gguf_write_to_file(header, path.string().c_str(), false), "NextN fixture write failed");
+        mfq::GgufModelSource source(path);
+        const auto config = nlohmann::json::parse(source.model_config_json());
+        require(config.at("num_hidden_layers") == 3 - predictors && config.at("layer_types").size() == 3 - predictors,
+            "GGUF NextN blocks leaked into the ordinary backbone");
+        require(config.at("layer_types").at(0) == "linear_attention", "NextN changed the backbone attention types");
+        const auto nextn_query = predictors > 0 ?
+            "predictor.block." + std::to_string(predictors - 1) + ".attention.query.weight" :
+            "model.block.2.attention.query.weight";
+        require(source.find_tensor(nextn_query), "NextN tensor record was discarded");
+        require(config.at("mtp_num_hidden_layers") == 0, "partial NextN fixture advertised a complete MTP head");
+    }
+    for (int invalid = 0; invalid < 4; ++invalid) {
+        if (invalid == 0) gguf_set_val_u32(header, "qwen35.nextn_predict_layers", 3);
+        else if (invalid == 1) gguf_set_val_u32(header, "qwen35.nextn_predict_layers", 4);
+        else if (invalid == 2) gguf_set_val_i32(header, "qwen35.nextn_predict_layers", -1);
+        else gguf_set_val_f32(header, "qwen35.nextn_predict_layers", .5f);
+        require(gguf_write_to_file(header, path.string().c_str(), false), "invalid NextN fixture write failed");
+        bool rejected = false;
+        try { mfq::GgufModelSource source(path); }
+        catch (const std::runtime_error& error) { rejected = std::string(error.what()).find("NextN layer count") != std::string::npos; }
+        require(rejected, "invalid GGUF NextN layer count accepted");
+    }
+    gguf_set_val_u32(header, "qwen35.nextn_predict_layers", 1);
+    for (const auto* suffix : {"enorm", "hnorm", "shared_head_norm"}) {
+        auto* tensor = ggml_new_tensor_1d(tensors, GGML_TYPE_F32, 128);
+        ggml_set_name(tensor, (std::string("blk.2.nextn.") + suffix + ".weight").c_str());
+        std::fill_n(static_cast<float*>(tensor->data), 128, .5f);
+        gguf_add_tensor(header, tensor);
+    }
+    auto* fusion = ggml_new_tensor_2d(tensors, GGML_TYPE_F16, 256, 128);
+    ggml_set_name(fusion, "blk.2.nextn.eh_proj.weight");
+    std::memset(fusion->data, 0, ggml_nbytes(fusion));
+    gguf_add_tensor(header, fusion);
+    require(gguf_write_to_file(header, path.string().c_str(), false), "MTP fixture write failed");
+    {
+        mfq::GgufModelSource source(path);
+        const auto config = nlohmann::json::parse(source.model_config_json());
+        require(config.at("num_hidden_layers") == 2 && config.at("mtp_num_hidden_layers") == 1,
+            "GGUF NextN MTP geometry lost");
+        require(config.at("mtp_use_dedicated_embeddings") == false, "shared MTP embeddings became dedicated");
+        const auto* record = source.find_tensor("predictor.fusion.weight");
+        require(record && record->shape == std::vector<int64_t>{128, 256}, "GGUF NextN fusion layout differs");
+        for (const auto* name : {"predictor.embedding_norm.weight", "predictor.hidden_norm.weight", "predictor.output_norm.weight"})
+            require(source.find_tensor(name), "GGUF NextN normalization alias missing");
+        const auto norm = source.read("predictor.embedding_norm.weight");
+        float norm_value = 0;
+        std::memcpy(&norm_value, norm.data() + 12, sizeof(norm_value));
+        require(norm_value == .5f, "GGUF NextN changed the absolute normalization weights");
+        require(!source.find_tensor("model.block.2.attention.query.weight"), "MTP block remained in the backbone namespace");
+    }
+    gguf_free(header); ggml_free(tensors);
+}
+}
+
 int main() {
     const auto directory = std::filesystem::temp_directory_path() /
         ("tinfer-gguf-test-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
@@ -727,6 +844,11 @@ int main() {
         gguf_free(gguf); ggml_free(tensors);
         auto source = mfq::open_model_source(path);
         require(source->architecture() == "qwen35", "architecture lost");
+        const auto& layout=source->legacy_tensor_compatibility().layout;
+        require(layout.norm_weight_offset==0.0 && !layout.linear_attention_a_is_log &&
+            layout.qwen_gdn_gguf_layout,"canonical Qwen GGUF tensor conventions lost");
+        require(source->legacy_tensor_compatibility().canonical_to_stored.empty(),
+            "canonical GGUF source exposed raw-name remapping");
         const auto* table = source->find_tensor("model.token_embedding.weight");
         require(table && table->dtype == "GGUF_Q4_K" && *table->shape == std::vector<int64_t>({3, 256}), "GGUF quantized metadata wrong");
         const auto data = source->read(table->name);
@@ -758,6 +880,10 @@ int main() {
         try { source->read(table->name, table->nbytes, 1); } catch (const std::out_of_range&) { bounded = true; }
         require(bounded, "out-of-range GGUF read accepted");
         const auto reader = source->tensor_reader(table->name);
+        const auto io_before=source->file_read_stats();std::byte probe{};
+        reader(0,&probe,1);const auto io_after=source->file_read_stats();
+        require(io_after.files>0 && io_after.calls>io_before.calls &&
+            io_after.logical_bytes==io_before.logical_bytes+1,"GGUF reads or retained staging memory are missing from telemetry");
         source.reset();
         std::byte value{};
         reader(0, &value, 1);
@@ -766,7 +892,9 @@ int main() {
         bool truncated = false;
         try { mfq::GgufModelSource invalid(path); } catch (const std::runtime_error&) { truncated = true; }
         require(truncated, "truncated GGUF accepted");
+        qwen35_nextn_source(directory);
         qwen4_source(directory);
+        qwen35_nextn_companion_source(directory);
         compact_formats(directory);
         deepseek_source(directory);
         std::filesystem::remove_all(directory);

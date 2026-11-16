@@ -1,4 +1,4 @@
-/* 聊天消息中的代码块与 Prism 语法高亮。 */
+
 .rich-text pre.code-block,
 .rich-text pre[class*="language-"] {
   position: relative;

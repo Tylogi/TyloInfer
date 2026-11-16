@@ -1,4 +1,4 @@
-/** 验证应用级故障分流、初次连接重试和后台任务流恢复。 */
+
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { runtimeApi } from '../shared/api/resources/runtime';
@@ -22,7 +22,7 @@ vi.mock('../features/settings/SettingsProvider', () => ({
   useSettings: () => ({ setContextSize: vi.fn() }),
 }));
 
-/** 以可操作的状态快照验证 Provider 的各类故障互不覆盖。 */
+
 function RuntimeFixture() {
   const runtime = useRuntime();
   capturedRuntime = runtime;

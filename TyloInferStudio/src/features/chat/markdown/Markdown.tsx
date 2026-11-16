@@ -1,7 +1,7 @@
-/**
- * Markdown 富文本渲染组件。
- * 负责模型生成文本的流式限频解析、Prism.js 语法高亮、代码块复制与 KaTeX 数学公式渲染。
- */
+
+
+
+
 import DOMPurify from 'dompurify';
 import renderMathInElement from 'katex/contrib/auto-render';
 import { Marked } from 'marked';
@@ -23,17 +23,17 @@ import { normalizeEscapedMarkdownLineBreaks } from './markdownText';
 import 'katex/dist/katex.min.css';
 import './markdown.css';
 
-/** Markdown 组件入参属性定义。 */
+
 export interface MarkdownProps {
-  /** 待渲染的 Markdown 源码文本。 */
+
   text: string;
-  /** 是否处于流式生成状态，流式阶段启用限频且推迟高开销公式与 DOM 交互。 */
+
   live?: boolean;
-  /** 是否需要还原完全转义的结构性换行。 */
+
   normalizeEscapedLineBreaks?: boolean;
 }
 
-/** HTML 字符转义映射表。 */
+
 const ESCAPE_HTML_MAP: Record<string, string> = {
   '&': '&amp;',
   '<': '&lt;',
@@ -42,17 +42,16 @@ const ESCAPE_HTML_MAP: Record<string, string> = {
   "'": '&#39;',
 };
 
-/**
- * 安全转义 HTML 特殊字符，防止未知语言或未高亮文本被直接注入解析。
- *
- * @param text 需要转义的纯文本
- * @returns 经过 HTML 实体转义的安全字符串
- */
+
+
+
+
+
+
 function escapeHtml(text: string): string {
   return text.replace(/[&<>"']/g, (char) => ESCAPE_HTML_MAP[char] || char);
 }
 
-/** 常用代码语言别名映射。 */
 const LANGUAGE_ALIASES: Record<string, string> = {
   js: 'javascript',
   ts: 'typescript',
@@ -93,7 +92,6 @@ function resolveLanguage(lang?: string): {
   };
 }
 
-/** 配置了 Prism 语法高亮和标准代码块结构的 Marked 解析器实例。 */
 const customMarked = new Marked({
   breaks: true,
   gfm: true,
@@ -116,7 +114,6 @@ const customMarked = new Marked({
   },
 });
 
-/** 限制长回答的全量 Markdown 解析频率，并在结束生成时立即展示最终文本。 */
 function useStreamingText(text: string, live: boolean): string {
   const [displayed, setDisplayed] = useState(text);
   const latest = useRef(text);
@@ -167,7 +164,6 @@ export const Markdown = memo(function Markdown({
     () => DOMPurify.sanitize(customMarked.parse(markdown) as string),
     [markdown],
   );
-  // 保持相同 HTML 的对象引用，避免限频状态更新覆盖公式和复制按钮的 DOM 增强。
   const markup = useMemo(() => ({ __html: html }), [html]);
 
   useEffect(() => {
@@ -187,7 +183,7 @@ export const Markdown = memo(function Markdown({
         trust: false,
       });
     } catch {
-      // 容错处理：不破坏 React DOM 挂载生命周期
+      // Ignore math-rendering failures.
     }
     const buttons: HTMLButtonElement[] = [];
     const timers = new Set<ReturnType<typeof setTimeout>>();

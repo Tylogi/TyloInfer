@@ -1,9 +1,9 @@
-/** 封装 connections 领域资源请求，不保存组件状态。 */
+
 import type { RemoteNode } from '../types';
 import { request, apiUrl, errorFromResponse, authorizedHeaders } from '../client';
 
 export const connectionsApi = {
-  /** 获取远程节点状态，可要求服务刷新健康信息。 */
+
   async remoteNodes(refresh = false): Promise<RemoteNode[]> {
     return (
       await request<{ data: RemoteNode[] }>(
@@ -12,7 +12,7 @@ export const connectionsApi = {
     ).data;
   },
 
-  /** 注册远程服务节点及其凭据环境变量名称。 */
+
   createRemoteNode(body: {
     name: string;
     url: string;
@@ -25,7 +25,7 @@ export const connectionsApi = {
     });
   },
 
-  /** 移除远程节点注册。 */
+
   async deleteRemoteNode(id: string): Promise<void> {
     const response = await fetch(apiUrl(`/api/cluster/nodes/${id}`), {
       method: 'DELETE',

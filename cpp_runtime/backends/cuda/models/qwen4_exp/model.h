@@ -15,6 +15,9 @@
 #include "runtime/row_stage.h"
 #include "runtime/kv_offload.h"
 #include "runtime/kv_memory.h"
+#include "runtime/qsa_tq_cache.h"
+#include "runtime/qsa_indexer.h"
+#include "runtime/qsa_tq_session.h"
 #include "runtime/decode_window.h"
 #include "runtime/recurrent_copy_batch.h"
 #include "mfq_cuda_kv_quantization.h"
@@ -724,13 +727,15 @@ class NgramEmbedding {
     using Context = mfq::models::qwen4_exp::NgramContext;
     using RowLookup = std::function<Tensor(const std::vector<int64_t>&,const tb::Device&)>;
     using StageFactory = std::function<std::shared_ptr<RowStage>(const std::vector<int64_t>&,const tb::Device&)>;
+    using RowPrepare = std::function<std::function<Tensor()>(const std::vector<int64_t>&,
+        const std::vector<int64_t>&,const tb::Device&)>;
     NgramEmbedding(std::vector<Embedding> shards, int64_t rows, int64_t dimension, int64_t ngram,
                    int64_t heads_per_ngram, int64_t eos, std::vector<int64_t> multipliers,
                    std::vector<int64_t> offsets, std::vector<int64_t> vocab,std::shared_ptr<NintRowPipeline> pipeline = {},
-                   RowLookup row_lookup = {},StageFactory stage_factory = {})
+                   RowLookup row_lookup = {},StageFactory stage_factory = {},RowPrepare row_prepare = {})
         : shards_(std::move(shards)), rows_(rows), dimension_(dimension), ngram_(ngram),
           heads_(heads_per_ngram), eos_(eos), multipliers_(std::move(multipliers)),
-          offsets_(std::move(offsets)), vocab_(std::move(vocab)),pipeline_(std::move(pipeline)),row_lookup_(std::move(row_lookup)),stage_factory_(std::move(stage_factory)) {
+          offsets_(std::move(offsets)), vocab_(std::move(vocab)),pipeline_(std::move(pipeline)),row_lookup_(std::move(row_lookup)),stage_factory_(std::move(stage_factory)),row_prepare_(std::move(row_prepare)) {
         TYLOINFER_RUNTIME_CHECK(!shards_.empty() && rows_ > 0 && dimension_ > 0 && ngram_ > 1 &&
                               heads_ > 0 && multipliers_.size() == size_t(ngram_) &&
                               offsets_.size() == size_t((ngram_ - 1) * heads_) &&
@@ -741,16 +746,29 @@ class NgramEmbedding {
                                   offsets_[h] <= int64_t(shards_.size()) * rows_ - vocab_[h],
                               "Qwen4 ngram vocabulary lies outside embedding shards");
     }
-    void reset() { context_ = {};hash_ready_=false; }
+    void reset() { context_ = {};hash_ready_=false;prefetched_={};prefetched_ids_.clear(); }
     bool graph_supported() const { return bool(pipeline_) || bool(stage_factory_); }
     const Context &context() const { return context_; }
-    void restore(Context context) { context_ = std::move(context);hash_ready_=false; }
+    void restore(Context context) {
+        prefetched_={};prefetched_ids_.clear();prefetched_shape_.clear();
+        context_ = std::move(context);hash_ready_=false;
+    }
     Context prefix_context(const Tensor& host_ids,int64_t count) const {
         auto host=host_ids.narrow(1,0,count).to(tb::kInt64).contiguous();
         return mfq::models::qwen4_exp::ngram_hashes(host.data_ptr<int64_t>(),host.size(0),count,
             ngram_,heads_,eos_,multipliers_,offsets_,vocab_,context_,true).next;
     }
     void prefetch(const Tensor& host_ids,bool early_prefix=false) {
+        if(row_prepare_ && host_ids.dim()==2 && host_ids.size(1)>8) {
+            TYLOINFER_RUNTIME_CHECK(host_ids.is_cpu(),"PLE prefetch requires host token IDs");
+            const auto host=host_ids.to(tb::kInt64).contiguous();const auto b=host.size(0),t=host.size(1);
+            auto hashes=mfq::models::qwen4_exp::ngram_hashes(host.data_ptr<int64_t>(),b,t,
+                ngram_,heads_,eos_,multipliers_,offsets_,vocab_,context_,true);
+            if(prefetched_ && prefetched_ids_==hashes.ids && prefetched_shape_==std::vector<int64_t>{b,t,(ngram_-1)*heads_})return;
+            prefetched_={};prefetched_ids_=std::move(hashes.ids);prefetched_shape_={b,t,(ngram_-1)*heads_};
+            prefetched_=row_prepare_(prefetched_ids_,prefetched_shape_,tb::Device(tb::kCUDA,mfq_current_cuda_device()));
+            return;
+        }
 #if TYLOINFER_ENABLE_MFQ_COMPAT
 
         if(!pipeline_)return;
@@ -784,13 +802,13 @@ class NgramEmbedding {
         auto host=host_ids.to(tb::kInt64).contiguous();const auto b=host.size(0),t=host.size(1);
         if(cacheable_hashes(b,t)) {
             auto& hashes=graph_hashes(host);
-            stage.upload(hashes.ids,{b,t,(ngram_-1)*heads_});
+            stage.upload_graph(hashes.ids,{b,t,(ngram_-1)*heads_});
             restore(std::move(hashes.next));
             return;
         }
         auto hashes=mfq::models::qwen4_exp::ngram_hashes(host.data_ptr<int64_t>(),b,t,ngram_,heads_,eos_,
             multipliers_,offsets_,vocab_,context_,true);
-        stage.upload(hashes.ids,{b,t,(ngram_-1)*heads_});
+        stage.upload_graph(hashes.ids,{b,t,(ngram_-1)*heads_});
         restore(std::move(hashes.next));
     }
     Tensor forward(const Tensor &ids, bool cache, Tensor *hashed_ids = nullptr,const Tensor& host_ids = {}) {
@@ -804,7 +822,17 @@ class NgramEmbedding {
             source, b, t, ngram_, heads_, eos_, multipliers_, offsets_, vocab_, context_, cache);
         auto &global = hashes.ids;
         if(row_lookup_) {
-            auto result=row_lookup_(global,ids.device());
+            auto prepared=std::move(prefetched_);
+            const bool matches=prepared && prefetched_ids_==global && prefetched_shape_==std::vector<int64_t>{b,t,nh};
+            prefetched_ids_.clear();prefetched_shape_.clear();
+            if(!matches)prepared={};
+            auto result=matches?prepared():row_lookup_(global,ids.device());
+            if(matches && std::getenv("TYLOINFER_TRACE_KERNEL_DISPATCH")) {
+                static std::atomic<bool> reported{false};
+                if(!reported.exchange(true))std::fprintf(stderr,
+                    "native_ple_prefill_prefetch actual_match=1 tokens=%lld cpu_read_only_worker=1 bounded_packet=1\n",
+                    static_cast<long long>(t));
+            }
             if(hashed_ids)*hashed_ids=tb::tensor(global).reshape({b,t,nh}).to(ids.device());
             if(cache)restore(std::move(hashes.next));
             return result.reshape({b,t,nh*dimension_});
@@ -866,6 +894,9 @@ class NgramEmbedding {
     std::shared_ptr<NintRowPipeline> pipeline_;
     RowLookup row_lookup_;
     StageFactory stage_factory_;
+    RowPrepare row_prepare_;
+    std::function<Tensor()> prefetched_;
+    std::vector<int64_t> prefetched_ids_,prefetched_shape_;
     bool reuse_hashes_=[] {
         const auto* option=std::getenv("TYLOINFER_PLE_HASH_REUSE");return !option || option[0]!='0';
     }();
@@ -1104,6 +1135,7 @@ struct QsaConfig {
 };
 
 class Qsa {
+    struct Projection;
   public:
     Qsa(QsaWeights weights, QsaConfig config, std::shared_ptr<RotaryEmbedding> rotary,
         bool fused_projection = true, bool grouped_projection = true,
@@ -1111,7 +1143,7 @@ class Qsa {
         : w_(std::move(weights)), c_(config), rotary_(std::move(rotary)), fused_projection_(fused_projection), grouped_projection_(grouped_projection),
           keys_(config.maximum, config.kv_heads * key_width(), cache_dtype()),
           values_(config.maximum, config.kv_heads * value_width(), cache_dtype()),
-          index_(config.maximum, config.index_width) {
+          index_(config.maximum, config.index_width+2, tb::kInt16) {
         TYLOINFER_RUNTIME_CHECK(c_.heads > 0 && c_.kv_heads > 0 && c_.heads % c_.kv_heads == 0 &&
                               c_.width > 0 && c_.index_heads > 0 && c_.pool > 0 && c_.budget > 0 &&
                               c_.budget % c_.pool == 0 && rotary_,
@@ -1122,6 +1154,18 @@ class Qsa {
         // BF16 sources otherwise record repeated casts in each row's graph.
         for(auto* weight:{&w_.query_norm,&w_.key_norm,&w_.index_query_norm,&w_.index_key_norm})
             if(weight->defined())*weight=weight->to(tb::kFloat32).contiguous();
+        if(const auto* trace=std::getenv("TYLOINFER_TRACE_KERNEL_DISPATCH");trace && trace[0]=='1') {
+            static std::atomic<bool> reported{false};
+            if(!reported.exchange(true))std::fprintf(stderr,"native_qsa_indexer_cache actual_match=1 format=int16_affine default=1\n");
+        }
+        if(qsa_tq_cache_enabled()) {
+            TYLOINFER_RUNTIME_CHECK(c_.pool==4 && !c_.dense_window && !quantization_.enabled(),
+                "adaptive QSA requires four-token sparse blocks and its own KV codec");
+            adaptive_=std::make_unique<QsaTqCache>(c_.maximum,int(c_.heads),int(c_.kv_heads),int(c_.width),
+                int(c_.index_heads),int(c_.index_width),int(c_.budget),w_.query_norm.options(),
+                memory?memory->ssd_enabled():kv_memory_options().placement=="auto_ssd");
+            return;
+        }
         memory_manager_=memory;
         offload_ = std::move(offload);
         if(memory && !offload_)memory_=memory->add(c_.maximum,c_.kv_heads,key_width(),value_width(),
@@ -1129,16 +1173,31 @@ class Qsa {
                 c_.maximum<=c_.budget?c_.maximum:c_.budget+c_.pool-1);
         if (offload_) {
             offloaded_kv_ = std::make_unique<KvOffloadSequence>(offload_, c_.kv_heads * (key_width()+value_width()), c_.pool, cache_dtype());
-            offloaded_index_ = std::make_unique<KvOffloadSequence>(offload_, c_.index_width, c_.pool);
-            offloaded_pooled_ = std::make_unique<KvOffloadSequence>(offload_, c_.index_width, 16);
+            offloaded_index_ = std::make_unique<KvOffloadSequence>(offload_, c_.index_width+2, c_.pool,tb::kInt16);
+            offloaded_pooled_ = std::make_unique<KvOffloadSequence>(offload_, c_.index_width+2, 16,tb::kInt16);
         }
     }
-    int64_t position() const { return offload_ && offloaded_kv_ ? offloaded_kv_->position() : keys_.position(); }
+    int64_t position() const { return adaptive_?adaptive_->position():offload_ && offloaded_kv_ ? offloaded_kv_->position() : keys_.position(); }
     bool managed_memory() const {return memory_ && memory_->ready;}
-    int64_t graph_capacity() const {return managed_memory()?c_.maximum:0;}
+    std::optional<tyloinfer::qsa::AdaptiveCacheStats> adaptive_stats() const {return adaptive_?std::optional(adaptive_->stats()):std::nullopt;}
+    std::uint64_t adaptive_ssd_read_bytes() const {return adaptive_?adaptive_->ssd_read_bytes():0;}
+    std::optional<QsaRamMemory> adaptive_ram_memory()const {return adaptive_?adaptive_->ram_memory():std::nullopt;}
+    void wait_adaptive() {if(adaptive_)adaptive_->wait();}
+    void collect_adaptive() {if(adaptive_)adaptive_->collect();}
+    std::shared_ptr<void> hold_adaptive_workspace(std::size_t bytes) {
+        return adaptive_?adaptive_->hold_host_workspace(bytes):std::shared_ptr<void>{};
+    }
+    QsaRamWorkspaceProgress reclaim_shared_adaptive_workspace() {
+        return adaptive_?adaptive_->reclaim_shared_host_workspace():QsaRamWorkspaceProgress{};
+    }
+    void release_idle_adaptive() {if(adaptive_)adaptive_->release_idle();}
+    void set_adaptive_budget(std::size_t bytes) {if(adaptive_)adaptive_->set_budget(bytes);}
+    int pending_device_graph_kind(int64_t tokens) const {return adaptive_?adaptive_->device_graph_kind(tokens):0;}
+    bool pending_graph_task_supported() const {return adaptive_ && adaptive_->graph_task_supported();}
+    int64_t graph_capacity() const {return adaptive_ || managed_memory()?c_.maximum:0;}
     // Tail queries share all history KV/index writes. Streamed attention also
     // stages raw KV by query row, so retain its complete-row path for now.
-    bool supports_history_tail_graph() const {return !offload_;}
+    bool supports_history_tail_graph() const {return !adaptive_ && !offload_;}
     void activate_memory() {
         if(!managed_memory())return;
         if(!index_.storage().defined())index_.replace_storage(memory_->index);
@@ -1160,6 +1219,7 @@ class Qsa {
         return w_.output(execution,x);
     }
     std::size_t growth_bytes(int64_t tokens) const {
+        if(adaptive_)return 0;
         if(managed_memory())return memory_->growth_bytes(position()+tokens);
         if (offload_) return 0;
         const auto required = position() + tokens;
@@ -1173,27 +1233,45 @@ class Qsa {
             int64_t capacity = current ? current : std::min<int64_t>(16, c_.maximum);
             while (capacity < required)
                 capacity = std::min(c_.maximum, capacity > c_.maximum / 2 ? c_.maximum : capacity * 2);
-            const auto width = cache == &index_ ? c_.index_width : c_.kv_heads * (cache == &keys_ ? key_width() : value_width());
+            const auto width = cache == &index_ ? c_.index_width+2 : c_.kv_heads * (cache == &keys_ ? key_width() : value_width());
             bytes += std::size_t(capacity) * width * (cache != &index_ && quantization_.enabled() ? 4 : 2);
         }
         return bytes;
     }
     std::size_t graph_growth_bytes(int64_t capacity) const {
+        if(adaptive_)return 0;
         if(managed_memory())return memory_->growth_bytes(capacity);
         if (graph_keys_.defined()) return 0;
         auto bytes = std::size_t(capacity) * c_.kv_heads * (key_width()+value_width()) * (quantization_.enabled()?4:2);
         if (!index_.storage().defined() || index_.storage().size(1) != capacity)
-            bytes += std::size_t(capacity) * c_.index_width * 2;
-        bytes += std::size_t((capacity+c_.pool-1)/c_.pool) * c_.index_width * 2;
+            bytes += std::size_t(capacity) * (c_.index_width+2) * 2;
+        bytes += std::size_t((capacity+c_.pool-1)/c_.pool) * (c_.index_width+2) * 2;
         return bytes;
     }
-    bool supports_session() const { return !offload_ && !(memory_ && memory_->offload); }
+    bool supports_session() const { return adaptive_?adaptive_->supports_session():!offload_ && !(memory_ && memory_->offload); }
+    std::size_t prefill_attention_workspace_bytes(int64_t append) const {
+        if(!adaptive_ || append<=8 || c_.heads/c_.kv_heads<4)return 0;
+        const auto padded=c_.width<=256?256:c_.width<=512?512:1024;
+        const auto blocks=std::uint64_t((position()+append+3)/4);
+        const auto per_block=std::uint64_t(c_.kv_heads)*4*padded*2*2;
+        if(blocks>SIZE_MAX/per_block/2)return SIZE_MAX;
+        // Encoded layer staging and decoded K/V coexist. The base planner
+        // already includes the former short-context scratch allowance.
+        const auto total=std::size_t(blocks*per_block*2);
+        return total>(32ULL<<20)?total-(32ULL<<20):0;
+    }
     std::size_t session_bytes(int64_t count) const {
         if(count<=0)return 0;
+        // The caller reserves device workspace for a checkpoint. Packed RAM
+        // snapshots retain host images/file leases and need no KV GPU copy.
+        if(adaptive_ && adaptive_->supports_session())return 0;
         return std::size_t(count)*(c_.kv_heads*(key_width()+value_width())*(quantization_.enabled()?4:2)+
-            c_.index_width*index_.storage().element_size());
+            (c_.index_width+2)*index_.storage().element_size());
     }
     void capture_session(Qwen4BlockSessionState& state,int64_t count,std::size_t& bytes) const {
+        if(adaptive_) {
+            state.adaptive_qsa=adaptive_->capture_session(count);bytes+=state.adaptive_qsa->resident_bytes();return;
+        }
         TYLOINFER_RUNTIME_CHECK(!offload_ && count>0 && count<=position(),"invalid Qwen4 QSA session boundary");
         const auto save=[&](const Tensor& tensor) {
             auto saved=tensor.contiguous().clone();bytes+=session_tensor_bytes(saved);return saved;
@@ -1211,13 +1289,24 @@ class Qsa {
         }
         state.index=save(index_.storage().narrow(1,0,count));
     }
+    std::shared_ptr<void> reserve_session_restore(const Qwen4BlockSessionState& state) {
+        if(!adaptive_)return {};
+        TYLOINFER_RUNTIME_CHECK(state.adaptive_qsa,"missing adaptive QSA session");
+        return adaptive_->reserve_session_restore(*state.adaptive_qsa);
+    }
     void restore_session(const Qwen4BlockSessionState& state,int64_t count) {
+        if(adaptive_) {
+            TYLOINFER_RUNTIME_CHECK(state.adaptive_qsa && state.adaptive_qsa->tokens==count,"incompatible adaptive QSA session");
+            adaptive_->restore_session(*state.adaptive_qsa,state.adaptive_qsa->borrow_prefix);return;
+        }
         TYLOINFER_RUNTIME_CHECK(!offload_ && state.keys.defined() && state.values.defined() && state.index.defined() &&
             state.keys.dim()==3 && state.keys.size(0)==1 && state.keys.size(1)==count &&
             state.keys.size(2)==c_.kv_heads*key_width() && state.keys.scalar_type()==cache_dtype() &&
             state.values.dim()==3 && state.values.size(0)==1 && state.values.size(1)==count &&
             state.values.size(2)==c_.kv_heads*value_width() && state.values.scalar_type()==cache_dtype() &&
-            state.index.dim()==3 && state.index.size(0)==1 && state.index.size(1)==count && state.index.size(2)==c_.index_width,
+            state.index.dim()==3 && state.index.size(0)==1 && state.index.size(1)==count &&
+            ((state.index.size(2)==c_.index_width+2 && state.index.scalar_type()==tb::kInt16) ||
+             (state.index.size(2)==c_.index_width && state.index.scalar_type()==tb::kFloat16)),
             "incompatible Qwen4 QSA session state");
         reset();activate_memory();
         if(managed_memory()) {
@@ -1230,10 +1319,11 @@ class Qsa {
                 graph_keys_.narrow(2,0,count).copy_(k);graph_values_.narrow(2,0,count).copy_(v);
                 memory_->hot.publish(graph_keys_,graph_values_,positions);
             }
-            keys_.advance_fixed(count);values_.advance_fixed(count);index_.append(state.index);graph_prepared_=false;
-        } else {keys_.append(state.keys);values_.append(state.values);index_.append(state.index);}
+            keys_.advance_fixed(count);values_.advance_fixed(count);index_.append(qsa_indexer::encode(state.index));graph_prepared_=false;
+        } else {keys_.append(state.keys);values_.append(state.values);index_.append(qsa_indexer::encode(state.index));}
     }
     std::vector<Tensor> resident_cache_tensors() const {
+        if(adaptive_)return adaptive_->resident_tensors();
         if(managed_memory())return {}; // Count physical GPU/RAM tiers through KvMemoryManager.
         return {keys_.storage(),values_.storage(),index_.storage(),graph_keys_,graph_values_,graph_pooled_};
     }
@@ -1247,6 +1337,7 @@ class Qsa {
         rotary_->set_fused(enabled);
     }
     void leave_graph() {
+        if(adaptive_)return;
         if(managed_memory()){graph_prepared_=false;return;}
         if(!graph_keys_.defined())return;
         const auto n=position();
@@ -1255,6 +1346,7 @@ class Qsa {
         graph_keys_={};graph_values_={};graph_pooled_={};
     }
     void reset() {
+        if(adaptive_){adaptive_->reset();return;}
         if (offload_) {
             if(offloaded_kv_)offloaded_kv_->reset();
             if(offloaded_index_)offloaded_index_->reset();
@@ -1267,7 +1359,11 @@ class Qsa {
         if(managed_memory()){memory_->hot.reset();activate_memory();return;}
         graph_keys_={};graph_values_={};graph_pooled_={};
     }
-    void prepare_graph(const Tensor& full_positions, int64_t capacity) {
+    void prepare_graph(const Tensor& full_positions, int64_t capacity,bool allow_pending_device_graph=false) {
+        prepare_graph_tokens(full_positions,capacity,allow_pending_device_graph,1);
+    }
+    void prepare_graph_tokens(const Tensor& full_positions, int64_t capacity,int pending_device_graph_kind,int64_t tokens) {
+        if(adaptive_){adaptive_->prepare_decode_tokens(tokens,pending_device_graph_kind!=0,pending_device_graph_kind&~3);return;}
         activate_memory();
         TYLOINFER_RUNTIME_CHECK(!offload_ || managed_memory(), "streamed QSA graphs require a resident indexer");
         if(managed_memory()) {
@@ -1275,10 +1371,9 @@ class Qsa {
             const auto n=position(),pools=n/c_.pool;
             memory_->ensure(n);
             if(pools) {
-                auto pooled=index_.storage().narrow(1,0,pools*c_.pool).reshape({1,pools,c_.pool,c_.index_width}).to(tb::kFloat32).mean(2).to(index_.storage().scalar_type());
-                pooled=rms_norm(pooled,w_.index_key_norm.to(tb::kFloat32)+1,c_.eps);
                 auto starts=tb::arange(pools,full_positions.options().dtype(tb::kInt64))*c_.pool;
-                graph_pooled_.narrow(1,0,pools).copy_(rotary_->forward(pooled.unsqueeze(1),full_positions.index_select(-1,starts)).squeeze(1));
+                auto pooled=pool_index(index_.storage().narrow(1,0,pools*c_.pool),full_positions.index_select(-1,starts));
+                graph_pooled_.narrow(1,0,pools).copy_(pooled);
             }
             graph_prepared_=true;return;
         }
@@ -1292,13 +1387,11 @@ class Qsa {
         graph_keys.narrow(2,0,n).copy_(keys_.storage().narrow(1,0,n).reshape({1,n,c_.kv_heads,key_width()}).permute({0,2,1,3}));
         graph_values.narrow(2,0,n).copy_(values_.storage().narrow(1,0,n).reshape({1,n,c_.kv_heads,value_width()}).permute({0,2,1,3}));
         index_.prepare_fixed(capacity);
-        auto graph_pooled=tb::zeros({1,(capacity+c_.pool-1)/c_.pool,c_.index_width},index_.storage().options());
+        auto graph_pooled=tb::zeros({1,(capacity+c_.pool-1)/c_.pool,c_.index_width+2},index_.storage().options());
         const auto pools=n/c_.pool;
         if(pools) {
-            auto pooled=index_.storage().narrow(1,0,pools*c_.pool).reshape({1,pools,c_.pool,c_.index_width}).to(tb::kFloat32).mean(2).to(index_.storage().scalar_type());
-            pooled=rms_norm(pooled,w_.index_key_norm.to(tb::kFloat32)+1,c_.eps);
             auto starts=tb::arange(pools,full_positions.options().dtype(tb::kInt64))*c_.pool;
-            graph_pooled.narrow(1,0,pools).copy_(rotary_->forward(pooled.unsqueeze(1),full_positions.index_select(-1,starts)).squeeze(1));
+            graph_pooled.narrow(1,0,pools).copy_(pool_index(index_.storage().narrow(1,0,pools*c_.pool),full_positions.index_select(-1,starts)));
         }
         // Commit only after all allocation/copy submissions succeed. Replay
         // reads graph KV; retaining the old layout duplicates the full prefix
@@ -1310,6 +1403,41 @@ class Qsa {
                          const Tensor& positions,const Tensor& cache_positions,
                          std::vector<Tensor> projections={},bool project_output=true,bool history_only=false,
                          bool query_tail=false) {
+        if(adaptive_) {
+            TYLOINFER_RUNTIME_CHECK(!query_tail,"adaptive QSA uses complete verification rows");
+            auto p=history_only?project_history(execution,hidden,positions):project(execution,hidden,positions,true,{},{},{},std::move(projections));
+            if(!history_only && adaptive_->pending_graph_enabled()) {
+                auto buffer=tb::empty({1,hidden.size(1),c_.heads*c_.width},hidden.options().dtype(
+                    hidden.scalar_type()==tb::kFloat16?tb::kFloat16:tb::kFloat32));
+                auto output=adaptive_->forward_pending_graph(p.query,p.key,p.value,p.iq,p.raw,cache_positions,p.gate,buffer,
+                    [this](const Tensor& raw,const Tensor& starts){return adaptive_pool(raw,starts);},positions).to(hidden.scalar_type());
+                return project_output?w_.output(execution,output):output;
+            }
+            auto* window=DecodeWindow::recording();
+            TYLOINFER_RUNTIME_CHECK(window,"adaptive QSA graph requires a decode window");
+            struct AdaptiveStage {Projection inputs;Tensor positions,output,attention_output;};
+            const auto stage=window->workspace<AdaptiveStage>(this,[&] {
+                ResidentAllocationScope resident;
+                const auto zeros=[](const Tensor& x){return x.defined()?tb::zeros(x.sizes(),x.options()):Tensor{};};
+                auto value=std::make_shared<AdaptiveStage>();
+                value->inputs={zeros(p.gate),zeros(p.query),zeros(p.key),zeros(p.value),zeros(p.iq),zeros(p.raw)};
+                value->positions=zeros(positions);
+                value->output=tb::zeros({1,hidden.size(1),c_.heads*c_.width},hidden.options());
+                value->attention_output=(hidden.scalar_type()==tb::kFloat16 || hidden.scalar_type()==tb::kFloat32)?value->output:
+                    tb::zeros(value->output.sizes(),hidden.options().dtype(tb::kFloat32));return value;
+            });
+            const auto copy=[](Tensor& dst,const Tensor& src){if(src.defined())dst.copy_(src);};
+            copy(stage->inputs.gate,p.gate);copy(stage->inputs.query,p.query);copy(stage->inputs.key,p.key);
+            copy(stage->inputs.value,p.value);copy(stage->inputs.iq,p.iq);copy(stage->inputs.raw,p.raw);stage->positions.copy_(positions);
+            // Projection and FFN segments remain captured; cache append and
+            // background publication run at an explicit completed boundary.
+            window->host_barrier([this,stage,history_only] {
+                adaptive_attention(stage->inputs,stage->positions,history_only,stage->attention_output);
+                if(!history_only && stage->attention_output.data_ptr()!=stage->output.data_ptr())stage->output.copy_(stage->attention_output);
+            });
+            if(history_only)return {};
+            return project_output?w_.output(execution,stage->output):stage->output;
+        }
         const auto mark=[](const char* phase) {
             if(auto* window=DecodeWindow::recording())window->mark_current(phase);
         };
@@ -1345,15 +1473,14 @@ class Qsa {
         if(exclusive) {
             const auto keys=(quantization_.enabled()?encode_key(p.key):p.key).permute({0,2,1,3});
             const auto values=(quantization_.enabled()?encode_value(p.value):p.value).permute({0,2,1,3});
-            index_written=memory_->hot.append_decode(keys,values,cache_positions,p.raw,index_.storage(),begin_prepare);
-            if(!index_written)memory_->hot.append(keys.to(cache_dtype()),values.to(cache_dtype()),cache_positions);
+            memory_->hot.append(keys.to(cache_dtype()),values.to(cache_dtype()),cache_positions);
         }
         else if (!p.cache_written && !streamed) {
             graph_keys_.index_copy_(2,cache_positions,encode_key(p.key).permute({0,2,1,3}));
             graph_values_.index_copy_(2,cache_positions,encode_value(p.value).permute({0,2,1,3}));
         }
         if(managed_memory() && !exclusive && !streamed)memory_->hot.publish(graph_keys_,graph_values_,cache_positions);
-        if(!index_written)index_.append_fixed(p.raw,cache_positions);
+        if(!index_written)index_.append_fixed(qsa_indexer::encode(p.raw),cache_positions);
         mark("qsa_cache_end");
         if(history_only && streamed) {
             auto* window=DecodeWindow::recording();
@@ -1413,23 +1540,17 @@ class Qsa {
         const bool pool_written=(!pool_fusion || pool_fusion[0]!='0') && (!pool_write || pool_write[0]!='0') &&
             index_.storage().size(1)>=c_.maximum && rotary_->pool_normalized_into(index_.storage(),w_.index_key_norm,
                 positions,cache_positions,graph_pooled_,c_.pool,c_.maximum,c_.eps);
-        if(!pool_written && rotary_->fused() && (!pool_fusion || pool_fusion[0]!='0') && index_.storage().size(1)>=c_.maximum) {
-            auto prepared=mfq_qwen4_exp::live_index_pool(index_.storage(),positions,cache_positions,c_.pool,c_.maximum);
-            block=prepared[1];
-            pooled=rotary_->forward_normalized(prepared[0].unsqueeze(2),w_.index_key_norm,prepared[2],c_.eps).squeeze(1);
-        }else if(!pool_written) {
+        if(!pool_written) {
             block=(cache_positions/c_.pool).to(tb::kInt64);
             auto row=(block.unsqueeze(-1)*c_.pool+tb::arange(c_.pool,block.options())).clamp(0,c_.maximum-1);
-            pooled=index_.storage().index_select(1,row.reshape({-1})).reshape({1,t,c_.pool,c_.index_width}).to(tb::kFloat32).mean(2).to(index_.storage().scalar_type());
-            pooled=rms_norm(pooled,w_.index_key_norm.to(tb::kFloat32)+1,c_.eps);
+            auto raw=index_.storage().index_select(1,row.reshape({-1}));
             auto delta=positions-cache_positions;
-            auto block_positions=block*c_.pool+delta;
-            pooled=rotary_->forward(pooled.unsqueeze(1),block_positions).squeeze(1);
+            pooled=pool_index(raw,block*c_.pool+delta);
+            graph_pooled_.index_copy_(1,block,pooled);
         }
-        if(!pool_written)graph_pooled_.index_copy_(1,block,pooled);
         mark("qsa_pool_end");
         if(history_only)return {};
-        auto ranked=mfq_qwen4_exp::live_block_scores(p.iq,graph_pooled_,query_positions,c_.pool);
+        auto ranked=qsa_indexer::scores(p.iq,graph_pooled_,query_positions,c_.pool);
         mark("qsa_scores_end");
         auto absolute=query_positions.reshape({1,query_tokens,1});
         const auto count=std::min(c_.budget/c_.pool,pools),columns=c_.budget+c_.pool-1;
@@ -1485,10 +1606,12 @@ class Qsa {
         return finish(std::move(gated));
     }
     void advance_graph(int64_t tokens) {
+        if(adaptive_){adaptive_->advance_graph(tokens);return;}
         if(!offload_){keys_.advance_fixed(tokens);values_.advance_fixed(tokens);}
         index_.advance_fixed(tokens);
     }
     void truncate(int64_t keep) {
+        if(adaptive_){adaptive_->truncate(keep);return;}
         if (offload_) {
             TYLOINFER_RUNTIME_CHECK(keep >= 0 && keep <= position(), "invalid offloaded QSA truncation");
             offloaded_kv_->truncate(keep);
@@ -1513,6 +1636,36 @@ class Qsa {
                           "Qwen4 QSA requires nonempty [B,T,H] input");
         activate_memory();
         TYLOINFER_RUNTIME_CHECK(!history_only || use_cache,"QSA history priming requires a cache");
+        if(adaptive_ && use_cache) {
+            TYLOINFER_RUNTIME_CHECK(hidden.size(0)==1,"adaptive QSA needs one cache per sequence");
+            TYLOINFER_RUNTIME_CHECK(!selection_trace,"adaptive QSA does not expose the legacy FP16 selection trace");
+            const auto start=position();
+            // Bound attention scratch independently of the model's FFN tile.
+            const int64_t rows=adaptive_->prefill_rows(hidden.size(1));
+            // Keep only the attention workspace tiled. The output projection
+            // consumes the complete batch, sharing weight decode and a GEMM.
+            auto gated_output=history_only?Tensor{}:tb::empty({1,hidden.size(1),c_.heads*c_.width},hidden.options().dtype(
+                hidden.scalar_type()==tb::kFloat16?tb::kFloat16:tb::kFloat32));
+            try {
+                for(int64_t begin=0;begin<hidden.size(1);begin+=rows) {
+                    const auto count=std::min(rows,hidden.size(1)-begin);
+                    std::vector<Tensor> projected;for(const auto& x:projections)projected.push_back(x.narrow(1,begin,count));
+                    auto h=hidden.narrow(1,begin,count),pos=current_positions.narrow(-1,begin,count);
+                    auto p=history_only?project_history(execution,h,pos):project(execution,h,pos,true,{},{},{},std::move(projected));
+                    auto buffer=history_only?Tensor{}:gated_output.narrow(1,begin,count);
+                    auto a=adaptive_attention(p,pos,history_only,buffer);
+                    if(!history_only) {
+                        auto gated=a.reshape({1,count,c_.heads*c_.width}).to(hidden.scalar_type());
+                        if(gated.data_ptr()!=buffer.data_ptr())buffer.copy_(gated);
+                    }
+                }
+                if(history_only){if(hidden.size(1)>8)adaptive_->release_prefill_workspace();return {};}
+                auto gated=gated_output.to(hidden.scalar_type());
+                auto result=project_output?w_.output(execution,gated):gated;
+                if(hidden.size(1)>8)adaptive_->release_prefill_workspace();
+                return result;
+            }catch(...){adaptive_->truncate(start);if(hidden.size(1)>8)adaptive_->release_prefill_workspace();throw;}
+        }
         if(use_cache && hidden.size(1)>8 && !selection_trace && !history_only) {
             // Index scores grow with both query rows and the accumulated
             // context. Bound that workspace independently of the FFN tile.
@@ -1598,7 +1751,7 @@ class Qsa {
                     p.value = values_.append(encode_value(p.value).reshape({b, t, -1}))
                                   .reshape({b, offset + t, c_.kv_heads, value_width()});
                 }
-                p.raw = index_.append(p.raw);
+                p.raw = index_.append(qsa_indexer::encode(p.raw));
             };
         if(history_only) {
             auto p=project_history(execution,hidden,current_positions);
@@ -1628,27 +1781,16 @@ class Qsa {
                 return attend_projected(p,window_indices(positions,b));
             },
             [&](const Projection &p) {
-                const auto &raw = p.raw;
-                const auto pools = (offset + t) / c_.pool;
-                auto pooled = raw.narrow(1, 0, pools * c_.pool)
-                                  .reshape({b, pools, c_.pool, c_.index_width})
-                                  .to(tb::kFloat32)
-                                  .mean(2)
-                                  .to(raw.scalar_type());
-                pooled = rms_norm(pooled, w_.index_key_norm.to(tb::kFloat32) + 1, c_.eps);
-                auto starts = tb::arange(pools, raw.options().dtype(tb::kInt64)) * c_.pool;
-                auto positions = full_positions.index_select(-1, starts);
-                pooled = rotary_->forward(pooled.unsqueeze(1), positions).squeeze(1);
-                return pooled;
+                const auto pools=(offset+t)/c_.pool;
+                auto starts=tb::arange(pools,p.raw.options().dtype(tb::kInt64))*c_.pool;
+                return pool_index(p.raw.narrow(1,0,pools*c_.pool),full_positions.index_select(-1,starts));
             },
-            [](const Projection &p, const Tensor &pooled) {
-                return mfq_qwen4_exp::block_scores(p.iq, pooled);
-            },
+            [](const Projection &p,const Tensor &pooled) {return qsa_indexer::scores(p.iq,pooled);},
             [&](const Tensor &scores, const Projection &p, const Tensor &pooled) {
                 auto ids =
                     select_pooled_blocks(scores, offset, offset + t, c_.pool, c_.budget, true);
                 if (selection_trace)
-                    *selection_trace = {scores, ids, p.iq, pooled};
+                    *selection_trace = {scores, ids, p.iq, qsa_indexer::decode(pooled)};
                 return ids;
             },
             [&](const Projection &p, Tensor ids) {
@@ -1664,6 +1806,27 @@ class Qsa {
     }
 
   private:
+    Tensor pool_index(const Tensor& raw,const Tensor& starts) {
+        const auto input=raw.scalar_type()==tb::kInt16?raw:raw.to(tb::kFloat32);
+        auto fused=rotary_->pool_normalized(input,w_.index_key_norm,starts,c_.pool,c_.eps);
+        if(fused.defined())return qsa_indexer::encode(fused);
+        const auto source=qsa_indexer::decode(raw);
+        auto pooled=source.reshape({raw.size(0),raw.size(1)/c_.pool,c_.pool,c_.index_width}).mean(2);
+        pooled=rms_norm(pooled,w_.index_key_norm+1,c_.eps);
+        return qsa_indexer::encode(rotary_->forward(pooled.unsqueeze(1),starts).squeeze(1));
+    }
+    Tensor adaptive_pool(const Tensor& raw,const Tensor& starts) {
+        auto fused=rotary_->pool_normalized(raw,w_.index_key_norm,starts,4,c_.eps);
+        if(fused.defined())return fused;
+        const auto pools=raw.size(1)/4;
+        auto pooled=raw.reshape({1,pools,4,c_.index_width}).to(tb::kFloat32).mean(2).to(raw.scalar_type());
+        pooled=rms_norm(pooled,w_.index_key_norm.to(tb::kFloat32)+1,c_.eps);
+        return rotary_->forward(pooled.unsqueeze(1),starts).squeeze(1);
+    }
+    Tensor adaptive_attention(const Projection& p,const Tensor& positions,bool history_only,Tensor output={}) {
+        return adaptive_->forward(p.query,p.key,p.value,p.iq,p.raw,positions,
+            [this](const Tensor& raw,const Tensor& starts){return adaptive_pool(raw,starts);},history_only,p.gate,std::move(output));
+    }
     Tensor window_indices(const Tensor& positions,int64_t batches) const {
         if(!c_.dense_window || c_.dense_window>=c_.maximum)return {};
         const auto tokens=positions.numel(),count=std::min(c_.dense_window,c_.maximum);
@@ -1759,7 +1922,7 @@ class Qsa {
         const auto offset = position(), tokens = hidden.size(1), length = offset + tokens;
         const auto pool_position=[&]{return managed_memory()?index_.position()/c_.pool:offloaded_pooled_->position();};
         const auto pool_range=[&](int64_t start,int64_t count){return managed_memory()
-            ? graph_pooled_.narrow(1,start,count).reshape({count,c_.index_width}) : offloaded_pooled_->range(start,count);};
+            ? graph_pooled_.narrow(1,start,count).reshape({count,c_.index_width+2}) : offloaded_pooled_->range(start,count);};
         TYLOINFER_RUNTIME_CHECK(hidden.size(0) == 1 && length <= c_.maximum && full_positions.size(-1) == length,
             "streamed QSA requires one sequence within its configured context");
         const auto key_row = c_.kv_heads * key_width(), value_row = c_.kv_heads * value_width();
@@ -1772,25 +1935,24 @@ class Qsa {
         try {
             offloaded_kv_->append(tb::cat({encode_key(p.key).reshape({tokens,key_row}), encode_value(p.value).reshape({tokens,value_row})}, 1));
             const auto first_pool = pool_position();
-            if(managed_memory())index_.append(p.raw);
-            else offloaded_index_->append(p.raw.reshape({tokens,c_.index_width}));
+            auto raw_records=qsa_indexer::encode(p.raw);
+            if(managed_memory())index_.append(raw_records);
+            else offloaded_index_->append(raw_records.reshape({tokens,c_.index_width+2}));
             const auto new_pools = length / c_.pool - first_pool;
             if (new_pools) {
-                auto raw = managed_memory()?index_.storage().narrow(1,first_pool*c_.pool,new_pools*c_.pool).reshape({new_pools*c_.pool,c_.index_width})
+                auto raw = managed_memory()?index_.storage().narrow(1,first_pool*c_.pool,new_pools*c_.pool).reshape({new_pools*c_.pool,c_.index_width+2})
                     : offloaded_index_->range(first_pool * c_.pool, new_pools * c_.pool);
-                auto pooled = raw.reshape({1, new_pools, c_.pool, c_.index_width}).to(tb::kFloat32).mean(2).to(tb::kFloat16);
-                pooled = rms_norm(pooled, w_.index_key_norm.to(tb::kFloat32) + 1, c_.eps);
-                auto starts = (tb::arange(new_pools, positions.options().dtype(tb::kInt64)) + first_pool) * c_.pool;
-                pooled = rotary_->forward(pooled.unsqueeze(1), full_positions.index_select(-1, starts)).squeeze(1);
+                auto starts=(tb::arange(new_pools,positions.options().dtype(tb::kInt64))+first_pool)*c_.pool;
+                auto pooled=pool_index(raw.reshape({1,new_pools*c_.pool,c_.index_width+2}),full_positions.index_select(-1,starts));
                 if(managed_memory())graph_pooled_.narrow(1,first_pool,new_pools).copy_(pooled);
-                else offloaded_pooled_->append(pooled.reshape({new_pools, c_.index_width}));
+                else offloaded_pooled_->append(pooled.reshape({new_pools,c_.index_width+2}));
             }
             if(history_only)return {};
             // When one layer fits in staging, reuse that layer across the
             // entire prefill tile instead of gathering the same rows per token.
             // Other layers remain under the GPU/RAM/SSD eviction policy.
             if (tokens > 8 && std::size_t(length) * row_bytes <= offload_->config().buffer_bytes / 2 &&
-                    std::size_t(length / c_.pool) * c_.index_width * 2 <= offload_->config().buffer_bytes / 4) {
+                    std::size_t(length / c_.pool) * (c_.index_width+2) * 2 <= offload_->config().buffer_bytes / 4) {
                 auto packed = offloaded_kv_->range(0, length);
                 auto key = packed.narrow(1,0,key_row).reshape({1,length,c_.kv_heads,key_width()}).permute({0,2,1,3});
                 auto value = packed.narrow(1,key_row,value_row).reshape({1,length,c_.kv_heads,value_width()}).permute({0,2,1,3});
@@ -1798,10 +1960,10 @@ class Qsa {
                 if(c_.dense_window && c_.dense_window<c_.maximum)
                     ids=window_indices(tb::arange(offset,offset+tokens,positions.options().dtype(tb::kInt64)),1);
                 else if (length > c_.budget) {
-                    auto pooled = pool_range(0,length / c_.pool).reshape({1,length / c_.pool,c_.index_width});
-                    auto scores = mfq_qwen4_exp::block_scores(p.iq, pooled);
+                    auto pooled = pool_range(0,length / c_.pool).reshape({1,length / c_.pool,c_.index_width+2});
+                    auto scores = qsa_indexer::scores(p.iq, pooled);
                     ids = select_pooled_blocks(scores, offset, length, c_.pool, c_.budget, true);
-                    if (trace) *trace = {scores,ids,p.iq,pooled};
+                    if (trace) *trace = {scores,ids,p.iq,qsa_indexer::decode(pooled)};
                 }
                 auto attended = attend(p.query, key, value, ids, offset);
                 auto gated = attended.to(tb::kFloat32) * tb::sigmoid(p.gate.to(tb::kFloat32));
@@ -1827,8 +1989,8 @@ class Qsa {
                         offload_->config().buffer_bytes / 8 / (c_.index_width * 2 + count * 4)));
                     for (int64_t start = 0; start < pools; start += pool_chunk) {
                         const auto n = std::min(pool_chunk, pools - start);
-                        auto pooled = pool_range(start, n).reshape({1, n, c_.index_width});
-                        auto scores = mfq_qwen4_exp::block_scores(p.iq.narrow(1, begin, count), pooled);
+                        auto pooled = pool_range(start, n).reshape({1, n, c_.index_width+2});
+                        auto scores = qsa_indexer::scores(p.iq.narrow(1, begin, count), pooled);
                         auto ids = tb::arange(start, start + n, cache_positions.options());
                         auto visible = (ids * c_.pool + c_.pool - 1).reshape({1, 1, n}) <= cache_positions.reshape({1, count, 1});
                         auto ranked = tb::where(visible, scores.to(tb::kFloat32), tb::full_like(scores, -1e30).to(tb::kFloat32));
@@ -1840,7 +2002,7 @@ class Qsa {
                             top = tb::topk(values, std::min(keep, values.size(-1)), -1, true, false);
                             best_scores = std::get<0>(top); best_ids = indices.gather(-1, std::get<1>(top));
                         } else { best_scores = values; best_ids = indices; }
-                        if (trace) { traced_scores.push_back(scores); traced_pools.push_back(pooled); }
+                        if (trace) { traced_scores.push_back(scores); traced_pools.push_back(qsa_indexer::decode(pooled)); }
                     }
                     selected = mfq_qwen4_exp::qsa_selected_tokens(best_ids, cache_positions, c_.pool, c_.budget);
                     if (trace && begin == 0) *trace = {tb::cat(traced_scores, -1), selected, p.iq.narrow(1, begin, count), tb::cat(traced_pools, 1)};
@@ -1962,6 +2124,7 @@ class Qsa {
     bool fused_projection_;
     bool grouped_projection_;
     SequenceCache keys_, values_, index_;
+    std::unique_ptr<QsaTqCache> adaptive_;
     std::shared_ptr<KvOffloadStore> offload_;
     std::unique_ptr<KvOffloadSequence> offloaded_kv_, offloaded_index_, offloaded_pooled_;
     Tensor graph_keys_,graph_values_,graph_pooled_;

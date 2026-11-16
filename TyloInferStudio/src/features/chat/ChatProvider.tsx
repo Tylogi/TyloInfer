@@ -1,4 +1,4 @@
-/** 组合聊天领域的会话、消息操作、附件和语音生命周期，跨页面保留进行中的生成。 */
+
 import { useChatAttachments } from './hooks/useChatAttachments';
 import {
   createContext,
@@ -33,7 +33,7 @@ import { isGenerationBusy } from './state/generationController';
 import { conversationActions } from './state/conversationStore';
 import { normalizeStudioPath, STUDIO_PATHS } from '../../navigation';
 
-/** 按聊天访问惰性加载数据，生成和语音控制器不会因为切换其他页面而丢失。 */
+
 function useChatDomain() {
   const location = useLocation();
   const chatRoute = normalizeStudioPath(location.pathname) === STUDIO_PATHS.chat;
@@ -96,7 +96,7 @@ function useChatDomain() {
   const trRef = useRef(tr);
   trRef.current = tr;
 
-  /** 为当前语音连接生成实时配置，使用解析后的模型默认设置。 */
+
   const realtimeSessionConfig = useCallback(
     (sessionId: string) => {
       const value = inferenceRef.current.effectiveSettings;
@@ -281,7 +281,7 @@ function useChatDomain() {
     ],
   );
 
-  /** 确认删除侧栏会话，并在服务端成功后移除本地语音历史。 */
+
   const deleteConversation = useCallback(async (id: string) => {
     const session = conversation.sessions.find((item) => item.id === id);
     if (!session || busy || conversation.transitioning) return;
@@ -306,7 +306,7 @@ function useChatDomain() {
     if (deleted.size) setVoiceMessages((current) => current.filter((message) => !deleted.has(message.sessionId)));
   }, [busy, conversation.transitioning, conversation.sessions.length, conversation.deleteAllSessions, setVoiceMessages]);
 
-  /** 用户确认后用新会话替换旧会话，同时移除对应语音历史。 */
+
   const clearActiveConversation = useCallback(async () => {
     if (
       !active ||
@@ -344,7 +344,7 @@ function useChatDomain() {
     setError,
   ]);
 
-  /** 切换会话交互模式前停止音频，成功后更新服务返回的会话版本。 */
+
   const selectInteractionMode = useCallback(
     async (mode: SessionMode) => {
       if (!active || busy || active.mode === mode) return;
@@ -364,7 +364,7 @@ function useChatDomain() {
     [active, busy, voiceRef, setSessions, setError],
   );
 
-  /** 根据当前会话切换麦克风采集，异常交给聊天错误区域展示。 */
+
   const toggleVoice = useCallback(async () => {
     if (!active || active.mode === 'text' || !inferenceRef.current.realtimeAvailable || busy) return;
     await voiceRef.current
@@ -372,7 +372,7 @@ function useChatDomain() {
       .catch((cause) => setError(errorMessage(cause)));
   }, [active, busy, voiceRef, realtimeSessionConfig, setError]);
 
-  /** 显式下载或启用语音组件，提交后刷新共享任务状态。 */
+
   const installOrEnableVoiceOutput = useCallback(async () => {
     if (voiceComponentBusy) return;
     setVoiceComponentBusy(true);
@@ -445,7 +445,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
   );
 }
 
-/** 保持生成与语音控制器挂载，不让聊天路由切换取消正在进行的请求。 */
+
 function ChatLifecycleProvider({ children }: { children: ReactNode }) {
   const value = useChatDomain();
   return <ChatContext.Provider value={value}>{children}</ChatContext.Provider>;

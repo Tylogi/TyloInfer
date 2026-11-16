@@ -1,4 +1,4 @@
-/** 验证应用入口、页面与共享层的依赖边界，防止重新出现根组件业务堆积。 */
+
 import { readFileSync, readdirSync } from 'node:fs';
 import { join, resolve, sep } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -17,6 +17,7 @@ describe('业务职责边界', () => {
     for (const route of ['chat', 'models', 'runtime', 'resources', 'logs', 'model-hub', 'analysis']) {
       expect(app).toContain(`path="${route}"`);
     }
+    expect(app).not.toMatch(/AgentProvider|AgentPage|EvaluationsPage/);
     expect(app).not.toContain('QuantizationPage');
     expect(app).not.toContain('ApplicationsPage');
     expect(app).not.toContain('SettingsRoute');

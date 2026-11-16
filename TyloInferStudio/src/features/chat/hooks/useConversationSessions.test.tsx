@@ -1,4 +1,4 @@
-/** 验证会话模块的惰性加载、历史竞态隔离及生成期间模型切换保护。 */
+
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { beforeEach, expect, it, vi } from 'vitest';
 import { sessionsApi } from '../../../shared/api/resources/sessions';

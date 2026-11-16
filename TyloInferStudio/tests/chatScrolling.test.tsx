@@ -1,4 +1,4 @@
-/** 验证滚动跟随、生命周期清理及推理展示，CSS 仅保留布局边界检查。 */
+
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { act, fireEvent, render, screen } from '@testing-library/react';
@@ -15,13 +15,13 @@ const frames = new Map<number, FrameRequestCallback>();
 let nextFrame = 0;
 let scroll: ReturnType<typeof useChatAutoScroll>;
 
-/** 提供真实 DOM ref 和滚动事件，由测试控制浏览器布局尺寸。 */
+
 function ScrollSurface({ sessionId = 'a', enabled = true }) {
   scroll = useChatAutoScroll(sessionId, enabled);
   return <div data-testid="scroller" ref={scroll.scrollerRef} onScroll={scroll.handleScroll}><div>messages</div></div>;
 }
 
-/** 执行单帧回调，验证合帧与用户操作之间的竞态。 */
+
 function flushFrames() {
   act(() => {
     const pending = [...frames.values()];

@@ -1,4 +1,4 @@
-/** 验证侧栏删除入口只转发目标会话，不触发会话切换。 */
+
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { expect, it, vi } from 'vitest';

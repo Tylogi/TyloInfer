@@ -1,4 +1,4 @@
-/** 验证任务日志订阅合并及切换任务时的旧请求隔离。 */
+
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { afterEach, expect, it, vi } from 'vitest';
 import type { JobEventResource, RuntimeLogEntry } from '../../shared/api/types';

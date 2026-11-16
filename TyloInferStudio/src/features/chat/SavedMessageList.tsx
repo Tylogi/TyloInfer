@@ -1,4 +1,4 @@
-/** 历史消息列表：展示附件、工具调用、推理指标及编辑操作。 */
+
 import { memo, useLayoutEffect, useMemo, useRef, type Dispatch, type SetStateAction } from 'react';
 import type { Message, ResponseResource } from '../../shared/api/types';
 import { Icon } from '../../app/display';
@@ -11,11 +11,11 @@ import { Tooltip } from '../../shared/ui/Tooltip';
 
 export interface EditDraft { messageId: string; text: string; }
 export interface MessageActions {
-  /** 保存已编辑消息，并从该消息继续生成。 */
+
   saveEdit: (message: Message) => Promise<void>;
-  /** 复制消息正文到剪贴板。 */
+
   copyMessage: (message: Message) => Promise<void>;
-  /** 从选定助手消息回退并重新生成回答。 */
+
   regenerate: (message: Message) => Promise<void>;
 }
 interface SavedMessageListProps {
@@ -29,7 +29,7 @@ interface SavedMessageListProps {
 }
 type MessageRowsProps = Omit<SavedMessageListProps, 'actions'> & MessageActions;
 
-/** 仅在历史数据、编辑状态或工具能力改变时重新渲染历史正文。 */
+
 const MessageRows = memo(function MessageRows({ messages, responses, busy, tr, editDraft, setEditDraft, saveEdit, copyMessage, regenerate }: MessageRowsProps) {
   return <>{messages.map((message) => {
                   const parts = textParts(message);
@@ -53,7 +53,7 @@ const MessageRows = memo(function MessageRows({ messages, responses, busy, tr, e
                 })}</>;
 });
 
-/** 将最新业务回调绑定为稳定事件入口，避免输入草稿及流式更新使历史正文失去缓存。 */
+
 export function SavedMessageList({ actions, ...props }: SavedMessageListProps) {
   const latest = useRef(actions);
   useLayoutEffect(() => { latest.current = actions; }, [actions]);

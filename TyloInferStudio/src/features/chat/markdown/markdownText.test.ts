@@ -1,4 +1,4 @@
-/** 验证模型文本换行修复不会破坏代码、JSON 和数学表达式。 */
+
 import { describe, expect, it } from 'vitest';
 import { normalizeEscapedMarkdownLineBreaks } from './markdownText';
 

@@ -1,6 +1,6 @@
-/**
- * 后台任务状态管理 (jobStore) 单元测试。
- */
+
+
+
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { jobsApi } from '../shared/api/resources/jobs';
@@ -116,7 +116,7 @@ describe('jobStore 后台任务状态管理', () => {
     const state = useJobStore.getState();
     expect(state.jobs[0].progress).toBe(45.5);
     expect(state.jobs[0].updated_at).toBe('2026-09-23T10:05:00Z');
-    // 活跃列表元素未变化时引用保持一致
+
     expect(state.activeJobIds).toBe(prevActive);
   });
 
@@ -148,7 +148,7 @@ describe('jobStore 后台任务状态管理', () => {
     );
     expect(eventCallback).toBeDefined();
 
-    // 触发进度事件
+
     eventCallback!({
       job_id: 'job-1',
       sequence: 1,
@@ -162,7 +162,7 @@ describe('jobStore 后台任务状态管理', () => {
     expect(useJobStore.getState().jobs[0].progress).toBe(60);
     expect(onTerminal).not.toHaveBeenCalled();
 
-    // 触发终态事件
+
     eventCallback!({
       job_id: 'job-1',
       sequence: 2,
@@ -371,7 +371,7 @@ describe('jobStore 后台任务状态管理', () => {
     useJobStore.getState().watchActiveJobs();
     expect(streamSpy).toHaveBeenCalledTimes(1);
 
-    // 重复调用不重复开启
+
     useJobStore.getState().watchActiveJobs();
     expect(streamSpy).toHaveBeenCalledTimes(1);
 

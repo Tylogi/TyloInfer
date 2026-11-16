@@ -7,7 +7,7 @@ import { studioCustomTitlebar } from '../shared/platform/studio';
 import tyloInferMark from '../assets/tylogi-ai-lab-mark.svg';
 import './desktop-window.css';
 
-/** 窗口控制独立于业务路由，登录、加载及渲染失败时仍可操作窗口。 */
+
 export function DesktopWindowFrame({ children }: { children: ReactNode }) {
   const { tr, settings } = useSettings();
   const [enabled, setEnabled] = useState(false);

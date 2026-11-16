@@ -1,4 +1,4 @@
-/** 验证语音音量独立订阅与控制器切换时的复位行为。 */
+
 import { act, renderHook } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { RealtimeCallbacks } from './realtimeTypes';

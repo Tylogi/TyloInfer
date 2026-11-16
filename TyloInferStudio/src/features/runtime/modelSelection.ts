@@ -1,4 +1,4 @@
-/** 汇总运行时模型、实例与加载任务，保持模型选择状态一致。 */
+
 import { JobResource, RuntimeInstance, RuntimeModel } from '../../shared/api/types';
 
 /** Return whether an adapted runtime state can accept inference requests. */

@@ -2,7 +2,7 @@ import { expect, test } from '@playwright/test';
 import { mockStudioServer } from './mockServer';
 
 for (const language of ['zh-CN', 'en'] as const) {
-  test(`service and chat have no managed MCP dependency (${language})`, async ({ page }, testInfo) => {
+  test(`service has no managed MCP dependency (${language})`, async ({ page }, testInfo) => {
     const state = await mockStudioServer(page, { language });
     await page.route('**/api/runtime/model-aliases', route => route.fulfill({ json: { aliases: {} } }));
     await page.route('**/api/runtime/memory-policy', route => route.fulfill({ json: {

@@ -1,10 +1,10 @@
-/** 验证共享设置更新的合并、持久化和跨页面上下文容量行为。 */
+
 import { fireEvent, render, screen } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import { DEFAULT_SETTINGS, SETTINGS_KEY, loadSettings } from './configuration';
 import { SettingsProvider, useSettings } from './SettingsProvider';
 
-/** 暴露两个独立消费者，用于检查跨页面共享状态与修改范围。 */
+
 function SettingsConsumer() {
   const { settings, updateSettings, contextSize, setContextSize, tr } = useSettings();
   return (

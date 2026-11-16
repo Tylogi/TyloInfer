@@ -1,9 +1,9 @@
-"""校验 Tauri Rust、发布脚本与 TypeScript 桥接的跨语言契约。
 
-纯前端迁移映射：TyloInferStudio/tests/studioContracts.test.ts、
-studioBehavior.test.tsx、studioMedia.test.tsx 与 voiceContracts.test.ts。
-Vitest 中保留旧测试名；源码契约明确标注为过渡，媒体等行为单独验证。
-"""
+
+
+
+
+
 
 import json
 from pathlib import Path

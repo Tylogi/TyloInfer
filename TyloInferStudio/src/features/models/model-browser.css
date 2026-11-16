@@ -1,6 +1,6 @@
 @import '../../shared/styles/numeric-values.css';
 
-/* 官方与社区模型浏览、设备建议和精度版本选择。 */
+
 .lab-view:has(> .model-download-page) > .screen-header { margin-bottom: 16px; }
 .model-browser { display: grid; min-width: 0; gap: 18px; }
 .model-download-page :is(input[type="number"], .download-concurrency select, .detected-memory-pool small, .model-metadata-grid dd, .model-variant small, .repository-line > span, .repository-file-list small, .download-queue-heading > span, .download-item-body > small, .download-item-files summary, .download-item-progress > span, .kv-cache-planner summary small, .kv-cache-chart text, .kv-cache-tooltip span, .kv-cache-ruler button, .kv-cache-breakdown tr:not(.kv-cache-group-row) td, .kv-cache-breakdown-heading > span) { font-family: var(--small-numerals-font); font-variant-numeric: tabular-nums; }

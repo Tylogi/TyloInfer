@@ -1,4 +1,4 @@
-/** 验证跨领域读取聊天模式时的默认值和活动会话切换。 */
+
 import { act, renderHook } from '@testing-library/react';
 import { beforeEach, expect, it } from 'vitest';
 import type { Session } from '../../../shared/api/types';

@@ -1,4 +1,4 @@
-/** 验证生成请求的会话隔离、事件顺序、业务终态及服务端错误传播。 */
+
 import { describe, expect, it, vi } from 'vitest';
 import { ApiError } from '../src/shared/api/client';
 import { streamResponse } from '../src/shared/api/responses';

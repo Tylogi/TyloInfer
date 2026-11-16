@@ -1,4 +1,4 @@
-/** 验证顶层故障视图可脱离路由和设置上下文独立渲染。 */
+
 import { fireEvent, render, screen } from '@testing-library/react';
 import { expect, it, vi } from 'vitest';
 import { FailureView } from './FailurePage';

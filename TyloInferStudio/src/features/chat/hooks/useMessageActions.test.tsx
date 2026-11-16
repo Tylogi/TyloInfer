@@ -1,4 +1,4 @@
-/** 验证消息编辑的提交时机、重新生成的回退目标及失败后的历史保护。 */
+
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { afterEach, expect, it, vi } from 'vitest';
 import { sessionsApi } from '../../../shared/api/resources/sessions';

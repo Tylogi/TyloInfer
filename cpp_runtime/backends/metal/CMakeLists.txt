@@ -361,6 +361,7 @@ add_library(mfq-metal-runtime STATIC
     runtime/mlx_qsa_kv_offload.cpp
     models/dflash2/mlx_dflash2.cpp
     ops/common/mlx_linear_attention.cpp
+    ops/common/mlx_staged_attention.cpp
     ops/common/mlx_moe_ops.cpp
     ops/common/mlx_expert_route_tiles.cpp
     ops/common/mlx_mx.cpp
@@ -429,11 +430,28 @@ target_compile_features(tyloinfer-metal-affine-test PRIVATE cxx_std_20)
 set_target_properties(tyloinfer-metal-affine-test PROPERTIES BUILD_RPATH "${TYLOINFER_MLX_ROOT}/lib")
 add_test(NAME tyloinfer-metal-affine-test COMMAND tyloinfer-metal-affine-test)
 add_executable(tyloinfer-metal-gguf-test tests/mlx_gguf_test.cpp)
+target_include_directories(tyloinfer-metal-gguf-test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/ops/gguf/native")
 target_link_libraries(tyloinfer-metal-gguf-test PRIVATE mfq-metal-runtime mfq-ggml)
 target_include_directories(tyloinfer-metal-gguf-test PRIVATE "${PROJECT_SOURCE_DIR}/components/ggml/src")
 target_compile_features(tyloinfer-metal-gguf-test PRIVATE cxx_std_20)
 set_target_properties(tyloinfer-metal-gguf-test PROPERTIES BUILD_RPATH "${TYLOINFER_MLX_ROOT}/lib")
 add_test(NAME tyloinfer-metal-gguf-test COMMAND tyloinfer-metal-gguf-test)
+add_test(NAME tyloinfer-metal-gguf-iq1-s-test COMMAND tyloinfer-metal-gguf-test iq1_s)
+add_test(NAME tyloinfer-metal-gguf-iq1-m-test COMMAND tyloinfer-metal-gguf-test iq1_m)
+add_test(NAME tyloinfer-metal-gguf-native-iq1-test COMMAND tyloinfer-metal-gguf-test native-iq1)
+add_test(NAME tyloinfer-metal-gguf-native-iq4-vector-test COMMAND tyloinfer-metal-gguf-test native-iq4-vector)
+add_test(NAME tyloinfer-metal-gguf-native-grid-vector-test COMMAND tyloinfer-metal-gguf-test native-grid-vector)
+add_test(NAME tyloinfer-metal-gguf-native-long-expansion-test COMMAND tyloinfer-metal-gguf-test native-long-expansion)
+add_test(NAME tyloinfer-metal-gguf-native-grid-decoder-exact-test COMMAND tyloinfer-metal-gguf-test native-grid-decoder-exact)
+add_test(NAME tyloinfer-metal-gguf-native-grouped-occupancy-test COMMAND tyloinfer-metal-gguf-test native-grouped-occupancy)
+add_test(NAME tyloinfer-metal-gguf-native-grouped-occupancy-no-nax-test
+    COMMAND ${CMAKE_COMMAND} -E env TYLOINFER_METAL_DISABLE_NAX=1 $<TARGET_FILE:tyloinfer-metal-gguf-test> native-grouped-occupancy)
+add_test(NAME tyloinfer-metal-gguf-native-dense-test COMMAND tyloinfer-metal-gguf-test native-dense)
+add_test(NAME tyloinfer-metal-gguf-normalized-projections-test COMMAND tyloinfer-metal-gguf-test normalized-projections)
+add_test(NAME tyloinfer-metal-gguf-native-dense-no-nax-test
+    COMMAND ${CMAKE_COMMAND} -E env TYLOINFER_METAL_DISABLE_NAX=1 $<TARGET_FILE:tyloinfer-metal-gguf-test> native-dense)
+add_test(NAME tyloinfer-metal-gguf-native-iq1-no-nax-test
+    COMMAND ${CMAKE_COMMAND} -E env TYLOINFER_METAL_DISABLE_NAX=1 $<TARGET_FILE:tyloinfer-metal-gguf-test> native-iq1)
 add_test(NAME tyloinfer-metal-gguf-split-test COMMAND tyloinfer-metal-gguf-test splits)
 add_test(NAME tyloinfer-metal-gguf-heterogeneous-test COMMAND tyloinfer-metal-gguf-test heterogeneous)
 add_test(NAME tyloinfer-metal-gguf-gyro-test COMMAND tyloinfer-metal-gguf-test gyro)
@@ -700,9 +718,6 @@ if(TYLOINFER_BUILD_PRECOMPILED_METAL)
         VERBATIM)
     add_custom_target(mfq-metal-precompiled DEPENDS "${_TYLOINFER_AOT_ROOT}/manifest.json")
     add_dependencies(mfq-decode-metal mfq-metal-precompiled)
-    if(TARGET mfq-perplexity)
-        add_dependencies(mfq-perplexity mfq-metal-precompiled)
-    endif()
 endif()
 set(_TYLOINFER_METAL_RUNTIME_BUNDLE_STAMP
     "${_TYLOINFER_METAL_RUNTIME_BUNDLE_DIR}/.mfq-runtime-bundle.stamp")
@@ -732,19 +747,6 @@ if(TARGET mfq-runtime-communication)
     target_compile_definitions(
         mfq-decode-metal PRIVATE TYLOINFER_METAL_RUNTIME_COMMUNICATION=1)
 
-    add_executable(mfq-perplexity
-        apps/mfq_perplexity_mlx.cpp
-    )
-    target_link_libraries(mfq-perplexity PRIVATE
-        mfq-metal-runtime
-        mfq-runtime-communication
-    )
-    target_compile_features(mfq-perplexity PRIVATE cxx_std_20)
-    set_target_properties(mfq-perplexity PROPERTIES
-        BUILD_RPATH "@executable_path/lib"
-        BUILD_WITH_INSTALL_RPATH ON
-        INSTALL_RPATH "@executable_path/lib"
-    )
 endif()
 
 add_custom_command(
@@ -756,12 +758,6 @@ add_custom_command(
 add_custom_target(mfq-metal-runtime-bundle
     DEPENDS "${_TYLOINFER_METAL_RUNTIME_BUNDLE_STAMP}")
 add_dependencies(mfq-decode-metal mfq-metal-runtime-bundle)
-if(TARGET mfq-perplexity)
-    add_dependencies(mfq-perplexity mfq-metal-runtime-bundle)
-    if(TARGET mfq-metal-precompiled)
-        add_dependencies(mfq-perplexity mfq-metal-precompiled)
-    endif()
-endif()
 
 add_executable(tyloinfer-metal-native-projection-test tests/mlx_mx_test.cpp)
 target_link_libraries(tyloinfer-metal-native-projection-test PRIVATE mfq-metal-runtime)

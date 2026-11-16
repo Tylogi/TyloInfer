@@ -1,4 +1,4 @@
-/** 验证模型面板拆分后仍将交互交给目录控制器。 */
+
 import { fireEvent, render, screen } from '@testing-library/react';
 import { expect, it, vi } from 'vitest';
 import type { useModelCatalog } from './useModelCatalog';
@@ -11,7 +11,7 @@ vi.mock('../settings/SettingsProvider', () => ({
   useSettings: () => ({ tr: (zh: string) => zh }),
 }));
 
-/** 构造供展示面板使用的最小模型目录。 */
+
 function catalog() {
   return {
     runtime: null,

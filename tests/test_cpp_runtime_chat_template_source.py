@@ -1,4 +1,3 @@
-"""校验原生对话模板、推理能力发布及上下文重载契约。"""
 import re
 from pathlib import Path
 

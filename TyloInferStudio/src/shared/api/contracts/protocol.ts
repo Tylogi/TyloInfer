@@ -1,4 +1,4 @@
-/** 定义 protocol 领域的服务契约，仅包含类型，不依赖运行时代码。 */
+
 
 export interface ApiErrorBody {
   error: {

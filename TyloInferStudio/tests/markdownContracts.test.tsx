@@ -1,4 +1,4 @@
-/** 补充富文本行为与静态样式契约，承接旧 Python Markdown 检查。 */
+
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { render, screen } from '@testing-library/react';

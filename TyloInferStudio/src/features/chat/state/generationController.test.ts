@@ -1,4 +1,4 @@
-/** 覆盖流式批处理、同步锁、取消和过期请求隔离等用户可见行为。 */
+
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { ResponseResource, Session, StreamRequest } from '../../../shared/api/types';
 import { GenerationController, type ConversationSnapshot } from './generationController';

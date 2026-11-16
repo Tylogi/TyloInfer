@@ -1,5 +1,5 @@
-/** 提供实时语音使用的 PCM 编解码、连续重采样及 WAV 封装。 */
-/** 将 Float32 视图的有效字节编码为 Base64，支持带偏移的大音频块。 */
+
+
 export function float32ToBase64(values: Float32Array): string {
   const bytes = new Uint8Array(values.buffer, values.byteOffset, values.byteLength);
   let binary = "";
@@ -9,7 +9,7 @@ export function float32ToBase64(values: Float32Array): string {
   return btoa(binary);
 }
 
-/** 将服务端 Base64 PCM 数据恢复为 Float32 样本数组。 */
+
 export function base64ToFloat32(value: string): Float32Array {
   const binary = atob(value);
   const bytes = new Uint8Array(binary.length);
@@ -19,10 +19,10 @@ export function base64ToFloat32(value: string): Float32Array {
   return new Float32Array(bytes.buffer);
 }
 
-/** 保存相邻块的采样位置，在线性插值时保持跨块重采样连续。 */
+
 export class StreamingLinearResampler {
   private buffer = new Float32Array(0);
-  /** 使用目标采样率作为分母累积相位，避免小数步长误差随分块变化。 */
+
   private position = 0;
 
   constructor(
@@ -30,7 +30,7 @@ export class StreamingLinearResampler {
     private readonly targetRate: number,
   ) {}
 
-  /** 追加采集块并返回可插值的样本；末尾不足一对的样本留给下一块。 */
+
   push(input: Float32Array): Float32Array {
     if (!input.length) return new Float32Array(0);
     if (this.sourceRate === this.targetRate) return new Float32Array(input);
@@ -61,7 +61,7 @@ export class StreamingLinearResampler {
   }
 }
 
-/** 将多个单声道浮点音频块裁幅并编码为 16 位小端 PCM WAV。 */
+
 export function wavBlob(chunks: Float32Array[], sampleRate: number): Blob {
   const sampleCount = chunks.reduce((total, chunk) => total + chunk.length, 0);
   const buffer = new ArrayBuffer(44 + sampleCount * 2);

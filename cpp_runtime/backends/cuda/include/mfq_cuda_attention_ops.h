@@ -5,22 +5,52 @@
 #include <cstdint>
 #include <vector>
 
+// FP16/FP32 projections, FP32 Q/K normalization and table RoPE.
+// Accepts strided head views and writes contiguous FP16 KV caches directly.
+// Positions may be shared [tokens] or independent [batch,tokens].
+mfq_tensor_backend::Tensor qk_norm_rope_cache_cuda(
+    mfq_tensor_backend::Tensor query,mfq_tensor_backend::Tensor key,mfq_tensor_backend::Tensor value,
+    mfq_tensor_backend::Tensor query_weight,mfq_tensor_backend::Tensor key_weight,
+    mfq_tensor_backend::Tensor positions,mfq_tensor_backend::Tensor write_positions,
+    mfq_tensor_backend::Tensor cosine,mfq_tensor_backend::Tensor sine,
+    mfq_tensor_backend::Tensor key_cache,mfq_tensor_backend::Tensor value_cache,
+    int64_t rotary_dim,double eps,double weight_offset);
+
+// Same normalization/RoPE arithmetic, writing FP16 physical pages directly.
+// Chunk pointer tables are int64[chunks]; pages is int32[batch,logical_pages].
+mfq_tensor_backend::Tensor qk_norm_rope_paged_cache_cuda(
+    mfq_tensor_backend::Tensor query,mfq_tensor_backend::Tensor key,mfq_tensor_backend::Tensor value,
+    mfq_tensor_backend::Tensor query_weight,mfq_tensor_backend::Tensor key_weight,
+    mfq_tensor_backend::Tensor positions,mfq_tensor_backend::Tensor write_positions,
+    mfq_tensor_backend::Tensor cosine,mfq_tensor_backend::Tensor sine,
+    mfq_tensor_backend::Tensor key_chunks,mfq_tensor_backend::Tensor value_chunks,
+    mfq_tensor_backend::Tensor pages,int64_t page_size,int64_t pages_per_chunk,
+    int64_t rotary_dim,double eps,double weight_offset);
+
 void qsa_pool_rotary_cache_cuda(
     const mfq_tensor_backend::Tensor& index, const mfq_tensor_backend::Tensor& weight,
     const mfq_tensor_backend::Tensor& positions, const mfq_tensor_backend::Tensor& cache_positions,
     const mfq_tensor_backend::Tensor& frequencies, const mfq_tensor_backend::Tensor& axes,
-    const mfq_tensor_backend::Tensor& output, int64_t pool, int64_t maximum, int64_t rotary_maximum, double eps);
+    const mfq_tensor_backend::Tensor& output, int64_t pool, int64_t maximum, int64_t rotary_maximum, double eps,
+    double attention_factor = 1.0);
+
+// Compact consecutive pools with their absolute RoPE start positions.
+void qsa_pool_rotary_cuda(
+    const mfq_tensor_backend::Tensor& index, const mfq_tensor_backend::Tensor& weight,
+    const mfq_tensor_backend::Tensor& positions, const mfq_tensor_backend::Tensor& frequencies,
+    const mfq_tensor_backend::Tensor& axes, const mfq_tensor_backend::Tensor& output,
+    int64_t pool, int64_t rotary_maximum, double eps,double attention_factor = 1.0);
 
 mfq_tensor_backend::Tensor rotary_embedding_cached_cuda(
     mfq_tensor_backend::Tensor input, mfq_tensor_backend::Tensor positions,
     mfq_tensor_backend::Tensor frequencies, mfq_tensor_backend::Tensor axes,
-    int64_t maximum);
+    int64_t maximum,double attention_factor = 1.0);
 mfq_tensor_backend::Tensor rotary_normalized_cached_cuda(
     mfq_tensor_backend::Tensor input, mfq_tensor_backend::Tensor weight,
     mfq_tensor_backend::Tensor positions, mfq_tensor_backend::Tensor frequencies,
     mfq_tensor_backend::Tensor axes, int64_t maximum, double eps,
     mfq_tensor_backend::Tensor key_cache, mfq_tensor_backend::Tensor cache_positions,
-    mfq_tensor_backend::Tensor projected_value, mfq_tensor_backend::Tensor value_cache);
+    mfq_tensor_backend::Tensor projected_value, mfq_tensor_backend::Tensor value_cache,double attention_factor = 1.0);
 
 std::vector<mfq_tensor_backend::Tensor> rotary_normalized_grouped_cuda(
     const std::vector<mfq_tensor_backend::Tensor>& inputs,
@@ -29,7 +59,7 @@ std::vector<mfq_tensor_backend::Tensor> rotary_normalized_grouped_cuda(
     mfq_tensor_backend::Tensor axes,int64_t maximum,double eps,int cache_entry,
     mfq_tensor_backend::Tensor key_cache,mfq_tensor_backend::Tensor cache_positions,
     mfq_tensor_backend::Tensor projected_value,mfq_tensor_backend::Tensor value_cache,
-    const std::vector<mfq_tensor_backend::Tensor>& entry_positions = {});
+    const std::vector<mfq_tensor_backend::Tensor>& entry_positions = {},double attention_factor = 1.0);
 
 mfq_tensor_backend::Tensor minicpm_qk_norm_rope_cache_write_bf16_cuda(
     mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v,

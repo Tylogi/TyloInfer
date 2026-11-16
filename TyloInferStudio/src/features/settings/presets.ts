@@ -1,4 +1,4 @@
-/** 管理生成预设的本地校验、设置快照及服务资源转换。 */
+
 import { GenerationPresetResource, SessionMode } from '../../shared/api/types';
 import { GenerationSettings, DEFAULT_SETTINGS } from './configuration';
 
@@ -34,7 +34,7 @@ export interface StoredPreset {
 
 export const STORED_PRESETS_KEY = "tyloinfer.studio.presets.v1";
 
-/** 截取可持久化的推理参数，不包含界面偏好。 */
+
 export function presetSnapshot(settings: GenerationSettings): StoredPresetSettings {
   return {
     systemPrompt: settings.systemPrompt,
@@ -54,7 +54,7 @@ export function presetSnapshot(settings: GenerationSettings): StoredPresetSettin
   };
 }
 
-/** 读取并校验本地生成预设，丢弃无效条目并限制历史数量。 */
+
 export function loadStoredPresets(key = STORED_PRESETS_KEY): StoredPreset[] {
   try {
     const decoded = JSON.parse(localStorage.getItem(key) || "[]");
@@ -133,7 +133,7 @@ export function loadStoredPresets(key = STORED_PRESETS_KEY): StoredPreset[] {
   }
 }
 
-/** 将服务端生成预设转换为界面使用的设置模型。 */
+
 export function storedPresetFromResource(preset: GenerationPresetResource): StoredPreset {
   const sampling = preset.settings.sampling;
   return {
@@ -167,7 +167,7 @@ export function storedPresetFromResource(preset: GenerationPresetResource): Stor
   };
 }
 
-/** 将本地预设转换为创建或更新服务端资源的请求体。 */
+
 export function presetResourceBody(
   preset: StoredPreset,
   fallbackModel: string,

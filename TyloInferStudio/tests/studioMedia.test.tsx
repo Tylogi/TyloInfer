@@ -1,4 +1,4 @@
-/** 用真实组件、媒体 API 和附件 hook 验证鉴权、首帧、元数据校验与资源释放；浏览器解码接口以事件替身驱动。 */
+
 import { act, cleanup, fireEvent, render, renderHook, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
@@ -35,7 +35,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-/** 拦截离屏 video 的创建，同时保留真实 DOM 方法供事件和清理断言使用。 */
+
 function captureDecoder() {
   const createElement = document.createElement.bind(document);
   const video = createElement('video');
@@ -45,7 +45,7 @@ function captureDecoder() {
   return video;
 }
 
-/** 模拟浏览器读取到的视频尺寸与时长，不替换被测元数据逻辑。 */
+
 function setVideoMetadata(video: HTMLVideoElement, width = 1920, height = 1080, duration = 1.25) {
   Object.defineProperties(video, {
     videoWidth: { configurable: true, value: width },

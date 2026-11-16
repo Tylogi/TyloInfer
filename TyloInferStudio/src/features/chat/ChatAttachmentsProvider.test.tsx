@@ -1,4 +1,4 @@
-/** 验证附件仅通知输入区，并在切换会话或服务时释放预览资源。 */
+
 import { act, render, screen } from '@testing-library/react';
 import { beforeEach, expect, it, vi } from 'vitest';
 import { mediaApi } from '../../shared/api/resources/media';

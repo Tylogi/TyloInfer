@@ -9,18 +9,18 @@ import { errorMessage } from '../../../app/formatters';
 interface MessageActionOptions {
   conversation: ReturnType<typeof useConversationSessions>;
   blocked: boolean;
-  /** 根据回退后的会话版本继续生成；工具输入不得追加乐观用户消息。 */
+
   generate: (
     session: Session,
     input: ContentPart[],
     optimistic?: boolean,
     role?: 'user' | 'tool',
   ) => Promise<void>;
-  /** 在历史写入期间锁定聊天操作，结束后由本 hook 释放。 */
+
   setBusy: (busy: boolean) => void;
 }
 
-/** 向消息列表提供明确的业务动作，并通过活动会话标识拒绝过期回写。 */
+
 export function useMessageActions({
   conversation,
   blocked,
@@ -34,7 +34,7 @@ export function useMessageActions({
     const current = (sessionId: string) =>
       latest.current.conversation.activeIdRef.current === sessionId;
 
-    /** 编辑用户消息后回退历史，保留附件并继续生成。 */
+
     async function saveEdit(
       message: Message,
       draftText: string,
@@ -75,7 +75,7 @@ export function useMessageActions({
       }
     }
 
-    /** 从助手回答前的用户输入重新生成，删除后续历史并使用服务返回的版本号。 */
+
     async function regenerate(message: Message) {
       const { conversation, blocked, generate, setBusy } = latest.current;
       const { active, messages, setMessages, setSessions, setResponses, setError } = conversation;
@@ -108,7 +108,7 @@ export function useMessageActions({
       }
     }
 
-    /** 复制消息正文与推理内容，失败时保留页面并展示可读错误。 */
+
     async function copyMessage(message: Message) {
       const { setError } = latest.current.conversation;
       try {

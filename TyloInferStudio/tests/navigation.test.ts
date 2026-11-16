@@ -1,4 +1,4 @@
-/** 验证深链接、路由生成与回退行为在页面拆分后保持一致。 */
+
 import { describe, expect, it } from 'vitest';
 import {
   dashboardPath,

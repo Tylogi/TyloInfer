@@ -1,4 +1,4 @@
-/** 验证音频设备资源独立后的播放调度与录音失败清理。 */
+
 import { beforeEach, expect, it, vi } from 'vitest';
 import { AudioDevices } from './AudioDevices';
 

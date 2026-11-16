@@ -1,4 +1,4 @@
-# ---- 外部参考仓库（仅本地查阅，不入库）----
+
 references/
 
 # ---- Python ----
@@ -16,13 +16,13 @@ pip-wheel-metadata/
 wheels/
 MANIFEST
 
-# ---- 虚拟环境 ----
+
 .venv/
 venv/
 env/
 ENV/
 
-# ---- 测试 / 类型 / 覆盖率 ----
+
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
@@ -31,19 +31,19 @@ ENV/
 htmlcov/
 .tox/
 
-# ---- 编辑器 / IDE ----
+
 .idea/
 .vscode/
 *.swp
 *.swo
 *~
 
-# ---- 操作系统 ----
+
 .DS_Store
 Thumbs.db
 desktop.ini
 
-# ---- 构建产物（C++/CUDA/Metal 扩展）----
+
 *.obj
 *.o
 *.a
@@ -57,7 +57,7 @@ CMakeCache.txt
 cmake_install.cmake
 compile_commands.json
 
-# ---- 日志 / 临时 ----
+
 *.log
 tmp/
 runs/
@@ -67,13 +67,9 @@ runs/
 .tyloinfer/
 packaging/docker/deploy.env
 
-# ---- 模型、校准数据与实验工件 ----
+
 /models/
 data/*
-!data/wikitext-2-raw/
-data/wikitext-2-raw/*
-!data/wikitext-2-raw/README.md
-!data/wikitext-2-raw/wiki.test.raw
 *.gguf
 *.mfq
 *.tq
@@ -83,3 +79,5 @@ data/wikitext-2-raw/*
 *.sqlite3
 *.pt
 *.pth
+docs/benchmarks/
+*.jsonl

@@ -1,20 +1,26 @@
 #include "gguf.h"
+#include "gguf_q6_group.h"
+#include "gguf_window.h"
+#include "gguf_stream_plan.cuh"
 #include "gguf_compact.h"
 #include "gguf_route_groups.h"
 #include "tyloinfer/gguf_quant.h"
 #include "ggml-cuda/common.cuh"
 #include "gguf_decode.cuh"
 #include "gguf_dot.cuh"
+#include "gguf_dot_q5_group32.cuh"
 #include "warp_sums.cuh"
 #include "gguf_routed_rows.cuh"
 #include "gguf_routed_shared.cuh"
 #include "gguf_quantize.cuh"
 #include "gguf_gate_up.cuh"
 #include "gguf_dense_rows.cuh"
+#include "gguf_dense_streamed_q5.cuh"
 #include "gguf_dense_interleaved.cuh"
 #include "../runtime/moe_pipeline.h"
 #include "kernel_dispatch_trace.h"
 #include <algorithm>
+#include <numeric>
 #include <atomic>
 #include <climits>
 #include <stdexcept>
@@ -25,6 +31,17 @@
 namespace mfq::cuda::gguf {
 namespace {
 template<int Format> inline constexpr bool has_decoded_weight=requires {typename PreparedDot<Format>::DecodedWeight;};
+// Prepared IQ dot products reuse each Q8 activation across two output rows.
+// Keep standalone and grouped M=1 projections on the same reduction tree.
+template<int Format>
+inline constexpr bool dense_m1_row_reuse = Format==GGML_TYPE_IQ1_S || Format==GGML_TYPE_IQ1_M ||
+    Format==GGML_TYPE_IQ2_XXS || Format==GGML_TYPE_IQ2_XS || Format==GGML_TYPE_IQ2_S ||
+    Format==GGML_TYPE_IQ3_XXS || Format==GGML_TYPE_IQ3_S || Format==GGML_TYPE_Q2_K || Format==GGML_TYPE_Q4_K || Format==GGML_TYPE_Q5_K ||
+    Format==GGML_TYPE_Q6_K || Format==GGML_TYPE_IQ4_XS;
+template<int Format>
+inline constexpr bool dense_long_reduction = Format==GGML_TYPE_IQ1_S || Format==GGML_TYPE_IQ1_M ||
+    Format==GGML_TYPE_IQ2_XXS || Format==GGML_TYPE_IQ2_XS || Format==GGML_TYPE_IQ2_S ||
+    Format==GGML_TYPE_IQ3_XXS || Format==GGML_TYPE_Q2_K || Format==GGML_TYPE_IQ4_XS;
 constexpr int projection_reduction_warps(std::int64_t parts) {
     // Populate complete warps on short axes without issuing multiple passes
     // through the same row. Large reductions retain the four-warp tile.
@@ -58,29 +75,14 @@ __global__ void snapshot_direct_cpu_plan(const std::uint64_t* source,const std::
         std::uint64_t* destination,std::uint64_t capacity,const volatile std::int32_t* cpu_slots,
         std::int32_t* device_slots,std::int64_t slots,const RouteGroup* host_groups,RouteGroup* device_groups,
         std::int64_t group_capacity) {
-    __shared__ std::uint64_t count;
-    __shared__ std::uint32_t abort;
-    __shared__ int group_count;
-    if(!threadIdx.x) {
-        count=source[0];const bool empty=count==~std::uint64_t(0);if(empty)count=0;
-        abort=*reinterpret_cast<const volatile std::uint32_t*>(cancelled) || count>capacity;
-        destination[0]=abort?0:count;destination[1]=source[1];
-        destination[2]=abort?1u:empty?2u:0u;destination[3]=abort || empty?0:source[3];
-        group_count=host_groups?host_groups[0].count:0;
-        if(group_count<0 || group_count>group_capacity)group_count=0;
-        if(device_groups)device_groups[0].count=abort?0:group_count;
-    }
+    __shared__ stream_plan_detail::Header header;
+    StreamPlanSnapshot p;
+    p.mapped=source;p.cancelled=cancelled;p.snapshot=destination;p.capacity=capacity;
+    p.cpu_slots=const_cast<const std::int32_t*>(cpu_slots);p.device_slots=device_slots;p.slots=slots;
+    p.host_groups=host_groups;p.device_groups=device_groups;p.group_capacity=group_capacity;
+    stream_plan_detail::read_header(p,header);
     __syncthreads();
-    // Each small host control word crosses PCIe once. The reduction reads only
-    // this VRAM snapshot; its inner route loop must never read mapped flags.
-    for(auto i=std::int64_t(threadIdx.x);i<slots;i+=blockDim.x)device_slots[i]=abort?0:cpu_slots[i];
-    if(abort)return;
-    if(host_groups && device_groups) {
-        const auto* input=reinterpret_cast<const volatile std::uint32_t*>(host_groups+1);
-        auto* output=reinterpret_cast<std::uint32_t*>(device_groups+1);
-        for(auto i=std::int64_t(threadIdx.x);i<std::int64_t(group_count)*sizeof(RouteGroup)/4;i+=blockDim.x)output[i]=input[i];
-    }
-    for(auto word=std::uint64_t(threadIdx.x);word<count*4;word+=blockDim.x)destination[4+word]=source[4+word];
+    stream_plan_detail::copy_payload(p,header);
 }
 template<typename Input>
 __global__ void quantize_q8(const Input* input, std::int64_t count, block_q8_1* output) {
@@ -123,6 +125,7 @@ __global__ void swiglu_paired_half_q8(const half* input,int64_t tokens,int64_t w
 }
 
 #include "gguf_dense_group.cuh"
+#include "gguf_dense_pairs.cuh"
 
 template<int Format, bool Routed>
 __global__ void project_q8(const std::uint8_t* packed, const std::uint64_t* addresses,
@@ -148,17 +151,54 @@ __global__ void project_q8(const std::uint8_t* packed, const std::uint64_t* addr
         }
     }
 }
+// A long K can leave a reused-row grid short of the device's actual resident
+// block capacity. Four K warps retain two-row activation reuse and expose
+// enough CTAs without a global partial-result buffer or another kernel.
+template<int Format>
+int dense_reuse_k_warps(std::int64_t rows,std::int64_t columns,std::uint64_t group_reused_blocks=0) {
+    if constexpr(Format==GGML_TYPE_IQ4_XS || Format==GGML_TYPE_Q6_K) {
+        // Both decoders cover complete Q8 groups. Keep their K partition
+        // independent of output-row count so wide row grids also benefit
+        // from coalesced cooperative reads rather than forcing one warp.
+        return canonical_iq4_k_warps(columns);
+    }
+    else if constexpr(!dense_m1_row_reuse<Format> || Format==GGML_TYPE_IQ1_S || Format==GGML_TYPE_IQ1_M)return 1;
+    else {
+        const auto parts=columns/M1PreparedDot<Format>::qk*M1PreparedDot<Format>::parts;
+        if(parts<4*32)return 1; // At least one fragment per cooperating lane.
+        // Three K warps avoid a partial final wave when they divide the
+        // fragment count evenly and four warps do not.
+        const int cooperative_warps=parts%(3*32)==0 && parts%(4*32)!=0?3:4;
+        int device=0;auto check=[](cudaError_t e){if(e!=cudaSuccess)throw std::runtime_error(cudaGetErrorString(e));};
+        check(cudaGetDevice(&device));
+        static thread_local int cached_device=-1,sms=0,active=0;
+        if(cached_device!=device) {
+            check(cudaDeviceGetAttribute(&sms,cudaDevAttrMultiProcessorCount,device));
+            check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active,project_dense_reused_q8<Format,2>,128,0));
+            cached_device=device;
+        }
+        const auto blocks=group_reused_blocks?group_reused_blocks:std::uint64_t((rows+7)/8);
+        return active>0 && blocks<std::uint64_t(sms)*unsigned(active)?cooperative_warps:1;
+    }
+}
+
 // A one-warp row leaves only ceil(N/4) CTAs. Cooperating on K gives
 // each output its own CTA when that grid cannot fill the actual resident
 // capacity. Large matrices keep the lower-overhead four-output layout.
 template<int Format>
 bool single_token_dense_cooperative(std::int64_t rows,std::int64_t parts,std::uint64_t group_blocks=0) {
     constexpr bool supported=Format==GGML_TYPE_Q8_0 || Format==GGML_TYPE_Q5_K ||
-        Format==GGML_TYPE_Q6_K || Format==GGML_TYPE_IQ4_XS;
-    if constexpr(!supported)return false;
+        Format==GGML_TYPE_Q6_K || Format==GGML_TYPE_IQ4_XS || dense_long_reduction<Format>;
+    if constexpr(!supported || dense_m1_row_reuse<Format>)return false;
     else {
         if(parts<64 || rows<1 || rows>INT_MAX)return false;
         if(const auto* option=std::getenv("TYLOINFER_GGUF_DENSE_M1_COOPERATIVE");option && option[0]=='0')return false;
+        // Four warps shorten the serial chain on long reductions. Require
+        // four weight fragments per cooperating lane to amortize the shared
+        // partial reduction; the cutoff is independent of model dimensions.
+        if constexpr(dense_long_reduction<Format>)if(parts>=4*32*4)return true;
+        if constexpr(Format!=GGML_TYPE_Q8_0 && Format!=GGML_TYPE_Q5_K &&
+                Format!=GGML_TYPE_Q6_K && Format!=GGML_TYPE_IQ4_XS)return false;
         int device=0,sms=0,active=0;
         const auto checked=[](cudaError_t status){if(status!=cudaSuccess)throw std::runtime_error(cudaGetErrorString(status));};
         checked(cudaGetDevice(&device));checked(cudaDeviceGetAttribute(&sms,cudaDevAttrMultiProcessorCount,device));
@@ -241,6 +281,7 @@ __global__ void project_grouped_q8(const std::uint64_t* addresses,std::uint64_t 
 }
 __device__ float staged_value(int type, const std::uint8_t* row, std::uint64_t column) {
     switch (type) {
+        case GGML_TYPE_F16:return __half2float(reinterpret_cast<const half*>(row)[column]);
 #define TYLOINFER_GGUF_VALUE(name) case GGML_TYPE_##name: return gguf_value<GGML_TYPE_##name>(row, column);
         TYLOINFER_GGUF_FORMATS(TYLOINFER_GGUF_VALUE)
 #undef TYLOINFER_GGUF_VALUE
@@ -440,14 +481,17 @@ bool supports_interleaved_activation(ggml_type type,std::int64_t tokens) noexcep
 }
 std::uint64_t interleaved_activation_bytes(std::int64_t tokens,std::int64_t columns) {
     q8_row_bytes(columns);
-    if(tokens<2 || tokens>4 || columns>INT_MAX)
+    if(tokens<2 || tokens>8 || columns>INT_MAX)
         throw std::invalid_argument("GGUF interleaved activation geometry differs");
+    if(tokens>=5)return std::uint64_t(columns)*std::uint64_t(tokens)*11/8;
     return std::uint64_t(columns)*(tokens==2?2:4)*9/8;
 }
 void quantize_input_interleaved(const void* input,bool half_input,std::int64_t tokens,std::int64_t columns,
         void* output,void* native,cudaStream_t stream) {
     interleaved_activation_bytes(tokens,columns);
     if(!input || !output)throw std::invalid_argument("GGUF interleaved activation storage missing");
+    if(tokens>=5 && (reinterpret_cast<std::uintptr_t>(output)&15))
+        throw std::invalid_argument("GGUF split Q8 code planes require 16-byte alignment");
     const auto blocks=unsigned((tokens*columns+255)/256);
     if(half_input)quantize_position_major<<<blocks,256,0,stream>>>(static_cast<const half*>(input),columns,int(tokens),output,static_cast<block_q8_1*>(native));
     else quantize_position_major<<<blocks,256,0,stream>>>(static_cast<const float*>(input),columns,int(tokens),output,static_cast<block_q8_1*>(native));
@@ -471,12 +515,11 @@ void matvec_interleaved(ggml_type type,const void* packed,std::uint64_t stride,s
             if(mfq::cuda::dispatch_trace::enabled())mfq::cuda::dispatch_trace::record(stream,
                 "gguf_dense_position_major",reinterpret_cast<const void*>(function),
                 "format="+std::to_string(Format)+" M="+std::to_string(Count)+" cooperative="+std::to_string(Cooperative)+
-                " warps="+std::to_string(Warps));
+                " warps="+std::to_string(Warps)+" streamed_iq4="+std::to_string(Format==GGML_TYPE_IQ4_XS && Cooperative));
         };
         if constexpr(Format==GGML_TYPE_IQ4_XS) {
-            const int warps=projection_reduction_warps(columns/Dot<Format>::qk*Dot<Format>::parts);
-            if(warps==2)run.template operator()<true,2>();
-            else if(warps==3)run.template operator()<true,3>();
+            const int warps=canonical_iq4_k_warps(columns);
+            if(warps==3)run.template operator()<true,3>();
             else if(warps==4)run.template operator()<true,4>();
             else run.template operator()<false,4>();
         }else run.template operator()<false,4>();
@@ -497,23 +540,107 @@ void matvec_group(const DenseProjection* projections,std::size_t count,std::int6
         bool half_output,cudaStream_t stream) {
     if(tokens<1 || tokens>4 || columns<1 || columns>INT_MAX || (!projections && count))
         throw std::invalid_argument("GGUF dense group geometry differs");
+    if(try_underfilled_q6_group(projections,count,columns,native_input,tokens,half_output,stream))return;
     // Judge M1 against all submitted matrices, so a tiny projection beside
     // a large saturated one does not multiply its launch work unnecessarily.
-    std::uint64_t group_blocks=0;
+    std::uint64_t group_blocks=0,group_reused_blocks=0;
     if(tokens==1)for(std::size_t i=0;i<count;++i) {
-        if(projections[i].rows>0 && projections[i].rows<=INT_MAX)
+        if(projections[i].rows>0 && projections[i].rows<=INT_MAX) {
             group_blocks+=std::uint64_t(projections[i].rows+3)/4;
+            // Every ordinary reused-row member emits eight output rows.
+            // A full group does not need extra K warps for each small member.
+            group_reused_blocks+=std::uint64_t(projections[i].rows+7)/8;
+        }
     }
     DenseGroupPacket packet{};unsigned blocks=0;
     const auto submit=[&] {
         if(!packet.count)return;
+        const bool single=tokens==1 && std::none_of(packet.entries,packet.entries+packet.count,
+            [](const auto& entry){return entry.cooperative;});
+        if(single) {
+            const bool long_k=std::any_of(packet.entries,packet.entries+packet.count,[](const auto& e) {
+                switch(e.projection.type) {
+#define REUSED_LONG(name) case GGML_TYPE_##name: return dense_m1_row_reuse<GGML_TYPE_##name> && e.warps>1;
+                    TYLOINFER_GGUF_FORMATS(REUSED_LONG)
+#undef REUSED_LONG
+                default:return false;
+                }
+            });
+            // Complete small projections before large peers. Preserve each
+            // projection's output and its already-computed tile count.
+            if(!long_k) {
+                std::stable_sort(packet.entries,packet.entries+packet.count,
+                    [](const auto& a,const auto& b){return a.projection.rows<b.projection.rows;});
+                unsigned next=0;
+                for(int i=0;i<packet.count;++i) {
+                    auto& entry=packet.entries[i];const auto tiles=entry.end-entry.begin;
+                    entry.begin=next;next+=tiles;entry.end=next;
+                }
+            }
+            // The long-reduction kernel keeps its own K-cooperative layout.
+            if(!long_k && try_dense_pair_single(packet,int(columns),static_cast<const block_q8_1*>(native_input),half_output,stream)) {
+                checked_launch();packet={};blocks=0;return;
+            }
+            const auto function=long_k?project_dense_group_single_long:project_dense_group_single;
+            function<<<blocks,dim3(32,4),0,stream>>>(packet,int(columns),
+                static_cast<const block_q8_1*>(native_input),half_output);
+            if(mfq::cuda::dispatch_trace::enabled())mfq::cuda::dispatch_trace::record(stream,
+                "gguf_dense_group_single",reinterpret_cast<const void*>(function),
+                "M=1 matrices="+std::to_string(packet.count));
+            checked_launch();packet={};blocks=0;return;
+        }
+        if(tokens>1 && std::all_of(packet.entries,packet.entries+packet.count,
+                [](const auto& e){return e.whole_group;})) {
+            // Keep complete existing K partitions in each block. In
+            // particular, three cooperating warps need no idle fourth warp.
+            int block_warps=1;
+            for(int i=0;i<packet.count;++i)
+                block_warps=std::min(4,std::lcm(block_warps,packet.entries[i].warps));
+            std::uint64_t total=0;
+            for(int i=0;i<packet.count;++i) {
+                const auto& e=packet.entries[i];const int outputs=2*(block_warps/e.warps);
+                total+=(std::uint64_t(e.projection.rows)+outputs-1)/outputs;
+            }
+            // More, smaller blocks must still fit CUDA's x grid. The
+            // original four-warp packet has already passed that bound.
+            if(total>INT_MAX)block_warps=4;
+            unsigned next=0;
+            for(int i=0;i<packet.count;++i) {
+                auto& e=packet.entries[i];const int outputs=2*(block_warps/e.warps);
+                const auto tiles=unsigned((std::uint64_t(e.projection.rows)+outputs-1)/outputs);
+                e.begin=next;next+=tiles;e.end=next;
+            }
+            const auto count=[&]<int M>() {
+                const auto launch=[&]<int BlockWarps>() {
+                    const auto function=project_dense_group_whole<M,BlockWarps>;
+                    function<<<next,dim3(32,BlockWarps),0,stream>>>(packet,int(columns),
+                        static_cast<const block_q8_1*>(native_input),half_output);
+                    if(mfq::cuda::dispatch_trace::enabled())mfq::cuda::dispatch_trace::record(stream,
+                        "gguf_dense_group_whole",reinterpret_cast<const void*>(function),
+                        "M="+std::to_string(M)+" matrices="+std::to_string(packet.count)+
+                        " block_warps="+std::to_string(BlockWarps)+" whole_q8_groups=1");
+                };
+                if(block_warps==1)launch.template operator()<1>();
+                else if(block_warps==2)launch.template operator()<2>();
+                else if(block_warps==3)launch.template operator()<3>();
+                else launch.template operator()<4>();
+            };
+            if(tokens==2)count.template operator()<2>();
+            else if(tokens==3)count.template operator()<3>();
+            else count.template operator()<4>();
+            checked_launch();packet={};blocks=0;return;
+        }
         const auto launch=[&]<int M>() {
             const auto function=project_dense_group<M>;
             function<<<blocks,dim3(32,4),0,stream>>>(packet,int(columns),
                 static_cast<const block_q8_1*>(native_input),interleaved_input,half_output);
             if(mfq::cuda::dispatch_trace::enabled())mfq::cuda::dispatch_trace::record(stream,
                 "gguf_dense_group",reinterpret_cast<const void*>(function),
-                "M="+std::to_string(M)+" matrices="+std::to_string(packet.count));
+                "M="+std::to_string(M)+" matrices="+std::to_string(packet.count)+
+                " whole_q8_groups="+std::to_string(std::count_if(packet.entries,packet.entries+packet.count,
+                    [](const auto& entry){return entry.whole_group;}))+
+                " streamed_iq4="+std::to_string(std::count_if(packet.entries,packet.entries+packet.count,
+                    [](const auto& entry){return entry.position_major && entry.cooperative && entry.projection.type==GGML_TYPE_IQ4_XS;})));
         };
         if(tokens==1)launch.template operator()<1>();
         else if(tokens==2)launch.template operator()<2>();
@@ -537,13 +664,38 @@ void matvec_group(const DenseProjection* projections,std::size_t count,std::int6
                 throw std::invalid_argument("GGUF dense group row encoding differs");
             entry.position_major=supports_interleaved_activation(p.type,tokens);
             entry.warps=projection_reduction_warps(columns/Dot<Format>::qk*Dot<Format>::parts);
-            constexpr bool supports_cooperative=Format==GGML_TYPE_Q8_0 || Format==GGML_TYPE_Q5_K ||
+            constexpr bool supports_cooperative=Format==GGML_TYPE_Q8_0 || Format==GGML_TYPE_Q3_K || Format==GGML_TYPE_IQ4_NL || Format==GGML_TYPE_Q5_K ||
                 Format==GGML_TYPE_Q6_K || Format==GGML_TYPE_IQ4_XS;
-            entry.cooperative=supports_cooperative && p.rows<=INT_MAX/tokens && p.stride<=INT_MAX && entry.warps>1 &&
+            entry.cooperative=(supports_cooperative || (tokens==1 && dense_long_reduction<Format>)) && p.rows<=INT_MAX/tokens && p.stride<=INT_MAX && entry.warps>1 &&
                 (tokens>1 || single_token_dense_cooperative<Format>(p.rows,columns/Dot<Format>::qk*Dot<Format>::parts,group_blocks));
+            if constexpr(dense_m1_row_reuse<Format>)if(tokens==1)entry.warps=dense_reuse_k_warps<Format>(p.rows,columns,group_reused_blocks);
+            // Keep IQ4_XS K accumulation independent of packet/layout/M.
+            // Each row still reuses its decoded weights across all tokens.
+            if constexpr(Format==GGML_TYPE_IQ4_XS) {
+                entry.warps=canonical_iq4_k_warps(columns);
+                entry.cooperative=tokens>1 && entry.warps>1 && p.rows<=INT_MAX/tokens && p.stride<=INT_MAX;
+            }
+            if constexpr(Format==GGML_TYPE_Q8_0 || Format==GGML_TYPE_Q3_K || Format==GGML_TYPE_IQ4_NL)if(tokens>1 && p.rows<=INT_MAX/tokens && p.stride<=INT_MAX) {
+                entry.whole_group=true;entry.cooperative=true;
+                entry.warps=projection_reduction_warps(columns/WholeQ8Prepared::qk);
+            }
+            if constexpr(Format==GGML_TYPE_Q4_K || Format==GGML_TYPE_Q5_K || Format==GGML_TYPE_Q6_K) {
+                // Native 32-value groups require the decoder's actual source
+                // alignment. Other external views retain the scalar decoder.
+                if(tokens>1 && p.rows<=INT_MAX/tokens && p.stride<=INT_MAX &&
+                        !((reinterpret_cast<std::uintptr_t>(p.packed)|p.stride)&(Format==GGML_TYPE_Q5_K?15u:Format==GGML_TYPE_Q4_K?3u:1u))) {
+                    entry.whole_group=true;entry.cooperative=true;
+                    entry.warps=Format==GGML_TYPE_Q4_K?1:Format==GGML_TYPE_Q6_K?4:whole_q8_k_warps(columns);
+                }
+            }
             if(entry.position_major) {
                 if constexpr(Format==GGML_TYPE_IQ4_XS)if(entry.warps>1)outputs=2;
-            }else if(entry.cooperative)outputs=tokens==1 || (Format==GGML_TYPE_Q6_K && tokens==2)?1:2;
+            }else if(entry.whole_group)outputs=2*(4/entry.warps);
+            else if(entry.cooperative)outputs=tokens==1 || (Format==GGML_TYPE_Q6_K && tokens==2)?1:2;
+            else if(tokens==1) {
+                if constexpr(dense_m1_row_reuse<Format>)outputs=entry.warps>1?2:8;
+                else outputs=8;
+            }
             if(entry.position_major?!interleaved_input:!native_input)
                 throw std::invalid_argument("GGUF dense group activation layout is absent");
         };
@@ -570,32 +722,74 @@ bool try_dense_cooperative(const void* packed,std::uint64_t stride,std::int64_t 
     // loads/dots. Two to four warps cooperate on the reduction and share a
     // decoded fragment across tokens. Short axes retain the one-warp path;
     // cooperative block size follows the number of independent weight parts.
-    constexpr bool supported=Format==GGML_TYPE_Q8_0 || Format==GGML_TYPE_Q5_K ||
-        Format==GGML_TYPE_Q6_K || Format==GGML_TYPE_IQ4_XS;
+    constexpr bool supported=Format==GGML_TYPE_Q8_0 || Format==GGML_TYPE_Q3_K || Format==GGML_TYPE_IQ4_NL || Format==GGML_TYPE_Q5_K ||
+        Format==GGML_TYPE_Q6_K || Format==GGML_TYPE_IQ4_XS || dense_long_reduction<Format>;
     if constexpr(!supported)return false;
     else {
-        if(tokens<1 || tokens>8 || rows>INT_MAX/tokens || columns>INT_MAX || stride>INT_MAX ||
-                columns/Dot<Format>::qk*Dot<Format>::parts<64)return false;
+        if constexpr(Format!=GGML_TYPE_Q8_0 && Format!=GGML_TYPE_Q3_K && Format!=GGML_TYPE_IQ4_NL && Format!=GGML_TYPE_Q5_K &&
+                Format!=GGML_TYPE_Q6_K && Format!=GGML_TYPE_IQ4_XS)if(tokens!=1)return false;
+        if(tokens<1 || tokens>8 || rows>INT_MAX/tokens || columns>INT_MAX || stride>INT_MAX)return false;
+        if constexpr(Format==GGML_TYPE_Q5_K || Format==GGML_TYPE_Q6_K)if(tokens>1 && columns%256==0 &&
+                ((reinterpret_cast<std::uintptr_t>(packed)|stride)&(Format==GGML_TYPE_Q5_K?15u:1u))==0) {
+            // Whole 32-value groups amortize code decoding and normalization
+            // over the token window. Q5's uint4 gathers need vector alignment;
+            // Q6 reconstructs aligned words from its halfword-aligned blocks.
+            const int warps=Format==GGML_TYPE_Q6_K?4:whole_q8_k_warps(columns);
+            const auto count=[&]<int Count>() {
+                constexpr int Outputs=Format==GGML_TYPE_Q6_K || Count<=4?2:1;
+                const auto run=[&]<int Warps>() {
+                    using Prepared=std::conditional_t<Format==GGML_TYPE_Q5_K,DirectQ5Group,M1PreparedDot<GGML_TYPE_Q6_K>>;
+                    // Exchange only each warp's reduced output values rather
+                    // than storing a full lane array for every token/row pair.
+                    constexpr bool WarpFirst=Format==GGML_TYPE_Q6_K || Count<=4;
+                    const auto function=[&] {
+                        if constexpr(Format==GGML_TYPE_Q5_K && Count<=4)return project_dense_streamed_q5<Count,Warps>;
+                        else return project_dense_cooperative_q8<Format,Count,Outputs,Warps,Prepared,WarpFirst>;
+                    }();
+                    function<<<unsigned((rows+Outputs-1)/Outputs),dim3(32,Warps),0,stream>>>(
+                        static_cast<const std::uint8_t*>(packed),int(stride),int(rows),int(columns),int(tokens),
+                        static_cast<const block_q8_1*>(input),output,std::is_same_v<Output,half>);
+                    if(mfq::cuda::dispatch_trace::enabled())mfq::cuda::dispatch_trace::record(stream,
+                        Format==GGML_TYPE_Q5_K && Count<=4?"gguf_dense_streamed_q5":"gguf_dense_affine_group32",reinterpret_cast<const void*>(function),
+                        "format="+std::to_string(Format)+" M="+std::to_string(tokens)+" outputs="+std::to_string(Outputs)+
+                        " warps="+std::to_string(Warps)+" affine_group=32 direct_weight_gather=1 warp_first="+std::to_string(WarpFirst));
+                };
+                if constexpr(Format==GGML_TYPE_Q6_K)run.template operator()<4>();
+                else {
+                    if(warps==1)run.template operator()<1>();else if(warps==2)run.template operator()<2>();
+                    else if(warps==3)run.template operator()<3>();else run.template operator()<4>();
+                }
+            };
+            if(tokens==2)count.template operator()<2>();else if(tokens==3)count.template operator()<3>();
+            else if(tokens==4)count.template operator()<4>();else count.template operator()<8>();
+            return true;
+        }
+        if constexpr(Format==GGML_TYPE_IQ4_XS)if(canonical_iq4_k_warps(columns)==1)return false;
+        if(columns/Dot<Format>::qk*Dot<Format>::parts<64)return false;
         if(tokens==1 && !single_token_dense_cooperative<Format>(rows,columns/Dot<Format>::qk*Dot<Format>::parts))return false;
         const auto launch=[&](auto capacity) {
             constexpr int Count=decltype(capacity)::value;
-            // Bound the accumulator and shared-partial footprint to eight
-            // output/token pairs. Longer windows process one output row.
+            // Q8_0 amortizes normalization across complete 32-value groups;
+            // its two-row tile also shares the activation words. Other
+            // formats retain the smaller row tile for longer windows.
             // Q6_K's two-row tile now shares decoded activation words and
             // scales. Three or four tokens amortize that tile; a two-token
             // Q6_K window retains the lighter one-row projection.
-            constexpr int Outputs=Count>1 && Count<=4 && (Format!=GGML_TYPE_Q6_K || Count>2)?2:1;
+            constexpr bool WholeQ8=(Format==GGML_TYPE_Q8_0 || Format==GGML_TYPE_Q3_K || Format==GGML_TYPE_IQ4_NL) && Count>1;
+            constexpr int Outputs=WholeQ8 || (Count>1 && Count<=4 && (Format!=GGML_TYPE_Q6_K || Count>2))?2:1;
+            using Prepared=std::conditional_t<WholeQ8,WholeWindowDot<Format>,PreparedDot<Format>>;
             const auto run=[&]<int Warps>() {
-                const auto function=project_dense_cooperative_q8<Format,Count,Outputs,Warps>;
+                const auto function=project_dense_cooperative_q8<Format,Count,Outputs,Warps,Prepared,Format==GGML_TYPE_IQ4_XS || WholeQ8>;
                 function<<<unsigned((rows+Outputs-1)/Outputs),dim3(32,Warps),0,stream>>>(
                     static_cast<const std::uint8_t*>(packed),int(stride),int(rows),int(columns),int(tokens),
                     static_cast<const block_q8_1*>(input),output,std::is_same_v<Output,half>);
                 if(mfq::cuda::dispatch_trace::enabled())mfq::cuda::dispatch_trace::record(stream,
                     "gguf_dense_cooperative",reinterpret_cast<const void*>(function),
                     "format="+std::to_string(Format)+" M="+std::to_string(tokens)+" outputs="+std::to_string(Outputs)+
-                    " warps="+std::to_string(Warps));
+                    " warps="+std::to_string(Warps)+" whole_q8_group="+std::to_string(WholeQ8));
             };
-            const int warps=projection_reduction_warps(columns/Dot<Format>::qk*Dot<Format>::parts);
+            const int warps=Format==GGML_TYPE_IQ4_XS?canonical_iq4_k_warps(columns):projection_reduction_warps(columns/Prepared::qk*Prepared::parts);
+            if constexpr(WholeQ8)if(warps==1){run.template operator()<1>();return;}
             if(warps==2)run.template operator()<2>();
             else if(warps==3)run.template operator()<3>();
             else run.template operator()<4>();
@@ -604,7 +798,12 @@ bool try_dense_cooperative(const void* packed,std::uint64_t stride,std::int64_t 
         else if(tokens==2)launch(std::integral_constant<int,2>{});
         else if(tokens==3)launch(std::integral_constant<int,3>{});
         else if(tokens==4)launch(std::integral_constant<int,4>{});
-        else launch(std::integral_constant<int,8>{});
+        else if constexpr(Format==GGML_TYPE_Q8_0 || Format==GGML_TYPE_Q3_K || Format==GGML_TYPE_IQ4_NL) {
+            if(tokens==5)launch(std::integral_constant<int,5>{});
+            else if(tokens==6)launch(std::integral_constant<int,6>{});
+            else if(tokens==7)launch(std::integral_constant<int,7>{});
+            else launch(std::integral_constant<int,8>{});
+        }else launch(std::integral_constant<int,8>{});
         return true;
     }
 }
@@ -638,6 +837,8 @@ void matvec_q8_typed(ggml_type type, const void* packed, std::uint64_t stride,
         }
         return;
     }
+    if(project_dense_window_q8(type,packed,stride,rows,columns,input,tokens,
+            output,std::is_same_v<Output,half>,stream))return;
     const dim3 threads(32, 4);
     const auto blocks = static_cast<unsigned>((rows + 3) / 4);
     const bool shared_rows=tokens>=2 && tokens<=8;
@@ -653,7 +854,14 @@ void matvec_q8_typed(ggml_type type, const void* packed, std::uint64_t stride,
     }
     switch (type) {
 #define TYLOINFER_GGUF_Q8(name) case GGML_TYPE_##name: \
-        if(try_dense_cooperative<GGML_TYPE_##name,Output>(packed,stride,rows,columns,input,tokens,output,stream)) {} \
+        if(tokens==1 && rows<=INT_MAX && columns<=INT_MAX && dense_m1_row_reuse<GGML_TYPE_##name>) { \
+            const int k_warps=dense_reuse_k_warps<GGML_TYPE_##name>(rows,columns); \
+            const auto function=k_warps==3?project_dense_reused_q8<GGML_TYPE_##name,2,3,3>:k_warps==4?project_dense_reused_q8<GGML_TYPE_##name,2,4>:project_dense_reused_q8<GGML_TYPE_##name,2>; \
+            const int outputs=k_warps>1?2:8; \
+            function<<<unsigned((rows+outputs-1)/outputs),dim3(32,k_warps==3?3:4),0,stream>>>(static_cast<const std::uint8_t*>(packed),stride,int(rows),int(columns),static_cast<const block_q8_1*>(input),output,std::is_same_v<Output,half>); \
+            if(mfq::cuda::dispatch_trace::enabled())mfq::cuda::dispatch_trace::record(stream,"gguf_dense_reused",reinterpret_cast<const void*>(function),"format="+std::to_string(GGML_TYPE_##name)+" M=1 k_warps="+std::to_string(k_warps)); \
+        } \
+        else if(try_dense_cooperative<GGML_TYPE_##name,Output>(packed,stride,rows,columns,input,tokens,output,stream)) {} \
         else if(shared_rows) { \
             const auto launch=[&](auto capacity) { \
                 project_dense_q8_rows<GGML_TYPE_##name,decltype(capacity)::value><<<blocks,threads,0,stream>>>( \
@@ -699,8 +907,13 @@ void quantize_moe_hidden(const float* gate,const float* up,std::int64_t rows,std
 void gate_up_swiglu_q8_f16(const void* gate_up,int64_t tokens,int64_t width,
         void* quantized,bool position_major,cudaStream_t stream) {
     q8_row_bytes(width);
-    if(tokens<0 || (position_major && (tokens<2 || tokens>4)))
+    if(tokens<0)
         throw std::invalid_argument("GGUF shared SwiGLU Q8 row geometry invalid");
+    if(position_major) {
+        interleaved_activation_bytes(tokens,width);
+        if(tokens>=5 && (reinterpret_cast<std::uintptr_t>(quantized)&15))
+            throw std::invalid_argument("GGUF split Q8 code planes require 16-byte alignment");
+    }
     if(!tokens)return;
     const auto launch=[&](auto interleaved) {
         swiglu_paired_half_q8<decltype(interleaved)::value><<<unsigned((tokens*width+255)/256),256,0,stream>>>(
@@ -718,7 +931,7 @@ void routed_matvec_q8(ggml_type type, const std::uint64_t* addresses,
     const std::int64_t* ids, std::int64_t tokens, std::int64_t routes,
     const void* input, bool routed_input, float* output, cudaStream_t stream,bool preserve_missing) {
     if (!tokens || !rows || !routes) return;
-    if(try_compact_routed_project(CompactFormat(type),addresses,stride,experts,rows,columns,
+    if(try_compact_routed_project_async(CompactFormat(type),addresses,stride,experts,rows,columns,
             ids,nullptr,tokens,routes,input,routed_input,output,stream,preserve_missing))return;
     // The compact indexing path needs 32-bit element and activation-block
     // offsets. Large tensors retain the original 64-bit implementation.
@@ -917,7 +1130,7 @@ bool try_gate_up_matvec_q8(ggml_type type,const uint64_t* gate_addresses,const u
         uint64_t gate_stride,uint64_t up_stride,int64_t experts,int64_t rows,int64_t columns,
         const int64_t* ids,const RouteGroup* groups,int64_t tokens,int64_t routes,const void* input,
         float* gate,float* up,cudaStream_t stream,bool preserve_missing) {
-    if(try_compact_routed_project(CompactFormat(type),gate_addresses,gate_stride,experts,rows,columns,
+    if(try_compact_routed_project_async(CompactFormat(type),gate_addresses,gate_stride,experts,rows,columns,
             ids,groups,tokens,routes,input,false,gate,stream,preserve_missing,up_addresses,up_stride,up))return true;
     return try_planar_routed_q8<true>(type,gate_addresses,up_addresses,gate_stride,up_stride,experts,rows,columns,
         ids,groups,tokens,routes,input,gate,up,stream,preserve_missing,false);
@@ -933,7 +1146,7 @@ void grouped_routed_matvec_q8(ggml_type type,const std::uint64_t* addresses,
         std::uint64_t stride,std::int64_t experts,std::int64_t rows,std::int64_t columns,
         const std::int64_t* ids,const RouteGroup* groups,std::int64_t tokens,std::int64_t routes,
         const void* input,bool routed_input,float* output,cudaStream_t stream,bool preserve_missing) {
-    if(try_compact_routed_project(CompactFormat(type),addresses,stride,experts,rows,columns,
+    if(try_compact_routed_project_async(CompactFormat(type),addresses,stride,experts,rows,columns,
             ids,groups,tokens,routes,input,routed_input,output,stream,preserve_missing))return;
     if(!groups || tokens<=1 || tokens*routes>INT_MAX) {
         routed_matvec_q8(type,addresses,stride,experts,rows,columns,ids,tokens,routes,input,routed_input,output,stream,preserve_missing);return;

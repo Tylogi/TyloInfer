@@ -1,9 +1,9 @@
-/** 应用外壳中的连接、刷新与任务流告警。 */
+
 import { useRuntime } from './RuntimeProvider';
 import { useSettings } from '../features/settings/SettingsProvider';
 import { Icon } from './display';
 
-/** 展示当前运行时异常及各自独立的重试操作。 */
+
 export function RuntimeAlerts({ connectionProblem }: { connectionProblem: string | null }) {
   const { tr } = useSettings();
   const { ready, refreshError, jobStreamErrors, loading: selectedModelLoading,

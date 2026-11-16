@@ -1,4 +1,4 @@
-/** 模拟 Studio 使用的 HTTP 服务，提供可控的生成、同步失败和取消场景。 */
+
 import type { Page } from '@playwright/test';
 import type { Message, OfficialModelList, ResponseResource, Session, StreamRequest } from '../src/shared/api/types';
 
@@ -66,17 +66,17 @@ interface MockOptions {
   language?: 'zh-CN' | 'en';
   theme?: 'light' | 'dark';
   preserveSettings?: boolean;
-  /** 首次生成后的历史查询返回失败，供验证手动恢复且不重复提交。 */
+
   failFirstSync?: boolean;
-  /** 挂起生成请求直到用户调用取消接口。 */
+
   waitForCancel?: boolean;
-  /** 挂起生成直到测试显式释放，验证跨路由生成不会被卸载取消。 */
+
   holdResponse?: boolean;
-  /** 首次生成明确返回 HTTP 拒绝，验证草稿与附件可重试。 */
+
   rejectFirstSubmission?: boolean;
 }
 
-/** 为页面注册隔离的模拟 API，返回请求计数供验证生成幂等边界。 */
+
 export async function mockStudioServer(page: Page, options: MockOptions = {}) {
   const state = { submissions: 0, cancellations: 0, unexpected: [] as string[], requests: [] as string[], releaseResponse: () => {} };
   let messages: Message[] = [];

@@ -17,6 +17,7 @@
 #include <iomanip>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <regex>
 #include <sstream>
 
@@ -81,6 +82,11 @@ public:
                 std::min<uint64_t>(parts_[i].size, header_bytes - parts_[i].begin) : 0;
             parts_[i].file = std::make_shared<MirroredFileReader>(std::move(replicas), model_file_read_mode(), header);
         }
+    }
+    FileReadStats stats()const noexcept {
+        FileReadStats result;
+        for(const auto& part:parts_)add_file_read_stats(result,part.file->stats());
+        return result;
     }
     const std::vector<std::filesystem::path>& paths() const noexcept { return paths_; }
     uint64_t size() const noexcept { return size_; }
@@ -199,7 +205,7 @@ json metadata_value(const gguf_context* ctx, int64_t id) {
     return result;
 }
 
-std::string canonical_name(const std::string& name) {
+std::string canonical_name(const std::string& name, const json* meta = nullptr) {
     if (name == "token_embd.weight") return "model.token_embedding.weight";
     if (name == "output.weight") return "model.output.weight";
     if (name == "output_norm.weight") return "model.output_norm.weight";
@@ -285,6 +291,24 @@ std::string canonical_name(const std::string& name) {
         {"engram_kv.weight", "associative_memory.projection.weight"},
     };
     const auto found = names.find(name.substr(dot + 1));
+    if (meta && meta->value("general.architecture", std::string{}) == "qwen35") {
+        const auto predictors = meta->value("qwen35.nextn_predict_layers", json(0));
+        const auto blocks = meta->value("qwen35.block_count", json(0));
+        if (predictors.is_number_integer() && blocks.is_number_integer() && predictors.get<int64_t>() == 1 &&
+            blocks.get<int64_t>() > 1 && name.compare(4, dot - 4, std::to_string(blocks.get<int64_t>() - 1)) == 0) {
+            static const std::map<std::string, std::string> predictor_names{
+                {"nextn.eh_proj.weight", "predictor.fusion.weight"},
+                {"nextn.enorm.weight", "predictor.embedding_norm.weight"},
+                {"nextn.hnorm.weight", "predictor.hidden_norm.weight"},
+                {"nextn.shared_head_norm.weight", "predictor.output_norm.weight"},
+                {"nextn.embed_tokens.weight", "predictor.token_embedding.weight"},
+                {"nextn.shared_head_head.weight", "predictor.output.weight"},
+            };
+            if (const auto nextn = predictor_names.find(name.substr(dot + 1)); nextn != predictor_names.end())
+                return nextn->second;
+            if (found != names.end()) return "predictor.block.0." + found->second;
+        }
+    }
     return found == names.end() ? name : "model.block." + name.substr(4, dot - 4) + "." + found->second;
 }
 
@@ -296,6 +320,48 @@ std::vector<std::byte> dense_prefix(const std::vector<int64_t>& shape) {
         for (unsigned i = 0; i < 8; ++i) bytes[4 + d * 8 + i] = std::byte(uint64_t(shape[d]) >> (i * 8));
     return bytes;
 }
+
+struct Qwen35Nextn {
+    int64_t backbone=0, layers=0;
+    Qwen35Nextn()=default;
+    explicit Qwen35Nextn(const gguf_context* context) {
+        const auto key=gguf_find_key(context,"qwen35.nextn_predict_layers");
+        if(key<0)return;
+        const auto value=scalar(context,key);
+        if(!value.is_number_integer())throw std::runtime_error("invalid GGUF NextN layer count: expected an integer");
+        layers=value.get<int64_t>();
+        if(layers<0)throw std::runtime_error("invalid GGUF NextN layer count: negative value");
+        if(!layers)return;
+        const auto count=gguf_find_key(context,"qwen35.block_count");
+        if(count<0 || !scalar(context,count).is_number_integer())
+            throw std::runtime_error("Qwen GGUF nextn requires an integer block count");
+        const auto blocks=scalar(context,count).get<int64_t>();
+        if(blocks<=0 || layers>=blocks)throw std::runtime_error("invalid GGUF NextN layer count: no backbone layers");
+        backbone=blocks-layers;
+    }
+    std::optional<std::string> name(const std::string& stored) const {
+        if(stored.rfind("predictor.",0)==0)return stored;
+        if(!layers || stored.rfind("blk.",0)!=0)return {};
+        const auto dot=stored.find('.',4);
+        if(dot==std::string::npos)return {};
+        int64_t layer=-1;
+        const auto parsed=std::from_chars(stored.data()+4,stored.data()+dot,layer);
+        if(parsed.ec!=std::errc{} || parsed.ptr!=stored.data()+dot || layer<backbone || layer>=backbone+layers)return {};
+        const auto suffix=stored.substr(dot+1);
+        static const std::map<std::string,std::string> inputs{
+            {"nextn.eh_proj.weight","predictor.fusion.weight"},
+            {"nextn.enorm.weight","predictor.embedding_norm.weight"},
+            {"nextn.hnorm.weight","predictor.hidden_norm.weight"},
+            {"nextn.shared_head_norm.weight","predictor.output_norm.weight"},
+            {"nextn.embed_tokens.weight","predictor.token_embedding.weight"},
+            {"nextn.shared_head_head.weight","predictor.output.weight"}};
+        if(const auto found=inputs.find(suffix);found!=inputs.end())return found->second;
+        const auto canonical=canonical_name(stored);
+        const auto prefix="model.block."+std::to_string(layer)+".";
+        if(canonical.rfind(prefix,0)!=0)throw std::runtime_error("unsupported Qwen GGUF nextn tensor: "+stored);
+        return "predictor.block."+std::to_string(layer-backbone)+"."+canonical.substr(prefix.size());
+    }
+};
 
 json model_config(const json& meta, const json& shapes, const std::string& arch) {
     if (arch == "deepseek41") {
@@ -352,6 +418,37 @@ json model_config(const json& meta, const json& shapes, const std::string& arch)
         config["linear_value_head_dim"] = number("ssm.state_size", 128);
         config["linear_num_key_heads"] = number("ssm.group_count", 0);
         config["linear_num_value_heads"] = number("ssm.time_step_rank", 0);
+        if (arch == "qwen35") {
+            const auto nextn = number("nextn_predict_layers", 0);
+            if (!nextn.is_number_integer()) throw std::runtime_error("invalid GGUF NextN layer count");
+            const auto predictors = nextn.get<int64_t>();
+            const auto blocks = config.value("num_hidden_layers", int64_t{0});
+            if (predictors < 0 || (predictors > 0 && predictors >= blocks))
+                throw std::runtime_error("invalid GGUF NextN layer count");
+            if (predictors > 0) config["num_hidden_layers"] = blocks - predictors;
+            config["mtp_num_hidden_layers"] = 0;
+            config["mtp_use_dedicated_embeddings"] = shapes.contains("predictor.token_embedding.weight");
+            int64_t available=0;
+            while(shapes.contains("predictor.block."+std::to_string(available)+".attention.query.weight"))++available;
+            // A backbone may declare NextN blocks without carrying an MTP head.
+            // Once head parameters are supplied, require a complete matching set.
+            const bool head_parameters=shapes.contains("predictor.fusion.weight") ||
+                shapes.contains("predictor.embedding_norm.weight") ||
+                shapes.contains("predictor.hidden_norm.weight") ||
+                shapes.contains("predictor.output_norm.weight");
+            if(head_parameters) {
+                const auto matches=[&](const char* name,const std::vector<int64_t>& shape){
+                    return shapes.contains(name) && shapes.at(name)==shape;
+                };
+                if(available<=0 || (predictors && available!=predictors) ||
+                        !matches("predictor.fusion.weight",{hidden,2*hidden}) ||
+                        !matches("predictor.embedding_norm.weight",{hidden}) ||
+                        !matches("predictor.hidden_norm.weight",{hidden}) ||
+                        !matches("predictor.output_norm.weight",{hidden}))
+                    throw std::runtime_error("Qwen GGUF predictor geometry is incomplete or differs from the backbone");
+                config["mtp_num_hidden_layers"]=available;
+            }
+        }
         json layers = json::array();
         const auto count = config.value("num_hidden_layers", int64_t{0});
         for (int64_t i = 0; i < count; ++i) {
@@ -516,12 +613,48 @@ struct GgufModelSource::Impl {
         std::shared_ptr<ModelSource> external;
         std::string external_name;
     };
+    static void read_record(const Record& record,uint64_t offset,std::byte* destination,std::size_t size) {
+        if (offset > record.tensor.nbytes || size > record.tensor.nbytes - offset)
+            throw std::out_of_range("GGUF tensor read exceeds its byte range");
+        if (!size) return;
+        if (!destination) throw std::invalid_argument("GGUF tensor destination is null");
+        if (record.external) {
+            record.external->read_range_into(record.external_name, offset, destination, size);
+            return;
+        }
+        if (!record.inline_bytes.empty()) {
+            if (size) std::memcpy(destination, record.inline_bytes.data() + offset, size);
+            return;
+        }
+        if (!record.pieces.empty()) {
+            auto piece = std::upper_bound(record.pieces.begin(), record.pieces.end(), offset,
+                [](uint64_t at, const Impl::Record::Piece& value) { return at < value.begin; }) - 1;
+            while (size) {
+                const auto within = offset - piece->begin;
+                const auto count = std::min<uint64_t>(size, piece->size - within);
+                piece->file->read(piece->file_offset + within, destination, count);
+                offset += count; destination += count; size -= count;
+                ++piece;
+            }
+            return;
+        }
+        if (offset < record.prefix.size()) {
+            const auto count = std::min<std::size_t>(size, record.prefix.size() - offset);
+            std::memcpy(destination, record.prefix.data() + offset, count);
+            offset += count; destination += count; size -= count;
+        }
+        if (size) record.file->read(record.offset + offset - record.prefix.size(), destination, size);
+    }
+    mutable std::mutex group_reader_mutex;
+    mutable std::weak_ptr<const TensorGroupReader> group_reader;
     std::vector<std::filesystem::path> paths;
+    std::vector<std::shared_ptr<GgufFile>> files;
     std::string arch;
     std::unordered_map<std::string, std::string> metadata;
     HadamardTransforms hadamard;
     std::vector<TensorMetadata> tensors;
     std::unordered_map<std::string, Record> records;
+    std::unordered_map<std::string, std::string> stored_names;
     std::unordered_map<std::string, std::vector<std::byte>> asset_data;
     std::vector<std::string> assets;
 };
@@ -591,6 +724,7 @@ GgufModelSource::GgufModelSource(const std::filesystem::path& path,
     }
 
     json meta = json::object(), shapes = json::object();
+    Qwen35Nextn model_nextn;
     for (std::size_t shard = 0; shard < impl_->paths.size(); ++shard) {
         ggml_context* raw = nullptr;
         auto file = open(impl_->paths[shard]);
@@ -615,6 +749,7 @@ GgufModelSource::GgufModelSource(const std::filesystem::path& path,
             }
             if (!meta.contains("general.architecture")) throw std::runtime_error("GGUF has no architecture");
             impl_->arch = meta["general.architecture"].get<std::string>();
+            if(impl_->arch=="qwen35")model_nextn=Qwen35Nextn(ctx.get());
             Gguf tokenizer(gguf_init_empty(), gguf_free);
             gguf_set_kv(tokenizer.get(), ctx.get());
             auto& asset = impl_->asset_data[kTokenizerGgufAsset];
@@ -623,6 +758,25 @@ GgufModelSource::GgufModelSource(const std::filesystem::path& path,
         }
         std::unordered_map<std::string, std::string> predictor_names;
         const auto architecture_key = gguf_find_key(ctx.get(), "general.architecture");
+        // Split model metadata may appear only in shard zero. Predictor block
+        // indices still use that model-wide layer count on every shard.
+        const bool qwen35_file=shard<model_shards?impl_->arch=="qwen35":
+            architecture_key>=0 && scalar(ctx.get(),architecture_key)=="qwen35";
+        const Qwen35Nextn nextn=qwen35_file?(shard<model_shards?model_nextn:Qwen35Nextn(ctx.get())):Qwen35Nextn();
+        const bool qwen35_companion=shard>=model_shards && qwen35_file && nextn.layers>0;
+        if(qwen35_companion) {
+            if(impl_->arch!="qwen35")throw std::runtime_error("Qwen35 MTP companion requires a Qwen35 backbone");
+            const auto primary_predictors=meta.value("qwen35.nextn_predict_layers",int64_t{0});
+            if(nextn.backbone!=meta.at("qwen35.block_count").get<int64_t>()-primary_predictors)
+                throw std::runtime_error("Qwen35 MTP companion backbone depth differs");
+            for(const auto* suffix:{"embedding_length","feed_forward_length","attention.head_count","attention.head_count_kv",
+                    "attention.key_length","rope.dimension_count","rope.freq_base","attention.layer_norm_rms_epsilon"}) {
+                const auto name=std::string("qwen35.")+suffix;
+                const auto id=gguf_find_key(ctx.get(),name.c_str());
+                if(meta.contains(name) && (id<0 || scalar(ctx.get(),id)!=meta.at(name)))
+                    throw std::runtime_error("Qwen35 MTP companion geometry differs: "+name);
+            }
+        }
         const bool raw_predictor = shard >= model_shards && architecture_key >= 0 &&
             scalar(ctx.get(), architecture_key) == "qwen4exp-mtp";
         if (raw_predictor) {
@@ -642,6 +796,8 @@ GgufModelSource::GgufModelSource(const std::filesystem::path& path,
         }
         for (int64_t i = 0; i < gguf_get_n_tensors(ctx.get()); ++i) {
             const auto* original = gguf_get_tensor_name(ctx.get(), i);
+            const auto qwen35_name=qwen35_file?nextn.name(original):std::optional<std::string>{};
+            if(qwen35_companion && !qwen35_name)continue;
             const auto* tensor = ggml_get_tensor(tensors.get(), original);
             if (!tensor) throw std::runtime_error("GGUF tensor shape is missing");
             const auto type = gguf_get_tensor_type(ctx.get(), i);
@@ -650,7 +806,7 @@ GgufModelSource::GgufModelSource(const std::filesystem::path& path,
                 throw std::runtime_error("Gyro GGUF requires agention.trellis.state_bits=15");
             std::vector<int64_t> shape;
             for (int d = ggml_n_dims(tensor) - 1; d >= 0; --d) shape.push_back(tensor->ne[d]);
-            auto name = raw_predictor ? predictor_names.at(original) : canonical_name(original);
+            auto name = raw_predictor ? predictor_names.at(original) : qwen35_name?*qwen35_name:canonical_name(original, &meta);
             if (impl_->arch == "qwen4exp") {
                 if (name == "per_layer_token_embd.weight") {
                     const auto layers = meta.at("qwen4exp.ple.layers").get<std::vector<int64_t>>();
@@ -661,6 +817,8 @@ GgufModelSource::GgufModelSource(const std::filesystem::path& path,
                     shape.insert(shape.begin(), 1);
             }
             if (impl_->records.count(name)) throw std::runtime_error("duplicate GGUF tensor: " + name);
+            const auto inserted=impl_->stored_names.emplace(original,name);
+            if(!inserted.second && inserted.first->second!=name)inserted.first->second.clear();
             Impl::Record record;
             record.file = file;
             record.path = impl_->paths[shard];
@@ -735,6 +893,8 @@ GgufModelSource::GgufModelSource(const std::filesystem::path& path,
         physical_paths.push_back(part);
     }
     impl_->paths = std::move(physical_paths);
+    impl_->files.reserve(files.size());
+    for(const auto& [path,file]:files)impl_->files.push_back(file);
     json mixed_experts = json::object();
     std::vector<std::string> type_maps;
     const std::string map_suffix = ".ffn_exps_gu_type";
@@ -753,7 +913,7 @@ GgufModelSource::GgufModelSource(const std::filesystem::path& path,
         const auto dot = root.find('.', 4);
         if (dot == std::string::npos) throw std::runtime_error("invalid GGUF mixed expert layer name");
         for (const auto* role : {"gate", "up", "down"}) {
-            const auto name = canonical_name(root + "ffn_" + role + "_exps.weight");
+            const auto name = canonical_name(root + "ffn_" + role + "_exps.weight", &meta);
             if (impl_->records.count(name)) continue;
             const auto role_map = root + (std::string_view(role) == "down" ? "ffn_exps_down_type" : "ffn_exps_gu_type");
             const auto map_it = impl_->records.find(role_map);
@@ -852,7 +1012,7 @@ GgufModelSource::GgufModelSource(const std::filesystem::path& path,
         const auto weights = meta.at("prism.hadamard.weight_names").get<std::vector<std::string>>();
         if (weights.empty()) throw std::runtime_error("GGUF Hadamard weight list is empty");
         for (const auto& original : weights) {
-            const auto name = canonical_name(original);
+            const auto name = canonical_name(original, &meta);
             const auto record = impl_->records.find(name);
             if (record == impl_->records.end() || !record->second.tensor.shape || record->second.tensor.shape->size() < 2 ||
                 record->second.tensor.dtype.rfind("GGUF_", 0) != 0 || transforms.contains(name))
@@ -1033,7 +1193,7 @@ GgufModelSource::GgufModelSource(const std::filesystem::path& path,
         const auto weights = meta.at("prism.hadamard.weight_names").get<std::vector<std::string>>();
         if (weights.empty()) throw std::runtime_error("GGUF Hadamard weight list is empty");
         for (const auto& original : weights) {
-            const auto name = canonical_name(original);
+            const auto name = canonical_name(original, &meta);
             const auto record = impl_->records.find(name);
             if (record == impl_->records.end() || !record->second.tensor.shape || record->second.tensor.shape->size() < 2 ||
                 record->second.tensor.dtype.rfind("GGUF_", 0) != 0 || transforms.contains(name))
@@ -1054,10 +1214,33 @@ const std::vector<std::filesystem::path>& GgufModelSource::source_paths() const 
 std::string_view GgufModelSource::architecture() const noexcept { return impl_->arch; }
 const std::unordered_map<std::string, std::string>& GgufModelSource::metadata() const noexcept { return impl_->metadata; }
 const HadamardTransforms* GgufModelSource::hadamard_transforms() const noexcept { return &impl_->hadamard; }
+
+const MfqLegacyTensorAliases& GgufModelSource::legacy_tensor_compatibility() const noexcept {
+    if(impl_->arch!="qwen35")return ModelSource::legacy_tensor_compatibility();
+    // Canonical names retain the original GGUF numeric/layout conventions:
+    // RMS weights include their offset, A is already negative, and GDN value
+    // heads are tiled. The tensor payload itself is intentionally unchanged.
+    static const MfqLegacyTensorAliases compatibility=[] {
+        MfqLegacyTensorAliases result;
+        result.layout.norm_weight_offset=0.0;
+        result.layout.linear_attention_a_is_log=false;
+        result.layout.qwen_gdn_gguf_layout=true;
+        return result;
+    }();
+    return compatibility;
+}
+
 const std::vector<TensorMetadata>& GgufModelSource::tensors() const noexcept { return impl_->tensors; }
 const TensorMetadata* GgufModelSource::find_tensor(std::string_view name) const noexcept {
     const auto it = impl_->records.find(std::string(name));
     return it == impl_->records.end() ? nullptr : &it->second.tensor;
+}
+std::string GgufModelSource::canonical_tensor_name(std::string_view stored) const {
+    if(find_tensor(stored))return std::string(stored);
+    const auto found=impl_->stored_names.find(std::string(stored));
+    if(found==impl_->stored_names.end() || found->second.empty())
+        throw std::invalid_argument("unknown or ambiguous GGUF tensor name: "+std::string(stored));
+    return found->second;
 }
 ModelSource::TensorReader GgufModelSource::tensor_reader(std::string_view name) const {
     const auto it = impl_->records.find(std::string(name));
@@ -1068,36 +1251,7 @@ ModelSource::TensorReader GgufModelSource::tensor_reader(std::string_view name) 
     }
     return [saved = std::shared_ptr<const Impl::Record>(impl_, &it->second)](uint64_t offset, std::byte* destination, std::size_t size) {
         const auto& record = *saved;
-        if (offset > record.tensor.nbytes || size > record.tensor.nbytes - offset)
-            throw std::out_of_range("GGUF tensor read exceeds its byte range");
-        if (!size) return;
-        if (!destination) throw std::invalid_argument("GGUF tensor destination is null");
-        if (record.external) {
-            record.external->read_range_into(record.external_name, offset, destination, size);
-            return;
-        }
-        if (!record.inline_bytes.empty()) {
-            if (size) std::memcpy(destination, record.inline_bytes.data() + offset, size);
-            return;
-        }
-        if (!record.pieces.empty()) {
-            auto piece = std::upper_bound(record.pieces.begin(), record.pieces.end(), offset,
-                [](uint64_t at, const Impl::Record::Piece& value) { return at < value.begin; }) - 1;
-            while (size) {
-                const auto within = offset - piece->begin;
-                const auto count = std::min<uint64_t>(size, piece->size - within);
-                piece->file->read(piece->file_offset + within, destination, count);
-                offset += count; destination += count; size -= count;
-                ++piece;
-            }
-            return;
-        }
-        if (offset < record.prefix.size()) {
-            const auto count = std::min<std::size_t>(size, record.prefix.size() - offset);
-            std::memcpy(destination, record.prefix.data() + offset, count);
-            offset += count; destination += count; size -= count;
-        }
-        if (size) record.file->read(record.offset + offset - record.prefix.size(), destination, size);
+        Impl::read_record(record,offset,destination,size);
     };
 }
 ModelSource::TensorReader GgufModelSource::mapped_tensor_reader(std::string_view name) const {
@@ -1193,8 +1347,60 @@ ModelSource::TensorBatchReader GgufModelSource::tensor_batch_reader(std::string_
         record.file->read_coalesced(destinations);
     };
 }
+std::shared_ptr<const GgufModelSource::TensorGroupReader> GgufModelSource::tensor_group_reader() const {
+    std::lock_guard lock(impl_->group_reader_mutex);
+    if(auto reader=impl_->group_reader.lock())return reader;
+    auto reader=std::make_shared<const TensorGroupReader>([saved=impl_](const std::vector<NamedReadSpan>& spans) {
+        std::vector<const Impl::Record*> records;records.reserve(spans.size());
+        std::vector<std::pair<std::uintptr_t,std::uintptr_t>> targets;targets.reserve(spans.size());
+        for(const auto& named:spans) {
+            const auto found=saved->records.find(std::string(named.name));
+            if(found==saved->records.end())throw std::out_of_range("GGUF tensor not found: "+std::string(named.name));
+            const auto& record=found->second;const auto& span=named.span;
+            if(span.offset>record.tensor.nbytes || span.size>record.tensor.nbytes-span.offset)
+                throw std::out_of_range("GGUF tensor read exceeds its byte range");
+            if(span.size) {
+                const auto first=reinterpret_cast<std::uintptr_t>(span.destination);
+                if(!span.destination || span.size>UINTPTR_MAX-first)
+                    throw std::invalid_argument("GGUF tensor destination range is invalid");
+                targets.emplace_back(first,first+span.size);
+            }
+            records.push_back(&record);
+        }
+        std::sort(targets.begin(),targets.end());
+        for(std::size_t i=1;i<targets.size();++i)if(targets[i].first<targets[i-1].second) {
+            // Aliased destinations retain the caller's overwrite order.
+            for(std::size_t j=0;j<spans.size();++j) {
+                const auto& span=spans[j].span;
+                Impl::read_record(*records[j],span.offset,span.destination,span.size);
+            }
+            return;
+        }
+        struct Group {std::shared_ptr<GgufFile> file;std::vector<ReadSpan> spans;};
+        std::vector<Group> groups;
+        for(std::size_t i=0;i<spans.size();++i) {
+            const auto& span=spans[i].span;const auto& record=*records[i];
+            if(!span.size)continue;
+            if(!record.prefix.empty() || !record.inline_bytes.empty() || record.external || !record.pieces.empty()) {
+                Impl::read_record(record,span.offset,span.destination,span.size);continue;
+            }
+            auto group=std::find_if(groups.begin(),groups.end(),[&](const auto& value){return value.file==record.file;});
+            if(group==groups.end()){groups.push_back({record.file,{}});group=groups.end()-1;}
+            group->spans.push_back({record.offset+span.offset,span.destination,span.size});
+        }
+        for(const auto& group:groups)group.file->read_coalesced(group.spans);
+    });
+    impl_->group_reader=reader;
+    return reader;
+}
+
 void GgufModelSource::read_range_into(std::string_view name, uint64_t offset, std::byte* destination, std::size_t size) const {
     tensor_reader(name)(offset, destination, size);
+}
+FileReadStats GgufModelSource::file_read_stats()const noexcept {
+    FileReadStats result;
+    for(const auto& file:impl_->files)add_file_read_stats(result,file->stats());
+    return result;
 }
 const std::vector<std::string>& GgufModelSource::assets() const noexcept { return impl_->assets; }
 bool GgufModelSource::has_asset(std::string_view name) const noexcept { return impl_->asset_data.count(std::string(name)) != 0; }

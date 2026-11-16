@@ -1,4 +1,4 @@
-/** 验证会话 store 的重置、过期请求隔离与同步更新边界。 */
+
 import { beforeEach, expect, it } from 'vitest';
 import type { Message, ResponseResource, Session } from '../../../shared/api/types';
 import { useConversationStore } from './conversationStore';

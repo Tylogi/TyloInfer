@@ -58,7 +58,12 @@ def test_download_space_uses_selected_filesystem_and_updates_free_bytes(tmp_path
     chosen = tmp_path / 'external'
     chosen.mkdir()
     link = tmp_path / 'external-link'
-    link.symlink_to(chosen, target_is_directory=True)
+    try:
+        link.symlink_to(chosen, target_is_directory=True)
+    except OSError as error:
+        if getattr(error, "winerror", None) == 1314:
+            pytest.skip("Creating directory symlinks requires permission")
+        raise
     available = 200
     calls = []
     def usage(path):

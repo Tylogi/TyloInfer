@@ -1,6 +1,6 @@
-/**
- * TyloInfer Web 与 Tauri 共用的 React 启动入口，负责路由和顶层错误隔离。
- */
+
+
+
 
 import { Component, StrictMode, type ErrorInfo, type ReactNode } from 'react';
 import { createRoot } from 'react-dom/client';
@@ -55,7 +55,7 @@ class AppErrorBoundary extends Component<{ children: ReactNode }, AppErrorBounda
   }
 }
 
-// 浏览器清理旧版根路径哈希链接；桌面打包资源仍使用哈希路由。
+
 if (!isStudio() && window.location.pathname === '/' && window.location.hash.startsWith('#/')) {
   window.history.replaceState(window.history.state, '', window.location.hash.slice(1));
 }

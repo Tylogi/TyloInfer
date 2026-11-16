@@ -252,7 +252,7 @@ class JobManager:
     async def retry(self, job_id: UUID, *, payload: dict[str, Any] | None = None) -> JobResource:
         await self.start()
         previous = await asyncio.to_thread(self.store.get_job, job_id)
-        if previous.kind in {'download.huggingface', 'download.modelscope'}:
+        if previous.kind in {"download.huggingface", "download.modelscope"}:
             if previous.kind not in self.handlers:
                 raise JobKindNotRegisteredError(previous.kind)
             if previous.status in {JobStatus.RUNNING, JobStatus.QUEUED}:
@@ -334,7 +334,10 @@ class JobManager:
                 if self._closing:
                     await asyncio.to_thread(self.store.interrupt_job, job_id)
                     job = await asyncio.to_thread(self.store.get_job, job_id)
-                    if job.kind in {'download.huggingface', 'download.modelscope'} and not job.cancel_requested:
+                    if (
+                        job.kind in {"download.huggingface", "download.modelscope"}
+                        and not job.cancel_requested
+                    ):
                         await asyncio.to_thread(self.store.requeue_job, job_id)
                 else:
                     await asyncio.to_thread(self.store.cancel_job, job_id)

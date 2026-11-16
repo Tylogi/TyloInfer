@@ -1,10 +1,10 @@
-/** 模型驻留策略的展示和表单控件。 */
+
 import { useSettings } from '../settings/SettingsProvider';
 import { TMPanel, SettingRow } from '../../app/display';
 import { Switch } from '../../shared/ui/Switch';
 import type { useModelCatalog } from './useModelCatalog';
 
-/** 展示内存固定和空闲卸载策略设置。 */
+
 export function ModelLoadPolicy({ catalog }: { catalog: ReturnType<typeof useModelCatalog> }) {
   const { tr } = useSettings();
   const { loadPinned, setLoadPinned, loadIdleTtl, setLoadIdleTtl } = catalog;

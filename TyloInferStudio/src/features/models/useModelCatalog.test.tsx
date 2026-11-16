@@ -1,4 +1,4 @@
-/** 验证模型目录的按需加载、策略传递及注册失败恢复。 */
+
 import { act, renderHook, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router';
 import type { ReactNode } from 'react';
@@ -51,7 +51,7 @@ const artifact: ModelArtifact = {
   modified_at: '2026-09-23T00:00:00Z',
 };
 
-/** 提供真实路由上下文，避免把页面导航行为替换成无条件成功的桩。 */
+
 function Wrapper({ children }: { children: ReactNode }) {
   return (
     <MemoryRouter>

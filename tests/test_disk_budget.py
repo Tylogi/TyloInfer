@@ -19,6 +19,7 @@ from tyloinfer.server.state.catalog import ModelCatalog
 @pytest.fixture
 def budget(tmp_path, monkeypatch):
     monkeypatch.setenv('TYLOINFER_DISK_BUDGET_DIR', str(tmp_path / 'reservations'))
+    monkeypatch.setattr(shutil, 'disk_usage', lambda _: SimpleNamespace(free=4 << 30))
     return DiskBudget()
 
 
@@ -107,10 +108,21 @@ def test_sparse_partial_file_does_not_release_unwritten_download_space(budget, t
         directory.mkdir()
         size = 10 << 20
         with (directory / 'weights.incomplete').open('wb') as stream:
+            if os.name == 'nt':
+                import ctypes
+                import msvcrt
+
+                returned = ctypes.c_ulong()
+                sparse = ctypes.windll.kernel32.DeviceIoControl
+                sparse.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_void_p, ctypes.c_ulong,
+                                   ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong), ctypes.c_void_p]
+                if not sparse(msvcrt.get_osfhandle(stream.fileno()), 0x900C4, None, 0, None, 0, ctypes.byref(returned), None):
+                    pytest.skip("The test filesystem does not support sparse files")
             stream.truncate(size)
         handlers = ToolJobHandlers(ModelCatalog([]), ToolJobPaths(tmp_path, Path(sys.executable), None, None, None))
         async def transfer(*args, **kwargs):
-            assert budget.reserved(directory) >= size + (512 << 20) - 4096
+            reserved = budget.reserved(directory)
+            assert (512 << 20) + size // 2 < reserved <= (512 << 20) + size
         monkeypatch.setattr(handlers, '_run', transfer)
         await handlers._run_download(SimpleNamespace(), ['test'], {}, directory, size)
         assert budget.reserved(directory) == 0

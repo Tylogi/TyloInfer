@@ -1,4 +1,4 @@
-/** 验证概览与历史消息实际展示相同的原生预填充指标。 */
+
 import { render, screen } from '@testing-library/react';
 import { MemoryRouter } from 'react-router';
 import { expect, it, vi } from 'vitest';

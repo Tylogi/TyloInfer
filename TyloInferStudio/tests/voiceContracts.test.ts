@@ -1,11 +1,11 @@
-/** 保留实时语音状态机、回合归属与默认参数的过渡源码契约；本文件不是行为测试，audioCodec/AudioDevices 行为覆盖不能替代它。 */
+
 import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 const sourceRoot = resolve(process.cwd(), 'src');
 
-/** 只读取产品实现，排除测试和类型声明，防止测试自身满足契约。 */
+
 function readSources(...paths: string[]): string {
   function collect(location: string): string[] {
     if (statSync(location).isDirectory()) {
@@ -41,8 +41,8 @@ describe('语音过渡源码契约（非行为测试）', () => {
   });
 
   it('test_studio_preserves_resampling_phase_across_audio_worklet_blocks', () => {
-    // 分块相位由 features/voice/audioCodec.test.ts 的多采样率分块/整块等价行为覆盖。
-    // 此处仅保留设备采样率接线；不检查重采样器私有变量，也不代表语音回合归属验证。
+
+
     const devices = readSources('features/voice/AudioDevices.ts');
     expect(devices).toContain('const INPUT_RATE = 16_000;');
     expect(devices).toContain('new AudioContext({ sampleRate: INPUT_RATE })');

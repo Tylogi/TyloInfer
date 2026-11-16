@@ -1,7 +1,7 @@
-/** 统一应用的错误、数值、容量和时长展示格式。 */
+
 import { ApiError } from '../shared/api/client';
 
-/** 将服务端或普通异常转换为用户可见的错误信息。 */
+
 export function errorMessage(error: unknown, tr?: (chinese: string, english: string) => string): string {
   if (error instanceof ApiError) {
     if (tr) {
@@ -73,7 +73,7 @@ export function errorMessage(error: unknown, tr?: (chinese: string, english: str
   return "Unknown error";
 }
 
-/** 格式化有限数值，缺失或无效时返回占位符。 */
+
 export function formatNumber(value: unknown, digits = 0): string {
   const number = Number(value);
   return Number.isFinite(number)
@@ -81,7 +81,7 @@ export function formatNumber(value: unknown, digits = 0): string {
     : "--";
 }
 
-/** 将字节数转换为可读的二进制容量单位。 */
+
 export function formatBytes(value: unknown): string {
   const bytes = Number(value);
   if (!Number.isFinite(bytes) || bytes <= 0) return "--";
@@ -91,7 +91,7 @@ export function formatBytes(value: unknown): string {
   return `${formatNumber(bytes / 2 ** 10, 0)} KB`;
 }
 
-/** 将秒数转换为天、小时、分钟与秒的简洁时长。 */
+
 export function formatDuration(value: unknown): string {
   const seconds = Math.max(0, Math.floor(Number(value) || 0));
   const days = Math.floor(seconds / 86400);

@@ -1,4 +1,4 @@
-/** 验证 SSE 在字节分片、换行边界和取消情况下正确解析并释放读取器。 */
+
 import { describe, expect, it, vi } from 'vitest';
 import { readEventStream } from '../src/shared/api/eventStream';
 

@@ -1,4 +1,4 @@
-/** 管理聊天附件类型、大小限制、文档识别及媒体元数据读取。 */
+
 
 
 export interface PendingAttachment {
@@ -44,7 +44,7 @@ export const DOCUMENT_ACCEPT = [
 
 export const MAX_DOCUMENT_BYTES = 64 * 1024 * 1024;
 
-/** 根据 MIME 和扩展名判断附件是否可作为文本读取。 */
+
 export function isTextDocument(file: File): boolean {
   const extension = file.name.toLowerCase().match(/\.[^.]+$/)?.[0] ?? "";
   return (
@@ -54,7 +54,7 @@ export function isTextDocument(file: File): boolean {
   );
 }
 
-/** 读取媒体尺寸或音频参数，并在完成后释放临时资源。 */
+
 export async function mediaMetadata(
   file: File,
   kind: Exclude<PendingAttachment["kind"], "document">,
@@ -118,7 +118,7 @@ export async function mediaMetadata(
   }
 }
 
-/** 优先使用文件 MIME，并为常见文档扩展名提供默认值。 */
+
 export function documentMimeType(file: File): string {
   if (file.type) return file.type;
   const extension = file.name.toLowerCase().match(/\.[^.]+$/)?.[0] ?? "";

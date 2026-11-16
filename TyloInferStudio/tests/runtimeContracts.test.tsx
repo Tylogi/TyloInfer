@@ -1,4 +1,4 @@
-/** 验证实例推理能力、附件类型和聊天工具栏的真实交互。 */
+
 import { act, render, renderHook, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -26,7 +26,7 @@ let settings: ReturnType<typeof useSettings>['settings'];
 const updateSettings = vi.fn();
 const selectInteractionMode = vi.fn();
 
-/** 创建默认仅支持文本的能力响应，按场景覆盖能力位。 */
+
 function capabilities(features: Partial<RuntimeCapabilities['model_capabilities']['features']> = {}): RuntimeCapabilities {
   return {
     model: 'selected', model_type: 'test', vision_available: false,
@@ -41,7 +41,7 @@ function capabilities(features: Partial<RuntimeCapabilities['model_capabilities'
   };
 }
 
-/** 创建实例记录，区分选中模型、失败实例和其他模型。 */
+
 function instance(overrides: Partial<RuntimeInstance> = {}): RuntimeInstance {
   return {
     id: 'selected-instance', model: 'selected', state: 'ready', devices: [],
@@ -49,7 +49,7 @@ function instance(overrides: Partial<RuntimeInstance> = {}): RuntimeInstance {
   };
 }
 
-/** 将真实推理 hook 接入工具栏，验证更新设置后的界面行为。 */
+
 function ToolbarHarness() {
   const inference = useChatInference('text');
   vi.mocked(useChat).mockReturnValue({

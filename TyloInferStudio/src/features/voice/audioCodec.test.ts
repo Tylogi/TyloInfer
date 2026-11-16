@@ -1,8 +1,8 @@
-/** 验证实时语音编码、WAV 格式和跨块重采样的数值边界。 */
+
 import { describe, expect, it } from 'vitest';
 import { base64ToFloat32, float32ToBase64, StreamingLinearResampler, wavBlob } from './audioCodec';
 
-/** 使用浏览器文件读取接口读取 WAV，兼容 jsdom 的 Blob 实现。 */
+
 function readBlob(blob: Blob): Promise<ArrayBuffer> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();

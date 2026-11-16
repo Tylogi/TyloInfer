@@ -1,4 +1,4 @@
-/** 聊天路由的局部交互状态，不接管跨路由的生成与会话生命周期。 */
+
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router';
 import { useChat } from '../ChatProvider';
@@ -6,7 +6,7 @@ import { useConversationSelector } from '../state/conversationStore';
 import { useChatAutoScroll } from './useChatAutoScroll';
 import type { EditDraft } from '../SavedMessageList';
 
-/** 组织侧栏、滚动和编辑草稿等仅在聊天页存在的交互。 */
+
 export function useChatPageState() {
   const chat = useChat();
   const navigate = useNavigate();
@@ -30,7 +30,7 @@ export function useChatPageState() {
     return () => viewport.removeEventListener('change', close);
   }, []);
 
-  /** 保存当前编辑，并仅在草稿未被继续修改时退出编辑。 */
+
   async function saveCurrentEdit(message: Parameters<typeof chat.messageActions.saveEdit>[0]) {
     const draft = editDraft;
     if (!draft || draft.messageId !== message.id) return;
@@ -41,20 +41,20 @@ export function useChatPageState() {
     });
   }
 
-  /** 切换历史会话，移动端同时折叠侧栏。 */
+
   function selectSession(id: string) {
     if (chat.busy) return;
     chat.conversation.selectSession(id);
     if (window.matchMedia('(max-width: 680px)').matches) setChatSessionsOpen(false);
   }
 
-  /** 新建会话，移动端同时折叠侧栏。 */
+
   async function createSession() {
     await chat.conversation.createSession(active?.mode);
     if (window.matchMedia('(max-width: 680px)').matches) setChatSessionsOpen(false);
   }
 
-  /** 跳转到模型目录以加载模型。 */
+
   function chooseModelDirectory() {
     navigate('/models');
   }

@@ -1,4 +1,4 @@
-/** 管理会话列表、选中会话与消息历史，所有异步回写绑定当前连接和会话。 */
+
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { sessionsApi } from '../../../shared/api/resources/sessions';
 import type { SessionMode } from '../../../shared/api/types';
@@ -7,7 +7,7 @@ import { errorMessage } from '../../../app/formatters';
 import { useConversationStore } from '../state/conversationStore';
 import { useDraftStore } from '../state/draftStore';
 
-/** 首次打开聊天才加载会话，切换时取消旧历史请求，跨页面保留已加载状态。 */
+
 export function useConversationSessions(enabled: boolean, generationBusy: boolean) {
   const { ready, connectionRevision, selectedModel, models, instances } =
     useRuntime();
@@ -93,7 +93,7 @@ export function useConversationSessions(enabled: boolean, generationBusy: boolea
     [transitioning, setActiveId],
   );
 
-  /** 创建新的空会话，版本戳防止服务切换后的返回污染当前列表。 */
+
   const createSession = useCallback(
     async (mode: SessionMode = 'text') => {
       if (!ready || transitioning || generationBusy) return;
@@ -126,7 +126,7 @@ export function useConversationSessions(enabled: boolean, generationBusy: boolea
     }
   }, [setSessions, setActiveId]);
 
-  /** 删除指定会话；仅在当前连接仍有效时更新列表和当前历史。 */
+
   const deleteSession = useCallback(
     async (id: string): Promise<boolean> => {
       if (generationBusy || transitioning || !useConversationStore.getState().sessions.some((session) => session.id === id)) return false;

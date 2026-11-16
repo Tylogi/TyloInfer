@@ -13,10 +13,18 @@ mfq_tensor_backend::Tensor normalize_hidden(mfq_tensor_backend::Tensor hidden,
                                             int64_t batch, int64_t tokens, CudaProfiler &profiler) {
     return profiler.measure("model.output_norm", [&]() {
         auto flat = hidden.reshape({batch * tokens, metadata.hidden_size});
-        return qwen_rms_norm(flat.to(mfq_tensor_backend::kFloat32), output_norm,
+        return qwen_rms_norm(flat, output_norm,
                              metadata.rms_norm_eps, metadata.norm_weight_offset)
             .reshape({batch, tokens, metadata.hidden_size});
     });
+}
+
+// GGUF projections accept FP32 normalized activations. Keep the same
+// quantizer input for scalar sampling and speculative verification.
+mfq_tensor_backend::Tensor head_input(const QuantLinear& head,mfq_tensor_backend::Tensor hidden) {
+    if(head.is_gguf() && hidden.scalar_type()==mfq_tensor_backend::kFloat32)
+        return hidden.contiguous();
+    return hidden.to(mfq_tensor_backend::kFloat16).contiguous();
 }
 
 } // namespace
@@ -86,13 +94,13 @@ CausalResources::adapter_logits(const QuantLinear &lm_head,
 mfq_tensor_backend::Tensor
 CausalResources::adapter_last_logits(const QuantLinear &lm_head,
                                      mfq_tensor_backend::Tensor hidden) const {
-    return lm_head.forward(*execution, hidden.to(mfq_tensor_backend::kFloat16).contiguous());
+    return lm_head.forward(*execution, head_input(lm_head,std::move(hidden)));
 }
 
 mfq_tensor_backend::Tensor
 CausalResources::adapter_next_token(const QuantLinear &lm_head,
                                     mfq_tensor_backend::Tensor hidden) const {
-    auto input = hidden.to(mfq_tensor_backend::kFloat16).contiguous();
+    auto input = head_input(lm_head,std::move(hidden));
     auto logits = execution->profiler.measure("model.lm_head",
                                               [&]() { return lm_head.forward(*execution, input); });
     return sample_greedy_cuda(logits.contiguous().view({input.size(0), -1}));
