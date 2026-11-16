@@ -2,10 +2,10 @@
 #include "cache/prefix.h"
 #include "http.h"
 #include "instance_json.h"
-#include "models/errors.h"
 #include "models/instances.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <initializer_list>
 #include <optional>
@@ -85,7 +85,6 @@ void cache_block_text(const Services& services, const httplib::Request& request,
 }
 
 void cache_purge(const Services& services, const httplib::Request& request, httplib::Response& response) {
-    auto& instances = services.instances;
     auto& cache = services.cache;
     const auto body = parse_json(request);
     fields(body, {"namespace"});
@@ -97,13 +96,7 @@ void cache_purge(const Services& services, const httplib::Request& request, http
             throw ApiError(400, "invalid_request", "namespace must be a 64-character hex digest");
         space = value;
     }
-    // Python refuses to purge while inference or cache writes are in flight; the native gate is queued requests.
-    if (instances.busy({})) throw ApiError(409, "runtime_busy",
-        "wait for inference and cache writes to finish before clearing cache");
     const auto result = cache.purge(space);
-    // The engine keeps an index of the purged files; refresh it so the freed space is reused.
-    try { instances.cache_control({}, engine::SessionCommand{engine::SessionCommand::Kind::refresh}); }
-    catch (const ModelError&) {}
     set_json(response, result);
 }
 

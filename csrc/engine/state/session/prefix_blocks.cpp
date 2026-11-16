@@ -7,6 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include <cerrno>
+#include <cctype>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
@@ -18,7 +19,9 @@
 #include <map>
 #include <mutex>
 #include <sstream>
+#include <set>
 #include <stdexcept>
+#include <system_error>
 #include <thread>
 #include <type_traits>
 #include <utility>
@@ -55,11 +58,36 @@ constexpr std::uint64_t kHeaderBytes =
 constexpr std::string_view kHashDomain = "mfq-paged-prefix-v1";
 constexpr std::uint64_t kDiskSafeDenominator = 10;
 
-class PrefixFileLease {
+std::string hex(const std::uint8_t* data, std::size_t size) {
+    static constexpr char digits[] = "0123456789abcdef";
+    std::string result(size * 2, '0');
+    for (std::size_t index = 0; index < size; ++index) {
+        result[2 * index] = digits[data[index] >> 4];
+        result[2 * index + 1] = digits[data[index] & 0x0f];
+    }
+    return result;
+}
+
+std::int64_t file_seconds(const std::filesystem::path& path, std::error_code& error) {
+    const auto moment = std::filesystem::last_write_time(path, error);
+    if (error) return 0;
+    const auto system = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+        moment - std::filesystem::file_time_type::clock::now() +
+        std::chrono::system_clock::now());
+    return std::chrono::duration_cast<std::chrono::seconds>(
+        system.time_since_epoch()).count();
+}
+
+class PrefixFileLease : public std::enable_shared_from_this<PrefixFileLease> {
 public:
-    explicit PrefixFileLease(const std::filesystem::path& path):file_(std::make_shared<tyloi::FileRangeReader>(path,tyloi::FileReadMode::Buffered)),bytes_(file_->size()){}
+    PrefixFileLease(const std::filesystem::path& path, std::shared_ptr<const void> directory_lease)
+        : directory_lease_(std::move(directory_lease)),
+          file_(std::make_shared<tyloi::FileRangeReader>(path,tyloi::FileReadMode::Buffered)),
+          bytes_(file_->size()) {}
     std::uint64_t size()const{return bytes_;}
-    std::shared_ptr<const tyloi::FileRangeReader> reader()const{return file_;}
+    std::shared_ptr<const tyloi::FileRangeReader> reader()const {
+        return std::shared_ptr<const tyloi::FileRangeReader>(shared_from_this(),file_.get());
+    }
     void read(std::uint64_t offset,void* destination,std::size_t bytes) {
         if(offset>bytes_ || bytes>bytes_-offset)throw std::out_of_range("borrowed SSD prefix byte range");
         if(tyloinfer::ScopedFileReadWindow::read(identity_,bytes_,offset,destination,bytes,
@@ -74,6 +102,7 @@ private:
     void read_uncached(std::uint64_t offset,void* destination,std::size_t bytes) {
         file_->read(offset,static_cast<std::byte*>(destination),bytes);
     }
+    std::shared_ptr<const void> directory_lease_;
     std::shared_ptr<tyloi::FileRangeReader> file_;
     std::uint64_t bytes_=0;
     inline static std::atomic<std::uint64_t> next_identity_{1};
@@ -403,6 +432,349 @@ void sync_directory_best_effort(const std::filesystem::path& path) noexcept {
 #endif
 }
 
+struct PrefixDirectoryRegistration {
+    std::function<void(const std::optional<std::string>&)> publish;
+    bool active = true;
+    std::size_t calls = 0;
+};
+
+struct PrefixDirectoryCoordinator {
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::size_t active = 0;
+    std::size_t retained = 0;
+    bool reclaiming = false;
+    std::vector<std::weak_ptr<PrefixDirectoryRegistration>> owners;
+};
+
+std::mutex prefix_directories_mutex;
+std::map<std::filesystem::path, std::weak_ptr<PrefixDirectoryCoordinator>> prefix_directories;
+
+std::filesystem::path canonical_directory(const std::filesystem::path& path) {
+    std::error_code error;
+    auto result = std::filesystem::weakly_canonical(path, error);
+    if (!error) return result;
+    result = std::filesystem::absolute(path, error);
+    return error ? path.lexically_normal() : result.lexically_normal();
+}
+
+std::shared_ptr<PrefixDirectoryCoordinator> directory_coordinator(
+        const std::filesystem::path& path) {
+    const auto key = canonical_directory(path);
+    std::lock_guard lock(prefix_directories_mutex);
+    auto& weak = prefix_directories[key];
+    if (auto result = weak.lock()) return result;
+    auto result = std::make_shared<PrefixDirectoryCoordinator>();
+    weak = result;
+    return result;
+}
+
+class PrefixDirectoryLease {
+public:
+    PrefixDirectoryLease(std::shared_ptr<PrefixDirectoryCoordinator> owner,
+            bool retained, bool writer)
+        : owner_(std::move(owner)), retained_(retained), writer_(writer) {}
+    ~PrefixDirectoryLease() {
+        std::lock_guard lock(owner_->mutex);
+        --owner_->active;
+        if (retained_) --owner_->retained;
+        if (writer_) owner_->reclaiming = false;
+        owner_->changed.notify_all();
+    }
+    PrefixDirectoryLease(const PrefixDirectoryLease&) = delete;
+    PrefixDirectoryLease& operator=(const PrefixDirectoryLease&) = delete;
+    void retain() const {
+        std::lock_guard lock(owner_->mutex);
+        if (!retained_) {
+            ++owner_->retained;
+            retained_ = true;
+            owner_->changed.notify_all();
+        }
+    }
+
+private:
+    std::shared_ptr<PrefixDirectoryCoordinator> owner_;
+    mutable bool retained_ = false;
+    bool writer_ = false;
+};
+
+std::shared_ptr<const void> acquire_directory_read(
+        const std::shared_ptr<PrefixDirectoryCoordinator>& coordinator) {
+    std::unique_lock lock(coordinator->mutex);
+    coordinator->changed.wait(lock, [&] { return !coordinator->reclaiming; });
+    auto lease = std::make_shared<PrefixDirectoryLease>(coordinator, false, false);
+    ++coordinator->active;
+    return std::static_pointer_cast<const void>(
+        std::move(lease));
+}
+
+std::shared_ptr<const void> try_acquire_directory_read(
+        const std::shared_ptr<PrefixDirectoryCoordinator>& coordinator) {
+    std::lock_guard lock(coordinator->mutex);
+    if (coordinator->reclaiming) return {};
+    auto lease = std::make_shared<PrefixDirectoryLease>(coordinator, false, false);
+    ++coordinator->active;
+    return std::static_pointer_cast<const void>(
+        std::move(lease));
+}
+
+void retain_directory_file_read(const std::shared_ptr<const void>& lease) {
+    std::static_pointer_cast<const PrefixDirectoryLease>(lease)->retain();
+}
+
+std::shared_ptr<const void> acquire_directory_write(
+        const std::shared_ptr<PrefixDirectoryCoordinator>& coordinator) {
+    std::unique_lock lock(coordinator->mutex);
+    coordinator->changed.wait(lock, [&] { return !coordinator->reclaiming; });
+    coordinator->reclaiming = true;
+    coordinator->changed.wait(lock, [&] {
+        return coordinator->active == coordinator->retained;
+    });
+    if (coordinator->retained) {
+        coordinator->reclaiming = false;
+        coordinator->changed.notify_all();
+        throw std::system_error(std::make_error_code(std::errc::device_or_resource_busy),
+            "prefix cache has active file readers");
+    }
+    try {
+        auto lease = std::make_shared<PrefixDirectoryLease>(coordinator, false, true);
+        ++coordinator->active;
+        return std::static_pointer_cast<const void>(std::move(lease));
+    } catch (...) {
+        coordinator->reclaiming = false;
+        coordinator->changed.notify_all();
+        throw;
+    }
+}
+
+std::vector<std::shared_ptr<PrefixDirectoryRegistration>> directory_owners(
+        const std::shared_ptr<PrefixDirectoryCoordinator>& coordinator) {
+    std::vector<std::shared_ptr<PrefixDirectoryRegistration>> result;
+    std::lock_guard lock(coordinator->mutex);
+    result.reserve(coordinator->owners.size());
+    for (auto owner = coordinator->owners.begin(); owner != coordinator->owners.end();) {
+        auto registration = owner->lock();
+        if (!registration) {
+            owner = coordinator->owners.erase(owner);
+            continue;
+        }
+        if (registration->active) {
+            ++registration->calls;
+            result.push_back(std::move(registration));
+        }
+        ++owner;
+    }
+    return result;
+}
+
+void finish_directory_owner_calls(
+        const std::shared_ptr<PrefixDirectoryCoordinator>& coordinator,
+        const std::vector<std::shared_ptr<PrefixDirectoryRegistration>>& owners) {
+    std::lock_guard lock(coordinator->mutex);
+    for (const auto& owner : owners) {
+        if (owner->calls) --owner->calls;
+    }
+    coordinator->changed.notify_all();
+}
+
+void unregister_directory_owner(
+        const std::shared_ptr<PrefixDirectoryCoordinator>& coordinator,
+        const std::shared_ptr<PrefixDirectoryRegistration>& registration) {
+    std::unique_lock lock(coordinator->mutex);
+    registration->active = false;
+    coordinator->changed.wait(lock, [&] { return registration->calls == 0; });
+    coordinator->owners.erase(std::remove_if(coordinator->owners.begin(), coordinator->owners.end(),
+        [&](const auto& owner) {
+            auto found = owner.lock();
+            return !found || found == registration;
+        }), coordinator->owners.end());
+}
+
+struct RawPrefixHeader {
+    BlockHash compatibility{}, hash{}, parent{}, payload_hash{};
+    std::uint32_t block_size = 0, token_count = 0;
+    std::uint64_t payload_bytes = 0;
+};
+
+bool read_raw_header(std::istream& input, RawPrefixHeader& header) {
+    std::array<std::uint8_t, 8> magic{};
+    input.read(reinterpret_cast<char*>(magic.data()), static_cast<std::streamsize>(magic.size()));
+    std::uint32_t version = 0;
+    if (!input || magic != kMagic || !read_little_endian(input, version) || version != kFormatVersion)
+        return false;
+    input.read(reinterpret_cast<char*>(header.compatibility.data()), 32);
+    input.read(reinterpret_cast<char*>(header.hash.data()), 32);
+    input.read(reinterpret_cast<char*>(header.parent.data()), 32);
+    if (!input || !read_little_endian(input, header.block_size) ||
+        !read_little_endian(input, header.token_count) || !read_little_endian(input, header.payload_bytes))
+        return false;
+    input.read(reinterpret_cast<char*>(header.payload_hash.data()), 32);
+    return static_cast<bool>(input);
+}
+
+constexpr std::size_t kTextHeaderBytes = 108;
+
+bool hex_digest(std::string_view value) {
+    return value.size() == 64 && std::all_of(value.begin(), value.end(),
+        [](unsigned char c) { return std::isxdigit(c) != 0; });
+}
+
+struct RawTextRecord {
+    std::vector<std::int64_t> tokens;
+    std::uintmax_t bytes = 0;
+    bool valid = false;
+};
+
+RawTextRecord read_text_record(const std::filesystem::path& block,
+        std::string_view space, std::string_view digest, bool include_tokens) {
+    RawTextRecord result;
+    auto side = block;
+    side += ".tokens";
+    std::ifstream input(side, std::ios::binary);
+    if (!input) return result;
+    std::string header(kTextHeaderBytes, '\0');
+    input.read(header.data(), static_cast<std::streamsize>(header.size()));
+    if (static_cast<std::size_t>(input.gcount()) != header.size()) return result;
+    std::error_code error;
+    const auto total = std::filesystem::file_size(side, error);
+    if (error || total < kTextHeaderBytes || total > (64u << 20) ||
+        std::memcmp(header.data(), "MFQTXT1\0", 8) != 0 ||
+        hex(reinterpret_cast<const std::uint8_t*>(header.data()) + 8, 32) != space ||
+        hex(reinterpret_cast<const std::uint8_t*>(header.data()) + 40, 32) != digest)
+        return result;
+    std::uint32_t count = 0;
+    std::memcpy(&count, header.data() + 72, sizeof(count));
+    if (!count || count > 65536 || total != kTextHeaderBytes + std::uintmax_t(count) * 8)
+        return result;
+    result.bytes = total;
+    result.valid = true;
+    if (!include_tokens) return result;
+    std::string payload(std::size_t(count) * 8, '\0');
+    input.read(payload.data(), static_cast<std::streamsize>(payload.size()));
+    if (static_cast<std::size_t>(input.gcount()) != payload.size()) {
+        result.tokens.clear();
+        return result;
+    }
+    const auto checksum = sha256(payload.data(), payload.size());
+    if (std::memcmp(checksum.data(), header.data() + 76, 32) != 0) {
+        result.tokens.clear();
+        return result;
+    }
+    result.tokens.resize(count);
+    for (std::uint32_t index = 0; index < count; ++index) {
+        std::uint64_t value = 0;
+        std::memcpy(&value, payload.data() + std::size_t(index) * 8, sizeof(value));
+        if (value > 0xffffffffull) {
+            result.tokens.clear();
+            return result;
+        }
+        result.tokens[index] = static_cast<std::int64_t>(value);
+    }
+    return result;
+}
+
+PrefixIdentity read_identity(const std::filesystem::path& directory,
+        std::string_view space) {
+    PrefixIdentity result;
+    if (!hex_digest(space)) return result;
+    std::ifstream input(directory / std::string(space) / "identity.txt", std::ios::binary);
+    if (!input) return result;
+    const std::string text((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    if (text.size() > 32768) return result;
+    std::istringstream lines(text);
+    std::string line;
+    if (!std::getline(lines, line) || line != "mfq-cache-identity-v1") return result;
+    if (!std::getline(lines, line) || line != "namespace=" + std::string(space)) return result;
+    while (std::getline(lines, line)) {
+        const auto split = line.find('=');
+        if (split == std::string::npos) continue;
+        const auto key = line.substr(0, split), value = line.substr(split + 1);
+        if (key == "codec" || key == "architecture") {
+            auto* target = key == "codec" ? &result.codec : &result.architecture;
+            *target = value.substr(0, 256);
+        } else if (key == "context" && !value.empty() &&
+                   std::all_of(value.begin(), value.end(), [](unsigned char c) { return std::isdigit(c) != 0; })) {
+            try { result.context_size = std::stoll(value); } catch (const std::exception&) {}
+        } else if (key == "model_path") {
+            result.model_path = value;
+        } else if ((key == "shard" || key == "source") && value.rfind("0:", 0) == 0) {
+            const auto last = value.rfind(':');
+            const auto name = value.substr(2, last == std::string::npos ? std::string::npos : last - 2);
+            const auto separator = name.rfind(':');
+            result.model_name = name.substr(0, separator == std::string::npos ? std::string::npos : separator);
+        }
+    }
+    return result;
+}
+
+struct ScannedPrefixBlock {
+    PrefixBlockInfo info;
+    std::filesystem::path path;
+    RawPrefixHeader header;
+    std::vector<std::int64_t> text_tokens;
+};
+
+std::optional<ScannedPrefixBlock> inspect_block(const std::filesystem::path& path,
+        std::string_view space, std::string_view bucket, bool include_tokens) {
+    const auto extension = path.extension();
+    if (extension != ".tqkv" && extension != ".mfqkv") return {};
+    std::error_code error;
+    if (!std::filesystem::is_regular_file(std::filesystem::symlink_status(path, error)) || error)
+        return {};
+    std::ifstream input(path, std::ios::binary);
+    RawPrefixHeader header;
+    if (!input || !read_raw_header(input, header)) return {};
+    const auto total = std::filesystem::file_size(path, error);
+    const auto digest = block_hash_hex(header.hash);
+    if (error || block_hash_hex(header.compatibility) != space || path.stem().string() != digest ||
+        bucket != digest.substr(0, 2) || !header.block_size || header.block_size > 65536 ||
+        !header.token_count || header.token_count > header.block_size ||
+        header.payload_bytes > std::numeric_limits<std::uintmax_t>::max() - kHeaderBytes ||
+        total != kHeaderBytes + header.payload_bytes) return {};
+    ScannedPrefixBlock result;
+    result.path = path;
+    result.header = header;
+    auto& info = result.info;
+    info.space = space;
+    info.digest = digest;
+    info.parent = block_hash_hex(header.parent);
+    info.tokens = header.token_count;
+    info.block_size = header.block_size;
+    info.payload = header.payload_bytes;
+    info.bytes = total;
+    info.modified = file_seconds(path, error);
+    auto text = read_text_record(path, space, digest, include_tokens);
+    info.text_saved = text.valid;
+    info.text_bytes = text.bytes;
+    result.text_tokens = std::move(text.tokens);
+    return result;
+}
+
+std::vector<ScannedPrefixBlock> scan_directory(const std::filesystem::path& directory) {
+    std::vector<ScannedPrefixBlock> result;
+    std::error_code ignored;
+    if (!std::filesystem::is_directory(directory, ignored)) {
+        if (ignored && ignored != std::errc::no_such_file_or_directory)
+            throw std::filesystem::filesystem_error("inspect prefix cache directory", directory, ignored);
+        return result;
+    }
+    for (const auto& space : std::filesystem::directory_iterator(directory)) {
+        const auto namespace_name = space.path().filename().string();
+        if (!hex_digest(namespace_name) || space.is_symlink() || !space.is_directory()) continue;
+        for (const auto& bucket : std::filesystem::directory_iterator(space.path())) {
+            const auto bucket_name = bucket.path().filename().string();
+            if (bucket_name.size() != 2 || !std::all_of(bucket_name.begin(), bucket_name.end(),
+                    [](unsigned char c) { return std::isxdigit(c) != 0; }) ||
+                bucket.is_symlink() || !bucket.is_directory()) continue;
+            for (const auto& entry : std::filesystem::directory_iterator(bucket.path())) {
+                if (auto block = inspect_block(entry.path(), namespace_name, bucket_name, false))
+                    result.push_back(std::move(*block));
+            }
+        }
+    }
+    return result;
+}
+
 } // namespace
 
 BlockHash sha256(const void* data, std::size_t size) {
@@ -480,17 +852,10 @@ private:
         std::uint64_t epoch = 0;
         bool replace_existing = false;
         std::vector<std::int64_t> tokens;
+        std::shared_ptr<const void> directory_lease;
     };
 
-    struct ParsedHeader {
-        BlockHash compatibility{};
-        BlockHash hash{};
-        BlockHash parent{};
-        std::uint32_t block_size = 0;
-        std::uint32_t token_count = 0;
-        std::uint64_t payload_bytes = 0;
-        BlockHash payload_hash{};
-    };
+    using ParsedHeader = RawPrefixHeader;
 
     enum class LoadSource {
         Hot,
@@ -526,6 +891,8 @@ public:
         if (config_.max_parallel_reads == 0) {
             config_.max_parallel_reads = 1;
         }
+        directory_ = directory_coordinator(config_.cache_dir);
+        const auto scan_lease = acquire_directory_read(directory_);
         namespace_dir_ = config_.cache_dir /
             block_hash_hex(compatibility_hash_);
         std::error_code error;
@@ -541,13 +908,22 @@ public:
             std::filesystem::perm_options::replace,
             error);
         scan();
-        if (config_.max_disk_bytes > 0) write_identity();
+        if (config_.max_disk_bytes > 0) write_identity(scan_lease);
+        registration_ = std::make_shared<PrefixDirectoryRegistration>();
+        registration_->publish = [this](const std::optional<std::string>& space) {
+            publish_reclaim(space);
+        };
+        {
+            std::lock_guard lock(directory_->mutex);
+            directory_->owners.push_back(registration_);
+        }
         worker_ = std::thread([this] { writer_loop(); });
     }
 
     ~Implementation() {
         if (config_.spill_hot_on_eviction) trim_hot(0);
         flush();
+        if (registration_) unregister_directory_owner(directory_, registration_);
         {
             std::lock_guard<std::mutex> lock(mutex_);
             stopping_ = true;
@@ -568,6 +944,7 @@ public:
         const BlockHash& hash,
         const BlockHash& parent,
         std::size_t token_count) {
+        const auto directory_lease = acquire_directory_read(directory_);
         std::lock_guard<std::mutex> lock(mutex_);
         auto disk = disk_.find(hash);
         if (disk != disk_.end() &&
@@ -608,6 +985,7 @@ public:
             token_count > config_.block_size_tokens) {
             throw std::invalid_argument("invalid paged prefix token block");
         }
+        auto directory_lease = acquire_directory_read(directory_);
         bool write_inline = false;
         std::uint64_t write_epoch = 0;
         const auto payload_bytes = static_cast<std::uint64_t>(
@@ -632,11 +1010,11 @@ public:
                 }
                 deferred_[hash] = WriteRequest{hash, parent, static_cast<std::uint32_t>(token_count),
                     payload, cache_epoch_, replace_existing,
-                    std::vector<std::int64_t>(token_ids, token_ids + token_count)};
-                put_hot_locked(hash, std::move(payload));
+                    std::vector<std::int64_t>(token_ids, token_ids + token_count), {}};
+                put_hot_locked(hash, std::move(payload), directory_lease);
                 remember_tail_locked(hash, parent, token_count);
                 prune_tail_cleanup_locked();
-                trim_for_ram_pressure_locked();
+                trim_for_ram_pressure_locked(directory_lease);
                 const bool drain = pending_write_bytes_ > config_.max_pending_bytes ||
                     writes_.size() >= config_.max_pending_writes;
                 lock.unlock();
@@ -649,7 +1027,7 @@ public:
                     ++metrics_.deduplicated_writes;
                     return hash;
                 }
-                put_hot_locked(hash, std::move(payload));
+                put_hot_locked(hash, std::move(payload), directory_lease);
                 if (hot_.count(hash) != 0) remember_tail_locked(hash, parent, token_count);
                 prune_tail_cleanup_locked();
                 sync_metrics_locked();
@@ -670,7 +1048,7 @@ public:
                 ? std::numeric_limits<std::uint64_t>::max()
                 : pending_payloads + pending_headers;
             enforce_disk_budget_locked(reserved_bytes);
-            put_hot_locked(hash, payload);
+            put_hot_locked(hash, payload, directory_lease);
             write_epoch = cache_epoch_;
             const bool pending_bytes_full =
                 config_.max_pending_bytes == 0 ||
@@ -690,6 +1068,7 @@ public:
                     write_epoch,
                     replace_existing,
                     std::vector<std::int64_t>(token_ids, token_ids + token_count),
+                    std::move(directory_lease),
                 });
                 pending_[hash] = writes_.back().payload;
             }
@@ -707,6 +1086,7 @@ public:
                 write_epoch,
                 replace_existing,
                 std::vector<std::int64_t>(token_ids, token_ids + token_count),
+                std::move(directory_lease),
             };
             bool success = false;
             try {
@@ -733,6 +1113,7 @@ public:
     }
 
     std::shared_ptr<const PagedPrefixReadLease> borrow(const BlockHash& hash) {
+        const auto operation_lease = acquire_directory_read(directory_);
         std::shared_ptr<PrefixFileLease> file;
         std::shared_ptr<ReadLeaseMemo> memo;
         std::filesystem::file_time_type stamp{};
@@ -755,7 +1136,10 @@ public:
                 found->second.reader=std::make_shared<ReadLeaseMemo>();found->second.reader->stamp=stamp;
             }
             memo=found->second.reader;
-            try {file=std::make_shared<PrefixFileLease>(found->second.path);}catch(...){return {};}
+            try {
+                retain_directory_file_read(operation_lease);
+                file=std::make_shared<PrefixFileLease>(found->second.path, operation_lease);
+            } catch(...) {return {};}
             found->second.last_used=++clock_;
         }
         try {
@@ -831,6 +1215,7 @@ public:
 
     std::vector<PagedPrefixPayload> load_prefix(
         const std::vector<BlockHash>& hashes) {
+        const auto directory_lease = acquire_directory_read(directory_);
         std::vector<LoadRequest> requests;
         requests.reserve(hashes.size());
         std::uint64_t load_epoch = 0;
@@ -957,7 +1342,7 @@ public:
                     request.payload =
                         std::make_shared<const std::vector<std::uint8_t>>(
                             std::move(*cold_payloads[index]));
-                    put_hot_locked(request.hash, request.payload);
+                    put_hot_locked(request.hash, request.payload, directory_lease);
                     const auto found = disk_.find(request.hash);
                     if (found != disk_.end()) {
                         found->second.last_used = ++clock_;
@@ -992,6 +1377,7 @@ public:
     }
 
     bool invalidate(const BlockHash& hash) {
+        const auto directory_lease = acquire_directory_read(directory_);
         std::unique_lock<std::mutex> lock(mutex_);
         writes_finished_.wait(lock, [this, &hash] {
             return pending_.count(hash) == 0;
@@ -1009,6 +1395,7 @@ public:
     }
 
     void unpin(const std::vector<BlockHash>& blocks) {
+        const auto directory_lease = acquire_directory_read(directory_);
         std::lock_guard<std::mutex> lock(mutex_);
         for (const auto& block : blocks) {
             auto pinned = pins_.find(block);
@@ -1039,8 +1426,9 @@ public:
     }
 
     std::uint64_t trim_hot(std::uint64_t target_bytes) {
+        const auto directory_lease = acquire_directory_read(directory_);
         std::unique_lock<std::mutex> lock(mutex_);
-        const auto released = trim_hot_locked(target_bytes);
+        const auto released = trim_hot_locked(target_bytes, directory_lease);
         sync_metrics_locked();
         lock.unlock();
         if (config_.spill_hot_on_eviction) flush();
@@ -1048,10 +1436,11 @@ public:
     }
 
     std::uint64_t set_hot_limit(std::uint64_t max_bytes) {
+        const auto directory_lease = acquire_directory_read(directory_);
         std::unique_lock<std::mutex> lock(mutex_);
         config_.max_hot_bytes = max_bytes;
         metrics_.hot_pressure_bytes = 0;
-        const auto released = trim_hot_locked(max_bytes);
+        const auto released = trim_hot_locked(max_bytes, directory_lease);
         sync_metrics_locked();
         lock.unlock();
         if (config_.spill_hot_on_eviction) flush();
@@ -1066,16 +1455,19 @@ public:
     }
 
     std::uint64_t set_disk_limit(std::uint64_t max_bytes) {
+        auto directory_lease = acquire_directory_read(directory_);
         std::lock_guard<std::mutex> lock(mutex_);
         if (config_.max_disk_bytes == max_bytes) return 0;
         disk_identity_pending_ |= config_.max_disk_bytes == 0 && max_bytes > 0;
         config_.max_disk_bytes = max_bytes;
         disk_budget_pending_ = true;
+        disk_budget_lease_ = std::move(directory_lease);
         work_available_.notify_one();
         return 0;
     }
 
     std::size_t refresh_disk_index() {
+        const auto directory_lease = acquire_directory_read(directory_);
         std::unique_lock<std::mutex> lock(mutex_);
         writes_finished_.wait(lock, [this] { return writes_.empty() && active_writes_ == 0; });
         std::size_t removed = 0;
@@ -1099,6 +1491,7 @@ public:
     }
 
     std::size_t clear() {
+        const auto directory_lease = acquire_directory_write(directory_);
         std::unique_lock<std::mutex> lock(mutex_);
         writes_finished_.wait(lock, [this] { return !clearing_; });
         clearing_ = true;
@@ -1106,6 +1499,7 @@ public:
         writes_.clear();
         pending_.clear();
         pending_write_bytes_ = 0;
+        sync_metrics_locked();
         std::size_t removed = 0;
         for (const auto& [hash, entry] : disk_) {
             (void)hash;
@@ -1124,12 +1518,17 @@ public:
         disk_bytes_ = 0;
         hot_bytes_ = 0;
         sync_metrics_locked();
-        writes_finished_.wait(lock, [this] {
-            return active_writes_ == 0;
-        });
         clearing_ = false;
         lock.unlock();
         writes_finished_.notify_all();
+        const auto owners = directory_owners(directory_);
+        std::exception_ptr failure;
+        for (const auto& owner : owners) {
+            try { owner->publish(block_hash_hex(compatibility_hash_)); }
+            catch (...) { if (!failure) failure = std::current_exception(); }
+        }
+        finish_directory_owner_calls(directory_, owners);
+        if (failure) std::rethrow_exception(failure);
         return removed;
     }
 
@@ -1197,27 +1596,8 @@ private:
     bool read_header(
         std::istream& input,
         ParsedHeader& header) const {
-        std::array<std::uint8_t, 8> magic{};
-        input.read(
-            reinterpret_cast<char*>(magic.data()),
-            static_cast<std::streamsize>(magic.size()));
-        std::uint32_t version = 0;
-        if (!input || magic != kMagic ||
-            !read_little_endian(input, version) ||
-            version != kFormatVersion) {
-            return false;
-        }
-        input.read(
-            reinterpret_cast<char*>(header.compatibility.data()), 32);
-        input.read(reinterpret_cast<char*>(header.hash.data()), 32);
-        input.read(reinterpret_cast<char*>(header.parent.data()), 32);
-        if (!input || !read_little_endian(input, header.block_size) ||
-            !read_little_endian(input, header.token_count) ||
-            !read_little_endian(input, header.payload_bytes)) {
-            return false;
-        }
-        input.read(reinterpret_cast<char*>(header.payload_hash.data()), 32);
-        return input && header.compatibility == compatibility_hash_ &&
+        return read_raw_header(input, header) &&
+            header.compatibility == compatibility_hash_ &&
             header.block_size == config_.block_size_tokens &&
             header.token_count > 0 &&
             header.token_count <= header.block_size &&
@@ -1367,7 +1747,7 @@ private:
         return true;
     }
 
-    void write_identity() {
+    void write_identity(std::shared_ptr<const void>) {
         DiskWriteGuard space_guard(namespace_dir_, 32768, config_.min_disk_free_bytes);
         if (!space_guard.allowed()) return;
         const auto target = namespace_dir_ / "identity.txt";
@@ -1447,38 +1827,64 @@ private:
     void writer_loop() {
         while (true) {
             WriteRequest request;
+            std::shared_ptr<const void> maintenance_lease;
             {
                 std::unique_lock<std::mutex> lock(mutex_);
                 work_available_.wait_for(lock, std::chrono::milliseconds(250), [this] {
                     return stopping_ || !writes_.empty() || disk_budget_pending_;
                 });
-                if (!clearing_) trim_for_ram_pressure_locked();
-                if (disk_budget_pending_) {
-                    if (disk_identity_pending_) {
-                        write_identity();
-                        disk_identity_pending_ = false;
-                    }
-                    disk_budget_pending_ = enforce_disk_budget_locked(0, 1);
-                    writes_finished_.notify_all();
-                    continue;
-                }
                 if (stopping_ && writes_.empty()) return;
-                if (writes_.empty()) continue;
-                request = std::move(writes_.front());
-                writes_.pop_front();
-                ++active_writes_;
+                if (!writes_.empty()) {
+                    request = std::move(writes_.front());
+                    writes_.pop_front();
+                    ++active_writes_;
+                } else if (disk_budget_pending_) {
+                    maintenance_lease = disk_budget_lease_;
+                }
             }
-            bool success = false;
-            try {
-                success = write_file(request);
-            } catch (...) {
-                success = false;
+            if (request.payload) {
+                bool success = false;
+                try {
+                    success = write_file(request);
+                } catch (...) {
+                    success = false;
+                }
+                finish_write(request, success);
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    --active_writes_;
+                    writes_finished_.notify_all();
+                }
+                continue;
             }
-            finish_write(request, success);
+
+            // RAM pressure and disk-budget work are unsolicited maintenance.
+            // Do not wait for the directory gate here: an already queued write
+            // owns the only lease that can let reclaim drain to completion.
+            if (!maintenance_lease) maintenance_lease = try_acquire_directory_read(directory_);
+            if (!maintenance_lease) {
+                std::unique_lock<std::mutex> lock(mutex_);
+                work_available_.wait_for(lock, std::chrono::milliseconds(250), [this] {
+                    return stopping_ || !writes_.empty() || !disk_budget_pending_;
+                });
+                continue;
+            }
             {
-                std::lock_guard<std::mutex> lock(mutex_);
-                --active_writes_;
-                writes_finished_.notify_all();
+                std::unique_lock<std::mutex> lock(mutex_);
+                if (!writes_.empty()) continue;
+                if (!clearing_) trim_for_ram_pressure_locked(maintenance_lease);
+                if (disk_budget_pending_) {
+                    const bool write_identity_file = disk_identity_pending_;
+                    lock.unlock();
+                    if (write_identity_file) write_identity(maintenance_lease);
+                    lock.lock();
+                    if (disk_budget_pending_) {
+                        disk_identity_pending_ = false;
+                        disk_budget_pending_ = enforce_disk_budget_locked(0, 1);
+                        if (!disk_budget_pending_) disk_budget_lease_.reset();
+                    }
+                    writes_finished_.notify_all();
+                }
             }
         }
     }
@@ -1508,8 +1914,8 @@ private:
                 error.clear();
                 continue;
             }
-            if (
-                iterator->path().extension() != ".mfqkv") {
+            if (iterator->path().extension() != ".mfqkv" &&
+                iterator->path().extension() != ".tqkv") {
                 continue;
             }
             const auto reject = [&] {
@@ -1525,9 +1931,14 @@ private:
             }
             if (symlink_error) continue;
             ParsedHeader header;
-            if (!read_header(iterator->path(), header) ||
-                iterator->path().lexically_normal() !=
-                    path_for(header.hash).lexically_normal()) {
+            if (!read_header(iterator->path(), header)) {
+                reject();
+                continue;
+            }
+            auto legacy_path = path_for(header.hash);
+            legacy_path.replace_extension(".tqkv");
+            if (iterator->path().lexically_normal() != path_for(header.hash).lexically_normal() &&
+                iterator->path().lexically_normal() != legacy_path.lexically_normal()) {
                 reject();
                 continue;
             }
@@ -1586,7 +1997,8 @@ private:
 
     void put_hot_locked(
         const BlockHash& hash,
-        std::shared_ptr<const std::vector<std::uint8_t>> payload) {
+        std::shared_ptr<const std::vector<std::uint8_t>> payload,
+        const std::shared_ptr<const void>& directory_lease) {
         auto previous = hot_.find(hash);
         if (previous != hot_.end()) {
             hot_bytes_ -= previous->second.payload->size();
@@ -1602,11 +2014,12 @@ private:
         }
         hot_[hash] = HotEntry{std::move(payload), ++clock_};
         hot_bytes_ += hot_[hash].payload->size();
-        trim_hot_locked(config_.max_hot_bytes);
+        trim_hot_locked(config_.max_hot_bytes, directory_lease);
         sync_metrics_locked();
     }
 
-    std::uint64_t trim_hot_locked(std::uint64_t target_bytes) {
+    std::uint64_t trim_hot_locked(std::uint64_t target_bytes,
+            const std::shared_ptr<const void>& directory_lease) {
         const auto before = hot_bytes_;
         while (hot_bytes_ > target_bytes && !hot_.empty()) {
             auto victim = hot_.end();
@@ -1629,7 +2042,13 @@ private:
             const auto hash = victim->first;
             const auto dirty = deferred_.find(hash);
             if (dirty != deferred_.end()) {
-                if (config_.max_disk_bytes > 0) {
+                bool reclaiming = false;
+                {
+                    std::lock_guard lock(directory_->mutex);
+                    reclaiming = directory_->reclaiming;
+                }
+                if (config_.max_disk_bytes > 0 && !reclaiming) {
+                    if (!dirty->second.directory_lease) dirty->second.directory_lease = directory_lease;
                     pending_[hash] = dirty->second.payload;
                     pending_write_bytes_ += dirty->second.payload->size();
                     writes_.push_back(std::move(dirty->second));
@@ -1644,12 +2063,12 @@ private:
     }
 
 
-    void trim_for_ram_pressure_locked() {
+    void trim_for_ram_pressure_locked(const std::shared_ptr<const void>& directory_lease) {
         if (!config_.available_ram_bytes || hot_bytes_ == 0) return;
         const auto available = config_.available_ram_bytes();
         if (available >= config_.min_free_ram_bytes) return;
         const auto shortage = config_.min_free_ram_bytes - available;
-        trim_hot_locked(hot_bytes_ > shortage ? hot_bytes_ - shortage : 0);
+        trim_hot_locked(hot_bytes_ > shortage ? hot_bytes_ - shortage : 0, directory_lease);
         sync_metrics_locked();
     }
 
@@ -1849,9 +2268,43 @@ private:
         metrics_.pending_max_bytes = config_.max_pending_bytes;
     }
 
+    void publish_reclaim(const std::optional<std::string>& space) {
+        const auto namespace_name = block_hash_hex(compatibility_hash_);
+        if (space && *space != namespace_name) return;
+        const auto surviving = scan_directory(config_.cache_dir);
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!pending_.empty() || !writes_.empty() || active_writes_ != 0)
+            throw std::runtime_error("prefix cache index published while writes were active");
+        disk_.clear();
+        disk_bytes_ = 0;
+        hot_.clear();
+        deferred_.clear();
+        hot_bytes_ = 0;
+        disk_budget_pending_ = false;
+        disk_budget_lease_.reset();
+        disk_identity_pending_ = false;
+        tail_cleanup_.clear();
+        pins_.clear();
+        tail_lengths_.clear();
+        tail_metadata_.clear();
+        for (const auto& block : surviving) {
+            const auto& header = block.header;
+            if (header.compatibility != compatibility_hash_ || header.block_size != config_.block_size_tokens)
+                continue;
+            const auto inserted = disk_.emplace(header.hash, DiskEntry{block.path, header.parent,
+                header.token_count, header.payload_bytes, block.info.bytes, ++clock_, 0});
+            if (!inserted.second) continue;
+            disk_bytes_ += block.info.bytes;
+            remember_tail_locked(header.hash, header.parent, header.token_count);
+        }
+        sync_metrics_locked();
+    }
+
     PrefixBlockStoreConfig config_;
     BlockHash compatibility_hash_{};
     std::filesystem::path namespace_dir_;
+    std::shared_ptr<PrefixDirectoryCoordinator> directory_;
+    std::shared_ptr<PrefixDirectoryRegistration> registration_;
     mutable std::mutex mutex_;
     std::condition_variable work_available_;
     std::condition_variable writes_finished_;
@@ -1876,6 +2329,7 @@ private:
     std::size_t active_writes_ = 0;
     bool stopping_ = false;
     bool disk_budget_pending_ = false;
+    std::shared_ptr<const void> disk_budget_lease_;
     bool disk_identity_pending_ = false;
     bool clearing_ = false;
     PrefixBlockStoreMetrics metrics_;
@@ -1887,6 +2341,140 @@ PrefixBlockStore::PrefixBlockStore(PrefixBlockStoreConfig config)
           std::make_unique<Implementation>(std::move(config))) {}
 
 PrefixBlockStore::~PrefixBlockStore() = default;
+
+PrefixInspection PrefixBlockStore::inspect_directory(
+        const std::filesystem::path& directory) {
+    const auto coordinator = directory_coordinator(directory);
+    const auto directory_lease = acquire_directory_read(coordinator);
+    const auto scanned = scan_directory(directory);
+    PrefixInspection result;
+    std::set<std::string> spaces;
+    result.blocks.reserve(scanned.size());
+    for (const auto& block : scanned) {
+        spaces.insert(block.info.space);
+        result.blocks.push_back(block.info);
+    }
+    for (const auto& space : spaces) result.identities.emplace(space, read_identity(directory, space));
+    return result;
+}
+
+PrefixText PrefixBlockStore::read_text_tokens(const std::filesystem::path& directory,
+        std::string_view space, std::string_view block) {
+    const auto coordinator = directory_coordinator(directory);
+    const auto directory_lease = acquire_directory_read(coordinator);
+    PrefixText result;
+    if (!hex_digest(space) || !hex_digest(block)) return result;
+    const auto namespace_dir = directory / std::string(space);
+    const auto bucket = std::string(block.substr(0, 2));
+    const auto bucket_dir = namespace_dir / bucket;
+    for (const auto& parent : {namespace_dir, bucket_dir}) {
+        std::error_code error;
+        if (!std::filesystem::is_directory(std::filesystem::symlink_status(parent, error)) || error)
+            return result;
+    }
+    result.identity = read_identity(directory, space);
+    for (const auto* extension : {".mfqkv", ".tqkv"}) {
+        if (auto item = inspect_block(bucket_dir / (std::string(block) + extension), space, bucket, true)) {
+            if (item->text_tokens.empty()) continue;
+            result.tokens = std::move(item->text_tokens);
+            return result;
+        }
+    }
+    return result;
+}
+
+PrefixReclaim PrefixBlockStore::reclaim_directory(const std::filesystem::path& directory,
+        const std::optional<std::string>& space) {
+    if (space && !hex_digest(*space))
+        throw std::invalid_argument("prefix cache namespace must be a hex digest");
+    const auto coordinator = directory_coordinator(directory);
+    const auto directory_lease = acquire_directory_write(coordinator);
+    const auto scanned = scan_directory(directory);
+    PrefixReclaim result;
+    result.found = !space.has_value();
+    std::set<std::filesystem::path> namespaces;
+    for (const auto& block : scanned) {
+        if (space && block.info.space != *space) continue;
+        result.found = true;
+        namespaces.insert(block.path.parent_path().parent_path());
+        bool failed = false;
+        std::error_code error;
+        const auto bytes = std::filesystem::file_size(block.path, error);
+        if (error) {
+            failed = true;
+        } else if (std::filesystem::remove(block.path, error) && !error) {
+            ++result.removed_blocks;
+            result.released_bytes += bytes;
+        } else {
+            failed = true;
+        }
+        if (block.info.text_saved) {
+            auto side = block.path;
+            side += ".tokens";
+            error.clear();
+            const auto text_bytes = std::filesystem::file_size(side, error);
+            if (error) {
+                failed = true;
+            } else if (std::filesystem::remove(side, error) && !error) {
+                result.released_bytes += text_bytes;
+            } else {
+                failed = true;
+            }
+        }
+        result.failed_blocks += failed;
+    }
+    if (!result.found) return result;
+    std::exception_ptr cleanup_failure;
+    const auto remember_cleanup_failure = [&](const std::error_code& error,
+            const char* operation) {
+        if (error && error != std::errc::directory_not_empty && !cleanup_failure)
+            cleanup_failure = std::make_exception_ptr(std::system_error(error, operation));
+    };
+    for (const auto& namespace_dir : namespaces) {
+        std::error_code error;
+        const auto namespace_status = std::filesystem::symlink_status(namespace_dir, error);
+        remember_cleanup_failure(error, "inspect prefix cache namespace");
+        if (!error && std::filesystem::is_directory(namespace_status)) {
+            std::filesystem::directory_iterator iterator(
+                namespace_dir,
+                std::filesystem::directory_options::skip_permission_denied,
+                error);
+            remember_cleanup_failure(error, "scan prefix cache namespace");
+            const std::filesystem::directory_iterator end;
+            while (!error && iterator != end) {
+                std::error_code entry_error;
+                if (iterator->is_symlink(entry_error)) {
+                    remember_cleanup_failure(entry_error, "inspect prefix cache bucket");
+                } else if (!entry_error && iterator->is_directory(entry_error)) {
+                    const auto name = iterator->path().filename().string();
+                    std::error_code remove_error;
+                    if (name.size() == 2 && std::all_of(name.begin(), name.end(),
+                            [](unsigned char c) { return std::isxdigit(c) != 0; }))
+                        std::filesystem::remove(iterator->path(), remove_error);
+                    remember_cleanup_failure(remove_error, "remove empty prefix cache bucket");
+                } else {
+                    remember_cleanup_failure(entry_error, "inspect prefix cache bucket");
+                }
+                iterator.increment(error);
+                remember_cleanup_failure(error, "scan prefix cache namespace");
+            }
+            error.clear();
+            // This is deliberately a non-recursive remove. identity.txt or
+            // any other non-cache entry keeps the namespace in place.
+            std::filesystem::remove(namespace_dir, error);
+            remember_cleanup_failure(error, "remove empty prefix cache namespace");
+        }
+    }
+    const auto owners = directory_owners(coordinator);
+    std::exception_ptr failure = cleanup_failure;
+    for (const auto& owner : owners) {
+        try { owner->publish(space); }
+        catch (...) { if (!failure) failure = std::current_exception(); }
+    }
+    finish_directory_owner_calls(coordinator, owners);
+    if (failure) std::rethrow_exception(failure);
+    return result;
+}
 
 std::size_t PrefixBlockStore::block_size_tokens() const noexcept {
     return implementation_->block_size_tokens();

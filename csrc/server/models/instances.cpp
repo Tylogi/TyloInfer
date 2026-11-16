@@ -6,6 +6,7 @@
 #include "engine/models/source/model.h"
 
 #include <algorithm>
+#include <system_error>
 
 namespace tyloi::server {
 namespace {
@@ -284,37 +285,53 @@ std::vector<std::shared_ptr<ModelInstance>> ModelInstances::targets(const std::o
 }
 
 std::size_t ModelInstances::cache_control(const std::optional<std::string>& instance_id, const engine::SessionCommand& command) {
+    std::unique_lock operation(operations_, std::try_to_lock);
+    if (!operation.owns_lock()) throw ModelError(ModelError::Kind::conflict, "model_operation_busy", "another model operation is in progress");
     std::size_t released = 0;
-    for (const auto& instance : targets(instance_id)) released += instance->engine_->session(command).count;
+    try {
+        for (const auto& instance : targets(instance_id)) released += instance->engine_->session(command).count;
+    } catch (const std::system_error& error) {
+        if (error.code() == std::make_error_code(std::errc::device_or_resource_busy))
+            throw ModelError(ModelError::Kind::conflict, "runtime_busy",
+                "wait for inference and cache writes to finish before clearing cache");
+        throw;
+    }
     return released;
 }
 
+cache::PrefixReclaim ModelInstances::reclaim_prefix_cache(const std::filesystem::path& directory,
+        const std::optional<std::string>& space) {
+    std::unique_lock operation(operations_, std::try_to_lock);
+    if (!operation.owns_lock()) throw ModelError(ModelError::Kind::conflict, "model_operation_busy", "another model operation is in progress");
+    const auto selected = targets({});
+    std::vector<std::unique_lock<std::mutex>> admissions;
+    admissions.reserve(selected.size());
+    for (const auto& instance : selected) admissions.emplace_back(instance->admission_);
+    for (const auto& instance : selected) {
+        (void)instance->engine_->status();
+        if (instance->engine_->snapshot().requests)
+            throw ModelError(ModelError::Kind::conflict, "runtime_busy",
+                "wait for inference and cache writes to finish before clearing cache");
+    }
+    try {
+        return cache::PrefixBlockStore::reclaim_directory(directory, space);
+    } catch (const std::system_error& error) {
+        if (error.code() == std::make_error_code(std::errc::device_or_resource_busy))
+            throw ModelError(ModelError::Kind::conflict, "runtime_busy",
+                "wait for inference and cache writes to finish before clearing cache");
+        throw;
+    }
+}
+
 std::vector<InstanceInfo> ModelInstances::reload(const std::optional<std::string>& instance_id, std::int64_t context) {
+    std::unique_lock operation(operations_, std::try_to_lock);
+    if (!operation.owns_lock()) throw ModelError(ModelError::Kind::conflict, "model_operation_busy", "another model operation is in progress");
     std::vector<InstanceInfo> reloaded;
     for (const auto& instance : targets(instance_id)) {
         instance->engine_->reload(context);
         reloaded.push_back(instance->snapshot());
     }
     return reloaded;
-}
-
-bool ModelInstances::busy(const std::optional<std::string>& instance_id) const {
-    std::vector<std::shared_ptr<ModelInstance>> selected;
-    {
-        std::lock_guard guard(mutex_);
-        if (instance_id) {
-            const auto found = instances_.find(*instance_id);
-            if (found == instances_.end()) throw ModelError(ModelError::Kind::not_found, "runtime_instance_not_found",
-                "runtime instance was not found: " + *instance_id);
-            selected.push_back(found->second);
-        } else {
-            if (loading_) return true;
-            for (const auto& [id, instance] : instances_) selected.push_back(instance);
-        }
-    }
-    for (const auto& instance : selected)
-        if (instance->engine_->snapshot().requests) return true;
-    return false;
 }
 
 bool ModelInstances::busy_for(const std::string& artifact_id, const std::string& name) const {

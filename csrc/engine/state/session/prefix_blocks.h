@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -21,7 +22,8 @@ using PagedPrefixPayload =
     std::shared_ptr<const std::vector<std::uint8_t>>;
 
 // Retains the existing SSD file, without retaining its full payload in RAM.
-// Byte ranges remain readable after cache eviction, replacement or clear().
+// Byte ranges remain readable after cache eviction or replacement. Directory
+// reclamation reports busy until the last retained file reader is released.
 struct PagedPrefixReadLease {
     std::size_t payload_bytes=0;
     std::function<std::vector<std::uint8_t>(std::size_t,std::size_t)> read_range;
@@ -85,6 +87,35 @@ struct PrefixBlockStoreMetrics {
     std::uint64_t low_disk_space_skips = 0;
 };
 
+struct PrefixIdentity {
+    std::optional<std::string> model_name, source_file, architecture, codec, model_path;
+    std::optional<std::int64_t> context_size;
+};
+
+struct PrefixBlockInfo {
+    std::string space, digest, parent;
+    std::uint32_t tokens = 0, block_size = 0;
+    std::uint64_t payload = 0, bytes = 0, text_bytes = 0;
+    std::int64_t modified = 0;
+    bool text_saved = false;
+};
+
+struct PrefixInspection {
+    std::vector<PrefixBlockInfo> blocks;
+    std::map<std::string, PrefixIdentity> identities;
+};
+
+struct PrefixText {
+    std::vector<std::int64_t> tokens;
+    PrefixIdentity identity;
+};
+
+struct PrefixReclaim {
+    bool found = true;
+    std::size_t removed_blocks = 0, failed_blocks = 0;
+    std::uint64_t released_bytes = 0;
+};
+
 class PrefixBlockStore {
 public:
     explicit PrefixBlockStore(PrefixBlockStoreConfig config);
@@ -92,6 +123,13 @@ public:
 
     PrefixBlockStore(const PrefixBlockStore&) = delete;
     PrefixBlockStore& operator=(const PrefixBlockStore&) = delete;
+
+    static PrefixInspection inspect_directory(
+        const std::filesystem::path& directory);
+    static PrefixText read_text_tokens(const std::filesystem::path& directory,
+        std::string_view space, std::string_view block);
+    static PrefixReclaim reclaim_directory(const std::filesystem::path& directory,
+        const std::optional<std::string>& space = {});
 
     std::size_t block_size_tokens() const noexcept;
     const BlockHash& compatibility_hash() const noexcept;

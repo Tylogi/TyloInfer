@@ -10,9 +10,8 @@ class Storage;
 class ModelCatalog;
 class ModelInstances;
 
-// The engine's on-disk prefix cache (MFQKVB1 blocks, MFQTXT1 token sidecars, identity.txt).
-// The same files the engine writes; this module only inspects, purges and decodes them,
-// mirroring the Python prefix_disk_budget service so Studio sees the same view.
+// Adapter for the engine's on-disk prefix cache. The engine owns inspection,
+// token reads, and reclamation; this module preserves the Server API view.
 class PrefixCache {
 public:
     PrefixCache(Storage& storage, ModelCatalog& catalog, ModelInstances& instances);
