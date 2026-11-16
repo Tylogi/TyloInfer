@@ -223,7 +223,7 @@ void runtime_aliases_put(const Services& services, const httplib::Request& reque
         throw ApiError(400, "invalid_request", "aliases must be an object of strings");
     for (const auto& value : body["aliases"])
         if (!value.is_string()) throw ApiError(400, "invalid_request", "aliases must be an object of strings");
-    set_json(response, {{"aliases", services.instances.set_aliases(body["aliases"].get<ModelInstances::Aliases>())}});
+    set_json(response, {{"aliases", services.instances.set_aliases(body["aliases"].get<EngineInstances::Aliases>())}});
 }
 
 } // namespace tyloi::server

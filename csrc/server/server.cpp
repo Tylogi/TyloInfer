@@ -213,7 +213,7 @@ int run(const Config& config, const std::atomic<bool>& stop_requested, EngineFac
     if (const auto* ca = std::getenv("SSL_CERT_FILE"); ca && *ca) hub_network.ca = fs::u8path(ca);
     Hub hub(data_dir, std::move(hub_network));
     const std::string backend = factory.backend;
-    ModelInstances instances(models, storage, std::move(factory));
+    EngineInstances instances(models, storage, std::move(factory));
     RuntimePolicies policies(storage);
     RuntimeProfiles profiles(storage, models);
     PrefixCache prefix_cache(storage, models, instances);

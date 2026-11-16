@@ -8,13 +8,13 @@
 namespace tyloi::server {
 class Storage;
 class ModelCatalog;
-class ModelInstances;
+class EngineInstances;
 
 // Adapter for the engine's on-disk prefix cache. The engine owns inspection,
 // token reads, and reclamation; this module preserves the Server API view.
 class PrefixCache {
 public:
-    PrefixCache(Storage& storage, ModelCatalog& catalog, ModelInstances& instances);
+    PrefixCache(Storage& storage, ModelCatalog& catalog, EngineInstances& instances);
     std::filesystem::path directory() const;
     // Filters: namespace, offset, limit, query, search_in, text_filter, chain_filter, sort.
     nlohmann::json entries(const nlohmann::json& filters) const;
@@ -25,6 +25,6 @@ public:
 private:
     Storage& storage_;
     ModelCatalog& catalog_;
-    ModelInstances& instances_;
+    EngineInstances& instances_;
 };
 } // namespace tyloi::server

@@ -11,7 +11,7 @@
 namespace tyloi::server {
 namespace {
 struct RequestLifetime {
-    std::shared_ptr<ModelInstance> instance;
+    std::shared_ptr<EngineInstance> instance;
     std::string id;
     std::shared_ptr<engine::Output> outbox;
     ~RequestLifetime() {
@@ -20,28 +20,28 @@ struct RequestLifetime {
 };
 }
 
-ModelInstance::ModelInstance(const ModelCatalog::Artifact& artifact, std::string selected_backend,
+EngineInstance::EngineInstance(const ModelCatalog::Artifact& artifact, std::string selected_backend,
         std::unique_ptr<engine::Engine> loaded)
     : id(normalize_uuid({})), model(artifact.name), artifact_id(artifact.id),
       backend(std::move(selected_backend)), engine_(std::move(loaded)) {
     auto source = tyloi::open_model_source(artifact.path);
     const auto embedded = source->metadata().find("runtime.sampling.v1");
-    const auto profile = resolve_mfq_runtime_profile(path_utf8(artifact.path), std::string(source->architecture()),
+    const auto profile = resolve_mfq_runtime_profile(path_utf8(artifact.path), engine_->info().capabilities.family,
         engine_->info().model_type, model,
         embedded == source->metadata().end() ? std::string() : embedded->second, tyloi::models::config_json(*source));
     sampling_ = default_sampling_params(profile);
 }
 
-InstanceInfo ModelInstance::snapshot() const {
+InstanceInfo EngineInstance::snapshot() const {
     const auto execution = engine_->snapshot();
     const auto state = close_failed_ || !execution.status.healthy ? InstanceInfo::State::failed :
         stopping_ ? InstanceInfo::State::unloading : InstanceInfo::State::loaded;
     return {state, id, model, artifact_id, backend, engine_->info(), execution, policy_};
 }
 
-std::shared_ptr<engine::Output> ModelInstance::submit(engine::EngineRequest request) {
+std::shared_ptr<engine::Output> EngineInstance::submit(engine::EngineRequest request) {
     std::lock_guard guard(admission_);
-    if (!accepting_ || stopping_) throw ModelError(ModelError::Kind::stopping, "model_stopping", "model instance is stopping");
+    if (!accepting_ || stopping_) throw ModelError(ModelError::Kind::stopping, "model_stopping", "engine instance is stopping");
     last_activity_ = engine::Clock::now();
     auto lifetime = std::make_shared<RequestLifetime>();
     lifetime->instance = shared_from_this();
@@ -50,19 +50,19 @@ std::shared_ptr<engine::Output> ModelInstance::submit(engine::EngineRequest requ
     return {lifetime, lifetime->outbox.get()};
 }
 
-bool ModelInstance::cancel(const engine::RequestId& id) {
+bool EngineInstance::cancel(const engine::RequestId& id) {
     std::lock_guard guard(admission_);
     return !stopping_ && engine_->cancel(id);
 }
 
-void ModelInstance::close(bool force) {
+void EngineInstance::close(bool force) {
     {
         std::lock_guard admission(admission_);
         if (!stopping_) {
             // Serialize admission and use a scheduler barrier before observing pending requests.
             (void)engine_->status();
             if (!force && engine_->snapshot().requests)
-                throw ModelError(ModelError::Kind::conflict, "model_busy", "model has active requests; cancel them or use force");
+                throw ModelError(ModelError::Kind::conflict, "model_busy", "engine instance has active requests; cancel them or use force");
             stopping_ = true;
         }
     }
@@ -80,11 +80,11 @@ void LoadControl::checkpoint(Phase phase) const {
     check();
 }
 
-ModelInstances::ModelInstances(ModelCatalog& catalog, Storage& storage, EngineFactory factory)
+EngineInstances::EngineInstances(ModelCatalog& catalog, Storage& storage, EngineFactory factory)
     : catalog_(catalog), storage_(storage), factory_(std::move(factory)), aliases_(read_aliases()) {}
-ModelInstances::~ModelInstances() { try { shutdown(); } catch (...) {} }
+EngineInstances::~EngineInstances() { try { shutdown(); } catch (...) {} }
 
-ModelInstances::Support ModelInstances::support(const ModelCatalog::Artifact& artifact) const {
+EngineInstances::Support EngineInstances::support(const ModelCatalog::Artifact& artifact) const {
     if (!artifact.complete) return {false, artifact.error};
     if (!factory_.load) return {false, "this server has no model execution backend"};
     try {
@@ -98,12 +98,12 @@ ModelInstances::Support ModelInstances::support(const ModelCatalog::Artifact& ar
     } catch (const std::exception&) { return {false, "execution support could not be determined"}; }
 }
 
-InstanceInfo ModelInstances::load(const std::string& model, LoadOptions options, const LoadControl& control, LoadPolicy policy) {
+InstanceInfo EngineInstances::load(const std::string& model, LoadOptions options, const LoadControl& control, LoadPolicy policy) {
     control.checkpoint(LoadControl::Phase::resolving);
     return open(catalog_.resolve(model), options, control, policy, false, {})->snapshot();
 }
 
-std::shared_ptr<ModelInstance> ModelInstances::acquire(const std::string& model, const std::function<bool()>& cancelled) {
+std::shared_ptr<EngineInstance> EngineInstances::acquire(const std::string& model, const std::function<bool()>& cancelled) {
     if (stopping_) throw ModelError(ModelError::Kind::stopping, "server_stopping", "server is stopping");
     if (cancelled && cancelled()) throw ModelError(ModelError::Kind::cancelled, "request_cancelled", "model acquisition was cancelled");
     try { return get(model); }
@@ -116,18 +116,18 @@ std::shared_ptr<ModelInstance> ModelInstances::acquire(const std::string& model,
     return open(catalog_.resolve(source), {}, {}, {}, true, cancelled);
 }
 
-std::shared_ptr<ModelInstance> ModelInstances::open(const ModelCatalog::Artifact& artifact, LoadOptions options,
+std::shared_ptr<EngineInstance> EngineInstances::open(const ModelCatalog::Artifact& artifact, LoadOptions options,
         const LoadControl& control, LoadPolicy policy, bool reuse, const std::function<bool()>& cancelled) {
     if (cancelled && cancelled()) throw ModelError(ModelError::Kind::cancelled, "request_cancelled", "model acquisition was cancelled");
-    std::shared_future<std::shared_ptr<ModelInstance>> pending;
-    std::optional<std::promise<std::shared_ptr<ModelInstance>>> promise;
+    std::shared_future<std::shared_ptr<EngineInstance>> pending;
+    std::optional<std::promise<std::shared_ptr<EngineInstance>>> promise;
     std::unique_lock operation(operations_, std::defer_lock);
     {
         std::lock_guard guard(mutex_);
         if (stopping_) throw ModelError(ModelError::Kind::stopping, "server_stopping", "server is stopping");
         if (reuse) {
             for (const auto& [id, instance] : instances_) if (instance->artifact_id == artifact.id) {
-                if (instance->stopping_) throw ModelError(ModelError::Kind::stopping, "model_stopping", "model instance is stopping");
+                if (instance->stopping_) throw ModelError(ModelError::Kind::stopping, "model_stopping", "engine instance is stopping");
                 return instance;
             }
             if (loading_ && loading_->id == artifact.id) pending = loading_->result;
@@ -153,7 +153,7 @@ std::shared_ptr<ModelInstance> ModelInstances::open(const ModelCatalog::Artifact
     return pending.get();
 }
 
-std::shared_ptr<ModelInstance> ModelInstances::create(const ModelCatalog::Artifact& artifact, LoadOptions options,
+std::shared_ptr<EngineInstance> EngineInstances::create(const ModelCatalog::Artifact& artifact, LoadOptions options,
         const LoadControl& control, LoadPolicy policy) {
     if (!factory_.load) throw ModelError(ModelError::Kind::unavailable, "backend_unavailable", "this server has no model execution backend");
     const auto supported = support(artifact);
@@ -179,7 +179,7 @@ std::shared_ptr<ModelInstance> ModelInstances::create(const ModelCatalog::Artifa
     control.checkpoint(LoadControl::Phase::loading);
     auto engine = factory_.load(artifact.path, options);
     if (!engine) throw std::runtime_error("engine factory returned no engine");
-    auto instance = std::make_shared<ModelInstance>(artifact, factory_.backend, std::move(engine));
+    auto instance = std::make_shared<EngineInstance>(artifact, factory_.backend, std::move(engine));
     instance->policy_ = policy;
     // shortcut: the inference policy only lowers the instance default; a request that names
     // enable_mtp explicitly still wins, until per-request policy application lands with the runtime work package.
@@ -208,31 +208,31 @@ std::shared_ptr<ModelInstance> ModelInstances::create(const ModelCatalog::Artifa
     }
 }
 
-std::shared_ptr<ModelInstance> ModelInstances::get(const std::string& model) const {
+std::shared_ptr<EngineInstance> EngineInstances::get(const std::string& model) const {
     std::lock_guard guard(mutex_);
-    const auto require_running = [&](const std::shared_ptr<ModelInstance>& instance) {
+    const auto require_loaded = [&](const std::shared_ptr<EngineInstance>& instance) {
         if (instance->stopping_)
-            throw ModelError(ModelError::Kind::stopping, "model_stopping", "model instance is stopping");
+            throw ModelError(ModelError::Kind::stopping, "model_stopping", "engine instance is stopping");
         return instance;
     };
-    if (const auto found = instances_.find(model); found != instances_.end()) return require_running(found->second);
+    if (const auto found = instances_.find(model); found != instances_.end()) return require_loaded(found->second);
     for (const auto& [id, instance] : instances_)
-        if (instance->artifact_id == model) return require_running(instance);
-    std::shared_ptr<ModelInstance> named;
+        if (instance->artifact_id == model) return require_loaded(instance);
+    std::shared_ptr<EngineInstance> named;
     for (const auto& [id, instance] : instances_) {
         const auto alias = aliases_.find(instance->model);
         if (instance->model != model && (alias == aliases_.end() || alias->second != model)) continue;
         if (named) throw ModelError(ModelError::Kind::conflict, "ambiguous_model", "model name selects more than one instance; use an instance ID");
         named = instance;
     }
-    if (named) return require_running(named);
+    if (named) return require_loaded(named);
     throw ModelError(ModelError::Kind::not_found, "model_not_loaded", "model has no loaded instance");
 }
 
-void ModelInstances::unload(const std::string& instance_id, bool force) {
+void EngineInstances::unload(const std::string& instance_id, bool force) {
     std::unique_lock operation(operations_, std::try_to_lock);
     if (!operation.owns_lock()) throw ModelError(ModelError::Kind::conflict, "model_operation_busy", "another model operation is in progress");
-    std::shared_ptr<ModelInstance> instance;
+    std::shared_ptr<EngineInstance> instance;
     {
         std::lock_guard guard(mutex_);
         const auto found = instances_.find(instance_id);
@@ -244,7 +244,7 @@ void ModelInstances::unload(const std::string& instance_id, bool force) {
     { std::lock_guard guard(mutex_); instances_.erase(instance_id); }
 }
 
-InstanceInfo ModelInstance::apply_policy(std::optional<bool> pin,
+InstanceInfo EngineInstance::apply_policy(std::optional<bool> pin,
         std::optional<std::optional<std::chrono::seconds>> idle_ttl) {
     std::lock_guard guard(admission_);
     const bool pinned = pin.value_or(policy_.pin);
@@ -256,9 +256,9 @@ InstanceInfo ModelInstance::apply_policy(std::optional<bool> pin,
     return snapshot();
 }
 
-InstanceInfo ModelInstances::update_policy(const std::string& instance_id, std::optional<bool> pin,
+InstanceInfo EngineInstances::update_policy(const std::string& instance_id, std::optional<bool> pin,
         std::optional<std::optional<std::chrono::seconds>> idle_ttl) {
-    std::shared_ptr<ModelInstance> instance;
+    std::shared_ptr<EngineInstance> instance;
     {
         std::lock_guard guard(mutex_);
         const auto found = instances_.find(instance_id);
@@ -269,8 +269,8 @@ InstanceInfo ModelInstances::update_policy(const std::string& instance_id, std::
     return instance->apply_policy(pin, idle_ttl);
 }
 
-std::vector<std::shared_ptr<ModelInstance>> ModelInstances::targets(const std::optional<std::string>& instance_id) {
-    std::vector<std::shared_ptr<ModelInstance>> selected;
+std::vector<std::shared_ptr<EngineInstance>> EngineInstances::targets(const std::optional<std::string>& instance_id) {
+    std::vector<std::shared_ptr<EngineInstance>> selected;
     std::lock_guard guard(mutex_);
     if (stopping_) throw ModelError(ModelError::Kind::stopping, "server_stopping", "server is stopping");
     if (instance_id) {
@@ -284,7 +284,7 @@ std::vector<std::shared_ptr<ModelInstance>> ModelInstances::targets(const std::o
     return selected;
 }
 
-std::size_t ModelInstances::cache_control(const std::optional<std::string>& instance_id, const engine::SessionCommand& command) {
+std::size_t EngineInstances::cache_control(const std::optional<std::string>& instance_id, const engine::SessionCommand& command) {
     std::unique_lock operation(operations_, std::try_to_lock);
     if (!operation.owns_lock()) throw ModelError(ModelError::Kind::conflict, "model_operation_busy", "another model operation is in progress");
     std::size_t released = 0;
@@ -299,7 +299,7 @@ std::size_t ModelInstances::cache_control(const std::optional<std::string>& inst
     return released;
 }
 
-cache::PrefixReclaim ModelInstances::reclaim_prefix_cache(const std::filesystem::path& directory,
+cache::PrefixReclaim EngineInstances::reclaim_prefix_cache(const std::filesystem::path& directory,
         const std::optional<std::string>& space) {
     std::unique_lock operation(operations_, std::try_to_lock);
     if (!operation.owns_lock()) throw ModelError(ModelError::Kind::conflict, "model_operation_busy", "another model operation is in progress");
@@ -323,7 +323,7 @@ cache::PrefixReclaim ModelInstances::reclaim_prefix_cache(const std::filesystem:
     }
 }
 
-std::vector<InstanceInfo> ModelInstances::reload(const std::optional<std::string>& instance_id, std::int64_t context) {
+std::vector<InstanceInfo> EngineInstances::reload(const std::optional<std::string>& instance_id, std::int64_t context) {
     std::unique_lock operation(operations_, std::try_to_lock);
     if (!operation.owns_lock()) throw ModelError(ModelError::Kind::conflict, "model_operation_busy", "another model operation is in progress");
     std::vector<InstanceInfo> reloaded;
@@ -334,7 +334,7 @@ std::vector<InstanceInfo> ModelInstances::reload(const std::optional<std::string
     return reloaded;
 }
 
-bool ModelInstances::busy_for(const std::string& artifact_id, const std::string& name) const {
+bool EngineInstances::busy_for(const std::string& artifact_id, const std::string& name) const {
     std::lock_guard guard(mutex_);
     if (loading_ && loading_->id == artifact_id) return true;
     for (const auto& [id, instance] : instances_) {
@@ -344,17 +344,17 @@ bool ModelInstances::busy_for(const std::string& artifact_id, const std::string&
     return false;
 }
 
-std::vector<InstanceInfo> ModelInstances::list() const {
-    std::vector<std::shared_ptr<ModelInstance>> instances;
+std::vector<InstanceInfo> EngineInstances::list() const {
+    std::vector<std::shared_ptr<EngineInstance>> instances;
     { std::lock_guard guard(mutex_); for (const auto& [id, instance] : instances_) instances.push_back(instance); }
     std::vector<InstanceInfo> result;
     for (const auto& instance : instances) result.push_back(instance->snapshot());
     return result;
 }
 
-void ModelInstances::request_stop() {
+void EngineInstances::request_stop() {
     stopping_ = true;
-    std::vector<std::shared_ptr<ModelInstance>> instances;
+    std::vector<std::shared_ptr<EngineInstance>> instances;
     { std::lock_guard guard(mutex_); for (const auto& [id, instance] : instances_) instances.push_back(instance); }
     std::exception_ptr failure;
     for (const auto& instance : instances) {
@@ -366,11 +366,11 @@ void ModelInstances::request_stop() {
     if (failure) std::rethrow_exception(failure);
 }
 
-void ModelInstances::shutdown() {
+void EngineInstances::shutdown() {
     std::exception_ptr failure;
     try { request_stop(); } catch (...) { failure = std::current_exception(); }
     std::lock_guard operation(operations_);
-    std::vector<std::shared_ptr<ModelInstance>> instances;
+    std::vector<std::shared_ptr<EngineInstance>> instances;
     { std::lock_guard guard(mutex_); for (const auto& [id, instance] : instances_) instances.push_back(instance); }
     for (const auto& instance : instances) {
         try {
@@ -381,15 +381,15 @@ void ModelInstances::shutdown() {
     if (failure) std::rethrow_exception(failure);
 }
 
-bool ModelInstance::idle_expired(engine::Clock::time_point now) {
+bool EngineInstance::idle_expired(engine::Clock::time_point now) {
     std::lock_guard guard(admission_);
     if (stopping_ || policy_.pin || !policy_.idle_ttl) return false;
     if (engine_->snapshot().requests) { last_activity_ = now; return false; }
     return now - last_activity_ >= *policy_.idle_ttl;
 }
-void ModelInstances::reap_idle() {
+void EngineInstances::reap_idle() {
     if (stopping_) return;
-    std::vector<std::shared_ptr<ModelInstance>> instances;
+    std::vector<std::shared_ptr<EngineInstance>> instances;
     { std::lock_guard guard(mutex_); for (const auto& [id, instance] : instances_) instances.push_back(instance); }
     for (const auto& instance : instances) if (instance->idle_expired(engine::Clock::now())) {
         // Only an actual eviction competes with explicit model operations.

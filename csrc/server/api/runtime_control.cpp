@@ -72,7 +72,7 @@ std::int64_t default_context(const ModelCatalog::Artifact& artifact, const json&
 
 // shortcut: the native engine reloads a context size only; yarn and KV reconfiguration are rejected
 // honestly until the engine grows those seams, and the reload never persists into model_overrides.
-json reload_target(ModelInstances& instances, ModelCatalog& catalog, RuntimePolicies& policies, const json& body) {
+json reload_target(EngineInstances& instances, ModelCatalog& catalog, RuntimePolicies& policies, const json& body) {
     fields(body, "reload");
     reject_unsupported_kv(body);
     std::optional<std::string> instance;

@@ -26,7 +26,7 @@ json directory_json(const ModelCatalog::DirectoryListing& listing) {
         {"can_open_directory", false}, {"can_open_in_finder", false}, {"files", std::move(files)}, {"data", std::move(data)}};
 }
 
-json artifacts(const std::vector<ModelCatalog::Artifact>& entries, const ModelInstances& instances) {
+json artifacts(const std::vector<ModelCatalog::Artifact>& entries, const EngineInstances& instances) {
     auto data = json::array();
     for (const auto& item : entries) {
         const auto support = instances.support(item);
@@ -97,7 +97,7 @@ std::int64_t policy_context_size(const ModelCatalog::Artifact& artifact, const j
 
 // POST /api/models/load and POST /api/runtime/profiles/{id}/load end in this same job; each route
 // resolves its own body into the load arguments.
-std::string submit_model_load(Jobs& jobs, ModelInstances& instances, const std::string& artifact_id,
+std::string submit_model_load(Jobs& jobs, EngineInstances& instances, const std::string& artifact_id,
     const LoadOptions& options, const LoadPolicy& policy, const json& payload) {
     return jobs.submit("model.load", payload, [&jobs, &instances, artifact_id, options, policy](const Jobs::Control& control) {
         const auto progress = [&](LoadControl::Phase phase) {

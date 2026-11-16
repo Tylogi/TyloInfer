@@ -28,17 +28,17 @@ struct InstanceInfo {
     LoadPolicy policy;
 };
 
-class ModelInstance : public std::enable_shared_from_this<ModelInstance> {
+class EngineInstance : public std::enable_shared_from_this<EngineInstance> {
 public:
     const std::string id, model, artifact_id, backend;
-    ModelInstance(const ModelCatalog::Artifact& artifact, std::string backend, std::unique_ptr<engine::Engine> engine);
+    EngineInstance(const ModelCatalog::Artifact& artifact, std::string backend, std::unique_ptr<engine::Engine> engine);
     InstanceInfo snapshot() const;
     const MfqSamplingParams& sampling() const { return sampling_; }
     // The returned native outbox keeps this instance alive and cancels on abandonment.
     std::shared_ptr<engine::Output> submit(engine::EngineRequest request);
     bool cancel(const engine::RequestId& id);
 private:
-    friend class ModelInstances;
+    friend class EngineInstances;
     void close(bool force);
     // A partial policy patch: an absent optional keeps the current value and a set-but-empty idle
     // timeout clears it. The result never combines a pin with an idle timeout.
@@ -61,12 +61,12 @@ struct LoadControl {
     void checkpoint(Phase phase) const;
 };
 
-class ModelInstances {
+class EngineInstances {
 public:
     using Aliases = std::map<std::string, std::string>;
     struct Support { bool supported; std::string reason; };
-    ModelInstances(ModelCatalog& catalog, Storage& storage, EngineFactory factory);
-    ~ModelInstances();
+    EngineInstances(ModelCatalog& catalog, Storage& storage, EngineFactory factory);
+    ~EngineInstances();
     Support support(const ModelCatalog::Artifact& artifact) const;
     InstanceInfo load(const std::string& model, LoadOptions options = {}, const LoadControl& control = {}, LoadPolicy policy = {});
     void unload(const std::string& instance_id, bool force = false);
@@ -84,8 +84,8 @@ public:
     std::vector<InstanceInfo> list() const;
     /** True when a loaded, unloading, or in-flight load selects this artifact or model name. */
     bool busy_for(const std::string& artifact_id, const std::string& name) const;
-    std::shared_ptr<ModelInstance> get(const std::string& model) const;
-    std::shared_ptr<ModelInstance> acquire(const std::string& model, const std::function<bool()>& cancelled = {});
+    std::shared_ptr<EngineInstance> get(const std::string& model) const;
+    std::shared_ptr<EngineInstance> acquire(const std::string& model, const std::function<bool()>& cancelled = {});
     Aliases aliases() const;
     Aliases set_aliases(Aliases values);
     std::vector<std::string> names() const;
@@ -95,12 +95,12 @@ public:
 private:
     struct Load {
         std::string id;
-        std::shared_future<std::shared_ptr<ModelInstance>> result;
+        std::shared_future<std::shared_ptr<EngineInstance>> result;
     };
-    std::vector<std::shared_ptr<ModelInstance>> targets(const std::optional<std::string>& instance_id);
-    std::shared_ptr<ModelInstance> open(const ModelCatalog::Artifact& artifact, LoadOptions options,
+    std::vector<std::shared_ptr<EngineInstance>> targets(const std::optional<std::string>& instance_id);
+    std::shared_ptr<EngineInstance> open(const ModelCatalog::Artifact& artifact, LoadOptions options,
         const LoadControl& control, LoadPolicy policy, bool reuse, const std::function<bool()>& cancelled);
-    std::shared_ptr<ModelInstance> create(const ModelCatalog::Artifact& artifact, LoadOptions options,
+    std::shared_ptr<EngineInstance> create(const ModelCatalog::Artifact& artifact, LoadOptions options,
         const LoadControl& control, LoadPolicy policy);
     Aliases read_aliases();
     ModelCatalog& catalog_;
@@ -108,7 +108,7 @@ private:
     EngineFactory factory_;
     mutable std::mutex mutex_;
     std::mutex operations_;
-    std::map<std::string, std::shared_ptr<ModelInstance>> instances_;
+    std::map<std::string, std::shared_ptr<EngineInstance>> instances_;
     std::optional<Load> loading_;
     Aliases aliases_;
     std::atomic<bool> stopping_{false};

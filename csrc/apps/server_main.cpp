@@ -1,10 +1,10 @@
 #include "server.h"
 #include "instance.h"
 #include "engine/engine.h"
+#include "engine/models/load.h"
 #include "engine/models/source/model.h"
 
 #include "engine/load.h"
-#include "engine/models/source/model_graph.h"
 
 #include <algorithm>
 #include <charconv>
@@ -29,15 +29,13 @@ tyloi::server::EngineFactory native_engine_factory() {
     factory.backend = "metal";
 #endif
     factory.unavailable_reason = [](const tyloi::ModelSource& source) -> std::string {
-        try {
-            const auto backbone = tyloi::models::graph(source).backbone;
-            if (backbone == "qwen3_5" || backbone == "generic_qwen" || backbone == "qwen4_exp") return {};
 #ifdef TYLOINFER_SERVER_CUDA
-            for (const auto* supported : {"glm_dsa", "glm5_next", "deepseek_v4", "gemma4", "deepseek_v41", "nemotron_h", "minicpmo45", "minicpmo_tts"})
-                if (backbone == supported) return {};
+        return tyloi::models::unavailable_reason(
+            source, tyloi::Device(tyloi::DeviceType::cuda, 0));
+#else
+        return tyloi::models::unavailable_reason(
+            source, tyloi::Device(tyloi::DeviceType::metal, 0));
 #endif
-        } catch (const std::exception&) {}
-        return "model graph is unsupported by the selected execution backend";
     };
     factory.load = [](const std::filesystem::path& path, const tyloi::server::LoadOptions& request) {
         tyloi::engine::EngineOptions options;

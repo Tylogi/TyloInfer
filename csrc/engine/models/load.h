@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <string_view>
 #include <unordered_set>
 
@@ -17,6 +18,9 @@ namespace weights { struct Loader; }
 
 namespace models {
 class CausalModel;
+
+/** Return an explanation when the graph has no loader for the requested device. */
+std::string unavailable_reason(const ModelSource& source, Device target);
 
 struct LoadOptions {
     std::int64_t context = 0;

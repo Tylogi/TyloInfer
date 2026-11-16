@@ -32,7 +32,7 @@ public:
         std::unique_ptr<State> state_;
     };
 
-    Sessions(Storage& storage, ModelInstances& models, Media& media);
+    Sessions(Storage& storage, EngineInstances& engines, Media& media);
     ~Sessions();
     Json create(const Json& request);
     Json get(const std::string& id) const;
@@ -55,7 +55,7 @@ public:
     void shutdown();
 private:
     Storage& storage_;
-    ModelInstances& models_;
+    EngineInstances& engines_;
     Media& media_;
     std::mutex mutex_;
     std::map<std::string, std::weak_ptr<Reply>> active_;

@@ -4,9 +4,9 @@
 #include "instance.h"
 
 #include "engine/models/source/model.h"
+#include "engine/models/source/model_graph.h"
 
 #include <algorithm>
-#include <array>
 #include <cmath>
 #include <cstdint>
 #include <map>
@@ -24,15 +24,7 @@ using json = nlohmann::json;
 /** Signals a config the cache model cannot describe; the caller answers with null. */
 struct Unsupported {};
 
-constexpr std::array<const char*, 7> qwen4_kinds{"qwen4_exp", "qwen4_exp_text", "qwen3_5", "qwen3_5_text",
-    "qwen3_5_moe", "qwen3_5_moe_text", "qwen3_next"};
-constexpr std::array<const char*, 7> dense_kinds{"qwen2", "qwen3", "qwen3_moe", "llama", "mistral", "minicpm", "minicpmo"};
-
 bool one_of(const std::string& value, std::initializer_list<const char*> names) {
-    return std::any_of(names.begin(), names.end(), [&](const char* name) { return value == name; });
-}
-
-bool one_of(const std::string& value, const std::array<const char*, 7>& names) {
     return std::any_of(names.begin(), names.end(), [&](const char* name) { return value == name; });
 }
 
@@ -75,12 +67,29 @@ json cache_component(const std::string& group, const std::string& name, std::int
         {"head_dimension", nullptr}, {"kv_heads", nullptr}};
 }
 
-json cache_profile(const json& config, bool include_recurrent, std::int64_t predictor_layers, bool cuda) {
+bool is_qwen4(const tyloi::ModelGraph& graph) {
+    return graph.backbone == "qwen4_exp";
+}
+
+bool is_qwen35(const tyloi::ModelGraph& graph) {
+    return graph.backbone == "qwen3_5";
+}
+
+bool is_deepseek_v4(const tyloi::ModelGraph& graph) {
+    return graph.backbone == "deepseek_v4";
+}
+
+bool is_deepseek_family(const tyloi::ModelGraph& graph) {
+    return graph.backbone == "deepseek_v4" || graph.backbone == "deepseek_v41";
+}
+
+json cache_profile(const json& config, const tyloi::ModelGraph* model_graph,
+        bool include_recurrent, std::int64_t predictor_layers, bool cuda) {
+    if (!model_graph) return nullptr;
     const auto text = text_config(config);
     if (!text.is_object()) return nullptr;
-    std::string kind;
-    if (const auto found = text.find("model_type"); found != text.end() && found->is_string()) kind = found->get<std::string>();
-    else if (const auto found = config.find("model_type"); found != config.end() && found->is_string()) kind = found->get<std::string>();
+    const auto& kind = model_graph->architecture;
+    const bool qwen4 = is_qwen4(*model_graph), qwen35 = is_qwen35(*model_graph);
     const auto maximum = integer(text, "max_position_embeddings");
     const auto layers = integer(text, "num_hidden_layers");
     if (std::min(maximum, layers) <= 0) return nullptr;
@@ -88,7 +97,7 @@ json cache_profile(const json& config, bool include_recurrent, std::int64_t pred
     const auto state = [&](const std::string& group, const std::string& name, std::int64_t count, std::int64_t bytes) {
         if (auto entry = fixed_component(group, name, count, bytes)) fixed.push_back(entry);
     };
-    if (kind == "deepseek_v4") {
+    if (is_deepseek_v4(*model_graph)) {
         const auto dim = integer(text, "head_dim"), index = integer(text, "index_head_dim"), window = integer(text, "sliding_window");
         const auto stored = text.find("compress_ratios");
         if (std::min({dim, index, window}) <= 0 || stored == text.end() || !stored->is_array()
@@ -113,8 +122,7 @@ json cache_profile(const json& config, bool include_recurrent, std::int64_t pred
         }
         for (const auto ratio : ratios)
             if (ratio != 0 && ratio != 4 && ratio != 128) return nullptr;
-    } else if (std::any_of(qwen4_kinds.begin(), qwen4_kinds.end(), [&](const char* name) { return kind == name; })) {
-        const bool qwen4 = kind == "qwen4_exp" || kind == "qwen4_exp_text";
+    } else if (qwen4 || qwen35) {
         json types = json::array();
         if (const auto found = text.find("layer_types"); found != text.end() && found->is_array()) types = *found;
         else {
@@ -188,7 +196,7 @@ json cache_profile(const json& config, bool include_recurrent, std::int64_t pred
                 state("PLE", "convolution_state", count, count * 4 * (kernel - 1) * ngram * hc * hidden);
             }
         }
-    } else if (std::any_of(dense_kinds.begin(), dense_kinds.end(), [&](const char* name) { return kind == name; })) {
+    } else if (one_of(kind, {"qwen2", "qwen3", "qwen3_moe", "llama", "mistral", "minicpm", "minicpmo"})) {
         const auto heads = integer(text, "num_key_value_heads", integer(text, "num_attention_heads"));
         const auto dim = integer(text, "head_dim", integer(text, "hidden_size") / integer(text, "num_attention_heads"));
         if (std::min(heads, dim) <= 0) return nullptr;
@@ -207,8 +215,8 @@ json cache_profile(const json& config, bool include_recurrent, std::int64_t pred
         {"fixed_components", std::move(fixed)}, {"components", std::move(components)}};
 }
 
-std::int64_t predictor_layers(const json& config, bool has_predictor) {
-    if (!has_predictor) return 0;
+std::int64_t predictor_layers(const json& config, const tyloi::ModelGraph* model_graph) {
+    if (!model_graph || !model_graph->has_component("predictor")) return 0;
     const auto text = text_config(config);
     if (!text.is_object()) return 0;
     const auto found = text.find("mtp_num_hidden_layers");
@@ -237,10 +245,11 @@ json source_config(const tyloi::ModelSource& source, const char* code) {
     } catch (const std::exception&) { unavailable(code, "checkpoint metadata cannot be read"); }
 }
 
-bool has_predictor(const tyloi::ModelSource& source) {
-    for (const auto& tensor : source.tensors())
-        if (tensor.name.rfind("predictor.block.", 0) == 0 || tensor.name.rfind("mtp.", 0) == 0) return true;
-    return false;
+std::optional<tyloi::ModelGraph> source_graph(const tyloi::ModelSource& source) {
+    if (!source.has_asset(tyloi::kModelGraphAsset) &&
+            !source.has_asset(tyloi::kModelConfigAsset)) return {};
+    try { return tyloi::models::graph(source); }
+    catch (const std::exception&) { return {}; }
 }
 
 // shortcut: analysis reads logical shapes from the model source. A container that stores no
@@ -437,7 +446,8 @@ struct Normalization {
     std::vector<std::int64_t> layers;
 };
 
-json advanced(const json& text, const std::vector<Tensor>& tensors) {
+json advanced(const json& text, const std::vector<Tensor>& tensors,
+        const tyloi::ModelGraph* model_graph) {
     const auto width = [&](const std::string& category) -> std::optional<std::int64_t> {
         for (const auto& tensor : tensors) {
             const auto projection = remove_suffix(tensor.projection, "_proj");
@@ -464,10 +474,10 @@ json advanced(const json& text, const std::vector<Tensor>& tensors) {
         shared_width = *shared_width % *shared_count == 0 ? std::optional(*shared_width / *shared_count) : std::nullopt;
     const auto hc_count = config_integer(text, {"hc_count", "hc_mult"});
     const auto hidden = config_integer(text, {"hidden_size"});
-    std::string architecture;
-    if (const auto found = text.find("model_type"); found != text.end() && found->is_string()) architecture = found->get<std::string>();
-    const bool qwen4 = architecture == "qwen4_exp" || architecture == "qwen4_exp_text";
-    const bool qwen35 = one_of(architecture, {"qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text", "qwen3_next"});
+    const std::string architecture = model_graph ? model_graph->architecture : std::string{};
+    const bool qwen4 = model_graph && is_qwen4(*model_graph);
+    const bool qwen35 = model_graph && is_qwen35(*model_graph);
+    const bool deepseek_family = model_graph && is_deepseek_family(*model_graph);
     const auto any_category = [&](std::initializer_list<const char*> names) {
         return std::any_of(tensors.begin(), tensors.end(),
             [&](const Tensor& tensor) { return one_of(tensor.category, names); });
@@ -477,7 +487,7 @@ json advanced(const json& text, const std::vector<Tensor>& tensors) {
             [&](const Tensor& tensor) { return tensor.name.find(needle) != std::string::npos; });
     };
     const bool has_gdn = any_category({"gdn"}), has_ple = any_category({"ple", "ple_projection"});
-    const bool has_predictor = any_category({"predictor"}), has_qsa = contains(".attention.indexer.");
+    const bool tensor_predictor = any_category({"predictor"}), has_qsa = contains(".attention.indexer.");
     const auto attention_heads = config_integer(text, {"num_attention_heads"}), head_dim = config_integer(text, {"head_dim"});
     bool has_full_gate = false;
     for (const auto& tensor : tensors) {
@@ -499,7 +509,7 @@ json advanced(const json& text, const std::vector<Tensor>& tensors) {
         if (tensor.layer && tensor.name.find(".attention.indexer.") != std::string::npos) sparse_layers.push_back(*tensor.layer);
         if (tensor.layer && tensor.category == "gdn") gdn_layers.push_back(*tensor.layer);
     }
-    const bool known_rms = qwen4 || qwen35 || architecture.rfind("deepseek", 0) == 0
+    const bool known_rms = qwen4 || qwen35 || deepseek_family
         || one_of(architecture, {"qwen2", "qwen2_moe", "qwen3", "qwen3_moe", "llama", "mistral", "mixtral"});
     const auto layer_in = [](const std::vector<std::int64_t>& layers, const std::optional<std::int64_t>& layer) {
         return layer && std::find(layers.begin(), layers.end(), *layer) != layers.end();
@@ -599,8 +609,9 @@ json advanced(const json& text, const std::vector<Tensor>& tensors) {
         if ((tensor.category == "ple" || tensor.category == "ple_projection") && tensor.layer
             && std::find(ple_layer_ids.begin(), ple_layer_ids.end(), *tensor.layer) == ple_layer_ids.end()) ple_layer_ids.push_back(*tensor.layer);
     std::sort(ple_layer_ids.begin(), ple_layer_ids.end());
-    std::optional<std::int64_t> predictor_count = has_predictor ? std::optional<std::int64_t>{} : std::optional<std::int64_t>{0};
-    if (has_predictor) predictor_count = config_integer(text, {"mtp_num_hidden_layers"});
+    const bool predictor_present = model_graph ? model_graph->has_component("predictor") : tensor_predictor;
+    std::optional<std::int64_t> predictor_count = predictor_present ? std::optional<std::int64_t>{} : std::optional<std::int64_t>{0};
+    if (predictor_present) predictor_count = config_integer(text, {"mtp_num_hidden_layers"});
     std::optional<std::int64_t> active_blocks = budget && stride && *budget % *stride == 0
         ? std::optional(*budget / *stride) : config_integer(text, {"index_topk"});
     const bool gdn_family = has_gdn && (qwen4 || qwen35);
@@ -630,7 +641,7 @@ json advanced(const json& text, const std::vector<Tensor>& tensors) {
             : has_gdn && qwen35 ? json("silu") : json(nullptr)},
         {"qsa_gate_activation", qwen4 && has_qsa ? json("sigmoid") : json(nullptr)},
         {"full_attention_gate_activation", qwen35 && has_full_gate ? json("sigmoid") : json(nullptr)},
-        {"residual_gate_activation", hc_count && *hc_count > 1 && (qwen4 || architecture.rfind("deepseek_v4", 0) == 0)
+        {"residual_gate_activation", hc_count && *hc_count > 1 && (qwen4 || deepseek_family)
             ? json("sigmoid") : json(nullptr)},
         {"indexer_query_heads", optional_json(config_integer(text, {"indexer_n_heads", "index_n_heads"}))},
         {"indexer_kv_heads", optional_json(config_integer(text, {"indexer_kv_heads"}))},
@@ -664,8 +675,10 @@ json model_cache_profile_json(const ModelCatalog::Artifact& artifact, bool inclu
     if (!artifact.complete) throw ApiError(422, code, "checkpoint cache metadata cannot be read");
     const auto source = open(artifact, code);
     const auto config = source_config(*source, code);
+    const auto model_graph = source_graph(*source);
+    const auto* facts = model_graph ? &*model_graph : nullptr;
     try {
-        return cache_profile(config, include_recurrent, predictor_layers(config, has_predictor(*source)), cuda);
+        return cache_profile(config, facts, include_recurrent, predictor_layers(config, facts), cuda);
     } catch (const Unsupported&) {
         return nullptr;
     }
@@ -676,6 +689,8 @@ json checkpoint_analysis_json(const ModelCatalog::Artifact& artifact, bool cuda)
     if (!artifact.complete) throw ApiError(422, code, "checkpoint is incomplete or its metadata cannot be read");
     const auto source = open(artifact, code);
     const auto config = source_config(*source, code);
+    const auto model_graph = source_graph(*source);
+    const auto* facts = model_graph ? &*model_graph : nullptr;
     std::vector<Tensor> tensors;
     std::vector<Expert> experts;
     json warnings = json::array();
@@ -817,7 +832,7 @@ json checkpoint_analysis_json(const ModelCatalog::Artifact& artifact, bool cuda)
         [](const Tensor& tensor) { return tensor.category == "shared_expert"; });
     json profile_value = nullptr;
     try {
-        profile_value = cache_profile(config, false, 0, cuda);
+        profile_value = cache_profile(config, facts, false, 0, cuda);
     } catch (const Unsupported&) {}
     return {
         {"model_id", artifact.id}, {"name", artifact.name}, {"architecture", architecture}, {"format", artifact.format},
@@ -832,7 +847,9 @@ json checkpoint_analysis_json(const ModelCatalog::Artifact& artifact, bool cuda)
         {"average_bpw", bpw_parameters ? json(8.0 * bpw_stored / bpw_parameters) : json(nullptr)},
         {"attention_distribution", distribution}, {"projections", std::move(projections)},
         {"layers", std::move(layers)}, {"experts", std::move(expert_rows)}, {"tensors", std::move(tensor_rows)},
-        {"graph", std::move(graph)}, {"advanced", advanced(text, tensors)}, {"cache_profile", std::move(profile_value)},
+        {"graph", std::move(graph)},
+        {"advanced", advanced(text, tensors, facts)},
+        {"cache_profile", std::move(profile_value)},
         {"warnings", std::move(warnings)},
     };
 }

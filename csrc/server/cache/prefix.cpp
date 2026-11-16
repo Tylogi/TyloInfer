@@ -110,7 +110,7 @@ std::string decode(const std::vector<std::int64_t>& tokens, ModelCatalog& catalo
 }
 } // namespace
 
-PrefixCache::PrefixCache(Storage& storage, ModelCatalog& catalog, ModelInstances& instances)
+PrefixCache::PrefixCache(Storage& storage, ModelCatalog& catalog, EngineInstances& instances)
     : storage_(storage), catalog_(catalog), instances_(instances) {}
 
 fs::path PrefixCache::directory() const {

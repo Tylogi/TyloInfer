@@ -8,7 +8,7 @@
 
 namespace tyloi::server {
 namespace {
-ModelInstances::Aliases normalize(ModelInstances::Aliases values) {
+EngineInstances::Aliases normalize(EngineInstances::Aliases values) {
     std::set<std::string> used;
     for (auto it = values.begin(); it != values.end();) {
         auto& [name, alias] = *it;
@@ -28,7 +28,7 @@ ModelInstances::Aliases normalize(ModelInstances::Aliases values) {
 }
 }
 
-ModelInstances::Aliases ModelInstances::read_aliases() try {
+EngineInstances::Aliases EngineInstances::read_aliases() try {
     auto access = storage_.access();
     sqlite::Statement query(access.database, "SELECT value FROM schema_meta WHERE key='runtime_model_aliases'");
     if (!query.step()) return {};
@@ -37,12 +37,12 @@ ModelInstances::Aliases ModelInstances::read_aliases() try {
     throw ModelError(ModelError::Kind::failure, "invalid_saved_aliases", "saved model aliases must be an object of strings");
 }
 
-ModelInstances::Aliases ModelInstances::aliases() const {
+EngineInstances::Aliases EngineInstances::aliases() const {
     std::lock_guard guard(mutex_);
     return aliases_;
 }
 
-ModelInstances::Aliases ModelInstances::set_aliases(Aliases values) {
+EngineInstances::Aliases EngineInstances::set_aliases(Aliases values) {
     values = normalize(std::move(values));
     std::string encoded;
     try { encoded = nlohmann::json(values).dump(); }
@@ -79,7 +79,7 @@ ModelInstances::Aliases ModelInstances::set_aliases(Aliases values) {
     return result;
 }
 
-std::vector<std::string> ModelInstances::names() const {
+std::vector<std::string> EngineInstances::names() const {
     struct Name { std::string model, id; };
     std::map<std::string, Name> candidates;
     for (const auto& artifact : catalog_.list(false))

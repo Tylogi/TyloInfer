@@ -353,7 +353,7 @@ struct Sessions::Reply::State {
     mutable std::mutex mutex;
     std::mutex reader;
     std::atomic<bool> cancelled{false};
-    std::shared_ptr<ModelInstance> instance;
+    std::shared_ptr<EngineInstance> instance;
     std::shared_ptr<engine::Output> outbox;
     Json resource, error, messages;
     common_chat_msg output;
@@ -366,7 +366,7 @@ struct Sessions::Reply::State {
     std::size_t bytes = 0;
 };
 
-Sessions::Sessions(Storage& storage, ModelInstances& models, Media& media) : storage_(storage), models_(models), media_(media) {
+Sessions::Sessions(Storage& storage, EngineInstances& engines, Media& media) : storage_(storage), engines_(engines), media_(media) {
     auto access = storage_.access();
     sqlite::Transaction transaction(access.database);
     Statement recover(access.database, "UPDATE sessions SET state='interrupted',runtime_instance_id=NULL,updated_at=? "
@@ -696,7 +696,7 @@ std::optional<std::vector<common_chat_msg_diff>> Sessions::Reply::next(const std
         };
         try {
             guard.unlock();
-            auto instance = state_->owner->models_.acquire(state_->resource.at("settings").at("model"), stopped);
+            auto instance = state_->owner->engines_.acquire(state_->resource.at("settings").at("model"), stopped);
             auto input = native_input(state_->resource.at("settings"), std::move(state_->messages), state_->resource.at("session_id"), instance->sampling());
             guard.lock();
             if (stopped()) fail("client_cancelled", "reply cancelled", true);

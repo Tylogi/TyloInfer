@@ -19,7 +19,7 @@ namespace tyloi::server {
 class InstanceLock;
 class Storage;
 class ModelCatalog;
-class ModelInstances;
+class EngineInstances;
 class Jobs;
 class Sessions;
 class Media;
@@ -35,7 +35,7 @@ struct Services {
     Authentication& auth;
     Storage& storage;
     ModelCatalog& catalog;
-    ModelInstances& instances;
+    EngineInstances& instances;
     Jobs& jobs;
     Sessions& sessions;
     Media& media;
