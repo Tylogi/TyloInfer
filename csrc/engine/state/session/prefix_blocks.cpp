@@ -13,7 +13,6 @@
 #include <deque>
 #include <exception>
 #include <fstream>
-#include <iomanip>
 #include <iterator>
 #include <limits>
 #include <map>
@@ -788,12 +787,7 @@ BlockHash sha256(std::string_view value) {
 }
 
 std::string block_hash_hex(const BlockHash& hash) {
-    std::ostringstream stream;
-    stream << std::hex << std::setfill('0');
-    for (const auto byte : hash) {
-        stream << std::setw(2) << static_cast<unsigned int>(byte);
-    }
-    return stream.str();
+    return hex(hash.data(), hash.size());
 }
 
 BlockHash prefix_block_hash(
