@@ -103,12 +103,12 @@ public:
         const auto b = host_ids.size(0), t = host_ids.size(1);
         if (cacheable_hashes(b, t)) {
             auto& hashes = graph_hashes(state, host);
-            stage.upload(hashes.ids, {b, t, (ngram_ - 1) * heads_});
+            stage.upload_graph(hashes.ids, {b, t, (ngram_ - 1) * heads_});
             restore(state, std::move(hashes.next));
         } else {
             auto hashes = ngram_hashes(host.data(), b, t, ngram_, heads_, eos_,
                 multipliers_, offsets_, vocab_, state.context, true);
-            stage.upload(hashes.ids, {b, t, (ngram_ - 1) * heads_});
+            stage.upload_graph(hashes.ids, {b, t, (ngram_ - 1) * heads_});
             restore(state, std::move(hashes.next));
         }
     }

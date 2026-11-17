@@ -1,6 +1,7 @@
 #pragma once
 #include "env.h"
 #include "engine/backends/cuda/native/copy_batch.h"
+#include "engine/backends/cuda/native/stream_context.h"
 #include <cuda.h>
 #include <array>
 #include <atomic>
@@ -51,6 +52,7 @@ public:
     template<class Alias>
     static bool submit(const std::vector<DmaCopy>& copies,cudaStream_t stream,int mode,Alias&& alias) {
         if(!mode || copies.empty() || !entry())return false;
+        const StreamContext context(stream);
         constexpr std::size_t capacity=128;
         if(copies.size()>capacity) {
             const auto* multiple=tyloi::cuda::env_lookup("TYLOINFER_MOE_NATIVE_DMA_MULTI_BATCH");

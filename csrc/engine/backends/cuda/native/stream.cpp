@@ -5,6 +5,16 @@
 
 namespace tyloi::cuda {
 
+bool event_ready(cudaEvent_t event) {
+    const auto status = cudaEventQuery(event);
+    if (status == cudaErrorNotReady) {
+        (void)cudaGetLastError();
+        return false;
+    }
+    TYLOINFER_NATIVE_CUDA_CHECK(status);
+    return true;
+}
+
 Event::Event(unsigned flags) {
     TYLOINFER_NATIVE_CUDA_CHECK(cudaGetDevice(&device_));
     TYLOINFER_NATIVE_CUDA_CHECK(cudaEventCreateWithFlags(&event_, flags));
@@ -37,16 +47,7 @@ void Event::record(cudaStream_t stream) {
 
 bool Event::ready() const {
     DeviceGuard guard(device_);
-    const auto status = cudaEventQuery(event_);
-    if (status == cudaSuccess) {
-        return true;
-    }
-    if (status == cudaErrorNotReady) {
-        (void)cudaGetLastError();
-        return false;
-    }
-    TYLOINFER_NATIVE_CUDA_CHECK(status);
-    return false;
+    return event_ready(event_);
 }
 
 void Event::synchronize() const {

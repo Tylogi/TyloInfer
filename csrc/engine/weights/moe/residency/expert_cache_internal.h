@@ -7,6 +7,7 @@
 #include "engine/weights/moe/residency/residency.h"
 #include "engine/backends/cuda/native/copy_batch.h"
 #include "engine/backends/cuda/native/device.h"
+#include "engine/backends/cuda/native/stream.h"
 #include "engine/weights/moe/residency/kv_expert_loan.h"
 #include "engine/backends/cpu/native/host_parallel.h"
 #include "engine/weights/moe/host/cost_model.h"
@@ -1471,8 +1472,7 @@ private:
             const size_t index =
                 (next_stage_ + offset) % stages_.size();
             auto & stage = stages_[index];
-            if (!stage.pending ||
-                cudaEventQuery(stage.done) == cudaSuccess) {
+            if (!stage.pending || tyloi::cuda::event_ready(stage.done)) {
                 stage.pending = false;
                 next_stage_ = (index + 1) % stages_.size();
                 if (!stage.host.defined() ||
@@ -1499,7 +1499,6 @@ private:
                 }
                 return stage;
             }
-            (void)cudaGetLastError();
         }
         auto & stage = stages_[next_stage_];
         TYLOINFER_CUDA_CHECK(cudaEventSynchronize(stage.done));

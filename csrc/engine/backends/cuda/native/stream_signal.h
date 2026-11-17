@@ -1,6 +1,7 @@
 #pragma once
-#include "engine/backends/cuda/native/context.h"
+#include "engine/backends/cuda/native/stream_context.h"
 #include <cuda.h>
+#include <cstdint>
 
 namespace tyloi::cuda {
 // A stream memory operation does not launch a completion kernel behind a
@@ -32,6 +33,7 @@ public:
     static bool submit(std::uint32_t* mapped,cudaStream_t stream) {
         const auto write=entry();
         if(!write || !mapped)return false;
+        const StreamContext context(stream);
         const auto result=write(reinterpret_cast<CUstream>(stream),reinterpret_cast<CUdeviceptr>(mapped),1,0);
         if(result==CUDA_ERROR_NOT_SUPPORTED)return false;
         if(result!=CUDA_SUCCESS)throw std::runtime_error("CUDA stream completion signal failed: "+std::to_string(result));

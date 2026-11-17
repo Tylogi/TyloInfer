@@ -7,6 +7,9 @@
 
 namespace tyloi::cuda {
 
+// The caller binds the event's device; only unfinished work is pending.
+bool event_ready(cudaEvent_t event);
+
 class Event final {
 public:
     explicit Event(unsigned flags = cudaEventDisableTiming);

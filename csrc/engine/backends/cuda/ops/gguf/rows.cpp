@@ -1,5 +1,6 @@
 #include "weight.h"
 #include "rotation.h"
+#include "engine/backends/cuda/ops/row_stage.h"
 #include "engine/weights/encoding/row_residual.h"
 #include "../../kernels/projection/gguf/linear.h"
 #include "engine/backends/cuda/native/profile.h"
@@ -137,9 +138,7 @@ class GgufRowStage final : public RowStage {
     ::tyloi::DenseTensor packet_, output_;
     void* packet_address_ = nullptr;
     bool mapped_ = false;
-    std::unique_ptr<tyloi::cuda::Event> done_;
-    cudaStream_t last_stream_ = nullptr;
-    bool pending_ = false;
+    tyloi::cuda::RowStageFence fence_;
     void retain_stream() {
         const auto stream = mfq_get_current_cuda_stream(device_.index);
         if (std::none_of(streams_.begin(), streams_.end(), [&](const auto& prior) { return prior.stream() == stream.stream(); }))
@@ -168,7 +167,7 @@ public:
         bytes_ = offset_ + std::size_t(count_) * stride_;
         MfqCudaGuard guard(device_);
         retain_stream();
-        done_ = std::make_unique<tyloi::cuda::Event>();
+        fence_.initialize();
         int can_map = 0;
         TYLOINFER_NATIVE_CUDA_CHECK(cudaDeviceGetAttribute(&can_map, cudaDevAttrCanMapHostMemory, device_.index));
         // As in the TQ row stage, a small packet is cheaper to read directly
@@ -210,7 +209,7 @@ public:
     void upload(const std::vector<std::int64_t>& ids, const std::vector<std::int64_t>& shape) override {
         MfqCudaGuard guard(device_);
         retain_stream();
-        if (pending_) done_->synchronize();
+        fence_.before_write();
         prepare_rows(ids,shape);
         upload_prepared();
     }
@@ -219,7 +218,8 @@ public:
         // The graph owner already fences the preceding read. A mapped packet
         // needs only CPU writes and the caller's publication flag, with no
         // event recorded on an otherwise idle CUDA stream during replay.
-        prepare_rows(ids,shape);pending_=false;
+        fence_.owner_fenced();
+        prepare_rows(ids,shape);
     }
     // Runs on a CPU I/O worker. All storage/events were prepared by the
     // model thread; this method never enters CUDA or changes GPU ownership.
@@ -245,29 +245,20 @@ public:
         retain_stream();
         if (!mapped_) TYLOINFER_NATIVE_CUDA_CHECK(cudaMemcpyAsync(packet_address_, host_->data(), bytes_,
             cudaMemcpyHostToDevice, mfq_current_cuda_stream()));
-        TYLOINFER_NATIVE_CUDA_CHECK(cudaEventRecord(done_->get(), mfq_current_cuda_stream()));
-        last_stream_ = mfq_current_cuda_stream(); pending_ = true;
-        if (packet_.defined()) packet_.record_stream(reinterpret_cast<std::uintptr_t>(last_stream_));
+        fence_.record_transfer(mfq_current_cuda_stream());
+        if (packet_.defined()) packet_.record_stream(
+            reinterpret_cast<std::uintptr_t>(mfq_current_cuda_stream()));
     }
     void decode() override {
         MfqCudaGuard guard(device_);
         retain_stream();
         const auto stream = mfq_current_cuda_stream();
-        cudaStreamCaptureStatus capture;
-        TYLOINFER_NATIVE_CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
-        if (!mapped_ && pending_ && stream != last_stream_)
-            TYLOINFER_NATIVE_CUDA_CHECK(cudaStreamWaitEvent(stream, done_->get(),
-                capture == cudaStreamCaptureStatusNone ? 0 : cudaEventWaitExternal));
+        const auto capture = fence_.join(stream);
         if (packet_.defined()) packet_.record_stream(reinterpret_cast<std::uintptr_t>(stream));
         output_.record_stream(reinterpret_cast<std::uintptr_t>(stream));
         tyloi::cuda::gguf::staged_rows(packet_address_, count_, width_, output_.data_ptr(), true,
             mfq_current_cuda_stream());
-        // A captured internal event cannot be synchronized by the next host
-        // upload. Graph owners fence replay; keep this event for eager/DMA use.
-        if (capture == cudaStreamCaptureStatusNone) {
-            TYLOINFER_NATIVE_CUDA_CHECK(cudaEventRecord(done_->get(), stream));
-            last_stream_ = stream; pending_ = true;
-        }
+        fence_.record_consumer(stream, capture);
     }
 };
 }

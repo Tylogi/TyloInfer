@@ -2,6 +2,7 @@
 #include "backend.h"
 
 #include "env.h"
+#include "engine/backends/cuda/ops/row_stage.h"
 #include "engine/backends/cuda/ops/projection/tq/tensor.h"
 #include "engine/weights/tq/image.h"
 #include "engine/backends/cuda/native/memory.h"
@@ -232,6 +233,7 @@ TqStageLayout tq_stage_layout(const std::vector<std::shared_ptr<tyloi::TqTable>>
 }
 
 class TqRowStage final : public RowStage {
+    tyloi::cuda::RowStageFence fence_;
     std::vector<std::shared_ptr<tyloi::TqTable>> tables_;
     std::vector<std::int64_t> shape_;
     std::int64_t rows_per_shard_, count_ = 1, columns_ = 0;
@@ -359,6 +361,7 @@ public:
             throw std::invalid_argument("TQ stage upload shape changed");
         }
         const MfqCudaGuard guard(device_);
+        fence_.before_write();
         retain_stream();
         std::unordered_map<std::int64_t, TrellisProjectionView> unique;
         std::vector<TrellisProjectionView> views;
@@ -381,19 +384,29 @@ public:
             TYLOINFER_CUDA_CHECK(cudaMemcpyAsync(
                 packet_address_, host_->data(), bytes_, cudaMemcpyHostToDevice,
                 mfq_current_cuda_stream()));
+            fence_.record_transfer(mfq_current_cuda_stream());
         }
     }
     void decode() override {
         const MfqCudaGuard guard(device_);
         retain_stream();
-        mfq_cuda_record_stream(output_.dense(), mfq_get_current_cuda_stream(device_.index));
+        const auto stream = mfq_get_current_cuda_stream(device_.index);
+        const auto capture = fence_.join(stream.stream());
+        mfq_cuda_record_stream(output_.dense(), stream);
         if (packet_.defined()) {
-            mfq_cuda_record_stream(packet_, mfq_get_current_cuda_stream(device_.index));
+            mfq_cuda_record_stream(packet_, stream);
         }
         status(mfq_tq_embedding_rows(
             reinterpret_cast<const TrellisProjectionView*>(packet_address_),
             int(count_), int(columns_), output_.dense().data_ptr(), 0,
-            mfq_current_cuda_stream()));
+            stream.stream()));
+        fence_.record_consumer(stream.stream(), capture);
+    }
+    void upload_graph(const std::vector<std::int64_t>& ids,
+                      const std::vector<std::int64_t>& shape) override {
+        const MfqCudaGuard guard(device_);
+        fence_.owner_fenced();
+        upload(ids, shape);
     }
 };
 
