@@ -1,5 +1,6 @@
 #include "env.h"
 #include "backend.h"
+#include "engine/memory/host.h"
 #include "engine/weights/rows/nint_pipeline.h"
 #include "engine/weights/rows/nint_cache.h"
 #include "engine/weights/source/mapped.h"
@@ -38,7 +39,12 @@ int64_t shape_rows(const std::vector<int64_t>& shape) {
 }
 // Sources share immutable encoded rows, with source identity in every key.
 std::shared_ptr<tyloi::NintRowCache> row_cache() {
-    static auto cache=std::make_shared<tyloi::NintRowCache>(1u<<20);return cache;
+    static auto cache = [] {
+        auto value = std::make_shared<tyloi::NintRowCache>(1u << 20);
+        tyloi::register_host_cache(value);
+        return value;
+    }();
+    return cache;
 }
 }
 struct NintRowStage::Impl {

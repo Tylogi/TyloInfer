@@ -5,6 +5,7 @@
 #include "engine/weights/moe/residency/expert_cache.h"
 #include "engine/weights/tq/cache.h"
 #include "engine/weights/tq/image.h"
+#include "engine/memory/host.h"
 
 #include <climits>
 #include <cstring>
@@ -55,7 +56,10 @@ tyloi::Tensor tyloi::weights::Cache::routed_tq(
     if (!data_->tq) {
         const auto bytes = data_->device_bytes.value_or(moe_expert_cache_budget_bytes(data_->moe));
         const bool explicit_budget = data_->device_bytes.has_value() || bool(data_->moe);
-        data_->tq = std::make_shared<TqCache>(bytes, data_->host_bytes, data_->host_limit, !explicit_budget, data_->exec);
+        auto cache = std::make_shared<TqCache>(bytes, data_->host_bytes, data_->host_limit,
+            !explicit_budget, data_->exec);
+        ::tyloi::register_host_cache(cache);
+        data_->tq = std::move(cache);
     }
     auto cache = data_->tq;
     auto result = std::make_shared<tyloi::TqBank>();

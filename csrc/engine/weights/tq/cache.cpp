@@ -15,6 +15,7 @@
 #include "engine/memory/host.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <climits>
 #include <cstdio>
@@ -33,10 +34,7 @@ std::size_t device_bytes(std::size_t bytes) {
 std::size_t available_host_bytes(std::size_t process_limit) {
     try {
         const auto memory=tyloi::sample_host_memory();
-        auto available=memory.available_host_bytes();
-        if(process_limit)available=std::min<std::uint64_t>(available,
-            memory.resident_bytes>=process_limit?0:process_limit-memory.resident_bytes);
-        return static_cast<std::size_t>(std::min<std::uint64_t>(available,SIZE_MAX));
+        return memory.headroom(process_limit);
     } catch(const std::runtime_error&) {return 0;}
 }
 }
@@ -55,6 +53,10 @@ struct TqCache::ViewTable {
     std::vector<std::uint8_t> bytes;
 };
 
+struct TqCache::HostAccounting {
+    std::atomic<std::size_t> physical{0};
+};
+
 struct TqCache::HostImage {
     tyloi::TqLayout layout;
     std::vector<std::uint8_t> bytes;
@@ -62,26 +64,45 @@ struct TqCache::HostImage {
     bool pin_attempted=false,registered=false;
     int pin_device=0;
     tyloi::cuda::HostRegistrationRetirement retirement;
-    explicit HostImage(const std::vector<std::uint8_t>& wire)
-        :layout(wire.data(),wire.size()),bytes(tq_image(wire,layout)),source_bytes(wire.size()) {
-        retirement.owner=this;
-        retirement.dispose=[](void* owner)noexcept{delete static_cast<HostImage*>(owner);};
+    std::shared_ptr<HostAccounting> accounting;
+    static void destroy(void* owner) noexcept {
+        auto* image=static_cast<HostImage*>(owner);
+        const auto capacity=image->bytes.capacity();
+        auto accounting=image->accounting;
+        delete image;
+        tyloi::cuda::tensor_host_bytes.fetch_sub(capacity,std::memory_order_relaxed);
+        accounting->physical.fetch_sub(capacity,std::memory_order_relaxed);
     }
-    HostImage(std::vector<std::uint8_t>&& image, std::size_t wire_bytes)
-        :layout(image.data(),wire_bytes),bytes(std::move(image)),source_bytes(wire_bytes) {
+    explicit HostImage(const std::vector<std::uint8_t>& wire,
+                       std::shared_ptr<HostAccounting> owner)
+        :layout(wire.data(),wire.size()),bytes(tq_image(wire,layout)),source_bytes(wire.size()),
+         accounting(std::move(owner)) {
         retirement.owner=this;
-        retirement.dispose=[](void* owner)noexcept{delete static_cast<HostImage*>(owner);};
+        retirement.dispose=destroy;
+        tyloi::cuda::charge_tensor_host_bytes(bytes.capacity());
+        accounting->physical.fetch_add(bytes.capacity(),std::memory_order_relaxed);
+    }
+    HostImage(std::vector<std::uint8_t>&& image, std::size_t wire_bytes,
+              std::shared_ptr<HostAccounting> owner)
+        :layout(image.data(),wire_bytes),bytes(std::move(image)),source_bytes(wire_bytes),
+         accounting(std::move(owner)) {
+        retirement.owner=this;
+        retirement.dispose=destroy;
+        tyloi::cuda::charge_tensor_host_bytes(bytes.capacity());
+        accounting->physical.fetch_add(bytes.capacity(),std::memory_order_relaxed);
     }
     HostImage(const HostImage&)=delete;
     HostImage& operator=(const HostImage&)=delete;
     static void release(HostImage* image) noexcept {
         if(image->registered)tyloi::cuda::retire_host_registration(&image->retirement);
-        else delete image;
+        else destroy(image);
     }
-    static std::shared_ptr<HostImage> create(const std::vector<std::uint8_t>& wire) {
-        return {new HostImage(wire),release};
+    static std::shared_ptr<HostImage> create(const std::vector<std::uint8_t>& wire,
+                                             std::shared_ptr<HostAccounting> accounting) {
+        return {new HostImage(wire,std::move(accounting)),release};
     }
-    static std::shared_ptr<HostImage> download(const DeviceEntry& entry) {
+    static std::shared_ptr<HostImage> download(const DeviceEntry& entry,
+                                               std::shared_ptr<HostAccounting> accounting) {
         const auto& source=entry.weight.image();
         const MfqCudaGuard guard(source.get_device());
         const auto stream=mfq_get_current_cuda_stream(source.get_device());
@@ -90,7 +111,7 @@ struct TqCache::HostImage {
         TYLOINFER_CUDA_CHECK(cudaMemcpyAsync(bytes.data(),source.data_ptr(),bytes.size(),
             cudaMemcpyDeviceToHost,stream.stream()));
         TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(stream.stream()));
-        return {new HostImage(std::move(bytes),entry.source_bytes),release};
+        return {new HostImage(std::move(bytes),entry.source_bytes,std::move(accounting)),release};
     }
     // Pin only a reused host image. One-use SSD reads retain bounded
     // staging; repeated RAM transfers avoid another full CPU copy.
@@ -133,19 +154,49 @@ struct TqCache::Stage {
 
 TqCache::HostTransfer::~HostTransfer() noexcept { try { ready->event.synchronize(); } catch (...) {} }
 
-std::size_t TqCache::reserve_host_locked(std::size_t bytes) {
-    if(!bytes || host_.empty())return 0;
-    if(bytes>SIZE_MAX-host_headroom)throw std::overflow_error("TQ host reservation overflows");
-    bytes+=host_headroom;
+std::size_t TqCache::reclaim_host_locked(std::size_t bytes) {
+    std::size_t released = 0;
+    while (released < bytes && !host_.empty()) {
+        const auto key = *host_.oldest();
+        const auto before = host_accounting_->physical.load(std::memory_order_relaxed);
+        host_.erase(key);
+        const auto after = host_accounting_->physical.load(std::memory_order_relaxed);
+        if (before > after) {
+            const auto delta = before - after;
+            released = delta > SIZE_MAX - released ? SIZE_MAX : released + delta;
+        }
+    }
+    return released;
+}
+
+std::size_t TqCache::reserve_host_headroom_locked(std::size_t bytes) {
+    if (!bytes || host_.empty()) return 0;
     std::size_t released = 0;
     while (!host_.empty()) {
         const auto available = available_host_bytes(process_host_limit_);
         if (available >= bytes) break;
-        released += host_.trim(bytes - available);
+        const auto reclaimed = reclaim_host_locked(bytes - available);
+        released = reclaimed > SIZE_MAX - released ? SIZE_MAX : released + reclaimed;
         // Freed expert images may remain in the host allocator's arenas.
         tyloi::trim_host_cache();
     }
     return released;
+}
+
+std::size_t TqCache::reserve_host_locked(std::size_t bytes) {
+    if(!bytes)return 0;
+    if(bytes>SIZE_MAX-host_headroom)throw std::overflow_error("TQ host reservation overflows");
+    return reserve_host_headroom_locked(bytes + host_headroom);
+}
+
+bool TqCache::admit_host_locked(std::size_t bytes, std::size_t reserve) const {
+    const auto limit = host_.limit();
+    // LRU usage is only cached payload. Admission must include evicted images
+    // whose leases or registration retirement still own their backing.
+    const auto physical = host_accounting_->physical.load(std::memory_order_relaxed);
+    if (limit && (physical > *limit || bytes > *limit - physical)) return false;
+    if (bytes > SIZE_MAX - reserve) return false;
+    return available_host_bytes(process_host_limit_) >= bytes + reserve;
 }
 
 std::size_t TqCache::trim_device(std::size_t bytes) {
@@ -158,9 +209,10 @@ std::size_t TqCache::trim_device(std::size_t bytes) {
         if(!host_.find(key.image) && needed<=*host_.limit()) {
             reserve_host_locked(needed);
             host_.reserve(needed);
-            if(available_host_bytes(process_host_limit_)>=needed+host_headroom) {
-                auto image=HostImage::download(entry);
-                host_.put(key.image,std::move(image),needed);
+            if(admit_host_locked(needed,host_headroom)) {
+                auto image=HostImage::download(entry,host_accounting_);
+                if(admit_host_locked(0,host_headroom))
+                    host_.put(key.image,std::move(image),needed);
             }
         }
         device_.trim(1);
@@ -214,6 +266,7 @@ void TqCache::upload(const ::tyloi::DenseTensor& destination,const std::vector<s
 TqCache::TqCache(std::size_t budget,std::size_t host_budget,std::size_t process_limit,bool retain_all,
               std::shared_ptr<TqExec> tq)
     :tq_(std::move(tq)),
+     host_accounting_(std::make_shared<HostAccounting>()),
      host_(host_budget?host_budget:available_host_bytes(process_limit)/5*4),
      device_(retain_all?std::nullopt:std::optional<std::size_t>(budget)),
      device_budget_(device_.limit()),
@@ -289,6 +342,11 @@ void TqCache::reclaim(int device, std::size_t available_bytes) {
     }
 }
 
+std::size_t TqCache::reclaim(std::size_t bytes) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    return reclaim_host_locked(bytes);
+}
+
 void TqCache::preload(int device, std::size_t workspace_reserve) {
     const tyloi::cuda::RoutedWeightAllocationScope resident;
     const MfqCudaGuard device_guard(device);
@@ -319,14 +377,19 @@ void TqCache::preload(int device, std::size_t workspace_reserve) {
                 if (std::uint64_t(source.rows) > SIZE_MAX / row_bound)
                     throw std::overflow_error("TQ preload image size overflow");
                 const auto bound = gpu ? device_bytes(row_bound * source.rows) : row_bound * source.rows;
-                const auto available = gpu ? context->available_memory()
-                    : available_host_bytes(process_host_limit_);
-                const auto reserve = gpu ? workspace_reserve : host_reserve;
-                const auto remaining = gpu ? device_.limit().value_or(SIZE_MAX) - device_.used()
-                    : *host_.limit() - host_.used();
-                if (bound > remaining || available <= reserve || bound > available - reserve) {
-                    exhausted = true;
-                    break;
+                if (gpu) {
+                    const auto available = context->available_memory();
+                    const auto remaining = device_.limit().value_or(SIZE_MAX) - device_.used();
+                    if (bound > remaining || available <= workspace_reserve ||
+                        bound > available - workspace_reserve) {
+                        exhausted = true;
+                        break;
+                    }
+                } else {
+                    if (!admit_host_locked(bound,host_reserve)) {
+                        exhausted = true;
+                        break;
+                    }
                 }
                 std::shared_ptr<HostImage> image;
                 if (const auto* cached = host_.find(key)) image = *cached;
@@ -334,7 +397,7 @@ void TqCache::preload(int device, std::size_t workspace_reserve) {
                     const auto wire = source.table->slice_rows(expert * source.rows, (expert + 1) * source.rows);
                     source_bytes_ += wire.size();
                     ++source_reads_;
-                    image = HostImage::create(wire);
+                    image = HostImage::create(wire,host_accounting_);
                 }
                 if (gpu) {
                     const auto capacity=device_bytes(image->bytes.size());
@@ -347,6 +410,10 @@ void TqCache::preload(int device, std::size_t workspace_reserve) {
                     device_.put(device_key, DeviceEntry{std::move(weight), std::move(ready), image->source_bytes}, capacity, true);
                     host_.erase(key);
                 } else {
+                    if (!admit_host_locked(0,host_reserve)) {
+                        exhausted = true;
+                        break;
+                    }
                     host_.put(key, image, image->bytes.size(), true);
                 }
             }
@@ -377,10 +444,12 @@ std::vector<std::pair<std::string,double>> TqCache::metrics() {
         if(stage)staging+=stage->host.size();
     const auto cold=payload_bytes_>covered?payload_bytes_-covered:0;
     const auto misses=calls_-gpu_hits_;
+    const auto physical=host_accounting_->physical.load(std::memory_order_relaxed);
     return {{"resident_expert_cache_bytes",double(device_.used())},
         {"expert_cache_budget_bytes",double(device_.limit().value_or(std::max(payload_bytes_,device_.used())))},
         {"ram_expert_enabled",host_.used()?1.0:0.0},
         {"ram_expert_payload_bytes",double(host_.used())},
+        {"ram_expert_physical_bytes",double(physical)},
         {"ram_expert_cache_budget_bytes",double(*host_.limit())},
         {"ram_expert_pcie_read_bytes",double(transfer_bytes_)},
         {"ram_expert_direct_pcie_read_bytes",double(direct_transfer_bytes_)},
@@ -492,9 +561,10 @@ std::vector<::tyloi::encoding::TqTensor> TqCache::get(std::uint64_t source,const
         // images against current RAM/commit headroom before packing one;
         // GPU hits and ordinary RAM streaming do not poll process memory.
         reserve_host_locked(wire.size());
-        const bool admit=available_host_bytes(process_host_limit_)>=wire.size()+host_headroom;
-        source_bytes_+=wire.size();++source_reads_;image=HostImage::create(wire);
+        source_bytes_+=wire.size();++source_reads_;image=HostImage::create(wire,host_accounting_);
         host_.reserve(image->bytes.size());
+        reserve_host_headroom_locked(host_headroom);
+        const bool admit=admit_host_locked(0,host_headroom);
         if(admit)host_.put(key,image,image->bytes.size());
     }
     fetch_ms_+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-fetch_started).count();

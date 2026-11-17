@@ -1,4 +1,5 @@
 #include "engine/weights/cache/cache.h"
+#include "engine/memory/host.h"
 #include "engine/weights/cache/workspace.h"
 #include "engine/memory/budget.h"
 #include "engine/backends/metal/ops/moe.h"
@@ -330,6 +331,7 @@ void Cache::resize(std::size_t bytes) {
     data_->configured = bytes;
 }
 std::size_t Cache::reserve(std::size_t bytes) {
+    reclaim_host(bytes);
     std::size_t before = 0;
     for (const auto& group : data_->groups) before = add(before, resident(group.cache));
 #if TYLOINFER_ENABLE_MFQ_COMPAT

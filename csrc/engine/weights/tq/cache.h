@@ -1,5 +1,6 @@
 #pragma once
 
+#include "engine/memory/host.h"
 #include "engine/weights/encoding/tq/tensor.h"
 #include "engine/weights/cache/lru.h"
 
@@ -18,11 +19,11 @@ class TqExec;
 
 // Selected weights own their backing after eviction; uploads retain host data
 // until DMA completes. Cache mutation is serialized across request streams.
-class TqCache {
+class TqCache final : public ::tyloi::HostCache {
 public:
     TqCache(std::size_t budget, std::size_t host_budget, std::size_t process_limit,
             bool retain_all, std::shared_ptr<TqExec> exec);
-    ~TqCache();
+    ~TqCache() override;
 
     std::uint64_t add(std::shared_ptr<const tyloi::TqTable>, std::int64_t rows);
     std::vector<::tyloi::encoding::TqTensor> get(std::uint64_t source, const std::int64_t* ids,
@@ -34,12 +35,14 @@ public:
     void resize(std::size_t bytes);
     void preload(int device, std::size_t workspace_reserve);
     void reclaim(int device, std::size_t available_bytes);
+    std::size_t reclaim(std::size_t bytes) override;
     void prepare_decode(int device, std::size_t workspace_reserve);
     std::uint64_t streamed_bytes();
     std::size_t reserve(std::size_t bytes);
     std::vector<std::pair<std::string, double>> metrics();
 
 private:
+    struct HostAccounting;
     struct Upload;
     struct HostImage;
     struct Stage;
@@ -75,6 +78,7 @@ private:
 
     // Streams outlive every cached tensor and its final consumer fence.
     std::shared_ptr<TqExec> tq_;
+    std::shared_ptr<HostAccounting> host_accounting_;
     tyloi::weights::Lru<std::uint64_t, std::shared_ptr<HostImage>> host_;
     tyloi::weights::Lru<DeviceKey, DeviceEntry, DeviceKeyHash> device_;
     std::optional<std::size_t> device_budget_;
@@ -90,7 +94,10 @@ private:
     double fetch_ms_ = 0, upload_submit_ms_ = 0;
     bool profile_;
 
+    std::size_t reclaim_host_locked(std::size_t bytes);
+    std::size_t reserve_host_headroom_locked(std::size_t bytes);
     std::size_t reserve_host_locked(std::size_t bytes);
+    bool admit_host_locked(std::size_t bytes, std::size_t reserve) const;
     std::size_t trim_device(std::size_t bytes);
     void reserve_device(std::size_t bytes);
     void report() const;

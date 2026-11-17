@@ -751,11 +751,7 @@ class GgufExpertCache {
     }
 
     std::size_t host_available() const {
-        const auto sample = tyloi::sample_host_memory();
-        const auto available = sample.available_host_bytes();
-        if (!physical_limit_) return available;
-        return std::min<std::uint64_t>(available,
-            physical_limit_ > sample.resident_bytes ? physical_limit_ - sample.resident_bytes : 0);
+        return tyloi::sample_host_memory().headroom(physical_limit_);
     }
     void reap() {
         const tyloi::cuda::Event* previous=nullptr;bool complete=false;

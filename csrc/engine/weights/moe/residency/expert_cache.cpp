@@ -68,12 +68,7 @@ std::optional<std::size_t> MoeExpertCache::available_host_ram() const {
     const auto* option=tyloi::cuda::env_lookup("TYLOINFER_PREFILL_BACKUP_PRESSURE");
     if(option && option[0]=='0')return std::nullopt;
     try {
-        const auto memory=MoeResidencyManager::sample_host_memory();
-        auto available=std::size_t(memory.available_host_bytes());
-        if(options_.host_limit)
-            available=std::min(available,memory.resident_bytes>=options_.host_limit
-                ?std::size_t(0):std::size_t(options_.host_limit-memory.resident_bytes));
-        return available;
+        return MoeResidencyManager::sample_host_memory().headroom(options_.host_limit);
     } catch(const std::runtime_error&) {return 0;}
 }
 

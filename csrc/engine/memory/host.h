@@ -1,6 +1,9 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
+#include <limits>
+#include <memory>
 #include <optional>
 
 namespace tyloi {
@@ -14,7 +17,28 @@ struct HostMemorySample {
         return commit_available_bytes && *commit_available_bytes < available_bytes
             ? *commit_available_bytes : available_bytes;
     }
+    // System/commit availability already excludes live allocations.
+    std::size_t headroom(std::uint64_t process_limit = 0) const noexcept {
+        auto available = available_host_bytes();
+        if (process_limit) {
+            const auto remaining = resident_bytes < process_limit ? process_limit - resident_bytes : 0;
+            if (remaining < available) available = remaining;
+        }
+        const auto maximum = std::numeric_limits<std::size_t>::max();
+        return static_cast<std::size_t>(available > maximum ? maximum : available);
+    }
 };
 HostMemorySample sample_host_memory();
 void trim_host_cache() noexcept;
+
+class HostCache {
+public:
+    virtual ~HostCache() = default;
+    // Return only released backing bytes; outstanding leases remain valid.
+    virtual std::size_t reclaim(std::size_t bytes) = 0;
+};
+void register_host_cache(const std::shared_ptr<HostCache>& cache);
+std::size_t reclaim_host_caches(std::size_t bytes) noexcept;
+// Reclaim under pressure; the caller's existing admission checks still apply.
+void reclaim_host(std::size_t bytes, std::uint64_t process_limit = 0) noexcept;
 } // namespace tyloi

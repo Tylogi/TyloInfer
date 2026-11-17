@@ -1,4 +1,5 @@
 #include "engram.h"
+#include "engine/memory/host.h"
 #include "engine/backends/cuda/native/memory.h"
 #include "engine/backends/cuda/native/stream.h"
 #include "engine/backends/cpu/native/host_parallel.h"
@@ -90,8 +91,10 @@ struct EngramTable::Impl {
         if (shared->tq_table) return;
 #if TYLOINFER_ENABLE_MFQ_COMPAT
         if(shared->nint) {
+            auto cache = std::make_shared<tyloi::NintRowCache>(shared->capacity);
+            tyloi::register_host_cache(cache);
             nint_pipeline=std::make_shared<NintRowPipeline>(shared->nint,
-                std::make_shared<tyloi::NintRowCache>(shared->capacity));
+                std::move(cache));
             return;
         }
 #endif

@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <exception>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 
 namespace tyloi::models {
@@ -48,6 +49,7 @@ std::shared_ptr<tyloi::cache::PagedPrefixCache> make_paged_prefix_cache(
 }
 
 void SessionOps::release_host_cache() {
+    (void)tyloi::reclaim_host_caches(std::numeric_limits<std::size_t>::max());
     tyloi::trim_host_cache();
 }
 

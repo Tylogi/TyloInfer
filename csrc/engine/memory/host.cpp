@@ -3,7 +3,10 @@
 #include <algorithm>
 #include <cstddef>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
+#include <utility>
+#include <vector>
 
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -26,6 +29,12 @@
 #endif
 
 namespace {
+struct Registry {
+    std::mutex mutex;
+    std::vector<std::weak_ptr<tyloi::HostCache>> caches;
+};
+Registry& registry() { static Registry instance; return instance; }
+
 #if defined(__linux__) || defined(__APPLE__)
 std::uint64_t bytes(std::uint64_t count, std::uint64_t size) {
     if (size && count > std::numeric_limits<std::uint64_t>::max() / size)
@@ -33,6 +42,52 @@ std::uint64_t bytes(std::uint64_t count, std::uint64_t size) {
     return count * size;
 }
 #endif
+}
+
+void tyloi::register_host_cache(const std::shared_ptr<HostCache>& cache) {
+    if (!cache) throw std::invalid_argument("cannot register an absent host cache");
+    auto& state = registry();
+    std::lock_guard lock(state.mutex);
+    state.caches.erase(std::remove_if(state.caches.begin(), state.caches.end(),
+        [](const auto& entry) { return entry.expired(); }), state.caches.end());
+    for (const auto& entry : state.caches)
+        if (entry.lock() == cache) return;
+    state.caches.push_back(cache);
+}
+
+std::size_t tyloi::reclaim_host_caches(std::size_t bytes) noexcept {
+    if (!bytes) return 0;
+    std::size_t released = 0;
+    try {
+        std::vector<std::shared_ptr<HostCache>> caches;
+        {
+            auto& state = registry();
+            std::lock_guard lock(state.mutex);
+            for (auto entry = state.caches.begin(); entry != state.caches.end();) {
+                if (auto cache = entry->lock()) { caches.push_back(std::move(cache)); ++entry; }
+                else entry = state.caches.erase(entry);
+            }
+        }
+        // Cache reclamation can release other owners; keep the registry unlocked.
+        for (const auto& cache : caches) {
+            try {
+                const auto reclaimed = cache->reclaim(bytes - released);
+                released += std::min(reclaimed, std::numeric_limits<std::size_t>::max() - released);
+            } catch (...) {}
+            if (released >= bytes) break;
+        }
+    } catch (...) {}
+    return released;
+}
+
+void tyloi::reclaim_host(std::size_t bytes, std::uint64_t process_limit) noexcept {
+    if (!bytes) return;
+    try {
+        const auto available = sample_host_memory().headroom(process_limit);
+        if (available >= bytes) return;
+        (void)reclaim_host_caches(bytes - available);
+        trim_host_cache();
+    } catch (...) {}
 }
 
 tyloi::HostMemorySample tyloi::sample_host_memory() {

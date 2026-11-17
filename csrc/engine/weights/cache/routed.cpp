@@ -1,4 +1,5 @@
 #include "engine/weights/cache/resources.h"
+#include "engine/memory/host.h"
 
 #include "engine/backends/cuda/native/context.h"
 #include "engine/backends/cuda/executor/executor.h"
@@ -279,6 +280,7 @@ void Cache::resize(std::size_t bytes) {
 }
 
 std::size_t Cache::reserve(std::size_t bytes) {
+    reclaim_host(bytes, data_->host_limit);
     return data_->tq ? data_->tq->reserve(bytes) : reclaim_moe_optional_host(data_->moe, bytes);
 }
 

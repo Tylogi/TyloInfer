@@ -503,12 +503,8 @@ MoeResidencyManager::MoeResidencyManager(MoeExpertCache* cache,Observer observer
         // cudaHostAlloc can synchronize with a graph waiting for host-side
         // expert publication. Reserve both directions before any replay and
         // keep adaptation batches within this fixed workspace thereafter.
-        const auto memory=s.memory_probe();
         auto capacity=std::min<std::uint64_t>({cache->host_experts_->stats().budget_bytes/4,
-            std::uint64_t(moe_ssd_residency_stage_limit_bytes),memory.available_host_bytes()/8});
-        if(cache->options_.host_limit)
-            capacity=std::min(capacity,memory.resident_bytes>=cache->options_.host_limit?std::uint64_t(0):
-                (cache->options_.host_limit-memory.resident_bytes)/8);
+            std::uint64_t(moe_ssd_residency_stage_limit_bytes),s.memory_probe().headroom(cache->options_.host_limit)/8});
         const auto options=::tyloi::TensorOptions().device(::tyloi::kCPU).dtype(::tyloi::kUInt8).pinned_memory(true);
         for(capacity=capacity/4096*4096;capacity;capacity=capacity/2/4096*4096) {
             try {
@@ -906,10 +902,7 @@ void MoeResidencyManager::prepare() {
     }
     std::uint64_t stage_limit=std::numeric_limits<std::uint64_t>::max();
     if(cache.options_.policy.warm) {
-        const auto memory=s.memory_probe();auto available=memory.available_host_bytes();
-        if(cache.options_.host_limit)
-            available=std::min(available,memory.resident_bytes>=cache.options_.host_limit
-                ? std::uint64_t(0):cache.options_.host_limit-memory.resident_bytes);
+        const auto available=s.memory_probe().headroom(cache.options_.host_limit);
         const auto reusable=std::uint64_t(s.backup.defined()?s.backup.numel():0)+
             std::uint64_t(s.upload.defined()?s.upload.numel():0);
         stage_limit=(available+reusable)/(s.direct?1:2);
