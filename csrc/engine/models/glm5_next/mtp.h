@@ -28,7 +28,7 @@ struct Mtp final : tyloi::models::Mtp {
     struct Layer {
         Parameter attention_norm, ffn_norm;
         std::unique_ptr<SparseMla> attention;
-        FeedForward ffn;
+        tyloi::models::Ffn ffn;
     };
 
     tyloi::models::glm5_next::Config config;

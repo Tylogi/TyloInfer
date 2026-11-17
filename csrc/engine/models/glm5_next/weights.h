@@ -1,32 +1,41 @@
 #pragma once
 #include "config.h"
+#include "engine/models/common/ffn.h"
 #include "engine/models/metadata.h"
 #include "../common/check.h"
 #include "../common/recurrent_attention.h"
 #include <memory>
+#include <utility>
 
 namespace tyloi::models::glm5_next {
 
 template <class Loader>
-auto load_dense_ffn(Loader &ops, const std::string &p, double limit) {
-    auto gate = ops.weight(p + ".gate.weight"), up = ops.weight(p + ".up.weight"),
-         down = ops.weight(p + ".down.weight");
-    return ops.gated_mlp(std::move(gate), std::move(up), std::move(down), limit);
+::tyloi::models::Mlp load_dense_ffn(Loader &ops, const std::string &p, double limit) {
+    ::tyloi::models::Mlp result;
+    result.gate_up = {ops.weight(p + ".gate.weight"), ops.weight(p + ".up.weight")};
+    result.down = ops.weight(p + ".down.weight");
+    result.swiglu_limit = limit;
+    return result;
 }
 
 template <class Loader>
-auto load_ffn(Loader &ops, const Config &c, int layer, const std::string &p, bool predictor) {
+::tyloi::models::Ffn load_ffn(Loader &ops, const Config &c, int layer,
+                              const std::string &p, bool predictor) {
     if (c.dense_layer(layer, predictor))
         return load_dense_ffn(ops, p, c.swiglu_limit);
-    auto gate_up = ops.routed_gate_up(p, layer, c.experts, c.moe_intermediate, c.hidden);
-    auto down = ops.routed(p + ".experts.down.weight", layer, c.experts, c.hidden, c.moe_intermediate);
-    auto router = ops.weight(p + ".router.weight");
-    auto shared = load_dense_ffn(ops, p + ".shared_expert", c.swiglu_limit);
-    auto bias = ::tyloi::Tensor(
-        ops.dense(p + ".router.bias").dense()
-            .to(::tyloi::kFloat32).contiguous());
-    return ops.moe(std::move(gate_up), std::move(down), std::move(router), std::move(shared),
-                   std::move(bias), c);
+    ::tyloi::models::Moe result;
+    result.gate_up = ops.routed_gate_up(p, layer, c.experts, c.moe_intermediate, c.hidden);
+    result.down = ops.routed(p + ".experts.down.weight", layer,
+                             c.experts, c.hidden, c.moe_intermediate);
+    result.router = ops.weight(p + ".router.weight");
+    result.shared = load_dense_ffn(ops, p + ".shared_expert", c.swiglu_limit);
+    result.router_bias = ::tyloi::Tensor(
+        ops.dense(p + ".router.bias").dense().to(::tyloi::kFloat32).contiguous());
+    result.routing = c.routing();
+    result.top_k = c.topk;
+    result.swiglu_limit = c.swiglu_limit;
+    result.layer = layer;
+    return result;
 }
 
 template <class Loader>

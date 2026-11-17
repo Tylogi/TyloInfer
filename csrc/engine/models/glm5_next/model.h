@@ -286,24 +286,11 @@ struct Mhc {
     }
 };
 
-struct FeedForward {
-    Linear gate, up, down;
-    std::vector<Linear> routed_gate_up;
-    Linear routed_down, router;
-    Parameter router_bias;
-    double limit = 0;
-    int64_t hidden = 0, topk = 0, intermediate = 0;
-    tyloi::ops::MoeRouting routing;
-
-    DenseTensor dense(const DenseTensor& input) const;
-    DenseTensor forward(const DenseTensor& input) const;
-};
-
 struct Layer {
     tyloi::models::glm5_next::Config config;
     Mhc attention_hc, ffn_hc;
     Parameter attention_norm, ffn_norm;
-    FeedForward ffn;
+    tyloi::models::Ffn ffn;
     std::unique_ptr<Kda> kda;
     std::unique_ptr<SparseMla> mla;
     int device = 0;
