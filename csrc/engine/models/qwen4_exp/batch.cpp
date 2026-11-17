@@ -13,6 +13,7 @@ namespace {
 class Request final : public BatchState {
 public:
     explicit Request(const Model& model) : state(model), model_(model) {}
+    models::State* target() noexcept override { return &state; }
     std::int64_t position() const override { return state.position(); }
     std::size_t resident_bytes() const override {
         for (const auto& [name, value] : state.metrics())
@@ -115,9 +116,9 @@ Tensor layer(const Layer& weights, const std::vector<State*>& requests, std::siz
 
 Batch::Batch(Model& model, const BatchConfig& config, bool batch_attention_projections)
     : model_(model), batch_attention_projections_(batch_attention_projections) {
-    require_model(config.slots > 0 && config.slots <= 32, "Flash-Next continuous batching supports 1..32 requests");
+    require_model(config.slots > 0 && config.slots <= 32, "Qwen4 continuous batching supports 1..32 requests");
     for (const auto& layer : model.layers)
-        require_model(layer->device == model.device, "Flash-Next continuous batching requires one device");
+        require_model(layer->device == model.device, "Qwen4 continuous batching requires one device");
 }
 
 std::unique_ptr<BatchState> Batch::make_state(std::int64_t) { return std::make_unique<Request>(model_); }
@@ -130,7 +131,7 @@ std::vector<State*> Batch::active(std::span<const BatchRow> rows) const {
     for (const auto& row : rows) if (row.eligible) {
         auto* request = dynamic_cast<Request*>(row.state);
         require_model(request && request->state.belongs_to(model_) && request->position() == row.position,
-            "Flash-Next batch decode position mismatch");
+            "Qwen4 batch decode position mismatch");
         result.push_back(&request->state);
     }
     return result;
@@ -171,7 +172,7 @@ StepSequence<std::vector<Tensor>> Batch::prefill(std::vector<BatchState*> batch,
 Tensor Batch::decode(std::span<const BatchRow> rows, Tensor ids, const Tensor& host_ids) {
     auto requests = active(rows);
     require_model(!requests.empty() && ids.dim() == 2 && ids.size(0) == std::int64_t(requests.size()) &&
-        ids.size(1) == 1, "invalid Flash-Next batch input");
+        ids.size(1) == 1, "invalid Qwen4 batch input");
     auto host_all = host_ids ? host_ids : ops::copy(ids, Device(kCPU));
     std::vector<Tensor> chunks, host;
     for (std::size_t row = 0; row < requests.size(); ++row) {

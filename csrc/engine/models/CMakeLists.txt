@@ -1,8 +1,6 @@
 set(TYLOINFER_MODEL_ASSEMBLY_SOURCES
     ${PROJECT_SOURCE_DIR}/engine/models/load.cpp
-    ${PROJECT_SOURCE_DIR}/engine/models/views/layers.cpp
     ${PROJECT_SOURCE_DIR}/engine/models/qwen35/load.cpp
-    ${PROJECT_SOURCE_DIR}/engine/models/qwen35/layers.cpp
     ${PROJECT_SOURCE_DIR}/engine/models/qwen4_exp/ops.cpp
     ${PROJECT_SOURCE_DIR}/engine/models/qwen4_exp/layer.cpp
     ${PROJECT_SOURCE_DIR}/engine/models/qwen4_exp/state.cpp
@@ -16,7 +14,6 @@ set(TYLOINFER_MODEL_ASSEMBLY_SOURCES "${TYLOINFER_MODEL_ASSEMBLY_SOURCES}" PAREN
 set(TYLOINFER_CUDA_MODEL_SOURCES
     ${PROJECT_SOURCE_DIR}/engine/models/deepseek_v41/axial_patch_encoder.cpp
     ${PROJECT_SOURCE_DIR}/engine/models/deepseek_v4/ops.cpp
-    ${PROJECT_SOURCE_DIR}/engine/models/deepseek_v4/groups.cpp
     ${PROJECT_SOURCE_DIR}/engine/models/deepseek_v41/ops.cpp
     ${PROJECT_SOURCE_DIR}/engine/models/deepseek_v41/components.cpp
     ${PROJECT_SOURCE_DIR}/engine/models/deepseek_v41/load.cpp
@@ -29,7 +26,6 @@ set(TYLOINFER_CUDA_MODEL_SOURCES
     ${PROJECT_SOURCE_DIR}/engine/models/glm5_next/ops.cpp
     ${PROJECT_SOURCE_DIR}/engine/models/glm5_next/components.cpp
     ${PROJECT_SOURCE_DIR}/engine/models/gemma4/forward.cpp
-    ${PROJECT_SOURCE_DIR}/engine/models/gemma4/layers.cpp
     ${PROJECT_SOURCE_DIR}/engine/models/gemma4/load.cpp
     ${PROJECT_SOURCE_DIR}/engine/models/gemma4/model.cpp
     ${PROJECT_SOURCE_DIR}/engine/models/gemma4/state.cpp
@@ -45,7 +41,5 @@ set(TYLOINFER_MODELS_CUDA_SOURCES
     ${PROJECT_SOURCE_DIR}/engine/models/minicpmo45/state.cpp
     ${PROJECT_SOURCE_DIR}/engine/models/minicpmo45/forward.cpp
     ${PROJECT_SOURCE_DIR}/engine/models/qwen35/batch_ops.cpp
-    ${PROJECT_SOURCE_DIR}/engine/models/views/groups.cpp
-    ${PROJECT_SOURCE_DIR}/engine/models/views/ffn.cpp
 )
 set(TYLOINFER_MODELS_CUDA_SOURCES "${TYLOINFER_MODELS_CUDA_SOURCES}" PARENT_SCOPE)

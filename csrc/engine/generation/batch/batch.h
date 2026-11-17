@@ -20,13 +20,15 @@ class Batch {
     virtual void step(const std::vector<std::string>& eligible) = 0;
     virtual Metrics metrics() const = 0;
     virtual void release_idle_buffers() = 0;
+    virtual bool supports_sessions() const noexcept { return false; }
 };
 
-// Physical row metadata only. Request lifecycle and output belong to the scheduler.
+// Request metadata shared by batch drivers; the scheduler owns lifecycle and output.
 struct BatchRequest {
     BatchRequest(std::string id, const InferenceRequest& input)
         : id(std::move(id)), prompt(input.prompt), sampling(input.sampling),
-          token_constraint(input.token_constraint), generation_limit(input.sampling.max_tokens) {}
+          token_constraint(input.token_constraint), generation_limit(input.sampling.max_tokens),
+          cache_plan(input.cache_plan), history(input.prompt) {}
     std::string id;
     std::vector<int64_t> prompt;
     MfqSamplingParams sampling;
@@ -35,6 +37,10 @@ struct BatchRequest {
     int64_t pending_token = 0;
     bool eligible = false;
     int64_t prefill_offset = 0, cache_length = 0;
+    MfqPromptCachePlan cache_plan;
+    std::vector<std::int64_t> history;
+    std::size_t prefix = 0, checkpoint = 0;
+    bool completed = false;
 };
 
 template <class Request> struct BatchState {
@@ -111,6 +117,7 @@ template <class Ops> class ContinuousBatch : public Batch {
     }
   public:
     void bind(Budget& budget) override { operations.bind(budget); }
+    bool supports_sessions() const noexcept override { return operations.supports_sessions(); }
     bool empty() const noexcept { return requests.empty(); }
     void invalidate_runtime_policy() {
         if constexpr (requires { operations.invalidate_runtime_policy(); }) operations.invalidate_runtime_policy();
@@ -135,11 +142,8 @@ template <class Ops> class ContinuousBatch : public Batch {
         if (!requests.emplace(work->request->id, work).second)
             throw std::invalid_argument("duplicate batch request id");
         ExecutionCleanup cleanup{output.cleanup_failure, [&] { release(*work); }};
-        int64_t reused = 0, prefix = 0;
-        if constexpr (requires { operations.prepare(work->request); })
-            reused = operations.prepare(work->request);
-        if constexpr (requires { operations.prefix_tokens(work->request); })
-            prefix = operations.prefix_tokens(work->request);
+        const auto reused = operations.prepare(work->request);
+        const auto prefix = operations.prefix_tokens(work->request);
         const auto prompt_tokens = static_cast<int64_t>(input.prompt.size());
         double elapsed = 0.0;
         auto offset = reused;
@@ -175,10 +179,11 @@ template <class Ops> class ContinuousBatch : public Batch {
                 while (!output.stopped()) {
                     auto delta = output.append(std::vector<std::int64_t>{token});
                     auto& request = *work->request;
+                    request.history.insert(request.history.end(), delta.token_ids.begin(), delta.token_ids.end());
                     // activate() initializes counts for the first sample.
                     if (request.produced) operations.accept(work->request, work->sample());
                     request.pending_token = token;
-                    ++request.produced;
+                    request.produced += static_cast<std::int32_t>(delta.token_ids.size());
                     if (!output.stopped()) work->schedule_decode();
                     co_yield std::move(delta);
                     if (!output.stopped()) {
@@ -189,6 +194,9 @@ template <class Ops> class ContinuousBatch : public Batch {
                 }
             }
         }
+        auto tail = output.finish();
+        if (!tail.diffs.empty()) co_yield std::move(tail);
+        work->request->completed = !output.result.cancelled;
         cleanup.finish();
     }
 

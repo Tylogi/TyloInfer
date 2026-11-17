@@ -9,7 +9,6 @@
 #include <algorithm>
 #include <array>
 #include <exception>
-#include <iostream>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -175,92 +174,4 @@ std::optional<Tensor> capture_batch(models::Batch& batch, Executor& executor,
     }
 }
 
-BatchDriver::BatchDriver(std::unique_ptr<models::Batch> batch, Executor& executor,
-        weights::Cache& weights, Budget& budget, Device device, std::size_t workspace_reserve)
-    : executor_(executor), weights_(weights), budget_(budget), device_(device),
-      workspace_reserve_(workspace_reserve), batch_(std::move(batch)) {
-    if(!batch_)throw std::invalid_argument("model does not provide numerical batching");
-}
-
-void BatchDriver::initialize() {
-    auto scope=executor_.enter();
-    reserve_batch(budget_,device_,batch_->initial_growth_bytes(),std::size_t(64)<<20);
-    batch_->initialize();
-    weights_.finish_exchange();
-    executor_.drain();
-}
-
-BatchDriver::~BatchDriver() noexcept {
-    std::unique_ptr<Executor::Scope> scope;
-    try { scope=executor_.enter(); } catch(const std::exception& e) { std::cerr<<"batch_driver_cleanup error="<<e.what()<<'\n'; } catch(...) {}
-    try { weights_.drain(); } catch(const std::exception& e) { std::cerr<<"batch_driver_cleanup error="<<e.what()<<'\n'; } catch(...) {}
-    try { executor_.drain(); } catch(const std::exception& e) { std::cerr<<"batch_driver_cleanup error="<<e.what()<<'\n'; } catch(...) {}
-    try { close(); } catch(const std::exception& e) { std::cerr<<"batch_driver_cleanup error="<<e.what()<<'\n'; } catch(...) {}
-}
-
-models::BatchState& BatchDriver::add(std::int64_t prompt_tokens) {
-    auto scope=executor_.enter();
-    if(states_.empty())weights_.finish_exchange();
-    auto state=batch_->make_state(prompt_tokens);
-    if(!state)throw std::runtime_error("batch state is unavailable");
-    reserve_batch(budget_,device_,state->initial_growth_bytes(),std::size_t(64)<<20);
-    states_.push_back(std::move(state));
-    states_.back()->initialize();
-    return *states_.back();
-}
-
-Tensor BatchDriver::prefill(models::BatchState& state, Tensor ids) {
-    auto scope=executor_.enter();
-    if(ids.dim()!=2 || ids.size(0)!=1 || ids.size(1)<=0)
-        throw std::invalid_argument("batch prompt must be nonempty [1,tokens]");
-    if(state.position()!=0)throw std::runtime_error("batch prefill position mismatch");
-    const auto count=ids.size(1);
-    const auto growth=state.prefill_growth_bytes(count);
-    std::size_t primary=0;
-    for(const auto& [device,bytes]:growth) {
-        if(device==device_)primary=prefill_budget_add(primary,bytes);
-        else if(bytes && device.is_cpu())budget_.reserve_ram(bytes);
-        else if(bytes)budget_.reserve_kv(device,prefill_budget_add(bytes,std::size_t(64)<<20));
-    }
-    const auto chunk=budget_.batch(device_,batch_->prefill_row_bytes(),{0,count,true},primary);
-    if(chunk.count!=count)throw std::runtime_error("batch prefill admission cannot preserve the full prompt");
-    if(count>1024)weights_.workspace(workspace_reserve_);
-    reserve_batch(budget_,device_,growth,std::size_t(256)<<20,true);
-    auto outputs=prefill_batch(*batch_,executor_,weights_,budget_,device_,{&state},{std::move(ids)});
-    if(outputs.size()!=1)throw std::runtime_error("invalid batch prefill output count");
-    return std::move(outputs.front());
-}
-
-std::optional<Tensor> BatchDriver::capture(const std::vector<models::BatchRow>& rows,
-        const Tensor& ids, const Tensor& host_ids, bool greedy) {
-    auto scope=executor_.enter();
-    std::unique_ptr<models::Batch::Plan> plan;
-    try {
-        reserve_batch(budget_,device_,batch_->decode_growth(rows),std::size_t(64)<<20);
-        batch_->prepare_decode(rows);
-        plan=plan_batch(*batch_,executor_,weights_,budget_,device_,rows,greedy);
-        if(!plan)return {};
-        if(plan->rebuild) {
-            executor_.reclaim(device_);
-            reserve_batch(budget_,device_,plan->growth,std::size_t(64)<<20);
-        }
-        return capture_batch(*batch_,executor_,weights_,budget_,device_,rows,ids,host_ids,greedy,*plan);
-    } catch(...) {
-        auto failure=std::current_exception();
-        try { weights_.drain(); } catch(...) {}
-        try { executor_.drain(); } catch(...) {}
-        plan.reset();
-        std::rethrow_exception(failure);
-    }
-}
-
-void BatchDriver::close() {
-    if(!batch_)return;
-    std::exception_ptr failure;
-    try { batch_->clear(); } catch(...) { failure=std::current_exception(); }
-    for(auto& state:states_)if(state)try { batch_->release(*state); }
-        catch(...) { if(!failure)failure=std::current_exception(); }
-    batch_.reset(); states_.clear();
-    if(failure)std::rethrow_exception(failure);
-}
 }

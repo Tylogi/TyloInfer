@@ -11,6 +11,7 @@ class Batch : public models::Batch {
 public:
     Batch(Model&, const BatchConfig&, bool batch_attention_projections);
     std::unique_ptr<BatchState> make_state(std::int64_t) override;
+    bool supports_sessions() const noexcept override { return true; }
     bool supports_packed() const override { return true; }
     std::size_t prefill_row_bytes() const override;
     StepSequence<std::vector<Tensor>> prefill(std::vector<BatchState*>, std::vector<Tensor>) override;

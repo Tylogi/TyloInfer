@@ -39,10 +39,8 @@ inline MlxSamplingParams mlx_batch_sampling(const MfqSamplingParams& input) {
 
 struct MlxQwen4BatchRequest : tyloi::engine::BatchRequest {
     MlxQwen4BatchRequest(std::string id, const tyloi::engine::InferenceRequest& input)
-        : BatchRequest(std::move(id), input), sampler(mlx_batch_sampling(input.sampling)),
-          cache_plan(input.cache_plan), history(input.prompt) {}
+        : BatchRequest(std::move(id), input), sampler(mlx_batch_sampling(input.sampling)) {}
     MlxSampler sampler;
-    MfqPromptCachePlan cache_plan;
     std::shared_ptr<MlxQwen4RequestCache> cache;
     std::optional<mlx::core::array> counts;
     std::optional<mlx::core::array> initial_logits;
@@ -62,8 +60,6 @@ struct MlxQwen4BatchRequest : tyloi::engine::BatchRequest {
     std::chrono::steady_clock::time_point draft_started;
     std::uint64_t draft_epoch = 0;
     bool draft_calibration = true;
-    std::vector<std::int64_t> history;
-    std::size_t prefix = 0, checkpoint = 0;
 };
 
 class MlxQwen4BatchOperations {
@@ -91,6 +87,7 @@ public:
     void bind(tyloi::engine::Budget&) {
         throw std::invalid_argument("legacy Metal batching cannot bind the shared Engine budget");
     }
+    bool supports_sessions() const noexcept { return true; }
 
     std::int64_t prepare(const std::shared_ptr<Request>& request) {
         request->mtp = request->sampling.enable_mtp && runtime_.supports_mtp();
@@ -225,7 +222,6 @@ public:
         if (request->token_constraint) request->token_constraint->accept(result.token);
         if (request->counts) *request->counts = sample_token_counts_add(*request->counts,
             mlx::core::array({result.token}, {1, 1}, mlx::core::int32));
-        request->history.push_back(result.token);
     }
     Decoded decode(const State& state) {
         bool speculative = false;
@@ -287,7 +283,7 @@ public:
                 runtime_.resolve_request(*request->cache, 0);
                 request->cache_length = runtime_.request_cache_position(*request->cache);
             }
-            checkpoint(*request, request->cache_length, true);
+            if (request->completed) checkpoint(*request, request->cache_length, true);
             request->cache.reset();
             request->target_work.reset();
             request->target_result.reset();

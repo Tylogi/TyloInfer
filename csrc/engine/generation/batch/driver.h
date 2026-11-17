@@ -28,32 +28,4 @@ std::optional<Tensor> capture_batch(models::Batch& batch, Executor& executor,
     weights::Cache& weights, Budget& budget, Device device, const std::vector<models::BatchRow>& rows,
     const Tensor& ids, const Tensor& host_ids, bool greedy, const models::Batch::Plan& plan);
 
-/** Own a controlled numerical batch and its independently admitted request states. */
-class BatchDriver final {
-public:
-    BatchDriver(std::unique_ptr<models::Batch> batch, Executor& executor,
-        weights::Cache& weights, Budget& budget, Device device, std::size_t workspace_reserve);
-    ~BatchDriver() noexcept;
-    BatchDriver(const BatchDriver&) = delete;
-    BatchDriver& operator=(const BatchDriver&) = delete;
-    /** Admit and initialize batch-wide backing after the resource owner retains this driver. */
-    void initialize();
-    /** Admit and initialize a request state; this driver owns it until retirement. */
-    models::BatchState& add(std::int64_t prompt_tokens);
-    /** Run one full prompt span, preserving the production admission and event driver. */
-    Tensor prefill(models::BatchState& state, Tensor ids);
-    /** Run an eligible graph; an empty result means the model did not execute one. */
-    std::optional<Tensor> capture(const std::vector<models::BatchRow>& rows,
-        const Tensor& ids, const Tensor& host_ids, bool greedy);
-    /** Retire graphs and states after the resource owner has drained. */
-    void close();
-private:
-    Executor& executor_;
-    weights::Cache& weights_;
-    Budget& budget_;
-    Device device_;
-    std::size_t workspace_reserve_;
-    std::unique_ptr<models::Batch> batch_;
-    std::vector<std::unique_ptr<models::BatchState>> states_;
-};
 }

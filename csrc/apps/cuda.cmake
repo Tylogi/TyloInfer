@@ -3,10 +3,9 @@ if(TARGET mfq-transport)
         ${PROJECT_SOURCE_DIR}/apps/runtime_main.cpp
         ${PROJECT_SOURCE_DIR}/commands/runtime.cpp
         ${PROJECT_SOURCE_DIR}/commands/cli.cpp
-        ${PROJECT_SOURCE_DIR}/commands/minicpmo45.cpp
     )
     target_link_libraries(tyloi-engine PRIVATE
-        mfq-cuda-eval mfq-transport)
+        mfq-cuda-engine mfq-transport)
     target_compile_definitions(tyloi-engine PRIVATE TYLOINFER_CLI_CUDA=1 TYLOINFER_CLI_METAL=0)
 endif()
 

@@ -15,6 +15,8 @@
 
 namespace tyloi::models {
 
+class State;
+
 /** Per-device allocation requirements for batch state. */
 using BatchGrowth = std::vector<std::pair<Device, std::size_t>>;
 
@@ -38,6 +40,8 @@ struct BatchSample {
 class BatchState {
 public:
     virtual ~BatchState() = default;
+    /** Return the independent target state, when this row owns one. */
+    virtual State* target() noexcept { return nullptr; }
     /** Return the number of committed tokens. */
     virtual std::int64_t position() const = 0;
     /** Return resident bytes owned by this request. */
@@ -75,6 +79,8 @@ public:
     virtual BatchGrowth initial_growth_bytes() const { return {}; }
     /** Initialize batch-wide backing after admission. */
     virtual void initialize() {}
+    /** Report whether request-owned target states support session snapshots. */
+    virtual bool supports_sessions() const noexcept { return false; }
     /** Create uninitialized numerical state for one request. */
     virtual std::unique_ptr<BatchState> make_state(std::int64_t prompt_tokens) = 0;
     /** Report whether independent prompt spans can be computed together. */

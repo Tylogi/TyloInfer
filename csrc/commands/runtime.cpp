@@ -3,10 +3,6 @@
 #include "engine/config.h"
 #include "engine/engine.h"
 #include "engine/load.h"
-#if TYLOINFER_CLI_CUDA
-#include "minicpmo45.h"
-#include "engine/program.h"
-#endif
 #include "engine/models/source/model.h"
 #include "engine/models/source/model_config.h"
 #include "transport/include/transport.h"
@@ -32,12 +28,6 @@ void print_help() {
         << "TyloInfer runtime\n\n"
         << "Usage:\n"
         << "  tyloi-engine --model MODEL --transport stdio|http [OPTIONS]\n"
-#if TYLOINFER_CLI_CUDA
-        << "  tyloi-engine --model MODEL --minicpmo-input-prefix PREFIX "
-           "--minicpmo-output-prefix PREFIX [OPTIONS]\n"
-        << "  tyloi-engine --model MODEL --minicpmo-duplex-input-prefix PREFIX "
-           "--minicpmo-duplex-output-prefix PREFIX [OPTIONS]\n"
-#endif
         << '\n'
         << "Runtime options:\n"
         << "  --model PATH                    model or split-model shard\n"
@@ -79,15 +69,8 @@ struct RuntimeOptions : tyloi::engine::EngineOptions {
     bool inspect_model_json = false;
 };
 
-struct RuntimeCommandOptions
-    : RuntimeOptions
-#if TYLOINFER_CLI_CUDA
-    , tyloi::cuda::minicpmo45::CommandOptions
-#endif
-{};
-
-RuntimeCommandOptions parse_runtime(ArgCursor& args) {
-    RuntimeCommandOptions result;
+RuntimeOptions parse_runtime(ArgCursor& args) {
+    RuntimeOptions result;
 #if TYLOINFER_CLI_CUDA
     result.device = tyloi::Device(tyloi::DeviceType::cuda);
 #elif TYLOINFER_CLI_METAL
@@ -103,12 +86,6 @@ RuntimeCommandOptions parse_runtime(ArgCursor& args) {
             throw HelpRequested{};
         }
         if (parse_load_option(option, args, result)) continue;
-#if TYLOINFER_CLI_CUDA
-        if (tyloi::cuda::minicpmo45::parse_command_option(
-                option, args, result)) {
-            continue;
-        }
-#endif
         if (option == "--inspect-model-json") {
             result.inspect_model_json = true;
         }
@@ -165,20 +142,10 @@ RuntimeCommandOptions parse_runtime(ArgCursor& args) {
     }
 
     if (result.model_path.empty()) usage_error("--model is required");
-    int modes = static_cast<int>(result.transport_mode) +
+    const int modes = static_cast<int>(result.transport_mode) +
         static_cast<int>(result.inspect_model_json);
-#if TYLOINFER_CLI_CUDA
-    tyloi::cuda::minicpmo45::validate_command_options(result);
-    modes +=
-        static_cast<int>(!result.input_prefix.empty()) +
-        static_cast<int>(!result.duplex_input_prefix.empty());
-#endif
     if (modes != 1) {
-        usage_error("select exactly one execution mode: --inspect-model-json or --transport"
-#if TYLOINFER_CLI_CUDA
-                    ", MiniCPM-o composite, or MiniCPM-o duplex"
-#endif
-        );
+        usage_error("select exactly one execution mode: --inspect-model-json or --transport");
     }
     if (transport_option && !result.transport_mode) {
         usage_error("transport options require --transport");
@@ -247,7 +214,7 @@ int run_transport_runtime(RuntimeOptions& options) {
     return transport->run(*engine);
 }
 
-int execute_runtime(RuntimeCommandOptions options) {
+int execute_runtime(RuntimeOptions options) {
     return with_command_errors([&]() -> int {
         if (options.inspect_model_json) {
             const auto source = tyloi::open_model_source(options.model_path);
@@ -268,14 +235,6 @@ int execute_runtime(RuntimeCommandOptions options) {
             return 0;
         }
         if (options.stdio_mode) prepare_mfq_stdio_transport();
-#if TYLOINFER_CLI_CUDA
-        if (!options.duplex_input_prefix.empty() || !options.input_prefix.empty()) {
-            auto program = tyloi::cuda::Program::open(options);
-            return !options.duplex_input_prefix.empty()
-                ? tyloi::cuda::minicpmo45::run_duplex(*program, options)
-                : tyloi::cuda::minicpmo45::run_composite(*program, options);
-        }
-#endif
         return run_transport_runtime(options);
     });
 }

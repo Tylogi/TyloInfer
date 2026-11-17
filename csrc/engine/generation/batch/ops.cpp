@@ -10,9 +10,11 @@
 #include "engine/generation/decode.h"
 #include "engine/generation/prefill/budget.h"
 #include "engine/generation/sampling.h"
+#include "engine/generation/session.h"
 #include "engine/models/batch.h"
 #include "engine/models/causal_model.h"
 #include "engine/ops/ops.h"
+#include "engine/state/session/sessions.h"
 #include "engine/weights/cache/cache.h"
 
 #include <algorithm>
@@ -25,12 +27,12 @@
 
 namespace tyloi::engine {
 
-bool batch_compatible(const EngineRequest& request, bool persistent_prefix, bool has_mtp) {
+bool batch_compatible(const EngineRequest& request, bool persistent_prefix, bool has_mtp, bool sessions) {
     const auto& input = request.input;
-    return !input.media && input.cache_plan.session_id.empty() &&
+    return !input.media && (sessions || (input.cache_plan.session_id.empty() &&
            !(input.prefix_cache_enabled &&
                (request.token_ids.empty() || input.cache_plan.stable_prefix_tokens) &&
-               persistent_prefix) &&
+               persistent_prefix))) &&
            !(input.sampling.enable_mtp && has_mtp);
 }
 
@@ -44,6 +46,7 @@ struct BatchRow : BatchRequest {
     std::unique_ptr<models::BatchState> state;
     std::int64_t row = -1;
     double packed_ms = 0;
+    bool caching = false;
 };
 
 std::exception_ptr prefill_failure(std::exception_ptr failure) {
@@ -78,15 +81,16 @@ public:
     static constexpr bool isolate_context_growth_failures = true;
 
     Ops(models::CausalModel& model, std::unique_ptr<models::Batch> batch, Executor& executor,
-        weights::Cache& weights, Budget& budget, ContinuousBatchConfig config,
+        weights::Cache& weights, Budget& budget, state::Sessions& sessions, ContinuousBatchConfig config,
         Device device, std::size_t workspace, bool packed, std::int64_t packed_tokens)
-        : model_(model), batch_(std::move(batch)), executor_(executor), weights_(weights), budget_(&budget),
+        : model_(model), batch_(std::move(batch)), executor_(executor), weights_(weights), budget_(&budget), sessions_(sessions),
           config_(std::move(config)), device_(device), workspace_(workspace), packed_(packed), packed_tokens_(packed_tokens) {
         if (!batch_ || config_.max_sequences == 0 || config_.max_sequences > 32)
             throw std::invalid_argument("continuous batching supports 1..32 requests");
     }
 
     void bind(Budget& budget) noexcept { budget_ = &budget; }
+    bool supports_sessions() const noexcept { return batch_->supports_sessions(); }
     std::int64_t cache_length(const std::shared_ptr<Request>& request) const { return request->state->position(); }
     std::int64_t vocab_size() const { return model_.info().vocab_size; }
     std::int64_t max_context() const { return model_.info().max_context; }
@@ -122,6 +126,26 @@ public:
         auto scope=executor_.enter();
         batch_->resume(position);
     }
+    std::int64_t prepare(const std::shared_ptr<Request>& request) {
+        auto scope = executor_.enter();
+        suspend_decode();
+        initialize(request, {});
+        auto* target = request->state->target();
+        if (supports_sessions() && !target)
+            throw std::logic_error("batch session state is unavailable");
+        request->caching = supports_sessions() && target && target->supports_text_session_state() &&
+            request->cache_plan.stable_prefix_tokens > 0 &&
+            (!request->cache_plan.session_id.empty() || sessions_.persistent_prefix_enabled());
+        if (!request->caching) return 0;
+        request->prefix = std::min(request->cache_plan.stable_prefix_tokens, request->prompt.size() - 1);
+        const auto restored = sessions_.restore_best(*target, executor_, weights_, *budget_, nullptr,
+            request->cache_plan.session_id, request->prompt, request->cache_plan.stable_prefix_tokens);
+        request->checkpoint = restored.tokens;
+        return static_cast<std::int64_t>(restored.tokens);
+    }
+    std::int64_t prefix_tokens(const std::shared_ptr<Request>& request) const {
+        return static_cast<std::int64_t>(request->prefix);
+    }
     PrefillChunk prefill_chunk(const std::shared_ptr<Request>& request, PrefillChunk chunk) {
         auto scope = executor_.enter();
         if (!request->state) weights_.finish_exchange();
@@ -155,6 +179,7 @@ public:
                     request->counts, request->token_constraint);
             timer->stop({hidden, next});
             request->timers.push_back(std::move(timer));
+            if (request->state->position() == static_cast<std::int64_t>(request->prefix)) checkpoint(request);
             return finish(request, std::move(next));
         } catch (...) { std::rethrow_exception(prefill_failure(std::current_exception())); }
     }
@@ -224,6 +249,8 @@ public:
                 const auto milliseconds=timer->elapsed_ms();
                 for (auto row : rows) {
                     items[row].first->packed_ms += milliseconds*items[row].second.count/tokens;
+                    const auto& request = items[row].first;
+                    if (request->state->position() == static_cast<std::int64_t>(request->prefix)) checkpoint(request);
                     result[row].sample=finish(items[row].first,std::move(next[row]));
                 }
                 ++packed_batches_; packed_requests_+=rows.size(); packed_rows_+=tokens;
@@ -254,6 +281,7 @@ public:
         weights_.finish_exchange();
         executor_.drain();
         for (const auto& request : retired) {
+            if (request->completed) checkpoint(request);
             if (request->state) batch_->release(*request->state);
             request->state.reset(); request->ids={}; request->timers.clear(); request->packed_ms=0;
         }
@@ -348,6 +376,13 @@ public:
     }
 
 private:
+    void checkpoint(const std::shared_ptr<Request>& request) {
+        if (!request->caching || !request->state ||
+            request->state->position() == static_cast<std::int64_t>(request->checkpoint)) return;
+        const auto saved = save_session(*request->state->target(), sessions_,
+            request->cache_plan.session_id, request->history);
+        if (saved) request->checkpoint = saved;
+    }
     void reserve(const models::BatchGrowth& values, std::size_t margin, bool primary=false) {
         reserve_batch(*budget_,device_,values,margin,primary);
     }
@@ -392,6 +427,7 @@ private:
     Executor& executor_;
     weights::Cache& weights_;
     Budget* budget_;
+    state::Sessions& sessions_;
     ContinuousBatchConfig config_;
     Device device_;
     std::size_t workspace_;
@@ -404,7 +440,8 @@ private:
 } // namespace
 
 std::unique_ptr<Batch> make_batch(models::CausalModel& model, Executor& executor,
-    weights::Cache& weights, Budget& budget, const Config& config, const models::ForwardOptions& forward) {
+    weights::Cache& weights, Budget& budget, state::Sessions& sessions,
+    const Config& config, const models::ForwardOptions& forward) {
     const auto& settings=config.continuous_batch;
     auto scope=executor.enter();
     auto batch = model.make_batch({settings.max_sequences,settings.paged_kv,settings.preallocate,
@@ -425,7 +462,7 @@ std::unique_ptr<Batch> make_batch(models::CausalModel& model, Executor& executor
     }
     return std::make_unique<ContinuousBatch<Ops>>(config.generation.prefill_chunk_size,
         config.continuous_batch.prefill_token_budget,model,std::move(batch),executor,weights,budget,
-        config.continuous_batch,config.device,config.workspace_reserve,config.continuous_batch.packed_prefill,
+        sessions,config.continuous_batch,config.device,config.workspace_reserve,config.continuous_batch.packed_prefill,
         config.continuous_batch.packed_tokens);
 }
 } // namespace tyloi::engine

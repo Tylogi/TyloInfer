@@ -3,8 +3,8 @@
 #include "engine/generation/decode.h"
 #include "engine/generation/prefill/prefill.h"
 #include "engine/generation/prefill/activity.h"
-#include "engine/generation/run.h"
 #include "engine/generation/batch/batch.h"
+#include "engine/generation/session.h"
 #include "engine/generation/mtp/state.h"
 #include "engine/generation/mtp/generation.h"
 #include "engine/generation/sampling.h"
@@ -24,6 +24,29 @@
 #include <stdexcept>
 
 namespace tyloi::engine {
+
+std::size_t save_session(models::State& state, state::Sessions& sessions,
+        const std::string& session, const std::vector<std::int64_t>& history,
+        const std::string& input_key, models::Mtp* mtp, const Tensor& last_hidden) {
+    const auto position = state.position();
+    if (position <= 0 || static_cast<std::size_t>(position) > history.size()) return 0;
+    if (mtp && (!last_hidden || !last_hidden.defined() || position <= 1)) return 0;
+    try {
+        std::vector<std::int64_t> tokens(history.begin(), history.begin() + position);
+        auto saved = state.capture_text_session_state(tokens);
+        saved.input_key = input_key;
+        if (mtp) {
+            saved.mtp = mtp->capture_session_state(*state.predictor, position, last_hidden);
+            saved.bytes += saved.mtp->bytes;
+        }
+        sessions.store(session, std::move(saved));
+        return static_cast<std::size_t>(position);
+    } catch (const std::exception& error) {
+        std::cerr << "runtime_session_cache action=skip error=" << error.what() << '\n';
+    }
+    return 0;
+}
+
 namespace {
 
 struct Plain {
@@ -324,25 +347,12 @@ Generation generate_session(Native& ops, InferenceRequest& request, InferenceOut
     bool initial_snapshot_attempted = false;
     const auto snapshot = [&] {
         const auto position = state.position();
-        if (!caching || output.result.cancelled || position <= 0 ||
-            static_cast<std::size_t>(position) > history.size() ||
+        if (!caching || output.result.cancelled ||
             static_cast<std::size_t>(position) == last_snapshot)
             return;
-        try {
-            std::vector<int64_t> tokens(history.begin(), history.begin() + position);
-            auto saved = state.capture_text_session_state(tokens);
-            saved.input_key = input_key;
-            if (use_mtp) {
-                if (!last_target_hidden || !last_target_hidden.defined() || position <= 1)
-                    return;
-                saved.mtp = mtp->capture_session_state(*state.predictor, position, last_target_hidden);
-                saved.bytes += saved.mtp->bytes;
-            }
-            session_cache.store(cache_plan.session_id, std::move(saved));
-            last_snapshot = static_cast<std::size_t>(position);
-        } catch (const std::exception &error) {
-            std::cerr << "runtime_session_cache action=skip error=" << error.what() << '\n';
-        }
+        const auto saved = save_session(state, session_cache, cache_plan.session_id,
+            history, input_key, use_mtp ? mtp : nullptr, last_target_hidden);
+        if (saved) last_snapshot = saved;
     };
     auto sequence = use_mtp
         ? ops.speculate(request, output, restored.tokens, restored.mtp_last_target_hidden,
@@ -474,12 +484,4 @@ StepSequence<EventData> Engine::generate(const RequestId& id, Request& request) 
         request.input, *request.output);
 }
 
-Generation generate(Run run, InferenceRequest& request, InferenceOutput& output, RequestId) {
-    auto sequence = generate_prepared(
-        Native{run.model, run.state, run.executor, run.budget, run.graph, run.weights, run.info,
-            run.config, run.forward_options, run.source, run.cache,
-            run.mtp_state, run.mtp, &run.executor},
-        request, output);
-    while (auto step = sequence.next()) co_yield std::move(step);
-}
 } // namespace tyloi::engine

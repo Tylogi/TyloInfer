@@ -89,7 +89,6 @@ set(TYLOINFER_CUDA_ENGINE_SOURCES
     ${PROJECT_SOURCE_DIR}/engine/models/minicpmo45/engine.cpp
     ${PROJECT_SOURCE_DIR}/engine/load.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/load.cpp
-    ${PROJECT_SOURCE_DIR}/engine/program.cpp
     ${TYLOINFER_CUDA_MODEL_SOURCES}
 )
 add_library(mfq-cuda-engine STATIC
@@ -128,5 +127,4 @@ set_target_properties(mfq-cuda-engine PROPERTIES
 )
 
 # The production entry point is part of the CUDA engine build.
-include(${PROJECT_SOURCE_DIR}/eval/cuda.cmake)
 include(${PROJECT_SOURCE_DIR}/apps/cuda.cmake)

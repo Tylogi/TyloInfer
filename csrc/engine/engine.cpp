@@ -233,7 +233,7 @@ void Engine::install(std::unique_ptr<tyloi::Executor::Graph> graph) {
         budget_->bind(predictor != nullptr);
         executor_->bind_budget(&*budget_);
         if (!batch_ && config_.continuous_batch.max_sequences)
-            batch_ = engine::make_batch(*model_, *executor_, *weights_, *budget_, config_, forward_options_);
+            batch_ = engine::make_batch(*model_, *executor_, *weights_, *budget_, *cache_, config_, forward_options_);
         if (batch_) batch_->bind(*budget_);
         if (const auto bytes = config_.resident_budget_bytes) {
             engine::SessionCommand command; command.kind = engine::SessionCommand::Kind::memory_budget; command.bytes = bytes;
@@ -440,7 +440,8 @@ ControlResult Engine::control_command(ControlRequest request) {
 }
 
 bool Engine::can_batch(const EngineRequest& request) const {
-    return batch_ && batch_compatible(request, cache_->persistent_prefix_enabled(), model_->predictor() != nullptr);
+    return batch_ && batch_compatible(request, cache_->persistent_prefix_enabled(),
+        model_->predictor() != nullptr, batch_->supports_sessions());
 }
 
 bool Engine::exclusive() const { return false; }
