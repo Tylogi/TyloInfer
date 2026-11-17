@@ -508,7 +508,8 @@ void Context::check_memory_limit(std::size_t additional) const {
 }
 
 void Context::begin_workspace_loan(const std::vector<std::pair<void*,std::size_t>>& regions,
-                                  cudaStream_t stream) {
+                                  cudaStream_t stream,
+                                  std::shared_ptr<void> backing) {
     std::lock_guard lock(graph_pool_mutex_);
     if(workspace_loan_)throw Error("CUDA workspace loan is already active");
     auto loan=std::make_unique<WorkspaceLoan>();
@@ -528,6 +529,7 @@ void Context::begin_workspace_loan(const std::vector<std::pair<void*,std::size_t
         // happened to place them adjacently. Never coalesce across their bounds.
         if(it->first+it->second==next->first)it->second-=256;
     }
+    loan->backing=std::move(backing);
     workspace_loan_=std::move(loan);
 }
 void Context::suspend_workspace_loan() {
@@ -535,13 +537,39 @@ void Context::suspend_workspace_loan() {
     if(workspace_loan_)workspace_loan_->enabled=false;
 }
 void Context::end_workspace_loan() {
-    std::lock_guard lock(graph_pool_mutex_);
-    if(workspace_loan_ && !workspace_loan_->live.empty()) {
-        std::size_t bytes=0;for(const auto& [p,n]:workspace_loan_->live)bytes+=n;
-        throw Error("CUDA workspace loan still has live tensors: count="+
-            std::to_string(workspace_loan_->live.size())+" bytes="+std::to_string(bytes));
+    std::unique_ptr<WorkspaceLoan> released;
+    {
+        std::lock_guard lock(graph_pool_mutex_);
+        if(workspace_loan_ && !workspace_loan_->live.empty()) {
+            std::size_t bytes=0;for(const auto& [p,n]:workspace_loan_->live)bytes+=n;
+            throw Error("CUDA workspace loan still has live tensors: count="+
+                std::to_string(workspace_loan_->live.size())+" bytes="+std::to_string(bytes));
+        }
+        released=std::move(workspace_loan_);
     }
-    workspace_loan_.reset();
+    // Backing tensors can release through this Context; destroy them outside the lock.
+}
+void Context::retire_workspace_loan() noexcept {
+    std::unique_ptr<WorkspaceLoan> released;
+    try {
+        {
+            std::lock_guard lock(graph_pool_mutex_);
+            if(!workspace_loan_)return;
+            workspace_loan_->enabled=false;
+            workspace_loan_->retiring=true;
+            if(workspace_loan_->live.empty())released=std::move(workspace_loan_);
+        }
+        if(released)internal::on_device_noexcept(device_,[&] {
+            (void)cudaStreamSynchronize(released->stream);
+        });
+    } catch(...) {
+        // Tensor destruction is noexcept. Keeping the loan attached preserves
+        // its backing and lets the final live allocation retry retirement.
+    }
+}
+bool Context::workspace_loan_active() const {
+    std::lock_guard lock(graph_pool_mutex_);
+    return bool(workspace_loan_);
 }
 std::size_t Context::workspace_available() const {
     std::lock_guard lock(graph_pool_mutex_);
@@ -549,6 +577,47 @@ std::size_t Context::workspace_available() const {
     if(workspace_loan_ && workspace_loan_->enabled && workspace_loan_->thread==std::this_thread::get_id())
         for(const auto& [p,n]:workspace_loan_->free)bytes+=n;
     return bytes;
+}
+
+std::size_t Context::workspace_largest_available(cudaStream_t stream) const {
+    if(!stream)stream=current_stream(device_).stream();
+    std::lock_guard lock(graph_pool_mutex_);
+    if(!workspace_loan_ || !workspace_loan_->enabled ||
+            workspace_loan_->thread!=std::this_thread::get_id() ||
+            workspace_loan_->stream!=stream)return 0;
+    std::size_t result=0;
+    for(const auto& [pointer,bytes]:workspace_loan_->free)result=std::max(result,bytes);
+    return result;
+}
+
+bool Context::workspace_allocations_fit(const std::vector<std::size_t>& allocations,
+                                       std::size_t ordinary,
+                                       cudaStream_t stream) const {
+    if(!stream)stream=current_stream(device_).stream();
+    std::vector<std::size_t> intervals;
+    {
+        std::lock_guard lock(graph_pool_mutex_);
+        if(workspace_loan_ && workspace_loan_->enabled &&
+                workspace_loan_->thread==std::this_thread::get_id() &&
+                workspace_loan_->stream==stream)
+            for(const auto& [pointer,bytes]:workspace_loan_->free)intervals.push_back(bytes);
+    }
+    for(const auto bytes:allocations) {
+        if(!bytes)continue;
+        if(bytes<=SIZE_MAX-255) {
+            const auto aligned=(bytes+255)&~std::size_t(255);
+            auto best=intervals.end();
+            for(auto it=intervals.begin();it!=intervals.end();++it)
+                if(*it>=aligned && (best==intervals.end() || *it<*best))best=it;
+            if(best!=intervals.end()) {
+                *best-=aligned;
+                continue;
+            }
+        }
+        if(bytes>ordinary)return false;
+        ordinary-=bytes;
+    }
+    return true;
 }
 
 std::vector<std::pair<void*,std::size_t>> Context::workspace_touched_regions() const {
@@ -890,35 +959,44 @@ void Context::release(
     if(auto* plan=GraphAllocationPlan::current())plan->release(device_,pointer);
     const auto allocation_stream =
         stream != nullptr ? stream : stream_.get();
+    std::unique_ptr<WorkspaceLoan> retired_loan;
     try {
         std::lock_guard lock(graph_pool_mutex_);
         if(workspace_loan_) {
             auto& loan=*workspace_loan_;
             if(auto it=loan.live.find(pointer);it!=loan.live.end()) {
-                const auto base=reinterpret_cast<std::uintptr_t>(pointer),size=it->second;
-                auto entry=loan.free.emplace(base,size).first;
-                loan.live.erase(it);
-                if(entry!=loan.free.begin()) {
-                    auto before=std::prev(entry);
-                    if(before->first+before->second==entry->first) {
-                        before->second+=entry->second;loan.free.erase(entry);entry=before;
+                if(loan.retiring) {
+                    loan.live.erase(it);
+                    if(loan.live.empty())retired_loan=std::move(workspace_loan_);
+                    else return;
+                } else {
+                    const auto base=reinterpret_cast<std::uintptr_t>(pointer),size=it->second;
+                    auto entry=loan.free.emplace(base,size).first;
+                    loan.live.erase(it);
+                    if(entry!=loan.free.begin()) {
+                        auto before=std::prev(entry);
+                        if(before->first+before->second==entry->first) {
+                            before->second+=entry->second;loan.free.erase(entry);entry=before;
+                        }
                     }
+                    auto after=std::next(entry);
+                    if(after!=loan.free.end() && entry->first+entry->second==after->first) {
+                        entry->second+=after->second;loan.free.erase(after);
+                    }
+                    return;
                 }
-                auto after=std::next(entry);
-                if(after!=loan.free.end() && entry->first+entry->second==after->first) {
-                    entry->second+=after->second;loan.free.erase(after);
-                }
-                return;
             }
         }
-        if(auto capacity=graph_allocation_sizes_.find(pointer);capacity!=graph_allocation_sizes_.end())
-            bytes=capacity->second;
-        if (auto pool = graph_pools_.find(allocation_stream);
-            pool != graph_pools_.end() && pool->second.owned.count(pointer)) {
-            pool->second.available[bytes].push_back(pointer);
-            return;
+        if(!retired_loan) {
+            if(auto capacity=graph_allocation_sizes_.find(pointer);capacity!=graph_allocation_sizes_.end())
+                bytes=capacity->second;
+            if (auto pool = graph_pools_.find(allocation_stream);
+                pool != graph_pools_.end() && pool->second.owned.count(pointer)) {
+                pool->second.available[bytes].push_back(pointer);
+                return;
+            }
+            graph_allocation_sizes_.erase(pointer);
         }
-        graph_allocation_sizes_.erase(pointer);
     } catch (...) {
         // Tensor destruction is noexcept. A warm-up bookkeeping allocation
         // failure must release the CUDA allocation instead of terminating or
@@ -931,6 +1009,14 @@ void Context::release(
         if (auto pool = graph_pools_.find(allocation_stream); pool != graph_pools_.end())
             pool->second.owned.erase(pointer);
         graph_allocation_sizes_.erase(pointer);
+    }
+    if(retired_loan) {
+        // The backing owner can release storage through this Context. Wait for
+        // the final allocation stream before dropping it, outside the lock.
+        internal::on_device_noexcept(device_,[&] {
+            (void)cudaStreamSynchronize(allocation_stream);
+        });
+        return;
     }
     internal::on_device_noexcept(device_, [&] {
         if (async_allocations_) {

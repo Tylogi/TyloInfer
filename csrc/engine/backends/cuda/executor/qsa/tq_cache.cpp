@@ -941,11 +941,16 @@ struct QsaTqCache::Impl {
             if(use_staging && !decode_staging_attempted) {
                 decode_staging_attempted=true;
                 const auto context=default_context(mfq_current_cuda_device());
-                const auto available=context->available_memory()+context->workspace_available();
                 const auto limit=option("TYLOINFER_QSA_PREFILL_STAGING_BYTES",SIZE_MAX);
                 const auto bytes=std::size_t(staged_elements)*sizeof(std::uint16_t);
-                const auto metadata=std::size_t(block_count)*(sizeof(tq::SelectedBlock)+5*sizeof(std::uint32_t));
-                if(bytes<=limit && bytes<=available && metadata<=available-bytes) {
+                const auto rows=std::size_t(block_count);
+                const std::vector<std::size_t> allocations{
+                    bytes,
+                    rows*sizeof(std::uint32_t),
+                    rows*4*sizeof(std::uint32_t),
+                    rows*sizeof(tq::SelectedBlock)};
+                if(bytes<=limit && context->workspace_allocations_fit(
+                        allocations,context->available_memory(),mfq_current_cuda_stream())) {
                     decoded_operands=::tyloi::cuda::empty({staged_elements},options.dtype(::tyloi::kFloat16));
                     requested_blocks=::tyloi::cuda::empty({block_count},options.dtype(::tyloi::kInt32));
                     auto ids=::tyloi::cuda::arange(block_count*4,options.dtype(::tyloi::kInt32));
@@ -1087,7 +1092,9 @@ int64_t QsaTqCache::prefill_rows(int64_t requested)const {
     const auto context=tyloi::cuda::default_context(a.ks.get_device());
     const auto free=context->available_memory(),reusable=context->reusable_workspace_bytes();
     const auto available=free>SIZE_MAX-reusable?SIZE_MAX:free+reusable;
-    const auto loan=context->workspace_available();
+    // This row-count estimate uses the largest loan interval; the allocator
+    // admits each actual scratch allocation independently.
+    const auto loan=context->workspace_largest_available(mfq_current_cuda_stream());
     const auto bytes=available>SIZE_MAX-loan?SIZE_MAX:available+loan;
     const auto count=(a.budget+6)/4;
     auto rows=requested;

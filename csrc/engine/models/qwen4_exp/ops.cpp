@@ -1,6 +1,7 @@
 #include "engine/models/qwen4_exp/ops.h"
 #include "engine/models/qwen4_exp/state.h"
 #include "engine/models/common/check.h"
+#include "engine/weights/cache/workspace.h"
 
 #include <algorithm>
 #include <array>
@@ -65,8 +66,12 @@ Tensor Model::forward(Input input, models::State& state_value, const ForwardOpti
         : state->decode_position_delta == 0 ? cache_positions : ops::add(cache_positions, state->decode_position_delta);
     if ((current.dim() == 2 || current.dim() == 3) && current.size(0) == 4)
         current = ops::slice(current, 0, 1, 4);
-    auto full_positions = state->positions.defined()
-        ? ops::cat(std::array<Tensor, 2>{state->positions, current}, -1) : current;
+    Tensor full_positions;
+    {
+        weights::Resident resident;
+        full_positions = state->positions.defined()
+            ? ops::cat(std::array<Tensor, 2>{state->positions, current}, -1) : ops::clone(current);
+    }
     require_model((current.dim() == 1 || (current.dim() == 2 && current.size(0) == 3) ||
         (current.dim() == 3 && current.size(0) == 3 && current.size(1) == batch)) &&
         current.size(-1) == tokens, "Qwen4 positions require [T], [3,T], [4,T], [3,B,T] or [4,B,T]");

@@ -94,16 +94,40 @@ std::int64_t prefill_weight_rows(std::int64_t rows,std::uint64_t bytes_per_row,
         return std::min(rows,alignment);
     }
     const auto physical=context->available_memory(),reusable=context->reusable_workspace_bytes();
-    const auto available=physical>SIZE_MAX-reusable?SIZE_MAX:physical+reusable;
-    const auto loan=context->workspace_available();
-    const auto budget=available>SIZE_MAX-loan?SIZE_MAX:available+loan;
+    const auto add=[](std::size_t left,std::size_t right) {
+        return left>SIZE_MAX-right?SIZE_MAX:left+right;
+    };
+    const auto ordinary=add(physical,reusable);
+    const auto budget=add(ordinary,context->workspace_available());
     // Leave room for the following activation and the BLAS library's scratch.
     // A complete matrix is preferred whenever it fits this live device budget;
     // the old fixed 16 MiB tile needlessly fragmented large prompt GEMMs.
     auto count=std::min<std::uint64_t>(rows,(budget/2)/bytes_per_row);
     if(count<std::uint64_t(rows) && double_buffer)count/=2;
-    const auto selected=count>=std::uint64_t(rows)?rows:count>=std::uint64_t(alignment)?
-        std::int64_t(count/alignment*alignment):std::max<std::int64_t>(1,std::int64_t(count));
+    const auto stream=mfq_current_cuda_stream();
+    const auto fits=[&](std::int64_t candidate) {
+        if(candidate<=0 || std::uint64_t(candidate)>SIZE_MAX/bytes_per_row)return false;
+        const auto bytes=std::size_t(candidate)*std::size_t(bytes_per_row);
+        const std::vector<std::size_t> allocations=double_buffer?
+            std::vector<std::size_t>{bytes,bytes}:std::vector<std::size_t>{bytes};
+        return context->workspace_allocations_fit(allocations,ordinary,stream);
+    };
+    std::uint64_t selected_count=count>=std::uint64_t(rows)?count:
+        count>=std::uint64_t(alignment)?
+            count/std::uint64_t(alignment)*std::uint64_t(alignment):
+            std::uint64_t(std::max<std::int64_t>(1,std::int64_t(count)));
+    if (!fits(std::int64_t(selected_count))) {
+        if(selected_count<std::uint64_t(alignment)) selected_count=1;
+        else {
+            while(selected_count>std::uint64_t(alignment) && !fits(std::int64_t(selected_count)))
+                selected_count-=std::uint64_t(alignment);
+            if(!fits(std::int64_t(selected_count)))
+                selected_count=1;
+        }
+    }
+    const auto selected=count>=std::uint64_t(rows) && selected_count==count?rows:
+        selected_count>=std::uint64_t(alignment)?
+            std::int64_t(selected_count):std::max<std::int64_t>(1,std::int64_t(selected_count));
     prepared[key]=selected;
     return selected;
 }

@@ -5,6 +5,7 @@
 #include "engine/backends/cuda/executor/options.h"
 #include "engine/backends/cuda/executor/executor.h"
 #include "engine/backends/cuda/executor/graph/window.h"
+#include "engine/backends/cuda/native/context.h"
 #include "engine/backends/cuda/native/resident_allocations.h"
 #include "engine/backends/cuda/native/matmul_rows.h"
 #include "engine/backends/cuda/ops/attention/gdn/launch.h"
@@ -604,13 +605,17 @@ class GdnCore {
         const auto commit_state = [&](const auto &convolution, const DenseTensor &next) {
                 if(request.conv.dense().defined())request.conv.dense().copy_(convolution[3]);
                 else {
-                    ::tyloi::cuda::ResidentAllocationScope resident(request.impl_->resident);
-                    request.conv.dense()=request.impl_->resident?convolution[3].clone():convolution[3];
+                    const bool resident = request.impl_->resident || (convolution[3].is_cuda() &&
+                        ::tyloi::cuda::default_context(convolution[3].get_device())->workspace_loan_active());
+                    ::tyloi::cuda::ResidentAllocationScope allocation(resident);
+                    request.conv.dense()=resident?convolution[3].clone():convolution[3];
                 }
                 if(request.recurrent.dense().defined()) {if(request.recurrent.dense().data_ptr()!=next.data_ptr())request.recurrent.dense().copy_(next);}
                 else {
-                    ::tyloi::cuda::ResidentAllocationScope resident(request.impl_->resident);
-                    request.recurrent.dense()=request.impl_->resident?next.clone():next;
+                    const bool resident = request.impl_->resident || (next.is_cuda() &&
+                        ::tyloi::cuda::default_context(next.get_device())->workspace_loan_active());
+                    ::tyloi::cuda::ResidentAllocationScope allocation(resident);
+                    request.recurrent.dense()=resident?next.clone():next;
                 }
             };
         auto projected=project();

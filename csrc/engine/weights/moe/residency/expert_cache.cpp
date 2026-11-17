@@ -1062,6 +1062,12 @@ std::size_t MoeExpertCache::begin_prefill_loan(std::size_t workspace_bytes) {
     std::sort(candidates.begin(),candidates.end(),[](auto* a,auto* b) {
         return (a->slots-a->minimum_slots)*a->slot_bytes>(b->slots-b->minimum_slots)*b->slot_bytes;
     });
+    struct Backing {
+        MfqCudaStream stream;
+        std::vector<::tyloi::DenseTensor> fields;
+    };
+    auto backing=std::make_shared<Backing>();
+    backing->stream=mfq_get_current_cuda_stream(owner_device_);
     std::vector<std::pair<void*,std::size_t>> regions;
     for(auto* arena:candidates) {
         if(loan->bytes>=desired)break;
@@ -1148,6 +1154,7 @@ std::size_t MoeExpertCache::begin_prefill_loan(std::size_t workspace_bytes) {
             const auto rows=arena->layouts[f].slot_shape[0];
             const auto tail=arena->fields[f].narrow(0,saved.first*rows,int64_t(slots)*rows);
             if(saved.saved[f].options().pinned())backup_pinned_bytes+=tail.nbytes();
+            backing->fields.push_back(tail);
             regions.emplace_back(tail.data_ptr(),tail.nbytes());
         }
         loan->bytes+=slots*arena->slot_bytes;
@@ -1239,7 +1246,9 @@ std::size_t MoeExpertCache::begin_prefill_loan(std::size_t workspace_bytes) {
             stage.pinned=true;pin_budget-=stage.host.nbytes();
         } else (void)cudaGetLastError();
     }
-    context->begin_workspace_loan(regions,mfq_current_cuda_stream());
+    context->begin_workspace_loan(regions,backing->stream.stream(),backing);
+    loan->context=context;
+    loan->stream=backing->stream;
     prefill_loan_=std::move(loan);
     std::cerr<<"runtime_prefill_loan action=borrow requested_bytes="<<workspace_bytes
         <<" available_bytes="<<available<<" borrowed_bytes="<<prefill_loan_->bytes
@@ -1255,22 +1264,26 @@ std::size_t MoeExpertCache::begin_prefill_loan(std::size_t workspace_bytes) {
 
 void MoeExpertCache::suspend_prefill_loan() {
     const MfqCudaGuard guard(owner_device_);
-    if(prefill_loan_)tyloi::cuda::default_context(mfq_current_cuda_device())->suspend_workspace_loan();
+    if(prefill_loan_ && prefill_loan_->context)prefill_loan_->context->suspend_workspace_loan();
 }
 void MoeExpertCache::end_prefill_loan() {
     const MfqCudaGuard guard(owner_device_);
     if(!prefill_loan_)return;
+    const tyloi::cuda::StreamGuard stream(prefill_loan_->stream);
     const auto restore_started=std::chrono::steady_clock::now();
     suspend_prefill_loan();
     release_moe_prefill_buffers(this);
     TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(mfq_current_cuda_stream()));
-    const auto context=tyloi::cuda::default_context(mfq_current_cuda_device());
+    const auto context=prefill_loan_->context;
     std::vector<std::pair<void*,std::size_t>> touched;
     const auto* restore_all_option=tyloi::cuda::env_lookup("TYLOINFER_PREFILL_RESTORE_ALL");
-    bool restore_all=restore_all_option && restore_all_option[0]=='1';
+    bool restore_all=!context || (restore_all_option && restore_all_option[0]=='1');
     if(!restore_all)try {touched=context->workspace_touched_regions();}
         catch(const std::bad_alloc&) {restore_all=true;}
-    context->end_workspace_loan();
+    if(context) {
+        context->end_workspace_loan();
+        prefill_loan_->context.reset();
+    }
     std::size_t restore_bytes=0;
     for(const auto& saved:prefill_loan_->arenas)for(std::size_t f=0;f<saved.saved.size();++f) {
         const auto rows=saved.arena->layouts[f].slot_shape[0];
@@ -2796,7 +2809,8 @@ bool lend_moe_decode_cache_for_prefill(const std::shared_ptr<MoeExpertCache>& ca
     const auto context=tyloi::cuda::default_context(mfq_current_cuda_device());
     context->reclaim_idle_memory();
     cache->reserve_workspace(workspace_bytes);
-    const bool retained=context->available_memory()+context->workspace_available()>=workspace_bytes;
+    const bool retained=context->workspace_allocations_fit(
+        {workspace_bytes},context->available_memory(),mfq_current_cuda_stream());
     if(returned)std::cerr<<"runtime_moe_prefill_graphs retained="<<retained
         <<" returned_expert_bytes="<<returned<<" workspace_bytes="<<workspace_bytes<<'\n';
     return retained;

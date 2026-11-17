@@ -1212,12 +1212,17 @@ private:
         struct Copy {const uint8_t* source;std::size_t offset,bytes;};
         struct Layer {std::size_t bytes=0;std::vector<Copy> copies;};
         struct Stage {::tyloi::DenseTensor host;bool pinned=false;};
+        std::shared_ptr<tyloi::cuda::Context> context;
+        tyloi::cuda::StreamHandle stream;
         std::vector<Arena> arenas;
         std::map<std::pair<int,int>,Cohort> cohorts;
         std::map<int,Layer> layers;
         std::array<Stage,2> stages;
         std::size_t bytes=0;
-        ~PrefillLoan() {for(auto& stage:stages)if(stage.pinned)(void)cudaHostUnregister(stage.host.data_ptr());}
+        ~PrefillLoan() {
+            if(context)context->retire_workspace_loan();
+            for(auto& stage:stages)if(stage.pinned)(void)cudaHostUnregister(stage.host.data_ptr());
+        }
     };
     std::unique_ptr<PrefillLoan> prefill_loan_;
     struct DmaCallSample {

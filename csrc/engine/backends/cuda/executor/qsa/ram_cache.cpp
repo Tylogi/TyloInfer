@@ -1196,10 +1196,9 @@ std::optional<QsaRamPrefillStage> QsaRamCache::stage_prefill(std::size_t blocks)
         bytes+=count;largest=std::max(largest,count);
     }
     auto context=default_context(s.device);
-    const auto free=context->available_memory(),workspace=context->workspace_available();
-    const auto available=free>SIZE_MAX-workspace?SIZE_MAX:free+workspace;
     const auto table_bytes=s.live.nbytes();
-    if(table_bytes>available || bytes>available-table_bytes)return {};
+    if(!context->workspace_allocations_fit(
+            {bytes,table_bytes},context->available_memory(),stream))return {};
     constexpr auto maximum_records=(1ULL<<20)/sizeof(tq::RamKvReadInto);
     const auto packet_bytes=std::max(largest,std::size_t(8ULL<<20));
     auto& retained=s.worker->prefill_transfer;

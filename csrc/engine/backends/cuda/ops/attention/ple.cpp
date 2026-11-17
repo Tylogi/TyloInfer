@@ -3,6 +3,8 @@
 #include "engine/backends/cuda/executor/options.h"
 #include "engine/backends/cuda/ops/qwen4_exp.h"
 #include "engine/backends/cuda/kernels/embedding/ple.h"
+#include "engine/backends/cuda/native/context.h"
+#include "engine/backends/cuda/native/resident_allocations.h"
 #include "engine/backends/cuda/native/tensor/backend.h"
 #include <cmath>
 #include <optional>
@@ -16,6 +18,12 @@ Tensor ple(const Tensor& input, const Tensor& embeddings, const PleWeights& w,
     const auto& rows = embeddings.dense();
     const auto b = x.size(0), t = x.size(1);
     auto conv = convolution.defined() ? convolution.dense() : DenseTensor{};
+    const auto retain_state = [](DenseTensor value) {
+        const bool resident = value.is_cuda() &&
+            ::tyloi::cuda::default_context(value.get_device())->workspace_loan_active();
+        ::tyloi::cuda::ResidentAllocationScope allocation(resident);
+        return resident ? value.clone() : value;
+    };
     const auto save_prefixes = [&](const DenseTensor& normalized) {
         if (!checkpoints) return;
         TYLOINFER_RUNTIME_CHECK(cache && conv.defined(), "PLE prefix history is unavailable");
@@ -41,7 +49,7 @@ Tensor ple(const Tensor& input, const Tensor& embeddings, const PleWeights& w,
         auto output = mfq_qwen4_exp::ple_conv_add_cuda(prepared[1], w.conv.dense(),
             cache && conv.defined() ? std::optional<DenseTensor>(conv) : std::nullopt,
             dilation, prepared[0], x.scalar_type() == kFloat16);
-        if (cache) { if (conv.defined()) conv.copy_(output[1]); else convolution = output[1]; }
+        if (cache) { if (conv.defined()) conv.copy_(output[1]); else convolution = retain_state(output[1]); }
         return output[0];
     }
     auto key = mfq_qwen4_exp::grouped_rms_norm(project(rows, w.key).dense(), w.key_norm.dense(), hidden, eps)
@@ -58,7 +66,7 @@ Tensor ple(const Tensor& input, const Tensor& embeddings, const PleWeights& w,
     auto convolved = mfq_qwen4_exp::ple_dilated_conv_silu(normalized, w.conv.dense(),
         cache && conv.defined() ? std::optional<DenseTensor>(conv) : std::nullopt, dilation);
     auto output = (gated + convolved[0]).to(x.scalar_type());
-    if (cache) { if (conv.defined()) conv.copy_(convolved[1]); else convolution = convolved[1]; }
+    if (cache) { if (conv.defined()) conv.copy_(convolved[1]); else convolution = retain_state(convolved[1]); }
     return output;
 }
 }
