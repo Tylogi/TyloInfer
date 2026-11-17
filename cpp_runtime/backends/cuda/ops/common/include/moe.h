@@ -156,6 +156,10 @@ struct MixedMoeRuntime {
             MixedMoeTransformKey transform) const;
 
     std::vector<MoeActivationGeometry> activation_geometry() const;
+    bool uses_f16_prefill(const CudaExecutionConfig& config,bool force_prefill_mma_off,
+            const MoeRoutePlan& route)const;
+    std::vector<MoeActivationGeometry> activation_geometry(const CudaExecutionConfig& config,
+            const KlMmqState& kl_mmq,bool force_prefill_mma_off,const MoeRoutePlan& route)const;
 
     mfq_tensor_backend::Tensor forward(
             const CudaExecutionConfig& config,

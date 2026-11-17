@@ -425,6 +425,7 @@ mfq_tensor_backend::Tensor FFN::forward_impl(CudaExecutionContext &execution,
     }
     if (is_moe) {
         const bool tq_routed=bool(moe_tq);
+        const bool native_routed=tq_routed || bool(moe_gguf);
         const int64_t rows = xh.numel() / xh.size(-1);
         if (execution.continuous_batch_cache_serial && uses_moe_expert_cache() && rows > 1) {
             // A bounded expert cache cannot safely admit the union of an
@@ -467,6 +468,21 @@ mfq_tensor_backend::Tensor FFN::forward_impl(CudaExecutionContext &execution,
         const bool expert_parallel = expert_parallel_moe_compatible();
         const bool use_pipeline=bool(moe_pipeline_forward) &&
             execution.kl_mmq.mode==KlMmqMode::Default && !execution.force_moe_materialized_swiglu;
+        const bool deferred_shared=native_routed && !use_pipeline && !moe_ungated_experts &&
+            activation==ActivationKind::silu_gated && xf.size(0)<=32;
+        Tensor deferred_shared_output;
+        const auto run_shared=[&] {
+            return profiler.measure("moe.shared",[&]{return shared->forward(execution,xf);})
+                .reshape({xf.size(0),xf.size(1)}).contiguous().to(mfq_tensor_backend::kFloat16);
+        };
+        const std::function<void()> shared_work=deferred_shared?std::function<void()>([&] {
+            deferred_shared_output=run_shared();
+        }):std::function<void()>{};
+        CudaIndependentBranchExecutor* shared_executor=nullptr;
+        if(deferred_shared && execution.config.decode_branch_parallel && !execution.decode_graph_serial_branches) {
+            const auto found=execution.shared_expert_executors.find(xf.get_device());
+            if(found!=execution.shared_expert_executors.end())shared_executor=found->second.get();
+        }
         struct ExpertOutput {
             Tensor values;
             bool reduced;
@@ -543,7 +559,7 @@ mfq_tensor_backend::Tensor FFN::forward_impl(CudaExecutionContext &execution,
                             1e-20, moe_router_scale);
                     });
                 }
-                if (!use_pipeline && !tq_routed) {
+                if (!use_pipeline && !native_routed) {
                     // Dense (source-precision) banks are not MFE cohorts, so
                     // their expert count comes from the bank itself.
                     const auto routed_experts =
@@ -560,7 +576,7 @@ mfq_tensor_backend::Tensor FFN::forward_impl(CudaExecutionContext &execution,
                 return selected;
             },
             [&](const auto &) {
-                if (mfq::mfq_compat_enabled && !expert_parallel && !use_pipeline && !tq_routed) {
+                if (mfq::mfq_compat_enabled && !expert_parallel && !use_pipeline && !native_routed) {
                     if (moe_split_gate_up) {
                         if (execution.config.moe_delayed_route_readback) {
                             moe_gate.prefetch_begin(route);
@@ -581,15 +597,14 @@ mfq_tensor_backend::Tensor FFN::forward_impl(CudaExecutionContext &execution,
                         }
                     }
                 }
-                auto shared_output = profiler.measure(
-                    "moe.shared", [&]() { return shared->forward(execution, xf); });
+                auto shared_output=deferred_shared?Tensor{}:run_shared();
                 if (!moe_split_gate_up && !moe_shared_ungated) {
                     shared_gate_logits = profiler.measure("moe.shared_gate", [&]() {
                         return mfq_tensor_backend::matmul(xf32, moe_shared_gate.transpose(0, 1))
                             .contiguous();
                     });
                 }
-                if (mfq::mfq_compat_enabled && !expert_parallel && !use_pipeline && !tq_routed && execution.config.moe_delayed_route_readback) {
+                if (mfq::mfq_compat_enabled && !expert_parallel && !use_pipeline && !native_routed && execution.config.moe_delayed_route_readback) {
                     projection_bundle_prefetched = prefetch_projection_bundle();
                     if (!projection_bundle_prefetched) {
                         if (moe_split_gate_up) {
@@ -599,9 +614,7 @@ mfq_tensor_backend::Tensor FFN::forward_impl(CudaExecutionContext &execution,
                         }
                     }
                 }
-                return shared_output.reshape({xf.size(0), xf.size(1)})
-                    .contiguous()
-                    .to(mfq_tensor_backend::kFloat16);
+                return shared_output;
             },
             [&](const auto &selected) -> ExpertOutput {
                 const bool dense_routed =
@@ -629,7 +642,7 @@ mfq_tensor_backend::Tensor FFN::forward_impl(CudaExecutionContext &execution,
                     if(!moe_ungated_experts && activation==ActivationKind::silu_gated) {
                         auto reduced=profiler.measure("moe.tq",[&] {
                             return moe_tq->forward_parallel(execution,routed_input,selected.at(0),selected.at(1),
-                                static_cast<float>(swiglu_limit));
+                                static_cast<float>(swiglu_limit),shared_work,shared_executor);
                         });
                         return {finish_latent(std::move(reduced)),true};
                     }
@@ -654,7 +667,7 @@ mfq_tensor_backend::Tensor FFN::forward_impl(CudaExecutionContext &execution,
                     if (!moe_ungated_experts && activation == ActivationKind::silu_gated) {
                         auto reduced = profiler.measure("moe.gguf", [&] {
                             return moe_gguf->forward(routed_input, selected.at(0), selected.at(1),
-                                static_cast<float>(swiglu_limit));
+                                static_cast<float>(swiglu_limit),shared_work,shared_executor);
                         });
                         return {finish_latent(std::move(reduced)), true};
                     }
@@ -920,6 +933,10 @@ mfq_tensor_backend::Tensor FFN::forward_impl(CudaExecutionContext &execution,
 #endif
             },
             [&](ExpertOutput experts, Tensor shared_half, const auto &selected) {
+                if(deferred_shared) {
+                    shared_half=std::move(deferred_shared_output);
+                    if(shared_half.defined())mfq_cuda_record_stream(shared_half,mfq_get_current_cuda_stream(xf.get_device()));
+                }
                 return mfq::models::combine_experts(
                     experts.values, shared_half, experts.reduced, moe_shared_ungated,
                     [&](Tensor pairs, Tensor shared) -> std::optional<Tensor> {
@@ -1085,18 +1102,19 @@ bool FFN::supports_prepared_gguf_input() const {
         gate_up.layers.size()==2 && gate_up.outs.size()==2 && gate_up.outs[0]==gate_up.outs[1];
 }
 
-std::optional<mfq_tensor_backend::Tensor> FFN::try_forward_gguf_prefill_residual(
+std::optional<mfq_tensor_backend::Tensor> FFN::try_forward_prefill_residual(
         CudaExecutionContext& execution,const mfq_tensor_backend::Tensor& input,
         const mfq_tensor_backend::Tensor& residual) const {
     namespace tb=mfq_tensor_backend;
     if(execution.config.diagnostic_fp32_residual || execution.kl_mmq.mode!=KlMmqMode::Default ||
-            !supports_prepared_gguf_input() || !input.is_cuda() || !input.is_contiguous() || input.dim()<1 ||
+            is_moe || geglu || activation!=mfq::models::MlpActivation::silu_gated || swiglu_limit>0 ||
+            important_neurons || tensor_parallel_dense_compatible() || down.tensor_parallel() ||
+            gate_up.outs.size()!=2 ||
+            gate_up.outs[0]!=gate_up.outs[1] || !input.is_cuda() || !input.is_contiguous() || input.dim()<1 ||
             input.scalar_type()!=tb::kFloat16 || input.size(-1)<1)return {};
     const auto tokens=input.numel()/input.size(-1);
-    if(!down.gguf.can_forward_prefill_residual(tokens,residual) || down.gguf.packed.device()!=input.device() ||
-            gate_up.outs[0]!=down.gguf.neuron_len)return {};
-    for(const auto& layer:gate_up.layers)if(!layer.is_gguf() || layer.tensor_parallel() ||
-            layer.gguf.packed.device()!=input.device() || layer.gguf.neuron_len!=input.size(-1))return {};
+    if(!down.can_forward_prefill_residual(tokens,residual) || residual.device()!=input.device() ||
+            gate_up.outs[0]!=down.neuron_len() || !gate_up.supports_prefill_input(input))return {};
     auto parts=execution.profiler.measure("ffn.gate_up",[&]{return gate_up.forward(execution,input);});
     if(parts[0].scalar_type()!=tb::kFloat16 || parts[1].scalar_type()!=tb::kFloat16 ||
             !parts[0].is_contiguous() || !parts[1].is_contiguous()) {
@@ -1108,10 +1126,16 @@ std::optional<mfq_tensor_backend::Tensor> FFN::try_forward_gguf_prefill_residual
     auto hidden=tb::empty_like(parts[0]);const auto stream=mfq_get_current_cuda_stream(input.get_device());
     for(const auto& tensor:{parts[0],parts[1],hidden})mfq_cuda_record_stream(tensor,stream);
     execution.profiler.measure("ffn.swiglu",[&]{
-        mfq::cuda::gguf::materialize_gated_input(parts[1].data_ptr(),parts[0].data_ptr(),true,hidden.numel(),true,hidden.data_ptr(),stream.stream());
+        mfq::cuda::materialize_gated_input(parts[1].data_ptr(),parts[0].data_ptr(),true,hidden.numel(),true,hidden.data_ptr(),stream.stream());
         return 0;
     });
-    return execution.profiler.measure("ffn.down_residual",[&]{return down.gguf.forward_base(hidden,true,residual);});
+    return execution.profiler.measure("ffn.down_residual",[&] {
+        auto output=down.forward_prefill_residual(hidden,residual);
+        if(output.defined())return output;
+        // Gate/Up may consume workspace after the initial capability check.
+        // Retain those completed projections if the bounded decoder no longer fits.
+        return acc_cuda(residual,down.forward(execution,hidden).to(tb::kFloat16).contiguous());
+    });
 }
 
 std::optional<mfq_tensor_backend::Tensor> FFN::try_forward_prepared_gguf_residual(
@@ -1156,6 +1180,12 @@ mfq_tensor_backend::Tensor FFN::forward_with_router_bias(CudaExecutionContext& e
 void prepare_ffn_workspaces(CudaExecutionContext &execution, FFN &f) {
     if (execution.loading_cpu_layer)
         return;
+    if(f.is_moe && (f.moe_tq || f.moe_gguf) && execution.config.decode_branch_parallel) {
+        const auto stream=mfq_get_current_cuda_stream();
+        auto& executor=execution.shared_expert_executors[stream.device_index()];
+        if(!executor)executor=std::make_shared<CudaIndependentBranchExecutor>();
+        executor->ensure(1,stream);
+    }
     if (f.down.tensor_parallel())
         return;
     if (mfq::mfq_compat_enabled && f.gate_up.nvq_prefix2 && f.gate_up.layers.size() == 2 && f.down.is_nvq() &&

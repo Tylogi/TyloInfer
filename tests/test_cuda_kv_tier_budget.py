@@ -109,7 +109,7 @@ def test_ram_kv_budget_subtracts_only_nonresident_experts(
     monkeypatch.setattr('tyloinfer.server.runtime.runtime_pool.host_memory_capacity',
                         lambda: (32 << 30, gib(available_gib)))
     monkeypatch.setattr('tyloinfer.server.runtime.runtime_pool.supports_cuda_ram_expert_pipeline', lambda path: False)
-    artifact = SimpleNamespace(resource=SimpleNamespace(total_bytes=70 << 30, format='tq'),
+    artifact = SimpleNamespace(resource=SimpleNamespace(total_bytes=70 << 30, format='tq', structured_decisions=False),
                                always_streamed_bytes=30 << 30, routed_expert_bytes=36 << 30,
                                path=tmp_path / 'fixture.tq')
     pool = RuntimePool(ModelCatalog([]), tmp_path / 'runtime', backend='cuda')

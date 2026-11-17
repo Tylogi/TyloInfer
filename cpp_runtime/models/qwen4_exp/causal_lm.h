@@ -9,6 +9,14 @@ namespace mfq::models::qwen4_exp {
 
 template <class Loader>
 auto load_residual(Loader &ops, const Config &c, const std::string &p, bool combine) {
+    if(c.streams==1) {
+        const auto suffix=std::string(".mhc.pre");
+        const auto root=p.substr(0,p.size()-suffix.size());
+        const auto name=root+(root.find(".block.")==std::string::npos?".output_norm.weight":".norm.weight");
+        auto norm=ops.fp32(ops.dense(name));
+        using Projection=decltype(ops.residual_linear(p+".down.weight"));
+        return ops.residual(std::move(norm),Projection{},Projection{},Projection{},c);
+    }
     auto norm = ops.fp32(ops.dense(p + ".norm.weight"));
     auto down = ops.residual_linear(p + ".down.weight"), up = ops.residual_linear(p + ".up.weight");
     decltype(down) injection{};
@@ -19,6 +27,7 @@ auto load_residual(Loader &ops, const Config &c, const std::string &p, bool comb
 
 template <class Loader>
 auto load_ffn(Loader &ops, const Config &c, int layer, const std::string &p) {
+    if(!c.experts)return ops.dense_ffn(p,c);
     auto gate_up = ops.routed_gate_up(p, layer, c.experts, c.moe_width, c.hidden);
     auto down = ops.routed(p + ".experts.down.weight", layer, c.experts, c.hidden, c.moe_width);
     auto router = ops.linear(p + ".router.weight");
@@ -190,13 +199,17 @@ auto decoder_layer_chained(Tensor hidden, bool has_ple, bool linear,
 
 template <class Backend> struct CausalLm : models::CausalModelBase<Backend, CausalLm<Backend>> {
     using Tensor = typename Backend::Tensor;
-    static bool accepts_backbone(std::string_view backbone) { return backbone == "qwen4_exp"; }
+    static bool accepts_backbone(std::string_view backbone) {
+        return backbone=="qwen4_exp" || backbone=="qwen4";
+    }
     template <class Graph, class Source>
     void adapter_load_config(std::string_view payload, const Graph &graph, const Source &source) {
         auto &config = this->config;
         auto &metadata = this->metadata;
 
         config = Config::from_json(payload);
+        if(source.legacy_tensor_compatibility().layout.qwen_gdn_gguf_layout)
+            config.linear_tiled_heads=true;
         metadata.vocab_size = config.vocab;
         metadata.hidden_size = config.hidden;
         metadata.num_hidden_layers = config.layers;
@@ -212,7 +225,7 @@ template <class Backend> struct CausalLm : models::CausalModelBase<Backend, Caus
         metadata.tie_word_embeddings = config.tied_embeddings;
         metadata.multi_axis_positions = true;
         metadata.flash_next = true;
-        metadata.model_type = "qwen4_exp";
+        metadata.model_type = graph.backbone;
         metadata.layer_types = config.layer_types;
     }
     Tensor adapter_prepare_hidden(Tensor hidden, int64_t batch, int64_t tokens) const {

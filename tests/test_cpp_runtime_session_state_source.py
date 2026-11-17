@@ -132,7 +132,9 @@ def test_glm_dsa_session_state_preserves_mla_and_index_caches() -> None:
 
 def test_partial_stable_prefix_is_saved_before_generation_suffix() -> None:
     assert "ops.plain(request,output,restored.tokens" in "".join(DECODE.split())
-    assert "progress->timing.prompt_tokens+restored.tokens==plan.stable_prefix_tokens" in "".join(DECODE.split())
+    compact = "".join(DECODE.split())
+    assert "std::min(plan.stable_prefix_tokens,prompt.size()-1)" in compact
+    assert "progress->timing.prompt_tokens+restored.tokens==prefix_boundary" in compact
     assert "model.capture_text_session_state(tokens)" in DECODE
     assert "tokens.size() > maximum_prefix_tokens" in SESSION_CACHE
 

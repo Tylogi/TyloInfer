@@ -1,4 +1,5 @@
 #include "common.h"
+#include "decision_protocol.h"
 
 #include "httplib.h"
 
@@ -520,7 +521,7 @@ int run_mfq_http_transport(
             {"name", "MFQ C++ HTTP runtime transport"},
             {"model", config.model_name},
             {"endpoints", {
-                "/runtime/generate", "/runtime/score", "/runtime/models",
+                "/runtime/generate", "/runtime/score", "/runtime/decide", "/runtime/models",
                 "/runtime/health", "/runtime/status", "/runtime/reload",
                 "/runtime/realtime", "/runtime/cache/clear",
                 "/runtime/cache/trim", "/runtime/cache/budget", "/runtime/cache/refresh", "/runtime/memory/budget", "/runtime/sessions/fork",
@@ -554,6 +555,7 @@ int run_mfq_http_transport(
             {"model", config.model_name},
             {"model_type", config.model_type},
             {"probability_available", scheduler.info().probability},
+            {"decisions_available", scheduler.info().decisions},
             {"model_capabilities", model_capabilities},
             {"vision_supported", vision_supported},
             {"vision_available", vision_available},
@@ -854,6 +856,23 @@ int run_mfq_http_transport(
         catch (const std::invalid_argument& error) { set_json(res, error_body(error.what(), "invalid_request_error"), 400); }
         catch (const std::exception& error) { set_json(res, error_body(error.what(), "server_error"), 500); }
     });
+
+    const auto decide=[&](const httplib::Request& req,httplib::Response& res) {
+        if(!authorized(req,res,config.api_key))return;
+        try {
+            if(!scheduler.info().decisions)throw ApiError(501,"decisions_unavailable","decision reads are unavailable for this model");
+            auto request=parse_decision_request(parse_body(req),true);
+            if(!request.model.empty() && request.model!=config.model_name)
+                throw ApiError(404,"model_not_found","the requested decision model is not served","model");
+            const auto result=std::get<mfq::engine::DecisionResult>(scheduler.control(request.input));
+            set_json(res,decision_result_json(request,result,config.model_name));
+        }catch(const mfq::engine::ControlBusyError& error) {set_json(res,error_body(error.what(),"runtime_busy"),409);}
+        catch(const mfq::engine::InferenceInputError& error) {set_json(res,error_body(error.what(),"invalid_request_error",error.field),400);}
+        catch(const ApiError& error) {handle_api_error(res,error);}
+        catch(const std::invalid_argument& error) {set_json(res,error_body(error.what(),"invalid_request_error"),400);}
+        catch(const std::exception& error) {set_json(res,error_body(error.what(),"server_error"),500);}
+    };
+    server.Post("/runtime/decide",decide);
 
     server.Post("/runtime/score", [&](const httplib::Request& req, httplib::Response& res) {
         if (!authorized(req, res, config.api_key)) return;

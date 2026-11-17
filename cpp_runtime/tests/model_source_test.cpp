@@ -5,10 +5,12 @@
 #include "tyloinfer/mapped_tensor_pages.h"
 #include "tyloinfer/mapped_prefetch_scope.h"
 #include "tyloinfer/tq_rows.h"
+#include "tyloinfer/decision_model.h"
 
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -111,6 +113,114 @@ void write_hf(const std::filesystem::path& root) {
     experts[17] = 0x46;
     experts[33] = 0x7e;
     stream.write(experts.data(), experts.size());
+}
+
+void test_bare_decision_source(const std::filesystem::path& root) {
+    using json=nlohmann::json;
+    std::filesystem::create_directories(root);
+    std::ofstream(root/"config.json") << R"({"model_type":"qwen3_5","text_config":{"model_type":"qwen3_5_text","num_hidden_layers":1}})";
+    json header,weight_map;
+    std::uint64_t offset=0;
+    for(const auto* name:{"language_model.embed_tokens.weight","language_model.norm.weight",
+            "language_model.layers.0.input_layernorm.weight"}) {
+        header[name]={{"dtype","BF16"},{"shape",{2}},{"data_offsets",{offset,offset+4}}};
+        weight_map[name]="model.safetensors";offset+=4;
+    }
+    const auto packed=header.dump();
+    {
+        std::ofstream stream(root/"model.safetensors",std::ios::binary);
+        write_scalar<std::uint64_t>(stream,packed.size());stream<<packed;
+        const std::array<char,12> payload{};stream.write(payload.data(),payload.size());
+    }
+    std::ofstream(root/"model.safetensors.index.json") << json{{"weight_map",weight_map}}.dump();
+    json config{{"format_version",1},{"format_id","d3-code-readout-v1"},{"attention_mode","noncausal_full_attention"}};
+    for(int i=0;i<255;++i){config["codes"].push_back("code"+std::to_string(i));config["token_ids"].push_back(i);}
+    std::ofstream(root/"decision_config.json") << config.dump();
+    std::ofstream(root/"readout.safetensors",std::ios::binary) << "readout-asset";
+    mfq::HfModelSource source(root);
+    for(const auto* name:{"model.token_embedding.weight","model.output_norm.weight","model.block.0.attention.norm.weight"})
+        require(source.find_tensor(name)!=nullptr,"bare decision backbone tensor was not normalized");
+    require(source.find_tensor("weight")==nullptr,"decision readout asset leaked into indexed backbone tensors");
+    require(source.has_asset(mfq::kDecisionReadoutAsset) && source.read_asset(mfq::kDecisionReadoutAsset).size()==13,
+        "decision readout sidecar was not exposed");
+    const auto spec=mfq::decision_model_spec(source);
+    require(spec && spec->attention==mfq::DecisionAttention::bidirectional && spec->codes.size()==255,
+        "decision source lost its codebook or attention mode");
+}
+
+void test_packed_hf_source(const std::filesystem::path& root) {
+    using json=nlohmann::json;
+    constexpr std::uint64_t rows=11,width=96,groups=3;
+    std::filesystem::create_directories(root);
+    const json scheme{{"num_bits",4},{"type","int"},{"strategy","group"},{"group_size",32},{"symmetric",false}};
+    const json quant{{"quant_method","compressed-tensors"},{"format","pack-quantized"},
+        {"config_groups",{{"group",{{"targets",{"Linear"}},{"weights",scheme}}}}}};
+    std::ofstream(root/"config.json")<<json{{"model_type","qwen3_5"},
+        {"num_hidden_layers",1},{"quantization_config",quant}}.dump();
+    json header;std::vector<std::byte> payload;
+    const auto add=[&](const std::string& name,const char* dtype,std::vector<std::uint64_t> shape,
+                       const void* data,std::size_t size) {
+        const auto begin=payload.size();
+        const auto* bytes=static_cast<const std::byte*>(data);payload.insert(payload.end(),bytes,bytes+size);
+        header[name]={{"dtype",dtype},{"shape",shape},{"data_offsets",{begin,payload.size()}}};
+    };
+    const std::array<std::uint16_t,2> embedding{};
+    add("language_model.embed_tokens.weight","BF16",{1,2},embedding.data(),sizeof(embedding));
+    const std::string module="language_model.layers.0.mlp.gate_proj";
+    const std::array<std::int64_t,2> shape{rows,width};
+    std::array<std::uint32_t,rows*width/8> packed{};
+    std::array<std::uint32_t,((rows+7)/8)*groups> zero{};
+    std::array<std::uint16_t,rows*groups> scale{};
+    for(std::uint64_t r=0;r<rows;++r) {
+        for(std::uint64_t k=0;k<width;++k)packed[r*width/8+k/8]|=std::uint32_t((r*7+k)%16)<<(4*(k%8));
+        for(std::uint64_t g=0;g<groups;++g) {
+            zero[(r/8)*groups+g]|=std::uint32_t((r+g*3)%16)<<(4*(r%8));
+            scale[r*groups+g]=g%2?0x3e80:0x3e00;
+        }
+    }
+    add(module+".weight_shape","I64",{2},shape.data(),sizeof(shape));
+    add(module+".weight_packed","I32",{rows,width/8},packed.data(),sizeof(packed));
+    add(module+".weight_scale","BF16",{rows,groups},scale.data(),sizeof(scale));
+    add(module+".weight_zero_point","I32",{(rows+7)/8,groups},zero.data(),sizeof(zero));
+    {
+        const auto text=header.dump();std::ofstream stream(root/"model.safetensors",std::ios::binary);
+        write_scalar<std::uint64_t>(stream,text.size());stream<<text;
+        stream.write(reinterpret_cast<const char*>(payload.data()),payload.size());
+    }
+    mfq::HfModelSource source(root);
+    const auto name="model.block.0.mlp.gate.weight";
+    const auto* tensor=source.find_tensor(name);
+    require(tensor && tensor->dtype=="GGUF_Q4_1" && tensor->shape==std::optional<std::vector<std::int64_t>>{{rows,width}},
+        "compressed HF INT4 did not reach the common quantized projection contract");
+    const auto image=source.read(name);
+    const auto f16=[](std::uint16_t bits) {
+        const int exponent=(bits>>10)&31;
+        return std::ldexp((exponent?1.f:0.f)+float(bits&1023)/1024.f,exponent?exponent-15:-14)*
+            (bits&0x8000?-1.f:1.f);
+    };
+    for(std::uint64_t r=0;r<rows;++r)for(std::uint64_t k=0;k<width;++k) {
+        const auto* block=image.data()+(r*(width/32)+k/32)*20;
+        std::uint16_t d,m;std::memcpy(&d,block,2);std::memcpy(&m,block+2,2);
+        const auto code=(std::to_integer<unsigned>(block[4+k%16])>>(k%32>=16?4:0))&15;
+        const auto value=f16(d)*float(code)+f16(m);
+        const auto expected=(float((r*7+k)%16)-float((r+(k/32)*3)%16))*(k/32%2?0.25f:0.125f);
+        require(value==expected,"compressed HF INT4 changed its affine values");
+    }
+    for(std::size_t offset=0;offset<=image.size();++offset) {
+        const auto size=std::min<std::size_t>(47,image.size()-offset);
+        std::vector<std::byte> part(size);source.read_range_into(name,offset,part.data(),size);
+        require(std::equal(part.begin(),part.end(),image.begin()+offset),"packed HF partial read differs");
+    }
+    require(!source.find_tensor(module+".weight_scale") && !source.find_tensor(module+".weight_shape") &&
+        !source.find_tensor(module+".weight_zero_point"),"consumed packed HF auxiliaries leaked into runtime tensors");
+    require(!source.tensor_file_range_at(name,0,image.size()),"transformed packed bytes advertised a physical file range");
+    const auto retained=[&] {mfq::HfModelSource temporary(root);return temporary.tensor_reader(name);}();
+    std::vector<std::byte> retained_image(image.size());
+    retained(0,retained_image.data(),retained_image.size());
+    require(retained_image==image,"packed HF reader did not survive source destruction");
+    bool rejected=false;
+    try {source.read_range_into(name,image.size(),nullptr,1);}catch(const std::out_of_range&){rejected=true;}
+    require(rejected,"packed HF read accepted a range outside its execution image");
 }
 
 void write_hf_mxfp8(const std::filesystem::path& root) {
@@ -313,6 +423,8 @@ int main() {
             "model.language_model.embed_tokens.weight");
         write_mfq(legacy_gguf_path, "token_embd.weight");
         write_hf(hf_path);
+        test_bare_decision_source(root/"bare-decision");
+        test_packed_hf_source(root/"packed-hf");
         write_hf_mxfp8(root / "hf-mxfp8");
         write_hf_fp8_128(root / "hf-fp8-128");
         write_hf_fp8_128(root / "hf-fp8-128-explicit", true);
@@ -396,6 +508,12 @@ int main() {
             std::vector<std::byte> expected(8197),actual(8197);
             ordinary(65521,expected.data(),expected.size());mapped(65521,actual.data(),actual.size());
             require(actual==expected,"mapped reader changed after releasing clean source pages");
+            for(int repeat=0;repeat<3;++repeat) {
+                mfq::MappedPrefetchScope transient(false,true);
+                std::fill(actual.begin(),actual.end(),std::byte{0});
+                mapped(65521,actual.data(),actual.size());
+                require(actual==expected,"transient mapped reader changed after page release");
+            }
         }
 
         {

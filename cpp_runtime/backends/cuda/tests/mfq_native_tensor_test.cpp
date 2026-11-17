@@ -1,4 +1,5 @@
 #include "mfq_native_tensor.h"
+#include "../runtime/host_storage_cache.h"
 
 #include <array>
 #include <cassert>
@@ -10,6 +11,21 @@
 
 int main() {
     using namespace mfq::cuda;
+
+    reclaim_tensor_host_storage_cache();
+    {
+        const auto baseline=tensor_host_bytes.load();
+        constexpr std::int64_t bytes=512u<<10;
+        auto active=empty({bytes},TensorOptions{}.dtype(kUInt8));active.data_ptr<std::uint8_t>()[0]=37;
+        void* address=nullptr;
+        {auto temporary=empty({bytes},TensorOptions{}.dtype(kUInt8));address=temporary.data_ptr();}
+        assert(tensor_host_bytes.load()==baseline+2*bytes);
+        {auto reused=empty({bytes},TensorOptions{}.dtype(kUInt8));assert(reused.data_ptr()==address);}
+        assert(reclaim_tensor_host_storage_cache()==bytes);
+        assert(active.data_ptr<std::uint8_t>()[0]==37 && tensor_host_bytes.load()==baseline+bytes);
+        active={};assert(reclaim_tensor_host_storage_cache()==bytes);
+        assert(tensor_host_bytes.load()==baseline);
+    }
 
     const auto before=tensor_host_bytes.load();
     Tensor retained_view;

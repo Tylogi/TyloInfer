@@ -1,15 +1,49 @@
+#include "runtime/routed_host_cache.h"
+#include "runtime/routed_event_retirement.h"
+#include "runtime/routed_prefill_routes.h"
+#include "runtime/routed_prefill_workspace_plan.h"
+#include "storage/routed_host_image.h"
+#include "runtime/routed_admission_executor.h"
+#include "runtime/routed_resident_views.h"
+#include "runtime/routed_moe_schedule.h"
+#include "runtime/routed_completion_order.h"
+#include "tyloinfer/host_copy.h"
+#include "runtime/routed_prefill_pipeline.h"
+#include "runtime/prefill_projection_plan.h"
+#include "gguf_prefill_fusion.h"
+#include "kernels/gguf.h"
+#include "runtime/routed_workspace_plan.h"
+#include "runtime/routed_prefill_loan.h"
+#include "runtime/routed_graph_pools.h"
+#include "runtime/routed_expert_journal.h"
+#include "runtime/routed_expert_groups.h"
 #include "tq.h"
+#include "tq_detail.h"
+#include "tyloinfer/tq_rows.h"
+#include "tyloinfer/runtime.h"
 #include "mfq_weight_memory.h"
-#include "nlohmann/json.hpp"
 #include "storage/moe_expert_cache.h"
+#include "storage/moe_pinned_expert_arena.h"
+#include "storage/device_image_arena.h"
+#include "storage/pinned_expert_reuse.h"
+#include "storage/routed_prefill_stager.h"
+#include "runtime/routed_image_layout.h"
 #include "quant_linear.h"
 #include "moe.h"
 #include "mfq_cuda_context.h"
+#include "mfq_cuda_resident_allocations.h"
 #include "mfq_cuda_activation_ops.h"
 #include "runtime/moe_pipeline.h"
 #include "runtime/decode_window.h"
+#include "runtime/independent_branch.h"
+#include "runtime/routed_transfer.h"
+#include "runtime/routed_stream_fence.h"
+#include "runtime/expert_route_usage.h"
+#include "runtime/routed_adaptive_slots.h"
+#include "runtime/routed_allocation_capacity.h"
 #include "runtime/execution_options.h"
 #include "tyloinfer/host_memory.h"
+#include "tyloinfer/cpu_wait.h"
 #include <algorithm>
 #include <atomic>
 #include <cstring>
@@ -20,10 +54,44 @@
 #include <cstdio>
 #include <cmath>
 #include <climits>
+#include <exception>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 
 namespace tb=mfq_tensor_backend;
+using tq_detail::logical_shape;
+using tq_detail::row_parts;
+using tq_detail::join_rows;
+using tq_detail::tq_image;
+using tq_detail::status;
+
+// Fence the actual eager reads before returning their image leases. Recording
+// consumers only when storage is finally freed can place a wait behind a later
+// graph that is itself waiting for an upload on the allocation stream.
+class TqExpertReadFence {
+    MfqCudaStream consumer_;
+    std::vector<MfqCudaStream> producers_;
+public:
+    TqExpertReadFence(std::initializer_list<const std::vector<TqWeight>*> banks,int device)
+        :consumer_(mfq_get_current_cuda_stream(device)) {
+        for(const auto* bank:banks)for(const auto& weight:*bank) {
+            if(!weight.allocation_stream || weight.allocation_stream->stream()==consumer_.stream())continue;
+            const auto& producer=*weight.allocation_stream;
+            if(std::none_of(producers_.begin(),producers_.end(),[&](const auto& s){return s.stream()==producer.stream();}))
+                producers_.push_back(producer);
+        }
+    }
+    ~TqExpertReadFence()noexcept {
+        if(producers_.empty())return;
+        try {
+            const MfqCudaGuard guard(consumer_.device());
+            mfq::cuda::Event consumed(cudaEventDisableTiming);consumed.record(consumer_.stream());
+            for(const auto& producer:producers_)
+                TYLOINFER_CUDA_CHECK(cudaStreamWaitEvent(producer.stream(),consumed.get(),0));
+        }catch(...) {(void)cudaStreamSynchronize(consumer_.stream());}
+    }
+};
 
 // Pinned plans are reused only after their last consumer completes. Keeping
 // them with model resources avoids a host allocation/free barrier per batch.
@@ -39,6 +107,30 @@ struct TqPrefillPlanLease {
         // Also fence uploads on exceptional exits before allowing reuse.
         if(cudaEventRecord(plan->done.get(),stream)!=cudaSuccess)(void)cudaStreamSynchronize(stream);
     }
+};
+
+struct TqPrefillWeightStage {
+    tb::Tensor image;
+    std::size_t cursor=0;
+    tb::Tensor allocate(std::size_t bytes) {
+        if(bytes>SIZE_MAX-15)throw std::overflow_error("TQ prefill image size overflow");
+        bytes=(bytes+15)&~std::size_t(15);
+        if(cursor>image.nbytes() || bytes>image.nbytes()-cursor)
+            throw MfqResourceExhausted("TQ prefill weight stage is exhausted");
+        auto result=image.narrow(0,int64_t(cursor),int64_t(bytes));cursor+=bytes;return result;
+    }
+};
+
+struct TqPrefillWeightPipeline {
+    struct Stage {
+        TqPrefillWeightStage workspace;
+        std::array<std::vector<TqWeight>,3> banks;
+    };
+    MfqCudaStream compute,upload;
+    std::array<Stage,mfq::cuda::RoutedPrefillPipeline::depth> stages;
+    mfq::cuda::RoutedPrefillPipeline schedule;
+    TqPrefillWeightPipeline(MfqCudaStream parent,MfqCudaStream transfer)
+        :compute(std::move(parent)),upload(std::move(transfer)),schedule(compute.stream(),upload.stream()) {}
 };
 
 // cuBLAS configuration is mutable. Give each execution stream a stable handle
@@ -88,7 +180,10 @@ public:
         auto plan=std::make_shared<TqPrefillPlan>();
         const auto capacity=(bytes+4095)&~std::int64_t(4095);
         plan->host=tb::empty({capacity},tb::TensorOptions().dtype(tb::kUInt8).pinned_memory(true));
-        plan->device=tb::empty({capacity},tb::TensorOptions().dtype(tb::kUInt8).device(tb::Device(tb::kCUDA,device_)));
+        {
+            const mfq::cuda::ResidentAllocationScope resident;
+            plan->device=tb::empty({capacity},tb::TensorOptions().dtype(tb::kUInt8).device(tb::Device(tb::kCUDA,device_)));
+        }
         prefill_plans_.push_back(plan);
         return plan;
     }
@@ -124,11 +219,6 @@ int dtype(tb::ScalarType type) {
     if(type==tb::kBFloat16)return 1;
     if(type==tb::kFloat32)return 2;
     throw std::invalid_argument("TQ activation dtype must be FP16, BF16 or FP32");
-}
-void status(int code) {
-    if(code<0)throw std::invalid_argument("invalid TQ CUDA projection arguments");
-    if(code>=1000)throw std::runtime_error("TQ cuBLAS status "+std::to_string(code-1000));
-    TYLOINFER_CUDA_CHECK(static_cast<cudaError_t>(code));
 }
 
 int gemm_min_tokens(tb::ScalarType type) {
@@ -190,103 +280,9 @@ tb::Tensor projection_workspace(const TqWeight& weight,int tokens,tb::ScalarType
             static_cast<unsigned long long>(bytes));
     return tb::empty({static_cast<std::int64_t>(bytes)},weight.image.options().dtype(tb::kUInt8));
 }
-std::vector<std::int64_t> logical_shape(const mfq::ModelSource& source,const std::string& name) {
-    const auto* record=source.find_tensor(name);
-    if(record && record->dtype!="TQ")throw std::invalid_argument("expected TQ tensor: "+name);
-    std::vector<std::int64_t> shape;
-    bool found=false;
-    for(const auto* key:{"tq_shapes","tensor_shapes"}) {
-        const auto metadata=source.metadata().find(key);
-        if(metadata==source.metadata().end())continue;
-        const auto shapes=nlohmann::json::parse(metadata->second);
-        if(!shapes.is_object())throw std::invalid_argument("invalid TQ shape metadata");
-        if(shapes.contains(name)) {
-            shape=shapes.at(name).get<std::vector<std::int64_t>>();found=true;break;
-        }
-    }
-    if(!found && record && record->shape)shape=*record->shape;
-    if(shape.empty() && record)
-        return mfq::tq_tensor_shape(record->nbytes,source.tensor_reader(name));
-    if(shape.size()!=2 && shape.size()!=3)
-        throw std::invalid_argument("TQ logical tensor shape must have rank 2 or 3: "+name);
-    std::uint64_t count=1;
-    for(const auto dimension:shape) {
-        if(dimension<1 || count>UINT64_MAX/std::uint64_t(dimension))
-            throw std::invalid_argument("invalid TQ logical tensor shape: "+name);
-        count*=dimension;
-    }
-    return shape;
-}
-std::vector<std::string> row_parts(const mfq::ModelSource& source,const std::string& name) {
-    for(const auto* key:{"tq_row_shards","tq.segments"}) {
-        const auto entry=source.metadata().find(key);
-        if(entry==source.metadata().end())continue;
-        const auto tables=nlohmann::json::parse(entry->second);
-        if(!tables.is_object())throw std::invalid_argument("invalid TQ row-shard manifest");
-        if(!tables.contains(name))continue;
-        if(std::string_view(key)=="tq_row_shards" && source.find_tensor(name))
-            throw std::invalid_argument("ambiguous TQ row table: "+name);
-        const auto names=tables.at(name).get<std::vector<std::string>>();
-        if(names.empty())throw std::invalid_argument("empty TQ row table: "+name);
-        return names;
-    }
-    return {name};
-}
-std::vector<std::uint8_t> join_rows(const std::vector<std::vector<std::uint8_t>>& blobs) {
-    if(blobs.empty())throw std::invalid_argument("empty TQ row selection");
-    const mfq::TqLayout first(blobs[0].data(),blobs[0].size());
-    std::uint64_t rows=0,packed_bytes=0;
-    for(const auto& blob:blobs) {
-        const mfq::TqLayout layout(blob.data(),blob.size());
-        if(layout.width!=first.width || layout.columns!=first.columns || layout.gs!=first.gs)
-            throw std::invalid_argument("incompatible TQ row segments");
-        if(first.columns && std::memcmp(blobs[0].data()+first.scales,blob.data()+layout.scales,first.scale_bytes))
-            throw std::invalid_argument("TQ row segments have different column scales");
-        rows+=layout.rows;packed_bytes+=layout.packed_bytes;
-    }
-    if(rows>UINT32_MAX || packed_bytes>UINT32_MAX)throw std::overflow_error("selected TQ rows exceed RTRELL05 limits");
-    const auto scale_bytes=first.columns?first.scale_bytes:(rows*first.groups+1)/2;
-    const auto scale_offset=64+rows*8,packed_offset=scale_offset+scale_bytes;
-    std::vector<std::uint8_t> result(packed_offset+packed_bytes);
-    std::memcpy(result.data(),blobs[0].data(),64);
-    mfq::TqLayout::integer(result.data()+12,rows,4);
-    mfq::TqLayout::integer(result.data()+28,packed_bytes,4);
-    std::uint64_t row_offset=0,byte_offset=0;
-    if(first.columns)std::memcpy(result.data()+scale_offset,blobs[0].data()+first.scales,scale_bytes);
-    for(const auto& blob:blobs) {
-        const mfq::TqLayout m(blob.data(),blob.size());
-        for(std::size_t row=0;row<m.rows;++row) {
-            auto descriptor=mfq::TqLayout::integer(blob.data()+64+row*8,8);
-            descriptor=m.rebase(descriptor,std::uint64_t(m.offset(descriptor))+byte_offset/4);
-            mfq::TqLayout::integer(result.data()+64+(row_offset+row)*8,descriptor,8);
-        }
-        if(!m.columns)for(std::size_t i=0;i<std::size_t(m.rows)*m.groups;++i) {
-            const auto selector=(blob[m.scales+i/2]>>((i&1)*4))&15;
-            const auto index=row_offset*m.groups+i;
-            result[scale_offset+index/2]|=selector<<((index&1)*4);
-        }
-        std::memcpy(result.data()+packed_offset+byte_offset,blob.data()+m.packed,m.packed_bytes);
-        row_offset+=m.rows;byte_offset+=m.packed_bytes;
-    }
-    return result;
-}
 }
 
 namespace {
-std::vector<std::uint8_t> tq_image(const std::vector<std::uint8_t>& blob,const mfq::TqLayout& m) {
-    // The serialized scale stream can end at an odd byte. Align the packed
-    // word stream in one compressed image instead of uploading fields apart.
-    const auto words_offset=(m.packed+3)&~std::size_t(3);
-    const auto relative_offset=words_offset+m.packed_bytes;
-    std::vector<std::uint8_t> image(relative_offset+32);
-    std::memcpy(image.data(),blob.data(),m.packed);
-    std::memcpy(image.data()+words_offset,blob.data()+m.packed,m.packed_bytes);
-    // Exact FP16 RELATIVE table from the TQ format, independent of device.
-    constexpr std::uint16_t relative[]{0x3400,0x34d0,0x35ca,0x36f7,0x3830,0x390a,0x3a10,0x3b4b,
-        0x3c63,0x3d47,0x3e59,0x3fa4,0x4098,0x4187,0x42a6,0x4400};
-    std::memcpy(image.data()+relative_offset,relative,sizeof(relative));
-    return image;
-}
 TqWeight tq_view(tb::Tensor image,const mfq::TqLayout& m,std::int64_t columns) {
     if(columns<1 || columns>m.width || m.rows>INT_MAX || m.width>INT_MAX)
         throw std::invalid_argument("invalid TQ CUDA logical shape");
@@ -331,20 +327,179 @@ TqWeight load_tq_weight(const mfq::ModelSource& source,const std::string& name,i
     return result;
 }
 
-namespace {
-TqWeight promote_tq(const TqWeight& weight,const tb::Device& device) {
-    TqWeight result=weight;
-    result.image=weight.image.to(device,false,false).contiguous();
-    result.gemm=tq_gemm_resources(device.index);
-    const auto old=reinterpret_cast<std::uintptr_t>(weight.image.data_ptr());
+TqWeight TqWeight::with_image(tb::Tensor storage)const {
+    if(!storage.defined() || !storage.is_contiguous() || storage.scalar_type()!=tb::kUInt8 ||
+            storage.numel()!=image.numel())
+        throw std::invalid_argument("TQ replacement image must preserve contiguous encoded bytes");
+    TqWeight result=*this;
+    result.image=std::move(storage);
+    result.gemm=result.image.is_cuda()?tq_gemm_resources(result.image.get_device()):nullptr;
+    const auto old=reinterpret_cast<std::uintptr_t>(image.data_ptr());
     const auto target=reinterpret_cast<std::uintptr_t>(result.image.data_ptr());
-    auto address=[&](const void* p){return p?target+(reinterpret_cast<std::uintptr_t>(p)-old):std::uintptr_t(0);};
-    result.view.words=reinterpret_cast<const std::uint32_t*>(address(weight.view.words));
-    result.view.descriptors=reinterpret_cast<const std::uint64_t*>(address(weight.view.descriptors));
-    result.view.scales=reinterpret_cast<const void*>(address(weight.view.scales));
-    result.view.relative=reinterpret_cast<const void*>(address(weight.view.relative));
+    auto address=[&](const void* p) {
+        if(!p)return std::uintptr_t(0);
+        const auto offset=reinterpret_cast<std::uintptr_t>(p)-old;
+        if(offset>=image.nbytes())throw std::invalid_argument("TQ view points outside its image");
+        return target+offset;
+    };
+    result.view.words=reinterpret_cast<const std::uint32_t*>(address(view.words));
+    result.view.descriptors=reinterpret_cast<const std::uint64_t*>(address(view.descriptors));
+    result.view.scales=reinterpret_cast<const void*>(address(view.scales));
+    result.view.relative=reinterpret_cast<const void*>(address(view.relative));
+    result.view.bias=reinterpret_cast<const float*>(address(view.bias));
     return result;
 }
+namespace {
+TqWeight promote_tq(const TqWeight& weight,const tb::Device& device) {
+    return weight.with_image(weight.image.to(device,false,false).contiguous());
+}
+
+tb::Tensor cached_tq_prefill_exponents(const TqWeight& w) {
+    return prefill_weight_exponents(w.image,w.out,w.neuron_len,
+        {1,reinterpret_cast<std::uintptr_t>(w.view.words),reinterpret_cast<std::uintptr_t>(w.view.descriptors),
+         reinterpret_cast<std::uintptr_t>(w.view.scales),reinterpret_cast<std::uintptr_t>(w.view.relative),
+         std::uintptr_t(w.view.stored_columns),std::uintptr_t(w.view.gslog),std::uintptr_t(w.view.columns)},
+        [&](const tb::Tensor& exponents) {
+            status(mfq_tq_prefill_row_exponents(w.view,0,int(w.out),exponents.data_ptr<int32_t>(),
+                mfq_get_current_cuda_stream(w.image.get_device()).stream()));
+        });
+}
+
+tb::Tensor try_tq_prefill_projection(const TqWeight& weight,const tb::Tensor& input,int64_t groups=1,
+        const tb::Tensor& residual={}) {
+    const auto type=input.scalar_type();
+    const auto tokens=input.numel()/(groups*weight.neuron_len);
+    const auto* setting=mfq::cuda::prefill_tensorcore_setting();
+    // Match GGUF's automatic reduced-accumulation prefill mode. Biased
+    // projections retain their bias-before-output-rounding implementation.
+    if(tokens<=32 || ((!setting || setting[0]=='a') && tokens<512) ||
+       (type!=tb::kFloat16 && type!=tb::kFloat32) || weight.view.bias ||
+       (setting && setting[0]!='1' && setting[0]!='a') ||
+       !mfq::cuda::gguf::grouped_f16_available(input.get_device()))return {};
+    if(residual.defined() && (groups!=1 || type!=tb::kFloat16 ||
+            !weight.can_forward_prefill_residual(tokens,residual)))return {};
+    if(groups==1 && type==tb::kFloat32) {
+        const auto product=prefill_product(prefill_projection_weight(weight),input);
+        if(product.defined()) {
+            auto shape=input.sizes().vec();shape.back()=weight.out;
+            return prefill_materialize(product).reshape(shape);
+        }
+    }
+    const auto stream=mfq_get_current_cuda_stream(input.get_device());
+    const auto row_count=weight.out/groups;
+    const bool scaled=type==tb::kFloat32;
+    const auto cached_exponents=scaled?cached_tq_prefill_exponents(weight):tb::Tensor{};
+    if(scaled && !cached_exponents.defined())return {};
+    const auto bytes_per_row=std::uint64_t(weight.neuron_len)*2+(scaled?std::uint64_t(tokens)*2:0);
+    const auto tile=std::min<int64_t>(65535,mfq::cuda::prefill_weight_rows(row_count,bytes_per_row,32,
+        input.get_device(),true));
+    auto shape=input.sizes().vec();shape.pop_back();if(groups==1)shape=input.sizes().vec();shape.back()=weight.out;
+    auto output=tb::empty({tokens,weight.out},input.options());
+    tb::Tensor residual_workspace;
+    if(residual.defined())mfq_cuda_record_stream(residual,stream);
+    const auto decoder=tile<row_count?mfq::cuda::stream_from_pool(false,input.get_device()):stream;
+    const int buffers=tile<row_count?2:1;
+    std::array<tb::Tensor,2> decoded,halves,exponents;
+    std::array<mfq::cuda::Event,2> ready,consumed;
+    for(int i=0;i<buffers;++i) {
+        decoded[i]=tb::empty({tile,weight.neuron_len},input.options().dtype(tb::kFloat16));
+        if(scaled)halves[i]=decoded[i];
+        for(const auto& tensor:{decoded[i],halves[i],exponents[i]})if(tensor.defined()) {
+            mfq_cuda_record_stream(tensor,stream);mfq_cuda_record_stream(tensor,decoder);
+        }
+    }
+    auto ids=scaled?tb::Tensor{}:tb::arange(weight.out,input.options().dtype(tb::kInt64));
+    auto product=scaled?tb::empty({tokens,tile},input.options().dtype(tb::kFloat16)):tb::Tensor{};
+    if(ids.defined())mfq_cuda_record_stream(ids,decoder);
+    if(cached_exponents.defined())mfq_cuda_record_stream(cached_exponents,decoder);
+    mfq_cuda_record_stream(weight.image,decoder);
+    mfq::cuda::Event source_ready;source_ready.record(stream.stream());
+    TYLOINFER_CUDA_CHECK(cudaStreamWaitEvent(decoder.stream(),source_ready.get(),0));
+    for(int64_t group=0;group<groups;++group) {
+        auto source=groups==1?input.reshape({tokens,weight.neuron_len}):
+            input.reshape({tokens,groups,weight.neuron_len}).select(1,group).contiguous();
+        tb::Tensor packed,input_exponents;
+        if(scaled) {
+            if(!GgufPrefillInputScope::lookup(source,packed,input_exponents)) {
+                packed=tb::empty(source.sizes(),source.options().dtype(tb::kFloat16));
+                input_exponents=tb::empty({tokens},source.options().dtype(tb::kInt32));
+                mfq::cuda::gguf::pack_scaled_f16_unit(source.data_ptr<float>(),packed.data_ptr(),
+                    input_exponents.data_ptr<int32_t>(),tokens,weight.neuron_len,stream.stream());
+            }
+        } else packed=source;
+        const auto prepare=[&](int64_t index) {
+            const auto first=index*tile,count=std::min(tile,row_count-first);
+            const int slot=int(index%buffers);
+            if(scaled) {
+                exponents[slot]=cached_exponents.narrow(0,group*row_count+first,count);
+                status(mfq_tq_prefill_scaled_rows(weight.view,int(group*row_count+first),int(count),
+                    exponents[slot].data_ptr<int32_t>(),halves[slot].data_ptr(),decoder.stream()));
+            } else status(mfq_tq_embedding(weight.view,ids.data_ptr<int64_t>()+group*row_count+first,int(count),
+                decoded[slot].data_ptr(),0,decoder.stream()));
+            ready[slot].record(decoder.stream());
+        };
+        const auto tiles=(row_count+tile-1)/tile;
+        for(int i=0;i<buffers && i<tiles;++i)prepare(i);
+        for(int64_t index=0;index<tiles;++index) {
+            const auto first=index*tile,count=std::min(tile,row_count-first);
+            const int slot=int(index%buffers);
+            TYLOINFER_CUDA_CHECK(cudaStreamWaitEvent(stream.stream(),ready[slot].get(),0));
+            auto* destination=static_cast<uint8_t*>(output.data_ptr())+(group*row_count+first)*output.element_size();
+            if(residual.defined()) {
+                prefill_residual_gemm(packed,decoded[slot],residual,output,first,count,weight.gemm->get(),residual_workspace);
+            } else mfq::cuda::gguf::prefill_gemm_f16_accum(packed.data_ptr(),scaled?halves[slot].data_ptr():decoded[slot].data_ptr(),
+                scaled?product.data_ptr():nullptr,static_cast<uint8_t*>(output.data_ptr())+
+                (group*row_count+first)*output.element_size(),!scaled,
+                scaled?input_exponents.data_ptr<int32_t>():nullptr,scaled?exponents[slot].data_ptr<int32_t>():nullptr,
+                tokens,count,weight.neuron_len,weight.out,weight.gemm->get(),stream.stream());
+            consumed[slot].record(stream.stream());
+            TYLOINFER_CUDA_CHECK(cudaStreamWaitEvent(decoder.stream(),consumed[slot].get(),0));
+            if(index+buffers<tiles)prepare(index+buffers);
+        }
+        for(const auto& tensor:{packed,input_exponents})if(tensor.defined())mfq_cuda_record_stream(tensor,stream);
+    }
+    if(const auto* trace=std::getenv("TYLOINFER_TRACE_KERNEL_DISPATCH");trace && trace[0]=='1') {
+        static std::atomic<bool> seen[2]{};
+        if(!seen[scaled].exchange(true))std::fprintf(stderr,
+            "native_tq_prefill_shared_gemm actual_match=1 M=%lld N=%lld K=%lld groups=%lld tile_rows=%lld buffers=%d scaled=%d f16_accum=1\n",
+            static_cast<long long>(tokens),static_cast<long long>(weight.out),static_cast<long long>(weight.neuron_len),
+            static_cast<long long>(groups),static_cast<long long>(tile),buffers,int(scaled));
+    }
+    return output.reshape(shape);
+}
+}
+
+PrefillProjectionWeight prefill_projection_weight(const TqWeight& w) {
+    if(!w.image.is_cuda() || w.view.bias || w.out<1 || w.neuron_len<1)return {};
+    return {w.image,w.out,w.neuron_len,std::uint64_t(w.neuron_len)*2,[w] {
+        const MfqCudaGuard guard(w.image.get_device());
+        const auto stream=mfq_get_current_cuda_stream(w.image.get_device());
+        auto exponents=cached_tq_prefill_exponents(w);if(!exponents.defined())return PrefillWeightImage{};
+        auto image=tb::empty({w.out,w.neuron_len},w.image.options().dtype(tb::kFloat16));
+        for(const auto& tensor:{w.image,image,exponents})mfq_cuda_record_stream(tensor,stream);
+        for(int64_t begin=0;begin<w.out;begin+=65535) {
+            const auto count=std::min<int64_t>(65535,w.out-begin);
+            status(mfq_tq_prefill_scaled_rows(w.view,int(begin),int(count),exponents.data_ptr<int32_t>()+begin,
+                static_cast<std::uint8_t*>(image.data_ptr())+begin*w.neuron_len*2,stream.stream()));
+        }
+        if(const auto* trace=std::getenv("TYLOINFER_TRACE_KERNEL_DISPATCH");trace && trace[0]=='1') {
+            static std::atomic<bool> reported{false};
+            if(!reported.exchange(true))std::fprintf(stderr,
+                "native_tq_prefill_weight_decoder actual_match=1 shared_product=1 cached_exponents=1 direct_scaled_f16=1 rows=%lld columns=%lld\n",
+                static_cast<long long>(w.out),static_cast<long long>(w.neuron_len));
+        }
+        return PrefillWeightImage{image,exponents};
+    }};
+}
+
+bool TqWeight::can_forward_prefill_residual(int64_t tokens,const tb::Tensor& residual)const {
+    return !view.bias && can_prefill_residual(image,out,neuron_len,tokens,residual);
+}
+tb::Tensor TqWeight::forward_prefill_residual(tb::Tensor input,const tb::Tensor& residual)const {
+    if(!input.is_cuda() || input.device()!=image.device() || input.dim()<1 || input.size(-1)!=neuron_len ||
+            input.scalar_type()!=tb::kFloat16)return {};
+    const MfqCudaGuard guard(image.get_device());
+    return try_tq_prefill_projection(*this,input.contiguous(),1,residual);
 }
 
 tb::Tensor TqWeight::forward(tb::Tensor input)const {
@@ -353,6 +508,7 @@ tb::Tensor TqWeight::forward(tb::Tensor input)const {
         throw std::invalid_argument("TQ projection input shape or device differs");
     const MfqCudaGuard guard(image.get_device());
     const auto source=input.contiguous();auto shape=input.sizes().vec();shape.back()=out;
+    if(auto result=try_tq_prefill_projection(*this,source);result.defined())return result;
     auto result=tb::empty(shape,input.options());
     const auto tokens=source.numel()/neuron_len;
     const auto element=source.element_size();
@@ -373,6 +529,7 @@ tb::Tensor TqWeight::forward_groupwise(tb::Tensor input,std::int64_t groups)cons
         throw std::invalid_argument("TQ grouped input must match the weight's group rows and width");
     const MfqCudaGuard guard(image.get_device());
     const auto source=input.contiguous();
+    if(auto result=try_tq_prefill_projection(*this,source,groups);result.defined())return result;
     const auto tokens=source.numel()/(groups*neuron_len);
     const auto element=source.element_size();
     auto shape=input.sizes().vec();shape.pop_back();shape.back()=out;
@@ -394,6 +551,72 @@ tb::Tensor TqWeight::forward_groupwise(tb::Tensor input,std::int64_t groups)cons
         else status(mfq_tq_grouped_tokens(view,x,y,count,static_cast<int>(groups),dtype(source.scalar_type()),mfq_current_cuda_stream()));
     }
     return result;
+}
+
+tb::Tensor TqWeight::try_residual(tb::Tensor input,const tb::Tensor& normalized,
+        std::int64_t streams,bool injection)const {
+    if(!image.is_cuda() || !input.is_cuda() || image.device()!=input.device() || input.dim()<1 ||
+            input.size(-1)!=neuron_len || streams<1 || streams>INT_MAX)return {};
+    const auto tokens=input.numel()/neuron_len;
+    if(tokens<1 || tokens>4)return {};
+    // Residual BF16 inputs already promote to FP32 in the separate path.
+    // FP16 retains its intermediate rounding through that existing path.
+    if(input.scalar_type()==tb::kBFloat16)input=input.to(tb::kFloat32);
+    if(input.scalar_type()!=tb::kFloat32)return {};
+    auto shape=input.sizes().vec();shape.back()=out;
+    if(normalized.defined()) {
+        if(out%streams || normalized.device()!=input.device() || !normalized.is_contiguous() ||
+                normalized.scalar_type()!=tb::kFloat32 || normalized.sizes().vec()!=shape)return {};
+        shape.back()/=streams;
+    }
+    const MfqCudaGuard guard(input.device());
+    const auto workspace=projection_workspace(*this,int(tokens),input.scalar_type());
+    if(!workspace.defined())return {};
+    const auto source=input.contiguous();
+    auto result=tb::empty(shape,input.options());
+    status(mfq_tq_q8_residual_tokens(view,source.data_ptr<float>(),
+        normalized.defined()?normalized.data_ptr<float>():nullptr,result.data_ptr<float>(),
+        int(tokens),int(streams),injection,workspace.data_ptr(),workspace.nbytes(),mfq_current_cuda_stream()));
+    if(const auto* trace=std::getenv("TYLOINFER_TRACE_KERNEL_DISPATCH");trace && trace[0]=='1') {
+        static std::atomic<unsigned> seen{0};
+        const auto bit=1u<<(unsigned(tokens)+4u*(normalized.defined()?2u:injection?1u:0u));
+        if(!(seen.fetch_or(bit,std::memory_order_relaxed)&bit))
+            std::fprintf(stderr,"native_tq_residual_epilogue actual_match=1 mode=%s rows=%lld K=%lld N=%lld streams=%lld\n",
+                normalized.defined()?"mix":injection?"injection":"activation",static_cast<long long>(tokens),
+                static_cast<long long>(neuron_len),static_cast<long long>(out),static_cast<long long>(streams));
+    }
+    return result;
+}
+
+std::vector<tb::Tensor> TqWeight::try_residual_down(tb::Tensor input,const tb::Tensor& injection,
+        std::int64_t streams)const {
+    if(!image.is_cuda() || !input.is_cuda() || image.device()!=input.device() || input.dim()<1 ||
+            input.size(-1)!=neuron_len || neuron_len<1 || streams<1 || streams>INT_MAX ||
+            !injection.defined() || !injection.is_cuda() || injection.device()!=input.device() ||
+            injection.dim()!=2 || injection.size(0)!=streams || injection.size(1)!=neuron_len ||
+            injection.scalar_type()!=tb::kBFloat16 || !injection.is_contiguous())return {};
+    const auto tokens=input.numel()/neuron_len;
+    if(tokens<1 || tokens>4)return {};
+    if(input.scalar_type()==tb::kBFloat16)input=input.to(tb::kFloat32);
+    if(input.scalar_type()!=tb::kFloat32)return {};
+    const MfqCudaGuard guard(input.device());
+    const auto workspace=projection_workspace(*this,int(tokens),input.scalar_type());
+    if(!workspace.defined())return {};
+    const auto source=input.contiguous();
+    auto shape=input.sizes().vec();shape.back()=out;
+    auto low=tb::empty(shape,input.options());shape.back()=streams;
+    auto gates=tb::empty(shape,input.options());
+    status(mfq_tq_q8_residual_down(view,source.data_ptr<float>(),static_cast<const uint16_t*>(injection.data_ptr()),
+        low.data_ptr<float>(),gates.data_ptr<float>(),int(tokens),int(streams),
+        workspace.data_ptr(),workspace.nbytes(),mfq_current_cuda_stream()));
+    if(const auto* trace=std::getenv("TYLOINFER_TRACE_KERNEL_DISPATCH");trace && trace[0]=='1') {
+        static std::atomic<unsigned> seen{0};const auto bit=1u<<unsigned(tokens);
+        if(!(seen.fetch_or(bit,std::memory_order_relaxed)&bit))std::fprintf(stderr,
+            "native_tq_residual_down_injection actual_match=1 rows=%lld K=%lld N=%lld streams=%lld launches=1\n",
+            static_cast<long long>(tokens),static_cast<long long>(neuron_len),
+            static_cast<long long>(out),static_cast<long long>(streams));
+    }
+    return {low,gates};
 }
 
 tb::Tensor TqWeight::embedding(tb::Tensor ids)const {
@@ -446,6 +669,9 @@ std::vector<tb::Tensor> TqProjectionGroup::forward(tb::Tensor input)const {
         throw std::invalid_argument("TQ group input shape or device differs");
     const MfqCudaGuard guard(input.get_device());
     const auto source=input.contiguous();
+    const auto stream=mfq_get_current_cuda_stream(input.get_device());
+    mfq_cuda_record_stream(source,stream);mfq_cuda_record_stream(plan_,stream);
+    for(const auto& weight:weights_)mfq_cuda_record_stream(weight.image,stream);
     const auto tokens=source.numel()/input_;
     const auto join=[&](std::vector<tb::Tensor> values) {
         if(joined_prefix_>1) {
@@ -456,6 +682,7 @@ std::vector<tb::Tensor> TqProjectionGroup::forward(tb::Tensor input)const {
         return values;
     };
     if(tokens>=gemm_min_tokens(source.scalar_type())) {
+        GgufPrefillInputScope prepared(source);
         std::vector<tb::Tensor> result;result.reserve(weights_.size());
         for(const auto& weight:weights_)result.push_back(weight.forward(source));
         return join(std::move(result));
@@ -537,380 +764,73 @@ tb::Tensor TqProjectionGroup::swiglu(tb::Tensor input)const {
     return output;
 }
 
-bool is_tq_row_table(const mfq::ModelSource& source,const std::string& name) {
-    const auto* record=source.find_tensor(name);
-    for(const auto* key:{"tq_row_shards","tq.segments"}) {
-        const auto entry=source.metadata().find(key);
-        if(entry!=source.metadata().end()) {
-            const auto tables=nlohmann::json::parse(entry->second);
-            if(!tables.is_object())throw std::invalid_argument("invalid TQ row-shard manifest");
-            if(tables.contains(name)) {
-                if(std::string_view(key)=="tq_row_shards" && record)
-                    throw std::invalid_argument("ambiguous TQ row table: "+name);
-                return true;
-            }
-        }
-    }
-    return record && record->dtype=="TQ";
-}
-TqRowTable::TqRowTable(const mfq::ModelSource& source,const std::string& name) {
-    const auto shape=logical_shape(source,name);
-    columns_=shape.back();
-    const auto names=row_parts(source,name);
-    std::unordered_set<std::string> unique;
-    std::uint64_t end=0;
-    for(const auto& part:names) {
-        const auto* record=source.find_tensor(part);
-        if(!unique.insert(part).second || !record || record->dtype!="TQ")
-            throw std::invalid_argument("invalid TQ row segment: "+part);
-        auto segments=mfq::tq_row_segments(record->nbytes,source.tensor_reader(part),columns_);
-        if(storage_bytes_>UINT64_MAX-record->nbytes)throw std::overflow_error("TQ row table size exceeds bounds");
-        storage_bytes_+=record->nbytes;
-        for(auto& rows:segments) {
-            if(end>UINT64_MAX-rows->layout().rows)throw std::overflow_error("TQ row count exceeds bounds");
-            end+=rows->layout().rows;ends_.push_back(end);segments_.push_back(std::move(rows));
-        }
-    }
-    std::uint64_t expected=1;
-    for(std::size_t i=0;i+1<shape.size();++i)expected*=shape[i];
-    if(end!=expected)throw std::invalid_argument("TQ table row count differs");
-}
-std::vector<std::uint8_t> TqRowTable::slice_rows(std::uint64_t begin,std::uint64_t end)const {
-    if(begin>=end || end>rows())throw std::out_of_range("invalid TQ table row range");
-    std::uint64_t start=0;
-    std::vector<std::vector<std::uint8_t>> pieces;
-    for(std::size_t i=0;i<segments_.size();++i) {
-        const auto a=std::max(begin,start),b=std::min(end,ends_[i]);
-        if(a<b)pieces.push_back(segments_[i]->slice_rows(a-start,b-start));
-        start=ends_[i];if(start>=end)break;
-    }
-    if(pieces.size()==1)return std::move(pieces[0]);
-    return join_rows(pieces);
-}
-
-std::size_t TqRowTable::row_image_bytes_bound()const {
-    std::size_t bytes=0;
-    for(const auto& segment:segments_) {
-        const auto& m=segment->layout();
-        if(m.width>INT_MAX)throw std::overflow_error("TQ row stage width exceeds CUDA limits");
-        const auto scales=m.columns?m.scale_bytes:(m.groups+1)/2;
-        // One descriptor, aligned packed words, up to8 bits/weight, relative table.
-        bytes=std::max(bytes,((64+8+scales+3)&~std::size_t(3))+m.width+32);
-    }
-    return (bytes+7)&~std::size_t(7);
-}
-tb::Tensor TqRowTable::lookup(const std::int64_t* ids,std::size_t count,const tb::Device& device)const {
-    if(!device.is_cuda() || !count || !ids)throw std::invalid_argument("TQ table lookup requires CUDA and row IDs");
-    std::vector<std::int64_t> selected(ids,ids+count);
-    std::sort(selected.begin(),selected.end());selected.erase(std::unique(selected.begin(),selected.end()),selected.end());
-    if(selected.front()<0 || std::uint64_t(selected.back())>=rows())throw std::out_of_range("TQ table lookup row is out of bounds");
-    // Shared table IDs occur across tokens and heads. Read each compressed
-    // row once, coalesce adjacent rows, then restore the caller's order on GPU.
-    // Sorting also groups metadata reads without fetching intervening weights.
-    const MfqCudaGuard guard(device);
-    const auto gather=[&](std::size_t segment,std::size_t begin,std::size_t end) {
-        const auto start=segment?ends_[segment-1]:0;
-        std::vector<std::vector<std::uint8_t>> pieces;
-        for(auto run=begin;run<end;) {
-            auto next=run+1;
-            while(next<end && selected[next]==selected[next-1]+1)++next;
-            pieces.push_back(segments_[segment]->slice_rows(selected[run]-start,selected[next-1]+1-start));
-            run=next;
-        }
-        return to_device_tq(join_rows(pieces),columns_,device.index);
-    };
-    const auto first=std::upper_bound(ends_.begin(),ends_.end(),selected.front())-ends_.begin();
-    const auto last=std::upper_bound(ends_.begin(),ends_.end(),selected.back())-ends_.begin();
-    if(first==last) {
-        // Preserve the single-segment path: decode duplicates directly in
-        // caller order, without an intermediate table or gather kernel.
-        const auto weight=gather(first,0,selected.size());
-        if(selected.size()!=count || !std::equal(selected.begin(),selected.end(),ids)) {
-            std::vector<std::int64_t> inverse;inverse.reserve(count);
-            for(std::size_t i=0;i<count;++i)
-                inverse.push_back(std::lower_bound(selected.begin(),selected.end(),ids[i])-selected.begin());
-            const auto index=tb::from_blob(inverse.data(),{static_cast<std::int64_t>(count)},tb::TensorOptions().dtype(tb::kInt64))
-                .clone().to(device,false,false);
-            return weight.embedding(index);
-        }
-        if(count>65535)return weight.embedding(tb::arange(count,weight.image.options().dtype(tb::kInt64)));
-        auto result=tb::empty({static_cast<std::int64_t>(count),columns_},weight.image.options().dtype(tb::kFloat16));
-        status(mfq_tq_embedding(weight.view,nullptr,static_cast<int>(count),result.data_ptr(),0,mfq_current_cuda_stream()));
-        return result;
-    }
-    auto result=tb::empty({static_cast<std::int64_t>(selected.size()),columns_},
-        tb::TensorOptions().device(device).dtype(tb::kFloat16));
-    std::size_t begin=0;
-    // Decode each physical segment separately: its padding, group size and
-    // column scales need not match the other segments of this logical table.
-    for(std::size_t segment=0;segment<segments_.size() && begin<selected.size();++segment) {
-        const auto end=std::lower_bound(selected.begin()+begin,selected.end(),ends_[segment])-selected.begin();
-        if(std::size_t(end)>begin) {
-            const auto weight=gather(segment,begin,end);
-            const auto count=end-begin;
-            if(count>65535) {
-                const auto index=tb::arange(count,weight.image.options().dtype(tb::kInt64));
-                result.slice(0,begin,end).copy_(weight.embedding(index));
-            } else status(mfq_tq_embedding(weight.view,nullptr,static_cast<int>(count),
-                static_cast<std::uint8_t*>(result.data_ptr())+begin*columns_*sizeof(std::uint16_t),
-                0,mfq_current_cuda_stream()));
-        }
-        begin=end;
-    }
-    if(selected.size()!=count || !std::equal(selected.begin(),selected.end(),ids)) {
-        std::vector<std::int64_t> inverse;inverse.reserve(count);
-        for(std::size_t i=0;i<count;++i)inverse.push_back(std::lower_bound(selected.begin(),selected.end(),ids[i])-selected.begin());
-        const auto index=tb::from_blob(inverse.data(),{static_cast<std::int64_t>(count)},tb::TensorOptions().dtype(tb::kInt64))
-            .clone().to(device,false,false);
-        return result.index_select(0,index);
-    }
-    return result;
-}
-tb::Tensor TqRowTable::lookup(tb::Tensor ids)const {
-    auto host=ids.contiguous().cpu().to(tb::kInt64);
-    auto shape=ids.sizes().vec();shape.push_back(columns_);
-    if(!ids.numel())return tb::empty(shape,ids.options().dtype(tb::kFloat16));
-    return lookup(host.data_ptr<std::int64_t>(),host.numel(),ids.device()).reshape(shape);
-}
-
-tb::Tensor lookup_tq_shards(const std::vector<std::shared_ptr<TqRowTable>>& shards,
-        std::int64_t rows_per_shard,const std::vector<std::int64_t>& ids,const tb::Device& device) {
-    if(shards.empty() || !shards.front() || rows_per_shard<1 || !device.is_cuda())
-        throw std::invalid_argument("invalid TQ table shard geometry");
-    const auto columns=shards.front()->width();
-    for(const auto& table:shards)if(!table || table->width()!=columns)
-        throw std::invalid_argument("TQ table shard widths differ");
-    static std::atomic<bool> reported{false};
-    if(std::getenv("TYLOINFER_TQ_PROFILE_CACHE") && !reported.exchange(true))
-        std::fprintf(stderr,"tq_table_shards_dispatch enabled=1 shards=%zu lookups=%zu width=%lld CPU_ids=1\n",
-            shards.size(),ids.size(),static_cast<long long>(columns));
-    const MfqCudaGuard guard(device);
-    auto result=tb::empty({static_cast<std::int64_t>(ids.size()),columns},
-        tb::TensorOptions().device(device).dtype(tb::kFloat16));
-    std::vector<std::vector<std::int64_t>> local(shards.size()),positions(shards.size());
-    for(std::size_t i=0;i<ids.size();++i) {
-        if(ids[i]<0 || std::uint64_t(ids[i]/rows_per_shard)>=shards.size())
-            throw std::out_of_range("TQ embedding shard ID is out of bounds");
-        const auto shard=ids[i]/rows_per_shard;
-        local[shard].push_back(ids[i]%rows_per_shard);positions[shard].push_back(static_cast<std::int64_t>(i));
-    }
-    // Hashing already produced CPU IDs. Keep shard selection on CPU, read
-    // only that shard's requested rows, then scatter once on GPU. There is no
-    // masked whole-batch lookup or GPU->CPU round trip for each shard.
-    for(std::size_t shard=0;shard<shards.size();++shard)if(!local[shard].empty()) {
-        const auto values=shards[shard]->lookup(local[shard].data(),local[shard].size(),device);
-        const auto index=tb::from_blob(positions[shard].data(),{static_cast<std::int64_t>(positions[shard].size())},
-            tb::TensorOptions().dtype(tb::kInt64)).clone().to(device,false,false);
-        result.index_copy_(0,index,values);
-    }
-    return result;
-}
-
-namespace {
-class TqRowStage final:public RowStage {
-    std::vector<std::shared_ptr<TqRowTable>> tables_;
-    std::vector<std::int64_t> shape_;
-    std::int64_t rows_per_shard_,count_=1,columns_=0;
-    std::size_t image_stride_=0,images_offset_=0,bytes_=0;
-    tb::Device device_;
-    std::unique_ptr<mfq::cuda::HostBuffer> host_;
-    tb::Tensor packet_,output_;
-    std::uint8_t* packet_address_=nullptr;
-    bool mapped_=false,charged_=false;
-    std::vector<MfqCudaStream> streams_;
-    void retain_stream() {
-        const auto stream=mfq_get_current_cuda_stream(device_.index);
-        if(std::none_of(streams_.begin(),streams_.end(),[&](const auto& s){return s.stream()==stream.stream();}))
-            streams_.push_back(stream);
-    }
-    TrellisProjectionView pack_row(const std::vector<std::uint8_t>& wire,std::size_t slot) {
-        const mfq::TqLayout layout(wire.data(),wire.size());
-        const auto image=tq_image(wire,layout);
-        if(layout.rows!=1 || columns_>layout.width || image.size()>image_stride_)
-            throw std::invalid_argument("TQ stage row exceeds its prepared layout");
-        const auto offset=images_offset_+slot*image_stride_;
-        std::memcpy(static_cast<std::uint8_t*>(host_->data())+offset,image.data(),image.size());
-        auto* address=packet_address_+offset;
-        const auto words=(layout.packed+3)&~std::size_t(3);
-        int gslog=0;for(auto gs=layout.gs;gs>1;gs>>=1)++gslog;
-        return {reinterpret_cast<const std::uint32_t*>(address+words),
-            reinterpret_cast<const std::uint64_t*>(address+64),address+layout.scales,
-            address+words+layout.packed_bytes,nullptr,1,int(layout.width),int(columns_),gslog,int(layout.columns)};
-    }
-public:
-    TqRowStage(std::vector<std::shared_ptr<TqRowTable>> tables,std::int64_t rows_per_shard,
-            std::vector<std::int64_t> shape,const tb::Device& device)
-        :tables_(std::move(tables)),shape_(std::move(shape)),rows_per_shard_(rows_per_shard),device_(device) {
-        if(tables_.empty() || !tables_[0] || rows_per_shard_<1 || !device.is_cuda())
-            throw std::invalid_argument("invalid TQ row stage geometry");
-        for(const auto size:shape_) {
-            if(size<1 || count_>INT_MAX/size)throw std::overflow_error("TQ row stage shape exceeds bounds");
-            count_*=size;
-        }
-        columns_=tables_[0]->width();
-        for(const auto& table:tables_) {
-            if(!table || table->width()!=columns_)throw std::invalid_argument("TQ row stage table widths differ");
-            image_stride_=std::max(image_stride_,table->row_image_bytes_bound());
-        }
-        if(columns_>INT_MAX || std::uint64_t(count_)>(SIZE_MAX-7)/sizeof(TrellisProjectionView))
-            throw std::overflow_error("TQ row stage metadata exceeds bounds");
-        images_offset_=(std::size_t(count_)*sizeof(TrellisProjectionView)+7)&~std::size_t(7);
-        if(std::uint64_t(count_)>(SIZE_MAX-images_offset_)/image_stride_)
-            throw std::overflow_error("TQ row stage packet exceeds bounds");
-        bytes_=images_offset_+std::size_t(count_)*image_stride_;
-        if(bytes_>INT64_MAX)throw std::overflow_error("TQ row stage packet exceeds tensor limits");
-        const MfqCudaGuard guard(device);
-        retain_stream();
-        int can_map=0;TYLOINFER_CUDA_CHECK(cudaDeviceGetAttribute(&can_map,cudaDevAttrCanMapHostMemory,device.index));
-        const auto* setting=std::getenv("TYLOINFER_PLE_MAPPED_ROWS");
-        mapped_=can_map && (setting?setting[0]=='1':bytes_<=16u*1024);
-        host_=std::make_unique<mfq::cuda::HostBuffer>(bytes_,mapped_);
-        if(mapped_) {
-            void* address=nullptr;
-            const auto error=cudaHostGetDevicePointer(&address,host_->data(),0);
-            if(error==cudaErrorNotSupported || error==cudaErrorInvalidValue) {
-                (void)cudaGetLastError();mapped_=false;
-            }else {TYLOINFER_CUDA_CHECK(error);packet_address_=static_cast<std::uint8_t*>(address);}
-        }
-        const auto options=tb::TensorOptions().device(device).dtype(tb::kFloat16);
-        if(!mapped_) {
-            packet_=tb::empty({static_cast<std::int64_t>(bytes_)},options.dtype(tb::kUInt8));
-            packet_address_=packet_.data_ptr<std::uint8_t>();
-        }
-        auto output_shape=shape_;output_shape.push_back(columns_);
-        output_=tb::zeros(output_shape,options);
-        std::memset(host_->data(),0,bytes_);
-        // Valid zero-anchor rows allow graph preparation without source reads
-        // or model-state changes. Actual upload publishes the requested rows.
-        const auto zero_width=(std::uint64_t(columns_)+255)&~std::uint64_t(255);
-        if(zero_width>INT_MAX)throw std::overflow_error("TQ row stage padding exceeds CUDA limits");
-        std::vector<std::uint8_t> zero(72+zero_width/32+zero_width/8);
-        std::memcpy(zero.data(),"RTRELL05",8);
-        mfq::TqLayout::integer(zero.data()+8,5,4);
-        mfq::TqLayout::integer(zero.data()+12,1,4);
-        mfq::TqLayout::integer(zero.data()+16,zero_width,4);
-        mfq::TqLayout::integer(zero.data()+24,16,4);
-        mfq::TqLayout::integer(zero.data()+28,zero_width/8,4);
-        const auto view=pack_row(zero,0);
-        auto* views=static_cast<TrellisProjectionView*>(host_->data());
-        std::fill_n(views,count_,view);
-        if(!mapped_)TYLOINFER_CUDA_CHECK(cudaMemcpyAsync(packet_address_,host_->data(),bytes_,cudaMemcpyHostToDevice,mfq_current_cuda_stream()));
-        TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(mfq_current_cuda_stream()));
-        mfq::cuda::charge_tensor_host_bytes(bytes_);charged_=true;
-    }
-    ~TqRowStage()override {
-        // The pinned packet is not tensor storage. Fence its I/O and target
-        // consumers explicitly before freeing mapped memory or DMA sources.
-        int previous=0;const bool restore=cudaGetDevice(&previous)==cudaSuccess;
-        (void)cudaSetDevice(device_.index);
-        for(const auto& stream:streams_)(void)cudaStreamSynchronize(stream.stream());
-        output_={};packet_={};
-        if(charged_)mfq::cuda::tensor_host_bytes.fetch_sub(bytes_);
-        if(restore)(void)cudaSetDevice(previous);
-    }
-    tb::Tensor output()const override{return output_;}
-    bool mapped_rows()const override{return mapped_;}
-    void upload(const std::vector<std::int64_t>& ids,const std::vector<std::int64_t>& shape)override {
-        if(shape!=shape_ || ids.size()!=std::size_t(count_))throw std::invalid_argument("TQ stage upload shape changed");
-        const MfqCudaGuard guard(device_);
-        retain_stream();
-        std::unordered_map<std::int64_t,TrellisProjectionView> unique;
-        std::vector<TrellisProjectionView> views;views.reserve(ids.size());
-        for(const auto id:ids) {
-            if(id<0 || std::uint64_t(id/rows_per_shard_)>=tables_.size())
-                throw std::out_of_range("TQ stage shard ID is out of bounds");
-            const auto [position,inserted]=unique.try_emplace(id);
-            if(inserted) {
-                const auto shard=id/rows_per_shard_,row=id%rows_per_shard_;
-                position->second=pack_row(tables_[shard]->slice_rows(row,row+1),unique.size()-1);
-            }
-            views.push_back(position->second);
-        }
-        std::memcpy(host_->data(),views.data(),views.size()*sizeof(views[0]));
-        if(!mapped_) {
-            mfq_cuda_record_stream(packet_,mfq_get_current_cuda_stream(device_.index));
-            TYLOINFER_CUDA_CHECK(cudaMemcpyAsync(packet_address_,host_->data(),bytes_,cudaMemcpyHostToDevice,mfq_current_cuda_stream()));
-        }
-    }
-    void decode()override {
-        const MfqCudaGuard guard(device_);retain_stream();
-        mfq_cuda_record_stream(output_,mfq_get_current_cuda_stream(device_.index));
-        if(packet_.defined())mfq_cuda_record_stream(packet_,mfq_get_current_cuda_stream(device_.index));
-        status(mfq_tq_embedding_rows(reinterpret_cast<const TrellisProjectionView*>(packet_address_),
-            int(count_),int(columns_),output_.data_ptr(),0,mfq_current_cuda_stream()));
-    }
-};
-}
-std::shared_ptr<RowStage> make_tq_row_stage(const std::vector<std::shared_ptr<TqRowTable>>& tables,
-        std::int64_t rows_per_shard,const std::vector<std::int64_t>& shape,const tb::Device& device) {
-    return std::make_shared<TqRowStage>(tables,rows_per_shard,shape,device);
-}
-
 namespace {
 std::size_t available_host_bytes(std::size_t process_limit) {
     try {
-        const auto memory=mfq::sample_host_memory();
-        auto available=memory.available_host_bytes();
-        if(process_limit)available=std::min<std::uint64_t>(available,
-            memory.resident_bytes>=process_limit?0:process_limit-memory.resident_bytes);
-        return static_cast<std::size_t>(std::min<std::uint64_t>(available,SIZE_MAX));
+        return mfq::host_memory_headroom(mfq::sample_host_memory(),process_limit);
     } catch(const std::runtime_error&) {return 0;}
 }
 }
 
 // Ordinary TQ projection images share a byte-budget LRU. The storage and
 // lifetime policy is independent of the row precision and does not use MFE.
-class TqExpertCache {
-    struct HostImage {
-        mfq::TqLayout layout;
-        std::vector<std::uint8_t> bytes;
-        std::size_t source_bytes;
-        bool pin_attempted=false,registered=false;
-        int pin_device=0;
-        mfq::cuda::HostRegistrationRetirement retirement;
-        explicit HostImage(const std::vector<std::uint8_t>& wire)
-            :layout(wire.data(),wire.size()),bytes(tq_image(wire,layout)),source_bytes(wire.size()) {
-            retirement.owner=this;
-            retirement.dispose=[](void* owner)noexcept{delete static_cast<HostImage*>(owner);};
+struct TqHostImage:mfq::cuda::RoutedHostImage<> {
+    mfq::TqLayout layout;
+    std::size_t source_bytes;
+    TqHostImage(mfq::TqLayout value,std::size_t source_count,std::shared_ptr<MoePinnedExpertArena::Block> pinned)
+        :layout(value),source_bytes(source_count) {
+        allocate(((layout.packed+3)&~std::size_t(3))+layout.packed_bytes+32,std::move(pinned));
+    }
+    explicit TqHostImage(std::vector<std::uint8_t> wire,std::shared_ptr<MoePinnedExpertArena::Block> block)
+        :layout(wire.data(),wire.size()),source_bytes(wire.size()) {
+        const auto words=(layout.packed+3)&~std::size_t(3),relative=words+layout.packed_bytes;
+        allocate(relative+32,std::move(block));
+        std::memcpy(data(),wire.data(),layout.packed);
+        std::memset(data()+layout.packed,0,words-layout.packed);
+        std::memcpy(data()+words,wire.data()+layout.packed,layout.packed_bytes);
+        constexpr std::uint16_t table[]{0x3400,0x34d0,0x35ca,0x36f7,0x3830,0x390a,0x3a10,0x3b4b,
+            0x3c63,0x3d47,0x3e59,0x3fa4,0x4098,0x4187,0x42a6,0x4400};
+        std::memcpy(data()+relative,table,sizeof(table));
+    }
+    TqHostImage(const TqHostImage&)=delete;
+    TqHostImage& operator=(const TqHostImage&)=delete;
+    static std::shared_ptr<TqHostImage> create(std::vector<std::uint8_t> wire,
+            std::shared_ptr<MoePinnedExpertArena::Block> block={}) {
+        return std::make_shared<TqHostImage>(std::move(wire),std::move(block));
+    }
+};
+
+class TqExpertCache:private mfq::cuda::RoutedHostCache<TqHostImage> {
+    struct CpuTimer {
+        double* total;
+        std::chrono::steady_clock::time_point start;
+        explicit CpuTimer(double* value):total(value),start(value?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{}) {}
+        ~CpuTimer(){if(total)*total+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();}
+    };
+    using HostImage=TqHostImage;
+    struct HostTransfer {
+        std::optional<MfqCudaStream> producer;
+        std::shared_ptr<mfq::cuda::Event> ready;
+        std::shared_ptr<std::atomic<bool>> submitted,recorded;
+        std::shared_ptr<mfq::cuda::RoutedCompletionPosition> position;
+        std::vector<std::shared_ptr<HostImage>> images;
+        std::vector<tb::Tensor> destinations;
+        std::vector<std::shared_ptr<void>> device_backings;
+        bool completed=false;
+        bool recorded_submission()const noexcept {
+            return submitted && recorded && submitted->load(std::memory_order_acquire) &&
+                recorded->load(std::memory_order_acquire);
         }
-        HostImage(const HostImage&)=delete;
-        HostImage& operator=(const HostImage&)=delete;
-        static std::shared_ptr<HostImage> create(const std::vector<std::uint8_t>& wire) {
-            return std::shared_ptr<HostImage>(new HostImage(wire),[](HostImage* image)noexcept {
-                if(image->registered)mfq::cuda::retire_host_registration(&image->retirement);
-                else delete image;
-            });
-        }
-        // Pin only a reused host image. One-use SSD reads retain bounded
-        // staging; repeated RAM transfers avoid another full CPU copy.
-        void try_pin() {
-            if(pin_attempted)return;
-            pin_attempted=true;
-            TYLOINFER_CUDA_CHECK(cudaGetDevice(&pin_device));
-            const auto result=cudaHostRegister(bytes.data(),bytes.size(),cudaHostRegisterPortable);
-            if(result==cudaSuccess){registered=true;return;}
-            if(mfq::cuda::pinned_allocation_rejected(result) || result==cudaErrorNotSupported ||
-               result==cudaErrorOperatingSystem || result==cudaErrorNotPermitted ||
-               result==cudaErrorHostMemoryAlreadyRegistered) {
-                (void)cudaGetLastError();return;
-            }
-            TYLOINFER_CUDA_CHECK(result);
-        }
-        ~HostImage()noexcept {
-            if(registered)try {
-                const mfq::cuda::DeviceGuard guard(pin_device);
-                if(cudaHostUnregister(bytes.data())!=cudaSuccess)(void)cudaGetLastError();
+        ~HostTransfer()noexcept {
+            if(completed)return;
+            try {
+                if(ready && recorded_submission())ready->synchronize();
+                else if(producer && submitted && submitted->load(std::memory_order_acquire)) {
+                    const MfqCudaGuard device(producer->device());
+                    (void)cudaStreamSynchronize(producer->stream());
+                }
             }catch(...) {}
         }
-    };
-    struct HostTransfer {
-        std::shared_ptr<mfq::cuda::Event> ready;
-        std::vector<std::shared_ptr<HostImage>> images;
-        ~HostTransfer()noexcept {try{ready->synchronize();}catch(...) {}}
-    };
-    struct HostEntry {
-        std::shared_ptr<HostImage> image;
-        std::list<std::uint64_t>::iterator recent;
     };
     struct DeviceKey {
         std::uint64_t image;
@@ -925,9 +845,12 @@ class TqExpertCache {
     struct DeviceEntry {
         TqWeight weight;
         std::list<DeviceKey>::iterator recent;
-        std::shared_ptr<mfq::cuda::Event> uploaded;
-        cudaStream_t producer=nullptr;
         std::size_t source_bytes=0;
+        mfq::TqLayout layout;
+        DeviceImageArena* arena=nullptr;
+        std::list<DeviceKey>::iterator arena_position;
+        std::optional<std::list<DeviceKey>::iterator> cold;
+        std::optional<std::uint64_t> group;
     };
     struct ViewTable {
         int device;
@@ -951,11 +874,14 @@ class TqExpertCache {
     };
     struct Stage {
         mfq::cuda::HostBuffer host;
+        std::uint8_t* mapped=nullptr;
         mfq::cuda::Event uploaded;
         std::size_t cursor=0;
         bool pending=false;
-        cudaStream_t stream=nullptr;
-        explicit Stage(std::size_t bytes):host(bytes),uploaded(cudaEventDisableTiming) {
+        explicit Stage(std::size_t bytes):host(bytes,true),uploaded(cudaEventDisableTiming) {
+            void* alias=nullptr;
+            TYLOINFER_CUDA_CHECK(cudaHostGetDevicePointer(&alias,host.data(),0));
+            mapped=static_cast<std::uint8_t*>(alias);
             mfq::cuda::charge_tensor_host_bytes(bytes);
         }
         ~Stage(){
@@ -965,46 +891,834 @@ class TqExpertCache {
         void reuse(){if(pending){uploaded.synchronize();pending=false;}cursor=0;}
     };
     struct DeviceStages {
+        std::optional<MfqCudaStream> owner;
         std::array<std::unique_ptr<Stage>,2> stages;
         unsigned index=0;
     };
-    std::unordered_map<std::uint64_t,HostEntry> host_;
     std::unordered_map<DeviceKey,DeviceEntry,DeviceKeyHash> device_;
+    struct ExpertSlot {
+        tb::Tensor image;
+        DeviceImageArena* arena;
+        mfq::cuda::RoutedExpertImageLayout layout;
+        unsigned residents=0;
+    };
+    std::unordered_map<DeviceKey,ExpertSlot,DeviceKeyHash> expert_slots_;
+    std::uint64_t expert_slot_reuses_=0;
+    std::unordered_map<int,std::size_t> pending_expert_bytes_;
     std::unordered_map<std::uint64_t,std::vector<ViewTable>> view_tables_;
     std::vector<std::shared_ptr<RouteReadback>> route_readbacks_;
-    std::list<std::uint64_t> host_recent_;
+    std::unordered_map<std::uint64_t,std::size_t> resident_copies_;
     std::list<DeviceKey> device_recent_;
-    std::size_t host_used_=0,device_used_=0,host_limit_=0,device_limit_=0;
-    bool retain_all_=false;
-    std::size_t payload_bytes_=0;
-    std::size_t process_host_limit_=0;
-    std::uint64_t host_evictions_=0,device_evictions_=0,source_reads_=0;
-    std::unordered_map<int,std::shared_ptr<TqGemmResources>> gemm_;
-    struct GraphPool {
+    std::size_t device_used_=0,host_limit_=0,ordinary_host_limit_=0,device_limit_=0;
+    std::vector<std::shared_ptr<MoePinnedExpertArena>> host_arenas_;
+    std::size_t host_reserved_=0,host_pageable_=0,pinned_ceiling_=SIZE_MAX;
+    std::unique_ptr<RoutedPrefillStager> prefill_host_stager_;
+    std::unordered_map<std::uint64_t,int> staged_host_jobs_;
+    std::unordered_map<int,std::size_t> device_usage_,decode_limits_;
+    using PrefillLoan=mfq::cuda::RoutedPrefillLoanState<mfq::cuda::Context,tb::Tensor,MfqCudaStream>;
+    struct WorkspaceReservation {
+        int device;
+        std::size_t limit,required;
         MfqCudaStream stream;
-        std::shared_ptr<mfq::cuda::Context> context;
+        std::thread::id thread;
+        std::shared_ptr<PrefillLoan> loan;
     };
-    std::unordered_map<cudaStream_t,GraphPool> graph_pools_;
+    std::unordered_map<std::uint64_t,WorkspaceReservation> workspace_limits_;
+    std::uint64_t next_workspace_token_=0;
+    struct DecodeReserve {std::size_t growth=0;std::optional<std::size_t> transient;};
+    std::unordered_map<int,DecodeReserve> decode_reserves_;
+    std::size_t device_used_locked(int device)const {
+        const auto found=device_usage_.find(device),pending=pending_expert_bytes_.find(device);
+        return (found==device_usage_.end()?0:found->second)+(pending==pending_expert_bytes_.end()?0:pending->second);
+    }
+    std::size_t device_limit_locked(int device=mfq_current_cuda_device())const {
+        auto limit=retain_all_?std::max(resident_bytes_bound_,device_used_locked(device)):device_limit_;
+        if(auto found=decode_limits_.find(device);found!=decode_limits_.end())limit=std::min(limit,found->second);
+        for(const auto& [token,reservation]:workspace_limits_)
+            if(reservation.device==device)limit=std::min(limit,reservation.limit);
+        return limit;
+    }
+    struct RoutePolicy {
+        mfq::cuda::ExpertRouteUsage usage;
+        mfq::cuda::RoutedExpertBanks banks;
+        std::list<DeviceKey> cold;
+        std::uint64_t windows=0,last_decay=0;
+        bool seeded=false,ready=false;
+        std::size_t assignment_budget=SIZE_MAX;
+        std::vector<mfq::cuda::AdaptiveImageSwap> replacements;
+        std::uint64_t observations=0;
+        std::unordered_set<std::uint64_t> decoded_banks;
+        std::uint64_t replacement_pairs=0,replacement_approved=0,replacement_budget_rejected=0;
+        std::uint64_t replacement_leased=0,replacement_resized=0,replacement_missing_slots=0;
+        std::uint64_t replacement_heat_rejected=0,replacement_multi_victim=0;
+        void register_banks(const std::array<std::uint64_t,3>& sources) {
+            banks.add(sources);
+        }
+        template<class Count> void select(std::size_t budget,Count&& count) {
+            if(!ready || assignment_budget!=budget) {
+                usage.select(budget,mfq::cuda::expert_replacement_margin,&banks);
+                replacements.clear();assignment_budget=budget;ready=true;return;
+            }
+            const auto groups=banks.groups();
+            std::vector<mfq::cuda::RoutedImageCandidate> candidates,victims;
+            for(const auto& group:groups) {
+                const auto experts=std::size_t(count(group[0]));
+                for(std::size_t expert=0;expert<experts;++expert) {
+                    const auto key=(group[0]<<32)|expert;const auto score=usage.score(key);
+                    const bool retained=usage.retained(key);
+                    if(!retained && score<2.f)continue;
+                    const auto bytes=usage.expert_bytes(key,banks);
+                    if(!bytes)continue;
+                    if(retained)victims.push_back({score,key,bytes});
+                    else candidates.push_back({score,key,bytes});
+                }
+            }
+            mfq::cuda::AdaptiveImageSwapStats stats;
+            replacements=mfq::cuda::adaptive_image_swaps(usage,candidates,victims,budget,banks,96,&stats);
+            replacement_pairs+=stats.proposed;replacement_budget_rejected+=stats.capacity_rejected;
+            replacement_heat_rejected+=stats.heat_rejected;replacement_multi_victim+=stats.multi_victim;
+            replacement_approved+=replacements.size();
+        }
+    };
+    struct PendingRoute {int device,rows;std::array<std::uint64_t,3> sources;std::vector<RoutedExpertTouch> touches;};
+    std::unordered_map<int,RoutePolicy> routes_;
+    RoutedExpertJournal route_journal_;
+    std::vector<RoutedExpertTouch> route_touches_;
+    std::vector<PendingRoute> speculative_routes_;
+    int speculative_rows_=0;
+    bool reuse_learning_=true;
+    void refresh_expert_priority_locked(int device,std::uint64_t expert) {
+        auto& policy=routes_[device];
+        policy.banks.visit_expert(expert,[&](auto image) {
+            const DeviceKey key{image,device};const auto found=device_.find(key);
+            if(found==device_.end())return;
+            auto& entry=found->second;
+            if(policy.usage.retained(image)) {
+                if(entry.cold){policy.cold.erase(*entry.cold);entry.cold.reset();}
+            }else if(!entry.cold)entry.cold=policy.cold.insert(policy.cold.end(),key);
+        });
+    }
+    void refresh_device_priority_locked(int device) {
+        auto& policy=routes_[device];
+        for(const auto& key:device_recent_)if(key.device==device) {
+            auto& entry=device_.at(key);
+            if(policy.usage.retained(key.image)) {
+                if(entry.cold){policy.cold.erase(*entry.cold);entry.cold.reset();}
+            }else if(entry.cold)policy.cold.splice(policy.cold.end(),policy.cold,*entry.cold);
+            else entry.cold=policy.cold.insert(policy.cold.end(),key);
+        }
+    }
+    bool finish_routes_locked(int device,bool frequent=false) {
+        auto& policy=routes_[device];
+        if(!policy.seeded || !reuse_learning_)return false;
+        if(mfq::cuda::routed_admission_due(++policy.windows,frequent)) {
+            CpuTimer timer(profile_?&route_policy_ms_:nullptr);
+            const auto limit=device_limit_locked(device);
+            const bool rebuild=!policy.ready || policy.assignment_budget!=limit;
+            policy.select(limit,[&](auto source){return source_info_.at(source).experts;});
+            policy.ready=true;policy.usage.decay(policy.windows-policy.last_decay);policy.last_decay=policy.windows;
+            // Apply admission decisions to replacement too. Rebuild only the
+            // cold ordering at an adaptation boundary, never scan on a miss.
+            if(rebuild)refresh_device_priority_locked(device);
+            else for(const auto& replacement:policy.replacements) {
+                for(const auto victim:replacement.victims)refresh_expert_priority_locked(device,victim);
+                refresh_expert_priority_locked(device,replacement.incoming);
+            }
+            return true;
+        }
+        return false;
+    }
+    bool retain_all_=false;
+    std::size_t payload_bytes_=0,predictor_resident_bytes_=0;
+    std::size_t resident_bytes_bound_=0;
+    std::size_t process_host_limit_=0;
+    std::uint64_t host_evictions_=0,device_evictions_=0,source_reads_=0,device_reuses_=0;
+    std::unordered_map<int,std::shared_ptr<TqGemmResources>> gemm_;
+    mfq::cuda::RoutedGraphPools graph_pools_;
     std::uint64_t sources_=0;
     std::mutex mutex_;
-    std::unordered_map<int,DeviceStages> stages_;
-    std::list<HostTransfer> host_transfers_;
-    std::uint64_t calls_=0,gpu_hits_=0,host_hits_=0,source_bytes_=0,transfer_bytes_=0;
-    std::uint64_t direct_transfer_bytes_=0,pin_attempts_=0,pin_failures_=0;
-    double fetch_ms_=0,upload_submit_ms_=0;
-    const bool profile_=std::getenv("TYLOINFER_TQ_PROFILE_CACHE")!=nullptr;
-    std::size_t reclaim_host_locked(std::size_t bytes) {
-        const auto before=host_used_;
-        while(before-host_used_<bytes && !host_recent_.empty()) {
-            const auto key=host_recent_.back();host_recent_.pop_back();
-            host_used_-=host_.at(key).image->bytes.size();host_.erase(key);++host_evictions_;
+    std::unordered_map<int,std::unordered_map<cudaStream_t,DeviceStages>> stages_;
+    std::unordered_map<int,MfqCudaStream> transfer_streams_,admission_streams_;
+    mfq::cuda::RoutedCompletionEvents completion_events_;
+    std::unordered_map<int,std::vector<std::shared_ptr<DeviceImageArena>>> device_arenas_;
+    std::unordered_map<DeviceImageArena*,std::list<DeviceKey>> arena_entries_;
+    struct SourceInfo {
+        std::shared_ptr<TqRowTable> table;
+        std::int64_t rows,experts;
+        std::shared_ptr<TqResidentBank> resident;
+    };
+    std::unordered_map<std::uint64_t,SourceInfo> source_info_;
+    void register_banks_locked(RoutePolicy& policy,const std::array<std::uint64_t,3>& sources) {
+        for(const auto source:sources)(void)source_info_.at(source);
+        if(source_info_.at(sources[0]).resident)return;
+        policy.register_banks(sources);
+    }
+    using ResidentViews=mfq::cuda::RoutedResidentViews<TrellisProjectionView>;
+    using LayerAdmission=mfq::cuda::RoutedLayerAdmission<ResidentViews,mfq::cuda::Event,tb::Tensor>;
+    std::map<std::array<std::uint64_t,4>,std::shared_ptr<ResidentViews>> resident_views_;
+    struct ResidentRole {std::weak_ptr<ResidentViews> views;int role;};
+    std::map<std::pair<int,std::uint64_t>,std::vector<ResidentRole>> resident_roles_;
+    std::unordered_map<int,unsigned> replay_readers_;
+    mfq::cuda::RoutedEventRetirement deferred_events_;
+    bool replay_active_locked()const {
+        return std::any_of(replay_readers_.begin(),replay_readers_.end(),[](const auto& item){return item.second!=0;});
+    }
+    std::unordered_set<int> resident_updates_;
+    std::unique_ptr<RoutedAdmission> admission_executor_=std::make_unique<RoutedAdmission>();
+    std::shared_ptr<LayerAdmission> layer_admission_;
+    std::unordered_map<int,tb::Tensor> admission_ready_words_;
+    void update_resident_view_locked(DeviceKey key,TrellisProjectionView value) {
+        const auto found=resident_roles_.find({key.device,key.image>>32});
+        if(found==resident_roles_.end())return;
+        for(const auto& binding:found->second)if(auto views=binding.views.lock())
+            views->update(binding.role,std::uint32_t(key.image),value,value.words!=nullptr);
+        resident_updates_.insert(key.device);
+    }
+    void join_admission(RoutedAdmission::Transition& admission) {
+        std::shared_ptr<LayerAdmission> epoch;
+        {std::lock_guard lock(mutex_);epoch=layer_admission_;}
+        try {
+            admission.wait();
+            if(epoch && epoch->submitted_done)epoch->submitted_done->synchronize();
+        }catch(...) {
+            std::lock_guard lock(mutex_);if(layer_admission_==epoch)layer_admission_.reset();throw;
         }
-        return before-host_used_;
+        std::lock_guard lock(mutex_);
+        if(layer_admission_==epoch)layer_admission_.reset();
+    }
+    void wait_admission(){admission_executor_->transition([&](auto& admission){join_admission(admission);});}
+    void abort_layer_admission(const std::shared_ptr<LayerAdmission>& epoch,std::exception_ptr error) {
+        if(!epoch)return;
+        std::lock_guard lock(mutex_);
+        epoch->abort(std::move(error),[](auto& view){view.invalidate();},mfq::cuda::publish_mapped_flag);
+    }
+    void queue_admission(int device,mfq::cuda::RoutedImageUse use=mfq::cuda::RoutedImageUse::Admission) {
+        admission_executor_->transition([&](auto& admission) {
+            join_admission(admission);
+            const auto upload=admission_stream(device);
+            const MfqCudaStreamGuard upload_guard(upload);
+            struct Batch {
+                std::uint64_t source;SourceInfo info;std::vector<std::int64_t> experts;
+                std::pair<std::uint64_t,unsigned> order;
+            };
+            std::vector<Batch> batches;
+            {
+                std::lock_guard lock(mutex_);
+                auto policy=routes_.find(device);
+                if(policy==routes_.end() || !policy->second.ready || replay_readers_[device])return;
+                for(const auto& replacement:policy->second.replacements) {
+                    const auto incoming=replacement.incoming;const DeviceKey new_key{incoming,device};
+                    const auto* banks=policy->second.banks.find(incoming>>32);
+                    if(!banks)continue;
+                    std::array<std::size_t,3> sizes{};
+                    for(unsigned role=0;role<3;++role) {
+                        const auto& info=source_info_.at((*banks)[role]);
+                        sizes[role]=info.table->expert_image_bytes(std::uint32_t(incoming),info.rows);
+                    }
+                    const mfq::cuda::RoutedExpertImageLayout layout(*banks,sizes);
+                    tb::Tensor image;DeviceImageArena* arena=nullptr;
+                    for(const auto victim:replacement.victims) {
+                        const auto old=expert_slots_.find(DeviceKey{victim,device});
+                        if(old==expert_slots_.end()){++policy->second.replacement_missing_slots;continue;}
+                        const auto& slot=old->second;
+                        if(slot.image.weak_storage_owner().use_count()!=slot.residents+1) {
+                            ++policy->second.replacement_leased;continue;
+                        }
+                        if(slot.image.nbytes()>=layout.bytes &&
+                                (!image.defined() || slot.image.nbytes()<image.nbytes())) {
+                            image=slot.image;arena=slot.arena;
+                        }
+                    }
+                    // Leased storage stays immutable until its readers release
+                    // it. An arena cannot recycle that interval prematurely.
+                    for(const auto victim:replacement.victims)erase_expert_locked(DeviceKey{victim,device});
+                    if(!image.defined()){++policy->second.replacement_resized;continue;}
+                    if(expert_slots_.count(new_key))continue;
+                    erase_expert_locked(new_key);
+                    const auto bytes=image.nbytes();
+                    expert_slots_.emplace(new_key,ExpertSlot{std::move(image),arena,layout});
+                    ++expert_slot_reuses_;
+                    pending_expert_bytes_[device]+=bytes;
+                }
+                policy->second.replacements.clear();
+                // Convert the prompt's independent projection allocations at
+                // the safe decode boundary. A grouped slot always owns all
+                // three banks; partial prompt images cannot strand its space.
+                for(const auto key:policy->second.usage.retained_keys()) {
+                    const auto* banks=policy->second.banks.find(key>>32);
+                    if(!banks || (key>>32)!=(*banks)[0] || expert_slots_.count(DeviceKey{key,device}))continue;
+                    erase_expert_locked(DeviceKey{key,device});
+                }
+                std::unordered_map<std::uint64_t,std::size_t> groups;
+                for(const auto key:policy->second.usage.retained_keys()) {
+                    if(device_.count(DeviceKey{key,device}))continue;
+                    const auto source=key>>32;
+                    const auto [group,inserted]=groups.try_emplace(source,batches.size());
+                    if(inserted) {
+                        const auto* banks=policy->second.banks.find(source);
+                        const auto role=banks?unsigned(std::find(banks->begin(),banks->end(),source)-banks->begin()):0u;
+                        batches.push_back({source,source_info_.at(source),{},
+                            {banks?(*banks)[0]:source,role}});
+                    }
+                    batches[group->second].experts.push_back(std::uint32_t(key));
+                }
+                // Release each earlier layer after its complete banks, even
+                // when usage entries were first observed in another order.
+                std::sort(batches.begin(),batches.end(),[](const auto& a,const auto& b){return a.order<b.order;});
+            }
+            if(batches.empty())return;
+            auto epoch=std::make_shared<LayerAdmission>();epoch->device=device;
+            {
+                std::lock_guard lock(mutex_);
+                for(const auto& [_,view]:resident_views_)if(view->device==device) {
+                    if(std::all_of(view->sources.begin(),view->sources.end(),[&](auto source) {
+                        return bool(source_info_.at(source).resident);
+                    }))continue;
+                    if(view->rebuild)view->republish();
+                    epoch->views.push_back(view);
+                }
+                if(epoch->views.empty())epoch.reset();
+                else {
+                    mfq::cuda::arm_routed_layer_admission(*epoch,admission_ready_words_[device],upload.stream());
+                    layer_admission_=epoch;
+                }
+            }
+            auto run=[this,device,upload,epoch,use,batches=std::move(batches)] {
+                const MfqCudaStreamGuard stream(upload);
+                try {
+                    std::unordered_set<std::uint64_t> pending;
+                    for(const auto& batch:batches)pending.insert(batch.source);
+                    std::unordered_set<const ResidentViews*> released;
+                    if(epoch)epoch->release_unchanged([&](const auto& view) {
+                        return std::any_of(view.sources.begin(),view.sources.end(),[&](auto source){return pending.count(source)!=0;});
+                    },mfq::cuda::publish_mapped_flag);
+                    if(epoch)for(const auto& view:epoch->views)
+                        if(*reinterpret_cast<const volatile std::uint32_t*>(view->admission_host()))released.insert(view.get());
+                    for(const auto& batch:batches) {
+                        (void)get_rows(batch.source,batch.experts.data(),batch.experts.size(),
+                            *batch.info.table,batch.info.rows,device,nullptr,use);
+                        pending.erase(batch.source);
+                        if(epoch) {
+                            std::vector<std::uint32_t*> ready;
+                            {
+                                std::lock_guard lock(mutex_);epoch->require_active();
+                                for(const auto& view:epoch->views)if(!released.count(view.get()) &&
+                                    std::none_of(view->sources.begin(),view->sources.end(),[&](auto source){return pending.count(source)!=0;})) {
+                                    released.insert(view.get());ready.push_back(view->admission_host());
+                                }
+                            }
+                            mfq::cuda::publish_routed_admission_layers(*epoch,ready,upload.stream());
+                        }
+                    }
+                    if(epoch)epoch->submitted_done->record(upload.stream());
+                    else TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(upload.stream()));
+                    std::lock_guard lock(mutex_);resident_updates_.erase(device);
+                }catch(...) {
+                    const auto error=std::current_exception();abort_layer_admission(epoch,error);
+                    (void)cudaStreamSynchronize(upload.stream());std::rethrow_exception(error);
+                }
+            };
+            try{admission.submit(std::move(run));}
+            catch(...){abort_layer_admission(epoch,std::current_exception());throw;}
+        });
+    }
+    std::list<HostTransfer> host_transfers_;
+    mfq::cuda::RoutedCompletionClock transfer_clock_;
+    std::uint64_t calls_=0,gpu_hits_=0,host_hits_=0,source_bytes_=0,source_batches_=0,transfer_bytes_=0;
+    std::uint64_t direct_transfer_bytes_=0,pin_attempts_=0,pin_failures_=0,native_batches_=0,writeback_bytes_=0,unpinned_bytes_=0;
+    std::uint64_t decode_calls_=0,decode_hits_=0,decode_transfer_=0,decode_source_=0,decode_writeback_=0;
+    std::uint64_t admission_transfer_=0,restore_transfer_=0;
+    std::uint64_t decode_metadata_bytes_=0,decode_metadata_updates_=0,decode_resident_bypasses_=0;
+    double decode_metadata_submit_ms_=0,decode_resident_touch_ms_=0,decode_admission_wait_ms_=0;
+    std::uint64_t upload_groups_=0,retirement_queries_=0;
+    std::uint64_t staged_packets_=0;
+    std::uint64_t host_compacted_bytes_=0,host_trimmed_bytes_=0;
+    std::uint64_t host_evacuated_bytes_=0,host_evacuated_images_=0;
+    bool host_evacuation_blocked_=false;
+    std::size_t pin_fragment_probe_bytes_=SIZE_MAX;
+    std::uint64_t pin_fragment_retries_=0,pin_fragment_reuses_=0,pin_interval_compactions_=0;
+    double fetch_ms_=0,upload_submit_ms_=0;
+    double get_rows_ms_=0,allocation_ms_=0,registration_ms_=0,source_prepare_ms_=0,route_policy_ms_=0;
+    double source_slice_ms_=0,host_admission_ms_=0,host_pack_ms_=0;
+    double pin_reuse_ms_=0,unpin_copy_ms_=0,image_pack_ms_=0,pageable_repin_ms_=0;
+    double unpin_allocate_ms_=0,unpin_memcpy_ms_=0,unpin_release_ms_=0;
+    double stage_copy_ms_=0,stage_wait_ms_=0;
+    double decode_get_rows_ms_=0,decode_fetch_ms_=0,decode_copy_ms_=0,decode_stage_wait_ms_=0;
+    double decode_allocation_ms_=0,decode_submit_ms_=0,decode_repin_ms_=0;
+    std::uint64_t arena_recycles_=0,retained_evictions_=0,decode_arena_recycles_=0,decode_retained_evictions_=0;
+    const bool profile_=std::getenv("TYLOINFER_TQ_PROFILE_CACHE")!=nullptr;
+    void mark_host_duplicate_locked(std::uint64_t key) {
+        if(!host_.count(key))return;
+        host_index_duplicate(key,resident_copies_.count(key)!=0);host_index_touch(key);
+    }
+    void erase_host_locked(std::uint64_t key) {
+        const auto found=host_.find(key);if(found==host_.end())return;
+        if(layer_admission_ || replay_active_locked())deferred_events_.retain(found->second.image->ready);
+        if(!found->second.image->block)host_pageable_-=found->second.image->fallback.nbytes();
+        host_index_erase(key);++host_evictions_;
+    }
+    void insert_host_locked(std::uint64_t key,const std::shared_ptr<HostImage>& image) {
+        host_index_insert(key,image,resident_copies_.count(key)!=0);
+        if(!image->block)host_pageable_+=image->fallback.nbytes();
+    }
+    void demote_device_locked(const DeviceKey& key,const DeviceEntry& entry) {
+        const mfq::cuda::RoutedHostEvacuationBlock block_evacuation(host_evacuation_blocked_);
+        if(host_.count(key.image))return;
+        const auto bytes=((entry.layout.packed+3)&~std::size_t(3))+entry.layout.packed_bytes+32;
+        if(bytes>host_limit_)return;
+        admit_host_space_locked(bytes);
+        auto block=allocate_pinned(bytes);
+        // Pageable D2H may synchronize a waiting compute graph. Immutable
+        // source recovery remains available when no pinned interval is free.
+        if(!block)return;
+        auto image=std::make_shared<HostImage>(entry.layout,entry.source_bytes,std::move(block));
+        auto stream=transfer_streams_.at(key.device);
+        // Replacement writes must follow a victim's D2H on the same lane.
+        // Admission has its own lane so later layers cannot queue ahead of
+        // demand uploads for the layer currently being decoded.
+        if(const auto found=admission_streams_.find(key.device);found!=admission_streams_.end() &&
+                found->second.stream()==mfq_get_current_cuda_stream(key.device).stream())stream=found->second;
+        const MfqCudaGuard device(key.device);
+        image->ready=completion_events_.at(key.device,stream.stream());
+        image->producer=stream.stream();
+        host_transfers_.emplace_back();auto& transfer=host_transfers_.back();
+        transfer.producer=stream;transfer.ready=image->ready;
+        transfer.submitted=std::make_shared<std::atomic<bool>>(false);
+        transfer.recorded=std::make_shared<std::atomic<bool>>(false);
+        transfer.position=std::make_shared<mfq::cuda::RoutedCompletionPosition>();
+        transfer.images.push_back(image);
+        if(!entry.arena)throw std::logic_error("TQ resident image has no backing arena");
+        transfer.device_backings.push_back(entry.arena->retain_backing());
+        try {
+            transfer.submitted->store(true,std::memory_order_release);
+            TYLOINFER_CUDA_CHECK(cudaMemcpyAsync(image->data(),entry.weight.image.data_ptr(),bytes,
+                cudaMemcpyDeviceToHost,stream.stream()));
+            image->ready->record(stream.stream());
+            *transfer.position=mfq::cuda::record_routed_completion(transfer_clock_,stream.device(),stream.stream());
+            transfer.recorded->store(true,std::memory_order_release);
+        }catch(...) {(void)cudaStreamSynchronize(stream.stream());host_transfers_.pop_back();throw;}
+        writeback_bytes_+=bytes;
+        insert_host_locked(key.image,image);
+    }
+    void erase_device_locked(DeviceKey key,bool preserve=true) {
+        const auto found=device_.find(key);
+        if(routes_.at(key.device).usage.retained(key.image))++retained_evictions_;
+        if(preserve)demote_device_locked(key,found->second);
+        const auto bytes=found->second.weight.image.nbytes();
+        routes_.at(key.device).usage.resident(key.image,false);
+        update_resident_view_locked(key,{});
+        if(found->second.cold)routes_.at(key.device).cold.erase(*found->second.cold);
+        arena_entries_.at(found->second.arena).erase(found->second.arena_position);
+        device_used_-=bytes;device_usage_[key.device]-=bytes;device_recent_.erase(found->second.recent);
+        if(found->second.group) {
+            const DeviceKey group{*found->second.group,key.device};auto& slot=expert_slots_.at(group);
+            pending_expert_bytes_[key.device]+=bytes;
+            if(!--slot.residents) {
+                pending_expert_bytes_[key.device]-=slot.image.nbytes();expert_slots_.erase(group);
+            }
+        }
+        const auto copies=resident_copies_.find(key.image);
+        if(!--copies->second) {
+            resident_copies_.erase(copies);
+            host_index_duplicate(key.image,false);
+        }
+        device_.erase(found);++device_evictions_;
+    }
+    void erase_expert_locked(DeviceKey key) {
+        // Replacement uses the same complete-expert unit as admission. Raw
+        // projection images keep their actual encoded sizes and arena leases.
+        routes_.at(key.device).banks.visit_expert(key.image,[&](auto image) {
+            const DeviceKey victim{image,key.device};if(device_.count(victim))erase_device_locked(victim);
+        });
+    }
+    bool evict_oldest_device_locked(int device) {
+        if(auto policy=routes_.find(device);policy!=routes_.end() && policy->second.ready && !policy->second.cold.empty()) {
+            erase_expert_locked(policy->second.cold.back());return true;
+        }
+        const auto oldest=std::find_if(device_recent_.rbegin(),device_recent_.rend(),
+            [device](const auto& key){return key.device==device;});
+        if(oldest==device_recent_.rend())return false;
+        erase_expert_locked(*oldest);return true;
+    }
+    void admit_host_space_locked(std::size_t bytes) {
+        // Prefer a revocable CPU duplicate over the only RAM copy of an
+        // expert. Reserve its interval before packing the incoming image.
+        while(bytes<=host_limit_ && host_used_>host_limit_-bytes && !host_recent_.empty())
+            erase_host_locked(host_index_victim());
+    }
+    std::size_t device_reserved_locked(int device)const {
+        std::size_t bytes=0;
+        if(auto found=device_arenas_.find(device);found!=device_arenas_.end())
+            for(const auto& arena:found->second)bytes+=arena->bytes();
+        return bytes;
+    }
+    void release_empty_device_arenas_locked(int device) {
+        auto& arenas=device_arenas_[device];
+        std::erase_if(arenas,[&](const auto& arena) {
+            if(arena->used_bytes())return false;
+            arena_entries_.erase(arena.get());return true;
+        });
+    }
+    std::size_t evict_device_arena_locked(int device,std::shared_ptr<DeviceImageArena>* recycled=nullptr,std::size_t minimum=0) {
+        auto& arenas=device_arenas_[device];
+        auto candidates=arenas;
+        std::sort(candidates.begin(),candidates.end(),[](const auto& a,const auto& b) {
+            return a->bytes()-a->used_bytes()>b->bytes()-b->used_bytes();
+        });
+        for(const auto& arena:candidates) {
+            if(arena->bytes()<minimum)continue;
+            std::size_t covered=0;bool busy=false;
+            std::unordered_set<std::uint64_t> groups;
+            const auto owners=arena_entries_.find(arena.get());
+            if(owners!=arena_entries_.end())for(const auto& key:owners->second) {
+                const auto& entry=device_.at(key);
+                if(!entry.group)covered+=entry.weight.image.nbytes();
+                else if(groups.insert(*entry.group).second)
+                    covered+=expert_slots_.at(DeviceKey{*entry.group,device}).image.nbytes();
+                const auto owned=entry.group?expert_slots_.at(DeviceKey{*entry.group,device}).residents+1:1;
+                if(entry.weight.image.weak_storage_owner().use_count()!=owned){busy=true;break;}
+            }
+            if(busy || covered!=arena->used_bytes())continue;
+            // The arena owns an index of its live entries. Reclaiming one
+            // backing region never scans unrelated layers or other devices.
+            if(owners!=arena_entries_.end())while(!owners->second.empty())
+                erase_expert_locked(owners->second.front());
+            const auto released=arena->bytes();
+            if(recycled)*recycled=arena;
+            else {arena_entries_.erase(arena.get());std::erase(arenas,arena);}
+            ++arena_recycles_;return released;
+        }
+        return 0;
+    }
+    tb::Tensor allocate_device_image(std::size_t bytes,int device,std::size_t limit,bool& cacheable,DeviceImageArena*& owner,
+            DeviceImageArena* transfer=nullptr,bool fallback=true) {
+        owner=nullptr;
+        if(!cacheable) {
+            if(transfer) {
+                auto image=transfer->allocate(bytes);
+                if(!image.defined())throw MfqResourceExhausted("TQ transfer workspace is exhausted");
+                return image;
+            }
+            return tb::empty({static_cast<int64_t>(bytes)},
+                tb::TensorOptions().device(tb::Device(tb::kCUDA,device)).dtype(tb::kUInt8));
+        }
+        auto& arenas=device_arenas_[device];
+        for(const auto& arena:arenas)if(auto image=arena->allocate(bytes);image.defined()) {
+            owner=arena.get();++device_reuses_;return image;
+        }
+        const auto aligned=(bytes+15)&~std::size_t(15);
+        if(transfer) {
+            // A running single-submission graph waits for this CPU task. It
+            // cannot tolerate driver allocations/frees on the upload path.
+            std::shared_ptr<DeviceImageArena> recycled;
+            if(evict_device_arena_locked(device,&recycled,aligned)) {
+                owner=recycled.get();++device_reuses_;return recycled->allocate(bytes);
+            }
+            cacheable=false;auto image=transfer->allocate(bytes);
+            if(!image.defined())throw MfqResourceExhausted("TQ transfer workspace is exhausted");
+            return image;
+        }
+        auto reserved=device_reserved_locked(device);
+        while(aligned<=limit && reserved>limit-aligned) {
+            if(!evict_device_arena_locked(device))break;
+            reserved=device_reserved_locked(device);
+        }
+        if(aligned<=limit && reserved<=limit-aligned) {
+            const auto capacity=std::max(aligned,std::min<std::size_t>(std::size_t(64)<<20,limit-reserved));
+            auto arena=std::make_shared<DeviceImageArena>(capacity,device);
+            auto image=arena->allocate(bytes);owner=arena.get();arenas.push_back(std::move(arena));return image;
+        }
+        if(!fallback){cacheable=false;return {};}
+        // Leased rows can temporarily outlive a tiny cache or workspace loan.
+        // They remain ordinary transient images and cannot enlarge the cache.
+        cacheable=false;
+        return tb::empty({static_cast<int64_t>(bytes)},
+            tb::TensorOptions().device(tb::Device(tb::kCUDA,device)).dtype(tb::kUInt8));
+    }
+    std::shared_ptr<MoePinnedExpertArena::Block> reuse_free_pinned(std::size_t bytes) {
+        for(const auto& arena:host_arenas_)if(auto block=arena->allocate(bytes))return block;
+        return {};
+    }
+    std::shared_ptr<MoePinnedExpertArena::Block> allocate_pinned(std::size_t bytes) {
+        const auto allocate=[&] {
+            return allocate_routed_pinned(host_arenas_,pinned_duplicates_,bytes,host_limit_,
+            !replay_readers_[mfq_current_cuda_device()],host_reserved_,pinned_ceiling_,pin_failures_,
+            [&](std::uint64_t key) {
+                const auto& image=host_.at(key).image;return image->block && image.use_count()==1;
+            },[&](std::uint64_t key){erase_host_locked(key);},
+            [&]{return available_host_bytes(process_host_limit_);},[&](std::size_t){++pin_attempts_;},profile_?&registration_ms_:nullptr);
+        };
+        auto block=allocate();
+        if(block || replay_readers_[mfq_current_cuda_device()] || layer_admission_ ||
+                mfq::cuda::DecodeWindow::recording())return block;
+        std::size_t holes=0,largest_arena=0;
+        for(const auto& arena:host_arenas_) {
+            holes+=arena->bytes()-arena->used_bytes();
+            largest_arena=std::max(largest_arena,arena->bytes());
+        }
+        pin_fragment_probe_bytes_=bytes>SIZE_MAX-pin_fragment_probe_bytes_?SIZE_MAX:pin_fragment_probe_bytes_+bytes;
+        if(holes<bytes || pin_fragment_probe_bytes_<largest_arena)return {};
+        // Match the GGUF failed-demand threshold. Only a failed pinned
+        // allocation scans host images; live DMA owners prevent their movement.
+        pin_fragment_probe_bytes_=0;++pin_fragment_retries_;
+        retire_host_transfers_locked();
+        std::unordered_map<const void*,std::vector<std::uint64_t>> keys;
+        for(const auto& [key,entry]:host_)if(entry.image->block)
+            keys[entry.image->block->allocation_id()].push_back(key);
+        const bool compacted=compact_host_interval(host_arenas_,keys,bytes,host_compacted_bytes_);
+        if(compacted)++pin_interval_compactions_;
+        else reclaim_host_locked(bytes,true);
+        block=allocate();
+        if(block){++pin_fragment_reuses_;pin_fragment_probe_bytes_=SIZE_MAX;}
+        if(const auto* trace=std::getenv("TYLOINFER_TRACE_KERNEL_DISPATCH");trace && trace[0]=='1')
+            std::fprintf(stderr,"native_tq_pinned_fragment_reuse actual_match=1 requested_bytes=%zu free_locked_bytes=%zu reused=%d probes=%llu interval_compacted=%d\n",
+                bytes,holes,int(bool(block)),static_cast<unsigned long long>(pin_fragment_retries_),int(compacted));
+        return block;
+    }
+    void release_empty_arenas() {
+        auto registration=mfq::cuda::try_host_registration();
+        if(!registration.owns_lock())return;
+        for(auto it=host_arenas_.begin();it!=host_arenas_.end();)
+            if(!(*it)->used_bytes()){host_reserved_-=(*it)->bytes();it=host_arenas_.erase(it);}else ++it;
+    }
+    void retire_host_transfers_locked() {
+        const mfq::cuda::Event* checked=nullptr;bool complete=false;
+        mfq::cuda::RoutedCompletionProbe probe;
+        const bool defer=layer_admission_ || replay_active_locked();
+        for(auto it=host_transfers_.begin();it!=host_transfers_.end();) {
+            // CUDA considers a never-recorded event complete. Keep queued
+            // descriptors and their sources until their actual submission.
+            if(!it->completed && !it->recorded_submission()){++it;continue;}
+            if(!it->completed && it->ready.get()!=checked) {
+                checked=it->ready.get();
+                complete=probe.ready(it->position?*it->position:mfq::cuda::RoutedCompletionPosition{},[&] {
+                    ++retirement_queries_;return checked->ready();
+                });
+            }
+            if(!it->completed && !complete){++it;continue;}
+            if(defer) {
+                deferred_events_.retain(it->ready);
+                for(const auto& image:it->images)deferred_events_.retain(image->ready);
+            }
+            it->completed=true;it=host_transfers_.erase(it);
+        }
+    }
+    void settle_host_transfers_locked() {
+        auto registration=mfq::cuda::try_host_registration();
+        if(!registration.owns_lock())return;
+        for(const auto& transfer:host_transfers_)
+            if(!transfer.completed && transfer.recorded_submission())transfer.ready->synchronize();
+        retire_host_transfers_locked();
+    }
+    std::size_t host_allocated_locked()const {
+        return host_reserved_+host_pageable_;
+    }
+    // Publish ordinary admissions and RAM-pressure migrations through the same
+    // residency indices and mapped address table. Migration enters at the cold
+    // end so it cannot displace a repeatedly used expert.
+    void commit_device_image_locked(DeviceKey key,const TqWeight& weight,const HostImage& image,
+            DeviceImageArena* arena,std::optional<std::uint64_t> group={},bool migration=false) {
+        if(!arena)throw std::logic_error("TQ resident image lost its arena owner");
+        auto& policy=routes_.at(key.device);
+        auto* group_slot=group?&expert_slots_.at(DeviceKey{*group,key.device}):nullptr;
+        auto* pending=group?&pending_expert_bytes_.at(key.device):nullptr;
+        policy.usage.image(key.image,weight.image.nbytes());
+        if(resident_roles_.count({key.device,key.image>>32}))resident_updates_.insert(key.device);
+        auto& device_bytes=device_usage_.try_emplace(key.device,0).first->second;
+        auto& arena_keys=arena_entries_[arena];
+        const auto [copies,created]=resident_copies_.try_emplace(key.image,0);
+        std::optional<std::list<DeviceKey>::iterator> cold;
+        std::list<DeviceKey>::iterator recent;
+        bool arena_linked=false,recent_linked=false,indexed=false;
+        try {
+            arena_keys.push_front(key);arena_linked=true;
+            recent=device_recent_.insert(migration?device_recent_.end():device_recent_.begin(),key);recent_linked=true;
+            if(migration || !policy.ready || !policy.usage.retained(key.image))
+                cold=policy.cold.insert(migration?policy.cold.end():policy.cold.begin(),key);
+            const auto [_,inserted]=device_.emplace(key,DeviceEntry{weight,recent,image.source_bytes,
+                image.layout,arena,arena_keys.begin(),cold,group});
+            if(!inserted)throw std::logic_error("duplicate TQ resident image admission");
+            ++copies->second;
+            if(group_slot){++group_slot->residents;*pending-=weight.image.nbytes();}
+            device_used_+=weight.image.nbytes();device_bytes+=weight.image.nbytes();indexed=true;
+            policy.usage.resident(key.image,true);
+            update_resident_view_locked(key,weight.view);
+            mark_host_duplicate_locked(key.image);
+        }catch(...) {
+            if(indexed)erase_device_locked(key,false);
+            else {
+                if(cold)policy.cold.erase(*cold);
+                if(recent_linked)device_recent_.erase(recent);
+                if(arena_linked)arena_keys.pop_front();
+                if(created)resident_copies_.erase(copies);
+            }
+            throw;
+        }
+    }
+    tb::Tensor allocate_idle_device_image_locked(std::size_t bytes,int device,std::size_t reserve,
+            const std::shared_ptr<mfq::cuda::Context>& context,DeviceImageArena*& owner) {
+        owner=nullptr;
+        const auto aligned=mfq::cuda::routed_aligned_bytes(bytes),limit=device_limit_locked(device);
+        if(aligned>mfq::cuda::routed_host_evacuation_capacity(
+                limit,device_used_locked(device),context->available_memory(),reserve))return {};
+        auto& arenas=device_arenas_[device];
+        for(const auto& arena:arenas)if(auto image=arena->allocate(aligned);image.defined()) {
+            owner=arena.get();++device_reuses_;return image;
+        }
+        // Exact new storage only: never recycle an occupied arena, evict a
+        // resident, or inflate the request to the ordinary growth quantum.
+        const auto reserved=device_reserved_locked(device);
+        if(aligned>limit-std::min(limit,reserved))return {};
+        const mfq::cuda::RoutedWeightAllocationScope allocation;
+        auto arena=std::make_shared<DeviceImageArena>(aligned,device);
+        auto image=arena->allocate(aligned);owner=arena.get();arenas.push_back(std::move(arena));return image;
+    }
+    void evacuate_host_allocation_locked(const void* allocation) {
+        const auto device=mfq_current_cuda_device();
+        if(host_evacuation_blocked_ || layer_admission_ || replay_readers_[device] ||
+                mfq::cuda::DecodeWindow::recording() || !decode_reserves_.count(device))return;
+        const auto context=mfq::cuda::default_context(device);
+        if(context->workspace_loan_active())return;
+        for(const auto& [_,reservation]:workspace_limits_)if(reservation.device==device)return;
+        cudaStreamCaptureStatus capture;
+        TYLOINFER_CUDA_CHECK(cudaStreamIsCapturing(mfq_current_cuda_stream(),&capture));
+        if(capture!=cudaStreamCaptureStatusNone)return;
+        const auto found_stream=transfer_streams_.find(device);
+        if(found_stream==transfer_streams_.end())return;
+        const auto stream=found_stream->second;
+        TYLOINFER_CUDA_CHECK(cudaStreamIsCapturing(stream.stream(),&capture));
+        if(capture!=cudaStreamCaptureStatusNone)return;
+        const auto& saved=decode_reserves_.at(device);
+        const auto reserve=mfq::cuda::routed_saturating_add(saved.growth,
+            saved.transient.value_or(mfq::cuda::runtime_options::workspace_reserve_bytes()));
+        if(context->available_memory()<=reserve)return;
+        auto candidates=host_evacuation_candidates(allocation,[&](auto key) {
+            const auto found=source_info_.find(key>>32);
+            return found!=source_info_.end() && !found->second.resident;
+        },[](const auto& image){return !image.ready || image.ready_on_host || image.ready->ready();});
+        struct Move {
+            DeviceKey key;
+            std::shared_ptr<HostImage> image;
+            TqWeight weight;
+            DeviceImageArena* arena;
+            std::optional<std::uint64_t> group;
+            std::size_t reserved=0;
+        };
+        std::vector<Move> moves;moves.reserve(candidates.size());
+        std::vector<mfq::cuda::DmaCopy> copies;copies.reserve(candidates.size());
+        std::vector<CUdeviceptr> aliases;aliases.reserve(candidates.size());
+        std::vector<DeviceKey> created_slots,committed;
+        created_slots.reserve(candidates.size());committed.reserve(candidates.size());
+        const MfqCudaStreamGuard upload(stream);
+        const auto cleanup=[&] {
+            for(const auto key:committed)if(device_.count(key))erase_device_locked(key,false);
+            for(const auto key:created_slots)if(const auto found=expert_slots_.find(key);
+                    found!=expert_slots_.end() && !found->second.residents) {
+                pending_expert_bytes_[device]-=found->second.image.nbytes();expert_slots_.erase(found);
+            }
+            for(const auto& move:moves)pending_expert_bytes_[device]-=move.reserved;
+            moves.clear();release_empty_device_arenas_locked(device);
+        };
+        try {
+            auto& policy=routes_[device];
+            for(const auto key:candidates) {
+                const auto& image=host_.at(key).image;
+                const auto source=key>>32,expert=std::uint64_t(std::uint32_t(key));
+                const auto needed=mfq::cuda::routed_aligned_bytes(image->size());
+                DeviceImageArena* arena=nullptr;
+                std::optional<std::uint64_t> group;
+                tb::Tensor storage;
+                if(const auto* banks=policy.banks.find(source)) {
+                    const DeviceKey group_key{((*banks)[0]<<32)|expert,device};
+                    auto slot=expert_slots_.find(group_key);
+                    if(slot==expert_slots_.end()) {
+                        bool partial=false;std::array<std::size_t,3> sizes{};
+                        for(unsigned role=0;role<3;++role) {
+                            const auto& info=source_info_.at((*banks)[role]);
+                            sizes[role]=info.table->expert_image_bytes(expert,info.rows);
+                            partial|=device_.count(DeviceKey{((*banks)[role]<<32)|expert,device})!=0;
+                        }
+                        if(!partial) {
+                            const mfq::cuda::RoutedExpertImageLayout layout(*banks,sizes);
+                            auto slot_image=allocate_idle_device_image_locked(layout.bytes,device,reserve,context,arena);
+                            if(!slot_image.defined())continue;
+                            pending_expert_bytes_.try_emplace(device,0);
+                            slot=expert_slots_.emplace(group_key,ExpertSlot{std::move(slot_image),arena,layout}).first;
+                            created_slots.push_back(group_key);pending_expert_bytes_[device]+=layout.bytes;
+                        }
+                    }
+                    if(slot!=expert_slots_.end()) {
+                        const auto role=std::find(banks->begin(),banks->end(),source)-banks->begin();
+                        if(needed!=slot->second.layout.sizes[role])throw std::logic_error("TQ migration slot byte count differs");
+                        storage=slot->second.image.narrow(0,slot->second.layout.offsets[role],needed);
+                        arena=slot->second.arena;group=group_key.image;
+                    }
+                }
+                if(!storage.defined())storage=allocate_idle_device_image_locked(needed,device,reserve,context,arena);
+                if(!storage.defined())continue;
+                auto weight=tq_view(std::move(storage),image->layout,source_info_.at(source).table->width());
+                weight.allocation_stream=stream;
+                pending_expert_bytes_.try_emplace(device,0);
+                moves.push_back({DeviceKey{key,device},image,std::move(weight),arena,group,group?0:needed});
+                pending_expert_bytes_[device]+=moves.back().reserved;
+                copies.push_back({moves.back().weight.image.data_ptr(),image->data(),image->size()});
+                aliases.push_back(reinterpret_cast<CUdeviceptr>(image->mapped_data(device)));
+            }
+            if(moves.empty()){cleanup();return;}
+            std::size_t index=0;
+            if(mfq::cuda::submit_routed_transfers(copies,stream.stream(),mfq::cuda::routed_dma_mode(),
+                    [&](const void*,std::size_t){return aliases[index++];}))++native_batches_;
+            for(const auto& move:moves){transfer_bytes_+=move.image->size();direct_transfer_bytes_+=move.image->size();}
+            // No mapped residency address is published, and no RAM owner is
+            // removed, until this independent upload lane has completed.
+            TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(stream.stream()));
+            if(context->available_memory()<reserve){cleanup();context->reclaim_idle_memory();return;}
+            for(auto& move:moves) {
+                commit_device_image_locked(move.key,move.weight,*move.image,move.arena,move.group,true);
+                committed.push_back(move.key);
+                pending_expert_bytes_[device]-=move.reserved;move.reserved=0;
+            }
+        }catch(const MfqResourceExhausted&) {
+            (void)cudaStreamSynchronize(stream.stream());cleanup();context->reclaim_idle_memory();return;
+        }catch(const mfq::cuda::Error& error) {
+            (void)cudaStreamSynchronize(stream.stream());cleanup();
+            if(std::string(error.what()).find(cudaGetErrorString(cudaErrorMemoryAllocation))==std::string::npos)throw;
+            (void)cudaGetLastError();context->reclaim_idle_memory();return;
+        }catch(...) {(void)cudaStreamSynchronize(stream.stream());cleanup();throw;}
+        for(const auto& move:moves){host_evacuated_bytes_+=move.weight.image.nbytes();++host_evacuated_images_;}
+    }
+    std::size_t reclaim_host_locked(std::size_t bytes,bool duplicates_only=false) {
+        retire_host_transfers_locked();
+        const auto before=host_allocated_locked();release_empty_arenas();
+        const auto victims=host_allocation_victims(host_arenas_);
+        std::unordered_set<const void*> retained;
+        for(bool duplicates:{true,false}) {
+            if(!duplicates && duplicates_only)break;
+            for(const auto& victim:victims) {
+                if(before-host_allocated_locked()>=bytes)return before-host_allocated_locked();
+                if(!duplicates)evacuate_host_allocation_locked(victim.allocation);
+                for(const auto key:victim.keys)if(const auto found=host_.find(key);found!=host_.end()) {
+                    const auto& image=found->second.image;
+                    const auto allocation=image->block?image->block->allocation_id():static_cast<const void*>(image.get());
+                    if(allocation==victim.allocation && (!duplicates || found->second.duplicate))erase_host_locked(key);
+                }
+                if(duplicates)host_trimmed_bytes_+=trim_host_image_ranges(victim.allocation,victim.keys);
+                release_empty_arenas();
+                if(duplicates && before-host_allocated_locked()<bytes && !retained.count(victim.allocation)) {
+                    host_compacted_bytes_+=relocate_host_images(host_arenas_,victim.allocation,victim.keys,retained,
+                        [](std::uint64_t,const void*,const void*){});
+                    release_empty_arenas();
+                }
+            }
+        }
+        return before-host_allocated_locked();
     }
     std::size_t reserve_host_locked(std::size_t bytes) {
-        if(!bytes || host_.empty())return 0;
-        const auto available=available_host_bytes(process_host_limit_);
-        return available>=bytes?0:reclaim_host_locked(bytes-available);
+        if(!bytes)return 0;
+        auto available=available_host_bytes(process_host_limit_);
+        available=host_headroom_after_allocator_trim(bytes,available,
+            []{mfq_release_host_allocator_cache();},[&]{return available_host_bytes(process_host_limit_);});
+        return available>=bytes || host_.empty()?0:reclaim_host_locked(bytes-available);
     }
     void report()const {
         if(profile_)std::fprintf(stderr,"tq_cache calls=%llu gpu_hits=%llu host_hits=%llu source_bytes=%llu h2d_bytes=%llu fetch_ms=%.3f upload_submit_ms=%.3f gpu_bytes=%zu host_bytes=%zu host_limit=%zu direct_h2d_bytes=%llu pin_attempts=%llu pin_failures=%llu\n",
@@ -1014,14 +1728,29 @@ class TqExpertCache {
             static_cast<unsigned long long>(direct_transfer_bytes_),static_cast<unsigned long long>(pin_attempts_),
             static_cast<unsigned long long>(pin_failures_));
     }
-    void upload(const tb::Tensor& destination,const std::vector<std::uint8_t>& bytes) {
+    template<class Bytes,class Queue,class Flush>
+    void stage_upload(const tb::Tensor& destination,const Bytes& bytes,Queue&& queue,Flush&& flush) {
+        const bool trace=std::getenv("TYLOINFER_TQ_TRACE_ROWS")!=nullptr;
+        const auto step=[&](const char* phase) {
+            if(trace){std::fprintf(stderr,"tq_dma step=%s bytes=%zu\n",phase,bytes.size());std::fflush(stderr);}
+        };
+        step("begin");
         const auto started=std::chrono::steady_clock::now();
-        auto& staging=stages_[destination.get_device()];
+        const auto stream=mfq_get_current_cuda_stream(destination.get_device());
+        auto& staging=stages_[destination.get_device()][stream.stream()];
+        staging.owner=stream;
         auto* stage=staging.stages[staging.index].get();
         if(!stage || bytes.size()>stage->host.size()-stage->cursor) {
+            // Submit every queued reference before an interval can be reused.
+            // A bank larger than the ring is streamed in bounded packets.
+            flush();
             staging.index^=1;
             auto& selected=staging.stages[staging.index];
-            if(selected)selected->reuse();
+            if(selected) {
+                step("reuse_wait");
+                {CpuTimer timer(profile_?&stage_wait_ms_:nullptr);selected->reuse();}
+                step("reuse_done");
+            }
             // Bound normal staging, while allowing any valid projection larger
             // than the normal chunk. This is a host DMA arena, not a GPU limit.
             const auto capacity=std::max<std::size_t>(std::size_t(32)<<20,bytes.size());
@@ -1029,64 +1758,670 @@ class TqExpertCache {
             stage=selected.get();
         }
         auto* source=static_cast<std::uint8_t*>(stage->host.data())+stage->cursor;
-        std::memcpy(source,bytes.data(),bytes.size());
-        const auto stream=mfq_current_cuda_stream();
-        // A staging arena can serve different request streams. Chain its
-        // copies so the final reuse fence covers every outstanding DMA.
-        if(stage->pending && stage->stream!=stream)
-            TYLOINFER_CUDA_CHECK(cudaStreamWaitEvent(stream,stage->uploaded.get(),0));
-        TYLOINFER_CUDA_CHECK(cudaMemcpyAsync(destination.data_ptr(),source,bytes.size(),cudaMemcpyHostToDevice,stream));
-        stage->uploaded.record(stream);stage->pending=true;stage->stream=stream;
+        step("cpu_copy");
+        {CpuTimer timer(profile_?&stage_copy_ms_:nullptr);mfq::copy_host_range({source,bytes.data(),bytes.size()});}
+        step("cpu_done");
+        // Keep DMA and projection-metadata staging independent. Reusing a
+        // completion event across streams can wait on a later graph replay
+        // which is itself waiting for this upload.
+        step("gpu_copy");
+        queue(mfq::cuda::DmaCopy{destination.data_ptr(),source,bytes.size()},
+            reinterpret_cast<CUdeviceptr>(stage->mapped+stage->cursor),stage);
+        step("gpu_submitted");
         stage->cursor+=bytes.size();transfer_bytes_+=bytes.size();
         upload_submit_ms_+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count();
     }
+    template<class Bytes> void upload(const tb::Tensor& destination,const Bytes& bytes) {
+        const auto stream=mfq_get_current_cuda_stream(destination.get_device());
+        stage_upload(destination,bytes,[&](const mfq::cuda::DmaCopy& copy,CUdeviceptr,Stage* stage) {
+            TYLOINFER_CUDA_CHECK(cudaMemcpyAsync(copy.destination,copy.source,copy.bytes,cudaMemcpyHostToDevice,stream.stream()));
+            stage->uploaded.record(stream.stream());stage->pending=true;
+        },[]{});
+    }
 public:
+    struct UploadBatch {
+        TqExpertCache& owner;
+        MfqCudaStream stream,consumer;
+        std::shared_ptr<mfq::cuda::Event> ready;
+        std::shared_ptr<std::atomic<bool>> submitted=std::make_shared<std::atomic<bool>>(false);
+        std::shared_ptr<std::atomic<bool>> recorded=std::make_shared<std::atomic<bool>>(false);
+        std::shared_ptr<mfq::cuda::RoutedCompletionPosition> position=std::make_shared<mfq::cuda::RoutedCompletionPosition>();
+        std::vector<DeviceKey> admitted;
+        bool finished=false;
+        UploadBatch(TqExpertCache& cache,MfqCudaStream upload,MfqCudaStream compute)
+            :owner(cache),stream(std::move(upload)),consumer(std::move(compute)) {}
+        UploadBatch(const UploadBatch&)=delete;
+        UploadBatch& operator=(const UploadBatch&)=delete;
+        ~UploadBatch(){if(!finished)owner.abort_uploads(*this);}
+    };
+    std::unique_ptr<UploadBatch> begin_uploads(int device) {
+        return std::make_unique<UploadBatch>(*this,transfer_stream(device),mfq_get_current_cuda_stream(device));
+    }
+    void finish_uploads(UploadBatch& batch) {
+        std::lock_guard lock(mutex_);
+        if(batch.finished)return;
+        const MfqCudaGuard device(batch.stream.device());
+        try {
+            if(batch.ready) {
+                ++upload_groups_;
+                batch.ready->record(batch.stream.stream());
+                *batch.position=mfq::cuda::record_routed_completion(transfer_clock_,batch.stream.device(),batch.stream.stream());
+                batch.recorded->store(true,std::memory_order_release);
+                if(batch.consumer.stream()!=batch.stream.stream())
+                    TYLOINFER_CUDA_CHECK(cudaStreamWaitEvent(batch.consumer.stream(),batch.ready->get(),0));
+            }
+            batch.submitted->store(true,std::memory_order_release);batch.finished=true;
+        }catch(...) {
+            (void)cudaStreamSynchronize(batch.stream.stream());throw;
+        }
+    }
+    void upload_decode_views(const tb::Tensor& target,std::size_t offset,const void* source,std::size_t bytes) {
+        // The graph stage owns this pinned packet until its DMA and replay
+        // finish. Upload only its selected slots, without a staging-ring copy.
+        const auto started=profile_?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
+        TYLOINFER_CUDA_CHECK(cudaMemcpyAsync(target.data_ptr<std::uint8_t>()+offset,source,bytes,
+            cudaMemcpyHostToDevice,mfq_current_cuda_stream()));
+        std::lock_guard lock(mutex_);
+        decode_metadata_bytes_+=bytes;++decode_metadata_updates_;transfer_bytes_+=bytes;
+        if(profile_)decode_metadata_submit_ms_+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count();
+    }
+    void touch_decode_residents(const std::array<std::uint64_t,3>& sources,
+            std::span<const std::int64_t> experts,int device) {
+        if(experts.empty())return;
+        std::lock_guard lock(mutex_);
+        if(std::all_of(sources.begin(),sources.end(),[&](auto source) {
+            return bool(source_info_.at(source).resident);
+        }))return;
+        const auto started=profile_?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
+        if(!replay_readers_[device])throw std::logic_error("resident decode touch requires a frozen cache epoch");
+        for(const auto source:sources)for(const auto expert:experts) {
+            if(const auto& permanent=source_info_.at(source).resident) {
+                if(permanent->packed.get_device()!=device || expert<0 ||
+                        std::uint64_t(expert)>=permanent->experts.size())
+                    throw std::invalid_argument("TQ permanent resident view mismatch");
+                continue;
+            }
+            const auto found=device_.find({(source<<32)|std::uint64_t(expert),device});
+            if(found==device_.end())throw std::logic_error("published resident expert lost its backing image");
+            device_recent_.splice(device_recent_.begin(),device_recent_,found->second.recent);
+            if(found->second.cold) {
+                auto& cold=routes_.at(device).cold;cold.splice(cold.begin(),cold,*found->second.cold);
+            }
+        }
+        const auto hits=experts.size()*sources.size();
+        calls_+=hits;gpu_hits_+=hits;decode_calls_+=hits;decode_hits_+=hits;
+        decode_resident_bypasses_+=hits;
+        if(profile_) {
+            const auto elapsed=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count();
+            decode_resident_touch_ms_+=elapsed;decode_get_rows_ms_+=elapsed;get_rows_ms_+=elapsed;
+        }
+    }
+    void abort_uploads(UploadBatch& batch) noexcept {
+        try {
+            const MfqCudaGuard device(batch.stream.device());
+            std::lock_guard lock(mutex_);
+            // Submitted banks and their sources remain alive until this
+            // retirement fence, including failure while preparing a later bank.
+            if(batch.ready) {
+                batch.ready->record(batch.stream.stream());
+                *batch.position=mfq::cuda::record_routed_completion(transfer_clock_,batch.stream.device(),batch.stream.stream());
+                batch.recorded->store(true,std::memory_order_release);
+            }
+            batch.submitted->store(true,std::memory_order_release);
+            for(const auto& key:batch.admitted)if(device_.count(key))erase_device_locked(key,false);
+            batch.finished=true;
+        }catch(...) {
+            try {
+                const MfqCudaGuard device(batch.stream.device());
+                if(cudaStreamSynchronize(batch.stream.stream())==cudaSuccess) {
+                    std::lock_guard lock(mutex_);
+                    // A failed event record has no queryable fence. A completed
+                    // stream is nevertheless an authoritative lifetime boundary.
+                    for(auto& transfer:host_transfers_)
+                        if(transfer.submitted==batch.submitted)transfer.completed=true;
+                    for(const auto& key:batch.admitted)if(device_.count(key))erase_device_locked(key,false);
+                    batch.finished=true;
+                }
+            }catch(...) {}
+        }
+    }
     TqExpertCache(std::size_t budget,std::size_t host_budget,std::size_t process_limit,bool retain_all)
-        :host_limit_(host_budget?host_budget:available_host_bytes(process_limit)/5*4),device_limit_(budget),
+        :host_limit_(host_budget?host_budget:available_host_bytes(process_limit)),ordinary_host_limit_(host_limit_),device_limit_(budget),
          retain_all_(retain_all),process_host_limit_(process_limit) {}
+    bool set_reuse_learning(bool enabled) {
+        std::lock_guard lock(mutex_);return std::exchange(reuse_learning_,enabled);
+    }
+    void record_prefill(const std::array<std::uint64_t,3>& sources,
+            const std::vector<std::int64_t>& experts,const std::vector<std::vector<std::int64_t>>& slots,
+            std::size_t rows,int device) {
+        std::lock_guard lock(mutex_);
+        if(!reuse_learning_ || source_info_.at(sources[0]).resident)return;
+        auto& policy=routes_[device];
+        register_banks_locked(policy,sources);
+        // Once decode has trained this bank, prompt preparation must preserve
+        // its working set, matching the existing fixed-slot cache lifecycle.
+        if(policy.decoded_banks.count(sources[0]))return;
+        for(auto source:sources)policy.usage.reset_prefill(source);
+        for(std::size_t i=0;i<experts.size();++i)for(auto source:sources)
+            policy.usage.prefill((source<<32)|std::uint64_t(experts[i]),slots[i].size(),rows);
+        policy.seeded=true;policy.ready=false;
+    }
+    void observe_routes(const std::array<std::uint64_t,3>& sources,const std::int64_t* experts,
+            int rows,int count,int device) {
+        std::lock_guard lock(mutex_);
+        if(!reuse_learning_ || source_info_.at(sources[0]).resident)return;
+        register_banks_locked(routes_[device],sources);
+        route_journal_.collect({experts,std::size_t(rows)*count},std::size_t(source_info_.at(sources[0]).experts),
+            route_touches_,[&](auto expert) {
+                for(auto source:sources)if(!device_.count(DeviceKey{(source<<32)|std::uint64_t(expert),device}))return true;
+                return false;
+            });
+        if(speculative_rows_) {speculative_routes_.push_back({device,rows,sources,route_touches_});return;}
+        auto& policy=routes_[device];
+        if(!route_touches_.empty())policy.decoded_banks.insert(sources[0]);
+        for(const auto& touch:route_touches_)for(auto source:sources)for(std::uint64_t i=0;i<touch.uses;++i) {
+            policy.usage.observe((source<<32)|std::uint64_t(touch.expert));++policy.observations;policy.seeded=true;
+        }
+    }
+    void finish_routes(int device) {
+        bool refresh=false;
+        std::vector<std::shared_ptr<mfq::cuda::Event>> retired;
+        {
+            std::lock_guard lock(mutex_);
+            if(replay_readers_[device])--replay_readers_[device];
+            if(!replay_active_locked())retired=deferred_events_.take();
+            if(!speculative_rows_)refresh=finish_routes_locked(device);
+        }
+        retired.clear();
+        if(refresh)queue_admission(device);
+    }
+    void begin_replay(int device) {
+        admission_executor_->transition([&](auto& admission) {
+            // Freeze metadata after submission. Each layer joins its own DMA
+            // through the same admission flag protocol used by GGUF.
+            admission.wait();
+            const auto upload=transfer_stream(device);
+            std::lock_guard lock(mutex_);
+            if(layer_admission_ && layer_admission_->device==device)layer_admission_->require_active();
+            if(resident_updates_.count(device)) {
+                TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(upload.stream()));
+                resident_updates_.erase(device);
+            }
+            for(const auto& [_,view]:resident_views_)if(view->device==device && view->rebuild)view->republish();
+            ++replay_readers_[device];
+        });
+    }
+    void release_deferred_events() {
+        std::vector<std::shared_ptr<mfq::cuda::Event>> retired;
+        {
+            std::lock_guard lock(mutex_);
+            if(!replay_active_locked())retired=deferred_events_.take();
+        }
+        retired.clear();
+    }
+    void wait_ready(){wait_admission();release_deferred_events();}
+    std::shared_ptr<void> prepare_prefill_staging(const std::array<std::uint64_t,3>& sources,
+            std::span<const std::int64_t> experts,std::span<const std::size_t> ends,int device) {
+        if(!RoutedPrefillStager::enabled() || experts.empty())return {};
+        std::lock_guard lock(mutex_);
+        if(!staged_host_jobs_.empty())throw std::logic_error("overlapping routed host staging");
+        RoutedPrefillStagePlan plan;
+        std::size_t begin=0;
+        for(const auto end:ends) {
+            for(const auto source:sources)for(auto i=begin;i<end;++i) {
+                const auto key=(source<<32)|std::uint64_t(experts[i]);
+                const auto found=host_.find(key);
+                if(found==host_.end() || found->second.image->pinned() || device_.count({key,device}))continue;
+                const auto& image=found->second.image;
+                plan.add(key,{image->data(),image->size(),image});
+            }
+            begin=end;
+        }
+        return plan.start(prefill_host_stager_,staged_host_jobs_,device,mutex_);
+    }
+    void wait_layer_admission(const std::shared_ptr<ResidentViews>& view) {
+        const auto started=profile_?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
+        if(!view){wait_admission();return;}
+        std::shared_ptr<LayerAdmission> epoch;
+        {
+            std::lock_guard lock(mutex_);epoch=layer_admission_;
+            if(!epoch || epoch->device!=view->device)return;
+        }
+        const auto* ready=reinterpret_cast<const volatile std::uint32_t*>(view->admission_host());
+        mfq::cuda::wait_routed_layer_admission([&]{return *ready!=0;},mfq::cpu::spin_pause,[&] {
+            auto error=std::make_exception_ptr(std::runtime_error("routed layer admission timed out"));
+            abort_layer_admission(epoch,error);std::rethrow_exception(error);
+        });
+        std::lock_guard lock(mutex_);epoch->require_active();
+        if(profile_)decode_admission_wait_ms_+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count();
+    }
+    void cancel_replay(int device) noexcept {
+        std::lock_guard lock(mutex_);
+        if(auto found=replay_readers_.find(device);found!=replay_readers_.end() && found->second)--found->second;
+    }
+    std::shared_ptr<ResidentViews> resident_views(std::array<std::uint64_t,3> sources,std::int64_t experts,int device) {
+        return admission_executor_->transition([&](auto& admission) {
+            join_admission(admission);
+            std::lock_guard lock(mutex_);
+            register_banks_locked(routes_[device],sources);
+            const std::array<std::uint64_t,4> key{sources[0],sources[1],sources[2],std::uint64_t(device)};
+            if(auto found=resident_views_.find(key);found!=resident_views_.end())return found->second;
+            auto views=std::make_shared<ResidentViews>(sources,experts,device);
+            for(int role=0;role<3;++role) {
+                if(const auto& permanent=source_info_.at(sources[role]).resident) {
+                    if(permanent->packed.get_device()!=device || permanent->experts.size()!=std::size_t(experts))
+                        throw std::invalid_argument("TQ permanent resident view mismatch");
+                    const auto stream=mfq_get_current_cuda_stream(device).stream();
+                    permanent->packed.record_stream(reinterpret_cast<std::uintptr_t>(stream));
+                    permanent->views.record_stream(reinterpret_cast<std::uintptr_t>(stream));
+                    for(std::int64_t expert=0;expert<experts;++expert)
+                        views->update(role,expert,permanent->experts[expert].view,true);
+                    continue;
+                }
+                resident_roles_[{device,sources[role]}].push_back({views,role});
+                for(std::int64_t expert=0;expert<experts;++expert) {
+                    const auto found=device_.find(DeviceKey{(sources[role]<<32)|std::uint64_t(expert),device});
+                    if(found!=device_.end())views->update(role,expert,found->second.weight.view,true);
+                }
+            }
+            resident_views_.emplace(key,views);return views;
+        });
+    }
+    void begin_routes(int rows) {
+        if(rows<1)throw std::invalid_argument("TQ speculative route window must be positive");
+        std::lock_guard lock(mutex_);
+        if(speculative_rows_)throw std::logic_error("TQ speculative route window already active");
+        speculative_rows_=rows;speculative_routes_.clear();
+    }
+    void commit_routes(int rows) {
+        std::unique_lock lock(mutex_);
+        if(rows<0 || rows>speculative_rows_)throw std::invalid_argument("TQ accepted route rows exceed window");
+        std::unordered_set<int> devices;
+        if(reuse_learning_)for(const auto& route:speculative_routes_)
+            if(mfq::cuda::routed_observed_rows(rows,route.rows)) {
+                auto& policy=routes_[route.device];
+                if(!route.touches.empty())policy.decoded_banks.insert(route.sources[0]);
+                for(const auto& touch:route.touches)for(auto source:route.sources)for(std::uint64_t i=0;i<touch.uses;++i) {
+                    policy.usage.observe((source<<32)|std::uint64_t(touch.expert));++policy.observations;
+                }
+                policy.seeded=true;devices.insert(route.device);
+            }
+        speculative_routes_.clear();speculative_rows_=0;
+        for(auto device:devices)finish_routes_locked(device,true);
+        lock.unlock();
+        for(auto device:devices)queue_admission(device);
+    }
+    void discard_routes() noexcept {
+        std::lock_guard lock(mutex_);speculative_routes_.clear();speculative_rows_=0;
+    }
+    MfqCudaStream transfer_stream(int device) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        auto found=transfer_streams_.find(device);
+        if(found==transfer_streams_.end())found=transfer_streams_.emplace(device,mfq_get_stream_from_pool(true,device)).first;
+        completion_events_.prepare(device,found->second.stream());
+        return found->second;
+    }
+    MfqCudaStream admission_stream(int device) {
+        std::lock_guard lock(mutex_);
+        auto found=admission_streams_.find(device);
+        if(found==admission_streams_.end())found=admission_streams_.emplace(device,mfq_get_stream_from_pool(false,device)).first;
+        completion_events_.prepare(device,found->second.stream());
+        return found->second;
+    }
+    void prepare_transfer_staging(int device) {
+        const auto upload=transfer_stream(device);
+        std::lock_guard<std::mutex> guard(mutex_);
+        auto& staging=stages_[device][upload.stream()];staging.owner=upload;
+        for(auto& stage:staging.stages)if(!stage)stage=std::make_unique<Stage>(std::size_t(32)<<20);
+    }
     ~TqExpertCache(){
+        try{wait_admission();}catch(...){}
+        {
+            std::lock_guard lock(mutex_);
+            std::unordered_set<PrefillLoan*> visited;
+            for(const auto& [_,reservation]:workspace_limits_)if(reservation.loan && visited.insert(reservation.loan.get()).second) {
+                try {
+                    const MfqCudaGuard device(reservation.device);
+                    const MfqCudaStreamGuard stream(reservation.stream);
+                    fence_workspace_locked(reservation.device);reservation.loan->finish();
+                }catch(const std::exception& error) {
+                    // An outstanding tensor still owns its pointer through
+                    // Context. The shared loan retains its arena on failure.
+                    std::fprintf(stderr,"TQ prefill backing retained during cache shutdown: %s\n",error.what());
+                }
+            }
+        }
+        admission_executor_.reset();
         host_transfers_.clear();
-        for(auto& [_,pool]:graph_pools_)pool.context->end_graph_pool(pool.stream.stream());
+        device_.clear();graph_pools_.clear();
         report();
     }
     void prepare_graph_pool() {
+        wait_admission();
         const auto stream=mfq_get_current_cuda_stream();
         std::lock_guard<std::mutex> guard(mutex_);
-        if(graph_pools_.count(stream.stream()))return;
-        const auto context=mfq::cuda::default_context(stream.device());
-        context->begin_graph_pool(stream.stream());
-        try {graph_pools_.emplace(stream.stream(),GraphPool{stream,context});}
-        catch(...) {context->end_graph_pool(stream.stream());throw;}
+        graph_pools_.prepare(stream);
     }
-    std::uint64_t register_source(std::size_t bytes) {
+    std::uint64_t register_source(std::shared_ptr<TqRowTable> table,std::int64_t rows,std::int64_t experts,
+            std::shared_ptr<TqResidentBank> resident={}) {
+        const auto bytes=table->storage_bytes(),resident_bound=table->routed_image_storage_bound(experts);
         std::lock_guard<std::mutex> guard(mutex_);
-        if(bytes>SIZE_MAX-payload_bytes_)throw std::overflow_error("TQ source payload exceeds size limits");
+        if(resident ? resident->packed.nbytes()>SIZE_MAX-predictor_resident_bytes_ :
+                bytes>SIZE_MAX-payload_bytes_ || resident_bound>SIZE_MAX-resident_bytes_bound_)
+            throw std::overflow_error("TQ source payload exceeds size limits");
         if(++sources_>UINT32_MAX)throw std::overflow_error("too many TQ projection sources");
-        payload_bytes_+=bytes;
+        if(resident)predictor_resident_bytes_+=resident->packed.nbytes();
+        else {payload_bytes_+=bytes;resident_bytes_bound_+=resident_bound;}
+        source_info_.emplace(sources_,SourceInfo{std::move(table),rows,experts,std::move(resident)});
         return sources_;
+    }
+    std::size_t source_bytes() {
+        std::lock_guard lock(mutex_);return payload_bytes_;
     }
     std::size_t budget_bytes() {
         std::lock_guard<std::mutex> guard(mutex_);
-        return retain_all_?std::max(payload_bytes_,device_used_):device_limit_;
+        return payload_bytes_?device_limit_locked():0;
+    }
+    std::size_t lendable_bytes() {
+        std::lock_guard<std::mutex> guard(mutex_);
+        return std::max(device_used_locked(mfq_current_cuda_device()),device_reserved_locked(mfq_current_cuda_device()));
+    }
+private:
+    void fence_workspace_locked(int device) {
+        const auto current=mfq_get_current_cuda_stream(device);
+        const auto producer=[device](const auto& streams) {
+            const auto found=streams.find(device);
+            return found==streams.end()?cudaStream_t{}:found->second.stream();
+        };
+        mfq::cuda::synchronize_routed_streams(current,
+            {producer(transfer_streams_),producer(admission_streams_)});
+        settle_host_transfers_locked();
+    }
+    void reserve_workspace_locked(std::size_t bytes,const std::shared_ptr<mfq::cuda::Context>& context,int device) {
+        // The loan allocator cannot combine independent arena intervals. Keep
+        // ordinary headroom for a single allocation as large as the complete
+        // request; small borrowed holes are optional reuse, never this credit.
+        auto available=context->available_memory();
+        if(available>=bytes || context->workspace_largest_available(mfq_get_current_cuda_stream(device).stream())>=bytes)return;
+        if(replay_readers_[device])
+            throw MfqResourceExhausted("expert weights are leased by an active decode window");
+        fence_workspace_locked(device);
+        while(available<bytes && (!device_recent_.empty() || device_reserved_locked(device))) {
+            const auto needed=bytes-available;
+            std::size_t released=0;
+            while(released<needed) {
+                if(const auto chunk=evict_device_arena_locked(device)) {released+=chunk;continue;}
+                const auto before=device_used_locked(device);
+                if(!evict_oldest_device_locked(device))break;
+                released+=before-device_used_locked(device);
+            }
+            settle_host_transfers_locked();
+            release_empty_device_arenas_locked(device);
+            context->reclaim_idle_memory();
+            available=context->available_memory();
+            if(!released)break;
+        }
+    }
+public:
+    void reserve_workspace(std::size_t bytes) {
+        admission_executor_->transition([&](auto& admission) {
+            join_admission(admission);
+            const auto device=mfq_current_cuda_device();
+            const auto context=mfq::cuda::default_context(device);
+            context->reclaim_idle_memory();
+            std::lock_guard<std::mutex> guard(mutex_);
+            reserve_workspace_locked(bytes,context,device);
+        });
+    }
+    std::pair<std::uint64_t,std::size_t> begin_workspace(std::size_t bytes) {
+        std::pair<std::uint64_t,std::size_t> result{};
+        admission_executor_->transition([&](auto& admission) {
+            join_admission(admission);
+            const auto device=mfq_current_cuda_device();
+            const auto context=mfq::cuda::default_context(device);
+            const auto stream=mfq_get_current_cuda_stream(device);
+            context->reclaim_idle_memory();
+            std::lock_guard<std::mutex> guard(mutex_);
+            if(next_workspace_token_==UINT64_MAX)throw std::overflow_error("TQ workspace reservation token overflow");
+            std::shared_ptr<PrefillLoan> loan;
+            for(const auto& [_,reservation]:workspace_limits_)if(reservation.device==device && reservation.loan) {
+                loan=reservation.loan;
+                if(!loan->matches(context,stream))
+                    throw MfqResourceExhausted("TQ prefill workspace is owned by another stream or thread");
+                break;
+            }
+            const auto before=context->available_memory();
+            auto available=before;
+            bool started=false;
+            const auto borrow=[&](bool complete) {
+                if(loan || replay_readers_[device] || context->workspace_loan_active())return;
+                // Only borrow already free intervals. In particular, never
+                // evict a whole fixed-size arena just to manufacture a loan.
+                fence_workspace_locked(device);
+                available=context->available_memory();
+                std::shared_ptr<DeviceImageArena> candidate;
+                if(const auto found=device_arenas_.find(device);found!=device_arenas_.end())
+                    for(const auto& arena:found->second)
+                        if(!candidate || arena->largest_available()>candidate->largest_available())candidate=arena;
+                const auto largest=candidate?candidate->largest_available():0;
+                const auto request=complete?mfq::cuda::routed_workspace_full_borrow_request(bytes,largest):
+                    mfq::cuda::routed_workspace_borrow_request(bytes,before,available,largest);
+                if(request)if(auto storage=candidate->allocate(request);storage.defined()) {
+                    if(complete && mfq::cuda::routed_workspace_region_bytes(storage.data_ptr(),storage.nbytes())<bytes)return;
+                    try {loan=PrefillLoan::begin(context,stream,std::move(storage));started=true;}
+                    catch(const mfq::cuda::Error& error) {
+                        // A suspended or fully occupied GGUF loan reports zero
+                        // available bytes but still owns Context's single slot.
+                        // Its existing owner remains untouched in this case.
+                        if(std::string_view(error.what())!="CUDA workspace loan is already active")throw;
+                    }
+                }
+            };
+            borrow(true);
+            // A single free interval can cover the complete additional working
+            // set. Otherwise keep full ordinary headroom; aggregate loan holes
+            // are deliberately never subtracted from that reserve.
+            const bool contiguous=context->workspace_largest_available(stream.stream())>=bytes;
+            if(!contiguous) {
+                reserve_workspace_locked(bytes,context,device);available=context->available_memory();
+                if(loan && available<bytes)
+                    throw MfqResourceExhausted("insufficient ordinary CUDA workspace for a nested prefill loan");
+                borrow(false);
+            }
+            const auto capacity=mfq::cuda::routed_saturating_add(
+                mfq::cuda::routed_saturating_add(device_used_locked(device),available),contiguous?bytes:0);
+            const auto token=++next_workspace_token_;
+            try {
+                workspace_limits_.emplace(token,WorkspaceReservation{device,capacity>bytes?capacity-bytes:0,bytes,
+                    stream,std::this_thread::get_id(),loan});
+            }catch(...) {if(started)loan->finish();throw;}
+            result={token,loan?loan->bytes():0};
+        });
+        return result;
+    }
+    void suspend_workspace(std::uint64_t token) {
+        admission_executor_->transition([&](auto& admission) {
+            join_admission(admission);
+            std::lock_guard<std::mutex> guard(mutex_);
+            const auto found=workspace_limits_.find(token);if(found==workspace_limits_.end())return;
+            if(found->second.thread!=std::this_thread::get_id())
+                throw std::logic_error("TQ workspace reservation belongs to another thread");
+            const MfqCudaGuard device(found->second.device);
+            const MfqCudaStreamGuard stream(found->second.stream);
+            if(const auto loan=found->second.loan) {
+                loan->suspend();
+                const auto context=mfq::cuda::default_context(found->second.device);
+                // The caller now clones persistent outputs out of the loan,
+                // as in GGUF. Cover every currently live loan byte so those
+                // copies do not depend on another borrowed interval.
+                auto copies=context->workspace_live_bytes();
+                for(const auto& [other,reservation]:workspace_limits_)
+                    if(other!=token && reservation.loan==loan)copies=std::max(copies,reservation.required);
+                reserve_workspace_locked(copies,context,found->second.device);
+                const auto available=context->available_memory();
+                if(available<copies)throw MfqResourceExhausted("insufficient ordinary CUDA workspace for prefill output copies");
+                const auto capacity=mfq::cuda::routed_saturating_add(device_used_locked(found->second.device),available);
+                const auto limit=capacity>copies?capacity-copies:0;
+                for(auto& [_,reservation]:workspace_limits_)if(reservation.loan==loan)
+                    reservation.limit=std::min(reservation.limit,limit);
+            }
+        });
+    }
+    void end_workspace(std::uint64_t token) {
+        admission_executor_->transition([&](auto& admission) {
+            join_admission(admission);
+            std::lock_guard<std::mutex> guard(mutex_);
+            const auto found=workspace_limits_.find(token);if(found==workspace_limits_.end())return;
+            const auto& reservation=found->second;
+            if(reservation.thread!=std::this_thread::get_id())
+                throw std::logic_error("TQ workspace reservation belongs to another thread");
+            if(const auto loan=reservation.loan) {
+                const bool shared=std::any_of(workspace_limits_.begin(),workspace_limits_.end(),[&](const auto& item) {
+                    return item.first!=token && item.second.loan==loan;
+                });
+                if(!shared) {
+                    const MfqCudaGuard device(reservation.device);
+                    const MfqCudaStreamGuard stream(reservation.stream);
+                    fence_workspace_locked(reservation.device);
+                    loan->finish(); // Preserve the token and owner if a tensor is still live.
+                }
+            }
+            workspace_limits_.erase(found);
+        });
+    }
+    void abandon_workspace(std::uint64_t token) noexcept {
+        std::shared_ptr<PrefillLoan> abandoned;
+        try {
+            std::lock_guard<std::mutex> guard(mutex_);
+            const auto found=workspace_limits_.find(token);if(found==workspace_limits_.end())return;
+            abandoned=std::move(found->second.loan);
+            workspace_limits_.erase(found);
+        }catch(...) {
+            std::fprintf(stderr,"TQ prefill reservation abandonment failed\n");
+        }
+        // Drop the owner outside the cache mutex. Other reservations retain
+        // their shared loan; the last owner retires Context's loan, whose
+        // backing remains alive until its final live tensor is released.
+    }
+    void finalize(std::size_t growth) {
+        const auto workspace=mfq::cuda::runtime_options::workspace_reserve_bytes();
+        const auto reserve=growth>SIZE_MAX-workspace?SIZE_MAX:growth+workspace;
+        reserve_workspace(reserve);
+        const auto device=mfq_current_cuda_device();
+        const auto available=mfq::cuda::default_context(device)->available_memory();
+        std::lock_guard lock(mutex_);
+        decode_reserves_[device]={growth,workspace};
+        decode_limits_[device]=std::max(device_used_locked(device),device_reserved_locked(device))+
+            (available>reserve?available-reserve:0);
+    }
+    void constrain_capture(std::size_t bytes) {
+        const auto device=mfq_current_cuda_device();
+        const auto available=mfq::cuda::default_context(device)->available_memory();
+        std::lock_guard lock(mutex_);
+        const auto capacity=std::max(device_used_locked(device),device_reserved_locked(device))+
+            (available>bytes?available-bytes:0);
+        decode_limits_[device]=std::min(device_limit_locked(device),capacity);
+    }
+    void restore_after_capture() {
+        std::size_t growth;std::optional<std::size_t> transient;
+        {std::lock_guard lock(mutex_);const auto saved=decode_reserves_[mfq_current_cuda_device()];
+         growth=saved.growth;transient=saved.transient;}
+        restore_decode(growth,transient);
+    }
+    void restore_decode(std::size_t growth,std::optional<std::size_t> transient) {
+        wait_admission();
+        const auto context=mfq::cuda::default_context(mfq_current_cuda_device());
+        context->reclaim_idle_memory();
+        {std::lock_guard lock(mutex_);retire_host_transfers_locked();}
+        context->reclaim_idle_memory();
+        const auto configured=std::getenv("TYLOINFER_CUDA_WORKSPACE_RESERVE_GIB")?
+            std::optional(mfq::cuda::runtime_options::workspace_reserve_bytes()):std::nullopt;
+        const auto reserve=mfq::cuda::routed_decode_workspace_reserve(growth,transient,configured);
+        reserve_workspace(reserve);
+        const auto available=context->available_memory();
+        const auto upload=transfer_stream(mfq_current_cuda_device());
+        std::unique_lock<std::mutex> guard(mutex_);
+        if(replay_readers_[mfq_current_cuda_device()])
+            throw MfqResourceExhausted("expert workspace cannot restore during an active decode window");
+        decode_reserves_[mfq_current_cuda_device()]={growth,transient};
+        // The requested cache ceiling remains unchanged. Admission follows
+        // current physical headroom after KV and decode workspaces are priced.
+        const auto device=mfq_current_cuda_device();
+        std::size_t reusable=0;
+        for(const auto& [key,entry]:device_)if(key.device==device) {
+            reusable=mfq::cuda::routed_reusable_pool_bytes(entry.weight.image.data_ptr());break;
+        }
+        decode_limits_[device]=mfq::cuda::routed_cache_capacity(
+            std::max(device_used_locked(device),device_reserved_locked(device)),reusable,available,reserve);
+        const auto limit=device_limit_locked();
+        while(device_used_locked(device)>limit)if(!evict_oldest_device_locked(device))break;
+        while(device_reserved_locked(device)>limit)if(!evict_device_arena_locked(device))break;
+        release_empty_device_arenas_locked(device);
+        auto& policy=routes_[device];
+        if(policy.seeded) {
+            CpuTimer timer(profile_?&route_policy_ms_:nullptr);
+            policy.select(limit,[&](auto source){return source_info_.at(source).experts;});
+            refresh_device_priority_locked(device);
+        }
+        auto reserved=device_reserved_locked(device);
+        const MfqCudaStreamGuard stream(upload);
+        const mfq::cuda::RoutedWeightAllocationScope allocation;
+        while(reserved<limit) {
+            const auto bytes=std::min<std::size_t>(std::size_t(64)<<20,limit-reserved);
+            try {device_arenas_[device].push_back(std::make_shared<DeviceImageArena>(bytes,device));}
+            catch(const MfqResourceExhausted&){break;}
+            reserved+=bytes;
+        }
+        guard.unlock();queue_admission(device,mfq::cuda::RoutedImageUse::Restore);wait_admission();
     }
     void resize(std::size_t bytes) {
-        std::lock_guard<std::mutex> guard(mutex_);
-        retain_all_=false;
-        device_limit_=bytes;
-        while(device_used_>bytes && !device_recent_.empty()) {
-            const auto key=device_recent_.back();device_recent_.pop_back();
-            device_used_-=device_.at(key).weight.image.nbytes();device_.erase(key);++device_evictions_;
-        }
+        admission_executor_->transition([&](auto& admission) {
+            join_admission(admission);
+            std::lock_guard<std::mutex> guard(mutex_);
+            for(const auto& [_,readers]:replay_readers_)if(readers)
+                throw MfqResourceExhausted("expert cache cannot resize during an active decode window");
+            retain_all_=false;
+            device_limit_=bytes;
+            for(const auto& [device,_]:device_arenas_)
+                while(device_used_locked(device)>bytes && evict_oldest_device_locked(device)) {}
+            settle_host_transfers_locked();
+            for(const auto& [device,_]:device_arenas_) {
+                while(device_reserved_locked(device)>bytes)
+                    if(!evict_device_arena_locked(device))break;
+                release_empty_device_arenas_locked(device);
+            }
+        });
     }
     std::size_t reclaim_host(std::size_t bytes) {
         std::lock_guard<std::mutex> guard(mutex_);
         return reclaim_host_locked(bytes);
     }
+    void resize_host(std::size_t bytes) {
+        std::lock_guard lock(mutex_);
+        const bool ordinary=host_limit_==ordinary_host_limit_;
+        ordinary_host_limit_=bytes;host_limit_=ordinary?bytes:std::min(host_limit_,bytes);
+        const auto allocated=host_allocated_locked();
+        if(allocated>bytes)(void)reclaim_host_locked(allocated-bytes);
+    }
+    std::size_t reclaim_duplicates(std::size_t bytes) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        return reclaim_host_locked(bytes,true);
+    }
     std::size_t reserve_host(std::size_t bytes) {
         std::lock_guard<std::mutex> guard(mutex_);return reserve_host_locked(bytes);
     }
+    std::size_t share_host(std::size_t bytes) {
+        const auto released=bytes?reserve_host(bytes):0;
+        std::lock_guard guard(mutex_);
+        host_limit_=mfq::cuda::routed_shared_host_limit(ordinary_host_limit_,host_used_,
+            available_host_bytes(process_host_limit_),bytes);
+        return released;
+    }
     std::uint64_t streamed_bytes() {
         std::lock_guard<std::mutex> guard(mutex_); return transfer_bytes_;
+    }
+    std::array<double,2> transfer_timings() {
+        std::lock_guard lock(mutex_);return {fetch_ms_,upload_submit_ms_};
     }
     std::vector<std::pair<std::string,double>> memory_metrics() {
         std::lock_guard<std::mutex> guard(mutex_);
@@ -1097,31 +2432,132 @@ public:
             if(covered_images.insert(key.image).second)covered+=entry.source_bytes;
         for(const auto& [key,entry]:host_)
             if(covered_images.insert(key).second)covered+=entry.image->source_bytes;
-        for(const auto& [_,arenas]:stages_)for(const auto& stage:arenas.stages)
+        for(const auto& [_,streams]:stages_)for(const auto& [stream,arenas]:streams)for(const auto& stage:arenas.stages)
             if(stage)staging+=stage->host.size();
         const auto cold=payload_bytes_>covered?payload_bytes_-covered:0;
         const auto misses=calls_-gpu_hits_;
-        return {{"resident_expert_cache_bytes",double(device_used_)},
-            {"expert_cache_budget_bytes",double(retain_all_?std::max(payload_bytes_,device_used_):device_limit_)},
+        std::vector<std::pair<std::string,double>> result{{"resident_expert_cache_bytes",double(device_used_)},
+            {"expert_complete_slot_reuses",double(expert_slot_reuses_)},
+            {"expert_cache_allocation_reuses",double(device_reuses_)},
+            {"expert_cache_reserved_bytes",double([&]{std::size_t sum=0;for(const auto& [device,_]:device_arenas_)sum+=device_reserved_locked(device);return sum;}())},
+            {"expert_cache_budget_bytes",double([&] {
+                if(routes_.empty())return device_limit_locked();
+                std::size_t sum=0;for(const auto& [device,_]:routes_)sum+=device_limit_locked(device);return sum;
+            }())},
+            {"expert_cache_configured_budget_bytes",double(retain_all_?std::max(resident_bytes_bound_,device_used_):device_limit_)},
+            {"tq_predictor_resident_expert_bytes",double(predictor_resident_bytes_)},
             {"ram_expert_enabled",host_used_?1.0:0.0},
             {"ram_expert_payload_bytes",double(host_used_)},
+            {"ram_expert_duplicate_bytes",double([&]{std::size_t sum=0;for(const auto key:host_duplicates_)sum+=host_.at(key).image->size();return sum;}())},
             {"ram_expert_cache_budget_bytes",double(host_limit_)},
+            {"ram_expert_cache_allocated_bytes",double(host_allocated_locked())},
+            {"ram_expert_pageable_payload_bytes",double(host_pageable_)},
+            {"ram_expert_compacted_bytes",double(host_compacted_bytes_)},
+            {"ram_expert_trimmed_pinned_bytes",double(host_trimmed_bytes_)},
+            {"ram_expert_evacuated_to_vram_bytes",double(host_evacuated_bytes_)},
+            {"ram_expert_evacuated_to_vram_images",double(host_evacuated_images_)},
+            {"ram_expert_pinned_fragment_retries",double(pin_fragment_retries_)},
+            {"ram_expert_pinned_interval_compactions",double(pin_interval_compactions_)},
+            {"ram_expert_pinned_fragment_reuses",double(pin_fragment_reuses_)},
+            {"ram_expert_pinned_reserved_bytes",double(host_reserved_)},
             {"ram_expert_pcie_read_bytes",double(transfer_bytes_)},
             {"ram_expert_direct_pcie_read_bytes",double(direct_transfer_bytes_)},
             {"ram_expert_cache_hits",double(host_hits_)},
+            {"expert_native_dma_batches",double(native_batches_)},
+            {"expert_upload_groups",double(upload_groups_)},{"expert_transfer_retire_queries",double(retirement_queries_)},
+            {"ram_expert_writeback_bytes",double(writeback_bytes_)},
+            {"ram_expert_unpinned_copy_bytes",double(unpinned_bytes_)},
+            {"expert_admission_pending_routes",double([&]{std::uint64_t n=0;for(const auto& route:speculative_routes_)
+                for(const auto& touch:route.touches)n+=3*touch.uses;return n;}())},
+            {"expert_admission_observations",double([&]{std::uint64_t n=0;for(const auto& [_,policy]:routes_)n+=policy.observations;return n;}())},
+            {"expert_admission_retained_images",double([&]{std::size_t n=0;for(const auto& [_,policy]:routes_)n+=policy.usage.retained_images();return n;}())},
+            {"expert_admission_resident_images",double([&]{std::size_t n=0;for(const auto& [_,policy]:routes_)n+=policy.usage.retained_resident_images();return n;}())},
+            {"expert_decode_calls",double(decode_calls_)},{"expert_decode_hits",double(decode_hits_)},
+            {"expert_decode_pcie_read_bytes",double(decode_transfer_)},
+            {"expert_admission_pcie_read_bytes",double(admission_transfer_)},
+            {"expert_restore_pcie_read_bytes",double(restore_transfer_)},
+            {"expert_background_admission_pcie_read_bytes",double(admission_transfer_-restore_transfer_)},
+            {"expert_decode_metadata_bytes",double(decode_metadata_bytes_)},
+            {"expert_decode_metadata_updates",double(decode_metadata_updates_)},
+            {"expert_decode_resident_bypasses",double(decode_resident_bypasses_)},
+            {"expert_decode_metadata_submit_ms",decode_metadata_submit_ms_},
+            {"expert_decode_resident_touch_ms",decode_resident_touch_ms_},
+            {"expert_decode_admission_wait_ms",decode_admission_wait_ms_},
+            {"expert_admission_independent_lanes",double([&] {
+                std::size_t count=0;
+                for(const auto& [device,stream]:admission_streams_)
+                    if(const auto found=transfer_streams_.find(device);found!=transfer_streams_.end() &&
+                            found->second.stream()!=stream.stream())++count;
+                return count;
+            }())},
+            {"expert_decode_source_read_bytes",double(decode_source_)},
+            {"expert_decode_writeback_bytes",double(decode_writeback_)},
+            {"expert_decode_host_get_rows_ms",decode_get_rows_ms_},
+            {"expert_decode_host_fetch_ms",decode_fetch_ms_},
+            {"expert_decode_cpu_stage_copy_ms",decode_copy_ms_},
+            {"expert_decode_cpu_stage_wait_ms",decode_stage_wait_ms_},
+            {"expert_decode_host_allocation_ms",decode_allocation_ms_},
+            {"expert_decode_host_upload_submit_ms",decode_submit_ms_},
+            {"expert_decode_host_repin_ms",decode_repin_ms_},
+            {"expert_decode_arena_recycles",double(decode_arena_recycles_)},
+            {"expert_decode_retained_evictions",double(decode_retained_evictions_)},
+            {"expert_admission_retained_route_mass",[&]{double n=0;for(const auto& [_,p]:routes_)n+=p.usage.retained_route_mass().first;return n;}()},
+            {"expert_admission_total_route_mass",[&]{double n=0;for(const auto& [_,p]:routes_)n+=p.usage.retained_route_mass().second;return n;}()},
             {"ram_expert_cache_misses",double(misses-host_hits_)},
             {"ram_expert_cache_evictions",double(host_evictions_)},
             {"ssd_expert_enabled",cold?1.0:0.0},
             {"ssd_expert_payload_bytes",double(cold)},
             {"ssd_expert_bytes_read",double(source_bytes_)},
             {"ssd_expert_read_count",double(source_reads_)},
+            {"expert_source_read_batches",double(source_batches_)},
             {"expert_logical_transfer_bytes",double(transfer_bytes_)},
             {"expert_host_fetch_ms",fetch_ms_},{"expert_host_copy_ms",upload_submit_ms_},
+            {"expert_batched_upload_packets",double(staged_packets_)},
+            {"expert_batched_cpu_copy_ms",stage_copy_ms_},{"expert_batched_stage_wait_ms",stage_wait_ms_},
+            {"expert_cache_get_rows_ms",get_rows_ms_},{"expert_allocation_ms",allocation_ms_},
+            {"expert_route_policy_ms",route_policy_ms_},
+            {"expert_host_register_ms",registration_ms_},{"expert_source_prepare_ms",source_prepare_ms_},
+            {"expert_source_slice_ms",source_slice_ms_},{"expert_host_admission_ms",host_admission_ms_},
+            {"expert_host_pack_ms",host_pack_ms_},
+            {"expert_host_pin_reuse_ms",pin_reuse_ms_},{"expert_host_unpin_copy_ms",unpin_copy_ms_},
+            {"expert_host_image_pack_ms",image_pack_ms_},{"expert_host_pageable_repin_ms",pageable_repin_ms_},
+            {"expert_host_unpin_allocate_ms",unpin_allocate_ms_},{"expert_host_unpin_memcpy_ms",unpin_memcpy_ms_},
+            {"expert_host_unpin_release_ms",unpin_release_ms_},
+            {"ram_expert_pageable_capacity_bytes",double([&]{std::size_t sum=0;for(const auto& [_,entry]:host_)sum+=entry.image->pageable_capacity();return sum;}())},
             {"expert_decode_transfer_bytes",double(staging)},
             {"expert_cache_hits",double(gpu_hits_)},
             {"expert_cache_misses",double(misses)},
             {"expert_cache_evictions",double(device_evictions_)},
             {"host_tensor_bytes",double(mfq::cuda::tensor_host_bytes.load())}};
+        if(profile_) {
+            const auto policy_sum=[&](auto value) {
+                double sum=0;for(const auto& [_,policy]:routes_)sum+=value(policy);return sum;
+            };
+            result.emplace_back("expert_admission_selected_bytes",policy_sum([](const auto& p){return p.usage.retained_bytes();}));
+            result.emplace_back("expert_admission_measured_selected_bytes",policy_sum([](const auto& p){return p.usage.measured_retained_bytes();}));
+            result.emplace_back("expert_replacement_pairs",policy_sum([](const auto& p){return p.replacement_pairs;}));
+            result.emplace_back("expert_replacement_approved",policy_sum([](const auto& p){return p.replacement_approved;}));
+            result.emplace_back("expert_replacement_budget_rejected",policy_sum([](const auto& p){return p.replacement_budget_rejected;}));
+            result.emplace_back("expert_replacement_leased",policy_sum([](const auto& p){return p.replacement_leased;}));
+            result.emplace_back("expert_replacement_resized",policy_sum([](const auto& p){return p.replacement_resized;}));
+            result.emplace_back("expert_replacement_missing_slots",policy_sum([](const auto& p){return p.replacement_missing_slots;}));
+            result.emplace_back("expert_replacement_heat_rejected",policy_sum([](const auto& p){return p.replacement_heat_rejected;}));
+            result.emplace_back("expert_replacement_multi_victim",policy_sum([](const auto& p){return p.replacement_multi_victim;}));
+            result.emplace_back("expert_admission_unretained_mass_below_one",policy_sum([](const auto& p){return p.usage.unretained_route_mass_below(1.f);}));
+            result.emplace_back("expert_admission_unretained_mass_below_two",policy_sum([](const auto& p){return p.usage.unretained_route_mass_below(2.f);}));
+            double ranked_mass=0;std::size_t ranked_images=0;
+            double stable_mass=0;
+            for(const auto& [device,policy]:routes_) {
+                auto ranked=policy.usage;ranked.select(device_limit_locked(device),0,&policy.banks);
+                ranked_mass+=ranked.retained_route_mass().first;ranked_images+=ranked.retained_images();
+                ranked=policy.usage;ranked.select(device_limit_locked(device),mfq::cuda::expert_replacement_margin,&policy.banks);
+                stable_mass+=ranked.retained_route_mass().first;
+            }
+            result.emplace_back("expert_admission_global_rank_route_mass",ranked_mass);
+            result.emplace_back("expert_admission_global_rank_images",double(ranked_images));
+            result.emplace_back("expert_admission_stable_global_rank_route_mass",stable_mass);
+        }
+        return result;
     }
     std::vector<std::int64_t> read_routes(const tb::Tensor& ids) {
         const auto source=ids.contiguous();
@@ -1179,9 +2615,16 @@ public:
         return result;
     }
     tb::Tensor projection_table(std::uint64_t source,std::int64_t experts,
-            const std::int64_t* ids,const std::vector<TqWeight>& weights,int device) {
+            const std::int64_t* ids,const std::vector<TqWeight>& weights,int device,cudaStream_t consumer=nullptr) {
         std::lock_guard<std::mutex> guard(mutex_);
-        const auto stream=mfq_current_cuda_stream();
+        const auto stream=consumer?consumer:mfq_current_cuda_stream();
+        if(const auto& permanent=source_info_.at(source).resident) {
+            if(permanent->packed.get_device()!=device || permanent->experts.size()!=std::size_t(experts))
+                throw std::invalid_argument("TQ permanent projection table mismatch");
+            permanent->packed.record_stream(reinterpret_cast<std::uintptr_t>(stream));
+            permanent->views.record_stream(reinterpret_cast<std::uintptr_t>(stream));
+            return permanent->views;
+        }
         auto& tables=view_tables_[source];
         auto found=std::find_if(tables.begin(),tables.end(),[&](const ViewTable& table) {
             return table.device==device && table.stream==stream;
@@ -1205,129 +2648,491 @@ public:
         }
         // One small DMA for changed metadata, no per-expert transfers and no
         // host synchronization. Resident hits submit no metadata work at all.
-        if(changed)try {upload(found->views,found->bytes);}
+        if(changed)try {
+            upload(found->views,found->bytes);
+            decode_metadata_bytes_+=found->bytes.size();++decode_metadata_updates_;
+        }
         catch(...) {std::fill(found->images.begin(),found->images.end(),0);throw;}
         return found->views;
     }
     std::vector<TqWeight> get_rows(std::uint64_t source,const std::int64_t* ids,std::size_t count,
-            const TqRowTable& table,std::int64_t out,int device) {
+            const TqRowTable& table,std::int64_t out,int device,DeviceImageArena* workspace=nullptr,
+            mfq::cuda::RoutedImageUse use=mfq::cuda::RoutedImageUse::Eager,
+            UploadBatch* batch=nullptr,TqPrefillWeightStage* prefill=nullptr) {
+        const bool decode_replay=use==mfq::cuda::RoutedImageUse::Decode;
         const MfqCudaGuard device_guard(device);
+        const auto consumer=mfq_get_current_cuda_stream(device);
+        const auto stream=use==mfq::cuda::RoutedImageUse::Admission || use==mfq::cuda::RoutedImageUse::Restore?
+            admission_stream(device):transfer_stream(device);
+        const MfqCudaStreamGuard upload_guard(stream);
         std::lock_guard<std::mutex> guard(mutex_);
+        const mfq::cuda::RoutedHostEvacuationBlock block_evacuation(host_evacuation_blocked_);
+        if(const auto& permanent=source_info_.at(source).resident) {
+            if(permanent->packed.get_device()!=device)
+                throw std::invalid_argument("TQ permanent resident expert device mismatch");
+            std::vector<TqWeight> result;result.reserve(count);
+            for(std::size_t index=0;index<count;++index) {
+                if(ids[index]<0 || std::uint64_t(ids[index])>=permanent->experts.size())
+                    throw std::out_of_range("TQ routed expert ID is out of bounds");
+                result.push_back(permanent->experts[ids[index]]);
+            }
+            permanent->packed.record_stream(reinterpret_cast<std::uintptr_t>(consumer.stream()));
+            return result;
+        }
+        const std::array<std::uint64_t,5> before{calls_,gpu_hits_,transfer_bytes_,source_bytes_,writeback_bytes_};
+        const auto decode_started=profile_ && decode_replay?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
+        const std::array<double,6> cpu_before{fetch_ms_,stage_copy_ms_,stage_wait_ms_,allocation_ms_,upload_submit_ms_,pageable_repin_ms_};
+        const auto arena_before=arena_recycles_,retained_before=retained_evictions_;
+        CpuTimer total_timer(profile_?&get_rows_ms_:nullptr);
         const auto resources=tq_gemm_resources(device);
         gemm_.try_emplace(device,resources);
         std::vector<TqWeight> result;result.reserve(count);
-        const auto stream=mfq_get_current_cuda_stream(device);
-        std::shared_ptr<mfq::cuda::Event> uploaded;
-        for(auto it=host_transfers_.begin();it!=host_transfers_.end();)
-            if(it->ready->ready())it=host_transfers_.erase(it);else ++it;
+        std::vector<mfq::cuda::DmaCopy> copies;copies.reserve(count);
+        std::vector<CUdeviceptr> aliases;aliases.reserve(count);
+        std::array<Stage*,2> queued_stages{};
+        std::size_t queued_stage_count=0;
+        std::vector<DeviceKey> admitted;admitted.reserve(count);
+        std::shared_ptr<std::atomic<bool>> submitted=batch?batch->submitted:nullptr;
+        std::shared_ptr<std::atomic<bool>> recorded=batch?batch->recorded:nullptr;
+        auto position=batch?batch->position:std::shared_ptr<mfq::cuda::RoutedCompletionPosition>{};
+        const auto submit_copies=[&] {
+            if(copies.empty())return;
+            // Prepare the following bank while this bank's DMA is in flight.
+            std::size_t index=0;
+            try {
+                // Mark possible DMA before submitting: a partial failure must
+                // retain its CPU sources until the stream has been joined.
+                if(submitted)submitted->store(true,std::memory_order_release);
+                if(mfq::cuda::submit_routed_transfers(copies,stream.stream(),mfq::cuda::routed_dma_mode(),
+                        [&](const void*,std::size_t){return aliases[index++];}))++native_batches_;
+                for(std::size_t i=0;i<queued_stage_count;++i) {
+                    auto* stage=queued_stages[i];
+                    stage->uploaded.record(stream.stream());stage->pending=true;
+                }
+                if(queued_stage_count)++staged_packets_;
+            }catch(...) {
+                copies.clear();aliases.clear();queued_stage_count=0;
+                (void)cudaStreamSynchronize(stream.stream());throw;
+            }
+            copies.clear();aliases.clear();queued_stage_count=0;
+        };
+        const char* trace_source=std::getenv("TYLOINFER_TQ_TRACE_ROWS");
+        const bool trace=trace_source && (std::strcmp(trace_source,"all")==0 ||
+            (decode_replay && std::strcmp(trace_source,"decode")==0) || std::strtoull(trace_source,nullptr,10)==source);
+        const auto trace_step=[&](const char* step,std::uint32_t expert=0) {
+            if(trace){std::fprintf(stderr,"tq_rows source=%llu expert=%u step=%s\n",
+                static_cast<unsigned long long>(source),expert,step);std::fflush(stderr);}
+        };
+        trace_step("entered");
+        std::shared_ptr<mfq::cuda::Event> uploaded=batch?batch->ready:nullptr;
+        retire_host_transfers_locked();trace_step("retired");
+        std::vector<std::int64_t> missing;
+        std::unordered_map<std::uint32_t,std::size_t> source_images;
+        for(std::size_t index=0;index<count;++index) {
+            if(ids[index]<0 || std::uint64_t(ids[index])>=table.rows()/std::uint64_t(out))
+                throw std::out_of_range("TQ routed expert ID is out of bounds");
+            const auto expert=static_cast<std::uint32_t>(ids[index]);
+            const auto key=(source<<32)|expert;
+            if(!device_.count({key,device}) && !host_.count(key) && !staged_host_jobs_.count(key)) {
+                const auto [_,inserted]=source_images.try_emplace(expert,missing.size());
+                if(inserted)missing.push_back(expert);
+            }
+        }
+        std::size_t source_bound=0,largest_source=0;
+        for(const auto expert:missing) {
+            const auto bytes=table.expert_image_bytes(std::uint64_t(expert),out);
+            source_bound=mfq::cuda::routed_saturating_add(source_bound,bytes);largest_source=std::max(largest_source,bytes);
+        }
+        const auto source_peak=mfq::cuda::routed_saturating_add(source_bound,largest_source);
+        const bool batch_source=missing.size()>1 && source_peak<=available_host_bytes(process_host_limit_);
+        auto prefetched=batch_source?table.slice_experts(missing,std::uint64_t(out)):
+            std::vector<std::vector<std::uint8_t>>{};
+        std::vector<std::shared_ptr<HostImage>> prepared_images(missing.size());
+        if(!prefetched.empty())++source_batches_;
         auto transfer=host_transfers_.end();
-        std::unordered_set<cudaEvent_t> waited;
         try {
         for(std::size_t index=0;index<count;++index) {
-        const auto expert=static_cast<std::uint32_t>(ids[index]);
+        const auto expert=static_cast<std::uint32_t>(ids[index]);trace_step("lookup",expert);
         const auto key=(source<<32)|expert;
         const DeviceKey device_key{key,device};
+        const auto staged=staged_host_jobs_.find(key);
         ++calls_;
         const auto resident=device_.find(device_key);
         if(resident!=device_.end()) {
-            if(resident->second.producer!=stream.stream()) {
-                const auto event=resident->second.uploaded->get();
-                if(waited.insert(event).second)TYLOINFER_CUDA_CHECK(cudaStreamWaitEvent(stream.stream(),event,0));
-                resident->second.weight.gemm->retain(stream);
-                mfq_cuda_record_stream(resident->second.weight.image,stream);
+            if(staged!=staged_host_jobs_.end()) {
+                prefill_host_stager_->skip(staged->second);prefill_host_stager_->pass(staged->second+1);
             }
             device_recent_.splice(device_recent_.begin(),device_recent_,resident->second.recent);
+            if(resident->second.cold) {
+                auto& cold=routes_.at(device).cold;cold.splice(cold.begin(),cold,*resident->second.cold);
+            }
             ++gpu_hits_;result.push_back(resident->second.weight);
             if((calls_&4095)==0)report();
             continue;
         }
+        trace_step("fetch",expert);
         const auto fetch_started=std::chrono::steady_clock::now();
         std::shared_ptr<HostImage> image;
         const auto cached=host_.find(key);
-        if(cached!=host_.end()) {
+        if(staged!=staged_host_jobs_.end()) {
+            // The prepared copy owns these exact bytes. Repinning would free
+            // a pageable source while its background memcpy is still active.
+            image=std::static_pointer_cast<HostImage>(prefill_host_stager_->jobs[staged->second].owner);
+            ++host_hits_;if(cached!=host_.end())mark_host_duplicate_locked(key);
+        }else if(cached!=host_.end()) {
             host_recent_.splice(host_recent_.begin(),host_recent_,cached->second.recent);
-            image=cached->second.image;++host_hits_;
-            if(resources->host_register() && !image->pin_attempted) {
-                if(auto registration=mfq::cuda::try_host_registration();registration.owns_lock()) {
-                    image->try_pin();++pin_attempts_;
-                    if(!image->registered)++pin_failures_;
-                }
+            image=cached->second.image;++host_hits_;mark_host_duplicate_locked(key);
+            if(resources->host_register() && !image->pinned()) {
+                CpuTimer timer(profile_?&pageable_repin_ms_:nullptr);
+                image->pin(reuse_free_pinned(image->size()));
+                if(image->pinned())mark_host_duplicate_locked(key);
             }
+        } else if(const auto prepared=source_images.find(expert);
+                prepared!=source_images.end() && prepared_images[prepared->second]) {
+            image=prepared_images[prepared->second];++host_hits_;
         } else {
-            auto wire=table.slice_rows(std::uint64_t(expert)*out,std::uint64_t(expert+1)*out);
+            CpuTimer source_timer(profile_?&source_prepare_ms_:nullptr);
+            auto wire=[&] {
+                CpuTimer timer(profile_?&source_slice_ms_:nullptr);
+                if(!prefetched.empty())return std::move(prefetched.at(source_images.at(expert)));
+                return table.slice_rows(std::uint64_t(expert)*out,std::uint64_t(expert+1)*out);
+            }();
             // Only source misses allocate new host images. Reclaim optional
             // images against current RAM/commit headroom before packing one;
             // GPU hits and ordinary RAM streaming do not poll process memory.
-            reserve_host_locked(wire.size());
-            const bool admit=available_host_bytes(process_host_limit_)>=wire.size();
-            source_bytes_+=wire.size();++source_reads_;image=HostImage::create(wire);
-            while(host_used_+image->bytes.size()>host_limit_ && !host_recent_.empty()) {
-                const auto old=host_recent_.back();host_recent_.pop_back();
-                host_used_-=host_.at(old).image->bytes.size();host_.erase(old);++host_evictions_;
+            const bool admit=[&] {
+                CpuTimer timer(profile_?&host_admission_ms_:nullptr);
+                reserve_host_locked(wire.size());
+                return available_host_bytes(process_host_limit_)>=wire.size();
+            }();
+            source_bytes_+=wire.size();++source_reads_;
+            {
+                CpuTimer timer(profile_?&host_pack_ms_:nullptr);
+                const mfq::TqLayout layout(wire.data(),wire.size());
+                const auto bytes=((layout.packed+3)&~std::size_t(3))+layout.packed_bytes+32;
+                if(admit)admit_host_space_locked(bytes);
+                auto block=admit && resources->host_register()?allocate_pinned(bytes):nullptr;
+                CpuTimer image_timer(profile_?&image_pack_ms_:nullptr);
+                image=HostImage::create(std::move(wire),std::move(block));
             }
-            if(admit && image->bytes.size()<=host_limit_) {
-                host_recent_.push_front(key);host_.emplace(key,HostEntry{image,host_recent_.begin()});host_used_+=image->bytes.size();
+            if(const auto prepared=source_images.find(expert);prepared!=source_images.end())
+                prepared_images[prepared->second]=image;
+            if(admit && image->size()<=host_limit_) {
+                insert_host_locked(key,image);
             }
         }
+        if(image->ready && image->producer!=stream.stream())
+            TYLOINFER_CUDA_CHECK(cudaStreamWaitEvent(stream.stream(),image->ready->get(),0));
         fetch_ms_+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-fetch_started).count();
-        const auto needed=image->bytes.size();
-        while(!retain_all_ && device_used_+needed>device_limit_ && !device_recent_.empty()) {
-            const auto old=device_recent_.back();device_recent_.pop_back();
-            device_used_-=device_.at(old).weight.image.numel();device_.erase(old);++device_evictions_;
+        trace_step("allocate",expert);
+        const auto needed=(image->size()+15)&~std::size_t(15);
+        auto& policy=routes_[device];policy.usage.image(key,needed);
+        // Captured consumers use an immutable resident epoch. Cache admission
+        // runs after the complete window, on the common admission executor.
+        // Prompt misses belong to the bounded, fenced prefill stages. As in
+        // GGUF, only reuse existing residents here; admission follows prefill.
+        bool cacheable=!prefill && !replay_readers_[device] && (!policy.ready || policy.usage.retained(key));
+        DeviceImageArena* owning_arena=nullptr;
+        std::optional<std::uint64_t> expert_group;
+        auto weight=[&] {
+        CpuTimer allocation_timer(profile_?&allocation_ms_:nullptr);
+        const auto limit=device_limit_locked();
+        cacheable=cacheable && needed<=limit;
+        tb::Tensor storage;
+        if(cacheable)if(const auto* banks=policy.banks.find(source)) {
+            const DeviceKey group{((*banks)[0]<<32)|expert,device};
+            auto slot=expert_slots_.find(group);
+            if(slot==expert_slots_.end() && policy.ready) {
+                std::array<std::size_t,3> sizes{};
+                bool partial=false;
+                for(unsigned role=0;role<3;++role) {
+                    const auto& info=source_info_.at((*banks)[role]);
+                    sizes[role]=info.table->expert_image_bytes(expert,info.rows);
+                    partial|=device_.count(DeviceKey{((*banks)[role]<<32)|expert,device})!=0;
+                }
+                if(!partial) {
+                    const mfq::cuda::RoutedExpertImageLayout layout(*banks,sizes);
+                    if(layout.bytes>limit)cacheable=false;
+                    while(cacheable && layout.bytes>limit-std::min(limit,device_used_locked(device)))
+                        if(!evict_oldest_device_locked(device))break;
+                    if(cacheable) {
+                        const mfq::cuda::RoutedWeightAllocationScope allocation;
+                        auto image=allocate_device_image(layout.bytes,device,limit,cacheable,owning_arena,nullptr,false);
+                        if(image.defined()) {
+                            slot=expert_slots_.emplace(group,ExpertSlot{std::move(image),owning_arena,layout}).first;
+                            pending_expert_bytes_[device]+=layout.bytes;
+                        }
+                    }
+                }
+            }
+            if(slot!=expert_slots_.end()) {
+                const auto role=std::find(banks->begin(),banks->end(),source)-banks->begin();
+                if(needed!=slot->second.layout.sizes[role])throw std::logic_error("TQ expert slot byte count differs");
+                storage=slot->second.image.narrow(0,slot->second.layout.offsets[role],needed);
+                owning_arena=slot->second.arena;expert_group=group.image;
+            }
         }
-        auto storage=tb::empty({static_cast<std::int64_t>(needed)},tb::TensorOptions().device(tb::Device(tb::kCUDA,device)).dtype(tb::kUInt8));
-        auto weight=tq_view(std::move(storage),image->layout,table.width());
-        if(image->registered) {
-            if(!uploaded)uploaded=std::make_shared<mfq::cuda::Event>(cudaEventDisableTiming);
+        // Return the old interval to the arena, which splits the next image
+        // to its actual size. Reusing an oversized tensor wholesale steadily
+        // inflates cache entries and requires a linear search for each miss.
+        while(!storage.defined() && cacheable && needed>limit-std::min(limit,device_used_locked(device)))
+            if(!evict_oldest_device_locked(device))break;
+        trace_step("evicted",expert);
+        const mfq::cuda::RoutedWeightAllocationScope allocation;
+        if(!storage.defined())storage=!cacheable && prefill?prefill->allocate(needed):
+            allocate_device_image(needed,device,limit,cacheable,owning_arena,workspace);
+        trace_step("allocated",expert);
+        auto result=tq_view(std::move(storage),image->layout,table.width());
+        result.allocation_stream=stream;return result;
+        }();
+        trace_step("upload",expert);
+        if(staged!=staged_host_jobs_.end()) {
+            submit_copies();
+            const std::uint8_t* prepared;
+            {CpuTimer timer(profile_?&stage_wait_ms_:nullptr);prepared=prefill_host_stager_->wait(staged->second);}
+            TYLOINFER_CUDA_CHECK(cudaMemcpyAsync(weight.image.data_ptr(),prepared,image->size(),
+                cudaMemcpyHostToDevice,stream.stream()));
+            prefill_host_stager_->issued_one(staged->second,stream.stream());
+            transfer_bytes_+=image->size();
+        }else if(image->pinned()) {
+            trace_step("direct_event",expert);
+            if(!uploaded) {
+                uploaded=completion_events_.at(device,stream.stream());
+                if(batch)batch->ready=uploaded;
+            }
             if(transfer==host_transfers_.end()) {
-                host_transfers_.emplace_back();transfer=std::prev(host_transfers_.end());transfer->ready=uploaded;
+                if(!submitted)submitted=std::make_shared<std::atomic<bool>>(false);
+                if(!recorded)recorded=std::make_shared<std::atomic<bool>>(false);
+                if(!position)position=std::make_shared<mfq::cuda::RoutedCompletionPosition>();
+                host_transfers_.emplace_back();transfer=std::prev(host_transfers_.end());
+                transfer->producer=stream;transfer->ready=uploaded;
+                transfer->submitted=submitted;transfer->recorded=recorded;
+                transfer->position=position;
             }
             // A host-cache eviction must not unpin a source still consumed
             // by asynchronous DMA. One event retains the whole call's images.
-            transfer->images.push_back(image);
+            transfer->images.push_back(image);transfer->destinations.push_back(weight.image);
             const auto started=std::chrono::steady_clock::now();
-            TYLOINFER_CUDA_CHECK(cudaMemcpyAsync(weight.image.data_ptr(),image->bytes.data(),image->bytes.size(),
-                cudaMemcpyHostToDevice,stream.stream()));
-            transfer_bytes_+=image->bytes.size();direct_transfer_bytes_+=image->bytes.size();
+            trace_step("direct_copy",expert);
+            copies.push_back({weight.image.data_ptr(),image->data(),image->size()});
+            aliases.push_back(reinterpret_cast<CUdeviceptr>(image->mapped_data(device)));
+            transfer_bytes_+=image->size();direct_transfer_bytes_+=image->size();
             upload_submit_ms_+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count();
-        }else upload(weight.image,image->bytes);
-        if(retain_all_ || weight.image.numel()<=device_limit_) {
-            if(!uploaded)uploaded=std::make_shared<mfq::cuda::Event>(cudaEventDisableTiming);
-            device_recent_.push_front(device_key);
-            device_.emplace(device_key,DeviceEntry{weight,device_recent_.begin(),uploaded,stream.stream(),image->source_bytes});
-            device_used_+=weight.image.numel();
+        }else {
+            trace_step("staged_copy",expert);
+            stage_upload(weight.image,*image,
+                [&](const mfq::cuda::DmaCopy& copy,CUdeviceptr alias,Stage* stage) {
+                    copies.push_back(copy);aliases.push_back(alias);
+                    const auto end=queued_stages.begin()+queued_stage_count;
+                    if(std::find(queued_stages.begin(),end,stage)==end) {
+                        if(queued_stage_count==queued_stages.size())
+                            throw std::logic_error("TQ DMA packet exceeded its staging ring");
+                        queued_stages[queued_stage_count++]=stage;
+                    }
+                },submit_copies);
+        }
+        trace_step("admit",expert);
+        if(cacheable && weight.image.numel()<=device_limit_locked()) {
+            commit_device_image_locked(device_key,weight,*image,owning_arena,expert_group);
+            admitted.push_back(device_key);if(batch)batch->admitted.push_back(device_key);
         }
         result.push_back(std::move(weight));
         if((calls_&4095)==0)report();
         }
+        submit_copies();
         }catch(...) {
-            // Publish readiness even when a later expert read/allocation
-            // fails, before another request can observe the inserted entries.
-            if(uploaded)uploaded->record(stream.stream());
+            const auto failure=std::current_exception();
+            if(!batch)try {
+                submit_copies();
+                if(uploaded) {
+                    uploaded->record(stream.stream());
+                    if(position)*position=mfq::cuda::record_routed_completion(transfer_clock_,stream.device(),stream.stream());
+                    if(recorded)recorded->store(true,std::memory_order_release);
+                }
+            }catch(...) {
+                if(cudaStreamSynchronize(stream.stream())==cudaSuccess && transfer!=host_transfers_.end())
+                    transfer->completed=true;
+            }
+            // A partially submitted batch cannot become a later GPU hit.
+            // Its immutable RAM source remains available for a clean retry.
+            for(const auto& key:admitted)if(device_.count(key))erase_device_locked(key,false);
+            for(auto slot=expert_slots_.begin();slot!=expert_slots_.end();) {
+                if(slot->first.device!=device || slot->second.residents){++slot;continue;}
+                pending_expert_bytes_[device]-=slot->second.image.nbytes();slot=expert_slots_.erase(slot);
+            }
+            std::rethrow_exception(failure);
+        }
+        // Keep allocation, upload and eventual free on one independent stream
+        // for both prefill and decode. A compute-stream free queued behind a
+        // waiting decode graph cannot supply the next expert upload.
+        trace_step("record_ready");
+        try {
+            if(batch) {
+                if(consumer.stream()!=batch->consumer.stream())throw std::logic_error("TQ upload batch changed its consumer stream");
+            }else if(consumer.stream()!=stream.stream()) {
+                if(!uploaded)uploaded=completion_events_.at(device,stream.stream());
+                uploaded->record(stream.stream());
+                TYLOINFER_CUDA_CHECK(cudaStreamWaitEvent(consumer.stream(),uploaded->get(),0));
+            }else if(uploaded)uploaded->record(stream.stream());
+            if(!batch && uploaded && recorded) {
+                if(position)*position=mfq::cuda::record_routed_completion(transfer_clock_,stream.device(),stream.stream());
+                recorded->store(true,std::memory_order_release);
+            }
+        }catch(...) {
+            if(!batch && cudaStreamSynchronize(stream.stream())==cudaSuccess && transfer!=host_transfers_.end())
+                transfer->completed=true;
             throw;
         }
-        if(uploaded)uploaded->record(stream.stream());
+        if(use==mfq::cuda::RoutedImageUse::Admission || use==mfq::cuda::RoutedImageUse::Restore)
+            admission_transfer_+=transfer_bytes_-before[2];
+        if(use==mfq::cuda::RoutedImageUse::Restore)restore_transfer_+=transfer_bytes_-before[2];
+        if(decode_replay) {
+            decode_calls_+=calls_-before[0];decode_hits_+=gpu_hits_-before[1];
+            decode_transfer_+=transfer_bytes_-before[2];decode_source_+=source_bytes_-before[3];
+            decode_writeback_+=writeback_bytes_-before[4];
+            decode_arena_recycles_+=arena_recycles_-arena_before;
+            decode_retained_evictions_+=retained_evictions_-retained_before;
+            if(profile_) {
+                decode_get_rows_ms_+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-decode_started).count();
+                decode_fetch_ms_+=fetch_ms_-cpu_before[0];decode_copy_ms_+=stage_copy_ms_-cpu_before[1];
+                decode_stage_wait_ms_+=stage_wait_ms_-cpu_before[2];decode_allocation_ms_+=allocation_ms_-cpu_before[3];
+                decode_submit_ms_+=upload_submit_ms_-cpu_before[4];decode_repin_ms_+=pageable_repin_ms_-cpu_before[5];
+            }
+        }
+        trace_step("return");
         return result;
     }
 };
 
+std::size_t tq_expert_source_bytes(const std::shared_ptr<TqExpertCache>& cache) {
+    return cache?cache->source_bytes():0;
+}
 std::size_t tq_expert_cache_budget_bytes(const std::shared_ptr<TqExpertCache>& cache) {
     return cache?cache->budget_bytes():0;
+}
+void finalize_tq_expert_cache(const std::shared_ptr<TqExpertCache>& cache,std::size_t growth) {
+    if(cache)cache->finalize(growth);
 }
 void resize_tq_expert_cache(const std::shared_ptr<TqExpertCache>& cache,std::size_t bytes) {
     if(cache)cache->resize(bytes);
 }
+std::size_t tq_prefill_lendable_bytes(const std::shared_ptr<TqExpertCache>& cache) {
+    return cache?cache->lendable_bytes():0;
+}
+void reserve_tq_expert_workspace(const std::shared_ptr<TqExpertCache>& cache,std::size_t bytes) {
+    if(cache)cache->reserve_workspace(bytes);
+}
+void constrain_tq_capture_workspace(const std::shared_ptr<TqExpertCache>& cache,std::size_t bytes) {
+    if(cache)cache->constrain_capture(bytes);
+}
+void restore_tq_decode_workspace(const std::shared_ptr<TqExpertCache>& cache,std::size_t growth,
+        std::optional<std::size_t> transient) {
+    if(cache)cache->restore_decode(growth,transient);
+}
+void restore_tq_decode_workspace_after_capture(const std::shared_ptr<TqExpertCache>& cache) {
+    if(cache)cache->restore_after_capture();
+}
+bool set_tq_reuse_learning(const std::shared_ptr<TqExpertCache>& cache,bool enabled) {
+    return cache?cache->set_reuse_learning(enabled):false;
+}
+void begin_tq_speculative_routes(const std::shared_ptr<TqExpertCache>& cache,int rows) {
+    if(cache)cache->begin_routes(rows);
+}
+void commit_tq_speculative_routes(const std::shared_ptr<TqExpertCache>& cache,int rows) {
+    if(cache)cache->commit_routes(rows);
+}
+void discard_tq_speculative_routes(const std::shared_ptr<TqExpertCache>& cache) noexcept {
+    if(cache)cache->discard_routes();
+}
+TqPrefillWorkspaceLoan::~TqPrefillWorkspaceLoan() {
+    try {finish();return;}
+    catch(const std::exception& error) {std::fprintf(stderr,"TQ prefill restore failed: %s\n",error.what());}
+    catch(...) {std::fprintf(stderr,"TQ prefill restore failed\n");}
+    if(token_)cache_->abandon_workspace(token_);
+    token_=0;
+}
+std::size_t TqPrefillWorkspaceLoan::begin(std::size_t bytes) {
+    finish();
+    if(!cache_)return 0;
+    const auto reservation=cache_->begin_workspace(bytes);
+    token_=reservation.first;return reservation.second;
+}
+void TqPrefillWorkspaceLoan::suspend() {if(token_)cache_->suspend_workspace(token_);}
+void TqPrefillWorkspaceLoan::finish() {
+    if(token_)cache_->end_workspace(token_);
+    token_=0;
+}
 std::size_t reclaim_tq_expert_host(const std::shared_ptr<TqExpertCache>& cache,std::size_t bytes) {
     return cache?cache->reclaim_host(bytes):0;
 }
+void resize_tq_expert_host(const std::shared_ptr<TqExpertCache>& cache,std::size_t bytes) {
+    if(cache)cache->resize_host(bytes);
+}
+std::size_t reclaim_tq_expert_duplicates(const std::shared_ptr<TqExpertCache>& cache,std::size_t bytes) {
+    return cache?cache->reclaim_duplicates(bytes):0;
+}
 std::size_t reserve_tq_expert_host(const std::shared_ptr<TqExpertCache>& cache,std::size_t bytes) {
     return cache?cache->reserve_host(bytes):0;
+}
+std::size_t share_tq_expert_host(const std::shared_ptr<TqExpertCache>& cache,std::size_t bytes) {
+    return cache?cache->share_host(bytes):0;
 }
 std::vector<std::pair<std::string,double>> tq_expert_memory_metrics(const std::shared_ptr<TqExpertCache>& cache) {
     return cache?cache->memory_metrics():std::vector<std::pair<std::string,double>>{};
 }
 std::uint64_t tq_expert_streamed_bytes(const std::shared_ptr<TqExpertCache>& cache) {
     return cache?cache->streamed_bytes():0;
+}
+std::array<double,2> tq_expert_transfer_timings(const std::shared_ptr<TqExpertCache>& cache) {
+    return cache?cache->transfer_timings():std::array<double,2>{};
+}
+
+namespace {
+std::shared_ptr<TqResidentBank> load_tq_resident_bank(const TqRowTable& table,
+        std::int64_t experts,std::int64_t out,std::int64_t input,int device) {
+    const MfqCudaGuard guard(device);
+    const mfq::cuda::WeightAllocationScope weights;
+    const mfq::cuda::ResidentAllocationScope permanent;
+    auto bank=std::make_shared<TqResidentBank>();
+    bank->gemm=tq_gemm_resources(device);
+    std::vector<std::size_t> offsets;offsets.reserve(std::size_t(experts)+1);offsets.push_back(0);
+    for(std::int64_t expert=0;expert<experts;++expert) {
+        const auto bytes=table.expert_image_bytes(std::uint64_t(expert),std::uint64_t(out));
+        if(bytes>std::size_t(INT64_MAX)-15 || offsets.back()>std::size_t(INT64_MAX)-((bytes+15)&~std::size_t(15)))
+            throw std::overflow_error("TQ permanent expert bank exceeds tensor size limits");
+        offsets.push_back(offsets.back()+((bytes+15)&~std::size_t(15)));
+    }
+    bank->packed=tb::empty({std::int64_t(offsets.back())},
+        tb::TensorOptions().device(tb::Device(tb::kCUDA,device)).dtype(tb::kUInt8));
+    bank->experts.reserve(std::size_t(experts));
+    std::vector<TrellisProjectionView> views;views.reserve(std::size_t(experts));
+    const auto stream=mfq_current_cuda_stream();
+    for(std::int64_t expert=0;expert<experts;++expert) {
+        // Read one expert at a time. Only its immutable encoded image enters
+        // the resident allocation; no decoded weights or RAM cache copy remain.
+        const auto wire=table.slice_rows(std::uint64_t(expert)*out,std::uint64_t(expert+1)*out);
+        const mfq::TqLayout layout(wire.data(),wire.size());
+        const auto image=tq_image(wire,layout);
+        if(image.size()>offsets[expert+1]-offsets[expert])
+            throw std::overflow_error("TQ permanent expert image exceeds its interval");
+        auto storage=bank->packed.narrow(0,std::int64_t(offsets[expert]),std::int64_t(image.size()));
+        // Synchronize each bounded upload before its temporary CPU owner leaves.
+        constexpr std::size_t chunk_bytes=4ULL<<20;
+        for(std::size_t offset=0;offset<image.size();) {
+            const auto bytes=std::min(chunk_bytes,image.size()-offset);
+            TYLOINFER_CUDA_CHECK(cudaMemcpyAsync(storage.data_ptr<std::uint8_t>()+offset,
+                image.data()+offset,bytes,cudaMemcpyHostToDevice,stream));
+            TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(stream));offset+=bytes;
+        }
+        bank->experts.push_back(tq_view(std::move(storage),layout,input));
+        views.push_back(bank->experts.back().view);
+    }
+    if(views.size()>std::size_t(INT64_MAX)/sizeof(TrellisProjectionView))
+        throw std::overflow_error("TQ permanent expert descriptor table exceeds tensor size limits");
+    bank->views=tb::from_blob(views.data(),{std::int64_t(views.size()*sizeof(TrellisProjectionView))},
+        tb::TensorOptions().dtype(tb::kUInt8)).clone().to(bank->packed.device(),false,false).contiguous();
+    return bank;
+}
 }
 
 TqRoutedWeight::TqRoutedWeight(CudaExecutionContext& execution,const mfq::ModelSource& source,
@@ -1336,6 +3141,12 @@ TqRoutedWeight::TqRoutedWeight(CudaExecutionContext& execution,const mfq::ModelS
     if(experts<1 || experts>UINT32_MAX || out<1 || input<1 ||
        table->rows()!=std::uint64_t(experts)*out || table->width()!=input)
         throw std::invalid_argument("TQ routed projection shape differs: "+name);
+    table->cache_row_metadata();
+    if(name.starts_with("predictor.")) {
+        resident=load_tq_resident_bank(*table,experts,out,input,mfq_current_cuda_device());
+        std::fprintf(stderr,"native_tq_predictor_resident actual_match=1 bank=%s bytes=%zu device=%d\n",
+            name.c_str(),resident->packed.nbytes(),resident->packed.get_device());
+    }
     if(!execution.tq_expert_cache) {
         const auto budget = execution.config.moe_device_cache_bytes.value_or(
             moe_expert_cache_budget_bytes(execution.moe_expert_cache));
@@ -1345,7 +3156,8 @@ TqRoutedWeight::TqRoutedWeight(CudaExecutionContext& execution,const mfq::ModelS
             budget,execution.config.moe_host_cache_bytes,
             execution.config.moe_host_physical_bytes,!explicit_budget);
     }
-    cache=execution.tq_expert_cache;source_id=cache->register_source(table->storage_bytes());
+    cache=execution.tq_expert_cache;
+    source_id=cache->register_source(table,out,experts,resident);
 }
 std::shared_ptr<TqRoutedWeight> load_tq_routed_weight(CudaExecutionContext& execution,
         const mfq::ModelSource& source,const std::string& name) {
@@ -1364,6 +3176,7 @@ tb::Tensor TqRoutedWeight::forward(tb::Tensor input_value,tb::Tensor ids)const {
     auto result=tb::empty({tokens,routes,out},source.options());
     if(!tokens)return result;
     const MfqCudaGuard guard(source.get_device());
+    if(!resident)cache->wait_ready();
     auto host=ids.contiguous().cpu().to(tb::kInt64);
     const auto* selected=host.data_ptr<std::int64_t>();
     std::vector<TrellisProjectionView> views;views.reserve(host.numel());
@@ -1371,6 +3184,7 @@ tb::Tensor TqRoutedWeight::forward(tb::Tensor input_value,tb::Tensor ids)const {
         if(selected[i]<0 || selected[i]>=experts)throw std::out_of_range("TQ routed expert ID is out of bounds");
     }
     const auto owners=cache->get_rows(source_id,selected,host.numel(),*table,out,source.get_device());
+    const TqExpertReadFence reads({&owners},source.get_device());
     for(const auto& owner:owners)views.push_back(owner.view);
     const auto bytes=static_cast<std::int64_t>(views.size()*sizeof(TrellisProjectionView));
     const auto metadata=tb::from_blob(views.data(),{bytes},tb::TensorOptions().dtype(tb::kUInt8))
@@ -1392,6 +3206,9 @@ bool prepare_tq_graph_pool(const std::shared_ptr<TqExpertCache>& cache) {
     if(!cache)return false;
     cache->prepare_graph_pool();return true;
 }
+void wait_tq_expert_admission(const std::shared_ptr<TqExpertCache>& cache) {
+    if(cache)cache->wait_ready();
+}
 bool tq_graph_supports_tokens(std::int64_t tokens)noexcept {
 #if CUDART_VERSION >= 11060
     return tokens>0;
@@ -1411,14 +3228,15 @@ struct TqIndexedJobs {
 TqIndexedJobs tq_indexed_jobs(const std::vector<TqWeight>& gate,
         const std::vector<TqWeight>& up,const std::vector<TqWeight>& down,
         const std::vector<std::vector<std::int64_t>>& slots,std::size_t begin,
-        std::int64_t routes,std::int64_t input,std::int64_t hidden,std::int64_t output,bool wide=false) {
+        std::int64_t routes,std::int64_t input,std::int64_t hidden,std::int64_t output,bool wide=false,
+        bool make_gu=true,bool make_down=true) {
     TqIndexedTiles gu_tiles,down_tiles;
     TqWideTiles wide_tiles;
     std::vector<TrellisIndexedWidePairJob> wide_gu;
     for(std::size_t i=0;i<gate.size();++i) {
         const auto& rows=slots[begin+i];
         const auto complete=wide?rows.size()/8*8:0;
-        for(std::size_t start=0;start<complete;start+=8) {
+        for(std::size_t start=0;make_gu && start<complete;start+=8) {
             TrellisIndexedWidePairJob job{};job.weight=gate[i].view;job.second=up[i].view;job.count=8;
             for(int t=0;t<8;++t) {
                 const auto slot=rows[start+t];job.input_offsets[t]=(slot/routes)*input;job.output_offsets[t]=slot*hidden;
@@ -1428,21 +3246,22 @@ TqIndexedJobs tq_indexed_jobs(const std::vector<TqWeight>& gate,
         // Eight columns fill the MMA instruction. Keep incomplete groups in
         // the short SIMT kernel instead of repeating padded MMA work.
         auto chunks=(rows.size()-complete+3)/4;
-        for(std::size_t start=complete;start<rows.size();--chunks) {
+        for(std::size_t start=complete;(make_gu || (make_down && !wide)) && start<rows.size();--chunks) {
             const auto tile=(rows.size()-start+chunks-1)/chunks;
             TrellisIndexedProjectionJob gu{},dn{};
-            gu.weight=gate[i].view;gu.second=up[i].view;dn.weight=down[i].view;
+            if(make_gu){gu.weight=gate[i].view;gu.second=up[i].view;}
+            if(make_down)dn.weight=down[i].view;
             gu.count=dn.count=int(tile);
             for(int t=0;t<gu.count;++t) {
                 const auto slot=rows[start+t];
                 gu.input_offsets[t]=(slot/routes)*input;gu.output_offsets[t]=slot*hidden;
                 dn.input_offsets[t]=slot*hidden;dn.output_offsets[t]=slot*output;
             }
-            gu_tiles[tile-1].push_back(gu);
-            if(!wide)down_tiles[tile-1].push_back(dn);
+            if(make_gu)gu_tiles[tile-1].push_back(gu);
+            if(make_down && !wide)down_tiles[tile-1].push_back(dn);
             start+=tile;
         }
-        if(wide) {
+        if(wide && make_down) {
             auto down_chunks=(rows.size()+7)/8;
             for(std::size_t start=0;start<rows.size();--down_chunks) {
                 const auto tile=(rows.size()-start+down_chunks-1)/down_chunks;
@@ -1463,28 +3282,41 @@ TqIndexedJobs tq_indexed_jobs(const std::vector<TqWeight>& gate,
     }
     return {std::move(gu_tiles),std::move(down_tiles),std::move(wide_tiles),std::move(wide_gu)};
 }
-struct TqGraphLease {std::array<std::vector<TqWeight>,3> weights;void clear(){for(auto& w:weights)w.clear();}};
+struct TqGraphLease {
+    std::array<std::vector<TqWeight>,3> weights;
+    std::unordered_map<int,MfqCudaStream> transfers;
+    std::unordered_map<int,std::shared_ptr<DeviceImageArena>> staging;
+    void clear(){for(auto& w:weights)w.clear();}
+};
 const char tq_graph_lease_identity=0;
 struct TqMoeGraphStage {
     std::array<std::shared_ptr<TqRoutedWeight>,3> banks;
     std::shared_ptr<TqGraphLease> lease;
-    MfqCudaStream stream;
+    MfqCudaStream stream,upload_stream;
     std::unique_ptr<mfq::cuda::HostBuffer> host_ids;
     std::array<tb::Tensor,3> views;
-    tb::Tensor input,ids,weights,hidden,pairs,result,plan,route_snapshot;
+    std::shared_ptr<mfq::cuda::RoutedResidentViews<TrellisProjectionView>> resident_views;
+    tb::Tensor resident_plan,stream_views;
+    std::vector<std::size_t> expert_offsets;
+    tb::Tensor input,ids,weights,hidden,pairs,result,plan,route_snapshot,cancelled;
     tb::ScalarType route_dtype;
     void* mapped_routes=nullptr;
     std::vector<int64_t> widened_routes;
+    std::vector<int64_t> route_experts,resident_experts,observation_routes;
     int routes,type,tokens;
     std::size_t slots=0,route_bytes=0,plan_bytes=0;
-    bool wide=false;
+    bool wide=false,direct=false;
+    static constexpr std::size_t publication_stride=128;
+    std::size_t control_bytes=64;
+    static constexpr int upload_word=publication_stride/sizeof(uint32_t),abort_word=2*upload_word,
+        down_word=3*upload_word;
     struct Plane {std::size_t offset=0;unsigned capacity=0,count=0;int tile=0,kind=0;};
     std::array<Plane,13> planes{};
     struct KernelChunk {int plane;std::size_t first,segment;unsigned capacity;cudaGraphNode_t node;};
     std::vector<KernelChunk> kernels;
     TqMoeGraphStage(const TqMoeBanks& b,const tb::Tensor& source,int count,tb::ScalarType route_type,
                    std::shared_ptr<TqGraphLease> l)
-        :banks{b.gate,b.up,b.down},lease(std::move(l)),stream(mfq_get_current_cuda_stream(source.get_device())),
+        :banks{b.gate,b.up,b.down},lease(std::move(l)),stream(mfq_get_current_cuda_stream(source.get_device())),upload_stream(stream),
          route_dtype(route_type),
          routes(count),type(dtype(source.scalar_type())),tokens(int(source.size(0))) {
         slots=std::size_t(tokens)*routes;
@@ -1517,8 +3349,46 @@ struct TqMoeGraphStage {
         const bool map=can_map && integral && words<=INT_MAX && (!mapped_option || mapped_option[0]!='0');
         // The first cache line is the publication flag. Int64 IDs are copied
         // as two int32 words, preserving their full range without narrowing.
-        host_ids=std::make_unique<mfq::cuda::HostBuffer>(64+route_bytes+plan_bytes,map);
+        const bool single_submission=map &&
+            mfq::cuda::default_context(source.get_device())->supports_async_allocations();
+        if(single_submission && tokens==1)plan_bytes=3*slots*sizeof(TrellisProjectionView);
+        // Route publication is written by the GPU; upload/abort publication
+        // is written by the CPU. Their words must not share a cache line.
+        control_bytes=single_submission?4*publication_stride:64;
+        host_ids=std::make_unique<mfq::cuda::HostBuffer>(control_bytes+route_bytes+plan_bytes,map);
         if(map)TYLOINFER_CUDA_CHECK(cudaHostGetDevicePointer(&mapped_routes,host_ids->data(),0));
+        // Fixed grids consume zero-filled unused jobs, as in the GGUF grouped
+        // graph path. Route changes do not require a host graph boundary.
+        direct=single_submission && mapped_routes;
+        if(direct) {
+            if(tokens==1) {
+                stream_views=tb::empty({static_cast<std::int64_t>(plan_bytes)},source.options().dtype(tb::kUInt8));
+                expert_offsets.resize(std::size_t(banks[0]->experts));
+            }
+            auto found=lease->transfers.find(source.get_device());
+            if(found==lease->transfers.end())found=lease->transfers.emplace(source.get_device(),
+                banks[0]->cache->transfer_stream(source.get_device())).first;
+            upload_stream=found->second;
+            const auto bound=[](const TqRoutedWeight& bank) {
+                return bank.table->row_image_bytes_bound(bank.out);
+            };
+            const auto one=bound(*banks[0])+bound(*banks[1])+bound(*banks[2]);
+            const auto images=std::min(std::size_t(banks[0]->experts),slots);
+            if(one>SIZE_MAX/images)throw std::overflow_error("TQ transfer geometry exceeds size limits");
+            const auto bytes=one*images;
+            auto& staging=lease->staging[source.get_device()];
+            if(!staging || staging->bytes()<bytes) {
+                const MfqCudaStreamGuard transfer(upload_stream);
+                const mfq::cuda::RoutedWeightAllocationScope allocation;
+                staging=std::make_shared<DeviceImageArena>(bytes,source.get_device());
+            }
+            banks[0]->cache->prepare_transfer_staging(source.get_device());
+            cancelled=tb::empty({1},source.options().dtype(tb::kInt32));
+            const auto resident_bytes=tokens==1?3*slots*sizeof(TrellisProjectionView):2*slots*sizeof(TrellisIndexedProjectionJob);
+            resident_plan=tb::empty({static_cast<int64_t>(resident_bytes)},source.options().dtype(tb::kUInt8));
+        }
+        if(map)resident_views=banks[0]->cache->resident_views(
+            {banks[0]->source_id,banks[1]->source_id,banks[2]->source_id},banks[0]->experts,source.get_device());
         if(mapped_routes) {
             route_snapshot=tb::empty({tokens,count},source.options().dtype(route_dtype));
             if(route_dtype==tb::kInt32)widened_routes.resize(slots);
@@ -1535,10 +3405,18 @@ struct TqMoeGraphStage {
     }
     void reset_routes() {
         if(!mapped_routes)return;
-        *static_cast<volatile uint32_t*>(host_ids->data())=0;
+        auto* flags=static_cast<volatile uint32_t*>(host_ids->data());
+        flags[0]=0;if(direct){flags[upload_word]=0;flags[down_word]=0;flags[abort_word]=0;}
         std::atomic_thread_fence(std::memory_order_seq_cst);
     }
-    void* route_data()const {return static_cast<uint8_t*>(host_ids->data())+64;}
+    void cancel() {
+        if(!direct)return;
+        auto* flags=static_cast<volatile uint32_t*>(host_ids->data());
+        mfq::cuda::publish_mapped_flag(const_cast<uint32_t*>(flags)+abort_word);
+        mfq::cuda::publish_mapped_flag(const_cast<uint32_t*>(flags)+upload_word);
+        mfq::cuda::publish_mapped_flag(const_cast<uint32_t*>(flags)+down_word);
+    }
+    void* route_data()const {return static_cast<uint8_t*>(host_ids->data())+control_bytes;}
     void publish_routes(const tb::Tensor& current,bool views,const int64_t* device_ids) {
         if(!mapped_routes) {
             TYLOINFER_CUDA_CHECK(cudaMemcpyAsync(route_data(),device_ids,route_bytes,cudaMemcpyDeviceToHost,stream.stream()));
@@ -1548,7 +3426,7 @@ struct TqMoeGraphStage {
         const auto* source=&current;
         if(!views || !current.is_contiguous()){route_snapshot.copy_(current);source=&route_snapshot;}
         mfq::cuda::moe_publish_routes(nullptr,reinterpret_cast<const int32_t*>(source->data_ptr()),nullptr,
-            reinterpret_cast<int32_t*>(static_cast<uint8_t*>(mapped_routes)+64),
+            reinterpret_cast<int32_t*>(static_cast<uint8_t*>(mapped_routes)+control_bytes),
             static_cast<uint32_t*>(mapped_routes),0,int(slots*(route_dtype==tb::kInt64?2:1)),stream.stream());
         TYLOINFER_CUDA_CHECK(cudaGetLastError());
     }
@@ -1557,48 +3435,138 @@ struct TqMoeGraphStage {
         // allocator. A window destroys its graphs before releasing the stage.
         int previous=0;const bool restore=cudaGetDevice(&previous)==cudaSuccess;
         (void)cudaSetDevice(stream.device());(void)cudaStreamSynchronize(stream.stream());
+        if(direct)(void)cudaStreamSynchronize(upload_stream.stream());
         mfq::cuda::tensor_host_bytes.fetch_sub(host_ids->size());
         if(restore)(void)cudaSetDevice(previous);
     }
     void load(mfq::cuda::DecodeWindow* window=nullptr) {
-        const MfqCudaStreamGuard guard(stream);
+        const bool trace=std::getenv("TYLOINFER_TQ_TRACE_HANDOFF")!=nullptr;
+        const auto trace_step=[&](const char* step,int role=-1) {
+            if(trace){std::fprintf(stderr,"tq_handoff source=%llu step=%s role=%d\n",
+                static_cast<unsigned long long>(banks[0]->source_id),step,role);std::fflush(stderr);}
+        };
+        trace_step("begin");
+        if(!std::all_of(banks.begin(),banks.end(),[](const auto& bank){return bool(bank->resident);}))
+            banks[0]->cache->wait_layer_admission(resident_views);
+        const MfqCudaStreamGuard guard(upload_stream);
+        std::optional<mfq::cuda::NonblockingAllocationScope> allocation;
+        if(direct && window)allocation.emplace();
         const auto* selected=static_cast<const int64_t*>(route_data());
         if(mapped_routes && route_dtype==tb::kInt32) {
             std::copy_n(static_cast<const int32_t*>(route_data()),slots,widened_routes.data());
             selected=widened_routes.data();
         }
-        for(std::size_t i=0;i<slots;++i)if(selected[i]<0 || selected[i]>=banks[0]->experts)
-            throw std::out_of_range("TQ graph expert ID is out of bounds");
-        std::vector<int64_t> unique;
+        // The next layer may reuse the mapped route packet after Down is
+        // published. Learning uses the same owned snapshot as the GGUF path.
+        if(direct){observation_routes.assign(selected,selected+slots);selected=observation_routes.data();}
+        const auto observe=[&] {
+            if(window)banks[0]->cache->observe_routes(
+                {banks[0]->source_id,banks[1]->source_id,banks[2]->source_id},selected,tokens,routes,stream.device());
+        };
+        auto& unique=route_experts;
         std::vector<std::vector<int64_t>> grouped;
-        if(tokens==1)unique.assign(selected,selected+routes);
-        else {
-            std::unordered_map<int64_t,std::size_t> positions;
-            for(std::size_t i=0;i<slots;++i) {
-                const auto [entry,inserted]=positions.emplace(selected[i],unique.size());
-                if(inserted){unique.push_back(selected[i]);grouped.emplace_back();}
-                grouped[entry->second].push_back(int64_t(i));
+        mfq::cuda::group_routed_experts({selected,slots},banks[0]->experts,unique,tokens==1?nullptr:&grouped);
+        const bool resident_partition=direct && window;
+        const bool compact_views=resident_partition && tokens==1;
+        bool streamed_views=false;
+        if(resident_partition) {
+            resident_experts.clear();std::size_t cold=0;
+            for(std::size_t index=0;index<unique.size();++index) {
+                const auto expert=unique[index];
+                bool resident=true;
+                for(int role=0;role<3;++role)resident&=resident_views->pointers(role)[expert].words!=nullptr;
+                if(compact_views)expert_offsets[std::size_t(expert)]=resident?SIZE_MAX:cold;
+                if(resident)resident_experts.push_back(expert);
+                else {
+                    unique[cold]=expert;
+                    if(tokens>1 && cold!=index)grouped[cold]=std::move(grouped[index]);
+                    ++cold;
+                }
             }
+            unique.resize(cold);if(tokens>1)grouped.resize(cold);
+            streamed_views=!unique.empty();
+            banks[0]->cache->touch_decode_residents(
+                {banks[0]->source_id,banks[1]->source_id,banks[2]->source_id},resident_experts,stream.device());
         }
         // The preceding GPU segment has consumed the prior layer's images.
         // Keep one live layer across all TQ sources, independently of cache
         // ownership, so graph capture cannot pin every layer's experts.
-        lease->clear();
+        lease->clear();trace_step("released");
+        if(compact_views && unique.empty()) {
+            // Release the GPU before bookkeeping, matching direct GGUF DMA.
+            mfq::cuda::publish_mapped_flag(static_cast<uint32_t*>(host_ids->data())+upload_word);
+            mfq::cuda::publish_mapped_flag(static_cast<uint32_t*>(host_ids->data())+down_word);
+            observe();return;
+        }
+        const bool shared_cache=banks[0]->cache==banks[1]->cache && banks[0]->cache==banks[2]->cache;
+        auto batch=window && shared_cache?banks[0]->cache->begin_uploads(stream.device()):nullptr;
         for(int role=0;role<3;++role) {
+            trace_step("weights",role);
             const auto& bank=*banks[role];
-            lease->weights[role]=bank.cache->get_rows(bank.source_id,unique.data(),unique.size(),*bank.table,bank.out,stream.device());
+            lease->weights[role]=bank.cache->get_rows(bank.source_id,unique.data(),unique.size(),*bank.table,bank.out,stream.device(),
+                direct && window?lease->staging.at(stream.device()).get():nullptr,
+                window?mfq::cuda::RoutedImageUse::Decode:mfq::cuda::RoutedImageUse::Eager,batch.get());
+            trace_step("views",role);
             if(tokens==1) {
-                const auto table=bank.cache->projection_table(bank.source_id,bank.experts,unique.data(),
-                    lease->weights[role],stream.device());
-                if(table.data_ptr()!=views[role].data_ptr())throw std::logic_error("TQ graph view table address changed");
+                if(compact_views) {
+                    if(streamed_views) {
+                        auto* packet=reinterpret_cast<TrellisProjectionView*>(
+                            static_cast<std::uint8_t*>(route_data())+route_bytes);
+                        for(std::size_t slot=0;slot<slots;++slot) {
+                            const auto offset=expert_offsets[std::size_t(selected[slot])];
+                            packet[std::size_t(role)*slots+slot]=offset==SIZE_MAX?TrellisProjectionView{}:
+                                lease->weights[role][offset].view;
+                        }
+                        if(role==1 || role==2) {
+                            const auto first=role==1?0:2*slots,count=role==1?2*slots:slots;
+                            bank.cache->upload_decode_views(stream_views,first*sizeof(TrellisProjectionView),
+                                packet+first,count*sizeof(TrellisProjectionView));
+                        }
+                    }
+                }else {
+                    const auto table=bank.cache->projection_table(bank.source_id,bank.experts,unique.data(),
+                        lease->weights[role],stream.device(),stream.stream());
+                    if(table.data_ptr()!=views[role].data_ptr())throw std::logic_error("TQ graph view table address changed");
+                }
+            }
+            if(role==1 && direct) {
+                if(tokens>1)upload_indexed_plan(grouped,0,5,window);
+                // Gate/Up can consume their images while Down is prepared and
+                // transferred. The transaction still owns all three banks.
+                mfq::cuda::enqueue_routed_completion(static_cast<uint32_t*>(host_ids->data())+upload_word,
+                    static_cast<uint32_t*>(mapped_routes)+upload_word,upload_stream.stream());
+                mfq::cuda::check_stream_progress(upload_stream.stream());
             }
         }
-        if(tokens==1)return;
+        if(batch)banks[0]->cache->finish_uploads(*batch);
+        if(tokens==1) {
+            if(direct) {
+                // Publish readiness on the DMA stream after its copies. The
+                // compute graph waits on this flag; the CPU can immediately
+                // serve the next stage without a driver synchronization.
+                mfq::cuda::enqueue_routed_completion(static_cast<uint32_t*>(host_ids->data())+down_word,
+                    static_cast<uint32_t*>(mapped_routes)+down_word,upload_stream.stream());
+                mfq::cuda::check_stream_progress(upload_stream.stream());
+                trace_step("dma_ready_queued");
+            }
+            observe();return;
+        }
+        if(direct) {
+            upload_indexed_plan(grouped,5,int(planes.size()),window);
+            mfq::cuda::enqueue_routed_completion(static_cast<uint32_t*>(host_ids->data())+down_word,
+                static_cast<uint32_t*>(mapped_routes)+down_word,upload_stream.stream());
+            mfq::cuda::check_stream_progress(upload_stream.stream());
+        }else upload_indexed_plan(grouped,0,int(planes.size()),window);
+        observe();
+    }
+    void upload_indexed_plan(const std::vector<std::vector<std::int64_t>>& grouped,int first,int last,
+            mfq::cuda::DecodeWindow* window) {
         auto [gu,dn,mma,gu8]=tq_indexed_jobs(lease->weights[0],lease->weights[1],lease->weights[2],
-            grouped,0,routes,banks[0]->input,banks[1]->out,banks[2]->out,wide);
+            grouped,0,routes,banks[0]->input,banks[1]->out,banks[2]->out,wide,first<5,last>5);
         auto* packet=static_cast<std::uint8_t*>(route_data())+route_bytes;
-        std::memset(packet,0,plan_bytes);
-        for(int i=0;i<int(planes.size());++i) {
+        const auto offset=planes[first].offset,end=last==int(planes.size())?plan_bytes:planes[last].offset;
+        std::memset(packet+offset,0,end-offset);
+        for(int i=first;i<last;++i) {
             auto& plane=planes[i];
             const auto fill=[&](const auto& jobs) {
                 if(jobs.size()>plane.capacity)throw std::overflow_error("TQ graph job count exceeds prepared plan");
@@ -1610,35 +3578,46 @@ struct TqMoeGraphStage {
             else if(plane.kind==2)fill(dn[plane.tile-1]);
             else fill(mma[plane.tile-5]);
         }
-        TYLOINFER_CUDA_CHECK(cudaMemcpyAsync(plan.data_ptr(),packet,plan_bytes,cudaMemcpyHostToDevice,stream.stream()));
-        if(window)for(const auto& kernel:kernels) {
+        TYLOINFER_CUDA_CHECK(cudaMemcpyAsync(plan.data_ptr<std::uint8_t>()+offset,packet+offset,end-offset,
+            cudaMemcpyHostToDevice,direct?upload_stream.stream():stream.stream()));
+        if(window && !direct)for(const auto& kernel:kernels)if(kernel.plane>=first && kernel.plane<last) {
             const auto count=kernel.first>=planes[kernel.plane].count?0:
                 unsigned(std::min<std::size_t>(kernel.capacity,planes[kernel.plane].count-kernel.first));
             window->set_kernel_rows(kernel.segment,kernel.node,count);
         }
-        if(window && wide && std::getenv("TYLOINFER_TQ_PROFILE_CACHE")) {
+        if(window && std::getenv("TYLOINFER_TQ_PROFILE_CACHE")) {
             unsigned mask=0,jobs=0;
-            for(int i=9;i<int(planes.size());++i)if(planes[i].count){mask|=1u<<planes[i].tile;jobs+=planes[i].count;}
-            if(planes[4].count)mask|=1u<<16;
+            for(int i=0;i<int(planes.size());++i)if(planes[i].count){mask|=1u<<i;jobs+=planes[i].count;}
             static std::atomic<unsigned> seen{0};
             if(mask & ~seen.fetch_or(mask,std::memory_order_relaxed))
-                std::fprintf(stderr,"tq_indexed_dispatch mode=graph dtype=%d tokens=%d wide_jobs=%u gu8_jobs=%u reuse_mask=%u plan_bytes=%zu\n",
+                std::fprintf(stderr,"tq_indexed_dispatch mode=graph dtype=%d tokens=%d jobs=%u gu8_jobs=%u plane_mask=%u plan_bytes=%zu\n",
                     type,tokens,jobs,planes[4].count,mask,plan_bytes);
         }
     }
-    void indexed(float limit,mfq::cuda::DecodeWindow& window,bool recording,const void* input_values) {
+    void indexed(float limit,mfq::cuda::DecodeWindow& window,bool recording,const void* input_values,bool down) {
 #if CUDART_VERSION >= 11060
-        if(recording)kernels.clear();
-        for(int i=0;i<int(planes.size());++i) {
+        if(recording && !down)kernels.clear();
+        for(int i=down?5:0;i<(down?int(planes.size()):5);++i) {
             const auto& plane=planes[i];
             for(std::size_t first=0;first<plane.capacity;first+=65535) {
                 const auto capacity=unsigned(std::min<std::size_t>(65535,plane.capacity-first));
                 const auto active=first>=plane.count?0:
                     unsigned(std::min<std::size_t>(capacity,plane.count-first));
-                const auto count=recording?capacity:std::max(1u,active);
+                const auto count=recording || direct?capacity:std::max(1u,active);
                 const auto* address=plan.data_ptr<std::uint8_t>()+plane.offset;
                 const auto* jobs=reinterpret_cast<const TrellisIndexedProjectionJob*>(address)+first;
-                if(plane.kind==0)status(mfq_tq_indexed_swiglu(jobs,input_values,hidden.data_ptr(),int(count),
+                if(direct) {
+                    const auto* abort=reinterpret_cast<const std::uint32_t*>(cancelled.data_ptr());
+                    if(plane.kind==0 || plane.kind==2)status(mfq_tq_indexed_guarded(jobs,
+                        down?hidden.data_ptr():input_values,down?pairs.data_ptr():hidden.data_ptr(),int(count),
+                        int(down?banks[2]->out:banks[1]->out),type,plane.tile,limit,!down,abort,stream.stream()));
+                    else {
+                        const auto stride=down?sizeof(TrellisIndexedWideProjectionJob):sizeof(TrellisIndexedWidePairJob);
+                        status(mfq_tq_indexed_wide_guarded(address+first*stride,
+                            down?hidden.data_ptr():input_values,down?pairs.data_ptr():hidden.data_ptr(),int(count),
+                            int(down?banks[2]->out:banks[1]->out),type,plane.tile,limit,!down,abort,stream.stream()));
+                    }
+                }else if(plane.kind==0)status(mfq_tq_indexed_swiglu(jobs,input_values,hidden.data_ptr(),int(count),
                     int(banks[1]->out),type,plane.tile,limit,stream.stream()));
                 else if(plane.kind==1)status(mfq_tq_indexed_wide_swiglu(
                     reinterpret_cast<const TrellisIndexedWidePairJob*>(address)+first,
@@ -1647,7 +3626,7 @@ struct TqMoeGraphStage {
                     int(banks[2]->out),type,plane.tile,stream.stream()));
                 else status(mfq_tq_indexed_wide(reinterpret_cast<const TrellisIndexedWideProjectionJob*>(address)+first,
                     hidden.data_ptr(),pairs.data_ptr(),int(count),int(banks[2]->out),type,plane.tile,stream.stream()));
-                if(recording) {
+                if(recording && !direct) {
                     cudaStreamCaptureStatus capture;const cudaGraphNode_t* dependencies=nullptr;std::size_t n=0;
                     TYLOINFER_CUDA_CHECK(cudaStreamGetCaptureInfo_v2(stream.stream(),&capture,nullptr,nullptr,&dependencies,&n));
                     if(capture!=cudaStreamCaptureStatusActive || n!=1)throw std::logic_error("TQ kernel capture has no unique node");
@@ -1657,15 +3636,27 @@ struct TqMoeGraphStage {
             if(i==4)window.mark_current("gate_up_end");
         }
 #else
-        (void)limit;(void)window;(void)recording;
+        (void)limit;(void)window;(void)recording;(void)input_values;(void)down;
         throw std::runtime_error("multi-token TQ graph plan updates require CUDA11.6 or newer");
 #endif
     }
 };
 tb::Tensor tq_graph_forward(const TqMoeBanks& banks,const tb::Tensor& source,const tb::Tensor& ids,
-        const tb::Tensor& weights,float limit,mfq::cuda::DecodeWindow& window) {
+        const tb::Tensor& weights,float limit,mfq::cuda::DecodeWindow& window,const std::function<void()>& independent_work,
+        CudaIndependentBranchExecutor* shared_executor) {
     window.mark_current("expert_begin");
+    const auto cache=banks.gate->cache;
+    const auto device=source.get_device();
+    auto entered=window.workspace<bool>(cache.get(),[]{return std::make_shared<bool>(false);});
     auto lease=window.workspace<TqGraphLease>(&tq_graph_lease_identity,[]{return std::make_shared<TqGraphLease>();});
+    const bool immutable=banks.gate->resident && banks.up->resident && banks.down->resident;
+    if(!immutable)window.enroll_once({cache.get(),[cache,device,entered]{cache->begin_replay(device);*entered=true;},[]{},
+        [cache,device,entered,lease]{if(*entered){lease->clear();*entered=false;cache->finish_routes(device);}},
+        [cache,device,entered]{if(*entered){*entered=false;cache->cancel_replay(device);}},
+        [cache,device,entered]{
+            if(*entered){*entered=false;cache->cancel_replay(device);}
+            cache->release_deferred_events();
+        },{}});
     auto stage=window.workspace<TqMoeGraphStage>(&banks,[&] {
         return std::make_shared<TqMoeGraphStage>(banks,source,int(ids.size(1)),ids.scalar_type(),lease);
     });
@@ -1678,54 +3669,123 @@ tb::Tensor tq_graph_forward(const TqMoeBanks& banks,const tb::Tensor& source,con
         const unsigned mode=(stage->mapped_routes?(stage->route_dtype==tb::kInt32?1u:2u):4u)|(views?8u:0u);
         static std::atomic<unsigned> seen{0};const unsigned bit=1u<<mode;
         if(!(seen.fetch_or(bit,std::memory_order_relaxed)&bit))
-            std::fprintf(stderr,"tq_graph_handoff mapped_routes=%d route_bits=%d input_views=%d\n",
-                int(stage->mapped_routes!=nullptr),stage->route_dtype==tb::kInt32?32:64,int(views));
+            std::fprintf(stderr,"tq_graph_handoff mapped_routes=%d route_bits=%d input_views=%d single_submission=%d slot_views=%d\n",
+                int(stage->mapped_routes!=nullptr),stage->route_dtype==tb::kInt32?32:64,int(views),int(stage->direct),
+                int(stage->direct && stage->tokens==1));
     }
     if(!views){stage->input.copy_(source);stage->weights.copy_(weights);}
     const int64_t* device_ids=nullptr;
     if(views && ids.scalar_type()==tb::kInt64)device_ids=ids.data_ptr<int64_t>();
-    else if(stage->tokens==1 || !stage->mapped_routes || !views) {
+    else if(stage->direct || !stage->mapped_routes || !views) {
         stage->ids.copy_(ids);device_ids=stage->ids.data_ptr<int64_t>();
     }
     stage->publish_routes(ids,views,device_ids);
     window.mark_current("cpu_wait_begin");
     cudaStreamCaptureStatus capture;
     TYLOINFER_CUDA_CHECK(cudaStreamIsCapturing(stage->stream.stream(),&capture));
-    if(capture==cudaStreamCaptureStatusNone) {
-        // DecodeWindow also calls the body during preparation/warmup. Execute
-        // real transfers there; host_barrier itself only records a callback.
-        if(stage->mapped_routes)mfq::cuda::wait_route_publication(static_cast<const uint32_t*>(stage->host_ids->data()),stage->stream.stream());
-        else TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(stage->stream.stream()));
-        stage->load();
-    }
-    window.enroll({stage.get(),[stage]{stage->reset_routes();},[stage,&window] {
-        if(!stage->mapped_routes)return;
-        mfq::cuda::wait_route_publication(static_cast<const uint32_t*>(stage->host_ids->data()),stage->stream.stream());
-        stage->load(&window);
-    },[lease]{lease->clear();},[]{},[lease]{lease->clear();},{}});
-    window.host_barrier([stage,&window]{if(!stage->mapped_routes)stage->load(&window);});
-    window.mark_current("hot_begin");
-    const auto* input_values=views?source.data_ptr():stage->input.data_ptr();
-    if(stage->tokens>1)stage->indexed(limit,window,capture==cudaStreamCaptureStatusActive,input_values);
-    else {
-    status(mfq_tq_routed_swiglu(reinterpret_cast<const TrellisProjectionView*>(stage->views[0].data_ptr()),
-        reinterpret_cast<const TrellisProjectionView*>(stage->views[1].data_ptr()),device_ids,
-        input_values,stage->hidden.data_ptr(),stage->routes,int(banks.up->out),stage->type,limit,stage->stream.stream()));
-    window.mark_current("gate_up_end");
-    status(mfq_tq_routed_down(reinterpret_cast<const TrellisProjectionView*>(stage->views[2].data_ptr()),
-        device_ids,stage->hidden.data_ptr(),stage->pairs.data_ptr(),stage->routes,
-        int(banks.down->out),int(banks.up->out),stage->type,stage->stream.stream()));
-    }
-    window.mark_current("down_end");
-    status(mfq_tq_weighted_reduce(stage->pairs.data_ptr(),views?weights.data_ptr<float>():stage->weights.data_ptr<float>(),stage->result.data_ptr(),
-        stage->tokens,stage->routes,int(banks.down->out),stage->type,stage->stream.stream()));
-    window.mark_current("hot_end");
-    return stage->result;
+    mfq::cuda::prepare_routed_graph(&window,capture,stage->mapped_routes!=nullptr,stage->direct,
+        {stage.get(),[stage]{stage->reset_routes();},{},[lease]{lease->clear();},
+            [stage]{stage->cancel();},[lease]{lease->clear();},[lease]{lease->clear();}},
+        [stage] {
+            if(stage->mapped_routes)mfq::cuda::wait_route_publication(
+                static_cast<const uint32_t*>(stage->host_ids->data()),stage->stream.stream());
+            else TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(stage->stream.stream()));
+        },[stage]{stage->load();},[stage,&window]{stage->load(&window);});
+    // A segmented graph must join any side stream before ending its segment.
+    // Fork after the host barrier; a single-submission graph also overlaps
+    // the shared branch with its remaining routed DMA wait.
+    const auto compute=[&]() -> tb::Tensor {
+        const auto* input_values=views?source.data_ptr():stage->input.data_ptr();
+        const bool overlap=stage->direct && capture==cudaStreamCaptureStatusActive;
+        auto* selected=overlap && stage->tokens==1?reinterpret_cast<TrellisProjectionView*>(stage->resident_plan.data_ptr()):nullptr;
+        const auto* abort=stage->direct?reinterpret_cast<const uint32_t*>(stage->cancelled.data_ptr()):nullptr;
+        return mfq::cuda::execute_routed_moe([]{},[]{},[&] {
+            if(!overlap)return;
+            mfq::cuda::wait_mapped_flag(stage->resident_views->admission_device(),stage->stream.stream());
+            if(stage->tokens>1) {
+                auto* gu=reinterpret_cast<TrellisIndexedProjectionJob*>(stage->resident_plan.data_ptr());
+                auto* dn=gu+stage->slots;
+                const auto tile=std::min(stage->tokens,4);
+                status(mfq_tq_prepare_resident_indexed(stage->resident_views->device_pointers(0),
+                    stage->resident_views->device_pointers(1),stage->resident_views->device_pointers(2),device_ids,
+                    gu,dn,int(stage->slots),stage->routes,int(banks.gate->experts),int(banks.gate->input),
+                    int(banks.up->out),int(banks.down->out),tile,stage->stream.stream()));
+                window.mark_current("hot_begin");
+                status(mfq_tq_indexed_swiglu(gu,input_values,stage->hidden.data_ptr(),int(stage->slots),
+                    int(banks.up->out),stage->type,tile,limit,stage->stream.stream()));
+                window.mark_current("resident_gate_up_end");
+                status(mfq_tq_indexed(dn,stage->hidden.data_ptr(),stage->pairs.data_ptr(),int(stage->slots),
+                    int(banks.down->out),stage->type,tile,stage->stream.stream()));
+                window.mark_current("resident_down_end");return;
+            }
+            status(mfq_tq_snapshot_resident(stage->resident_views->device_pointers(0),
+                stage->resident_views->device_pointers(1),stage->resident_views->device_pointers(2),device_ids,
+                selected,stage->routes,int(banks.gate->experts),stage->stream.stream()));
+            window.mark_current("hot_begin");
+            status(mfq_tq_partition_swiglu(selected,selected+stage->routes,selected,device_ids,input_values,
+                stage->hidden.data_ptr(),stage->routes,int(banks.gate->experts),int(banks.up->out),stage->type,limit,
+                true,nullptr,stage->stream.stream()));
+            window.mark_current("resident_gate_up_end");
+            status(mfq_tq_partition_down(selected+2*stage->routes,selected,device_ids,stage->hidden.data_ptr(),
+                stage->pairs.data_ptr(),stage->routes,int(banks.gate->experts),int(banks.down->out),int(banks.up->out),
+                stage->type,true,nullptr,stage->stream.stream()));
+            window.mark_current("resident_down_end");
+        },[&] {
+            if(stage->direct) {
+                auto* flags=static_cast<uint32_t*>(stage->mapped_routes);
+                mfq::cuda::wait_mapped_plan(flags+TqMoeGraphStage::upload_word,nullptr,nullptr,0,
+                    flags+TqMoeGraphStage::abort_word,reinterpret_cast<uint32_t*>(stage->cancelled.data_ptr()),stage->stream.stream());
+            }
+            window.mark_current(overlap?"stream_gate_up_join":"hot_begin");
+        },[&] {
+            if(stage->tokens>1) {
+                stage->indexed(limit,window,capture==cudaStreamCaptureStatusActive,input_values,false);return;
+            }
+            const auto* gate=reinterpret_cast<const TrellisProjectionView*>(
+                overlap?stage->stream_views.data_ptr():stage->views[0].data_ptr());
+            const auto* up=overlap?gate+stage->slots:reinterpret_cast<const TrellisProjectionView*>(stage->views[1].data_ptr());
+            if(overlap)status(mfq_tq_partition_slot_swiglu(gate,up,selected,device_ids,input_values,stage->hidden.data_ptr(),
+                stage->routes,int(banks.gate->experts),int(banks.up->out),stage->type,limit,abort,stage->stream.stream()));
+            else if(stage->direct)status(mfq_tq_routed_guarded_swiglu(gate,up,device_ids,input_values,stage->hidden.data_ptr(),
+                stage->routes,int(banks.up->out),stage->type,limit,abort,stage->stream.stream()));
+            else status(mfq_tq_routed_swiglu(gate,up,device_ids,input_values,stage->hidden.data_ptr(),
+                stage->routes,int(banks.up->out),stage->type,limit,stage->stream.stream()));
+            window.mark_current("gate_up_end");
+        },[&] {
+            if(!stage->direct)return;
+            auto* flags=static_cast<uint32_t*>(stage->mapped_routes);
+            mfq::cuda::wait_mapped_plan(flags+TqMoeGraphStage::down_word,nullptr,nullptr,0,
+                flags+TqMoeGraphStage::abort_word,reinterpret_cast<uint32_t*>(stage->cancelled.data_ptr()),stage->stream.stream());
+            window.mark_current("stream_down_join");
+        },[&] {
+            if(stage->tokens>1) {
+                stage->indexed(limit,window,capture==cudaStreamCaptureStatusActive,input_values,true);return;
+            }
+            const auto* down=overlap?reinterpret_cast<const TrellisProjectionView*>(stage->stream_views.data_ptr())+2*stage->slots:
+                reinterpret_cast<const TrellisProjectionView*>(stage->views[2].data_ptr());
+            if(overlap)status(mfq_tq_partition_slot_down(down,selected,device_ids,stage->hidden.data_ptr(),stage->pairs.data_ptr(),
+                stage->routes,int(banks.gate->experts),int(banks.down->out),int(banks.up->out),stage->type,abort,stage->stream.stream()));
+            else if(stage->direct)status(mfq_tq_routed_guarded_down(down,device_ids,stage->hidden.data_ptr(),stage->pairs.data_ptr(),
+                stage->routes,int(banks.down->out),int(banks.up->out),stage->type,abort,stage->stream.stream()));
+            else status(mfq_tq_routed_down(down,device_ids,stage->hidden.data_ptr(),stage->pairs.data_ptr(),
+                stage->routes,int(banks.down->out),int(banks.up->out),stage->type,stage->stream.stream()));
+        },[&] {
+            window.mark_current("down_end");
+            status(mfq_tq_weighted_reduce(stage->pairs.data_ptr(),views?weights.data_ptr<float>():stage->weights.data_ptr<float>(),stage->result.data_ptr(),
+                stage->tokens,stage->routes,int(banks.down->out),stage->type,stage->stream.stream()));
+            window.mark_current("hot_end");return stage->result;
+        });
+    };
+    if(auto output=try_independent_branch(shared_executor,independent_work,compute,stage->tokens,
+            stage->upload_stream.stream()))return *output;
+    if(independent_work)independent_work();
+    return compute();
 }
 }
 
 tb::Tensor TqMoeBanks::forward(tb::Tensor input_value,tb::Tensor ids,
-        tb::Tensor weights,float limit,CudaProfiler* profiler,std::int64_t expert_begin,std::int64_t expert_end)const {
+        tb::Tensor weights,float limit,CudaProfiler* profiler,std::int64_t expert_begin,std::int64_t expert_end,
+        const std::function<void()>& independent_work,CudaIndependentBranchExecutor* shared_executor)const {
     const auto phase=[&](const char* name,auto&& operation) {
         return profiler?profiler->measure(name,operation):operation();
     };
@@ -1745,8 +3805,15 @@ tb::Tensor TqMoeBanks::forward(tb::Tensor input_value,tb::Tensor ids,
         throw std::overflow_error("TQ MoE activation dimensions exceed CUDA limits");
     const auto source=input_value.contiguous();
     const MfqCudaGuard guard(source.get_device());
+    if(tokens<=32 && shared_executor && independent_work && !mfq::cuda::DecodeWindow::recording()) {
+        if(auto output=try_independent_branch(shared_executor,independent_work,[&] {
+            return forward(source,ids,weights,limit,profiler,expert_begin,expert_end);
+        },tokens,gate->cache->transfer_stream(source.get_device()).stream()))return *output;
+    }
     if(auto* window=mfq::cuda::DecodeWindow::recording();!partitioned && window && tq_graph_supports_tokens(tokens) && ids.device()==source.device())
-        return tq_graph_forward(*this,source,ids,weights,limit,*window);
+        return tq_graph_forward(*this,source,ids,weights,limit,*window,independent_work,shared_executor);
+    gate->cache->wait_ready();
+    if(independent_work)independent_work();
     auto result=tb::empty({tokens,width},source.options());
     if(!tokens)return result;
     const auto type=dtype(source.scalar_type());
@@ -1756,38 +3823,12 @@ tb::Tensor TqMoeBanks::forward(tb::Tensor input_value,tb::Tensor ids,
     // Router output is normally int32. Widen this tiny ID list on CPU after
     // the readback, avoiding a GPU allocation/conversion before every wait.
     const auto host=phase("tq.moe.routes",[&] {return gate->cache->read_routes(ids);});
-    const auto* selected=host.data();
     std::vector<std::int64_t> unique;
     std::vector<std::vector<std::int64_t>> slots;
-    if(static_cast<std::uint64_t>(up->experts)<=host.size()) {
-        // Dense counters use no more memory than the route readback. Count
-        // first to reserve each expert's slots once, then reuse counters as
-        // indices. Sparse expert domains retain bounded hash lookup below.
-        std::vector<std::size_t> positions(static_cast<std::size_t>(up->experts),0);
-        for(const auto expert:host) {
-            if(expert<0 || expert>=up->experts)throw std::out_of_range("TQ routed expert ID is out of bounds");
-            if(expert<expert_begin || expert>=expert_end)continue;
-            if(!positions[expert]++)unique.push_back(expert);
-        }
-        slots.resize(unique.size());
-        for(std::size_t i=0;i<unique.size();++i) {
-            auto& count=positions[unique[i]];slots[i].reserve(count);count=i;
-        }
-        for(std::size_t i=0;i<host.size();++i)
-            if(selected[i]>=expert_begin && selected[i]<expert_end)slots[positions[selected[i]]].push_back(i);
-    }else {
-        std::unordered_map<std::int64_t,std::size_t> positions;
-        positions.reserve(host.size());
-        for(std::size_t i=0;i<host.size();++i) {
-            const auto expert=selected[i];
-            if(expert<0 || expert>=up->experts)throw std::out_of_range("TQ routed expert ID is out of bounds");
-            if(expert<expert_begin || expert>=expert_end)continue;
-            const auto [position,inserted]=positions.emplace(expert,unique.size());
-            if(inserted){unique.push_back(expert);slots.emplace_back();}
-            slots[position->second].push_back(i);
-        }
-    }
+    mfq::cuda::group_routed_experts(host,up->experts,unique,&slots,expert_begin,expert_end);
     if(unique.empty())return tb::zeros({tokens,width},source.options());
+    if(tokens>32 && gate->cache==up->cache && gate->cache==down->cache)
+        gate->cache->record_prefill({gate->source_id,up->source_id,down->source_id},unique,slots,tokens,source.get_device());
     // Choose GEMM by each expert's actual token count. A long prompt can
     // still have many sparsely selected experts that belong in indexed jobs.
     std::size_t long_groups=0;
@@ -1796,10 +3837,11 @@ tb::Tensor TqMoeBanks::forward(tb::Tensor input_value,tb::Tensor ids,
     }
     const auto resources=tq_gemm_resources(source.get_device());
     std::size_t prefill_groups=0;
-    if(type==0 && width==up->input && hidden<=INT_MAX/2) {
+    if(type==0 && (width==up->input || (tokens>32 && resources->prefill_mma())) && hidden<=INT_MAX/2) {
         // Batch up to two 128-token reuse tiles to amortize expert dispatch.
         // Larger groups retain GEMM, which decodes each weight tile once.
-        for(std::size_t i=0;i<long_groups;++i)if(slots[i].size()<=256) {
+        if(tokens>32)prefill_groups=long_groups=unique.size();
+        else for(std::size_t i=0;i<long_groups;++i)if(slots[i].size()<=256) {
             std::swap(unique[i],unique[prefill_groups]);std::swap(slots[i],slots[prefill_groups]);++prefill_groups;
         }
     }
@@ -1825,17 +3867,21 @@ tb::Tensor TqMoeBanks::forward(tb::Tensor input_value,tb::Tensor ids,
         const auto stream=mfq_get_current_cuda_stream(source.get_device());
         resources->retain(stream);
         std::size_t gemm_groups=0;
-        while(gemm_groups<prefill_groups && (!resources->prefill_mma() || slots[gemm_groups].size()>128))++gemm_groups;
+        // PP follows the GGUF decoded-GEMM schedule. Short verification keeps
+        // its direct tile kernel; long prompts decode each expert only once.
+        while(gemm_groups<prefill_groups && (tokens>32 || !resources->prefill_mma() || slots[gemm_groups].size()>128))++gemm_groups;
         const auto job_bytes=(prefill_groups*sizeof(TrellisPrefillMoeJob)+15)&~std::size_t(15);
-        TqPrefillPlanLease lease{resources->prefill_plan(job_bytes+selected_slots*sizeof(int64_t)),stream.stream()};
+        const mfq::cuda::RoutedPrefillRoutes route_plan(prefill_groups,[&](auto i)->const auto&{return slots[i];});
+        const auto bounds_offset=job_bytes+selected_slots*sizeof(int64_t);
+        const auto static_bytes=(selected_slots+prefill_groups+1)*sizeof(int64_t);
+        TqPrefillPlanLease lease{resources->prefill_plan(job_bytes+static_bytes),stream.stream()};
         auto* host_bytes=static_cast<std::uint8_t*>(lease.plan->host.data_ptr());
         auto* device_bytes=static_cast<std::uint8_t*>(lease.plan->device.data_ptr());
         auto* host_slots=reinterpret_cast<int64_t*>(host_bytes+job_bytes);
-        std::size_t first=0;
-        for(std::size_t i=0;i<prefill_groups;++i) {
-            std::memcpy(host_slots+first,slots[i].data(),slots[i].size()*sizeof(int64_t));first+=slots[i].size();
-        }
-        TYLOINFER_CUDA_CHECK(cudaMemcpyAsync(device_bytes+job_bytes,host_slots,selected_slots*sizeof(int64_t),
+        const auto& slot_offsets=route_plan.bounds;
+        std::memcpy(host_slots,route_plan.slots.data(),selected_slots*sizeof(int64_t));
+        std::memcpy(host_bytes+bounds_offset,slot_offsets.data(),slot_offsets.size()*sizeof(int64_t));
+        TYLOINFER_CUDA_CHECK(cudaMemcpyAsync(device_bytes+job_bytes,host_slots,static_bytes,
             cudaMemcpyHostToDevice,stream.stream()));
         const auto free_bytes=[&] {
             return phase("tq.moe.capacity",[&] {
@@ -1843,87 +3889,134 @@ tb::Tensor TqMoeBanks::forward(tb::Tensor input_value,tb::Tensor ids,
             });
         };
         const auto available=free_bytes();
-        const auto max_width=std::uint64_t(std::max(up->input,hidden));
-        const auto output_width=std::uint64_t(std::max(up->input,2*hidden));
-        const auto max_capacity=(slots[0].size()+15)&~std::size_t(15);
-        const auto minimum_activations=max_capacity*(gemm_groups?2*max_width+4*output_width:4*max_width+2*hidden)+32;
-        std::uint64_t useful_activations=gemm_groups?
-            max_capacity*(2*max_width+4*output_width)*std::min<std::size_t>(16,gemm_groups)+32:0;
-        if(gemm_groups<prefill_groups) {
-            const auto short_capacity=(slots[gemm_groups].size()+15)&~std::size_t(15);
-            const auto useful=short_capacity*(4*max_width+2*hidden)*(prefill_groups-gemm_groups)+32;
-            useful_activations=std::max<std::uint64_t>(useful_activations,
-                std::min<std::uint64_t>(std::uint64_t(16)<<20,useful));
+        std::size_t image_per_expert=0;
+        for(std::size_t i=0;i<prefill_groups;++i) {
+            std::size_t bytes=0;
+            for(const auto* bank:{gate.get(),up.get(),down.get()}) {
+                const auto size=bank->table->expert_image_bytes(unique[i],bank->out);
+                bytes=mfq::cuda::routed_saturating_add(bytes,(size+15)&~std::size_t(15));
+            }
+            image_per_expert=std::max(image_per_expert,bytes);
         }
-        const auto activation_budget=std::max<std::uint64_t>(minimum_activations,
-            std::min<std::uint64_t>({std::uint64_t(gemm_groups?64:16)<<20,available/16,useful_activations}));
-        auto activations=tb::empty({static_cast<int64_t>(activation_budget)},source.options().dtype(tb::kUInt8));
+        // Match the bounded compressed PP staging used by the GGUF adapter.
+        // Actual encoded sizes include row metadata and heterogeneous bits.
+        const auto image_budget=std::max<std::size_t>(image_per_expert,
+            std::min<std::size_t>(std::size_t(64)<<20,available/4));
+        const auto image_capacity=std::min(mfq::cuda::routed_prefill_group_capacity(prefill_groups,image_per_expert,
+            2.L*(2.L*up->input*hidden+static_cast<long double>(hidden)*width)),
+            std::max<std::size_t>(1,image_budget/image_per_expert));
+        const auto group_ends=mfq::cuda::routed_prefill_group_ends(prefill_groups,image_capacity,
+            [&](auto i){return slots[i].size();});
+        // Price the compute batches that these image groups actually allow.
+        // Compact kernels need only valid routes; legacy verification keeps
+        // its padded buffers. Neither workspace scales with the whole layer.
+        const auto workspace=mfq::cuda::routed_prefill_workspace_plan(group_ends,gemm_groups,
+            [&](auto i){return slots[i].size();},
+            mfq::cuda::RoutedPrefillWorkspaceShape{std::uint64_t(up->input),std::uint64_t(hidden),std::uint64_t(width)},
+            std::min<std::uint64_t>(std::uint64_t(gemm_groups?64:16)<<20,available/16),
+            std::min<std::uint64_t>(std::uint64_t(256)<<20,available/4),resources->prefill_mma());
+        const auto image_batch=workspace.peak_image_batch;
+        if(workspace.activation_bytes>std::uint64_t(INT64_MAX) || workspace.decoded_bytes>std::uint64_t(INT64_MAX))
+            throw std::overflow_error("TQ prefill workspace exceeds tensor byte limits");
+        auto activations=tb::empty({static_cast<int64_t>(workspace.activation_bytes)},source.options().dtype(tb::kUInt8));
         tb::Tensor decoded;
         cublasHandle_t blas=nullptr;
         if(gemm_groups) {
-            const auto useful=4*std::uint64_t(up->input)*hidden*std::min<std::size_t>(16,gemm_groups);
-            const auto bytes=std::max<std::uint64_t>(max_width*2,
-                std::min<std::uint64_t>({std::uint64_t(128)<<20,available/16,useful}));
-            decoded=tb::empty({static_cast<int64_t>(bytes)},source.options().dtype(tb::kUInt8));
-            blas=resources->get();
+            decoded=tb::empty({static_cast<int64_t>(workspace.decoded_bytes)},source.options().dtype(tb::kUInt8));
+            if(std::any_of(workspace.tiles.begin(),workspace.tiles.end(),
+                    [](const auto& tile){return tile.gemm && !tile.compact;}))blas=resources->get();
         }
-        const auto image_bound=[](const TqRoutedWeight& w) {
-            return std::uint64_t(w.out)*(((std::uint64_t(w.input)+255)&~std::uint64_t(255))*2+16)+512;
-        };
-        const auto image_per_expert=image_bound(*gate)+image_bound(*up)+image_bound(*down);
-        // Image leases and compute scratch have independent live budgets.
-        // Account for allocated scratch before admitting compressed misses.
-        const auto image_batch=std::min<std::size_t>(prefill_groups,
-            std::max<std::uint64_t>(1,(free_bytes()/2)/image_per_expert));
+        TqPrefillWeightPipeline pipeline(stream,gate->cache->transfer_stream(source.get_device()));
+        {
+            const MfqCudaStreamGuard transfer(pipeline.upload);
+            const mfq::cuda::RoutedWeightAllocationScope temporary(false);
+            for(auto& stage:pipeline.stages)stage.workspace.image=tb::empty(
+                {int64_t(image_batch*image_per_expert)},source.options().dtype(tb::kUInt8));
+        }
+        if(const auto* trace=std::getenv("TYLOINFER_TRACE_KERNEL_DISPATCH");trace && trace[0]=='1') {
+            static std::atomic<bool> seen{false};
+            if(!seen.exchange(true,std::memory_order_relaxed))std::fprintf(stderr,
+                "native_tq_prefill_weight_pipeline actual_match=1 arenas=2 gate_up_early=1 decoded_gemm=%d compact_gemm=%zu compute_tiles=%zu activation_bytes=%llu decoded_bytes=%llu bytes_per_arena=%zu image_batch=%zu\n",
+                int(gemm_groups==prefill_groups),std::count_if(workspace.tiles.begin(),workspace.tiles.end(),
+                    [](const auto& tile){return tile.compact;}),workspace.tiles.size(),
+                static_cast<unsigned long long>(workspace.activation_bytes),
+                static_cast<unsigned long long>(workspace.decoded_bytes),image_batch*image_per_expert,image_batch);
+        }
+        auto staging=gate->cache==up->cache && gate->cache==down->cache?
+            gate->cache->prepare_prefill_staging({gate->source_id,up->source_id,down->source_id},
+                {unique.data(),prefill_groups},group_ends,source.get_device()):std::shared_ptr<void>{};
         if(std::getenv("TYLOINFER_TQ_PROFILE_CACHE"))std::fprintf(stderr,
             "tq_prefill_moe jobs=%zu gemm_jobs=%zu scratch=%lld decoded=%lld image_batch=%zu\n",
             prefill_groups,gemm_groups,static_cast<long long>(activations.numel()),
             static_cast<long long>(decoded.defined()?decoded.numel():0),image_batch);
-        first=0;
-        for(std::size_t begin=0;begin<prefill_groups;begin+=image_batch) {
-            const auto count=std::min(image_batch,prefill_groups-begin);
-            const auto banks=phase("tq.moe.weights",[&] {
-                return std::array<std::vector<TqWeight>,3>{
-                    gate->cache->get_rows(gate->source_id,unique.data()+begin,count,*gate->table,gate->out,source.get_device()),
-                    up->cache->get_rows(up->source_id,unique.data()+begin,count,*up->table,up->out,source.get_device()),
-                    down->cache->get_rows(down->source_id,unique.data()+begin,count,*down->table,down->out,source.get_device())};
+        const auto acquire=[&](std::size_t group) {
+            const auto begin=group?group_ends[group-1]:0;
+            const auto count=group_ends[group]-begin;
+            auto& stage=pipeline.stages[group%pipeline.stages.size()];
+            const MfqCudaStreamGuard transfer(pipeline.upload);
+            // Cache intervals remain leased until their reader dependency has
+            // been published on the stream that may overwrite them.
+            for(auto& bank:stage.banks)bank.clear();
+            stage.workspace.cursor=0;
+            stage.banks=phase("tq.moe.weights",[&] {
+                std::array<std::vector<TqWeight>,3> banks;
+                banks[0]=
+                    gate->cache->get_rows(gate->source_id,unique.data()+begin,count,*gate->table,gate->out,source.get_device(),
+                        nullptr,mfq::cuda::RoutedImageUse::Eager,nullptr,&stage.workspace);
+                banks[1]=
+                    up->cache->get_rows(up->source_id,unique.data()+begin,count,*up->table,up->out,source.get_device(),
+                        nullptr,mfq::cuda::RoutedImageUse::Eager,nullptr,&stage.workspace);
+                pipeline.schedule.gate_up_ready[group%pipeline.stages.size()].record(pipeline.upload.stream());
+                banks[2]=
+                    down->cache->get_rows(down->source_id,unique.data()+begin,count,*down->table,down->out,source.get_device(),
+                        nullptr,mfq::cuda::RoutedImageUse::Eager,nullptr,&stage.workspace);
+                return banks;
             });
             for(std::size_t i=0;i<count;++i) {
                 const auto index=begin+i;
-                const TrellisPrefillMoeJob job{banks[0][i].view,banks[1][i].view,banks[2][i].view,
-                    static_cast<int64_t>(first),static_cast<int>(slots[index].size())};
-                std::memcpy(host_bytes+index*sizeof(job),&job,sizeof(job));first+=slots[index].size();
+                const TrellisPrefillMoeJob job{stage.banks[0][i].view,stage.banks[1][i].view,stage.banks[2][i].view,
+                    static_cast<int64_t>(slot_offsets[index]),static_cast<int>(slots[index].size())};
+                std::memcpy(host_bytes+index*sizeof(job),&job,sizeof(job));
             }
+        };
+        pipeline.schedule.run(group_ends.size(),acquire,[&](std::size_t group) {
+            const auto begin=group?group_ends[group-1]:0;
+            const auto count=group_ends[group]-begin;
+            auto& stage=pipeline.stages[group%pipeline.stages.size()];
             const auto offset=begin*sizeof(TrellisPrefillMoeJob);
             TYLOINFER_CUDA_CHECK(cudaMemcpyAsync(device_bytes+offset,host_bytes+offset,count*sizeof(TrellisPrefillMoeJob),
                 cudaMemcpyHostToDevice,stream.stream()));
-            for(std::size_t tile=begin;tile<begin+count;) {
-                const bool gemm=tile<gemm_groups;
-                const auto capacity=(slots[tile].size()+15)&~std::size_t(15);
-                const auto per_expert=capacity*(gemm?2*max_width+4*output_width:4*max_width+2*hidden);
-                const auto act_limit=gemm?activation_budget:std::min<std::uint64_t>(activation_budget,std::uint64_t(16)<<20);
-                auto tile_count=std::min<std::size_t>({begin+count-tile,65535,
-                    std::max<std::uint64_t>(1,(act_limit-std::min<std::uint64_t>(32,act_limit))/per_expert)});
-                if(gemm) {
-                    // Bound independent GEMMs while keeping full weight tiles
-                    // when possible; larger matrices still use row tiling.
-                    const auto full_tile=4*std::uint64_t(up->input)*hidden;
-                    tile_count=std::min<std::size_t>({tile_count,gemm_groups-tile,16,
-                        std::max<std::uint64_t>(1,decoded.nbytes()/full_tile)});
-                }
+            pipeline.schedule.join(group,true);
+            const auto first_compute=group?workspace.group_tile_ends[group-1]:0;
+            for(auto compute=first_compute;compute<workspace.group_tile_ends[group];++compute) {
+                const auto& compute_tile=workspace.tiles[compute];
+                const auto tile=compute_tile.begin,tile_count=compute_tile.end-tile;
+                const auto capacity=compute_tile.capacity;
+                const bool gemm=compute_tile.gemm;
                 const auto* plan=reinterpret_cast<const TrellisPrefillMoeJob*>(device_bytes+tile*sizeof(TrellisPrefillMoeJob));
                 const auto* device_slots=reinterpret_cast<const int64_t*>(device_bytes+job_bytes);
-                if(gemm)phase("tq.moe.prefill_gemm",[&] {status(mfq_tq_prefill_moe_gemm(plan,device_slots,
+                const auto* device_bounds=reinterpret_cast<const int64_t*>(device_bytes+bounds_offset)+tile;
+                const auto down_ready=pipeline.schedule.ready[group%pipeline.stages.size()].get();
+                if(gemm)phase("tq.moe.prefill_gemm",[&] {
+                    // The common compact product uses SM70 FP16 WMMA. cuBLAS
+                    // retains the established path on earlier instruction sets.
+                    if(compute_tile.compact)status(mfq_tq_prefill_moe_compact(plan,device_slots,device_bounds,
+                        source.data_ptr(),pairs.data_ptr(),static_cast<int>(tile_count),static_cast<int>(capacity),
+                        slot_offsets[tile],static_cast<int64_t>(compute_tile.rows),
+                        static_cast<int>(up->input),static_cast<int>(hidden),static_cast<int>(width),static_cast<int>(routes),limit,
+                        decoded.data_ptr(),decoded.nbytes(),activations.data_ptr(),activations.nbytes(),down_ready,stream.stream()));
+                    else status(mfq_tq_prefill_moe_gemm_staged(plan,device_slots,source.data_ptr(),pairs.data_ptr(),
+                        static_cast<int>(tile_count),static_cast<int>(capacity),static_cast<int>(up->input),static_cast<int>(hidden),
+                        static_cast<int>(routes),limit,decoded.data_ptr(),decoded.nbytes(),activations.data_ptr(),activations.nbytes(),
+                        blas,down_ready,stream.stream()));
+                    return 0;
+                });
+                else phase("tq.moe.prefill",[&] {status(mfq_tq_prefill_moe_staged(plan,device_slots,
                     source.data_ptr(),pairs.data_ptr(),static_cast<int>(tile_count),static_cast<int>(capacity),
                     static_cast<int>(up->input),static_cast<int>(hidden),static_cast<int>(routes),limit,
-                    decoded.data_ptr(),decoded.nbytes(),activations.data_ptr(),activations.nbytes(),blas,stream.stream()));return 0;});
-                else phase("tq.moe.prefill",[&] {status(mfq_tq_prefill_moe(plan,device_slots,
-                    source.data_ptr(),pairs.data_ptr(),static_cast<int>(tile_count),static_cast<int>(capacity),
-                    static_cast<int>(up->input),static_cast<int>(hidden),static_cast<int>(routes),limit,
-                    activations.data_ptr(),activations.nbytes(),stream.stream()));return 0;});
-                tile+=tile_count;
+                    activations.data_ptr(),activations.nbytes(),down_ready,stream.stream()));return 0;});
             }
-        }
+        });
     }
     if(prefill_groups<long_groups) {
         // Long prefill gathers one expert's rows and uses the ordinary
@@ -1934,6 +4027,7 @@ tb::Tensor TqMoeBanks::forward(tb::Tensor input_value,tb::Tensor ids,
             const auto g=gate->cache->get_rows(gate->source_id,&expert,1,*gate->table,gate->out,source.get_device());
             const auto u=up->cache->get_rows(up->source_id,&expert,1,*up->table,up->out,source.get_device());
             const auto d=down->cache->get_rows(down->source_id,&expert,1,*down->table,down->out,source.get_device());
+            const TqExpertReadFence reads({&g,&u,&d},source.get_device());
             std::vector<std::int64_t> token_ids;token_ids.reserve(slots[index].size());
             for(const auto slot:slots[index])token_ids.push_back(slot/routes);
             const auto token_index=tb::from_blob(token_ids.data(),{static_cast<std::int64_t>(token_ids.size())},
@@ -1973,6 +4067,7 @@ tb::Tensor TqMoeBanks::forward(tb::Tensor input_value,tb::Tensor ids,
                     down->cache->get_rows(down->source_id,unique.data()+begin,count,*down->table,down->out,source.get_device())};
             });
             const auto& g=banks[0];const auto& u=banks[1];const auto& d=banks[2];
+            const TqExpertReadFence reads({&g,&u,&d},source.get_device());
             if(tokens==1 && unique.size()==static_cast<std::size_t>(routes)) {
                 // Preserve the tuned single-vector geometry. Each selected
                 // expert gets one slot, with no multi-token dummy work.
@@ -2041,9 +4136,10 @@ tb::Tensor TqMoeBanks::forward(tb::Tensor input_value,tb::Tensor ids,
 }
 
 tb::Tensor TqMoeBanks::forward_parallel(CudaExecutionContext& execution,tb::Tensor input,
-        tb::Tensor ids,tb::Tensor weights,float limit)const {
+        tb::Tensor ids,tb::Tensor weights,float limit,const std::function<void()>& independent_work,CudaIndependentBranchExecutor* shared_executor)const {
     const auto& parallel=moe_parallel_config(execution);
-    if(!parallel.enabled())return forward(std::move(input),std::move(ids),std::move(weights),limit,&execution.profiler);
+    if(!parallel.enabled())return forward(std::move(input),std::move(ids),std::move(weights),limit,&execution.profiler,0,-1,independent_work,shared_executor);
+    if(independent_work)independent_work();
     if(!gate)throw std::invalid_argument("TQ expert parallelism requires a Gate bank");
     const auto slices=plan_moe_expert_parallel_slices(parallel,gate->experts,"TQ experts");
     std::vector<tb::Tensor> partials(slices.size());

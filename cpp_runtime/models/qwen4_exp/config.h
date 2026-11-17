@@ -36,17 +36,21 @@ struct Config {
 
     template <class Source> static Config from_source(const Source &source) {
         const auto graph = source.resolved_model_graph();
-        if (graph.backbone != "qwen4_exp") {
-            throw std::runtime_error("Qwen4-Exp loading requires a qwen4_exp model graph");
+        if (graph.backbone != "qwen4_exp" && graph.backbone != "qwen4") {
+            throw std::runtime_error("Qwen4 loading requires a compatible model graph");
         }
-        return from_json(source.model_config_json());
+        auto result=from_json(source.model_config_json());
+        if(source.legacy_tensor_compatibility().layout.qwen_gdn_gguf_layout)result.linear_tiled_heads=true;
+        return result;
     }
     static Config parse(const nlohmann::json &outer) {
         const auto &text = outer.contains("text_config") ? outer.at("text_config") : outer;
         const auto outer_type = outer.value("model_type", std::string{});
-        if ((outer_type != "qwen4_exp" && outer_type != "qwen4_exp_text") ||
-            text.value("model_type", outer_type) != "qwen4_exp_text")
-            throw std::runtime_error("expected Qwen4-Exp text config");
+        const bool dense=outer_type=="qwen4" || outer_type=="qwen4_text";
+        const auto expected=dense?"qwen4_text":"qwen4_exp_text";
+        if ((!dense && outer_type != "qwen4_exp" && outer_type != "qwen4_exp_text") ||
+            text.value("model_type", outer_type) != expected)
+            throw std::runtime_error("expected a Qwen4 text config");
         const auto positive = [&](const char *key) {
             const auto &v = text.at(key);
             if (!v.is_number_integer() || v.get<int64_t>() <= 0)
@@ -98,10 +102,16 @@ struct Config {
         c.value_heads = positive("linear_num_value_heads");
         c.linear_width = positive("linear_key_head_dim");
         c.kernel = positive("linear_conv_kernel_dim");
-        c.experts = positive("num_experts");
-        c.topk = positive("num_experts_per_tok");
-        c.moe_width = positive("moe_intermediate_size");
-        c.shared_width = positive("shared_expert_intermediate_size");
+        if(dense) {
+            if(text.value("num_experts",int64_t(0))!=0)
+                throw std::runtime_error("Dense Qwen4 cannot declare routed experts");
+            c.experts=0;c.topk=0;c.shared_width=0;c.moe_width=positive("intermediate_size");
+        } else {
+            c.experts = positive("num_experts");
+            c.topk = positive("num_experts_per_tok");
+            c.moe_width = positive("moe_intermediate_size");
+            c.shared_width = positive("shared_expert_intermediate_size");
+        }
         c.index_heads = positive("indexer_n_heads");
         c.index_width = positive("indexer_head_dim");
         c.pool = positive("indexer_compress_ratio");
@@ -112,7 +122,7 @@ struct Config {
         c.shards = positive("split_ngram_parts");
         positive("ngram_vocab_size_base");
         if (c.heads % c.kv_heads || c.value_heads % c.key_heads ||
-            c.linear_width != positive("linear_value_head_dim") || c.kernel < 2 || c.streams < 2 ||
+            c.linear_width != positive("linear_value_head_dim") || c.kernel < 2 || c.streams < (dense?1:2) ||
             positive("ple_embed_dim") != c.hidden || c.ngram < 2 ||
             c.hidden % ((c.ngram - 1) * c.ngram_heads) || positive("indexer_kv_heads") != 1 ||
             c.budget % c.pool || c.topk > std::min<int64_t>(16, c.experts) || c.experts > 4096 ||

@@ -3,6 +3,7 @@ add_library(mfq-engine STATIC
     src/generation_policy.cpp
     src/mtp_metrics.cpp
     src/text_emitter.cpp
+    src/decision.cpp
 )
 add_library(mfq::engine ALIAS mfq-engine)
 target_include_directories(mfq-engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)

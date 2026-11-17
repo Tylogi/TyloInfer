@@ -3261,6 +3261,33 @@
         "title": "InputAudioDelta",
         "type": "object"
       },
+      "JevWeightMemoryEstimate": {
+        "additionalProperties": false,
+        "properties": {
+          "resident_vram_bytes": {
+            "minimum": 0.0,
+            "title": "Resident Vram Bytes",
+            "type": "integer"
+          },
+          "stream_ram_bytes": {
+            "minimum": 0.0,
+            "title": "Stream Ram Bytes",
+            "type": "integer"
+          },
+          "stream_vram_bytes": {
+            "minimum": 0.0,
+            "title": "Stream Vram Bytes",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "stream_vram_bytes",
+          "stream_ram_bytes",
+          "resident_vram_bytes"
+        ],
+        "title": "JevWeightMemoryEstimate",
+        "type": "object"
+      },
       "JobEventLevel": {
         "enum": [
           "debug",
@@ -3983,6 +4010,16 @@
             "title": "Id",
             "type": "string"
           },
+          "jev_weight_memory": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/JevWeightMemoryEstimate"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "loadable": {
             "title": "Loadable",
             "type": "boolean"
@@ -4037,6 +4074,11 @@
               }
             ],
             "title": "Ssd Ple Bytes"
+          },
+          "structured_decisions": {
+            "default": false,
+            "title": "Structured Decisions",
+            "type": "boolean"
           },
           "tensor_count": {
             "minimum": 0.0,
@@ -4720,6 +4762,15 @@
               }
             ],
             "title": "Idle Ttl Seconds"
+          },
+          "jev_weights": {
+            "default": "stream",
+            "enum": [
+              "stream",
+              "vram"
+            ],
+            "title": "Jev Weights",
+            "type": "string"
           },
           "kv_memory": {
             "$ref": "#/components/schemas/KvMemorySettings"
@@ -7627,6 +7678,18 @@
             ],
             "title": "Prefix Cache Ram Limit Bytes"
           },
+          "ram_embedding_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ram Embedding Bytes"
+          },
           "ram_expert_bytes": {
             "anyOf": [
               {
@@ -7684,6 +7747,18 @@
               }
             ],
             "title": "Ram Kv Limit Bytes"
+          },
+          "ram_weight_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ram Weight Bytes"
           },
           "resident_buffer_bytes": {
             "anyOf": [

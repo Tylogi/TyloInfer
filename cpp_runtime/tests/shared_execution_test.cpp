@@ -1771,6 +1771,9 @@ struct ParameterLoader {
     static Tensor gdn(GdnWeights w, const mfq::models::qwen4_exp::Config &) { return w[0]; }
     static Tensor qsa(QsaWeights w, const mfq::models::qwen4_exp::Config &) { return w[0]; }
     template <class... Args> static Tensor moe(Args &&...) { return "moe"; }
+    Tensor dense_ffn(const std::string& p,const mfq::models::qwen4_exp::Config&) {
+        linear(p+".gate.weight");linear(p+".up.weight");return linear(p+".down.weight");
+    }
     static Tensor gated_mlp(Tensor gate, Tensor, Tensor, double) { return gate; }
     auto embedding(const std::string &name) {
         return std::pair{dense(name), std::array<int64_t, 2>{32, bad_shard ? 7 : 8}};
@@ -1794,7 +1797,7 @@ struct ParameterLoader {
 static void family_parameter_loading_test() {
     using namespace mfq::models;
     qwen4_exp::Config q{};
-    q.hidden = 8; q.streams = 2; q.ngram = 2; q.ngram_heads = 1; q.shards = 2;
+    q.hidden = 8; q.streams = 2; q.ngram = 2; q.ngram_heads = 1; q.shards = 2;q.experts=8;
     q.layer_types = {"linear_attention", "full_attention"}; q.ple_layers = {1};
     q.predictor_layers = 3; // Predictor depth is independent of the backbone schedule.
     ParameterLoader qops;
@@ -1811,6 +1814,15 @@ static void family_parameter_loading_test() {
     }
     qops.bad_shard = true;
     try { qops.block(q, 0, false); assert(false); } catch (const std::runtime_error &) {}
+    auto dense_qsa=q;dense_qsa.experts=0;dense_qsa.streams=1;dense_qsa.ple_layers.clear();
+    ParameterLoader dense_ops;
+    const auto dense_block=dense_ops.block(dense_qsa,1,false);
+    assert(dense_block.ffn=="model.block.1.mlp.down.weight");
+    assert(dense_block.attention_gr=="model.block.1.attention.norm.weight" &&
+        dense_block.ffn_gr=="model.block.1.mlp.norm.weight");
+    assert(std::none_of(dense_ops.names.begin(),dense_ops.names.end(),[](const auto& name) {
+        return name.find("experts")!=std::string::npos || name.find("mhc")!=std::string::npos || name.find("router")!=std::string::npos;
+    }));
 
     glm5_next::Config g{};
     g.hidden = 8; g.predictor_layers = 3;

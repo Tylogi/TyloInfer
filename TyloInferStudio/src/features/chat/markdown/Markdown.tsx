@@ -68,12 +68,7 @@ const LANGUAGE_ALIASES: Record<string, string> = {
   svg: 'markup',
 };
 
-/**
- * 解析并匹配 Prism 支持的语法定义与规范化语言名称。
- *
- * @param lang 原始语言标记字符串
- * @returns 规范化的语言名、别名和对应的 Prism 语法定义
- */
+/** Normalize a language tag and resolve its Prism grammar. */
 function resolveLanguage(lang?: string): {
   rawLang: string;
   normalizedLang: string;
@@ -140,12 +135,7 @@ function useStreamingText(text: string, live: boolean): string {
   return live ? displayed : text;
 }
 
-/**
- * 将模型文本安全渲染为富文本；支持流式限频、Prism.js 代码语法高亮与 KaTeX 数学公式增强。
- *
- * @param props 组件入参
- * @returns 渲染后的富文本 DOM 结构
- */
+/** Sanitize and render streamed Markdown with syntax highlighting and math. */
 export const Markdown = memo(function Markdown({
   text,
   live = false,

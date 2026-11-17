@@ -9,7 +9,8 @@ import { formatNumber } from '../../app/formatters';
 import { ModelPressureBars } from './ModelMemoryPressure';
 import { availableResidentMemory, hasSeparateVram } from '../runtime/memoryArchitecture';
 import { ModelDeleteDialog } from './ModelDeleteDialog';
-import { availableLoadMemory } from './loadMemoryEstimate';
+import { availableLoadMemory, estimateModelWeights } from './loadMemoryEstimate';
+import { readLoadContext } from './loadContextDefaults';
 import { groupCheckpoints } from './checkpointGroups';
 
 export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useModelCatalog> }) {
@@ -72,7 +73,7 @@ export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useMo
         <div className="checkpoint-family-groups">
           {families.map((family, familyIndex) => <TMPanel className="model-catalog-panel model-library-panel checkpoint-family-panel" key={family.key}>
             <header className="checkpoint-family-heading">
-              <h3>{family.name || tr('其它', 'Other')}</h3>
+              <h3>{family.key === 'jev' ? tr('Jev 决策模型', 'Jev decision models') : family.name || tr('其它', 'Other')}</h3>
               <span>{(() => {
                 const count = family.models.reduce((sum, group) => sum + group.artifacts.filter(isComponent).length, 0);
                 return tr(`${family.count - count} 个版本${count ? ` · ${count} 个配套资产` : ''}`,
@@ -91,6 +92,10 @@ export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useMo
                 (candidate) => candidate.model === item.name && candidate.state !== 'failed',
               );
               const loaded = Boolean(instance) || item.name === runtime?.model;
+              const placement = instance?.memory?.ram_weight_bytes != null
+                ? instance.memory.ram_weight_bytes > 0 ? 'stream' : 'vram'
+                : (catalog.loadContextForModel?.(item.name) ?? readLoadContext(item.name)).jev_weights ?? 'stream';
+              const memory = estimateModelWeights(item, placement);
               const streamsExperts = !loaded && item.loadable && (item.estimated_weight_bytes_by_role?.experts ?? 0) > 0
                 && loadMemory != null && item.estimated_resident_weight_bytes != null && item.estimated_resident_weight_bytes > loadMemory;
               const unavailableLabel = item.complete && item.format === 'hf'
@@ -108,7 +113,10 @@ export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useMo
                     <small>{gib(item.total_bytes)} · {item.missing_shards
                       ? tr(`${item.shard_count} 个分片，缺 ${item.missing_shards} 片`, `${item.shard_count} shards, ${item.missing_shards} missing`)
                       : tr(`${item.shard_count} 个分片`, `${item.shard_count} shards`)}</small>
-                    {!component && <small>{tr('预计常驻内存', 'Estimated resident memory')} {gib(item.estimated_resident_weight_bytes)}
+                    {!component && <small>{item.structured_decisions
+                      ? <>{tr('预计显存常驻', 'Estimated resident VRAM')} {gib(memory?.vram)}
+                          {placement === 'stream' && <> · {tr('RAM 流式权重', 'RAM-streamed weights')} {gib(memory?.ram)}</>}</>
+                      : <>{tr('预计常驻内存', 'Estimated resident memory')} {gib(item.estimated_resident_weight_bytes)}</>}
                       {(item.ssd_ple_bytes ?? 0) > 0 && ` · SSD PLE ${gib(item.ssd_ple_bytes)}`}</small>}
                     {instance && <small className="model-library-runtime">{instance.state === 'busy' ? tr('使用中', 'Busy')
                       : instance.state === 'loading' ? tr('加载中', 'Loading') : instance.state === 'unloading' ? tr('卸载中', 'Unloading') : tr('就绪', 'Ready')}
@@ -130,7 +138,8 @@ export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useMo
                       {streamsExperts && <small className="model-streaming-notice" id={`expert-streaming-${item.id}`} title={streamingNotice}>{streamingNotice}</small>}
                     </div>
                     <div className="local-checkpoint-memory">
-                    <ModelPressureBars weights={item.estimated_resident_weight_bytes} roles={item.estimated_weight_bytes_by_role}
+                    <ModelPressureBars weights={memory?.total} roles={item.estimated_weight_bytes_by_role}
+                      combineMemory={item.structured_decisions && placement === 'stream'}
                       system={system} available={available} combineMoe showDetails={false}
                       label={tr('预计占剩余可用内存', 'Estimated share of remaining available memory')}
                       tr={tr} />

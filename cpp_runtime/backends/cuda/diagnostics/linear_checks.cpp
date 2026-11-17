@@ -137,6 +137,8 @@ int run_linear_check(
         ? (double)mxfp4_sq->blob.numel()
         : fp8_sq != nullptr
         ? (double)fp8_sq->blob.numel()
+        : linear.is_channel_fp8()
+        ? double(linear.channel_fp8.values.nbytes()+linear.channel_fp8.scales.nbytes())
         : (double)mxfp8->values.numel() + (double)mxfp8->scales.numel();
     std::cout << "shape=" << y_ref.sizes() << "\n";
     if (nint != nullptr) {
@@ -175,6 +177,9 @@ int run_linear_check(
                   << " block=" << fp8_sq->block_rows
                   << "x" << fp8_sq->block_columns
                   << " m=" << M << "\n";
+    } else if (linear.is_channel_fp8()) {
+        std::cout << "dtype=FP8-E4M3-CHANNEL dynamic_activations="
+                  << linear.channel_fp8.dynamic_activations << " m=" << M << "\n";
     } else {
         std::cout << "dtype=MXFP8 block=128x128 m=" << M << "\n";
     }

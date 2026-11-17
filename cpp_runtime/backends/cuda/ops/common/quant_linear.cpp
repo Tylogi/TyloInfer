@@ -1,4 +1,5 @@
 #include "../../runtime/execution_options.h"
+#include "../../runtime/layer_weight_stream.h"
 #include "mfq_cuda_activation_ops.h"
 #include "mfq_cuda_quant_ops.h"
 #include "mfq_cuda_nint_route_hint.h"
@@ -10,6 +11,8 @@
 #include "../../kernels/gguf.h"
 #include "float_projection.h"
 #include "tyloinfer/format_features.h"
+#include "tyloinfer/tq_rows.h"
+#include "tyloinfer/channel_fp8.h"
 #include "mfq_weight_memory.h"
 
 #include "format.h"
@@ -288,6 +291,13 @@ mfq_tensor_backend::Tensor run_quant_linear_shard(
             "MXFP4 tensor-parallel linear does not support input gating");
         return mxfp4_matmul(shard.mxfp4, x);
     }
+    if (shard.kind == QuantLinearKind::ChannelFp8) {
+        if (gate.has_value()) {
+            TYLOINFER_RUNTIME_CHECK(gate_mode == 1 || gate_mode == 2,"invalid FP8 input gate mode");
+            x = x * (gate_mode == 1 ? mfq_tensor_backend::sigmoid(gate.value()) : mfq_tensor_backend::silu(gate.value()));
+        }
+        return shard.channel_fp8.forward(x,&profiler);
+    }
     if (shard.kind == QuantLinearKind::Dense) {
         auto local = x.to(shard.dense.scalar_type());
         if (gate.has_value()) {
@@ -565,6 +575,29 @@ mfq_tensor_backend::Tensor reduce_model_parallel_outputs(
     return reduced.to(output_dtype).contiguous();
 }
 
+mfq_tensor_backend::Tensor QuantLinear::forward_rows(CudaExecutionContext& execution,
+        mfq_tensor_backend::Tensor input,const std::vector<int64_t>& rows) const {
+    namespace tb=mfq_tensor_backend;
+    if(!input.defined() || !input.is_cuda() || input.dim()<1 || input.size(-1)!=neuron_len() ||
+            (input.scalar_type()!=tb::kFloat16 && input.scalar_type()!=tb::kBFloat16 &&
+             input.scalar_type()!=tb::kFloat32))
+        throw std::invalid_argument("selected projection requires CUDA floating input with the weight width");
+    for(const auto row:rows)if(row<0 || row>=out())
+        throw std::out_of_range("selected projection output row is out of range");
+    auto shape=input.sizes().vec();shape.back()=int64_t(rows.size());
+    if(rows.empty() || !input.numel())return tb::empty(shape,input.options().dtype(tb::kFloat32));
+    auto ids=tb::tensor(rows,input.options().dtype(tb::kInt64));
+    // Input-dependent corrections and sharded projections retain their full
+    // execution contract. Static row corrections are part of embedding().
+    if(tensor_parallel() || is_mxfp4_sq() || is_fp8_sq() ||
+            (is_gguf() && gguf.projection_correction))
+        return forward(execution,std::move(input)).index_select(int64_t(shape.size())-1,ids).to(tb::kFloat32);
+    auto weights=is_gguf()?gguf.embedding(ids):quant_embedding_lookup(*this,ids);
+    weights=weights.to(input.device(),tb::kFloat32).reshape({int64_t(rows.size()),neuron_len()});
+    auto output=tb::matmul(input.reshape({-1,neuron_len()}).to(tb::kFloat32),weights.transpose(0,1));
+    return output.reshape(shape);
+}
+
 mfq_tensor_backend::Tensor quant_embedding_lookup(
         const QuantLinear & embedding,
         mfq_tensor_backend::Tensor token_ids) {
@@ -577,6 +610,7 @@ mfq_tensor_backend::Tensor quant_embedding_lookup(
         return embedding.dense.index_select(
             0, token_ids.reshape({-1})).reshape(output_shape);
     }
+    if (embedding.is_channel_fp8()) return embedding.channel_fp8.rows(token_ids);
     if (embedding.is_tq()) return embedding.tq.embedding(token_ids);
     if (embedding.is_gguf()) return embedding.gguf.embedding(token_ids).to(mfq_tensor_backend::kFloat16);
     if ((mfq::mfq_compat_enabled && embedding.is_nvq())) {
@@ -1163,7 +1197,33 @@ QuantLinear load_quant_linear(
         }
     } else
 #endif
-    if (dtype == "MXFP4") {
+    if (dtype == mfq::channel_fp8::dtype) {
+        result.kind = QuantLinearKind::ChannelFp8;
+        auto cpu = load_channel_fp8(read_tensor(execution.drop_file_cache,mfq,name),false,-1);
+        result.logical_out = cpu.out; result.logical_neuron_len = cpu.neuron_len;
+        const auto transfer = [](ChannelFp8Weight value,int device) {
+            MfqCudaGuard guard(device);
+            const auto target=mfq_tensor_backend::Device(mfq_tensor_backend::kCUDA,device);
+            value.values=value.values.to(target).contiguous();value.scales=value.scales.to(target).contiguous();
+            return value;
+        };
+        if (!cpu_layer && execution.tensor_parallel.enabled() && axis != TensorParallelAxis::Mirrored &&
+                (!cpu.dynamic_activations || axis == TensorParallelAxis::Output)) {
+            const bool output_axis=axis==TensorParallelAxis::Output;
+            for (const auto& slice:select_slices(output_axis?cpu.out:cpu.neuron_len,1)) {
+                QuantLinearShard shard;
+                shard.kind=result.kind;shard.device=slice.device;
+                shard.output_begin=output_axis?slice.begin:0;shard.output_end=output_axis?slice.end:cpu.out;
+                shard.input_begin=output_axis?0:slice.begin;shard.input_end=output_axis?cpu.neuron_len:slice.end;
+                auto part=cpu;
+                part.values=cpu.values.narrow(output_axis?0:1,slice.begin,slice.end-slice.begin).contiguous();
+                if(output_axis)part.scales=cpu.scales.narrow(0,slice.begin,slice.end-slice.begin).contiguous();
+                part.out=shard.output_end-shard.output_begin;part.neuron_len=shard.input_end-shard.input_begin;
+                shard.channel_fp8=transfer(std::move(part),slice.device);
+                result.tensor_parallel_shards.push_back(std::move(shard));
+            }
+        } else result.channel_fp8=cpu_layer?std::move(cpu):transfer(std::move(cpu),active_weight_load_device(execution));
+    } else if (dtype == "MXFP4") {
         result.kind = QuantLinearKind::Mxfp4;
         const auto cpu = unpack_mxfp4(
             read_tensor(execution.drop_file_cache, mfq, name));
@@ -1281,7 +1341,7 @@ QuantLinear load_quant_linear(
         }
     } else {
         throw std::runtime_error(
-            "linear tensor must be NINT/NVQ/MXFP4-SQ/MXFP8-SQ/FP8-128SQ/MXFP4/MXFP8/BF16/F16/F32: " +
+            "linear tensor must be NINT/NVQ/MXFP4-SQ/MXFP8-SQ/FP8-128SQ/MXFP4/MXFP8/FP8-E4M3-CHANNEL/BF16/F16/F32: " +
             name + " dtype=" + dtype);
     }
     return result;
@@ -1291,7 +1351,7 @@ bool is_quant_dtype(const std::string & dtype) {
     return mfq::gguf::is_quantized(dtype) || dtype == "TQ" || is_nint_linear_dtype(dtype) ||
         is_nvq_linear_dtype(dtype) || dtype == "MXFP4-SQ" ||
         mfq::fp8sq::is_dtype(dtype) ||
-        dtype == "MXFP4" || dtype == "MXFP8";
+        dtype == "MXFP4" || dtype == "MXFP8" || dtype == mfq::channel_fp8::dtype;
 }
 
 QuantLinearGroup make_quant_group(
@@ -1354,6 +1414,7 @@ static bool quant_linear_pair_compatible(const QuantLinear & a, const QuantLinea
                 b.tensor_parallel_shards.size();
     }
     if (a.kind != b.kind) return false;
+    if (a.is_channel_fp8()) return a.channel_fp8.neuron_len == b.channel_fp8.neuron_len;
     if (a.is_tq()) return a.tq.neuron_len == b.tq.neuron_len;
     if ((mfq::mfq_compat_enabled && a.is_nvq())) return nvq_pair_compatible(a.nvq, b.nvq);
     if (a.is_mxfp8()) {
@@ -1483,61 +1544,63 @@ DenseLinearGroup make_dense_group(const std::vector<mfq_tensor_backend::Tensor> 
 #include "../mfq/linear_reference.inc"
 #endif
 
-static mfq_tensor_backend::Tensor dequant_quant_linear_f32(
-        CudaExecutionContext& execution,
-        const QuantLinear& linear) {
-    if (!linear.tensor_parallel()) {
-        if (linear.is_tq()) {
-            return quant_linear_reference_weight(linear).to(mfq_tensor_backend::kFloat32).contiguous();
-        }
-#if TYLOINFER_ENABLE_MFQ_COMPAT
-        if ((mfq::mfq_compat_enabled && linear.is_nint())) {
-            return dequant_nint_dense_f32(linear.nint);
-        }
-#endif
-        if ((mfq::mfq_compat_enabled && linear.is_nvq())) {
-            return nvq_dequant(linear.nvq)
-                .to(mfq_tensor_backend::kFloat32).contiguous();
-        }
-        if (linear.is_mxfp8()) {
-            return mxfp8_dequant_cuda(
-                linear.mxfp8.weight.values,
-                linear.mxfp8.weight.scales)
-                .to(mfq_tensor_backend::kFloat32).contiguous();
-        }
-        if (linear.is_mxfp4()) {
-            return mxfp4_dequant_cuda(
-                linear.mxfp4.weight.values,
-                linear.mxfp4.weight.scales)
-                .to(mfq_tensor_backend::kFloat32).contiguous();
-        }
-#if TYLOINFER_ENABLE_MFQ_COMPAT
-        if ((mfq::mfq_compat_enabled && linear.is_mxfp4_sq())) {
-            const auto & weight = linear.mxfp4_sq.weight;
-            if (!weight.blob.is_cuda()) return dequant_mxfp4_sq_cpu(weight);
-            return mxfp4_sq_dequant_cuda(
-                weight.blob,
-                weight.row_q,
-                weight.row_symbol_byte_offsets,
-                weight.row_auxiliary,
-                weight.bits,
-                weight.out,
-                weight.neuron_len,
-                weight.matrix_scale_base,
-                weight.q_sum,
-                weight.sq4_rows,
-                true).contiguous();
-        }
-#endif
-        if ((mfq::mfq_compat_enabled && linear.is_fp8_sq())) {
-            return dequant_fp8_sq(linear.fp8_sq.weight, true).contiguous();
-        }
-        if (linear.is_dense()) {
-            return linear.dense.to(mfq_tensor_backend::kFloat32).contiguous();
-        }
-        throw std::runtime_error(
-            "unsupported linear kind for FP32 reconstruction");
+static mfq_tensor_backend::Tensor dequant_local_quant_linear_f32(const QuantLinear& linear) {
+    if (linear.is_channel_fp8()) return linear.channel_fp8.dequant();
+    if (linear.is_tq()) {
+        return quant_linear_reference_weight(linear).to(mfq_tensor_backend::kFloat32).contiguous();
     }
+#if TYLOINFER_ENABLE_MFQ_COMPAT
+    if ((mfq::mfq_compat_enabled && linear.is_nint())) {
+        return dequant_nint_dense_f32(linear.nint);
+    }
+#endif
+    if ((mfq::mfq_compat_enabled && linear.is_nvq())) {
+        return nvq_dequant(linear.nvq)
+            .to(mfq_tensor_backend::kFloat32).contiguous();
+    }
+    if (linear.is_mxfp8()) {
+        return mxfp8_dequant_cuda(
+            linear.mxfp8.weight.values,
+            linear.mxfp8.weight.scales)
+            .to(mfq_tensor_backend::kFloat32).contiguous();
+    }
+    if (linear.is_mxfp4()) {
+        return mxfp4_dequant_cuda(
+            linear.mxfp4.weight.values,
+            linear.mxfp4.weight.scales)
+            .to(mfq_tensor_backend::kFloat32).contiguous();
+    }
+#if TYLOINFER_ENABLE_MFQ_COMPAT
+    if ((mfq::mfq_compat_enabled && linear.is_mxfp4_sq())) {
+        const auto & weight = linear.mxfp4_sq.weight;
+        if (!weight.blob.is_cuda()) return dequant_mxfp4_sq_cpu(weight);
+        return mxfp4_sq_dequant_cuda(
+            weight.blob,
+            weight.row_q,
+            weight.row_symbol_byte_offsets,
+            weight.row_auxiliary,
+            weight.bits,
+            weight.out,
+            weight.neuron_len,
+            weight.matrix_scale_base,
+            weight.q_sum,
+            weight.sq4_rows,
+            true).contiguous();
+    }
+#endif
+    if ((mfq::mfq_compat_enabled && linear.is_fp8_sq())) {
+        return dequant_fp8_sq(linear.fp8_sq.weight, true).contiguous();
+    }
+    if (linear.is_dense()) {
+        return linear.dense.to(mfq_tensor_backend::kFloat32).contiguous();
+    }
+    throw std::runtime_error(
+        "unsupported linear kind for FP32 reconstruction");
+}
+
+static mfq_tensor_backend::Tensor dequant_quant_linear_f32(
+        CudaExecutionContext& execution,const QuantLinear& linear) {
+    if(!linear.tensor_parallel())return dequant_local_quant_linear_f32(linear);
     if (linear.tensor_parallel_axis != TensorParallelAxis::Output &&
         linear.tensor_parallel_axis != TensorParallelAxis::Input) {
         throw std::runtime_error(
@@ -1562,7 +1625,9 @@ static mfq_tensor_backend::Tensor dequant_quant_linear_f32(
                 .to(mfq_tensor_backend::kFloat32).contiguous();
         } else
 #endif
-        if (shard.kind == QuantLinearKind::Mxfp8) {
+        if (shard.kind == QuantLinearKind::ChannelFp8) {
+            part=shard.channel_fp8.dequant();
+        } else if (shard.kind == QuantLinearKind::Mxfp8) {
             part = mxfp8_dequant_cuda(
                 shard.mxfp8.values,
                 shard.mxfp8.scales)
@@ -1600,6 +1665,26 @@ static mfq_tensor_backend::Tensor dequant_quant_linear_f32(
             "reconstructed tensor-parallel linear shape mismatch");
     }
     return dense;
+}
+
+PrefillProjectionWeight prefill_projection_weight(const NintWeight& weight) {
+#if TYLOINFER_ENABLE_MFQ_COMPAT
+    return prefill_decoded_projection(weight.q_packed,weight.out,weight.neuron_len,[weight] {
+        return dequant_nint_dense_f32(weight);
+    });
+#else
+    return {};
+#endif
+}
+
+PrefillProjectionWeight prefill_projection_weight(const NvqWeight& weight) {
+#if TYLOINFER_ENABLE_MFQ_COMPAT
+    return prefill_decoded_projection(weight.indices_packed,weight.out,weight.neuron_len,[weight] {
+        return nvq_dequant(weight).to(mfq_tensor_backend::kFloat32).contiguous();
+    });
+#else
+    return {};
+#endif
 }
 
 DenseLinearGroup make_fp32_quant_group(
@@ -1642,6 +1727,7 @@ DenseLinearGroup make_fp32_quant_group(
 mfq_tensor_backend::Tensor quant_linear_reference_weight(
         const QuantLinear& linear) {
     TYLOINFER_RUNTIME_CHECK(!linear.tensor_parallel(),"linear reference requires local weights");
+    if (linear.is_channel_fp8()) return linear.channel_fp8.dequant();
     if (linear.is_tq()) {
         const auto ids=mfq_tensor_backend::arange(linear.tq.out,
             linear.tq.image.options().dtype(mfq_tensor_backend::kInt64));
@@ -1787,6 +1873,8 @@ mfq_tensor_backend::Tensor dense_projection(
     if(auto projected=try_dense_f32_projection_cuda(input,weight);projected.defined())return projected;
     if(auto projected=try_dense_bf16_projection_cuda(input,weight);projected.defined())return projected;
     input = input.to(weight.scalar_type());
+    if(activation_dtype!=mfq_tensor_backend::kFloat32 && weight.scalar_type()==mfq_tensor_backend::kFloat32)
+        if(auto projected=try_dense_f32_projection_cuda(input,weight);projected.defined())return projected;
     const int64_t rows = input.numel() / input.size(-1);
     if (rows > 1 && rows <= 6) {
         auto shape = input.sizes().vec();
@@ -1811,6 +1899,7 @@ mfq_tensor_backend::Tensor QuantLinear::forward_dense(mfq_tensor_backend::Tensor
 mfq_tensor_backend::Tensor QuantLinear::forward(
         CudaExecutionContext& execution,
         mfq_tensor_backend::Tensor x) const {
+    mfq::cuda::LayerWeightPrefetchKick prefetch;
     if(is_tq() && !tensor_parallel())return execution.profiler.measure("tq.linear",[&] {return tq.forward(std::move(x));});
     if(is_gguf() && !tensor_parallel()) {
         if(!execution.profiler.enabled)return gguf.forward(std::move(x));
@@ -1819,6 +1908,15 @@ mfq_tensor_backend::Tensor QuantLinear::forward(
                 (x.scalar_type()==mfq_tensor_backend::kFloat32?"gguf.linear.prefill_f32":"gguf.linear.prefill_f16");
             return execution.profiler.measure(name,[&] {return gguf.forward(std::move(x));});
         });
+    }
+    if(!tensor_parallel() && !is_dense() && !is_nint() && !is_nvq() &&
+            execution.kl_mmq.mode==KlMmqMode::Default && x.is_cuda() && x.dim()>0 &&
+            x.scalar_type()==mfq_tensor_backend::kFloat32 && x.size(-1)>0 && x.numel()/x.size(-1)>=512) {
+        const auto product=prefill_product(prefill_weight(),x);
+        if(product.defined()) {
+            auto shape=x.sizes().vec();shape.back()=out();
+            return prefill_materialize(product).reshape(shape);
+        }
     }
     if (tensor_parallel() || (mfq::mfq_compat_enabled && is_nint()) || (mfq::mfq_compat_enabled && is_nvq())) {
         auto shape = x.sizes().vec();
@@ -1839,6 +1937,7 @@ mfq_tensor_backend::Tensor QuantLinear::forward(
     if (is_mxfp4()) return mxfp4.forward(x);
     if ((mfq::mfq_compat_enabled && is_mxfp4_sq())) return mxfp4_sq.forward(x);
     if ((mfq::mfq_compat_enabled && is_fp8_sq())) return fp8_sq.forward(x);
+    if (is_channel_fp8()) return channel_fp8.forward(x,&execution.profiler);
     if (is_dense()) return forward_dense(x);
     return mxfp8.forward(execution.profiler, x);
 }
@@ -1949,19 +2048,6 @@ mfq_tensor_backend::Tensor QuantLinear::forward_input_mul(
         return (aligned_m1?gguf.forward_m1_aligned_base(activation,x.scalar_type()):
             gguf.forward_q8(activation,tokens,x.scalar_type(),position_major)).reshape(shape);
     }
-    if(is_gguf() && !tensor_parallel() && tokens>32 && x.is_cuda() &&
-            x.device()==gguf.packed.device() && gate.device()==x.device() &&
-            x.is_contiguous() && gate.is_contiguous() && x.sizes()==gate.sizes() &&
-            x.scalar_type()==gate.scalar_type() &&
-            (x.scalar_type()==mfq_tensor_backend::kFloat16 || x.scalar_type()==mfq_tensor_backend::kFloat32)) {
-        TYLOINFER_RUNTIME_CHECK(mode==1 || mode==2,"input gate mode must be sigmoid or SiLU");
-        auto gated=mfq_tensor_backend::empty_like(x);
-        const auto stream=mfq_get_current_cuda_stream(x.get_device());
-        for(const auto& tensor:{x,gate,gated})mfq_cuda_record_stream(tensor,stream);
-        mfq::cuda::gguf::materialize_gated_input(x.data_ptr(),gate.data_ptr(),
-            x.scalar_type()==mfq_tensor_backend::kFloat16,x.numel(),mode==2,gated.data_ptr(),stream.stream());
-        return forward(execution,gated);
-    }
     if (tensor_parallel() || (mfq::mfq_compat_enabled && is_nint()) || (mfq::mfq_compat_enabled && is_nvq())) {
         auto shape = x.sizes().vec();
         auto flat = x.reshape({-1, x.size(-1)});
@@ -1981,24 +2067,79 @@ mfq_tensor_backend::Tensor QuantLinear::forward_input_mul(
         shape.back() = y.size(-1);
         return y.reshape(shape);
     }
-    if (is_dense()) {
-        TYLOINFER_RUNTIME_CHECK(mode == 1 || mode == 2,
-            "dense input gate mode must be sigmoid or SiLU");
-        // Match the existing dense shard path, including dtype rounding.
-        auto local = x.to(dense.scalar_type());
-        auto local_gate = gate.to(dense.scalar_type());
-        auto gated = mode == 1
-            ? local * mfq_tensor_backend::sigmoid(local_gate)
-            : local * mfq_tensor_backend::silu(local_gate);
-        return forward_dense(gated);
-    }
     TYLOINFER_RUNTIME_CHECK(mode == 1 || mode == 2,
         "input gate mode must be sigmoid or SiLU");
+    // Dense weights retain their existing input conversion before activation.
+    if(is_dense())x=x.to(dense.scalar_type());
     auto local_gate = gate.to(x.scalar_type());
+    if(x.is_cuda() && local_gate.device()==x.device() &&
+            x.is_contiguous() && local_gate.is_contiguous() && x.sizes()==local_gate.sizes() &&
+            (x.scalar_type()==mfq_tensor_backend::kFloat16 || x.scalar_type()==mfq_tensor_backend::kFloat32)) {
+        const MfqCudaGuard guard(x.get_device());
+        auto gated=mfq_tensor_backend::empty_like(x);
+        const auto stream=mfq_get_current_cuda_stream(x.get_device());
+        for(const auto& tensor:{x,local_gate,gated})mfq_cuda_record_stream(tensor,stream);
+        execution.profiler.measure("linear.gated_input",[&] {
+            mfq::cuda::materialize_gated_input(x.data_ptr(),local_gate.data_ptr(),
+                x.scalar_type()==mfq_tensor_backend::kFloat16,x.numel(),mode==2,gated.data_ptr(),stream.stream());
+            return 0;
+        });
+        return is_dense()?forward_dense(gated):forward(execution,gated);
+    }
     auto gated = mode == 1
         ? x * mfq_tensor_backend::sigmoid(local_gate)
         : x * mfq_tensor_backend::silu(local_gate);
-    return forward(execution, gated);
+    return is_dense()?forward_dense(gated):forward(execution,gated);
+}
+
+PrefillProjectionWeight QuantLinear::prefill_weight() const {
+    if(tensor_parallel())return {};
+    if(is_tq())return prefill_projection_weight(tq);
+    if(is_gguf())return prefill_projection_weight(gguf);
+    if(is_nint())return prefill_projection_weight(nint);
+    if(is_nvq())return prefill_projection_weight(nvq);
+    const auto storage=is_mxfp4()?mxfp4.weight.values:is_mxfp8()?mxfp8.weight.values:
+        is_mxfp4_sq()?mxfp4_sq.weight.blob:is_fp8_sq()?fp8_sq.weight.blob:is_dense()?dense:mfq_tensor_backend::Tensor{};
+    if(!storage.is_cuda())return {};
+    return prefill_decoded_projection(storage,out(),neuron_len(),[weight=*this] {
+        return dequant_local_quant_linear_f32(weight);
+    });
+}
+
+static bool shared_prefill_input(const QuantLinear& layer,const mfq_tensor_backend::Tensor& input) {
+    const auto weight=layer.prefill_weight();
+    return weight && weight.storage.device()==input.device() && weight.columns==input.size(-1);
+}
+
+bool QuantLinear::can_forward_prefill_residual(std::int64_t tokens,
+        const mfq_tensor_backend::Tensor& residual) const {
+    if(tensor_parallel())return false;
+    if(is_tq())return tq.can_forward_prefill_residual(tokens,residual);
+    if(is_gguf())return gguf.can_forward_prefill_residual(tokens,residual);
+    return can_prefill_residual(prefill_weight(),tokens,residual);
+}
+
+mfq_tensor_backend::Tensor QuantLinear::forward_prefill_residual(
+        const mfq_tensor_backend::Tensor& input,const mfq_tensor_backend::Tensor& residual) const {
+    if(tensor_parallel())return {};
+    if(is_tq())return tq.forward_prefill_residual(input,residual);
+    if(is_gguf())return gguf.forward_base(input,true,residual);
+    return prefill_residual_projection(prefill_weight(),input,residual);
+}
+
+bool QuantLinearGroup::supports_prefill_input(const mfq_tensor_backend::Tensor& input) const {
+    if(!input.is_cuda() || input.dim()<1 || input.size(-1)<1)return false;
+    if(nint_grouped) {
+        const auto compatible=[&](const NintWeight& value) {
+            const auto weight=prefill_projection_weight(value);
+            return weight && weight.storage.device()==input.device() && weight.columns==input.size(-1);
+        };
+        if(nint.split_w.empty())return compatible(nint.w);
+        return std::all_of(nint.split_w.begin(),nint.split_w.end(),compatible);
+    }
+    return !layers.empty() && std::all_of(layers.begin(),layers.end(),[&](const QuantLinear& layer) {
+        return shared_prefill_input(layer,input);
+    });
 }
 
 std::unique_ptr<GgufPrefillInputScope> QuantLinearGroup::prepare_prefill_rms_norm_input(
@@ -2006,11 +2147,9 @@ std::unique_ptr<GgufPrefillInputScope> QuantLinearGroup::prepare_prefill_rms_nor
         const mfq_tensor_backend::Tensor& weight,double eps,double offset,
         mfq_tensor_backend::Tensor& normalized) const {
     normalized={};
-    if(execution.kl_mmq.mode!=KlMmqMode::Default || layers.empty() || !input.is_cuda() ||
+    if(execution.kl_mmq.mode!=KlMmqMode::Default || !input.is_cuda() ||
             input.dim()<1 || input.size(-1)<1 || input.numel()/input.size(-1)<512)return {};
-    for(const auto& layer:layers)if(!layer.is_gguf() || layer.tensor_parallel() ||
-            !layer.gguf.packed.is_cuda() || layer.gguf.packed.device()!=input.device() ||
-            layer.gguf.neuron_len!=input.size(-1) || layer.gguf.prefers_original_input())return {};
+    if(!supports_prefill_input(input))return {};
     return GgufPrefillInputScope::prepare_rms(input,weight,eps,offset,normalized);
 }
 
@@ -2157,10 +2296,8 @@ mfq_tensor_backend::Tensor QuantLinear::forward_input_rms_gate(
             float(eps),silu,activation.data_ptr(),stream.stream());
         return gguf.forward_q8(activation,batch*tokens,tb::kFloat32,position_major).reshape({batch,tokens,gguf.out});
     }
-    if(is_gguf() && !tensor_parallel()) {
-        auto fused=gguf_rms_gated_prefill(gguf,attended,gate,norm_weight,eps,silu);
-        if(fused.defined())return fused;
-    }
+    const auto product=prefill_rms_gated_product(prefill_weight(),attended,gate,norm_weight,eps,silu);
+    if(product.defined())return prefill_materialize(product).reshape({batch,tokens,out()});
     auto normalized=rms_norm_cuda(attended.contiguous().reshape({-1,width}),norm_weight,eps)
         .reshape_as(attended).transpose(1,2).contiguous().reshape({batch,tokens,heads*width});
     return forward_input_mul(execution,normalized,gate.contiguous().reshape_as(normalized),silu?2:1);
@@ -2195,6 +2332,7 @@ int64_t QuantLinear::out() const {
     if (is_mxfp4()) return mxfp4.weight.out;
     if ((mfq::mfq_compat_enabled && is_mxfp4_sq())) return mxfp4_sq.weight.out;
     if ((mfq::mfq_compat_enabled && is_fp8_sq())) return fp8_sq.weight.out;
+    if (is_channel_fp8()) return channel_fp8.out;
     if (is_dense()) return dense.size(0);
     return mxfp8.weight.out;
 }
@@ -2208,6 +2346,7 @@ int64_t QuantLinear::neuron_len() const {
     if (is_mxfp4()) return mxfp4.weight.neuron_len;
     if ((mfq::mfq_compat_enabled && is_mxfp4_sq())) return mxfp4_sq.weight.neuron_len;
     if ((mfq::mfq_compat_enabled && is_fp8_sq())) return fp8_sq.weight.neuron_len;
+    if (is_channel_fp8()) return channel_fp8.neuron_len;
     if (is_dense()) return dense.size(1);
     return mxfp8.weight.neuron_len;
 }
@@ -2237,6 +2376,7 @@ QuantLinearGroup::forward_tensor_parallel_output_group(
 std::vector<mfq_tensor_backend::Tensor> QuantLinearGroup::forward(
         CudaExecutionContext& execution,
         mfq_tensor_backend::Tensor x) const {
+    mfq::cuda::LayerWeightPrefetchKick prefetch;
     if(tq.defined())return execution.profiler.measure("tq.parallel",[&] {return tq.forward(std::move(x));});
     const bool default_mmq =
         execution.kl_mmq.mode == KlMmqMode::Default;
@@ -2307,6 +2447,20 @@ std::vector<mfq_tensor_backend::Tensor> QuantLinearGroup::forward(
     // Native GGUF groups share the activation packet just like their loaded
     // function counterparts. Keep dependent corrections after all base dots.
     const auto tokens=x.numel()/x.size(-1);
+    if(default_mmq && tokens>8 && layers.size()>1 && x.is_cuda() &&
+        std::all_of(layers.begin(),layers.end(),[&](const QuantLinear& layer) {
+            return layer.is_channel_fp8() && !layer.tensor_parallel() && layer.channel_fp8.dynamic_activations &&
+                layer.channel_fp8.neuron_len==x.size(-1) && layer.channel_fp8.values.device()==x.device();
+        })) {
+        auto prepared=prepare_channel_fp8_input(x,&execution.profiler);
+        std::vector<mfq_tensor_backend::Tensor> result;result.reserve(layers.size());
+        for(const auto& layer:layers)result.push_back(layer.channel_fp8.forward(x,&execution.profiler,&prepared));
+        if(const auto* trace=std::getenv("TYLOINFER_TRACE_KERNEL_DISPATCH");trace && trace[0]=='1') {
+            static std::atomic<bool> reported{};
+            if(!reported.exchange(true))std::fprintf(stderr,"channel_fp8_shared_input projections=%zu quantize_once=1\n",layers.size());
+        }
+        return result;
+    }
     if(default_mmq && tokens>=1 && tokens<=32 && !layers.empty() &&
             std::all_of(layers.begin(),layers.end(),[&](const QuantLinear& layer) {
                 return layer.is_gguf() && !layer.tensor_parallel() && layer.gguf.packed.is_cuda() &&
@@ -2320,9 +2474,7 @@ std::vector<mfq_tensor_backend::Tensor> QuantLinearGroup::forward(
     std::unique_ptr<GgufPrefillInputScope> prefill_input;
     if(default_mmq && tokens>=512 && layers.size()>1 &&
             std::all_of(layers.begin(),layers.end(),[&](const QuantLinear& layer) {
-                return layer.is_gguf() && !layer.tensor_parallel() && layer.gguf.packed.is_cuda() &&
-                    layer.gguf.packed.device()==x.device() && layer.gguf.neuron_len==x.size(-1) &&
-                    !layer.gguf.prefers_original_input();
+                return shared_prefill_input(layer,x);
             }))prefill_input=std::make_unique<GgufPrefillInputScope>(x);
     std::vector<mfq_tensor_backend::Tensor> result;
     if (default_mmq && decode_branch_parallel &&

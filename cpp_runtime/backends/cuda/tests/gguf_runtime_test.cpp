@@ -4,8 +4,9 @@
 #include "gguf_cpu.h"
 #include "tyloinfer/cpu_expert_pool.h"
 #include "tyloinfer/host_memory.h"
+#include "tyloinfer/runtime.h"
 #include "../ops/gguf/gguf_cpu_executor.h"
-#include "../ops/gguf/gguf_adaptive_slots.h"
+#include "runtime/routed_adaptive_slots.h"
 #include "../ops/gguf/gguf_host_snapshot.h"
 #include "../ops/gguf/gguf_decode_dma.h"
 #include "../ops/gguf/gguf_rotation.h"
@@ -31,6 +32,7 @@
 #include "mfq_cuda_norm_ops.h"
 #include "runtime/decode_window.h"
 #include "runtime/moe_pipeline.h"
+#include "runtime/routed_cache_resources.h"
 #include "runtime/native_dma_batch.h"
 #include "ggml-quants.h"
 #include "mfq_cuda_resident_allocations.h"
@@ -1359,11 +1361,11 @@ void run_global_prefill_admission() {
 void run_strata_adaptive_slots() {
     const std::vector<std::vector<float>> usage{{5.f,3.f,8.f,4.f},{0.f,7.f,1.f}};
     const auto resident=[](std::size_t layer,std::size_t expert){return layer==0?expert<2:expert==0;};
-    const auto swaps=mfq::cuda::gguf::adaptive_slot_swaps(usage,resident);
+    const auto swaps=mfq::cuda::adaptive_slot_swaps(usage,resident);
     require(swaps.size()==2 && swaps[0].layer==1 && swaps[0].in==1 && swaps[0].out==0 &&
         swaps[1].layer==0 && swaps[1].in==2 && swaps[1].out==1,
         "Strata adaptive slots changed minimum gain, same-layer victims or global gain order");
-    require(mfq::cuda::gguf::adaptive_slot_swaps(usage,resident,1).size()==1,
+    require(mfq::cuda::adaptive_slot_swaps(usage,resident,1).size()==1,
         "Strata adaptive slot swap cap was ignored");
 }
 void run_unmanaged_bank_learning() {
@@ -1693,6 +1695,20 @@ void run_borrowed_gguf_prefill(bool quantized_prefill=false) {
     try {
         GgufPrefillWorkspaceLoan loan(execution.gguf_expert_cache);
         require(loan.begin(lendable)>0,"GGUF second prefill did not borrow its cache tail");
+        const auto borrowed=context->workspace_largest_available(mfq_current_cuda_stream());
+        require(borrowed>context->available_memory(),"GGUF nested reservation fixture did not price borrowed storage");
+        const auto retained=gguf_prefill_lendable_bytes(execution.gguf_expert_cache);
+        mfq::cuda::reserve_routed_workspace(execution,borrowed);
+        require(context->workspace_loan_active() &&
+            gguf_prefill_lendable_bytes(execution.gguf_expert_cache)==retained &&
+            context->workspace_largest_available(mfq_current_cuda_stream())==borrowed,
+            "nested workspace reservation retired or changed an active GGUF loan");
+        bool rejected=false;
+        try {mfq::cuda::reserve_routed_workspace(execution,borrowed+context->available_memory()+4096);}
+        catch(const MfqResourceExhausted&) {rejected=true;}
+        require(rejected && context->workspace_loan_active() &&
+            gguf_prefill_lendable_bytes(execution.gguf_expert_cache)==retained,
+            "insufficient nested reservation corrupted its live GGUF loan");
         auto output=banks.forward(x,ids,weights);
         loan.suspend();context->set_memory_limit(old_limit);
         auto preserved=output.clone();output={};

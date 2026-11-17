@@ -23,8 +23,6 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from tyloinfer.evaluation.inference import BenchmarkValidationError, validate_benchmark_result
-
 PROMPT_TEXT = (
     "The kernel scheduler divides continuous decode batches into tiles so "
     "that recurring experts stay resident between steps. Explain the memory "
@@ -44,6 +42,47 @@ METRIC_KEYS = (
     "mtp_drafted_tokens",
     "mtp_accepted_tokens",
 )
+
+
+class BenchmarkValidationError(ValueError):
+    pass
+
+
+def validate_benchmark_result(result, prompt_tokens, decode_tokens, mode):
+    """Validate native request metrics before deriving measured rates."""
+    if not isinstance(result, dict):
+        raise BenchmarkValidationError("runtime result must be an object")
+    metrics, usage = result.get("metrics"), result.get("usage")
+    if not isinstance(metrics, dict) or not isinstance(usage, dict):
+        raise BenchmarkValidationError("runtime result is missing metrics or usage")
+
+    def number(values, name, *, positive=False):
+        value = values.get(name)
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(value) or value < 0 or (positive and value == 0)):
+            raise BenchmarkValidationError(f"invalid runtime metric: {name}")
+        return value
+
+    prompt = number(usage, "prompt_tokens", positive=True)
+    completion = number(usage, "completion_tokens", positive=True)
+    prefill = number(metrics, "prefill_tokens", positive=True)
+    if (prompt != prompt_tokens or prefill != prompt_tokens or int(prompt) != prompt
+            or int(completion) != completion or completion < 2 or completion > decode_tokens):
+        raise BenchmarkValidationError("runtime token counts do not match the benchmark request")
+    prefill_ms = number(metrics, "prefill_ms", positive=True)
+    decode_ms = number(metrics, "decode_ms", positive=True)
+    number(metrics, "ttft_ms")
+    used = metrics.get("mtp_used", 0)
+    if mode not in ("decode", "mtp") or used not in (0, 1) or bool(used) != (mode == "mtp"):
+        raise BenchmarkValidationError("requested decoding mode did not execute")
+    if used:
+        drafted = number(metrics, "mtp_drafted_tokens", positive=True)
+        accepted = number(metrics, "mtp_accepted_tokens")
+        if not metrics.get("mtp_available", 1) or accepted > drafted:
+            raise BenchmarkValidationError("MTP metrics disagree with runtime capability or drafts")
+    measured = {**metrics, "prefill_tps": prefill * 1000 / prefill_ms,
+                "decode_tps": (completion - 1) * 1000 / decode_ms}
+    return {"metrics": measured, "prompt_tokens": int(prompt), "completion_tokens": int(completion)}
 
 
 def default_runtime(root):

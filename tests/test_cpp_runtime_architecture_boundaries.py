@@ -395,7 +395,10 @@ def test_model_sources_are_backend_neutral_and_shared() -> None:
         assert "#include <cuda" not in source.lower()
         assert "#include <metal" not in source.lower()
     assert '#include "tyloinfer/mfq_model_source.h"' not in CUDA_BACKEND_SOURCE
-    assert "HfModelSource" not in CUDA_BACKEND_SOURCE
+    cuda_production = "\n".join(path.read_text(encoding="utf-8")
+        for path in CUDA_MODELS.parent.rglob("*")
+        if path.suffix in {".h", ".cpp"} and "tests" not in path.relative_to(CUDA_MODELS.parent).parts)
+    assert "HfModelSource" not in cuda_production
     assert '#include "tyloinfer/mfq_model_source.h"' in MODEL_SOURCE_FACTORY
     assert "HfModelSource" in MODEL_SOURCE_FACTORY
     assert '#include "tyloinfer/mfq_model_source.h"' in METAL_CONTAINER

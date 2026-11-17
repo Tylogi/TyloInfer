@@ -12,6 +12,8 @@ using GatedResidualMixProjection = std::function<mfq_tensor_backend::Tensor(
 using GatedResidualMarker = std::function<void(const char*)>;
 using GatedResidualActivationProjection = std::function<mfq_tensor_backend::Tensor(
     CudaExecutionContext&, const mfq_tensor_backend::Tensor&,int64_t,bool)>;
+using GatedResidualDownInjectionProjection = std::function<std::vector<mfq_tensor_backend::Tensor>(
+    CudaExecutionContext&, const mfq_tensor_backend::Tensor&,int64_t)>;
 
 std::vector<mfq_tensor_backend::Tensor> try_gated_residual_bf16_prefill_cuda(
     const mfq_tensor_backend::Tensor& input,const mfq_tensor_backend::Tensor& norm,
@@ -37,7 +39,8 @@ std::vector<mfq_tensor_backend::Tensor> gated_residual_pre_projected(
     const GatedResidualMixProjection& mixed_projection = {},
     const GatedResidualMarker& marker = {},
     const GatedResidualActivationProjection& activated_down = {},
-    const GatedResidualActivationProjection& activated_injection = {});
+    const GatedResidualActivationProjection& activated_injection = {},
+    const GatedResidualDownInjectionProjection& combined_down = {});
 
 std::vector<mfq_tensor_backend::Tensor> gated_residual_pre_after_projected(
     CudaExecutionContext&, const mfq_tensor_backend::Tensor& branch,
@@ -48,4 +51,5 @@ std::vector<mfq_tensor_backend::Tensor> gated_residual_pre_after_projected(
     const GatedResidualMixProjection& mixed_projection = {},
     const GatedResidualMarker& marker = {},
     const GatedResidualActivationProjection& activated_down = {},
-    const GatedResidualActivationProjection& activated_injection = {});
+    const GatedResidualActivationProjection& activated_injection = {},
+    const GatedResidualDownInjectionProjection& combined_down = {});

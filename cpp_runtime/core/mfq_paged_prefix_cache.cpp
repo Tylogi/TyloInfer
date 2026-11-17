@@ -2,6 +2,7 @@
 #include "include/tyloinfer/disk_budget.h"
 #include "include/tyloinfer/file_read_window.h"
 #include "tyloinfer/file_range_reader.h"
+#include "tyloinfer/native_file_path.h"
 
 #include <algorithm>
 #include <atomic>
@@ -501,7 +502,7 @@ public:
         if (config_.max_parallel_reads == 0) {
             config_.max_parallel_reads = 1;
         }
-        namespace_dir_ = config_.cache_dir /
+        namespace_dir_ = mfq::native_file_path(config_.cache_dir) /
             block_hash_hex(compatibility_hash_);
         std::error_code error;
         std::filesystem::create_directories(namespace_dir_, error);

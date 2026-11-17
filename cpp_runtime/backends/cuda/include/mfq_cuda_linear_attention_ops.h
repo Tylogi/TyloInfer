@@ -101,7 +101,7 @@ std::vector<mfq_tensor_backend::Tensor> gdn_decode_core_cuda(
     double convolution_eps, double norm_eps, bool silu_gate, bool output_half,
     bool transposed_state,
     mfq_tensor_backend::Tensor workspace={},bool inplace_state=false,
-    mfq_tensor_backend::Tensor state_addresses={},bool tiled_heads=false,bool quantize_output=false);
+    mfq_tensor_backend::Tensor state_addresses={},bool tiled_heads=false,bool quantize_output=false,bool position_major=false);
 // quantize_output returns flat native GGUF Q8_1 bytes, after the same output
 // rounding, for a directly connected quantized projection.
 // Write speculative prefix snapshots with the producing core; no state-copy launches.

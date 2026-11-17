@@ -58,7 +58,8 @@ public:
     void finish_window(int layer);
     void record_window_expert_fence(int layer,void* stream);
     void apply_pending();
-    void record_prefill_routes(int layer,const int32_t* ids,int tokens,int routes,void* stream);
+    void record_prefill_counts(int layer,const int32_t* counts,int tokens,void* stream);
+    void record_prefill_counts(int layer,const std::vector<std::uint64_t>& counts,int tokens);
     void prepare_decode();
     void release_transfer_stages();
     Stats stats() const noexcept;

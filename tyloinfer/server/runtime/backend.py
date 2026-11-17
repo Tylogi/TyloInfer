@@ -60,6 +60,8 @@ class BackendDelta:
 
 
 class ChatBackend(Protocol):
+    async def decide(self, *, model: str, payload: dict[str, Any]) -> dict[str, Any]: ...
+
     async def preflight(
         self,
         *,
@@ -181,6 +183,66 @@ class OpenAIChatBackend:
         for key in ("prompt_tokens", "context_size"):
             if type(result.get(key)) is not int or result[key] < 1:
                 raise BackendProtocolError(f"invalid native {key}")
+        return result
+
+    async def decide(self, *, model: str, payload: dict[str, Any]) -> dict[str, Any]:
+        import math
+
+        result = await self._runtime.decide({**payload, "model": model})
+        questions = payload.get("questions")
+        if not isinstance(result, dict) or result.get("object") != "structured_decision":
+            raise BackendProtocolError("invalid native decision response")
+        answers, usage, diagnostics = result.get("answers"), result.get("usage"), result.get("diagnostics")
+        if not isinstance(questions, dict) or not isinstance(answers, dict) or set(answers) != set(questions):
+            raise BackendProtocolError("native decision question alignment changed")
+        if not isinstance(diagnostics, dict) or set(diagnostics) != set(questions):
+            raise BackendProtocolError("invalid native decision diagnostics")
+        if not isinstance(usage, dict) or type(usage.get("input_tokens")) is not int or usage["input_tokens"] < 1 or \
+                type(usage.get("output_tokens")) is not int or usage["output_tokens"] != 0:
+            raise BackendProtocolError("invalid native decision usage")
+        for name, answer in answers.items():
+            if not isinstance(questions[name], dict) or not isinstance(answer, dict) or answer.get("type") != questions[name].get("type"):
+                raise BackendProtocolError("native decision answer type changed")
+            probabilities, confidence = answer.get("probabilities"), answer.get("confidence")
+            if not isinstance(probabilities, dict) or not probabilities or \
+                    any(type(p) not in {int, float} or not math.isfinite(p) or not 0 <= p <= 1 for p in probabilities.values()) or \
+                    not math.isclose(math.fsum(probabilities.values()), 1, rel_tol=1e-6, abs_tol=1e-7) or \
+                    type(confidence) not in {int, float} or not math.isfinite(confidence) or not 0 <= confidence <= 1:
+                raise BackendProtocolError("invalid native decision probabilities")
+            criteria = questions[name].get("criteria")
+            kind = answer["type"]
+            expected = set(criteria) if kind == "choice" and isinstance(criteria, dict) else \
+                {"yes", "no"} if kind == "noul" else \
+                {str(i) for i in range(len(criteria))} if kind == "score" and isinstance(criteria, list) else set()
+            if set(probabilities) != expected or confidence > max(probabilities.values()) + 1e-6:
+                raise BackendProtocolError("native decision option alignment changed")
+            if kind == "choice":
+                choice = answer.get("choice")
+                if not isinstance(choice, str) or choice not in expected or probabilities[choice] != max(probabilities.values()):
+                    raise BackendProtocolError("invalid native decision choice")
+            if kind == "noul" and answer.get("noul") != probabilities["yes"]:
+                raise BackendProtocolError("invalid native predicate probability")
+            if kind == "score":
+                score = answer.get("score")
+                if type(score) not in {int, float} or not math.isfinite(score) or \
+                        not math.isclose(score, math.fsum(int(key) * p for key, p in probabilities.items()), abs_tol=1e-6):
+                    raise BackendProtocolError("invalid native decision score")
+                if answer.get("legend") != {str(i): value for i, value in enumerate(criteria)}:
+                    raise BackendProtocolError("invalid native decision score legend")
+            detail = diagnostics[name]
+            if not isinstance(detail, dict):
+                raise BackendProtocolError("invalid native decision diagnostics")
+            mass, argmax = detail.get("label_mass"), detail.get("argmax_is_label")
+            if detail.get("normalization") == "labels":
+                if mass is not None or argmax is not None:
+                    raise BackendProtocolError("invalid native conditional normalization")
+            elif payload.get("full_vocabulary", True):
+                if type(mass) not in {int, float} or not math.isfinite(mass) or not 0 <= mass <= 1 or type(argmax) is not bool:
+                    raise BackendProtocolError("invalid native decision label mass")
+            elif mass is not None or argmax is not None or detail.get("normalization") != "labels":
+                raise BackendProtocolError("invalid native conditional normalization")
+            if not math.isclose(confidence, max(probabilities.values()) * (1 if mass is None else mass), abs_tol=1e-6):
+                raise BackendProtocolError("native decision confidence is inconsistent with its probabilities")
         return result
 
     async def score(self, payload: dict[str, Any]) -> dict[str, Any]:

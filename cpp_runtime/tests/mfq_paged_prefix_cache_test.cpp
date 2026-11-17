@@ -1,6 +1,7 @@
 #include "mfq_paged_prefix_cache.h"
 #include "paged_session_bindings.h"
 #include "tyloinfer/file_read_window.h"
+#include "tyloinfer/native_file_path.h"
 
 #include <algorithm>
 #include <array>
@@ -1275,6 +1276,31 @@ int main() try {
     if (const auto* enabled = std::getenv("TYLOINFER_PREFIX_CACHE_BENCHMARK");
         enabled != nullptr && enabled[0] == '1') {
         run_benchmark();
+    }
+    {
+        auto directory=temporary_directory();
+        auto long_directory=directory;
+        while(long_directory.native().size()<320)long_directory/="cache-segment";
+        mfq::cache::PagedPrefixCacheConfig cfg;cfg.cache_dir=long_directory;
+        cfg.compatibility_key="long-path";cfg.block_size_tokens=4;cfg.min_disk_free_bytes=0;
+        mfq::cache::BlockHash hash;
+        const std::vector<std::uint8_t> payload{1,3,5,7};
+        const std::int64_t tokens[]{11,12,13,14};
+        {
+            mfq::cache::PagedPrefixCache cache(cfg);
+            hash=cache.store({},tokens,4,std::make_shared<std::vector<std::uint8_t>>(payload));cache.flush();
+            require(cache.metrics().failed_writes==0 && cache.metrics().disk_blocks==1,
+                "long cache path prevented durable prefix writes");
+        }
+        {
+            mfq::cache::PagedPrefixCache cache(cfg);
+            const auto loaded=cache.load(hash);
+            require(loaded && *loaded==payload,"long cache path could not be restored after restart");
+            const auto lease=cache.borrow(hash);
+            require(lease && lease->read_range(1,2)==std::vector<std::uint8_t>({3,5}),
+                "long cache path could not supply a borrowed KV range");
+        }
+        std::filesystem::remove_all(mfq::native_file_path(directory));
     }
     std::cout << "MFQ paged prefix cache tests passed\n";
     return 0;

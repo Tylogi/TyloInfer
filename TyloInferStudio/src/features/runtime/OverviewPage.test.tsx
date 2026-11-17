@@ -2,6 +2,7 @@ import { act, fireEvent, render, screen, within } from '@testing-library/react';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import type { RuntimeStatus, ServingStatistics } from '../../shared/api/contracts/runtime';
 import { OverviewPage } from './OverviewPage';
+import { setApiBaseUrl } from '../../shared/api/client';
 
 const state = vi.hoisted(() => ({ runtime: null as RuntimeStatus | null, models: [], instances: [],
   connectionRevision: 0, refreshRuntime: vi.fn(), listener: vi.fn().mockResolvedValue({ anthropic_port: null }),
@@ -15,7 +16,16 @@ vi.mock('./MemoryHierarchy', () => ({ MemoryHierarchy: () => null }));
 vi.mock('./useServingStatistics', () => ({ useServingStatistics: (scope: string) => { state.scope = scope; return { data: state.data, error: null }; } }));
 
 beforeEach(() => { state.runtime = null; state.models = []; state.data = null; });
-afterEach(() => { vi.restoreAllMocks(); });
+afterEach(() => { vi.restoreAllMocks(); setApiBaseUrl(''); });
+
+it('shows the complete Jev URL on the current service port with explicit request instructions', async () => {
+  setApiBaseUrl('https://example.com:9443/inference/v1/');
+  await act(async () => { render(<OverviewPage />); });
+  const copy = screen.getByRole('button', { name: 'Copy Jev endpoint' });
+  expect(copy).toBeEnabled();
+  expect(copy.closest('.overview-api-entry')).toHaveTextContent('https://example.com:9443/inference/v1/systemone');
+  expect(screen.getByText('Jev shares the OpenAI port.', { exact: false })).toHaveTextContent('Send POST requests to the Jev URL explicitly');
+});
 
 it('places the combined appearance control beside Refresh in the overview header', async () => {
   await act(async () => { render(<OverviewPage />); });

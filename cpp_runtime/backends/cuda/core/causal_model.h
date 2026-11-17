@@ -4,6 +4,9 @@
 #include "core/block.h"
 #include "models/common/causal_model.h"
 #include "quant_linear.h"
+#include "mfq_cuda_context.h"
+#include "mfq_cuda_resident_allocations.h"
+#include "runtime/layer_weight_stream.h"
 
 #include <cstdint>
 #include <functional>
@@ -145,6 +148,7 @@ template <typename Model> struct CudaCausalOps : Model {
     std::unordered_map<int, RopeCache> device_ropes;
     QuantLinear embed;
     std::vector<std::unique_ptr<Block>> blocks;
+    std::shared_ptr<LayerWeightStream> layer_weights;
     mfq_tensor_backend::Tensor output_norm;
     QuantLinear lm_head;
     std::optional<Tensor> graph_logits(CausalModel& model,Tensor ids,int kind) {
@@ -162,6 +166,10 @@ template <typename Model> struct CudaCausalOps : Model {
         return value.narrow(0, start, count);
     }
     static Tensor concat_positions(Tensor first, Tensor second) {
+        // Full positions survive the forward call and its borrowed workspace.
+        std::optional<ResidentAllocationScope> persistent_positions;
+        if(default_context(mfq_current_cuda_device())->workspace_loan_active())
+            persistent_positions.emplace();
         // Generated text advances all semantic axes equally after an image.
         if (first.dim() > 1 && second.dim() == 1) {
             auto shape = first.sizes().vec();
@@ -232,12 +240,17 @@ template <typename Model> struct CudaCausalOps : Model {
         void prepare_inputs() { ids = device_ids(ids); }
         bool has_mrope() const { return model.rope.sections.numel() > 0; }
         Tensor position_range(int64_t start, int64_t tokens) {
+            std::optional<ResidentAllocationScope> persistent_positions;
+            if(default_context(primary)->workspace_loan_active())persistent_positions.emplace();
             return mfq_tensor_backend::arange(start, start + tokens,
                                               mfq_tensor_backend::TensorOptions()
                                                   .device(mfq_tensor_backend::kCUDA)
                                                   .dtype(mfq_tensor_backend::kInt64));
         }
         static Tensor offset_positions(Tensor positions, int64_t delta) {
+            std::optional<ResidentAllocationScope> persistent_positions;
+            if(default_context(mfq_current_cuda_device())->workspace_loan_active())
+                persistent_positions.emplace();
             return positions + delta;
         }
         Tensor prepare_hidden(int64_t B, int64_t T) {
@@ -269,6 +282,7 @@ template <typename Model> struct CudaCausalOps : Model {
         }
         Tensor layer(std::unique_ptr<Block> &b, Tensor x) {
             MfqCudaGuard block_guard(b->cuda_device);
+            auto weights=model.layer_weights?model.layer_weights->enter(b.get()):LayerWeightStream::Lease{};
             auto local_ids =
                 b->cpu_offloaded
                     ? cpu_ids
@@ -343,6 +357,7 @@ template <typename Model> struct CudaCausalOps : Model {
                         .clone());
         }
         Tensor finish(Tensor x, int64_t B, int64_t T) {
+            if(model.layer_weights)model.layer_weights->report_timings();
             x = tensor_to_cuda_device(model.execution->model_parallel_collectives, x, primary);
             auto finalized = model.finalize_hidden(x, B, T);
             if (raw_hidden)

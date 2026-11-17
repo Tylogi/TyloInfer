@@ -30,11 +30,12 @@ from tyloinfer.formats.gguf import gguf_is_table_component, gguf_part_paths, is_
 from tyloinfer.server.protocol.models import (
     ModelArtifactList,
     ModelArtifactResource,
+    JevWeightMemoryEstimate,
     ModelDirectoryEntry,
     ModelDirectoryFile,
     ModelDirectoryList,
 )
-from tyloinfer.server.state.model_weights import estimated_resident_weight_bytes, estimated_weight_roles, weight_role
+from tyloinfer.server.state.model_weights import estimated_resident_weight_bytes, estimated_weight_roles, jev_weight_memory, weight_role
 from tyloinfer.server.services.model_context import declared_context_size, yarn_context_limits
 from tyloinfer.server.services.desktop import directory_opener
 from tyloinfer.server.state.table_components import TableComponent, component_base, component_resource, inspect_table_component, table_record_kind
@@ -795,13 +796,19 @@ class ModelCatalog:
     def _inspect_source(self, root: Path, path: Path) -> DiscoveredModel:
         if not is_gguf_path(path):
             artifact = self._inspect(root, path)
-            if artifact.resource.format != 'hf' or not artifact.resource.complete or 'U32' not in artifact.resource.dtypes:
+            decision = artifact.resource.structured_decisions
+            if (artifact.resource.format != 'hf' or not artifact.resource.complete
+                    or 'U32' not in artifact.resource.dtypes and not decision):
+                return artifact
+            if decision and self._native_inspector is None:
                 return artifact
             try:
                 sources = [path / 'config.json', *sorted(path.glob('*.safetensors'))]
                 index = path / 'model.safetensors.index.json'
                 if index.is_file():
                     sources.append(index)
+                if decision:
+                    sources.append(path / 'decision_config.json')
                 signature = tuple((str(source), source.stat().st_size, source.stat().st_mtime_ns) for source in sources)
                 metadata = self._inspect_native_metadata(path, signature)
                 config, tensors = metadata['config'], metadata['tensors']
@@ -813,6 +820,7 @@ class ModelCatalog:
                         streamed += size
                     else:
                         roles[weight_role(name)] += size
+                decision_memory = jev_weight_memory(tensors, config, trained_readout=True) if decision else None
                 resource = artifact.resource.model_copy(update={
                     'loadable': True, 'error': None,
                     'architecture': _native_architecture(metadata, artifact.resource.architecture),
@@ -820,6 +828,7 @@ class ModelCatalog:
                     'estimated_weight_bytes_by_role': roles, 'ssd_ple_bytes': streamed,
                     'tensor_count': len(tensors), 'record_count': len(tensors),
                     'dtypes': sorted({item['dtype'] for item in tensors.values()}),
+                    'jev_weight_memory': JevWeightMemoryEstimate(**decision_memory) if decision_memory else None,
                 })
                 return replace(artifact, resource=resource, routed_expert_bytes=roles['experts'],
                     always_streamed_bytes=streamed, source_config=config, source_tensors=tensors)
@@ -860,7 +869,7 @@ class ModelCatalog:
             tensors = metadata['tensors']
             architecture = _native_architecture(metadata)
             supported = {'Q4_0', 'Q4_1', 'Q5_0', 'Q5_1', 'Q8_0', 'Q2_K', 'Q3_K', 'Q4_K', 'Q5_K', 'Q6_K',
-                'Q8_K', 'IQ2_XXS', 'IQ2_XS', 'IQ2_S', 'IQ3_XXS', 'IQ3_S', 'IQ4_NL', 'IQ4_XS', 'Q2_0',
+                'Q8_K', 'IQ1_S', 'IQ1_M', 'IQ2_XXS', 'IQ2_XS', 'IQ2_S', 'IQ3_XXS', 'IQ3_S', 'IQ4_NL', 'IQ4_XS', 'Q2_0',
                 'PTQ1_0', 'TQ2_T', 'TQK4', 'TQK5', 'TQK6', 'TQK7', 'TQP5', 'TQP6', 'TQP7',
                 'MXFP4', 'MIXED', 'ENGRAM_MXFP8'}
             unsupported = set()
@@ -887,6 +896,9 @@ class ModelCatalog:
             for layer in text.get('engram_layer_ids', []) or [])
         resource = ModelArtifactResource(id=identifier, name=name, architecture=architecture, format='gguf',
             gguf_companion_required=companion_required,
+            structured_decisions=bool(metadata.get("structured_decisions", False)) if tensors else False,
+            jev_weight_memory=jev_weight_memory(tensors, config, trained_readout=False)
+                if tensors and metadata.get('structured_decisions') else None,
             shard_count=count, missing_shards=missing, total_bytes=sum(stat.st_size for stat in stats),
             estimated_resident_weight_bytes=sum(roles.values()) if tensors else None,
             estimated_weight_bytes_by_role=roles if tensors else {}, ssd_ple_bytes=streamed if tensors else None,
@@ -1155,6 +1167,7 @@ class ModelCatalog:
                 name=name,
                 architecture=f"{model_type}-hf-full-mfq",
                 format="hf",
+                structured_decisions=(path / "decision_config.json").is_file(),
                 shard_count=len(shard_paths),
                 total_bytes=sum(stat.st_size for stat in stats),
                 estimated_resident_weight_bytes=estimated_resident_weight_bytes(sum(weight_bytes_by_dtype.values()), weight_bytes_by_dtype),
@@ -1205,5 +1218,6 @@ class ModelCatalog:
             always_streamed_bytes=(
                 always_streamed_bytes if resource.complete else 0
             ),
+            source_config=config if resource.complete else None,
             file_paths=shard_paths if resource.complete else (),
         )

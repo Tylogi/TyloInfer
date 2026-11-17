@@ -1,5 +1,5 @@
 import { expect, it } from 'vitest';
-import { anthropicEndpoint, openAIEndpoint } from './endpoint';
+import { anthropicEndpoint, jevEndpoint, openAIEndpoint } from './endpoint';
 
 it.each([
   [null, 'http://127.0.0.1:8090/v1'],
@@ -10,6 +10,7 @@ it.each([
   ['http://[::1]:8090', 'http://[::1]:8090/v1'],
 ])('produces an SDK base URL from %s without duplicate /v1', (source, expected) => {
   expect(openAIEndpoint(source)).toBe(expected);
+  expect(jevEndpoint(source)).toBe(`${expected}/systemone`);
 });
 
 it('keeps OpenAI /v1 while Anthropic uses the actual separate port and full request path', () => {

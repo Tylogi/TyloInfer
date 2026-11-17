@@ -141,6 +141,69 @@ void resolved_hot_reference() {
     }
     std::cout<<"QSA resolved VRAM/RAM descriptors, remapped tiers, masked tails and changing graphs cases="<<cases<<" max_error="<<largest<<" PASS\n";
 }
+void request_projection_graph() {
+    using namespace mfq::cuda::qwen4_exp;
+    constexpr int hidden=32,heads=6,kv=2,iw=32,ih=3,maximum=64;
+    int cases=0;
+    for(bool half:{false,true})for(int width:{32,48}) {
+        CudaExecutionContext execution;
+        const auto dtype=half?tb::kFloat16:tb::kFloat32;
+        const auto linear=[&](int in,int out,int salt)->Linear {
+            auto weight=data({out,in},salt).to(dtype);
+            return [weight](CudaExecutionContext&,const Tensor& x) {
+                return tb::matmul(x.to(weight.scalar_type()),weight.transpose(-1,-2));
+            };
+        };
+        auto norm=data({width},1,0),inorm=data({iw},2,0);
+        QsaWeights weights{linear(hidden,heads*2*width,1),linear(hidden,kv*width,2),linear(hidden,kv*width,3),
+            linear(heads*width,hidden,4),linear(hidden,(ih+1)*iw,5),norm,norm,inorm,inorm};
+        weights.index_pre_key_norm=data({iw},3,.01f)+1;
+        auto rotary=std::make_shared<RotaryEmbedding>(width/2,maximum,10000.0);
+        Qsa attention(weights,{heads,kv,width,ih,iw,4,8,maximum,1e-6},rotary);
+        for(int batch:{2,3,4,8})for(int tokens:{1,2}) {
+            auto input=data({batch,tokens,hidden},17,.4f).to(dtype);
+            std::vector<Tensor> positions;
+            for(int row=0;row<batch;++row)
+                positions.push_back(tb::arange(row+3,row+3+tokens,input.options().dtype(tb::kInt64)));
+            std::vector<Qsa::Projection> output;
+            {
+                GraphWarmupScope warm(default_context(mfq_current_cuda_device()),mfq_current_cuda_stream());
+                output=attention.project_requests(execution,input,positions);
+            }
+            output.clear();
+            Graph graph;graph.capture_begin_shared();
+            output=attention.project_requests(execution,input,positions);graph.capture_end();
+            for(int iteration=0;iteration<3;++iteration) {
+                input.copy_(data(input.sizes().vec(),23+iteration,.4f).to(dtype));
+                for(int row=0;row<batch;++row)positions[row].fill_(row*3+iteration+7);
+                graph.replay();
+                for(int row=0;row<batch;++row) {
+                    const auto expected=attention.project_requests(execution,input.narrow(0,row,1),{positions[row]})[0];
+                    const auto& actual=output[row];
+                    for(const auto& pair:{std::pair{actual.gate,expected.gate},std::pair{actual.query,expected.query},
+                            std::pair{actual.key,expected.key},std::pair{actual.value,expected.value},
+                            std::pair{actual.iq,expected.iq},std::pair{actual.raw,expected.raw}}) {
+                        const auto a=pair.first.to(tb::kFloat32).contiguous().cpu().contiguous();
+                        const auto b=pair.second.to(tb::kFloat32).contiguous().cpu().contiguous();
+                        if(a.sizes()!=b.sizes())throw std::runtime_error("QSA batched request projection changed its row shape");
+                        for(int64_t index=0;index<a.numel();++index) {
+                            const auto error=std::abs(a.data_ptr<float>()[index]-b.data_ptr<float>()[index]);
+                            if(!std::isfinite(error) || error>(half?3e-3f:2e-5f)+2e-4f*std::abs(b.data_ptr<float>()[index]))
+                                throw std::runtime_error("QSA batched request projection mixed independent positions or channels");
+                        }
+                        ++cases;
+                    }
+                }
+            }
+        }
+        bool rejected=false;
+        try{attention.project_requests(execution,data({2,1,hidden},1),{tb::zeros({1},norm.options().dtype(tb::kInt64))});}
+        catch(const std::exception&){rejected=true;}
+        if(!rejected)throw std::runtime_error("QSA request projection accepted missing positions");
+    }
+    std::cout<<"QSA batched request projections: independent positions, changing graphs and row/channel tails cases="<<cases<<" PASS\n";
+}
+
 void history_tail_graph() {
     using namespace mfq::cuda::qwen4_exp;
     constexpr int hidden=32,heads=6,kv=2,iw=8,ih=2,pool=4,maximum=64,prefix=6;
@@ -560,13 +623,14 @@ int main(int argc,char** argv) {
         else if(argc==2 && (std::string(argv[1])=="--bench" || std::string(argv[1])=="--bench-f16"))benchmark(std::string(argv[1])=="--bench-f16");
         else if(argc==2 && std::string(argv[1])=="--prefill-bench")prefill_benchmark();
         else if(argc==2 && std::string(argv[1])=="--history-tail-check")history_tail_graph();
+        else if(argc==2 && std::string(argv[1])=="--request-projection-check")request_projection_graph();
         else if(argc==2 && std::string(argv[1])=="--draft-window-check")draft_window_graph();
         else if(argc==2 && std::string(argv[1])=="--causal-live-check")causal_live(false);
         else if(argc==2 && std::string(argv[1])=="--resolved-hot-check")resolved_hot_reference();
         else if(argc==2 && std::string(argv[1])=="--causal-live-bench")causal_live(true);
         else if(argc==3 && std::string(argv[1])=="--causal-live-export")causal_live(false,argv[2],true);
         else if(argc==3 && std::string(argv[1])=="--causal-live-reference")causal_live(false,argv[2]);
-        else{gate_reference();sparse_uniform_reference();general_query();qsa_sparse_gate_case();resolved_hot_reference();}
+        else{gate_reference();sparse_uniform_reference();general_query();qsa_sparse_gate_case();resolved_hot_reference();request_projection_graph();}
         return 0;
     }catch(const std::exception& error){std::cerr<<error.what()<<'\n';return 1;}
 }

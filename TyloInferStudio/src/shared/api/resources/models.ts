@@ -122,7 +122,7 @@ export const modelsApi = {
     model: string,
     contextSize: number | null = null,
     prefillChunkSize: number | 'auto' = 'auto',
-    policy: { pin?: boolean; idle_ttl_seconds?: number | null; device_ids?: string[]; context_management?: ModelLoadContextSettings; gguf_companions?: string[] } = {},
+    policy: { jev_weights?: 'stream' | 'vram'; pin?: boolean; idle_ttl_seconds?: number | null; device_ids?: string[]; context_management?: ModelLoadContextSettings; gguf_companions?: string[] } = {},
   ): Promise<{ operation_id: string; status: 'accepted' }> {
     return request('/api/v1/models/load', {
       method: 'POST',
@@ -131,6 +131,7 @@ export const modelsApi = {
         context_size: contextSize,
         prefill_chunk_size: prefillChunkSize,
         pin: policy.pin ?? false,
+        ...(policy.jev_weights ? { jev_weights: policy.jev_weights } : {}),
         ...(policy.context_management ? { context_management: {
           automatic: policy.context_management.automatic, ssd_kv: policy.context_management.ssd_kv,
           ram_preallocated: policy.context_management.ram_preallocated, vram_preallocated: policy.context_management.vram_preallocated,

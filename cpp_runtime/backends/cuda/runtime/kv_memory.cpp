@@ -3,6 +3,7 @@
 #include "kv_budget.h"
 #include "kv_expert_loan.h"
 #include "execution_options.h"
+#include "device_memory_topology.h"
 #include "mfq_cuda_context.h"
 #include "mfq_cuda_resident_allocations.h"
 #include <algorithm>
@@ -42,12 +43,9 @@ std::size_t host_available() {
 }
 std::size_t width_bytes(const tb::TensorOptions& options) { return options.scalar_type() == tb::kInt32 ? 4 : 2; }
 bool discrete_device() {
-    if(const auto* value=std::getenv("TYLOINFER_MEMORY_ARCHITECTURE"))return std::string(value)=="discrete";
-    int device=0,integrated=0,host_tables=0;
+    int device=0;
     TYLOINFER_NATIVE_CUDA_CHECK(cudaGetDevice(&device));
-    TYLOINFER_NATIVE_CUDA_CHECK(cudaDeviceGetAttribute(&integrated,cudaDevAttrIntegrated,device));
-    TYLOINFER_NATIVE_CUDA_CHECK(cudaDeviceGetAttribute(&host_tables,cudaDevAttrPageableMemoryAccessUsesHostPageTables,device));
-    return !integrated && !host_tables;
+    return device_has_separate_memory(device);
 }
 tb::Tensor external(void* data, std::shared_ptr<void> owner, const std::vector<int64_t>& shape,
                     const tb::TensorOptions& options) {
@@ -163,9 +161,13 @@ std::shared_ptr<KvMemoryAllocation> KvMemoryManager::add(int64_t maximum,int64_t
         int64_t iw,int64_t pool,const tb::TensorOptions& options,int64_t selected_columns) {
     if (ready_) {
         auto policy=options_;policy.additional_request=true;
-        if(policy.budget_policy && policy.gpu_budget)for(const auto& weak:allocations_)if(auto existing=weak.lock()) {
-            if(existing->maximum!=maximum || existing->heads!=heads || existing->key_width!=kw || existing->value_width!=vw)continue;
-            policy.gpu_budget=existing->index_bytes()+(existing->hot.exclusive()?
+        std::size_t resident=0;
+        for(const auto& weak:allocations_)if(auto existing=weak.lock()) {
+            if(existing->maximum!=maximum || existing->heads!=heads || existing->key_width!=kw ||
+               existing->value_width!=vw || existing->index_width!=iw || existing->pool!=pool ||
+               existing->selected_columns!=selected_columns || existing->options.scalar_type()!=options.scalar_type())continue;
+            resident=existing->gpu_bytes();
+            if(policy.budget_policy && policy.gpu_budget)policy.gpu_budget=existing->index_bytes()+(existing->hot.exclusive()?
                 std::size_t(existing->hot.keys.numel()+existing->hot.values.numel())*width_bytes(existing->options):
                 existing->host || existing->offload?0:existing->raw_bytes());
             break;
@@ -175,6 +177,13 @@ std::shared_ptr<KvMemoryAllocation> KvMemoryManager::add(int64_t maximum,int64_t
         if(!automatic_ram_ && !policy.budget_policy && (policy.placement=="auto" || policy.placement=="auto_ssd"))policy.placement="vram";
         KvMemoryManager child(policy);
         auto a=child.add(maximum,heads,kw,vw,iw,pool,options,selected_columns);
+        // Request caches must reclaim optional expert/prefix storage before
+        // the placement check. Growth after construction already uses this
+        // same reservation callback; preserve it for independent sessions.
+        child.set_reservation(reserve_);
+        if(!resident)resident=a->index_bytes()+
+            (policy.placement=="vram" && !policy.dynamic?a->raw_bytes():0);
+        if(reserve_)reserve_(resident+(std::size_t(256)<<20));
         child.finalize();allocations_.push_back(a);return a;
     }
     auto a=std::make_shared<KvMemoryAllocation>();

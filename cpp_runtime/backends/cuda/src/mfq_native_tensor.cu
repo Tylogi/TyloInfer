@@ -89,6 +89,17 @@ std::size_t WeightMemoryLedger::ple_bytes() const {
     for(const auto& payload:ple_)if(!payload.owner.expired())bytes+=payload.bytes;
     return bytes;
 }
+void WeightMemoryLedger::observe_embedding(const std::shared_ptr<void>& owner,std::size_t bytes) {
+    embeddings_.push_back({owner,bytes});
+}
+std::size_t WeightMemoryLedger::embedding_bytes() const {
+    std::size_t bytes=0;
+    for(const auto& payload:embeddings_)if(!payload.owner.expired())bytes+=payload.bytes;
+    return bytes;
+}
+void observe_streamed_embedding(const std::shared_ptr<void>& owner,std::size_t bytes) {
+    if(loading_weight_memory)loading_weight_memory->observe_embedding(owner,bytes);
+}
 WeightMemoryLoadScope::WeightMemoryLoadScope(WeightMemoryLedger& ledger):previous_(loading_weight_memory) {
     loading_weight_memory=&ledger;
 }

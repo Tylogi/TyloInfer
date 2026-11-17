@@ -4,6 +4,7 @@
 #include "gguf_rotation.h"
 #include "gguf_row_correction.h"
 #include "quant_linear.h"
+#include "runtime/prefill_projection_plan.h"
 #include "mfq_weight_memory.h"
 #include "tyloinfer/runtime.h"
 #include "mfq_cuda_context.h"
@@ -35,37 +36,13 @@
 namespace tb = mfq_tensor_backend;
 
 namespace {
-std::int64_t prefill_weight_rows(std::int64_t,std::uint64_t,std::int64_t,int,bool);
+using mfq::cuda::prefill_weight_rows;
 #ifdef TYLOINFER_NATIVE_CUDA_RUNTIME
-// Only row exponents are retained. Weak ownership prevents either model
-// retention or reuse after an allocator gives another weight the same address.
-struct PrefillRowScale {
-    std::weak_ptr<void> owner;const void* data;ggml_type type;int device;
-    std::int64_t rows,columns,quad_rows,quad_begin;
-    tb::Tensor exponents;mfq::cuda::Event ready;
-};
 tb::Tensor prefill_cached_exponents(const GgufWeight& w) {
-    static std::mutex mutex;static std::vector<std::unique_ptr<PrefillRowScale>> cache;
-    const auto owner=w.packed.weak_storage_owner();const auto stream=mfq_get_current_cuda_stream(w.packed.get_device());
-    std::lock_guard lock(mutex);
-    for(auto i=cache.begin();i!=cache.end();) {
-        if((*i)->owner.expired()){i=cache.erase(i);continue;}
-        auto& entry=**i;++i;
-        if(!entry.owner.owner_before(owner) && !owner.owner_before(entry.owner) &&
-                entry.data==w.packed.data_ptr() && entry.type==w.type && entry.rows==w.out &&
-                entry.columns==w.neuron_len && entry.quad_rows==w.quad_storage_rows && entry.quad_begin==w.quad_row_begin) {
-            TYLOINFER_CUDA_CHECK(cudaStreamWaitEvent(stream.stream(),entry.ready.get(),0));
-            mfq_cuda_record_stream(entry.exponents,stream);return entry.exponents;
-        }
-    }
-    cudaStreamCaptureStatus capture=cudaStreamCaptureStatusNone;
-    TYLOINFER_CUDA_CHECK(cudaStreamIsCapturing(stream.stream(),&capture));
-    if(capture!=cudaStreamCaptureStatusNone)return {};
-    auto entry=std::make_unique<PrefillRowScale>();entry->owner=owner;entry->data=w.packed.data_ptr();entry->type=w.type;
-    entry->device=w.packed.get_device();entry->rows=w.out;entry->columns=w.neuron_len;
-    entry->quad_rows=w.quad_storage_rows;entry->quad_begin=w.quad_row_begin;
-    entry->exponents=tb::empty({w.out},w.packed.options().dtype(tb::kInt32));
-    mfq_cuda_record_stream(entry->exponents,stream);
+    const auto stream=mfq_get_current_cuda_stream(w.packed.get_device());
+    return prefill_weight_exponents(w.packed,w.out,w.neuron_len,
+        {0,std::uintptr_t(w.type),std::uintptr_t(w.quad_storage_rows),std::uintptr_t(w.quad_row_begin)},
+        [&](const tb::Tensor& exponents) {
     if(w.quad_storage_rows) {
         const auto rows=prefill_weight_rows(w.out,w.row_bytes,128,w.packed.get_device(),false);
         auto image=tb::empty({std::int64_t(rows*w.row_bytes)},w.packed.options());
@@ -75,244 +52,51 @@ tb::Tensor prefill_cached_exponents(const GgufWeight& w) {
             mfq::cuda::gguf::unpack_quad_storage(w.type,w.packed.data_ptr(),w.quad_storage_rows,w.neuron_len,
                 w.quad_row_begin+begin,count,nullptr,count,image.data_ptr(),w.row_bytes,stream.stream());
             mfq::cuda::gguf::prefill_row_exponents(w.type,image.data_ptr(),w.row_bytes,count,w.neuron_len,
-                entry->exponents.data_ptr<std::int32_t>()+begin,stream.stream());
+                exponents.data_ptr<std::int32_t>()+begin,stream.stream());
         }
     } else {
         mfq_cuda_record_stream(w.packed,stream);
         mfq::cuda::gguf::prefill_row_exponents(w.type,w.packed.data_ptr(),w.row_bytes,w.out,w.neuron_len,
-            entry->exponents.data_ptr<std::int32_t>(),stream.stream());
+            exponents.data_ptr<std::int32_t>(),stream.stream());
     }
-    entry->ready.record(stream.stream());auto result=entry->exponents;cache.push_back(std::move(entry));return result;
+    });
 }
 #else
 tb::Tensor prefill_cached_exponents(const GgufWeight&) { return {}; }
 #endif
-std::int64_t prefill_weight_rows(std::int64_t rows,std::uint64_t bytes_per_row,
-        std::int64_t alignment,int device,bool double_buffer=false) {
-    const auto context=mfq::cuda::default_context(device);
-    using Key=std::tuple<int,std::int64_t,std::uint64_t,std::int64_t,bool>;
-    static thread_local std::map<Key,std::int64_t> prepared;
-    const Key key{device,rows,bytes_per_row,alignment,double_buffer};
-    cudaStreamCaptureStatus capture=cudaStreamCaptureStatusNone;
-    TYLOINFER_CUDA_CHECK(cudaStreamIsCapturing(mfq_current_cuda_stream(),&capture));
-    if(capture!=cudaStreamCaptureStatusNone) {
-        if(const auto found=prepared.find(key);found!=prepared.end())return found->second;
-        return std::min(rows,alignment);
-    }
-    const auto physical=context->available_memory(),reusable=context->reusable_workspace_bytes();
-    const auto available=physical>SIZE_MAX-reusable?SIZE_MAX:physical+reusable;
-    const auto loan=context->workspace_available();
-    const auto budget=available>SIZE_MAX-loan?SIZE_MAX:available+loan;
-    // Leave room for the following activation and the BLAS library's scratch.
-    // A complete matrix is preferred whenever it fits this live device budget;
-    // the old fixed 16 MiB tile needlessly fragmented large prompt GEMMs.
-    auto count=std::min<std::uint64_t>(rows,(budget/2)/bytes_per_row);
-    if(count<std::uint64_t(rows) && double_buffer)count/=2;
-    const auto selected=count>=std::uint64_t(rows)?rows:count>=std::uint64_t(alignment)?
-        std::int64_t(count/alignment*alignment):std::max<std::int64_t>(1,std::int64_t(count));
-    prepared[key]=selected;
-    return selected;
-}
+
 }
 
-struct GgufPrefillInputScope::Impl {
-    static thread_local Impl* active;Impl* previous=nullptr;
-    tb::Tensor source,half,exponents;mfq::cuda::Event ready;
-};
-thread_local GgufPrefillInputScope::Impl* GgufPrefillInputScope::Impl::active=nullptr;
-GgufPrefillInputScope::GgufPrefillInputScope()=default;
-std::unique_ptr<GgufPrefillInputScope> GgufPrefillInputScope::prepare_rms(
-        const tb::Tensor& input,const tb::Tensor& weight,double eps,double offset,tb::Tensor& normalized) {
-    normalized={};const auto* setting=std::getenv("TYLOINFER_GGUF_PREFILL_TENSORCORE");
-    if(!input.is_cuda() || !input.is_contiguous() || input.dim()<1 || input.size(-1)<1 ||
-            input.numel()/input.size(-1)<512 ||
-            (input.scalar_type()!=tb::kFloat32 && input.scalar_type()!=tb::kFloat16 && input.scalar_type()!=tb::kBFloat16) ||
-            weight.device()!=input.device() || weight.scalar_type()!=tb::kFloat32 || !weight.is_contiguous() ||
-            weight.numel()!=input.size(-1) || !std::isfinite(eps) || eps<=0 || !std::isfinite(offset) ||
-            (setting && setting[0]!='1' && setting[0]!='a'))return {};
-    const MfqCudaGuard guard(input.get_device());const auto rows=input.numel()/input.size(-1),width=input.size(-1);
-    if(!mfq::cuda::gguf::grouped_f16_available(input.get_device()) ||
-            !mfq::cuda::gguf::rms_prefill_available(rows,width,input.get_device()))return {};
-    auto scope=std::unique_ptr<GgufPrefillInputScope>(new GgufPrefillInputScope);
-    auto plan=std::make_unique<Impl>();
-    normalized=tb::empty(input.sizes(),input.options().dtype(tb::kFloat32));plan->source=normalized;
-    plan->half=tb::empty(input.sizes(),input.options().dtype(tb::kFloat16));
-    plan->exponents=tb::empty({rows},input.options().dtype(tb::kInt32));
-    const auto stream=mfq_get_current_cuda_stream(input.get_device());
-    for(const auto& tensor:{input,weight,normalized,plan->half,plan->exponents})mfq_cuda_record_stream(tensor,stream);
-    const auto type=input.scalar_type()==tb::kFloat32?GGML_TYPE_F32:input.scalar_type()==tb::kFloat16?GGML_TYPE_F16:GGML_TYPE_BF16;
-    mfq::cuda::gguf::pack_rms_prefill(input.data_ptr(),type,weight.data_ptr<float>(),rows,width,float(eps),float(offset),
-        normalized.data_ptr<float>(),plan->half.data_ptr(),plan->exponents.data_ptr<int32_t>(),stream.stream());
-    plan->ready.record(stream.stream());plan->previous=Impl::active;Impl::active=plan.get();scope->impl_=std::move(plan);
-    if(const auto* trace=std::getenv("TYLOINFER_TRACE_KERNEL_DISPATCH");trace && trace[0]=='1') {
-        static std::atomic<bool> reported{};
-        if(!reported.exchange(true))std::fprintf(stderr,"native_gguf_prefill_rms_input actual_match=1 M=%lld K=%lld normalized_fp32=1 reuse_scaled_fp16=1\n",
-            static_cast<long long>(rows),static_cast<long long>(width));
-    }
-    return scope;
+PrefillProjectionWeight prefill_projection_weight(const GgufWeight& w) {
+    if(!w.packed.is_cuda() || w.prefers_original_input() || w.out<1 || w.neuron_len<1)return {};
+    return {w.packed,w.out,w.neuron_len,std::uint64_t(w.neuron_len)*2,[w] {
+        const MfqCudaGuard guard(w.packed.get_device());
+        auto exponents=prefill_cached_exponents(w);if(!exponents.defined())return PrefillWeightImage{};
+        auto image=tb::empty({w.out,w.neuron_len},w.packed.options().dtype(tb::kFloat16));
+        const auto stream=mfq_get_current_cuda_stream(w.packed.get_device());
+        for(const auto& tensor:{w.packed,exponents,image})mfq_cuda_record_stream(tensor,stream);
+        if(w.quad_storage_rows)mfq::cuda::gguf::decode_quad_rows_scaled(w.type,w.packed.data_ptr(),w.quad_storage_rows,
+            w.neuron_len,w.quad_row_begin,w.out,exponents.data_ptr<int32_t>(),image.data_ptr(),stream.stream());
+        else mfq::cuda::gguf::dequantize_rows_scaled(w.type,w.packed.data_ptr(),w.row_bytes,w.out,w.neuron_len,
+            exponents.data_ptr<int32_t>(),image.data_ptr(),stream.stream());
+        return PrefillWeightImage{image,exponents};
+    }};
 }
-GgufPrefillInputScope::GgufPrefillInputScope(const tb::Tensor& input) {
-    const auto* setting=std::getenv("TYLOINFER_GGUF_PREFILL_TENSORCORE");
-    if(!input.is_cuda() || input.scalar_type()!=tb::kFloat32 || !input.is_contiguous() || input.dim()<1 ||
-            input.size(-1)<1 || input.numel()/input.size(-1)<512 ||
-            (setting && setting[0]!='1' && setting[0]!='a'))return;
-    const MfqCudaGuard guard(input.get_device());
-    if(!mfq::cuda::gguf::grouped_f16_available(input.get_device()))return;
-    if(Impl::active && input.data_ptr()==Impl::active->source.data_ptr() &&
-            input.device()==Impl::active->source.device() && input.sizes()==Impl::active->source.sizes())return;
-    auto plan=std::make_unique<Impl>();plan->source=input;
-    plan->half=tb::empty(input.sizes(),input.options().dtype(tb::kFloat16));
-    plan->exponents=tb::empty({input.numel()/input.size(-1)},input.options().dtype(tb::kInt32));
-    const auto stream=mfq_get_current_cuda_stream(input.get_device());
-    for(const auto& tensor:{input,plan->half,plan->exponents})mfq_cuda_record_stream(tensor,stream);
-    mfq::cuda::gguf::pack_scaled_f16_unit(input.data_ptr<float>(),plan->half.data_ptr(),plan->exponents.data_ptr<int32_t>(),
-        input.numel()/input.size(-1),input.size(-1),stream.stream());
-    plan->ready.record(stream.stream());plan->previous=Impl::active;Impl::active=plan.get();impl_=std::move(plan);
-}
-GgufPrefillInputScope::~GgufPrefillInputScope(){if(impl_)Impl::active=impl_->previous;}
-bool GgufPrefillInputScope::lookup(const tb::Tensor& input,tb::Tensor& half,tb::Tensor& exponents) {
-    const auto* plan=Impl::active;
-    if(!plan || !input.defined() || input.dim()<1 || !input.is_contiguous() ||
-            input.scalar_type()!=tb::kFloat32 || input.device()!=plan->source.device() || input.data_ptr()!=plan->source.data_ptr() || input.numel()!=plan->source.numel() ||
-            input.size(-1)!=plan->source.size(-1))return false;
-    const MfqCudaGuard guard(input.get_device());
-    const auto stream=mfq_get_current_cuda_stream(input.get_device());
-    TYLOINFER_CUDA_CHECK(cudaStreamWaitEvent(stream.stream(),plan->ready.get(),0));
-    half=plan->half;exponents=plan->exponents;
-    if(const auto* trace=std::getenv("TYLOINFER_TRACE_KERNEL_DISPATCH");trace && trace[0]=='1') {
-        static std::atomic<bool> reported{};
-        if(!reported.exchange(true,std::memory_order_relaxed))std::fprintf(stderr,
-            "native_gguf_prefill_shared_input actual_match=1 M=%lld K=%lld reuse_scaled_fp16=1\n",
-            static_cast<long long>(input.numel()/input.size(-1)),static_cast<long long>(input.size(-1)));
-    }
-    mfq_cuda_record_stream(half,stream);mfq_cuda_record_stream(exponents,stream);return true;
-}
+
 GgufPrefillProduct gguf_prefill_product(const GgufWeight& w,const tb::Tensor& input) {
-    const auto* setting=std::getenv("TYLOINFER_GGUF_PREFILL_TENSORCORE");
-    if((setting && setting[0]!='1' && setting[0]!='a') || w.prefers_original_input() ||
-            !w.packed.is_cuda() || !input.is_cuda() || input.device()!=w.packed.device() ||
-            input.scalar_type()!=tb::kFloat32 || !input.is_contiguous() || input.dim()<1 ||
-            input.size(-1)!=w.neuron_len || w.neuron_len<1 || input.numel()/w.neuron_len<512)return {};
-    const MfqCudaGuard guard(w.packed.get_device());
-    if(!mfq::cuda::gguf::grouped_f16_available(w.packed.get_device()))return {};
-    const auto tokens=input.numel()/w.neuron_len;
-    if(prefill_weight_rows(w.out,uint64_t(w.neuron_len)*2+uint64_t(tokens)*2,32,w.packed.get_device())<w.out)return {};
-    auto columns=prefill_cached_exponents(w);if(!columns.defined())return {};
-    tb::Tensor packed,rows;
-    const auto stream=mfq_get_current_cuda_stream(w.packed.get_device());
-    if(!GgufPrefillInputScope::lookup(input,packed,rows)) {
-        packed=tb::empty({tokens,w.neuron_len},input.options().dtype(tb::kFloat16));
-        rows=tb::empty({tokens},input.options().dtype(tb::kInt32));
-        mfq_cuda_record_stream(input,stream);mfq_cuda_record_stream(packed,stream);mfq_cuda_record_stream(rows,stream);
-        mfq::cuda::gguf::pack_scaled_f16_unit(input.data_ptr<float>(),packed.data_ptr(),rows.data_ptr<int32_t>(),
-            tokens,w.neuron_len,stream.stream());
-    }
-    auto image=tb::empty({w.out,w.neuron_len},input.options().dtype(tb::kFloat16));
-    auto product=tb::empty({tokens,w.out},input.options().dtype(tb::kFloat16));
-    for(const auto& tensor:{w.packed,packed,rows,columns,image,product})mfq_cuda_record_stream(tensor,stream);
-    if(w.quad_storage_rows)mfq::cuda::gguf::decode_quad_rows_scaled(w.type,w.packed.data_ptr(),w.quad_storage_rows,
-        w.neuron_len,w.quad_row_begin,w.out,columns.data_ptr<int32_t>(),image.data_ptr(),stream.stream());
-    else mfq::cuda::gguf::dequantize_rows_scaled(w.type,w.packed.data_ptr(),w.row_bytes,w.out,w.neuron_len,
-        columns.data_ptr<int32_t>(),image.data_ptr(),stream.stream());
-    auto& blas=mfq::cuda::default_context(w.packed.get_device())->blas(stream.stream());
-    mfq::cuda::gguf::prefill_gemm_f16_accum(packed.data_ptr(),image.data_ptr(),nullptr,product.data_ptr(),true,
-        nullptr,nullptr,tokens,w.out,w.neuron_len,w.out,blas.get(),stream.stream());
-    if(const auto* trace=std::getenv("TYLOINFER_TRACE_KERNEL_DISPATCH");trace && trace[0]=='1') {
-        static std::atomic<bool> reported{};
-        if(!reported.exchange(true))std::fprintf(stderr,
-            "native_gguf_prefill_scaled_product actual_match=1 M=%lld N=%lld K=%lld restore_at_consumer=1\n",
-            static_cast<long long>(tokens),static_cast<long long>(w.out),static_cast<long long>(w.neuron_len));
-    }
-    return {product,rows,columns};
+    return prefill_product(prefill_projection_weight(w),input);
 }
-
-static GgufPrefillProduct rms_gated_product_impl(const GgufWeight& w,const tb::Tensor& attended,
-        const tb::Tensor& gate,const tb::Tensor& norm,double eps,bool silu,const GgufPrefillProduct* scaled_gate) {
-    const auto* setting=std::getenv("TYLOINFER_GGUF_PREFILL_TENSORCORE");
-    if((setting && setting[0]!='1' && setting[0]!='a') || w.prefers_original_input() || !w.packed.is_cuda() ||
-            !attended.is_cuda() || attended.device()!=w.packed.device() || !attended.is_contiguous() ||
-            attended.scalar_type()!=tb::kFloat32 || attended.dim()!=4 ||
-            norm.device()!=attended.device() || norm.scalar_type()!=tb::kFloat32 || !norm.is_contiguous() ||
-            gate.device()!=attended.device() || gate.scalar_type()!=(scaled_gate?tb::kFloat16:tb::kFloat32) || gate.dim()!=3)return {};
-    if(!std::isfinite(eps) || eps<=0)return {};
-    const MfqCudaGuard guard(w.packed.get_device());
-    const auto batch=attended.size(0),heads=attended.size(1),tokens=attended.size(2),width=attended.size(3);
-    const auto m=batch*tokens;
-    if(m<512 || heads*width!=w.neuron_len || norm.numel()!=width || gate.size(0)!=batch || gate.size(1)!=tokens ||
-            gate.size(2)!=heads*width || gate.stride(2)!=1 || gate.stride(1)<heads*width ||
-            gate.stride(0)<tokens*gate.stride(1) || !mfq::cuda::gguf::grouped_f16_available(w.packed.get_device()) ||
-            !mfq::cuda::gguf::rms_gated_prefill_available(w.neuron_len,w.packed.get_device()))return {};
-    if(scaled_gate) {
-        for(const auto* e:{&scaled_gate->row_exponents,&scaled_gate->column_exponents})
-            if(!e->defined() || !e->is_contiguous() || e->device()!=attended.device() || e->scalar_type()!=tb::kInt32)return {};
-        if(scaled_gate->row_exponents.numel()!=m || scaled_gate->column_exponents.numel()!=w.neuron_len)return {};
-    }
-    const auto row_bytes=uint64_t(w.neuron_len)*2+uint64_t(m)*2;
-    if(prefill_weight_rows(w.out,row_bytes,32,w.packed.get_device(),false)<w.out)return {};
-    auto exponents=prefill_cached_exponents(w);if(!exponents.defined())return {};
-    auto image=tb::empty({w.out,w.neuron_len},attended.options().dtype(tb::kFloat16));
-    auto packed=tb::empty({m,w.neuron_len},attended.options().dtype(tb::kFloat16));
-    auto rows=tb::empty({m},attended.options().dtype(tb::kInt32));
-    auto product=tb::empty({m,w.out},attended.options().dtype(tb::kFloat16));
-    const auto stream=mfq_get_current_cuda_stream(w.packed.get_device());
-    for(const auto& tensor:{w.packed,attended,gate,norm,exponents,image,packed,rows,product})mfq_cuda_record_stream(tensor,stream);
-    if(scaled_gate) {
-        mfq_cuda_record_stream(scaled_gate->row_exponents,stream);mfq_cuda_record_stream(scaled_gate->column_exponents,stream);
-        mfq::cuda::gguf::pack_rms_scaled_gate_prefill(attended.data_ptr<float>(),gate.data_ptr(),norm.data_ptr<float>(),
-            scaled_gate->row_exponents.data_ptr<int32_t>(),scaled_gate->column_exponents.data_ptr<int32_t>(),
-            batch,heads,tokens,width,gate.stride(0),gate.stride(1),float(eps),silu,packed.data_ptr(),rows.data_ptr<int32_t>(),stream.stream());
-    } else mfq::cuda::gguf::pack_rms_gated_prefill(attended.data_ptr<float>(),gate.data_ptr<float>(),norm.data_ptr<float>(),
-            batch,heads,tokens,width,gate.stride(0),gate.stride(1),float(eps),silu,packed.data_ptr(),rows.data_ptr<int32_t>(),stream.stream());
-    if(w.quad_storage_rows)mfq::cuda::gguf::decode_quad_rows_scaled(w.type,w.packed.data_ptr(),w.quad_storage_rows,
-        w.neuron_len,w.quad_row_begin,w.out,exponents.data_ptr<int32_t>(),image.data_ptr(),stream.stream());
-    else mfq::cuda::gguf::dequantize_rows_scaled(w.type,w.packed.data_ptr(),w.row_bytes,w.out,w.neuron_len,
-        exponents.data_ptr<int32_t>(),image.data_ptr(),stream.stream());
-    const auto context=mfq::cuda::default_context(w.packed.get_device());auto& blas=context->blas(stream.stream());
-    mfq::cuda::gguf::prefill_gemm_f16_accum(packed.data_ptr(),image.data_ptr(),nullptr,product.data_ptr(),true,
-        nullptr,nullptr,m,w.out,w.neuron_len,w.out,blas.get(),stream.stream());
-    if(const auto* trace=std::getenv("TYLOINFER_TRACE_KERNEL_DISPATCH");trace && trace[0]=='1') {
-        static std::atomic<bool> printed{false};if(!printed.exchange(true))std::fprintf(stderr,
-            "native_gguf_prefill_rms_gate_pack actual_match=1 M=%lld N=%lld K=%lld fused_rms=1 fused_layout=1 fused_gate=%s fused_scale=1\n",
-            static_cast<long long>(m),static_cast<long long>(w.out),static_cast<long long>(w.neuron_len),silu?"silu":"sigmoid");
-    }
-    return {product,rows,exponents};
-}
-
 GgufPrefillProduct gguf_rms_gated_product(const GgufWeight& w,const tb::Tensor& attended,
         const tb::Tensor& gate,const tb::Tensor& norm,double eps,bool silu) {
-    return rms_gated_product_impl(w,attended,gate,norm,eps,silu,nullptr);
+    return prefill_rms_gated_product(prefill_projection_weight(w),attended,gate,norm,eps,silu);
 }
 GgufPrefillProduct gguf_rms_gated_product(const GgufWeight& w,const tb::Tensor& attended,
         const GgufPrefillProduct& gate,const tb::Tensor& norm,double eps,bool silu) {
-    if(!gate.defined() || gate.values.dim()!=2 || !gate.values.is_contiguous() || attended.dim()!=4 ||
-        gate.values.size(0)!=attended.size(0)*attended.size(2) ||
-        gate.values.size(1)!=attended.size(1)*attended.size(3))return {};
-    auto result=rms_gated_product_impl(w,attended,
-        gate.values.reshape({attended.size(0),attended.size(2),gate.values.size(1)}),norm,eps,silu,&gate);
-    if(result.defined())if(const auto* trace=std::getenv("TYLOINFER_TRACE_KERNEL_DISPATCH");trace && trace[0]=='1') {
-        static std::atomic<bool> reported{};
-        if(!reported.exchange(true))std::fprintf(stderr,"native_gguf_prefill_scaled_gate actual_match=1 restore_at_consumer=1\n");
-    }
-    return result;
+    return prefill_rms_gated_product(prefill_projection_weight(w),attended,gate,norm,eps,silu);
 }
-tb::Tensor gguf_prefill_materialize(const GgufPrefillProduct& product) {
-    TYLOINFER_RUNTIME_CHECK(product.defined() && product.values.is_cuda() && product.values.is_contiguous() &&
-        product.values.dim()==2 && product.values.scalar_type()==tb::kFloat16,
-        "scaled prefill materialization requires a contiguous FP16 product");
-    const auto rows=product.values.size(0),columns=product.values.size(1);
-    for(const auto* e:{&product.row_exponents,&product.column_exponents})
-        TYLOINFER_RUNTIME_CHECK(e->defined() && e->is_contiguous() && e->device()==product.values.device() && e->scalar_type()==tb::kInt32,
-            "scaled prefill materialization exponents disagree");
-    TYLOINFER_RUNTIME_CHECK(product.row_exponents.numel()==rows && product.column_exponents.numel()==columns,
-        "scaled prefill materialization exponent sizes disagree");
-    const MfqCudaGuard guard(product.values.get_device());
-    auto output=tb::empty({rows,columns},product.values.options().dtype(tb::kFloat32));
-    const auto stream=mfq_get_current_cuda_stream(output.get_device());
-    for(const auto& t:{product.values,product.row_exponents,product.column_exponents,output})mfq_cuda_record_stream(t,stream);
-    mfq::cuda::gguf::restore_scaled_f16(product.values.data_ptr(),output.data_ptr(),false,
-        product.row_exponents.data_ptr<int32_t>(),product.column_exponents.data_ptr<int32_t>(),rows,columns,columns,stream.stream());
-    return output;
-}
+tb::Tensor gguf_prefill_materialize(const GgufPrefillProduct& product){return prefill_materialize(product);}
+std::vector<tb::Tensor> gguf_prefill_acc_rms(const GgufPrefillProduct& product,const tb::Tensor& residual,
+        const tb::Tensor& norm,double eps,double offset){return prefill_acc_rms(product,residual,norm,eps,offset);}
 
 tb::Tensor gguf_rms_gated_prefill(const GgufWeight& w,const tb::Tensor& attended,
         const tb::Tensor& gate,const tb::Tensor& norm,double eps,bool silu) {
@@ -326,35 +110,6 @@ tb::Tensor gguf_rms_gated_prefill(const GgufWeight& w,const tb::Tensor& attended
         output.size(0),output.size(1),output.size(1),stream.stream());
     return output.reshape({attended.size(0),attended.size(2),w.out});
 }
-std::vector<tb::Tensor> gguf_prefill_acc_rms(const GgufPrefillProduct& product,const tb::Tensor& residual,
-        const tb::Tensor& norm,double eps,double offset) {
-    TYLOINFER_RUNTIME_CHECK(product.defined() && residual.is_cuda() && residual.is_contiguous() &&
-        residual.scalar_type()==tb::kFloat16 && residual.dim()==2 && product.values.is_contiguous() &&
-        product.values.device()==residual.device() && product.values.sizes()==residual.sizes() &&
-        product.values.scalar_type()==tb::kFloat16 && norm.is_contiguous() && norm.device()==residual.device() &&
-        norm.scalar_type()==tb::kFloat32 && norm.numel()==residual.size(1),"scaled prefill residual/RMS operands disagree");
-    for(const auto* exponents:{&product.row_exponents,&product.column_exponents})
-        TYLOINFER_RUNTIME_CHECK(exponents->defined() && exponents->is_cuda() && exponents->is_contiguous() &&
-            exponents->device()==residual.device() && exponents->scalar_type()==tb::kInt32,
-            "scaled prefill residual/RMS exponents disagree");
-    TYLOINFER_RUNTIME_CHECK(product.row_exponents.numel()==residual.size(0) &&
-        product.column_exponents.numel()==residual.size(1) && std::isfinite(eps) && eps>0,
-        "scaled prefill residual/RMS exponent geometry or epsilon disagrees");
-    const MfqCudaGuard guard(residual.get_device());
-    auto sum=tb::empty_like(residual),normalized=tb::empty_like(residual);
-    const auto stream=mfq_get_current_cuda_stream(residual.get_device());
-    for(const auto& tensor:{residual,norm,product.values,product.row_exponents,product.column_exponents,sum,normalized})
-        mfq_cuda_record_stream(tensor,stream);
-    mfq::cuda::gguf::acc_rms_scaled_f16(product.values.data_ptr(),residual.data_ptr(),norm.data_ptr<float>(),
-        product.row_exponents.data_ptr<int32_t>(),product.column_exponents.data_ptr<int32_t>(),
-        residual.size(0),residual.size(1),float(eps),float(offset),sum.data_ptr(),normalized.data_ptr(),stream.stream());
-    if(const auto* trace=std::getenv("TYLOINFER_TRACE_KERNEL_DISPATCH");trace && trace[0]=='1') {
-        static std::atomic<bool> reported{};
-        if(!reported.exchange(true))std::fprintf(stderr,"native_gguf_prefill_acc_rms actual_match=1 fused_restore=1 fused_residual=1 fused_rms=1\n");
-    }
-    return {sum,normalized};
-}
-
 void GgufWeight::repack_inplace() {
     // Called during loading, before publishing aliased immutable views.
     namespace gguf=mfq::cuda::gguf;
@@ -490,7 +245,8 @@ GgufWeight combine_gguf_rows(const std::vector<GgufWeight*>& weights) {
 }
 
 void decode_gguf_cpu(ggml_type type, const void* packed, float* output, std::int64_t columns) {
-    if (type == GGML_TYPE_Q8_K)
+    if(type==GGML_TYPE_F32)std::memcpy(output,packed,std::size_t(columns)*sizeof(float));
+    else if (type == GGML_TYPE_Q8_K)
         dequantize_row_q8_K(static_cast<const block_q8_K*>(packed), output, columns);
     else {
         const auto* traits = ggml_get_type_traits(type);
@@ -925,15 +681,7 @@ tb::Tensor GgufWeight::forward(tb::Tensor input,bool allow_mmq) const {
 }
 
 bool GgufWeight::can_forward_prefill_residual(int64_t tokens,const tb::Tensor& residual) const {
-    const auto* setting=std::getenv("TYLOINFER_GGUF_PREFILL_TENSORCORE");
-    if(tokens<=32 || (setting?setting[0]!='1' && setting[0]!='a':false) ||
-            ((!setting || setting[0]=='a') && tokens<512) ||
-            correction || projection_correction || !packed.is_cuda() || out<1 || neuron_len<1 ||
-            !residual.is_cuda() || residual.device()!=packed.device() || !residual.is_contiguous() ||
-            residual.scalar_type()!=tb::kFloat16 || residual.dim()<1 || residual.size(-1)!=out ||
-            residual.numel()/out!=tokens)return false;
-    const MfqCudaGuard guard(packed.get_device());
-    return mfq::cuda::gguf::grouped_f16_available(packed.get_device());
+    return !correction && !projection_correction && can_prefill_residual(packed,out,neuron_len,tokens,residual);
 }
 
 tb::Tensor GgufWeight::forward_base(tb::Tensor input,bool allow_mmq) const {
@@ -1020,7 +768,7 @@ tb::Tensor GgufWeight::forward_base(tb::Tensor input,bool allow_mmq,const tb::Te
     } else {
         namespace mmq=mfq::cuda::gguf::mmq;
         const auto* mmq_setting=std::getenv("TYLOINFER_GGUF_DENSE_MMQ");
-        const auto* fast_setting=std::getenv("TYLOINFER_GGUF_PREFILL_TENSORCORE");
+        const auto* fast_setting=mfq::cuda::prefill_tensorcore_setting();
         // Large prompts amortize decoding over many tokens. Keep MMQ for short
         // matrices and explicit non-MMQ reference calls. An explicit 1/0
         // permits enabling/disabling the reduced-accumulation GEMM mode.
@@ -1073,7 +821,7 @@ tb::Tensor GgufWeight::forward_base(tb::Tensor input,bool allow_mmq,const tb::Te
         // Prefill shares each decoded tile across every token. Temporary weight
         // expansion is bounded and never changes permanent compressed storage.
         const bool half = dtype == tb::kFloat16;
-        const auto* setting=std::getenv("TYLOINFER_GGUF_PREFILL_TENSORCORE");
+        const auto* setting=mfq::cuda::prefill_tensorcore_setting();
         const bool scaled_half=!half && dtype==tb::kFloat32 && (fast_prefill || !setting || setting[0]!='0') &&
             mfq::cuda::gguf::grouped_f16_available(packed.get_device());
         x = x.to(half ? tb::kFloat16 : tb::kFloat32).contiguous();
@@ -1089,7 +837,7 @@ tb::Tensor GgufWeight::forward_base(tb::Tensor input,bool allow_mmq,const tb::Te
         const bool pipelined=tile_rows<out && capture==cudaStreamCaptureStatusNone;
         const auto decoder=pipelined?mfq::cuda::stream_from_pool(false,packed.get_device()):stream;
         const int buffers=pipelined?2:1;
-        tb::Tensor tile[2],scaled_weight[2],weight_exponents[2],scaled_x,x_exponents;
+        tb::Tensor tile[2],scaled_weight[2],weight_exponents[2],scaled_x,x_exponents,residual_workspace;
         auto tile_output=fast_prefill && !half?tb::empty({tokens,tile_rows},x.options().dtype(tb::kFloat16)):tb::Tensor{};
         if(tile_output.defined())mfq_cuda_record_stream(tile_output,stream);
         const auto pack_half=fast_prefill?mfq::cuda::gguf::pack_scaled_f16_unit:mfq::cuda::gguf::pack_scaled_f16;
@@ -1147,22 +895,7 @@ tb::Tensor GgufWeight::forward_base(tb::Tensor input,bool allow_mmq,const tb::Te
             if(fast_prefill && half) {
                 auto* destination=static_cast<std::uint8_t*>(output.data_ptr())+begin*output.element_size();
                 if(prefill_residual.defined()) {
-                    const auto* residual=static_cast<const std::uint8_t*>(prefill_residual.data_ptr())+begin*sizeof(std::uint16_t);
-                    auto plan=mfq::cuda::gguf::prepare_prefill_residual_gemm(x.data_ptr(),tile[slot].data_ptr(),residual,
-                        destination,tokens,count,neuron_len,out,mfq_current_cuda_stream());
-                    tb::Tensor workspace;
-                    if(plan && plan.workspace_bytes) {
-                        try {
-                            workspace=tb::empty({int64_t(plan.workspace_bytes)},x.options().dtype(tb::kUInt8));
-                            mfq_cuda_record_stream(workspace,stream);
-                        } catch(const MfqResourceExhausted&) {
-                            (void)cudaGetLastError();
-                            plan={}; // Keep the ordinary result when scratch does not fit.
-                        }
-                    }
-                    mfq::cuda::gguf::prefill_gemm_f16_residual(x.data_ptr(),tile[slot].data_ptr(),residual,destination,
-                        tokens,count,neuron_len,out,plan,workspace.defined()?workspace.data_ptr():nullptr,
-                        workspace.defined()?workspace.nbytes():0,blas.get(),mfq_current_cuda_stream());
+                    prefill_residual_gemm(x,tile[slot],prefill_residual,output,begin,count,blas.get(),residual_workspace);
                 }
                 else mfq::cuda::gguf::prefill_gemm_f16_accum(x.data_ptr(),tile[slot].data_ptr(),nullptr,
                     destination,true,nullptr,nullptr,tokens,count,neuron_len,out,blas.get(),mfq_current_cuda_stream());

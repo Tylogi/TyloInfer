@@ -469,7 +469,7 @@ struct MfqModelCapabilityRegistration {
     MfqModelCapabilityProfile profile;
 };
 
-static const std::array<MfqModelCapabilityRegistration, 12>
+static const std::array<MfqModelCapabilityRegistration, 13>
     kModelCapabilityRegistry{{
         {{{"minicpmo", nullptr, nullptr}},
          {"minicpmo", true, true, true, true, true, true, false}},
@@ -491,6 +491,8 @@ static const std::array<MfqModelCapabilityRegistration, 12>
          {"qwen3_5", true, false, false, false, false, false, true}},
         {{{"qwen4_exp", "qwen4_exp_text", nullptr}},
          {"qwen4_exp", true, true, true, false, false, false, true}},
+        {{{"qwen4", "qwen4_text", nullptr}},
+         {"qwen4", true, true, true, false, false, false, true}},
         {{{"glm5_next", "glm5_next_text", nullptr}},
          {"glm5_next", true, true, true, false, false, false, true}},
     }};

@@ -11,7 +11,7 @@ void qsa_streamed_graph_case() {
             linear(heads*width,hidden,4),linear(hidden,(ih+1)*iw,5),norm,norm,inorm,inorm};
         QsaConfig cfg{heads,kv,width,ih,iw,pool,budget,maximum,1e-6};
         KvMemoryOptions policy;policy.placement="auto_ssd";policy.budget_policy=true;
-        policy.gpu_budget=2*(maximum+maximum/pool)*iw*2+kv*width*4*4;
+        policy.gpu_budget=2*(maximum+maximum/pool)*(iw+2)*sizeof(std::int16_t)+kv*width*4*4;
         policy.ram_limit_set=true;policy.ram_limit=256;
         policy.directory=(std::filesystem::current_path()/"qsa-stream-graph-test").string();
         auto memory=std::make_shared<KvMemoryManager>(policy);
@@ -87,6 +87,30 @@ void qsa_kv_offload_case() {
     if (metric(store,"qsa_kv_ram_bytes") || !metric(store,"qsa_kv_ssd_bytes"))
         throw std::runtime_error("zero RAM budget must spill directly to SSD");
     equal(direct.range(0,64),source.narrow(0,0,64),"KV direct SSD restore",0,0);
+
+    for(const auto dtype:{tb::kInt16,tb::kInt32}) {
+        KvOffloadConfig typed_config;typed_config.buffer_bytes=16u<<10;
+        typed_config.gpu_budget_bytes=24u<<10;typed_config.ram_budget_bytes=8u<<10;
+        auto typed_store=std::make_shared<KvOffloadStore>(typed_config);
+        auto cpu=tb::empty({512,17},tb::TensorOptions().device(tb::kCPU).dtype(dtype));
+        auto* bytes=static_cast<std::uint8_t*>(cpu.data_ptr());
+        for(std::size_t i=0;i<cpu.nbytes();++i)bytes[i]=std::uint8_t(i*37+131);
+        auto encoded=cpu.to(tb::kCUDA);
+        KvOffloadSequence typed(typed_store,17,64,dtype);typed.append(encoded);typed_store->flush();
+        const std::vector<int64_t> ids{500,0,129,500,67};
+        auto expected=encoded.index_select(0,tb::tensor(ids).to(tb::kCUDA)).cpu().contiguous();
+        auto actual=typed.gather(ids).cpu().contiguous();
+        if(actual.scalar_type()!=dtype || std::memcmp(actual.data_ptr(),expected.data_ptr(),expected.nbytes()))
+            throw std::runtime_error("packed KV three-tier gather changed integer bits");
+        auto workspace=typed.gather_workspace(ids.size());typed.gather_into(ids,*workspace);
+        actual=workspace->rows.cpu().contiguous();
+        if(std::memcmp(actual.data_ptr(),expected.data_ptr(),expected.nbytes()))
+            throw std::runtime_error("packed KV gather workspace changed integer bits");
+        bool rejected=false;
+        try {KvOffloadSequence invalid(typed_store,INT64_MAX,INT64_MAX,tb::kFloat16);}
+        catch(const std::invalid_argument&){rejected=true;}
+        if(!rejected)throw std::runtime_error("overflowed KV sequence geometry was accepted");
+    }
 
     for (int width : {8,256}) {
         CudaExecutionContext execution;

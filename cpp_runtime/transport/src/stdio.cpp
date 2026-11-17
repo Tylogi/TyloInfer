@@ -1,4 +1,5 @@
 #include "common.h"
+#include "decision_protocol.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -184,6 +185,7 @@ public:
                 {"model", config_.model_name},
                 {"model_type", config_.model_type},
                 {"probability_available", scheduler.info().probability},
+                {"decisions_available", scheduler.info().decisions},
                 {"model_capabilities", model_capabilities},
                 {"vision_supported", vision_supported},
                 {"vision_available", vision_available},
@@ -825,6 +827,17 @@ public:
                 if (op == "count_tokens") {
                     send_result(id, token_count_json(std::get<mfq::engine::TokenCount>(
                         scheduler.control(parse_token_count_request(params)))));
+                    continue;
+                }
+                if(op=="decide") {
+                    if(!scheduler.info().decisions)throw ApiError(501,"decisions_unavailable","decision reads are unavailable for this model");
+                    auto request=parse_decision_request(params,true);
+                    if(!request.model.empty() && request.model!=config_.model_name)
+                        throw ApiError(404,"model_not_found","the requested decision model is not served","model");
+                    try {
+                        const auto result=std::get<mfq::engine::DecisionResult>(scheduler.control(request.input));
+                        send_result(id,decision_result_json(request,result,config_.model_name));
+                    }catch(const mfq::engine::ControlBusyError& error) {throw ApiError(409,"runtime_busy",error.what());}
                     continue;
                 }
                 if (op == "score") {

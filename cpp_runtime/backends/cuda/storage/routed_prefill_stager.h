@@ -5,15 +5,21 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstring>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 // Adapted from Strata src/prefill/prefill.cpp (MIT): parallel RAM copies
 // run ahead of uploads through a generation-safe, DMA-fenced pinned ring.
-class GgufPrefillStager {
+class RoutedPrefillStager {
 public:
+    static bool enabled() {
+        const auto* option=std::getenv("TYLOINFER_PREFILL_HOST_STAGE");return !option || option[0]!='0';
+    }
     // D-5: the pinned ring's depth (STRATA_STAGER_RING, default 16) - how far the host copies can run ahead of the
     // DMAs of the unpinned experts' blobs
     int kRing = 16;
@@ -44,6 +50,7 @@ public:
     std::size_t capacity=0;
 
     bool init(size_t blob_bytes, int nthreads) {
+        TYLOINFER_NATIVE_CUDA_CHECK(cudaGetDevice(&device));
         capacity=blob_bytes;
 
         buf.assign((size_t) kRing, nullptr);
@@ -60,22 +67,24 @@ public:
             mfq::cuda::charge_tensor_host_bytes(blob_bytes);
             if (cudaEventCreateWithFlags(&dma_done[i], cudaEventDisableTiming | cudaEventBlockingSync) != cudaSuccess) return false;
         }
-        cudaGetDevice(&device);
         for (int t = 0; t < nthreads; ++t)
             threads.emplace_back([this] {
                 work();
             });
         return true;
     }
-    ~GgufPrefillStager() {
+    ~RoutedPrefillStager() {
+        int previous=0;const bool restore=cudaGetDevice(&previous)==cudaSuccess;
+        (void)cudaSetDevice(device);
         finish();
         { std::lock_guard<std::mutex> lk(mu); quit = true; }
         cv.notify_all();
         for (auto& t : threads) t.join();
-        for (int i = 0; i < kRing; ++i) {
-            if (dma_done[i]) {cudaEventSynchronize(dma_done[i]);cudaEventDestroy(dma_done[i]);}
+        for (std::size_t i = 0; i < buf.size(); ++i) {
+            if(i<dma_done.size() && dma_done[i]) {cudaEventSynchronize(dma_done[i]);cudaEventDestroy(dma_done[i]);}
             if (buf[i]) {if(pinned[i])cudaFreeHost(buf[i]);mfq::cuda::tensor_host_bytes.fetch_sub(capacity);}
         }
+        if(restore)(void)cudaSetDevice(previous);
     }
     void work() {
         cudaSetDevice(device);
@@ -140,13 +149,14 @@ public:
     /// A layer's jobs; the previous layer's are finished (finish()).
     void start(std::vector<Job>&& js) {
         if (js.empty()) return;
-        if(js.size()>65535)throw std::length_error("GGUF host staging job count");
+        if(js.size()>65535)throw std::length_error("routed host staging job count");
         std::lock_guard<std::mutex> lk(mu);
         jobs = std::move(js);
         if (ready_cap < jobs.size()) {
-            ready_cap = jobs.size() * 2;
-            ready.reset(new std::atomic<int>[ready_cap]);
-            skipped.reset(new std::atomic<char>[ready_cap]);
+            const auto capacity=jobs.size()*2;
+            auto next_ready=std::make_unique<std::atomic<int>[]>(capacity);
+            auto next_skipped=std::make_unique<std::atomic<char>[]>(capacity);
+            ready=std::move(next_ready);skipped=std::move(next_skipped);ready_cap=capacity;
         }
         for (size_t i = 0; i < jobs.size(); ++i) {
             ready[i].store(0, std::memory_order_relaxed);
@@ -173,12 +183,17 @@ public:
     }
     /// Job j's bytes, in a pinned buffer (waits for the copy).
     const uint8_t* wait(int j) {
+        // A pinned slot may already hold a later job once its watermark
+        // advances. Reject a traversal that differs from the prepared order.
+        if(j<issued.load(std::memory_order_acquire))
+            throw std::logic_error("routed host staging jobs were consumed out of order");
         while (!ready[(size_t) j].load(std::memory_order_acquire)) std::this_thread::yield();
         return buf[j % kRing];
     }
     /// The launching thread queued job j's DMA on `copy`: its buffer is free once that is done.
     void issued_one(int j, cudaStream_t copy) {
-        cudaEventRecord(dma_done[j % kRing], copy);
+        try{TYLOINFER_NATIVE_CUDA_CHECK(cudaEventRecord(dma_done[j % kRing],copy));}
+        catch(...){(void)cudaStreamSynchronize(copy);throw;}
         issued.store(j + 1, std::memory_order_release);
 #if defined(__cpp_lib_atomic_wait)
         issued.notify_all();
@@ -192,5 +207,44 @@ public:
         issued.notify_all();
 #endif
         while (active.load(std::memory_order_acquire) != 0) std::this_thread::yield();
+    }
+};
+
+struct RoutedPrefillStagePlan {
+    std::vector<RoutedPrefillStager::Job> jobs;
+    std::unordered_map<std::uint64_t,int> positions;
+    std::size_t maximum=0;
+    bool aliases=false;
+    void add(std::uint64_t key,RoutedPrefillStager::Job job) {
+        if(!positions.emplace(key,int(jobs.size())).second){aliases=true;return;}
+        maximum=std::max(maximum,job.bytes);jobs.push_back(std::move(job));
+    }
+    std::shared_ptr<void> start(std::unique_ptr<RoutedPrefillStager>& stager,
+            std::unordered_map<std::uint64_t,int>& index,int device,std::mutex& mutex) {
+        if(jobs.empty() || aliases || jobs.size()>65535)return {};
+        if(!stager || stager->device!=device || stager->capacity<maximum) {
+            stager.reset();
+            auto candidate=std::make_unique<RoutedPrefillStager>();
+            const auto hw=std::thread::hardware_concurrency();
+            if(!candidate->init(maximum,std::max(2u,std::min(4u,hw/4))))return {};
+            stager=std::move(candidate);
+        }
+        struct Session {
+            RoutedPrefillStager* stager;
+            std::unordered_map<std::uint64_t,int>& index;
+            std::mutex& mutex;
+            bool active=false;
+            Session(RoutedPrefillStager* worker,std::unordered_map<std::uint64_t,int>& entries,std::mutex& lock)
+                :stager(worker),index(entries),mutex(lock){}
+            ~Session() {
+                if(!active)return;
+                std::lock_guard lock(mutex);stager->finish();stager->jobs.clear();index.clear();
+            }
+        };
+        auto session=std::make_shared<Session>(stager.get(),index,mutex);
+        index=std::move(positions);
+        try{stager->start(std::move(jobs));session->active=true;}
+        catch(...){index.clear();throw;}
+        return session;
     }
 };

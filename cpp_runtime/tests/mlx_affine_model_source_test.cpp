@@ -34,6 +34,7 @@ int main() {
             const auto text = header.dump(); u64(file, text.size()); file << text;
             file.write(reinterpret_cast<const char*>(payload.data()), payload.size());
         }
+        {
         mfq::HfModelSource source(root);
         const auto* tensor = source.find_tensor("probe.weight");
         require(tensor && tensor->dtype == "MLX-AFFINE" && tensor->shape ==
@@ -70,6 +71,7 @@ int main() {
         try { mfq::MlxAffineLayout::parse(bytes.data(), layout.prefix_bytes - 1); }
         catch (const std::invalid_argument&) { rejected = true; }
         require(rejected, "MLX truncated metadata was accepted");
+        }
         std::filesystem::remove_all(root);
         std::cout << "MLX affine source overrides/logical shape/bit-exact payload/range reads PASS\n";
         return 0;

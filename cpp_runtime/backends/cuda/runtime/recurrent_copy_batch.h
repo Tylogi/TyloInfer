@@ -1,6 +1,8 @@
 #pragma once
 #include "mfq_tensor_backend.h"
 #ifdef TYLOINFER_NATIVE_CUDA_RUNTIME
+#include "mfq_cuda_context.h"
+#include "mfq_cuda_resident_allocations.h"
 #include "recurrent_copy_kernel.h"
 
 namespace mfq::cuda {
@@ -84,3 +86,16 @@ inline void copy_recurrent_state(mfq_tensor_backend::Tensor& destination,
         const mfq_tensor_backend::Tensor& source) {destination.copy_(source);}
 }
 #endif
+
+namespace mfq::cuda {
+inline mfq_tensor_backend::Tensor retain_recurrent_state(mfq_tensor_backend::Tensor value,
+        bool independent = false) {
+#ifdef TYLOINFER_NATIVE_CUDA_RUNTIME
+    // Request state must survive the return of borrowed expert storage.
+    independent=independent || (value.is_cuda() &&
+        default_context(value.get_device())->workspace_loan_active());
+    ResidentAllocationScope resident(independent);
+#endif
+    return independent?value.clone():std::move(value);
+}
+}

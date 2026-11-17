@@ -509,6 +509,19 @@ describe('useModelCatalog', () => {
     expect(result.current.busy).toBe(false);
   });
 
+  it('passes Jev weight placement independently of automatic context settings', async () => {
+    state.ready = true;
+    vi.spyOn(modelsApi, 'modelArtifacts').mockResolvedValue([{ ...artifact, structured_decisions: true }]);
+    const load = vi.spyOn(modelsApi, 'loadModel').mockResolvedValue({ operation_id: 'load-jev', status: 'accepted' });
+    const { result } = renderHook(useModelCatalog, { wrapper: Wrapper });
+    await waitFor(() => expect(result.current.artifacts).toHaveLength(1));
+    act(() => result.current.openModelSettings(artifact.name));
+    act(() => result.current.setLoadContext({ ...DEFAULT_LOAD_CONTEXT, jev_weights: 'vram' }));
+    await act(async () => result.current.loadArtifact(artifact.name));
+    expect(load).toHaveBeenCalledWith(artifact.name, null, 'auto', expect.objectContaining({ jev_weights: 'vram' }));
+    expect(load.mock.calls[0][3]).not.toHaveProperty('context_management');
+  });
+
   it('isolates context, devices and residency choices by model and connection', async () => {
     const load = vi.spyOn(modelsApi, 'loadModel').mockResolvedValue({ operation_id: 'load', status: 'accepted' });
     const { result, rerender } = renderHook(useModelCatalog, { wrapper: Wrapper });

@@ -9,6 +9,7 @@
 #include "mfq_cuda_resident_allocations.h"
 #include "runtime/decode_window.h"
 #include "runtime/execution_options.h"
+#include "runtime/routed_cache_resources.h"
 #include "tyloinfer/hf_safetensors_source.h"
 #include "tyloinfer/runtime.h"
 #include "ggml-quants.h"
@@ -443,17 +444,17 @@ struct Draft final : MtpModule {
             (!setting || setting[0]!='0');
     }
     bool reserve_graph_workspace(std::size_t bytes) {
-        if(!execution.gguf_expert_cache)return false;
+        if(!has_routed_expert_cache(execution))return false;
         const auto context=default_context(hidden_norm.get_device());
         if(context->available_memory()>=bytes)return false;
-        const auto before=gguf_expert_cache_budget_bytes(execution.gguf_expert_cache);
-        reserve_gguf_expert_workspace(execution.gguf_expert_cache,bytes);
-        return gguf_expert_cache_budget_bytes(execution.gguf_expert_cache)<before;
+        const auto before=routed_expert_cache_budget_bytes(execution);
+        reserve_routed_capture_workspace(execution,bytes);
+        return routed_expert_cache_budget_bytes(execution)<before;
     }
     void finish_graph_preparation(bool returned) {
         graph_initialized=true;
         if(decode_workspace_changed)decode_workspace_changed();
-        else if(returned)restore_gguf_decode_workspace_after_capture(execution.gguf_expert_cache);
+        else if(returned)restore_routed_decode_workspace_after_capture(execution);
     }
     std::optional<std::size_t> extra_decode_workspace_bytes(int maximum_depth) const override {
         bool prepared=draft_graph && draft_graph->valid();

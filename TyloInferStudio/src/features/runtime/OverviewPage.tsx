@@ -16,7 +16,7 @@ import { useServingStatistics } from './useServingStatistics';
 import { RuntimeHero } from './RuntimeHero';
 import { MemoryHierarchy } from './MemoryHierarchy';
 import { residentMemoryCapacity } from './memoryArchitecture';
-import { anthropicEndpoint, openAIEndpoint } from './endpoint';
+import { anthropicEndpoint, jevEndpoint, openAIEndpoint } from './endpoint';
 import { getApiBaseUrl, getApiToken } from '../../shared/api/client';
 import { runtimeApi } from '../../shared/api/resources/runtime';
 import { toast } from '../../stores/toastStore';
@@ -40,7 +40,7 @@ export function OverviewPage() {
   const { data: servingStatistics, error: statisticsError } = useServingStatistics(scope, connectionRevision);
   const [endpointCopied, setEndpointCopied] = useState<string | null>(null);
   const [listener, setListener] = useState<{ url: string; revision: number; port: number | null } | null>(null);
-  const serviceUrl = studio?.service_url || getApiBaseUrl();
+  const serviceUrl = studio?.service_url || getApiBaseUrl() || window.location.origin;
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(
     () => () => {
@@ -74,8 +74,9 @@ export function OverviewPage() {
   const availableModelNames = runtimeModelNames(models, instances);
   const anthropicPort = listener?.url === serviceUrl && listener.revision === connectionRevision ? listener.port : null;
   const endpoints = [
-    { id: 'openai', label: tr('OpenAI 兼容端点', 'OpenAI-compatible endpoint'), url: openAIEndpoint(serviceUrl) },
-    { id: 'anthropic', label: tr('Anthropic 兼容端点', 'Anthropic-compatible endpoint'), url: anthropicEndpoint(serviceUrl, anthropicPort) },
+    { id: 'openai', name: 'OpenAI', label: tr('OpenAI 兼容端点', 'OpenAI-compatible endpoint'), url: openAIEndpoint(serviceUrl) },
+    { id: 'anthropic', name: 'Anthropic', label: tr('Anthropic 兼容端点', 'Anthropic-compatible endpoint'), url: anthropicEndpoint(serviceUrl, anthropicPort) },
+    { id: 'jev', name: 'Jev', label: tr('Jev 决策端点', 'Jev decision endpoint'), url: jevEndpoint(serviceUrl) },
   ];
   async function copyEndpoint(id: string, endpoint: string) {
     try {
@@ -185,11 +186,11 @@ export function OverviewPage() {
             <h2>{tr('API 端点', 'API endpoints')}</h2>
           </div>
           <div className="overview-api-list">
-            {endpoints.map(({ id, label, url }) => (
+            {endpoints.map(({ id, name, label, url }) => (
               <div className="overview-api-entry" key={id} data-protocol={id}>
-                  <strong title={label}>{id === 'openai' ? 'OpenAI' : 'Anthropic'}</strong>
+                  <strong title={label}>{name}</strong>
                   {url ? <code title={url}>{url}</code> : <span>{tr('暂不可用', 'Unavailable')}</span>}
-                  <button aria-label={tr(`复制 ${id === 'openai' ? 'OpenAI' : 'Anthropic'} 端点`, `Copy ${id === 'openai' ? 'OpenAI' : 'Anthropic'} endpoint`)}
+                  <button aria-label={tr(`复制 ${name} 端点`, `Copy ${name} endpoint`)}
                     className={endpointCopied === id ? 'copied' : ''} disabled={!url}
                     onClick={() => { if (url) void copyEndpoint(id, url); }} type="button">
                     <Icon name={endpointCopied === id ? 'check' : 'copy'} size={14} />
@@ -197,6 +198,8 @@ export function OverviewPage() {
               </div>
             ))}
           </div>
+          <p>{tr('Jev 与 OpenAI 共用端口。客户端需显式向 Jev 地址发送 POST 请求，不能使用 chat/completions。',
+            'Jev shares the OpenAI port. Send POST requests to the Jev URL explicitly; chat/completions does not support Jev decisions.')}</p>
         </TMPanel>
         <ServingTotalsPanel data={servingStatistics} scope={scope} runtime={runtime} />
       </div>

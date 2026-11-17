@@ -282,6 +282,8 @@ __global__ void project_grouped_q8(const std::uint64_t* addresses,std::uint64_t 
 __device__ float staged_value(int type, const std::uint8_t* row, std::uint64_t column) {
     switch (type) {
         case GGML_TYPE_F16:return __half2float(reinterpret_cast<const half*>(row)[column]);
+        case GGML_TYPE_BF16:return __uint_as_float(std::uint32_t(reinterpret_cast<const std::uint16_t*>(row)[column])<<16);
+        case GGML_TYPE_F32:return reinterpret_cast<const float*>(row)[column];
 #define TYLOINFER_GGUF_VALUE(name) case GGML_TYPE_##name: return gguf_value<GGML_TYPE_##name>(row, column);
         TYLOINFER_GGUF_FORMATS(TYLOINFER_GGUF_VALUE)
 #undef TYLOINFER_GGUF_VALUE
@@ -765,7 +767,11 @@ bool try_dense_cooperative(const void* packed,std::uint64_t stride,std::int64_t 
             return true;
         }
         if constexpr(Format==GGML_TYPE_IQ4_XS)if(canonical_iq4_k_warps(columns)==1)return false;
-        if(columns/Dot<Format>::qk*Dot<Format>::parts<64)return false;
+        // Mixed projection packets use complete Q8 groups even for short K.
+        // Individual projections must keep the same integer dot and FP32
+        // reduction tree so schedule calibration cannot change their values.
+        constexpr bool whole_window=Format==GGML_TYPE_Q8_0 || Format==GGML_TYPE_Q3_K || Format==GGML_TYPE_IQ4_NL;
+        if(columns/Dot<Format>::qk*Dot<Format>::parts<64 && !(whole_window && tokens>1))return false;
         if(tokens==1 && !single_token_dense_cooperative<Format>(rows,columns/Dot<Format>::qk*Dot<Format>::parts))return false;
         const auto launch=[&](auto capacity) {
             constexpr int Count=decltype(capacity)::value;

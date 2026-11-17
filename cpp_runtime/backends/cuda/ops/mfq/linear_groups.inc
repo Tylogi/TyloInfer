@@ -7,6 +7,12 @@ std::vector<mfq_tensor_backend::Tensor> NintLinearGroup::forward(
     auto shape = x.sizes().vec();
     std::vector<mfq_tensor_backend::Tensor> parts;
     auto xf = x.reshape({-1, x.size(-1)});
+    std::unique_ptr<PrefillInputScope> prefill_input;
+    if(kl_mmq.mode==KlMmqMode::Default && xf.is_cuda() &&
+            xf.scalar_type()==mfq_tensor_backend::kFloat32 && xf.size(0)>=512) {
+        mfq_tensor_backend::Tensor half,exponents;
+        if(!PrefillInputScope::lookup(xf,half,exponents))prefill_input=std::make_unique<PrefillInputScope>(xf);
+    }
     if (w.q8_zero && xf.size(0) > 64 &&
             projection_w.size() == outs.size()) {
         parts.reserve(projection_w.size());

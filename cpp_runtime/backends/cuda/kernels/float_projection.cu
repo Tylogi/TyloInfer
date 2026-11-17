@@ -15,6 +15,7 @@
 #include <array>
 #include <cstdio>
 #include <cuda_bf16.h>
+#include "tyloinfer/kernels/cuda/gr_bf16_projection.cuh"
 #if TYLOINFER_ENABLE_MFQ_COMPAT
 #include "gr_prefill_tf32.cuh"
 #include "gr_prefill_half2.cuh"
@@ -29,12 +30,12 @@
 #include "gr_bf16_prefill_read.cuh"
 
 namespace {
-template<bool Vectorized,int Rows=1>
+template<bool Vectorized,int Rows=1,int QueryTiles=2>
 __global__ __launch_bounds__(256) void dense_f32_projection_kernel(
         const float* __restrict__ input,const float* __restrict__ weight,float* output,int width,int outputs) {
- // Share each activation load across two output rows. Two query tiles retain
- // enough independent CTAs without changing a query's FMA or reduction order.
- constexpr int Tile=2,QueryTiles=2;
+ // Share each activation load across two outputs and weight loads across
+ // queries. Query tiling changes occupancy, never a query's summation tree.
+ constexpr int Tile=2;
  constexpr int Columns=(Rows+QueryTiles-1)/QueryTiles;
  const int row0=(blockIdx.x/QueryTiles)*Tile,first=(blockIdx.x%QueryTiles)*Columns;
  if(first>=Rows)return;
@@ -158,68 +159,20 @@ __global__ void __launch_bounds__(128) dense_bf16_projection_kernel(
     }
 }
 
-template<class Input>
-__device__ __forceinline__ float4 gr_dense_input4(const Input* input) {
-    if constexpr(std::is_same_v<Input,float>)return *reinterpret_cast<const float4*>(input);
-    else {
-        const uint2 x=*reinterpret_cast<const uint2*>(input);
-        return make_float4(__half2float(__ushort_as_half(x.x)),__half2float(__ushort_as_half(x.x>>16)),
-            __half2float(__ushort_as_half(x.y)),__half2float(__ushort_as_half(x.y>>16)));
-    }
-}
-__device__ __forceinline__ float4 gr_dense_weight4(const uint16_t* weight) {
-    const uint2 w=*reinterpret_cast<const uint2*>(weight);
-    return make_float4(__uint_as_float(w.x<<16),__uint_as_float(w.x&0xffff0000u),
-        __uint_as_float(w.y<<16),__uint_as_float(w.y&0xffff0000u));
-}
-__device__ __forceinline__ float gr_dense_dot4(float sum,float4 w,float4 x) {
-    sum=fmaf(w.x,x.x,sum);sum=fmaf(w.y,x.y,sum);
-    sum=fmaf(w.z,x.z,sum);return fmaf(w.w,x.w,sum);
-}
+using mfq_gr_detail::gr_dense_input4;
+using mfq_gr_detail::gr_dense_weight4;
+using mfq_gr_detail::gr_dense_dot4;
+
 template<int Rows,class Input>
 __global__ void __launch_bounds__(Rows==1?128:256) gr_bf16_down_kernel(
         const Input* input,const uint16_t* weight,float* output,int width,int rank,int streams,
         const uint16_t* injection,float* injection_output) {
     const bool injecting=int(blockIdx.x)>=rank;
-    const int row=injecting?int(blockIdx.x)-rank:int(blockIdx.x),tid=threadIdx.x,lane=tid&31,warp=tid>>5;
-    const auto* matrix=injecting?injection:weight;
-    // Preserve the singleton's accumulation order. Multiple independent rows
-    // use more warps to shorten each thread's serial projection loop.
-    constexpr int threads=Rows==1?128:256,warps=threads/32;
-    float sums[Rows]{};
-    if(width%4==0 && reinterpret_cast<std::uintptr_t>(input)%(4*sizeof(Input))==0 &&
-            reinterpret_cast<std::uintptr_t>(matrix)%8==0)for(int column=tid*4;column<width;column+=threads*4) {
-        const float4 w=gr_dense_weight4(matrix+size_t(row)*width+column);
-        #pragma unroll
-        for(int m=0;m<Rows;++m)sums[m]=gr_dense_dot4(sums[m],w,
-            gr_dense_input4(input+size_t(m)*width+column));
-    }else for(int column=tid;column<width;column+=threads) {
-        const float w=__uint_as_float(uint32_t(matrix[size_t(row)*width+column])<<16);
-        #pragma unroll
-        for(int m=0;m<Rows;++m)sums[m]=fmaf(w,float(input[size_t(m)*width+column]),sums[m]);
-    }
-    __shared__ float partial[Rows][warps];
-    #pragma unroll
-    for(int m=0;m<Rows;++m) {
-        #pragma unroll
-        for(int offset=16;offset>0;offset>>=1)sums[m]+=__shfl_down_sync(0xffffffffu,sums[m],offset);
-        if(lane==0)partial[m][warp]=sums[m];
-    }
-    __syncthreads();
-    if(tid<Rows) {
-        float sum;
-        if constexpr(warps==4)sum=(partial[tid][0]+partial[tid][2])+(partial[tid][1]+partial[tid][3]);
-        else {
-            const float s0=partial[tid][0]+partial[tid][4],s1=partial[tid][1]+partial[tid][5];
-            const float s2=partial[tid][2]+partial[tid][6],s3=partial[tid][3]+partial[tid][7];
-            sum=(s0+s2)+(s1+s3);
-        }
-        const float low=__fdiv_rn(sum,float(streams));
-        const float gate=1.f/(1.f+expf(-low));
-        if(injecting)injection_output[size_t(tid)*streams+row]=__fmul_rn(2.f,gate);
-        else output[size_t(tid)*rank+row]=__fmul_rn(low,gate);
-    }
+    const int row=injecting?int(blockIdx.x)-rank:int(blockIdx.x);
+    mfq_gr_detail::gr_bf16_activated_row<Rows>(input,injecting?injection:weight,
+        injecting?injection_output:output,width,injecting?streams:rank,streams,row,injecting);
 }
+
 template<int Rows,class Normalized>
 __global__ void __launch_bounds__(256) gr_bf16_up_mix_kernel(
         const float* input,const Normalized* normalized,const uint16_t* weight,float* output,
@@ -635,9 +588,6 @@ mfq_tensor_backend::Tensor try_dense_f32_projection_cuda(const mfq_tensor_backen
         TYLOINFER_CUDA_CHECK(cudaDeviceGetAttribute(&sms,cudaDevAttrMultiProcessorCount,input.get_device()));
         cached_device=input.get_device();
     }
-    // Two output rows and two query tiles keep about one CTA per output.
-    // Larger matrices retain their cuBLAS schedule.
-    if(weight.size(0)>=int64_t(sms)*4)return {};
     const MfqCudaGuard guard(input.get_device());
     const auto stream=mfq_get_current_cuda_stream(input.get_device());
     auto shape=input.sizes().vec();shape.back()=weight.size(0);
@@ -646,11 +596,17 @@ mfq_tensor_backend::Tensor try_dense_f32_projection_cuda(const mfq_tensor_backen
     const bool vectorized=weight.size(1)%4==0 &&
         (reinterpret_cast<std::uintptr_t>(input.data_ptr())|reinterpret_cast<std::uintptr_t>(weight.data_ptr()))%16==0;
     const auto launch=[&]<int M>() {
-        const auto kernel=vectorized?dense_f32_projection_kernel<true,M>:dense_f32_projection_kernel<false,M>;
-        kernel<<<unsigned(((weight.size(0)+1)/2)*2),256,0,stream.stream()>>>(input.data_ptr<float>(),weight.data_ptr<float>(),
-            output.data_ptr<float>(),int(weight.size(1)),int(weight.size(0)));
-        if(mfq::cuda::dispatch_trace::enabled())mfq::cuda::dispatch_trace::record(stream.stream(),"dense_f32_projection",
-            reinterpret_cast<const void*>(kernel),"M="+std::to_string(M)+" N="+std::to_string(weight.size(0))+" K="+std::to_string(weight.size(1))+" output_tile=2 query_tiles=2");
+        const auto queries=[&]<int Tiles>() {
+            const auto kernel=vectorized?dense_f32_projection_kernel<true,M,Tiles>:dense_f32_projection_kernel<false,M,Tiles>;
+            kernel<<<unsigned(((weight.size(0)+1)/2)*Tiles),256,0,stream.stream()>>>(input.data_ptr<float>(),weight.data_ptr<float>(),
+                output.data_ptr<float>(),int(weight.size(1)),int(weight.size(0)));
+            if(mfq::cuda::dispatch_trace::enabled())mfq::cuda::dispatch_trace::record(stream.stream(),"dense_f32_projection",
+                reinterpret_cast<const void*>(kernel),"M="+std::to_string(M)+" N="+std::to_string(weight.size(0))+" K="+std::to_string(weight.size(1))+" output_tile=2 query_tiles="+std::to_string(Tiles));
+        };
+        // Retain two query tiles only when output tiles alone provide fewer
+        // than two CTAs per processor. Wider projections read weights once.
+        if(M==1 || (weight.size(0)+1)/2>=int64_t(sms)*2)queries.template operator()<1>();
+        else queries.template operator()<2>();
     };
     switch(rows) {
         case 1:launch.template operator()<1>();break;case 2:launch.template operator()<2>();break;
@@ -707,32 +663,34 @@ mfq_tensor_backend::Tensor try_dense_bf16_projection_cuda(const mfq_tensor_backe
     TYLOINFER_CUDA_CHECK(cudaGetLastError());return output;
 }
 
-std::vector<mfq_tensor_backend::Tensor> try_gr_bf16_down_injection_cuda(const mfq_tensor_backend::Tensor& input,
-        const mfq_tensor_backend::Tensor& weight,const mfq_tensor_backend::Tensor& injection,int64_t streams) {
+static std::vector<mfq_tensor_backend::Tensor> gr_bf16_activated_projections_cuda(const mfq_tensor_backend::Tensor& input,
+        const mfq_tensor_backend::Tensor& down,const mfq_tensor_backend::Tensor& injection,int64_t streams) {
     namespace tb=mfq_tensor_backend;
+    const auto& weight=down.defined()?down:injection;
     if(streams<1 || streams>INT_MAX || !input.is_cuda() || !input.is_contiguous() || input.dim()<1 || input.size(-1)<1 ||
             input.size(-1)>INT_MAX || input.numel()/input.size(-1)<1 || input.numel()/input.size(-1)>6 ||
             (input.scalar_type()!=tb::kFloat16 && input.scalar_type()!=tb::kFloat32) ||
-            !weight.is_cuda() || !weight.is_contiguous() || weight.device()!=input.device() ||
+            !weight.defined() || !weight.is_cuda() || !weight.is_contiguous() || weight.device()!=input.device() ||
             weight.scalar_type()!=tb::kBFloat16 || weight.dim()!=2 || weight.size(0)<1 || weight.size(0)>INT_MAX ||
             weight.size(1)!=input.size(-1))return {};
     if(injection.defined() && (!injection.is_cuda() || !injection.is_contiguous() || injection.device()!=input.device() ||
             injection.scalar_type()!=tb::kBFloat16 || injection.dim()!=2 || injection.size(0)!=streams ||
-            injection.size(1)!=input.size(-1) || weight.size(0)>INT_MAX-streams))return {};
+            injection.size(1)!=input.size(-1) || (down.defined() && down.size(0)>INT_MAX-streams)))return {};
     const MfqCudaGuard guard(input.device());
-    const int width=int(weight.size(1)),rank=int(weight.size(0)),rows=int(input.numel()/width);
+    const int width=int(weight.size(1)),rank=down.defined()?int(down.size(0)):0,rows=int(input.numel()/width);
     auto shape=input.sizes().vec();shape.back()=rank;
-    auto output=tb::empty(shape,input.options().dtype(tb::kFloat32));
+    auto output=rank?tb::empty(shape,input.options().dtype(tb::kFloat32)):tb::Tensor{};
     tb::Tensor gates;
-    if(injection.defined()) {shape.back()=streams;gates=tb::empty(shape,output.options());}
+    if(injection.defined()) {shape.back()=streams;gates=tb::empty(shape,input.options().dtype(tb::kFloat32));}
     const auto launch=[&](auto capacity,auto type) {
         using Input=decltype(type);
         constexpr int threads=decltype(capacity)::value==1?128:256;
         gr_bf16_down_kernel<decltype(capacity)::value,Input><<<rank+(gates.defined()?int(streams):0),threads,0,mfq_current_cuda_stream()>>>(
-            input.data_ptr<Input>(),static_cast<const uint16_t*>(weight.data_ptr()),output.data_ptr<float>(),width,rank,int(streams),
+            input.data_ptr<Input>(),down.defined()?static_cast<const uint16_t*>(down.data_ptr()):nullptr,
+            output.defined()?output.data_ptr<float>():nullptr,width,rank,int(streams),
             gates.defined()?static_cast<const uint16_t*>(injection.data_ptr()):nullptr,gates.defined()?gates.data_ptr<float>():nullptr);
         if(mfq::cuda::dispatch_trace::enabled())mfq::cuda::dispatch_trace::record(mfq_current_cuda_stream(),
-            gates.defined()?"gr_bf16_down_silu_injection":"gr_bf16_down_silu",
+            rank?(gates.defined()?"gr_bf16_down_silu_injection":"gr_bf16_down_silu"):"gr_bf16_injection",
             reinterpret_cast<const void*>(gr_bf16_down_kernel<decltype(capacity)::value,Input>),
             "M="+std::to_string(rows)+" N="+std::to_string(rank)+" K="+std::to_string(width));
     };
@@ -748,6 +706,18 @@ std::vector<mfq_tensor_backend::Tensor> try_gr_bf16_down_injection_cuda(const mf
         case 6:types(std::integral_constant<int,6>{});break;
     }
     TYLOINFER_CUDA_CHECK(cudaGetLastError());return {output,gates};
+}
+
+std::vector<mfq_tensor_backend::Tensor> try_gr_bf16_down_injection_cuda(const mfq_tensor_backend::Tensor& input,
+        const mfq_tensor_backend::Tensor& weight,const mfq_tensor_backend::Tensor& injection,int64_t streams) {
+    if(!weight.defined())return {};
+    return gr_bf16_activated_projections_cuda(input,weight,injection,streams);
+}
+
+mfq_tensor_backend::Tensor try_gr_bf16_injection_cuda(const mfq_tensor_backend::Tensor& input,
+        const mfq_tensor_backend::Tensor& weight,int64_t streams) {
+    auto projected=gr_bf16_activated_projections_cuda(input,{},weight,streams);
+    return projected.empty()?mfq_tensor_backend::Tensor{}:projected[1];
 }
 
 mfq_tensor_backend::Tensor try_gr_bf16_down_cuda(const mfq_tensor_backend::Tensor& input,

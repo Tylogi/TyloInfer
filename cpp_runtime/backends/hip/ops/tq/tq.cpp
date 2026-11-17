@@ -11,7 +11,7 @@ extern "C" uint64_t mfq_tq_prefill_f32_workspace(ProjectionView,int);
 #include "tq_residual.h"
 #include "tyloinfer/tq_rows.h"
 #include "tyloinfer/host_parallel.h"
-#include "nlohmann/json.hpp"
+#include "tyloinfer/tq_model_layout.h"
 #include <algorithm>
 #include <climits>
 #include <cmath>
@@ -22,11 +22,13 @@ extern "C" uint64_t mfq_tq_prefill_f32_workspace(ProjectionView,int);
 #include <unordered_map>
 #include <unordered_set>
 #include <future>
-#include <climits>
 
 namespace tb=mfq_tensor_backend;
 namespace {
-std::vector<std::int64_t> logical_shape(const mfq::ModelSource&,const std::string&);
+using mfq::tq_source::logical_shape;
+using mfq::tq_source::row_parts;
+using mfq::tq_source::join_rows;
+using mfq::tq_source::tq_image;
 int dtype(tb::ScalarType type) {
     if(type==tb::kFloat16)return 0;
     if(type==tb::kBFloat16)return 1;
@@ -621,8 +623,8 @@ tb::Tensor TqMoeBanks::forward(tb::Tensor input_value,tb::Tensor ids,tb::Tensor 
     const std::vector<int64_t> pair_shape{ids.size(0),ids.size(1),down->out};
     auto pairs=route.plan.pairs?tb::zeros(pair_shape,x.options()):tb::empty(pair_shape,x.options());
     const auto stream=mfq_current_cuda_stream();const int type=dtype(x.scalar_type());
-    const auto wide_bytes=type==0&&route.plan.tokens==4096?
-        mfq_tq_moe_wide128_workspace(gate->weight.view,up->weight.view,int(gate->out),route.plan,type,limit):0;
+    const auto wide_bytes=mfq_tq_moe_wide128_workspace(
+        gate->weight.view,up->weight.view,int(gate->out),route.plan,type,limit);
     if(wide_bytes){
         auto workspace=tb::empty({static_cast<int64_t>(wide_bytes)},x.options().dtype(tb::kUInt8));
         status(mfq_tq_moe_swiglu_wide128(gate->weight.view,up->weight.view,x.data_ptr(),hidden.data_ptr(),int(gate->out),route.plan,type,limit,workspace.data_ptr(),wide_bytes,stream));
@@ -636,108 +638,8 @@ tb::Tensor TqMoeBanks::forward(tb::Tensor input_value,tb::Tensor ids,tb::Tensor 
 }
 
 namespace {
-std::vector<std::int64_t> logical_shape(const mfq::ModelSource& source,const std::string& name) {
-    const auto* record=source.find_tensor(name);
-    if(record && record->dtype!="TQ")throw std::invalid_argument("expected TQ tensor: "+name);
-    std::vector<std::int64_t> shape;
-    bool found=false;
-    for(const auto* key:{"tq_shapes","tensor_shapes"}) {
-        const auto metadata=source.metadata().find(key);
-        if(metadata==source.metadata().end())continue;
-        const auto shapes=nlohmann::json::parse(metadata->second);
-        if(!shapes.is_object())throw std::invalid_argument("invalid TQ shape metadata");
-        if(shapes.contains(name)) {
-            shape=shapes.at(name).get<std::vector<std::int64_t>>();found=true;break;
-        }
-    }
-    if(!found && record && record->shape)shape=*record->shape;
-    if(shape.empty() && record && record->nbytes>=64) {
-        std::array<uint8_t,64> header{};source.tensor_reader(name)(0,reinterpret_cast<std::byte*>(header.data()),header.size());
-        if(!std::memcmp(header.data(),"RTQEXP01",8))shape={int64_t(mfq::TqLayout::integer(header.data()+12,4)),
-            int64_t(mfq::TqLayout::integer(header.data()+16,4)),int64_t(mfq::TqLayout::integer(header.data()+20,4))};
-        else if(!std::memcmp(header.data(),"RTRELL05",8) || !std::memcmp(header.data(),"RTRELL06",8))shape={int64_t(mfq::TqLayout::integer(header.data()+12,4)),
-            int64_t(mfq::TqLayout::integer(header.data()+16,4))};
-    }
-    if(shape.size()!=2 && shape.size()!=3)
-        throw std::invalid_argument("TQ logical tensor shape must have rank 2 or 3: "+name);
-    std::uint64_t count=1;
-    for(const auto dimension:shape) {
-        if(dimension<1 || count>UINT64_MAX/std::uint64_t(dimension))
-            throw std::invalid_argument("invalid TQ logical tensor shape: "+name);
-        count*=dimension;
-    }
-    return shape;
-}
-std::vector<std::string> row_parts(const mfq::ModelSource& source,const std::string& name) {
-    for(const auto* key:{"tq_row_shards","tq.segments"}) {
-        const auto entry=source.metadata().find(key);
-        if(entry==source.metadata().end())continue;
-        const auto tables=nlohmann::json::parse(entry->second);
-        if(!tables.is_object())throw std::invalid_argument("invalid TQ row-shard manifest");
-        if(!tables.contains(name))continue;
-        if(std::string_view(key)=="tq_row_shards" && source.find_tensor(name))
-            throw std::invalid_argument("ambiguous TQ row table: "+name);
-        const auto names=tables.at(name).get<std::vector<std::string>>();
-        if(names.empty())throw std::invalid_argument("empty TQ row table: "+name);
-        return names;
-    }
-    return {name};
-}
-std::vector<std::uint8_t> join_rows(const std::vector<std::vector<std::uint8_t>>& blobs) {
-    if(blobs.empty())throw std::invalid_argument("empty TQ row selection");
-    const mfq::TqLayout first(blobs[0].data(),blobs[0].size());
-    std::uint64_t rows=0,packed_bytes=0;
-    for(const auto& blob:blobs) {
-        const mfq::TqLayout layout(blob.data(),blob.size());
-        if(layout.width!=first.width || layout.columns!=first.columns || layout.gs!=first.gs)
-            throw std::invalid_argument("incompatible TQ row segments");
-        rows+=layout.rows;packed_bytes+=layout.packed_bytes;
-    }
-    if(rows>UINT32_MAX || packed_bytes>UINT32_MAX)throw std::overflow_error("selected TQ rows exceed RTRELL05 limits");
-    const auto scale_bytes=first.columns?first.scale_bytes:(rows*first.groups+1)/2;
-    const auto scale_offset=64+rows*8,packed_offset=scale_offset+scale_bytes;
-    std::vector<std::uint8_t> result(packed_offset+packed_bytes);
-    std::memcpy(result.data(),blobs[0].data(),64);
-    mfq::TqLayout::integer(result.data()+12,rows,4);
-    mfq::TqLayout::integer(result.data()+28,packed_bytes,4);
-    std::uint64_t row_offset=0,byte_offset=0;
-    if(first.columns)std::memcpy(result.data()+scale_offset,blobs[0].data()+first.scales,scale_bytes);
-    for(const auto& blob:blobs) {
-        const mfq::TqLayout m(blob.data(),blob.size());
-        for(std::size_t row=0;row<m.rows;++row) {
-            auto descriptor=mfq::TqLayout::integer(blob.data()+64+row*8,8);
-            descriptor=m.rebase(descriptor,std::uint64_t(m.offset(descriptor))+byte_offset/4);
-            mfq::TqLayout::integer(result.data()+64+(row_offset+row)*8,descriptor,8);
-        }
-        if(!m.columns)for(std::size_t i=0;i<std::size_t(m.rows)*m.groups;++i) {
-            const auto selector=(blob[m.scales+i/2]>>((i&1)*4))&15;
-            const auto index=row_offset*m.groups+i;
-            result[scale_offset+index/2]|=selector<<((index&1)*4);
-        }
-        std::memcpy(result.data()+packed_offset+byte_offset,blob.data()+m.packed,m.packed_bytes);
-        row_offset+=m.rows;byte_offset+=m.packed_bytes;
-    }
-    return result;
-}
 }
 
-namespace {
-std::vector<std::uint8_t> tq_image(const std::vector<std::uint8_t>& blob,const mfq::TqLayout& m) {
-    // The serialized scale stream can end at an odd byte. Align the packed
-    // word stream in one compressed image instead of uploading fields apart.
-    const auto words_offset=(m.packed+3)&~std::size_t(3);
-    const auto relative_offset=words_offset+m.packed_bytes;
-    std::vector<std::uint8_t> image(relative_offset+32);
-    std::memcpy(image.data(),blob.data(),m.packed);
-    std::memcpy(image.data()+words_offset,blob.data()+m.packed,m.packed_bytes);
-    // Exact FP16 RELATIVE table from the TQ format, independent of device.
-    constexpr std::uint16_t relative[]{0x3400,0x34d0,0x35ca,0x36f7,0x3830,0x390a,0x3a10,0x3b4b,
-        0x3c63,0x3d47,0x3e59,0x3fa4,0x4098,0x4187,0x42a6,0x4400};
-    std::memcpy(image.data()+relative_offset,relative,sizeof(relative));
-    return image;
-}
-
-}
 TqRowTable::TqRowTable(const mfq::ModelSource& source,const std::string& name) {
     const auto shape=logical_shape(source,name);
     columns_=shape.back();
@@ -790,23 +692,14 @@ std::size_t TqRowTable::row_image_bytes_bound()const {
 }
 ProjectionView TqRowTable::stage_row(std::uint64_t row,std::uint8_t* host,
         std::uint8_t* device,std::size_t capacity)const {
-    if(row>=rows())throw std::out_of_range("TQ staged row is out of bounds");
+    if(row>=rows() || !device)throw std::out_of_range("TQ staged row is out of bounds");
     const auto segment=std::upper_bound(ends_.begin(),ends_.end(),row)-ends_.begin();
     const auto start=segment?ends_[segment-1]:0;
     const auto& m=segments_[segment]->layout();
-    const auto scale_bytes=m.columns?m.scale_bytes:(m.groups+1)/2;
-    const auto packed=72+scale_bytes,words=(packed+3)&~std::size_t(3);
-    if(capacity<words+std::size_t(m.width)+32)
-        throw std::overflow_error("TQ staged row image exceeds capacity");
-    const auto wire=segments_[segment]->slice_row_into(row-start,host,capacity);
-    const auto packed_bytes=wire-packed,relative=words+packed_bytes;
-    std::memmove(host+words,host+packed,packed_bytes);
-    constexpr std::uint16_t gains[]{0x3400,0x34d0,0x35ca,0x36f7,0x3830,0x390a,0x3a10,0x3b4b,
-        0x3c63,0x3d47,0x3e59,0x3fa4,0x4098,0x4187,0x42a6,0x4400};
-    std::memcpy(host+relative,gains,sizeof(gains));
+    const auto image=segments_[segment]->stage_row_image(row-start,host,capacity);
     int gslog=0;for(auto gs=m.gs;gs>1;gs>>=1)++gslog;
-    return {reinterpret_cast<const std::uint32_t*>(device+words),
-        reinterpret_cast<const std::uint64_t*>(device+64),device+72,device+relative,nullptr,
+    return {reinterpret_cast<const std::uint32_t*>(device+image.packed_offset),
+        reinterpret_cast<const std::uint64_t*>(device+64),device+72,device+image.relative_offset,nullptr,
         1,int(m.width),int(columns_),gslog,int(m.columns)};
 }
 tb::Tensor TqRowTable::lookup(const std::int64_t* ids,std::size_t count,const tb::Device& device)const {
@@ -1080,13 +973,9 @@ std::shared_ptr<RowStage> make_tq_row_stage(const std::vector<std::shared_ptr<Tq
 }
 
 bool is_tq_row_table(const mfq::ModelSource& source,const std::string& name) {
-    if(const auto* record=source.find_tensor(name);record && record->dtype=="TQ")return true;
-    for(const char* key:{"tq_row_shards","tq.segments"}) {
-        const auto value=source.metadata().find(key);
-        if(value!=source.metadata().end()) {const auto table=nlohmann::json::parse(value->second);if(table.is_object() && table.contains(name))return true;}
-    }
-    return false;
+    return mfq::tq_source::is_row_table(source,name);
 }
+
 tb::Tensor TqWeight::embedding(tb::Tensor ids)const {
     MfqCudaGuard guard(image.device());auto index=ids.to(image.device()).to(tb::kInt64).contiguous();
     auto shape=ids.sizes().vec();shape.push_back(neuron_len);

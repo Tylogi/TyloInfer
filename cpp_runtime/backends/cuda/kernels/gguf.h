@@ -20,9 +20,6 @@ void quantize_gated_head_input_interleaved(const void* input,const void* gate,bo
     std::int64_t batch,std::int64_t tokens,std::int64_t heads,std::int64_t width,
     std::int64_t batch_stride,std::int64_t token_stride,std::int64_t head_stride,
     bool silu,void* output,cudaStream_t);
-// Materialized prefill activation, preserving the activation's dtype boundary.
-void materialize_gated_input(const void* up,const void* gate,bool half,std::int64_t count,
-    bool silu,void* output,cudaStream_t);
 // Ordinary RMSNorm with an F32 result and its Q8_1 packet in one pass.
 // Complete 32-value rows; input may be FP16 or FP32.
 void quantize_rms_input(const void* input,bool half_input,const float* weight,

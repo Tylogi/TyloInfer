@@ -109,7 +109,25 @@ int main() try {
                 "stable prefix does not include expanded image spans");
         }
     }
-    std::cout << "MFQ text processor media-prefix boundaries passed\n";
+    DecisionText decision;
+    decision.reads={{"abc",{"A","B"}},{"xyz",{"0","1"}}};
+    decision.cache_salt="isolated";decision.prefix_cache=false;decision.full_vocabulary=false;
+    const auto prepared=processor.prepare_decisions(decision,1024);
+    require(prepared.reads.size()==2 && prepared.cache_salt=="isolated" &&
+        !prepared.prefix_cache && !prepared.full_vocabulary,"decision read flags changed");
+    for(const auto& read:prepared.reads)
+        require(!read.prompt.empty() && read.labels.size()==2 && read.labels[0]!=read.labels[1],
+            "decision labels lost their reply-boundary token alignment");
+    for(const auto& labels:std::vector<std::vector<std::string>>{{"A","A"},{"several"},{"</s>"},{""},{}}) {
+        auto invalid=decision;invalid.reads[0].labels=labels;
+        bool rejected=false;
+        try {processor.prepare_decisions(invalid,1024);}catch(const std::invalid_argument&){rejected=true;}
+        require(rejected,"decision accepted a duplicate, special or multi-token label");
+    }
+    bool context_rejected=false;
+    try{processor.prepare_decisions(decision,1);}catch(const InferenceInputError&){context_rejected=true;}
+    require(context_rejected,"decision preparation accepted a prompt beyond the loaded context");
+    std::cout << "MFQ text processor media-prefix and decision boundaries passed\n";
     return 0;
 } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

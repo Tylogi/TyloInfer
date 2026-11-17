@@ -158,3 +158,25 @@ async def openai_chat_completions(service: ServiceDependency, request: Request) 
             ),
         )
     return JSONResponse(content=result)
+
+
+@router.post("/v1/systemone", include_in_schema=False)
+async def structured_decisions(service: ServiceDependency, request: Request) -> Response:
+    try:
+        body = await request.json()
+    except ValueError as error:
+        return JSONResponse(status_code=400, content=openai_error_body(str(error)))
+    if not isinstance(body, dict) or not isinstance(body.get("model"), str) or not body["model"]:
+        return JSONResponse(status_code=400, content=openai_error_body("a decision model is required", param="model"))
+    # Private readout controls are not part of the public System One contract.
+    if "full_vocabulary" in body or "prefix_cache" in body:
+        return JSONResponse(status_code=400, content=openai_error_body("unsupported decision parameter"))
+    operation = getattr(service.backend, "decide", None)
+    if not callable(operation):
+        return JSONResponse(status_code=501, content=openai_error_body("decision reads are unavailable", error_type="decisions_unavailable"))
+    try:
+        result = await operation(model=service.resolve_model_alias(body["model"]), payload=body)
+    except BackendError as error:
+        return JSONResponse(status_code=backend_error_status(error),
+            content=openai_error_body(str(error), error_type=error.code, code=error.status_code))
+    return JSONResponse(content={**result, "model": body["model"]})

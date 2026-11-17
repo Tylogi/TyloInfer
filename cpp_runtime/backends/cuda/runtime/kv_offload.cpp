@@ -18,6 +18,10 @@
 namespace mfq::cuda {
 namespace tb = mfq_tensor_backend;
 namespace {
+std::size_t kv_element_size(tb::ScalarType dtype) {
+    if(dtype==tb::kFloat16 || dtype==tb::kInt16)return 2;
+    return dtype==tb::kInt32?4:0;
+}
 constexpr auto no_offset = std::numeric_limits<std::size_t>::max();
 struct Slots {
     std::map<std::size_t,std::size_t> free;
@@ -207,7 +211,7 @@ KvOffloadStore::KvOffloadStore(KvOffloadConfig config) : impl_(std::make_shared<
 KvOffloadStore::~KvOffloadStore() = default;
 std::shared_ptr<KvOffloadStore::GatherWorkspace> KvOffloadStore::gather_workspace(int64_t rows,int64_t width,tb::ScalarType dtype,int64_t heads,int64_t key_width) {
     std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
-    if(rows<=0 || width<=0 || heads<=0 || width%heads || key_width<0 || (key_width && key_width>=width/heads))
+    if(rows<=0 || width<=0 || !kv_element_size(dtype) || heads<=0 || width%heads || key_width<0 || (key_width && key_width>=width/heads))
         throw std::invalid_argument("invalid CUDA KV gather geometry");
     auto& workspace=impl_->gather_workspaces[{rows,width,int(dtype),heads,key_width}];
     if(!workspace) {
@@ -234,8 +238,8 @@ std::size_t KvOffloadStore::graph_workspace_bytes() const {
 const KvOffloadConfig& KvOffloadStore::config() const { return impl_->config; }
 
 KvOffloadStore::BlockPtr KvOffloadStore::write(const tb::Tensor& rows) {
-    if (!rows.is_cuda() || rows.dim() != 2 || !rows.numel() || (rows.scalar_type() != tb::kFloat16 && rows.scalar_type() != tb::kInt32))
-        throw std::invalid_argument("CUDA KV microblock must contain nonempty FP16 or packed GPU rows");
+    if (!rows.is_cuda() || rows.dim() != 2 || !rows.numel() || !kv_element_size(rows.scalar_type()))
+        throw std::invalid_argument("CUDA KV microblock must contain nonempty FP16, INT16 or packed INT32 rows");
     const auto bytes = static_cast<std::size_t>(rows.numel()) * rows.element_size();
     if (bytes > impl_->config.buffer_bytes / 2)
         throw std::invalid_argument("CUDA KV microblock exceeds its write staging buffer");
@@ -326,8 +330,9 @@ std::vector<std::pair<std::string, double>> KvOffloadStore::metrics() const {
 
 KvOffloadSequence::KvOffloadSequence(std::shared_ptr<KvOffloadStore> store, int64_t width, int64_t block_rows, tb::ScalarType dtype)
     : store_(std::move(store)), width_(width), block_rows_(block_rows), dtype_(dtype) {
-    if (!store_ || width <= 0 || block_rows <= 0 || (dtype != tb::kFloat16 && dtype != tb::kInt32) ||
-        std::size_t(width) * block_rows * (dtype == tb::kInt32 ? 4 : 2) > store_->config().buffer_bytes / 2)
+    const auto bytes=kv_element_size(dtype);
+    if (!store_ || width <= 0 || block_rows <= 0 || !bytes ||
+        std::uint64_t(width) > std::uint64_t(store_->config().buffer_bytes/2)/bytes/std::uint64_t(block_rows))
         throw std::invalid_argument("invalid CUDA KV sequence geometry");
 }
 void KvOffloadSequence::reset() { blocks_.clear(); position_ = 0; }

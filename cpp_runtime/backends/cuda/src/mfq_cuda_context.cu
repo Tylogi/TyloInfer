@@ -1,6 +1,8 @@
 #include "mfq_cuda_context.h"
 #include "mfq_cuda_process_memory.h"
 #include "mfq_cuda_resident_allocations.h"
+#include "../runtime/routed_prefill_loan.h"
+#include "../runtime/cuda_event_status.h"
 #include "tyloinfer/runtime.h"
 #include <cuda.h>
 
@@ -27,6 +29,9 @@
 #endif
 
 namespace mfq::cuda {
+namespace {thread_local unsigned nonblocking_allocations=0;}
+NonblockingAllocationScope::NonblockingAllocationScope(){++nonblocking_allocations;}
+NonblockingAllocationScope::~NonblockingAllocationScope(){--nonblocking_allocations;}
 std::optional<PhysicalDeviceMemoryStats> physical_device_memory_stats(int device) {
 #ifdef _WIN32
     // Adapted from Strata's nvml_device_free (src/core/expert_cache.cpp, MIT;
@@ -278,16 +283,7 @@ void Event::record(cudaStream_t stream) {
 
 bool Event::ready() const {
     DeviceGuard guard(device_);
-    const auto status = cudaEventQuery(event_);
-    if (status == cudaSuccess) {
-        return true;
-    }
-    if (status == cudaErrorNotReady) {
-        (void)cudaGetLastError();
-        return false;
-    }
-    TYLOINFER_NATIVE_CUDA_CHECK(status);
-    return false;
+    return cuda_event_ready(event_);
 }
 
 void Event::synchronize() const {
@@ -893,11 +889,11 @@ void Context::check_memory_limit(std::size_t additional) const {
     // Completed asynchronous frees can leave reusable pool pages charged to
     // WDDM. Release those pages before pricing a new allocation against the
     // process limit; the logical allocation budget remains checked separately.
-    if(async_allocations_ && pool_ && (usage>allocation_budget_->limit || additional>allocation_budget_->limit-usage)) {
+    if(!nonblocking_allocations && async_allocations_ && pool_ && (usage>allocation_budget_->limit || additional>allocation_budget_->limit-usage)) {
         trim_pool_pages();
         usage=local_memory_usage();
     }
-    if(usage>allocation_budget_->limit || additional>allocation_budget_->limit-usage) {
+    if(!nonblocking_allocations && (usage>allocation_budget_->limit || additional>allocation_budget_->limit-usage)) {
         // A layer transition may still have frees pending on transfer/compute
         // streams. Retire them before rejecting a request against physical use.
         TYLOINFER_NATIVE_CUDA_CHECK(cudaDeviceSynchronize());
@@ -914,7 +910,7 @@ void Context::check_memory_limit(std::size_t additional) const {
 }
 
 void Context::begin_workspace_loan(const std::vector<std::pair<void*,std::size_t>>& regions,
-                                  cudaStream_t stream) {
+                                  cudaStream_t stream,std::shared_ptr<void> backing) {
     std::lock_guard lock(graph_pool_mutex_);
     if(workspace_loan_)throw Error("CUDA workspace loan is already active");
     auto loan=std::make_unique<WorkspaceLoan>();
@@ -934,20 +930,38 @@ void Context::begin_workspace_loan(const std::vector<std::pair<void*,std::size_t
         // happened to place them adjacently. Never coalesce across their bounds.
         if(it->first+it->second==next->first)it->second-=256;
     }
-    workspace_loan_=std::move(loan);
+    loan->backing=std::move(backing);workspace_loan_=std::move(loan);
 }
 void Context::suspend_workspace_loan() {
     std::lock_guard lock(graph_pool_mutex_);
     if(workspace_loan_)workspace_loan_->enabled=false;
 }
 void Context::end_workspace_loan() {
-    std::lock_guard lock(graph_pool_mutex_);
-    if(workspace_loan_ && !workspace_loan_->live.empty()) {
-        std::size_t bytes=0;for(const auto& [p,n]:workspace_loan_->live)bytes+=n;
-        throw Error("CUDA workspace loan still has live tensors: count="+
-            std::to_string(workspace_loan_->live.size())+" bytes="+std::to_string(bytes));
+    std::unique_ptr<WorkspaceLoan> released;
+    {
+        std::lock_guard lock(graph_pool_mutex_);
+        if(workspace_loan_ && !workspace_loan_->live.empty()) {
+            std::size_t bytes=0;for(const auto& [p,n]:workspace_loan_->live)bytes+=n;
+            throw Error("CUDA workspace loan still has live tensors: count="+
+                std::to_string(workspace_loan_->live.size())+" bytes="+std::to_string(bytes));
+        }
+        released=std::move(workspace_loan_);
     }
-    workspace_loan_.reset();
+    // A backing tensor can itself release storage through this Context.
+    // Destroy it only after dropping graph_pool_mutex_.
+}
+void Context::retire_workspace_loan() noexcept {
+    std::unique_ptr<WorkspaceLoan> released;
+    try {
+        std::lock_guard lock(graph_pool_mutex_);
+        if(!workspace_loan_)return;
+        workspace_loan_->enabled=false;workspace_loan_->retiring=true;
+        if(workspace_loan_->live.empty())released=std::move(workspace_loan_);
+    }catch(...) {return;}
+    if(released)on_device_noexcept(device_,[&] {(void)cudaStreamSynchronize(released->stream);});
+}
+bool Context::workspace_loan_active() const {
+    std::lock_guard lock(graph_pool_mutex_);return bool(workspace_loan_);
 }
 std::size_t Context::workspace_available() const {
     std::lock_guard lock(graph_pool_mutex_);
@@ -955,6 +969,33 @@ std::size_t Context::workspace_available() const {
     if(workspace_loan_ && workspace_loan_->enabled && workspace_loan_->thread==std::this_thread::get_id())
         for(const auto& [p,n]:workspace_loan_->free)bytes+=n;
     return bytes;
+}
+std::size_t Context::workspace_largest_available(cudaStream_t stream) const {
+    if(!stream)stream=current_stream(device_).stream();
+    std::lock_guard lock(graph_pool_mutex_);
+    std::size_t bytes=0;
+    if(workspace_loan_ && workspace_loan_->enabled && workspace_loan_->thread==std::this_thread::get_id() && workspace_loan_->stream==stream)
+        for(const auto& [p,n]:workspace_loan_->free)bytes=std::max(bytes,n);
+    return bytes;
+}
+std::size_t Context::workspace_live_bytes() const {
+    std::lock_guard lock(graph_pool_mutex_);
+    std::size_t bytes=0;
+    if(workspace_loan_)for(const auto& [p,n]:workspace_loan_->live)bytes+=n;
+    return bytes;
+}
+
+bool Context::workspace_allocations_fit(const std::vector<std::size_t>& allocations,
+        std::size_t ordinary,cudaStream_t stream) const {
+    if(!stream)stream=current_stream(device_).stream();
+    std::vector<std::size_t> intervals;
+    {
+        std::lock_guard lock(graph_pool_mutex_);
+        if(workspace_loan_ && workspace_loan_->enabled && workspace_loan_->stream==stream &&
+                workspace_loan_->thread==std::this_thread::get_id())
+            for(const auto& [pointer,bytes]:workspace_loan_->free)intervals.push_back(bytes);
+    }
+    return routed_workspace_allocations_fit(allocations,std::move(intervals),ordinary);
 }
 
 std::vector<std::pair<void*,std::size_t>> Context::workspace_touched_regions() const {
@@ -1057,6 +1098,13 @@ void* Context::allocate(std::size_t bytes, cudaStream_t stream) {
             try {
                 std::uint64_t threshold=std::numeric_limits<std::uint64_t>::max();
                 TYLOINFER_NATIVE_CUDA_CHECK(cudaMemPoolSetAttribute(memory,cudaMemPoolAttrReleaseThreshold,&threshold));
+                if(routed_weight_allocations) {
+                    // An implicit reuse dependency can wait for a free queued
+                    // after a graph that itself waits for expert admission.
+                    // Reuse completed pages without inventing that cycle.
+                    int dependencies=0;
+                    TYLOINFER_NATIVE_CUDA_CHECK(cudaMemPoolSetAttribute(memory,cudaMemPoolReuseAllowInternalDependencies,&dependencies));
+                }
                 allocation_budget_->graph_memory_pools.emplace(memory,false);
             } catch(...) {(void)cudaMemPoolDestroy(memory);memory=nullptr;throw;}
         }
@@ -1086,7 +1134,7 @@ void* Context::allocate(std::size_t bytes, cudaStream_t stream) {
     try {
         auto result=async ? cudaMallocFromPoolAsync(&pointer,bytes,allocation_pool,allocation_stream)
             : cudaMalloc(&pointer,bytes);
-        if(result==cudaErrorMemoryAllocation) {
+        if(result==cudaErrorMemoryAllocation && !nonblocking_allocations) {
             (void)cudaGetLastError();
             reclaim_idle_memory();
             result=async ? cudaMallocFromPoolAsync(&pointer,bytes,allocation_pool,allocation_stream)
@@ -1126,35 +1174,44 @@ void Context::release(
     }
     const auto allocation_stream =
         stream != nullptr ? stream : stream_.get();
+    std::unique_ptr<WorkspaceLoan> retired_loan;
     try {
         std::lock_guard lock(graph_pool_mutex_);
         if(workspace_loan_) {
             auto& loan=*workspace_loan_;
             if(auto it=loan.live.find(pointer);it!=loan.live.end()) {
-                const auto base=reinterpret_cast<std::uintptr_t>(pointer),size=it->second;
-                auto entry=loan.free.emplace(base,size).first;
-                loan.live.erase(it);
-                if(entry!=loan.free.begin()) {
-                    auto before=std::prev(entry);
-                    if(before->first+before->second==entry->first) {
-                        before->second+=entry->second;loan.free.erase(entry);entry=before;
+                if(loan.retiring) {
+                    loan.live.erase(it);
+                    if(!loan.live.empty())return;
+                    retired_loan=std::move(workspace_loan_);
+                } else {
+                    const auto base=reinterpret_cast<std::uintptr_t>(pointer),size=it->second;
+                    auto entry=loan.free.emplace(base,size).first;
+                    loan.live.erase(it);
+                    if(entry!=loan.free.begin()) {
+                        auto before=std::prev(entry);
+                        if(before->first+before->second==entry->first) {
+                            before->second+=entry->second;loan.free.erase(entry);entry=before;
+                        }
                     }
+                    auto after=std::next(entry);
+                    if(after!=loan.free.end() && entry->first+entry->second==after->first) {
+                        entry->second+=after->second;loan.free.erase(after);
+                    }
+                    return;
                 }
-                auto after=std::next(entry);
-                if(after!=loan.free.end() && entry->first+entry->second==after->first) {
-                    entry->second+=after->second;loan.free.erase(after);
-                }
-                return;
             }
         }
-        if(auto capacity=graph_allocation_sizes_.find(pointer);capacity!=graph_allocation_sizes_.end())
-            bytes=capacity->second;
-        if (auto pool = graph_pools_.find(allocation_stream);
-            pool != graph_pools_.end() && pool->second.owned.count(pointer)) {
-            pool->second.available[bytes].push_back(pointer);
-            return;
+        if(!retired_loan) {
+            if(auto capacity=graph_allocation_sizes_.find(pointer);capacity!=graph_allocation_sizes_.end())
+                bytes=capacity->second;
+            if (auto pool = graph_pools_.find(allocation_stream);
+                pool != graph_pools_.end() && pool->second.owned.count(pointer)) {
+                pool->second.available[bytes].push_back(pointer);
+                return;
+            }
+            graph_allocation_sizes_.erase(pointer);
         }
-        graph_allocation_sizes_.erase(pointer);
     } catch (...) {
         // Tensor destruction is noexcept. A warm-up bookkeeping allocation
         // failure must release the CUDA allocation instead of terminating or
@@ -1167,6 +1224,13 @@ void Context::release(
         if (auto pool = graph_pools_.find(allocation_stream); pool != graph_pools_.end())
             pool->second.owned.erase(pointer);
         graph_allocation_sizes_.erase(pointer);
+    }
+    if(retired_loan) {
+        // Tensor destruction enqueues cross-stream reader fences before
+        // release(). Complete them before returning an arena interval that
+        // another cache upload stream could immediately reuse.
+        on_device_noexcept(device_,[&] {(void)cudaStreamSynchronize(allocation_stream);});
+        return;
     }
     on_device_noexcept(device_, [&] {
         if (async_allocations_) {
@@ -1183,13 +1247,18 @@ void Context::release(
 bool Context::has_graph_pool(cudaStream_t stream) const {
     std::lock_guard lock(graph_pool_mutex_);return graph_pools_.count(stream)!=0;
 }
-void Context::begin_graph_pool(cudaStream_t stream) {
+void Context::begin_graph_pool(cudaStream_t stream,bool share_existing) {
     if (stream == nullptr) {
         throw std::invalid_argument("CUDA graph memory pool requires a stream");
     }
     std::lock_guard lock(graph_pool_mutex_);
-    const auto [_, inserted] = graph_pools_.try_emplace(stream);
+    const auto [found, inserted] = graph_pools_.try_emplace(stream);
     if (!inserted) {
+        if(share_existing) {
+            if(found->second.owners==std::numeric_limits<std::size_t>::max())
+                throw Error("CUDA graph memory pool owner count overflow");
+            ++found->second.owners;return;
+        }
         throw Error("CUDA graph memory pool is already active on this stream");
     }
     if(async_allocations_) {
@@ -1277,6 +1346,7 @@ void Context::end_graph_pool(cudaStream_t stream) noexcept {
         if (found == graph_pools_.end()) {
             return;
         }
+        if(found->second.owners>1){--found->second.owners;return;}
         for(const auto& [bytes,pointers]:found->second.available)
             for(void* pointer:pointers)graph_allocation_sizes_.erase(pointer);
         pool = std::move(found->second);

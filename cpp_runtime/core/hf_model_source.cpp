@@ -1,4 +1,5 @@
 #include "tyloinfer/hf_model_source.h"
+#include "hf_packed_quant.h"
 
 #include "tyloinfer/fp8_sq_blob.h"
 #include "mlx/mlx_affine_source.h"
@@ -250,11 +251,14 @@ MfqLegacyTensorAliases source_compatibility(
 
     if (!source.has_asset(kModelConfigAsset)) return {};
     const auto config = source.read_asset(kModelConfigAsset);
+    const auto parsed_config=json::parse(reinterpret_cast<const char*>(config.data()),
+        reinterpret_cast<const char*>(config.data()+config.size()));
+    const auto packed_quantization=parsed_config.value("quantization_config",json{});
     std::vector<std::string> names;
     names.reserve(source.tensors().size());
     std::unordered_map<std::string, std::string> normalized_to_source;
     for (const auto& tensor : source.tensors()) {
-        auto normalized = mlx_hf_tensor_name(tensor.name);
+        auto normalized = hf_packed_tensor_name(mlx_hf_tensor_name(tensor.name),packed_quantization);
         if (!normalized_to_source.emplace(normalized, tensor.name).second)
             throw std::invalid_argument("duplicate normalized HF tensor: " + normalized);
         names.push_back(std::move(normalized));
@@ -292,6 +296,7 @@ struct HfModelSource::Impl {
     struct Record {
         TensorMetadata metadata;
         std::vector<Segment> segments;
+        ModelSource::TensorReader transformed;
     };
 
     explicit Impl(std::filesystem::path root, std::string source_prefix)
@@ -302,10 +307,28 @@ struct HfModelSource::Impl {
     std::vector<TensorMetadata> tensors;
     std::unordered_map<std::string, std::size_t> tensor_indices;
     std::unordered_map<std::string, Record> records;
+
+    void read(const Record& record,std::uint64_t offset,std::byte* destination,std::size_t size) const {
+        if(offset>record.metadata.nbytes || size>record.metadata.nbytes-offset || (size && !destination))
+            throw std::out_of_range("HF tensor byte range is out of bounds");
+        if(record.transformed) {record.transformed(offset,destination,size);return;}
+        const auto request_end=offset+size;
+        for(const auto& segment:record.segments) {
+            const auto segment_end=checked_add(segment.offset,
+                segment.inline_bytes.empty()?segment.nbytes:segment.inline_bytes.size(),"HF virtual tensor segment");
+            const auto begin=std::max(offset,segment.offset),end=std::min(request_end,segment_end);
+            if(begin>=end)continue;
+            const auto count=static_cast<std::size_t>(end-begin);
+            if(!segment.inline_bytes.empty())
+                std::copy_n(segment.inline_bytes.data()+(begin-segment.offset),count,destination+(begin-offset));
+            else source.read_range_into(segment.source_name,segment.source_offset+begin-segment.offset,
+                destination+(begin-offset),count);
+        }
+    }
 };
 
 HfModelSource::HfModelSource(std::filesystem::path root, std::string source_prefix)
-    : impl_(std::make_unique<Impl>(std::move(root), source_prefix)) {
+    : impl_(std::make_shared<Impl>(std::move(root), source_prefix)) {
     const bool has_explicit_source_map =
         impl_->source.has_asset(kHfSourceMapAsset);
     impl_->legacy_tensor_compatibility =
@@ -377,12 +400,13 @@ HfModelSource::HfModelSource(std::filesystem::path root, std::string source_pref
     };
 
     std::unordered_set<std::string> consumed_scales;
-    json mlx_quantization;
+    json mlx_quantization,packed_quantization;
     if (impl_->source.has_asset(kModelConfigAsset)) {
         const auto config = impl_->source.read_asset(kModelConfigAsset);
         const auto parsed = json::parse(reinterpret_cast<const char*>(config.data()),
             reinterpret_cast<const char*>(config.data() + config.size()));
         mlx_quantization = parsed.value("quantization", json{});
+        packed_quantization=parsed.value("quantization_config",json{});
     }
     std::vector<std::pair<std::string, std::string>> aliases(
         canonical_to_source.begin(), canonical_to_source.end());
@@ -399,7 +423,13 @@ HfModelSource::HfModelSource(std::filesystem::path root, std::string source_pref
         record.metadata.stored_dtype = values->dtype;
         record.metadata.shape = values->shape;
         const auto item_size = dense_item_size(values->dtype);
-        if (values->dtype == "U32") {
+        auto packed=hf_channel_fp8_binding(impl_->source,packed_quantization,*values);
+        if(!packed)packed=hf_packed_quant_binding(impl_->source,packed_quantization,*values);
+        if(packed) {
+            record.metadata=std::move(packed->tensor);record.metadata.name=canonical;
+            record.transformed=std::move(packed->read);
+            for(const auto& auxiliary:packed->auxiliaries)consumed_scales.insert(auxiliary);
+        } else if (values->dtype == "U32") {
             const auto binding = mlx_affine_binding(impl_->source, mlx_quantization, *values);
             const auto& layout = binding.layout;
             record.metadata.dtype = "MLX-AFFINE";
@@ -702,6 +732,7 @@ std::optional<TensorFileRange> HfModelSource::tensor_file_range_at(std::string_v
     const auto& record = found->second;
     if (offset > record.metadata.nbytes || size > record.metadata.nbytes - offset)
         throw std::out_of_range("HF tensor file range is out of bounds");
+    if(record.transformed)return std::nullopt;
     for (const auto& segment : record.segments) {
         if (!segment.inline_bytes.empty() || offset < segment.offset || offset - segment.offset > segment.nbytes ||
             size > segment.nbytes - (offset - segment.offset)) continue;
@@ -721,36 +752,15 @@ void HfModelSource::read_range_into(
     if (found == impl_->records.end()) {
         throw std::runtime_error("model tensor not found: " + std::string(name));
     }
-    const auto& record = found->second;
-    if (relative_offset > record.metadata.nbytes ||
-        size > record.metadata.nbytes - relative_offset) {
-        throw std::out_of_range("model tensor byte range is out of bounds: " +
-                                std::string(name));
-    }
-    const auto request_end = relative_offset + size;
-    for (const auto& segment : record.segments) {
-        const auto segment_end = checked_add(
-            segment.offset,
-            segment.inline_bytes.empty() ? segment.nbytes
-                                         : segment.inline_bytes.size(),
-            "HF virtual tensor segment");
-        const auto begin = std::max(relative_offset, segment.offset);
-        const auto end = std::min<std::uint64_t>(request_end, segment_end);
-        if (begin >= end) continue;
-        const auto target_offset = static_cast<std::size_t>(begin - relative_offset);
-        const auto count = static_cast<std::size_t>(end - begin);
-        if (!segment.inline_bytes.empty()) {
-            std::copy_n(
-                segment.inline_bytes.data() + (begin - segment.offset), count,
-                destination + target_offset);
-        } else {
-            impl_->source.read_range_into(
-                segment.source_name,
-                segment.source_offset + begin - segment.offset,
-                destination + target_offset,
-                count);
-        }
-    }
+    impl_->read(found->second,relative_offset,destination,size);
+}
+
+ModelSource::TensorReader HfModelSource::tensor_reader(std::string_view name) const {
+    const auto found=impl_->records.find(std::string(name));
+    if(found==impl_->records.end())throw std::out_of_range("HF tensor not found: "+std::string(name));
+    return [owner=impl_,record=found->second](std::uint64_t offset,std::byte* destination,std::size_t size) {
+        owner->read(record,offset,destination,size);
+    };
 }
 
 const std::vector<std::string>& HfModelSource::assets() const noexcept {

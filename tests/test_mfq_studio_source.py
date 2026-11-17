@@ -111,7 +111,8 @@ def test_studio_uses_native_confirmation_dialogs_for_destructive_actions():
 
 
 def test_model_hub_resolves_links_and_downloads_selected_variants():
-    assert "modelsApi.resolveHubModel(reference, provider)" in MODEL_BROWSER
+    community = (STUDIO / "src" / "features" / "models" / "CommunityModelBrowser.tsx").read_text(encoding="utf-8")
+    assert "modelsApi.resolveHubModel(reference, provider, controller.signal)" in community
     assert (
         'destination: `${repositoryDownloadPath(source)}${sharedEngram ? "" : `/${variantPath}`}`'
         in MODEL_BROWSER
@@ -119,8 +120,8 @@ def test_model_hub_resolves_links_and_downloads_selected_variants():
     assert "return `models/${source.provider}/${source.repo_id.split('/').map(safeSegment).join('/')}`" in MODEL_BROWSER
     assert "downloadPatterns(variant)" in MODEL_BROWSER
     assert "jobsApi.createJob" in MODEL_BROWSER
-    assert 'tr("官方模型", "Official")' in MODEL_BROWSER
-    assert 'tr("第三方模型", "Community")' in MODEL_BROWSER
+    assert "selectedOfficial" in MODEL_BROWSER
+    assert "<CommunityModelBrowser" in MODEL_BROWSER
     assert 'tr("内存压力", "Memory pressure")' not in MODEL_BROWSER
     assert "not model capability or quality" not in MODEL_BROWSER
     assert "三星推荐" not in MODEL_BROWSER

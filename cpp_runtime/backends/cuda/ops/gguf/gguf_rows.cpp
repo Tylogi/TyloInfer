@@ -1,6 +1,10 @@
 #include "gguf_weight.h"
 #include "gguf_rotation.h"
 #include "tyloinfer/row_residual.h"
+#include "tyloinfer/encoded_row_cache.h"
+#include "tyloinfer/mapped_prefetch_scope.h"
+#include "runtime/row_stage_fence.h"
+#include "runtime/row_packet_prefetch.h"
 #include "../../kernels/gguf.h"
 #include "mfq_weight_memory.h"
 #include "mfq_cuda_resident_allocations.h"
@@ -19,33 +23,74 @@
 namespace tb = mfq_tensor_backend;
 
 struct GgufRowTable::RowCache {
-    struct Entry {std::vector<std::byte> bytes;std::list<std::uint64_t>::iterator recent;};
     std::mutex mutex;
-    std::unordered_map<std::uint64_t,Entry> rows;
-    std::list<std::uint64_t> recent;
-    std::size_t capacity=0,bytes=0;
+    using Cache=mfq::EncodedRowCache<std::vector<std::byte>>;
+    std::shared_ptr<Cache> rows=std::make_shared<Cache>(8u<<20,[](const auto& bytes){return bytes.size();},
+        [](std::size_t bytes,bool retained) {
+            if(retained)mfq::cuda::charge_tensor_host_bytes(bytes);
+            else mfq::cuda::tensor_host_bytes.fetch_sub(bytes);
+        });
+    std::size_t capacity=0;
     bool parallel=false;
-    ~RowCache(){mfq::cuda::tensor_host_bytes.fetch_sub(bytes);}
+    RowCache(){mfq::register_host_cache(rows);}
 };
 
 GgufRowTable::GgufRowTable(const mfq::ModelSource& source, const std::string& name) {
     const auto* record = source.find_tensor(name);
-    if (!record || !record->shape || record->shape->size() != 2)
-        throw std::invalid_argument("GGUF row table requires a matrix: " + name);
-    type_ = mfq::gguf::quant_type(record->dtype);
-    rows_ = record->shape->at(0); columns_ = record->shape->at(1);
+    if (!record)throw std::invalid_argument("missing row table: " + name);
+    auto shape=record->shape;
+    std::uint64_t payload_offset=0;
+    const bool floating=record->dtype=="F16" || record->dtype=="BF16" || record->dtype=="F32";
+    if(!shape && floating) {
+        // MFQ dense records embed rank and dimensions before their row data.
+        // Read only this header; PLE tables must never be materialized here.
+        std::array<std::byte,20> header{};
+        if(record->nbytes<header.size())throw std::invalid_argument("truncated floating row table: "+name);
+        source.read_range_into(name,0,header.data(),header.size());
+        const auto integer=[&](std::size_t start,std::size_t bytes) {
+            std::uint64_t value=0;
+            for(std::size_t i=0;i<bytes;++i)value|=std::uint64_t(std::to_integer<unsigned char>(header[start+i]))<<(8*i);
+            return value;
+        };
+        if(integer(0,4)!=2 || integer(4,8)>INT64_MAX || integer(12,8)>INT64_MAX)
+            throw std::invalid_argument("floating row table requires a matrix: "+name);
+        shape=std::vector<int64_t>{int64_t(integer(4,8)),int64_t(integer(12,8))};payload_offset=header.size();
+    }
+    if(!shape || shape->size()!=2)throw std::invalid_argument("row table requires a matrix: "+name);
+    type_ = record->dtype=="F16"?GGML_TYPE_F16:record->dtype=="BF16"?GGML_TYPE_BF16:
+        record->dtype=="F32"?GGML_TYPE_F32:mfq::gguf::quant_type(record->dtype);
+    rows_ = shape->at(0); columns_ = shape->at(1);
     if(load_gguf_input_rotation(source,name,columns_,0,columns_,0,false))
         throw std::invalid_argument("GGUF streaming row tables do not yet support an inverse Hadamard transform");
     row_bytes_ = mfq::gguf::row_bytes(type_, columns_);
     if (rows_ <= 0 || std::uint64_t(rows_) > UINT64_MAX / row_bytes_ ||
-            record->nbytes != std::uint64_t(rows_) * row_bytes_)
+            record->nbytes-payload_offset != std::uint64_t(rows_) * row_bytes_)
         throw std::invalid_argument("invalid GGUF row table payload: " + name);
-    read_ = std::make_shared<mfq::ModelSource::TensorReader>(source.tensor_reader(name));
-    batch_ = source.tensor_batch_reader(name);
+    // A source-provided batch reader owns its I/O scheduling and staging.
+    // Use mapped sparse reads when that capability is absent.
+    auto batch=source.tensor_batch_reader(name);
+    auto reader=batch?mfq::ModelSource::TensorReader{}:source.mapped_tensor_reader(name);
+    const bool mapped=bool(reader);
+    if(!reader)reader=source.tensor_reader(name);
+    read_ = std::make_shared<mfq::ModelSource::TensorReader>(
+        [reader=std::move(reader),payload_offset](std::uint64_t offset,std::byte* destination,std::size_t bytes) {
+            reader(payload_offset+offset,destination,bytes);
+        });
+    if(mapped)batch=source.mapped_tensor_batch_reader(name);
+    if(batch)batch_=[batch=std::move(batch),payload_offset](const auto& requests) {
+        auto adjusted=requests;for(auto& request:adjusted)request.offset+=payload_offset;batch(adjusted);
+    };
     correction_=source.row_residual(name);
     if(correction_ && !correction_->payload_bytes())correction_.reset();
     cache_ = std::make_unique<RowCache>();
-    cache_->parallel=source.supports_parallel_tensor_reads();
+    cache_->parallel=source.supports_parallel_tensor_reads() || (mapped && !correction_);
+    if(const auto* trace=std::getenv("TYLOINFER_TRACE_KERNEL_DISPATCH");trace && trace[0]=='1') {
+        static std::atomic<unsigned> reported{0};
+        const auto bit=mapped?1u:batch_?2u:4u;
+        if(!(reported.fetch_or(bit)&bit))std::fprintf(stderr,
+            "native_gguf_sparse_rows actual_match=1 mapped=%d batch=%d parallel=%d\n",
+            int(mapped),int(bool(batch_)),int(cache_->parallel));
+    }
     // Include per-entry metadata in this small optional cache's bound.
     cache_->capacity=row_bytes_>SIZE_MAX-128?0:(8ULL<<20)/(row_bytes_+128);
     mfq::cuda::observe_streamed_ple(read_, record->nbytes);
@@ -90,14 +135,14 @@ void GgufRowTable::read_rows(const std::vector<mfq::ReadSpan>& requests) const {
     for(const auto& row:requests) {
         if(row.size!=row_bytes_ || row.offset%row_bytes_ || row.offset/row_bytes_>=std::uint64_t(rows_) || !row.destination)
             throw std::out_of_range("invalid GGUF table row range");
-        if(auto found=cache_->rows.find(row.offset);found!=cache_->rows.end()) {
-            std::memcpy(row.destination,found->second.bytes.data(),row_bytes_);
-            cache_->recent.splice(cache_->recent.begin(),cache_->recent,found->second.recent);
+        if(const auto found=cache_->rows->find(row.offset)) {
+            std::memcpy(row.destination,found->data(),row_bytes_);
         }else if(auto [first,inserted]=unique.emplace(row.offset,row.destination);inserted) missing.push_back(row);
         else repeated.emplace_back(row.destination,first->second);
     }
     std::sort(missing.begin(),missing.end(),[](const auto& a,const auto& b){return a.offset<b.offset;});
     const auto count=std::max<std::size_t>(1,std::min<std::size_t>(256,(8ULL<<20)/std::max<std::uint64_t>(4096,row_bytes_)));
+    const mfq::MappedPrefetchScope copied(missing.size()>128,true);
     for(std::size_t begin=0;begin<missing.size();begin+=count) {
         const auto end=std::min(missing.size(),begin+count);
         if(batch_)batch_({missing.begin()+begin,missing.begin()+end});
@@ -108,18 +153,8 @@ void GgufRowTable::read_rows(const std::vector<mfq::ReadSpan>& requests) const {
     // Physical reads are sorted, but retention follows the caller's token
     // order so a long prompt leaves its most recent rows hot for decode.
     for(const auto& row:requests) {
-        if(auto found=cache_->rows.find(row.offset);found!=cache_->rows.end()) {
-            cache_->recent.splice(cache_->recent.begin(),cache_->recent,found->second.recent);continue;
-        }
-        if(cache_->rows.size()>=cache_->capacity) {
-            const auto old=cache_->recent.back();cache_->recent.pop_back();
-            cache_->rows.erase(old);cache_->bytes-=row_bytes_;mfq::cuda::tensor_host_bytes.fetch_sub(row_bytes_);
-        }
-        std::vector<std::byte> value(row.destination,row.destination+row_bytes_);
-        cache_->recent.push_front(row.offset);
-        try {cache_->rows.emplace(row.offset,RowCache::Entry{std::move(value),cache_->recent.begin()});}
-        catch(...) {cache_->recent.pop_front();throw;}
-        cache_->bytes+=row_bytes_;mfq::cuda::charge_tensor_host_bytes(row_bytes_);
+        if(cache_->rows->find(row.offset))continue;
+        cache_->rows->insert(row.offset,std::vector<std::byte>(row.destination,row.destination+row_bytes_));
     }
 }
 
@@ -137,9 +172,8 @@ class GgufRowStage final : public RowStage {
     tb::Tensor packet_, output_;
     void* packet_address_ = nullptr;
     bool mapped_ = false;
-    std::unique_ptr<mfq::cuda::Event> done_;
-    cudaStream_t last_stream_ = nullptr;
-    bool pending_ = false;
+    mfq::cuda::RowStageFence fence_;
+    mfq::cuda::RowPacketPrefetch prefetch_;
     void retain_stream() {
         const auto stream = mfq_get_current_cuda_stream(device_.index);
         if (std::none_of(streams_.begin(), streams_.end(), [&](const auto& prior) { return prior.stream() == stream.stream(); }))
@@ -168,7 +202,7 @@ public:
         bytes_ = offset_ + std::size_t(count_) * stride_;
         MfqCudaGuard guard(device_);
         retain_stream();
-        done_ = std::make_unique<mfq::cuda::Event>();
+        fence_.initialize();
         int can_map = 0;
         TYLOINFER_NATIVE_CUDA_CHECK(cudaDeviceGetAttribute(&can_map, cudaDevAttrCanMapHostMemory, device_.index));
         // As in the TQ row stage, a small packet is cheaper to read directly
@@ -207,10 +241,16 @@ public:
     }
     tb::Tensor output() const override { return output_; }
     bool mapped_rows() const override { return mapped_; }
+    bool prefetch(const std::vector<std::int64_t>& ids,const std::vector<std::int64_t>& shape)override {
+        if(std::any_of(tables_.begin(),tables_.end(),[](const auto& table){return !table->parallel_reads();}))return false;
+        prefetch_.start(ids,shape,bytes_,[this,ids,shape](void* packet) {
+            prepare_rows_to(ids,shape,packet);return bytes_;
+        });return true;
+    }
     void upload(const std::vector<std::int64_t>& ids, const std::vector<std::int64_t>& shape) override {
         MfqCudaGuard guard(device_);
         retain_stream();
-        if (pending_) done_->synchronize();
+        fence_.before_write();
         prepare_rows(ids,shape);
         upload_prepared();
     }
@@ -219,55 +259,61 @@ public:
         // The graph owner already fences the preceding read. A mapped packet
         // needs only CPU writes and the caller's publication flag, with no
         // event recorded on an otherwise idle CUDA stream during replay.
-        prepare_rows(ids,shape);pending_=false;
+        fence_.owner_fenced();prepare_rows(ids,shape);
     }
     // Runs on a CPU I/O worker. All storage/events were prepared by the
     // model thread; this method never enters CUDA or changes GPU ownership.
     void prepare_rows(const std::vector<std::int64_t>& ids,const std::vector<std::int64_t>& shape) {
+        if(!prefetch_.consume(ids,shape,host_->data()))prepare_rows_to(ids,shape,host_->data());
+    }
+    void prepare_rows_to(const std::vector<std::int64_t>& ids,const std::vector<std::int64_t>& shape,void* packet) {
         if (shape != shape_ || ids.size() != static_cast<std::size_t>(count_))
             throw std::invalid_argument("GGUF row stage upload shape differs");
-        auto* descriptors = static_cast<mfq::cuda::gguf::StagedRow*>(host_->data());
-        auto* bytes = static_cast<std::uint8_t*>(host_->data());
+        auto* descriptors = static_cast<mfq::cuda::gguf::StagedRow*>(packet);
+        auto* bytes = static_cast<std::uint8_t*>(packet);
         std::vector<std::vector<mfq::ReadSpan>> requests(tables_.size());
         for (std::int64_t i = 0; i < count_; ++i) {
             const auto id = ids[i];
             if (id < 0 || std::uint64_t(id / rows_per_shard_) >= tables_.size())
                 throw std::out_of_range("GGUF row stage shard id");
             const auto& table = tables_[id / rows_per_shard_];
+            descriptors[i].offset=offset_+i*stride_;
+            descriptors[i].reserved=0;
             descriptors[i].type = table->staged_type();
             requests[id/rows_per_shard_].push_back({std::uint64_t(id%rows_per_shard_)*table->row_bytes(),
                 reinterpret_cast<std::byte*>(bytes+descriptors[i].offset),std::size_t(table->staged_row_bytes())});
         }
-        for(std::size_t shard=0;shard<tables_.size();++shard)tables_[shard]->read_staged_rows(requests[shard]);
+        std::vector<std::size_t> active;
+        bool parallel=true;
+        for(std::size_t shard=0;shard<tables_.size();++shard)if(!requests[shard].empty()) {
+            active.push_back(shard);parallel=parallel && tables_[shard]->parallel_reads();
+        }
+        const auto read=[&](std::int64_t begin,std::int64_t end) {
+            for(auto index=begin;index<end;++index) {
+                const auto shard=active[index];tables_[shard]->read_staged_rows(requests[shard]);
+            }
+        };
+        if(parallel)mfq_parallel_for(0,static_cast<std::int64_t>(active.size()),1,read);
+        else read(0,static_cast<std::int64_t>(active.size()));
     }
     void upload_prepared() {
         MfqCudaGuard guard(device_);
         retain_stream();
         if (!mapped_) TYLOINFER_NATIVE_CUDA_CHECK(cudaMemcpyAsync(packet_address_, host_->data(), bytes_,
             cudaMemcpyHostToDevice, mfq_current_cuda_stream()));
-        TYLOINFER_NATIVE_CUDA_CHECK(cudaEventRecord(done_->get(), mfq_current_cuda_stream()));
-        last_stream_ = mfq_current_cuda_stream(); pending_ = true;
-        if (packet_.defined()) packet_.record_stream(reinterpret_cast<std::uintptr_t>(last_stream_));
+        fence_.record_transfer(mfq_current_cuda_stream());
+        if (packet_.defined()) packet_.record_stream(reinterpret_cast<std::uintptr_t>(mfq_current_cuda_stream()));
     }
     void decode() override {
         MfqCudaGuard guard(device_);
         retain_stream();
         const auto stream = mfq_current_cuda_stream();
-        cudaStreamCaptureStatus capture;
-        TYLOINFER_NATIVE_CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
-        if (!mapped_ && pending_ && stream != last_stream_)
-            TYLOINFER_NATIVE_CUDA_CHECK(cudaStreamWaitEvent(stream, done_->get(),
-                capture == cudaStreamCaptureStatusNone ? 0 : cudaEventWaitExternal));
+        const auto capture=fence_.join(stream);
         if (packet_.defined()) packet_.record_stream(reinterpret_cast<std::uintptr_t>(stream));
         output_.record_stream(reinterpret_cast<std::uintptr_t>(stream));
         mfq::cuda::gguf::staged_rows(packet_address_, count_, width_, output_.data_ptr(), true,
             mfq_current_cuda_stream());
-        // A captured internal event cannot be synchronized by the next host
-        // upload. Graph owners fence replay; keep this event for eager/DMA use.
-        if (capture == cudaStreamCaptureStatusNone) {
-            TYLOINFER_NATIVE_CUDA_CHECK(cudaEventRecord(done_->get(), stream));
-            last_stream_ = stream; pending_ = true;
-        }
+        fence_.record_consumer(stream,capture);
     }
 };
 }
@@ -282,23 +328,7 @@ std::function<tb::Tensor()> prefetch_gguf_shards(
     const std::vector<std::int64_t>& ids,const std::vector<std::int64_t>& shape,const tb::Device& device) {
     // Providers with a shared seek cursor must retain synchronous reads.
     if(std::any_of(tables.begin(),tables.end(),[](const auto& table){return !table || !table->parallel_reads();}))return {};
-    struct Pending {
-        std::shared_ptr<GgufRowStage> stage;
-        // Destroy/join the CPU job before releasing stage CUDA allocations.
-        std::future<void> ready;
-    };
-    auto pending=std::make_shared<Pending>();
-    {
-        mfq::cuda::ResidentAllocationScope resident;
-        pending->stage=std::make_shared<GgufRowStage>(tables,rows,shape,device);
-    }
-    pending->ready=std::async(std::launch::async,
-        [stage=pending->stage.get(),ids,shape]{stage->prepare_rows(ids,shape);});
-    return [pending] {
-        if(pending->ready.valid())pending->ready.get();
-        pending->stage->upload_prepared();pending->stage->decode();
-        return pending->stage->output();
-    };
+    return mfq::cuda::prefetch_table_rows([&]{return make_gguf_row_stage(tables,rows,shape,device);},ids,shape);
 }
 
 tb::Tensor lookup_gguf_shards(const std::vector<std::shared_ptr<GgufRowTable>>& tables,

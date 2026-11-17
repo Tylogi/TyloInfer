@@ -2,6 +2,7 @@
 #include "attention_mma_verify.h"
 #include "gguf_prefill_fusion.h"
 #include "runtime/execution_options.h"
+#include "runtime/decision_attention.h"
 #include "models/common/attention.h"
 #include "models/common/gated_mlp.h"
 #include "models/common/transformer_layer.h"
@@ -474,6 +475,32 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                         attention_scale > 0.0 ? attention_scale : 1.0 / std::sqrt((double)hd);
                     mfq_tensor_backend::Tensor a;
                     a = profiler.measure("full.attention", [&]() {
+                        if (const auto decision_boundary=mfq::cuda::decision_attention_boundary(execution)) {
+                            TYLOINFER_RUNTIME_CHECK(!sliding,
+                                "bidirectional decisions do not support sliding attention");
+                            const auto boundary = *decision_boundary;
+                            auto decision_q=q.to(mfq_tensor_backend::kFloat16).contiguous();
+                            auto decision_k=(cache_pos?kv.first:k).to(mfq_tensor_backend::kFloat16).contiguous();
+                            auto decision_v=(cache_pos?kv.second:v).to(mfq_tensor_backend::kFloat16).contiguous();
+                            if (boundary >= 0) {
+                                TYLOINFER_RUNTIME_CHECK(boundary > 0 &&
+                                    ((cache_pos == 0 && boundary <= T) || cache_pos == boundary),
+                                    "decision prefix must contain the complete state window");
+                                if(cache_pos == boundary || boundary == T)
+                                    return mfq_scaled_dot_product_attention(decision_q,decision_k,decision_v,
+                                        mfq_nullopt,0.0,false,attn_scale,true);
+                                auto state=mfq_scaled_dot_product_attention(decision_q.narrow(2,0,boundary),
+                                    decision_k.narrow(2,0,boundary),decision_v.narrow(2,0,boundary),
+                                    mfq_nullopt,0.0,false,attn_scale,true);
+                                auto question=mfq_scaled_dot_product_attention(decision_q.narrow(2,boundary,T-boundary),
+                                    decision_k,decision_v,mfq_nullopt,0.0,false,attn_scale,true);
+                                return mfq_tensor_backend::cat({state,question},2);
+                            }
+                            TYLOINFER_RUNTIME_CHECK(cache_pos == 0,
+                                "fully bidirectional decisions require the complete prompt");
+                            return mfq_scaled_dot_product_attention(decision_q,decision_k,decision_v,
+                                mfq_nullopt,0.0,false,attn_scale,true);
+                        }
                         if(cache.quantization.enabled()) {
                             attention_token_major=true;
                             const auto capacity=planned_kv_length>0?planned_kv_length:cache_pos+T;
@@ -921,7 +948,7 @@ mfq_tensor_backend::Tensor FullBlock::forward_ffn(CudaExecutionContext &executio
                     if (!official_bf16) {
                         auto ffn_input = xn.reshape({B * T, H});
                         auto residual_flat = residual.reshape({B * T, H});
-                        if(auto fused=ffn.try_forward_gguf_prefill_residual(execution,ffn_input,residual_flat))
+                        if(auto fused=ffn.try_forward_prefill_residual(execution,ffn_input,residual_flat))
                             return fused->reshape({B,T,H});
                         if(auto fused=ffn.try_forward_prepared_gguf_residual(
                             execution,normalized_ffn_input,residual_flat))return fused->reshape({B,T,H});

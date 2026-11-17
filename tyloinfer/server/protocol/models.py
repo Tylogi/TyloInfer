@@ -615,6 +615,7 @@ class ModelLoadRequest(ProtocolModel):
     pin: bool = False
     context_size: int | None = Field(default=None, ge=512, le=2147483647)
     yarn_enabled: bool | None = Field(default=None, strict=True)
+    jev_weights: Literal["stream", "vram"] = "stream"
     prefill_chunk_size: Literal["auto"] | Annotated[int, Field(ge=1, le=8192)] = "auto"
     moe_gpu_cache_gb: float | None = Field(
         default=None,
@@ -826,6 +827,8 @@ class RuntimeMemoryResources(ProtocolModel):
     prefix_cache_ram_blocks: int | None = Field(default=None, ge=0)
     ram_experts: bool | None = None
     ram_expert_bytes: int | None = Field(default=None, ge=0)
+    ram_embedding_bytes: int | None = Field(default=None, ge=0)
+    ram_weight_bytes: int | None = Field(default=None, ge=0)
     ram_kv: bool | None = None
     ram_kv_bytes: int | None = Field(default=None, ge=0)
     ram_kv_limit_bytes: int | None = Field(default=None, ge=0)
@@ -922,6 +925,12 @@ class RuntimeLogList(ProtocolModel):
     data: list[RuntimeLogEntry]
 
 
+class JevWeightMemoryEstimate(ProtocolModel):
+    stream_vram_bytes: int = Field(ge=0)
+    stream_ram_bytes: int = Field(ge=0)
+    resident_vram_bytes: int = Field(ge=0)
+
+
 class ModelArtifactResource(ProtocolModel):
     id: str = Field(pattern=r"^[0-9a-f]{32}$")
     name: str = Field(min_length=1, max_length=255)
@@ -930,6 +939,8 @@ class ModelArtifactResource(ProtocolModel):
     asset_kind: Literal['model', 'ple', 'engram'] = 'model'
     owned_file_bytes: int | None = Field(default=None, ge=0)
     gguf_companion_required: bool = False
+    structured_decisions: bool = False
+    jev_weight_memory: JevWeightMemoryEstimate | None = None
     shard_count: int = Field(ge=1)
     missing_shards: int = Field(default=0, ge=0)
     total_bytes: int = Field(ge=0)

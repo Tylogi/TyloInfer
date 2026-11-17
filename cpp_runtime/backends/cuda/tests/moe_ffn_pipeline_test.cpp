@@ -2,6 +2,7 @@
 #include "runtime/decode_window.h"
 #include "runtime/execution_options.h"
 #include "runtime/moe_pipeline.h"
+#include "runtime/routed_prefill_pipeline.h"
 #include "runtime/router_lookahead_audit.h"
 #include "mfq_cuda_moe_ops.h"
 #include "moe_cache_transfer.h"
@@ -495,12 +496,12 @@ void verify_speculative_route_prefix(const std::filesystem::path& root) {
     auto forward=make_moe_ffn_pipeline({weights[0],weights[1]},{weights[2]});
     finalize_moe_expert_cache(cache);MoeResidencyManager manager(cache.get());
     const auto* heat_option=std::getenv("TYLOINFER_MOE_MTP_WINDOW_HEAT");
-    const int heat_mode=heat_option?std::clamp(std::atoi(heat_option),0,2):2;
+    const int heat_mode=heat_option?std::clamp(std::atoi(heat_option),0,2):0;
     const bool window_heat=heat_mode!=0;
     for(int i=0;i<3;++i) {
         manager.begin_speculative_routes(4);
         manager.after_layer(0,{1,2,2,2},4);
-        if(manager.stats().observed_routes!=std::uint64_t(i))
+        if(manager.stats().observed_routes!=std::uint64_t(i*(heat_option?1:4)))
             throw std::runtime_error("unverified routes entered expert heat");
         manager.commit_speculative_routes(1);
     }
@@ -526,26 +527,26 @@ void verify_speculative_route_prefix(const std::filesystem::path& root) {
     manager.discard_speculative_routes();
     manager.after_layer(0,{0},1);
     const auto stats=manager.stats();
-    if(stats.observed_routes!=7 || stats.speculative_route_windows!=5 ||
+    if(stats.observed_routes!=std::uint64_t(heat_option?7:21) || stats.speculative_route_windows!=5 ||
             stats.speculative_routes_committed!=6 || stats.speculative_routes_discarded!=21 ||
-            stats.speculative_route_cancels!=4 || stats.speculative_heat_routes!=(window_heat?5:6))
+            stats.speculative_route_cancels!=4 || stats.speculative_heat_routes!=std::uint64_t(heat_option?(window_heat?5:6):20))
         throw std::runtime_error("accepted route prefix accounting changed");
-    // Rejected expert 2 appeared more often than accepted expert 1. Actual
-    // residency must follow the committed prefix rather than those drafts.
+    // Default cache learning includes executed rejected drafts. Explicit old
+    // modes retain prefix-only learning for reproducible comparisons.
     manager.apply_pending();
     manager.after_layer(0,{},32);manager.apply_pending();
     for(const auto& source:sources)
-        if(!source->gpu_resident(1) || source->gpu_resident(2))
-            throw std::runtime_error("rejected draft routes drove expert promotion");
+        if(!source->gpu_resident(heat_option?1:2) || source->gpu_resident(heat_option?2:1))
+            throw std::runtime_error("speculative heat did not follow the selected executed/prefix policy");
     manager.begin_speculative_routes(4);manager.after_layer(0,{0,1,2,1},4);
     manager.commit_speculative_routes(4);manager.apply_pending();
     const auto full=manager.stats();
-    if(full.observed_routes!=11 || full.speculative_route_windows!=6 ||
+    if(full.observed_routes!=std::uint64_t(heat_option?11:25) || full.speculative_route_windows!=6 ||
             full.speculative_routes_committed!=10 || full.speculative_routes_discarded!=21 ||
-            full.speculative_heat_routes!=(window_heat?8:10))
+            full.speculative_heat_routes!=std::uint64_t(heat_option?(window_heat?8:10):24))
         throw std::runtime_error("fully accepted route window lost observations");
-    // A single verification's repeated use does not pay for four transfers.
-    // Check actual residency, including the legacy policy used for the A/B.
+    // Shared default heat counts executed rows. Explicit unique-only mode
+    // needs several committed windows before the same promotion threshold.
     for(int p=0;p<3;++p)sources[p]=source(root/(p==2?"nint5-2560-640.mfq":"nint5-640-2560.mfq"));
     auto repeated_cache=make_moe_expert_cache(bundle,config);
     std::array<std::shared_ptr<MfeWeight>,3> repeated_weights;
@@ -558,7 +559,7 @@ void verify_speculative_route_prefix(const std::filesystem::path& root) {
     repeated.after_layer(0,{},32);repeated.apply_pending();
     for(const auto& source:sources)if(source->gpu_resident(1)==(heat_mode==1))
         throw std::runtime_error("one repeated draft window used token frequency for transfer heat");
-    for(int step=0;step<2;++step) {
+    for(int step=0;step<(heat_mode==1?4:2);++step) {
         repeated.begin_speculative_routes(4);repeated.after_layer(0,{2,2,2,2},4);
         repeated.commit_speculative_routes(4);repeated.apply_pending();
     }
@@ -580,7 +581,55 @@ void verify_speculative_route_prefix(const std::filesystem::path& root) {
     for(const auto& source:sources)
         if(source->gpu_resident(1)!=(heat_mode==0) || source->gpu_resident(2)!=(heat_mode==2))
             throw std::runtime_error("mixed route multiplicity changed transfer ranking or hysteresis scale");
+    auto frozen_baseline=mixed.stats();
+    const auto assert_frozen=[&] {
+        const auto actual=mixed.stats();
+        if(actual.observed_routes!=frozen_baseline.observed_routes ||
+                actual.scheduled_rounds!=frozen_baseline.scheduled_rounds ||
+                actual.speculative_heat_routes!=frozen_baseline.speculative_heat_routes ||
+                actual.committed_projections!=frozen_baseline.committed_projections)
+            throw std::runtime_error("disabled reuse learning changed residency heat or submitted admission");
+    };
+    // A pre-freeze histogram still owns its producer fence. Consume that
+    // lifetime without importing its observations or starting an exchange.
+    const std::vector<std::uint64_t> frozen_counts={0,0,32};
+    mixed.record_prefill_counts(0,frozen_counts,32);
+    set_moe_reuse_learning(mixed_cache,false);
+    mixed.prepare_decode();assert_frozen();
+    for(int tokens:{1,4,32})mixed.after_layer(0,std::vector<int32_t>(tokens,2),tokens);
+    mixed.record_prefill_counts(0,frozen_counts,32);
+    mixed.record_prefill_counts(0,static_cast<const int32_t*>(nullptr),32,
+        mfq_get_current_cuda_stream().stream());
+    mixed.prepare_decode();mixed.apply_pending();assert_frozen();
+    // Both switch boundaries must retain journal validation and close the
+    // transaction, without learning routes published or committed frozen.
+    mixed.begin_speculative_routes(4);mixed.after_layer(0,{2,2,2,2},4);
+    set_moe_reuse_learning(mixed_cache,true);
+    mixed.commit_speculative_routes(1);mixed.apply_pending();assert_frozen();
+    mixed.begin_speculative_routes(4);mixed.after_layer(0,{2,2,2,2},4);
+    set_moe_reuse_learning(mixed_cache,false);
+    // An admission submitted before freezing is still joined and published.
+    mixed.apply_pending();frozen_baseline=mixed.stats();
+    mixed.commit_speculative_routes(1);mixed.apply_pending();assert_frozen();
+    mixed.begin_speculative_routes(4);rejected=false;
+    try{mixed.after_layer(0,{1,INT32_MAX,2,2},4);}catch(const std::out_of_range&){rejected=true;}
+    if(!rejected)throw std::runtime_error("frozen speculative journal accepted an invalid expert");
+    mixed.discard_speculative_routes();assert_frozen();
+    set_moe_reuse_learning(mixed_cache,true);
+    auto device_counts=tb::empty({3},tb::TensorOptions().device(tb::kCUDA).dtype(tb::kInt32));
+    const int32_t host_counts[]={0,0,32};
+    const auto stream=mfq_get_current_cuda_stream().stream();
+    TYLOINFER_CUDA_CHECK(cudaMemcpyAsync(device_counts.data_ptr(),host_counts,sizeof(host_counts),cudaMemcpyHostToDevice,stream));
+    mixed.record_prefill_counts(0,device_counts.data_ptr<int32_t>(),32,stream);
+    set_moe_reuse_learning(mixed_cache,false);
+    mixed.prepare_decode();assert_frozen();
+    set_moe_reuse_learning(mixed_cache,true);
+    mixed.prepare_decode();assert_frozen();
+    mixed.after_layer(0,{1},1);mixed.apply_pending();
+    if(mixed.stats().observed_routes!=frozen_baseline.observed_routes+1)
+        throw std::runtime_error("restored reuse learning lost an ordinary route");
     std::cout<<"speculative_route_prefix pending/partial/full-prefix, cancel/reset, repeated graph setup, ordinary routes and actual promoted expert PASS\n";
+    std::cout<<"residency_learning_freeze ordinary/prefill/device-fence/speculative-switch/journal-validation/resume PASS\n";
 }
 void verify_short_decode_residency_interval(const std::filesystem::path& root) {
     struct Interval {
@@ -2434,7 +2483,40 @@ void verify_activation_workspace_reuse() {
         const auto entries=mixed?runtime.activation_workspaces.size():weight.activation_workspaces->size();
         if(entries!=1)throw std::runtime_error("eager activation scratch retained one buffer per prompt length");
     }
-    std::cout<<"activation_workspace_reuse eager_rows=10 runtimes=2 PASS\n";
+    auto context=mfq::cuda::default_context(mfq_current_cuda_device());
+    const auto stream=mfq_current_cuda_stream();
+    for(bool mixed:{false,true})for(bool stable:{false,true}) {
+        MfeWeight weight;MixedMoeRuntime runtime;
+        const int rows=stable?3:33;
+        const auto options=tb::TensorOptions().device(tb::kCUDA);
+        auto backing=tb::empty({1<<20},options.dtype(tb::kUInt8));
+        auto input=tb::empty({rows,256},options.dtype(tb::kFloat16));
+        context->begin_workspace_loan({{backing.data_ptr(),backing.nbytes()}},stream,
+            std::make_shared<tb::Tensor>(backing));
+        bool returned=false;
+        try {
+            const auto scratch=[&] {return mixed?runtime.activation_workspace(input,rows,8,32,{},stable):
+                weight.activation_workspace(input,rows,8,32,stable);};
+            auto workspace=scratch();
+            if(context->workspace_live_bytes()!=0)
+                throw std::runtime_error("persistent MFQ activation bucket borrowed expert workspace");
+            TYLOINFER_CUDA_CHECK(cudaMemsetAsync(workspace.qx.data_ptr(),0x35,workspace.qx.nbytes(),stream));
+            workspace.xscale.fill_(7);
+            TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(stream));
+            context->end_workspace_loan();returned=true;
+            if(context->workspace_loan_active())throw std::runtime_error("MFQ activation bucket prevented loan return");
+            backing.fill_(0);
+            auto cached=scratch();
+            if(cached.qx.data_ptr()!=workspace.qx.data_ptr() || cached.xscale.data_ptr()!=workspace.xscale.data_ptr())
+                throw std::runtime_error("MFQ activation cache lost its bucket after loan return");
+            const auto quantized=cached.qx.cpu(),scales=cached.xscale.cpu();
+            for(int64_t i=0;i<quantized.numel();++i)if(quantized.data_ptr<int8_t>()[i]!=0x35)
+                throw std::runtime_error("returned expert workspace overwrote cached MFQ activation bytes");
+            for(int64_t i=0;i<scales.numel();++i)if(scales.data_ptr<float>()[i]!=7)
+                throw std::runtime_error("returned expert workspace overwrote cached MFQ activation scales");
+        }catch(...) {if(!returned)context->retire_workspace_loan();throw;}
+    }
+    std::cout<<"activation_workspace_reuse eager_rows=10 runtimes=2 loan_cases=4 PASS\n";
 }
 void verify_activation_workspace_binding() {
     for(int rows:{1,3,8,1024,2048,4096})for(bool stable:{false,true}) {
@@ -2512,8 +2594,70 @@ void verify_activation_workspace_stable_allocation() {
     std::cout<<"activation_workspace_stable_allocation graph_replay=2 bounded_buckets=1 PASS\n";
 }
 
+void verify_activation_workspace_dispatch() {
+    // This planning check deliberately uses CPU tensors and no model weights.
+    const auto options=tb::TensorOptions().device(tb::kCPU).dtype(tb::kInt32);
+    MoeRoutePlan route;route.ids=tb::empty({33,2},options);
+    route.ids_dst=tb::empty({66},options);route.map_ready=true;
+    CudaExecutionConfig config;config.moe_prefill_mma=true;config.moe_prefill_mma_min_tokens=9;
+    KlMmqState kl;
+    int cases=0;
+    for(auto family:{MixedMoeFamily::Nint,MixedMoeFamily::Nint8Zero,MixedMoeFamily::Nvq,
+            MixedMoeFamily::Nepq,MixedMoeFamily::Mxfp4,MixedMoeFamily::Mxfp4Sq,MixedMoeFamily::Fp8Sq}) {
+        MixedMoePool pool;pool.family=family;
+        pool.nint.ng=pool.q8_zero.ng=pool.nvq.ng=pool.nepq.ng=3;
+        pool.nint.gs=pool.nvq.gs=24;
+        MixedMoeRuntime runtime;runtime.pools.push_back(std::move(pool));
+        const bool ordinary_q8=family==MixedMoeFamily::Nint || family==MixedMoeFamily::Nint8Zero ||
+            family==MixedMoeFamily::Nvq || family==MixedMoeFamily::Nepq;
+        const bool f16_q8=ordinary_q8 && family!=MixedMoeFamily::Nvq;
+        const auto check=[&](bool force,bool expected) {
+            const auto geometry=runtime.activation_geometry(config,kl,force,route);
+            if(geometry.size()!=std::size_t(expected))
+                throw std::runtime_error("mixed FP16/MMQ dispatch requested incorrect Q8 workspace");
+            ++cases;
+        };
+        check(false,f16_q8);check(true,ordinary_q8);
+        config.moe_prefill_mma=false;check(false,ordinary_q8);config.moe_prefill_mma=true;
+        route.map_ready=false;check(false,ordinary_q8);route.map_ready=true;
+        route.ids=tb::empty({1,2},options);route.ids_dst=tb::empty({2},options);
+        check(false,ordinary_q8);
+        runtime.prefill_only=true;check(false,f16_q8);
+        for(auto mode:{KlMmqMode::Nint8One,KlMmqMode::Fp16}) {kl.mode=mode;check(false,false);}
+        kl.mode=KlMmqMode::Default;
+        route.ids=tb::empty({33,2},options);route.ids_dst=tb::empty({66},options);
+        if(!runtime.activation_workspaces.empty())
+            throw std::runtime_error("workspace planning allocated activation storage");
+    }
+    // A never-used resident stage has no DMA/consumer dependency to join.
+    mfq::cuda::RoutedPrefillStageFence(nullptr,nullptr,nullptr).begin_upload(nullptr,false);
+    std::cout<<"mixed_activation_workspace_dispatch cases="<<cases<<" cpu_only=1 PASS\n";
+}
+
+void verify_prefill_capacity_plan() {
+    constexpr std::size_t mib=std::size_t(1)<<20;
+    if(mfq::cuda::routed_prefill_group_capacity(100,8*mib,32*mib)!=8 ||
+            mfq::cuda::routed_prefill_group_capacity(100,8*mib,0)!=8 ||
+            mfq::cuda::routed_prefill_group_capacity(3,8*mib,0)!=3 ||
+            mfq::cuda::routed_prefill_group_capacity(100,128*mib,512*mib)!=1)
+        throw std::runtime_error("routed image limits differ for direct and decoded products");
+    // Two stages, fixed cohort dummy fields, then linear per-expert payload.
+    const auto bytes=[&](std::size_t experts){return 2*(mib+experts*3*mib);};
+    if(mfq::cuda::routed_prefill_workspace_capacity(64,41*mib,bytes)!=6 ||
+            mfq::cuda::routed_prefill_workspace_capacity(3,41*mib,bytes)!=3 ||
+            mfq::cuda::routed_prefill_workspace_capacity(64,7*mib,bytes)!=0)
+        throw std::runtime_error("routed prefill capacity ignored actual stage layout or explicit bound");
+    std::cout<<"routed_prefill_capacity direct_decode=1 cohort_baseline=1 bounded_workspace=1 cpu_only=1 PASS\n";
+}
+
 int main(int argc,char** argv)try {
     std::cout.setf(std::ios::unitbuf);
+    if(argc==2 && std::string(argv[1])=="--prefill-capacity-plan-check") {
+        verify_prefill_capacity_plan();return 0;
+    }
+    if(argc==2 && std::string(argv[1])=="--activation-workspace-dispatch-check") {
+        verify_activation_workspace_dispatch();return 0;
+    }
     if(argc==2 && std::string(argv[1])=="--activation-workspace-reuse-check") {
         verify_activation_workspace_reuse();return 0;
     }

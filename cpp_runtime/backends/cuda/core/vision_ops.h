@@ -5,7 +5,7 @@
 #include "mfq_cuda_norm_ops.h"
 #include "models/common/grid_vision_model.h"
 #include "runtime/execution_options.h"
-#include "storage/moe_expert_cache.h"
+#include "runtime/routed_cache_resources.h"
 #include "storage/weight_loader.h"
 
 #include <algorithm>
@@ -90,7 +90,7 @@ Tensor vision_workspace(
     CudaExecutionContext& execution,
     std::size_t bytes,
     Forward forward) {
-    MoePrefillWorkspaceLoan loan(execution.moe_expert_cache);
+    RoutedPrefillWorkspaceLoan loan(execution);
     const bool borrowed = loan.begin(bytes) != 0;
     auto result = forward();
     if (borrowed) {

@@ -12,6 +12,9 @@ public:
     virtual bool mapped_rows()const=0;
     virtual void upload(const std::vector<std::int64_t>& ids,const std::vector<std::int64_t>& shape)=0;
     virtual void decode()=0;
+    // Prepare immutable source rows on a CPU worker. GPU-visible packets are
+    // published only by upload(), after their preceding consumers are fenced.
+    virtual bool prefetch(const std::vector<std::int64_t>&,const std::vector<std::int64_t>&) {return false;}
     // The owning decode window has completed earlier consumers before this
     // upload; this window's consumer remains behind its publication flag.
     // Providers needing DMA retain their normal upload synchronization.

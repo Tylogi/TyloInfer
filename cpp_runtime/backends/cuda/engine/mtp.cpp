@@ -63,7 +63,7 @@ template <class Model> struct CudaMtpOps {
   int64_t prefill_compute_chunk;
   InferenceOutput* output;
   // Destroy after local/result tensors, including cancellation of priming.
-  std::unique_ptr<MoePrefillWorkspaceLoan> predictor_loan;
+  std::unique_ptr<mfq::cuda::RoutedPrefillWorkspaceLoan> predictor_loan;
   std::shared_ptr<mfq::cuda::qwen35::MtpTargetGraphs> dense_target_graphs;
   int64_t target_planned_kv_length=0;
   const mfq_tensor_backend::TensorOptions options =
@@ -95,8 +95,7 @@ template <class Model> struct CudaMtpOps {
     }();
     return enabled;
   }
-  std::shared_ptr<MoeExpertCache> target_route_cache;
-  std::shared_ptr<GgufExpertCache> target_gguf_route_cache;
+  mfq::cuda::RoutedSpeculativeRoutes target_routes;
   static bool profile_target() {
     static const bool enabled=[] {
       const auto* option=std::getenv("TYLOINFER_PROFILE_MTP");
@@ -106,16 +105,9 @@ template <class Model> struct CudaMtpOps {
   }
   std::array<double,6> target_costs() const {
     std::array<double,6> result{};
-    // Profiling a window must not scan every cached RAM/GPU weight merely
-    // to read one counter. The other GGUF timing fields are not reported.
-    if(model.execution->gguf_expert_cache)
-      result[1]=gguf_expert_fetch_ms(model.execution->gguf_expert_cache);
-    else for(const auto& [name,value]:mfq::cuda::routed_expert_memory_metrics(*model.execution)) {
-      if(name=="expert_route_wait_ms")result[0]=value;
-      else if(name=="expert_host_fetch_ms")result[1]=value;
-      else if(name=="expert_host_copy_ms")result[2]=value;
-      else if(name=="ssd_expert_read_wait_ms")result[3]=value;
-    }
+    // Read counters without enumerating encoded weights or cache ownership.
+    const auto routed=mfq::cuda::routed_expert_phase_timings(*model.execution);
+    std::copy(routed.begin(),routed.end(),result.begin());
     if(model.source) {
       const auto io=model.source->file_read_stats();
       result[4]=double(io.read_nanoseconds)/1e6;
@@ -134,24 +126,14 @@ template <class Model> struct CudaMtpOps {
     if(profile_resolve() && resolve_rounds)std::cerr<<"runtime_target_resolve rounds="<<resolve_rounds
         <<" rollback_rounds="<<rollback_rounds<<" rollback_model_ms="<<resolve_profile[0]
         <<" rollback_submit_ms="<<resolve_profile[1]<<" routes_ms="<<resolve_profile[2]<<'\n';
-    if(target_route_cache)discard_moe_speculative_routes(target_route_cache);
-    discard_gguf_speculative_routes(target_gguf_route_cache);
+
   }
   void begin_target_routes(int rows) {
-    begin_moe_speculative_routes(model.execution->moe_expert_cache,rows);
-    target_route_cache=model.execution->moe_expert_cache;
-    begin_gguf_speculative_routes(model.execution->gguf_expert_cache,rows);
-    target_gguf_route_cache=model.execution->gguf_expert_cache;
+    target_routes.begin(*model.execution,rows);
   }
   void resolve_target_routes(int rows,bool cancelled) {
     const auto started=profile_resolve()?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
-    if(target_route_cache) {
-      if(cancelled)discard_moe_speculative_routes(target_route_cache);
-      else commit_moe_speculative_routes(target_route_cache,rows);
-    }
-    if(cancelled)discard_gguf_speculative_routes(target_gguf_route_cache);
-    else commit_gguf_speculative_routes(target_gguf_route_cache,rows);
-    target_route_cache.reset();
+    target_routes.resolve(rows,cancelled);
     if(profile_resolve()) {
       resolve_profile[2]+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count();
       ++resolve_rounds;
@@ -184,8 +166,13 @@ template <class Model> struct CudaMtpOps {
     model.rollback_speculative(keep);
 #endif
   }
+  std::uint64_t target_capture_generation() const {
+    auto captures=moe_expert_graph_captures(model.execution->moe_expert_cache);
+    if constexpr(requires {model.decode_graph_captures;})captures+=model.decode_graph_captures;
+    return captures;
+  }
   bool take_target_maintenance() {
-    const auto captures=moe_expert_graph_captures(model.execution->moe_expert_cache);
+    const auto captures=target_capture_generation();
     const bool initialized=captures!=target_graph_captures;
     target_graph_captures=captures;
     const bool predictor_initialized=mtp.take_graph_initialization();
@@ -339,7 +326,7 @@ template <class Model> struct CudaMtpOps {
                               prepared->positions.size(0) == 3
                           ? 3
                           : 1), prefill_compute_chunk(compute_chunk), output(output) {
-    target_graph_captures=moe_expert_graph_captures(model.execution->moe_expert_cache);
+    target_graph_captures=target_capture_generation();
   }
   void initialize(const std::vector<int64_t> &prompt,
                   const MfqSamplingParams &sampling) {
@@ -539,7 +526,7 @@ template <class Model> struct CudaMtpOps {
         return {std::move(hidden),std::move(raw),timer.elapsed_ms()};
       }
     }
-    MoePrefillWorkspaceLoan workspace(model.execution->moe_expert_cache);
+    mfq::cuda::RoutedPrefillWorkspaceLoan workspace(*model.execution);
     const bool host_history=host_prompt_history(chunk.count);
     bool borrowed=false;
     if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>)
@@ -816,7 +803,7 @@ template <class Model> struct CudaMtpOps {
       const auto rows=std::min<int64_t>(1024,pairs);
       const auto bytes=(std::size_t(1)<<30)+std::size_t(rows)*model.config.hidden*
           model.config.streams*sizeof(float)*8+moe_prefill_transfer_bytes(model.execution->moe_expert_cache,true);
-      auto loan=std::make_unique<MoePrefillWorkspaceLoan>(model.execution->moe_expert_cache);
+      auto loan=std::make_unique<mfq::cuda::RoutedPrefillWorkspaceLoan>(*model.execution);
       if(loan->begin(bytes))predictor_loan=std::move(loan);
     }
     return std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count();
@@ -840,7 +827,7 @@ template <class Model> struct CudaMtpOps {
     if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
       if(cache_only_prompt_history()) {
         auto& predictor=static_cast<mfq::cuda::qwen4_exp::Qwen4ExpMtp&>(mtp);
-        MoePrefillWorkspaceLoan workspace(model.execution->moe_expert_cache);
+        mfq::cuda::RoutedPrefillWorkspaceLoan workspace(*model.execution);
         if(ids.size(1)>128)workspace.begin((std::size_t(64)<<20)+
             std::size_t(ids.size(1))*model.hidden_size()*model.hc_mult()*sizeof(float)*12);
         {

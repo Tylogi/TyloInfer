@@ -20,8 +20,20 @@ export function availableLoadMemory(runtime?: RuntimeStatus | null, deviceIds: s
   return !deviceIds.length && measured(runtime?.device_free_bytes) ? ram + runtime.device_free_bytes : null;
 }
 
+export function estimateModelWeights(model: ModelArtifact, placement: 'stream' | 'vram' = 'stream') {
+  if (!model.structured_decisions) {
+    const total = model.estimated_resident_weight_bytes;
+    return measured(total) ? { total, vram: null, ram: null } : null;
+  }
+  const estimate = model.jev_weight_memory;
+  if (!estimate) return null;
+  const vram = placement === 'stream' ? estimate.stream_vram_bytes : estimate.resident_vram_bytes;
+  const ram = placement === 'stream' ? estimate.stream_ram_bytes : 0;
+  return measured(vram) && measured(ram) ? { total: vram + ram, vram, ram } : null;
+}
+
 export function estimateLoadMemory(model: ModelArtifact, profile: ModelCacheProfile, settings: LoadContextDefaults) {
-  const weights = model.estimated_resident_weight_bytes;
+  const weights = estimateModelWeights(model, settings.jev_weights)?.total;
   if (!measured(weights)) return null;
   const requested = settings.context_size ?? 32768;
   const context = Math.min(requested, model.context_capacity ?? profile.max_context, profile.max_context);

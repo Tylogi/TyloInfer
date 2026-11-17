@@ -1,3 +1,6 @@
+#include "runtime/host_storage_cache.h"
+#include "runtime/routed_expert_heat.h"
+#include "tyloinfer/host_cache_registry.h"
 #include "../../runtime/execution_options.h"
 #include "cuda_execution.h"
 
@@ -136,18 +139,14 @@ bool dma_graph_batch() { return exact_one("TYLOINFER_MOE_DMA_GRAPH_BATCH"); }
 bool warp_multi_sum() { return exact_one("TYLOINFER_CUDA_WARP_MULTI_SUM"); }
 float residency_heat_retention() {
     const auto* setting=std::getenv("TYLOINFER_MOE_RESIDENCY_HEAT_RETENTION");
-    // A four-token adaptation interval needs to remember experts reused every
-    // dozen tokens. With 0.7 decay their score never reaches the admission
-    // threshold; 0.9 retains that evidence across roughly 26 tokens. Prefill
-    // still replaces the heat seed when a new request changes the working set.
-    if(!setting)return 0.9f;
+    if(!setting)return mfq::cuda::expert_usage_retention;
     char* end=nullptr;const float value=std::strtof(setting,&end);
     if(end==setting || *end || !std::isfinite(value) || value<0.0f || value>1.0f)
         throw std::invalid_argument("TYLOINFER_MOE_RESIDENCY_HEAT_RETENTION must be between zero and one");
     return value;
 }
 int residency_interval() {
-    return environment_int("TYLOINFER_MOE_RESIDENCY_INTERVAL",1,1,1024);
+    return environment_int("TYLOINFER_MOE_RESIDENCY_INTERVAL",int(mfq::cuda::expert_usage_interval),1,1024);
 }
 bool router_lookahead() { return exact_one("TYLOINFER_MOE_ROUTER_LOOKAHEAD"); }
 std::optional<bool> router_lookahead_override() {
@@ -228,6 +227,14 @@ MoeDiagnostics moe_diagnostics() {
     if (const auto* path = std::getenv("TYLOINFER_MOE_MISS_RECORD")) result.miss_record = path;
     if (const auto* path = std::getenv("TYLOINFER_MOE_DISPATCH_REPLAY")) result.dispatch_replay = path;
     return result;
+}
+bool layer_weight_timings(){return exact_one("TYLOINFER_LAYER_WEIGHT_TIMINGS");}
+std::optional<bool> layer_weight_streaming() {
+    const auto* value=std::getenv("TYLOINFER_LAYER_WEIGHT_STREAMING");
+    if(!value)return {};
+    if(std::string_view(value)=="1")return true;
+    if(std::string_view(value)=="0")return false;
+    throw std::invalid_argument("TYLOINFER_LAYER_WEIGHT_STREAMING must be zero or one");
 }
 std::optional<int> embedding_mapped() {
     const auto* value=std::getenv("TYLOINFER_EMBEDDING_MAPPED");
@@ -607,6 +614,10 @@ CudaExecutionConfig load_cuda_execution_config() {
 }
 
 void mfq_release_host_allocator_cache() noexcept {
+#ifdef TYLOINFER_NATIVE_CUDA_RUNTIME
+    (void)mfq::reclaim_host_caches(std::numeric_limits<std::size_t>::max());
+    (void)mfq::cuda::reclaim_tensor_host_storage_cache();
+#endif
 #if defined(__GLIBC__)
     (void)malloc_trim(0);
 #elif defined(_WIN32)
@@ -771,6 +782,8 @@ ModelParallelCollectiveRuntime::~ModelParallelCollectiveRuntime() {
 }
 
 void ModelParallelCollectiveRuntime::reset() noexcept {
+    int previous_device=0;
+    const bool restore_device=!devices.empty() && cudaGetDevice(&previous_device)==cudaSuccess;
     // Release CUDA-owned state while every device context is still alive.
     // Static destruction is too late: the CUDA allocator may already be
     // shutting down when tensors on secondary model-parallel devices are
@@ -800,6 +813,7 @@ void ModelParallelCollectiveRuntime::reset() noexcept {
     ready.clear();
     completed.clear();
     collectives_enabled = false;
+    if(restore_device)(void)cudaSetDevice(previous_device);
 }
 
 void ModelParallelCollectiveRuntime::configure(
@@ -913,12 +927,14 @@ CudaExecutionContext::CudaExecutionContext()
 
 void CudaExecutionContext::reset() noexcept {
     profiler.reset();
+    qsa_kv_store.reset();kv_memory.reset();
     moe_expert_cache.reset();
     tq_expert_cache.reset();
     gguf_expert_cache.reset();
     projection_executors.clear();
     shared_expert_executors.clear();
     dflash2_draft_path.clear();
+    jev_full_vram.reset();
     model_parallel_collectives.reset();
     tensor_parallel = {};
     expert_parallel = {};
@@ -1268,6 +1284,12 @@ std::optional<bool> gr_chain_ffn_post() {
 std::optional<bool> mtp_predictor_graph() {
     if (const auto* value = std::getenv("TYLOINFER_MTP_PREDICTOR_GRAPH")) return value[0] != '0';
     return std::nullopt;
+}
+bool load_native_mtp() {
+    const auto* value=std::getenv("TYLOINFER_LOAD_NATIVE_MTP");
+    if(!value || !*value || std::strcmp(value,"1")==0)return true;
+    if(std::strcmp(value,"0")==0)return false;
+    throw std::invalid_argument("TYLOINFER_LOAD_NATIVE_MTP requires 0 or 1");
 }
 std::optional<std::int64_t> mtp_attention_window() {
     const auto* value=std::getenv("TYLOINFER_MTP_ATTENTION_WINDOW");

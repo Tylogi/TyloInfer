@@ -153,6 +153,13 @@ inline bool parse_cuda_load_option(
         }
         result.n_gpu_layers_set = true;
     }
+    else if (option == "--jev-weights") {
+        const auto placement = args.value(option);
+        if (placement != "stream" && placement != "vram")
+            usage_error("--jev-weights must be stream or vram");
+        result.jev_weights_set = true;
+        result.jev_full_vram = placement == "vram";
+    }
     else if (option == "--moe-gpu-cache-gb") {
         result.moe_gpu_cache_gb = number(args.value(option), option);
         if (result.moe_gpu_cache_gb < 0.0) {

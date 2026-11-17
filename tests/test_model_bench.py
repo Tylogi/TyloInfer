@@ -274,3 +274,24 @@ def test_invalid_cli_parameters_fail_before_loading(monkeypatch, arguments):
     with pytest.raises(SystemExit) as error:
         model_bench.main()
     assert error.value.code == 2
+
+
+@pytest.mark.parametrize("group,key,value", [
+    ("metrics", "decode_ms", float("nan")),
+    ("metrics", "prefill_ms", 0),
+    ("metrics", "ttft_ms", -1),
+    ("usage", "completion_tokens", 1),
+    ("usage", "completion_tokens", 9),
+    ("usage", "prompt_tokens", 31),
+    ("metrics", "prefill_tokens", 16),
+])
+def test_invalid_native_metrics_are_rejected(group, key, value):
+    result = native_result()
+    result[group][key] = value
+    with pytest.raises(model_bench.BenchmarkValidationError):
+        model_bench.validate_benchmark_result(result, 32, 8, "decode")
+
+
+def test_native_decode_rate_excludes_first_token():
+    run = model_bench.validate_benchmark_result(native_result(), 32, 8, "decode")
+    assert run["metrics"]["decode_tps"] == 350

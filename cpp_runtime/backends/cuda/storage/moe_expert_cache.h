@@ -85,6 +85,7 @@ void finalize_moe_expert_cache(
     const std::shared_ptr<MoeExpertCache>& cache, std::size_t kv_growth_reserve = 0, std::size_t kv_budget_charge = 0);
 std::size_t moe_expert_cache_minimum_bytes(const std::shared_ptr<MoeExpertCache>& cache);
 std::size_t moe_expert_cache_budget_bytes(const std::shared_ptr<MoeExpertCache>& cache);
+std::size_t moe_expert_source_bytes(const std::shared_ptr<MoeExpertCache>& cache);
 void resize_moe_expert_cache(const std::shared_ptr<MoeExpertCache>& cache, std::size_t bytes);
 // Reclaim lower-priority cache storage before reducing prefill transfer overlap.
 void set_moe_workspace_reservation(const std::shared_ptr<MoeExpertCache>& cache,
@@ -92,6 +93,10 @@ void set_moe_workspace_reservation(const std::shared_ptr<MoeExpertCache>& cache,
 void reserve_moe_workspace(const std::shared_ptr<MoeExpertCache>& cache,std::size_t bytes);
 std::size_t reclaim_moe_optional_host(const std::shared_ptr<MoeExpertCache>& cache,
     std::size_t allocation_bytes=0);
+std::size_t reclaim_moe_expert_duplicates(const std::shared_ptr<MoeExpertCache>& cache,std::size_t bytes);
+std::size_t share_moe_expert_host(const std::shared_ptr<MoeExpertCache>& cache,std::size_t bytes);
+std::size_t moe_expert_host_minimum_bytes(const std::shared_ptr<MoeExpertCache>& cache);
+void resize_moe_expert_host(const std::shared_ptr<MoeExpertCache>& cache,std::size_t bytes);
 double moe_expert_cache_ram_pcie_fraction(const std::shared_ptr<MoeExpertCache>& cache);
 std::uint64_t moe_expert_streamed_bytes(const std::shared_ptr<MoeExpertCache>& cache);
 // Successful private FFN captures change this counter for every model family.

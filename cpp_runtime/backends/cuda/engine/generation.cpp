@@ -1,4 +1,5 @@
 #include "runtime/routed_cache_resources.h"
+#include "runtime/decision_attention.h"
 #include "generation.h"
 #include "generation_flow.h"
 #include "token_row_prefetch.h"
@@ -71,6 +72,7 @@ template <typename Model> struct CudaGenerationOps {
     bool graph_prepared = false;
     int64_t prefill_compute_chunk=1024;
     mfq::engine::InferenceOutput* output=nullptr;
+    mfq_tensor_backend::Tensor* readout_hidden=nullptr;
 
     CudaGenerationOps(Model &model, DecodeGraphCache &graph,
         const mfq::engine::InferenceRequest &request, const CudaPreparedPrompt *prepared,
@@ -112,7 +114,7 @@ template <typename Model> struct CudaGenerationOps {
             // layer. Splitting these batches into verification windows would
             // repeatedly transfer the same expert when it is not resident.
             const bool verification_windows=!model.execution->tq_expert_cache || chunk.count<=8;
-            if(verification_windows && (!prepared || !prepared->transformed()) && model.reuse_decode_graphs &&
+            if(!readout_hidden && verification_windows && (!prepared || !prepared->transformed()) && model.reuse_decode_graphs &&
                     model.graph_registry && chunk.count<=128) {
                 // The same bounded prompt windows as MTP avoid materializing
                 // a whole expert layer before a short prompt has any scratch.
@@ -149,7 +151,7 @@ template <typename Model> struct CudaGenerationOps {
         if (hidden.defined()) {
             // The layer-major path has already advanced every physical cache.
         } else if (prepared && prepared->transformed()) {
-            MoePrefillWorkspaceLoan workspace(model.execution->moe_expert_cache);
+            mfq::cuda::RoutedPrefillWorkspaceLoan workspace(*model.execution);
             bool borrowed=false;
             if constexpr(std::is_same_v<Model,Qwen4CausalLm>)
                 borrowed=workspace.begin((std::size_t(4)<<30)+
@@ -178,7 +180,9 @@ template <typename Model> struct CudaGenerationOps {
         // Match prompt-progress timing: first-token head/sampling and expert
         // restoration remain in TTFT, outside reported prefill throughput.
         finish_prefill();
-        if (chunk.offset + chunk.count == full_ids.size(1)) {
+        if (chunk.offset + chunk.count == full_ids.size(1) && readout_hidden) {
+            *readout_hidden=model.last_hidden(std::move(hidden)).contiguous();
+        } else if (chunk.offset + chunk.count == full_ids.size(1)) {
             auto logits = model
                               .logits_from_hidden(hidden.index({Slice(), -1, Slice()})
                                       .to(mfq_tensor_backend::kFloat16)
@@ -207,7 +211,7 @@ template <typename Model> struct CudaGenerationOps {
         return graph_config.enabled && (!prepared || !prepared->transformed()) && !constraint &&
                !model.metadata.flash_next && mfq_cuda_graph_capture_supported() &&
                execution.dsv4_cpu_offload_layers.empty() && execution.dense_cpu_layer_count == 0 &&
-               !execution.moe_expert_cache && model_parallel_cuda_graph_enabled(execution) &&
+               !has_routed_expert_cache(execution) && model_parallel_cuda_graph_enabled(execution) &&
                generation_limit >= graph_config.minimum_generation_tokens &&
                generation_limit <= graph.generated_capacity;
     }
@@ -423,7 +427,7 @@ template <class Model> struct CudaGenerationContext {
             model.decode_reserve_until=std::min<int64_t>(model.max_position_embeddings(),
                 int64_t(input.prompt.size())+std::min<int64_t>(input.sampling.max_tokens,256));
             if(!batching && input.prompt.size()>1024) {
-                finish_moe_expert_exchanges(model.execution->moe_expert_cache);
+                finish_routed_expert_exchanges(*model.execution);
                 if(model.cache_pos==0 && !model.graph_registry)
                     release_moe_decode_buffers(model.execution->moe_expert_cache);
                 else release_moe_prefill_buffers(model.execution->moe_expert_cache);
@@ -435,8 +439,8 @@ template <class Model> struct CudaGenerationContext {
     void reserve_workspace(std::size_t bytes,bool allow_prefill_loan = false) {
 #ifdef TYLOINFER_NATIVE_CUDA_RUNTIME
         {
-            if(allow_prefill_loan && model.execution->gguf_expert_cache) {
-                const auto lendable=gguf_prefill_lendable_bytes(model.execution->gguf_expert_cache);
+            if(allow_prefill_loan && has_routed_expert_cache(*model.execution)) {
+                const auto lendable=mfq::cuda::routed_prefill_workspace_budget(*model.execution,true).lendable_bytes;
                 bytes=bytes>lendable?bytes-lendable:0;
             }
             reserve_routed_workspace(*model.execution,bytes);
@@ -608,25 +612,30 @@ template <class Model> struct CudaGenerationContext {
         catch (...) { graph.invalidate(); throw; }
         if (std::uncaught_exceptions()) graph.invalidate();
     }
-    Generation plain(mfq::engine::InferenceRequest& input, mfq::engine::InferenceOutput& output,
-                     size_t reused, size_t stable) {
-        if (batching) return batching->generate(request_id, input, output);
-        prepare_prefill_workspace(input.prompt.size()-reused);
-        const auto compute_chunk=prefill_chunk(input.prompt.size()-reused);
+    int64_t logical_prefill_chunk(std::size_t prompt_tokens,std::size_t reused,
+            std::size_t stable,int64_t compute_chunk) const {
         auto logical_chunk=compute_chunk;
         if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
             // Bound residual/FFN storage as well as projection tiles. Long
             // prompts advance each bounded chunk through all layers.
             logical_chunk=std::min<int64_t>(logical_chunk,8192);
-            if(compute_chunk>8 && reused==0 && (stable==0 || stable==input.prompt.size()) &&
+            if(compute_chunk>8 && reused==0 && (stable==0 || stable==prompt_tokens) &&
                 (!prepared || !prepared->transformed()) &&
-                qwen4_layer_major_prefill_eligible(model,input.prompt.size()))
-                logical_chunk=input.prompt.size();
+                qwen4_layer_major_prefill_eligible(model,prompt_tokens))
+                logical_chunk=prompt_tokens;
         }
         if constexpr(std::is_same_v<Model,DeepseekV41CausalLm>) {
-            if(!short_streamed_prefill(input.prompt.size()-reused) &&
-                    (!prepared || !prepared->transformed()))logical_chunk=input.prompt.size();
+            if(!short_streamed_prefill(prompt_tokens-reused) &&
+                    (!prepared || !prepared->transformed()))logical_chunk=prompt_tokens;
         }
+        return logical_chunk;
+    }
+    Generation plain(mfq::engine::InferenceRequest& input, mfq::engine::InferenceOutput& output,
+                     size_t reused, size_t stable) {
+        if (batching) return batching->generate(request_id, input, output);
+        prepare_prefill_workspace(input.prompt.size()-reused);
+        const auto compute_chunk=prefill_chunk(input.prompt.size()-reused);
+        const auto logical_chunk=logical_prefill_chunk(input.prompt.size(),reused,stable,compute_chunk);
         return mfq::engine::generate_sequence(
             CudaGenerationOps<Model>(model, graph, input, prepared ? &*prepared : nullptr,
                 config.decode_graph,compute_chunk,&output),
@@ -646,6 +655,108 @@ template <class Model> struct CudaGenerationContext {
             committed,prefix_boundary);
     }
 };
+
+template<class Model>
+CudaReadoutHidden prefill_readout(Model& model,DecodeGraphCache& graph,TextSessionCache& cache,
+        const CudaRuntimeConfig& config,const std::vector<int64_t>& prompt,
+        std::size_t stable_prefix,const std::string& input_key,bool prefix_cache) {
+    if(prompt.empty() || prompt.size()>std::size_t(model.max_position_embeddings()))
+        throw std::invalid_argument("decision prompt exceeds the loaded context");
+    auto& profiler=model.execution->profiler;
+    const auto* profile_setting=std::getenv("TYLOINFER_PROFILE_PREFILL");
+    const bool profiling=profile_setting && profile_setting[0]=='1' && !profiler.enabled;
+    if(profiling){profiler.reset();profiler.enabled=true;}
+    struct ProfileScope {
+        CudaProfiler& profiler;bool active;
+        ~ProfileScope(){if(active){try{profiler.report("runtime.decision_prefill");}catch(...){}profiler.reset();profiler.enabled=false;}}
+    } profile_scope{profiler,profiling};
+    mfq::engine::InferenceRequest input;input.prompt=prompt;
+    input.sampling.max_tokens=0;input.sampling.enable_mtp=false;
+    CudaGenerationContext<Model> owner{model,graph,cache,config,nullptr,{},nullptr,{}};
+    owner.prepare_request(input);
+    if(const auto decision_boundary=mfq::cuda::decision_attention_boundary(*model.execution)) {
+        // Only a complete state segment is reusable under prefix-bidirectional
+        // attention. An arbitrary common token prefix has different hidden states.
+        const bool reusable=*decision_boundary>0 && prefix_cache && cache.persistent_prefix_enabled() &&
+            model.supports_text_session_state() && !mfq::cuda::cuda_kv_quantization().enabled();
+        if(reusable) {
+            const auto boundary=std::size_t(*decision_boundary);
+            if(boundary>=prompt.size())throw std::invalid_argument("decision state boundary is outside the prompt");
+            const auto key="decision-prefix-bidir:"+std::to_string(boundary)+":"+input_key;
+            auto restored=cache.restore_best(model,nullptr,"",prompt,boundary,key);
+            // A shorter matching prefix was computed with a different future
+            // state window and cannot be retained, even when its tokens match.
+            if(restored.tokens!=boundary) {owner.reset();restored={};}
+            owner.prepare_prefill_workspace(prompt.size()-restored.tokens);
+            PrefillCudaTimer timer;
+            const auto ids=[&](std::size_t first,std::size_t count) {
+                return mfq_tensor_backend::tensor(std::vector<int64_t>(prompt.begin()+first,prompt.begin()+first+count),
+                    mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCPU).dtype(mfq_tensor_backend::kInt64))
+                    .reshape({1,int64_t(count)}).to(mfq_tensor_backend::Device(mfq_tensor_backend::kCUDA,
+                        model.execution->layer_placement.primary_device()));
+            };
+            if(!restored.tokens) {
+                (void)model.hidden_forward(ids(0,boundary));
+                try {
+                    if(owner.prepare_snapshot()) {
+                        std::vector<int64_t> prefix(prompt.begin(),prompt.begin()+boundary);
+                        auto state=model.capture_text_session_state(prefix);state.input_key=key;
+                        cache.store("",std::move(state));
+                    }
+                } catch(const std::exception& error) {
+                    std::cerr<<"runtime_decision_prefix action=skip error="<<error.what()<<'\n';
+                }
+            }
+            auto hidden=model.hidden_forward(ids(boundary,prompt.size()-boundary));
+            TYLOINFER_CUDA_CHECK(cudaEventRecord(timer.finished_event(),mfq_get_current_cuda_stream()));
+            auto normalized=model.last_hidden(std::move(hidden));
+            return {std::move(normalized),restored.tokens,timer.elapsed_ms()};
+        }
+        owner.reset();
+        owner.prepare_prefill_workspace(prompt.size());
+        PrefillCudaTimer timer;
+        auto ids=mfq_tensor_backend::tensor(prompt,mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCPU)
+            .dtype(mfq_tensor_backend::kInt64)).reshape({1,int64_t(prompt.size())}).to(
+                mfq_tensor_backend::Device(mfq_tensor_backend::kCUDA,model.execution->layer_placement.primary_device()));
+        auto hidden=model.hidden_forward(ids);
+        TYLOINFER_CUDA_CHECK(cudaEventRecord(timer.finished_event(),mfq_get_current_cuda_stream()));
+        auto normalized=model.last_hidden(std::move(hidden));
+        return {std::move(normalized),0,timer.elapsed_ms()};
+    }
+    const bool caching=prefix_cache && cache.persistent_prefix_enabled() && model.supports_text_session_state();
+    const auto boundary=caching?std::min(stable_prefix,prompt.size()-1):0;
+    auto restored=caching?cache.restore_best(model,nullptr,"",prompt,boundary,input_key):TextSessionRestore{};
+    if(!restored.tokens)owner.reset();
+    owner.prepare_prefill_workspace(prompt.size()-restored.tokens);
+    const auto compute_chunk=owner.prefill_chunk(prompt.size()-restored.tokens);
+    const auto logical_chunk=owner.logical_prefill_chunk(prompt.size(),restored.tokens,boundary,compute_chunk);
+    CudaReadoutHidden result;result.cached_tokens=restored.tokens;
+    CudaGenerationOps<Model> ops(model,graph,input,nullptr,config.decode_graph,compute_chunk);
+    ops.readout_hidden=&result.hidden;
+    for(auto offset=int64_t(restored.tokens);offset<int64_t(prompt.size());) {
+        auto chunk=mfq::engine::next_prefill_chunk(prompt.size(),offset,logical_chunk);
+        if(std::size_t(offset)<boundary && std::size_t(offset+chunk.count)>boundary)
+            chunk.count=int64_t(boundary)-offset;
+        result.prefill_ms+=ops.prefill(chunk);offset+=chunk.count;
+        if(caching && std::size_t(offset)==boundary) {
+            try {
+                if(owner.prepare_snapshot()) {
+                    std::vector<int64_t> prefix(prompt.begin(),prompt.begin()+boundary);
+                    auto state=model.capture_text_session_state(prefix);state.input_key=input_key;
+                    cache.store("",std::move(state));
+                }
+            }catch(const std::exception& error) {
+                std::cerr<<"runtime_decision_prefix action=skip error="<<error.what()<<'\n';
+            }
+        }
+    }
+    return result;
+}
+
+template CudaReadoutHidden prefill_readout(mfq::cuda::Qwen35CausalLm&,DecodeGraphCache&,TextSessionCache&,
+    const CudaRuntimeConfig&,const std::vector<int64_t>&,std::size_t,const std::string&,bool);
+template CudaReadoutHidden prefill_readout(mfq::cuda::Qwen4CausalLm&,DecodeGraphCache&,TextSessionCache&,
+    const CudaRuntimeConfig&,const std::vector<int64_t>&,std::size_t,const std::string&,bool);
 
 template <typename Model>
 Generation generate(Model &model, DecodeGraphCache &graph, TextSessionCache &cache,

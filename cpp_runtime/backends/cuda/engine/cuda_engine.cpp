@@ -2,6 +2,9 @@
 #include "cuda_runtime_config.h"
 #include "cuda_execution.h"
 #include "generation.h"
+#include "decision_readout.h"
+#include "core/full_block.h"
+#include "models/qwen35/linear_attention.h"
 #include "storage/model_loader.h"
 #include "storage/weight_loader.h"
 #include "storage/moe_expert_cache.h"
@@ -45,6 +48,8 @@ struct CudaEngineState {
     std::shared_ptr<void> ram_prefix_reclaimer,ram_expert_reclaimer,ram_duplicate_reclaimer,ram_budget_reserver;
     std::unique_ptr<ContinuousBatch<CudaBatchOperations<Model>>> batching;
     bool duplex_active = false;
+    std::optional<mfq::DecisionModelSpec> decision_model;
+    QuantLinear decision_readout;
     std::size_t resident_budget=0, weight_budget=0, initial_expert_budget=0, allocation_ceiling=0;
     std::shared_ptr<KvExpertLoan> graph_expert_loan;
     mfq_tensor_backend::Tensor graph_expert_storage;
@@ -54,6 +59,7 @@ struct CudaEngineState {
     std::uint64_t workspace_expert_reclaimed_used_bytes=0;
     int graph_draft_depth=3;
     bool preparing_graph_depth=true;
+    bool planning_mtp=true;
 
     std::size_t workspace_expert_capacity() const {
         std::size_t bytes=0;for(const auto& part:workspace_expert_regions)bytes+=part.storage.nbytes();return bytes;
@@ -65,7 +71,7 @@ struct CudaEngineState {
     }
     void release_graph_expert_space(std::size_t required_available=std::numeric_limits<std::size_t>::max()) {
         if(!graph_expert_region && workspace_expert_regions.empty())return;
-        finish_moe_expert_exchanges(execution->moe_expert_cache);
+        finish_routed_expert_exchanges(*execution);
         TYLOINFER_CUDA_CHECK(cudaDeviceSynchronize());
         auto context=mfq::cuda::default_context(execution->layer_placement.primary_device());
         const bool all=required_available==std::numeric_limits<std::size_t>::max();
@@ -121,15 +127,15 @@ struct CudaEngineState {
 
     void restore_graph_expert_space() {
         if(preparing_graph_depth)return;
-        if(execution->gguf_expert_cache) {
-            std::optional<std::size_t> transient;
-            if constexpr(std::is_same_v<Model,Qwen4CausalLm>)
-                if(!batching)transient=qwen4_decode_transient_reserve(language,components.mtp.get(),graph_draft_depth);
-            restore_gguf_decode_workspace(execution->gguf_expert_cache,
-                execution->kv_memory?execution->kv_memory->growth_reserve():0,transient);
+        std::optional<std::size_t> transient;
+        if constexpr(std::is_same_v<Model,Qwen4CausalLm>)
+            if(!batching)transient=qwen4_decode_transient_reserve(language,planning_mtp?components.mtp.get():nullptr,graph_draft_depth);
+        restore_routed_decode_workspace(*execution,
+            execution->kv_memory?execution->kv_memory->growth_reserve():0,transient);
+        if(execution->gguf_expert_cache || execution->tq_expert_cache) {
             if(runtime_options::layer_timings()) {
-                std::cerr<<"runtime_gguf_decode_ready";
-                for(const auto& [name,value]:gguf_expert_memory_metrics(execution->gguf_expert_cache))
+                std::cerr<<"runtime_routed_decode_ready";
+                for(const auto& [name,value]:routed_expert_memory_metrics(*execution))
                     if(name=="expert_logical_transfer_bytes" || name=="expert_host_fetch_ms" ||
                         name=="expert_batched_cpu_copy_ms" || name=="expert_batched_stage_wait_ms" ||
                         name=="expert_allocation_ms" || name=="expert_writeback_bytes" ||
@@ -141,8 +147,6 @@ struct CudaEngineState {
             }
             return;
         }
-        if(execution->tq_expert_cache)return;
-        prepare_moe_decode_residency(execution->moe_expert_cache);
         mfq::cuda::default_context(execution->layer_placement.primary_device())->reclaim_idle_memory();
         restore_mtp_expert_space();
         if(!graph_expert_loan)return;
@@ -277,17 +281,30 @@ struct CudaEngineState {
                   language.supports_paged_text_session_state(), config.prefix_cache),
                 language.supports_text_session_state(), language.supports_text_session_state() ? 0 : 1,
                 cuda_has_separate_memory()) {
+        const auto trace_load=[](const char* phase) {
+            if(std::getenv("TYLOINFER_TRACE_ENGINE_LOAD"))std::cerr<<"cuda_engine_load phase="<<phase<<'\n';
+        };
+        trace_load("resources");
+        decision_model=mfq::decision_model_spec(*language.source);
+        if(decision_model) {
+            if constexpr(std::is_same_v<Model,Qwen35CausalLm>) {
+                if(!decision_model->vocabulary_readout)
+                    decision_readout=load_decision_readout(*language.source,language.hidden_size(),
+                        mfq_tensor_backend::Device(mfq_tensor_backend::kCUDA,execution->layer_placement.primary_device()));
+            }
+            else throw std::invalid_argument("trained D3 decisions require a Qwen3.5/Qwen3.8 backbone");
+        }
         ram_prefix_reclaimer=register_qsa_ram_reclaimer(execution->layer_placement.primary_device(),
             mfq_current_cuda_stream(),cache.ram_reclaimer());
         ram_duplicate_reclaimer=register_qsa_ram_reclaimer(execution->layer_placement.primary_device(),
             mfq_current_cuda_stream(),[weak=std::weak_ptr<CudaExecutionContext>(execution)](std::size_t bytes) {
-                auto owner=weak.lock();return owner?reclaim_gguf_expert_duplicates(owner->gguf_expert_cache,bytes):0;
+                auto owner=weak.lock();if(!owner)return std::size_t(0);
+                return reclaim_routed_expert_duplicates(*owner,bytes);
             });
         ram_budget_reserver=register_qsa_ram_budget_reserver(execution->layer_placement.primary_device(),
             mfq_current_cuda_stream(),[weak=std::weak_ptr<CudaExecutionContext>(execution)](std::size_t bytes) {
                 auto owner=weak.lock();if(!owner)return std::size_t(0);
-                return owner->gguf_expert_cache?share_gguf_expert_host(owner->gguf_expert_cache,bytes):
-                    bytes?reclaim_routed_optional_host(*owner,bytes):0;
+                return share_routed_expert_host(*owner,bytes);
             });
         ram_expert_reclaimer=register_qsa_ram_capacity_reclaimer(execution->layer_placement.primary_device(),
             mfq_current_cuda_stream(),[weak=std::weak_ptr<CudaExecutionContext>(execution)](std::size_t bytes) {
@@ -310,9 +327,9 @@ struct CudaEngineState {
             else throw std::invalid_argument("continuous batching is unavailable for this model");
         }
 #ifdef TYLOINFER_NATIVE_CUDA_RUNTIME
-        if(execution->moe_expert_cache || execution->gguf_expert_cache)
+        if(has_routed_expert_cache(*execution))
             language.restore_decode_workspace=[this]{restore_graph_expert_space();};
-        if(execution->gguf_expert_cache && components.mtp)
+        if(has_routed_expert_cache(*execution) && components.mtp)
             components.mtp->decode_workspace_changed=[this]{restore_graph_expert_space();};
         if(execution->moe_expert_cache) {
             graph_expert_loan=execution->kv_memory?execution->kv_memory->expert_loan():nullptr;
@@ -358,16 +375,12 @@ struct CudaEngineState {
             session(command);
         }
         if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
-            struct CacheLearningScope {
-                std::shared_ptr<MoeExpertCache> cache;
-                std::shared_ptr<GgufExpertCache> gguf;
-                bool previous,previous_gguf;
-                CacheLearningScope(std::shared_ptr<MoeExpertCache> value,std::shared_ptr<GgufExpertCache> row)
-                    :cache(std::move(value)),gguf(std::move(row)),previous(set_moe_reuse_learning(cache,false)),
-                     previous_gguf(set_gguf_reuse_learning(gguf,false)) {}
-                ~CacheLearningScope(){set_moe_reuse_learning(cache,previous);set_gguf_reuse_learning(gguf,previous_gguf);}
-            } learning(execution->moe_expert_cache,execution->gguf_expert_cache);
+            mfq::cuda::RoutedCacheLearningScope learning(*execution,false);
+            trace_load("graph_warmup");
             qwen4_warmup_decode_graphs(language,components.mtp.get());
+            trace_load("graph_warmup_done");
+            preparing_graph_depth=false;
+            restore_graph_expert_space();
             // Exercise the same draft/verify/commit loop as a real request.
             // Graph-only warmup cannot cover its history replay, sampling and
             // expert exchange boundaries. No synthetic policy/history survives.
@@ -391,15 +404,17 @@ struct CudaEngineState {
                     request.sampling.top_k=0;
                 }
                 request.sampling.seed=1234;
-                request.sampling.max_tokens=static_cast<int32_t>(
-                    std::min<int64_t>(64,language.max_position_embeddings()-16));
                 request.sampling.mtp_max_draft_tokens=3;
+                // One full draft/verification window exercises these paths;
+                // policy and history are discarded immediately after warmup.
+                request.sampling.max_tokens=static_cast<int32_t>(std::min<int64_t>(
+                    request.sampling.mtp_max_draft_tokens+1,language.max_position_embeddings()-16));
                 for(int i=0;i<16;++i)request.prompt.push_back((i*7919+17)%language.vocab_size());
                 InferenceOutput output(request,nullptr,"cuda-mtp-warmup");
                 auto scope=language.execution_scope();
                 auto generation=run_mtp_generation(language,predictor,request,output,16);
                 while(generation.next()) {}
-                finish_moe_expert_exchanges(execution->moe_expert_cache);
+                finish_routed_expert_exchanges(*execution);
                 predictor.reset(1);
                 language.reset(1);
                 predictor.policy_state=saved_policy;
@@ -414,7 +429,9 @@ struct CudaEngineState {
             }
         }
         preparing_graph_depth=false;
+        trace_load("decode_workspace");
         restore_graph_expert_space();
+        trace_load("ready");
     }
     bool can_batch(const EngineRequest& request) const {
         if constexpr (std::is_same_v<Model,Qwen4CausalLm>)
@@ -453,7 +470,7 @@ struct CudaEngineState {
         const auto previous_experts=routed_expert_cache_budget_bytes(*execution);
         const auto before=context->resident_memory_usage();
         release_graph_expert_space();
-        finish_moe_expert_exchanges(execution->moe_expert_cache);
+        finish_routed_expert_exchanges(*execution);
         graph.invalidate();
         if constexpr(std::is_same_v<Model,Qwen4CausalLm>)
             qwen4_release_decode_graphs(language,components.mtp.get());
@@ -513,6 +530,7 @@ struct CudaEngineState {
     }
     Generation generate_text(InferenceRequest& input, InferenceOutput& output, std::optional<Prepared> prepared,
                              const RequestId& id, bool batched) {
+        planning_mtp=!batched && input.sampling.enable_mtp && bool(components.mtp);
         if(!batched)prepare_graph_depth(input);
         return internal::generate(language, graph, cache, config,
                                   input, output, batched ? nullptr : components.mtp.get(), std::move(prepared),
@@ -531,7 +549,108 @@ struct CudaEngineState {
         return generate_prepared(*this, request.input, request.output, id, request.batched);
     }
     template <class T> ControlResult control(T value) {
-        if constexpr (std::is_same_v<T, RuntimeMetrics>) {
+        if constexpr(std::is_same_v<T,DecisionTokens>) {
+            if constexpr(std::is_same_v<Model,Qwen35CausalLm> || std::is_same_v<Model,Qwen4CausalLm>) {
+                if(value.reads.empty() || value.reads.size()>64)
+                    throw std::invalid_argument("decision requests require 1 to 64 reads");
+                const auto vocabulary=language.vocab_size();
+                std::size_t total=0;
+                for(const auto& read:value.reads) {
+                    if(read.prompt.empty() || read.prompt.size()>std::size_t(language.max_position_embeddings()) ||
+                            read.labels.empty() || read.labels.size()>255)
+                        throw std::invalid_argument("invalid decision prompt or label count");
+                    if(decision_model && decision_model->max_tokens && read.prompt.size()>*decision_model->max_tokens)
+                        throw std::invalid_argument("decision prompt exceeds the model input limit");
+                    if(decision_model && decision_model->attention==mfq::DecisionAttention::prefix_bidirectional &&
+                        (!read.state_tokens || read.state_tokens>=read.prompt.size()))
+                        throw std::invalid_argument("decision state boundary is outside the prompt");
+                    for(const auto token:read.prompt)if(token<0 || token>=vocabulary)
+                        throw std::invalid_argument("decision prompt token is outside the vocabulary");
+                    std::unordered_set<int64_t> unique;
+                    for(const auto token:read.labels) {
+                        if(token<0 || token>=vocabulary || !unique.insert(token).second)
+                            throw std::invalid_argument("decision labels must be distinct vocabulary tokens");
+                        if(decision_model && !decision_model->vocabulary_readout &&
+                            std::find(decision_model->token_ids.begin(),decision_model->token_ids.end(),token)==decision_model->token_ids.end())
+                            throw std::invalid_argument("decision label is absent from trained codebook");
+                    }
+                    if(read.prompt.size()>1048576-total)
+                        throw std::invalid_argument("decision request exceeds the aggregate token limit");
+                    total+=read.prompt.size();
+                }
+                auto common=value.reads.front().prompt.size();
+                for(const auto& read:value.reads) {
+                    common=std::min(common,read.prompt.size());
+                    std::size_t i=0;
+                    while(i<common && read.prompt[i]==value.reads.front().prompt[i])++i;
+                    common=i;
+                }
+                MfqCudaGuard guard(execution->layer_placement.primary_device());
+                graph.invalidate();
+                if constexpr(std::is_same_v<Model,Qwen4CausalLm>)
+                    qwen4_release_decode_graphs(language,components.mtp.get());
+                if(components.mtp)components.mtp->reset(1);
+                const bool previous_mtp=planning_mtp;planning_mtp=false;
+                bool cleaned=false;
+                const auto cleanup=[&] {
+                    if(std::exchange(cleaned,true))return;
+                    language.reset(1);
+                    if(language.restore_decode_workspace)language.restore_decode_workspace();
+                    planning_mtp=previous_mtp;
+                };
+                try {
+                    DecisionResult result;
+                    for(const auto& read:value.reads) {
+                        DecisionAttentionScope attention_scope(*execution,decision_model?&*decision_model:nullptr,read.state_tokens);
+                        auto prepared=prefill_readout(language,graph,cache,config,read.prompt,common,
+                            "decision:"+value.cache_salt,value.prefix_cache);
+                        std::vector<double> selected;
+                        std::optional<double> normalizer;
+                        std::optional<int64_t> argmax;
+                        if(decision_model) {
+                            auto logits=(decision_model->vocabulary_readout
+                                ? language.lm_head.forward_rows(*execution,prepared.hidden,read.labels)
+                                : decision_readout.forward(*execution,prepared.hidden.to(mfq_tensor_backend::kFloat32)))
+                                    .to(mfq_tensor_backend::kFloat32).reshape({-1}).cpu().contiguous();
+                            if(logits.numel()!=int64_t(decision_model->vocabulary_readout?read.labels.size():decision_model->codes.size()))
+                                throw std::runtime_error("trained decision readout size changed");
+                            for(std::size_t i=0;i<read.labels.size();++i) {
+                                const auto token=read.labels[i];
+                                const auto found=std::find(decision_model->token_ids.begin(),decision_model->token_ids.end(),token);
+                                if(!decision_model->vocabulary_readout && found==decision_model->token_ids.end())
+                                    throw std::invalid_argument("decision label is absent from trained codebook");
+                                const auto row=decision_model->vocabulary_readout?i:std::size_t(found-decision_model->token_ids.begin());
+                                selected.push_back(logits.template data_ptr<float>()[row]/decision_model->temperature_for(read.type));
+                            }
+                        } else if(value.full_vocabulary) {
+                            auto logits=language.logits_from_hidden(prepared.hidden).to(mfq_tensor_backend::kFloat32)
+                                .reshape({-1}).cpu().contiguous();
+                            if(logits.numel()!=vocabulary)throw std::runtime_error("decision head vocabulary changed");
+                            std::vector<double> all(logits.numel());
+                            for(int64_t i=0;i<logits.numel();++i)all[i]=logits.template data_ptr<float>()[i];
+                            normalizer=decision_logsumexp(all);
+                            argmax=std::max_element(all.begin(),all.end())-all.begin();
+                            for(const auto id:read.labels)selected.push_back(all[id]);
+                        } else {
+                            auto logits=language.apply_final_logit_softcap(language.lm_head.forward_rows(
+                                *execution,prepared.hidden,read.labels)).to(mfq_tensor_backend::kFloat32)
+                                .reshape({-1}).cpu().contiguous();
+                            for(int64_t i=0;i<logits.numel();++i)selected.push_back(logits.template data_ptr<float>()[i]);
+                        }
+                        auto answer=normalize_decision(read.labels,selected,normalizer,argmax);
+                        answer.prompt_tokens=read.prompt.size();answer.cached_tokens=prepared.cached_tokens;
+                        answer.prefill_ms=prepared.prefill_ms;
+                        result.reads.push_back(std::move(answer));
+                    }
+                    cleanup();return result;
+                }catch(...) {
+                    auto failure=std::current_exception();
+                    try{cleanup();}catch(...){planning_mtp=previous_mtp;graph.invalidate();throw;}
+                    planning_mtp=previous_mtp;
+                    std::rethrow_exception(failure);
+                }
+            } else throw std::invalid_argument("decision reads are unavailable for this model architecture");
+        } else if constexpr (std::is_same_v<T, RuntimeMetrics>) {
             const auto batch_metrics = batching ? batching->metrics() : Metrics{};
             const auto capabilities = components.state();
             Metrics metrics{
@@ -569,6 +688,12 @@ struct CudaEngineState {
             std::size_t resident_weights=weight_memory->resident_bytes();
             for(const auto& metric:experts)
                 if(metric.first=="resident_expert_cache_bytes")resident_weights+=std::size_t(metric.second);
+            const auto embedding=weight_memory->embedding_bytes();
+            const bool jev=bool(decision_model);
+            const auto streamed_weights=(language.layer_weights?language.layer_weights->host_bytes():0)+(jev?embedding:0);
+            metrics.insert(metrics.end(),{{"ram_embedding_bytes",double(jev?0:embedding)},
+                {"ram_weight_bytes",double(streamed_weights)},
+                {"jev_weights_streamed",language.layer_weights?1.0:0.0}});
             const auto ple=weight_memory->ple_bytes();
             metrics.insert(metrics.end(),{{"resident_weight_bytes",double(resident_weights)},
                 {"ssd_ple_enabled",ple>0?1.0:0.0},{"ssd_ple_payload_bytes",double(ple)}});
@@ -582,6 +707,29 @@ struct CudaEngineState {
                             value += batch_value;
                     }
                 metrics.insert(metrics.end(),cache_memory.begin(),cache_memory.end());
+            }
+            if(jev) {
+                std::map<std::pair<int,const void*>,std::size_t> allocations;
+                const auto add=[&](const mfq_tensor_backend::Tensor& tensor) {
+                    if(!tensor.defined() || !tensor.is_cuda())return;
+                    const auto storage=std::static_pointer_cast<mfq::cuda::TensorStorage>(tensor.weak_storage_owner().lock());
+                    if(storage)allocations[{tensor.get_device(),storage->base}]=storage->bytes;
+                };
+                for(const auto& block:language.blocks) {
+                    if(const auto* full=dynamic_cast<const FullBlock*>(block.get()))
+                        for(const auto* tensor:{&full->cache.k,&full->cache.v,&full->cache.k_chunk_ptrs,
+                            &full->cache.v_chunk_ptrs,&full->cache.page_table})add(*tensor);
+                    if(const auto* linear=dynamic_cast<const qwen35::LinearAttentionBlock*>(block.get()))
+                        for(const auto* tensor:{&linear->mixer.convolution,&linear->mixer.recurrent,
+                            &linear->mixer.speculative_convolution,&linear->mixer.speculative_recurrent})add(*tensor);
+                }
+                std::map<int,std::size_t> devices;
+                std::size_t bytes=0;
+                for(const auto& [address,size]:allocations){bytes+=size;devices[address.first]+=size;}
+                metrics.emplace_back("kv_cache_bytes",double(bytes));
+                metrics.emplace_back("kv_cache_contexts",language.cache_pos>0?1.0:0.0);
+                for(const auto& [device,size]:devices)
+                    metrics.emplace_back("gpu_"+std::to_string(device)+"_live_kv_bytes",double(size));
             }
             const auto metric_bytes = [&](const std::string& key) {
                 for(const auto& [name,value]:metrics)if(name==key)return std::size_t(value);
@@ -621,7 +769,7 @@ struct CudaEngineState {
                         {stem+"process_memory_reservation_bytes",double(process->reservation)},
                         {stem+"process_shared_memory_budget_bytes",double(process->shared_budget)},
                         {stem+"process_shared_memory_usage_bytes",double(process->shared_usage)}});
-                if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
+                if(std::is_same_v<Model,Qwen4CausalLm> || jev) {
                     const auto categorized=weights+live+hot;
                     const auto buffer=resident>categorized?resident-categorized:0;
                     metrics.emplace_back(stem+"resident_buffer_bytes",double(buffer));
@@ -632,7 +780,7 @@ struct CudaEngineState {
             }
             metrics.insert(metrics.end(),{{"device_free_bytes",double(free_bytes)}, {"device_total_bytes",double(total_bytes)},
                 {"cuda_allocated_bytes",double(allocated)}, {"cuda_reserved_bytes",double(reserved)}});
-            if constexpr(std::is_same_v<Model,Qwen4CausalLm>)metrics.emplace_back("resident_buffer_bytes",double(buffers));
+            if(std::is_same_v<Model,Qwen4CausalLm> || jev)metrics.emplace_back("resident_buffer_bytes",double(buffers));
             const auto expert_bytes=metric_bytes("resident_expert_cache_bytes");
             const auto minimum=moe_expert_cache_minimum_bytes(execution->moe_expert_cache);
             metrics.insert(metrics.end(),{{"resident_memory_dynamic_budget",online_budget_supported()?1.0:0.0},
@@ -726,6 +874,7 @@ struct CudaBackend {
                 using Model = std::decay_t<decltype(model)>;
                 if constexpr (!std::is_same_v<Model, Qwen4CausalLm>)
                     if (execution->qsa_kv_store) throw std::invalid_argument("CUDA streamed KV requires a QSA model");
+                if(std::getenv("TYLOINFER_TRACE_ENGINE_LOAD"))std::cerr<<"cuda_engine_load phase=model_loaded\n";
                 return std::make_unique<CudaEngineState<Model>>(execution, std::move(model), std::move(components), config,weight_memory);
             });
         return visit([&](auto& state) {
@@ -734,6 +883,8 @@ struct CudaBackend {
             info.max_context = state.language.max_position_embeddings();
             info.vocab_size = static_cast<int32_t>(state.language.vocab_size());
             info.model_type = state.language.model_type();
+            using Language=std::decay_t<decltype(state.language)>;
+            info.decisions=std::is_same_v<Language,Qwen35CausalLm> || std::is_same_v<Language,Qwen4CausalLm>;
             info.multimodal = state.components.grid_vision.has_value() ||
                 state.components.deepseek_vision.has_value() ||
                 state.components.radio_vision.has_value() || bool(state.components.composite);

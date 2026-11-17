@@ -251,7 +251,12 @@ def test_text_sidecar_symlink_is_neither_read_nor_deleted(tmp_path):
     external = tmp_path / 'private.txt'
     external.write_text('keep')
     sidecar = path.with_name(path.name + '.tokens')
-    sidecar.symlink_to(external)
+    try:
+        sidecar.symlink_to(external)
+    except OSError as error:
+        if getattr(error, "winerror", None) == 1314:
+            pytest.skip("creating symlinks requires Windows developer mode or privilege")
+        raise
     assert read_prefix_cache_tokens(tmp_path, 'a' * 64, '1' * 64)['reason'] == 'text_not_saved'
     purge_prefix_cache(tmp_path)
     assert external.read_text() == 'keep' and sidecar.is_symlink()

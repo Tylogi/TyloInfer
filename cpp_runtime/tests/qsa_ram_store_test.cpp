@@ -828,7 +828,12 @@ void check_prefix_reclamation(const std::filesystem::path& root) {
         assert(reclaim(4096)==512 && cache->metrics().hot_bytes==0);
         for(int i=0;i<4;++i) {
             const auto bytes=cache->load(hashes[i]);
-            assert(bool(bytes)==ssd);
+            if(bool(bytes)!=ssd) {
+                const auto state=cache->metrics();
+                throw std::runtime_error("prefix pressure restore mismatch: ssd="+std::to_string(ssd)+
+                    " block="+std::to_string(i)+" disk_bytes="+std::to_string(state.disk_bytes)+
+                    " failed_writes="+std::to_string(state.failed_writes));
+            }
             if(bytes)assert(*bytes==std::vector<std::uint8_t>(256,std::uint8_t(i)));
         }
         std::weak_ptr<mfq::cache::PagedPrefixCache> weak=cache;

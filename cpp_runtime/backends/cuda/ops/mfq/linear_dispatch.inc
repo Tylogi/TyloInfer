@@ -191,6 +191,11 @@ mfq_tensor_backend::Tensor run_nint_linear(
         mfq_tensor_backend::Tensor x,
         MfqOptional<mfq_tensor_backend::Tensor> gate,
         int mode) {
+    if(!gate.has_value() && kl_mmq.mode==KlMmqMode::Default && x.is_cuda() &&
+            x.dim()==2 && x.scalar_type()==mfq_tensor_backend::kFloat32 && x.size(0)>=512) {
+        const auto product=prefill_product(prefill_projection_weight(w),x);
+        if(product.defined())return prefill_materialize(product);
+    }
     if (!x.is_cuda() || !w.q8_zero || kl_mmq.mode == KlMmqMode::Default) {
         return gate.has_value()
             ? nint_matmul_input_mul(profiler, w, x, gate.value(), mode)
@@ -226,6 +231,11 @@ mfq_tensor_backend::Tensor run_nvq_linear(
         mfq_tensor_backend::Tensor x,
         MfqOptional<mfq_tensor_backend::Tensor> gate,
         int mode) {
+    if(!gate.has_value() && kl_mmq.mode==KlMmqMode::Default && x.is_cuda() &&
+            x.dim()==2 && x.scalar_type()==mfq_tensor_backend::kFloat32 && x.size(0)>=512) {
+        const auto product=prefill_product(prefill_projection_weight(w),x);
+        if(product.defined())return prefill_materialize(product);
+    }
     if (!x.is_cuda() || kl_mmq.mode == KlMmqMode::Default) {
         return gate.has_value()
             ? nvq_matmul_input_mul(profiler, w, x, gate.value(), mode)

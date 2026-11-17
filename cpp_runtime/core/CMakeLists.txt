@@ -4,6 +4,7 @@ find_package(Threads REQUIRED)
 add_library(mfq-host-parallel STATIC host_parallel.cpp include/tyloinfer/host_parallel.h
     host_copy.cpp include/tyloinfer/host_copy.h
     host_memory.cpp include/tyloinfer/host_memory.h
+    host_cache_registry.cpp include/tyloinfer/host_cache_registry.h
     cpu_expert_pool.cpp include/tyloinfer/cpu_expert_pool.h)
 target_include_directories(mfq-host-parallel PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_features(mfq-host-parallel PUBLIC cxx_std_17)
@@ -62,6 +63,7 @@ add_library(mfq-model-source STATIC
     include/tyloinfer/nvq_rows.h
     include/tyloinfer/packed_row_range.h
     hf_model_source.cpp
+    hf_packed_quant.cpp hf_packed_quant.h
     mlx/mlx_affine.cpp
     mlx/mlx_affine_source.cpp
     gguf/gguf_model_source.cpp
@@ -79,6 +81,7 @@ add_library(mfq-model-source STATIC
     tq_fixture_source.cpp
     include/tyloinfer/tq_fixture_source.h
     include/tyloinfer/tq_rows.h
+    tq_model_layout.cpp include/tyloinfer/tq_model_layout.h
 )
 add_library(mfq::model-source ALIAS mfq-model-source)
 target_include_directories(mfq-model-source PUBLIC

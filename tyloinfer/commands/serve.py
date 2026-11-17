@@ -366,6 +366,7 @@ def _run_locked(args: argparse.Namespace, identity: dict[str, str | int]) -> int
                 artifact_uri=f"mfq://{initial_artifact.resource.id}",
                 context_size=args.context_size or None,
                 prefill_chunk_size=args.prefill_chunk_size,
+                jev_weights=args.jev_weights,
                 moe_gpu_cache_gb=args.moe_gpu_cache_gb,
                 prefix_cache_enabled=not args.no_prefix_cache,
                 prefix_cache_disk_bytes=args.prefix_cache_disk_size,
@@ -494,6 +495,8 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         "--anthropic-port", type=_port, default=None,
         help="Anthropic Messages API bind port (default: saved listener port or 8091)",
     )
+    parser.add_argument("--jev-weights", choices=("stream", "vram"), default="stream",
+        help="Jev layer weights: two streaming buffers (default) or full VRAM")
     parser.add_argument("--context-size", type=_nonnegative_int, default=0)
     parser.add_argument(
         "--prefill-chunk-size", type=_prefill_chunk_size, default="auto",
