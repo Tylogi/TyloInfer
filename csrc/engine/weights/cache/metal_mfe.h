@@ -131,7 +131,6 @@ private:
         const MlxMfeWeight& weight) noexcept;
     static MlxMfeWeight weight_from_impl(
         const std::shared_ptr<const WeightImpl>& impl);
-    void track_external_weights(const std::vector<MlxMfeWeight>& weights);
     void retain_cached_until_drain(
         std::vector<std::shared_ptr<const MlxMfeCachedProjection>> projections,
         std::vector<mlx::core::array> outputs);

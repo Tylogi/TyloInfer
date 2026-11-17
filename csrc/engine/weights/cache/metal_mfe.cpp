@@ -16,6 +16,7 @@
 #include "engine/backends/metal/native/allocation.h"
 #include "engine/backends/metal/native/tensor/tensor.h"
 #include "engine/tensor/tensor.h"
+#include "components/error.h"
 #include <mlx/mlx.h>
 #include <algorithm>
 #include <array>
@@ -2008,17 +2009,13 @@ struct MlxMfeOffloadCache::Impl {
         result.insert(result.end(), values.begin(), values.end());
     }
 
-    void track_external_weights(
-        std::vector<std::weak_ptr<const MlxMfeOffloadCache::WeightImpl>> weights) {
-        std::lock_guard lock(mutex);
+    void track_weight_locked(const MlxMfeWeight& weight) {
         std::erase_if(external_weights, [](const auto& entry) {
             return entry.second.expired();
         });
-        for (auto& weight : weights) {
-            if (const auto owner = weight.lock())
-                external_weights.emplace(owner.get(), std::move(weight));
-        }
-        recount_locked();
+        auto weak = MlxMfeOffloadCache::weight_impl(weight);
+        if (const auto owner = weak.lock())
+            external_weights.emplace(owner.get(), std::move(weak));
     }
 
     void append_retained_backings(
@@ -2097,7 +2094,7 @@ struct MlxMfeOffloadCache::Impl {
         std::span<const std::shared_ptr<const MfeCachedExpert>> pages = {},
         std::span<const array> arrays = {}) {
         if (!fits_candidate_locked(weights, pages, arrays))
-            throw std::runtime_error(
+            throw MfqResourceExhausted(
                 "MFE physical backing exceeds the configured cache limit");
     }
 
@@ -2117,13 +2114,8 @@ struct MlxMfeOffloadCache::Impl {
         std::vector<array> outputs) {
         if (weights.empty() && outputs.empty()) return;
         std::lock_guard lock(mutex);
-        std::erase_if(external_weights, [](const auto& entry) {
-            return entry.second.expired();
-        });
         for (const auto& weight : weights) {
-            auto weak = MlxMfeOffloadCache::weight_impl(weight);
-            if (const auto owner = weak.lock())
-                external_weights.emplace(owner.get(), std::move(weak));
+            track_weight_locked(weight);
         }
         async_holds.push_back(AsyncHold{
             next_async_id++, std::move(weights), std::move(outputs), {}});
@@ -2253,14 +2245,6 @@ MlxMfeOffloadCache::weight_impl(const MlxMfeWeight& weight) noexcept {
 MlxMfeWeight MlxMfeOffloadCache::weight_from_impl(
     const std::shared_ptr<const MlxMfeOffloadCache::WeightImpl>& impl) {
     return MlxMfeWeight(impl);
-}
-
-void MlxMfeOffloadCache::track_external_weights(
-    const std::vector<MlxMfeWeight>& weights) {
-    std::vector<std::weak_ptr<const MlxMfeOffloadCache::WeightImpl>> refs;
-    refs.reserve(weights.size());
-    for (const auto& weight : weights) refs.push_back(weight_impl(weight));
-    impl_->track_external_weights(std::move(refs));
 }
 
 bool MlxMfeOffloadCache::can_offload(
@@ -2469,8 +2453,10 @@ std::optional<std::vector<MlxMfeWeight>> MlxMfeOffloadCache::layer_mfe(
         if (epoch == impl_->epoch)
             for (const auto& name : names)
                 impl_->backing_records.emplace(name, impl_->record(name).metadata.nbytes);
+        for (const auto& weight : result)
+            impl_->track_weight_locked(weight);
+        impl_->recount_locked();
     }
-    track_external_weights(result);
     return result;
 }
 
@@ -2585,6 +2571,21 @@ MfeGroupTask MlxMfeOffloadCache::Impl::prepare_grouped(
             value.credit + counts.at(key.expert) - (hit ? 0 : 1)));
         impl_->mfe_cache.get(key);
     };
+    const auto admit_result = [&](MlxMfeWeight result) {
+        const std::array<MlxMfeWeight, 1> candidate{result};
+        if (!impl_->fits_candidate_locked(candidate)) {
+            if (impl_->async_holds.empty())
+                throw MfqResourceExhausted(
+                    "MFE physical backing exceeds the configured cache limit");
+            lock.unlock();
+            impl_->drain();
+            lock.lock();
+            impl_->admit_candidate_locked(candidate);
+        }
+        impl_->track_weight_locked(result);
+        impl_->recount_locked();
+        return result;
+    };
     const auto reuse_packed = [&](const Impl::PreparedProjection& packed)
         -> std::optional<MlxMfeWeight> {
         std::vector<std::int32_t> local;
@@ -2599,7 +2600,9 @@ MfeGroupTask MlxMfeOffloadCache::Impl::prepare_grouped(
         impl_->stats.expert_hits += ordered_keys.size();
         ++impl_->stats.packed_hits;
         lock.unlock();
-        return weight.select_experts(local);
+        auto result = weight.select_experts(local).prepare_cache_storage();
+        lock.lock();
+        return admit_result(std::move(result));
     };
     if (completed && completed->result)
         if (auto result = reuse_packed(*completed->result)) co_return std::move(*result);
@@ -2908,12 +2911,15 @@ MfeGroupTask MlxMfeOffloadCache::Impl::prepare_grouped(
     if (bank) candidate_weights.push_back(bank->weight);
     if (!impl_->fits_candidate_locked(candidate_weights, candidate_pages)) {
         if (impl_->async_holds.empty())
-            throw std::runtime_error("MFE physical backing exceeds the configured cache limit");
+            throw MfqResourceExhausted(
+                "MFE physical backing exceeds the configured cache limit");
         lock.unlock();
         impl_->drain();
         lock.lock();
         impl_->admit_candidate_locked(candidate_weights, candidate_pages);
     }
+    impl_->track_weight_locked(result);
+    impl_->recount_locked();
     std::unordered_map<std::int32_t, std::int32_t> result_ids;
     for (std::size_t index = 0; index < pages.size(); ++index) {
         result_ids.emplace(pages[index].key.expert, static_cast<std::int32_t>(index));
@@ -2998,7 +3004,6 @@ std::vector<MlxMfeWeight> MlxMfeOffloadCache::grouped_mfe(
             auto result = grouped_mfe(names.first(2), active_experts, activation_counts, prefill_scan);
             prefix_ready(result);
             result.push_back(grouped_mfe(names.back(), active_experts, activation_counts, prefill_scan));
-            track_external_weights(result);
             return result;
         }
     }
@@ -3115,7 +3120,6 @@ std::vector<MlxMfeWeight> MlxMfeOffloadCache::grouped_mfe(
     std::vector<MlxMfeWeight> result;
     result.reserve(ordered.size());
     for (auto& weight : ordered) result.push_back(std::move(*weight));
-    track_external_weights(result);
     return result;
 }
 
