@@ -2,14 +2,13 @@
 
 #include "engine/models/source/model_graph.h"
 #include "engine/models/common/ffn.h"
-#include "engine/backends/cuda/ops/projection/quant_linear.h"
 #include "engine/ops/ops.h"
 #include "engine/models/metadata.h"
 #include "engine/models/causal_model.h"
-#include "engine/models/metadata.h"
 #include "engine/models/deepseek_v4/config.h"
 #include "engine/models/source/model.h"
 
+#include <cstdint>
 #include <memory>
 #include <vector>
 
@@ -21,7 +20,7 @@ struct PoolState;
 struct Compressor {
     int64_t ratio = 0, head_dim = 0, cache_quant_mode = 0;
     bool overlap = false;
-    DenseLinearGroup projection;
+    ::tyloi::Tensor projection;
     ::tyloi::Tensor ape, norm;
 
     std::vector<DenseTensor> project(DenseTensor x, int64_t batch, int64_t tokens) const;

@@ -1,11 +1,8 @@
 #include "projection.h"
 
-#include "engine/backends/cuda/native/collectives.h"
-#include "engine/backends/cuda/ops/projection/quant.h"
 #include "engine/backends/cuda/native/allocation.h"
 
 #include <algorithm>
-#include <numeric>
 #include <optional>
 #include <stdexcept>
 #include <utility>
@@ -190,130 +187,6 @@ QuantLinearGroup make_quant_group(
 #endif
     }
     return result;
-}
-
-DenseLinearGroup make_dense_group(const std::vector<::tyloi::Tensor>& ws) {
-    if (ws.empty()) throw std::runtime_error("empty dense group");
-    DenseLinearGroup g;
-    std::vector<::tyloi::DenseTensor> parts;
-    parts.reserve(ws.size());
-    for (const auto& weight : ws) {
-        const auto& w = weight.dense();
-        if (w.dim() != 2) throw std::runtime_error("dense linear group expects 2D weights");
-        if (!parts.empty() && w.size(1) != parts[0].size(1))
-            throw std::runtime_error("cannot group dense tensors with different input width");
-        g.outs.push_back(w.size(0));
-        parts.push_back(w.to(::tyloi::kFloat32));
-    }
-    auto joined = ::tyloi::cuda::cat(parts, 0).contiguous();
-    g.w = std::make_shared<::tyloi::DenseTensor>(std::move(joined));
-    return g;
-}
-
-static ::tyloi::DenseTensor dequant_quant_linear_f32(
-        tyloi::cuda::Collectives& collectives, int primary,
-        const ::tyloi::Tensor& linear) {
-    const auto* sharded = linear.representation<tyloi::ShardedTensor>();
-    if (!sharded) {
-        if (linear.representation<::tyloi::encoding::TqTensor>() != nullptr)
-            return quant_linear_reference_weight(linear).to(::tyloi::kFloat32).contiguous();
-#if TYLOINFER_ENABLE_MFQ_COMPAT
-        if (const auto* nint = linear.representation<tyloi::NintTensor>();
-            nint != nullptr && tyloi::mfq_compat_enabled)
-            return dequant_nint_dense_f32(*nint);
-        if (const auto* nvq = linear.representation<tyloi::NvqTensor>();
-            nvq != nullptr && tyloi::mfq_compat_enabled)
-            return nvq_dequant(*nvq).to(::tyloi::kFloat32).contiguous();
-#endif
-        if (const auto* mx8 = linear.representation<tyloi::Mxfp8Tensor>();
-            mx8 != nullptr)
-            return mxfp8_dequant_cuda(mx8->values, mx8->scales).to(::tyloi::kFloat32).contiguous();
-        if (const auto* mx4 = linear.representation<tyloi::Mxfp4Tensor>();
-            mx4 != nullptr)
-            return mxfp4_dequant_cuda(mx4->values, mx4->scales).to(::tyloi::kFloat32).contiguous();
-#if TYLOINFER_ENABLE_MFQ_COMPAT
-        if (const auto* sq4 = linear.representation<tyloi::Mxfp4SqTensor>();
-            sq4 != nullptr && tyloi::mfq_compat_enabled) {
-            if (!sq4->blob.is_cuda()) return dequant_mxfp4_sq_cpu(*sq4);
-            return mxfp4_sq_dequant_cuda(
-                sq4->blob, sq4->row_q, sq4->row_symbol_byte_offsets, sq4->row_auxiliary,
-                sq4->bits, sq4->out, sq4->neuron_len, sq4->matrix_scale_base,
-                sq4->q_sum, sq4->sq4_rows, true).contiguous();
-        }
-        if (const auto* sq8 = linear.representation<tyloi::Fp8SqTensor>();
-            sq8 != nullptr && tyloi::mfq_compat_enabled)
-            return dequant_fp8_sq(*sq8, true).contiguous();
-#endif
-        if (const auto* dense = linear.representation<::tyloi::DenseTensor>();
-            dense != nullptr)
-            return dense->to(::tyloi::kFloat32).contiguous();
-        throw std::runtime_error("unsupported linear weight for FP32 reconstruction");
-    }
-    if (sharded->axis != TensorParallelAxis::Output &&
-        sharded->axis != TensorParallelAxis::Input)
-        throw std::runtime_error("cannot reconstruct a mirrored tensor-parallel linear");
-    std::vector<::tyloi::DenseTensor> parts;
-    parts.reserve(sharded->shards.size());
-    for (const auto& shard : sharded->shards) {
-        MfqCudaGuard shard_guard(shard.device);
-        ::tyloi::DenseTensor part;
-        const auto& payload = shard.weight;
-        if (payload.representation<::tyloi::encoding::TqTensor>() != nullptr) {
-            part = quant_linear_reference_weight(payload).to(::tyloi::kFloat32).contiguous();
-        } else
-#if TYLOINFER_ENABLE_MFQ_COMPAT
-        if (const auto* nint = payload.representation<tyloi::NintTensor>();
-            nint != nullptr && tyloi::mfq_compat_enabled) {
-            part = dequant_nint_dense_f32(*nint);
-        } else if (const auto* nvq = payload.representation<tyloi::NvqTensor>();
-            nvq != nullptr && tyloi::mfq_compat_enabled) {
-            part = nvq_dequant(*nvq).to(::tyloi::kFloat32).contiguous();
-        } else
-#endif
-        if (const auto* mx8 = payload.representation<tyloi::Mxfp8Tensor>(); mx8 != nullptr) {
-            part = mxfp8_dequant_cuda(mx8->values, mx8->scales).to(::tyloi::kFloat32).contiguous();
-        } else if (const auto* mx4 = payload.representation<tyloi::Mxfp4Tensor>(); mx4 != nullptr) {
-            part = mxfp4_dequant_cuda(mx4->values, mx4->scales).to(::tyloi::kFloat32).contiguous();
-        } else if (payload.representation<tyloi::Mxfp4SqTensor>() != nullptr ||
-                payload.representation<tyloi::Fp8SqTensor>() != nullptr) {
-            part = dequant_quant_linear_f32(collectives, primary, payload);
-        } else if (const auto* dense = payload.representation<::tyloi::DenseTensor>();
-            dense != nullptr) {
-            part = dense->to(::tyloi::kFloat32).contiguous();
-        } else {
-            throw std::runtime_error(
-                "unsupported tensor-parallel shard representation for reconstruction");
-        }
-        parts.push_back(collectives.copy(part, primary).to(::tyloi::kFloat32).contiguous());
-    }
-    MfqCudaGuard primary_guard(primary);
-    auto dense = ::tyloi::cuda::cat(
-        parts, sharded->axis == TensorParallelAxis::Output ? 0 : 1).contiguous();
-    if (dense.size(0) != linear.size(0) || dense.size(1) != linear.size(1))
-        throw std::runtime_error("reconstructed tensor-parallel linear shape mismatch");
-    return dense;
-}
-
-DenseLinearGroup make_fp32_quant_group(
-        tyloi::cuda::Collectives& collectives,
-        int primary,
-        std::span<const ::tyloi::Tensor> weights) {
-    DenseLinearGroup dense;
-    std::vector<::tyloi::DenseTensor> parts;
-    parts.reserve(weights.size());
-    for (const auto& weight : weights) {
-        dense.outs.push_back(weight.size(0));
-        parts.push_back(dequant_quant_linear_f32(collectives, primary, weight));
-    }
-    auto joined = ::tyloi::cuda::cat(parts, 0).contiguous();
-    dense.w = std::make_shared<::tyloi::DenseTensor>(std::move(joined));
-    const auto& grouped = dense.w;
-    TYLOINFER_RUNTIME_CHECK(
-        grouped.dim() == 2 &&
-            grouped.size(0) == std::accumulate(
-                dense.outs.begin(), dense.outs.end(), int64_t{0}),
-        "FP32 compressor projection shape mismatch");
-    return dense;
 }
 
 } // namespace tyloi::cuda

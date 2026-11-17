@@ -8,6 +8,7 @@
 #include "engine/models/common/load.h"
 #include "engine/models/source/model_graph.h"
 #include "engine/weights/loader.h"
+#include "engine/weights/prepare/quant.h"
 #include "engine/backends/cuda/ops/projection/projection.h"
 #include "engine/backends/cuda/executor/tq/resources.h"
 #include "engine/models/deepseek_v4/load.h"
@@ -77,10 +78,13 @@ void load_layer(Layer& layer, const tyloi::weights::Loader& weights, const Confi
         layer.compressor.head_dim = c.head_dim;
         layer.compressor.overlap = layer.compress_ratio == 4;
         layer.compressor.cache_quant_mode = 1;
-        layer.compressor.projection = make_fp32_quant_group(
-            collectives, primary,
-            weights.group({p + "attention.compressor.key_value.weight",
-                                         p + "attention.compressor.gate.weight"}));
+        auto projection = weights.group({p + "attention.compressor.key_value.weight",
+                                          p + "attention.compressor.gate.weight"});
+        const auto output_dim = layer.compressor.overlap ? 2 * c.head_dim : c.head_dim;
+        for (const auto& weight : projection)
+            TYLOINFER_RUNTIME_CHECK(weight.dim() == 2 && weight.size(0) == output_dim &&
+                weight.size(1) == c.hidden_size, "FP32 compressor projection shape mismatch");
+        layer.compressor.projection = tyloi::weights::fp32_group(collectives, primary, projection);
         layer.compressor.ape = std::make_shared<DenseTensor>(weights.tensor(p + "attention.compressor.position").dense().to(::tyloi::kFloat32).contiguous());
         layer.compressor.norm = std::make_shared<DenseTensor>(weights.tensor(p + "attention.compressor.norm.weight").dense().to(::tyloi::kFloat32).contiguous());
     }
@@ -89,10 +93,12 @@ void load_layer(Layer& layer, const tyloi::weights::Loader& weights, const Confi
         layer.indexer_compressor.head_dim = c.index_head_dim;
         layer.indexer_compressor.overlap = true;
         layer.indexer_compressor.cache_quant_mode = 2;
-        layer.indexer_compressor.projection = make_fp32_quant_group(
-            collectives, primary,
-            weights.group({p + "attention.indexer.compressor.key_value.weight",
-                                         p + "attention.indexer.compressor.gate.weight"}));
+        auto projection = weights.group({p + "attention.indexer.compressor.key_value.weight",
+                                          p + "attention.indexer.compressor.gate.weight"});
+        for (const auto& weight : projection)
+            TYLOINFER_RUNTIME_CHECK(weight.dim() == 2 && weight.size(0) == 2 * c.index_head_dim &&
+                weight.size(1) == c.hidden_size, "FP32 compressor projection shape mismatch");
+        layer.indexer_compressor.projection = tyloi::weights::fp32_group(collectives, primary, projection);
         layer.indexer_compressor.ape = std::make_shared<DenseTensor>(weights.tensor(p + "attention.indexer.compressor.position").dense().to(::tyloi::kFloat32).contiguous());
         layer.indexer_compressor.norm = std::make_shared<DenseTensor>(weights.tensor(p + "attention.indexer.compressor.norm.weight").dense().to(::tyloi::kFloat32).contiguous());
         layer.indexer_q = weights.weight(p + "attention.indexer.query.weight");
@@ -591,8 +597,10 @@ void PoolState::reset(int64_t batch, int64_t max_positions) {
 
 std::vector<::tyloi::DenseTensor> Compressor::project(::tyloi::DenseTensor x, int64_t batch,
                                                 int64_t tokens) const {
-    auto parts = projection.forward(x.to(::tyloi::kFloat32));
     const int64_t output_dim = overlap ? 2 * head_dim : head_dim;
+    auto joined = tyloi::ops::project(
+        x.to(::tyloi::kFloat32).reshape({-1, x.size(-1)}), projection).dense();
+    auto parts = joined.split_with_sizes({output_dim, output_dim}, -1);
     return {
         parts.at(0)
             .reshape({batch, tokens, output_dim})

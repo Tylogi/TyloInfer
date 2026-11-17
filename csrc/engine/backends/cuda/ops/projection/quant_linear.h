@@ -28,7 +28,6 @@
 enum class InputGateMode : int { None = 0, Sigmoid = 1, Silu = 2 };
 
 struct QuantLinearGroup;
-struct DenseLinearGroup;
 
 ::tyloi::DenseTensor dense_projection(
     ::tyloi::DenseTensor input, const ::tyloi::DenseTensor& weight);
@@ -120,13 +119,6 @@ struct QuantLinearGroup {
 };
 
 void check_projection(const QuantLinearGroup& group, const ::tyloi::DenseTensor& input);
-
-struct DenseLinearGroup {
-    ::tyloi::Tensor w;
-    std::vector<int64_t> outs;
-
-    std::vector<::tyloi::DenseTensor> forward(::tyloi::DenseTensor x) const;
-};
 
 ::tyloi::DenseTensor nint_kld(
     CudaProfiler& profiler, KlMmqState& mmq, const ::tyloi::Tensor& weight,

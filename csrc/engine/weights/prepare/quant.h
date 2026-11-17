@@ -1,5 +1,6 @@
 #pragma once
 
+#include "engine/tensor/tensor.h"
 #include "engine/weights/encoding/format_features.h"
 #include "engine/weights/encoding/mx/blob.h"
 #include "engine/weights/prepare/mx.h"
@@ -15,9 +16,12 @@
 #endif
 
 #include <cstdint>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
+
+namespace tyloi::cuda { class Collectives; }
 
 tyloi::mxfp4::Data select_mxfp4_cpu_rows(
     const tyloi::mxfp4::Data& source, const std::vector<int64_t>& rows);
@@ -80,3 +84,12 @@ tyloi::Fp8SqTensor to_device_fp8_sq(
     std::string_view dtype, const std::vector<uint8_t>& payload,
     bool cuda, int device = -1);
 #endif
+
+namespace tyloi::weights {
+
+::tyloi::Tensor fp32_group(
+    ::tyloi::cuda::Collectives& collectives,
+    int primary,
+    std::span<const ::tyloi::Tensor> weights);
+
+} // namespace tyloi::weights

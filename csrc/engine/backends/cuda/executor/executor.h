@@ -2,9 +2,9 @@
 
 #include "engine/backends/cuda/native/context.h"
 #include "engine/backends/cuda/ops/attention/attention.h"
-#include "engine/backends/cuda/ops/attention/linear.h"
 #include "engine/backends/cuda/ops/ffn/dense.h"
 #include "engine/backends/cuda/ops/ffn/options.h"
+#include "engine/backends/cuda/ops/projection/projection.h"
 #include "engine/executor.h"
 
 #include <memory>
@@ -73,7 +73,10 @@ public:
 
     struct Mode {
         FfnMode ffn;
-        LinearCore::Options linear;
+        struct {
+            bool shared_input = true;
+            bool fused_conv = true;
+        } linear;
         Compute compute;
         std::int64_t kv_capacity = 0;
         bool transposed = true;

@@ -299,16 +299,3 @@ bool QuantLinearGroup::tensor_parallel_output_compatible() const {
     return tensor_parallel_output_projections_compatible(
         tensor_parallel_output_projections());
 }
-
-std::vector<::tyloi::DenseTensor> DenseLinearGroup::forward(::tyloi::DenseTensor x) const {
-    auto shape = x.sizes().vec();
-    auto y = dense_projection(x.reshape({-1, x.size(-1)}),
-        w.dense());
-    auto parts = y.split_with_sizes(outs, -1);
-    for (auto & p : parts) {
-        auto s = shape;
-        s.back() = p.size(-1);
-        p = p.reshape(s);
-    }
-    return parts;
-}
