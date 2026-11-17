@@ -40,6 +40,10 @@ struct MoeRoutePlan {
     ::tyloi::DenseTensor counts;
     ::tyloi::DenseTensor cursors;
     int n_experts = 0;
+    // Packed-window coordinates for route publication.  The tensors remain
+    // local to this route; these fields identify their rows in the window.
+    std::int64_t row_offset = 0;
+    std::int64_t row_total = 0;
     int mma_tile_m = 8;
     int wide_tile_m = 8;
     bool map_ready = false;

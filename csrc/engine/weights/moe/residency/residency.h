@@ -51,6 +51,11 @@ public:
     ~MoeResidencyManager();
     void before_layer(int layer);
     void prepare_predictor();
+    // Publish route IDs without entering the after-layer scheduling path.
+    // Packed callers provide the exact window coordinates of this publication.
+    void observe_routes(int layer, std::span<const int32_t> ids, int tokens,
+                        int row_offset = 0, int row_total = 0,
+                        bool independent_sequences = false);
     void after_layer(int layer,const std::vector<int32_t>& ids,int tokens,bool window_inflight=false,bool independent_sequences=false);
     void begin_speculative_routes(int rows);
     void commit_speculative_routes(std::span<const std::uint8_t> keep);

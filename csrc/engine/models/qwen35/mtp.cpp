@@ -52,6 +52,16 @@ tyloi::models::MtpStep Mtp::step(tyloi::models::MtpState& value, const ::tyloi::
     return {output, output};
 }
 
+std::vector<tyloi::models::MtpStep> Mtp::batch_step(
+        std::span<const tyloi::models::MtpRow> rows,
+        const tyloi::models::ForwardOptions& options) const {
+    if (rows.empty()) throw std::invalid_argument("Qwen MTP batch is empty");
+    for (const auto& row : rows)
+        if (!row.state || !row.state->belongs_to(*this))
+            throw std::invalid_argument("Qwen MTP batch state belongs to another predictor");
+    return model_.batch_step(rows, options);
+}
+
 void Mtp::trim_cache_to(tyloi::models::MtpState& value, int64_t position) const {
     state<MtpState>(value).trim(position);
 }

@@ -5,7 +5,6 @@
 
 #include <atomic>
 #include <cstdint>
-#include <map>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -20,14 +19,23 @@ public:
         tyloi::Device device{tyloi::DeviceType::cuda, 0};
         int64_t heads = 0;
         int64_t head_dim = 0;
+        ::tyloi::ScalarType dtype = ::tyloi::kFloat16;
         tyloi::state::KvQuantization quantization;
     };
     struct Sequence {
+        Sequence() = default;
+        Sequence(const Sequence&) = delete;
+        Sequence& operator=(const Sequence&) = delete;
+        Sequence(Sequence&&) noexcept = default;
+        Sequence& operator=(Sequence&&) noexcept = default;
+
     private:
         friend class PagedKv;
         std::vector<std::int32_t> physical_pages_;
         std::vector<std::uint64_t> page_generations_;
         std::shared_ptr<const Identity> owner_;
+        std::shared_ptr<std::vector<std::int32_t>> host_page_table_;
+        std::vector<std::pair<Device, ::tyloi::Tensor>> page_tables_;
     };
     struct Stats {
         int64_t page_size = 0;
@@ -50,15 +58,21 @@ public:
     static Growth construction_growth(const std::vector<Layout>& layers, int64_t context,
                                       int32_t sequences, bool preallocate);
     Growth ensure_growth(const std::vector<std::pair<const Sequence*, int64_t>>& sequences) const;
-    Growth update_growth() const;
 
     bool ensure_tokens(Sequence& sequence, int64_t tokens);
     void release(Sequence& sequence);
-    void update(const std::vector<const Sequence*>& sequences);
+    void update(Sequence& sequence);
     // Metal physical pages have shape [1,H,physical_pages*page_size,width].
     // Reacquire after growth or update; old views retain old backing and do not follow replacements.
     // Consumers must retire before pages are released/reused or this store is destroyed.
-    tyloi::state::KvView view(size_t layer, int64_t batch) const;
+    tyloi::state::KvView view(size_t layer, const Sequence& sequence) const;
+    // Read or write packed logical KV pages without dequantizing or invoking
+    // an attention kernel. The tensors have shape [1, heads, tokens, width].
+    std::pair<::tyloi::Tensor, ::tyloi::Tensor>
+    read(const Sequence& sequence, size_t layer, int64_t tokens) const;
+    void write(const Sequence& sequence, size_t layer,
+               const ::tyloi::Tensor& key, const ::tyloi::Tensor& value,
+               int64_t tokens) const;
     Stats stats() const noexcept;
 
 private:
@@ -92,8 +106,6 @@ private:
     std::shared_ptr<const Identity> identity_ = std::make_shared<Identity>();
     std::vector<std::uint64_t> page_generations_;
     std::uint64_t generation_ = 1;
-    std::vector<std::int32_t> host_page_table_;
-    std::map<std::pair<DeviceType, std::int32_t>, ::tyloi::Tensor> device_page_tables_;
     std::vector<Pool> layers_;
     size_t storage_pages_ = 0;
     size_t reserved_bytes_ = 0;

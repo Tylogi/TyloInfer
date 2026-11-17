@@ -21,13 +21,17 @@ std::shared_ptr<const MfeTensor> cpu_expert(const std::shared_ptr<const MfeTenso
 
 } // namespace
 
-ExpertBatch::ExpertBatch(std::span<const Tensor> banks, const Tensor& down, const Tensor& ids)
+ExpertBatch::ExpertBatch(std::span<const Tensor> banks, const Tensor& down, const Tensor& ids,
+                         std::int64_t row_offset, std::int64_t row_total)
     : impl_(std::make_unique<Impl>()) {
     if ((banks.size() != 1 && banks.size() != 2) || !down || !ids ||
         ids.dim() != 2 || !ids.representation<DenseTensor>() || !ids.is_cuda() || ids.scalar_type() != kInt32 ||
         !ids.is_contiguous() || ids.size(0) <= 0 || ids.size(1) <= 0 ||
         ids.size(0) > INT_MAX / ids.size(1))
         throw std::invalid_argument("invalid selected expert banks or route IDs");
+    if (row_offset < 0 || row_total <= 0 || row_offset > row_total ||
+        ids.size(0) > row_total - row_offset)
+        throw std::invalid_argument("invalid packed MoE route row coordinates");
     for (const auto& bank : banks)
         if (!bank || bank.dim() != 3 || bank.size(0) <= 0 || bank.size(0) > INT_MAX ||
             bank.size(1) <= 0 || bank.size(2) <= 0)
@@ -92,6 +96,8 @@ ExpertBatch::ExpertBatch(std::span<const Tensor> banks, const Tensor& down, cons
             return build_moe_route_plan(ids.dense(), static_cast<int>(banks[0].size(0)));
         });
     }
+    b.route.row_offset = row_offset;
+    b.route.row_total = row_total;
 #if TYLOINFER_ENABLE_MFQ_COMPAT
     if (!b.sharded && !tq_routed) {
         const auto& first = b.split ? b.gate : b.gate_up;

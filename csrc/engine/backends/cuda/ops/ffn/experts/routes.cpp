@@ -91,6 +91,8 @@ const MoeRoutePlan& moe_route_to_device(
     copy_route_tensor(collectives, replica->counts, source.counts, device);
     copy_route_tensor(collectives, replica->cursors, source.cursors, device);
     replica->n_experts = source.n_experts;
+    replica->row_offset = source.row_offset;
+    replica->row_total = source.row_total;
     replica->mma_tile_m = source.mma_tile_m;
     replica->wide_tile_m = source.wide_tile_m;
     replica->map_ready = source.map_ready;

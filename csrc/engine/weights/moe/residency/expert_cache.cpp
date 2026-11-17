@@ -20,6 +20,7 @@
 #include <condition_variable>
 #include <deque>
 #include <cmath>
+#include <limits>
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -88,6 +89,41 @@ std::size_t MoeExpertCache::reclaim_optional_host(std::size_t allocation_bytes) 
     if(released)std::cerr<<"runtime_prefill_backup action=reclaim bytes="<<released
         <<" available_bytes="<<*available<<" allocation_bytes="<<allocation_bytes<<'\n';
     return released;
+}
+
+void MoeExpertCache::observe_route(int source_id, int layer, const MoeRoutePlan & route,
+                                   std::span<const int32_t> ids, int n_experts) {
+    const auto rows64 = route.ids.size(0);
+    const auto routes64 = route.ids.size(1);
+    if (route.ids.dim() != 2 || rows64 <= 0 || routes64 <= 0 ||
+        rows64 > std::numeric_limits<int>::max() ||
+        routes64 > std::numeric_limits<int>::max() ||
+        ids.size() != static_cast<std::size_t>(rows64 * routes64))
+        throw std::runtime_error("cached MoE route readback geometry mismatch");
+    const auto row_offset64 = route.row_offset;
+    const auto row_total64 = route.row_total > 0 ? route.row_total : rows64;
+    if (row_offset64 < 0 || row_total64 <= 0 ||
+        row_offset64 > row_total64 ||
+        rows64 > row_total64 - row_offset64 ||
+        row_total64 > std::numeric_limits<int>::max())
+        throw std::runtime_error("cached MoE route publication coordinates mismatch");
+    const int rows = static_cast<int>(rows64);
+    const int routes = static_cast<int>(routes64);
+    const int row_offset = static_cast<int>(row_offset64);
+    const int row_total = static_cast<int>(row_total64);
+    if (moe_residency_)
+        moe_residency_->observe_routes(layer, ids, rows, row_offset, row_total);
+    if (!kv_expert_loan_) return;
+    std::array<int64_t, 3> sources{source_id, source_id, source_id};
+    for (const auto & bundle : pipeline_bundles_) {
+        if (sources_[bundle[0]]->layer_id_ != layer) continue;
+        if (std::find(bundle.begin(), bundle.end(), source_id) == bundle.end()) continue;
+        sources = {bundle[0], bundle[1], bundle[2]};
+        break;
+    }
+    kv_expert_loan_->next_packet();
+    kv_expert_loan_->speculative_packet(
+        sources, ids.data(), rows, routes, n_experts, row_offset, row_total);
 }
 
 std::shared_ptr<MoeCachedSource> MoeExpertCache::register_source(

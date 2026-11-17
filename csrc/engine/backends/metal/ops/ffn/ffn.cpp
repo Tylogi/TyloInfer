@@ -82,7 +82,8 @@ Tensor qwen_ffn(const FfnWeights& weights, const Tensor& input, const Tensor& bi
             return project(chunk, weights.moe_router);
         });
         auto selected = topk(logits, weights.moe_top_k, routing, bias);
-        tyloi::weights::ExpertBatch batch(weights.gate_up, weights.down, selected.ids);
+        tyloi::weights::ExpertBatch batch(
+            weights.gate_up, weights.down, selected.ids, 0, part.size(0));
         auto shared = shared_ffn(*weights.shared, part, projection_rows);
         ExpertSpec spec{weights.moe_shared_gate, weights.moe_latent_in, weights.moe_latent_out,
                         weights.swiglu_limit, weights.moe_layer, true};

@@ -8,7 +8,8 @@
 namespace tyloi::models {
 namespace {
 
-Tensor routed(const Moe& weights, const Tensor& input, const Tensor& bias) {
+Tensor routed(const Moe& weights, const Tensor& input, const Tensor& bias,
+              std::int64_t row_offset, std::int64_t row_total) {
     auto input_f32 = ops::measure("moe.input_f32", input.device(), [&] {
         return ops::cast(input, kFloat32);
     });
@@ -20,7 +21,8 @@ Tensor routed(const Moe& weights, const Tensor& input, const Tensor& bias) {
     auto selected = ops::measure("moe.topk", input.device(), [&] {
         return ops::topk(logits, weights.top_k, weights.routing, bias);
     });
-    tyloi::weights::ExpertBatch batch(weights.gate_up, weights.down, selected.ids);
+    tyloi::weights::ExpertBatch batch(
+        weights.gate_up, weights.down, selected.ids, row_offset, row_total);
     auto shared = ops::measure("moe.shared", input.device(), [&] {
         return mlp(weights.shared, input);
     });
@@ -56,7 +58,7 @@ Tensor moe(const Moe& weights, const Tensor& input, bool serial_experts) {
         for (const auto& bank : weights.gate_up)
             cached = cached || tyloi::weights::cached(bank);
     }
-    if (!cached) return routed(weights, half, bias);
+    if (!cached) return routed(weights, half, bias, 0, input.size(0));
 
     // Bound cache admission to one token's selected experts.
     std::vector<Tensor> outputs;
@@ -64,7 +66,7 @@ Tensor moe(const Moe& weights, const Tensor& input, bool serial_experts) {
     for (std::int64_t row = 0; row < input.size(0); ++row) {
         auto values = ops::contiguous(ops::slice(half, 0, row, row + 1));
         auto row_bias = bias && bias.dim() == 2 ? ops::slice(bias, 0, row, row + 1) : bias;
-        outputs.push_back(routed(weights, values, row_bias));
+        outputs.push_back(routed(weights, values, row_bias, row, input.size(0)));
     }
     return ops::cat(outputs, 0);
 }

@@ -84,7 +84,7 @@ public:
         if(speculative_rows_)throw std::logic_error("nested KV expert speculation");
         if(rows<1 || rows>tyloi::engine::RouteHistory::max_speculative_rows)
             throw std::invalid_argument("invalid KV expert speculative rows");
-        speculative_keys_.clear();packet_sources_={};packet_masks_.clear();
+        speculative_keys_.clear();packet_sources_={};packet_sources_valid_=false;packet_masks_.clear();
         try {speculative_keys_.reserve(std::max(speculative_keys_.capacity(),lru_.size()+64));}
         catch(const std::bad_alloc&){++speculative_stats_.disabled;return;}
         if(++speculative_epoch_==0) {
@@ -97,9 +97,10 @@ public:
         for(auto it=lru_.rbegin();it!=lru_.rend();++it)it->order=++access_order_;
         speculative_rows_=rows;
     }
-    void speculative_packet(const std::array<int64_t,3>& sources,const int32_t* ids,int rows,int routes,int experts) {
+    void speculative_packet(const std::array<int64_t,3>& sources,const int32_t* ids,int rows,int routes,int experts,
+                            int row_offset=0,int row_total=0) {
         std::lock_guard<std::mutex> lock(mutex_);
-        speculative_packet_locked(sources,ids,rows,routes,experts);
+        speculative_packet_locked(sources,ids,rows,routes,experts,row_offset,row_total);
     }
     void commit_speculative(std::span<const std::uint8_t> keep) {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -159,7 +160,7 @@ public:
             exchange_finished_.wait(lock,[&]{return !exchange_readers_;});
         r.manual_live=rows;if(update_bounds())revoke();
     }
-    void next_packet(const std::array<int64_t,3>& sources={},const int32_t* ids=nullptr,int rows=0,int routes=0,int experts=0) {
+    void next_packet() {
         std::lock_guard<std::mutex> lock(mutex_);
         if(++packet_==0){for(auto& e:lru_){e.packet=0;e.forecast_packet=0;e.last_use_packet=0;}packet_=1;}
         // The next route publication fences readers of the previous packet,
@@ -177,7 +178,6 @@ public:
             if(!entry.retired && !entry.published){entry.published=true;notify_projection(entry,true);}
         }
         pending_publications_.clear();
-        if(ids)speculative_packet_locked(sources,ids,rows,routes,experts);
     }
     // Pin every known member of this packet before an allocation can evict a
     // later routed projection. Actual pin() calls still update LRU recency.
@@ -316,16 +316,42 @@ private:
         if(std::any_of(keep.begin(),keep.end(),[](std::uint8_t value){return value>1;}))
             throw std::invalid_argument("invalid KV expert speculative row mask");
     }
-    void speculative_packet_locked(const std::array<int64_t,3>& sources,const int32_t* ids,int rows,int routes,int experts) {
+    void speculative_packet_locked(const std::array<int64_t,3>& sources,const int32_t* ids,int rows,int routes,int experts,
+                                   int row_offset,int row_total) {
         if(!speculative_rows_)return;
-        if(rows!=speculative_rows_ || !ids || routes<=0 || experts<=0) {disable_speculative();return;}
-        try {packet_masks_.assign(experts,SpeculativeMask{});}
-        catch(const std::bad_alloc&){disable_speculative();return;}
-        packet_sources_=sources;
+        if(row_total==0)row_total=speculative_rows_;
+        if(!ids || rows<=0 || routes<=0 || experts<=0 || row_total!=speculative_rows_ ||
+            row_offset<0 || row_offset>row_total || rows>row_total-row_offset) {disable_speculative();return;}
+        const bool reset_all = !packet_sources_valid_ || packet_sources_!=sources ||
+            packet_masks_.size()!=std::size_t(experts);
+        if(reset_all) {
+            for(const auto& key:speculative_keys_)if(auto found=entries_.find(key);found!=entries_.end()) {
+                found->second->epoch=0;
+                found->second->used_rows={};
+            }
+            speculative_keys_.clear();
+        } else {
+            for(const auto& key:speculative_keys_) {
+                if(std::find(sources.begin(),sources.end(),key[0])==sources.end())continue;
+                if(auto found=entries_.find(key);found!=entries_.end())
+                    for(int row=0;row<rows;++row)found->second->used_rows.reset(std::size_t(row_offset+row));
+            }
+        }
+        try {
+            if(reset_all) {
+                packet_masks_.assign(experts,SpeculativeMask{});
+                packet_sources_=sources;
+                packet_sources_valid_=true;
+            } else {
+                for(auto& mask:packet_masks_)
+                    for(int row=0;row<rows;++row)
+                        mask.reset(std::size_t(row_offset+row));
+            }
+        } catch(const std::bad_alloc&){disable_speculative();return;}
         for(int row=0;row<rows;++row)for(int route=0;route<routes;++route) {
             const auto expert=ids[row*routes+route];
             if(unsigned(expert)<unsigned(experts))
-                packet_masks_[expert].set(std::size_t(row));
+                packet_masks_[expert].set(std::size_t(row_offset+row));
         }
     }
     struct Region {::tyloi::DenseTensor owner;int64_t capacity=0,ratio=1,manual_live=-1;std::size_t row_bytes=0,begin=0,end=0,largest_free=0;bool prefix=false,external=false;std::map<std::size_t,std::size_t> free;};
@@ -336,7 +362,7 @@ private:
         Entry* reuse_prev=nullptr;Entry* reuse_next=nullptr;
         std::unique_ptr<ProjectionLayout> projection;std::size_t exchange_pins=0;};
     void disable_speculative() {
-        speculative_rows_=0;speculative_keys_.clear();packet_sources_={};packet_masks_.clear();++speculative_stats_.disabled;
+        speculative_rows_=0;speculative_keys_.clear();packet_sources_={};packet_sources_valid_=false;packet_masks_.clear();++speculative_stats_.disabled;
     }
     void note_access(Entry& entry,bool fresh=false) {
         if(!reuse_learning_)return;
@@ -419,7 +445,7 @@ private:
             std::fprintf(stderr,"moe_kv_mtp_lru_dispatch enabled=1 rows=%zu window_rows=%d reverted_hits=%llu cold_insertions=%llu\n",
                 accepted_rows,speculative_rows_,static_cast<unsigned long long>(hits),static_cast<unsigned long long>(insertions));
         }
-        speculative_rows_=0;speculative_keys_.clear();packet_sources_={};packet_masks_.clear();
+        speculative_rows_=0;speculative_keys_.clear();packet_sources_={};packet_sources_valid_=false;packet_masks_.clear();
     }
     struct KeyHash {
         std::size_t operator()(const Key& key) const noexcept {
@@ -650,6 +676,7 @@ private:
     uint64_t packet_=1;
     int speculative_rows_=0;uint64_t speculative_epoch_=0,access_order_=0;
     std::array<int64_t,3> packet_sources_{};
+    bool packet_sources_valid_=false;
     std::vector<SpeculativeMask> packet_masks_;
     std::vector<Key> speculative_keys_;
     SpeculativeStats speculative_stats_;

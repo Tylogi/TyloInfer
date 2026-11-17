@@ -5,6 +5,7 @@
 #include "engine/state/kv/view.h"
 #include "engine/state/recurrent/state.h"
 #include "engine/state/media.h"
+#include "engine/state/kv/paged.h"
 #include "engine/models/common/linear.h"
 
 #include <cstdint>
@@ -57,24 +58,31 @@ struct Layout {
 class State : public tyloi::models::State {
 public:
     struct Restore {
+        ~Restore();
+        Restore() = default;
+        Restore(const Restore&) = delete;
+        Restore& operator=(const Restore&) = delete;
+        Restore(Restore&&) noexcept;
+        Restore& operator=(Restore&&) = delete;
         std::vector<LayerState> layers;
+        tyloi::state::PagedKv::Sequence pages;
+        tyloi::state::PagedKv* pool = nullptr;
         std::int64_t cache_pos = 0;
         std::int64_t decode_position_delta = 0;
     };
 
     State(const Model& model, bool transposed);
+    ~State() override;
     State(const State&) = delete;
     State& operator=(const State&) = delete;
-    State(State&&) noexcept = default;
-    State& operator=(State&&) noexcept = default;
 
     void preallocate() override;
     std::vector<std::pair<tyloi::Device, std::size_t>> preallocate_growth() const override;
     std::vector<std::pair<tyloi::Device, std::size_t>> growth(
         const tyloi::models::Input&, const tyloi::models::ForwardOptions&) const override;
     std::vector<std::pair<tyloi::Device, std::size_t>> growth_for(
-        std::int64_t batch, std::int64_t tokens, const tyloi::models::ForwardOptions&,
-        bool paged = false) const;
+        std::int64_t batch, std::int64_t tokens,
+        const tyloi::models::ForwardOptions&) const;
     void reset(std::int64_t new_batch) override;
     tyloi::engine::Metrics metrics() const override;
     std::int64_t position() const noexcept override { return cache_pos; }
@@ -86,6 +94,14 @@ public:
     std::int64_t confirmed_prefix() const noexcept override { return speculative_confirmed; }
     std::int64_t rewind(std::int64_t accepted_suffix);
     void abort_speculative() noexcept;
+    bool retains_partial_prefix(std::int64_t accepted) const noexcept override {
+        return speculative_start >= 0 && accepted >= 0 &&
+               speculative_start + speculative_confirmed + accepted <= cache_pos;
+    }
+
+    // A batch borrows one shared physical pool; this State owns its Sequence.
+    void bind_pages(tyloi::state::PagedKv& pool);
+    void prepare_pages(std::int64_t end);
 
     std::vector<::tyloi::Tensor*> graph_state() override;
     std::vector<::tyloi::Tensor> storage() const override;
@@ -116,11 +132,13 @@ public:
 private:
     std::vector<std::pair<tyloi::Device, std::size_t>> growth_for(
         std::int64_t batch, std::int64_t tokens, const tyloi::models::Input&,
-        const tyloi::models::ForwardOptions&, bool paged) const;
+        const tyloi::models::ForwardOptions&) const;
     const Model* owner_;
     std::vector<Layout> layout_;
     std::int64_t max_position_embeddings_;
     bool transposed_;
+    tyloi::state::PagedKv* paged_kv_ = nullptr;
+    tyloi::state::PagedKv::Sequence pages_;
 };
 
 } // namespace tyloi::models::qwen35

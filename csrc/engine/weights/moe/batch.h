@@ -11,7 +11,8 @@ namespace tyloi::weights {
 // Preparation and consumption require the same execution scope.
 class ExpertBatch {
 public:
-    ExpertBatch(std::span<const Tensor> gate_up, const Tensor& down, const Tensor& ids);
+    ExpertBatch(std::span<const Tensor> gate_up, const Tensor& down, const Tensor& ids,
+                std::int64_t row_offset, std::int64_t row_total);
     ~ExpertBatch();
     ExpertBatch(ExpertBatch&&) noexcept;
     ExpertBatch& operator=(ExpertBatch&&) noexcept;

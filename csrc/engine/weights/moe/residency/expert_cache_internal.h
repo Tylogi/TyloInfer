@@ -21,6 +21,7 @@ struct MoeScratch;
 struct CudaProfiler;
 class MoePinnedExpertArena;
 struct MoeSsdPrefillReader;
+struct MoeRoutePlan;
 class MoeExpertCache {
 public:
     struct PrefillCopySubmission {
@@ -661,7 +662,13 @@ public:
         route_readback_pending_ = true;
     }
 
-    std::vector<int32_t> read_route_experts(
+    // Route readback is the one point where the selected IDs are both real
+    // host values and still ahead of expert preparation.  Publish that exact
+    // row window to learning and KV reuse without entering after-layer policy.
+    void observe_route(int source_id, int layer, const MoeRoutePlan & route,
+                       std::span<const int32_t> ids, int n_experts);
+
+    std::vector<int32_t> read_route_ids(
             const MoeRoutePlan & route,
             int n_experts) {
         const MfqCudaGuard guard(owner_device_);
@@ -686,10 +693,6 @@ public:
             route_host_.data_ptr<int32_t>();
         std::vector<int32_t> result(
             values, values + count);
-        std::sort(result.begin(), result.end());
-        result.erase(
-            std::unique(result.begin(), result.end()),
-            result.end());
         for (int expert : result) {
             if (expert < 0 || expert >= n_experts) {
                 throw std::runtime_error(

@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <span>
 #include <stdexcept>
 #include <vector>
@@ -40,7 +41,8 @@ public:
             histories_.push_back({bundle.verified,
                 std::vector<float>(std::size_t(bundle.experts)),
                 std::vector<float>(std::size_t(bundle.experts)), {},
-                std::vector<std::uint64_t>((std::size_t(bundle.experts) + 63) / 64)});
+                std::vector<std::uint64_t>((std::size_t(bundle.experts) + 63) / 64),
+                {}});
         }
     }
 
@@ -52,23 +54,42 @@ public:
         for (auto& history : histories_) {
             history.ids.clear();
             history.rows = 0;
+            history.routes = 0;
+            history.published.clear();
         }
         pending_rows_ = rows;
     }
     bool pending() const noexcept { return pending_rows_ != 0; }
 
     void observe(std::size_t bundle, std::span<const int32_t> ids, int rows,
-                 bool independent_sequences = false) {
+                 bool independent_sequences = false, int row_offset = 0,
+                 int row_total = 0) {
         auto& history = histories_.at(bundle);
         const bool deferred = pending() && history.verified;
-        if (deferred && (independent_sequences || rows < 1 || rows > pending_rows_ || ids.size() % rows))
+        if (deferred && (independent_sequences || rows < 1 || rows > pending_rows_ ||
+                         ids.size() % std::size_t(rows)))
             throw std::logic_error("speculative routes do not describe one aligned sequence");
         validate_experts(history, ids);
         if (deferred) {
-            // Graph setup can publish a layer repeatedly; only the latest
-            // complete route publication counts.
-            history.ids.assign(ids.begin(), ids.end());
-            history.rows = rows;
+            if (row_total == 0) row_total = pending_rows_;
+            if (row_offset < 0 || row_total != pending_rows_ ||
+                row_offset > row_total || rows > row_total - row_offset)
+                throw std::logic_error("speculative route row coordinates are not aligned");
+            const auto routes = ids.size() / std::size_t(rows);
+            if (routes == 0 || routes > std::size_t(std::numeric_limits<int>::max()))
+                throw std::logic_error("speculative route width is out of range");
+            if (!history.rows) {
+                history.rows = row_total;
+                history.routes = static_cast<int>(routes);
+                history.ids.assign(std::size_t(row_total) * routes, -1);
+                history.published.assign(std::size_t(row_total), std::uint8_t(0));
+            } else if (history.rows != row_total || history.routes != static_cast<int>(routes)) {
+                throw std::logic_error("speculative route publication geometry changed");
+            }
+            std::copy(ids.begin(), ids.end(), history.ids.begin() +
+                std::size_t(row_offset) * routes);
+            std::fill(history.published.begin() + row_offset,
+                      history.published.begin() + row_offset + rows, std::uint8_t(1));
         } else {
             for (const auto expert : ids)
                 history.observations[expert] += 1.0f;
@@ -86,11 +107,11 @@ public:
             if (!keep[std::size_t(row)]) continue;
             for (std::size_t bundle = 0; bundle < histories_.size(); ++bundle) {
                 const auto& history = histories_[bundle];
-                if (!history.rows || row >= history.rows)
+                if (!history.rows || row >= history.rows ||
+                    (!history.published.empty() && !history.published[std::size_t(row)]))
                     continue;
-                const auto routes = history.ids.size() / history.rows;
-                for (std::size_t route = 0; route < routes; ++route)
-                    accepted_.push_back({bundle, history.ids[std::size_t(row) * routes + route]});
+                for (int route = 0; route < history.routes; ++route)
+                    accepted_.push_back({bundle, history.ids[std::size_t(row) * history.routes + route]});
             }
         }
         return accepted_;
@@ -104,16 +125,16 @@ public:
         for (auto& history : histories_) {
             if (!history.rows)
                 continue;
-            const auto routes = history.ids.size() / history.rows;
             std::size_t count = 0;
             if (mode_ != HeatMode::count)
                 std::fill(history.seen.begin(), history.seen.end(), std::uint64_t(0));
             std::size_t distinct = 0;
             for (int row = 0; row < pending_rows_; ++row) {
                 if (!keep[std::size_t(row)]) continue;
-                if (row >= history.rows) continue;
-                for (std::size_t route = 0; route < routes; ++route) {
-                    const auto expert = unsigned(history.ids[std::size_t(row) * routes + route]);
+                if (row >= history.rows || (!history.published.empty() &&
+                    !history.published[std::size_t(row)])) continue;
+                for (int route = 0; route < history.routes; ++route) {
+                    const auto expert = unsigned(history.ids[std::size_t(row) * history.routes + route]);
                     ++count;
                     if (mode_ != HeatMode::count) {
                         auto& word = history.seen[expert / 64];
@@ -130,9 +151,10 @@ public:
                 ? float(count) / float(distinct) : 1.0f;
             for (int row = 0; row < pending_rows_; ++row) {
                 if (!keep[std::size_t(row)]) continue;
-                if (row >= history.rows) continue;
-                for (std::size_t route = 0; route < routes; ++route) {
-                    const auto expert = unsigned(history.ids[std::size_t(row) * routes + route]);
+                if (row >= history.rows || (!history.published.empty() &&
+                    !history.published[std::size_t(row)])) continue;
+                for (int route = 0; route < history.routes; ++route) {
+                    const auto expert = unsigned(history.ids[std::size_t(row) * history.routes + route]);
                     if (mode_ != HeatMode::count) {
                         auto& word = history.seen[expert / 64];
                         const auto bit = std::uint64_t(1) << (expert % 64);
@@ -145,7 +167,8 @@ public:
             }
             result.routes += count;
             result.heat_routes += distinct;
-            discarded_ += history.ids.size() - count;
+            discarded_ += std::size_t(std::count(history.published.begin(), history.published.end(),
+                                                 std::uint8_t(1))) * history.routes - count;
         }
         observed_ += result.routes;
         committed_ += result.routes;
@@ -159,9 +182,12 @@ public:
         if (!pending())
             return;
         for (auto& history : histories_) {
-            discarded_ += history.ids.size();
+            discarded_ += std::size_t(std::count(history.published.begin(), history.published.end(),
+                                                 std::uint8_t(1))) * history.routes;
             history.ids.clear();
             history.rows = 0;
+            history.routes = 0;
+            history.published.clear();
         }
         ++cancels_;
         pending_rows_ = 0;
@@ -212,7 +238,8 @@ private:
         std::vector<float> heat, observations;
         std::vector<int32_t> ids;
         std::vector<std::uint64_t> seen;
-        int rows = 0;
+        std::vector<std::uint8_t> published;
+        int rows = 0, routes = 0;
     };
 
     static void validate_experts(const History& history, std::span<const int32_t> ids) {
@@ -235,6 +262,11 @@ private:
             if (history.rows)
                 for (std::size_t row = std::size_t(history.rows); row < keep.size(); ++row)
                     if (keep[row])
+                        throw std::logic_error("speculative route publication lost row alignment");
+        for (const auto& history : histories_)
+            if (history.rows && !history.published.empty())
+                for (std::size_t row = 0; row < keep.size(); ++row)
+                    if (keep[row] && !history.published[row])
                         throw std::logic_error("speculative route publication lost row alignment");
     }
 

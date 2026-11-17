@@ -1,105 +1,47 @@
 #pragma once
 
+#include "engine/models/batch.h"
 #include "engine/models/qwen35/model.h"
 #include "engine/models/qwen35/state.h"
-#include "engine/models/batch.h"
 #include "engine/state/kv/paged.h"
-
-#include <cstdint>
-#include <memory>
-#include <string>
-#include <variant>
-#include <vector>
 
 namespace tyloi::models::qwen35 {
 
-// A copyable snapshot is only needed for paused recurrent decode rows. KV state
-// remains owned by the aggregate state and is copied into its stable slot in place.
-struct BatchState {
-    std::int64_t batch = 0;
-    std::vector<std::variant<tyloi::state::KvView, tyloi::state::Recurrent::State>> layers;
-};
+class Batch : public models::Batch {
+public:
+    Batch(const Model&, BatchConfig);
+    BatchGrowth initial_growth_bytes() const override;
+    void initialize() override;
+    bool supports_sessions() const noexcept override { return true; }
+    bool supports_mtp() const noexcept override { return model_.supports_speculation(); }
+    bool supports_packed() const override { return true; }
+    std::unique_ptr<models::BatchState> make_state(std::int64_t prompt) override;
+    void activate(models::BatchState&) override;
+    void release(models::BatchState&) override;
+    BatchGrowth decode_growth(std::span<const BatchRow>) const override;
+    void prepare_decode(std::span<const BatchRow>) override;
+    std::size_t prefill_row_bytes() const override;
+    StepSequence<std::vector<Decoded>> prefill(std::vector<models::BatchState*>, std::vector<Tensor>) override;
+    StepSequence<std::vector<Decoded>> verify(std::vector<models::BatchState*>, std::vector<Tensor>) override;
+    Tensor decode(std::span<const BatchRow>, Tensor ids, const Tensor& host_ids) override;
+    StepSequence<std::unique_ptr<Plan>> plan(std::span<const BatchRow>, bool) override { return {}; }
+    StepSequence<std::optional<Tensor>> capture(std::span<const BatchRow>, const Tensor&,
+        const Tensor&, bool, const Plan&) override { return {}; }
+    void clear() override {}
+    engine::Metrics metrics() const override;
 
-// A request owns its prefill state. The batch only copies state
-// into a stable decode slot; immutable weights are shared by every request.
-class RequestState {
-  public:
-    RequestState() = default;
-    RequestState(const RequestState &) = delete;
-    RequestState &operator=(const RequestState &) = delete;
-    std::int32_t slot() const noexcept { return slot_; }
-    qwen35::State &state() noexcept { return *state_; }
-    const qwen35::State &state() const noexcept { return *state_; }
-    bool initialized() const noexcept { return bool(state_); }
-
-  private:
-    friend class Batch;
-    std::unique_ptr<qwen35::State> state_;
-    tyloi::state::PagedKv::Sequence pages_;
-    std::int32_t slot_ = -1;
-};
-
-class Batch {
-  public:
-    struct Options {
-        std::size_t slots = 0;
-        bool paged = false;
-        bool preallocate = false;
-        bool cpu_offload = false;
-        int cached_slots = 0;
-    };
-
-    // The model must outlive the batch.
-    Batch(const Model &weights, bool transposed, Options options);
-    Batch(const Batch &) = delete;
-    Batch &operator=(const Batch &) = delete;
-    ~Batch();
-
-    static BatchGrowth construction_growth(const Model&, Options);
-    BatchGrowth request_growth(const RequestState&, std::int64_t tokens) const;
-    BatchGrowth activate_growth(const RequestState&, const ForwardOptions&) const;
-    BatchGrowth decode_growth(std::span<const std::pair<const RequestState*, std::int64_t>>) const;
-
-    bool has_moe() const;
+protected:
+    std::vector<State*> active(std::span<const BatchRow>) const;
     bool has_cached_moe() const;
-    static bool has_cached_moe(const Model &model);
-    bool paged_kv_enabled() const noexcept;
-    tyloi::state::PagedKv::Stats paged_kv_stats() const noexcept;
-    std::int64_t slot_releases() const noexcept { return slot_releases_; }
+    const Model& model_;
+    BatchConfig config_;
 
-    void prepare_prefill(RequestState &request, std::int64_t offset, std::int64_t tokens);
-    void activate(RequestState &request);
-    void resume_decode(std::int64_t cache_position);
-    void release(RequestState &request);
-    void finish_retire(std::int64_t cache_position);
-    void ensure_decode_tokens(const RequestState &request, std::int64_t tokens);
-    void prepare_decode(std::int64_t cache_position);
-    void finish_decode(std::int64_t cache_position);
-
-    BatchState capture_recurrent_slots(const std::vector<std::int32_t> &slots) const;
-    void restore_recurrent_slots(const std::vector<std::int32_t> &slots,
-                                 const BatchState &state);
-
-    qwen35::State &state() noexcept { return *state_; }
-    const qwen35::State &state() const noexcept { return *state_; }
-
-  private:
-    void copy_to_slot(qwen35::State &target, const qwen35::State &source,
-                      std::int64_t slot) const;
-    void bind_paged(qwen35::State &state,
-                    const std::vector<const tyloi::state::PagedKv::Sequence *> &sequences);
-    void bind_paged_slots();
-    void detach_paged(qwen35::State &state) noexcept;
-    std::string incompatibility(bool cpu_offload, int cached_slots) const;
-
-    const Model &weights_;
-    const bool transposed_;
-    std::unique_ptr<qwen35::State> state_;
-    std::vector<RequestState *> slots_;
-    std::int64_t slot_releases_ = 0;
-    bool page_table_dirty_ = false;
-    std::unique_ptr<tyloi::state::PagedKv> paged_kv_;
-    std::vector<tyloi::state::PagedKv::Sequence> paged_slots_;
+private:
+    class Request;
+    Request& request(models::BatchState&) const;
+    StepSequence<std::vector<Decoded>> forward(std::vector<models::BatchState*>, std::vector<Tensor>, bool verify);
+    std::unique_ptr<state::PagedKv> pages_;
+    std::int64_t releases_ = 0;
 };
 
 } // namespace tyloi::models::qwen35

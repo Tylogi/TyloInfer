@@ -5,15 +5,9 @@
 #include "engine/models/qwen35/mtp_state.h"
 #include "engine/models/common/mtp.h"
 
-#include <functional>
 #include <memory>
 
 namespace tyloi::models::qwen35 {
-
-class State;
-class Mtp;
-
-void restore_session(State&, tyloi::models::Mtp*, const TextSessionState&, const std::function<void()>&);
 
 class Mtp final : public tyloi::models::Mtp {
 public:
@@ -29,6 +23,9 @@ public:
     // The caller owns the predictor execution scope.
     tyloi::models::MtpStep step(tyloi::models::MtpState& state, const ::tyloi::Tensor& hidden,
         const ::tyloi::Tensor& next_ids, const ::tyloi::Tensor& positions = {},
+        const tyloi::models::ForwardOptions& options = {}) const override;
+    std::vector<tyloi::models::MtpStep> batch_step(
+        std::span<const tyloi::models::MtpRow>,
         const tyloi::models::ForwardOptions& options = {}) const override;
 
     void trim_cache_to(tyloi::models::MtpState& state, int64_t position) const override;

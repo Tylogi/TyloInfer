@@ -1,4 +1,5 @@
 #include "engine/models/qwen35/model.h"
+#include "engine/models/qwen35/forward.h"
 #include "engine/models/qwen35/state.h"
 #include "engine/models/common/ffn.h"
 
@@ -20,6 +21,12 @@ Tensor normalize_ids(Tensor ids, Device primary) {
     if (ids.dim() == 1) ids = ops::unsqueeze(ids, 0);
     require_forward(ids.size(0) > 0 && ids.size(1) > 0, "token IDs must not be empty");
     return ops::contiguous(ops::copy(ops::cast(ids, kInt64), primary));
+}
+
+const ops::RopeTable& rope_for(const Model& model, const Layer& layer) {
+    if (layer.device.is_cpu()) return model.cpu_rope;
+    const auto found=model.device_ropes.find(layer.device.index);
+    return found==model.device_ropes.end() ? model.rope : found->second;
 }
 
 models::AttentionStep layer_step(const Layer& layer, const models::AttentionStep& step) {
@@ -50,9 +57,88 @@ void clear_linear_speculative(LinearState& state) noexcept {
     state.mixer.commit();
 }
 
+struct PreparedRow {
+    State* state = nullptr;
+    models::Input input;
+    Tensor embeddings;
+    models::AttentionStep step;
+    std::int64_t batch = 0;
+    std::int64_t tokens = 0;
+};
+
+PreparedRow prepare_row(const Model& model, ForwardRow row,
+                        const models::ForwardOptions& options, bool prepare_pages) {
+    require_forward(row.state != nullptr, "Qwen3.5 forward row has no state");
+    require_forward(row.state->belongs_to(model),
+                    "Qwen3.5 state belongs to another model");
+    auto& state = *row.state;
+    auto input = std::move(row.input);
+    require_forward(!input.suffix, "Qwen3.5 does not support speculative suffix forwarding");
+    const Device primary{model.device.type, options.primary};
+    const auto [B, T] = input.shape();
+    auto ids = input.ids && input.ids.defined() ? normalize_ids(input.ids, primary) : Tensor{};
+    auto embeddings = input.embeddings && input.embeddings.defined()
+        ? input.embeddings
+        : model.embedding(ids, options.primary);
+    require_forward(embeddings.dim() == 3 && embeddings.size(0) == B &&
+                        embeddings.size(1) == T && embeddings.size(2) == model.metadata.hidden_size,
+                    "inputs_embeds shape must match [batch,tokens,hidden_size]");
+    require_forward(B > 0 && T > 0, "Qwen3.5 input batch and tokens must be positive");
+    require_forward(input.confirmed >= 0 &&
+        (input.confirmed == 0 || (input.confirmed < T && B == 1 && state.cache_pos > 0 &&
+         !input.positions && !input.cache_positions && model.supports_speculation())),
+        "unsupported speculative backbone geometry");
+    require_forward(state.speculative_start < 0,
+                    "commit or roll back the pending speculative pass before forwarding");
+    require_forward(state.cache_pos + T <= model.metadata.max_position_embeddings,
+                    "Qwen3.5 history exceeds context capacity");
+    if (state.cache_pos == 0) state.reset(B);
+    else require_forward(state.batch == B, "Qwen3.5 cache batch does not match input batch");
+    if (prepare_pages) state.prepare_pages(state.cache_pos + T);
+    if (input.lengths)
+        require_forward(input.lengths.dim() == 1 && input.lengths.size(0) == B,
+                        "sequence lengths must have shape [batch]");
+    auto physical = input.cache_positions
+        ? ops::copy(ops::cast(input.cache_positions, kInt64), primary)
+        : ops::arange(state.cache_pos, state.cache_pos + T, primary);
+    physical = ops::contiguous(physical);
+    require_forward((physical.dim() == 1 && physical.numel() == T) ||
+                    (physical.dim() == 2 && physical.size(0) == B && physical.size(1) == T),
+                    "cache_positions must have shape [tokens] or [batch,tokens]");
+    const bool has_mrope = model.rope.sections && model.rope.sections.numel() > 0;
+    auto semantic = input.positions
+        ? ops::copy(ops::cast(input.positions, kInt64), primary)
+        : (state.decode_position_delta == 0 ? physical
+                                            : ops::add(physical, state.decode_position_delta));
+    semantic = ops::contiguous(semantic);
+    const auto rank = semantic.dim();
+    require_forward(Config::valid_positions(rank, rank > 1 ? semantic.size(0) : 0,
+                                           semantic.size(-1), B, T, has_mrope),
+                    "position_ids must have shape [tokens], [batch,tokens], or configured grid-MRoPE [3,tokens]");
+    Tensor lengths;
+    if (input.lengths) lengths = ops::contiguous(ops::copy(ops::cast(input.lengths, kInt64), primary));
+    else if (state.cache_pos > 0 && T == 1) {
+        const std::array<std::int64_t, 1> shape{B};
+        lengths = ops::full(shape, state.cache_pos + 1, primary);
+    }
+    models::AttentionStep step{semantic, lengths,
+        has_mrope || input.positions || input.cache_positions ? physical : Tensor{},
+        state.cache_pos, input.kv_length, input.attention_parts};
+    if (input.confirmed > 0) {
+        state.speculative_start = state.cache_pos;
+        state.speculative_confirmed = input.confirmed;
+    }
+    return {&state, std::move(input), std::move(embeddings), std::move(step), B, T};
+}
+
+struct AttentionResult {
+    Tensor residual;
+    Tensor output;
+};
+
 } // namespace
 
-static Tensor forward_layer(const Layer& layer, LayerState& state, Tensor input,
+static AttentionResult forward_attention(const Layer& layer, LayerState& state, Tensor input,
                      const ::tyloi::models::AttentionStep& step, std::int64_t confirmed_prefix,
                      const tyloi::ops::RopeTable& rope,
                      const models::ForwardOptions& options, bool transposed) {
@@ -82,11 +168,7 @@ static Tensor forward_layer(const Layer& layer, LayerState& state, Tensor input,
         cache->quantization = attention.kv_quantization;
         auto output = attention.forward(input, local_step, *cache,
                                         rope, trace);
-        return ::tyloi::models::full_ffn(
-            full->ffn, full->ffn_norm, output[0], output[1],
-            attention.rms_norm_eps, attention.norm_weight_offset,
-            attention.official_bf16, attention.attention_output_gate, trace,
-            options.serial_experts);
+        return {std::move(output[0]), std::move(output[1])};
     }
     const auto* linear = std::get_if<Linear>(&layer.weights);
     auto* linear_state = std::get_if<LinearState>(&state);
@@ -111,15 +193,7 @@ static Tensor forward_layer(const Layer& layer, LayerState& state, Tensor input,
     try {
         auto output = linear->attention.forward(
             input, linear_view, captured);
-        auto result = ::tyloi::models::linear_ffn(
-            linear->ffn, linear->ffn_norm, std::move(output[0]), std::move(output[1]),
-            attention.rms_norm_eps, attention.norm_weight_offset,
-            options.serial_experts);
-        if (confirmed_prefix > 0) {
-            ++linear_state->speculative_projection_batches;
-            ++linear_state->speculative_ffn_batches;
-        }
-        return result;
+        return {std::move(output[0]), std::move(output[1])};
     } catch (...) {
         if (confirmed_prefix > 0) {
             linear_state->mixer.abort();
@@ -129,87 +203,165 @@ static Tensor forward_layer(const Layer& layer, LayerState& state, Tensor input,
     }
 }
 
+static Tensor finish_layer(const Layer& layer, AttentionResult attention,
+                           const models::ForwardOptions& options) {
+    ops::DeviceScope scope(layer.device);
+    const auto* full = std::get_if<Full>(&layer.weights);
+    if (full != nullptr) {
+        const auto* trace = options.trace_layer >= 0 &&
+                                    options.trace_layer == full->attention.layer
+                                ? options.trace
+                                : nullptr;
+        return ::tyloi::models::full_ffn(
+            full->ffn, full->ffn_norm, std::move(attention.residual),
+            std::move(attention.output), full->attention.rms_norm_eps,
+            full->attention.norm_weight_offset, full->attention.official_bf16,
+            full->attention.attention_output_gate, trace, options.serial_experts);
+    }
+    const auto* linear = std::get_if<Linear>(&layer.weights);
+    require_forward(linear != nullptr, "Qwen3.5 layer weight kind mismatch");
+    return ::tyloi::models::linear_ffn(
+        linear->ffn, linear->ffn_norm, std::move(attention.residual),
+        std::move(attention.output), linear->attention.rms_norm_eps,
+        linear->attention.norm_weight_offset, options.serial_experts);
+}
+
 Tensor Model::forward(models::Input input, models::State& value, const models::ForwardOptions& options) const {
     auto* selected = dynamic_cast<State*>(&value);
     require_forward(selected && selected->belongs_to(*this), "Qwen3.5 state belongs to another model");
-    auto& state = *selected;
-    require_forward(!input.suffix, "Qwen3.5 does not support speculative suffix forwarding");
     const Device primary{device.type, options.primary};
     ops::DeviceScope scope(primary);
-    auto ids = normalize_ids(input.ids, primary);
-    const auto B = ids.size(0);
-    const auto T = ids.size(1);
-    auto embeddings = input.embeddings ? input.embeddings : embedding(ids, options.primary);
-    require_forward(embeddings.dim() == 3 && embeddings.size(0) == B &&
-                        embeddings.size(1) == T && embeddings.size(2) == metadata.hidden_size,
-                    "inputs_embeds shape must match [batch,tokens,hidden_size]");
-    require_forward(input.confirmed >= 0 &&
-        (input.confirmed == 0 || (input.confirmed < T && B == 1 && state.cache_pos > 0 &&
-         !input.positions && !input.cache_positions && supports_speculation())),
-        "unsupported speculative backbone geometry");
-    require_forward(state.speculative_start < 0,
-                    "commit or roll back the pending speculative pass before forwarding");
-    require_forward(state.cache_pos + T <= metadata.max_position_embeddings,
-                    "Qwen3.5 history exceeds context capacity");
-    if (state.cache_pos == 0) state.reset(B);
-    else require_forward(state.batch == B, "Qwen3.5 cache batch does not match input batch");
-    if (input.lengths)
-        require_forward(input.lengths.dim() == 1 && input.lengths.size(0) == B,
-                        "sequence lengths must have shape [batch]");
-    auto physical = input.cache_positions
-        ? ops::copy(ops::cast(input.cache_positions, kInt64), primary)
-        : ops::arange(state.cache_pos, state.cache_pos + T, primary);
-    physical = ops::contiguous(physical);
-    require_forward((physical.dim() == 1 && physical.numel() == T) ||
-                    (physical.dim() == 2 && physical.size(0) == B && physical.size(1) == T),
-                    "cache_positions must have shape [tokens] or [batch,tokens]");
-    auto semantic = input.positions ? ops::copy(ops::cast(input.positions, kInt64), primary)
-        : (state.decode_position_delta == 0 ? physical : ops::add(physical, state.decode_position_delta));
-    semantic = ops::contiguous(semantic);
-    const auto rank = semantic.dim();
-    const bool has_mrope = rope.sections && rope.sections.numel() > 0;
-    require_forward(Config::valid_positions(rank, rank > 1 ? semantic.size(0) : 0,
-                                           semantic.size(-1), B, T, has_mrope),
-                    "position_ids must have shape [tokens], [batch,tokens], or configured grid-MRoPE [3,tokens]");
-    Tensor lengths;
-    if (input.lengths) lengths = ops::contiguous(ops::copy(ops::cast(input.lengths, kInt64), primary));
-    else if (state.cache_pos > 0 && T == 1) {
-        const std::array<std::int64_t, 1> shape{B};
-        lengths = ops::full(shape, state.cache_pos + 1, primary);
-    }
-    models::AttentionStep step{semantic, lengths,
-        has_mrope || input.positions || input.cache_positions ? physical : Tensor{},
-        state.cache_pos, input.kv_length, input.attention_parts};
-    auto hidden = ops::contiguous(ops::copy(embeddings, primary));
+    auto prepared = prepare_row(*this, ForwardRow{selected, std::move(input)}, options, true);
+    auto& state = *prepared.state;
+    auto hidden = ops::contiguous(ops::copy(prepared.embeddings, primary));
     auto snapshot = [&](const Tensor& value) {
         return ops::clone(ops::contiguous(ops::cast(ops::copy(value, primary), kFloat32)));
     };
-    if (input.trace) input.trace->push_back(snapshot(hidden));
-    if (input.confirmed > 0) {
-        state.speculative_start = state.cache_pos;
-        state.speculative_confirmed = input.confirmed;
-    }
+    if (prepared.input.trace) prepared.input.trace->push_back(snapshot(hidden));
     try {
         for (std::size_t index = 0; index < layers.size(); ++index) {
             const auto& layer = layers[index];
-            const auto* active_rope = layer.device.is_cpu() ? &cpu_rope : &rope;
-            if (!layer.device.is_cpu() && !device_ropes.empty()) {
-                const auto it = device_ropes.find(layer.device.index);
-                if (it != device_ropes.end()) active_rope = &it->second;
+            auto attention = forward_attention(layer, state.layers[index], hidden,
+                                               prepared.step, prepared.input.confirmed,
+                                               rope_for(*this,layer), options, state.transposed());
+            hidden = finish_layer(layer, std::move(attention), options);
+            if (std::get_if<Linear>(&layer.weights) != nullptr && prepared.input.confirmed > 0) {
+                auto& linear = std::get<LinearState>(state.layers[index]);
+                ++linear.speculative_projection_batches;
+                ++linear.speculative_ffn_batches;
             }
-            hidden = forward_layer(layer, state.layers[index], hidden, step, input.confirmed,
-                                   *active_rope, options, state.transposed());
-            if (input.trace) input.trace->push_back(snapshot(hidden));
+            if (prepared.input.trace) prepared.input.trace->push_back(snapshot(hidden));
         }
     } catch (...) {
         state.abort_speculative();
         throw;
     }
-    if (!input.positions || input.advance) state.cache_pos += T;
+    if (!prepared.input.positions || prepared.input.advance) state.cache_pos += prepared.tokens;
     hidden = ops::contiguous(ops::copy(hidden, primary));
-    auto finalized = normalize(hidden, B, T);
-    if (input.raw_hidden) *input.raw_hidden = std::move(hidden);
+    auto finalized = normalize(hidden, prepared.batch, prepared.tokens);
+    if (prepared.input.raw_hidden) *prepared.input.raw_hidden = std::move(hidden);
     return finalized;
+}
+
+StepSequence<std::vector<models::Decoded>> forward_batch(
+    const Model& model, std::vector<ForwardRow> rows,
+    const models::ForwardOptions& options, bool advance) {
+    require_forward(!rows.empty(), "Qwen3.5 packed forward requires at least one row");
+    const Device primary{model.device.type, options.primary};
+    ops::DeviceScope scope(primary);
+    std::vector<PreparedRow> prepared;
+    try {
+        prepared.reserve(rows.size());
+        for (auto& row : rows) {
+            auto value = prepare_row(model, std::move(row), options, advance);
+            require_forward(value.batch == 1,
+                            "Qwen3.5 packed forward requires B=1 rows");
+            prepared.push_back(std::move(value));
+        }
+
+        std::vector<Tensor> hidden;
+        hidden.reserve(prepared.size());
+        for (auto& row : prepared)
+            hidden.push_back(ops::contiguous(ops::copy(row.embeddings, primary)));
+        const auto snapshot = [&](const Tensor& value) {
+            return ops::clone(ops::contiguous(ops::cast(ops::copy(value, primary), kFloat32)));
+        };
+        for (std::size_t row_index = 0; row_index < prepared.size(); ++row_index)
+            if (prepared[row_index].input.trace)
+                prepared[row_index].input.trace->push_back(snapshot(hidden[row_index]));
+
+        std::vector<std::int64_t> offsets(prepared.size() + 1, 0);
+        for (std::size_t index = 0; index < prepared.size(); ++index)
+            offsets[index + 1] = offsets[index] + prepared[index].tokens;
+
+        for (std::size_t layer_index = 0; layer_index < model.layers.size(); ++layer_index) {
+            co_yield LayerEvent{LayerEvent::Phase::begin, LayerEvent::Mode::packed};
+            const auto& layer = model.layers[layer_index];
+            ops::DeviceScope layer_scope(layer.device);
+            const auto& rope=rope_for(model,layer);
+            std::vector<Tensor> residuals;
+            std::vector<Tensor> attention_outputs;
+            residuals.reserve(prepared.size());
+            attention_outputs.reserve(prepared.size());
+            for (std::size_t row_index = 0; row_index < prepared.size(); ++row_index) {
+                auto attention = forward_attention(
+                    layer, prepared[row_index].state->layers[layer_index],
+                    std::move(hidden[row_index]), prepared[row_index].step,
+                    prepared[row_index].input.confirmed, rope, options,
+                    prepared[row_index].state->transposed());
+                residuals.push_back(std::move(attention.residual));
+                attention_outputs.push_back(std::move(attention.output));
+            }
+            auto packed_attention = AttentionResult{
+                residuals.size() == 1 ? std::move(residuals.front()) : ops::cat(residuals, 1),
+                attention_outputs.size() == 1 ? std::move(attention_outputs.front())
+                                              : ops::cat(attention_outputs, 1)};
+            auto packed = finish_layer(layer, std::move(packed_attention), options);
+            if (std::get_if<Linear>(&layer.weights) != nullptr) {
+                for (auto& row : prepared) {
+                    if (row.input.confirmed == 0) continue;
+                    auto& linear = std::get<LinearState>(row.state->layers[layer_index]);
+                    ++linear.speculative_projection_batches;
+                    ++linear.speculative_ffn_batches;
+                }
+            }
+            for (std::size_t row_index = 0; row_index < prepared.size(); ++row_index) {
+                hidden[row_index] = ops::slice(
+                    packed, 1, offsets[row_index], offsets[row_index + 1]);
+                if (prepared[row_index].input.trace)
+                    prepared[row_index].input.trace->push_back(snapshot(hidden[row_index]));
+            }
+            co_yield LayerEvent{LayerEvent::Phase::end, LayerEvent::Mode::packed};
+        }
+
+        for (auto& row : prepared) {
+            if (advance && (!row.input.positions || row.input.advance))
+                row.state->cache_pos += row.tokens;
+        }
+        std::vector<Tensor> packed_parts;
+        packed_parts.reserve(hidden.size());
+        for (auto& value : hidden) packed_parts.push_back(std::move(value));
+        auto raw_packed = packed_parts.size() == 1 ? std::move(packed_parts.front())
+                                                   : ops::cat(packed_parts, 1);
+        raw_packed = ops::contiguous(ops::copy(raw_packed, primary));
+        auto finalized = model.normalize(raw_packed, 1, offsets.back());
+        std::vector<models::Decoded> result;
+        result.reserve(prepared.size());
+        for (std::size_t row_index = 0; row_index < prepared.size(); ++row_index) {
+            models::Decoded decoded;
+            decoded.hidden = ops::slice(finalized, 1, offsets[row_index], offsets[row_index + 1]);
+            decoded.raw = ops::slice(raw_packed, 1, offsets[row_index], offsets[row_index + 1]);
+            if (prepared[row_index].input.raw_hidden) {
+                *prepared[row_index].input.raw_hidden = decoded.raw;
+            }
+            result.push_back(std::move(decoded));
+        }
+        co_yield std::move(result);
+    } catch (...) {
+        for (auto& row : prepared)
+            if (row.state) row.state->abort_speculative();
+        throw;
+    }
 }
 
 bool Model::supports_speculation() const noexcept {

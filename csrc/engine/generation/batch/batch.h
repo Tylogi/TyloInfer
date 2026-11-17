@@ -81,9 +81,10 @@ template <class Ops> class ContinuousBatch : public Batch {
         }
     };
     int64_t prefill_chunk_size, prefill_token_budget;
+    // Request states return pages to the numerical batch during destruction.
+    Ops operations;
     State state;
     std::unordered_map<std::string, std::shared_ptr<Work>> requests;
-    Ops operations;
     bool decode_next = true;
     int64_t admissions = 0, prefill_chunks = 0, prefill_yields = 0;
 

@@ -8,8 +8,6 @@
 
 #include <algorithm>
 #include <cstddef>
-#include <exception>
-#include <functional>
 #include <limits>
 #include <stdexcept>
 #include <utility>
@@ -130,6 +128,15 @@ void initialize_layers(std::vector<LayerState>& layers,
 
 } // namespace
 
+State::Restore::~Restore() {
+    if (pool) pool->release(pages);
+}
+
+State::Restore::Restore(Restore&& other) noexcept
+    : layers(std::move(other.layers)), pages(std::move(other.pages)),
+      pool(std::exchange(other.pool,nullptr)), cache_pos(other.cache_pos),
+      decode_position_delta(other.decode_position_delta) {}
+
 State::State(const Model& model, bool transposed)
     : owner_(&model), max_position_embeddings_(model.metadata.max_position_embeddings),
       transposed_(transposed) {
@@ -161,7 +168,43 @@ State::State(const Model& model, bool transposed)
     initialize_layers(layers, layout_);
 }
 
+State::~State() {
+    if (paged_kv_) paged_kv_->release(pages_);
+}
+
+void State::bind_pages(tyloi::state::PagedKv& pool) {
+    if (paged_kv_ && paged_kv_ != &pool)
+        throw std::invalid_argument("Qwen3.5 state is already bound to another paged KV pool");
+    paged_kv_ = &pool;
+    for (std::size_t index = 0; index < layers.size(); ++index) {
+        if (const auto* full = std::get_if<FullLayout>(&layout_[index].attention))
+            require_state(!full->sliding, "Qwen3.5 sliding attention cannot use paged KV");
+        auto& state = layers[index];
+        auto* cache = std::get_if<tyloi::state::KvView>(&state);
+        if (cache) *cache = {};
+    }
+}
+
+void State::prepare_pages(std::int64_t end) {
+    if (!paged_kv_) return;
+    require_state(batch == 1, "Qwen3.5 paged State supports one request row");
+    require_state(end > 0 && end <= max_position_embeddings_,
+                  "Qwen3.5 paged KV position is invalid");
+    const auto changed = paged_kv_->ensure_tokens(pages_, end);
+    if (changed) paged_kv_->update(pages_);
+    std::size_t paged_layer = 0;
+    for (std::size_t index = 0; index < layers.size(); ++index) {
+        auto* cache = std::get_if<tyloi::state::KvView>(&layers[index]);
+        if (!cache) continue;
+        const auto& full = std::get<FullLayout>(layout_[index].attention);
+        require_state(!full.sliding,
+                      "Qwen3.5 sliding attention cannot use paged KV");
+        *cache = paged_kv_->view(paged_layer++, pages_);
+    }
+}
+
 void State::preallocate() {
+    if (paged_kv_) return;
     for (std::size_t index = 0; index < layout_.size(); ++index) {
         const auto& layer = layout_[index];
         const auto* full = std::get_if<FullLayout>(&layer.attention);
@@ -178,6 +221,7 @@ void State::preallocate() {
 
 std::vector<std::pair<tyloi::Device, std::size_t>> State::preallocate_growth() const {
     std::vector<std::pair<tyloi::Device, std::size_t>> result;
+    if (paged_kv_) return result;
     for (std::size_t i = 0; i < layout_.size(); ++i) {
         const auto& layer = layout_[i];
         const auto* full = std::get_if<FullLayout>(&layer.attention);
@@ -199,18 +243,18 @@ std::vector<std::pair<tyloi::Device, std::size_t>> State::preallocate_growth() c
 std::vector<std::pair<tyloi::Device, std::size_t>> State::growth(
         const tyloi::models::Input& input, const tyloi::models::ForwardOptions& options) const {
     const auto [next_batch, tokens] = input.shape();
-    return growth_for(next_batch, tokens, input, options, false);
+    return growth_for(next_batch, tokens, input, options);
 }
 
 std::vector<std::pair<tyloi::Device, std::size_t>> State::growth_for(
-        std::int64_t next_batch, std::int64_t tokens, const tyloi::models::ForwardOptions& options,
-        bool paged) const {
-    return growth_for(next_batch, tokens, tyloi::models::Input{}, options, paged);
+        std::int64_t next_batch, std::int64_t tokens,
+        const tyloi::models::ForwardOptions& options) const {
+    return growth_for(next_batch, tokens, tyloi::models::Input{}, options);
 }
 
 std::vector<std::pair<tyloi::Device, std::size_t>> State::growth_for(
         std::int64_t next_batch, std::int64_t tokens, const tyloi::models::Input& input,
-        const tyloi::models::ForwardOptions& options, bool paged) const {
+        const tyloi::models::ForwardOptions& options) const {
     if (batch <= 0 || tokens <= 0 || next_batch != batch || cache_pos < 0 ||
         cache_pos > max_position_embeddings_ || tokens > max_position_embeddings_ - cache_pos ||
         input.suffix || input.confirmed < 0 || speculative_start >= 0 || options.primary < 0 ||
@@ -228,16 +272,32 @@ std::vector<std::pair<tyloi::Device, std::size_t>> State::growth_for(
         return a + b;
     };
     std::vector<std::pair<tyloi::Device, std::size_t>> result;
+    std::vector<std::pair<tyloi::Device, std::size_t>> gathered;
     const auto add = [&](tyloi::Device device, std::size_t bytes) {
         auto it = std::find_if(result.begin(), result.end(), [device](const auto& v) { return v.first == device; });
         if (it == result.end()) result.emplace_back(device, bytes);
         else it->second = sum(it->second, bytes);
     };
+    if (paged_kv_) {
+        for (const auto& [device, bytes] : paged_kv_->ensure_growth(
+                 {{&pages_, cache_pos + tokens}}))
+            add(device, bytes);
+    }
     for (std::size_t i = 0; i < layers.size(); ++i) {
         const auto& layout = layout_[i];
         const tyloi::Device device = layout.device;
         if (const auto* full = std::get_if<FullLayout>(&layout.attention)) {
-            if (paged) continue;
+            if (paged_kv_) {
+                // Multi-token paged attention gathers the visible prefix before computing attention.
+                if (cache_pos>0 && tokens>1 && !full->quantization.enabled()) {
+                    const auto bytes=tyloi::state::kv_bytes(batch,full->kv_heads,cache_pos+tokens,
+                        full->head_dim,false,full->dtype,full->quantization);
+                    auto found=std::find_if(gathered.begin(),gathered.end(),[device](const auto& value) { return value.first==device; });
+                    if (found==gathered.end()) gathered.emplace_back(device,bytes);
+                    else found->second=std::max(found->second,bytes);
+                }
+                continue;
+            }
             const auto& cache = std::get<tyloi::state::KvView>(layers[i]);
             if (input.confirmed > 0 && full->sliding)
                 throw std::invalid_argument("Qwen3.5 speculation does not support sliding attention");
@@ -276,11 +336,14 @@ std::vector<std::pair<tyloi::Device, std::size_t>> State::growth_for(
             }
         }
     }
+    for (const auto& [device,bytes]:gathered) add(device,bytes);
     return result;
 }
 
 void State::reset(std::int64_t new_batch) {
     require_state(new_batch > 0, "Qwen3.5 batch must be positive");
+    require_state(!paged_kv_ || new_batch == 1,
+                  "Qwen3.5 paged State supports one request row");
     cache_pos = 0;
     decode_position_delta = 0;
     speculative_start = -1;
@@ -414,6 +477,18 @@ TextSessionState State::capture_text_session_state(
     state.tokens = tokens;
     state.cache_pos = cache_pos;
     state.decode_position_delta = decode_position_delta;
+    std::size_t paged_layer = 0;
+    const auto capture_full = [&](const FullLayout& full,
+                                  const tyloi::state::KvView& cache) {
+        if (!cache.paged()) return capture_kv(cache, cache_pos, state.bytes);
+        require_state(paged_kv_ != nullptr,
+                      "Qwen paged KV cache has no owning pool");
+        const auto [key, value] = paged_kv_->read(pages_, paged_layer++, cache_pos);
+        KvSnapshot saved{key, value, full.capacity, false};
+        state.bytes += session_tensor_bytes(saved.k);
+        state.bytes += session_tensor_bytes(saved.v);
+        return saved;
+    };
     if (kind == TextSessionStateKind::FullAttention) {
         state.payload = std::vector<KvSnapshot>{};
         auto& saved_layers = std::get<std::vector<KvSnapshot>>(state.payload);
@@ -424,7 +499,7 @@ TextSessionState State::capture_text_session_state(
             const auto& cache = std::get<tyloi::state::KvView>(layers[index]);
             validate_cache_configuration(full, cache);
             tyloi::ops::DeviceScope guard(layout.device);
-            auto saved = capture_kv(cache, cache_pos, state.bytes);
+            auto saved = capture_full(full, cache);
             validate_full_snapshot(layout, full, saved);
             validate_full_snapshot_length(saved, cache_pos);
             saved_layers.push_back(std::move(saved));
@@ -443,7 +518,7 @@ TextSessionState State::capture_text_session_state(
             const auto& cache = std::get<tyloi::state::KvView>(layers[index]);
             validate_cache_configuration(*full, cache);
             saved.kind = HybridBlockSessionStateKind::FullAttention;
-            saved.full_attention = capture_kv(cache, cache_pos, state.bytes);
+            saved.full_attention = capture_full(*full, cache);
             validate_full_snapshot(layout, *full, saved.full_attention);
             validate_full_snapshot_length(saved.full_attention, cache_pos);
         } else {
@@ -512,6 +587,7 @@ State::Restore State::prepare(const TextSessionState& state) const {
 
     Restore result;
     initialize_layers(result.layers, layout_);
+    result.pool = paged_kv_;
     result.cache_pos = state.cache_pos;
     result.decode_position_delta = state.decode_position_delta;
     return result;
@@ -547,11 +623,19 @@ public:
         const auto add_kv = [&](const KvSnapshot& kv) {
             add_kv_restore_growth(result, kv);
         };
+        if (target_.pool) {
+            for (const auto& [device, bytes] : target_.pool->ensure_growth(
+                     {{&target_.pages, snapshot_.cache_pos}}))
+                add(device, bytes);
+        }
         if (const auto* blocks = std::get_if<std::vector<KvSnapshot>>(&snapshot_.payload)) {
-            for (const auto& block : *blocks) add_kv(block);
+            if (!target_.pool)
+                for (const auto& block : *blocks) add_kv(block);
         } else {
             for (const auto& block : std::get<std::vector<HybridBlockSessionState>>(snapshot_.payload)) {
-                if (block.kind == HybridBlockSessionStateKind::FullAttention) add_kv(block.full_attention);
+                if (block.kind == HybridBlockSessionStateKind::FullAttention) {
+                    if (!target_.pool) add_kv(block.full_attention);
+                }
                 else {
                     add(block.convolution.device(), session_tensor_bytes(block.convolution));
                     add(block.recurrent.device(), session_tensor_bytes(block.recurrent));
@@ -573,6 +657,9 @@ public:
             if (const auto* kv = std::get_if<tyloi::state::KvView>(&layer)) {
                 add(kv->physical_key);
                 add(kv->physical_value);
+                add(kv->key_chunk_ptrs);
+                add(kv->value_chunk_ptrs);
+                add(kv->page_table);
             } else {
                 const auto& mixer = std::get<LinearState>(layer).mixer.view();
                 add(mixer.convolution);
@@ -603,20 +690,6 @@ std::unique_ptr<tyloi::models::Restore> State::prepare_restore(
     return std::make_unique<SessionRestore>(*this, state, predictor_model);
 }
 
-void restore_session(State& state, tyloi::models::Mtp* mtp, const TextSessionState& snapshot,
-                     const std::function<void()>& drain) {
-    auto candidate = state.prepare_restore(snapshot, mtp);
-    try {
-        candidate->stage();
-        drain();
-        candidate->publish();
-    } catch (...) {
-        const auto failure = std::current_exception();
-        try { drain(); } catch (...) {}
-        std::rethrow_exception(failure);
-    }
-}
-
 void State::stage(Restore& restore, const TextSessionState& state) const {
     const auto kind = text_session_state_kind();
     const auto* full_layers = kind == TextSessionStateKind::FullAttention
@@ -626,6 +699,13 @@ void State::stage(Restore& restore, const TextSessionState& state) const {
                                     ? std::get_if<std::vector<HybridBlockSessionState>>(
                                           &state.payload)
                                     : nullptr;
+    if (restore.pool) {
+        require_state(paged_kv_ != nullptr,
+                      "Qwen paged restore has no owning pool");
+        paged_kv_->ensure_tokens(restore.pages, state.cache_pos);
+        paged_kv_->update(restore.pages);
+    }
+    std::size_t paged_layer = 0;
     for (std::size_t index = 0; index < layout_.size(); ++index) {
         const auto& layout = layout_[index];
         tyloi::ops::DeviceScope guard(layout.device);
@@ -634,7 +714,13 @@ void State::stage(Restore& restore, const TextSessionState& state) const {
                                     ? full_layers->at(index)
                                     : hybrid_layers->at(index).full_attention;
             auto& cache = std::get<tyloi::state::KvView>(restore.layers[index]);
-            stage_kv(cache, saved, full->head_dim, full->dtype, full->quantization);
+            if (restore.pool) {
+                paged_kv_->write(restore.pages, paged_layer++, saved.k, saved.v,
+                                 state.cache_pos);
+                cache = paged_kv_->view(paged_layer - 1, restore.pages);
+            } else {
+                stage_kv(cache, saved, full->head_dim, full->dtype, full->quantization);
+            }
         } else {
             const auto& saved = hybrid_layers->at(index);
             const auto& current = std::get<LinearState>(layers[index]);
@@ -656,6 +742,7 @@ void State::stage(Restore& restore, const TextSessionState& state) const {
 }
 
 void State::publish(Restore&& restore) noexcept {
+    if (restore.pool) std::swap(pages_,restore.pages);
     layers.swap(restore.layers);
     cache_pos = restore.cache_pos;
     decode_position_delta = restore.decode_position_delta;

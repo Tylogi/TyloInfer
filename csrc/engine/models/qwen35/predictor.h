@@ -3,6 +3,7 @@
 #include "engine/models/qwen35/config.h"
 #include "engine/models/common/attention.h"
 #include "engine/models/common/mlp.h"
+#include "engine/models/common/mtp.h"
 #include "engine/models/input.h"
 
 #include <span>
@@ -29,6 +30,9 @@ struct Predictor {
 
     Tensor step(const Tensor& hidden, const Tensor& next_ids, const Tensor& positions,
                 tyloi::models::qwen35::MtpState& state, const ForwardOptions& options = {}) const;
+    std::vector<tyloi::models::MtpStep> batch_step(
+        std::span<const tyloi::models::MtpRow>,
+        const ForwardOptions& options = {}) const;
     Tensor forward(const Tensor& hidden, const Tensor& embeddings, const AttentionStep& step,
                    std::span<const state::KvView> kv, const ops::RopeTable& rope,
                    ops::Trace* trace = nullptr, int trace_layer = -1) const;

@@ -52,7 +52,7 @@ PagedKv::Growth PagedKv::storage_growth(const std::vector<Layout>& layers,
             const auto pages = layer.device.is_metal() ? current_pages + chunk : chunk;
             const auto capacity = static_cast<int64_t>(multiply(pages, kPageSize));
             auto bytes = kv_bytes(1, layer.heads, capacity, layer.head_dim, false,
-                                  kFloat16, layer.quantization);
+                                  layer.dtype, layer.quantization);
             // Metal grow_kv creates a new zero-filled target and functional slice updates.
             // Both can be live in its lazy graph until the replacement is submitted.
             if (layer.device.is_metal() && current_pages) bytes = multiply(bytes, 2);
@@ -69,12 +69,8 @@ PagedKv::Growth PagedKv::construction_growth(const std::vector<Layout>& layouts,
     const auto pages = context / kPageSize + (context % kPageSize != 0);
     const auto maximum = checked_maximum_pages(sequences, pages);
     require(!layouts.empty(), "Paged KV requires at least one full-attention layer");
-    const auto table_bytes = multiply(multiply(static_cast<size_t>(sequences),
-        static_cast<size_t>(pages)), sizeof(std::int32_t));
     const auto chunks = (maximum + kPagesPerChunk - 1) / kPagesPerChunk;
     Growth growth;
-    add_growth(growth, Device(DeviceType::cpu, 0), table_bytes);
-    std::unordered_set<std::int64_t> table_devices;
     for (const auto& layout : layouts) {
         const auto device = layout.device;
         require(layout.heads > 0 && layout.head_dim > 0,
@@ -85,9 +81,7 @@ PagedKv::Growth PagedKv::construction_growth(const std::vector<Layout>& layouts,
         if (device.is_cuda()) throw std::invalid_argument("Paged KV CUDA support is unavailable");
 #endif
         // Also validate quantization before any device allocation.
-        (void)kv_layout(1, layout.heads, 1, layout.head_dim, false, kFloat16, layout.quantization);
-        const auto key = (static_cast<std::int64_t>(device.type) << 32) | static_cast<std::uint32_t>(device.index);
-        if (table_devices.insert(key).second) add_growth(growth, device, table_bytes);
+        (void)kv_layout(1, layout.heads, 1, layout.head_dim, false, layout.dtype, layout.quantization);
         if (device.is_cuda()) add_growth(growth, device, multiply(chunks, 2 * sizeof(std::int64_t)));
     }
     if (preallocate)
@@ -100,17 +94,40 @@ PagedKv::Growth PagedKv::ensure_growth(
         const std::vector<std::pair<const Sequence*, int64_t>>& sequences) const {
     size_t additional = 0;
     std::unordered_set<const Sequence*> seen;
+    Growth growth;
     for (const auto& [sequence, tokens] : sequences) {
         require(sequence && seen.insert(sequence).second && validate(*sequence),
             "Paged KV sequence handle is invalid");
         require(tokens >= 0 && tokens <= logical_pages_per_sequence_ * kPageSize,
             "Paged KV sequence length exceeds the configured context");
         const auto pages = static_cast<size_t>(tokens / kPageSize + (tokens % kPageSize != 0));
-        if (pages > sequence->physical_pages_.size()) {
+        const bool pages_changed = pages > sequence->physical_pages_.size();
+        if (pages_changed) {
             const auto count = pages - sequence->physical_pages_.size();
             require(count <= maximum_physical_pages_ - allocator_.live_pages() - additional,
                 "Paged KV physical storage exhausted");
             additional += count;
+        }
+        if (!sequence->host_page_table_) {
+            add_growth(growth, Device(DeviceType::cpu, 0), multiply(
+                static_cast<size_t>(logical_pages_per_sequence_), sizeof(std::int32_t)));
+        }
+        std::unordered_set<std::int64_t> table_devices;
+        for (const auto& pool : layers_) {
+            const auto device = pool.layout.device;
+            const auto key = (static_cast<std::int64_t>(device.type) << 32) |
+                             static_cast<std::uint32_t>(device.index);
+            if (!table_devices.insert(key).second) continue;
+            const auto found = std::find_if(sequence->page_tables_.begin(),
+                sequence->page_tables_.end(), [device](const auto& item) {
+                    return item.first == device;
+                });
+            if (found == sequence->page_tables_.end())
+                add_growth(growth, device, multiply(
+                    static_cast<size_t>(logical_pages_per_sequence_), sizeof(std::int32_t)));
+            else if (pages_changed && device.is_metal())
+                add_growth(growth, device, multiply(
+                    static_cast<size_t>(logical_pages_per_sequence_), sizeof(std::int32_t)));
         }
     }
     if (additional) require(generation_ != std::numeric_limits<std::uint64_t>::max(),
@@ -119,14 +136,8 @@ PagedKv::Growth PagedKv::ensure_growth(
     std::vector<Layout> layouts;
     layouts.reserve(layers_.size());
     for (const auto& pool : layers_) layouts.push_back(pool.layout);
-    return storage_growth(layouts, maximum_physical_pages_, storage_pages_, required);
-}
-
-PagedKv::Growth PagedKv::update_growth() const {
-    Growth growth;
-    const auto bytes = multiply(host_page_table_.size(), sizeof(std::int32_t));
-    for (const auto& [device, table] : device_page_tables_)
-        if (device.first == DeviceType::metal) add_growth(growth, Device(device.first, device.second), bytes);
+    auto storage = storage_growth(layouts, maximum_physical_pages_, storage_pages_, required);
+    for (const auto& item : storage) add_growth(growth, item.first, item.second);
     return growth;
 }
 
@@ -135,8 +146,7 @@ PagedKv::PagedKv(const std::vector<Layout>& layouts, int64_t context,
     : maximum_sequences_(sequences),
       logical_pages_per_sequence_((context + kPageSize - 1) / kPageSize),
       maximum_physical_pages_(checked_maximum_pages(sequences, logical_pages_per_sequence_)),
-      allocator_(maximum_physical_pages_),
-      host_page_table_(size_t(sequences) * size_t(logical_pages_per_sequence_), -1) {
+      allocator_(maximum_physical_pages_) {
     require(maximum_sequences_ > 0 &&
         logical_pages_per_sequence_ > 0,
         "Paged KV requires positive sequence and context limits");
@@ -154,17 +164,6 @@ PagedKv::PagedKv(const std::vector<Layout>& layouts, int64_t context,
 #if !TYLOINFER_HAS_CUDA
         if (device.is_cuda()) throw std::invalid_argument("Paged KV CUDA support is unavailable");
 #endif
-        const auto device_key = std::pair{device.type, device.index};
-        if (!device_page_tables_.contains(device_key)) {
-            if (device.is_metal()) {
-                device_page_tables_.emplace(device_key, host_table(host_page_table_, maximum_sequences_, logical_pages_per_sequence_).relocated(Device{DeviceType::metal, 0}));
-            } else {
-                auto page_table = ops::empty({maximum_sequences_, logical_pages_per_sequence_},
-                    TensorOptions().device(device).dtype(kInt32));
-                ops::fill(page_table, -1);
-                device_page_tables_.emplace(device_key, std::move(page_table));
-            }
-        }
         Pool pool;
         pool.layout = layout;
         pool.key_width = layout.quantization.enabled()
@@ -172,7 +171,7 @@ PagedKv::PagedKv(const std::vector<Layout>& layouts, int64_t context,
         pool.value_width = layout.quantization.enabled()
             ? kv_packed_width(int(head_dim), layout.quantization.value_bits()) : head_dim;
         pool.dtype = layout.quantization.enabled()
-            ? (device.is_metal() ? ScalarType::uint32 : kInt32) : kFloat16;
+            ? (device.is_metal() ? ScalarType::uint32 : kInt32) : layout.dtype;
         if (device.is_cuda()) {
             auto options = TensorOptions().device(device).dtype(kInt64);
             pool.k_chunk_ptrs = ops::zeros({maximum_chunks}, options);
@@ -232,54 +231,58 @@ bool PagedKv::ensure_tokens(Sequence& sequence, int64_t token_count) {
 void PagedKv::release(Sequence& sequence) {
     require(validate(sequence),
         "Paged KV sequence handle is invalid");
-    if (sequence.physical_pages_.empty()) return;
-    allocator_.release(sequence.physical_pages_);
-    sequence.physical_pages_.clear();
-    sequence.page_generations_.clear();
-    sequence.owner_.reset();
-    publish_allocator_metrics();
+    if (!sequence.physical_pages_.empty()) {
+        allocator_.release(sequence.physical_pages_);
+        sequence.physical_pages_.clear();
+        sequence.page_generations_.clear();
+        sequence.owner_.reset();
+        publish_allocator_metrics();
+    }
+    sequence.page_tables_.clear();
+    sequence.host_page_table_.reset();
 }
 
-void PagedKv::update(const std::vector<const Sequence*>& sequences) {
-    require(!sequences.empty() &&
-        sequences.size() <= static_cast<size_t>(maximum_sequences_),
-        "Paged KV cannot update the requested batch size");
-    const size_t rows = sequences.size();
-    const size_t row_width =
-        static_cast<size_t>(logical_pages_per_sequence_);
-    for (const auto * sequence : sequences) {
-        require(sequence != nullptr &&
-            sequence->physical_pages_.size() <= row_width &&
-            validate(*sequence),
-            "Paged KV received an invalid sequence handle");
-    }
-    std::fill(
-        host_page_table_.begin(),
-        host_page_table_.begin() + rows * row_width, -1);
-    for (size_t row = 0; row < rows; ++row) {
-        const auto * sequence = sequences[row];
-        for (size_t logical_page = 0;
-                logical_page < sequence->physical_pages_.size();
-                ++logical_page) {
-            const auto physical =
-                sequence->physical_pages_[logical_page];
-            host_page_table_[row * row_width + logical_page] = physical;
+void PagedKv::update(Sequence& sequence) {
+    require(validate(sequence) &&
+        sequence.physical_pages_.size() <= static_cast<size_t>(logical_pages_per_sequence_),
+        "Paged KV received an invalid sequence handle");
+    if (!sequence.host_page_table_)
+        sequence.host_page_table_ = std::make_shared<std::vector<std::int32_t>>(
+            static_cast<size_t>(logical_pages_per_sequence_), -1);
+    std::fill(sequence.host_page_table_->begin(), sequence.host_page_table_->end(), -1);
+    for (size_t logical_page = 0; logical_page < sequence.physical_pages_.size(); ++logical_page)
+        (*sequence.host_page_table_)[logical_page] = sequence.physical_pages_[logical_page];
+
+    for (const auto& pool : layers_) {
+        const auto device = pool.layout.device;
+        const auto found = std::find_if(sequence.page_tables_.begin(),
+            sequence.page_tables_.end(), [device](const auto& item) {
+                return item.first == device;
+            });
+        if (found != sequence.page_tables_.end()) continue;
+        if (device.is_metal()) {
+            sequence.page_tables_.emplace_back(device,Tensor{});
+        } else {
+            auto table = ops::empty({1, logical_pages_per_sequence_},
+                TensorOptions().device(device).dtype(kInt32));
+            sequence.page_tables_.emplace_back(device, std::move(table));
         }
     }
-    for (auto & [device, table] : device_page_tables_) {
-        if (device.first == DeviceType::metal) {
-            table = host_table(host_page_table_, maximum_sequences_, logical_pages_per_sequence_).relocated(Device{DeviceType::metal, 0});
+    for (auto& [device, table] : sequence.page_tables_) {
+        if (device.is_metal()) {
+            table = host_table(*sequence.host_page_table_, 1, logical_pages_per_sequence_)
+                .relocated(Device{DeviceType::metal, 0});
         } else {
-            auto target = Tensor{table.dense().narrow(0, 0, static_cast<int64_t>(rows))};
-            ops::copy_into(target, host_table(host_page_table_, static_cast<int64_t>(rows), logical_pages_per_sequence_));
+            ops::copy_into(table, host_table(*sequence.host_page_table_, 1,
+                logical_pages_per_sequence_));
         }
     }
     page_table_updates_metric_.fetch_add(1, std::memory_order_relaxed);
 }
 
-tyloi::state::KvView PagedKv::view(size_t index, int64_t batch) const {
-    require(batch > 0 && batch <= maximum_sequences_,
-        "Paged KV view batch size is invalid");
+tyloi::state::KvView PagedKv::view(size_t index, const Sequence& sequence) const {
+    require(validate(sequence) && !sequence.page_tables_.empty(),
+        "Paged KV view sequence is unavailable");
     const auto& pool = layers_.at(index);
     tyloi::state::KvView cache;
     if (pool.layout.device.is_metal()) {
@@ -289,15 +292,90 @@ tyloi::state::KvView PagedKv::view(size_t index, int64_t batch) const {
         cache.key_chunk_ptrs = pool.k_chunk_ptrs;
         cache.value_chunk_ptrs = pool.v_chunk_ptrs;
     }
-    cache.page_table = device_page_tables_.at({pool.layout.device.type, pool.layout.device.index});
-    cache.batch = batch;
+    const auto table = std::find_if(sequence.page_tables_.begin(), sequence.page_tables_.end(),
+        [&pool](const auto& item) { return item.first == pool.layout.device; });
+    require(table != sequence.page_tables_.end(), "Paged KV view device table is unavailable");
+    cache.page_table = table->second;
+    cache.batch = 1;
     cache.heads = pool.layout.heads;
     cache.head_dim = pool.layout.head_dim;
     cache.page_size = kPageSize;
     cache.pages_per_chunk = kPagesPerChunk;
-    cache.dtype = ::tyloi::kFloat16;
+    cache.dtype = pool.layout.dtype;
     cache.quantization = pool.layout.quantization;
     return cache;
+}
+
+std::pair<::tyloi::Tensor, ::tyloi::Tensor>
+PagedKv::read(const Sequence& sequence, size_t index, int64_t tokens) const {
+    require(validate(sequence) && tokens >= 0 &&
+        tokens <= static_cast<int64_t>(sequence.physical_pages_.size()) * kPageSize,
+        "Paged KV read sequence is invalid");
+    const auto& pool = layers_.at(index);
+    require(tokens == 0 || !pool.k_chunks.empty() || pool.storage.defined(),
+        "Paged KV read storage is unavailable");
+    if (tokens == 0) return {};
+    std::vector<::tyloi::Tensor> keys, values;
+    keys.reserve((static_cast<size_t>(tokens) + kPageSize - 1) / kPageSize);
+    values.reserve(keys.capacity());
+    int64_t remaining = tokens;
+    for (size_t logical = 0; remaining > 0; ++logical) {
+        const auto physical = sequence.physical_pages_.at(logical);
+        const auto count = std::min<int64_t>(remaining, kPageSize);
+        if (pool.layout.device.is_metal()) {
+            const auto start = static_cast<int64_t>(physical) * kPageSize;
+            keys.push_back(ops::slice(pool.storage.physical_key, 2, start, start + count));
+            values.push_back(ops::slice(pool.storage.physical_value, 2, start, start + count));
+        } else {
+            const auto chunk = static_cast<size_t>(physical) / kPagesPerChunk;
+            const auto page = static_cast<int64_t>(static_cast<size_t>(physical) % kPagesPerChunk);
+            keys.push_back(ops::slice(ops::slice(pool.k_chunks.at(chunk), 0, page, page + 1),
+                                      2, 0, count));
+            values.push_back(ops::slice(ops::slice(pool.v_chunks.at(chunk), 0, page, page + 1),
+                                        2, 0, count));
+        }
+        remaining -= count;
+    }
+    return {ops::clone(ops::contiguous(ops::cat(keys, 2))),
+            ops::clone(ops::contiguous(ops::cat(values, 2)))};
+}
+
+void PagedKv::write(const Sequence& sequence, size_t index,
+                    const ::tyloi::Tensor& key, const ::tyloi::Tensor& value,
+                    int64_t tokens) const {
+    require(validate(sequence) && tokens > 0 &&
+        tokens <= static_cast<int64_t>(sequence.physical_pages_.size()) * kPageSize,
+        "Paged KV write sequence is invalid");
+    const auto& pool = layers_.at(index);
+    require(key.defined() && value.defined() && key.dim() == 4 && value.dim() == 4 &&
+        key.size(0) == 1 && value.size(0) == 1 && key.size(1) == pool.layout.heads &&
+        value.size(1) == pool.layout.heads && key.size(2) >= tokens && value.size(2) >= tokens &&
+        key.size(3) == pool.key_width && value.size(3) == pool.value_width,
+        "Paged KV write tensor geometry is invalid");
+    int64_t remaining = tokens;
+    int64_t offset = 0;
+    for (size_t logical = 0; remaining > 0; ++logical) {
+        const auto physical = sequence.physical_pages_.at(logical);
+        const auto count = std::min<int64_t>(remaining, kPageSize);
+        const auto source_key = ops::slice(key, 2, offset, offset + count);
+        const auto source_value = ops::slice(value, 2, offset, offset + count);
+        if (pool.layout.device.is_metal()) {
+            const auto start = static_cast<int64_t>(physical) * kPageSize;
+            ops::copy_into(ops::slice(pool.storage.physical_key, 2, start, start + count),
+                source_key);
+            ops::copy_into(ops::slice(pool.storage.physical_value, 2, start, start + count),
+                source_value);
+        } else {
+            const auto chunk = static_cast<size_t>(physical) / kPagesPerChunk;
+            const auto page = static_cast<int64_t>(static_cast<size_t>(physical) % kPagesPerChunk);
+            ops::copy_into(ops::slice(ops::slice(pool.k_chunks.at(chunk), 0, page, page + 1),
+                2, 0, count), source_key);
+            ops::copy_into(ops::slice(ops::slice(pool.v_chunks.at(chunk), 0, page, page + 1),
+                2, 0, count), source_value);
+        }
+        remaining -= count;
+        offset += count;
+    }
 }
 
 PagedKv::Stats PagedKv::stats() const noexcept {
@@ -371,7 +449,7 @@ void PagedKv::ensure_storage(size_t required_pages) {
                     chunk.storage = grow_kv(layer.storage, capacity, static_cast<int64_t>(storage_pages_ * kPageSize));
                 else
                     chunk.storage = allocate_kv(1, layer.layout.heads, capacity, layer.layout.head_dim,
-                        false, layer.layout.device, kFloat16, layer.layout.quantization);
+                        false, layer.layout.device, layer.layout.dtype, layer.layout.quantization);
             } else {
                 auto options = TensorOptions().device(layer.layout.device).dtype(layer.dtype);
                 chunk.k = ops::empty(

@@ -394,10 +394,12 @@ public:
     std::vector<int32_t> route_experts(
             const MoeRoutePlan & route) const {
         if (!route.host_unique_experts) {
+            auto ids = cache_->read_route_ids(route, cpu_->n_experts);
+            cache_->observe_route(id_, layer_id_, route, ids, cpu_->n_experts);
+            std::sort(ids.begin(), ids.end());
+            ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
             route.host_unique_experts =
-                std::make_shared<std::vector<int32_t>>(
-                    cache_->read_route_experts(
-                        route, cpu_->n_experts));
+                std::make_shared<std::vector<int32_t>>(std::move(ids));
         }
         return *route.host_unique_experts;
     }

@@ -1,8 +1,7 @@
 #include "engine/models/qwen35/batch.h"
-#include "engine/ops/ops.h"
-
-#include "engine/weights/moe/experts.h"
+#include "engine/models/qwen35/forward.h"
 #include "engine/models/common/check.h"
+#include "engine/weights/moe/experts.h"
 
 #include <algorithm>
 #include <limits>
@@ -11,486 +10,215 @@
 #include <utility>
 
 namespace tyloi::models::qwen35 {
+namespace {
 
-using ::tyloi::Tensor;
-
-static std::vector<std::int64_t> shape(const Tensor &tensor) {
-    std::vector<std::int64_t> result;
-    for (std::int64_t dim = 0; dim < tensor.dim(); ++dim)
-        result.push_back(tensor.size(dim));
-    return result;
-}
-
-static bool has_cached_experts(const ::tyloi::models::Ffn& ffn) {
-    const auto* moe = std::get_if<::tyloi::models::Moe>(&ffn);
-    return moe && (::tyloi::weights::cached(moe->down) ||
-        std::any_of(moe->gate_up.begin(), moe->gate_up.end(), ::tyloi::weights::cached));
-}
-
-static void merge_growth(BatchGrowth& into, const BatchGrowth& values) {
+void add(BatchGrowth& result, const BatchGrowth& values) {
     for (const auto& [device, bytes] : values) {
-        auto found = std::find_if(into.begin(), into.end(), [&](const auto& item) { return item.first == device; });
-        if (found == into.end()) into.emplace_back(device, bytes);
+        auto found=std::find_if(result.begin(),result.end(),[&](const auto& value) { return value.first==device; });
+        if (found==result.end()) result.emplace_back(device,bytes);
         else {
-            if (found->second > std::numeric_limits<std::size_t>::max() - bytes)
+            if (bytes>std::numeric_limits<std::size_t>::max()-found->second)
                 throw std::overflow_error("Qwen batch growth overflow");
-            found->second += bytes;
+            found->second+=bytes;
         }
     }
 }
 
-static std::vector<tyloi::state::PagedKv::Layout> paged_layouts(const Model& model) {
-    std::vector<tyloi::state::PagedKv::Layout> result;
-    for (const auto& layer : model.layers) if (const auto* full = std::get_if<Full>(&layer.weights)) {
-        const auto& attention = full->attention;
-        result.push_back({layer.device,
-            attention.kv_heads > 0 ? attention.kv_heads : model.metadata.num_key_value_heads,
-            attention.attention_head_dim > 0 ? attention.attention_head_dim : model.metadata.head_dim,
-            attention.kv_quantization});
+bool cached(const models::Ffn& ffn) {
+    const auto* moe=std::get_if<models::Moe>(&ffn);
+    return moe && (weights::cached(moe->down) ||
+        std::any_of(moe->gate_up.begin(),moe->gate_up.end(),weights::cached));
+}
+
+std::vector<state::PagedKv::Layout> layouts(const Model& model) {
+    std::vector<state::PagedKv::Layout> result;
+    for (const auto& layer:model.layers) if (const auto* full=std::get_if<Full>(&layer.weights)) {
+        const auto& attention=full->attention;
+        result.push_back({layer.device,attention.kv_heads,attention.attention_head_dim,
+            attention.official_bf16 ? kBFloat16 : kFloat16,attention.kv_quantization});
     }
     return result;
 }
 
-BatchGrowth Batch::construction_growth(const Model& model, Options options) {
-    if (!options.paged) return {};
-    if (options.slots == 0 || options.slots > std::size_t(std::numeric_limits<int32_t>::max()))
-        throw std::invalid_argument("continuous batching max sequences must be positive int32");
-    return tyloi::state::PagedKv::construction_growth(paged_layouts(model),
-        model.metadata.max_position_embeddings, static_cast<int32_t>(options.slots), options.preallocate);
+} // namespace
+
+class Batch::Request final : public models::BatchState {
+public:
+    explicit Request(Batch& owner) : state(owner.model_,owner.model_.recurrent_transposed), owner_(owner) {
+        if (owner_.pages_) state.bind_pages(*owner_.pages_);
+    }
+    models::State* target() noexcept override { return &state; }
+    std::int64_t position() const override { return state.position(); }
+    std::size_t resident_bytes() const override {
+        std::vector<std::shared_ptr<TensorStorage>> backings;
+        for (const auto& value:state.storage()) {
+            auto storage=value.backings();
+            backings.insert(backings.end(),storage.begin(),storage.end());
+        }
+        if (state.predictor) for (const auto& value:state.predictor->storage()) {
+            auto storage=value.backings();
+            backings.insert(backings.end(),storage.begin(),storage.end());
+        }
+        return backing_bytes(backings);
+    }
+    BatchGrowth initial_growth_bytes() const override {
+        return owner_.config_.preallocate && !owner_.pages_ ? state.preallocate_growth() : BatchGrowth{};
+    }
+    void initialize() override {
+        state.reset(1);
+        if (owner_.config_.preallocate && !owner_.pages_) state.preallocate();
+    }
+    BatchGrowth prefill_growth_bytes(std::int64_t tokens) const override {
+        return state.growth_for(1,tokens,owner_.config_.forward);
+    }
+    std::vector<Tensor> storage() const override { return state.storage(); }
+    State state;
+    bool admitted=false;
+private:
+    friend class Batch;
+    Batch& owner_;
+};
+
+Batch::Batch(const Model& model, BatchConfig config) : model_(model),config_(std::move(config)) {
+    require_model(config_.slots>0 && config_.slots<=32,"Qwen continuous batching supports 1..32 requests");
+    require_model(!model_.layers.empty(),"continuous batching requires at least one model block");
+    require_model(!config_.cpu_offload,"continuous batching requires GPU-resident model blocks");
+    for (const auto& layer:model_.layers) {
+        require_model(!layer.device.is_cpu(),"continuous batching cannot use CPU-offloaded blocks");
+        std::visit([&](const auto& value) {
+            if constexpr (std::is_same_v<std::decay_t<decltype(value)>,Full>)
+                require_model(!value.attention.sliding,"continuous batching requires non-sliding Qwen attention");
+            if (const auto* moe=std::get_if<models::Moe>(&value.ffn); moe && cached(value.ffn))
+                require_model(moe->top_k<=config_.cached_slots,"continuous batching requires one cached slot per routed expert");
+        },layer.weights);
+    }
 }
 
-BatchGrowth Batch::request_growth(const RequestState& request, std::int64_t tokens) const {
-    if (!paged_kv_) return {};
-    auto result = paged_kv_->ensure_growth({{&request.pages_, tokens}});
-    merge_growth(result, paged_kv_->update_growth());
-    return result;
+BatchGrowth Batch::initial_growth_bytes() const {
+    return config_.paged ? state::PagedKv::construction_growth(layouts(model_),model_.metadata.max_position_embeddings,
+        std::int32_t(config_.slots),config_.preallocate) : BatchGrowth{};
 }
-
-BatchGrowth Batch::activate_growth(const RequestState&, const ForwardOptions& options) const {
+void Batch::initialize() {
+    if (config_.paged) pages_=std::make_unique<state::PagedKv>(layouts(model_),model_.metadata.max_position_embeddings,
+        std::int32_t(config_.slots),config_.preallocate);
+}
+std::unique_ptr<models::BatchState> Batch::make_state(std::int64_t prompt) {
+    require_model(prompt>0,"invalid Qwen batch prompt");
+    return std::make_unique<Request>(*this);
+}
+Batch::Request& Batch::request(models::BatchState& value) const {
+    auto* result=dynamic_cast<Request*>(&value);
+    require_model(result && &result->owner_==this,"Qwen batch state belongs to another batch");
+    return *result;
+}
+void Batch::activate(models::BatchState& value) { request(value).admitted=true; }
+void Batch::release(models::BatchState& value) {
+    clear();
+    auto& row=request(value);
+    if (row.admitted) { row.admitted=false; ++releases_; }
+}
+std::vector<State*> Batch::active(std::span<const BatchRow> rows) const {
+    std::vector<State*> states;
+    for (const auto& row:rows) if (row.eligible) {
+        auto& value=request(*row.state);
+        require_model(value.state.position()==row.position,"Qwen batch position mismatch");
+        states.push_back(&value.state);
+    }
+    return states;
+}
+BatchGrowth Batch::decode_growth(std::span<const BatchRow> rows) const {
     BatchGrowth result;
-    if (state_->batch == static_cast<std::int64_t>(slots_.size()))
-        result = state_->growth_for(state_->batch, 1, options, bool(paged_kv_));
-    else {
-        State empty(weights_, transposed_);
-        empty.reset(static_cast<std::int64_t>(slots_.size()));
-        result = empty.growth_for(empty.batch, 1, options, bool(paged_kv_));
-    }
-    if (paged_kv_) {
-        std::vector<std::pair<const tyloi::state::PagedKv::Sequence*, std::int64_t>> needed;
-        for (const auto& slot : paged_slots_) needed.emplace_back(&slot, 1);
-        merge_growth(result, paged_kv_->ensure_growth(needed));
-        merge_growth(result, paged_kv_->update_growth());
-        merge_growth(result, paged_kv_->update_growth());
-    }
+    for (const auto* state:active(rows)) add(result,state->growth_for(1,1,config_.forward));
     return result;
 }
-
-BatchGrowth Batch::decode_growth(
-        std::span<const std::pair<const RequestState*, std::int64_t>> requests) const {
-    if (!paged_kv_) return {};
-    std::vector<std::pair<const tyloi::state::PagedKv::Sequence*, std::int64_t>> needed;
-    for (const auto& [request, tokens] : requests) {
-        tyloi::models::require_model(request && request->slot_ >= 0 &&
-            std::size_t(request->slot_) < paged_slots_.size(), "invalid Qwen batch slot");
-        needed.emplace_back(&paged_slots_[request->slot_], tokens);
+void Batch::prepare_decode(std::span<const BatchRow> rows) {
+    for (auto* state:active(rows)) state->prepare_pages(state->position()+1);
+}
+std::size_t Batch::prefill_row_bytes() const {
+    return std::size_t(model_.metadata.hidden_size)*model_.metadata.hc_mult*sizeof(float)*8;
+}
+StepSequence<std::vector<Decoded>> Batch::prefill(std::vector<models::BatchState*> states,std::vector<Tensor> ids) {
+    return forward(std::move(states),std::move(ids),false);
+}
+StepSequence<std::vector<Decoded>> Batch::verify(std::vector<models::BatchState*> states,std::vector<Tensor> ids) {
+    return forward(std::move(states),std::move(ids),true);
+}
+StepSequence<std::vector<Decoded>> Batch::forward(std::vector<models::BatchState*> states,
+        std::vector<Tensor> ids,bool verify) {
+    require_model(!states.empty() && states.size()==ids.size(),"invalid Qwen batch rows");
+    std::vector<ForwardRow> rows;
+    for (std::size_t i=0;i<states.size();++i) {
+        models::Input input;
+        input.ids=std::move(ids[i]);
+        input.confirmed=verify && input.ids.size(1)>1 ? 1 : 0;
+        rows.push_back({&request(*states[i]).state,std::move(input)});
     }
-    auto result = paged_kv_->ensure_growth(needed);
-    merge_growth(result, paged_kv_->update_growth());
-    return result;
-}
-
-Batch::~Batch() {
-    if (state_)
-        detach_paged(*state_);
-    state_.reset();
-}
-
-Batch::Batch(const Model &weights, bool transposed, Options options)
-    : weights_(weights), transposed_(transposed),
-      state_(std::make_unique<State>(weights_, transposed_)) {
-    if (options.slots == 0 ||
-        options.slots > static_cast<std::size_t>(std::numeric_limits<int32_t>::max()))
-        throw std::invalid_argument("continuous batching max sequences must be positive int32");
-    const auto reason = incompatibility(options.cpu_offload, options.cached_slots);
-    if (!reason.empty())
-        throw std::runtime_error(reason);
-    slots_.resize(options.slots);
-    state_->reset(static_cast<std::int64_t>(options.slots));
-    if (options.paged) {
-        paged_slots_.resize(options.slots);
-        paged_kv_ = std::make_unique<tyloi::state::PagedKv>(paged_layouts(weights_), weights_.metadata.max_position_embeddings,
-                                               static_cast<int32_t>(options.slots),
-                                               options.preallocate);
-        detach_paged(*state_);
-    }
-}
-
-bool Batch::paged_kv_enabled() const noexcept { return static_cast<bool>(paged_kv_); }
-
-tyloi::state::PagedKv::Stats Batch::paged_kv_stats() const noexcept {
-    return paged_kv_ ? paged_kv_->stats() : tyloi::state::PagedKv::Stats{};
-}
-
-void Batch::prepare_prefill(RequestState &request, std::int64_t offset, std::int64_t tokens) {
-    tyloi::models::require_model(request.slot_ < 0 && offset >= 0 && offset < tokens,
-                            "continuous batching prefill state is invalid");
-    if (!request.state_) {
-        tyloi::models::require_model(offset == 0, "continuous batching lost prefill state");
-        auto state = std::make_unique<State>(weights_, transposed_);
-        state->reset(1);
-        if (paged_kv_) {
-            detach_paged(*state);
-            paged_kv_->ensure_tokens(request.pages_, tokens);
-        }
-        request.state_ = std::move(state);
-    }
-    if (paged_kv_)
-        bind_paged(*request.state_, {&request.pages_});
-}
-
-void Batch::activate(RequestState &request) {
-    tyloi::models::require_model(request.slot_ < 0 && request.state_,
-                            "continuous batching request has no prefill state");
-    const auto free = std::find(slots_.begin(), slots_.end(), nullptr);
-    tyloi::models::require_model(free != slots_.end(), "continuous batching has no free stable slot");
-    const auto slot = static_cast<int32_t>(free - slots_.begin());
-    if (state_->batch != static_cast<std::int64_t>(slots_.size())) {
-        tyloi::models::require_model(
-            std::none_of(slots_.begin(), slots_.end(), [](auto *owner) { return owner != nullptr; }),
-            "continuous batching aggregate state has active slots at the wrong batch size");
-        state_->reset(static_cast<std::int64_t>(slots_.size()));
-    }
-    if (paged_kv_)
-        bind_paged_slots();
-    copy_to_slot(*state_, *request.state_, slot);
-    bool pages_swapped = false;
-    try {
-        if (paged_kv_) {
-            auto &target = paged_slots_[slot];
-            paged_kv_->release(target);
-            std::swap(target, request.pages_);
-            pages_swapped = true;
-        }
-        *free = &request;
-        request.slot_ = slot;
-        if (paged_kv_)
-            bind_paged_slots();
-        request.state_.reset();
-    } catch (...) {
-        if (request.slot_ == slot) {
-            *free = nullptr;
-            request.slot_ = -1;
-        }
-        if (pages_swapped) {
-            detach_paged(*state_);
-            detach_paged(*request.state_);
-            std::swap(paged_slots_[slot], request.pages_);
-        }
-        throw;
+    auto options=config_.forward;
+    options.serial_experts=options.serial_experts || has_cached_moe();
+    auto job=forward_batch(model_,std::move(rows),options);
+    while (auto step=job.next()) {
+        if (step.value) {
+            auto output=std::move(*step.value);
+            if (verify) {
+                std::vector<Tensor> hidden;
+                for (const auto& row:output) hidden.push_back(row.hidden);
+                auto logits=model_.logits(ops::cat(hidden,1));
+                std::int64_t offset=0;
+                for (auto& row:output) {
+                    row.logits=ops::slice(logits,1,offset,offset+row.hidden.size(1));
+                    offset+=row.hidden.size(1);
+                }
+            } else for (std::size_t i=0;i<output.size();++i) {
+                auto& row=output[i];
+                row.hidden=ops::slice(row.hidden,1,row.hidden.size(1)-1,row.hidden.size(1));
+                if (!request(*states[i]).state.predictor) row.raw={};
+            }
+            co_yield std::move(output);
+        } else if (step.layer) co_yield *step.layer;
+        else if (step.workspace) co_yield *step.workspace;
+        else if (step.graph) co_yield *step.graph;
+        else if (step.state==StepState::waiting) co_yield StepState::waiting;
     }
 }
-
-void Batch::resume_decode(std::int64_t cache_position) {
-    state_->cache_pos = cache_position;
-    const bool active = std::any_of(slots_.begin(), slots_.end(), [](auto *owner) {
-        return owner != nullptr;
+Tensor Batch::decode(std::span<const BatchRow> rows,Tensor ids,const Tensor&) {
+    const auto states=active(rows);
+    require_model(!states.empty() && ids.dim()==2 && ids.size(0)==std::int64_t(states.size()) && ids.size(1)==1,
+        "invalid Qwen batch decode rows");
+    std::vector<ForwardRow> inputs;
+    for (std::size_t i=0;i<states.size();++i) {
+        models::Input input;
+        input.ids=ops::slice(ids,0,i,i+1);
+        inputs.push_back({states[i],std::move(input)});
+    }
+    auto options=config_.forward;
+    options.serial_experts=options.serial_experts || has_cached_moe();
+    auto job=forward_batch(model_,std::move(inputs),options);
+    std::vector<Tensor> hidden;
+    while (auto step=job.next()) {
+        if (step.value) for (const auto& row:*step.value) hidden.push_back(row.hidden);
+        else if (!step.layer) throw std::logic_error("unexpected ordinary Qwen batch decode event");
+    }
+    require_model(hidden.size()==states.size(),"Qwen batch decode returned no hidden rows");
+    return ops::reshape(model_.logits(ops::cat(hidden,0)),{std::int64_t(states.size()),-1});
+}
+bool Batch::has_cached_moe() const {
+    return std::any_of(model_.layers.begin(),model_.layers.end(),[](const auto& layer) {
+        return std::visit([](const auto& value) { return cached(value.ffn); },layer.weights);
     });
-    if (paged_kv_ && active)
-        bind_paged_slots();
-    else if (paged_kv_) {
-        state_->reset(1);
-        detach_paged(*state_);
-        for (auto &sequence : paged_slots_)
-            paged_kv_->release(sequence);
-    } else if (!active) {
-        state_->reset(1);
-    }
-    page_table_dirty_ = false;
 }
-
-void Batch::release(RequestState &request) {
-    if (request.slot_ >= 0) {
-        const auto slot = static_cast<std::size_t>(request.slot_);
-        tyloi::models::require_model(slot < slots_.size() && slots_[slot] == &request,
-                                "continuous batching stable slot ownership changed");
-        if (request.state_)
-            detach_paged(*request.state_);
-        if (paged_kv_)
-            paged_kv_->release(paged_slots_[slot]);
-        slots_[slot] = nullptr;
-        request.slot_ = -1;
-        ++slot_releases_;
-    }
-    if (request.state_)
-        detach_paged(*request.state_);
-    if (paged_kv_)
-        paged_kv_->release(request.pages_);
-    request.state_.reset();
-}
-
-void Batch::finish_retire(std::int64_t cache_position) {
-    if (std::none_of(slots_.begin(), slots_.end(), [](auto *owner) { return owner != nullptr; })) {
-        state_->reset(1);
-        if (paged_kv_) {
-            detach_paged(*state_);
-            for (auto &sequence : paged_slots_)
-                paged_kv_->release(sequence);
-        }
-    } else if (paged_kv_) {
-        state_->cache_pos = cache_position;
-        bind_paged_slots();
-    } else {
-        state_->cache_pos = cache_position;
-    }
-    page_table_dirty_ = false;
-}
-
-void Batch::ensure_decode_tokens(const RequestState &request, std::int64_t tokens) {
-    tyloi::models::require_model(request.slot_ >= 0 &&
-                                static_cast<std::size_t>(request.slot_) < slots_.size() &&
-                                slots_[request.slot_] == &request,
-                            "continuous batching request lost its stable slot");
-    if (paged_kv_)
-        page_table_dirty_ =
-            paged_kv_->ensure_tokens(paged_slots_[request.slot_], tokens) || page_table_dirty_;
-}
-
-void Batch::prepare_decode(std::int64_t cache_position) {
-    if (page_table_dirty_)
-        bind_paged_slots();
-    state_->cache_pos = cache_position;
-}
-
-void Batch::finish_decode(std::int64_t cache_position) { state_->cache_pos = cache_position; }
-
-void Batch::bind_paged(State &state, const std::vector<const tyloi::state::PagedKv::Sequence *> &sequences) {
-    tyloi::models::require_model(bool(paged_kv_), "continuous batching paged KV state is unavailable");
-    paged_kv_->update(sequences);
-    std::size_t state_index = 0;
-    std::size_t paged_layer = 0;
-    for (const auto &layer : weights_.layers) {
-        std::visit(
-            [&](const auto &value) {
-                using T = std::decay_t<decltype(value)>;
-                if constexpr (std::is_same_v<T, Full>) {
-                    tyloi::ops::DeviceScope guard(layer.device);
-                    auto *cache = std::get_if<tyloi::state::KvView>(&state.layers[state_index]);
-                    tyloi::models::require_model(cache, "continuous batching full state layout changed");
-                    *cache = paged_kv_->view(paged_layer++, static_cast<int64_t>(sequences.size()));
-                }
-                ++state_index;
-            },
-            layer.weights);
-    }
-}
-
-void Batch::detach_paged(State &state) noexcept {
-    if (!paged_kv_)
-        return;
-    for (auto &layer_state : state.layers)
-        if (auto *cache = std::get_if<tyloi::state::KvView>(&layer_state))
-            *cache = {};
-}
-
-void Batch::bind_paged_slots() {
-    if (!paged_kv_)
-        return;
-    std::vector<const tyloi::state::PagedKv::Sequence *> sequences;
-    sequences.reserve(paged_slots_.size());
-    for (auto &sequence : paged_slots_) {
-        paged_kv_->ensure_tokens(sequence, 1);
-        sequences.push_back(&sequence);
-    }
-    bind_paged(*state_, sequences);
-    page_table_dirty_ = false;
-}
-
-bool Batch::has_moe() const {
-    for (const auto &layer : weights_.layers) {
-        const bool result = std::visit(
-            [](const auto &value) { return std::holds_alternative<::tyloi::models::Moe>(value.ffn); }, layer.weights);
-        if (result)
-            return true;
-    }
-    return false;
-}
-
-bool Batch::has_cached_moe() const { return has_cached_moe(weights_); }
-
-bool Batch::has_cached_moe(const Model &model) {
-    for (const auto &layer : model.layers) {
-        const bool result = std::visit(
-            [](const auto &value) { return has_cached_experts(value.ffn); },
-            layer.weights);
-        if (result)
-            return true;
-    }
-    return false;
-}
-
-std::string Batch::incompatibility(bool cpu_offload, int cached_slots) const {
-    if (weights_.layers.empty())
-        return "continuous batching requires at least one model block";
-    if (cpu_offload)
-        return "continuous batching requires GPU-resident model blocks";
-    for (const auto &layer : weights_.layers) {
-        if (layer.device.is_cpu())
-            return "continuous batching cannot use CPU-offloaded blocks";
-        const auto reason = std::visit(
-            [&](const auto &value) -> std::string {
-                if constexpr (std::is_same_v<std::decay_t<decltype(value)>, Full>) {
-                    if (value.attention.sliding)
-                        return "continuous batching requires non-sliding Qwen attention";
-                }
-                const auto* moe = std::get_if<::tyloi::models::Moe>(&value.ffn);
-                if (moe && has_cached_experts(value.ffn) && moe->top_k > cached_slots)
-                    return "continuous batching requires one cached slot per routed expert";
-                return {};
-            },
-            layer.weights);
-        if (!reason.empty())
-            return reason;
-    }
-    return {};
-}
-
-void Batch::copy_to_slot(State &target, const State &source, std::int64_t slot) const {
-    tyloi::models::require_model(source.batch == 1 && slot >= 0 && slot < target.batch &&
-                                target.layers.size() == source.layers.size() &&
-                                source.speculative_start < 0,
-                            "continuous batching received an invalid stable slot");
-    for (std::size_t index = 0; index < target.layers.size(); ++index) {
-        tyloi::ops::DeviceScope guard(weights_.layers[index].device);
-        auto &destination = target.layers[index];
-        const auto &origin = source.layers[index];
-        tyloi::models::require_model(destination.index() == origin.index(),
-                                "continuous batching stable slot layout changed");
-        if (auto *cache = std::get_if<tyloi::state::KvView>(&destination)) {
-            const auto &from = std::get<tyloi::state::KvView>(origin);
-            tyloi::models::require_model(from.defined() && from.batch == 1,
-                                    "continuous batching KV state is unavailable");
-            tyloi::models::require_model(cache->paged() == from.paged(),
-                                    "continuous batching stable slot KV layout changed");
-            if (!cache->paged()) {
-                const auto& from_key = from.physical_key;
-                const auto& from_value = from.physical_value;
-                tyloi::models::require_model(from_key.dim() == 4 && from_value.dim() == 4 &&
-                                            from_key.size(0) == 1 && from_value.size(0) == 1 &&
-                                            !from.ring &&
-                                            session_kv_geometry_matches(from_key, from_value),
-                                        "continuous batching KV cache geometry changed");
-                if (cache->defined())
-                    tyloi::models::require_model(
-                        cache->batch == target.batch && !cache->ring &&
-                            cache->physical_key.dim() == 4 && cache->physical_value.dim() == 4 &&
-                            session_kv_geometry_matches(cache->physical_key, cache->physical_value) &&
-                            cache->physical_key.size(1) == from_key.size(1) &&
-                            cache->physical_value.size(1) == from_value.size(1) &&
-                            cache->physical_key.size(2) == from_key.size(2) &&
-                            cache->physical_value.size(2) == from_value.size(2) &&
-                            cache->physical_key.size(3) == from_key.size(3) &&
-                            cache->physical_value.size(3) == from_value.size(3),
-                        "continuous batching stable slot KV geometry changed");
-                if (!cache->defined()) {
-                    *cache = from;
-                    auto key_shape = shape(from_key);
-                    auto value_shape = shape(from_value);
-                    key_shape[0] = target.batch;
-                    value_shape[0] = target.batch;
-                    cache->physical_key = tyloi::ops::zeros(key_shape, from_key.options());
-                    cache->physical_value = tyloi::ops::zeros(value_shape, from_value.options());
-                    cache->batch = target.batch;
-                }
-                auto key_row = tyloi::ops::slice(cache->physical_key, 0, slot, slot + 1);
-                auto value_row = tyloi::ops::slice(cache->physical_value, 0, slot, slot + 1);
-                tyloi::ops::copy_into(key_row, from_key);
-                tyloi::ops::copy_into(value_row, from_value);
-            }
-        } else {
-            auto &state = std::get<LinearState>(destination);
-            const auto &from = std::get<LinearState>(origin);
-            tyloi::models::require_model(
-                from.mixer.defined() && !from.mixer.pending() &&
-                    from.mixer.view().convolution.size(0) == 1 &&
-                    from.mixer.view().recurrent.size(0) == 1,
-                "continuous batching recurrent state is unavailable");
-            const auto &source = from.mixer.view();
-            auto &target_view = state.mixer.view();
-            if (!target_view.defined()) {
-                auto convolution_shape = shape(source.convolution);
-                auto recurrent_shape = shape(source.recurrent);
-                convolution_shape[0] = target.batch;
-                recurrent_shape[0] = target.batch;
-                target_view.convolution = ::tyloi::ops::zeros(
-                    convolution_shape, source.convolution.options());
-                target_view.recurrent = ::tyloi::ops::zeros(
-                    recurrent_shape, source.recurrent.options());
-                target_view.transposed = source.transposed;
-            }
-            tyloi::models::require_model(target_view.transposed == source.transposed,
-                                    "continuous batching recurrent layout changed");
-            tyloi::ops::copy_into(tyloi::ops::slice(target_view.convolution, 0, slot, slot + 1), source.convolution);
-            tyloi::ops::copy_into(tyloi::ops::slice(target_view.recurrent, 0, slot, slot + 1), source.recurrent);
-        }
-    }
-}
-
-BatchState Batch::capture_recurrent_slots(const std::vector<std::int32_t> &slots) const {
-    BatchState state;
-    state.batch = static_cast<int64_t>(slots.size());
-    if (slots.empty())
-        return state;
-    state.layers.resize(state_->layers.size());
-    for (std::size_t index = 0; index < state_->layers.size(); ++index) {
-        const auto *linear = std::get_if<LinearState>(&state_->layers[index]);
-        if (!linear)
-            continue;
-        tyloi::ops::DeviceScope guard(weights_.layers[index].device);
-        std::vector<Tensor> conv, recurrent;
-        for (auto slot : slots) {
-            conv.push_back(tyloi::ops::slice(linear->mixer.view().convolution, 0, slot, slot + 1));
-            recurrent.push_back(tyloi::ops::slice(linear->mixer.view().recurrent, 0, slot, slot + 1));
-        }
-        state.layers[index] = tyloi::state::Recurrent::State{
-            tyloi::ops::clone(tyloi::ops::cat(conv, 0)),
-            tyloi::ops::clone(tyloi::ops::cat(recurrent, 0)),
-            linear->mixer.view().transposed};
-    }
-    return state;
-}
-
-void Batch::restore_recurrent_slots(const std::vector<std::int32_t> &slots,
-                                    const BatchState &state) {
-    if (slots.empty())
-        return;
-    tyloi::models::require_model(state.batch == static_cast<int64_t>(slots.size()) &&
-                                state.layers.size() == state_->layers.size(),
-                            "continuous batching recurrent snapshot layout changed");
-    for (std::size_t index = 0; index < state_->layers.size(); ++index) {
-        auto *linear = std::get_if<LinearState>(&state_->layers[index]);
-        if (!linear)
-            continue;
-        tyloi::ops::DeviceScope guard(weights_.layers[index].device);
-        const auto *saved = std::get_if<tyloi::state::Recurrent::State>(&state.layers[index]);
-        tyloi::models::require_model(saved && saved->defined() &&
-                                    saved->convolution.size(0) == state.batch &&
-                                    saved->recurrent.size(0) == state.batch &&
-                                    saved->transposed == linear->mixer.view().transposed,
-                                "continuous batching recurrent snapshot changed");
-    }
-    for (std::size_t index = 0; index < state_->layers.size(); ++index) {
-        auto *linear = std::get_if<LinearState>(&state_->layers[index]);
-        if (!linear)
-            continue;
-        tyloi::ops::DeviceScope guard(weights_.layers[index].device);
-        const auto &saved = std::get<tyloi::state::Recurrent::State>(state.layers[index]);
-        for (std::size_t row = 0; row < slots.size(); ++row) {
-            tyloi::ops::copy_into(tyloi::ops::slice(linear->mixer.view().convolution, 0, slots[row], slots[row] + 1),
-                                  tyloi::ops::slice(saved.convolution, 0, row, row + 1));
-            tyloi::ops::copy_into(tyloi::ops::slice(linear->mixer.view().recurrent, 0, slots[row], slots[row] + 1),
-                                  tyloi::ops::slice(saved.recurrent, 0, row, row + 1));
-        }
-    }
+engine::Metrics Batch::metrics() const {
+    const auto stats=pages_ ? pages_->stats() : state::PagedKv::Stats{};
+    const bool moe=std::any_of(model_.layers.begin(),model_.layers.end(),[](const auto& layer) {
+        return std::visit([](const auto& value) { return std::holds_alternative<models::Moe>(value.ffn); },layer.weights);
+    });
+    return {{"continuous_batching_request_releases",double(releases_)},
+        {"continuous_batching_moe",double(moe)}, {"continuous_batching_moe_cached_row_serial",double(has_cached_moe())},
+        {"continuous_batching_paged_kv",double(bool(pages_))},
+        {"paged_kv_page_size",double(stats.page_size)}, {"paged_kv_live_pages",double(stats.live_pages)},
+        {"paged_kv_peak_live_pages",double(stats.peak_live_pages)}, {"paged_kv_capacity_pages",double(stats.capacity_pages)},
+        {"paged_kv_reserved_bytes",double(stats.reserved_bytes)}, {"paged_kv_page_allocations",double(stats.allocations)},
+        {"paged_kv_page_reuses",double(stats.reuses)}, {"paged_kv_page_releases",double(stats.releases)},
+        {"paged_kv_table_updates",double(stats.table_updates)}};
 }
 
 } // namespace tyloi::models::qwen35

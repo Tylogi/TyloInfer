@@ -66,8 +66,13 @@ struct ExpertBatch::Impl {
     Tensor ids;
 };
 
-ExpertBatch::ExpertBatch(std::span<const Tensor> gate_up, const Tensor& down, const Tensor& ids)
-    : impl_(std::make_unique<Impl>(Impl{{gate_up.begin(), gate_up.end()}, down, ids})) {}
+ExpertBatch::ExpertBatch(std::span<const Tensor> gate_up, const Tensor& down, const Tensor& ids,
+                         std::int64_t row_offset, std::int64_t row_total)
+    : impl_(std::make_unique<Impl>(Impl{{gate_up.begin(), gate_up.end()}, down, ids})) {
+    if (row_offset < 0 || row_total <= 0 || row_offset > row_total ||
+        ids.size(0) > row_total - row_offset)
+        throw std::invalid_argument("invalid packed Metal MoE route row coordinates");
+}
 ExpertBatch::~ExpertBatch() = default;
 ExpertBatch::ExpertBatch(ExpertBatch&&) noexcept = default;
 ExpertBatch& ExpertBatch::operator=(ExpertBatch&&) noexcept = default;

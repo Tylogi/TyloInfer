@@ -732,14 +732,22 @@ void MoeResidencyManager::discard_speculative_routes() noexcept {
     if(s.cache->ssd_experts())s.cache->host_experts_->discard_speculative_learning();
     s.route_history->discard();
 }
+void MoeResidencyManager::observe_routes(int layer, std::span<const int32_t> ids, int tokens,
+                                         int row_offset, int row_total,
+                                         bool independent_sequences) {
+    auto& s=*impl_;
+    const MfqCudaGuard guard(s.cache->device());
+    if (s.cache->pipeline_residency_suspended_) return;
+    for (std::size_t b=0; b<s.cache->pipeline_bundles_.size(); ++b)
+        if (s.cache->sources_[s.cache->pipeline_bundles_[b][0]]->layer_id_ == layer)
+            s.route_history->observe(b, ids, tokens, independent_sequences,
+                                     row_offset, row_total);
+}
 void MoeResidencyManager::after_layer(int layer,const std::vector<int32_t>& ids,int tokens,bool window_inflight,bool independent_sequences) {
     auto& s=*impl_;
     const MfqCudaGuard guard(s.cache->device());
     if(s.cache->pipeline_residency_suspended_)return;
-    for(std::size_t b=0;b<s.cache->pipeline_bundles_.size();++b)
-        if(s.cache->sources_[s.cache->pipeline_bundles_[b][0]]->layer_id_==layer) {
-            s.route_history->observe(b,ids,tokens,independent_sequences);
-        }
+    observe_routes(layer, ids, tokens, 0, 0, independent_sequences);
     if(!s.cache->options_.policy.adapt)return;
     if(layer!=s.last || s.work_pending.load(std::memory_order_acquire))return;
     if(!s.cache->options_.policy.warm && (tokens>8 || (++s.rounds%4)!=0))return;
