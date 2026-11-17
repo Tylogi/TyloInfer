@@ -5,6 +5,7 @@
 namespace tyloi::metal {
 
 struct MlxMfeCachedProjection;
+struct MlxMfeCachedRoute;
 
 struct MlxMfeProjectionInfo {
     int experts = 0;
@@ -38,8 +39,8 @@ struct MlxMfeCacheReuseStats {
 // MlxMfeWeight is the default model path. The cache is constructed only
 // after an explicit disk-offload request. Apple Silicon has unified memory,
 // so there is no separate CUDA-style CPU-RAM versus device-RAM mode. Disk
-// backing uses read_range(); the LRU limit accounts for packed expert bytes
-// staged in unified memory for active dispatches.
+// backing uses read_range(); the LRU limit accounts for the actual MLX/Metal
+// backings retained by active dispatches, including nested page resources.
 class MlxMfeOffloadCache {
 public:
     MlxMfeOffloadCache(
@@ -61,10 +62,6 @@ public:
     // example legacy NINTv1, dense cohorts, or unsupported VQ layouts).
     // Malformed streamable records still raise.
     virtual bool can_offload(const std::string& name);
-    virtual bool can_stream(const std::string& name) {
-        return can_offload(name);
-    }
-    virtual bool can_group_mfe(const std::string& name);
     virtual void activate_record(const std::string& name);
     virtual void prepare_projection(
         const std::string& name, bool shared_input, bool fused_swiglu = false);
@@ -103,11 +100,22 @@ public:
         std::span<const std::int32_t> experts);
 
     virtual std::size_t cache_limit_bytes() const noexcept;
+    // Historical name retained for callers; this is physical retained backing
+    // bytes, not MlxMfeWeight::packed_nbytes().
     virtual std::size_t resident_packed_bytes() const;
     virtual std::size_t cached_expert_count() const;
     virtual MlxMfeCacheReuseStats reuse_stats() const;
     virtual std::size_t set_cache_limit(std::size_t bytes);
     virtual void set_prefill_priority(std::span<const std::string> names);
+
+    // Keep page weights alive until their MLX consumer has completed. Callers
+    // must pass every weight read by the output; this is a per-dispatch lease,
+    // not ownership of a weight held outside the cache. The output roots are
+    // evaluated by drain() before the held weights are released.
+    virtual void retain_until_drain(
+        std::vector<MlxMfeWeight> weights,
+        std::vector<mlx::core::array> outputs);
+    virtual void drain();
 
     // Atomically forget one parsed projection and all of its resident
     // experts.  Already returned routed weights retain their own Metal
@@ -117,6 +125,16 @@ public:
     virtual void clear();
 
 private:
+    friend struct MlxMfeCachedRoute;
+    using WeightImpl = MlxMfeWeight::Impl;
+    static std::weak_ptr<const WeightImpl> weight_impl(
+        const MlxMfeWeight& weight) noexcept;
+    static MlxMfeWeight weight_from_impl(
+        const std::shared_ptr<const WeightImpl>& impl);
+    void track_external_weights(const std::vector<MlxMfeWeight>& weights);
+    void retain_cached_until_drain(
+        std::vector<std::shared_ptr<const MlxMfeCachedProjection>> projections,
+        std::vector<mlx::core::array> outputs);
     MlxMfeOffloadCache(const tyloi::source::Source& source, std::size_t limit, int experts,
         std::function<void(const std::string&)> prepared);
     MlxMfeOffloadCache(std::shared_ptr<MfqContainer> model, std::size_t limit, int experts);
@@ -129,7 +147,6 @@ struct MlxMfeCachedProjection {
     mlx::core::array expert_map;
     std::vector<std::int32_t> host_expert_map;
     std::string name;
-    std::size_t metadata_bytes = 0;
 };
 
 struct MlxMfeCachedRoute {

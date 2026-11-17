@@ -14,6 +14,8 @@
 #include "engine/backends/metal/native/memory.h"
 #include "engine/backends/metal/native/env.h"
 #include "engine/backends/metal/native/allocation.h"
+#include "engine/backends/metal/native/tensor/tensor.h"
+#include "engine/tensor/tensor.h"
 #include <mlx/mlx.h>
 #include <algorithm>
 #include <array>
@@ -1481,6 +1483,7 @@ struct MlxMfeOffloadCache::Impl {
 
         std::int32_t expert = 0;
         MlxMfeWeight weight;
+        // Logical packed bytes remain useful for IO and reuse heuristics only.
         std::size_t packed_nbytes = 0;
         bool transient = false;
     };
@@ -1501,6 +1504,13 @@ struct MlxMfeOffloadCache::Impl {
         bool complete = false;
         std::optional<PreparedProjection> result;
         std::vector<std::shared_ptr<const MfeCachedExpert>> pages;
+    };
+
+    struct AsyncHold {
+        std::uint64_t id = 0;
+        std::vector<MlxMfeWeight> weights;
+        std::vector<array> outputs;
+        std::vector<std::shared_ptr<const MlxMfeCachedProjection>> projections;
     };
 
     struct PinRequest {
@@ -1957,7 +1967,7 @@ struct MlxMfeOffloadCache::Impl {
         std::shared_ptr<const MfeStreamProjection>> mfe_projections;
     tyloi::weights::Lru<Key, MfeCacheValue, KeyHash> mfe_cache{std::nullopt};
     std::unordered_set<std::string> prefill_priority;
-    std::size_t resident_bytes = 0;
+    mutable std::size_t resident_bytes = 0;
     std::unordered_map<std::string, std::size_t> backing_records;
     MlxResourceTelemetry resources;
     tyloi::HostParallelPool io_workers{{}, false};
@@ -1970,6 +1980,12 @@ struct MlxMfeOffloadCache::Impl {
     std::unordered_map<std::string, std::shared_ptr<InFlight>> loading;
     std::condition_variable loaded;
     std::size_t epoch = 0;
+    std::uint64_t next_async_id = 0;
+    mutable std::vector<AsyncHold> async_holds;
+    mutable std::unordered_map<const MlxMfeOffloadCache::WeightImpl*,
+        std::weak_ptr<const MlxMfeOffloadCache::WeightImpl>> external_weights;
+    mutable std::unordered_map<const MlxMfeCachedProjection*,
+        std::weak_ptr<const MlxMfeCachedProjection>> external_views;
     MlxMfeCacheReuseStats stats;
     std::mutex pin_mutex;
     std::condition_variable pin_ready;
@@ -1978,25 +1994,220 @@ struct MlxMfeOffloadCache::Impl {
     bool pin_stopping = false;
     std::thread pin_worker;
 
+    static void append_backings(
+        std::vector<std::shared_ptr<tyloi::TensorStorage>>& result,
+        const MlxMfeWeight& weight) {
+        auto values = weight.backings();
+        result.insert(result.end(), values.begin(), values.end());
+    }
+
+    static void append_backings(
+        std::vector<std::shared_ptr<tyloi::TensorStorage>>& result,
+        const array& value) {
+        auto values = tyloi::metal::backings(value);
+        result.insert(result.end(), values.begin(), values.end());
+    }
+
+    void track_external_weights(
+        std::vector<std::weak_ptr<const MlxMfeOffloadCache::WeightImpl>> weights) {
+        std::lock_guard lock(mutex);
+        std::erase_if(external_weights, [](const auto& entry) {
+            return entry.second.expired();
+        });
+        for (auto& weight : weights) {
+            if (const auto owner = weight.lock())
+                external_weights.emplace(owner.get(), std::move(weight));
+        }
+        recount_locked();
+    }
+
+    void append_retained_backings(
+        std::vector<std::shared_ptr<tyloi::TensorStorage>>& result) const {
+        for (const auto& [key, value] : mfe_cache.entries()) {
+            (void)key;
+            if (value.weight) append_backings(result, value.weight->weight);
+        }
+        for (const auto& [name, value] : prepared) {
+            (void)name;
+            append_backings(result, value.weight);
+        }
+        for (const auto& [name, value] : cached_views) {
+            (void)name;
+            if (!value) continue;
+            append_backings(result, value->weight);
+            append_backings(result, value->expert_map);
+        }
+        std::erase_if(external_weights, [&](const auto& entry) {
+            const auto owner = entry.second.lock();
+            if (!owner) return true;
+            append_backings(result,
+                MlxMfeOffloadCache::weight_from_impl(owner));
+            return false;
+        });
+        std::erase_if(external_views, [&](const auto& entry) {
+            const auto view = entry.second.lock();
+            if (!view) return true;
+            append_backings(result, view->weight);
+            append_backings(result, view->expert_map);
+            return false;
+        });
+        for (const auto& hold : async_holds)
+            for (const auto& weight : hold.weights) append_backings(result, weight);
+        for (const auto& hold : async_holds)
+            for (const auto& projection : hold.projections) {
+                if (!projection) continue;
+                append_backings(result, projection->weight);
+                append_backings(result, projection->expert_map);
+            }
+    }
+
+    void retire_ready_locked() const {
+        std::erase_if(async_holds, [](const auto& hold) {
+            return !hold.outputs.empty() && std::all_of(
+                hold.outputs.begin(), hold.outputs.end(),
+                [](const auto& output) { return output.is_available(); });
+        });
+    }
+
+    void recount_locked() const {
+        // Match Metal Stream::retire_ready: an output-bearing hold is complete
+        // only when every published output root is available. A hold without
+        // outputs remains until the explicit drain contract is used.
+        retire_ready_locked();
+        std::vector<std::shared_ptr<tyloi::TensorStorage>> backings;
+        append_retained_backings(backings);
+        resident_bytes = tyloi::backing_bytes(backings);
+    }
+
+    std::size_t candidate_bytes_locked(
+        std::span<const MlxMfeWeight> weights = {},
+        std::span<const std::shared_ptr<const MfeCachedExpert>> pages = {},
+        std::span<const array> arrays = {}) const {
+        std::vector<std::shared_ptr<tyloi::TensorStorage>> backings;
+        append_retained_backings(backings);
+        for (const auto& weight : weights) append_backings(backings, weight);
+        for (const auto& page : pages)
+            if (page) append_backings(backings, page->weight);
+        for (const auto& value : arrays) append_backings(backings, value);
+        return tyloi::backing_bytes(backings);
+    }
+
+    void admit_candidate_locked(
+        std::span<const MlxMfeWeight> weights = {},
+        std::span<const std::shared_ptr<const MfeCachedExpert>> pages = {},
+        std::span<const array> arrays = {}) {
+        if (!fits_candidate_locked(weights, pages, arrays))
+            throw std::runtime_error(
+                "MFE physical backing exceeds the configured cache limit");
+    }
+
+    bool fits_candidate_locked(
+        std::span<const MlxMfeWeight> weights = {},
+        std::span<const std::shared_ptr<const MfeCachedExpert>> pages = {},
+        std::span<const array> arrays = {}) {
+        for (;;) {
+            recount_locked();
+            if (candidate_bytes_locked(weights, pages, arrays) <= cache_limit) return true;
+            if (!evict_one_locked()) return false;
+        }
+    }
+
+    void retain_until_drain(
+        std::vector<MlxMfeWeight> weights,
+        std::vector<array> outputs) {
+        if (weights.empty() && outputs.empty()) return;
+        std::lock_guard lock(mutex);
+        std::erase_if(external_weights, [](const auto& entry) {
+            return entry.second.expired();
+        });
+        for (const auto& weight : weights) {
+            auto weak = MlxMfeOffloadCache::weight_impl(weight);
+            if (const auto owner = weak.lock())
+                external_weights.emplace(owner.get(), std::move(weak));
+        }
+        async_holds.push_back(AsyncHold{
+            next_async_id++, std::move(weights), std::move(outputs), {}});
+        recount_locked();
+    }
+
+    void retain_cached_until_drain(
+        std::vector<std::shared_ptr<const MlxMfeCachedProjection>> projections,
+        std::vector<array> outputs) {
+        if (projections.empty() && outputs.empty()) return;
+        std::lock_guard lock(mutex);
+        std::erase_if(external_views, [](const auto& entry) {
+            return entry.second.expired();
+        });
+        for (const auto& projection : projections)
+            if (projection) external_views.emplace(projection.get(), projection);
+        async_holds.push_back(AsyncHold{
+            next_async_id++, {}, std::move(outputs), std::move(projections)});
+        recount_locked();
+    }
+
+    void drain() {
+        std::vector<array> outputs;
+        std::uint64_t last_id = 0;
+        bool empty = false;
+        {
+            std::lock_guard lock(mutex);
+            if (async_holds.empty()) {
+                empty = true;
+            } else {
+                last_id = async_holds.back().id;
+                for (const auto& hold : async_holds) {
+                    if (hold.id > last_id) break;
+                    outputs.insert(outputs.end(), hold.outputs.begin(), hold.outputs.end());
+                }
+            }
+        }
+
+        // There may still be cache-owned work submitted by a legacy caller
+        // that did not publish an output root.
+        if (empty) {
+            mlx::core::synchronize();
+            std::lock_guard lock(mutex);
+            recount_locked();
+            return;
+        }
+
+        // Do not hold mutex while eval/wait can enter MLX or a completion callback.
+        for (auto& output : outputs) {
+            if (output.status() == array::Status::unscheduled) output.eval();
+            output.wait();
+        }
+        mlx::core::synchronize();
+
+        std::lock_guard lock(mutex);
+        std::erase_if(async_holds, [last_id](const auto& hold) {
+            return hold.id <= last_id;
+        });
+        recount_locked();
+    }
+
     void drop_prepared(const std::string& name) {
         const auto found = prepared.find(name);
         if (found == prepared.end()) return;
-        resident_bytes -= found->second.weight.packed_nbytes();
         prepared.erase(found);
     }
 
     void drop_cached_view(const std::string& name) {
         ++page_generation;
         if (const auto found = cached_views.find(name); found != cached_views.end()) {
-            resident_bytes -= found->second->metadata_bytes;
             cached_views.erase(found);
         }
     }
 
-    void trim() {
-        while (resident_bytes > cache_limit && !prepared.empty())
+    bool evict_one_locked() {
+        if (!prepared.empty()) {
             drop_prepared(prepared.begin()->first);
-        while (resident_bytes > cache_limit && !mfe_cache.empty()) {
+            return true;
+        }
+        if (!cached_views.empty()) {
+            drop_cached_view(cached_views.begin()->first);
+            return true;
+        }
+        while (!mfe_cache.empty()) {
             const auto& key = *mfe_cache.oldest();
             auto& victim = mfe_cache.at(key);
             if (victim.credit > 0) {
@@ -2005,11 +2216,20 @@ struct MlxMfeOffloadCache::Impl {
                 continue;
             }
             drop_cached_view(key.name);
-            resident_bytes -= victim.weight->packed_nbytes;
             resident_pages.at(key.name)[key.expert].reset();
             ++stats.evictions;
             cancel_pin(key);
             mfe_cache.erase(key);
+            return true;
+        }
+        return false;
+    }
+
+    void trim() {
+        recount_locked();
+        while (resident_bytes > cache_limit) {
+            if (!evict_one_locked()) break;
+            recount_locked();
         }
     }
 };
@@ -2023,21 +2243,27 @@ MlxMfeOffloadCache::MlxMfeOffloadCache(
     std::function<void(const std::string&)> prepared)
     : impl_(std::make_unique<Impl>(model, limit, experts, std::move(prepared))) {}
 
-MlxMfeOffloadCache::~MlxMfeOffloadCache() =
-    default;
+MlxMfeOffloadCache::~MlxMfeOffloadCache() = default;
 
-bool MlxMfeOffloadCache::can_offload(
-    const std::string& name) {
-    std::lock_guard lock(impl_->mutex);
-    try {
-        (void)impl_->mfe_projection_locked(name);
-        return true;
-    } catch (const MfeStreamUnsupported&) {
-        return false;
-    }
+std::weak_ptr<const MlxMfeOffloadCache::WeightImpl>
+MlxMfeOffloadCache::weight_impl(const MlxMfeWeight& weight) noexcept {
+    return weight.impl_;
 }
 
-bool MlxMfeOffloadCache::can_group_mfe(
+MlxMfeWeight MlxMfeOffloadCache::weight_from_impl(
+    const std::shared_ptr<const MlxMfeOffloadCache::WeightImpl>& impl) {
+    return MlxMfeWeight(impl);
+}
+
+void MlxMfeOffloadCache::track_external_weights(
+    const std::vector<MlxMfeWeight>& weights) {
+    std::vector<std::weak_ptr<const MlxMfeOffloadCache::WeightImpl>> refs;
+    refs.reserve(weights.size());
+    for (const auto& weight : weights) refs.push_back(weight_impl(weight));
+    impl_->track_external_weights(std::move(refs));
+}
+
+bool MlxMfeOffloadCache::can_offload(
     const std::string& name) {
     std::lock_guard lock(impl_->mutex);
     try {
@@ -2226,16 +2452,25 @@ std::optional<std::vector<MlxMfeWeight>> MlxMfeOffloadCache::layer_mfe(
                 return read_record(names[index + 1], std::move(pending));
             });
         }
-        result.push_back(is_nint_dtype(impl_->record(names[index]).metadata.dtype)
-            ? MlxMfeWeight::from_nint_blob(storage) : MlxMfeWeight::from_blob(storage));
+        result.push_back((is_nint_dtype(impl_->record(names[index]).metadata.dtype)
+            ? MlxMfeWeight::from_nint_blob(storage) : MlxMfeWeight::from_blob(storage))
+            .prepare_cache_storage());
         if (next.valid()) storage = next.get();
     }
     {
-        std::lock_guard lock(impl_->mutex);
+        std::unique_lock lock(impl_->mutex);
+        if (!impl_->fits_candidate_locked(result)) {
+            if (impl_->async_holds.empty()) return std::nullopt;
+            lock.unlock();
+            impl_->drain();
+            lock.lock();
+            if (!impl_->fits_candidate_locked(result)) return std::nullopt;
+        }
         if (epoch == impl_->epoch)
             for (const auto& name : names)
                 impl_->backing_records.emplace(name, impl_->record(name).metadata.nbytes);
     }
+    track_external_weights(result);
     return result;
 }
 
@@ -2440,6 +2675,7 @@ MfeGroupTask MlxMfeOffloadCache::Impl::prepare_grouped(
                 "in-flight MFE expert bytes");
         }
     }
+    impl_->recount_locked();
     const auto spare = impl_->cache_limit - std::min(impl_->cache_limit, impl_->resident_bytes);
     bool prepare = pending.empty() && bank_pages.size() > 1 && bank_bytes <= spare;
     const auto epoch = admission_epoch.value_or(impl_->epoch);
@@ -2531,10 +2767,11 @@ MfeGroupTask MlxMfeOffloadCache::Impl::prepare_grouped(
                     for (std::size_t index = 0; index < batch.size(); ++index) {
                         auto& request = pending[batch[index]];
                         const std::array blobs{std::span<const std::uint8_t>(wire[index])};
+                        auto weight = request.destination
+                            ? MlxMfeWeight::from_projection_blobs_impl(blobs, false, nullptr, &*request.destination)
+                            : MlxMfeWeight::from_blob(wire[index]);
                         pages[request.page].value = std::make_shared<Impl::MfeCachedExpert>(
-                            request.expert, request.destination
-                                ? MlxMfeWeight::from_projection_blobs_impl(blobs, false, nullptr, &*request.destination)
-                                : MlxMfeWeight::from_blob(wire[index]), request.destination.has_value());
+                            request.expert, weight.prepare_cache_storage(), request.destination.has_value());
                     }
                     pending[batch.front()].prepare_seconds = std::chrono::duration<double>(
                         std::chrono::steady_clock::now() - started).count() - reads.seconds;
@@ -2606,7 +2843,7 @@ MfeGroupTask MlxMfeOffloadCache::Impl::prepare_grouped(
                     parsed.emplace(parse());
                 }
                 pages[request.page].value = std::make_shared<Impl::MfeCachedExpert>(
-                    request.expert, std::move(*parsed), request.destination.has_value());
+                    request.expert, parsed->prepare_cache_storage(), request.destination.has_value());
                 request.prepare_seconds = std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - started).count() - request.reads.seconds;
             }
@@ -2632,14 +2869,16 @@ MfeGroupTask MlxMfeOffloadCache::Impl::prepare_grouped(
         }
         bank.emplace(Impl::PreparedProjection{
             assemble(bank_weights)
-                .with_kernel_profile(projection->kernel_profile), std::move(local)});
+                .with_kernel_profile(projection->kernel_profile)
+                .prepare_cache_storage(), std::move(local)});
     }
     auto result = [&] {
         if (!bank) return assemble(weights)
-            .with_kernel_profile(projection->kernel_profile);
+            .with_kernel_profile(projection->kernel_profile)
+            .prepare_cache_storage();
         std::vector<std::int32_t> local;
         for (const auto& key : ordered_keys) local.push_back(bank->local_ids.at(key.expert));
-        return bank->weight.select_experts(local);
+        return bank->weight.select_experts(local).prepare_cache_storage();
     }();
     if (!bank && pages.size() > 1 && !indirect_pages) {
         std::unordered_map<std::int32_t, std::int32_t> local;
@@ -2658,6 +2897,22 @@ MfeGroupTask MlxMfeOffloadCache::Impl::prepare_grouped(
         impl_->stats.parallel_body_read_batches += request.reads.parallel_body_batches;
         impl_->stats.io_seconds += request.reads.seconds;
         impl_->stats.prepare_seconds += request.prepare_seconds;
+    }
+    std::vector<std::shared_ptr<const Impl::MfeCachedExpert>> candidate_pages;
+    candidate_pages.reserve(pages.size());
+    for (const auto& page : pages) {
+        if (page.value) candidate_pages.push_back(page.value);
+    }
+    std::vector<MlxMfeWeight> candidate_weights;
+    candidate_weights.push_back(result);
+    if (bank) candidate_weights.push_back(bank->weight);
+    if (!impl_->fits_candidate_locked(candidate_weights, candidate_pages)) {
+        if (impl_->async_holds.empty())
+            throw std::runtime_error("MFE physical backing exceeds the configured cache limit");
+        lock.unlock();
+        impl_->drain();
+        lock.lock();
+        impl_->admit_candidate_locked(candidate_weights, candidate_pages);
     }
     std::unordered_map<std::int32_t, std::int32_t> result_ids;
     for (std::size_t index = 0; index < pages.size(); ++index) {
@@ -2683,20 +2938,19 @@ MfeGroupTask MlxMfeOffloadCache::Impl::prepare_grouped(
         if (impl_->mfe_cache.find(page.key)) continue;
         auto& by_id = impl_->resident_pages[name];
         if (by_id.empty()) by_id.resize(projection->experts);
-        const auto bytes = checked_add(impl_->resident_bytes,
-            page.value->packed_nbytes, "resident MFE expert bytes");
-        impl_->mfe_cache.put(page.key, {page.value}, page.value->packed_nbytes,
+        impl_->mfe_cache.put(page.key, {page.value},
+            tyloi::backing_bytes(page.value->weight.backings()),
             prefill_scan && !priority_scan);
-        impl_->resident_bytes = bytes;
         by_id[page.key.expert] = page.value;
     }
     for (const auto& page : pages) touch(page.key, !page.staged);
-    if (bank && bank->weight.packed_nbytes() <= impl_->cache_limit
+    impl_->recount_locked();
+    const auto bank_bytes = bank ? tyloi::backing_bytes(bank->weight.backings()) : 0;
+    if (bank && bank_bytes <= impl_->cache_limit
         - std::min(impl_->cache_limit, impl_->resident_bytes)) {
-        const auto bytes = bank->weight.packed_nbytes();
         impl_->prepared.emplace(name, std::move(*bank));
-        impl_->resident_bytes += bytes;
     }
+    impl_->recount_locked();
     impl_->trim();
     for (const auto& page : pages) {
         const auto cached = impl_->mfe_cache.find(page.key);
@@ -2744,6 +2998,7 @@ std::vector<MlxMfeWeight> MlxMfeOffloadCache::grouped_mfe(
             auto result = grouped_mfe(names.first(2), active_experts, activation_counts, prefill_scan);
             prefix_ready(result);
             result.push_back(grouped_mfe(names.back(), active_experts, activation_counts, prefill_scan));
+            track_external_weights(result);
             return result;
         }
     }
@@ -2860,6 +3115,7 @@ std::vector<MlxMfeWeight> MlxMfeOffloadCache::grouped_mfe(
     std::vector<MlxMfeWeight> result;
     result.reserve(ordered.size());
     for (auto& weight : ordered) result.push_back(std::move(*weight));
+    track_external_weights(result);
     return result;
 }
 
@@ -2873,6 +3129,7 @@ MlxMfeOffloadCache::cache_limit_bytes() const noexcept {
 std::size_t
 MlxMfeOffloadCache::resident_packed_bytes() const {
     std::lock_guard lock(impl_->mutex);
+    impl_->recount_locked();
     return impl_->resident_bytes;
 }
 
@@ -2888,7 +3145,9 @@ MlxMfeCacheReuseStats MlxMfeOffloadCache::reuse_stats() const {
 }
 
 std::size_t MlxMfeOffloadCache::set_cache_limit(std::size_t bytes) {
+    if (bytes < cache_limit_bytes()) drain();
     std::lock_guard lock(impl_->mutex);
+    impl_->recount_locked();
     const auto before = impl_->resident_bytes;
     if (impl_->cache_limit != bytes) {
         impl_->cache_limit = bytes;
@@ -2896,6 +3155,22 @@ std::size_t MlxMfeOffloadCache::set_cache_limit(std::size_t bytes) {
     }
     impl_->trim();
     return before - impl_->resident_bytes;
+}
+
+void MlxMfeOffloadCache::retain_until_drain(
+    std::vector<MlxMfeWeight> weights,
+    std::vector<mlx::core::array> outputs) {
+    impl_->retain_until_drain(std::move(weights), std::move(outputs));
+}
+
+void MlxMfeOffloadCache::retain_cached_until_drain(
+    std::vector<std::shared_ptr<const MlxMfeCachedProjection>> projections,
+    std::vector<mlx::core::array> outputs) {
+    impl_->retain_cached_until_drain(std::move(projections), std::move(outputs));
+}
+
+void MlxMfeOffloadCache::drain() {
+    impl_->drain();
 }
 
 void MlxMfeOffloadCache::set_prefill_priority(std::span<const std::string> names) {
@@ -2935,7 +3210,6 @@ void MlxMfeOffloadCache::discard_record(
             const bool done = current == last;
             const auto next = done ? keys.end() : std::prev(current);
             if (current->name == name) {
-                impl_->resident_bytes -= impl_->mfe_cache.at(*current).weight->packed_nbytes;
                 impl_->cancel_pin(*current);
                 impl_->mfe_cache.erase(*current);
             }
@@ -2946,9 +3220,17 @@ void MlxMfeOffloadCache::discard_record(
     impl_->mfe_projections.erase(name);
     impl_->resident_pages.erase(name);
     impl_->backing_records.erase(name);
+    try {
+        impl_->recount_locked();
+    } catch (...) {
+        // Keep accounting conservative if a no-throw discard cannot rebuild its
+        // deduplicated backing list.
+        impl_->resident_bytes = std::numeric_limits<std::size_t>::max();
+    }
 }
 
 void MlxMfeOffloadCache::clear() {
+    drain();
     std::lock_guard lock(impl_->mutex);
     ++impl_->epoch;
     impl_->prepared.clear();
@@ -2963,7 +3245,11 @@ void MlxMfeOffloadCache::clear() {
     }
     impl_->mfe_cache.clear();
     impl_->mfe_projections.clear();
-    impl_->resident_bytes = 0;
+    impl_->async_holds.clear();
+    // Returned weights and cached projections may still be held by callers.
+    // Their weak entries are retained so clear() does not undercount live
+    // Metal owners or make the next admission exceed the limit silently.
+    impl_->recount_locked();
 }
 
 std::shared_ptr<const MlxMfeCachedProjection> MlxMfeOffloadCache::cached_projection(const std::string& name) {
@@ -2996,22 +3282,36 @@ std::shared_ptr<const MlxMfeCachedProjection> MlxMfeOffloadCache::cached_project
     }
     if (pages.empty()) return {};
     lock.unlock();
-    auto weight = MlxMfeWeight::concatenate_expert_pages(pages, projection->kernel_profile).with_prepared_page_resources();
-    const auto weight_metadata = weight.cached_page_metadata_bytes();
-    if (!weight_metadata) return {};
+    auto weight = MlxMfeWeight::concatenate_expert_pages(pages, projection->kernel_profile)
+        .with_prepared_page_resources().prepare_cache_storage();
     array expert_map(map.begin(), Shape{projection->experts}, mlx::core::int32);
-    const auto metadata = *weight_metadata + expert_map.nbytes();
     auto view = std::make_shared<const MlxMfeCachedProjection>(MlxMfeCachedProjection{
-        std::move(weight), std::move(expert_map), std::move(map), name, metadata});
+        std::move(weight), std::move(expert_map), std::move(map), name});
     lock.lock();
-    if (epoch == impl_->epoch && generation == impl_->page_generation && metadata <= impl_->cache_limit) {
-        if (const auto cached = impl_->cached_views.find(name); cached != impl_->cached_views.end()) return cached->second;
-        const auto bytes = checked_add(impl_->resident_bytes, metadata, "cached expert metadata");
-        impl_->cached_views.emplace(name, view);
-        impl_->resident_bytes = bytes;
-        impl_->trim();
+    const std::array<MlxMfeWeight, 1> candidate_weights{view->weight};
+    const std::array<array, 1> candidate_arrays{view->expert_map};
+    bool admitted = epoch == impl_->epoch && generation == impl_->page_generation
+        && impl_->fits_candidate_locked(candidate_weights,
+            std::span<const std::shared_ptr<const Impl::MfeCachedExpert>>{},
+            candidate_arrays);
+    if (!admitted && !impl_->async_holds.empty()) {
+        lock.unlock();
+        impl_->drain();
+        lock.lock();
+        admitted = epoch == impl_->epoch && generation == impl_->page_generation
+            && impl_->fits_candidate_locked(candidate_weights,
+                std::span<const std::shared_ptr<const Impl::MfeCachedExpert>>{},
+                candidate_arrays);
     }
-    return view;
+    if (admitted) {
+        if (const auto cached = impl_->cached_views.find(name); cached != impl_->cached_views.end()) return cached->second;
+        impl_->cached_views.emplace(name, view);
+        impl_->external_views.emplace(view.get(), view);
+        impl_->recount_locked();
+        impl_->trim();
+        return view;
+    }
+    return {};
 }
 
 bool MlxMfeOffloadCache::resolve_cached_projections(std::span<const std::shared_ptr<const MlxMfeCachedProjection>> views,
@@ -3065,6 +3365,10 @@ bool MlxMfeOffloadCache::resolve_cached_projections(std::span<const std::shared_
 
 array MlxMfeCachedRoute::forward(const array& source, const array& routes, float swiglu_limit,
     const array* reduce_weights) {
+    if (!cache || projections.empty())
+        throw std::invalid_argument("cached MFE route is incomplete");
+    for (const auto& projection : projections)
+        if (!projection) throw std::invalid_argument("cached MFE route projection is missing");
     ids = routes;
     const auto down = projections.size() - 1;
     auto intermediate = [&]() {
@@ -3075,8 +3379,10 @@ array MlxMfeCachedRoute::forward(const array& source, const array& routes, float
             source, routes, swiglu_limit, nullptr, &projections[0]->expert_map, &projections[1]->expert_map);
     }();
     auto down_ids = mlx::core::take(projections[down]->expert_map, routes);
-    return reduce_weights ? projections[down]->weight.routed_matmul_reduce(intermediate, down_ids, *reduce_weights)
+    auto result = reduce_weights ? projections[down]->weight.routed_matmul_reduce(intermediate, down_ids, *reduce_weights)
         : projections[down]->weight.routed_matmul(intermediate, down_ids);
+    cache->retain_cached_until_drain(projections, {result});
+    return result;
 }
 
 std::span<const std::int32_t> MlxMfeCachedRoute::host_ids() {

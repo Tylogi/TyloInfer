@@ -235,13 +235,15 @@ private:
 
     friend class MlxMfeOffloadCache;
     void collect_cache_preparation(int experts, bool shared_input, bool fused_swiglu) const;
-    std::optional<std::size_t> cached_page_metadata_bytes() const;
     static MlxMfeWeight concatenate_expert_pages(const std::vector<MlxMfeWeight>& weights,
         std::shared_ptr<const MlxMfeKernelProfile> profile = nullptr);
     std::shared_ptr<void> pin_packed_storage() const noexcept;
     MlxMfeWeight with_kernel_profile(
         std::shared_ptr<const MlxMfeKernelProfile> profile) const;
     MlxMfeWeight with_prepared_page_resources() const;
+    // Materialize every array root used by cache storage accounting before
+    // backings() is inspected. This is a cache seam, not a numerical transform.
+    MlxMfeWeight prepare_cache_storage() const;
 
     static MlxMfeWeight from_projection_blobs_impl(
         std::span<const std::span<const std::uint8_t>> blobs,

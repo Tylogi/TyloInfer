@@ -1008,7 +1008,7 @@ public:
     }
     void validate_offload(const std::shared_ptr<MlxMfeOffloadCache>& cache) const {
         for (const auto& name : {gate_name_, up_name_.value_or(gate_name_), down_name_}) {
-            if (!cache->can_group_mfe(name)) throw std::runtime_error("expert projection cannot be offloaded: " + name);
+            if (!cache->can_offload(name)) throw std::runtime_error("expert projection cannot be offloaded: " + name);
         }
     }
     void use_offload(const std::shared_ptr<MlxMfeOffloadCache>& cache) {
@@ -1061,7 +1061,7 @@ public:
         const auto down_name = expert_prefix + "down.weight";
         if (tyloi::mfq_compat_enabled && mfe_offload_cache) {
             for (const auto& name : {gate_name, up_name.value_or(gate_name), down_name}) {
-                if (!mfe_offload_cache->can_group_mfe(name)) {
+                if (!mfe_offload_cache->can_offload(name)) {
                     throw std::runtime_error(
                         "Qwen4 expert cache cannot page " + name +
                         "; refusing to bypass the configured cache budget");
@@ -1348,7 +1348,9 @@ public:
                         auto intermediate = up_name_
                             ? (*layer)[0].routed_swiglu_pair((*layer)[2], source, global_ids)
                             : (*layer)[0].routed_swiglu(source, global_ids);
-                        return (*layer)[1].routed_matmul(intermediate, global_ids);
+                        auto output = (*layer)[1].routed_matmul(intermediate, global_ids);
+                        mfe_offload_cache_->retain_until_drain(std::move(*layer), {output});
+                        return output;
                     }
                 }
                 std::vector<std::int32_t> global_to_local(
@@ -1408,6 +1410,10 @@ public:
                     tyloi::metal::profile_eval(
                         "qwen4.moe.routed_gate_up", intermediate);
                 }
+                std::vector<MlxMfeWeight> gate_up_weights;
+                gate_up_weights.push_back(std::move(gate));
+                if (up) gate_up_weights.push_back(std::move(*up));
+                mfe_offload_cache_->retain_until_drain(std::move(gate_up_weights), {intermediate});
                 if ((tokens <= 6 || batched_decode || sorted_routes) && !tyloi::profiling::active())
                     mlx::core::async_eval({intermediate});
                 auto down = mfe_offload_cache_->grouped_mfe(
@@ -1420,9 +1426,11 @@ public:
                         *sorted_routes, true, false, 0.0f, &plan);
                     if (tyloi::profiling::active())
                         tyloi::metal::profile_eval("qwen4.moe.routed_down", output);
-                    return mlx::core::reshape(mlx::core::take(output,
+                    auto result = mlx::core::reshape(mlx::core::take(output,
                         moe_inverse_permutation(*sorted_routes), 0),
                         Shape{tokens, global_ids.shape(1), down.out_per_expert()});
+                    mfe_offload_cache_->retain_until_drain({std::move(down)}, {result});
+                    return result;
                 }
                 if (sorted_routes) intermediate = mlx::core::reshape(mlx::core::take(
                     intermediate, moe_inverse_permutation(*sorted_routes), 0),
@@ -1440,6 +1448,7 @@ public:
                     tyloi::metal::profile_eval(
                         "qwen4.moe.routed_down", output);
                 }
+                mfe_offload_cache_->retain_until_drain({std::move(down)}, {output});
                 return output;
             }
 #endif

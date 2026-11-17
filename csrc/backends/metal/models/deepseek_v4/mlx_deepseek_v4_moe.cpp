@@ -2337,25 +2337,37 @@ MlxDeepseekV4Moe::forward_branches(
                             streamed_gate_name_, selected, activation_counts);
                         auto up_weight = expert_offload_->grouped_mfe(
                             streamed_up_name_, selected, activation_counts);
-                        return gate_weight.routed_swiglu_pair(
+                        auto result = gate_weight.routed_swiglu_pair(
                             up_weight,
                             chunk_source,
                             local_ids,
                             static_cast<float>(config_.swiglu_limit));
+                        expert_offload_->retain_until_drain(
+                            {std::move(gate_weight), std::move(up_weight)},
+                            {result});
+                        return result;
                     }
                     auto gate_weight = expert_offload_->grouped_mfe(
                         streamed_gate_up_name_, selected, activation_counts);
-                    return gate_weight.routed_swiglu(
+                    auto result = gate_weight.routed_swiglu(
                         chunk_source,
                         local_ids,
                         static_cast<float>(config_.swiglu_limit));
+                    expert_offload_->retain_until_drain(
+                        {std::move(gate_weight)},
+                        {result});
+                    return result;
                 }();
                 auto down_weight = expert_offload_->grouped_mfe(
                     streamed_down_name_, selected, activation_counts);
-                return down_weight.routed_matmul_reduce(
+                auto result = down_weight.routed_matmul_reduce(
                     routed_hidden,
                     local_ids,
                     chunk_weights);
+                expert_offload_->retain_until_drain(
+                    {std::move(down_weight)},
+                    {result});
+                return result;
             }();
             // Decode/small-M stays one lazy gate->down graph and is
             // materialized by the causal-layer boundary.  For multi-chunk

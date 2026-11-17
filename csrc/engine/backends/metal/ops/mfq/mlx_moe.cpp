@@ -7378,6 +7378,10 @@ struct MlxMfeWeight::Impl {
     bool nint_q_dispatch = true;
     std::size_t packed_bytes = 0;
 
+    void collect_cache_storage(
+        std::vector<array>& roots,
+        std::vector<std::shared_ptr<tyloi::TensorStorage>>& nested) const;
+
     MlxMfeKernelProfile compilation_profile() const {
         return kernel_profile ? *kernel_profile
             : MlxMfeKernelProfile{family_mask, vq_profile_mask, vq_layouts,
@@ -7790,6 +7794,63 @@ struct MlxMfeWeight::Impl {
         }
     }
 };
+
+void MlxMfeWeight::Impl::collect_cache_storage(
+    std::vector<array>& roots,
+    std::vector<std::shared_ptr<tyloi::TensorStorage>>& nested) const {
+    std::vector<const Impl*> pending{this};
+    std::unordered_set<const Impl*> visited;
+    while (!pending.empty()) {
+        const auto* impl = pending.back();
+        pending.pop_back();
+        if (!visited.insert(impl).second) continue;
+        for (const auto* value : {&impl->descriptors, &impl->nint_q, &impl->nint_sub_scale,
+                &impl->nint_sub_min, &impl->nint_anchor_scale, &impl->nint_anchor_min,
+                &impl->q8_q, &impl->q8_scales, &impl->vq_indices, &impl->vq_state,
+                &impl->vq_aux, &impl->vq_anchors, &impl->vq_codebooks, &impl->vq_scales,
+                &impl->vq_state_to_codebank, &impl->vq_banks, &impl->vq_parameters,
+                &impl->vq_residual_codebooks, &impl->vq_residual_first,
+                &impl->vq_residual_second, &impl->mx_values, &impl->mx_scales}) {
+            roots.push_back(*value);
+        }
+        for (const auto* value : {&impl->indirect_addresses, &impl->packed_arena,
+                &impl->expert_order, &impl->standalone_owner, &impl->mxfp4_slot_ids}) {
+            if (*value) roots.push_back(**value);
+        }
+        for (const auto& value : impl->indirect_owners) roots.push_back(value);
+        if (impl->page_resources)
+            for (const auto& value : impl->page_resources->owners)
+                roots.push_back(value);
+        for (const auto& value : impl->narrow_bindings) roots.push_back(value);
+        for (const auto& rotation : impl->rotations) roots.push_back(rotation.signs);
+        for (const auto& cohort : impl->reference_cohorts) {
+            std::visit([&](const auto& weight) {
+                using Weight = std::decay_t<decltype(weight)>;
+                if constexpr (std::is_same_v<Weight, DenseReferenceMoeWeight>) {
+                    roots.push_back(weight.values);
+                } else {
+                    auto values = weight.backings();
+                    nested.insert(nested.end(), values.begin(), values.end());
+                }
+            }, cohort.weight);
+        }
+        for (const auto& cohort : impl->mxfp4_sq_cohorts) {
+            roots.push_back(cohort.expert_map);
+            auto values = cohort.weight.backings();
+            nested.insert(nested.end(), values.begin(), values.end());
+        }
+        for (const auto& cohort : impl->fp8_sq_cohorts) {
+            roots.push_back(cohort.expert_map);
+            auto values = cohort.weight.backings();
+            nested.insert(nested.end(), values.begin(), values.end());
+        }
+        for (const auto& view : impl->projection_views)
+            pending.push_back(view.get());
+        if (impl->indirect_sources)
+            for (const auto& source : *impl->indirect_sources)
+                pending.push_back(source.impl_.get());
+    }
+}
 
 MlxMfeWeight::MlxMfeWeight(
     std::shared_ptr<const Impl> impl)
@@ -9443,10 +9504,12 @@ MlxMfeWeight MlxMfeWeight::with_prepared_page_resources() const {
     return MlxMfeWeight(std::move(impl));
 }
 
-std::optional<std::size_t> MlxMfeWeight::cached_page_metadata_bytes() const {
-    if (!impl_->page_resources) return std::nullopt;
-    return impl_->descriptors.nbytes() + impl_->indirect_addresses->nbytes()
-        + (impl_->expert_order ? impl_->expert_order->nbytes() : 0);
+MlxMfeWeight MlxMfeWeight::prepare_cache_storage() const {
+    std::vector<array> roots;
+    std::vector<std::shared_ptr<tyloi::TensorStorage>> nested;
+    impl_->collect_cache_storage(roots, nested);
+    if (!roots.empty()) mlx::core::eval(std::move(roots));
+    return *this;
 }
 
 void MlxMfeWeight::collect_cache_preparation(int experts, bool shared_input, bool fused_swiglu) const {
@@ -11909,49 +11972,11 @@ std::vector<std::shared_ptr<tyloi::TensorStorage>> MlxMfeWeight::backings() cons
             if (identity && seen.insert(identity).second) result.push_back(std::move(storage));
         }
     };
-    const auto append_array = [&](const array& value) { append(tyloi::metal::backings(value)); };
-    std::vector<const Impl*> pending{impl_.get()};
-    std::unordered_set<const Impl*> visited;
-    while (!pending.empty()) {
-        const auto* impl = pending.back();
-        pending.pop_back();
-        if (!visited.insert(impl).second) continue;
-        for (const auto* value : {&impl->descriptors, &impl->nint_q, &impl->nint_sub_scale,
-                &impl->nint_sub_min, &impl->nint_anchor_scale, &impl->nint_anchor_min,
-                &impl->q8_q, &impl->q8_scales, &impl->vq_indices, &impl->vq_state,
-                &impl->vq_aux, &impl->vq_anchors, &impl->vq_codebooks, &impl->vq_scales,
-                &impl->vq_state_to_codebank, &impl->vq_banks, &impl->vq_parameters,
-                &impl->vq_residual_codebooks, &impl->vq_residual_first, &impl->vq_residual_second,
-                &impl->mx_values, &impl->mx_scales}) append_array(*value);
-        for (const auto* value : {&impl->indirect_addresses, &impl->packed_arena,
-                &impl->expert_order, &impl->standalone_owner, &impl->mxfp4_slot_ids})
-            if (*value) append_array(**value);
-        for (const auto& value : impl->indirect_owners) append_array(value);
-        if (impl->page_resources)
-            for (const auto& value : impl->page_resources->owners) append_array(value);
-        for (const auto& value : impl->narrow_bindings) append_array(value);
-        for (const auto& rotation : impl->rotations) append_array(rotation.signs);
-        for (const auto& cohort : impl->reference_cohorts) {
-            std::visit([&](const auto& weight) {
-                using Weight = std::decay_t<decltype(weight)>;
-                if constexpr (std::is_same_v<Weight, DenseReferenceMoeWeight>)
-                    append_array(weight.values);
-                else
-                    append(weight.backings());
-            }, cohort.weight);
-        }
-        for (const auto& cohort : impl->mxfp4_sq_cohorts) {
-            append_array(cohort.expert_map);
-            append(cohort.weight.backings());
-        }
-        for (const auto& cohort : impl->fp8_sq_cohorts) {
-            append_array(cohort.expert_map);
-            append(cohort.weight.backings());
-        }
-        for (const auto& view : impl->projection_views) pending.push_back(view.get());
-        if (impl->indirect_sources)
-            for (const auto& source : *impl->indirect_sources) pending.push_back(source.impl_.get());
-    }
+    std::vector<array> roots;
+    std::vector<std::shared_ptr<tyloi::TensorStorage>> nested;
+    impl_->collect_cache_storage(roots, nested);
+    append(std::move(nested));
+    for (const auto& value : roots) append(tyloi::metal::backings(value));
     return result;
 }
 

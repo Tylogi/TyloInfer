@@ -88,9 +88,9 @@ MlxDeepseekV41Moe MlxDeepseekV41Moe::load(
         : std::nullopt;
     const auto down_name = expert_prefix + "down.weight";
     if (tyloi::mfq_compat_enabled && mfe_offload_cache &&
-        (!mfe_offload_cache->can_group_mfe(gate_up_name)
-         || (up_name && !mfe_offload_cache->can_group_mfe(*up_name))
-         || !mfe_offload_cache->can_group_mfe(down_name))) {
+        (!mfe_offload_cache->can_offload(gate_up_name)
+         || (up_name && !mfe_offload_cache->can_offload(*up_name))
+         || !mfe_offload_cache->can_offload(down_name))) {
         throw std::runtime_error(
             "DeepSeek-V4.1 expert projection cannot be offloaded; "
             "refusing to bypass the configured cache budget: " + prefix);
@@ -364,7 +364,7 @@ void MlxDeepseekV41Moe::validate_offload(
     for (const auto& name : {streamed_gate_up_name_,
              streamed_up_name_.value_or(streamed_gate_up_name_),
              streamed_down_name_}) {
-        if (!cache->can_group_mfe(name)) {
+        if (!cache->can_offload(name)) {
             throw std::runtime_error("expert projection cannot be offloaded: " + name);
         }
     }
@@ -674,6 +674,9 @@ MlxDeepseekV41MoeResult MlxDeepseekV41Moe::forward(
                 [&](const std::vector<MlxMfeWeight>& gu) {
                     staged_hidden = gu[0].routed_swiglu_pair(gu[1], source,
                         local_ids, swiglu_limit_, route_groups);
+                    mfe_offload_cache_->retain_until_drain(
+                        std::vector<MlxMfeWeight>(gu.begin(), gu.end()),
+                        {*staged_hidden});
                     mlx::core::async_eval({*staged_hidden});
                 });
             layer_ready = true;
@@ -718,6 +721,7 @@ MlxDeepseekV41MoeResult MlxDeepseekV41Moe::forward(
         }();
         if (!layer_ready) {
             if (!prefill_scan || sorted_routes) mlx::core::async_eval({routed_hidden});
+            mfe_offload_cache_->retain_until_drain(*weights, {routed_hidden});
             weights->clear();
             weights->push_back(mfe_offload_cache_->grouped_mfe(
                 streamed_down_name_, active, activation_counts, prefill_scan));
@@ -738,6 +742,7 @@ MlxDeepseekV41MoeResult MlxDeepseekV41Moe::forward(
                 Shape{rows, top_k_, intermediate_});
             routed = down.routed_matmul_reduce(routed_hidden, local_ids, routes.weights, route_groups);
         }
+        mfe_offload_cache_->retain_until_drain(std::move(*weights), {routed});
     } else
 #endif
     if (gguf_expert_cache_) {
