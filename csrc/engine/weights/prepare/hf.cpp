@@ -1,6 +1,7 @@
 #include "hf.h"
 
 #include "../encoding/dense/blob.h"
+#include "../encoding/fp8/channel.h"
 #include "../encoding/sq/fp8_blob.h"
 #include "../encoding/mx/blob.h"
 #include "../encoding/quant/mfe_blob.h"
@@ -9,6 +10,8 @@
 
 #include <algorithm>
 #include <limits>
+#include <optional>
+#include <regex>
 #include <stdexcept>
 #include <utility>
 
@@ -89,6 +92,117 @@ void append(
     }
 }
 
+std::optional<Record> make_channel_fp8(
+    const Safetensors& files,
+    const TensorMetadata& values,
+    std::string name,
+    const nlohmann::json& config) {
+    if ((values.dtype != "F8_E4M3" && values.dtype != "F8_E4M3FN") ||
+        !config.is_object() ||
+        config.value("format", std::string{}) != "float-quantized") {
+        return std::nullopt;
+    }
+    if (config.value("quant_method", std::string{}) != "compressed-tensors" ||
+        values.name.size() < 7 ||
+        values.name.substr(values.name.size() - 7) != ".weight") {
+        throw std::invalid_argument(
+            "unsupported channel FP8 quantization contract");
+    }
+
+    const auto module = values.name.substr(0, values.name.size() - 7);
+    const nlohmann::json* group = nullptr;
+    for (const auto& candidate : config.at("config_groups")) {
+        bool match = false;
+        for (const auto& value : candidate.at("targets")) {
+            const auto target = value.get<std::string>();
+            match |= target == "Linear" || target == module ||
+                (target.rfind("re:", 0) == 0 &&
+                 std::regex_match(module, std::regex(target.substr(3))));
+        }
+        if (match) {
+            if (group != nullptr) {
+                throw std::invalid_argument(
+                    "FP8 weight matches multiple quantization groups");
+            }
+            group = &candidate;
+        }
+    }
+    if (group == nullptr) {
+        throw std::invalid_argument(
+            "FP8 weight has no matching quantization group");
+    }
+
+    const auto& weights = group->at("weights");
+    if (weights.value("num_bits", 0) != 8 ||
+        weights.value("type", std::string{}) != "float" ||
+        weights.value("strategy", std::string{}) != "channel" ||
+        !weights.value("symmetric", false) ||
+        weights.value("dynamic", false) || !values.shape ||
+        values.shape->size() != 2) {
+        throw std::invalid_argument("unsupported FP8 weight scale scheme");
+    }
+
+    bool dynamic = false;
+    if (group->contains("input_activations") &&
+        !group->at("input_activations").is_null()) {
+        const auto& input = group->at("input_activations");
+        if (input.value("num_bits", 0) != 8 ||
+            input.value("type", std::string{}) != "float" ||
+            input.value("strategy", std::string{}) != "token" ||
+            !input.value("symmetric", false) ||
+            !input.value("dynamic", false)) {
+            throw std::invalid_argument(
+                "unsupported FP8 input activation scheme");
+        }
+        dynamic = true;
+    }
+    if (group->contains("output_activations") &&
+        !group->at("output_activations").is_null()) {
+        throw std::invalid_argument(
+            "FP8 output activation quantization is unsupported");
+    }
+
+    const auto scale_name = module + ".weight_scale";
+    const auto* scale = files.find(scale_name);
+    const auto rows = values.shape->at(0);
+    const auto width = values.shape->at(1);
+    if (!scale || !scale->shape ||
+        (*scale->shape != std::vector<std::int64_t>{rows} &&
+         *scale->shape != std::vector<std::int64_t>{rows, 1})) {
+        throw std::invalid_argument(
+            "channel FP8 scale shape must match output channels");
+    }
+    const auto kind = scale->dtype == "BF16"
+        ? channel_fp8::ScaleKind::Bf16
+        : scale->dtype == "F16"
+            ? channel_fp8::ScaleKind::F16
+            : scale->dtype == "F32"
+                ? channel_fp8::ScaleKind::F32
+                : throw std::invalid_argument(
+                    "unsupported channel FP8 scale dtype");
+    const auto image = channel_fp8::layout(rows, width, kind, dynamic);
+    if (values.nbytes != static_cast<std::uint64_t>(rows) *
+                             static_cast<std::uint64_t>(width) ||
+        scale->nbytes != static_cast<std::uint64_t>(rows) *
+                             channel_fp8::scale_bytes(kind)) {
+        throw std::invalid_argument("channel FP8 source size mismatch");
+    }
+
+    Record record;
+    record.metadata.name = std::move(name);
+    record.metadata.dtype = std::string(channel_fp8::dtype);
+    record.metadata.stored_dtype = values.dtype;
+    record.metadata.shape = values.shape;
+    record.metadata.nbytes = image.bytes;
+    record.segments.push_back({0, channel_fp8::prefix(image), {}, 0, 0});
+    record.segments.push_back({
+        channel_fp8::header_bytes, {}, values.name, 0,
+        image.scales - channel_fp8::header_bytes});
+    record.segments.push_back({
+        image.scales, {}, scale_name, 0, image.bytes - image.scales});
+    return record;
+}
+
 } // namespace
 
 Record prepare(
@@ -97,11 +211,15 @@ Record prepare(
     std::string name,
     const std::vector<std::int64_t>& dense_shape,
     const std::vector<std::string>& scale_names,
-    const nlohmann::json& quantization) {
+    const nlohmann::json& quantization,
+    const nlohmann::json& quantization_config) {
     if (!values.shape) {
         throw std::runtime_error("HF tensor shape is missing: " + values.name);
     }
 
+    if (auto channel = make_channel_fp8(files, values, name, quantization_config)) {
+        return std::move(*channel);
+    }
     Record record;
     record.metadata.name = std::move(name);
     record.metadata.stored_dtype = values.dtype;

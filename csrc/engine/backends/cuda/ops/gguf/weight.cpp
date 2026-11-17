@@ -4,6 +4,7 @@
 #include "rotation.h"
 #include "row_correction.h"
 #include "engine/backends/cuda/ops/projection/quant_linear.h"
+#include "engine/backends/cuda/ops/projection/prefill.h"
 #include "engine/backends/cuda/native/profile.h"
 #include "engine/backends/cuda/native/tensor/backend.h"
 #include "engine/backends/cuda/native/context.h"
@@ -26,14 +27,11 @@
 #include <cstdlib>
 #include <atomic>
 #include <cstdio>
-#include <map>
-#include <tuple>
 
 #include <mutex>
 
 
 namespace {
-std::int64_t prefill_weight_rows(std::int64_t,std::uint64_t,std::int64_t,int,bool);
 // Only row exponents are retained. Weak ownership prevents either model
 // retention or reuse after an allocator gives another weight the same address.
 struct PrefillRowScale {
@@ -64,7 +62,7 @@ struct PrefillRowScale {
     entry->exponents=::tyloi::cuda::empty({w.out},w.packed.options().dtype(::tyloi::kInt32));
     mfq_cuda_record_stream(entry->exponents,stream);
     if(w.quad_storage_rows) {
-        const auto rows=prefill_weight_rows(w.out,w.row_bytes,128,w.packed.get_device(),false);
+        const auto rows=tyloi::cuda::prefill_weight_rows(w.out,w.row_bytes,128,w.packed.get_device(),false);
         auto image=::tyloi::cuda::empty({std::int64_t(rows*w.row_bytes)},w.packed.options());
         mfq_cuda_record_stream(image,stream);mfq_cuda_record_stream(w.packed,stream);
         for(std::int64_t begin=0;begin<w.out;begin+=rows) {
@@ -80,56 +78,6 @@ struct PrefillRowScale {
             entry->exponents.data_ptr<std::int32_t>(),stream.stream());
     }
     entry->ready.record(stream.stream());auto result=entry->exponents;cache.push_back(std::move(entry));return result;
-}
-std::int64_t prefill_weight_rows(std::int64_t rows,std::uint64_t bytes_per_row,
-        std::int64_t alignment,int device,bool double_buffer=false) {
-    const auto context=tyloi::cuda::default_context(device);
-    using Key=std::tuple<int,std::int64_t,std::uint64_t,std::int64_t,bool>;
-    static thread_local std::map<Key,std::int64_t> prepared;
-    const Key key{device,rows,bytes_per_row,alignment,double_buffer};
-    cudaStreamCaptureStatus capture=cudaStreamCaptureStatusNone;
-    TYLOINFER_CUDA_CHECK(cudaStreamIsCapturing(mfq_current_cuda_stream(),&capture));
-    if(capture!=cudaStreamCaptureStatusNone) {
-        if(const auto found=prepared.find(key);found!=prepared.end())return found->second;
-        return std::min(rows,alignment);
-    }
-    const auto physical=context->available_memory(),reusable=context->reusable_workspace_bytes();
-    const auto add=[](std::size_t left,std::size_t right) {
-        return left>SIZE_MAX-right?SIZE_MAX:left+right;
-    };
-    const auto ordinary=add(physical,reusable);
-    const auto budget=add(ordinary,context->workspace_available());
-    // Leave room for the following activation and the BLAS library's scratch.
-    // A complete matrix is preferred whenever it fits this live device budget;
-    // the old fixed 16 MiB tile needlessly fragmented large prompt GEMMs.
-    auto count=std::min<std::uint64_t>(rows,(budget/2)/bytes_per_row);
-    if(count<std::uint64_t(rows) && double_buffer)count/=2;
-    const auto stream=mfq_current_cuda_stream();
-    const auto fits=[&](std::int64_t candidate) {
-        if(candidate<=0 || std::uint64_t(candidate)>SIZE_MAX/bytes_per_row)return false;
-        const auto bytes=std::size_t(candidate)*std::size_t(bytes_per_row);
-        const std::vector<std::size_t> allocations=double_buffer?
-            std::vector<std::size_t>{bytes,bytes}:std::vector<std::size_t>{bytes};
-        return context->workspace_allocations_fit(allocations,ordinary,stream);
-    };
-    std::uint64_t selected_count=count>=std::uint64_t(rows)?count:
-        count>=std::uint64_t(alignment)?
-            count/std::uint64_t(alignment)*std::uint64_t(alignment):
-            std::uint64_t(std::max<std::int64_t>(1,std::int64_t(count)));
-    if (!fits(std::int64_t(selected_count))) {
-        if(selected_count<std::uint64_t(alignment)) selected_count=1;
-        else {
-            while(selected_count>std::uint64_t(alignment) && !fits(std::int64_t(selected_count)))
-                selected_count-=std::uint64_t(alignment);
-            if(!fits(std::int64_t(selected_count)))
-                selected_count=1;
-        }
-    }
-    const auto selected=count>=std::uint64_t(rows) && selected_count==count?rows:
-        selected_count>=std::uint64_t(alignment)?
-            std::int64_t(selected_count):std::max<std::int64_t>(1,std::int64_t(selected_count));
-    prepared[key]=selected;
-    return selected;
 }
 }
 
@@ -214,7 +162,7 @@ GgufPrefillProduct gguf_prefill_product(const GgufWeight& w,const ::tyloi::Dense
     const MfqCudaGuard guard(w.packed.get_device());
     if(!tyloi::cuda::gguf::grouped_f16_available(w.packed.get_device()))return {};
     const auto tokens=input.numel()/w.neuron_len;
-    if(prefill_weight_rows(w.out,uint64_t(w.neuron_len)*2+uint64_t(tokens)*2,32,w.packed.get_device())<w.out)return {};
+    if(tyloi::cuda::prefill_weight_rows(w.out,uint64_t(w.neuron_len)*2+uint64_t(tokens)*2,32,w.packed.get_device())<w.out)return {};
     auto columns=prefill_cached_exponents(w);if(!columns.defined())return {};
     ::tyloi::DenseTensor packed,rows;
     const auto stream=mfq_get_current_cuda_stream(w.packed.get_device());
@@ -266,7 +214,7 @@ static GgufPrefillProduct rms_gated_product_impl(const GgufWeight& w,const ::tyl
         if(scaled_gate->row_exponents.numel()!=m || scaled_gate->column_exponents.numel()!=w.neuron_len)return {};
     }
     const auto row_bytes=uint64_t(w.neuron_len)*2+uint64_t(m)*2;
-    if(prefill_weight_rows(w.out,row_bytes,32,w.packed.get_device(),false)<w.out)return {};
+    if(tyloi::cuda::prefill_weight_rows(w.out,row_bytes,32,w.packed.get_device(),false)<w.out)return {};
     auto exponents=prefill_cached_exponents(w);if(!exponents.defined())return {};
     auto image=::tyloi::cuda::empty({w.out,w.neuron_len},attended.options().dtype(::tyloi::kFloat16));
     auto packed=::tyloi::cuda::empty({m,w.neuron_len},attended.options().dtype(::tyloi::kFloat16));
@@ -1041,7 +989,7 @@ bool GgufWeight::can_forward_prefill_residual(int64_t tokens,const ::tyloi::Dens
         const bool fast_prefill=((fast_setting && fast_setting[0]=='1') ||
             ((!fast_setting || fast_setting[0]=='a') && tokens>=512 && allow_mmq)) &&
             tyloi::cuda::gguf::grouped_f16_available(packed.get_device());
-        const auto mmq_rows=fast_prefill?0:prefill_weight_rows(out,row_bytes,128,packed.get_device());
+        const auto mmq_rows=fast_prefill?0:tyloi::cuda::prefill_weight_rows(out,row_bytes,128,packed.get_device());
         const auto final_rows=mmq_rows>0?out%mmq_rows:0;
         if(allow_mmq && (!mmq_setting || mmq_setting[0]!='0') && mmq_rows>0 && tokens<=INT_MAX && neuron_len<=INT_MAX &&
                 (dtype==::tyloi::kFloat16 || dtype==::tyloi::kFloat32) && mmq::fits(type,mmq_rows,packed.get_device()) &&
@@ -1097,7 +1045,7 @@ bool GgufWeight::can_forward_prefill_residual(int64_t tokens,const ::tyloi::Dens
         // output removes the tile result and its strided copy for tensor cores.
         const auto workspace_row_bytes=std::uint64_t(neuron_len)*(half || fused_scaled?2:4)+
             (scaled_half && !fused_scaled?std::uint64_t(neuron_len)*2:0)+(!half && !scaled_half?std::uint64_t(tokens)*4:0)+(fast_prefill?std::uint64_t(tokens)*2:0);
-        const auto tile_rows=prefill_weight_rows(out,workspace_row_bytes,32,packed.get_device(),true);
+        const auto tile_rows=tyloi::cuda::prefill_weight_rows(out,workspace_row_bytes,32,packed.get_device(),true);
         cudaStreamCaptureStatus capture=cudaStreamCaptureStatusNone;
         TYLOINFER_CUDA_CHECK(cudaStreamIsCapturing(mfq_current_cuda_stream(),&capture));
         const bool pipelined=tile_rows<out && capture==cudaStreamCaptureStatusNone;

@@ -22,7 +22,8 @@ Record prepare(
     std::string name,
     const std::vector<std::int64_t>& dense_shape,
     const std::vector<std::string>& scale_names,
-    const nlohmann::json& quantization);
+    const nlohmann::json& quantization,
+    const nlohmann::json& quantization_config);
 
 Record experts(std::string name, const std::map<std::size_t, const Record*>& records);
 

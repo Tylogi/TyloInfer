@@ -112,7 +112,7 @@ ResidualCore::Projection ResidualCore::projection(::tyloi::Tensor weight, Part p
             !result.promoted.defined() && result.right.size(0) % 4 == 0)
             result.prepared_right = prepare_gr_dense_vector_right(result.prepared_right);
         const bool direct = dense.scalar_type() == ::tyloi::kBFloat16 && dense.is_contiguous();
-        result.can_activate = direct && part == Part::final_down;
+        result.can_activate = direct && part != Part::final_up;
         result.can_mix = direct && part == Part::final_up;
         return result;
     }
@@ -188,9 +188,13 @@ ResidualCore::DenseTensor ResidualCore::Projection::activate(
     }
 #endif
     const auto option = ::tyloi::cuda::options::gr_dense_bf16_direct();
-    if (!injection && (!option || *option))
-        if (auto output = try_gr_bf16_down_cuda(input, payload_as<DenseTensor>(weight), streams); output.defined())
+    if (!option || *option) {
+        if (injection) {
+            if (auto output = try_gr_bf16_injection_cuda(input, payload_as<DenseTensor>(weight), streams); output.defined())
+                return output;
+        } else if (auto output = try_gr_bf16_down_cuda(input, payload_as<DenseTensor>(weight), streams); output.defined())
             return output;
+    }
     auto projected = forward(input);
     return injection ? mfq_qwen4_exp::gated_residual_injection(projected, streams)
                      : mfq_qwen4_exp::gated_residual_bottleneck(projected, streams);

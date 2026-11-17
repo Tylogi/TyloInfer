@@ -27,12 +27,12 @@
 #include "../ffn/residual/bf16_prefill_mix.cuh"
 
 namespace {
-template<bool Vectorized,int Rows=1>
+template<bool Vectorized,int Rows=1,int QueryTiles=2>
 __global__ __launch_bounds__(256) void dense_f32_projection_kernel(
         const float* __restrict__ input,const float* __restrict__ weight,float* output,int width,int outputs) {
- // Share each activation load across two output rows. Two query tiles retain
- // enough independent CTAs without changing a query's FMA or reduction order.
- constexpr int Tile=2,QueryTiles=2;
+ // Share each activation load across two outputs and weight loads across
+ // queries. Query tiling changes occupancy, never a query's summation tree.
+ constexpr int Tile=2;
  constexpr int Columns=(Rows+QueryTiles-1)/QueryTiles;
  const int row0=(blockIdx.x/QueryTiles)*Tile,first=(blockIdx.x%QueryTiles)*Columns;
  if(first>=Rows)return;
@@ -632,9 +632,6 @@ namespace {
         TYLOINFER_CUDA_CHECK(cudaDeviceGetAttribute(&sms,cudaDevAttrMultiProcessorCount,input.get_device()));
         cached_device=input.get_device();
     }
-    // Two output rows and two query tiles keep about one CTA per output.
-    // Larger matrices retain their cuBLAS schedule.
-    if(weight.size(0)>=int64_t(sms)*4)return {};
     const MfqCudaGuard guard(input.get_device());
     const auto stream=mfq_get_current_cuda_stream(input.get_device());
     auto shape=input.sizes().vec();shape.back()=weight.size(0);
@@ -643,11 +640,17 @@ namespace {
     const bool vectorized=weight.size(1)%4==0 &&
         (reinterpret_cast<std::uintptr_t>(input.data_ptr())|reinterpret_cast<std::uintptr_t>(weight.data_ptr()))%16==0;
     const auto launch=[&]<int M>() {
-        const auto kernel=vectorized?dense_f32_projection_kernel<true,M>:dense_f32_projection_kernel<false,M>;
-        kernel<<<unsigned(((weight.size(0)+1)/2)*2),256,0,stream.stream()>>>(input.data_ptr<float>(),weight.data_ptr<float>(),
-            output.data_ptr<float>(),int(weight.size(1)),int(weight.size(0)));
-        if(tyloi::cuda::dispatch_trace::enabled())tyloi::cuda::dispatch_trace::record(stream.stream(),"dense_f32_projection",
-            reinterpret_cast<const void*>(kernel),"M="+std::to_string(M)+" N="+std::to_string(weight.size(0))+" K="+std::to_string(weight.size(1))+" output_tile=2 query_tiles=2");
+        const auto queries=[&]<int Tiles>() {
+            const auto kernel=vectorized?dense_f32_projection_kernel<true,M,Tiles>:dense_f32_projection_kernel<false,M,Tiles>;
+            kernel<<<unsigned(((weight.size(0)+1)/2)*Tiles),256,0,stream.stream()>>>(input.data_ptr<float>(),weight.data_ptr<float>(),
+                output.data_ptr<float>(),int(weight.size(1)),int(weight.size(0)));
+            if(tyloi::cuda::dispatch_trace::enabled())tyloi::cuda::dispatch_trace::record(stream.stream(),"dense_f32_projection",
+                reinterpret_cast<const void*>(kernel),"M="+std::to_string(M)+" N="+std::to_string(weight.size(0))+" K="+std::to_string(weight.size(1))+" output_tile=2 query_tiles="+std::to_string(Tiles));
+        };
+        // Retain two query tiles only when output tiles alone provide fewer
+        // than two CTAs per processor. Wider projections read weights once.
+        if(M==1 || (weight.size(0)+1)/2>=int64_t(sms)*2)queries.template operator()<1>();
+        else queries.template operator()<2>();
     };
     switch(rows) {
         case 1:launch.template operator()<1>();break;case 2:launch.template operator()<2>();break;
@@ -704,32 +707,34 @@ namespace {
     TYLOINFER_CUDA_CHECK(cudaGetLastError());return output;
 }
 
-std::vector<::tyloi::DenseTensor> try_gr_bf16_down_injection_cuda(const ::tyloi::DenseTensor& input,
-        const ::tyloi::DenseTensor& weight,const ::tyloi::DenseTensor& injection,int64_t streams) {
+static std::vector<::tyloi::DenseTensor> gr_bf16_activated_projections_cuda(const ::tyloi::DenseTensor& input,
+        const ::tyloi::DenseTensor& down,const ::tyloi::DenseTensor& injection,int64_t streams) {
 
+    const auto& weight=down.defined()?down:injection;
     if(streams<1 || streams>INT_MAX || !input.is_cuda() || !input.is_contiguous() || input.dim()<1 || input.size(-1)<1 ||
             input.size(-1)>INT_MAX || input.numel()/input.size(-1)<1 || input.numel()/input.size(-1)>6 ||
             (input.scalar_type()!=::tyloi::kFloat16 && input.scalar_type()!=::tyloi::kFloat32) ||
-            !weight.is_cuda() || !weight.is_contiguous() || weight.device()!=input.device() ||
+            !weight.defined() || !weight.is_cuda() || !weight.is_contiguous() || weight.device()!=input.device() ||
             weight.scalar_type()!=::tyloi::kBFloat16 || weight.dim()!=2 || weight.size(0)<1 || weight.size(0)>INT_MAX ||
             weight.size(1)!=input.size(-1))return {};
     if(injection.defined() && (!injection.is_cuda() || !injection.is_contiguous() || injection.device()!=input.device() ||
             injection.scalar_type()!=::tyloi::kBFloat16 || injection.dim()!=2 || injection.size(0)!=streams ||
-            injection.size(1)!=input.size(-1) || weight.size(0)>INT_MAX-streams))return {};
+            injection.size(1)!=input.size(-1) || (down.defined() && down.size(0)>INT_MAX-streams)))return {};
     const MfqCudaGuard guard(input.device());
-    const int width=int(weight.size(1)),rank=int(weight.size(0)),rows=int(input.numel()/width);
+    const int width=int(weight.size(1)),rank=down.defined()?int(down.size(0)):0,rows=int(input.numel()/width);
     auto shape=input.sizes().vec();shape.back()=rank;
-    auto output=::tyloi::cuda::empty(shape,input.options().dtype(::tyloi::kFloat32));
+    auto output=rank ? ::tyloi::cuda::empty(shape,input.options().dtype(::tyloi::kFloat32)) : ::tyloi::DenseTensor{};
     ::tyloi::DenseTensor gates;
-    if(injection.defined()) {shape.back()=streams;gates=::tyloi::cuda::empty(shape,output.options());}
+    if(injection.defined()) {shape.back()=streams;gates=::tyloi::cuda::empty(shape,input.options().dtype(::tyloi::kFloat32));}
     const auto launch=[&](auto capacity,auto type) {
         using Input=decltype(type);
         constexpr int threads=decltype(capacity)::value==1?128:256;
         gr_bf16_down_kernel<decltype(capacity)::value,Input><<<rank+(gates.defined()?int(streams):0),threads,0,mfq_current_cuda_stream()>>>(
-            input.data_ptr<Input>(),static_cast<const uint16_t*>(weight.data_ptr()),output.data_ptr<float>(),width,rank,int(streams),
+            input.data_ptr<Input>(),down.defined()?static_cast<const uint16_t*>(down.data_ptr()):nullptr,
+            output.defined()?output.data_ptr<float>():nullptr,width,rank,int(streams),
             gates.defined()?static_cast<const uint16_t*>(injection.data_ptr()):nullptr,gates.defined()?gates.data_ptr<float>():nullptr);
         if(tyloi::cuda::dispatch_trace::enabled())tyloi::cuda::dispatch_trace::record(mfq_current_cuda_stream(),
-            gates.defined()?"gr_bf16_down_silu_injection":"gr_bf16_down_silu",
+            rank?(gates.defined()?"gr_bf16_down_silu_injection":"gr_bf16_down_silu"):"gr_bf16_injection",
             reinterpret_cast<const void*>(gr_bf16_down_kernel<decltype(capacity)::value,Input>),
             "M="+std::to_string(rows)+" N="+std::to_string(rank)+" K="+std::to_string(width));
     };
@@ -745,6 +750,18 @@ std::vector<::tyloi::DenseTensor> try_gr_bf16_down_injection_cuda(const ::tyloi:
         case 6:types(std::integral_constant<int,6>{});break;
     }
     TYLOINFER_CUDA_CHECK(cudaGetLastError());return {output,gates};
+}
+
+std::vector<::tyloi::DenseTensor> try_gr_bf16_down_injection_cuda(const ::tyloi::DenseTensor& input,
+        const ::tyloi::DenseTensor& weight,const ::tyloi::DenseTensor& injection,int64_t streams) {
+    if(!weight.defined())return {};
+    return gr_bf16_activated_projections_cuda(input,weight,injection,streams);
+}
+
+::tyloi::DenseTensor try_gr_bf16_injection_cuda(const ::tyloi::DenseTensor& input,
+        const ::tyloi::DenseTensor& weight,int64_t streams) {
+    auto projected=gr_bf16_activated_projections_cuda(input,{},weight,streams);
+    return projected.empty()?::tyloi::DenseTensor{}:projected[1];
 }
 
 ::tyloi::DenseTensor try_gr_bf16_down_cuda(const ::tyloi::DenseTensor& input,

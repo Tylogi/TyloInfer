@@ -6,6 +6,8 @@ int nint_float_projection_resident_blocks(int device);
 
 ::tyloi::DenseTensor try_gr_bf16_down_cuda(
     const ::tyloi::DenseTensor& input,const ::tyloi::DenseTensor& weight,int64_t streams);
+::tyloi::DenseTensor try_gr_bf16_injection_cuda(
+    const ::tyloi::DenseTensor& input,const ::tyloi::DenseTensor& weight,int64_t streams);
 ::tyloi::DenseTensor try_gr_bf16_up_mix_cuda(
     const ::tyloi::DenseTensor& input,const ::tyloi::DenseTensor& normalized,
     const ::tyloi::DenseTensor& weight,int64_t streams);

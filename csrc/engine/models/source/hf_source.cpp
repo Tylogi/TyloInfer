@@ -221,11 +221,13 @@ HfSource::HfSource(std::filesystem::path root, std::string source_prefix)
     };
     std::unordered_set<std::string> consumed_scales;
     json mlx_quantization;
+    json quantization_config;
     if (has_asset(kModelConfigAsset)) {
         const auto config = read_asset(kModelConfigAsset);
         const auto parsed = json::parse(reinterpret_cast<const char*>(config.data()),
             reinterpret_cast<const char*>(config.data() + config.size()));
         mlx_quantization = parsed.value("quantization", json{});
+        quantization_config = parsed.value("quantization_config", json{});
     }
     std::vector<std::pair<std::string, std::string>> aliases(
         canonical_to_source.begin(), canonical_to_source.end());
@@ -238,7 +240,8 @@ HfSource::HfSource(std::filesystem::path root, std::string source_prefix)
             : std::vector<std::int64_t>{};
         auto record = hf::prepare(
             impl_->files, *values, canonical, dense_shape,
-            scale_candidates(source_name, canonical), mlx_quantization);
+            scale_candidates(source_name, canonical), mlx_quantization,
+            quantization_config);
         for (const auto& segment : record.segments) {
             if (!segment.source_name.empty() &&
                 segment.source_name != source_name) {

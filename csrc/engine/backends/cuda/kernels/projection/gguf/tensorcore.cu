@@ -17,6 +17,7 @@
 
 
 #include "prefill/scale.cuh"
+#include "../prefill/lt.cuh"
 #include "../../reduce.cuh"
 
 namespace tyloi::cuda::gguf {
@@ -68,7 +69,6 @@ __global__ void restore_scale_strided(float* output,const std::int32_t* input_ex
     }
 }
 void checked(cudaError_t status) {if(status!=cudaSuccess)throw std::runtime_error(cudaGetErrorString(status));}
-#include "prefill/lt.cuh"
 }
 void pack_scaled_f16(const float* input,void* output,std::int32_t* exponents,
         std::int64_t rows,std::int64_t columns,cudaStream_t stream) {
@@ -220,7 +220,7 @@ PrefillResidualGemmPlan prepare_prefill_residual_gemm(const void* input,const vo
     if(!input || !weight || !residual || !output || output==residual || tokens<0 || rows<0 || columns<0 ||
             tokens>INT_MAX || rows>INT_MAX || columns>INT_MAX || output_stride<rows || output_stride>INT_MAX)
         throw std::invalid_argument("Invalid GGUF residual GEMM planning geometry");
-    auto plan=prefill_lt_residual_plan(input,weight,residual,output,tokens,rows,columns,output_stride,stream);
+    auto plan=tyloi::cuda::prefill::prepare_residual(input,weight,residual,output,tokens,rows,columns,output_stride,stream);
     const auto bytes=plan?plan->workspace:0;
     return {std::move(plan),bytes};
 }
@@ -233,13 +233,13 @@ void prefill_gemm_f16_residual(const void* input,const void* weight,const void* 
             tokens>INT_MAX || rows>INT_MAX || columns>INT_MAX || output_stride<rows || output_stride>INT_MAX)
         throw std::invalid_argument("GGUF FP16 residual GEMM dimensions are invalid");
     if(prepared) {
-        const auto plan=std::static_pointer_cast<PrefillLtResidual>(prepared.implementation);
+        const auto plan=std::static_pointer_cast<tyloi::cuda::prefill::GemmPlan>(prepared.implementation);
         int device=0;checked(cudaGetDevice(&device));
         if(plan->owner->device!=device || plan->tokens!=tokens || plan->rows!=rows || plan->columns!=columns ||
                 plan->stride!=output_stride || workspace_bytes<plan->workspace || (plan->workspace && !workspace))
             throw std::invalid_argument("GGUF residual GEMM plan or scratch differs from its operands");
         const half one=__float2half(1.f);
-        prefill_lt_checked(cublasLtMatmul(plan->owner->handle,plan->operation,&one,weight,plan->a,input,plan->b,
+        tyloi::cuda::prefill::check_lt(cublasLtMatmul(plan->owner->handle,plan->operation,&one,weight,plan->a,input,plan->b,
             &one,residual,plan->c,output,plan->c,&plan->algorithm,workspace,workspace_bytes,stream));
     } else {
         prefill_gemm_f16_accum(input,weight,nullptr,output,true,nullptr,nullptr,tokens,rows,columns,output_stride,blas_handle,stream);

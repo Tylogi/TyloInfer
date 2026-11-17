@@ -7,6 +7,7 @@
 #include "engine/backends/cuda/native/tensor/tensor.h"
 #include "engine/backends/cuda/ops/activation.h"
 #include "engine/backends/cuda/ops/projection/quant.h"
+#include "engine/backends/cuda/ops/projection/channel_fp8.h"
 #include "engine/backends/cuda/ops/projection/nint/input.h"
 #include "engine/weights/tq/routed.h"
 #include "engine/weights/encoding/rows.h"
@@ -273,6 +274,16 @@ tyloi::DenseTensor tyloi::cuda::ops::sigmoid_project(tyloi::DenseTensor input, t
         TYLOINFER_RUNTIME_CHECK(gate_mode == first || gate_mode == second,
             "input gate mode is not supported by this projection");
     };
+    if (const auto* fp8 = weight.representation<tyloi::ChannelFp8Tensor>()) {
+        if (gate.has_value()) {
+            gated(InputGateMode::Sigmoid, InputGateMode::Silu);
+            auto local_gate = gate.value().to(x.scalar_type());
+            x = x * (gate_mode == InputGateMode::Sigmoid
+                ? ::tyloi::cuda::sigmoid(local_gate) : ::tyloi::cuda::silu(local_gate));
+        }
+        check_device(*fp8, x);
+        return tyloi::cuda::channel_fp8_projection(*fp8, std::move(x), &profiler);
+    }
     if (const auto* tq_weight = weight.representation<tyloi::encoding::TqTensor>()) {
         if (gate.has_value()) {
             gated(InputGateMode::Sigmoid, InputGateMode::Silu);
@@ -612,6 +623,8 @@ Projector::grouped(
         const ::tyloi::Tensor& weight,
         ::tyloi::DenseTensor x) const {
     check_projection(weight, x);
+    if (const auto* fp8 = local_format<tyloi::ChannelFp8Tensor>(weight))
+        return channel_fp8_projection(*fp8, std::move(x), &profiler_);
     if (const auto* tq = local_format<tyloi::encoding::TqTensor>(weight); tq != nullptr)
         return profiler_.measure("tq.linear", [&] {
             const auto resources = tq_.get(x.get_device());
@@ -694,7 +707,11 @@ bool Projector::grouped(std::span<const ::tyloi::Tensor> weights) const {
     const ::tyloi::encoding::TqTensor* first = nullptr;
     size_t tq_count = 0;
     bool all_nint = options_.nint_grouped && !independent_ && tyloi::mfq_compat_enabled;
+    bool all_fp8 = true;
     for (const auto& weight : weights) {
+        const auto* fp8 = weight.representation<tyloi::ChannelFp8Tensor>();
+        all_fp8 = all_fp8 && fp8 && fp8->dynamic_activations && fp8->values.is_cuda() &&
+            weight.size(1) == weights.front().size(1) && weight.device() == weights.front().device();
         const auto* tq = weight.representation<::tyloi::encoding::TqTensor>();
         if (tq && tq->is_cuda()) {
             if (first && (weight.size(1) != first->size(1) || tq->device() != first->device())) return false;
@@ -708,7 +725,7 @@ bool Projector::grouped(std::span<const ::tyloi::Tensor> weights) const {
         all_nint = false;
 #endif
     }
-    return tq_count >= 2 || all_nint;
+    return tq_count >= 2 || all_nint || all_fp8;
 }
 
 std::vector<::tyloi::DenseTensor> Projector::run(
@@ -747,7 +764,8 @@ std::vector<::tyloi::DenseTensor> Projector::run(
     } else if (compatible && grouped(weights)) {
         projections.group = group(weights);
         auto& nint = projections.group.nint;
-        projections.joined = prefix > 1 && (nint.split_w.empty() || nint.split_outs.front().size() >= prefix);
+        projections.joined = projections.group.nint_grouped && prefix > 1 &&
+            (nint.split_w.empty() || nint.split_outs.front().size() >= prefix);
         if (projections.joined) {
             auto& sizes = nint.split_w.empty() ? nint.outs : nint.split_outs.front();
             const auto combined = std::accumulate(sizes.begin(), sizes.begin() + prefix, int64_t(0));
@@ -796,6 +814,10 @@ std::vector<::tyloi::DenseTensor> Projector::run(
         return join(std::move(outputs));
     }
 
+    if (!projections.group.nint_grouped && !projections.group.layers.empty() &&
+            x.is_cuda() && x.numel() / x.size(-1) > 8) {
+        return join(run(projections.group, x));
+    }
     if (projections.group.nint_grouped && x.is_cuda() &&
             mmq_.mode == KlMmqMode::Default &&
             x.numel() / x.size(-1) <= 8) {
@@ -920,6 +942,20 @@ std::vector<::tyloi::DenseTensor> Projector::run(
         for (const auto & layer : group.layers) {
             result.push_back(run(layer, x));
         }
+        return result;
+    }
+    if (x.numel() / x.size(-1) > 8 && !group.layers.empty() &&
+        std::all_of(group.layers.begin(), group.layers.end(), [&](const auto& layer) {
+            const auto* fp8 = layer.template representation<tyloi::ChannelFp8Tensor>();
+            return fp8 && fp8->dynamic_activations && fp8->neuron_len == x.size(-1) &&
+                fp8->values.device() == x.device();
+        })) {
+        auto prepared = prepare_channel_fp8_input(x, &profiler_);
+        std::vector<::tyloi::DenseTensor> result;
+        result.reserve(group.layers.size());
+        for (const auto& layer : group.layers)
+            result.push_back(channel_fp8_projection(
+                *layer.representation<tyloi::ChannelFp8Tensor>(), x, &profiler_, &prepared));
         return result;
     }
     if (options_.grouped &&

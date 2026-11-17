@@ -10,8 +10,10 @@
 #include "engine/backends/cuda/ops/projection/tq/tensor.h"
 #include "engine/weights/group.h"
 #include "engine/weights/prepare/quant.h"
+#include "engine/weights/prepare/channel_fp8.h"
 #include "engine/weights/sharded.h"
 #include "engine/weights/encoding/dense/blob.h"
+#include "engine/weights/encoding/fp8/tensor.h"
 #include "engine/backends/cuda/ops/projection/quant.h"
 #include <algorithm>
 #include <cstdio>
@@ -58,6 +60,18 @@ tyloi::weights::Cache& tyloi::weights::Loader::cache() const noexcept { return i
 
 static int cuda_device(const tyloi::weights::Loader::Placement& placement) {
     return placement.target.is_cuda() ? placement.target.index : mfq_current_cuda_device();
+}
+
+static tyloi::ChannelFp8Tensor channel_fp8_to_device(
+        tyloi::ChannelFp8Tensor value,
+        tyloi::Device target) {
+    if (target.is_cpu()) return value;
+    if (!target.is_cuda())
+        throw std::invalid_argument("channel FP8 weights require CPU or CUDA");
+    MfqCudaGuard guard(target.index);
+    value.values = value.values.to(target).contiguous();
+    value.scales = value.scales.to(target).contiguous();
+    return value;
 }
 
 static std::vector<std::uint8_t> read_weight(
@@ -532,6 +546,57 @@ static TensorParallelAxis infer_tensor_parallel_axis(
             weight = std::make_shared<tyloi::Mxfp8Tensor>(to_device_mxfp8(
                 cpu, true, cuda_device(placement)));
         }
+    } else if (dtype == "FP8-E4M3-CHANNEL") {
+        const bool may_shard =
+            !cpu_layer && placement.tensor.enabled() &&
+            axis != TensorParallelAxis::Mirrored;
+        const auto load_target = may_shard
+            ? tyloi::Device(tyloi::kCPU)
+            : placement.target;
+        auto value = tyloi::weights::load_channel_fp8(
+            read_weight(placement.drop_cache, mfq, name),
+            load_target);
+        logical_out = value.out;
+        logical_neuron_len = value.neuron_len;
+        if (const auto* record = mfq.find_tensor(name);
+            record != nullptr && record->shape.has_value() &&
+            *record->shape != std::vector<int64_t>{value.out, value.neuron_len}) {
+            throw std::runtime_error(
+                "channel FP8 tensor metadata shape mismatch: " + name);
+        }
+        if (may_shard &&
+                (!value.dynamic_activations || axis == TensorParallelAxis::Output)) {
+            const bool output_axis = axis == TensorParallelAxis::Output;
+            const int64_t extent = output_axis ? value.out : value.neuron_len;
+            for (const auto& slice : select_slices(extent, 1)) {
+                tyloi::ChannelFp8Tensor part = value;
+                part.values = value.values.narrow(
+                    output_axis ? 0 : 1,
+                    slice.begin,
+                    slice.end - slice.begin).contiguous();
+                if (output_axis) {
+                    part.scales = value.scales.narrow(
+                        0, slice.begin, slice.end - slice.begin).contiguous();
+                    part.out = slice.end - slice.begin;
+                } else {
+                    part.neuron_len = slice.end - slice.begin;
+                }
+                tyloi::ShardedTensor::Shard shard;
+                shard.device = slice.device;
+                shard.output_begin = output_axis ? slice.begin : 0;
+                shard.output_end = output_axis ? slice.end : value.out;
+                shard.input_begin = output_axis ? 0 : slice.begin;
+                shard.input_end = output_axis ? value.neuron_len : slice.end;
+                shard.weight = std::make_shared<tyloi::ChannelFp8Tensor>(
+                    channel_fp8_to_device(
+                        std::move(part),
+                        tyloi::Device(tyloi::kCUDA, slice.device)));
+                shards.push_back(std::move(shard));
+            }
+        } else {
+            weight = std::make_shared<tyloi::ChannelFp8Tensor>(
+                channel_fp8_to_device(std::move(value), placement.target));
+        }
     } else if (dtype == "BF16" || dtype == "F16" || dtype == "F32") {
         auto cpu = host_value(name);
         TYLOINFER_RUNTIME_CHECK(cpu.dim() == 2, "dense linear tensor must be rank 2: ", name);
@@ -578,7 +643,7 @@ static TensorParallelAxis infer_tensor_parallel_axis(
         }
     } else {
         throw std::runtime_error(
-            "linear tensor must be NINT/NVQ/MXFP4-SQ/MXFP8-SQ/FP8-128SQ/MXFP4/MXFP8/BF16/F16/F32: " +
+            "linear tensor must be NINT/NVQ/MXFP4-SQ/MXFP8-SQ/FP8-128SQ/MXFP4/MXFP8/FP8-E4M3-CHANNEL/BF16/F16/F32: " +
             name + " dtype=" + dtype);
     }
     if (shards.empty()) return weight;

@@ -1,6 +1,7 @@
 #include "quant_linear.h"
 #include "engine/backends/cuda/ops/embedding.h"
 #include "engine/backends/cuda/ops/projection/quant.h"
+#include "engine/backends/cuda/ops/projection/channel_fp8.h"
 #include "engine/weights/encoding/sq/mxfp4_decode.h"
 
 #include <algorithm>
@@ -150,6 +151,10 @@ void check_device(const ::tyloi::TensorImpl& weight, const ::tyloi::DenseTensor&
     }
     if (const auto* tq = weight.representation<tyloi::encoding::TqTensor>())
         return tyloi::cuda::tq::embedding(*tq, token_ids);
+    if (const auto* fp8 = weight.representation<tyloi::ChannelFp8Tensor>()) {
+        check_device(*fp8, token_ids);
+        return tyloi::cuda::channel_fp8_rows(*fp8, std::move(token_ids));
+    }
     if (const auto* nvq = weight.representation<tyloi::NvqTensor>()) {
         TYLOINFER_RUNTIME_CHECK(tyloi::mfq_compat_enabled, "NVQ embedding weight is not enabled");
 #if TYLOINFER_ENABLE_MFQ_COMPAT
@@ -209,6 +214,8 @@ bool tensor_parallel_output_projections_compatible(
 ::tyloi::DenseTensor quant_linear_reference_weight(
         const ::tyloi::Tensor& weight) {
     TYLOINFER_RUNTIME_CHECK(weight.representation<tyloi::ShardedTensor>() == nullptr, "linear reference requires local weights");
+    if (const auto* fp8 = weight.representation<tyloi::ChannelFp8Tensor>())
+        return tyloi::cuda::dequant_channel_fp8(*fp8);
     if (const auto* tq = weight.representation<tyloi::encoding::TqTensor>()) {
         const auto ids = ::tyloi::cuda::arange(tq->size(0),
             ::tyloi::TensorOptions{}.dtype(::tyloi::kInt64).device(tq->device()));

@@ -13,7 +13,7 @@ bool supported_tensor_dtype(std::string_view dtype) noexcept {
          dtype == "MXFP8-SQ" || dtype == "FP8-128SQ")) return true;
     return dtype == "TQ" || dtype == "BF16" || dtype == "F16" || dtype == "F32"
         || dtype == "F8_E4M3" || dtype == "I32" || dtype == "I64"
-        || dtype == "MXFP4" || dtype == "MXFP8" || dtype == "BLOB";
+        || dtype == "MXFP4" || dtype == "MXFP8" || dtype == "FP8-E4M3-CHANNEL" || dtype == "BLOB";
 }
 
 } // namespace tyloi

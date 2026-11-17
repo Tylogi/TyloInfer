@@ -78,6 +78,7 @@ set_target_properties(mfq-cuda-core PROPERTIES
 )
 
 set(TYLOINFER_CUDA_KERNEL_SOURCES
+    ${TYLOINFER_CUDA_ROOT}/kernels/projection/channel_fp8.cu
     ${TYLOINFER_CUDA_ROOT}/kernels/attention/qsa/ram.cu
     ${TYLOINFER_CUDA_ROOT}/kernels/attention/qsa/tq.cu
     ${TYLOINFER_CUDA_ROOT}/kernels/attention/qsa/tq_fa.cu
