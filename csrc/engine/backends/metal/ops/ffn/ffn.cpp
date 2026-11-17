@@ -3,6 +3,9 @@
 #include "engine/backends/metal/ops/ffn/projection.h"
 #include "engine/backends/metal/ops/moe.h"
 #include "engine/weights/moe/batch.h"
+#if TYLOINFER_ENABLE_MFQ_COMPAT
+#include "engine/tensor/encoding/metal_experts.h"
+#endif
 #include "backends/metal/runtime/mlx_packed_expert_cache.h"
 #include "backends/metal/runtime/mlx_projection_batch.h"
 #include "backends/metal/runtime/mlx_tq_expert_cache.h"
@@ -22,6 +25,13 @@ bool preserve_activation(const Tensor& bank) {
     const auto* cache = std::get_if<std::shared_ptr<metal::MlxPackedExpertCache>>(&expert->cache());
     return cache && (*cache)->preserves_activation_dtype();
 }
+
+#if TYLOINFER_ENABLE_MFQ_COMPAT
+bool paged_mfe(const Tensor& bank) {
+    const auto* expert = bank.representation<encoding::MetalExperts>();
+    return expert && bool(expert->cache());
+}
+#endif
 
 template<class Work>
 Tensor rows(const Tensor& input, std::int64_t count, Work work) {
@@ -55,7 +65,14 @@ Tensor qwen_ffn(const FfnWeights& weights, const Tensor& input, const Tensor& bi
     routing.delayed_softmax = weights.moe_delayed_softmax;
     routing.scale = weights.moe_router_scale;
     std::int64_t cache_rows = 0;
-    if (weights.qwen_tq) {
+    bool paged = false;
+#if TYLOINFER_ENABLE_MFQ_COMPAT
+    paged = paged_mfe(weights.down) || paged_mfe(weights.gate_up[0]) ||
+        (weights.gate_up.size() == 2 && paged_mfe(weights.gate_up[1]));
+#endif
+    if (paged) {
+        cache_rows = 1;
+    } else if (weights.qwen_tq) {
         const auto& bank = *weights.gate_up.front().representation<metal::ExpertBank>();
         const auto& cache = *std::get<std::shared_ptr<metal::MlxTqExpertCache>>(bank.cache());
         if (cache.limit_bytes() < cache.maximum()) cache_rows = 1;

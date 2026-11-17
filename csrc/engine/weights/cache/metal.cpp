@@ -8,6 +8,7 @@
 #include "engine/weights/tq/source.h"
 #if TYLOINFER_ENABLE_MFQ_COMPAT
 #include "engine/tensor/encoding/metal_experts.h"
+#include "engine/weights/cache/metal_mfe.h"
 #include "engine/backends/metal/ops/mfq/mlx_moe.h"
 #include "engine/backends/metal/ops/mfq/mlx_nint.h"
 #endif
@@ -24,9 +25,20 @@
 #include <numeric>
 #include <ostream>
 #include <stdexcept>
+#include <type_traits>
 #include <utility>
+#include <variant>
 
 namespace tyloi::weights {
+
+#if TYLOINFER_ENABLE_MFQ_COMPAT
+// Private policy storage. MFE is a residency policy, not a numeric ExpertBank.
+using MetalCachePolicy = std::variant<
+    metal::ExpertCache,
+    std::shared_ptr<metal::MlxMfeOffloadCache>>;
+#else
+using MetalCachePolicy = metal::ExpertCache;
+#endif
 
 struct Resident::Impl {};
 Resident::Resident() : impl_(std::make_unique<Impl>()) {}
@@ -34,7 +46,7 @@ Resident::~Resident() = default;
 
 struct Cache::Resources {
     struct Group {
-        metal::ExpertCache cache;
+        MetalCachePolicy cache;
         std::vector<std::string> prefixes;
         std::size_t minimum = 0, maximum = 0, limit = 0;
     };
@@ -53,17 +65,74 @@ std::size_t add(std::size_t a, std::size_t b) {
         throw std::overflow_error("Metal expert cache budget overflow");
     return a + b;
 }
-std::size_t limit(const metal::ExpertCache& cache) {
-    return std::visit([](const auto& value) { return value->limit_bytes(); }, cache);
+#if TYLOINFER_ENABLE_MFQ_COMPAT
+bool mfe_policy(const MetalCachePolicy& cache) {
+    return std::holds_alternative<std::shared_ptr<metal::MlxMfeOffloadCache>>(cache);
 }
-std::size_t resident(const metal::ExpertCache& cache) {
-    return std::visit([](const auto& value) { return value->resident_bytes(); }, cache);
+#endif
+template <typename Visitor>
+decltype(auto) visit_cache(const MetalCachePolicy& cache, Visitor&& visitor) {
+#if TYLOINFER_ENABLE_MFQ_COMPAT
+    return std::visit([&](const auto& value) -> decltype(auto) {
+        using Value = std::decay_t<decltype(value)>;
+        if constexpr (std::is_same_v<Value, std::shared_ptr<metal::MlxMfeOffloadCache>>)
+            return visitor(value);
+        else
+            return std::visit([&](const auto& item) -> decltype(auto) { return visitor(item); }, value);
+    }, cache);
+#else
+    return std::visit(std::forward<Visitor>(visitor), cache);
+#endif
 }
-std::size_t set_limit(const metal::ExpertCache& cache, std::size_t bytes) {
-    return std::visit([&](const auto& value) { return value->set_limit(bytes); }, cache);
+std::size_t limit(const MetalCachePolicy& cache) {
+    return visit_cache(cache, [](const auto& value) {
+#if TYLOINFER_ENABLE_MFQ_COMPAT
+        using Value = std::decay_t<decltype(value)>;
+        if constexpr (std::is_same_v<Value, std::shared_ptr<metal::MlxMfeOffloadCache>>)
+            return value->cache_limit_bytes();
+        else
+#endif
+            return value->limit_bytes();
+    });
 }
-void clear(const metal::ExpertCache& cache) {
-    std::visit([](const auto& value) { value->clear(); }, cache);
+std::size_t resident(const MetalCachePolicy& cache) {
+    return visit_cache(cache, [](const auto& value) {
+#if TYLOINFER_ENABLE_MFQ_COMPAT
+        using Value = std::decay_t<decltype(value)>;
+        if constexpr (std::is_same_v<Value, std::shared_ptr<metal::MlxMfeOffloadCache>>)
+            return value->resident_packed_bytes();
+        else
+#endif
+            return value->resident_bytes();
+    });
+}
+std::size_t set_limit(const MetalCachePolicy& cache, std::size_t bytes) {
+    return visit_cache(cache, [&](const auto& value) {
+#if TYLOINFER_ENABLE_MFQ_COMPAT
+        using Value = std::decay_t<decltype(value)>;
+        if constexpr (std::is_same_v<Value, std::shared_ptr<metal::MlxMfeOffloadCache>>)
+            return value->set_cache_limit(bytes);
+        else
+#endif
+            return value->set_limit(bytes);
+    });
+}
+void clear(const MetalCachePolicy& cache) {
+    visit_cache(cache, [](const auto& value) { value->clear(); });
+}
+void preload_cache(const MetalCachePolicy& cache) {
+    visit_cache(cache, [](const auto& value) {
+#if TYLOINFER_ENABLE_MFQ_COMPAT
+        using Value = std::decay_t<decltype(value)>;
+        if constexpr (std::is_same_v<Value, std::shared_ptr<metal::MlxMfeOffloadCache>>)
+            throw std::invalid_argument("Metal native MFE expert preload is unsupported");
+        else
+#endif
+            value->preload();
+    });
+}
+void drain_cache(const MetalCachePolicy& cache) {
+    visit_cache(cache, [](const auto& value) { value->drain(); });
 }
 void require_metal(Device device) {
     if (device != Device(DeviceType::metal))
@@ -102,11 +171,24 @@ std::vector<std::pair<std::string, double>> Cache::metrics() const {
     std::uint64_t hits = 0, misses = 0, evictions = 0, read = 0, calls = 0;
     for (const auto& group : data_->groups) {
         bytes = add(bytes, resident(group.cache));
-        std::visit([&](const auto& cache) {
-            const auto stats = cache->stats();
-            hits += stats.hits; misses += stats.misses; evictions += stats.evictions;
-            read += stats.bytes_read; calls += stats.read_calls;
-        }, group.cache);
+        visit_cache(group.cache, [&](const auto& cache) {
+#if TYLOINFER_ENABLE_MFQ_COMPAT
+            using Value = std::decay_t<decltype(cache)>;
+            if constexpr (std::is_same_v<Value, std::shared_ptr<metal::MlxMfeOffloadCache>>) {
+                const auto stats = cache->reuse_stats();
+                hits += stats.expert_hits;
+                misses += stats.expert_loads;
+                evictions += stats.evictions;
+                read += stats.bytes_read;
+                calls += stats.read_calls;
+            } else
+#endif
+            {
+                const auto stats = cache->stats();
+                hits += stats.hits; misses += stats.misses; evictions += stats.evictions;
+                read += stats.bytes_read; calls += stats.read_calls;
+            }
+        });
     }
     return {{"resident_expert_cache_bytes", double(bytes)}, {"expert_cache_budget_bytes", double(budget())},
             {"expert_cache_hits", double(hits)}, {"expert_cache_misses", double(misses)},
@@ -120,7 +202,17 @@ void Cache::report(std::ostream& output) const {
 Cache::Activity Cache::activity() const {
     std::uint64_t bytes = 0;
     for (const auto& group : data_->groups)
-        std::visit([&](const auto& cache) { bytes += cache->stats().bytes_read; }, group.cache);
+        visit_cache(group.cache, [&](const auto& cache) {
+#if TYLOINFER_ENABLE_MFQ_COMPAT
+            using Value = std::decay_t<decltype(cache)>;
+            if constexpr (std::is_same_v<Value, std::shared_ptr<metal::MlxMfeOffloadCache>>)
+                bytes += cache->reuse_stats().bytes_read;
+            else
+                bytes += cache->stats().bytes_read;
+#else
+            bytes += cache->stats().bytes_read;
+#endif
+        });
     return {bytes, 0};
 }
 bool Cache::graph_safe(Graph, bool) const { return false; }
@@ -142,22 +234,42 @@ void Cache::resize(std::size_t bytes) {
     next.reserve(data_->groups.size());
     for (const auto& group : data_->groups) next.push_back(group.minimum);
     auto remaining = bytes - minimum_bytes;
-    std::size_t total_room = 0;
-    for (const auto& group : data_->groups)
-        total_room = add(total_room, group.maximum - group.minimum);
-    const auto distributable = std::min(remaining, total_room);
-    if (total_room) for (std::size_t i = 0; i < data_->groups.size(); ++i) {
-        const auto room = data_->groups[i].maximum - next[i];
-        const auto grant = std::min(room, static_cast<std::size_t>(
-            static_cast<long double>(distributable) * room / total_room));
-        next[i] += grant;
-        remaining -= grant;
-    }
-    for (std::size_t i = 0; i < data_->groups.size() && remaining; ++i) {
-        const auto room = data_->groups[i].maximum - next[i];
-        const auto grant = std::min(room, remaining);
-        next[i] += grant;
-        remaining -= grant;
+#if TYLOINFER_ENABLE_MFQ_COMPAT
+    const auto has_mfe = std::any_of(data_->groups.begin(), data_->groups.end(),
+        [](const auto& group) { return mfe_policy(group.cache); });
+#else
+    constexpr bool has_mfe = false;
+#endif
+    if (has_mfe) {
+        // MFE has no truthful static maximum. Fixed pools keep their real
+        // minimum; the remaining configured budget is its physical ceiling.
+        for (std::size_t i = 0; i < data_->groups.size(); ++i) {
+#if TYLOINFER_ENABLE_MFQ_COMPAT
+            if (mfe_policy(data_->groups[i].cache)) {
+                next[i] = add(next[i], remaining);
+                remaining = 0;
+                break;
+            }
+#endif
+        }
+    } else {
+        std::size_t total_room = 0;
+        for (const auto& group : data_->groups)
+            total_room = add(total_room, group.maximum - group.minimum);
+        const auto distributable = std::min(remaining, total_room);
+        if (total_room) for (std::size_t i = 0; i < data_->groups.size(); ++i) {
+            const auto room = data_->groups[i].maximum - next[i];
+            const auto grant = std::min(room, static_cast<std::size_t>(
+                static_cast<long double>(distributable) * room / total_room));
+            next[i] += grant;
+            remaining -= grant;
+        }
+        for (std::size_t i = 0; i < data_->groups.size() && remaining; ++i) {
+            const auto room = data_->groups[i].maximum - next[i];
+            const auto grant = std::min(room, remaining);
+            next[i] += grant;
+            remaining -= grant;
+        }
     }
     std::vector<std::size_t> previous;
     previous.reserve(data_->groups.size());
@@ -175,15 +287,43 @@ void Cache::resize(std::size_t bytes) {
         for (auto& group : data_->groups) group.limit = limit(group.cache);
         std::rethrow_exception(failure);
     }
-    for (std::size_t i = 0; i < next.size(); ++i) data_->groups[i].limit = next[i];
+    for (std::size_t i = 0; i < next.size(); ++i) {
+        data_->groups[i].limit = next[i];
+#if TYLOINFER_ENABLE_MFQ_COMPAT
+        if (mfe_policy(data_->groups[i].cache)) data_->groups[i].maximum = next[i];
+#endif
+    }
     data_->configured = bytes;
 }
 std::size_t Cache::reserve(std::size_t bytes) {
-    std::size_t before = 0, current = 0;
-    for (const auto& group : data_->groups) {
-        before = add(before, resident(group.cache));
-        current = add(current, group.limit);
+    std::size_t before = 0;
+    for (const auto& group : data_->groups) before = add(before, resident(group.cache));
+#if TYLOINFER_ENABLE_MFQ_COMPAT
+    const auto has_mfe = std::any_of(data_->groups.begin(), data_->groups.end(),
+        [](const auto& group) { return mfe_policy(group.cache); });
+    if (has_mfe) {
+        if (bytes) for (auto& group : data_->groups) {
+            if (!mfe_policy(group.cache) || !group.limit) continue;
+            const auto ceiling = group.limit;
+            const auto current = resident(group.cache);
+            const auto target = current > bytes ? std::min(ceiling, current - bytes) : 0;
+            try {
+                set_limit(group.cache, target);
+                set_limit(group.cache, ceiling);
+            } catch (...) {
+                try { set_limit(group.cache, ceiling); } catch (...) {}
+                throw;
+            }
+            break;
+        }
+        std::size_t after = 0;
+        for (const auto& group : data_->groups) after = add(after, resident(group.cache));
+        // resize() already keeps fixed pools at their minimum while MFE is active.
+        return before > after ? before - after : 0;
     }
+#endif
+    std::size_t current = 0;
+    for (const auto& group : data_->groups) current = add(current, group.limit);
     if (current <= minimum()) return 0;
     const auto configured = data_->configured;
     resize(current - std::min(bytes, current - minimum()));
@@ -202,7 +342,7 @@ void Cache::clear_workspace() noexcept {}
 void Cache::drain() const {
     if (data_->groups.empty()) return;
     for (const auto& group : data_->groups)
-        std::visit([](const auto& cache) { cache->drain(); }, group.cache);
+        drain_cache(group.cache);
     mlx::core::synchronize();
 }
 void Cache::finish_exchange() const { drain(); }
@@ -290,34 +430,56 @@ void Cache::Priority::finish() {}
 
 Tensor Cache::experts(const source::Source& source, const std::string& name,
                             int, const std::string& role) {
+    const auto& record = require_tensor(source, name);
 #if TYLOINFER_ENABLE_MFQ_COMPAT
-    const auto& resident_record = require_tensor(source, name);
-    if (resident_record.dtype == "MFE" || metal::is_nint_dtype(resident_record.dtype)) {
-        // shortcut: MFE/NINT is fully resident; allow limits after partial-cache admission and retirement are connected.
-        if (data_->configured)
-            throw std::invalid_argument("bounded MFE/NINT expert cache is not supported");
+    const auto paged_mfe = data_->configured.has_value() &&
+        (record.dtype == "MFE" || metal::is_nint_dtype(record.dtype));
+    if (paged_mfe && data_->preload)
+        throw std::invalid_argument("Metal native MFE expert preload is unsupported");
+    if (!data_->configured && (record.dtype == "MFE" || metal::is_nint_dtype(record.dtype))) {
+        // Without an explicit cache budget, preserve the existing full-resident path.
         const auto blob = read_tensor(source, name);
-        auto weight = resident_record.dtype == "MFE" ? metal::MlxMfeWeight::from_blob(blob)
+        auto weight = record.dtype == "MFE" ? metal::MlxMfeWeight::from_blob(blob)
                                              : metal::MlxMfeWeight::from_nint_blob(blob);
         auto value = std::make_shared<encoding::MetalExperts>(std::move(weight));
-        if (resident_record.shape && (*resident_record.shape != std::vector<std::int64_t>{value->size(0), value->size(1), value->size(2)}))
+        if (record.shape && (*record.shape != std::vector<std::int64_t>{value->size(0), value->size(1), value->size(2)}))
             throw std::invalid_argument("Metal expert bank shape differs from payload: " + name);
         observe_weight(value);
         return value;
     }
+#else
+    constexpr bool paged_mfe = false;
 #endif
     using metal::ExpertRole;
-    ExpertRole kind;
-    if (role == "gate") kind = ExpertRole::gate;
-    else if (role == "up") kind = ExpertRole::up;
-    else if (role == "down") kind = ExpertRole::down;
-    else throw std::invalid_argument("Metal cached experts require separate gate, up and down banks");
-    const auto suffix = std::string(".mlp.experts.") + role + ".weight";
-    if (name.size() <= suffix.size() || name.compare(name.size() - suffix.size(), suffix.size(), suffix))
-        throw std::invalid_argument("unexpected Metal expert bank name: " + name);
-    const auto prefix = name.substr(0, name.size() - suffix.size());
+    ExpertRole kind = ExpertRole::gate;
+    std::string prefix;
+    if (!paged_mfe) {
+        if (role == "gate") kind = ExpertRole::gate;
+        else if (role == "up") kind = ExpertRole::up;
+        else if (role == "down") kind = ExpertRole::down;
+        else throw std::invalid_argument("Metal cached experts require separate gate, up and down banks");
+        const auto suffix = std::string(".mlp.experts.") + role + ".weight";
+        if (name.size() <= suffix.size() || name.compare(name.size() - suffix.size(), suffix.size(), suffix))
+            throw std::invalid_argument("unexpected Metal expert bank name: " + name);
+        prefix = name.substr(0, name.size() - suffix.size());
+    }
     if (data_->source && data_->source != &source)
         throw std::invalid_argument("Metal expert cache belongs to a different source");
+#if TYLOINFER_ENABLE_MFQ_COMPAT
+    std::shared_ptr<metal::MlxMfeOffloadCache> requested_mfe;
+    bool attach_mfe = false;
+    if (paged_mfe) {
+        for (const auto& group : data_->groups)
+            if (const auto* value = std::get_if<std::shared_ptr<metal::MlxMfeOffloadCache>>(&group.cache)) {
+                requested_mfe = *value;
+                break;
+            }
+        if (!requested_mfe) {
+            requested_mfe = std::make_shared<metal::MlxMfeOffloadCache>(source, 0);
+            attach_mfe = data_->source != nullptr;
+        }
+    }
+#endif
 
     if (!data_->source) {
         enum class Format { tq, gguf, affine };
@@ -328,6 +490,11 @@ Tensor Cache::experts(const source::Source& source, const std::string& name,
             return std::nullopt;
         };
         std::map<Format, std::vector<std::string>> prefixes;
+#if TYLOINFER_ENABLE_MFQ_COMPAT
+        const auto has_mfe = bool(requested_mfe);
+#else
+        constexpr bool has_mfe = false;
+#endif
         const std::string gate_suffix = ".mlp.experts.gate.weight";
         for (const auto& tensor : source.tensors()) {
             if (tensor.name.size() <= gate_suffix.size() ||
@@ -373,23 +540,25 @@ Tensor Cache::experts(const source::Source& source, const std::string& name,
         }
         const auto budget = data_->configured.value_or(total_maximum);
         if (budget < total_minimum) throw std::invalid_argument("Metal expert cache budget is below its minimum");
-        auto remaining = budget - total_minimum;
-        const auto room = total_maximum - total_minimum;
-        const auto distributable = std::min(remaining, room);
-        if (room) for (auto& group : pending) {
-            const auto available = group.maximum - group.minimum;
-            const auto grant = std::min(available, static_cast<std::size_t>(
-                static_cast<long double>(distributable) * available / room));
-            group.limit += grant;
-            remaining -= grant;
-        }
-        for (auto& group : pending) {
-            const auto grant = std::min(remaining, group.maximum - group.limit);
-            group.limit += grant;
-            remaining -= grant;
+        if (!has_mfe) {
+            auto remaining = budget - total_minimum;
+            const auto room = total_maximum - total_minimum;
+            const auto distributable = std::min(remaining, room);
+            if (room) for (auto& group : pending) {
+                const auto available = group.maximum - group.minimum;
+                const auto grant = std::min(available, static_cast<std::size_t>(
+                    static_cast<long double>(distributable) * available / room));
+                group.limit += grant;
+                remaining -= grant;
+            }
+            for (auto& group : pending) {
+                const auto grant = std::min(remaining, group.maximum - group.limit);
+                group.limit += grant;
+                remaining -= grant;
+            }
         }
         std::vector<Resources::Group> prepared;
-        prepared.reserve(pending.size());
+        prepared.reserve(pending.size() + (has_mfe ? 1 : 0));
         for (auto& item : pending) {
             metal::ExpertCache cache;
             if (item.format == Format::tq) {
@@ -409,27 +578,58 @@ Tensor Cache::experts(const source::Source& source, const std::string& name,
                     std::move(std::get<AffinePlan>(item.plan)), item.limit, data_->policy.io_workers));
             prepared.push_back({std::move(cache), std::move(item.prefixes), item.minimum, item.maximum, item.limit});
         }
+#if TYLOINFER_ENABLE_MFQ_COMPAT
+        if (has_mfe) {
+            prepared.push_back({requested_mfe, {}, 0, budget, 0});
+        }
+#endif
         data_->groups = std::move(prepared);
         data_->source = &source;
         const auto configured = data_->configured;
         resize(budget);
         data_->configured = configured;
     }
+#if TYLOINFER_ENABLE_MFQ_COMPAT
+    if (attach_mfe) {
+        const auto budget = data_->configured.value();
+        data_->groups.push_back({requested_mfe, {}, 0, budget, 0});
+        resize(budget);
+    }
+#endif
     if (!data_->ready) {
         std::size_t full = 0;
         for (const auto& group : data_->groups) full = add(full, group.maximum);
         if (data_->preload && budget() < full)
             throw std::invalid_argument("Metal expert preload requires the complete cache budget");
         for (const auto& group : data_->groups) {
-            if (data_->preload)
-                std::visit([](const auto& cache) { cache->preload(); }, group.cache);
-            else if (group.limit >= group.maximum)
+            if (data_->preload) preload_cache(group.cache);
+            else if (group.limit >= group.maximum) {
+#if TYLOINFER_ENABLE_MFQ_COMPAT
+                if (const auto* native = std::get_if<metal::ExpertCache>(&group.cache))
+                    if (const auto* tq = std::get_if<std::shared_ptr<metal::MlxTqExpertCache>>(native))
+                        (*tq)->preload();
+#else
                 if (const auto* tq = std::get_if<std::shared_ptr<metal::MlxTqExpertCache>>(&group.cache))
                     (*tq)->preload();
+#endif
+            }
         }
         data_->ready = true;
     }
-    const auto& record = require_tensor(source, name);
+#if TYLOINFER_ENABLE_MFQ_COMPAT
+    if (paged_mfe) {
+        if (!requested_mfe) throw std::invalid_argument("Metal cache has no MFE policy for: " + name);
+        if (!requested_mfe->can_offload(name))
+            throw std::invalid_argument("Metal bounded MFE/NINT record is not streamable: " + name);
+        requested_mfe->activate_record(name);
+        const auto info = requested_mfe->projection_info(name);
+        const std::array<std::int64_t, 3> shape{
+            info.experts, info.out_per_expert, info.neuron_len};
+        if (record.shape && *record.shape != std::vector<std::int64_t>{shape[0], shape[1], shape[2]})
+            throw std::invalid_argument("Metal expert bank shape differs from MFE header: " + name);
+        return std::make_shared<encoding::MetalExperts>(requested_mfe, name, shape);
+    }
+#endif
     std::vector<std::int64_t> shape;
     if (record.dtype == "TQ") shape = tq_shape(source, name);
     else if (record.shape) shape = *record.shape;
@@ -443,7 +643,13 @@ Tensor Cache::experts(const source::Source& source, const std::string& name,
     for (const auto& group : data_->groups) {
         const auto found = std::lower_bound(group.prefixes.begin(), group.prefixes.end(), prefix);
         if (found == group.prefixes.end() || *found != prefix) continue;
+#if TYLOINFER_ENABLE_MFQ_COMPAT
+        const auto* cache = std::get_if<metal::ExpertCache>(&group.cache);
+        if (!cache) throw std::invalid_argument("Metal expert cache bank uses a non-numeric policy: " + name);
+        return std::make_shared<metal::ExpertBank>(*cache,
+#else
         return std::make_shared<metal::ExpertBank>(group.cache,
+#endif
             static_cast<std::size_t>(found - group.prefixes.begin()), kind,
             std::array<std::int64_t, 3>{shape[0], shape[1], shape[2]});
     }

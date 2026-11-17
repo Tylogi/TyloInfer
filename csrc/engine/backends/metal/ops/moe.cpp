@@ -9,12 +9,16 @@
 #if TYLOINFER_ENABLE_MFQ_COMPAT
 #include "engine/tensor/encoding/metal_experts.h"
 #include "engine/backends/metal/ops/mfq/mlx_moe.h"
+#include "engine/weights/cache/metal_mfe.h"
 #endif
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstdint>
 #include <limits>
 #include <stdexcept>
+#include <string>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -68,7 +72,14 @@ ExpertBatch::~ExpertBatch() = default;
 ExpertBatch::ExpertBatch(ExpertBatch&&) noexcept = default;
 ExpertBatch& ExpertBatch::operator=(ExpertBatch&&) noexcept = default;
 
-bool cached(const Tensor& bank) { return bank.representation<metal::ExpertBank>() != nullptr; }
+bool cached(const Tensor& bank) {
+    if (bank.representation<metal::ExpertBank>()) return true;
+#if TYLOINFER_ENABLE_MFQ_COMPAT
+    if (const auto* mfe = bank.representation<encoding::MetalExperts>())
+        return bool(mfe->cache());
+#endif
+    return false;
+}
 
 } // namespace tyloi::weights
 
@@ -99,6 +110,47 @@ void check_banks(const std::vector<Tensor>& banks, const Tensor& down,
          banks[0].size(1) != down.size(2) || banks[1].size(1) != down.size(2)))
         throw std::invalid_argument("routed expert bank geometry mismatch");
 }
+
+#if TYLOINFER_ENABLE_MFQ_COMPAT
+struct PagedRoutes {
+    mx::array local_ids;
+    std::vector<std::int32_t> active;
+    std::vector<std::uint32_t> activation_counts;
+};
+
+PagedRoutes paged_routes(const Tensor& route_ids, std::int64_t experts) {
+    auto ids = mx::contiguous(mx::astype(metal::array(route_ids), mx::int32));
+    mx::eval(ids);
+    const auto* values = ids.data<std::int32_t>();
+    std::vector<std::int32_t> active;
+    std::vector<std::uint32_t> counts;
+    std::vector<std::int32_t> global_to_local(
+        static_cast<std::size_t>(experts) + 1, -1);
+    std::vector<std::int32_t> local_ids(ids.size(), -1);
+    active.reserve(ids.size());
+    counts.reserve(ids.size());
+    for (std::size_t index = 0; index < ids.size(); ++index) {
+        const auto expert = values[index];
+        if (expert == -1) continue;
+        if (expert < -1 || static_cast<std::int64_t>(expert) >= experts)
+            throw std::invalid_argument("paged MFE route expert ID is out of range");
+        auto& local = global_to_local[static_cast<std::size_t>(expert) + 1];
+        if (local < 0) {
+            local = static_cast<std::int32_t>(active.size());
+            active.push_back(expert);
+            counts.push_back(0);
+        }
+        if (counts[static_cast<std::size_t>(local)] == std::numeric_limits<std::uint32_t>::max())
+            throw std::overflow_error("paged MFE route count overflow");
+        ++counts[static_cast<std::size_t>(local)];
+        local_ids[index] = local;
+    }
+    if (active.empty())
+        throw std::invalid_argument("paged MFE routing selected no experts");
+    return {mx::array(local_ids.begin(), ids.shape(), mx::int32),
+            std::move(active), std::move(counts)};
+}
+#endif
 
 } // namespace
 
@@ -137,14 +189,54 @@ RoutedExperts routed(const Tensor& input, const Tensor& input_f32, const Tensor&
     if (resident_gate || resident_up || resident_down) {
         if (!resident_gate || !resident_down || (b.gate_up.size() == 2 && !resident_up))
             throw std::invalid_argument("incompatible resident Metal expert banks");
-        const auto& ids = metal::array(b.ids);
-        const auto& source = metal::array(x);
-        const auto limit = static_cast<float>(spec.swiglu_limit);
-        auto hidden = resident_up
-            ? resident_gate->weight().routed_swiglu_pair(resident_up->weight(), source, ids, limit)
-            : resident_gate->weight().routed_swiglu(source, ids, limit);
-        result = metal::tensor(resident_down->weight().routed_matmul_reduce(
-            hidden, ids, metal::array(route_weights)));
+        const auto paged = bool(resident_gate->cache()) || bool(resident_down->cache()) ||
+            (resident_up && bool(resident_up->cache()));
+        if (paged) {
+            if (!resident_gate->cache() || !resident_down->cache() ||
+                (resident_up && !resident_up->cache()) ||
+                resident_gate->cache() != resident_down->cache() ||
+                (resident_up && resident_gate->cache() != resident_up->cache()))
+                throw std::invalid_argument("incompatible paged Metal expert banks");
+            auto& cache = *resident_gate->cache();
+            const auto routes = paged_routes(b.ids, b.gate_up[0].size(0));
+            const auto& source = metal::array(x);
+            const auto limit = static_cast<float>(spec.swiglu_limit);
+            const auto hidden = [&]() {
+                if (resident_up) {
+                    const std::array<std::string, 2> names{
+                        resident_gate->record_name(), resident_up->record_name()};
+                    auto weights = cache.grouped_mfe(names, routes.active, routes.activation_counts);
+                    if (weights.size() != 2)
+                        throw std::logic_error("paged MFE Gate/Up grouping returned an invalid count");
+                    auto result = weights[0].routed_swiglu_pair(
+                        weights[1], source, routes.local_ids, limit);
+                    cache.retain_until_drain(
+                        std::vector<metal::MlxMfeWeight>{std::move(weights[0]), std::move(weights[1])},
+                        {result});
+                    return result;
+                }
+                auto weight = cache.grouped_mfe(
+                    resident_gate->record_name(), routes.active, routes.activation_counts);
+                auto result = weight.routed_swiglu(source, routes.local_ids, limit);
+                cache.retain_until_drain({std::move(weight)}, {result});
+                return result;
+            }();
+            auto down = cache.grouped_mfe(
+                resident_down->record_name(), routes.active, routes.activation_counts);
+            auto value = down.routed_matmul_reduce(
+                hidden, routes.local_ids, metal::array(route_weights));
+            cache.retain_until_drain({std::move(down)}, {value});
+            result = metal::tensor(std::move(value));
+        } else {
+            const auto& ids = metal::array(b.ids);
+            const auto& source = metal::array(x);
+            const auto limit = static_cast<float>(spec.swiglu_limit);
+            auto hidden = resident_up
+                ? resident_gate->weight().routed_swiglu_pair(resident_up->weight(), source, ids, limit)
+                : resident_gate->weight().routed_swiglu(source, ids, limit);
+            result = metal::tensor(resident_down->weight().routed_matmul_reduce(
+                hidden, ids, metal::array(route_weights)));
+        }
     } else
 #endif
     if (gate || down || (b.gate_up.size() == 2 && b.gate_up[1].representation<metal::ExpertBank>())) {

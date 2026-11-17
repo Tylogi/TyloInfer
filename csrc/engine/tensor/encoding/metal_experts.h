@@ -3,18 +3,27 @@
 #include "engine/tensor/tensor.h"
 
 #include <array>
+#include <cstdint>
 #include <memory>
+#include <string>
 
-namespace tyloi::metal { class MlxMfeWeight; }
+namespace tyloi::metal {
+class MlxMfeOffloadCache;
+class MlxMfeWeight;
+}
 
 namespace tyloi::encoding {
 
 class MetalExperts final : public TensorImpl {
 public:
     explicit MetalExperts(metal::MlxMfeWeight weight);
+    MetalExperts(std::shared_ptr<metal::MlxMfeOffloadCache> cache,
+        std::string record_name, std::array<std::int64_t, 3> shape);
 
-    const metal::MlxMfeWeight& weight() const noexcept { return *weight_; }
-    bool defined() const noexcept override { return bool(weight_); }
+    const metal::MlxMfeWeight& weight() const;
+    const std::shared_ptr<metal::MlxMfeOffloadCache>& cache() const noexcept { return cache_; }
+    const std::string& record_name() const noexcept { return record_name_; }
+    bool defined() const noexcept override { return bool(weight_) || bool(cache_); }
     std::int64_t dim() const noexcept override { return 3; }
     std::int64_t numel() const override;
     std::size_t nbytes() const override;
@@ -30,6 +39,8 @@ public:
 
 private:
     std::shared_ptr<const metal::MlxMfeWeight> weight_;
+    std::shared_ptr<metal::MlxMfeOffloadCache> cache_;
+    std::string record_name_;
     std::array<std::int64_t, 3> shape_{};
     Device device_{DeviceType::metal, 0};
 };
