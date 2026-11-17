@@ -3,7 +3,6 @@
 #include "engine/models/metadata.h"
 #include "engine/ops/ops.h"
 #include "../common/check.h"
-#include "../common/recurrent_attention.h"
 
 namespace tyloi::models::qwen4_exp {
 

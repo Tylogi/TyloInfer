@@ -1,6 +1,6 @@
 #pragma once
 
-#include "engine/models/common/recurrent_attention.h"
+#include "engine/models/common/check.h"
 #include "engine/models/qwen4_exp/ngram.h"
 #include "engine/ops/ops.h"
 #include "engine/ops/ple.h"
@@ -305,16 +305,30 @@ public:
             bind_graph_checkpoint(state, conv, std::move(context), cache_position + confirmed);
             return result;
         }
-        return models::recurrent_window(x.size(1), cache, confirmed, state.saved,
-            [&](int64_t start, int64_t count) {
-                return forward_chunk(state, ops::slice(x, 1, start, start + count),
-                    ops::slice(ids, 1, start, start + count), cache,
-                    host_ids ? ops::slice(host_ids, 1, start, start + count) : Tensor{});
-            },
-            [&] { state.saved = true; state.saved_conv = ops::clone(state.conv);
-                  state.saved_context = embedding_.context(state.embedding); },
-            [&] { rollback(state); },
-            [](Tensor first, Tensor second) { const std::array<Tensor, 2> parts{first, second}; return ops::cat(parts, 1); });
+        require_model(x.size(1) > 0 && confirmed >= 0 && confirmed <= x.size(1) &&
+            (!confirmed || cache), "invalid recurrent verification window");
+        if (confirmed == 0 || confirmed == x.size(1))
+            return forward_chunk(state, ops::slice(x, 1, 0, x.size(1)),
+                ops::slice(ids, 1, 0, ids.size(1)), cache,
+                host_ids ? ops::slice(host_ids, 1, 0, x.size(1)) : Tensor{});
+
+        require_model(!state.saved, "resolve previous recurrent checkpoint");
+        auto prefix = forward_chunk(state, ops::slice(x, 1, 0, confirmed),
+            ops::slice(ids, 1, 0, confirmed), cache,
+            host_ids ? ops::slice(host_ids, 1, 0, confirmed) : Tensor{});
+        state.saved = true;
+        state.saved_conv = ops::clone(state.conv);
+        state.saved_context = embedding_.context(state.embedding);
+        try {
+            auto suffix = forward_chunk(state, ops::slice(x, 1, confirmed, x.size(1)),
+                ops::slice(ids, 1, confirmed, ids.size(1)), cache,
+                host_ids ? ops::slice(host_ids, 1, confirmed, x.size(1)) : Tensor{});
+            const std::array<Tensor, 2> parts{prefix, suffix};
+            return ops::cat(parts, 1);
+        } catch (...) {
+            rollback(state);
+            throw;
+        }
     }
     Tensor forward_chunk(State& state, const Tensor& x, const Tensor& ids, bool cache,
         const Tensor& host_ids = {}, const Tensor& graph_embeddings = {},

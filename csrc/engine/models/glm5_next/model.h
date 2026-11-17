@@ -10,7 +10,6 @@
 #include "engine/backends/cuda/ops/norm/rms.h"
 #include "engine/backends/cuda/ops/attention/attention.h"
 #include "engine/backends/cuda/ops/glm5_next.h"
-#include <array>
 #include <cmath>
 
 namespace tyloi::cuda::glm5_next {
@@ -38,17 +37,23 @@ class Kda {
                    int64_t confirmed = 0) const {
         TYLOINFER_RUNTIME_CHECK(hidden.is_cuda() && hidden.dim() == 3 && hidden.size(0) > 0,
                           "recurrent attention requires nonempty [B,T,H] input");
-        return tyloi::models::recurrent_window(
-            hidden.size(1), use_cache, confirmed, state.pending(),
-            [&](int64_t start, int64_t count) {
-                return forward_chunk(state, hidden.narrow(1, start, count), use_cache);
-            },
-            [&] {
-                state.rollback_conv = state.conv;
-                state.rollback_recurrent = state.recurrent;
-            },
-            [&] { state.rollback(); },
-            [](DenseTensor prefix, DenseTensor suffix) { return ::tyloi::cuda::cat({prefix, suffix}, 1); });
+        const auto tokens = hidden.size(1);
+        tyloi::models::require_model(
+            tokens > 0 && confirmed >= 0 && confirmed <= tokens && (!confirmed || use_cache),
+            "invalid recurrent verification window");
+        if (confirmed == 0 || confirmed == tokens)
+            return forward_chunk(state, hidden, use_cache);
+        tyloi::models::require_model(!state.pending(), "resolve previous recurrent checkpoint");
+        auto prefix = forward_chunk(state, hidden.narrow(1, 0, confirmed), use_cache);
+        state.rollback_conv = state.conv;
+        state.rollback_recurrent = state.recurrent;
+        try {
+            auto suffix = forward_chunk(state, hidden.narrow(1, confirmed, tokens - confirmed), use_cache);
+            return ::tyloi::cuda::cat({prefix, suffix}, 1);
+        } catch (...) {
+            state.rollback();
+            throw;
+        }
     }
     DenseTensor forward_chunk(KdaState& state, const DenseTensor &hidden, bool use_cache) const {
         const auto b = hidden.size(0), t = hidden.size(1), channels = heads_ * width_;
@@ -59,103 +64,97 @@ class Kda {
         auto previous = use_cache && state.conv.defined()
                             ? state.conv
                             : ::tyloi::cuda::zeros({b, kernel_ - 1, 3 * channels}, options);
-        return tyloi::models::gated_delta_attention(
-            use_cache,
-            [&] {
-                auto projected = ::tyloi::cuda::cat({::tyloi::ops::project(hidden, w_.query).dense(), ::tyloi::ops::project(hidden, w_.key).dense(),
-                                          ::tyloi::ops::project(hidden, w_.value).dense()},
-                                         -1)
-                                     .to(::tyloi::kFloat32);
-                TYLOINFER_RUNTIME_CHECK(projected.sizes().vec() ==
-                                      std::vector<int64_t>({b, t, 3 * channels}),
-                                  "GLM KDA projection shape mismatch");
-                return projected;
-            },
-            [&](DenseTensor projected) {
-                auto joined = ::tyloi::cuda::cat({previous, projected}, 1).contiguous();
-                auto convolved = ssm_conv_silu_cuda(joined,
-                                                    w_.conv.dense().to(::tyloi::kFloat32).contiguous(),
-                                                    ::tyloi::cuda::empty({0}, options), t);
-                auto next_conv = joined.narrow(1, t, kernel_ - 1).contiguous();
-                const auto heads = [&](int64_t begin) {
-                    return convolved.narrow(-1, begin, channels)
-                        .reshape({b, t, heads_, width_})
-                        .permute({0, 2, 1, 3});
-                };
-                const auto normalize = [&](const DenseTensor &x) {
-                    return (x / ::tyloi::cuda::clamp_min((x * x).sum(-1, true).sqrt(), 1e-6)).contiguous();
-                };
-                auto q = normalize(heads(0)), k = normalize(heads(channels)),
-                     v = heads(2 * channels).contiguous();
-                return std::array<DenseTensor, 4>{q, k, v, next_conv};
-            },
-            [&] {
-                auto forget =
-                    mfq_glm5_next::kda_forget_gate(hidden,
-                                                   w_.forget_a.dense(),
-                                                   w_.forget_b.dense(),
-                                                   w_.dt_bias.dense(),
-                                                   w_.a_log.dense(),
-                                                   heads_, width_, lower_bound_)
-                        .permute({0, 2, 1, 3})
+        DenseTensor q, k, v, next_conv;
+        {
+            auto projected = ::tyloi::cuda::cat({::tyloi::ops::project(hidden, w_.query).dense(), ::tyloi::ops::project(hidden, w_.key).dense(),
+                                      ::tyloi::ops::project(hidden, w_.value).dense()},
+                                     -1)
+                                 .to(::tyloi::kFloat32);
+            TYLOINFER_RUNTIME_CHECK(projected.sizes().vec() ==
+                                  std::vector<int64_t>({b, t, 3 * channels}),
+                              "GLM KDA projection shape mismatch");
+            auto joined = ::tyloi::cuda::cat({previous, projected}, 1).contiguous();
+            auto convolved = ssm_conv_silu_cuda(joined,
+                                                w_.conv.dense().to(::tyloi::kFloat32).contiguous(),
+                                                ::tyloi::cuda::empty({0}, options), t);
+            next_conv = joined.narrow(1, t, kernel_ - 1).contiguous();
+            const auto heads = [&](int64_t begin) {
+                return convolved.narrow(-1, begin, channels)
+                    .reshape({b, t, heads_, width_})
+                    .permute({0, 2, 1, 3});
+            };
+            const auto normalize = [&](const DenseTensor &x) {
+                return (x / ::tyloi::cuda::clamp_min((x * x).sum(-1, true).sqrt(), 1e-6)).contiguous();
+            };
+            q = normalize(heads(0));
+            k = normalize(heads(channels));
+            v = heads(2 * channels).contiguous();
+        }
+
+        auto forget =
+            mfq_glm5_next::kda_forget_gate(hidden,
+                                           w_.forget_a.dense(),
+                                           w_.forget_b.dense(),
+                                           w_.dt_bias.dense(),
+                                           w_.a_log.dense(),
+                                           heads_, width_, lower_bound_)
+                .permute({0, 2, 1, 3})
+                .contiguous();
+        auto beta = ::tyloi::cuda::sigmoid(::tyloi::ops::project(hidden, w_.beta).dense().to(::tyloi::kFloat32))
+                        .transpose(1, 2)
                         .contiguous();
-                auto beta = ::tyloi::cuda::sigmoid(::tyloi::ops::project(hidden, w_.beta).dense().to(::tyloi::kFloat32))
-                                .transpose(1, 2)
-                                .contiguous();
-                return std::array<DenseTensor, 2>{forget, beta};
-            },
-            [&](const auto &convolution, const auto &gates) {
-                auto q = convolution[0], k = convolution[1], v = convolution[2];
-                auto forget = gates[0], beta = gates[1];
-                DenseTensor attended, next_recurrent;
-                auto initial = use_cache && state.recurrent.defined() ? state.recurrent : DenseTensor{};
-                if (width_ == 32 || width_ == 64 || width_ == 128) {
-                    auto result =
-                        gdn_cuda(q, k, v, forget, beta,
-                                 initial.defined() ? MfqOptional<DenseTensor>(initial) : mfq_nullopt);
-                    attended = result[0];
-                    next_recurrent = result[1];
-                } else {
-                    // Public model dimensions use the fused kernel. Keep the exact
-                    // recurrence available for small independent architecture fixtures.
-                    next_recurrent = initial.defined()
-                                         ? initial
-                                         : ::tyloi::cuda::zeros({b, heads_, width_, width_}, options);
-                    std::vector<DenseTensor> steps;
-                    for (int64_t i = 0; i < t; ++i) {
-                        auto ki = k.select(2, i);
-                        next_recurrent = next_recurrent * forget.select(2, i).exp().unsqueeze(-1);
-                        auto predicted = (next_recurrent * ki.unsqueeze(-1)).sum(-2);
-                        auto delta = (v.select(2, i) - predicted) * beta.select(2, i).unsqueeze(-1);
-                        next_recurrent = next_recurrent + ki.unsqueeze(-1) * delta.unsqueeze(-2);
-                        steps.push_back((next_recurrent *
-                                         (q.select(2, i) / std::sqrt(double(width_))).unsqueeze(-1))
-                                            .sum(-2)
-                                            .unsqueeze(2));
-                    }
-                    attended = ::tyloi::cuda::cat(steps, 2);
+        DenseTensor attended, next_recurrent;
+        {
+            auto initial = use_cache && state.recurrent.defined() ? state.recurrent : DenseTensor{};
+            if (width_ == 32 || width_ == 64 || width_ == 128) {
+                auto result =
+                    gdn_cuda(q, k, v, forget, beta,
+                             initial.defined() ? MfqOptional<DenseTensor>(initial) : mfq_nullopt);
+                attended = result[0];
+                next_recurrent = result[1];
+            } else {
+                // Public model dimensions use the fused kernel. Keep the exact
+                // recurrence available for small independent architecture fixtures.
+                next_recurrent = initial.defined()
+                                     ? initial
+                                     : ::tyloi::cuda::zeros({b, heads_, width_, width_}, options);
+                std::vector<DenseTensor> steps;
+                for (int64_t i = 0; i < t; ++i) {
+                    auto ki = k.select(2, i);
+                    next_recurrent = next_recurrent * forget.select(2, i).exp().unsqueeze(-1);
+                    auto predicted = (next_recurrent * ki.unsqueeze(-1)).sum(-2);
+                    auto delta = (v.select(2, i) - predicted) * beta.select(2, i).unsqueeze(-1);
+                    next_recurrent = next_recurrent + ki.unsqueeze(-1) * delta.unsqueeze(-2);
+                    steps.push_back((next_recurrent *
+                                     (q.select(2, i) / std::sqrt(double(width_))).unsqueeze(-1))
+                                        .sum(-2)
+                                        .unsqueeze(2));
                 }
-                return std::array<DenseTensor, 2>{attended, next_recurrent};
-            },
-            [&](DenseTensor attended) {
-                auto gate = ::tyloi::ops::project(::tyloi::ops::project(hidden, w_.gate_a), w_.gate_b).dense()
-                                .reshape({b, t, heads_, width_})
-                                .permute({0, 2, 1, 3});
-                return rms_norm(attended,
-                                w_.output_norm.dense(),
-                                eps_) *
-                       ::tyloi::cuda::sigmoid(gate.to(::tyloi::kFloat32));
-            },
-            [&](DenseTensor normalized) {
-                auto result = ::tyloi::ops::project(normalized.permute({0, 2, 1, 3})
-                                                       .reshape({b, t, channels})
-                                                       .to(hidden.scalar_type()), w_.output).dense();
-                return result;
-            },
-            [&](const auto &convolution, const DenseTensor &next) {
-                state.conv = convolution[3];
-                state.recurrent = next;
-            });
+                attended = ::tyloi::cuda::cat(steps, 2);
+            }
+        }
+        q = DenseTensor();
+        k = DenseTensor();
+        v = DenseTensor();
+        forget = DenseTensor();
+        beta = DenseTensor();
+        DenseTensor result;
+        {
+            auto gate = ::tyloi::ops::project(::tyloi::ops::project(hidden, w_.gate_a), w_.gate_b).dense()
+                            .reshape({b, t, heads_, width_})
+                            .permute({0, 2, 1, 3});
+            auto normalized = rms_norm(attended, w_.output_norm.dense(), eps_) *
+                              ::tyloi::cuda::sigmoid(gate.to(::tyloi::kFloat32));
+            attended = DenseTensor();
+            result = ::tyloi::ops::project(normalized.permute({0, 2, 1, 3})
+                                               .reshape({b, t, channels})
+                                               .to(hidden.scalar_type()), w_.output).dense();
+        }
+        if (use_cache) {
+            state.conv = next_conv;
+            state.recurrent = next_recurrent;
+        }
+        return result;
     }
 
   private:
@@ -192,84 +191,100 @@ class SparseMla {
         const auto b = hidden.size(0), t = hidden.size(1), offset = use_cache ? state.position() : 0;
         TYLOINFER_RUNTIME_CHECK(offset == (use_cache ? state.index.position() : 0) && t <= c_.maximum - offset,
                           "GLM MLA cache position/capacity mismatch");
-        struct Projection {
-            DenseTensor rank, query, latent, index;
-        };
         const double scale = 1.0 / std::sqrt(double(c_.nope));
-        return tyloi::models::glm5_next::sparse_mla(
-            offset + t, c_.budget, use_cache,
-            [&] {
-                auto qr = rms_norm(::tyloi::ops::project(hidden, w_.query_a).dense(),
-                                   w_.query_norm.dense(),
-                                   c_.eps);
-                auto query = ::tyloi::ops::project(qr, w_.query_b).dense().reshape({b, t, c_.heads, c_.nope});
-                auto latent = rms_norm(::tyloi::ops::project(hidden, w_.key_value_a).dense().narrow(-1, 0, c_.latent),
-                                       w_.latent_norm.dense(), c_.eps);
-                // Metal's indexer LayerNorm explicitly casts the source/output to F16.
-                auto ik = ::tyloi::ops::project(hidden, w_.index_key).dense().to(::tyloi::kFloat16).to(::tyloi::kFloat32);
-                auto centered = ik - ik.mean(-1, true);
-                ik = (centered * ::tyloi::cuda::rsqrt((centered * centered).mean(-1, true) + 1e-6) *
-                          w_.index_norm.dense().to(::tyloi::kFloat32) +
-                      w_.index_bias.dense().to(::tyloi::kFloat32))
-                         .to(::tyloi::kFloat16);
-                auto gate_dtype = hidden.scalar_type() == w_.index_gate.scalar_type()
-                                      ? hidden.scalar_type()
-                                      : ::tyloi::kFloat32;
-                auto gates = ::tyloi::cuda::matmul(hidden.to(gate_dtype),
-                    w_.index_gate.dense().to(gate_dtype).transpose(-1, -2));
-                auto packed = ::tyloi::cuda::cat({ik.to(gates.scalar_type()), gates}, -1);
-                return Projection{qr, query, latent, packed};
-            },
-            [&](Projection &p) {
-                p.latent = state.latent.append(p.latent).dense();
-                p.index = state.index.append(p.index).dense();
-            },
-            [&](const Projection &p) {
-                TYLOINFER_RUNTIME_CHECK(p.query.dim()==4 && p.query.size(2)==c_.heads,"GLM head-wise projection shape mismatch");
-                const auto batch=p.query.size(0), tokens=p.query.size(1), rows=batch*tokens*c_.heads;
-                auto ids=::tyloi::cuda::arange(rows,p.query.options().dtype(::tyloi::kInt32)).remainder(c_.heads).reshape({rows,1});
-                return ::tyloi::ops::project(p.query.reshape({rows,p.query.size(-1)}),w_.embed_query,ids).dense()
-                    .reshape({batch,tokens,c_.heads,c_.latent}).permute({0,2,1,3}).to(::tyloi::kFloat32);
-            },
-            [&](const DenseTensor &query, const Projection &p) {
-                return mfq_glm5_next::dense_mla_attention(query, p.latent, offset, scale);
-            },
-            [&](const Projection &p) {
-                return mfq_glm5_next::kpool_states(
-                    p.index.narrow(-1, 0, c_.index_width),
-                    p.index.narrow(-1, c_.index_width, c_.index_width),
-                    w_.index_position.dense(), c_.pool);
-            },
-            [&](const Projection &p) {
-                return ::tyloi::ops::project(p.rank, w_.index_query).dense()
-                    .reshape({b, t, c_.index_heads, c_.index_width});
-            },
-            [&](DenseTensor query, DenseTensor pooled) {
-                return mfq_glm5_next::kpool_scores(query, pooled,
-                                                   ::tyloi::ops::project(hidden, w_.index_score).dense());
-            },
-            [&](DenseTensor scores) {
-                return ::tyloi::cuda::ops::select_pooled_blocks(
-                    scores, offset, offset + t, c_.pool, c_.budget, c_.tail);
-            },
-            [&](const DenseTensor &query, const Projection &p, DenseTensor selected) {
-                return mfq_glm5_next::sparse_mla_attention(query, p.latent, selected, scale);
-            },
-            [&](DenseTensor attended) {
-                auto value=attended.to(::tyloi::kFloat16);
-                TYLOINFER_RUNTIME_CHECK(value.dim()==4 && value.size(2)==c_.heads,"GLM head-wise projection shape mismatch");
-                const auto batch=value.size(0), tokens=value.size(1), rows=batch*tokens*c_.heads;
-                auto ids=::tyloi::cuda::arange(rows,value.options().dtype(::tyloi::kInt32)).remainder(c_.heads).reshape({rows,1});
-                return ::tyloi::ops::project(value.reshape({rows,value.size(-1)}),w_.unembed_output,ids).dense()
-                    .reshape({batch,tokens,c_.heads,c_.value_width});
-            },
-            [&](DenseTensor value) {
-                return ::tyloi::ops::project(value.reshape({b, t, c_.heads * c_.value_width}), w_.output).dense();
-            },
-            [&] {
+        auto rank = rms_norm(::tyloi::ops::project(hidden, w_.query_a).dense(),
+                             w_.query_norm.dense(), c_.eps);
+        auto query = ::tyloi::ops::project(rank, w_.query_b).dense().reshape({b, t, c_.heads, c_.nope});
+        auto latent = rms_norm(::tyloi::ops::project(hidden, w_.key_value_a).dense().narrow(-1, 0, c_.latent),
+                               w_.latent_norm.dense(), c_.eps);
+        DenseTensor index;
+        {
+            // Metal's indexer LayerNorm explicitly casts the source/output to F16.
+            auto ik = ::tyloi::ops::project(hidden, w_.index_key).dense().to(::tyloi::kFloat16).to(::tyloi::kFloat32);
+            auto centered = ik - ik.mean(-1, true);
+            ik = (centered * ::tyloi::cuda::rsqrt((centered * centered).mean(-1, true) + 1e-6) *
+                      w_.index_norm.dense().to(::tyloi::kFloat32) +
+                  w_.index_bias.dense().to(::tyloi::kFloat32))
+                     .to(::tyloi::kFloat16);
+            auto gate_dtype = hidden.scalar_type() == w_.index_gate.scalar_type()
+                                  ? hidden.scalar_type()
+                                  : ::tyloi::kFloat32;
+            auto gates = ::tyloi::cuda::matmul(hidden.to(gate_dtype),
+                w_.index_gate.dense().to(gate_dtype).transpose(-1, -2));
+            index = ::tyloi::cuda::cat({ik.to(gates.scalar_type()), gates}, -1);
+        }
+
+        try {
+            if (use_cache) {
+                latent = state.latent.append(latent).dense();
+                index = state.index.append(index).dense();
+            }
+            DenseTensor absorbed_query;
+            {
+                TYLOINFER_RUNTIME_CHECK(query.dim() == 4 && query.size(2) == c_.heads,
+                                        "GLM head-wise projection shape mismatch");
+                const auto query_batch = query.size(0), query_tokens = query.size(1);
+                const auto query_rows = query_batch * query_tokens * c_.heads;
+                auto ids = ::tyloi::cuda::arange(query_rows, query.options().dtype(::tyloi::kInt32))
+                               .remainder(c_.heads)
+                               .reshape({query_rows, 1});
+                absorbed_query = ::tyloi::ops::project(
+                                     query.reshape({query_rows, query.size(-1)}), w_.embed_query, ids)
+                                     .dense()
+                                     .reshape({query_batch, query_tokens, c_.heads, c_.latent})
+                                     .permute({0, 2, 1, 3})
+                                     .to(::tyloi::kFloat32);
+            }
+
+            DenseTensor attended;
+            if (offset + t <= c_.budget) {
+                attended = mfq_glm5_next::dense_mla_attention(absorbed_query, latent, offset, scale);
+            } else {
+                DenseTensor selected;
+                {
+                    DenseTensor scores;
+                    {
+                        auto pooled = mfq_glm5_next::kpool_states(
+                            index.narrow(-1, 0, c_.index_width),
+                            index.narrow(-1, c_.index_width, c_.index_width),
+                            w_.index_position.dense(), c_.pool);
+                        auto index_query = ::tyloi::ops::project(rank, w_.index_query).dense()
+                                               .reshape({b, t, c_.index_heads, c_.index_width});
+                        scores = mfq_glm5_next::kpool_scores(
+                            index_query, pooled, ::tyloi::ops::project(hidden, w_.index_score).dense());
+                    }
+                    selected = ::tyloi::cuda::ops::select_pooled_blocks(
+                        scores, offset, offset + t, c_.pool, c_.budget, c_.tail);
+                }
+                attended = mfq_glm5_next::sparse_mla_attention(absorbed_query, latent, selected, scale);
+            }
+
+            DenseTensor unembedded;
+            {
+                auto value = attended.to(::tyloi::kFloat16);
+                TYLOINFER_RUNTIME_CHECK(value.dim() == 4 && value.size(2) == c_.heads,
+                                        "GLM head-wise projection shape mismatch");
+                const auto value_batch = value.size(0), value_tokens = value.size(1);
+                const auto value_rows = value_batch * value_tokens * c_.heads;
+                auto value_ids = ::tyloi::cuda::arange(value_rows, value.options().dtype(::tyloi::kInt32))
+                                     .remainder(c_.heads)
+                                     .reshape({value_rows, 1});
+                unembedded = ::tyloi::ops::project(
+                                 value.reshape({value_rows, value.size(-1)}), w_.unembed_output, value_ids)
+                                 .dense()
+                                 .reshape({value_batch, value_tokens, c_.heads, c_.value_width});
+            }
+            attended = DenseTensor();
+            return ::tyloi::ops::project(
+                       unembedded.reshape({b, t, c_.heads * c_.value_width}), w_.output)
+                .dense();
+        } catch (...) {
+            if (use_cache) {
                 state.latent.truncate(offset);
                 state.index.truncate(offset);
-            });
+            }
+            throw;
+        }
     }
 
   private:

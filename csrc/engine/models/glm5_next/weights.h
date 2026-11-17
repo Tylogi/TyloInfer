@@ -3,7 +3,6 @@
 #include "engine/models/common/ffn.h"
 #include "engine/models/metadata.h"
 #include "../common/check.h"
-#include "../common/recurrent_attention.h"
 #include <memory>
 #include <utility>
 
@@ -125,33 +124,6 @@ bool load_predictor(Predictor &result, Loader &ops, const Config &c) {
                       result.output_norm.numel() == c.hidden,
                   "GLM5-Next MTP normalization width disagrees with backbone");
     return true;
-}
-
-template <class Project, class Cache, class Absorb, class Dense, class Pool, class IndexQuery,
-          class Score, class Select, class Sparse, class Unembed, class Output, class Rollback>
-auto sparse_mla(int64_t length, int64_t budget, bool cache, Project project, Cache append,
-                Absorb absorb, Dense dense, Pool pool, IndexQuery index_query, Score score,
-                Select select, Sparse sparse, Unembed unembed, Output output, Rollback rollback) {
-    auto projected = project();
-    try {
-        if (cache)
-            append(projected);
-        auto query = absorb(projected);
-        auto attended = [&] {
-            if (length <= budget)
-                return dense(query, projected);
-            auto pooled = pool(projected);
-            auto iq = index_query(projected);
-            auto scores = score(std::move(iq), std::move(pooled));
-            auto selected = select(std::move(scores));
-            return sparse(query, projected, std::move(selected));
-        }();
-        return output(unembed(std::move(attended)));
-    } catch (...) {
-        if (cache)
-            rollback();
-        throw;
-    }
 }
 
 inline void load_config(std::string_view payload, Config& config, models::CausalLmMetadata& metadata) {
