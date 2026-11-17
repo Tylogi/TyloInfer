@@ -1,23 +1,23 @@
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-CUDA_ROOT = ROOT / "csrc" / "backends" / "cuda"
+CUDA_ROOT = ROOT / "cpp_runtime" / "backends" / "cuda"
 SOURCE = "\n".join(
     path.read_text(encoding="utf-8")
     for path in sorted(CUDA_ROOT.rglob("*"))
     if path.suffix in {".h", ".cpp"}
 )
-CORE = (ROOT / "csrc" / "core" / "tensor_parallel.h").read_text(
+CORE = (ROOT / "cpp_runtime" / "core" / "tensor_parallel.h").read_text(
     encoding="utf-8"
 )
-CMAKE = (ROOT / "csrc" / "tests" / "CMakeLists.txt").read_text(
+CMAKE = (ROOT / "cpp_runtime" / "tests" / "CMakeLists.txt").read_text(
     encoding="utf-8"
 )
 COMPONENTS = "\n".join(
     path.read_text(encoding="utf-8")
     for path in (
-        CUDA_ROOT / "engine" / "model_components.h",
-        CUDA_ROOT / "engine" / "model_components.cpp",
+        CUDA_ROOT / "storage" / "model_loader.h",
+        CUDA_ROOT / "storage" / "model_loader.cpp",
         CUDA_ROOT / "models" / "qwen35" / "ops.cpp",
     )
 )
@@ -64,13 +64,12 @@ def test_tensor_parallel_has_a_native_partition_test_target():
 
 def test_tq_parallel_preserves_compressed_rows_and_input_rings():
     linear = (CUDA_ROOT / "ops" / "common" / "quant_linear.cpp").read_text(encoding="utf-8")
-    loader = (CUDA_ROOT / "storage" / "weights" / "loaders" / "weight.cpp").read_text(encoding="utf-8")
     header = (CUDA_ROOT / "ops" / "common" / "include" / "quant_linear.h").read_text(encoding="utf-8")
     shard = header.split("struct QuantLinearShard {", 1)[1].split("};", 1)[0]
     assert "TqWeight tq;" in shard
-    assert "rows.slice_rows(slice.begin,slice.end)" in loader
-    assert "rows.slice_columns(slice.begin*256,slice.end*256)" in loader
-    assert "shard.tq=to_device_tq" in loader
+    assert "rows.slice_rows(slice.begin,slice.end)" in linear
+    assert "rows.slice_columns(slice.begin*256,slice.end*256)" in linear
+    assert "shard.tq=to_device_tq" in linear
     assert 'profiler.measure("tq.tensor_parallel"' in linear
     assert "if(is_tq() && !tensor_parallel())" in linear
     for method, logical in (("out", "logical_out"), ("neuron_len", "logical_neuron_len")):
@@ -81,7 +80,7 @@ def test_tq_parallel_preserves_compressed_rows_and_input_rings():
 
 
 def test_tq_self_describing_headers_supply_missing_shape_metadata():
-    tq = (CUDA_ROOT / "ops" / "tq" / "tq.cpp").read_text(encoding="utf-8")
+    tq = (CUDA_ROOT.parents[1] / "core" / "tq_model_layout.cpp").read_text(encoding="utf-8")
     logical = tq.split("std::vector<std::int64_t> logical_shape(", 1)[1].split(
         "std::vector<std::string> row_parts(", 1
     )[0]
@@ -91,9 +90,9 @@ def test_tq_self_describing_headers_supply_missing_shape_metadata():
 
 
 def test_tq_residual_projection_uses_the_parallel_aware_linear_entry():
-    loader = (CUDA_ROOT / "storage" / "weights" / "loaders" / "weight.cpp").read_text(encoding="utf-8")
+    loader = (CUDA_ROOT / "storage" / "weight_loader.cpp").read_text(encoding="utf-8")
     residual = loader.split("ResidualLinear residual_linear(", 1)[1]
-    tq = residual.split("if(weight->is_tq()) {", 1)[1].split("if(weight->is_dense())", 1)[0]
+    tq = residual.split("if(weight->is_tq() || weight->is_gguf()) {", 1)[1].split("if(weight->is_dense())", 1)[0]
     assert "weight->forward(context," in tq
     assert "weight->tq.forward(" not in tq
     assert "input.scalar_type()==tb::kFloat16?input:input.to(tb::kFloat32)" in tq
@@ -102,11 +101,11 @@ def test_tq_residual_projection_uses_the_parallel_aware_linear_entry():
 
 def test_tq_expert_cache_isolates_device_images_and_upload_arenas():
     tq = (CUDA_ROOT / "ops" / "tq" / "tq.cpp").read_text(encoding="utf-8")
-    cache = tq.split("class TqExpertCache {", 1)[1]
+    cache = tq.split("class TqExpertCache:private mfq::cuda::RoutedHostCache<TqHostImage> {", 1)[1]
     assert "std::unordered_map<DeviceKey,DeviceEntry,DeviceKeyHash> device_;" in cache
     assert "const DeviceKey device_key{key,device};" in cache
     assert "device_.find(device_key)" in cache
-    assert "device_.emplace(device_key," in cache
+    assert "device_.emplace(key,DeviceEntry{" in cache
     assert "stages_[destination.get_device()]" in cache
     assert "gemm_.try_emplace(device,resources)" in cache
     assert "covered_images.insert(key.image)" in cache
@@ -119,7 +118,8 @@ def test_tq_default_residency_is_not_an_explicit_zero_cache_budget():
     assert "execution.config.moe_device_cache_bytes.has_value()" in tq
     assert "bool(execution.moe_expert_cache)" in tq
     assert "execution.config.moe_host_physical_bytes,!explicit_budget)" in tq
-    assert "if(retain_all_ || weight.image.numel()<=device_limit_)" in tq
+    assert "if(cacheable && weight.image.numel()<=device_limit_locked())" in tq
+    assert "retain_all_?std::max(resident_bytes_bound_,device_used_locked(device)):device_limit_" in tq
     resize = tq.split("void resize(std::size_t bytes) {", 1)[1].split("std::size_t reclaim_host(", 1)[0]
     assert "retain_all_=false;" in resize
     assert '"TQ default loading disabled GPU expert residency"' in SOURCE
@@ -129,11 +129,14 @@ def test_tq_default_residency_is_not_an_explicit_zero_cache_budget():
 def test_tq_expert_partitions_keep_global_routes_and_zero_unowned_outputs():
     tq = (CUDA_ROOT / "ops" / "tq" / "tq.cpp").read_text(encoding="utf-8")
     assert "plan_moe_expert_parallel_slices(parallel,gate->experts" in tq
-    assert "expert<expert_begin || expert>=expert_end" in tq
+    assert "group_routed_experts(host,up->experts,unique,&slots,expert_begin,expert_end)" in tq
+    selection = (CUDA_ROOT / "runtime/routed_expert_groups.h").read_text(encoding="utf-8")
+    assert "return id>=begin && id<end;" in selection
+    assert 'if(id<0 || id>=experts)throw std::out_of_range(' in selection
     assert "auto pairs=partitioned?tb::zeros(" in tq
     assert "if(unique.empty())return tb::zeros(" in tq
     assert "return reduce_model_parallel_outputs(execution,std::move(partials))" in tq
-    ffn = (CUDA_ROOT / "models" / "common" / "ffn.cpp").read_text(encoding="utf-8")
+    ffn = (CUDA_ROOT / "core" / "ffn.cpp").read_text(encoding="utf-8")
     qwen = (CUDA_ROOT / "models" / "qwen4_exp" / "ops.cpp").read_text(encoding="utf-8")
     assert "moe_tq->forward_parallel(execution," in ffn
     assert "tq->forward_parallel(execution," in qwen
@@ -232,14 +235,10 @@ def test_tensor_parallel_peer_first_launch_preserves_rank_indexing():
 
 
 def test_qwen35_mtp_accepts_dense_tensor_parallel_placement():
-    source = (CUDA_ROOT / "engine/model_components.cpp").read_text()
-    qwen35 = source.split(
-        "RuntimeComponents<mfq::cuda::Qwen35CausalLm> load_runtime_components(", 1
-    )[1].split("RuntimeComponents<mfq::cuda::Qwen4CausalLm>", 1)[0]
-    assert "const bool supported_placement" in qwen35
-    assert "!model_execution.layer_placement.enabled()" in qwen35
-    assert "!execution.tensor_parallel.enabled()" not in qwen35
-    assert "dense GPU-resident Qwen blocks" in qwen35
+    assert "const bool supported_placement" in COMPONENTS
+    assert "!model_execution.layer_placement.enabled()" in COMPONENTS
+    assert "!execution.tensor_parallel.enabled()" not in COMPONENTS
+    assert "dense GPU-resident Qwen blocks" in COMPONENTS
 
 
 def test_quantized_tp_weights_and_workspaces_follow_the_shard_device():

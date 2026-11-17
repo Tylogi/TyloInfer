@@ -4,9 +4,32 @@ import type { ModelArtifact } from '../../shared/api/types';
 import type { useModelCatalog } from './useModelCatalog';
 import { LocalCheckpoints } from './LocalCheckpoints';
 import userEvent from '@testing-library/user-event';
+import { DEFAULT_LOAD_CONTEXT } from './loadContextDefaults';
 
 vi.mock('../settings/SettingsProvider', () => ({ useSettings: () => ({ tr: (_zh: string, en: string) => en }) }));
 vi.mock('./ModelLoadProgress', () => ({ ModelLoadProgress: () => null }));
+
+it('shows streamed Jev placement and updates pressure when full VRAM is selected', () => {
+  const GiB = 2 ** 30;
+  const artifact = { id: 'decision', name: 'd3-turbo', architecture: 'qwen35', format: 'hf',
+    shard_count: 1, total_bytes: 20 * GiB, estimated_resident_weight_bytes: 20 * GiB,
+    jev_weight_memory: { stream_vram_bytes: GiB / 2, stream_ram_bytes: 16 * GiB, resident_vram_bytes: 16 * GiB },
+    structured_decisions: true, tensor_count: 1, record_count: 1, dtypes: [], complete: true,
+    loadable: true, modified_at: '' } as ModelArtifact;
+  const catalog = { runtime: { memory_architecture: 'discrete', device_memory_total_bytes: 24 * GiB,
+    host_memory_total_bytes: 64 * GiB }, artifacts: [artifact], filteredArtifacts: [artifact], instances: [],
+    busy: false, modelFilter: '', setModelFilter: vi.fn(), unloadInstance: vi.fn(), loadArtifact: vi.fn(),
+    chooseModelDirectory: vi.fn(), openModelFiles: vi.fn(), loadContextForModel: () => DEFAULT_LOAD_CONTEXT,
+  } as unknown as ReturnType<typeof useModelCatalog>;
+  const { rerender } = render(<LocalCheckpoints catalog={catalog} />);
+  expect(screen.getByText('Estimated resident VRAM', { exact: false })).toHaveTextContent('0.5 GiB · RAM-streamed weights 16 GiB');
+  expect(screen.getByRole('progressbar', { name: 'VRAM + RAM pressure: 18.8%' })).toBeInTheDocument();
+  rerender(<LocalCheckpoints catalog={{ ...catalog,
+    loadContextForModel: () => ({ ...DEFAULT_LOAD_CONTEXT, jev_weights: 'vram' }) }} />);
+  expect(screen.getByText('Estimated resident VRAM', { exact: false })).toHaveTextContent('16 GiB');
+  expect(screen.queryByText('RAM-streamed weights', { exact: false })).toBeNull();
+  expect(screen.getByRole('progressbar', { name: 'VRAM pressure: 66.7%' })).toBeInTheDocument();
+});
 
 it('passes an explicit external Engram path only for the selected GGUF model', async () => {
   const artifact = { id: 'xq', name: 'XQ', architecture: 'deepseek_v41', format: 'gguf', shard_count: 16,

@@ -2,7 +2,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).parents[1]
-CUDA_ROOT = ROOT / "csrc" / "backends" / "cuda"
+CUDA_ROOT = ROOT / "cpp_runtime" / "backends" / "cuda"
 CUDA_RUNTIME = "\n".join(
     path.read_text(encoding="utf-8")
     for path in (
@@ -15,7 +15,7 @@ BACKEND_CHECKS = (
     CUDA_ROOT / "diagnostics" / "backend_checks.cpp"
 ).read_text(encoding="utf-8")
 MODEL_METADATA_SOURCE = "\n".join(
-    (ROOT / "csrc/models" / model / "causal_lm.h").read_text(
+    (ROOT / "cpp_runtime/models" / model / "causal_lm.h").read_text(
         encoding="utf-8"
     )
     for model in ("glm_dsa", "minicpmo45")
@@ -23,61 +23,66 @@ MODEL_METADATA_SOURCE = "\n".join(
 SOURCE = "\n".join(
     path.read_text(encoding="utf-8")
     for path in (
-        CUDA_ROOT / "models" / "common" / "causal_model_ops.h",
-        CUDA_ROOT / "models" / "common" / "causal_model_ops.cpp",
-        CUDA_ROOT / "models" / "common" / "session_codec.h",
-        CUDA_ROOT / "models" / "common" / "transformer_loader.h",
-        CUDA_ROOT / "models" / "common" / "transformer_loader.cpp",
-        CUDA_ROOT / "models" / "common" / "full_block.h",
-        CUDA_ROOT / "models" / "common" / "full_block.cpp",
-        CUDA_ROOT / "storage" / "state" / "kv_cache.h",
-        CUDA_ROOT / "storage" / "state" / "kv_cache.cpp",
+        CUDA_ROOT / "core" / "causal_model.h",
+        CUDA_ROOT / "core" / "causal_model.cpp",
+        CUDA_ROOT / "storage" / "session_codec.h",
+        CUDA_ROOT / "storage" / "transformer_loader.h",
+        CUDA_ROOT / "storage" / "transformer_loader.cpp",
+        CUDA_ROOT / "core" / "full_block.h",
+        CUDA_ROOT / "core" / "full_block.cpp",
+        CUDA_ROOT / "core" / "kv_cache.h",
+        CUDA_ROOT / "core" / "kv_cache.cpp",
         CUDA_ROOT / "include" / "mfq_cuda_attention_ops.h",
         CUDA_ROOT / "include" / "mfq_cuda_cache_ops.h",
         CUDA_ROOT / "include" / "mfq_cuda_norm_ops.h",
+        CUDA_ROOT / "include" / "mfq_cuda_profiler.h",
         CUDA_ROOT / "include" / "mfq_cuda_sampling_ops.h",
-        CUDA_ROOT / "execution" / "execution.h",
-        CUDA_ROOT / "execution" / "execution.cpp",
-        CUDA_ROOT / "engine" / "decode_graph.h",
+        CUDA_ROOT / "ops" / "common" / "include" / "cuda_execution.h",
+        CUDA_ROOT / "ops" / "common" / "cuda_execution.cpp",
+        CUDA_ROOT / "core" / "decode_graph.h",
     )
 ) + "\n" + BACKEND_CHECKS + "\n" + CUDA_RUNTIME + "\n" + (
     CUDA_ROOT / "commands" / "diagnostics.cpp"
 ).read_text(encoding="utf-8")
 ATTENTION_SOURCE = (
-    CUDA_ROOT / "kernels" / "attention.cu"
+    Path(__file__).parents[1] / "tyloinfer" / "kernels" / "cuda" / "attention.cu"
 ).read_text(encoding="utf-8")
 ATTENTION_MMA_SOURCE = (
-    CUDA_ROOT / "kernels" / "attention_mma.cu"
+    Path(__file__).parents[1]
+    / "tyloinfer"
+    / "kernels"
+    / "cuda"
+    / "attention_mma.cu"
 ).read_text(encoding="utf-8")
 BACKEND_SOURCE = (
-    CUDA_ROOT / "native" / "tensor" / "backend.h"
+    Path(__file__).parents[1] / "cpp_runtime" / "backends" / "cuda" / "include" / "mfq_tensor_backend.h"
 ).read_text(encoding="utf-8")
 CONTEXT_SOURCE = (
-    CUDA_ROOT / "native" / "context.cu"
+    Path(__file__).parents[1] / "cpp_runtime" / "backends" / "cuda" / "src" / "mfq_cuda_context.cu"
 ).read_text(encoding="utf-8")
 NATIVE_OPS_SOURCE = "\n".join(
     path.read_text(encoding="utf-8")
-    for path in sorted((CUDA_ROOT / "native" / "tensor").glob("*"))
+    for path in sorted((CUDA_ROOT / "src").glob("mfq_native_tensor*"))
     if path.suffix in {".cpp", ".cu", ".cuh"}
 )
 NATIVE_TENSOR_SOURCE = (
-    CUDA_ROOT / "native" / "tensor" / "tensor.cu"
+    Path(__file__).parents[1] / "cpp_runtime" / "backends" / "cuda" / "src" / "mfq_native_tensor.cu"
 ).read_text(encoding="utf-8")
 KV_CACHE_SOURCE = (
-    CUDA_ROOT / "kernels" / "kv_cache.cu"
+    Path(__file__).parents[1] / "tyloinfer" / "kernels" / "cuda" / "kv_cache.cu"
 ).read_text(encoding="utf-8")
 ACC_SOURCE = (
-    CUDA_ROOT / "kernels" / "acc.cu"
+    Path(__file__).parents[1] / "tyloinfer" / "kernels" / "cuda" / "acc.cu"
 ).read_text(encoding="utf-8")
 
 
 SHARED_ENGINE = "\n".join(
     path.read_text(encoding="utf-8")
-    for path in (ROOT / "csrc" / "engine" / "include").glob("*.h")
+    for path in (ROOT / "cpp_runtime" / "engine" / "include").glob("*.h")
 )
 SHARED_MODELS = "\n".join(
     path.read_text(encoding="utf-8")
-    for path in (ROOT / "csrc" / "models").rglob("*.h")
+    for path in (ROOT / "cpp_runtime" / "models").rglob("*.h")
 )
 
 SOURCE += SHARED_ENGINE + SHARED_MODELS
@@ -93,7 +98,7 @@ def test_minicpmo_native_runtime_keeps_cuda_graph_enabled() -> None:
 
 
 def test_static_decode_uses_dynamic_position_for_kv_writes() -> None:
-    causal_lm = (ROOT / "csrc/models/common/causal_model.h").read_text(
+    causal_lm = (ROOT / "cpp_runtime/models/common/causal_model.h").read_text(
         encoding="utf-8"
     )
     static_forward = causal_lm.split(
@@ -147,8 +152,7 @@ def test_graph_profile_covers_model_and_commit_boundaries() -> None:
 def test_torch_reference_graph_can_emit_a_debug_dump() -> None:
     assert 'std::getenv("TYLOINFER_TORCH_CUDA_GRAPH_DUMP")' in BACKEND_SOURCE
     assert "graph.enable_debug_mode();" in BACKEND_SOURCE
-    assert "cudaGraphDebugDotPrint(" in BACKEND_SOURCE
-    assert "graph.raw_cuda_graph()" in BACKEND_SOURCE
+    assert "graph.debug_dump(debug_path);" in BACKEND_SOURCE
     assert "mfq_debug_dump_cuda_graph(graph);" in SOURCE
 
 
@@ -260,13 +264,16 @@ def test_full_flash_attention_accepts_gqa8_with_matching_tiles() -> None:
     implementation = ATTENTION_MMA_SOURCE.split(
         "mfq_attention_mma256_cuda", 1
     )[1].split("mfq_attention_mma128_cuda", 1)[0]
-    assert "(gqa_ratio == 4 || gqa_ratio == 8)" in implementation
+    assert "gqa_ratio > 0" in implementation
+    assert "gqa_ratio != 4 && gqa_ratio != 8" in implementation
+    assert "mfq_attention_mma_launch<256, 256, 32, 1>" in implementation
     assert "mfq_attention_mma_launch<256, 256, 16, 4>" in implementation
     assert "mfq_attention_mma_launch<256, 256, 8, 8>" in implementation
     selection = SOURCE.split(
         "const bool mma_attention_enabled =", 1
-    )[1].split("else if (sliding)", 1)[0]
-    assert "nh == 4 * nkh || nh == 8 * nkh" in selection
+    )[1].split("a = attention_cuda(", 1)[0]
+    assert "nkh > 0 && nh % nkh == 0" in selection
+    assert "mfq_attention_mma256_cuda(" in selection
 
 
 def test_minicpmo_bf16_residual_uses_contiguous_specialized_add() -> None:

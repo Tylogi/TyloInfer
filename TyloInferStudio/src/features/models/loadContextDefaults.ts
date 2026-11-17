@@ -4,6 +4,7 @@ import type { KvQuantizationSettings } from '../../shared/api/resources/runtime'
 export interface LoadContextDefaults {
   context_size: number | null;
   automatic: boolean;
+  jev_weights?: 'stream' | 'vram';
   ssd_kv: boolean;
   ram_preallocated: boolean;
   vram_preallocated: boolean;
@@ -11,7 +12,7 @@ export interface LoadContextDefaults {
 }
 
 export const DEFAULT_LOAD_CONTEXT: LoadContextDefaults = {
-  context_size: null, automatic: true, ssd_kv: false,
+  context_size: null, automatic: true, jev_weights: 'stream', ssd_kv: false,
   ram_preallocated: true, vram_preallocated: true,
   kv_quantization: { enabled: false, bits: 4, algorithm: 'turboquant' },
 };
@@ -31,6 +32,7 @@ export function readLoadContext(model?: string): LoadContextDefaults {
       if (typeof value[field] === 'boolean') result[field] = value[field];
     if (typeof value.kv_quantization?.enabled === 'boolean' && [2, 2.5, 3, 3.5, 4, 6, 8].includes(value.kv_quantization.bits))
       result.kv_quantization = { enabled: value.kv_quantization.enabled, bits: value.kv_quantization.bits, algorithm: 'turboquant' };
+    if (value.jev_weights === 'stream' || value.jev_weights === 'vram') result.jev_weights = value.jev_weights;
     if (!result.ssd_kv) result.ram_preallocated = true;
     return result;
   } catch { return structuredClone(DEFAULT_LOAD_CONTEXT); }

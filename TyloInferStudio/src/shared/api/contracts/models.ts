@@ -8,6 +8,12 @@ export interface ModelArtifact {
   asset_kind?: 'model' | 'ple' | 'engram';
   owned_file_bytes?: number | null;
   gguf_companion_required?: boolean;
+  structured_decisions?: boolean;
+  jev_weight_memory?: {
+    stream_vram_bytes: number;
+    stream_ram_bytes: number;
+    resident_vram_bytes: number;
+  } | null;
   shard_count: number;
   missing_shards?: number;
   total_bytes: number;
@@ -22,7 +28,6 @@ export interface ModelArtifact {
   loadable: boolean;
   modified_at: string;
   error?: string | null;
-  support_error?: string | null;
 }
 
 export interface ModelDeletionPlan {
@@ -348,4 +353,17 @@ export interface OfficialModelList {
   system: HubSystemProfile;
   data: OfficialModelInfo[];
   refreshing?: boolean;
+}
+
+export interface ArtifactLineage {
+  id: string;
+  artifact_uri: string;
+  artifact_name: string;
+  producer_job_id: string;
+  producer_kind: string;
+  source_uris: string[];
+  parameters: Record<string, unknown>;
+  metadata: Record<string, unknown>;
+  validation_job_ids: string[];
+  created_at: string;
 }

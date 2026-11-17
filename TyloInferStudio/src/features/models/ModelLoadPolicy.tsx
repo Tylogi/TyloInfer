@@ -29,6 +29,15 @@ export function ModelLoadPolicy({ catalog }: { catalog: ReturnType<typeof useMod
             </option>)}
           </select>}
         />}
+        {catalog.runtime?.backend === 'cuda' && catalog.artifacts.some(item =>
+          item.name === catalog.settingsModel && item.structured_decisions) && <SettingRow
+          title={tr('全部载入显存', 'Load all Jev weights into VRAM')}
+          detail={tr('默认仅保留两层权重缓冲，按层从 RAM 传入显存。开启后全部权重常驻显存，需要足够的空余显存。',
+            'By default, two layer buffers stream weights from RAM. Enable to keep all weights in VRAM; sufficient free VRAM is required.')}
+          trailing={<Switch label={tr('全部载入显存', 'Load all Jev weights into VRAM')}
+            checked={catalog.loadContext.jev_weights === 'vram'}
+            onCheckedChange={checked => catalog.setLoadContext({ ...catalog.loadContext, jev_weights: checked ? 'vram' : 'stream' })} />}
+        />}
         <SettingRow
           title={tr('固定到内存', 'Pin in memory')}
           detail={tr('跳过 LRU 与空闲卸载', 'Skip LRU and idle eviction')}

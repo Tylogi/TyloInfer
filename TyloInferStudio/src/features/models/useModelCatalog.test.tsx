@@ -96,13 +96,10 @@ describe('useModelCatalog', () => {
   });
 
   it('forwards explicitly selected GGUF companions with the model load request', async () => {
-    state.ready = true;
-    vi.mocked(modelsApi.modelArtifacts).mockResolvedValue([{ ...artifact, id: 'xq-id', name: 'XQ' }]);
     const load = vi.spyOn(modelsApi, 'loadModel').mockResolvedValue({ operation_id: 'load', status: 'accepted' });
     const { result } = renderHook(useModelCatalog, { wrapper: Wrapper });
-    await waitFor(() => expect(result.current.artifacts).toHaveLength(1));
     await act(async () => result.current.loadArtifact('XQ', ['/models/engram']));
-    expect(load).toHaveBeenCalledExactlyOnceWith('xq-id', null, 'auto', expect.objectContaining({
+    expect(load).toHaveBeenCalledExactlyOnceWith('XQ', null, 'auto', expect.objectContaining({
       gguf_companions: ['/models/engram'],
     }));
   });
@@ -299,12 +296,9 @@ describe('useModelCatalog', () => {
   });
 
   it('ignores a completed model load after leaving the model page', async () => {
-    state.ready = true;
     let resolve!: (value: Awaited<ReturnType<typeof modelsApi.loadModel>>) => void;
     vi.spyOn(modelsApi, 'loadModel').mockReturnValue(new Promise((done) => { resolve = done; }));
     const { result, unmount } = renderHook(useModelCatalog, { wrapper: Wrapper });
-    await waitFor(() => expect(result.current.artifacts).toHaveLength(1));
-    state.refreshRuntime.mockClear();
     let pending!: Promise<void>;
     act(() => { pending = result.current.loadArtifact(artifact.name); });
     unmount();
@@ -315,13 +309,10 @@ describe('useModelCatalog', () => {
   });
 
   it('does not select an old model if the server changes during the post-load refresh', async () => {
-    state.ready = true;
     vi.spyOn(modelsApi, 'loadModel').mockResolvedValue({ operation_id: 'load', status: 'accepted' });
     let resolve!: () => void;
     state.refreshRuntime.mockReturnValue(new Promise<void>((done) => { resolve = done; }));
     const { result, rerender } = renderHook(useModelCatalog, { wrapper: Wrapper });
-    await waitFor(() => expect(result.current.artifacts).toHaveLength(1));
-    state.refreshRuntime.mockClear();
     let pending!: Promise<void>;
     await act(async () => { pending = result.current.loadArtifact(artifact.name); await Promise.resolve(); });
     expect(state.refreshRuntime).toHaveBeenCalledWith(false);
@@ -356,13 +347,10 @@ describe('useModelCatalog', () => {
   });
 
   it.each(['load', 'unload'] as const)('does not show a late %s error after leaving the model page', async (operation) => {
-    state.ready = true;
     let reject!: (cause: Error) => void;
     const response = new Promise<never>((_resolve, fail) => { reject = fail; });
     vi.spyOn(modelsApi, operation === 'load' ? 'loadModel' : 'unloadModel').mockReturnValue(response);
     const { result, unmount } = renderHook(useModelCatalog, { wrapper: Wrapper });
-    await waitFor(() => expect(result.current.artifacts).toHaveLength(1));
-    state.refreshRuntime.mockClear();
     let pending!: Promise<void>;
     act(() => { pending = operation === 'load' ? result.current.loadArtifact(artifact.name) : result.current.unloadInstance('instance'); });
     unmount();
@@ -511,7 +499,7 @@ describe('useModelCatalog', () => {
       result.current.setLoadDeviceIds(['2']);
     });
     await act(async () => result.current.loadArtifact(artifact.name));
-    expect(load).toHaveBeenCalledWith(artifact.id, null, 'auto', {
+    expect(load).toHaveBeenCalledWith('Local Model', null, 'auto', {
       pin: true,
       idle_ttl_seconds: 300,
       device_ids: ['2'],
@@ -521,14 +509,22 @@ describe('useModelCatalog', () => {
     expect(result.current.busy).toBe(false);
   });
 
-  it('isolates context, devices and residency choices by model and connection', async () => {
+  it('passes Jev weight placement independently of automatic context settings', async () => {
     state.ready = true;
-    vi.mocked(modelsApi.modelArtifacts).mockResolvedValue([
-      { ...artifact, id: 'model-a', name: 'Model A' }, { ...artifact, id: 'model-b', name: 'Model B' },
-    ]);
+    vi.spyOn(modelsApi, 'modelArtifacts').mockResolvedValue([{ ...artifact, structured_decisions: true }]);
+    const load = vi.spyOn(modelsApi, 'loadModel').mockResolvedValue({ operation_id: 'load-jev', status: 'accepted' });
+    const { result } = renderHook(useModelCatalog, { wrapper: Wrapper });
+    await waitFor(() => expect(result.current.artifacts).toHaveLength(1));
+    act(() => result.current.openModelSettings(artifact.name));
+    act(() => result.current.setLoadContext({ ...DEFAULT_LOAD_CONTEXT, jev_weights: 'vram' }));
+    await act(async () => result.current.loadArtifact(artifact.name));
+    expect(load).toHaveBeenCalledWith(artifact.name, null, 'auto', expect.objectContaining({ jev_weights: 'vram' }));
+    expect(load.mock.calls[0][3]).not.toHaveProperty('context_management');
+  });
+
+  it('isolates context, devices and residency choices by model and connection', async () => {
     const load = vi.spyOn(modelsApi, 'loadModel').mockResolvedValue({ operation_id: 'load', status: 'accepted' });
     const { result, rerender } = renderHook(useModelCatalog, { wrapper: Wrapper });
-    await waitFor(() => expect(result.current.artifacts).toHaveLength(2));
     act(() => result.current.openModelSettings('Model A'));
     act(() => {
       result.current.setLoadPinned(true);
@@ -540,9 +536,9 @@ describe('useModelCatalog', () => {
     expect(result.current.loadDeviceIds).toEqual([]);
     expect(result.current.loadContext.context_size).toBeNull();
     await act(async () => result.current.loadArtifact('Model B'));
-    expect(load).toHaveBeenLastCalledWith('model-b', null, 'auto', { pin: false, device_ids: [], idle_ttl_seconds: null });
+    expect(load).toHaveBeenLastCalledWith('Model B', null, 'auto', { pin: false, device_ids: [], idle_ttl_seconds: null });
     await act(async () => result.current.loadArtifact('Model A'));
-    expect(load).toHaveBeenLastCalledWith('model-a', 8192, 'auto', expect.objectContaining({ pin: true, device_ids: ['2'],
+    expect(load).toHaveBeenLastCalledWith('Model A', 8192, 'auto', expect.objectContaining({ pin: true, device_ids: ['2'],
       context_management: expect.objectContaining({ automatic: false, context_size: 8192 }) }));
     act(() => result.current.openModelSettings('Model A'));
     setApiBaseUrl('https://another.invalid'); state.connectionRevision++;

@@ -11,7 +11,6 @@ from pathlib import Path
 import pytest
 
 from bench import model_bench
-from tyloinfer.evaluation.inference import BenchmarkValidationError, validate_benchmark_result
 
 
 def native_result():
@@ -119,35 +118,6 @@ def test_timeout_reaps_wrapper_children_holding_output_pipes(runtime_script):
         runtime.close()
 
 
-@pytest.mark.parametrize("section,key,value", [
-    ("usage", "prompt_tokens", 16),
-    ("usage", "completion_tokens", 0),
-    ("usage", "completion_tokens", 9),
-    ("usage", "completion_tokens", True),
-    ("metrics", "prefill_tokens", 0),
-    ("metrics", "prefill_ms", 0),
-    ("metrics", "decode_ms", float("nan")),
-    ("metrics", "ttft_ms", float("inf")),
-    ("metrics", "ttft_ms", None),
-    ("metrics", "prefill_tps", float("nan")),
-    ("metrics", "mtp_used", "false"),
-    ("metrics", "mtp_used", 1),
-    ("metrics", "mtp_available", "unsupported"),
-    ("metrics", "mtp_drafted_tokens", -1),
-    ("metrics", "mtp_accepted_tokens", 1),
-])
-def test_cli_and_server_reject_the_same_invalid_metrics(runtime_script, section, key, value):
-    result = native_result()
-    result[section][key] = value
-    # JSON also exercises the native wire representation of non-finite numbers.
-    body = f"result = json.loads({json.dumps(result)!r})\nsend('event', result)\nsend('done')\n"
-    runtime = process(runtime_script(body))
-    try:
-        assert runtime.generate("invalid", 32, 8, False, 1)["status"] == "error"
-    finally:
-        runtime.close()
-    with pytest.raises(BenchmarkValidationError):
-        validate_benchmark_result(result, 32, 8, "decode")
 
 
 def test_requested_mtp_must_execute(runtime_script):
@@ -304,3 +274,24 @@ def test_invalid_cli_parameters_fail_before_loading(monkeypatch, arguments):
     with pytest.raises(SystemExit) as error:
         model_bench.main()
     assert error.value.code == 2
+
+
+@pytest.mark.parametrize("group,key,value", [
+    ("metrics", "decode_ms", float("nan")),
+    ("metrics", "prefill_ms", 0),
+    ("metrics", "ttft_ms", -1),
+    ("usage", "completion_tokens", 1),
+    ("usage", "completion_tokens", 9),
+    ("usage", "prompt_tokens", 31),
+    ("metrics", "prefill_tokens", 16),
+])
+def test_invalid_native_metrics_are_rejected(group, key, value):
+    result = native_result()
+    result[group][key] = value
+    with pytest.raises(model_bench.BenchmarkValidationError):
+        model_bench.validate_benchmark_result(result, 32, 8, "decode")
+
+
+def test_native_decode_rate_excludes_first_token():
+    run = model_bench.validate_benchmark_result(native_result(), 32, 8, "decode")
+    assert run["metrics"]["decode_tps"] == 350

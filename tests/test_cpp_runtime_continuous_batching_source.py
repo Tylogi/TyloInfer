@@ -2,7 +2,7 @@ from pathlib import Path
 import re
 
 ROOT = Path(__file__).resolve().parents[1]
-CUDA_ROOT = ROOT / "csrc" / "backends" / "cuda"
+CUDA_ROOT = ROOT / "cpp_runtime" / "backends" / "cuda"
 DECODE = "\n".join(
     path.read_text(encoding="utf-8")
     for path in sorted(CUDA_ROOT.rglob("*"))
@@ -19,35 +19,41 @@ BATCH_STATE = "\n".join(
 BATCHING_CHECK = (
     CUDA_ROOT / "diagnostics" / "runtime_checks.cpp"
 ).read_text(encoding="utf-8")
-SCHEDULER = (ROOT / "csrc" / "scheduler" / "src" / "scheduler.cpp").read_text(encoding="utf-8")
-ROPE = (CUDA_ROOT / "kernels" / "rope.cu").read_text(encoding="utf-8")
-ATTENTION = (CUDA_ROOT / "kernels" / "attention.cu").read_text(encoding="utf-8")
+SCHEDULER = (ROOT / "cpp_runtime" / "scheduler" / "src" / "scheduler.cpp").read_text(encoding="utf-8")
+ROPE = (ROOT / "tyloinfer" / "kernels" / "cuda" / "rope.cu").read_text(
+    encoding="utf-8"
+)
+ATTENTION = (ROOT / "tyloinfer" / "kernels" / "cuda" / "attention.cu").read_text(
+    encoding="utf-8"
+)
 ATTENTION_MMA = (
-    CUDA_ROOT / "kernels" / "attention_mma.cu"
+    ROOT / "tyloinfer" / "kernels" / "cuda" / "attention_mma.cu"
 ).read_text(encoding="utf-8")
-KV_CACHE = (CUDA_ROOT / "kernels" / "kv_cache.cu").read_text(encoding="utf-8")
+KV_CACHE = (ROOT / "tyloinfer" / "kernels" / "cuda" / "kv_cache.cu").read_text(
+    encoding="utf-8"
+)
 QWEN_LOADER = (
-    ROOT / "csrc" / "models" / "qwen35" / "causal_lm.h"
+    ROOT / "cpp_runtime" / "models" / "qwen35" / "causal_lm.h"
 ).read_text(encoding="utf-8")
 QWEN_CONFIG = (
-    ROOT / "csrc" / "models" / "qwen35" / "config.cpp"
+    ROOT / "cpp_runtime" / "models" / "qwen35" / "config.cpp"
 ).read_text(encoding="utf-8")
 CAUSAL_LM = "\n".join(
     (CUDA_ROOT / name).read_text(encoding="utf-8")
-    for name in ("models/common/causal_model_ops.h", "models/common/causal_model_ops.cpp", "models/common/session_codec.h")
+    for name in ("core/causal_model.h", "core/causal_model.cpp", "storage/session_codec.h")
 )
 RUNTIME_OPTIONS = (
-    CUDA_ROOT / "engine" / "load_options.cpp"
+    CUDA_ROOT / "storage" / "load_options.cpp"
 ).read_text(encoding="utf-8")
 
 
 SHARED_ENGINE = "\n".join(
     path.read_text(encoding="utf-8")
-    for path in (ROOT / "csrc" / "engine" / "include").glob("*.h")
+    for path in (ROOT / "cpp_runtime" / "engine" / "include").glob("*.h")
 )
 SHARED_MODELS = "\n".join(
     path.read_text(encoding="utf-8")
-    for path in (ROOT / "csrc" / "models").rglob("*.h")
+    for path in (ROOT / "cpp_runtime" / "models").rglob("*.h")
 )
 
 DECODE += SHARED_ENGINE + SHARED_MODELS
@@ -64,7 +70,7 @@ def test_continuous_batching_is_an_explicit_server_mode():
     assert "std::thread" not in BATCHING
     assert "engine_.step(eligible)" in SCHEDULER
     assert "worker_" not in BATCHING
-    assert "queue_" not in BATCHING
+    assert not re.search(r"\bqueue_\b", BATCHING)
     assert "queue_mutex_" not in BATCHING
     assert "batch_compatible(constEngineRequest&request," in "".join(DECODE.split())
     assert "run_exclusive_generation" not in BATCHING
@@ -163,7 +169,7 @@ def test_generic_qwen_loader_constructs_moe_ffns():
     assert "load_mfe_gpu(" in DECODE
     assert "result.is_moe = true" in DECODE
     assert "load_ffn<typename Loader::Ffn>(" in QWEN_LOADER
-    assert "metadata.num_experts = config.num_experts" in (ROOT / "csrc/models/qwen35/causal_lm.h").read_text(encoding="utf-8")
+    assert "metadata.num_experts = config.num_experts" in (ROOT / "cpp_runtime/models/qwen35/causal_lm.h").read_text(encoding="utf-8")
     assert "return this->metadata.num_experts" in CAUSAL_LM
     assert "dense Qwen model config intermediate_size must be positive" in QWEN_CONFIG
     assert '"Qwen model config intermediate_size must be positive"' not in QWEN_CONFIG

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -23,7 +24,8 @@ def test_authentication_policy_is_hot_persistent_and_shared(tmp_path: Path) -> N
             assert response.status_code == 200
             assert response.json() == {"enabled": True, "has_key": True}
             assert secret not in path.read_text()
-            assert path.stat().st_mode & 0o777 == 0o600
+            if os.name == "posix":
+                assert path.stat().st_mode & 0o777 == 0o600
             assert (await client.get("/v1/models")).status_code == 401
             denied = await client.post("/v1/messages", headers={"x-api-key": "incorrect"}, json={})
             assert denied.status_code == 401

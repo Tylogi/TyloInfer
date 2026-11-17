@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -33,7 +34,7 @@ def cmake_path():
     (True, True, ["-DTYLOINFER_BUILD_CUDA_RUNTIME=ON", "-DTYLOINFER_BUILD_HIP_RUNTIME=ON"], None),
 ])
 def test_cmake_accelerator_selection(tmp_path, cuda, hip, flags, expected):
-    source = (ROOT / "csrc/CMakeLists.txt").read_text()
+    source = (ROOT / "cpp_runtime/CMakeLists.txt").read_text()
     options = source.split("include(CheckLanguage)\n", 1)[1].split("\nif(APPLE)\n", 1)[0]
     options = options.replace("check_language(CUDA)", "").replace("check_language(HIP)", "")
     (tmp_path / "CMakeLists.txt").write_text(
@@ -44,7 +45,11 @@ def test_cmake_accelerator_selection(tmp_path, cuda, hip, flags, expected):
     )
     output = tmp_path / "build"
     command = [cmake_path(), "-S", str(tmp_path), "-B", str(output)]
-    result = subprocess.run([*command, *flags], capture_output=True, text=True)
+    environment = dict(os.environ)
+    # A Python-installed CMake launcher may use another interpreter.
+    environment.pop("PYTHONHOME", None)
+    environment.pop("PYTHONPATH", None)
+    result = subprocess.run([*command, *flags], capture_output=True, text=True, env=environment)
     if expected is None:
         assert result.returncode != 0
         assert "Select either TYLOINFER_BUILD_CUDA_RUNTIME or TYLOINFER_BUILD_HIP_RUNTIME" in result.stderr
@@ -53,7 +58,7 @@ def test_cmake_accelerator_selection(tmp_path, cuda, hip, flags, expected):
         assert (output / "selected.txt").read_text() == expected
         if flags == ["-DTYLOINFER_BUILD_HIP_RUNTIME=ON"]:
             result = subprocess.run([*command, "-DTYLOINFER_BUILD_CUDA_RUNTIME=ON", "-DTYLOINFER_BUILD_HIP_RUNTIME=OFF"],
-                                    capture_output=True, text=True)
+                                    capture_output=True, text=True, env=environment)
             assert result.returncode == 0, result.stdout + result.stderr
             assert (output / "selected.txt").read_text() == "ON;OFF"
 
@@ -160,9 +165,6 @@ def test_staging_is_content_addressed_and_excludes_cuda(tmp_path):
     cuda = root / "tyloinfer/kernels/cuda"
     cuda.mkdir()
     (cuda / "fixed.cuh").write_text("#pragma once\n#define WIDTH 32\n")
-    native_cuda = root / "csrc/backends/cuda/kernels"
-    native_cuda.mkdir(parents=True)
-    (native_cuda / "fixed.cuh").write_text("#pragma once\n#define WIDTH 64\n")
     original = hashes(root)
     cache = tmp_path / "cache"
     with ThreadPoolExecutor(max_workers=4) as executor:
@@ -170,7 +172,6 @@ def test_staging_is_content_addressed_and_excludes_cuda(tmp_path):
     assert len(set(stages)) == 1
     stage = stages[0]
     assert not (stage / "tyloinfer/kernels/cuda").exists()
-    assert not (stage / "csrc/backends/cuda/kernels").exists()
     target = stage / "tyloinfer/kernels/hip/fixed.cuh"
     stamp = target.stat().st_mtime_ns
     assert stage_sources(root, cache) == stage
@@ -220,7 +221,4 @@ def test_loader_only_passes_staged_inputs_to_torch(tmp_path, monkeypatch):
     for path in captured["sources"] + captured["extra_include_paths"]:
         value = Path(path)
         assert value.exists() and value.is_relative_to(tmp_path)
-    staged = next(Path(path) for path in captured["extra_include_paths"] if Path(path).name == "csrc")
-    assert (staged / "formats/fp8_sq_blob.h").is_file()
-    assert (staged / "backends/cpu/native/host_parallel.h").is_file()
     assert captured["build_directory"] == str(tmp_path / "cache")

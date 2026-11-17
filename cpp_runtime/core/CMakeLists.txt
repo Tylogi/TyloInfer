@@ -1,0 +1,161 @@
+# Backend-neutral graph, policies, interfaces, and generated tables.
+
+find_package(Threads REQUIRED)
+add_library(mfq-host-parallel STATIC host_parallel.cpp include/tyloinfer/host_parallel.h
+    host_copy.cpp include/tyloinfer/host_copy.h
+    host_memory.cpp include/tyloinfer/host_memory.h
+    host_cache_registry.cpp include/tyloinfer/host_cache_registry.h
+    cpu_expert_pool.cpp include/tyloinfer/cpu_expert_pool.h)
+target_include_directories(mfq-host-parallel PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_features(mfq-host-parallel PUBLIC cxx_std_17)
+if(MSVC)
+    # Worker failures must unwind dispatch locks before the caller retries.
+    target_compile_options(mfq-host-parallel PRIVATE /EHsc)
+endif()
+target_link_libraries(mfq-host-parallel PUBLIC Threads::Threads)
+set_target_properties(mfq-host-parallel PROPERTIES POSITION_INDEPENDENT_CODE ON)
+add_library(mfq::host-parallel ALIAS mfq-host-parallel)
+
+add_library(mfq-model-graph STATIC
+    grid_vision.cpp
+    grid_vision.h
+    mfq_model_graph.cpp
+    mfq_model_graph.h
+    compat/mfq_legacy_model_graph.cpp
+    compat/mfq_legacy_model_graph.h
+    compat/mfq_legacy_tensor_names.cpp
+    compat/mfq_legacy_tensor_names.h
+    compat/mfq_format_compat.h
+)
+add_library(mfq::model-graph ALIAS mfq-model-graph)
+target_include_directories(mfq-model-graph PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/compat
+)
+target_link_libraries(mfq-model-graph PUBLIC mfq-json)
+target_compile_features(mfq-model-graph PUBLIC cxx_std_17)
+set_target_properties(mfq-model-graph PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
+)
+
+add_library(mfq-file-range-reader STATIC file_range_reader.cpp include/tyloinfer/file_range_reader.h
+    include/tyloinfer/read_span.h)
+add_library(mfq::file-range-reader ALIAS mfq-file-range-reader)
+target_include_directories(mfq-file-range-reader PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(mfq-file-range-reader PUBLIC Threads::Threads)
+target_link_libraries(mfq-file-range-reader PRIVATE mfq-host-parallel)
+target_compile_features(mfq-file-range-reader PUBLIC cxx_std_17)
+set_target_properties(mfq-file-range-reader PROPERTIES POSITION_INDEPENDENT_CODE ON)
+if(MSVC)
+    target_compile_options(mfq-file-range-reader PRIVATE /EHsc)
+endif()
+
+add_library(mfq-model-source STATIC
+    mirrored_file_reader.cpp
+    include/tyloinfer/mirrored_file_reader.h
+    async_range_reader.cpp
+    include/tyloinfer/file_range_reader.h
+    mfe_quant_expert_store.cpp
+    include/tyloinfer/mfe_quant_expert_store.h
+    nint_rows.cpp
+    include/tyloinfer/nint_rows.h
+    nvq_rows.cpp
+    include/tyloinfer/nvq_rows.h
+    include/tyloinfer/packed_row_range.h
+    hf_model_source.cpp
+    hf_packed_quant.cpp hf_packed_quant.h
+    mlx/mlx_affine.cpp
+    mlx/mlx_affine_source.cpp
+    gguf/gguf_model_source.cpp
+    include/tyloinfer/gguf_model_source.h
+    hf_safetensors_source.cpp
+    include/tyloinfer/hf_model_source.h
+    include/tyloinfer/hf_safetensors_source.h
+    include/tyloinfer/model_graph.h
+    include/tyloinfer/model_source.h
+    include/tyloinfer/mfq_model_source.h
+    mfq_model_source.cpp
+    model_source.cpp
+    row_residual.cpp
+    include/tyloinfer/row_residual.h
+    tq_fixture_source.cpp
+    include/tyloinfer/tq_fixture_source.h
+    include/tyloinfer/tq_rows.h
+    tq_model_layout.cpp include/tyloinfer/tq_model_layout.h
+)
+add_library(mfq::model-source ALIAS mfq-model-source)
+target_include_directories(mfq-model-source PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/compat
+)
+target_link_libraries(mfq-model-source PUBLIC mfq-model-graph mfq-file-range-reader)
+target_link_libraries(mfq-model-source PRIVATE mfq-host-parallel)
+target_link_libraries(mfq-model-source PRIVATE mfq-json mfq-ggml)
+target_compile_features(mfq-model-source PUBLIC cxx_std_17)
+if(MSVC)
+    target_compile_options(mfq-model-source PRIVATE /EHsc)
+endif()
+set_target_properties(mfq-model-source PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
+)
+
+add_library(mfq-core INTERFACE)
+add_library(mfq-qsa-kv-store STATIC
+    qsa_kv_store.cpp include/tyloinfer/qsa_kv_store.h
+    qsa_adaptive_cache.cpp include/tyloinfer/qsa_adaptive_cache.h
+    qsa_tq_cpu.cpp include/tyloinfer/qsa_tq_cpu.h
+    qsa_ram_store.cpp include/tyloinfer/qsa_ram_store.h
+    include/tyloinfer/qsa_energy_allocation.h
+    include/tyloinfer/qsa_precision_policy.h
+    include/tyloinfer/qsa_ram_policy.h)
+target_include_directories(mfq-qsa-kv-store PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(mfq-qsa-kv-store PUBLIC Threads::Threads mfq-file-range-reader)
+target_link_libraries(mfq-qsa-kv-store PRIVATE mfq-ggml mfq-host-parallel)
+target_compile_features(mfq-qsa-kv-store PUBLIC cxx_std_17)
+set_target_properties(mfq-qsa-kv-store PROPERTIES POSITION_INDEPENDENT_CODE ON)
+if(MSVC)
+    target_compile_options(mfq-qsa-kv-store PRIVATE /utf-8 /EHsc)
+endif()
+add_library(mfq::core ALIAS mfq-core)
+target_include_directories(mfq-core INTERFACE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/compat
+    ${CMAKE_CURRENT_SOURCE_DIR}/generated
+)
+target_link_libraries(mfq-core INTERFACE
+    mfq-host-parallel
+    mfq-model-graph
+    mfq-model-source
+    mfq-json
+    mfq-qsa-kv-store
+)
+
+if(TYLOINFER_BUILD_RUNTIME_COMMUNICATION)
+    find_package(Threads REQUIRED)
+
+    add_library(mfq-paged-prefix-cache STATIC
+        mfq_paged_prefix_cache.cpp
+        mfq_paged_prefix_cache.h
+    )
+    target_include_directories(mfq-paged-prefix-cache PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    target_link_libraries(mfq-paged-prefix-cache PUBLIC Threads::Threads mfq-file-range-reader)
+    if(WIN32)
+        target_link_libraries(mfq-paged-prefix-cache PRIVATE bcrypt)
+    elseif(NOT APPLE)
+        # EVP_MD_CTX_new/free require OpenSSL 1.1; older or absent libraries
+        # keep the portable implementation without adding a build dependency.
+        find_package(OpenSSL 1.1 QUIET COMPONENTS Crypto)
+        if(TARGET OpenSSL::Crypto)
+            target_link_libraries(mfq-paged-prefix-cache PRIVATE OpenSSL::Crypto)
+            target_compile_definitions(mfq-paged-prefix-cache PRIVATE TYLOINFER_PREFIX_OPENSSL=1)
+        endif()
+    endif()
+    target_compile_features(mfq-paged-prefix-cache PUBLIC cxx_std_17)
+    set_target_properties(mfq-paged-prefix-cache PROPERTIES
+        POSITION_INDEPENDENT_CODE ON
+    )
+endif()

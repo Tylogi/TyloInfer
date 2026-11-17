@@ -9,16 +9,14 @@ import { formatNumber } from '../../app/formatters';
 import { ModelPressureBars } from './ModelMemoryPressure';
 import { availableResidentMemory, hasSeparateVram } from '../runtime/memoryArchitecture';
 import { ModelDeleteDialog } from './ModelDeleteDialog';
-import { availableLoadMemory } from './loadMemoryEstimate';
-import { serverCapabilities } from '../../app/serverCapabilities';
+import { availableLoadMemory, estimateModelWeights } from './loadMemoryEstimate';
+import { readLoadContext } from './loadContextDefaults';
 import { groupCheckpoints } from './checkpointGroups';
 
-/** Render catalog artifacts and connect lifecycle actions to their human-readable names. */
 export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useModelCatalog> }) {
   const { tr } = useSettings();
   const { runtime, artifacts, busy, instances, modelFilter,
     setModelFilter, filteredArtifacts, unloadInstance, loadArtifact, chooseModelDirectory, openModelFiles, prepareModelDeletion } = catalog;
-  const capabilities = serverCapabilities();
   const [status, setStatus] = useState('all');
   const [architecture, setArchitecture] = useState('all');
   const [format, setFormat] = useState('all');
@@ -75,7 +73,7 @@ export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useMo
         <div className="checkpoint-family-groups">
           {families.map((family, familyIndex) => <TMPanel className="model-catalog-panel model-library-panel checkpoint-family-panel" key={family.key}>
             <header className="checkpoint-family-heading">
-              <h3>{family.name || tr('其它', 'Other')}</h3>
+              <h3>{family.key === 'jev' ? tr('Jev 决策模型', 'Jev decision models') : family.name || tr('其它', 'Other')}</h3>
               <span>{(() => {
                 const count = family.models.reduce((sum, group) => sum + group.artifacts.filter(isComponent).length, 0);
                 return tr(`${family.count - count} 个版本${count ? ` · ${count} 个配套资产` : ''}`,
@@ -94,9 +92,13 @@ export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useMo
                 (candidate) => candidate.model === item.name && candidate.state !== 'failed',
               );
               const loaded = Boolean(instance) || item.name === runtime?.model;
+              const placement = instance?.memory?.ram_weight_bytes != null
+                ? instance.memory.ram_weight_bytes > 0 ? 'stream' : 'vram'
+                : (catalog.loadContextForModel?.(item.name) ?? readLoadContext(item.name)).jev_weights ?? 'stream';
+              const memory = estimateModelWeights(item, placement);
               const streamsExperts = !loaded && item.loadable && (item.estimated_weight_bytes_by_role?.experts ?? 0) > 0
                 && loadMemory != null && item.estimated_resident_weight_bytes != null && item.estimated_resident_weight_bytes > loadMemory;
-              const unavailableLabel = item.support_error ? tr('后端暂不支持', 'Backend unsupported') : item.complete && item.format === 'hf'
+              const unavailableLabel = item.complete && item.format === 'hf'
                 ? tr('需先转换', 'Convert first') : item.missing_shards
                   ? tr('分片不全', 'Incomplete shards') : tr('不可用', 'Invalid');
               const streamingNotice = tr('剩余内存不足，超出部分专家会被放入 SSD 进行流式加载推理。',
@@ -111,14 +113,17 @@ export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useMo
                     <small>{gib(item.total_bytes)} · {item.missing_shards
                       ? tr(`${item.shard_count} 个分片，缺 ${item.missing_shards} 片`, `${item.shard_count} shards, ${item.missing_shards} missing`)
                       : tr(`${item.shard_count} 个分片`, `${item.shard_count} shards`)}</small>
-                    {!component && <small>{tr('预计常驻内存', 'Estimated resident memory')} {gib(item.estimated_resident_weight_bytes)}
+                    {!component && <small>{item.structured_decisions
+                      ? <>{tr('预计显存常驻', 'Estimated resident VRAM')} {gib(memory?.vram)}
+                          {placement === 'stream' && <> · {tr('RAM 流式权重', 'RAM-streamed weights')} {gib(memory?.ram)}</>}</>
+                      : <>{tr('预计常驻内存', 'Estimated resident memory')} {gib(item.estimated_resident_weight_bytes)}</>}
                       {(item.ssd_ple_bytes ?? 0) > 0 && ` · SSD PLE ${gib(item.ssd_ple_bytes)}`}</small>}
                     {instance && <small className="model-library-runtime">{instance.state === 'busy' ? tr('使用中', 'Busy')
                       : instance.state === 'loading' ? tr('加载中', 'Loading') : instance.state === 'unloading' ? tr('卸载中', 'Unloading') : tr('就绪', 'Ready')}
                       {instance.context_size != null && ` · ${formatNumber(instance.context_size)} ctx`}
                       {instance.pinned ? ` · ${tr('固定', 'Pinned')}` : instance.idle_ttl_seconds != null ? ` · TTL ${instance.idle_ttl_seconds}s` : ''}
                     </small>}
-                    {!component && <ModelLoadProgress model={item.name} artifactId={item.id} />}
+                    {!component && <ModelLoadProgress model={item.name} />}
                     {!loaded && item.gguf_companion_required && <details className="model-companion-picker">
                       <summary>{tr('Engram 配套文件', 'Engram companion')}</summary>
                       <input aria-label={tr(`Engram 路径：${item.name}`, `Engram path: ${item.name}`)}
@@ -129,11 +134,12 @@ export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useMo
                   </div>
                   {!component && <div className="local-checkpoint-resources">
                     <div className="local-checkpoint-notice">
-                      {!loaded && !item.loadable && <em className="failed" id={`checkpoint-unavailable-${item.id}`} title={item.support_error || item.error || unavailableLabel}>{unavailableLabel}</em>}
+                      {!loaded && !item.loadable && <em className="failed" id={`checkpoint-unavailable-${item.id}`} title={item.error || unavailableLabel}>{unavailableLabel}</em>}
                       {streamsExperts && <small className="model-streaming-notice" id={`expert-streaming-${item.id}`} title={streamingNotice}>{streamingNotice}</small>}
                     </div>
                     <div className="local-checkpoint-memory">
-                    <ModelPressureBars weights={item.estimated_resident_weight_bytes} roles={item.estimated_weight_bytes_by_role}
+                    <ModelPressureBars weights={memory?.total} roles={item.estimated_weight_bytes_by_role}
+                      combineMemory={item.structured_decisions && placement === 'stream'}
                       system={system} available={available} combineMoe showDetails={false}
                       label={tr('预计占剩余可用内存', 'Estimated share of remaining available memory')}
                       tr={tr} />
@@ -151,14 +157,14 @@ export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useMo
                   ) : loaded ? (
                     <em className="model-load-action">{tr('已加载', 'Loaded')}</em>
                   ) : (
-                    <button className="model-load-action" disabled={busy || !item.loadable || (item.gguf_companion_required && !companions[item.id]?.trim())} title={!item.loadable ? item.support_error || item.error || unavailableLabel : undefined}
+                    <button className="model-load-action" disabled={busy || !item.loadable || (item.gguf_companion_required && !companions[item.id]?.trim())} title={!item.loadable ? item.error || unavailableLabel : undefined}
                       aria-describedby={!item.loadable ? `checkpoint-unavailable-${item.id}` : streamsExperts ? `expert-streaming-${item.id}` : undefined}
                       onClick={() => void (companions[item.id]?.trim()
                         ? loadArtifact(item.name, [companions[item.id].trim()]) : loadArtifact(item.name))} type="button">
                       {tr('加载', 'Load')}
                     </button>
                   )}<button className="model-delete-action" aria-label={tr(`删除模型：${item.name}`, `Delete model: ${item.name}`)}
-                    disabled={!capabilities.modelDeletion || busy || loaded} title={!capabilities.modelDeletion ? tr('当前原生服务暂不支持删除模型文件。', 'Deleting model files is unavailable on the native server.') : loaded ? tr('请先卸载模型再删除', 'Unload the model before deleting it') : tr('删除模型', 'Delete model')}
+                    disabled={busy || loaded} title={loaded ? tr('请先卸载模型再删除', 'Unload the model before deleting it') : tr('删除模型', 'Delete model')}
                     onClick={() => void prepareModelDeletion(item.id)} type="button"><Icon name="trash" size={14} /></button></>}
                     </div>
                   </div>

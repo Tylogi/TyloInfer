@@ -28,6 +28,7 @@ from tyloinfer.server.runtime.host_memory import (
     host_memory_snapshot,
     metal_allocation_limit,
     process_physical_footprint,
+    process_resident_bytes,
     total_physical_memory,
 )
 from tyloinfer.server.services.jobs import JobCancelledError, JobContext, JobExecutionError
@@ -2229,6 +2230,48 @@ class RuntimePool:
             if instance is not None:
                 await self._release_control_lease(instance)
 
+    async def decide(self, *, model: str, payload: dict[str, Any]) -> dict[str, Any]:
+        instance = await self._select(model, session_id=None)
+        if instance is not None and instance.state == RuntimeInstanceState.LOADING:
+            await self._wait_for_model_ready(instance.artifact.resource.name)
+            instance = await self._select(model, session_id=None)
+        if instance is None:
+            instance = await self._ensure_model_loaded_with_revival(model)
+        if instance is None:
+            operation = getattr(self.fallback, "decide", None)
+            if not callable(operation):
+                raise BackendError("decisions_unavailable", "no decision runtime is available", status_code=501)
+            return await operation(model=model, payload=payload)
+        async with self._lock:
+            await self._wait_for_runtime_maintenance_locked(instance, global_only=True)
+            if self._instances.get(instance.id) is not instance or instance.state != RuntimeInstanceState.READY:
+                raise BackendError("model_not_ready", "the decision runtime is not ready", status_code=409, retryable=True)
+            if instance.active_requests or instance.queued_requests or instance.control_leases:
+                raise BackendError("runtime_busy", "decision reads require an idle runtime", status_code=409, retryable=True)
+            instance.control_leases += 1
+        pending = None
+        try:
+            operation = getattr(instance.backend, "decide", None)
+            if not callable(operation):
+                raise BackendError("decisions_unavailable", "decision reads are unavailable for this runtime", status_code=501)
+            pending = asyncio.create_task(operation(model=instance.artifact.resource.name, payload=payload))
+            return await asyncio.shield(pending)
+        finally:
+            if pending is None or pending.done():
+                await self._release_control_lease(instance)
+            else:
+                # A disconnected caller cannot cancel a native control already
+                # executing. Keep maintenance excluded until its response ends.
+                async def finish() -> None:
+                    try:
+                        with suppress(Exception, asyncio.CancelledError):
+                            await pending
+                    finally:
+                        await self._decrement_control_lease(instance)
+                task = asyncio.create_task(finish(), name=f"tyloinfer-decision-drain-{instance.id}")
+                self._lease_release_tasks.add(task)
+                task.add_done_callback(self._finish_control_lease_release)
+
     async def capabilities(
         self,
         instance_id: UUID | None = None,
@@ -2279,6 +2322,7 @@ class RuntimePool:
             ) = self._runtime_memory_pressure_locked()
             memory_status = {
                 **memory_topology(),
+                "backend": self.backend,
                 "mtp_service_enabled": self.inference_policy.mtp_enabled,
                 "runtime_memory_budget_bytes": self._resident_total_limit(),
                 "runtime_memory_effective_budget_bytes": effective_memory_budget,
@@ -3655,6 +3699,21 @@ class RuntimePool:
             0,
             artifact.resource.total_bytes - artifact.always_streamed_bytes,
         )
+        if self.backend == 'cuda' and artifact.resource.structured_decisions and artifact.resource.jev_weight_memory is not None:
+            estimate = artifact.resource.jev_weight_memory
+            return estimate.stream_vram_bytes if request.jev_weights == 'stream' else estimate.resident_vram_bytes
+        if self.backend == "cuda" and artifact.resource.structured_decisions and request.jev_weights == "stream":
+            # Only two layer images and non-layer, non-embedding weights stay on the GPU.
+            layers: dict[str, int] = {}
+            for name, tensor in (artifact.source_tensors or {}).items():
+                match = re.search(r"(?:model\.block|(?:model\.)?(?:language_model\.)?layers)\.(\d+)\.", name)
+                if match:
+                    key = match[1]
+                    size = int(tensor.get("nbytes", 0))
+                    layers[key] = layers.get(key, 0) + size + 255
+            if layers:
+                embedding = artifact.resource.estimated_weight_bytes_by_role.get("embedding", 0)
+                return max(0, total_bytes - sum(layers.values()) - embedding) + 2 * max(layers.values())
         cache_gb = request.moe_gpu_cache_gb
         streamed_bytes = artifact.routed_expert_bytes
         if streamed_bytes <= 0:
@@ -4315,6 +4374,8 @@ class RuntimePool:
             ("resident_weight_bytes", "resident_weight_bytes"),
             ("resident_buffer_bytes", "resident_buffer_bytes"),
             ("ram_expert_bytes", "ram_expert_payload_bytes"),
+            ("ram_embedding_bytes", "ram_embedding_bytes"),
+            ("ram_weight_bytes", "ram_weight_bytes"),
             ("ram_kv_bytes", "qsa_kv_ram_bytes"),
             ("ram_kv_limit_bytes", "qsa_kv_ram_limit_bytes"),
             ("prefix_cache_ram_bytes", "prefix_cache_ram_bytes"),
@@ -4533,6 +4594,14 @@ class RuntimePool:
     def _cuda_expert_host_budget(self, artifact: DiscoveredModel, request: ModelLoadRequest) -> int:
         return self._cuda_expert_host_budget_plan(artifact, request).bytes
 
+    @staticmethod
+    def _cuda_expert_preload_bytes(artifact: DiscoveredModel) -> int:
+        """Host bytes held by the complete preload of the routed expert set."""
+        # Preload keeps a host image of every routed expert, including the ones
+        # uploaded to the GPU cache, so the requirement is not the cold subset.
+        # The native guard is moe_preload_fits_host() on the same definition.
+        return max(0, artifact.routed_expert_bytes)
+
     def _cuda_expert_host_budget_plan(
         self, artifact: DiscoveredModel, request: ModelLoadRequest
     ) -> _ExpertHostBudget:
@@ -4604,6 +4673,10 @@ class RuntimePool:
                     and supports_cuda_ram_expert_pipeline(artifact.path)):
                 budget = self._cuda_expert_host_budget(artifact, request)
                 host_experts = min(host_experts, budget)
+                if budget >= self._cuda_expert_preload_bytes(artifact):
+                    # Preload keeps the complete routed set in host memory,
+                    # including experts mirrored in the GPU cache.
+                    host_experts = self._cuda_expert_preload_bytes(artifact)
             available = max(0, available - host_experts - (2 << 30))
             limit = available if limit is None else min(limit, available)
         return limit
@@ -4653,6 +4726,8 @@ class RuntimePool:
             "--model-name",
             artifact.resource.name,
         ])
+        if artifact.resource.structured_decisions and self.backend == "cuda":
+            command.extend(["--jev-weights", request.jev_weights])
         append_native_prefill_chunk_override(command, request.prefill_chunk_size)
         yarn_enabled = self.context_policy.model_yarn_enabled.get(artifact.resource.name, False) if request.yarn_enabled is None else request.yarn_enabled
         if (self.backend in {"cuda", "metal"} and yarn_enabled
@@ -4690,11 +4765,11 @@ class RuntimePool:
                     host_budget, budget.physical_bytes, budget.commit_bytes,
                     budget.commit_available_bytes, budget.commit_footprint_bytes,
                 )
-            preload_bytes = max(0, artifact.routed_expert_bytes)
+            preload_bytes = self._cuda_expert_preload_bytes(artifact)
             if supports_cuda_ram_expert_pipeline(artifact.path):
-                # TQ tiers own disjoint images. Native workspace and allocator
-                # headroom can still reduce the planned GPU coverage at load.
-                preload_bytes = max(0, preload_bytes - int(request.moe_gpu_cache_gb * (1 << 30)))
+                # Preload needs room for the complete routed set, not only for
+                # the experts missing from the GPU cache; otherwise Windows
+                # commit (and physical RAM on Linux) is exhausted after load.
                 streaming = (
                     host_budget < preload_bytes
                     or process_environment.get("TYLOINFER_MOE_PRELOAD_ALL") == "0"
@@ -4731,10 +4806,10 @@ class RuntimePool:
                 if streaming:
                     process_environment["TYLOINFER_MOE_PRELOAD_ALL"] = "0"
                     process_environment["TYLOINFER_MOE_ASSERT_RESIDENT"] = "0"
-                # Bulk expert images bypass the OS cache even when all fit in
-                # GPU + RAM; sparse PLE rows retain batched mapped reads.
-                if process_environment.setdefault("TYLOINFER_MODEL_FILE_IO", "direct") == "direct":
-                    process_environment.setdefault("TYLOINFER_PLE_FILE_MAP", "1")
+                    # Bulk expert images bypass the OS cache; sparse PLE rows
+                    # retain batched mapped reads. Native LRUs own copied data.
+                    if process_environment.setdefault("TYLOINFER_MODEL_FILE_IO", "direct") == "direct":
+                        process_environment.setdefault("TYLOINFER_PLE_FILE_MAP", "1")
             else:
                 if host_budget < preload_bytes:
                     raise _job_error("runtime_ram_expert_budget_exceeded",
@@ -4813,12 +4888,4 @@ class RuntimePool:
 
     @staticmethod
     def _process_resident_bytes(pid: int) -> int | None:
-        try:
-            output = subprocess.check_output(
-                ["ps", "-o", "rss=", "-p", str(pid)],
-                text=True,
-                timeout=1,
-            ).strip()
-            return int(output) * 1024 if output else None
-        except (OSError, ValueError, subprocess.SubprocessError):
-            return None
+        return process_resident_bytes(pid)

@@ -221,7 +221,7 @@ def test_gguf_engram_component_with_multiple_tables(tmp_path):
         gguf_is_table_component(path)
 
 
-@pytest.mark.parametrize('dtype', ['PTQ1_0', 'MXFP4', 'TQ2_T', 'TQK4', 'TQK5', 'TQK6', 'TQK7', 'TQP5', 'TQP6', 'TQP7', 'MIXED'])
+@pytest.mark.parametrize('dtype', ['IQ1_S', 'IQ1_M', 'PTQ1_0', 'MXFP4', 'TQ2_T', 'TQK4', 'TQK5', 'TQK6', 'TQK7', 'TQP5', 'TQP6', 'TQP7', 'MIXED'])
 def test_catalog_accepts_native_gyro_and_mixed_experts(tmp_path, dtype):
     async def check():
         path = tmp_path / 'native.gguf'

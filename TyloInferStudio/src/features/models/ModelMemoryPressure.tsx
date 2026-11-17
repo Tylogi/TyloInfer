@@ -1,6 +1,6 @@
 import { memoryPressureRows, type PressureSystem, type WeightRoles } from './memoryPressure';
 
-export function ModelPressureBars({ weights, roles, system, available, cacheBytes, moe, combineMoe, showDetails = true, label, tr }: {
+export function ModelPressureBars({ weights, roles, system, available, cacheBytes, moe, combineMoe, combineMemory, showDetails = true, label, tr }: {
   weights?: number | null;
   roles?: WeightRoles;
   system?: PressureSystem;
@@ -8,11 +8,12 @@ export function ModelPressureBars({ weights, roles, system, available, cacheByte
   cacheBytes?: number;
   moe?: boolean;
   combineMoe?: boolean;
+  combineMemory?: boolean;
   showDetails?: boolean;
   label: string;
   tr(chinese: string, english: string): string;
 }) {
-  const rows = memoryPressureRows({ weights, roles, system, available, cacheBytes, moe, combineMoe });
+  const rows = memoryPressureRows({ weights, roles, system, available, cacheBytes, moe, combineMoe, combineMemory });
   const bytes = (value?: number | null) => value == null ? '—' : `${(value / 2 ** 30).toFixed(1)} GiB`;
   return <div className="variant-memory-tiers">{rows.map(row => <div key={row.kind}>
     {showDetails && row.kind !== 'shared' && <small className="variant-memory-caption" title={row.kind === 'ram'

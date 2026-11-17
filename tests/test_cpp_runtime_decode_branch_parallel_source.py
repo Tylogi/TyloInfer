@@ -2,7 +2,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CUDA_ROOT = ROOT / "csrc" / "backends" / "cuda"
+CUDA_ROOT = ROOT / "cpp_runtime" / "backends" / "cuda"
 SOURCE = "\n".join(
     path.read_text(encoding="utf-8")
     for path in sorted(CUDA_ROOT.rglob("*"))
@@ -24,7 +24,7 @@ def test_decode_branch_parallelism_is_decode_only_and_graph_safe() -> None:
 
 
 def test_runtime_parallelizes_important_neuron_branches_only_for_decode() -> None:
-    source = (CUDA_ROOT / "models/common/ffn.cpp").read_text(encoding="utf-8")
+    source = (CUDA_ROOT / "core/ffn.cpp").read_text(encoding="utf-8")
     branch = source.split("if (allow_important_neurons && important_neurons)", 1)[1]
     branch = branch.split("if (tensor_parallel_dense_compatible())", 1)[0]
     assert "decode_branch_parallel_enabled(execution.config,execution.decode_graph_serial_branches,rows)&&" in "".join(branch.split())

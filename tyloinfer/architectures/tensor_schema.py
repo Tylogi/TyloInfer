@@ -426,7 +426,7 @@ def _canonical_scale_companion(
         if not source_name.endswith(source_suffix):
             continue
         weight_source = source_name.removesuffix(source_suffix) + ".weight"
-        weight = resolved_sources.get(weight_source)
+        weight = resolved_sources.get(weight_source) or resolved_sources.get(weight_source.removesuffix('.weight') + '.weight_packed')
         if weight is None or not weight.canonical_name.endswith(".weight"):
             return None
         return weight.canonical_name.removesuffix(".weight") + canonical_suffix
@@ -492,6 +492,10 @@ def map_source_tensor_name(
             raise ValueError("model architecture has no canonical tensor schema")
         return None
     normalized = mlx_source_tensor_name(source_name)
+    quantization = config.get('quantization_config')
+    if (normalized.endswith('.weight_packed') and isinstance(quantization, Mapping)
+            and quantization.get('quant_method') == 'compressed-tensors'):
+        normalized = normalized.removesuffix('.weight_packed') + '.weight'
     auxiliary = next((suffix for suffix in (".scales", ".biases") if normalized.endswith(suffix)), None)
     mapped = registration.source_mapper(
         normalized if auxiliary is None else normalized[:-len(auxiliary)] + ".weight",
@@ -639,6 +643,8 @@ def _qwen35_source_mapper(
     topology: GraphTopology,
     _config: Mapping[str, object],
 ) -> TensorNameMapping | None:
+    if source_name.startswith(('language_model.', 'visual.')):
+        source_name = 'model.' + source_name
     roots = {
         "model.language_model.embed_tokens.weight": (
             "model.token_embedding.weight",
@@ -2005,10 +2011,6 @@ def _gemma4_source_mapper(
     canonical = _already_canonical(source_name)
     if canonical is not None:
         return canonical
-    if source_name in ("model.embed_tokens.weight", "model.norm.weight") or source_name.startswith(
-        "model.layers."
-    ):
-        source_name = "model.language_model." + source_name.removeprefix("model.")
     roots = {
         "model.language_model.embed_tokens.weight": (
             "model.token_embedding.weight",

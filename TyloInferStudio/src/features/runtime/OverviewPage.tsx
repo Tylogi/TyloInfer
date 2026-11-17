@@ -12,17 +12,17 @@ import {
 import { errorMessage, formatNumber } from '../../app/formatters';
 import { runtimeModelNames } from './modelSelection';
 import { ServingStatisticsPanel, ServingTotalsPanel } from './ServingStatisticsPanel';
+import { useServingStatistics } from './useServingStatistics';
 import { RuntimeHero } from './RuntimeHero';
 import { MemoryHierarchy } from './MemoryHierarchy';
 import { residentMemoryCapacity } from './memoryArchitecture';
-import { anthropicEndpoint, openAIEndpoint } from './endpoint';
+import { anthropicEndpoint, jevEndpoint, openAIEndpoint } from './endpoint';
 import { getApiBaseUrl, getApiToken } from '../../shared/api/client';
 import { runtimeApi } from '../../shared/api/resources/runtime';
 import { toast } from '../../stores/toastStore';
 import { ModelVendorMark } from '../../app/ModelVendorMark';
 import { AppearanceControls } from '../../app/AppearanceControls';
 
-/** Render native instance availability and leave unavailable service telemetry unreported. */
 export function OverviewPage() {
   const {
     runtime,
@@ -37,9 +37,10 @@ export function OverviewPage() {
   } = useRuntime();
   const { tr } = useSettings();
   const [scope, setScope] = useState<'session' | 'alltime'>('session');
-  const native = runtime?.source === 'native-instances';
+  const { data: servingStatistics, error: statisticsError } = useServingStatistics(scope, connectionRevision);
   const [endpointCopied, setEndpointCopied] = useState<string | null>(null);
-  const serviceUrl = studio?.service_url || getApiBaseUrl();
+  const [listener, setListener] = useState<{ url: string; revision: number; port: number | null } | null>(null);
+  const serviceUrl = studio?.service_url || getApiBaseUrl() || window.location.origin;
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(
     () => () => {
@@ -47,11 +48,35 @@ export function OverviewPage() {
     },
     [],
   );
+  useEffect(() => {
+    let disposed = false;
+    let pending = false;
+    const endpoint = getApiBaseUrl();
+    const credential = getApiToken();
+    const current = () => !disposed && endpoint === getApiBaseUrl() && credential === getApiToken();
+    const refresh = async () => {
+      if (pending) return;
+      pending = true;
+      try {
+        const value = await runtimeApi.runtimeListener();
+        if (current()) setListener({ url: serviceUrl, revision: connectionRevision, port: value.anthropic_port ?? null });
+      } catch {
+        if (current()) setListener(null);
+      } finally {
+        pending = false;
+      }
+    };
+    void refresh();
+    const poll = setInterval(() => void refresh(), 5000);
+    window.addEventListener('focus', refresh);
+    return () => { disposed = true; clearInterval(poll); window.removeEventListener('focus', refresh); };
+  }, [serviceUrl, connectionRevision]);
   const availableModelNames = runtimeModelNames(models, instances);
-  const openAIUrl = openAIEndpoint(serviceUrl);
+  const anthropicPort = listener?.url === serviceUrl && listener.revision === connectionRevision ? listener.port : null;
   const endpoints = [
-    { id: 'openai', label: tr('OpenAI 兼容端点', 'OpenAI-compatible endpoint'), url: openAIUrl },
-    { id: 'anthropic', label: tr('Anthropic 兼容端点', 'Anthropic-compatible endpoint'), url: openAIUrl ? `${openAIUrl}/messages` : null },
+    { id: 'openai', name: 'OpenAI', label: tr('OpenAI 兼容端点', 'OpenAI-compatible endpoint'), url: openAIEndpoint(serviceUrl) },
+    { id: 'anthropic', name: 'Anthropic', label: tr('Anthropic 兼容端点', 'Anthropic-compatible endpoint'), url: anthropicEndpoint(serviceUrl, anthropicPort) },
+    { id: 'jev', name: 'Jev', label: tr('Jev 决策端点', 'Jev decision endpoint'), url: jevEndpoint(serviceUrl) },
   ];
   async function copyEndpoint(id: string, endpoint: string) {
     try {
@@ -100,9 +125,9 @@ export function OverviewPage() {
                 const stateLabel =
                   instance?.state === 'busy' ? tr('使用中', 'Busy') : tr('就绪', 'Ready');
                 const details = [
-                  instance?.devices.join(' + ') || instance?.backend,
+                  instance?.devices.join(' + '),
                   instance?.context_size ? `${formatNumber(instance.context_size)} ctx` : null,
-                  instance?.active_requests != null ? tr(`${instance.active_requests} 个活动请求`, `${instance.active_requests} active requests`) : instance?.active_sessions != null
+                  instance
                     ? tr(
                         `${instance.active_sessions} 个会话`,
                         `${instance.active_sessions} sessions`,
@@ -139,7 +164,7 @@ export function OverviewPage() {
           </TMPanel>
         </>
       )}
-      <ServingStatisticsPanel unavailable={tr('原生服务暂未提供汇总统计。', 'The native server does not provide aggregate statistics yet.')} scope={scope} onScopeChange={setScope} />
+      <ServingStatisticsPanel data={servingStatistics} error={statisticsError} scope={scope} onScopeChange={setScope} />
       <SectionLabel title={tr('资源概览', 'Resource overview')} />
       {runtime ? (
         <MemoryHierarchy instances={instances} runtime={runtime} connectionRevision={connectionRevision}
@@ -161,11 +186,11 @@ export function OverviewPage() {
             <h2>{tr('API 端点', 'API endpoints')}</h2>
           </div>
           <div className="overview-api-list">
-            {endpoints.map(({ id, label, url }) => (
+            {endpoints.map(({ id, name, label, url }) => (
               <div className="overview-api-entry" key={id} data-protocol={id}>
-                  <strong title={label}>{id === 'openai' ? 'OpenAI' : 'Anthropic'}</strong>
+                  <strong title={label}>{name}</strong>
                   {url ? <code title={url}>{url}</code> : <span>{tr('暂不可用', 'Unavailable')}</span>}
-                  <button aria-label={tr(`复制 ${id === 'openai' ? 'OpenAI' : 'Anthropic'} 端点`, `Copy ${id === 'openai' ? 'OpenAI' : 'Anthropic'} endpoint`)}
+                  <button aria-label={tr(`复制 ${name} 端点`, `Copy ${name} endpoint`)}
                     className={endpointCopied === id ? 'copied' : ''} disabled={!url}
                     onClick={() => { if (url) void copyEndpoint(id, url); }} type="button">
                     <Icon name={endpointCopied === id ? 'check' : 'copy'} size={14} />
@@ -173,8 +198,10 @@ export function OverviewPage() {
               </div>
             ))}
           </div>
+          <p>{tr('Jev 与 OpenAI 共用端口。客户端需显式向 Jev 地址发送 POST 请求，不能使用 chat/completions。',
+            'Jev shares the OpenAI port. Send POST requests to the Jev URL explicitly; chat/completions does not support Jev decisions.')}</p>
         </TMPanel>
-        <ServingTotalsPanel scope={scope} runtime={runtime} />
+        <ServingTotalsPanel data={servingStatistics} scope={scope} runtime={runtime} />
       </div>
     </section>
   );

@@ -1,4 +1,5 @@
 import asyncio
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -19,6 +20,13 @@ def test_model_activation_is_published_only_after_the_load_transaction(tmp_path,
         executable = tmp_path / "fake-runtime"
         _fake_runtime(executable)
         pool = RuntimePool(ModelCatalog([tmp_path], cache_seconds=0), executable, startup_timeout_seconds=5)
+        launch = pool._launch_configuration
+
+        def launch_python(*args, **kwargs):
+            command, environment = launch(*args, **kwargs)
+            return [sys.executable, *command], environment
+
+        monkeypatch.setattr(pool, "_launch_configuration", launch_python)
         pool.memory_policy = RuntimeMemoryPolicy(prefix_directory=str(tmp_path / "prefix-cache"))
         entered, release = asyncio.Event(), asyncio.Event()
 

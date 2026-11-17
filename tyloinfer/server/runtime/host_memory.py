@@ -11,6 +11,8 @@ import time
 from collections import deque
 from dataclasses import dataclass
 
+import psutil
+
 _HOST_VM_INFO64 = 4
 _HOST_INFO64_MAX_COUNT = 256
 _VM_STATS_MIN_COUNT = 4
@@ -56,6 +58,15 @@ def _open_process_usage():
 
 
 _PROCESS_USAGE = _open_process_usage()
+
+
+def process_resident_bytes(pid: int) -> int | None:
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return None
+    try:
+        return int(psutil.Process(pid).memory_info().rss)
+    except (OSError, ValueError, psutil.Error):
+        return None
 
 
 def process_physical_footprint(pid: int) -> int | None:

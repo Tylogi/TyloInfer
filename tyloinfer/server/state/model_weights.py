@@ -1,6 +1,42 @@
+import math
 import re
 
 from tyloinfer.formats.compat import canonical_dtype
+
+
+def jev_weight_memory(tensors: dict, config: dict, *, trained_readout: bool) -> dict[str, int] | None:
+    layers: dict[str, int] = {}
+    tables = resident = 0
+    for name, record in tensors.items():
+        layer = re.match(r'^model\.block\.(\d+)\.', name)
+        table = name in {'model.token_embedding.weight', 'model.output.weight'}
+        if not layer and not table and name != 'model.output_norm.weight':
+            continue
+        size = int(record['nbytes'])
+        shape, dtype = record.get('shape'), record.get('dtype')
+        if shape and dtype in {'BF16', 'F16', 'F32'}:
+            size = math.prod(shape) * (4 if dtype == 'F32' else 2)
+            if 'norm' in name or layer and '.linear_attention.' in name and name.rsplit('.', 1)[-1] in {'a', 'dt_bias'}:
+                size = math.prod(shape) * 4
+        if layer:
+            key = layer[1]
+            layers[key] = ((layers.get(key, 0) + 255) // 256) * 256 + size
+        elif table:
+            tables += size
+        else:
+            resident += size
+    if not layers:
+        return None
+    text = config.get('text_config', config)
+    if trained_readout:
+        hidden = text.get('hidden_size')
+        if not isinstance(hidden, int) or hidden <= 0:
+            return None
+        # The D3 readout has 255 rows and executes in FP32.
+        resident += 255 * hidden * 4
+    return {'stream_vram_bytes': 2 * max(layers.values()) + resident,
+        'stream_ram_bytes': sum(layers.values()) + tables,
+        'resident_vram_bytes': sum(layers.values()) + tables + resident}
 
 
 def weight_role(name: str) -> str:
