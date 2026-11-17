@@ -10,6 +10,7 @@
 #include <iosfwd>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -50,6 +51,7 @@ public:
         Routes& operator=(Routes&&) = delete;
         void begin(Cache& cache, int rows);
         void resolve(int rows, bool cancelled);
+        void resolve(std::span<const std::uint8_t> keep);
     private:
         struct Impl;
         std::unique_ptr<Impl> impl_;

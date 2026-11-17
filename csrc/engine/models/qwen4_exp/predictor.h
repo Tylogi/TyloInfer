@@ -67,6 +67,9 @@ struct Predictor final : tyloi::models::Mtp {
     tyloi::models::MtpStep step(tyloi::models::MtpState&, const tyloi::Tensor& hidden, const tyloi::Tensor& ids,
                                 const tyloi::Tensor& positions = {},
                                 const tyloi::models::ForwardOptions& = {}) const override;
+    std::vector<tyloi::models::MtpStep> batch_step(
+        std::span<const tyloi::models::MtpRow>,
+        const tyloi::models::ForwardOptions& = {}) const override;
     void history_step(tyloi::models::MtpState&, Tensor hidden, Tensor ids, Tensor positions = {},
                       bool scalar_chain = false) const;
 

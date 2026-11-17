@@ -5,6 +5,7 @@
 #include <deque>
 #include <functional>
 #include <memory>
+#include <span>
 #include <unordered_map>
 
 namespace tyloi::engine {
@@ -21,6 +22,7 @@ class Batch {
     virtual Metrics metrics() const = 0;
     virtual void release_idle_buffers() = 0;
     virtual bool supports_sessions() const noexcept { return false; }
+    virtual bool supports_mtp() const noexcept { return false; }
 };
 
 // Request metadata shared by batch drivers; the scheduler owns lifecycle and output.
@@ -60,13 +62,19 @@ template <class Ops> class ContinuousBatch : public Batch {
     using State = BatchState<Request>;
     struct Work {
         std::shared_ptr<Request> request;
+        InferenceOutput* output = nullptr;
         std::optional<PrefillChunk> prefill;
         std::optional<Sample> result;
+        std::optional<OutputDelta> delta;
         std::exception_ptr failure;
-        bool decode = false, active = false;
-        void schedule_prefill(PrefillChunk chunk) { result.reset(); prefill = chunk; }
-        void schedule_decode() { result.reset(); decode = true; }
-        bool ready() const { return result.has_value() || failure; }
+        bool decode = false, active = false, custom = false;
+        void schedule_prefill(PrefillChunk chunk) {
+            result.reset(); delta.reset(); prefill = chunk;
+        }
+        void schedule_decode() {
+            result.reset(); delta.reset(); decode = true;
+        }
+        bool ready() const { return result.has_value() || delta.has_value() || failure; }
         const Sample& sample() const {
             if (failure) std::rethrow_exception(failure);
             return result.value();
@@ -84,6 +92,22 @@ template <class Ops> class ContinuousBatch : public Batch {
         for (const auto& request : state.active)
             position = std::max(position, request->cache_length);
         return position;
+    }
+    void publish(Work& work, bool report_stats = true) {
+        if (!work.output) throw std::logic_error("batch output is unavailable");
+        const auto& sample = work.sample();
+        std::vector<std::int64_t> candidates;
+        if (!sample.tokens.empty()) candidates = sample.tokens;
+        if (candidates.empty()) candidates.push_back(sample.token);
+        work.delta = work.output->append(candidates);
+        auto& request = *work.request;
+        request.history.insert(request.history.end(), work.delta->token_ids.begin(),
+            work.delta->token_ids.end());
+        operations.accept(work.request, sample,
+            std::span<const std::int64_t>(work.delta->token_ids.data(), work.delta->token_ids.size()));
+        if (!work.delta->token_ids.empty()) request.pending_token = work.delta->token_ids.back();
+        request.produced += static_cast<std::int32_t>(work.delta->token_ids.size());
+        if (report_stats) operations.report(work.request, *work.output);
     }
     void recover(std::exception_ptr error) {
         State failed;
@@ -118,6 +142,7 @@ template <class Ops> class ContinuousBatch : public Batch {
   public:
     void bind(Budget& budget) override { operations.bind(budget); }
     bool supports_sessions() const noexcept override { return operations.supports_sessions(); }
+    bool supports_mtp() const noexcept override { return operations.supports_mtp(); }
     bool empty() const noexcept { return requests.empty(); }
     void invalidate_runtime_policy() {
         if constexpr (requires { operations.invalidate_runtime_policy(); }) operations.invalidate_runtime_policy();
@@ -142,6 +167,7 @@ template <class Ops> class ContinuousBatch : public Batch {
         if (!requests.emplace(work->request->id, work).second)
             throw std::invalid_argument("duplicate batch request id");
         ExecutionCleanup cleanup{output.cleanup_failure, [&] { release(*work); }};
+        work->output = &output;
         const auto reused = operations.prepare(work->request);
         const auto prefix = operations.prefix_tokens(work->request);
         const auto prompt_tokens = static_cast<int64_t>(input.prompt.size());
@@ -171,25 +197,25 @@ template <class Ops> class ContinuousBatch : public Batch {
                     [&work] { (void)work->sample(); });
                 if (generation) {
                     generated = true;
+                    work->custom = true;
                     while (auto step = generation->next()) co_yield std::move(step);
                 }
             }
             if (!generated) {
-                auto token = work->sample().token;
-                while (!output.stopped()) {
-                    auto delta = output.append(std::vector<std::int64_t>{token});
-                    auto& request = *work->request;
-                    request.history.insert(request.history.end(), delta.token_ids.begin(), delta.token_ids.end());
-                    // activate() initializes counts for the first sample.
-                    if (request.produced) operations.accept(work->request, work->sample());
-                    request.pending_token = token;
-                    request.produced += static_cast<std::int32_t>(delta.token_ids.size());
-                    if (!output.stopped()) work->schedule_decode();
+                publish(*work);
+                while (work->delta) {
+                    auto delta = std::move(*work->delta);
+                    work->delta.reset();
                     co_yield std::move(delta);
-                    if (!output.stopped()) {
-                        while (!work->ready() && !output.stopped()) co_yield StepState::waiting;
+                    if (output.stopped()) break;
+                    work->schedule_decode();
+                    while (!work->ready() && !output.stopped()) co_yield StepState::waiting;
+                    // A stopped output still has to publish the delta cached by
+                    // step() once. release() handles a row with no delta.
+                    if (!work->delta) {
                         if (output.stopped()) break;
-                        token = work->sample().token;
+                        (void)work->sample();
+                        throw std::logic_error("batch decode produced no output delta");
                     }
                 }
             }
@@ -236,8 +262,13 @@ template <class Ops> class ContinuousBatch : public Batch {
                 for (const auto& request : state.active) if (request->eligible) {
                     auto& work = *requests.at(request->id);
                     work.result = operations.sample(request, decoded);
+                    if (!work.custom) publish(work, false);
                     request->cache_length = operations.cache_length(request);
                     work.decode = false;
+                }
+                for (const auto& request : state.active) if (request->eligible) {
+                    const auto& work = *requests.at(request->id);
+                    if (!work.custom) operations.report(request, *work.output);
                 }
             } else if (prefill != requests.end()) {
                 prefill_work.push_back(prefill->second);

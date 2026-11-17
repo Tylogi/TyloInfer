@@ -10,6 +10,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -34,6 +35,10 @@ struct BatchSample {
     ::tyloi::Tensor next;
     int64_t token = 0;
     MfqPrefillTiming timing;
+    // A non-empty value is a complete candidate round (for example, an MTP
+    // accepted prefix followed by its next token). Ordinary sampling keeps
+    // this empty and uses token above.
+    std::vector<int64_t> tokens;
 };
 
 /** Own one request's numerical state independently of the batch scheduler. */
@@ -81,6 +86,8 @@ public:
     virtual void initialize() {}
     /** Report whether request-owned target states support session snapshots. */
     virtual bool supports_sessions() const noexcept { return false; }
+    /** Report whether request-owned target states can carry an MTP predictor. */
+    virtual bool supports_mtp() const noexcept { return false; }
     /** Create uninitialized numerical state for one request. */
     virtual std::unique_ptr<BatchState> make_state(std::int64_t prompt_tokens) = 0;
     /** Report whether independent prompt spans can be computed together. */
@@ -104,8 +111,11 @@ public:
     /** Return numerical workspace bytes per prompt row for runtime admission. */
     virtual std::size_t prefill_row_bytes() const = 0;
     /** Compute independent prompt spans in row order, yielding resource boundaries. */
-    virtual StepSequence<std::vector<Tensor>> prefill(std::vector<BatchState*> states,
+    virtual StepSequence<std::vector<Decoded>> prefill(std::vector<BatchState*> states,
         std::vector<Tensor> ids) = 0;
+    /** Compute ragged speculative target rows when the batch supports it. */
+    virtual StepSequence<std::vector<Decoded>> verify(std::vector<BatchState*>,
+        std::vector<Tensor>) { throw std::logic_error("batched MTP verification is unsupported"); }
     /** Compute one ordinary decode step for each supplied row. */
     virtual Tensor decode(std::span<const BatchRow> rows, Tensor ids,
         const Tensor& host_ids) = 0;

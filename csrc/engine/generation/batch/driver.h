@@ -15,9 +15,14 @@ void reserve_batch(Budget& budget, Device device, const models::BatchGrowth& val
 void submit_batch(Executor& executor, std::span<const Tensor> outputs,
     std::span<models::BatchState* const> states);
 
+/** Submit decoded batch outputs while retaining all published tensor fields. */
+void submit_batch(Executor& executor, std::span<const models::Decoded> outputs,
+    std::span<models::BatchState* const> states);
+
 /** Drive model batch prefill events using the executor's working-set owner. */
-std::vector<Tensor> prefill_batch(models::Batch& batch, Executor& executor, weights::Cache& weights,
-    Budget& budget, Device device, std::vector<models::BatchState*> states, std::vector<Tensor> ids);
+std::vector<models::Decoded> prefill_batch(models::Batch& batch, Executor& executor, weights::Cache& weights,
+    Budget& budget, Device device, std::vector<models::BatchState*> states, std::vector<Tensor> ids,
+    bool verify = false);
 
 /** Drive a batch graph plan through the shared capture coordinator. */
 std::unique_ptr<models::Batch::Plan> plan_batch(models::Batch& batch, Executor& executor,

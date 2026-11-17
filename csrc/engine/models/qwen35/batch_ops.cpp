@@ -72,7 +72,7 @@ public:
     std::size_t prefill_row_bytes() const override {
         return std::size_t(model_.metadata.hidden_size) * model_.metadata.hc_mult * sizeof(float) * 8;
     }
-    StepSequence<std::vector<Tensor>> prefill(std::vector<models::BatchState*> states,
+    StepSequence<std::vector<models::Decoded>> prefill(std::vector<models::BatchState*> states,
         std::vector<Tensor> ids) override;
     Tensor decode(std::span<const BatchRow> rows, Tensor ids, const Tensor& host_ids) override;
     StepSequence<std::unique_ptr<Plan>> plan(std::span<const BatchRow>, bool) override;
@@ -155,7 +155,7 @@ void PublicBatch::prepare_decode(std::span<const BatchRow> rows) {
     state_->prepare_decode(maximum);
 }
 
-StepSequence<std::vector<Tensor>> PublicBatch::prefill(std::vector<models::BatchState*> states,
+StepSequence<std::vector<models::Decoded>> PublicBatch::prefill(std::vector<models::BatchState*> states,
         std::vector<Tensor> ids) {
     require_model(states.size() == 1 && ids.size() == 1, "Qwen batch prefill requires one request");
     auto& item = request(*states.front());
@@ -166,7 +166,9 @@ StepSequence<std::vector<Tensor>> PublicBatch::prefill(std::vector<models::Batch
     input.ids = std::move(ids.front());
     auto output = model_.forward(std::move(input), item.cache_.state(), config_.forward);
     item.position_ = item.cache_.state().position();
-    co_yield std::vector<Tensor>{std::move(output)};
+    models::Decoded result;
+    result.hidden = ops::slice(output, 1, output.size(1) - 1, output.size(1));
+    co_yield std::vector<models::Decoded>{std::move(result)};
 }
 
 Tensor PublicBatch::decode(std::span<const BatchRow> rows, Tensor, const Tensor&) {

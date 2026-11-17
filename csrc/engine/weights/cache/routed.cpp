@@ -20,6 +20,7 @@ namespace tyloi::weights {
 
 struct Cache::Routes::Impl {
     std::shared_ptr<MoeExpertCache> cache;
+    int rows = 0;
 };
 
 Cache::Routes::Routes() noexcept = default;
@@ -31,15 +32,54 @@ Cache::Routes::~Routes() {
 void Cache::Routes::begin(Cache& owner, int rows) {
     if (!impl_) impl_ = std::make_unique<Impl>();
     auto cache = owner.data_->moe;
-    begin_moe_speculative_routes(cache, rows);
+    try {
+        begin_moe_speculative_routes(cache, rows);
+    } catch (...) {
+        discard_moe_speculative_routes(cache);
+        throw;
+    }
     impl_->cache = std::move(cache);
+    impl_->rows = rows;
 }
 
 void Cache::Routes::resolve(int rows, bool cancelled) {
     if (!impl_ || !impl_->cache) return;
-    if (cancelled) discard_moe_speculative_routes(impl_->cache);
-    else commit_moe_speculative_routes(impl_->cache, rows);
+    if (cancelled) {
+        discard_moe_speculative_routes(impl_->cache);
+        impl_->cache.reset();
+        impl_->rows = 0;
+        return;
+    }
+    try {
+        if (rows < 0 || rows > impl_->rows)
+            throw std::invalid_argument("committed route prefix is out of range");
+        std::vector<std::uint8_t> keep(std::size_t(impl_->rows), std::uint8_t(0));
+        std::fill(keep.begin(), keep.begin() + rows, std::uint8_t(1));
+        resolve(keep);
+    } catch (...) {
+        if (impl_ && impl_->cache) {
+            discard_moe_speculative_routes(impl_->cache);
+            impl_->cache.reset();
+            impl_->rows = 0;
+        }
+        throw;
+    }
+}
+
+void Cache::Routes::resolve(std::span<const std::uint8_t> keep) {
+    if (!impl_ || !impl_->cache) return;
+    try {
+        if (keep.size() != std::size_t(impl_->rows))
+            throw std::invalid_argument("speculative route mask row count is out of range");
+        commit_moe_speculative_routes(impl_->cache, keep);
+    } catch (...) {
+        discard_moe_speculative_routes(impl_->cache);
+        impl_->cache.reset();
+        impl_->rows = 0;
+        throw;
+    }
     impl_->cache.reset();
+    impl_->rows = 0;
 }
 
 struct Cache::Warmup::Impl {

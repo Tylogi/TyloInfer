@@ -689,17 +689,18 @@ void MoeResidencyManager::finish_window(int layer) {
 }
 void MoeResidencyManager::begin_speculative_routes(int rows) {
     auto& s=*impl_;
-    if(rows<1 || rows>32)throw std::invalid_argument("speculative route row count is out of range");
+    if(rows<1 || rows>tyloi::engine::RouteHistory::max_speculative_rows)
+        throw std::invalid_argument("speculative route row count is out of range");
     if(s.route_history->pending())throw std::logic_error("speculative routes already pending");
     // Keep host learning's begin boundary ahead of policy state, as before.
     if(s.cache->ssd_experts())s.cache->host_experts_->begin_speculative_learning();
     s.route_history->begin(rows);
 }
-void MoeResidencyManager::commit_speculative_routes(int rows) {
+void MoeResidencyManager::commit_speculative_routes(std::span<const std::uint8_t> keep) {
     auto& s=*impl_;if(!s.route_history->pending())return;
     // Validate the entire prefix before changing observations. Graph setup may
     // replay a layer more than once; only its latest route publication counts.
-    const auto accepted=s.route_history->prefix(rows);
+    const auto accepted=s.route_history->selected(keep);
     if(s.cache->ssd_experts()) {
         s.speculative_host_keys.clear();
         // Commit in ordinary decode order: each accepted token visits all
@@ -716,10 +717,11 @@ void MoeResidencyManager::commit_speculative_routes(int rows) {
         s.cache->host_experts_->commit_speculative_learning(s.speculative_host_keys);
     }
     // Publish heat only after host learning has committed successfully.
-    const auto result=s.route_history->commit(rows);
+    const auto result=s.route_history->commit(keep);
     if(!s.traced_speculative_heat && result.routes) {
         std::fprintf(stderr,"moe_mtp_heat_policy scope=first_committed_window window_union=%d normalized=%d rows=%d routes=%llu heat_routes=%llu\n",
-            int(s.speculative_heat_mode!=0),int(s.speculative_heat_mode==2),rows,
+            int(s.speculative_heat_mode!=0),int(s.speculative_heat_mode==2),
+            int(std::count(keep.begin(),keep.end(),std::uint8_t(1))),
             static_cast<unsigned long long>(result.routes),
             static_cast<unsigned long long>(result.heat_routes));
         s.traced_speculative_heat=true;

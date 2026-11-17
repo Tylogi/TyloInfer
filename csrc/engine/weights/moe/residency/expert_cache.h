@@ -12,6 +12,7 @@
 #include <memory>
 #include <optional>
 #include <ostream>
+#include <span>
 #include <string>
 #include <vector>
 #include <utility>
@@ -81,7 +82,8 @@ std::uint64_t moe_expert_graph_captures(const std::shared_ptr<MoeExpertCache>& c
 void drain_moe_expert_cache(const std::shared_ptr<MoeExpertCache>& cache);
 void finish_moe_expert_exchanges(const std::shared_ptr<MoeExpertCache>& cache);
 void begin_moe_speculative_routes(const std::shared_ptr<MoeExpertCache>& cache,int rows);
-void commit_moe_speculative_routes(const std::shared_ptr<MoeExpertCache>& cache,int rows);
+void commit_moe_speculative_routes(const std::shared_ptr<MoeExpertCache>& cache,
+    std::span<const std::uint8_t> keep);
 void discard_moe_speculative_routes(const std::shared_ptr<MoeExpertCache>& cache) noexcept;
 void prepare_moe_decode_residency(const std::shared_ptr<MoeExpertCache>& cache);
 // Target, predictor and request batches share the MFE pool on their compute stream.

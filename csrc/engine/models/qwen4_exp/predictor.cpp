@@ -220,6 +220,119 @@ tyloi::models::MtpStep Predictor::step(tyloi::models::MtpState& value, const tyl
     return {std::move(result.first), std::move(result.second)};
 }
 
+std::vector<tyloi::models::MtpStep> Predictor::batch_step(
+        std::span<const tyloi::models::MtpRow> rows,
+        const tyloi::models::ForwardOptions&) const {
+    tyloi::models::require_model(!rows.empty() && !layers.empty(),
+                                 "invalid Qwen4 predictor batch");
+
+    const auto& block = *layers.front();
+    tyloi::models::require_model(block.qsa && rows.size() <=
+                                     static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max()),
+                                 "Qwen4 predictor batch requires QSA layers");
+
+    std::vector<PredictorState*> requests;
+    std::vector<Tensor> hidden_rows, id_rows, current_positions, full_positions;
+    requests.reserve(rows.size());
+    hidden_rows.reserve(rows.size());
+    id_rows.reserve(rows.size());
+    current_positions.reserve(rows.size());
+    full_positions.reserve(rows.size());
+
+    const auto batch = static_cast<std::int64_t>(rows.size());
+    for (const auto& row : rows) {
+        tyloi::models::require_model(row.state && row.state->belongs_to(*this),
+                                     "Qwen4 predictor batch state belongs to another model");
+        auto& request = state<PredictorState>(*row.state);
+        tyloi::models::require_model(request.layer_states.size() == layers.size() &&
+                request.positions.size() == layers.size() && request.lengths.size() == layers.size() &&
+                request.batch <= 1 && row.hidden.dim() == 3 && row.hidden.size(0) == 1 &&
+                row.hidden.size(1) == 1 && row.hidden.size(2) == hidden_norm.numel() &&
+                row.ids.dim() == 2 && row.ids.size(0) == 1 && row.ids.size(1) == 1,
+            "invalid Qwen4 predictor batch row geometry");
+        tyloi::models::require_model(request.layer_states.front() &&
+                request.layer_states.front()->qsa,
+            "Qwen4 predictor batch state has no QSA cache");
+        tyloi::models::require_model(request.lengths.front() >= 0 &&
+                request.lengths.front() <= config.maximum - 1,
+            "Qwen4 predictor batch history exceeds context capacity");
+
+        requests.push_back(&request);
+        hidden_rows.push_back(ops::copy(row.hidden, device));
+        id_rows.push_back(ops::contiguous(ops::copy(ops::cast(row.ids, ::tyloi::kInt64), device)));
+
+        auto current = row.positions.defined()
+            ? row.positions
+            : ::tyloi::ops::arange(request.lengths.front(), request.lengths.front() + 1, device);
+        current = ops::cast(ops::copy(current, device), kInt32);
+        if (current.dim() == 1)
+            current = ops::expand(ops::reshape(current, {1, 1, 1}), {3, 1, 1});
+        else if (current.dim() == 2)
+            current = ops::unsqueeze(current, 1);
+        if (current.dim() == 3 && current.size(0) == 4)
+            current = ops::slice(current, 0, 1, 4);
+        tyloi::models::require_model(current.dim() == 3 && current.size(0) == 3 &&
+                current.size(1) == 1 && current.size(2) == 1,
+            "Qwen4 predictor batch positions require [T], [3,T] or [3,1,T]");
+        current = ops::contiguous(ops::expand(current, {3, 1, 1}));
+        current_positions.push_back(current);
+        full_positions.push_back(request.positions.front().defined()
+            ? ops::cat(std::array<Tensor, 2>{request.positions.front(), current}, -1)
+            : current);
+    }
+
+    auto ids = ops::cat(id_rows, 0);
+    auto hidden = ops::cat(hidden_rows, 0);
+    auto embeds = embed(ids);
+    auto e = ops::project(
+        ops::rms_norm(embeds, embedding_norm, config.eps, 1.0, embeds.scalar_type()),
+        embedding_fusion);
+    embeds = {};
+    auto normalized = ops::rms_norm(hidden, hidden_norm, config.eps, 1.0, hidden.scalar_type());
+    auto streams = ops::project(
+        ops::reshape(normalized, {batch, 1, config.streams, config.hidden}), hidden_fusion);
+    auto x = ops::reshape(ops::add(streams, ops::unsqueeze(e, -2)),
+                          {batch, 1, config.streams * config.hidden});
+
+    auto [attention_input, attention_residual, attention_gate] = block.attention_gr.pre(x);
+    auto projections = block.qsa->project_inputs(attention_input);
+    std::vector<Tensor> attended;
+    attended.reserve(rows.size());
+    for (std::size_t index = 0; index < rows.size(); ++index) {
+        std::vector<Tensor> row_projections;
+        row_projections.reserve(projections.size());
+        for (const auto& projection : projections)
+            row_projections.push_back(ops::slice(projection, 0,
+                static_cast<std::int64_t>(index), static_cast<std::int64_t>(index + 1)));
+        attended.push_back(block.qsa->forward(
+            *requests[index]->layer_states.front()->qsa,
+            ops::slice(attention_input, 0, static_cast<std::int64_t>(index),
+                       static_cast<std::int64_t>(index + 1)),
+            current_positions[index], full_positions[index], true, nullptr,
+            std::move(row_projections), false));
+    }
+    auto attention = block.qsa->project_output(ops::cat(attended, 0));
+    x = block.attention_gr.post(attention, attention_residual, attention_gate);
+    auto [ffn_input, ffn_residual, ffn_gate] = block.ffn_gr.pre(x);
+    auto ffn_output = ops::ffn(block.ffn, ffn_input);
+    auto multi = block.ffn_gr.post(ffn_output, ffn_residual, ffn_gate);
+    auto sample = final_mixer->pre(multi).mixed;
+
+    std::vector<tyloi::models::MtpStep> result;
+    result.reserve(rows.size());
+    for (std::size_t index = 0; index < rows.size(); ++index) {
+        requests[index]->positions.front() = std::move(full_positions[index]);
+        requests[index]->lengths.front() += 1;
+        requests[index]->batch = 1;
+        result.push_back({
+            ops::slice(sample, 0, static_cast<std::int64_t>(index),
+                       static_cast<std::int64_t>(index + 1)),
+            ops::slice(multi, 0, static_cast<std::int64_t>(index),
+                       static_cast<std::int64_t>(index + 1))});
+    }
+    return result;
+}
+
 void Predictor::history_step(tyloi::models::MtpState& value,Tensor hidden,Tensor ids,Tensor positions,bool scalar_chain) const {
     if(ids.dim()==1)ids=ops::unsqueeze(ids,0);
     if(positions.defined()) {

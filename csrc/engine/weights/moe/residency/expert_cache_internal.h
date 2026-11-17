@@ -1353,7 +1353,8 @@ private:
     friend void release_moe_decode_buffers(const std::shared_ptr<MoeExpertCache>& cache);
     friend bool lend_moe_decode_cache_for_prefill(const std::shared_ptr<MoeExpertCache>&,std::size_t);
     friend void begin_moe_speculative_routes(const std::shared_ptr<MoeExpertCache>&,int);
-    friend void commit_moe_speculative_routes(const std::shared_ptr<MoeExpertCache>&,int);
+    friend void commit_moe_speculative_routes(const std::shared_ptr<MoeExpertCache>&,
+        std::span<const std::uint8_t>);
     friend void discard_moe_speculative_routes(const std::shared_ptr<MoeExpertCache>&) noexcept;
     friend bool prepare_moe_graph_pool(const std::shared_ptr<MoeExpertCache>& cache);
     friend struct MoeResidencyTestAccess;

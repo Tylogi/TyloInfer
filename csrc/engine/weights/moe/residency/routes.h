@@ -13,6 +13,10 @@ namespace tyloi::engine {
 
 class RouteHistory {
 public:
+    // CUDA packed MTP admits at most 32 requests times five draft rows plus
+    // the target row.  The mask API keeps each of those physical rows
+    // independently, including holes between accepted requests.
+    static constexpr int max_speculative_rows = 32 * (5 + 1);
     enum class HeatMode { count, unique, normalized };
     struct Bundle { int experts; bool verified; };
     struct Route { std::size_t bundle; int32_t expert; };
@@ -41,7 +45,7 @@ public:
     }
 
     void begin(int rows) {
-        if (rows < 1 || rows > 32)
+        if (rows < 1 || rows > max_speculative_rows)
             throw std::invalid_argument("speculative route row count is out of range");
         if (pending_rows_)
             throw std::logic_error("speculative routes already pending");
@@ -61,7 +65,8 @@ public:
             throw std::logic_error("speculative routes do not describe one aligned sequence");
         validate_experts(history, ids);
         if (deferred) {
-            // Graph setup can publish a layer repeatedly; only the latest routes count.
+            // Graph setup can publish a layer repeatedly; only the latest
+            // complete route publication counts.
             history.ids.assign(ids.begin(), ids.end());
             history.rows = rows;
         } else {
@@ -71,60 +76,72 @@ public:
         }
     }
 
-    // The returned view remains valid until the next prefix query.
-    std::span<const Route> prefix(int rows) {
-        validate_prefix(rows);
+    // The returned view remains valid until the next selection query.
+    std::span<const Route> selected(std::span<const std::uint8_t> keep) {
+        validate_keep(keep);
         accepted_.clear();
         if (!pending())
             return accepted_;
-        for (int row = 0; row < rows; ++row)
+        for (int row = 0; row < pending_rows_; ++row) {
+            if (!keep[std::size_t(row)]) continue;
             for (std::size_t bundle = 0; bundle < histories_.size(); ++bundle) {
                 const auto& history = histories_[bundle];
-                if (!history.rows)
+                if (!history.rows || row >= history.rows)
                     continue;
                 const auto routes = history.ids.size() / history.rows;
                 for (std::size_t route = 0; route < routes; ++route)
                     accepted_.push_back({bundle, history.ids[std::size_t(row) * routes + route]});
             }
+        }
         return accepted_;
     }
 
-    Accepted commit(int rows) {
-        validate_prefix(rows);
+    Accepted commit(std::span<const std::uint8_t> keep) {
+        validate_keep(keep);
         Accepted result;
         if (!pending())
             return result;
         for (auto& history : histories_) {
             if (!history.rows)
                 continue;
-            const auto count = std::size_t(rows) * (history.ids.size() / history.rows);
+            const auto routes = history.ids.size() / history.rows;
+            std::size_t count = 0;
             if (mode_ != HeatMode::count)
                 std::fill(history.seen.begin(), history.seen.end(), std::uint64_t(0));
             std::size_t distinct = 0;
-            for (std::size_t i = 0; i < count; ++i) {
-                const auto expert = unsigned(history.ids[i]);
-                if (mode_ != HeatMode::count) {
-                    auto& word = history.seen[expert / 64];
-                    const auto bit = std::uint64_t(1) << (expert % 64);
-                    if (word & bit)
-                        continue;
-                    word |= bit;
+            for (int row = 0; row < pending_rows_; ++row) {
+                if (!keep[std::size_t(row)]) continue;
+                if (row >= history.rows) continue;
+                for (std::size_t route = 0; route < routes; ++route) {
+                    const auto expert = unsigned(history.ids[std::size_t(row) * routes + route]);
+                    ++count;
+                    if (mode_ != HeatMode::count) {
+                        auto& word = history.seen[expert / 64];
+                        const auto bit = std::uint64_t(1) << (expert % 64);
+                        if (word & bit)
+                            continue;
+                        word |= bit;
+                    }
+                    ++distinct;
                 }
-                ++distinct;
             }
             // Preserve total token heat while valuing each saved transfer equally.
             const float weight = mode_ == HeatMode::normalized && distinct
                 ? float(count) / float(distinct) : 1.0f;
-            for (std::size_t i = 0; i < count; ++i) {
-                const auto expert = unsigned(history.ids[i]);
-                if (mode_ != HeatMode::count) {
-                    auto& word = history.seen[expert / 64];
-                    const auto bit = std::uint64_t(1) << (expert % 64);
-                    if (!(word & bit))
-                        continue;
-                    word &= ~bit;
+            for (int row = 0; row < pending_rows_; ++row) {
+                if (!keep[std::size_t(row)]) continue;
+                if (row >= history.rows) continue;
+                for (std::size_t route = 0; route < routes; ++route) {
+                    const auto expert = unsigned(history.ids[std::size_t(row) * routes + route]);
+                    if (mode_ != HeatMode::count) {
+                        auto& word = history.seen[expert / 64];
+                        const auto bit = std::uint64_t(1) << (expert % 64);
+                        if (!(word & bit))
+                            continue;
+                        word &= ~bit;
+                    }
+                    history.observations[expert] += weight;
                 }
-                history.observations[expert] += weight;
             }
             result.routes += count;
             result.heat_routes += distinct;
@@ -204,14 +221,21 @@ private:
                 throw std::out_of_range("expert route is out of range");
     }
 
-    void validate_prefix(int rows) const {
-        if (!pending())
+    void validate_keep(std::span<const std::uint8_t> keep) const {
+        if (!pending()) {
+            if (!keep.empty())
+                throw std::invalid_argument("speculative route mask has no pending window");
             return;
-        if (rows < 0 || rows > pending_rows_)
-            throw std::invalid_argument("committed route prefix is out of range");
+        }
+        if (keep.size() != std::size_t(pending_rows_))
+            throw std::invalid_argument("speculative route mask row count is out of range");
+        if (std::any_of(keep.begin(), keep.end(), [](std::uint8_t value) { return value > 1; }))
+            throw std::invalid_argument("speculative route mask contains a non-binary row");
         for (const auto& history : histories_)
-            if (history.rows && history.rows < rows)
-                throw std::logic_error("speculative route publication lost row alignment");
+            if (history.rows)
+                for (std::size_t row = std::size_t(history.rows); row < keep.size(); ++row)
+                    if (keep[row])
+                        throw std::logic_error("speculative route publication lost row alignment");
     }
 
     std::vector<History> histories_;

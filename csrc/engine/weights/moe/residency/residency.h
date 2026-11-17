@@ -4,6 +4,7 @@
 #include <memory>
 #include <optional>
 #include <functional>
+#include <span>
 #include <vector>
 #include <iosfwd>
 class MoeExpertCache;
@@ -52,7 +53,7 @@ public:
     void prepare_predictor();
     void after_layer(int layer,const std::vector<int32_t>& ids,int tokens,bool window_inflight=false,bool independent_sequences=false);
     void begin_speculative_routes(int rows);
-    void commit_speculative_routes(int rows);
+    void commit_speculative_routes(std::span<const std::uint8_t> keep);
     void discard_speculative_routes() noexcept;
     bool prepare_during_window() const noexcept;
     void finish_window(int layer);

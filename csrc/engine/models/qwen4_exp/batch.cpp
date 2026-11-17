@@ -74,22 +74,35 @@ Rows prepare(const Model& model, const std::vector<State*>& states, const std::v
 // projecting and applying the FFN across the combined rows.
 Tensor layer(const Layer& weights, const std::vector<State*>& requests, std::size_t index,
         const std::vector<Tensor>& ids, const std::vector<Tensor>& host, const Rows& rows,
-        Tensor hidden, bool decode, bool batch_projection) {
+        Tensor hidden, bool decode, bool batch_projection,
+        const std::vector<std::int64_t>* confirmed_rows = nullptr) {
     const auto axis = decode ? 0 : 1;
+    for (std::size_t row = 0; row < requests.size(); ++row) {
+        const auto confirmed = confirmed_rows ? (*confirmed_rows)[row] : std::int64_t{0};
+        requests[row]->layers[index]->retained_prefix =
+            confirmed > 0 && ids[row].size(1) <= 8;
+    }
     if (weights.ple) {
         std::vector<Tensor> values;
         for (std::size_t row = 0; row < requests.size(); ++row) {
             const auto first = decode ? std::int64_t(row) : rows.offsets[row];
             const auto last = decode ? first + 1 : rows.offsets[row + 1];
             auto input = ops::slice(hidden, axis, first, last);
+            const auto confirmed = confirmed_rows ? (*confirmed_rows)[row] : std::int64_t{0};
             auto ple = weights.ple->forward(requests[row]->layers[index]->ple, input,
-                ids[row], true, 0, host[row]);
+                ids[row], true, confirmed, host[row],
+                rows.full[row].size(-1) - ids[row].size(1));
             values.push_back(ops::add(input, ple));
         }
         hidden = ops::cat(values, axis);
     }
     auto mix = weights.attention_gr.pre(hidden);
-    const bool project = requests.size() > 1 && batch_projection;
+    const bool any_speculative = confirmed_rows && std::any_of(
+        confirmed_rows->begin(), confirmed_rows->end(), [](std::int64_t value) { return value > 0; });
+    // A speculative GDN row must use its journal-aware request path.  This
+    // disables only the grouped GDN projection; QSA keeps the shared path.
+    const bool project = requests.size() > 1 && batch_projection &&
+        !(weights.gdn && any_speculative);
     const auto projections = project ? (weights.gdn ? weights.gdn->project_inputs(mix.mixed)
         : weights.qsa->project_inputs(mix.mixed)) : std::vector<Tensor>{};
     std::vector<Tensor> attended;
@@ -100,10 +113,17 @@ Tensor layer(const Layer& weights, const std::vector<State*>& requests, std::siz
         std::vector<Tensor> row_projections;
         for (const auto& value : projections) row_projections.push_back(ops::slice(value, axis, first, last));
         auto& state = *requests[row]->layers[index];
-        attended.push_back(weights.gdn
-            ? weights.gdn->forward_chunk(state.gdn, input, true, std::move(row_projections), !project)
-            : weights.qsa->forward(*state.qsa, input, rows.current[row], rows.full[row], true,
-                nullptr, std::move(row_projections), !project));
+        const auto confirmed = confirmed_rows ? (*confirmed_rows)[row] : std::int64_t{0};
+        if (weights.gdn && (confirmed > 0 || !project)) {
+            attended.push_back(weights.gdn->forward(state.gdn, input, true, confirmed,
+                rows.full[row].size(-1) - ids[row].size(1)));
+        } else {
+            attended.push_back(weights.gdn
+                ? weights.gdn->forward_chunk(state.gdn, input, true,
+                    std::move(row_projections), !project)
+                : weights.qsa->forward(*state.qsa, input, rows.current[row], rows.full[row], true,
+                    nullptr, std::move(row_projections), !project));
+        }
     }
     auto attention = ops::cat(attended, axis);
     if (project) attention = weights.gdn ? weights.gdn->project_output(attention)
@@ -137,12 +157,45 @@ std::vector<State*> Batch::active(std::span<const BatchRow> rows) const {
     return result;
 }
 
-StepSequence<std::vector<Tensor>> Batch::prefill(std::vector<BatchState*> batch, std::vector<Tensor> ids) {
+StepSequence<std::vector<Decoded>> Batch::prefill(std::vector<BatchState*> batch,
+        std::vector<Tensor> ids) {
+    return forward(std::move(batch), std::move(ids), false);
+}
+
+StepSequence<std::vector<Decoded>> Batch::verify(std::vector<BatchState*> batch,
+        std::vector<Tensor> ids) {
+    return forward(std::move(batch), std::move(ids), true);
+}
+
+StepSequence<std::vector<Decoded>> Batch::forward(std::vector<BatchState*> batch,
+        std::vector<Tensor> ids, bool verify) {
     std::vector<State*> requests;
+    requests.reserve(batch.size());
     for (auto* value : batch) {
         auto* request = dynamic_cast<Request*>(value);
         require_model(request && request->state.belongs_to(model_), "Qwen4 batch state belongs to a different model");
         requests.push_back(&request->state);
+    }
+    require_model(!requests.empty() && requests.size() == ids.size(),
+        verify ? "invalid Qwen4 verification rows" : "invalid Qwen4 batch rows");
+    std::vector<std::int64_t> confirmed;
+    if (verify) {
+        confirmed.assign(ids.size(), 0);
+        for (std::size_t row = 0; row < requests.size(); ++row) {
+            require_model(ids[row].dim() == 2 && ids[row].size(0) == 1 && ids[row].size(1) > 0,
+                "invalid Qwen4 verification row");
+            require_model(requests[row]->speculative_start < 0,
+                "Qwen4 verification has a pending speculative pass");
+            if (ids[row].size(1) > 1)
+                require_model(requests[row]->cache_pos > 0,
+                    "Qwen4 speculative verification requires a non-empty prefix");
+        }
+        for (std::size_t row = 0; row < requests.size(); ++row) {
+            if (ids[row].size(1) <= 1) continue;
+            confirmed[row] = 1;
+            requests[row]->speculative_start = requests[row]->cache_pos;
+            requests[row]->speculative_confirmed = 1;
+        }
     }
     auto rows = prepare(model_, requests, ids);
     auto all_ids = ops::cat(ids, 1);
@@ -154,15 +207,30 @@ StepSequence<std::vector<Tensor>> Batch::prefill(std::vector<BatchState*> batch,
         for (std::size_t i = 0; i < model_.layers.size(); ++i)
             if (model_.layers[i]->ple) model_.layers[i]->ple->prefetch_tokens(requests[0]->layers[i]->ple, host[0]);
     auto hidden = model_.repeat_hidden(model_.embed_tokens(all_ids), model_.metadata.hc_mult);
+    const auto* confirmed_rows = verify ? &confirmed : nullptr;
     for (std::size_t i = 0; i < model_.layers.size(); ++i) {
         co_yield LayerEvent{LayerEvent::Phase::begin, requests.size() > 1 ? LayerEvent::Mode::packed : LayerEvent::Mode::single};
-        hidden = layer(*model_.layers[i], requests, i, ids, host, rows, std::move(hidden), false, true);
+        hidden = layer(*model_.layers[i], requests, i, ids, host, rows,
+            std::move(hidden), false, true, confirmed_rows);
         co_yield LayerEvent{LayerEvent::Phase::end};
     }
+    const bool want_raw = std::any_of(requests.begin(), requests.end(),
+        [](const State* state) { return bool(state->predictor); });
+    auto raw = (verify || want_raw) ? hidden : Tensor{};
     hidden = model_.final_mixer->pre(hidden, ops::ResidualRole::final).mixed;
-    std::vector<Tensor> result;
+    auto logits = verify ? ops::softcap(model_.logits(hidden, false),
+        model_.metadata.final_logit_softcapping) : Tensor{};
+    std::vector<Decoded> result;
     for (std::size_t row = 0; row < requests.size(); ++row) {
-        result.push_back(ops::slice(hidden, 1, rows.offsets[row + 1] - 1, rows.offsets[row + 1]));
+        Decoded decoded;
+        decoded.hidden = verify
+            ? ops::slice(hidden, 1, rows.offsets[row], rows.offsets[row + 1])
+            : ops::slice(hidden, 1, rows.offsets[row + 1] - 1, rows.offsets[row + 1]);
+        if (raw && (verify || requests[row]->predictor))
+            decoded.raw = ops::slice(raw, 1, rows.offsets[row], rows.offsets[row + 1]);
+        if (verify)
+            decoded.logits = ops::slice(logits, 1, rows.offsets[row], rows.offsets[row + 1]);
+        result.push_back(std::move(decoded));
         requests[row]->finish_forward(rows.full[row], 1, ids[row].size(1));
         requests[row]->cache_pos += ids[row].size(1);
     }

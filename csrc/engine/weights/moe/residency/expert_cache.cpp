@@ -2724,9 +2724,10 @@ void begin_moe_speculative_routes(const std::shared_ptr<MoeExpertCache>& cache,i
     if(cache && cache->kv_expert_loan_ && (!kv_lru || kv_lru[0]!='0'))
         cache->kv_expert_loan_->begin_speculative(rows);
 }
-void commit_moe_speculative_routes(const std::shared_ptr<MoeExpertCache>& cache,int rows) {
-    if(cache && cache->moe_residency_)cache->moe_residency_->commit_speculative_routes(rows);
-    if(cache && cache->kv_expert_loan_)cache->kv_expert_loan_->commit_speculative(rows);
+void commit_moe_speculative_routes(const std::shared_ptr<MoeExpertCache>& cache,
+        std::span<const std::uint8_t> keep) {
+    if(cache && cache->moe_residency_)cache->moe_residency_->commit_speculative_routes(keep);
+    if(cache && cache->kv_expert_loan_)cache->kv_expert_loan_->commit_speculative(keep);
 }
 void discard_moe_speculative_routes(const std::shared_ptr<MoeExpertCache>& cache) noexcept {
     if(cache && cache->moe_residency_)cache->moe_residency_->discard_speculative_routes();

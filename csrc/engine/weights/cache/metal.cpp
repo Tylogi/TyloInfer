@@ -416,6 +416,7 @@ Cache::Routes::Routes(Routes&&) noexcept = default;
 Cache::Routes::~Routes() = default;
 void Cache::Routes::begin(Cache&, int) {}
 void Cache::Routes::resolve(int, bool) {}
+void Cache::Routes::resolve(std::span<const std::uint8_t>) {}
 
 struct Cache::Warmup::Impl { Cache& cache; };
 Cache::Warmup::Warmup(Cache& cache, bool) : impl_(std::make_unique<Impl>(Impl{cache})) {}

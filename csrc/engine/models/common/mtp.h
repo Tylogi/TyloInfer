@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <limits>
 #include <memory>
+#include <span>
 #include <stdexcept>
 
 namespace tyloi::models {
@@ -21,6 +22,13 @@ struct MtpStep {
     // Optional last-row vocabulary projection computed in the predictor graph.
     Tensor sample_logits;
     int32_t greedy_token=-1;
+};
+
+struct MtpRow {
+    MtpState* state = nullptr;
+    Tensor hidden;
+    Tensor ids;
+    Tensor positions;
 };
 
 // Predictor weights and math use the explicit state owned by the request.
@@ -46,6 +54,10 @@ struct Mtp {
         const Tensor& next_ids,
         const Tensor& positions = {},
         const ForwardOptions& options = {}) const = 0;
+    virtual std::vector<MtpStep> batch_step(
+        std::span<const MtpRow>, const ForwardOptions& = {}) const {
+        throw std::logic_error("batched MTP step is unsupported");
+    }
     virtual void trim_cache_to(MtpState& state, int64_t position) const = 0;
     virtual bool teacher_forced_prompt_prime() const noexcept = 0;
     virtual bool target_bootstrap_decode() const noexcept = 0;

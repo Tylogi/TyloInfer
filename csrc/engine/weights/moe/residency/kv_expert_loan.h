@@ -4,7 +4,10 @@
 #include "engine/backends/cuda/native/stream.h"
 #include "engine/backends/cuda/native/device.h"
 #include "engine/backends/cuda/native/copy_batch.h"
+#include "engine/weights/moe/residency/routes.h"
+#include <algorithm>
 #include <array>
+#include <bitset>
 #include <list>
 #include <map>
 #include <mutex>
@@ -25,6 +28,7 @@ namespace tyloi::cuda {
 // KV growth is prepared before a window or at its ordered KV service boundary.
 class KvExpertLoan {
     struct Entry;
+    using SpeculativeMask = std::bitset<tyloi::engine::RouteHistory::max_speculative_rows>;
     struct ProjectionLayout {
         std::array<std::size_t,8> bytes{},offsets{};
         int fields=0;std::size_t logical_bytes=0;
@@ -78,7 +82,8 @@ public:
     void begin_speculative(int rows) {
         std::lock_guard<std::mutex> lock(mutex_);
         if(speculative_rows_)throw std::logic_error("nested KV expert speculation");
-        if(rows<1 || rows>32)throw std::invalid_argument("invalid KV expert speculative rows");
+        if(rows<1 || rows>tyloi::engine::RouteHistory::max_speculative_rows)
+            throw std::invalid_argument("invalid KV expert speculative rows");
         speculative_keys_.clear();packet_sources_={};packet_masks_.clear();
         try {speculative_keys_.reserve(std::max(speculative_keys_.capacity(),lru_.size()+64));}
         catch(const std::bad_alloc&){++speculative_stats_.disabled;return;}
@@ -96,16 +101,15 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         speculative_packet_locked(sources,ids,rows,routes,experts);
     }
-    void commit_speculative(int rows) {
+    void commit_speculative(std::span<const std::uint8_t> keep) {
         std::lock_guard<std::mutex> lock(mutex_);
         if(!speculative_rows_)return;
-        if(rows<0 || rows>speculative_rows_)throw std::invalid_argument("invalid KV expert committed prefix");
-        finish_speculative(rows,false);
+        finish_speculative(keep,false);
     }
     void discard_speculative() noexcept {
         try {
             std::lock_guard<std::mutex> lock(mutex_);
-            if(speculative_rows_)finish_speculative(0,true);
+            if(speculative_rows_)finish_speculative({},true);
         }catch(...){}
     }
     SpeculativeStats speculative_stats() const {std::lock_guard<std::mutex> lock(mutex_);return speculative_stats_;}
@@ -306,22 +310,29 @@ public:
         for(const auto* entries:{&lru_,&retired_})for(const auto& e:*entries)if(e.region==region)result+=e.bytes;return result;
     }
 private:
+    void validate_speculative_keep(std::span<const std::uint8_t> keep) const {
+        if(keep.size()!=std::size_t(speculative_rows_))
+            throw std::invalid_argument("invalid KV expert speculative row mask");
+        if(std::any_of(keep.begin(),keep.end(),[](std::uint8_t value){return value>1;}))
+            throw std::invalid_argument("invalid KV expert speculative row mask");
+    }
     void speculative_packet_locked(const std::array<int64_t,3>& sources,const int32_t* ids,int rows,int routes,int experts) {
         if(!speculative_rows_)return;
         if(rows!=speculative_rows_ || !ids || routes<=0 || experts<=0) {disable_speculative();return;}
-        try {packet_masks_.assign(experts,0);}
+        try {packet_masks_.assign(experts,SpeculativeMask{});}
         catch(const std::bad_alloc&){disable_speculative();return;}
         packet_sources_=sources;
         for(int row=0;row<rows;++row)for(int route=0;route<routes;++route) {
             const auto expert=ids[row*routes+route];
-            if(unsigned(expert)<unsigned(experts))packet_masks_[expert]|=uint32_t(1)<<row;
+            if(unsigned(expert)<unsigned(experts))
+                packet_masks_[expert].set(std::size_t(row));
         }
     }
     struct Region {::tyloi::DenseTensor owner;int64_t capacity=0,ratio=1,manual_live=-1;std::size_t row_bytes=0,begin=0,end=0,largest_free=0;bool prefix=false,external=false;std::map<std::size_t,std::size_t> free;};
     struct Entry {Key key;std::size_t region,first,pages,bytes;uint64_t packet=0;bool retired=false,published=false;
         uint64_t forecast_packet=0;
         uint64_t order=0,prior_order=0,epoch=0,last_use_packet=0,prior_use_packet=0;
-        uint32_t used_rows=0;bool reused=false,reuse_eligible=false,reuse_linked=false;
+        SpeculativeMask used_rows{};bool reused=false,reuse_eligible=false,reuse_linked=false;
         Entry* reuse_prev=nullptr;Entry* reuse_next=nullptr;
         std::unique_ptr<ProjectionLayout> projection;std::size_t exchange_pins=0;};
     void disable_speculative() {
@@ -341,42 +352,49 @@ private:
             return;
         }
         const auto expert=entry.key[1];
-        const auto mask=expert>=0 && std::size_t(expert)<packet_masks_.size() &&
+        const auto* mask=expert>=0 && std::size_t(expert)<packet_masks_.size() &&
             std::find(packet_sources_.begin(),packet_sources_.end(),entry.key[0])!=packet_sources_.end()?
-                packet_masks_[std::size_t(expert)]:0;
-        if(mask) {
+                &packet_masks_[std::size_t(expert)]:nullptr;
+        if(mask && mask->any()) {
             if(entry.epoch!=speculative_epoch_) {
                 try {speculative_keys_.push_back(entry.key);}
                 catch(const std::bad_alloc&){disable_speculative();return;}
-                entry.epoch=speculative_epoch_;entry.prior_order=fresh?0:entry.order;entry.used_rows=0;
+                entry.epoch=speculative_epoch_;entry.prior_order=fresh?0:entry.order;entry.used_rows={};
                 entry.prior_use_packet=fresh?0:entry.last_use_packet;
                 entry.reuse_eligible=reused;
             }
-            entry.used_rows|=mask;
+            entry.used_rows|=*mask;
         }else if(reuse_priority_ && reused){set_reused(entry,true);trim_reused(&entry);}
         entry.last_use_packet=packet_;entry.order=++access_order_;
     }
-    void finish_speculative(int rows,bool cancelled) {
-        const uint32_t accepted=rows==32?UINT32_MAX:(uint32_t(1)<<rows)-1;
+    void finish_speculative(std::span<const std::uint8_t> keep,bool cancelled) {
+        SpeculativeMask accepted{};
+        if(!cancelled) {
+            validate_speculative_keep(keep);
+            for(std::size_t row=0;row<keep.size();++row)if(keep[row])
+                accepted.set(row);
+        }
+        const auto accepted_rows=accepted.count();
         const auto token_stride=access_order_+1;
         bool reordered=false,token_ordered=false;uint64_t hits=0,insertions=0;
         for(const auto& key:speculative_keys_)if(auto found=entries_.find(key);found!=entries_.end()) {
             auto& entry=*found->second;if(entry.epoch!=speculative_epoch_)continue;
             entry.epoch=0;
             const auto used=entry.used_rows&accepted;
-            if(used) {
-                const bool repeated_rows=(used&(used-1))!=0;
+            if(used.any()) {
+                const bool repeated_rows=used.count()>1;
                 if(reuse_priority_ && (entry.reuse_eligible || repeated_rows)) {
                     if(!entry.reused && !entry.reuse_eligible && repeated_rows && !reuse_stats_.accepted_row_promotions++)
                         std::fprintf(stderr,"moe_kv_accepted_row_reuse scope=first_promotion enabled=1\n");
                     set_reused(entry,true);
                 }
-                if(rows>1) {
+                if(accepted_rows>1) {
                     // Batched GPU consumption runs layer by layer. Match the
                     // accepted token chronology used by RAM learning instead
                     // of letting read completion order rank the next token's
                     // expert cache. Rejected later rows never affect this rank.
-                    unsigned last_row=0;for(auto mask=used>>1;mask;mask>>=1)++last_row;
+                    auto last_row=used.size()-1;
+                    while(!used[last_row])--last_row;
                     entry.order=(last_row+1)*token_stride+entry.order;
                     reordered=token_ordered=true;
                 }
@@ -392,14 +410,14 @@ private:
         if(reuse_priority_){rebuild_reuse_queues();trim_reused();}
         if(token_ordered && !token_order_reported_) {
             token_order_reported_=true;
-            std::fprintf(stderr,"moe_kv_token_order scope=first_committed_window enabled=1 rows=%d\n",rows);
+            std::fprintf(stderr,"moe_kv_token_order scope=first_committed_window enabled=1 rows=%zu\n",accepted_rows);
         }
         ++speculative_stats_.windows;speculative_stats_.reverted_hits+=hits;
         speculative_stats_.cold_insertions+=insertions;speculative_stats_.cancels+=cancelled;
         if(reordered && !speculative_reported_) {
             speculative_reported_=true;
-            std::fprintf(stderr,"moe_kv_mtp_lru_dispatch enabled=1 rows=%d window_rows=%d reverted_hits=%llu cold_insertions=%llu\n",
-                rows,speculative_rows_,static_cast<unsigned long long>(hits),static_cast<unsigned long long>(insertions));
+            std::fprintf(stderr,"moe_kv_mtp_lru_dispatch enabled=1 rows=%zu window_rows=%d reverted_hits=%llu cold_insertions=%llu\n",
+                accepted_rows,speculative_rows_,static_cast<unsigned long long>(hits),static_cast<unsigned long long>(insertions));
         }
         speculative_rows_=0;speculative_keys_.clear();packet_sources_={};packet_masks_.clear();
     }
@@ -632,7 +650,7 @@ private:
     uint64_t packet_=1;
     int speculative_rows_=0;uint64_t speculative_epoch_=0,access_order_=0;
     std::array<int64_t,3> packet_sources_{};
-    std::vector<uint32_t> packet_masks_;
+    std::vector<SpeculativeMask> packet_masks_;
     std::vector<Key> speculative_keys_;
     SpeculativeStats speculative_stats_;
     bool reuse_priority_=false,reuse_learning_=true;

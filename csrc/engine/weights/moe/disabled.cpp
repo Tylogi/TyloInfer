@@ -44,7 +44,8 @@ void finish_moe_expert_exchanges(const std::shared_ptr<MoeExpertCache>& cache) {
 
 void begin_moe_speculative_routes(const std::shared_ptr<MoeExpertCache>& cache, int rows) {}
 
-void commit_moe_speculative_routes(const std::shared_ptr<MoeExpertCache>& cache, int rows) {}
+void commit_moe_speculative_routes(const std::shared_ptr<MoeExpertCache>& cache,
+        std::span<const std::uint8_t> keep) {}
 
 void discard_moe_speculative_routes(const std::shared_ptr<MoeExpertCache>& cache)noexcept {}
 

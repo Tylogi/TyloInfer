@@ -50,17 +50,29 @@ void submit_batch(Executor& executor, std::span<const Tensor> outputs,
     executor.submit(retained);
 }
 
-std::vector<Tensor> prefill_batch(models::Batch& batch, Executor& executor, weights::Cache& weights,
-        Budget& budget, Device device, std::vector<models::BatchState*> states, std::vector<Tensor> ids) {
+void submit_batch(Executor& executor, std::span<const models::Decoded> outputs,
+        std::span<models::BatchState* const> states) {
+    std::vector<Tensor> retained;
+    for (const auto& output : outputs) {
+        for (const auto& value : {output.hidden, output.raw, output.logits, output.compact, output.ids})
+            if (value) retained.push_back(value);
+    }
+    submit_batch(executor,std::span<const Tensor>{retained},states);
+}
+
+std::vector<models::Decoded> prefill_batch(models::Batch& batch, Executor& executor, weights::Cache& weights,
+        Budget& budget, Device device, std::vector<models::BatchState*> states, std::vector<Tensor> ids,
+        bool verify) {
     Capture capture(executor,weights,budget,device);
     auto work=executor.work();
     std::unique_ptr<weights::Loan> loan;
-    StepSequence<std::vector<Tensor>> job;
-    std::optional<std::vector<Tensor>> result;
+    StepSequence<std::vector<models::Decoded>> job;
+    std::optional<std::vector<models::Decoded>> result;
     try {
-        job=batch.prefill(states,std::move(ids));
+        job = verify ? batch.verify(states, std::move(ids))
+                     : batch.prefill(states, std::move(ids));
         for(;;) {
-            StepResult<std::vector<Tensor>> step;
+            StepResult<std::vector<models::Decoded>> step;
             { auto scope=work->enter(); step=job.next(); }
             const int events=int(bool(step.value))+int(bool(step.layer))+int(bool(step.workspace))+int(bool(step.graph));
             if(events>1 || (step.state==StepState::complete && events))

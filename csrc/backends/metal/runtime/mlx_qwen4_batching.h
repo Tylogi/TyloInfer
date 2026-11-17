@@ -69,6 +69,7 @@ public:
     struct Sample {
         std::int64_t token = 0;
         MfqPrefillTiming timing;
+        std::vector<std::int64_t> tokens;
     };
     struct Decoded {
         mlx::core::array logits;
@@ -88,6 +89,7 @@ public:
         throw std::invalid_argument("legacy Metal batching cannot bind the shared Engine budget");
     }
     bool supports_sessions() const noexcept { return true; }
+    bool supports_mtp() const noexcept { return runtime_.supports_mtp(); }
 
     std::int64_t prepare(const std::shared_ptr<Request>& request) {
         request->mtp = request->sampling.enable_mtp && runtime_.supports_mtp();
@@ -206,9 +208,7 @@ public:
         policy_.reset();
         park_memory_ = {};
     }
-    void activate(const std::shared_ptr<Request>& request, const Sample& result) {
-        if (!request->mtp) accept(request, result);
-    }
+    void activate(const std::shared_ptr<Request>&, const Sample&) {}
     std::int64_t cache_length(const std::shared_ptr<Request>& request) const {
         return runtime_.request_cache_position(*request->cache);
     }
@@ -218,10 +218,20 @@ public:
         if (!request->mtp) return std::nullopt;
         return generate_mtp(request, output, std::move(schedule), std::move(ready), std::move(check));
     }
-    void accept(const std::shared_ptr<Request>& request, const Sample& result) {
-        if (request->token_constraint) request->token_constraint->accept(result.token);
-        if (request->counts) *request->counts = sample_token_counts_add(*request->counts,
-            mlx::core::array({result.token}, {1, 1}, mlx::core::int32));
+    void accept(const std::shared_ptr<Request>& request, const Sample&,
+        std::span<const std::int64_t> emitted) {
+        for (const auto token : emitted) {
+            if (request->token_constraint) request->token_constraint->accept(token);
+            if (request->counts) *request->counts = sample_token_counts_add(*request->counts,
+                mlx::core::array({token}, {1, 1}, mlx::core::int32));
+        }
+    }
+    void report(const std::shared_ptr<Request>& request, tyloi::engine::InferenceOutput& output) const {
+        const auto& stats = request->mtp_stats;
+        output.metrics.mtp = {stats.available, stats.used, stats.cycles, stats.drafted_tokens,
+            stats.accepted_tokens, stats.depth_cycles, stats.position_drafted, stats.position_accepted,
+            stats.measured_depth_ms, stats.selected_depth, stats.standard_tokens, stats.park_count,
+            stats.reentry_probes};
     }
     Decoded decode(const State& state) {
         bool speculative = false;
