@@ -11,7 +11,6 @@ namespace tyloi::server {
 namespace {
 
 using json = nlohmann::json;
-constexpr int schema_version = 19;
 constexpr const char* key_columns = "id,name,prefix,scopes_json,role,expires_at,revoked_at,created_at,last_used_at";
 
 using sqlite::Statement;

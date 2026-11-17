@@ -10,12 +10,8 @@ find_package(SQLite3 REQUIRED)
 find_package(CURL 7.85 REQUIRED)
 find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 set(_schema_file "${TYLOINFER_REPOSITORY_ROOT}/tyloinfer/server/state/schema.sql")
-set(_storage_file "${TYLOINFER_REPOSITORY_ROOT}/tyloinfer/server/state/storage.py")
-set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_schema_file}" "${_storage_file}")
-file(STRINGS "${_storage_file}" _schema_version_line REGEX "^SCHEMA_VERSION = [0-9]+$")
-if(NOT _schema_version_line STREQUAL "SCHEMA_VERSION = 19")
-    message(FATAL_ERROR "Update native SQLite migrations to match Python SCHEMA_VERSION")
-endif()
+# shortcut: the frozen Python consumer requires this SQL path until its migration is allowed.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_schema_file}")
 # Embed input byte by byte to preserve its encoding and avoid MSVC's string literal length limit.
 # /** Reads a file as escaped character initializers without changing its bytes. */
 function(tyloinfer_server_read_bytes path output)

@@ -1,6 +1,7 @@
 #pragma once
 
 namespace tyloi::server {
+inline constexpr int schema_version = 19;
 inline constexpr char schema_sql[] = {
 @TYLOINFER_SERVER_SCHEMA@'\0'
 };
