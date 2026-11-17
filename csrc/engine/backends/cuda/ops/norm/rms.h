@@ -17,6 +17,12 @@ tyloi::DenseTensor merge_norms(tyloi::DenseTensor dense, tyloi::DenseTensor expe
     const tyloi::DenseTensor& output_weight, const tyloi::DenseTensor& scale, double eps);
 }
 
+namespace tyloi::cuda::attention_ops {
+// Keep the F32 expression order and source dtype of the original model helper.
+::tyloi::DenseTensor rms_norm(const ::tyloi::DenseTensor& value,
+                              const ::tyloi::DenseTensor& weight, double eps);
+}
+
 ::tyloi::DenseTensor qwen_rms_norm(
     ::tyloi::DenseTensor x,
     const ::tyloi::Tensor& weight,

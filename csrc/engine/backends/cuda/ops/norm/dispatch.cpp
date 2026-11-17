@@ -6,6 +6,13 @@
 #include <stdexcept>
 
 #include "engine/backends/cuda/executor/executor.h"
+::tyloi::DenseTensor tyloi::cuda::attention_ops::rms_norm(
+    const ::tyloi::DenseTensor& value, const ::tyloi::DenseTensor& weight, double eps) {
+    auto f = value.to(::tyloi::kFloat32);
+    return (f * ::tyloi::cuda::rsqrt((f * f).mean(-1, true) + eps) * weight.to(::tyloi::kFloat32))
+        .to(value.scalar_type());
+}
+
 tyloi::DenseTensor tyloi::cuda::ops::rms_norm(tyloi::DenseTensor input, const tyloi::DenseTensor& weight,
                                      double eps, double offset, tyloi::ScalarType output_type) {
     std::optional<MfqCudaGuard> guard;

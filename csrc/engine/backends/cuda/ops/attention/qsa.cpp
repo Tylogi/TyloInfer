@@ -12,6 +12,7 @@
 #include "engine/backends/cuda/native/resident_allocations.h"
 #include "engine/backends/cuda/ops/qwen4_exp.h"
 #include "engine/backends/cuda/ops/norm/launch.h"
+#include "engine/backends/cuda/ops/norm/rms.h"
 #include "engine/backends/cuda/ops/attention/kv/quantization.h"
 #include "engine/backends/cuda/executor/kv/memory.h"
 #include "engine/backends/cuda/ops/attention/kv/hot_cache.h"
@@ -33,13 +34,6 @@
 
 namespace tyloi::ops::detail {
 using namespace ::tyloi::cuda;
-
-/** Preserve the QSA normalization order used by the original attention path. */
-inline DenseTensor qsa_rms_norm(const DenseTensor& value, const DenseTensor& weight, double eps) {
-    auto f=value.to(::tyloi::kFloat32);
-    return (f * ::tyloi::cuda::rsqrt((f * f).mean(-1, true) + eps) * weight.to(::tyloi::kFloat32))
-        .to(value.scalar_type());
-}
 
 class QsaCore {
   public:
@@ -358,7 +352,7 @@ class QsaCore {
             request.memory->ensure(n);
             if(pools) {
                 auto pooled=request.index.storage().dense().narrow(1,0,pools*c_.pool).reshape({1,pools,c_.pool,c_.index_width}).to(::tyloi::kFloat32).mean(2).to(request.index.storage().scalar_type());
-                pooled=qsa_rms_norm(pooled,w_->index_key_norm.dense().to(::tyloi::kFloat32)+1,c_.eps);
+                pooled=::tyloi::cuda::attention_ops::rms_norm(pooled,w_->index_key_norm.dense().to(::tyloi::kFloat32)+1,c_.eps);
                 auto starts=::tyloi::cuda::arange(pools,full_positions.options().dtype(::tyloi::kInt64))*c_.pool;
                 (request.graph_pooled.defined()?request.graph_pooled.dense():DenseTensor{}).narrow(1,0,pools).copy_(rotary_->forward(pooled.unsqueeze(1),full_positions.index_select(-1,starts)).squeeze(1));
             }
@@ -379,7 +373,7 @@ class QsaCore {
         const auto pools=n/c_.pool;
         if(pools) {
             auto pooled=request.index.storage().dense().narrow(1,0,pools*c_.pool).reshape({1,pools,c_.pool,c_.index_width}).to(::tyloi::kFloat32).mean(2).to(request.index.storage().scalar_type());
-            pooled=qsa_rms_norm(pooled,w_->index_key_norm.dense().to(::tyloi::kFloat32)+1,c_.eps);
+            pooled=::tyloi::cuda::attention_ops::rms_norm(pooled,w_->index_key_norm.dense().to(::tyloi::kFloat32)+1,c_.eps);
             auto starts=::tyloi::cuda::arange(pools,full_positions.options().dtype(::tyloi::kInt64))*c_.pool;
             graph_pooled.narrow(1,0,pools).copy_(rotary_->forward(pooled.unsqueeze(1),full_positions.index_select(-1,starts)).squeeze(1));
         }
@@ -484,7 +478,7 @@ class QsaCore {
             block=(cache_positions/c_.pool).to(::tyloi::kInt64);
             auto row=(block.unsqueeze(-1)*c_.pool+::tyloi::cuda::arange(c_.pool,block.options())).clamp(0,c_.maximum-1);
             pooled=request.index.storage().dense().index_select(1,row.reshape({-1})).reshape({1,t,c_.pool,c_.index_width}).to(::tyloi::kFloat32).mean(2).to(request.index.storage().scalar_type());
-            pooled=qsa_rms_norm(pooled,w_->index_key_norm.dense().to(::tyloi::kFloat32)+1,c_.eps);
+            pooled=::tyloi::cuda::attention_ops::rms_norm(pooled,w_->index_key_norm.dense().to(::tyloi::kFloat32)+1,c_.eps);
             auto delta=positions-cache_positions;
             auto block_positions=block*c_.pool+delta;
             pooled=rotary_->forward(pooled.unsqueeze(1),block_positions).squeeze(1);
@@ -619,18 +613,18 @@ class QsaCore {
                     return project(hidden,current_positions,!history_only && offset+t>c_.budget,{},{},{},std::move(projections));
                 auto pair = this->project_query(hidden).reshape({b, t, c_.heads, 2 * c_.width});
                 auto gate = pair.narrow(-1, c_.width, c_.width);
-                auto query = qsa_rms_norm(pair.narrow(-1, 0, c_.width),
+                auto query = ::tyloi::cuda::attention_ops::rms_norm(pair.narrow(-1, 0, c_.width),
                                       w_->query_norm.dense().to(::tyloi::kFloat32) + 1, c_.eps)
                                  .permute({0, 2, 1, 3});
                 auto key =
-                    qsa_rms_norm(::tyloi::ops::project(hidden,w_->input_projection[1]).dense().reshape({b, t, c_.kv_heads, c_.width}),
+                    ::tyloi::cuda::attention_ops::rms_norm(::tyloi::ops::project(hidden,w_->input_projection[1]).dense().reshape({b, t, c_.kv_heads, c_.width}),
                              w_->key_norm.dense().to(::tyloi::kFloat32) + 1, c_.eps)
                         .permute({0, 2, 1, 3});
                 auto value = ::tyloi::ops::project(hidden,w_->input_projection[2]).dense().reshape({b, t, c_.kv_heads, c_.width});
                 query = rotary_->forward(query, current_positions);
                 key = rotary_->forward(key, current_positions).permute({0, 2, 1, 3});
                 auto iqk = ::tyloi::ops::project(hidden,w_->input_projection[3]).dense();
-                auto iq = qsa_rms_norm(iqk.narrow(-1, 0, c_.index_heads * c_.index_width)
+                auto iq = ::tyloi::cuda::attention_ops::rms_norm(iqk.narrow(-1, 0, c_.index_heads * c_.index_width)
                                        .reshape({b, t, c_.index_heads, c_.index_width}),
                                    w_->index_query_norm.dense().to(::tyloi::kFloat32) + 1, c_.eps)
                               .permute({0, 2, 1, 3});
@@ -695,7 +689,7 @@ class QsaCore {
                                   .to(::tyloi::kFloat32)
                                   .mean(2)
                                   .to(raw.scalar_type());
-                pooled = qsa_rms_norm(pooled, w_->index_key_norm.dense().to(::tyloi::kFloat32) + 1, c_.eps);
+                pooled = ::tyloi::cuda::attention_ops::rms_norm(pooled, w_->index_key_norm.dense().to(::tyloi::kFloat32) + 1, c_.eps);
                 auto starts = ::tyloi::cuda::arange(pools, raw.options().dtype(::tyloi::kInt64)) * c_.pool;
                 auto positions = full_positions.index_select(-1, starts);
                 pooled = rotary_->forward(pooled.unsqueeze(1), positions).squeeze(1);
@@ -860,7 +854,7 @@ class QsaCore {
                     raw=raw_owner.dense();
                 }
                 auto pooled = raw.reshape({1, new_pools, c_.pool, c_.index_width}).to(::tyloi::kFloat32).mean(2).to(::tyloi::kFloat16);
-                pooled = qsa_rms_norm(pooled, w_->index_key_norm.dense().to(::tyloi::kFloat32) + 1, c_.eps);
+                pooled = ::tyloi::cuda::attention_ops::rms_norm(pooled, w_->index_key_norm.dense().to(::tyloi::kFloat32) + 1, c_.eps);
                 auto starts = (::tyloi::cuda::arange(new_pools, positions.options().dtype(::tyloi::kInt64)) + first_pool) * c_.pool;
                 pooled = rotary_->forward(pooled.unsqueeze(1), full_positions.index_select(-1, starts)).squeeze(1);
                 if(managed_memory(request))graph_pooled.narrow(1,first_pool,new_pools).copy_(pooled);
@@ -954,7 +948,7 @@ class QsaCore {
     DenseTensor project_norm(const DenseTensor& value,const DenseTensor& weight) {
         if(value.scalar_type()==::tyloi::kFloat16 || value.scalar_type()==::tyloi::kFloat32)
             return grouped_rms_norm_cuda(value.contiguous(),weight.to(::tyloi::kFloat32).contiguous(),value.size(-1),c_.eps,1.0);
-        return qsa_rms_norm(value,weight.to(::tyloi::kFloat32)+1,c_.eps);
+        return ::tyloi::cuda::attention_ops::rms_norm(value,weight.to(::tyloi::kFloat32)+1,c_.eps);
     }
     Projection project_history(const DenseTensor& hidden,const DenseTensor& positions) {
         const auto b=hidden.size(0),t=hidden.size(1);

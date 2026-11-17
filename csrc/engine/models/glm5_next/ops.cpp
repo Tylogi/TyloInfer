@@ -107,12 +107,12 @@ static DenseTensor execute(const Layer& layer, LayerState& activity,
         TYLOINFER_RUNTIME_CHECK(std::get<MlaState>(activity).position() == position,
                                "GLM MLA/model cache positions diverged");
     auto attention_mix = attention_hc.pre(x, config);
-    auto normalized = rms_norm(attention_mix[2], attention_norm, config.eps);
+    auto normalized = rms_norm(attention_mix[2], attention_norm.dense(), config.eps);
     auto branch = kda ? kda->forward(std::get<KdaState>(activity), std::move(normalized), true, confirmed)
                       : mla->forward(std::get<MlaState>(activity), std::move(normalized), true);
     auto hidden = mfq_glm5_next::mhc_post(branch, x, attention_mix[0], attention_mix[1]);
     auto ffn_mix = ffn_hc.pre(hidden, config);
-    normalized = rms_norm(ffn_mix[2], ffn_norm, config.eps);
+    normalized = rms_norm(ffn_mix[2], ffn_norm.dense(), config.eps);
     branch = ffn.forward(normalized);
     return mfq_glm5_next::mhc_post(branch, hidden, ffn_mix[0], ffn_mix[1]);
 }
@@ -361,7 +361,7 @@ tyloi::StepSequence<tyloi::models::Prepared> Model::prepare(
     });
 }
 ::tyloi::Tensor Model::normalize(const ::tyloi::Tensor& hidden, std::int64_t, std::int64_t) const {
-    return rms_norm(hidden.dense().mean(2), output_norm, metadata.rms_norm_eps);
+    return rms_norm(hidden.dense().mean(2), output_norm.dense(), metadata.rms_norm_eps);
 }
 ::tyloi::Tensor Model::softcap(const ::tyloi::Tensor& value) const { return value; }
 ::tyloi::Tensor Model::logits(const ::tyloi::Tensor& hidden, bool, tyloi::models::LogitPrecision) const {
@@ -496,28 +496,28 @@ std::pair<DenseTensor, DenseTensor> Mtp::evaluate(tyloi::models::MtpState& value
         {
             auto mask = (pos == 0).reshape({pos.dim() == 1 ? 1 : b, t, 1});
             auto masked = ::tyloi::cuda::where(mask, ::tyloi::cuda::zeros_like(embeds), embeds);
-            e = rms_norm(masked, embedding_norm, config.eps);
+            e = rms_norm(masked, embedding_norm.dense(), config.eps);
         }
         // Release prior-stage tensors before later projections allocate.
         embeds = {};
         DenseTensor streams;
-        streams = rms_norm(hidden, hidden_norm, config.eps);
+        streams = rms_norm(hidden, hidden_norm.dense(), config.eps);
         x = ::tyloi::ops::project(::tyloi::cuda::cat({e, streams}, -1), fusion).dense();
     }
     DenseTensor multi;
     {
         auto &block = layers[layer];
         dtype = x.scalar_type() == ::tyloi::kFloat32 ? ::tyloi::kFloat32 : ::tyloi::kFloat16;
-        auto normalized = rms_norm(x, block.attention_norm, config.eps);
+        auto normalized = rms_norm(x, block.attention_norm.dense(), config.eps);
         auto branch = block.attention->forward(state.states[layer], normalized, cache);
         x = x.to(::tyloi::kFloat32) + branch.to(::tyloi::kFloat32);
-        normalized = rms_norm(x, block.ffn_norm, config.eps).to(dtype);
+        normalized = rms_norm(x, block.ffn_norm.dense(), config.eps).to(dtype);
         branch = block.ffn.forward(normalized);
         multi = x.to(::tyloi::kFloat32) + branch.to(::tyloi::kFloat32);
     }
     x = {};
     DenseTensor result;
-    result = rms_norm(multi, output_norm, config.eps).to(dtype);
+    result = rms_norm(multi, output_norm.dense(), config.eps).to(dtype);
     if (cache) {
         state.batch = b;
         state.lengths[layer] = start + t;

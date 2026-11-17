@@ -7,7 +7,7 @@
 #include "engine/models/common/mtp.h"
 #include "engine/models/source/model.h"
 #include "engine/backends/cuda/ops/projection/quant_linear.h"
-#include "engine/models/common/attention_ops.h"
+#include "engine/backends/cuda/ops/norm/rms.h"
 #include "engine/backends/cuda/ops/attention/attention.h"
 #include "engine/backends/cuda/ops/glm5_next.h"
 #include <array>
@@ -142,7 +142,7 @@ class Kda {
                                 .reshape({b, t, heads_, width_})
                                 .permute({0, 2, 1, 3});
                 return rms_norm(attended,
-                                w_.output_norm,
+                                w_.output_norm.dense(),
                                 eps_) *
                        ::tyloi::cuda::sigmoid(gate.to(::tyloi::kFloat32));
             },
@@ -200,11 +200,11 @@ class SparseMla {
             offset + t, c_.budget, use_cache,
             [&] {
                 auto qr = rms_norm(::tyloi::ops::project(hidden, w_.query_a).dense(),
-                                   w_.query_norm,
+                                   w_.query_norm.dense(),
                                    c_.eps);
                 auto query = ::tyloi::ops::project(qr, w_.query_b).dense().reshape({b, t, c_.heads, c_.nope});
                 auto latent = rms_norm(::tyloi::ops::project(hidden, w_.key_value_a).dense().narrow(-1, 0, c_.latent),
-                                       w_.latent_norm, c_.eps);
+                                       w_.latent_norm.dense(), c_.eps);
                 // Metal's indexer LayerNorm explicitly casts the source/output to F16.
                 auto ik = ::tyloi::ops::project(hidden, w_.index_key).dense().to(::tyloi::kFloat16).to(::tyloi::kFloat32);
                 auto centered = ik - ik.mean(-1, true);
