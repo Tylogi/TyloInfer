@@ -490,62 +490,6 @@ static void dsv4_report_hc_difference(int layer, const char *stage, const char *
 }
 
 
-namespace tyloi::models::deepseek_v4 {
-template <class DenseTensor> struct Projections {
-    DenseTensor rank, queries, values;
-    std::vector<DenseTensor> compressor, indexer;
-};
-
-template <class Query, class Values, class Compressor, class Indexer, class Prefill, class Decode,
-          class Concat>
-auto attention(int64_t tokens, int64_t position, bool lengths, int64_t ratio, Query query,
-               Values values, Compressor compressor, Indexer indexer, Prefill prefill,
-               Decode decode, Concat concat) {
-    auto q = query();
-    using DenseTensor = decltype(values());
-    Projections<DenseTensor> projected{q[0], q[1], values(), {}, {}};
-    if (ratio > 0)
-        projected.compressor = compressor();
-    if (ratio == 4)
-        projected.indexer = indexer();
-    if (tokens > 1 && position == 0 && !lengths)
-        return prefill(projected);
-    std::vector<DenseTensor> output;
-    output.reserve(tokens);
-    for (int64_t token = 0; token < tokens; ++token)
-        output.push_back(decode(projected, token, position + token + 1));
-    return concat(output);
-}
-
-template <class Index, class All, class Empty>
-auto select_compressed(int64_t ratio, int64_t visible, Index index, All all, Empty empty) {
-    if (ratio == 4 && visible > 512)
-        return index();
-    if (visible > 0)
-        return all();
-    return empty();
-}
-
-template <class Write, class Compress, class Index, class Select, class Plan, class Cache,
-          class Attend, class Inverse, class Output>
-auto compressed_step(int64_t ratio, bool prefill, Write write, Compress compress, Index index,
-                     Select select, Plan plan, Cache cache, Attend attend, Inverse inverse,
-                     Output output) {
-    write();
-    const auto visible = ratio > 0 ? compress() : 0;
-    if (ratio == 4) {
-        const auto indexed = index();
-        require_model(!prefill || indexed == visible,
-                      "DeepSeek V4 compressor/indexer prefill length mismatch");
-    }
-    auto selected = select(visible);
-    auto indices = plan(std::move(selected), visible);
-    auto values = cache(visible);
-    return output(inverse(attend(std::move(values), indices)));
-}
-
-} // namespace tyloi::models::deepseek_v4
-
 namespace tyloi::cuda::deepseek_v4 {
 using tyloi::models::deepseek_v4::PoolSnapshot;
 
@@ -1089,335 +1033,285 @@ attention_forward(const Layer& w, LayerState& state, Executor& executor,
         x.reshape({batch * tokens, hidden_size}).to(::tyloi::kFloat16).contiguous();
 
     using DenseTensor = ::tyloi::DenseTensor;
-    return tyloi::models::deepseek_v4::attention(
-        tokens, cache_pos, seq_len.has_value(), compress_ratio,
-        [&] {
-            auto qr =
-                profiler.measure("dsv4.q_a", [&]() { return project.run(q_a, flat); });
-            qr = profiler.measure("dsv4.q_a_norm", [&]() {
-                const auto& q_a_norm = w.q_a_norm.dense();
-                return rms_norm_cuda(
-                           qr.reshape({-1, qr.size(-1)}).to(::tyloi::kFloat32),
-                           q_a_norm, eps)
-                    .to(::tyloi::kFloat16)
+    auto qr = profiler.measure("dsv4.q_a", [&]() { return project.run(q_a, flat); });
+    qr = profiler.measure("dsv4.q_a_norm", [&]() {
+        const auto& q_a_norm = w.q_a_norm.dense();
+        return rms_norm_cuda(
+                   qr.reshape({-1, qr.size(-1)}).to(::tyloi::kFloat32), q_a_norm, eps)
+            .to(::tyloi::kFloat16)
+            .contiguous();
+    });
+    auto queries = profiler.measure("dsv4.q_b", [&]() {
+        return project.run(q_b, qr)
+            .reshape({batch, tokens, heads, head_dim})
+            .transpose(1, 2)
+            .contiguous()
+            .to(::tyloi::kFloat32);
+    });
+    queries = profiler.measure("dsv4.q_norm_rope", [&]() {
+        auto normalized =
+            queries * ::tyloi::cuda::rsqrt(queries.square().mean(-1, true) + eps);
+        auto rotated = tyloi::ops::tail_rope(normalized, positions, attention_rope, false);
+        return rotated.dense();
+    });
+    auto values = profiler.measure("dsv4.kv", [&]() {
+        return project.run(kv, flat).reshape({batch, tokens, head_dim});
+    });
+    values = profiler.measure("dsv4.kv_norm_rope", [&]() {
+        const auto& kv_norm = w.kv_norm.dense();
+        auto normalized =
+            rms_norm_cuda(values.reshape({-1, head_dim}).to(::tyloi::kFloat32), kv_norm, eps)
+                .reshape({batch, tokens, head_dim})
+                .to(::tyloi::kFloat16);
+        auto values_heads = normalized.unsqueeze(1).contiguous();
+        auto rotated = tyloi::ops::tail_rope(values_heads, positions, attention_rope, false);
+        values_heads = rotated.dense();
+        return values_heads.squeeze(1).contiguous();
+    });
+    std::vector<DenseTensor> compressor_parts;
+    if (compress_ratio > 0) {
+        compressor_parts = profiler.measure("dsv4.compressor_proj", [&]() {
+            return compressor.project(flat, batch, tokens);
+        });
+    }
+    std::vector<DenseTensor> indexer_parts;
+    if (compress_ratio == 4) {
+        indexer_parts = profiler.measure("dsv4.indexer_compressor_proj", [&]() {
+            return indexer_compressor.project(flat, batch, tokens);
+        });
+    }
+
+    if (tokens > 1 && cache_pos == 0 && !seq_len.has_value()) {
+        {
+            const int64_t local_tokens = std::min<int64_t>(tokens, 128);
+            auto local_positions =
+                positions.narrow(0, tokens - local_tokens, local_tokens)
+                    .remainder(128)
+                    .to(::tyloi::kInt64)
                     .contiguous();
+            profiler.measure("dsv4.local_cache_prefill", [&]() {
+                local_cache.index_copy_(
+                    1, local_positions, values.narrow(1, tokens - local_tokens, local_tokens));
+                return 0;
             });
-            auto queries = profiler.measure("dsv4.q_b", [&]() {
-                return project.run(q_b, qr)
-                    .reshape({batch, tokens, heads, head_dim})
-                    .transpose(1, 2)
-                    .contiguous()
-                    .to(::tyloi::kFloat32);
+        }
+        int64_t visible = 0;
+        if (compress_ratio > 0) {
+            visible = profiler.measure("dsv4.compressor_prefill", [&]() {
+                return compressor.prefill(state.compressor, compressor_parts.at(0),
+                                          compressor_parts.at(1), attention_rope);
             });
-            queries = profiler.measure("dsv4.q_norm_rope", [&]() {
-                auto normalized =
-                    queries * ::tyloi::cuda::rsqrt(queries.square().mean(-1, true) + eps);
-                auto rotated = tyloi::ops::tail_rope(normalized, positions, attention_rope, false);
-                return rotated.dense();
+        }
+        if (compress_ratio == 4) {
+            const auto indexed = profiler.measure("dsv4.indexer_compressor_prefill", [&]() {
+                return indexer_compressor.prefill(
+                    state.indexer_compressor, indexer_parts.at(0), indexer_parts.at(1),
+                    attention_rope);
             });
+            tyloi::models::require_model(
+                indexed == visible, "DeepSeek V4 compressor/indexer prefill length mismatch");
+        }
 
-            return std::array<DenseTensor, 2>{qr, queries};
-        },
-        [&] {
-            auto values = profiler.measure("dsv4.kv", [&]() {
-                return project.run(kv, flat).reshape({batch, tokens, head_dim});
-            });
-            values = profiler.measure("dsv4.kv_norm_rope", [&]() {
-                const auto& kv_norm = w.kv_norm.dense();
-                auto normalized =
-                    rms_norm_cuda(
-                        values.reshape({-1, head_dim}).to(::tyloi::kFloat32),
-                        kv_norm, eps)
-                        .reshape({batch, tokens, head_dim})
-                        .to(::tyloi::kFloat16);
-                auto values_heads = normalized.unsqueeze(1).contiguous();
-                auto rotated = tyloi::ops::tail_rope(values_heads, positions, attention_rope, false);
-                values_heads = rotated.dense();
-                return values_heads.squeeze(1).contiguous();
-            });
-
-            return values;
-        },
-        [&] {
-            return profiler.measure("dsv4.compressor_proj",
-                                    [&] { return compressor.project(flat, batch, tokens); });
-        },
-        [&] {
-            return profiler.measure("dsv4.indexer_compressor_proj", [&] {
-                return indexer_compressor.project(flat, batch, tokens);
-            });
-        },
-        [&](const auto &projected) {
-            auto qr = projected.rank, queries = projected.queries, values = projected.values;
-            const auto &compressor_parts = projected.compressor;
-            const auto &indexer_parts = projected.indexer;
-            return tyloi::models::deepseek_v4::compressed_step(
-                compress_ratio, true,
-                [&] {
-                    const int64_t local_tokens = std::min<int64_t>(tokens, 128);
-                    auto local_positions =
-                        positions.narrow(0, tokens - local_tokens, local_tokens)
-                            .remainder(128)
-                            .to(::tyloi::kInt64)
+        DenseTensor attention;
+        {
+            DenseTensor selected;
+            {
+                auto int_options = ::tyloi::TensorOptions().device(x.device()).dtype(::tyloi::kInt32);
+                if (compress_ratio == 4 && visible > 512) {
+                    auto index_query = profiler.measure("dsv4.indexer_q_prefill", [&]() {
+                        return project.run(indexer_q, qr)
+                            .reshape({batch, tokens, heads, 128})
+                            .transpose(1, 2)
                             .contiguous();
-                    profiler.measure("dsv4.local_cache_prefill", [&]() {
-                        local_cache.index_copy_(
-                            1, local_positions,
-                            values.narrow(1, tokens - local_tokens, local_tokens));
-                        return 0;
                     });
-                },
-                [&] {
-                    return profiler.measure("dsv4.compressor_prefill", [&] {
-                        return compressor.prefill(state.compressor, compressor_parts.at(0),
-                                                  compressor_parts.at(1), attention_rope);
-                    });
-                },
-                [&] {
-                    return profiler.measure("dsv4.indexer_compressor_prefill", [&] {
-                        return indexer_compressor.prefill(state.indexer_compressor, indexer_parts.at(0),
-                                                          indexer_parts.at(1), attention_rope);
-                    });
-                },
-                [&](int64_t visible) {
-                    auto int_options = ::tyloi::TensorOptions()
-                                           .device(x.device())
-                                           .dtype(::tyloi::kInt32);
-                    return tyloi::models::deepseek_v4::select_compressed(
-                        compress_ratio, visible,
-                        [&] {
-                            auto index_query =
-                                profiler.measure("dsv4.indexer_q_prefill", [&]() {
-                                    return project.run(indexer_q, qr)
-                                        .reshape({batch, tokens, heads, 128})
-                                        .transpose(1, 2)
-                                        .contiguous();
-                                });
-                            auto rotated = tyloi::ops::tail_rope(index_query, positions, attention_rope, false);
-                            index_query = rotated.dense()
-                                              .transpose(1, 2)
-                                              .contiguous();
-                            index_query = nepq_hadamard_input_cuda(
-                                              index_query.reshape({batch * tokens * heads, 128})
-                                                  .to(::tyloi::kFloat16)
-                                                  .contiguous(),
-                                              scratch.hadamard_signs, 128)
-                                              .reshape({batch, tokens, heads, 128});
-                            index_query = dsv4_fp4_sim_cuda(index_query.contiguous());
-                            auto weights =
-                                profiler.measure("dsv4.indexer_weight_prefill", [&]() {
-                                    const auto& indexer_weight = w.indexer_weight.dense();
-                                    return ::tyloi::cuda::matmul(
-                                               x.reshape({batch * tokens, hidden_size})
-                                                   .to(::tyloi::kFloat32),
-                                               indexer_weight.transpose(0, 1))
-                                        .reshape({batch, tokens, heads})
-                                        .to(::tyloi::kFloat16)
-                                        .contiguous();
-                                });
-                            auto scores =
-                                profiler.measure("dsv4.indexer_scores_prefill", [&]() {
-                                    return dsv4_indexer_scores_cuda(
-                                        index_query,
-                                        state.indexer_compressor.pool.narrow(1, 0, visible)
-                                            .contiguous(),
-                                        weights, 0, 4);
-                                });
-                            return profiler.measure("dsv4.indexer_topk_prefill", [&]() {
-                                return dsv4_topk512_cuda(scores);
-                            });
-                        },
-                        [&] {
-                            return ::tyloi::cuda::arange(visible, int_options)
-                                .reshape({1, 1, visible})
-                                .expand({batch, tokens, visible})
-                                .contiguous();
-                        },
-                        [&] {
-                            return ::tyloi::cuda::zeros({batch, tokens, 1}, int_options);
-                        });
-                },
-                [&](DenseTensor selected, int64_t visible) {
-                    const int64_t plan_ratio = compress_ratio > 0 ? compress_ratio : 1;
-                    return profiler.measure("dsv4.attention_plan_prefill", [&]() {
-                        return dsv4_build_prefill_plan_cuda(selected, 0, 0, visible, plan_ratio,
-                                                            128);
-                    });
-                },
-                [&](int64_t visible) {
-                    return profiler.measure("dsv4.attention_cache_prefill", [&]() {
-                        return visible > 0
-                                   ? ::tyloi::cuda::cat(
-                                         {values, state.compressor.pool.narrow(1, 0, visible)}, 1)
-                                         .contiguous()
-                                   : values.contiguous();
-                    });
-                },
-                [&](DenseTensor cache, const auto &plan) {
-                    return profiler.measure("dsv4.sparse_attention_prefill", [&]() {
-                        const auto& sinks = w.sinks.dense();
-                        return attention_dsv4_sparse_cuda(
-                            queries, cache, plan.at(0), plan.at(1), sinks,
-                            scratch.attention_meta,
-                            1.0 / std::sqrt(static_cast<double>(head_dim)));
-                    });
-                },
-                [&](DenseTensor attention) {
-                    return profiler.measure("dsv4.attention_inverse_rope_prefill", [&]() {
-                        auto transposed = attention.transpose(1, 2).contiguous();
-                        auto rotated = tyloi::ops::tail_rope(transposed, positions, attention_rope, true);
-                        transposed = rotated.dense();
-                        return transposed.transpose(1, 2).contiguous();
-                    });
-                },
-                [&](DenseTensor attention) { return project.low_rank(attention, output_a, output_b, groups, mode.groupwise_output, true); });
-        },
-        [&](const auto &projected, int64_t token, int64_t absolute_length) {
-            auto qr = projected.rank, queries = projected.queries, values = projected.values;
-            const auto &compressor_parts = projected.compressor;
-            const auto &indexer_parts = projected.indexer;
-            auto position = positions.narrow(0, token, 1);
-            auto slot = ::tyloi::cuda::remainder(position, 128)
-                            .to(::tyloi::kInt64)
+                    auto rotated = tyloi::ops::tail_rope(index_query, positions, attention_rope, false);
+                    index_query = rotated.dense().transpose(1, 2).contiguous();
+                    index_query = nepq_hadamard_input_cuda(
+                                      index_query.reshape({batch * tokens * heads, 128})
+                                          .to(::tyloi::kFloat16)
+                                          .contiguous(),
+                                      scratch.hadamard_signs, 128)
+                                      .reshape({batch, tokens, heads, 128});
+                    index_query = dsv4_fp4_sim_cuda(index_query.contiguous());
+                    auto weights = profiler.measure("dsv4.indexer_weight_prefill", [&]() {
+                        const auto& indexer_weight = w.indexer_weight.dense();
+                        return ::tyloi::cuda::matmul(
+                                   x.reshape({batch * tokens, hidden_size}).to(::tyloi::kFloat32),
+                                   indexer_weight.transpose(0, 1))
+                            .reshape({batch, tokens, heads})
+                            .to(::tyloi::kFloat16)
                             .contiguous();
-            ::tyloi::DenseTensor length;
-            if (tokens == 1 && seq_len.has_value()) {
-                length = seq_len.value().contiguous();
-            } else {
-                length = ::tyloi::cuda::full({batch}, absolute_length,
-                                                  ::tyloi::TensorOptions()
-                                                      .device(::tyloi::kCUDA)
-                                                      .dtype(::tyloi::kInt64));
+                    });
+                    auto scores = profiler.measure("dsv4.indexer_scores_prefill", [&]() {
+                        return dsv4_indexer_scores_cuda(
+                            index_query,
+                            state.indexer_compressor.pool.narrow(1, 0, visible).contiguous(),
+                            weights, 0, 4);
+                    });
+                    selected = profiler.measure("dsv4.indexer_topk_prefill", [&]() {
+                        return dsv4_topk512_cuda(scores);
+                    });
+                } else if (visible > 0) {
+                    selected = ::tyloi::cuda::arange(visible, int_options)
+                                   .reshape({1, 1, visible})
+                                   .expand({batch, tokens, visible})
+                                   .contiguous();
+                } else {
+                    selected = ::tyloi::cuda::zeros({batch, tokens, 1}, int_options);
+                }
             }
-            return tyloi::models::deepseek_v4::compressed_step(
-                compress_ratio, false,
-                [&] {
-                    profiler.measure("dsv4.local_cache_write", [&]() {
-                        glm_dsa_cache_write_cuda(local_cache,
-                                                 values.narrow(1, token, 1).contiguous(), slot);
-                        return 0;
+            const int64_t plan_ratio = compress_ratio > 0 ? compress_ratio : 1;
+            auto plan = profiler.measure("dsv4.attention_plan_prefill", [&]() {
+                return dsv4_build_prefill_plan_cuda(selected, 0, 0, visible, plan_ratio, 128);
+            });
+            selected = DenseTensor();
+            auto cache = profiler.measure("dsv4.attention_cache_prefill", [&]() {
+                return visible > 0
+                           ? ::tyloi::cuda::cat(
+                                 {values, state.compressor.pool.narrow(1, 0, visible)}, 1)
+                                 .contiguous()
+                           : values.contiguous();
+            });
+            attention = profiler.measure("dsv4.sparse_attention_prefill", [&]() {
+                const auto& sinks = w.sinks.dense();
+                return attention_dsv4_sparse_cuda(
+                    queries, cache, plan.at(0), plan.at(1), sinks, scratch.attention_meta,
+                    1.0 / std::sqrt(static_cast<double>(head_dim)));
+            });
+        }
+        attention = profiler.measure("dsv4.attention_inverse_rope_prefill", [&]() {
+            auto transposed = attention.transpose(1, 2).contiguous();
+            auto rotated = tyloi::ops::tail_rope(transposed, positions, attention_rope, true);
+            transposed = rotated.dense();
+            return transposed.transpose(1, 2).contiguous();
+        });
+        return project.low_rank(attention, output_a, output_b, groups, mode.groupwise_output, true);
+    }
+
+    std::vector<DenseTensor> output;
+    output.reserve(tokens);
+    for (int64_t token = 0; token < tokens; ++token) {
+        const int64_t absolute_length = cache_pos + token + 1;
+        auto position = positions.narrow(0, token, 1);
+        auto slot = ::tyloi::cuda::remainder(position, 128)
+                        .to(::tyloi::kInt64)
+                        .contiguous();
+        ::tyloi::DenseTensor length;
+        if (tokens == 1 && seq_len.has_value()) {
+            length = seq_len.value().contiguous();
+        } else {
+            length = ::tyloi::cuda::full(
+                {batch}, absolute_length,
+                ::tyloi::TensorOptions().device(::tyloi::kCUDA).dtype(::tyloi::kInt64));
+        }
+
+        profiler.measure("dsv4.local_cache_write", [&]() {
+            glm_dsa_cache_write_cuda(local_cache, values.narrow(1, token, 1).contiguous(), slot);
+            return 0;
+        });
+        int64_t visible = 0;
+        if (compress_ratio > 0) {
+            profiler.measure("dsv4.compressor_update", [&]() {
+                compressor.update(
+                    state.compressor, compressor_parts.at(0).narrow(1, token, 1).contiguous(),
+                    compressor_parts.at(1).narrow(1, token, 1).contiguous(), length,
+                    attention_rope);
+                return 0;
+            });
+            visible = absolute_length / compress_ratio;
+        }
+        if (compress_ratio == 4) {
+            profiler.measure("dsv4.indexer_compressor_update", [&]() {
+                indexer_compressor.update(
+                    state.indexer_compressor, indexer_parts.at(0).narrow(1, token, 1).contiguous(),
+                    indexer_parts.at(1).narrow(1, token, 1).contiguous(), length,
+                    attention_rope);
+                return 0;
+            });
+        }
+
+        DenseTensor attention;
+        {
+            DenseTensor selected;
+            {
+                auto int_options = ::tyloi::TensorOptions().device(::tyloi::kCUDA).dtype(::tyloi::kInt32);
+                if (compress_ratio == 4 && visible > 512) {
+                    auto qr_token = qr.reshape({batch, tokens, qr.size(-1)})
+                                        .narrow(1, token, 1)
+                                        .reshape({batch, qr.size(-1)})
+                                        .contiguous();
+                    auto index_query = profiler.measure("dsv4.indexer_q", [&]() {
+                        return project.run(indexer_q, qr_token)
+                            .reshape({batch, 1, heads, 128})
+                            .transpose(1, 2)
+                            .contiguous();
                     });
-                },
-                [&] {
-                    profiler.measure("dsv4.compressor_update", [&]() {
-                        compressor.update(
-                            state.compressor, compressor_parts.at(0).narrow(1, token, 1).contiguous(),
-                            compressor_parts.at(1).narrow(1, token, 1).contiguous(), length,
-                            attention_rope);
-                        return 0;
+                    auto rotated = tyloi::ops::tail_rope(index_query, position, attention_rope, false);
+                    index_query = rotated.dense().transpose(1, 2).contiguous();
+                    index_query = nepq_hadamard_input_cuda(
+                                      index_query.reshape({batch * heads, 128})
+                                          .to(::tyloi::kFloat16)
+                                          .contiguous(),
+                                      scratch.hadamard_signs, 128)
+                                      .reshape({batch, 1, heads, 128});
+                    index_query = dsv4_fp4_sim_cuda(index_query.contiguous());
+                    auto weights = profiler.measure("dsv4.indexer_weight", [&]() {
+                        const auto& indexer_weight = w.indexer_weight.dense();
+                        return ::tyloi::cuda::matmul(
+                                   x.narrow(1, token, 1)
+                                       .reshape({batch, hidden_size})
+                                       .to(::tyloi::kFloat32),
+                                   indexer_weight.transpose(0, 1))
+                            .reshape({batch, 1, heads})
+                            .to(::tyloi::kFloat16)
+                            .contiguous();
                     });
-                    return absolute_length / compress_ratio;
-                },
-                [&] {
-                    profiler.measure("dsv4.indexer_compressor_update", [&]() {
-                        indexer_compressor.update(
-                            state.indexer_compressor, indexer_parts.at(0).narrow(1, token, 1).contiguous(),
-                            indexer_parts.at(1).narrow(1, token, 1).contiguous(), length,
-                            attention_rope);
-                        return 0;
+                    auto scores = profiler.measure("dsv4.indexer_scores", [&]() {
+                        return dsv4_indexer_scores_cuda(
+                            index_query,
+                            state.indexer_compressor.pool.narrow(1, 0, visible).contiguous(),
+                            weights, cache_pos + token, 4);
                     });
-                    return int64_t{0};
-                },
-                [&](int64_t visible) {
-                    auto int_options = ::tyloi::TensorOptions()
-                                           .device(::tyloi::kCUDA)
-                                           .dtype(::tyloi::kInt32);
-                    return tyloi::models::deepseek_v4::select_compressed(
-                        compress_ratio, visible,
-                        [&] {
-                            auto qr_token = qr.reshape({batch, tokens, qr.size(-1)})
-                                                .narrow(1, token, 1)
-                                                .reshape({batch, qr.size(-1)})
-                                                .contiguous();
-                            auto index_query = profiler.measure("dsv4.indexer_q", [&]() {
-                                return project.run(indexer_q, qr_token)
-                                    .reshape({batch, 1, heads, 128})
-                                    .transpose(1, 2)
-                                    .contiguous();
-                            });
-                            auto rotated = tyloi::ops::tail_rope(index_query, position, attention_rope, false);
-                            index_query = rotated.dense()
-                                              .transpose(1, 2)
-                                              .contiguous();
-                            index_query = nepq_hadamard_input_cuda(
-                                              index_query.reshape({batch * heads, 128})
-                                                  .to(::tyloi::kFloat16)
-                                                  .contiguous(),
-                                              scratch.hadamard_signs, 128)
-                                              .reshape({batch, 1, heads, 128});
-                            index_query = dsv4_fp4_sim_cuda(index_query.contiguous());
-                            auto weights = profiler.measure("dsv4.indexer_weight", [&]() {
-                                const auto& indexer_weight = w.indexer_weight.dense();
-                                return ::tyloi::cuda::matmul(
-                                           x.narrow(1, token, 1)
-                                               .reshape({batch, hidden_size})
-                                               .to(::tyloi::kFloat32),
-                                           indexer_weight.transpose(0, 1))
-                                    .reshape({batch, 1, heads})
-                                    .to(::tyloi::kFloat16)
-                                    .contiguous();
-                            });
-                            auto scores = profiler.measure("dsv4.indexer_scores", [&]() {
-                                return dsv4_indexer_scores_cuda(
-                                    index_query,
-                                    state.indexer_compressor.pool.narrow(1, 0, visible).contiguous(),
-                                    weights, cache_pos + token, 4);
-                            });
-                            return profiler.measure("dsv4.indexer_topk", [&]() {
-                                return dsv4_topk512_cuda(scores);
-                            });
-                        },
-                        [&] {
-                            return ::tyloi::cuda::arange(visible, int_options)
-                                .reshape({1, 1, visible})
-                                .expand({batch, 1, visible})
-                                .contiguous();
-                        },
-                        [&] {
-                            return ::tyloi::cuda::arange(visible, int_options)
-                                .reshape({1, 1, visible})
-                                .expand({batch, 1, visible})
-                                .contiguous();
-                        });
-                },
-                [&](DenseTensor selected, int64_t visible) {
-                    const int64_t plan_ratio = compress_ratio > 0 ? compress_ratio : 1;
-                    return profiler.measure("dsv4.attention_plan", [&]() {
-                        return dsv4_build_decode_plan_cuda(selected, length, visible,
-                                                           plan_ratio, 128);
+                    selected = profiler.measure("dsv4.indexer_topk", [&]() {
+                        return dsv4_topk512_cuda(scores);
                     });
-                },
-                [&](int64_t visible) {
-                    return profiler.measure("dsv4.attention_cache", [&]() {
-                        return visible > 0
-                                   ? ::tyloi::cuda::cat(
-                                         {local_cache, state.compressor.pool.narrow(1, 0, visible)},
-                                         1)
-                                         .contiguous()
-                                   : local_cache;
-                    });
-                },
-                [&](DenseTensor cache, const auto &plan) {
-                    auto query = queries.narrow(2, token, 1).contiguous();
-                    return profiler.measure("dsv4.sparse_attention", [&]() {
-                        const auto& sinks = w.sinks.dense();
-                        return attention_dsv4_sparse_cuda(
-                            query, cache, plan.at(0), plan.at(1), sinks,
-                            scratch.attention_meta,
-                            1.0 / std::sqrt(static_cast<double>(head_dim)));
-                    });
-                },
-                [&](DenseTensor attention) {
-                    return profiler.measure("dsv4.attention_inverse_rope", [&]() {
-                        auto transposed = attention.transpose(1, 2).contiguous();
-                        auto rotated = tyloi::ops::tail_rope(transposed, position, attention_rope, true);
-                        transposed = rotated.dense();
-                        return transposed.transpose(1, 2).contiguous();
-                    });
-                },
-                [&](DenseTensor attention) { return project.low_rank(attention, output_a, output_b, groups, mode.groupwise_output, true); });
-        },
-        [](const auto &outputs) { return ::tyloi::cuda::cat(outputs, 1); });
+                } else {
+                    selected = ::tyloi::cuda::arange(visible, int_options)
+                                   .reshape({1, 1, visible})
+                                   .expand({batch, 1, visible})
+                                   .contiguous();
+                }
+            }
+            const int64_t plan_ratio = compress_ratio > 0 ? compress_ratio : 1;
+            auto plan = profiler.measure("dsv4.attention_plan", [&]() {
+                return dsv4_build_decode_plan_cuda(selected, length, visible, plan_ratio, 128);
+            });
+            selected = DenseTensor();
+            auto cache = profiler.measure("dsv4.attention_cache", [&]() {
+                return visible > 0
+                           ? ::tyloi::cuda::cat(
+                                 {local_cache, state.compressor.pool.narrow(1, 0, visible)}, 1)
+                                 .contiguous()
+                           : local_cache;
+            });
+            auto query = queries.narrow(2, token, 1).contiguous();
+            attention = profiler.measure("dsv4.sparse_attention", [&]() {
+                const auto& sinks = w.sinks.dense();
+                return attention_dsv4_sparse_cuda(
+                    query, cache, plan.at(0), plan.at(1), sinks, scratch.attention_meta,
+                    1.0 / std::sqrt(static_cast<double>(head_dim)));
+            });
+        }
+        attention = profiler.measure("dsv4.attention_inverse_rope", [&]() {
+            auto transposed = attention.transpose(1, 2).contiguous();
+            auto rotated = tyloi::ops::tail_rope(transposed, position, attention_rope, true);
+            transposed = rotated.dense();
+            return transposed.transpose(1, 2).contiguous();
+        });
+        output.push_back(
+            project.low_rank(attention, output_a, output_b, groups, mode.groupwise_output, true));
+    }
+    return ::tyloi::cuda::cat(output, 1);
 }
 
 DenseTensor forward_layer(const Layer& w, LayerState& state, Executor& executor, DenseTensor x,
