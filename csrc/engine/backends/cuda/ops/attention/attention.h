@@ -58,6 +58,10 @@ struct AttentionConfig {
 
 namespace ops {
 std::int64_t attention_parts(std::int64_t planned_len);
+::tyloi::DenseTensor select_pooled_blocks(
+    const ::tyloi::DenseTensor& scores, std::int64_t query_offset,
+    std::int64_t logical_length, std::int64_t pool, std::int64_t budget,
+    bool include_tail);
 tyloi::ops::AttentionResult attention(const tyloi::ops::AttentionInput&, const tyloi::state::KvView&,
                                     const tyloi::ops::AttentionConfig&);
 ::tyloi::DenseTensor sparse_attention(

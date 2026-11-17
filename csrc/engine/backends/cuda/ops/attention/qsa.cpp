@@ -2,6 +2,7 @@
 
 
 #include "engine/ops/ops.h"
+#include "engine/backends/cuda/ops/attention/attention.h"
 #include "engine/backends/cuda/ops/attention/sequence.h"
 #include "engine/backends/cuda/ops/rope/rope.h"
 #include "engine/backends/cuda/executor/options.h"
@@ -705,7 +706,8 @@ class QsaCore {
             };
         const auto select = [&](const DenseTensor &scores, const Projection &p, const DenseTensor &pooled) {
                 auto ids =
-                    select_pooled_blocks(scores, offset, offset + t, c_.pool, c_.budget, true);
+                    tyloi::cuda::ops::select_pooled_blocks(
+                        scores, offset, offset + t, c_.pool, c_.budget, true);
                 if (selection_trace)
                     *selection_trace = {scores, ids, p.iq, pooled};
                 return ids;
@@ -879,7 +881,8 @@ class QsaCore {
                     ::tyloi::Tensor pooled_owner;
                     auto pooled = pool_range(0,length / c_.pool,pooled_owner).reshape({1,length / c_.pool,c_.index_width});
                     auto scores = mfq_qwen4_exp::block_scores(p.iq, pooled);
-                    ids = select_pooled_blocks(scores, offset, length, c_.pool, c_.budget, true);
+                    ids = tyloi::cuda::ops::select_pooled_blocks(
+                        scores, offset, length, c_.pool, c_.budget, true);
                     if (trace) *trace = {scores,ids,p.iq,pooled};
                 }
                 auto attended = attend(request,p.query, key, value, ids, offset);

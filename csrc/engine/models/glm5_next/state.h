@@ -1,6 +1,6 @@
 #pragma once
 
-#include "engine/models/common/attention_ops.h"
+#include "engine/backends/cuda/native/tensor/backend.h"
 #include "engine/state/sequence.h"
 #include "engine/models/state.h"
 #include "engine/models/session/snapshot.h"

@@ -8,16 +8,15 @@
 #include "engine/models/source/model.h"
 #include "engine/backends/cuda/ops/projection/quant_linear.h"
 #include "engine/models/common/attention_ops.h"
+#include "engine/backends/cuda/ops/attention/attention.h"
 #include "engine/backends/cuda/ops/glm5_next.h"
 #include <array>
+#include <cmath>
 
 namespace tyloi::cuda::glm5_next {
-using attention_ops::DenseTensor;
-using attention_ops::Linear;
-using attention_ops::Embedding;
 using attention_ops::rms_norm;
-using attention_ops::select_pooled_blocks;
 
+using Linear = ::tyloi::Tensor;
 using Parameter = ::tyloi::Tensor;
 
 struct KdaWeights {
@@ -250,8 +249,8 @@ class SparseMla {
                                                    ::tyloi::ops::project(hidden, w_.index_score).dense());
             },
             [&](DenseTensor scores) {
-                return select_pooled_blocks(scores, offset, offset + t, c_.pool, c_.budget,
-                                            c_.tail);
+                return ::tyloi::cuda::ops::select_pooled_blocks(
+                    scores, offset, offset + t, c_.pool, c_.budget, c_.tail);
             },
             [&](const DenseTensor &query, const Projection &p, DenseTensor selected) {
                 return mfq_glm5_next::sparse_mla_attention(query, p.latent, selected, scale);

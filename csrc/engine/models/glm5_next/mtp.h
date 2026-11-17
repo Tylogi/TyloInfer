@@ -8,7 +8,6 @@
 namespace tyloi::weights { struct Loader; }
 
 namespace tyloi::cuda::glm5_next {
-using attention_ops::Linear;
 class SparseMla;
 
 struct PredictorState final : tyloi::models::MtpState {
