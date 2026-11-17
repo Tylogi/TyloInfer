@@ -10,7 +10,7 @@ namespace tyloi::weights { struct Loader; }
 namespace tyloi::models { struct LoadOptions; }
 namespace tyloi::cuda::deepseek_v4 {
 /** Load a layer's routed FFN into an owner that retains partially loaded weights. */
-void load_ffn(tyloi::cuda::Ffn&, const tyloi::weights::Loader&, const Config&, int, bool);
+void load_ffn(tyloi::ops::FfnWeights&, const tyloi::weights::Loader&, const Config&, int, bool);
 /** Assemble a supported DeepSeek V4 causal model using the active execution scope. */
 void load(std::unique_ptr<tyloi::models::CausalModel>& owner,
     std::shared_ptr<const tyloi::ModelSource> source, std::string_view definition,

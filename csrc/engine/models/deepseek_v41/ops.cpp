@@ -8,7 +8,7 @@
 
 namespace tyloi::cuda::deepseek_v41_runtime {
 
-tyloi::cuda::Ffn load_moe_at(const tyloi::weights::Loader& weights,
+tyloi::ops::FfnWeights load_moe_at(const tyloi::weights::Loader& weights,
                 const CommonConfig &config, const std::string &prefix, std::int64_t layer,
                 std::int64_t top_k) {
     auto result = load_moe_weights(weights, prefix,

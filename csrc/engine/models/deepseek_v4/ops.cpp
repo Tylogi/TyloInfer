@@ -129,7 +129,7 @@ void load_layer(Layer& layer, const tyloi::weights::Loader& weights, const Confi
     }
 }
 
-void load_ffn(Ffn& ffn, const tyloi::weights::Loader& weights, const Config& c,
+void load_ffn(tyloi::ops::FfnWeights& ffn, const tyloi::weights::Loader& weights, const Config& c,
               int i, bool cpu_offload) {
     const std::string p = "model.block." + std::to_string(i) + ".";
     ffn = load_moe_weights(
@@ -1462,8 +1462,8 @@ DenseTensor forward_layer(const Layer& w, LayerState& state, Executor& executor,
                                  .to(::tyloi::kFloat32), ffn_norm, eps)
             .reshape({batch, tokens, hidden_size}).to(::tyloi::kFloat16);
     });
-    auto feed_forward = ffn.forward(
-        normalized.reshape({batch * tokens, hidden_size}), current_ids);
+    auto feed_forward = tyloi::ops::ffn(ffn,
+        normalized.reshape({batch * tokens, hidden_size}), current_ids).dense();
     feed_forward = feed_forward.reshape({batch, tokens, hidden_size});
     return profiler.measure("dsv4.hc_ffn_post", [&]() {
         return hc_post(w, feed_forward, x, ffn_mix.at(1), ffn_mix.at(2), "ffn_post");

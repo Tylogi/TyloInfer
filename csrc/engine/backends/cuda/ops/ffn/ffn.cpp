@@ -1,5 +1,5 @@
-#include "ffn.h"
 #include "engine/ops/ffn.h"
+#include "engine/backends/cuda/ops/ffn/options.h"
 #include "engine/backends/cuda/executor/executor.h"
 #include "engine/backends/cuda/executor/graph/window.h"
 #include "engine/backends/cuda/executor/options.h"
@@ -43,8 +43,7 @@ std::shared_ptr<const ::tyloi::MfeTensor> mfe_runtime(const ::tyloi::Tensor& wei
     return std::dynamic_pointer_cast<const ::tyloi::MfeTensor>(weight.implementation());
 }
 
-template<class Weights>
-bool uses_expert_cache(const Weights& f) {
+bool uses_expert_cache(const tyloi::ops::FfnWeights& f) {
     if (!f.is_moe) return false;
     if (f.moe_split_gate_up)
         return weights::cached(f.moe_gate) || weights::cached(f.moe_up) ||
@@ -52,8 +51,7 @@ bool uses_expert_cache(const Weights& f) {
     return weights::cached(f.moe_gate_up) || weights::cached(f.moe_down);
 }
 
-template<class Weights>
-Mlp dense(const Weights& f, const Projector& project) {
+Mlp dense(const tyloi::ops::FfnWeights& f, const Projector& project) {
     TYLOINFER_RUNTIME_CHECK(f.down, "FFN down projection is missing");
     return {project.group(f.gate_up), f.down, f.activation, f.geglu, f.swiglu_limit};
 }
@@ -81,10 +79,7 @@ DenseTensor local(const Mlp& mlp, DenseTensor x, Executor& executor, const Proje
     return mlp.forward(project, executor.profiler(), mlp_options, x);
 }
 
-} // namespace
-
-template<class Weights>
-DenseTensor ffn_forward_experts(const Weights& f, DenseTensor x, Executor& executor, const FfnMode& mode_,
+DenseTensor ffn_forward_experts(const tyloi::ops::FfnWeights& f, DenseTensor x, Executor& executor, const FfnMode& mode_,
                             const Projector& project_, const MoeRoutePlan& route,
                             DenseTensor route_weights) {
 #if TYLOINFER_ENABLE_MFQ_COMPAT
@@ -167,8 +162,7 @@ DenseTensor ffn_forward_experts(const Weights& f, DenseTensor x, Executor& execu
 #endif
 }
 
-template<class Weights>
-DenseTensor ffn_forward_impl(const Weights& f, DenseTensor x, Executor& executor, const FfnMode& mode_,
+DenseTensor ffn_forward_impl(const tyloi::ops::FfnWeights& f, DenseTensor x, Executor& executor, const FfnMode& mode_,
                          const Projector& project_, std::optional<DenseTensor> input_ids,
                          bool allow_important_neurons,
                          std::optional<DenseTensor> router_bias) {
@@ -717,8 +711,7 @@ DenseTensor ffn_forward_impl(const Weights& f, DenseTensor x, Executor& executor
     return local(*mlp, xh, executor, project_);
 }
 
-template<class Weights>
-DenseTensor ffn_run(const Weights& f, DenseTensor x, Executor& executor, const FfnMode& mode,
+DenseTensor ffn_run(const tyloi::ops::FfnWeights& f, DenseTensor x, Executor& executor, const FfnMode& mode,
                     std::optional<DenseTensor> input_ids, std::optional<DenseTensor> router_bias) {
     if (router_bias.has_value()) {
         const auto& bias = router_bias.value();
@@ -731,12 +724,7 @@ DenseTensor ffn_run(const Weights& f, DenseTensor x, Executor& executor, const F
     return ffn_forward_impl(f, std::move(x), executor, mode, project, std::move(input_ids),
                             true, std::move(router_bias));
 }
-DenseTensor Ffn::forward(DenseTensor x, std::optional<DenseTensor> input_ids,
-                    std::optional<DenseTensor> router_bias) const {
-    auto& executor = Executor::current();
-    const auto& mode = Executor::current_ffn();
-    return ffn_run(*this, std::move(x), executor, mode, std::move(input_ids), std::move(router_bias));
-}
+} // namespace
 
 } // namespace tyloi::cuda
 

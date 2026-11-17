@@ -6,7 +6,7 @@
 #include "engine/ops/ops.h"
 #include "engine/backends/cuda/ops/ffn/tq/banks.h"
 #include "engine/models/common/load.h"
-#include "engine/backends/cuda/ops/ffn/ffn.h"
+#include "engine/ops/ffn.h"
 #include "engine/backends/cuda/ops/norm/rms.h"
 #include "engine/weights/loader.h"
 #include "weights.h"
@@ -293,7 +293,7 @@ static DenseTensor moe_forward(const Moe& weights, DenseTensor x) {
         return tyloi::ops::reshape(normalized, {B, T, H}).dense();
     });
     auto mixed = measure("moe.ffn", [&] {
-        return ffn.forward(xn.reshape({B * T, H})).reshape({B, T, H});
+        return tyloi::ops::ffn(ffn, xn.reshape({B * T, H})).dense().reshape({B, T, H});
     });
     xn = {};
     auto rr = x.reshape({-1, H});
@@ -486,10 +486,6 @@ DenseTensor forward_layer(const Layer& layer, LayerState& state, DenseTensor inp
 }
 
 
-struct LayerLoader : TransformerWeightLoader {
-    using Ffn = tyloi::cuda::Ffn;
-};
-
 template <class MambaWeights> void convert_mamba_weights(MambaWeights& block) {
     block.conv_weight = std::make_shared<DenseTensor>(block.conv_weight.dense().to(::tyloi::kFloat32).contiguous());
     block.a_log = std::make_shared<DenseTensor>(block.a_log.dense().to(::tyloi::kFloat32).contiguous());
@@ -522,7 +518,7 @@ Layer load_layer(const ::tyloi::weights::Loader& weights,
     MfqCudaGuard guard(weights.placement.target.index);
     Layer result;
     result.device = weights.placement.target.index;
-    LayerLoader loader{{weights}};
+    TransformerWeightLoader loader{weights};
     switch (Config::mixer_kind(type)) {
         case tyloi::models::nemotron_h::MixerKind::linear_attention: {
             auto& mamba = result.weights.emplace<Mamba>();

@@ -1,7 +1,7 @@
 #pragma once
 #include "engine/backends/cuda/ops/norm/launch.h"
 #include "engine/backends/cuda/ops/norm/rms.h"
-#include "engine/backends/cuda/ops/ffn/ffn.h"
+#include "engine/ops/ffn.h"
 #include "engine/ops/ops.h"
 #include "engine/state/media.h"
 #include "engine/models/deepseek_v41/causal_lm.h"
@@ -376,7 +376,7 @@ struct Block final {
     ::tyloi::Tensor index_query;
     ::tyloi::Tensor index_key;
     ::tyloi::Tensor index_score;
-    tyloi::cuda::Ffn mlp;
+    tyloi::ops::FfnWeights mlp;
     Parameter vision_router_bias;
     ::tyloi::ops::TailRopeTable rope;
     std::unique_ptr<Engram> engram;
@@ -898,12 +898,12 @@ struct Block final {
                 TYLOINFER_RUNTIME_CHECK(vision_router_bias && vision_router_bias.defined(),"DeepSeek-V4.1 visual router bias is missing");
                 TYLOINFER_RUNTIME_CHECK(mlp.moe_router_bias, "DeepSeek-V4.1 router bias is missing");
                 auto bias=::tyloi::cuda::where(shared.routing_mask,vision_router_bias.dense(),mlp.moe_router_bias.dense()).contiguous();
-                return mlp.forward(
-                    value.reshape({-1,config.hidden}), layer_state.current_ids, bias)
+                return tyloi::ops::ffn(mlp,
+                    value.reshape({-1,config.hidden}), layer_state.current_ids, bias).dense()
                     .reshape({batch,tokens,config.hidden});
             }
-            return mlp.forward(
-                    value.reshape({-1, config.hidden}), layer_state.current_ids)
+            return tyloi::ops::ffn(mlp,
+                    value.reshape({-1, config.hidden}), layer_state.current_ids).dense()
                 .reshape({batch, tokens, config.hidden});
         });
         hidden = expand(output, hidden, ffn_mix, "deepseek_v41.mhc.mlp.expand");
@@ -912,7 +912,7 @@ struct Block final {
     }
 };
 
-tyloi::cuda::Ffn load_moe_at(const tyloi::weights::Loader& weights,
+tyloi::ops::FfnWeights load_moe_at(const tyloi::weights::Loader& weights,
                 const CommonConfig &config, const std::string &prefix, std::int64_t layer,
                 std::int64_t top_k);
 

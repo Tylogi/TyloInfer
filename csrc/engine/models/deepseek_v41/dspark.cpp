@@ -6,7 +6,7 @@
 
 #include "engine/models/common/mtp.h"
 #include "engine/ops/ops.h"
-#include "engine/backends/cuda/ops/ffn/ffn.h"
+#include "engine/ops/ffn.h"
 #include "engine/ops/mhc.h"
 #include "ops.h"
 
@@ -69,7 +69,7 @@ struct Stage {
     tyloi::Tensor attention_mhc_function, attention_mhc_scale, attention_mhc_base;
     tyloi::Tensor mlp_mhc_function, mlp_mhc_scale, mlp_mhc_base;
     tyloi::ops::TailRopeTable rope;
-    tyloi::cuda::Ffn mlp;
+    tyloi::ops::FfnWeights mlp;
 };
 
 struct DeepseekV41Dspark final : tyloi::models::Mtp {
@@ -618,8 +618,8 @@ struct DeepseekV41Dspark final : tyloi::models::Mtp {
                         stage.mlp_mhc_scale, stage.mlp_mhc_base, stage.mlp_norm, mhc);
                 });
                 const auto rows = mlp_mix.branch.size(1);
-                auto mlp = stage.mlp.forward(mlp_mix.branch.dense().reshape({-1, config.hidden}),
-                    draft_ids.narrow(1, 0, rows)).reshape({state.batch, rows, config.hidden});
+                auto mlp = tyloi::ops::ffn(stage.mlp, mlp_mix.branch.dense().reshape({-1, config.hidden}),
+                    draft_ids.narrow(1, 0, rows)).dense().reshape({state.batch, rows, config.hidden});
                 auto result = tyloi::ops::measure("deepseek_v41.dspark.mhc.mlp.expand", [&] {
                     return tyloi::ops::mhc_expand(mlp, after_attention.narrow(1, 0, rows), mlp_mix).dense();
                 });

@@ -81,7 +81,7 @@ void load_moe(Block& block, Loader& ops, const Config& config, int layer,
     block.rms_norm_eps = config.rms_norm_eps;
     block.ffn_norm = ops.weights.tensor(layer_prefix + "attention.norm.weight");
     auto& ffn = block.ffn;
-    ffn = models::load_moe_weights<typename Loader::Ffn>(ops, mlp, layer, true, true, true);
+    ffn = models::load_moe_weights(ops, mlp, layer, true, true, true);
     ffn.moe_top_k = static_cast<int>(config.num_experts_per_tok);
     ffn.moe_use_sigmoid = true;
     ffn.moe_use_sqrt_softplus = false;

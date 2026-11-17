@@ -1,7 +1,7 @@
 #pragma once
 
 #include "engine/models/source/model_graph.h"
-#include "engine/backends/cuda/ops/ffn/ffn.h"
+#include "engine/ops/ffn.h"
 #include "engine/backends/cuda/ops/projection/quant_linear.h"
 #include "engine/ops/ops.h"
 #include "engine/models/metadata.h"
@@ -40,7 +40,7 @@ struct Layer {
     Compressor compressor, indexer_compressor;
     ::tyloi::Tensor indexer_q;
     ::tyloi::Tensor indexer_weight;
-    Ffn ffn;
+    tyloi::ops::FfnWeights ffn;
     tyloi::ops::TailRopeTable attention_rope;
 };
 

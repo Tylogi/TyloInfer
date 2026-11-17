@@ -1,6 +1,6 @@
 #pragma once
 
-#include "engine/backends/cuda/ops/ffn/ffn.h"
+#include "engine/ops/ffn.h"
 #include "engine/models/common/attention.h"
 #include "engine/backends/cuda/ops/projection/quant_linear.h"
 #include "engine/models/nemotron_h/config.h"
@@ -36,7 +36,7 @@ struct Moe {
     int layer = -1;
     double rms_norm_eps = 1e-6;
     ::tyloi::Tensor ffn_norm;
-    Ffn ffn;
+    ::tyloi::ops::FfnWeights ffn;
 };
 
 struct Layer {
