@@ -67,31 +67,6 @@ std::shared_ptr<const tyloi::MfeTensor> to_gpu_mfe(const tyloi::mfe::Data & cpu)
         : ::tyloi::DenseTensor();
 }
 
-static int64_t tensor_storage_bytes(const ::tyloi::DenseTensor & value) {
-    return value.defined()
-        ? value.numel() * (int64_t)value.element_size()
-        : 0;
-}
-
-// Physical bytes of every backing an expert runtime keeps alive. Aliased
-// buffers are counted once, the same rule the projection weights use.
-int64_t mixed_moe_storage_bytes(const ::tyloi::MfeTensor & runtime) {
-    std::vector<const ::tyloi::DenseTensor*> buffers;
-    if (runtime.nint_dispatch) {
-        const auto& d = *runtime.nint_dispatch;
-        buffers.insert(buffers.end(), {&d.map_ptrs, &d.pool_params,
-            &d.initial_expert_pool, &d.initial_expert_local});
-    }
-    if (runtime.nvq_dispatch) {
-        const auto& d = *runtime.nvq_dispatch;
-        buffers.insert(buffers.end(), {&d.weight_ptrs, &d.weight_sizes, &d.pool_params,
-            &d.initial_expert_pool, &d.initial_expert_local});
-    }
-    for (const auto & pool : runtime.pools)
-        pool.visit_tensors([&](const ::tyloi::DenseTensor& tensor) { buffers.push_back(&tensor); });
-    return static_cast<int64_t>(::tyloi::backing_bytes(buffers));
-}
-
 std::shared_ptr<::tyloi::MfeTensor> make_mfe(
         const tyloi::mfe::Data & cpu,
         bool cuda,

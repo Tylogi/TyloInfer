@@ -26,7 +26,6 @@ std::shared_ptr<::tyloi::MfeTensor> make_mfe(
     const tyloi::mfe::Data& source,
     bool cuda,
     const MoeLoadOptions& options = {});
-int64_t mixed_moe_storage_bytes(const ::tyloi::MfeTensor& runtime);
 ::tyloi::DenseTensor copy_cpu_weight_to_cuda(
     const ::tyloi::DenseTensor& source);
 std::shared_ptr<const tyloi::MfeTensor> to_gpu_mixed_moe(

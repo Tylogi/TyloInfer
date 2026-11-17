@@ -8,7 +8,6 @@
 
 #if TYLOINFER_ENABLE_MFQ_COMPAT
 #include "residency/cached_source_internal.h"
-#include "engine/weights/moe/prepare/load.h"
 #include "engine/backends/cuda/ops/ffn/experts/moe.h"
 #endif
 
@@ -503,27 +502,6 @@ bool supports_clamped_swiglu(const MfeTensor& weight) {
         (weight.cached_source && weight.cached_source->supports_clamped_swiglu());
 #else
     return weight.compact && !weight.compact->empty();
-#endif
-}
-
-double logical_bytes(const MfeTensor& weight) {
-#if TYLOINFER_ENABLE_MFQ_COMPAT
-    double bytes = 0;
-    for (const auto& shard : weight.shards)
-        if (shard.weight) bytes += logical_bytes(*shard.weight);
-    if (weight.compact) for (const auto& pool : *weight.compact) {
-        const auto& w = pool.weight;
-        for (const auto* value : {&w.q_packed, &w.row_q_bits, &w.row_q_bit_offsets,
-                                  &w.sub_scale, &w.sub_min, &w.neuron_scale, &w.neuron_min})
-            if (value->defined()) bytes += double(value->nbytes());
-    }
-    if (!weight.pools.empty() || weight.cached_source)
-        bytes += double(weight.cached_source ? weight.cached_source->logical_weight_bytes()
-                                             : mixed_moe_storage_bytes(weight));
-    return bytes;
-#else
-    (void)weight;
-    throw std::runtime_error("Legacy MFQ inference requires a compatibility build");
 #endif
 }
 

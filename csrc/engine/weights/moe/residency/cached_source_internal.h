@@ -270,14 +270,8 @@ public:
     }
 
     int64_t host_bytes() const {
-        return mixed_moe_storage_bytes(*cpu_)+(quant_source_ ? quant_source_->store().index_nbytes() : 0);
-    }
-
-    int64_t logical_weight_bytes() const {
-        if (quant_source_) return static_cast<int64_t>(quant_source_->store().payload_nbytes());
-        if (!range_store_) return host_bytes();
-        return range_store_->record().nbytes > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())
-            ? std::numeric_limits<int64_t>::max() : static_cast<int64_t>(range_store_->record().nbytes);
+        return static_cast<int64_t>(cpu_->backing_nbytes()) +
+            (quant_source_ ? quant_source_->store().index_nbytes() : 0);
     }
 
     void finalize() {
