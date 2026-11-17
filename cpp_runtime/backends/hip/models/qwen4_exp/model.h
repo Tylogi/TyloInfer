@@ -694,6 +694,7 @@ struct QsaWeights {
     Tensor query_norm, key_norm, index_query_norm, index_key_norm;
     LinearGroup input_projection;
     Linear gate;
+    Tensor index_pre_key_norm;
 };
 struct QsaConfig {
     int64_t heads, kv_heads, width, index_heads, index_width, pool, budget, maximum;
@@ -987,6 +988,11 @@ class Qsa {
     Tensor encode_key(const Tensor& x) const {return quantization_.enabled()?cuda_kv_encode(x,quantization_.key_bits(),false):x.to(tb::kFloat16);}
     Tensor encode_value(const Tensor& x) const {return quantization_.enabled()?cuda_kv_encode(x,quantization_.value_bits(),true):x.to(tb::kFloat16);}
     struct Projection {Tensor gate,query,key,value,iq,raw;bool cache_written=false;};
+    Tensor normalize_index_key(const Tensor& value) {
+        if(!w_.index_pre_key_norm.defined())return value;
+        return grouped_rms_norm_cuda(value.contiguous(),w_.index_pre_key_norm,
+            value.size(-1),c_.eps,0.0);
+    }
     Tensor project_norm(const Tensor& value,const Tensor& weight) {
         if(value.scalar_type()==tb::kFloat16 || value.scalar_type()==tb::kFloat32)
             return grouped_rms_norm_cuda(value.contiguous(),weight.to(tb::kFloat32).contiguous(),value.size(-1),c_.eps,1.0);
@@ -1036,7 +1042,7 @@ class Qsa {
                 iq=rotary_->forward(iq,positions).permute({0,2,1,3});
             }
         }
-        return {gate,query,key,value,iq,iqk.narrow(-1,c_.index_heads*c_.index_width,c_.index_width),cache_written};
+        return {gate,query,key,value,iq,normalize_index_key(iqk.narrow(-1,c_.index_heads*c_.index_width,c_.index_width)),cache_written};
     }
     QsaWeights w_;
     QsaConfig c_;

@@ -1,5 +1,5 @@
 #pragma once
-#include "../ops/gguf/gguf_speculative_journal.h"
+#include "../runtime/routed_expert_journal.h"
 #include <array>
 #include <cstring>
 #include <iostream>
@@ -58,7 +58,7 @@ inline void resolve_reference(State& state,const Rows& rows) {
         state.touch(expert);
     }
 }
-inline void resolve_compact(State& state,const std::vector<GgufSpeculativeTouch>& touches) {
+inline void resolve_compact(State& state,const std::vector<RoutedExpertTouch>& touches) {
     for(auto it=touches.rbegin();it!=touches.rend();++it) {
         for(std::uint64_t i=0;i<it->uses;++i)state.heat_one(it->expert);
         if(it->missed)state.scores[it->expert]+=it->uses;else state.scores.erase(it->expert);
@@ -66,8 +66,8 @@ inline void resolve_compact(State& state,const std::vector<GgufSpeculativeTouch>
     }
 }
 inline void check_ordinary() {
-    GgufSpeculativeJournal journal;std::size_t cases=0;
-    std::vector<GgufSpeculativeTouch> touches,other_window;
+    RoutedExpertJournal journal;std::size_t cases=0;
+    std::vector<RoutedExpertTouch> touches,other_window;
     for(int experts:{1,17,257,1024,7}) {
         State expected(experts),actual(experts);
         for(int rows:{0,1,2,3,4,8,32})for(int routes:{1,5,10})for(int diversity:{0,3,53}) {
@@ -102,11 +102,11 @@ inline void check_ordinary() {
 }
 inline void check() {
     check_ordinary();
-    GgufSpeculativeJournal journal;
+    RoutedExpertJournal journal;
     std::size_t cases=0;
     for(int experts:{1,17,257,1024,7}) {
         State expected(experts),actual(experts);
-        std::vector<GgufSpeculativeTouch> touches;
+        std::vector<RoutedExpertTouch> touches;
         for(int rows:{0,1,2,3,4,8,32})for(int routes:{1,5,10})for(int diversity:{0,3,53})
         for(int kept:{0,1,rows})for(bool cancelled:{false,true}) {
             std::vector<std::int64_t> ids(std::size_t(rows)*routes);

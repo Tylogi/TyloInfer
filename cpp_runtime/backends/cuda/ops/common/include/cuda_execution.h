@@ -4,6 +4,7 @@ namespace mfq::cuda { class KvOffloadStore; class KvMemoryManager; }
 struct CudaIndependentBranchExecutor;
 
 #include "mfq_tensor_backend.h"
+#include "mfq_cuda_profiler.h"
 #include "tensor_parallel.h"
 #include "tyloinfer/yarn.h"
 #ifdef TYLOINFER_NATIVE_CUDA_RUNTIME
@@ -106,63 +107,6 @@ public:
     }
     CudaImageMaskScope(const CudaImageMaskScope&)=delete;
     CudaImageMaskScope& operator=(const CudaImageMaskScope&)=delete;
-};
-
-struct ProfileStat {
-    double ms = 0.0;
-    double wall_ms = 0.0;
-    int64_t calls = 0;
-};
-
-struct CudaProfiler {
-    struct PendingEvent {
-        std::string name;
-        cudaEvent_t start = nullptr;
-        cudaEvent_t stop = nullptr;
-    };
-
-    bool enabled = false;
-    bool graph_events = false;
-    std::string filter;
-    std::unordered_map<std::string, ProfileStat> stats;
-    std::vector<std::string> order;
-    std::vector<PendingEvent> pending;
-
-    bool selected(const std::string& name) const;
-    void reset();
-
-    template <typename Fn>
-    auto measure(const std::string & name, Fn && fn) -> decltype(fn()) {
-        if (!enabled || !selected(name)) return fn();
-        cudaEvent_t start, stop;
-        cudaEventCreate(&start);
-        cudaEventCreate(&stop);
-        auto stream = mfq_get_current_cuda_stream().stream();
-        if (graph_events) {
-            cudaEventRecordWithFlags(start, stream, cudaEventRecordExternal);
-        } else {
-            cudaEventRecord(start, stream);
-        }
-        auto t0 = std::chrono::steady_clock::now();
-        auto out = fn();
-        if (graph_events) {
-            cudaEventRecordWithFlags(stop, stream, cudaEventRecordExternal);
-        } else {
-            cudaEventRecord(stop, stream);
-        }
-        auto t1 = std::chrono::steady_clock::now();
-        auto it = stats.find(name);
-        if (it == stats.end()) {
-            order.push_back(name);
-            it = stats.emplace(name, ProfileStat{}).first;
-        }
-        it->second.wall_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
-        it->second.calls += 1;
-        pending.push_back(PendingEvent{name, start, stop});
-        return out;
-    }
-
-    void report(const std::string& title);
 };
 
 enum class KlMmqMode {
@@ -361,6 +305,7 @@ struct CudaExecutionContext {
     KlMmqState kl_mmq;
     std::unordered_set<int> dsv4_cpu_offload_layers;
     int64_t dsv4_cpu_offload_host_bytes = 0;
+    std::optional<bool> jev_full_vram;
     int n_gpu_layers = -1;
     int dense_cpu_layer_count = 0;
     bool loading_cpu_layer = false;
@@ -481,7 +426,13 @@ struct CudaIndependentBranchExecutor {
     std::vector<cudaEvent_t> completed;
     std::vector<std::shared_ptr<void>> graph_pools;
 
+    CudaIndependentBranchExecutor()=default;
+    CudaIndependentBranchExecutor(const CudaIndependentBranchExecutor&)=delete;
+    CudaIndependentBranchExecutor& operator=(const CudaIndependentBranchExecutor&)=delete;
     ~CudaIndependentBranchExecutor() {
+        int previous=0;
+        const bool restore=device>=0 && cudaGetDevice(&previous)==cudaSuccess && previous!=device;
+        if(restore)(void)cudaSetDevice(device);
         for (cudaEvent_t event : completed) {
             if (event != nullptr) {
                 (void)cudaEventDestroy(event);
@@ -490,6 +441,8 @@ struct CudaIndependentBranchExecutor {
         if (ready != nullptr) {
             (void)cudaEventDestroy(ready);
         }
+        graph_pools.clear();streams.clear();
+        if(restore)(void)cudaSetDevice(previous);
     }
 
     bool ensure(size_t branches, const Stream & parent) {
@@ -500,6 +453,7 @@ struct CudaIndependentBranchExecutor {
         if (streams.size() >= branches) {
             return true;
         }
+        const MfqCudaGuard device_guard(parent_device);
         cudaStreamCaptureStatus capture_status =
             cudaStreamCaptureStatusNone;
         TYLOINFER_CUDA_CHECK(cudaStreamIsCapturing(
@@ -507,18 +461,18 @@ struct CudaIndependentBranchExecutor {
         if (capture_status != cudaStreamCaptureStatusNone) {
             return false;
         }
+        streams.reserve(branches);completed.reserve(branches);graph_pools.reserve(branches);
         device = parent_device;
         if (ready == nullptr) {
             TYLOINFER_CUDA_CHECK(cudaEventCreateWithFlags(
                 &ready, cudaEventDisableTiming));
         }
         while (streams.size() < branches) {
-            streams.push_back(
-                mfq_get_stream_from_pool(false, device));
+            auto stream=mfq_get_stream_from_pool(false, device);
             cudaEvent_t event = nullptr;
             TYLOINFER_CUDA_CHECK(cudaEventCreateWithFlags(
                 &event, cudaEventDisableTiming));
-            completed.push_back(event);
+            streams.push_back(std::move(stream));completed.push_back(event);
             graph_pools.emplace_back();
         }
         return true;
@@ -546,10 +500,13 @@ struct CudaIndependentBranchExecutor {
         outputs.resize(branches);
         TYLOINFER_CUDA_CHECK(cudaEventRecord(
             ready, parent.stream()));
+        size_t submitted=0;
+        try {
         for (size_t index = 0; index < branches; ++index) {
             const Stream branch_stream = streams[index];
             TYLOINFER_CUDA_CHECK(cudaStreamWaitEvent(
                 branch_stream.stream(), ready, 0));
+            ++submitted;
             {
                 MfqCudaStreamGuard guard(
                     branch_stream);
@@ -566,5 +523,12 @@ struct CudaIndependentBranchExecutor {
             }
         }
         return true;
+        } catch(...) {
+            for(size_t index=0;index<submitted;++index) {
+                (void)cudaEventRecord(completed[index],streams[index].stream());
+                (void)cudaStreamWaitEvent(parent.stream(),completed[index],0);
+            }
+            throw;
+        }
     }
 };

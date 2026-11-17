@@ -1,10 +1,14 @@
 #include "models/qwen4_exp/model.h"
 #include "runtime/decode_window.h"
+#include "runtime/gdn_decode_plan.h"
+#include "gdn_test_options.h"
 #include "mfq_cuda_context.h"
 #include "tyloinfer/runtime.h"
 #include "cuda_execution.h"
+#if TYLOINFER_ENABLE_MFQ_COMPAT
 #include "../../../tests/nint_row_fixture.h"
 #include "nint.h"
+#endif
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -17,6 +21,7 @@ using tb::Tensor;
 using namespace mfq::cuda;
 using namespace mfq::cuda::qwen4_exp;
 namespace {
+#if TYLOINFER_ENABLE_MFQ_COMPAT
 void ple_prefix_context_case() {
     auto fixture=std::make_shared<mfq::test::Fixture>(mfq::test::fixture(529,160,28,7,false));
     std::vector<std::shared_ptr<mfq::NintRows>> tables={
@@ -109,26 +114,7 @@ void ple_hash_lifecycle_case() {
     }
     std::cout<<"MFQ PLE hash lifecycle exact PASS cases="<<cases<<" commit/reset/restore/mutation/eager/stateless/batch/long-window\n";
 }
-class GdnTileScope {
-    std::string previous_;
-    bool present_;
-    static void set(const char* value) {
-#ifdef _WIN32
-        if(_putenv_s("TYLOINFER_GDN_DECODE_TILES",value)!=0)throw std::runtime_error("cannot set GDN tile option");
-#else
-        const int result=*value?setenv("TYLOINFER_GDN_DECODE_TILES",value,1):unsetenv("TYLOINFER_GDN_DECODE_TILES");
-        if(result!=0)throw std::runtime_error("cannot set GDN tile option");
 #endif
-    }
-public:
-    explicit GdnTileScope(int tiles):present_(std::getenv("TYLOINFER_GDN_DECODE_TILES")!=nullptr) {
-        if(present_)previous_=std::getenv("TYLOINFER_GDN_DECODE_TILES");
-        set(std::to_string(tiles).c_str());
-    }
-    ~GdnTileScope(){
-        try{set(present_?previous_.c_str():"");}catch(...){}
-    }
-};
 Tensor data(std::vector<int64_t> shape,int salt,float scale=.03f) {
     int64_t n=1;for(auto dim:shape)n*=dim;std::vector<float> values(n);
     for(int64_t i=0;i<n;++i)values[i]=std::sin(float(i)*.173f+salt)*scale;
@@ -277,8 +263,11 @@ void quota_recovery_case() {
 void layer_profile_case() {
     auto input=data({1,1,2560},29);auto output=tb::empty_like(input);
     DecodeWindow window(mfq_current_cuda_stream(),true);
+    int bodies=0;
     window.capture([&] {
-        window.mark(-1,"begin");window.mark(0,"copy_begin");output.copy_(input);window.mark(0,"copy_end");
+        ++bodies;window.mark(-1,"begin");
+        window.mark(0,bodies<=3?"eager_copy_begin":"copy_begin");
+        output.copy_(input);window.mark(0,"copy_end");
     },[]{});
     for(int replay=0;replay<3;++replay) {
         input.copy_(data({1,1,2560},replay+30));window.run();equal(output,input,"profiled replay output",0);
@@ -696,9 +685,14 @@ void gdn_core_case(bool inplace=false,int head_ratio=3) {
                 throw std::runtime_error("GDN inplace state storage was replaced");
             const auto* conv_option=std::getenv("TYLOINFER_GDN_INPLACE_CONV");
             const auto* tile_option=std::getenv("TYLOINFER_GDN_DECODE_TILES");
+            int selected_tiles=tile_option && *tile_option?std::atoi(tile_option):0;
+            if(!selected_tiles) {
+                int processors=0;TYLOINFER_CUDA_CHECK(cudaDeviceGetAttribute(&processors,cudaDevAttrMultiProcessorCount,mfq_current_cuda_device()));
+                selected_tiles=mfq::cuda::gdn_decode_tiles(std::uint64_t(batch)*nv,processors);
+            }
             const bool conv_default=transposed;
             const bool conv_alias=inplace && (conv_option?conv_option[0]!='0':conv_default) && head_ratio<=24 &&
-                (!tile_option || tile_option[0]!='1');
+                selected_tiles>1;
             if((result[1].data_ptr()==input_conv.data_ptr())!=conv_alias)
                 throw std::runtime_error("GDN convolution inplace/fallback storage differs");
             return result;
@@ -1179,6 +1173,10 @@ void qsa_sparse_gate_benchmark(bool compare_query=false) {
 #include "gdn_prefill_pipeline_test.h"
 #include "gdn_core_q8_test.h"
 int main(int argc,char** argv)try {
+    int devices=0;
+    if(cudaGetDeviceCount(&devices)!=cudaSuccess || !devices) {
+        std::cout<<"CUDA device unavailable\n";return 77;
+    }
     auto context=default_context(mfq_current_cuda_device());
     const auto stream=mfq_current_cuda_stream();context->begin_graph_pool(stream);
     if(argc==2 && std::string(argv[1])=="--qk-prepare-check")qk_prepare_case();
@@ -1230,13 +1228,16 @@ int main(int argc,char** argv)try {
             std::cout<<"gdn_broadcast_batch_arm="<<arm<<'\n';gdn_batch_core_benchmark(2);
         }
     }
-    else if(argc==2 && std::string(argv[1])=="--gdn-core-q8-check")gdn_core_q8_case();
+    else if(argc==2 && std::string(argv[1])=="--gdn-core-q8-check") {gdn_core_q8_case();gdn_independent_q8_case();}
+    else if(argc==2 && std::string(argv[1])=="--gdn-independent-q8-check")gdn_independent_q8_case();
     else if(argc==2 && std::string(argv[1])=="--gdn-independent-check") {
-        for(int tiles:{4,2,1}){GdnTileScope setting(tiles);gdn_independent_state_case();}
+        for(int tiles:{0,4,2,1}){GdnTileScope setting(tiles);gdn_independent_state_case();}
     }
     else if(argc==2 && std::string(argv[1])=="--gdn-prefix-checkpoint-check")gdn_prefix_checkpoint_case();
+#if TYLOINFER_ENABLE_MFQ_COMPAT
     else if(argc==2 && std::string(argv[1])=="--ple-prefix-context-check")ple_prefix_context_case();
     else if(argc==2 && std::string(argv[1])=="--ple-hash-lifecycle-check")ple_hash_lifecycle_case();
+#endif
     else if(argc==2 && std::string(argv[1])=="--gdn-short-check")gdn_short_preparation_case();
     else if(argc==2 && std::string(argv[1])=="--gdn-short-path-bench")gdn_short_preparation_benchmark();
     else if(argc==2 && std::string(argv[1])=="--gdn-prefill-check")gdn_prefill_case();
@@ -1269,7 +1270,7 @@ int main(int argc,char** argv)try {
     else if(argc==2 && std::string(argv[1])=="--segmented-sort-check")segmented_sort_graph_case();
     else if(argc==2 && std::string(argv[1])=="--quota-recovery-check")quota_recovery_case();
     else if(argc==1) {
-        qk_prepare_case();layer_profile_case();grouped_norm_case();gated_residual_case();gdn_output_case();gdn_preparation_case();gdn_core_case();gdn_core_q8_case();segmented_sort_graph_case();qsa_sparse_gate_case();qsa_selection_case();qsa_case(8,4,40);qsa_case(256,24,41);qsa_case(256,24,512,2048);qsa_case(256,24,4096,2048);qsa_case(256,24,262144,2048);gdn_case();gdn_case(true);
+        qk_prepare_case();layer_profile_case();grouped_norm_case();gated_residual_case();gdn_output_case();gdn_preparation_case();gdn_core_case();gdn_core_q8_case();gdn_independent_q8_case();segmented_sort_graph_case();qsa_sparse_gate_case();qsa_selection_case();qsa_case(8,4,40);qsa_case(256,24,41);qsa_case(256,24,512,2048);qsa_case(256,24,4096,2048);qsa_case(256,24,262144,2048);gdn_case();gdn_case(true);
     } else throw std::runtime_error("unknown attention test argument");
     TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(stream));std::cout.flush();context->end_graph_pool(stream);
     if(argc==1)std::cout<<"MFQ window QSA/GDN changing-position, rollback and fixed-state checks PASS\n";

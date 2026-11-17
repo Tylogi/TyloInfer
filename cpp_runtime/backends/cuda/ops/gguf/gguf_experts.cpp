@@ -1,15 +1,32 @@
+#include "runtime/routed_host_cache.h"
+#include "runtime/routed_event_retirement.h"
+#include "runtime/routed_resident_views.h"
+#include "storage/routed_host_image.h"
 #include "gguf_weight.h"
 #include "gguf_row_correction.h"
 #include "gguf_rotation.h"
 #include "gguf_cpu_executor.h"
 #include "gguf_decode_dma.h"
-#include "gguf_admission_executor.h"
+#include "runtime/expert_route_usage.h"
+#include "storage/pinned_expert_reuse.h"
+#include "runtime/independent_branch.h"
+#include "runtime/routed_admission_executor.h"
+#include "runtime/routed_moe_schedule.h"
+#include "runtime/routed_completion_order.h"
+#include "tyloinfer/host_copy.h"
+#include "runtime/routed_prefill_pipeline.h"
+#include "runtime/routed_prefill_routes.h"
+#include "runtime/routed_workspace_plan.h"
+#include "runtime/routed_image_layout.h"
+#include "runtime/routed_graph_pools.h"
 #include "gguf_cpu_balance.h"
-#include "gguf_adaptive_slots.h"
+#include "runtime/routed_adaptive_slots.h"
+#include "runtime/routed_allocation_capacity.h"
 #include "gguf_route_trace.h"
 #include "gguf_host_snapshot.h"
-#include "gguf_prefill_stager.h"
-#include "gguf_speculative_journal.h"
+#include "storage/routed_prefill_stager.h"
+#include "runtime/routed_expert_journal.h"
+#include "runtime/routed_expert_groups.h"
 #include "quant_linear.h"
 #include "cuda_execution.h"
 #include "storage/moe_expert_cache.h"
@@ -62,42 +79,19 @@ struct GgufPrefillWeightStage {
 // Fixed slots are replaced within their own layer. A mapped ready word lets
 // that layer consume its new view after its copies, while earlier layers run.
 // General LRU/aliased graph work retains whole-job synchronization.
-struct GgufResidentView {
-    std::array<std::uint64_t,3> sources,permanent{},strides{};
-    std::int64_t experts;
-    int device;
-    std::vector<std::uint64_t> raw;
+struct GgufResidentView:mfq::cuda::RoutedResidentViews<std::uint64_t> {
+    std::array<std::uint64_t,3> permanent{},strides{};
     std::vector<std::uint64_t> pending_ready;
-    std::unique_ptr<mfq::cuda::HostBuffer> host;
-    std::size_t admission_offset;
-    void* mapped=nullptr;
-    bool rebuild=false;
     GgufResidentView(const std::array<std::shared_ptr<GgufRoutedWeight>,3>& banks,int ordinal)
-        :sources{banks[0]->source_id,banks[1]->source_id,banks[2]->source_id},experts(banks[0]->experts),device(ordinal),raw(3*std::size_t(experts),0),
-         host(std::make_unique<mfq::cuda::HostBuffer>(((3*std::size_t(experts)*sizeof(std::uint64_t)+63)&~std::size_t(63))+64,true)),
-         admission_offset(host->size()-64) {
-        TYLOINFER_CUDA_CHECK(cudaHostGetDevicePointer(&mapped,host->data(),0));
-        std::memset(host->data(),0,host->size());
-        mfq::cuda::publish_mapped_flag(admission_host());
+        :RoutedResidentViews({banks[0]->source_id,banks[1]->source_id,banks[2]->source_id},banks[0]->experts,ordinal) {
         for(int role=0;role<3;++role)if(banks[role]->resident_packed.defined()) {
             if(banks[role]->resident_packed.get_device()!=device)throw std::invalid_argument("GGUF resident view device mismatch");
             permanent[role]=reinterpret_cast<std::uintptr_t>(banks[role]->resident_packed.data_ptr());
             strides[role]=banks[role]->expert_bytes;
         }
-        mfq::cuda::charge_tensor_host_bytes(host->size()+raw.size()*sizeof(std::uint64_t));
-    }
-    ~GgufResidentView(){mfq::cuda::tensor_host_bytes.fetch_sub(host->size()+raw.size()*sizeof(std::uint64_t));}
-    std::uint64_t* pointers(int role){return static_cast<std::uint64_t*>(host->data())+role*experts;}
-    std::uint32_t* admission_host() const {
-        return reinterpret_cast<std::uint32_t*>(static_cast<std::uint8_t*>(host->data())+admission_offset);
-    }
-    std::uint32_t* admission_device() const {
-        return reinterpret_cast<std::uint32_t*>(static_cast<std::uint8_t*>(mapped)+admission_offset);
     }
     void update(int role,std::int64_t expert,std::uint64_t address) {
-        raw[role*experts+expert]=address;
-        const bool complete=raw[expert] && raw[experts+expert] && raw[2*experts+expert];
-        for(int bank=0;bank<3;++bank)pointers(bank)[expert]=complete?raw[bank*experts+expert]:0;
+        RoutedResidentViews::update(role,expert,address,address!=0);
     }
 };
 
@@ -147,14 +141,7 @@ struct GgufDirectWorkspaceImages {
     void copied(std::size_t selected,int role) {slots[selected_slots.at(selected)].roles|=1u<<role;}
 };
 
-struct GgufLayerAdmission {
-    int device;
-    tb::Tensor ready_word;
-    std::shared_ptr<mfq::cuda::Event> submitted_done;
-    bool cancelled=false;
-    std::exception_ptr error;
-    std::vector<std::shared_ptr<GgufResidentView>> views;
-};
+using GgufLayerAdmission=mfq::cuda::RoutedLayerAdmission<GgufResidentView,mfq::cuda::Event,tb::Tensor>;
 
 // Windows on one consumer stream execute serially. Keep their transfer images
 // in one high-water arena; an older, smaller allocation remains owned by any
@@ -167,30 +154,9 @@ struct GgufDirectArena {
 
 // Cache the original GGUF blocks. Formats share capacity and eviction policy;
 // only the projection kernel interprets their encoding.
-class GgufExpertCache {
-    struct HostImage {
-        std::shared_ptr<MoePinnedExpertArena::Block> block;
-        std::size_t block_offset=0;
-        tb::Tensor fallback;
-        std::shared_ptr<GgufHostSnapshot> snapshot;
-        std::size_t snapshot_offset=0;
-        std::size_t bytes;
-        std::shared_ptr<mfq::cuda::Event> ready;
-        cudaStream_t producer = nullptr;
-        bool ready_on_host=false;
-        void* data() const { return snapshot ? snapshot->data(snapshot_offset) :
-            block ? static_cast<void*>(block->data()+block_offset) : fallback.data_ptr(); }
-        bool pinned() const { return block || (snapshot && snapshot->registration(snapshot_offset,bytes)); }
-        const void* registration_id() const { return block ? block->allocation_id() :
-            snapshot ? snapshot->registration(snapshot_offset,bytes) : nullptr; }
-        std::uint8_t* mapped_data(int device) const { return block ? block->mapped_data()+block_offset :
-            snapshot->mapped_data(snapshot_offset,bytes,device); }
-    };
-    struct HostEntry {
-        std::shared_ptr<HostImage> image;
-        std::list<std::uint64_t>::iterator recent;
-        std::optional<std::list<std::uint64_t>::iterator> duplicate;
-    };
+using GgufHostImage=mfq::cuda::RoutedHostImage<GgufHostSnapshot>;
+class GgufExpertCache:private mfq::cuda::RoutedHostCache<GgufHostImage> {
+    using HostImage=mfq::cuda::RoutedHostImage<GgufHostSnapshot>;
     struct Key {
         std::uint64_t image;
         int device;
@@ -214,7 +180,9 @@ class GgufExpertCache {
         std::shared_ptr<HostImage> image;
         std::shared_ptr<mfq::cuda::Event> ready;
         tb::Tensor device_image;
+        mfq::cuda::RoutedCompletionPosition position;
     };
+    mfq::cuda::RoutedCompletionClock transfer_clock_;
     struct PendingUpload { Key key; GgufWeight weight; std::shared_ptr<HostImage> source; bool retain; };
     struct UploadBatch { std::vector<PendingUpload> images; };
     enum class UploadPurpose {Streamed,CacheAdmission};
@@ -238,7 +206,7 @@ class GgufExpertCache {
     std::size_t upload_cursor_ = 0;
     int upload_blocks_=0,upload_threads_=0;
     std::mutex mutex_;
-    std::size_t host_limit_, host_used_ = 0, host_reserved_ = 0, host_pageable_ = 0, physical_limit_;
+    std::size_t host_limit_, host_reserved_ = 0, host_pageable_ = 0, physical_limit_;
     std::size_t pinned_ceiling_ = SIZE_MAX;
     std::size_t pin_fragment_probe_bytes_=SIZE_MAX;
     std::uint64_t pin_fragment_retries_=0,pin_fragment_reuses_=0;
@@ -253,7 +221,7 @@ class GgufExpertCache {
     std::uint64_t transfer_reap_images_=0,transfer_reap_queries_=0;
     std::uint64_t prefill_phased_groups_=0;
     std::size_t ordinary_host_limit_=0;
-    std::unique_ptr<GgufPrefillStager> prefill_host_stager_;
+    std::unique_ptr<RoutedPrefillStager> prefill_host_stager_;
     std::unordered_map<std::uint64_t,int> staged_host_jobs_;
     std::uint64_t prefill_host_staged_bytes_=0;
     double prefill_host_staging_wait_ms_=0;
@@ -263,11 +231,7 @@ class GgufExpertCache {
     std::unordered_map<std::uint64_t,std::shared_ptr<GgufRoutedWeight>> reclaim_banks_;
     std::uint64_t host_evacuated_bytes_=0,host_evacuated_images_=0;
     bool host_evacuation_blocked_=false;
-    struct BlockHostEvacuation {
-        bool& flag;bool previous;
-        explicit BlockHostEvacuation(bool& value):flag(value),previous(std::exchange(value,true)){}
-        ~BlockHostEvacuation(){flag=previous;}
-    };
+    using BlockHostEvacuation=mfq::cuda::RoutedHostEvacuationBlock;
     std::uint64_t sources_ = 0;
     std::size_t payload_bytes_ = 0, predictor_resident_bytes_ = 0;
     std::uint64_t calls_ = 0, gpu_hits_ = 0, host_hits_ = 0, source_bytes_ = 0,
@@ -281,16 +245,12 @@ class GgufExpertCache {
         prefill_direct_mmq_bytes_=0,prefill_dma_bytes_=0,prefill_dma_copies_=0,prefill_dma_images_=0,prefill_staging_images_=0,prefill_staging_bytes_=0;
     double fetch_ms_ = 0, upload_enqueue_ms_ = 0, writeback_enqueue_ms_ = 0, allocation_ms_ = 0,
         batch_copy_ms_ = 0, batch_wait_ms_ = 0;
-    struct GraphPool { MfqCudaStream stream; std::shared_ptr<mfq::cuda::Context> context; };
-    std::map<cudaStream_t, GraphPool> graph_pools_;
+    mfq::cuda::RoutedGraphPools graph_pools_;
     std::map<std::pair<int,cudaStream_t>,std::weak_ptr<GgufDirectArena>> direct_arenas_;
     std::vector<std::weak_ptr<GgufDirectArena>> direct_allocations_;
     std::uint64_t direct_arena_reuses_=0;
     std::vector<std::shared_ptr<MoePinnedExpertArena>> arenas_;
-    std::unordered_map<std::uint64_t, HostEntry> host_;
     std::unordered_map<const void*,std::unordered_set<std::uint64_t>> host_arena_keys_;
-    std::list<std::uint64_t> host_recent_;
-    std::list<std::uint64_t> host_duplicates_;
     std::unordered_map<std::uint64_t,mfq::ModelSource::TensorReader> source_readers_;
     struct GroupSource {
         std::shared_ptr<const mfq::GgufModelSource::TensorGroupReader> reader;
@@ -315,7 +275,7 @@ class GgufExpertCache {
     };
     struct SpeculativeDemand {
         std::array<std::weak_ptr<GgufRoutedWeight>,3> banks;
-        std::vector<GgufSpeculativeTouch> touches;
+        std::vector<RoutedExpertTouch> touches;
         // unordered_map keeps element pointers stable across rehashes. The
         // residency version rejects this snapshot before any erased entry can
         // be read; collection and resolution both hold the cache mutex.
@@ -324,8 +284,8 @@ class GgufExpertCache {
         std::size_t rows=0;
         int device=0;
     };
-    GgufSpeculativeJournal speculative_journal_;
-    std::vector<GgufSpeculativeTouch> ordinary_touches_;
+    RoutedExpertJournal speculative_journal_;
+    std::vector<RoutedExpertTouch> ordinary_touches_;
     std::map<std::uint64_t,SpeculativeDemand> speculative_demand_;
     int speculative_rows_=0;
     std::uint64_t speculative_committed_=0,speculative_discarded_=0;
@@ -349,8 +309,7 @@ class GgufExpertCache {
     std::map<int,tb::Tensor> admission_ready_words_;
     // Joined before a new decode graph can wait on host-published routes.
     // Only post-window cache admission runs here; speculative rows never do.
-    std::future<void> admission_job_;
-    std::unique_ptr<GgufAdmissionExecutor> admission_executor_;
+    std::unique_ptr<RoutedAdmission> admission_executor_;
     std::shared_ptr<GgufLayerAdmission> layer_admission_;
     std::uint64_t layer_admission_epochs_=0,layer_admission_signals_=0,layer_admission_served_=0;
     std::uint64_t layer_admission_ready_updates_=0;
@@ -397,7 +356,7 @@ class GgufExpertCache {
     std::uint64_t prefill_inplace_mmq_bytes_=0,prefill_host_bypass_bytes_=0;
     std::uint64_t host_device_ready_waits_=0,prefill_device_ready_skips_=0;
     std::uint64_t speculative_cache_observed_=0;
-    std::vector<std::shared_ptr<mfq::cuda::Event>> deferred_events_;
+    mfq::cuda::RoutedEventRetirement deferred_events_;
     std::uint64_t deferred_event_releases_=0;
     struct Serving {
         bool& active;bool previous;
@@ -437,8 +396,7 @@ class GgufExpertCache {
         return !setting || setting[0]!='0';
     }
     static std::size_t slot_part_bytes(std::size_t bytes) {
-        if(bytes>std::size_t(INT64_MAX)-255)throw std::overflow_error("GGUF slot size overflows");
-        return (bytes+255)&~std::size_t(255);
+        return mfq::cuda::routed_aligned_bytes(bytes,256);
     }
     tb::Tensor slot_image(const GgufRoutedWeight& bank,std::int64_t expert,int device) {
         const auto tier=slot_tiers_.find(device);if(tier==slot_tiers_.end())return {};
@@ -528,7 +486,7 @@ class GgufExpertCache {
                 if(!ready){selected.push_back({banks,expert,score,bytes,-1});used.insert(expert);}
             }
         }
-        const auto swaps=mfq::cuda::gguf::adaptive_slot_swaps(tier.usage,[&](auto layer,auto expert) {
+        const auto swaps=mfq::cuda::adaptive_slot_swaps(tier.usage,[&](auto layer,auto expert) {
             const auto slot=tier.cache->slot_of(layer,expert);
             return slot>=0 && slot<tier.loan_first;
         });
@@ -539,7 +497,7 @@ class GgufExpertCache {
             selected.push_back({std::move(banks),swap.in,0,bytes,swap.out});
         }
         const auto elapsed=tier.windows-tier.last_decay;
-        const float decay=elapsed==4?.7f:std::pow(.7f,float(elapsed)/4.f);
+        const float decay=mfq::cuda::expert_usage_decay(elapsed);
         for(auto& layer:tier.usage)for(auto& count:layer)count*=decay;
         tier.last_decay=tier.windows;
         return true;
@@ -734,46 +692,35 @@ class GgufExpertCache {
     }
 
     std::size_t reusable_resident_memory(int device) const {
-#if defined(TYLOINFER_NATIVE_CUDA_RUNTIME) && CUDA_VERSION >= 11030
         for(const auto& [key,entry]:device_)if(key.device==device) {
-            CUmemoryPool pool=nullptr;
-            if(cuPointerGetAttribute(&pool,CU_POINTER_ATTRIBUTE_MEMPOOL_HANDLE,
-                    CUdeviceptr(reinterpret_cast<std::uintptr_t>(entry.weight.packed.data_ptr())))!=CUDA_SUCCESS || !pool)return 0;
-            std::uint64_t used=0,reserved=0;
-            const auto native=reinterpret_cast<cudaMemPool_t>(pool);
-            if(cudaMemPoolGetAttribute(native,cudaMemPoolAttrUsedMemCurrent,&used)!=cudaSuccess ||
-                    cudaMemPoolGetAttribute(native,cudaMemPoolAttrReservedMemCurrent,&reserved)!=cudaSuccess) {
-                (void)cudaGetLastError();return 0;
-            }
-            return reserved>used?reserved-used:0;
+            return mfq::cuda::routed_reusable_pool_bytes(entry.weight.packed.data_ptr());
         }
-#endif
         return 0;
     }
 
     std::size_t host_available() const {
-        const auto sample = mfq::sample_host_memory();
-        const auto available = sample.available_host_bytes();
-        if (!physical_limit_) return available;
-        return std::min<std::uint64_t>(available,
-            physical_limit_ > sample.resident_bytes ? physical_limit_ - sample.resident_bytes : 0);
+        return mfq::host_memory_headroom(mfq::sample_host_memory(),physical_limit_);
     }
     void reap() {
         const mfq::cuda::Event* previous=nullptr;bool complete=false;
+        mfq::cuda::RoutedCompletionProbe probe;
         transfer_reap_images_+=transfers_.size();
-        std::erase_if(transfers_, [this,&previous,&complete](const Transfer& transfer) {
+        std::erase_if(transfers_, [this,&previous,&complete,&probe](const Transfer& transfer) {
             // One upload fence covers many consecutive immutable images.
             // A false result can safely keep the whole run until the next
             // reap; it must never cause a later image to retire earlier.
             const bool first=transfer.ready.get()!=previous;
             if(first) {
-                previous=transfer.ready.get();complete=transfer.ready->ready();++transfer_reap_queries_;
+                previous=transfer.ready.get();
+                complete=probe.ready(transfer.position,[&] {
+                    ++transfer_reap_queries_;return transfer.ready->ready();
+                });
             }
             if(!complete)return false;
             if(serving_graph_ || layer_admission_) {
-                if(first)deferred_events_.push_back(transfer.ready);
+                if(first)deferred_events_.retain(transfer.ready);
                 if(transfer.image && transfer.image->ready && transfer.image->ready!=transfer.ready)
-                    deferred_events_.push_back(transfer.image->ready);
+                    deferred_events_.retain(transfer.image->ready);
             }
             return true;
         });
@@ -792,124 +739,20 @@ class GgufExpertCache {
         // Spare RAM may keep upload sources, avoiding a return transfer when
         // an expert leaves VRAM. Under pressure discard those duplicates
         // before any expert whose sole resident copy is in RAM.
-        const auto old = host_duplicates_.empty() ? host_recent_.back() : host_duplicates_.back();
+        const auto old = host_index_victim();
         erase_host(old); ++host_evictions_;
     }
     bool compact_pinned_interval(std::size_t bytes) {
-        struct Lease {MoePinnedExpertArena::Block* block;std::size_t owners=0,references=0;bool idle=true;};
-        std::vector<std::pair<std::size_t,MoePinnedExpertArena*>> candidates;
-        for(const auto& arena:arenas_) {
-            const auto free=arena->bytes()-arena->used_bytes();
-            if(free>=bytes)candidates.emplace_back(free,arena.get());
-        }
-        std::sort(candidates.begin(),candidates.end(),[](const auto& a,const auto& b){return a.first>b.first;});
-        // A contiguous run of idle leases can combine its surrounding holes.
-        // Prefer an arena with spare capacity, then minimize its moved bytes.
-        std::vector<MoePinnedExpertArena::Block*> best;
-        std::size_t best_bytes=SIZE_MAX;
-        for(const auto& [free,arena]:candidates) {
-            const auto keys=host_arena_keys_.find(arena->allocation_id());
-            if(keys==host_arena_keys_.end())continue;
-            std::unordered_map<MoePinnedExpertArena::Block*,Lease> leases;
-            for(const auto key:keys->second) {
-                const auto& image=host_.at(key).image;
-                auto* block=image->block.get();
-                auto [found,inserted]=leases.try_emplace(block,Lease{block});
-                ++found->second.owners;
-                found->second.references=image->block.use_count();
-                found->second.idle&=image.use_count()==1;
-            }
-            std::vector<Lease*> blocks;blocks.reserve(leases.size());
-            for(auto& [block,lease]:leases)blocks.push_back(&lease);
-            std::size_t accounted=0;
-            for(const auto* lease:blocks)accounted+=lease->block->bytes();
-            // Leases held outside the cache may occupy otherwise apparent gaps.
-            if(accounted!=arena->used_bytes())continue;
-            std::sort(blocks.begin(),blocks.end(),[](const auto* a,const auto* b){return a->block->offset()<b->block->offset();});
-            std::vector<std::size_t> gaps;gaps.reserve(blocks.size()+1);
-            std::size_t end=0;
-            for(auto* lease:blocks) {
-                gaps.push_back(lease->block->offset()-end);
-                end=lease->block->offset()+lease->block->bytes();
-                // Count distinct HostImage owners without retaining another
-                // Block reference that would prevent the exclusivity check.
-                lease->idle&=lease->owners==lease->references;
-            }
-            gaps.push_back(arena->bytes()-end);
-            std::size_t begin=0;
-            while(begin<blocks.size()) {
-                while(begin<blocks.size() && !blocks[begin]->idle)++begin;
-                if(begin==blocks.size())break;
-                auto finish=begin;
-                while(finish<blocks.size() && blocks[finish]->idle)++finish;
-                std::size_t left=begin,free=0,cost=0;
-                for(auto right=begin;right<=finish;++right) {
-                    free+=gaps[right];
-                    if(right>begin)cost+=blocks[right-1]->block->bytes();
-                    while(left<right && free-gaps[left]>=bytes) {
-                        free-=gaps[left];cost-=blocks[left]->block->bytes();++left;
-                    }
-                    if(free>=bytes && cost<best_bytes) {
-                        best_bytes=cost;best.clear();
-                        for(auto i=left;i<right;++i)best.push_back(blocks[i]->block);
-                    }
-                }
-                begin=finish;
-            }
-            if(!best.empty())break;
-        }
-        if(best.empty())return false;
-        for(auto* block:best)host_compacted_bytes_+=block->compact_left();
+        if(!compact_host_interval(arenas_,host_arena_keys_,bytes,host_compacted_bytes_))return false;
         ++pin_interval_compactions_;
         return true;
     }
     std::size_t relocate_host_allocation(const void* allocation,const std::vector<std::uint64_t>& keys,
             std::unordered_set<const void*>& retained) {
-        struct Move { std::uint64_t key;HostImage* image; std::shared_ptr<MoePinnedExpertArena::Block> target; };
-        std::vector<Move> moves;
-        std::vector<std::pair<std::uint64_t,HostImage*>> images;
-        std::multimap<std::size_t,MoePinnedExpertArena*> targets;
-        std::size_t available=0,required=0;
-        for(const auto& arena:arenas_)if(arena->allocation_id()!=allocation) {
-            const auto largest=arena->largest_free_bytes();
-            if(largest)targets.emplace(largest,arena.get());
-            available+=arena->bytes()-arena->used_bytes();
-        }
-        // Plan into already registered holes. Keep every source unchanged if
-        // the whole allocation cannot move; no temporary pinned arena is made.
-        for(const auto key:keys) {
-            const auto found=host_.find(key);if(found==host_.end())continue;
-            const auto& image=found->second.image;
-            if(!image->block || image->block->allocation_id()!=allocation)continue;
-            if(image.use_count()!=1)return 0;
-            const auto bytes=(image->bytes+15)&~std::size_t(15);
-            if(targets.empty() || bytes>targets.rbegin()->first || bytes>available-required)return 0;
-            required+=bytes;images.emplace_back(key,image.get());
-        }
-        // Reserve large images first. The maximum-hole index rejects
-        // impossible moves before constructing thousands of temporary leases.
-        std::sort(images.begin(),images.end(),[](const auto& a,const auto& b){return a.second->bytes>b.second->bytes;});
-        moves.reserve(images.size());
-        for(const auto& [key,image]:images) {
-            const auto found=targets.lower_bound((image->bytes+15)&~std::size_t(15));
-            if(found==targets.end())return 0;
-            auto* arena=found->second;targets.erase(found);
-            std::shared_ptr<MoePinnedExpertArena::Block> target;
-            target=arena->allocate(image->bytes);
-            if(!target)return 0;
-            if(const auto largest=arena->largest_free_bytes())targets.emplace(largest,arena);
-            moves.push_back({key,image,std::move(target)});
-        }
-        std::size_t copied=0;
-        for(auto& move:moves) {
-            std::memcpy(move.target->data(),move.image->data(),move.image->bytes);
-            copied+=move.image->bytes;
-            retained.insert(move.target->allocation_id());
-            remove_host_arena_key(move.key,move.image->block->allocation_id());
-            host_arena_keys_[move.target->allocation_id()].insert(move.key);
-            move.image->block=std::move(move.target);move.image->block_offset=0;
-        }
-        return copied;
+        return relocate_host_images(arenas_,allocation,keys,retained,
+            [&](std::uint64_t key,const void* source,const void* target) {
+                remove_host_arena_key(key,source);host_arena_keys_[target].insert(key);
+            });
     }
     void evacuate_host_allocation(const void* allocation) {
         const auto device=mfq_current_cuda_device();
@@ -926,14 +769,12 @@ class GgufExpertCache {
         const auto reserve=decode_workspace_reserve_?decode_workspace_reserve_:
             mfq::cuda::runtime_options::workspace_reserve_bytes();
         const auto available=context->available_memory();if(available<=reserve)return;
-        std::size_t remaining=std::min(limit->second-device_used_[device],available-reserve);
+        std::size_t remaining=mfq::cuda::routed_host_evacuation_capacity(limit->second,device_used_[device],available,reserve);
         std::vector<Key> candidates,promoted;
-        for(const auto& [image,entry]:host_) {
-            if(entry.duplicate || !entry.image->block || entry.image.use_count()!=1 ||
-                    entry.image->block->allocation_id()!=allocation || !reclaim_banks_.count(image>>32))continue;
-            if(entry.image->ready && !entry.image->ready_on_host && !entry.image->ready->ready())continue;
+        for(const auto image:host_evacuation_candidates(allocation,
+                [&](auto key){return reclaim_banks_.count(key>>32)!=0;},
+                [](const auto& image){return !image.ready || image.ready_on_host || image.ready->ready();}))
             candidates.push_back({image,device});
-        }
         promoted.reserve(candidates.size());
         std::shared_ptr<mfq::cuda::Event> ready;
         for(const auto& key:candidates) {
@@ -978,40 +819,9 @@ class GgufExpertCache {
         if(serving_graph_ || layer_admission_)return 0;
         release_empty_arenas();
         if(before-host_allocated()>=bytes)return before-host_allocated();
-        struct Victim {
-            const void* allocation=nullptr;
-            std::size_t unique=0,payload=0,allocated=0,age=0;
-            std::unordered_set<const void*> blocks;
-            bool busy=false;
-            std::vector<std::uint64_t> keys;
-        };
-        std::unordered_map<const void*,Victim> allocations;
-        // Releasing unrelated LRU entries leaves holes in many still-pinned
-        // arenas. Rank whole allocations by the unique expert data they lose.
-        std::size_t age=0;
-        for(auto it=host_recent_.rbegin();it!=host_recent_.rend();++it,++age) {
-            const auto& entry=host_.at(*it);const auto& image=entry.image;
-            if(image->snapshot)continue;
-            const auto id=image->block?image->block->allocation_id():image.get();
-            auto& victim=allocations[id];victim.allocation=id;
-            if(victim.keys.empty())victim.age=age;victim.keys.push_back(*it);
-            if(image->block && victim.blocks.insert(image->block.get()).second)victim.allocated+=image->block->bytes();
-            victim.payload+=image->bytes;
-            if(!entry.duplicate)victim.unique+=image->bytes;
-            victim.busy|=image.use_count()!=1;
-        }
-        for(const auto& arena:arenas_)if(const auto found=allocations.find(arena->allocation_id());found!=allocations.end())
-            found->second.busy|=arena->used_bytes()>found->second.allocated;
-        std::vector<Victim*> order;order.reserve(allocations.size());
-        for(auto& [id,victim]:allocations)
-            if(!victim.busy)order.push_back(&victim);
-        std::stable_sort(order.begin(),order.end(),[](const auto* a,const auto* b) {
-            // Fully duplicated allocations always precede unique RAM data.
-            // Within each class, evict the least unique payload per arena.
-            if(a->unique!=b->unique)return a->unique<b->unique;
-            if(a->payload!=b->payload)return a->payload<b->payload;
-            return a->age<b->age;
-        });
+        const auto victims=host_allocation_victims(arenas_);
+        std::vector<const HostAllocationVictim*> order;order.reserve(victims.size());
+        for(const auto& victim:victims)order.push_back(&victim);
         std::unordered_set<const void*> retained;
         for(const auto* victim:order) {
             if(before-host_allocated()>=bytes)break;
@@ -1024,14 +834,7 @@ class GgufExpertCache {
             }
             // A paired Gate/Up survivor otherwise keeps its deleted half
             // unavailable. Narrow only exclusively owned, idle image ranges.
-            for(const auto key:victim->keys)if(const auto found=host_.find(key);found!=host_.end()) {
-                auto& image=found->second.image;
-                if(image.use_count()!=1 || !image->block || image->block.use_count()!=1 || image->block_offset%16 ||
-                        image->block->allocation_id()!=victim->allocation)continue;
-                if(const auto freed=image->block->retain_range(image->block_offset,image->bytes)) {
-                    image->block_offset=0;host_trimmed_bytes_+=freed;
-                }
-            }
+            host_trimmed_bytes_+=trim_host_image_ranges(victim->allocation,victim->keys);
             release_empty_arenas();
             if(before-host_allocated()>=bytes)break;
             // Each survivor moves at most once during a reclaim, even when
@@ -1055,43 +858,10 @@ class GgufExpertCache {
         return before-host_allocated();
     }
     std::shared_ptr<MoePinnedExpertArena::Block> allocate_pinned(std::size_t bytes) {
-        for (const auto& arena : arenas_)
-            if (auto block = arena->allocate(bytes)) return block;
-        // Strata prioritizes CUDA registration for experts absent from VRAM
-        // (PinnedArena::ByNeed). A VRAM duplicate must not leave a cold expert
-        // pageable merely because the OS/driver's pinning budget is full.
-        for (auto next = host_duplicates_.end(); next != host_duplicates_.begin();) {
-            const auto old = std::prev(next);
-            const auto found = host_.find(*old);
-            if (!found->second.image->block || found->second.image.use_count() != 1) { next = old; continue; }
-            const auto key = *old;
-            erase_host(key);++host_evictions_;
-            for (const auto& arena : arenas_)
-                if (auto block = arena->allocate(bytes)) return block;
-        }
-        if (serving_graph_ || layer_admission_) return {}; // Reuse intervals; never register memory while the GPU waits.
-        const auto pinned_limit = std::min(host_limit_, pinned_ceiling_);
-        if (bytes <= pinned_limit - std::min(pinned_limit, host_reserved_)) {
-            const auto available = host_available();
-            const auto capacity = std::min<std::size_t>(pinned_limit - host_reserved_,
-                std::max<std::size_t>(bytes, std::min<std::size_t>(256ULL << 20, available / 8)));
-            if (capacity >= bytes && capacity <= available) {
-                try {
-                    auto arena = std::make_shared<MoePinnedExpertArena>(capacity);
-                    auto block = arena->allocate(bytes);
-                    arenas_.push_back(std::move(arena)); host_reserved_ += capacity;
-                    return block;
-                } catch (const std::exception& error) {
-                    if (!std::string(error.what()).starts_with("CUDA pinned allocation failed:")) throw;
-                    ++pin_failures_;
-                    pinned_ceiling_ = host_reserved_;
-                    // Pageable source storage remains valid when the host
-                    // cannot pin another region. Its transfer is still fenced.
-                    (void)cudaGetLastError();
-                }
-            }
-        }
-        return {};
+        return allocate_routed_pinned(arenas_,pinned_duplicates_,bytes,host_limit_,!serving_graph_ && !layer_admission_,
+            host_reserved_,pinned_ceiling_,pin_failures_,[&](std::uint64_t key) {
+                const auto& image=host_.at(key).image;return image->block && image.use_count()==1;
+            },[&](std::uint64_t key){erase_host(key);++host_evictions_;},[&]{return host_available();},[](std::size_t){});
     }
     std::shared_ptr<HostImage> allocate_host(std::size_t bytes,std::size_t batch_bytes=0) {
         while (bytes > host_limit_ - std::min(host_used_, host_limit_) && !host_recent_.empty())
@@ -1144,18 +914,13 @@ class GgufExpertCache {
         }
         return image;
     }
-    void insert_host(std::uint64_t key, const std::shared_ptr<HostImage>& image) {
-        if (image->bytes <= host_limit_) {
-            host_recent_.push_front(key);
-            auto [found, inserted] = host_.emplace(key, HostEntry{image, host_recent_.begin(), {}});
-            if (!inserted) throw std::logic_error("GGUF duplicate host cache insertion");
-            host_used_ += image->bytes;
+    void insert_host(std::uint64_t key,const std::shared_ptr<HostImage>& image) {
+        if(image->bytes>host_limit_)return;
+        host_index_insert(key,image,device_copies_.count(key)!=0);
+        try {
             if(image->block)host_arena_keys_[image->block->allocation_id()].insert(key);
-            if(!image->block && !image->snapshot)host_pageable_+=image->bytes;
-            if (device_copies_.count(key)) {
-                host_duplicates_.push_front(key); found->second.duplicate = host_duplicates_.begin();
-            }
-        }
+        }catch(...) {host_index_erase(key);throw;}
+        if(!image->block && !image->snapshot)host_pageable_+=image->bytes;
     }
     void remove_host_arena_key(std::uint64_t key,const void* allocation) {
         const auto found=host_arena_keys_.find(allocation);
@@ -1166,20 +931,16 @@ class GgufExpertCache {
     void erase_host(std::uint64_t key) {
         const auto found = host_.find(key);
         if (found == host_.end()) return;
-        if(serving_graph_ && found->second.image->ready)deferred_events_.push_back(found->second.image->ready);
-        host_used_ -= found->second.image->bytes;
+        if(serving_graph_ && found->second.image->ready)deferred_events_.retain(found->second.image->ready);
         if(found->second.image->block)remove_host_arena_key(key,found->second.image->block->allocation_id());
         if(!found->second.image->block && !found->second.image->snapshot)host_pageable_-=found->second.image->bytes;
-        if (found->second.duplicate) host_duplicates_.erase(*found->second.duplicate);
-        host_recent_.erase(found->second.recent); host_.erase(found);
+        host_index_erase(key);
     }
     void add_device_copy(std::uint64_t key,int device) {
         ++resident_version_;
         if(resident_roles_.count(Key{key>>32,device}))dirty_resident_images_[device].insert(key);
         ++device_copies_[key];
-        if (auto found = host_.find(key); found != host_.end() && !found->second.duplicate) {
-            host_duplicates_.push_front(key); found->second.duplicate = host_duplicates_.begin();
-        }
+        host_index_duplicate(key,true);
     }
     void remove_device_copy(std::uint64_t key,int device) {
         ++resident_version_;
@@ -1188,16 +949,12 @@ class GgufExpertCache {
         if (copy == device_copies_.end()) throw std::logic_error("GGUF device cache accounting differs");
         if (--copy->second) return;
         device_copies_.erase(copy);
-        if (auto found = host_.find(key); found != host_.end() && found->second.duplicate) {
-            host_duplicates_.erase(*found->second.duplicate); found->second.duplicate.reset();
-        }
+        host_index_duplicate(key,false);
     }
     std::shared_ptr<HostImage> read_host(const GgufRoutedWeight& bank, std::int64_t expert) {
         const auto key = (bank.source_id << 32) | std::uint64_t(expert);
         if (auto found = host_.find(key); found != host_.end()) {
-            host_recent_.splice(host_recent_.begin(), host_recent_, found->second.recent);
-            if (found->second.duplicate)
-                host_duplicates_.splice(host_duplicates_.begin(), host_duplicates_, *found->second.duplicate);
+            host_index_touch(key);
             ++host_hits_;
             auto image = found->second.image;
             const bool available=image->ready_on_host || !image->ready || image->ready->ready();
@@ -1208,10 +965,11 @@ class GgufExpertCache {
                 if (auto block = allocate_pinned(image->bytes)) {
                     auto pinned = std::make_shared<HostImage>(); pinned->bytes = image->bytes;
                     pinned->block = std::move(block); std::memcpy(pinned->data(), image->data(), image->bytes);
-                    if(serving_graph_ && image->ready)deferred_events_.push_back(image->ready);
+                    if(serving_graph_ && image->ready)deferred_events_.retain(image->ready);
                     host_pageable_-=image->bytes;
                     host_arena_keys_[pinned->block->allocation_id()].insert(key);
                     found->second.image = pinned; image = std::move(pinned);
+                    host_index_duplicate(key,device_copies_.count(key)!=0);
                 }
             }
             if (serving_graph_) {
@@ -1227,7 +985,7 @@ class GgufExpertCache {
         }
         auto image = allocate_host(bank.expert_bytes);
         bank.reader(std::uint64_t(expert) * bank.expert_bytes,
-            static_cast<std::byte*>(image->data()), image->bytes);
+            reinterpret_cast<std::byte*>(image->data()), image->bytes);
         source_bytes_ += image->bytes; ++source_reads_;
         insert_host(key, image);
         return image;
@@ -1278,7 +1036,7 @@ class GgufExpertCache {
                 if(bypass)transient->emplace(key,image);
                 else {images.emplace_back(key,image);insert_host(key,image);}
                 spans.push_back({std::uint64_t(expert)*bank.expert_bytes,
-                    static_cast<std::byte*>(image->data()),image->bytes});
+                    reinterpret_cast<std::byte*>(image->data()),image->bytes});
             }
             bank.batch_reader(spans);
             source_bytes_+=total;source_reads_+=missing.size();++source_batches_;
@@ -1337,7 +1095,7 @@ class GgufExpertCache {
                 auto image=allocate_host(item.bank->expert_bytes,remaining);remaining-=item.bank->expert_bytes;
                 images.emplace_back(item.key,image);insert_host(item.key,image);
                 spans.push_back({group_sources_.at(item.bank->source_id).name,
-                    {item.offset,static_cast<std::byte*>(image->data()),image->bytes}});
+                    {item.offset,reinterpret_cast<std::byte*>(image->data()),image->bytes}});
             }
             (*reader)(spans);
             source_bytes_+=bytes;source_reads_+=missing.size();++source_batches_;++source_group_batches_;
@@ -1359,7 +1117,7 @@ class GgufExpertCache {
             // stream ends. Experts are immutable: a bounded source mapping
             // can restore these same bytes without a device synchronization.
             const auto expert=std::uint32_t(key.image);
-            source->second(std::uint64_t(expert)*image->bytes,static_cast<std::byte*>(image->data()),image->bytes);
+            source->second(std::uint64_t(expert)*image->bytes,reinterpret_cast<std::byte*>(image->data()),image->bytes);
             source_bytes_+=image->bytes;++source_reads_;immutable_recovery_bytes_+=image->bytes;
             insert_host(key.image,image);return;
         }
@@ -1374,6 +1132,7 @@ class GgufExpertCache {
                 cudaMemcpyDeviceToHost, stream));
             writeback_enqueue_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now()-before).count();
             image->ready->record(stream);
+            transfers_.back().position=mfq::cuda::record_routed_completion(transfer_clock_,key.device,stream);
             writeback_bytes_ += image->bytes;
         } catch (...) { (void)cudaStreamSynchronize(stream); transfers_.pop_back(); throw; }
         insert_host(key.image, image);
@@ -1457,10 +1216,10 @@ public:
         }
     }
     void wait_direct_admission() {
-        if(!admission_job_.valid() && !layer_admission_)return;
+        if(!admission_executor_->pending() && !layer_admission_)return;
         const auto before=std::chrono::steady_clock::now();
         try {
-            if(admission_job_.valid())admission_job_.get();
+            admission_executor_->wait();
             if(layer_admission_ && layer_admission_->submitted_done)layer_admission_->submitted_done->synchronize();
         }
         catch(...) {
@@ -1490,13 +1249,13 @@ public:
             }
         }
         if(submitted_only) {
-            if(!admission_job_.valid())return;
+            if(!admission_executor_->pending())return;
             // Freeze cache metadata and finish enqueueing copies before the
             // next graph. Waiting for DMA remains layer-local; the planner
             // must not contend with a worker still preparing later banks.
             const auto before=std::chrono::steady_clock::now();
             std::exception_ptr error;
-            try{if(admission_job_.valid())admission_job_.get();}catch(...){error=std::current_exception();}
+            try{admission_executor_->wait();}catch(...){error=std::current_exception();}
             {
                 std::lock_guard lock(mutex_);
                 admission_submission_join_ms_+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-before).count();
@@ -1518,7 +1277,6 @@ public:
         // fixed, same-layer replacement tier permits concurrent graph readers.
         prepare_resident_views(device,mfq_current_cuda_stream());
         auto epoch=std::make_shared<GgufLayerAdmission>();epoch->device=device;
-        epoch->submitted_done=std::make_shared<mfq::cuda::Event>();
         std::lock_guard lock(mutex_);
         const auto tier=slot_tiers_.find(device);
         if(tier==slot_tiers_.end() || tier->second.loan_active)return {};
@@ -1536,46 +1294,26 @@ public:
             if(matches)epoch->views.push_back(view);
         }
         if(epoch->views.empty())return {};
-        auto& ready_word=admission_ready_words_[device];
-        if(!ready_word.defined()) {
-            ready_word=tb::full({1},1,tb::TensorOptions().device(tb::Device(tb::kCUDA,device)).dtype(tb::kInt32));
-            TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(mfq_current_cuda_stream()));
-            const auto stream=admission_streams_.at(device).stream();
-            TYLOINFER_CUDA_CHECK(cudaMemcpyAsync(epoch->views.front()->admission_host(),ready_word.data_ptr(),
-                sizeof(std::uint32_t),cudaMemcpyDeviceToHost,stream));
-            TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(stream));
-        }
-        epoch->ready_word=ready_word;
-        for(const auto& view:epoch->views)
-            *reinterpret_cast<volatile std::uint32_t*>(view->admission_host())=0;
-        std::atomic_thread_fence(std::memory_order_seq_cst);
+        mfq::cuda::arm_routed_layer_admission(*epoch,admission_ready_words_[device],admission_streams_.at(device).stream());
         layer_admission_=epoch;++layer_admission_epochs_;
         return epoch;
     }
     void abort_layer_admission(const std::shared_ptr<GgufLayerAdmission>& epoch,std::exception_ptr error={}) {
         if(!epoch)return;
         std::lock_guard lock(mutex_);
-        if(error)epoch->error=std::move(error);
-        if(epoch->cancelled)return;
-        epoch->cancelled=true;
         // Never release a waiting GPU onto a partially overwritten slot.
         // An aborted window sees zero hits; its normal cancellation clears the
         // streamed-copy descriptors too. A later window rebuilds the journal.
-        for(const auto& view:epoch->views) {
-            std::memset(view->host->data(),0,view->raw.size()*sizeof(std::uint64_t));
-            view->rebuild=true;
-        }
-        ++resident_version_;
-        std::atomic_thread_fence(std::memory_order_seq_cst);
-        for(const auto& view:epoch->views)mfq::cuda::publish_mapped_flag(view->admission_host());
+        const bool active=!epoch->cancelled;
+        epoch->abort(std::move(error),[](auto& view){view.invalidate();},mfq::cuda::publish_mapped_flag);
+        if(active)++resident_version_;
     }
     void release_unchanged_layers(const std::shared_ptr<GgufLayerAdmission>& epoch,
             const std::unordered_set<std::uint64_t>& pending) {
         if(!epoch)return;
         std::lock_guard lock(mutex_);
-        if(epoch->cancelled)return;
-        for(const auto& view:epoch->views)if(!pending.count(view->sources[0]))
-            mfq::cuda::publish_mapped_flag(view->admission_host());
+        epoch->release_unchanged([&](const auto& view){return pending.count(view.sources[0])!=0;},
+            mfq::cuda::publish_mapped_flag);
     }
     void publish_admission_layer(const std::shared_ptr<GgufLayerAdmission>& epoch,
             const std::array<std::shared_ptr<GgufRoutedWeight>,3>& banks,cudaStream_t stream) {
@@ -1607,12 +1345,7 @@ public:
         // A copy-engine landing word can progress while the serving graph
         // waits. A separate signal kernel can be serialized behind that graph
         // by WDDM's compute scheduling, creating a circular wait.
-        for(auto* flag:ready)TYLOINFER_CUDA_CHECK(cudaMemcpyAsync(flag,epoch->ready_word.data_ptr(),
-            sizeof(std::uint32_t),cudaMemcpyDeviceToHost,stream));
-        // Submit landing signals before the host prepares a later layer.
-        // This is also the flush used by Strata for WDDM's command batching.
-        const auto progress=cudaStreamQuery(stream);
-        if(progress!=cudaSuccess && progress!=cudaErrorNotReady)TYLOINFER_CUDA_CHECK(progress);
+        mfq::cuda::publish_routed_admission_layers(*epoch,ready,stream);
     }
     void wait_layer_admission(const std::shared_ptr<GgufResidentView>& view) {
         if(!view)return;
@@ -1623,19 +1356,12 @@ public:
         }
         const auto started=std::chrono::steady_clock::now();
         const auto* ready=reinterpret_cast<const volatile std::uint32_t*>(view->admission_host());
-        std::uint32_t spins=0;
-        while(!*ready) {
-            mfq::cpu::spin_pause();
-            if((++spins&1023u)!=0)continue;
-            if(std::chrono::steady_clock::now()-started>std::chrono::seconds(20)) {
-                auto error=std::make_exception_ptr(std::runtime_error("GGUF layer admission timed out"));
-                abort_layer_admission(epoch,error);std::rethrow_exception(error);
-            }
-        }
-        std::atomic_thread_fence(std::memory_order_acquire);
+        mfq::cuda::wait_routed_layer_admission([&]{return *ready!=0;},mfq::cpu::spin_pause,[&] {
+            auto error=std::make_exception_ptr(std::runtime_error("routed layer admission timed out"));
+            abort_layer_admission(epoch,error);std::rethrow_exception(error);
+        });
         std::lock_guard lock(mutex_);
-        if(epoch->error)std::rethrow_exception(epoch->error);
-        if(epoch->cancelled)throw std::runtime_error("GGUF layer admission cancelled");
+        epoch->require_active();
         // The mapped signal proves these per-layer events have completed.
         // Avoid querying each new image's event again in the host plan.
         for(const auto image:view->pending_ready)
@@ -1701,6 +1427,7 @@ public:
             TYLOINFER_CUDA_CHECK(cudaMemcpyAsync(packet.data_ptr(), image->data(), image->bytes,
                 cudaMemcpyHostToDevice, mfq_current_cuda_stream()));
             ready->record(mfq_current_cuda_stream());
+            transfers_.back().position=mfq::cuda::record_routed_completion(transfer_clock_,device,mfq_current_cuda_stream());
         } catch (...) { (void)cudaStreamSynchronize(mfq_current_cuda_stream()); transfers_.pop_back(); throw; }
         packet.record_stream(reinterpret_cast<std::uintptr_t>(mfq_current_cuda_stream()));
         return packet;
@@ -1740,7 +1467,7 @@ public:
         }
         host_limit_ = execution.config.moe_host_cache_bytes;
         TYLOINFER_CUDA_CHECK(mfq::cuda::moe_mapped_copy_launch_geometry(&upload_blocks_,&upload_threads_));
-        if (!host_limit_) host_limit_ = host_available() / 5 * 4;
+        if (!host_limit_) host_limit_ = host_available();
         ordinary_host_limit_=host_limit_;
         const auto* keep_original=std::getenv("TYLOINFER_GGUF_HOST_SNAPSHOT");
         if(keep_original && keep_original[0]=='1') {
@@ -1766,7 +1493,7 @@ public:
             configured_device_limit_ = moe_expert_cache_budget_bytes(execution.moe_expert_cache);
         // Create before a graph temporarily pins its serving caller. Linux
         // threads otherwise inherit that narrow affinity at the first update.
-        admission_executor_=std::make_unique<GgufAdmissionExecutor>();
+        admission_executor_=std::make_unique<RoutedAdmission>();
     }
     ~GgufExpertCache() {
         // CPU workers retain RAM images; finish them before freeing arenas.
@@ -1787,7 +1514,7 @@ public:
         // reverse member destruction would otherwise destroy the streams first.
         transfers_.clear();device_.clear();
         for(auto& stage:upload_stages_)stage.device={};
-        for (auto& [stream, pool] : graph_pools_) pool.context->end_graph_pool(pool.stream.stream());
+        graph_pools_.clear();
         if (direct_host_) mfq::cuda::tensor_host_bytes.fetch_sub(direct_capacity);
     }
     bool direct_supported(std::size_t bytes) const {return direct_mapped_ && bytes<=direct_capacity;}
@@ -1809,7 +1536,7 @@ public:
         prefill_rebalance_pending_.insert(device);
     }
     void record_decode_seed(const std::array<std::shared_ptr<GgufRoutedWeight>,3>& banks,
-            const std::vector<GgufSpeculativeTouch>& touches,int device) {
+            const std::vector<RoutedExpertTouch>& touches,int device) {
         // A prefix hit may never visit grouped prefill. Retain its executed
         // routes so the next safe phase boundary can seed the same slot cache.
         // Unobserved experts receive empty slots when the safe phase boundary
@@ -1868,14 +1595,15 @@ public:
             // token frequency ranks saved transfer time per resident byte.
             // Allocate across layers instead of assigning every layer the
             // same fraction of its expert count.
-            std::stable_sort(candidates.begin(),candidates.end(),[](const auto& a,const auto& b){return a.count>b.count;});
             std::size_t remaining=device_limit_.at(ordinal);
             std::unordered_set<std::uint64_t> wanted;
-            for(auto& candidate:candidates)if(candidate.bytes<=remaining) {
+            mfq::cuda::select_routed_experts(candidates,remaining,[](const auto& item){return item.count;},
+                [](const auto& item){return (item.banks[0]->source_id<<32)|std::uint64_t(item.expert);},
+                [](const auto& item){return item.bytes;},[&](auto candidate) {
                 remaining-=candidate.bytes;
                 for(const auto& bank:candidate.banks)wanted.insert((bank->source_id<<32)|std::uint64_t(candidate.expert));
                 selected.push_back(std::move(candidate));
-            }
+            });
             if(strata_slots_requested() && remaining) {
                 struct ColdGroup {
                     std::array<std::shared_ptr<GgufRoutedWeight>,3> banks;
@@ -1971,7 +1699,7 @@ public:
         // the waiting graph and the cache mutex.
         std::vector<std::shared_ptr<mfq::cuda::Event>> retired;
         {
-            std::lock_guard lock(mutex_);retired.swap(deferred_events_);
+            std::lock_guard lock(mutex_);retired=deferred_events_.take();
             deferred_event_releases_+=retired.size();
         }
         retired.clear();
@@ -2000,7 +1728,7 @@ public:
                 auto& tier=slot_tiers_.at(device);
                 if(tier.loan_active)return;
                 ++tier.windows;
-                if(!frequent && tier.windows%4)return;
+                if(!mfq::cuda::routed_admission_due(tier.windows,frequent))return;
             }
             if(!deferred_selection) {
                 std::vector<Candidate> candidates;
@@ -2101,7 +1829,7 @@ public:
             }
         };
         if(asynchronous) {
-            try{admission_job_=admission_executor_->submit(std::move(run));}
+            try{admission_executor_->submit(std::move(run));}
             catch(...){abort_layer_admission(epoch,std::current_exception());throw;}
             if(const auto* trace=std::getenv("TYLOINFER_TRACE_KERNEL_DISPATCH");trace && trace[0]=='1') {
                 static std::atomic<bool> reported{false};
@@ -2206,7 +1934,7 @@ public:
                 // (expert_source.cpp, begin_layer). Rejected drafts consumed
                 // real weights too. KV/state still keeps only the accepted
                 // prefix; graph preparation/cancellation discards the journal.
-                const auto observed=count?pending.rows:0;
+                const auto observed=mfq::cuda::routed_observed_rows(count,pending.rows);
                 speculative_cache_observed_+=observed;
                 auto& demand=direct_demand_[source];demand.banks=pending.banks;
                 // Residency and bank identities stay fixed under this lock.
@@ -2258,11 +1986,7 @@ public:
         wait_direct_admission();
         const auto stream = mfq_get_current_cuda_stream();
         std::lock_guard lock(mutex_);
-        if (graph_pools_.count(stream.stream())) return;
-        const auto context = mfq::cuda::default_context(stream.device());
-        context->begin_graph_pool(stream.stream());
-        try { graph_pools_.emplace(stream.stream(), GraphPool{stream, context}); }
-        catch (...) { context->end_graph_pool(stream.stream()); throw; }
+        graph_pools_.prepare(stream);
     }
     std::uint64_t register_source(const std::string& name,std::size_t bytes,mfq::ModelSource::TensorReader recovery,bool resident=false,
             std::shared_ptr<const mfq::GgufModelSource::TensorGroupReader> group={}) {
@@ -2286,6 +2010,9 @@ public:
         auto metadata=std::make_shared<GgufRoutedWeight>(bank);metadata->cache.reset();
         std::lock_guard lock(mutex_);reclaim_banks_.emplace(bank.source_id,std::move(metadata));
     }
+    std::size_t source_bytes() {
+        std::lock_guard lock(mutex_);return payload_bytes_;
+    }
     std::size_t budget_bytes() {
         std::lock_guard lock(mutex_);
         std::size_t bytes = 0;
@@ -2302,7 +2029,7 @@ public:
         std::lock_guard lock(mutex_);
         ++grouped_prefills_;
         const auto budget = device_limit_.count(device) ? device_limit_.at(device) : configured_device_limit_.value_or(0);
-        return payload_bytes_ ? std::min(experts, std::size_t(static_cast<long double>(experts)*budget/payload_bytes_)) : 0;
+        return mfq::cuda::routed_prefill_quota(experts,budget,payload_bytes_);
     }
     void finalize(std::size_t reserve) {
         wait_direct_admission();
@@ -2326,6 +2053,9 @@ public:
         if(slot_tiers_.count(device)) {
             context->reclaim_idle_memory();reap();
             if(context->available_memory()>=bytes)return;
+            if(context->workspace_largest_available(mfq_current_cuda_stream())>=bytes)return;
+            if(slot_tiers_.at(device).loan_active)
+                throw MfqResourceExhausted("active prefill workspace has insufficient unleased CUDA memory");
             // A segmented arena can return only its cold tail. Contiguous
             // allocations still require the original complete retirement.
             if(!slot_tiers_.at(device).cache->segmented())release_slot_tier(device);
@@ -2418,15 +2148,12 @@ public:
         // only the prepared decoder's transient allowance after prompt tensors
         // retire; unprepared callers retain their original capture allowance.
         // Explicit user reservations always take precedence.
-        const auto add=[](std::size_t a,std::size_t b){return b>SIZE_MAX-a?SIZE_MAX:a+b;};
         const bool configured=std::getenv("TYLOINFER_CUDA_WORKSPACE_RESERVE_GIB")!=nullptr;
         // Concrete operator workspaces do not price all driver residency costs.
         // Retain Strata's general 700 MiB free-memory allowance after capture;
         // explicit reservations still take precedence on every device.
-        constexpr auto residency_allowance=std::size_t(700)<<20;
-        const auto base=configured?mfq::cuda::runtime_options::workspace_reserve_bytes():
-            add(std::max(transient.value_or(std::size_t(1280)<<20),residency_allowance),2*upload_capacity);
-        const auto reserve=add(base,growth);
+        const auto reserve=mfq::cuda::routed_decode_workspace_reserve(growth,transient,
+            configured?std::optional(mfq::cuda::runtime_options::workspace_reserve_bytes()):std::nullopt,2*upload_capacity);
         // A retained decoder can return from prefill with less free memory
         // than its allowance. Clamping a negative surplus to zero would keep
         // every existing expert and silently consume the promised headroom.
@@ -2443,7 +2170,7 @@ public:
             // temporary pool and therefore cannot count this space as free.
             const auto existing=slot_tiers_.find(device);
             const auto physical=existing==slot_tiers_.end()?device_used_[device]:std::size_t(existing->second.cache->mapped_bytes());
-            const auto capacity=physical+reusable+(available>reserve?available-reserve:0);
+            const auto capacity=mfq::cuda::routed_cache_capacity(physical,reusable,available,reserve);
             if(const auto tier=slot_tiers_.find(device);tier!=slot_tiers_.end() &&
                     std::uint64_t(tier->second.cache->bytes())>capacity)
                 if(!shrink_slot_tier(device,capacity))release_slot_tier(device);
@@ -2455,7 +2182,7 @@ public:
             {std::lock_guard lock(mutex_);
                 if(const auto tier=slot_tiers_.find(device);tier!=slot_tiers_.end()) {
                     const auto free=context->available_memory();
-                    capacity=std::size_t(tier->second.cache->mapped_bytes())+(free>reserve?free-reserve:0);
+                    capacity=mfq::cuda::routed_cache_capacity(std::size_t(tier->second.cache->mapped_bytes()),0,free,reserve);
                 }}
             if(capacity)grow_slot_tier(device,capacity);
         }
@@ -2521,6 +2248,35 @@ public:
         wait_direct_admission();std::lock_guard lock(mutex_);
         return reclaim_host(bytes,true);
     }
+    bool host_snapshot_busy_locked()const {
+        if(serving_graph_ || layer_admission_)return true;
+        for(const auto& [_,entry]:host_)if(entry.image->snapshot && entry.image.use_count()!=1)return true;
+        for(const auto& transfer:transfers_)if(transfer.image->snapshot)return true;
+        return false;
+    }
+    std::size_t release_host_snapshot_locked() {
+        if(!snapshot_ || host_snapshot_busy_locked())return 0;
+        const auto original=snapshot_->bytes;
+        std::vector<std::uint64_t> discard;
+        for(const auto& [key,entry]:host_)if(entry.image->snapshot)discard.push_back(key);
+        for(const auto key:discard)erase_host(key);
+        snapshot_sources_.clear();snapshot_.reset();host_limit_=ordinary_host_limit_;
+        return original;
+    }
+    std::size_t host_minimum_bytes() {
+        std::lock_guard lock(mutex_);return snapshot_ && host_snapshot_busy_locked()?snapshot_->bytes:0;
+    }
+    void resize_host(std::size_t bytes) {
+        wait_direct_admission();std::lock_guard lock(mutex_);
+        if(snapshot_ && bytes<snapshot_->bytes) {
+            if(host_snapshot_busy_locked())throw std::runtime_error("host cache budget is below its leased snapshot");
+            (void)release_host_snapshot_locked();
+        }
+        const bool ordinary=host_limit_==ordinary_host_limit_;
+        ordinary_host_limit_=bytes;host_limit_=ordinary?bytes:std::min(host_limit_,bytes);
+        const auto allocated=host_allocated();
+        if(allocated>bytes)(void)reclaim_host(allocated-bytes);
+    }
     std::size_t share_host(std::size_t free_bytes) {
         // Only called by the model thread, outside graph host callbacks.
         // Updating the soft ceiling prevents experts immediately borrowing
@@ -2528,40 +2284,31 @@ public:
         const auto released=free_bytes?reserve_host(free_bytes):0;
         std::lock_guard lock(mutex_);
         const auto free=host_available();
-        const auto ceiling=free>=free_bytes?
-            host_used_+std::min(ordinary_host_limit_-std::min(ordinary_host_limit_,host_used_),free-free_bytes):
-            host_used_-std::min(host_used_,free_bytes-free);
-        host_limit_=free_bytes?std::min(ordinary_host_limit_,ceiling):ordinary_host_limit_;
+        host_limit_=mfq::cuda::routed_shared_host_limit(ordinary_host_limit_,host_used_,free,free_bytes);
         return released;
     }
-    std::chrono::steady_clock::time_point last_host_trim_{};
     std::size_t reserve_host(std::size_t bytes) {
         wait_direct_admission();
         std::lock_guard lock(mutex_);
         auto available = host_available();
         if(available>=bytes)return 0;
-        const auto now=std::chrono::steady_clock::now();
-        if(now-last_host_trim_>=std::chrono::seconds(1)) {
-            last_host_trim_=now;mfq_release_host_allocator_cache();
+        available=host_headroom_after_allocator_trim(bytes,available,
+            []{mfq_release_host_allocator_cache();},[&] {
             const auto after=host_available();
             if(std::getenv("TYLOINFER_TRACE_QSA_TQ"))std::fprintf(stderr,
                 "native_host_allocator_trim before_free=%zu after_free=%zu actual_released=%zu\n",
                 available,after,after>available?after-available:0);
-            available=after;if(available>=bytes)return 0;
-        }
+            return after;
+        });
+        if(available>=bytes)return 0;
         auto released=reclaim_host(bytes-available);
-        if(snapshot_ && available+released<bytes) {
+        // Reclaimed cache entries may leave pages in an allocator or pinned
+        // arena. Only the sampled headroom can make the snapshot unnecessary.
+        available=host_available();
+        if(snapshot_ && available<bytes) {
             // This is a request-planning boundary, never a host callback of a
             // waiting graph. Do not unregister RAM still owned by a consumer.
-            bool busy=serving_graph_;
-            for(const auto& [key,entry]:host_)if(entry.image->snapshot && entry.image.use_count()!=1)busy=true;
-            for(const auto& transfer:transfers_)if(transfer.image->snapshot)busy=true;
-            if(!busy) {
-                const auto original=snapshot_->bytes;
-                std::vector<std::uint64_t> discard;
-                for(const auto& [key,entry]:host_)if(entry.image->snapshot)discard.push_back(key);
-                for(const auto key:discard)erase_host(key);
-                snapshot_sources_.clear();snapshot_.reset();host_limit_=ordinary_host_limit_;
+            if(const auto original=release_host_snapshot_locked()) {
                 released+=original;
                 std::fprintf(stderr,"native_gguf_host_snapshot released_bytes=%zu reason=ram_workspace\n",original);
             }
@@ -2822,7 +2569,7 @@ public:
                         g->block=block;g->bytes=gate->bytes;
                         u->block=std::move(block);u->block_offset=gate->bytes;u->bytes=bank.expert_bytes;
                         std::memcpy(g->data(),old->data(),old->bytes);
-                        bank.reader(std::uint64_t(expert)*bank.expert_bytes,static_cast<std::byte*>(u->data()),u->bytes);
+                        bank.reader(std::uint64_t(expert)*bank.expert_bytes,reinterpret_cast<std::byte*>(u->data()),u->bytes);
                         source_bytes_+=u->bytes;++source_reads_;
                         erase_host(key);insert_host(key,g);
                         insert_host((bank.source_id<<32)|std::uint64_t(expert),u);
@@ -2945,6 +2692,8 @@ public:
                     cudaMemcpyHostToDevice, stream));
                 upload_enqueue_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now()-before).count();
                 ready->record(stream);
+                // External evacuation fences may be re-recorded by later rows.
+                if(!shared_ready)transfers_.back().position=mfq::cuda::record_routed_completion(transfer_clock_,device,stream);
                 transfer_bytes_ += image->bytes;
             } catch (...) { (void)cudaStreamSynchronize(stream); transfers_.pop_back(); throw; }
             GgufWeight weight{std::move(packed), bank.type, bank.out, bank.input, bank.row_bytes, bank.rotation};
@@ -3040,41 +2789,28 @@ public:
         std::lock_guard lock(mutex_);
         const auto* setting=std::getenv("TYLOINFER_GGUF_PREFILL_HOST_STAGE");
         const auto* dma=std::getenv("TYLOINFER_GGUF_PREFILL_DMA");
-        if(!snapshot_ || (setting && setting[0]=='0') || (dma && dma[0]=='0'))return {};
+        if(!RoutedPrefillStager::enabled() || !snapshot_ || (setting && setting[0]=='0') || (dma && dma[0]=='0'))return {};
         if(!staged_host_jobs_.empty())throw std::logic_error("overlapping GGUF host staging");
-        std::vector<GgufPrefillStager::Job> jobs;
-        std::size_t first=0,maximum=0;
+        RoutedPrefillStagePlan plan;
+        std::size_t first=0;
         for(const auto end:ends) {
             for(const auto& bank:banks)for(auto i=first;i<end;++i) {
                 if(bank->resident_packed.defined())continue;
                 const auto expert=active[i];const Key key{(bank->source_id<<32)|std::uint64_t(expert),device};
                 if(device_.count(key))continue;
                 auto image=read_host(*bank,expert);if(image->pinned())continue;
-                staged_host_jobs_.emplace(key.image,int(jobs.size()));maximum=std::max(maximum,image->bytes);
-                jobs.push_back({static_cast<const std::uint8_t*>(image->data()),image->bytes,image});
+                plan.add(key.image,{image->data(),image->bytes,image});
             }
             first=end;
         }
-        if(jobs.empty())return {};
-        if(jobs.size()>65535){staged_host_jobs_.clear();return {};}
-        if(!prefill_host_stager_ || prefill_host_stager_->device!=device || prefill_host_stager_->capacity<maximum) {
-            prefill_host_stager_.reset();
-            auto stager=std::make_unique<GgufPrefillStager>();
-            const auto hw=std::thread::hardware_concurrency();
-            const auto threads=std::max(2u,std::min(4u,hw/4));
-            if(!stager->init(maximum,threads)){staged_host_jobs_.clear();return {};}
-            prefill_host_stager_=std::move(stager);
-        }
-        prefill_host_stager_->start(std::move(jobs));
+        auto session=plan.start(prefill_host_stager_,staged_host_jobs_,device,mutex_);
+        if(!session)return {};
         static std::once_flag report;
         if(const auto* trace=std::getenv("TYLOINFER_TRACE_KERNEL_DISPATCH");trace && trace[0]=='1')std::call_once(report,[&] {
             std::fprintf(stderr,"native_gguf_prefill_host_stage actual_match=1 ring=%d jobs=%zu\n",
                 prefill_host_stager_->kRing,staged_host_jobs_.size());
         });
-        return std::shared_ptr<void>(this,[this](void*) {
-            std::lock_guard lock(mutex_);prefill_host_stager_->finish();
-            prefill_host_stager_->jobs.clear();staged_host_jobs_.clear();
-        });
+        return session;
     }
     void record_cpu(std::size_t experts,double ms,double queue_ms) {
         std::lock_guard lock(mutex_);cpu_experts_+=experts;cpu_work_ms_+=ms;cpu_queue_ms_+=queue_ms;
@@ -3279,7 +3015,7 @@ public:
                 if(image->pinned())source=image->mapped_data(device);
                 else {
                     if(image->bytes>direct_capacity-pageable_bytes)throw std::logic_error("GGUF direct host packet overflow");
-                    std::memcpy(static_cast<std::uint8_t*>(direct_host_->data())+pageable_bytes,image->data(),image->bytes);
+                    mfq::copy_host_range({static_cast<std::uint8_t*>(direct_host_->data())+pageable_bytes,image->data(),image->bytes});
                     source=static_cast<const std::uint8_t*>(direct_mapped_)+pageable_bytes;
                     pageable_bytes=(pageable_bytes+image->bytes+15)&~std::size_t(15);
                 }
@@ -3337,7 +3073,7 @@ public:
                     batch_wait_ms_+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-waited).count();
                     const auto count=std::min(upload_capacity,image.source->bytes-offset);
                     const auto copied=std::chrono::steady_clock::now();
-                    std::memcpy(stage.host->data(),static_cast<const std::uint8_t*>(image.source->data())+offset,count);
+                    mfq::copy_host_range({stage.host->data(),static_cast<const std::uint8_t*>(image.source->data())+offset,count});
                     batch_copy_ms_+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-copied).count();
                     const auto issued=std::chrono::steady_clock::now();
                     TYLOINFER_CUDA_CHECK(cudaMemcpyAsync(image.weight.packed.data_ptr<std::uint8_t>()+offset,
@@ -3365,7 +3101,7 @@ public:
             for(const auto& image:batch.images)if(image.source->pinned()) {
                 if(image.source->ready && image.source->producer!=stream)
                     TYLOINFER_CUDA_CHECK(cudaStreamWaitEvent(stream,image.source->ready->get(),0));
-                auto* destination=static_cast<std::byte*>(image.weight.packed.data_ptr());
+                auto* destination=reinterpret_cast<std::byte*>(image.weight.packed.data_ptr());
                 // Only PP slices inside this single known-live allocation
                 // share a destination root. Permanent cache images do not.
                 const void* destination_root=destination;
@@ -3377,7 +3113,7 @@ public:
                         destination_root=staging->image.data_ptr();
                 }
                 const int phase=phased && (image.key.image>>32)==down_source;
-                phases[phase].push_back({static_cast<const std::byte*>(image.source->data()),
+                phases[phase].push_back({reinterpret_cast<const std::byte*>(image.source->data()),
                     destination,image.source->bytes,image.source->registration_id(),destination_root});
             }
             auto& dma_images=cache_admission?admission_dma_images_:prefill_dma_images_;
@@ -3388,18 +3124,15 @@ public:
                 dma_images+=copies.size();
                 mfq::cuda::coalesce_pinned_uploads(copies);
                 const auto before=std::chrono::steady_clock::now();
-                bool submitted=false;
-                const auto* native=std::getenv("TYLOINFER_MOE_NATIVE_DMA_BATCH");
-                const auto mode=native?std::clamp(std::atoi(native),0,2):2;
+                const auto mode=mfq::cuda::routed_dma_mode();
                 // A PP group's active expert IDs are unique, so these ranges are
                 // independent. All source/destination owners and the existing
                 // transfer fences remain live. CUDA's batch ABI excludes the
                 // legacy NULL stream; older drivers use the same individual DMA.
-                if(!cache_admission && mode && copies.size()>1 && stream && stream!=cudaStreamLegacy &&
-                        mfq::cuda::NativeDmaBatch::available()) {
-                    std::vector<mfq::cuda::DmaCopy> commands;commands.reserve(copies.size());
-                    for(const auto& span:copies)commands.push_back({span.destination,span.source,span.bytes});
-                    submitted=mfq::cuda::NativeDmaBatch::submit(commands,stream,mode,
+                const bool native_allowed=!cache_admission && copies.size()>1 && stream && stream!=cudaStreamLegacy;
+                std::vector<mfq::cuda::DmaCopy> commands;commands.reserve(copies.size());
+                for(const auto& span:copies)commands.push_back({span.destination,span.source,span.bytes});
+                const bool submitted=mfq::cuda::submit_routed_transfers(commands,stream,native_allowed?mode:0,
                         [&](const void* source,std::size_t) -> CUdeviceptr {
                             // Coalescing keeps the first image's source address.
                             // Its registration already provides the mapped alias;
@@ -3408,14 +3141,11 @@ public:
                                 return reinterpret_cast<CUdeviceptr>(image.source->mapped_data(device));
                             return 0;
                         });
-                    if(submitted) {
-                        prefill_dma_batches_+=(commands.size()+127)/128;
-                        prefill_dma_batched_ranges_+=commands.size();
-                        if(mode>=2)prefill_dma_overlap_batches_+=(commands.size()+127)/128;
-                    }
+                if(submitted) {
+                    prefill_dma_batches_+=(commands.size()+127)/128;
+                    prefill_dma_batched_ranges_+=commands.size();
+                    if(mfq::cuda::routed_native_copy_flags(mode))prefill_dma_overlap_batches_+=(commands.size()+127)/128;
                 }
-                if(!submitted)for(const auto& span:copies)
-                    TYLOINFER_CUDA_CHECK(cudaMemcpyAsync(span.destination,span.source,span.bytes,cudaMemcpyHostToDevice,stream));
                 for(const auto& span:copies){dma_bytes+=span.bytes;++dma_copies;}
                 upload_enqueue_ms_+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-before).count();
                 if(phased && phase==0) {
@@ -3464,7 +3194,7 @@ public:
                     batch_wait_ms_+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-waited).count();
                     count=std::min(count,upload_capacity-cursor);
                     const auto copied=std::chrono::steady_clock::now();
-                    std::memcpy(packet+cursor,static_cast<const std::uint8_t*>(image.source->data())+offset,count);
+                    mfq::copy_host_range({packet+cursor,static_cast<const std::uint8_t*>(image.source->data())+offset,count});
                     batch_copy_ms_+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-copied).count();
                     source=stage.device.data_ptr<std::uint8_t>()+cursor;cursor=(cursor+count+15)&~std::size_t(15);
                 }
@@ -3485,9 +3215,10 @@ public:
             stage.device.record_stream(reinterpret_cast<std::uintptr_t>(stream));stage.ready->record(stream);
         }
         auto ready=std::make_shared<mfq::cuda::Event>();ready->record(stream);
+        const auto position=mfq::cuda::record_routed_completion(transfer_clock_,device,stream);
         for(const auto& image:batch.images) {
             transfer_bytes_+=image.source->bytes;
-            if(image.source->pinned() || (cache_admission && dma))transfers_.push_back({image.source,ready,image.weight.packed});
+            if(image.source->pinned() || (cache_admission && dma))transfers_.push_back({image.source,ready,image.weight.packed,position});
             if(!image.retain) continue;
             evict_device(device,image.source->bytes);
             if(image.source->bytes<=device_limit_.at(device) && !device_.count(image.key)) {
@@ -3505,6 +3236,9 @@ public:
     }
 };
 
+std::size_t gguf_expert_source_bytes(const std::shared_ptr<GgufExpertCache>& cache) {
+    return cache?cache->source_bytes():0;
+}
 std::size_t gguf_expert_cache_budget_bytes(const std::shared_ptr<GgufExpertCache>& cache) {
     return cache ? cache->budget_bytes() : 0;
 }
@@ -3530,6 +3264,12 @@ double gguf_expert_fetch_ms(const std::shared_ptr<GgufExpertCache>& cache) {
 }
 void resize_gguf_expert_cache(const std::shared_ptr<GgufExpertCache>& cache, std::size_t bytes) {
     if (cache) cache->resize(bytes);
+}
+std::size_t gguf_expert_host_minimum_bytes(const std::shared_ptr<GgufExpertCache>& cache) {
+    return cache?cache->host_minimum_bytes():0;
+}
+void resize_gguf_expert_host(const std::shared_ptr<GgufExpertCache>& cache,std::size_t bytes) {
+    if(cache)cache->resize_host(bytes);
 }
 std::size_t reserve_gguf_expert_host(const std::shared_ptr<GgufExpertCache>& cache, std::size_t bytes) {
     return cache ? cache->reserve_host(bytes) : 0;
@@ -4067,13 +3807,7 @@ struct GgufMoeStage {
             times[index]+=std::chrono::duration<double,std::milli>(now-before).count();before=now;
         };
         const auto* values = static_cast<const std::int64_t*>(route_data());
-        selected.clear();
-        for (std::int64_t slot = 0; slot < tokens * routes; ++slot) {
-            const auto id=values[slot];
-            if (id < 0 || id >= banks[0]->experts)
-                throw std::out_of_range("GGUF MoE expert id");
-            if(std::find(selected.begin(),selected.end(),id)==selected.end())selected.push_back(id);
-        }
+        mfq::cuda::group_routed_experts({values,std::size_t(tokens*routes)},banks[0]->experts,selected);
         // The GPU may publish the next layer as soon as this copy plan is
         // released. Later metadata learning must not retain its mapped IDs.
         if(direct)observation_routes.assign(values,values+tokens*routes);
@@ -4253,20 +3987,18 @@ struct GgufMoeStage {
     }
     tb::Tensor compute(float limit,const std::function<void()>& independent_work={}) {
         using namespace mfq::cuda::gguf;
-        auto* window = mfq::cuda::DecodeWindow::recording();
+        auto* window=mfq::cuda::DecodeWindow::recording();
         auto* groups=route_groups.defined()?static_cast<RouteGroup*>(route_groups.data_ptr()):nullptr;
         if(groups && !direct)prepare_route_groups(ids.data_ptr<std::int64_t>(),tokens*routes,int(tokens),groups,stream.stream());
-        if(resident_overlap) {
+        return mfq::cuda::execute_routed_moe([&] {
+            if(!resident_overlap)return;
             copy_start->record(stream.stream());
             TYLOINFER_CUDA_CHECK(cudaStreamWaitEvent(transfer_stream.stream(),copy_start->get(),0));
             prepare_direct_copy(transfer_stream.stream());copy_done->record(transfer_stream.stream());
-            // Route publication has already released the host planner. Start
-            // its copy stream before independent shared-expert computation,
-            // giving both host preparation and DMA useful work to overlap.
-            if(independent_work) {
-                independent_work();
-                if(window)window->mark_current("shared_end");
-            }
+        },[&] {
+            if(independent_work){independent_work();if(window)window->mark_current("shared_end");}
+        },[&] {
+            if(!resident_overlap)return;
             const bool gpu_residency=!lease->mutable_residency;
             if(!gpu_residency)mfq::cuda::wait_mapped_flag(reinterpret_cast<const std::uint32_t*>(
                 static_cast<const std::uint8_t*>(mapped_routes)+96),stream.stream());
@@ -4292,20 +4024,27 @@ struct GgufMoeStage {
                     "native_gguf_gpu_resident_routes actual_match=1 rows=%lld host_plan_wait=0 fused_prepare=%d\n",static_cast<long long>(tokens),int(prepared));
             }
             if(window)window->mark_current("hot_begin");
-            compute_experts(limit,true,early_groups,false);
+            compute_gate_up(limit,true,early_groups);
+            compute_down(true,early_groups,false);
             if(window)window->mark_current("resident_down_end");
-            TYLOINFER_CUDA_CHECK(cudaStreamWaitEvent(stream.stream(),copy_gate_up_done->get(),0));
-            if(window)window->mark_current("stream_gate_up_join");
-        } else {
-            if(independent_work) {
-                independent_work();
-                if(window)window->mark_current("shared_end");
+        },[&] {
+            if(resident_overlap) {
+                TYLOINFER_CUDA_CHECK(cudaStreamWaitEvent(stream.stream(),copy_gate_up_done->get(),0));
+                if(window)window->mark_current("stream_gate_up_join");
+            }else {
+                if(cpu_auto)mfq::cuda::moe_stamp_clock(reinterpret_cast<std::uint64_t*>(static_cast<std::uint8_t*>(cpu_mapped)+8),stream.stream());
+                prepare_direct_copy(stream.stream());
+                if(window)window->mark_current("hot_begin");
             }
-            if(cpu_auto)mfq::cuda::moe_stamp_clock(reinterpret_cast<std::uint64_t*>(static_cast<std::uint8_t*>(cpu_mapped)+8),stream.stream());
-            prepare_direct_copy(stream.stream());
-            if(window)window->mark_current("hot_begin");
-        }
-        compute_experts(limit,false,groups,resident_overlap,resident_overlap?copy_done->get():nullptr);
+        },[&] {
+            compute_gate_up(limit,false,groups);
+        },[&] {
+            if(!resident_overlap)return;
+            TYLOINFER_CUDA_CHECK(cudaStreamWaitEvent(stream.stream(),copy_done->get(),0));
+            if(window)window->mark_current("stream_down_join");
+        },[&] {
+            compute_down(false,groups,resident_overlap);
+        },[&]() -> tb::Tensor {
         if(cpu_auto)mfq::cuda::moe_stamp_clock(reinterpret_cast<std::uint64_t*>(static_cast<std::uint8_t*>(cpu_mapped)+16),stream.stream());
         if (window) window->mark_current("down_end");
         tb::Tensor result;
@@ -4323,8 +4062,9 @@ struct GgufMoeStage {
         }
         if (window) window->mark_current("hot_end");
         return result;
+        });
     }
-    void compute_experts(float limit,bool resident,mfq::cuda::gguf::RouteGroup* groups,bool preserve_missing,cudaEvent_t down_ready=nullptr) {
+    void compute_gate_up(float limit,bool resident,mfq::cuda::gguf::RouteGroup* groups) {
         using namespace mfq::cuda::gguf;
         auto* window=mfq::cuda::DecodeWindow::recording();
         const bool joined=shared_input_basis && banks[0]->type==banks[1]->type && banks[0]->input==banks[1]->input &&
@@ -4341,15 +4081,15 @@ struct GgufMoeStage {
         }
         if (window) window->mark_current(resident?"resident_gate_up_end":"gate_up_end");
         prepare_bank_hidden(banks[2]->rotation,gate,up,output_type,limit,q8_hidden,stream.stream());
-        if(down_ready) {
-            TYLOINFER_CUDA_CHECK(cudaStreamWaitEvent(stream.stream(),down_ready,0));
-            if(window)window->mark_current("stream_down_join");
-        }
+    }
+    void compute_down(bool resident,mfq::cuda::gguf::RouteGroup* groups,bool preserve_missing) {
+        using namespace mfq::cuda::gguf;
         const auto& bank = *banks[2];
         grouped_routed_matvec_q8(bank.type, resident?resident_device_table(2):device_table(2),
             bank.row_bytes, bank.experts, bank.out, bank.input, ids.data_ptr<std::int64_t>(),groups,
             tokens, routes, q8_hidden.data_ptr(), true, pairs.data_ptr<float>(), stream.stream(),preserve_missing);
     }
+
 };
 
 tb::Tensor grouped_moe_prefill(const GgufMoeBanks& banks, tb::Tensor source,
@@ -4400,6 +4140,8 @@ tb::Tensor grouped_moe_prefill(const GgufMoeBanks& banks, tb::Tensor source,
     // Similar row counts keep both the BMM padding and MMQ's shared tile
     // width efficient. Preserve those groups when scheduling their uploads.
     active=std::move(ranking);
+    const auto route_plan=use_mmq?std::make_unique<mfq::cuda::RoutedPrefillRoutes>(active.size(),
+        [&](auto i)->const auto&{return grouped[active[i]];}):nullptr;
     auto pairs = tb::empty({tokens, routes, banks.down->out}, source.options());
     const auto stream = mfq_current_cuda_stream();
     const auto transfer_stream=banks.up->cache->prefill_transfer_stream(source.get_device());
@@ -4411,23 +4153,19 @@ tb::Tensor grouped_moe_prefill(const GgufMoeBanks& banks, tb::Tensor source,
     }
     // Expand each original weight once for the whole expert's token batch.
     // Temporary decoded storage stays bounded independently of model size.
-    auto group=std::max<std::size_t>(1,std::size_t(std::min({65535.L,static_cast<long double>(active.size()),
-        (64ULL<<20)/compressed_bytes,(256ULL<<20)/decoded_bytes})));
+    auto group=mfq::cuda::routed_prefill_group_capacity(active.size(),compressed_bytes,decoded_bytes);
     if(use_mmq)group=std::min(group,std::size_t(mmq::group_capacity));
-    std::vector<std::size_t> group_ends;
-    for(std::size_t begin=0;begin<active.size();) {
-        auto end=std::min(active.size(),begin+group);
-        const auto maximum=grouped[active[begin]].size();
-        for(auto next=begin+1;next<end;++next)if(grouped[active[next]].size()<(maximum+1)/2){end=next;break;}
-        group_ends.push_back(end);begin=end;
-    }
+    const auto group_ends=mfq::cuda::routed_prefill_group_ends(active.size(),group,
+        [&](auto i){return grouped[active[i]].size();});
     auto host_staging=banks.up->cache->prepare_host_staging(projections,active,group_ends,source.get_device());
     std::size_t mmq_guard_bytes=0;
     if(use_mmq)for(const auto& bank:projections)mmq_guard_bytes+=128*ggml_type_size(bank->type)+15;
     const auto arena_bytes=aligned_compressed_bytes*group+mmq_guard_bytes;
     if(arena_bytes>INT64_MAX)throw std::overflow_error("GGUF prefill staging capacity overflow");
     std::array<GgufPrefillWeightStage,2> weight_stages;
-    std::array<mfq::cuda::Event,2> weight_consumed,weight_ready,gate_up_ready;
+    mfq::cuda::RoutedPrefillPipeline pipeline(stream,transfer_stream.stream());
+    auto& weight_ready=pipeline.ready;
+    auto& gate_up_ready=pipeline.gate_up_ready;
     {
         // Strata's PP uploads reuse a bounded expert workspace. Temporary
         // images never enter the resident cache: two fenced arenas replace
@@ -4468,14 +4206,14 @@ tb::Tensor grouped_moe_prefill(const GgufMoeBanks& banks, tb::Tensor source,
                 mmq_offsets.push_back(mmq_cursor);
                 mmq_row_offsets.push_back(compact_row);
                 const auto n=std::int64_t(end-begin);
-                std::int64_t count=0;
-                for(auto i=begin;i<end;++i)count+=grouped[active[i]].size();
+                const auto count=route_plan->rows(begin,end);
                 auto* bounds=mmq_metadata.data_ptr<std::int32_t>()+mmq_cursor;bounds[0]=0;
                 auto* identity=bounds+n+1;auto* output_ids=identity+count+mmq::id_guard;
                 std::fill_n(identity+count,mmq::id_guard,0);
                 std::int64_t at=0;
                 for(std::int64_t i=0;i<n;++i) {
-                    for(const auto slot:grouped[active[begin+i]]) {
+                    for(auto pos=route_plan->bounds[begin+i];pos<route_plan->bounds[begin+i+1];++pos) {
+                        const auto slot=route_plan->slots[pos];
                         inverse[slot]=std::int32_t(compact_row+at);
                         identity[at]=std::int32_t(at);output_ids[at++]=std::int32_t(slot);
                     }
@@ -4563,9 +4301,6 @@ tb::Tensor grouped_moe_prefill(const GgufMoeBanks& banks, tb::Tensor source,
     const auto acquire_group=[&](std::size_t index) {
         if(index>=upload_groups.size())return;
         const MfqCudaStreamGuard transfer_guard(transfer_stream);
-        if(index>=weight_stages.size())
-            TYLOINFER_CUDA_CHECK(cudaStreamWaitEvent(transfer_stream.stream(),
-                weight_consumed[index%weight_stages.size()].get(),0));
         auto& job=upload_groups[index];
         banks.up->cache->profile_prefill("gguf.pp.acquire",[&] {
             if(projections[0]->cache==projections[1]->cache && projections[0]->cache==projections[2]->cache)
@@ -4574,15 +4309,12 @@ tb::Tensor grouped_moe_prefill(const GgufMoeBanks& banks, tb::Tensor source,
                 job.acquired[role]=projections[role]->cache->acquire(*projections[role],job.experts,source.get_device(),nullptr,true,&admission,&job.stage);
             return true;
         });
-        weight_ready[index%weight_stages.size()].record(transfer_stream.stream());
     };
-    acquire_group(0);
-    group_index=0;
-    for(std::size_t begin=0;begin<active.size();++group_index) {
+    pipeline.run(upload_groups.size(),acquire_group,[&](std::size_t group_index) {
+        const auto begin=group_index?group_ends[group_index-1]:0;
         const auto stage_index=group_index%2,end=group_ends[group_index];
         auto& job=upload_groups[group_index];auto& weight_stage=job.stage;
         const auto& experts=job.experts;auto& mmq_packed=job.packed;
-        acquire_group(group_index+1);
         auto& acquired=job.acquired;
         for(const auto& bank:acquired)for(const auto& weight:bank)
             weight.packed.record_stream(reinterpret_cast<std::uintptr_t>(stream));
@@ -4677,15 +4409,13 @@ tb::Tensor grouped_moe_prefill(const GgufMoeBanks& banks, tb::Tensor source,
             auto result=tb::empty({count,banks.down->out},gu.options());
             product(2,banks.down->out,banks.down->expert_bytes,hidden_q,result.data_ptr<float>(),banks.down->out);
             mmq::scatter(result.data_ptr<float>(),pairs.data_ptr(),device_output,count,banks.down->out,stream);
-            weight_consumed[stage_index].record(stream);
-            for(auto& weights:acquired)weights.clear();
             if(const auto* trace=std::getenv("TYLOINFER_TRACE_KERNEL_DISPATCH");trace && trace[0]=='1') {
                 static std::atomic<bool> reported{false};
                 if(!reported.exchange(true,std::memory_order_relaxed))std::fprintf(stderr,
                     "native_gguf_prefill_mmq actual_match=1 gate=%d up=%d down=%d experts=%lld joined_gate_up=%d expert_major=%d expert_order=frequency_groups\n",
                     int(banks.gate->type),int(banks.up->type),int(banks.down->type),static_cast<long long>(n),int(joined),int(expert_major_mmq));
             }
-            begin=end;continue;
+            return;
         }
         std::array<tb::Tensor, 3> packets;
         std::int64_t maximum = 0;
@@ -4754,10 +4484,9 @@ tb::Tensor grouped_moe_prefill(const GgufMoeBanks& banks, tb::Tensor source,
         });
         mfq::cuda::gguf::grouped_scatter_f16(reinterpret_cast<const mfq::cuda::gguf::GemmJob*>(packets[2].data_ptr()),
             int(batch),maximum,banks.down->out,result.data_ptr(),pairs.data_ptr(),stream);
-        weight_consumed[stage_index].record(stream);
-        for(auto& weights:acquired)weights.clear();
-        begin=end;
-    }
+    },[&](std::size_t group_index) {
+        for(auto& bank:upload_groups[group_index].acquired)bank.clear();
+    });
     return moe_weighted_reduce_cuda(pairs, weights.to(tb::kFloat32).contiguous());
 }
 }
@@ -4826,56 +4555,7 @@ static tb::Tensor resident_moe(const GgufMoeBanks& banks,tb::Tensor source,
     return result;
 }
 
-namespace {
-// Same ready/fork/join graph structure as Strata's default CUDA shared expert
-// stream. Keep the main MoE on its original stream, including host doorbells
-// and transfer events; only the independent shared projection changes stream.
-template<class Main>
-std::optional<tb::Tensor> try_shared_branch(CudaIndependentBranchExecutor* executor,
-        const std::function<void()>& side,Main&& main,std::int64_t tokens,
-        cudaStream_t transfer=nullptr) {
-    auto* window=mfq::cuda::DecodeWindow::recording();
-    if(!executor || !side || (window && window->layer_profiling()))return std::nullopt;
-    const auto parent=mfq_get_current_cuda_stream();
-    if(!executor->ensure(1,parent))return std::nullopt;
-    const auto branch=executor->streams[0];
-    if(branch.stream()==parent.stream() || branch.stream()==transfer)return std::nullopt;
-    cudaStreamCaptureStatus capture=cudaStreamCaptureStatusNone;
-    TYLOINFER_CUDA_CHECK(cudaStreamIsCapturing(parent.stream(),&capture));
-#ifdef TYLOINFER_NATIVE_CUDA_RUNTIME
-    if(window)window->prepare_branch_stream(branch,executor->graph_pools[0]);
-#endif
-    TYLOINFER_CUDA_CHECK(cudaEventRecord(executor->ready,parent.stream()));
-    TYLOINFER_CUDA_CHECK(cudaStreamWaitEvent(branch.stream(),executor->ready,0));
-    const char* phase="shared";
-    try {
-        {const MfqCudaStreamGuard guard(branch);side();}
-        phase="shared_complete";
-        TYLOINFER_CUDA_CHECK(cudaEventRecord(executor->completed[0],branch.stream()));
-        phase="routed";
-        auto output=main();
-        phase="join";
-        TYLOINFER_CUDA_CHECK(cudaStreamWaitEvent(parent.stream(),executor->completed[0],0));
-        if(const auto* trace=std::getenv("TYLOINFER_TRACE_KERNEL_DISPATCH");trace && trace[0]=='1') {
-            static std::atomic<std::uint64_t> seen[2]{};
-            const auto bit=std::uint64_t(1)<<std::min(tokens,std::int64_t(63));
-            const int captured=capture!=cudaStreamCaptureStatusNone;
-            if(!(seen[captured].fetch_or(bit,std::memory_order_relaxed)&bit))std::fprintf(stderr,
-                "native_gguf_shared_stream actual_match=1 rows=%lld fork_join=1 shared_parallel_resident=1 captured=%d\n",
-                static_cast<long long>(tokens),captured);
-        }
-        return output;
-    }catch(const std::exception& error) {
-        std::fprintf(stderr,"native_gguf_shared_stream_error phase=%s rows=%lld captured=%d error=%s\n",
-            phase,static_cast<long long>(tokens),int(capture!=cudaStreamCaptureStatusNone),error.what());
-        // Preserve the dependency even if shared/main preparation throws;
-        // temporary branch allocations must not race the parent's recovery.
-        (void)cudaEventRecord(executor->completed[0],branch.stream());
-        (void)cudaStreamWaitEvent(parent.stream(),executor->completed[0],0);
-        throw;
-    }
-}
-}
+
 tb::Tensor GgufMoeBanks::forward(tb::Tensor source, tb::Tensor ids, tb::Tensor weights, float limit,
         const std::function<void()>& independent_work,CudaIndependentBranchExecutor* shared_executor) const {
     if (!gate || !up || !down || gate->experts != up->experts || up->experts != down->experts ||
@@ -4898,7 +4578,7 @@ tb::Tensor GgufMoeBanks::forward(tb::Tensor source, tb::Tensor ids, tb::Tensor w
         return moe_weighted_reduce_cuda(down->forward(hidden,ids),weights.to(tb::kFloat32).contiguous());
     }
     if(source.size(0)<=32 && gate->resident_packed.defined() && up->resident_packed.defined() && down->resident_packed.defined()) {
-        if(auto output=try_shared_branch(shared_executor,independent_work,
+        if(auto output=try_independent_branch(shared_executor,independent_work,
                 [&]{return resident_moe(*this,source,ids,weights,limit);},source.size(0)))return *output;
         if(independent_work)independent_work();
         return resident_moe(*this,source,ids,weights,limit);
@@ -4943,22 +4623,14 @@ tb::Tensor GgufMoeBanks::forward(tb::Tensor source, tb::Tensor ids, tb::Tensor w
     }
     if (window) window->mark_current("cpu_wait_begin");
     stage->publish_routes();
-    if (capture == cudaStreamCaptureStatusNone) {
-        stage->wait_routes(); stage->load(limit);
-    }
-    if (window) {
-        window->enroll({stage.get(), [stage] { stage->reset_routes(); }, [stage,limit] {
-                if (stage->mapped_routes) { stage->wait_routes(); stage->load(limit); }
-            }, [lease,stage] { stage->wait_cpu();lease->clear();if(stage->direct)stage->banks[0]->cache->finish_direct(); },
-            [stage] {stage->cancel();}, [lease] { lease->clear(); }, [stage,lease] {
-                // The synchronized warmup has completed all consumers. Drop
-                // its borrowed inputs now, before capture: their side-stream
-                // lifetime fences cannot be inserted into an unrelated graph.
+    mfq::cuda::prepare_routed_graph(window,capture,stage->mapped_routes!=nullptr,stage->direct,
+        {stage.get(),[stage]{stage->reset_routes();},{},
+            [lease,stage]{stage->wait_cpu();lease->clear();if(stage->direct)stage->banks[0]->cache->finish_direct();},
+            [stage]{stage->cancel();},[lease]{lease->clear();},[stage,lease] {
                 stage->input={};stage->ids={};stage->weights={};lease->clear();
-            }});
-        if(!stage->direct)window->host_barrier([stage,limit] { if (!stage->mapped_routes) stage->load(limit); });
-    }
-    if(auto output=try_shared_branch(shared_executor,independent_work,[&]{return stage->compute(limit);},
+            }},
+        [stage]{stage->wait_routes();},[stage,limit]{stage->load(limit);},[stage,limit]{stage->load(limit);});
+    if(auto output=try_independent_branch(shared_executor,independent_work,[&]{return stage->compute(limit);},
             source.size(0),stage->resident_overlap?stage->transfer_stream.stream():nullptr))return *output;
     if(const auto* trace=std::getenv("TYLOINFER_TRACE_KERNEL_DISPATCH");independent_work && trace && trace[0]=='1') {
         static std::atomic<std::uint64_t> reported{0};

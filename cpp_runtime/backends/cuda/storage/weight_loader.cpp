@@ -212,7 +212,34 @@ std::shared_ptr<const QuantLinear> linear_weight(const Linear& function) {
     const auto* loaded=function.target<LoadedLinear>();return loaded?loaded->weight:nullptr;
 }
 
-LinearGroup grouped_linear(CudaExecutionContext& execution, std::vector<Linear>& functions,
+namespace {
+struct ProjectionBranches {
+    std::vector<std::size_t> indices;std::vector<Tensor> weights;
+    std::shared_ptr<CudaIndependentBranchExecutor> executor;
+};
+ProjectionBranches projection_branches(CudaExecutionContext& execution,const std::vector<Linear>& functions,
+        const std::vector<std::size_t>& grouped,const Tensor& storage,std::int64_t input_width) {
+    ProjectionBranches result;
+#ifdef TYLOINFER_NATIVE_CUDA_RUNTIME
+    for(std::size_t i=0;i<functions.size();++i) {
+        if(std::find(grouped.begin(),grouped.end(),i)!=grouped.end())continue;
+        const auto weight=linear_weight(functions[i]);
+        if(!weight || weight->kind!=QuantLinearKind::Dense || weight->tensor_parallel() ||
+                !weight->dense.is_cuda() || weight->dense.dim()!=2 ||
+                weight->dense.device()!=storage.device() || weight->dense.size(1)!=input_width)return {};
+        result.indices.push_back(i);result.weights.push_back(weight->dense);
+    }
+    if(!result.indices.empty()) {
+        auto& shared=execution.projection_executors[storage.get_device()];
+        if(!shared)shared=std::make_shared<CudaIndependentBranchExecutor>();
+        result.executor=shared;
+    }
+#endif
+    return result;
+}
+}
+
+static LinearGroup grouped_linear_impl(CudaExecutionContext& execution, std::vector<Linear>& functions,
                            std::size_t joined_prefix,bool combine_rows) {
     if (functions.empty() || execution.loading_cpu_layer) return {};
     TYLOINFER_RUNTIME_CHECK(joined_prefix>=1 && joined_prefix<=functions.size(),"invalid grouped projection prefix");
@@ -227,17 +254,36 @@ LinearGroup grouped_linear(CudaExecutionContext& execution, std::vector<Linear>&
             weight->tq.image.device()!=tq_weights.front().tq.image.device()))return {};
         tq_weights.push_back(*weight);tq_indices.push_back(i);
     }
-    if(tq_weights.size()>=2 && combine_rows) {
+    // TQ groups retain independent immutable images, including when the
+    // caller only requests a shared input and device projection plan.
+    auto tq_branches=tq_weights.empty()?ProjectionBranches{}:projection_branches(execution,functions,tq_indices,
+        tq_weights.front().tq.image,tq_weights.front().neuron_len());
+    if(tq_weights.size()>=2 || bool(tq_branches.executor)) {
         auto group=std::make_shared<QuantLinearGroup>(make_quant_group(execution,tq_weights));
         TYLOINFER_RUNTIME_CHECK(group->tq.defined(),"TQ projection group was not constructed");
         bool direct_join=joined_prefix>1 && tq_indices.size()>=joined_prefix;
         for(std::size_t i=0;direct_join && i<joined_prefix;++i)direct_join=tq_indices[i]==i;
         if(direct_join)group->tq.join_prefix(joined_prefix);
-        return [group=std::move(group),indices=std::move(tq_indices),separate=functions,joined_prefix,direct_join](
+        return [group=std::move(group),indices=std::move(tq_indices),separate=functions,joined_prefix,direct_join,
+                branches=std::move(tq_branches)](
                 CudaExecutionContext& context,const Tensor& input) {
             std::vector<Tensor> outputs(separate.size());
             if(input.is_cuda()) {
-                auto grouped=group->forward(context,input);
+                std::vector<Tensor> grouped,auxiliary;
+                const auto rows=input.dim()>0 && input.size(-1)>0?input.numel()/input.size(-1):0;
+                const bool parallel=branches.executor && rows>0 && rows<=32 && context.config.decode_branch_parallel &&
+                    branches.executor->run(branches.indices.size()+1,[&](std::size_t branch) {
+                        const auto stream=mfq_get_current_cuda_stream(input.get_device());
+                        mfq_cuda_record_stream(input,stream);
+                        if(!branch){grouped=group->forward(context,input);return Tensor{};}
+                        const auto index=branch-1;mfq_cuda_record_stream(branches.weights[index],stream);
+                        return separate[branches.indices[index]](context,input);
+                    },auxiliary);
+                if(parallel) {
+                    const auto stream=mfq_get_current_cuda_stream(input.get_device());
+                    for(const auto& value:grouped)mfq_cuda_record_stream(value,stream);
+                    for(std::size_t i=0;i<branches.indices.size();++i)outputs[branches.indices[i]]=std::move(auxiliary[i+1]);
+                } else grouped=group->forward(context,input);
                 for(std::size_t i=0,j=0;i<indices.size();++i) {
                     outputs[indices[i]]=std::move(grouped[j++]);
                     if(direct_join && i==0)i+=joined_prefix-1;
@@ -298,31 +344,9 @@ LinearGroup grouped_linear(CudaExecutionContext& execution, std::vector<Linear>&
         }
         std::vector<GgufWeight> images;images.reserve(groups.size());
         for(const auto& group:groups)images.push_back(group.weight);
-        std::vector<std::size_t> auxiliary_indices;
-        std::vector<Tensor> auxiliary_weights;
-        std::shared_ptr<CudaIndependentBranchExecutor> executor;
-#ifdef TYLOINFER_NATIVE_CUDA_RUNTIME
-        bool independent_auxiliaries=true;
-        for(std::size_t i=0;i<functions.size();++i) {
-            bool grouped=false;
-            for(const auto& group:groups)
-                grouped|=std::find(group.indices.begin(),group.indices.end(),i)!=group.indices.end();
-            if(grouped)continue;
-            const auto weight=linear_weight(functions[i]);
-            if(!weight || weight->kind!=QuantLinearKind::Dense || weight->tensor_parallel() ||
-                    !weight->dense.is_cuda() || weight->dense.dim()!=2 ||
-                    weight->dense.device()!=images.front().packed.device() ||
-                    weight->dense.size(1)!=images.front().neuron_len) {
-                independent_auxiliaries=false;break;
-            }
-            auxiliary_indices.push_back(i);auxiliary_weights.push_back(weight->dense);
-        }
-        if(independent_auxiliaries && images.size()+auxiliary_indices.size()>1) {
-            auto& shared=execution.projection_executors[images.front().packed.get_device()];
-            if(!shared)shared=std::make_shared<CudaIndependentBranchExecutor>();
-            executor=shared;
-        }
-#endif
+        std::vector<std::size_t> grouped_indices;
+        for(const auto& group:groups)grouped_indices.insert(grouped_indices.end(),group.indices.begin(),group.indices.end());
+        auto branches=projection_branches(execution,functions,grouped_indices,images.front().packed,images.front().neuron_len);
         // Compatible rows share an activation quantization and a GEMV. Mixed
         // formats and dense auxiliaries keep their own projections. Components
         // alias the joined allocation, so this never duplicates resident weights.
@@ -330,8 +354,8 @@ LinearGroup grouped_linear(CudaExecutionContext& execution, std::vector<Linear>&
         for(auto& image:base_images)image.projection_correction.reset();
         return [separate=functions,joined_prefix,groups=std::move(groups),images=std::move(images),
                 base_images=std::move(base_images),
-                auxiliary_indices=std::move(auxiliary_indices),auxiliary_weights=std::move(auxiliary_weights),
-                executor=std::move(executor)](CudaExecutionContext& context,const Tensor& input) {
+                auxiliary_indices=std::move(branches.indices),auxiliary_weights=std::move(branches.weights),
+                executor=std::move(branches.executor)](CudaExecutionContext& context,const Tensor& input) {
             std::vector<Tensor> output(separate.size());
             bool direct_join=false;
             if(input.is_cuda() && input.dim()>0 && input.size(-1)>0 && input.numel()/input.size(-1)<=32) {
@@ -504,6 +528,56 @@ LinearGroup grouped_linear(CudaExecutionContext& execution, std::vector<Linear>&
 #endif
 }
 
+LinearGroup grouped_linear(CudaExecutionContext& execution,std::vector<Linear>& functions,
+        std::size_t joined_prefix,bool combine_rows) {
+    auto forward=grouped_linear_impl(execution,functions,joined_prefix,combine_rows);
+    if(functions.empty() || execution.loading_cpu_layer)return forward;
+    std::int64_t width=0;mfq_tensor_backend::Device device;bool encoded=false;
+    for(const auto& function:functions) {
+        const auto weight=linear_weight(function);
+        if(!weight || weight->tensor_parallel())return forward;
+        const auto descriptor=weight->prefill_weight();
+        if(!descriptor || (width && (descriptor.columns!=width || descriptor.storage.device()!=device)))return forward;
+        width=descriptor.columns;device=descriptor.storage.device();encoded|=!weight->is_dense();
+    }
+    if(!forward) {
+        // Preserve separate projection arithmetic when an encoding has no
+        // joined-weight implementation. Input preparation is still shared.
+        forward=[separate=functions,joined_prefix](CudaExecutionContext& context,const Tensor& input) {
+            std::vector<Tensor> output;output.reserve(separate.size());
+            for(const auto& projection:separate)output.push_back(projection(context,input));
+            if(joined_prefix>1) {
+                auto joined=tb::cat(std::vector<Tensor>(output.begin(),output.begin()+joined_prefix),-1);
+                output.erase(output.begin(),output.begin()+joined_prefix);
+                output.insert(output.begin(),std::move(joined));
+            }
+            return output;
+        };
+    }
+    if(functions.size()<2 || !encoded)return forward;
+    return [forward=std::move(forward),width,device](CudaExecutionContext& context,const Tensor& input) {
+        if(context.kl_mmq.mode==KlMmqMode::Default && input.is_cuda() && input.device()==device &&
+                input.is_contiguous() && input.scalar_type()==tb::kFloat32 && input.dim()>0 &&
+                input.size(-1)==width && width>0 && input.numel()/width>=512) {
+            PrefillInputScope prepared(input);
+            return forward(context,input);
+        }
+        return forward(context,input);
+    };
+}
+
+GatedResidualDownInjectionProjection residual_down_injection(const ResidualLinear& down,const ResidualLinear& injection) {
+    if(!down.weight || !injection.weight || !down.weight->is_tq() || down.weight->tensor_parallel() ||
+            !injection.weight->is_dense() || injection.weight->tensor_parallel() ||
+            !injection.weight->dense.is_cuda() || injection.weight->dense.scalar_type()!=tb::kBFloat16 ||
+            !injection.weight->dense.is_contiguous())return {};
+    return [weight=down.weight,gates=injection.weight](CudaExecutionContext&,const Tensor& input,int64_t streams) {
+        const auto direct=mfq::cuda::runtime_options::gr_dense_bf16_direct();
+        if(direct && !*direct)return std::vector<Tensor>{};
+        return weight->tq.try_residual_down(input,gates->dense,streams);
+    };
+}
+
 ResidualLinear residual_linear(CudaExecutionContext& execution, const mfq::ModelSource& file, const std::string& name) {
     const mfq::cuda::WeightAllocationScope weight_memory;
     auto weight = std::make_shared<QuantLinear>(load_quant_linear(execution, file, name));
@@ -523,7 +597,21 @@ ResidualLinear residual_linear(CudaExecutionContext& execution, const mfq::Model
             if(auto output=try_gguf_residual_mix(weight->gguf,input,normalized,streams);output.defined())return output;
             return mfq_qwen4_exp::gated_residual_mix(forward(context,input),normalized,streams);
         };
-        return {std::move(forward),std::move(mixed),{},std::move(weight),{}};
+        GatedResidualActivationProjection activated;
+        if(weight->is_tq()) {
+            mixed=[weight,forward](CudaExecutionContext& context,const Tensor& input,
+                    const Tensor& normalized,int64_t streams) {
+                if(auto result=weight->tq.try_residual(input,normalized,streams);result.defined())return result;
+                return mfq_qwen4_exp::gated_residual_mix(forward(context,input),normalized,streams);
+            };
+            activated=[weight,forward](CudaExecutionContext& context,const Tensor& input,int64_t streams,bool injection) {
+                if(auto result=weight->tq.try_residual(input,{},streams,injection);result.defined())return result;
+                auto projected=forward(context,input);
+                return injection?mfq_qwen4_exp::gated_residual_injection(projected,streams):
+                    mfq_qwen4_exp::gated_residual_bottleneck(projected,streams);
+            };
+        }
+        return {std::move(forward),std::move(mixed),std::move(activated),std::move(weight),{}};
     }
     if(weight->is_dense()) {
         auto right=weight->dense.transpose(-1,-2);
@@ -549,8 +637,11 @@ ResidualLinear residual_linear(CudaExecutionContext& execution, const mfq::Model
         if(weight->dense.scalar_type()==tb::kBFloat16 && weight->dense.is_contiguous() && weight->dense.dim()==2)
             activated=[weight,forward](CudaExecutionContext& execution,const Tensor& input,int64_t streams,bool injection) {
                 const auto option=mfq::cuda::runtime_options::gr_dense_bf16_direct();
-                if(!injection && (!option || *option))
-                    if(auto output=try_gr_bf16_down_cuda(input,weight->dense,streams);output.defined())return output;
+                if(!option || *option) {
+                    auto output=injection?try_gr_bf16_injection_cuda(input,weight->dense,streams):
+                        try_gr_bf16_down_cuda(input,weight->dense,streams);
+                    if(output.defined())return output;
+                }
                 auto projected=forward(execution,input);
                 return injection?mfq_qwen4_exp::gated_residual_injection(projected,streams):
                     mfq_qwen4_exp::gated_residual_bottleneck(projected,streams);

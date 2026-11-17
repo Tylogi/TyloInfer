@@ -73,6 +73,47 @@ class _Service:
         return await self.runtime_models()
 
 
+def test_systemone_routes_to_the_selected_model_and_preserves_alias() -> None:
+    class Backend(_Backend):
+        async def decide(self, **request: Any) -> dict[str, Any]:
+            self.requests.append(request)
+            return {"object": "structured_decision", "model": request["model"], "answers": {}}
+
+    class Service(_Service):
+        def resolve_model_alias(self, model: str) -> str:
+            return "canonical" if model == "friendly" else model
+
+    async def run() -> None:
+        backend = Backend()
+        app = create_app(Service(backend))
+        payload = {"model": "friendly", "state": "blue", "questions": {"color": {"type": "choice", "criteria": {"blue": None}}}}
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.post("/v1/systemone", json=payload)
+            assert response.status_code == 200 and response.json()["model"] == "friendly"
+            assert backend.requests == [{"model": "canonical", "payload": payload}]
+            for body in ({}, {**payload, "full_vocabulary": False}, {**payload, "prefix_cache": False}):
+                assert (await client.post("/v1/systemone", json=body)).status_code == 400
+
+    asyncio.run(run())
+
+
+def test_systemone_reports_unsupported_and_busy_backends() -> None:
+    async def run() -> None:
+        payload = {"model": "sample", "state": "x", "questions": {}}
+        app = create_app(_Service(_Backend()))
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            assert (await client.post("/v1/systemone", json=payload)).status_code == 501
+        class Busy(_Backend):
+            async def decide(self, **request: Any) -> dict[str, Any]:
+                raise BackendError("runtime_busy", "busy", status_code=409, retryable=True)
+        app = create_app(_Service(Busy()))
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.post("/v1/systemone", json=payload)
+            assert response.status_code == 409 and response.json()["error"]["type"] == "runtime_busy"
+
+    asyncio.run(run())
+
+
 def _request(**updates: Any):
     body: dict[str, Any] = {
         "model": "DeepSeek-V4-Flash",

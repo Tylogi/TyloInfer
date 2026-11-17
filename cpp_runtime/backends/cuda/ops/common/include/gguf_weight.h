@@ -89,9 +89,12 @@ std::vector<mfq_tensor_backend::Tensor> project_gguf_group(
 struct CudaExecutionContext;
 class GgufExpertCache;
 std::size_t gguf_expert_cache_budget_bytes(const std::shared_ptr<GgufExpertCache>&);
+std::size_t gguf_expert_source_bytes(const std::shared_ptr<GgufExpertCache>&);
 std::uint64_t gguf_expert_streamed_bytes(const std::shared_ptr<GgufExpertCache>&);
 double gguf_expert_fetch_ms(const std::shared_ptr<GgufExpertCache>&);
 void resize_gguf_expert_cache(const std::shared_ptr<GgufExpertCache>&, std::size_t bytes);
+std::size_t gguf_expert_host_minimum_bytes(const std::shared_ptr<GgufExpertCache>&);
+void resize_gguf_expert_host(const std::shared_ptr<GgufExpertCache>&,std::size_t bytes);
 std::size_t reserve_gguf_expert_host(const std::shared_ptr<GgufExpertCache>&, std::size_t bytes);
 std::size_t reclaim_gguf_expert_duplicates(const std::shared_ptr<GgufExpertCache>&,std::size_t bytes);
 // Keep an available-RAM allowance for growing live KV. Zero returns the loan.

@@ -388,8 +388,8 @@ struct LinearAttentionBlock final : ::Block {
                                .dtype(mfq_tensor_backend::kFloat32));
     }
     GgufProjectionInput normalized_projection_input;
-    std::unique_ptr<GgufPrefillInputScope> normalized_prefill_input;
-    GgufPrefillProduct scaled_output;
+    std::unique_ptr<PrefillInputScope> normalized_prefill_input;
+    PrefillProduct scaled_output;
     const bool scaled_residual=T>=512 && x.scalar_type()==mfq_tensor_backend::kFloat16 &&
         execution.kl_mmq.mode==KlMmqMode::Default && !execution.config.diagnostic_fp32_residual &&
         ffn_norm.scalar_type()==mfq_tensor_backend::kFloat32 && ffn_norm.is_contiguous() && ffn_norm.numel()==H;
@@ -427,23 +427,23 @@ struct LinearAttentionBlock final : ::Block {
               nv%nk==0 && taps>=2 && taps<=8 && core_conv_layout &&
               (!conv_bias.defined() || conv_bias.numel()==0) &&
               conv_weight.scalar_type()==mfq_tensor_backend::kFloat32 && conv_weight.is_contiguous();
-          GgufPrefillProduct scaled_qkv,scaled_gate;
+          PrefillProduct scaled_qkv,scaled_gate;
           const auto project_inputs=[&](mfq_tensor_backend::Tensor xn) {
                 const auto project_group=[&] {
                   if(T>=256 && packed_convolution_candidate && execution.kl_mmq.mode==KlMmqMode::Default &&
                       normalized_projection_input.shape.empty() && !in_proj.layers.empty() &&
                       std::all_of(in_proj.layers.begin(),in_proj.layers.end(),[](const QuantLinear& linear) {
-                        return linear.is_gguf() && !linear.tensor_parallel() && !linear.gguf.prefers_original_input();
+                        return bool(linear.prefill_weight());
                       })) {
-                    GgufPrefillInputScope input_scope(xn);
-                    scaled_qkv=gguf_prefill_product(in_proj.layers[0].gguf,xn);
+                    PrefillInputScope input_scope(xn);
+                    scaled_qkv=prefill_product(in_proj.layers[0].prefill_weight(),xn);
                     if(scaled_qkv.defined()) {
                       std::vector<mfq_tensor_backend::Tensor> parts;
                       parts.reserve(in_proj.layers.size());
                       parts.push_back(scaled_qkv.values.reshape({B,T,in_proj.layers[0].out()}));
                       for(size_t i=1;i<in_proj.layers.size();++i) {
-                        if(i==1 && scaled_residual && !dense_out_proj && out_proj.is_gguf() && !out_proj.tensor_parallel())
-                          scaled_gate=gguf_prefill_product(in_proj.layers[i].gguf,xn);
+                        if(i==1 && scaled_residual && !dense_out_proj && bool(out_proj.prefill_weight()))
+                          scaled_gate=prefill_product(in_proj.layers[i].prefill_weight(),xn);
                         parts.push_back(i==1 && scaled_gate.defined()
                             ?scaled_gate.values.reshape({B,T,in_proj.layers[i].out()})
                             :in_proj.layers[i].forward(execution,xn));
@@ -573,7 +573,7 @@ struct LinearAttentionBlock final : ::Block {
               taps>1 && core_conv_layout && std::isfinite(qwen_config.rms_norm_eps) &&
               qwen_config.rms_norm_eps>0 && dk==dv && (dk==32 || dk==64 || dk==128) &&
               (!conv_bias.defined() || conv_bias.numel()==0) && !dense_out_proj &&
-              out_proj.is_gguf() && !out_proj.tensor_parallel() &&
+              !out_proj.tensor_parallel() &&
               projected.qkv.defined() && projected.output_gate.scalar_type()==projected.alpha.scalar_type() &&
               projected.alpha.scalar_type()==projected.beta.scalar_type() &&
               (projected.alpha.scalar_type()==mfq_tensor_backend::kFloat16 ||
@@ -587,7 +587,7 @@ struct LinearAttentionBlock final : ::Block {
             auto weight=conv_weight;
             if(weight.dim()==2 && weight.size(0)==conv_dim && weight.size(1)==taps)
               weight=weight.reshape({conv_dim,1,taps});
-            const bool quantized=!out_proj.gguf.prefers_original_input();
+            const bool quantized=out_proj.is_gguf() && !out_proj.gguf.prefers_original_input();
             const bool position_major=quantized && out_proj.gguf.prefers_position_major_q8(T);
             auto result=profiler.measure("linear.verify_core",[&] {
               return gdn_verify_window_cuda(p.qkv,p.output_gate,p.alpha.reshape({B,T,nv}),p.beta.reshape({B,T,nv}),
@@ -612,7 +612,7 @@ struct LinearAttentionBlock final : ::Block {
               weight=weight.reshape({conv_dim,1,qwen_config.linear_conv_kernel_dim});
             // Activation-dependent corrections retain the floating readout;
             // ordinary integer projections can consume Q8 directly.
-            const bool quantized_readout=!out_proj.gguf.prefers_original_input();
+            const bool quantized_readout=out_proj.is_gguf() && !out_proj.gguf.prefers_original_input();
             auto result=profiler.measure(quantized_readout?"linear.decode_core_q8":"linear.decode_core_f32",[&] {
               return gdn_decode_core_cuda(p.qkv,p.output_gate,p.alpha.reshape({B,1,nv}),p.beta.reshape({B,1,nv}),
                   mixer.convolution,mixer.recurrent,weight,dt_bias,a_log,linear_norm,nk,nv,dv,
@@ -621,6 +621,12 @@ struct LinearAttentionBlock final : ::Block {
             });
             // The core can update convolution in place or return fresh history.
             if(result[1].data_ptr()!=mixer.convolution.data_ptr())mixer.convolution.copy_(result[1]);
+            if(const auto* trace=std::getenv("TYLOINFER_TRACE_KERNEL_DISPATCH");trace && trace[0]=='1') {
+              static std::atomic<bool> reported[2]{};
+              if(!reported[quantized_readout].exchange(true))std::fprintf(stderr,
+                  "native_gdn_decode_core actual_match=1 fused_conv_norm_gates_recurrence_readout=1 q8_output=%d\n",
+                  int(quantized_readout));
+            }
             return profiler.measure("linear.out_proj_prepared",[&] {
               if(!quantized_readout)return out_proj.forward(execution,result[0].reshape({B,1,vsz}));
               return out_proj.gguf.forward_q8(result[0],B,mfq_tensor_backend::kFloat32).reshape({B,1,H});
@@ -869,13 +875,13 @@ struct LinearAttentionBlock final : ::Block {
               [&](mfq_tensor_backend::Tensor yf, mfq_tensor_backend::Tensor z) {
                 if (!dense_out_proj) {
                   return profiler.measure("linear.out_proj_gate", [&]() {
-                    if(scaled_residual && out_proj.is_gguf() && !out_proj.tensor_parallel()) {
+                    if(scaled_residual && bool(out_proj.prefill_weight())) {
                       scaled_output=scaled_gate.defined()
-                          ?gguf_rms_gated_product(out_proj.gguf,yf,scaled_gate,linear_norm,qwen_config.rms_norm_eps,true)
-                          :gguf_rms_gated_product(out_proj.gguf,yf,z.reshape({B,T,vsz}),linear_norm,qwen_config.rms_norm_eps,true);
+                          ?prefill_rms_gated_product(out_proj.prefill_weight(),yf,scaled_gate,linear_norm,qwen_config.rms_norm_eps,true)
+                          :prefill_rms_gated_product(out_proj.prefill_weight(),yf,z.reshape({B,T,vsz}),linear_norm,qwen_config.rms_norm_eps,true);
                       if(scaled_output.defined())return scaled_output.values.reshape({B,T,H});
                     }
-                    if(scaled_gate.defined())z=gguf_prefill_materialize(scaled_gate).reshape({B,T,vsz});
+                    if(scaled_gate.defined())z=prefill_materialize(scaled_gate).reshape({B,T,vsz});
                     return out_proj.forward_input_rms_silu(
                         execution, yf, z.reshape({B, T, vsz}), linear_norm,
                         qwen_config.rms_norm_eps);
@@ -903,7 +909,7 @@ struct LinearAttentionBlock final : ::Block {
               profiler.measure("linear.attn_residual_ffn_norm", [&]() {
                 auto rr = residual.reshape({-1, H});
                 auto oo2 = oo.reshape({-1, H});
-                if(scaled_output.defined())return gguf_prefill_acc_rms(scaled_output,rr,ffn_norm,
+                if(scaled_output.defined())return prefill_acc_rms(scaled_output,rr,ffn_norm,
                     qwen_config.rms_norm_eps,qwen_config.legacy_tensor_layout.norm_weight_offset);
                 if(normalized_ffn_input && !execution.config.diagnostic_fp32_residual && ffn.supports_prepared_gguf_input()) {
                   mfq_tensor_backend::Tensor sum,norm;
@@ -1042,7 +1048,7 @@ struct LinearAttentionBlock final : ::Block {
             -> std::optional<mfq_tensor_backend::Tensor> {
           auto ffn_input = xn.reshape({B * T, H});
           auto residual_flat = residual.reshape({B * T, H});
-          if(auto fused=ffn.try_forward_gguf_prefill_residual(execution,ffn_input,residual_flat))
+          if(auto fused=ffn.try_forward_prefill_residual(execution,ffn_input,residual_flat))
             return fused->reshape({B,T,H});
           if(normalized_ffn_input) {
             if(auto fused=ffn.try_forward_prepared_gguf_residual(

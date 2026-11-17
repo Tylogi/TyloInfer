@@ -85,6 +85,10 @@ struct Gr {
 }
     std::vector<Tensor> pre(CudaExecutionContext &execution, const Tensor &x,
         const GatedResidualMarker& marker={}) const {
+        if(streams==1) {
+            auto normalized=grouped_rms_norm_cuda(x.contiguous(),norm,x.size(-1),eps,0.0);
+            return {std::move(normalized),x,x.narrow(-1,0,1)};
+        }
         if(can_fuse(execution,x,marker))return fused({},x,{},false);
         if(can_fuse_tq(execution,x,marker))return fused_tq(x,
             mfq_qwen4_exp::grouped_rms_norm(x,norm,hidden,eps));
@@ -92,10 +96,12 @@ struct Gr {
             hidden, streams, eps,up.mixed,marker,down.activated,injection.activated);
     }
     Tensor post(const Tensor &branch, const std::vector<Tensor> &inputs) const {
+        if(streams==1)return inputs[1]+branch;
         return mfq_qwen4_exp::gated_residual_post(branch, inputs[1], inputs[2], streams);
     }
     std::vector<Tensor> pre_after(CudaExecutionContext& execution,const Tensor& branch,
         const std::vector<Tensor>& inputs,const GatedResidualMarker& marker={}) const {
+        if(streams==1)return pre(execution,inputs[1]+branch,marker);
         if(can_fuse_tq(execution,inputs[1],marker) && execution.config.gr_fused_post_norm &&
            branch.is_contiguous() && inputs[2].is_contiguous() &&
            (branch.scalar_type()==tb::kFloat16 || branch.scalar_type()==tb::kFloat32) &&
@@ -251,8 +257,9 @@ struct BlockLoader : weight_loader::Loader {
     auto residual_linear(const std::string &name) const {
         return weight_loader::residual_linear(execution, source, name);
     }
-    static Gr residual(Tensor norm, weight_loader::ResidualLinear down,
+    Gr residual(Tensor norm, weight_loader::ResidualLinear down,
         weight_loader::ResidualLinear up, weight_loader::ResidualLinear injection, const Config &c) {
+        if(c.streams==1)norm=norm+source.legacy_tensor_compatibility().layout.norm_weight_offset;
         return {std::move(norm), std::move(down), std::move(up), std::move(injection),
                 c.hidden, c.streams, c.eps};
     }
@@ -268,19 +275,34 @@ struct BlockLoader : weight_loader::Loader {
                 return tb::cat({projections[0](execution,x),projections[1](execution,x),projections[2](execution,x)},-1);
             };
         }
-        return GdnWeights{
+        auto weights=GdnWeights{
             std::move(qkv), linear(p + ".gate.weight"),
             linear(p + ".alpha.weight"), linear(p + ".beta.weight"),
             linear(p + ".output.weight"), dense(p + ".conv.weight"),
             dense(p + ".dt_bias"), dense(p + ".a"), dense(p + ".norm.weight")};
+        if(!source.legacy_tensor_compatibility().layout.linear_attention_a_is_log)weights.a_log=tb::log(-weights.a_log);
+        return weights;
     }
     auto qsa_weights(const std::string &p) const {
+        Linear index;
+        if(has(p+".indexer.query_key.weight"))index=linear(p+".indexer.query_key.weight");
+        else {
+            auto query=linear(p+".indexer.query.weight"),key=linear(p+".indexer.key.weight");
+            index=[query,key](CudaExecutionContext& e,const Tensor& x) {
+                const auto input=x.to(tb::kFloat32);
+                return tb::cat({query(e,input),key(e,input)},-1);
+            };
+        }
         auto result=QsaWeights{
             linear(p + ".query.weight"), linear(p + ".key.weight"),
             linear(p + ".value.weight"), linear(p + ".output.weight"),
-            linear(p + ".indexer.query_key.weight"), dense(p + ".query_norm.weight"),
+            std::move(index), dense(p + ".query_norm.weight"),
             dense(p + ".key_norm.weight"), dense(p + ".indexer.query_norm.weight"),
             dense(p + ".indexer.key_norm.weight")};
+        const auto offset=source.legacy_tensor_compatibility().layout.norm_weight_offset-1.;
+        if(offset)for(auto* norm:{&result.query_norm,&result.key_norm,&result.index_query_norm,&result.index_key_norm})
+            *norm=norm->to(tb::kFloat32)+offset;
+        if(has(p+".indexer.pre_key_norm.weight"))result.index_pre_key_norm=fp32(dense(p+".indexer.pre_key_norm.weight"));
         if(has_tensor(source,p+".gate.weight"))result.gate=linear(p+".gate.weight");
         return result;
     }
@@ -329,6 +351,15 @@ struct BlockLoader : weight_loader::Loader {
                            c.pool, c.budget, c.maximum, c.eps};
         auto rotary = std::make_shared<RotaryEmbedding>(c.rotary, c.maximum, c.rope_base, c.sections, c.interleaved);
         return std::make_unique<Qsa>(std::move(weights), geometry, std::move(rotary));
+    }
+    auto dense_ffn(const std::string& p,const Config& c) const {
+        auto weights=std::make_shared<FFN>();
+        weights->down=load_quant_linear(execution,source,p+".down.weight");
+        weights->gate_up=load_paired_gate_up(execution,source,{p+".gate.weight",p+".up.weight"},weights->down);
+        TYLOINFER_RUNTIME_CHECK(weights->down.out()==c.hidden && weights->down.neuron_len()==c.moe_width,
+            "Dense Qwen4 FFN geometry differs from its config");
+        prepare_ffn_workspaces(execution,*weights);
+        return Linear{[weights](CudaExecutionContext& e,const Tensor& x){return weights->forward(e,x);}};
     }
     auto moe(weight_loader::Routed gate_up, weight_loader::Routed down, Linear router,
                     Linear shared_gate, Linear sg, Linear su, Linear sd, const Config &c) const {

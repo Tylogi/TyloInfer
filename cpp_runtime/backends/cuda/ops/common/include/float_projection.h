@@ -3,7 +3,7 @@
 #include <vector>
 
 struct NintWeight;
-// Single-row FP32 projections whose packed-row grid would underfill the GPU.
+// FP32 windows share weights while retaining each token's singleton sum tree.
 mfq_tensor_backend::Tensor try_dense_f32_projection_cuda(
     const mfq_tensor_backend::Tensor& input,const mfq_tensor_backend::Tensor& weight);
 int nint_float_projection_resident_blocks(int device);
@@ -21,6 +21,8 @@ mfq_tensor_backend::Tensor try_gr_bf16_down_cuda(
 std::vector<mfq_tensor_backend::Tensor> try_gr_bf16_down_injection_cuda(
     const mfq_tensor_backend::Tensor& input,const mfq_tensor_backend::Tensor& weight,
     const mfq_tensor_backend::Tensor& injection,int64_t streams);
+mfq_tensor_backend::Tensor try_gr_bf16_injection_cuda(
+    const mfq_tensor_backend::Tensor& input,const mfq_tensor_backend::Tensor& weight,int64_t streams);
 mfq_tensor_backend::Tensor try_gr_bf16_up_mix_cuda(
     const mfq_tensor_backend::Tensor& input,const mfq_tensor_backend::Tensor& normalized,
     const mfq_tensor_backend::Tensor& weight,int64_t streams);

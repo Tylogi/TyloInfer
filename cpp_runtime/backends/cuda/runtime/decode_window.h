@@ -42,6 +42,7 @@ public:
                  const std::function<void()>& restore,
                  const std::function<void()>& release_output = {});
     void enroll(Task task);
+    bool enroll_once(Task task);
     // The executor retains this stream's pool across windows; each captured
     // window also owns it until its final GPU submission has completed.
     void prepare_branch_stream(const StreamHandle& stream,std::shared_ptr<void>& owner);
@@ -64,6 +65,15 @@ public:
     void mark(int layer,const char* phase);
     void mark_current(const char* phase) {mark(profile_layer_,phase);}
     int set_profile_tile(int tile) noexcept {const int previous=profile_tile_;profile_tile_=tile;return previous;}
+    class ProfileTileScope {
+        DecodeWindow& window_;
+        int previous_;
+    public:
+        ProfileTileScope(DecodeWindow& window,int tile):window_(window),previous_(window.set_profile_tile(tile)){}
+        ProfileTileScope(const ProfileTileScope&)=delete;
+        ProfileTileScope& operator=(const ProfileTileScope&)=delete;
+        ~ProfileTileScope(){window_.set_profile_tile(previous_);}
+    };
     void set_profile_geometry(const char* role,int rows) {profile_role_=role;profile_rows_=rows;}
     void set_profile_layer_kind(int layer,const char* kind) {if(layer_profile_)profile_kinds_[layer]=kind;}
     std::vector<GpuPhase> gpu_phases() const;

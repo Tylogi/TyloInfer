@@ -6,6 +6,8 @@
 #include "mfq_cuda_context.h"
 #include "runtime/moe_residency.h"
 #include "runtime/dma_copy_batch.h"
+#include "runtime/routed_graph_pools.h"
+#include "runtime/cuda_event_status.h"
 #include "runtime/kv_expert_loan.h"
 #include "tyloinfer/host_parallel.h"
 #include "tyloinfer/moe_cpu_cost_model.h"
@@ -19,7 +21,7 @@
 struct MoeFfnPrefillHostWorkspace;
 struct CudaProfiler;
 class MoePinnedExpertArena;
-struct MoeSsdPrefillReader;
+class RoutedAdmissionExecutor;
 class MoeExpertCache {
 public:
     struct PrefillCopySubmission {
@@ -48,6 +50,16 @@ public:
     MoePrefillWorkspaceBudget prefill_workspace_budget(bool allow_borrow) const;
     std::optional<std::size_t> available_host_ram() const;
     std::size_t reclaim_optional_host(std::size_t allocation_bytes);
+    std::size_t reclaim_host_duplicates(std::size_t bytes);
+    std::size_t share_host(std::size_t bytes);
+    std::size_t host_minimum_bytes() const {
+        return std::max(host_experts_->minimum_budget(),pipeline_ram_complement_
+            ?static_cast<std::size_t>(pipeline_ram_complement_->nbytes()):std::size_t(0));
+    }
+    void resize_host(std::size_t bytes) {
+        if(bytes<host_minimum_bytes())throw std::runtime_error("host cache budget is below its RAM complement");
+        host_experts_->resize_budget(bytes);
+    }
     void reserve_workspace(std::size_t bytes) {if(reserve_workspace_)reserve_workspace_(bytes);}
     void set_workspace_reservation(std::function<void(std::size_t)> reserve,
                                    std::function<void(std::size_t)> reserve_ram={}) {
@@ -76,7 +88,12 @@ public:
         TYLOINFER_CUDA_CHECK(cudaEventCreateWithFlags(
             &route_done_, cudaEventDisableTiming));
         stages_.resize(4);
-        host_experts_=std::make_shared<MoeHostExpertCache>(config.moe_host_cache_bytes);
+        if(!config_.moe_host_cache_bytes) {
+            try {config_.moe_host_cache_bytes=mfq::host_memory_headroom(
+                mfq::sample_host_memory(),config_.moe_host_physical_bytes);}
+            catch(const std::runtime_error&) {}
+        }
+        host_experts_=std::make_shared<MoeHostExpertCache>(config_.moe_host_cache_bytes);
         for (auto & stage : stages_) {
             TYLOINFER_CUDA_CHECK(cudaEventCreateWithFlags(
                 &stage.done, cudaEventDisableTiming));
@@ -133,14 +150,11 @@ public:
         try {release_direct_transfer_cache();}catch(const std::exception& error) {
             std::cerr<<"runtime_direct_expert_cache destructor_error="<<error.what()<<'\n';
         }
-        if(pipeline_pool_context_) {
-            (void)cudaStreamSynchronize(pipeline_pool_stream_);
-        }
+        try{pipeline_graph_pools_.synchronize();}catch(...) {}
         // Drain and destroy copy graphs while their stream and graph buffers
         // are still alive. Every layer shares these two phase caches.
         for(auto& batch:pipeline_dma_batches_)batch.reset();
-        if(pipeline_pool_context_)
-            pipeline_pool_context_->end_graph_pool(pipeline_pool_stream_);
+        pipeline_graph_pools_.clear();
         if ((!registered_host_fields_.empty() || pinned_expert_arena_ ||
                 pipeline_prefill_host_ring_.defined() || pipeline_prefill_metadata_host_.defined()) &&
                 weight_stream_ != nullptr) {
@@ -299,6 +313,8 @@ public:
     int64_t budget_bytes() const noexcept {
         return budget_bytes_;
     }
+
+    std::size_t source_bytes() const noexcept {return source_bytes_;}
 
     int64_t allocated_bytes() const noexcept {
         return allocated_bytes_;
@@ -599,6 +615,7 @@ public:
     bool reuse_learning() const noexcept {return pipeline_reuse_learning_;}
     double ram_pcie_fraction() const noexcept { return ram_pcie_fraction_; }
     void finish_pipeline_exchanges() { if(moe_residency_)moe_residency_->apply_pending(); }
+    void fence_storage_consumers();
     void prepare_predictor_exchange() { if(moe_residency_)moe_residency_->prepare_predictor(); }
     void prepare_decode_residency() { if(moe_residency_)moe_residency_->prepare_decode(); }
 
@@ -1316,9 +1333,9 @@ private:
     SsdReadPriority ssd_read_priority_;
     std::unique_ptr<mfq::HostParallelPool> ssd_read_pool_;
     std::unique_ptr<mfq::HostParallelPool> ssd_background_read_pool_;
-    std::shared_ptr<MoeSsdPrefillReader> ssd_prefill_reader_;
+    std::shared_ptr<RoutedAdmissionExecutor> ssd_prefill_reader_;
     std::unique_ptr<mfq::HostParallelPool> ssd_prediction_pool_;
-    std::shared_ptr<MoeSsdPrefillReader> ssd_prediction_reader_;
+    std::shared_ptr<RoutedAdmissionExecutor> ssd_prediction_reader_;
     std::unique_ptr<SsdExpertReads> ssd_prediction_reads_,ssd_previous_prediction_;
     std::vector<SsdExpertRequest> ssd_pending_prediction_;
     std::function<void()> ssd_pending_forecast_;
@@ -1372,7 +1389,7 @@ private:
     uint64_t pipeline_wire_fallback_cells_=0,pipeline_wire_fallback_bytes_=0;
     std::vector<std::function<void()>> pipeline_decode_release_;
     std::vector<std::function<bool()>> pipeline_decode_indirect_;
-    // Eager prefill projections execute in order on pipeline_pool_stream_.
+    // Eager prefill projections execute in order on the shared graph stream.
     // Their quantization scratch can be reused across projections and layers.
     std::shared_ptr<MixedMoeRuntime> pipeline_prefill_activations_;
     std::shared_ptr<void> pipeline_prefill_dma_metadata_;
@@ -1433,8 +1450,7 @@ private:
     std::vector<DispatchRecord> pipeline_comparison_records_;
     std::vector<DispatchRecord> pipeline_dispatch_records_,pipeline_dispatch_replay_;
     std::size_t pipeline_dispatch_replay_cursor_=0;
-    std::shared_ptr<mfq::cuda::Context> pipeline_pool_context_;
-    cudaStream_t pipeline_pool_stream_=nullptr;
+    mfq::cuda::RoutedGraphPools pipeline_graph_pools_;
 
     void append_source_transfers(
         MoeCachedSource & source,
@@ -1473,8 +1489,7 @@ private:
             const size_t index =
                 (next_stage_ + offset) % stages_.size();
             auto & stage = stages_[index];
-            if (!stage.pending ||
-                cudaEventQuery(stage.done) == cudaSuccess) {
+            if (!stage.pending || mfq::cuda::cuda_event_ready(stage.done)) {
                 stage.pending = false;
                 next_stage_ = (index + 1) % stages_.size();
                 if (!stage.host.defined() ||
@@ -1501,7 +1516,6 @@ private:
                 }
                 return stage;
             }
-            (void)cudaGetLastError();
         }
         auto & stage = stages_[next_stage_];
         TYLOINFER_CUDA_CHECK(cudaEventSynchronize(stage.done));
@@ -1783,6 +1797,8 @@ private:
     void invalidate(const mfq::MoeCacheKey & key, int slot,bool retain_cold=true);
     void publish_quant_promotions(const std::vector<MoeCacheNewLease>& leases);
 
+    std::shared_ptr<MoeCachedSource> retain_source(std::shared_ptr<MoeCachedSource> source);
+    std::size_t source_bytes_ = 0;
     int64_t budget_bytes_ = 0;
     int64_t allocated_bytes_ = 0;
     int64_t host_bytes_ = 0;

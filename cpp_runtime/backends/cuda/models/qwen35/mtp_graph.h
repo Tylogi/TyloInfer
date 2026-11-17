@@ -7,6 +7,7 @@
 #include "runtime/decode_window.h"
 #include "mfq_cuda_context.h"
 #include "runtime/graph_pool_lease.h"
+#include "runtime/routed_cache_resources.h"
 #include "runtime/gdn_recorded_replay_batch.h"
 #include "mfq_cuda_sampling_ops.h"
 #include <cstdlib>
@@ -85,7 +86,7 @@ public:
                 model.cache_pos<=0 || model.speculative_start>=0 ||
                 model.execution->layer_placement.enabled() ||
                 model.execution->dense_cpu_layer_count ||
-                model.execution->moe_expert_cache || model.execution->gguf_expert_cache ||
+                mfq::cuda::has_routed_expert_cache(*model.execution) ||
                 model.num_experts()!=0 || model.decode_position_delta!=0 ||
                 model.rope.sections.numel()!=0) return false;
         for(const auto& block:model.blocks) {

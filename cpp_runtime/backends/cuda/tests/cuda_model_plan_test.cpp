@@ -91,6 +91,14 @@ int main() {
             cuda_component_state(flash, flash_plan, true, true), true, false),
             {true, true, false, false, false, false, true},
             "Qwen4 grid-ViT and MTP must be available together");
+        auto dense_qsa=flash;dense_qsa.backbone="qwen4";
+        const auto dense_plan=cuda_model_plan(dense_qsa);
+        require(cuda_backbone(dense_qsa.backbone)==CudaBackbone::qwen4_exp,
+            "Dense QSA did not reuse its shared execution adapter");
+        require_capabilities(cuda_runtime_capabilities(dense_qsa,dense_plan,
+            cuda_component_state(dense_qsa,dense_plan,true,true),true,false),
+            {true,true,false,false,false,false,true},
+            "Dense QSA grid-ViT and MTP capabilities mismatch");
         const auto require_grid_rejected = [](const mfq::ModelGraph& graph) {
             require(
                 cuda_model_plan(graph).vision ==

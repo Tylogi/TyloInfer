@@ -35,6 +35,7 @@ SOURCE = "\n".join(
         CUDA_ROOT / "include" / "mfq_cuda_attention_ops.h",
         CUDA_ROOT / "include" / "mfq_cuda_cache_ops.h",
         CUDA_ROOT / "include" / "mfq_cuda_norm_ops.h",
+        CUDA_ROOT / "include" / "mfq_cuda_profiler.h",
         CUDA_ROOT / "include" / "mfq_cuda_sampling_ops.h",
         CUDA_ROOT / "ops" / "common" / "include" / "cuda_execution.h",
         CUDA_ROOT / "ops" / "common" / "cuda_execution.cpp",
@@ -263,13 +264,16 @@ def test_full_flash_attention_accepts_gqa8_with_matching_tiles() -> None:
     implementation = ATTENTION_MMA_SOURCE.split(
         "mfq_attention_mma256_cuda", 1
     )[1].split("mfq_attention_mma128_cuda", 1)[0]
-    assert "(gqa_ratio == 4 || gqa_ratio == 8)" in implementation
+    assert "gqa_ratio > 0" in implementation
+    assert "gqa_ratio != 4 && gqa_ratio != 8" in implementation
+    assert "mfq_attention_mma_launch<256, 256, 32, 1>" in implementation
     assert "mfq_attention_mma_launch<256, 256, 16, 4>" in implementation
     assert "mfq_attention_mma_launch<256, 256, 8, 8>" in implementation
     selection = SOURCE.split(
         "const bool mma_attention_enabled =", 1
-    )[1].split("else if (sliding)", 1)[0]
-    assert "nh == 4 * nkh || nh == 8 * nkh" in selection
+    )[1].split("a = attention_cuda(", 1)[0]
+    assert "nkh > 0 && nh % nkh == 0" in selection
+    assert "mfq_attention_mma256_cuda(" in selection
 
 
 def test_minicpmo_bf16_residual_uses_contiguous_specialized_add() -> None:

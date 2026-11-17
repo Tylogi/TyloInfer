@@ -13,13 +13,20 @@
 #include "models/qwen4_exp/model.h"
 #include "storage/session_state.h"
 #include "moe.h"
+#if TYLOINFER_ENABLE_MFQ_COMPAT
 #include "storage/mfe_expert_store.h"
+#endif
 #include "storage/moe_expert_cache.h"
 #include "storage/weight_loader.h"
 #include "runtime/kv_memory.h"
 #include "runtime/kv_expert_loan.h"
 #include "runtime/dma_copy_batch.h"
+#include "runtime/device_memory_topology.h"
+#include "tyloinfer/native_file_path.h"
+#include "tyloinfer/tq_rows.h"
+#if TYLOINFER_ENABLE_MFQ_COMPAT
 #include "mfe_cached_dispatch_test.h"
+#endif
 #include "attention_mma_verify.h"
 
 #include <algorithm>
@@ -145,6 +152,14 @@ struct MemoryTensorSource final : mfq::ModelSource {
     void read_range_into(std::string_view, uint64_t offset, std::byte* output, size_t size) const override {
         check(offset <= bytes.size() && size <= bytes.size() - offset, "memory fixture range");
         if (size) std::memcpy(output, bytes.data() + offset, size);
+    }
+    TensorReader tensor_reader(std::string_view name) const override {
+        if(!find_tensor(name))throw std::out_of_range("unknown memory fixture tensor");
+        auto image=std::make_shared<const std::vector<std::uint8_t>>(bytes);
+        return [image=std::move(image)](std::uint64_t offset,std::byte* output,std::size_t count) {
+            check(offset<=image->size() && count<=image->size()-offset,"retained memory fixture range");
+            if(count)std::memcpy(output,image->data()+offset,count);
+        };
     }
     const std::vector<std::string>& assets() const noexcept override { return asset_names; }
     bool has_asset(std::string_view) const noexcept override { return false; }
@@ -315,6 +330,7 @@ static void check_dense_loading() {
     }
 }
 
+#if TYLOINFER_ENABLE_MFQ_COMPAT
 static void check_cached_moe_binding() {
     using namespace mfq_tensor_backend;
     MfeCpu cpu;
@@ -395,6 +411,8 @@ static void check_cached_moe_binding() {
         check(bool(other.moe_expert_cache), "releasing one cache changed another Engine");
     }
 }
+
+#endif
 
 static void check_gemma_composition() {
     using namespace mfq_tensor_backend;
@@ -590,13 +608,18 @@ static void check_tq_parallel() {
             TqRoutedWeight weight(resident,source,"weight",1,outputs,width);
             const auto input=tb::ones({1,width},options.dtype(tb::kFloat16));
             const auto ids=tb::zeros({1,1},options.dtype(tb::kInt64));
-            const auto expected=local.forward(execution,input).to(tb::kFloat32);
+            // Residency is checked against decoded weights. The ordinary
+            // projection may additionally quantize activations to Q8.
+            const auto expected=tb::matmul(input.to(tb::kFloat32),reference.to(tb::kFloat32).transpose(0,1))
+                .to(tb::kFloat16).to(tb::kFloat32);
             for(int pass=0;pass<2;++pass) {
                 const auto actual=weight.forward(input,ids).reshape({1,outputs}).to(tb::kFloat32);
                 const auto error=actual-expected;
                 const float scale=(expected*expected).sum().item<float>();
-                check(std::sqrt((error*error).sum().item<float>()/std::max(scale,1e-20f))<.0015f,
-                    "TQ default residency changed expert projection values");
+                const auto relative=std::sqrt((error*error).sum().item<float>()/std::max(scale,1e-20f));
+                if(relative>=.0015f)std::cerr<<"TQ residency mismatch columns="<<columns<<" pass="<<pass
+                    <<" relative="<<relative<<" budget="<<tq_expert_cache_budget_bytes(resident.tq_expert_cache)<<'\n';
+                check(relative<.0015f,"TQ default residency changed expert projection values");
             }
             const auto metrics=tq_expert_memory_metrics(resident.tq_expert_cache);
             const auto hits=std::find_if(metrics.begin(),metrics.end(),[](const auto& item) {
@@ -617,7 +640,8 @@ static void check_tq_parallel() {
             resize_tq_expert_cache(streamed.tq_expert_cache,std::size_t{1}<<20);
             auto input=((tb::arange(width,tb::TensorOptions().device(tb::kCPU).dtype(tb::kFloat32)).remainder(31)-15)*.01)
                 .to(tb::kFloat16).reshape({1,width});
-            const auto expected=local.forward(execution,input.to(tb::Device(tb::kCUDA,0))).to(tb::kCPU,tb::kFloat32);
+            const auto expected=tb::matmul(input.to(tb::Device(tb::kCUDA,0),tb::kFloat32),reference.to(tb::kFloat32).transpose(0,1))
+                .to(tb::kFloat16).to(tb::kCPU,tb::kFloat32);
             for(int device:{0,1,0,1}) {
                 const MfqCudaGuard guard(device);
                 const auto destination=tb::Device(tb::kCUDA,device);
@@ -703,6 +727,7 @@ static void check_ffn_branches() {
     }
 }
 
+#if TYLOINFER_ENABLE_MFQ_COMPAT
 static void check_linear_execution() {
     Nint8ZeroCpu nint_cpu;
     nint_cpu.out = 2;
@@ -777,6 +802,91 @@ static void check_linear_execution() {
     }
 }
 
+#endif
+
+static void check_collective_reset_device() {
+    int devices=0;
+    TYLOINFER_CUDA_CHECK(cudaGetDeviceCount(&devices));
+    if(devices<2) {
+        std::cout << "Collective reset device restoration requires two GPUs; skipped\n";
+        return;
+    }
+    const MfqCudaGuard primary(0);
+    ModelParallelCollectiveRuntime collective;
+    collective.devices={0,1};
+    collective.reset();
+    check(mfq_current_cuda_device()==0,"collective reset changed the caller's active CUDA device");
+}
+
+static void check_memory_topology() {
+    check(device_has_separate_memory(false, false), "discrete capability classification failed");
+    for (const auto flags : {std::pair{true, false}, std::pair{false, true}, std::pair{true, true}})
+        check(!device_has_separate_memory(flags.first, flags.second), "shared memory capability classification failed");
+    check(!separate_memory_override(nullptr) && !separate_memory_override("") &&
+        !separate_memory_override("unknown"), "unresolved memory override must use device capabilities");
+    check(separate_memory_override("discrete") == true && separate_memory_override("unified") == false,
+        "explicit memory topology override changed");
+    bool rejected = false;
+    try { (void)separate_memory_override("invalid"); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    check(rejected, "invalid memory topology override was silently accepted");
+    check(cuda_has_separate_memory() == device_has_separate_memory(mfq_current_cuda_device()),
+        "prefix and KV memory topology disagree");
+}
+
+static void check_paged_tensor_codecs() {
+    namespace tb = mfq_tensor_backend;
+    const auto device = mfq_current_cuda_device();
+    CudaPagedPayload int16_payload;
+    std::int32_t expected_code=0;
+    for (const auto dtype : {tb::kUInt8, tb::kInt8, tb::kInt16, tb::kInt32,
+                            tb::kInt64, tb::kFloat16, tb::kBFloat16, tb::kFloat32}) {
+        auto cpu = tb::empty({3, 5}, tb::TensorOptions().device(tb::kCPU).dtype(dtype));
+        auto* bytes = static_cast<std::uint8_t*>(cpu.data_ptr());
+        for (std::size_t i = 0; i < cpu.nbytes(); ++i) bytes[i] = std::uint8_t(i * 37 + 19);
+        auto source = cpu.to(tb::Device(tb::kCUDA, device)).transpose(0, 1);
+        CudaPagedWriter writer;
+        writer.tensor(source);
+        const auto payload = std::move(writer).finish();
+        check(payload->size()>=4 && (*payload)[0]==++expected_code &&
+            (*payload)[1]==0 && (*payload)[2]==0 && (*payload)[3]==0,
+            "paged tensor wire IDs changed with the backend enum");
+        CudaPagedReader reader(*payload);
+        const auto [decoded, owner] = reader.tensor();
+        reader.expect_end();
+        const auto expected = source.contiguous().to(tb::kCPU);
+        check(owner == device && decoded.scalar_type() == dtype && decoded.sizes() == expected.sizes(),
+              "paged tensor changed dtype, device or transposed dimensions");
+        check(std::memcmp(decoded.data_ptr(), expected.data_ptr(), expected.nbytes()) == 0,
+              "paged tensor changed encoded bits");
+        if (dtype == tb::kInt16) int16_payload = payload;
+    }
+    const auto rejected = [](const std::vector<std::uint8_t>& payload) {
+        try { CudaPagedReader reader(payload); (void)reader.tensor(); }
+        catch (const CudaSessionStateError&) { return true; }
+        return false;
+    };
+    auto corrupted = *int16_payload;
+    std::fill_n(corrupted.begin(), sizeof(std::int32_t), std::uint8_t{0x7f});
+    check(rejected(corrupted), "paged tensor accepted an unknown dtype");
+    corrupted = *int16_payload;
+    corrupted[1] = 1;
+    check(rejected(corrupted), "paged tensor accepted a dtype narrowed from an invalid integer");
+    corrupted = *int16_payload;
+    corrupted.pop_back();
+    check(rejected(corrupted), "paged tensor accepted a truncated INT16 payload");
+    corrupted = *int16_payload;
+    std::fill_n(corrupted.begin() + 32, sizeof(std::uint64_t), std::uint8_t{0});
+    check(rejected(corrupted), "paged tensor accepted an inconsistent INT16 byte count");
+    bool empty_rejected = false;
+    try {
+        CudaPagedWriter writer;
+        writer.tensor(tb::empty({0}, tb::TensorOptions().device(tb::Device(tb::kCUDA, device)).dtype(tb::kInt16)));
+    }catch (const std::runtime_error&) { empty_rejected = true; }
+    check(empty_rejected, "paged writer emitted an unreadable empty tensor");
+    std::cout << "Paged tensor codecs preserve quantized bytes and reject malformed payloads\n";
+}
+
 static void check_snapshots(CudaExecutionContext& execution, bool hybrid) {
     Qwen35CausalLm model;
     model.execution = &execution;
@@ -828,9 +938,9 @@ static void check_snapshots(CudaExecutionContext& execution, bool hybrid) {
     model.restore_text_session_state(decoded);
     check(model.decode_position_delta == 0, "paged text retained media position");
 
-    const auto directory = std::filesystem::temp_directory_path() /
+    const auto directory = mfq::native_file_path(std::filesystem::temp_directory_path() /
         ("mfq-runtime-state-" + std::to_string(
-            std::chrono::steady_clock::now().time_since_epoch().count()));
+            std::chrono::steady_clock::now().time_since_epoch().count())));
     {
         mfq::cache::PagedPrefixCacheConfig config;
         config.cache_dir = directory;
@@ -1775,14 +1885,19 @@ void check_dma_copy_buckets() {
 
 #include "kv_cache_bench.h"
 #include "mapped_copy_bench.h"
+#if TYLOINFER_ENABLE_MFQ_COMPAT
 #include "mfe_prepare_bench.h"
+#endif
+#if TYLOINFER_ENABLE_MFQ_COMPAT
 #include "mfe_transfer_bench.h"
+#endif
 #include "sampling_bench.h"
 #include "transfer_copy_bench.h"
 #include "kv_speculative_lru_test.h"
 int main(int argc, char** argv) try {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) return 77;
+    check_memory_topology();
     if (argc == 2 && std::string(argv[1]) == "--attention-prefix-check") {
         check_attention_logical_prefix(); return 0;
     }
@@ -1809,12 +1924,20 @@ int main(int argc, char** argv) try {
     if(argc==2 && std::string(argv[1])=="--kv-cache-bench") {benchmark_decode_kv_cache();return 0;}
     if(argc==2 && std::string(argv[1])=="--route-export-bench") {benchmark_route_export();return 0;}
     if(argc==2 && std::string(argv[1])=="--mapped-copy-bench") {benchmark_mapped_copy();return 0;}
+#if TYLOINFER_ENABLE_MFQ_COMPAT
     if(argc==2 && std::string(argv[1])=="--mfe-prepare-bench") {benchmark_mfe_prepare();return 0;}
+#endif
+#if TYLOINFER_ENABLE_MFQ_COMPAT
     if(argc==2 && std::string(argv[1])=="--mfe-prepare-check") {benchmark_mfe_prepare(false);return 0;}
+#endif
     if(argc==2 && std::string(argv[1])=="--mapped-copy-check") {benchmark_mapped_copy(false);return 0;}
     if(argc==2 && std::string(argv[1])=="--mapped-copy-pcie-bench") {benchmark_mapped_copy(true,true);return 0;}
+#if TYLOINFER_ENABLE_MFQ_COMPAT
     if(argc==2 && std::string(argv[1])=="--mfe-transfer-bench") {benchmark_mfe_transfer();return 0;}
+#endif
+#if TYLOINFER_ENABLE_MFQ_COMPAT
     if(argc==2 && std::string(argv[1])=="--mfe-transfer-check") {benchmark_mfe_transfer(false);return 0;}
+#endif
     if(argc==2 && std::string(argv[1])=="--kv-append-check") {
         check_exclusive_kv();check_decode_kv_append();
         std::cout<<"Exclusive short KV/index append and graph replay checks passed\n";return 0;
@@ -1834,17 +1957,25 @@ int main(int argc, char** argv) try {
     check_speculative_recurrent_input_reuse();
     check_attention_logical_prefix();
     check_sampling_storage();
+#if TYLOINFER_ENABLE_MFQ_COMPAT
     check_linear_execution();
+#endif
     check_graph_warmup_state();
     check_dense_loading();
+#if TYLOINFER_ENABLE_MFQ_COMPAT
     check_cached_moe_binding();
+#endif
     check_gemma_composition();
     check_tts_sampling();
     check_ffn_branches();
     check_tq_parallel();
+#if TYLOINFER_ENABLE_MFQ_COMPAT
     check_mfe_cached_dispatch_geometry();
+#endif
     {
         CudaExecutionContext execution;
+        check_collective_reset_device();
+        check_paged_tensor_codecs();
         check_snapshots(execution, false);
         check_snapshots(execution, true);
     }

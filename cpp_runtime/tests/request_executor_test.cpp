@@ -92,6 +92,7 @@ struct TestBackend {
         template <class T> ControlResult control(T) {
             if constexpr (std::is_same_v<T, RuntimeMetrics>)
                 return Metrics{{"advances", double(advances)}};
+            else if constexpr(std::is_same_v<T,DecisionTokens>)return DecisionResult{};
             else throw std::invalid_argument("no duplex in test backend");
         }
     } ops;
@@ -105,6 +106,7 @@ struct TestBackend {
         if (fail_load) throw std::runtime_error("load failed after allocation");
         ops = Operations{};
         auto metadata = info();
+        metadata.decisions=true;
         metadata.max_context = options.context_size;
         return std::pair{metadata, std::unique_ptr<TextProcessor>{}};
     }
@@ -139,6 +141,9 @@ static void check_engine_lifecycle() {
     assert(first.admit(request()) == Admission::accepted);
     first.step({"one"});
     assert(first_instance.backend.ops.live == 1);
+    bool busy=false;
+    try{first.control(DecisionTokens{});}catch(const ControlBusyError&){busy=true;}
+    assert(busy && std::holds_alternative<DecisionResult>(second.control(DecisionTokens{})));
     rejects([&] { first.reload(48); });
     rejects([&] { second.reload(0); });
     assert(first_instance.backend.loads == 1 && second_instance.backend.loads == 1);

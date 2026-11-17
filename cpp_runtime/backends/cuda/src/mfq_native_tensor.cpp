@@ -1,4 +1,5 @@
 #include "mfq_native_tensor.h"
+#include "../runtime/host_storage_cache.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -40,6 +41,10 @@ struct HostStoragePool {
         idle-=block.bytes;block={};
     }
     ~HostStoragePool(){for(auto& block:blocks)erase(block);}
+    std::size_t clear() {
+        std::lock_guard lock(mutex);const auto bytes=idle;
+        for(auto& block:blocks)erase(block);return bytes;
+    }
     Block acquire(std::size_t bytes) {
         Block result;
         const auto capacity=(bytes+4095)/4096*4096;
@@ -75,6 +80,10 @@ struct HostStoragePool {
     }
 };
 
+const std::shared_ptr<HostStoragePool>& host_storage_pool() {
+    static auto pool=std::make_shared<HostStoragePool>();return pool;
+}
+
 std::shared_ptr<TensorStorage> allocate_cpu_storage(std::size_t bytes, bool pinned) {
     if (pinned) {
         throw std::invalid_argument(
@@ -87,7 +96,7 @@ std::shared_ptr<TensorStorage> allocate_cpu_storage(std::size_t bytes, bool pinn
         // Keep only a bounded idle working set. SSD expert churn can reuse
         // these pages instead of repeatedly freeing and faulting megabytes.
         // Live views retain the allocation; pinned storage uses its own path.
-        static auto pool=std::make_shared<HostStoragePool>();
+        const auto& pool=host_storage_pool();
         const auto block=pool->acquire(allocation_bytes);pointer=block.data;
         owner=std::shared_ptr<void>(pointer,[held=pool,capacity=block.bytes](void* value){held->release(value,capacity);});
     } else {
@@ -259,6 +268,10 @@ void copy_contiguous_cpu(Tensor& destination, const Tensor& source) {
 }
 
 }  // namespace
+
+std::size_t reclaim_tensor_host_storage_cache() noexcept {
+    try{return host_storage_pool()->clear();}catch(...){return 0;}
+}
 
 // Implemented in mfq_native_tensor.cu for CUDA allocations and copies.
 Tensor empty_cuda(std::span<const std::int64_t> shape, const TensorOptions& options);

@@ -155,6 +155,21 @@ void test_token_count_contract() {
     assert(counted["tokenization"] == "raw-no-special-tokens");
 }
 
+void test_decision_control_exclusion() {
+    FakeEngine engine;
+    MfqScheduler scheduler(engine,{64,8192});
+    auto input=request(0,1000);input.token_ids={61};
+    auto handle=scheduler.submit(std::move(input));
+    while(engine.advances[0]<3)std::this_thread::yield();
+    for(auto command:std::vector<ControlRequest>{DecisionText{},DecisionTokens{}}) {
+        bool rejected=false;
+        try{(void)scheduler.control(std::move(command));}catch(const ControlBusyError&){rejected=true;}
+        assert(rejected);
+    }
+    scheduler.cancel_request("0");drain(handle,true);
+    assert(std::holds_alternative<Metrics>(scheduler.control(DecisionTokens{})));
+}
+
 void test_benchmark_input_contract() {
     using namespace mfq::transport_detail;
     json params = {{"input", {{"messages", json::array({{{"role", "user"}, {"content", "test input"}}})}, {"preformatted_prompt", "test input"},
@@ -224,6 +239,7 @@ int main() {
     test_probability_contract();
     test_benchmark_input_contract();
     test_token_count_contract();
+    test_decision_control_exclusion();
     test_decode_timing();
     {
         FakeEngine engine;

@@ -169,9 +169,82 @@ void packed_convolution(bool focused=false) {
     }
     std::cout<<"Packed GDN prefill f16/f32 + strided QKV/gates PASS"<<std::endl;
 }
+void cold_state_case() {
+    using namespace mfq::cuda;
+    using namespace mfq::cuda::qwen4_exp;
+    constexpr int hidden=64,nk=2,nv=6;
+    for(int width:{32,64,128})for(int batch:{1,2})for(auto dtype:{tb::kFloat16,tb::kFloat32}) {
+        const auto linear=[&](int in,int out,int salt) -> Linear {
+            auto weight=data({out,in},salt,.03f).to(dtype);
+            return [weight](CudaExecutionContext&,const Tensor& x) {
+                return tb::matmul(x.to(weight.scalar_type()),weight.transpose(-1,-2));
+            };
+        };
+        const auto options=tb::TensorOptions().device(tb::kCUDA).dtype(tb::kFloat32);
+        const int channels=(2*nk+nv)*width;
+        const GdnWeights weights{linear(hidden,channels,620),linear(hidden,nv*width,621),
+            linear(hidden,nv,622),linear(hidden,nv,623),linear(nv*width,hidden,624),
+            data({channels,4},625,.02f),tb::zeros({nv},options),tb::zeros({nv},options),tb::ones({width},options)};
+        Gdn cold(weights,nk,nv,width,4,1e-6,true),warm(weights,nk,nv,width,4,1e-6,true);
+        CudaExecutionContext execution;
+        auto input=data({batch,1,hidden},626,.2f).to(dtype);
+        warm.forward_chunk(execution,input,true);warm.reset(true);
+        equal(cold.forward_chunk(execution,input,true),warm.forward_chunk(execution,input,true),
+            "cold and retained GDN first-token output differ",0,0);
+        const auto a=cold.graph_state(),b=warm.graph_state();
+        for(int i=0;i<2;++i)equal(*a[i],*b[i],"cold and retained GDN first-token state differs",0,0);
+    }
+    std::cout<<"GDN cold/retained first-token output and state: 12 exact cases PASS\n";
+}
+void recurrent_workspace_case() {
+    using namespace mfq::cuda;
+    using namespace mfq::cuda::qwen4_exp;
+    constexpr int hidden=64,nk=1,nv=2,width=32,channels=(2*nk+nv)*width;
+    CudaExecutionContext execution;
+    const auto linear=[](int in,int out,int salt) -> Linear {
+        auto weight=data({out,in},salt,.03f);
+        return [weight](CudaExecutionContext&,const Tensor& x) {
+            return tb::matmul(x.to(weight.scalar_type()),weight.transpose(-1,-2));
+        };
+    };
+    const auto options=tb::TensorOptions().device(tb::kCUDA).dtype(tb::kFloat32);
+    const GdnWeights weights{linear(hidden,channels,610),linear(hidden,nv*width,611),
+        linear(hidden,nv,612),linear(hidden,nv,613),linear(nv*width,hidden,614),
+        data({channels,4},615,.02f),tb::zeros({nv},options),tb::zeros({nv},options),tb::ones({width},options)};
+    const auto context=default_context(mfq_current_cuda_device());
+    const auto stream=mfq_current_cuda_stream();
+    for(int tokens:{1,4,17})for(bool requested_storage:{false,true}) {
+        Gdn actual(weights,nk,nv,width,4,1e-6,true),reference(weights,nk,nv,width,4,1e-6,true);
+        if(requested_storage)actual.initialize_request_cache();
+        const auto input=data({1,tokens,hidden},616,.2f);
+        if(tokens==1) {
+            reference.forward_chunk(execution,input,true);
+            reference.reset(true);
+        }
+        const auto expected=reference.forward_chunk(execution,input,true);
+        auto backing=tb::empty({2<<20},options.dtype(tb::kUInt8));
+        context->begin_workspace_loan({{backing.data_ptr(),backing.nbytes()}},stream);
+        {
+            const auto output=actual.forward_chunk(execution,input,true);
+            equal(output,expected,"borrowed GDN output changed",0,0);
+        }
+        if(context->workspace_live_bytes())throw std::runtime_error("GDN retained borrowed recurrent storage");
+        context->end_workspace_loan();backing.fill_(0);
+        const auto a=actual.graph_state(),b=reference.graph_state();
+        equal(*a[0],*b[0],"returned workspace changed GDN convolution",0,0);
+        equal(*a[1],*b[1],"returned workspace changed GDN recurrence",0,0);
+        const auto next=data({1,1,hidden},617,.2f);
+        equal(actual.forward_chunk(execution,next,true),reference.forward_chunk(execution,next,true),
+            "GDN continuation after workspace return changed",0,0);
+    }
+    std::cout<<"GDN persistent state survives borrowed workspace return: 6 cases PASS\n";
+}
 int main(int argc,char** argv) {
     int count=0;if(cudaGetDeviceCount(&count)!=cudaSuccess || count==0)return 77;
     try {
+        cold_state_case();
+        recurrent_workspace_case();
+        if(argc==2 && std::string(argv[1])=="--recurrent-workspace-check")return 0;
         const auto context=mfq::cuda::default_context(mfq_current_cuda_device());
         const auto stream=mfq_current_cuda_stream();context->begin_graph_pool(stream);
         struct ReleasePool {

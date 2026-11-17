@@ -101,7 +101,7 @@ include = ["tyloinfer*"]
 [tool.setuptools.package-data]
 "tyloinfer._gyro" = ["*.h", "*.inc", "*.c", "*.bin", "LICENSE", "NOTICE"]
 "tyloinfer.kernels.hip" = ["*.hip", "*.h"]
-"tyloinfer.kernels.cuda" = ["tq_ops.cu", "tq_ops.h", "tq_*.cuh"]
+"tyloinfer.kernels.cuda" = ["tq_ops.cu", "tq_indexed.cu", "tq_routed_views.cu", "tq_ops.h", "tq_*.cuh", "gr_bf16_projection.cuh", "prefill_scale.cuh", "routed_prefill_f16.cuh"]
 "tyloinfer.kernels.metal" = ["tq_decode.h", "tq_matmul.h"]
 "tyloinfer.server" = [
     "protocol/*.json",

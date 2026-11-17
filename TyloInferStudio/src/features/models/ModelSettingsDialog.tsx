@@ -10,11 +10,13 @@ import { useSettings } from '../settings/SettingsProvider';
 import { ModelContextSettings } from '../runtime/ModelContextSettings';
 import { ModelLoadContext } from './ModelLoadContext';
 import { ModelLoadPolicy } from './ModelLoadPolicy';
+import { getApiBaseUrl } from '../../shared/api/client';
+import { jevEndpoint } from '../runtime/endpoint';
 import type { useModelCatalog } from './useModelCatalog';
 
 export function ModelSettingsDialog({ catalog }: { catalog: ReturnType<typeof useModelCatalog> }) {
   const { tr } = useSettings();
-  const { refreshRuntime } = useRuntime();
+  const { refreshRuntime, studio } = useRuntime();
   const connectionScope = useConnectionScope();
   const [section, setSection] = useState('context');
   const [pinned, setPinned] = useState(false);
@@ -24,14 +26,15 @@ export function ModelSettingsDialog({ catalog }: { catalog: ReturnType<typeof us
   const [error, setError] = useState('');
   const name = catalog.settingsModel;
   const artifact = catalog.artifacts.find(model => model.name === name);
+  const defaultSection = artifact?.structured_decisions ? 'residency' : 'context';
   const instance = catalog.instances?.find(model => model.model === name && model.state !== 'failed');
   const loaded = instance?.state === 'ready' || instance?.state === 'busy';
   const wasLoaded = useRef(false);
   if (loaded) wasLoaded.current = true;
   useEffect(() => {
-    setSection('context'); setSaving(false); setSaved(false); setError('');
+    setSection(defaultSection); setSaving(false); setSaved(false); setError('');
     setPinned(instance?.pinned ?? false); setTtl(instance?.idle_ttl_seconds ?? null);
-  }, [name, instance?.id, catalog.connectionRevision]);
+  }, [name, instance?.id, catalog.connectionRevision, defaultSection]);
   if (!name) return null;
 
   async function applyResidency() {
@@ -64,6 +67,11 @@ export function ModelSettingsDialog({ catalog }: { catalog: ReturnType<typeof us
         }}>{label}</button>)}
     </div>
     <div className="model-settings-body">
+      {artifact?.structured_decisions && <p className="configuration-effect">
+        Jev API: <code style={{ overflowWrap: 'anywhere' }}>POST {jevEndpoint(studio?.service_url || getApiBaseUrl() || window.location.origin)}</code><br />
+        {tr('与 OpenAI 共用端口，无需另设端口。客户端需显式调用此地址，并将 model 设为当前模型名称。',
+          'Shares the OpenAI port; no separate port is needed. Call this URL explicitly and set model to this model’s name.')}
+      </p>}
       <section role="tabpanel" id="model-settings-section-context" aria-labelledby="model-settings-tab-context" hidden={section !== 'context'}>
         {loaded || wasLoaded.current ? <>
           <p className="configuration-effect">{tr('保存到服务端；应用上下文或 KV 更改会重载此模型并清除活动 KV。', 'Saved on the server. Applying context or KV changes reloads this model and clears its active KV cache.')}</p>

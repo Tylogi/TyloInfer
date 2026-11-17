@@ -3,6 +3,7 @@
 #include "minicpmo45.h"
 #include "storage/model_source.h"
 #include "tyloinfer/model_source.h"
+#include "tyloinfer/decision_model.h"
 #include "transport.h"
 #include "mtp_limits.h"
 #include "nlohmann/json.hpp"
@@ -33,6 +34,7 @@ void print_help() {
         << "  --model PATH                    model or split-model shard\n"
         << "  --dflash2-draft PATH            DFlash2 checkpoint for compatible Qwen text\n"
         << "  --inspect-model-json            inspect metadata without loading GPU weights\n"
+        << "  --jev-weights stream|vram       Jev weights: two layer buffers (default) or full VRAM\n"
         << "  --config PATH                   external model config\n"
         << "  --transport TYPE                stdio or http\n"
         << "  --host HOST                     HTTP bind host (default 127.0.0.1)\n"
@@ -231,6 +233,7 @@ int execute_runtime(RuntimeCommandOptions options) {
             nlohmann::json result{{"architecture", source->architecture()},
                 {"config", nlohmann::json::parse(source->model_config_json())},
                 {"paths", nlohmann::json::array()}, {"tensors", nlohmann::json::object()}};
+            result["structured_decisions"] = bool(mfq::decision_model_spec(*source));
             for (const auto& path : source->source_paths()) {
                 const auto value = path.generic_u8string();
                 result["paths"].push_back(std::string(value.begin(), value.end()));

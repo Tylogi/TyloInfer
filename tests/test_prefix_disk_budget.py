@@ -2,6 +2,8 @@ import os
 import struct
 from pathlib import Path
 
+import pytest
+
 from tyloinfer.server.runtime.prefix_disk_budget import maintain_prefix_disk_budget
 
 
@@ -43,7 +45,12 @@ def test_eviction_never_follows_links_or_deletes_unmanaged_files(tmp_path):
     external = tmp_path / 'external'
     path = block(external, 'b', '2')
     cache.mkdir()
-    (cache / ('b' * 64)).symlink_to(external / ('b' * 64), target_is_directory=True)
+    try:
+        (cache / ('b' * 64)).symlink_to(external / ('b' * 64), target_is_directory=True)
+    except OSError as error:
+        if getattr(error, 'winerror', None) == 1314:
+            pytest.skip('Symbolic link creation requires Windows developer mode or privilege')
+        raise
     owned = block(cache, 'a', '1')
     (owned.parent / ('2' * 64 + '.tqkv')).symlink_to(path)
     unrelated = owned.parent / 'notes.txt'

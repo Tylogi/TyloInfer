@@ -14,7 +14,7 @@ void qsa_scalar_history_chain_case() {
         std::shared_ptr<KvMemoryManager> memory;
         if(mode) {
             KvMemoryOptions policy;policy.placement=mode==1?"auto":"auto_ssd";policy.budget_policy=true;
-            policy.gpu_budget=2*(maximum+maximum/pool)*iw*2+8*kv*width*4;
+            policy.gpu_budget=2*(maximum+maximum/pool)*(iw+2)*sizeof(std::int16_t)+8*kv*width*4;
             policy.ram_limit_set=true;policy.ram_limit=mode==1?2*maximum*kv*width*4:256;
             policy.directory=(std::filesystem::current_path()/"qsa-scalar-history-chain-test").string();
             memory=std::make_shared<KvMemoryManager>(policy);
@@ -92,7 +92,7 @@ void qsa_history_prime_case() {
         std::shared_ptr<KvMemoryManager> memory;
         if(mode) {
             KvMemoryOptions policy;policy.placement=mode==1?"auto":"auto_ssd";policy.budget_policy=true;
-            policy.gpu_budget=(maximum+maximum/pool)*iw*2+(mode==1?maximum:4)*kv*width*4;
+            policy.gpu_budget=(maximum+maximum/pool)*(iw+2)*sizeof(std::int16_t)+(mode==1?maximum:4)*kv*width*4;
             policy.ram_limit_set=true;policy.ram_limit=mode==1?maximum*kv*width*4:256;
             policy.directory=(std::filesystem::current_path()/"qsa-history-prime-test").string();
             memory=std::make_shared<KvMemoryManager>(policy);

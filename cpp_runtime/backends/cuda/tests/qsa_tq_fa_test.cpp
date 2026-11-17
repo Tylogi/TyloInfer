@@ -1,3 +1,4 @@
+#include "mfq_cuda_activation_ops.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include "kernels/qsa_tq.h"
@@ -23,7 +24,7 @@ void check_materialized_gate() {
     Device<float> dg(n),du(n),dy(n);Device<half> dgh(n),duh(n),dyh(n);
     dg.put(gate);du.put(up);dgh.put(gh);duh.put(uh);
     for(bool fp16:{false,true})for(bool silu:{false,true}) {
-        mfq::cuda::gguf::materialize_gated_input(fp16?static_cast<void*>(duh.p):du.p,
+        mfq::cuda::materialize_gated_input(fp16?static_cast<void*>(duh.p):du.p,
             fp16?static_cast<void*>(dgh.p):dg.p,fp16,n,silu,fp16?static_cast<void*>(dyh.p):dy.p,nullptr);
         if(fp16)ck(cudaMemcpy(oh.data(),dyh.p,n*2,cudaMemcpyDeviceToHost));
         else ck(cudaMemcpy(out.data(),dy.p,n*4,cudaMemcpyDeviceToHost));

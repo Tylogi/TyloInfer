@@ -62,6 +62,8 @@ struct MoeDiagnostics {
 MoeDiagnostics moe_diagnostics();
 // Operator and storage controls are parsed only at this execution boundary.
 std::optional<int> embedding_mapped();
+std::optional<bool> layer_weight_streaming();
+bool layer_weight_timings();
 std::optional<bool> gdn_inplace_state();
 std::optional<bool> gdn_prefill_fused();
 std::optional<bool> gr_dense_vector();
@@ -129,6 +131,7 @@ std::optional<bool> gdn_prefill_layer_batch();
 std::optional<bool> gr_prefill_layer_batch();
 std::optional<bool> gr_chain_ffn_post();
 std::optional<bool> mtp_predictor_graph();
+bool load_native_mtp();
 // Unset preserves QSA; zero selects full-context dense draft attention.
 std::optional<std::int64_t> mtp_attention_window();
 std::optional<std::int64_t> continuous_ffn_tile();

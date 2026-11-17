@@ -244,6 +244,16 @@ int main() {
             require(rejected, "invalid active predictor configuration was accepted");
         }
 
+        auto dense_qsa=flash;
+        dense_qsa["model_type"]="qwen4_text";dense_qsa["num_experts"]=0;
+        dense_qsa["intermediate_size"]=48;dense_qsa["hc_count"]=1;
+        dense_qsa["mtp_num_hidden_layers"]=0;
+        const auto dense_config=mfq::models::qwen4_exp::Config::parse(dense_qsa);
+        require(dense_config.experts==0 && dense_config.topk==0 && dense_config.shared_width==0 &&
+            dense_config.moe_width==48 && dense_config.streams==1,"Dense QSA retained routed or GR geometry");
+        dense_qsa["num_experts"]=8;rejected=false;
+        try{mfq::models::qwen4_exp::Config::parse(dense_qsa);}catch(const std::runtime_error&){rejected=true;}
+        require(rejected,"Dense Qwen4 accepted routed expert configuration");
         std::cout << "model config tests passed\n";
         return 0;
     } catch (const std::exception& error) {

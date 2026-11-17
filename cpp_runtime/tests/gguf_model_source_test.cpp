@@ -784,6 +784,66 @@ void qwen35_nextn_source(const std::filesystem::path& directory) {
 }
 }
 
+namespace {
+void fixture_composition(const std::filesystem::path& directory,const std::filesystem::path& base) {
+    auto* tensors=ggml_init({1<<20,nullptr,false});
+    auto* header=gguf_init_empty();
+    gguf_set_val_str(header,"general.architecture","qwen35");
+    gguf_set_val_u32(header,"qwen35.embedding_length",256);
+    gguf_set_val_u32(header,"qwen35.attention.head_count",2);
+    gguf_set_val_u32(header,"qwen35.block_count",1);
+    auto* norm=ggml_new_tensor_1d(tensors,GGML_TYPE_F32,256);
+    ggml_set_name(norm,"output_norm.weight");
+    for(int i=0;i<256;++i)static_cast<float*>(norm->data)[i]=7;
+    gguf_add_tensor(header,norm);
+    const auto donor=directory/"fixture-donor.gguf";
+    require(gguf_write_to_file(header,donor.string().c_str(),false),"fixture donor write failed");
+    gguf_free(header);ggml_free(tensors);
+    using json=nlohmann::json;
+    const auto fixture=directory/"composition.tq-fixture.json";
+    json spec{{"format","mfq-tq-fixture-v1"},{"synthetic",true},{"reference",base.filename().string()},
+        {"source_files",json::array()},{"tensors",json::object()},
+        {"config_patch",{{"model_type","qwen4_exp"},{"fixture_value",7}}},
+        {"borrowed_sources",json::array({{{"path",donor.filename().string()},
+            {"tensors",json::array({"model.output_norm.weight"})}}})}};
+    const auto write=[&](const json& value){std::ofstream stream(fixture);stream<<value;};
+    write(spec);
+    auto source=mfq::open_model_source(fixture);
+    mfq::GgufModelSource original(base);
+    require(source->architecture()=="qwen4_exp" && source->resolved_model_graph().backbone=="qwen4_exp",
+        "fixture config patch did not replace its graph");
+    require(json::parse(source->model_config_json()).at("fixture_value")==7,"fixture config asset was not patched");
+    require(source->read("model.token_embedding.weight")==original.read("model.token_embedding.weight"),
+        "fixture changed its referenced quantized weights");
+    require(source->legacy_tensor_compatibility().layout.qwen_gdn_gguf_layout==
+        original.legacy_tensor_compatibility().layout.qwen_gdn_gguf_layout,"fixture lost base layout semantics");
+    const auto expected=source->read("model.output_norm.weight");float value=0;
+    std::memcpy(&value,expected.data()+12,sizeof(value));require(value==7,"fixture ignored borrowed weight data");
+    const auto retained=source->tensor_reader("model.output_norm.weight");
+    const auto mapped=source->mapped_tensor_reader("model.token_embedding.weight");
+    require(bool(mapped)==bool(original.mapped_tensor_reader("model.token_embedding.weight")),
+        "fixture lost mapped row reads");
+    require(bool(source->tensor_batch_reader("model.token_embedding.weight")),"fixture lost batched row reads");
+    const auto range=source->tensor_file_range("model.output_norm.weight");
+    const mfq::GgufModelSource donor_source(donor);
+    const auto donor_range=donor_source.tensor_file_range("model.output_norm.weight");
+    require(bool(range)==bool(donor_range),"fixture changed donor range capability");
+    if(range)require(range->path==donor_range->path && range->offset==donor_range->offset && range->nbytes==donor_range->nbytes,
+        "fixture lost donor file range geometry");
+    source.reset();std::vector<std::byte> actual(expected.size());retained(0,actual.data(),actual.size());
+    require(actual==expected,"retained borrowed reader lost its owner");
+    for(int invalid=0;invalid<3;++invalid) {
+        auto bad=spec;
+        if(invalid==0)bad["reference"]=fixture.filename().string();
+        else if(invalid==1)bad["borrowed_sources"][0]["tensors"]={"missing"};
+        else bad["borrowed_sources"].push_back(bad["borrowed_sources"][0]);
+        write(bad);bool rejected=false;
+        try{mfq::open_model_source(fixture);}catch(const std::exception&){rejected=true;}
+        require(rejected,"invalid fixture composition was accepted");
+    }
+    write(spec);require(bool(mfq::open_model_source(fixture)),"fixture failure retained a recursive-open guard");
+}
+}
 int main() {
     const auto directory = std::filesystem::temp_directory_path() /
         ("tinfer-gguf-test-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
@@ -811,6 +871,7 @@ int main() {
         gguf_add_tensor(gguf, norm);
         const auto path = directory / "model.gguf";
         require(gguf_write_to_file(gguf, path.string().c_str(), false), "GGUF write failed");
+        fixture_composition(directory,path);
         raw_part_source(path);
         raw_part_source(path, {}, 2);
         raw_part_source(path, {}, 2, 16, 0);

@@ -59,6 +59,7 @@ std::vector<mfq_tensor_backend::Tensor> residual_pre(
         const GatedResidualMixProjection& mixed_projection,const GatedResidualMarker& marker,
         const GatedResidualActivationProjection& activated_down,
         const GatedResidualActivationProjection& activated_injection,
+        const GatedResidualDownInjectionProjection& combined_down,
         const mfq_tensor_backend::Tensor& prepared_norm = {}) {
     namespace tb = mfq_tensor_backend;
     TYLOINFER_RUNTIME_CHECK(input.dim() >= 1 && hidden > 0 && streams > 0 &&
@@ -70,8 +71,11 @@ std::vector<mfq_tensor_backend::Tensor> residual_pre(
     if(marker)marker("norm");
     const bool fused=execution.config.gr_fused_projections;
     const bool epilogue=fused && execution.config.gr_fused_projection_activation;
-    const bool down_activated=epilogue && bool(activated_down);
-    auto low = down_activated?activated_down(execution,normalized,streams,false):down(execution, normalized);
+    auto combined=epilogue && combined_down?combined_down(execution,normalized,streams):std::vector<tb::Tensor>{};
+    TYLOINFER_RUNTIME_CHECK(combined.empty() || combined.size()==2,"gated-residual combined projection result disagrees");
+    const bool down_activated=!combined.empty() || (epilogue && bool(activated_down));
+    auto low = !combined.empty()?combined[0]:
+        down_activated?activated_down(execution,normalized,streams,false):down(execution, normalized);
     if(marker)marker("down");
     TYLOINFER_RUNTIME_CHECK(low.dim() == input.dim() && low.size(-1) > 0,
         "gated-residual bottleneck rank disagrees");
@@ -87,9 +91,11 @@ std::vector<mfq_tensor_backend::Tensor> residual_pre(
         return mfq_qwen4_exp::gated_residual_mix(mixing,normalized,streams);
     }();
     if(marker)marker("up_mix");
-    tb::Tensor injection;
+    tb::Tensor injection=combined.empty()?tb::Tensor{}:combined[1];
     if (inject) {
-        if(epilogue && activated_injection) {
+        if(injection.defined()) {
+            if(marker)marker("inject");
+        } else if(epilogue && activated_injection) {
             injection=activated_injection(execution,normalized,streams,true);
             if(marker)marker("inject");
         } else {
@@ -114,9 +120,10 @@ std::vector<mfq_tensor_backend::Tensor> gated_residual_pre_projected(
     const GatedResidualProjection& up,const GatedResidualProjection& inject,
     int64_t hidden,int64_t streams,double eps,const GatedResidualMixProjection& mixed,
     const GatedResidualMarker& marker,const GatedResidualActivationProjection& activated_down,
-    const GatedResidualActivationProjection& activated_injection) {
+    const GatedResidualActivationProjection& activated_injection,
+    const GatedResidualDownInjectionProjection& combined_down) {
     return residual_pre(execution,input,norm,down,up,inject,hidden,streams,eps,
-        mixed,marker,activated_down,activated_injection);
+        mixed,marker,activated_down,activated_injection,combined_down);
 }
 
 std::vector<mfq_tensor_backend::Tensor> gated_residual_pre_after_projected(
@@ -126,15 +133,16 @@ std::vector<mfq_tensor_backend::Tensor> gated_residual_pre_after_projected(
     const GatedResidualProjection& up,const GatedResidualProjection& inject,
     int64_t hidden,int64_t streams,double eps,const GatedResidualMixProjection& mixed,
     const GatedResidualMarker& marker,const GatedResidualActivationProjection& activated_down,
-    const GatedResidualActivationProjection& activated_injection) {
+    const GatedResidualActivationProjection& activated_injection,
+    const GatedResidualDownInjectionProjection& combined_down) {
     if(!execution.config.gr_fused_projections || !execution.config.gr_fused_post_norm) {
         auto input=mfq_qwen4_exp::gated_residual_post(branch,residual,prior_injection,streams);
         return residual_pre(execution,input,norm,down,up,inject,hidden,streams,eps,
-            mixed,marker,activated_down,activated_injection);
+            mixed,marker,activated_down,activated_injection,combined_down);
     }
     TYLOINFER_RUNTIME_CHECK(branch.size(-1)==hidden,"gated-residual chained hidden width disagrees");
     if(marker)marker("begin");
     auto prepared=mfq_qwen4_exp::gated_residual_post_norm(branch,residual,prior_injection,norm,streams,eps);
     return residual_pre(execution,prepared[0],norm,down,up,inject,hidden,streams,eps,
-        mixed,marker,activated_down,activated_injection,prepared[1]);
+        mixed,marker,activated_down,activated_injection,combined_down,prepared[1]);
 }

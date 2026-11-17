@@ -1,5 +1,6 @@
 import { expect, it } from 'vitest';
-import { availableLoadMemory } from './loadMemoryEstimate';
+import { availableLoadMemory, estimateModelWeights } from './loadMemoryEstimate';
+import type { ModelArtifact } from '../../shared/api/types';
 
 it('counts unified memory once even for CUDA', () => {
   expect(availableLoadMemory({ memory_architecture: 'unified', backend: 'cuda', host_memory_available_bytes: 48,
@@ -30,4 +31,13 @@ it('keeps missing telemetry unknown and treats zero free space as measured', () 
   expect(availableLoadMemory({ memory_architecture: 'discrete', host_memory_available_bytes: 0,
     device_free_bytes: 0 })).toBe(0);
   expect(availableLoadMemory({ memory_architecture: 'discrete', host_memory_available_bytes: 12 })).toBeNull();
+});
+
+it('counts Jev layer buffers in VRAM and the backing weights in RAM', () => {
+  const model = { structured_decisions: true, estimated_resident_weight_bytes: 10000,
+    jev_weight_memory: { stream_vram_bytes: 400, stream_ram_bytes: 9000, resident_vram_bytes: 9100 } } as ModelArtifact;
+  expect(estimateModelWeights(model)).toEqual({ total: 9400, vram: 400, ram: 9000 });
+  expect(estimateModelWeights(model, 'vram')).toEqual({ total: 9100, vram: 9100, ram: 0 });
+  expect(estimateModelWeights({ ...model, jev_weight_memory: undefined })).toBeNull();
+  expect(estimateModelWeights({ ...model, structured_decisions: false })).toEqual({ total: 10000, vram: null, ram: null });
 });

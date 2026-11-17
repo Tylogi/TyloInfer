@@ -5,6 +5,7 @@
 
 #include <functional>
 #include <memory>
+#include <optional>
 #include <vector>
 
 struct MoeHostExpertReservation;
@@ -16,6 +17,7 @@ struct MoeHostExpert {
     std::shared_ptr<MoeHostExpertReservation> reservation;
     MixedMoePool weights;
     std::size_t bytes=0;
+    std::size_t size()const noexcept{return bytes;}
 };
 
 struct MoeHostExpertCacheStats {
@@ -67,6 +69,14 @@ public:
     // Drop only idle negative-key backup images, oldest first. Active leases
     // and the last CPU copies of routed experts are never reclaimed here.
     std::size_t reclaim_optional(std::size_t bytes);
+    // Reclaim idle routed images under host pressure. Duplicate-only requests
+    // keep unique/reused images; complete residency keeps ordinary images.
+    std::size_t reclaim(std::size_t bytes,bool duplicates_only=false);
+    using Headroom=std::function<std::optional<std::size_t>()>;
+    // Allocator trim precedes image eviction. Physical headroom is sampled
+    // again for sharing; removed payload bytes never count as available RAM.
+    std::size_t reserve(std::size_t bytes,const Headroom& available,const std::function<void()>& trim);
+    std::size_t share(std::size_t bytes,const Headroom& available,const std::function<void()>& trim);
     bool contains(mfq::MoeCacheKey key) const;
     // Read an already cached immutable image without invoking a loader.
     Lease find(mfq::MoeCacheKey key,bool touch=true);
@@ -74,6 +84,10 @@ public:
     // Busy keys remain eligible for the normal parallel acquisition path.
     Lease try_find(mfq::MoeCacheKey key,bool touch=true,bool consume=true);
     MoeHostExpertCacheStats stats() const;
+    // A complete-residency complement cannot discard its ordinary fields.
+    // Active leases stay charged even when the admission ceiling contracts.
+    std::size_t minimum_budget() const;
+    void resize_budget(std::size_t bytes);
     // A streaming scan must not evict repeatedly consumed decoded images.
     void enable_reuse_priority();
     void set_reuse_learning(bool enabled);

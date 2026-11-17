@@ -32,10 +32,11 @@ export function groupCheckpoints(artifacts: ModelArtifact[]): CheckpointFamilyGr
     const vendor = modelVendor(artifact.name, artifact.architecture);
     const architecture = artifact.architecture?.trim();
     const declared = architecture && architecture.toLowerCase() !== 'unknown' ? architecture : null;
-    const key = vendor ?? (declared ? `architecture:${declared.toLowerCase()}` : 'other');
+    const decision = artifact.structured_decisions === true;
+    const key = decision ? 'jev' : vendor ?? (declared ? `architecture:${declared.toLowerCase()}` : 'other');
     let family = families.get(key);
     if (!family) {
-      family = { key, name: vendor ? vendorNames[vendor] : declared, models: [], count: 0 };
+      family = { key, name: decision ? 'Jev' : vendor ? vendorNames[vendor] : declared, models: [], count: 0 };
       families.set(key, family);
       modelGroups.set(family, new Map());
     }

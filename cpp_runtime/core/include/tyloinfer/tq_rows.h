@@ -82,25 +82,58 @@ struct TqLayout {
     }
 };
 
+struct TqRowImageLayout {
+    std::size_t packed_offset,relative_offset,bytes;
+};
+
 // Retained bounded reads; no expanded weights and no expert/cache ownership.
 class TqRows {
     ModelSource::TensorReader read_;
+    std::uint64_t source_offset_=0;
     TqLayout layout_;
     std::array<std::uint8_t,64> header_{};
+    std::vector<std::uint8_t> metadata_;
+    void read_metadata(std::uint64_t offset,std::byte* destination,std::size_t bytes)const {
+        if(offset<64 || offset>layout_.packed || bytes>layout_.packed-offset)
+            throw std::out_of_range("TQ metadata read exceeds its stream");
+        if(metadata_.empty())read_(offset,destination,bytes);
+        else std::memcpy(destination,metadata_.data()+offset-64,bytes);
+    }
 public:
-    TqRows(std::size_t bytes,ModelSource::TensorReader read):read_(std::move(read)) {
+    TqRows(std::size_t bytes,ModelSource::TensorReader read,std::uint64_t source_offset=0)
+        :read_(std::move(read)),source_offset_(source_offset) {
         if(bytes<64)throw std::invalid_argument("truncated TQ header");
         read_(0,reinterpret_cast<std::byte*>(header_.data()),header_.size());
         layout_=TqLayout(header_.data(),bytes);
     }
     const TqLayout& layout()const noexcept{return layout_;}
+    std::size_t packed_row_bytes(std::uint64_t begin,std::uint64_t end)const {
+        if(begin>=end || end>layout_.rows)throw std::out_of_range("invalid TQ row byte range");
+        std::array<std::uint8_t,16> records{};
+        read_metadata(64+begin*8,reinterpret_cast<std::byte*>(records.data()),8);
+        read_metadata(64+(end-1)*8,reinterpret_cast<std::byte*>(records.data()+8),8);
+        const auto first=TqLayout::integer(records.data(),8),last=TqLayout::integer(records.data()+8,8);
+        if(!layout_.valid_descriptor(first) || !layout_.valid_descriptor(last))throw std::invalid_argument("invalid TQ row descriptor");
+        const auto start=std::uint64_t(layout_.offset(first))*4;
+        const auto finish=std::uint64_t(layout_.offset(last))*4+std::uint64_t(layout_.width)*(((last>>32)&7)+1)/8;
+        if(finish<start || finish>layout_.packed_bytes)throw std::invalid_argument("invalid TQ row payload byte range");
+        return std::size_t(finish-start);
+    }
+    // Routed banks reuse descriptors and scale selectors across requests.
+    // Sparse embedding tables retain bounded reads instead of this cache.
+    void cache_metadata() {
+        if(!metadata_.empty())return;
+        std::vector<std::uint8_t> data(layout_.packed-64);
+        read_(64,reinterpret_cast<std::byte*>(data.data()),data.size());
+        metadata_=std::move(data);
+    }
     // Write one ordinary TQ row into caller-owned staging storage.
     // This avoids temporary descriptor/payload vectors for sparse CPU tables.
     std::size_t slice_row_into(std::uint64_t row,std::uint8_t* target,std::size_t capacity)const {
         const auto& m=layout_;
         if(row>=m.rows || !target)throw std::out_of_range("invalid TQ table row");
         std::array<std::uint8_t,8> record{};
-        read_(64+row*8,reinterpret_cast<std::byte*>(record.data()),record.size());
+        read_metadata(64+row*8,reinterpret_cast<std::byte*>(record.data()),record.size());
         const auto descriptor=TqLayout::integer(record.data(),8);
         const auto first=m.offset(descriptor);
         const auto bits=((descriptor>>32)&7)+1;
@@ -116,16 +149,16 @@ public:
         TqLayout::integer(target+12,1,4);TqLayout::integer(target+28,packed_bytes,4);
         TqLayout::integer(target+64,m.rebase(descriptor,0),8);
         auto* scales=target+72;
-        if(m.columns)read_(m.scales,reinterpret_cast<std::byte*>(scales),scale_bytes);
+        if(m.columns)read_metadata(m.scales,reinterpret_cast<std::byte*>(scales),scale_bytes);
         else if(m.groups==1) {
             std::uint8_t selector=0;
-            read_(m.scales+row/2,reinterpret_cast<std::byte*>(&selector),1);
+            read_metadata(m.scales+row/2,reinterpret_cast<std::byte*>(&selector),1);
             scales[0]=(selector>>((row&1)*4))&15;
         } else {
             const auto first_selector=std::size_t(row)*m.groups;
             const auto start=first_selector/2,end=(first_selector+m.groups+1)/2;
             std::vector<std::uint8_t> selectors(end-start);
-            read_(m.scales+start,reinterpret_cast<std::byte*>(selectors.data()),selectors.size());
+            read_metadata(m.scales+start,reinterpret_cast<std::byte*>(selectors.data()),selectors.size());
             std::memset(scales,0,scale_bytes);
             for(std::size_t i=0;i<m.groups;++i) {
                 const auto at=i+(first_selector&1);
@@ -135,12 +168,27 @@ public:
         read_(m.packed+std::uint64_t(first)*4,reinterpret_cast<std::byte*>(scales+scale_bytes),packed_bytes);
         return bytes;
     }
-    std::vector<std::uint8_t> slice_rows(std::uint64_t begin,std::uint64_t end)const {
+    TqRowImageLayout stage_row_image(std::uint64_t row,std::uint8_t* target,std::size_t capacity)const {
+        const auto scale_bytes=layout_.columns?layout_.scale_bytes:(layout_.groups+1)/2;
+        const auto packed=72+scale_bytes,words=(packed+3)&~std::size_t(3);
+        const auto wire=slice_row_into(row,target,capacity);
+        const auto packed_bytes=wire-packed,relative=words+packed_bytes;
+        constexpr std::uint16_t gains[]{0x3400,0x34d0,0x35ca,0x36f7,0x3830,0x390a,0x3a10,0x3b4b,
+            0x3c63,0x3d47,0x3e59,0x3fa4,0x4098,0x4187,0x42a6,0x4400};
+        if(relative>capacity || sizeof(gains)>capacity-relative)
+            throw std::overflow_error("TQ staged row image exceeds capacity");
+        std::memmove(target+words,target+packed,packed_bytes);
+        std::memset(target+packed,0,words-packed);
+        std::memcpy(target+relative,gains,sizeof(gains));
+        return {words,relative,relative+sizeof(gains)};
+    }
+    std::vector<std::uint8_t> slice_rows(std::uint64_t begin,std::uint64_t end,
+            std::vector<ReadSpan>* deferred=nullptr)const {
         const auto& m=layout_;
         if(begin>=end || end>m.rows)throw std::out_of_range("invalid TQ row range");
         const auto count=std::size_t(end-begin);
         std::vector<std::uint8_t> descriptors(count*8);
-        read_(64+begin*8,reinterpret_cast<std::byte*>(descriptors.data()),descriptors.size());
+        read_metadata(64+begin*8,reinterpret_cast<std::byte*>(descriptors.data()),descriptors.size());
         const auto first=m.offset(TqLayout::integer(descriptors.data(),8));
         auto expected=first;
         for(std::size_t row=0;row<count;++row) {
@@ -157,24 +205,37 @@ public:
             throw std::invalid_argument("TQ row payload range differs");
         const auto packed_bytes=std::size_t(expected-first)*4;
         const auto scale_bytes=m.columns?m.scale_bytes:(count*m.groups+1)/2;
-        std::vector<std::uint8_t> result(64+count*8+scale_bytes+packed_bytes);
+        std::vector<std::uint8_t> result;
+        result.reserve(64+count*8+scale_bytes+packed_bytes+35);
+        result.resize(64+count*8+scale_bytes+packed_bytes);
         std::memcpy(result.data(),header_.data(),64);
         TqLayout::integer(result.data()+12,count,4);
         TqLayout::integer(result.data()+28,packed_bytes,4);
         std::memcpy(result.data()+64,descriptors.data(),descriptors.size());
         auto* scales=result.data()+64+descriptors.size();
-        if(m.columns)read_(m.scales,reinterpret_cast<std::byte*>(scales),scale_bytes);
+        if(m.columns)read_metadata(m.scales,reinterpret_cast<std::byte*>(scales),scale_bytes);
         else {
             const auto first_selector=std::size_t(begin)*m.groups,selectors=count*m.groups;
             const auto start_byte=first_selector/2,end_byte=(first_selector+selectors+1)/2;
-            std::vector<std::uint8_t> source(end_byte-start_byte);
-            read_(m.scales+start_byte,reinterpret_cast<std::byte*>(source.data()),source.size());
-            for(std::size_t i=0;i<selectors;++i) {
-                const auto index=i+(first_selector&1);
-                scales[i/2]|=((source[index/2]>>((index&1)*4))&15)<<((i&1)*4);
+            if(!(first_selector&1)) {
+                read_metadata(m.scales+start_byte,reinterpret_cast<std::byte*>(scales),scale_bytes);
+                if(selectors&1)scales[scale_bytes-1]&=15;
+            } else {
+                std::vector<std::uint8_t> source(end_byte-start_byte);
+                read_metadata(m.scales+start_byte,reinterpret_cast<std::byte*>(source.data()),source.size());
+                for(std::size_t i=0;i<scale_bytes;++i) {
+                    scales[i]=source[i]>>4;
+                    if(i+1<source.size())scales[i]|=source[i+1]<<4;
+                }
+                if(selectors&1)scales[scale_bytes-1]&=15;
             }
         }
-        read_(m.packed+first*4,reinterpret_cast<std::byte*>(scales+scale_bytes),packed_bytes);
+        auto* destination=reinterpret_cast<std::byte*>(scales+scale_bytes);
+        if(deferred) {
+            const auto offset=m.packed+first*4;
+            if(source_offset_>UINT64_MAX-offset)throw std::overflow_error("TQ source span offset");
+            deferred->push_back({source_offset_+offset,destination,packed_bytes});
+        }else read_(m.packed+first*4,destination,packed_bytes);
         return result;
     }
     std::vector<std::uint8_t> slice_columns(std::uint64_t begin,std::uint64_t end)const {
@@ -262,7 +323,7 @@ inline std::vector<std::shared_ptr<TqRows>> tq_row_segments(
                 throw std::out_of_range("TQ expert read exceeds its payload");
             read(offset + begin, destination, length);
         };
-        auto child = std::make_shared<TqRows>(size, std::move(child_read));
+        auto child = std::make_shared<TqRows>(size, std::move(child_read),offset);
         if (child->layout().rows != outputs || logical_width > child->layout().width
                 || (index && child->layout().width != result.front()->layout().width))
             throw std::invalid_argument("TQ expert container dimensions differ");

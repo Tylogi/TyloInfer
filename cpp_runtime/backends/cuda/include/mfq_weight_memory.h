@@ -12,11 +12,14 @@ class WeightMemoryLedger {
     struct Payload { std::weak_ptr<void> owner; std::size_t bytes; };
     std::vector<std::weak_ptr<TensorStorage>> weights_;
     std::vector<Payload> ple_;
+    std::vector<Payload> embeddings_;
 public:
     void observe(const std::shared_ptr<TensorStorage>& storage);
     void observe_ple(const std::shared_ptr<void>& owner,std::size_t bytes);
     std::size_t resident_bytes(int device = -1) const;
     std::size_t ple_bytes() const;
+    void observe_embedding(const std::shared_ptr<void>& owner,std::size_t bytes);
+    std::size_t embedding_bytes() const;
 };
 
 class WeightMemoryLoadScope {
@@ -36,5 +39,6 @@ public:
     WeightAllocationScope& operator=(const WeightAllocationScope&)=delete;
 };
 void observe_weight_allocation(const std::shared_ptr<TensorStorage>& storage);
+void observe_streamed_embedding(const std::shared_ptr<void>& owner,std::size_t bytes);
 void observe_streamed_ple(const std::shared_ptr<void>& owner,std::size_t bytes);
 }

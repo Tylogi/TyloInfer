@@ -148,12 +148,15 @@ void check_weight_memory() {
             require(nested.resident_bytes()==0,"weight ledger releases expired allocations");
         }
         observe_streamed_ple(table,4096);
+        observe_streamed_embedding(table,2048);
+        require(ledger.embedding_bytes()==2048 && nested.embedding_bytes()==0,"mapped embedding telemetry isolates model ledgers");
         require(ledger.resident_bytes()==64 && ledger.ple_bytes()==4096,"weight ledger drops replaced projections and counts PLE payload");
     }
     weight={};
     require(ledger.resident_bytes()==64,"weight view retains its full allocation");
     view={};table.reset();
     require(ledger.resident_bytes()==0 && ledger.ple_bytes()==0,"telemetry must not retain weights or tables");
+    require(ledger.embedding_bytes()==0,"embedding telemetry must not retain host tables");
 }
 
 #include "matmul_rows_test.h"

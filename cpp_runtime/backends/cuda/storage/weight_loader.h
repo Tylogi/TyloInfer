@@ -135,11 +135,14 @@ using LinearGroup = std::function<std::vector<Tensor>(CudaExecutionContext&, con
 // individual boundaries for GEMM. Unquantized auxiliaries keep their outputs.
 // combine_rows=false shares GGUF activation quantization using the existing
 // weight images; use it for subsets so an earlier joined image is not copied.
+// Large FP32 inputs share preparation across all supported encodings, also
+// when their projections retain separate weights and arithmetic.
 LinearGroup grouped_linear(CudaExecutionContext&, std::vector<Linear>& functions,
                            std::size_t joined_prefix=1,bool combine_rows=true);
 
 // GR projections retain floating activation math for dense and quantized input.
 ResidualLinear residual_linear(CudaExecutionContext&, const mfq::ModelSource&, const std::string& name);
+GatedResidualDownInjectionProjection residual_down_injection(const ResidualLinear& down,const ResidualLinear& injection);
 
 Tensor dense(CudaExecutionContext& execution, const mfq::ModelSource& file, const std::string& name);
 

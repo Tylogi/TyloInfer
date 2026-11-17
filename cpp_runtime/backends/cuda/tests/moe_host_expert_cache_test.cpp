@@ -34,6 +34,114 @@ void wait_coalesced(const MoeHostExpertCache& cache,std::promise<void>& release)
 }
 
 int main() try {
+    {
+        MoeHostExpertCache cache(0);
+        auto transient=cache.acquire(key(0),64,[]{return weight(64,1);});
+        check(cache.stats().budget_bytes==0 && !cache.contains(key(0)),
+            "direct host-cache construction lost its explicit zero admission budget");
+    }
+    {
+        MoeHostExpertCache cache(256);
+        auto held=cache.acquire(key(0),64,[]{return weight(64,1);});
+        cache.acquire(key(1),64,[]{return weight(64,2);});
+        cache.resize_budget(0);
+        check(cache.stats().budget_bytes==0 && cache.stats().managed_bytes==64 && cache.contains(key(0)) &&
+            !cache.contains(key(1)),"host cap contraction freed an active lease or retained an idle victim");
+        bytes_equal(held,1);
+        auto transient=cache.acquire(key(2),64,[]{return weight(64,3);});
+        check(!cache.contains(key(2)) && cache.stats().managed_bytes==64 && cache.stats().transient_bytes==64,
+            "zero host admission cap reused active footprint as available cache capacity");
+        transient.reset();held.reset();cache.resize_budget(0);
+        check(cache.stats().managed_bytes==0,"completed host lease remained charged after idle reclamation");
+        cache.resize_budget(128);
+        const auto probe=[] {return std::optional<std::size_t>{0};};
+        cache.share(64,probe,[]{});cache.share(0,probe,[]{});
+        check(cache.stats().budget_bytes==128,"host sharing restored an obsolete pre-partition budget");
+    }
+    {
+        MoeHostExpertCache cache(256);cache.preserve_resident_experts();
+        auto held=cache.acquire(key(0),64,[]{return weight(64,1);});
+        cache.acquire(key(1),64,[]{return weight(64,2);});
+        cache.acquire(key(2,-2),64,[]{return weight(64,3);});
+        check(cache.minimum_budget()==128,"preserved host minimum included an idle optional backup");
+        cache.resize_budget(128);
+        check(cache.stats().managed_bytes==128 && cache.stats().budget_bytes==128 &&
+            cache.contains(key(0)) && cache.contains(key(1)) && !cache.contains(key(2,-2)),
+            "partitioned host cap discarded preserved fields or kept an unnecessary optional backup");
+        bool rejected=false;
+        try{cache.resize_budget(127);}catch(const std::runtime_error&){rejected=true;}
+        check(rejected && cache.stats().budget_bytes==128 && cache.stats().managed_bytes==128,
+            "insufficient host cap mutated a preserved RAM complement");
+        bytes_equal(held,1);
+    }
+    {
+        MoeHostExpertCache cache(256);cache.enable_reuse_priority();
+        auto hints=std::make_shared<MoeHostExpertCache::DeviceCacheHints>(
+            std::vector<mfq::MoeCacheKey>{key(0),key(1),key(2)});
+        cache.set_device_cache_hints(hints);
+        cache.acquire(key(0),64,[]{return weight(64,1);});
+        auto held=cache.acquire(key(1),64,[]{return weight(64,2);});
+        cache.acquire(key(2),64,[]{return weight(64,3);});cache.find(key(2));
+        cache.acquire(key(3),64,[]{return weight(64,4);});
+        for(int i=0;i<3;++i)hints->publish(i,true);
+        check(cache.reclaim(256,true)==64 && !cache.contains(key(0)) &&
+            cache.contains(key(1)) && cache.contains(key(2)) && cache.contains(key(3)),
+            "explicit duplicate reclaim removed a unique, reused or leased image");
+        bytes_equal(held,2);held.reset();
+        check(cache.reclaim(256,true)==64 && cache.stats().device_duplicate_evicted_bytes==128 &&
+            cache.stats().managed_bytes==128,"duplicate reclaim failed to release the last idle lease");
+    }
+    {
+        MoeHostExpertCache cache(128);
+        cache.acquire(key(0),64,[]{return weight(64,1);});
+        std::size_t available=0;int trims=0;
+        const auto probe=[&]{return std::optional<std::size_t>{available};};
+        const auto trim=[&]{++trims;check(cache.stats().managed_bytes==64,"trim ran after expert eviction");if(trims==1)available=160;};
+        check(cache.reserve(128,probe,trim)==0 && trims==1 && cache.contains(key(0)),
+            "host reserve evicted an image before recovering idle allocator headroom");
+        available=0;
+        check(cache.reserve(32,probe,trim)==64 && !cache.stats().managed_bytes,
+            "ordinary pressure eviction failed after sampling allocator headroom");
+    }
+    {
+        MoeHostExpertCache cache(256);
+        cache.acquire(key(0),64,[]{return weight(64,1);});
+        cache.acquire(key(1),64,[]{return weight(64,2);});
+        auto held=cache.acquire(key(2),64,[]{return weight(64,3);});
+        const auto probe=[] {return std::optional<std::size_t>{0};};
+        check(cache.share(128,probe,[]{})==128 && cache.stats().managed_bytes==64 &&
+            cache.stats().budget_bytes==0,"logical eviction was credited as physical host headroom");
+        auto transient=cache.acquire(key(3),64,[]{return weight(64,4);});
+        check(!cache.contains(key(3)) && cache.stats().transient_bytes==64 && cache.contains(key(2)),
+            "contracted host ceiling admitted data or freed an active lease");
+        transient.reset();held.reset();
+        check(cache.share(0,probe,[]{})==0 && cache.stats().budget_bytes==256,
+            "clearing host sharing did not restore the configured budget");
+        cache.acquire(key(3),64,[]{return weight(64,4);});
+        check(cache.contains(key(3)),"restored host ceiling did not permit admission");
+    }
+    {
+        MoeHostExpertCache cache(256);
+        auto held=cache.acquire(key(0),64,[]{return weight(64,1);});
+        auto available=std::size_t(128);
+        const auto probe=[&]{return std::optional<std::size_t>{available};};
+        cache.share(64,probe,[]{});
+        check(cache.stats().budget_bytes==128 && cache.stats().managed_bytes==64,
+            "host sharing ignored measured available memory");
+        available=192;cache.share(64,probe,[]{});
+        check(cache.stats().budget_bytes==192,"host ceiling did not grow with measured headroom");
+    }
+    {
+        MoeHostExpertCache cache(192);cache.preserve_resident_experts();
+        auto hints=std::make_shared<MoeHostExpertCache::DeviceCacheHints>(std::vector<mfq::MoeCacheKey>{key(0)});
+        cache.set_device_cache_hints(hints);
+        cache.acquire(key(0),64,[]{return weight(64,1);});hints->publish(0,true);
+        cache.acquire(key(1,-2),64,[]{return weight(64,2);});
+        const auto probe=[] {return std::optional<std::size_t>{0};};
+        check(cache.reclaim(192,true)==0 && cache.share(192,probe,[]{})==64 &&
+            cache.contains(key(0)) && cache.stats().managed_bytes==64 && cache.stats().budget_bytes==192,
+            "complete residency lost an ordinary image or its exchange admission budget");
+    }
     for(int access:{0,1,2}) {
         MoeHostExpertCache cache(256);cache.enable_reuse_priority();
         auto predicted=cache.acquire(key(0),64,[]{return weight(64,1);},true,false);
@@ -720,7 +828,8 @@ int main() try {
         });
         entered.get_future().wait();
         auto preflight=std::async(std::launch::async,[&] {
-            return !cache.try_find(key(0)) && !cache.try_find(key(1)) && bool(cache.try_find(key(7),false));
+            return cache.reclaim(64,true)==0 && !cache.try_find(key(0)) &&
+                !cache.try_find(key(1)) && bool(cache.try_find(key(7),false));
         });
         const bool preflight_ready=preflight.wait_for(std::chrono::seconds(1))==std::future_status::ready;
         auto unrelated=std::async(std::launch::async,[&] {

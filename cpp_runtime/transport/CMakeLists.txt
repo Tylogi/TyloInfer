@@ -5,6 +5,7 @@ find_package(Threads REQUIRED)
 add_library(mfq-runtime-communication STATIC
     include/transport.h
     src/common.cpp
+    src/decision.cpp
     src/common.h
     src/http.cpp
     src/stdio.cpp

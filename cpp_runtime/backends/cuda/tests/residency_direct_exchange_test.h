@@ -376,11 +376,14 @@ void verify_direct_exchange(const std::filesystem::path& root) {
         }
         if(phase=="prefill") {
             auto old_routes=tb::full({32,1},2,tb::TensorOptions().device(tb::kCUDA).dtype(tb::kInt32));
-            manager->record_prefill_routes(0,old_routes.data_ptr<int32_t>(),32,1,mfq_current_cuda_stream());
+            auto old_plan=build_moe_route_plan(old_routes,3);
+            manager->record_prefill_counts(0,old_plan.counts.data_ptr<int32_t>(),32,mfq_current_cuda_stream());
             auto wide_routes=tb::full({32,2},2,tb::TensorOptions().device(tb::kCUDA).dtype(tb::kInt32));
-            manager->record_prefill_routes(0,wide_routes.data_ptr<int32_t>(),32,2,mfq_current_cuda_stream());
+            auto wide_plan=build_moe_route_plan(wide_routes,3);
+            manager->record_prefill_counts(0,wide_plan.counts.data_ptr<int32_t>(),32,mfq_current_cuda_stream());
             auto routes=tb::full({32,1},1,tb::TensorOptions().device(tb::kCUDA).dtype(tb::kInt32));
-            manager->record_prefill_routes(0,routes.data_ptr<int32_t>(),32,1,mfq_current_cuda_stream());
+            auto plan=build_moe_route_plan(routes,3);
+            manager->record_prefill_counts(0,plan.counts.data_ptr<int32_t>(),32,mfq_current_cuda_stream());
             if(manager->stats().committed_projections)throw std::runtime_error("prefill routes exchanged before decode boundary");
             manager->prepare_decode();
             manager->prepare_decode(); // No second transaction without a new prompt.

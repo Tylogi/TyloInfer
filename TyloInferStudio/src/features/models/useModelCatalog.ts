@@ -49,6 +49,7 @@ export function useModelCatalog() {
   const modelSettingsTriggerRef = useRef<HTMLElement | null>(null);
   const preferences = settingsModel ? loadPreferences[settingsModel] ?? defaultPreferences(settingsModel) : defaultPreferences('');
   const { pinned: loadPinned, deviceIds: loadDeviceIds, idleTtl: loadIdleTtl, context: loadContext } = preferences;
+  const loadContextForModel = (name: string) => loadPreferences[name]?.context ?? readLoadContext(name);
   function changePreferences(change: Partial<LoadPreferences>) {
     if (settingsModel) setLoadPreferences(current => ({ ...current, [settingsModel]: { ...current[settingsModel] ?? defaultPreferences(settingsModel), ...change } }));
   }
@@ -192,6 +193,7 @@ export function useModelCatalog() {
       }
       const options = loadPreferences[name] ?? defaultPreferences(name);
       await modelsApi.loadModel(name, options.context.context_size, 'auto', {
+        ...(artifacts.find(item => item.name === name)?.structured_decisions ? { jev_weights: options.context.jev_weights } : {}),
         pin: options.pinned,
         device_ids: options.deviceIds,
         idle_ttl_seconds: options.idleTtl,
@@ -244,6 +246,7 @@ export function useModelCatalog() {
       if (!loaded && !artifact.gguf_companion_required) {
         const options = loadPreferences[artifact.name] ?? defaultPreferences(artifact.name);
         await modelsApi.loadModel(artifact.name, options.context.context_size, 'auto', {
+          ...(artifact.structured_decisions ? { jev_weights: options.context.jev_weights } : {}),
           pin: options.pinned,
           device_ids: options.deviceIds,
           idle_ttl_seconds: options.idleTtl,
@@ -439,6 +442,7 @@ export function useModelCatalog() {
     filteredArtifacts,
     loadPinned,
     loadContext,
+    loadContextForModel,
     setLoadContext,
     loadDeviceIds,
     setLoadDeviceIds,

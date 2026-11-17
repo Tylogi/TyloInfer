@@ -8,6 +8,12 @@ export interface ModelArtifact {
   asset_kind?: 'model' | 'ple' | 'engram';
   owned_file_bytes?: number | null;
   gguf_companion_required?: boolean;
+  structured_decisions?: boolean;
+  jev_weight_memory?: {
+    stream_vram_bytes: number;
+    stream_ram_bytes: number;
+    resident_vram_bytes: number;
+  } | null;
   shard_count: number;
   missing_shards?: number;
   total_bytes: number;

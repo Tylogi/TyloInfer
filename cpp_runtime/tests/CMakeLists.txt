@@ -12,6 +12,18 @@ target_include_directories(mfq-benchmark-validation-test PRIVATE
 target_compile_features(mfq-benchmark-validation-test PRIVATE cxx_std_17)
 add_test(NAME mfq-benchmark-validation-test COMMAND mfq-benchmark-validation-test)
 
+add_executable(tyloinfer-expert-route-usage-test expert_route_usage_test.cpp)
+target_compile_features(tyloinfer-expert-route-usage-test PRIVATE cxx_std_20)
+add_test(NAME tyloinfer-expert-route-usage-test COMMAND tyloinfer-expert-route-usage-test)
+
+add_executable(tyloinfer-routed-prefill-workspace-test routed_prefill_workspace_test.cpp)
+target_compile_features(tyloinfer-routed-prefill-workspace-test PRIVATE cxx_std_20)
+add_test(NAME tyloinfer-routed-prefill-workspace-test COMMAND tyloinfer-routed-prefill-workspace-test)
+
+add_executable(tyloinfer-routed-prefill-loan-test routed_prefill_loan_test.cpp)
+target_compile_features(tyloinfer-routed-prefill-loan-test PRIVATE cxx_std_20)
+add_test(NAME tyloinfer-routed-prefill-loan-test COMMAND tyloinfer-routed-prefill-loan-test)
+
 add_executable(mfq-cuda-tensor-view-test
     ${PROJECT_SOURCE_DIR}/backends/cuda/tests/mfq_cuda_tensor_view_test.cpp
 )
@@ -58,6 +70,7 @@ function(mfq_add_core_test target source)
 endfunction()
 
 mfq_add_core_test(tyloinfer-tq-rows-test tq_rows_test.cpp)
+target_link_libraries(tyloinfer-tq-rows-test PRIVATE Threads::Threads mfq::host-parallel)
 mfq_add_core_test(tyloinfer-qsa-precision-policy-test qsa_precision_policy_test.cpp)
 mfq_add_core_test(tyloinfer-qsa-ram-policy-test qsa_ram_policy_test.cpp)
 mfq_add_core_test(tyloinfer-qsa-ram-codec-test qsa_ram_codec_test.cpp)
@@ -227,6 +240,9 @@ if(TARGET mfq-paged-prefix-cache)
 endif()
 
 if(TARGET mfq-runtime-communication)
+    mfq_add_core_test(mfq-decision-test decision_test.cpp)
+    target_link_libraries(mfq-decision-test PRIVATE mfq-runtime-communication mfq-json)
+    target_include_directories(mfq-decision-test PRIVATE ${PROJECT_SOURCE_DIR}/transport/src)
     mfq_add_core_test(mfq-runtime-transport-test mfq_runtime_transport_test.cpp)
     target_link_libraries(mfq-runtime-transport-test PRIVATE mfq-runtime-communication mfq-json)
     target_include_directories(mfq-runtime-transport-test PRIVATE

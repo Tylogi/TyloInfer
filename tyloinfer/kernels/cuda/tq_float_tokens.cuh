@@ -127,7 +127,7 @@ int launch_tile(TrellisProjectionView m,const void* x,void* y,
     return int(cudaGetLastError());
 }
 
-int launch(TrellisProjectionView m,const void* x,void* y,
+inline int launch(TrellisProjectionView m,const void* x,void* y,
         int tokens,int groups,int dtype,cudaStream_t stream) {
     // FP32 activations use twice the registers of packed BF16 pairs. Shorter
     // vectors keep their register footprint bounded while sharing each decoded

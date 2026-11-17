@@ -16,7 +16,7 @@ export function variantMemoryPressureRows(variant: HubModelVariant | undefined, 
     available: variant.configuration.available_memory_bytes });
 }
 
-export function memoryPressureRows({ weights, roles, system, available, cacheBytes = 0, moe = false, combineMoe = false }: {
+export function memoryPressureRows({ weights, roles, system, available, cacheBytes = 0, moe = false, combineMoe = false, combineMemory = false }: {
   weights?: number | null;
   roles?: WeightRoles;
   system?: PressureSystem;
@@ -24,6 +24,7 @@ export function memoryPressureRows({ weights, roles, system, available, cacheByt
   cacheBytes?: number;
   moe?: boolean;
   combineMoe?: boolean;
+  combineMemory?: boolean;
 }): PressureRow[] {
   const pools = system?.memory_pools ?? [];
   const vram = pools.find(pool => pool.kind === 'vram');
@@ -31,8 +32,8 @@ export function memoryPressureRows({ weights, roles, system, available, cacheByt
     return [{ kind: 'shared', required: weights == null ? null : weights + cacheBytes,
       available: available ?? system?.runtime_memory_budget_bytes ?? system?.physical_memory_bytes }];
   }
-  if (moe || (roles?.experts ?? 0) > 0) {
-    if (combineMoe) {
+  if (moe || (roles?.experts ?? 0) > 0 || combineMemory) {
+    if (combineMoe || combineMemory) {
       const ram = pools.find(pool => pool.kind === 'ram')?.capacity_bytes ?? system?.physical_memory_bytes;
       return [{ kind: 'combined', required: weights == null ? null : weights + cacheBytes,
         available: vram.capacity_bytes == null || ram == null ? null : vram.capacity_bytes + ram }];

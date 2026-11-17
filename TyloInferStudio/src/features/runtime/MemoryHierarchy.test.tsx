@@ -23,7 +23,7 @@ it('shows eight separate VRAM, RAM and SSD tiers without treating unknown RAM te
   expect(container.querySelector('[data-storage="ram"] [data-tier="ram-experts"]')).toBeInTheDocument();
   expect(container.querySelector('[data-storage="ssd"] [data-tier="ple"]')).toBeInTheDocument();
   expect(screen.getByText('VRAM-resident weights and buffers')).toBeInTheDocument();
-  expect(screen.getByText('RAM-streamed experts')).toBeInTheDocument();
+  expect(screen.getByText('RAM-streamed weights')).toBeInTheDocument();
   expect(screen.getByText('RAM-streamed KV')).toBeInTheDocument();
   expect(screen.getByText('Not yet supported on this device')).toBeInTheDocument();
   expect(container.querySelector('[data-tier="ram-experts"] .resource-tier-model strong')).toHaveTextContent('4 KiB');
@@ -34,9 +34,27 @@ it('shows eight separate VRAM, RAM and SSD tiers without treating unknown RAM te
   rerender(<MemoryHierarchy instances={[item]} runtime={{ memory_architecture: 'unified', backend: 'cuda' }} />);
   expect(container.querySelectorAll('[data-tier]')).toHaveLength(5);
   expect(container.querySelector('[data-storage="vram"]')).not.toBeInTheDocument();
-  expect(screen.queryByText('RAM-streamed experts')).not.toBeInTheDocument();
+  expect(screen.queryByText('RAM-streamed weights')).not.toBeInTheDocument();
 });
 import type { RuntimeInstance } from '../../shared/api/types';
+
+it.each([false, true])('accounts for RAM embeddings and streamed Jev weights in both panels (detailed=%s)', detailed => {
+  const ordinary = model('ordinary', 1024), jev = model('jev', 512);
+  Object.assign(ordinary.memory!, { ram_experts: true, ram_expert_bytes: 1024, ram_kv: false, ram_kv_bytes: 0, prefix_cache_ram_bytes: 0, ram_embedding_bytes: 2048, ram_weight_bytes: 0 });
+  Object.assign(jev.memory!, { ram_experts: false, ram_kv: false, ram_kv_bytes: 0, prefix_cache_ram_bytes: 0, ram_embedding_bytes: 0, ram_weight_bytes: 4096 });
+  const { container } = render(<MemoryHierarchy instances={[ordinary, jev]} detailed={detailed}
+    runtime={{ memory_architecture: 'discrete', host_memory_total_bytes: 16384, host_memory_available_bytes: 8192 }} />);
+  expect(screen.getByText('RAM-streamed embedding tables')).toBeInTheDocument();
+  expect(screen.getByText('RAM-streamed weights')).toBeInTheDocument();
+  const embeddings = container.querySelector('[data-tier="ram-embedding"]')!;
+  const weights = container.querySelector('[data-tier="ram-experts"]')!;
+  expect(embeddings.querySelector('.memory-tier-heading')).toHaveTextContent('2 KiB / 15 KiB');
+  expect(weights.querySelector('.memory-tier-heading')).toHaveTextContent('5 KiB / 15 KiB');
+  expect(embeddings.querySelector('.memory-tier-track [data-model-id="ordinary"]')).toBeInTheDocument();
+  expect(embeddings.querySelector('.memory-tier-track [data-model-id="jev"]')).toBeNull();
+  expect(weights.querySelector('.memory-tier-track [data-model-id="jev"]')).toBeInTheDocument();
+  expect(weights.querySelector('.memory-tier-track [data-model-id="ordinary"]')).toBeInTheDocument();
+});
 
 it('shows independent GPU capacities, model allocations and an idle third GPU', () => {
   const item = model('split', 8192);
@@ -314,7 +332,7 @@ it('expands the same five tiers into per-model sizes, active KV, hot prefixes an
   expect(container.querySelector('[data-tier="kv"]')).toHaveTextContent('4 KiB / 28 KiB');
   expect(container.querySelector('[data-tier="kv"] .resource-tier-model')).toHaveTextContent('Active KV 768 B · Prefix RAM 256 B / 2 KiB');
   expect(container.querySelector('[data-tier="weights"] .resource-tier-model')).toHaveTextContent('METAL · Wired 1 KiB');
-  expect(container.querySelector('[data-tier="experts"] .resource-tier-model')).toHaveTextContent('All experts resident');
+  expect(container.querySelector('[data-tier="experts"] .resource-tier-model')).toHaveTextContent('All weights resident');
   expect(container.querySelector('[data-tier="ple"] .resource-tier-model')).toHaveTextContent('No SSD PLE table');
   for (const tier of container.querySelectorAll('.resource-tier-details')) {
     expect(tier.querySelector('.resource-tier-model-name i')).toHaveStyle({ backgroundColor: 'var(--bar-fill)' });

@@ -1,5 +1,6 @@
 #pragma once
 #include "../kernels/gguf.h"
+#include "gdn_test_options.h"
 
 inline void gdn_core_q8_case() {
     const auto set_tiles=[](const char* value) {
@@ -74,6 +75,81 @@ inline void gdn_core_q8_case() {
         }
     }
     std::cout<<"GDN core prepared output Q8/state/snapshot changing-graph bitwise cases="<<checked<<" PASS\n";
+}
+
+inline void gdn_independent_q8_case() {
+    const auto bits=[](const Tensor& actual,const Tensor& expected,const char* label) {
+        const auto x=actual.contiguous().cpu(),y=expected.contiguous().cpu();
+        if(x.sizes()!=y.sizes() || x.scalar_type()!=y.scalar_type() ||
+                std::memcmp(x.data_ptr(),y.data_ptr(),x.nbytes()))throw std::runtime_error(label);
+    };
+    int checked=0;
+    for(int width:{32,64,128})for(int batch=2;batch<=8;++batch)
+    for(bool half:{false,true})for(bool position_major:{false,true}) {
+        const int nv=width==128?48:6,nk=nv/3,channels=(2*nk+nv)*width;
+        const int choice=(batch+int(half)+int(position_major))%4;
+        GdnTileScope tiles(choice==0?1:choice==1?2:choice==2?4:0);
+        const auto dtype=half?tb::kFloat16:tb::kFloat32;
+        auto qkv=data({batch,1,channels+17},541,.4f).to(dtype).narrow(2,0,channels);
+        auto gate=data({batch,1,nv*width+13},542,.5f).to(dtype).narrow(2,0,nv*width);
+        auto alpha=data({batch,1,nv},543,.3f).to(dtype),beta=data({batch,1,nv},544,.3f).to(dtype);
+        auto initial_conv=data({batch,3,channels},545,.3f).to(tb::kFloat32);
+        auto initial_state=data({batch,nv,width,width},546,.1f).to(tb::kFloat32);
+        auto conv=initial_conv.clone(),state=initial_state.clone();
+        auto reference_conv=initial_conv.clone(),reference_state=initial_state.clone();
+        auto workspace=tb::zeros({batch,nv,width+1},state.options()),reference_workspace=tb::zeros_like(workspace);
+        auto weight=data({channels,1,4},547,.2f).to(tb::kFloat32),bias=data({nv},548,.1f).to(tb::kFloat32);
+        auto a=data({nv},549,.2f).to(tb::kFloat32),norm=data({width},550,1.3f).to(tb::kFloat32);
+        auto host=tb::empty({batch,3},state.options().device(tb::kCPU).dtype(tb::kInt64));
+        for(int row=0;row<batch;++row) {
+            host.data_ptr<int64_t>()[3*row]=reinterpret_cast<int64_t>(conv.narrow(0,row,1).data_ptr());
+            host.data_ptr<int64_t>()[3*row+1]=reinterpret_cast<int64_t>(state.narrow(0,row,1).data_ptr());
+            host.data_ptr<int64_t>()[3*row+2]=reinterpret_cast<int64_t>(workspace.narrow(0,row,1).data_ptr());
+        }
+        const auto addresses=host.to(state.device());
+        const bool output_half=!half,transpose=position_major,silu=half;
+        const auto reset=[&] {
+            conv.copy_(initial_conv);state.copy_(initial_state);workspace.zero_();
+            reference_conv.copy_(initial_conv);reference_state.copy_(initial_state);reference_workspace.zero_();
+        };
+        std::vector<Tensor> actual;
+        DecodeWindow graph(mfq_current_cuda_stream());
+        graph.capture([&] {
+            actual=gdn_decode_core_cuda(qkv,gate,alpha,beta,conv.narrow(0,0,1),state.narrow(0,0,1),
+                weight,bias,a,norm,nk,nv,width,1e-6,.013456789123,silu,output_half,transpose,
+                workspace.narrow(0,0,1),true,addresses,true,true,position_major);
+        },reset,[&]{actual.clear();});
+        reset();
+        for(int replay=0;replay<2;++replay) {
+            qkv.copy_(data(qkv.sizes().vec(),551+replay,replay?8.f:0.f).to(dtype));
+            gate.copy_(data(gate.sizes().vec(),553+replay,.8f).to(dtype));
+            alpha.copy_(data(alpha.sizes().vec(),555+replay,88.f).to(dtype));
+            beta.copy_(data(beta.sizes().vec(),557+replay,88.f).to(dtype));
+            const auto expected=gdn_decode_core_cuda(qkv,gate,alpha,beta,reference_conv,reference_state,
+                weight,bias,a,norm,nk,nv,width,1e-6,.013456789123,silu,output_half,transpose,
+                reference_workspace,true,{},true);
+            reference_conv.copy_(expected[1]);
+            const auto bytes=position_major?mfq::cuda::gguf::interleaved_activation_bytes(batch,nv*width):
+                std::size_t(batch)*mfq::cuda::gguf::q8_row_bytes(nv*width);
+            auto prepared=tb::empty({int64_t(bytes)},qkv.options().dtype(tb::kUInt8));
+            if(position_major)mfq::cuda::gguf::quantize_input_interleaved(expected[0].data_ptr(),output_half,
+                batch,nv*width,prepared.data_ptr(),nullptr,mfq_current_cuda_stream());
+            else if(output_half)mfq::cuda::gguf::quantize_input_f16(expected[0].data_ptr(),batch,nv*width,
+                prepared.data_ptr(),mfq_current_cuda_stream());
+            else mfq::cuda::gguf::quantize_input(expected[0].data_ptr<float>(),batch,nv*width,
+                prepared.data_ptr(),mfq_current_cuda_stream());
+            graph.run();
+            bits(actual[0],prepared,"independent GDN prepared output changed Q8 bytes");
+            bits(actual[1],expected[1],"independent GDN prepared output changed convolution output");
+            bits(conv,reference_conv,"independent GDN prepared output changed owned convolution");
+            bits(state,reference_state,"independent GDN prepared output changed owned recurrence");
+            bits(workspace.select(-1,width),reference_workspace.select(-1,width),
+                "independent GDN prepared output left stale tile counters");
+            ++checked;
+        }
+    }
+    std::cout<<"GDN independent Q8 canonical/position-major changing-graph cases="<<checked
+        <<" rows2-8, widths32/64/128, tiles1/2/4/auto output/state/counters EXACT PASS\n";
 }
 
 inline void gdn_core_q8_benchmark(int layers) {

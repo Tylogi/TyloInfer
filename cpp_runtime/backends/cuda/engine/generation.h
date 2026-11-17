@@ -13,6 +13,16 @@
 namespace mfq::cuda::internal {
 class TextSessionCache;
 
+struct CudaReadoutHidden {
+    mfq_tensor_backend::Tensor hidden;
+    std::size_t cached_tokens = 0;
+    double prefill_ms = 0.0;
+};
+template<class Model>
+CudaReadoutHidden prefill_readout(Model& model,DecodeGraphCache& graph,TextSessionCache& cache,
+    const CudaRuntimeConfig& config,const std::vector<int64_t>& prompt,
+    std::size_t stable_prefix,const std::string& input_key,bool prefix_cache);
+
 template <typename Model>
 mfq::engine::Generation generate(
     Model& model, DecodeGraphCache& graph, TextSessionCache& cache,

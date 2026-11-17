@@ -97,25 +97,25 @@ int main(int argc,char** argv)try {
     for(int64_t i=0;i<input.numel();++i)input.data_ptr<float>()[i]=float(std::sin(i*.047)*.4);
     auto gpu=input.to(tb::kFloat16).to(tb::kCUDA),residual=(input.to(tb::kCUDA)*.25).to(tb::kFloat16);CudaExecutionContext execution;
     auto expected=acc_cuda(residual,ffn.forward(execution,gpu)).to(tb::kCPU,tb::kFloat32);
-    auto result=ffn.try_forward_gguf_prefill_residual(execution,gpu,residual);require(result.has_value(),"FFN did not select the residual prefill path");
+    auto result=ffn.try_forward_prefill_residual(execution,gpu,residual);require(result.has_value(),"FFN did not select the residual prefill path");
     auto actual=result->to(tb::kCPU,tb::kFloat32);double error=0,energy=0;
     for(int64_t i=0;i<actual.numel();++i){const double a=actual.data_ptr<float>()[i],r=expected.data_ptr<float>()[i];error+=(a-r)*(a-r);energy+=r*r;}
     require(error<energy*4e-6+1e-12,"fused FFN differs excessively from the ordinary quantized FFN");
-    require(!ffn.try_forward_gguf_prefill_residual(execution,gpu.narrow(0,0,4),residual.narrow(0,0,4)),"MTP small M entered prefill residual projection");
+    require(!ffn.try_forward_prefill_residual(execution,gpu.narrow(0,0,4),residual.narrow(0,0,4)),"MTP small M entered prefill residual projection");
     auto side=mfq::cuda::stream_from_pool(false,0);
     {mfq::cuda::StreamGuard use(side);mfq::cuda::Graph graph;graph.prepare_memory();
-     {auto warm=ffn.try_forward_gguf_prefill_residual(execution,gpu,residual);require(warm.has_value(),"residual FFN graph warmup missing");}
+     {auto warm=ffn.try_forward_prefill_residual(execution,gpu,residual);require(warm.has_value(),"residual FFN graph warmup missing");}
      TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(side.stream()));
-     graph.capture_begin();auto replayed=ffn.try_forward_gguf_prefill_residual(execution,gpu,residual);graph.capture_end();
+     graph.capture_begin();auto replayed=ffn.try_forward_prefill_residual(execution,gpu,residual);graph.capture_end();
      for(float value:{.125f,-.75f,1.5f}) {
        gpu.fill_(value);residual.fill_(value*.2f);graph.replay();
-       auto reference=ffn.try_forward_gguf_prefill_residual(execution,gpu,residual);
+       auto reference=ffn.try_forward_prefill_residual(execution,gpu,residual);
        auto a=replayed->to(tb::kCPU),r=reference->to(tb::kCPU);
        require(std::memcmp(a.data_ptr(),r.data_ptr(),a.nbytes())==0,"residual FFN graph kept stale inputs or residuals");
      }}
     struct Correction final:GgufProjectionCorrection {Tensor apply(const Tensor&,Tensor y)const override{return y;}};
     ffn.down.gguf.projection_correction=std::make_shared<Correction>();
-    require(!ffn.try_forward_gguf_prefill_residual(execution,gpu,residual),"projection correction was applied in the wrong residual order");
+    require(!ffn.try_forward_prefill_residual(execution,gpu,residual),"projection correction was applied in the wrong residual order");
   }
   std::cout<<"Prefill residual GEMM independent FP64 reference PASS cases="<<residual_cases<<"; immutable input, output tails, scratch fallback, FFN Graph replay and correction/small-M fallback PASS"<<std::endl;
   if(argc==2 && std::string_view(argv[1])=="--prefill-residual-check")return 0;
@@ -203,7 +203,7 @@ int main(int argc,char** argv)try {
         .transpose(1,2).contiguous().reshape({batch*tokens,cols});
     auto gated=tb::empty_like(normalized);auto reference=tb::empty_like(packed),reference_exp=tb::empty_like(exp);
     auto contiguous_gate=gate.contiguous();
-    mfq::cuda::gguf::materialize_gated_input(normalized.data_ptr(),contiguous_gate.data_ptr(),false,normalized.numel(),silu,gated.data_ptr(),stream.stream());
+    mfq::cuda::materialize_gated_input(normalized.data_ptr(),contiguous_gate.data_ptr(),false,normalized.numel(),silu,gated.data_ptr(),stream.stream());
     mfq::cuda::gguf::pack_scaled_f16_unit(gated.data_ptr<float>(),reference.data_ptr(),reference_exp.data_ptr<int32_t>(),batch*tokens,cols,stream.stream());
     if(width%32==0) {
         auto q8=tb::empty({int64_t(batch*tokens*mfq::cuda::gguf::q8_row_bytes(cols))},gpu.options().dtype(tb::kUInt8)),expected=tb::empty_like(q8);

@@ -172,7 +172,7 @@ public:
         }
         release(begin,end);
     }
-    void read(std::uint64_t offset,std::byte* destination,std::size_t size)const {
+    void copy_range(std::uint64_t offset,std::byte* destination,std::size_t size)const {
         if(offset>bytes_ || size>bytes_-offset)throw std::out_of_range("mapped tensor row range is out of bounds");
         if(!size)return;
         if(!destination)throw std::invalid_argument("mapped tensor destination is null");
@@ -183,6 +183,10 @@ public:
             mapped_read_totals[2].fetch_add(size,std::memory_order_relaxed);
             mapped_read_totals[3].fetch_add(1,std::memory_order_relaxed);
         }
+    }
+    void read(std::uint64_t offset,std::byte* destination,std::size_t size)const {
+        copy_range(offset,destination,size);
+        if(mapped_release_context && size)release_read_pages({{offset,destination,size}});
     }
     void read_batch(const std::vector<ReadSpan>& spans)const {
         // Check the complete batch before touching any destination. A failed
@@ -223,7 +227,7 @@ public:
             mapped_read_totals[0].fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(MappedClock::now()-started).count(),std::memory_order_relaxed);
             mapped_read_totals[4].fetch_add(1,std::memory_order_relaxed);
         }
-        for(const auto& span:spans)if(span.size)read(span.offset,span.destination,span.size);
+        for(const auto& span:spans)if(span.size)copy_range(span.offset,span.destination,span.size);
         // Selected rows now belong to the bounded row cache/packet. Keeping
         // a second working-set copy of sparse pages across all Engram tables
         // can exhaust RAM despite a bounded expert cache.

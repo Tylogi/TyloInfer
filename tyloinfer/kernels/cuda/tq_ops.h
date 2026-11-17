@@ -52,6 +52,35 @@ extern "C" TYLOINFER_TRELLIS_API int mfq_tq_routed_swiglu(const TrellisProjectio
 extern "C" TYLOINFER_TRELLIS_API int mfq_tq_routed_down(const TrellisProjectionView* down,
     const int64_t* ids,const void* hidden,void* output,int routes,int output_rows,
     int hidden_width,int dtype,cudaStream_t stream);
+// A device cancellation snapshot guards every pointer read in a graph that
+// waits for host-provided expert images. Cancelled calls leave outputs unused.
+extern "C" TYLOINFER_TRELLIS_API int mfq_tq_routed_guarded_swiglu(const TrellisProjectionView* gate,
+    const TrellisProjectionView* up,const int64_t* ids,const void* x,void* hidden,
+    int routes,int hidden_rows,int dtype,float limit,const uint32_t* cancelled,cudaStream_t stream);
+extern "C" TYLOINFER_TRELLIS_API int mfq_tq_routed_guarded_down(const TrellisProjectionView* down,
+    const int64_t* ids,const void* hidden,void* output,int routes,int output_rows,
+    int hidden_width,int dtype,const uint32_t* cancelled,cudaStream_t stream);
+// Snapshot only the selected resident views before the host prepares misses.
+// Output contains three compact [routes] tables, with zero views for misses.
+extern "C" TYLOINFER_TRELLIS_API int mfq_tq_snapshot_resident(const TrellisProjectionView* gate,
+    const TrellisProjectionView* up,const TrellisProjectionView* down,const int64_t* ids,
+    TrellisProjectionView* selected,int routes,int experts,cudaStream_t stream);
+extern "C" TYLOINFER_TRELLIS_API int mfq_tq_partition_swiglu(const TrellisProjectionView* gate,
+    const TrellisProjectionView* up,const TrellisProjectionView* resident_mask,const int64_t* ids,
+    const void* x,void* hidden,int routes,int experts,int hidden_rows,int dtype,float limit,
+    bool resident,const uint32_t* cancelled,cudaStream_t stream);
+extern "C" TYLOINFER_TRELLIS_API int mfq_tq_partition_down(const TrellisProjectionView* down,
+    const TrellisProjectionView* resident_mask,const int64_t* ids,const void* hidden,void* output,
+    int routes,int experts,int output_rows,int hidden_width,int dtype,bool resident,
+    const uint32_t* cancelled,cudaStream_t stream);
+// Streamed plans store one view per routing slot rather than every expert.
+extern "C" TYLOINFER_TRELLIS_API int mfq_tq_partition_slot_swiglu(const TrellisProjectionView* gate,
+    const TrellisProjectionView* up,const TrellisProjectionView* resident_mask,const int64_t* ids,
+    const void* x,void* hidden,int routes,int experts,int rows,int dtype,float limit,
+    const uint32_t* cancelled,cudaStream_t stream);
+extern "C" TYLOINFER_TRELLIS_API int mfq_tq_partition_slot_down(const TrellisProjectionView* down,
+    const TrellisProjectionView* resident_mask,const int64_t* ids,const void* hidden,void* output,
+    int routes,int experts,int rows,int width,int dtype,const uint32_t* cancelled,cudaStream_t stream);
 
 // A zero-copy execution plan for independent projections sharing an input.
 // block_end is the cumulative number of ceil(weight.rows/GROUP_ROWS) blocks.
@@ -92,6 +121,19 @@ extern "C" TYLOINFER_TRELLIS_API int mfq_tq_parallel_tokens(const TrellisProject
 extern "C" TYLOINFER_TRELLIS_API int mfq_tq_q8_tokens(TrellisProjectionView weight,
     const void* x,void* output,int tokens,int groups,int dtype,void* workspace,
     uint64_t workspace_bytes,cudaStream_t stream);
+// FP32 residual epilogues preserve the ordinary Q8 projection's sum tree.
+// A normalized [tokens,weight.rows] input selects sigmoid/mix/reduce into
+// [tokens,weight.rows/streams]. Otherwise apply SiLU(projection/streams)
+// or 2*sigmoid(projection/streams).
+// The workspace, input, normalized values and output must not overlap.
+extern "C" TYLOINFER_TRELLIS_API int mfq_tq_q8_residual_tokens(TrellisProjectionView weight,
+    const float* x,const float* normalized,float* output,int tokens,int streams,bool injection,
+    void* workspace,uint64_t workspace_bytes,cudaStream_t stream);
+// Mixed TQ Down and BF16 injection share a launch and retain their respective
+// projection arithmetic. Injection is contiguous [streams,input_columns].
+extern "C" TYLOINFER_TRELLIS_API int mfq_tq_q8_residual_down(TrellisProjectionView weight,
+    const float* input,const uint16_t* injection,float* output,float* gates,int tokens,int streams,
+    void* workspace,uint64_t workspace_bytes,cudaStream_t stream);
 // host_jobs and device_jobs describe identical immutable projections. Small
 // batches of host descriptors become kernel parameters, avoiding per-block
 // descriptor fetches without limiting the total projection count.
@@ -112,6 +154,16 @@ struct TrellisIndexedProjectionJob {
     int64_t input_offsets[4],output_offsets[4];
     int count;
 };
+// Fixed grids skip empty jobs and stop before reading an aborted plan.
+extern "C" TYLOINFER_TRELLIS_API int mfq_tq_indexed_guarded(const TrellisIndexedProjectionJob* jobs,
+    const void* x,void* output,int count,int max_rows,int dtype,int token_tile,float limit,bool pair,
+    const uint32_t* cancelled,cudaStream_t stream);
+extern "C" TYLOINFER_TRELLIS_API int mfq_tq_indexed_wide_guarded(const void* jobs,const void* x,void* output,
+    int count,int max_rows,int dtype,int token_tile,float limit,bool pair,const uint32_t* cancelled,cudaStream_t stream);
+extern "C" TYLOINFER_TRELLIS_API int mfq_tq_prepare_resident_indexed(const TrellisProjectionView* gate,
+    const TrellisProjectionView* up,const TrellisProjectionView* down,const int64_t* ids,
+    TrellisIndexedProjectionJob* gu,TrellisIndexedProjectionJob* dn,int slots,int routes,int experts,
+    int input,int hidden,int output,int token_tile,cudaStream_t stream);
 // A single ordinary projection reused across up to eight input rows. Dropping
 // the unused SwiGLU view keeps this plan as small as the four-row pair plan.
 struct TrellisIndexedWideProjectionJob {
@@ -166,6 +218,29 @@ extern "C" TYLOINFER_TRELLIS_API int mfq_tq_prefill_moe_gemm(const TrellisPrefil
     uint64_t workspace_bytes,void* activations,uint64_t activation_bytes,
     void* blas,cudaStream_t stream);
 
+// Gate/Up are ready on entry. Join the caller's Down transfer only after
+// activation, allowing its DMA to overlap the first projection.
+extern "C" TYLOINFER_TRELLIS_API int mfq_tq_prefill_moe_staged(const TrellisPrefillMoeJob* jobs,
+    const int64_t* slots,const void* input,void* pairs,int batch,int capacity,
+    int input_width,int hidden_width,int routes,float limit,void* activations,
+    uint64_t activation_bytes,cudaEvent_t down_ready,cudaStream_t stream);
+extern "C" TYLOINFER_TRELLIS_API int mfq_tq_prefill_moe_gemm_staged(const TrellisPrefillMoeJob* jobs,
+    const int64_t* slots,const void* input,void* pairs,int batch,int capacity,
+    int input_width,int hidden_width,int routes,float limit,void* workspace,
+    uint64_t workspace_bytes,void* activations,uint64_t activation_bytes,
+    void* blas,cudaEvent_t down_ready,cudaStream_t stream);
+
+// Compact bounds contain batch+1 cumulative valid-row offsets. first_slot
+// equals bounds[0]; rows equals bounds[batch]-bounds[0]. Geometry and slot
+// ownership are validated by the caller. No padded token rows are computed.
+// Scratch is align16(rows*max(K,H)*2)+rows*max(N,2H)*4; decoded tiles stay
+// bounded by workspace_bytes. Independent output width N supports local FFNs.
+extern "C" TYLOINFER_TRELLIS_API int mfq_tq_prefill_moe_compact(const TrellisPrefillMoeJob* jobs,
+    const int64_t* slots,const int64_t* bounds,const void* input,void* pairs,int batch,int capacity,
+    int64_t first_slot,int64_t rows,int input_width,int hidden_width,int output_width,int routes,
+    float limit,void* workspace,uint64_t workspace_bytes,void* activations,uint64_t activation_bytes,
+    cudaEvent_t down_ready,cudaStream_t stream);
+
 extern "C" TYLOINFER_TRELLIS_API int mfq_tq_gemv_tokens(TrellisProjectionView weight,
     const void* x,void* output,int tokens,int dtype,cudaStream_t stream);
 // FP16 prefill with bounded temporary decoded rows. Workspace never caches
@@ -199,6 +274,11 @@ extern "C" TYLOINFER_TRELLIS_API int mfq_tq_weighted_reduce(const void* expert_o
 // Only selected embedding rows are materialized. Expert projections use GEMV.
 extern "C" TYLOINFER_TRELLIS_API int mfq_tq_embedding(TrellisProjectionView weight,
     const int64_t* ids,int count,void* output,int dtype,cudaStream_t stream);
+// Row exponents are reusable for immutable images; scaled decoding writes FP16 directly.
+extern "C" TYLOINFER_TRELLIS_API int mfq_tq_prefill_row_exponents(TrellisProjectionView weight,
+    int first,int count,int32_t* exponents,cudaStream_t stream);
+extern "C" TYLOINFER_TRELLIS_API int mfq_tq_prefill_scaled_rows(TrellisProjectionView weight,
+    int first,int count,const int32_t* exponents,void* output,cudaStream_t stream);
 // Each view selects one ordinary TQ row, potentially from different tables.
 // Views and compressed payload may reside in a caller-owned mapped packet.
 extern "C" TYLOINFER_TRELLIS_API int mfq_tq_embedding_rows(const TrellisProjectionView* rows,

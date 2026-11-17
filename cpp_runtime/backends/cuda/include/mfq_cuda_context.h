@@ -217,10 +217,18 @@ public:
     // Temporarily reuse already charged expert-cache storage on one ordered
     // compute stream. Graph/resident allocations never enter this workspace.
     void begin_workspace_loan(const std::vector<std::pair<void*,std::size_t>>& regions,
-                              cudaStream_t stream);
+                              cudaStream_t stream,std::shared_ptr<void> backing = {});
     void suspend_workspace_loan();
     void end_workspace_loan();
+    // An abandoned owner disables new allocations and retains backing until
+    // the last live suballocation and its ordered consumers have completed.
+    void retire_workspace_loan() noexcept;
+    bool workspace_loan_active() const;
     std::size_t workspace_available() const;
+    std::size_t workspace_largest_available(cudaStream_t stream) const;
+    bool workspace_allocations_fit(const std::vector<std::size_t>& allocations,
+        std::size_t ordinary,cudaStream_t stream) const;
+    std::size_t workspace_live_bytes() const;
     std::vector<std::pair<void*,std::size_t>> workspace_touched_regions() const;
     void check_memory_limit(std::size_t additional = 0) const;
     void set_memory_limit(std::size_t bytes);
@@ -230,7 +238,9 @@ public:
         void* pointer,
         std::size_t bytes,
         cudaStream_t stream = nullptr) noexcept;
-    void begin_graph_pool(cudaStream_t stream);
+    // Each owner pairs a successful begin with end; shared pools retire only
+    // after their last cache or graph owner releases the stream registration.
+    void begin_graph_pool(cudaStream_t stream,bool share_existing=false);
     bool has_graph_pool(cudaStream_t stream) const;
     void begin_graph_warmup(cudaStream_t stream);
     void end_graph_warmup(cudaStream_t stream) noexcept;
@@ -242,6 +252,7 @@ public:
 private:
     struct GraphPool {
         cudaMemPool_t memory = nullptr;
+        std::size_t owners = 1;
         bool capturing = false;
         bool warming = false;
         std::map<std::size_t, std::vector<void*>> available;
@@ -263,6 +274,8 @@ private:
         cudaStream_t stream=nullptr;
         std::thread::id thread;
         bool enabled=true;
+        bool retiring=false;
+        std::shared_ptr<void> backing;
         std::map<std::uintptr_t,std::size_t> free;
         std::unordered_map<void*,std::size_t> live;
         std::vector<std::pair<std::uintptr_t,std::size_t>> touched;
@@ -274,6 +287,15 @@ private:
 };
 
 std::shared_ptr<Context> default_context(int device = 0);
+// A host callback serving a waiting graph must report allocation pressure
+// without synchronizing the device that is waiting for that callback.
+class NonblockingAllocationScope {
+public:
+    NonblockingAllocationScope();
+    ~NonblockingAllocationScope();
+    NonblockingAllocationScope(const NonblockingAllocationScope&)=delete;
+    NonblockingAllocationScope& operator=(const NonblockingAllocationScope&)=delete;
+};
 class GraphWarmupScope {
 public:
     GraphWarmupScope(std::shared_ptr<Context> context,cudaStream_t stream):context_(std::move(context)),stream_(stream) {

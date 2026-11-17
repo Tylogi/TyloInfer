@@ -1,5 +1,6 @@
 #include "../../runtime/execution_options.h"
 #include "mfq_cuda_moe_ops.h"
+#include "mfq_cuda_resident_allocations.h"
 #include "mfq_cuda_quant_ops.h"
 #include "mfq_cuda_nint_route_hint.h"
 #include "mfq_cuda_nvq1_decode.h"
@@ -1308,10 +1309,18 @@ MoeActivationWorkspace MixedMoeRuntime::activation_workspace(
         // Publish both allocations together so an allocation failure cannot
         // leave new Q8 storage paired with an old scale buffer.
         MoeActivationWorkspace workspace;
+#ifdef TYLOINFER_NATIVE_CUDA_RUNTIME
+        {
+        // The capacity bucket outlives a request's borrowed expert workspace.
+        const mfq::cuda::ResidentAllocationScope resident;
+#endif
         workspace.qx = mfq_tensor_backend::empty(
             {capacity, groups * gs}, x.options().dtype(mfq_tensor_backend::kInt8));
         workspace.xscale = mfq_tensor_backend::empty(
             {capacity, groups}, x.options().dtype(mfq_tensor_backend::kFloat32));
+#ifdef TYLOINFER_NATIVE_CUDA_RUNTIME
+        }
+#endif
         it = activation_workspaces.insert_or_assign(key, std::move(workspace)).first;
     }
     return {it->second.qx.narrow(0, 0, input_rows),
@@ -1324,9 +1333,19 @@ MoeActivationWorkspace MixedMoeRuntime::prefill_activation_workspace(
     return activation_workspace(x, input_rows, groups, gs, transform, false);
 }
 
-std::vector<MoeActivationGeometry> MixedMoeRuntime::activation_geometry() const {
+static bool mixed_uses_quantized_activation(MixedMoeFamily family,bool use_f16_mma,bool use_kl_mmq) {
+    // NINT and NINT8Zero still receive Q8 workspace in their FP16 MMA calls.
+    // NVQ's FP16 product and the ordinary floating kernels consume x directly.
+    return !use_kl_mmq && family!=MixedMoeFamily::Mxfp4 &&
+        family!=MixedMoeFamily::Mxfp4Sq && family!=MixedMoeFamily::Fp8Sq &&
+        !(family==MixedMoeFamily::Nvq && use_f16_mma);
+}
+
+static std::vector<MoeActivationGeometry> mixed_activation_geometry(
+        const std::vector<MixedMoePool>& pools,bool use_f16_mma,bool use_kl_mmq) {
     std::vector<MoeActivationGeometry> result;
     for (const auto & pool : pools) {
+        if(!mixed_uses_quantized_activation(pool.family,use_f16_mma,use_kl_mmq))continue;
         int groups = 0;
         int gs = 24;
         int transform_block = 0;
@@ -1356,6 +1375,24 @@ std::vector<MoeActivationGeometry> MixedMoeRuntime::activation_geometry() const 
         }
     }
     return result;
+}
+
+std::vector<MoeActivationGeometry> MixedMoeRuntime::activation_geometry() const {
+    return mixed_activation_geometry(pools,false,false);
+}
+
+bool MixedMoeRuntime::uses_f16_prefill(const CudaExecutionConfig& config,
+        bool force_prefill_mma_off,const MoeRoutePlan& route)const {
+    return config.moe_prefill_mma && !force_prefill_mma_off &&
+        (route.ids.size(0)>=config.moe_prefill_mma_min_tokens || prefill_only) &&
+        route.map_ready && route.ids_dst.numel()==route.ids.numel();
+}
+
+std::vector<MoeActivationGeometry> MixedMoeRuntime::activation_geometry(
+        const CudaExecutionConfig& config,const KlMmqState& kl_mmq,
+        bool force_prefill_mma_off,const MoeRoutePlan& route)const {
+    return mixed_activation_geometry(pools,uses_f16_prefill(config,force_prefill_mma_off,route),
+        kl_mmq.mode!=KlMmqMode::Default);
 }
 
 mfq_tensor_backend::Tensor MixedMoeRuntime::forward(
@@ -1404,12 +1441,7 @@ mfq_tensor_backend::Tensor MixedMoeRuntime::forward(
     prepared_inputs.emplace(identity, x);
     std::unordered_set<
         MixedMoeActivationKey, MixedMoeActivationKeyHash> quantized;
-    const bool use_f16_mma =
-        config.moe_prefill_mma &&
-        !force_prefill_mma_off &&
-        (tokens >= config.moe_prefill_mma_min_tokens || prefill_only) &&
-        route.map_ready &&
-        route.ids_dst.numel() == route.ids.numel();
+    const bool use_f16_mma = uses_f16_prefill(config,force_prefill_mma_off,route);
     const bool use_kl_mmq =
         kl_mmq.mode != KlMmqMode::Default;
     const bool nvq_hetero_prefill_ready = nvq_dispatch &&
@@ -1744,7 +1776,8 @@ mfq_tensor_backend::Tensor MixedMoeRuntime::forward(
                 neuron_len, output);
             continue;
         }
-        if (pool.family == MixedMoeFamily::Nvq && use_f16_mma) {
+        if (pool.family == MixedMoeFamily::Nvq &&
+                !mixed_uses_quantized_activation(pool.family,use_f16_mma,use_kl_mmq)) {
             nvq_moe_grouped_matmul_pool_f16_cuda(
                 pool.nvq.indices_packed, pool.nvq.aux_packed,
                 pool.nvq.sub_scale_packed, pool.nvq.neuron_scale,

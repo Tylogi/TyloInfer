@@ -11,10 +11,14 @@ inline std::string mlx_hf_tensor_name(std::string_view name) {
     std::string result(name);
     constexpr std::string_view language = "language_model.model.";
     constexpr std::string_view head = "language_model.lm_head.";
+    const auto starts = [&](std::string_view prefix) { return name.substr(0,prefix.size())==prefix; };
     if (name.substr(0, language.size()) == language)
         result = "model.language_model." + std::string(name.substr(language.size()));
     else if (name.substr(0, head.size()) == head)
         result = "lm_head." + std::string(name.substr(head.size()));
+    else if (starts("language_model.embed_tokens.") || starts("language_model.norm.") ||
+             starts("language_model.layers."))
+        result = "model." + std::string(name);
     const auto replace = [&](std::string_view from, std::string_view to) {
         const auto offset = result.find(from);
         if (offset != std::string::npos) result.replace(offset, from.size(), to);

@@ -257,6 +257,9 @@ void MfqScheduler::loop() noexcept {
                     }
                     value.reply.set_value(found);
                 } else if constexpr (std::is_same_v<T, Control>) {
+                    if((std::holds_alternative<DecisionText>(value.request) || std::holds_alternative<DecisionTokens>(value.request)) &&
+                            (duplex_active || !requests_.empty()))
+                        throw ControlBusyError("decision reads require an idle runtime");
                     if ((std::holds_alternative<ScoreText>(value.request) || std::holds_alternative<ScoreTokens>(value.request)) &&
                         (duplex_active || !requests_.empty()))
                         throw std::runtime_error("probability scoring requires an idle runtime");

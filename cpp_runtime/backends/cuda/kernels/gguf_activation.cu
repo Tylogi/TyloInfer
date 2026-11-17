@@ -99,17 +99,6 @@ __global__ void rms_gated_prefill_kernel(const float* input,const void* gate,con
     for(auto d=int64_t(threadIdx.x);d<columns;d+=blockDim.x)
         output[row*columns+d]=__float2half_rn(prefill_ldexp(values[d],-exponent));
 }
-template<class Input>
-__global__ void materialized_gate(const Input* up,const Input* gate,Input* output,
-        std::int64_t count,bool silu) {
-    for(auto i=std::int64_t(blockIdx.x)*blockDim.x+threadIdx.x;i<count;i+=std::int64_t(gridDim.x)*blockDim.x) {
-        const float g=float(gate[i]),u=float(up[i]);
-        float activation=silu?g/(1.f+expf(-g)):1.f/(1.f+expf(-g));
-        if constexpr(std::is_same_v<Input,half>)activation=__half2float(__float2half_rn(activation));
-        output[i]=Input(__fmul_rn(activation,u));
-    }
-}
-
 template<class Input,bool Aligned=false,bool PositionMajor=false>
 __global__ void gated_input_q8(const Input* up,const Input* gate,std::int64_t count,
         bool silu,block_q8_1* output,int width,int tokens=1) {
@@ -465,19 +454,6 @@ void quantize_rms_gated_input(const float* input,const float* gate,const float* 
         int64_t batch,int64_t heads,int64_t tokens,int64_t width,int64_t batch_stride,int64_t token_stride,
         float eps,void* output,cudaStream_t stream) {
     quantize_rms_gated_input(input,gate,weight,batch,heads,tokens,width,batch_stride,token_stride,eps,true,output,stream);
-}
-void materialize_gated_input(const void* up,const void* gate,bool fp16,std::int64_t count,
-        bool silu,void* output,cudaStream_t stream) {
-    if(count<0 || (count && (!up || !gate || !output)))throw std::invalid_argument("Invalid materialized gate operands");
-    if(!count)return;
-    const auto blocks=unsigned(std::min(int64_t(65535),(count+255)/256));
-    if(fp16)materialized_gate<<<blocks,256,0,stream>>>(static_cast<const half*>(up),static_cast<const half*>(gate),static_cast<half*>(output),count,silu);
-    else materialized_gate<<<blocks,256,0,stream>>>(static_cast<const float*>(up),static_cast<const float*>(gate),static_cast<float*>(output),count,silu);
-    const auto status=cudaGetLastError();if(status!=cudaSuccess)throw std::runtime_error(cudaGetErrorString(status));
-    if(dispatch_trace::enabled()) {
-        static std::once_flag reported;
-        std::call_once(reported,[&]{std::fprintf(stderr,"native_gguf_prefill_gate_fused actual_match=1 count=%lld fp16=%d silu=%d dtype_rounding=1\n",static_cast<long long>(count),int(fp16),int(silu));});
-    }
 }
 
 bool rms_gated_prefill_available(int64_t columns,int device) {

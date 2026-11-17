@@ -202,6 +202,7 @@ class RuntimeClient(Protocol):
     async def health(self) -> dict[str, Any]: ...
     async def count_tokens(self, payload: dict[str, Any]) -> dict[str, Any]: ...
     async def score(self, payload: dict[str, Any]) -> dict[str, Any]: ...
+    async def decide(self, payload: dict[str, Any]) -> dict[str, Any]: ...
 
     async def status(self) -> dict[str, Any]: ...
 
@@ -301,6 +302,9 @@ class HttpRuntimeClient:
 
     async def score(self, payload: dict[str, Any]) -> dict[str, Any]:
         return await self._json_request("POST", "/runtime/score", json_body=payload, timeout_seconds=self.long_control_timeout_seconds)
+
+    async def decide(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self._json_request("POST", "/runtime/decide", json_body=payload, timeout_seconds=self.long_control_timeout_seconds)
 
     async def count_tokens(self, payload: dict[str, Any]) -> dict[str, Any]:
         return await self._json_request("POST", "/runtime/count_tokens", json_body=payload)
@@ -592,6 +596,9 @@ class StdioRuntimeClient:
 
     async def score(self, payload: dict[str, Any]) -> dict[str, Any]:
         return await self._unary("score", payload, timeout_seconds=self.long_control_timeout_seconds)
+
+    async def decide(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self._unary("decide", payload, timeout_seconds=self.long_control_timeout_seconds)
 
     async def count_tokens(self, payload: dict[str, Any]) -> dict[str, Any]:
         return await self._unary("count_tokens", payload)

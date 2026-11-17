@@ -3,6 +3,7 @@
 #include "format.h"
 #include "fp8_sq.h"
 #include "mx.h"
+#include "channel_fp8.h"
 #include "mxfp4_sq.h"
 #include "nint.h"
 #include "vq.h"
@@ -25,7 +26,7 @@
 
 struct QuantLinear;
 struct QuantLinearGroup;
-class GgufPrefillInputScope;
+#include "prefill_projection.h"
 struct DenseLinearGroup;
 
 mfq_tensor_backend::Tensor dense_projection(
@@ -89,6 +90,7 @@ enum class QuantLinearKind {
     Mxfp4Sq,
     Fp8Sq,
     Mxfp8,
+    ChannelFp8,
     Dense,
     Tq,
     Gguf,
@@ -108,6 +110,7 @@ struct QuantLinearShard {
     Mxfp4SqLinear mxfp4_sq;
     Fp8SqLinear fp8_sq;
     Mxfp8Weight mxfp8;
+    ChannelFp8Weight channel_fp8;
     mfq_tensor_backend::Tensor dense;
     TqWeight tq;
     GgufWeight gguf;
@@ -121,6 +124,7 @@ struct QuantLinear {
     Mxfp4SqLinear mxfp4_sq;
     Fp8SqLinear fp8_sq;
     Mxfp8Linear mxfp8;
+    ChannelFp8Weight channel_fp8;
     mfq_tensor_backend::Tensor dense;
     TqWeight tq;
     GgufWeight gguf;
@@ -140,8 +144,14 @@ struct QuantLinear {
     bool is_mxfp4_sq() const { return mfq::mfq_compat_enabled && kind == QuantLinearKind::Mxfp4Sq; }
     bool is_fp8_sq() const { return mfq::mfq_compat_enabled && kind == QuantLinearKind::Fp8Sq; }
     bool is_mxfp8() const { return kind == QuantLinearKind::Mxfp8; }
+    bool is_channel_fp8() const { return kind == QuantLinearKind::ChannelFp8; }
     bool is_dense() const { return kind == QuantLinearKind::Dense; }
     bool is_tq() const { return kind == QuantLinearKind::Tq; }
+    PrefillProjectionWeight prefill_weight() const;
+    bool can_forward_prefill_residual(std::int64_t tokens,
+        const mfq_tensor_backend::Tensor& residual) const;
+    mfq_tensor_backend::Tensor forward_prefill_residual(
+        const mfq_tensor_backend::Tensor& input,const mfq_tensor_backend::Tensor& residual) const;
     bool is_gguf() const { return kind == QuantLinearKind::Gguf; }
 
     mfq_tensor_backend::Tensor forward_tensor_parallel_flat(
@@ -155,6 +165,10 @@ struct QuantLinear {
     mfq_tensor_backend::Tensor forward(
             CudaExecutionContext& execution,
             mfq_tensor_backend::Tensor x) const;
+    // Read selected output channels in FP32 without expanding the full weight.
+    mfq_tensor_backend::Tensor forward_rows(
+            CudaExecutionContext& execution,mfq_tensor_backend::Tensor input,
+            const std::vector<int64_t>& rows) const;
     mfq_tensor_backend::Tensor forward_bf16_output(
             CudaExecutionContext& execution,
             mfq_tensor_backend::Tensor x) const;
@@ -216,6 +230,8 @@ struct QuantLinearGroup {
     mutable std::shared_ptr<CudaIndependentBranchExecutor>
         branch_executor =
             std::make_shared<CudaIndependentBranchExecutor>();
+
+    bool supports_prefill_input(const mfq_tensor_backend::Tensor& input) const;
 
     // Empty input means this group's representation needs the ordinary path.
     GgufProjectionInput prepare_rms_norm_input(

@@ -481,12 +481,14 @@ HfSafetensorsSource::HfSafetensorsSource(
         impl_->metadata.emplace("source.precision", "native");
         add_inline_asset(std::string(kModelConfigAsset), parsed.dump());
     }
-    static constexpr std::array<std::pair<std::string_view, std::string_view>, 4>
+    static constexpr std::array<std::pair<std::string_view, std::string_view>, 6>
         sidecars{{
             {"tokenizer.json", "hf/tokenizer.json"},
             {"tokenizer_config.json", "hf/tokenizer_config.json"},
             {"chat_template.jinja", "hf/chat_template.jinja"},
             {"generation_config.json", "hf/generation_config.json"},
+            {"decision_config.json", "decision_config.json"},
+            {"readout.safetensors", "readout.safetensors"},
         }};
     for (const auto& [filename, asset_name] : sidecars) {
         const auto path = impl_->root / filename;

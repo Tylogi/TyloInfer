@@ -1,5 +1,6 @@
 #include "decode_window.h"
 #include "execution_options.h"
+#include "routed_dma_submission.h"
 #include "mfq_cuda_context.h"
 #include "tyloinfer/runtime.h"
 #include "tyloinfer/cpu_expert_pool.h"
@@ -132,7 +133,7 @@ void DecodeWindow::mark(int layer,const char* phase) {
         constexpr const char* boundaries[]={"attention_core_begin","attention_core_end",
             "ffn_pre_end","expert_begin","shared_end","ple_begin","ple_end","gate_up_end","down_end",
             "cpu_merge_begin","cpu_merge_end","resident_gate_up_end","resident_down_end","stream_copy_join","stream_gate_up_join","stream_down_join",
-            "gdn_input_end","gdn_recurrence_end","qsa_input_end","qsa_attention_end",
+            "gdn_projection_end","gdn_input_end","gdn_recurrence_end","qsa_projection_end","qsa_input_end","qsa_attention_end",
             "cpu_input_publish_end","route_publish_end","input_fusion_end","head_begin","head_norm_end","head_projection_end"};
         if(std::none_of(std::begin(phases),std::end(phases),
                 [&](const char* allowed){return std::strcmp(phase,allowed)==0;}) &&
@@ -246,6 +247,11 @@ void DecodeWindow::enroll(Task task) {
         throw std::logic_error("one MFQ operator cell was recorded twice in a window");
     tasks_.push_back(std::move(task));
 }
+bool DecodeWindow::enroll_once(Task task) {
+    if(active!=this)throw std::logic_error("cache task outside window capture");
+    if(std::any_of(tasks_.begin(),tasks_.end(),[&](const auto& t){return t.identity==task.identity;}))return false;
+    tasks_.push_back(std::move(task));return true;
+}
 std::size_t DecodeWindow::nodes() const {
     std::size_t result=0;
     for(std::size_t i=0;i<segments();++i)if(const auto* graph=graphs_.find(i,1))result+=graph->nodes();
@@ -310,6 +316,9 @@ void DecodeWindow::capture(const std::function<void()>& body,const std::function
             if(!pass){tasks_.clear();barriers_.clear();}
         }
         const auto warm_tasks=tasks_.size(),warm_barriers=barriers_.size();tasks_.clear();barriers_.clear();
+        // Preparation may use an eager operator where capture uses resident
+        // and streamed kernels. Only captured marks define replay ordering.
+        layer_points_.clear();layer_point_index_.clear();
         checkpoint("record");
         try {
             struct BranchCapture {
@@ -403,7 +412,15 @@ void DecodeWindow::run() {
             total+=std::chrono::duration_cast<std::chrono::nanoseconds>(now-previous).count();previous=now;
         };
         checkpoint("reset");
-        for(auto& task:tasks_)task.reset();
+        if(trace_steps && replays_%16==0) {
+            for(std::size_t index=0;index<tasks_.size();++index) {
+                const auto before=Clock::now();tasks_[index].reset();
+                const auto ms=std::chrono::duration<double,std::milli>(Clock::now()-before).count();
+                if(ms>=.05)std::fprintf(stderr,
+                    "runtime_decode_window_reset role=%s rows=%d replay=%llu task=%zu ms=%.6f\n",
+                    profile_role_.c_str(),profile_rows_,static_cast<unsigned long long>(replays_+1),index,ms);
+            }
+        }else for(auto& task:tasks_)task.reset();
         sample(reset_ns_);
         std::string error;
         std::size_t task_begin=0;
@@ -419,7 +436,16 @@ void DecodeWindow::run() {
             sample(launch_ns_);
             checkpoint("serve");
             const auto task_end=segment<barriers_.size()?barriers_[segment].task_end:tasks_.size();
-            for(;task_begin<task_end;++task_begin)tasks_[task_begin].serve();
+            {
+                const RoutedHostSubmissionScope host_submission;
+                for(;task_begin<task_end;++task_begin) {
+                    if(trace_steps && replays_==0) {
+                        std::fprintf(stderr,"decode_window operation=replay phase=serve task=%zu\n",task_begin);
+                        std::fflush(stderr);
+                    }
+                    tasks_[task_begin].serve();
+                }
+            }
             sample(serve_ns_);
             checkpoint("wait");
             if(!graph->wait_ms(60000))throw std::runtime_error("MFQ model window did not finish");

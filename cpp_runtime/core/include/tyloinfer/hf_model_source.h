@@ -39,6 +39,7 @@ public:
         std::uint64_t relative_offset,
         std::byte* destination,
         std::size_t size) const override;
+    TensorReader tensor_reader(std::string_view name) const override;
     const std::vector<std::string>& assets() const noexcept override;
     bool has_asset(std::string_view name) const noexcept override;
     std::vector<std::byte> read_asset(std::string_view name) const override;
@@ -46,7 +47,7 @@ public:
 
 private:
     struct Impl;
-    std::unique_ptr<Impl> impl_;
+    std::shared_ptr<Impl> impl_;
 };
 
 } // namespace mfq

@@ -142,6 +142,8 @@ set(TYLOINFER_CUDA_KERNEL_SOURCES
     ${TYLOINFER_CUDA_KERNEL_ROOT}/moe.cu
     ${TYLOINFER_CUDA_KERNEL_ROOT}/mx_matmul.cu
     ${TYLOINFER_CUDA_KERNEL_ROOT}/tq_ops.cu
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/tq_indexed.cu
+    ${TYLOINFER_CUDA_KERNEL_ROOT}/tq_routed_views.cu
     ${TYLOINFER_CUDA_KERNEL_ROOT}/norm.cu
     ${TYLOINFER_CUDA_KERNEL_ROOT}/rope.cu
     ${TYLOINFER_CUDA_KERNEL_ROOT}/sampling.cu
@@ -173,6 +175,7 @@ endif()
 add_library(mfq-cuda-native-kernels STATIC
     ${TYLOINFER_CUDA_KERNEL_SOURCES}
     ${TYLOINFER_CUDA_ROOT}/kernels/float_projection.cu
+    ${TYLOINFER_CUDA_ROOT}/kernels/channel_fp8.cu
     ${TYLOINFER_CUDA_ROOT}/kernels/kv_quantization.cu
     ${TYLOINFER_CUDA_ROOT}/kernels/kv_hot_cache.cu
     ${TYLOINFER_CUDA_ROOT}/kernels/shared_gate_fused.cu
@@ -550,8 +553,10 @@ set(TYLOINFER_CUDA_RUNTIME_OP_SOURCES
     ${TYLOINFER_CUDA_ROOT}/ops/common/moe_routes.cpp
     ${TYLOINFER_CUDA_ROOT}/ops/common/gated_residual.cpp
     ${TYLOINFER_CUDA_ROOT}/ops/tq/tq.cpp
+    ${TYLOINFER_CUDA_ROOT}/ops/tq/tq_rows.cpp
     ${TYLOINFER_CUDA_ROOT}/ops/common/mx.cpp
     ${TYLOINFER_CUDA_ROOT}/ops/common/quant_linear.cpp
+    ${TYLOINFER_CUDA_ROOT}/ops/common/prefill_projection.cpp
 )
 if(TYLOINFER_ENABLE_MFQ_COMPAT)
     list(APPEND TYLOINFER_CUDA_RUNTIME_OP_SOURCES
@@ -577,6 +582,8 @@ set(TYLOINFER_CUDA_LOADING_SOURCES
     ${TYLOINFER_CUDA_ROOT}/storage/model_loader.cpp
     ${TYLOINFER_CUDA_ROOT}/runtime/graph_registry.cpp
     ${TYLOINFER_CUDA_ROOT}/runtime/mfq_cache_api.cpp
+    ${TYLOINFER_CUDA_ROOT}/runtime/routed_cache_resources.cpp
+    ${TYLOINFER_CUDA_ROOT}/runtime/layer_weight_stream.cpp
     ${TYLOINFER_CUDA_ROOT}/runtime/decode_window.cpp
     ${TYLOINFER_CUDA_ROOT}/storage/weight_loader.cpp
     ${TYLOINFER_CUDA_ROOT}/storage/transformer_loader.cpp
@@ -622,6 +629,15 @@ add_library(mfq::cuda-runtime ALIAS mfq-cuda-runtime)
 mfq_configure_cuda_runtime_target(mfq-cuda-runtime)
 
 if(BUILD_TESTING)
+    add_executable(tyloinfer-cuda-tq-resource-test ${TYLOINFER_CUDA_ROOT}/tests/tq_resource_test.cpp)
+    mfq_configure_cuda_runtime_target(tyloinfer-cuda-tq-resource-test)
+    target_link_libraries(tyloinfer-cuda-tq-resource-test PRIVATE mfq-cuda-runtime)
+    target_compile_definitions(tyloinfer-cuda-tq-resource-test PRIVATE TYLOINFER_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
+    if(MSVC)
+        target_compile_options(tyloinfer-cuda-tq-resource-test PRIVATE /EHsc)
+    endif()
+    add_test(NAME tyloinfer-cuda-tq-resources COMMAND tyloinfer-cuda-tq-resource-test)
+    set_tests_properties(tyloinfer-cuda-tq-resources PROPERTIES SKIP_RETURN_CODE 77)
     if(TYLOINFER_ENABLE_MFQ_COMPAT)
     add_executable(mfq-cuda-format-bench
         ${TYLOINFER_REPOSITORY_ROOT}/bench/cuda_format_comparison/mfq_format_bench.cpp)
@@ -804,6 +820,22 @@ if(BUILD_TESTING)
         TYLOINFER_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
     target_link_libraries(mfq-quant-range-cache-test PRIVATE mfq-cuda-runtime)
     endif()
+    add_executable(tyloinfer-cuda-layer-weight-stream-test ${TYLOINFER_CUDA_ROOT}/tests/layer_weight_stream_test.cpp)
+    mfq_configure_cuda_runtime_target(tyloinfer-cuda-layer-weight-stream-test)
+    target_link_libraries(tyloinfer-cuda-layer-weight-stream-test PRIVATE mfq-cuda-runtime)
+    target_compile_definitions(tyloinfer-cuda-layer-weight-stream-test PRIVATE TYLOINFER_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
+    if(MSVC)
+        target_compile_options(tyloinfer-cuda-layer-weight-stream-test PRIVATE /EHsc)
+    endif()
+    add_test(NAME tyloinfer-cuda-layer-weight-stream COMMAND tyloinfer-cuda-layer-weight-stream-test)
+    set_tests_properties(tyloinfer-cuda-layer-weight-stream PROPERTIES SKIP_RETURN_CODE 77)
+    add_executable(tyloinfer-cuda-channel-fp8-test ${TYLOINFER_CUDA_ROOT}/tests/channel_fp8_test.cpp)
+    mfq_configure_cuda_runtime_target(tyloinfer-cuda-channel-fp8-test)
+    target_compile_definitions(tyloinfer-cuda-channel-fp8-test PRIVATE TYLOINFER_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
+    target_include_directories(tyloinfer-cuda-channel-fp8-test PRIVATE ${TYLOINFER_CUDA_ROOT})
+    target_link_libraries(tyloinfer-cuda-channel-fp8-test PRIVATE mfq-cuda-runtime)
+    add_test(NAME tyloinfer-cuda-channel-fp8-test COMMAND tyloinfer-cuda-channel-fp8-test)
+    set_tests_properties(tyloinfer-cuda-channel-fp8-test PROPERTIES SKIP_RETURN_CODE 77)
     add_executable(mfq-mxfp8-layout-test ${TYLOINFER_CUDA_ROOT}/tests/mxfp8_layout_test.cpp)
     mfq_configure_cuda_runtime_target(mfq-mxfp8-layout-test)
     target_compile_definitions(mfq-mxfp8-layout-test PRIVATE TYLOINFER_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
@@ -841,6 +873,7 @@ if(BUILD_TESTING)
     target_link_libraries(mfq-ssm-prefill-test PRIVATE mfq-cuda-runtime)
     add_test(NAME mfq-ssm-prefill-test COMMAND mfq-ssm-prefill-test)
     set_tests_properties(mfq-ssm-prefill-test PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
     add_executable(mfq-window-segment-test ${TYLOINFER_CUDA_ROOT}/tests/decode_window_segment_test.cpp)
     mfq_configure_cuda_runtime_target(mfq-window-segment-test)
     target_compile_definitions(mfq-window-segment-test PRIVATE TYLOINFER_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
@@ -848,7 +881,6 @@ if(BUILD_TESTING)
     add_test(NAME mfq-window-segment-test COMMAND mfq-window-segment-test)
     set_tests_properties(mfq-window-segment-test PROPERTIES SKIP_RETURN_CODE 77)
     add_executable(mfq-window-attention-test ${TYLOINFER_CUDA_ROOT}/tests/decode_window_attention_test.cpp)
-    endif()
     add_executable(tyloinfer-cuda-gdn-prefill-test ${TYLOINFER_CUDA_ROOT}/tests/gdn_prefill_test.cpp)
     mfq_configure_cuda_runtime_target(tyloinfer-cuda-gdn-prefill-test)
     target_compile_definitions(tyloinfer-cuda-gdn-prefill-test PRIVATE TYLOINFER_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
@@ -893,7 +925,6 @@ if(BUILD_TESTING)
     target_compile_definitions(mfq-gdn-decode-window-test PRIVATE TYLOINFER_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
     target_link_libraries(mfq-gdn-decode-window-test PRIVATE mfq-cuda-runtime)
     add_test(NAME mfq-gdn-decode-window-test COMMAND mfq-gdn-decode-window-test)
-    if(TYLOINFER_ENABLE_MFQ_COMPAT)
     mfq_configure_cuda_runtime_target(mfq-window-attention-test)
     target_compile_definitions(mfq-window-attention-test PRIVATE TYLOINFER_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
     target_link_libraries(mfq-window-attention-test PRIVATE mfq-cuda-runtime)
@@ -905,31 +936,41 @@ if(BUILD_TESTING)
     foreach(bits 0 2.5 4)
         add_test(NAME mfq-cuda-qsa-stream-graph-${bits}-test COMMAND mfq-window-attention-test --qsa-stream-graph-check)
         set_tests_properties(mfq-cuda-qsa-stream-graph-${bits}-test PROPERTIES
+            SKIP_RETURN_CODE 77
             ENVIRONMENT "TYLOINFER_KV_TURBOQUANT_BITS=${bits};TYLOINFER_KV_STREAM_GRAPHS=1;TYLOINFER_MEMORY_ARCHITECTURE=discrete")
     endforeach()
     add_test(NAME mfq-cuda-turboquant-kv-test COMMAND mfq-window-attention-test --turboquant-kv-check)
     add_test(NAME mfq-cuda-turboquant-qsa-test COMMAND mfq-window-attention-test --turboquant-qsa-check)
     set_tests_properties(mfq-cuda-turboquant-qsa-test PROPERTIES ENVIRONMENT "TYLOINFER_KV_TURBOQUANT_BITS=3.5")
-    endif()
+    set_tests_properties(mfq-window-attention-test mfq-cuda-qsa-live-scores-test
+        mfq-cuda-qsa-pool-write-test mfq-cuda-qsa-history-prime-test
+        mfq-cuda-qsa-kv-offload-test mfq-cuda-turboquant-kv-test
+        mfq-cuda-turboquant-qsa-test PROPERTIES SKIP_RETURN_CODE 77)
     if(TYLOINFER_ENABLE_MFQ_COMPAT)
     mfq_configure_cuda_runtime_target(mfq-nint-row-pipeline-test)
     target_link_libraries(mfq-nint-row-pipeline-test PRIVATE mfq-cuda-runtime)
+    endif()
     add_executable(mfq-host-expert-cache-test
         ${TYLOINFER_CUDA_ROOT}/tests/moe_host_expert_cache_test.cpp)
+    if(NOT TYLOINFER_ENABLE_MFQ_COMPAT)
+        target_sources(mfq-host-expert-cache-test PRIVATE
+            ${TYLOINFER_CUDA_ROOT}/runtime/moe_host_expert_cache.cpp)
+    endif()
     mfq_configure_cuda_runtime_target(mfq-host-expert-cache-test)
     target_compile_definitions(mfq-host-expert-cache-test PRIVATE
         TYLOINFER_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
     target_link_libraries(mfq-host-expert-cache-test PRIVATE mfq-cuda-runtime)
     add_test(NAME mfq-host-expert-cache-test COMMAND mfq-host-expert-cache-test)
+    if(TYLOINFER_ENABLE_MFQ_COMPAT)
     add_executable(mfq-ssd-expert-streaming-test ${TYLOINFER_CUDA_ROOT}/tests/ssd_expert_streaming_test.cpp)
     mfq_configure_cuda_runtime_target(mfq-ssd-expert-streaming-test)
     target_compile_definitions(mfq-ssd-expert-streaming-test PRIVATE TYLOINFER_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
     target_link_libraries(mfq-ssd-expert-streaming-test PRIVATE mfq-cuda-runtime)
     endif()
     if(MSVC)
+        target_compile_options(mfq-host-expert-cache-test PRIVATE /EHsc)
     if(TYLOINFER_ENABLE_MFQ_COMPAT)
         target_compile_options(mfq-ssd-expert-streaming-test PRIVATE /EHsc)
-        target_compile_options(mfq-host-expert-cache-test PRIVATE /EHsc)
     endif()
         # Cancellation checks must unwind CUDA stream guards before recovery.
     if(TYLOINFER_ENABLE_MFQ_COMPAT)
@@ -1297,6 +1338,7 @@ if(BUILD_TESTING)
     if(TYLOINFER_ENABLE_MFQ_COMPAT)
     add_test(NAME mfq-cuda-execution-scope-test
         COMMAND mfq-cuda-execution-scope-test)
+    endif()
     add_executable(mfq-cuda-runtime-state-test
         ${TYLOINFER_CUDA_ROOT}/tests/cuda_runtime_state_test.cpp)
     mfq_configure_cuda_runtime_target(mfq-cuda-runtime-state-test)
@@ -1310,17 +1352,22 @@ if(BUILD_TESTING)
     add_test(NAME tyloinfer-cuda-attention-prefix-test COMMAND mfq-cuda-runtime-state-test --attention-prefix-check)
     set_tests_properties(tyloinfer-cuda-attention-prefix-test PROPERTIES SKIP_RETURN_CODE 77)
     add_test(NAME tyloinfer-cuda-tq-parallel-test COMMAND mfq-cuda-runtime-state-test --tq-tp-check)
+    if(TYLOINFER_ENABLE_MFQ_COMPAT)
     add_test(NAME mfq-cuda-mfe-prepare-test COMMAND mfq-cuda-runtime-state-test --mfe-prepare-check)
     add_test(NAME mfq-cuda-mfe-transfer-test COMMAND mfq-cuda-runtime-state-test --mfe-transfer-check)
+    endif()
     add_test(NAME mfq-cuda-mapped-copy-test COMMAND mfq-cuda-runtime-state-test --mapped-copy-check)
     add_test(NAME mfq-cuda-sampling-keys-test COMMAND mfq-cuda-runtime-state-test --sampling-check)
     add_test(NAME mfq-cuda-transfer-copy-test COMMAND mfq-cuda-runtime-state-test --transfer-copy-check)
     set_tests_properties(mfq-cuda-runtime-state-test PROPERTIES SKIP_RETURN_CODE 77)
     set_tests_properties(tyloinfer-cuda-tq-parallel-test PROPERTIES SKIP_RETURN_CODE 77)
-    set_tests_properties(mfq-cuda-mfe-prepare-test mfq-cuda-mfe-transfer-test mfq-cuda-mapped-copy-test PROPERTIES SKIP_RETURN_CODE 77)
+    if(TYLOINFER_ENABLE_MFQ_COMPAT)
+    set_tests_properties(mfq-cuda-mfe-prepare-test mfq-cuda-mfe-transfer-test PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
+    set_tests_properties(mfq-cuda-mapped-copy-test PROPERTIES SKIP_RETURN_CODE 77)
     set_tests_properties(mfq-cuda-sampling-keys-test PROPERTIES SKIP_RETURN_CODE 77)
     set_tests_properties(mfq-cuda-transfer-copy-test PROPERTIES SKIP_RETURN_CODE 77)
-    endif()
+
 endif()
 
 

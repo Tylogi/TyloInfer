@@ -1,3 +1,6 @@
+#include "runtime/routed_admission_executor.h"
+#include "runtime/routed_prefill_capacity.h"
+#include "runtime/routed_stream_fence.h"
 #include "../runtime/execution_options.h"
 #include "mfq_cache_provider.h"
 #include "moe_cached_source_internal.h"
@@ -23,65 +26,40 @@
 #include <unistd.h>
 #endif
 
-struct MoeSsdPrefillReader {
-    std::mutex mutex;
-    std::condition_variable ready;
-    std::deque<std::packaged_task<void()>> jobs;
-    bool stopping=false;
-    std::thread worker;
-    ~MoeSsdPrefillReader() {
-        {std::lock_guard lock(mutex);stopping=true;}
-        ready.notify_one();
-        if(worker.joinable())worker.join();
-    }
-    std::future<void> submit(std::function<void()> read) {
-        std::packaged_task<void()> task(std::move(read));auto result=task.get_future();
-        {
-            std::lock_guard lock(mutex);
-            if(stopping || jobs.size()>=2)throw std::logic_error("SSD prefill read queue exceeds its two packets");
-            if(!worker.joinable())worker=std::thread([this] {
-                for(;;) {
-                    std::packaged_task<void()> next;
-                    {
-                        std::unique_lock lock(mutex);
-                        ready.wait(lock,[&]{return stopping || !jobs.empty();});
-                        if(jobs.empty())return;
-                        next=std::move(jobs.front());jobs.pop_front();
-                    }
-                    next();
-                }
-            });
-            jobs.push_back(std::move(task));
-        }
-        ready.notify_one();return result;
-    }
-};
 
 std::optional<std::size_t> MoeExpertCache::available_host_ram() const {
     const auto* option=std::getenv("TYLOINFER_PREFILL_BACKUP_PRESSURE");
     if(option && option[0]=='0')return std::nullopt;
     try {
-        const auto memory=MoeResidencyManager::sample_host_memory();
-        auto available=std::size_t(memory.available_host_bytes());
-        if(config_.moe_host_physical_bytes)
-            available=std::min(available,memory.resident_bytes>=config_.moe_host_physical_bytes
-                ?std::size_t(0):std::size_t(config_.moe_host_physical_bytes-memory.resident_bytes));
-        return available;
+        return mfq::host_memory_headroom(MoeResidencyManager::sample_host_memory(),
+            config_.moe_host_physical_bytes);
     } catch(const std::runtime_error&) {return std::nullopt;}
 }
 
 std::size_t MoeExpertCache::reclaim_optional_host(std::size_t allocation_bytes) {
-    if(!host_experts_->stats().optional_bytes)return 0;
-    const auto available=available_host_ram();
-    if(!available)return 0;
-    constexpr auto reserve=std::size_t(1)<<30;
-    const auto free=*available>reserve?*available-reserve:0;
-    if(free>=allocation_bytes && *available>=reserve)return 0;
-    const auto shortage=allocation_bytes>free?allocation_bytes-free:reserve-*available;
-    const auto released=host_experts_->reclaim_optional(shortage);
-    if(released)std::cerr<<"runtime_prefill_backup action=reclaim bytes="<<released
-        <<" available_bytes="<<*available<<" allocation_bytes="<<allocation_bytes<<'\n';
-    return released;
+    return host_experts_->reserve(allocation_bytes,[this]{return available_host_ram();},
+        []{mfq_release_host_allocator_cache();});
+}
+
+std::size_t MoeExpertCache::reclaim_host_duplicates(std::size_t bytes) {
+    return host_experts_->reclaim(bytes,true);
+}
+
+std::size_t MoeExpertCache::share_host(std::size_t bytes) {
+    return host_experts_->share(bytes,[this]{return available_host_ram();},
+        []{mfq_release_host_allocator_cache();});
+}
+
+std::shared_ptr<MoeCachedSource> MoeExpertCache::retain_source(std::shared_ptr<MoeCachedSource> source) {
+    const auto payload=source->logical_weight_bytes(),host=source->host_bytes();
+    if(payload<0 || static_cast<std::uint64_t>(payload)>std::numeric_limits<std::size_t>::max()-source_bytes_ ||
+            host<0 || host>std::numeric_limits<std::int64_t>::max()-host_bytes_)
+        throw std::overflow_error("MoE source byte accounting overflow");
+    sources_.push_back(source);
+    // Preserve the checkpoint footprint when CPU views are released or the
+    // device cache is resized. Resource shares depend on immutable sources.
+    source_bytes_+=static_cast<std::size_t>(payload);host_bytes_+=host;
+    return source;
 }
 
 std::shared_ptr<MoeCachedSource> MoeExpertCache::register_source(
@@ -94,9 +72,7 @@ std::shared_ptr<MoeCachedSource> MoeExpertCache::register_source(
     auto source = std::make_shared<MoeCachedSource>(
         this, id, name, std::move(cpu), minimum_slots,
         layer_id, std::move(projection_role), nullptr);
-    host_bytes_ += source->host_bytes();
-    sources_.push_back(source);
-    return source;
+    return retain_source(std::move(source));
 }
 
 std::shared_ptr<MoeCachedSource> MoeExpertCache::register_range_source(
@@ -110,9 +86,7 @@ std::shared_ptr<MoeCachedSource> MoeExpertCache::register_range_source(
     auto source = std::make_shared<MoeCachedSource>(
         this, id, name, std::move(metadata), minimum_slots,
         layer_id, std::move(projection_role), std::move(store));
-    host_bytes_ += source->host_bytes();
-    sources_.push_back(source);
-    return source;
+    return retain_source(std::move(source));
 }
 
 std::shared_ptr<MoeCachedSource> MoeExpertCache::register_quant_range_source(
@@ -123,9 +97,7 @@ std::shared_ptr<MoeCachedSource> MoeExpertCache::register_quant_range_source(
     auto runtime=range->metadata();
     auto source=std::make_shared<MoeCachedSource>(this,id,name,std::move(runtime),minimum_slots,
         layer_id,std::move(projection_role),nullptr,std::move(range));
-    host_bytes_+=source->host_bytes();
-    sources_.push_back(source);
-    return source;
+    return retain_source(std::move(source));
 }
 
 void MoeExpertCache::finalize(std::size_t kv_growth_reserve, std::size_t kv_budget_charge) {
@@ -511,7 +483,7 @@ void MoeExpertCache::finalize(std::size_t kv_growth_reserve, std::size_t kv_budg
 void MoeExpertCache::initialize_ssd_readers() {
     if(!ssd_read_pool_)ssd_read_pool_=std::make_unique<mfq::HostParallelPool>(std::function<void(std::size_t)>{},false);
     if(!ssd_background_read_pool_)ssd_background_read_pool_=std::make_unique<mfq::HostParallelPool>(std::function<void(std::size_t)>{},false);
-    if(!ssd_prefill_reader_)ssd_prefill_reader_=std::make_shared<MoeSsdPrefillReader>();
+    if(!ssd_prefill_reader_)ssd_prefill_reader_=std::make_shared<RoutedAdmissionExecutor>(2);
 }
 
 void MoeExpertCache::prepare_ssd_placement(MoeCachedSource& source,const std::vector<int32_t>& chosen,SsdPlacementStats& stats) {
@@ -589,6 +561,7 @@ void MoeExpertCache::initialize_ssd_residency() {
             // non-local budget. Price the model's largest FFN bundle before
             // committing the cache; these transient packets cannot be paged.
             std::unordered_map<int,std::size_t> layer_bytes;
+            std::array<mfq::cuda::RoutedPrefillImageGeometry,2> image_geometry;
             for(const auto& source:sources_) {
                 std::size_t largest=0;
                 for(const auto& cohort:source->cohorts_) {
@@ -597,16 +570,31 @@ void MoeExpertCache::initialize_ssd_residency() {
                     largest=std::max(largest,bytes);
                 }
                 layer_bytes[source->layer_id_]+=largest;
+                for(int expert=0;expert<source->n_experts();++expert) {
+                    const auto& cohort=source->cohorts_[source->expert_to_cohort_[expert]];
+                    for(const auto field:cohort.bytes_per_expert)
+                        image_geometry[source->layer_id_<0].add(source->layer_id_,expert,field);
+                }
             }
-            std::size_t bundle=0;for(const auto& [layer,bytes]:layer_bytes)bundle=std::max(bundle,bytes);
-            const auto groups=std::getenv("TYLOINFER_MOE_PREFILL_GROUP_SIZE")?
-                std::clamp(mfq::cuda::runtime_options::moe_prefill_group_size(),1,96):64;
+            std::array<std::size_t,2> bundles{};
+            for(const auto& [layer,bytes]:layer_bytes)bundles[layer<0]=std::max(bundles[layer<0],bytes);
+            const auto bundle=std::max(bundles[0],bundles[1]);
+            std::size_t requested=0;
+            if(const auto* option=std::getenv("TYLOINFER_MOE_PREFILL_GROUP_SIZE");option && option[0])
+                requested=std::max(1,mfq::cuda::runtime_options::moe_prefill_group_size());
+            std::size_t prefill_packets=0;
+            for(std::size_t kind=0;kind<image_geometry.size();++kind)if(image_geometry[kind].experts) {
+                const auto& geometry=image_geometry[kind];
+                const auto groups=mfq::cuda::routed_prefill_group_capacity(geometry.experts,geometry.encoded,0,
+                    requested,host_experts_->stats().budget_bytes);
+                prefill_packets=std::max(prefill_packets,2*groups*bundles[kind]);
+            }
             // Backup/upload storage survives across phases. Prefill and
             // decode packets are released at their reader fences and share
             // the remaining headroom instead of consuming it together.
             const auto exchange=2*std::min(host_experts_->stats().budget_bytes/4,
                 moe_ssd_residency_stage_limit_bytes);
-            const auto transient=bundle*std::max(2*groups,moe_decode_transfer_slots(8,10))+
+            const auto transient=std::max(prefill_packets,bundle*std::size_t(moe_decode_transfer_slots(8,10)))+
                 exchange+(std::size_t(256)<<20);
             const auto reserve=std::size_t(mfq::cuda::runtime_options::moe_ram_pin_reserve_bytes().value_or(
                 std::int64_t(std::max(std::size_t(1)<<30,transient))));
@@ -770,7 +758,7 @@ void MoeExpertCache::queue_ssd_prediction(std::vector<SsdExpertRequest> requests
     // to interrupt between predictions, without pausing an active source read.
     reads->prioritize_prediction_experts(selected);
     reads->initialize_predictions();
-    if(!ssd_prediction_reader_)ssd_prediction_reader_=std::make_shared<MoeSsdPrefillReader>();
+    if(!ssd_prediction_reader_)ssd_prediction_reader_=std::make_shared<RoutedAdmissionExecutor>(2);
     if(!ssd_prediction_pool_)ssd_prediction_pool_=std::make_unique<mfq::HostParallelPool>(std::function<void(std::size_t)>{},false);
     std::uint64_t bytes=0;
     for(const auto i:reads->missing)bytes+=reads->requests[i].first->expert_field_bytes(reads->requests[i].second);
@@ -940,6 +928,7 @@ MoePrefillWorkspaceBudget MoeExpertCache::prefill_workspace_budget(bool allow_bo
         // Auto must shrink computation before reducing transfer overlap.
         struct Layer {std::size_t baseline=0,largest=0;};
         std::map<int,Layer> layers;
+        mfq::cuda::RoutedPrefillImageGeometry geometry;
         for(const auto& source:sources_)if(source->layer_id_>=0) {
             auto& layer=layers[source->layer_id_];std::size_t largest=0;
             for(const auto& cohort:source->cohorts_) {
@@ -950,13 +939,17 @@ MoePrefillWorkspaceBudget MoeExpertCache::prefill_workspace_budget(bool allow_bo
                 largest=std::max(largest,bytes);
             }
             layer.largest+=largest;
+            for(int expert=0;expert<source->n_experts();++expert) {
+                const auto& cohort=source->cohorts_[source->expert_to_cohort_[expert]];
+                for(const auto bytes:cohort.bytes_per_expert)geometry.add(source->layer_id_,expert,bytes);
+            }
         }
-        std::size_t largest=1;
-        for(const auto& [id,layer]:layers)largest=std::max(largest,layer.largest);
-        auto slots=std::getenv("TYLOINFER_MOE_PREFILL_GROUP_SIZE")
-            ? mfq::cuda::runtime_options::moe_prefill_group_size() : 64;
-        slots=std::min<std::size_t>(std::clamp(slots,1,96),
-            std::max<std::size_t>(1,host_experts_->stats().budget_bytes/2/largest));
+        if(!geometry.experts)return budget;
+        std::size_t requested=0;
+        if(const auto* option=std::getenv("TYLOINFER_MOE_PREFILL_GROUP_SIZE");option && option[0])
+            requested=std::max(1,mfq::cuda::runtime_options::moe_prefill_group_size());
+        const auto slots=mfq::cuda::routed_prefill_group_capacity(geometry.experts,geometry.encoded,0,
+            requested,host_experts_->stats().budget_bytes);
         for(const auto& [id,layer]:layers)
             budget.transfer_bytes=std::max(budget.transfer_bytes,
                 2*((layer.baseline+slots*layer.largest+255)&~std::size_t(255)));
@@ -997,7 +990,7 @@ std::size_t MoeExpertCache::begin_prefill_loan(std::size_t workspace_bytes) {
     const auto loan_started=std::chrono::steady_clock::now();
     finish_pipeline_exchanges();
     mfq_legacy_release_moe_prefill_buffers(this);
-    TYLOINFER_CUDA_CHECK(cudaDeviceSynchronize());
+    fence_storage_consumers();
     context->reclaim_idle_memory();
     const auto available=context->available_memory();
     if(!force && available>=workspace_bytes)return 0;
@@ -2522,6 +2515,9 @@ bool mfq_legacy_moe_expert_cache_ssd_router_prefetch(const std::shared_ptr<MoeEx
 std::size_t mfq_legacy_moe_expert_cache_budget_bytes(const std::shared_ptr<MoeExpertCache>& cache) {
     return cache ? std::size_t(cache->budget_bytes()) : 0;
 }
+std::size_t mfq_legacy_moe_expert_source_bytes(const std::shared_ptr<MoeExpertCache>& cache) {
+    return cache ? cache->source_bytes() : 0;
+}
 void mfq_legacy_resize_moe_expert_cache(const std::shared_ptr<MoeExpertCache>& cache,std::size_t bytes) {
     if(!cache)return;
     mfq_legacy_release_moe_decode_buffers(cache);
@@ -2536,6 +2532,18 @@ void mfq_legacy_reserve_moe_workspace(const std::shared_ptr<MoeExpertCache>& cac
 }
 std::size_t mfq_legacy_reclaim_moe_optional_host(const std::shared_ptr<MoeExpertCache>& cache,std::size_t allocation_bytes) {
     return cache?cache->reclaim_optional_host(allocation_bytes):0;
+}
+std::size_t mfq_legacy_reclaim_moe_expert_duplicates(const std::shared_ptr<MoeExpertCache>& cache,std::size_t bytes) {
+    return cache?cache->reclaim_host_duplicates(bytes):0;
+}
+std::size_t mfq_legacy_share_moe_expert_host(const std::shared_ptr<MoeExpertCache>& cache,std::size_t bytes) {
+    return cache?cache->share_host(bytes):0;
+}
+std::size_t mfq_legacy_moe_expert_host_minimum_bytes(const std::shared_ptr<MoeExpertCache>& cache) {
+    return cache?cache->host_minimum_bytes():0;
+}
+void mfq_legacy_resize_moe_expert_host(const std::shared_ptr<MoeExpertCache>& cache,std::size_t bytes) {
+    if(cache)cache->resize_host(bytes);
 }
 
 void mfq_legacy_finalize_moe_expert_cache(
@@ -2589,6 +2597,16 @@ void MoeExpertCache::finish_prefill_copies() {
     if(failure)std::rethrow_exception(failure);
 }
 
+void MoeExpertCache::fence_storage_consumers() {
+    finish_prefill_copies();
+    mfq::cuda::synchronize_routed_streams(mfq_get_current_cuda_stream(mfq_current_cuda_device()),
+        {route_stream_,weight_stream_});
+    // Recorded consumers may belong to an earlier execution lane. Captured
+    // readers retain their lane through the common graph-pool owner.
+    if(compute_done_recorded_)TYLOINFER_CUDA_CHECK(cudaEventSynchronize(compute_done_));
+    pipeline_graph_pools_.synchronize();
+}
+
 void mfq_legacy_release_moe_prefill_buffers(const std::shared_ptr<MoeExpertCache>& cache) {
     // Public request/decode boundary: borrowed weights must have been restored.
     // Internal prefill cleanup uses the raw overload while retiring loan views.
@@ -2600,15 +2618,16 @@ void mfq_legacy_release_moe_prefill_buffers(MoeExpertCache* cache) {
     if(!cache)return;
     if(!cache->pipeline_prefill_copy_pending_ && cache->pipeline_prefill_release_.empty() &&
             !cache->pipeline_prefill_layer_buffer_.defined() && !cache->pipeline_prefill_pool_ &&
-            !cache->pipeline_prefill_host_ring_.defined() && !cache->pipeline_prefill_metadata_host_.defined())return;
+            !cache->pipeline_prefill_host_ring_.defined() && !cache->pipeline_prefill_metadata_host_.defined() &&
+            !cache->pipeline_prefill_activations_)return;
     cudaStreamCaptureStatus capture;
     const auto stream=mfq_current_cuda_stream();
     TYLOINFER_CUDA_CHECK(cudaStreamIsCapturing(stream,&capture));
     if(capture!=cudaStreamCaptureStatusNone)
         throw std::runtime_error("prefill buffers must be released before decode graph capture");
     if(cache->pipeline_prefill_copy_pending_)cache->finish_prefill_copies();
-    TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(stream));
-    TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(cache->weight_stream_));
+    mfq::cuda::synchronize_routed_streams(mfq_get_current_cuda_stream(mfq_current_cuda_device()),
+        {cache->weight_stream_});
     for(auto& release:cache->pipeline_prefill_release_)release();
     cache->pipeline_prefill_release_.clear();
     for(auto i=cache->pipeline_stages_.begin();i!=cache->pipeline_stages_.end();)
@@ -2747,7 +2766,7 @@ bool mfq_legacy_lend_moe_decode_cache_for_prefill(const std::shared_ptr<MoeExper
         if(!key.starts_with("prefill:"))return false;
     for(const auto& batch:cache->pipeline_dma_batches_)if(batch)return false;
     cache->finish_pipeline_exchanges();
-    TYLOINFER_CUDA_CHECK(cudaDeviceSynchronize());
+    cache->fence_storage_consumers();
     cache->ssd_pending_forecast_={};
     cache->ssd_forecast_gpu_fields_.clear();
     mfq_legacy_release_moe_prefill_buffers(cache);
@@ -2764,7 +2783,8 @@ bool mfq_legacy_lend_moe_decode_cache_for_prefill(const std::shared_ptr<MoeExper
     const auto context=mfq::cuda::default_context(mfq_current_cuda_device());
     context->reclaim_idle_memory();
     cache->reserve_workspace(workspace_bytes);
-    const bool retained=context->available_memory()+context->workspace_available()>=workspace_bytes;
+    const bool retained=context->workspace_allocations_fit({workspace_bytes},context->available_memory(),
+        mfq_get_current_cuda_stream().stream());
     if(returned)std::cerr<<"runtime_moe_prefill_graphs retained="<<retained
         <<" returned_expert_bytes="<<returned<<" workspace_bytes="<<workspace_bytes<<'\n';
     return retained;
@@ -2775,7 +2795,7 @@ void mfq_legacy_release_moe_decode_buffers(const std::shared_ptr<MoeExpertCache>
     cache->ssd_pending_prediction_.clear();
     cache->ssd_forecast_gpu_fields_.clear();
     cache->finish_pipeline_exchanges();
-    TYLOINFER_CUDA_CHECK(cudaDeviceSynchronize());
+    cache->fence_storage_consumers();
     cache->ssd_pending_forecast_={};
     mfq_legacy_release_moe_prefill_buffers(cache);
     for(const auto& held:cache->pipeline_transfer_slots_)
@@ -2784,10 +2804,7 @@ void mfq_legacy_release_moe_decode_buffers(const std::shared_ptr<MoeExpertCache>
     // Destroy captured DMA/FFN consumers before returning their storage.
     for(auto& batch:cache->pipeline_dma_batches_)batch.reset();
     for(auto& release:cache->pipeline_decode_release_)release();
-    if(cache->pipeline_pool_context_) {
-        cache->pipeline_pool_context_->end_graph_pool(cache->pipeline_pool_stream_);
-        cache->pipeline_pool_context_.reset();cache->pipeline_pool_stream_=nullptr;
-    }
+    cache->pipeline_graph_pools_.clear();
     // Adaptation caches arena pointers independently of captured FFN cells.
     // Keep its heat history, but retire those pointers before freeing arenas.
     if(cache->moe_residency_)cache->moe_residency_->release_transfer_stages();
@@ -2801,13 +2818,7 @@ void mfq_legacy_release_moe_decode_buffers(const std::shared_ptr<MoeExpertCache>
 
 bool mfq_legacy_prepare_moe_graph_pool(const std::shared_ptr<MoeExpertCache>& cache) {
     if (!cache || !mfq_legacy_moe_expert_cache_has_sources(cache)) return false;
-    const auto stream = mfq_current_cuda_stream();
-    if (!cache->pipeline_pool_context_) {
-        cache->pipeline_pool_context_ = mfq::cuda::default_context(mfq_current_cuda_device());
-        cache->pipeline_pool_stream_ = stream;
-        cache->pipeline_pool_context_->begin_graph_pool(stream);
-    } else if (cache->pipeline_pool_stream_ != stream)
-        throw std::runtime_error("MFE graph memory pool changed its CUDA stream");
+    cache->pipeline_graph_pools_.prepare_shared_buffers(mfq_get_current_cuda_stream(mfq_current_cuda_device()));
     return true;
 }
 

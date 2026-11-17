@@ -86,8 +86,11 @@ __device__ __forceinline__ void tq_mma_grouped_loop(TrellisProjectionView m,
     }
 }
 __global__ __launch_bounds__(128)
-void tq_indexed_mma_kernel(const TrellisIndexedWideProjectionJob* jobs,const uint16_t* x,uint16_t* output,int tile) {
+void tq_indexed_mma_kernel(const TrellisIndexedWideProjectionJob* jobs,const uint16_t* x,uint16_t* output,int tile,
+        const uint32_t* cancelled=nullptr) {
+    if(cancelled && *cancelled)return;
     const auto* job=jobs+blockIdx.y;const auto m=job->weight;
+    if(job->count<=0)return;
 #if __CUDA_ARCH__ < 800
     // m16n8k16 FP16 MMA requires SM80. Explicit wide API calls on older
     // targets remain correct; the native planner retains its four-row tiles.
@@ -175,8 +178,10 @@ __device__ __forceinline__ void tq_mma_pair_loop(const TrellisIndexedWidePairJob
 
 __global__ __launch_bounds__(256)
 void tq_indexed_wide_swiglu_kernel(const TrellisIndexedWidePairJob* jobs,
-        const uint16_t* x,uint16_t* output,int tile,float limit) {
+        const uint16_t* x,uint16_t* output,int tile,float limit,const uint32_t* cancelled=nullptr) {
+    if(cancelled && *cancelled)return;
     const auto* job=jobs+blockIdx.y;
+    if(job->count<=0)return;
 #if __CUDA_ARCH__ < 800
     // Explicit calls remain correct on older targets. The native planner uses
     // its existing <=4-row jobs when m16n8k16 FP16 MMA is unavailable.
@@ -253,6 +258,23 @@ extern "C" int mfq_tq_indexed_wide(const TrellisIndexedWideProjectionJob* jobs,
     for(int64_t first=0;first<count;first+=65535) {
         tq_indexed_mma_kernel<<<dim3((uint64_t(rows)+63)/64,std::min(int64_t(65535),int64_t(count)-first)),128,0,stream>>>(
             jobs+first,static_cast<const uint16_t*>(x),static_cast<uint16_t*>(y),tile);
+        const auto error=cudaGetLastError();if(error)return int(error);
+    }
+    return 0;
+}
+
+extern "C" int mfq_tq_indexed_wide_guarded(const void* jobs,const void* x,void* y,int count,int rows,
+        int dtype,int tile,float limit,bool pair,const uint32_t* cancelled,cudaStream_t stream) {
+    if(!jobs || !x || !y || x==y || !cancelled || count<1 || rows<1 || dtype!=0 ||
+       tile<1 || tile>8 || (!pair && tile<5) || !std::isfinite(limit) || limit<0)return -1;
+    for(int64_t first=0;first<count;first+=65535) {
+        const auto batch=std::min(int64_t(65535),int64_t(count)-first);
+        if(pair)tq_indexed_wide_swiglu_kernel<<<dim3((uint64_t(rows)+7)/8,batch),256,0,stream>>>(
+            static_cast<const TrellisIndexedWidePairJob*>(jobs)+first,static_cast<const uint16_t*>(x),
+            static_cast<uint16_t*>(y),tile,limit,cancelled);
+        else tq_indexed_mma_kernel<<<dim3((uint64_t(rows)+63)/64,batch),128,0,stream>>>(
+            static_cast<const TrellisIndexedWideProjectionJob*>(jobs)+first,static_cast<const uint16_t*>(x),
+            static_cast<uint16_t*>(y),tile,cancelled);
         const auto error=cudaGetLastError();if(error)return int(error);
     }
     return 0;

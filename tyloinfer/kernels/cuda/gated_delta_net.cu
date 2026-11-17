@@ -10,6 +10,8 @@
 #include "gdn_update.cuh"
 #include <cuda_fp16.h>
 #include "gdn_input.cuh"
+#include "../../../cpp_runtime/backends/cuda/runtime/gdn_decode_plan.h"
+#include "../../../cpp_runtime/backends/cuda/kernels/gguf.h"
 #define GGML_COMMON_DECL_CUDA
 #include "ggml-common.h"
 #include "../../../cpp_runtime/backends/cuda/kernels/gguf_quantize.cuh"
@@ -481,7 +483,7 @@ __global__ void gdn_decode_core_kernel(const void* qkv,const Gate* output_gate,
     Output* output,block_q8_1* quantized_output,float* convolution_out,float* recurrent_out,int key_heads,int value_heads,
     int width,int taps,int layout,float convolution_eps,double norm_eps,bool silu_gate,
     bool transposed_state,int64_t as0,int64_t as2,int64_t bs0,int64_t bs2,
-    float* workspace,const int64_t* state_addresses,int64_t qkv_stride,int64_t gate_stride,bool warp_reductions,float* checkpoint_convolution,float* checkpoint_recurrent,bool qkv_float,bool tiled_heads,GdnHeadDivisors divisors) {
+    float* workspace,const int64_t* state_addresses,int64_t qkv_stride,int64_t gate_stride,bool warp_reductions,float* checkpoint_convolution,float* checkpoint_recurrent,bool qkv_float,bool tiled_heads,GdnHeadDivisors divisors,bool position_major) {
     if constexpr(FixedWidth>0)width=FixedWidth;
     if constexpr(FixedTaps>0)taps=FixedTaps;
     const int bh=blockIdx.x/tiles,tile=blockIdx.x%tiles;
@@ -747,7 +749,11 @@ __global__ void gdn_decode_core_kernel(const void* qkv,const Gate* output_gate,
         const float gate=silu_gate?__fmul_rn(z,sigmoid):sigmoid;
         const float scaled=__fmul_rn(__fmul_rn(attended[tid],inverse),norm_weight[tid]);
         const auto rounded=static_cast<Output>(__fmul_rn(scaled,gate));
-        if(quantized_output)mfq::cuda::gguf::store_q8(float(rounded),index,quantized_output);
+        if(quantized_output) {
+            if(position_major)mfq::cuda::gguf::store_q8_position_major(float(rounded),index,int64_t(value_heads)*width,
+                int(gridDim.x)/(value_heads*tiles),quantized_output);
+            else mfq::cuda::gguf::store_q8(float(rounded),index,quantized_output);
+        }
         else output[index]=rounded;
     }
     if constexpr(InplaceConv) {
@@ -788,9 +794,9 @@ static std::vector<mfq_tensor_backend::Tensor> gdn_decode_core_impl(
     double convolution_eps,double norm_eps,bool silu_gate,bool output_half,
     bool transposed_state,mfq_tensor_backend::Tensor workspace,bool inplace_state,
     mfq_tensor_backend::Tensor state_addresses,
-    mfq_tensor_backend::Tensor checkpoint_convolution={},mfq_tensor_backend::Tensor checkpoint_recurrent={},bool tiled_heads=false,bool quantize_output=false) {
+    mfq_tensor_backend::Tensor checkpoint_convolution={},mfq_tensor_backend::Tensor checkpoint_recurrent={},bool tiled_heads=false,bool quantize_output=false,bool position_major=false) {
     constexpr int threads=256;
-    const int tiles=[] {
+    int tiles=[] {
         const char* value=std::getenv("TYLOINFER_GDN_DECODE_TILES");
         if(!value || !*value || std::strcmp(value,"4")==0)return 4;
         if(std::strcmp(value,"2")==0)return 2;
@@ -807,7 +813,7 @@ static std::vector<mfq_tensor_backend::Tensor> gdn_decode_core_impl(
         "GDN decode core heads/batch disagree");
     const int64_t batch=qkv.size(0),channels=(2*key_heads+value_heads)*width,taps=convolution_state.size(1)+1;
     TYLOINFER_RUNTIME_CHECK(channels<=std::numeric_limits<int>::max() && taps>1 &&
-        taps<=std::numeric_limits<int>::max() && batch<=std::numeric_limits<int>::max()/value_heads/tiles &&
+        taps<=std::numeric_limits<int>::max() && batch<=std::numeric_limits<int>::max()/value_heads &&
         std::isfinite(convolution_eps) && convolution_eps>0 && std::isfinite(norm_eps) && norm_eps>0,
         "GDN decode core geometry/epsilon exceeds supported bounds");
     TYLOINFER_RUNTIME_CHECK(qkv.is_cuda() && qkv.stride(2)==1 && qkv.stride(0)>=channels &&
@@ -845,8 +851,20 @@ static std::vector<mfq_tensor_backend::Tensor> gdn_decode_core_impl(
     TYLOINFER_RUNTIME_CHECK(dt_bias.numel()==value_heads && a_log.numel()==value_heads && norm_weight.numel()==width,
         "GDN decode core vector width disagrees");
     MfqCudaGuard guard(device);
+    if(const auto* setting=std::getenv("TYLOINFER_GDN_DECODE_TILES");!setting || !*setting) {
+        static thread_local int cached_device=-1,processors=0;
+        if(cached_device!=qkv.get_device()) {
+            TYLOINFER_CUDA_CHECK(cudaDeviceGetAttribute(&processors,cudaDevAttrMultiProcessorCount,qkv.get_device()));
+            cached_device=qkv.get_device();
+        }
+        tiles=mfq::cuda::gdn_decode_tiles(std::uint64_t(batch)*value_heads,processors);
+    }
+    TYLOINFER_RUNTIME_CHECK(batch<=std::numeric_limits<int>::max()/value_heads/tiles,
+        "GDN decode core tiled launch exceeds supported bounds");
+    TYLOINFER_RUNTIME_CHECK(!position_major || quantize_output,"GDN position-major output requires Q8 preparation");
     auto output=quantize_output
-        ? tb::empty({batch*value_heads*(width/32)*int64_t(sizeof(block_q8_1))},qkv.options().dtype(tb::kUInt8))
+        ? tb::empty({position_major?int64_t(mfq::cuda::gguf::interleaved_activation_bytes(batch,value_heads*width)):
+            batch*value_heads*(width/32)*int64_t(sizeof(block_q8_1))},qkv.options().dtype(tb::kUInt8))
         : tb::empty({batch,1,value_heads*width},qkv.options().dtype(output_half?tb::kFloat16:tb::kFloat32));
     const auto* conv_option=std::getenv("TYLOINFER_GDN_INPLACE_CONV");
     const bool conv_default=transposed_state;
@@ -881,15 +899,14 @@ static std::vector<mfq_tensor_backend::Tensor> gdn_decode_core_impl(
             independent?state_addresses.data_ptr<int64_t>():nullptr,qkv.stride(0),output_gate.stride(0),
             [] {const char* option=std::getenv("TYLOINFER_GDN_WARP_REDUCTIONS");return !option || option[0]!='0';}(),
             checkpoint_convolution.defined()?checkpoint_convolution.data_ptr<float>():nullptr,
-            checkpoint_recurrent.defined()?checkpoint_recurrent.data_ptr<float>():nullptr,qkv.scalar_type()==tb::kFloat32,tiled_heads,head_divisors);
+            checkpoint_recurrent.defined()?checkpoint_recurrent.data_ptr<float>():nullptr,qkv.scalar_type()==tb::kFloat32,tiled_heads,head_divisors,position_major);
         };
         if(checkpoint_convolution.defined())dispatch.template operator()<true>();
         else dispatch.template operator()<false>();
         };
         const auto* option=std::getenv("TYLOINFER_GDN_BROADCAST_NORMALIZATION");
         const int mode=option?std::atoi(option):
-            (width==128 && taps==4 &&
-             transposed_state && Tiles==4 && threads==256?2:0);
+            (width==128 && taps==4 && threads==256?2:0);
         if constexpr(FixedWidth==128 && FixedTaps==4) {
             if(mode==2){normalizations.template operator()<2>();return;}
             if(mode==3){normalizations.template operator()<3>();return;}
@@ -941,9 +958,9 @@ std::vector<mfq_tensor_backend::Tensor> gdn_decode_core_cuda(
     double convolution_eps, double norm_eps, bool silu_gate, bool output_half,
     bool transposed_state,
     mfq_tensor_backend::Tensor workspace,bool inplace_state,
-    mfq_tensor_backend::Tensor state_addresses,bool tiled_heads,bool quantize_output) {
+    mfq_tensor_backend::Tensor state_addresses,bool tiled_heads,bool quantize_output,bool position_major) {
     return gdn_decode_core_impl(qkv,output_gate,alpha,beta,convolution_state,recurrent_state,convolution_weight,dt_bias,a_log,norm_weight,
-        key_heads,value_heads,width,convolution_eps,norm_eps,silu_gate,output_half,transposed_state,workspace,inplace_state,state_addresses,{}, {},tiled_heads,quantize_output);
+        key_heads,value_heads,width,convolution_eps,norm_eps,silu_gate,output_half,transposed_state,workspace,inplace_state,state_addresses,{}, {},tiled_heads,quantize_output,position_major);
 }
 
 std::vector<mfq_tensor_backend::Tensor> gdn_decode_core_checkpoint_cuda(

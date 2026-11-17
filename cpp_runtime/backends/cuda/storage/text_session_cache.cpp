@@ -1,4 +1,5 @@
 #include "storage/text_session_cache.h"
+#include "runtime/device_memory_topology.h"
 #include "storage/qsa_ram_session.h"
 #include "core/full_block.h"
 #include <array>
@@ -42,9 +43,7 @@
 namespace mfq::cuda::internal {
 
 bool cuda_has_separate_memory() {
-    cudaDeviceProp properties{};
-    TYLOINFER_CUDA_CHECK(cudaGetDeviceProperties(&properties, mfq_current_cuda_device()));
-    return !properties.integrated && std::strstr(properties.name, "GB10") == nullptr;
+    return device_has_separate_memory(mfq_current_cuda_device());
 }
 
 static std::string cuda_prefix_cache_compatibility_key(
@@ -299,6 +298,25 @@ TYLOINFER_INSTANTIATE_SESSION_CACHE(mfq::cuda::NemotronHCausalLm)
 using mfq::cuda::internal::read_ram_qsa_page;
 using mfq::cuda::internal::write_ram_qsa_page;
 
+namespace {
+struct PagedTensorType {
+    int32_t code;
+    mfq_tensor_backend::ScalarType dtype;
+    std::size_t bytes;
+};
+// Persistent IDs are independent of the backend's tensor enum.
+constexpr std::array<PagedTensorType,8> paged_tensor_types{{
+    {1,mfq_tensor_backend::kUInt8,1}, {2,mfq_tensor_backend::kInt8,1},
+    {3,mfq_tensor_backend::kInt16,2}, {4,mfq_tensor_backend::kInt32,4},
+    {5,mfq_tensor_backend::kInt64,8}, {6,mfq_tensor_backend::kFloat16,2},
+    {7,mfq_tensor_backend::kBFloat16,2}, {8,mfq_tensor_backend::kFloat32,4}}};
+template<class Predicate>
+const PagedTensorType* paged_tensor_type(Predicate matches) {
+    const auto found=std::find_if(paged_tensor_types.begin(),paged_tensor_types.end(),matches);
+    return found==paged_tensor_types.end()?nullptr:&*found;
+}
+}
+
 void CudaPagedWriter::raw(const void *data, size_t size) {
     const auto *begin = static_cast<const uint8_t *>(data);
     bytes_.insert(bytes_.end(), begin, begin + size);
@@ -309,12 +327,14 @@ void CudaPagedWriter::tensor(const mfq_tensor_backend::Tensor &source) {
         throw std::runtime_error("invalid CUDA paged cache tensor");
     }
     const auto dtype = source.scalar_type();
-    if (dtype != mfq_tensor_backend::kFloat16 && dtype != mfq_tensor_backend::kBFloat16 &&
-        dtype != mfq_tensor_backend::kFloat32 && dtype != mfq_tensor_backend::kInt32 && dtype != mfq_tensor_backend::kInt64) {
+    const auto* type=paged_tensor_type([&](const auto& type){return type.dtype==dtype;});
+    if (!type) {
         throw std::runtime_error("unsupported CUDA paged cache tensor dtype");
     }
+    for (const auto dimension : source.sizes())
+        if (dimension <= 0) throw std::runtime_error("invalid CUDA paged cache tensor shape");
     const auto cpu = source.contiguous().to(mfq_tensor_backend::kCPU);
-    scalar<int32_t>(static_cast<int32_t>(dtype));
+    scalar<int32_t>(type->code);
     scalar<int32_t>(source.get_device());
     scalar<uint32_t>(static_cast<uint32_t>(cpu.dim()));
     scalar<uint32_t>(0);
@@ -345,11 +365,12 @@ std::pair<mfq_tensor_backend::Tensor, int> CudaPagedReader::tensor() {
     if (rank == 0 || rank > 8 || device < 0) {
         throw CudaSessionStateError("invalid CUDA paged cache tensor header");
     }
-    const auto dtype = static_cast<mfq_tensor_backend::ScalarType>(dtype_value);
-    if (dtype != mfq_tensor_backend::kFloat16 && dtype != mfq_tensor_backend::kBFloat16 &&
-        dtype != mfq_tensor_backend::kFloat32 && dtype != mfq_tensor_backend::kInt32 && dtype != mfq_tensor_backend::kInt64) {
+    const auto* type=paged_tensor_type([&](const auto& type){return type.code==dtype_value;});
+    if (!type) {
         throw CudaSessionStateError("invalid CUDA paged cache tensor dtype");
     }
+    const auto dtype=type->dtype;
+    const uint64_t element_size=type->bytes;
     std::vector<int64_t> shape;
     shape.reserve(rank);
     uint64_t elements = 1;
@@ -363,8 +384,6 @@ std::pair<mfq_tensor_backend::Tensor, int> CudaPagedReader::tensor() {
         elements *= static_cast<uint64_t>(dimension);
     }
     const auto bytes = scalar<uint64_t>("tensor size");
-    const uint64_t element_size = dtype == mfq_tensor_backend::kInt64 ? 8 :
-        (dtype == mfq_tensor_backend::kFloat32 || dtype == mfq_tensor_backend::kInt32) ? 4 : 2;
     if (elements > std::numeric_limits<uint64_t>::max() / element_size ||
         bytes != elements * element_size || bytes > remaining()) {
         throw CudaSessionStateError("invalid CUDA paged cache tensor size");

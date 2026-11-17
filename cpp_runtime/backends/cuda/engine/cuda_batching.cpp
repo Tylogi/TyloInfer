@@ -7,6 +7,7 @@
 #include "models/qwen35/ops.h"
 #include "storage/moe_expert_cache.h"
 #include "runtime/execution_options.h"
+#include "runtime/routed_cache_resources.h"
 #include "prefill_budget.h"
 
 #include <algorithm>
@@ -26,13 +27,26 @@ using qwen35::Qwen35BatchStateAdapter;
 using qwen35::QwenBatchRequestState;
 
 template<class Model>
+static std::size_t batch_prefill_workspace_bytes(Model& model,CudaExecutionContext& execution,
+        int64_t tokens,std::size_t growth=0) {
+    const auto transfer=routed_prefill_workspace_budget(execution,false).transfer_bytes;
+    const auto row=std::size_t(model.hidden_size())*model.hc_mult()*sizeof(float);
+    const auto fixed=mfq::engine::prefill_budget_add((std::size_t(1)<<30)+growth,transfer);
+    // Residual inputs and assembled outputs survive projection tiles. Hold
+    // their space throughout prefill so expert admission cannot consume it.
+    return mfq::engine::prefill_budget_add(fixed,std::size_t(tokens)*row*11);
+}
+
+template<class Model>
 static mfq::engine::PrefillChunk budget_batch_prefill(Model& model,
         CudaExecutionContext& execution,mfq::engine::PrefillChunk chunk,std::size_t growth=0) {
     const auto context=default_context(execution.layer_placement.primary_device());
-    const auto transfer=moe_prefill_workspace_budget(execution.moe_expert_cache,false).transfer_bytes;
-    const auto fixed=mfq::engine::prefill_budget_add((std::size_t(1)<<30)+growth,transfer);
+    const auto fixed=batch_prefill_workspace_bytes(model,execution,0,growth);
+    const auto row_bytes=std::size_t(model.hidden_size())*model.hc_mult()*sizeof(float)*11;
+    const auto wanted=batch_prefill_workspace_bytes(model,execution,chunk.count,growth);
+    if(context->available_memory()+context->workspace_available()<wanted)
+        reserve_routed_workspace(execution,wanted);
     const auto available=context->available_memory()+context->workspace_available();
-    const auto row_bytes=std::size_t(model.hidden_size())*model.hc_mult()*sizeof(float)*8;
     const auto selected=mfq::engine::select_prefill_chunk(chunk.count,chunk.count,available,fixed,row_bytes);
     if(!selected)throw mfq::engine::InferenceInputError(
         mfq::engine::InferenceInputErrorCode::ContextLength,
@@ -569,6 +583,9 @@ FlashNextBatchOperations::Sample FlashNextBatchOperations::prefill(
     try {
     MfqCudaGuard guard(execution_.layer_placement.primary_device());
     initialize_prefill(request,chunk);
+    RoutedPrefillWorkspaceLoan workspace(execution_);
+    workspace.begin(batch_prefill_workspace_bytes(model_,execution_,chunk.count,
+        request->cache->prefill_growth_bytes(chunk.count)));
     auto timer = std::make_unique<PrefillCudaTimer>();
     auto hidden = request->cache->prefill(model_,request->prefill_ids.narrow(1,chunk.offset,chunk.count).contiguous());
     const auto finished = chunk.offset + chunk.count == static_cast<int64_t>(request->prompt.size());
@@ -578,6 +595,12 @@ FlashNextBatchOperations::Sample FlashNextBatchOperations::prefill(
         request->counts,request->token_constraint);
     TYLOINFER_CUDA_CHECK(cudaEventRecord(timer->finished_event(),mfq_get_current_cuda_stream()));
     request->prefill_timers.push_back(std::move(timer));
+    hidden={};
+    workspace.suspend();
+    // Only the sampled token crosses the prefill/decoder boundary. Keep it
+    // outside the expert-backed workspace while retaining transient logits.
+    if(next.defined())next=next.clone();
+    workspace.finish();
     return finish_prefill(request,std::move(next));
     } catch(...) {std::rethrow_exception(flash_next_prefill_failure(std::current_exception()));}
 }
@@ -628,6 +651,8 @@ FlashNextBatchOperations::prefill_batch(
                 chunks.push_back(request->prefill_ids.narrow(1,chunk.offset,chunk.count).contiguous());
                 tokens+=chunk.count;
             }
+            RoutedPrefillWorkspaceLoan workspace(execution_);
+            workspace.begin(batch_prefill_workspace_bytes(model_,execution_,tokens,growth));
             PrefillCudaTimer timer;
             auto hidden=qwen4_batch_prefill(model_,caches,chunks);
             std::vector<Tensor> last;
@@ -648,6 +673,9 @@ FlashNextBatchOperations::prefill_batch(
             }
             TYLOINFER_CUDA_CHECK(cudaEventRecord(timer.finished_event(),mfq_get_current_cuda_stream()));
             const auto milliseconds=timer.elapsed_ms();
+            hidden.clear();last.clear();workspace.suspend();
+            for(auto& token:next)if(token.defined())token=token.clone();
+            workspace.finish();
             for(const auto row:rows) {
                 items[row].first->packed_prefill_ms+=milliseconds*items[row].second.count/tokens;
                 result[row].sample=finish_prefill(items[row].first,std::move(next[row]));
@@ -668,7 +696,7 @@ void FlashNextBatchOperations::activate(const std::shared_ptr<Request>& request,
 }
 void FlashNextBatchOperations::discard_prefill(const std::shared_ptr<Request>& request) {
     if (graph_) graph_->clear();
-    finish_moe_expert_exchanges(execution_.moe_expert_cache);
+    finish_routed_expert_exchanges(execution_);
     request->cache.reset(); request->prefill_ids = {}; request->prefill_timers.clear(); request->packed_prefill_ms=0;
 }
 void FlashNextBatchOperations::retire(const std::vector<std::shared_ptr<Request>>& retired,int64_t) {

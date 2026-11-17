@@ -1,4 +1,5 @@
 #include "float_projection.h"
+#include "dense_f32_projection_test.h"
 #include "quant_linear.h"
 #include "cuda_execution.h"
 #include "gated_residual.h"
@@ -70,6 +71,40 @@ void check_dense(int width,int outputs,int rows,tb::ScalarType dtype) {
         const auto single=try_dense_bf16_projection_cuda(x.narrow(1,m,1),weight);
         if((single.to(tb::kFloat32)-actual.narrow(1,m,1).to(tb::kFloat32)).abs().max().item<float>()!=0)
             throw std::runtime_error("BF16 dense projection changed a token when grouped with other tokens");
+    }
+}
+void check_injection(int width,int streams,int rows,tb::ScalarType dtype,bool offset,bool graph=false) {
+    auto input=pattern(int64_t(rows)*width+int(offset),.19f).to(dtype)
+        .narrow(0,int(offset),int64_t(rows)*width).reshape({1,rows,width});
+    auto weight=pattern(int64_t(streams)*width+int(offset),.47f).to(tb::kBFloat16)
+        .narrow(0,int(offset),int64_t(streams)*width).reshape({streams,width});
+    auto output=try_gr_bf16_injection_cuda(input,weight,streams);
+    const auto verify=[&] {
+        if(!output.defined() || output.scalar_type()!=tb::kFloat32 ||
+                output.sizes().vec()!=std::vector<int64_t>{1,rows,streams})
+            throw std::runtime_error("BF16 residual injection changed output shape or precision");
+        const auto x=input.to(tb::kFloat32).cpu().contiguous(),w=weight.to(tb::kFloat32).cpu().contiguous();
+        const auto actual=output.cpu().contiguous();
+        for(int row=0;row<rows;++row)for(int stream=0;stream<streams;++stream) {
+            double sum=0;
+            for(int k=0;k<width;++k)sum+=double(x.data_ptr<float>()[row*width+k])*w.data_ptr<float>()[stream*width+k];
+            const auto expected=2.0/(1.0+std::exp(-sum/streams));
+            if(!std::isfinite(actual.data_ptr<float>()[row*streams+stream]) ||
+                    std::abs(actual.data_ptr<float>()[row*streams+stream]-expected)>3e-6)
+                throw std::runtime_error("BF16 residual injection differs from the independent FP32-input dot");
+        }
+    };
+    verify();
+    if(graph) {
+        const auto context=mfq::cuda::default_context(input.get_device());
+        context->begin_graph_pool(mfq_current_cuda_stream());
+        struct PoolEnd {std::shared_ptr<mfq::cuda::Context> context;
+            ~PoolEnd(){context->end_graph_pool(mfq_current_cuda_stream());}} pool_end{context};
+        mfq::cuda::DecodeWindow window(mfq_current_cuda_stream());
+        window.capture([&]{output=try_gr_bf16_injection_cuda(input,weight,streams);},[]{},[&]{output={};});
+        for(float scale:{0.f,-.75f,1.25f}) {
+            input.fill_(scale);window.run();verify();
+        }
     }
 }
 void check_prefill_mix(int hidden,int rank,int streams,int rows,bool strided,bool graph=false) {
@@ -562,6 +597,19 @@ int main(int argc,char** argv) {
             check_post_mixed(2560,4,4,3);check_post_alias_rejection();
             std::cout<<"GR post all8 dtype modes/bit-exact product rounding/exact-alias/overlap-rejection/changed graphs PASS\n";return 0;
         }
+        if(argc==2 && std::string(argv[1])=="--injection-check") {
+            for(int rows:{1,2,3,4,5,6})for(auto type:{tb::kFloat16,tb::kFloat32}) {
+                check_injection(33,3,rows,type,true);
+                check_injection(1025,7,rows,type,false);
+            }
+            check_injection(10240,4,1,tb::kFloat32,false,true);
+            check_injection(513,1,4,tb::kFloat16,true,true);
+            if(try_gr_bf16_injection_cuda(pattern(7*33,.1f).reshape({7,33}),
+                    pattern(3*33,.2f).to(tb::kBFloat16).reshape({3,33}),3).defined())
+                throw std::runtime_error("BF16 injection bypassed the larger-window fallback");
+            std::cout<<"BF16 GR injection: FP32-input reference, tails, offsets, arbitrary streams and changing graphs PASS\n";
+            return 0;
+        }
         if(argc==8 && std::string(argv[1])=="--gr-read-bench") {
             benchmark_projection(std::stoi(argv[2]),std::stoi(argv[3]),std::stoi(argv[4]),
                 std::stoi(argv[5]),std::stoi(argv[6]),std::stoi(argv[7]),true);return 0;
@@ -607,6 +655,14 @@ int main(int argc,char** argv) {
             std::cout<<"shared gate48cases+changinggraphs+overflow/precision checks PASS\n";
             return 0;
         }
+        if(argc==2 && std::string(argv[1])=="--dense-f32-check") {
+            mfq::cuda::test::check_dense_f32_windows();return 0;
+        }
+        if(argc==6 && std::string(argv[1])=="--dense-f32-bench") {
+            mfq::cuda::test::benchmark_dense_f32_windows(std::stoi(argv[2]),std::stoi(argv[3]),
+                std::stoi(argv[4]),std::stoi(argv[5]));return 0;
+        }
+        mfq::cuda::test::check_dense_f32_windows();
         check_prefill(129,17,33,true);check_prefill(768,129,97,false);check_prefill(10240,320,33,false);
         for(int rows:{1,2,3,4,5,6})for(auto dtype:{tb::kFloat16,tb::kFloat32,tb::kBFloat16})
             check_dense(257,17,rows,dtype);

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -44,7 +45,11 @@ def test_cmake_accelerator_selection(tmp_path, cuda, hip, flags, expected):
     )
     output = tmp_path / "build"
     command = [cmake_path(), "-S", str(tmp_path), "-B", str(output)]
-    result = subprocess.run([*command, *flags], capture_output=True, text=True)
+    environment = dict(os.environ)
+    # A Python-installed CMake launcher may use another interpreter.
+    environment.pop("PYTHONHOME", None)
+    environment.pop("PYTHONPATH", None)
+    result = subprocess.run([*command, *flags], capture_output=True, text=True, env=environment)
     if expected is None:
         assert result.returncode != 0
         assert "Select either TYLOINFER_BUILD_CUDA_RUNTIME or TYLOINFER_BUILD_HIP_RUNTIME" in result.stderr
@@ -53,7 +58,7 @@ def test_cmake_accelerator_selection(tmp_path, cuda, hip, flags, expected):
         assert (output / "selected.txt").read_text() == expected
         if flags == ["-DTYLOINFER_BUILD_HIP_RUNTIME=ON"]:
             result = subprocess.run([*command, "-DTYLOINFER_BUILD_CUDA_RUNTIME=ON", "-DTYLOINFER_BUILD_HIP_RUNTIME=OFF"],
-                                    capture_output=True, text=True)
+                                    capture_output=True, text=True, env=environment)
             assert result.returncode == 0, result.stdout + result.stderr
             assert (output / "selected.txt").read_text() == "ON;OFF"
 

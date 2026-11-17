@@ -76,7 +76,7 @@ struct FFN {
     mutable std::function<void(const mfq_tensor_backend::Tensor&)> moe_pipeline_prefetch;
 
     bool supports_prepared_gguf_input() const;
-    std::optional<mfq_tensor_backend::Tensor> try_forward_gguf_prefill_residual(
+    std::optional<mfq_tensor_backend::Tensor> try_forward_prefill_residual(
         CudaExecutionContext& execution,const mfq_tensor_backend::Tensor& input,
         const mfq_tensor_backend::Tensor& residual) const;
     mfq_tensor_backend::Tensor forward_prepared_gguf(CudaExecutionContext& execution,

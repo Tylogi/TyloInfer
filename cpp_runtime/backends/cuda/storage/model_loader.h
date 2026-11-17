@@ -19,6 +19,7 @@
 #include "storage/weight_loader.h"
 #include "storage/moe_expert_cache.h"
 #include "runtime/kv_memory.h"
+#include "runtime/routed_cache_resources.h"
 
 #include <chrono>
 #include <memory>
@@ -164,7 +165,7 @@ auto with_loaded_cuda_model(
                 (execution.kv_memory?execution.kv_memory->growth_reserve():0)+graph_reserve,
                 execution.kv_memory?execution.kv_memory->expert_budget_charge():0);
         }
-        finalize_gguf_expert_cache(execution.gguf_expert_cache,
+        mfq::cuda::finalize_routed_weight_images(execution,
             execution.kv_memory ? execution.kv_memory->growth_reserve() : 0);
         mfq_cuda_synchronize();
         auto loaded = std::chrono::steady_clock::now();

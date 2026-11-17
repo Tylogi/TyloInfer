@@ -70,7 +70,7 @@ def test_continuous_batching_is_an_explicit_server_mode():
     assert "std::thread" not in BATCHING
     assert "engine_.step(eligible)" in SCHEDULER
     assert "worker_" not in BATCHING
-    assert "queue_" not in BATCHING
+    assert not re.search(r"\bqueue_\b", BATCHING)
     assert "queue_mutex_" not in BATCHING
     assert "batch_compatible(constEngineRequest&request," in "".join(DECODE.split())
     assert "run_exclusive_generation" not in BATCHING

@@ -2,7 +2,10 @@
 #include "storage/weight_loader.h"
 #include "storage/model_loader.h"
 #include "storage/mapped_embedding.h"
+#include "runtime/device_memory_topology.h"
 #include "mfq_weight_memory.h"
+#include "tyloinfer/decision_model.h"
+#include <limits>
 #include "models/qwen4_exp/mtp.h"
 #include "models/glm5_next/mtp.h"
 #include "models/qwen35/mtp.h"
@@ -61,26 +64,35 @@ template <class Model> struct CudaWeightLoader {
     auto embedding(const std::string &name) {
         const auto mapped=mfq::cuda::runtime_options::embedding_mapped();
         const bool mapped_control=mapped && *mapped==2;
-        const bool use_mapped=mapped ? *mapped==1 || mapped_control :
-            model.execution->config.moe_pipeline && model.execution->config.moe_ram_pcie;
+        const bool jev_resident=model.execution->jev_full_vram.value_or(false) && bool(mfq::decision_model_spec(source));
+        const bool use_mapped=!jev_resident && (mapped ? *mapped==1 || mapped_control :
+            (bool(model.layer_weights) || model.num_experts()>0 ||
+                (model.execution->config.moe_pipeline && model.execution->config.moe_ram_pcie)) &&
+            mfq::cuda::device_has_separate_memory(active_weight_load_device(*model.execution)));
         const auto& dtype=require_tensor(source,name).dtype;
         const bool nint=mfq::mfq_compat_enabled && dtype=="NINT";
-        if(use_mapped && model.has_independent_output_weights(*this) &&
+        const bool quantized=nint || dtype=="TQ" || dtype.rfind("GGUF_",0)==0;
+        if(use_mapped && (bool(model.layer_weights) || model.has_independent_output_weights(*this)) &&
                 !model.execution->tensor_parallel.enabled() && !model.execution->loading_cpu_layer &&
-                (dtype=="BF16" || dtype=="F16" || dtype=="F32" || nint)) {
+                (dtype=="BF16" || dtype=="F16" || dtype=="F32" || quantized)) {
             try {
                 const mfq::cuda::WeightAllocationScope weight_memory;
-                if(nint) {
+                if(quantized) {
                     QuantLinear cpu;
                     {
                         struct CpuLoadScope {
-                            bool& flag;
-                            explicit CpuLoadScope(bool& value):flag(value){flag=true;}
-                            ~CpuLoadScope(){flag=false;}
+                            bool& flag;bool previous;
+                            explicit CpuLoadScope(bool& value):flag(value),previous(value){flag=true;}
+                            ~CpuLoadScope(){flag=previous;}
                         } scope(model.execution->loading_cpu_layer);
                         cpu=load_quant_linear(*model.execution,source,name);
                     }
-                    auto result=map_nint_embedding(std::move(cpu),active_weight_load_device(*model.execution),mapped_control);
+                    if(cpu.kind==QuantLinearKind::Gguf && (cpu.gguf.rotation || cpu.gguf.correction ||
+                            cpu.gguf.projection_correction)) {
+                        if(mapped)throw std::invalid_argument("mapped GGUF embedding requires device-compatible auxiliary weights");
+                        return load_quant_linear(*model.execution,source,name);
+                    }
+                    auto result=map_quant_embedding(std::move(cpu),active_weight_load_device(*model.execution),mapped_control);
                     std::cerr<<"mapped_token_embedding rows="<<result.out()<<" width="<<result.neuron_len()
                              <<" dtype="<<dtype<<" read="<<(mapped_control?"device_control":"mapped_host")<<std::endl;
                     return result;
@@ -102,6 +114,7 @@ template <class Model> struct CudaWeightLoader {
         return load_quant_linear(*model.execution, source, name);
     }
     auto output(const std::string &name) {
+        if(model.layer_weights && mfq::decision_model_spec(source))return embedding(name);
         return load_quant_linear(*model.execution, source, name, TensorParallelAxis::Output);
     }
     auto tied_output(const QuantLinear &embedding, const std::string &name) {
@@ -116,14 +129,19 @@ template <class Model> struct CudaWeightLoader {
         auto &execution = *model.execution;
         const int device = execution.layer_placement.device_for_layer(layer);
         const bool cpu_offloaded = layer < execution.dense_cpu_layer_count;
-        execution.loading_cpu_layer = cpu_offloaded;
+        struct LoadScope {
+            bool& value;bool previous;
+            ~LoadScope(){value=previous;}
+        } scope{execution.loading_cpu_layer,execution.loading_cpu_layer};
+        execution.loading_cpu_layer = cpu_offloaded || bool(model.layer_weights);
         execution.layer_placement.load_device = device;
         MfqCudaGuard layer_guard(device);
         std::cerr << "loading layer " << layer << ' ' << type << ' '
-                  << (cpu_offloaded ? "CPU" : "CUDA") << std::endl;
+                  << (model.layer_weights ? "CUDA-streamed" : cpu_offloaded ? "CPU" : "CUDA") << std::endl;
         auto block = model.adapter_load_block(source, layer, device, type);
         block->cuda_device = device;
         block->cpu_offloaded = cpu_offloaded;
+        if(model.layer_weights)model.layer_weights->add(*block);
         if (auto* full = dynamic_cast<FullBlock*>(block.get())) full->preallocate_kv();
         return block;
     }
@@ -204,6 +222,20 @@ Model mfq::cuda::load_causal_lm(CudaExecutionContext &execution, const std::stri
         throw std::runtime_error("CUDA grid-Vision currently requires GPU-resident text layers");
     }
 
+    const bool decision_model = bool(mfq::decision_model_spec(source));
+    if(execution.jev_full_vram && !decision_model)
+        throw std::invalid_argument("--jev-weights requires a Jev decision model");
+    const auto stream_override=runtime_options::layer_weight_streaming();
+    const bool stream_layers=decision_model && execution.jev_full_vram
+        ? !*execution.jev_full_vram : stream_override.value_or(decision_model && load_blocks);
+    if(stream_layers) {
+        if(!load_blocks || execution.dense_cpu_layer_count || model_parallel_enabled(execution) ||
+                execution.layer_placement.enabled() || model.num_experts()>0 ||
+                !model.adapter_supports_dense_cpu_offload())
+            throw std::invalid_argument("layer weight streaming requires single-device dense attention blocks");
+        model.layer_weights=std::make_shared<LayerWeightStream>(execution.layer_placement.primary_device(),runtime_options::layer_weight_timings());
+    }
+
     if (model.adapter_uses_common_rope() && !model.metadata.no_rope) {
         auto make_rope = [&](mfq_tensor_backend::Device device) {
             RopeCache rope(model.max_position_embeddings(), model.rotary_dim(), model.rope_base(),
@@ -235,6 +267,7 @@ Model mfq::cuda::load_causal_lm(CudaExecutionContext &execution, const std::stri
         model.adapter_prepare_blocks(source);
     }
 
+    if(model.layer_weights)model.layer_weights->prepare();
     execution.loading_cpu_layer = false;
     execution.layer_placement.load_device = execution.layer_placement.primary_device();
     if (moe_expert_cache_has_sources(execution.moe_expert_cache) &&
@@ -306,13 +339,13 @@ RuntimeComponents<mfq::cuda::Qwen35CausalLm> load_runtime_components(
 
     if (!model.execution->dflash2_draft_path.empty()) {
         if (model.execution->layer_placement.enabled() || model.execution->dense_cpu_layer_count ||
-                !model.execution->dsv4_cpu_offload_layers.empty() || model.execution->moe_expert_cache ||
-                model.execution->gguf_expert_cache)
+                !model.execution->dsv4_cpu_offload_layers.empty() || mfq::cuda::has_routed_expert_cache(*model.execution))
             throw std::runtime_error("DFlash2 Qwen target requires GPU-resident blocks");
         result.mtp = mfq::cuda::dflash2::load(*model.execution, model, model.execution->dflash2_draft_path);
         result.mtp_available = true;
         return result;
     }
+    if (!mfq::cuda::runtime_options::load_native_mtp()) return result;
     if (result.plan.predictor == mfq::cuda::CudaPredictorAdapter::qwen35) {
         const auto& model_execution = *model.execution;
         const bool supported_placement =
@@ -393,6 +426,7 @@ RuntimeComponents<mfq::cuda::Qwen4CausalLm> load_runtime_components(
         result.mtp_available = true;
         return result;
     }
+    if (!mfq::cuda::runtime_options::load_native_mtp()) return result;
     if (result.plan.predictor ==
             mfq::cuda::CudaPredictorAdapter::none) return result;
     TYLOINFER_RUNTIME_CHECK(
@@ -422,6 +456,7 @@ RuntimeComponents<mfq::cuda::Glm5CausalLm> load_runtime_components(
         throw std::runtime_error(
             "unsupported GLM5 CUDA component adapter");
     }
+    if (!mfq::cuda::runtime_options::load_native_mtp()) return result;
     if (result.plan.predictor ==
             mfq::cuda::CudaPredictorAdapter::none) return result;
     TYLOINFER_RUNTIME_CHECK(
@@ -456,6 +491,7 @@ RuntimeComponents<mfq::cuda::DeepseekV41CausalLm> load_runtime_components(
         result.deepseek_vision.emplace(mfq::cuda::deepseek_v41_runtime::Vision::load(model.source,model.shared->config));
         result.vision_available=true;
     }
+    if (!mfq::cuda::runtime_options::load_native_mtp()) return result;
     if (result.plan.predictor ==
             mfq::cuda::CudaPredictorAdapter::none) return result;
     TYLOINFER_RUNTIME_CHECK(
@@ -493,6 +529,7 @@ RuntimeComponents<mfq::cuda::NemotronHCausalLm> load_runtime_components(
                 component->position_policy));
         result.vision_available = true;
     }
+    if (!mfq::cuda::runtime_options::load_native_mtp()) return result;
     if (result.plan.predictor ==
             mfq::cuda::CudaPredictorAdapter::none) return result;
     TYLOINFER_RUNTIME_CHECK(model.supports_speculation(),

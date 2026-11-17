@@ -1,6 +1,7 @@
 #pragma once
 
 #include "mfq_cuda_moe_ops.h"
+#include "mfq_cuda_resident_allocations.h"
 #include "moe_types.h"
 
 
@@ -61,10 +62,17 @@ struct MfeWeight {
         auto it = activation_workspaces->find(key);
         if (it == activation_workspaces->end() || it->second.qx.size(0) < input_rows) {
             MoeActivationWorkspace workspace;
+#ifdef TYLOINFER_NATIVE_CUDA_RUNTIME
+            {
+            const mfq::cuda::ResidentAllocationScope resident;
+#endif
             workspace.qx = mfq_tensor_backend::empty(
                 {capacity, groups * gs}, x.options().dtype(mfq_tensor_backend::kInt8));
             workspace.xscale = mfq_tensor_backend::empty(
                 {capacity, groups}, x.options().dtype(mfq_tensor_backend::kFloat32));
+#ifdef TYLOINFER_NATIVE_CUDA_RUNTIME
+            }
+#endif
             it = activation_workspaces->insert_or_assign(key, std::move(workspace)).first;
         }
         return {it->second.qx.narrow(0, 0, input_rows),

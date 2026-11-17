@@ -2,6 +2,7 @@
 #include <atomic>
 #include "quant_linear.h"
 #include "cuda_execution.h"
+#include "mfq_weight_memory.h"
 #include "mfq_cuda_context.h"
 #include <cstring>
 #include <memory>
@@ -41,6 +42,7 @@ inline mfq_tensor_backend::Tensor map_embedding_storage(const mfq_tensor_backend
     };
     MfqCudaGuard guard(device);
     auto owner=std::make_shared<Owner>(bytes);
+    mfq::cuda::observe_streamed_embedding(owner,bytes);
     std::memcpy(owner->host.data(),cpu.data_ptr(),bytes);
     void* alias=nullptr;
     TYLOINFER_CUDA_CHECK(cudaHostGetDevicePointer(&alias,owner->host.data(),0));
@@ -60,6 +62,7 @@ inline mfq_tensor_backend::Tensor map_embedding_storage(const mfq_tensor_backend
     return tb::from_blob(alias,cpu.sizes(),[owner](void*){},cpu.options().device(gpu_device));
 #endif
 }
+
 
 inline QuantLinear map_dense_embedding(const mfq_tensor_backend::Tensor& cpu,int device,
         bool device_read_control=false) {
@@ -86,5 +89,19 @@ inline QuantLinear map_nint_embedding(QuantLinear result,int device,bool device_
         if(field->defined())*field=map_embedding_storage(*field,device,device_read_control);
     for(auto* field:{&w.row_q_bits,&w.row_q_bit_offsets,&w.neuron_scale,&w.neuron_min})
         if(field->defined())*field=field->to(tb::Device(tb::kCUDA,device));
+    return result;
+}
+
+
+inline QuantLinear map_quant_embedding(QuantLinear result,int device,bool device_read_control=false) {
+    if(result.is_nint())return map_nint_embedding(std::move(result),device,device_read_control);
+    TYLOINFER_RUNTIME_CHECK(!result.tensor_parallel(),"mapped embedding requires an unsharded table");
+    if(result.kind==QuantLinearKind::Tq) {
+        result.tq=result.tq.with_image(map_embedding_storage(result.tq.image,device,device_read_control));
+    } else if(result.kind==QuantLinearKind::Gguf) {
+        TYLOINFER_RUNTIME_CHECK(!result.gguf.rotation && !result.gguf.correction &&
+            !result.gguf.projection_correction,"mapped GGUF embedding requires device-compatible auxiliary weights");
+        result.gguf.packed=map_embedding_storage(result.gguf.packed,device,device_read_control);
+    } else throw std::invalid_argument("unsupported mapped quantized embedding format");
     return result;
 }

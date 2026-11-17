@@ -5,8 +5,12 @@
 template<int DT,bool Pair,int T>
 __global__ __launch_bounds__(128)
 void tq_indexed_kernel(const TrellisIndexedProjectionJob* jobs,
-        const Scalar<DT>* input,Scalar<DT>* output,float limit) {
-    const auto job=jobs[blockIdx.y];
+        const Scalar<DT>* input,Scalar<DT>* output,float limit,const uint32_t* cancelled) {
+    if(cancelled && *cancelled)return;
+    using Job=std::conditional_t<(DT==0 && !Pair && T>2),
+        const TrellisIndexedProjectionJob&,const TrellisIndexedProjectionJob>;
+    Job job=jobs[blockIdx.y];
+    if(job.count<=0)return;
     const int warp=threadIdx.x/32,role=Pair?(warp&1):0,slot=Pair?warp/2:warp;
     const auto m=role?job.second:job.weight;
     constexpr int R=Pair?2:4;
@@ -14,8 +18,13 @@ void tq_indexed_kernel(const TrellisIndexedProjectionJob* jobs,
     float value[T]{};
     if(row<m.rows) {
         if constexpr(DT==0) {
-            if(m.columns)multi_dispatch<T,true,true>(m,row,input,0,job.count,0,value,job.input_offsets);
-            else multi_dispatch<T,false,true>(m,row,input,0,job.count,0,value,job.input_offsets);
+            // Short jobs use one packed vector per lane, leaving room for
+            // more independent decoded rows without extending activation life.
+            // Independent Down rows use smaller coalesced input vectors and
+            // read job offsets directly instead of spilling a copied array.
+            constexpr int V=T<=2?8:!Pair?4:16;
+            if(m.columns)multi_dispatch<T,true,true,V>(m,row,input,0,job.count,0,value,job.input_offsets);
+            else multi_dispatch<T,false,true,V>(m,row,input,0,job.count,0,value,job.input_offsets);
         }else if constexpr(T>1) {
             // Bound live activations while decoding each compressed row once
             // for the entire job, including BF16/FP32 verification windows.
@@ -57,14 +66,14 @@ void tq_indexed_kernel(const TrellisIndexedProjectionJob* jobs,
 
 template<bool Pair,int T>
 int tq_indexed_launch(const TrellisIndexedProjectionJob* jobs,const void* x,
-        void* y,int count,int rows,int dtype,float limit,cudaStream_t stream) {
+        void* y,int count,int rows,int dtype,float limit,cudaStream_t stream,const uint32_t* cancelled=nullptr) {
     if(!jobs || !x || !y || x==y || count<1 || rows<1 || dtype<0 || dtype>2 ||
        !std::isfinite(limit) || limit<0)return -1;
     for(int64_t first=0;first<count;first+=65535) {
         constexpr int R=Pair?2:4;
         const dim3 grid((uint64_t(rows)+R-1)/R,std::min(int64_t(65535),int64_t(count)-first));
         #define INDEXED(D) tq_indexed_kernel<D,Pair,T><<<grid,128,0,stream>>>( \
-            jobs+first,static_cast<const Scalar<D>*>(x),static_cast<Scalar<D>*>(y),limit)
+            jobs+first,static_cast<const Scalar<D>*>(x),static_cast<Scalar<D>*>(y),limit,cancelled)
         if(dtype==0){INDEXED(0);}
         else if(dtype==1){INDEXED(1);}
         else {INDEXED(2);}
@@ -87,6 +96,18 @@ extern "C" int mfq_tq_indexed_swiglu(const TrellisIndexedProjectionJob* jobs,con
         void* y,int count,int rows,int dtype,int tile,float limit,cudaStream_t stream) {
     switch(tile) {
     #define TILE(T) case T:return tq_indexed_launch<true,T>(jobs,x,y,count,rows,dtype,limit,stream)
+    TILE(1);TILE(2);TILE(3);TILE(4);
+    #undef TILE
+    default:return -1;
+    }
+}
+
+extern "C" int mfq_tq_indexed_guarded(const TrellisIndexedProjectionJob* jobs,const void* x,
+        void* y,int count,int rows,int dtype,int tile,float limit,bool pair,const uint32_t* cancelled,cudaStream_t stream) {
+    if(!cancelled)return -1;
+    switch(tile) {
+    #define TILE(T) case T:return pair?tq_indexed_launch<true,T>(jobs,x,y,count,rows,dtype,limit,stream,cancelled): \
+        tq_indexed_launch<false,T>(jobs,x,y,count,rows,dtype,0,stream,cancelled)
     TILE(1);TILE(2);TILE(3);TILE(4);
     #undef TILE
     default:return -1;

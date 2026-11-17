@@ -16,7 +16,17 @@ struct BlockLoader : TransformerWeightLoader {
     template <class T> static std::unique_ptr<::Block> finish(std::unique_ptr<T> block) {
         return block;
     }
-    static auto log_negative(mfq_tensor_backend::Tensor value) { return mfq_tensor_backend::log(-value); }
+    static auto log_negative(mfq_tensor_backend::Tensor value) {
+        if(!value.is_cpu())return mfq_tensor_backend::log(-value);
+        auto result=value.to(mfq_tensor_backend::kFloat32).contiguous().clone();
+        for(int64_t i=0;i<result.numel();++i) {
+            auto& element=result.template data_ptr<float>()[i];
+            if(!std::isfinite(element) || element>=0)
+                throw std::invalid_argument("linear attention decay must be finite and negative");
+            element=std::log(-element);
+        }
+        return result;
+    }
     void linear_projections(LinearAttentionBlock& b,
         const mfq::models::qwen35::LinearWeightNames& names, bool split_qkv) const {
         if (split_qkv) {

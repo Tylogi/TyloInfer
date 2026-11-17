@@ -97,6 +97,12 @@ class ClusterBackend:
         self._refresh_lock = asyncio.Lock()
         self._closed = False
 
+    async def decide(self, *, model: str, payload: dict[str, Any]) -> dict[str, Any]:
+        operation = getattr(self.local, 'decide', None)
+        if not callable(operation):
+            raise BackendError('decisions_unavailable', 'decision reads are unavailable', status_code=501)
+        return await operation(model=model, payload=payload)
+
     @staticmethod
     def _headers(node: RemoteNodeResource) -> dict[str, str]:
         if not node.api_key_env:

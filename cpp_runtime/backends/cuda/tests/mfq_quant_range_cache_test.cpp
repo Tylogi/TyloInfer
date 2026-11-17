@@ -136,10 +136,14 @@ int main(int argc,char** argv) try {
             throw std::runtime_error("range cache registration materialized the entire expert pool");
         std::int64_t bytes=0;
         for (const auto& pool:source->metadata()->pools) bytes+=slot_bytes(pool);
-        execution.config.moe_host_cache_bytes=host_cache ? 3*bytes : 0;
+        execution.config.moe_host_cache_bytes=host_cache ? 3*bytes : 1;
         auto cache=make_moe_expert_cache(hybrid ? 3*bytes : bytes,execution.config);
         auto cached=cache_quant_moe_weight(cache,"linear.weight",source,1,0,"gate");
+        if(moe_expert_source_bytes(cache)!=store->payload_nbytes())
+            throw std::runtime_error("range source footprint differs from its checkpoint payload");
         finalize_moe_expert_cache(cache);
+        if(moe_expert_source_bytes(cache)!=store->payload_nbytes())
+            throw std::runtime_error("device cache allocation changed its registered source footprint");
         // The baseline follows the same canonical field layout and kernels.
         // It is deliberately independent of the range source and cache.
         auto baseline=stage_cpu_mixed_moe(make_mixed_moe_runtime(load_mfe_cpu(*model,"linear.weight"),false),execution.config);

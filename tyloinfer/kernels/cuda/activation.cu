@@ -13,6 +13,32 @@
 
 #include "glu.cuh"
 #include "mfq_cuda_kernels.h"
+#include "mfq_cuda_activation_ops.h"
+
+namespace mfq::cuda {
+namespace {
+template<class Input>
+__global__ void materialized_gate(const Input* input,const Input* gate,Input* output,
+        std::int64_t count,bool silu) {
+    for(auto i=std::int64_t(blockIdx.x)*blockDim.x+threadIdx.x;i<count;i+=std::int64_t(gridDim.x)*blockDim.x) {
+        const float g=float(gate[i]),value=float(input[i]);
+        float activation=silu?g/(1.f+expf(-g)):1.f/(1.f+expf(-g));
+        if constexpr(std::is_same_v<Input,half>)activation=__half2float(__float2half_rn(activation));
+        output[i]=Input(__fmul_rn(activation,value));
+    }
+}
+}
+void materialize_gated_input(const void* input,const void* gate,bool fp16,std::int64_t count,
+        bool silu,void* output,cudaStream_t stream) {
+    if(count<0 || (count && (!input || !gate || !output)))
+        throw std::invalid_argument("Invalid materialized gate operands");
+    if(!count)return;
+    const auto blocks=unsigned(std::min(int64_t(65535),1+(count-1)/256));
+    if(fp16)materialized_gate<<<blocks,256,0,stream>>>(static_cast<const half*>(input),static_cast<const half*>(gate),static_cast<half*>(output),count,silu);
+    else materialized_gate<<<blocks,256,0,stream>>>(static_cast<const float*>(input),static_cast<const float*>(gate),static_cast<float*>(output),count,silu);
+    TYLOINFER_CUDA_KERNEL_LAUNCH_CHECK();
+}
+}
 
 // Calling libdevice explicitly keeps standalone FP32 GeGLU within its FP32
 // tolerance even when Torch compiles the extension with --use_fast_math.

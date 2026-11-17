@@ -40,7 +40,7 @@ for (const architecture of ['discrete', 'unified'] as const) {
       await expect(page.locator('[data-tier="ram-experts"]')).toContainText('30 GiB / 43 GiB');
       await expect(page.locator('[data-tier="ram-kv"]')).toContainText('2 GiB / 13 GiB');
       await expect(page.locator('[data-tier="ram-prefix"]')).toContainText('1 GiB / 11 GiB');
-      await expect(page.getByText('内存流式加载专家', { exact: true })).toBeVisible();
+      await expect(page.getByText('内存流式加载权重', { exact: true })).toBeVisible();
       await expect(page.getByText('内存流式 KV', { exact: true })).toBeVisible();
     } else await expect(page.locator('[data-tier="weights"]')).toContainText('10 GiB / 22 GiB');
     await page.goto('/resources');

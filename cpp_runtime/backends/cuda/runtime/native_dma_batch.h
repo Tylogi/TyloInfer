@@ -1,5 +1,7 @@
 #pragma once
 #include "dma_copy_batch.h"
+#include "native_stream_context.h"
+#include "routed_dma_submission.h"
 #include <cuda.h>
 #include <array>
 #include <atomic>
@@ -50,6 +52,7 @@ public:
     template<class Alias>
     static bool submit(const std::vector<DmaCopy>& copies,cudaStream_t stream,int mode,Alias&& alias) {
         if(!mode || copies.empty() || !entry())return false;
+        const NativeStreamContext context(stream);
         constexpr std::size_t capacity=128;
         if(copies.size()>capacity) {
             const auto* multiple=std::getenv("TYLOINFER_MOE_NATIVE_DMA_MULTI_BATCH");
@@ -74,7 +77,14 @@ public:
             if(!p.sources[index])return false;
             p.destinations[index]=reinterpret_cast<CUdeviceptr>(copy.destination);p.sizes[index]=copy.bytes;
         }
-        Attributes attributes;attributes.flags=mode>=2?1u:0u;
+        Attributes attributes;attributes.flags=routed_native_copy_flags(mode);
+        if(const auto* trace=std::getenv("TYLOINFER_TRACE_KERNEL_DISPATCH");trace && trace[0]=='1') {
+            static std::atomic<unsigned> seen{0};
+            const unsigned state=attributes.flags|(RoutedHostSubmissionScope::active()?2u:0u),bit=1u<<state;
+            if(!(seen.fetch_or(bit,std::memory_order_relaxed)&bit))std::fprintf(stderr,
+                "native_routed_dma_dispatch actual_match=1 waiting_consumer=%u overlap_hint=%u\n",
+                unsigned(RoutedHostSubmissionScope::active()),attributes.flags);
+        }
         for(std::size_t begin=0;begin<copies.size();begin+=capacity) {
             auto& p=packet(begin/capacity);const auto count=std::min(capacity,copies.size()-begin);
             std::size_t first=0;
@@ -86,6 +96,10 @@ public:
             if(result!=CUDA_SUCCESS) {
                 std::string detail="CUDA native DMA batch failed: "+std::to_string(result)+
                     " copies="+std::to_string(copies.size())+" offset="+std::to_string(begin);
+                cudaStreamCaptureStatus capture=cudaStreamCaptureStatusNone;
+                const auto capture_status=cudaStreamIsCapturing(stream,&capture);
+                detail+=" capture="+std::to_string(int(capture))+" capture_query="+std::to_string(capture_status)+
+                    " null_stream="+std::to_string(stream==nullptr);
                 for(std::size_t i=0;i<std::min<std::size_t>(count,12);++i) {
                     const auto& copy=copies[begin+i];
                     cudaPointerAttributes src{},dst{};

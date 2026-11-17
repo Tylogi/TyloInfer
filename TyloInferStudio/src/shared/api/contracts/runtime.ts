@@ -53,6 +53,7 @@ export interface RuntimeRequestMetrics {
 }
 
 export interface RuntimeStatus {
+  backend?: string;
   gpu_devices?: { id: string; name: string; memory_total_bytes?: number | null;
     memory_available_bytes?: number | null; unified_memory?: boolean }[];
   memory_architecture?: 'unified' | 'discrete' | 'unknown';
@@ -213,6 +214,8 @@ export interface RuntimeMemoryResources {
   devices?: RuntimeDeviceMemory[];
   ram_experts?: boolean | null;
   ram_expert_bytes?: number | null;
+  ram_embedding_bytes?: number | null;
+  ram_weight_bytes?: number | null;
   ram_kv?: boolean | null;
   ram_kv_bytes?: number | null;
   ram_kv_limit_bytes?: number | null;
