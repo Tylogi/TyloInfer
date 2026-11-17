@@ -51,6 +51,126 @@ std::uint64_t dense_item_size(std::string_view dtype) {
     return 0;
 }
 
+bool packed_name(std::string_view name) {
+    constexpr std::string_view suffix = ".weight_packed";
+    return name.size() > suffix.size() &&
+        name.substr(name.size() - suffix.size()) == suffix;
+}
+
+bool packed_config(const nlohmann::json& config) {
+    return config.is_object() &&
+        config.value("quant_method", std::string{}) == "compressed-tensors" &&
+        config.value("format", std::string{}) == "pack-quantized";
+}
+
+std::vector<std::byte> read_tensor(const Safetensors& files, const std::string& name) {
+    const auto found = files.records().find(name);
+    if (found == files.records().end())
+        throw std::runtime_error("HF tensor not found: " + name);
+    std::vector<std::byte> bytes(found->second.metadata.nbytes);
+    files.read(found->second.location.shard, found->second.location.offset,
+        bytes.data(), bytes.size());
+    return bytes;
+}
+
+std::uint64_t packed_u64(const std::byte* bytes) {
+    std::uint64_t value = 0;
+    for (unsigned i = 0; i < 8; ++i)
+        value |= std::uint64_t(std::to_integer<unsigned char>(bytes[i])) << (8 * i);
+    return value;
+}
+
+std::optional<Record> make_packed_int4(
+    const Safetensors& files, const TensorMetadata& values,
+    std::string name, const nlohmann::json& config) {
+    if (!packed_name(values.name)) return std::nullopt;
+    if (!packed_config(config) || values.dtype != "I32")
+        throw std::invalid_argument("unsupported packed HF quantization contract");
+    const auto module = values.name.substr(0, values.name.size() - 14);
+    const nlohmann::json* scheme = nullptr;
+    for (const auto& group : config.at("config_groups")) {
+        bool match = false;
+        for (const auto& target_value : group.at("targets")) {
+            const auto target = target_value.get<std::string>();
+            match |= target == "Linear" || target == module ||
+                (target.rfind("re:", 0) == 0 &&
+                 std::regex_match(module, std::regex(target.substr(3))));
+        }
+        if (match) {
+            if (scheme != nullptr)
+                throw std::invalid_argument("packed HF weight matches multiple quantization groups");
+            scheme = &group.at("weights");
+        }
+    }
+    if (scheme == nullptr || scheme->value("num_bits", 0) != 4 ||
+        scheme->value("type", std::string{}) != "int" ||
+        scheme->value("strategy", std::string{}) != "group" ||
+        (scheme->contains("actorder") && !(*scheme)["actorder"].is_null()))
+        throw std::invalid_argument("packed HF execution requires grouped INT4 without activation reordering");
+    const auto group_size = scheme->at("group_size").get<std::int64_t>();
+    const auto shape_name = module + ".weight_shape";
+    const auto scale_name = module + ".weight_scale";
+    const auto zero_name = module + ".weight_zero_point";
+    const auto* shape_record = files.find(shape_name);
+    if (!shape_record || shape_record->dtype != "I64" || !shape_record->shape ||
+        *shape_record->shape != std::vector<std::int64_t>{2} || shape_record->nbytes != 16)
+        throw std::invalid_argument("packed INT4 weight_shape must contain two int64 dimensions");
+    const auto shape_bytes = read_tensor(files, shape_name);
+    const auto rows_u = packed_u64(shape_bytes.data());
+    const auto width_u = packed_u64(shape_bytes.data() + 8);
+    if (!rows_u || !width_u || rows_u > INT64_MAX || width_u > INT64_MAX)
+        throw std::invalid_argument("invalid packed INT4 shape");
+    const auto rows = static_cast<std::int64_t>(rows_u);
+    const auto width = static_cast<std::int64_t>(width_u);
+    if (group_size < 32 || group_size % 32 || width % group_size ||
+        rows_u > std::numeric_limits<std::uint64_t>::max() / width_u || !values.shape ||
+        *values.shape != std::vector<std::int64_t>{rows, width / 8} ||
+        values.nbytes != rows_u * width_u / 2)
+        throw std::invalid_argument("invalid grouped packed INT4 matrix geometry");
+    const auto groups = width / group_size;
+    const auto blocks = width / 32;
+    const auto* scale = files.find(scale_name);
+    if (!scale || !scale->shape ||
+        *scale->shape != std::vector<std::int64_t>{rows, groups} ||
+        (scale->dtype != "F32" && scale->dtype != "F16" && scale->dtype != "BF16"))
+        throw std::invalid_argument("packed INT4 weight_scale has incompatible geometry or dtype");
+    const auto scale_bytes = scale->dtype == "F32" ? std::size_t(4) : std::size_t(2);
+    if (scale->nbytes != rows_u * std::uint64_t(groups) * scale_bytes)
+        throw std::invalid_argument("packed INT4 scale byte count differs");
+    const auto* zero = files.find(zero_name);
+    const bool symmetric = scheme->value("symmetric", true);
+    if ((!zero && !symmetric) || (zero &&
+        (zero->dtype != "I32" || !zero->shape ||
+         *zero->shape != std::vector<std::int64_t>{(rows + 7) / 8, groups} ||
+         zero->nbytes != std::uint64_t((rows + 7) / 8) * groups * 4)))
+        throw std::invalid_argument("packed INT4 zero-point has incompatible geometry");
+    if (rows_u > std::numeric_limits<std::uint64_t>::max() /
+            std::uint64_t(blocks) / 20)
+        throw std::overflow_error("packed INT4 execution image is too large");
+    auto descriptor = std::make_shared<PackedInt4>();
+    descriptor->values = values.name;
+    descriptor->shape = shape_name;
+    descriptor->scales = scale_name;
+    descriptor->zero_points = zero_name;
+    descriptor->scale_dtype = scale->dtype;
+    descriptor->rows = rows;
+    descriptor->width = width;
+    descriptor->group_size = group_size;
+    descriptor->groups = groups;
+    descriptor->blocks = blocks;
+    descriptor->scale_bytes = scale_bytes;
+    descriptor->has_zero_points = zero != nullptr;
+    descriptor->bytes = rows_u * std::uint64_t(blocks) * 20;
+    Record record;
+    record.metadata.name = std::move(name);
+    record.metadata.dtype = "GGUF_Q4_1";
+    record.metadata.stored_dtype = "GGUF_Q4_1";
+    record.metadata.shape = std::vector<std::int64_t>{rows, width};
+    record.metadata.nbytes = descriptor->bytes;
+    record.segments.push_back({0, {}, {}, 0, descriptor->bytes, std::move(descriptor)});
+    return record;
+}
+
 std::string find_scale(
     const Safetensors& files,
     const std::vector<std::string>& names,
@@ -83,6 +203,11 @@ void append(
     const Segment& segment) {
     if (!segment.inline_bytes.empty()) {
         append(aggregate, logical_offset, segment.inline_bytes);
+    } else if (segment.packed) {
+        aggregate.segments.push_back({
+            logical_offset, {}, {}, segment.source_offset, segment.nbytes, segment.packed});
+        logical_offset = checked_add(
+            logical_offset, segment.nbytes, "virtual MFE tensor");
     } else {
         aggregate.segments.push_back({
             logical_offset, {}, segment.source_name,
@@ -217,6 +342,9 @@ Record prepare(
         throw std::runtime_error("HF tensor shape is missing: " + values.name);
     }
 
+    if (auto packed = make_packed_int4(files, values, name, quantization_config)) {
+        return std::move(*packed);
+    }
     if (auto channel = make_channel_fp8(files, values, name, quantization_config)) {
         return std::move(*channel);
     }
@@ -361,14 +489,10 @@ Record experts(std::string name, const std::map<std::size_t, const Record*>& rec
                 aggregate.metadata.name);
         }
 
-        auto pool = mfe::expert_prefix(
-            static_cast<std::int32_t>(expert), dtype, record->metadata.nbytes);
-        pool.insert(pool.end(), record->segments.front().inline_bytes.begin(),
-                    record->segments.front().inline_bytes.end());
-        append(aggregate, logical_offset, std::move(pool));
-        for (std::size_t index = 1; index < record->segments.size(); ++index) {
-            append(aggregate, logical_offset, record->segments[index]);
-        }
+        append(aggregate, logical_offset, mfe::expert_prefix(
+            static_cast<std::int32_t>(expert), dtype, record->metadata.nbytes));
+        for (const auto& segment : record->segments)
+            append(aggregate, logical_offset, segment);
     }
     aggregate.metadata.nbytes = logical_offset;
     return aggregate;

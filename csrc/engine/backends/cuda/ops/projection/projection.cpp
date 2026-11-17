@@ -8,6 +8,7 @@
 #include "engine/backends/cuda/ops/activation.h"
 #include "engine/backends/cuda/ops/projection/quant.h"
 #include "engine/backends/cuda/ops/projection/channel_fp8.h"
+#include "engine/backends/cuda/ops/gguf/projection.h"
 #include "engine/backends/cuda/ops/projection/nint/input.h"
 #include "engine/weights/tq/routed.h"
 #include "engine/weights/encoding/rows.h"
@@ -274,6 +275,16 @@ tyloi::DenseTensor tyloi::cuda::ops::sigmoid_project(tyloi::DenseTensor input, t
         TYLOINFER_RUNTIME_CHECK(gate_mode == first || gate_mode == second,
             "input gate mode is not supported by this projection");
     };
+    if (const auto* gguf = weight.representation<tyloi::GgufTensor>()) {
+        if (gate.has_value()) {
+            gated(InputGateMode::Sigmoid, InputGateMode::Silu);
+            auto local_gate = gate.value().to(x.scalar_type());
+            x = x * (gate_mode == InputGateMode::Sigmoid
+                ? ::tyloi::cuda::sigmoid(local_gate) : ::tyloi::cuda::silu(local_gate));
+        }
+        check_device(*gguf, x);
+        return tyloi::cuda::gguf::project(*gguf, std::move(x));
+    }
     if (const auto* fp8 = weight.representation<tyloi::ChannelFp8Tensor>()) {
         if (gate.has_value()) {
             gated(InputGateMode::Sigmoid, InputGateMode::Silu);
@@ -623,6 +634,8 @@ Projector::grouped(
         const ::tyloi::Tensor& weight,
         ::tyloi::DenseTensor x) const {
     check_projection(weight, x);
+    if (const auto* encoded = local_format<tyloi::GgufTensor>(weight))
+        return gguf::project(*encoded, std::move(x));
     if (const auto* fp8 = local_format<tyloi::ChannelFp8Tensor>(weight))
         return channel_fp8_projection(*fp8, std::move(x), &profiler_);
     if (const auto* tq = local_format<tyloi::encoding::TqTensor>(weight); tq != nullptr)
@@ -708,7 +721,14 @@ bool Projector::grouped(std::span<const ::tyloi::Tensor> weights) const {
     size_t tq_count = 0;
     bool all_nint = options_.nint_grouped && !independent_ && tyloi::mfq_compat_enabled;
     bool all_fp8 = true;
+    bool all_gguf = true;
+    const tyloi::GgufTensor* first_gguf = nullptr;
     for (const auto& weight : weights) {
+        const auto* encoded = weight.representation<tyloi::GgufTensor>();
+        all_gguf = all_gguf && encoded && encoded->packed.is_cuda() &&
+            weight.size(1) == weights.front().size(1) && weight.device() == weights.front().device() &&
+            (!first_gguf || gguf::same_input_basis(*first_gguf, *encoded));
+        if (encoded && !first_gguf) first_gguf = encoded;
         const auto* fp8 = weight.representation<tyloi::ChannelFp8Tensor>();
         all_fp8 = all_fp8 && fp8 && fp8->dynamic_activations && fp8->values.is_cuda() &&
             weight.size(1) == weights.front().size(1) && weight.device() == weights.front().device();
@@ -725,7 +745,7 @@ bool Projector::grouped(std::span<const ::tyloi::Tensor> weights) const {
         all_nint = false;
 #endif
     }
-    return tq_count >= 2 || all_nint || all_fp8;
+    return tq_count >= 2 || all_nint || all_fp8 || all_gguf;
 }
 
 std::vector<::tyloi::DenseTensor> Projector::run(
@@ -815,7 +835,8 @@ std::vector<::tyloi::DenseTensor> Projector::run(
     }
 
     if (!projections.group.nint_grouped && !projections.group.layers.empty() &&
-            x.is_cuda() && x.numel() / x.size(-1) > 8) {
+            x.is_cuda() && (x.numel() / x.size(-1) > 8 ||
+                projections.group.layers.front().representation<tyloi::GgufTensor>())) {
         return join(run(projections.group, x));
     }
     if (projections.group.nint_grouped && x.is_cuda() &&
@@ -943,6 +964,16 @@ std::vector<::tyloi::DenseTensor> Projector::run(
             result.push_back(run(layer, x));
         }
         return result;
+    }
+    if (!group.layers.empty() &&
+        std::all_of(group.layers.begin(), group.layers.end(), [](const auto& layer) {
+            return layer.template representation<tyloi::GgufTensor>() != nullptr;
+        })) {
+        std::vector<tyloi::GgufTensor> weights;
+        weights.reserve(group.layers.size());
+        for (const auto& layer : group.layers)
+            weights.push_back(*layer.representation<tyloi::GgufTensor>());
+        return gguf::project_group(weights, std::move(x));
     }
     if (x.numel() / x.size(-1) > 8 && !group.layers.empty() &&
         std::all_of(group.layers.begin(), group.layers.end(), [&](const auto& layer) {

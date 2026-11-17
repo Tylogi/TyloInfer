@@ -1,11 +1,15 @@
 #include "model.h"
 
 #include "engine/weights/source/gguf.h"
+#include "engine/weights/source/json.h"
 #include "engine/weights/source/read.h"
 #include "hf_source.h"
 #include "gguf_source.h"
 #include "mfq_source.h"
+#include "residual.h"
 #include "tq_fixture_source.h"
+
+#include "nlohmann/json.hpp"
 
 #include <cstdlib>
 
@@ -31,6 +35,14 @@ std::shared_ptr<const ModelSource> open_model_source(
     std::error_code error;
     if (std::filesystem::is_directory(path, error) && !error) {
         return std::make_shared<models::HfSource>(path);
+    }
+    if (path.extension() == ".json") {
+        const auto document = source::parse_json(source::read_text(path), path);
+        if (document.is_object() &&
+            document.value("format", std::string{}) ==
+                "tyloinfer-row-residual-v1") {
+            return models::open_residual_model_source(path);
+        }
     }
     if (is_gguf_file(path)) return std::make_shared<models::GgufSource>(path);
     return std::make_shared<models::MfqSource>(path);

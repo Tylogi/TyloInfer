@@ -27,6 +27,8 @@ add_library(mfq-model-source STATIC
     mfq.cpp
     hf_source.cpp
     gguf_source.cpp
+    residual.cpp
+    residual.h
     gguf_source.h
     mfq_source.h
     mfq.h

@@ -23,6 +23,8 @@ add_library(mfq-weight-source STATIC
     ${PROJECT_SOURCE_DIR}/engine/weights/source/safetensors.h
     ${PROJECT_SOURCE_DIR}/engine/weights/source/hf.cpp
     ${PROJECT_SOURCE_DIR}/engine/weights/source/hf.h
+    ${PROJECT_SOURCE_DIR}/engine/weights/source/row_residual.cpp
+    ${PROJECT_SOURCE_DIR}/engine/weights/source/row_residual.h
     ${PROJECT_SOURCE_DIR}/engine/weights/tq/source.cpp
     ${PROJECT_SOURCE_DIR}/engine/weights/source/assets.h
     ${PROJECT_SOURCE_DIR}/engine/weights/tq/source.h

@@ -50,6 +50,7 @@ set(TYLOINFER_CUDA_LOADING_SOURCES
     ${PROJECT_SOURCE_DIR}/engine/weights/format.cpp
     ${PROJECT_SOURCE_DIR}/engine/weights/prepare/quant.cpp
     ${PROJECT_SOURCE_DIR}/engine/weights/prepare/channel_fp8.cpp
+    ${PROJECT_SOURCE_DIR}/engine/weights/prepare/gguf_weight.cpp
     ${PROJECT_SOURCE_DIR}/engine/weights/moe/experts.cpp
     ${PROJECT_SOURCE_DIR}/engine/weights/moe/batch.cpp
     ${PROJECT_SOURCE_DIR}/engine/models/common/load.cpp

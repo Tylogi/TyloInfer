@@ -14,6 +14,9 @@
 #include "engine/weights/sharded.h"
 #include "engine/weights/encoding/dense/blob.h"
 #include "engine/weights/encoding/fp8/tensor.h"
+#include "engine/weights/encoding/gguf/tensor.h"
+#include "engine/weights/encoding/gguf_quant.h"
+#include "engine/weights/prepare/gguf_weight.h"
 #include "engine/backends/cuda/ops/projection/quant.h"
 #include <algorithm>
 #include <cstdio>
@@ -597,6 +600,51 @@ static TensorParallelAxis infer_tensor_parallel_axis(
             weight = std::make_shared<tyloi::ChannelFp8Tensor>(
                 channel_fp8_to_device(std::move(value), placement.target));
         }
+    } else if (tyloi::gguf::is_quantized(dtype)) {
+        const auto* record = mfq.find_tensor(name);
+        TYLOINFER_RUNTIME_CHECK(record != nullptr && record->shape.has_value() &&
+            record->shape->size() == 2,
+            "GGUF projection requires a rank-2 tensor: ", name);
+        const auto shape = *record->shape;
+        const auto type = tyloi::gguf::quant_type(dtype);
+        const auto block = ggml_blck_size(type);
+        TYLOINFER_RUNTIME_CHECK(shape[0] > 0 && shape[1] > 0 && block > 0 &&
+            shape[1] % block == 0,
+            "GGUF projection width is not block aligned: ", name);
+        logical_out = shape[0];
+        logical_neuron_len = shape[1];
+        const bool may_shard = !cpu_layer && placement.tensor.enabled() &&
+            axis != TensorParallelAxis::Mirrored;
+        if (!may_shard) {
+            weight = std::make_shared<tyloi::GgufTensor>(
+                tyloi::weights::load_gguf(mfq, name, placement.target));
+        } else {
+            const bool output_axis = axis == TensorParallelAxis::Output;
+            const int64_t extent = output_axis ? shape[0] : shape[1] / block;
+            int64_t preferred = output_axis ? 128 : 1;
+            if (!output_axis) {
+                const auto basis = tyloi::weights::gguf_rotation_block(mfq, name);
+                preferred = basis / std::gcd<int64_t>(basis, block);
+            }
+            for (const auto& slice : select_slices(extent, preferred)) {
+                const int64_t row_begin = output_axis ? slice.begin : 0;
+                const int64_t row_end = output_axis ? slice.end : shape[0];
+                const int64_t column_begin = output_axis ? 0 : slice.begin * block;
+                const int64_t column_end = output_axis ? shape[1] : slice.end * block;
+                auto part = tyloi::weights::load_gguf(
+                    mfq, name, tyloi::Device(tyloi::kCUDA, slice.device),
+                    row_begin, row_end, column_begin, column_end);
+                tyloi::ShardedTensor::Shard shard;
+                shard.device = slice.device;
+                shard.output_begin = output_axis ? row_begin : 0;
+                shard.output_end = output_axis ? row_end : shape[0];
+                shard.input_begin = output_axis ? 0 : column_begin;
+                shard.input_end = output_axis ? shape[1] : column_end;
+                shard.weight = std::make_shared<tyloi::GgufTensor>(std::move(part));
+                shards.push_back(std::move(shard));
+            }
+        }
+        if (placement.drop_cache) mfq.drop_file_cache();
     } else if (dtype == "BF16" || dtype == "F16" || dtype == "F32") {
         auto cpu = host_value(name);
         TYLOINFER_RUNTIME_CHECK(cpu.dim() == 2, "dense linear tensor must be rank 2: ", name);
@@ -643,7 +691,7 @@ static TensorParallelAxis infer_tensor_parallel_axis(
         }
     } else {
         throw std::runtime_error(
-            "linear tensor must be NINT/NVQ/MXFP4-SQ/MXFP8-SQ/FP8-128SQ/MXFP4/MXFP8/FP8-E4M3-CHANNEL/BF16/F16/F32: " +
+            "linear tensor must be NINT/NVQ/MXFP4-SQ/MXFP8-SQ/FP8-128SQ/MXFP4/MXFP8/FP8-E4M3-CHANNEL/GGUF/BF16/F16/F32: " +
             name + " dtype=" + dtype);
     }
     if (shards.empty()) return weight;

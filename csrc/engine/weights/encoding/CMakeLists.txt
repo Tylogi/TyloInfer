@@ -29,8 +29,6 @@ add_library(mfq-quant-readers STATIC
     tq/table.cpp
     tq/table.h
     # QSA codecs live in tensor/encoding; mutable KV policy is built by state.
-    # native/row_residual.cpp is deliberately absent: it still uses the removed
-    # GgufModelSource and legacy tensor alias API and does not compile.
     ${PROJECT_SOURCE_DIR}/engine/weights/encoding/readers/mirrored.cpp
     ${PROJECT_SOURCE_DIR}/engine/tensor/encoding/qsa/tq_cpu.cpp
 )

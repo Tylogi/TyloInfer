@@ -1,9 +1,11 @@
 #pragma once
 #include "engine/backends/cuda/native/tensor/backend.h"
+#include "engine/weights/encoding/gguf/tensor.h"
 #include <cuda_runtime_api.h>
-struct GgufWeight;
 #include <memory>
 #include <vector>
+namespace tyloi::cuda::gguf {
+
 class GgufPrefillInputScope {
     struct Impl;std::unique_ptr<Impl> impl_;
     GgufPrefillInputScope();
@@ -16,7 +18,7 @@ public:
         const ::tyloi::DenseTensor& input,const ::tyloi::DenseTensor& weight,
         double eps,double offset,::tyloi::DenseTensor& normalized);
 };
-::tyloi::DenseTensor gguf_rms_gated_prefill(const GgufWeight& weight,
+::tyloi::DenseTensor gguf_rms_gated_prefill(const ::tyloi::GgufTensor& weight,
     const ::tyloi::DenseTensor& attended,const ::tyloi::DenseTensor& gate,
     const ::tyloi::DenseTensor& norm,double eps,bool silu);
 
@@ -26,13 +28,13 @@ struct GgufPrefillProduct {
 };
 // A following operator may restore values at the point of consumption.
 // Empty means the ordinary streamed/reference projection should be used.
-GgufPrefillProduct gguf_prefill_product(const GgufWeight& weight,
+GgufPrefillProduct gguf_prefill_product(const ::tyloi::GgufTensor& weight,
     const ::tyloi::DenseTensor& input);
 
-GgufPrefillProduct gguf_rms_gated_product(const GgufWeight& weight,
+GgufPrefillProduct gguf_rms_gated_product(const ::tyloi::GgufTensor& weight,
     const ::tyloi::DenseTensor& attended,const ::tyloi::DenseTensor& gate,
     const ::tyloi::DenseTensor& norm,double eps,bool silu);
-GgufPrefillProduct gguf_rms_gated_product(const GgufWeight& weight,
+GgufPrefillProduct gguf_rms_gated_product(const ::tyloi::GgufTensor& weight,
     const ::tyloi::DenseTensor& attended,const GgufPrefillProduct& gate,
     const ::tyloi::DenseTensor& norm,double eps,bool silu);
 // Materialize a scaled [tokens, columns] product for an ordinary FP32 consumer.
@@ -40,3 +42,5 @@ GgufPrefillProduct gguf_rms_gated_product(const GgufWeight& weight,
 std::vector<::tyloi::DenseTensor> gguf_prefill_acc_rms(
     const GgufPrefillProduct& product,const ::tyloi::DenseTensor& residual,
     const ::tyloi::DenseTensor& norm,double eps,double offset);
+
+} // namespace tyloi::cuda::gguf

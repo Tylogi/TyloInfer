@@ -1,5 +1,5 @@
 #include "residual.h"
-#include "weight.h"
+#include "projection.h"
 #include "../../kernels/projection/gguf/linear.h"
 #include "../../kernels/projection/gguf/residual/residual.h"
 #include "../../kernels/projection/gguf/residual/residual_prepare.h"
@@ -11,11 +11,13 @@
 #include <climits>
 #include <cstdlib>
 
-::tyloi::DenseTensor try_gguf_residual_mix(const GgufWeight& weight,
+namespace tyloi::cuda::gguf {
+
+::tyloi::DenseTensor residual_mix(const GgufTensor& weight,
         const ::tyloi::DenseTensor& input,const ::tyloi::DenseTensor& normalized,std::int64_t streams) {
 
     if(const auto* setting=tyloi::cuda::env_lookup("TYLOINFER_GGUF_GR_MIX");setting && setting[0]=='0')return {};
-    if(weight.prefers_original_input() || !tyloi::cuda::gguf::residual_mix_supported(weight.type) ||
+    if(original_input(weight) || !tyloi::cuda::gguf::residual_mix_supported(weight.type) ||
             !weight.packed.is_cuda() || !input.is_cuda() || !normalized.is_cuda() ||
             input.device()!=weight.packed.device() || normalized.device()!=input.device() ||
             input.scalar_type()!=::tyloi::kFloat32 || normalized.scalar_type()!=::tyloi::kFloat32 ||
@@ -33,17 +35,17 @@
     const auto stream=mfq_get_current_cuda_stream(input.get_device());
     for(const auto& tensor:{source,values,output,activation,weight.packed})mfq_cuda_record_stream(tensor,stream);
     tyloi::cuda::gguf::quantize_input(source.data_ptr<float>(),tokens,weight.neuron_len,activation.data_ptr(),stream.stream());
-    const auto image=weight.canonical_packed();mfq_cuda_record_stream(image,stream);
+    const auto image=canonical_packed(weight);mfq_cuda_record_stream(image,stream);
     tyloi::cuda::gguf::residual_mix(weight.type,image.data_ptr(),weight.row_bytes,weight.out,weight.neuron_len,
         activation.data_ptr(),tokens,values.data_ptr<float>(),streams,output.data_ptr<float>(),stream.stream());
     return output;
 }
 
-std::vector<::tyloi::DenseTensor> try_gguf_gated_residual_pre(
+std::vector<::tyloi::DenseTensor> gated_residual_pre(
         const ::tyloi::DenseTensor& input,const ::tyloi::DenseTensor& norm,
-        const GgufWeight& down,const GgufWeight& up,const GgufWeight& injection,
+        const GgufTensor& down,const GgufTensor& up,const GgufTensor& injection,
         std::int64_t streams,double eps,const ::tyloi::DenseTensor& branch,
-        const ::tyloi::DenseTensor& prior_injection,const GatedResidualMarker& marker) {
+        const ::tyloi::DenseTensor& prior_injection) {
 
     if(!input.defined() || !input.is_cuda() || !input.is_contiguous() || input.dim()<1 ||
             input.scalar_type()!=::tyloi::kFloat32 || streams<1 || streams>INT_MAX ||
@@ -53,7 +55,7 @@ std::vector<::tyloi::DenseTensor> try_gguf_gated_residual_pre(
             up.out!=width || injection.neuron_len!=width || injection.out!=streams ||
             !tyloi::cuda::gguf::residual_mix_supported(up.type))return {};
     for(const auto* weight:{&down,&up,&injection})
-        if(weight->prefers_original_input() || !weight->packed.is_cuda() ||
+        if(original_input(*weight) || !weight->packed.is_cuda() ||
                 weight->packed.device()!=input.device())return {};
     if(!norm.is_cuda() || norm.device()!=input.device() || norm.dim()!=1 || norm.numel()!=width)return {};
     if(branch.defined()) {
@@ -66,14 +68,13 @@ std::vector<::tyloi::DenseTensor> try_gguf_gated_residual_pre(
                 prior_injection.sizes().vec()!=gates)return {};
     } else if(prior_injection.defined())return {};
     const MfqCudaGuard guard(input.device());
-    if(marker)marker("begin");
     ::tyloi::DenseTensor updated=input,normalized,prepared_activation;
-    const std::vector<GgufWeight> pre_weights{down,injection};
+    const std::vector<GgufTensor> pre_weights{down,injection};
     // This preparation emits the native Q8 packet. Existing aligned and
     // position-major groups retain their corresponding preparation layouts.
-    const bool fused_input=hidden%32==0 && !prefers_gguf_m1_aligned(pre_weights,tokens) &&
+    const bool fused_input=hidden%32==0 && !m1_aligned(pre_weights,tokens) &&
         std::none_of(pre_weights.begin(),pre_weights.end(),[&](const auto& weight){
-            return weight.prefers_position_major_q8(tokens);
+            return position_major_q8(weight,tokens);
         });
     if(fused_input) {
         normalized=::tyloi::cuda::empty_like(input);
@@ -95,17 +96,15 @@ std::vector<::tyloi::DenseTensor> try_gguf_gated_residual_pre(
         auto prepared=mfq_qwen4_exp::gated_residual_post_norm(branch,input,prior_injection,norm,streams,eps);
         updated=prepared[0];normalized=prepared[1];
     } else normalized=mfq_qwen4_exp::grouped_rms_norm(input,norm,hidden,eps);
-    if(marker)marker("norm");
     // Independent dense projections consume the shared packet directly.
     // Weights retain their standard formats outside routed expert caches.
     std::vector<::tyloi::DenseTensor> projected;
     if(prepared_activation.defined()) {
-        GgufProjectionInput prepared;
+        ProjectionInput prepared;
         prepared.native=prepared_activation;prepared.shape=normalized.sizes().vec();
         prepared.tokens=tokens;prepared.dtype=::tyloi::kFloat32;
-        projected=prepared.project_all(pre_weights);
-    } else projected=project_gguf_group(pre_weights,normalized);
-    if(marker)marker("down");
+        projected=project_input(prepared,pre_weights);
+    } else projected=project_group(pre_weights,normalized);
     ::tyloi::DenseTensor inject,mixed;
     const auto* mix_setting=tyloi::cuda::env_lookup("TYLOINFER_GGUF_GR_MIX");
     const bool fused_activation=down.out<=INT_MAX && down.out%32==0 && (!mix_setting || mix_setting[0]!='0');
@@ -119,19 +118,15 @@ std::vector<::tyloi::DenseTensor> try_gguf_gated_residual_pre(
             mfq_cuda_record_stream(tensor,stream);
         tyloi::cuda::gguf::prepare_residual_activation(projected[0].data_ptr<float>(),projected[1].data_ptr<float>(),
             tokens,down.out,streams,activation.data_ptr(),inject.data_ptr<float>(),stream.stream());
-        if(marker){marker("bottleneck");marker("inject");}
-        const auto image=up.canonical_packed();mfq_cuda_record_stream(image,stream);
+        const auto image=canonical_packed(up);mfq_cuda_record_stream(image,stream);
         tyloi::cuda::gguf::residual_mix(up.type,image.data_ptr(),up.row_bytes,up.out,up.neuron_len,
             activation.data_ptr(),tokens,normalized.data_ptr<float>(),streams,mixed.data_ptr<float>(),stream.stream());
     } else {
         auto low=mfq_qwen4_exp::gated_residual_bottleneck(projected[0],streams);
-        if(marker)marker("bottleneck");
         inject=mfq_qwen4_exp::gated_residual_injection(projected[1],streams);
-        if(marker)marker("inject");
-        mixed=try_gguf_residual_mix(up,low,normalized,streams);
-        if(!mixed.defined())mixed=mfq_qwen4_exp::gated_residual_mix(up.forward(low),normalized,streams);
+        mixed=residual_mix(up,low,normalized,streams);
+        if(!mixed.defined())mixed=mfq_qwen4_exp::gated_residual_mix(project(up,low),normalized,streams);
     }
-    if(marker){marker("up_mix");marker("end");}
     if(const auto* trace=tyloi::cuda::env_lookup("TYLOINFER_TRACE_KERNEL_DISPATCH");trace && trace[0]=='1') {
         cudaStreamCaptureStatus capture{};
         const auto stream=mfq_current_cuda_stream();
@@ -144,3 +139,5 @@ std::vector<::tyloi::DenseTensor> try_gguf_gated_residual_pre(
     }
     return {mixed,updated,inject};
 }
+
+} // namespace tyloi::cuda::gguf

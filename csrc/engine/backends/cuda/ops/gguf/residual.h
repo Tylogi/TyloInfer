@@ -1,13 +1,20 @@
 #pragma once
 #include "engine/backends/cuda/native/tensor/backend.h"
-#include "gated_residual.h"
-struct GgufWeight;
-// Empty asks the caller to retain its general projection+mix path.
-::tyloi::DenseTensor try_gguf_residual_mix(const GgufWeight& weight,
-    const ::tyloi::DenseTensor& input,const ::tyloi::DenseTensor& normalized,
-    std::int64_t streams);
-std::vector<::tyloi::DenseTensor> try_gguf_gated_residual_pre(
-    const ::tyloi::DenseTensor& input,const ::tyloi::DenseTensor& norm,
-    const GgufWeight& down,const GgufWeight& up,const GgufWeight& injection,
-    std::int64_t streams,double eps,const ::tyloi::DenseTensor& branch={},
-    const ::tyloi::DenseTensor& prior_injection={},const GatedResidualMarker& marker={});
+#include "engine/weights/encoding/gguf/tensor.h"
+
+#include <cstdint>
+#include <vector>
+
+namespace tyloi::cuda::gguf {
+
+DenseTensor residual_mix(
+    const GgufTensor&, const DenseTensor& input,
+    const DenseTensor& normalized, std::int64_t streams);
+
+std::vector<DenseTensor> gated_residual_pre(
+    const DenseTensor& input, const DenseTensor& norm,
+    const GgufTensor& down, const GgufTensor& up, const GgufTensor& injection,
+    std::int64_t streams, double eps,
+    const DenseTensor& branch = {}, const DenseTensor& prior_injection = {});
+
+} // namespace tyloi::cuda::gguf

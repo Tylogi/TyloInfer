@@ -2,6 +2,10 @@
 #include "engine/backends/cuda/ops/qwen4_exp.h"
 #include "engine/backends/cuda/ops/projection/quant_linear.h"
 #include "engine/backends/cuda/ops/projection/projection.h"
+#include "engine/backends/cuda/ops/gguf/projection.h"
+#include "engine/backends/cuda/ops/gguf/residual.h"
+#include "engine/weights/encoding/gguf/tensor.h"
+#include "engine/weights/encoding/fp8/tensor.h"
 #include "engine/backends/cuda/kernels/attention/selected.h"
 #include "engine/backends/cuda/native/profile.h"
 #include "engine/backends/cuda/native/allocation.h"
@@ -91,7 +95,9 @@ ResidualCore::Projection ResidualCore::projection(::tyloi::Tensor weight, Part p
     TYLOINFER_RUNTIME_CHECK(
         dynamic_cast<const DenseTensor*>(payload) != nullptr ||
             dynamic_cast<const tyloi::NintTensor*>(payload) != nullptr ||
-            dynamic_cast<const tyloi::encoding::TqTensor*>(payload) != nullptr,
+            dynamic_cast<const tyloi::encoding::TqTensor*>(payload) != nullptr ||
+            dynamic_cast<const tyloi::GgufTensor*>(payload) != nullptr ||
+            dynamic_cast<const tyloi::ChannelFp8Tensor*>(payload) != nullptr,
         "unsupported floating residual projection");
     Projection result;
     result.weight = std::move(weight);
@@ -116,6 +122,9 @@ ResidualCore::Projection ResidualCore::projection(::tyloi::Tensor weight, Part p
         result.can_mix = direct && part == Part::final_up;
         return result;
     }
+    if (result.weight.representation<tyloi::GgufTensor>() ||
+            result.weight.representation<tyloi::ChannelFp8Tensor>())
+        return result;
 #if TYLOINFER_ENABLE_MFQ_COMPAT
     result.can_mix = result.can_activate = result.weight.representation<tyloi::NintTensor>() != nullptr;
     const auto group_option = ::tyloi::cuda::options::gr_up_group_coefficients();
@@ -139,6 +148,10 @@ ResidualCore::DenseTensor ResidualCore::Projection::forward(const DenseTensor& i
                 input.scalar_type() == ::tyloi::kFloat16 ? input : input.to(::tyloi::kFloat32));
         });
     }
+    if (const auto* gguf = weight.representation<tyloi::GgufTensor>())
+        return ::tyloi::cuda::gguf::project(*gguf, input);
+    if (weight.representation<tyloi::ChannelFp8Tensor>())
+        return executor.projector(Executor::current_ffn()).run(weight, input);
     if (weight.representation<DenseTensor>()) {
         const auto dtype = input.scalar_type() == right.scalar_type() ? input.scalar_type() : ::tyloi::kFloat32;
         if (options.prepared_dense && promoted.defined() && dtype == ::tyloi::kFloat32)
@@ -168,6 +181,9 @@ ResidualCore::DenseTensor ResidualCore::Projection::mix(
         });
     }
 #endif
+    if (weight.representation<tyloi::GgufTensor>() ||
+            weight.representation<tyloi::ChannelFp8Tensor>())
+        return mfq_qwen4_exp::gated_residual_mix(forward(input), normalized, streams);
     const auto option = ::tyloi::cuda::options::gr_dense_bf16_direct();
     if (!option || *option)
         if (auto output = try_gr_bf16_up_mix_cuda(input, normalized, payload_as<DenseTensor>(weight), streams); output.defined())
@@ -187,6 +203,12 @@ ResidualCore::DenseTensor ResidualCore::Projection::activate(
         });
     }
 #endif
+    if (weight.representation<tyloi::GgufTensor>() ||
+            weight.representation<tyloi::ChannelFp8Tensor>()) {
+        auto projected = forward(input);
+        return injection ? mfq_qwen4_exp::gated_residual_injection(projected, streams)
+                         : mfq_qwen4_exp::gated_residual_bottleneck(projected, streams);
+    }
     const auto option = ::tyloi::cuda::options::gr_dense_bf16_direct();
     if (!option || *option) {
         if (injection) {
@@ -302,6 +324,19 @@ ResidualCore::Result ResidualCore::fused(const DenseTensor& input,const DenseTen
 }
 ResidualCore::Result ResidualCore::pre(const DenseTensor &input,
     ::tyloi::ops::ResidualRole role) const {
+    if (const auto* down_weight = down.weight.representation<tyloi::GgufTensor>();
+            down_weight && Executor::current().residual_options().fused_projections) {
+        const auto* up_weight = up.weight.representation<tyloi::GgufTensor>();
+        const auto* injection_weight = injection.weight.representation<tyloi::GgufTensor>();
+        if (up_weight && injection_weight) {
+            auto fused = ::tyloi::cuda::gguf::gated_residual_pre(
+                input, payload_as<DenseTensor>(norm), *down_weight, *up_weight,
+                *injection_weight, streams, eps);
+            if (fused.size() == 3) {
+                return {std::move(fused[0]), std::move(fused[1]), std::move(fused[2])};
+            }
+        }
+    }
     if(const auto chunk=prefill_work_chunk(input))
         return bounded_pre(input,chunk,true,[&](int64_t begin,int64_t count) {
             return pre(input.narrow(1,begin,count),role);
@@ -314,6 +349,19 @@ DenseTensor ResidualCore::post(const DenseTensor& input,const DenseTensor& resid
 }
 ResidualCore::Result ResidualCore::pre_after(const DenseTensor& input,
     const DenseTensor& residual,const DenseTensor& gate,::tyloi::ops::ResidualRole role) const {
+    if (const auto* down_weight = down.weight.representation<tyloi::GgufTensor>();
+            down_weight && Executor::current().residual_options().fused_projections &&
+            Executor::current().residual_options().fused_post_norm) {
+        const auto* up_weight = up.weight.representation<tyloi::GgufTensor>();
+        const auto* injection_weight = injection.weight.representation<tyloi::GgufTensor>();
+        if (up_weight && injection_weight) {
+            auto fused = ::tyloi::cuda::gguf::gated_residual_pre(
+                residual, payload_as<DenseTensor>(norm), *down_weight, *up_weight,
+                *injection_weight, streams, eps, input, gate);
+            if (fused.size() == 3)
+                return {std::move(fused[0]), std::move(fused[1]), std::move(fused[2])};
+        }
+    }
     if(const auto chunk=prefill_work_chunk(residual))
         return bounded_pre(residual,chunk,false,[&](int64_t begin,int64_t count) {
             return pre_after(input.narrow(1,begin,count),residual.narrow(1,begin,count),

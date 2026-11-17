@@ -54,7 +54,15 @@ Names hf_names(
     names.reserve(stored_names.size());
     std::unordered_map<std::string, std::string> normalized_to_source;
     for (const auto& stored : stored_names) {
-        auto normalized = mfq::mlx_hf_tensor_name(stored);
+        auto source_name = stored;
+        constexpr std::string_view packed_suffix = ".weight_packed";
+        if (source_name.size() > packed_suffix.size() &&
+                source_name.compare(source_name.size() - packed_suffix.size(),
+                    packed_suffix.size(), packed_suffix) == 0) {
+            source_name.replace(source_name.size() - packed_suffix.size(),
+                packed_suffix.size(), ".weight");
+        }
+        auto normalized = mfq::mlx_hf_tensor_name(source_name);
         if (!normalized_to_source.emplace(normalized, stored).second)
             throw std::invalid_argument("duplicate normalized HF tensor: " + normalized);
         names.push_back(std::move(normalized));

@@ -247,6 +247,12 @@ HfSource::HfSource(std::filesystem::path root, std::string source_prefix)
                 segment.source_name != source_name) {
                 consumed_scales.insert(segment.source_name);
             }
+            if (segment.packed) {
+                consumed_scales.insert(segment.packed->shape);
+                consumed_scales.insert(segment.packed->scales);
+                if (segment.packed->has_zero_points)
+                    consumed_scales.insert(segment.packed->zero_points);
+            }
         }
         if (!impl_->records.emplace(canonical, std::move(record)).second) {
             throw std::runtime_error("duplicate canonical HF tensor: " + canonical);
