@@ -4,6 +4,7 @@ add_library(mfq-io STATIC
     file_range_reader.h
     async_range_reader.h
     read_span.h
+    path.h
 )
 target_include_directories(mfq-io PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../..

@@ -2,6 +2,7 @@
 #include "../disk_budget.h"
 #include "engine/weights/encoding/readers/window.h"
 #include "engine/io/file_range_reader.h"
+#include "engine/io/path.h"
 
 #include <algorithm>
 #include <atomic>
@@ -68,7 +69,7 @@ std::string hex(const std::uint8_t* data, std::size_t size) {
 }
 
 std::int64_t file_seconds(const std::filesystem::path& path, std::error_code& error) {
-    const auto moment = std::filesystem::last_write_time(path, error);
+    const auto moment = std::filesystem::last_write_time(tyloi::native_path(path), error);
     if (error) return 0;
     const auto system = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
         moment - std::filesystem::file_time_type::clock::now() +
@@ -401,7 +402,7 @@ std::uint64_t monotonic_tick() {
 bool sync_regular_file(const std::filesystem::path& path) {
 #if defined(_WIN32)
     const int descriptor = _wopen(
-        path.c_str(), _O_RDWR | _O_BINARY);
+        tyloi::native_path(path).c_str(), _O_RDWR | _O_BINARY);
     if (descriptor < 0) return false;
     const bool synced = _commit(descriptor) == 0;
     (void)_close(descriptor);
@@ -450,11 +451,25 @@ std::mutex prefix_directories_mutex;
 std::map<std::filesystem::path, std::weak_ptr<PrefixDirectoryCoordinator>> prefix_directories;
 
 std::filesystem::path canonical_directory(const std::filesystem::path& path) {
+    // Coordinator keys stay in the logical namespace. Strip only the
+    // extended-length marker here so ordinary and extended spellings share
+    // one owner; native_path() remains reserved for actual filesystem IO.
+#if defined(_WIN32)
+    auto key_path = path;
+    const auto& text = key_path.native();
+    if (text.rfind(LR"(\\?\UNC\)", 0) == 0) {
+        key_path = std::filesystem::path(LR"(\\)" + text.substr(8));
+    } else if (text.rfind(LR"(\\?\)", 0) == 0) {
+        key_path = std::filesystem::path(text.substr(4));
+    }
+#else
+    const auto& key_path = path;
+#endif
     std::error_code error;
-    auto result = std::filesystem::weakly_canonical(path, error);
+    auto result = std::filesystem::weakly_canonical(key_path, error);
     if (!error) return result;
-    result = std::filesystem::absolute(path, error);
-    return error ? path.lexically_normal() : result.lexically_normal();
+    result = std::filesystem::absolute(key_path, error);
+    return error ? key_path.lexically_normal() : result.lexically_normal();
 }
 
 std::shared_ptr<PrefixDirectoryCoordinator> directory_coordinator(
@@ -627,7 +642,7 @@ struct RawTextRecord {
 RawTextRecord read_text_record(const std::filesystem::path& block,
         std::string_view space, std::string_view digest, bool include_tokens) {
     RawTextRecord result;
-    auto side = block;
+    auto side = tyloi::native_path(block);
     side += ".tokens";
     std::ifstream input(side, std::ios::binary);
     if (!input) return result;
@@ -676,7 +691,8 @@ PrefixIdentity read_identity(const std::filesystem::path& directory,
         std::string_view space) {
     PrefixIdentity result;
     if (!hex_digest(space)) return result;
-    std::ifstream input(directory / std::string(space) / "identity.txt", std::ios::binary);
+    const auto physical_directory = tyloi::native_path(directory);
+    std::ifstream input(physical_directory / std::string(space) / "identity.txt", std::ios::binary);
     if (!input) return result;
     const std::string text((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
     if (text.size() > 32768) return result;
@@ -715,23 +731,24 @@ struct ScannedPrefixBlock {
 
 std::optional<ScannedPrefixBlock> inspect_block(const std::filesystem::path& path,
         std::string_view space, std::string_view bucket, bool include_tokens) {
-    const auto extension = path.extension();
+    const auto physical_path = tyloi::native_path(path);
+    const auto extension = physical_path.extension();
     if (extension != ".tqkv" && extension != ".mfqkv") return {};
     std::error_code error;
-    if (!std::filesystem::is_regular_file(std::filesystem::symlink_status(path, error)) || error)
+    if (!std::filesystem::is_regular_file(std::filesystem::symlink_status(physical_path, error)) || error)
         return {};
-    std::ifstream input(path, std::ios::binary);
+    std::ifstream input(physical_path, std::ios::binary);
     RawPrefixHeader header;
     if (!input || !read_raw_header(input, header)) return {};
-    const auto total = std::filesystem::file_size(path, error);
+    const auto total = std::filesystem::file_size(physical_path, error);
     const auto digest = block_hash_hex(header.hash);
-    if (error || block_hash_hex(header.compatibility) != space || path.stem().string() != digest ||
+    if (error || block_hash_hex(header.compatibility) != space || physical_path.stem().string() != digest ||
         bucket != digest.substr(0, 2) || !header.block_size || header.block_size > 65536 ||
         !header.token_count || header.token_count > header.block_size ||
         header.payload_bytes > std::numeric_limits<std::uintmax_t>::max() - kHeaderBytes ||
         total != kHeaderBytes + header.payload_bytes) return {};
     ScannedPrefixBlock result;
-    result.path = path;
+    result.path = physical_path;
     result.header = header;
     auto& info = result.info;
     info.space = space;
@@ -741,8 +758,8 @@ std::optional<ScannedPrefixBlock> inspect_block(const std::filesystem::path& pat
     info.block_size = header.block_size;
     info.payload = header.payload_bytes;
     info.bytes = total;
-    info.modified = file_seconds(path, error);
-    auto text = read_text_record(path, space, digest, include_tokens);
+    info.modified = file_seconds(physical_path, error);
+    auto text = read_text_record(physical_path, space, digest, include_tokens);
     info.text_saved = text.valid;
     info.text_bytes = text.bytes;
     result.text_tokens = std::move(text.tokens);
@@ -751,13 +768,14 @@ std::optional<ScannedPrefixBlock> inspect_block(const std::filesystem::path& pat
 
 std::vector<ScannedPrefixBlock> scan_directory(const std::filesystem::path& directory) {
     std::vector<ScannedPrefixBlock> result;
+    const auto physical_directory = tyloi::native_path(directory);
     std::error_code ignored;
-    if (!std::filesystem::is_directory(directory, ignored)) {
+    if (!std::filesystem::is_directory(physical_directory, ignored)) {
         if (ignored && ignored != std::errc::no_such_file_or_directory)
             throw std::filesystem::filesystem_error("inspect prefix cache directory", directory, ignored);
         return result;
     }
-    for (const auto& space : std::filesystem::directory_iterator(directory)) {
+    for (const auto& space : std::filesystem::directory_iterator(physical_directory)) {
         const auto namespace_name = space.path().filename().string();
         if (!hex_digest(namespace_name) || space.is_symlink() || !space.is_directory()) continue;
         for (const auto& bucket : std::filesystem::directory_iterator(space.path())) {
@@ -887,7 +905,7 @@ public:
         }
         directory_ = directory_coordinator(config_.cache_dir);
         const auto scan_lease = acquire_directory_read(directory_);
-        namespace_dir_ = config_.cache_dir /
+        namespace_dir_ = tyloi::native_path(config_.cache_dir) /
             block_hash_hex(compatibility_hash_);
         std::error_code error;
         std::filesystem::create_directories(namespace_dir_, error);
@@ -1555,15 +1573,19 @@ private:
     }
 
     static void remove_text(const std::filesystem::path& block) {
+        auto side = tyloi::native_path(block);
+        side += ".tokens";
         std::error_code error;
-        std::filesystem::remove(block.string() + ".tokens", error);
+        std::filesystem::remove(side, error);
     }
 
     void write_text(const WriteRequest& request) {
         DiskWriteGuard space_guard(namespace_dir_, 108 + request.tokens.size() * 8, config_.min_disk_free_bytes);
         if (!space_guard.allowed()) return;
-        const auto target = path_for(request.hash).string() + ".tokens";
-        const auto temporary = target + ".tmp." + std::to_string(monotonic_tick());
+        auto target = tyloi::native_path(path_for(request.hash));
+        target += ".tokens";
+        auto temporary = target;
+        temporary += ".tmp." + std::to_string(monotonic_tick());
         std::vector<std::uint8_t> bytes;
         bytes.reserve(request.tokens.size() * 8);
         for (const auto token : request.tokens) for (std::size_t i = 0; i < 8; ++i)
@@ -1603,14 +1625,14 @@ private:
     bool read_header(
         const std::filesystem::path& path,
         ParsedHeader& header) const {
-        std::ifstream input(path, std::ios::binary);
+        std::ifstream input(tyloi::native_path(path), std::ios::binary);
         return input && read_header(input, header);
     }
 
     std::optional<std::vector<std::uint8_t>> read_payload(
         const std::filesystem::path& path,
         const BlockHash& expected_hash) const {
-        std::ifstream input(path, std::ios::binary);
+        std::ifstream input(tyloi::native_path(path), std::ios::binary);
         if (!input) return std::nullopt;
         ParsedHeader header;
         if (!read_header(input, header) || header.hash != expected_hash) {
@@ -2358,7 +2380,8 @@ PrefixText PrefixBlockStore::read_text_tokens(const std::filesystem::path& direc
     const auto directory_lease = acquire_directory_read(coordinator);
     PrefixText result;
     if (!hex_digest(space) || !hex_digest(block)) return result;
-    const auto namespace_dir = directory / std::string(space);
+    const auto physical_directory = tyloi::native_path(directory);
+    const auto namespace_dir = physical_directory / std::string(space);
     const auto bucket = std::string(block.substr(0, 2));
     const auto bucket_dir = namespace_dir / bucket;
     for (const auto& parent : {namespace_dir, bucket_dir}) {
@@ -2366,7 +2389,7 @@ PrefixText PrefixBlockStore::read_text_tokens(const std::filesystem::path& direc
         if (!std::filesystem::is_directory(std::filesystem::symlink_status(parent, error)) || error)
             return result;
     }
-    result.identity = read_identity(directory, space);
+    result.identity = read_identity(physical_directory, space);
     for (const auto* extension : {".mfqkv", ".tqkv"}) {
         if (auto item = inspect_block(bucket_dir / (std::string(block) + extension), space, bucket, true)) {
             if (item->text_tokens.empty()) continue;

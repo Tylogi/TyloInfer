@@ -1,4 +1,5 @@
 #include "engine/weights/source/mapped.h"
+#include "engine/io/path.h"
 
 #include <algorithm>
 #include <atomic>
@@ -67,7 +68,8 @@ public:
         try {
             std::uint64_t granularity=0,file_bytes=0;
 #ifdef _WIN32
-            file_=CreateFileW(path.c_str(),GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_FLAG_RANDOM_ACCESS,nullptr);
+            const auto physical=native_path(path);
+            file_=CreateFileW(physical.c_str(),GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_FLAG_RANDOM_ACCESS,nullptr);
             if(file_==INVALID_HANDLE_VALUE)throw std::system_error(GetLastError(),std::system_category(),"open mapped tensor");
             LARGE_INTEGER size{};
             if(!GetFileSizeEx(file_,&size) || size.QuadPart<0)throw std::runtime_error("mapped tensor file size unavailable");

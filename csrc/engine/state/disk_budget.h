@@ -1,5 +1,7 @@
 #pragma once
 
+#include "engine/io/path.h"
+
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -25,7 +27,8 @@ class DiskBudgetLock {
 public:
     explicit DiskBudgetLock(const std::filesystem::path& path, bool wait = true) {
 #ifdef _WIN32
-        handle_ = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE,
+        const auto physical_path = tyloi::native_path(path);
+        handle_ = CreateFileW(physical_path.c_str(), GENERIC_READ | GENERIC_WRITE,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
         OVERLAPPED position{};
         locked_ = handle_ != INVALID_HANDLE_VALUE && LockFileEx(handle_, LOCKFILE_EXCLUSIVE_LOCK |
@@ -67,7 +70,8 @@ inline std::filesystem::path disk_budget_directory() {
 
 inline std::uint64_t disk_volume(const std::filesystem::path& path) {
 #ifdef _WIN32
-    HANDLE handle = CreateFileW(path.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+    const auto physical_path = tyloi::native_path(path);
+    HANDLE handle = CreateFileW(physical_path.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
     BY_HANDLE_FILE_INFORMATION info{};
     const bool ok = handle != INVALID_HANDLE_VALUE && GetFileInformationByHandle(handle, &info);
@@ -82,7 +86,7 @@ inline std::uint64_t disk_volume(const std::filesystem::path& path) {
 
 inline std::uint64_t disk_reserved_locked(const std::filesystem::path& root, std::uint64_t volume) {
     std::uint64_t reserved = 0;
-    for (const auto& entry : std::filesystem::directory_iterator(root)) {
+    for (const auto& entry : std::filesystem::directory_iterator(tyloi::native_path(root))) {
         if (entry.path().extension() != ".lease") continue;
         DiskBudgetLock lease(entry.path(), false);
         if (lease.locked()) continue;
@@ -104,7 +108,7 @@ public:
     DiskWriteGuard(const std::filesystem::path& directory, std::uint64_t bytes, std::uint64_t margin = 0)
         : root_(disk_budget_directory()), lock_(prepare(root_) / "lock") {
         if (!lock_.locked()) throw std::runtime_error("cannot lock SSD budget");
-        const auto free = std::filesystem::space(directory).available;
+        const auto free = std::filesystem::space(tyloi::native_path(directory)).available;
         const auto reserved = disk_reserved_locked(root_, disk_volume(directory));
         const auto available = free > reserved ? free - reserved : 0;
         allowed_ = margin <= available && bytes <= available - margin;
@@ -112,7 +116,7 @@ public:
     bool allowed() const { return allowed_; }
 private:
     static std::filesystem::path prepare(const std::filesystem::path& root) {
-        std::filesystem::create_directories(root);
+        std::filesystem::create_directories(tyloi::native_path(root));
         return root;
     }
     std::filesystem::path root_;
@@ -122,10 +126,10 @@ private:
 
 inline std::uint64_t unreserved_disk_space(const std::filesystem::path& directory, std::uint64_t managed = 0) {
     const auto root = disk_budget_directory();
-    std::filesystem::create_directories(root);
+    std::filesystem::create_directories(tyloi::native_path(root));
     DiskBudgetLock lock(root / "lock");
     if (!lock.locked()) throw std::runtime_error("cannot lock SSD budget");
-    const auto available = std::filesystem::space(directory).available;
+    const auto available = std::filesystem::space(tyloi::native_path(directory)).available;
     const auto free = managed > std::numeric_limits<std::uint64_t>::max() - available
         ? std::numeric_limits<std::uint64_t>::max() : managed + available;
     const auto reserved = disk_reserved_locked(root, disk_volume(directory));

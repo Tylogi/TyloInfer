@@ -1,4 +1,5 @@
 #include "engine/weights/source/buffered.h"
+#include "engine/io/path.h"
 
 #include <cstdio>
 #include <ios>
@@ -22,7 +23,8 @@ class BufferedRecordInput {
 public:
     explicit BufferedRecordInput(const std::filesystem::path& path) {
 #ifdef _WIN32
-        file_=_wfopen(path.c_str(),L"rb");
+        const auto physical=native_path(path);
+        file_=_wfopen(physical.c_str(),L"rb");
 #else
         file_=std::fopen(path.c_str(),"rb");
 #endif
