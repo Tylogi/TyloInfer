@@ -1,7 +1,7 @@
-#include "engine/weights/encoding/qsa/tq_cpu.h"
-#include "engine/weights/encoding/qsa/energy_allocation.h"
+#include "engine/tensor/encoding/qsa/tq_cpu.h"
+#include "engine/tensor/encoding/qsa/energy_allocation.h"
 #include "components/ggml/include/ggml.h"
-#include "../../../backends/cpu/native/host_parallel.h"
+#include "engine/backends/cpu/native/host_parallel.h"
 #include <algorithm>
 #include <array>
 #include <cmath>

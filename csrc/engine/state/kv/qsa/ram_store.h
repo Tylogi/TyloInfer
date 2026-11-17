@@ -1,6 +1,7 @@
 #pragma once
-#include "engine/weights/encoding/qsa/adaptive_cache.h"
-#include "engine/weights/encoding/qsa/ram_policy.h"
+#include "engine/tensor/encoding/qsa/image.h"
+#include "engine/state/kv/qsa_blocks.h"
+#include "engine/state/kv/qsa/ram_policy.h"
 #include "engine/io/read_span.h"
 #include "engine/io/file_range_reader.h"
 #include <functional>
@@ -8,17 +9,6 @@
 #include <vector>
 
 namespace tyloinfer::qsa {
-// Storage is supplied by the backend. A CUDA backend can own one mapped,
-// pinned image without retaining an additional pageable copy of its bytes.
-struct RamKvImage {
-    std::shared_ptr<const void> owner;
-    const std::uint8_t* key=nullptr;
-    const std::uint8_t* value=nullptr;
-    std::size_t key_bytes=0,value_bytes=0;
-    std::uint8_t key_bits=0,value_bits=0,key_state_bits=16,value_state_bits=16;
-    std::size_t bytes()const{return key_bytes+value_bytes;}
-};
-using RamKvImagePtr=std::shared_ptr<const RamKvImage>;
 // One retained file reader serves many immutable block slices. Keep callbacks
 // with that source instead of embedding two std::functions in every block.
 struct RamKvReadSource {

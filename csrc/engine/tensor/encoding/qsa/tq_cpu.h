@@ -1,5 +1,5 @@
 #pragma once
-#include "engine/weights/encoding/qsa/adaptive_cache.h"
+#include "engine/tensor/encoding/qsa/image.h"
 #include <memory>
 #include <cstdint>
 #include <vector>

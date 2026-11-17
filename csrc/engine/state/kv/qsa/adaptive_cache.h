@@ -1,6 +1,7 @@
 #pragma once
+#include "engine/tensor/encoding/qsa/image.h"
 #include "engine/state/kv/qsa_blocks.h"
-#include "engine/weights/encoding/qsa/precision_policy.h"
+#include "engine/state/kv/qsa/precision_policy.h"
 #include <functional>
 #include <memory>
 #include <string>
@@ -8,17 +9,6 @@
 
 namespace tyloinfer::qsa {
 
-inline constexpr std::uint8_t affine8_tag=254;
-enum class RowPrecisionAllocation {Energy,Uniform};
-struct MicroblockImage {
-    std::vector<std::uint8_t> key, value;
-    // 254: FP16 scale + INT8 zero per 256-element H4 mode, then INT8 codes.
-    // 1..8: uniform TQ; 255: row precision allocated from H4 mode energy.
-    std::uint8_t key_bits = affine8_tag, value_bits = affine8_tag;
-    // Trellis address width, independent of the payload's bits per value.
-    // Canonical Affine8 has no trellis; original TQ8 images use 16-bit states.
-    std::uint8_t key_state_bits = 16, value_state_bits = 16;
-};
 struct BlockReplacement {
     std::size_t block = 0;
     std::uint8_t tier = 5;

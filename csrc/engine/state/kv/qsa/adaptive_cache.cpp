@@ -1,4 +1,4 @@
-#include "engine/weights/encoding/qsa/adaptive_cache.h"
+#include "engine/state/kv/qsa/adaptive_cache.h"
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>

@@ -1,6 +1,6 @@
-#include "engine/weights/encoding/qsa/ram_store.h"
+#include "engine/state/kv/qsa/ram_store.h"
 #include "engine/weights/encoding/readers/window.h"
-#include "../../../backends/cpu/native/host_parallel.h"
+#include "engine/backends/cpu/native/host_parallel.h"
 #include <algorithm>
 #include <atomic>
 #include <cstdio>

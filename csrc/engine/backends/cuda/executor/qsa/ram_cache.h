@@ -1,6 +1,7 @@
 #pragma once
 #include "engine/backends/cuda/native/tensor/backend.h"
-#include "engine/weights/encoding/qsa/ram_store.h"
+#include "engine/state/kv/qsa/adaptive_cache.h"
+#include "engine/state/kv/qsa/ram_store.h"
 #include <cuda_runtime_api.h>
 #include <functional>
 #include <memory>

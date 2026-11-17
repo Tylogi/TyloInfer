@@ -1,5 +1,7 @@
 #pragma once
 
+#include "engine/tensor/encoding/qsa/image.h"
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -12,9 +14,6 @@
 
 namespace tyloinfer::qsa {
 
-struct Precision {
-    std::uint8_t key_bits, value_bits;
-};
 // Ordered by storage cost. Half-bit modes assign the extra bit to V.
 inline constexpr std::array<Precision, 6> precisions{{{2,2},{2,3},{3,3},{3,4},{4,4},{8,8}}};
 

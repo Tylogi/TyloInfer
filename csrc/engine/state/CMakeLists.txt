@@ -3,12 +3,19 @@ find_package(Threads REQUIRED)
 add_library(mfq-qsa-kv-store STATIC
     ${CMAKE_CURRENT_SOURCE_DIR}/kv/qsa_blocks.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/kv/qsa_blocks.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/kv/qsa/adaptive_cache.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/kv/qsa/adaptive_cache.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/kv/qsa/precision_policy.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/kv/qsa/ram_policy.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/kv/qsa/ram_store.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/kv/qsa/ram_store.h
 )
 target_include_directories(mfq-qsa-kv-store PUBLIC
     ${PROJECT_SOURCE_DIR}
     ${PROJECT_SOURCE_DIR}/engine/state
 )
-target_link_libraries(mfq-qsa-kv-store PUBLIC Threads::Threads mfq-quant-readers)
+target_link_libraries(mfq-qsa-kv-store PUBLIC Threads::Threads mfq-quant-readers
+    PRIVATE mfq-host-parallel)
 target_compile_features(mfq-qsa-kv-store PUBLIC cxx_std_17)
 set_target_properties(mfq-qsa-kv-store PROPERTIES POSITION_INDEPENDENT_CODE ON)
 

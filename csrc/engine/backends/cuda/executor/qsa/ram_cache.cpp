@@ -6,7 +6,7 @@
 #include "engine/backends/cuda/kernels/moe/pipeline.h"
 #include "engine/memory/host.h"
 #include "engine/backends/cpu/native/host_parallel.h"
-#include "engine/weights/encoding/qsa/tq_cpu.h"
+#include "engine/tensor/encoding/qsa/tq_cpu.h"
 #include <algorithm>
 #include <atomic>
 #include <climits>
