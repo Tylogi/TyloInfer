@@ -3367,28 +3367,6 @@ bool MlxMfeOffloadCache::resolve_cached_projections(std::span<const std::shared_
     return true;
 }
 
-array MlxMfeCachedRoute::forward(const array& source, const array& routes, float swiglu_limit,
-    const array* reduce_weights) {
-    if (!cache || projections.empty())
-        throw std::invalid_argument("cached MFE route is incomplete");
-    for (const auto& projection : projections)
-        if (!projection) throw std::invalid_argument("cached MFE route projection is missing");
-    ids = routes;
-    const auto down = projections.size() - 1;
-    auto intermediate = [&]() {
-        if (projections.size() != 3)
-            return projections[0]->weight.routed_swiglu(source,
-                mlx::core::take(projections[0]->expert_map, routes), swiglu_limit);
-        return projections[0]->weight.routed_swiglu_pair(projections[1]->weight,
-            source, routes, swiglu_limit, nullptr, &projections[0]->expert_map, &projections[1]->expert_map);
-    }();
-    auto down_ids = mlx::core::take(projections[down]->expert_map, routes);
-    auto result = reduce_weights ? projections[down]->weight.routed_matmul_reduce(intermediate, down_ids, *reduce_weights)
-        : projections[down]->weight.routed_matmul(intermediate, down_ids);
-    cache->retain_cached_until_drain(projections, {result});
-    return result;
-}
-
 std::span<const std::int32_t> MlxMfeCachedRoute::host_ids() {
     if (!ids) throw std::logic_error("cached route was not evaluated");
     ids->eval();

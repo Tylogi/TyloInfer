@@ -25,6 +25,14 @@ class MlxMfeWeight;
 class MlxMfeOffloadCache;
 class MlxNintSwiGluPair;
 class MlxNintWeight;
+struct MlxMfeCachedRoute;
+
+mlx::core::array cached_mfe(
+    MlxMfeCachedRoute& route,
+    const mlx::core::array& source,
+    const mlx::core::array& routes,
+    float swiglu_limit = 0.0f,
+    const mlx::core::array* reduce_weights = nullptr);
 
 struct MlxMfeKernelProfile {
     std::uint32_t family_mask = 0;

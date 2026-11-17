@@ -1,4 +1,5 @@
 #include "engine/weights/cache/metal_mfe.h"
+#include "engine/backends/metal/ops/mfq/mlx_moe.h"
 #include "mlx_deepseek_v41_moe.h"
 
 #include "engine/backends/metal/native/profile.h"
@@ -603,13 +604,13 @@ MlxDeepseekV41MoeResult MlxDeepseekV41Moe::forward(
             routes.weights);
     } else if (tyloi::mfq_compat_enabled && mfe_offload_cache_) {
         if (deferred_route) {
-            auto output = deferred_route->forward(source, routes.ids, swiglu_limit_, &routes.weights);
+            auto output = cached_mfe(*deferred_route, source, routes.ids, swiglu_limit_, &routes.weights);
             return {mlx::core::reshape(std::move(output), input.shape()),
                 mlx::core::reshape(std::move(shared), input.shape())};
         }
         if (rows == 1 && !image_mask && !tyloi::profiling::active()) {
             if (auto cached = cached_route()) {
-                auto output = cached->forward(source, routes.ids, swiglu_limit_, &routes.weights);
+                auto output = cached_mfe(*cached, source, routes.ids, swiglu_limit_, &routes.weights);
                 mlx::core::async_eval({output});
                 if (cached->resolve()) {
                     return {mlx::core::reshape(std::move(output), input.shape()),

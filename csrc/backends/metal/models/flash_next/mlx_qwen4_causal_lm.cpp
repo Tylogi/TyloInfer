@@ -14,7 +14,7 @@
 #include "qwen4_ops.h"
 #include "mlx_legacy_tensor_compat.h"
 #include "mlx_linear_attention.h"
-#include "mlx_moe.h"
+#include "engine/backends/metal/ops/mfq/mlx_moe.h"
 #include "mlx_moe_ops.h"
 #include "mlx_nint_rows.h"
 #include "mlx_tq_rows.h"
@@ -1316,7 +1316,7 @@ public:
                     auto local_route = deferred_route ? std::nullopt : cached_route();
                     auto* cached = deferred_route ? deferred_route : local_route ? &*local_route : nullptr;
                     if (cached) {
-                        auto output = cached->forward(source, routes.ids);
+                        auto output = cached_mfe(*cached, source, routes.ids);
                         if (deferred_route) return output;
                         mlx::core::async_eval({output});
                         if (cached->resolve()) return output;

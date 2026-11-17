@@ -2,6 +2,8 @@
 #include "mlx_moe_cache_internal.h"
 #include "mlx_moe_ops.h"
 
+#include "engine/weights/cache/metal_mfe.h"
+
 #include "mlx_kernel_prepare.h"
 #include "engine/backends/metal/native/kernel.h"
 #include "engine/backends/metal/kernels/source.h"
@@ -12178,6 +12180,43 @@ MlxRoutedSwiGluFfn::forward_from_logits(
         std::move(routes.ids),
         std::move(routes.weights),
     };
+}
+
+array cached_mfe(
+    MlxMfeCachedRoute& route,
+    const array& source,
+    const array& routes,
+    float swiglu_limit,
+    const array* reduce_weights) {
+    if (!route.cache || route.projections.empty())
+        throw std::invalid_argument("cached MFE route is incomplete");
+    for (const auto& projection : route.projections)
+        if (!projection) throw std::invalid_argument("cached MFE route projection is missing");
+    route.ids = routes;
+    const auto down = route.projections.size() - 1;
+    auto intermediate = [&]() {
+        if (route.projections.size() != 3)
+            return route.projections[0]->weight.routed_swiglu(
+                source,
+                mlx::core::take(route.projections[0]->expert_map, routes),
+                swiglu_limit);
+        return route.projections[0]->weight.routed_swiglu_pair(
+            route.projections[1]->weight,
+            source,
+            routes,
+            swiglu_limit,
+            nullptr,
+            &route.projections[0]->expert_map,
+            &route.projections[1]->expert_map);
+    }();
+    auto down_ids = mlx::core::take(route.projections[down]->expert_map, routes);
+    auto result = reduce_weights
+        ? route.projections[down]->weight.routed_matmul_reduce(
+            intermediate, down_ids, *reduce_weights)
+        : route.projections[down]->weight.routed_matmul(
+            intermediate, down_ids);
+    route.cache->retain_cached_until_drain(route.projections, {result});
+    return result;
 }
 
 } // namespace tyloi::metal

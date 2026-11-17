@@ -125,7 +125,12 @@ public:
     virtual void clear();
 
 private:
-    friend struct MlxMfeCachedRoute;
+    friend mlx::core::array cached_mfe(
+        MlxMfeCachedRoute& route,
+        const mlx::core::array& source,
+        const mlx::core::array& routes,
+        float swiglu_limit,
+        const mlx::core::array* reduce_weights);
     using WeightImpl = MlxMfeWeight::Impl;
     static std::weak_ptr<const WeightImpl> weight_impl(
         const MlxMfeWeight& weight) noexcept;
@@ -153,9 +158,6 @@ struct MlxMfeCachedRoute {
     std::vector<std::shared_ptr<const MlxMfeCachedProjection>> projections;
     std::optional<mlx::core::array> ids;
 
-    mlx::core::array forward(const mlx::core::array& source,
-        const mlx::core::array& routes, float swiglu_limit = 0.0f,
-        const mlx::core::array* reduce_weights = nullptr);
     std::span<const std::int32_t> host_ids();
     bool all_resident();
     bool resolve();
