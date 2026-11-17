@@ -4,6 +4,7 @@
 #include "engine/backends/metal/ops/moe.h"
 #include "engine/weights/encoding/mx/affine.h"
 #include "engine/weights/memory.h"
+#include "engine/weights/moe/experts.h"
 #include "engine/weights/source/read.h"
 #include "engine/weights/tq/source.h"
 #if TYLOINFER_ENABLE_MFQ_COMPAT
@@ -19,6 +20,7 @@
 #include <mlx/mlx.h>
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <exception>
 #include <limits>
 #include <map>
@@ -139,6 +141,38 @@ void require_metal(Device device) {
         throw std::invalid_argument("Metal cache requires Metal device 0");
 }
 } // namespace
+
+void prepare_experts(std::span<const Tensor> gate_up, const Tensor& down,
+                     std::int64_t top_k, double limit) {
+    if ((gate_up.size() != 1 && gate_up.size() != 2) || !down || down.dim() != 3 ||
+        top_k <= 0 || !std::isfinite(limit) || limit < 0)
+        throw std::invalid_argument("incomplete Metal routed expert bank");
+    for (const auto& bank : gate_up)
+        if (!bank || bank.dim() != 3 || !bank.is_metal() ||
+            bank.size(0) != down.size(0))
+            throw std::invalid_argument("invalid Metal routed expert bank");
+    if (!down.is_metal() || down.size(1) <= 0 || down.size(2) <= 0 ||
+        (gate_up.size() == 1 ? gate_up[0].size(1) != 2 * down.size(2) :
+         gate_up[0].size(1) != down.size(2) || gate_up[1].size(1) != down.size(2)) ||
+        gate_up[0].size(2) <= 0)
+        throw std::invalid_argument("invalid Metal routed expert bank geometry");
+    const auto* gate = gate_up.front().representation<metal::ExpertBank>();
+    const auto* up = gate_up.size() == 2 ? gate_up.back().representation<metal::ExpertBank>() : nullptr;
+    const auto* down_bank = down.representation<metal::ExpertBank>();
+    if (!gate && !up && !down_bank) return;
+    if (!gate || !up || !down_bank || gate->role() != metal::ExpertRole::gate ||
+        up->role() != metal::ExpertRole::up || down_bank->role() != metal::ExpertRole::down ||
+        gate->cache() != up->cache() || gate->cache() != down_bank->cache() ||
+        gate->layer() != up->layer() || gate->layer() != down_bank->layer())
+        throw std::invalid_argument("incompatible Metal expert cache banks");
+    std::visit([&](const auto& cache) {
+        cache->validate_layer(gate->layer(), static_cast<int>(down.size(0)),
+                              static_cast<int>(gate_up.front().size(2)),
+                              static_cast<int>(down.size(2)));
+        cache->prepare_layer(gate->layer(), static_cast<int>(top_k),
+                             static_cast<float>(limit));
+    }, gate->cache());
+}
 
 Cache::Cache() : data_(std::make_unique<Resources>()) {}
 Cache::~Cache() {

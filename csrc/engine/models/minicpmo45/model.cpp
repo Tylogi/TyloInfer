@@ -102,7 +102,7 @@ void load(Model& model, const tyloi::weights::Loader& weights, const LayerPlacem
         const auto prefix = "model.block." + std::to_string(index) + ".";
         tyloi::models::load_attention_mixer(layer.attention, loader, config, index, prefix, 1.0);
         layer.ffn_norm = placed.tensor(prefix + "mlp.norm.weight");
-        layer.ffn = tyloi::models::load_dense_ffn<tyloi::models::Mlp>(loader, config, prefix + "mlp.");
+        layer.ffn = tyloi::models::load_dense_ffn(loader, config, prefix + "mlp.");
     }
 }
 

@@ -22,7 +22,8 @@ std::shared_ptr<const MfeTensor> cpu_expert(const std::shared_ptr<const MfeTenso
 } // namespace
 
 ExpertBatch::ExpertBatch(std::span<const Tensor> banks, const Tensor& down, const Tensor& ids,
-                         std::int64_t row_offset, std::int64_t row_total)
+                         std::int64_t row_offset, std::int64_t row_total,
+                         ops::MlpActivation activation)
     : impl_(std::make_unique<Impl>()) {
     if ((banks.size() != 1 && banks.size() != 2) || !down || !ids ||
         ids.dim() != 2 || !ids.representation<DenseTensor>() || !ids.is_cuda() || ids.scalar_type() != kInt32 ||
@@ -36,12 +37,14 @@ ExpertBatch::ExpertBatch(std::span<const Tensor> banks, const Tensor& down, cons
         if (!bank || bank.dim() != 3 || bank.size(0) <= 0 || bank.size(0) > INT_MAX ||
             bank.size(1) <= 0 || bank.size(2) <= 0)
             throw std::invalid_argument("invalid selected expert bank");
+    const bool ungated = activation == ops::MlpActivation::relu_squared && banks.size() == 1;
     if (down.dim() != 3 || down.size(0) != banks[0].size(0) ||
         down.size(1) <= 0 || down.size(2) <= 0 ||
         (banks.size() == 2 && (banks[1].size(0) != banks[0].size(0) ||
                                banks[1].size(1) != banks[0].size(1) ||
                                banks[1].size(2) != banks[0].size(2))) ||
-        (banks.size() == 1 ? (banks[0].size(1) % 2 != 0 || banks[0].size(1) / 2 != down.size(2))
+        (banks.size() == 1 ? (ungated ? banks[0].size(1) != down.size(2)
+                                      : (banks[0].size(1) % 2 != 0 || banks[0].size(1) / 2 != down.size(2)))
                            : banks[0].size(1) != down.size(2)))
         throw std::invalid_argument("incompatible selected expert bank shapes");
 
@@ -49,6 +52,8 @@ ExpertBatch::ExpertBatch(std::span<const Tensor> banks, const Tensor& down, cons
     b.gate_up_weights.assign(banks.begin(), banks.end());
     b.down_weight = down;
     b.ids = ids;
+    b.activation = activation;
+    b.ungated = ungated;
     b.split = banks.size() == 2;
     if (b.split) {
         b.gate = mfe(banks[0]);
@@ -57,8 +62,15 @@ ExpertBatch::ExpertBatch(std::span<const Tensor> banks, const Tensor& down, cons
         b.dense_up = std::dynamic_pointer_cast<const DenseTensor>(banks[1].implementation());
         b.tq = tq_banks(banks[0], banks[1], down);
     } else {
-        b.gate_up = mfe(banks[0]);
-        b.tq = tq_banks({}, {}, down);
+        if (ungated) {
+            b.up = mfe(banks[0]);
+            b.dense_up = std::dynamic_pointer_cast<const DenseTensor>(banks[0].implementation());
+            b.tq = tq_banks({}, banks[0], down);
+        } else {
+            b.gate_up = mfe(banks[0]);
+            b.dense_gate_up = std::dynamic_pointer_cast<const DenseTensor>(banks[0].implementation());
+            b.tq = tq_banks({}, {}, down);
+        }
     }
     b.down = mfe(down);
     b.dense_down = std::dynamic_pointer_cast<const DenseTensor>(down.implementation());
@@ -68,10 +80,13 @@ ExpertBatch::ExpertBatch(std::span<const Tensor> banks, const Tensor& down, cons
     b.cpu_down = cpu_expert(b.down);
     b.sharded = !b.split && expert_parallel(banks[0], down);
     const bool tq_routed = bool(b.tq.gate || b.tq.up || b.tq.down);
-    if ((tq_routed && (!b.split || !b.tq.gate || !b.tq.up || !b.tq.down)) ||
+    if ((tq_routed && (b.ungated ? (b.split || b.tq.gate || !b.tq.up || !b.tq.down)
+                                  : (!b.split || !b.tq.gate || !b.tq.up || !b.tq.down))) ||
         (!tq_routed && b.split && !((b.gate && b.up && b.down) ||
                                     (b.dense_gate && b.dense_up && b.dense_down))) ||
-        (!tq_routed && !b.split && !(b.gate_up && b.down)))
+        (!tq_routed && !b.split &&
+            (b.ungated ? !((b.up && b.down) || (b.dense_up && b.dense_down))
+                       : !((b.gate_up && b.down) || (b.dense_gate_up && b.dense_down)))))
         throw std::invalid_argument("unsupported selected expert bank representations");
 
 #if TYLOINFER_ENABLE_MFQ_COMPAT
@@ -83,7 +98,7 @@ ExpertBatch::ExpertBatch(std::span<const Tensor> banks, const Tensor& down, cons
         }
     }
 #endif
-    for (const auto& weight : {b.dense_gate, b.dense_up, b.dense_down}) {
+    for (const auto& weight : {b.dense_gate, b.dense_up, b.dense_gate_up, b.dense_down}) {
         if (weight && (!weight->is_contiguous() || weight->device() != ids.device() ||
                        (weight->scalar_type() != kFloat16 && weight->scalar_type() != kBFloat16 &&
                         weight->scalar_type() != kFloat32)))
@@ -100,7 +115,7 @@ ExpertBatch::ExpertBatch(std::span<const Tensor> banks, const Tensor& down, cons
     b.route.row_total = row_total;
 #if TYLOINFER_ENABLE_MFQ_COMPAT
     if (!b.sharded && !tq_routed) {
-        const auto& first = b.split ? b.gate : b.gate_up;
+        const auto& first = b.split ? b.gate : (b.ungated ? b.up : b.gate_up);
         if (executor.options().ffn.delayed_readback) {
             if (first) cuda::prefetch_experts(*first, b.route, true);
         } else {
@@ -124,6 +139,10 @@ bool ExpertBatch::Impl::prefetch_bundle() {
         if (cpu_gate || cpu_up || !gate || !up || !down) return false;
         return cuda::prefetch_cached_moe_projection_bundle(*gate, *up, *down, route);
     }
+    if (ungated) {
+        if (cpu_up || !up || !down) return false;
+        return cuda::prefetch_cached_moe_projection_bundle(*up, *down, route);
+    }
     if (cpu_gate_up || !gate_up || !down) return false;
     return cuda::prefetch_cached_moe_projection_bundle(*gate_up, *down, route);
 #else
@@ -136,7 +155,7 @@ void ExpertBatch::Impl::ready() {
     const bool tq_routed = bool(tq.gate || tq.up || tq.down);
     if (!sharded && !tq_routed && cuda::Executor::current().options().ffn.delayed_readback) {
         bundle_prefetched = prefetch_bundle();
-        const auto& first = split ? gate : gate_up;
+        const auto& first = split ? gate : (ungated ? up : gate_up);
         if (!bundle_prefetched && first) cuda::prefetch_experts(*first, route);
     }
 #endif

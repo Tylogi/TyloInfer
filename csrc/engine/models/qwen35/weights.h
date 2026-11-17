@@ -19,7 +19,7 @@ models::Ffn load_ffn(Loader& ops, const Config& config, int layer, std::string_v
         !ops.has(prefix + "experts.gate.weight") &&
         !ops.has(prefix + "experts.up.weight") &&
         !ops.has(prefix + "experts.down.weight")) {
-        return models::load_dense_ffn<Mlp>(ops, config, prefix);
+        return models::load_dense_ffn(ops, config, prefix);
     }
     if (config.num_experts <= 0 || config.num_experts_per_tok <= 0 ||
         config.moe_intermediate_size <= 0 || config.shared_expert_intermediate_size <= 0) {

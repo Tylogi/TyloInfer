@@ -4,6 +4,7 @@
 #include "engine/weights/moe/prepare/prepare.h"
 #include "engine/weights/moe/prepare/projection.h"
 #include "engine/weights/encoding/format_features.h"
+#include "engine/backends/cuda/ops/ffn/tq/banks.h"
 
 #if TYLOINFER_ENABLE_MFQ_COMPAT
 #include "residency/cached_source_internal.h"
@@ -279,6 +280,25 @@ std::shared_ptr<::tyloi::TensorImpl> tyloi::MfeTensor::relocated(Device target) 
 }
 
 namespace tyloi::weights {
+
+void prepare_experts(std::span<const ::tyloi::Tensor> gate_up,
+                     const ::tyloi::Tensor& down,
+                     std::int64_t top_k, double limit) {
+    // Preparation validates routed weight readiness. Graph/capture support is
+    // decided by the execution driver from its own TQ/cache conditions.
+    (void)top_k;
+    (void)limit;
+    if (gate_up.size() != 2 || !down.defined()) return;
+    const auto banks = ::tq_banks(gate_up[0], gate_up[1], down);
+    const bool any = bool(banks.gate || banks.up || banks.down);
+    if (!any) return;
+    if (!banks.gate || !banks.up || !banks.down)
+        throw std::invalid_argument("TQ MoE requires matching Gate, Up and Down banks");
+    if (banks.gate->experts != banks.up->experts || banks.gate->experts != banks.down->experts ||
+        banks.gate->out != banks.up->out || banks.gate->input != banks.up->input ||
+        banks.down->input != banks.gate->out || banks.down->out != banks.gate->input)
+        throw std::invalid_argument("TQ MoE Gate, Up and Down geometry differs");
+}
 
 void PreparedExperts::retire() {
     if (retired_) return;

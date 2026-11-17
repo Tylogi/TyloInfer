@@ -6,7 +6,7 @@
 
 #include "engine/models/common/mtp.h"
 #include "engine/ops/ops.h"
-#include "engine/ops/ffn.h"
+#include "engine/models/common/ffn.h"
 #include "engine/ops/mhc.h"
 #include "ops.h"
 
@@ -69,7 +69,7 @@ struct Stage {
     tyloi::Tensor attention_mhc_function, attention_mhc_scale, attention_mhc_base;
     tyloi::Tensor mlp_mhc_function, mlp_mhc_scale, mlp_mhc_base;
     tyloi::ops::TailRopeTable rope;
-    tyloi::ops::FfnWeights mlp;
+    tyloi::models::Moe mlp;
 };
 
 struct DeepseekV41Dspark final : tyloi::models::Mtp {
@@ -147,8 +147,7 @@ struct DeepseekV41Dspark final : tyloi::models::Mtp {
                    function.size(1) == function_width && scale.numel() == 3 && base.numel() == 24 &&
                    norm.numel() == config.hidden;
         };
-        const auto& routed = result->mlp.moe_split_gate_up ? result->mlp.moe_gate : result->mlp.moe_gate_up;
-        const auto routed_experts = routed ? routed.size(0) : 0;
+        const auto routed_experts = result->mlp.gate_up.empty() ? 0 : result->mlp.gate_up.front().size(0);
         TYLOINFER_RUNTIME_CHECK(valid_mhc(result->attention_mhc_function, result->attention_mhc_scale,
                                     result->attention_mhc_base, result->attention_norm) &&
                               valid_mhc(result->mlp_mhc_function, result->mlp_mhc_scale,
@@ -169,7 +168,7 @@ struct DeepseekV41Dspark final : tyloi::models::Mtp {
                               result->key_value_norm.numel() == config.head_dim &&
                               result->sinks.numel() == config.n_heads &&
                               routed_experts == config.dspark_n_experts &&
-                              (result->mlp.moe_down ? result->mlp.moe_down.size(0) : 0) == config.dspark_n_experts,
+                              result->mlp.down && result->mlp.down.size(0) == config.dspark_n_experts,
                           "DeepSeek-V4.1 DSpark stage tensor geometry disagrees at stage ", stage);
         return result;
     }
@@ -618,7 +617,8 @@ struct DeepseekV41Dspark final : tyloi::models::Mtp {
                         stage.mlp_mhc_scale, stage.mlp_mhc_base, stage.mlp_norm, mhc);
                 });
                 const auto rows = mlp_mix.branch.size(1);
-                auto mlp = tyloi::ops::ffn(stage.mlp, mlp_mix.branch.dense().reshape({-1, config.hidden}),
+                auto mlp = tyloi::models::moe(stage.mlp,
+                    mlp_mix.branch.dense().reshape({-1, config.hidden}), false,
                     draft_ids.narrow(1, 0, rows)).dense().reshape({state.batch, rows, config.hidden});
                 auto result = tyloi::ops::measure("deepseek_v41.dspark.mhc.mlp.expand", [&] {
                     return tyloi::ops::mhc_expand(mlp, after_attention.narrow(1, 0, rows), mlp_mix).dense();

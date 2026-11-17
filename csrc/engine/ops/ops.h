@@ -349,22 +349,6 @@ Tensor add(const Tensor& input, std::int64_t offset);
 // Up projection, so it has no gate branch and no SwiGLU clamp.
 enum class MlpActivation { silu_gated, gelu_gated, relu_squared };
 
-// Prepared weights determine supported host and sharded MLP paths.
-Tensor mlp(const Tensor& input, std::span<const Tensor> gate_up, const ::tyloi::Tensor& down,
-           MlpActivation activation, double swiglu_limit);
-// BF16 MLP retains its source-precision projection and activation path.
-Tensor bf16_mlp(const Tensor& input, std::span<const Tensor> gate_up, const Tensor& down,
-                MlpActivation activation, double swiglu_limit);
-// Add two prepared MLP branches using the configured parallel and accumulation policy.
-Tensor additive_mlp(const Tensor& input,
-    std::span<const Tensor> gate_up, const Tensor& down, MlpActivation activation, double limit,
-    std::span<const Tensor> extra_gate_up, const Tensor& extra_down,
-    MlpActivation extra_activation, double extra_limit);
-// Flattened [rows,width] inputs; a declined fusion does not compute or write.
-std::optional<Tensor> mlp_residual(const Tensor& input, const Tensor& residual,
-    std::span<const Tensor> gate_up, const Tensor& down, MlpActivation activation,
-    double swiglu_limit, bool recurrent = false);
-
 enum class RouterActivation { softmax, sigmoid, sqrt_softplus };
 struct MoeRouting {
     RouterActivation activation = RouterActivation::softmax;
@@ -374,34 +358,23 @@ struct MoeRouting {
 };
 
 struct ExpertSpec {
-    Tensor shared_gate, latent_in, latent_out;
+    MlpActivation activation = MlpActivation::silu_gated;
     double swiglu_limit = 0;
     int layer = -1;
-    bool source_precision_gate = false;
 };
-struct RoutedExperts { Tensor values, shared_logits; bool reduced = false; };
-// Flat F16 input and matching F32 input; the batch owns selected bank/route preparation.
-// Execute after the shared expert, then combine its F16 output with these routed values.
-RoutedExperts routed(const Tensor& input, const Tensor& input_f32, const Tensor& route_weights,
-                     weights::ExpertBatch& batch, const ExpertSpec& spec);
-Tensor combine_experts(const RoutedExperts& experts, const Tensor& route_weights, const Tensor& shared);
-
+struct RoutedExperts { Tensor values; bool reduced = false; };
 struct SelectedExperts { Tensor ids, weights; };
 SelectedExperts topk(const Tensor& logits, std::int64_t count, const MoeRouting& routing,
                      const Tensor& bias = {});
+// Select the table's expert IDs for each token and compute sqrt-softplus route weights.
+SelectedExperts hash_route(const Tensor& logits, const Tensor& table,
+                          const Tensor& token_ids, double scale);
 // Scale the selected weights in place.
 void expert_scale(Tensor& weights, const Tensor& ids, const Tensor& scales);
 Tensor weighted_reduce(const Tensor& pairs, const Tensor& weights);
 // SwiGLU routed experts, reduced in FP32 across the selected routes.
 Tensor experts(const Tensor& input, const Tensor& ids, const Tensor& weights,
                std::span<const Tensor> gate_up, const Tensor& down, std::int64_t width);
-// Full MoE value: the routed SwiGLU result plus a scalar-gated shared expert.
-// `shared` contains Gate, Up and Down in that order. `shared_rows` preserves
-// shared projection row calibration; nonpositive values use the full input.
-Tensor moe(const Tensor& input, const Tensor& ids, const Tensor& weights,
-           std::span<const Tensor> gate_up, const Tensor& down,
-           std::span<const Tensor> shared, const Tensor& shared_gate,
-           std::int64_t width, std::int64_t shared_rows = 0);
 // Input is CUDA F16 [rows,in], ids are CUDA I32 [rows,routes], and banks are
 // [experts,2*hidden,in] and [experts,out,hidden]. Pairs are [rows,routes,out].
 // Traced intermediates are F32 snapshots taken before subsequent projections.

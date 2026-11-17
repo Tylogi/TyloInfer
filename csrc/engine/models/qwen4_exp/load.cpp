@@ -6,6 +6,7 @@
 #include "engine/weights/loader.h"
 #include "engine/weights/source/read.h"
 #include "engine/weights/group.h"
+#include "engine/weights/moe/experts.h"
 #include "engine/models/qwen4_exp/predictor.h"
 #include "engine/ops/ffn.h"
 #include "engine/ops/gdn.h"
@@ -99,27 +100,24 @@ struct LayerLoader : tyloi::weights::Loader {
     auto moe(std::vector<tyloi::Tensor> gate_up, tyloi::Tensor down, tyloi::Tensor router,
              tyloi::Tensor shared_gate, tyloi::Tensor sg, tyloi::Tensor su, tyloi::Tensor sd,
              const Config& c, int layer) const {
-        tyloi::ops::FfnWeights f;
-        f.is_moe = true;
+        tyloi::models::Moe f;
         f.gate_up = std::move(gate_up);
         f.down = std::move(down);
-        f.moe_router = std::move(router);
-        f.moe_shared_gate = std::move(shared_gate);
-        f.shared = std::make_unique<tyloi::ops::FfnWeights>();
-        f.shared->gate_up = {std::move(sg), std::move(su)};
-        f.shared->down = std::move(sd);
-        const auto routing = c.routing();
-        f.moe_top_k = static_cast<int>(c.topk);
-        f.moe_use_sigmoid = routing.activation == tyloi::ops::RouterActivation::sigmoid;
-        f.moe_use_sqrt_softplus = routing.activation == tyloi::ops::RouterActivation::sqrt_softplus;
-        f.moe_normalize = routing.normalize;
-        f.moe_delayed_softmax = routing.delayed_softmax;
-        f.moe_router_scale = routing.scale;
-        f.moe_layer = layer;
-        f.qwen_hidden = c.hidden;
-        f.qwen_moe_width = c.moe_width;
-        f.target = placement.target;
-        return tyloi::ops::qwen4_ffn_weights(std::move(f));
+        f.router = std::move(router);
+        f.shared_gate = std::move(shared_gate);
+        f.shared.gate_up = {std::move(sg), std::move(su)};
+        f.shared.down = std::move(sd);
+        f.routing = c.routing();
+        f.top_k = c.topk;
+        f.layer = layer;
+        require_model(f.router && f.router.dim() == 2 && f.router.size(0) == c.experts &&
+            f.router.size(1) == c.hidden &&
+            f.top_k > 0 && f.top_k <= f.router.size(0) && f.shared_gate &&
+            f.shared.gate_up[0] && f.shared.gate_up[1] && f.shared.down &&
+            f.down && f.down.dim() == 3 && f.down.size(0) == c.experts &&
+            f.down.size(1) == c.hidden && f.down.size(2) == c.moe_width,
+            "Qwen4 shared and routed expert projections are incomplete");
+        return f;
     }
     auto embedding(const std::string &name) const {
         auto table = rows(name);
@@ -151,6 +149,8 @@ std::unique_ptr<Layer> LayerLoader::layer(const Config &c, int layer, bool predi
     LayerLoader loader{*this, yarn, kv_quantization};
     loader.role = "qwen4_exp";
     tyloi::models::qwen4_exp::load_layer(*result, loader, c, layer, predictor);
+    tyloi::weights::prepare_experts(result->ffn.gate_up, result->ffn.down,
+        result->ffn.top_k, result->ffn.swiglu_limit);
     return result;
 }
 

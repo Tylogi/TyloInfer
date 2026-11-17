@@ -1,9 +1,31 @@
 #include "engine/models/qwen4_exp/layer.h"
 #include "engine/models/qwen4_exp/state.h"
+#include "engine/weights/moe/batch.h"
 
+#include <stdexcept>
 #include <utility>
+#include <vector>
 
 namespace tyloi::models::qwen4_exp {
+
+Tensor feed_forward(const Moe& weights, const Tensor& input, std::int64_t projection_rows) {
+    if (!input || input.dim() < 2 || weights.gate_up.empty() ||
+        !weights.router || input.size(-1) != weights.router.size(1))
+        throw std::invalid_argument("invalid Qwen4 FFN input");
+    std::vector<std::int64_t> shape;
+    for (std::int64_t axis = 0; axis < input.dim(); ++axis) shape.push_back(input.size(axis));
+    auto source = ops::contiguous(ops::cast(ops::reshape(input, {-1, input.size(-1)}),
+        ops::Ffn::input_type(weights.gate_up.front(), input.scalar_type())));
+    auto logits = ops::Ffn::project(source, weights.router, projection_rows);
+    auto selected = ops::topk(logits, weights.top_k, weights.routing);
+    tyloi::weights::ExpertBatch batch(weights.gate_up, weights.down, selected.ids,
+        0, source.size(0), weights.activation);
+    const ops::ExpertSpec spec{weights.activation, weights.swiglu_limit, weights.layer};
+    auto output = ops::Ffn::routed_shared(source, selected.weights, batch,
+        weights.shared.gate_up, weights.shared.down, source, weights.shared_gate,
+        spec, projection_rows);
+    return ops::reshape(output, shape);
+}
 
 Tensor forward(const Layer& weights, LayerState& request,
                     Tensor x, const Tensor& ids,
@@ -43,7 +65,7 @@ Tensor forward(const Layer& weights, LayerState& request,
     Tensor ffn_output;
     {
         ::tyloi::ops::ProfileRange range("prefill.ffn", device);
-        ffn_output = tyloi::ops::ffn(weights.ffn, ffn_mix.mixed);
+        ffn_output = tyloi::models::qwen4_exp::feed_forward(weights.ffn, ffn_mix.mixed);
         range.finish();
     }
     ::tyloi::ops::ProfileRange range("prefill.gr_ffn_post", device);

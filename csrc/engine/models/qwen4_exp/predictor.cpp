@@ -199,7 +199,7 @@ std::pair<Tensor, Tensor> Predictor::evaluate(tyloi::models::MtpState& value, co
             x=block.attention_gr.post(attention_output,attention_residual,attention_gate);
             attention_output={};
             auto [ffn_input,ffn_residual,ffn_gate]=block.ffn_gr.pre(x);
-            auto ffn_output=tyloi::ops::ffn(block.ffn,ffn_input);
+            auto ffn_output=tyloi::models::qwen4_exp::feed_forward(block.ffn,ffn_input);
             multi = block.ffn_gr.post(ffn_output,ffn_residual,ffn_gate);
         }
     }
@@ -314,7 +314,7 @@ std::vector<tyloi::models::MtpStep> Predictor::batch_step(
     auto attention = block.qsa->project_output(ops::cat(attended, 0));
     x = block.attention_gr.post(attention, attention_residual, attention_gate);
     auto [ffn_input, ffn_residual, ffn_gate] = block.ffn_gr.pre(x);
-    auto ffn_output = ops::ffn(block.ffn, ffn_input);
+    auto ffn_output = tyloi::models::qwen4_exp::feed_forward(block.ffn, ffn_input);
     auto multi = block.ffn_gr.post(ffn_output, ffn_residual, ffn_gate);
     auto sample = final_mixer->pre(multi).mixed;
 

@@ -80,39 +80,37 @@ void load_moe(Block& block, Loader& ops, const Config& config, int layer,
     block.layer = layer;
     block.rms_norm_eps = config.rms_norm_eps;
     block.ffn_norm = ops.weights.tensor(layer_prefix + "attention.norm.weight");
-    auto& ffn = block.ffn;
-    ffn = models::load_moe_weights(ops, mlp, layer, true, true, true);
-    ffn.moe_top_k = static_cast<int>(config.num_experts_per_tok);
-    ffn.moe_use_sigmoid = true;
-    ffn.moe_use_sqrt_softplus = false;
-    ffn.moe_normalize = config.norm_topk_prob;
-    ffn.moe_delayed_softmax = false;
-    ffn.moe_router_scale = config.routed_scaling_factor;
-    ffn.moe_shared_ungated = true;
+    auto ffn = models::load_moe_weights(ops, mlp, layer, true, true, true);
+    ffn.top_k = static_cast<int>(config.num_experts_per_tok);
+    ffn.routing.activation = tyloi::ops::RouterActivation::sigmoid;
+    ffn.routing.normalize = config.norm_topk_prob;
+    ffn.routing.delayed_softmax = false;
+    ffn.routing.scale = config.routed_scaling_factor;
     const auto rows = static_cast<int64_t>(config.num_routed_experts);
-    const bool expert_shapes = ffn.moe_up && ffn.moe_down && !ffn.moe_gate &&
-        ffn.moe_up.dim() == 3 && ffn.moe_down.dim() == 3 &&
-        ffn.moe_up.size(0) == rows && ffn.moe_down.size(0) == rows &&
-        ffn.moe_up.size(1) == config.moe_intermediate_size &&
-        ffn.moe_up.size(2) == config.moe_latent_size &&
-        ffn.moe_down.size(1) == config.moe_latent_size &&
-        ffn.moe_down.size(2) == config.moe_intermediate_size;
-    const auto router_shape = ops.shape(ffn.moe_router);
+    const bool expert_shapes = ffn.gate_up.size() == 1 && ffn.down &&
+        ffn.gate_up[0].dim() == 3 && ffn.down.dim() == 3 &&
+        ffn.gate_up[0].size(0) == rows && ffn.down.size(0) == rows &&
+        ffn.gate_up[0].size(1) == config.moe_intermediate_size &&
+        ffn.gate_up[0].size(2) == config.moe_latent_size &&
+        ffn.down.size(1) == config.moe_latent_size &&
+        ffn.down.size(2) == config.moe_intermediate_size;
+    const auto router_shape = ops.shape(ffn.router);
     if (!expert_shapes || router_shape.size() != 2 || router_shape[0] != config.num_routed_experts ||
-        router_shape[1] != config.hidden_size || !ffn.moe_latent_in || !ffn.moe_latent_out ||
-        ops.elements(ffn.moe_router_bias) != config.num_routed_experts ||
-        ffn.moe_latent_in.size(0) != config.moe_latent_size ||
-        ffn.moe_latent_in.size(1) != config.hidden_size ||
-        ffn.moe_latent_out.size(0) != config.hidden_size ||
-        ffn.moe_latent_out.size(1) != config.moe_latent_size ||
-        ffn.shared->gate_up.size() != 1 ||
-        ffn.shared->gate_up[0].size(0) != config.moe_shared_intermediate_size ||
-        ffn.shared->down.size(0) != config.hidden_size ||
-        ffn.shared->down.size(1) != config.moe_shared_intermediate_size ||
+        router_shape[1] != config.hidden_size || !ffn.latent_in || !ffn.latent_out ||
+        ops.elements(ffn.router_bias) != config.num_routed_experts ||
+        ffn.latent_in.size(0) != config.moe_latent_size ||
+        ffn.latent_in.size(1) != config.hidden_size ||
+        ffn.latent_out.size(0) != config.hidden_size ||
+        ffn.latent_out.size(1) != config.moe_latent_size ||
+        ffn.shared.gate_up.size() != 1 ||
+        ffn.shared.gate_up[0].size(0) != config.moe_shared_intermediate_size ||
+        ffn.shared.down.size(0) != config.hidden_size ||
+        ffn.shared.down.size(1) != config.moe_shared_intermediate_size ||
         ops.elements(block.ffn_norm) != config.hidden_size) {
         throw std::runtime_error("Nemotron-H MoE tensor shapes disagree with config at layer " +
                                  std::to_string(layer));
     }
+    block.ffn = std::move(ffn);
 }
 
 // The dense relu-squared MLP block of the same family shares the canonical
@@ -125,7 +123,7 @@ void load_dense_mlp(Block& block, Loader& ops, const Config& config, int layer,
     block.layer = layer;
     block.rms_norm_eps = config.rms_norm_eps;
     block.ffn_norm = ops.weights.tensor(layer_prefix + "attention.norm.weight");
-    auto& ffn = block.ffn;
+    models::Mlp ffn;
     ffn.down = ops.linear(mlp + "down.weight");
     ffn.gate_up = ops.gate_up({mlp + "up.weight"}, ffn.down);
     ffn.activation = tyloi::ops::MlpActivation::relu_squared;
@@ -135,6 +133,7 @@ void load_dense_mlp(Block& block, Loader& ops, const Config& config, int layer,
         throw std::runtime_error("Nemotron-H dense MLP shapes disagree with config at layer " +
                                  std::to_string(layer));
     }
+    block.ffn = std::move(ffn);
 }
 
 inline void load_config(std::string_view payload, const ModelGraph& graph, Config& config,

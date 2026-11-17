@@ -49,6 +49,12 @@ namespace tyloi::models::qwen4_exp {
 using namespace ::tyloi::cuda;
 namespace {
 
+bool routed_graph_supported(const tyloi::models::Moe& weights) {
+    if (weights.gate_up.size() != 2 || !weights.down) return false;
+    const auto banks = ::tq_banks(weights.gate_up[0], weights.gate_up[1], weights.down);
+    return banks.gate && banks.up && banks.down;
+}
+
 struct GraphCheckpoint {
     std::vector<::tyloi::Tensor> gdn_conv, gdn_state;
     std::vector<::tyloi::Tensor> ple_conv;
@@ -495,7 +501,7 @@ struct Qwen4DecodeGraph final : DecodeGraph {
                             auto ffn_result=graph_attention(b,layer_state,std::move(hidden),cell.ids,cell.positions,
                                 cell.cache_positions,rows,layer,confirmed,confirmed?&cell.checkpoints[layer]:nullptr,pending_residual);
                             const auto& ffn_input=ffn_result.mixed;
-                            auto ffn_output=tyloi::ops::ffn(b.ffn,ffn_input).dense();
+                            auto ffn_output=tyloi::models::qwen4_exp::feed_forward(b.ffn,ffn_input).dense();
                             if(defer) {
                                 next_residual=std::move(ffn_result);
                                 hidden=std::move(ffn_output);
@@ -602,7 +608,7 @@ tyloi::StepSequence<tyloi::models::Decoded> qwen4_exp::Model::decode(
         (input.confirmed && input.confirmed>=ids.size(1))) co_return;
     if(options.routed && !tq_graph_supports_tokens(ids.size(1)))co_return;
     for(const auto& block:layers)
-        if(block->device != device || ((hidden || options.routed) && (!block->ffn.qwen_tq ||
+        if(block->device != device || ((hidden || options.routed) && (!routed_graph_supported(block->ffn) ||
             (block->ple && !block->ple->graph_supported())))) co_return;
     TYLOINFER_RUNTIME_CHECK(state.cache_pos+ids.size(1)<=max_position_embeddings(),"MFQ window exceeds context");
     state.decode_reserve_until=options.reserve_until;
@@ -624,7 +630,7 @@ tyloi::StepSequence<tyloi::models::Decoded> qwen4_exp::Model::warmup(
         max_position_embeddings()<32 || !streamed_decode_graphs()) co_return;
     for(std::size_t i=0;i<layers.size();++i) {
         const auto& block=*layers[i];
-        if(block.device != device || !block.ffn.qwen_tq || (block.qsa && !block.qsa->graph_capacity(*state.layers[i]->qsa)) ||
+        if(block.device != device || !routed_graph_supported(block.ffn) || (block.qsa && !block.qsa->graph_capacity(*state.layers[i]->qsa)) ||
             (block.ple && !block.ple->graph_supported())) co_return;
     }
     struct Reset {
@@ -933,7 +939,7 @@ tyloi::StepSequence<::tyloi::Tensor> Qwen4BatchDecodeGraph::run(
                 graph.window->mark(static_cast<int>(i),"attention_core_end");
                 auto ffn_mix = block.ffn_gr.pre_after(std::move(attention),mix.residual,mix.gate,tyloi::ops::ResidualRole::ffn);
                 graph.window->mark(static_cast<int>(i),"ffn_pre_end");
-                auto ffn_output=tyloi::ops::batch_ffn(block.ffn,ffn_mix.mixed).dense();
+                auto ffn_output=tyloi::models::qwen4_exp::feed_forward(block.ffn,ffn_mix.mixed).dense();
                 bool defer=false;
                 if(chain_post && i+1<model.layers.size()) {
                     const auto& next=*model.layers[i+1];
@@ -1287,14 +1293,14 @@ tyloi::StepSequence<tyloi::models::Prefill> qwen4_exp::Model::prefill(
             {
                 tyloi::ops::ProfileRange range("prefill.ffn");
                 if(expert_batch_count(tokens)==tokens) {
-                    ffn_output=tyloi::ops::ffn(qwen_block.ffn,ffn_inputs,{}, {}, reference_rows).dense();
+                    ffn_output=tyloi::models::qwen4_exp::feed_forward(qwen_block.ffn,ffn_inputs,reference_rows).dense();
                 } else {
                     for(int64_t begin=0;begin<tokens;) {
                         auto count=expert_batch_count(tokens-begin);
                         const auto tail=tokens-begin-count;
                         // Keep tiny tails in the prefill path to retain shared prefill images.
                         if(tail>0 && tail<=8)count-=16-tail;
-                        auto part=tyloi::ops::ffn(qwen_block.ffn,ffn_inputs.narrow(1,begin,count),{}, {}, reference_rows).dense();
+                        auto part=tyloi::models::qwen4_exp::feed_forward(qwen_block.ffn,ffn_inputs.narrow(1,begin,count),reference_rows).dense();
                         if(!ffn_output.defined()) {
                             auto shape=part.sizes().vec();shape[1]=tokens;
                             ffn_output=::tyloi::cuda::empty(shape,part.options());
@@ -1311,7 +1317,7 @@ tyloi::StepSequence<tyloi::models::Prefill> qwen4_exp::Model::prefill(
                 for(int64_t begin=0;begin<tokens;begin+=compute_chunk) {
                     const auto count=std::min(compute_chunk,tokens-begin);
                     expected.narrow(1,begin,count).copy_(
-                        tyloi::ops::ffn(qwen_block.ffn,ffn_inputs.narrow(1,begin,count),{}, {}, reference_rows).dense());
+                        tyloi::models::qwen4_exp::feed_forward(qwen_block.ffn,ffn_inputs.narrow(1,begin,count),reference_rows).dense());
                 }
                 auto a=ffn_output.to(::tyloi::kCPU,::tyloi::kFloat32).contiguous();
                 auto b=expected.to(::tyloi::kCPU,::tyloi::kFloat32).contiguous();

@@ -1,7 +1,7 @@
 #pragma once
 
 #include "engine/models/source/model_config.h"
-#include "engine/ops/ffn.h"
+#include "engine/models/common/ffn.h"
 #include "engine/ops/ops.h"
 
 #include <memory>
@@ -12,15 +12,13 @@
 
 namespace tyloi::models {
 
-struct Mlp;
-
 enum class ExpertProjection { gate, up, gate_up, down };
 
 // Canonical parameter relationships are shared; the loader materializes native
 // weights and chooses packing, projection fusion and device placement.
-template <class Ffn, class Loader>
-Ffn load_dense_ffn(Loader& ops, const ModelConfig& config, const std::string& prefix) {
-    Ffn result;
+template <class Loader>
+Mlp load_dense_ffn(Loader& ops, const ModelConfig& config, const std::string& prefix) {
+    Mlp result;
     const auto down = prefix + "down.weight", gate = prefix + "gate.weight",
                up = prefix + "up.weight";
     result.down = ops.linear(down);
@@ -54,49 +52,44 @@ bool has_moe_latent(Loader& ops, const std::string& prefix, int layer) {
 // Routed banks may be gated (gate/up or fused gate_up) or ungated (up only).
 // An ungated expert's activation is relu^2, never a gate projection alias.
 template <class Loader>
-tyloi::ops::FfnWeights load_moe_weights(Loader& ops, const std::string& prefix, int layer,
+Moe load_moe_weights(Loader& ops, const std::string& prefix, int layer,
                     bool router_bias_required = false, bool ungated_experts = false,
                     bool ungated_shared = false) {
     const auto gate_up = prefix + "experts.gate_up.weight", gate = prefix + "experts.gate.weight",
                up = prefix + "experts.up.weight", down = prefix + "experts.down.weight";
     const bool has_up = ops.has(up), has_down = ops.has(down);
     const bool has_gate = ops.has(gate), has_gate_up = ops.has(gate_up);
-    tyloi::ops::FfnWeights result;
-    result.is_moe = true;
-    result.moe_layer = layer;
+    Moe result;
+    result.layer = layer;
     if (ungated_experts) {
         if (!has_up || !has_down || has_gate || has_gate_up)
             throw std::runtime_error(
                 "ungated routed MoE requires only Up and Down at layer " +
                 std::to_string(layer));
-        result.moe_ungated_experts = true;
-        // Up lives in the split slot so prefetch/cache code sees a real
-        // single projection instead of an empty fused pair.
-        result.moe_split_gate_up = true;
+        // Up is the sole routed projection and relu-squared supplies its activation.
+        result.gate_up = {ops.expert(ExpertProjection::up, up, layer)};
         result.activation = tyloi::ops::MlpActivation::relu_squared;
-        ops.experts(result, ExpertProjection::up, up, layer);
     } else {
         const bool split = split_experts(ops, prefix, layer);
-        result.moe_split_gate_up = split;
         if (split) {
-            ops.experts(result, ExpertProjection::gate, gate, layer);
-            ops.experts(result, ExpertProjection::up, up, layer);
+            result.gate_up = {
+                ops.expert(ExpertProjection::gate, gate, layer),
+                ops.expert(ExpertProjection::up, up, layer)};
         } else {
-            ops.experts(result, ExpertProjection::gate_up, gate_up, layer);
+            result.gate_up = {ops.expert(ExpertProjection::gate_up, gate_up, layer)};
         }
     }
-    ops.experts(result, ExpertProjection::down, down, layer);
+    result.down = ops.expert(ExpertProjection::down, down, layer);
     const auto latent_in = prefix + "latent.down.weight";
     const auto latent_out = prefix + "latent.up.weight";
     if (has_moe_latent(ops, prefix, layer)) {
-        result.moe_latent_in = ops.linear(latent_in);
-        result.moe_latent_out = ops.linear(latent_out);
+        result.latent_in = ops.linear(latent_in);
+        result.latent_out = ops.linear(latent_out);
     }
-    result.moe_router = ops.router_parameter(prefix + "router.weight");
+    result.router = ops.router_parameter(prefix + "router.weight");
     if (router_bias_required || ops.has(prefix + "router.bias"))
-        result.moe_router_bias = ops.router_parameter(prefix + "router.bias");
-    result.shared = std::make_unique<tyloi::ops::FfnWeights>();
-    result.shared->down = ops.linear(prefix + "shared_expert.down.weight");
+        result.router_bias = ops.router_parameter(prefix + "router.bias");
+    result.shared.down = ops.linear(prefix + "shared_expert.down.weight");
     const auto shared_gate = prefix + "shared_expert.gate.weight";
     const auto shared_up = prefix + "shared_expert.up.weight";
     if (ungated_shared) {
@@ -104,10 +97,10 @@ tyloi::ops::FfnWeights load_moe_weights(Loader& ops, const std::string& prefix, 
             throw std::runtime_error(
                 "ungated shared expert requires Up without a Gate at layer " +
                 std::to_string(layer));
-        result.shared->activation = tyloi::ops::MlpActivation::relu_squared;
-        result.shared->gate_up = ops.gate_up({shared_up}, result.shared->down);
+        result.shared.activation = tyloi::ops::MlpActivation::relu_squared;
+        result.shared.gate_up = ops.gate_up({shared_up}, result.shared.down);
     } else {
-        result.shared->gate_up = ops.gate_up({shared_gate, shared_up}, result.shared->down);
+        result.shared.gate_up = ops.gate_up({shared_gate, shared_up}, result.shared.down);
     }
     return result;
 }
@@ -167,14 +160,10 @@ struct TransformerWeightLoader {
     std::vector<::tyloi::Tensor> gate_up(const std::vector<std::string>& names, const ::tyloi::Tensor& down) const;
     void qkv(tyloi::models::FullAttention& attention, const std::vector<std::string>& names) const;
     void output(tyloi::models::FullAttention& attention, const std::string& name) const;
-    void important_neurons(int64_t hidden, int64_t intermediate, tyloi::ops::FfnWeights& ffn,
-        const std::string& down, const std::string& gate, const std::string& up) const;
     void important_neurons(int64_t hidden, int64_t intermediate, tyloi::models::Mlp& ffn,
         const std::string& down, const std::string& gate, const std::string& up) const;
     ::tyloi::Tensor expert(tyloi::models::ExpertProjection projection,
                            const std::string& name, int layer) const;
-    void experts(tyloi::ops::FfnWeights& ffn, tyloi::models::ExpertProjection projection,
-                 const std::string& name, int layer) const;
     ::tyloi::Tensor headwise(const std::string& name) const;
     static std::vector<std::int64_t> shape(const ::tyloi::DenseTensor& value);
     static int64_t elements(const ::tyloi::DenseTensor& value);
@@ -194,7 +183,7 @@ struct MoeWeightLoadOptions {
     std::size_t shared_gate_up_compatible_prefix = 2;
 };
 
-tyloi::ops::FfnWeights load_moe_weights(
+tyloi::models::Moe load_moe_weights(
     const tyloi::weights::Loader& weights,
     std::string_view prefix,
     const MoeWeightLoadOptions& options);

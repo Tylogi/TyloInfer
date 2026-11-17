@@ -1,4 +1,5 @@
 #include "engine/ops/ops.h"
+#include "engine/ops/ffn.h"
 #include "engine/backends/metal/native/tensor/tensor.h"
 #include "engine/backends/metal/ops/attention/attention.h"
 #include "engine/backends/metal/ops/attention/kv.h"
@@ -50,22 +51,22 @@ static Tensor mlp_impl(const Tensor& input, std::span<const Tensor> weights, con
     }
     return project(hidden, down);
 }
-Tensor mlp(const Tensor& input, std::span<const Tensor> weights, const Tensor& down,
-           MlpActivation activation, double limit) {
-    return mlp_impl(cast(input, kFloat16), weights, down, activation, limit);
+Tensor Ffn::dense(const Tensor& input, std::span<const Tensor> weights, const Tensor& down,
+                  MlpActivation activation, double limit) {
+    return mlp_impl(input, weights, down, activation, limit);
 }
-Tensor bf16_mlp(const Tensor& value, std::span<const Tensor> weights, const Tensor& down,
-                MlpActivation activation, double limit) {
+Tensor Ffn::bf16(const Tensor& value, std::span<const Tensor> weights, const Tensor& down,
+                 MlpActivation activation, double limit) {
     return cast(mlp_impl(value, weights, down, activation, limit), kBFloat16);
 }
-Tensor additive_mlp(const Tensor& value, std::span<const Tensor> weights, const Tensor& down,
-        MlpActivation activation, double limit, std::span<const Tensor> extra, const Tensor& extra_down,
-        MlpActivation extra_activation, double extra_limit) {
-    return add(mlp(value, weights, down, activation, limit),
-               mlp(value, extra, extra_down, extra_activation, extra_limit));
+Tensor Ffn::additive(const Tensor& value, std::span<const Tensor> weights, const Tensor& down,
+                     MlpActivation activation, double limit, std::span<const Tensor> extra,
+                     const Tensor& extra_down, MlpActivation extra_activation, double extra_limit) {
+    return add(Ffn::dense(value, weights, down, activation, limit),
+               Ffn::dense(value, extra, extra_down, extra_activation, extra_limit));
 }
-std::optional<Tensor> mlp_residual(const Tensor&, const Tensor&, std::span<const Tensor>, const Tensor&,
-                                   MlpActivation, double, bool) { return std::nullopt; }
+std::optional<Tensor> Ffn::residual(const Tensor&, const Tensor&, std::span<const Tensor>, const Tensor&,
+                                    MlpActivation, double, bool) { return std::nullopt; }
 std::optional<std::vector<Tensor>> linear_shared(const Tensor&, std::span<const Tensor>,
                                                   const Tensor&, std::span<const Tensor>) { return std::nullopt; }
 Tensor silu_project(const Tensor& input, const Tensor& gate, const Tensor& weight) {
@@ -203,6 +204,10 @@ SelectedExperts topk(const Tensor& logits, std::int64_t count, const MoeRouting&
         routing.normalize, routing.delayed_softmax, b, std::nullopt, 1e-20f,
         static_cast<float>(routing.scale), false);
     return {tensor(std::move(result.ids)), tensor(std::move(result.weights))};
+}
+
+SelectedExperts hash_route(const Tensor&, const Tensor&, const Tensor&, double) {
+    throw std::invalid_argument("Metal hash routing is unsupported");
 }
 
 Tensor norm_rope_kv(const AttentionInput&, const state::KvView&, const RopeTable&,

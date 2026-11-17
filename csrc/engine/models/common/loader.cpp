@@ -89,7 +89,7 @@ void TransformerWeightLoader::output(tyloi::models::FullAttention& block, const 
 void TransformerWeightLoader::important_neurons(int64_t hidden, int64_t intermediate,
     tyloi::models::Mlp& ffn, const std::string& down,
     const std::string& gate, const std::string& up) const {
-    tyloi::models::load_important_branch(weights, hidden, intermediate, ffn, false,
+    tyloi::models::load_important_branch(weights, hidden, intermediate, ffn,
         down, gate, up);
 }
 ::tyloi::Tensor TransformerWeightLoader::expert(tyloi::models::ExpertProjection projection,

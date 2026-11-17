@@ -1,6 +1,7 @@
 #pragma once
 
 #include "engine/models/common/ffn.h"
+#include "engine/ops/ffn.h"
 
 #include <stdexcept>
 #include <type_traits>
@@ -13,16 +14,16 @@ Tensor feed_forward(const Moe& weights, const Tensor& input, bool bf16, bool ser
 inline Tensor dense_ffn(const Mlp& weights, const Tensor& input, bool bf16) {
     if (!weights.down) throw std::runtime_error("FFN down projection is missing");
     if (bf16)
-        return ops::bf16_mlp(input, weights.gate_up, weights.down,
+        return ops::Ffn::bf16(input, weights.gate_up, weights.down,
             weights.activation, weights.swiglu_limit);
     if (weights.important_neurons) {
         const auto& extra = *weights.important_neurons;
         if (!extra.down) throw std::runtime_error("FFN down projection is missing");
-        return ops::additive_mlp(input, weights.gate_up, weights.down,
+        return ops::Ffn::additive(input, weights.gate_up, weights.down,
             weights.activation, weights.swiglu_limit, extra.gate_up, extra.down,
             extra.activation, extra.swiglu_limit);
     }
-    return ops::mlp(input, weights.gate_up, weights.down,
+    return ops::Ffn::dense(input, weights.gate_up, weights.down,
         weights.activation, weights.swiglu_limit);
 }
 
@@ -40,7 +41,7 @@ Tensor full(const Weights& weights, const Tensor& norm,
     if constexpr (!std::is_same_v<Weights, Moe>) {
         if (!bf16 && !weights.important_neurons) {
             auto flat_residual = ops::reshape(pair[0], {batch * tokens, width});
-            if (auto fused = ops::mlp_residual(input, flat_residual, weights.gate_up,
+            if (auto fused = ops::Ffn::residual(input, flat_residual, weights.gate_up,
                     weights.down, weights.activation, weights.swiglu_limit))
                 return ops::reshape(*fused, {batch, tokens, width});
         }
@@ -62,7 +63,7 @@ Tensor linear(const Weights& weights, const Tensor& norm,
     if constexpr (!std::is_same_v<Weights, Moe>) {
         if (!weights.important_neurons) {
             auto flat_residual = ops::reshape(pair[0], {batch * tokens, width});
-            if (auto fused = ops::mlp_residual(input, flat_residual, weights.gate_up,
+            if (auto fused = ops::Ffn::residual(input, flat_residual, weights.gate_up,
                     weights.down, weights.activation, weights.swiglu_limit, true))
                 return ops::reshape(*fused, {batch, tokens, width});
         }

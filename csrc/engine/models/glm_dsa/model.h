@@ -6,7 +6,7 @@
 #include "engine/models/source/model_graph.h"
 #include "engine/models/source/model.h"
 #include "engine/backends/cuda/ops/rope/rope.h"
-#include "engine/ops/ffn.h"
+#include "engine/models/common/ffn.h"
 #include "engine/weights/moe/experts.h"
 
 #include <memory>
@@ -26,7 +26,7 @@ struct Layer {
     std::vector<::tyloi::Tensor> input_proj, q_proj;
     ::tyloi::Tensor embed_q, unembed_out;
     ::tyloi::Tensor o_proj;
-    ::tyloi::ops::FfnWeights ffn;
+    ::tyloi::models::Ffn ffn;
 };
 
 struct Model

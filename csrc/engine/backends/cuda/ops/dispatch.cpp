@@ -1,9 +1,11 @@
 #include "engine/ops/ops.h"
+#include "engine/ops/ffn.h"
 
 #include "engine/backends/cuda/executor/executor.h"
 #include "engine/weights/moe/batch_internal.h"
 #include "engine/weights/moe/experts.h"
 #include "engine/backends/cuda/ops/ffn/tq/banks.h"
+#include "engine/backends/cuda/ops/ffn/tq/routed.h"
 #include "engine/backends/cuda/native/collectives.h"
 #include "engine/backends/cuda/ops/ffn/experts/moe.h"
 #include "engine/backends/cuda/ops/ffn/mlp.h"
@@ -339,26 +341,23 @@ Tensor weighted_reduce(const Tensor& pairs_tensor, const Tensor& weights_tensor)
     require_cuda(pairs);
     return owner(cuda::ops::weighted_reduce(pairs, weights));
 }
-RoutedExperts routed(const Tensor& input_tensor, const Tensor& input_f32_tensor,
-                     const Tensor& weights_tensor, weights::ExpertBatch& batch, const ExpertSpec& spec) {
+RoutedExperts Ffn::routed(const Tensor& input_tensor, const Tensor& weights_tensor,
+                     weights::ExpertBatch& batch, const ExpertSpec& spec) {
     if (!batch.impl_) throw std::invalid_argument("expert batch has been moved");
     auto& b = *batch.impl_;
-    const auto& x = dense(input_tensor);
-    const auto& xf32 = dense(input_f32_tensor);
-    const auto& weights = dense(weights_tensor);
-    const auto& ids = dense(b.ids);
-    compatible(input_tensor, input_f32_tensor);
+    const auto& x = ::tyloi::ops::dense(input_tensor);
+    const auto& weights = ::tyloi::ops::dense(weights_tensor);
+    const auto& ids = ::tyloi::ops::dense(b.ids);
+    if (!std::isfinite(spec.swiglu_limit) || spec.swiglu_limit < 0)
+        throw std::invalid_argument("routed expert clamp must be finite and nonnegative");
     compatible(input_tensor, weights_tensor);
     compatible(input_tensor, b.ids);
-    compatible(input_tensor, spec.shared_gate);
     require_cuda(input_tensor);
     if (x.dim() != 2 || x.scalar_type() != kFloat16 || !x.is_contiguous() ||
-        xf32.sizes() != x.sizes() || xf32.scalar_type() != kFloat32 || !xf32.is_contiguous() ||
         ids.dim() != 2 || ids.scalar_type() != kInt32 || ids.size(0) != x.size(0) ||
         ids.size(1) <= 0 || weights.sizes() != ids.sizes() || weights.scalar_type() != kFloat32 ||
         !ids.is_contiguous() || !weights.is_contiguous() || x.size(0) <= 0 || x.size(1) <= 0 ||
-        spec.shared_gate.dim() != 2 || spec.shared_gate.size(0) != 1 ||
-        spec.shared_gate.size(1) != x.size(1) || dense(spec.shared_gate).scalar_type() != kFloat32)
+        (spec.activation == MlpActivation::relu_squared) != b.ungated)
         throw std::invalid_argument("routed expert input geometry mismatch");
     const auto& gate_bank = b.gate_up_weights;
     if (gate_bank.empty() || !b.down_weight.defined())
@@ -366,22 +365,21 @@ RoutedExperts routed(const Tensor& input_tensor, const Tensor& input_f32_tensor,
     const auto& gate = gate_bank[0];
     const auto& up = b.split ? gate_bank[1] : gate_bank[0];
     const auto& down = b.down_weight;
-    const bool dense_routed = bool(b.dense_gate) || bool(b.dense_up) || bool(b.dense_down);
+    const bool dense_routed = bool(b.dense_gate) || bool(b.dense_up) ||
+        bool(b.dense_gate_up) || bool(b.dense_down);
     const bool tq_routed = bool(b.tq.gate || b.tq.up || b.tq.down);
-    if ((spec.latent_in.defined() && (spec.latent_in.dim() != 2 || spec.latent_in.size(1) != x.size(1))) ||
-        (spec.latent_out.defined() && spec.latent_out.dim() != 2))
-        throw std::invalid_argument("routed expert latent geometry mismatch");
-    const auto input_width = spec.latent_in.defined() && (dense_routed || tq_routed || b.sharded)
-        ? spec.latent_in.size(0) : x.size(1);
+    if ((b.ungated && spec.swiglu_limit != 0) ||
+        (spec.activation == MlpActivation::gelu_gated &&
+         (tq_routed || b.sharded || !dense_routed)))
+        throw std::invalid_argument("unsupported routed expert activation or clamp");
     if (gate.dim() != 3 || up.dim() != 3 || down.dim() != 3 ||
         gate.size(0) <= 0 || gate.size(0) != up.size(0) || gate.size(0) != down.size(0) ||
-        gate.size(2) != input_width || up.size(2) != input_width ||
+        gate.size(2) != x.size(1) || up.size(2) != x.size(1) ||
         gate.size(1) <= 0 || up.size(1) <= 0 || down.size(1) <= 0 ||
-        (b.split ? gate.size(1) != up.size(1) || down.size(2) != up.size(1)
-                 : gate.size(1) % 2 != 0 || down.size(2) != gate.size(1) / 2) ||
-        (spec.latent_out.defined() && (dense_routed || tq_routed || b.sharded) &&
-         (spec.latent_out.size(1) != down.size(1) || spec.latent_out.size(0) != x.size(1))) ||
-        ((!spec.latent_out.defined() || (!dense_routed && !tq_routed && !b.sharded)) && down.size(1) != x.size(1)))
+        (b.ungated ? down.size(2) != up.size(1) :
+         (b.split ? gate.size(1) != up.size(1) || down.size(2) != up.size(1)
+                  : gate.size(1) % 2 != 0 || down.size(2) != gate.size(1) / 2)) ||
+        down.size(1) != x.size(1))
         throw std::invalid_argument("routed expert bank geometry mismatch");
     auto& executor = cuda::Executor::current();
     const auto& mode = cuda::Executor::current_ffn();
@@ -390,72 +388,87 @@ RoutedExperts routed(const Tensor& input_tensor, const Tensor& input_f32_tensor,
     auto& stats = executor.routes();
     const auto& options = executor.options().ffn;
     const auto& projection = executor.options().projection;
-    DenseTensor logits;
-    auto shared_gate = [&] {
-        if (!logits.defined())
-            logits = profiler.measure("moe.shared_gate", [&] {
-                return cuda::matmul(xf32, dense(spec.shared_gate).transpose(0, 1)).contiguous();
-            });
-    };
-    if (!b.split) shared_gate();
     b.ready();
-    const bool latent_routed = !dense_routed && spec.latent_in.defined();
-    if (latent_routed && !spec.latent_out.defined())
-        throw std::runtime_error("MoE latent output projection is missing");
     auto routed_input = x;
-    if (latent_routed)
-        routed_input = profiler.measure("moe.latent_down", [&] { return project.run(spec.latent_in, x); });
-    auto finish_latent = [&](DenseTensor value) {
-        if (latent_routed)
-            return profiler.measure("moe.latent_up", [&] { return project.run(spec.latent_out, value); });
-        return value;
-    };
     DenseTensor result;
     bool reduced = false;
     if (b.tq.gate || b.tq.up || b.tq.down) {
-        if (!b.tq.up || !b.tq.down || !b.tq.gate)
+        if (!b.tq.up || !b.tq.down || (!b.ungated && !b.tq.gate) || (b.ungated && b.tq.gate))
             throw std::runtime_error("TQ routed FFN requires matching Gate, Up and Down projections");
-        result = profiler.measure("moe.tq", [&] {
-            return project.run(b.tq, routed_input, ids, weights, static_cast<float>(spec.swiglu_limit));
-        });
-        result = finish_latent(std::move(result));
+        if (b.ungated) {
+            auto up_value = profiler.measure("moe.tq_up", [&] {
+                return tq_ops::routed_projection(*b.tq.up, routed_input, ids);
+            });
+            auto hidden = profiler.measure("moe.tq_activation", [&] {
+                return cuda::expert_activation(spec.activation, {}, std::move(up_value), 0);
+            });
+            auto pairs = profiler.measure("moe.tq_down", [&] {
+                return tq_ops::routed_projection(*b.tq.down, hidden, ids);
+            });
+            result = profiler.measure("moe.tq_reduce", [&] {
+                return moe_weighted_reduce_cuda(pairs, weights);
+            });
+        } else {
+            result = profiler.measure("moe.tq", [&] {
+                return project.run(b.tq, routed_input, ids, weights,
+                                   static_cast<float>(spec.swiglu_limit));
+            });
+        }
         reduced = true;
     } else if (dense_routed) {
-        if (!b.dense_gate || !b.dense_up || !b.dense_down)
-            throw std::runtime_error("gated dense routed MoE requires Gate, Up and Down banks");
+        if (!b.dense_down || (b.ungated && !b.dense_up) ||
+            (!b.ungated && !b.dense_gate && !b.dense_gate_up))
+            throw std::runtime_error("dense routed MoE requires compatible Gate, Up and Down banks");
         auto expert_input = x;
-        if (spec.latent_in.defined())
-            expert_input = profiler.measure("moe.latent_down", [&] { return project.run(spec.latent_in, x); });
-        auto up_value = profiler.measure("moe.dense_up", [&] { return ::dense_routed_projection(*b.dense_up, expert_input, ids); });
-        auto gate_value = profiler.measure("moe.dense_gate", [&] { return ::dense_routed_projection(*b.dense_gate, expert_input, ids); });
+        DenseTensor up_value;
+        DenseTensor gate_value;
+        if (b.dense_gate_up) {
+            auto gate_up = profiler.measure("moe.dense_gate_up", [&] {
+                return ::dense_routed_projection(*b.dense_gate_up, expert_input, ids);
+            });
+            const auto width = gate_up.size(-1) / 2;
+            gate_value = gate_up.narrow(-1, 0, width);
+            up_value = gate_up.narrow(-1, width, width);
+        } else {
+            up_value = profiler.measure("moe.dense_up", [&] {
+                return ::dense_routed_projection(*b.dense_up, expert_input, ids);
+            });
+        }
+        if (!b.ungated && !b.dense_gate_up)
+            gate_value = profiler.measure("moe.dense_gate", [&] { return ::dense_routed_projection(*b.dense_gate, expert_input, ids); });
         auto hidden = profiler.measure("moe.dense_activation", [&] {
-            return cuda::expert_activation(MlpActivation::silu_gated, std::move(gate_value), std::move(up_value), spec.swiglu_limit);
+            return cuda::expert_activation(spec.activation, std::move(gate_value), std::move(up_value), spec.swiglu_limit);
         });
         auto pairs = profiler.measure("moe.dense_down", [&] { return ::dense_routed_projection(*b.dense_down, hidden, ids); });
         result = profiler.measure("moe.dense_reduce", [&] { return moe_weighted_reduce_cuda(pairs, weights); });
-        if (spec.latent_out.defined())
-            result = profiler.measure("moe.latent_up", [&] { return project.run(spec.latent_out, result); });
-        stats.record(spec.layer, ids, weights, pairs, static_cast<int>(b.dense_up->size(0)));
+        stats.record(spec.layer, ids, weights, pairs,
+                     static_cast<int>((b.dense_up ? b.dense_up : b.dense_gate_up)->size(0)));
         reduced = true;
     }
 #if TYLOINFER_ENABLE_MFQ_COMPAT
     else if (b.sharded) {
         auto& collectives = executor.collectives();
-        const size_t count = b.gate_up->shards.size();
+        const auto& first = b.ungated ? b.up : b.gate_up;
+        TYLOINFER_RUNTIME_CHECK(first, "sharded routed expert bank is missing");
+        const size_t count = first->shards.size();
         std::vector<DenseTensor> partials(count), down_partials;
         const bool energy = stats.energy();
         if (energy) down_partials.resize(count);
         result = profiler.measure("moe.sharded_experts", [&] {
             for (size_t pos = 0; pos < count; ++pos) {
                 const auto index = ::parallel_index(projection.peer_first, pos, count);
-                const auto& gs = b.gate_up->shards[index];
+                const auto& gs = first->shards[index];
                 const auto& ds = b.down->shards[index];
                 MfqCudaGuard guard(gs.device);
                 auto local_x = collectives.copy(routed_input, gs.device);
                 auto local_weights = collectives.copy(weights, gs.device);
                 const auto& route = ::moe_route_to_device(collectives, b.route, gs.device);
                 DenseTensor pairs;
-                if (spec.swiglu_limit <= 0 && !mode.materialized && cuda::supports_projection_glu_epilogue(*gs.weight)) {
+                if (b.ungated) {
+                    auto up_value = project.run(*gs.weight, local_x, route);
+                    auto hidden = ::relu_squared_cuda(up_value);
+                    pairs = project.run(*ds.weight, hidden, route);
+                } else if (spec.swiglu_limit <= 0 && !mode.materialized && cuda::supports_projection_glu_epilogue(*gs.weight)) {
                     auto hidden = project.glu(*gs.weight, local_x, route, false);
                     pairs = project.run(*ds.weight, hidden, route);
                 } else {
@@ -484,15 +497,13 @@ RoutedExperts routed(const Tensor& input_tensor, const Tensor& input_f32_tensor,
             if (stats.enabled()) {
                 DenseTensor complete;
                 if (energy) complete = collectives.sum(std::move(down_partials), project.primary_device(), projection.reduce_to_primary, projection.fp16_reduce);
-                stats.record(spec.layer, b.route.ids, weights, complete, b.gate_up->n_experts);
+                stats.record(spec.layer, b.route.ids, weights, complete, first->n_experts);
             }
             return collectives.sum(std::move(partials), project.primary_device(), projection.reduce_to_primary, projection.fp16_reduce);
         });
-        if (latent_routed && result.dim() == 3) result = moe_weighted_reduce_cuda(result, weights);
-        result = finish_latent(std::move(result));
         reduced = true;
     } else {
-        // shortcut: local MFQ retains its legacy latent behavior until numerical validation.
+        // Local MFE keeps the cache, staging and fusion path for selected experts.
         auto active_gate_up = b.gate_up, active_gate = b.gate, active_up = b.up;
         DenseTensor gu, hidden;
         if (b.split) {
@@ -504,10 +515,15 @@ RoutedExperts routed(const Tensor& input_tensor, const Tensor& input_f32_tensor,
                 TYLOINFER_RUNTIME_CHECK(active_gate, "MFE input must be contiguous CUDA f16 with exact K");
                 auto g = project.run(*active_gate, x, b.route);
                 if (!b.bundle_prefetched && active_up) cuda::prefetch_experts(*active_up, b.route);
-                shared_gate();
                 TYLOINFER_RUNTIME_CHECK(active_up, "MFE input must be contiguous CUDA f16 with exact K");
                 auto u = reuse ? project.run(*active_up, x, b.route, true) : project.run(*active_up, x, b.route);
                 return cuda::cat({g, u}, -1).contiguous();
+            });
+        } else if (b.ungated) {
+            if (b.cpu_up) active_up = b.stage(b.cpu_up, "moe.cpu_offload_up_h2d");
+            hidden = profiler.measure("moe.up_relu_squared", [&] {
+                TYLOINFER_RUNTIME_CHECK(active_up, "MFE input must be contiguous CUDA f16 with exact K");
+                return ::relu_squared_cuda(project.run(*active_up, x, b.route));
             });
         } else {
             if (b.cpu_gate_up) active_gate_up = b.stage(b.cpu_gate_up, "moe.cpu_offload_gate_up_h2d");
@@ -552,41 +568,61 @@ RoutedExperts routed(const Tensor& input_tensor, const Tensor& input_f32_tensor,
                 });
             }
         }
-        stats.record(spec.layer, ids, weights, result, b.split ? b.gate->n_experts : b.gate_up->n_experts);
+        stats.record(spec.layer, ids, weights, result,
+                     b.split ? b.gate->n_experts : (b.ungated ? b.up->n_experts : b.gate_up->n_experts));
         active_down.reset();
     }
 #else
     else throw std::runtime_error("Legacy MFQ inference requires a compatibility build");
 #endif
-    shared_gate();
-    return {owner(std::move(result)), owner(std::move(logits)), reduced};
+    return {owner(std::move(result)), reduced};
 }
 
-Tensor combine_experts(const RoutedExperts& experts, const Tensor& weights_tensor, const Tensor& shared_tensor) {
-    const auto& values = dense(experts.values);
-    const auto& weights = dense(weights_tensor);
-    const auto& shared = dense(shared_tensor);
-    const auto& logits = dense(experts.shared_logits);
+Tensor Ffn::combine(const RoutedExperts& experts, const Tensor& weights_tensor,
+                    const Tensor& shared_tensor, const Tensor& shared_logits_tensor) {
+    const auto& values = ::tyloi::ops::dense(experts.values);
+    const auto& weights = ::tyloi::ops::dense(weights_tensor);
+    const auto* shared = shared_tensor.defined()
+        ? &::tyloi::ops::dense(shared_tensor) : nullptr;
+    const auto* logits = shared_logits_tensor.defined()
+        ? &::tyloi::ops::dense(shared_logits_tensor) : nullptr;
     compatible(experts.values, weights_tensor);
-    compatible(experts.values, shared_tensor);
-    compatible(experts.values, experts.shared_logits);
+    if (shared) compatible(experts.values, shared_tensor);
+    if (shared_logits_tensor.defined()) compatible(experts.values, shared_logits_tensor);
     require_cuda(experts.values);
-    if (shared.dim() != 2 || shared.scalar_type() != kFloat16 || !shared.is_contiguous() ||
-        weights.dim() != 2 || weights.scalar_type() != kFloat32 || !weights.is_contiguous() ||
-        logits.dim() != 2 || logits.size(0) != shared.size(0) || logits.size(1) != 1 ||
-        logits.scalar_type() != kFloat32 || !logits.is_contiguous() ||
-        (experts.reduced ? values.dim() != 2 || values.sizes() != shared.sizes() :
-         values.dim() != 3 || values.size(0) != shared.size(0) || values.size(1) != weights.size(1) || values.size(2) != shared.size(1)) ||
-        weights.size(0) != shared.size(0))
+    if (weights.dim() != 2 || weights.scalar_type() != kFloat32 || !weights.is_contiguous() ||
+        (shared && (shared->dim() != 2 || shared->scalar_type() != kFloat16 || !shared->is_contiguous())) ||
+        (logits && (!shared || logits->dim() != 2 || logits->size(0) != shared->size(0) || logits->size(1) != 1 ||
+                    logits->scalar_type() != kFloat32 || !logits->is_contiguous())) ||
+        (experts.reduced ? values.dim() != 2 || (shared && values.sizes() != shared->sizes()) :
+         values.dim() != 3 || values.size(1) != weights.size(1) ||
+         (shared && (values.size(0) != shared->size(0) || values.size(2) != shared->size(1)))) ||
+        (shared && weights.size(0) != shared->size(0)))
         throw std::invalid_argument("expert combination geometry mismatch");
     auto& executor = cuda::Executor::current();
     auto& profiler = executor.profiler();
-    if (!experts.reduced && !cuda::Executor::current_ffn().unfused && executor.options().ffn.reduce_fusion && values.size(0) <= 8)
+    if (!shared) {
+        if (shared_logits_tensor.defined())
+            throw std::invalid_argument("shared gate logits require a shared expert output");
+        auto reduced = experts.reduced ? values : profiler.measure("moe.reduce", [&] {
+            return moe_weighted_reduce_cuda(values, weights);
+        });
+        return owner(std::move(reduced));
+    }
+    if (shared_logits_tensor.defined() && !experts.reduced && !cuda::Executor::current_ffn().unfused &&
+        executor.options().ffn.reduce_fusion && values.size(0) <= 8)
         return owner(profiler.measure("moe.reduce_combine", [&] {
-            return moe_weighted_reduce_shared_gate_cuda(values, weights, shared, logits);
+            return moe_weighted_reduce_shared_gate_cuda(values, weights, *shared, *logits);
         }));
     auto reduced = experts.reduced ? values : profiler.measure("moe.reduce", [&] { return moe_weighted_reduce_cuda(values, weights); });
-    return owner(profiler.measure("moe.combine", [&] { return moe_add_shared_gate_cuda(reduced.contiguous(), shared, logits); }));
+    return owner(profiler.measure("moe.combine", [&] {
+        if (shared_logits_tensor.defined())
+            return moe_add_shared_gate_cuda(reduced.contiguous(), *shared, *logits);
+        auto shared_value = *shared;
+        if (reduced.scalar_type() != shared_value.scalar_type())
+            shared_value = shared_value.to(reduced.scalar_type()).contiguous();
+        return acc_cuda(reduced.contiguous(), shared_value);
+    }));
 }
 
 RoutedGeglu routed_geglu(const Tensor& value_tensor, const Tensor& ids_tensor,
@@ -630,32 +666,32 @@ Tensor low_rank(const Tensor& value_tensor, const Tensor& output_a, const Tensor
     input(value);
     return owner(cuda::ops::low_rank(value, output_a, output_b, groups, groupwise, profile));
 }
-Tensor mlp(const Tensor& value_tensor, std::span<const Tensor> gate_up, const ::tyloi::Tensor& down,
+Tensor Ffn::dense(const Tensor& value_tensor, std::span<const Tensor> gate_up, const ::tyloi::Tensor& down,
            MlpActivation activation, double swiglu_limit) {
     const auto& value = ::tyloi::ops::dense(value_tensor);
     input(value);
     return owner(cuda::ops::mlp(value, gate_up, down, activation, swiglu_limit));
 }
-Tensor bf16_mlp(const Tensor& value, std::span<const Tensor> gate_up, const Tensor& down,
+Tensor Ffn::bf16(const Tensor& value, std::span<const Tensor> gate_up, const Tensor& down,
         MlpActivation activation, double swiglu_limit) {
     input(value);
-    return owner(cuda::ops::bf16_mlp(dense(value), gate_up, down, activation, swiglu_limit));
+    return owner(cuda::ops::bf16_mlp(::tyloi::ops::dense(value), gate_up, down, activation, swiglu_limit));
 }
-Tensor additive_mlp(const Tensor& value,
+Tensor Ffn::additive(const Tensor& value,
         std::span<const Tensor> gate_up, const Tensor& down, MlpActivation activation, double limit,
         std::span<const Tensor> extra_gate_up, const Tensor& extra_down,
         MlpActivation extra_activation, double extra_limit) {
     input(value);
-    return owner(cuda::ops::additive_mlp(dense(value), gate_up, down, activation, limit,
+    return owner(cuda::ops::additive_mlp(::tyloi::ops::dense(value), gate_up, down, activation, limit,
         extra_gate_up, extra_down, extra_activation, extra_limit));
 }
-std::optional<Tensor> mlp_residual(const Tensor& value, const Tensor& residual,
+std::optional<Tensor> Ffn::residual(const Tensor& value, const Tensor& residual,
         std::span<const Tensor> gate_up, const Tensor& down, MlpActivation activation,
         double swiglu_limit, bool recurrent) {
     compatible(value, residual);
-    if (value.dim() != 2 || dense(value).sizes() != dense(residual).sizes())
+    if (value.dim() != 2 || ::tyloi::ops::dense(value).sizes() != ::tyloi::ops::dense(residual).sizes())
         throw std::invalid_argument("fused MLP residual inputs must have matching [rows,width] shapes");
-    auto result = cuda::ops::mlp_residual(dense(value), dense(residual), gate_up, down,
+    auto result = cuda::ops::mlp_residual(::tyloi::ops::dense(value), ::tyloi::ops::dense(residual), gate_up, down,
         activation, swiglu_limit, recurrent);
     if (!result) return std::nullopt;
     return owner(std::move(*result));

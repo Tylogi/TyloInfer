@@ -389,7 +389,7 @@ std::optional<tyloi::models::qwen35::Predictor> load_predictor(LayerLoader& load
         if (loader.has(mlp + "experts.gate_up.weight") || loader.has(mlp + "experts.gate.weight") ||
             loader.has(mlp + "experts.up.weight") || loader.has(mlp + "experts.down.weight"))
             throw std::runtime_error("Qwen MTP requires dense predictor projections");
-        layer.ffn = tyloi::models::load_dense_ffn<tyloi::models::Mlp>(loader, config, mlp);
+        layer.ffn = tyloi::models::load_dense_ffn(loader, config, mlp);
         model.layers.push_back(std::move(layer));
     }
     return model;

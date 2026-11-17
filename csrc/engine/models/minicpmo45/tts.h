@@ -156,7 +156,7 @@ struct Tts {
             tyloi::models::load_attention_mixer(layer.attention, loader, result.config, index,
                                              prefix, 0.0);
             layer.ffn_norm = weights.tensor(prefix + "mlp.norm.weight");
-            layer.ffn = tyloi::models::load_dense_ffn<tyloi::models::Mlp>(loader, result.config, prefix + "mlp.");
+            layer.ffn = tyloi::models::load_dense_ffn(loader, result.config, prefix + "mlp.");
         }
         return result;
     }

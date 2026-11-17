@@ -1,5 +1,7 @@
 #include "engine/models/common/ffn_internal.h"
 
+#include <type_traits>
+
 namespace tyloi::models {
 
 Tensor ffn_internal::feed_forward(const Mlp& weights, const Tensor& input, bool bf16, bool) {
@@ -25,6 +27,17 @@ Tensor linear_ffn(const Mlp& weights, const Tensor& norm,
     double epsilon, double offset) {
     return ffn_internal::linear(weights, norm, residual, attention_output,
         epsilon, offset);
+}
+
+Tensor feed_forward(const Ffn& weights, const Tensor& input,
+                    const Tensor& ids, const Tensor& router_bias) {
+    return std::visit([&](const auto& value) -> Tensor {
+        using Weight = std::decay_t<decltype(value)>;
+        if constexpr (std::is_same_v<Weight, Mlp>)
+            return mlp(value, input);
+        else
+            return moe(value, input, false, ids, router_bias);
+    }, weights);
 }
 
 } // namespace tyloi::models

@@ -33,7 +33,6 @@ DenseTensor Projector::run(const ::tyloi::Tensor& weight, DenseTensor input,
     if (!mfe) throw std::invalid_argument("unsupported expert tensor layout");
     return run(*mfe, std::move(input), route);
 }
-
 #if TYLOINFER_ENABLE_MFQ_COMPAT
 namespace {
 
@@ -546,20 +545,4 @@ tyloi::Tensor tyloi::ops::experts(const Tensor& input, const Tensor& ids, const 
         reduced = reduced + pairs.select(1, r).to(kFloat32) *
                             weights.dense().select(1, r).unsqueeze(-1);
     return reduced.to(pairs.scalar_type());
-}
-
-tyloi::Tensor tyloi::ops::moe(const Tensor& input, const Tensor& ids, const Tensor& weights,
-                              std::span<const Tensor> gate_up, const Tensor& down,
-                              std::span<const Tensor> shared, const Tensor& shared_gate,
-                              std::int64_t width, std::int64_t shared_rows) {
-    validate_expert_inputs(input, ids, weights, gate_up, down, width);
-    TYLOINFER_RUNTIME_CHECK(shared.size() == 3 && shared_gate.defined(),
-                            "invalid shared expert inputs");
-    for (const auto& weight : shared)
-        TYLOINFER_RUNTIME_CHECK(weight.defined(), "missing shared expert projection");
-
-    const auto shared_output = cuda::MoeSharedExpert(
-        shared[0], shared[1], shared[2], shared_gate).forward(input.dense(), shared_rows);
-    const auto routed = experts(input, ids, weights, gate_up, down, width).dense();
-    return routed + shared_output;
 }

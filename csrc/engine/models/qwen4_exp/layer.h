@@ -3,6 +3,7 @@
 // Read-only weights and configuration shared by one Qwen4 layer.
 
 #include "engine/models/qwen4_exp/model.h"
+#include "engine/models/common/moe.h"
 #include "engine/ops/ffn.h"
 #include "engine/ops/gdn.h"
 #include "engine/ops/qsa.h"
@@ -20,11 +21,14 @@ struct Layer final {
     ::tyloi::Device device;
     tyloi::models::qwen4_exp::Config config;
     tyloi::ops::Residual attention_gr, ffn_gr;
-    tyloi::ops::FfnWeights ffn;
+    tyloi::models::Moe ffn;
     std::unique_ptr<tyloi::ops::Gdn> gdn;
     std::unique_ptr<tyloi::ops::Qsa> qsa;
     std::unique_ptr<Ple> ple;
 };
+
+Tensor feed_forward(const Moe& weights, const Tensor& input,
+                    std::int64_t projection_rows = 0);
 
 Tensor forward(const Layer& weights, LayerState& request,
                     Tensor x, const Tensor& ids,

@@ -6,7 +6,7 @@
 #include "engine/ops/ops.h"
 #include "engine/backends/cuda/ops/ffn/tq/banks.h"
 #include "engine/models/common/load.h"
-#include "engine/ops/ffn.h"
+#include "engine/models/common/ffn.h"
 #include "engine/backends/cuda/ops/norm/rms.h"
 #include "engine/weights/loader.h"
 #include "weights.h"
@@ -293,7 +293,7 @@ static DenseTensor moe_forward(const Moe& weights, DenseTensor x) {
         return tyloi::ops::reshape(normalized, {B, T, H}).dense();
     });
     auto mixed = measure("moe.ffn", [&] {
-        return tyloi::ops::ffn(ffn, xn.reshape({B * T, H})).dense().reshape({B, T, H});
+        return tyloi::models::feed_forward(ffn, ::tyloi::Tensor(xn.reshape({B * T, H}))).dense().reshape({B, T, H});
     });
     xn = {};
     auto rr = x.reshape({-1, H});

@@ -2,12 +2,18 @@
 
 #include "engine/weights/placement.h"
 
+#include <cstdint>
 #include <memory>
+#include <span>
 
 namespace tyloi { class MfeTensor; }
 struct MoeRoutePlan;
 
 namespace tyloi::weights {
+
+void prepare_experts(std::span<const ::tyloi::Tensor> gate_up,
+                     const ::tyloi::Tensor& down,
+                     std::int64_t top_k, double limit);
 
 bool cached(const ::tyloi::Tensor& bank);
 bool expert_parallel(const ::tyloi::Tensor& gate_up,

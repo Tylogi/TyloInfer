@@ -129,7 +129,7 @@ Tensor layer(const Layer& weights, const std::vector<State*>& requests, std::siz
     if (project) attention = weights.gdn ? weights.gdn->project_output(attention)
                                         : weights.qsa->project_output(attention);
     auto ffn = weights.ffn_gr.pre_after(attention, mix.residual, mix.gate);
-    auto output = decode ? ops::batch_ffn(weights.ffn, ffn.mixed) : ops::ffn(weights.ffn, ffn.mixed);
+    auto output = tyloi::models::qwen4_exp::feed_forward(weights.ffn, ffn.mixed);
     return weights.ffn_gr.post(output, ffn.residual, ffn.gate);
 }
 } // namespace

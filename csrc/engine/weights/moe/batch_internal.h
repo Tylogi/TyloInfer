@@ -13,9 +13,11 @@ struct ExpertBatch::Impl {
     TqMoeBanks tq;
     std::shared_ptr<const MfeTensor> gate, up, gate_up, down;
     std::shared_ptr<const MfeTensor> cpu_gate, cpu_up, cpu_gate_up, cpu_down;
-    std::shared_ptr<const DenseTensor> dense_gate, dense_up, dense_down;
+    std::shared_ptr<const DenseTensor> dense_gate, dense_up, dense_gate_up, dense_down;
     MoeRoutePlan route;
     bool split = false, sharded = false, bundle_prefetched = false;
+    ops::MlpActivation activation = ops::MlpActivation::silu_gated;
+    bool ungated = false;
 
     void ready();
     std::shared_ptr<const MfeTensor> stage(const std::shared_ptr<const MfeTensor>& source,

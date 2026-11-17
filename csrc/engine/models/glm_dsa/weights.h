@@ -19,33 +19,33 @@ inline void load_config(std::string_view definition, Config& c, CausalLmMetadata
     m.decode_graph_double_warmup = true; m.model_type = c.model_type; m.layer_types = c.layer_types;
 }
 
-template <class Ffn, class Loader>
-void load_ffn(Loader& ops, const Config& c, int i, Ffn& f) {
+template <class Loader>
+void load_ffn(Loader& ops, const Config& c, int i, models::Ffn& f) {
     const auto &config = c;
     const std::string p = "model.block." + std::to_string(i) + ".mlp.";
     if (config.mlp_layer_types.at(static_cast<size_t>(i)) == "sparse") {
-        f = models::load_moe_weights(ops, p, i, true);
-        f.moe_top_k = static_cast<int>(c.num_experts_per_tok);
-        f.moe_use_sigmoid = true;
-        f.moe_use_sqrt_softplus = false;
-        f.moe_normalize = c.norm_topk_prob;
-        f.moe_delayed_softmax = false;
-        f.moe_shared_ungated = true;
-        f.moe_router_scale = c.routed_scaling_factor;
-        if (!f.moe_gate_up || !f.moe_down ||
-            f.moe_gate_up.size(0) != c.num_experts || f.moe_down.size(0) != c.num_experts ||
-            f.moe_gate_up.size(2) != c.hidden_size ||
-            f.moe_gate_up.size(1) != 2 * c.moe_intermediate_size ||
-            f.moe_down.size(2) != c.moe_intermediate_size ||
-            f.moe_down.size(1) != c.hidden_size || ops.shape(f.moe_router).size() != 2 ||
-            ops.shape(f.moe_router)[0] != c.num_experts || ops.shape(f.moe_router)[1] != c.hidden_size ||
-            ops.elements(f.moe_router_bias) != c.num_experts) {
+        auto moe = models::load_moe_weights(ops, p, i, true);
+        moe.top_k = c.num_experts_per_tok;
+        moe.routing.activation = tyloi::ops::RouterActivation::sigmoid;
+        moe.routing.normalize = c.norm_topk_prob;
+        moe.routing.delayed_softmax = false;
+        moe.routing.scale = c.routed_scaling_factor;
+        const auto& gate_up = moe.gate_up;
+        if (gate_up.size() != 1 || !gate_up[0] || !moe.down ||
+            gate_up[0].size(0) != c.num_experts || moe.down.size(0) != c.num_experts ||
+            gate_up[0].size(2) != c.hidden_size ||
+            gate_up[0].size(1) != 2 * c.moe_intermediate_size ||
+            moe.down.size(2) != c.moe_intermediate_size ||
+            moe.down.size(1) != c.hidden_size || ops.shape(moe.router).size() != 2 ||
+            ops.shape(moe.router)[0] != c.num_experts || ops.shape(moe.router)[1] != c.hidden_size ||
+            ops.elements(moe.router_bias) != c.num_experts) {
             throw std::runtime_error("GLM DSA MoE tensor shapes disagree with config at layer " +
                                      std::to_string(i));
         }
+        f = std::move(moe);
         return;
     }
-    f = models::load_dense_ffn<Ffn>(ops, c, p);
+    f = models::load_dense_ffn(ops, c, p);
 }
 
 template <class Block, class Loader>

@@ -13,7 +13,7 @@
 #include "engine/backends/cuda/ops/attention/launch.h"
 #include "engine/backends/cuda/ops/attention/kv/launch.h"
 #include "engine/backends/cuda/ops/norm/launch.h"
-#include "engine/ops/ffn.h"
+#include "engine/models/common/ffn.h"
 #include "engine/ops/ops.h"
 
 #include <algorithm>
@@ -792,7 +792,7 @@ static DenseTensor forward_layer(const Layer& layer, LayerState& state, Selectio
     attn_out = {};
     auto hidden = std::move(prepared[0]);
     auto ffn_input = std::move(prepared[1]);
-    auto ffn_out = tyloi::ops::ffn(ffn, ffn_input).dense().reshape({B * T, H});
+    auto ffn_out = tyloi::models::feed_forward(ffn, ::tyloi::Tensor(ffn_input)).dense().reshape({B * T, H});
     ffn_input = {};
     return measure("glm.ffn_residual", [&]() {
         return acc_cuda(hidden.reshape({B * T, H}), ffn_out).reshape({B, T, H});

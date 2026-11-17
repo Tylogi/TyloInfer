@@ -102,11 +102,9 @@ void load_layer(Layer& layer, const tyloi::weights::Loader& weights, const Confi
     const bool cpu_offload = offload.count(i) != 0;
     load_ffn(layer.ffn, weights, c, i, cpu_offload);
     if (cpu_offload) {
-        const int64_t gate_up_bytes =
-            layer.ffn.moe_split_gate_up
-                ? layer.ffn.moe_gate.backing_nbytes() + layer.ffn.moe_up.backing_nbytes()
-                : layer.ffn.moe_gate_up.backing_nbytes();
-        const int64_t down_bytes = layer.ffn.moe_down.backing_nbytes();
+        int64_t gate_up_bytes = 0;
+        for (const auto& bank : layer.ffn.gate_up) gate_up_bytes += bank.backing_nbytes();
+        const int64_t down_bytes = layer.ffn.down.backing_nbytes();
         host_bytes += gate_up_bytes + down_bytes;
         std::cerr << "cpu_offload layer=" << i << " gate_up_bytes=" << gate_up_bytes
                   << " down_bytes=" << down_bytes
@@ -129,42 +127,41 @@ void load_layer(Layer& layer, const tyloi::weights::Loader& weights, const Confi
     }
 }
 
-void load_ffn(tyloi::ops::FfnWeights& ffn, const tyloi::weights::Loader& weights, const Config& c,
+void load_ffn(tyloi::models::Moe& ffn, const tyloi::weights::Loader& weights, const Config& c,
               int i, bool cpu_offload) {
     const std::string p = "model.block." + std::to_string(i) + ".";
     ffn = load_moe_weights(
         weights, p + "mlp.",
         {.layer = i, .cpu_offloaded = cpu_offload, .shared_gate_up_compatible_prefix = 0});
     if (i < c.hash_layer_count) {
-        ffn.moe_hash_ids = std::make_shared<::tyloi::DenseTensor>(weights.tensor(p + "mlp.router.token_to_expert").dense()
+        ffn.hash_ids = std::make_shared<::tyloi::DenseTensor>(weights.tensor(p + "mlp.router.token_to_expert").dense()
                                   .to(::tyloi::kInt32)
                                   .contiguous());
     }
-    ffn.moe_top_k = static_cast<int>(c.num_experts_per_tok);
-    ffn.moe_use_sqrt_softplus = true;
-    ffn.moe_normalize = c.norm_topk_prob;
-    ffn.moe_delayed_softmax = false;
-    ffn.moe_shared_ungated = true;
-    ffn.moe_router_scale = c.routed_scaling_factor;
+    ffn.top_k = c.num_experts_per_tok;
+    ffn.routing.activation = tyloi::ops::RouterActivation::sqrt_softplus;
+    ffn.routing.normalize = c.norm_topk_prob;
+    ffn.routing.delayed_softmax = false;
+    ffn.routing.scale = c.routed_scaling_factor;
     ffn.swiglu_limit = c.swiglu_limit;
-    ffn.shared->swiglu_limit = c.swiglu_limit;
+    ffn.shared.swiglu_limit = c.swiglu_limit;
 
     const bool gate_up_shapes =
-        ffn.moe_split_gate_up
-            ? ffn.moe_gate && ffn.moe_up && ffn.moe_gate.size(0) == c.num_experts &&
-                  ffn.moe_up.size(0) == c.num_experts &&
-                  ffn.moe_gate.size(2) == c.hidden_size &&
-                  ffn.moe_up.size(2) == c.hidden_size &&
-                  ffn.moe_gate.size(1) == c.moe_intermediate_size &&
-                  ffn.moe_up.size(1) == c.moe_intermediate_size
-            : ffn.moe_gate_up && ffn.moe_gate_up.size(0) == c.num_experts &&
-                  ffn.moe_gate_up.size(2) == c.hidden_size &&
-                  ffn.moe_gate_up.size(1) == 2 * c.moe_intermediate_size;
-    const bool moe_shapes = gate_up_shapes && ffn.moe_down && ffn.moe_down.size(0) == c.num_experts &&
-                            ffn.moe_down.size(2) == c.moe_intermediate_size &&
-                            ffn.moe_down.size(1) == c.hidden_size &&
-                            ffn.moe_router && ffn.moe_router.size(0) == c.num_experts &&
-                            ffn.moe_router.size(1) == c.hidden_size;
+        ffn.gate_up.size() == 2
+            ? ffn.gate_up[0] && ffn.gate_up[1] && ffn.gate_up[0].size(0) == c.num_experts &&
+                  ffn.gate_up[1].size(0) == c.num_experts &&
+                  ffn.gate_up[0].size(2) == c.hidden_size &&
+                  ffn.gate_up[1].size(2) == c.hidden_size &&
+                  ffn.gate_up[0].size(1) == c.moe_intermediate_size &&
+                  ffn.gate_up[1].size(1) == c.moe_intermediate_size
+            : ffn.gate_up.size() == 1 && ffn.gate_up[0] && ffn.gate_up[0].size(0) == c.num_experts &&
+                  ffn.gate_up[0].size(2) == c.hidden_size &&
+                  ffn.gate_up[0].size(1) == 2 * c.moe_intermediate_size;
+    const bool moe_shapes = gate_up_shapes && ffn.down && ffn.down.size(0) == c.num_experts &&
+                            ffn.down.size(2) == c.moe_intermediate_size &&
+                            ffn.down.size(1) == c.hidden_size &&
+                            ffn.router && ffn.router.size(0) == c.num_experts &&
+                            ffn.router.size(1) == c.hidden_size;
     if (!moe_shapes) {
         throw std::runtime_error("DeepSeek V4 MoE tensor shapes disagree with config at layer " +
                                  std::to_string(i));
@@ -1462,8 +1459,9 @@ DenseTensor forward_layer(const Layer& w, LayerState& state, Executor& executor,
                                  .to(::tyloi::kFloat32), ffn_norm, eps)
             .reshape({batch, tokens, hidden_size}).to(::tyloi::kFloat16);
     });
-    auto feed_forward = tyloi::ops::ffn(ffn,
-        normalized.reshape({batch * tokens, hidden_size}), current_ids).dense();
+    auto feed_forward = tyloi::models::moe(ffn,
+        ::tyloi::Tensor(normalized.reshape({batch * tokens, hidden_size})), false,
+        ::tyloi::Tensor(current_ids)).dense();
     feed_forward = feed_forward.reshape({batch, tokens, hidden_size});
     return profiler.measure("dsv4.hc_ffn_post", [&]() {
         return hc_post(w, feed_forward, x, ffn_mix.at(1), ffn_mix.at(2), "ffn_post");
