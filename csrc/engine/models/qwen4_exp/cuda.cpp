@@ -25,7 +25,6 @@
 #include "engine/weights/encoding/quant/nint_rows.h"
 #include "engine/weights/encoding/tq/tensor.h"
 #include "engine/weights/tq/source.h"
-#include "engine/weights/tq/rows.h"
 #include "engine/backends/cuda/executor/graph/window.h"
 #include "engine/backends/cuda/ops/profile.h"
 #include "engine/backends/cuda/kernels/moe/pipeline.h"

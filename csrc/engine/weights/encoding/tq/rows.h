@@ -1,4 +1,5 @@
 #pragma once
+#include "engine/io/read_span.h"
 #include <algorithm>
 #include <array>
 #include <climits>
@@ -15,6 +16,10 @@
 namespace tyloi {
 using TqRead = std::function<void(
     std::uint64_t, std::byte*, std::size_t)>;
+
+inline constexpr std::uint16_t kTqRelative[]{
+    0x3400, 0x34d0, 0x35ca, 0x36f7, 0x3830, 0x390a, 0x3a10, 0x3b4b,
+    0x3c63, 0x3d47, 0x3e59, 0x3fa4, 0x4098, 0x4187, 0x42a6, 0x4400};
 
 struct TqRowSelection {
     std::vector<std::int64_t> selected;
@@ -92,18 +97,36 @@ struct TqLayout {
     }
 };
 
+struct TqRowImageLayout {
+    std::size_t packed_offset,relative_offset,bytes;
+};
+
 // Retained bounded reads; no expanded weights and no expert/cache ownership.
 class TqRows {
     TqRead read_;
+    std::uint64_t source_offset_=0;
     TqLayout layout_;
     std::array<std::uint8_t,64> header_{};
 public:
-    TqRows(std::size_t bytes,TqRead read):read_(std::move(read)) {
+    TqRows(std::size_t bytes,TqRead read,std::uint64_t source_offset=0)
+        :read_(std::move(read)),source_offset_(source_offset) {
         if(bytes<64)throw std::invalid_argument("truncated TQ header");
         read_(0,reinterpret_cast<std::byte*>(header_.data()),header_.size());
         layout_=TqLayout(header_.data(),bytes);
     }
     const TqLayout& layout()const noexcept{return layout_;}
+    std::size_t packed_row_bytes(std::uint64_t begin,std::uint64_t end)const {
+        if(begin>=end || end>layout_.rows)throw std::out_of_range("invalid TQ row byte range");
+        std::array<std::uint8_t,16> records{};
+        read_(64+begin*8,reinterpret_cast<std::byte*>(records.data()),8);
+        read_(64+(end-1)*8,reinterpret_cast<std::byte*>(records.data()+8),8);
+        const auto first=TqLayout::integer(records.data(),8),last=TqLayout::integer(records.data()+8,8);
+        if(!layout_.valid_descriptor(first) || !layout_.valid_descriptor(last))throw std::invalid_argument("invalid TQ row descriptor");
+        const auto start=std::uint64_t(layout_.offset(first))*4;
+        const auto finish=std::uint64_t(layout_.offset(last))*4+std::uint64_t(layout_.width)*(((last>>32)&7)+1)/8;
+        if(finish<start || finish>layout_.packed_bytes)throw std::invalid_argument("invalid TQ row payload byte range");
+        return std::size_t(finish-start);
+    }
     // Write one ordinary TQ row into caller-owned staging storage.
     // This avoids temporary descriptor/payload vectors for sparse CPU tables.
     std::size_t slice_row_into(std::uint64_t row,std::uint8_t* target,std::size_t capacity)const {
@@ -145,7 +168,20 @@ public:
         read_(m.packed+std::uint64_t(first)*4,reinterpret_cast<std::byte*>(scales+scale_bytes),packed_bytes);
         return bytes;
     }
-    std::vector<std::uint8_t> slice_rows(std::uint64_t begin,std::uint64_t end)const {
+    TqRowImageLayout stage_row_image(std::uint64_t row,std::uint8_t* target,std::size_t capacity)const {
+        const auto scale_bytes=layout_.columns?layout_.scale_bytes:(layout_.groups+1)/2;
+        const auto packed=72+scale_bytes,words=(packed+3)&~std::size_t(3);
+        const auto wire=slice_row_into(row,target,capacity);
+        const auto packed_bytes=wire-packed,relative=words+packed_bytes;
+        if(relative>capacity || sizeof(kTqRelative)>capacity-relative)
+            throw std::overflow_error("TQ staged row image exceeds capacity");
+        std::memmove(target+words,target+packed,packed_bytes);
+        std::memset(target+packed,0,words-packed);
+        std::memcpy(target+relative,kTqRelative,sizeof(kTqRelative));
+        return {words,relative,relative+sizeof(kTqRelative)};
+    }
+    std::vector<std::uint8_t> slice_rows(std::uint64_t begin,std::uint64_t end,
+            std::vector<ReadSpan>* deferred=nullptr)const {
         const auto& m=layout_;
         if(begin>=end || end>m.rows)throw std::out_of_range("invalid TQ row range");
         const auto count=std::size_t(end-begin);
@@ -184,7 +220,12 @@ public:
                 scales[i/2]|=((source[index/2]>>((index&1)*4))&15)<<((i&1)*4);
             }
         }
-        read_(m.packed+first*4,reinterpret_cast<std::byte*>(scales+scale_bytes),packed_bytes);
+        const auto offset=m.packed+first*4;
+        auto* destination=reinterpret_cast<std::byte*>(scales+scale_bytes);
+        if(deferred) {
+            if(source_offset_>UINT64_MAX-offset)throw std::overflow_error("TQ source span offset");
+            deferred->push_back({source_offset_+offset,destination,packed_bytes});
+        } else read_(offset,destination,packed_bytes);
         return result;
     }
     std::vector<std::uint8_t> slice_columns(std::uint64_t begin,std::uint64_t end)const {
@@ -272,7 +313,7 @@ inline std::vector<std::shared_ptr<TqRows>> tq_row_segments(
                 throw std::out_of_range("TQ expert read exceeds its payload");
             read(offset + begin, destination, length);
         };
-        auto child = std::make_shared<TqRows>(size, std::move(child_read));
+        auto child = std::make_shared<TqRows>(size, std::move(child_read), offset);
         if (child->layout().rows != outputs || logical_width > child->layout().width
                 || (index && child->layout().width != result.front()->layout().width))
             throw std::invalid_argument("TQ expert container dimensions differ");

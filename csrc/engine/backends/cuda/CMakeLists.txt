@@ -373,6 +373,7 @@ set(TYLOINFER_CUDA_OP_SOURCES
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/ffn/experts/shared.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/ffn/gated_residual.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/projection/tq/tensor.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/projection/tq/rows.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/ffn/tq/routed.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/ffn/tq/banks.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/projection/mx/tensor.cpp

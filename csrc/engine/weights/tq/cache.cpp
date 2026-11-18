@@ -460,6 +460,7 @@ std::vector<std::pair<std::string,double>> TqCache::metrics() {
         {"ssd_expert_payload_bytes",double(cold)},
         {"ssd_expert_bytes_read",double(source_bytes_)},
         {"ssd_expert_read_count",double(source_reads_)},
+        {"expert_source_read_batches",double(source_batches_)},
         {"expert_logical_transfer_bytes",double(transfer_bytes_)},
         {"expert_host_fetch_ms",fetch_ms_},{"expert_host_copy_ms",upload_submit_ms_},
         {"expert_decode_transfer_bytes",double(staging)},
@@ -520,12 +521,43 @@ std::vector<::tyloi::encoding::TqTensor> TqCache::get(std::uint64_t source,const
     for (std::size_t i = 0; i < count; ++i)
         if (!ids || ids[i] < 0 || std::uint64_t(ids[i]) >= table.rows() / out)
             throw std::out_of_range("TQ routed expert ID is out of bounds");
+    for(auto it=host_transfers_.begin();it!=host_transfers_.end();)
+        if(it->ready->event.ready())it=host_transfers_.erase(it);else ++it;
+    std::vector<std::int64_t> missing;
+    std::unordered_map<std::uint32_t, std::size_t> source_images;
+    if (count > 1) {
+        for (std::size_t i = 0; i < count; ++i) {
+            const auto expert = static_cast<std::uint32_t>(ids[i]);
+            const auto key = (source << 32) | expert;
+            if (!device_.find({key, device}) && !host_.find(key) &&
+                source_images.try_emplace(expert, missing.size()).second)
+                missing.push_back(expert);
+        }
+    }
+    std::vector<std::vector<std::uint8_t>> prefetched;
+    if (missing.size() > 1) {
+        const auto started = std::chrono::steady_clock::now();
+        auto headroom = available_host_bytes(process_host_limit_);
+        std::size_t largest = 0;
+        bool fits = true;
+        for (const auto expert : missing) {
+            const auto bytes = table.expert_image_bytes(expert, out);
+            if (bytes > headroom) { fits = false; break; }
+            headroom -= bytes;
+            largest = std::max(largest, bytes);
+        }
+        if (fits && largest <= headroom) {
+            prefetched = table.slice_experts(missing, out);
+            ++source_batches_;
+        }
+        fetch_ms_ += std::chrono::duration<double,std::milli>(
+            std::chrono::steady_clock::now() - started).count();
+    }
+    std::vector<std::shared_ptr<HostImage>> prepared_images(prefetched.size());
     const auto resources=tq_->get(device);
     std::vector<::tyloi::encoding::TqTensor> result;result.reserve(count);
     const auto stream=mfq_get_current_cuda_stream(device);
     std::shared_ptr<Upload> uploaded;
-    for(auto it=host_transfers_.begin();it!=host_transfers_.end();)
-        if(it->ready->event.ready())it=host_transfers_.erase(it);else ++it;
     auto transfer=host_transfers_.end();
     std::unordered_set<cudaEvent_t> waited;
     try {
@@ -556,16 +588,24 @@ std::vector<::tyloi::encoding::TqTensor> TqCache::get(std::uint64_t source,const
             }
         }
     } else {
-        auto wire=table.slice_rows(std::uint64_t(expert)*out,std::uint64_t(expert+1)*out);
-        // Only source misses allocate new host images. Reclaim optional
-        // images against current RAM/commit headroom before packing one;
-        // GPU hits and ordinary RAM streaming do not poll process memory.
-        reserve_host_locked(wire.size());
-        source_bytes_+=wire.size();++source_reads_;image=HostImage::create(wire,host_accounting_);
-        host_.reserve(image->bytes.size());
-        reserve_host_headroom_locked(host_headroom);
-        const bool admit=admit_host_locked(0,host_headroom);
-        if(admit)host_.put(key,image,image->bytes.size());
+        const auto prepared = source_images.find(expert);
+        const auto batch_index = prepared == source_images.end() ? prefetched.size() : prepared->second;
+        if (batch_index < prefetched.size() && prepared_images[batch_index]) {
+            image = prepared_images[batch_index];
+            ++host_hits_;
+        } else {
+            // Earlier admissions can evict a hit that was outside the original batch.
+            auto wire = batch_index < prefetched.size() ? std::move(prefetched[batch_index]) :
+                table.slice_rows(std::uint64_t(expert)*out,std::uint64_t(expert+1)*out);
+            reserve_host_locked(wire.size());
+            source_bytes_ += wire.size();
+            ++source_reads_;
+            image = HostImage::create(wire, host_accounting_);
+            host_.reserve(image->bytes.size());
+            reserve_host_headroom_locked(host_headroom);
+            if (admit_host_locked(0, host_headroom)) host_.put(key, image, image->bytes.size());
+            if (batch_index < prefetched.size()) prepared_images[batch_index] = image;
+        }
     }
     fetch_ms_+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-fetch_started).count();
     const auto needed=image->bytes.size();

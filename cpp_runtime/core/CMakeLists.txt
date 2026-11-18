@@ -77,8 +77,6 @@ add_library(mfq-model-source STATIC
     model_source.cpp
     row_residual.cpp
     include/tyloinfer/row_residual.h
-    tq_fixture_source.cpp
-    include/tyloinfer/tq_fixture_source.h
     include/tyloinfer/tq_rows.h
     tq_model_layout.cpp include/tyloinfer/tq_model_layout.h
 )

@@ -38,7 +38,6 @@ set(TYLOINFER_CUDA_LOADING_SOURCES
     ${PROJECT_SOURCE_DIR}/engine/weights/tq/image.cpp
     ${PROJECT_SOURCE_DIR}/engine/weights/tq/cache.cpp
     ${PROJECT_SOURCE_DIR}/engine/weights/tq/routed.cpp
-    ${PROJECT_SOURCE_DIR}/engine/weights/tq/rows.cpp
     ${PROJECT_SOURCE_DIR}/engine/weights/encoding/rows.cpp
     ${PROJECT_SOURCE_DIR}/engine/weights/rows/source.cpp
     ${PROJECT_SOURCE_DIR}/engine/weights/rows/gguf.cpp

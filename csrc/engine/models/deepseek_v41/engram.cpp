@@ -10,7 +10,7 @@
 #include "engine/weights/rows/nint_cache.h"
 #include "engine/weights/rows/nint_pipeline.h"
 #include "engine/weights/tq/source.h"
-#include "engine/weights/tq/rows.h"
+#include "engine/backends/cuda/ops/projection/tq/rows.h"
 
 #include <condition_variable>
 #include <future>
@@ -294,7 +294,7 @@ EngramTensor EngramTable::gather(State& state, const std::int64_t* rows, int bat
     auto& s = *state.impl_;
     const auto count = std::size_t(batch) * tokens * columns;
     if(s.shared->tq_table) {
-        auto result=lookup_tq_table(*s.shared->tq_table,rows,count,device);
+        auto result=tq::lookup_rows(*s.shared->tq_table,rows,count,device);
         return result.dense()
             .reshape({batch,tokens,static_cast<int64_t>(columns)*s.shared->width});
     }

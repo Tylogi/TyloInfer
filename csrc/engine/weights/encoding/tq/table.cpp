@@ -73,12 +73,18 @@ std::vector<std::uint8_t> join_rows(
 
 TqTable::TqTable(std::vector<std::shared_ptr<TqRows>> segments,
                  std::int64_t columns, std::uint64_t expected_rows,
-                 std::uint64_t storage_bytes)
-    : segments_(std::move(segments)), columns_(columns),
-      storage_bytes_(storage_bytes) {
+                 std::uint64_t storage_bytes, std::vector<TqOrigin> readers,
+                 std::vector<std::size_t> origins)
+    : segments_(std::move(segments)), readers_(std::move(readers)), origins_(std::move(origins)),
+      columns_(columns), storage_bytes_(storage_bytes) {
     if (segments_.empty() || columns_ < 1 || expected_rows < 1) {
         throw std::invalid_argument("invalid TQ row table geometry");
     }
+    if ((!readers_.empty() || !origins_.empty()) &&
+        (origins_.size() != segments_.size() ||
+         std::any_of(origins_.begin(), origins_.end(), [&](auto origin) {
+             return origin >= readers_.size() || !readers_[origin].read;
+         }))) throw std::invalid_argument("invalid TQ row source readers");
     std::uint64_t end = 0;
     ends_.reserve(segments_.size());
     for (const auto& segment : segments_) {
@@ -114,6 +120,67 @@ std::vector<std::uint8_t> TqTable::slice_rows(
     }
     if (pieces.size() == 1) return std::move(pieces.front());
     return join_rows(pieces);
+}
+
+std::size_t TqTable::expert_image_bytes(std::uint64_t expert, std::uint64_t count) const {
+    if (!count || rows() % count || expert >= rows() / count)
+        throw std::out_of_range("invalid TQ expert image range");
+    const auto begin = expert * count, end = begin + count;
+    auto segment = std::upper_bound(ends_.begin(), ends_.end(), begin) - ends_.begin();
+    const auto& layout = segments_.at(segment)->layout();
+    std::size_t packed = 0;
+    while (segment < segments_.size()) {
+        const auto start = segment ? ends_[segment - 1] : 0;
+        const auto first = std::max(begin, start), last = std::min(end, ends_[segment]);
+        if (first < last) {
+            const auto& part = segments_[segment]->layout();
+            if (part.width != layout.width || part.columns != layout.columns || part.gs != layout.gs)
+                throw std::invalid_argument("incompatible TQ expert row segments");
+            const auto bytes = segments_[segment]->packed_row_bytes(first - start, last - start);
+            if (bytes > SIZE_MAX - packed) throw std::overflow_error("TQ expert packed bytes");
+            packed += bytes;
+        }
+        if (ends_[segment] >= end) break;
+        ++segment;
+    }
+    const auto scales = layout.columns ? layout.scale_bytes : (count * layout.groups + 1) / 2;
+    const auto metadata = (64 + count * 8 + scales + 3) & ~std::uint64_t(3);
+    if (metadata > SIZE_MAX - 32 || packed > SIZE_MAX - 32 - metadata)
+        throw std::overflow_error("TQ expert image bytes");
+    return std::size_t(metadata) + packed + 32;
+}
+
+std::vector<std::vector<std::uint8_t>> TqTable::slice_experts(
+        const std::vector<std::int64_t>& experts, std::uint64_t rows_per_expert) const {
+    if (!rows_per_expert || rows() % rows_per_expert)
+        throw std::invalid_argument("invalid TQ expert row count");
+    std::vector<std::vector<std::vector<std::uint8_t>>> pieces(experts.size());
+    std::vector<std::vector<ReadSpan>> spans(readers_.size());
+    for (std::size_t index = 0; index < experts.size(); ++index) {
+        const auto expert = experts[index];
+        if (expert < 0 || std::uint64_t(expert) >= rows() / rows_per_expert)
+            throw std::out_of_range("TQ expert ID");
+        const auto begin = std::uint64_t(expert) * rows_per_expert, end = begin + rows_per_expert;
+        auto segment = std::upper_bound(ends_.begin(), ends_.end(), begin) - ends_.begin();
+        while (segment < segments_.size()) {
+            const auto start = segment ? ends_[segment - 1] : 0;
+            const auto first = std::max(begin, start), last = std::min(end, ends_[segment]);
+            if (first < last) pieces[index].push_back(segments_[segment]->slice_rows(
+                first - start, last - start, readers_.empty() ? nullptr : &spans[origins_[segment]]));
+            if (ends_[segment] >= end) break;
+            ++segment;
+        }
+    }
+    for (std::size_t origin = 0; origin < readers_.size(); ++origin) if (!spans[origin].empty()) {
+        const auto& reader = readers_[origin];
+        if (reader.batch) reader.batch(spans[origin]);
+        else for (const auto& span : spans[origin]) reader.read(span.offset, span.destination, span.size);
+    }
+    std::vector<std::vector<std::uint8_t>> result;
+    result.reserve(experts.size());
+    for (auto& parts : pieces)
+        result.push_back(parts.size() == 1 ? std::move(parts.front()) : join_rows(parts));
+    return result;
 }
 
 std::size_t TqTable::row_image_bytes_bound() const {

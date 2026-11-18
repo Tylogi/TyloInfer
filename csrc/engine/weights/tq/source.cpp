@@ -99,22 +99,29 @@ std::shared_ptr<TqTable> tq_table(
     const auto names = row_parts(source, name);
     std::unordered_set<std::string> unique;
     std::vector<std::shared_ptr<TqRows>> segments;
+    std::vector<TqOrigin> readers;
+    std::vector<std::size_t> origins;
     std::uint64_t storage_bytes = 0;
     for (const auto& part : names) {
         const auto* record = source.find_tensor(part);
         if (!unique.insert(part).second || !record || record->dtype != "TQ") {
             throw std::invalid_argument("invalid TQ row segment: " + part);
         }
-        auto physical = tyloi::tq_row_segments(
-            record->nbytes, source.tensor_reader(part), columns);
+        auto reader = shape.size() == 2 ? source.mapped_tensor_reader(part) : source::Source::TensorReader{};
+        auto batch = reader ? source.mapped_tensor_batch_reader(part) : source.tensor_batch_reader(part);
+        if (!reader) reader = source.tensor_reader(part);
+        auto physical = tyloi::tq_row_segments(record->nbytes, reader, columns);
+        const auto origin = readers.size();
+        readers.push_back({std::move(reader), std::move(batch)});
         if (storage_bytes > UINT64_MAX - record->nbytes) {
             throw std::overflow_error("TQ row table size exceeds bounds");
         }
         storage_bytes += record->nbytes;
-        for (auto& rows : physical) segments.push_back(std::move(rows));
+        for (auto& rows : physical) { segments.push_back(std::move(rows)); origins.push_back(origin); }
     }
     return std::make_shared<TqTable>(
-        std::move(segments), columns, expected_rows(shape, name), storage_bytes);
+        std::move(segments), columns, expected_rows(shape, name), storage_bytes,
+        std::move(readers), std::move(origins));
 }
 
 bool is_tq_table(

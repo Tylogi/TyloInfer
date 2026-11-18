@@ -14,7 +14,7 @@
 #include "engine/weights/tq/routed.h"
 #include "engine/weights/encoding/rows.h"
 #include "engine/weights/rows/gguf.h"
-#include "engine/weights/tq/rows.h"
+#include "engine/backends/cuda/ops/projection/tq/rows.h"
 #if TYLOINFER_ENABLE_MFQ_COMPAT
 #include "engine/backends/cuda/ops/projection/nint/tensor.h"
 #endif
@@ -137,7 +137,7 @@ tyloi::DenseTensor tyloi::cuda::ops::embedding(tyloi::DenseTensor ids, const ::t
     std::optional<MfqCudaGuard> guard;
     if (ids.is_cuda()) guard.emplace(ids.device().index);
     if (const auto* rows = weight.representation<tyloi::weights::Rows>()) {
-        if (rows->tq()) return lookup_tq_table(*rows->tq(), Tensor(std::move(ids))).dense();
+        if (rows->tq()) return tq::lookup_rows(*rows->tq(), Tensor(std::move(ids))).dense();
         if (rows->gguf()) {
             const auto shape = ids.sizes().vec();
             const auto host = ids.to(kInt64).cpu().contiguous().reshape({-1});

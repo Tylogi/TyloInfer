@@ -28,10 +28,7 @@ std::vector<std::uint8_t> tq_image(
     std::memcpy(image.data(), blob.data(), layout.packed);
     std::memcpy(image.data() + words_offset,
                 blob.data() + layout.packed, layout.packed_bytes);
-    constexpr std::uint16_t relative[]{
-        0x3400, 0x34d0, 0x35ca, 0x36f7, 0x3830, 0x390a, 0x3a10, 0x3b4b,
-        0x3c63, 0x3d47, 0x3e59, 0x3fa4, 0x4098, 0x4187, 0x42a6, 0x4400};
-    std::memcpy(image.data() + relative_offset, relative, sizeof(relative));
+    std::memcpy(image.data() + relative_offset, tyloi::kTqRelative, sizeof(tyloi::kTqRelative));
     return image;
 }
 

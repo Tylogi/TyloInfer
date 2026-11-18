@@ -1,4 +1,4 @@
-#include "engine/weights/tq/rows.h"
+#include "rows.h"
 #include "backend.h"
 
 #include "env.h"
@@ -13,8 +13,9 @@
 #include <cstring>
 #include <cstdio>
 #include <stdexcept>
-#include <unordered_map>
 
+
+namespace tyloi::cuda::tq {
 
 namespace {
 
@@ -134,13 +135,13 @@ std::size_t segment_for(const tyloi::TqTable& table, std::uint64_t row) {
 
 } // namespace
 
-::tyloi::Tensor lookup_tq_table(const tyloi::TqTable& table,
+::tyloi::Tensor lookup_rows(const tyloi::TqTable& table,
                            const std::int64_t* ids, std::size_t count,
                            const ::tyloi::Device& device) {
     return std::make_shared<::tyloi::DenseTensor>(lookup_tq_rows(table, ids, count, device));
 }
 
-::tyloi::Tensor lookup_tq_table(const tyloi::TqTable& table, const ::tyloi::Tensor& input) {
+::tyloi::Tensor lookup_rows(const tyloi::TqTable& table, const ::tyloi::Tensor& input) {
     const auto& ids = input.dense();
     auto host = ids.contiguous().cpu().to(::tyloi::kInt64);
     auto shape = ids.sizes().vec();
@@ -150,7 +151,7 @@ std::size_t segment_for(const tyloi::TqTable& table, std::uint64_t row) {
         table, host.data_ptr<std::int64_t>(), host.numel(), ids.device()).reshape(shape));
 }
 
-::tyloi::Tensor lookup_tq_shards(
+::tyloi::Tensor lookup_rows(
         const std::vector<std::shared_ptr<tyloi::TqTable>>& tables,
         std::int64_t rows_per_shard, const std::vector<std::int64_t>& ids,
         const ::tyloi::Device& device) {
@@ -276,6 +277,25 @@ class TqRowStage final : public RowStage {
                 int(layout.columns)};
     }
 
+    TrellisProjectionView pack_row(const tyloi::TqTable& table,
+                                    std::uint64_t row, std::size_t slot) {
+        if (row >= table.rows()) throw std::out_of_range("TQ staged row is out of bounds");
+        const auto segment = segment_for(table, row);
+        const auto start = segment ? table.segment_end(segment - 1) : 0;
+        const auto& rows = table.segment(segment);
+        const auto& layout = rows.layout();
+        const auto offset = images_offset_ + slot * image_stride_;
+        auto* host = static_cast<std::uint8_t*>(host_->data()) + offset;
+        auto* address = packet_address_ + offset;
+        const auto image = rows.stage_row_image(row - start, host, image_stride_);
+        int gslog = 0;
+        for (auto gs = layout.gs; gs > 1; gs >>= 1) ++gslog;
+        return {reinterpret_cast<const std::uint32_t*>(address + image.packed_offset),
+                reinterpret_cast<const std::uint64_t*>(address + 64), address + 72,
+                address + image.relative_offset, nullptr, 1, int(layout.width),
+                int(columns_), gslog, int(layout.columns)};
+    }
+
 public:
     TqRowStage(std::vector<std::shared_ptr<tyloi::TqTable>> tables,
                std::int64_t rows_per_shard, std::vector<std::int64_t> shape,
@@ -363,26 +383,19 @@ public:
         const MfqCudaGuard guard(device_);
         fence_.before_write();
         retain_stream();
-        std::unordered_map<std::int64_t, TrellisProjectionView> unique;
-        std::vector<TrellisProjectionView> views;
-        views.reserve(ids.size());
-        for (const auto id : ids) {
-            if (id < 0 || std::uint64_t(id / rows_per_shard_) >= tables_.size()) {
-                throw std::out_of_range("TQ stage shard ID is out of bounds");
-            }
-            const auto [position, inserted] = unique.try_emplace(id);
-            if (inserted) {
-                const auto shard = id / rows_per_shard_, row = id % rows_per_shard_;
-                position->second = pack_row(
-                    tables_[shard]->slice_rows(row, row + 1), unique.size() - 1);
-            }
-            views.push_back(position->second);
+        const auto selection = select_tq_rows(ids, rows_per_shard_, tables_.size());
+        std::vector<TrellisProjectionView> unique;
+        unique.reserve(selection.selected.size());
+        for (const auto id : selection.selected) {
+            const auto shard = id / rows_per_shard_, row = id % rows_per_shard_;
+            unique.push_back(pack_row(*tables_[shard], row, unique.size()));
         }
-        std::memcpy(host_->data(), views.data(), views.size() * sizeof(views[0]));
+        auto* views = static_cast<TrellisProjectionView*>(host_->data());
+        for (std::size_t i = 0; i < ids.size(); ++i) views[i] = unique[selection.inverse[i]];
         if (!mapped_) {
             mfq_cuda_record_stream(packet_, mfq_get_current_cuda_stream(device_.index));
             TYLOINFER_CUDA_CHECK(cudaMemcpyAsync(
-                packet_address_, host_->data(), bytes_, cudaMemcpyHostToDevice,
+                packet_address_, host_->data(), images_offset_ + unique.size() * image_stride_, cudaMemcpyHostToDevice,
                 mfq_current_cuda_stream()));
             fence_.record_transfer(mfq_current_cuda_stream());
         }
@@ -412,7 +425,7 @@ public:
 
 } // namespace
 
-std::pair<std::size_t, std::size_t> tq_row_stage_growth(
+std::pair<std::size_t, std::size_t> row_stage_growth(
         const std::vector<std::shared_ptr<tyloi::TqTable>>& tables,
         std::int64_t rows_per_shard, const std::vector<std::int64_t>& shape,
         const ::tyloi::Device& device) {
@@ -426,9 +439,11 @@ std::pair<std::size_t, std::size_t> tq_row_stage_growth(
     return {layout.bytes, output + layout.bytes};
 }
 
-std::shared_ptr<RowStage> make_tq_row_stage(
+std::shared_ptr<RowStage> make_row_stage(
         const std::vector<std::shared_ptr<tyloi::TqTable>>& tables,
         std::int64_t rows_per_shard, const std::vector<std::int64_t>& shape,
         const ::tyloi::Device& device) {
     return std::make_shared<TqRowStage>(tables, rows_per_shard, shape, device);
 }
+
+} // namespace tyloi::cuda::tq

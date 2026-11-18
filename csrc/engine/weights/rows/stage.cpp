@@ -4,7 +4,7 @@
 #include "engine/weights/encoding/rows.h"
 #include "engine/weights/rows/gguf.h"
 #include "engine/weights/rows/gguf_read.h"
-#include "engine/weights/tq/rows.h"
+#include "engine/backends/cuda/ops/projection/tq/rows.h"
 #if TYLOINFER_ENABLE_MFQ_COMPAT
 #include "engine/weights/rows/nint_pipeline.h"
 #endif
@@ -123,7 +123,7 @@ std::vector<std::pair<Device, std::size_t>> RowReader::stage_growth(
     if (source->nint) bytes = NintRowPipeline::stage_growth(*source->nint, shape, device);
     else
 #endif
-    bytes = tq_row_stage_growth(source->tq, source->rows, shape, device);
+    bytes = cuda::tq::row_stage_growth(source->tq, source->rows, shape, device);
     return {{Device(kCPU), bytes.first}, {device, bytes.second}};
 }
 RowReader::RowReader(std::shared_ptr<const Source> source) : impl_(std::make_unique<Impl>()) {
@@ -162,7 +162,7 @@ Tensor RowReader::collect(const std::vector<std::int64_t>& ids, const std::vecto
         count *= std::size_t(extent);
     }
     if (count != ids.size()) throw std::invalid_argument("row reader shape mismatch");
-    auto output = lookup_tq_shards(impl_->source->tq, impl_->source->rows, ids, device);
+    auto output = cuda::tq::lookup_rows(impl_->source->tq, impl_->source->rows, ids, device);
     auto result_shape = shape;
     result_shape.push_back(impl_->source->tq.front()->width());
     return output.dense().reshape(result_shape);
@@ -177,7 +177,7 @@ std::shared_ptr<RowStage> RowReader::stage(const std::vector<std::int64_t>& shap
     if (impl_->nint) result = std::make_shared<NintStage>(impl_->nint, shape, device);
     else
 #endif
-    result = make_tq_row_stage(impl_->source->tq, impl_->source->rows, shape, device);
+    result = cuda::tq::make_row_stage(impl_->source->tq, impl_->source->rows, shape, device);
     return result;
 }
 }

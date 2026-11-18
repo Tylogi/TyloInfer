@@ -1,5 +1,6 @@
 #include "tq_fixture_source.h"
-#include "mfq_source.h"
+#include "model_config.h"
+#include "engine/weights/source/transform.h"
 #include "nlohmann/json.hpp"
 #include <algorithm>
 #include <array>
@@ -139,6 +140,13 @@ struct Segment {
 
 class Fixture final:public ModelSource {
     std::shared_ptr<const ModelSource> base_;
+    std::vector<std::shared_ptr<const ModelSource>> sources_;
+    std::vector<std::shared_ptr<FileRangeReader>> files_;
+    std::unordered_map<std::string,std::shared_ptr<const ModelSource>> borrowed_;
+    std::vector<std::filesystem::path> paths_;
+    std::optional<std::string> config_;
+    std::string architecture_;
+    HadamardTransforms transforms_;
     std::vector<TensorMetadata> tensors_;
     std::unordered_map<std::string,std::size_t> index_;
     std::unordered_map<std::string,TensorReader> readers_;
@@ -148,8 +156,18 @@ public:
         std::ifstream input(path);json spec;input>>spec;
         if(spec.at("format")!="mfq-tq-fixture-v1" || spec.at("synthetic")!=true)
             throw std::invalid_argument("expected an explicit synthetic TQ fixture");
-        base_=std::make_shared<models::MfqSource>(std::filesystem::u8path(spec.at("reference").get<std::string>()));
+        const auto resolve=[&](const std::string& name) {
+            auto value=std::filesystem::u8path(name);
+            return value.is_absolute()?value:path.parent_path()/value;
+        };
+        base_=open_model_source(resolve(spec.at("reference").get<std::string>()));
+        sources_.push_back(base_);architecture_=base_->architecture();
         tensors_=base_->tensors();metadata_=base_->metadata();metadata_["tq.synthetic"]="true";
+        if(spec.contains("config_patch")) {
+            if(!spec["config_patch"].is_object())throw std::invalid_argument("fixture config patch must be an object");
+            auto config=json::parse(models::config_json(*base_));config.merge_patch(spec["config_patch"]);
+            architecture_=config.value("model_type",architecture_);config_=config.dump();
+        }
         // Synthetic conversion can replace a legacy combined Gate/Up bank
         // with two ordinary tensors, while retaining all unchanged assets.
         const auto removed=spec.value("remove_tensors",std::vector<std::string>{});
@@ -165,9 +183,8 @@ public:
                 TensorMetadata tensor;tensor.name=item.key();tensors_.push_back(std::move(tensor));
             }
         }
-        std::vector<std::shared_ptr<FileRangeReader>> files;
         for(const auto& file:spec.at("source_files"))
-            files.push_back(std::make_shared<FileRangeReader>(std::filesystem::u8path(file.get<std::string>()),model_file_read_mode()));
+            files_.push_back(std::make_shared<FileRangeReader>(resolve(file.get<std::string>()),model_file_read_mode()));
         json segmented=json::object();
         for(auto& tensor:tensors_) {
             const auto item=spec.at("tensors").find(tensor.name);
@@ -176,7 +193,7 @@ public:
             tensor.shape=item->at("shape").get<std::vector<std::int64_t>>();
             tensor.nbytes=item->at("nbytes");
             std::vector<std::shared_ptr<Segment>> segments;
-            for(const auto& segment:item->at("segments"))segments.push_back(std::make_shared<Segment>(segment,files));
+            for(const auto& segment:item->at("segments"))segments.push_back(std::make_shared<Segment>(segment,files_));
             auto reader=[segments,total=tensor.nbytes](std::uint64_t offset,std::byte* out,std::size_t bytes) {
                 if(offset>total || bytes>total-offset)throw std::out_of_range("synthetic TQ tensor read is out of bounds");
                 std::uint64_t start=0,end=offset+bytes;
@@ -212,29 +229,107 @@ public:
             }
         }
         metadata_["tq.segments"]=segmented.dump();
+        if(spec.contains("borrowed_sources")) {
+            if(!spec["borrowed_sources"].is_array())throw std::invalid_argument("fixture borrowed sources must be an array");
+            for(const auto& entry:spec["borrowed_sources"]) {
+                auto source=open_model_source(resolve(entry.at("path").get<std::string>()));
+                for(const auto& name:entry.at("tensors").get<std::vector<std::string>>()) {
+                    const auto* tensor=source->find_tensor(name);
+                    if(!tensor)throw std::invalid_argument("borrowed fixture tensor is missing: "+name);
+                    if(readers_.count(name) || !borrowed_.emplace(name,source).second)
+                        throw std::invalid_argument("fixture tensor has multiple replacements: "+name);
+                    const auto found=std::find_if(tensors_.begin(),tensors_.end(),[&](const auto& value){return value.name==name;});
+                    if(found==tensors_.end())tensors_.push_back(*tensor);else *found=*tensor;
+                }
+                sources_.push_back(std::move(source));
+            }
+        }
+        paths_.push_back(std::filesystem::weakly_canonical(path));
+        for(const auto& file:spec.at("source_files"))paths_.push_back(std::filesystem::weakly_canonical(resolve(file.get<std::string>())));
+        for(const auto& source:sources_)
+            for(const auto& value:source->source_paths())
+                if(std::find(paths_.begin(),paths_.end(),value)==paths_.end())paths_.push_back(value);
         for(std::size_t i=0;i<tensors_.size();++i)index_.emplace(tensors_[i].name,i);
+        for(const auto& tensor:tensors_)if(!readers_.count(tensor.name)) {
+            const auto& backing=underlying(tensor.name);
+            if(auto transform=source::hadamard(backing,tensor.name))
+                transforms_.emplace(tensor.name,std::move(*transform));
+        }
     }
-    const std::vector<std::filesystem::path>& source_paths()const noexcept override{return base_->source_paths();}
-    std::string_view architecture()const noexcept override{return base_->architecture();}
+    const ModelSource& underlying(std::string_view name) const {
+        if(!find_tensor(name))throw std::out_of_range("fixture tensor is missing: "+std::string(name));
+        const auto found=borrowed_.find(std::string(name));return found==borrowed_.end()?*base_:*found->second;
+    }
+    const std::vector<std::filesystem::path>& source_paths()const noexcept override{return paths_;}
+    std::string_view architecture()const noexcept override{return architecture_;}
     const std::unordered_map<std::string,std::string>& metadata()const noexcept override{return metadata_;}
+    const HadamardTransforms* hadamard_transforms()const noexcept override{return &transforms_;}
+    TensorLayout tensor_layout()const noexcept override{return base_->tensor_layout();}
     const std::vector<TensorMetadata>& tensors()const noexcept override{return tensors_;}
     const TensorMetadata* find_tensor(std::string_view name)const noexcept override {
         const auto item=index_.find(std::string(name));return item==index_.end()?nullptr:&tensors_[item->second];
     }
     TensorReader tensor_reader(std::string_view name)const override {
-        const auto item=readers_.find(std::string(name));return item==readers_.end()?base_->tensor_reader(name):item->second;
+        const auto item=readers_.find(std::string(name));return item==readers_.end()?underlying(name).tensor_reader(name):item->second;
+    }
+    TensorBatchReader tensor_batch_reader(std::string_view name)const override {
+        if(readers_.count(std::string(name)))return {};
+        return underlying(name).tensor_batch_reader(name);
+    }
+    TensorReader mapped_tensor_reader(std::string_view name)const override {
+        if(readers_.count(std::string(name)))return {};
+        return underlying(name).mapped_tensor_reader(name);
+    }
+    TensorBatchReader mapped_tensor_batch_reader(std::string_view name)const override {
+        if(readers_.count(std::string(name)))return {};
+        return underlying(name).mapped_tensor_batch_reader(name);
+    }
+    std::optional<TensorFileRange> tensor_file_range(std::string_view name)const override {
+        if(readers_.count(std::string(name)))return {};
+        return underlying(name).tensor_file_range(name);
+    }
+    std::optional<TensorFileRange> tensor_file_range_at(std::string_view name,
+            std::uint64_t offset,std::size_t size)const override {
+        if(readers_.count(std::string(name)))return {};
+        return underlying(name).tensor_file_range_at(name,offset,size);
+    }
+    std::shared_ptr<const RowResidualFile> row_residual(std::string_view name)const override {
+        if(readers_.count(std::string(name)))return {};
+        return underlying(name).row_residual(name);
     }
     void read_range_into(std::string_view name,std::uint64_t offset,std::byte* out,std::size_t size)const override {
         tensor_reader(name)(offset,out,size);
     }
-    bool supports_parallel_tensor_reads()const noexcept override{return true;}
+    bool supports_parallel_tensor_reads()const noexcept override {
+        return std::all_of(sources_.begin(),sources_.end(),[](const auto& source){return source->supports_parallel_tensor_reads();}) &&
+            std::all_of(files_.begin(),files_.end(),[](const auto& file){return file->stats().mode==FileReadMode::Direct;});
+    }
+    void drop_file_cache()const noexcept override {for(const auto& source:sources_)source->drop_file_cache();}
+    FileReadStats file_read_stats()const noexcept override {
+        FileReadStats result;
+        for(const auto& source:sources_)add_file_read_stats(result,source->file_read_stats());
+        for(const auto& file:files_)add_file_read_stats(result,file->stats());return result;
+    }
     const std::vector<std::string>& assets()const noexcept override{return base_->assets();}
     bool has_asset(std::string_view name)const noexcept override{return base_->has_asset(name);}
-    std::vector<std::byte> read_asset(std::string_view name)const override{return base_->read_asset(name);}
-    std::optional<ModelGraph> model_graph()const override{return base_->model_graph();}
+    std::vector<std::byte> read_asset(std::string_view name)const override {
+        if(name==kModelConfigAsset && config_) {
+            const auto* data=reinterpret_cast<const std::byte*>(config_->data());return {data,data+config_->size()};
+        }
+        return base_->read_asset(name);
+    }
+    std::optional<ModelGraph> model_graph()const override{return config_?std::nullopt:base_->model_graph();}
 };
 }
 std::shared_ptr<const ModelSource> open_tq_fixture_source(const std::filesystem::path& path) {
+    static thread_local std::unordered_set<std::filesystem::path> opening;
+    const auto canonical=std::filesystem::weakly_canonical(path);
+    if(opening.size()>=32 || !opening.insert(canonical).second)
+        throw std::invalid_argument("cyclic or excessively nested fixture references");
+    struct Finish {
+        std::unordered_set<std::filesystem::path>& paths;std::filesystem::path path;
+        ~Finish(){paths.erase(path);}
+    } finish{opening,canonical};
     return std::make_shared<Fixture>(path);
 }
 } // namespace tyloi
