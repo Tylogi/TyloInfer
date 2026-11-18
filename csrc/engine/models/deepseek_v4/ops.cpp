@@ -8,6 +8,7 @@
 #include "engine/models/common/load.h"
 #include "engine/models/source/model_graph.h"
 #include "engine/weights/loader.h"
+#include "engine/weights/moe/experts.h"
 #include "engine/weights/prepare/quant.h"
 #include "engine/backends/cuda/ops/projection/projection.h"
 #include "engine/backends/cuda/executor/tq/resources.h"
@@ -172,6 +173,7 @@ void load_ffn(tyloi::models::Moe& ffn, const tyloi::weights::Loader& weights, co
         throw std::runtime_error("DeepSeek V4 MoE tensor shapes disagree with config at layer " +
                                  std::to_string(i));
     }
+    tyloi::weights::prepare_experts(ffn.gate_up, ffn.down, ffn.top_k, ffn.swiglu_limit);
 }
 
 void validate_offload(const Config &config, const std::unordered_set<int>& offload) {

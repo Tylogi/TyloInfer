@@ -36,6 +36,9 @@ public:
         return result;
     }
     bool pipeline_enabled() const { return cache_->options_.policy.pipeline; }
+    void add_bundle(const MoeCachedSource& up, const MoeCachedSource& down);
+    void begin_routes(const MoeRoutePlan& route);
+    void finish_routes(const MoeRoutePlan& route);
     bool two_stage_compatible() const {
         return std::all_of(cohorts_.begin(),cohorts_.end(),[](const auto& cohort) {
             const auto& p=*cohort.cpu;
@@ -387,6 +390,7 @@ public:
 
     std::vector<int32_t> route_experts(
             const MoeRoutePlan & route) const {
+        cache_->finish_pipeline_exchanges();
         if (!route.host_unique_experts) {
             auto ids = cache_->read_route_ids(route, cpu_->n_experts);
             cache_->observe_route(id_, layer_id_, route, ids, cpu_->n_experts);

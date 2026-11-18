@@ -1,6 +1,7 @@
 #include "engine/models/session/snapshot.h"
 #include "engine/models/common/load.h"
 #include "engine/weights/loader.h"
+#include "engine/weights/moe/experts.h"
 #include "ops.h"
 #include "vision.h"
 #include "engine/models/common/check.h"
@@ -22,6 +23,7 @@ tyloi::models::Moe load_moe_at(const tyloi::weights::Loader& weights,
     result.routing.scale = config.routed_scaling;
     result.swiglu_limit = config.swiglu_limit;
     result.shared.swiglu_limit = config.swiglu_limit;
+    tyloi::weights::prepare_experts(result.gate_up, result.down, result.top_k, result.swiglu_limit);
     return result;
 }
 

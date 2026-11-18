@@ -3,6 +3,9 @@
 #include "engine/backends/cuda/native/profile.h"
 #include "engine/weights/encoding/format_features.h"
 #include "engine/weights/moe/experts.h"
+#if TYLOINFER_ENABLE_MFQ_COMPAT
+#include "engine/weights/moe/residency/cached_source_internal.h"
+#endif
 
 #include <climits>
 #include <stdexcept>
@@ -113,22 +116,30 @@ ExpertBatch::ExpertBatch(std::span<const Tensor> banks, const Tensor& down, cons
     }
     b.route.row_offset = row_offset;
     b.route.row_total = row_total;
-#if TYLOINFER_ENABLE_MFQ_COMPAT
-    if (!b.sharded && !tq_routed) {
-        const auto& first = b.split ? b.gate : (b.ungated ? b.up : b.gate_up);
-        if (executor.options().ffn.delayed_readback) {
-            if (first) cuda::prefetch_experts(*first, b.route, true);
-        } else {
-            b.bundle_prefetched = b.prefetch_bundle();
-            if (!b.bundle_prefetched && first) cuda::prefetch_experts(*first, b.route);
-        }
-    }
-#endif
+    if (!cuda::Executor::current_ffn().batch_serial) b.prepare();
 }
 
 ExpertBatch::~ExpertBatch() = default;
 ExpertBatch::ExpertBatch(ExpertBatch&&) noexcept = default;
 ExpertBatch& ExpertBatch::operator=(ExpertBatch&&) noexcept = default;
+
+void ExpertBatch::Impl::prepare() {
+    if (prepared) return;
+#if TYLOINFER_ENABLE_MFQ_COMPAT
+    const bool tq_routed = bool(tq.gate || tq.up || tq.down);
+    if (!sharded && !tq_routed) {
+        if (down && down->cached_source) down->cached_source->begin_routes(route);
+        const auto& first = split ? gate : (ungated ? up : gate_up);
+        if (cuda::Executor::current().options().ffn.delayed_readback) {
+            if (first) cuda::prefetch_experts(*first, route, true);
+        } else {
+            bundle_prefetched = prefetch_bundle();
+            if (!bundle_prefetched && first) cuda::prefetch_experts(*first, route);
+        }
+    }
+#endif
+    prepared = true;
+}
 
 bool ExpertBatch::Impl::prefetch_bundle() {
 #if TYLOINFER_ENABLE_MFQ_COMPAT
@@ -151,6 +162,8 @@ bool ExpertBatch::Impl::prefetch_bundle() {
 }
 
 void ExpertBatch::Impl::ready() {
+    if (readied) return;
+    prepare();
 #if TYLOINFER_ENABLE_MFQ_COMPAT
     const bool tq_routed = bool(tq.gate || tq.up || tq.down);
     if (!sharded && !tq_routed && cuda::Executor::current().options().ffn.delayed_readback) {
@@ -158,6 +171,14 @@ void ExpertBatch::Impl::ready() {
         const auto& first = split ? gate : (ungated ? up : gate_up);
         if (!bundle_prefetched && first) cuda::prefetch_experts(*first, route);
     }
+#endif
+    readied = true;
+}
+
+void ExpertBatch::Impl::retire() {
+#if TYLOINFER_ENABLE_MFQ_COMPAT
+    if (!sharded && !tq.gate && !tq.up && !tq.down && down && down->cached_source)
+        down->cached_source->finish_routes(route);
 #endif
 }
 

@@ -105,6 +105,7 @@ tyloi::weights::PreparedExperts MoeCachedSource::prepare(
     using tyloi::weights::ExpertProjection;
     using tyloi::weights::PreparedExperts;
 
+    cache_->finish_pipeline_exchanges();
     PreparedExperts result;
     result.complete = cache_->complete_residency();
     result.quantized = bool(quant_source_);
@@ -283,10 +284,22 @@ namespace tyloi::weights {
 void prepare_experts(std::span<const ::tyloi::Tensor> gate_up,
                      const ::tyloi::Tensor& down,
                      std::int64_t top_k, double limit) {
-    // Preparation validates routed weight readiness. Graph/capture support is
-    // decided by the execution driver from its own TQ/cache conditions.
+    // Graph/capture support is decided by the execution driver.
     (void)top_k;
     (void)limit;
+#if TYLOINFER_ENABLE_MFQ_COMPAT
+    if ((gate_up.size() == 1 || gate_up.size() == 2) && down.defined()) {
+        const auto* gate = gate_up[0].representation<MfeTensor>();
+        const auto* up = gate_up.back().representation<MfeTensor>();
+        const auto* output = down.representation<MfeTensor>();
+        if (gate && up && output && gate->cached_source && up->cached_source &&
+            output->cached_source &&
+            (gate_up.size() == 2 ||
+             (gate->out_per_expert % 2 == 0 &&
+              gate->out_per_expert / 2 == output->neuron_len)))
+            gate->cached_source->add_bundle(*up->cached_source, *output->cached_source);
+    }
+#endif
     if (gate_up.size() != 2 || !down.defined()) return;
     const auto banks = ::tq_banks(gate_up[0], gate_up[1], down);
     const bool any = bool(banks.gate || banks.up || banks.down);

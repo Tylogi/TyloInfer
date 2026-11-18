@@ -152,30 +152,49 @@ Tensor Ffn::routed_shared(const Tensor& input_tensor, const Tensor& route_weight
     std::optional<MfqCudaGuard> device_guard;
     device_guard.emplace(input.device());
 
-    auto run = [&](const DenseTensor& source, const DenseTensor& weights,
-                   const DenseTensor& shared_source, const DenseTensor& selected_ids) {
+    auto& executor = cuda::Executor::current();
+    auto run = [&](weights::ExpertBatch::Impl& selected, const DenseTensor& source,
+                   const DenseTensor& weights, const DenseTensor& shared_source,
+                   const DenseTensor& selected_ids) {
         // Enqueue shared projections first to preserve overlap with selected experts.
         auto shared = cuda::MoeSharedExpert(shared_gate_up[0], shared_gate_up[1],
                                             shared_down, gate_weight)
                           .forward(shared_source, projection_rows);
-        Tensor source_handle{source};
-        Tensor ids_handle{selected_ids};
-        Tensor weights_handle{weights};
-        auto routed = ::tyloi::ops::experts(source_handle, ids_handle,
-                                            weights_handle, b.gate_up_weights,
-                                            b.down_weight, b.down_weight.size(2)).dense();
+        selected.ready();
+        auto project = executor.projector(cuda::Executor::current_ffn());
+        DenseTensor routed;
+        if (selected.tq.gate) {
+            routed = executor.profiler().measure("tq.moe", [&] {
+                return project.run(selected.tq, source, selected_ids, weights);
+            });
+        } else {
+            const auto expert = [&](const Tensor& bank, DenseTensor value) {
+                if (selected.down) return project.run(bank, std::move(value), selected.route);
+                return project.run(bank, std::move(value), selected_ids);
+            };
+            const auto width = selected.down_weight.size(2);
+            auto gu = expert(selected.gate_up_weights[0], source);
+            if (selected.gate_up_weights.size() == 2)
+                gu = cuda::cat({gu, expert(selected.gate_up_weights[1], source)}, -1);
+            auto gate = gu.narrow(-1, 0, width), up = gu.narrow(-1, width, width);
+            auto pairs = expert(selected.down_weight, (gate * cuda::sigmoid(gate)) * up);
+            routed = cuda::zeros({source.size(0), source.size(1)}, source.options().dtype(kFloat32));
+            for (std::int64_t route = 0; route < selected_ids.size(1); ++route)
+                routed = routed + pairs.select(1, route).to(kFloat32) * weights.select(1, route).unsqueeze(-1);
+            routed = routed.to(pairs.scalar_type());
+        }
+        selected.retire();
         return (routed + shared).contiguous();
     };
 
     const auto& mode = cuda::Executor::current_ffn();
     if (!mode.batch_serial || input.size(0) <= 1) {
-        return std::make_shared<DenseTensor>(run(input, route_weights, gate_input, ids));
+        return std::make_shared<DenseTensor>(run(b, input, route_weights, gate_input, ids));
     }
     const auto option = cuda::options::continuous_ffn_tile();
     const auto rows = option ? *option : 8;
     TYLOINFER_RUNTIME_CHECK(rows == 8 || rows == 16,
                             "continuous FFN tile must be 8 or 16 rows");
-    auto& executor = cuda::Executor::current();
     auto* window = cuda::DecodeWindow::recording();
     const int previous_profile_tile = window ? window->set_profile_tile(-1) : -1;
     auto& ffn_mode = executor.mode().ffn;
@@ -201,10 +220,15 @@ Tensor Ffn::routed_shared(const Tensor& input_tensor, const Tensor& route_weight
         tile_mode.tiles = ffn_mode.tiles;
         auto tile_scope = executor.enter(tile_mode);
         const auto count = std::min(rows, input.size(0) - start);
-        outputs.push_back(run(input.narrow(0, start, count).contiguous(),
+        auto tile_ids = ids.narrow(0, start, count).contiguous();
+        std::optional<weights::ExpertBatch> tile;
+        if (b.down)
+            tile.emplace(b.gate_up_weights, b.down_weight, Tensor{tile_ids},
+                         b.route.row_offset + start, b.route.row_total, b.activation);
+        outputs.push_back(run(tile ? *tile->impl_ : b, input.narrow(0, start, count).contiguous(),
                               route_weights.narrow(0, start, count).contiguous(),
                               gate_input.narrow(0, start, count).contiguous(),
-                              ids.narrow(0, start, count).contiguous()));
+                              tile_ids));
     }
     return std::make_shared<DenseTensor>(::tyloi::cuda::cat(outputs, 0));
 }

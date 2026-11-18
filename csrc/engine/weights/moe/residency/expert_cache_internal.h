@@ -586,6 +586,7 @@ public:
     void calibrate_pipeline_pcie();
     bool complete_residency() const noexcept { return complete_residency_; }
     bool pipeline_ready() const noexcept { return complete_residency_ || ssd_experts_; }
+    MoeResidencyManager* ensure_residency();
     bool ssd_experts() const noexcept { return ssd_experts_; }
     bool suspend_residency(bool suspended) {
         if(suspended)finish_pipeline_exchanges();

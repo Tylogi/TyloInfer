@@ -575,6 +575,7 @@ RoutedExperts Ffn::routed(const Tensor& input_tensor, const Tensor& weights_tens
 #else
     else throw std::runtime_error("Legacy MFQ inference requires a compatibility build");
 #endif
+    b.retire();
     return {owner(std::move(result)), reduced};
 }
 

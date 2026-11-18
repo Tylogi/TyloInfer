@@ -16,10 +16,13 @@ struct ExpertBatch::Impl {
     std::shared_ptr<const DenseTensor> dense_gate, dense_up, dense_gate_up, dense_down;
     MoeRoutePlan route;
     bool split = false, sharded = false, bundle_prefetched = false;
+    bool prepared = false, readied = false;
     ops::MlpActivation activation = ops::MlpActivation::silu_gated;
     bool ungated = false;
 
+    void prepare();
     void ready();
+    void retire();
     std::shared_ptr<const MfeTensor> stage(const std::shared_ptr<const MfeTensor>& source,
                                            const char* label);
 private:

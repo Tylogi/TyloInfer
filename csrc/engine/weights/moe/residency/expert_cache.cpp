@@ -5,6 +5,7 @@
 #include "engine/weights/moe/prepare/load.h"
 #include "env.h"
 #include "engine/backends/cuda/executor/options.h"
+#include "engine/backends/cuda/executor/executor.h"
 #include "engine/weights/moe/residency/expert_cache.h"
 #include "engine/weights/moe/residency/cached_source_internal.h"
 #include "engine/backends/cuda/ops/ffn/experts/moe.h"
@@ -86,6 +87,58 @@ std::size_t MoeExpertCache::reclaim_optional_host(std::size_t allocation_bytes) 
     return released;
 }
 
+void MoeCachedSource::add_bundle(const MoeCachedSource& up, const MoeCachedSource& down) {
+    if (!pipeline_enabled() || up.cache_ != cache_ || down.cache_ != cache_ ||
+        !quant_source_ || !up.quant_source_ || !down.quant_source_ ||
+        id_ == down.id_ || up.id_ == down.id_ ||
+        layer_id_ != up.layer_id_ || layer_id_ != down.layer_id_ ||
+        n_experts() != up.n_experts() || n_experts() != down.n_experts()) return;
+    const std::array<int, 3> bundle{id_, up.id_, down.id_};
+    if (std::find(cache_->pipeline_bundles_.begin(), cache_->pipeline_bundles_.end(), bundle) !=
+        cache_->pipeline_bundles_.end()) return;
+    if (cache_->finalized_) throw std::logic_error("cannot register a MoE bundle after cache finalization");
+    cache_->pipeline_bundles_.push_back(bundle);
+}
+
+MoeResidencyManager* MoeExpertCache::ensure_residency() {
+    if (!finalized_ || !options_.policy.pipeline || !pipeline_ready() || pipeline_bundles_.empty()) return nullptr;
+    const MfqCudaGuard guard(owner_device_);
+    cudaStreamCaptureStatus capture;
+    TYLOINFER_CUDA_CHECK(cudaStreamIsCapturing(mfq_get_current_cuda_stream().stream(), &capture));
+    if (capture != cudaStreamCaptureStatusNone) return nullptr;
+    if (!moe_residency_) {
+        moe_residency_ = std::make_unique<MoeResidencyManager>(this);
+    }
+    return moe_residency_.get();
+}
+
+void MoeCachedSource::begin_routes(const MoeRoutePlan& route) {
+    if (std::none_of(cache_->pipeline_bundles_.begin(), cache_->pipeline_bundles_.end(),
+                     [&](const auto& bundle) { return bundle[2] == id_; })) return;
+    const MfqCudaGuard guard(cache_->owner_device_);
+    if (auto* manager = cache_->ensure_residency()) {
+        manager->before_layer(layer_id_);
+        (void)route_experts(route);
+    }
+}
+
+void MoeCachedSource::finish_routes(const MoeRoutePlan& route) {
+    if (!cache_->moe_residency_ ||
+        std::none_of(cache_->pipeline_bundles_.begin(), cache_->pipeline_bundles_.end(),
+                     [&](const auto& bundle) { return bundle[2] == id_; })) return;
+    const MfqCudaGuard guard(cache_->owner_device_);
+    cudaStreamCaptureStatus capture;
+    TYLOINFER_CUDA_CHECK(cudaStreamIsCapturing(mfq_get_current_cuda_stream().stream(), &capture));
+    if (capture != cudaStreamCaptureStatusNone) return;
+    const auto rows = route.ids.size(0);
+    const auto total = route.row_total > 0 ? route.row_total : rows;
+    if (total > std::numeric_limits<int>::max())
+        throw std::runtime_error("cached MoE route publication coordinates mismatch");
+    if (route.row_offset + rows == total)
+        cache_->moe_residency_->after_layer(layer_id_, {}, static_cast<int>(total), false,
+            tyloi::cuda::Executor::current_ffn().batch_serial);
+}
+
 void MoeExpertCache::observe_route(int source_id, int layer, const MoeRoutePlan & route,
                                    std::span<const int32_t> ids, int n_experts) {
     const auto rows64 = route.ids.size(0);
@@ -106,8 +159,14 @@ void MoeExpertCache::observe_route(int source_id, int layer, const MoeRoutePlan 
     const int routes = static_cast<int>(routes64);
     const int row_offset = static_cast<int>(row_offset64);
     const int row_total = static_cast<int>(row_total64);
-    if (moe_residency_)
-        moe_residency_->observe_routes(layer, ids, rows, row_offset, row_total);
+    if (moe_residency_ && std::any_of(pipeline_bundles_.begin(), pipeline_bundles_.end(),
+            [&](const auto& bundle) { return bundle[2] == source_id; })) {
+        cudaStreamCaptureStatus capture;
+        TYLOINFER_CUDA_CHECK(cudaStreamIsCapturing(mfq_get_current_cuda_stream().stream(), &capture));
+        if (capture == cudaStreamCaptureStatusNone)
+            moe_residency_->observe_routes(layer, ids, rows, row_offset, row_total,
+                tyloi::cuda::Executor::current_ffn().batch_serial);
+    }
     if (!kv_expert_loan_) return;
     std::array<int64_t, 3> sources{source_id, source_id, source_id};
     for (const auto & bundle : pipeline_bundles_) {
@@ -2762,15 +2821,19 @@ bool set_moe_reuse_learning(const std::shared_ptr<MoeExpertCache>& cache,bool en
 }
 void begin_moe_speculative_routes(const std::shared_ptr<MoeExpertCache>& cache,int rows) {
     const auto* option=tyloi::cuda::env_lookup("TYLOINFER_MOE_MTP_COMMITTED_HEAT");
-    if(cache && cache->moe_residency_ && (!option || option[0]!='0'))
-        cache->moe_residency_->begin_speculative_routes(rows);
+    if(cache && (!option || option[0]!='0'))
+        if(auto* manager=cache->ensure_residency()) {
+            manager->begin_speculative_routes(rows);
+        }
     const auto* kv_lru=tyloi::cuda::env_lookup("TYLOINFER_MOE_MTP_KV_LRU");
     if(cache && cache->kv_expert_loan_ && (!kv_lru || kv_lru[0]!='0'))
         cache->kv_expert_loan_->begin_speculative(rows);
 }
 void commit_moe_speculative_routes(const std::shared_ptr<MoeExpertCache>& cache,
         std::span<const std::uint8_t> keep,bool executed) {
-    if(cache && cache->moe_residency_)cache->moe_residency_->commit_speculative_routes(keep,executed);
+    if(cache && cache->moe_residency_) {
+        cache->moe_residency_->commit_speculative_routes(keep,executed);
+    }
     if(cache && cache->kv_expert_loan_)cache->kv_expert_loan_->commit_speculative(keep);
 }
 void discard_moe_speculative_routes(const std::shared_ptr<MoeExpertCache>& cache) noexcept {

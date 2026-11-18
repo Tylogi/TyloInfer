@@ -3,6 +3,7 @@
 #include "engine/models/session/snapshot.h"
 #include "engine/models/common/load.h"
 #include "engine/weights/loader.h"
+#include "engine/weights/moe/experts.h"
 #include "engine/models/glm_dsa/snapshot.h"
 #include "engine/models/glm_dsa/model.h"
 #include "engine/models/glm_dsa/state.h"
@@ -301,6 +302,8 @@ void load_layer(Layer& layer, const ::tyloi::weights::Loader& weights, const Con
     layer.device = weights.placement.target.index;
     TransformerWeightLoader loader{weights};
     tyloi::models::glm_dsa::load_layer_weights(layer, loader, config, index, type);
+    if (const auto* moe = std::get_if<tyloi::models::Moe>(&layer.ffn))
+        tyloi::weights::prepare_experts(moe->gate_up, moe->down, moe->top_k, moe->swiglu_limit);
 }
 
 Model read(std::shared_ptr<const tyloi::ModelSource> source, std::string_view definition,

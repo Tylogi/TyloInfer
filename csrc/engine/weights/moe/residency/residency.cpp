@@ -3,6 +3,7 @@
 #include "engine/backends/cuda/executor/graph/window.h"
 #include "engine/backends/cuda/kernels/moe/pipeline.h"
 #include "engine/backends/cuda/native/dma_batch.h"
+#include "engine/backends/cuda/native/context.h"
 #include "engine/weights/moe/residency/cached_source_internal.h"
 #include "engine/backends/cuda/native/memory.h"
 #include "engine/backends/cpu/executor/expert_pool.h"
@@ -279,6 +280,7 @@ struct MoeResidencyManager::Impl {
     std::vector<cudaEvent_t> preserve_events;
     cudaEvent_t done=nullptr;
     cudaEvent_t window_done=nullptr;
+    tyloi::cuda::StreamHandle compute_stream;
     std::unique_ptr<tyloi::cuda::HostBuffer> expert_done_host;
     uint32_t* expert_done_device=nullptr;
     cudaStream_t expert_compute_stream=nullptr;
@@ -632,7 +634,7 @@ void MoeResidencyManager::release_transfer_stages() {
     for(auto& stages:impl_->transfer_stages)for(auto& stage:stages)stage.arena=nullptr;
 }
 void MoeResidencyManager::before_layer(int layer) {
-    auto& s=*impl_;if(layer!=s.first && layer>=0)return;
+    auto& s=*impl_;
     if(layer<0 && s.predictor_overlap_scope){prepare_predictor();return;}
     s.predictor_overlap_scope=false;
     // Eager MTP enters the predictor before the next backbone layer zero.
@@ -705,6 +707,8 @@ void MoeResidencyManager::commit_speculative_routes(std::span<const std::uint8_t
     const auto accepted=s.route_history->selected(keep);
     const bool learning=s.cache->reuse_learning();
     if(s.cache->ssd_experts()) {
+        // Commit reads residency to decide which host accesses to retain.
+        apply_pending();
         s.speculative_host_keys.clear();
         // Commit in ordinary decode order: each accepted token visits all
         // layers. Frequency and recency must not depend on verify batch size.
@@ -748,7 +752,7 @@ void MoeResidencyManager::observe_routes(int layer, std::span<const int32_t> ids
                !ids.empty() && (!s.route_history->pending() || layer<0))
                 s.route_history->stage_prefill(b,ids,tokens);
             else
-                s.route_history->observe(b, ids, tokens, independent_sequences,
+                s.route_history->observe(b, ids, tokens, independent_sequences && !s.route_history->pending(),
                                          row_offset, row_total, learning);
         }
 }
@@ -787,7 +791,8 @@ void MoeResidencyManager::after_layer(int layer,const std::vector<int32_t>& ids,
     // Capture this transaction's producer fence now. compute_done_ is also
     // recorded by later predictor calls and cannot be read asynchronously by
     // the worker without risking a dependency on its own downstream DMA.
-    TYLOINFER_CUDA_CHECK(cudaEventRecord(s.window_done,mfq_get_current_cuda_stream().stream()));
+    s.compute_stream=tyloi::cuda::current_stream();
+    TYLOINFER_CUDA_CHECK(cudaEventRecord(s.window_done,s.compute_stream.stream()));
     if(window_inflight)++s.window_prepares;
     if(!s.worker.joinable())s.worker=std::thread([this] {
         auto& state=*impl_;
@@ -805,6 +810,7 @@ void MoeResidencyManager::after_layer(int layer,const std::vector<int32_t>& ids,
                     TYLOINFER_CUDA_CHECK(cudaSetDevice(state.cache->owner_device_));
                     device_ready=true;
                 }
+                const tyloi::cuda::StreamGuard stream_guard(state.compute_stream);
                 prepare();
                 if(state.async_publish && !state.ssd_predictor_isolated) {
                     std::unique_lock<std::mutex> finish_lock(state.worker_mutex);
@@ -817,7 +823,10 @@ void MoeResidencyManager::after_layer(int layer,const std::vector<int32_t>& ids,
             }
             catch(...) {
                 auto failure=std::current_exception();
-                try {rollback();}catch(...) {failure=std::current_exception();}
+                try {
+                    const tyloi::cuda::StreamGuard stream_guard(state.compute_stream);
+                    rollback();
+                } catch(...) {failure=std::current_exception();}
                 state.error=failure;
             }
             // Keep borrowed cache addresses protected through rollback as well
@@ -1865,8 +1874,9 @@ void MoeResidencyManager::apply_pending() {
     // addresses pinned until publication (or rollback) retires their reads.
     struct ReleaseReads {
         decltype(s.exchange_reads)& guard;
-        ~ReleaseReads(){guard.reset();}
-    } release_reads{s.exchange_reads};
+        tyloi::cuda::StreamHandle& stream;
+        ~ReleaseReads(){guard.reset();stream={};}
+    } release_reads{s.exchange_reads,s.compute_stream};
     if(s.error){auto failure=s.error;s.error=nullptr;std::rethrow_exception(failure);}
     publish_pending();
     const auto elapsed=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count();

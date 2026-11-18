@@ -11,6 +11,7 @@
 #include "engine/models/load.h"
 #include "engine/models/source/model_graph.h"
 #include "engine/weights/loader.h"
+#include "engine/weights/moe/experts.h"
 #include "engine/weights/cache/cache.h"
 #include "engine/weights/source/read.h"
 
@@ -172,6 +173,11 @@ void load_layer(Layer& result, const ::tyloi::weights::Loader& weights, const Co
         loader.load_linear_attention(linear.attention, config, index, tensor_root);
         linear.ffn = tyloi::models::qwen35::load_ffn(loader, config, index, tensor_root);
     }
+    if (weights.placement.target.is_cuda())
+        std::visit([](const auto& layer) {
+            if (const auto* moe = std::get_if<models::Moe>(&layer.ffn))
+                tyloi::weights::prepare_experts(moe->gate_up, moe->down, moe->top_k, moe->swiglu_limit);
+        }, result.weights);
 }
 
 Layer load_layer(const ::tyloi::weights::Loader& weights, const Config& config,
