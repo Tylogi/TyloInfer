@@ -199,6 +199,9 @@ bool parse_load_option(
     else if (option == "--moe-cache-profile") {
         result.moe_cache_profile_path = args.value(option);
     }
+    else if (option == "--dflash2-draft") {
+        result.dflash2_draft_path = args.value(option);
+    }
     else if (option == "--tensor-parallel") {
         result.tensor_parallel.devices = parse_parallel_devices(
             args.value(option), "--tensor-parallel");

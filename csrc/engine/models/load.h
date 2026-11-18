@@ -36,6 +36,7 @@ struct LoadOptions {
     bool host_tokens = false;
     bool optional_components = true;
     tyloi::state::KvQuantization kv_quantization;
+    std::string dflash2_draft_path;
 };
 
 /** Assemble the model into an owner retained by the caller. */

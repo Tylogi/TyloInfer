@@ -18,6 +18,8 @@ void reload(engine::Engine&, engine::EngineOptions);
 
 namespace tyloi::engine {
 std::unique_ptr<Engine> load(EngineOptions options) {
+    if (!options.dflash2_draft_path.empty() && !options.device.is_cuda())
+        throw std::invalid_argument("--dflash2-draft requires CUDA");
     auto reload_options = options;
     std::unique_ptr<Engine> result;
 #if TYLOINFER_HAS_CUDA
@@ -31,6 +33,8 @@ std::unique_ptr<Engine> load(EngineOptions options) {
     return result;
 }
 void reload(Engine& engine, EngineOptions options) {
+    if (!options.dflash2_draft_path.empty() && !options.device.is_cuda())
+        throw std::invalid_argument("--dflash2-draft requires CUDA");
 #if TYLOINFER_HAS_CUDA
     if (options.device.is_cuda()) return cuda::reload(engine, std::move(options));
 #endif

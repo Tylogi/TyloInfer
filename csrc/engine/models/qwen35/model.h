@@ -1,8 +1,8 @@
 #pragma once
 
 #include "engine/models/qwen35/config.h"
-#include "engine/models/qwen35/mtp.h"
 #include "engine/models/causal_model.h"
+#include "engine/models/common/mtp.h"
 #include "engine/models/common/vision/grid_encoder.h"
 #include "engine/models/metadata.h"
 #include "engine/models/input.h"
@@ -54,7 +54,7 @@ struct Model : tyloi::models::CausalModel {
     ::tyloi::Tensor output_norm;
     std::vector<Layer> layers;
     std::optional<tyloi::models::grid::Vision> vision;
-    std::unique_ptr<qwen35::Mtp> mtp;
+    std::unique_ptr<tyloi::models::Mtp> mtp;
     bool recurrent_transposed = false;
     tyloi::state::KvQuantization kv_quantization;
     tyloi::models::Info info() const override;

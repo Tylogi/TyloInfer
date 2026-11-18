@@ -9,6 +9,8 @@ namespace tyloi::models::qwen35 {
 
 tyloi::models::Info Model::info() const {
     auto result = tyloi::models::model_info(metadata);
+    if (mtp && !mtp->target_layers().empty())
+        result.raw_row_bytes = std::size_t(metadata.hidden_size) * mtp->target_layers().size() * sizeof(float);
     for (const auto& layer : layers)
         if (layer.device.is_cpu()) result.decode_graph = false;
     return result;

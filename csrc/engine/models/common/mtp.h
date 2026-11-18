@@ -98,6 +98,8 @@ struct Mtp {
         return tyloi::engine::mtp::kMaximumDraftDepth;
     }
     virtual bool blockwise_drafting() const noexcept { return false; }
+    virtual std::span<const std::int64_t> target_layers() const noexcept { return {}; }
+    virtual std::int64_t target_context_window() const noexcept { return 0; }
     virtual std::unique_ptr<tyloi::engine::mtp::DepthPolicy> depth_policy(
             int maximum_depth, tyloi::engine::mtp::PolicyState& state) const {
         return std::make_unique<tyloi::engine::mtp::AdaptivePolicy>(maximum_depth, &state);
@@ -148,6 +150,7 @@ struct Mtp {
             "this CUDA MTP predictor has no block-draft adapter");
     }
     virtual Tensor draft_next(
+        MtpState&,
         const Tensor&,
         const Tensor&) const {
         throw std::runtime_error("this CUDA MTP predictor has no block-draft adapter");

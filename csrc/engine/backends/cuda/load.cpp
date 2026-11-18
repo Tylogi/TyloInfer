@@ -112,7 +112,10 @@ std::unique_ptr<engine::Engine> load_native_engine(tyloi::engine::EngineOptions 
                 const auto loader = weights->loader(*source, load.weights,
                     {Device(kCUDA, load.layer_placement.primary_device()), load.drop_file_cache,
                         load.tensor_parallel, moe_parallel_config(load)});
-                const auto policy = model_options(load, options.context_size, true, root->mode().transposed);
+                auto policy = model_options(load, options.context_size, true, root->mode().transposed);
+                policy.dflash2_draft_path = options.dflash2_draft_path;
+                if (policy.dflash2_draft_path.empty())
+                    if (const auto* path = env_lookup("TYLOINFER_DFLASH2_DRAFT")) policy.dflash2_draft_path = path;
                 models::load(model, source, definition, loader, load.layer_placement, policy);
                 load.dense_cpu_layer_count = load.n_gpu_layers >= 0
                     ? static_cast<int>(std::max<std::int64_t>(models::graph(*source).topology.text_layers - load.n_gpu_layers, 0)) : 0;

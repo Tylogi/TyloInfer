@@ -204,18 +204,18 @@ struct MtpOps {
         return hidden;
     }
     struct PrefillResult { Tensor hidden, raw; double elapsed; };
-    PrefillResult prefill(PrefillChunk chunk) {
+    PrefillResult prefill(PrefillChunk chunk, bool capture_raw) {
         Tensor raw;
         auto ids = slice(input_ids, 1, chunk.offset, chunk.count);
         models::Input input;
-        input.ids = std::move(ids); input.raw_hidden = &raw; input.advance = true;
+        input.ids = std::move(ids); input.raw_hidden = capture_raw ? &raw : nullptr; input.advance = true;
         if (prepared && prepared->transformed()) {
             if (prepared->embeddings) input.embeddings = slice(prepared->embeddings, 1, chunk.offset, chunk.count);
             if (prepared->positions) input.positions = slice(prepared->positions, -1, chunk.offset, chunk.count);
         }
         const std::array<Device, 1> devices{device};
         const auto available = executor.memory(devices).front().allocatable;
-        const bool host = mtp.host_prompt_history(chunk.count, available, info.raw_row_bytes);
+        const bool host = capture_raw && mtp.host_prompt_history(chunk.count, available, info.raw_row_bytes);
         auto result = engine::prefill(model, state, executor, weights, budget, options,
             std::move(input), prefill_chunk_size, output, host);
         if (prepared && prepared->transformed()) state.set_position_delta(prepared->decode_position_delta);
@@ -434,7 +434,9 @@ Generation speculative_sequence(MtpOps ops, InferenceRequest &request, Inference
     auto &predictor = ops.predictor;
     auto &mtp_state = ops.mtp_state;
     const auto append_blockwise_context=[&](Tensor context,int64_t start) {
+        auto scope = ops::dense_scope(&ops.predictor_execution, ops.device);
         mtp.append_target_context(predictor,std::move(context),start);
+        ops.predictor_execution.submit(predictor.storage());
     };
     const auto *prepared = ops.prepared;
     using Clock = std::chrono::steady_clock;
@@ -530,9 +532,12 @@ Generation speculative_sequence(MtpOps ops, InferenceRequest &request, Inference
         bool stream_boundary_pair_pending=false;
         const auto prime_blockwise=[&](Tensor context,int64_t position,bool seed) {
             if(seed) {
+                auto scope = ops::dense_scope(&ops.predictor_execution, ops.device);
                 mtp.seed_target_context(predictor, context,position);
-            } else mtp.append_target_context(predictor, context,position-ops.size(context,1));
+                ops.predictor_execution.submit(predictor.storage());
+            } else append_blockwise_context(context, position - ops.size(context, 1));
         };
+        const auto context_window = mtp.target_context_window();
         const bool stream_prompt_history = mtp.teacher_forced_prompt_prime() && !mtp.blockwise_drafting() &&
             ops.stream_prompt_history(ops.size(input_ids, 1));
         const int64_t predictor_chunk = ops.predictor_prefill_chunk_size(prefill_chunk_size);
@@ -565,9 +570,12 @@ Generation speculative_sequence(MtpOps ops, InferenceRequest &request, Inference
                 next_prefill_chunk(ops.size(input_ids, 1), offset, prefill_chunk_size);
             if(checkpoint>offset)chunk.count=std::min(chunk.count,checkpoint-offset);
             chunk.last=chunk.offset+chunk.count==ops.size(input_ids,1);
+            const auto end = offset + chunk.count;
+            const auto boundary = checkpoint > offset ? checkpoint : ops.size(input_ids, 1);
+            const auto first = context_window > 0 ? std::max(offset, boundary - context_window) : offset;
             auto step = [&] {
                 PrefillActivity activity;
-                return ops.prefill(chunk);
+                return ops.prefill(chunk, first < end);
             }();
             hidden = std::move(step.hidden);
             if (stream_prompt_history) {
@@ -589,6 +597,11 @@ Generation speculative_sequence(MtpOps ops, InferenceRequest &request, Inference
                 }
                 prime_rows(ops.slice(step.raw, 1, 0, pairs), offset + 1, pairs);
                 raw = ops.clone(ops.slice(step.raw, 1, ops.size(step.raw, 1) - 1, 1));
+            } else if (context_window > 0) {
+                if (first < end) {
+                    raw_chunks.push_back(first == offset ? std::move(step.raw) :
+                        tyloi::ops::clone(ops.slice(step.raw, 1, first - offset, end - first)));
+                }
             } else {
                 raw_chunks.push_back(std::move(step.raw));
             }
@@ -851,13 +864,24 @@ Generation speculative_sequence(MtpOps ops, InferenceRequest &request, Inference
                     "block predictor cache did not advance");
                 if (requested_depth > 0) {
                     auto anchor=ops.ids_for({next_ids.back()});
+                    if (greedy && !penalties && !mtp.split_target_verification()) {
+                        auto queued = ops.greedy_draft(hidden_rows, anchor, requested_depth);
+                        if (queued.ids) {
+                            require_execution(predictor.position() == predictor_history_position,
+                                "block draft changed committed context");
+                            maintenance = maintenance || queued.initialized;
+                            result.queued = std::move(queued.ids);
+                            return result;
+                        }
+                    }
+                    auto scope = ops::dense_scope(&ops.predictor_execution, ops.device);
                     auto block_result = mtp.draft_block(predictor,anchor,requested_depth);
                     const auto& block = block_result;
                     require_execution(ops.size(block, 1) == requested_depth,
                         "block predictor returned an incomplete draft");
                     auto previous = std::move(anchor);
                     for (int position = 0; position < requested_depth; ++position) {
-                        auto logits = mtp.draft_next(ops.slice(block, 1, position, 1), previous);
+                        auto logits = mtp.draft_next(predictor, ops.slice(block, 1, position, 1), previous);
                         const auto token = select_draft(logits);
                         previous = ops.ids_for({token});
                     }

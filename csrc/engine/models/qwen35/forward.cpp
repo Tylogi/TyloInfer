@@ -15,6 +15,19 @@ void require_forward(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
 }
 
+void capture_target(std::span<const std::int64_t> layers, std::size_t index,
+                    const Tensor& hidden, Device primary, std::vector<Tensor>& values) {
+    if (values.size() < layers.size() && layers[values.size()] == std::int64_t(index)) {
+        ops::DeviceScope scope(primary);
+        values.push_back(ops::contiguous(ops::cast(ops::copy(hidden, primary), kFloat32)));
+    }
+}
+
+Tensor target_raw(std::span<const std::int64_t> layers, std::vector<Tensor>& values) {
+    require_forward(values.size() == layers.size(), "DFlash2 target hidden states were not fully captured");
+    return ops::contiguous(ops::cat(values, -1));
+}
+
 Tensor normalize_ids(Tensor ids, Device primary) {
     require_forward(ids.dim() == 1 || ids.dim() == 2,
                     "token IDs must have shape [tokens] or [batch,tokens]");
@@ -236,6 +249,9 @@ static models::Decoded forward_one(const Model& model, State& selected, models::
     ops::DeviceScope scope(primary);
     auto prepared = prepare_row(model, ForwardRow{&selected, std::move(input)}, options, !capture, capture);
     auto& state = *prepared.state;
+    const auto targets = model.mtp && (capture || prepared.input.raw_hidden)
+        ? model.mtp->target_layers() : std::span<const std::int64_t>{};
+    std::vector<Tensor> captured;
     auto hidden = ops::contiguous(ops::copy(prepared.embeddings, primary));
     auto snapshot = [&](const Tensor& value) {
         return ops::clone(ops::contiguous(ops::cast(ops::copy(value, primary), kFloat32)));
@@ -248,6 +264,7 @@ static models::Decoded forward_one(const Model& model, State& selected, models::
                                                prepared.step, prepared.input.confirmed,
                                                rope_for(model,layer), options, state.transposed());
             hidden = finish_layer(layer, std::move(attention), options);
+            capture_target(targets, index, hidden, primary, captured);
             if (!capture && std::get_if<Linear>(&layer.weights) != nullptr && prepared.input.confirmed > 0) {
                 auto& linear = std::get<LinearState>(state.layers[index]);
                 ++linear.speculative_projection_batches;
@@ -263,7 +280,7 @@ static models::Decoded forward_one(const Model& model, State& selected, models::
     hidden = ops::contiguous(ops::copy(hidden, primary));
     models::Decoded result;
     result.hidden = model.normalize(hidden, prepared.batch, prepared.tokens);
-    result.raw = std::move(hidden);
+    result.raw = targets.empty() ? std::move(hidden) : target_raw(targets, captured);
     if (prepared.input.raw_hidden) *prepared.input.raw_hidden = result.raw;
     return result;
 }

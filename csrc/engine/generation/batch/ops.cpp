@@ -111,7 +111,9 @@ public:
 
     void bind(Budget& budget) noexcept { budget_ = &budget; }
     bool supports_sessions() const noexcept { return batch_->supports_sessions(); }
-    bool supports_mtp() const noexcept { return batch_->supports_mtp() && mtp_ && predictor_execution_; }
+    bool supports_mtp() const noexcept {
+        return batch_->supports_mtp() && mtp_ && !mtp_->blockwise_drafting() && predictor_execution_;
+    }
     std::int64_t cache_length(const std::shared_ptr<Request>& request) const { return request->state->position(); }
     std::int64_t vocab_size() const { return model_.info().vocab_size; }
     std::int64_t max_context() const { return model_.info().max_context; }

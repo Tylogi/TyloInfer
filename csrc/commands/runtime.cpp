@@ -49,6 +49,7 @@ void print_help() {
         << "  -ngl, --n-gpu-layers N          non-negative GPU layer count\n"
         << "  --cpu-offload-layers RANGES     explicit CPU-offloaded layers\n"
         << "  --moe-cache-profile PATH        MoE cache profile\n"
+        << "  --dflash2-draft PATH             CUDA DFlash2 draft checkpoint for Qwen3.5\n"
         << "  --tensor-parallel DEVICES       device count or comma-separated IDs\n"
         << "  --tensor-split WEIGHTS          tensor-parallel weights\n"
         << "  --expert-parallel DEVICES       expert-parallel devices\n"

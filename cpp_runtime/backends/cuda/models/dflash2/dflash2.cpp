@@ -2,7 +2,6 @@
 #include "weight_quant.h"
 #include "gguf_weight.h"
 #include "models/qwen4_exp/ops.h"
-#include "models/qwen35/ops.h"
 #include "../../kernels/dflash2.h"
 #include "mfq_cuda_sampling_ops.h"
 #include "mfq_weight_memory.h"
@@ -945,18 +944,6 @@ std::unique_ptr<MtpModule> load(CudaExecutionContext& execution, Qwen4CausalLm& 
     Loader loader(directory, execution.layer_placement.primary_device());
     auto draft = std::make_unique<Draft>(execution, loader, config);
     qwen4_set_hidden_capture_layers(target, config.target_layers);
-    return draft;
-}
-std::unique_ptr<MtpModule> load(CudaExecutionContext& execution, Qwen35CausalLm& target, const std::filesystem::path& directory) {
-    auto config = Config::load(directory);
-    if (config.hidden != target.hidden_size() || config.vocabulary != target.vocab_size() ||
-            config.target_layers.back() >= target.num_hidden_layers() || !target.supports_speculation())
-        throw std::invalid_argument("DFlash2 checkpoint is incompatible with the target");
-    Loader loader(directory, execution.layer_placement.primary_device());
-    auto draft = std::make_unique<Draft>(execution, loader, config);
-    auto capture = std::make_shared<Qwen35HiddenCapture>();
-    capture->layers = config.target_layers;
-    target.hidden_capture = std::move(capture);
     return draft;
 }
 }

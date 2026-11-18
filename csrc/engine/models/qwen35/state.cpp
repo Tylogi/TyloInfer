@@ -622,7 +622,7 @@ public:
         : state_(state), snapshot_(snapshot), target_(state.prepare(snapshot_)) {
         if (predictor_model) {
             if (!state_.predictor || !snapshot_.mtp ||
-                snapshot_.mtp->cache_pos != snapshot_.cache_pos - 1)
+                !predictor_model->session_boundary(snapshot_.cache_pos, snapshot_.mtp->cache_pos))
                 throw CudaSessionStateError("Qwen MTP session boundary is incompatible");
             if (!state_.predictor->belongs_to(*predictor_model))
                 throw std::invalid_argument("predictor state belongs to another model");

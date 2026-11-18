@@ -15,6 +15,10 @@
 #include "engine/weights/cache/cache.h"
 #include "engine/weights/source/read.h"
 
+#if TYLOINFER_HAS_CUDA
+#include "engine/models/dflash2/model.h"
+#endif
+
 #include <algorithm>
 #include <iostream>
 #include <optional>
@@ -334,12 +338,25 @@ void load_vision(Model& model, const ::tyloi::weights::Loader& weights, bool res
 
 void load_components(Model& model, const ::tyloi::weights::Loader& weights,
         const LayerPlacementConfig& placement, int cpu_layers, bool cpu_offload,
-        bool resident, bool preallocate) {
+        bool resident, bool preallocate, const std::string& dflash2_draft_path) {
     const bool mtp_allowed =
         !placement.enabled() && cpu_layers == 0 && !cpu_offload &&
         weights.cache().transfer() == ::tyloi::weights::Cache::Transfer::automatic;
 
     load_vision(model, weights, resident);
+    if (!dflash2_draft_path.empty()) {
+#if TYLOINFER_HAS_CUDA
+        if (!mtp_allowed || !weights.cache().empty() || model.metadata.num_experts ||
+            !model.device.is_cuda() || !model.supports_speculation())
+            throw std::invalid_argument("DFlash2 requires dense device-resident Qwen3.5 layers");
+        const auto& m = model.metadata;
+        model.mtp = dflash2::load(model, dflash2_draft_path, model.device,
+            m.hidden_size, m.vocab_size, m.num_hidden_layers);
+        return;
+#else
+        throw std::invalid_argument("DFlash2 requires CUDA");
+#endif
+    }
     if (model.graph.has_component("predictor")) {
         if (mtp_allowed && model.metadata.num_experts == 0 && model.supports_speculation()) {
             LayerLoader loader{{weights}};

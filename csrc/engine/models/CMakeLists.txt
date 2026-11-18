@@ -12,6 +12,9 @@ set(TYLOINFER_MODEL_ASSEMBLY_SOURCES
 set(TYLOINFER_MODEL_ASSEMBLY_SOURCES "${TYLOINFER_MODEL_ASSEMBLY_SOURCES}" PARENT_SCOPE)
 
 set(TYLOINFER_CUDA_MODEL_SOURCES
+    ${PROJECT_SOURCE_DIR}/engine/models/dflash2/load.cpp
+    ${PROJECT_SOURCE_DIR}/engine/models/dflash2/forward.cpp
+    ${PROJECT_SOURCE_DIR}/engine/models/dflash2/state.cpp
     ${PROJECT_SOURCE_DIR}/engine/models/deepseek_v41/axial_patch_encoder.cpp
     ${PROJECT_SOURCE_DIR}/engine/models/deepseek_v4/ops.cpp
     ${PROJECT_SOURCE_DIR}/engine/models/deepseek_v41/ops.cpp

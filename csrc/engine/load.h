@@ -25,6 +25,7 @@ struct LoadOptions {
     bool n_gpu_layers_set = false;
     bool cpu_threads_set = false;
     int n_gpu_layers = -1;
+    std::string dflash2_draft_path;
 };
 
 struct EngineOptions : LoadOptions {

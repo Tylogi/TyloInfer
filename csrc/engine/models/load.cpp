@@ -112,7 +112,11 @@ void load(
     LayerPlacementConfig& placement,
     LoadOptions options) {
     const auto model_graph = graph(*source);
-    switch (select_family(model_graph, weights.placement.target)) {
+    const auto family = select_family(model_graph, weights.placement.target);
+    if (!options.dflash2_draft_path.empty() && (family != ModelFamily::qwen35 ||
+            !weights.placement.target.is_cuda() || !options.optional_components))
+        throw std::invalid_argument("DFlash2 requires a CUDA Qwen3.5 target");
+    switch (family) {
 #if TYLOINFER_HAS_CUDA
     case ModelFamily::glm_dsa:
         ::tyloi::cuda::glm_dsa::load(owner, std::move(source), definition, weights, placement, options);
@@ -139,7 +143,8 @@ void load(
         if (options.optional_components)
             ::tyloi::models::qwen35::load_components(
                 static_cast<::tyloi::models::qwen35::Model&>(*owner), weights, placement,
-                cpu_layers, !options.cpu_offload_layers.empty(), options.vision_resident, options.preallocate);
+                cpu_layers, !options.cpu_offload_layers.empty(), options.vision_resident, options.preallocate,
+                options.dflash2_draft_path);
         return;
     }
     case ModelFamily::qwen4_exp:

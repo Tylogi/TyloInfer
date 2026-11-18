@@ -130,8 +130,8 @@ auto with_loaded_cuda_model(
     } else source=mfq::open_model_source(options.model_path);
     if(!execution.dflash2_draft_path.empty()) {
         const auto backbone=cuda_backbone(source->resolved_model_graph().backbone);
-        if(backbone!=CudaBackbone::qwen4_exp && backbone!=CudaBackbone::generic_qwen)
-            throw std::invalid_argument("DFlash2 requires a compatible Qwen target model");
+        if(backbone!=CudaBackbone::qwen4_exp)
+            throw std::invalid_argument("This DFlash2 loader requires a Qwen4 target model");
     }
     auto load = [&]<typename Model>() {
         auto started = std::chrono::steady_clock::now();

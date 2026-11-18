@@ -648,7 +648,7 @@ struct DeepseekV41Dspark final : tyloi::models::Mtp {
             [](DenseTensor logits, int64_t count) { return logits.narrow(1, 0, count); })};
     }
 
-    ::tyloi::Tensor draft_next(const tyloi::Tensor& input_logits,
+    ::tyloi::Tensor draft_next(tyloi::models::MtpState&, const tyloi::Tensor& input_logits,
                                               const tyloi::Tensor& input_previous) const override {
         const auto& logits = input_logits.dense();
         const auto& previous = input_previous.dense();
