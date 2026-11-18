@@ -11,8 +11,8 @@ bool LinearAttention::verify_window(std::int64_t batch, std::int64_t tokens) con
         key_dim == 128 && value_dim == 128 && conv_kernel == 4;
 }
 
-std::array<Tensor, 2> LinearAttention::forward(
-    const Tensor& input, LinearView state, LinearInputs* captured) const {
+LinearOutput LinearAttention::forward(
+    const Tensor& input, LinearView state, LinearInputs* captured, const Tensor& ffn_norm) const {
     if (!dense_ab_tail && split_in_proj && !split_dense_zab && !z_proj)
         throw std::runtime_error("linear attention Z projection is missing");
     if (!dense_out_proj && !out_proj)
@@ -25,6 +25,12 @@ std::array<Tensor, 2> LinearAttention::forward(
     };
     Tensor xn;
     Tensor qkv, qk, value, z, alpha, beta;
+    std::array<ops::ScaledProjection, 2> scaled;
+    const bool prefill = input.is_cuda() && !split_in_proj && !captured &&
+        T > 1 && key_dim == dv && dv > 0 && dv <= 256 && key_heads > 0 && nv % key_heads == 0 &&
+        conv_kernel >= 2 && conv_kernel <= 8 && (!conv_bias || !conv_bias.numel());
+    const bool readout = input.is_cuda() && !captured && T >= 512 && ffn_norm &&
+        input.scalar_type() == kFloat16 && !dense_out_proj;
     if (split_in_proj) {
         xn = normalize();
         auto shared = !split_dense_zab && ab_is_nint
@@ -70,13 +76,15 @@ std::array<Tensor, 2> LinearAttention::forward(
         }
     } else {
         auto parts = ops::project_group_rms(input, attn_norm, in_proj,
-            rms_norm_eps, norm_weight_offset, xn);
+            rms_norm_eps, norm_weight_offset, xn,
+            std::span(scaled).first(prefill && T >= 256 ? (readout ? 2 : 1) : 0));
         if (parts.empty()) {
             xn = normalize();
             ops::ProfileRange range("linear.in_proj", input.device());
             parts = ops::project_group(xn, in_proj);
         }
-        qkv = ops::cast(parts[0], kFloat32); z = parts[1];
+        if (!scaled[0]) qkv = ops::cast(parts[0], kFloat32);
+        z = parts[1];
         if (dense_ab_tail) {
             ops::ProfileRange range("linear.ab_proj", input.device());
             auto ab = ops::reshape(ops::project(ops::reshape(xn, {B * T, H}), ab_proj),
@@ -96,24 +104,43 @@ std::array<Tensor, 2> LinearAttention::forward(
             out_proj, key_heads, nv, dv, rms_norm_eps, state.transposed, tiled_v_heads, verify);
         if (output) {
             if (captured) *captured = {{}, {}, qkv, {}, {}, B, T, false, output->updates};
-            return {input, ops::reshape(output->output, {B, T, H})};
+            return {input, ops::reshape(output->output, {B, T, H}), {}};
         }
     }
     std::array<Tensor, 2> gates;
-    {
-        ops::ProfileRange range("linear.gates_fused", input.device());
-        gates = ops::linear_gates(ops::reshape(alpha, {B, T, nv}),
-                                 ops::reshape(beta, {B, T, nv}), dt_bias, a_log);
+    std::array<Tensor, 3> qkv_values;
+    auto prepared = prefill ? ops::linear_prefill(state.convolution, qkv, scaled[0],
+        ops::reshape(alpha, {B, T, nv}), ops::reshape(beta, {B, T, nv}),
+        conv_weight, dt_bias, a_log, key_heads, nv, dv, rms_norm_eps) : std::nullopt;
+    if (prepared) {
+        qkv_values = std::move(prepared->qkv);
+        gates = std::move(prepared->gates);
+    } else {
+        if (scaled[0]) qkv = ops::reshape(ops::materialize(scaled[0]),
+                                            {B, T, 2 * key_heads * key_dim + vsz});
+        {
+            ops::ProfileRange range("linear.gates_fused", input.device());
+            gates = ops::linear_gates(ops::reshape(alpha, {B, T, nv}),
+                                     ops::reshape(beta, {B, T, nv}), dt_bias, a_log);
+        }
+        if (captured) *captured = {qk, value, qkv, gates[0], gates[1], B, T, split_in_proj, {}};
+        qkv_values = ops::linear_conv(state.convolution, split_in_proj ? qk : qkv,
+            value, conv_weight, conv_bias, key_heads, nv, key_dim, dv, rms_norm_eps);
     }
-    if (captured) *captured = {qk, value, qkv, gates[0], gates[1], B, T, split_in_proj, {}};
-    auto qkv_values = ops::linear_conv(state.convolution, split_in_proj ? qk : qkv,
-        value, conv_weight, conv_bias, key_heads, nv, key_dim, dv, rms_norm_eps);
+    scaled[0] = {};
     Tensor y;
     {
         ops::ProfileRange range("linear.gdn", input.device());
         y = ops::linear_recur(qkv_values[0], qkv_values[1], qkv_values[2],
             gates[0], gates[1], state.recurrent, state.transposed, tiled_v_heads);
     }
+    if (readout) {
+        auto result = ops::linear_readout(y, z ? ops::reshape(z, {B, T, vsz}) : Tensor{},
+                                          scaled[1], linear_norm, out_proj,
+                                          input, ffn_norm, rms_norm_eps, norm_weight_offset);
+        if (result) return {std::move((*result)[0]), {}, std::move((*result)[1])};
+    }
+    if (scaled[1]) z = ops::reshape(ops::materialize(scaled[1]), {B, T, vsz});
     {
         ops::ProfileRange range("linear.out_norm", input.device());
         y = ops::rms_norm(y, linear_norm, rms_norm_eps, 0.0);
@@ -126,7 +153,7 @@ std::array<Tensor, 2> LinearAttention::forward(
         output = ops::silu_project(y, ops::reshape(z, {B, T, vsz}),
                                    dense_out_proj ? out_proj_dense : out_proj);
     }
-    return {input, ops::reshape(output, {B, T, H})};
+    return {input, ops::reshape(output, {B, T, H}), {}};
 }
 
 void LinearAttention::replay(LinearView state, const LinearInputs& inputs,

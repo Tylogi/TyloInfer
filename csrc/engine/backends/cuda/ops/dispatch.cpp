@@ -894,8 +894,47 @@ void linear_replay(Tensor& convolution, Tensor& recurrent, const Tensor& qkv,
         throw std::invalid_argument("invalid linear-attention recorded replay");
 }
 
+Tensor materialize(const ScaledProjection& product) {
+    return owner(cuda::gguf::gguf_prefill_materialize({
+        dense(product.values), dense(product.row_exponents), dense(product.column_exponents)}));
+}
+
+std::optional<std::array<Tensor, 2>> linear_readout(const Tensor& attended, const Tensor& gate,
+        const ScaledProjection& scaled_gate, const Tensor& linear_norm, const Tensor& out_weight,
+        const Tensor& residual, const Tensor& ffn_norm, double eps, double offset) {
+    const auto* out = out_weight.representation<GgufTensor>();
+    if (!out || !residual.is_cuda() || !residual.is_contiguous() || residual.dim() != 3 ||
+        residual.scalar_type() != kFloat16 || residual.size(1) < 512 ||
+        out->out != residual.size(2) || !ffn_norm.defined() || ffn_norm.dim() < 1 ||
+        !ffn_norm.is_contiguous() || ffn_norm.device() != residual.device() ||
+        ffn_norm.scalar_type() != kFloat32 || ffn_norm.numel() != residual.size(2) ||
+        ffn_norm.size(-1) != residual.size(2) || !std::isfinite(float(eps)) || float(eps) <= 0 ||
+        !std::isfinite(float(offset)))
+        return std::nullopt;
+    auto& executor = cuda::Executor::current();
+    if (executor.mmq().mode != KlMmqMode::Default || executor.options().dense.fp32_residual)
+        return std::nullopt;
+    const auto& y = dense(attended);
+    const auto& norm = dense(linear_norm);
+    const auto& skip = dense(residual);
+    if (y.device() != skip.device() || y.dim() != 4 ||
+        y.size(0) != skip.size(0) || y.size(2) != skip.size(1))
+        return std::nullopt;
+    auto product = scaled_gate
+        ? cuda::gguf::gguf_rms_gated_product(*out, y, cuda::gguf::GgufPrefillProduct{
+              dense(scaled_gate.values), dense(scaled_gate.row_exponents),
+              dense(scaled_gate.column_exponents)}, norm, eps, true)
+        : cuda::gguf::gguf_rms_gated_product(*out, y, dense(gate), norm, eps, true);
+    if (!product.defined()) return std::nullopt;
+    auto pair = cuda::gguf::gguf_prefill_acc_rms(product, skip.reshape({-1, skip.size(-1)}),
+        dense(ffn_norm), eps, offset);
+    return std::array<Tensor, 2>{owner(pair[0].reshape(skip.sizes())), owner(pair[1].reshape(skip.sizes()))};
+}
+
 std::vector<Tensor> project_group_rms(const Tensor& input, const Tensor& norm,
-        std::span<const Tensor> group, double eps, double offset, Tensor& normalized) {
+        std::span<const Tensor> group, double eps, double offset, Tensor& normalized,
+        std::span<ScaledProjection> scaled) {
+    for (auto& product : scaled) product = {};
     if (!input.defined() || !norm.defined() || !input.is_cuda() || input.dim() < 1 ||
         !input.representation<DenseTensor>() || !norm.representation<DenseTensor>() ||
         input.is_encoded() || norm.is_encoded() || input.size(-1) <= 0 || group.empty() ||
@@ -930,14 +969,27 @@ std::vector<Tensor> project_group_rms(const Tensor& input, const Tensor& norm,
     auto scope = cuda::gguf::GgufPrefillInputScope::prepare_rms(x.reshape({rows, width}),
         scale, eps, offset, value);
     if (!scope) return {};
-    auto outputs = cuda::gguf::project_group(weights, value);
     auto shape = x.sizes().vec();
-    for (auto& out : outputs) {
+    std::size_t prefix = 0;
+    const auto& executor = cuda::Executor::current();
+    if (!scaled.empty() && executor.mode().linear.fused_conv) {
+        const auto limit = std::min({scaled.size(), weights.size(), std::size_t{2}});
+        for (; prefix < limit; ++prefix) {
+            if (prefix == 1 && (x.scalar_type() != kFloat16 || executor.fp32_residual())) break;
+            auto product = cuda::gguf::gguf_prefill_product(weights[prefix], value);
+            if (!product.defined()) break;
+            scaled[prefix] = {owner(std::move(product.values)), owner(std::move(product.row_exponents)),
+                              owner(std::move(product.column_exponents))};
+        }
+    }
+    std::vector<Tensor> result(weights.size());
+    for (auto index = prefix; index < weights.size(); ++index) {
+        auto out = cuda::gguf::project(weights[index], value);
         shape.back() = out.size(-1);
-        out = out.reshape(shape);
+        result[index] = owner(out.reshape(shape));
     }
     normalized = owner(value.reshape(x.sizes()));
-    return owners(std::move(outputs));
+    return result;
 }
 
 std::optional<std::vector<Tensor>> linear_shared(const Tensor& input_tensor, std::span<const Tensor> qkv,

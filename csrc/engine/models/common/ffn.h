@@ -23,9 +23,8 @@ Tensor linear_ffn(const Mlp& weights, const Tensor& norm,
     const Tensor& residual, const Tensor& attention_output,
     double epsilon, double offset);
 
-Tensor linear_ffn(const Ffn& weights, const Tensor& norm,
-    const Tensor& residual, const Tensor& attention_output,
-    double epsilon, double offset, bool serial_experts = false);
+Tensor linear_ffn(const Ffn& weights, const std::array<Tensor, 2>& prepared,
+                  bool serial_experts = false);
 
 // Execute one model-owned FFN with optional token routing inputs.
 Tensor feed_forward(const Ffn& weights, const Tensor& input,

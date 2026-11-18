@@ -18,10 +18,6 @@ public:
         const ::tyloi::DenseTensor& input,const ::tyloi::DenseTensor& weight,
         double eps,double offset,::tyloi::DenseTensor& normalized);
 };
-::tyloi::DenseTensor gguf_rms_gated_prefill(const ::tyloi::GgufTensor& weight,
-    const ::tyloi::DenseTensor& attended,const ::tyloi::DenseTensor& gate,
-    const ::tyloi::DenseTensor& norm,double eps,bool silu);
-
 struct GgufPrefillProduct {
     ::tyloi::DenseTensor values, row_exponents, column_exponents;
     bool defined() const { return values.defined(); }

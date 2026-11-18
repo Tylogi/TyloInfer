@@ -95,7 +95,6 @@ set(TYLOINFER_CUDA_KERNEL_SOURCES
     ${TYLOINFER_CUDA_ROOT}/kernels/qsa_tq_fit.cu
     ${TYLOINFER_CUDA_ROOT}/kernels/gguf.cu
     ${TYLOINFER_CUDA_ROOT}/kernels/gguf_stream_plan.cu
-    ${TYLOINFER_CUDA_ROOT}/kernels/gguf_activation.cu
     ${TYLOINFER_CUDA_ROOT}/kernels/gguf_dense_m1_aligned.cu
     ${TYLOINFER_CUDA_ROOT}/kernels/gguf_m1_residual.cu
     ${TYLOINFER_CUDA_ROOT}/kernels/gguf_quad_storage.cu

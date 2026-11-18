@@ -21,6 +21,8 @@ struct LinearView {
     bool transposed;
 };
 
+struct LinearOutput { Tensor residual, output, normalized; };
+
 struct LinearAttention {
     std::int64_t key_heads = 0, value_heads = 0, key_dim = 0, value_dim = 0;
     std::int64_t conv_kernel = 0;
@@ -31,8 +33,8 @@ struct LinearAttention {
     std::vector<Tensor> in_proj, qkv_proj, ab_nint_proj;
     Tensor ab_proj, zab_proj, z_proj, out_proj, out_proj_dense;
 
-    std::array<Tensor, 2> forward(const Tensor& input, LinearView state,
-                                  LinearInputs* captured = nullptr) const;
+    LinearOutput forward(const Tensor& input, LinearView state,
+                         LinearInputs* captured = nullptr, const Tensor& ffn_norm = {}) const;
     bool verify_window(std::int64_t batch, std::int64_t tokens) const;
     void replay(LinearView state, const LinearInputs& inputs, std::int64_t retained_tokens) const;
 };

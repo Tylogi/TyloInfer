@@ -131,17 +131,20 @@ PreparedRow prepare_row(const Model& model, ForwardRow row,
     return {&state, std::move(input), std::move(embeddings), std::move(step), B, T};
 }
 
-struct AttentionResult {
-    Tensor residual;
-    Tensor output;
-};
+using AttentionResult = ::tyloi::models::LinearOutput;
+
+std::array<Tensor, 2> prepare_ffn(const Linear& layer, const AttentionResult& attention) {
+    return ops::recurrent_norm(attention.residual, attention.output, layer.ffn_norm,
+        layer.attention.rms_norm_eps, layer.attention.norm_weight_offset);
+}
 
 } // namespace
 
 static AttentionResult forward_attention(const Layer& layer, LayerState& state, Tensor input,
                      const ::tyloi::models::AttentionStep& step, std::int64_t confirmed_prefix,
                      const tyloi::ops::RopeTable& rope,
-                     const models::ForwardOptions& options, bool transposed) {
+                     const models::ForwardOptions& options, bool transposed,
+                     bool scaled_readout = true) {
     ops::DeviceScope scope(layer.device);
     auto local_step = layer_step(layer, step);
     input = ops::contiguous(ops::copy(input, layer.device));
@@ -168,7 +171,7 @@ static AttentionResult forward_attention(const Layer& layer, LayerState& state, 
         cache->quantization = attention.kv_quantization;
         auto output = attention.forward(input, local_step, *cache,
                                         rope, trace);
-        return {std::move(output[0]), std::move(output[1])};
+        return {std::move(output[0]), std::move(output[1]), {}};
     }
     const auto* linear = std::get_if<Linear>(&layer.weights);
     auto* linear_state = std::get_if<LinearState>(&state);
@@ -191,9 +194,8 @@ static AttentionResult forward_attention(const Layer& layer, LayerState& state, 
     const ::tyloi::models::LinearView linear_view{
         state_view.convolution, state_view.recurrent, state_view.transposed};
     try {
-        auto output = linear->attention.forward(
-            input, linear_view, captured);
-        return {std::move(output[0]), std::move(output[1])};
+        return linear->attention.forward(input, linear_view, captured,
+            scaled_readout ? linear->ffn_norm : Tensor{});
     } catch (...) {
         if (confirmed_prefix > 0) {
             linear_state->mixer.abort();
@@ -220,10 +222,10 @@ static Tensor finish_layer(const Layer& layer, AttentionResult attention,
     }
     const auto* linear = std::get_if<Linear>(&layer.weights);
     require_forward(linear != nullptr, "Qwen3.5 layer weight kind mismatch");
-    return ::tyloi::models::linear_ffn(
-        linear->ffn, linear->ffn_norm, std::move(attention.residual),
-        std::move(attention.output), linear->attention.rms_norm_eps,
-        linear->attention.norm_weight_offset, options.serial_experts);
+    auto pair = attention.normalized
+        ? std::array<Tensor, 2>{std::move(attention.residual), std::move(attention.normalized)}
+        : prepare_ffn(*linear, attention);
+    return ::tyloi::models::linear_ffn(linear->ffn, pair, options.serial_experts);
 }
 
 Tensor Model::forward(models::Input input, models::State& value, const models::ForwardOptions& options) const {
@@ -299,23 +301,35 @@ StepSequence<std::vector<models::Decoded>> forward_batch(
             const auto& layer = model.layers[layer_index];
             ops::DeviceScope layer_scope(layer.device);
             const auto& rope=rope_for(model,layer);
-            std::vector<Tensor> residuals;
-            std::vector<Tensor> attention_outputs;
-            residuals.reserve(prepared.size());
-            attention_outputs.reserve(prepared.size());
+            const bool scaled_readout = layer.device.is_cuda() && std::holds_alternative<Linear>(layer.weights) &&
+                std::all_of(hidden.begin(), hidden.end(),
+                    [](const auto& value) { return value.scalar_type() == kFloat16; });
+            std::vector<AttentionResult> attended;
+            attended.reserve(prepared.size());
             for (std::size_t row_index = 0; row_index < prepared.size(); ++row_index) {
-                auto attention = forward_attention(
+                attended.push_back(forward_attention(
                     layer, prepared[row_index].state->layers[layer_index],
                     std::move(hidden[row_index]), prepared[row_index].step,
                     prepared[row_index].input.confirmed, rope, options,
-                    prepared[row_index].state->transposed());
-                residuals.push_back(std::move(attention.residual));
-                attention_outputs.push_back(std::move(attention.output));
+                    prepared[row_index].state->transposed(), scaled_readout));
             }
-            auto packed_attention = AttentionResult{
-                residuals.size() == 1 ? std::move(residuals.front()) : ops::cat(residuals, 1),
-                attention_outputs.size() == 1 ? std::move(attention_outputs.front())
-                                              : ops::cat(attention_outputs, 1)};
+            const bool normalized = std::any_of(attended.begin(), attended.end(),
+                [](const auto& attention) { return attention.normalized.defined(); });
+            std::vector<Tensor> residuals, values;
+            residuals.reserve(attended.size());
+            values.reserve(attended.size());
+            for (auto& attention : attended) {
+                if (normalized && !attention.normalized) {
+                    auto pair = prepare_ffn(std::get<Linear>(layer.weights), attention);
+                    attention = {std::move(pair[0]), {}, std::move(pair[1])};
+                }
+                residuals.push_back(std::move(attention.residual));
+                values.push_back(normalized ? std::move(attention.normalized) : std::move(attention.output));
+            }
+            AttentionResult packed_attention{
+                residuals.size() == 1 ? std::move(residuals.front()) : ops::cat(residuals, 1), {}, {}};
+            (normalized ? packed_attention.normalized : packed_attention.output) =
+                values.size() == 1 ? std::move(values.front()) : ops::cat(values, 1);
             auto packed = finish_layer(layer, std::move(packed_attention), options);
             if (std::get_if<Linear>(&layer.weights) != nullptr) {
                 for (auto& row : prepared) {

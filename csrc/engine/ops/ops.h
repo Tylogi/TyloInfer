@@ -215,9 +215,16 @@ Tensor low_rank(const Tensor& input, const Tensor& output_a, const Tensor& outpu
 Tensor linear(const Tensor& input, const ::tyloi::Tensor& weight, const Tensor& bias = {});
 Tensor affine(const Tensor& input, const ::tyloi::Tensor& weight, const Tensor& bias = {});
 std::vector<Tensor> project_group(const Tensor& input, std::span<const Tensor> group);
+struct ScaledProjection {
+    Tensor values, row_exponents, column_exponents;
+    explicit operator bool() const noexcept { return values.defined(); }
+};
 // Empty when the backend cannot share RMS-normalized projection input.
+// A scaled prefix has flat FP16 values and exponents. Its plain slots are empty.
 std::vector<Tensor> project_group_rms(const Tensor& input, const Tensor& norm,
-    std::span<const Tensor> group, double eps, double offset, Tensor& normalized);
+    std::span<const Tensor> group, double eps, double offset, Tensor& normalized,
+    std::span<ScaledProjection> scaled = {});
+Tensor materialize(const ScaledProjection& product);
 // Capability depends on prepared weights and the current execution policy.
 bool grouped(std::span<const Tensor> weights);
 // Ordered projections; combine the first prefix outputs into one. The backend
@@ -232,6 +239,14 @@ std::array<Tensor, 3> linear_conv(Tensor& convolution, const Tensor& qkv_or_qk, 
     std::int64_t dk, std::int64_t dv, double eps, bool replay = false);
 Tensor linear_recur(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& gate,
     const Tensor& beta, Tensor& recurrent, bool transposed, bool tiled);
+struct LinearPrefill { std::array<Tensor, 3> qkv; std::array<Tensor, 2> gates; };
+std::optional<LinearPrefill> linear_prefill(Tensor& convolution, const Tensor& qkv,
+    const ScaledProjection& scaled, const Tensor& alpha, const Tensor& beta,
+    const Tensor& conv_weight, const Tensor& dt_bias, const Tensor& a_log,
+    std::int64_t key_heads, std::int64_t value_heads, std::int64_t width, double eps);
+std::optional<std::array<Tensor, 2>> linear_readout(const Tensor& attended, const Tensor& gate,
+    const ScaledProjection& scaled_gate, const Tensor& linear_norm, const Tensor& out_weight,
+    const Tensor& residual, const Tensor& ffn_norm, double eps, double offset);
 struct LinearDecode { Tensor output, updates; };
 std::optional<LinearDecode> linear_decode(const Tensor& qkv, const Tensor& gate,
     const Tensor& alpha, const Tensor& beta, Tensor& convolution, Tensor& recurrent,

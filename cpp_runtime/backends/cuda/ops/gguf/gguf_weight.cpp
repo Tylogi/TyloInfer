@@ -98,18 +98,6 @@ tb::Tensor gguf_prefill_materialize(const GgufPrefillProduct& product){return pr
 std::vector<tb::Tensor> gguf_prefill_acc_rms(const GgufPrefillProduct& product,const tb::Tensor& residual,
         const tb::Tensor& norm,double eps,double offset){return prefill_acc_rms(product,residual,norm,eps,offset);}
 
-tb::Tensor gguf_rms_gated_prefill(const GgufWeight& w,const tb::Tensor& attended,
-        const tb::Tensor& gate,const tb::Tensor& norm,double eps,bool silu) {
-    const auto product=gguf_rms_gated_product(w,attended,gate,norm,eps,silu);
-    if(!product.defined())return {};
-    auto output=tb::empty(product.values.sizes(),attended.options());
-    const auto stream=mfq_get_current_cuda_stream(output.get_device());
-    for(const auto& tensor:{product.values,product.row_exponents,product.column_exponents,output})mfq_cuda_record_stream(tensor,stream);
-    mfq::cuda::gguf::restore_scaled_f16(product.values.data_ptr(),output.data_ptr(),false,
-        product.row_exponents.data_ptr<int32_t>(),product.column_exponents.data_ptr<int32_t>(),
-        output.size(0),output.size(1),output.size(1),stream.stream());
-    return output.reshape({attended.size(0),attended.size(2),w.out});
-}
 void GgufWeight::repack_inplace() {
     // Called during loading, before publishing aliased immutable views.
     namespace gguf=mfq::cuda::gguf;

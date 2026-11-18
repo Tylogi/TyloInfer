@@ -133,12 +133,9 @@ Tensor full_ffn(const Ffn& weights, const Tensor& norm,
     }, weights);
 }
 
-Tensor linear_ffn(const Ffn& weights, const Tensor& norm,
-    const Tensor& residual, const Tensor& attention_output,
-    double epsilon, double offset, bool serial_experts) {
+Tensor linear_ffn(const Ffn& weights, const std::array<Tensor, 2>& prepared, bool serial_experts) {
     return std::visit([&](const auto& value) {
-        return ffn_internal::linear(value, norm,
-            residual, attention_output, epsilon, offset, serial_experts);
+        return ffn_internal::linear(value, prepared, serial_experts);
     }, weights);
 }
 

@@ -298,18 +298,6 @@ GgufPrefillProduct gguf_rms_gated_product(const GgufTensor& w,const ::tyloi::Den
     return output;
 }
 
-::tyloi::DenseTensor gguf_rms_gated_prefill(const GgufTensor& w,const ::tyloi::DenseTensor& attended,
-        const ::tyloi::DenseTensor& gate,const ::tyloi::DenseTensor& norm,double eps,bool silu) {
-    const auto product=gguf_rms_gated_product(w,attended,gate,norm,eps,silu);
-    if(!product.defined())return {};
-    auto output=::tyloi::cuda::empty(product.values.sizes(),attended.options());
-    const auto stream=mfq_get_current_cuda_stream(output.get_device());
-    for(const auto& tensor:{product.values,product.row_exponents,product.column_exponents,output})mfq_cuda_record_stream(tensor,stream);
-    tyloi::cuda::gguf::restore_scaled_f16(product.values.data_ptr(),output.data_ptr(),false,
-        product.row_exponents.data_ptr<int32_t>(),product.column_exponents.data_ptr<int32_t>(),
-        output.size(0),output.size(1),output.size(1),stream.stream());
-    return output.reshape({attended.size(0),attended.size(2),w.out});
-}
 std::vector<::tyloi::DenseTensor> gguf_prefill_acc_rms(const GgufPrefillProduct& product,const ::tyloi::DenseTensor& residual,
         const ::tyloi::DenseTensor& norm,double eps,double offset) {
     TYLOINFER_RUNTIME_CHECK(product.defined() && residual.is_cuda() && residual.is_contiguous() &&

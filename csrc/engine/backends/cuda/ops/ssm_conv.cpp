@@ -1,7 +1,10 @@
 #include "backend.h"
+#include "engine/ops/ops.h"
+#include "engine/backends/cuda/executor/executor.h"
 #include "engine/backends/cuda/kernels/recurrent/convolution_raw.h"
 #include <cstdint>
 #include <climits>
+#include <cmath>
 #include <vector>
 
 ::tyloi::DenseTensor ssm_conv_silu_cuda(::tyloi::DenseTensor conv_input, ::tyloi::DenseTensor weight, ::tyloi::DenseTensor bias, int64_t n_tokens)
@@ -295,7 +298,11 @@ static std::vector<::tyloi::DenseTensor> linear_conv_qkv_gate_prefill_impl(
     a.batch=B;a.tokens=T;a.channels=C;a.nk=int(nk);a.nv=int(nv);a.dk=int(width);a.dv=int(width);a.kernel=K;a.layout=layout;a.eps=float(eps);
     a.input_float=qkv.scalar_type()==::tyloi::kFloat32;a.half_gate=alpha.scalar_type()==::tyloi::kFloat16;a.stable_softplus=stable_softplus;
     a.q_stride0=qkv.stride(0);a.q_stride1=qkv.stride(1);a.a_stride0=alpha.stride(0);a.a_stride1=alpha.stride(1);a.b_stride0=beta.stride(0);a.b_stride1=beta.stride(1);
-    tyloi::cuda::ssm_conv_raw::qkv_gate_short(a,mfq_current_cuda_stream());
+    const auto stream = mfq_get_current_cuda_stream(qkv.get_device());
+    for (const auto& tensor : {state, qkv, weight, alpha, beta, dt_bias, a_log,
+                                row_exponents, column_exponents, q, k, v, next, decay, bt})
+        if (tensor.defined()) mfq_cuda_record_stream(tensor, stream);
+    tyloi::cuda::ssm_conv_raw::qkv_gate_short(a,stream.stream());
     return {q,k,v,next,decay,bt};
 }
 
@@ -316,6 +323,86 @@ std::vector<::tyloi::DenseTensor> linear_conv_qkv_gate_scaled_prefill_cuda(
     return linear_conv_qkv_gate_prefill_impl(state,product,weight,alpha,beta,dt_bias,a_log,nk,nv,width,eps,stable_softplus,
         row_exponents,column_exponents);
 }
+
+namespace tyloi::ops {
+std::optional<LinearPrefill> linear_prefill(
+    Tensor& convolution, const Tensor& qkv, const ScaledProjection& scaled,
+    const Tensor& alpha, const Tensor& beta, const Tensor& conv_weight,
+    const Tensor& dt_bias, const Tensor& a_log, std::int64_t nk, std::int64_t nv,
+    std::int64_t width, double eps) {
+    auto* state = convolution.representation<DenseTensor>();
+    const auto* projected = (scaled ? scaled.values : qkv).representation<DenseTensor>();
+    const auto* a = alpha.representation<DenseTensor>();
+    const auto* b = beta.representation<DenseTensor>();
+    const auto* weight = conv_weight.representation<DenseTensor>();
+    const auto* dt = dt_bias.representation<DenseTensor>();
+    const auto* log = a_log.representation<DenseTensor>();
+    if (!state || !projected || !a || !b || !weight || !dt || !log ||
+        !state->defined() || !state->is_cuda() || state->is_encoded() || !state->is_contiguous() ||
+        state->scalar_type() != kFloat32 || state->dim() != 3 || a->dim() != 3 ||
+        nk <= 0 || nv <= 0 || nv % nk || width <= 0 || width > 256 ||
+        !std::isfinite(float(eps)) || float(eps) <= 0 ||
+        nk > INT_MAX / 2 || nv > INT_MAX - 2 * nk || 2 * nk + nv > INT_MAX / width)
+        return std::nullopt;
+    const auto batch = a->size(0), tokens = a->size(1), channels = (2 * nk + nv) * width;
+    const auto taps = state->size(1) + 1;
+    if (batch <= 0 || batch > INT_MAX || tokens <= 1 || tokens > INT_MAX - 15 ||
+        taps < 2 || taps > 8 || state->size(0) != batch || state->size(2) != channels ||
+        a->size(2) != nv || b->dim() != 3 || b->sizes() != a->sizes())
+        return std::nullopt;
+    const auto same_device = [&](const DenseTensor& value) {
+        return value.defined() && value.is_cuda() && value.device() == state->device() && !value.is_encoded();
+    };
+    const auto row_strided = [&](const DenseTensor& value, std::int64_t columns) {
+        return same_device(value) && value.dim() == 3 && value.size(0) == batch &&
+            value.size(1) == tokens && value.size(2) == columns && value.stride(2) == 1 &&
+            value.stride(1) >= columns && (batch == 1 || value.stride(0) / tokens >= value.stride(1)) &&
+            (value.scalar_type() == kFloat16 || value.scalar_type() == kFloat32);
+    };
+    if (!row_strided(*a, nv) || !row_strided(*b, nv) || a->scalar_type() != b->scalar_type())
+        return std::nullopt;
+    for (const auto* value : {weight, dt, log})
+        if (!same_device(*value) || !value->is_contiguous() || value->scalar_type() != kFloat32)
+            return std::nullopt;
+    if (dt->numel() != nv || log->numel() != nv) return std::nullopt;
+    const bool channel_major = weight->sizes().vec() == std::vector<int64_t>({channels, taps});
+    if (!channel_major && weight->sizes().vec() != std::vector<int64_t>({channels, 1, taps}) &&
+        weight->sizes().vec() != std::vector<int64_t>({taps, channels}))
+        return std::nullopt;
+    const DenseTensor *rows = nullptr, *columns = nullptr;
+    DenseTensor input;
+    if (scaled) {
+        rows = scaled.row_exponents.representation<DenseTensor>();
+        columns = scaled.column_exponents.representation<DenseTensor>();
+        if (!same_device(*projected) || projected->scalar_type() != kFloat16 || !projected->is_contiguous() ||
+            projected->dim() != 2 || projected->size(0) != batch * tokens || projected->size(1) != channels ||
+            !rows || !columns || !same_device(*rows) || !same_device(*columns) ||
+            !rows->is_contiguous() || !columns->is_contiguous() || rows->scalar_type() != kInt32 ||
+            columns->scalar_type() != kInt32 || rows->numel() != batch * tokens || columns->numel() != channels)
+            return std::nullopt;
+        input = projected->reshape({batch, tokens, channels});
+    } else {
+        if (!row_strided(*projected, channels)) return std::nullopt;
+        input = *projected;
+    }
+    const auto heads = 2 * nk + nv;
+    if (tokens >= 256) {
+        const auto tiles = (tokens + 15) / 16;
+        if (heads > INT_MAX / tiles || batch > INT_MAX / (heads * tiles)) return std::nullopt;
+    } else if (batch * tokens > INT_MAX / (2 * nk) ||
+               nv * width > 65535 * 256 - 255 || batch > (INT_MAX - 255) / ((taps - 1) * channels)) {
+        return std::nullopt;
+    }
+    if (!cuda::Executor::current().mode().linear.fused_conv) return std::nullopt;
+    MfqCudaGuard guard(state->device());
+    auto kernel_weight = channel_major ? weight->reshape({channels, 1, taps}) : *weight;
+    auto result = linear_conv_qkv_gate_prefill_impl(*state, input, kernel_weight, *a, *b, *dt, *log,
+        nk, nv, width, eps, false, rows ? *rows : DenseTensor{}, columns ? *columns : DenseTensor{});
+    state->copy_(result[3]);
+    return LinearPrefill{{Tensor(result[0]), Tensor(result[1]), Tensor(result[2])},
+                         {Tensor(result[4]), Tensor(result[5])}};
+}
+} // namespace tyloi::ops
 
 std::vector<::tyloi::DenseTensor> linear_conv_qkv_gate_prefill_cuda(
     ::tyloi::DenseTensor state,::tyloi::DenseTensor qkv,

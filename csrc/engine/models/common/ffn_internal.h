@@ -54,11 +54,9 @@ Tensor full(const Weights& weights, const Tensor& norm,
 }
 
 template <class Weights>
-Tensor linear(const Weights& weights, const Tensor& norm,
-    const Tensor& residual, const Tensor& attention_output,
-    double epsilon, double offset, bool serial_experts = false) {
+Tensor linear(const Weights& weights, const std::array<Tensor, 2>& pair, bool serial_experts) {
+    const auto& residual = pair[0];
     const auto batch = residual.size(0), tokens = residual.size(1), width = residual.size(2);
-    auto pair = ops::recurrent_norm(residual, attention_output, norm, epsilon, offset);
     auto input = ops::reshape(pair[1], {batch * tokens, width});
     if constexpr (!std::is_same_v<Weights, Moe>) {
         if (!weights.important_neurons) {
@@ -70,6 +68,14 @@ Tensor linear(const Weights& weights, const Tensor& norm,
     }
     auto output = ops::reshape(feed_forward(weights, input, false, serial_experts), {batch, tokens, width});
     return ops::recurrent_add(pair[0], output);
+}
+
+template <class Weights>
+Tensor linear(const Weights& weights, const Tensor& norm,
+    const Tensor& residual, const Tensor& attention_output,
+    double epsilon, double offset, bool serial_experts = false) {
+    return linear(weights, ops::recurrent_norm(residual, attention_output, norm, epsilon, offset),
+        serial_experts);
 }
 
 } // namespace tyloi::models::ffn_internal

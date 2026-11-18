@@ -4,10 +4,6 @@
 struct GgufWeight;
 #include <memory>
 #include <vector>
-mfq_tensor_backend::Tensor gguf_rms_gated_prefill(const GgufWeight& weight,
-    const mfq_tensor_backend::Tensor& attended,const mfq_tensor_backend::Tensor& gate,
-    const mfq_tensor_backend::Tensor& norm,double eps,bool silu);
-
 // A following operator may restore values at the point of consumption.
 // Empty means the ordinary streamed/reference projection should be used.
 GgufPrefillProduct gguf_prefill_product(const GgufWeight& weight,

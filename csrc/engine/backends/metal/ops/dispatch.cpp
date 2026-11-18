@@ -177,8 +177,20 @@ std::optional<LinearDecode> linear_decode(const Tensor&, const Tensor&, const Te
     return std::nullopt;
 }
 std::vector<Tensor> project_group_rms(const Tensor&, const Tensor&, std::span<const Tensor>,
-        double, double, Tensor&) {
+        double, double, Tensor&, std::span<ScaledProjection>) {
     return {};
+}
+Tensor materialize(const ScaledProjection&) {
+    throw std::logic_error("scaled projection materialization requires CUDA");
+}
+std::optional<LinearPrefill> linear_prefill(Tensor&, const Tensor&, const ScaledProjection&,
+        const Tensor&, const Tensor&, const Tensor&, const Tensor&, const Tensor&,
+        std::int64_t, std::int64_t, std::int64_t, double) {
+    return std::nullopt;
+}
+std::optional<std::array<Tensor, 2>> linear_readout(const Tensor&, const Tensor&,
+        const ScaledProjection&, const Tensor&, const Tensor&, const Tensor&, const Tensor&, double, double) {
+    return std::nullopt;
 }
 void linear_replay(Tensor&, Tensor&, const Tensor&, const Tensor&, std::int64_t, bool) {
     throw std::logic_error("recorded GDN replay requires CUDA");
