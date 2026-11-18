@@ -1,7 +1,7 @@
 #pragma once
 
-#include "engine/backends/cuda/kernels/mfq_cuda_gdn_replay_ops.h"
-#include "engine/backends/cuda/executor/recurrent_copy_batch.h"
+#include "engine/backends/cuda/ops/attention/gdn/replay.h"
+#include "engine/backends/cuda/executor/recurrent_copy_kernel.h"
 
 #include <algorithm>
 #include <cstdlib>

@@ -62,6 +62,7 @@ struct NativeAttentionInput {
     ::tyloi::DenseTensor query, key, value, positions, write_positions;
     MfqOptional<::tyloi::DenseTensor> sequence_lengths, attention_mask;
     std::int64_t cache_position, planned_kv_length, decode_attention_parts;
+    bool contiguous_tail;
 };
 struct NativeKvView {
     ::tyloi::DenseTensor visible_key, visible_value, physical_key, physical_value;
@@ -205,7 +206,8 @@ tyloi::ops::AttentionResult ops::attention(const tyloi::ops::AttentionInput& inp
         dense(input.write_positions),
         input.sequence_lengths ? MfqOptional<DenseTensor>{dense(input.sequence_lengths)} : mfq_nullopt,
         input.attention_mask ? MfqOptional<DenseTensor>{dense(input.attention_mask)} : mfq_nullopt,
-        input.cache_position, input.planned_kv_length, input.decode_attention_parts};
+        input.cache_position, input.planned_kv_length, input.decode_attention_parts,
+        input.contiguous_tail};
     const NativeKvView kv{dense_kv_buffer(public_kv.visible_key), dense_kv_buffer(public_kv.visible_value),
         dense_kv_buffer(public_kv.physical_key), dense_kv_buffer(public_kv.physical_value),
         dense_kv_buffer(public_kv.key_chunk_ptrs), dense_kv_buffer(public_kv.value_chunk_ptrs),
@@ -236,6 +238,32 @@ tyloi::ops::AttentionResult ops::attention(const tyloi::ops::AttentionInput& inp
     bool attention_token_major = false;
 
     auto attention = profiler.measure("full.attention", [&]() -> ::tyloi::DenseTensor {
+        if (request.contiguous_tail && (tokens > 1 || config.official_bf16 || config.kernels.decode_aten)) {
+            TYLOINFER_RUNTIME_CHECK(request.sequence_lengths.has_value() &&
+                !request.attention_mask.has_value() && !config.sliding && !kv.paged() &&
+                !public_kv.ring && !kv.quantization.enabled(),
+                "contiguous tail attention requires lengths and an unmasked contiguous cache");
+            const auto& lengths = request.sequence_lengths.value();
+            TYLOINFER_RUNTIME_CHECK(lengths.device() == q.device() && lengths.dim() == 1 &&
+                lengths.size(0) == batch && lengths.scalar_type() == ::tyloi::kInt64 &&
+                lengths.is_contiguous(), "contiguous tail attention requires CUDA int64 lengths [batch]");
+            const auto& key_cache = kv.physical_key;
+            const auto& value_cache = kv.physical_value;
+            TYLOINFER_RUNTIME_CHECK(key_cache.defined() && value_cache.defined() &&
+                key_cache.dim() == 4 && value_cache.dim() == 4 &&
+                key_cache.sizes() == value_cache.sizes() && key_cache.size(0) == batch &&
+                key_cache.size(1) == kv_heads && key_cache.size(2) >= tokens &&
+                key_cache.size(3) == head_dim && heads % kv_heads == 0,
+                "contiguous tail attention cache geometry is incompatible");
+            const auto attention_dtype = config.official_bf16 ? ::tyloi::kBFloat16 : ::tyloi::kFloat16;
+            TYLOINFER_RUNTIME_CHECK(key_cache.scalar_type() == attention_dtype &&
+                value_cache.scalar_type() == attention_dtype,
+                "contiguous tail attention cache dtype is incompatible");
+            const auto capacity = key_cache.size(2);
+            return attention_cache_swa_planned_cuda(
+                q.to(attention_dtype).contiguous(), key_cache, value_cache,
+                lengths, attn_scale, capacity, request.planned_kv_length);
+        }
         if (kv.quantization.enabled()) {
             attention_token_major = true;
             const auto capacity = request.planned_kv_length > 0

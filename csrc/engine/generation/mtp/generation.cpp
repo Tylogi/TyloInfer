@@ -52,12 +52,14 @@ struct MtpOps {
     Tensor input_ids, counts, known_ids_host, known_ids_device;
     Tensor projected_predictor_hidden, projected_predictor_logits;
     Tensor projected_target_hidden, projected_target_logits, projected_target_compact;
+    Tensor projected_target_ids;
     std::vector<std::int32_t> projected_target_tokens;
     int32_t projected_predictor_greedy = -1;
     std::optional<Sampler> sampler_;
     bool penalties = false;
     bool target_maintenance = false;
     std::uint64_t target_graph_captures = 0, target_transfer_bytes = 0;
+    std::int64_t target_extent = 0;
     std::array<double, 6> target_profile{};
     weights::Cache::Routes target_routes;
 
@@ -91,6 +93,9 @@ struct MtpOps {
     void rollback_target(std::int64_t accepted) { state.rollback_speculative(accepted); }
     void initialize(const std::vector<int64_t>& prompt, const MfqSamplingParams& sampling) {
         input_ids = ids_for(prompt);
+        const auto prefix = std::min<std::int64_t>(prompt.size(), info.max_context);
+        const auto growth = std::clamp<std::int64_t>(sampling.max_tokens, 0, info.max_context - prefix);
+        target_extent = decode_bucket(prefix + growth, info.max_context);
         sampler_.emplace(sampling, device);
         penalties = sampler().has_penalties();
         if (penalties) {
@@ -137,20 +142,28 @@ struct MtpOps {
         if (same_view(input.ids, known_ids_device)) input.host_ids = known_ids_host;
         Tensor hidden;
         projected_target_hidden = {}; projected_target_logits = {}; projected_target_compact = {};
+        projected_target_ids = {};
         projected_target_tokens.clear();
         if (graph_enabled && (!prepared || !prepared->transformed())) {
             budget.reserve(state.graph_exit_growth());
             budget.reserve(state.growth(input, options));
             models::DecodeOptions policy;
             policy.projection = models::DecodeOptions::Projection::hidden;
-            policy.enabled = weights.decode() != weights::Cache::Decode::none;
             policy.routed = weights.decode() == weights::Cache::Decode::routed;
+            const bool dense = device.is_cuda() && info.graph == models::GraphOwner::executor &&
+                weights.graph_safe(weights::Cache::Graph::legacy);
+            policy.enabled = policy.routed || dense;
+            if (dense) {
+                policy.reserve_until = target_extent;
+                policy.greedy_readout = sampler_ && !penalties && sampler().greedy();
+            }
             policy.compact_sampling = sampler_ && !penalties && !sampler().greedy() &&
                 sampler().params().top_k > 0 && sampler().params().top_k <= 64;
             if (auto result = engine::decode(model, state, executor, weights, budget, options, input, policy)) {
                 hidden = result->hidden;
                 projected_target_hidden = hidden; projected_target_logits = result->logits;
                 projected_target_compact = result->compact; projected_target_tokens = std::move(result->tokens);
+                projected_target_ids = std::move(result->ids);
                 target_maintenance = target_maintenance || result->initialized;
             }
         }
@@ -294,13 +307,16 @@ struct MtpOps {
             return projected_predictor_greedy;
         if (sampler().greedy() && !penalties && projected_target_tokens.size() == 1 &&
             same_data(logits, projected_target_logits)) return projected_target_tokens.front();
+        if (sampler().greedy() && !penalties && projected_target_ids.numel() == 1 &&
+            same_data(logits, projected_target_logits)) return static_cast<int32_t>(ops::item(projected_target_ids));
         if (penalties) logits = ops::clone(logits);
         return static_cast<int32_t>(ops::item(sample_logits(sampler(), std::move(logits), token_counts)));
     }
     std::vector<int32_t> greedy_tokens(Tensor logits) {
         if (penalties || !sampler().greedy() || logits.dim() != 2) throw std::runtime_error("batched greedy MTP sampling geometry is invalid");
         if (same_data(logits, projected_target_logits) && !projected_target_tokens.empty()) return projected_target_tokens;
-        const auto tokens = ops::read_integers(ops::sample_greedy(ops::contiguous(logits)));
+        const auto tokens = ops::read_integers(projected_target_ids && same_data(logits, projected_target_logits)
+            ? projected_target_ids : ops::sample_greedy(ops::contiguous(logits)));
         return {tokens.begin(), tokens.end()};
     }
     int32_t sample_constrained(Tensor logits, Tensor token_counts, const MfqTokenConstraintPtr& constraint) {

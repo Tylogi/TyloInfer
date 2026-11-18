@@ -229,8 +229,9 @@ static ::tyloi::DenseTensor attention_cache_swa_impl_cuda(
                 "attention_cache_swa: seq_len must be cuda int64[B]");
     TYLOINFER_RUNTIME_CHECK(q.scalar_type() == k_cache.scalar_type() && q.scalar_type() == v_cache.scalar_type(),
                 "attention_cache_swa: q/k/v dtype mismatch");
-    TYLOINFER_RUNTIME_CHECK(q.scalar_type() == ::tyloi::kFloat16 || q.scalar_type() == ::tyloi::kFloat32,
-                "attention_cache_swa: dtype must be f16 or f32");
+    TYLOINFER_RUNTIME_CHECK(q.scalar_type() == ::tyloi::kFloat16 || q.scalar_type() == ::tyloi::kBFloat16 ||
+                q.scalar_type() == ::tyloi::kFloat32,
+                "attention_cache_swa: dtype must be f16, bf16 or f32");
     TYLOINFER_RUNTIME_CHECK(q.dim() == 4 && k_cache.dim() == 4 && v_cache.dim() == 4 &&
                 k_cache.sizes() == v_cache.sizes(),
                 "attention_cache_swa: expected q[B,Hq,T,D] and cache[B,Hk,capacity,D]");

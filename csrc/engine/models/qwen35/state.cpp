@@ -169,12 +169,18 @@ State::State(const Model& model, bool transposed)
 }
 
 State::~State() {
+    release_graphs();
     if (paged_kv_) paged_kv_->release(pages_);
+}
+
+void State::release_graphs() noexcept {
+    decode_graphs.reset();
 }
 
 void State::bind_pages(tyloi::state::PagedKv& pool) {
     if (paged_kv_ && paged_kv_ != &pool)
         throw std::invalid_argument("Qwen3.5 state is already bound to another paged KV pool");
+    release_graphs();
     paged_kv_ = &pool;
     for (std::size_t index = 0; index < layers.size(); ++index) {
         if (const auto* full = std::get_if<FullLayout>(&layout_[index].attention))
@@ -357,6 +363,7 @@ void State::reset(std::int64_t new_batch) {
     require_state(new_batch > 0, "Qwen3.5 batch must be positive");
     require_state(!paged_kv_ || new_batch == 1,
                   "Qwen3.5 paged State supports one request row");
+    release_graphs();
     cache_pos = 0;
     decode_position_delta = 0;
     speculative_start = -1;
@@ -755,6 +762,7 @@ void State::stage(Restore& restore, const TextSessionState& state) const {
 }
 
 void State::publish(Restore&& restore) noexcept {
+    release_graphs();
     if (restore.pool) std::swap(pages_,restore.pages);
     layers.swap(restore.layers);
     cache_pos = restore.cache_pos;

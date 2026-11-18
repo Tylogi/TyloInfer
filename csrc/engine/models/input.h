@@ -77,6 +77,7 @@ struct DecodeOptions {
     Projection projection = Projection::hidden_only;
     bool routed = false, compact_sampling = false, enabled = true;
     std::int64_t reserve_until = 0;
+    bool greedy_readout = false;
 };
 
 struct Decoded {

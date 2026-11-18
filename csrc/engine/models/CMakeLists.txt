@@ -41,5 +41,6 @@ set(TYLOINFER_MODELS_CUDA_SOURCES
     ${PROJECT_SOURCE_DIR}/engine/models/minicpmo45/state.cpp
     ${PROJECT_SOURCE_DIR}/engine/models/minicpmo45/forward.cpp
     ${PROJECT_SOURCE_DIR}/engine/models/qwen35/batch_ops.cpp
+    ${PROJECT_SOURCE_DIR}/engine/models/qwen35/cuda.cpp
 )
 set(TYLOINFER_MODELS_CUDA_SOURCES "${TYLOINFER_MODELS_CUDA_SOURCES}" PARENT_SCOPE)

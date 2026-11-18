@@ -39,6 +39,8 @@ struct AttentionInput {
     // Empty handles mean the input is absent.
     Tensor sequence_lengths, attention_mask;
     std::int64_t cache_position = 0, planned_kv_length = 0, decode_attention_parts = 0;
+    // Positions are the contiguous tail ending at each length, which must be in [tokens, capacity].
+    bool contiguous_tail = false;
 };
 struct AttentionConfig {
     bool bf16 = false, sliding = false;

@@ -457,7 +457,9 @@ static std::vector<::tyloi::DenseTensor> gdn_window_impl(const ::tyloi::DenseTen
  if(out_of_place)snapshots.final_state=next_state.data_ptr<float>();
  ::tyloi::DenseTensor updates;
  if(mode==GdnWindowMode::RecordUpdates || out_of_place) {
-  const tyloi::cuda::ResidentAllocationScope resident;
+  using tyloi::cuda::GraphAllocationPlan;
+  const tyloi::cuda::ResidentAllocationScope resident(
+      !GraphAllocationPlan::current() && !GraphAllocationPlan::warming());
   updates=::tyloi::cuda::empty({tokens,nv,257},state.options());
  }
  if(updates.defined())snapshots.updates=updates.data_ptr<float>();

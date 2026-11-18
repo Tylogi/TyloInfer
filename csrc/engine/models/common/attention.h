@@ -18,6 +18,8 @@ struct AttentionStep {
     std::int64_t decode_attention_parts = 0;
     /** Optional key-validity mask covering the visible cache. */
     ::tyloi::Tensor attention_mask;
+    // Positions are the contiguous tail ending at each length, which must be in [tokens, capacity].
+    bool contiguous_tail = false;
 };
 
 struct FullAttention {

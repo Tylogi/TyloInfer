@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <algorithm>
+#include <memory>
 #include <variant>
 #include <vector>
 
@@ -21,6 +22,7 @@ inline std::int64_t kv_capacity_for(bool sliding, std::int64_t capacity,
 }
 
 struct Model;
+struct DecodeGraphs;
 
 // Linear attention keeps the projected rows until a speculative pass has
 // either been committed or replayed from its confirmed prefix.
@@ -84,6 +86,7 @@ public:
         std::int64_t batch, std::int64_t tokens,
         const tyloi::models::ForwardOptions&) const;
     void reset(std::int64_t new_batch) override;
+    void release_graphs() noexcept override;
     tyloi::engine::Metrics metrics() const override;
     std::int64_t position() const noexcept override { return cache_pos; }
     void advance(std::int64_t tokens) noexcept override { cache_pos += tokens; }
@@ -122,6 +125,7 @@ public:
     bool belongs_to(const Model& model) const noexcept { return owner_ == &model; }
 
     tyloi::cache::Media images;
+    std::shared_ptr<DecodeGraphs> decode_graphs;
     std::vector<LayerState> layers;
     std::int64_t cache_pos = 0;
     std::int64_t decode_position_delta = 0;

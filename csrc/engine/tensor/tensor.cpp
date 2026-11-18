@@ -15,6 +15,18 @@ void count_storage(const std::shared_ptr<TensorStorage>& storage,
 
 }  // namespace
 
+bool Tensor::same_view(const Tensor& other) const {
+    if (impl_ == other.impl_) return true;
+    const auto* first = representation<DenseTensor>();
+    const auto* second = other.representation<DenseTensor>();
+    if (!first || !second || !first->defined() || !second->defined() ||
+        first->device() != second->device() || first->scalar_type() != second->scalar_type() ||
+        first->data_ptr() != second->data_ptr() || first->dim() != second->dim()) return false;
+    for (std::int64_t axis = 0; axis < first->dim(); ++axis)
+        if (first->size(axis) != second->size(axis) || first->stride(axis) != second->stride(axis)) return false;
+    return true;
+}
+
 const DenseTensor& Tensor::dense() const {
     const auto* value = dynamic_cast<const DenseTensor*>(impl_.get());
     if (!value) throw std::invalid_argument("operation requires a dense tensor");
