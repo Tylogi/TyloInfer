@@ -175,7 +175,6 @@ endif()
 add_library(mfq-cuda-native-kernels STATIC
     ${TYLOINFER_CUDA_KERNEL_SOURCES}
     ${TYLOINFER_CUDA_ROOT}/kernels/float_projection.cu
-    ${TYLOINFER_CUDA_ROOT}/kernels/channel_fp8.cu
     ${TYLOINFER_CUDA_ROOT}/kernels/kv_quantization.cu
     ${TYLOINFER_CUDA_ROOT}/kernels/kv_hot_cache.cu
     ${TYLOINFER_CUDA_ROOT}/kernels/shared_gate_fused.cu
@@ -541,7 +540,6 @@ set(TYLOINFER_CUDA_RUNTIME_OP_SOURCES
     ${TYLOINFER_CUDA_ROOT}/ops/gguf/gguf_weight.cpp
     ${TYLOINFER_CUDA_ROOT}/ops/gguf/gguf_residual.cpp
     ${TYLOINFER_CUDA_ROOT}/ops/gguf/gguf_rotation.cpp
-    ${TYLOINFER_CUDA_ROOT}/ops/gguf/gguf_rows.cpp
     ${TYLOINFER_CUDA_ROOT}/ops/gguf/gguf_experts.cpp
     ${TYLOINFER_CUDA_ROOT}/ops/gguf/gguf_cpu_executor.cpp
     ${TYLOINFER_CUDA_ROOT}/../../third_party/strata/src/core/expert_cache.cpp

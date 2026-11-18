@@ -1,6 +1,6 @@
 #include "row_correction.h"
 #include "../../kernels/projection/gguf/residual/row_residual.h"
-#include "projection.h"
+#include "engine/weights/encoding/gguf/decode.h"
 #include "engine/backends/cuda/native/context.h"
 #include "engine/backends/cuda/native/tensor/backend.h"
 #include <climits>
@@ -89,7 +89,7 @@ namespace tyloi::cuda::gguf {
         const auto index=c.first+i;
         const auto type=types.data_ptr<std::int32_t>()[index];
         if(!type)continue;
-        decode_cpu(ggml_type(type),packed.data_ptr<std::uint8_t>()+
+        tyloi::gguf::decode_row(ggml_type(type),packed.data_ptr<std::uint8_t>()+
             offsets.data_ptr<std::int64_t>()[index],row.data(),std::int64_t(row.size()));
         std::copy_n(row.data()+c.column_first,c.columns,out.data_ptr<float>()+i*c.columns);
     }

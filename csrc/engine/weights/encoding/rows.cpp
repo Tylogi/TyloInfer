@@ -1,5 +1,6 @@
 #include "engine/weights/encoding/rows.h"
 #include "engine/weights/encoding/tq/table.h"
+#include "engine/weights/rows/gguf.h"
 #if TYLOINFER_ENABLE_MFQ_COMPAT
 #include "engine/weights/encoding/quant/nint_rows.h"
 #endif
@@ -12,6 +13,7 @@ Rows::Rows(std::shared_ptr<TqTable> table) : tq_(std::move(table)) {
         throw std::overflow_error("row table size overflow");
 }
 Rows::Rows(std::shared_ptr<NintRows> table) : nint_(std::move(table)) {}
+Rows::Rows(std::shared_ptr<GgufRows> table) : gguf_(std::move(table)) {}
 Rows::Rows(std::int64_t rows, std::int64_t width, ScalarType dtype, Read read)
     : shape_{rows, width}, dtype_(dtype), read_(std::move(read)) {
     if (rows <= 0 || width <= 0 || !read_ ||
@@ -31,11 +33,12 @@ void Rows::read_rows(const std::vector<Row>& rows) const {
     }
     if (!ranges.empty()) read_(ranges);
 }
-bool Rows::defined() const noexcept { return bool(tq_) || bool(nint_) || bool(read_); }
+bool Rows::defined() const noexcept { return bool(tq_) || bool(nint_) || bool(gguf_) || bool(read_); }
 std::int64_t Rows::size(std::int64_t dimension) const {
     if (dimension < 0) dimension += 2;
     if (dimension < 0 || dimension >= 2 || !defined()) throw std::out_of_range("invalid row table dimension");
     if (tq_) return dimension == 0 ? static_cast<std::int64_t>(tq_->rows()) : tq_->width();
+    if (gguf_) return dimension == 0 ? gguf_->rows() : gguf_->width();
     if (read_) return shape_[dimension];
 #if TYLOINFER_ENABLE_MFQ_COMPAT
     return dimension == 0 ? nint_->rows() : nint_->width();

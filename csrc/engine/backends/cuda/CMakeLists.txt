@@ -378,6 +378,7 @@ set(TYLOINFER_CUDA_OP_SOURCES
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/projection/mx/tensor.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/projection/quant_linear.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/gguf/projection.cpp
+    ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/gguf/rows.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/gguf/rotation.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/gguf/row_correction.cpp
     ${PROJECT_SOURCE_DIR}/engine/backends/cuda/ops/gguf/residual.cpp

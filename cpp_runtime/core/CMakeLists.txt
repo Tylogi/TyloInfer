@@ -63,7 +63,6 @@ add_library(mfq-model-source STATIC
     include/tyloinfer/nvq_rows.h
     include/tyloinfer/packed_row_range.h
     hf_model_source.cpp
-    hf_packed_quant.cpp hf_packed_quant.h
     mlx/mlx_affine.cpp
     mlx/mlx_affine_source.cpp
     gguf/gguf_model_source.cpp

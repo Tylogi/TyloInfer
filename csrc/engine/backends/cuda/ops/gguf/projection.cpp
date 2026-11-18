@@ -15,7 +15,7 @@
 #include "../../kernels/projection/gguf/quad/small_m.h"
 #include "../../kernels/projection/gguf/quad/decode.h"
 #include "dense_schedule.h"
-#include "components/ggml/src/ggml-quants.h"
+#include "engine/weights/encoding/gguf/decode.h"
 
 #include <algorithm>
 #include <climits>
@@ -392,15 +392,6 @@ tyloi::cuda::gguf::QuadProjection quad_projection(const GgufTensor& w,void* outp
 bool same_input_basis(const GgufTensor& a, const GgufTensor& b) {
     return (!a.rotation && !b.rotation) || (a.rotation && b.rotation && (a.rotation->block==b.rotation->block && a.rotation->signs_cpu==b.rotation->signs_cpu));
 }
-void decode_cpu(ggml_type type, const void* packed, float* output, std::int64_t columns) {
-    if (type == GGML_TYPE_Q8_K)
-        dequantize_row_q8_K(static_cast<const block_q8_K*>(packed), output, columns);
-    else {
-        const auto* traits = ggml_get_type_traits(type);
-        if (!traits->to_float) throw std::invalid_argument("GGUF format has no CPU decoder");
-        traits->to_float(packed, output, columns);
-    }
-}
 
 
 ::tyloi::DenseTensor dequantize_stored(const GgufTensor& w) {
@@ -415,7 +406,7 @@ void decode_cpu(ggml_type type, const void* packed, float* output, std::int64_t 
             output.data_ptr(),false,stream.stream());
     } else {
         for (std::int64_t row = 0; row < w.out; ++row)
-            decode_cpu(w.type, w.packed.data_ptr<std::uint8_t>() + row * w.row_bytes,
+            tyloi::gguf::decode_row(w.type, w.packed.data_ptr<std::uint8_t>() + row * w.row_bytes,
                 output.data_ptr<float>() + row * w.neuron_len, w.neuron_len);
     }
     return output;
@@ -446,7 +437,7 @@ void decode_cpu(ggml_type type, const void* packed, float* output, std::int64_t 
         for (std::int64_t row = 0; row < ids.numel(); ++row) {
             const auto id = ids.data_ptr<std::int64_t>()[row];
             if (id < 0 || id >= w.out) continue;
-            decode_cpu(w.type, w.packed.data_ptr<std::uint8_t>() + id * w.row_bytes,
+            tyloi::gguf::decode_row(w.type, w.packed.data_ptr<std::uint8_t>() + id * w.row_bytes,
                 output.data_ptr<float>() + row * w.neuron_len, w.neuron_len);
         }
         return output.reshape(shape);

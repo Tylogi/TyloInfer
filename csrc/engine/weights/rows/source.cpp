@@ -4,6 +4,7 @@
 #include "engine/weights/encoding/rows.h"
 #include "engine/weights/encoding/dense/blob.h"
 #if TYLOINFER_HAS_CUDA
+#include "engine/weights/rows/gguf.h"
 #include "engine/backends/cuda/native/env.h"
 #else
 #include <cstdlib>
@@ -18,6 +19,15 @@
 #include <limits>
 #include <stdexcept>
 #include <utility>
+
+#if TYLOINFER_HAS_CUDA
+std::shared_ptr<tyloi::weights::Rows> tyloi::weights::load_gguf_rows(
+        const source::Source& source, const std::string& name) {
+    auto table = std::make_shared<GgufRows>(source, name);
+    observe_streamed_ple(table, static_cast<std::size_t>(require_tensor(source, name).nbytes));
+    return std::make_shared<Rows>(std::move(table));
+}
+#endif
 
 std::shared_ptr<tyloi::weights::Rows> tyloi::weights::load_dense_rows(
         const source::Source& source, const std::string& name) {

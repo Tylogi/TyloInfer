@@ -52,7 +52,7 @@ struct HfSource::Impl {
 };
 
 HfSource::HfSource(std::filesystem::path root, std::string source_prefix)
-    : impl_(std::make_unique<Impl>(std::move(root), source_prefix)) {
+    : impl_(std::make_shared<Impl>(std::move(root), source_prefix)) {
     std::vector<std::string> raw_names;
     raw_names.reserve(impl_->files.records().size());
     for (const auto& [name, unused] : impl_->files.records()) {
@@ -359,6 +359,30 @@ const TensorMetadata* HfSource::find_tensor(
 
 TensorLayout HfSource::tensor_layout() const noexcept {
     return impl_->layout;
+}
+
+HfSource::TensorReader HfSource::tensor_reader(std::string_view name) const {
+    const auto found = impl_->records.find(std::string(name));
+    if (found == impl_->records.end())
+        throw std::out_of_range("HF tensor not found: " + std::string(name));
+    return [owner = impl_, record = &found->second](
+            std::uint64_t offset, std::byte* destination, std::size_t size) {
+        record->read(owner->files, offset, destination, size);
+    };
+}
+
+HfSource::TensorBatchReader HfSource::tensor_batch_reader(std::string_view name) const {
+    return [read = tensor_reader(name)](const std::vector<ReadSpan>& spans) {
+        for (const auto& span : spans) read(span.offset, span.destination, span.size);
+    };
+}
+
+bool HfSource::supports_parallel_tensor_reads() const noexcept {
+#if defined(_WIN32)
+    return false;
+#else
+    return true;
+#endif
 }
 
 std::optional<TensorFileRange> HfSource::tensor_file_range_at(std::string_view name,

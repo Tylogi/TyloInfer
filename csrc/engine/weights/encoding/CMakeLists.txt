@@ -4,6 +4,8 @@ target_include_directories(mfq-formats INTERFACE
 
 add_library(mfq-quant-readers STATIC
     features.cpp
+    gguf/decode.cpp
+    gguf/decode.h
     bytes.h
     legacy.h
     dense/blob.cpp
@@ -35,7 +37,7 @@ add_library(mfq-quant-readers STATIC
 target_include_directories(mfq-quant-readers PRIVATE
     ${PROJECT_SOURCE_DIR})
 target_link_libraries(mfq-quant-readers PUBLIC mfq-formats mfq-io
-    PRIVATE mfq-host-parallel mfq-json)
+    PRIVATE mfq-host-parallel mfq-json mfq-ggml-internal-headers mfq-ggml)
 target_compile_features(mfq-quant-readers PUBLIC cxx_std_17 PRIVATE cxx_std_20)
 target_compile_definitions(mfq-quant-readers PRIVATE
     TYLOINFER_ENABLE_MFQ_COMPAT=$<BOOL:${TYLOINFER_ENABLE_MFQ_COMPAT}>)

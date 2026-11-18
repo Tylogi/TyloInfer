@@ -9,9 +9,11 @@
 #include "engine/backends/cuda/ops/projection/quant.h"
 #include "engine/backends/cuda/ops/projection/channel_fp8.h"
 #include "engine/backends/cuda/ops/gguf/projection.h"
+#include "engine/backends/cuda/ops/gguf/rows.h"
 #include "engine/backends/cuda/ops/projection/nint/input.h"
 #include "engine/weights/tq/routed.h"
 #include "engine/weights/encoding/rows.h"
+#include "engine/weights/rows/gguf.h"
 #include "engine/weights/tq/rows.h"
 #if TYLOINFER_ENABLE_MFQ_COMPAT
 #include "engine/backends/cuda/ops/projection/nint/tensor.h"
@@ -136,6 +138,15 @@ tyloi::DenseTensor tyloi::cuda::ops::embedding(tyloi::DenseTensor ids, const ::t
     if (ids.is_cuda()) guard.emplace(ids.device().index);
     if (const auto* rows = weight.representation<tyloi::weights::Rows>()) {
         if (rows->tq()) return lookup_tq_table(*rows->tq(), Tensor(std::move(ids))).dense();
+        if (rows->gguf()) {
+            const auto shape = ids.sizes().vec();
+            const auto host = ids.to(kInt64).cpu().contiguous().reshape({-1});
+            std::vector<std::int64_t> values(static_cast<std::size_t>(host.numel()));
+            if (!values.empty())
+                std::copy_n(host.data_ptr<std::int64_t>(), values.size(), values.begin());
+            return gguf::lookup_rows({rows->gguf()}, rows->gguf()->rows(), values,
+                shape, ids.device()).dense();
+        }
 #if TYLOINFER_ENABLE_MFQ_COMPAT
         if (rows->nint()) return nint_row_embedding_lookup(*rows->nint(), ids);
 #endif

@@ -17,6 +17,7 @@
 #include "engine/weights/encoding/gguf/tensor.h"
 #include "engine/weights/encoding/gguf_quant.h"
 #include "engine/weights/prepare/gguf_weight.h"
+#include "engine/weights/source/transform.h"
 #include "engine/backends/cuda/ops/projection/quant.h"
 #include <algorithm>
 #include <cstdio>
@@ -193,6 +194,7 @@ static TensorParallelAxis infer_tensor_parallel_axis(
         return std::make_shared<Rows>(load_nint_rows(source, name));
 #endif
     const auto& dtype = tyloi::require_tensor(source, name).dtype;
+    if (tyloi::gguf::is_quantized(dtype)) return load_gguf_rows(source, name);
     if (dtype == "BF16" || dtype == "F16" || dtype == "F32") {
         return load_dense_rows(source, name);
     }
@@ -623,7 +625,8 @@ static TensorParallelAxis infer_tensor_parallel_axis(
             const int64_t extent = output_axis ? shape[0] : shape[1] / block;
             int64_t preferred = output_axis ? 128 : 1;
             if (!output_axis) {
-                const auto basis = tyloi::weights::gguf_rotation_block(mfq, name);
+                const auto transform = tyloi::source::hadamard(mfq, name);
+                const auto basis = transform ? transform->block_size : 1;
                 preferred = basis / std::gcd<int64_t>(basis, block);
             }
             for (const auto& slice : select_slices(extent, preferred)) {

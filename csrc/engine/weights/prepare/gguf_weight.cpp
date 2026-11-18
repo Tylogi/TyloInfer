@@ -6,7 +6,7 @@
 #include "engine/backends/cuda/kernels/projection/gguf/quad/storage.h"
 #include "engine/weights/encoding/gguf_quant.h"
 #include "engine/weights/source/row_residual.h"
-#include "nlohmann/json.hpp"
+#include "engine/weights/source/transform.h"
 
 #include <cuda_runtime_api.h>
 
@@ -29,43 +29,10 @@ DenseTensor read_bytes(const source::Source& source, const std::string& name,
     return result;
 }
 
-std::optional<HadamardTransform> transform_for(const source::Source& source,
-        const std::string& name) {
-    HadamardTransform parsed;
-    const HadamardTransform* transform = nullptr;
-    if (const auto* cached = source.hadamard_transforms()) {
-        const auto found = cached->find(name);
-        if (found == cached->end()) return std::nullopt;
-        transform = &found->second;
-    } else {
-        const auto& metadata = source.metadata();
-        const auto found = metadata.find("gguf_hadamard");
-        if (found == metadata.end()) {
-            const auto required = metadata.find("gguf_requires_hadamard");
-            if (required != metadata.end() && required->second == "true")
-                throw std::invalid_argument("GGUF Hadamard descriptors are missing");
-            return std::nullopt;
-        }
-        const auto transforms = nlohmann::json::parse(found->second);
-        if (!transforms.contains(name)) return std::nullopt;
-        parsed.block_size = transforms.at(name).at("block_size").get<std::int64_t>();
-        for (const auto sign : transforms.at(name).at("signs").get<std::vector<int>>()) {
-            if (sign != 1 && sign != -1)
-                throw std::invalid_argument("GGUF Hadamard sign value differs");
-            parsed.signs.push_back(static_cast<std::int8_t>(sign));
-        }
-        transform = &parsed;
-    }
-    if (transform->block_size < 1 || transform->block_size > INT_MAX ||
-            (transform->block_size & (transform->block_size - 1)))
-        throw std::invalid_argument("invalid GGUF Hadamard block");
-    return *transform;
-}
-
 std::optional<GgufRotation> rotation_for(const source::Source& source,
         const std::string& name, std::int64_t width, std::int64_t first,
         std::int64_t last, Device target) {
-    const auto transform = transform_for(source, name);
+    const auto transform = source::hadamard(source, name);
     if (!transform) return std::nullopt;
     const auto block = transform->block_size;
     const auto& signs = transform->signs;
@@ -197,11 +164,6 @@ std::shared_ptr<TensorImpl> GgufTensor::relocated(Device target) const {
 } // namespace tyloi
 
 namespace tyloi::weights {
-
-std::int64_t gguf_rotation_block(const source::Source& source, const std::string& name) {
-    const auto transform = transform_for(source, name);
-    return transform ? transform->block_size : 1;
-}
 
 GgufTensor load_gguf(const source::Source& source, const std::string& name,
         Device target, std::int64_t row_begin, std::int64_t row_end,

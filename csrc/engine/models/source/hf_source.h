@@ -31,6 +31,9 @@ public:
     const TensorMetadata* find_tensor(
         std::string_view name) const noexcept override;
     TensorLayout tensor_layout() const noexcept override;
+    TensorReader tensor_reader(std::string_view name) const override;
+    TensorBatchReader tensor_batch_reader(std::string_view name) const override;
+    bool supports_parallel_tensor_reads() const noexcept override;
     std::optional<TensorFileRange> tensor_file_range_at(std::string_view name,
         std::uint64_t offset, std::size_t size) const override;
     void read_range_into(
@@ -45,7 +48,7 @@ public:
 
 private:
     struct Impl;
-    std::unique_ptr<Impl> impl_;
+    std::shared_ptr<Impl> impl_;
 };
 
 } // namespace tyloi::models

@@ -8,8 +8,6 @@
 
 namespace tyloi::weights {
 
-std::int64_t gguf_rotation_block(const source::Source&, const std::string& name);
-
 GgufTensor load_gguf(
     const source::Source& source,
     const std::string& name,

@@ -27,6 +27,5 @@ bool m1_aligned(const std::vector<GgufTensor>&, std::int64_t);
 DenseTensor canonical_packed(const GgufTensor&);
 ProjectionInput prepare_input(const std::vector<GgufTensor>&, DenseTensor);
 std::vector<DenseTensor> project_input(const ProjectionInput&, const std::vector<GgufTensor>&);
-void decode_cpu(ggml_type, const void*, float*, std::int64_t);
 
 } // namespace tyloi::cuda::gguf
