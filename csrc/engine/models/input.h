@@ -74,10 +74,11 @@ struct Prefill {
 
 struct DecodeOptions {
     enum class Projection { hidden_only, hidden, logits, greedy };
+    enum class Readout { none, greedy, verification };
     Projection projection = Projection::hidden_only;
     bool routed = false, compact_sampling = false, enabled = true;
     std::int64_t reserve_until = 0;
-    bool greedy_readout = false;
+    Readout readout = Readout::none;
 };
 
 struct Decoded {

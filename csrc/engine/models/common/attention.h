@@ -48,7 +48,7 @@ struct FullAttention {
     std::array<::tyloi::Tensor, 2> forward(
         const tyloi::Tensor& input, const AttentionStep& step,
         tyloi::state::KvView cache, const tyloi::ops::RopeTable& rope,
-        tyloi::ops::Trace* trace = nullptr) const;
+        tyloi::ops::Trace* trace = nullptr, bool history_only = false) const;
 };
 
 } // namespace tyloi::models

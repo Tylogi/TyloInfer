@@ -162,13 +162,8 @@ public:
                 cell.hidden=model_.finalize_hidden(hidden,1,tokens);
                 cell.raw=model_.adapter_raw_hidden(hidden,cell.hidden);
                 cell.logits=model_.logits_from_hidden(cell.hidden);
-                if(greedy_packet) {
-                    auto samples=sample_greedy_cuda(cell.logits.reshape({tokens,-1}).contiguous()).reshape({tokens});
-                    // Keep both token sets in one stable captured allocation:
-                    // input draft IDs, followed by all target argmax IDs.
-                    cell.greedy_packet=tokens>1?mfq_tensor_backend::cat({
-                        cell.ids.narrow(1,1,tokens-1).reshape({tokens-1}),samples},0):samples;
-                }
+                if(greedy_packet)
+                    cell.greedy_packet=sample_greedy_cuda(cell.logits.reshape({tokens,-1}).contiguous()).reshape({tokens});
                 if(confirmed)for(const auto& block:model_.blocks)
                     if(auto* b=dynamic_cast<LinearAttentionBlock*>(block.get()))
                         cell.checkpoints.push_back({b,b->mixer.speculative_convolution,

@@ -72,11 +72,13 @@ void MtpState::prepare(int64_t batch, int64_t tokens, int64_t kl_capacity) {
             ? tyloi::state::grow_kv(kv_[index], capacity, position_)
             : tyloi::state::allocate_kv(batch, layout.heads, capacity, layout.head_dim, false,
                 layout.device, layout.dtype, layout.quantization);
+        graphs.reset();
         kv_[index] = std::move(grown);
     }
 }
 
 void MtpState::reset(int64_t batch) {
+    graphs.reset();
     position_ = 0;
     for (auto& cache : kv_)
         if (!cache.defined() || cache.batch != batch) cache = {};
@@ -196,6 +198,7 @@ void MtpState::stage(Restore& restore, const MtpSessionState& saved) const {
 }
 
 void MtpState::publish(Restore&& restore) noexcept {
+    graphs.reset();
     kv_.swap(restore.kv);
     position_ = restore.position;
 }

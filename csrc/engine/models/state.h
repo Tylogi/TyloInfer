@@ -42,6 +42,7 @@ public:
     virtual std::int64_t position() const noexcept = 0;
     // Retained lazy state roots to submit before releasing the execution scope.
     virtual std::vector<Tensor> storage() const { return {}; }
+    virtual void release_graphs() noexcept {}
     virtual std::unique_ptr<Restore> prepare_restore(const ::MtpSessionState& snapshot);
 private:
     const Mtp* model_;

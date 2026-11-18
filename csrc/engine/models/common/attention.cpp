@@ -8,7 +8,7 @@ namespace tyloi::models {
 
 std::array<::tyloi::Tensor, 2> FullAttention::forward(
         const tyloi::Tensor& input, const AttentionStep& step, tyloi::state::KvView cache,
-        const tyloi::ops::RopeTable& rope, tyloi::ops::Trace* trace) const {
+        const tyloi::ops::RopeTable& rope, tyloi::ops::Trace* trace, bool history_only) const {
     if (!step.positions) throw std::runtime_error("attention positions are missing");
     const auto& pos = step.positions;
     const auto cache_pos = step.cache_position;
@@ -147,6 +147,7 @@ std::array<::tyloi::Tensor, 2> FullAttention::forward(
             });
         }
     }
+    if (history_only) return {};
     if (prepared) {
         kv = {tyloi::ops::slice(cache.physical_key, 2, 0, cache_pos + T),
               tyloi::ops::slice(cache.physical_value, 2, 0, cache_pos + T)};

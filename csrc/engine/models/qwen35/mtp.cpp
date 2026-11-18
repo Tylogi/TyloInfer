@@ -52,6 +52,24 @@ tyloi::models::MtpStep Mtp::step(tyloi::models::MtpState& value, const ::tyloi::
     return {output, output};
 }
 
+tyloi::models::MtpStep Mtp::prefill(tyloi::models::MtpState& value, const Tensor& hidden,
+        const Tensor& ids, const Tensor& positions, const ForwardOptions& options) const {
+    if (!model_.device.is_cuda() || model_.layers.size() != 1 || options.trace || positions ||
+        !model_.config.mrope_sections.empty() ||
+        (model_.rope.sections && model_.rope.sections.numel()) ||
+        (model_.layers.front().attention.attention_rope.sections &&
+         model_.layers.front().attention.attention_rope.sections.numel()) ||
+        model_.layers.front().attention.sliding ||
+        model_.layers.front().attention.kv_quantization.enabled() ||
+        !hidden || hidden.is_encoded() || hidden.device() != model_.device ||
+        hidden.dim() != 3 || hidden.size(0) != 1 ||
+        !ids || ids.is_encoded() || ids.device() != model_.device || ids.dim() != 2 || ids.size(0) != 1)
+        return step(value, hidden, ids, positions, options);
+    auto& request = state<MtpState>(value);
+    (void)model_.step(hidden, ids, positions, request, options, true);
+    return {};
+}
+
 std::vector<tyloi::models::MtpStep> Mtp::batch_step(
         std::span<const tyloi::models::MtpRow> rows,
         const tyloi::models::ForwardOptions& options) const {
@@ -71,5 +89,12 @@ MtpSessionState Mtp::capture_session_state(const tyloi::models::MtpState& value,
     tyloi::ops::DeviceScope guard(model_.device);
     return state<MtpState>(value).capture(position, hidden);
 }
+
+#if !TYLOINFER_HAS_CUDA
+StepSequence<tyloi::models::MtpDraft> Mtp::greedy_draft(const tyloi::models::CausalModel&,
+        tyloi::models::MtpRow, int, const tyloi::models::ForwardOptions&) const {
+    return {};
+}
+#endif
 
 } // namespace tyloi::models::qwen35

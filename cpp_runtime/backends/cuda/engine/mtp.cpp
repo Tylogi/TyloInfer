@@ -572,63 +572,7 @@ template <class Model> struct CudaMtpOps {
                ? result.reshape({1, tokens}).expand({3, tokens}).contiguous()
                : result;
   }
-  Tensor enqueue_greedy_chain(Tensor hidden,Tensor ids,Tensor positions,int depth,Tensor* verification_ids) {
-    if constexpr(std::is_same_v<Model,mfq::cuda::Qwen35CausalLm>) {
-      if(auto* predictor=dynamic_cast<Qwen35Mtp*>(&mtp);
-          predictor && mfq::cuda::qwen35::MtpTargetGraphs::eligible(model,ids)) {
-        auto proposals=predictor->enqueue_greedy_chain(target,std::move(hidden),std::move(ids),std::move(positions),depth,verification_ids);
-        if(proposals) {
-          projected_predictor_hidden={};projected_predictor_logits={};projected_predictor_compact={};
-          projected_predictor_greedy=-1;projected_predictor_probability=-1.f;
-          const bool initialized=mtp.take_graph_initialization();
-          target_maintenance=target_maintenance || initialized;
-          return std::move(*proposals);
-        }
-      }
-    }
-    return {};
-  }
-  std::pair<std::vector<int32_t>,std::vector<int32_t>> resolve_queued_greedy(
-      const Tensor& proposals,Tensor logits) {
-    TYLOINFER_RUNTIME_CHECK(sampler().greedy() && !penalties && logits.dim()==2 &&
-        logits.size(0)==proposals.numel()+1,"invalid queued greedy verification");
-    const bool captured=projected_target_packet.defined() && projected_target_logits.defined() &&
-        logits.data_ptr()==projected_target_logits.data_ptr() && logits.numel()==projected_target_logits.numel();
-    auto packet=projected_target_packet;
-    if(!captured) {
-      auto samples=sampler().ops().sample_greedy(logits.contiguous()).reshape({-1});
-      packet=mfq_tensor_backend::cat({proposals,samples},0);
-    }
-    auto host=packet.cpu().contiguous();
-    const auto* tokens=host.template data_ptr<int64_t>();
-    const auto count=proposals.numel();
-    static thread_local bool reported=false;
-    if(!reported) {
-      std::cerr<<"runtime_qwen35_queued_verification actual_match=1 draft_host_reads=0 combined_host_reads=1"
-          <<" captured_target_greedy="<<captured<<'\n';
-      reported=true;
-    }
-    return {std::vector<int32_t>(tokens,tokens+count),
-        std::vector<int32_t>(tokens+count,tokens+host.numel())};
-  }
   std::optional<std::vector<int32_t>> predictor_greedy_chain(Tensor hidden,Tensor ids,Tensor positions,int depth,int32_t anchor) {
-    if constexpr(std::is_same_v<Model,mfq::cuda::Qwen35CausalLm>) {
-      if(auto* predictor=dynamic_cast<Qwen35Mtp*>(&mtp)) {
-        auto result=predictor->queued_greedy_chain(target,std::move(hidden),std::move(ids),std::move(positions),depth);
-        if(result) {
-          static thread_local bool reported=false;
-          if(!reported) {
-            std::cerr<<"runtime_qwen35_queued_greedy actual_match=1 depth="<<depth<<" host_reads=1\n";
-            reported=true;
-          }
-          projected_predictor_hidden={};projected_predictor_logits={};projected_predictor_compact={};
-          projected_predictor_greedy=-1;projected_predictor_probability=-1.f;
-          const bool initialized=mtp.take_graph_initialization();
-          target_maintenance=target_maintenance || initialized;
-        }
-        return result;
-      }
-    }
     if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
       if(auto* predictor=dynamic_cast<mfq::cuda::qwen4_exp::Qwen4ExpMtp*>(&mtp);
           predictor && predictor->layers.size()==1 && model.reuse_decode_graphs && model.graph_registry) {
@@ -886,7 +830,7 @@ template <class Model> struct CudaMtpOps {
     if(projected_target_packet.defined() && projected_target_logits.defined() &&
         logits.data_ptr()==projected_target_logits.data_ptr() && logits.numel()==projected_target_logits.numel()) {
       auto host=projected_target_packet.cpu().contiguous();
-      const auto* tokens=host.template data_ptr<int64_t>()+logits.size(0)-1;
+      const auto* tokens=host.template data_ptr<int64_t>();
       return std::vector<int32_t>(tokens,tokens+logits.size(0));
     }
     auto host = sampler().ops().sample_greedy(logits.contiguous()).cpu().contiguous();

@@ -24,8 +24,14 @@ public:
     tyloi::models::MtpStep step(tyloi::models::MtpState& state, const ::tyloi::Tensor& hidden,
         const ::tyloi::Tensor& next_ids, const ::tyloi::Tensor& positions = {},
         const tyloi::models::ForwardOptions& options = {}) const override;
+    tyloi::models::MtpStep prefill(tyloi::models::MtpState& state, const ::tyloi::Tensor& hidden,
+        const ::tyloi::Tensor& ids, const ::tyloi::Tensor& positions,
+        const tyloi::models::ForwardOptions& options) const override;
     std::vector<tyloi::models::MtpStep> batch_step(
         std::span<const tyloi::models::MtpRow>,
+        const tyloi::models::ForwardOptions& options = {}) const override;
+    StepSequence<tyloi::models::MtpDraft> greedy_draft(const tyloi::models::CausalModel& target,
+        tyloi::models::MtpRow row, int depth,
         const tyloi::models::ForwardOptions& options = {}) const override;
 
     void trim_cache_to(tyloi::models::MtpState& state, int64_t position) const override;

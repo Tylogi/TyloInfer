@@ -133,7 +133,11 @@ struct MtpOps {
         executor.submit(outputs);
         return hidden;
     }
-    Tensor target_forward(Tensor ids, Tensor* raw = nullptr, int64_t confirmed = 0) {
+    bool dense_target_graph() const {
+        return device.is_cuda() && info.graph == models::GraphOwner::executor &&
+            weights.graph_safe(weights::Cache::Graph::legacy);
+    }
+    Tensor target_forward(Tensor ids, Tensor* raw = nullptr, int64_t confirmed = 0, bool queued = false) {
         target_transfer_bytes = 0;
         const auto before = weights.activity().streamed_bytes;
         const auto costs = profile ? target_costs() : std::array<double, 6>{};
@@ -150,12 +154,14 @@ struct MtpOps {
             models::DecodeOptions policy;
             policy.projection = models::DecodeOptions::Projection::hidden;
             policy.routed = weights.decode() == weights::Cache::Decode::routed;
-            const bool dense = device.is_cuda() && info.graph == models::GraphOwner::executor &&
-                weights.graph_safe(weights::Cache::Graph::legacy);
+            const bool dense = dense_target_graph();
             policy.enabled = policy.routed || dense;
             if (dense) {
                 policy.reserve_until = target_extent;
-                policy.greedy_readout = sampler_ && !penalties && sampler().greedy();
+                if (sampler_ && !penalties && sampler().greedy()) {
+                    policy.readout = queued ? models::DecodeOptions::Readout::verification
+                                            : models::DecodeOptions::Readout::greedy;
+                }
             }
             policy.compact_sampling = sampler_ && !penalties && !sampler().greedy() &&
                 sampler().params().top_k > 0 && sampler().params().top_k <= 64;
@@ -250,6 +256,46 @@ struct MtpOps {
         else projected_predictor_hidden = {};
         return result;
     }
+    models::MtpDraft greedy_draft(const Tensor& hidden, const Tensor& ids, int depth) {
+        if (!graph_enabled || (prepared && prepared->transformed()) || !dense_target_graph()) return {};
+        auto scope = ops::dense_scope(&predictor_execution, device);
+        auto predictor_options = options;
+        predictor_options.serial_experts = false;
+        Capture capture(predictor_execution, weights, budget, device);
+        auto job = mtp.greedy_draft(model, {&predictor, hidden, ids, {}}, depth, predictor_options);
+        models::MtpDraft result;
+        bool admitted = false;
+        try {
+            while (auto step = job.next()) {
+                if (result.ids || step.layer || step.workspace || bool(step.graph) == bool(step.value))
+                    throw std::logic_error("invalid MTP draft graph event");
+                if (step.graph) {
+                    admitted = true;
+                    capture.step(std::move(*step.graph));
+                } else {
+                    result = std::move(*step.value);
+                    if (!result.ids || result.ids.device() != device || result.ids.scalar_type() != kInt64 ||
+                        result.ids.dim() != 2 || result.ids.size(0) != 1 || result.ids.size(1) != depth + 1)
+                        throw std::logic_error("incomplete MTP verification window");
+                }
+            }
+            if (admitted && !result.ids) throw std::logic_error("MTP draft graph ended without a result");
+            if (result.ids) {
+                predictor_execution.submit(predictor.storage());
+                predictor_execution.submit(std::array<Tensor, 1>{result.ids});
+                projected_predictor_hidden = {};
+                projected_predictor_logits = {};
+                projected_predictor_greedy = -1;
+            }
+            capture.finish();
+        } catch (...) {
+            try { capture.drain(); } catch (...) {}
+            job = {};
+            predictor.release_graphs();
+            throw;
+        }
+        return result;
+    }
     int64_t predictor_prefill_chunk_size(int64_t requested) const { return mtp.prefill_chunk_size(requested); }
     bool stream_prompt_history(int64_t tokens) const { return mtp.stream_prompt_history(tokens); }
     bool bootstrap_before_publication() const { return mtp.bootstrap_before_publication(); }
@@ -318,6 +364,15 @@ struct MtpOps {
         const auto tokens = ops::read_integers(projected_target_ids && same_data(logits, projected_target_logits)
             ? projected_target_ids : ops::sample_greedy(ops::contiguous(logits)));
         return {tokens.begin(), tokens.end()};
+    }
+    std::vector<std::int64_t> verify_greedy(const Tensor& queued, const Tensor& logits) {
+        const auto rows = logits.size(0);
+        if (projected_target_ids.numel() == 2 * rows - 1 && same_data(logits, projected_target_logits))
+            return ops::read_integers(projected_target_ids);
+        auto proposals = ops::reshape(ops::slice(queued, 1, 1, rows), {rows - 1});
+        auto targets = ops::reshape(ops::sample_greedy(ops::contiguous(logits)), {rows});
+        const std::array<Tensor, 2> packet{proposals, targets};
+        return ops::read_integers(ops::cat(packet, 0));
     }
     int32_t sample_constrained(Tensor logits, Tensor token_counts, const MfqTokenConstraintPtr& constraint) {
         if (!constraint && sampler().greedy() && !penalties) return sample_normal(logits, token_counts);
@@ -452,6 +507,7 @@ Generation speculative_sequence(MtpOps ops, InferenceRequest &request, Inference
         std::vector<int32_t> tokens;
         std::vector<std::vector<float>> probabilities;
         std::vector<CompactDistribution> compact_probabilities;
+        Tensor queued;
     };
     const bool compact_stochastic = !greedy && sampling.top_k > 0 && sampling.top_k <= 64;
     auto draft_sampling = mtp.draft_sampling(sampling, compact_stochastic);
@@ -831,7 +887,18 @@ Generation speculative_sequence(MtpOps ops, InferenceRequest &request, Inference
             auto history_ids=ops.ids_for(std::move(shifted));
             auto history_positions=positioned_prompt
                 ? ops.decode_positions(predictor_history_position+1,history_rows) : Tensor{};
-
+            if (greedy && !penalties && !history_positions && requested_depth > 1 &&
+                !mtp.split_target_verification()) {
+                auto queued = ops.greedy_draft(hidden_rows, history_ids, requested_depth);
+                if (queued.ids) {
+                    predictor_history_position += history_rows;
+                    require_execution(predictor.position() == predictor_history_position + requested_depth - 1,
+                        "queued MTP predictor cache did not advance");
+                    maintenance = maintenance || queued.initialized;
+                    result.queued = std::move(queued.ids);
+                    return result;
+                }
+            }
 
             auto head=ops.predictor_step(std::move(hidden_rows),std::move(history_ids),std::move(history_positions));
             predictor_history_position += history_rows;
@@ -901,14 +968,12 @@ Generation speculative_sequence(MtpOps ops, InferenceRequest &request, Inference
                 if(output.stopped()){finish();co_return;}
                 continue;
             }
-            const int draft_count = static_cast<int>(draft.tokens.size());
+            const int draft_count = draft.queued ? static_cast<int>(draft.queued.size(1) - 1)
+                                                : static_cast<int>(draft.tokens.size());
             // Depth selection pays for the draft prepared before verification
             // as well. Keep that complete cycle when comparing with depth zero.
             const auto verify_started=Clock::now();
             Tensor verified_raw;
-            std::vector<int64_t> verify_ids;
-            verify_ids.push_back(pending);
-            verify_ids.insert(verify_ids.end(), draft.tokens.begin(), draft.tokens.end());
             Tensor verified;
             const bool split_target=mtp.split_target_verification();
             if (split_target) {
@@ -930,8 +995,14 @@ Generation speculative_sequence(MtpOps ops, InferenceRequest &request, Inference
                 }
             } else {
                 if(draft_count>0)ops.begin_target_routes(draft_count+1);
-                auto ids=ops.ids_for(std::move(verify_ids));
-                verified = ops.target_forward(std::move(ids), &verified_raw, draft_count > 0 ? 1 : 0);
+                auto ids = draft.queued;
+                if (!ids) {
+                    std::vector<int64_t> verify_ids{pending};
+                    verify_ids.insert(verify_ids.end(), draft.tokens.begin(), draft.tokens.end());
+                    ids = ops.ids_for(std::move(verify_ids));
+                }
+                verified = ops.target_forward(std::move(ids), &verified_raw, draft_count > 0 ? 1 : 0,
+                    bool(draft.queued));
             }
             auto targets =
                 ops.reshape(ops.logits_for(verified), {std::int64_t(draft_count) + 1, metadata.vocab_size});
@@ -951,10 +1022,14 @@ Generation speculative_sequence(MtpOps ops, InferenceRequest &request, Inference
                 result = {0, ops.sample_normal(ops.slice(targets, 0, 0, 1), row_counts), true};
             } else if (greedy) {
                 std::vector<int32_t> target_tokens;
-
-                {
-                    if (!penalties && target_tokens.empty()) target_tokens = ops.greedy_tokens(targets);
-                }
+                if (draft.queued) {
+                    auto packet = ops.verify_greedy(draft.queued, targets);
+                    require_execution(packet.size() == static_cast<std::size_t>(2 * draft_count + 1),
+                        "queued MTP verification packet is incomplete");
+                    const auto split = packet.begin() + draft_count;
+                    draft.tokens.assign(packet.begin(), split);
+                    target_tokens.assign(split, packet.end());
+                } else if (!penalties) target_tokens = ops.greedy_tokens(targets);
                 if (target_tokens.empty()) {
                     target_tokens.reserve(static_cast<size_t>(draft_count + 1));
                     for (int row = 0; row <= draft_count; ++row) {

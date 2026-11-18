@@ -8,6 +8,8 @@
 
 namespace tyloi::models::qwen35 {
 
+struct MtpGraphs;
+
 class MtpState final : public tyloi::models::MtpState {
 public:
     struct Restore {
@@ -24,6 +26,7 @@ public:
 
     MtpState(const tyloi::models::Mtp& owner, std::vector<Layout> layout, int64_t hidden);
     int64_t position() const noexcept override { return position_; }
+    void release_graphs() noexcept override { graphs.reset(); }
     /** Plan new KV backing for the next predictor operation. */
     std::vector<std::pair<tyloi::Device, std::size_t>> growth(
         int64_t batch, int64_t tokens, int64_t capacity, bool resetting = false) const;
@@ -39,6 +42,7 @@ public:
     Restore prepare(const MtpSessionState& saved) const;
     void stage(Restore& restore, const MtpSessionState& saved) const;
     void publish(Restore&& restore) noexcept;
+    std::shared_ptr<MtpGraphs> graphs;
 
 private:
     std::vector<Layout> layout_;

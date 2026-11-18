@@ -9,6 +9,7 @@
 #include "engine/generation/prefill/budget.h"
 
 #include <algorithm>
+#include <array>
 #include <exception>
 #include <limits>
 #include <map>
@@ -36,7 +37,7 @@ struct DecodeGraphs {
 
     explicit DecodeGraphs(cuda::StreamHandle stream) : stream(std::move(stream)) {}
 
-    using Key = std::tuple<std::int64_t, std::int64_t, std::int64_t, bool>;
+    using Key = std::tuple<std::int64_t, std::int64_t, std::int64_t, models::DecodeOptions::Readout>;
     cuda::StreamHandle stream;
     std::shared_ptr<cuda::GraphPoolLease> pool;
     std::vector<DenseTensor> replay_workspace;
@@ -105,7 +106,7 @@ StepSequence<models::Decoded> Model::decode(models::Input input, models::State& 
 
     const auto end = start + tokens;
     const auto extent = std::clamp(options.reserve_until > 0 ? options.reserve_until : limit, end, limit);
-    const DecodeGraphs::Key key{tokens, confirmed, extent, options.greedy_readout};
+    const DecodeGraphs::Key key{tokens, confirmed, extent, options.readout};
     const auto stream = mfq_get_current_cuda_stream(device.index);
     auto& graphs = state->decode_graphs;
     if (graphs && graphs->stream.stream() != stream.stream()) state->release_graphs();
@@ -172,9 +173,15 @@ StepSequence<models::Decoded> Model::decode(models::Input input, models::State& 
                         auto readout = ops::dense_scope(nullptr, device);
                         cell.output.logits = logits(cell.output.hidden);
                     }
-                    if (options.greedy_readout) {
+                    if (options.readout != models::DecodeOptions::Readout::none) {
                         auto rows = ops::reshape(cell.output.logits, {tokens, -1});
-                        cell.output.ids = ops::sample_greedy(ops::contiguous(rows));
+                        auto ids = ops::reshape(ops::sample_greedy(ops::contiguous(rows)), {tokens});
+                        if (options.readout == models::DecodeOptions::Readout::verification) {
+                            auto draft = ops::reshape(ops::slice(cell.ids, 1, 1, tokens), {tokens - 1});
+                            const std::array<Tensor, 2> packet{draft, ids};
+                            ids = ops::cat(packet, 0);
+                        }
+                        cell.output.ids = std::move(ids);
                     }
                     if (confirmed > 0) {
                         for (std::size_t i = 0; i < state->layers.size(); ++i) {

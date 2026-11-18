@@ -9,7 +9,8 @@
 namespace tyloi::models::qwen35 {
 
 Tensor Predictor::step(const Tensor& hidden, const Tensor& next_ids, const Tensor& positions,
-                       tyloi::models::qwen35::MtpState& state, const ForwardOptions& options) const {
+                       tyloi::models::qwen35::MtpState& state, const ForwardOptions& options,
+                       bool history_only) const {
     hidden.require_dense();
     next_ids.require_dense();
     if (positions.defined()) positions.require_dense();
@@ -43,7 +44,7 @@ Tensor Predictor::step(const Tensor& hidden, const Tensor& next_ids, const Tenso
         attention.sequence_lengths = ops::full(std::array<std::int64_t, 1>{batch}, state.position() + 1, pos.device());
     if (explicit_positions)
         attention.cache_positions = ops::arange(state.position(), state.position() + tokens, pos.device());
-    auto result = forward(hidden, embedded_value, attention, kv, rope, options.trace, options.trace_layer);
+    auto result = forward(hidden, embedded_value, attention, kv, rope, options.trace, options.trace_layer, history_only);
     state.advance(tokens);
     return result;
 }
@@ -167,7 +168,7 @@ std::vector<tyloi::models::MtpStep> Predictor::batch_step(
 
 Tensor Predictor::forward(const Tensor& hidden, const Tensor& embeddings, const AttentionStep& step,
                           std::span<const state::KvView> kv, const ops::RopeTable& rope,
-                          ops::Trace* trace, int trace_layer) const {
+                          ops::Trace* trace, int trace_layer, bool history_only) const {
     if (!hidden || !embeddings || hidden.dim() != 3 || embeddings.dim() != 3 ||
         hidden.size(0) <= 0 || hidden.size(1) <= 0 || hidden.size(2) <= 0 ||
         hidden.size(2) != config.hidden_size ||
@@ -176,6 +177,8 @@ Tensor Predictor::forward(const Tensor& hidden, const Tensor& embeddings, const 
         throw std::runtime_error("Qwen MTP inputs must be matching nonempty [B,T,H] tensors");
     if (kv.size() != layers.size())
         throw std::runtime_error("Qwen MTP cache does not match predictor layers");
+    if (history_only && (layers.size() != 1 || trace))
+        throw std::runtime_error("Qwen MTP cache-only history requires one untraced layer");
     if (step.cache_position < 0 || hidden.size(1) > config.max_position_embeddings ||
         step.cache_position > config.max_position_embeddings - hidden.size(1))
         throw std::runtime_error("Qwen MTP history exceeds context capacity");
@@ -198,7 +201,8 @@ Tensor Predictor::forward(const Tensor& hidden, const Tensor& embeddings, const 
     for (std::size_t index = 0; index < layers.size(); ++index) {
         const auto& layer = layers[index];
         const auto& attention = layer.attention;
-        auto output = attention.forward(current, step, kv[index], rope, trace_for(attention.layer));
+        auto output = attention.forward(current, step, kv[index], rope, trace_for(attention.layer), history_only);
+        if (history_only) return {};
         current = full_ffn(layer.ffn, layer.ffn_norm, output[0], output[1],
                            attention.rms_norm_eps, attention.norm_weight_offset,
                            attention.official_bf16, attention.attention_output_gate,

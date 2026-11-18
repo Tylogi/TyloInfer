@@ -1,5 +1,6 @@
 #pragma once
 
+#include "engine/generation/sequence.h"
 #include "engine/models/session/snapshot.h"
 #include "engine/tensor/tensor.h"
 #include "engine/models/state.h"
@@ -16,6 +17,8 @@
 
 namespace tyloi::models {
 
+class CausalModel;
+
 struct MtpStep {
     Tensor sample_hidden;
     Tensor chain_hidden;
@@ -29,6 +32,12 @@ struct MtpRow {
     Tensor hidden;
     Tensor ids;
     Tensor positions;
+};
+
+struct MtpDraft {
+    // The last history ID followed by the device-generated proposals.
+    Tensor ids;
+    bool initialized = false;
 };
 
 // Predictor weights and math use the explicit state owned by the request.
@@ -58,6 +67,8 @@ struct Mtp {
         std::span<const MtpRow>, const ForwardOptions& = {}) const {
         throw std::logic_error("batched MTP step is unsupported");
     }
+    virtual StepSequence<MtpDraft> greedy_draft(
+        const CausalModel&, MtpRow, int, const ForwardOptions&) const { return {}; }
     virtual void trim_cache_to(MtpState& state, int64_t position) const = 0;
     virtual bool teacher_forced_prompt_prime() const noexcept = 0;
     virtual bool target_bootstrap_decode() const noexcept = 0;

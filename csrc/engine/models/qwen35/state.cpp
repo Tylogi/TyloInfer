@@ -175,6 +175,7 @@ State::~State() {
 
 void State::release_graphs() noexcept {
     decode_graphs.reset();
+    if (predictor) predictor->release_graphs();
 }
 
 void State::bind_pages(tyloi::state::PagedKv& pool) {
