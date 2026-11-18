@@ -22,6 +22,7 @@ DenseTensor gated_residual(const GgufTensor&, const DenseTensor& gate,
 std::vector<DenseTensor> project_group(const std::vector<GgufTensor>&, DenseTensor);
 bool same_input_basis(const GgufTensor&, const GgufTensor&);
 bool original_input(const GgufTensor&);
+DenseTensor project_q8(const GgufTensor&, const DenseTensor&, std::int64_t, ScalarType, bool);
 bool position_major_q8(const GgufTensor&, std::int64_t);
 bool m1_aligned(const std::vector<GgufTensor>&, std::int64_t);
 DenseTensor canonical_packed(const GgufTensor&);

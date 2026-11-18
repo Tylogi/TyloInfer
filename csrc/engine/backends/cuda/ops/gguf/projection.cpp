@@ -44,7 +44,6 @@ static bool quad_ready(const GgufTensor& w) {
 static DenseTensor dequantize_stored(const GgufTensor&);
 static DenseTensor embedding_base(const GgufTensor&, DenseTensor);
 static DenseTensor project_m1(const GgufTensor&, const DenseTensor&, ScalarType);
-static DenseTensor project_q8(const GgufTensor&, const DenseTensor&, std::int64_t, ScalarType, bool);
 static bool can_prefill_residual(const GgufTensor&, std::int64_t, const DenseTensor&);
 static DenseTensor project_base(const GgufTensor&, DenseTensor, bool);
 static DenseTensor project_base(const GgufTensor&, DenseTensor, bool, const DenseTensor&);

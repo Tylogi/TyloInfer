@@ -3,6 +3,7 @@
 #include "engine/backends/cuda/ops/projection/quant.h"
 #include "engine/backends/cuda/ops/projection/channel_fp8.h"
 #include "engine/backends/cuda/ops/gguf/projection.h"
+#include "engine/backends/cuda/kernels/projection/dense.h"
 #include "engine/weights/encoding/sq/mxfp4_decode.h"
 
 #include <algorithm>
@@ -268,7 +269,19 @@ bool tensor_parallel_output_projections_compatible(
 
 ::tyloi::DenseTensor dense_projection(
         ::tyloi::DenseTensor input, const ::tyloi::DenseTensor& weight) {
+    const auto activation_type = input.scalar_type();
+    // CUDA residual and sampling ops consume FP16 or FP32 activations.
+    const auto activation_output = [activation_type](::tyloi::DenseTensor value) {
+        return value.scalar_type() == tyloi::kBFloat16
+            ? value.to(activation_type == tyloi::kFloat32 ? tyloi::kFloat32 : tyloi::kFloat16)
+            : value;
+    };
+    if (auto out = try_dense_f32_projection_cuda(input, weight); out.defined()) return out;
+    if (auto out = try_dense_bf16_projection_cuda(input, weight); out.defined()) return out;
     input = input.to(weight.scalar_type());
+    if (activation_type != tyloi::kFloat32 && weight.scalar_type() == tyloi::kFloat32) {
+        if (auto out = try_dense_f32_projection_cuda(input, weight); out.defined()) return out;
+    }
     const int64_t rows = input.numel() / input.size(-1);
     if (rows > 1 && rows <= 6) {
         auto shape = input.sizes().vec();
@@ -278,12 +291,11 @@ bool tensor_parallel_output_projections_compatible(
         outputs.reserve(rows);
         // A strided-batched GEMM may select different accumulation from M=1.
         // Keep short target/predictor windows on the decode projection path.
-        // ponytail: at most six launches; fuse only with decode-equivalent accumulation.
         for (int64_t row = 0; row < rows; ++row)
-            outputs.push_back(::tyloi::cuda::matmul(flat.narrow(0, row, 1), weight.transpose(0, 1)));
-        return ::tyloi::cuda::cat(outputs, 0).reshape(shape);
+            outputs.push_back(dense_projection(flat.narrow(0, row, 1), weight));
+        return activation_output(tyloi::cuda::cat(outputs, 0).reshape(shape));
     }
-    return ::tyloi::cuda::matmul(input, weight.transpose(0, 1));
+    return activation_output(tyloi::cuda::matmul(input, weight.transpose(0, 1)));
 }
 
 tyloi::weights::Placement projection_placement(const ::tyloi::Tensor& weight, std::size_t index) {

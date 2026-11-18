@@ -2,6 +2,10 @@
 #include "backend.h"
 
 #include "engine/weights/encoding/quant/nint_tensor.h"
+::tyloi::DenseTensor try_dense_f32_projection_cuda(
+    const ::tyloi::DenseTensor& input, const ::tyloi::DenseTensor& weight);
+::tyloi::DenseTensor try_dense_bf16_projection_cuda(
+    const ::tyloi::DenseTensor& input, const ::tyloi::DenseTensor& weight);
 int nint_float_projection_resident_blocks(int device);
 
 ::tyloi::DenseTensor try_gr_bf16_down_cuda(

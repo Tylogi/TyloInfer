@@ -78,6 +78,14 @@ std::array<Tensor, 2> LinearAttention::forward(
             alpha = parts[2]; beta = parts[3];
         }
     }
+    if (!captured && !split_in_proj && !dense_out_proj && (!conv_bias || !conv_bias.numel()) &&
+        T == 1 && key_dim == value_dim) {
+        auto output = ops::linear_decode_q8(qkv, ops::reshape(z, {B, 1, vsz}),
+            ops::reshape(alpha, {B, 1, nv}), ops::reshape(beta, {B, 1, nv}),
+            state.convolution, state.recurrent, conv_weight, dt_bias, a_log, linear_norm,
+            out_proj, key_heads, nv, dv, rms_norm_eps, state.transposed, tiled_v_heads);
+        if (output) return {input, ops::reshape(*output, {B, T, H})};
+    }
     std::array<Tensor, 2> gates;
     {
         ops::ProfileRange range("linear.gates_fused", input.device());

@@ -229,6 +229,11 @@ std::array<Tensor, 3> linear_conv(Tensor& convolution, const Tensor& qkv_or_qk, 
     std::int64_t dk, std::int64_t dv, double eps, bool replay = false);
 Tensor linear_recur(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& gate,
     const Tensor& beta, Tensor& recurrent, bool transposed, bool tiled);
+std::optional<Tensor> linear_decode_q8(const Tensor& qkv, const Tensor& gate,
+    const Tensor& alpha, const Tensor& beta, Tensor& convolution, Tensor& recurrent,
+    const Tensor& conv_weight, const Tensor& dt_bias, const Tensor& a_log,
+    const Tensor& norm, const Tensor& out_weight, std::int64_t key_heads,
+    std::int64_t value_heads, std::int64_t width, double eps, bool transposed, bool tiled);
 Tensor silu_project(const Tensor& input, const Tensor& gate, const Tensor& weight);
 std::optional<std::vector<Tensor>> linear_shared(const Tensor& input, std::span<const Tensor> qkv,
     const Tensor& z, std::span<const Tensor> ab);

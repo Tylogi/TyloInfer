@@ -174,7 +174,6 @@ endif()
 
 add_library(mfq-cuda-native-kernels STATIC
     ${TYLOINFER_CUDA_KERNEL_SOURCES}
-    ${TYLOINFER_CUDA_ROOT}/kernels/float_projection.cu
     ${TYLOINFER_CUDA_ROOT}/kernels/kv_quantization.cu
     ${TYLOINFER_CUDA_ROOT}/kernels/kv_hot_cache.cu
     ${TYLOINFER_CUDA_ROOT}/kernels/shared_gate_fused.cu
