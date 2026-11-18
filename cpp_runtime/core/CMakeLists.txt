@@ -4,7 +4,6 @@ find_package(Threads REQUIRED)
 add_library(mfq-host-parallel STATIC host_parallel.cpp include/tyloinfer/host_parallel.h
     host_copy.cpp include/tyloinfer/host_copy.h
     host_memory.cpp include/tyloinfer/host_memory.h
-    host_cache_registry.cpp include/tyloinfer/host_cache_registry.h
     cpu_expert_pool.cpp include/tyloinfer/cpu_expert_pool.h)
 target_include_directories(mfq-host-parallel PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_features(mfq-host-parallel PUBLIC cxx_std_17)

@@ -1,6 +1,5 @@
 #include "runtime/host_storage_cache.h"
 #include "runtime/routed_expert_heat.h"
-#include "tyloinfer/host_cache_registry.h"
 #include "../../runtime/execution_options.h"
 #include "cuda_execution.h"
 
@@ -615,7 +614,6 @@ CudaExecutionConfig load_cuda_execution_config() {
 
 void mfq_release_host_allocator_cache() noexcept {
 #ifdef TYLOINFER_NATIVE_CUDA_RUNTIME
-    (void)mfq::reclaim_host_caches(std::numeric_limits<std::size_t>::max());
     (void)mfq::cuda::reclaim_tensor_host_storage_cache();
 #endif
 #if defined(__GLIBC__)
