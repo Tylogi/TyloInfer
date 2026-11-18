@@ -26,16 +26,21 @@ class TqTable {
     std::vector<std::size_t> origins_;
     std::int64_t columns_ = 0;
     std::uint64_t storage_bytes_ = 0;
+    bool parallel_reads_ = false;
 
 public:
     TqTable(std::vector<std::shared_ptr<TqRows>> segments,
             std::int64_t columns, std::uint64_t expected_rows,
             std::uint64_t storage_bytes, std::vector<TqOrigin> readers = {},
-            std::vector<std::size_t> origins = {});
+            std::vector<std::size_t> origins = {}, bool parallel_reads = false);
 
     std::uint64_t rows() const noexcept { return ends_.back(); }
     std::int64_t width() const noexcept { return columns_; }
     std::uint64_t storage_bytes() const noexcept { return storage_bytes_; }
+    bool parallel_reads() const noexcept { return parallel_reads_; }
+    // Prepare before publishing the table to concurrent readers.
+    void prepare_routed_metadata();
+    std::size_t routed_image_storage_bound(std::uint64_t experts) const;
     std::size_t row_image_bytes_bound() const;
     std::vector<std::uint8_t> slice_rows(std::uint64_t begin,
                                          std::uint64_t end) const;

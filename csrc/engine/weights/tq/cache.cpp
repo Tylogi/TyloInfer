@@ -25,11 +25,11 @@
 
 namespace {
 constexpr std::size_t host_headroom = std::size_t(2) << 30;
+constexpr std::size_t device_alignment = 64 << 10;
 std::size_t device_bytes(std::size_t bytes) {
-    constexpr std::size_t alignment = 64 << 10;
-    if(bytes>SIZE_MAX-(alignment-1))throw std::overflow_error("TQ device image size overflows");
+    if(bytes>SIZE_MAX-(device_alignment-1))throw std::overflow_error("TQ device image size overflows");
     // Reuse size classes instead of fragmenting the CUDA pool with variable-bit images.
-    return (bytes+alignment-1)&~(alignment-1);
+    return (bytes+device_alignment-1)&~(device_alignment-1);
 }
 std::size_t available_host_bytes(std::size_t process_limit) {
     try {
@@ -286,18 +286,22 @@ std::uint64_t TqCache::add(std::shared_ptr<const tyloi::TqTable> table, std::int
         throw std::invalid_argument("invalid TQ expert source geometry");
     std::lock_guard<std::mutex> guard(mutex_);
     const auto bytes = table->storage_bytes();
-    if (bytes > SIZE_MAX - payload_bytes_)
+    const auto experts = table->rows() / rows;
+    const auto images = table->routed_image_storage_bound(experts);
+    if (bytes > SIZE_MAX - payload_bytes_ || images > SIZE_MAX - resident_bound_ ||
+        experts > (SIZE_MAX - resident_bound_ - images) / (device_alignment - 1))
         throw std::overflow_error("TQ source payload exceeds size limits");
     if (sources_.size() == UINT32_MAX)
         throw std::overflow_error("too many TQ projection sources");
     sources_.push_back({std::move(table), rows});
     payload_bytes_ += bytes;
+    resident_bound_ += images + experts * (device_alignment - 1);
     return sources_.size();
 }
 
 std::size_t TqCache::budget() {
     std::lock_guard<std::mutex> guard(mutex_);
-    return device_budget_.value_or(std::max(payload_bytes_,device_.used()));
+    return device_budget_.value_or(std::max(resident_bound_,device_.used()));
 }
 
 std::size_t TqCache::resident_bytes() {
@@ -373,10 +377,8 @@ void TqCache::preload(int device, std::size_t workspace_reserve) {
                     continue;
                 }
                 if (!gpu && host_.find(key)) continue;
-                const auto row_bound = source.table->row_image_bytes_bound();
-                if (std::uint64_t(source.rows) > SIZE_MAX / row_bound)
-                    throw std::overflow_error("TQ preload image size overflow");
-                const auto bound = gpu ? device_bytes(row_bound * source.rows) : row_bound * source.rows;
+                const auto image_bytes = source.table->expert_image_bytes(expert, source.rows);
+                const auto bound = gpu ? device_bytes(image_bytes) : image_bytes;
                 if (gpu) {
                     const auto available = context->available_memory();
                     const auto remaining = device_.limit().value_or(SIZE_MAX) - device_.used();
@@ -446,7 +448,7 @@ std::vector<std::pair<std::string,double>> TqCache::metrics() {
     const auto misses=calls_-gpu_hits_;
     const auto physical=host_accounting_->physical.load(std::memory_order_relaxed);
     return {{"resident_expert_cache_bytes",double(device_.used())},
-        {"expert_cache_budget_bytes",double(device_.limit().value_or(std::max(payload_bytes_,device_.used())))},
+        {"expert_cache_budget_bytes",double(device_.limit().value_or(std::max(resident_bound_,device_.used())))},
         {"ram_expert_enabled",host_.used()?1.0:0.0},
         {"ram_expert_payload_bytes",double(host_.used())},
         {"ram_expert_physical_bytes",double(physical)},

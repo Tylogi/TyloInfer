@@ -107,6 +107,13 @@ class TqRows {
     std::uint64_t source_offset_=0;
     TqLayout layout_;
     std::array<std::uint8_t,64> header_{};
+    std::vector<std::uint8_t> metadata_;
+    void read_metadata(std::uint64_t offset,std::byte* destination,std::size_t bytes)const {
+        if(offset<64 || offset>layout_.packed || bytes>layout_.packed-offset)
+            throw std::out_of_range("TQ metadata read exceeds its stream");
+        if(metadata_.empty())read_(offset,destination,bytes);
+        else std::memcpy(destination,metadata_.data()+offset-64,bytes);
+    }
 public:
     TqRows(std::size_t bytes,TqRead read,std::uint64_t source_offset=0)
         :read_(std::move(read)),source_offset_(source_offset) {
@@ -118,8 +125,8 @@ public:
     std::size_t packed_row_bytes(std::uint64_t begin,std::uint64_t end)const {
         if(begin>=end || end>layout_.rows)throw std::out_of_range("invalid TQ row byte range");
         std::array<std::uint8_t,16> records{};
-        read_(64+begin*8,reinterpret_cast<std::byte*>(records.data()),8);
-        read_(64+(end-1)*8,reinterpret_cast<std::byte*>(records.data()+8),8);
+        read_metadata(64+begin*8,reinterpret_cast<std::byte*>(records.data()),8);
+        read_metadata(64+(end-1)*8,reinterpret_cast<std::byte*>(records.data()+8),8);
         const auto first=TqLayout::integer(records.data(),8),last=TqLayout::integer(records.data()+8,8);
         if(!layout_.valid_descriptor(first) || !layout_.valid_descriptor(last))throw std::invalid_argument("invalid TQ row descriptor");
         const auto start=std::uint64_t(layout_.offset(first))*4;
@@ -127,13 +134,19 @@ public:
         if(finish<start || finish>layout_.packed_bytes)throw std::invalid_argument("invalid TQ row payload byte range");
         return std::size_t(finish-start);
     }
+    void cache_metadata() {
+        if(!metadata_.empty())return;
+        std::vector<std::uint8_t> data(layout_.packed-64);
+        read_(64,reinterpret_cast<std::byte*>(data.data()),data.size());
+        metadata_=std::move(data);
+    }
     // Write one ordinary TQ row into caller-owned staging storage.
     // This avoids temporary descriptor/payload vectors for sparse CPU tables.
     std::size_t slice_row_into(std::uint64_t row,std::uint8_t* target,std::size_t capacity)const {
         const auto& m=layout_;
         if(row>=m.rows || !target)throw std::out_of_range("invalid TQ table row");
         std::array<std::uint8_t,8> record{};
-        read_(64+row*8,reinterpret_cast<std::byte*>(record.data()),record.size());
+        read_metadata(64+row*8,reinterpret_cast<std::byte*>(record.data()),record.size());
         const auto descriptor=TqLayout::integer(record.data(),8);
         const auto first=m.offset(descriptor);
         const auto bits=((descriptor>>32)&7)+1;
@@ -149,16 +162,16 @@ public:
         TqLayout::integer(target+12,1,4);TqLayout::integer(target+28,packed_bytes,4);
         TqLayout::integer(target+64,m.rebase(descriptor,0),8);
         auto* scales=target+72;
-        if(m.columns)read_(m.scales,reinterpret_cast<std::byte*>(scales),scale_bytes);
+        if(m.columns)read_metadata(m.scales,reinterpret_cast<std::byte*>(scales),scale_bytes);
         else if(m.groups==1) {
             std::uint8_t selector=0;
-            read_(m.scales+row/2,reinterpret_cast<std::byte*>(&selector),1);
+            read_metadata(m.scales+row/2,reinterpret_cast<std::byte*>(&selector),1);
             scales[0]=(selector>>((row&1)*4))&15;
         } else {
             const auto first_selector=std::size_t(row)*m.groups;
             const auto start=first_selector/2,end=(first_selector+m.groups+1)/2;
             std::vector<std::uint8_t> selectors(end-start);
-            read_(m.scales+start,reinterpret_cast<std::byte*>(selectors.data()),selectors.size());
+            read_metadata(m.scales+start,reinterpret_cast<std::byte*>(selectors.data()),selectors.size());
             std::memset(scales,0,scale_bytes);
             for(std::size_t i=0;i<m.groups;++i) {
                 const auto at=i+(first_selector&1);
@@ -186,7 +199,7 @@ public:
         if(begin>=end || end>m.rows)throw std::out_of_range("invalid TQ row range");
         const auto count=std::size_t(end-begin);
         std::vector<std::uint8_t> descriptors(count*8);
-        read_(64+begin*8,reinterpret_cast<std::byte*>(descriptors.data()),descriptors.size());
+        read_metadata(64+begin*8,reinterpret_cast<std::byte*>(descriptors.data()),descriptors.size());
         const auto first=m.offset(TqLayout::integer(descriptors.data(),8));
         auto expected=first;
         for(std::size_t row=0;row<count;++row) {
@@ -209,16 +222,21 @@ public:
         TqLayout::integer(result.data()+28,packed_bytes,4);
         std::memcpy(result.data()+64,descriptors.data(),descriptors.size());
         auto* scales=result.data()+64+descriptors.size();
-        if(m.columns)read_(m.scales,reinterpret_cast<std::byte*>(scales),scale_bytes);
+        if(m.columns)read_metadata(m.scales,reinterpret_cast<std::byte*>(scales),scale_bytes);
         else {
             const auto first_selector=std::size_t(begin)*m.groups,selectors=count*m.groups;
             const auto start_byte=first_selector/2,end_byte=(first_selector+selectors+1)/2;
-            std::vector<std::uint8_t> source(end_byte-start_byte);
-            read_(m.scales+start_byte,reinterpret_cast<std::byte*>(source.data()),source.size());
-            for(std::size_t i=0;i<selectors;++i) {
-                const auto index=i+(first_selector&1);
-                scales[i/2]|=((source[index/2]>>((index&1)*4))&15)<<((i&1)*4);
+            if(!(first_selector&1)) {
+                read_metadata(m.scales+start_byte,reinterpret_cast<std::byte*>(scales),scale_bytes);
+            } else {
+                std::vector<std::uint8_t> source(end_byte-start_byte);
+                read_metadata(m.scales+start_byte,reinterpret_cast<std::byte*>(source.data()),source.size());
+                for(std::size_t i=0;i<scale_bytes;++i) {
+                    scales[i]=source[i]>>4;
+                    if(i+1<source.size())scales[i]|=source[i+1]<<4;
+                }
             }
+            if(selectors&1)scales[scale_bytes-1]&=15;
         }
         const auto offset=m.packed+first*4;
         auto* destination=reinterpret_cast<std::byte*>(scales+scale_bytes);

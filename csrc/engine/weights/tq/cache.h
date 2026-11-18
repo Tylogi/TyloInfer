@@ -83,7 +83,7 @@ private:
     tyloi::weights::Lru<DeviceKey, DeviceEntry, DeviceKeyHash> device_;
     std::optional<std::size_t> device_budget_;
     std::unordered_map<std::uint64_t, std::vector<ViewTable>> view_tables_;
-    std::size_t payload_bytes_ = 0, process_host_limit_ = 0;
+    std::size_t payload_bytes_ = 0, resident_bound_ = 0, process_host_limit_ = 0;
     std::uint64_t source_reads_ = 0, source_batches_ = 0;
     std::vector<Source> sources_;
     std::mutex mutex_;

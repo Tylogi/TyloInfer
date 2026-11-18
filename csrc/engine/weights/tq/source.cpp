@@ -102,12 +102,14 @@ std::shared_ptr<TqTable> tq_table(
     std::vector<TqOrigin> readers;
     std::vector<std::size_t> origins;
     std::uint64_t storage_bytes = 0;
+    bool parallel_reads = true;
     for (const auto& part : names) {
         const auto* record = source.find_tensor(part);
         if (!unique.insert(part).second || !record || record->dtype != "TQ") {
             throw std::invalid_argument("invalid TQ row segment: " + part);
         }
         auto reader = shape.size() == 2 ? source.mapped_tensor_reader(part) : source::Source::TensorReader{};
+        parallel_reads = parallel_reads && (bool(reader) || source.supports_parallel_tensor_reads());
         auto batch = reader ? source.mapped_tensor_batch_reader(part) : source.tensor_batch_reader(part);
         if (!reader) reader = source.tensor_reader(part);
         auto physical = tyloi::tq_row_segments(record->nbytes, reader, columns);
@@ -121,7 +123,7 @@ std::shared_ptr<TqTable> tq_table(
     }
     return std::make_shared<TqTable>(
         std::move(segments), columns, expected_rows(shape, name), storage_bytes,
-        std::move(readers), std::move(origins));
+        std::move(readers), std::move(origins), parallel_reads);
 }
 
 bool is_tq_table(

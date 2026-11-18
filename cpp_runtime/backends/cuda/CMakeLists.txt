@@ -551,7 +551,6 @@ set(TYLOINFER_CUDA_RUNTIME_OP_SOURCES
     ${TYLOINFER_CUDA_ROOT}/ops/common/moe_routes.cpp
     ${TYLOINFER_CUDA_ROOT}/ops/common/gated_residual.cpp
     ${TYLOINFER_CUDA_ROOT}/ops/tq/tq.cpp
-    ${TYLOINFER_CUDA_ROOT}/ops/tq/tq_rows.cpp
     ${TYLOINFER_CUDA_ROOT}/ops/common/mx.cpp
     ${TYLOINFER_CUDA_ROOT}/ops/common/quant_linear.cpp
     ${TYLOINFER_CUDA_ROOT}/ops/common/prefill_projection.cpp

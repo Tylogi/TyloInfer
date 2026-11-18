@@ -1,7 +1,6 @@
 #include "engine/weights/rows/gguf.h"
+#include "engine/weights/rows/cache.h"
 
-#include "engine/backends/cuda/native/tensor/tensor.h"
-#include "engine/memory/host.h"
 #include "engine/weights/encoding/gguf/decode.h"
 #include "engine/weights/encoding/gguf_quant.h"
 #include "engine/weights/source/mapped.h"
@@ -13,7 +12,6 @@
 #include <array>
 #include <cstring>
 #include <limits>
-#include <list>
 #include <mutex>
 #include <stdexcept>
 #include <unordered_map>
@@ -22,73 +20,6 @@
 namespace tyloi::weights {
 namespace {
 constexpr std::size_t kCacheBytes = 8u << 20;
-
-class RowCache final : public HostCache {
-    struct Image {
-        std::vector<std::byte> bytes;
-        Image(const std::byte* source, std::size_t size) : bytes(source, source + size) {
-            cuda::charge_tensor_host_bytes(bytes.capacity());
-        }
-        ~Image() {
-            const auto size = bytes.capacity();
-            { std::vector<std::byte> released; bytes.swap(released); }
-            cuda::tensor_host_bytes.fetch_sub(size);
-        }
-    };
-    using Entry = std::pair<std::uint64_t, std::shared_ptr<const Image>>;
-    std::mutex mutex_;
-    std::list<Entry> lru_;
-    std::unordered_map<std::uint64_t, std::list<Entry>::iterator> entries_;
-    std::size_t used_ = 0;
-
-    std::size_t evict() {
-        auto it = std::prev(lru_.end());
-        const auto bytes = it->second->bytes.capacity();
-        const std::weak_ptr<const Image> owner = it->second;
-        entries_.erase(it->first);
-        used_ -= bytes + 128;
-        lru_.erase(it);
-        return owner.expired() ? bytes : 0;
-    }
-public:
-    std::shared_ptr<const Image> find(std::uint64_t offset) {
-        std::lock_guard lock(mutex_);
-        const auto found = entries_.find(offset);
-        if (found == entries_.end()) return {};
-        lru_.splice(lru_.begin(), lru_, found->second);
-        return found->second->second;
-    }
-
-    void insert(std::uint64_t offset, const std::byte* source, std::size_t bytes) {
-        if (bytes > kCacheBytes - 128) return;
-        auto data = std::make_shared<Image>(source, bytes);
-        std::lock_guard lock(mutex_);
-        const auto found = entries_.find(offset);
-        if (found != entries_.end()) {
-            lru_.splice(lru_.begin(), lru_, found->second);
-            return;
-        }
-        const auto backing = data->bytes.capacity();
-        if (backing > kCacheBytes - 128) return;
-        const auto cost = backing + 128;
-        while (used_ > kCacheBytes - cost) evict();
-        lru_.emplace_front(offset, std::move(data));
-        try {
-            entries_.emplace(offset, lru_.begin());
-        } catch (...) {
-            lru_.pop_front();
-            throw;
-        }
-        used_ += cost;
-    }
-
-    std::size_t reclaim(std::size_t bytes) override {
-        std::lock_guard lock(mutex_);
-        std::size_t released = 0;
-        while (released < bytes && !lru_.empty()) released += evict();
-        return released;
-    }
-};
 } // namespace
 
 struct GgufRows::Cache {
@@ -164,8 +95,7 @@ GgufRows::GgufRows(const source::Source& source, const std::string& name)
     staged_row_bytes_ = cache_->correction ? gguf::row_bytes(GGML_TYPE_F16, width_) : row_bytes_;
     if (staged_row_bytes_ > SIZE_MAX) throw std::invalid_argument("GGUF staged row is too large");
     parallel_ = source.supports_parallel_tensor_reads() || (mapped && !cache_->correction);
-    cache_->rows = std::make_shared<RowCache>();
-    register_host_cache(cache_->rows);
+    cache_->rows = make_row_cache();
 }
 
 GgufRows::~GgufRows() = default;
@@ -209,11 +139,11 @@ void GgufRows::read_rows(const std::vector<ReadSpan>& requests) const {
     for (const auto& row : requests) {
         if (row.size != row_bytes_ || row.offset % row_bytes_ || row.offset / row_bytes_ >= std::uint64_t(rows_) || !row.destination)
             throw std::out_of_range("invalid GGUF table row range");
-        if (const auto found = cache_->rows->find(row.offset))
-            std::memcpy(row.destination, found->bytes.data(), row.size);
-        else if (auto [first, inserted] = unique.emplace(row.offset, row.destination); inserted)
-            missing.push_back(row);
-        else repeated.emplace_back(row.destination, first->second);
+        if (!cache_->rows->copy(row.offset, row.destination, row.size)) {
+            if (auto [first, inserted] = unique.emplace(row.offset, row.destination); inserted)
+                missing.push_back(row);
+            else repeated.emplace_back(row.destination, first->second);
+        }
     }
     std::sort(missing.begin(), missing.end(), [](const auto& a, const auto& b) { return a.offset < b.offset; });
     const MappedPrefetchScope copied(missing.size() > 128, true);
@@ -239,7 +169,6 @@ void GgufRows::read_rows(const std::vector<ReadSpan>& requests) const {
     flush();
     for (const auto& [destination, source] : repeated) std::memcpy(destination, source, row_bytes_);
     for (const auto& row : requests) {
-        if (cache_->rows->find(row.offset)) continue;
         cache_->rows->insert(row.offset, row.destination, row.size);
     }
 }

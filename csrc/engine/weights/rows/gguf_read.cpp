@@ -1,25 +1,21 @@
 #include "engine/weights/rows/gguf_read.h"
 #include "engine/weights/rows/gguf.h"
+#include "engine/weights/rows/prefetch.h"
 #include "engine/backends/cpu/native/host_parallel.h"
 #include "engine/backends/cuda/native/tensor/tensor.h"
 
 #include <algorithm>
-#include <array>
-#include <condition_variable>
 #include <cstring>
 #include <future>
 #include <limits>
-#include <mutex>
-#include <queue>
 #include <stdexcept>
-#include <thread>
 
 namespace tyloi::weights {
 namespace {
 struct Job {
     std::vector<std::shared_ptr<GgufRows>> tables;
     std::int64_t rows;
-    std::vector<std::int64_t> ids, shape;
+    std::vector<std::int64_t> ids;
     DenseTensor packet;
     std::promise<DenseTensor> result;
 };
@@ -53,49 +49,6 @@ void read(Job& job) {
     else run(0, static_cast<std::int64_t>(active.size()));
 }
 
-class Workers {
-public:
-    Workers() {
-        try {
-            for (auto& worker : workers_) worker = std::thread([this] { work(); });
-        } catch (...) {
-            { std::lock_guard lock(mutex_); stopping_ = true; }
-            ready_.notify_all();
-            for (auto& worker : workers_) if (worker.joinable()) worker.join();
-            throw;
-        }
-    }
-    ~Workers() {
-        { std::lock_guard lock(mutex_); stopping_ = true; }
-        ready_.notify_all();
-        for (auto& worker : workers_) worker.join();
-    }
-    void submit(std::unique_ptr<Job> job) {
-        { std::lock_guard lock(mutex_); jobs_.push(std::move(job)); }
-        ready_.notify_one();
-    }
-private:
-    void work() {
-        for (;;) {
-            std::unique_ptr<Job> job;
-            {
-                std::unique_lock lock(mutex_);
-                ready_.wait(lock, [&] { return stopping_ || !jobs_.empty(); });
-                if (jobs_.empty()) return;
-                job = std::move(jobs_.front());
-                jobs_.pop();
-            }
-            try { read(*job); job->result.set_value(std::move(job->packet)); }
-            catch (...) { job->result.set_exception(std::current_exception()); }
-        }
-    }
-    std::mutex mutex_;
-    std::condition_variable ready_;
-    std::queue<std::unique_ptr<Job>> jobs_;
-    std::array<std::thread, 2> workers_;
-    bool stopping_ = false;
-};
-Workers& workers() { static Workers value; return value; }
 }
 
 struct GgufRead::Impl {
@@ -122,13 +75,11 @@ struct GgufRead::Impl {
                 throw std::out_of_range("GGUF row id out of range");
         }
     }
-    std::unique_ptr<Job> make_job(const std::vector<std::int64_t>& selected,
-                                  const std::vector<std::int64_t>& dimensions) const {
+    std::unique_ptr<Job> make_job(const std::vector<std::int64_t>& selected) const {
         auto job = std::make_unique<Job>();
         job->tables = tables;
         job->rows = rows;
         job->ids = selected;
-        job->shape = dimensions;
         job->packet = cuda::empty({static_cast<std::int64_t>(selected.size()), stride},
             TensorOptions().dtype(kUInt8).device(kCPU));
         return job;
@@ -164,11 +115,14 @@ bool GgufRead::issue(const std::vector<std::int64_t>& ids, const std::vector<std
     if (!impl_->parallel) return false;
     if (impl_->pending.valid() && impl_->ids == ids && impl_->shape == shape) return true;
     clear();
-    auto job = impl_->make_job(ids, shape);
+    auto job = impl_->make_job(ids);
     auto future = job->result.get_future();
     impl_->ids = ids;
     impl_->shape = shape;
-    workers().submit(std::move(job));
+    submit_row_read(std::packaged_task<void()>([job = std::move(job)] {
+        try { read(*job); job->result.set_value(std::move(job->packet)); }
+        catch (...) { job->result.set_exception(std::current_exception()); }
+    }));
     impl_->pending = std::move(future);
     return true;
 }
@@ -181,7 +135,7 @@ DenseTensor GgufRead::collect(const std::vector<std::int64_t>& ids, const std::v
         return future.get();
     }
     clear();
-    auto job = impl_->make_job(ids, shape);
+    auto job = impl_->make_job(ids);
     read(*job);
     return std::move(job->packet);
 }

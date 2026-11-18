@@ -4,6 +4,7 @@
 #include "env.h"
 #include "engine/backends/cuda/ops/row_stage.h"
 #include "engine/backends/cuda/ops/projection/tq/tensor.h"
+#include "engine/weights/rows/tq.h"
 #include "engine/weights/tq/image.h"
 #include "engine/backends/cuda/native/memory.h"
 
@@ -235,9 +236,9 @@ TqStageLayout tq_stage_layout(const std::vector<std::shared_ptr<tyloi::TqTable>>
 
 class TqRowStage final : public RowStage {
     tyloi::cuda::RowStageFence fence_;
-    std::vector<std::shared_ptr<tyloi::TqTable>> tables_;
+    std::shared_ptr<weights::TqRead> read_;
     std::vector<std::int64_t> shape_;
-    std::int64_t rows_per_shard_, count_ = 1, columns_ = 0;
+    std::int64_t count_ = 1, columns_ = 0;
     std::size_t image_stride_ = 0, images_offset_ = 0, bytes_ = 0;
     ::tyloi::Device device_;
     std::unique_ptr<tyloi::cuda::HostBuffer> host_;
@@ -277,32 +278,24 @@ class TqRowStage final : public RowStage {
                 int(layout.columns)};
     }
 
-    TrellisProjectionView pack_row(const tyloi::TqTable& table,
-                                    std::uint64_t row, std::size_t slot) {
-        if (row >= table.rows()) throw std::out_of_range("TQ staged row is out of bounds");
-        const auto segment = segment_for(table, row);
-        const auto start = segment ? table.segment_end(segment - 1) : 0;
-        const auto& rows = table.segment(segment);
-        const auto& layout = rows.layout();
-        const auto offset = images_offset_ + slot * image_stride_;
-        auto* host = static_cast<std::uint8_t*>(host_->data()) + offset;
-        auto* address = packet_address_ + offset;
-        const auto image = rows.stage_row_image(row - start, host, image_stride_);
+    TrellisProjectionView row_view(const weights::TqRow& row, std::size_t slot) const {
+        auto* address = packet_address_ + images_offset_ + slot * image_stride_;
         int gslog = 0;
-        for (auto gs = layout.gs; gs > 1; gs >>= 1) ++gslog;
-        return {reinterpret_cast<const std::uint32_t*>(address + image.packed_offset),
+        for (auto gs = row.group; gs > 1; gs >>= 1) ++gslog;
+        return {reinterpret_cast<const std::uint32_t*>(address + row.image.packed_offset),
                 reinterpret_cast<const std::uint64_t*>(address + 64), address + 72,
-                address + image.relative_offset, nullptr, 1, int(layout.width),
-                int(columns_), gslog, int(layout.columns)};
+                address + row.image.relative_offset, nullptr, 1, int(row.width),
+                int(columns_), gslog, int(row.column_scales)};
     }
 
 public:
-    TqRowStage(std::vector<std::shared_ptr<tyloi::TqTable>> tables,
+    TqRowStage(const std::vector<std::shared_ptr<tyloi::TqTable>>& tables,
                std::int64_t rows_per_shard, std::vector<std::int64_t> shape,
-               const ::tyloi::Device& device)
-        : tables_(std::move(tables)), shape_(std::move(shape)),
-          rows_per_shard_(rows_per_shard), device_(device) {
-        const auto layout = tq_stage_layout(tables_, rows_per_shard_, shape_, device_);
+               const ::tyloi::Device& device, std::shared_ptr<weights::TqRead> read)
+        : read_(std::move(read)), shape_(std::move(shape)), device_(device) {
+        const auto layout = tq_stage_layout(tables, rows_per_shard, shape_, device_);
+        if (!read_ || read_->stride() != layout.image_stride)
+            throw std::invalid_argument("TQ stage reader layout differs");
         count_ = layout.count;
         columns_ = layout.columns;
         image_stride_ = layout.image_stride;
@@ -370,6 +363,7 @@ public:
         }
         output_ = {};
         packet_ = {};
+        host_.reset();
         if (charged_) tyloi::cuda::tensor_host_bytes.fetch_sub(bytes_);
         if (restore) (void)cudaSetDevice(previous);
     }
@@ -383,13 +377,11 @@ public:
         const MfqCudaGuard guard(device_);
         fence_.before_write();
         retain_stream();
-        const auto selection = select_tq_rows(ids, rows_per_shard_, tables_.size());
+        auto* images = static_cast<std::uint8_t*>(host_->data()) + images_offset_;
+        const auto selection = read_->collect(ids, shape, images, bytes_ - images_offset_);
         std::vector<TrellisProjectionView> unique;
-        unique.reserve(selection.selected.size());
-        for (const auto id : selection.selected) {
-            const auto shard = id / rows_per_shard_, row = id % rows_per_shard_;
-            unique.push_back(pack_row(*tables_[shard], row, unique.size()));
-        }
+        unique.reserve(selection.rows.size());
+        for (const auto& row : selection.rows) unique.push_back(row_view(row, unique.size()));
         auto* views = static_cast<TrellisProjectionView*>(host_->data());
         for (std::size_t i = 0; i < ids.size(); ++i) views[i] = unique[selection.inverse[i]];
         if (!mapped_) {
@@ -433,17 +425,21 @@ std::pair<std::size_t, std::size_t> row_stage_growth(
     if (std::uint64_t(layout.count) > SIZE_MAX / std::uint64_t(layout.columns) / sizeof(std::uint16_t))
         throw std::overflow_error("TQ row stage output exceeds bounds");
     const auto output = std::size_t(layout.count) * std::size_t(layout.columns) * sizeof(std::uint16_t);
-    if (output > SIZE_MAX - layout.bytes)
+    const auto image_bytes = layout.bytes - layout.images_offset;
+    const auto pending = image_bytes <= weights::TqRead::prefetch_limit &&
+        std::all_of(tables.begin(), tables.end(), [](const auto& table) { return table->parallel_reads(); })
+        ? image_bytes : 0;
+    if (output > SIZE_MAX - layout.bytes || pending > SIZE_MAX - layout.bytes)
         throw std::overflow_error("TQ row stage bytes exceed bounds");
     // Mapping can fail after the host allocation and requires a device packet.
-    return {layout.bytes, output + layout.bytes};
+    return {layout.bytes + pending, output + layout.bytes};
 }
 
 std::shared_ptr<RowStage> make_row_stage(
         const std::vector<std::shared_ptr<tyloi::TqTable>>& tables,
         std::int64_t rows_per_shard, const std::vector<std::int64_t>& shape,
-        const ::tyloi::Device& device) {
-    return std::make_shared<TqRowStage>(tables, rows_per_shard, shape, device);
+        const ::tyloi::Device& device, std::shared_ptr<weights::TqRead> read) {
+    return std::make_shared<TqRowStage>(tables, rows_per_shard, shape, device, std::move(read));
 }
 
 } // namespace tyloi::cuda::tq

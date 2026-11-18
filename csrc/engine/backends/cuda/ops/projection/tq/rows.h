@@ -8,6 +8,8 @@
 #include <memory>
 #include <vector>
 
+namespace tyloi::weights { class TqRead; }
+
 namespace tyloi::cuda::tq {
 
 ::tyloi::Tensor lookup_rows(
@@ -25,7 +27,7 @@ namespace tyloi::cuda::tq {
 std::shared_ptr<RowStage> make_row_stage(
     const std::vector<std::shared_ptr<tyloi::TqTable>>& tables,
     std::int64_t rows_per_shard, const std::vector<std::int64_t>& shape,
-    const ::tyloi::Device& device);
+    const ::tyloi::Device& device, std::shared_ptr<weights::TqRead> read);
 
 std::pair<std::size_t, std::size_t> row_stage_growth(
     const std::vector<std::shared_ptr<tyloi::TqTable>>& tables,

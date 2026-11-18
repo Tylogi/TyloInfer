@@ -40,6 +40,9 @@ set(TYLOINFER_CUDA_LOADING_SOURCES
     ${PROJECT_SOURCE_DIR}/engine/weights/tq/routed.cpp
     ${PROJECT_SOURCE_DIR}/engine/weights/encoding/rows.cpp
     ${PROJECT_SOURCE_DIR}/engine/weights/rows/source.cpp
+    ${PROJECT_SOURCE_DIR}/engine/weights/rows/cache.cpp
+    ${PROJECT_SOURCE_DIR}/engine/weights/rows/prefetch.cpp
+    ${PROJECT_SOURCE_DIR}/engine/weights/rows/tq.cpp
     ${PROJECT_SOURCE_DIR}/engine/weights/rows/gguf.cpp
     ${PROJECT_SOURCE_DIR}/engine/weights/rows/gguf_read.cpp
     ${PROJECT_SOURCE_DIR}/engine/weights/rows/stage.cpp

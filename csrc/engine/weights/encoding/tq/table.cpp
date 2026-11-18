@@ -74,9 +74,9 @@ std::vector<std::uint8_t> join_rows(
 TqTable::TqTable(std::vector<std::shared_ptr<TqRows>> segments,
                  std::int64_t columns, std::uint64_t expected_rows,
                  std::uint64_t storage_bytes, std::vector<TqOrigin> readers,
-                 std::vector<std::size_t> origins)
+                 std::vector<std::size_t> origins, bool parallel_reads)
     : segments_(std::move(segments)), readers_(std::move(readers)), origins_(std::move(origins)),
-      columns_(columns), storage_bytes_(storage_bytes) {
+      columns_(columns), storage_bytes_(storage_bytes), parallel_reads_(parallel_reads) {
     if (segments_.empty() || columns_ < 1 || expected_rows < 1) {
         throw std::invalid_argument("invalid TQ row table geometry");
     }
@@ -100,6 +100,22 @@ TqTable::TqTable(std::vector<std::shared_ptr<TqRows>> segments,
     if (end != expected_rows) {
         throw std::invalid_argument("TQ table row count differs");
     }
+}
+
+void TqTable::prepare_routed_metadata() {
+    for (const auto& segment : segments_) segment->cache_metadata();
+}
+
+std::size_t TqTable::routed_image_storage_bound(std::uint64_t experts) const {
+    if (!experts || experts > rows()) throw std::invalid_argument("invalid TQ image count");
+    std::uint64_t column_scales = 0;
+    for (const auto& segment : segments_)
+        if (segment->layout().columns)
+            column_scales = std::max(column_scales, std::uint64_t(segment->layout().scale_bytes));
+    const auto extra = 64 + column_scales + 1 + 3 + 32 + 15;
+    if (storage_bytes_ > SIZE_MAX || experts > (SIZE_MAX - storage_bytes_) / extra)
+        throw std::overflow_error("TQ resident images exceed addressable storage");
+    return static_cast<std::size_t>(storage_bytes_ + experts * extra);
 }
 
 std::vector<std::uint8_t> TqTable::slice_rows(

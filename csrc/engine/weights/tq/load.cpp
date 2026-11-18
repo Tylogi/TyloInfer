@@ -50,6 +50,7 @@ tyloi::Tensor tyloi::weights::Cache::routed_tq(
         table->width() != input) {
         throw std::invalid_argument("TQ routed projection shape differs: " + name);
     }
+    table->prepare_routed_metadata();
     auto slices = parallel.enabled()
         ? plan_slices(experts, 1, parallel)
         : std::vector<tyloi::TensorParallelSlice>{};
