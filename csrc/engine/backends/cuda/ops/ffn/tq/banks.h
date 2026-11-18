@@ -23,7 +23,9 @@ struct TqMoeBanks {
         TqExec&, ::tyloi::DenseTensor input,
         ::tyloi::DenseTensor ids, ::tyloi::DenseTensor weights,
         float swiglu_limit = 0, CudaProfiler* profiler = nullptr,
-        std::int64_t expert_begin = 0, std::int64_t expert_end = -1) const;
+        std::int64_t expert_begin = 0, std::int64_t expert_end = -1,
+        std::int64_t row_offset = 0, std::int64_t row_total = 0,
+        bool independent = false) const;
 };
 
 TqMoeBanks tq_banks(::tyloi::Tensor gate,

@@ -13,6 +13,7 @@
 #include <string>
 #include <utility>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace tyloi { class TqTable; }
@@ -40,6 +41,12 @@ public:
     void reclaim(int device, std::size_t available_bytes);
     std::size_t reclaim(std::size_t bytes) override;
     void prepare_decode(int device, std::size_t workspace_reserve);
+    void observe_routes(const std::array<std::uint64_t,3>& banks, std::span<const std::int64_t> ids,
+                        int rows, int row_offset, int row_total, int device, bool independent);
+    void begin_routes(int rows);
+    void commit_routes(std::span<const std::uint8_t> keep, bool single_sequence);
+    void discard_routes() noexcept;
+    bool set_learning(bool enabled);
     std::uint64_t streamed_bytes();
     std::size_t reserve(std::size_t bytes);
     std::vector<std::pair<std::string, double>> metrics();
@@ -70,6 +77,7 @@ private:
         std::size_t source_bytes = 0;
     };
     struct ViewTable;
+    struct Routes;
     struct DeviceStages {
         std::array<std::unique_ptr<Stage>, 2> stages;
         unsigned index = 0;
@@ -85,6 +93,9 @@ private:
     tyloi::weights::Lru<std::uint64_t, std::shared_ptr<HostImage>> host_;
     tyloi::weights::Lru<DeviceKey, DeviceEntry, DeviceKeyHash> device_;
     std::optional<std::size_t> device_budget_;
+    std::unique_ptr<Routes> routes_;
+    std::unordered_set<DeviceKey, DeviceKeyHash> retained_;
+    bool learning_ = true;
     std::unordered_map<std::uint64_t, std::vector<ViewTable>> view_tables_;
     std::size_t payload_bytes_ = 0, resident_bound_ = 0, process_host_limit_ = 0;
     std::uint64_t source_reads_ = 0, source_batches_ = 0;
@@ -101,8 +112,9 @@ private:
     std::size_t reserve_host_headroom_locked(std::size_t bytes);
     std::size_t reserve_host_locked(std::size_t bytes);
     bool admit_host_locked(std::size_t bytes, std::size_t reserve) const;
-    std::size_t trim_device(std::size_t bytes);
-    void reserve_device(std::size_t bytes);
+    std::size_t trim_device(std::size_t bytes, bool protect = false);
+    bool reserve_device(std::size_t bytes, int device);
+    void adapt_routes(bool prefill);
     void report() const;
     void upload(const ::tyloi::DenseTensor&, const std::vector<std::uint8_t>&);
 };

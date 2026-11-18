@@ -130,7 +130,8 @@ struct TqMoeGraphStage {
         tyloi::cuda::tensor_host_bytes.fetch_sub(host_ids->size());
         if(restore)(void)cudaSetDevice(previous);
     }
-    void load(tyloi::cuda::DecodeWindow* window=nullptr) {
+    void load(tyloi::cuda::DecodeWindow* window=nullptr, int row_offset=0,
+              int row_total=0, bool independent=false, bool observe=false) {
         const MfqCudaStreamGuard guard(stream);
         const auto* selected=static_cast<const int64_t*>(route_data());
         if(mapped_routes && route_dtype==::tyloi::kInt32) {
@@ -141,6 +142,9 @@ struct TqMoeGraphStage {
         std::vector<std::vector<int64_t>> grouped;
         tyloi::weights::group_routed_experts({selected,slots},banks[0]->experts,unique,
             tokens==1?nullptr:&grouped);
+        if(window && observe)banks[0]->cache->observe_routes(
+            {banks[0]->source_id,banks[1]->source_id,banks[2]->source_id},
+            {selected,slots},tokens,row_offset,row_total,stream.device(),independent);
         // The preceding GPU segment has consumed the prior layer's images.
         // Keep one live layer across all TQ sources, independently of cache
         // ownership, so graph capture cannot pin every layer's experts.
@@ -230,7 +234,8 @@ struct TqMoeGraphStage {
     }
 };
 ::tyloi::DenseTensor tq_graph_forward(TqExec& exec,const TqMoeBanks& banks,const ::tyloi::DenseTensor& source,const ::tyloi::DenseTensor& ids,
-        const ::tyloi::DenseTensor& weights,float limit,tyloi::cuda::DecodeWindow& window) {
+        const ::tyloi::DenseTensor& weights,float limit,tyloi::cuda::DecodeWindow& window,
+        int row_offset,int row_total,bool independent,bool observe) {
     window.mark_current("expert_begin");
     auto lease=window.workspace<TqGraphLease>(&tq_graph_lease_identity,[]{return std::make_shared<TqGraphLease>();});
     auto stage=window.workspace<TqMoeGraphStage>(banks.up.get(),[&] {
@@ -266,12 +271,14 @@ struct TqMoeGraphStage {
         else TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(stage->stream.stream()));
         stage->load();
     }
-    window.enroll({stage.get(),[stage]{stage->reset_routes();},[stage,&window] {
+    window.enroll({stage.get(),[stage]{stage->reset_routes();},[stage,&window,row_offset,row_total,independent,observe] {
         if(!stage->mapped_routes)return;
         tyloi::cuda::wait_route_publication(static_cast<const uint32_t*>(stage->host_ids->data()),stage->stream.stream());
-        stage->load(&window);
+        stage->load(&window,row_offset,row_total,independent,observe);
     },[lease]{lease->clear();},[]{},[lease]{lease->clear();},{}});
-    window.host_barrier([stage,&window]{if(!stage->mapped_routes)stage->load(&window);});
+    window.host_barrier([stage,&window,row_offset,row_total,independent,observe] {
+        if(!stage->mapped_routes)stage->load(&window,row_offset,row_total,independent,observe);
+    });
     window.mark_current("hot_begin");
     const auto* input_values=views?source.data_ptr():stage->input.data_ptr();
     if(stage->tokens>1)stage->indexed(limit,window,capture==cudaStreamCaptureStatusActive,input_values);
@@ -293,7 +300,8 @@ struct TqMoeGraphStage {
 }
 
 ::tyloi::DenseTensor TqMoeBanks::forward(TqExec& exec,::tyloi::DenseTensor input_value,::tyloi::DenseTensor ids,
-        ::tyloi::DenseTensor weights,float limit,CudaProfiler* profiler,std::int64_t expert_begin,std::int64_t expert_end)const {
+        ::tyloi::DenseTensor weights,float limit,CudaProfiler* profiler,std::int64_t expert_begin,std::int64_t expert_end,
+        std::int64_t row_offset,std::int64_t row_total,bool independent)const {
     const auto phase=[&](const char* name,auto&& operation) {
         return profiler?profiler->measure(name,operation):operation();
     };
@@ -310,13 +318,18 @@ struct TqMoeGraphStage {
     if(expert_begin<0 || expert_end<expert_begin || expert_end>gate->experts)
         throw std::invalid_argument("invalid TQ expert ownership range");
     const bool partitioned=expert_begin!=0 || expert_end!=gate->experts;
+    const bool observe=!partitioned && slices.empty();
     const auto tokens=ids.size(0),routes=ids.size(1),hidden=up->out,width=down->out;
+    if(row_total==0)row_total=tokens;
+    if(row_offset<0 || row_total<0 || row_total>INT_MAX || row_offset>row_total || tokens>row_total-row_offset)
+        throw std::invalid_argument("invalid TQ packed route row coordinates");
     if(tokens>INT_MAX || hidden>INT_MAX || width>INT_MAX || up->input>INT_MAX)
         throw std::overflow_error("TQ MoE activation dimensions exceed CUDA limits");
     const auto source=input_value.contiguous();
     const MfqCudaGuard guard(source.get_device());
     if(auto* window=tyloi::cuda::DecodeWindow::recording();!partitioned && window && tq_graph_supports_tokens(tokens) && ids.device()==source.device())
-        return tq_graph_forward(exec,*this,source,ids,weights,limit,*window);
+        return tq_graph_forward(exec,*this,source,ids,weights,limit,*window,
+            int(row_offset),int(row_total),independent,observe);
     auto result=::tyloi::cuda::empty({tokens,width},source.options());
     if(!tokens)return result;
     const auto type=tq_detail::dtype(source.scalar_type());
@@ -329,6 +342,9 @@ struct TqMoeGraphStage {
     std::vector<std::int64_t> unique;
     std::vector<std::vector<std::int64_t>> slots;
     tyloi::weights::group_routed_experts(host,up->experts,unique,&slots,expert_begin,expert_end);
+    if(observe)gate->cache->observe_routes(
+        {gate->source_id,up->source_id,down->source_id},host,int(tokens),
+        int(row_offset),int(row_total),source.get_device(),independent);
     if(unique.empty())return ::tyloi::cuda::zeros({tokens,width},source.options());
     // Choose GEMM by each expert's actual token count. A long prompt can
     // still have many sparsely selected experts that belong in indexed jobs.

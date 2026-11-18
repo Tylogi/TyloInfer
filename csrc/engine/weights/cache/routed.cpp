@@ -21,34 +21,46 @@ namespace tyloi::weights {
 
 struct Cache::Routes::Impl {
     std::shared_ptr<MoeExpertCache> cache;
+    std::shared_ptr<TqCache> tq;
     int rows = 0;
+
+    void discard() noexcept {
+        discard_moe_speculative_routes(cache);
+        if (tq) tq->discard_routes();
+        cache.reset();
+        tq.reset();
+        rows = 0;
+    }
 };
 
 Cache::Routes::Routes() noexcept = default;
 Cache::Routes::Routes(Routes&&) noexcept = default;
 Cache::Routes::~Routes() {
-    if (impl_ && impl_->cache) discard_moe_speculative_routes(impl_->cache);
+    if (impl_) impl_->discard();
 }
 
 void Cache::Routes::begin(Cache& owner, int rows) {
     if (!impl_) impl_ = std::make_unique<Impl>();
+    if (impl_->cache || impl_->tq)
+        throw std::logic_error("speculative routes already pending");
     auto cache = owner.data_->moe;
+    auto tq = owner.data_->tq;
     try {
         begin_moe_speculative_routes(cache, rows);
+        if (tq) tq->begin_routes(rows);
     } catch (...) {
         discard_moe_speculative_routes(cache);
         throw;
     }
     impl_->cache = std::move(cache);
+    impl_->tq = std::move(tq);
     impl_->rows = rows;
 }
 
 void Cache::Routes::resolve(int rows, bool cancelled) {
-    if (!impl_ || !impl_->cache) return;
+    if (!impl_ || (!impl_->cache && !impl_->tq)) return;
     if (cancelled) {
-        discard_moe_speculative_routes(impl_->cache);
-        impl_->cache.reset();
-        impl_->rows = 0;
+        impl_->discard();
         return;
     }
     try {
@@ -58,11 +70,7 @@ void Cache::Routes::resolve(int rows, bool cancelled) {
         std::fill(keep.begin(), keep.begin() + rows, std::uint8_t(1));
         commit(keep, true);
     } catch (...) {
-        if (impl_ && impl_->cache) {
-            discard_moe_speculative_routes(impl_->cache);
-            impl_->cache.reset();
-            impl_->rows = 0;
-        }
+        impl_->discard();
         throw;
     }
 }
@@ -72,36 +80,47 @@ void Cache::Routes::resolve(std::span<const std::uint8_t> keep) {
 }
 
 void Cache::Routes::commit(std::span<const std::uint8_t> keep, bool single_sequence) {
-    if (!impl_ || !impl_->cache) return;
+    if (!impl_ || (!impl_->cache && !impl_->tq)) return;
     try {
         if (keep.size() != std::size_t(impl_->rows))
             throw std::invalid_argument("speculative route mask row count is out of range");
         commit_moe_speculative_routes(impl_->cache, keep, single_sequence);
+        if (impl_->tq) impl_->tq->commit_routes(keep, single_sequence);
     } catch (...) {
-        discard_moe_speculative_routes(impl_->cache);
-        impl_->cache.reset();
-        impl_->rows = 0;
+        impl_->discard();
         throw;
     }
     impl_->cache.reset();
+    impl_->tq.reset();
     impl_->rows = 0;
 }
 
 struct Cache::Warmup::Impl {
     std::shared_ptr<MoeExpertCache> cache;
+    std::shared_ptr<TqCache> tq;
     bool suspended = false;
     bool previous_residency = false;
     bool previous_learning = false;
+    bool previous_tq_learning = false;
 };
 
 Cache::Warmup::Warmup(Cache& owner, bool suspend_residency) : impl_(std::make_unique<Impl>()) {
     impl_->cache = owner.data_->moe;
+    impl_->tq = owner.data_->tq;
     impl_->suspended = suspend_residency;
     if (suspend_residency) impl_->previous_residency = suspend_moe_residency(impl_->cache, true);
     impl_->previous_learning = set_moe_reuse_learning(impl_->cache, false);
+    try {
+        if (impl_->tq) impl_->previous_tq_learning = impl_->tq->set_learning(false);
+    } catch (...) {
+        set_moe_reuse_learning(impl_->cache, impl_->previous_learning);
+        if (impl_->suspended) suspend_moe_residency(impl_->cache, impl_->previous_residency);
+        throw;
+    }
 }
 
 Cache::Warmup::~Warmup() {
+    if (impl_->tq) impl_->tq->set_learning(impl_->previous_tq_learning);
     set_moe_reuse_learning(impl_->cache, impl_->previous_learning);
     if (impl_->suspended) suspend_moe_residency(impl_->cache, impl_->previous_residency);
 }

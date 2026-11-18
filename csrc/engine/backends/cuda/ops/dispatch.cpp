@@ -412,7 +412,8 @@ RoutedExperts Ffn::routed(const Tensor& input_tensor, const Tensor& weights_tens
         } else {
             result = profiler.measure("moe.tq", [&] {
                 return project.run(b.tq, routed_input, ids, weights,
-                                   static_cast<float>(spec.swiglu_limit));
+                                   static_cast<float>(spec.swiglu_limit),
+                                   b.route.row_offset, b.route.row_total, mode.batch_serial);
             });
         }
         reduced = true;

@@ -37,15 +37,17 @@ public:
             !std::isfinite(retention) || retention < 0 || retention > 1)
             throw std::invalid_argument("invalid expert heat policy");
         histories_.reserve(layout.size());
-        for (const auto& bundle : layout) {
-            if (bundle.experts <= 0)
-                throw std::invalid_argument("invalid expert history layout");
-            histories_.push_back({bundle.verified,
-                std::vector<float>(std::size_t(bundle.experts)),
-                std::vector<float>(std::size_t(bundle.experts)), {},
-                std::vector<std::uint64_t>((std::size_t(bundle.experts) + 63) / 64),
-                {}});
-        }
+        for (const auto& bundle : layout) add_bundle(bundle);
+    }
+
+    void add_bundle(Bundle bundle) {
+        if (bundle.experts <= 0)
+            throw std::invalid_argument("invalid expert history layout");
+        histories_.push_back({bundle.verified,
+            std::vector<float>(std::size_t(bundle.experts)),
+            std::vector<float>(std::size_t(bundle.experts)), {},
+            std::vector<std::uint64_t>((std::size_t(bundle.experts) + 63) / 64),
+            {}});
     }
 
     void begin(int rows) {

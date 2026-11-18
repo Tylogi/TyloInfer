@@ -1,6 +1,8 @@
 #include "engine/weights/tq/cache.h"
 
 #include "engine/weights/tq/image.h"
+#include "engine/weights/tq/retention.h"
+#include "engine/weights/moe/residency/routes.h"
 #include "engine/backends/cuda/ops/projection/tq/tensor.h"
 #include "engine/backends/cuda/native/device.h"
 #include "engine/backends/cuda/native/context.h"
@@ -51,6 +53,22 @@ struct TqCache::ViewTable {
     ::tyloi::DenseTensor views;
     std::vector<std::uintptr_t> images;
     std::vector<std::uint8_t> bytes;
+};
+
+struct TqCache::Routes {
+    struct Bank {
+        std::array<std::uint64_t, 3> sources;
+        int device;
+        std::size_t first, count;
+        bool decoded = false;
+    };
+    tyloi::engine::RouteHistory history{
+        {}, tyloi::engine::RouteHistory::HeatMode::count, tyloi::engine::expert_usage_retention};
+    std::vector<Bank> banks;
+    std::vector<tyloi::weights::TqRetention> experts;
+    std::optional<std::size_t> budget;
+    std::uint64_t windows = 0;
+    bool prefill = false;
 };
 
 struct TqCache::HostAccounting {
@@ -199,10 +217,12 @@ bool TqCache::admit_host_locked(std::size_t bytes, std::size_t reserve) const {
     return available_host_bytes(process_host_limit_) >= bytes + reserve;
 }
 
-std::size_t TqCache::trim_device(std::size_t bytes) {
+std::size_t TqCache::trim_device(std::size_t bytes, bool protect) {
     const auto before=device_.used();
     while(!device_.empty() && before-device_.used()<bytes) {
-        const auto key=*device_.oldest();
+        auto oldest = device_.oldest(retained_);
+        if (!oldest && protect) break;
+        const auto key = oldest ? *oldest : *device_.oldest();
         const auto& entry=device_.at(key);
         const auto needed=entry.weight.layout().bytes;
         // Preserve an evicted GPU image in RAM before falling back to its file.
@@ -215,16 +235,22 @@ std::size_t TqCache::trim_device(std::size_t bytes) {
                     host_.put(key.image,std::move(image),needed);
             }
         }
-        device_.trim(1);
+        device_.evict(key);
     }
     return before-device_.used();
 }
 
-void TqCache::reserve_device(std::size_t bytes) {
-    if(const auto limit=device_.limit()) {
-        const auto keep=bytes<*limit?*limit-bytes:0;
-        if(device_.used()>keep)trim_device(device_.used()-keep);
-    }
+bool TqCache::reserve_device(std::size_t bytes, int device) {
+    const auto limit = device_.limit();
+    if (!limit) return true;
+    const auto keep = bytes < *limit ? *limit - bytes : 0;
+    if (device_.used() > keep) trim_device(device_.used() - keep, true);
+    if (bytes <= *limit - device_.used()) return true;
+    // A cold miss can use a leased image without entering the cache. Retire
+    // retained backing too if that transient upload would exceed headroom.
+    const auto available = tyloi::cuda::default_context(device)->available_memory();
+    if (available < bytes) trim_device(bytes - available);
+    return false;
 }
 
 void TqCache::report()const {
@@ -341,6 +367,136 @@ std::uint64_t TqCache::streamed_bytes() {
     return transfer_bytes_;
 }
 
+void TqCache::adapt_routes(bool prefill) {
+    if (!routes_ || !learning_ || !device_.limit()) return;
+    auto& r = *routes_;
+    const auto budget = *device_.limit();
+    const bool rebuild = !r.budget || *r.budget != budget;
+    if (prefill) {
+        if (!r.prefill && !rebuild) return;
+    } else if (!rebuild && ++r.windows < tyloi::engine::expert_usage_interval) {
+        return;
+    }
+    r.history.flush();
+    auto items = r.experts;
+    for (std::size_t bank = 0; bank < r.banks.size(); ++bank) {
+        const auto& group = r.banks[bank];
+        for (std::size_t expert = 0; expert < group.count; ++expert)
+            items[group.first + expert].heat = r.history.heat(bank, static_cast<int>(expert));
+    }
+    tyloi::weights::select_tq_retention(items, budget, rebuild);
+    decltype(retained_) next;
+    for (const auto& group : r.banks) {
+        for (std::size_t expert = 0; expert < group.count; ++expert)
+            if (items[group.first + expert].retained)
+                for (const auto source : group.sources)
+                    next.insert({(source << 32) | expert, group.device});
+    }
+    retained_.swap(next);
+    r.experts.swap(items);
+    if (r.windows) r.history.decay(tyloi::engine::expert_usage_decay(r.windows));
+    r.windows = 0;
+    r.prefill = false;
+    r.budget = budget;
+}
+
+void TqCache::observe_routes(const std::array<std::uint64_t, 3>& banks,
+        std::span<const std::int64_t> ids, int rows, int row_offset, int row_total,
+        int device, bool independent) {
+    std::lock_guard lock(mutex_);
+    if (!device_.limit() || (!learning_ && (!routes_ || !routes_->history.pending()))) return;
+    if (rows < 1 || ids.empty() || ids.size() % std::size_t(rows) ||
+        row_offset < 0 || row_total <= 0 || row_offset > row_total || rows > row_total - row_offset)
+        throw std::invalid_argument("invalid TQ route geometry");
+    const auto& first = sources_.at(banks[0] - 1);
+    const auto experts = first.table->rows() / first.rows;
+    if (experts > INT_MAX) return;
+    std::vector<std::int32_t> published;
+    published.reserve(ids.size());
+    for (const auto id : ids) {
+        if (id < 0 || std::uint64_t(id) >= experts) throw std::out_of_range("TQ route expert ID");
+        published.push_back(static_cast<std::int32_t>(id));
+    }
+    if (!routes_) routes_ = std::make_unique<Routes>();
+    auto& r = *routes_;
+    auto found = std::find_if(r.banks.begin(), r.banks.end(), [&](const auto& group) {
+        return group.device == device && group.sources == banks;
+    });
+    const auto bundle = static_cast<std::size_t>(found - r.banks.begin());
+    if (found == r.banks.end()) {
+        // Every protected entry belongs to one complete three-bank group.
+        for (const auto& group : r.banks)
+            if (group.device == device)
+                for (const auto source : banks)
+                    if (std::find(group.sources.begin(), group.sources.end(), source) != group.sources.end())
+                        return;
+        std::vector<const Source*> projections;
+        projections.reserve(banks.size());
+        for (auto it = banks.begin(); it != banks.end(); ++it) {
+            const auto& source = sources_.at(*it - 1);
+            if (source.table->rows() / source.rows != experts)
+                throw std::invalid_argument("TQ expert group geometry differs");
+            if (std::find(banks.begin(), it, *it) == it) projections.push_back(&source);
+        }
+        std::vector<tyloi::weights::TqRetention> items;
+        items.reserve(experts);
+        for (std::uint64_t expert = 0; expert < experts; ++expert) {
+            std::size_t bytes = 0;
+            for (const auto* source : projections) {
+                const auto size = device_bytes(source->table->expert_image_bytes(expert, source->rows));
+                if (size > SIZE_MAX - bytes) throw std::overflow_error("TQ expert group size overflows");
+                bytes += size;
+            }
+            items.push_back({(banks[0] << 32) | expert, device, bytes, 0, false});
+        }
+        r.banks.reserve(r.banks.size() + 1);
+        r.experts.reserve(r.experts.size() + items.size());
+        r.history.add_bundle({static_cast<int>(experts), true});
+        r.banks.push_back({banks, device, r.experts.size(), items.size()});
+        r.experts.insert(r.experts.end(), items.begin(), items.end());
+    }
+    if (!r.history.pending() && rows > 8 && !independent) {
+        if (!r.banks[bundle].decoded) {
+            r.history.stage_prefill(bundle, published, rows);
+            r.prefill = true;
+        }
+        return;
+    }
+    const bool journal = r.history.pending();
+    r.history.observe(bundle, published, rows, independent && !journal,
+                      row_offset, row_total, learning_);
+    if (!journal) {
+        r.banks[bundle].decoded = true;
+        // Count one decode window when the first group has all its rows.
+        if (bundle == 0 && rows == row_total - row_offset) adapt_routes(false);
+    }
+}
+
+void TqCache::begin_routes(int rows) {
+    std::lock_guard lock(mutex_);
+    if (!routes_) routes_ = std::make_unique<Routes>();
+    routes_->history.begin(rows);
+}
+
+void TqCache::commit_routes(std::span<const std::uint8_t> keep, bool single_sequence) {
+    std::lock_guard lock(mutex_);
+    if (!routes_) throw std::logic_error("TQ routes have no active window");
+    auto& r = *routes_;
+    for (const auto& route : r.history.selected(keep))
+        if (learning_) r.banks[route.bundle].decoded = true;
+    if (r.history.commit(keep, single_sequence, learning_).heat_routes) adapt_routes(false);
+}
+
+void TqCache::discard_routes() noexcept {
+    std::lock_guard lock(mutex_);
+    if (routes_) routes_->history.discard();
+}
+
+bool TqCache::set_learning(bool enabled) {
+    std::lock_guard lock(mutex_);
+    return std::exchange(learning_, enabled);
+}
+
 void TqCache::prepare_decode(int device, std::size_t workspace_reserve) {
     const MfqCudaGuard device_guard(device);
     std::lock_guard<std::mutex> guard(mutex_);
@@ -350,6 +506,7 @@ void TqCache::prepare_decode(int device, std::size_t workspace_reserve) {
     const auto headroom = available > workspace_reserve ? available - workspace_reserve : 0;
     // Temporary workspace eviction must not permanently lower the configured budget.
     device_.limit(std::min(device_budget_.value_or(SIZE_MAX), device_.used() + headroom));
+    adapt_routes(true);
 }
 
 void TqCache::reclaim(int device, std::size_t available_bytes) {
@@ -632,10 +789,9 @@ std::vector<::tyloi::encoding::TqTensor> TqCache::get(std::uint64_t source,const
     fetch_ms_+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-fetch_started).count();
     const auto needed=image->bytes.size();
     const auto capacity=device_bytes(needed);
-    const bool cacheable=!device_.limit() || capacity<=*device_.limit();
+    const bool cacheable=reserve_device(capacity, device);
     // The local image owns the upload source; its RAM slot can hold a GPU victim.
     if(cacheable)host_.erase(key);
-    reserve_device(capacity);
     auto storage=::tyloi::cuda::empty({static_cast<std::int64_t>(capacity)},::tyloi::TensorOptions().device(::tyloi::Device(::tyloi::kCUDA,device)).dtype(::tyloi::kUInt8));
     auto weight=tq_view(storage.narrow(0,0,needed),image->layout,table.width());
     if(image->registered) {

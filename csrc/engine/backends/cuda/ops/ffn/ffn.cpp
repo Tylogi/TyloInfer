@@ -165,7 +165,9 @@ Tensor Ffn::routed_shared(const Tensor& input_tensor, const Tensor& route_weight
         DenseTensor routed;
         if (selected.tq.gate) {
             routed = executor.profiler().measure("tq.moe", [&] {
-                return project.run(selected.tq, source, selected_ids, weights);
+                return project.run(selected.tq, source, selected_ids, weights, 0,
+                    selected.route.row_offset, selected.route.row_total,
+                    cuda::Executor::current_ffn().batch_serial);
             });
         } else {
             const auto expert = [&](const Tensor& bank, DenseTensor value) {
@@ -222,7 +224,7 @@ Tensor Ffn::routed_shared(const Tensor& input_tensor, const Tensor& route_weight
         const auto count = std::min(rows, input.size(0) - start);
         auto tile_ids = ids.narrow(0, start, count).contiguous();
         std::optional<weights::ExpertBatch> tile;
-        if (b.down)
+        if (b.down || b.tq.gate)
             tile.emplace(b.gate_up_weights, b.down_weight, Tensor{tile_ids},
                          b.route.row_offset + start, b.route.row_total, b.activation);
         outputs.push_back(run(tile ? *tile->impl_ : b, input.narrow(0, start, count).contiguous(),

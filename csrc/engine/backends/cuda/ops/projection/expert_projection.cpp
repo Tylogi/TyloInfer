@@ -471,10 +471,11 @@ DenseTensor Projector::clamped(const MfeTensor& weight, DenseTensor input,
 }
 
 DenseTensor Projector::run(const TqMoeBanks& banks, DenseTensor input, DenseTensor ids,
-                      DenseTensor weights, float limit) const {
+                      DenseTensor weights, float limit, std::int64_t row_offset,
+                      std::int64_t row_total, bool independent) const {
     if (banks.slices.empty())
         return banks.forward(tq_, std::move(input), std::move(ids), std::move(weights),
-                             limit, &profiler_);
+                             limit, &profiler_, 0, -1, row_offset, row_total, independent);
     if (!banks.gate)
         throw std::invalid_argument("TQ expert parallelism requires a Gate bank");
     std::vector<DenseTensor> partials(banks.slices.size());
@@ -486,7 +487,8 @@ DenseTensor Projector::run(const TqMoeBanks& banks, DenseTensor input, DenseTens
         auto local_ids = collectives_.copy(ids, slice.device);
         auto local_weights = collectives_.copy(weights, slice.device);
         partials[index] = banks.forward(tq_, std::move(local_input), std::move(local_ids),
-            std::move(local_weights), limit, &profiler_, slice.begin, slice.end);
+            std::move(local_weights), limit, &profiler_, slice.begin, slice.end,
+            row_offset, row_total, independent);
     }
     return collectives_.sum(std::move(partials), primary_,
                             options_.reduce_to_primary, options_.fp16_reduce);

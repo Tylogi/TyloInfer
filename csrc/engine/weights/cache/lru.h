@@ -71,6 +71,10 @@ public:
         return true;
     }
 
+    void evict(const Key& key) {
+        if (erase(key)) ++evictions_;
+    }
+
     void clear() noexcept {
         entries_.clear();
         recent_.clear();

@@ -92,7 +92,8 @@ public:
     ::tyloi::DenseTensor run(
         const TqMoeBanks& banks, ::tyloi::DenseTensor input,
         ::tyloi::DenseTensor ids, ::tyloi::DenseTensor weights,
-        float swiglu_limit = 0) const;
+        float swiglu_limit = 0, std::int64_t row_offset = 0,
+        std::int64_t row_total = 0, bool independent = false) const;
 
 private:
     CudaProfiler& profiler_;
