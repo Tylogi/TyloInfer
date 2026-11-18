@@ -304,6 +304,26 @@ std::size_t TqCache::budget() {
     return device_budget_.value_or(std::max(resident_bound_,device_.used()));
 }
 
+std::size_t TqCache::prefill_peak(const std::array<std::uint64_t,3>& banks,
+        std::span<const std::int64_t> experts) {
+    std::lock_guard lock(mutex_);
+    for (const auto bank : banks)
+        if (!bank || bank > sources_.size()) throw std::out_of_range("unknown TQ source");
+    std::size_t peak = 0;
+    for (const auto expert : experts) {
+        if (expert < 0) throw std::out_of_range("TQ routed expert ID is out of bounds");
+        std::size_t sum = 0;
+        for (const auto bank : banks) {
+            const auto& source = sources_[bank - 1];
+            const auto bytes = device_bytes(source.table->expert_image_bytes(expert, source.rows));
+            if (bytes > SIZE_MAX - sum) throw std::overflow_error("TQ prefill image size overflow");
+            sum += bytes;
+        }
+        peak = std::max(peak, sum);
+    }
+    return peak;
+}
+
 std::size_t TqCache::resident_bytes() {
     std::lock_guard<std::mutex> guard(mutex_);
     return device_.used();

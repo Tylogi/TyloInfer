@@ -4,6 +4,7 @@
 #include "engine/backends/cuda/native/env.h"
 #include "engine/backends/cuda/ops/ffn/experts/moe.h"
 #include "engine/backends/cuda/kernels/ffn/mfe/token_groups.h"
+#include "engine/weights/moe/residency/heat.h"
 
 #include <charconv>
 #include <climits>
@@ -74,18 +75,14 @@ bool dma_graph_batch() { return exact_one("TYLOINFER_MOE_DMA_GRAPH_BATCH"); }
 bool warp_multi_sum() { return exact_one("TYLOINFER_CUDA_WARP_MULTI_SUM"); }
 float residency_heat_retention() {
     const auto* setting=tyloi::cuda::env_lookup("TYLOINFER_MOE_RESIDENCY_HEAT_RETENTION");
-    // A four-token adaptation interval needs to remember experts reused every
-    // dozen tokens. With 0.7 decay their score never reaches the admission
-    // threshold; 0.9 retains that evidence across roughly 26 tokens. Prefill
-    // still replaces the heat seed when a new request changes the working set.
-    if(!setting)return 0.9f;
+    if(!setting)return tyloi::engine::expert_usage_retention;
     char* end=nullptr;const float value=std::strtof(setting,&end);
     if(end==setting || *end || !std::isfinite(value) || value<0.0f || value>1.0f)
         throw std::invalid_argument("TYLOINFER_MOE_RESIDENCY_HEAT_RETENTION must be between zero and one");
     return value;
 }
 int residency_interval() {
-    return env_int("TYLOINFER_MOE_RESIDENCY_INTERVAL",1,1,1024);
+    return env_int("TYLOINFER_MOE_RESIDENCY_INTERVAL",int(tyloi::engine::expert_usage_interval),1,1024);
 }
 bool batch_attention_projections() {
     const auto* value=tyloi::cuda::env_lookup("TYLOINFER_BATCH_ATTENTION_PROJECTIONS");

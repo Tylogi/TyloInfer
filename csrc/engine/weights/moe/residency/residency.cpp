@@ -89,7 +89,7 @@ struct MoeResidencyManager::Impl {
     Observer observer;
     MemoryProbe memory_probe;
     int first=0,last=0;
-    int64_t rounds=0;
+    int64_t rounds=0,last_decay=0,pending_round=0;
     int pending_tokens=0;
     std::unique_ptr<tyloi::engine::RouteHistory> route_history;
     std::vector<std::vector<uint8_t>> projection_marks;
@@ -122,11 +122,10 @@ struct MoeResidencyManager::Impl {
         return flag?flag[0]=='2':exchange_defaults;
     }();
     std::vector<tyloi::MoeCacheKey> speculative_host_keys;
-    // One streamed expert serves every matching row of a verification window.
-    // Rank its avoided transfer once, rather than counting each routed token.
+    // Explicit overrides retain the accepted-only experimental heat policies.
     const int speculative_heat_mode=[] {
         const auto* option=tyloi::cuda::env_lookup("TYLOINFER_MOE_MTP_WINDOW_HEAT");
-        return option?std::clamp(std::atoi(option),0,2):2;
+        return option?std::clamp(std::atoi(option),0,2):-1;
     }();
     bool traced_speculative_heat=false;
     std::unique_ptr<tyloi::MoeResidencyRanker> ranking;
@@ -437,7 +436,9 @@ MoeResidencyManager::MoeResidencyManager(MoeExpertCache* cache,Observer observer
                 stages.push_back({std::to_string(p)+":"+cohort.arena->signature,nullptr,p});
         }
     }
-    const auto heat_mode=s.speculative_heat_mode==0
+    const auto heat_mode=s.speculative_heat_mode<0
+        ?tyloi::engine::RouteHistory::HeatMode::executed
+        :s.speculative_heat_mode==0
         ?tyloi::engine::RouteHistory::HeatMode::count
         :s.speculative_heat_mode==1
             ?tyloi::engine::RouteHistory::HeatMode::unique
@@ -558,7 +559,7 @@ MoeResidencyManager::~MoeResidencyManager() {
 void MoeResidencyManager::record_prefill_routes(int layer,const int32_t* ids,int tokens,int routes,void* raw_stream) {
     auto& s=*impl_;
     const MfqCudaGuard guard(s.cache->device());
-    if(layer<0 || !s.cache->options_.policy.adapt || !s.cache->options_.policy.warm)return;
+    if(!s.cache->reuse_learning() || layer<0 || !s.cache->options_.policy.adapt || !s.cache->options_.policy.warm)return;
     const auto* option=tyloi::cuda::env_lookup("TYLOINFER_MOE_PREFILL_RESIDENCY");
     if(option && option[0]=='0')return;
     const auto stream=static_cast<cudaStream_t>(raw_stream);
@@ -599,6 +600,11 @@ void MoeResidencyManager::prepare_decode() {
     const MfqCudaGuard guard(s.cache->device());
     if(!s.prefill_pending)return;
     apply_pending();
+    if(!s.cache->reuse_learning()) {
+        TYLOINFER_CUDA_CHECK(cudaEventSynchronize(s.prefill_done));
+        for(auto& sample:s.prefill_routes)sample.tokens=0;
+        s.prefill_pending=false;return;
+    }
     TYLOINFER_CUDA_CHECK(cudaStreamWaitEvent(s.stream,s.prefill_done,0));
     TYLOINFER_CUDA_CHECK(cudaMemcpyAsync(s.prefill_route_host->data(),s.prefill_route_device.data_ptr(),
         s.prefill_route_device.numel()*sizeof(int32_t),cudaMemcpyDeviceToHost,s.stream));
@@ -692,16 +698,17 @@ void MoeResidencyManager::begin_speculative_routes(int rows) {
     if(s.cache->ssd_experts())s.cache->host_experts_->begin_speculative_learning();
     s.route_history->begin(rows);
 }
-void MoeResidencyManager::commit_speculative_routes(std::span<const std::uint8_t> keep) {
+void MoeResidencyManager::commit_speculative_routes(std::span<const std::uint8_t> keep,bool executed) {
     auto& s=*impl_;if(!s.route_history->pending())return;
     // Validate the entire prefix before changing observations. Graph setup may
     // replay a layer more than once; only its latest route publication counts.
     const auto accepted=s.route_history->selected(keep);
+    const bool learning=s.cache->reuse_learning();
     if(s.cache->ssd_experts()) {
         s.speculative_host_keys.clear();
         // Commit in ordinary decode order: each accepted token visits all
         // layers. Frequency and recency must not depend on verify batch size.
-        for(const auto& route:accepted) {
+        if(learning)for(const auto& route:accepted) {
             const auto& bundle=s.cache->pipeline_bundles_[route.bundle];
             for(int p=0;p<3;++p) {
                 if(p && bundle[p]==bundle[p-1])continue;
@@ -713,10 +720,10 @@ void MoeResidencyManager::commit_speculative_routes(std::span<const std::uint8_t
         s.cache->host_experts_->commit_speculative_learning(s.speculative_host_keys);
     }
     // Publish heat only after host learning has committed successfully.
-    const auto result=s.route_history->commit(keep);
+    const auto result=s.route_history->commit(keep,executed,learning);
     if(!s.traced_speculative_heat && result.routes) {
-        std::fprintf(stderr,"moe_mtp_heat_policy scope=first_committed_window window_union=%d normalized=%d rows=%d routes=%llu heat_routes=%llu\n",
-            int(s.speculative_heat_mode!=0),int(s.speculative_heat_mode==2),
+        std::fprintf(stderr,"moe_mtp_heat_policy scope=first_committed_window executed_rows=%d window_union=%d normalized=%d rows=%d routes=%llu heat_routes=%llu\n",
+            int(s.speculative_heat_mode<0 && executed),int(s.speculative_heat_mode>0),int(s.speculative_heat_mode==2),
             int(std::count(keep.begin(),keep.end(),std::uint8_t(1))),
             static_cast<unsigned long long>(result.routes),
             static_cast<unsigned long long>(result.heat_routes));
@@ -734,19 +741,27 @@ void MoeResidencyManager::observe_routes(int layer, std::span<const int32_t> ids
     auto& s=*impl_;
     const MfqCudaGuard guard(s.cache->device());
     if (s.cache->pipeline_residency_suspended_) return;
+    const bool learning=s.cache->reuse_learning();
     for (std::size_t b=0; b<s.cache->pipeline_bundles_.size(); ++b)
-        if (s.cache->sources_[s.cache->pipeline_bundles_[b][0]]->layer_id_ == layer)
-            s.route_history->observe(b, ids, tokens, independent_sequences,
-                                     row_offset, row_total);
+        if (s.cache->sources_[s.cache->pipeline_bundles_[b][0]]->layer_id_ == layer) {
+            if(learning && tokens>8 && !independent_sequences && s.cache->options_.policy.warm &&
+               !ids.empty() && (!s.route_history->pending() || layer<0))
+                s.route_history->stage_prefill(b,ids,tokens);
+            else
+                s.route_history->observe(b, ids, tokens, independent_sequences,
+                                         row_offset, row_total, learning);
+        }
 }
 void MoeResidencyManager::after_layer(int layer,const std::vector<int32_t>& ids,int tokens,bool window_inflight,bool independent_sequences) {
     auto& s=*impl_;
     const MfqCudaGuard guard(s.cache->device());
     if(s.cache->pipeline_residency_suspended_)return;
-    observe_routes(layer, ids, tokens, 0, 0, independent_sequences);
-    if(!s.cache->options_.policy.adapt)return;
-    if(layer!=s.last || s.work_pending.load(std::memory_order_acquire))return;
-    if(!s.cache->options_.policy.warm && (tokens>8 || (++s.rounds%4)!=0))return;
+    if(!ids.empty())observe_routes(layer, ids, tokens, 0, 0, independent_sequences);
+    if(!s.cache->reuse_learning() || !s.cache->options_.policy.adapt)return;
+    if(layer!=s.last)return;
+    ++s.rounds;
+    if(s.work_pending.load(std::memory_order_acquire))return;
+    if(!s.cache->options_.policy.warm && (tokens>8 || s.rounds%tyloi::engine::expert_usage_interval!=0))return;
     // Strata adjusts its cache every few completed windows. Keep collecting
     // all routes between rounds; prompt batches still prepare immediately.
     // Speculative observations become visible when verification commits its
@@ -758,11 +773,12 @@ void MoeResidencyManager::after_layer(int layer,const std::vector<int32_t>& ids,
     const auto* short_interval=tyloi::cuda::env_lookup("TYLOINFER_MOE_SHORT_DECODE_INTERVAL");
     const bool interval_decode=tokens==1 || (tokens<=8 &&
         (!independent_sequences || !short_interval || short_interval[0]!='0'));
-    if(s.cache->options_.policy.warm && interval_decode && (++s.rounds%s.interval)!=0)return;
+    if(s.cache->options_.policy.warm && interval_decode && s.rounds%s.interval!=0)return;
     if(!s.pending.empty())throw std::logic_error("adaptive tier has an unpublished transaction");
     s.route_history->flush();
     ++s.scheduled_rounds;
     s.pending_tokens=tokens;
+    s.pending_round=s.rounds;
     s.error=nullptr;
     // During replay the entire graph is already queued on the compute stream.
     // Planning can proceed now; resident writes must follow its completion.
@@ -1140,7 +1156,10 @@ void MoeResidencyManager::prepare() {
         bytes=next_bytes;for(int i=0;i<count;++i)s.pending.push_back(std::move(bundle[i]));
     }
     s.memory_rejections+=memory_rejections;
-    s.route_history->decay();
+    const float decay=tyloi::cuda::env_lookup("TYLOINFER_MOE_RESIDENCY_HEAT_RETENTION")
+        ?s.heat_retention:tyloi::engine::expert_usage_decay(std::uint64_t(s.pending_round-s.last_decay));
+    s.route_history->decay(decay);
+    s.last_decay=s.pending_round;
     if(s.pending.empty()){finish_plan();return;}
     const auto options=::tyloi::TensorOptions().device(::tyloi::kCPU).dtype(::tyloi::kUInt8).pinned_memory(true);
     if(cache.options_.policy.warm &&

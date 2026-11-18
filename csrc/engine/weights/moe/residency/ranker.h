@@ -1,4 +1,5 @@
 #pragma once
+#include "engine/weights/moe/residency/heat.h"
 #include <algorithm>
 #include <cstddef>
 #include <stdexcept>
@@ -55,7 +56,7 @@ public:
             std::partial_sort(group.hot.begin(),group.hot.begin()+count,group.hot.end(),colder);
             for(std::size_t i=0;i<count;++i) {
                 const float gain=group.cold[i].heat-group.hot[i].heat;
-                if(gain<1.5f)break;
+                if(gain<engine::expert_replacement_margin)break;
                 pairs_.push_back({group.cold[i].expert,group.hot[i].expert,gain});
             }
         }

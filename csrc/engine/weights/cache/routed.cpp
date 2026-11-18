@@ -56,7 +56,7 @@ void Cache::Routes::resolve(int rows, bool cancelled) {
             throw std::invalid_argument("committed route prefix is out of range");
         std::vector<std::uint8_t> keep(std::size_t(impl_->rows), std::uint8_t(0));
         std::fill(keep.begin(), keep.begin() + rows, std::uint8_t(1));
-        resolve(keep);
+        commit(keep, true);
     } catch (...) {
         if (impl_ && impl_->cache) {
             discard_moe_speculative_routes(impl_->cache);
@@ -68,11 +68,15 @@ void Cache::Routes::resolve(int rows, bool cancelled) {
 }
 
 void Cache::Routes::resolve(std::span<const std::uint8_t> keep) {
+    commit(keep, false);
+}
+
+void Cache::Routes::commit(std::span<const std::uint8_t> keep, bool single_sequence) {
     if (!impl_ || !impl_->cache) return;
     try {
         if (keep.size() != std::size_t(impl_->rows))
             throw std::invalid_argument("speculative route mask row count is out of range");
-        commit_moe_speculative_routes(impl_->cache, keep);
+        commit_moe_speculative_routes(impl_->cache, keep, single_sequence);
     } catch (...) {
         discard_moe_speculative_routes(impl_->cache);
         impl_->cache.reset();

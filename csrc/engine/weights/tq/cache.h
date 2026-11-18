@@ -9,6 +9,7 @@
 #include <list>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <string>
 #include <utility>
 #include <unordered_map>
@@ -26,6 +27,8 @@ public:
     ~TqCache() override;
 
     std::uint64_t add(std::shared_ptr<const tyloi::TqTable>, std::int64_t rows);
+    std::size_t prefill_peak(const std::array<std::uint64_t,3>& banks,
+                             std::span<const std::int64_t> experts);
     std::vector<::tyloi::encoding::TqTensor> get(std::uint64_t source, const std::int64_t* ids,
                               std::size_t count, int device);
     ::tyloi::DenseTensor views(std::uint64_t source, const std::int64_t* ids,

@@ -53,6 +53,7 @@ public:
         void resolve(int rows, bool cancelled);
         void resolve(std::span<const std::uint8_t> keep);
     private:
+        void commit(std::span<const std::uint8_t> keep, bool single_sequence);
         struct Impl;
         std::unique_ptr<Impl> impl_;
     };

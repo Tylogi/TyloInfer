@@ -4,6 +4,7 @@
 #include "engine/backends/cuda/executor/graph/window.h"
 #include "engine/backends/cuda/executor/options.h"
 #include "engine/weights/tq/cache.h"
+#include "engine/weights/moe/routed_groups.h"
 #include "engine/backends/cuda/ops/projection/tq/layout.h"
 #include "engine/backends/cuda/ops/ffn/tq/routed.h"
 #include "engine/backends/cuda/native/memory.h"
@@ -20,7 +21,6 @@
 #include <cstdio>
 #include <stdexcept>
 #include <string>
-#include <unordered_map>
 
 
 bool tq_graph_supports_tokens(std::int64_t tokens)noexcept {
@@ -137,19 +137,10 @@ struct TqMoeGraphStage {
             std::copy_n(static_cast<const int32_t*>(route_data()),slots,widened_routes.data());
             selected=widened_routes.data();
         }
-        for(std::size_t i=0;i<slots;++i)if(selected[i]<0 || selected[i]>=banks[0]->experts)
-            throw std::out_of_range("TQ graph expert ID is out of bounds");
         std::vector<int64_t> unique;
         std::vector<std::vector<int64_t>> grouped;
-        if(tokens==1)unique.assign(selected,selected+routes);
-        else {
-            std::unordered_map<int64_t,std::size_t> positions;
-            for(std::size_t i=0;i<slots;++i) {
-                const auto [entry,inserted]=positions.emplace(selected[i],unique.size());
-                if(inserted){unique.push_back(selected[i]);grouped.emplace_back();}
-                grouped[entry->second].push_back(int64_t(i));
-            }
-        }
+        tyloi::weights::group_routed_experts({selected,slots},banks[0]->experts,unique,
+            tokens==1?nullptr:&grouped);
         // The preceding GPU segment has consumed the prior layer's images.
         // Keep one live layer across all TQ sources, independently of cache
         // ownership, so graph capture cannot pin every layer's experts.
@@ -335,37 +326,9 @@ struct TqMoeGraphStage {
     // Router output is normally int32. Widen this tiny ID list on CPU after
     // the readback, avoiding a GPU allocation/conversion before every wait.
     const auto host=phase("tq.moe.routes",[&] {return exec.get(source.get_device())->routes(ids);});
-    const auto* selected=host.data();
     std::vector<std::int64_t> unique;
     std::vector<std::vector<std::int64_t>> slots;
-    if(static_cast<std::uint64_t>(up->experts)<=host.size()) {
-        // Dense counters use no more memory than the route readback. Count
-        // first to reserve each expert's slots once, then reuse counters as
-        // indices. Sparse expert domains retain bounded hash lookup below.
-        std::vector<std::size_t> positions(static_cast<std::size_t>(up->experts),0);
-        for(const auto expert:host) {
-            if(expert<0 || expert>=up->experts)throw std::out_of_range("TQ routed expert ID is out of bounds");
-            if(expert<expert_begin || expert>=expert_end)continue;
-            if(!positions[expert]++)unique.push_back(expert);
-        }
-        slots.resize(unique.size());
-        for(std::size_t i=0;i<unique.size();++i) {
-            auto& count=positions[unique[i]];slots[i].reserve(count);count=i;
-        }
-        for(std::size_t i=0;i<host.size();++i)
-            if(selected[i]>=expert_begin && selected[i]<expert_end)slots[positions[selected[i]]].push_back(i);
-    }else {
-        std::unordered_map<std::int64_t,std::size_t> positions;
-        positions.reserve(host.size());
-        for(std::size_t i=0;i<host.size();++i) {
-            const auto expert=selected[i];
-            if(expert<0 || expert>=up->experts)throw std::out_of_range("TQ routed expert ID is out of bounds");
-            if(expert<expert_begin || expert>=expert_end)continue;
-            const auto [position,inserted]=positions.emplace(expert,unique.size());
-            if(inserted){unique.push_back(expert);slots.emplace_back();}
-            slots[position->second].push_back(i);
-        }
-    }
+    tyloi::weights::group_routed_experts(host,up->experts,unique,&slots,expert_begin,expert_end);
     if(unique.empty())return ::tyloi::cuda::zeros({tokens,width},source.options());
     // Choose GEMM by each expert's actual token count. A long prompt can
     // still have many sparsely selected experts that belong in indexed jobs.
@@ -441,21 +404,22 @@ struct TqMoeGraphStage {
             decoded=::tyloi::cuda::empty({static_cast<int64_t>(bytes)},source.options().dtype(::tyloi::kUInt8));
             blas=resources->get();
         }
-        const auto image_bound=[](const tyloi::TqBank& w) {
-            return std::uint64_t(w.out)*(((std::uint64_t(w.input)+255)&~std::uint64_t(255))*2+16)+512;
-        };
-        const auto image_per_expert=image_bound(*gate)+image_bound(*up)+image_bound(*down);
+        const auto image_per_expert=gate->cache->prefill_peak(
+            {gate->source_id,up->source_id,down->source_id},{unique.data(),prefill_groups});
         // Image leases and compute scratch have independent live budgets.
         // Account for allocated scratch before admitting compressed misses.
-        const auto image_batch=std::min<std::size_t>(prefill_groups,
-            std::max<std::uint64_t>(1,(free_bytes()/2)/image_per_expert));
+        const auto image_batch=tyloi::weights::routed_prefill_group_capacity(
+            prefill_groups,image_per_expert,free_bytes());
+        const auto group_ends=tyloi::weights::routed_prefill_group_ends(
+            {slots.data(),prefill_groups},image_batch);
         if(tyloi::cuda::env_lookup("TYLOINFER_TQ_PROFILE_CACHE"))std::fprintf(stderr,
             "tq_prefill_moe jobs=%zu gemm_jobs=%zu scratch=%lld decoded=%lld image_batch=%zu\n",
             prefill_groups,gemm_groups,static_cast<long long>(activations.numel()),
             static_cast<long long>(decoded.defined()?decoded.numel():0),image_batch);
         first=0;
-        for(std::size_t begin=0;begin<prefill_groups;begin+=image_batch) {
-            const auto count=std::min(image_batch,prefill_groups-begin);
+        std::size_t begin=0;
+        for(const auto end:group_ends) {
+            const auto count=end-begin;
             const auto banks=phase("tq.moe.weights",[&] {
                 return std::array<std::vector<::tyloi::encoding::TqTensor>,3>{
                     gate->cache->get(gate->source_id,unique.data()+begin,count,source.get_device()),
@@ -497,6 +461,7 @@ struct TqMoeGraphStage {
                     activations.data_ptr(),activations.nbytes(),stream.stream()));return 0;});
                 tile+=tile_count;
             }
+            begin=end;
         }
     }
     if(prefill_groups<long_groups) {

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "heat.h"
+
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -18,7 +20,7 @@ public:
     // the target row.  The mask API keeps each of those physical rows
     // independently, including holes between accepted requests.
     static constexpr int max_speculative_rows = 32 * (5 + 1);
-    enum class HeatMode { count, unique, normalized };
+    enum class HeatMode { count, unique, normalized, executed };
     struct Bundle { int experts; bool verified; };
     struct Route { std::size_t bundle; int32_t expert; };
     struct Stats {
@@ -31,7 +33,7 @@ public:
         : mode_(mode), retention_(retention) {
         const auto mode_value = static_cast<int>(mode);
         if (mode_value < static_cast<int>(HeatMode::count) ||
-            mode_value > static_cast<int>(HeatMode::normalized) ||
+            mode_value > static_cast<int>(HeatMode::executed) ||
             !std::isfinite(retention) || retention < 0 || retention > 1)
             throw std::invalid_argument("invalid expert heat policy");
         histories_.reserve(layout.size());
@@ -56,6 +58,7 @@ public:
             history.rows = 0;
             history.routes = 0;
             history.published.clear();
+            history.learning.clear();
         }
         pending_rows_ = rows;
     }
@@ -63,7 +66,7 @@ public:
 
     void observe(std::size_t bundle, std::span<const int32_t> ids, int rows,
                  bool independent_sequences = false, int row_offset = 0,
-                 int row_total = 0) {
+                 int row_total = 0, bool learning = true) {
         auto& history = histories_.at(bundle);
         const bool deferred = pending() && history.verified;
         if (deferred && (independent_sequences || rows < 1 || rows > pending_rows_ ||
@@ -83,6 +86,7 @@ public:
                 history.routes = static_cast<int>(routes);
                 history.ids.assign(std::size_t(row_total) * routes, -1);
                 history.published.assign(std::size_t(row_total), std::uint8_t(0));
+                history.learning.assign(std::size_t(row_total), std::uint8_t(0));
             } else if (history.rows != row_total || history.routes != static_cast<int>(routes)) {
                 throw std::logic_error("speculative route publication geometry changed");
             }
@@ -90,7 +94,9 @@ public:
                 std::size_t(row_offset) * routes);
             std::fill(history.published.begin() + row_offset,
                       history.published.begin() + row_offset + rows, std::uint8_t(1));
-        } else {
+            std::fill(history.learning.begin() + row_offset,
+                      history.learning.begin() + row_offset + rows, std::uint8_t(learning));
+        } else if (learning) {
             for (const auto expert : ids)
                 history.observations[expert] += 1.0f;
             observed_ += ids.size();
@@ -108,7 +114,7 @@ public:
             for (std::size_t bundle = 0; bundle < histories_.size(); ++bundle) {
                 const auto& history = histories_[bundle];
                 if (!history.rows || row >= history.rows ||
-                    (!history.published.empty() && !history.published[std::size_t(row)]))
+                    !history.published[std::size_t(row)] || !history.learning[std::size_t(row)])
                     continue;
                 for (int route = 0; route < history.routes; ++route)
                     accepted_.push_back({bundle, history.ids[std::size_t(row) * history.routes + route]});
@@ -117,26 +123,30 @@ public:
         return accepted_;
     }
 
-    Accepted commit(std::span<const std::uint8_t> keep) {
+    Accepted commit(std::span<const std::uint8_t> keep, bool executed = false, bool learning = true) {
         validate_keep(keep);
         Accepted result;
         if (!pending())
             return result;
+        const bool accepted = std::any_of(keep.begin(), keep.end(), [](std::uint8_t value) { return value != 0; });
+        const bool all_rows = accepted && executed && mode_ == HeatMode::executed;
+        const bool unique = mode_ == HeatMode::unique || mode_ == HeatMode::normalized;
         for (auto& history : histories_) {
             if (!history.rows)
                 continue;
-            std::size_t count = 0;
-            if (mode_ != HeatMode::count)
+            std::size_t count = 0, committed = 0;
+            if (unique)
                 std::fill(history.seen.begin(), history.seen.end(), std::uint64_t(0));
             std::size_t distinct = 0;
             for (int row = 0; row < pending_rows_; ++row) {
-                if (!keep[std::size_t(row)]) continue;
-                if (row >= history.rows || (!history.published.empty() &&
-                    !history.published[std::size_t(row)])) continue;
+                if (row >= history.rows || !history.published[std::size_t(row)]) continue;
+                if (keep[std::size_t(row)]) committed += std::size_t(history.routes);
+                if (!learning || !history.learning[std::size_t(row)] ||
+                    (!all_rows && !keep[std::size_t(row)])) continue;
                 for (int route = 0; route < history.routes; ++route) {
                     const auto expert = unsigned(history.ids[std::size_t(row) * history.routes + route]);
                     ++count;
-                    if (mode_ != HeatMode::count) {
+                    if (unique) {
                         auto& word = history.seen[expert / 64];
                         const auto bit = std::uint64_t(1) << (expert % 64);
                         if (word & bit)
@@ -150,12 +160,12 @@ public:
             const float weight = mode_ == HeatMode::normalized && distinct
                 ? float(count) / float(distinct) : 1.0f;
             for (int row = 0; row < pending_rows_; ++row) {
-                if (!keep[std::size_t(row)]) continue;
-                if (row >= history.rows || (!history.published.empty() &&
-                    !history.published[std::size_t(row)])) continue;
+                if (row >= history.rows || !history.published[std::size_t(row)] ||
+                    !learning || !history.learning[std::size_t(row)] ||
+                    (!all_rows && !keep[std::size_t(row)])) continue;
                 for (int route = 0; route < history.routes; ++route) {
                     const auto expert = unsigned(history.ids[std::size_t(row) * history.routes + route]);
-                    if (mode_ != HeatMode::count) {
+                    if (unique) {
                         auto& word = history.seen[expert / 64];
                         const auto bit = std::uint64_t(1) << (expert % 64);
                         if (!(word & bit))
@@ -165,12 +175,12 @@ public:
                     history.observations[expert] += weight;
                 }
             }
-            result.routes += count;
+            result.routes += committed;
             result.heat_routes += distinct;
             discarded_ += std::size_t(std::count(history.published.begin(), history.published.end(),
-                                                 std::uint8_t(1))) * history.routes - count;
+                                                 std::uint8_t(1))) * history.routes - committed;
+            observed_ += count;
         }
-        observed_ += result.routes;
         committed_ += result.routes;
         heat_routes_ += result.heat_routes;
         ++windows_;
@@ -188,6 +198,7 @@ public:
             history.rows = 0;
             history.routes = 0;
             history.published.clear();
+            history.learning.clear();
         }
         ++cancels_;
         pending_rows_ = 0;
@@ -198,27 +209,38 @@ public:
         if (rows < 1 || routes < 1 || ids.size() != std::size_t(rows) * routes)
             throw std::invalid_argument("invalid prefill route geometry");
         validate_experts(history, ids);
-        std::fill(history.heat.begin(), history.heat.end(), 0.0f);
+        prefill_values(history.heat, ids, rows);
         std::fill(history.observations.begin(), history.observations.end(), 0.0f);
-        // Seed about six recent token-equivalents so long prompts cannot dominate decode.
-        for (int row = 0; row < rows; ++row) {
-            const float weight = std::exp2(-float(rows - 1 - row) / 4.0f);
-            for (int route = 0; route < routes; ++route)
-                history.heat[ids[std::size_t(row) * routes + route]] += weight;
-        }
+        history.prefill_reset = false;
+    }
+
+    void stage_prefill(std::size_t bundle, std::span<const int32_t> ids, int rows) {
+        auto& history = histories_.at(bundle);
+        if (rows < 1 || ids.empty() || ids.size() % std::size_t(rows))
+            throw std::invalid_argument("invalid prefill route geometry");
+        validate_experts(history, ids);
+        prefill_values(history.observations, ids, rows);
+        history.prefill_reset = true;
+        observed_ += ids.size();
     }
 
     void flush() {
-        for (auto& history : histories_)
+        for (auto& history : histories_) {
+            if (history.prefill_reset) {
+                std::fill(history.heat.begin(), history.heat.end(), 0.0f);
+                history.prefill_reset = false;
+            }
             for (std::size_t expert = 0; expert < history.heat.size(); ++expert) {
                 history.heat[expert] += history.observations[expert];
                 history.observations[expert] = 0;
             }
+        }
     }
-    void decay() {
+    void decay() { decay(retention_); }
+    void decay(float retention) {
         for (auto& history : histories_)
             for (float& heat : history.heat)
-                heat *= retention_;
+                heat *= retention;
     }
     float heat(std::size_t bundle, int expert) const {
         return histories_.at(bundle).heat.at(std::size_t(expert));
@@ -238,9 +260,18 @@ private:
         std::vector<float> heat, observations;
         std::vector<int32_t> ids;
         std::vector<std::uint64_t> seen;
-        std::vector<std::uint8_t> published;
+        std::vector<std::uint8_t> published, learning;
         int rows = 0, routes = 0;
+        bool prefill_reset = false;
     };
+
+    static void prefill_values(std::vector<float>& values, std::span<const int32_t> ids, int rows) {
+        std::vector<std::uint64_t> counts(values.size());
+        for (const auto expert : ids)
+            ++counts[std::size_t(expert)];
+        for (std::size_t expert = 0; expert < counts.size(); ++expert)
+            values[expert] = expert_prefill_usage(counts[expert], std::size_t(rows));
+    }
 
     static void validate_experts(const History& history, std::span<const int32_t> ids) {
         for (const auto expert : ids)
