@@ -427,6 +427,7 @@ struct DecodeWindow::Capture::Impl {
             for(auto& task:window.tasks_)if(task.cancel)task.cancel();
             window.graphs_.clear();
             (void)cudaStreamSynchronize(window.stream_);
+            for(const auto& pool:window.branch_pools_)(void)cudaStreamSynchronize(pool->stream.stream());
             if(window.transfer_)(void)cudaStreamSynchronize(window.transfer_->get());
             window.failed_=true;
         }

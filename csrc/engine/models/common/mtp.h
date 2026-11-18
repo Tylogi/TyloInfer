@@ -32,6 +32,7 @@ struct MtpRow {
     Tensor hidden;
     Tensor ids;
     Tensor positions;
+    Tensor context = {};
 };
 
 struct MtpDraft {
@@ -146,7 +147,8 @@ struct Mtp {
         MtpState&,
         const Tensor&,
         int,
-        bool) const {
+        bool,
+        const Tensor&) const {
         throw std::runtime_error(
             "this CUDA MTP predictor has no block-draft adapter");
     }

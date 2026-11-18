@@ -114,9 +114,6 @@ set(TYLOINFER_CUDA_KERNEL_SOURCES
     ${TYLOINFER_CUDA_ROOT}/kernels/gguf_prefill_scale.cu
     ${TYLOINFER_CUDA_ROOT}/kernels/gguf_mmq.cu
     ${TYLOINFER_CUDA_ROOT}/kernels/gguf_window.cu
-    ${TYLOINFER_CUDA_ROOT}/kernels/dflash2.cu
-    ${TYLOINFER_CUDA_ROOT}/kernels/dflash2_gemm.cu
-    ${TYLOINFER_CUDA_ROOT}/kernels/dflash2_q4.cu
     # DeepSeek indexers use this signed Hadamard transform in native TQ/GGUF too.
     ${TYLOINFER_CUDA_KERNEL_ROOT}/nepq.cu
     ${TYLOINFER_CUDA_KERNEL_ROOT}/acc.cu

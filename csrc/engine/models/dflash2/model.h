@@ -2,6 +2,7 @@
 
 #include "engine/models/common/mtp.h"
 
+#include <array>
 #include <filesystem>
 
 namespace tyloi::models::dflash2 {
@@ -32,13 +33,13 @@ struct State final : MtpState {
     std::int64_t position() const noexcept override { return pos; }
     std::vector<Tensor> storage() const override;
     std::unique_ptr<Restore> prepare_restore(const MtpSessionState&) override;
-    void release_graphs() noexcept override { graph.reset(); }
+    void release_graphs() noexcept override { graphs = {}; }
 
     const Draft& model;
     std::vector<DenseTensor> keys, values;
     DenseTensor compact, selector;
     DenseTensor successor_rows;
-    std::shared_ptr<DraftGraph> graph;
+    std::array<std::shared_ptr<DraftGraph>, 2> graphs;
     std::int64_t pos = 0;
     int row = 0;
 };
@@ -68,7 +69,7 @@ public:
     MtpSessionState capture_session_state(const MtpState&, std::int64_t, const Tensor&) const override;
     void seed_target_context(MtpState&, const Tensor&, std::int64_t) const override;
     void append_target_context(MtpState&, const Tensor&, std::int64_t) const override;
-    StepSequence<Tensor> draft_block(MtpState&, const Tensor&, int, bool graph) const override;
+    StepSequence<Tensor> draft_block(MtpState&, const Tensor&, int, bool graph, const Tensor& context) const override;
     Tensor draft_next(MtpState&, const Tensor&, const Tensor&) const override;
     StepSequence<MtpDraft> greedy_draft(const CausalModel&, MtpRow, int, const ForwardOptions&) const override;
 

@@ -552,7 +552,8 @@ struct DeepseekV41Dspark final : tyloi::models::Mtp {
 
     ::tyloi::StepSequence<::tyloi::Tensor> draft_block(tyloi::models::MtpState& value,
                                 const tyloi::Tensor& input_ids,
-                                int requested, bool) const override {
+                                int requested, bool, const tyloi::Tensor& context) const override {
+        if (context) append_target_context(value, context, value.position());
         const auto& state = this->state<DsState>(value);
         auto anchor_ids = input_ids.dense();
         const auto physical_width =

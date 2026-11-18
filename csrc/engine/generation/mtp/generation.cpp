@@ -302,13 +302,13 @@ struct MtpOps {
         }
         return result;
     }
-    models::MtpDraft greedy_draft(const Tensor& hidden, const Tensor& ids, int depth) {
+    models::MtpDraft greedy_draft(const Tensor& hidden, const Tensor& ids, int depth, Tensor context = {}) {
         if (!graph_enabled || (prepared && prepared->transformed()) ||
             !draft_target_graph(weights.decode() == weights::Cache::Decode::routed)) return {};
         auto predictor_options = options;
         predictor_options.serial_experts = false;
         bool initialized = false;
-        auto result = drive_draft(mtp.greedy_draft(model, {&predictor, hidden, ids, {}}, depth, predictor_options),
+        auto result = drive_draft(mtp.greedy_draft(model, {&predictor, hidden, ids, {}, std::move(context)}, depth, predictor_options),
             depth, initialized);
         if (!result) return {};
         projected_predictor_hidden = {};
@@ -317,9 +317,9 @@ struct MtpOps {
         result->initialized = result->initialized || initialized;
         return std::move(*result);
     }
-    Tensor draft_block(const Tensor& ids, int depth, bool& initialized) {
+    Tensor draft_block(const Tensor& ids, int depth, bool& initialized, const Tensor& context) {
         auto result = drive_draft(mtp.draft_block(predictor, ids, depth,
-                graph_enabled && (!prepared || !prepared->transformed())),
+                graph_enabled && (!prepared || !prepared->transformed()), context),
             depth, initialized);
         if (!result) throw std::logic_error("MTP block draft ended without a result");
         return std::move(*result);
@@ -887,22 +887,36 @@ Generation speculative_sequence(MtpOps ops, InferenceRequest &request, Inference
                     pending_hidden.push_back(requested_depth>0 && pending_ids.empty()?hidden_rows:ops.clone(hidden_rows));
                     pending_ids.insert(pending_ids.end(),next_ids.begin(),next_ids.end());
                 }
-                if(requested_depth>0 || !pending_ids.empty())flush_history();
+                if (requested_depth == 0) flush_history();
                 require_execution(predictor.position() == predictor_history_position,
                     "block predictor cache did not advance");
                 if (requested_depth > 0) {
+                    Tensor context;
+                    if (!pending_ids.empty())
+                        context = pending_hidden.size() == 1 ? pending_hidden.front()
+                            : ops.concatenate(pending_hidden, 1);
+                    auto commit_context = [&] {
+                        const auto next = predictor_history_position + static_cast<int64_t>(pending_ids.size());
+                        require_execution(predictor.position() == next,
+                            "block predictor cache did not advance");
+                        predictor_history_position = next;
+                        pending_hidden.clear();
+                        pending_ids.clear();
+                    };
                     auto anchor=ops.ids_for({next_ids.back()});
                     if (greedy && !penalties && !mtp.split_target_verification()) {
-                        auto queued = ops.greedy_draft(hidden_rows, anchor, requested_depth);
+                        auto queued = ops.greedy_draft(hidden_rows, anchor, requested_depth, context);
                         if (queued.ids) {
-                            require_execution(predictor.position() == predictor_history_position,
-                                "block draft changed committed context");
+                            commit_context();
                             maintenance = maintenance || queued.initialized;
                             result.queued = std::move(queued.ids);
                             return result;
                         }
+                        require_execution(predictor.position() == predictor_history_position,
+                            "empty block draft changed committed context");
                     }
-                    auto block_result = ops.draft_block(anchor, requested_depth, maintenance);
+                    auto block_result = ops.draft_block(anchor, requested_depth, maintenance, context);
+                    commit_context();
                     const auto& block = block_result;
                     auto scope = ops::dense_scope(&ops.predictor_execution, ops.device);
                     auto previous = std::move(anchor);
