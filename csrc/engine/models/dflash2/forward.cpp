@@ -2,17 +2,34 @@
 
 #include "engine/models/causal_model.h"
 #include "engine/ops/ops.h"
+#include "engine/backends/cuda/executor/graph/window.h"
+#include "engine/backends/cuda/executor/graph_pool_lease.h"
 #include "engine/backends/cuda/kernels/attention/dflash2/attention.h"
 #include "engine/backends/cuda/native/context.h"
+#include "engine/backends/cuda/native/env.h"
 #include "engine/backends/cuda/ops/sampling/launch.h"
 
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <exception>
 #include <limits>
 #include <stdexcept>
 
 namespace tyloi::models::dflash2 {
+
+struct DraftGraph {
+    DraftGraph(cuda::StreamHandle stream, const std::shared_ptr<cuda::Context>& context)
+        : stream(std::move(stream)), pool(cuda::GraphPoolLease::acquire(context, this->stream.stream())),
+          window(this->stream.stream()) {}
+
+    cuda::StreamHandle stream;
+    std::shared_ptr<cuda::GraphPoolLease> pool;
+    Tensor ids, positions;
+    DenseTensor hidden;
+    cuda::DecodeWindow window;
+};
+
 namespace {
 namespace raw = tyloi::cuda::dflash2;
 
@@ -215,7 +232,7 @@ void Draft::seed_target_context(MtpState& value, const Tensor& hidden, std::int6
     append_target_context(value, hidden, count - hidden.size(1));
 }
 
-Tensor Draft::draft_block(MtpState& value, const Tensor& anchor, int requested) const {
+StepSequence<Tensor> Draft::draft_block(MtpState& value, const Tensor& anchor, int requested, bool graph) const {
     auto& s = state<State>(value);
     const auto& c = config;
     if (!s.pos || requested < 1 || requested > maximum_draft_depth() || !anchor.defined() ||
@@ -224,10 +241,63 @@ Tensor Draft::draft_block(MtpState& value, const Tensor& anchor, int requested) 
         throw std::invalid_argument("DFlash2 draft depth or anchor differs");
     const auto stream = cuda::current_stream(device.index);
     const std::int64_t shape[] = {1, c.block};
-    auto ids = ops::full(shape, c.mask, device).dense();
-    auto positions = ops::arange(s.pos, s.pos + c.block, device).dense();
-    ids.narrow(1, 0, 1).copy_(anchor.dense().reshape({1, 1}));
-    auto hidden = block_hidden(*this, s, ids, positions, stream);
+    const auto context = cuda::default_context(device.index);
+    const auto* setting = cuda::env_lookup("TYLOINFER_DFLASH2_GRAPH");
+    DenseTensor hidden;
+    if (graph && context->supports_async_allocations() && (!setting || setting[0] != '0')) {
+        std::vector<Tensor> rings;
+        rings.reserve(s.keys.size() + s.values.size());
+        rings.insert(rings.end(), s.keys.begin(), s.keys.end());
+        rings.insert(rings.end(), s.values.begin(), s.values.end());
+        if (s.graph && (s.graph->stream.stream() != stream.stream() || !s.graph->window.matches(rings)))
+            s.release_graphs();
+        const bool capture = !s.graph;
+        if (capture) {
+            co_yield GraphPhase::ready;
+            std::vector<std::pair<Device, std::size_t>> growth{{device, 2 * std::size_t(c.block) * sizeof(std::int64_t)}};
+            co_yield GraphRequest{GraphPhase::admit, nullptr, std::move(growth)};
+            auto cell = std::make_shared<DraftGraph>(stream, context);
+            cell->ids = cell->window.buffer({1, c.block}, anchor.options());
+            cell->positions = cell->window.buffer({c.block}, anchor.options());
+            ops::fill(cell->ids, c.mask);
+            s.graph = std::move(cell);
+        }
+        auto& cell = *s.graph;
+        record(stream, {anchor.dense()});
+        raw::prepare_draft_inputs(anchor.dense().data_ptr<std::int64_t>(), cell.ids.dense().data_ptr<std::int64_t>(),
+            cell.positions.dense().data_ptr<std::int64_t>(), c.block, s.pos, stream.stream());
+        if (capture) {
+            auto recording = cell.window.begin_capture();
+            while (recording->next()) {
+                std::exception_ptr failure;
+                bool warm = false;
+                try {
+                    cell.hidden = block_hidden(*this, s, cell.ids.dense(), cell.positions.dense(), stream);
+                    warm = recording->finish();
+                } catch (...) { failure = std::current_exception(); }
+                if (failure) {
+                    if (!recording->retry(failure)) std::rethrow_exception(failure);
+                    warm = true;
+                }
+                if (warm) {
+                    cell.hidden = {};
+                    recording->release_warm_outputs();
+                    recording->pause();
+                    co_yield GraphRequest{GraphPhase::admit, nullptr, recording->growth()};
+                    recording->resume();
+                }
+            }
+            recording->complete();
+            cell.window.retain(rings);
+        }
+        if (!cell.window.enqueue_if_device_only()) cell.window.run();
+        hidden = cell.hidden;
+    } else {
+        auto ids = ops::full(shape, c.mask, device).dense();
+        auto positions = ops::arange(s.pos, s.pos + c.block, device).dense();
+        ids.narrow(1, 0, 1).copy_(anchor.dense().reshape({1, 1}));
+        hidden = block_hidden(*this, s, ids, positions, stream);
+    }
     auto norm = normalize(hidden.narrow(1, 1, requested), final_norm, c.epsilon, stream);
     auto logits = ops::contiguous(ops::cast(target.logits(norm.values, true, LogitPrecision::input), ScalarType::float32)).dense();
     if (logits.numel() != std::int64_t(requested) * c.vocabulary || logits.device() != device)
@@ -256,7 +326,7 @@ Tensor Draft::draft_block(MtpState& value, const Tensor& anchor, int requested) 
     s.selector = std::move(selector);
     s.successor_rows = std::move(successor_rows);
     s.row = 0;
-    return logits;
+    co_yield Tensor{std::move(logits)};
 }
 
 Tensor Draft::draft_next(MtpState& value, const Tensor& logits, const Tensor& previous) const {
@@ -288,7 +358,9 @@ StepSequence<MtpDraft> Draft::greedy_draft(const CausalModel& model, MtpRow inpu
     if (&model != &target || !input.state || !input.state->belongs_to(*this) ||
         input.ids.dim() != 2 || input.ids.size(0) != 1 || input.ids.size(1) != 1) co_return;
     auto& request = state<State>(*input.state);
-    draft_block(request, input.ids, depth);
+    auto block = draft_block(request, input.ids, depth, true);
+    while (auto step = block.next())
+        if (step.graph) co_yield std::move(*step.graph);
     auto tokens = ops::empty({1, depth}, TensorOptions().device(device).dtype(kInt64));
     const auto stream = cuda::current_stream(device.index);
     const bool staged = successor.is_cpu();

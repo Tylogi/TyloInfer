@@ -550,9 +550,9 @@ struct DeepseekV41Dspark final : tyloi::models::Mtp {
             });
     }
 
-    ::tyloi::Tensor draft_block(tyloi::models::MtpState& value,
+    ::tyloi::StepSequence<::tyloi::Tensor> draft_block(tyloi::models::MtpState& value,
                                 const tyloi::Tensor& input_ids,
-                                int requested) const override {
+                                int requested, bool) const override {
         const auto& state = this->state<DsState>(value);
         auto anchor_ids = input_ids.dense();
         const auto physical_width =
@@ -574,7 +574,7 @@ struct DeepseekV41Dspark final : tyloi::models::Mtp {
                             1)
                             .contiguous();
         }
-        return ::tyloi::Tensor{tyloi::models::deepseek_v41::dspark_draft(
+        co_yield ::tyloi::Tensor{tyloi::models::deepseek_v41::dspark_draft(
             physical_width, requested, stages.size(),
             [&](int64_t) {
                 auto local_ids = tyloi::ops::copy(draft_ids, ::tyloi::Device(::tyloi::kCUDA, primary));

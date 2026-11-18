@@ -76,6 +76,7 @@ void State::release_graphs() {
     if (graph_registry) graph_registry->release();
     graph_registry.reset();
     for (auto& layer : layers) layer->retain_graph_storage = false;
+    if (predictor) predictor->release_graphs();
 }
 
 void State::publish_restore(State& candidate) noexcept {

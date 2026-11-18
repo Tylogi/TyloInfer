@@ -129,6 +129,7 @@ public:
     }
     Tensor target_hidden() const override { return hidden_; }
     void publish() noexcept override {
+        state_.release_graphs();
         state_.keys.swap(keys_);
         state_.values.swap(values_);
         state_.pos = saved_.cache_pos;
@@ -186,6 +187,7 @@ void Draft::reset(MtpState& value, std::int64_t batch) const {
     if (batch != 1) throw std::invalid_argument("DFlash2 requires a single sequence");
     (void)ring_bytes(*this);
     ops::DeviceScope guard(device);
+    current.release_graphs();
     current.keys.resize(config.layers);
     current.values.resize(config.layers);
     for (auto* rings : {&current.keys, &current.values}) for (auto& ring : *rings) {

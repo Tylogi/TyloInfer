@@ -25,17 +25,20 @@ struct Layer {
 };
 
 class Draft;
+struct DraftGraph;
 
 struct State final : MtpState {
     explicit State(const Draft& model);
     std::int64_t position() const noexcept override { return pos; }
     std::vector<Tensor> storage() const override;
     std::unique_ptr<Restore> prepare_restore(const MtpSessionState&) override;
+    void release_graphs() noexcept override { graph.reset(); }
 
     const Draft& model;
     std::vector<DenseTensor> keys, values;
     DenseTensor compact, selector;
     DenseTensor successor_rows;
+    std::shared_ptr<DraftGraph> graph;
     std::int64_t pos = 0;
     int row = 0;
 };
@@ -65,7 +68,7 @@ public:
     MtpSessionState capture_session_state(const MtpState&, std::int64_t, const Tensor&) const override;
     void seed_target_context(MtpState&, const Tensor&, std::int64_t) const override;
     void append_target_context(MtpState&, const Tensor&, std::int64_t) const override;
-    Tensor draft_block(MtpState&, const Tensor&, int) const override;
+    StepSequence<Tensor> draft_block(MtpState&, const Tensor&, int, bool graph) const override;
     Tensor draft_next(MtpState&, const Tensor&, const Tensor&) const override;
     StepSequence<MtpDraft> greedy_draft(const CausalModel&, MtpRow, int, const ForwardOptions&) const override;
 

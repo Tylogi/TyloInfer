@@ -24,6 +24,7 @@
 #include <memory>
 #include <optional>
 #include <stdexcept>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -258,37 +259,39 @@ struct MtpOps {
         else projected_predictor_hidden = {};
         return result;
     }
-    models::MtpDraft greedy_draft(const Tensor& hidden, const Tensor& ids, int depth) {
-        if (!graph_enabled || (prepared && prepared->transformed()) ||
-            !draft_target_graph(weights.decode() == weights::Cache::Decode::routed)) return {};
+    template<class T>
+    std::optional<T> drive_draft(StepSequence<T> job, int depth, bool& initialized) {
         auto scope = ops::dense_scope(&predictor_execution, device);
-        auto predictor_options = options;
-        predictor_options.serial_experts = false;
         Capture capture(predictor_execution, weights, budget, device);
-        auto job = mtp.greedy_draft(model, {&predictor, hidden, ids, {}}, depth, predictor_options);
-        models::MtpDraft result;
+        std::optional<T> result;
+        Tensor output;
         bool admitted = false;
         try {
             while (auto step = job.next()) {
-                if (result.ids || step.layer || step.workspace || bool(step.graph) == bool(step.value))
+                if (result || step.layer || step.workspace || bool(step.graph) == bool(step.value))
                     throw std::logic_error("invalid MTP draft graph event");
                 if (step.graph) {
                     admitted = true;
+                    initialized = initialized || step.graph->phase == GraphPhase::ready;
                     capture.step(std::move(*step.graph));
                 } else {
+                    if constexpr (std::is_same_v<T, models::MtpDraft>) {
+                        output = step.value->ids;
+                        if (!output || output.device() != device || output.scalar_type() != kInt64 ||
+                            output.dim() != 2 || output.size(0) != 1 || output.size(1) != depth + 1)
+                            throw std::logic_error("incomplete MTP verification window");
+                    } else {
+                        output = *step.value;
+                        if (!output || output.dim() != 3 || output.size(0) != 1 || output.size(1) != depth)
+                            throw std::runtime_error("block predictor returned an incomplete draft");
+                    }
                     result = std::move(*step.value);
-                    if (!result.ids || result.ids.device() != device || result.ids.scalar_type() != kInt64 ||
-                        result.ids.dim() != 2 || result.ids.size(0) != 1 || result.ids.size(1) != depth + 1)
-                        throw std::logic_error("incomplete MTP verification window");
                 }
             }
-            if (admitted && !result.ids) throw std::logic_error("MTP draft graph ended without a result");
-            if (result.ids) {
+            if (admitted && !result) throw std::logic_error("MTP draft graph ended without a result");
+            if (result) {
                 predictor_execution.submit(predictor.storage());
-                predictor_execution.submit(std::array<Tensor, 1>{result.ids});
-                projected_predictor_hidden = {};
-                projected_predictor_logits = {};
-                projected_predictor_greedy = -1;
+                predictor_execution.submit(std::array<Tensor, 1>{output});
             }
             capture.finish();
         } catch (...) {
@@ -298,6 +301,28 @@ struct MtpOps {
             throw;
         }
         return result;
+    }
+    models::MtpDraft greedy_draft(const Tensor& hidden, const Tensor& ids, int depth) {
+        if (!graph_enabled || (prepared && prepared->transformed()) ||
+            !draft_target_graph(weights.decode() == weights::Cache::Decode::routed)) return {};
+        auto predictor_options = options;
+        predictor_options.serial_experts = false;
+        bool initialized = false;
+        auto result = drive_draft(mtp.greedy_draft(model, {&predictor, hidden, ids, {}}, depth, predictor_options),
+            depth, initialized);
+        if (!result) return {};
+        projected_predictor_hidden = {};
+        projected_predictor_logits = {};
+        projected_predictor_greedy = -1;
+        result->initialized = result->initialized || initialized;
+        return std::move(*result);
+    }
+    Tensor draft_block(const Tensor& ids, int depth, bool& initialized) {
+        auto result = drive_draft(mtp.draft_block(predictor, ids, depth,
+                graph_enabled && (!prepared || !prepared->transformed())),
+            depth, initialized);
+        if (!result) throw std::logic_error("MTP block draft ended without a result");
+        return std::move(*result);
     }
     int64_t predictor_prefill_chunk_size(int64_t requested) const { return mtp.prefill_chunk_size(requested); }
     bool stream_prompt_history(int64_t tokens) const { return mtp.stream_prompt_history(tokens); }
@@ -877,11 +902,9 @@ Generation speculative_sequence(MtpOps ops, InferenceRequest &request, Inference
                             return result;
                         }
                     }
-                    auto scope = ops::dense_scope(&ops.predictor_execution, ops.device);
-                    auto block_result = mtp.draft_block(predictor,anchor,requested_depth);
+                    auto block_result = ops.draft_block(anchor, requested_depth, maintenance);
                     const auto& block = block_result;
-                    require_execution(ops.size(block, 1) == requested_depth,
-                        "block predictor returned an incomplete draft");
+                    auto scope = ops::dense_scope(&ops.predictor_execution, ops.device);
                     auto previous = std::move(anchor);
                     for (int position = 0; position < requested_depth; ++position) {
                         auto logits = mtp.draft_next(predictor, ops.slice(block, 1, position, 1), previous);

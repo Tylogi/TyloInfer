@@ -142,10 +142,11 @@ struct Mtp {
         throw std::runtime_error(
             "this CUDA MTP predictor has no target-context adapter");
     }
-    virtual Tensor draft_block(
+    virtual StepSequence<Tensor> draft_block(
         MtpState&,
         const Tensor&,
-        int) const {
+        int,
+        bool) const {
         throw std::runtime_error(
             "this CUDA MTP predictor has no block-draft adapter");
     }

@@ -1,9 +1,11 @@
 #include "model.h"
 #include "weight_quant.h"
 
+#include "components/error.h"
 #include "engine/backends/cuda/kernels/attention/dflash2/attention.h"
 #include "engine/backends/cuda/native/env.h"
 #include "engine/backends/cuda/native/resident_allocations.h"
+#include "engine/weights/rows/mapped_embedding.h"
 #include "engine/weights/source/safetensors.h"
 #include "nlohmann/json.hpp"
 
@@ -81,8 +83,8 @@ struct Loader {
         return result;
     }
 
-    DenseTensor dense(const std::string& name, const std::vector<std::int64_t>& shape, bool codebook = false) const {
-        return host(name, shape).to(codebook ? kBFloat16 : kFloat32).to(device);
+    DenseTensor dense(const std::string& name, const std::vector<std::int64_t>& shape) const {
+        return host(name, shape).to(kFloat32).to(device);
     }
 
     Matrix linear(const std::string& name, std::int64_t rows, std::int64_t columns) const {
@@ -126,12 +128,37 @@ std::unique_ptr<Draft> load(const CausalModel& target, const std::filesystem::pa
     model->selector_projection = loader.linear("candidate_selector.hidden_projection", config.rank, config.hidden);
     model->hidden_norm = loader.dense("hidden_norm.weight", {config.hidden});
     model->final_norm = loader.dense("norm.weight", {config.hidden});
-    model->predecessor = loader.dense("candidate_selector.predecessor_codebook", {config.vocabulary, config.rank}, true);
     const auto* stage = cuda::env_lookup("TYLOINFER_DFLASH2_STAGE_SUCCESSOR");
-    if (stage && stage[0] == '1')
+    const bool staged = stage && stage[0] == '1';
+    const auto* ram = cuda::env_lookup("TYLOINFER_DFLASH2_CODEBOOK_RAM");
+    const bool requested_ram = !staged && ram && ram[0] == '1';
+    int capable = 0;
+    if (requested_ram) TYLOINFER_CUDA_CHECK(cudaDeviceGetAttribute(&capable, cudaDevAttrCanMapHostMemory, device.index));
+    std::size_t mapped_bytes = 0;
+    const auto codebook = [&](const std::string& name) {
+        auto values = loader.host(name, {config.vocabulary, config.rank}).to(kBFloat16);
+        if (capable) {
+            try {
+                auto mapped = map_embedding_storage(values, device.index);
+                mapped_bytes += mapped.nbytes();
+                return mapped;
+            } catch (const MfqResourceExhausted&) {
+                // Optional pinned storage can fall back to the device.
+            }
+        }
+        return values.to(device);
+    };
+    model->predecessor = codebook("candidate_selector.predecessor_codebook");
+    if (staged)
         model->successor = loader.host("candidate_selector.successor_codebook", {config.vocabulary, config.rank}).to(kBFloat16);
     else
-        model->successor = loader.dense("candidate_selector.successor_codebook", {config.vocabulary, config.rank}, true);
+        model->successor = codebook("candidate_selector.successor_codebook");
+    if (const auto* trace = cuda::env_lookup("TYLOINFER_TRACE_KERNEL_DISPATCH"); trace && trace[0] == '1' && (staged || requested_ram)) {
+        const auto ram_bytes = staged ? model->successor.nbytes() : mapped_bytes;
+        std::cerr << "runtime_dflash2_codebooks actual_match=1 stage=" << (staged ? "successor_rows" : "prepared")
+                  << " ram_bytes=" << ram_bytes << " vram_bytes="
+                  << model->predecessor.nbytes() + model->successor.nbytes() - ram_bytes << '\n';
+    }
     if (loader.source.find("mask_embedding")) model->mask_embedding = loader.dense("mask_embedding", {config.hidden});
     model->layers.reserve(config.layers);
     for (int index = 0; index < config.layers; ++index) {
