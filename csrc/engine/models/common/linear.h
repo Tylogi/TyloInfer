@@ -12,6 +12,7 @@ struct LinearInputs {
     Tensor qk, value, qkv, gate, beta;
     std::int64_t batch = 0, tokens = 0;
     bool split = false;
+    Tensor updates;
 };
 
 struct LinearView {
@@ -32,6 +33,7 @@ struct LinearAttention {
 
     std::array<Tensor, 2> forward(const Tensor& input, LinearView state,
                                   LinearInputs* captured = nullptr) const;
+    bool verify_window(std::int64_t batch, std::int64_t tokens) const;
     void replay(LinearView state, const LinearInputs& inputs, std::int64_t retained_tokens) const;
 };
 

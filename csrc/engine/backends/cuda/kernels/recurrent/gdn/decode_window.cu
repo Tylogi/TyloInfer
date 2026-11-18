@@ -1,4 +1,5 @@
 #include "engine/backends/cuda/native/env.h"
+#include "engine/backends/cuda/native/resident_allocations.h"
 #include "../../../ops/attention/gdn/launch.h"
 #include "update.cuh"
 #include "../../../ops/attention/gdn/replay.h"
@@ -454,8 +455,11 @@ static std::vector<::tyloi::DenseTensor> gdn_window_impl(const ::tyloi::DenseTen
  auto next_conv=read_only && !out_of_place?::tyloi::DenseTensor{}: ::tyloi::cuda::empty_like(conv);GdnWindowSnapshots snapshots;snapshots.confirmed=confirmed;
  auto next_state=out_of_place?::tyloi::cuda::empty_like(state):state;
  if(out_of_place)snapshots.final_state=next_state.data_ptr<float>();
- auto updates=mode==GdnWindowMode::RecordUpdates || out_of_place?
-  ::tyloi::cuda::empty({tokens,nv,257},state.options()): ::tyloi::DenseTensor{};
+ ::tyloi::DenseTensor updates;
+ if(mode==GdnWindowMode::RecordUpdates || out_of_place) {
+  const tyloi::cuda::ResidentAllocationScope resident;
+  updates=::tyloi::cuda::empty({tokens,nv,257},state.options());
+ }
  if(updates.defined())snapshots.updates=updates.data_ptr<float>();
  if(quantize_output && !deferred)snapshots.quantized=static_cast<block_q8_1*>(output.data_ptr());
  snapshots.position_major=position_major;

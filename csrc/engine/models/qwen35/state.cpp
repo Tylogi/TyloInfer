@@ -35,7 +35,7 @@ void require_state(bool condition, const char* message) {
 bool projected(const ::tyloi::models::LinearInputs& value) {
     return value.qk.defined() || value.value.defined() || value.qkv.defined() ||
            value.gate.defined() || value.beta.defined() || value.batch != 0 ||
-           value.tokens != 0 || value.split;
+           value.tokens != 0 || value.split || value.updates.defined();
 }
 
 bool on_layer_device(const ::tyloi::Tensor& tensor, const Layout& layer) {
@@ -272,11 +272,17 @@ std::vector<std::pair<tyloi::Device, std::size_t>> State::growth_for(
         return a + b;
     };
     std::vector<std::pair<tyloi::Device, std::size_t>> result;
-    std::vector<std::pair<tyloi::Device, std::size_t>> gathered;
+    std::vector<std::pair<tyloi::Device, std::size_t>> scratch;
     const auto add = [&](tyloi::Device device, std::size_t bytes) {
         auto it = std::find_if(result.begin(), result.end(), [device](const auto& v) { return v.first == device; });
         if (it == result.end()) result.emplace_back(device, bytes);
         else it->second = sum(it->second, bytes);
+    };
+    const auto need_scratch = [&](tyloi::Device device, std::size_t bytes) {
+        auto found = std::find_if(scratch.begin(), scratch.end(),
+            [device](const auto& value) { return value.first == device; });
+        if (found == scratch.end()) scratch.emplace_back(device, bytes);
+        else found->second = std::max(found->second, bytes);
     };
     if (paged_kv_) {
         for (const auto& [device, bytes] : paged_kv_->ensure_growth(
@@ -292,9 +298,7 @@ std::vector<std::pair<tyloi::Device, std::size_t>> State::growth_for(
                 if (cache_pos>0 && tokens>1 && !full->quantization.enabled()) {
                     const auto bytes=tyloi::state::kv_bytes(batch,full->kv_heads,cache_pos+tokens,
                         full->head_dim,false,full->dtype,full->quantization);
-                    auto found=std::find_if(gathered.begin(),gathered.end(),[device](const auto& value) { return value.first==device; });
-                    if (found==gathered.end()) gathered.emplace_back(device,bytes);
-                    else found->second=std::max(found->second,bytes);
+                    need_scratch(device, bytes);
                 }
                 continue;
             }
@@ -331,12 +335,21 @@ std::vector<std::pair<tyloi::Device, std::size_t>> State::growth_for(
             if (input.confirmed > 0) {
                 add(device, state_bytes);
                 const auto rows = multiply(batch, tokens);
-                const auto projection = sum(sum(width, value), multiply(4, linear.value_heads));
+                auto projection = sum(sum(width, value), multiply(4, linear.value_heads));
+                const auto& attention = std::get<Linear>(owner_->layers.at(i).weights).attention;
+                if (device.is_cuda() && attention.verify_window(batch, tokens)) {
+                    // QKV plus normalized key, rank-one delta and decay per row.
+                    const auto records = multiply(sum(multiply(2, linear.value_dim), 1), linear.value_heads);
+                    projection = std::max(projection, sum(width, records));
+                    // The window writes final state and stages its prepared inputs and readout.
+                    const auto planes = multiply(sum(multiply(5, linear.value_dim), 2), linear.value_heads);
+                    need_scratch(device, sum(state_bytes, multiply(multiply(rows, planes), sizeof(float))));
+                }
                 add(device, multiply(multiply(rows, projection), sizeof(float)));
             }
         }
     }
-    for (const auto& [device,bytes]:gathered) add(device,bytes);
+    for (const auto& [device,bytes]:scratch) add(device,bytes);
     return result;
 }
 

@@ -215,6 +215,9 @@ Tensor low_rank(const Tensor& input, const Tensor& output_a, const Tensor& outpu
 Tensor linear(const Tensor& input, const ::tyloi::Tensor& weight, const Tensor& bias = {});
 Tensor affine(const Tensor& input, const ::tyloi::Tensor& weight, const Tensor& bias = {});
 std::vector<Tensor> project_group(const Tensor& input, std::span<const Tensor> group);
+// Empty when the backend cannot share RMS-normalized projection input.
+std::vector<Tensor> project_group_rms(const Tensor& input, const Tensor& norm,
+    std::span<const Tensor> group, double eps, double offset, Tensor& normalized);
 // Capability depends on prepared weights and the current execution policy.
 bool grouped(std::span<const Tensor> weights);
 // Ordered projections; combine the first prefix outputs into one. The backend
@@ -229,11 +232,14 @@ std::array<Tensor, 3> linear_conv(Tensor& convolution, const Tensor& qkv_or_qk, 
     std::int64_t dk, std::int64_t dv, double eps, bool replay = false);
 Tensor linear_recur(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& gate,
     const Tensor& beta, Tensor& recurrent, bool transposed, bool tiled);
-std::optional<Tensor> linear_decode_q8(const Tensor& qkv, const Tensor& gate,
+struct LinearDecode { Tensor output, updates; };
+std::optional<LinearDecode> linear_decode(const Tensor& qkv, const Tensor& gate,
     const Tensor& alpha, const Tensor& beta, Tensor& convolution, Tensor& recurrent,
     const Tensor& conv_weight, const Tensor& dt_bias, const Tensor& a_log,
     const Tensor& norm, const Tensor& out_weight, std::int64_t key_heads,
-    std::int64_t value_heads, std::int64_t width, double eps, bool transposed, bool tiled);
+    std::int64_t value_heads, std::int64_t width, double eps, bool transposed, bool tiled, bool verify);
+void linear_replay(Tensor& convolution, Tensor& recurrent, const Tensor& qkv,
+    const Tensor& updates, std::int64_t retained_tokens, bool transposed);
 Tensor silu_project(const Tensor& input, const Tensor& gate, const Tensor& weight);
 std::optional<std::vector<Tensor>> linear_shared(const Tensor& input, std::span<const Tensor> qkv,
     const Tensor& z, std::span<const Tensor> ab);

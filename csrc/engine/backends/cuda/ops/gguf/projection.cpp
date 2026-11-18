@@ -499,6 +499,42 @@ ProjectionInput prepare_input(const std::vector<GgufTensor>& weights,::tyloi::De
     return {std::move(activation),std::move(position_major),keep_original?std::move(original): ::tyloi::DenseTensor{},input.sizes().vec(),tokens,dtype,aligned_m1};
 }
 
+ProjectionInput prepare_rms_input(const std::vector<GgufTensor>& weights, const DenseTensor& input,
+        const DenseTensor& norm, double eps, double offset, DenseTensor& normalized) {
+    normalized={};
+    if(weights.empty() || !input.defined() || !input.is_cuda() || !input.is_contiguous() || input.dim()<1 ||
+        (input.scalar_type()!=kFloat16 && input.scalar_type()!=kFloat32) ||
+        !norm.defined() || !norm.is_cuda() || norm.device()!=input.device() || !norm.is_contiguous() ||
+        norm.scalar_type()!=kFloat32 || norm.dim()<1 || !std::isfinite(eps) || eps<=0 ||
+        !std::isfinite(float(eps)) || float(eps)<=0 || !std::isfinite(float(offset)))return {};
+    const auto width=input.size(-1);
+    if(width<1 || width>INT_MAX || width%32 || norm.numel()!=width || norm.size(-1)!=width)return {};
+    const auto rows=input.numel()/width;
+    if(rows<1 || rows>32)return {};
+    for(const auto& weight:weights)
+        if(original_input(weight) || weight.neuron_len!=width || !weight.packed.is_cuda() ||
+            weight.packed.device()!=input.device())return {};
+    const bool aligned=m1_aligned(weights,rows);
+    const bool interleaved=std::any_of(weights.begin(),weights.end(),[&](const auto& w){return position_major_q8(w,rows);});
+    const bool native=std::any_of(weights.begin(),weights.end(),[&](const auto& w){return !position_major_q8(w,rows);});
+    const MfqCudaGuard guard(input.get_device());
+    const auto handle=mfq_get_current_cuda_stream(input.get_device());
+    auto value=::tyloi::cuda::empty(input.sizes(),input.options().dtype(kFloat32));
+    auto packet=native?::tyloi::cuda::empty({std::int64_t(rows*q8_row_bytes(width))},input.options().dtype(kUInt8)):DenseTensor{};
+    auto position=interleaved?::tyloi::cuda::empty({std::int64_t(interleaved_activation_bytes(rows,width))},input.options().dtype(kUInt8)):DenseTensor{};
+    for(const auto& tensor:{input,norm,value,packet,position})if(tensor.defined())mfq_cuda_record_stream(tensor,handle);
+    if(interleaved)quantize_rms_input_interleaved(input.data_ptr(),input.scalar_type()==kFloat16,
+        norm.data_ptr<float>(),rows,width,float(eps),float(offset),value.data_ptr<float>(),position.data_ptr(),
+        packet.defined()?packet.data_ptr():nullptr,handle.stream());
+    else {
+        const auto quantize=aligned?quantize_rms_input_m1_aligned:quantize_rms_input;
+        quantize(input.data_ptr(),input.scalar_type()==kFloat16,norm.data_ptr<float>(),rows,width,
+            float(eps),float(offset),value.data_ptr<float>(),packet.data_ptr(),handle.stream());
+    }
+    normalized=std::move(value);
+    return {std::move(packet),std::move(position),{},input.sizes().vec(),rows,kFloat32,aligned};
+}
+
 ::tyloi::DenseTensor project_prepared(const ProjectionInput& prepared, const GgufTensor& weight) {
     TYLOINFER_RUNTIME_CHECK(!prepared.shape.empty(),"GGUF projection input was not prepared");
     TYLOINFER_RUNTIME_CHECK(!prepared.aligned_m1 || prepared.tokens==1,"Aligned GGUF projection requires one token");

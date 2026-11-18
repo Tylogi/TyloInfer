@@ -21,6 +21,7 @@
 #include "engine/backends/cuda/ops/ffn/residual.h"
 #include "engine/backends/cuda/ops/projection/projection.h"
 #include "engine/backends/cuda/ops/gguf/projection.h"
+#include "engine/backends/cuda/ops/gguf/prefill_fusion.h"
 #include "engine/backends/cuda/ops/tensor.h"
 #include "engine/backends/cuda/native/tensor/tensor.h"
 #include "engine/backends/cuda/ops/attention/attention.h"
@@ -32,6 +33,7 @@
 #include "engine/backends/cuda/native/env.h"
 #include "engine/backends/cuda/ops/sampling/launch.h"
 #include "engine/backends/cuda/ops/attention/gdn/launch.h"
+#include "engine/backends/cuda/ops/attention/gdn/replay.h"
 #include "engine/backends/cuda/ops/norm/launch.h"
 #include <algorithm>
 #include <cmath>
@@ -815,27 +817,37 @@ Tensor linear_recur(const Tensor& query, const Tensor& key, const Tensor& value,
     return owner(cuda::stack(outputs, 2));
 }
 
-std::optional<Tensor> linear_decode_q8(const Tensor& qkv, const Tensor& gate,
+std::optional<LinearDecode> linear_decode(const Tensor& qkv, const Tensor& gate,
         const Tensor& alpha, const Tensor& beta, Tensor& convolution, Tensor& recurrent,
         const Tensor& conv_weight, const Tensor& dt_bias, const Tensor& a_log,
         const Tensor& norm, const Tensor& out_weight, std::int64_t nk,
-        std::int64_t nv, std::int64_t width, double eps, bool transposed, bool tiled) {
+        std::int64_t nv, std::int64_t width, double eps, bool transposed, bool tiled, bool verify) {
+    const std::array<const Tensor*, 10> tensors{
+        &qkv, &gate, &alpha, &beta, &convolution, &recurrent, &conv_weight, &dt_bias, &a_log, &norm};
+    for (const auto* tensor : tensors)
+        if (!tensor->defined() || !tensor->representation<DenseTensor>() || tensor->is_encoded())
+            return std::nullopt;
     const auto* out = out_weight.representation<GgufTensor>();
     const auto& x = dense(qkv);
-    if (!x.is_cuda() || !out || cuda::gguf::original_input(*out) ||
+    if (!x.is_cuda() || !out_weight.defined() || out_weight.representation<ShardedTensor>() ||
         cuda::Executor::current().mmq().mode != KlMmqMode::Default ||
         (width != 32 && width != 64 && width != 128) || nk <= 0 || nv <= 0 || nv % nk ||
-        !std::isfinite(eps) || eps <= 0 || x.dim() != 3 || x.size(1) != 1 || x.size(0) <= 0 ||
-        out->neuron_len != nv * width || out->packed.device() != x.device()) return std::nullopt;
+        nk > (std::numeric_limits<int>::max() / width - nv) / 2 ||
+        !std::isfinite(eps) || eps <= 0 || x.dim() != 3 || x.size(0) <= 0 ||
+        (verify ? x.size(0) != 1 || x.size(1) < 2 || x.size(1) > 8 || width != 128
+                : x.size(1) != 1) ||
+        out_weight.dim() != 2 || out_weight.size(1) != nv * width ||
+        out_weight.device() != x.device()) return std::nullopt;
     const auto& z = dense(gate); const auto& a = dense(alpha); const auto& b = dense(beta);
     auto& conv = dense(convolution); auto& state = dense(recurrent);
     auto weight = dense(conv_weight);
     const auto& dt = dense(dt_bias); const auto& log = dense(a_log); const auto& scale = dense(norm);
-    const auto batch = x.size(0), channels = (2 * nk + nv) * width;
+    const auto batch = x.size(0), tokens = x.size(1), channels = (2 * nk + nv) * width;
     const auto real = [&](const DenseTensor& t) {
         return t.is_cuda() && t.device() == x.device() && t.is_contiguous() && t.scalar_type() == kFloat32;
     };
-    if (x.size(2) != channels || x.stride(2) != 1 || x.stride(0) < channels ||
+    if (x.size(2) != channels || x.stride(2) != 1 ||
+        (verify ? x.stride(1) < channels : x.stride(0) < channels) ||
         (x.scalar_type() != kFloat16 && x.scalar_type() != kFloat32) ||
         !real(conv) || !real(state) || !real(weight) || !real(dt) || !real(log) || !real(scale) ||
         conv.dim() != 3 || conv.size(1) < 1 ||
@@ -843,21 +855,89 @@ std::optional<Tensor> linear_decode_q8(const Tensor& qkv, const Tensor& gate,
         state.sizes().vec() != std::vector<std::int64_t>({batch, nv, width, width}) ||
         dt.numel() != nv || log.numel() != nv || scale.numel() != width) return std::nullopt;
     const auto taps = conv.size(1) + 1;
+    if ((verify && (taps != 4 || nv > 65535)) || taps > std::numeric_limits<int>::max() ||
+        batch > std::numeric_limits<int>::max() / nv / 4) return std::nullopt;
     if (weight.dim() == 2 && weight.size(0) == channels && weight.size(1) == taps)
         weight = weight.reshape({channels, 1, taps});
     if (weight.sizes().vec() != std::vector<std::int64_t>({channels, 1, taps}) &&
         weight.sizes().vec() != std::vector<std::int64_t>({taps, channels})) return std::nullopt;
     if (!z.is_cuda() || !a.is_cuda() || !b.is_cuda() || z.device() != x.device() ||
         a.device() != x.device() || b.device() != x.device() ||
-        z.sizes().vec() != std::vector<std::int64_t>({batch, 1, nv * width}) ||
-        a.sizes().vec() != std::vector<std::int64_t>({batch, 1, nv}) || b.sizes() != a.sizes() ||
-        z.stride(2) != 1 || z.stride(0) < nv * width || z.scalar_type() != a.scalar_type() ||
+        z.sizes().vec() != std::vector<std::int64_t>({batch, tokens, nv * width}) ||
+        a.sizes().vec() != std::vector<std::int64_t>({batch, tokens, nv}) || b.sizes() != a.sizes() ||
+        z.stride(2) != 1 || (verify ? z.stride(1) <= 0 : z.stride(0) < nv * width) ||
+        a.stride(1) <= 0 || a.stride(2) <= 0 || b.stride(1) <= 0 || b.stride(2) <= 0 ||
+        z.scalar_type() != a.scalar_type() ||
         a.scalar_type() != b.scalar_type() || (a.scalar_type() != kFloat16 && a.scalar_type() != kFloat32))
         return std::nullopt;
-    auto result = gdn_decode_core_cuda(x, z, a, b, conv, state, weight, dt, log, scale,
-        nk, nv, width, eps, eps, true, false, transposed, {}, true, {}, tiled, true);
+    const bool quantized = out && !cuda::gguf::original_input(*out);
+    const bool position_major = verify && quantized && cuda::gguf::position_major_q8(*out, tokens);
+    auto result = verify
+        ? gdn_verify_window_cuda(x, z, a, b, conv, state, weight, dt, log, scale,
+              nk, nv, eps, eps, true, false, transposed, tiled, quantized, position_major)
+        : gdn_decode_core_cuda(x, z, a, b, conv, state, weight, dt, log, scale,
+              nk, nv, width, eps, eps, true, false, transposed, {}, true, {}, tiled, quantized);
+    Tensor output = quantized
+        ? owner(cuda::gguf::project_q8(*out, result[0], batch * tokens, kFloat32, position_major))
+        : project(owner(result[0]), out_weight);
     if (result[1].data_ptr() != conv.data_ptr()) conv.copy_(result[1]);
-    return owner(cuda::gguf::project_q8(*out, result[0], batch, kFloat32, false));
+    if (verify) state.copy_(result[2]);
+    return LinearDecode{std::move(output), verify ? owner(std::move(result[3])) : Tensor{}};
+}
+
+void linear_replay(Tensor& convolution, Tensor& recurrent, const Tensor& qkv,
+                   const Tensor& updates, std::int64_t retained, bool transposed) {
+    auto& conv = dense(convolution);
+    auto& state = dense(recurrent);
+    if (!try_gdn_replay_updates_cuda(dense(qkv), dense(updates), conv, state,
+                                     conv, state, retained, transposed))
+        throw std::invalid_argument("invalid linear-attention recorded replay");
+}
+
+std::vector<Tensor> project_group_rms(const Tensor& input, const Tensor& norm,
+        std::span<const Tensor> group, double eps, double offset, Tensor& normalized) {
+    if (!input.defined() || !norm.defined() || !input.is_cuda() || input.dim() < 1 ||
+        !input.representation<DenseTensor>() || !norm.representation<DenseTensor>() ||
+        input.is_encoded() || norm.is_encoded() || input.size(-1) <= 0 || group.empty() ||
+        cuda::Executor::current().mmq().mode != KlMmqMode::Default)
+        return {};
+    const auto& x = dense(input);
+    const auto& scale = dense(norm);
+    const auto width = x.size(-1);
+    const auto rows = x.numel() / width;
+    if (!x.is_contiguous() || scale.dim() < 1 || scale.size(-1) != width ||
+        !std::isfinite(float(eps)) || float(eps) <= 0 || !std::isfinite(float(offset)) ||
+        (rows > 32 && rows < 512)) return {};
+    std::vector<GgufTensor> weights;
+    weights.reserve(group.size());
+    for (const auto& weight : group) {
+        const auto* gguf = weight.representation<GgufTensor>();
+        if (!gguf || gguf->neuron_len != width || gguf->packed.device() != x.device() ||
+            cuda::gguf::original_input(*gguf))
+            return {};
+        weights.push_back(*gguf);
+    }
+    DenseTensor value;
+    if (rows <= 32) {
+        auto prepared = cuda::gguf::prepare_rms_input(weights, x, scale, eps, offset, value);
+        if (prepared.shape.empty()) return {};
+        auto result = owners(cuda::gguf::project_input(prepared, weights));
+        normalized = owner(std::move(value));
+        return result;
+    }
+    // Use the same flat view in the prepared scope and grouped projection.
+    // Each matrix can consume the same scaled FP16 input without repacking.
+    auto scope = cuda::gguf::GgufPrefillInputScope::prepare_rms(x.reshape({rows, width}),
+        scale, eps, offset, value);
+    if (!scope) return {};
+    auto outputs = cuda::gguf::project_group(weights, value);
+    auto shape = x.sizes().vec();
+    for (auto& out : outputs) {
+        shape.back() = out.size(-1);
+        out = out.reshape(shape);
+    }
+    normalized = owner(value.reshape(x.sizes()));
+    return owners(std::move(outputs));
 }
 
 std::optional<std::vector<Tensor>> linear_shared(const Tensor& input_tensor, std::span<const Tensor> qkv,

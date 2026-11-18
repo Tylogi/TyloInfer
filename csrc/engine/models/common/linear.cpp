@@ -5,6 +5,12 @@
 
 namespace tyloi::models {
 
+bool LinearAttention::verify_window(std::int64_t batch, std::int64_t tokens) const {
+    return !split_in_proj && !dense_out_proj && (!conv_bias || !conv_bias.numel()) &&
+        batch == 1 && tokens >= 2 && tokens <= 8 &&
+        key_dim == 128 && value_dim == 128 && conv_kernel == 4;
+}
+
 std::array<Tensor, 2> LinearAttention::forward(
     const Tensor& input, LinearView state, LinearInputs* captured) const {
     if (!dense_ab_tail && split_in_proj && !split_dense_zab && !z_proj)
@@ -13,13 +19,14 @@ std::array<Tensor, 2> LinearAttention::forward(
         throw std::runtime_error("linear attention output projection is missing");
     const auto B = input.size(0), T = input.size(1), H = input.size(2);
     const auto nv = value_heads, dv = value_dim, vsz = nv * dv;
-    Tensor xn;
-    {
+    const auto normalize = [&] {
         ops::ProfileRange range("linear.attn_norm", input.device());
-        xn = ops::rms_norm(input, attn_norm, rms_norm_eps, norm_weight_offset);
-    }
+        return ops::rms_norm(input, attn_norm, rms_norm_eps, norm_weight_offset);
+    };
+    Tensor xn;
     Tensor qkv, qk, value, z, alpha, beta;
     if (split_in_proj) {
+        xn = normalize();
         auto shared = !split_dense_zab && ab_is_nint
             ? ops::linear_shared(xn, qkv_proj, z_proj, ab_nint_proj) : std::nullopt;
         if (shared) {
@@ -62,8 +69,10 @@ std::array<Tensor, 2> LinearAttention::forward(
             }
         }
     } else {
-        std::vector<Tensor> parts;
-        {
+        auto parts = ops::project_group_rms(input, attn_norm, in_proj,
+            rms_norm_eps, norm_weight_offset, xn);
+        if (parts.empty()) {
+            xn = normalize();
             ops::ProfileRange range("linear.in_proj", input.device());
             parts = ops::project_group(xn, in_proj);
         }
@@ -78,13 +87,17 @@ std::array<Tensor, 2> LinearAttention::forward(
             alpha = parts[2]; beta = parts[3];
         }
     }
-    if (!captured && !split_in_proj && !dense_out_proj && (!conv_bias || !conv_bias.numel()) &&
-        T == 1 && key_dim == value_dim) {
-        auto output = ops::linear_decode_q8(qkv, ops::reshape(z, {B, 1, vsz}),
-            ops::reshape(alpha, {B, 1, nv}), ops::reshape(beta, {B, 1, nv}),
+    const bool verify = captured && verify_window(B, T);
+    if (verify || (!captured && T == 1 && key_dim == value_dim &&
+        !split_in_proj && !dense_out_proj && (!conv_bias || !conv_bias.numel()))) {
+        auto output = ops::linear_decode(qkv, ops::reshape(z, {B, T, vsz}),
+            ops::reshape(alpha, {B, T, nv}), ops::reshape(beta, {B, T, nv}),
             state.convolution, state.recurrent, conv_weight, dt_bias, a_log, linear_norm,
-            out_proj, key_heads, nv, dv, rms_norm_eps, state.transposed, tiled_v_heads);
-        if (output) return {input, ops::reshape(*output, {B, T, H})};
+            out_proj, key_heads, nv, dv, rms_norm_eps, state.transposed, tiled_v_heads, verify);
+        if (output) {
+            if (captured) *captured = {{}, {}, qkv, {}, {}, B, T, false, output->updates};
+            return {input, ops::reshape(output->output, {B, T, H})};
+        }
     }
     std::array<Tensor, 2> gates;
     {
@@ -92,7 +105,7 @@ std::array<Tensor, 2> LinearAttention::forward(
         gates = ops::linear_gates(ops::reshape(alpha, {B, T, nv}),
                                  ops::reshape(beta, {B, T, nv}), dt_bias, a_log);
     }
-    if (captured) *captured = {qk, value, qkv, gates[0], gates[1], B, T, split_in_proj};
+    if (captured) *captured = {qk, value, qkv, gates[0], gates[1], B, T, split_in_proj, {}};
     auto qkv_values = ops::linear_conv(state.convolution, split_in_proj ? qk : qkv,
         value, conv_weight, conv_bias, key_heads, nv, key_dim, dv, rms_norm_eps);
     Tensor y;
@@ -121,6 +134,11 @@ void LinearAttention::replay(LinearView state, const LinearInputs& inputs,
     if (retained_tokens <= 0 || retained_tokens > inputs.tokens || inputs.batch <= 0 ||
         inputs.split != split_in_proj)
         throw std::runtime_error("invalid linear-attention recurrent replay");
+    if (inputs.updates.defined()) {
+        ops::linear_replay(state.convolution, state.recurrent, inputs.qkv, inputs.updates,
+                           retained_tokens, state.transposed);
+        return;
+    }
     auto first = ops::slice(inputs.split ? inputs.qk : inputs.qkv, 1, 0, retained_tokens);
     auto value = inputs.split ? ops::slice(inputs.value, 1, 0, retained_tokens) : Tensor{};
     auto qkv = ops::linear_conv(state.convolution, first, value, conv_weight, conv_bias,

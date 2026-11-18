@@ -99,12 +99,15 @@ bool try_gdn_replay_updates_cuda(const ::tyloi::DenseTensor& qkv,const ::tyloi::
        overlaps(qkv.data_ptr(),qkv_bytes,next_conv.data_ptr(),next_conv.nbytes()) ||
        overlaps(qkv.data_ptr(),qkv_bytes,next_state.data_ptr(),next_state.nbytes()))return false;
     const MfqCudaGuard guard(qkv.device());
+    const auto stream=mfq_get_current_cuda_stream(qkv.get_device());
+    for(const auto& tensor:{qkv,updates,initial_conv,initial_state,next_conv,next_state})
+        mfq_cuda_record_stream(tensor,stream);
     const bool vectorized=((reinterpret_cast<uintptr_t>(initial_state.data_ptr())|
         reinterpret_cast<uintptr_t>(next_state.data_ptr()))&15u)==0;
     const int64_t items=initial_state.numel()/(vectorized?4:1);
     const int64_t state_blocks=(items+255)/256,total_blocks=state_blocks+(qkv.size(2)+255)/256;
     const auto launch=[&]<bool Transposed,bool Vectorized>() {
-        gdn_replay_updates_kernel<Transposed,Vectorized><<<unsigned(std::min<int64_t>(total_blocks,65535)),256,0,mfq_current_cuda_stream()>>>(
+        gdn_replay_updates_kernel<Transposed,Vectorized><<<unsigned(std::min<int64_t>(total_blocks,65535)),256,0,stream.stream()>>>(
             qkv.data_ptr(),updates.data_ptr<float>(),initial_state.data_ptr<float>(),next_state.data_ptr<float>(),
             initial_conv.data_ptr<float>(),next_conv.data_ptr<float>(),qkv.stride(1),updates.size(1),initial_state.numel(),
             qkv.size(2),state_blocks,total_blocks,int(keep),qkv.scalar_type()==::tyloi::kFloat32);

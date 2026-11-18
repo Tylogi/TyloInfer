@@ -27,6 +27,8 @@ bool position_major_q8(const GgufTensor&, std::int64_t);
 bool m1_aligned(const std::vector<GgufTensor>&, std::int64_t);
 DenseTensor canonical_packed(const GgufTensor&);
 ProjectionInput prepare_input(const std::vector<GgufTensor>&, DenseTensor);
+ProjectionInput prepare_rms_input(const std::vector<GgufTensor>&, const DenseTensor& input,
+    const DenseTensor& norm, double eps, double offset, DenseTensor& normalized);
 std::vector<DenseTensor> project_input(const ProjectionInput&, const std::vector<GgufTensor>&);
 
 } // namespace tyloi::cuda::gguf

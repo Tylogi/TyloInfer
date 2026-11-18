@@ -171,10 +171,17 @@ std::array<Tensor, 2> linear_gates(const Tensor& alpha, const Tensor& beta,
     auto result = metal::gated_delta_gates(array(alpha), array(beta), array(bias), -mx::exp(array(a_log)));
     return {tensor(std::move(result.gate)), tensor(std::move(result.beta))};
 }
-std::optional<Tensor> linear_decode_q8(const Tensor&, const Tensor&, const Tensor&, const Tensor&,
+std::optional<LinearDecode> linear_decode(const Tensor&, const Tensor&, const Tensor&, const Tensor&,
         Tensor&, Tensor&, const Tensor&, const Tensor&, const Tensor&, const Tensor&, const Tensor&,
-        std::int64_t, std::int64_t, std::int64_t, double, bool, bool) {
+        std::int64_t, std::int64_t, std::int64_t, double, bool, bool, bool) {
     return std::nullopt;
+}
+std::vector<Tensor> project_group_rms(const Tensor&, const Tensor&, std::span<const Tensor>,
+        double, double, Tensor&) {
+    return {};
+}
+void linear_replay(Tensor&, Tensor&, const Tensor&, const Tensor&, std::int64_t, bool) {
+    throw std::logic_error("recorded GDN replay requires CUDA");
 }
 std::array<Tensor, 3> linear_conv(Tensor& state, const Tensor& input, const Tensor& value,
         const Tensor& weight, const Tensor& bias, std::int64_t nk, std::int64_t nv,
