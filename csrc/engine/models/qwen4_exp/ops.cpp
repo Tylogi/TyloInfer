@@ -1,6 +1,8 @@
 #include "engine/models/qwen4_exp/ops.h"
 #include "engine/models/qwen4_exp/state.h"
+#include "engine/models/qwen4_exp/taps.h"
 #include "engine/models/common/check.h"
+#include "engine/models/common/mtp.h"
 #include "engine/weights/cache/workspace.h"
 
 #include <algorithm>
@@ -85,6 +87,10 @@ Tensor Model::forward(Input input, models::State& state_value, const ForwardOpti
             if (layers[i]->ple) layers[i]->ple->prefetch_tokens(state->layers[i]->ple, host_ids);
     }
     auto hidden = repeat_hidden(ops::contiguous(ops::copy(embeddings, device)), metadata.hc_mult);
+    const auto* mtp = predictor();
+    const auto targets = device.is_cuda() && input.raw_hidden && mtp
+        ? mtp->target_layers() : std::span<const std::int64_t>{};
+    Taps taps(targets, metadata.hc_mult, device);
     state->begin_forward();
     const auto trace = [&] {
         if (input.trace) input.trace->push_back(ops::clone(ops::cast(ops::copy(hidden, device), kFloat32)));
@@ -99,12 +105,13 @@ Tensor Model::forward(Input input, models::State& state_value, const ForwardOpti
         hidden = ops::contiguous(ops::copy(hidden, layer.device));
         hidden = qwen4_exp::forward(layer, *state->layers[i], std::move(hidden),
             local_ids, local_positions, local_full, confirmed, host_ids);
+        taps.capture(std::int64_t(i), hidden);
         trace();
     }
     state->finish_forward(full_positions, batch, tokens);
     state->cache_pos += tokens;
     hidden = ops::copy(hidden, device);
-    if (input.raw_hidden) *input.raw_hidden = hidden;
+    if (input.raw_hidden) *input.raw_hidden = taps.finish(hidden);
     return final_mixer->pre(hidden, ops::ResidualRole::final).mixed;
 }
 

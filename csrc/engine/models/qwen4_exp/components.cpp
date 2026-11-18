@@ -6,6 +6,10 @@
 #include "engine/models/qwen4_exp/predictor.h"
 #include "engine/weights/loader.h"
 
+#if TYLOINFER_HAS_CUDA
+#include "engine/models/dflash2/model.h"
+#endif
+
 #include <algorithm>
 #include <stdexcept>
 #include <utility>
@@ -25,6 +29,8 @@ tyloi::models::Info Model::info() const {
     result.graph = device.is_cuda() ? tyloi::models::GraphOwner::model : tyloi::models::GraphOwner::executor;
     result.graph_weights = tyloi::models::GraphWeights::native;
     result.raw_row_bytes = std::size_t(metadata.hidden_size) * metadata.hc_mult * sizeof(std::uint16_t);
+    if (const auto* draft = predictor(); draft && !draft->target_layers().empty())
+        result.raw_row_bytes = std::size_t(metadata.hidden_size) * draft->target_layers().size() * sizeof(float);
     return result;
 }
 
@@ -37,12 +43,13 @@ MfqModelCapabilities Model::capabilities() const {
 tyloi::engine::Metrics Model::metrics() const {
     const bool vision = parts && parts->grid_vision.has_value();
     const bool vision_declared = graph.has_component("vision");
-    const bool mtp_declared = graph.has_component("predictor");
+    const auto* draft = predictor();
+    const bool mtp_declared = graph.has_component("predictor") || (draft && !draft->target_layers().empty());
     return {{"kv_memory_supported", 0.0}, {"kv_quantization_supported", 0.0},
         {"kv_quantization_bits", 0.0}, {"vision_declared", double(vision_declared)},
         {"vision_supported", double(vision_declared)}, {"vision_available", double(vision)},
         {"mtp_declared", double(mtp_declared)}, {"mtp_supported", double(mtp_declared)},
-        {"mtp_available", double(predictor() != nullptr)}};
+        {"mtp_available", double(draft != nullptr)}};
 }
 
 tyloi::models::Mtp* Model::predictor() const noexcept { return parts ? parts->mtp.get() : nullptr; }
@@ -122,6 +129,15 @@ void load_components(
             tyloi::models::grid::Vision::load(
                 weights, weights.cache(), config, image, video,
                 component->input_contract, component->position_policy, load_options.vision_resident));
+    }
+    if (!load_options.dflash2_draft_path.empty()) {
+#if TYLOINFER_HAS_CUDA
+        result.mtp = dflash2::load(model, load_options.dflash2_draft_path, model.device,
+            model.hidden_size(), model.metadata.vocab_size, model.num_hidden_layers());
+        return;
+#else
+        throw std::invalid_argument("DFlash2 requires CUDA");
+#endif
     }
     if (!model.graph.has_component("predictor")) return;
     TYLOINFER_RUNTIME_CHECK(

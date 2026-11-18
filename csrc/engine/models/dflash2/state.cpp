@@ -134,6 +134,7 @@ public:
         state_.pos = saved_.cache_pos;
         state_.compact = {};
         state_.selector = {};
+        state_.successor_rows = {};
         state_.row = 0;
     }
 
@@ -155,6 +156,7 @@ std::vector<Tensor> State::storage() const {
     for (const auto& value : values) if (value.defined()) result.emplace_back(value);
     if (compact.defined()) result.emplace_back(compact);
     if (selector.defined()) result.emplace_back(selector);
+    if (successor_rows.defined()) result.emplace_back(successor_rows);
     return result;
 }
 
@@ -198,6 +200,7 @@ void Draft::reset(MtpState& value, std::int64_t batch) const {
     current.pos = 0;
     current.compact = {};
     current.selector = {};
+    current.successor_rows = {};
     current.row = 0;
 }
 

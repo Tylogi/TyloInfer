@@ -35,6 +35,7 @@ struct State final : MtpState {
     const Draft& model;
     std::vector<DenseTensor> keys, values;
     DenseTensor compact, selector;
+    DenseTensor successor_rows;
     std::int64_t pos = 0;
     int row = 0;
 };
@@ -71,6 +72,7 @@ public:
     const CausalModel& target;
     const Config config;
     const Device device;
+    std::string cache_key;
     bool compact_kv = false;
     Matrix context_projection, selector_projection;
     DenseTensor hidden_norm, final_norm, predecessor, successor, mask_embedding;

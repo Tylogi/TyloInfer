@@ -113,9 +113,9 @@ void load(
     LoadOptions options) {
     const auto model_graph = graph(*source);
     const auto family = select_family(model_graph, weights.placement.target);
-    if (!options.dflash2_draft_path.empty() && (family != ModelFamily::qwen35 ||
+    if (!options.dflash2_draft_path.empty() && ((family != ModelFamily::qwen35 && family != ModelFamily::qwen4_exp) ||
             !weights.placement.target.is_cuda() || !options.optional_components))
-        throw std::invalid_argument("DFlash2 requires a CUDA Qwen3.5 target");
+        throw std::invalid_argument("DFlash2 requires a CUDA Qwen3.5 or Qwen4 target");
     switch (family) {
 #if TYLOINFER_HAS_CUDA
     case ModelFamily::glm_dsa:

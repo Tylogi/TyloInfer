@@ -78,7 +78,51 @@ MtpSessionState read_qwen4_mtp(SessionBlockReader& reader) {
         std::optional<::tyloi::Device> device; auto positions=read_optional(reader,device);if(positions)state.bytes+=session_tensor_bytes(positions);snapshot.positions.push_back(std::move(positions));snapshot.positions_devices.push_back(device);
         snapshot.lengths.push_back(reader.scalar<int64_t>("MTP layer position"));
     }
+    // Older DFlash2 snapshots used the Qwen4 envelope for [window, heads, width] rings.
+    if(std::all_of(snapshot.layers.begin(),snapshot.layers.end(),[&](const auto& layer) {
+        const auto i=std::size_t(&layer-snapshot.layers.data());
+        return layer.keys && layer.values && layer.keys.dim()==3 && layer.values.dim()==3 &&
+            !layer.index && !layer.convolution && !layer.recurrent && !layer.ple_convolution &&
+            !layer.ple_batch && layer.ple_tokens.empty() && !snapshot.positions[i] &&
+            snapshot.lengths[i]==state.cache_pos && layer.devices[0]==layer.devices[1];
+    })) {
+        std::vector<KvSnapshot> rings;
+        for(const auto& layer:snapshot.layers) {
+            const auto convert=[](const ::tyloi::Tensor& tensor) {
+                return ops::clone(ops::transpose(ops::reshape(tensor,
+                    {1,tensor.size(0),tensor.size(1),tensor.size(2)}),1,2));
+            };
+            KvSnapshot ring{convert(layer.keys),convert(layer.values),layer.keys.size(0),true,layer.devices[0]};
+            validate_kv(ring);
+            rings.push_back(std::move(ring));
+        }
+        state.payload=std::move(rings);
+    }
     return state;
+}
+
+void write_dflash_mtp(SessionBlockWriter& writer,const MtpSessionState& state) {
+    const auto& rings=std::get<std::vector<KvSnapshot>>(state.payload);
+    if(rings.empty() || rings.size()>64)throw CudaSessionStateError("invalid DFlash2 session layers");
+    MtpSessionState legacy;
+    legacy.cache_pos=state.cache_pos;
+    legacy.last_target_hidden=state.last_target_hidden;
+    auto& snapshot=legacy.payload.emplace<MtpSnapshot>();
+    snapshot.hidden_device=rings.front().target_device();
+    for(const auto& ring:rings) {
+        validate_kv(ring);
+        if(!ring.ring || ring.k.size(2)!=ring.capacity)throw CudaSessionStateError("invalid DFlash2 session ring");
+        const auto transpose=[](const Tensor& tensor) {
+            return ops::reshape(ops::transpose(tensor,1,2),{tensor.size(2),tensor.size(1),tensor.size(3)});
+        };
+        auto& layer=snapshot.layers.emplace_back();
+        layer.keys=transpose(ring.k);
+        layer.values=transpose(ring.v);
+        layer.devices[0]=layer.devices[1]=ring.destination;
+        snapshot.positions.emplace_back();
+        snapshot.lengths.push_back(state.cache_pos);
+    }
+    write_qwen4_mtp(writer,legacy);
 }
 }
 
@@ -89,6 +133,7 @@ SessionBlockPayload encode_block(const TextSessionState& state,size_t block_size
         throw std::runtime_error("invalid Qwen4 prefix block boundary");
     const auto start=index*block_size,count=std::min(block_size,state.tokens.size()-start);
     const bool exact=start+count==state.tokens.size();
+    const bool dflash=state.mtp && std::holds_alternative<std::vector<KvSnapshot>>(state.mtp->payload);
     SessionBlockWriter writer;writer.raw(qwen4_magic.data(),qwen4_magic.size());writer.scalar<uint32_t>(2);
     writer.scalar<uint32_t>(uint32_t(start));writer.scalar<uint32_t>(uint32_t(count));
     writer.scalar<uint32_t>(uint32_t(snapshot->layers.size()));writer.scalar<uint32_t>(exact?1:0);
@@ -106,7 +151,10 @@ SessionBlockPayload encode_block(const TextSessionState& state,size_t block_size
     if(exact) {
         write_optional(writer,snapshot->positions,snapshot->positions_device);writer.scalar<int64_t>(state.decode_position_delta);
         writer.scalar<uint32_t>(state.mtp?1:0);
-        if(state.mtp)write_qwen4_mtp(writer,*state.mtp);
+        if(state.mtp) {
+            if(dflash)write_dflash_mtp(writer,*state.mtp);
+            else write_qwen4_mtp(writer,*state.mtp);
+        }
     }
     return std::move(writer).finish();
 }

@@ -133,9 +133,11 @@ struct MtpOps {
         executor.submit(outputs);
         return hidden;
     }
-    bool dense_target_graph() const {
-        return device.is_cuda() && info.graph == models::GraphOwner::executor &&
-            weights.graph_safe(weights::Cache::Graph::legacy);
+    bool draft_target_graph(bool routed) const {
+        if (!device.is_cuda()) return false;
+        if (info.graph == models::GraphOwner::executor)
+            return weights.graph_safe(weights::Cache::Graph::legacy);
+        return !mtp.target_layers().empty() && (routed || weights.graph_safe(weights::Cache::Graph::native));
     }
     Tensor target_forward(Tensor ids, Tensor* raw = nullptr, int64_t confirmed = 0, bool queued = false) {
         target_transfer_bytes = 0;
@@ -154,9 +156,9 @@ struct MtpOps {
             models::DecodeOptions policy;
             policy.projection = models::DecodeOptions::Projection::hidden;
             policy.routed = weights.decode() == weights::Cache::Decode::routed;
-            const bool dense = dense_target_graph();
-            policy.enabled = policy.routed || dense;
-            if (dense) {
+            const bool draft_graph = draft_target_graph(policy.routed);
+            policy.enabled = policy.routed || draft_graph;
+            if (draft_graph) {
                 policy.reserve_until = target_extent;
                 if (sampler_ && !penalties && sampler().greedy()) {
                     policy.readout = queued ? models::DecodeOptions::Readout::verification
@@ -257,7 +259,8 @@ struct MtpOps {
         return result;
     }
     models::MtpDraft greedy_draft(const Tensor& hidden, const Tensor& ids, int depth) {
-        if (!graph_enabled || (prepared && prepared->transformed()) || !dense_target_graph()) return {};
+        if (!graph_enabled || (prepared && prepared->transformed()) ||
+            !draft_target_graph(weights.decode() == weights::Cache::Decode::routed)) return {};
         auto scope = ops::dense_scope(&predictor_execution, device);
         auto predictor_options = options;
         predictor_options.serial_experts = false;

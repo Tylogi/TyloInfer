@@ -8,11 +8,13 @@
 #include "nlohmann/json.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
 
 namespace tyloi::models::dflash2 {
@@ -125,7 +127,11 @@ std::unique_ptr<Draft> load(const CausalModel& target, const std::filesystem::pa
     model->hidden_norm = loader.dense("hidden_norm.weight", {config.hidden});
     model->final_norm = loader.dense("norm.weight", {config.hidden});
     model->predecessor = loader.dense("candidate_selector.predecessor_codebook", {config.vocabulary, config.rank}, true);
-    model->successor = loader.dense("candidate_selector.successor_codebook", {config.vocabulary, config.rank}, true);
+    const auto* stage = cuda::env_lookup("TYLOINFER_DFLASH2_STAGE_SUCCESSOR");
+    if (stage && stage[0] == '1')
+        model->successor = loader.host("candidate_selector.successor_codebook", {config.vocabulary, config.rank}).to(kBFloat16);
+    else
+        model->successor = loader.dense("candidate_selector.successor_codebook", {config.vocabulary, config.rank}, true);
     if (loader.source.find("mask_embedding")) model->mask_embedding = loader.dense("mask_embedding", {config.hidden});
     model->layers.reserve(config.layers);
     for (int index = 0; index < config.layers; ++index) {
@@ -148,6 +154,18 @@ std::unique_ptr<Draft> load(const CausalModel& target, const std::filesystem::pa
         layer.down = loader.linear(p + "mlp.down_proj", config.hidden, config.intermediate);
         model->layers.push_back(std::move(layer));
     }
+    std::ostringstream identity;
+    identity << "-dflash2-" << (loader.q4 ? "q4_0" : "q8_0") << (model->compact_kv ? "-bf16" : "-fp32");
+    auto files = loader.source.paths();
+    std::sort(files.begin(), files.end());
+    files.push_back(loader.source.root() / "config.json");
+    for (const auto& file : files) {
+        const auto path = std::filesystem::canonical(file);
+        const auto stamp = std::filesystem::last_write_time(path);
+        identity << '\n' << path.string() << ':' << std::filesystem::file_size(path) << ':'
+                 << std::chrono::duration_cast<std::chrono::nanoseconds>(stamp.time_since_epoch()).count();
+    }
+    model->cache_key = identity.str();
     return model;
 }
 

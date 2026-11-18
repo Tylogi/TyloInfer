@@ -20,6 +20,8 @@
 #include "model.h"
 #include "engine/models/qwen4_exp/snapshot.h"
 #include "engine/models/qwen4_exp/batch.h"
+#include "engine/models/qwen4_exp/taps.h"
+#include "engine/models/common/mtp.h"
 #include "predictor.h"
 #include "engine/models/common/load.h"
 #include "engine/weights/encoding/quant/nint_rows.h"
@@ -38,6 +40,7 @@
 #include "engine/backends/cuda/native/matmul_rows.h"
 #include "engine/backends/cuda/native/graph.h"
 #include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <cstring>
 #include <chrono>
@@ -212,6 +215,7 @@ struct Qwen4DecodeGraph final : DecodeGraph {
     };
     struct Cell {
         ::tyloi::DenseTensor ids,positions,cache_positions,host_ids,output,raw_hidden,logits,greedy_host,compact_host;
+        Tensor verification;
         unsigned used_kinds=0;
         std::vector<std::unique_ptr<PleStage>> ple;
         std::vector<GraphCheckpoint> checkpoints;
@@ -256,7 +260,7 @@ struct Qwen4DecodeGraph final : DecodeGraph {
         }
     };
     DecodeStream stream;
-    std::map<std::tuple<int,int,int>,std::unique_ptr<Cell>> cells;
+    std::map<std::tuple<int,int,int,bool,bool>,std::unique_ptr<Cell>> cells;
     // Verification widths execute serially and commit/rollback before the next
     // window. Their snapshots can share stable allocations across graph shapes.
     std::vector<GraphCheckpoint> shared_checkpoints;
@@ -299,7 +303,8 @@ struct Qwen4DecodeGraph final : DecodeGraph {
         for (const auto& [key, cell] : cells) {
             const auto prefix = std::string("cuda_graph_profile_target_rows_") +
                 std::to_string(std::get<0>(key)) + "_kind_" + std::to_string(std::get<1>(key)) +
-                "_confirmed_" + std::to_string(std::get<2>(key)) + "_";
+                "_confirmed_" + std::to_string(std::get<2>(key)) +
+                (std::get<3>(key) ? "_raw" : "") + (std::get<4>(key) ? "_verify_" : "_");
             append_graph_profile_metrics(cell->window, prefix, result);
         }
         result.emplace_back("decode_graph_count", double(cells.size()));
@@ -323,11 +328,13 @@ struct Qwen4DecodeGraph final : DecodeGraph {
         const auto tokens=static_cast<int>(ids.size(1));
         const auto confirmed=static_cast<int>(input.confirmed);
         const bool want_raw=input.raw_hidden!=nullptr;
+        const auto tap_layers=want_raw && model.predictor() ? model.predictor()->target_layers() : std::span<const int64_t>{};
         const auto projection=options.projection;
         int kind=projection==tyloi::models::DecodeOptions::Projection::greedy ? 2 :
             projection==tyloi::models::DecodeOptions::Projection::logits ? 1 :
             projection==tyloi::models::DecodeOptions::Projection::hidden ? 4 : 3;
         const bool want_logits=kind==4;
+        const bool verify=want_logits && tokens>1 && options.readout==tyloi::models::DecodeOptions::Readout::verification;
         tyloi::models::Decoded result;
         if(failed)throw std::runtime_error("MFQ model session requires recovery after its previous error");
         stream.require_current();
@@ -377,7 +384,7 @@ struct Qwen4DecodeGraph final : DecodeGraph {
             }
             return result;
         };
-        auto& owner=cells[{tokens,kind,confirmed}];
+        auto& owner=cells[{tokens,kind,confirmed,!tap_layers.empty() || (want_raw && kind<3),verify}];
         if(owner && owner->window.valid() && !owner->window.matches(observed()))owner.reset();
         if(!owner) {
             const Device device = model.device;
@@ -411,15 +418,17 @@ struct Qwen4DecodeGraph final : DecodeGraph {
         }
         owner->window.set_profile_geometry(want_raw?"mtp_target":"target_decode",tokens);
         auto& cell=*owner;
-        if(kind==4 && tokens>1)cell.window.set_compact_sampling(options.compact_sampling,"target",tokens);
+        if(kind==4 && tokens>1 && !verify)cell.window.set_compact_sampling(options.compact_sampling,"target",tokens);
         // A retained graph's first replay can still pay cold transfer/cache
         // costs after prefill. Exclude that replay from steady MTP policy data.
         result.initialized=!cell.window.valid() || !(cell.used_kinds&(1u<<result_kind));
-        if(input.host_ids) {
-            TYLOINFER_RUNTIME_CHECK(!input.host_ids.dense().is_cuda() && input.host_ids.dense().scalar_type()==::tyloi::kInt64 &&
-                input.host_ids.dense().sizes()==ids.sizes(),"Qwen4 graph host token geometry changed");
-            cell.host_ids.copy_(input.host_ids.dense());
-        } else cell.host_ids.copy_(ids.to(::tyloi::kCPU,::tyloi::kInt64));
+        if(!cell.ple.empty()) {
+            if(input.host_ids) {
+                TYLOINFER_RUNTIME_CHECK(!input.host_ids.dense().is_cuda() && input.host_ids.dense().scalar_type()==::tyloi::kInt64 &&
+                    input.host_ids.dense().sizes()==ids.sizes(),"Qwen4 graph host token geometry changed");
+                cell.host_ids.copy_(input.host_ids.dense());
+            } else cell.host_ids.copy_(ids.to(::tyloi::kCPU,::tyloi::kInt64));
+        }
         cell.ids.copy_(ids);
         mfq_qwen4_exp::fill_decode_positions(cell.cache_positions,cell.positions,request.cache_pos,request.decode_position_delta);
         try {
@@ -461,6 +470,7 @@ struct Qwen4DecodeGraph final : DecodeGraph {
                     try {
                     cell.window.mark(-1,"window_begin");
                     auto hidden=model.repeat_hidden(model.embed_tokens(cell.ids),model.metadata.hc_mult).dense();
+                    qwen4_exp::Taps taps(tap_layers,model.metadata.hc_mult,model.device);
                     std::size_t ple_index=0;int layer=0;
                     std::optional<tyloi::ops::Residual::Result> pending_residual;
                     const auto chain_setting=::tyloi::cuda::options::gr_chain_ffn_post();
@@ -493,7 +503,7 @@ struct Qwen4DecodeGraph final : DecodeGraph {
                         bool defer=false;
                         if(chain_post && size_t(layer+1)<model.layers.size()) {
                             auto& next=*model.layers[layer+1];
-                            defer=!next.ple && next.attention_gr.can_chain(pending_residual?pending_residual->residual:hidden);
+                            defer=!taps.contains(layer) && !next.ple && next.attention_gr.can_chain(pending_residual?pending_residual->residual:hidden);
                         }
                         {
                             auto& layer_state=*request.layers[layer];
@@ -507,15 +517,22 @@ struct Qwen4DecodeGraph final : DecodeGraph {
                             } else hidden=b.ffn_gr.post(ffn_output,ffn_result.residual,ffn_result.gate).dense();
                         }
                         pending_residual=std::move(next_residual);
+                        taps.capture(layer,hidden);
                         cell.window.mark(layer++,"block_end");
                     }
-                    if(kind>=3)cell.raw_hidden=hidden.clone();
+                    if(kind>=3 || want_raw)cell.raw_hidden=taps.finish(hidden).dense().clone();
                     hidden=qwen4_finalize_hidden(model,std::move(hidden),1,tokens);
                     if(kind>=3) {
                         cell.output=std::move(hidden);
                         if(kind==4) {
                             cell.logits=qwen4_logits_from_hidden(model, cell.output);
-                            cell.window.sample(cell.logits,cell.greedy_host,cell.compact_host,tokens);
+                            if(verify) {
+                                auto rows=tyloi::ops::reshape(Tensor(cell.logits),{tokens,-1});
+                                const std::array<Tensor,2> packet{
+                                    cell.ids.narrow(1,1,tokens-1).reshape({tokens-1}),
+                                    tyloi::ops::reshape(tyloi::ops::sample_greedy(tyloi::ops::contiguous(rows)),{tokens})};
+                                cell.verification=tyloi::ops::cat(packet,0);
+                            } else cell.window.sample(cell.logits,cell.greedy_host,cell.compact_host,tokens);
                         }
                     }
                     else if(kind==2)cell.output=qwen4_next_token(model,qwen4_last_hidden(std::move(hidden)));
@@ -531,6 +548,7 @@ struct Qwen4DecodeGraph final : DecodeGraph {
                     restore();
                     if(warm) {
                         cell.output={};cell.raw_hidden={};cell.logits={};
+                        cell.verification={};
                         recording->release_warm_outputs();
                         recording->pause();
                         co_yield tyloi::GraphRequest{tyloi::GraphPhase::admit, nullptr, recording->growth()};
@@ -541,6 +559,7 @@ struct Qwen4DecodeGraph final : DecodeGraph {
                 cell.window.retain_result(cell.output);
                 cell.window.retain_result(cell.raw_hidden);
                 cell.window.retain_result(cell.logits);
+                cell.window.retain_result(cell.verification);
                 cell.window.retain(observed());
                 } catch(...) {recording.reset();restore();throw;}
                 ++request.decode_graph_captures;
@@ -573,12 +592,15 @@ struct Qwen4DecodeGraph final : DecodeGraph {
             // MTP can retain history until a later probe. Each step must own its
             // raw residual rather than alias the next replay's capture buffer.
             if(want_raw)result.raw=cell.raw_hidden.clone();
-            if(kind==4 && tokens>1 && options.compact_sampling && cell.logits.size(-1)>=64)
+            if(kind==4 && tokens>1 && !verify && options.compact_sampling && cell.logits.size(-1)>=64)
                 result.compact=cell.compact_host;
             if(want_logits) {
                 result.logits=cell.logits.clone();
-                const auto* first=cell.greedy_host.data_ptr<int64_t>();
-                result.tokens.assign(first,first+tokens);
+                if(verify)result.ids=cell.verification;
+                else {
+                    const auto* first=cell.greedy_host.data_ptr<int64_t>();
+                    result.tokens.assign(first,first+tokens);
+                }
             }
             if(tokens==1 && result_kind==1)result.logits=cell.logits.reshape({1,-1});
             else if(tokens==1 && result_kind==2)result.ids=cell.greedy_host;
@@ -1108,6 +1130,7 @@ tyloi::StepSequence<tyloi::models::Prefill> qwen4_exp::Model::prefill(
     auto compute_chunk=policy.compute;
     const bool raw_hidden=input.raw_hidden!=nullptr;
     const bool raw_hidden_host=policy.raw_host;
+    const auto tap_layers=raw_hidden && model.predictor() ? model.predictor()->target_layers() : std::span<const int64_t>{};
     using DenseTensor=::tyloi::DenseTensor;
     auto ids = ids_handle.dense();
     TYLOINFER_RUNTIME_CHECK(ids.dim()==2 && ids.size(0)==1 &&
@@ -1121,7 +1144,8 @@ tyloi::StepSequence<tyloi::models::Prefill> qwen4_exp::Model::prefill(
     compute_chunk=std::min(compute_chunk,tokens);
     const auto reserve=std::size_t(1)<<30;
     const auto row_bytes=std::size_t(model.config.hidden)*model.config.streams*sizeof(float)*8;
-    const auto sequence_reserve=std::size_t(tokens)*model.config.hidden*model.config.streams*sizeof(float)*3;
+    const auto sequence_reserve=std::size_t(tokens)*model.config.hidden*sizeof(float)*
+        (model.config.streams*3+tap_layers.size()*2);
     capture.suspend();
     co_yield tyloi::Workspace{reserve+sequence_reserve, nullptr,
         tyloi::Workspace::Tile{tokens,row_bytes,&compute_chunk}};
@@ -1179,6 +1203,7 @@ tyloi::StepSequence<tyloi::models::Prefill> qwen4_exp::Model::prefill(
     const auto audit_option=::tyloi::cuda::options::prefill_expert_batch_audit();
     const bool audit_batch=audit_option && *audit_option!=0;
     const auto started=std::chrono::steady_clock::now();
+    std::optional<qwen4_exp::Taps> taps(std::in_place,tap_layers,model.metadata.hc_mult,model.device);
     int layer=0;
     for(auto& block:model.layers) {
         auto& layer_state=*state.layers[layer];
@@ -1347,6 +1372,7 @@ tyloi::StepSequence<tyloi::models::Prefill> qwen4_exp::Model::prefill(
             next_hidden=std::move(post_hidden);
         }
         hidden=std::move(next_hidden);
+        taps->capture(layer,hidden);
         capture.suspend(); co_yield tyloi::LayerEvent{tyloi::LayerEvent::Phase::end}; capture.resume();
         ++layer;
         if(trace && (layer%4==0 || layer==int(model.layers.size()))) {
@@ -1362,14 +1388,19 @@ tyloi::StepSequence<tyloi::models::Prefill> qwen4_exp::Model::prefill(
     const auto begin=((tokens-1)/compute_chunk)*compute_chunk;
     auto finalized=qwen4_finalize_hidden(model, hidden.narrow(1,begin,tokens-begin),1,tokens-begin);
     finalized=qwen4_last_hidden(std::move(finalized)).unsqueeze(1);
-    if(raw_hidden && raw_hidden_host)hidden=hidden.to(::tyloi::kCPU);
+    Tensor raw;
+    if(raw_hidden) {
+        raw=taps->finish(hidden);
+        if(raw_hidden_host)raw=raw.dense().to(::tyloi::kCPU);
+    }
+    taps.reset();
+    hidden={};
     tyloi::models::Prefill result;
     result.mode=tyloi::models::Prefill::Mode::layered;
     result.phase=tyloi::models::Prefill::Phase::computed;
     capture.suspend(); co_yield result; capture.resume();
     result.hidden=std::move(finalized);
-    if(raw_hidden)result.raw=std::move(hidden);
-    else hidden={};
+    result.raw=std::move(raw);
     capture.suspend();
     co_yield tyloi::Workspace{0,&result.hidden,std::nullopt,raw_hidden && !raw_hidden_host ? &result.raw : nullptr};
     capture.resume();

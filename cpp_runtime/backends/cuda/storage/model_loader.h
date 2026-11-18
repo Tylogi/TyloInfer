@@ -119,8 +119,6 @@ auto with_loaded_cuda_model(
     std::shared_ptr<const mfq::ModelSource> source;
     const auto* native_mtp=std::getenv("TYLOINFER_MTP_NATIVE_GGUF");
     if(native_mtp && *native_mtp) {
-        if(!execution.dflash2_draft_path.empty())
-            throw std::invalid_argument("native MTP and DFlash2 drafts cannot both be selected");
         if(!mfq::is_gguf_file(options.model_path))
             throw std::invalid_argument("an external MTP GGUF requires a GGUF target");
         source=std::make_shared<mfq::GgufModelSource>(options.model_path,
@@ -128,11 +126,6 @@ auto with_loaded_cuda_model(
         if(!source->find_tensor("predictor.embedding_norm.weight"))
             throw std::invalid_argument("the MTP GGUF companion has no canonical predictor tensors");
     } else source=mfq::open_model_source(options.model_path);
-    if(!execution.dflash2_draft_path.empty()) {
-        const auto backbone=cuda_backbone(source->resolved_model_graph().backbone);
-        if(backbone!=CudaBackbone::qwen4_exp)
-            throw std::invalid_argument("This DFlash2 loader requires a Qwen4 target model");
-    }
     auto load = [&]<typename Model>() {
         auto started = std::chrono::steady_clock::now();
         Model model = load_causal_lm<Model>(

@@ -8,6 +8,7 @@
 #include "engine/models/source/model_graph.h"
 #include "engine/models/causal_model.h"
 #include "engine/models/common/mtp.h"
+#include "engine/models/dflash2/model.h"
 #include "engine/models/minicpmo45/engine.h"
 #include "engine/models/minicpmo45/text/model.h"
 #include "engine/models/source/model_config.h"
@@ -151,11 +152,14 @@ std::unique_ptr<engine::Engine> load_native_engine(tyloi::engine::EngineOptions 
                     throw std::invalid_argument("CUDA streamed KV requires a QSA model");
             }
             graph = root->graph();
+            auto kv_key = cuda_kv_quantization_tag();
+            if (const auto* draft = dynamic_cast<const models::dflash2::Draft*>(model->predictor()))
+                kv_key += draft->cache_key;
             sessions = models::make_sessions(*source, config.session_cache, config.prefix_cache,
                 model->info().max_context, state->supports_text_session_state(),
                 state->supports_paged_text_session_state(),
                 Device(kCUDA, load.layer_placement.primary_device()),
-                separate_memory(load.layer_placement.primary_device()), cuda_kv_quantization_tag());
+                separate_memory(load.layer_placement.primary_device()), kv_key);
         }
         root->mode().ffn.independent |= model->info().separate_projections;
         const auto mode = root->forward_mode(load.layer_placement.primary_device());

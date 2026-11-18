@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 
@@ -203,6 +204,7 @@ void Draft::append_target_context(MtpState& value, const Tensor& hidden, std::in
     s.pos = start + count;
     s.compact = {};
     s.selector = {};
+    s.successor_rows = {};
     s.row = 0;
 }
 
@@ -233,8 +235,26 @@ Tensor Draft::draft_block(MtpState& value, const Tensor& anchor, int requested) 
     logits = logits.reshape({1, requested, c.vocabulary});
     auto compact = sample_top_k_compact_cuda(logits.reshape({requested, c.vocabulary}), c.candidates);
     auto selector = project(selector_projection, norm.values, stream);
+    DenseTensor successor_rows;
+    if (successor.is_cpu()) {
+        const auto candidates = compact.cpu();
+        const auto rows = std::int64_t(requested) * c.candidates;
+        auto host = empty({rows, c.rank}, successor.options());
+        const auto* indices = candidates.data_ptr<std::int64_t>();
+        const auto* table = successor.data_ptr<std::uint16_t>();
+        auto* destination = host.data_ptr<std::uint16_t>();
+        for (std::int64_t row = 0; row < rows; ++row) {
+            const auto token = std::uint32_t(indices[row]);
+            auto* output = destination + row * c.rank;
+            if (token < std::uint32_t(c.vocabulary))
+                std::memcpy(output, table + std::int64_t(token) * c.rank, c.rank * sizeof(std::uint16_t));
+            else std::memset(output, 0, c.rank * sizeof(std::uint16_t));
+        }
+        successor_rows = host.to(device);
+    }
     s.compact = std::move(compact);
     s.selector = std::move(selector);
+    s.successor_rows = std::move(successor_rows);
     s.row = 0;
     return logits;
 }
@@ -251,11 +271,14 @@ Tensor Draft::draft_next(MtpState& value, const Tensor& logits, const Tensor& pr
     auto output = ops::empty(logits.dense().sizes(), logits.options().dtype(ScalarType::float32));
     ops::fill(output, -std::numeric_limits<float>::infinity());
     const auto stream = cuda::current_stream(device.index);
-    record(stream, {s.compact, s.selector, previous.dense(), predecessor, successor, output.dense()});
+    const bool staged = successor.is_cpu();
+    const auto& rows = staged ? s.successor_rows : successor;
+    record(stream, {s.compact, s.selector, previous.dense(), predecessor, rows, output.dense()});
     raw::selector_logits(s.compact.data_ptr<std::int64_t>() + std::int64_t(s.row) * c.candidates, c.candidates,
-        previous.dense().data_ptr<std::int64_t>(), predecessor.data_ptr<std::uint16_t>(), successor.data_ptr<std::uint16_t>(),
+        previous.dense().data_ptr<std::int64_t>(), predecessor.data_ptr<std::uint16_t>(),
+        rows.data_ptr<std::uint16_t>() + (staged ? std::int64_t(s.row) * c.candidates * c.rank : 0),
         s.selector.data_ptr<float>() + std::int64_t(s.row) * c.rank, output.dense().data_ptr<float>(),
-        c.rank, c.vocabulary, stream.stream());
+        c.rank, c.vocabulary, stream.stream(), staged);
     ++s.row;
     return output;
 }
@@ -268,11 +291,13 @@ StepSequence<MtpDraft> Draft::greedy_draft(const CausalModel& model, MtpRow inpu
     draft_block(request, input.ids, depth);
     auto tokens = ops::empty({1, depth}, TensorOptions().device(device).dtype(kInt64));
     const auto stream = cuda::current_stream(device.index);
-    record(stream, {request.compact, request.selector, input.ids.dense(), predecessor, successor, tokens.dense()});
+    const bool staged = successor.is_cpu();
+    const auto& rows = staged ? request.successor_rows : successor;
+    record(stream, {request.compact, request.selector, input.ids.dense(), predecessor, rows, tokens.dense()});
     raw::selector_greedy_walk(request.compact.data_ptr<std::int64_t>(), depth, config.candidates,
         input.ids.dense().data_ptr<std::int64_t>(), predecessor.data_ptr<std::uint16_t>(),
-        successor.data_ptr<std::uint16_t>(), request.selector.data_ptr<float>(),
-        tokens.dense().data_ptr<std::int64_t>(), config.rank, config.vocabulary, stream.stream());
+        rows.data_ptr<std::uint16_t>(), request.selector.data_ptr<float>(),
+        tokens.dense().data_ptr<std::int64_t>(), config.rank, config.vocabulary, stream.stream(), staged);
     request.row = depth;
     const std::array<Tensor, 2> window{input.ids, tokens};
     co_yield MtpDraft{ops::cat(window, 1)};

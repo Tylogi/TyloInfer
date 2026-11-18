@@ -598,7 +598,7 @@ public:
             validate_layer_session(*model_.layers[i], *state_.layers[i], saved->layers[i], snapshot_.cache_pos);
         if (predictor_model) {
             if (!state_.predictor || !state_.predictor->belongs_to(*predictor_model) ||
-                !snapshot_.mtp || snapshot_.mtp->cache_pos != snapshot_.cache_pos - 1)
+                !snapshot_.mtp || !predictor_model->session_boundary(snapshot_.cache_pos, snapshot_.mtp->cache_pos))
                 throw CudaSessionStateError("incompatible Qwen4 predictor session boundary");
             predictor_ = state_.predictor->prepare_restore(*snapshot_.mtp);
         }

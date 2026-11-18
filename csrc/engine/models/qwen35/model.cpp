@@ -31,14 +31,15 @@ tyloi::engine::Metrics Model::metrics() const {
             break;
         }
     }
+    const bool mtp_declared = graph.has_component("predictor") || (mtp && !mtp->target_layers().empty());
     return {{"kv_memory_supported", 0.0},
             {"kv_quantization_supported", double(full_attention)},
             {"kv_quantization_bits", bits},
             {"vision_declared", double(graph.has_component("vision"))},
             {"vision_supported", double(graph.has_component("vision"))},
             {"vision_available", double(vision.has_value())},
-            {"mtp_declared", double(graph.has_component("predictor"))},
-            {"mtp_supported", double(graph.has_component("predictor"))}, {"mtp_available", double(bool(mtp))}};
+            {"mtp_declared", double(mtp_declared)},
+            {"mtp_supported", double(mtp_declared)}, {"mtp_available", double(bool(mtp))}};
 }
 
 std::unique_ptr<tyloi::models::State> Model::make_state() const {

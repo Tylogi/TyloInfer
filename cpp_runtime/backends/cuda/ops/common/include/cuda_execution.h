@@ -293,7 +293,6 @@ struct MoeRouteLayerStats {
 struct CudaExecutionContext {
     CudaExecutionContext();
     bool yarn_context_extension=false;
-    std::string dflash2_draft_path;
     mfq::models::YarnScaling yarn;
 
     CudaProfiler profiler;
