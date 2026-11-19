@@ -39,7 +39,7 @@ public:
     void prepare_decode(bool allow_pending_graph=false);
     void prepare_decode_tokens(int64_t tokens,bool allow_pending_graph=false,int host_mode=0,const Tensor& history={});
     bool graph_task_supported()const;
-    void advance_graph(int64_t tokens);
+    void advance_graph(int64_t tokens,int64_t attention_rows=-1);
     Tensor forward_pending_graph(const Tensor& query,const Tensor& key,const Tensor& value,const Tensor& iq,
         const Tensor& raw_index,const Tensor& cache_positions,const Tensor& gate,Tensor output,
         const Pool& pool={},const Tensor& absolute_positions={});

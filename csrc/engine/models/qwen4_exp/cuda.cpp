@@ -164,7 +164,7 @@ struct PredictorGraphs {
 
     StreamHandle stream;
     std::shared_ptr<GraphPoolLease> pool;
-    std::map<std::tuple<int64_t, ScalarType, MtpStepMode>, std::unique_ptr<Cell>> cells;
+    std::map<std::tuple<int64_t, ScalarType, MtpStepMode, int>, std::unique_ptr<Cell>> cells;
     DenseTensor history;
     int64_t capacity = 0;
 
@@ -189,8 +189,8 @@ struct PredictorGraphs {
             history, state.owner.config.maximum, "TYLOINFER_MTP_POSITION_BUFFER");
     }
 
-    static void advance(PredictorState& state, Tensor positions, int64_t tokens) {
-        state.owner.layers.front()->qsa->advance_graph(*state.layer_states.front()->qsa, tokens);
+    static void advance(PredictorState& state, Tensor positions, int64_t tokens, int64_t attention_rows = -1) {
+        state.owner.layers.front()->qsa->advance_graph(*state.layer_states.front()->qsa, tokens, attention_rows);
         state.positions[0] = std::move(positions);
         state.lengths[0] += tokens;
     }
@@ -202,8 +202,8 @@ bool predictor_graph_enabled() {
     return cuda::options::mtp_predictor_graph().value_or(true) && mfq_cuda_graph_capture_supported();
 }
 
-std::vector<Tensor> predictor_graph_storage(const Predictor& model, PredictorState& state) {
-    std::vector<Tensor> owners;
+std::vector<Tensor> predictor_graph_storage(const Predictor& model, PredictorState& state,
+        std::vector<Tensor> owners = {}) {
     const auto& attention = *model.layers.front()->qsa;
     for (auto* tensor : attention.graph_state(*state.layer_states.front()->qsa)) owners.push_back(*tensor);
     return owners;
@@ -236,7 +236,7 @@ StepSequence<MtpStep> Predictor::graph_step(const CausalModel& target, MtpRow ro
     auto& qsa = *block.qsa;
     auto& cache = *request->layer_states.front()->qsa;
     ::tyloi::ops::Qsa::Graph graph({{{{&qsa, &cache}}, start, config.maximum, 0}}, false);
-    if (!graph.eligible()) co_return;
+    if (!graph.eligible(true)) co_return;
     const auto stream = cuda::current_stream(device.index);
     auto& graphs = request->graphs;
     if (graphs && graphs->stream.stream() != stream.stream()) request->release_graphs();
@@ -264,8 +264,10 @@ StepSequence<MtpStep> Predictor::graph_step(const CausalModel& target, MtpRow ro
     }
     graph.prepare(0, request->positions[0]);
 
-    const auto owners = predictor_graph_storage(*this, *request);
-    auto& slot = graphs->cells[{tokens, row.hidden.scalar_type(), mode}];
+    const auto pending = graph.pending_kind();
+    const bool pending_tail = pending && mode == MtpStepMode::tail;
+    const auto owners = predictor_graph_storage(*this, *request, graph.storage());
+    auto& slot = graphs->cells[{tokens, row.hidden.scalar_type(), mode, pending}];
     if (slot && !slot->window.matches(owners)) slot.reset();
     const bool capture = !slot;
     const bool readout = mode != MtpStepMode::history;
@@ -305,14 +307,15 @@ StepSequence<MtpStep> Predictor::graph_step(const CausalModel& target, MtpRow ro
                 auto input = fuse(cell.hidden, embed(cell.ids));
                 auto mix = block.attention_gr.pre(input);
                 const auto prefix = mode == MtpStepMode::tail ? tokens - 1 : 0;
-                if (prefix) {
+                if (prefix && !pending_tail) {
                     qsa.forward_graph(cache, ::tyloi::ops::slice(mix.mixed, 1, 0, prefix),
                         ::tyloi::ops::contiguous(::tyloi::ops::slice(cell.positions, 2, 0, prefix)),
                         ::tyloi::ops::slice(cell.cache_positions, 0, 0, prefix), {}, true, true);
                 }
-                auto attention = qsa.forward_graph(cache, ::tyloi::ops::slice(mix.mixed, 1, prefix, tokens),
-                    ::tyloi::ops::contiguous(::tyloi::ops::slice(cell.positions, 2, prefix, tokens)),
-                    ::tyloi::ops::slice(cell.cache_positions, 0, prefix, tokens), {}, true, !readout);
+                const auto begin = pending_tail ? 0 : prefix;
+                auto attention = qsa.forward_graph(cache, ::tyloi::ops::slice(mix.mixed, 1, begin, tokens),
+                    ::tyloi::ops::contiguous(::tyloi::ops::slice(cell.positions, 2, begin, tokens)),
+                    ::tyloi::ops::slice(cell.cache_positions, 0, begin, tokens), {}, true, !readout, pending_tail);
                 if (readout) {
                     auto residual = block.attention_gr.post(attention,
                         ::tyloi::ops::slice(mix.residual, 1, prefix, tokens), ::tyloi::ops::slice(mix.gate, 1, prefix, tokens));
@@ -344,8 +347,9 @@ StepSequence<MtpStep> Predictor::graph_step(const CausalModel& target, MtpRow ro
         cell.window.retain(owners);
     }
     auto positions = graphs->positions(*request, cell);
-    if (readout || !cell.window.enqueue_if_device_only()) cell.window.run();
-    graphs->advance(*request, std::move(positions), tokens);
+    if (readout || pending || !cell.window.enqueue_if_device_only()) cell.window.run();
+    const auto attention_rows = !readout ? 0 : pending_tail ? 1 : -1;
+    graphs->advance(*request, std::move(positions), tokens, attention_rows);
     if (readout) {
         auto result = cell.output;
         result.sample_hidden = ::tyloi::ops::clone(result.sample_hidden);
@@ -375,7 +379,7 @@ StepSequence<MtpDraft> Predictor::greedy_draft(const CausalModel& target, MtpRow
         graphs.stream.stream() != cuda::current_stream(device.index).stream()) co_return;
     const auto owners = predictor_graph_storage(*this, *request);
     const auto ready = [&](int64_t width, ScalarType type, MtpStepMode mode) -> PredictorGraphs::Cell* {
-        const auto found = graphs.cells.find({width, type, mode});
+        const auto found = graphs.cells.find({width, type, mode, 0});
         return found != graphs.cells.end() && found->second->window.valid() &&
             found->second->window.matches(owners) ? found->second.get() : nullptr;
     };

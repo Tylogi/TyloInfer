@@ -162,6 +162,11 @@ struct QsaTqCache::Impl {
         ::tyloi::DenseTensor key,value,index,modes_key,modes_value,fp16_key,fp16_value,rotated_key,rotated_value,packed;
     };
     std::array<BatchAppendWorkspace,7> batch_append;
+    ::tyloi::DenseTensor graph_first(const ::tyloi::DenseTensor& positions) const {
+        if(positions.dim()==3 && positions.size(0)==3)return graph_first_position.narrow(0,0,3).reshape({3,1,1});
+        if(positions.dim()==2 && positions.size(0)==3)return graph_first_position.narrow(0,0,3).reshape({3,1});
+        return graph_first_position.narrow(0,0,1);
+    }
     AttentionWorkspace& graph_workspace(int queries) {
         return queries==1?pending_attention:batch_attention.at(std::size_t(queries-2));
     }
@@ -518,10 +523,12 @@ struct QsaTqCache::Impl {
         check(cudaMemcpyAsync(views.data_ptr<std::uint8_t>()+id*sizeof(pending_view),&pending_view,sizeof(pending_view),cudaMemcpyHostToDevice,mfq_current_cuda_stream()));
     }
     bool graph_host_boundary=false,graph_ssd_task=false;
-    ::tyloi::DenseTensor stage_pending(const ::tyloi::DenseTensor& selected,int queries,int count,const ::tyloi::DenseTensor& positions) {
+    ::tyloi::DenseTensor stage_pending(const ::tyloi::DenseTensor& selected,int queries,int count,const ::tyloi::DenseTensor& positions,int appended) {
         if(!ram)return views;
-        if(graph_ssd_task)return ram->stage_graph_task(selected,queries,count,views,positions,queries);
-        if(!graph_host_boundary)return ram->stage(selected,queries,count,views,positions,tokens,queries);
+        if((graph_ssd_task || graph_host_boundary) && queries!=appended)
+            throw std::logic_error("QSA SSD graph requires matching append and query widths");
+        if(graph_ssd_task)return ram->stage_graph_task(selected,queries,count,views,positions,appended);
+        if(!graph_host_boundary)return ram->stage(selected,queries,count,views,positions,tokens,appended);
         auto* window=DecodeWindow::recording();
         if(!window)throw std::logic_error("SSD QSA graph requires its decode window host boundary");
         cudaStreamCaptureStatus capture;check(cudaStreamIsCapturing(mfq_current_cuda_stream(),&capture));
@@ -530,12 +537,12 @@ struct QsaTqCache::Impl {
         // index scoring, selection and attention keep their captured GPU work.
         // Read the live epoch when replaying, rather than retaining the epoch
         // of the first capture in LRU updates.
-        window->host_barrier([this,selected,queries,count,positions,selection_in_graph] {
-            ram->stage(selected,queries,count,views,positions,tokens,queries,selection_in_graph);
+        window->host_barrier([this,selected,queries,count,positions,appended,selection_in_graph] {
+            ram->stage(selected,queries,count,views,positions,tokens,appended,selection_in_graph);
         });
         if(capture==cudaStreamCaptureStatusNone) {
             check(cudaStreamSynchronize(mfq_current_cuda_stream()));
-            ram->stage(selected,queries,count,views,positions,tokens,queries,selection_in_graph);
+            ram->stage(selected,queries,count,views,positions,tokens,appended,selection_in_graph);
         }
         return ram->prepared_views();
     }
@@ -543,13 +550,30 @@ struct QsaTqCache::Impl {
         const ::tyloi::DenseTensor& raw,const ::tyloi::DenseTensor& positions,const ::tyloi::DenseTensor& gate,::tyloi::DenseTensor output,
         const QsaTqCache::Pool& pool,const ::tyloi::DenseTensor& absolute_positions) {
         const int n=int(key.size(1));
-        if(!pending_graph || !batch_prepared || n!=graph_queries || !output.defined() || !pool)
+        if(!pending_graph || !batch_prepared || n!=graph_queries || !pool)
             throw std::logic_error("QSA batch graph was not prepared");
         const auto convert=[](const ::tyloi::DenseTensor& x) {
             auto y=(x.scalar_type()==::tyloi::kFloat16 || x.scalar_type()==::tyloi::kFloat32)?x:x.to(::tyloi::kFloat32);
             return y.stride(y.dim()-1)==1?y:y.contiguous();
         };
-        auto k=convert(key),v=convert(value),r=convert(raw),q=convert(query),g=convert(gate);
+        auto k=convert(key),v=convert(value),r=convert(raw);
+        ::tyloi::DenseTensor q,g,index_query,query_positions;
+        int rows=0;
+        if(output.defined()) {
+            if(output.dim()!=3)
+                throw std::invalid_argument("QSA graph output geometry mismatch");
+            if(output.size(0)==1 && output.size(2)==int64_t(heads)*width)rows=int(output.size(1));
+            else if(output.size(1)==heads && output.size(2)==width)rows=int(output.size(0));
+            if(rows!=1 && rows!=n)throw std::invalid_argument("QSA graph output geometry mismatch");
+            const auto select=[&](const ::tyloi::DenseTensor& x,int axis) {
+                if(!x.defined() || x.dim()!=4 || (x.size(axis)!=rows && x.size(axis)!=n))
+                    throw std::invalid_argument("QSA graph query geometry mismatch");
+                return x.size(axis)==rows?x:x.narrow(axis,n-rows,rows);
+            };
+            q=convert(select(query,2));g=convert(select(gate,1));
+            index_query=select(iq,1).to(::tyloi::kFloat32).contiguous();
+            query_positions=positions.reshape({-1}).narrow(0,n-rows,rows);
+        }
         auto& a=graph_workspace(n);auto& batch=batch_append.at(std::size_t(n-2));
         const int staged=int(batch.key.size(1)),blocks=staged/4;
         check(tq::tq_stage_graph_batch(k.data_ptr(),v.data_ptr(),r.data_ptr(),k.scalar_type()==::tyloi::kFloat16,v.scalar_type()==::tyloi::kFloat16,r.scalar_type()==::tyloi::kFloat16,
@@ -574,7 +598,7 @@ struct QsaTqCache::Impl {
         auto last=absolute.narrow(-1,n-1,1);
         starts=::tyloi::cuda::where(starts<=last,starts,last);
         auto first=starts.narrow(-1,0,1);
-        first.copy_(::tyloi::cuda::where(graph_first_position.narrow(0,1,1)>0,graph_first_position.narrow(0,0,1),first));
+        first.copy_(::tyloi::cuda::where(graph_first_position.narrow(0,3,1)>0,graph_first(absolute),first));
         auto pooled=pool(batch.index,starts).to(::tyloi::kFloat32).contiguous();
         check(tq::indexer_affine16_append_batch(pooled.data_ptr<float>(),index_codes.data_ptr<std::int16_t>(),index_scales.data_ptr<std::uint16_t>(),
             index_zero.data_ptr<std::int16_t>(),positions.data_ptr<int64_t>(),blocks,index_width,capacity,mfq_current_cuda_stream()));
@@ -586,15 +610,16 @@ struct QsaTqCache::Impl {
             n,kv_heads,width,padded,index_width,int(canonical_bytes),int(interval/4),bool(ram)};
         check(tq::tq_publish_graph_batch(publication,mfq_current_cuda_stream()));
         if(!graph_archive_mapped)check(cudaMemcpyAsync(graph_archive_host.data_ptr(),graph_archive.data_ptr(),graph_archive.numel(),cudaMemcpyDeviceToHost,mfq_current_cuda_stream()));
+        if(!output.defined())return {};
         const int count=(budget+6)/4;
-        auto ranked=a.ranked.narrow(0,0,int64_t(n)*capacity).reshape({1,n,capacity});auto index_query=iq.to(::tyloi::kFloat32).contiguous();
-        indexer_scores(index_query,positions,ranked,n,capacity,a);
-        auto selected=mfq_qwen4_exp::live_topk_selected_blocks(ranked,positions,4,std::min(budget/4,capacity),budget);
+        auto ranked=a.ranked.narrow(0,0,int64_t(rows)*capacity).reshape({1,rows,capacity});
+        indexer_scores(index_query,query_positions,ranked,rows,capacity,a);
+        auto selected=mfq_qwen4_exp::live_topk_selected_blocks(ranked,query_positions,4,std::min(budget/4,capacity),budget);
         cudaStreamCaptureStatus status;check(cudaStreamIsCapturing(mfq_current_cuda_stream(),&status));const bool observe=status!=cudaStreamCaptureStatusNone;
-        const auto operands=stage_pending(selected,n,count,positions);
+        const auto operands=stage_pending(selected,rows,count,positions,n);
         check(tq::tq_sparse_attention(q.data_ptr(),ks.data_ptr<float>(),vs.data_ptr<float>(),relative.data_ptr<std::uint16_t>(),operands.data_ptr<tq::TqBlockView>(),
-            selected.data_ptr<tq::SelectedBlock>(),positions.data_ptr<int64_t>(),output.data_ptr(),a.rotated.data_ptr<float>(),a.partial.data_ptr<float>(),a.stats.data_ptr<float>(),
-            a.logmass.data_ptr<float>(),a.norm.data_ptr<float>(),observe?hits.data_ptr<float>():nullptr,observe?mass.data_ptr<float>():nullptr,n,heads,kv_heads,width,padded,count,a.parts,
+            selected.data_ptr<tq::SelectedBlock>(),query_positions.data_ptr<int64_t>(),output.data_ptr(),a.rotated.data_ptr<float>(),a.partial.data_ptr<float>(),a.stats.data_ptr<float>(),
+            a.logmass.data_ptr<float>(),a.norm.data_ptr<float>(),observe?hits.data_ptr<float>():nullptr,observe?mass.data_ptr<float>():nullptr,rows,heads,kv_heads,width,padded,count,a.parts,
             q.stride(2),q.stride(1),mfq_current_cuda_stream(),bool(ram),g.data_ptr(),g.scalar_type()==::tyloi::kFloat16,output.scalar_type()==::tyloi::kFloat16,
             g.stride(1),g.stride(2),q.scalar_type()==::tyloi::kFloat16,true,false));
         return output;
@@ -603,22 +628,30 @@ struct QsaTqCache::Impl {
         const ::tyloi::DenseTensor& raw,const ::tyloi::DenseTensor& positions,const ::tyloi::DenseTensor& gate,::tyloi::DenseTensor output,
         const QsaTqCache::Pool& pool,const ::tyloi::DenseTensor& absolute_positions) {
         if(key.size(1)>1)return forward_pending_batch(query,key,value,iq,raw,positions,gate,std::move(output),pool,absolute_positions);
-        if(!pending_graph || key.size(1)!=1 || !output.defined())throw std::logic_error("QSA device graph was not prepared");
+        if(!pending_graph || key.size(1)!=1)throw std::logic_error("QSA device graph was not prepared");
         const auto mark=[](const char* phase){if(auto* window=DecodeWindow::recording())window->mark_current(phase);};
         mark("qsa_cache_begin");
         const auto convert=[](const ::tyloi::DenseTensor& x) {
             auto y=(x.scalar_type()==::tyloi::kFloat16 || x.scalar_type()==::tyloi::kFloat32)?x:x.to(::tyloi::kFloat32);
             return y.stride(y.dim()-1)==1?y:y.contiguous();
         };
-        auto k=convert(key),v=convert(value),r=convert(raw),q=convert(query),g=convert(gate);
+        auto k=convert(key),v=convert(value),r=convert(raw);
         auto& a=pending_attention;
-        const tq::PendingQuery prepared_query{q.data_ptr(),a.rotated.data_ptr<float>(),heads,q.stride(1),q.scalar_type()==::tyloi::kFloat16};
+        ::tyloi::DenseTensor q,g;
+        tq::PendingQuery prepared_query{};
+        if(output.defined()) {
+            if(output.dim()!=3 || output.numel()!=int64_t(heads)*width ||
+               !query.defined() || query.dim()!=4 || query.size(2)!=1 || !gate.defined() || gate.dim()!=4 || gate.size(1)!=1 ||
+               !iq.defined() || iq.dim()!=4 || iq.size(1)!=1)throw std::invalid_argument("QSA graph query geometry mismatch");
+            q=convert(query);g=convert(gate);
+            prepared_query={q.data_ptr(),a.rotated.data_ptr<float>(),heads,q.stride(1),q.scalar_type()==::tyloi::kFloat16};
+        }
         check(tq::tq_append_pending(k.data_ptr(),v.data_ptr(),r.data_ptr(),k.scalar_type()==::tyloi::kFloat16,v.scalar_type()==::tyloi::kFloat16,r.scalar_type()==::tyloi::kFloat16,
             positions.data_ptr<int64_t>(),tail_storage_k.data_ptr<float>(),tail_storage_v.data_ptr<float>(),tail_storage_index.data_ptr<float>(),
             rotated_tail_k.data_ptr<float>(),rotated_tail_v.data_ptr<float>(),
             ks.data_ptr<float>(),vs.data_ptr<float>(),pending_k.data_ptr<std::uint16_t>(),pending_v.data_ptr<std::uint16_t>(),views.data_ptr<tq::TqBlockView>(),
             kv_heads,width,padded,index_width,k.stride(2),v.stride(2),mfq_current_cuda_stream(),
-            graph_complete?pending_modes_k.data_ptr<float>():nullptr,graph_complete?pending_modes_v.data_ptr<float>():nullptr,&prepared_query));
+            graph_complete?pending_modes_k.data_ptr<float>():nullptr,graph_complete?pending_modes_v.data_ptr<float>():nullptr,output.defined()?&prepared_query:nullptr));
         if(graph_complete) {
             if(!pool)throw std::logic_error("complete QSA graph requires indexer pooling");
             check(tq::tq_finalize_pending(pending_modes_k.data_ptr<float>(),pending_modes_v.data_ptr<float>(),tail_storage_index.data_ptr<float>(),
@@ -627,7 +660,7 @@ struct QsaTqCache::Impl {
             auto starts=absolute_positions.defined()?absolute_positions:positions;
             if(starts.dim()==1)starts=starts.reshape({1,1});
             starts=starts-3;
-            starts=::tyloi::cuda::where(graph_first_position.narrow(0,1,1)>0,graph_first_position.narrow(0,0,1),starts);
+            starts=::tyloi::cuda::where(graph_first_position.narrow(0,3,1)>0,graph_first(starts),starts);
             auto pooled=pool(tail_storage_index,starts).to(::tyloi::kFloat32).contiguous();
             check(tq::indexer_affine16_append(pooled.data_ptr<float>(),index_codes.data_ptr<std::int16_t>(),index_scales.data_ptr<std::uint16_t>(),
                 index_zero.data_ptr<std::int16_t>(),positions.data_ptr<int64_t>(),index_width,mfq_current_cuda_stream()));
@@ -636,6 +669,7 @@ struct QsaTqCache::Impl {
                 1,index_width,0,positions.data_ptr<int64_t>(),mfq_current_cuda_stream()));
             if(!graph_archive_mapped)check(cudaMemcpyAsync(graph_archive_host.data_ptr(),graph_archive.data_ptr(),graph_archive.numel(),cudaMemcpyDeviceToHost,mfq_current_cuda_stream()));
         }
+        if(!output.defined())return {};
         const int columns=budget+3,count=(columns+3)/4,parts=a.parts;
         mark("qsa_cache_append_end");
         auto ranked=a.ranked.narrow(0,0,capacity).reshape({1,1,capacity});auto index_query=iq.to(::tyloi::kFloat32).contiguous();
@@ -648,7 +682,7 @@ struct QsaTqCache::Impl {
         cudaStreamCaptureStatus capture_status;
         check(cudaStreamIsCapturing(mfq_current_cuda_stream(),&capture_status));
         const bool observe=capture_status!=cudaStreamCaptureStatusNone;
-        const auto operands=stage_pending(blocks,1,count,positions);
+        const auto operands=stage_pending(blocks,1,count,positions,1);
         if(ram)mark("qsa_cache_ram_staging_end");
         check(tq::tq_sparse_attention(q.data_ptr(),ks.data_ptr<float>(),vs.data_ptr<float>(),relative.data_ptr<std::uint16_t>(),operands.data_ptr<tq::TqBlockView>(),
             blocks.data_ptr<tq::SelectedBlock>(),positions.data_ptr<int64_t>(),output.data_ptr(),a.rotated.data_ptr<float>(),a.partial.data_ptr<float>(),a.stats.data_ptr<float>(),
@@ -1168,7 +1202,7 @@ std::vector<std::pair<tyloi::Device,std::size_t>> QsaTqCache::graph_growth(int64
             q*count*sizeof(tq::SelectedBlock)+q*s.heads*s.padded*4+q*s.heads*parts*s.padded*4+
             q*s.heads*parts*2*4+q*s.heads*count*4+q*s.heads*4;
     }
-    if(!s.graph_first_position.defined())gpu+=2*sizeof(std::int64_t);
+    if(!s.graph_first_position.defined())gpu+=4*sizeof(std::int64_t);
     if(queries>1) {
         const auto& b=s.batch_append.at(std::size_t(queries-2));
         if(!b.key.defined()) {
@@ -1244,14 +1278,18 @@ void QsaTqCache::prepare_decode_tokens(int64_t queries,bool allow_pending,int ho
     impl_->graph_complete=impl_->graph_blocks!=0;
     if(impl_->pending_graph) {
         ResidentAllocationScope resident;
-        if(!impl_->graph_first_position.defined())impl_->graph_first_position=::tyloi::cuda::zeros({2},impl_->options.dtype(::tyloi::kInt64));
+        if(!impl_->graph_first_position.defined())impl_->graph_first_position=::tyloi::cuda::zeros({4},impl_->options.dtype(::tyloi::kInt64));
         const auto prior=impl_->tokens%4;
-        if(history.defined() && prior) {
-            if(history.scalar_type()!=::tyloi::kInt64 || history.numel()<impl_->tokens || history.device()!=impl_->ks.device())
+        if(history.defined()) {
+            const bool scalar=history.dim()==1 || (history.dim()==2 && history.size(0)==1);
+            const bool axes=(history.dim()==2 && history.size(0)==3) ||
+                (history.dim()==3 && history.size(0)==3 && history.size(1)==1);
+            if((!scalar && !axes) || (history.scalar_type()!=::tyloi::kInt64 && history.scalar_type()!=::tyloi::kInt32) ||
+                    history.size(-1)<impl_->tokens || history.device()!=impl_->ks.device())
                 throw std::invalid_argument("QSA graph history position geometry mismatch");
-            impl_->graph_first_position.narrow(0,0,1).copy_(history.reshape({-1}).narrow(0,impl_->tokens-prior,1));
-            impl_->graph_first_position.narrow(0,1,1).fill_(1);
-        }else impl_->graph_first_position.narrow(0,1,1).zero_();
+            if(prior)impl_->graph_first_position.narrow(0,0,axes?3:1).copy_(history.narrow(-1,impl_->tokens-prior,1).reshape({axes?3:1}));
+        }
+        impl_->graph_first_position.narrow(0,3,1).fill_(history.defined() && prior?1:0);
         // This arena belongs to one fixed cache geometry and CUDA device.
         // Keep its plan across token replays, avoiding a device query per layer.
         auto& scratch=impl_->graph_workspace(int(queries));
@@ -1318,8 +1356,10 @@ void QsaTqCache::prepare_decode_tokens(int64_t queries,bool allow_pending,int ho
         }
     }
 }
-void QsaTqCache::advance_graph(int64_t tokens){
+void QsaTqCache::advance_graph(int64_t tokens,int64_t attention_rows){
     if(!impl_->pending_graph)return;
+    if(attention_rows!=-1 && attention_rows!=0 && attention_rows!=1)
+        throw std::invalid_argument("invalid QSA graph attention row count");
     if(tokens!=impl_->graph_queries || (tokens==1?impl_->graph_complete!=(impl_->tokens%4==3):impl_->graph_phase!=impl_->tokens%4))
         throw std::logic_error("QSA graph replay changed block phase");
     const auto start=impl_->tokens;
@@ -1329,7 +1369,7 @@ void QsaTqCache::advance_graph(int64_t tokens){
     impl_->tail_k=remainder?impl_->tail_storage_k.narrow(1,0,remainder):Tensor{};
     impl_->tail_v=remainder?impl_->tail_storage_v.narrow(1,0,remainder):Tensor{};
     impl_->tail_index=remainder?impl_->tail_storage_index.narrow(1,0,remainder):Tensor{};
-    impl_->update_history(start);
+    if(attention_rows!=0)impl_->update_history(attention_rows==1?start+tokens-1:start);
 }
 QsaTqCache::Tensor QsaTqCache::forward_pending_graph(const Tensor& q,const Tensor& k,const Tensor& v,const Tensor& iq,const Tensor& raw,
     const Tensor& positions,const Tensor& gate,Tensor output,const Pool& pool,const Tensor& absolute){

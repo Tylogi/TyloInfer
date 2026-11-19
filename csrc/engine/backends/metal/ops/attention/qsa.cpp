@@ -223,7 +223,7 @@ void Qsa::truncate(State& state, std::int64_t keep) const {
     state.impl_->keys.truncate(keep); state.impl_->values.truncate(keep); state.impl_->index.truncate(keep);
 }
 void Qsa::prepare_graph(State&, const Tensor&, std::int64_t, std::int64_t) const { throw std::logic_error("Metal QSA does not support graphs"); }
-void Qsa::advance_graph(State&, std::int64_t) const { throw std::logic_error("Metal QSA does not support graphs"); }
+void Qsa::advance_graph(State&, std::int64_t, std::int64_t) const { throw std::logic_error("Metal QSA does not support graphs"); }
 std::vector<Tensor> Qsa::project_inputs(const Tensor& input) const {
     auto result = project_group(input, impl_->weights.input_projection);
     if (impl_->weights.has_gate) {
@@ -334,7 +334,7 @@ Tensor Qsa::forward(State& state, const Tensor& hidden, const Tensor& positions,
         throw;
     }
 }
-Tensor Qsa::forward_graph(State&, const Tensor&, const Tensor&, const Tensor&, std::vector<Tensor>, bool, bool) const {
+Tensor Qsa::forward_graph(State&, const Tensor&, const Tensor&, const Tensor&, std::vector<Tensor>, bool, bool, bool) const {
     throw std::logic_error("Metal QSA does not support graphs");
 }
 

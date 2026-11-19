@@ -177,7 +177,7 @@ public:
     void prepare_graph(State&, const Tensor& positions, std::int64_t capacity,
         std::int64_t pending_tokens = 0) const;
     /** Advance the request after a graph replay. */
-    void advance_graph(State&, std::int64_t tokens) const;
+    void advance_graph(State&, std::int64_t tokens, std::int64_t attention_rows = -1) const;
     /** Truncate request cache to the accepted prefix. */
     void truncate(State&, std::int64_t keep) const;
     /** Project input rows under the configured grouped policy. */
@@ -190,7 +190,8 @@ public:
         bool project_output = true, bool history_only = false) const;
     /** Execute attention using prepared graph cache storage. */
     Tensor forward_graph(State&, const Tensor& hidden, const Tensor& positions, const Tensor& cache_positions,
-        std::vector<Tensor> projections = {}, bool project_output = true, bool history_only = false) const;
+        std::vector<Tensor> projections = {}, bool project_output = true, bool history_only = false,
+        bool query_tail = false) const;
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

@@ -453,19 +453,33 @@ class QsaCore {
     }
     DenseTensor forward_graph(State& request,const DenseTensor& hidden,
                          const DenseTensor& positions,const DenseTensor& cache_positions,
-                         std::vector<DenseTensor> projections={},bool project_output=true,bool history_only=false) {
+                         std::vector<DenseTensor> projections,bool project_output,bool history_only,bool query_tail) {
         if(request.adaptive) {
-            TYLOINFER_RUNTIME_CHECK(!history_only && hidden.size(0)==1 && request.adaptive->pending_graph_enabled(),
+            TYLOINFER_RUNTIME_CHECK(hidden.size(0)==1 && request.adaptive->pending_graph_enabled(),
                 "adaptive QSA requires a complete pending graph window");
-            auto p=project(hidden,positions,true,{},{},{},std::move(projections));
-            auto output=::tyloi::cuda::empty({1,hidden.size(1),c_.heads*c_.width},hidden.options().dtype(
+            const auto tokens=hidden.size(1);
+            Projection p;
+            if(history_only) p=project_history(hidden,positions);
+            else if(query_tail && tokens>1) {
+                const auto prefix=tokens-1;
+                auto history=project_history(hidden.narrow(1,0,prefix),positions.narrow(-1,0,prefix).contiguous());
+                p=project(hidden.narrow(1,prefix,1),positions.narrow(-1,prefix,1).contiguous());
+                p.key=::tyloi::cuda::cat({history.key,p.key},1);
+                p.value=::tyloi::cuda::cat({history.value,p.value},1);
+                p.raw=::tyloi::cuda::cat({history.raw,p.raw},1);
+            }else p=project(hidden,positions,true,{},{},{},std::move(projections));
+            const auto rows=query_tail?1:tokens;
+            auto output=history_only ? DenseTensor{} : ::tyloi::cuda::empty({1,rows,c_.heads*c_.width},hidden.options().dtype(
                 hidden.scalar_type()==::tyloi::kFloat16 ? ::tyloi::kFloat16 : ::tyloi::kFloat32));
             output=request.adaptive->forward_pending_graph(p.query,p.key,p.value,p.iq,p.raw,cache_positions,p.gate,
                 std::move(output),[this](const DenseTensor& raw,const DenseTensor& starts) {
                     return pool_index(raw,starts);
-                },positions).to(hidden.scalar_type());
+                },positions);
+            if(history_only)return {};
+            output=output.to(hidden.scalar_type());
             return project_output?this->project_output(output):output;
         }
+        TYLOINFER_RUNTIME_CHECK(!query_tail,"ordinary QSA requires separate graph history and tail writes");
         const auto mark=[](const char* phase) {
             if(auto* window=DecodeWindow::recording())window->mark_current(phase);
         };
@@ -620,10 +634,10 @@ class QsaCore {
         }
         return finish(std::move(gated));
     }
-    void advance_graph(State& request,int64_t tokens) {
+    void advance_graph(State& request,int64_t tokens,int64_t attention_rows) {
         if(request.adaptive) {
             MfqCudaGuard guard(c_.device);
-            request.adaptive->advance_graph(tokens);
+            request.adaptive->advance_graph(tokens,attention_rows);
             return;
         }
         if(!request.offload){request.keys.advance_fixed(tokens);request.values.advance_fixed(tokens);}
@@ -1342,7 +1356,9 @@ void Qsa::prepare_graph(State& state, const Tensor& positions, std::int64_t capa
     impl_->core.prepare_graph(state.impl_->cache,
         positions.representation<DenseTensor>() ? positions.dense() : DenseTensor{}, capacity, pending_tokens);
 }
-void Qsa::advance_graph(State& state, std::int64_t tokens) const { impl_->core.advance_graph(state.impl_->cache, tokens); }
+void Qsa::advance_graph(State& state, std::int64_t tokens, std::int64_t attention_rows) const {
+    impl_->core.advance_graph(state.impl_->cache, tokens, attention_rows);
+}
 void Qsa::truncate(State& state, std::int64_t keep) const { impl_->core.truncate(state.impl_->cache, keep); }
 std::vector<Tensor> Qsa::project_inputs(const Tensor& input) const {
     std::optional<MfqCudaGuard> guard;
@@ -1381,12 +1397,12 @@ Tensor Qsa::forward(State& state, const Tensor& hidden, const Tensor& positions,
     }
 }
 Tensor Qsa::forward_graph(State& state, const Tensor& hidden, const Tensor& positions, const Tensor& cache_positions,
-        std::vector<Tensor> projections, bool project_output, bool history_only) const {
+        std::vector<Tensor> projections, bool project_output, bool history_only, bool query_tail) const {
     std::optional<MfqCudaGuard> guard;
     if (impl_->device.is_cuda()) guard.emplace(impl_->device);
     Tensor result{DenseTensor{}};
     result.dense()=impl_->core.forward_graph(state.impl_->cache, hidden.dense(), positions.dense(), cache_positions.dense(),
-        views(projections), project_output, history_only);
+        views(projections), project_output, history_only, query_tail);
     return result;
 }
 struct Qsa::Graph::Impl {
