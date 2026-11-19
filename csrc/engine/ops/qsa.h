@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <utility>
 #include <vector>
 
@@ -49,6 +50,24 @@ public:
         struct Impl;
         std::unique_ptr<Impl> impl_;
         friend class Qsa;
+    };
+
+    /** Keep host staging capacity borrowed during prefill, within the supplied states' lifetime. */
+    class HostLoan {
+    public:
+        HostLoan(std::span<State* const> layers, std::size_t base_bytes, std::int64_t end, std::int64_t rows);
+        ~HostLoan();
+        HostLoan(const HostLoan&) = delete;
+        HostLoan& operator=(const HostLoan&) = delete;
+        std::size_t bytes() const noexcept { return bytes_; }
+        /** Reclaim host memory before allocating the input staging buffers. */
+        void prepare();
+        /** Retire completed GPU images before returning the expert workspace. */
+        void collect();
+    private:
+        struct Impl;
+        std::unique_ptr<Impl> impl_;
+        std::size_t bytes_;
     };
 
     /** Plan and prepare graph cache layouts for transient request states. */

@@ -1235,12 +1235,6 @@ class Qsa {
     std::optional<QsaRamMemory> adaptive_ram_memory()const {return adaptive_?adaptive_->ram_memory():std::nullopt;}
     void wait_adaptive() {if(adaptive_)adaptive_->wait();}
     void collect_adaptive() {if(adaptive_)adaptive_->collect();}
-    std::shared_ptr<void> hold_adaptive_workspace(std::size_t bytes) {
-        return adaptive_?adaptive_->hold_host_workspace(bytes):std::shared_ptr<void>{};
-    }
-    QsaRamWorkspaceProgress reclaim_shared_adaptive_workspace() {
-        return adaptive_?adaptive_->reclaim_shared_host_workspace():QsaRamWorkspaceProgress{};
-    }
     void release_idle_adaptive() {if(adaptive_)adaptive_->release_idle();}
     void set_adaptive_budget(std::size_t bytes) {if(adaptive_)adaptive_->set_budget(bytes);}
     int pending_device_graph_kind(int64_t tokens) const {return adaptive_?adaptive_->device_graph_kind(tokens):0;}

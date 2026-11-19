@@ -436,13 +436,6 @@ namespace {
     return output;
 }
 
-void qwen4_validate_forward(const qwen4_exp::Model& model, std::int64_t tokens,
-                            std::int64_t position, bool cache_override) {
-    tyloi::models::require_model(tokens > 0 &&
-        position + tokens <= model.metadata.max_position_embeddings && !cache_override,
-        "Qwen4 requires unpadded causal cache positions");
-}
-
 
 } // namespace
 bool Model::prefetch_token_rows(State& state,const ::tyloi::Tensor& host_ids) {
@@ -1400,6 +1393,10 @@ tyloi::StepSequence<tyloi::models::Prefill> qwen4_exp::Model::prefill(
     TYLOINFER_RUNTIME_CHECK(compute_chunk>8,"layer-major compute chunk must exceed decode width");
     const auto tokens=ids.size(1);
     compute_chunk=std::min(compute_chunk,tokens);
+    const auto cache_start=state.cache_pos;
+    const auto maximum=model.metadata.max_position_embeddings;
+    tyloi::models::require_model(tokens > 0 && cache_start >= 0 && cache_start <= maximum &&
+        tokens <= maximum - cache_start, "Qwen4 requires unpadded causal cache positions");
     const Device cpu(kCPU);
     std::size_t ple_host = 0, previous = 0;
     for (const auto& block : model.layers) {
@@ -1414,13 +1411,17 @@ tyloi::StepSequence<tyloi::models::Prefill> qwen4_exp::Model::prefill(
     const auto raw_rows = tap_layers.empty() ? model.config.streams : int64_t(tap_layers.size());
     const auto raw_host = raw_hidden && raw_hidden_host
         ? make_contiguous_view(nullptr, std::array<int64_t, 3>{tokens, model.config.hidden, raw_rows}, kFloat32, cpu).nbytes() : 0;
+    std::vector<tyloi::ops::Qsa::State*> qsa_states;
+    for (const auto& layer : state.layers)
+        if (layer->qsa) qsa_states.push_back(layer->qsa.get());
+    std::optional<tyloi::ops::Qsa::HostLoan> host_workspace(std::in_place, qsa_states,
+        std::max(ple_host, raw_host), cache_start + tokens, compute_chunk);
     auto growth = state.growth(input, options);
     add_growth(growth, cpu, std::size_t(tokens) * sizeof(int64_t));
-    add_growth(growth, cpu, std::max(ple_host, raw_host));
+    add_growth(growth, cpu, host_workspace->bytes());
     co_yield tyloi::GraphRequest{tyloi::GraphPhase::admit, nullptr, std::move(growth)};
 
     ids=model.device_ids(ids).dense();
-    const auto cache_start=state.cache_pos;
     auto capture = tyloi::ops::ProfileCapture::prefill_once(tokens);
     const auto reserve=std::size_t(1)<<30;
     const auto row_bytes=std::size_t(model.config.hidden)*model.config.streams*sizeof(float)*8;
@@ -1431,7 +1432,6 @@ tyloi::StepSequence<tyloi::models::Prefill> qwen4_exp::Model::prefill(
         tyloi::Workspace::Tile{tokens,row_bytes,&compute_chunk}};
     capture.resume();
     tyloi::cuda::ResidentAllocationScope persistent_preamble;
-    qwen4_validate_forward(model,tokens,cache_start,false);
     if(cache_start==0)state.reset(1);
     state.begin_forward();
     auto current=::tyloi::cuda::arange(cache_start,cache_start+tokens,ids.options());
@@ -1445,6 +1445,7 @@ tyloi::StepSequence<tyloi::models::Prefill> qwen4_exp::Model::prefill(
         (prepared.dim() == 3 && prepared.size(0) == 3 && prepared.size(1) == 1)) && prepared.size(-1) == tokens,
         "Qwen4 positions require [T], [3,T], [4,T], [3,B,T] or [4,B,T]");
     auto cpu_ids=ids.to(::tyloi::kCPU,::tyloi::kInt64).contiguous();
+    host_workspace->prepare();
     const auto first_ids = cpu_ids.narrow(1, 0, compute_chunk);
     const auto prefetch = [&](std::size_t layer) {
         if (layer < model.layers.size() && model.layers[layer]->ple)
@@ -1691,10 +1692,12 @@ tyloi::StepSequence<tyloi::models::Prefill> qwen4_exp::Model::prefill(
     result.hidden=std::move(finalized);
     result.raw=std::move(raw);
     capture.suspend();
+    host_workspace->collect();
     co_yield tyloi::Workspace{0,&result.hidden,std::nullopt,raw_hidden && !raw_hidden_host ? &result.raw : nullptr};
     capture.resume();
     state.finish_forward(prepared_full,1,tokens);
     state.cache_pos=cache_start+tokens;
+    host_workspace.reset();
     result.phase=tyloi::models::Prefill::Phase::complete;
     capture.suspend(); co_yield std::move(result); capture.resume();
 }

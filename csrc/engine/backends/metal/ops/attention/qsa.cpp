@@ -123,6 +123,12 @@ struct Qsa::State::Impl {
           values(model.config.maximum, model.config.kv_heads * model.value_width, model.cache_type),
           index(model.config.maximum, model.config.index_width) {}
 };
+struct Qsa::HostLoan::Impl {};
+Qsa::HostLoan::HostLoan(std::span<State* const>, std::size_t base_bytes, std::int64_t, std::int64_t)
+    : bytes_(base_bytes) {}
+Qsa::HostLoan::~HostLoan() = default;
+void Qsa::HostLoan::prepare() {}
+void Qsa::HostLoan::collect() {}
 Qsa::Qsa(QsaWeights weights, QsaConfig config) : impl_(std::make_unique<Impl>(std::move(weights), std::move(config))) {}
 Qsa::~Qsa() = default;
 Qsa::Qsa(Qsa&&) noexcept = default;

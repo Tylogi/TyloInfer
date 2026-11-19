@@ -18,6 +18,7 @@
 #include "engine/backends/cuda/ops/attention/kv/quantization.h"
 #include "engine/backends/cuda/executor/kv/memory.h"
 #include "engine/backends/cuda/ops/attention/kv/hot_cache.h"
+#include "engine/generation/prefill/budget.h"
 #include "engine/state/kv/offload.h"
 #include <algorithm>
 #include <array>
@@ -1168,6 +1169,47 @@ struct Qsa::State::Impl {
     DenseTensor failed_output;
     explicit Impl(const detail::QsaCore& model) : cache(model) {}
 };
+
+struct Qsa::HostLoan::Impl {
+    std::vector<cuda::QsaTqCache*> caches;
+    std::vector<cuda::QsaRamCache*> pools;
+    std::vector<std::shared_ptr<void>> holds;
+};
+
+Qsa::HostLoan::HostLoan(std::span<State* const> layers, std::size_t base_bytes,
+                       std::int64_t end, std::int64_t rows) : bytes_(base_bytes) {
+    std::size_t extra = 0;
+    for (auto* layer : layers) {
+        auto* cache = layer->impl_->cache.adaptive.get();
+        if (!cache) continue;
+        if (!impl_) impl_ = std::make_unique<Impl>();
+        impl_->caches.push_back(cache);
+        auto* ram = cache->ram();
+        if (!ram) continue;
+        extra = std::max(extra, cache->prefill_host_bytes(end, rows));
+        const auto pool = ram->workspace_pool();
+        if (std::none_of(impl_->pools.begin(), impl_->pools.end(),
+                [pool](const auto* other) { return other->workspace_pool() == pool; }))
+            impl_->pools.push_back(ram);
+    }
+    bytes_ = engine::prefill_budget_add(base_bytes, extra);
+    if (impl_)
+        for (auto* pool : impl_->pools) impl_->holds.push_back(pool->hold_workspace(bytes_));
+}
+
+Qsa::HostLoan::~HostLoan() = default;
+
+void Qsa::HostLoan::prepare() {
+    if (!impl_ || impl_->pools.empty()) return;
+    for (auto* cache : impl_->caches) cache->wait();
+    cuda::QsaRamCache::prepare_workspace(impl_->pools, bytes_);
+}
+
+void Qsa::HostLoan::collect() {
+    if (!impl_) return;
+    TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(mfq_current_cuda_stream()));
+    for (auto* cache : impl_->caches) cache->collect();
+}
 
 Qsa::Qsa(QsaWeights weights, QsaConfig config)
     : impl_(std::make_unique<Impl>(std::move(weights), std::move(config))) {}

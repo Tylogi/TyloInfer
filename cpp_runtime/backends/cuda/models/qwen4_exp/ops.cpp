@@ -5,8 +5,6 @@
 #include "mfq_cuda_sampling_ops.h"
 #include "tyloinfer/runtime.h"
 #include "tyloinfer/host_memory.h"
-#include "runtime/qsa_ram_cache.h"
-#include "kernels/qsa_ram.h"
 #include "ops.h"
 #include "model.h"
 #include "mtp.h"
@@ -3368,23 +3366,6 @@ mfq_tensor_backend::Tensor qwen4_layer_major_prefill_hidden(
         }
     } restore{profiler,profiler.enabled,previous_profile,collect};
     compute_chunk=std::min(compute_chunk,tokens);
-    // Host hidden exports, PLE packets and replacement descriptors overlap
-    // live KV. Reserve their actual geometry before reclaiming cold blocks.
-    const auto hidden_host=raw_hidden && raw_hidden_host ?
-        std::size_t(tokens)*model.config.hidden*model.config.streams*sizeof(float):0;
-    const auto ple_host=model.config.ple_layers.empty()?0:
-        2*std::size_t(compute_chunk)*model.config.hidden*sizeof(float);
-    const auto blocks=std::size_t(cache_start+tokens+3)/4;
-    const auto descriptors=2*blocks*(sizeof(tyloinfer::qsa::RamBlockView)+sizeof(std::int32_t));
-    const auto codec=2*std::size_t(compute_chunk)*model.config.kv_heads*model.config.width*2*sizeof(float);
-    const auto host_workspace=mfq::engine::prefill_budget_add(
-        std::max(hidden_host,ple_host),mfq::engine::prefill_budget_add(descriptors,codec));
-    std::vector<std::shared_ptr<void>> host_loans;
-    std::unordered_set<const void*> reserved_host_pools;
-    for(auto* block:model.loaded_blocks)if(block->qsa)
-        if(const auto memory=block->qsa->adaptive_ram_memory();
-                memory && reserved_host_pools.insert(memory->pool).second)
-            host_loans.push_back(block->qsa->hold_adaptive_workspace(host_workspace));
     RoutedPrefillWorkspaceLoan workspace_loan(*model.execution);
     bool borrowed_workspace=false;
     {
@@ -3449,29 +3430,6 @@ mfq_tensor_backend::Tensor qwen4_layer_major_prefill_hidden(
     auto prepared=model.adapter_prepare_positions(std::move(current),1,tokens);
     model.adapter_validate_positions(prepared.positions,1,tokens,false);
     auto cpu_ids=ids.to(tb::kCPU,tb::kInt64).contiguous();
-    // Expert-cache restoration can consume RAM after the preceding chunk's
-    // last attention. Reclaim cold KV before the next PLE packet is pinned.
-    const auto host_before=mfq::sample_host_memory().available_host_bytes();
-    mfq::cuda::prepare_qsa_ram_workspace(host_workspace,[&] {
-        for(auto* block:model.loaded_blocks)if(block->qsa)block->qsa->wait_adaptive();
-        TYLOINFER_CUDA_CHECK(cudaStreamSynchronize(mfq_current_cuda_stream()));
-        mfq::cuda::QsaRamWorkspaceProgress progress;
-        std::unordered_set<const void*> pools;
-        for(auto* block:model.loaded_blocks)if(block->qsa) {
-            if(const auto memory=block->qsa->adaptive_ram_memory()) {
-                if(pools.insert(memory->pool).second) {
-                    const auto shared=block->qsa->reclaim_shared_adaptive_workspace();
-                    progress.logical+=shared.logical;progress.physical+=shared.physical;
-                }
-            }
-            block->qsa->collect_adaptive();
-        }
-        return progress;
-    });
-    if(const auto* trace=std::getenv("TYLOINFER_TRACE_KERNEL_DISPATCH");trace && trace[0]=='1')
-        std::fprintf(stderr,"native_prefill_host_pressure actual_match=1 before_bytes=%llu after_bytes=%llu workspace_bytes=%zu before_ple=1\n",
-            static_cast<unsigned long long>(host_before),
-            static_cast<unsigned long long>(mfq::sample_host_memory().available_host_bytes()),host_workspace);
     persistent_preamble.finish();
     Tensor hidden=tb::empty({1,tokens,model.hidden_size()*model.hc_mult()},
                            ids.options().dtype(tb::kFloat16));

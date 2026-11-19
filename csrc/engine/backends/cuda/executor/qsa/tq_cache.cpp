@@ -9,6 +9,7 @@
 #include "engine/backends/cuda/kernels/attention/qsa/tq_encode.h"
 #include "engine/backends/cuda/native/resident_allocations.h"
 #include "engine/backends/cuda/ops/qwen4_exp.h"
+#include "engine/generation/prefill/budget.h"
 #include "engine/weights/encoding/readers/window.h"
 #include <atomic>
 #include <array>
@@ -1262,11 +1263,18 @@ QsaTqCache::Tensor QsaTqCache::forward(const Tensor& q,const Tensor& k,const Ten
     const Tensor& positions,const Pool& pool,bool history_only,const Tensor& gate,Tensor output,bool fp16_math,const Tensor& full_positions){
     return impl_->forward(q,k,v,iq,raw,positions,pool,history_only,gate,std::move(output),fp16_math,full_positions);
 }
-std::shared_ptr<void> QsaTqCache::hold_host_workspace(std::size_t bytes) {
-    return impl_->ram?impl_->ram->hold_workspace(bytes):std::shared_ptr<void>{};
-}
-QsaRamWorkspaceProgress QsaTqCache::reclaim_shared_host_workspace() {
-    return impl_->ram?impl_->ram->reclaim_shared_workspace():QsaRamWorkspaceProgress{};
+QsaRamCache* QsaTqCache::ram() noexcept { return impl_->ram.get(); }
+std::size_t QsaTqCache::prefill_host_bytes(std::int64_t end, std::int64_t rows) const {
+    const auto& s = *impl_;
+    if (!s.ram) return 0;
+    if (end <= 0 || end > s.maximum || rows <= 0 || rows > end)
+        throw std::invalid_argument("invalid QSA host workspace window");
+    const auto blocks = (end + 3) / 4;
+    const auto descriptors = make_contiguous_view(nullptr,
+        std::array<int64_t, 3>{2, blocks, sizeof(tq::RamBlockView) + sizeof(int32_t)}, kUInt8, Device(kCPU)).nbytes();
+    const auto codec = make_contiguous_view(nullptr,
+        std::array<int64_t, 4>{4, rows, s.kv_heads, s.width}, kFloat32, Device(kCPU)).nbytes();
+    return engine::prefill_budget_add(descriptors, codec);
 }
 std::optional<QsaRamMemory> QsaTqCache::ram_memory()const {
     if(!impl_->ram)return {};auto result=impl_->ram->memory();

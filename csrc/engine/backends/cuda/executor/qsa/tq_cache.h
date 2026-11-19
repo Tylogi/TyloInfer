@@ -47,8 +47,8 @@ public:
     // Observe I/O without finishing pending history or changing cache policy.
     std::uint64_t ssd_read_bytes() const;
     std::optional<QsaRamMemory> ram_memory()const;
-    std::shared_ptr<void> hold_host_workspace(std::size_t bytes);
-    QsaRamWorkspaceProgress reclaim_shared_host_workspace();
+    QsaRamCache* ram() noexcept;
+    std::size_t prefill_host_bytes(std::int64_t end, std::int64_t rows) const;
     std::vector<Tensor> resident_tensors()const;
     bool supports_session()const;
     std::size_t fresh_session_growth() const;

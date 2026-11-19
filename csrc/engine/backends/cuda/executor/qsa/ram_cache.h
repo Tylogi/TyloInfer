@@ -6,14 +6,10 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <span>
 #include <utility>
 
 namespace tyloi::cuda {
-struct QsaRamWorkspaceProgress {std::size_t logical=0,physical=0;};
-// A shared budget changes after each layer is reclaimed. Revisit all layers
-// until the host allocation can proceed, rather than accepting a local fit.
-void prepare_qsa_ram_workspace(std::size_t bytes,
-    const std::function<QsaRamWorkspaceProgress()>& reclaim);
 struct QsaRamMemory {
     const void* pool=nullptr;
     std::size_t payload=0,allocated=0,target=0,disk=0;
@@ -36,7 +32,9 @@ public:
     ~QsaRamCache();
     // Use the cache's owning worker even after loader/request thread handoff.
     std::shared_ptr<void> hold_workspace(std::size_t bytes);
-    QsaRamWorkspaceProgress reclaim_shared_workspace();
+    const void* workspace_pool()const noexcept;
+    // Reserve each worker first; pass one live cache per worker.
+    static void prepare_workspace(std::span<QsaRamCache* const> pools,std::size_t bytes);
     void prepare();
     Tensor prepared_views()const;
     bool collect_graph_selection(const Tensor& selected,int queries,int count);
@@ -70,6 +68,8 @@ public:
     QsaRamMemory memory()const;
     std::vector<Tensor> resident_tensors()const;
 private:
+    struct WorkspaceProgress {std::size_t logical=0,physical=0;};
+    WorkspaceProgress reclaim_shared_workspace();
     struct Impl;std::unique_ptr<Impl> impl_;
 };
 } // namespace tyloi::cuda

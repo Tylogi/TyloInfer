@@ -585,21 +585,6 @@ static std::shared_ptr<void> hold_worker_workspace(std::shared_ptr<RamWorker> ow
     };
     return std::make_shared<Reservation>(std::move(owner),bytes);
 }
-void prepare_qsa_ram_workspace(std::size_t bytes,
-        const std::function<QsaRamWorkspaceProgress()>& reclaim) {
-    auto previous=reclaim();bool retried=false;
-    while(tyloi::sample_host_memory().available_host_bytes()<bytes) {
-        const auto current=reclaim();
-        if(tyloi::sample_host_memory().available_host_bytes()>=bytes)return;
-        const bool progress=current.logical<previous.logical || current.physical<previous.physical;
-        if(!progress && retried)
-            throw std::runtime_error("Insufficient host memory for prefill workspace: required="+
-                std::to_string(bytes)+" available="+
-                std::to_string(tyloi::sample_host_memory().available_host_bytes())+
-                " logical_kv="+std::to_string(current.logical)+" pinned_kv="+std::to_string(current.physical));
-        retried=!progress;previous=current;
-    }
-}
 struct QsaRamCache::Impl {
     int capacity,rows,count,bits,device=0;std::size_t fp16_bytes,affine_bytes,cache_stride,spill_stride;
     bool ssd_enabled=false,mapped_capability=false;
@@ -1067,8 +1052,11 @@ QsaRamCache::~QsaRamCache(){
 std::shared_ptr<void> QsaRamCache::hold_workspace(std::size_t bytes) {
     return hold_worker_workspace(impl_->worker,bytes);
 }
-QsaRamWorkspaceProgress QsaRamCache::reclaim_shared_workspace() {
+const void* QsaRamCache::workspace_pool()const noexcept{return impl_->worker.get();}
+QsaRamCache::WorkspaceProgress QsaRamCache::reclaim_shared_workspace() {
     const auto worker=impl_->worker;
+    MfqCudaGuard device(worker->device);
+    const MfqCudaStreamGuard stream(StreamHandle(worker->device,worker->stream));
     std::vector<std::shared_ptr<RamAccount>> accounts;
     {
         std::lock_guard lock(worker->mutex);
@@ -1089,7 +1077,7 @@ QsaRamWorkspaceProgress QsaRamCache::reclaim_shared_workspace() {
         if(account->owner)account->owner->wait();
     }
     check(cudaStreamSynchronize(mfq_current_cuda_stream()));
-    QsaRamWorkspaceProgress progress;
+    WorkspaceProgress progress;
     for(const auto& account:accounts) {
         std::lock_guard lock(account->owner_mutex);
         if(!account->owner)continue;
@@ -1102,6 +1090,28 @@ QsaRamWorkspaceProgress QsaRamCache::reclaim_shared_workspace() {
         accounts.size(),worker->workspace_bytes.load(),accounted_before,actual_before,progress.logical,progress.physical,
         static_cast<unsigned long long>(tyloi::sample_host_memory().available_host_bytes()));
     return progress;
+}
+void QsaRamCache::prepare_workspace(std::span<QsaRamCache* const> pools,std::size_t bytes) {
+    const auto reclaim=[&] {
+        WorkspaceProgress total;
+        for(auto* pool:pools) {
+            const auto progress=pool->reclaim_shared_workspace();
+            total.logical+=progress.logical;total.physical+=progress.physical;
+        }
+        return total;
+    };
+    auto previous=reclaim();bool retried=false;
+    while(tyloi::sample_host_memory().available_host_bytes()<bytes) {
+        const auto current=reclaim();
+        if(tyloi::sample_host_memory().available_host_bytes()>=bytes)return;
+        const bool progress=current.logical<previous.logical || current.physical<previous.physical;
+        if(!progress && retried)
+            throw std::runtime_error("Insufficient host memory for prefill workspace: required="+
+                std::to_string(bytes)+" available="+
+                std::to_string(tyloi::sample_host_memory().available_host_bytes())+
+                " logical_kv="+std::to_string(current.logical)+" pinned_kv="+std::to_string(current.physical));
+        retried=!progress;previous=current;
+    }
 }
 void QsaRamCache::prepare() {
     auto& s=*impl_;if(!s.arena)s.arena=arena_for(s.device,mfq_current_cuda_stream(),s.capacity,s.count,2*s.fp16_bytes,s.options,s.worker->pool_account);
@@ -1120,8 +1130,9 @@ std::optional<QsaRamPrefillStage> QsaRamCache::stage_prefill(std::size_t blocks)
     constexpr auto maximum_io_records=(1ULL<<20)/sizeof(tq::RamKvReadInto);
     const auto io_bytes=tq::RamKvStore::sequential_read_workspace(std::min(blocks,std::size_t(maximum_io_records)));
     const auto io_reservation=hold_worker_workspace(s.worker,io_bytes);
-    if(tyloi::sample_host_memory().available_host_bytes()<io_bytes)
-        prepare_qsa_ram_workspace(io_bytes,[this]{return reclaim_shared_workspace();});
+    if(tyloi::sample_host_memory().available_host_bytes()<io_bytes) {
+        const std::array<QsaRamCache*,1> pools{this};prepare_workspace(pools,io_bytes);
+    }
     // Re-evaluate physical pressure before taking leases that prevent KV
     // reclamation. Waiting only for an earlier codec plan uses a stale budget.
     const auto snapshot=this->snapshot(blocks);
