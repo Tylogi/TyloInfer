@@ -67,6 +67,8 @@ struct Qwen4ExpMtp final : MtpModule {
     void history_step(const MtpTarget &target, Tensor hidden, Tensor ids, Tensor positions = {},
                       bool scalar_chain = false);
     std::optional<MtpStep> history_tail_step(const MtpTarget&,Tensor hidden,Tensor ids,Tensor positions = {});
+    std::optional<Tensor> enqueue_greedy_chain(const MtpTarget&,Tensor hidden,Tensor ids,
+        Tensor positions,int depth,bool publish_host=false);
     std::optional<std::vector<int32_t>> queued_greedy_chain(const MtpTarget&,Tensor hidden,Tensor ids,
         Tensor positions,int depth,const std::function<void(const std::vector<int32_t>&)>& publish = {});
 

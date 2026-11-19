@@ -589,20 +589,38 @@ template <class Model> struct CudaMtpOps {
                : result;
   }
   Tensor enqueue_greedy_chain(Tensor hidden,Tensor ids,Tensor positions,int depth,Tensor* verification_ids) {
+    Tensor proposals;
     if constexpr(std::is_same_v<Model,mfq::cuda::Qwen35CausalLm>) {
       if(auto* predictor=dynamic_cast<Qwen35Mtp*>(&mtp);
           predictor && mfq::cuda::qwen35::MtpTargetGraphs::eligible(model,ids)) {
-        auto proposals=predictor->enqueue_greedy_chain(target,std::move(hidden),std::move(ids),std::move(positions),depth,verification_ids);
-        if(proposals) {
-          projected_predictor_hidden={};projected_predictor_logits={};projected_predictor_compact={};
-          projected_predictor_greedy=-1;projected_predictor_probability=-1.f;
-          const bool initialized=mtp.take_graph_initialization();
-          target_maintenance=target_maintenance || initialized;
-          return std::move(*proposals);
+        auto tokens=predictor->enqueue_greedy_chain(target,std::move(hidden),std::move(ids),std::move(positions),depth,verification_ids);
+        if(tokens)proposals=std::move(*tokens);
+      }
+    } else if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
+      if(auto* predictor=dynamic_cast<mfq::cuda::qwen4_exp::Qwen4ExpMtp*>(&mtp);
+          predictor && !transformed_prompt && depth<8 && mfq::cuda::qwen4_can_verify_device_drafts(model)) {
+        auto window=predictor->enqueue_greedy_chain(target,std::move(hidden),std::move(ids),std::move(positions),depth);
+        if(window) {
+          if(verification_ids)*verification_ids=*window;
+          proposals=window->narrow(1,1,depth).reshape({depth});
+          if(const auto* trace=std::getenv("TYLOINFER_TRACE_KERNEL_DISPATCH");trace && trace[0]=='1') {
+            static thread_local bool reported=false;
+            if(!reported) {
+              reported=true;
+              std::cerr<<"native_qwen4_device_verification actual_match=1 depth="<<depth
+                       <<" draft_wait_before_target=0\n";
+            }
+          }
         }
       }
     }
-    return {};
+    if(proposals.defined()) {
+      projected_predictor_hidden={};projected_predictor_logits={};projected_predictor_compact={};
+      projected_predictor_greedy=-1;projected_predictor_probability=-1.f;
+      const bool initialized=mtp.take_graph_initialization();
+      target_maintenance=target_maintenance || initialized;
+    }
+    return proposals;
   }
   std::pair<std::vector<int32_t>,std::vector<int32_t>> resolve_queued_greedy(
       const Tensor& proposals,Tensor logits) {
@@ -610,6 +628,14 @@ template <class Model> struct CudaMtpOps {
         logits.size(0)==proposals.numel()+1,"invalid queued greedy verification");
     const bool captured=projected_target_packet.defined() && projected_target_logits.defined() &&
         logits.data_ptr()==projected_target_logits.data_ptr() && logits.numel()==projected_target_logits.numel();
+    if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
+      if(projected_target_logits.defined() && logits.data_ptr()==projected_target_logits.data_ptr() &&
+          projected_target_greedy.size()==std::size_t(logits.size(0))) {
+        auto host=proposals.cpu().contiguous();
+        const auto* tokens=host.template data_ptr<int64_t>();
+        return {std::vector<int32_t>(tokens,tokens+host.numel()),projected_target_greedy};
+      }
+    }
     auto packet=projected_target_packet;
     if(!captured) {
       auto samples=sampler().ops().sample_greedy(logits.contiguous()).reshape({-1});

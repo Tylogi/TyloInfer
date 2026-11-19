@@ -117,6 +117,7 @@ void qwen4_restore_dense_prefill_weights(Qwen4CausalLm&,MtpModule*,std::size_t t
     std::size_t prefill_workspace=0,std::optional<std::size_t> batch_decode_workspace=std::nullopt);
 std::size_t qwen4_borrowed_dense_weight_bytes(const Qwen4CausalLm&);
 bool qwen4_prefetch_decode_ple(Qwen4CausalLm&,const mfq_tensor_backend::Tensor& host_ids);
+bool qwen4_can_verify_device_drafts(const Qwen4CausalLm&);
 std::optional<mfq_tensor_backend::Tensor> qwen4_decode_graph_logits(
     Qwen4CausalLm&,mfq_tensor_backend::Tensor,int,const mfq_tensor_backend::Tensor& host_ids={});
 std::optional<mfq_tensor_backend::Tensor> qwen4_decode_graph_hidden(
