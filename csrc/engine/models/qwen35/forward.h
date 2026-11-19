@@ -21,8 +21,9 @@ struct ForwardRow {
     const Model& model, State& state, ::tyloi::models::Input input,
     const ::tyloi::models::ForwardOptions& options);
 
+void replay_layers(const Model& model, State& state, std::int64_t retained);
 #if TYLOINFER_HAS_CUDA
-bool replay_graph(State& state, std::int64_t retained);
+StepSequence<bool> replay_graph(const Model& model, State& state, std::int64_t retained, bool capture);
 #endif
 
 ::tyloi::StepSequence<std::vector<::tyloi::models::Decoded>> forward_batch(

@@ -20,6 +20,7 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <exception>
 #include <iostream>
 #include <memory>
 #include <optional>
@@ -91,7 +92,37 @@ struct MtpOps {
     bool retains_partial_target_prefix(int accepted) const {
         return state.retains_partial_prefix(accepted) || mtp.retains_partial_target_prefix();
     }
-    void rollback_target(std::int64_t accepted) { state.rollback_speculative(accepted); }
+    void rollback_target(std::int64_t accepted) {
+        if (!graph_enabled) {
+            state.rollback_speculative(accepted);
+            return;
+        }
+        auto scope = executor.enter();
+        Capture capture(executor, weights, budget, device);
+        auto job = state.rollback_steps(accepted);
+        std::optional<bool> result;
+        bool observed = false;
+        try {
+            while (auto step = job.next()) {
+                if (result || step.layer || step.workspace || bool(step.graph) == bool(step.value))
+                    throw std::logic_error("invalid MTP rollback graph event");
+                observed = true;
+                if (step.graph) capture.step(std::move(*step.graph));
+                else result = *step.value;
+            }
+            if (!result) throw std::logic_error("MTP rollback graph ended without a result");
+            executor.submit(state.storage());
+            capture.finish();
+            job = {};
+            target_maintenance = target_maintenance || *result;
+        } catch (...) {
+            auto failure = std::current_exception();
+            try { capture.drain(); } catch (...) {}
+            job = {};
+            if (observed) try { budget.reserve(state.graph_exit_growth()); state.release_graphs(); } catch (...) {}
+            std::rethrow_exception(failure);
+        }
+    }
     void initialize(const std::vector<int64_t>& prompt, const MfqSamplingParams& sampling) {
         input_ids = ids_for(prompt);
         const auto prefix = std::min<std::int64_t>(prompt.size(), info.max_context);

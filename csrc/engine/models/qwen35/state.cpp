@@ -397,8 +397,14 @@ void State::commit_speculative() {
 }
 
 void State::rollback_speculative(std::int64_t accepted) {
-    owner_->replay(*this, accepted);
+    (void)finish_steps(owner_->replay(*this, accepted, false));
 }
+
+#if TYLOINFER_HAS_CUDA
+StepSequence<bool> State::rollback_steps(std::int64_t accepted) {
+    return owner_->replay(*this, accepted, true);
+}
+#endif
 
 std::int64_t State::rewind(std::int64_t accepted_suffix) {
     require_state(speculative_start >= 0 && accepted_suffix >= 0,

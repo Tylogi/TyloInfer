@@ -33,6 +33,7 @@ struct DecodeGraphs {
         std::vector<Checkpoint> checkpoints;
         std::unique_ptr<cuda::RecordedGdnReplayBatch> replay;
         cuda::DecodeWindow window;
+        std::map<std::int64_t, std::unique_ptr<cuda::DecodeWindow>> rollbacks;
     };
 
     explicit DecodeGraphs(cuda::StreamHandle stream) : stream(std::move(stream)) {}
@@ -240,20 +241,62 @@ StepSequence<models::Decoded> Model::decode(models::Input input, models::State& 
     co_yield std::move(result);
 }
 
-bool replay_graph(State& state, std::int64_t retained) {
+StepSequence<bool> replay_graph(const Model& model, State& state, std::int64_t retained, bool capture) {
     const auto& graphs = state.decode_graphs;
-    if (!graphs || !graphs->active || !graphs->active->replay ||
+    if (!graphs || !graphs->active ||
         graphs->stream.stream() != mfq_get_current_cuda_stream(graphs->stream.device_index()).stream())
-        return false;
+        co_return;
     auto& cell = *graphs->active;
+    if (cell.checkpoints.empty()) co_return;
     for (const auto& checkpoint : cell.checkpoints) {
         const auto& linear = std::get<LinearState>(state.layers[checkpoint.layer]);
-        if (!checkpoint.projected.qkv.same_view(linear.projected.qkv) ||
-            !checkpoint.projected.updates.same_view(linear.projected.updates))
-            return false;
+        const auto& recorded = checkpoint.projected;
+        const auto& current = linear.projected;
+        if (!recorded.qkv.same_view(current.qkv) || !recorded.updates.same_view(current.updates) ||
+            !recorded.qk.same_view(current.qk) || !recorded.value.same_view(current.value) ||
+            !recorded.gate.same_view(current.gate) || !recorded.beta.same_view(current.beta)) co_return;
     }
-    cell.replay->run(retained);
-    return true;
+    if (cell.replay) {
+        cell.replay->run(retained);
+        co_yield false;
+        co_return;
+    }
+    if (!capture) co_return;
+
+    auto owners = state.storage();
+    auto& slot = cell.rollbacks[retained];
+    if (slot && !slot->matches(owners)) slot.reset();
+    const bool initialize = !slot;
+    if (initialize) {
+        co_yield GraphPhase::ready;
+        auto window = std::make_unique<cuda::DecodeWindow>(graphs->stream.stream());
+        const auto accepted = retained - state.speculative_confirmed;
+        auto recording = window->begin_capture();
+        while (recording->next()) {
+            std::exception_ptr failure;
+            bool warm = false;
+            try {
+                replay_layers(model, state, retained);
+                warm = recording->finish();
+            } catch (...) { failure = std::current_exception(); }
+            if (failure) {
+                if (!recording->retry(failure)) std::rethrow_exception(failure);
+                warm = true;
+            }
+            if (warm) {
+                // Each pass must consume the same initial recurrence.
+                state.rewind(accepted);
+                recording->pause();
+                co_yield GraphRequest{GraphPhase::admit, nullptr, recording->growth()};
+                recording->resume();
+            }
+        }
+        recording->complete();
+        window->retain(owners);
+        slot = std::move(window);
+    }
+    if (!slot->enqueue_if_device_only()) slot->run();
+    co_yield initialize;
 }
 
 } // namespace tyloi::models::qwen35

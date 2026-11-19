@@ -69,7 +69,7 @@ struct Model : tyloi::models::CausalModel {
     ::tyloi::Tensor forward(tyloi::models::Input input, tyloi::models::State& state, const tyloi::models::ForwardOptions& options = {}) const override;
     StepSequence<models::Decoded> decode(models::Input, models::State&,
         const models::ForwardOptions&, const models::DecodeOptions&) const override;
-    void replay(State& state, std::int64_t accepted = 0) const;
+    StepSequence<bool> replay(State& state, std::int64_t accepted, bool capture) const;
     bool supports_speculation() const noexcept override;
     ::tyloi::Tensor embedding(const tyloi::Tensor& ids, int primary = 0) const override;
     ::tyloi::Tensor normalize(const tyloi::Tensor& hidden, std::int64_t batch, std::int64_t tokens) const override;

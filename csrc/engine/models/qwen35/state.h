@@ -93,6 +93,9 @@ public:
     void set_position_delta(std::int64_t delta) noexcept override { decode_position_delta = delta; }
     void commit_speculative() override;
     void rollback_speculative(std::int64_t accepted) override;
+#if TYLOINFER_HAS_CUDA
+    StepSequence<bool> rollback_steps(std::int64_t accepted) override;
+#endif
     bool speculating() const noexcept override { return speculative_start >= 0; }
     std::int64_t confirmed_prefix() const noexcept override { return speculative_confirmed; }
     std::int64_t rewind(std::int64_t accepted_suffix);

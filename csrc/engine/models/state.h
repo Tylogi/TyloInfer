@@ -2,6 +2,7 @@
 
 #include "engine/tensor/tensor.h"
 #include "engine/metrics.h"
+#include "engine/generation/sequence.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -87,6 +88,11 @@ public:
     }
     virtual void rollback_speculative(std::int64_t) {
         throw std::logic_error("speculative transactions are not supported");
+    }
+    // Finish the rollback and report whether a graph was initialized.
+    virtual StepSequence<bool> rollback_steps(std::int64_t accepted) {
+        rollback_speculative(accepted);
+        co_yield false;
     }
     virtual bool retains_partial_prefix(std::int64_t) const noexcept { return false; }
     // Owners keep storage alive; deduplicate using backing identity, not object identity.

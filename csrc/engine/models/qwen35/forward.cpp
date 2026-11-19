@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <optional>
 #include <stdexcept>
 #include <utility>
 
@@ -454,32 +455,41 @@ StepSequence<models::Decoded> Model::decode(models::Input, models::State&,
 }
 #endif
 
-void Model::replay(State& state, std::int64_t accepted) const {
+void replay_layers(const Model& model, State& state, std::int64_t retained) {
+    for (std::size_t index = 0; index < state.layers.size(); ++index) {
+        auto* linear = std::get_if<LinearState>(&state.layers[index]);
+        if (linear == nullptr) continue;
+        const auto& block = model.layers[index];
+        ops::DeviceScope scope(block.device);
+        const auto* layer = std::get_if<Linear>(&block.weights);
+        require_forward(layer != nullptr, "Qwen3.5 recurrent layer weight kind mismatch");
+        auto& view = linear->mixer.view();
+        const models::LinearView linear_view{view.convolution, view.recurrent, view.transposed};
+        layer->attention.replay(linear_view, linear->projected, retained);
+    }
+}
+
+StepSequence<bool> Model::replay(State& state, std::int64_t accepted, [[maybe_unused]] bool capture) const {
     require_forward(state.belongs_to(*this), "Qwen3.5 state belongs to another model");
     require_forward(state.speculative_start >= 0 && accepted >= 0, "no speculative transaction");
-    try {
-        const auto keep = state.rewind(accepted);
+    struct Rollback {
+        State& state;
+        ~Rollback() { if (state.speculating()) state.abort_speculative(); }
+    } rollback{state};
+    const auto keep = state.rewind(accepted);
+    const auto retained = keep - state.speculative_start;
+    std::optional<bool> graph_result;
 #if TYLOINFER_HAS_CUDA
-        const bool replayed = replay_graph(state, keep - state.speculative_start);
-#else
-        constexpr bool replayed = false;
-#endif
-        for (std::size_t index = 0; !replayed && index < state.layers.size(); ++index) {
-            auto* linear = std::get_if<LinearState>(&state.layers[index]);
-            if (linear == nullptr) continue;
-            ops::DeviceScope scope(layers[index].device);
-            const auto* layer = std::get_if<Linear>(&layers[index].weights);
-            require_forward(layer != nullptr, "Qwen3.5 recurrent layer weight kind mismatch");
-            auto& view = linear->mixer.view();
-            const models::LinearView linear_view{view.convolution, view.recurrent, view.transposed};
-            layer->attention.replay(linear_view, linear->projected, keep - state.speculative_start);
-        }
-        state.commit_speculative();
-        state.cache_pos = keep;
-    } catch (...) {
-        state.abort_speculative();
-        throw;
+    auto graph = replay_graph(*this, state, retained, capture);
+    while (auto step = graph.next()) {
+        if (step.graph) co_yield std::move(*step.graph);
+        else if (step.value) graph_result = *step.value;
     }
+#endif
+    if (!graph_result.has_value()) replay_layers(*this, state, retained);
+    state.commit_speculative();
+    state.cache_pos = keep;
+    co_yield graph_result.value_or(false);
 }
 
 } // namespace tyloi::models::qwen35
