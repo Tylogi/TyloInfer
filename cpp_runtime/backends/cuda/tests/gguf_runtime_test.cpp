@@ -3120,6 +3120,14 @@ void run_mmq_prefill_input_reuse() {
         const auto x=a.cpu().contiguous(),y=b.cpu().contiguous();
         return x.nbytes()==y.nbytes() && std::memcmp(x.data_ptr(),y.data_ptr(),x.nbytes())==0;
     };
+    const auto half=host.to(tb::kCUDA,tb::kFloat16);
+    const auto converted=half.to(tb::kFloat32);
+    for(const auto type:{GGML_TYPE_IQ3_XXS,GGML_TYPE_Q4_K,GGML_TYPE_Q2_K}) {
+        const auto actual=PrefillInputScope::prepare_mmq(half,type);
+        auto expected=tb::empty_like(actual.activation);
+        mmq::quantize(converted.data_ptr<float>(),nullptr,expected.data_ptr(),type,256,512,mfq_current_cuda_stream());
+        require(same_bytes(actual.activation,expected),"Direct FP16 MMQ input changed the FP32-converted packet");
+    }
     for(auto dtype:{tb::kFloat32,tb::kFloat16}) {
         const auto input=host.to(tb::kCUDA,dtype);
         const auto other=input*-1.;

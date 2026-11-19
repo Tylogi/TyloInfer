@@ -281,7 +281,8 @@ MmqPrefillInput PrefillInputScope::prepare_mmq(const tb::Tensor& input,int type)
         }
         plan->mmq={};
     }
-    auto source=input.to(tb::kFloat32).contiguous();
+    const bool fp16=input.scalar_type()==tb::kFloat16 && reinterpret_cast<std::uintptr_t>(input.data_ptr())%8==0;
+    auto source=fp16?input.contiguous():input.to(tb::kFloat32).contiguous();
     mfq_cuda_record_stream(source,stream);
     MmqPrefillInput result;
     tb::Tensor scaled;
@@ -295,7 +296,8 @@ MmqPrefillInput PrefillInputScope::prepare_mmq(const tb::Tensor& input,int type)
     }
     result.activation=tb::empty({std::int64_t(mmq::activation_bytes(rows,width))},input.options().dtype(tb::kUInt8));
     mfq_cuda_record_stream(result.activation,stream);
-    mmq::quantize((scaled.defined()?scaled:source).data_ptr<float>(),nullptr,result.activation.data_ptr(),type,width,rows,stream.stream());
+    if(fp16)mmq::quantize_f16(source.data_ptr(),result.activation.data_ptr(),type,width,rows,stream.stream());
+    else mmq::quantize((scaled.defined()?scaled:source).data_ptr<float>(),nullptr,result.activation.data_ptr(),type,width,rows,stream.stream());
     if(reuse){plan->mmq=result;plan->mmq_layout=layout;}
     return result;
 }
