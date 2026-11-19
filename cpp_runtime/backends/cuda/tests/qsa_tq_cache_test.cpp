@@ -135,6 +135,14 @@ void check_selected_blocks() {
                     std::vector<int> ranked(available);for(int i=0;i<available;++i)ranked[i]=i;
                     std::stable_sort(ranked.begin(),ranked.end(),[&](int a,int b){return input[row*pools+a]>input[row*pools+b];});
                     for(int i=0;i<count;++i)expected.emplace_back(ranked[i],pool==32?0xffffffffu:(1u<<pool)-1);
+                    if(available<=4096) {
+                        std::sort(expected.begin(),expected.end());
+                        for(int slot=0;slot<count;++slot) {
+                            const auto* block=blocks.data_ptr<int32_t>()+(row*slots+slot)*2;
+                            if(block[0]!=expected[slot].first || uint32_t(block[1])!=expected[slot].second)
+                                throw std::runtime_error("single live tile changed the selected block order");
+                        }
+                    }
                     if((p+1)%pool)expected.emplace_back(int((p+1)/pool),(1u<<int((p+1)%pool))-1);
                 }
                 std::sort(expected.begin(),expected.end());
@@ -146,6 +154,7 @@ void check_selected_blocks() {
     for(int pattern:{0,1,2,3})for(int pool:{1,4,8,32})for(int pools:{1,129,4096,8193})for(int budget:{4,32,2048,6144}) {
         if(budget%pool)continue;std::vector<int64_t> position;
         for(int64_t p:{0,1,2,3,31,32,2047,2048,2050,2051,12289})position.push_back(std::min(p,int64_t(pool)*pools-1));
+        for(int64_t live:{4096,4097})position.push_back(std::min(live*pool-1,int64_t(pool)*pools-1));
         test(pools,pool,budget,position,pattern);
     }
     // Exercise both sides of every per-thread threshold storage capacity.

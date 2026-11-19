@@ -549,7 +549,21 @@ __global__ void live_topk_blocks_kernel(const float* source,const int64_t* ids,
     constexpr int tile=4096;
     extern __shared__ __align__(16) unsigned char temporary[];
     const int row=blockIdx.y,begin=int(blockIdx.x)*tile,tiles=int((int64_t(columns)+tile-1)/tile);
-    int live=int(min(int64_t(pools),max(int64_t(0),(positions[row]+1)/pool)));
+    const int64_t position=positions[row];
+    int live=int(min(int64_t(pools),max(int64_t(0),(position+1)/pool)));
+    if(selected) {
+        // When all live scores fit in one tile, its top-k IDs are already
+        // final. The graph keeps the same grid as the context grows.
+        if(live<=tile) {
+            if(stage || blockIdx.x)return;
+            if constexpr(Blocks) {
+                if(position+1<=budget) {
+                    emit_selected_blocks(nullptr,selected,position,pool,count,budget,row);
+                    return;
+                }
+            }
+        }else if(tiles!=1)selected=nullptr;
+    }
     for(int s=0;s<stage;++s)live=live/tile*count+min(count,live%tile);
     const int available=min(tile,max(0,live-begin));
     const int64_t out=(int64_t(row)*tiles+blockIdx.x)*count;
@@ -579,11 +593,9 @@ __global__ void live_topk_blocks_kernel(const float* source,const int64_t* ids,
     else live_topk_sort<16>(source,ids,output,out_ids,row,columns,begin,live,pools,count,out,temporary,selected!=nullptr);
     }
     if(selected) {
-        // Only the final reduction has one CTA per query. Its IDs are now
-        // complete; publish them to this CTA before expanding whole pools
-        // and the incomplete causal tail into the existing token order.
+        // This CTA has the complete selection. Join its ID writes before
+        // expanding whole pools and the incomplete causal tail.
         __syncthreads();
-        const int64_t position=positions[row];
         if constexpr(Blocks) {
             emit_selected_blocks(selected_ids,selected,position,pool,count,budget,row);
             return;
@@ -656,11 +668,12 @@ static Tensor live_topk_impl(const Tensor& scores,const Tensor& positions,int64_
             keys.data_ptr<float>(),ids.defined()?ids.data_ptr<int64_t>():nullptr,
             next.data_ptr<float>(),next_ids.data_ptr<int64_t>(),positions.data_ptr<int64_t>(),
             columns,pools,int(pool),int(count),stage,compact,
-            tiles==1 && selected.defined()?selected.data_ptr<int32_t>():nullptr,int(budget));
+            selected.defined()?selected.data_ptr<int32_t>():nullptr,int(budget));
         if(mfq::cuda::dispatch_trace::enabled())mfq::cuda::dispatch_trace::record(
             mfq_current_cuda_stream(),"qsa_live_topk",reinterpret_cast<const void*>(live_topk_blocks_kernel<Blocks,Items>),
             "M="+std::to_string(rows)+" candidate_columns="+std::to_string(columns)+
             " count="+std::to_string(count)+" selection_fused="+std::to_string(tiles==1 && selected.defined())+
+            " live_tile_emit="+std::to_string(stage==0 && tiles>1 && selected.defined())+
             " block_output="+std::to_string(Blocks)+
             " selection_algorithm="+std::string(Blocks?"radix_threshold":"radix_sort")+
             " minimum_sort_items="+std::to_string(compact?1:16)+" shared_bytes="+std::to_string(bytes));
