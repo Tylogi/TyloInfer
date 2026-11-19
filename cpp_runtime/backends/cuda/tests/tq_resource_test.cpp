@@ -1429,8 +1429,43 @@ void check_qwen4_batch_verification(const std::string& path) {
     }
     std::cout<<"Qwen4 packed verification and independent acceptance passed\n";
 }
+void check_tq_arena_headroom() {
+    const MfqCudaGuard guard(0);
+    const auto context=mfq::cuda::default_context(0);
+    Source source;
+    CudaExecutionContext execution;execution.config.moe_device_cache_bytes=0;
+    TqMoeBanks banks{load_tq_routed_weight(execution,source,"gate"),load_tq_routed_weight(execution,source,"up"),
+        load_tq_routed_weight(execution,source,"down")};
+    const auto options=tb::TensorOptions().device(tb::Device(tb::kCUDA,0));
+    const auto input=tb::ones({1,33},options.dtype(tb::kFloat16))*.1f;
+    const auto ids=tb::zeros({1,1},options.dtype(tb::kInt32));
+    const auto scores=tb::ones({1,1},options.dtype(tb::kFloat32));
+    const auto expected=banks.forward(input,ids,scores).cpu().contiguous();
+    mfq::cuda::finish_routed_expert_exchanges(execution);
+    context->reclaim_idle_memory();
+    const auto prior=context->memory_stats().limit;
+    context->set_memory_limit(std::max(context->local_memory_usage(),context->memory_stats().allocated)+(32u<<20));
+    try {
+        // An expert image fits, while the usual 64 MiB growth quantum does not.
+        resize_tq_expert_cache(execution.tq_expert_cache,128u<<20);
+        const auto actual=banks.forward(input,ids,scores).cpu().contiguous();
+        mfq::cuda::finish_routed_expert_exchanges(execution);
+        require(actual.nbytes()==expected.nbytes() && !std::memcmp(actual.data_ptr(),expected.data_ptr(),actual.nbytes()),
+            "bounded TQ arena growth changed routed output");
+        require(context->local_memory_usage()<=context->memory_stats().limit &&
+            context->memory_stats().peak<=context->memory_stats().limit,
+            "bounded TQ arena growth exceeded its memory limit");
+    }catch(...) {context->set_memory_limit(prior);throw;}
+    context->set_memory_limit(prior);
+    std::cout<<"TQ arena growth below its allocation quantum preserves exact routed output\n";
+}
 }
 int main(int argc,char** argv)try {
+    if(argc==2 && std::string_view(argv[1])=="--arena-headroom") {
+        int devices=0;if(cudaGetDeviceCount(&devices)!=cudaSuccess || !devices)return 77;
+        check_tq_arena_headroom();
+        return 0;
+    }
     if(argc==3 && std::string_view(argv[1])=="--qwen4-batch-verification") {
         check_qwen4_batch_verification(argv[2]);
         return 0;

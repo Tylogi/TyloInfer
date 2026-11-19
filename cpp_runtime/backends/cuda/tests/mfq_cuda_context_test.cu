@@ -1,6 +1,7 @@
 #include "mfq_cuda_context.h"
 #include "mfq_cuda_resident_allocations.h"
 #include "tyloinfer/runtime.h"
+#include "../runtime/native_stream_context.h"
 
 #include <cuda_runtime_api.h>
 
@@ -11,6 +12,8 @@
 #include <cstdlib>
 #include <iostream>
 #include <string>
+#include <thread>
+#include <exception>
 
 int memory_limit_cases() {
     constexpr auto mib=std::size_t(1024)*1024;
@@ -225,11 +228,49 @@ int resident_allocation_case() {
     return 0;
 }
 
+int stream_context_case() {
+    auto context=std::make_shared<mfq::cuda::Context>(0);
+    const auto stream=context->stream().get();
+    CUcontext owner=nullptr;
+    if(cuStreamGetCtx(reinterpret_cast<CUstream>(stream),&owner)!=CUDA_SUCCESS || !owner)
+        throw std::runtime_error("stream owner context is unavailable");
+    const auto current=[] {
+        CUcontext value=nullptr;
+        if(cuCtxGetCurrent(&value)!=CUDA_SUCCESS)
+            throw std::runtime_error("current context query failed");
+        return value;
+    };
+    const auto verify=[&] {
+        const auto before=current();
+        {
+            const mfq::cuda::NativeStreamContext active(stream);
+            if(current()!=owner)throw std::runtime_error("stream context was not bound");
+        }
+        if(current()!=before)throw std::runtime_error("stream context was not restored");
+    };
+    verify();
+    std::exception_ptr failure;
+    std::thread worker([&] {
+        try {
+            if(current())throw std::runtime_error("fresh thread already has a context");
+            verify();
+        }catch(...){failure=std::current_exception();}
+    });
+    worker.join();
+    if(failure)std::rethrow_exception(failure);
+    std::cout<<"cuda_native_stream_context current_thread=PASS fresh_thread=PASS\n";
+    return 0;
+}
+
 int main(int argc,char** argv) {
     int devices = 0;
     TYLOINFER_NATIVE_CUDA_CHECK(cudaGetDeviceCount(&devices));
     if (devices == 0) {
         return 77;
+    }
+    if(argc==2 && std::string(argv[1])=="--stream-context") {
+        try {return stream_context_case();}
+        catch(const std::exception& error){std::cerr<<error.what()<<'\n';return 1;}
     }
     if(argc==2 && std::string(argv[1])=="--memory-limit")return memory_limit_cases();
     if(argc==2 && std::string(argv[1])=="--memory-pool-reuse")return memory_pool_reuse_case();

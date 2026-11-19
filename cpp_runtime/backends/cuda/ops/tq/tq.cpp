@@ -1424,9 +1424,29 @@ class TqExpertCache:private mfq::cuda::RoutedHostCache<TqHostImage> {
             reserved=device_reserved_locked(device);
         }
         if(aligned<=limit && reserved<=limit-aligned) {
-            const auto capacity=std::max(aligned,std::min<std::size_t>(std::size_t(64)<<20,limit-reserved));
-            auto arena=std::make_shared<DeviceImageArena>(capacity,device);
-            auto image=arena->allocate(bytes);owner=arena.get();arenas.push_back(std::move(arena));return image;
+            // KV, prefix checkpoints and graph storage can grow after the
+            // cache ceiling was selected. Its growth quantum must also fit
+            // current headroom; existing arena intervals need no new pages.
+            const auto available=mfq::cuda::default_context(device)->available_memory()&~std::size_t(15);
+            const auto capacity=std::min(available,
+                std::max(aligned,std::min<std::size_t>(std::size_t(64)<<20,limit-reserved)));
+            if(capacity>=aligned)try {
+                auto arena=std::make_shared<DeviceImageArena>(capacity,device);
+                auto image=arena->allocate(bytes);owner=arena.get();arenas.push_back(std::move(arena));return image;
+            }catch(const MfqResourceExhausted&) {
+                // Another allocation may have consumed headroom meanwhile.
+                // Recycle only unleased storage, without synchronizing a
+                // decode graph that may be waiting for this admission lane.
+                std::shared_ptr<DeviceImageArena> recycled;
+                if(evict_device_arena_locked(device,&recycled,aligned)) {
+                    owner=recycled.get();++device_reuses_;return recycled->allocate(bytes);
+                }
+                throw;
+            }
+            std::shared_ptr<DeviceImageArena> recycled;
+            if(evict_device_arena_locked(device,&recycled,aligned)) {
+                owner=recycled.get();++device_reuses_;return recycled->allocate(bytes);
+            }
         }
         if(!fallback){cacheable=false;return {};}
         // Leased rows can temporarily outlive a tiny cache or workspace loan.
@@ -3628,7 +3648,11 @@ struct TqMoeGraphStage {
                     hidden.data_ptr(),pairs.data_ptr(),int(count),int(banks[2]->out),type,plane.tile,stream.stream()));
                 if(recording && !direct) {
                     cudaStreamCaptureStatus capture;const cudaGraphNode_t* dependencies=nullptr;std::size_t n=0;
+#if CUDART_VERSION >= 13000
+                    TYLOINFER_CUDA_CHECK(cudaStreamGetCaptureInfo(stream.stream(),&capture,nullptr,nullptr,&dependencies,nullptr,&n));
+#else
                     TYLOINFER_CUDA_CHECK(cudaStreamGetCaptureInfo_v2(stream.stream(),&capture,nullptr,nullptr,&dependencies,&n));
+#endif
                     if(capture!=cudaStreamCaptureStatusActive || n!=1)throw std::logic_error("TQ kernel capture has no unique node");
                     kernels.push_back({i,first,window.segments()-1,capacity,dependencies[0]});
                 }

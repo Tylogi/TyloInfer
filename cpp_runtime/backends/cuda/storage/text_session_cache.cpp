@@ -572,7 +572,7 @@ TextSessionState decode_qwen4_pages(size_t pages,Load load,
         if(!i){layers.resize(header.layers);fragments.resize(header.layers);}
         position+=header.count;
         for(size_t layer=0;layer<layers.size();++layer) {
-            const auto packed=header.version==2?reader.scalar<uint32_t>("QSA page kind"):0;
+            const auto packed=header.version==2?reader.template scalar<uint32_t>("QSA page kind"):0;
             if(packed>1)throw CudaSessionStateError("invalid QSA page kind");
             if(packed)read_ram_qsa_page(reader,lease,
                 header.start,header.count,header.exact,layers[layer].adaptive_qsa);
@@ -593,7 +593,7 @@ TextSessionState decode_qwen4_pages(size_t pages,Load load,
         }
         if(header.exact) {
             state.qwen4_positions=read_optional(reader);
-            state.mtp.reset();if(reader.scalar<uint32_t>("MTP presence"))
+            state.mtp.reset();if(reader.template scalar<uint32_t>("MTP presence"))
                 state.mtp=read_qwen4_mtp(reader,lease,header.version==2);
         }
         if(i+1==pages && !header.exact)throw CudaSessionStateError("Qwen4 prefix has no exact recurrent checkpoint");

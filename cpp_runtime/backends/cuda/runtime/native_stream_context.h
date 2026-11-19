@@ -13,7 +13,12 @@ class NativeStreamContext {
         decltype(&cuCtxPopCurrent) pop;
         template<class Function> static Function resolve(const char* name) {
             void* raw=nullptr;cudaDriverEntryPointQueryResult query=cudaDriverEntryPointSymbolNotFound;
+#if CUDART_VERSION >= 12050
+            // Keep the two-argument cuStreamGetCtx ABI instead of selecting v2.
+            TYLOINFER_NATIVE_CUDA_CHECK(cudaGetDriverEntryPointByVersion(name,&raw,12000,cudaEnableDefault,&query));
+#else
             TYLOINFER_NATIVE_CUDA_CHECK(cudaGetDriverEntryPoint(name,&raw,cudaEnableDefault,&query));
+#endif
             if(!raw || query!=cudaDriverEntryPointSuccess)
                 throw std::runtime_error(std::string("CUDA context entry unavailable: ")+name);
             return reinterpret_cast<Function>(raw);

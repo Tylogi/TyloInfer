@@ -1378,7 +1378,7 @@ static int run_qwen4_mtp_generation_variants(mfq::cuda::Qwen4CausalLm& model,Mtp
                 for(int row=0;row<2;++row) {
                     states[row]=std::make_unique<mfq::cuda::Qwen4BatchRequestState>(model);
                     requests.push_back(states[row].get());
-                    auto hidden=states[row]->prefill(model,prompt_tensor);
+                    auto hidden=states[row]->prefill(model,prompt_tensor,{});
                     next.push_back(model.adapter_next_token(model.lm_head,model.last_hidden(std::move(hidden))).item<int64_t>());
                     generated[row].push_back(next.back());
                 }
@@ -1387,8 +1387,7 @@ static int run_qwen4_mtp_generation_variants(mfq::cuda::Qwen4CausalLm& model,Mtp
                 const auto started=std::chrono::steady_clock::now();
                 for(int step=1;step<512;++step) {
                     auto host_ids=tb::tensor(next,options).reshape({2,1});
-                    auto ids=host_ids.to(device);
-                    auto result=graph.run(requests,ids,host_ids,true);
+                    auto result=graph.run(requests,host_ids,true);
                     TYLOINFER_RUNTIME_CHECK(result.has_value(),"short-batch variant must use a CUDA graph");
                     auto host=result->cpu().contiguous();
                     next.assign(host.data_ptr<int64_t>(),host.data_ptr<int64_t>()+2);

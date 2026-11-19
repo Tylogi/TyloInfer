@@ -348,6 +348,9 @@ if(BUILD_TESTING)
 
     mfq_add_cuda_test(mfq-cuda-context-test
         ${TYLOINFER_CUDA_ROOT}/tests/mfq_cuda_context_test.cu)
+    add_test(NAME mfq-cuda-stream-context-test
+        COMMAND mfq-cuda-context-test --stream-context)
+    set_tests_properties(mfq-cuda-stream-context-test PROPERTIES SKIP_RETURN_CODE 77)
     mfq_add_cuda_test(tyloinfer-cuda-hadamard-test
         ${TYLOINFER_CUDA_ROOT}/tests/hadamard_test.cu
         mfq-cuda-native-kernels)
@@ -641,6 +644,8 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME tyloinfer-cuda-tq-resources COMMAND tyloinfer-cuda-tq-resource-test)
     set_tests_properties(tyloinfer-cuda-tq-resources PROPERTIES SKIP_RETURN_CODE 77)
+    add_test(NAME tyloinfer-cuda-tq-arena-headroom COMMAND tyloinfer-cuda-tq-resource-test --arena-headroom)
+    set_tests_properties(tyloinfer-cuda-tq-arena-headroom PROPERTIES SKIP_RETURN_CODE 77)
     if(TYLOINFER_ENABLE_MFQ_COMPAT)
     add_executable(mfq-cuda-format-bench
         ${TYLOINFER_REPOSITORY_ROOT}/bench/cuda_format_comparison/mfq_format_bench.cpp)
