@@ -168,8 +168,8 @@ struct PredictorGraphs {
     int64_t capacity = 0;
 
     static void prepare(Cell& cell, const MtpRow& row, int64_t start) {
-        ops::copy_into(cell.ids, row.ids);
-        ops::copy_into(cell.hidden, row.hidden);
+        ::tyloi::ops::copy_into(cell.ids, row.ids);
+        ::tyloi::ops::copy_into(cell.hidden, row.hidden);
         mfq_qwen4_exp::fill_decode_positions(cell.cache_positions.dense(), cell.positions.dense(), start);
     }
 
@@ -234,7 +234,7 @@ StepSequence<MtpStep> Predictor::graph_step(const CausalModel& target, MtpRow ro
 
     auto& qsa = *block.qsa;
     auto& cache = *request->layer_states.front()->qsa;
-    ops::Qsa::Graph graph({{{{&qsa, &cache}}, start, config.maximum, 0}}, false);
+    ::tyloi::ops::Qsa::Graph graph({{{{&qsa, &cache}}, start, config.maximum, 0}}, false);
     if (!graph.eligible()) co_return;
     const auto stream = cuda::current_stream(device.index);
     auto& graphs = request->graphs;
@@ -305,21 +305,21 @@ StepSequence<MtpStep> Predictor::graph_step(const CausalModel& target, MtpRow ro
                 auto mix = block.attention_gr.pre(input);
                 const auto prefix = mode == MtpStepMode::tail ? tokens - 1 : 0;
                 if (prefix) {
-                    qsa.forward_graph(cache, ops::slice(mix.mixed, 1, 0, prefix),
-                        ops::contiguous(ops::slice(cell.positions, 2, 0, prefix)),
-                        ops::slice(cell.cache_positions, 0, 0, prefix), {}, true, true);
+                    qsa.forward_graph(cache, ::tyloi::ops::slice(mix.mixed, 1, 0, prefix),
+                        ::tyloi::ops::contiguous(::tyloi::ops::slice(cell.positions, 2, 0, prefix)),
+                        ::tyloi::ops::slice(cell.cache_positions, 0, 0, prefix), {}, true, true);
                 }
-                auto attention = qsa.forward_graph(cache, ops::slice(mix.mixed, 1, prefix, tokens),
-                    ops::contiguous(ops::slice(cell.positions, 2, prefix, tokens)),
-                    ops::slice(cell.cache_positions, 0, prefix, tokens), {}, true, !readout);
+                auto attention = qsa.forward_graph(cache, ::tyloi::ops::slice(mix.mixed, 1, prefix, tokens),
+                    ::tyloi::ops::contiguous(::tyloi::ops::slice(cell.positions, 2, prefix, tokens)),
+                    ::tyloi::ops::slice(cell.cache_positions, 0, prefix, tokens), {}, true, !readout);
                 if (readout) {
                     auto residual = block.attention_gr.post(attention,
-                        ops::slice(mix.residual, 1, prefix, tokens), ops::slice(mix.gate, 1, prefix, tokens));
+                        ::tyloi::ops::slice(mix.residual, 1, prefix, tokens), ::tyloi::ops::slice(mix.gate, 1, prefix, tokens));
                     auto ffn = block.ffn_gr.pre(residual);
                     auto chain = block.ffn_gr.post(feed_forward(block.ffn, ffn.mixed), ffn.residual, ffn.gate);
                     auto sample = final_mixer->pre(chain).mixed;
                     const auto end = sample.size(1);
-                    auto last = ops::slice(sample, 1, end - 1, end);
+                    auto last = ::tyloi::ops::slice(sample, 1, end - 1, end);
                     auto scores = draft_token_ids ? logits(std::move(last)) : target.logits(last);
                     cell.output = {std::move(sample), std::move(chain), std::move(scores)};
                     cell.greedy = cell.window.sample(cell.output.sample_logits, cell.greedy_host, cell.compact_host, 1);
@@ -347,11 +347,11 @@ StepSequence<MtpStep> Predictor::graph_step(const CausalModel& target, MtpRow ro
     graphs->advance(*request, std::move(positions), tokens);
     if (readout) {
         auto result = cell.output;
-        result.sample_hidden = ops::clone(result.sample_hidden);
-        result.chain_hidden = ops::clone(result.chain_hidden);
-        result.sample_logits = ops::clone(result.sample_logits);
+        result.sample_hidden = ::tyloi::ops::clone(result.sample_hidden);
+        result.chain_hidden = ::tyloi::ops::clone(result.chain_hidden);
+        result.sample_logits = ::tyloi::ops::clone(result.sample_logits);
         result.greedy_token = int32_t(*cell.greedy_host.dense().data_ptr<int64_t>());
-        if (compact) result.sample_compact = ops::clone(cell.compact_host);
+        if (compact) result.sample_compact = ::tyloi::ops::clone(cell.compact_host);
         co_yield std::move(result);
     } else co_yield MtpStep{};
 }
@@ -385,7 +385,7 @@ StepSequence<MtpDraft> Predictor::greedy_draft(const CausalModel& target, MtpRow
 
     auto& qsa = *layers.front()->qsa;
     auto& cache = *request->layer_states.front()->qsa;
-    ops::Qsa::Graph graph({{{{&qsa, &cache}}, start, config.maximum, 0}}, false);
+    ::tyloi::ops::Qsa::Graph graph({{{{&qsa, &cache}}, start, config.maximum, 0}}, false);
     graph.admit(written, graphs.capacity, true);
     auto growth = graph.growth();
     add_growth(growth, device, graphs.history_growth(*request, written));
@@ -394,8 +394,8 @@ StepSequence<MtpDraft> Predictor::greedy_draft(const CausalModel& target, MtpRow
     graph.materialize();
     graph.prepare(0, request->positions[0]);
 
-    auto packet = ops::empty({1, depth + 1}, row.ids.options());
-    ops::copy_into(ops::slice(packet, 1, 0, 1), ops::slice(row.ids, 1, tokens - 1, tokens));
+    auto packet = ::tyloi::ops::empty({1, depth + 1}, row.ids.options());
+    ::tyloi::ops::copy_into(::tyloi::ops::slice(packet, 1, 0, 1), ::tyloi::ops::slice(row.ids, 1, tokens - 1, tokens));
     for (int index = 0; index < depth; ++index) {
         auto& cell = index == 0 ? *first : *next;
         PredictorGraphs::prepare(cell, row, request->position());
@@ -403,9 +403,9 @@ StepSequence<MtpDraft> Predictor::greedy_draft(const CausalModel& target, MtpRow
         cell.window.set_compact_sampling(false, "predictor", 1);
         if (!cell.window.enqueue_if_device_only()) cell.window.run();
         graphs.advance(*request, std::move(positions), cell.ids.size(1));
-        row.ids = ops::reshape(cell.greedy, {1, 1});
+        row.ids = ::tyloi::ops::reshape(cell.greedy, {1, 1});
         row.hidden = cell.output.chain_hidden;
-        ops::copy_into(ops::slice(packet, 1, index + 1, index + 2), row.ids);
+        ::tyloi::ops::copy_into(::tyloi::ops::slice(packet, 1, index + 1, index + 2), row.ids);
     }
     co_yield MtpDraft{std::move(packet)};
 }
