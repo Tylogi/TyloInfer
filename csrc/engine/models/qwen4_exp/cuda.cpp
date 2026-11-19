@@ -38,6 +38,7 @@
 #include "engine/ops/gdn.h"
 #include "engine/ops/qsa.h"
 #include "engine/generation/sequence.h"
+#include "engine/generation/prefill/budget.h"
 #include "engine/backends/cuda/native/matmul_rows.h"
 #include "engine/backends/cuda/native/graph.h"
 #include <algorithm>
@@ -1385,7 +1386,6 @@ tyloi::StepSequence<tyloi::models::Prefill> qwen4_exp::Model::prefill(
         const tyloi::models::ForwardOptions& options, const tyloi::models::PrefillOptions& policy) const {
     if (!prefill_plan(value, policy).layered) co_return;
     auto& state=dynamic_cast<qwen4_exp::State&>(value);
-    co_yield tyloi::GraphRequest{tyloi::GraphPhase::admit, nullptr, state.growth(input, options)};
     const auto& model=*this;
     auto ids_handle=input.ids;
     auto compute_chunk=policy.compute;
@@ -1398,11 +1398,30 @@ tyloi::StepSequence<tyloi::models::Prefill> qwen4_exp::Model::prefill(
         prefill_plan(state,policy).layered,
         "layer-major prefill requires a bounded single-device Qwen4 chunk and whole-layer cache");
     TYLOINFER_RUNTIME_CHECK(compute_chunk>8,"layer-major compute chunk must exceed decode width");
-    ids=model.device_ids(ids).dense();
     const auto tokens=ids.size(1);
+    compute_chunk=std::min(compute_chunk,tokens);
+    const Device cpu(kCPU);
+    std::size_t ple_host = 0, previous = 0;
+    for (const auto& block : model.layers) {
+        std::size_t current = 0;
+        if (block->ple && block->ple->graph_supported()) {
+            for (const auto& [target, bytes] : block->ple->graph_stage_growth(1, compute_chunk, model.device))
+                if (target.is_cpu()) current = ::tyloi::engine::prefill_budget_add(current, bytes);
+        }
+        ple_host = std::max(ple_host, ::tyloi::engine::prefill_budget_add(previous, current));
+        previous = current;
+    }
+    const auto raw_rows = tap_layers.empty() ? model.config.streams : int64_t(tap_layers.size());
+    const auto raw_host = raw_hidden && raw_hidden_host
+        ? make_contiguous_view(nullptr, std::array<int64_t, 3>{tokens, model.config.hidden, raw_rows}, kFloat32, cpu).nbytes() : 0;
+    auto growth = state.growth(input, options);
+    add_growth(growth, cpu, std::size_t(tokens) * sizeof(int64_t));
+    add_growth(growth, cpu, std::max(ple_host, raw_host));
+    co_yield tyloi::GraphRequest{tyloi::GraphPhase::admit, nullptr, std::move(growth)};
+
+    ids=model.device_ids(ids).dense();
     const auto cache_start=state.cache_pos;
     auto capture = tyloi::ops::ProfileCapture::prefill_once(tokens);
-    compute_chunk=std::min(compute_chunk,tokens);
     const auto reserve=std::size_t(1)<<30;
     const auto row_bytes=std::size_t(model.config.hidden)*model.config.streams*sizeof(float)*8;
     const auto sequence_reserve=std::size_t(tokens)*model.config.hidden*sizeof(float)*
@@ -1426,6 +1445,12 @@ tyloi::StepSequence<tyloi::models::Prefill> qwen4_exp::Model::prefill(
         (prepared.dim() == 3 && prepared.size(0) == 3 && prepared.size(1) == 1)) && prepared.size(-1) == tokens,
         "Qwen4 positions require [T], [3,T], [4,T], [3,B,T] or [4,B,T]");
     auto cpu_ids=ids.to(::tyloi::kCPU,::tyloi::kInt64).contiguous();
+    const auto first_ids = cpu_ids.narrow(1, 0, compute_chunk);
+    const auto prefetch = [&](std::size_t layer) {
+        if (layer < model.layers.size() && model.layers[layer]->ple)
+            model.layers[layer]->ple->prefetch_tokens(state.layers[layer]->ple, first_ids);
+    };
+    prefetch(0);
     persistent_preamble.finish();
     DenseTensor hidden=::tyloi::cuda::empty({1,tokens,model.metadata.hidden_size*model.metadata.hc_mult},
                            ids.options().dtype(::tyloi::kFloat16));
@@ -1469,6 +1494,7 @@ tyloi::StepSequence<tyloi::models::Prefill> qwen4_exp::Model::prefill(
     for(auto& block:model.layers) {
         auto& layer_state=*state.layers[layer];
         capture.suspend(); co_yield tyloi::LayerEvent{tyloi::LayerEvent::Phase::begin, tyloi::LayerEvent::Mode::tiled}; capture.resume();
+        prefetch(std::size_t(layer) + 1);
         DenseTensor next_hidden=hidden;
         DenseTensor ffn_inputs,ffn_gate;
         tyloi::ops::Residual::Result attention_result;
@@ -1482,7 +1508,7 @@ tyloi::StepSequence<tyloi::models::Prefill> qwen4_exp::Model::prefill(
                     const auto count=std::min(compute_chunk,tokens-begin);
                     auto chunk_ids=ids.narrow(1,begin,count);
                     auto host_ids=cpu_ids.narrow(1,begin,count);
-                    qwen_block.ple->prefetch_tokens(layer_state.ple, host_ids);
+                    if (begin) qwen_block.ple->prefetch_tokens(layer_state.ple, host_ids);
                     auto input=qwen4_exp::prefill_ple(qwen_block,layer_state,
                         hidden.narrow(1,begin,count),chunk_ids,host_ids).dense();
                     if(begin==0)source=::tyloi::cuda::empty(hidden.sizes(),input.options());
@@ -1511,7 +1537,7 @@ tyloi::StepSequence<tyloi::models::Prefill> qwen4_exp::Model::prefill(
             auto host_ids=cpu_ids.narrow(1,begin,count);
             auto positions=prepared.narrow(-1,begin,count);
             auto full_positions=prepared_full.narrow(-1,0,cache_start+begin+count);
-            if (block->ple)
+            if (!bulk_gr && begin && block->ple)
                 block->ple->prefetch_tokens(layer_state.ple, host_ids);
             auto input=hidden.narrow(1,begin,count);
             DenseTensor output;
@@ -1622,6 +1648,9 @@ tyloi::StepSequence<tyloi::models::Prefill> qwen4_exp::Model::prefill(
             DenseTensor post_hidden=next_hidden;
             for(int64_t begin=0;begin<tokens;begin+=compute_chunk) {
                 const auto count=std::min(compute_chunk,tokens-begin);
+                if(mfq_qwen4_exp::try_gated_residual_post_out(ffn_output.narrow(1,begin,count),
+                    next_hidden.narrow(1,begin,count),ffn_gate.narrow(1,begin,count),
+                    post_hidden.narrow(1,begin,count),model.metadata.hc_mult))continue;
                 auto output=qwen_block.ffn_gr.post(ffn_output.narrow(1,begin,count),
                     next_hidden.narrow(1,begin,count),ffn_gate.narrow(1,begin,count));
                 if(begin==0 && output.scalar_type()!=next_hidden.scalar_type())

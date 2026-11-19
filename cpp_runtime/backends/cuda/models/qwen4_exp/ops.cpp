@@ -215,10 +215,6 @@ struct Gr {
         if(streams==1)return inputs[1]+branch;
         return mfq_qwen4_exp::gated_residual_post(branch, inputs[1], inputs[2], streams);
     }
-    bool post_into(const Tensor& branch,const std::vector<Tensor>& inputs,const Tensor& output)const {
-        if(streams==1){auto target=output;target.copy_(inputs[1]+branch);return true;}
-        return mfq_qwen4_exp::try_gated_residual_post_out(branch,inputs[1],inputs[2],output,streams);
-    }
     std::vector<Tensor> dense_fused(CudaExecutionContext& execution,const Tensor& input,
             const Tensor& branch,const Tensor& prior,const GatedResidualMarker& marker)const {
         const auto option=mfq::cuda::runtime_options::gr_dense_bf16_direct();
@@ -3476,10 +3472,6 @@ mfq_tensor_backend::Tensor qwen4_layer_major_prefill_hidden(
         std::fprintf(stderr,"native_prefill_host_pressure actual_match=1 before_bytes=%llu after_bytes=%llu workspace_bytes=%zu before_ple=1\n",
             static_cast<unsigned long long>(host_before),
             static_cast<unsigned long long>(mfq::sample_host_memory().available_host_bytes()),host_workspace);
-    // Each pending PLE read owns pinned input and decoded GPU output. Keep
-    // only the next layer ahead so these buffers do not scale with depth.
-    const auto prefetch_ids=cpu_ids.narrow(1,0,std::min(tokens,compute_chunk));
-    if(!model.blocks.empty())model.blocks.front()->prefetch_token_ids(prefetch_ids);
     persistent_preamble.finish();
     Tensor hidden=tb::empty({1,tokens,model.hidden_size()*model.hc_mult()},
                            ids.options().dtype(tb::kFloat16));
@@ -3524,8 +3516,6 @@ mfq_tensor_backend::Tensor qwen4_layer_major_prefill_hidden(
     const auto started=std::chrono::steady_clock::now();
     int layer=0;
     for(auto& block:model.blocks) {
-        if(std::size_t(layer+1)<model.blocks.size())
-            model.blocks[std::size_t(layer+1)]->prefetch_token_ids(prefetch_ids);
         const auto decode_reuse_option=mfq::cuda::runtime_options::nint_prefill_decode_reuse();
         NintPrefillDecodeCacheScope decode_reuse(!decode_reuse_option || *decode_reuse_option);
         Tensor next_hidden=hidden;
@@ -3678,7 +3668,6 @@ mfq_tensor_backend::Tensor qwen4_layer_major_prefill_hidden(
                 for(int64_t begin=0;begin<tokens;begin+=compute_chunk) {
                     const auto count=std::min(compute_chunk,tokens-begin);
                     std::vector<Tensor> mix{{},next_hidden.narrow(1,begin,count),ffn_injection.narrow(1,begin,count)};
-                    if(qwen_block.ffn_gr.post_into(branch.narrow(1,begin,count),mix,post_hidden.narrow(1,begin,count)))continue;
                     auto output=qwen_block.ffn_gr.post(branch.narrow(1,begin,count),mix);
                     if(begin==0 && output.scalar_type()!=next_hidden.scalar_type())
                         post_hidden=tb::empty(next_hidden.sizes(),output.options());
