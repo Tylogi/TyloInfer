@@ -15,6 +15,7 @@
 #include "engine/backends/cuda/executor/graph/registry.h"
 #include "env.h"
 #include "engine/memory/host.h"
+#include "components/error.h"
 
 #include <algorithm>
 #include <atomic>
@@ -44,7 +45,16 @@ std::size_t available_host_bytes(std::size_t process_limit) {
 struct TqCache::Upload {
     tyloi::cuda::Event event{cudaEventDisableTiming};
     cudaStream_t producer;
-    explicit Upload(cudaStream_t stream) : producer(stream) {}
+    tyloi::cuda::GraphRetirement retirement;
+    explicit Upload(cudaStream_t stream) : producer(stream) {
+        retirement.owner=this;
+        retirement.dispose=[](void* value) noexcept {delete static_cast<Upload*>(value);};
+    }
+    static std::shared_ptr<Upload> create(cudaStream_t stream) {
+        return {new Upload(stream),[](Upload* value) noexcept {
+            tyloi::cuda::retire_graph_resource(&value->retirement);
+        }};
+    }
 };
 
 struct TqCache::ViewTable {
@@ -69,6 +79,7 @@ struct TqCache::Routes {
     std::optional<std::size_t> budget;
     std::uint64_t windows = 0;
     bool prefill = false;
+    std::unordered_set<int> pending;
 };
 
 struct TqCache::HostAccounting {
@@ -81,7 +92,7 @@ struct TqCache::HostImage {
     std::size_t source_bytes;
     bool pin_attempted=false,registered=false;
     int pin_device=0;
-    tyloi::cuda::HostRegistrationRetirement retirement;
+    tyloi::cuda::GraphRetirement retirement;
     std::shared_ptr<HostAccounting> accounting;
     static void destroy(void* owner) noexcept {
         auto* image=static_cast<HostImage*>(owner);
@@ -112,7 +123,7 @@ struct TqCache::HostImage {
     HostImage(const HostImage&)=delete;
     HostImage& operator=(const HostImage&)=delete;
     static void release(HostImage* image) noexcept {
-        if(image->registered)tyloi::cuda::retire_host_registration(&image->retirement);
+        if(image->registered)tyloi::cuda::retire_graph_resource(&image->retirement);
         else destroy(image);
     }
     static std::shared_ptr<HostImage> create(const std::vector<std::uint8_t>& wire,
@@ -170,7 +181,7 @@ struct TqCache::Stage {
     void reuse(){if(pending){uploaded.synchronize();pending=false;}cursor=0;}
 };
 
-TqCache::HostTransfer::~HostTransfer() noexcept { try { ready->event.synchronize(); } catch (...) {} }
+TqCache::HostTransfer::~HostTransfer() noexcept { try { if(ready)ready->event.synchronize(); } catch (...) {} }
 
 std::size_t TqCache::reclaim_host_locked(std::size_t bytes) {
     std::size_t released = 0;
@@ -217,12 +228,18 @@ bool TqCache::admit_host_locked(std::size_t bytes, std::size_t reserve) const {
     return available_host_bytes(process_host_limit_) >= bytes + reserve;
 }
 
-std::size_t TqCache::trim_device(std::size_t bytes, bool protect) {
+std::size_t TqCache::trim_device(std::size_t bytes, bool protect, int only_device) {
     const auto before=device_.used();
     while(!device_.empty() && before-device_.used()<bytes) {
-        auto oldest = device_.oldest(retained_);
-        if (!oldest && protect) break;
-        const auto key = oldest ? *oldest : *device_.oldest();
+        const DeviceKey* oldest=nullptr;
+        if(only_device<0) {
+            oldest=device_.oldest(retained_);
+            if(!oldest && !protect)oldest=device_.oldest();
+        }else for(auto it=device_.keys().rbegin();it!=device_.keys().rend();++it) {
+            if(it->device==only_device && (!protect || !retained_.contains(*it))){oldest=&*it;break;}
+        }
+        if(!oldest)break;
+        const auto key = *oldest;
         const auto& entry=device_.at(key);
         const auto needed=entry.weight.layout().bytes;
         // Preserve an evicted GPU image in RAM before falling back to its file.
@@ -395,6 +412,18 @@ void TqCache::adapt_routes(bool prefill) {
     }
     retained_.swap(next);
     r.experts.swap(items);
+    r.pending.clear();
+    for (const auto& group : r.banks) {
+        for (std::size_t expert = 0; expert < group.count; ++expert) {
+            if (!r.experts[group.first + expert].retained) continue;
+            for (const auto source : group.sources) {
+                if (!device_.find({(source << 32) | expert, group.device})) {
+                    r.pending.insert(group.device);
+                    break;
+                }
+            }
+        }
+    }
     if (r.windows) r.history.decay(tyloi::engine::expert_usage_decay(r.windows));
     r.windows = 0;
     r.prefill = false;
@@ -500,14 +529,86 @@ bool TqCache::set_learning(bool enabled) {
 
 void TqCache::prepare_decode(int device, std::size_t workspace_reserve) {
     const MfqCudaGuard device_guard(device);
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+        const auto context = tyloi::cuda::default_context(device);
+        context->reclaim_idle_memory();
+        const auto available = context->available_memory();
+        const auto headroom = available > workspace_reserve ? available - workspace_reserve : 0;
+        // Temporary workspace eviction must not permanently lower the configured budget.
+        device_.limit(std::min(device_budget_.value_or(SIZE_MAX), device_.used() + headroom));
+        if(!routes_ || !routes_->history.pending())adapt_routes(true);
+    }
+    admit_routes(device,workspace_reserve);
+}
+
+void TqCache::admit_routes(int device, std::size_t workspace_reserve) {
     std::lock_guard<std::mutex> guard(mutex_);
-    const auto context = tyloi::cuda::default_context(device);
-    context->reclaim_idle_memory();
-    const auto available = context->available_memory();
-    const auto headroom = available > workspace_reserve ? available - workspace_reserve : 0;
-    // Temporary workspace eviction must not permanently lower the configured budget.
-    device_.limit(std::min(device_budget_.value_or(SIZE_MAX), device_.used() + headroom));
-    adapt_routes(true);
+    if (!routes_ || !learning_) return;
+    if (routes_->prefill && !routes_->history.pending())adapt_routes(true);
+    if (!routes_->pending.contains(device)) return;
+    const tyloi::cuda::RoutedWeightAllocationScope resident;
+    const MfqCudaGuard device_guard(device);
+    auto& r=*routes_;
+    struct Candidate {std::size_t bank,expert;float heat;};
+    std::vector<Candidate> candidates;
+    for (std::size_t bank=0;bank<r.banks.size();++bank) {
+        const auto& group=r.banks[bank];if(group.device!=device)continue;
+        for (std::size_t expert=0;expert<group.count;++expert) {
+            const auto& item=r.experts[group.first+expert];
+            if(item.retained)candidates.push_back({bank,expert,item.heat});
+        }
+    }
+    std::stable_sort(candidates.begin(),candidates.end(),[](const auto& a,const auto& b){return a.heat>b.heat;});
+    const auto context=tyloi::cuda::default_context(device);
+    for (const auto& candidate:candidates) {
+        const auto& group=r.banks[candidate.bank];
+        std::vector<DeviceKey> missing;
+        std::size_t bytes=0;
+        for (const auto source:group.sources) {
+            const DeviceKey key{(source<<32)|candidate.expert,device};
+            if(device_.find(key) || std::find(missing.begin(),missing.end(),key)!=missing.end())continue;
+            const auto& bank=sources_.at(source-1);
+            const auto size=device_bytes(bank.table->expert_image_bytes(candidate.expert,bank.rows));
+            if(size>SIZE_MAX-bytes)throw std::overflow_error("TQ route admission size overflows");
+            bytes+=size;missing.push_back(key);
+        }
+        if(missing.empty())continue;
+        const auto limit=device_.limit().value_or(SIZE_MAX);
+        if(bytes>limit) {++route_admit_skips_;continue;}
+        if(device_.used()>limit-bytes)trim_device(device_.used()-(limit-bytes),true);
+        if(device_.used()>limit-bytes || bytes>SIZE_MAX-workspace_reserve) {
+            ++route_admit_skips_;continue;
+        }
+        const auto required=bytes+workspace_reserve;
+        auto available=context->available_memory();
+        if(available<required) {
+            context->reclaim_idle_memory();
+            available=context->available_memory();
+        }
+        while(available<required) {
+            const auto before=device_.used();
+            trim_device(required-available,true,device);
+            if(device_.used()==before)break;
+            context->reclaim_idle_memory();
+            available=context->available_memory();
+        }
+        if(available<required) {++route_admit_skips_;continue;}
+        try {
+            const auto expert=std::int64_t(candidate.expert);
+            for(const auto& key:missing)get_locked(key.image>>32,&expert,1,device,false);
+            for(const auto& key:missing)if(!device_.find(key))
+                throw std::runtime_error("TQ route admission did not retain a complete expert");
+        } catch(const MfqResourceExhausted&) {
+            for(const auto& key:missing)device_.erase(key);
+            ++route_admit_failures_;continue;
+        } catch(...) {
+            for(const auto& key:missing)device_.erase(key);
+            ++route_admit_failures_;throw;
+        }
+        ++route_admit_groups_;route_admit_images_+=missing.size();route_admit_bytes_+=bytes;
+    }
+    r.pending.erase(device);
 }
 
 void TqCache::reclaim(int device, std::size_t available_bytes) {
@@ -617,7 +718,7 @@ void TqCache::preload(int device, std::size_t workspace_reserve) {
                     auto storage = ::tyloi::cuda::empty({static_cast<std::int64_t>(capacity)},
                         ::tyloi::TensorOptions().device(::tyloi::Device(::tyloi::kCUDA, device)).dtype(::tyloi::kUInt8));
                     auto weight = tq_view(storage.narrow(0,0,image->bytes.size()), image->layout, source.table->width());
-                    auto ready = std::make_shared<Upload>(stream);
+                    auto ready = Upload::create(stream);
                     upload(storage, image->bytes);
                     ready->event.record(stream);
                     device_.put(device_key, DeviceEntry{std::move(weight), std::move(ready), image->source_bytes}, capacity, true);
@@ -680,6 +781,11 @@ std::vector<std::pair<std::string,double>> TqCache::metrics() {
         {"expert_cache_hits",double(gpu_hits_)},
         {"expert_cache_misses",double(misses)},
         {"expert_cache_evictions",double(device_.evictions())},
+        {"tq_route_admit_groups",double(route_admit_groups_)},
+        {"tq_route_admit_images",double(route_admit_images_)},
+        {"tq_route_admit_bytes",double(route_admit_bytes_)},
+        {"tq_route_admit_skips",double(route_admit_skips_)},
+        {"tq_route_admit_failures",double(route_admit_failures_)},
         {"host_tensor_bytes",double(tyloi::cuda::tensor_host_bytes.load())}};
 }
 
@@ -727,6 +833,10 @@ std::vector<::tyloi::encoding::TqTensor> TqCache::get(std::uint64_t source,const
     const tyloi::cuda::RoutedWeightAllocationScope resident;
     const MfqCudaGuard device_guard(device);
     std::lock_guard<std::mutex> guard(mutex_);
+    return get_locked(source,ids,count,device);
+}
+
+std::vector<::tyloi::encoding::TqTensor> TqCache::get_locked(std::uint64_t source,const std::int64_t* ids,std::size_t count,int device,bool demand) {
     if (!source || source > sources_.size()) throw std::out_of_range("unknown TQ source");
     const auto& bank = sources_[source - 1];
     const auto& table = *bank.table;
@@ -734,8 +844,12 @@ std::vector<::tyloi::encoding::TqTensor> TqCache::get(std::uint64_t source,const
     for (std::size_t i = 0; i < count; ++i)
         if (!ids || ids[i] < 0 || std::uint64_t(ids[i]) >= table.rows() / out)
             throw std::out_of_range("TQ routed expert ID is out of bounds");
-    for(auto it=host_transfers_.begin();it!=host_transfers_.end();)
-        if(it->ready->event.ready())it=host_transfers_.erase(it);else ++it;
+    for(auto it=host_transfers_.begin();it!=host_transfers_.end();) {
+        if(it->ready->event.ready()) {
+            it->ready.reset();
+            it=host_transfers_.erase(it);
+        }else ++it;
+    }
     std::vector<std::int64_t> missing;
     std::unordered_map<std::uint32_t, std::size_t> source_images;
     if (count > 1) {
@@ -778,7 +892,7 @@ std::vector<::tyloi::encoding::TqTensor> TqCache::get(std::uint64_t source,const
     const auto expert=static_cast<std::uint32_t>(ids[index]);
     const auto key=(source<<32)|expert;
     const DeviceKey device_key{key,device};
-    ++calls_;
+    if(demand)++calls_;
     if(const auto* resident=device_.get(device_key)) {
         if(resident->uploaded->producer!=stream.stream()) {
             const auto event=resident->uploaded->event.get();
@@ -786,14 +900,16 @@ std::vector<::tyloi::encoding::TqTensor> TqCache::get(std::uint64_t source,const
             resources->retain(stream);
             mfq_cuda_record_stream(resident->weight,stream);
         }
-        ++gpu_hits_;result.push_back(resident->weight);
-        if((calls_&4095)==0)report();
+        if(demand)++gpu_hits_;
+        result.push_back(resident->weight);
+        if(demand && (calls_&4095)==0)report();
         continue;
     }
     const auto fetch_started=std::chrono::steady_clock::now();
     std::shared_ptr<HostImage> image;
     if(const auto* cached=host_.get(key)) {
-        image=*cached;++host_hits_;
+        image=*cached;
+        if(demand)++host_hits_;
         if(resources->host_register() && !image->pin_attempted) {
             if(auto registration=tyloi::cuda::try_host_registration();registration.owns_lock()) {
                 image->try_pin();++pin_attempts_;
@@ -805,7 +921,7 @@ std::vector<::tyloi::encoding::TqTensor> TqCache::get(std::uint64_t source,const
         const auto batch_index = prepared == source_images.end() ? prefetched.size() : prepared->second;
         if (batch_index < prefetched.size() && prepared_images[batch_index]) {
             image = prepared_images[batch_index];
-            ++host_hits_;
+            if(demand)++host_hits_;
         } else {
             // Earlier admissions can evict a hit that was outside the original batch.
             auto wire = batch_index < prefetched.size() ? std::move(prefetched[batch_index]) :
@@ -829,7 +945,7 @@ std::vector<::tyloi::encoding::TqTensor> TqCache::get(std::uint64_t source,const
     auto storage=::tyloi::cuda::empty({static_cast<std::int64_t>(capacity)},::tyloi::TensorOptions().device(::tyloi::Device(::tyloi::kCUDA,device)).dtype(::tyloi::kUInt8));
     auto weight=tq_view(storage.narrow(0,0,needed),image->layout,table.width());
     if(image->registered) {
-        if(!uploaded)uploaded=std::make_shared<Upload>(stream.stream());
+        if(!uploaded)uploaded=Upload::create(stream.stream());
         if(transfer==host_transfers_.end()) {
             host_transfers_.emplace_back();transfer=std::prev(host_transfers_.end());transfer->ready=uploaded;
         }
@@ -843,11 +959,11 @@ std::vector<::tyloi::encoding::TqTensor> TqCache::get(std::uint64_t source,const
         upload_submit_ms_+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count();
     }else upload(storage,image->bytes);
     if(cacheable) {
-        if(!uploaded)uploaded=std::make_shared<Upload>(stream.stream());
+        if(!uploaded)uploaded=Upload::create(stream.stream());
         device_.put(device_key,DeviceEntry{weight,uploaded,image->source_bytes},capacity);
     }
     result.push_back(std::move(weight));
-    if((calls_&4095)==0)report();
+    if(demand && (calls_&4095)==0)report();
     }
     }catch(...) {
         // Publish readiness even when a later expert read/allocation

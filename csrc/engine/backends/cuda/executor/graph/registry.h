@@ -12,21 +12,21 @@
 #include "engine/backends/cuda/native/stream.h"
 
 namespace tyloi::cuda {
-// Host registration changes may synchronize the device. Keep them outside
-// graph capture and replays that wait for CPU expert-loading callbacks.
+// Host registration and resource destruction can enter the driver. Keep them
+// outside captures and replays that wait for CPU expert loading.
 class HostRegistrationBlock {
     std::shared_ptr<void> state_;
 public:
     HostRegistrationBlock();
 };
 std::unique_lock<std::mutex> try_host_registration();
-struct HostRegistrationRetirement {
+struct GraphRetirement {
     void* owner=nullptr;
     void (*dispose)(void*) noexcept=nullptr;
-    HostRegistrationRetirement* next=nullptr;
+    GraphRetirement* next=nullptr;
 };
-// Intrusive retirement allocates nothing when optional cached RAM is evicted.
-void retire_host_registration(HostRegistrationRetirement*)noexcept;
+// Retire without allocating when a replay evicts cached resources.
+void retire_graph_resource(GraphRetirement*)noexcept;
 
 class CapturedGraph {
 public:

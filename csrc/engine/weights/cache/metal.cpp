@@ -385,6 +385,7 @@ void Cache::drain() const {
     mlx::core::synchronize();
 }
 void Cache::finish_exchange() const { drain(); }
+void Cache::admit_routes(Device) {}
 void Cache::retire_prefill() { drain(); }
 void Cache::discard_prefill() {}
 void Cache::settle() { drain(); }

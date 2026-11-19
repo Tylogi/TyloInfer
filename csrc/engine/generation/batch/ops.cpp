@@ -332,6 +332,7 @@ public:
     }
     Decoded decode(State& state) {
         auto scope=executor_.enter();
+        weights_.admit_routes(device_);
         if (std::any_of(state.active.begin(),state.active.end(),[](const auto& request) {
             return request->eligible && request->speculative;
         })) return decode_mtp(state);

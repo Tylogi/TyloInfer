@@ -329,6 +329,11 @@ void Cache::finish_exchange() const {
     finish_moe_expert_exchanges(data_->moe);
 }
 
+void Cache::admit_routes(Device device) {
+    if (data_->tq && device.is_cuda())
+        data_->tq->admit_routes(device.index, cuda::options::workspace_reserve_bytes());
+}
+
 void Cache::retire_prefill() {
     release_moe_prefill_buffers(data_->moe);
 }

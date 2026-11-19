@@ -119,6 +119,7 @@ public:
     void share_host(std::size_t free_bytes);
     void drain() const;
     void finish_exchange() const;
+    void admit_routes(Device device);
     void retire_prefill();
     void discard_prefill();
     void settle();

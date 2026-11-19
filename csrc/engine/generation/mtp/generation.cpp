@@ -173,6 +173,7 @@ struct MtpOps {
         return routed || weights.graph_safe(weights::Cache::Graph::native);
     }
     Tensor target_forward(Tensor ids, Tensor* raw = nullptr, int64_t confirmed = 0, bool queued = false) {
+        weights.admit_routes(device);
         target_transfer_bytes = 0;
         const auto before = weights.activity().streamed_bytes;
         const auto costs = profile ? target_costs() : std::array<double, 6>{};

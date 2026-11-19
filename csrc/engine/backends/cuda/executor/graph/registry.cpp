@@ -14,7 +14,7 @@ struct HostRegistrationSchedule {
     std::mutex mutex;
     std::condition_variable changed;
     unsigned active=0;
-    HostRegistrationRetirement* retired=nullptr;
+    GraphRetirement* retired=nullptr;
     void drain()noexcept {
         while(retired) {
             auto* item=retired;retired=item->next;
@@ -52,7 +52,7 @@ std::unique_lock<std::mutex> try_host_registration() {
     if(!lock.owns_lock() || state.active)return {};
     state.drain();return lock;
 }
-void retire_host_registration(HostRegistrationRetirement* item)noexcept {
+void retire_graph_resource(GraphRetirement* item)noexcept {
     auto& state=host_registration_schedule();std::lock_guard lock(state.mutex);
     item->next=state.retired;state.retired=item;
     if(!state.active)state.drain();

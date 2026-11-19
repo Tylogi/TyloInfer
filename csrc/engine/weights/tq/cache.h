@@ -43,6 +43,8 @@ public:
     std::size_t reclaim_duplicates(std::size_t bytes);
     std::size_t share_host(std::size_t free_bytes);
     void prepare_decode(int device, std::size_t workspace_reserve);
+    // Decode boundary only. Replay can select experts but cannot admit a prepared group.
+    void admit_routes(int device, std::size_t workspace_reserve);
     void observe_routes(const std::array<std::uint64_t,3>& banks, std::span<const std::int64_t> ids,
                         int rows, int row_offset, int row_total, int device, bool independent);
     void begin_routes(int rows);
@@ -108,6 +110,8 @@ private:
     std::list<HostTransfer> host_transfers_;
     std::uint64_t calls_ = 0, gpu_hits_ = 0, host_hits_ = 0, source_bytes_ = 0, transfer_bytes_ = 0;
     std::uint64_t direct_transfer_bytes_ = 0, pin_attempts_ = 0, pin_failures_ = 0;
+    std::uint64_t route_admit_groups_ = 0, route_admit_images_ = 0, route_admit_bytes_ = 0;
+    std::uint64_t route_admit_skips_ = 0, route_admit_failures_ = 0;
     double fetch_ms_ = 0, upload_submit_ms_ = 0;
     bool profile_;
 
@@ -115,9 +119,11 @@ private:
     std::size_t reserve_host_headroom_locked(std::size_t bytes);
     std::size_t reserve_host_locked(std::size_t bytes);
     bool admit_host_locked(std::size_t bytes, std::size_t reserve) const;
-    std::size_t trim_device(std::size_t bytes, bool protect = false);
+    std::size_t trim_device(std::size_t bytes, bool protect = false, int only_device = -1);
     bool reserve_device(std::size_t bytes, int device);
     void adapt_routes(bool prefill);
+    std::vector<::tyloi::encoding::TqTensor> get_locked(std::uint64_t source,const std::int64_t* ids,
+                                                       std::size_t count,int device,bool demand=true);
     void report() const;
     void upload(const ::tyloi::DenseTensor&, const std::vector<std::uint8_t>&);
 };

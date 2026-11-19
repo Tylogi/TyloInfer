@@ -118,6 +118,7 @@ struct Plain {
         if (penalties && !graph_active) ops::add_token_counts(graph.counts, ops::contiguous(pending));
     }
     int64_t advance() {
+        weights.admit_routes(config.device);
         if (!graph_prepared && config.decode_graph.enabled && (!prepared || !prepared->transformed())) {
             models::Input model_input;
             model_input.ids = ops::reshape(pending, {1, 1});
