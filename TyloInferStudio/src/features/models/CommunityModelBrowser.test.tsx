@@ -174,17 +174,20 @@ it('continues past one hundred results without replacing the selected model or p
     .mockResolvedValueOnce({ data: Array.from({ length: 40 }, (_, index) => info(`model-${index + 40}`)), next_cursor: 'page-three' })
     .mockResolvedValueOnce({ data: Array.from({ length: 40 }, (_, index) => info(`model-${index + 80}`)), next_cursor: null });
   render(<Harness />);
-  await screen.findByRole('heading', { name: 'model-0' });
-  fireEvent.click(screen.getByRole('radio', { name: /Q4_K_M/ }));
-  fireEvent.click(screen.getByRole('button', { name: 'Show more' }));
-  await screen.findByText('model-79');
-  expect(screen.getByRole('button', { name: 'Download Q4_K_M' })).toBeVisible();
-  fireEvent.click(screen.getByRole('button', { name: 'Show more' }));
-  await screen.findByText('model-119');
+  const details = within(screen.getByRole('region', { name: 'Model details' }));
+  const results = within(screen.getByRole('region', { name: 'Model search results' }));
+  await details.findByRole('heading', { name: 'model-0' });
+  fireEvent.click(details.getByRole('radio', { name: /Q4_K_M/ }));
+  await act(async () => { fireEvent.click(results.getByText('Show more', { selector: 'button' })); });
+  expect(results.getByText('model-79')).toBeInTheDocument();
+  expect(details.getByRole('button', { name: 'Download Q4_K_M' })).toBeVisible();
+  await act(async () => { fireEvent.click(results.getByText('Show more', { selector: 'button' })); });
+  expect(results.getByText('model-119')).toBeInTheDocument();
   expect(modelsApi.browseHubModels).toHaveBeenLastCalledWith('huggingface', '', expect.objectContaining({ cursor: 'page-three' }));
   expect(modelsApi.hubModelInfo).toHaveBeenCalledOnce();
-  expect(screen.getByRole('heading', { name: 'model-0' })).toBeVisible();
-  expect(screen.queryByRole('button', { name: 'Show more' })).not.toBeInTheDocument();
+  expect(details.getByRole('heading', { name: 'model-0' })).toBeVisible();
+  expect(details.getByRole('button', { name: 'Download Q4_K_M' })).toBeVisible();
+  expect(results.queryByText('Show more', { selector: 'button' })).not.toBeInTheDocument();
 });
 
 it('defaults to supported formats on CUDA without preventing explicit cross-device downloads', async () => {

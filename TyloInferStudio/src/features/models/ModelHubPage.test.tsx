@@ -67,7 +67,7 @@ it('keeps a submitted download on this page, animates into the circle and opens 
   expect(screen.getByText('Queued')).toBeInTheDocument();
 });
 
-it('reclaims prefix space only after the setting is saved and restores it on failure', async () => {
+it('saves prefix reclaim without counting reclaimable bytes as free space and preserves the setting on failure', async () => {
   vi.mocked(modelsApi.configureDownloadReclaim).mockResolvedValue({ directory: null, actual_directory: '/workspace/models', default_directory: '/workspace/models', disk_total_bytes: 2048 * 2 ** 30, disk_free_bytes: 200 * 2 ** 30, disk_available_bytes: 260 * 2 ** 30, evict_prefix_cache: true });
   render(<ModelHubPage />);
   const checkbox = await screen.findByRole('checkbox', { name: 'Reclaim SSD prefix budget' });
@@ -76,11 +76,13 @@ it('reclaims prefix space only after the setting is saved and restores it on fai
   fireEvent.click(checkbox);
   await waitFor(() => expect(checkbox).toBeChecked());
   expect(modelsApi.configureDownloadReclaim).toHaveBeenCalledWith(true);
-  expect(screen.getByText('260.0 / 2048.0 GiB')).toBeInTheDocument();
+  expect(screen.getByRole('progressbar', { name: 'SSD free space: 9.8%' })).toBeInTheDocument();
+  expect(screen.getByText('200.0 / 2048.0 GiB')).toBeInTheDocument();
   vi.mocked(modelsApi.configureDownloadReclaim).mockRejectedValue(new Error('save failed'));
   fireEvent.click(checkbox);
   await waitFor(() => expect(checkbox).toBeEnabled());
   expect(checkbox).toBeChecked();
+  expect(modelsApi.configureDownloadReclaim).toHaveBeenLastCalledWith(false);
 });
 
 it('distinguishes two precisions of one repository by their file paths and lists all shards', () => {

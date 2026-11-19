@@ -10,7 +10,7 @@ it('uses the TyloInfer mark across the desktop and web shell', () => {
   expect(mark).toContain('M48 48H86M67 48V77C67 84 71.5 88 79 88H84');
   expect(mark).not.toContain('M16 44V20L32 37 48 20V44');
   expect(read('index.html')).toContain('/src/assets/tylogi-ai-lab-mark.svg');
-  expect(read('src/app/StudioSidebar.tsx')).toContain('<div><strong>TyloInfer</strong></div>');
+  expect(read('src/app/StudioSidebar.tsx')).toMatch(/>TyloInfer<\//);
   for (const component of ['StudioSidebar', 'LoadingPage', 'NotFoundPage', 'DesktopWindowFrame', 'LoginPage', 'FailurePage', 'display']) {
     const source = read(`src/app/${component}.tsx`);
     expect(source).toContain('../assets/tylogi-ai-lab-mark.svg');
@@ -19,7 +19,7 @@ it('uses the TyloInfer mark across the desktop and web shell', () => {
 });
 
 it('uses TyloInfer in context-management descriptions and exported filenames', () => {
-  const context = read('src/features/runtime/ModelContextSettings.tsx');
+  const context = read('src/features/runtime/ModelContextSettingsView.tsx');
   expect(context).toContain('留空由 TyloInfer 管理');
   expect(context).not.toContain('由 MFQ 管理');
   expect(read('src/features/runtime/LogsPage.tsx')).toContain('`tyloinfer-${tab}-');

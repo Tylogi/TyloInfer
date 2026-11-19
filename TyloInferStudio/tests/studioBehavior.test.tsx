@@ -14,6 +14,10 @@ import { PanelDeck, PANEL_COLLAPSED_KEY } from '../src/app/PanelDeck';
 
 const { addJob } = vi.hoisted(() => ({ addJob: vi.fn() }));
 vi.mock('../src/app/RuntimeProvider', () => ({ useRuntime: () => ({ addJob }) }));
+vi.mock('../src/shared/api/resources/jobs', async (importOriginal) => {
+  const { jobsApi } = await importOriginal<typeof import('../src/shared/api/resources/jobs')>();
+  return { jobsApi: { ...jobsApi, createJob: vi.fn() } };
+});
 vi.mock('../src/features/settings/SettingsProvider', () => ({
   useSettings: () => ({ tr: (_zh: string, en: string) => en }),
 }));
@@ -21,6 +25,7 @@ vi.mock('../src/features/settings/SettingsProvider', () => ({
 beforeEach(() => {
   vi.restoreAllMocks();
   addJob.mockReset();
+  vi.mocked(jobsApi.createJob).mockReset();
   vi.spyOn(modelsApi, 'downloadDirectory').mockResolvedValue({ directory: null, actual_directory: '/workspace/models', default_directory: '/workspace/models' });
 });
 
@@ -93,7 +98,7 @@ describe('test_model_hub_accepts_repository_links_and_downloads_into_the_model_c
     });
     vi.spyOn(jobsApi, 'jobKinds').mockResolvedValue([{ kind: `download.${provider}`, payload_schema: {} }]);
     const inspect = vi.spyOn(modelsApi, 'resolveHubModel').mockResolvedValue(info);
-    const createJob = vi.spyOn(jobsApi, 'createJob').mockResolvedValue(job);
+    const createJob = vi.mocked(jobsApi.createJob).mockResolvedValue(job);
     render(<MemoryRouter><ModelHubPage /></MemoryRouter>);
     fireEvent.click(screen.getByRole('tab', { name: 'Model browser' }));
     fireEvent.change(screen.getByPlaceholderText('Model name, owner/repo, or repository URL'), { target: { value: `https://${host}/team/model/tree/main` } });

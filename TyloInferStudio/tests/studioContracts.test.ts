@@ -61,7 +61,7 @@ describe('Studio 过渡源码与静态样式契约（非行为测试）', () => 
   it('test_studio_exposes_every_loaded_model_and_switches_chat_sessions_safely', () => {
     const sessions = readSources('features/chat/hooks/useConversationSessions.ts');
     const overview = readSources('features/runtime/OverviewPage.tsx');
-    expect(overview).toContain('availableModelNames.map((name)');
+    expect(overview).toContain('<OverviewModels names={availableModelNames}');
     expect(APP).not.toContain('artifacts.slice(0, 8)');
     expect(sessions).not.toContain('.forkSession(');
     expect(sessions).not.toContain('setSelectedModel(');
@@ -164,7 +164,7 @@ describe('Studio 过渡源码与静态样式契约（非行为测试）', () => 
   });
 
   it('test_studio_runtime_monogram_tracks_the_real_model_lifecycle', () => {
-    const hero = readSources('features/runtime/RuntimeHero.tsx');
+    const hero = readSources('features/runtime/runtimeHeroState.ts', 'features/runtime/RuntimeHeroView.tsx');
     expect(hero).toContain('runtime?.model || \'Empty\'');
     expect(hero).toContain('job.kind === \'model.load\'');
     expect(hero).toContain('instance.state === \'loading\'');
@@ -177,16 +177,16 @@ describe('Studio 过渡源码与静态样式契约（非行为测试）', () => 
   });
 
   it('test_studio_overview_lists_every_loaded_model', () => {
-    const overview = readSources('features/runtime/OverviewPage.tsx');
+    const overview = readSources('features/runtime/OverviewPanels.tsx');
     expect(overview).toContain('className="overview-models-panel"');
-    expect(overview).toContain('availableModelNames.map((name)');
+    expect(overview).toContain('names.map(name =>');
     expect(overview).toContain('candidate.model === name && candidate.state !== \'failed\'');
     expect(overview).toContain('onClick={() => selectModel(name)}');
     expect(STYLES).toContain('.overview-model-grid {');
   });
 
   it('test_studio_adapts_prefix_cache_panel_to_flash_next_hot_cache', () => {
-    const cache = readSources('features/runtime/CachePage.tsx');
+    const cache = readSources('features/runtime/CachePage.tsx', 'features/runtime/PrefixCacheOverview.tsx');
     for (const field of ['prefix_cache_mode', 'prefix_cache_pending_bytes', 'prefix_cache_pending_max_bytes', 'prefix_cache_supported', 'prefix_cache_disabled_reason']) {
       expect(API).toContain(field);
     }
@@ -263,7 +263,7 @@ describe('Studio 过渡源码与静态样式契约（非行为测试）', () => 
       ['MemorySettingsPanel', 'features/connections/MemorySettingsPanel.tsx', 'Memory plan'],
       ['ContextManagementPanel', 'features/connections/ContextManagementPanel.tsx', 'Context defaults'],
       ['PrefixCacheSettingsPanel', 'features/connections/PrefixCacheSettingsPanel.tsx', 'Persistent prefix cache'],
-      ['InferencePolicyPanel', 'features/connections/InferencePolicyPanel.tsx', 'Inference controls'],
+      ['InferencePolicyPanel', 'features/connections/InferencePolicyView.tsx', 'Inference controls'],
       ['RemoteRoutingPanel', 'features/connections/RemoteRoutingPanel.tsx', 'Remote routing'],
     ]) {
       expect(connection).toContain(`<${component} />`);
@@ -273,7 +273,7 @@ describe('Studio 过渡源码与静态样式契约（非行为测试）', () => 
     expect(connection).not.toContain('RuntimeProfilesPanel');
     expect(connection).not.toContain('Automation');
     expect(readSources('features/connections/ContextManagementPanel.tsx')).toContain('scope="global"');
-    expect(readSources('features/connections/ModelAliasMapping.tsx')).toContain('Alias mapping');
+    expect(readSources('features/connections/ModelAliasMappingView.tsx')).toContain('Alias mapping');
     expect(connection).not.toContain('InferenceDefaultsPanel');
     expect(readSources('features/chat/components/ChatPageHeader.tsx')).toContain('<InferenceDefaultsPanel />');
     expect(readSources('features/connections/InferenceDefaultsPanel.tsx')).toContain('Maximum output');
