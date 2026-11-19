@@ -60,6 +60,7 @@ struct MtpOps {
     std::optional<Sampler> sampler_;
     bool penalties = false;
     bool target_maintenance = false;
+    bool predictor_maintenance = false;
     std::uint64_t target_graph_captures = 0, target_transfer_bytes = 0;
     std::int64_t target_extent = 0;
     std::array<double, 6> target_profile{};
@@ -270,7 +271,8 @@ struct MtpOps {
             return ops::contiguous(ops::expand(ops::reshape(result, {1, tokens}), {3, tokens}));
         return result;
     }
-    models::MtpStep predictor_step(Tensor hidden, Tensor ids, Tensor positions) {
+    models::MtpStep predictor_step(Tensor hidden, Tensor ids, Tensor positions,
+                                   models::MtpStepMode mode = models::MtpStepMode::full) {
         auto predictor_options = options;
         predictor_options.serial_experts = false;
         budget.reserve(mtp.growth(predictor, hidden, ids, positions, predictor_options));
@@ -278,10 +280,17 @@ struct MtpOps {
         {
             auto scope = ops::dense_scope(&predictor_execution, device);
             hidden = ops::copy(hidden, device);
-            result = mtp.step(predictor, hidden, ids, positions, predictor_options);
-            predictor_execution.submit(predictor.storage());
-            const std::array<Tensor, 3> outputs{result.sample_hidden, result.chain_hidden, result.sample_logits};
-            predictor_execution.submit(outputs);
+            std::optional<models::MtpStep> graph;
+            if (graph_enabled && (!prepared || !prepared->transformed()))
+                graph = drive_draft(mtp.graph_step(model, {&predictor, hidden, ids, positions}, mode, predictor_options),
+                                    ids.size(1), predictor_maintenance, mode);
+            if (graph) result = std::move(*graph);
+            else {
+                result = mtp.step(predictor, hidden, ids, positions, predictor_options);
+                predictor_execution.submit(predictor.storage());
+                const std::array<Tensor, 3> outputs{result.sample_hidden, result.chain_hidden, result.sample_logits};
+                predictor_execution.submit(outputs);
+            }
         }
         projected_predictor_logits = result.sample_logits;
         projected_predictor_greedy = result.greedy_token;
@@ -291,11 +300,12 @@ struct MtpOps {
         return result;
     }
     template<class T>
-    std::optional<T> drive_draft(StepSequence<T> job, int depth, bool& initialized) {
+    std::optional<T> drive_draft(StepSequence<T> job, int64_t depth, bool& initialized,
+                                 models::MtpStepMode mode = models::MtpStepMode::full) {
         auto scope = ops::dense_scope(&predictor_execution, device);
         Capture capture(predictor_execution, weights, budget, device);
         std::optional<T> result;
-        Tensor output;
+        std::array<Tensor, 3> outputs;
         bool admitted = false;
         try {
             while (auto step = job.next()) {
@@ -307,12 +317,26 @@ struct MtpOps {
                     capture.step(std::move(*step.graph));
                 } else {
                     if constexpr (std::is_same_v<T, models::MtpDraft>) {
-                        output = step.value->ids;
+                        auto& output = outputs[0] = step.value->ids;
                         if (!output || output.device() != device || output.scalar_type() != kInt64 ||
                             output.dim() != 2 || output.size(0) != 1 || output.size(1) != depth + 1)
                             throw std::logic_error("incomplete MTP verification window");
+                    } else if constexpr (std::is_same_v<T, models::MtpStep>) {
+                        outputs = {step.value->sample_hidden, step.value->chain_hidden, step.value->sample_logits};
+                        if (mode == models::MtpStepMode::history) {
+                            if (outputs[0] || outputs[1] || outputs[2])
+                                throw std::logic_error("MTP history graph returned output tensors");
+                        } else {
+                            const auto rows = mode == models::MtpStepMode::tail ? 1 : depth;
+                            for (int i = 0; i < 2; ++i)
+                                if (!outputs[i] || outputs[i].device() != device || outputs[i].dim() != 3 ||
+                                    outputs[i].size(0) != 1 || outputs[i].size(1) != rows)
+                                    throw std::logic_error("incomplete MTP predictor step");
+                            if (outputs[2] && outputs[2].device() != device)
+                                throw std::logic_error("MTP predictor logits are on the wrong device");
+                        }
                     } else {
-                        output = *step.value;
+                        auto& output = outputs[0] = *step.value;
                         if (!output || output.dim() != 3 || output.size(0) != 1 || output.size(1) != depth)
                             throw std::runtime_error("block predictor returned an incomplete draft");
                     }
@@ -322,7 +346,7 @@ struct MtpOps {
             if (admitted && !result) throw std::logic_error("MTP draft graph ended without a result");
             if (result) {
                 predictor_execution.submit(predictor.storage());
-                predictor_execution.submit(std::array<Tensor, 1>{output});
+                predictor_execution.submit(outputs);
             }
             capture.finish();
         } catch (...) {
@@ -719,7 +743,10 @@ Generation speculative_sequence(MtpOps ops, InferenceRequest &request, Inference
                 auto ids=ops.ids_for(pending_ids);
                 auto positions=positioned_prompt ? ops.decode_positions(predictor_history_position + 1,
                     static_cast<int64_t>(pending_ids.size())) : Tensor{};
-                (void)ops.predictor_step(std::move(rows),std::move(ids),std::move(positions));
+                (void)ops.predictor_step(std::move(rows),std::move(ids),std::move(positions),
+                                         models::MtpStepMode::history);
+                require_execution(predictor.position() == predictor_history_position +
+                    static_cast<int64_t>(pending_ids.size()), "MTP predictor history did not advance");
             }
             predictor_history_position += static_cast<int64_t>(pending_ids.size());
             pending_hidden.clear();
@@ -995,7 +1022,8 @@ Generation speculative_sequence(MtpOps ops, InferenceRequest &request, Inference
                 }
             }
 
-            auto head=ops.predictor_step(std::move(hidden_rows),std::move(history_ids),std::move(history_positions));
+            auto head=ops.predictor_step(std::move(hidden_rows),std::move(history_ids),std::move(history_positions),
+                                         models::MtpStepMode::tail);
             predictor_history_position += history_rows;
             require_execution(predictor.position() == predictor_history_position,
                 "MTP predictor cache did not advance");
@@ -1044,7 +1072,9 @@ Generation speculative_sequence(MtpOps ops, InferenceRequest &request, Inference
                 ++mtp_state.stats.standard_tokens;
                 bool time_sample=!maintenance;
                 {
-                    const bool initialized=ops.take_target_maintenance();time_sample=time_sample && !initialized;
+                    const bool initialized=ops.take_target_maintenance();
+                    const bool predictor_initialized=std::exchange(ops.predictor_maintenance, false);
+                    time_sample=time_sample && !initialized && !predictor_initialized;
                 }
                 depth_controller->observe_plain_window(cycle_started,Clock::now(),time_sample);
                 if(const auto measured=depth_controller->measured_cycle_ms(0))
@@ -1290,7 +1320,9 @@ Generation speculative_sequence(MtpOps ops, InferenceRequest &request, Inference
                     std::chrono::duration<double,std::milli>(Clock::now()-verify_finished).count());
             bool time_sample=!maintenance;
             {
-                const bool initialized=ops.take_target_maintenance();time_sample=time_sample && !initialized;
+                const bool initialized=ops.take_target_maintenance();
+                const bool predictor_initialized=std::exchange(ops.predictor_maintenance, false);
+                time_sample=time_sample && !initialized && !predictor_initialized;
             }
             depth_controller->observe_window(draft_count,accepted,cycle_started,cycle_finished,time_sample);
             mtp_state.stats.park_count = depth_controller->parks();

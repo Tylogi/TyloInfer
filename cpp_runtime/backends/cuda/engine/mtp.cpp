@@ -270,8 +270,6 @@ template <class Model> struct CudaMtpOps {
     return mtp.retains_partial_target_prefix();
   }
   std::size_t predictor_history_merge_limit() const {
-    if constexpr(std::is_same_v<Model,mfq::cuda::Qwen35CausalLm>)
-      return 1+mfq::engine::mtp::kMaximumReportedDraftDepth;
     return std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>?128:0;
   }
   std::size_t predictor_history_flush_threshold() const {
@@ -544,10 +542,6 @@ template <class Model> struct CudaMtpOps {
     return {};
   }
   MtpStep predictor_step(Tensor hidden, Tensor ids, Tensor positions) {
-    if constexpr(std::is_same_v<Model,mfq::cuda::Qwen35CausalLm>)
-      if(auto* predictor=dynamic_cast<Qwen35Mtp*>(&mtp))
-        if(auto tail=predictor->history_tail_step(target,hidden,ids,positions))
-          return remember_predictor_step(std::move(*tail));
     if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
       if(auto* predictor=dynamic_cast<mfq::cuda::qwen4_exp::Qwen4ExpMtp*>(&mtp);
           predictor && predictor->layers.size()==1 && model.reuse_decode_graphs &&
