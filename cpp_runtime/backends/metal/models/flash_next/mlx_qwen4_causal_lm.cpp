@@ -1081,7 +1081,7 @@ public:
             for (const auto& name : {prefix + ".router.weight", prefix + ".shared_expert.router.weight"})
                 use_native &= model.record(name).dtype == "BF16" || model.record(name).dtype == "F32" ||
                     (affine && model.record(name).dtype == "MLX-AFFINE");
-            use_native &= model.tensor_shape(prefix + ".shared_expert.gate.weight") ==
+            use_native = use_native && model.tensor_shape(prefix + ".shared_expert.gate.weight") ==
                 std::vector<std::int64_t>{config.moe_intermediate_size, config.hidden_size};
             if (use_native) {
                 if (gguf) native.emplace(std::array{mlx_native_gguf_load(model, gate_name),
